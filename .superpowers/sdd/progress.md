@@ -38,3 +38,11 @@ Base (branch start): c50efb7e9a8a4d3001d63d286be1e83095a7429f
   5. Add Chinese fixture + assertion to exercise 中英混合 path; end-to-end test pushing stereo/non-16k frames through run_pipeline.
   6. Trim likely-unused deps: thiserror, serde_json (verify first).
 - LIVE SMOKE still required (human): speak mixed 中文+English, confirm Chinese chars appear.
+
+## P1.5 — VAD 语句分段重构 (on branch p1-walking-skeleton, before merge)
+Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
+- T1: pending — fetch silero_vad.onnx
+- T2: pending — Segmenter trait + MockSegmenter
+- T3: pending — SileroSegmenter (sherpa VAD)
+- T4: pending — rewrite run_pipeline (final+partial), delete buffer, ipc FinalEvent
+- T5: pending — lib.rs wiring + frontend final list + partial line
