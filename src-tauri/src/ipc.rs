@@ -11,3 +11,9 @@ pub struct PartialEvent {
 pub struct StatusEvent {
     pub state: String, // "recording" | "stopped" | "error"
 }
+
+/// 一句定稿文本，事件名 "final"。
+#[derive(Debug, Clone, Serialize)]
+pub struct FinalEvent {
+    pub text: String,
+}

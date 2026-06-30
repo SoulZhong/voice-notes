@@ -35,10 +35,22 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             }
         };
         let capture = Box::new(audio::microphone::Microphone::new()) as Box<dyn audio::AudioCapture>;
-        let app2 = app.clone();
-        if let Err(e) = session::run_pipeline(capture, recognizer, 16000, 1.5, move |text| {
-            let _ = app2.emit("partial", ipc::PartialEvent { text });
-        }) {
+        let vad_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/silero_vad.onnx");
+        let segmenter = match pipeline::silero::SileroSegmenter::new(&vad_path) {
+            Ok(s) => Box::new(s) as Box<dyn pipeline::segmenter::Segmenter>,
+            Err(e) => {
+                let _ = app.emit("status", ipc::StatusEvent { state: format!("error: {e}") });
+                *running.lock().unwrap() = false;
+                return;
+            }
+        };
+        let app_p = app.clone();
+        let app_f = app.clone();
+        if let Err(e) = session::run_pipeline(
+            capture, recognizer, segmenter, 16000, 16000,
+            move |text| { let _ = app_p.emit("partial", ipc::PartialEvent { text }); },
+            move |text| { let _ = app_f.emit("final", ipc::FinalEvent { text }); },
+        ) {
             let _ = app.emit("status", ipc::StatusEvent { state: format!("error: {e}") });
             *running.lock().unwrap() = false;
             return;
