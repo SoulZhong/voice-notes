@@ -42,8 +42,10 @@ impl AudioCapture for Microphone {
 
         let stream_config: cpal::StreamConfig = supported.into();
 
-        // --- stop-channel ---
-        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        // --- stop-channel (signal-only: never sends, drop = disconnect) ---
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(0);
+        // --- ready-channel: background thread reports whether the stream opened ---
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
 
         // --- background thread owns the !Send stream ---
         std::thread::spawn(move || {
@@ -62,18 +64,27 @@ impl AudioCapture for Microphone {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("无法建立麦克风流: {e}");
+                    let _ = ready_tx.send(Err(format!("无法建立麦克风流: {e}")));
                     return;
                 }
             };
             if let Err(e) = stream.play() {
-                eprintln!("无法启动麦克风流: {e}");
+                let _ = ready_tx.send(Err(format!("无法启动麦克风流: {e}")));
                 return;
             }
-            // Block until stop_tx is dropped (stop() called) or explicitly signalled.
+            // 流已成功开启，通知 start() 可以放心返回。
+            let _ = ready_tx.send(Ok(()));
+            // Block until stop_tx is dropped (stop() called).
             stop_rx.recv().ok();
             // `stream` drops here, stopping capture.
         });
+
+        // 等待后台线程确认流是否真正开启，把静默失败变成可见错误。
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow::anyhow!(e)),
+            Err(_) => return Err(anyhow::anyhow!("麦克风线程意外退出，未能开启音频流")),
+        }
 
         self.stop_tx = Some(stop_tx);
         Ok(())
