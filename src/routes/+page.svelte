@@ -1,156 +1,123 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from "svelte";
+  import { onPartial, onStatus } from "$lib/events";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  let status = $state("idle");
+  let transcript = $state("");
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  onMount(() => {
+    const u1 = onPartial((e) => { transcript = e.text; });
+    const u2 = onStatus((e) => { status = e.state; });
+    return () => {
+      u1.then((f) => f());
+      u2.then((f) => f());
+    };
+  });
+
+  async function start() {
+    try {
+      await invoke("start_recording");
+    } catch (err) {
+      status = `error: ${err}`;
+    }
+  }
+
+  async function stop() {
+    await invoke("stop_recording");
+  }
+
+  function isError(s: string) {
+    return s.startsWith("error:");
   }
 </script>
 
 <main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
-
+  <h1>实时转写（骨架）</h1>
   <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
+    <button onclick={start} disabled={status === "recording"}>开始录音</button>
+    <button onclick={stop} disabled={status !== "recording"}>停止</button>
+    <span class="status" class:error={isError(status)}>状态：{status}</span>
   </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
-
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  <pre class="transcript">{transcript || "（开始说话…）"}</pre>
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  .container {
+    padding: 1.5rem;
+    font-family: -apple-system, system-ui, sans-serif;
   }
 
-  a:hover {
-    color: #24c8db;
+  h1 {
+    margin-bottom: 0.5rem;
   }
 
-  input,
+  .row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin: 1rem 0;
+  }
+
   button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    padding: 0.5em 1.2em;
+    font-size: 1em;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    background-color: #ffffff;
+    box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+    transition: border-color 0.25s;
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
 
+  button:hover:not(:disabled) {
+    border-color: #396cd8;
+  }
+
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .status {
+    color: #666;
+  }
+
+  .status.error {
+    color: #c0392b;
+    font-weight: 600;
+  }
+
+  .transcript {
+    white-space: pre-wrap;
+    min-height: 8rem;
+    background: #f5f5f7;
+    border-radius: 8px;
+    padding: 1rem;
+    font-size: 1.1rem;
+    line-height: 1.6;
+    font-family: inherit;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    button {
+      color: #ffffff;
+      background-color: #0f0f0f98;
+    }
+
+    button:active:not(:disabled) {
+      background-color: #0f0f0f69;
+    }
+
+    .status {
+      color: #aaa;
+    }
+
+    .transcript {
+      background: #2a2a2a;
+      color: #f0f0f0;
+    }
+  }
 </style>
