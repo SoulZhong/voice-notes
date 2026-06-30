@@ -1,5 +1,5 @@
 mod audio;
-mod pipeline;
+pub mod pipeline;
 pub mod asr;
 mod ipc;
 mod session;
