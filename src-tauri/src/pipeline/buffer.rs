@@ -15,13 +15,16 @@ impl AccumulatingBuffer {
     pub fn push(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
         self.samples.extend_from_slice(samples);
         if self.samples.len() >= self.next_emit_at {
-            self.next_emit_at += self.window_len;
+            // 推进到刚超过当前累积长度的下一个窗口边界，使单次超大 push
+            // 也只触发一次发射（而非之后每次 push 都立即触发）。
+            self.next_emit_at = (self.samples.len() / self.window_len + 1) * self.window_len;
             Some(self.samples.clone())
         } else {
             None
         }
     }
 
+    /// 终止操作：仅在录制停止时调用，取出剩余不足一窗的样本。
     pub fn drain(&mut self) -> Vec<f32> {
         std::mem::take(&mut self.samples)
     }
@@ -29,7 +32,6 @@ impl AccumulatingBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::*;
 
     #[test]
@@ -55,5 +57,15 @@ mod tests {
         let mut buf = AccumulatingBuffer::new(16000, 1.0);
         buf.push(&vec![0.0; 5000]);
         assert_eq!(buf.drain().len(), 5000);
+    }
+
+    #[test]
+    fn large_push_does_not_strand_threshold() {
+        // 单次 push 跨多个窗口：只发射一次，且下一次小 push 不应立即再次发射。
+        let mut buf = AccumulatingBuffer::new(16000, 1.0);
+        let out = buf.push(&vec![0.0; 48000]).expect("超大 push 应发射一次");
+        assert_eq!(out.len(), 48000);
+        // 已累积 48000，next_emit_at 应为 64000；再推 100 个样本不应发射。
+        assert!(buf.push(&vec![0.0; 100]).is_none(), "阈值不应落后导致立即再次发射");
     }
 }
