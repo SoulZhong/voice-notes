@@ -24,3 +24,17 @@ Base (branch start): c50efb7e9a8a4d3001d63d286be1e83095a7429f
 - Minor (defer to final): test fixture is English-only ("Hello"); once multilingual confirmed, add a Chinese-containing fixture+assertion to exercise 中英混合 path. recognizer_it.rs comment dropped VN_MODELS hint (harmless, #[ignore] gates it).
 - API note: sherpa-rs 0.6.8 WhisperRecognizer::transcribe(u32, &[f32]) -> WhisperRecognizerResult (not Result); ctor uses eyre. model tokens file is base-tokens.txt.
 - Task 6 intake for Task 7: Microphone::start now BLOCKS until stream confirmed open, returns Err on failure. cpal::Stream is !Send (owned on bg thread). In lib.rs start_recording, run_pipeline returning Err must emit a "status" error event (don't swallow). Keep `pub mod asr;` so tests/recognizer_it.rs (app_lib::asr) still compiles.
+- Minor (Task 8, defer/triage): stop() has no try/catch (backend stop is no-op; low risk).
+- ALL 8 TASKS COMPLETE. Ready for final whole-branch review.
+
+## Final whole-branch review (opus): READY to merge
+- No must-fix. 4 known minors all OK-to-defer.
+- Lifecycle verified sound; "start blocked until restart" is intentional (stop is P1 no-op).
+- P2 backlog (forward concerns):
+  1. Fast stream re-transcribes ENTIRE cumulative buffer every ~1.5s → O(n²) CPU + unbounded RAM (~64KB/s). Needs sliding fast-window + committed slow-segment model.
+  2. bounded(256) sink + blocking send in cpal callback → audio glitches when ASR lags; use try_send/drop-oldest or move ASR off capture path.
+  3. Wire real stop/cancel (hook already exists: Microphone stop_tx + AudioCapture::stop; thread a stop handle lib.rs→run_pipeline).
+  4. Emit "recording" status only AFTER recognizer init (avoid recording→error flash).
+  5. Add Chinese fixture + assertion to exercise 中英混合 path; end-to-end test pushing stereo/non-16k frames through run_pipeline.
+  6. Trim likely-unused deps: thiserror, serde_json (verify first).
+- LIVE SMOKE still required (human): speak mixed 中文+English, confirm Chinese chars appear.
