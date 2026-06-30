@@ -16,23 +16,28 @@ pub fn run_pipeline(
     let (tx, rx) = bounded::<crate::audio::AudioFrame>(256);
     capture.start(tx)?;
 
+    // 用立即执行闭包包住主循环，确保无论成功还是识别出错，都执行 capture.stop()。
     let mut buf = AccumulatingBuffer::new(target_rate, window_secs);
-    for frame in rx.iter() {
-        let mono = to_mono(&frame.samples, frame.channels);
-        let resampled = resample_linear(&mono, frame.sample_rate, target_rate);
-        if let Some(window) = buf.push(&resampled) {
-            let t = recognizer.recognize(&window)?;
+    let result = (|| -> anyhow::Result<()> {
+        for frame in rx.iter() {
+            let mono = to_mono(&frame.samples, frame.channels);
+            let resampled = resample_linear(&mono, frame.sample_rate, target_rate);
+            if let Some(window) = buf.push(&resampled) {
+                let t = recognizer.recognize(&window)?;
+                on_partial(t.text);
+            }
+        }
+        // 收尾：剩余不足一窗的也识别一次
+        let rest = buf.drain();
+        if !rest.is_empty() {
+            let t = recognizer.recognize(&rest)?;
             on_partial(t.text);
         }
-    }
-    // 收尾：剩余不足一窗的也识别一次
-    let rest = buf.drain();
-    if !rest.is_empty() {
-        let t = recognizer.recognize(&rest)?;
-        on_partial(t.text);
-    }
+        Ok(())
+    })();
+
     capture.stop();
-    Ok(())
+    result
 }
 
 #[cfg(test)]

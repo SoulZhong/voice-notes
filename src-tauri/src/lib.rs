@@ -50,9 +50,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn stop_recording(state: State<AppState>) {
-    // 骨架：置 false 并依赖关闭设备停止；完整停止逻辑在后续计划完善。
-    *state.running.lock().unwrap() = false;
+fn stop_recording() {
+    // P1 占位：尚无中断正在运行的管线的信号通路（需把停止句柄串到 run_pipeline，
+    // 属 P2/P3 范围）。此处不清 `running` 标志——标志由管线线程退出时自行清除，
+    // 以避免在停止与线程退出之间的窗口里 start_recording 启动出第二个管线线程。
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
