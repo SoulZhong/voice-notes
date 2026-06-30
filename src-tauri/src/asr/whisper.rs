@@ -18,7 +18,7 @@ impl WhisperRecognizer {
             encoder: encoder.to_string_lossy().into_owned(),
             decoder: decoder.to_string_lossy().into_owned(),
             tokens: tokens.to_string_lossy().into_owned(),
-            language: "en".into(), // 测试仅需 hello/world；语种固定为英语
+            language: "".into(), // 中英混合：空字符串 = sherpa-onnx 自动语种检测
             ..Default::default()
         };
         let inner = sherpa_rs::whisper::WhisperRecognizer::new(config)
