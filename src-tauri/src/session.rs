@@ -1,7 +1,22 @@
 use crate::asr::Recognizer;
 use crate::audio::{resample::resample_linear, to_mono, AudioCapture};
+use crate::audio::Source;
 use crate::pipeline::segmenter::Segmenter;
 use crossbeam_channel::bounded;
+
+/// 完成句识别任务：进 finals 队列，永不丢弃（保证不丢内容）。
+#[derive(Debug, Clone)]
+pub struct FinalJob {
+    pub source: Source,
+    pub samples: Vec<f32>,
+}
+
+/// 当前句预览任务：写入每源覆盖式槽，忙时被更新版本覆盖（best-effort）。
+#[derive(Debug, Clone)]
+pub struct PartialJob {
+    pub source: Source,
+    pub samples: Vec<f32>,
+}
 
 /// 录制管线核心：capture 取帧 → 归一 16kHz 单声道 → 喂 segmenter。
 /// 每出现完成语句 → 识别 → on_final；按采样节流对当前句识别 → on_partial。

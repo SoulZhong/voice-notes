@@ -1,0 +1,88 @@
+use crate::audio::{resample::resample_linear, to_mono, AudioFrame, Source};
+use crate::pipeline::segmenter::Segmenter;
+use crate::session::{FinalJob, PartialJob};
+use crossbeam_channel::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+/// 单源分段 worker：frame_rx 取原生帧 → 归一 16kHz 单声道 → VAD 分段。
+/// 完成句 → finals_tx.send(FinalJob)；当前句按采样节流 → 覆盖 partial_slot。
+/// frame_rx 关闭（采集停止/结束）后 flush 尾段并返回。
+pub fn run_segment_worker(
+    source: Source,
+    frame_rx: Receiver<AudioFrame>,
+    target_rate: u32,
+    partial_interval_samples: usize,
+    finals_tx: Sender<FinalJob>,
+    partial_slot: Arc<Mutex<Option<PartialJob>>>,
+    mut segmenter: Box<dyn Segmenter>,
+) {
+    let mut since_partial: usize = 0;
+    for frame in frame_rx.iter() {
+        let mono = to_mono(&frame.samples, frame.channels);
+        let resampled = resample_linear(&mono, frame.sample_rate, target_rate);
+        since_partial += resampled.len();
+        segmenter.accept(&resampled);
+
+        for seg in segmenter.take_finished() {
+            *partial_slot.lock().unwrap() = None; // 定稿：清过时预览
+            let _ = finals_tx.send(FinalJob { source, samples: seg.samples });
+            since_partial = 0;
+        }
+
+        if since_partial >= partial_interval_samples {
+            since_partial = 0;
+            if let Some(cur) = segmenter.current_partial() {
+                *partial_slot.lock().unwrap() = Some(PartialJob { source, samples: cur });
+            }
+        }
+    }
+
+    // 采集结束：尾段定稿
+    segmenter.flush();
+    for seg in segmenter.take_finished() {
+        *partial_slot.lock().unwrap() = None;
+        let _ = finals_tx.send(FinalJob { source, samples: seg.samples });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::mock::MockCapture;
+    use crate::audio::AudioCapture;
+    use crate::pipeline::segmenter::MockSegmenter;
+
+    #[test]
+    fn segment_worker_tags_finals_with_source() {
+        let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(256);
+        let (final_tx, final_rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(None));
+        let slot2 = slot.clone();
+
+        // 先起 worker（消费者），再让 MockCapture 同步灌帧，避免灌满 256 阻塞。
+        let worker = std::thread::spawn(move || {
+            run_segment_worker(
+                Source::System,
+                frx,
+                16000,
+                4000,
+                final_tx,
+                slot2,
+                Box::new(MockSegmenter::new(8000)),
+            );
+        });
+
+        let mut cap = MockCapture::from_wav(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample_16k.wav"
+        ))
+        .expect("fixture");
+        cap.start(ftx).expect("start"); // 灌完帧后 ftx 被 drop → frx 关闭
+        worker.join().expect("join");
+
+        let finals: Vec<FinalJob> = final_rx.try_iter().collect();
+        assert!(!finals.is_empty(), "应至少产出一个 final");
+        assert!(finals.iter().all(|f| f.source == Source::System), "全部带 System 标记");
+        assert!(finals.iter().all(|f| !f.samples.is_empty()), "final 样本非空");
+    }
+}
