@@ -21,12 +21,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         *r = true;
     }
     let running = state.running.clone();
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models/sherpa-onnx-whisper-base");
+    let sense_voice_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17");
 
     std::thread::spawn(move || {
         let _ = app.emit("status", ipc::StatusEvent { state: "recording".into() });
-        let recognizer = match asr::whisper::WhisperRecognizer::new(&model_dir) {
+        let recognizer = match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir) {
             Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
             Err(e) => {
                 let _ = app.emit("status", ipc::StatusEvent { state: format!("error: {e}") });

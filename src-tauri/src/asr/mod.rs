@@ -1,4 +1,5 @@
 pub mod whisper;
+pub mod sense_voice;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone)]
