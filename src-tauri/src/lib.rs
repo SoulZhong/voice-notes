@@ -116,6 +116,15 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 
         match start {
             Ok(start) => {
+                // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
+                if !start.active.contains(&Source::Mic) {
+                    start.handle.stop();
+                    let mic_err = start.failed.iter()
+                        .find(|(s, _)| *s == Source::Mic)
+                        .map(|(_, msg)| format!("error: 麦克风未能启动: {msg}"))
+                        .unwrap_or_else(|| "error: 麦克风未能启动".into());
+                    return fail(&app, &running, mic_err);
+                }
                 let system_audio = classify_system(&start.active, &start.failed);
                 *handle_slot.lock().unwrap() = Some(start.handle);
                 let _ = app.emit(

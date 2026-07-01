@@ -31,9 +31,8 @@ pub fn run_segment_worker(
 
         if since_partial >= partial_interval_samples {
             since_partial = 0;
-            if let Some(cur) = segmenter.current_partial() {
-                *partial_slot.lock().unwrap() = Some(PartialJob { source, samples: cur });
-            }
+            *partial_slot.lock().unwrap() =
+                segmenter.current_partial().map(|cur| PartialJob { source, samples: cur });
         }
     }
 
@@ -50,7 +49,7 @@ mod tests {
     use super::*;
     use crate::audio::mock::MockCapture;
     use crate::audio::AudioCapture;
-    use crate::pipeline::segmenter::MockSegmenter;
+    use crate::pipeline::segmenter::{MockSegmenter, Segment};
 
     #[test]
     fn segment_worker_tags_finals_with_source() {
@@ -84,5 +83,56 @@ mod tests {
         assert!(!finals.is_empty(), "应至少产出一个 final");
         assert!(finals.iter().all(|f| f.source == Source::System), "全部带 System 标记");
         assert!(finals.iter().all(|f| !f.samples.is_empty()), "final 样本非空");
+    }
+
+    /// Fix B: when the throttle fires and current_partial() returns None, the slot must be
+    /// cleared (not left stale from a prior Some).
+    #[test]
+    fn stale_partial_cleared_when_throttle_returns_none() {
+        /// A segmenter whose current_partial returns Some on the 1st call and None on all others.
+        struct ScriptedSegmenter {
+            calls: usize,
+        }
+        impl crate::pipeline::segmenter::Segmenter for ScriptedSegmenter {
+            fn accept(&mut self, _: &[f32]) {}
+            fn take_finished(&mut self) -> Vec<Segment> { vec![] }
+            fn current_partial(&mut self) -> Option<Vec<f32>> {
+                self.calls += 1;
+                if self.calls == 1 { Some(vec![0.5; 10]) } else { None }
+            }
+            fn flush(&mut self) {}
+        }
+
+        let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(4);
+        let (final_tx, _final_rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(None::<PartialJob>));
+        let slot2 = slot.clone();
+
+        let worker = std::thread::spawn(move || {
+            run_segment_worker(
+                Source::Mic,
+                frx,
+                16000,
+                50, // partial_interval_samples
+                final_tx,
+                slot2,
+                Box::new(ScriptedSegmenter { calls: 0 }),
+            );
+        });
+
+        // Two 50-sample mono 16kHz frames; each exactly hits the throttle.
+        // Tick 1: current_partial() → Some  → slot = Some(...)
+        // Tick 2: current_partial() → None  → slot = None  (Fix B; old code left slot stale)
+        let frame = AudioFrame { samples: vec![0.0; 50], sample_rate: 16000, channels: 1 };
+        ftx.send(frame.clone()).unwrap();
+        ftx.send(frame).unwrap();
+        drop(ftx); // close channel → worker exits after processing both frames
+
+        worker.join().unwrap();
+
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "slot must be cleared to None when throttle fires with no current partial"
+        );
     }
 }
