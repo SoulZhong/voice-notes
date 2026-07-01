@@ -41,8 +41,8 @@ Base (branch start): c50efb7e9a8a4d3001d63d286be1e83095a7429f
 
 ## P1.5 — VAD 语句分段重构 (on branch p1-walking-skeleton, before merge)
 Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
-- T1: pending — fetch silero_vad.onnx
-- T2: pending — Segmenter trait + MockSegmenter
-- T3: pending — SileroSegmenter (sherpa VAD)
-- T4: pending — rewrite run_pipeline (final+partial), delete buffer, ipc FinalEvent
+- T1: complete (head 5dcc0c4) — fetch silero_vad.onnx
+- T2: complete (head b8e891d, review clean) — Segmenter trait + MockSegmenter
+- T3: complete (head 878445f, review clean; 2 accepted minors) — SileroSegmenter
+- T4: complete (head d7c6dfa, review clean; +partial assertion) — rewrite run_pipeline; delete buffer; ipc FinalEvent; lib.rs wired
 - T5: pending — lib.rs wiring + frontend final list + partial line
