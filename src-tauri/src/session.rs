@@ -95,5 +95,6 @@ mod tests {
         .expect("run");
         assert!(!finals.lock().unwrap().is_empty(), "应至少有一个 final");
         assert!(finals.lock().unwrap().iter().all(|s| s.starts_with("len=")));
+        assert!(!partials.lock().unwrap().is_empty(), "应至少触发一次 partial");
     }
 }
