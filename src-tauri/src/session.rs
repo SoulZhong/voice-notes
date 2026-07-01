@@ -3,6 +3,9 @@ use crate::audio::{resample::resample_linear, to_mono, AudioCapture};
 use crate::audio::Source;
 use crate::pipeline::segmenter::Segmenter;
 use crossbeam_channel::bounded;
+use crossbeam_channel::Receiver;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// 完成句识别任务：进 finals 队列，永不丢弃（保证不丢内容）。
 #[derive(Debug, Clone)]
@@ -16,6 +19,40 @@ pub struct FinalJob {
 pub struct PartialJob {
     pub source: Source,
     pub samples: Vec<f32>,
+}
+
+/// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
+/// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
+pub fn run_asr_worker(
+    mut recognizer: Box<dyn Recognizer>,
+    finals_rx: Receiver<FinalJob>,
+    partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
+    mut on_final: impl FnMut(Source, String),
+    mut on_partial: impl FnMut(Source, String),
+) {
+    loop {
+        match finals_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(job) => {
+                let text = match recognizer.recognize(&job.samples) {
+                    Ok(t) => t.text,
+                    Err(_) => "[识别失败]".to_string(),
+                };
+                on_final(job.source, text);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // 空闲：服务每源最新 partial（取出即清空，只识别最新一版）。
+                for (src, slot) in &partial_slots {
+                    let job = slot.lock().unwrap().take();
+                    if let Some(job) = job {
+                        if let Ok(t) = recognizer.recognize(&job.samples) {
+                            on_partial(*src, t.text);
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 /// 录制管线核心：capture 取帧 → 归一 16kHz 单声道 → 喂 segmenter。
@@ -68,6 +105,111 @@ pub fn run_pipeline(
 
     capture.stop();
     result
+}
+
+#[cfg(test)]
+mod asr_worker_tests {
+    use super::*;
+    use crate::asr::{Recognizer, Transcript};
+    use crate::audio::Source;
+    use std::sync::{Arc, Mutex};
+
+    struct CountingRecognizer;
+    impl Recognizer for CountingRecognizer {
+        fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
+            Ok(Transcript { text: format!("len={}", s.len()) })
+        }
+    }
+
+    struct FlakyRecognizer { n: usize }
+    impl Recognizer for FlakyRecognizer {
+        fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
+            self.n += 1;
+            if self.n == 1 {
+                anyhow::bail!("boom");
+            }
+            Ok(Transcript { text: format!("len={}", s.len()) })
+        }
+    }
+
+    #[test]
+    fn emits_all_finals_tagged_in_order() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 10] }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 20] }).unwrap();
+        drop(tx);
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        run_asr_worker(
+            Box::new(CountingRecognizer),
+            rx,
+            vec![],
+            move |s, t| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::Mic, "len=10".into()), (Source::System, "len=20".into())]
+        );
+    }
+
+    #[test]
+    fn failed_final_becomes_placeholder_and_worker_survives() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3] }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 4] }).unwrap();
+        drop(tx);
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        run_asr_worker(
+            Box::new(FlakyRecognizer { n: 0 }),
+            rx,
+            vec![],
+            move |s, t| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::Mic, "[识别失败]".into()), (Source::Mic, "len=4".into())]
+        );
+    }
+
+    #[test]
+    fn services_latest_partial_when_idle() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let p2 = partials.clone();
+        let slot_for_worker = slot.clone();
+
+        let worker = std::thread::spawn(move || {
+            run_asr_worker(
+                Box::new(CountingRecognizer),
+                rx,
+                vec![(Source::System, slot_for_worker)],
+                |_, _| {},
+                move |s, t| p2.lock().unwrap().push((s, t)),
+            );
+        });
+
+        // 轮询等待 worker 在空闲分支服务了 partial 槽（有界，避免固定 sleep 假设）。
+        let mut serviced = false;
+        for _ in 0..200 {
+            if !partials.lock().unwrap().is_empty() {
+                serviced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(tx); // 结束 worker
+        worker.join().unwrap();
+
+        assert!(serviced, "空闲时应服务 partial 槽");
+        assert_eq!(*partials.lock().unwrap(), vec![(Source::System, "len=7".into())]);
+        assert!(slot.lock().unwrap().is_none(), "partial 取出后槽应清空");
+    }
 }
 
 #[cfg(test)]
