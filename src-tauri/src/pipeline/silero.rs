@@ -33,6 +33,10 @@ impl Segmenter for SileroSegmenter {
         self.vad.accept_waveform(samples.to_vec());
         if self.vad.is_speech() {
             self.current.extend_from_slice(samples);
+        } else {
+            // 静音期清空预览缓冲：避免噪声导致 is_speech 抖动却不成段时，
+            // current 里残留过时片段被当成 partial 显示。
+            self.current.clear();
         }
     }
 

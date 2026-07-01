@@ -14,10 +14,16 @@
       if (e.state === "recording") {
         finals = [];
         partial = "";
+      } else if (e.state === "stopped" || e.state.startsWith("error:")) {
+        // 结束/出错时清掉未定稿的临时行，避免半句灰字残留。
+        partial = "";
       }
     });
     const u3 = onFinal((e) => {
-      finals = [...finals, e.text];
+      // 跳过空识别结果，避免追加空白行。
+      if (e.text.trim()) {
+        finals = [...finals, e.text];
+      }
       partial = "";
     });
     return () => {
