@@ -46,3 +46,9 @@ Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
 - T3: complete (head 878445f, review clean; 2 accepted minors) — SileroSegmenter
 - T4: complete (head d7c6dfa, review clean; +partial assertion) — rewrite run_pipeline; delete buffer; ipc FinalEvent; lib.rs wired
 - T5: complete (head 615bf65, review clean) — frontend final list + partial line (lib.rs wiring was folded into T4)
+
+## P1.5 final review (opus): READY WITH MINOR FIXES → minors applied
+- Confirmed: O(n²)+unbounded-memory FIXED (每次 Whisper ≤15s 单句；current/VAD 每句清空；整体线性、内存恒定).
+- Applied minors: (a) clear partial on status stopped/error; (b) guard empty final; (c) clear current during silence.
+- P2 backlog additions: move Whisper off consume loop (bounded(256) back-pressure); add a non-ignored VAD segmentation test (commit small fixture/model); short (<1s) utterances skip partial by design; stop_recording still no-op.
+- ALL P1.5 DONE. Ready for live smoke + merge.
