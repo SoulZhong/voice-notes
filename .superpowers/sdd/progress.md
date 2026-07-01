@@ -45,4 +45,4 @@ Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
 - T2: complete (head b8e891d, review clean) — Segmenter trait + MockSegmenter
 - T3: complete (head 878445f, review clean; 2 accepted minors) — SileroSegmenter
 - T4: complete (head d7c6dfa, review clean; +partial assertion) — rewrite run_pipeline; delete buffer; ipc FinalEvent; lib.rs wired
-- T5: pending — lib.rs wiring + frontend final list + partial line
+- T5: complete (head 615bf65, review clean) — frontend final list + partial line (lib.rs wiring was folded into T4)
