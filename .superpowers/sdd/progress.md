@@ -52,3 +52,7 @@ Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
 - Applied minors: (a) clear partial on status stopped/error; (b) guard empty final; (c) clear current during silence.
 - P2 backlog additions: move Whisper off consume loop (bounded(256) back-pressure); add a non-ignored VAD segmentation test (commit small fixture/model); short (<1s) utterances skip partial by design; stop_recording still no-op.
 - ALL P1.5 DONE. Ready for live smoke + merge.
+
+## P1.6 — SenseVoice recognizer (quality fix: base-int8 Chinese was poor)
+User smoke: whisper-base int8 中文识别差、组织不成句。Design doc wanted large-v3; we downgraded for speed. Per-utterance segmentation (P1.5) makes a stronger model feasible. User chose SenseVoice-small (fast, strong zh/en).
+- T: add SenseVoiceRecognizer + model + swap lib.rs + Chinese integration test.
