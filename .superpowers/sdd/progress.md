@@ -55,4 +55,11 @@ Plan: docs/superpowers/plans/2026-07-01-voice-notes-p1.5-vad-segmentation.md
 
 ## P1.6 — SenseVoice recognizer (quality fix: base-int8 Chinese was poor)
 User smoke: whisper-base int8 中文识别差、组织不成句。Design doc wanted large-v3; we downgraded for speed. Per-utterance segmentation (P1.5) makes a stronger model feasible. User chose SenseVoice-small (fast, strong zh/en).
-- T: add SenseVoiceRecognizer + model + swap lib.rs + Chinese integration test.
+- DONE: SenseVoiceRecognizer added (920c8ae), lib.rs switched. Chinese test perfect: '今天开会讨论一下项目进度和下一步计划。'. whisper module kept as alt. Model 347MB fp32 gitignored.
+- T: complete (commit 394662e..920c8ae, task review clean/approved by sonnet) — SenseVoiceRecognizer + fetch_models guard + lib.rs swap (whisper kept) + Chinese IT.
+  - Model: sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.onnx (347MB fp32; no int8 in tarball; tarball ~1GB not 100MB).
+  - Test PASSED: `sense_voice_transcribes_chinese` → "今天开会讨论一下项目进度和下一步计划。" (Tingting TTS, ITN period). All 8 unit tests green; ignored tests model-gated.
+  - API: language="auto" worked verbatim; use_itn=true; ctor eyre→anyhow via map_err. No deviations.
+  - Minor (deferred, non-blocking): find_model_onnx doesn't try dir.join("model.onnx") first (unlike find_tokens); harmless (one non-int8 onnx in pkg). Mirror find_tokens pattern for determinism.
+  - Report: .superpowers/sdd/p16-sensevoice-report.md
+  - ALL P1.6 DONE. Live smoke (human): confirm mixed 中英 transcription quality beats whisper-base-int8.
