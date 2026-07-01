@@ -1,17 +1,29 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { onPartial, onStatus } from "$lib/events";
+  import { onPartial, onStatus, onFinal } from "$lib/events";
 
   let status = $state("idle");
-  let transcript = $state("");
+  let finals = $state<string[]>([]);
+  let partial = $state("");
 
   onMount(() => {
-    const u1 = onPartial((e) => { transcript = e.text; });
-    const u2 = onStatus((e) => { status = e.state; });
+    const u1 = onPartial((e) => { partial = e.text; });
+    const u2 = onStatus((e) => {
+      status = e.state;
+      if (e.state === "recording") {
+        finals = [];
+        partial = "";
+      }
+    });
+    const u3 = onFinal((e) => {
+      finals = [...finals, e.text];
+      partial = "";
+    });
     return () => {
       u1.then((f) => f());
       u2.then((f) => f());
+      u3.then((f) => f());
     };
   });
 
@@ -39,7 +51,17 @@
     <button onclick={stop} disabled={status !== "recording"}>停止</button>
     <span class="status" class:error={isError(status)}>状态：{status}</span>
   </div>
-  <pre class="transcript">{transcript || "（开始说话…）"}</pre>
+  <div class="transcript">
+    {#each finals as line}
+      <p class="final">{line}</p>
+    {/each}
+    {#if partial}
+      <p class="partial">{partial}</p>
+    {/if}
+    {#if finals.length === 0 && !partial}
+      <p class="hint">（开始说话…）</p>
+    {/if}
+  </div>
 </main>
 
 <style>
@@ -91,7 +113,6 @@
   }
 
   .transcript {
-    white-space: pre-wrap;
     min-height: 8rem;
     background: #f5f5f7;
     border-radius: 8px;
@@ -99,6 +120,23 @@
     font-size: 1.1rem;
     line-height: 1.6;
     font-family: inherit;
+  }
+
+  .transcript p {
+    margin: 0 0 0.25rem 0;
+  }
+
+  .final {
+    color: #1a1a1a;
+  }
+
+  .partial {
+    color: #888;
+    font-style: italic;
+  }
+
+  .hint {
+    color: #aaa;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -117,7 +155,18 @@
 
     .transcript {
       background: #2a2a2a;
+    }
+
+    .final {
       color: #f0f0f0;
+    }
+
+    .partial {
+      color: #888;
+    }
+
+    .hint {
+      color: #555;
     }
   }
 </style>
