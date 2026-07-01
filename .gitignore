@@ -1,6 +1,16 @@
 /target
+src-tauri/target/
 node_modules/
 *.onnx
 *.bin
 dist/
 .DS_Store
+/src-tauri/models/
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
