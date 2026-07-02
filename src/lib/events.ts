@@ -1,8 +1,11 @@
 import { listen } from "@tauri-apps/api/event";
 
-export type PartialEvent = { text: string };
-export type StatusEvent = { state: string };
-export type FinalEvent = { text: string };
+export type Source = "mic" | "system";
+export type SystemAudio = "on" | "denied" | "unavailable" | "";
+
+export type PartialEvent = { source: Source; text: string };
+export type FinalEvent = { source: Source; text: string };
+export type StatusEvent = { state: string; system_audio: SystemAudio };
 
 export function onPartial(cb: (e: PartialEvent) => void) {
   return listen<PartialEvent>("partial", (ev) => cb(ev.payload));
