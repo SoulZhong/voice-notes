@@ -94,9 +94,10 @@ impl AudioBufferList {
     pub fn num_buffers(&self) -> usize
     pub fn get(&self, index: usize) -> Option<&AudioBuffer>
     pub fn iter(&self) -> AudioBufferListIter<'_>
+    pub fn buffer(&self, index: usize) -> Option<AudioBufferRef<'_>>
 }
 ```
-Source: `screencapturekit-8.0.0/src/cm/audio.rs:159-195`
+Source: `screencapturekit-8.0.0/src/cm/audio.rs:153-195`
 
 ### `AudioBuffer`
 
