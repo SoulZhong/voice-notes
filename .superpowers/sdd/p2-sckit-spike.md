@@ -260,3 +260,12 @@ Zero errors. Two pre-existing warnings (not introduced by this task).
 - No changes to the `AudioCapture` trait or existing modules
 - The `screencapturekit` dep is gated with `[target.'cfg(target_os = "macos")'.dependencies]` — cross-platform build is unaffected
 - Two pre-existing warnings (`MockCapture`) are unchanged — not our concern
+
+## 运行时实锤（2026-07-02 冒烟，macOS 26 Apple Silicon）
+探针实测（授权屏幕录制 + TTS 放音）：
+- **采样率**：`format_description().audio_sample_rate()` = `Some(48000.0)`（48k 回退分支用不上，但保留无害）。
+- **布局**：`num_buffers=2`，每 buffer `number_channels=1`、3840 bytes（=960 样本/20ms）→ **PLANAR**，extract_audio_mono 走 `n>1` → planar_to_mono 分支。两平面内容相同（系统把 mono 源上混为双声道）。
+- **样本格式**：f32-LE 确认——有声帧解码为平滑波形（head=[0.0516, 0.1088, 0.0751]，peak≈0.24 随语音起伏，静音=0）；错误编码会解出乱码级数值。codec="lpcm"。
+- **权限拒绝**：未授权时 `SCShareableContent::get()` → `NoShareableContent("Content unavailable: 用户拒绝了…TCC")` → T3 的 `unauthorized:` 前缀 → `denied` 分类正确。
+- **静音行为**：无声时 SCKit 仍持续投递全零 buffer（回调不断流）。
+- 结论：T3 `extract_audio_mono`/`bytes_to_f32`/`audio_sample_rate` 全部假设与实测一致，无需修改。

@@ -15,14 +15,36 @@ fn probe_system_audio() {
     struct Handler(mpsc::Sender<String>);
     impl SCStreamOutputTrait for Handler {
         fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _t: SCStreamOutputType) {
-            // 目标：打印采样率/声道/缓冲个数/首缓冲字节数，判定 f32 与 planar/interleaved。
-            // NOTE: format_description() is on CMSampleBuffer directly (apple_cf);
-            //       audio_buffer_list() is from CMSampleBufferExt (in prelude).
-            let fmt = sample.format_description();
-            let list = sample.audio_buffer_list();
-            let _ = self
-                .0
-                .send(format!("format_description={fmt:?} | audio_buffer_list={list:?}"));
+            // 目标：实锤 T3 extract_audio_mono 的全部假设——
+            // 采样率、每 buffer 声道数/字节数、样本按 f32-LE 解码是否合理([-1,1])。
+            let rate = sample
+                .format_description()
+                .and_then(|f| f.audio_sample_rate());
+            let mut desc = format!("rate={rate:?}");
+            if let Some(list) = sample.audio_buffer_list() {
+                desc += &format!(" | num_buffers={}", list.num_buffers());
+                for (i, buf) in list.iter().enumerate() {
+                    let data = buf.data();
+                    // 按 f32-LE 解前 3 个样本（与 audio/system.rs 的 bytes_to_f32 同法）
+                    let head: Vec<f32> = data
+                        .chunks_exact(4)
+                        .take(3)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    let peak = data
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
+                        .fold(0.0f32, f32::max);
+                    desc += &format!(
+                        " | buf{i}: ch={} bytes={} head={head:?} peak={peak:.4}",
+                        buf.number_channels,
+                        data.len()
+                    );
+                }
+            } else {
+                desc += " | audio_buffer_list=None";
+            }
+            let _ = self.0.send(desc);
         }
     }
 
@@ -43,14 +65,27 @@ fn probe_system_audio() {
     stream.add_output_handler(Handler(tx), SCStreamOutputType::Audio);
     stream.start_capture().expect("start_capture 失败");
 
+    // 采集最多 ~6 秒（300 × 20ms）：静音帧只打印前 3 帧，之后只打印非零峰值帧，
+    // 逮到 3 帧有声帧即可提前结束——足以实锤 f32-LE 解码合理性。
     let mut n = 0;
+    let mut loud = 0;
     while let Ok(msg) = rx.recv_timeout(Duration::from_secs(2)) {
-        println!("AUDIO#{n}: {msg}");
+        let has_sound = !msg.contains("peak=0.0000");
+        if n < 3 || has_sound {
+            println!("AUDIO#{n}: {msg}");
+        }
+        if has_sound {
+            loud += 1;
+            if loud >= 3 {
+                break;
+            }
+        }
         n += 1;
-        if n >= 20 {
+        if n >= 300 {
             break;
         }
     }
     stream.stop_capture().ok();
+    println!("共收到 {n} 帧，其中有声帧 {loud} 帧");
     assert!(n > 0, "未收到系统音频回调——检查屏幕录制授权与是否有声音在播放");
 }
