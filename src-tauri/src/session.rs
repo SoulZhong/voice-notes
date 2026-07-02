@@ -32,9 +32,18 @@ pub fn run_asr_worker(
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
-                let text = match recognizer.recognize(&job.samples) {
-                    Ok(t) => t.text,
-                    Err(_) => "[识别失败]".to_string(),
+                let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    recognizer.recognize(&job.samples)
+                })) {
+                    Ok(Ok(t)) => t.text,
+                    Ok(Err(_)) => "[识别失败]".to_string(),
+                    Err(_) => {
+                        eprintln!(
+                            "run_asr_worker: recognize panicked on a {:?} final; 以占位继续",
+                            job.source
+                        );
+                        "[识别失败]".to_string()
+                    }
                 };
                 on_final(job.source, text);
             }
@@ -43,8 +52,17 @@ pub fn run_asr_worker(
                 for (src, slot) in &partial_slots {
                     let job = slot.lock().unwrap().take();
                     if let Some(job) = job {
-                        if let Ok(t) = recognizer.recognize(&job.samples) {
-                            on_partial(*src, t.text);
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            recognizer.recognize(&job.samples)
+                        })) {
+                            Ok(Ok(t)) => on_partial(*src, t.text),
+                            Ok(Err(_)) => {}
+                            Err(_) => {
+                                eprintln!(
+                                    "run_asr_worker: recognize panicked on a {:?} partial; 跳过",
+                                    src
+                                );
+                            }
                         }
                     }
                 }
@@ -72,7 +90,9 @@ impl RecordingHandle {
             let _ = w.join();
         }
         if let Some(a) = self.asr.take() {
-            let _ = a.join();
+            if a.join().is_err() {
+                eprintln!("RecordingHandle::stop: asr 线程异常退出（panic）");
+            }
         }
     }
 }
@@ -217,6 +237,48 @@ mod asr_worker_tests {
         assert_eq!(
             *finals.lock().unwrap(),
             vec![(Source::Mic, "[识别失败]".into()), (Source::Mic, "len=4".into())]
+        );
+    }
+
+    struct PanicRecognizer { n: usize }
+    impl Recognizer for PanicRecognizer {
+        fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
+            self.n += 1;
+            if self.n == 1 {
+                panic!("boom");
+            }
+            Ok(Transcript { text: format!("len={}", s.len()) })
+        }
+    }
+
+    #[test]
+    fn recognize_panic_becomes_placeholder_worker_survives() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3] }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 5] }).unwrap();
+        drop(tx);
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+
+        // Suppress "panicked at" output so test stderr stays clean.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        run_asr_worker(
+            Box::new(PanicRecognizer { n: 0 }),
+            rx,
+            vec![],
+            move |s, t| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+        );
+        std::panic::set_hook(prev);
+
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![
+                (Source::Mic, "[识别失败]".into()),
+                (Source::Mic, "len=5".into()),
+            ]
         );
     }
 
