@@ -91,8 +91,13 @@ fn extract_audio_mono(sample: &CMSampleBuffer) -> Vec<f32> {
             None => return Vec::new(),
         };
         let channels = buf.number_channels;
+        if channels == 0 {
+            // 防御性守卫：设备理论上不应报告 0 声道，但若发生则跳过该 buffer，
+            // 避免把非法/无意义数据当作 mono 直接透传出去。
+            return Vec::new();
+        }
         let samples = bytes_to_f32(buf.data());
-        if channels <= 1 {
+        if channels == 1 {
             samples
         } else {
             // INTERLEAVED：调用 super::to_mono 做帧内平均

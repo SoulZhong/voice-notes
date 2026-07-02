@@ -25,7 +25,9 @@ pub fn run_segment_worker(
 
         for seg in segmenter.take_finished() {
             *partial_slot.lock().unwrap() = None; // 定稿：清过时预览
-            let _ = finals_tx.send(FinalJob { source, samples: seg.samples });
+            if finals_tx.send(FinalJob { source, samples: seg.samples }).is_err() {
+                eprintln!("segment_worker: finals 通道已关闭，一段完成句被丢弃 ({source:?})");
+            }
             since_partial = 0;
         }
 
@@ -40,7 +42,9 @@ pub fn run_segment_worker(
     segmenter.flush();
     for seg in segmenter.take_finished() {
         *partial_slot.lock().unwrap() = None;
-        let _ = finals_tx.send(FinalJob { source, samples: seg.samples });
+        if finals_tx.send(FinalJob { source, samples: seg.samples }).is_err() {
+            eprintln!("segment_worker: finals 通道已关闭，一段完成句被丢弃 ({source:?})");
+        }
     }
 }
 

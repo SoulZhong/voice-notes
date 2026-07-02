@@ -84,10 +84,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     sys_seg,
                 )),
                 Err(e) => {
-                    let _ = app.emit(
-                        "status",
-                        ipc::StatusEvent { state: format!("error: {e}"), system_audio: String::new() },
-                    );
+                    // 系统声音 VAD 构建失败非致命：不发 error 状态（避免闪烁），
+                    // 静默跳过该源；classify_system 会因 System 既不在 active 也不在
+                    // failed 里而归类为 "unavailable"，UI 仍会显示降级横幅。
+                    eprintln!("系统声音 VAD 构建失败，降级为仅麦克风: {e}");
                 }
             }
         }
@@ -125,8 +125,23 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                         .unwrap_or_else(|| "error: 麦克风未能启动".into());
                     return fail(&app, &running, mic_err);
                 }
+                // 停/存竞态保护：存 handle 与 running 检查必须在同一把 running 锁内完成
+                // （加载线程锁序 running → handle_slot）。stop_recording 一律先置
+                // running=false 再取 handle，且从不同时持有两把锁，因此无论 stop
+                // 发生在加载前、加载中还是加载后，两个线程的交错都是安全的：
+                //  - stop 先到：这里检测到 running==false，不存 handle、不发
+                //    "recording"，直接把刚起好的会话原地停掉，避免孤儿会话。
+                //  - stop 后到：这里已把 handle 存进 handle_slot 并发出
+                //    "recording"，stop_recording 随后正常取到该 handle 并停止。
+                let running_guard = running.lock().unwrap();
+                if !*running_guard {
+                    drop(running_guard);
+                    start.handle.stop();
+                    return;
+                }
                 let system_audio = classify_system(&start.active, &start.failed);
                 *handle_slot.lock().unwrap() = Some(start.handle);
+                drop(running_guard);
                 let _ = app.emit(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio },
@@ -141,12 +156,15 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 
 #[tauri::command]
 fn stop_recording(app: AppHandle, state: State<AppState>) {
-    // 真停止：取出句柄并优雅停止（停 capture → flush 尾段 → 排干 finals → join）。
+    // 真停止协议：先置 running=false（statement-scoped 锁，用完立即释放），
+    // 再取 handle 并优雅停止（停 capture → flush 尾段 → 排干 finals → join）。
+    // 与 start_recording 加载线程的锁序一致（running → handle_slot），且本函数
+    // 从不同时持有两把锁，所以与加载线程的任意交错都不会死锁。
+    { *state.running.lock().unwrap() = false; }
     let handle = state.handle.lock().unwrap().take();
     if let Some(h) = handle {
         h.stop();
     }
-    *state.running.lock().unwrap() = false;
     let _ = app.emit(
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new() },
