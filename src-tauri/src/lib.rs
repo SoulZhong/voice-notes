@@ -3,6 +3,7 @@ pub mod pipeline;
 pub mod asr;
 mod ipc;
 mod session;
+mod store;
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
