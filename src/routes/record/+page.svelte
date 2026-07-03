@@ -1,9 +1,8 @@
 <script lang="ts">
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
-  import type { Source } from "$lib/events";
-
-  const label = (s: Source) => (s === "mic" ? "我" : "对方");
+  import { speakerLabel, speakerColor } from "$lib/notes";
+  import SpeakerChips from "$lib/SpeakerChips.svelte";
 
   function isError(s: string) {
     return s.startsWith("error:");
@@ -31,11 +30,13 @@
     <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
   {/if}
 
+  <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
+
   <div class="transcript">
     {#each recording.finals as line}
       <p class="final">
-        <span class="badge" class:mic={line.source === "mic"} class:system={line.source === "system"}>
-          {label(line.source)}
+        <span class="badge" style="background: {speakerColor(line.speaker, line.source)}">
+          {speakerLabel(line.speaker, line.source, recording.speakers)}
         </span>
         {line.text}
       </p>

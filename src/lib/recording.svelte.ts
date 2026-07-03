@@ -5,12 +5,15 @@ import {
   onStatus,
   onFinal,
   onStorage,
+  onSpeakers,
   type Source,
   type SystemAudio,
   type StatusEvent,
 } from "./events";
+import { renameSpeaker as renameSpeakerCmd } from "./notes";
 
-export type Line = { source: Source; text: string };
+export type Line = { source: Source; text: string; speaker: string | null };
+export type SpeakerMap = Record<string, { name: string; sources: string[] }>;
 
 let status = $state("idle");
 let systemAudio = $state<SystemAudio>("");
@@ -19,6 +22,7 @@ let finals = $state<Line[]>([]);
 let partialMic = $state("");
 let partialSystem = $state("");
 let storageDegraded = $state(false);
+let speakers = $state<SpeakerMap>({});
 /** recording/stopped/error 翻转时 +1，侧栏据此刷新列表。 */
 let statusVersion = $state(0);
 /** 笔记改名/删除后 +1，供侧栏与详情页跨组件同步刷新。 */
@@ -39,6 +43,7 @@ export const recording = {
   get partialMic() { return partialMic; },
   get partialSystem() { return partialSystem; },
   get storageDegraded() { return storageDegraded; },
+  get speakers() { return speakers; },
   get statusVersion() { return statusVersion; },
   get notesVersion() { return notesVersion; },
   get pending() { return pending; },
@@ -57,7 +62,8 @@ export const recording = {
       else partialSystem = e.text;
     });
     onFinal((e) => {
-      if (e.text.trim()) finals = [...finals, { source: e.source, text: e.text }];
+      if (e.text.trim())
+        finals = [...finals, { source: e.source, text: e.text, speaker: e.speaker }];
       if (e.source === "mic") partialMic = "";
       else partialSystem = "";
     });
@@ -70,6 +76,7 @@ export const recording = {
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
+        speakers = {};
         statusVersion++;
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
         partialMic = "";
@@ -83,6 +90,11 @@ export const recording = {
     });
     onStorage((e) => {
       storageDegraded = e.state === "degraded";
+    });
+    onSpeakers((e) => {
+      speakers = Object.fromEntries(
+        e.speakers.map((s) => [s.id, { name: s.name, sources: s.sources }]),
+      );
     });
 
     // 事件非粘性：冷启动/刷新时主动查询一次。返回 idle 不覆盖，避免与真实事件竞争。
@@ -130,5 +142,10 @@ export const recording = {
     } finally {
       pending = false;
     }
+  },
+
+  /** 录制中改名说话人；本地 speakers 表由 "speakers" 事件回推更新，无需手动改。 */
+  async renameSpeaker(noteId: string, speakerId: string, name: string) {
+    await renameSpeakerCmd(noteId, speakerId, name);
   },
 };

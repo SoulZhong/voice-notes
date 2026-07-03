@@ -29,16 +29,41 @@ export type SegmentRecord = {
   speaker: string | null;
 };
 
-export type Note = { meta: NoteMeta; segments: SegmentRecord[]; skipped_lines: number };
+export type Note = {
+  meta: NoteMeta;
+  segments: SegmentRecord[];
+  skipped_lines: number;
+  speakers: Record<string, { name: string; sources: string[] }>;
+};
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 export const getNote = (id: string) => invoke<Note>("get_note", { id });
 export const renameNote = (id: string, title: string) =>
   invoke<void>("rename_note", { id, title });
 export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
+export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
+  invoke<void>("rename_speaker", { noteId, speakerId, name });
 /** 返回导出文件绝对路径 */
 export const exportNote = (id: string, format: "md" | "txt") =>
   invoke<string>("export_note", { id, format });
+
+/** 显示名:名字 > 「说话人 N」;null → 按来源 我/对方 */
+export function speakerLabel(
+  speaker: string | null,
+  source: Source,
+  speakers: Record<string, { name: string }>,
+): string {
+  if (!speaker) return source === "mic" ? "我" : "对方";
+  const name = speakers[speaker]?.name;
+  return name || `说话人 ${speaker.replace(/^S/, "")}`;
+}
+/** 稳定调色板:S1..Sn 循环取色(亮/暗色下均可读) */
+const PALETTE = ["#396cd8", "#2e9e5b", "#b5651d", "#8e44ad", "#c0392b", "#16808a", "#946200", "#5d6d7e"];
+export function speakerColor(speaker: string | null, source: Source): string {
+  if (!speaker) return source === "mic" ? "#396cd8" : "#2e9e5b";
+  const n = parseInt(speaker.replace(/^S/, ""), 10) || 0;
+  return PALETTE[(n - 1) % PALETTE.length];
+}
 
 /** 00:01:23 */
 export function formatTs(ms: number): string {

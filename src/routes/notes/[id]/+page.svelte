@@ -9,9 +9,11 @@
     formatTs,
     formatDate,
     formatDuration,
+    speakerLabel,
+    speakerColor,
     type Note,
   } from "$lib/notes";
-  import type { Source } from "$lib/events";
+  import SpeakerChips from "$lib/SpeakerChips.svelte";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -20,9 +22,6 @@
   let exportMsg = $state("");
 
   const id = $derived($page.params.id as string);
-
-  const label = (source: Source, speaker: string | null) =>
-    speaker ?? (source === "mic" ? "我" : "对方");
 
   function durationSecs(n: Note): number | null {
     if (n.meta.ended_at && n.meta.started_at) {
@@ -122,11 +121,21 @@
       {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
     </div>
 
+    <SpeakerChips
+      speakers={note.speakers}
+      noteId={id}
+      editable={true}
+      onRenamed={() => {
+        refresh();
+        recording.bumpNotes();
+      }}
+    />
+
     <div class="transcript">
       {#each note.segments as seg (seg.seq)}
         <p class="final">
-          <span class="badge" class:mic={seg.source === "mic"} class:system={seg.source === "system"}>
-            {label(seg.source, seg.speaker)}
+          <span class="badge" style="background: {speakerColor(seg.speaker, seg.source)}">
+            {speakerLabel(seg.speaker, seg.source, note.speakers)}
           </span>
           <span class="ts">{formatTs(seg.start_ms)}</span>
           {seg.text}
@@ -201,12 +210,6 @@
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
     color: #fff;
-  }
-  .badge.mic {
-    background: #396cd8;
-  }
-  .badge.system {
-    background: #2e9e5b;
   }
   .ts {
     color: #999;
