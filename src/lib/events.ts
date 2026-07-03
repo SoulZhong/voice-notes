@@ -11,10 +11,19 @@ export type FinalEvent = {
   end_ms: number;
   speaker: string | null;
 };
-export type StatusEvent = { state: string; system_audio: SystemAudio; note_id: string };
+export type Diarization = "on" | "unavailable" | "";
+export type StatusEvent = {
+  state: string;
+  system_audio: SystemAudio;
+  note_id: string;
+  diarization: Diarization;
+};
 export type StorageEvent = { state: "ok" | "degraded" };
 export type SpeakerEntry = { id: string; name: string; sources: Source[] };
-export type SpeakersEvent = { speakers: SpeakerEntry[] };
+export type SpeakersEvent = {
+  speakers: SpeakerEntry[];
+  merged: { loser: string; winner: string } | null;
+};
 
 export function onPartial(cb: (e: PartialEvent) => void) {
   return listen<PartialEvent>("partial", (ev) => cb(ev.payload));

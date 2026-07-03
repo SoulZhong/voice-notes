@@ -8,6 +8,7 @@ import {
   onSpeakers,
   type Source,
   type SystemAudio,
+  type Diarization,
   type StatusEvent,
 } from "./events";
 
@@ -16,6 +17,7 @@ export type SpeakerMap = Record<string, { name: string; sources: string[] }>;
 
 let status = $state("idle");
 let systemAudio = $state<SystemAudio>("");
+let diarization = $state<Diarization>("");
 let noteId = $state("");
 let finals = $state<Line[]>([]);
 let partialMic = $state("");
@@ -37,6 +39,7 @@ let initialized = false;
 export const recording = {
   get status() { return status; },
   get systemAudio() { return systemAudio; },
+  get diarization() { return diarization; },
   get noteId() { return noteId; },
   get finals() { return finals; },
   get partialMic() { return partialMic; },
@@ -69,6 +72,7 @@ export const recording = {
     onStatus((e) => {
       status = e.state;
       systemAudio = e.system_audio;
+      diarization = e.diarization;
       if (e.state === "recording") {
         noteId = e.note_id;
         finals = [];
@@ -91,6 +95,11 @@ export const recording = {
       storageDegraded = e.state === "degraded";
     });
     onSpeakers((e) => {
+      // 先把已上屏历史段的 loser id 改写为 winner，使历史徽章与合并后的新段统一。
+      if (e.merged) {
+        const { loser, winner } = e.merged;
+        finals = finals.map((l) => (l.speaker === loser ? { ...l, speaker: winner } : l));
+      }
       speakers = Object.fromEntries(
         e.speakers.map((s) => [s.id, { name: s.name, sources: s.sources }]),
       );
@@ -101,6 +110,7 @@ export const recording = {
     if (s.state === "recording") {
       status = s.state;
       systemAudio = s.system_audio;
+      diarization = s.diarization;
       noteId = s.note_id;
     }
   },
@@ -122,6 +132,7 @@ export const recording = {
         if (s.state === "recording") {
           status = s.state;
           systemAudio = s.system_audio;
+          diarization = s.diarization;
           noteId = s.note_id;
         }
         return false;

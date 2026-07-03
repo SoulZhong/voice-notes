@@ -33,6 +33,8 @@ struct ActiveSession {
     note_id: String,
     /// classify_system 的结果："on" | "denied" | "unavailable"，供重挂载时重建状态。
     system_audio: String,
+    /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
+    diarization: String,
 }
 
 #[derive(Default)]
@@ -145,7 +147,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new() });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new() });
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -161,6 +163,8 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         // 时不现场加载——预载失败即降级为无声纹（说话人区分不可用），而不是在
         // 开录路径上额外背一次模型加载的延迟/失败风险。
         let embedder = embedder_cache.lock().unwrap().take();
+        // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
+        let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
         // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
         let vad_path = models_dir().join("silero_vad.onnx");
@@ -275,10 +279,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                         })
                         .collect();
                     drop(w);
-                    let _ = app_d.emit("speakers", ipc::SpeakersEvent { speakers });
+                    let _ = app_d.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
                 }
                 session::DiarEvent::Merged { loser, winner } => {
                     let mut w = writer_d.lock().unwrap();
+                    // 落盘失败也照发 merged：内存/前端先统一（历史段徽章回写），
+                    // 磁盘落后由 storage degraded 告警，finalize 兜底再补。
                     if let Err(e) = w.merge_speaker(&loser, &winner) {
                         eprintln!("说话人合并重写失败({loser}->{winner}): {e}");
                         let _ = app_d.emit("storage", ipc::StorageEvent { state: "degraded".into() });
@@ -293,7 +299,13 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                         })
                         .collect();
                     drop(w);
-                    let _ = app_d.emit("speakers", ipc::SpeakersEvent { speakers });
+                    let _ = app_d.emit(
+                        "speakers",
+                        ipc::SpeakersEvent {
+                            speakers,
+                            merged: Some(ipc::MergedPair { loser, winner }),
+                        },
+                    );
                 }
             },
         );
@@ -346,11 +358,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     writer: writer.clone(),
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
+                    diarization: diarization.clone(),
                 });
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone() },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization },
                 );
             }
             Err(se) => {
@@ -391,7 +404,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     }
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new() },
     );
 }
 
@@ -403,11 +416,13 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
             state: "recording".into(),
             system_audio: s.system_audio.clone(),
             note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
         },
         None => ipc::StatusEvent {
             state: "idle".into(),
             system_audio: String::new(),
             note_id: String::new(),
+            diarization: String::new(),
         },
     }
 }
@@ -455,9 +470,10 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
     store::NoteStore::new(dir).delete(&id).map_err(|e| e.to_string())
 }
 
-/// 改说话人显示名：录制中的笔记也允许改——speakers.json 走 NoteStore 直写，不经
-/// finalize 内存态覆写（与标题改名不同，标题改名对活动会话是拒绝的）。
-/// 若为活动会话，同步更新 writer 内存表（防后续 sync_speakers 用空名覆写）并广播。
+/// 改说话人显示名：录制中的笔记也允许改。
+/// 活动会话走 writer 单写者路径——在 writer 锁内改内存表并 persist_speakers 原子落盘，
+/// 与 worker 线程的 sync_speakers 共用同一把锁、同一原子写，杜绝互相覆盖窗口（不再经
+/// NoteStore 直写）；非活动笔记才走 NoteStore::rename_speaker 直写磁盘。
 #[tauri::command]
 fn rename_speaker(
     app: AppHandle,
@@ -470,14 +486,12 @@ fn rename_speaker(
     if name.is_empty() {
         return Err("名字不能为空".into());
     }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .rename_speaker(&note_id, &speaker_id, name)
-        .map_err(|e| e.to_string())?;
+    // 活动会话：writer 锁内改名 + 落盘 + 广播，单写者不与 sync_speakers 竞争。
     if let Some(s) = state.session.lock().unwrap().as_ref() {
         if s.note_id == note_id {
             let mut w = s.writer.lock().unwrap();
             w.set_speaker_name(&speaker_id, name);
+            let persisted = w.persist_speakers();
             let speakers = w
                 .speakers()
                 .iter()
@@ -488,10 +502,16 @@ fn rename_speaker(
                 })
                 .collect();
             drop(w);
-            let _ = app.emit("speakers", ipc::SpeakersEvent { speakers });
+            persisted.map_err(|e| format!("说话人改名落盘失败: {e}"))?;
+            let _ = app.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
+            return Ok(());
         }
     }
-    Ok(())
+    // 非活动笔记：直写磁盘。
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .rename_speaker(&note_id, &speaker_id, name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -520,8 +540,11 @@ pub fn run() {
                         Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
                     }
                 }
-                drop(slot);
-
+                // 锁序：预载是唯一嵌套持两槽者——在仍持 recognizer 槽锁期间嵌套获取
+                // embedder 槽锁，消除释放 recognizer 锁到锁定 embedder 锁之间的间隙
+                // （否则开录线程可在间隙 take 到尚空的 embedder，静默无声纹）。开录
+                // 线程从不同时持两槽（先 take recognizer 后 take embedder，各自即刻释放），
+                // 故无死锁。
                 let mut eslot = embedder_cache.lock().unwrap();
                 if eslot.is_none() {
                     match diar::SherpaEmbedder::new(&speaker_model_path()) {
@@ -529,6 +552,8 @@ pub fn run() {
                         Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
                     }
                 }
+                drop(eslot);
+                drop(slot);
             });
             Ok(())
         })

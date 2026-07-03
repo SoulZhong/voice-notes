@@ -117,9 +117,22 @@ impl NoteWriter {
     /// ended_at 写入、state 置 complete 并原子落盘。
     pub fn finalize(&mut self, now: DateTime<Local>) -> anyhow::Result<()> {
         self.flush_pending()?;
+        // 兜底落盘说话人表：活动会话期间改名/归簇均只改内存 + 增量落盘，
+        // 收尾时再确保磁盘与内存一致（失败不阻塞主流程，仅告警）。
+        if !self.speakers.is_empty() {
+            if let Err(e) = self.persist_speakers() {
+                eprintln!("finalize: speakers.json 落盘失败（不阻塞收尾）: {e}");
+            }
+        }
         self.meta.ended_at = Some(now.to_rfc3339());
         self.meta.state = "complete".into();
         write_meta_atomic(&self.dir, &self.meta)
+    }
+
+    /// 从内存说话人表原子落盘 speakers.json（复用 write_speakers_atomic）。
+    /// 供活动会话改名走单写者路径（rename_speaker command）与 finalize 兜底调用。
+    pub fn persist_speakers(&self) -> anyhow::Result<()> {
+        write_speakers_atomic(&self.dir, &self.speakers)
     }
 
     /// 合入声纹归簇产生的说话人信息：只增不删，已有名字保留，sources 取并集；
@@ -152,7 +165,10 @@ impl NoteWriter {
         self.flush_pending()?;
 
         let path = self.dir.join("segments.jsonl");
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        // 读失败（瞬时 IO 错误）绝不能当空串：否则下方原子替换会把整场转写
+        // 覆写成空文件，静默丢失全部内容。中止合并，内存 speakers 表此时未动。
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（合并中止，避免清空）: {e}"))?;
         let mut out = String::new();
         for line in content.lines() {
             match serde_json::from_str::<SegmentRecord>(line) {
@@ -411,5 +427,51 @@ mod tests {
         assert!(note.speakers.contains_key("S1"));
         assert!(!note.speakers.contains_key("S2"));
         assert!(note.speakers["S1"].sources.contains(&"system".to_string()), "sources 并入");
+    }
+
+    #[test]
+    fn merge_speaker_read_failure_leaves_data_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2")).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
+
+        // 构造读失败：丢弃句柄、删掉 segments.jsonl 并在同名处建目录，
+        // read_to_string 必失败（"Is a directory"）。
+        let path = w.dir().join("segments.jsonl");
+        w.file = None;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        // 合并必须返回 Err 且不 panic；内存 speakers 表不得已被修改（S2 仍在）。
+        assert!(w.merge_speaker("S2", "S1").is_err(), "读失败应中止合并而非清空");
+        assert!(w.speakers().contains_key("S2"), "Err 路径下 speakers 表未被改动");
+        assert!(w.speakers().contains_key("S1"));
+
+        // 恢复（删目录）后不再触发路径存在的清空——重点是上面的 Err 与不 panic。
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn persist_speakers_reloads_and_finalize_syncs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+
+        // set_speaker_name + persist_speakers 后重开 NoteStore.load，名字应在磁盘上。
+        w.set_speaker_name("S1", "张三");
+        w.persist_speakers().unwrap();
+        let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].name, "张三");
+
+        // 再改内存但不显式落盘；finalize 兜底应把磁盘同步到内存态。
+        w.set_speaker_name("S1", "李四");
+        w.finalize(now()).unwrap();
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.speakers["S1"].name, "李四", "finalize 兜底落盘 speakers");
+        assert_eq!(note.speakers, *w.speakers(), "speakers.json 与内存一致");
     }
 }

@@ -26,6 +26,10 @@
     </div>
   {/if}
 
+  {#if recording.isRecording && recording.diarization === "unavailable"}
+    <div class="banner">说话人区分不可用（声纹模型缺失）。转写与录音不受影响。</div>
+  {/if}
+
   {#if recording.storageDegraded}
     <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
   {/if}

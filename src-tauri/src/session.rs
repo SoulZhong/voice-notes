@@ -46,7 +46,9 @@ pub fn run_asr_worker(
     mut on_diar: impl FnMut(DiarEvent),
 ) -> (Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>) {
     let mut registry = SpeakerRegistry::new();
-    let mut known_speakers = 0usize;
+    // 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
+    // 已有簇 sources 增长等变化都能被捕获并同步。
+    let mut last_sent: Vec<crate::diar::registry::SpeakerInfo> = Vec::new();
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
@@ -83,8 +85,8 @@ pub fn run_asr_worker(
                     on_diar(DiarEvent::Merged { loser, winner });
                 }
                 let speakers = registry.speakers();
-                if speakers.len() != known_speakers {
-                    known_speakers = speakers.len();
+                if speakers != last_sent {
+                    last_sent = speakers.clone();
                     on_diar(DiarEvent::SpeakersChanged(speakers));
                 }
                 on_final(job.source, text, job.start_ms, job.end_ms, speaker);
@@ -427,6 +429,41 @@ mod asr_worker_tests {
             vec![Some("S1".into()), Some("S2".into())]
         );
         assert!(*diar_events.lock().unwrap() >= 2, "每个新说话人应发 SpeakersChanged");
+    }
+
+    #[test]
+    fn same_speaker_growing_sources_reemits_speakers() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // 同一说话人两段，不同 source（两次同向量 → 都归入 S1，sources 从 {mic} 增长到 {mic,system}）。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 2000, end_ms: 4000 }).unwrap();
+        drop(tx);
+
+        let embedder = MockEmbedder::new(vec![
+            Ok(vec![1.0, 0.0, 0.0]),
+            Ok(vec![1.0, 0.0, 0.0]),
+        ]);
+        let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let diar_events = Arc::new(Mutex::new(0usize));
+        let (f2, d2) = (finals.clone(), diar_events.clone());
+        let _ = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            rx,
+            vec![],
+            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            |_, _| {},
+            move |_ev| *d2.lock().unwrap() += 1,
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![Some("S1".into()), Some("S1".into())],
+            "两段同说话人"
+        );
+        assert!(
+            *diar_events.lock().unwrap() >= 2,
+            "sources 增长应再发一次 SpeakersChanged（全量比较，非仅 len）"
+        );
     }
 
     #[test]

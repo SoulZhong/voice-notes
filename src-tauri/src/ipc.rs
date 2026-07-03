@@ -15,6 +15,8 @@ pub struct StatusEvent {
     pub system_audio: String,
     /// 本次会话的笔记 id；recording / stopped 时携带，其余为空串。
     pub note_id: String,
+    /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（模型缺失，降级）| ""（非录制态）。
+    pub diarization: String,
 }
 
 /// 一句定稿文本，事件名 "final"。
@@ -44,7 +46,16 @@ pub struct SpeakerEntry {
     pub sources: Vec<String>,
 }
 
+/// 一次簇合并：loser 的历史段应在前端改写为 winner，使历史徽章与新段统一。
+#[derive(Debug, Clone, Serialize)]
+pub struct MergedPair {
+    pub loser: String,
+    pub winner: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeakersEvent {
     pub speakers: Vec<SpeakerEntry>,
+    /// 本次事件伴随的簇合并（仅 Merged 分支非 None）；前端据此回写已上屏历史段。
+    pub merged: Option<MergedPair>,
 }
