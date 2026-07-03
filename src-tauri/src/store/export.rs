@@ -56,7 +56,7 @@ fn header_line(note: &Note) -> Option<String> {
     {
         Some(end) => {
             let dur = human_duration((end - start).num_seconds().max(0) as u64);
-            Some(format!("{start_str} – {}（{dur}）", end.format("%H:%M")))
+            Some(format!("{start_str} – {}({dur})", end.format("%H:%M")))
         }
         None => Some(format!("{start_str} – 中断")),
     }
@@ -80,12 +80,11 @@ pub(super) fn render_markdown(note: &Note) -> String {
 }
 
 pub(super) fn render_text(note: &Note) -> String {
-    let mut out = format!("{}\n", note.meta.title);
+    let mut out = format!("{}\n\n", note.meta.title);
     if let Some(h) = header_line(note) {
         out.push_str(&h);
-        out.push('\n');
+        out.push_str("\n\n");
     }
-    out.push('\n');
     for seg in &note.segments {
         out.push_str(&format!(
             "[{}] {} {}\n",
@@ -165,5 +164,61 @@ mod tests {
             skipped_lines: 0,
         };
         assert!(render_markdown(&note).contains("**[张三] 00:00:00** hi"));
+    }
+
+    #[test]
+    fn header_line_covers_normal_interrupted_and_corrupt() {
+        // Test normal case: both started_at and ended_at are valid
+        let note_normal = crate::store::Note {
+            meta: crate::store::NoteMeta {
+                schema_version: 1,
+                id: "x".into(),
+                title: "t".into(),
+                started_at: "2026-07-03T15:04:00+08:00".into(),
+                ended_at: Some("2026-07-03T16:12:00+08:00".into()),
+                state: "complete".into(),
+            },
+            segments: vec![],
+            skipped_lines: 0,
+        };
+        let md_normal = render_markdown(&note_normal);
+        assert!(md_normal.contains("2026-07-03 15:04 – 16:12(1 小时 8 分)"),
+            "normal case should contain time range with half-width brackets: {md_normal}");
+
+        // Test interrupted case: ended_at is None
+        let note_interrupted = crate::store::Note {
+            meta: crate::store::NoteMeta {
+                schema_version: 1,
+                id: "x".into(),
+                title: "t".into(),
+                started_at: "2026-07-03T15:04:00+08:00".into(),
+                ended_at: None,
+                state: "complete".into(),
+            },
+            segments: vec![],
+            skipped_lines: 0,
+        };
+        let md_interrupted = render_markdown(&note_interrupted);
+        assert!(md_interrupted.contains("2026-07-03 15:04 – 中断"),
+            "interrupted case should contain 中断: {md_interrupted}");
+
+        // Test corrupt case: started_at is empty
+        let note_corrupt = crate::store::Note {
+            meta: crate::store::NoteMeta {
+                schema_version: 1,
+                id: "x".into(),
+                title: "t".into(),
+                started_at: String::new(),
+                ended_at: None,
+                state: "complete".into(),
+            },
+            segments: vec![],
+            skipped_lines: 0,
+        };
+        let md_corrupt = render_markdown(&note_corrupt);
+        assert!(!md_corrupt.contains(" – "),
+            "corrupt case should not contain ` – ` (header_line skipped): {md_corrupt}");
+        assert!(md_corrupt.contains("# t"),
+            "corrupt case should still contain title: {md_corrupt}");
     }
 }
