@@ -16,6 +16,7 @@ pub fn run_segment_worker(
     partial_slot: Arc<Mutex<Option<PartialJob>>>,
     mut segmenter: Box<dyn Segmenter>,
 ) {
+    let ms = |samples: usize| samples as u64 * 1000 / target_rate as u64;
     let mut since_partial: usize = 0;
     for frame in frame_rx.iter() {
         let mono = to_mono(&frame.samples, frame.channels);
@@ -25,7 +26,11 @@ pub fn run_segment_worker(
 
         for seg in segmenter.take_finished() {
             *partial_slot.lock().unwrap() = None; // 定稿：清过时预览
-            if finals_tx.send(FinalJob { source, samples: seg.samples }).is_err() {
+            let (start_ms, end_ms) = (ms(seg.start), ms(seg.start + seg.samples.len()));
+            if finals_tx
+                .send(FinalJob { source, samples: seg.samples, start_ms, end_ms })
+                .is_err()
+            {
                 eprintln!("segment_worker: finals 通道已关闭，一段完成句被丢弃 ({source:?})");
             }
             since_partial = 0;
@@ -42,7 +47,11 @@ pub fn run_segment_worker(
     segmenter.flush();
     for seg in segmenter.take_finished() {
         *partial_slot.lock().unwrap() = None;
-        if finals_tx.send(FinalJob { source, samples: seg.samples }).is_err() {
+        let (start_ms, end_ms) = (ms(seg.start), ms(seg.start + seg.samples.len()));
+        if finals_tx
+            .send(FinalJob { source, samples: seg.samples, start_ms, end_ms })
+            .is_err()
+        {
             eprintln!("segment_worker: finals 通道已关闭，一段完成句被丢弃 ({source:?})");
         }
     }
@@ -87,6 +96,12 @@ mod tests {
         assert!(!finals.is_empty(), "应至少产出一个 final");
         assert!(finals.iter().all(|f| f.source == Source::System), "全部带 System 标记");
         assert!(finals.iter().all(|f| !f.samples.is_empty()), "final 样本非空");
+        // 时间戳：fixture 417ms @16k；MockSegmenter(8000) 未达到 utterance_len，flush 产出一个段
+        assert_eq!(finals[0].start_ms, 0);
+        assert!(finals[0].end_ms > 400 && finals[0].end_ms < 420, "首段约 417ms");
+        if finals.len() > 1 {
+            assert!(finals[1].start_ms >= finals[0].end_ms, "后续段时间戳递增");
+        }
     }
 
     /// Fix B: when the throttle fires and current_partial() returns None, the slot must be
