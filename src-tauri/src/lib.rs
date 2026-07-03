@@ -346,6 +346,7 @@ fn spawn_session(
                     writer_d.lock().unwrap().store_centroids(&snaps);
                 }
             },
+            None, // Task 6 接真麦克风电平回调
         );
 
         match start {
