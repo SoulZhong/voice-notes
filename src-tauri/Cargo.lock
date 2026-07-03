@@ -436,6 +436,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+dependencies = [
+ "bzip2-sys",
+]
+
+[[package]]
 name = "bzip2-sys"
 version = "0.1.13+1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3546,7 +3555,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591c9432b20f41d47f622a73c2888b188c321e313d820824df7d9fa51dbada43"
 dependencies = [
  "bindgen 0.69.5",
- "bzip2",
+ "bzip2 0.4.4",
  "cmake",
  "dirs 5.0.1",
  "flate2",
@@ -4559,6 +4568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "log",
  "once_cell",
  "rustls",
@@ -4634,20 +4644,25 @@ name = "voice-notes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bzip2 0.5.2",
  "chrono",
  "coreaudio-rs 0.12.1",
  "cpal",
  "crossbeam-channel",
+ "hex",
  "hound",
  "screencapturekit",
  "serde",
  "serde_json",
+ "sha2",
  "sherpa-rs",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tempfile",
  "thiserror 1.0.69",
+ "ureq",
 ]
 
 [[package]]

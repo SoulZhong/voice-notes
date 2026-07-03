@@ -3,6 +3,8 @@
 //! 目录解析顺序：VN_MODELS 环境变量 → debug 构建下的 src-tauri/models（开发机零迁移）
 //! → 生产默认 app_data_dir/models（setup 时经 init_app_root 注入）。
 
+pub mod download;
+
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
