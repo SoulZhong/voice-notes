@@ -1,179 +1,154 @@
-# P2 Task 1 Report: screencapturekit 依赖 + 系统声音 spike
+# Task 1: Segment 带流内样本偏移 - Report
 
 ## Status: DONE
 
 ---
 
-## What Was Done
+## What Was Implemented
 
-### Step 1: Added dependency (macOS-only)
+Successfully implemented sample offset tracking (`start` field) for the `Segment` struct to support timestamp calculation in Task 2. The implementation follows strict TDD: tests first (RED) → implement (GREEN) → verify → commit.
 
-Added to `src-tauri/Cargo.toml`:
-```toml
-[target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = { version = "8", features = ["macos_13_0"] }
+### 1. Segment Structure Update
+- Added `start: usize` field to track the offset (in samples at 16kHz mono) of each segment's first sample relative to the audio stream start
+- Documentation: "段首样本相对该源音频流开始的偏移（16kHz 单声道样本数）"
+
+### 2. MockSegmenter Changes
+- Added `current_start: usize` field to track the start offset of the current utterance
+- Updated `accept()` method to:
+  - Emit segments with `start: self.current_start`
+  - Increment `current_start` by `utterance_len` after each segment
+- Updated `flush()` method to:
+  - Emit remainder with correct `start: self.current_start`
+  - Increment offset by remainder length
+
+### 3. SileroSegmenter Changes  
+- Updated `take_finished()` to pass `seg.start.max(0) as usize` from sherpa's `SpeechSegment.start` (i32)
+- Handles potential negative values safely with `.max(0)`
+
+---
+
+## TDD Evidence
+
+### RED: Tests Fail (Step 2)
+
+Command:
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml segmenter
 ```
 
-Resolved to `screencapturekit = "8.0.0"`.
-
-### Step 2: Wrote probe (`src-tauri/tests/sckit_probe.rs`)
-
-Created `#[ignore]` probe with `#![cfg(target_os = "macos")]` gate. One API correction vs. the brief's illustrative code: `sample.get_audio_buffer_list()` → `sample.audio_buffer_list()` (see API Deviations below).
-
-### Step 3: Compiled probe
-
+Expected failure (4 compilation errors on missing `start` field):
 ```
-cd src-tauri && cargo test --test sckit_probe --no-run
+error[E0609]: no field `start` on type `segmenter::Segment`
+  --> src/pipeline/segmenter.rs:69:28
+   |
+69 |         assert_eq!(segs[0].start, 0, "首段起点为 0");
+   |                            ^^^^^ unknown field
+   |
+   = note: available field is: `samples`
+
+error[E0609]: no field `start` on type `segmenter::Segment`
+  --> src/pipeline/segmenter.rs:76:28
+   |
+76 |         assert_eq!(segs[0].start, 100, "第二段起点 = 前一段末尾");
+   ...
+```
+
+All 4 assertions in the new tests failed as expected because `Segment` had no `start` field. Compilation aborted.
+
+### GREEN: Tests Pass (Step 4)
+
+Focused test command:
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml segmenter
 ```
 
 Result:
 ```
-   Compiling screencapturekit v8.0.0
-   Compiling voice-notes v0.1.0 (...)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.30s
-  Executable tests/sckit_probe.rs (target/debug/deps/sckit_probe-9887d28a6744db1c)
+running 2 tests
+test pipeline::segmenter::tests::mock_flush_emits_remainder_with_start ... ok
+test pipeline::segmenter::tests::mock_emits_segment_per_utterance_len ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored
 ```
 
-Zero errors. Two pre-existing warnings (unrelated to this task).
-
-### Step 4 (Deferred)
-
-Runtime probe run deferred to final manual smoke session (requires screen-recording permission + audio playback).
-
-### Step 5: Wrote spike findings
-
-Created `.superpowers/sdd/p2-sckit-spike.md` with confirmed API signatures and sources (file:line into crate source), deviation table, and runtime items to confirm at smoke.
-
-### Step 6: Committed
-
-```
-git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tests/sckit_probe.rs .superpowers/sdd/p2-sckit-spike.md
-git commit -m "spike(p2): screencapturekit 依赖 + 系统声音探针与 findings"
+Full test suite:
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
----
-
-## Confirmed Crate API (compile-verified, with file:line)
-
-### `SCStreamOutputTrait`
-
-```rust
-trait SCStreamOutputTrait: Send + Sync + 'static {
-    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType);
-}
+Result:
 ```
-Source: `screencapturekit-8.0.0/src/stream/output_trait.rs`
-
-### `SCStreamOutputType::Audio`
-
-```rust
-pub enum SCStreamOutputType { Screen, Audio, Microphone }
-```
-Source: `screencapturekit-8.0.0/src/stream/output_type.rs:27`
-
-### `CMSampleBuffer::format_description()`
-
-```rust
-// On CMSampleBuffer struct directly (apple_cf)
-pub fn format_description(&self) -> Option<CMFormatDescription>
-```
-Source: `apple-cf-0.9.3/src/cm/sample_buffer.rs:179`
-
-### `CMSampleBufferExt::audio_buffer_list()`
-
-```rust
-// Trait in prelude — NOT get_audio_buffer_list()
-fn audio_buffer_list(&self) -> Option<AudioBufferList>
-```
-Source: `screencapturekit-8.0.0/src/cm/sample_buffer.rs:331`
-
-### `AudioBufferList`
-
-```rust
-impl AudioBufferList {
-    pub fn num_buffers(&self) -> usize
-    pub fn get(&self, index: usize) -> Option<&AudioBuffer>
-    pub fn iter(&self) -> AudioBufferListIter<'_>
-    pub fn buffer(&self, index: usize) -> Option<AudioBufferRef<'_>>
-}
-```
-Source: `screencapturekit-8.0.0/src/cm/audio.rs:153-195`
-
-### `AudioBuffer`
-
-```rust
-#[repr(C)]
-pub struct AudioBuffer {
-    pub number_channels: u32,
-    pub data_bytes_size: u32,
-    // data_ptr private
-}
-impl AudioBuffer {
-    pub fn data(&self) -> &[u8]   // raw bytes; cast to &[f32] for audio
-}
-```
-Source: `screencapturekit-8.0.0/src/cm/audio.rs:19-98`
-
-### `SCContentFilter` builder
-
-```rust
-SCContentFilter::create()
-    .with_display(&display)
-    .with_excluding_windows(&[])
-    .build()
-```
-Source: `screencapturekit-8.0.0/src/stream/content_filter.rs`
-
-### `SCStreamConfiguration` builder
-
-```rust
-SCStreamConfiguration::new()
-    .with_width(2_u32)
-    .with_height(2_u32)
-    .with_captures_audio(true)
-    .with_sample_rate(48_000_i32)
-    .with_channel_count(2_i32)
-```
-Sources: `screencapturekit-8.0.0/src/stream/configuration/dimensions.rs:45,103` and `audio.rs:187,232,288`
-
-### `SCStream`
-
-```rust
-pub fn new(filter: &SCContentFilter, config: &SCStreamConfiguration) -> SCStream
-pub fn add_output_handler<H: SCStreamOutputTrait>(&mut self, handler: H, output_type: SCStreamOutputType)
-pub fn start_capture(&mut self) -> SCResult<()>
-pub fn stop_capture(&mut self) -> SCResult<()>
+test result: ok. 23 passed; 0 failed; 0 ignored
 ```
 
----
-
-## API Deviations from Brief
-
-| Brief (illustrative) | Real crate v8 API | Impact |
-|---|---|---|
-| `sample.get_audio_buffer_list()` | `sample.audio_buffer_list()` | Fixed in probe; T3 must use `audio_buffer_list()` |
-| All other calls | Match exactly | — |
+- All 23 unit tests passed (including the 2 new segmenter tests)
+- 4 model integration tests ignored (marked with `#[ignore]`, as expected)
+- Zero failures, zero unexpected compiler warnings related to changes
 
 ---
 
 ## Files Changed
 
-- `src-tauri/Cargo.toml` — macOS-gated screencapturekit dep
-- `src-tauri/Cargo.lock` — new crate + transitive deps
-- `src-tauri/tests/sckit_probe.rs` — new ignored probe
-- `.superpowers/sdd/p2-sckit-spike.md` — spike findings
+1. **src-tauri/src/pipeline/segmenter.rs**
+   - Added `start: usize` field to `Segment` struct with doc comment
+   - Modified `MockSegmenter` struct to add `current_start: usize` field
+   - Rewrote `Segmenter` trait implementation (`accept`, `flush`) to properly track and emit offsets
+   - Replaced 2 old tests with 2 new comprehensive tests that assert `start` values
+
+2. **src-tauri/src/pipeline/silero.rs**
+   - Updated `take_finished()` method to pass `start: seg.start.max(0) as usize` when building segments
 
 ---
 
-## Self-Review
+## Self-Review Findings
 
-- Dep correctly gated to macOS only — cross-platform builds unaffected
-- Probe is `#[ignore]` + file-level `#![cfg(target_os = "macos")]` — will not run in CI
-- No production code modified (trait, audio/mod.rs, etc. all unchanged)
-- No new warnings introduced
-- Probe uses `use screencapturekit::prelude::*` which brings in `CMSampleBufferExt` (needed for `audio_buffer_list()`)
+✓ **Complete implementation:** All brief steps 1-5 followed strictly  
+✓ **Tests validate behavior:** Both new tests properly verify offset progression:
+  - Test 1: Multi-segment progression (0 → 100 → 200)
+  - Test 2: Flush remainder handling (offset continues after complete segment)  
+✓ **YAGNI compliance:** Only modified required files and methods  
+✓ **Code style:** Chinese comments preserved, consistent with existing code  
+✓ **No regressions:** Full test suite passes  
+✓ **Compilation:** segment_worker.rs and session.rs compile without changes (they only use `seg.samples`, as specified)  
+✓ **Clean output:** No extraneous warnings from changes  
+
+### Technical Verification
+
+**MockSegmenter test 1 (`mock_emits_segment_per_utterance_len`):**
+- Accepts 60 samples (no segment): `take_finished()` empty ✓
+- Accepts 50 more (110 total ≥ 100): first segment [0, 100) with `start=0` ✓
+- Remainder (10) stays in `current_partial()` ✓
+- Accepts 190 more (200 total ≥ 100): second segment [100, 200) with `start=100` ✓
+- Verifies offset correctly increments by `utterance_len` ✓
+
+**MockSegmenter test 2 (`mock_flush_emits_remainder_with_start`):**
+- Accepts 130 samples: one complete segment [0, 100) + 30 remainder ✓
+- Take finished returns segment with `start=0` ✓
+- Flush emits remainder with `start=100` (offset continues from end of first segment) ✓
+- No `current_partial()` after flush ✓
+
+**SileroSegmenter:**
+- Correctly converts i32 sherpa offset to usize
+- `.max(0)` guards against negative offsets (defensive coding)
+
+---
 
 ## Concerns
 
-- **Runtime deferred**: We know the crate API compiles; whether ScreenCaptureKit actually delivers f32 audio frames is confirmed at smoke only. The decision gate (continue vs. Swift shim) stays open until then.
-- **f32 interpretation**: `AudioBuffer::data()` returns `&[u8]`. T3 will need `bytemuck::cast_slice` or manual `f32::from_le_bytes` to get `&[f32]`. Format (planar vs. interleaved) also needs runtime confirmation.
+None identified. Implementation is straightforward, well-tested, and aligns perfectly with design.
+
+---
+
+## Commit
+
+```
+cfe214d P3 Task 1: Segment 带流内样本偏移
+```
+
+Commit includes:
+- Segment struct with `start: usize` field
+- MockSegmenter offset tracking with `current_start`
+- SileroSegmenter start value passthrough
+- 2 comprehensive unit tests verifying offset behavior
+
+Signed-off: Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
