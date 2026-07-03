@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from "$app/stores";
+  import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import {
@@ -77,6 +78,11 @@
       error = `导出失败: ${e}`;
     }
   }
+
+  async function doResume() {
+    const ok = await recording.resume(id);
+    if (ok) goto("/record");
+  }
 </script>
 
 <main class="container">
@@ -109,7 +115,7 @@
     </p>
 
     {#if note.meta.state === "recording"}
-      <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。</div>
+      <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
     {/if}
     {#if note.skipped_lines > 0}
       <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
@@ -118,6 +124,7 @@
     <div class="row">
       <button onclick={() => doExport("md")}>导出 Markdown</button>
       <button onclick={() => doExport("txt")}>导出纯文本</button>
+      <button disabled={recording.isRecording} onclick={doResume}>继续录制</button>
       {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
     </div>
 

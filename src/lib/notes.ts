@@ -41,6 +41,7 @@ export const getNote = (id: string) => invoke<Note>("get_note", { id });
 export const renameNote = (id: string, title: string) =>
   invoke<void>("rename_note", { id, title });
 export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
+export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
 /** 返回导出文件绝对路径 */
