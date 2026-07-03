@@ -21,6 +21,9 @@ let partialSystem = $state("");
 let storageDegraded = $state(false);
 /** recording/stopped/error 翻转时 +1，侧栏据此刷新列表。 */
 let statusVersion = $state(0);
+/** 笔记改名/删除后 +1，供侧栏与详情页跨组件同步刷新。 */
+let notesVersion = $state(0);
+let pending = $state(false);
 
 let initialized = false;
 
@@ -37,7 +40,12 @@ export const recording = {
   get partialSystem() { return partialSystem; },
   get storageDegraded() { return storageDegraded; },
   get statusVersion() { return statusVersion; },
+  get notesVersion() { return notesVersion; },
+  get pending() { return pending; },
   get isRecording() { return status === "recording"; },
+
+  /** 笔记改名/删除后调用，驱动侧栏与详情页统一刷新。 */
+  bumpNotes() { notesVersion++; },
 
   /** 幂等：注册事件监听 + 用 recording_status 重建冷启动状态。 */
   async init() {
@@ -86,16 +94,41 @@ export const recording = {
     }
   },
 
-  /** 一键开录。成功由 "recording" 事件驱动 UI；这里只处理同步拒绝。 */
-  async start() {
+  /**
+   * 一键开录。成功由 "recording" 事件驱动 UI；这里只处理同步拒绝。
+   * 返回是否已发起（供调用方决定是否跳转）。
+   */
+  async start(): Promise<boolean> {
+    if (pending || status === "recording") return false;
+    pending = true;
     try {
       await invoke("start_recording");
+      return true;
     } catch (err) {
+      // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
+      if (String(err).includes("已在录制")) {
+        const s = await invoke<StatusEvent>("recording_status");
+        if (s.state === "recording") {
+          status = s.state;
+          systemAudio = s.system_audio;
+          noteId = s.note_id;
+        }
+        return false;
+      }
       status = `error: ${err}`;
+      return false;
+    } finally {
+      pending = false;
     }
   },
 
   async stop() {
-    await invoke("stop_recording");
+    if (pending) return;
+    pending = true;
+    try {
+      await invoke("stop_recording");
+    } finally {
+      pending = false;
+    }
   },
 };

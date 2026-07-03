@@ -9,7 +9,11 @@
     try {
       const notes = await listNotes();
       if (notes.length > 0) {
-        goto(`/notes/${notes[0].id}`, { replaceState: true });
+        if (notes[0].state === "active") {
+          goto("/record", { replaceState: true });
+        } else {
+          goto(`/notes/${notes[0].id}`, { replaceState: true });
+        }
       } else {
         empty = true;
       }

@@ -31,9 +31,10 @@
     }
   }
 
-  // 挂载时 + 录制状态翻转时刷新列表（新笔记出现/徽章变化）。
+  // 挂载时 + 录制状态翻转时 + 笔记改名/删除时刷新列表（新笔记出现/徽章变化/标题变化）。
   $effect(() => {
     void recording.statusVersion;
+    void recording.notesVersion;
     refresh();
   });
 
@@ -41,8 +42,8 @@
     if (recording.isRecording) {
       await recording.stop(); // 跳详情由全局 status 监听驱动
     } else {
-      await recording.start();
-      goto("/record");
+      const started = await recording.start();
+      if (started) goto("/record");
     }
   }
 
@@ -57,16 +58,17 @@
     editingId = null;
     try {
       await renameNote(id, editingTitle);
+      recording.bumpNotes();
     } catch (e) {
       error = `改名失败: ${e}`;
     }
-    await refresh();
   }
 
   async function confirmDelete(id: string) {
     confirmingDeleteId = null;
     try {
       await deleteNote(id);
+      recording.bumpNotes();
       // 删的是当前正在看的笔记 → 回首页
       if ($page.url.pathname === `/notes/${id}`) {
         goto("/");
@@ -74,7 +76,6 @@
     } catch (e) {
       error = `删除失败: ${e}`;
     }
-    await refresh();
   }
 
   const stateBadge = (s: NoteSummary["state"]) =>
@@ -82,7 +83,12 @@
 </script>
 
 <aside class="sidebar">
-  <button class="record-btn" class:recording={recording.isRecording} onclick={toggleRecording}>
+  <button
+    class="record-btn"
+    class:recording={recording.isRecording}
+    onclick={toggleRecording}
+    disabled={recording.pending}
+  >
     {recording.isRecording ? "■ 停止" : "● 开始录制"}
   </button>
 

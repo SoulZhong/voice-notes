@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { recording } from "$lib/recording.svelte";
   import {
     getNote,
     renameNote,
@@ -42,7 +42,14 @@
     }
   }
 
-  onMount(refresh);
+  // id 变化（侧栏切换笔记时组件被复用）或笔记改名/删除时重新加载。
+  $effect(() => {
+    void id;
+    void recording.notesVersion;
+    editing = false;
+    exportMsg = "";
+    refresh();
+  });
 
   function beginRename() {
     if (!note) return;
@@ -55,7 +62,7 @@
     editing = false;
     try {
       await renameNote(id, editingTitle);
-      await refresh();
+      recording.bumpNotes();
     } catch (e) {
       error = `改名失败: ${e}`;
     }
