@@ -38,16 +38,17 @@ pub enum DiarEvent {
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
 /// 每条 final 定稿时额外提声纹嵌入并归簇（嵌入失败/无 embedder/panic 均降级为 None，绝不影响文本）；
 /// 归簇产生的簇合并 / 说话人表变化通过 on_diar 通知（顺序：先 Merged 后 SpeakersChanged）。
+#[allow(clippy::too_many_arguments)]
 pub fn run_asr_worker(
     mut recognizer: Box<dyn Recognizer>,
     mut embedder: Option<Box<dyn SpeakerEmbedder>>,
+    mut registry: SpeakerRegistry,
     finals_rx: Receiver<FinalJob>,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
     mut on_final: impl FnMut(Source, String, u64, u64, Option<String>),
     mut on_partial: impl FnMut(Source, String),
     mut on_diar: impl FnMut(DiarEvent),
 ) -> (Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>) {
-    let mut registry = SpeakerRegistry::new();
     // 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
     // 已有簇 sources 增长等变化都能被捕获并同步。
     let mut last_sent: Vec<crate::diar::registry::SpeakerInfo> = Vec::new();
@@ -180,6 +181,7 @@ pub fn start_session(
     sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)>,
     recognizer: Box<dyn Recognizer>,
     embedder: Option<Box<dyn SpeakerEmbedder>>,
+    registry: SpeakerRegistry,
     target_rate: u32,
     partial_interval_samples: usize,
     on_final: impl FnMut(Source, String, u64, u64, Option<String>) + Send + 'static,
@@ -236,7 +238,7 @@ pub fn start_session(
     }
 
     let asr = std::thread::spawn(move || {
-        run_asr_worker(recognizer, embedder, finals_rx, slots, on_final, on_partial, on_diar)
+        run_asr_worker(recognizer, embedder, registry, finals_rx, slots, on_final, on_partial, on_diar)
     });
 
     Ok(SessionStart {
@@ -284,6 +286,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(CountingRecognizer),
             None,
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |s, t, start_ms, end_ms, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
@@ -311,6 +314,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(FlakyRecognizer { n: 0 }),
             None,
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
@@ -350,6 +354,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(PanicRecognizer { n: 0 }),
             None,
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
@@ -379,6 +384,7 @@ mod asr_worker_tests {
             let _ = run_asr_worker(
                 Box::new(CountingRecognizer),
                 None,
+                SpeakerRegistry::new(),
                 rx,
                 vec![(Source::System, slot_for_worker)],
                 |_, _, _, _, _| {},
@@ -422,6 +428,7 @@ mod asr_worker_tests {
         let (_r, e) = run_asr_worker(
             Box::new(CountingRecognizer),
             Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
@@ -454,6 +461,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(CountingRecognizer),
             Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
@@ -482,6 +490,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(CountingRecognizer),
             Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
@@ -501,6 +510,7 @@ mod asr_worker_tests {
         let (_r, e) = run_asr_worker(
             Box::new(CountingRecognizer),
             None,
+            SpeakerRegistry::new(),
             rx,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
@@ -523,6 +533,7 @@ mod asr_worker_tests {
         let _ = run_asr_worker(
             Box::new(CountingRecognizer),
             Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
             rx,
             vec![],
             |_, _, _, _, _| {},
@@ -611,6 +622,7 @@ mod session_tests {
             sources,
             Box::new(CountingRecognizer),
             None,
+            SpeakerRegistry::new(),
             16000,
             4000,
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
@@ -650,6 +662,7 @@ mod session_tests {
             sources,
             Box::new(CountingRecognizer),
             None,
+            SpeakerRegistry::new(),
             16000,
             4000,
             |_, _, _, _, _| {},
@@ -676,6 +689,7 @@ mod session_tests {
             sources,
             Box::new(CountingRecognizer),
             None,
+            SpeakerRegistry::new(),
             16000,
             4000,
             |_, _, _, _, _| {},

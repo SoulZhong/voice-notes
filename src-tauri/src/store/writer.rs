@@ -17,6 +17,9 @@ pub struct NoteWriter {
     pending: VecDeque<String>,
     /// 说话人表内存副本，随 sync_speakers/merge_speaker 原子落盘 speakers.json。
     speakers: BTreeMap<String, SpeakerMeta>,
+    /// 续录时间轴偏移：resume 路径 = 上一场最大 end_ms，create 路径恒 0。
+    /// on_final 落盘/emit 前 start_ms/end_ms 均需 + base_ms，保证时间轴连续。
+    base_ms: u64,
 }
 
 impl NoteWriter {
@@ -56,11 +59,74 @@ impl NoteWriter {
             next_seq: 0,
             pending: VecDeque::new(),
             speakers: BTreeMap::new(),
+            base_ms: 0,
+        })
+    }
+
+    /// 续录一场非活动（已中断或已完成）笔记：读 meta（缺失/损坏 → Err）→ 置
+    /// state=recording、ended_at=None 原子写；扫 segments.jsonl 得 next_seq（最大
+    /// 可解析 seq + 1，空文件/全不可解析 → 0）与 base_ms（最大可解析 end_ms，同上
+    /// 兜底 0）——不可解析的尾行（如崩溃截断的半行）与 NoteStore::load 一致地容忍
+    /// 跳过；加载 speakers.json（缺失 → 空表）；重开 append 句柄。
+    pub fn resume(notes_dir: &Path, id: &str) -> anyhow::Result<Self> {
+        super::validate_note_id(id)?;
+        let dir = notes_dir.join(id);
+        if !dir.is_dir() {
+            anyhow::bail!("笔记不存在: {id}");
+        }
+
+        let meta_str = std::fs::read_to_string(dir.join("meta.json"))
+            .map_err(|e| anyhow::anyhow!("读 meta.json 失败: {e}"))?;
+        let mut meta: NoteMeta = serde_json::from_str(&meta_str)
+            .map_err(|e| anyhow::anyhow!("meta.json 解析失败: {e}"))?;
+        meta.state = "recording".into();
+        meta.ended_at = None;
+        write_meta_atomic(&dir, &meta)?;
+
+        let content = std::fs::read_to_string(dir.join("segments.jsonl")).unwrap_or_default();
+        let mut next_seq = 0u64;
+        let mut base_ms = 0u64;
+        for line in content.lines() {
+            if let Ok(rec) = serde_json::from_str::<SegmentRecord>(line) {
+                next_seq = next_seq.max(rec.seq + 1);
+                base_ms = base_ms.max(rec.end_ms);
+            }
+        }
+
+        let speakers: BTreeMap<String, SpeakerMeta> = std::fs::read_to_string(dir.join("speakers.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("segments.jsonl"))?;
+        // 修复截断尾行：崩溃可能发生在写完段字节、写入换行符之前，留下无尾随换行
+        // 的半行。若不修复，后续 append 会把新段字节直接拼接到这半行末尾，破坏其
+        // 后每一行的 JSON 结构（半行本身仍按损坏行被 load 跳过，不受影响）。
+        if !content.is_empty() && !content.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+
+        Ok(Self {
+            dir,
+            meta,
+            file: Some(file),
+            next_seq,
+            pending: VecDeque::new(),
+            speakers,
+            base_ms,
         })
     }
 
     pub fn note_id(&self) -> &str {
         &self.meta.id
+    }
+
+    /// 续录时间轴偏移量（create 路径恒 0，resume 路径 = 续录前最大 end_ms）。
+    pub fn base_ms(&self) -> u64 {
+        self.base_ms
     }
 
     /// 是否已产生过任何定稿段（含仍在待写队列中的）。
@@ -162,9 +228,8 @@ impl NoteWriter {
     }
 
     /// 从内存说话人表中有质心的项构造 registry 快照，供续录时重建 SpeakerRegistry
-    /// （编号续接、质心延续）。本任务(Task 1)只实现，暂无调用者(Task 2 消费)——
-    /// 允许 dead_code。
-    #[allow(dead_code)]
+    /// （编号续接、质心延续）。消费者：lib.rs 的 spawn_session（New/Resume 均调用，
+    /// New 路径表为空 ⇒ 等价 SpeakerRegistry::new()）。
     pub fn registry_snapshot(&self) -> Vec<crate::diar::registry::ClusterSnapshot> {
         self.speakers
             .iter()
@@ -427,6 +492,7 @@ mod tests {
             sources,
             Box::new(CountingRecognizer),
             None,
+            crate::diar::registry::SpeakerRegistry::new(),
             16000,
             4000,
             move |src, text, start_ms, end_ms, spk| {
@@ -614,5 +680,201 @@ mod tests {
         assert_eq!(snaps[0].centroid, vec![1.0, 0.0]);
         assert_eq!(snaps[0].count, 3);
         assert!(snaps[0].sources.contains("mic"));
+    }
+
+    #[test]
+    fn create_path_base_ms_is_always_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = NoteWriter::create(tmp.path(), now()).unwrap();
+        assert_eq!(w.base_ms(), 0);
+    }
+
+    #[test]
+    fn resume_flips_meta_back_to_recording_continues_seq_and_base_ms_and_loads_speakers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "第一句", 0, 1500, None).unwrap();
+        w.append_final("system", "第二句", 1500, 3000, None).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.finalize(now()).unwrap();
+        assert_eq!(read_meta(&tmp.path().join(&id)).state, "complete");
+
+        let mut r = NoteWriter::resume(tmp.path(), &id).unwrap();
+        assert_eq!(r.note_id(), id, "续录复用同一 id/目录");
+        assert_eq!(r.base_ms(), 3000, "base_ms = 续录前最大 end_ms");
+        let meta = read_meta(r.dir());
+        assert_eq!(meta.state, "recording", "resume 后 meta 翻回 recording");
+        assert!(meta.ended_at.is_none(), "resume 后 ended_at 清空");
+        assert!(r.speakers().contains_key("S1"), "speakers.json 应加载进内存表");
+
+        // resume 后追加：seq 应从 2 续接（此前两段 seq=0,1）。
+        r.append_final("mic", "第三句", 0, 1000, None).unwrap();
+        let lines = read_lines(r.dir());
+        assert_eq!(lines.len(), 3);
+        let rec2: SegmentRecord = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(rec2.seq, 2, "resume 后追加的 seq 续接而非从 0 重来");
+    }
+
+    #[test]
+    fn resume_of_never_finalized_recording_also_works() {
+        // 续录语义不限于 complete：中断（仍是 recording 态）的笔记同样可续录。
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "崩溃前", 0, 800, None).unwrap();
+        // 不 finalize，模拟崩溃：meta 仍是 recording。
+
+        let r = NoteWriter::resume(tmp.path(), &id).unwrap();
+        assert_eq!(r.base_ms(), 800);
+        let meta = read_meta(r.dir());
+        assert_eq!(meta.state, "recording");
+    }
+
+    #[test]
+    fn resume_tolerates_truncated_tail_line_for_next_seq_and_base_ms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "完整句", 0, 1000, None).unwrap();
+        w.finalize(now()).unwrap();
+
+        // 模拟崩溃写了半行（不可解析，next_seq/base_ms 应只依据可解析行）。
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join(&id).join("segments.jsonl"))
+            .unwrap();
+        f.write_all(b"{\"seq\":1,\"source\":\"mic\",\"te").unwrap();
+        drop(f);
+
+        let mut r = NoteWriter::resume(tmp.path(), &id).unwrap();
+        assert_eq!(r.base_ms(), 1000, "损坏尾行应被跳过，base_ms 取最大可解析 end_ms");
+        r.append_final("mic", "续录句", 0, 500, None).unwrap();
+        // 续录追加的段 seq 应为 1（唯一可解析的前段 seq=0）——证明 next_seq 未被半行干扰到 2。
+        let lines = read_lines(r.dir());
+        let appended: SegmentRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(appended.seq, 1, "next_seq 应据可解析行计算，不被截断尾行带偏");
+    }
+
+    #[test]
+    fn resume_missing_id_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(NoteWriter::resume(tmp.path(), "does-not-exist").is_err());
+    }
+
+    #[test]
+    fn resume_corrupt_meta_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.finalize(now()).unwrap();
+        std::fs::write(tmp.path().join(&id).join("meta.json"), "not json").unwrap();
+        assert!(NoteWriter::resume(tmp.path(), &id).is_err());
+    }
+
+    #[test]
+    fn resume_rejects_path_traversal_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["../x", "a/b", "a\\b", "..", ""] {
+            assert!(NoteWriter::resume(tmp.path(), bad).is_err(), "应拒绝非法 id: {bad}");
+        }
+    }
+
+    /// 集成测试（仿 full_session_persists_every_final）：第一场会话落 N 段 →
+    /// finalize → resume + 新会话再落 M 段（on_final 中 + base_ms，模拟 lib.rs
+    /// spawn_session 的偏移逻辑）→ load 出 N+M 段、seq 单调、后 M 段 start_ms ≥ base_ms。
+    #[test]
+    fn resume_session_continues_seq_and_offsets_timestamps() {
+        use crate::audio::mock::MockCapture;
+        use crate::audio::{AudioCapture, Source};
+        use crate::diar::registry::SpeakerRegistry;
+        use crate::pipeline::segmenter::{MockSegmenter, Segmenter};
+        use crate::store::NoteStore;
+        use std::sync::{Arc, Mutex};
+
+        struct CountingRecognizer;
+        impl crate::asr::Recognizer for CountingRecognizer {
+            fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
+                Ok(crate::asr::Transcript { text: format!("len={}", s.len()) })
+            }
+        }
+
+        fn fixture_sources() -> Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> {
+            let cap = MockCapture::from_wav(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/sample_16k.wav"
+            ))
+            .expect("fixture");
+            vec![(Source::Mic, Box::new(cap), Box::new(MockSegmenter::new(2000)))]
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 第一场会话：落 N 段。
+        let writer = Arc::new(Mutex::new(NoteWriter::create(tmp.path(), now()).unwrap()));
+        let id = writer.lock().unwrap().note_id().to_string();
+        let w2 = writer.clone();
+        let start = crate::session::start_session(
+            fixture_sources(),
+            Box::new(CountingRecognizer),
+            None,
+            SpeakerRegistry::new(),
+            16000,
+            4000,
+            move |src, text, start_ms, end_ms, spk| {
+                w2.lock()
+                    .unwrap()
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .unwrap();
+            },
+            |_, _| {},
+            |_| {},
+        )
+        .expect("start_session");
+        let _ = start.handle.stop();
+        writer.lock().unwrap().finalize(now()).unwrap();
+
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let n = store.load(&id).unwrap().segments.len();
+        assert!(n > 0, "第一场应产出至少一段");
+
+        // 续录：第二场会话，落 M 段（时间戳按 base_ms 偏移，仿 spawn_session 的 on_final）。
+        let resumed = NoteWriter::resume(tmp.path(), &id).unwrap();
+        let base_ms = resumed.base_ms();
+        assert!(base_ms > 0, "续录前应已有非零 end_ms");
+        let writer2 = Arc::new(Mutex::new(resumed));
+        let w3 = writer2.clone();
+        let start2 = crate::session::start_session(
+            fixture_sources(),
+            Box::new(CountingRecognizer),
+            None,
+            SpeakerRegistry::from_snapshot(&writer2.lock().unwrap().registry_snapshot()),
+            16000,
+            4000,
+            move |src, text, start_ms, end_ms, spk| {
+                w3.lock()
+                    .unwrap()
+                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref())
+                    .unwrap();
+            },
+            |_, _| {},
+            |_| {},
+        )
+        .expect("start_session (resumed)");
+        let _ = start2.handle.stop();
+        writer2.lock().unwrap().finalize(now()).unwrap();
+
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.segments.len(), n * 2, "N+M 段一段不丢（同一 fixture，M=N）");
+        assert!(
+            note.segments.windows(2).all(|w| w[1].seq == w[0].seq + 1),
+            "seq 跨会话仍单调续接"
+        );
+        assert!(
+            note.segments[n..].iter().all(|s| s.start_ms >= base_ms),
+            "续录段 start_ms 均 ≥ base_ms（时间轴连续）"
+        );
+        assert_eq!(note.meta.state, "complete", "续录后 stop 仍正常收尾为 complete");
     }
 }

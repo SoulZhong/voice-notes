@@ -15,16 +15,17 @@ use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
 // 锁序约定（必须在任何持锁场景下遵守）：running → generation → session_slot。
-// 只有 start_recording 的加载线程会嵌套持有 running→generation（以及 running→
+// 只有 spawn_session 的加载线程会嵌套持有 running→generation（以及 running→
 // generation→session_slot），且只在极短的检查/存储语句内完成；stop_recording
 // 每条语句只持有一把锁，从不同时持有两把，因此不存在死锁风险。
 //
-// generation 协议：stop_recording 和每次新的 start_recording 都会递增
-// generation。加载线程在耗时的模型/会话初始化完成后，无论是要存 session
-// （成功路径）还是要清空 running（失败路径 fail()），都必须先确认自己捕获的
-// my_gen 仍然等于当前 generation —— 只有仍是"当前代"时，才允许改动共享状态；
-// 否则说明该线程是被后续 stop/start 抢先淘汰的过期加载，直接静默让路，避免
-// 已被覆盖或已被终止的会话把自己的（过期的）结果错误地写回全局状态。
+// generation 协议：stop_recording 和每次新的 spawn_session 调用（start_recording
+// 与 resume_recording 均经它发起，二者的守卫逻辑完全相同）都会递增 generation。
+// 加载线程在耗时的模型/会话初始化完成后，无论是要存 session（成功路径）还是要
+// 清空 running（失败路径 fail()），都必须先确认自己捕获的 my_gen 仍然等于当前
+// generation —— 只有仍是"当前代"时，才允许改动共享状态；否则说明该线程是被后续
+// stop/start/resume 抢先淘汰的过期加载，直接静默让路，避免已被覆盖或已被终止的
+// 会话把自己的（过期的）结果错误地写回全局状态。
 
 /// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
 struct ActiveSession {
@@ -110,30 +111,42 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
     }
 }
 
-#[tauri::command]
-fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 会话加载线程要落盘的目标笔记：New = 新建，Resume = 续录既有非活动笔记
+/// （已中断或已完成均可）。spawn_session 据此分支 writer 的创建方式。
+enum NoteTarget {
+    New,
+    Resume(String),
+}
+
+/// start_recording / resume_recording 共用的会话启动实现：running/generation
+/// 守卫（拒绝重复录制、递增 generation）+ 加载线程 spawn。二者的运行守卫与
+/// 竞态处理完全一致（同一份代码），仅 target 决定 writer 走 create 还是 resume。
+fn spawn_session(
+    app: AppHandle,
+    running: Arc<Mutex<bool>>,
+    generation: Arc<Mutex<u64>>,
+    session_slot: Arc<Mutex<Option<ActiveSession>>>,
+    recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    target: NoteTarget,
+) -> Result<(), String> {
     let my_gen = {
-        let mut r = state.running.lock().unwrap();
+        let mut r = running.lock().unwrap();
         if *r {
             return Err("已在录制".into());
         }
         *r = true;
         // 锁序 running → generation：running 锁仍持有时嵌套锁 generation 并
         // 递增，捕获的 my_gen 即本次会话的"代号"，随线程一起移动。
-        let mut g = state.generation.lock().unwrap();
+        let mut g = generation.lock().unwrap();
         *g += 1;
         *g
     };
-    let running = state.running.clone();
-    let generation = state.generation.clone();
-    let session_slot = state.session.clone();
-    let recognizer_cache = state.recognizer_cache.clone();
-    let embedder_cache = state.embedder_cache.clone();
 
     std::thread::spawn(move || {
         // fail()：加载过程中任何一步失败都会调用。必须先确认 my_gen 仍是当前代
         // 才清空 running / 发出 error —— 否则说明本线程已过期（被后续的
-        // stop/start 淘汰），其失败结果不该覆盖更新的会话状态，静默丢弃即可。
+        // stop/start/resume 淘汰），其失败结果不该覆盖更新的会话状态，静默丢弃即可。
         let fail = |app: &AppHandle, running: &Arc<Mutex<bool>>, generation: &Arc<Mutex<u64>>, my_gen: u64, msg: String| {
             let running_guard = running.lock().unwrap();
             let gen_guard = generation.lock().unwrap();
@@ -201,18 +214,32 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             }
         }
 
-        // 2.5) 创建笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
-        let writer = match notes_dir(&app)
-            .and_then(|d| store::writer::NoteWriter::create(&d, chrono::Local::now()))
-        {
+        // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
+        // New → NoteWriter::create；Resume → NoteWriter::resume（meta 损坏/id 不存在 → Err）。
+        let writer = match notes_dir(&app).and_then(|d| match &target {
+            NoteTarget::New => store::writer::NoteWriter::create(&d, chrono::Local::now()),
+            NoteTarget::Resume(id) => store::writer::NoteWriter::resume(&d, id),
+        }) {
             Ok(w) => Arc::new(Mutex::new(w)),
             Err(e) => {
                 stash_model(&recognizer_cache, Some(recognizer));
                 stash_model(&embedder_cache, embedder);
-                return fail(&app, &running, &generation, my_gen, format!("error: 创建笔记失败: {e}"));
+                let msg = match &target {
+                    NoteTarget::New => format!("error: 创建笔记失败: {e}"),
+                    NoteTarget::Resume(_) => format!("error: 续录笔记失败: {e}"),
+                };
+                return fail(&app, &running, &generation, my_gen, msg);
             }
         };
         let note_id = writer.lock().unwrap().note_id().to_string();
+        // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
+        // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
+        let base_ms = writer.lock().unwrap().base_ms();
+        // 说话人编号/质心延续：New 路径表为空 ⇒ 等价 SpeakerRegistry::new()；
+        // Resume 路径从 speakers.json 已加载的质心表重建（同一人保持同一编号）。
+        let registry = crate::diar::registry::SpeakerRegistry::from_snapshot(
+            &writer.lock().unwrap().registry_snapshot(),
+        );
 
         // 3) 起会话。emit 回调带 source 字符串。
         let app_f = app.clone();
@@ -225,9 +252,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             sources,
             recognizer,
             embedder,
+            registry,
             16000,
             16000,
             move |src, text, start_ms, end_ms, spk| {
+                let start_ms = start_ms + base_ms;
+                let end_ms = end_ms + base_ms;
                 // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
                 match writer_f
                     .lock()
@@ -329,14 +359,14 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
                 // running 锁内完成（锁序 running → generation → session_slot）。
-                // stop_recording 和更新的 start_recording 都会递增 generation；
-                // stop_recording 一律先置 running=false 再取 session，且从不同时
-                // 持有两把锁，因此无论 stop/新 start 发生在加载前、加载中还是加载
-                // 后，与本线程的任意交错都是安全的：
+                // stop_recording 和更新的 spawn_session 调用（新 start 或 resume）都会
+                // 递增 generation；stop_recording 一律先置 running=false 再取 session，
+                // 且从不同时持有两把锁，因此无论 stop/新 start(/resume) 发生在加载前、
+                // 加载中还是加载后，与本线程的任意交错都是安全的：
                 //  - stop 先到（running=false）：这里检测到 running==false，不存
                 //    session、不发 "recording"，直接把刚起好的会话原地停掉，避免
                 //    孤儿会话。
-                //  - 更快的 start #2 先到（running 仍为 true，但 generation 已被
+                //  - 更快的 start/resume #2 先到（running 仍为 true，但 generation 已被
                 //    #2 抢先递增）：这里检测到 gen 不等于 my_gen，说明自己是过期
                 //    加载（T1），同样不存 session、不发 "recording"，原地停掉，让
                 //    路给 #2 稍后存入的 session——修复了"T1 的 handle 被 T2 覆盖
@@ -351,7 +381,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     let (r, e) = start.handle.stop();
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
-                    abort_or_finalize(&writer); // 被 stop/新 start 抢先：有内容则收尾保全（flush 失败时留 recording）
+                    abort_or_finalize(&writer); // 被 stop/新 start(/resume) 抢先：有内容则收尾保全（flush 失败时留 recording）
                     return;
                 }
                 drop(gen_guard);
@@ -382,13 +412,41 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    spawn_session(
+        app,
+        state.running.clone(),
+        state.generation.clone(),
+        state.session.clone(),
+        state.recognizer_cache.clone(),
+        state.embedder_cache.clone(),
+        NoteTarget::New,
+    )
+}
+
+/// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
+/// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
+#[tauri::command]
+fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    spawn_session(
+        app,
+        state.running.clone(),
+        state.generation.clone(),
+        state.session.clone(),
+        state.recognizer_cache.clone(),
+        state.embedder_cache.clone(),
+        NoteTarget::Resume(note_id),
+    )
+}
+
+#[tauri::command]
 fn stop_recording(app: AppHandle, state: State<AppState>) {
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
     // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
     // capture → flush 尾段 → 排干 finals → join）。递增 generation 让任何仍在
     // 加载窗口内的旧线程（无论其 running 检查读到 true 还是 false）都会因
     // generation 不匹配而放弃存 session / 放弃清空 running，从而不会与本次
-    // stop 产生孤儿会话或误清 running 的竞态。与 start_recording 加载线程的
+    // stop 产生孤儿会话或误清 running 的竞态。与 spawn_session 加载线程的
     // 锁序一致（running → generation → session_slot），且本函数从不同时持有
     // 两把锁，所以与加载线程的任意交错都不会死锁。
     { *state.running.lock().unwrap() = false; }
@@ -562,6 +620,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_recording,
+            resume_recording,
             stop_recording,
             recording_status,
             list_notes,

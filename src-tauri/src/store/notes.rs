@@ -19,9 +19,7 @@ impl NoteStore {
 
     /// id 合法性校验（防路径穿越）+ 存在性检查。
     pub(super) fn note_dir(&self, id: &str) -> anyhow::Result<PathBuf> {
-        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-            anyhow::bail!("非法笔记 id: {id:?}");
-        }
+        super::validate_note_id(id)?;
         let dir = self.notes_dir.join(id);
         if !dir.is_dir() {
             anyhow::bail!("笔记不存在: {id}");

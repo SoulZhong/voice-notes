@@ -67,6 +67,14 @@ pub struct NoteSummary {
     pub state: String,
 }
 
+/// 笔记 id 合法性校验（防路径穿越），供 NoteStore::note_dir 与 NoteWriter::resume 共用。
+pub(crate) fn validate_note_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        anyhow::bail!("非法笔记 id: {id:?}");
+    }
+    Ok(())
+}
+
 /// meta.json 原子写：先写 meta.json.tmp 再 rename，任何时刻磁盘上的 meta.json 都完整。
 pub(crate) fn write_meta_atomic(note_dir: &Path, meta: &NoteMeta) -> anyhow::Result<()> {
     let tmp = note_dir.join("meta.json.tmp");
