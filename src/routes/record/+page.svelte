@@ -1,8 +1,21 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import { speakerLabel, speakerColor } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import { modelsStatus, type ModelsStatus } from "$lib/models";
+  import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
+
+  let models = $state<ModelsStatus | null>(null);
+  async function refreshModels() {
+    try {
+      models = await modelsStatus();
+    } catch {
+      /* 查询失败按就绪处理，不挡老用户 */
+    }
+  }
+  onMount(refreshModels);
 
   function isError(s: string) {
     return s.startsWith("error:");
@@ -16,45 +29,54 @@
 
 <div class="container">
   <h1>实时转写</h1>
-  <p class="status" class:error={isError(recording.status)}>状态：{recording.status}</p>
 
-  {#if recording.isRecording && recording.systemAudio !== "on" && recording.systemAudio !== ""}
-    <div class="banner">
-      系统声音不可用（未授权屏幕录制）。仅麦克风在录。
-      <button class="link" onclick={openScreenRecordingSettings}>打开系统设置</button>
-      <span class="hint">授权后重新开录生效。</span>
+  {#if models && !models.recording_ready}
+    <ModelDownloadCard status={models} onComplete={refreshModels} />
+  {:else if models && !models.diarization_ready}
+    <ModelDownloadCard status={models} compact onComplete={refreshModels} />
+  {/if}
+
+  {#if !models || models.recording_ready}
+    <p class="status" class:error={isError(recording.status)}>状态：{recording.status}</p>
+
+    {#if recording.isRecording && recording.systemAudio !== "on" && recording.systemAudio !== ""}
+      <div class="banner">
+        系统声音不可用（未授权屏幕录制）。仅麦克风在录。
+        <button class="link" onclick={openScreenRecordingSettings}>打开系统设置</button>
+        <span class="hint">授权后重新开录生效。</span>
+      </div>
+    {/if}
+
+    {#if recording.isRecording && recording.diarization === "unavailable"}
+      <div class="banner">说话人区分不可用（声纹模型缺失）。转写与录音不受影响。</div>
+    {/if}
+
+    {#if recording.storageDegraded}
+      <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
+    {/if}
+
+    <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
+
+    <div class="transcript">
+      {#each recording.finals as line}
+        <p class="final">
+          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}">
+            {speakerLabel(line.speaker, line.source, recording.speakers)}
+          </span>
+          {line.text}
+        </p>
+      {/each}
+      {#if recording.partialMic}
+        <p class="partial"><span class="badge mic">我</span>{recording.partialMic}</p>
+      {/if}
+      {#if recording.partialSystem}
+        <p class="partial"><span class="badge system">对方</span>{recording.partialSystem}</p>
+      {/if}
+      {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
+        <p class="hint">（开始说话…）</p>
+      {/if}
     </div>
   {/if}
-
-  {#if recording.isRecording && recording.diarization === "unavailable"}
-    <div class="banner">说话人区分不可用（声纹模型缺失）。转写与录音不受影响。</div>
-  {/if}
-
-  {#if recording.storageDegraded}
-    <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
-  {/if}
-
-  <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
-
-  <div class="transcript">
-    {#each recording.finals as line}
-      <p class="final">
-        <span class="badge" style="background: {speakerColor(line.speaker, line.source)}">
-          {speakerLabel(line.speaker, line.source, recording.speakers)}
-        </span>
-        {line.text}
-      </p>
-    {/each}
-    {#if recording.partialMic}
-      <p class="partial"><span class="badge mic">我</span>{recording.partialMic}</p>
-    {/if}
-    {#if recording.partialSystem}
-      <p class="partial"><span class="badge system">对方</span>{recording.partialSystem}</p>
-    {/if}
-    {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
-      <p class="hint">（开始说话…）</p>
-    {/if}
-  </div>
 </div>
 
 <style>
