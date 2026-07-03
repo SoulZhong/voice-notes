@@ -172,11 +172,13 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
             }
         };
-        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
-            Source::Mic,
-            Box::new(audio::microphone::Microphone::new()),
-            mic_seg,
-        )];
+        // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
+        #[cfg(target_os = "macos")]
+        let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
+        #[cfg(not(target_os = "macos"))]
+        let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
+            vec![(Source::Mic, mic, mic_seg)];
 
         #[cfg(target_os = "macos")]
         {
