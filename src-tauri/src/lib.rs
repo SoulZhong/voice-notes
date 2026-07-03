@@ -2,6 +2,7 @@ mod audio;
 pub mod pipeline;
 pub mod asr;
 mod ipc;
+pub mod models;
 mod session;
 mod store;
 pub mod diar;
@@ -50,10 +51,6 @@ struct AppState {
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
 }
 
-fn models_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
-}
-
 /// notes 根目录（不存在则创建）。
 fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let dir = app
@@ -90,11 +87,11 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
 }
 
 fn sense_voice_dir() -> PathBuf {
-    models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+    models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
 
 fn speaker_model_path() -> PathBuf {
-    models_dir().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
+    models::root().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -182,7 +179,7 @@ fn spawn_session(
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
         // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
-        let vad_path = models_dir().join("silero_vad.onnx");
+        let vad_path = models::root().join("silero_vad.onnx");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
             Err(e) => {
@@ -416,6 +413,9 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if !models::recording_ready() {
+        return Err("模型缺失：请先在录制页下载模型".into());
+    }
     spawn_session(
         app,
         state.running.clone(),
@@ -431,6 +431,9 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    if !models::recording_ready() {
+        return Err("模型缺失：请先在录制页下载模型".into());
+    }
     spawn_session(
         app,
         state.running.clone(),
@@ -587,38 +590,53 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
         .map_err(|e| e.to_string())
 }
 
+/// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
+/// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
+/// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
+fn preload_models(
+    cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+) {
+    std::thread::spawn(move || {
+        let mut slot = cache.lock().unwrap();
+        if slot.is_none() {
+            match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
+                Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
+                Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
+            }
+        }
+        let mut eslot = embedder_cache.lock().unwrap();
+        if eslot.is_none() {
+            match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+                Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
+            }
+        }
+        drop(eslot);
+        drop(slot);
+    });
+}
+
+#[tauri::command]
+fn models_status() -> models::ModelsStatus {
+    models::status()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
-            // 启动预载识别器：持锁加载，开录若赶上预载会在锁上等待至就绪。
+            // 生产模型根目录注入（VN_MODELS / dev 目录优先级更高，见 models::root）。
+            if let Ok(dir) = app.path().app_data_dir() {
+                let models_dir = dir.join("models");
+                let _ = std::fs::create_dir_all(&models_dir);
+                models::init_app_root(models_dir);
+            }
             let cache = app.state::<AppState>().recognizer_cache.clone();
             let embedder_cache = app.state::<AppState>().embedder_cache.clone();
-            std::thread::spawn(move || {
-                let mut slot = cache.lock().unwrap();
-                if slot.is_none() {
-                    match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                        Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
-                        Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
-                    }
-                }
-                // 锁序：预载是唯一嵌套持两槽者——在仍持 recognizer 槽锁期间嵌套获取
-                // embedder 槽锁，消除释放 recognizer 锁到锁定 embedder 锁之间的间隙
-                // （否则开录线程可在间隙 take 到尚空的 embedder，静默无声纹）。开录
-                // 线程从不同时持两槽（先 take recognizer 后 take embedder，各自即刻释放），
-                // 故无死锁。
-                let mut eslot = embedder_cache.lock().unwrap();
-                if eslot.is_none() {
-                    match diar::SherpaEmbedder::new(&speaker_model_path()) {
-                        Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
-                        Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
-                    }
-                }
-                drop(eslot);
-                drop(slot);
-            });
+            preload_models(cache, embedder_cache);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -631,7 +649,8 @@ pub fn run() {
             rename_note,
             delete_note,
             export_note,
-            rename_speaker
+            rename_speaker,
+            models_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
