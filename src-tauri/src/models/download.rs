@@ -1,12 +1,14 @@
 //! 模型下载器：断点续传 + SHA256 校验 + tar.bz2 解压进位。
-//! 本文件的纯逻辑（镜像拼接/校验/解压）由单测覆盖；网络路径（download_artifact，
-//! Task 3 添加）靠人工冒烟。
+//! 本文件的纯逻辑（镜像拼接/校验/解压）由单测覆盖；网络路径（download_artifact）
+//! 靠人工冒烟，不做单测。
 
 use super::FinalFile;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// 镜像前缀拼接：启用且前缀非空时 = prefix + 原完整 URL（ghproxy 风格），自动补尾 '/'。
 pub fn apply_mirror(url: &str, enabled: bool, prefix: &str) -> String {
@@ -95,6 +97,87 @@ pub fn extract_and_install(
     }
     let _ = fs::remove_dir_all(&backup);
     let _ = fs::remove_dir_all(&tmp);
+    Ok(())
+}
+
+/// 进度回调：(artifact_id, phase, received_bytes, total_bytes, message)。
+pub type Progress = dyn Fn(&str, &str, u64, u64, &str);
+
+/// 下载并安装单个工件。断点：root/<id>.part（HTTP Range 续传；服务端不支持则重下）。
+/// cancel 置位 → Err 且消息恰为 "cancelled"（保留 .part 供续传）；
+/// 校验/解压失败 → 删 .part（脏数据不值得续）并 Err。
+pub fn download_artifact(
+    a: &super::Artifact,
+    root: &Path,
+    url: &str,
+    cancel: &AtomicBool,
+    progress: &Progress,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(root)?;
+    let part = root.join(format!("{}.part", a.id));
+    let mut offset = part.metadata().map(|m| m.len()).unwrap_or(0);
+
+    let req = ureq::get(url).timeout(Duration::from_secs(600 * 60)); // 大文件慢链路：整体超时放极宽，靠取消兜底
+    let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
+    let resp = req.call().map_err(|e| anyhow::anyhow!("请求失败: {e}"))?;
+    let status = resp.status();
+    let out: fs::File;
+    if status == 206 {
+        out = fs::OpenOptions::new().append(true).open(&part)?;
+    } else if status == 200 {
+        offset = 0; // 服务端不支持 Range（或首次下载）：从头来
+        out = fs::File::create(&part)?;
+    } else {
+        anyhow::bail!("HTTP {status}");
+    }
+    let total = offset
+        + resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+    let mut reader = resp.into_reader();
+    let mut out = std::io::BufWriter::new(out);
+    let mut received = offset;
+    let mut buf = [0u8; 64 * 1024];
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            drop(out); // 落盘已写字节，保留 .part
+            anyhow::bail!("cancelled");
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        received += n as u64;
+        if last_emit.elapsed() >= Duration::from_millis(250) {
+            last_emit = Instant::now();
+            progress(a.id, "downloading", received, total, "");
+        }
+    }
+    out.flush()?;
+    drop(out);
+
+    match &a.kind {
+        super::ArtifactKind::File => {
+            progress(a.id, "verifying", received, total, "");
+            if let Err(e) = verify_file(&part, &a.files[0]) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+            fs::rename(&part, root.join(a.files[0].rel_path))?;
+        }
+        super::ArtifactKind::TarBz2 { dest_dir } => {
+            progress(a.id, "extracting", received, total, "");
+            if let Err(e) = extract_and_install(&part, root, dest_dir, a.files) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+            let _ = fs::remove_file(&part);
+        }
+    }
+    progress(a.id, "done", received, total, "");
     Ok(())
 }
 

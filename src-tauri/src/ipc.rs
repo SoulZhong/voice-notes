@@ -59,3 +59,15 @@ pub struct SpeakersEvent {
     /// 本次事件伴随的簇合并（仅 Merged 分支非 None）；前端据此回写已上屏历史段。
     pub merged: Option<MergedPair>,
 }
+
+/// 模型下载进度，事件名 "model_download"。artifact="all" + phase="done" 表示整体完成。
+/// phase: downloading | verifying | extracting | done | error | cancelled。
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelDownloadEvent {
+    pub artifact: String,
+    pub phase: String,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+    /// error 时的原因说明，其余为空串。
+    pub message: String,
+}

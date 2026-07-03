@@ -4,9 +4,11 @@ pub mod asr;
 mod ipc;
 pub mod models;
 mod session;
+mod settings;
 mod store;
 pub mod diar;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -49,6 +51,9 @@ struct AppState {
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
+    download_running: Arc<AtomicBool>,
+    download_cancel: Arc<AtomicBool>,
 }
 
 /// notes 根目录（不存在则创建）。
@@ -622,6 +627,76 @@ fn models_status() -> models::ModelsStatus {
     models::status()
 }
 
+#[tauri::command]
+fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if state.download_running.swap(true, Ordering::SeqCst) {
+        return Err("下载已在进行中".into());
+    }
+    state.download_cancel.store(false, Ordering::SeqCst);
+    let running = state.download_running.clone();
+    let cancel = state.download_cancel.clone();
+    let recognizer_cache = state.recognizer_cache.clone();
+    let embedder_cache = state.embedder_cache.clone();
+    std::thread::spawn(move || {
+        let root = models::root();
+        models::download::sweep_tmp(&root);
+        let s = app
+            .path()
+            .app_data_dir()
+            .map(|d| settings::load(&d))
+            .unwrap_or_default();
+        let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
+            let _ = app.emit(
+                "model_download",
+                ipc::ModelDownloadEvent {
+                    artifact: id.into(),
+                    phase: phase.into(),
+                    received_bytes: received,
+                    total_bytes: total,
+                    message: message.into(),
+                },
+            );
+        };
+        let mut all_ok = true;
+        for a in models::ARTIFACTS {
+            if models::artifact_present(&root, a) {
+                continue;
+            }
+            let url = models::download::apply_mirror(a.url, s.mirror_enabled, &s.mirror_prefix);
+            if let Err(e) = models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+                all_ok = false;
+                let msg = e.to_string();
+                let phase = if msg == "cancelled" { "cancelled" } else { "error" };
+                emit(a.id, phase, 0, 0, &msg);
+                break;
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+        if all_ok {
+            emit("all", "done", 0, 0, "");
+            // 补齐后立即预载，无需重启即可开录。
+            preload_models(recognizer_cache, embedder_cache);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_models_download(state: State<AppState>) {
+    state.download_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
+    app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_settings(app: AppHandle, new_settings: settings::Settings) -> Result<(), String> {
+    let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    settings::save(&d, &new_settings).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -634,6 +709,7 @@ pub fn run() {
                 let _ = std::fs::create_dir_all(&models_dir);
                 models::init_app_root(models_dir);
             }
+            models::download::sweep_tmp(&models::root());
             let cache = app.state::<AppState>().recognizer_cache.clone();
             let embedder_cache = app.state::<AppState>().embedder_cache.clone();
             preload_models(cache, embedder_cache);
@@ -650,7 +726,11 @@ pub fn run() {
             delete_note,
             export_note,
             rename_speaker,
-            models_status
+            models_status,
+            download_models,
+            cancel_models_download,
+            get_settings,
+            set_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
