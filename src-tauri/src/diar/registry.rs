@@ -3,12 +3,12 @@
 
 use std::collections::BTreeSet;
 
-/// 归簇阈值(余弦)。fixture 校准初值,冒烟后可调。
-pub const ASSIGN_THRESHOLD: f32 = 0.55;
-/// 簇间合并阈值(余弦,高于归簇阈值防过度合并)。fixture 校准初值。
-pub const MERGE_THRESHOLD: f32 = 0.68;
-/// 低于此样本数(16kHz)的段不允许新建簇(短段声纹不可靠)。
-pub const MIN_NEW_CLUSTER_SAMPLES: usize = 16000;
+/// 归簇阈值(余弦)。首轮真实会议校准(10+人短句场景)调整:原 0.55 下不同人被吸入同簇。
+pub const ASSIGN_THRESHOLD: f32 = 0.62;
+/// 簇间合并阈值(余弦,高于归簇阈值防过度合并)。首轮真实会议校准(10+人短句场景)调整:原 0.68 下触发过度合并。
+pub const MERGE_THRESHOLD: f32 = 0.74;
+/// 低于此样本数(16kHz)的段不允许新建簇(短段声纹不可靠)。首轮真实会议校准(10+人短句场景)调整:原 16000(1.0s) 下 0.9s 真句子被拦截。
+pub const MIN_NEW_CLUSTER_SAMPLES: usize = 9600; // 0.6s
 /// 每 N 次 assign 做一次簇间合并检查。
 pub const MERGE_CHECK_INTERVAL: u64 = 8;
 
@@ -56,8 +56,9 @@ impl SpeakerRegistry {
         Self { clusters: Vec::new(), next_id: 1, assigns: 0, pending_merges: Vec::new() }
     }
 
-    /// 归簇:与各质心比余弦,≥ 阈值归入最相似簇并更新质心;
-    /// 否则段够长才新建簇。返回说话人 id;不可用嵌入/短段无归属返回 None。
+    /// 归簇:与各质心比余弦,≥ 阈值归入最相似簇;
+    /// 长段(≥ MIN_NEW_CLUSTER_SAMPLES)更新质心、增计数; 短段仅记录来源、不拖质心(防噪声污染)。
+    /// 不相似且段够长才新建簇。返回说话人 id;不可用嵌入/短段无归属返回 None。
     pub fn assign(&mut self, embedding: &[f32], source: &str, num_samples: usize) -> Option<String> {
         let unit = normalize(embedding)?;
         if let Some(c) = self.clusters.first() {
@@ -78,16 +79,19 @@ impl SpeakerRegistry {
 
         if let Some((sim, cluster)) = best {
             if sim >= ASSIGN_THRESHOLD {
-                // 质心 running mean(在单位向量上),再归一化
-                let n = cluster.count as f32;
-                for (ci, ui) in cluster.centroid.iter_mut().zip(&unit) {
-                    *ci = (*ci * n + ui) / (n + 1.0);
-                }
-                if let Some(renorm) = normalize(&cluster.centroid) {
-                    cluster.centroid = renorm;
-                }
-                cluster.count += 1;
                 cluster.sources.insert(source.to_string());
+                // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
+                if num_samples >= MIN_NEW_CLUSTER_SAMPLES {
+                    // 质心 running mean(在单位向量上),再归一化
+                    let n = cluster.count as f32;
+                    for (ci, ui) in cluster.centroid.iter_mut().zip(&unit) {
+                        *ci = (*ci * n + ui) / (n + 1.0);
+                    }
+                    if let Some(renorm) = normalize(&cluster.centroid) {
+                        cluster.centroid = renorm;
+                    }
+                    cluster.count += 1;
+                }
                 return Some(cluster.id.clone());
             }
         }
@@ -246,6 +250,19 @@ mod tests {
         // sources 并集:S1 成员全是 mic,"system" 只能来自被并入的 S2
         assert!(r.speakers()[0].sources.contains("system"), "合并须汇总 sources");
         assert!(r.speakers()[0].sources.contains("mic"));
+    }
+
+    #[test]
+    fn short_joins_do_not_drag_centroid() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG); // S1 质心 = e1
+        // 10 个短段归入 S1(相似度 0.8 ≥ 0.62),但不得拖动质心
+        for _ in 0..10 {
+            assert_eq!(r.assign(&v(0.8, 0.6, 0.0), "mic", 8000), Some("S1".into()));
+        }
+        // 探针:与 e1 余弦 0.35 —— 若质心仍是 e1 → 低于阈值,新建 S2;
+        // 若质心被短段拖向 (0.8,0.6) → 会被吸入 S1(回归即失败)
+        assert_eq!(r.assign(&v(0.35, 0.937, 0.0), "mic", LONG), Some("S2".into()));
     }
 
     #[test]
