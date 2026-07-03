@@ -215,44 +215,37 @@ mod tests {
     #[test]
     fn drifting_clusters_get_merged_small_into_large() {
         let mut r = SpeakerRegistry::new();
-        // 两簇初始正交
+        // S1(大簇,全部来自 mic):质心 ≈ e1
         for _ in 0..6 {
-            r.assign(&v(1.0, 0.0, 0.0), "mic", LONG); // S1(大簇)
+            r.assign(&v(1.0, 0.0, 0.0), "mic", LONG);
         }
-        r.assign(&v(0.0, 1.0, 0.0), "system", LONG); // S2(小簇)
-        assert!(r.take_merges().is_empty(), "正交簇不该合并");
-        // 把 S2 的质心喂到与 S1 高度相似
-        for _ in 0..12 {
-            r.assign(&v(0.9, 0.435, 0.0), "system", LONG); // 与 e1 余弦≈0.9 → 落 S1? 不——
-            // 注:该向量与 S1 质心(≈e1)余弦 ≈ 0.9 > ASSIGN_THRESHOLD,会直接归入 S1,
-            // 这正是在线聚类的常态;为构造"两簇漂移到相似"的场景,直接喂与 S2 相似、
-            // 同时逐渐偏向 e1 的序列:
-        }
-        let mut r = SpeakerRegistry::new();
-        for _ in 0..6 {
-            r.assign(&v(1.0, 0.0, 0.0), "mic", LONG); // S1(大簇)
-        }
-        r.assign(&v(0.30, 0.954, 0.0), "system", LONG); // S2(小簇)
-        assert!(r.take_merges().is_empty(), "正交簇不该合并");
-        // S2 的后续成员逐渐偏向 e1
+        // S2 种子(来自 system):与 e1 余弦 0.30 < ASSIGN_THRESHOLD → 新建
+        r.assign(&v(0.30, 0.954, 0.0), "system", LONG);
+        assert_eq!(r.speakers().len(), 2);
+        assert!(r.take_merges().is_empty(), "初始两簇远离,不该合并");
+
+        // 相向漂移(在线聚类的真实收敛方式):
+        // 1) 这批向量与 S2 当前质心更近 → 归入 S2,把 S2 从 72.5° 拖向 e1
         for k in 1..=10 {
-            let t = 0.30 + 0.05 * k as f32;
+            let t = 0.30 + 0.05 * k as f32; // 0.35..0.80
             let y = (1.0 - t * t).max(0.0).sqrt();
             r.assign(&v(t, y, 0.0), "system", LONG);
         }
-        // 继续推动 S2 质心更接近 S1
+        // 2) 这批与 S1 质心(≈e1,余弦 0.90)更近 → 归入 S1,把 S1 拖向 S2
         for _ in 0..12 {
-            r.assign(&v(0.90, 0.436, 0.0), "system", LONG);
+            r.assign(&v(0.90, 0.436, 0.0), "mic", LONG);
         }
-        // 触发周期性合并检查(take_merges 内部在每 MERGE_CHECK_INTERVAL 次 assign 后检测)
+
+        // 两簇相向漂移后质心相似度过 MERGE_THRESHOLD → 合并,小簇 S2 并入大簇 S1
         let merges = r.take_merges();
-        assert_eq!(merges.len(), 1, "漂移后两簇应合并");
+        assert_eq!(merges.len(), 1, "相向漂移后两簇应合并");
         let (loser, winner) = &merges[0];
         assert_eq!(winner, "S1", "小簇并入大簇");
         assert_eq!(loser, "S2");
         assert_eq!(r.speakers().len(), 1);
-        // 合并后 sources 汇总
-        assert!(r.speakers()[0].sources.contains("system"));
+        // sources 并集:S1 成员全是 mic,"system" 只能来自被并入的 S2
+        assert!(r.speakers()[0].sources.contains("system"), "合并须汇总 sources");
+        assert!(r.speakers()[0].sources.contains("mic"));
     }
 
     #[test]
