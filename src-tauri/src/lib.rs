@@ -65,18 +65,20 @@ fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全，无内容则删掉空文件夹。
+/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全；无内容且是本会话新建的才删空目录；
+/// 续录打开的既有笔记(即使零段)绝不删——留 recording 态(诚实显示「已中断」)。
 fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
     let mut w = writer.lock().unwrap();
     if w.has_content() {
         if let Err(e) = w.finalize(chrono::Local::now()) {
             eprintln!("abort_or_finalize: finalize 失败: {e}");
         }
-    } else {
+    } else if w.created_this_session() {
         let dir = w.dir().to_path_buf();
         drop(w);
         let _ = std::fs::remove_dir_all(dir);
     }
+    // 既有笔记零段:什么都不做,meta 留 recording,内容零损失。
 }
 
 /// 归还识别器/嵌入器进常驻槽（None = 没取到、asr 线程 panic 等，不回收）。

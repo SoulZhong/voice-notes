@@ -20,6 +20,9 @@ pub struct NoteWriter {
     /// 续录时间轴偏移：resume 路径 = 上一场最大 end_ms，create 路径恒 0。
     /// on_final 落盘/emit 前 start_ms/end_ms 均需 + base_ms，保证时间轴连续。
     base_ms: u64,
+    /// 本会话新建标记：create() 置 true，resume() 置 false。
+    /// 用于 abort_or_finalize 区分：零段新建空笔记删除；零段既有笔记保留（不丢内容）。
+    created_this_session: bool,
 }
 
 impl NoteWriter {
@@ -60,6 +63,7 @@ impl NoteWriter {
             pending: VecDeque::new(),
             speakers: BTreeMap::new(),
             base_ms: 0,
+            created_this_session: true,
         })
     }
 
@@ -117,6 +121,7 @@ impl NoteWriter {
             pending: VecDeque::new(),
             speakers,
             base_ms,
+            created_this_session: false,
         })
     }
 
@@ -136,6 +141,12 @@ impl NoteWriter {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 本会话新建标记：create() 置 true，resume() 置 false。
+    /// 用于 abort_or_finalize 区分：零段新建空笔记删除；零段既有笔记保留（不丢内容）。
+    pub fn created_this_session(&self) -> bool {
+        self.created_this_session
     }
 
     /// 说话人表只读访问（供 IPC 层组装 SpeakersEvent，不落盘）。
@@ -687,6 +698,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = NoteWriter::create(tmp.path(), now()).unwrap();
         assert_eq!(w.base_ms(), 0);
+    }
+
+    #[test]
+    fn create_marks_created_resume_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        assert!(w.created_this_session(), "create() 应设 created_this_session=true");
+
+        let r = NoteWriter::resume(tmp.path(), &id).unwrap();
+        assert!(!r.created_this_session(), "resume() 应设 created_this_session=false");
     }
 
     #[test]
