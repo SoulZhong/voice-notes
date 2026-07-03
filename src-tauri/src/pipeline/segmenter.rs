@@ -2,6 +2,8 @@
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub samples: Vec<f32>,
+    /// 段首样本相对该源音频流开始的偏移（16kHz 单声道样本数）。
+    pub start: usize,
 }
 
 /// 语句分段器：吃入音频流，切出完整语句，并提供当前未定稿语句用于实时 partial。
@@ -21,12 +23,18 @@ pub trait Segmenter: Send {
 pub struct MockSegmenter {
     utterance_len: usize,
     current: Vec<f32>,
+    current_start: usize,
     finished: Vec<Segment>,
 }
 
 impl MockSegmenter {
     pub fn new(utterance_len: usize) -> Self {
-        Self { utterance_len: utterance_len.max(1), current: Vec::new(), finished: Vec::new() }
+        Self {
+            utterance_len: utterance_len.max(1),
+            current: Vec::new(),
+            current_start: 0,
+            finished: Vec::new(),
+        }
     }
 }
 
@@ -36,7 +44,8 @@ impl Segmenter for MockSegmenter {
         while self.current.len() >= self.utterance_len {
             let rest = self.current.split_off(self.utterance_len);
             let seg = std::mem::replace(&mut self.current, rest);
-            self.finished.push(Segment { samples: seg });
+            self.finished.push(Segment { samples: seg, start: self.current_start });
+            self.current_start += self.utterance_len;
         }
     }
     fn take_finished(&mut self) -> Vec<Segment> {
@@ -47,7 +56,12 @@ impl Segmenter for MockSegmenter {
     }
     fn flush(&mut self) {
         if !self.current.is_empty() {
-            self.finished.push(Segment { samples: std::mem::take(&mut self.current) });
+            let len = self.current.len();
+            self.finished.push(Segment {
+                samples: std::mem::take(&mut self.current),
+                start: self.current_start,
+            });
+            self.current_start += len;
         }
     }
 }
@@ -66,18 +80,27 @@ mod tests {
         let segs = s.take_finished();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].samples.len(), 100);
+        assert_eq!(segs[0].start, 0, "首段起点为 0");
         // 段产出后，剩余 10 作为当前句
         assert_eq!(s.current_partial().map(|v| v.len()), Some(10));
+        // 再来 190 → 累计 200 → 第二段 [100, 200)
+        s.accept(&vec![0.0; 190]);
+        let segs = s.take_finished();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].start, 100, "第二段起点 = 前一段末尾");
+        assert_eq!(segs[1].start, 200);
     }
 
     #[test]
-    fn mock_flush_emits_remainder() {
+    fn mock_flush_emits_remainder_with_start() {
         let mut s = MockSegmenter::new(100);
-        s.accept(&vec![0.0; 30]);
+        s.accept(&vec![0.0; 130]); // 一段 [0,100) + 残留 30
+        let _ = s.take_finished();
         s.flush();
         let segs = s.take_finished();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].samples.len(), 30);
+        assert_eq!(segs[0].start, 100, "尾段起点接在已切段之后");
         assert!(s.current_partial().is_none(), "flush 后无当前句");
     }
 }

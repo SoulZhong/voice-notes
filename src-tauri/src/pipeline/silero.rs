@@ -44,7 +44,7 @@ impl Segmenter for SileroSegmenter {
         let mut out = Vec::new();
         while !self.vad.is_empty() {
             let seg = self.vad.front();
-            out.push(Segment { samples: seg.samples });
+            out.push(Segment { samples: seg.samples, start: seg.start.max(0) as usize });
             self.vad.pop();
         }
         if !out.is_empty() {

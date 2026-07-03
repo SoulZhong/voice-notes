@@ -28,6 +28,10 @@ cpal = "0.15"
 crossbeam-channel = "0.5"
 hound = "3.5"
 sherpa-rs = "0.6"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_13_0"] }
