@@ -31,7 +31,7 @@ pub fn run_asr_worker(
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
     mut on_final: impl FnMut(Source, String, u64, u64),
     mut on_partial: impl FnMut(Source, String),
-) {
+) -> Box<dyn Recognizer> {
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
@@ -73,29 +73,36 @@ pub fn run_asr_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
+    recognizer
 }
 
 /// 一次录制会话的句柄：持两路 capture + 各 worker 的 join 句柄。
 pub struct RecordingHandle {
     captures: Vec<Box<dyn AudioCapture>>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    asr: Option<std::thread::JoinHandle<()>>,
+    asr: Option<std::thread::JoinHandle<Box<dyn Recognizer>>>,
 }
 
 impl RecordingHandle {
     /// 优雅停止：停各 capture（关帧通道）→ 分段 worker flush 尾段后退出并 join
-    /// →（其 finals 发送端随之 drop）ASR worker 排干剩余 finals 后退出并 join。
-    pub fn stop(mut self) {
+    /// →（其 finals 发送端随之 drop）ASR worker 排干剩余 finals 后退出并 join，
+    /// 返还 recognizer 供复用（asr 线程 panic 时返 None，调用方现场重载兜底）。
+    pub fn stop(mut self) -> Option<Box<dyn Recognizer>> {
         for c in self.captures.iter_mut() {
             c.stop();
         }
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
-        if let Some(a) = self.asr.take() {
-            if a.join().is_err() {
-                eprintln!("RecordingHandle::stop: asr 线程异常退出（panic）");
-            }
+        match self.asr.take() {
+            Some(a) => match a.join() {
+                Ok(r) => Some(r),
+                Err(_) => {
+                    eprintln!("RecordingHandle::stop: asr 线程异常退出（panic），识别器不回收");
+                    None
+                }
+            },
+            None => None,
         }
     }
 }
@@ -105,6 +112,18 @@ pub struct SessionStart {
     pub handle: RecordingHandle,
     pub active: Vec<Source>,
     pub failed: Vec<(Source, String)>,
+}
+
+/// start_session 失败时携带 recognizer 返还，避免常驻识别器在错误路径丢失。
+pub struct StartError {
+    pub error: anyhow::Error,
+    pub recognizer: Box<dyn Recognizer>,
+}
+
+impl std::fmt::Debug for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StartError({})", self.error)
+    }
 }
 
 /// 起会话：每源一条分段 worker + 单 ASR worker，接好 finals 通道与每源 partial 槽。
@@ -117,7 +136,7 @@ pub fn start_session(
     partial_interval_samples: usize,
     on_final: impl FnMut(Source, String, u64, u64) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
-) -> anyhow::Result<SessionStart> {
+) -> Result<SessionStart, StartError> {
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
     let mut slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)> = Vec::new();
     let mut captures: Vec<Box<dyn AudioCapture>> = Vec::new();
@@ -160,11 +179,14 @@ pub fn start_session(
     drop(finals_tx); // 仅剩各 worker 持有发送端 → 它们结束后 ASR 才断开
 
     if active.is_empty() {
-        return Err(anyhow::anyhow!("没有可用音频源可启动: {failed:?}"));
+        return Err(StartError {
+            error: anyhow::anyhow!("没有可用音频源可启动: {failed:?}"),
+            recognizer,
+        });
     }
 
     let asr = std::thread::spawn(move || {
-        run_asr_worker(recognizer, finals_rx, slots, on_final, on_partial);
+        run_asr_worker(recognizer, finals_rx, slots, on_final, on_partial)
     });
 
     Ok(SessionStart {
@@ -208,7 +230,7 @@ mod asr_worker_tests {
 
         let finals = Arc::new(Mutex::new(Vec::<(Source, String, u64, u64)>::new()));
         let f2 = finals.clone();
-        run_asr_worker(
+        let _ = run_asr_worker(
             Box::new(CountingRecognizer),
             rx,
             vec![],
@@ -233,7 +255,7 @@ mod asr_worker_tests {
 
         let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let f2 = finals.clone();
-        run_asr_worker(
+        let _ = run_asr_worker(
             Box::new(FlakyRecognizer { n: 0 }),
             rx,
             vec![],
@@ -270,7 +292,7 @@ mod asr_worker_tests {
         // Suppress "panicked at" output so test stderr stays clean.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        run_asr_worker(
+        let _ = run_asr_worker(
             Box::new(PanicRecognizer { n: 0 }),
             rx,
             vec![],
@@ -297,7 +319,7 @@ mod asr_worker_tests {
         let slot_for_worker = slot.clone();
 
         let worker = std::thread::spawn(move || {
-            run_asr_worker(
+            let _ = run_asr_worker(
                 Box::new(CountingRecognizer),
                 rx,
                 vec![(Source::System, slot_for_worker)],
@@ -414,12 +436,25 @@ mod session_tests {
             drop(g);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        start.handle.stop(); // 真停止：停 capture → join workers → join asr
+        let _ = start.handle.stop(); // 真停止：停 capture → join workers → join asr
         assert!(ok, "两源都应产出带标记的 final");
     }
 
     #[test]
-    fn all_sources_fail_returns_err() {
+    fn stop_returns_recognizer_for_reuse() {
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
+            Source::Mic,
+            Box::new(IdlingCapture::from_fixture()),
+            Box::new(MockSegmenter::new(2000)),
+        )];
+        let start = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _, _, _| {}, |_, _| {})
+            .expect("start_session");
+        let returned = start.handle.stop();
+        assert!(returned.is_some(), "停止后应返还 recognizer 供复用");
+    }
+
+    #[test]
+    fn all_sources_fail_returns_recognizer_in_err() {
         struct FailingCapture;
         impl AudioCapture for FailingCapture {
             fn start(&mut self, _sink: Sender<AudioFrame>) -> anyhow::Result<()> {
@@ -430,6 +465,11 @@ mod session_tests {
         let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
             vec![(Source::System, Box::new(FailingCapture), Box::new(MockSegmenter::new(8000)))];
         let r = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _, _, _| {}, |_, _| {});
-        assert!(r.is_err(), "无源可启动应返回 Err");
+        let err = match r {
+            Ok(_) => panic!("无源可启动应返回 Err"),
+            Err(e) => e,
+        };
+        assert!(err.error.to_string().contains("没有可用音频源"));
+        let _reusable: Box<dyn Recognizer> = err.recognizer; // Err 携带 recognizer 返还
     }
 }

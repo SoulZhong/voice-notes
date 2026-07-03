@@ -282,7 +282,7 @@ mod tests {
             |_, _| {},
         )
         .expect("start_session");
-        start.handle.stop(); // MockCapture 已灌完帧；stop 排干全部 finals
+        let _ = start.handle.stop(); // MockCapture 已灌完帧；stop 排干全部 finals
         writer.lock().unwrap().finalize(now()).unwrap();
 
         let n = *emitted.lock().unwrap();

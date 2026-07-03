@@ -39,6 +39,9 @@ struct AppState {
     running: Arc<Mutex<bool>>,
     generation: Arc<Mutex<u64>>,
     session: Arc<Mutex<Option<ActiveSession>>>,
+    /// 常驻识别器（启动预载、开录取用、停录归还）。叶子锁：绝不与上面三把锁嵌套持有；
+    /// 预载线程持锁加载，使开录 take() 自然阻塞至就绪且永不双重加载。
+    recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
 }
 
 fn models_dir() -> PathBuf {
@@ -68,6 +71,20 @@ fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
         drop(w);
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// 归还识别器进常驻槽（None = asr 线程 panic 等，不回收）。
+fn stash_recognizer(
+    cache: &Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    r: Option<Box<dyn asr::Recognizer>>,
+) {
+    if let Some(r) = r {
+        *cache.lock().unwrap() = Some(r);
+    }
+}
+
+fn sense_voice_dir() -> PathBuf {
+    models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -103,6 +120,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
     let running = state.running.clone();
     let generation = state.generation.clone();
     let session_slot = state.session.clone();
+    let recognizer_cache = state.recognizer_cache.clone();
 
     std::thread::spawn(move || {
         // fail()：加载过程中任何一步失败都会调用。必须先确认 my_gen 仍是当前代
@@ -124,11 +142,13 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new() });
         };
 
-        // 1) 先建 recognizer（加载模型，耗时）——就绪后才发 recording，消除闪烁。
-        let sv_dir = models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17");
-        let recognizer = match asr::sense_voice::SenseVoiceRecognizer::new(&sv_dir) {
-            Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
-            Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
+        // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
+        let recognizer = match recognizer_cache.lock().unwrap().take() {
+            Some(r) => r,
+            None => match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
+                Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
+                Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
+            },
         };
 
         // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
@@ -213,7 +233,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             Ok(start) => {
                 // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
                 if !start.active.contains(&Source::Mic) {
-                    start.handle.stop(); // 先排干可能已产生的 system finals
+                    stash_recognizer(&recognizer_cache, start.handle.stop()); // 先排干可能已产生的 system finals
                     abort_or_finalize(&writer);
                     let mic_err = start.failed.iter()
                         .find(|(s, _)| *s == Source::Mic)
@@ -242,7 +262,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 if !*running_guard || *gen_guard != my_gen {
                     drop(gen_guard);
                     drop(running_guard);
-                    start.handle.stop();
+                    stash_recognizer(&recognizer_cache, start.handle.stop());
                     abort_or_finalize(&writer); // 被 stop/新 start 抢先：有内容则收尾保全（flush 失败时留 recording）
                     return;
                 }
@@ -260,9 +280,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone() },
                 );
             }
-            Err(e) => {
+            Err(se) => {
+                stash_recognizer(&recognizer_cache, Some(se.recognizer));
                 abort_or_finalize(&writer);
-                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+                return fail(&app, &running, &generation, my_gen, format!("error: {}", se.error));
             }
         }
     });
@@ -285,7 +306,8 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     let sess = state.session.lock().unwrap().take();
     let mut note_id = String::new();
     if let Some(s) = sess {
-        s.handle.stop(); // 排干 finals：所有 append 在此完成
+        let returned = s.handle.stop(); // 排干 finals：所有 append 在此完成
+        stash_recognizer(&state.recognizer_cache, returned);
         note_id = s.note_id;
         if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
             eprintln!("stop_recording: finalize 失败: {e}");
@@ -372,6 +394,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // 启动预载识别器：持锁加载，开录若赶上预载会在锁上等待至就绪。
+            let cache = app.state::<AppState>().recognizer_cache.clone();
+            std::thread::spawn(move || {
+                let mut slot = cache.lock().unwrap();
+                if slot.is_none() {
+                    match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
+                        Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
+                        Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
