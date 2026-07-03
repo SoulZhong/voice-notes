@@ -1,6 +1,6 @@
-use super::{write_meta_atomic, NoteMeta, SegmentRecord, SCHEMA_VERSION};
+use super::{write_meta_atomic, write_speakers_atomic, NoteMeta, SegmentRecord, SpeakerMeta, SCHEMA_VERSION};
 use chrono::{DateTime, Local};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,8 @@ pub struct NoteWriter {
     pub(super) file: Option<File>,
     next_seq: u64,
     pending: VecDeque<String>,
+    /// 说话人表内存副本，随 sync_speakers/merge_speaker 原子落盘 speakers.json。
+    speakers: BTreeMap<String, SpeakerMeta>,
 }
 
 impl NoteWriter {
@@ -47,7 +49,14 @@ impl NoteWriter {
             .create(true)
             .append(true)
             .open(dir.join("segments.jsonl"))?;
-        Ok(Self { dir, meta, file: Some(file), next_seq: 0, pending: VecDeque::new() })
+        Ok(Self {
+            dir,
+            meta,
+            file: Some(file),
+            next_seq: 0,
+            pending: VecDeque::new(),
+            speakers: BTreeMap::new(),
+        })
     }
 
     pub fn note_id(&self) -> &str {
@@ -71,6 +80,7 @@ impl NoteWriter {
         text: &str,
         start_ms: u64,
         end_ms: u64,
+        speaker: Option<&str>,
     ) -> anyhow::Result<()> {
         let rec = SegmentRecord {
             seq: self.next_seq,
@@ -78,7 +88,7 @@ impl NoteWriter {
             text: text.into(),
             start_ms,
             end_ms,
-            speaker: None,
+            speaker: speaker.map(String::from),
         };
         self.next_seq += 1;
         let line = serde_json::to_string(&rec)?;
@@ -95,6 +105,74 @@ impl NoteWriter {
         self.meta.ended_at = Some(now.to_rfc3339());
         self.meta.state = "complete".into();
         write_meta_atomic(&self.dir, &self.meta)
+    }
+
+    /// 合入声纹归簇产生的说话人信息：只增不删，已有名字保留，sources 取并集；
+    /// 有实际变化时才原子写 speakers.json（避免无谓落盘）。
+    pub fn sync_speakers(&mut self, infos: &[(String, Vec<String>)]) -> anyhow::Result<()> {
+        let mut changed = false;
+        for (id, sources) in infos {
+            let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
+                changed = true;
+                SpeakerMeta { name: String::new(), sources: Vec::new() }
+            });
+            for s in sources {
+                if !entry.sources.contains(s) {
+                    entry.sources.push(s.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            write_speakers_atomic(&self.dir, &self.speakers)?;
+        }
+        Ok(())
+    }
+
+    /// 合并两个说话人 id：loser 的段与 sources 归入 winner。
+    /// 先 flush_pending 保证 jsonl 完整，再逐行重写 segments.jsonl
+    /// （不可解析行原样保留，避免吞掉损坏但仍有诊断价值的行）到临时文件后原子替换；
+    /// speakers 表移除 loser、sources 并入 winner（winner 已有名字保留，否则继承 loser 的名字），原子写。
+    pub fn merge_speaker(&mut self, loser: &str, winner: &str) -> anyhow::Result<()> {
+        self.flush_pending()?;
+
+        let path = self.dir.join("segments.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut out = String::new();
+        for line in content.lines() {
+            match serde_json::from_str::<SegmentRecord>(line) {
+                Ok(mut rec) => {
+                    if rec.speaker.as_deref() == Some(loser) {
+                        rec.speaker = Some(winner.to_string());
+                    }
+                    out.push_str(&serde_json::to_string(&rec)?);
+                }
+                Err(_) => out.push_str(line), // 不可解析行原样保留
+            }
+            out.push('\n');
+        }
+        let tmp = self.dir.join("segments.jsonl.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &path)?;
+        // 重写替换了 segments.jsonl 的磁盘文件，旧句柄仍指向被替换前的 inode；
+        // 丢弃句柄，下次 flush_pending 会按新路径重开，避免写入"消失"的文件。
+        self.file = None;
+
+        if let Some(loser_meta) = self.speakers.remove(loser) {
+            let winner_entry = self
+                .speakers
+                .entry(winner.to_string())
+                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() });
+            if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
+                winner_entry.name = loser_meta.name;
+            }
+            for s in loser_meta.sources {
+                if !winner_entry.sources.contains(&s) {
+                    winner_entry.sources.push(s);
+                }
+            }
+        }
+        write_speakers_atomic(&self.dir, &self.speakers)
     }
 
     fn flush_pending(&mut self) -> anyhow::Result<()> {
@@ -167,8 +245,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         assert!(!w.has_content());
-        w.append_final("mic", "第一句", 0, 1500).unwrap();
-        w.append_final("system", "second", 1500, 3000).unwrap();
+        w.append_final("mic", "第一句", 0, 1500, None).unwrap();
+        w.append_final("system", "second", 1500, 3000, None).unwrap();
         assert!(w.has_content());
 
         let lines = read_lines(w.dir());
@@ -197,11 +275,11 @@ mod tests {
         // 模拟句柄失效 + 目录消失：追加必须失败但段保留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "丢不得", 0, 1000).is_err());
+        assert!(w.append_final("mic", "丢不得", 0, 1000, None).is_err());
 
         // 目录恢复后，下一次追加把队列里的段一并补写
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None).unwrap();
         let lines = read_lines(&dir);
         assert_eq!(lines.len(), 2, "失败段重试补写，一段不丢");
         let r0: crate::store::SegmentRecord = serde_json::from_str(&lines[0]).unwrap();
@@ -222,7 +300,7 @@ mod tests {
         // 模拟句柄失效 + 目录消失：append 必须失败，段留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "会丢失吗", 0, 1000).is_err());
+        assert!(w.append_final("mic", "会丢失吗", 0, 1000, None).is_err());
 
         // 目录仍不存在：finalize 应失败，且不得把 state 标记为 complete
         // （此时磁盘上连 meta.json 都不存在，正是"不诚实的 complete"要避免的场景）。
@@ -231,7 +309,7 @@ mod tests {
         // 目录恢复后：finalize 应能补写队列并把 meta 正常置 complete，
         // 验证"失败不置 complete、恢复后可补救"的语义。
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None).unwrap();
         w.finalize(now()).unwrap();
 
         let meta = read_meta(&dir);
@@ -276,8 +354,11 @@ mod tests {
             None,
             16000,
             4000,
-            move |src, text, start_ms, end_ms, _spk| {
-                w2.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms).unwrap();
+            move |src, text, start_ms, end_ms, spk| {
+                w2.lock()
+                    .unwrap()
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .unwrap();
                 *e2.lock().unwrap() += 1;
             },
             |_, _| {},
@@ -295,5 +376,25 @@ mod tests {
         assert!(note.segments.windows(2).all(|w| w[1].start_ms >= w[0].start_ms), "时间戳单调");
         assert_eq!(note.meta.state, "complete");
         assert_eq!(note.skipped_lines, 0);
+    }
+
+    #[test]
+    fn speakers_sync_merge_and_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2")).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
+        // 合并 S2 → S1：jsonl 重写 + speakers 表收缩
+        w.merge_speaker("S2", "S1").unwrap();
+        w.finalize(now()).unwrap();
+
+        let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
+        let note = store.load(&id).unwrap();
+        assert!(note.segments.iter().all(|s| s.speaker.as_deref() == Some("S1")), "S2 段已重写为 S1");
+        assert!(note.speakers.contains_key("S1"));
+        assert!(!note.speakers.contains_key("S2"));
+        assert!(note.speakers["S1"].sources.contains(&"system".to_string()), "sources 并入");
     }
 }

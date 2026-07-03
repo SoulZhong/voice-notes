@@ -1,4 +1,8 @@
-use super::{write_meta_atomic, Note, NoteMeta, NoteSummary, SegmentRecord, SCHEMA_VERSION};
+use super::{
+    write_meta_atomic, write_speakers_atomic, Note, NoteMeta, NoteSummary, SegmentRecord,
+    SpeakerMeta, SCHEMA_VERSION,
+};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -60,7 +64,8 @@ impl NoteStore {
                 }
             }
         }
-        Ok(Note { meta, segments, skipped_lines })
+        let speakers = read_speakers(&dir);
+        Ok(Note { meta, segments, skipped_lines, speakers })
     }
 
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
@@ -75,6 +80,25 @@ impl NoteStore {
         fs::remove_dir_all(dir)?;
         Ok(())
     }
+
+    /// 改说话人显示名：读表（缺失则视为空表新建）→ 设 name → 原子写 speakers.json。
+    pub fn rename_speaker(&self, id: &str, speaker_id: &str, name: &str) -> anyhow::Result<()> {
+        let dir = self.note_dir(id)?;
+        let mut speakers = read_speakers(&dir);
+        speakers
+            .entry(speaker_id.to_string())
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() })
+            .name = name.to_string();
+        write_speakers_atomic(&dir, &speakers)
+    }
+}
+
+/// speakers.json 缺失/损坏 → 空表（P3 产物无此文件，属正常情况，容忍不报错）。
+fn read_speakers(dir: &Path) -> BTreeMap<String, SpeakerMeta> {
+    fs::read_to_string(dir.join("speakers.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn read_meta(dir: &Path) -> Option<NoteMeta> {
@@ -147,7 +171,7 @@ mod tests {
         let mut w = NoteWriter::create(notes_dir, now()).unwrap();
         for (i, t) in texts.iter().enumerate() {
             let s = i as u64 * 1000;
-            w.append_final(if i % 2 == 0 { "mic" } else { "system" }, t, s, s + 900).unwrap();
+            w.append_final(if i % 2 == 0 { "mic" } else { "system" }, t, s, s + 900, None).unwrap();
         }
         if finalize {
             w.finalize(now()).unwrap();
@@ -251,5 +275,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = NoteStore::new(tmp.path().join("不存在"));
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn rename_speaker_persists_and_missing_file_tolerated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "x", 0, 2000, Some("S1")).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.finalize(now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.rename_speaker(&id, "S1", "张三").unwrap();
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].name, "张三");
+        // speakers.json 缺失的旧笔记(P3 产物)：load 正常，speakers 为空表
+        let id2 = make_note(tmp.path(), &["旧"], true);
+        let n2 = store.load(&id2).unwrap();
+        assert!(n2.speakers.is_empty());
     }
 }

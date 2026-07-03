@@ -1,4 +1,5 @@
-use super::{Note, NoteStore, SegmentRecord};
+use super::{Note, NoteStore, SegmentRecord, SpeakerMeta};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 impl NoteStore {
@@ -35,12 +36,20 @@ pub(super) fn human_duration(secs: u64) -> String {
     }
 }
 
-/// 段落标签：有说话人名用名字，否则按来源 我/对方。
-fn label(seg: &SegmentRecord) -> &str {
+/// 段落标签：有说话人 id 且 speakers 表里有非空名字 → 用名字；
+/// 有 id 但表里无名（或名为空）→ 「说话人 N」（N 取 id 去掉前导 'S'）；
+/// 无 id（未跑声纹/降级）→ 按来源 我/对方。
+fn label<'a>(seg: &'a SegmentRecord, speakers: &'a BTreeMap<String, SpeakerMeta>) -> String {
     match &seg.speaker {
-        Some(name) => name,
-        None if seg.source == "mic" => "我",
-        None => "对方",
+        Some(id) => {
+            if let Some(name) = speakers.get(id).map(|m| &m.name).filter(|n| !n.is_empty()) {
+                name.clone()
+            } else {
+                format!("说话人 {}", id.trim_start_matches('S'))
+            }
+        }
+        None if seg.source == "mic" => "我".to_string(),
+        None => "对方".to_string(),
     }
 }
 
@@ -71,7 +80,7 @@ pub(super) fn render_markdown(note: &Note) -> String {
     for seg in &note.segments {
         out.push_str(&format!(
             "**[{}] {}** {}\n\n",
-            label(seg),
+            label(seg, &note.speakers),
             format_ts(seg.start_ms),
             seg.text
         ));
@@ -88,7 +97,7 @@ pub(super) fn render_text(note: &Note) -> String {
     for seg in &note.segments {
         out.push_str(&format!(
             "[{}] {} {}\n",
-            label(seg),
+            label(seg, &note.speakers),
             format_ts(seg.start_ms),
             seg.text
         ));
@@ -121,8 +130,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "今天开会讨论项目进度。", 83_000, 86_000).unwrap();
-        w.append_final("system", "好的，先看上周的问题。", 91_000, 94_000).unwrap();
+        w.append_final("mic", "今天开会讨论项目进度。", 83_000, 86_000, None).unwrap();
+        w.append_final("system", "好的，先看上周的问题。", 91_000, 94_000, None).unwrap();
         w.finalize(chrono::Local::now()).unwrap();
 
         let store = NoteStore::new(tmp.path().to_path_buf());
@@ -144,6 +153,11 @@ mod tests {
 
     #[test]
     fn export_uses_speaker_name_when_present() {
+        let mut speakers = std::collections::BTreeMap::new();
+        speakers.insert(
+            "S1".to_string(),
+            crate::store::SpeakerMeta { name: "张三".into(), sources: vec![] },
+        );
         let note = crate::store::Note {
             meta: crate::store::NoteMeta {
                 schema_version: 1,
@@ -153,17 +167,39 @@ mod tests {
                 ended_at: None,
                 state: "complete".into(),
             },
-            segments: vec![crate::store::SegmentRecord {
-                seq: 0,
-                source: "mic".into(),
-                text: "hi".into(),
-                start_ms: 0,
-                end_ms: 1000,
-                speaker: Some("张三".into()),
-            }],
+            segments: vec![
+                crate::store::SegmentRecord {
+                    seq: 0,
+                    source: "mic".into(),
+                    text: "hi".into(),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    speaker: Some("S1".into()),
+                },
+                crate::store::SegmentRecord {
+                    seq: 1,
+                    source: "system".into(),
+                    text: "yo".into(),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    speaker: Some("S2".into()), // 表中无此 id
+                },
+                crate::store::SegmentRecord {
+                    seq: 2,
+                    source: "mic".into(),
+                    text: "plain".into(),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    speaker: None,
+                },
+            ],
             skipped_lines: 0,
+            speakers,
         };
-        assert!(render_markdown(&note).contains("**[张三] 00:00:00** hi"));
+        let md = render_markdown(&note);
+        assert!(md.contains("**[张三] 00:00:00** hi"), "{md}");
+        assert!(md.contains("**[说话人 2] 00:00:01** yo"), "无名兜底为「说话人 N」: {md}");
+        assert!(md.contains("**[我] 00:00:02** plain"), "speaker null 仍走 我/对方: {md}");
     }
 
     #[test]
@@ -180,6 +216,7 @@ mod tests {
             },
             segments: vec![],
             skipped_lines: 0,
+            speakers: Default::default(),
         };
         let md_normal = render_markdown(&note_normal);
         assert!(md_normal.contains("2026-07-03 15:04 – 16:12(1 小时 8 分)"),
@@ -197,6 +234,7 @@ mod tests {
             },
             segments: vec![],
             skipped_lines: 0,
+            speakers: Default::default(),
         };
         let md_interrupted = render_markdown(&note_interrupted);
         assert!(md_interrupted.contains("2026-07-03 15:04 – 中断"),
@@ -214,6 +252,7 @@ mod tests {
             },
             segments: vec![],
             skipped_lines: 0,
+            speakers: Default::default(),
         };
         let md_corrupt = render_markdown(&note_corrupt);
         assert!(!md_corrupt.contains(" – "),

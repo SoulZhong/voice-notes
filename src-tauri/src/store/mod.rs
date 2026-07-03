@@ -4,6 +4,7 @@ mod notes;
 pub use notes::NoteStore;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -32,6 +33,14 @@ pub struct SegmentRecord {
     pub speaker: Option<String>,
 }
 
+/// 一位说话人的可持久化信息，存 speakers.json（键为说话人 id，如 "S1"）。
+/// name 空串 = 未改名，显示端兜底「说话人 N」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerMeta {
+    pub name: String,
+    pub sources: Vec<String>,
+}
+
 /// 一场会议的完整内容（详情页 / 导出用）。
 #[derive(Debug, Clone, Serialize)]
 pub struct Note {
@@ -39,6 +48,7 @@ pub struct Note {
     pub segments: Vec<SegmentRecord>,
     /// load 时因损坏被跳过的行数（>0 时前端可提示）。
     pub skipped_lines: u32,
+    pub speakers: BTreeMap<String, SpeakerMeta>,
 }
 
 /// 列表项。state 除 meta 的两态外，command 层会把当前活动会话改写为 "active"。
@@ -57,5 +67,17 @@ pub(crate) fn write_meta_atomic(note_dir: &Path, meta: &NoteMeta) -> anyhow::Res
     let json = serde_json::to_string_pretty(meta)?;
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, note_dir.join("meta.json"))?;
+    Ok(())
+}
+
+/// speakers.json 原子写：同 meta 策略，先写 speakers.json.tmp 再 rename。
+pub(crate) fn write_speakers_atomic(
+    note_dir: &Path,
+    speakers: &BTreeMap<String, SpeakerMeta>,
+) -> anyhow::Result<()> {
+    let tmp = note_dir.join("speakers.json.tmp");
+    let json = serde_json::to_string_pretty(speakers)?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, note_dir.join("speakers.json"))?;
     Ok(())
 }
