@@ -183,3 +183,19 @@ Base: 569bf30
 - P3.5 终审 (fable): No→修复 commit 344d0de(Critical: 详情页参数导航不刷新; Important: notesVersion 跨组件同步 / `/` 避开录制中笔记 / 开录 pending 防重+已在录制对账)→ 复审 (opus): Ready to merge YES
 - P3.5 后续项(不阻塞): 冷刷新中途录制 finals 不回灌(可用 getNote 水合); 侧栏改名可能吹掉详情页未提交编辑态; 停止后立即开始若遇孤儿线程会冷加载一次; HMR 下 store 重估双监听(仅 dev)
 - P3.5 自动化: cargo 41/41, npm check 0 errors, build OK。待人工冒烟(计划 Task 4 Step 2)
+
+## P4 — 说话人区分 + AEC (branch p4-diarization-aec)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p4-diarization-aec.md
+Base: e4c8df2
+- P4 Task 1: complete (commits e4c8df2..6cc199d, spike approved; 结论: coreaudio-sys 直调可行, 44.1kHz f32 mono, 回调须 initialize 前注册; AEC 消除量待冒烟机实测; 报告已补 Send 约束澄清) 
+- P4 Task 2: complete (commits 6cc199d..86431ff, review approved 零 findings, 真模型测试 PASS) 
+- P4 Task 3: complete (commits 86431ff..6999f11, 1 fix round: 合并测试语义如实化+删死代码, re-review approved 经独立仿真核验) 
+- P4 Task 4: complete (commits 6999f11..19f9b7b, review approved; 正当偏差: lib.rs 4 处调用点最小适配(None/noop), 真接线留 Task 6) 
+- P4 Task 5: complete (commits 19f9b7b..850f94f, review approved; minors: merge 两文件间崩溃窗口(与既有单文件原子哲学一致,建议补注释)、损坏行经重写保留仅靠走查无专测) 
+- P4 Task 6: complete (commits 850f94f..af94bcf, opus review approved, 六归还点+死锁面核验; minors: rename 持 session 锁跨 emit(顺序一致无环)、Merged 落盘失败时内存/磁盘瞬时分歧(重启自愈)) 
+- P4 Task 7: complete (commits af94bcf..83e8bd6, review approved, 2 minors 已清理) 
+- P4 Task 8: complete (commits 83e8bd6..1a181d5, opus review approved, FFI 安全六项核验; 真机自检 44.1kHz 产帧+stop 干净; minors: 回调可加 catch_unwind、teardown OSStatus 未打日志) 
+- P4 Task 9 (自动化部分): cargo 55/55 + 真模型嵌入测试 PASS + npm check 0 errors + build OK
+- P4 终审 (fable): With fixes → 修复 commit c862f80(Critical: merge 读错误防清空; Important: 合并回写前端 finals / diarization 降级横幅 / rename 单写者 / SpeakersChanged 全量比较; Minor: 预载锁窗)→ 复审 (opus): Ready to merge YES
+- P4 后续项(不阻塞): rename 持 session 锁跨磁盘 IO+emit(可收窄); chips 编辑中遇合并可复活孤儿条目; speakerColor 对非 S<n> id 兜底; chips 排序 S10<S2; MERGE_CHECK_INTERVAL 冗余; teardown OSStatus 日志; merge 两文件崩溃窗口注释
+- 待人工冒烟(计划 Task 9 Step 2, 六项)+ 聚类阈值校准(Step 3)
