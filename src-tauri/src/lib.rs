@@ -30,6 +30,20 @@ use session::RecordingHandle;
 // stop/start/resume 抢先淘汰的过期加载，直接静默让路，避免已被覆盖或已被终止的
 // 会话把自己的（过期的）结果错误地写回全局状态。
 
+/// 活跃时长 = 总 wall 时长 - 已累计暂停 - 当前暂停中时长，再加续录基线 base_ms。
+/// checked_sub 兜底：时钟异常倒挂时饱和为 0 而非 panic。
+fn active_elapsed_ms(
+    total: std::time::Duration,
+    paused_accum: std::time::Duration,
+    current_pause: Option<std::time::Duration>,
+    base_ms: u64,
+) -> u64 {
+    let active = total
+        .checked_sub(paused_accum + current_pause.unwrap_or_default())
+        .unwrap_or_default();
+    base_ms + active.as_millis() as u64
+}
+
 /// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
 struct ActiveSession {
     handle: RecordingHandle,
@@ -39,6 +53,22 @@ struct ActiveSession {
     system_audio: String,
     /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
     diarization: String,
+    /// 计时：会话入槽时刻、续录基线、暂停起点（Some=暂停中）、已累计暂停时长。
+    started: std::time::Instant,
+    base_ms: u64,
+    paused_at: Option<std::time::Instant>,
+    paused_accum: std::time::Duration,
+}
+
+impl ActiveSession {
+    fn elapsed_ms(&self) -> u64 {
+        active_elapsed_ms(
+            self.started.elapsed(),
+            self.paused_accum,
+            self.paused_at.map(|p| p.elapsed()),
+            self.base_ms,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -164,7 +194,7 @@ fn spawn_session(
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new() });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -346,7 +376,12 @@ fn spawn_session(
                     writer_d.lock().unwrap().store_centroids(&snaps);
                 }
             },
-            None, // Task 6 接真麦克风电平回调
+            {
+                let app_l = app.clone();
+                Some(Box::new(move |rms: f32| {
+                    let _ = app_l.emit("level", ipc::LevelEvent { rms });
+                }) as Box<dyn Fn(f32) + Send>)
+            },
         );
 
         match start {
@@ -398,11 +433,15 @@ fn spawn_session(
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
+                    started: std::time::Instant::now(),
+                    base_ms,
+                    paused_at: None,
+                    paused_accum: std::time::Duration::ZERO,
                 });
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
             }
             Err(se) => {
@@ -477,7 +516,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     }
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new() },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
 }
 
@@ -486,18 +525,62 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
 fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
     match state.session.lock().unwrap().as_ref() {
         Some(s) => ipc::StatusEvent {
-            state: "recording".into(),
+            state: if s.paused_at.is_some() { "paused".into() } else { "recording".into() },
             system_audio: s.system_audio.clone(),
             note_id: s.note_id.clone(),
             diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
         },
         None => ipc::StatusEvent {
             state: "idle".into(),
             system_audio: String::new(),
             note_id: String::new(),
             diarization: String::new(),
+            elapsed_ms: 0,
         },
     }
+}
+
+#[tauri::command]
+fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let ev = {
+        let mut slot = state.session.lock().unwrap();
+        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        if s.paused_at.is_some() {
+            return Ok(()); // 已暂停：幂等
+        }
+        s.handle.set_paused(true);
+        s.paused_at = Some(std::time::Instant::now());
+        ipc::StatusEvent {
+            state: "paused".into(),
+            system_audio: s.system_audio.clone(),
+            note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
+        }
+    };
+    let _ = app.emit("status", ev);
+    Ok(())
+}
+
+#[tauri::command]
+fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let ev = {
+        let mut slot = state.session.lock().unwrap();
+        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(p) = s.paused_at.take() else { return Ok(()) }; // 未暂停：幂等
+        s.paused_accum += p.elapsed();
+        s.handle.set_paused(false);
+        ipc::StatusEvent {
+            state: "recording".into(),
+            system_audio: s.system_audio.clone(),
+            note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
+        }
+    };
+    let _ = app.emit("status", ev);
+    Ok(())
 }
 
 #[tauri::command]
@@ -721,6 +804,8 @@ pub fn run() {
             resume_recording,
             stop_recording,
             recording_status,
+            pause_recording,
+            unpause_recording,
             list_notes,
             get_note,
             rename_note,
@@ -735,4 +820,20 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_elapsed_ms;
+    use std::time::Duration;
+
+    #[test]
+    fn active_elapsed_subtracts_pauses_and_adds_base() {
+        let s = Duration::from_secs;
+        assert_eq!(active_elapsed_ms(s(10), s(0), None, 0), 10_000, "无暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(3), None, 0), 7_000, "扣已累计暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
+        assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
 }
