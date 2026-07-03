@@ -44,7 +44,7 @@ fn label(seg: &SegmentRecord) -> &str {
     }
 }
 
-/// 头部第二行："2026-07-03 15:04 – 16:12（1 小时 8 分）"；中断会议结束时间标「中断」。
+/// 头部第二行："2026-07-03 15:04 – 16:12(1 小时 8 分)"；中断会议结束时间标「中断」。
 fn header_line(note: &Note) -> Option<String> {
     let start = chrono::DateTime::parse_from_rfc3339(&note.meta.started_at).ok()?;
     let start_str = start.format("%Y-%m-%d %H:%M").to_string();
