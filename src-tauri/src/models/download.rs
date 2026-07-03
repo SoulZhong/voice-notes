@@ -127,6 +127,10 @@ pub fn download_artifact(
     } else if status == 200 {
         offset = 0; // 服务端不支持 Range（或首次下载）：从头来
         out = fs::File::create(&part)?;
+    } else if status == 416 {
+        // 续传偏移越界（上次崩溃残留满尺寸 .part）：清掉重来，下次重试从头下载。
+        let _ = fs::remove_file(&part);
+        anyhow::bail!("续传偏移越界，已清理残留分片，请重试");
     } else {
         anyhow::bail!("HTTP {status}");
     }
