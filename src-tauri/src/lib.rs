@@ -30,6 +30,8 @@ struct ActiveSession {
     handle: RecordingHandle,
     writer: Arc<Mutex<store::writer::NoteWriter>>,
     note_id: String,
+    /// classify_system 的结果："on" | "denied" | "unavailable"，供重挂载时重建状态。
+    system_audio: String,
 }
 
 #[derive(Default)]
@@ -250,6 +252,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     handle: start.handle,
                     writer: writer.clone(),
                     note_id: note_id.clone(),
+                    system_audio: system_audio.clone(),
                 });
                 drop(running_guard);
                 let _ = app.emit(
@@ -295,6 +298,23 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     );
 }
 
+/// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
+#[tauri::command]
+fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
+    match state.session.lock().unwrap().as_ref() {
+        Some(s) => ipc::StatusEvent {
+            state: "recording".into(),
+            system_audio: s.system_audio.clone(),
+            note_id: s.note_id.clone(),
+        },
+        None => ipc::StatusEvent {
+            state: "idle".into(),
+            system_audio: String::new(),
+            note_id: String::new(),
+        },
+    }
+}
+
 #[tauri::command]
 fn list_notes(app: AppHandle, state: State<AppState>) -> Result<Vec<store::NoteSummary>, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
@@ -317,7 +337,10 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 }
 
 #[tauri::command]
-fn rename_note(app: AppHandle, id: String, title: String) -> Result<(), String> {
+fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String) -> Result<(), String> {
+    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
+        return Err("录制中的笔记不能改名".into());
+    }
     let title = title.trim();
     if title.is_empty() {
         return Err("标题不能为空".into());
@@ -352,6 +375,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            recording_status,
             list_notes,
             get_note,
             rename_note,

@@ -86,14 +86,15 @@ impl NoteWriter {
         self.flush_pending()
     }
 
-    /// 收尾：补写待写队列 → meta 置 complete。队列仍写不出时也更新 meta，
-    /// 并把队列错误上抛（内容此时只可能因磁盘持续故障而丢，调用方告警）。
+    /// 收尾：先补写待写队列；仍写不出则直接返回 Err、**不动 meta**——state 留在
+    /// "recording"，笔记诚实地显示为「已中断」（详情页/列表页已有对应横幅/徽标），
+    /// 而不是被静默标记为 complete 掩盖内容缺失。队列补写成功后才把
+    /// ended_at 写入、state 置 complete 并原子落盘。
     pub fn finalize(&mut self, now: DateTime<Local>) -> anyhow::Result<()> {
-        let flush_result = self.flush_pending();
+        self.flush_pending()?;
         self.meta.ended_at = Some(now.to_rfc3339());
         self.meta.state = "complete".into();
-        write_meta_atomic(&self.dir, &self.meta)?;
-        flush_result
+        write_meta_atomic(&self.dir, &self.meta)
     }
 
     fn flush_pending(&mut self) -> anyhow::Result<()> {
@@ -210,6 +211,34 @@ mod tests {
         // finalize 重建 meta（此前随目录被删）
         w.finalize(now()).unwrap();
         assert_eq!(read_meta(&dir).state, "complete");
+    }
+
+    #[test]
+    fn finalize_fails_leaves_recording_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let dir = w.dir().to_path_buf();
+
+        // 模拟句柄失效 + 目录消失：append 必须失败，段留在待写队列
+        w.file = None;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(w.append_final("mic", "会丢失吗", 0, 1000).is_err());
+
+        // 目录仍不存在：finalize 应失败，且不得把 state 标记为 complete
+        // （此时磁盘上连 meta.json 都不存在，正是"不诚实的 complete"要避免的场景）。
+        assert!(w.finalize(now()).is_err());
+
+        // 目录恢复后：finalize 应能补写队列并把 meta 正常置 complete，
+        // 验证"失败不置 complete、恢复后可补救"的语义。
+        std::fs::create_dir_all(&dir).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000).unwrap();
+        w.finalize(now()).unwrap();
+
+        let meta = read_meta(&dir);
+        assert_eq!(meta.state, "complete");
+        assert!(meta.ended_at.is_some());
+        let lines = read_lines(&dir);
+        assert_eq!(lines.len(), 2, "两段都应补写，一段不丢");
     }
 
     #[test]

@@ -3,7 +3,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { onPartial, onStatus, onFinal, onStorage, type Source, type SystemAudio } from "$lib/events";
+  import { onPartial, onStatus, onFinal, onStorage, type Source, type SystemAudio, type StatusEvent } from "$lib/events";
 
   type Line = { source: Source; text: string };
 
@@ -32,6 +32,7 @@
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
         partialMic = "";
         partialSystem = "";
+        storageDegraded = false;
         if (e.state === "stopped" && e.note_id) {
           goto(`/notes/${e.note_id}`);
         }
@@ -44,6 +45,15 @@
     });
     const u4 = onStorage((e) => {
       storageDegraded = e.state === "degraded";
+    });
+    // 重挂载时事件非粘性：主动查询一次当前录制状态，避免离开 /record 再返回
+    // 时 status 停在初始的 "idle" 导致停止按钮永久 disabled。返回 idle 时不覆盖
+    // 任何状态，避免与几乎同时到达的真实 "status" 事件竞争。
+    invoke<StatusEvent>("recording_status").then((s) => {
+      if (s.state === "recording") {
+        status = s.state;
+        systemAudio = s.system_audio;
+      }
     });
     return () => {
       u1.then((f) => f());
