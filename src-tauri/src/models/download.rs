@@ -119,7 +119,16 @@ pub fn download_artifact(
 
     let req = ureq::get(url).timeout(Duration::from_secs(600 * 60)); // 大文件慢链路：整体超时放极宽，靠取消兜底
     let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
-    let resp = req.call().map_err(|e| anyhow::anyhow!("请求失败: {e}"))?;
+    let resp = match req.call() {
+        Ok(r) => r,
+        // ureq 对 4xx/5xx 返回 Err(Status)。416 = 续传偏移越界（上次崩溃残留
+        // 满尺寸 .part）：清掉重来，下次重试从头下载。
+        Err(ureq::Error::Status(416, _)) => {
+            let _ = fs::remove_file(&part);
+            anyhow::bail!("续传偏移越界，已清理残留分片，请重试");
+        }
+        Err(e) => anyhow::bail!("请求失败: {e}"),
+    };
     let status = resp.status();
     let out: fs::File;
     if status == 206 {
@@ -127,10 +136,6 @@ pub fn download_artifact(
     } else if status == 200 {
         offset = 0; // 服务端不支持 Range（或首次下载）：从头来
         out = fs::File::create(&part)?;
-    } else if status == 416 {
-        // 续传偏移越界（上次崩溃残留满尺寸 .part）：清掉重来，下次重试从头下载。
-        let _ = fs::remove_file(&part);
-        anyhow::bail!("续传偏移越界，已清理残留分片，请重试");
     } else {
         anyhow::bail!("HTTP {status}");
     }
