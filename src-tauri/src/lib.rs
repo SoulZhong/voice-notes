@@ -143,7 +143,8 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
-        let recognizer = match recognizer_cache.lock().unwrap().take() {
+        let taken = recognizer_cache.lock().unwrap().take();
+        let recognizer = match taken {
             Some(r) => r,
             None => match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
                 Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
@@ -155,7 +156,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         let vad_path = models_dir().join("silero_vad.onnx");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
-            Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
+            Err(e) => {
+                stash_recognizer(&recognizer_cache, Some(recognizer));
+                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+            }
         };
         let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
             Source::Mic,
@@ -185,7 +189,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             .and_then(|d| store::writer::NoteWriter::create(&d, chrono::Local::now()))
         {
             Ok(w) => Arc::new(Mutex::new(w)),
-            Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: 创建笔记失败: {e}")),
+            Err(e) => {
+                stash_recognizer(&recognizer_cache, Some(recognizer));
+                return fail(&app, &running, &generation, my_gen, format!("error: 创建笔记失败: {e}"));
+            }
         };
         let note_id = writer.lock().unwrap().note_id().to_string();
 
