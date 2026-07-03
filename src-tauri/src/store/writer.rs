@@ -273,13 +273,15 @@ mod tests {
         let start = crate::session::start_session(
             sources,
             Box::new(CountingRecognizer),
+            None,
             16000,
             4000,
-            move |src, text, start_ms, end_ms| {
+            move |src, text, start_ms, end_ms, _spk| {
                 w2.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms).unwrap();
                 *e2.lock().unwrap() += 1;
             },
             |_, _| {},
+            |_| {},
         )
         .expect("start_session");
         let _ = start.handle.stop(); // MockCapture 已灌完帧；stop 排干全部 finals

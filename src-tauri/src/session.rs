@@ -1,5 +1,7 @@
 use crate::asr::Recognizer;
 use crate::audio::{AudioCapture, AudioFrame, Source};
+use crate::diar::registry::SpeakerRegistry;
+use crate::diar::SpeakerEmbedder;
 use crate::pipeline::segment_worker::run_segment_worker;
 use crate::pipeline::segmenter::Segmenter;
 use crossbeam_channel::Receiver;
@@ -23,15 +25,28 @@ pub struct PartialJob {
     pub samples: Vec<f32>,
 }
 
+/// diarization 侧事件:说话人表变化 / 簇合并(需回写落盘与 UI)。
+#[derive(Debug, Clone)]
+pub enum DiarEvent {
+    SpeakersChanged(Vec<crate::diar::registry::SpeakerInfo>),
+    Merged { loser: String, winner: String },
+}
+
 /// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
+/// 每条 final 定稿时额外提声纹嵌入并归簇（嵌入失败/无 embedder/panic 均降级为 None，绝不影响文本）；
+/// 归簇产生的簇合并 / 说话人表变化通过 on_diar 通知（顺序：先 Merged 后 SpeakersChanged）。
 pub fn run_asr_worker(
     mut recognizer: Box<dyn Recognizer>,
+    mut embedder: Option<Box<dyn SpeakerEmbedder>>,
     finals_rx: Receiver<FinalJob>,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
-    mut on_final: impl FnMut(Source, String, u64, u64),
+    mut on_final: impl FnMut(Source, String, u64, u64, Option<String>),
     mut on_partial: impl FnMut(Source, String),
-) -> Box<dyn Recognizer> {
+    mut on_diar: impl FnMut(DiarEvent),
+) -> (Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>) {
+    let mut registry = SpeakerRegistry::new();
+    let mut known_speakers = 0usize;
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
@@ -48,7 +63,31 @@ pub fn run_asr_worker(
                         "[识别失败]".to_string()
                     }
                 };
-                on_final(job.source, text, job.start_ms, job.end_ms);
+                // 声纹:嵌入失败/无 embedder → None,绝不影响文本
+                let speaker = embedder.as_mut().and_then(|e| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        e.embed(&job.samples)
+                    })) {
+                        Ok(Ok(v)) => registry.assign(&v, job.source.as_str(), job.samples.len()),
+                        Ok(Err(err)) => {
+                            eprintln!("声纹提取失败({:?} 段): {err}", job.source);
+                            None
+                        }
+                        Err(_) => {
+                            eprintln!("声纹提取 panic({:?} 段),该段无标签", job.source);
+                            None
+                        }
+                    }
+                });
+                for (loser, winner) in registry.take_merges() {
+                    on_diar(DiarEvent::Merged { loser, winner });
+                }
+                let speakers = registry.speakers();
+                if speakers.len() != known_speakers {
+                    known_speakers = speakers.len();
+                    on_diar(DiarEvent::SpeakersChanged(speakers));
+                }
+                on_final(job.source, text, job.start_ms, job.end_ms, speaker);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // 空闲：服务每源最新 partial（取出即清空，只识别最新一版）。
@@ -73,21 +112,21 @@ pub fn run_asr_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
-    recognizer
+    (recognizer, embedder)
 }
 
 /// 一次录制会话的句柄：持两路 capture + 各 worker 的 join 句柄。
 pub struct RecordingHandle {
     captures: Vec<Box<dyn AudioCapture>>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    asr: Option<std::thread::JoinHandle<Box<dyn Recognizer>>>,
+    asr: Option<std::thread::JoinHandle<(Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>)>>,
 }
 
 impl RecordingHandle {
     /// 优雅停止：停各 capture（关帧通道）→ 分段 worker flush 尾段后退出并 join
     /// →（其 finals 发送端随之 drop）ASR worker 排干剩余 finals 后退出并 join，
-    /// 返还 recognizer 供复用（asr 线程 panic 时返 None，调用方现场重载兜底）。
-    pub fn stop(mut self) -> Option<Box<dyn Recognizer>> {
+    /// 返还 recognizer / embedder 供复用（asr 线程 panic 时均返 None，调用方现场重载兜底）。
+    pub fn stop(mut self) -> (Option<Box<dyn Recognizer>>, Option<Box<dyn SpeakerEmbedder>>) {
         for c in self.captures.iter_mut() {
             c.stop();
         }
@@ -96,13 +135,13 @@ impl RecordingHandle {
         }
         match self.asr.take() {
             Some(a) => match a.join() {
-                Ok(r) => Some(r),
+                Ok((r, e)) => (Some(r), e),
                 Err(_) => {
-                    eprintln!("RecordingHandle::stop: asr 线程异常退出（panic），识别器不回收");
-                    None
+                    eprintln!("RecordingHandle::stop: asr 线程异常退出（panic），模型不回收");
+                    (None, None)
                 }
             },
-            None => None,
+            None => (None, None),
         }
     }
 }
@@ -114,10 +153,11 @@ pub struct SessionStart {
     pub failed: Vec<(Source, String)>,
 }
 
-/// start_session 失败时携带 recognizer 返还，避免常驻识别器在错误路径丢失。
+/// start_session 失败时携带 recognizer / embedder 返还，避免常驻模型在错误路径丢失。
 pub struct StartError {
     pub error: anyhow::Error,
     pub recognizer: Box<dyn Recognizer>,
+    pub embedder: Option<Box<dyn SpeakerEmbedder>>,
 }
 
 impl std::fmt::Debug for StartError {
@@ -132,10 +172,12 @@ impl std::fmt::Debug for StartError {
 pub fn start_session(
     sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)>,
     recognizer: Box<dyn Recognizer>,
+    embedder: Option<Box<dyn SpeakerEmbedder>>,
     target_rate: u32,
     partial_interval_samples: usize,
-    on_final: impl FnMut(Source, String, u64, u64) + Send + 'static,
+    on_final: impl FnMut(Source, String, u64, u64, Option<String>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
+    on_diar: impl FnMut(DiarEvent) + Send + 'static,
 ) -> Result<SessionStart, StartError> {
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
     let mut slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)> = Vec::new();
@@ -182,11 +224,12 @@ pub fn start_session(
         return Err(StartError {
             error: anyhow::anyhow!("没有可用音频源可启动: {failed:?}"),
             recognizer,
+            embedder,
         });
     }
 
     let asr = std::thread::spawn(move || {
-        run_asr_worker(recognizer, finals_rx, slots, on_final, on_partial)
+        run_asr_worker(recognizer, embedder, finals_rx, slots, on_final, on_partial, on_diar)
     });
 
     Ok(SessionStart {
@@ -201,6 +244,7 @@ mod asr_worker_tests {
     use super::*;
     use crate::asr::{Recognizer, Transcript};
     use crate::audio::Source;
+    use crate::diar::MockEmbedder;
     use std::sync::{Arc, Mutex};
 
     struct CountingRecognizer;
@@ -232,10 +276,12 @@ mod asr_worker_tests {
         let f2 = finals.clone();
         let _ = run_asr_worker(
             Box::new(CountingRecognizer),
+            None,
             rx,
             vec![],
-            move |s, t, start_ms, end_ms| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
+            move |s, t, start_ms, end_ms, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
             |_, _| {},
+            |_| {},
         );
         assert_eq!(
             *finals.lock().unwrap(),
@@ -257,10 +303,12 @@ mod asr_worker_tests {
         let f2 = finals.clone();
         let _ = run_asr_worker(
             Box::new(FlakyRecognizer { n: 0 }),
+            None,
             rx,
             vec![],
-            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
+            |_| {},
         );
         assert_eq!(
             *finals.lock().unwrap(),
@@ -294,10 +342,12 @@ mod asr_worker_tests {
         std::panic::set_hook(Box::new(|_| {}));
         let _ = run_asr_worker(
             Box::new(PanicRecognizer { n: 0 }),
+            None,
             rx,
             vec![],
-            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
+            |_| {},
         );
         std::panic::set_hook(prev);
 
@@ -321,10 +371,12 @@ mod asr_worker_tests {
         let worker = std::thread::spawn(move || {
             let _ = run_asr_worker(
                 Box::new(CountingRecognizer),
+                None,
                 rx,
                 vec![(Source::System, slot_for_worker)],
-                |_, _, _, _| {},
+                |_, _, _, _, _| {},
                 move |s, t| p2.lock().unwrap().push((s, t)),
+                |_| {},
             );
         });
 
@@ -343,6 +395,78 @@ mod asr_worker_tests {
         assert!(serviced, "空闲时应服务 partial 槽");
         assert_eq!(*partials.lock().unwrap(), vec![(Source::System, "len=7".into())]);
         assert!(slot.lock().unwrap().is_none(), "partial 取出后槽应清空");
+    }
+
+    #[test]
+    fn finals_get_speaker_labels_and_diar_events() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // 两段长音频:第一段 → S1;第二段正交向量 → S2
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 2000, end_ms: 4000 }).unwrap();
+        drop(tx);
+
+        let embedder = MockEmbedder::new(vec![
+            Ok(vec![1.0, 0.0, 0.0]),
+            Ok(vec![0.0, 1.0, 0.0]),
+        ]);
+        let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let diar_events = Arc::new(Mutex::new(0usize));
+        let (f2, d2) = (finals.clone(), diar_events.clone());
+        let (_r, e) = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            rx,
+            vec![],
+            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            |_, _| {},
+            move |_ev| *d2.lock().unwrap() += 1,
+        );
+        assert!(e.is_some(), "embedder 应返还");
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![Some("S1".into()), Some("S2".into())]
+        );
+        assert!(*diar_events.lock().unwrap() >= 2, "每个新说话人应发 SpeakersChanged");
+    }
+
+    #[test]
+    fn embed_failure_degrades_to_null_speaker() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        drop(tx);
+        let embedder = MockEmbedder::new(vec![Err(anyhow::anyhow!("boom"))]);
+        let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            rx,
+            vec![],
+            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(*finals.lock().unwrap(), vec![None], "嵌入失败段 speaker 为 null,不影响文本");
+    }
+
+    #[test]
+    fn no_embedder_all_speakers_null() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        drop(tx);
+        let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let f2 = finals.clone();
+        let (_r, e) = run_asr_worker(
+            Box::new(CountingRecognizer),
+            None,
+            rx,
+            vec![],
+            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            |_, _| {},
+            |_| {},
+        );
+        assert!(e.is_none());
+        assert_eq!(*finals.lock().unwrap(), vec![None]);
     }
 }
 
@@ -413,10 +537,12 @@ mod session_tests {
         let start = start_session(
             sources,
             Box::new(CountingRecognizer),
+            None,
             16000,
             4000,
-            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
+            |_| {},
         )
         .expect("start_session");
 
@@ -447,10 +573,19 @@ mod session_tests {
             Box::new(IdlingCapture::from_fixture()),
             Box::new(MockSegmenter::new(2000)),
         )];
-        let start = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _, _, _| {}, |_, _| {})
-            .expect("start_session");
-        let returned = start.handle.stop();
-        assert!(returned.is_some(), "停止后应返还 recognizer 供复用");
+        let start = start_session(
+            sources,
+            Box::new(CountingRecognizer),
+            None,
+            16000,
+            4000,
+            |_, _, _, _, _| {},
+            |_, _| {},
+            |_| {},
+        )
+        .expect("start_session");
+        let (r, _e) = start.handle.stop();
+        assert!(r.is_some(), "停止后应返还 recognizer 供复用");
     }
 
     #[test]
@@ -464,7 +599,16 @@ mod session_tests {
         }
         let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
             vec![(Source::System, Box::new(FailingCapture), Box::new(MockSegmenter::new(8000)))];
-        let r = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _, _, _| {}, |_, _| {});
+        let r = start_session(
+            sources,
+            Box::new(CountingRecognizer),
+            None,
+            16000,
+            4000,
+            |_, _, _, _, _| {},
+            |_, _| {},
+            |_| {},
+        );
         let err = match r {
             Ok(_) => panic!("无源可启动应返回 Err"),
             Err(e) => e,

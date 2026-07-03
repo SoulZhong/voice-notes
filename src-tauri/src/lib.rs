@@ -211,9 +211,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         let start = session::start_session(
             sources,
             recognizer,
+            None,
             16000,
             16000,
-            move |src, text, start_ms, end_ms| {
+            move |src, text, start_ms, end_ms, _spk| {
                 // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
                 match writer_f.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms) {
                     Ok(()) => {
@@ -241,13 +242,15 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     ipc::PartialEvent { source: src.as_str().into(), text },
                 );
             },
+            |_diar| {},
         );
 
         match start {
             Ok(start) => {
                 // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
                 if !start.active.contains(&Source::Mic) {
-                    stash_recognizer(&recognizer_cache, start.handle.stop()); // 先排干可能已产生的 system finals
+                    let (r, _e) = start.handle.stop(); // 先排干可能已产生的 system finals
+                    stash_recognizer(&recognizer_cache, r);
                     abort_or_finalize(&writer);
                     let mic_err = start.failed.iter()
                         .find(|(s, _)| *s == Source::Mic)
@@ -276,7 +279,8 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 if !*running_guard || *gen_guard != my_gen {
                     drop(gen_guard);
                     drop(running_guard);
-                    stash_recognizer(&recognizer_cache, start.handle.stop());
+                    let (r, _e) = start.handle.stop();
+                    stash_recognizer(&recognizer_cache, r);
                     abort_or_finalize(&writer); // 被 stop/新 start 抢先：有内容则收尾保全（flush 失败时留 recording）
                     return;
                 }
@@ -320,7 +324,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     let sess = state.session.lock().unwrap().take();
     let mut note_id = String::new();
     if let Some(s) = sess {
-        let returned = s.handle.stop(); // 排干 finals：所有 append 在此完成
+        let (returned, _embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
         stash_recognizer(&state.recognizer_cache, returned);
         note_id = s.note_id;
         if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
