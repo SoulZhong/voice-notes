@@ -35,3 +35,5 @@ tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_13_0"] }
+# P4 VPIO spike: Apple 内建 AEC(VoiceProcessingIO)采集麦克风。crate 名 `coreaudio`。
+coreaudio-rs = { version = "0.12", default-features = false, features = ["audio_unit", "core_audio"] }

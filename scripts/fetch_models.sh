@@ -27,3 +27,12 @@ if [ ! -d "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17" ]; then
   rm -f sv.tar.bz2
   echo "SenseVoice 模型已就绪：$DIR/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 fi
+
+# 3D-Speaker CAM++ 中文声纹模型(说话人区分用)
+SPK_MODEL="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+if [ ! -f "$SPK_MODEL" ]; then
+  SPK_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/$SPK_MODEL"
+  echo "下载声纹模型 $SPK_URL ..."
+  curl -fL -o "$SPK_MODEL" "$SPK_URL"
+  echo "声纹模型已就绪：$DIR/$SPK_MODEL"
+fi

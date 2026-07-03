@@ -4,6 +4,7 @@ pub mod asr;
 mod ipc;
 mod session;
 mod store;
+pub mod diar;
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
@@ -14,16 +15,17 @@ use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
 // 锁序约定（必须在任何持锁场景下遵守）：running → generation → session_slot。
-// 只有 start_recording 的加载线程会嵌套持有 running→generation（以及 running→
+// 只有 spawn_session 的加载线程会嵌套持有 running→generation（以及 running→
 // generation→session_slot），且只在极短的检查/存储语句内完成；stop_recording
 // 每条语句只持有一把锁，从不同时持有两把，因此不存在死锁风险。
 //
-// generation 协议：stop_recording 和每次新的 start_recording 都会递增
-// generation。加载线程在耗时的模型/会话初始化完成后，无论是要存 session
-// （成功路径）还是要清空 running（失败路径 fail()），都必须先确认自己捕获的
-// my_gen 仍然等于当前 generation —— 只有仍是"当前代"时，才允许改动共享状态；
-// 否则说明该线程是被后续 stop/start 抢先淘汰的过期加载，直接静默让路，避免
-// 已被覆盖或已被终止的会话把自己的（过期的）结果错误地写回全局状态。
+// generation 协议：stop_recording 和每次新的 spawn_session 调用（start_recording
+// 与 resume_recording 均经它发起，二者的守卫逻辑完全相同）都会递增 generation。
+// 加载线程在耗时的模型/会话初始化完成后，无论是要存 session（成功路径）还是要
+// 清空 running（失败路径 fail()），都必须先确认自己捕获的 my_gen 仍然等于当前
+// generation —— 只有仍是"当前代"时，才允许改动共享状态；否则说明该线程是被后续
+// stop/start/resume 抢先淘汰的过期加载，直接静默让路，避免已被覆盖或已被终止的
+// 会话把自己的（过期的）结果错误地写回全局状态。
 
 /// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
 struct ActiveSession {
@@ -32,6 +34,8 @@ struct ActiveSession {
     note_id: String,
     /// classify_system 的结果："on" | "denied" | "unavailable"，供重挂载时重建状态。
     system_audio: String,
+    /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
+    diarization: String,
 }
 
 #[derive(Default)]
@@ -42,6 +46,8 @@ struct AppState {
     /// 常驻识别器（启动预载、开录取用、停录归还）。叶子锁：绝不与上面三把锁嵌套持有；
     /// 预载线程持锁加载，使开录 take() 自然阻塞至就绪且永不双重加载。
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
 }
 
 fn models_dir() -> PathBuf {
@@ -59,32 +65,36 @@ fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全，无内容则删掉空文件夹。
+/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全；无内容且是本会话新建的才删空目录；
+/// 续录打开的既有笔记(即使零段)绝不删——留 recording 态(诚实显示「已中断」)。
 fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
     let mut w = writer.lock().unwrap();
     if w.has_content() {
         if let Err(e) = w.finalize(chrono::Local::now()) {
             eprintln!("abort_or_finalize: finalize 失败: {e}");
         }
-    } else {
+    } else if w.created_this_session() {
         let dir = w.dir().to_path_buf();
         drop(w);
         let _ = std::fs::remove_dir_all(dir);
     }
+    // 既有笔记零段:什么都不做,meta 留 recording,内容零损失。
 }
 
-/// 归还识别器进常驻槽（None = asr 线程 panic 等，不回收）。
-fn stash_recognizer(
-    cache: &Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
-    r: Option<Box<dyn asr::Recognizer>>,
-) {
-    if let Some(r) = r {
-        *cache.lock().unwrap() = Some(r);
+/// 归还识别器/嵌入器进常驻槽（None = 没取到、asr 线程 panic 等，不回收）。
+/// recognizer_cache 与 embedder_cache 策略完全一致，故共用一个泛型实现。
+fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>) {
+    if let Some(m) = m {
+        *cache.lock().unwrap() = Some(m);
     }
 }
 
 fn sense_voice_dir() -> PathBuf {
     models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+}
+
+fn speaker_model_path() -> PathBuf {
+    models_dir().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -103,29 +113,42 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
     }
 }
 
-#[tauri::command]
-fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 会话加载线程要落盘的目标笔记：New = 新建，Resume = 续录既有非活动笔记
+/// （已中断或已完成均可）。spawn_session 据此分支 writer 的创建方式。
+enum NoteTarget {
+    New,
+    Resume(String),
+}
+
+/// start_recording / resume_recording 共用的会话启动实现：running/generation
+/// 守卫（拒绝重复录制、递增 generation）+ 加载线程 spawn。二者的运行守卫与
+/// 竞态处理完全一致（同一份代码），仅 target 决定 writer 走 create 还是 resume。
+fn spawn_session(
+    app: AppHandle,
+    running: Arc<Mutex<bool>>,
+    generation: Arc<Mutex<u64>>,
+    session_slot: Arc<Mutex<Option<ActiveSession>>>,
+    recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    target: NoteTarget,
+) -> Result<(), String> {
     let my_gen = {
-        let mut r = state.running.lock().unwrap();
+        let mut r = running.lock().unwrap();
         if *r {
             return Err("已在录制".into());
         }
         *r = true;
         // 锁序 running → generation：running 锁仍持有时嵌套锁 generation 并
         // 递增，捕获的 my_gen 即本次会话的"代号"，随线程一起移动。
-        let mut g = state.generation.lock().unwrap();
+        let mut g = generation.lock().unwrap();
         *g += 1;
         *g
     };
-    let running = state.running.clone();
-    let generation = state.generation.clone();
-    let session_slot = state.session.clone();
-    let recognizer_cache = state.recognizer_cache.clone();
 
     std::thread::spawn(move || {
         // fail()：加载过程中任何一步失败都会调用。必须先确认 my_gen 仍是当前代
         // 才清空 running / 发出 error —— 否则说明本线程已过期（被后续的
-        // stop/start 淘汰），其失败结果不该覆盖更新的会话状态，静默丢弃即可。
+        // stop/start/resume 淘汰），其失败结果不该覆盖更新的会话状态，静默丢弃即可。
         let fail = |app: &AppHandle, running: &Arc<Mutex<bool>>, generation: &Arc<Mutex<u64>>, my_gen: u64, msg: String| {
             let running_guard = running.lock().unwrap();
             let gen_guard = generation.lock().unwrap();
@@ -139,7 +162,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new() });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new() });
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -151,21 +174,30 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
             },
         };
+        // 1.5) 取常驻声纹嵌入器；与 recognizer 完全对称的取用节奏（其后），但槽空
+        // 时不现场加载——预载失败即降级为无声纹（说话人区分不可用），而不是在
+        // 开录路径上额外背一次模型加载的延迟/失败风险。
+        let embedder = embedder_cache.lock().unwrap().take();
+        // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
+        let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
         // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
         let vad_path = models_dir().join("silero_vad.onnx");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
             Err(e) => {
-                stash_recognizer(&recognizer_cache, Some(recognizer));
+                stash_model(&recognizer_cache, Some(recognizer));
+                stash_model(&embedder_cache, embedder);
                 return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
             }
         };
-        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
-            Source::Mic,
-            Box::new(audio::microphone::Microphone::new()),
-            mic_seg,
-        )];
+        // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
+        #[cfg(target_os = "macos")]
+        let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
+        #[cfg(not(target_os = "macos"))]
+        let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
+            vec![(Source::Mic, mic, mic_seg)];
 
         #[cfg(target_os = "macos")]
         {
@@ -184,31 +216,57 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             }
         }
 
-        // 2.5) 创建笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
-        let writer = match notes_dir(&app)
-            .and_then(|d| store::writer::NoteWriter::create(&d, chrono::Local::now()))
-        {
+        // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
+        // New → NoteWriter::create；Resume → NoteWriter::resume（meta 损坏/id 不存在 → Err）。
+        let writer = match notes_dir(&app).and_then(|d| match &target {
+            NoteTarget::New => store::writer::NoteWriter::create(&d, chrono::Local::now()),
+            NoteTarget::Resume(id) => store::writer::NoteWriter::resume(&d, id),
+        }) {
             Ok(w) => Arc::new(Mutex::new(w)),
             Err(e) => {
-                stash_recognizer(&recognizer_cache, Some(recognizer));
-                return fail(&app, &running, &generation, my_gen, format!("error: 创建笔记失败: {e}"));
+                stash_model(&recognizer_cache, Some(recognizer));
+                stash_model(&embedder_cache, embedder);
+                let msg = match &target {
+                    NoteTarget::New => format!("error: 创建笔记失败: {e}"),
+                    NoteTarget::Resume(_) => format!("error: 续录笔记失败: {e}"),
+                };
+                return fail(&app, &running, &generation, my_gen, msg);
             }
         };
         let note_id = writer.lock().unwrap().note_id().to_string();
+        // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
+        // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
+        let base_ms = writer.lock().unwrap().base_ms();
+        // 说话人编号/质心延续：New 路径表为空 ⇒ 等价 SpeakerRegistry::new()；
+        // Resume 路径从 speakers.json 已加载的质心表重建（同一人保持同一编号）。
+        let registry = crate::diar::registry::SpeakerRegistry::from_snapshot(
+            &writer.lock().unwrap().registry_snapshot(),
+        );
 
         // 3) 起会话。emit 回调带 source 字符串。
         let app_f = app.clone();
         let app_p = app.clone();
+        let app_d = app.clone();
         let writer_f = writer.clone();
+        let writer_d = writer.clone();
         let mut degraded = false;
         let start = session::start_session(
             sources,
             recognizer,
+            embedder,
+            registry,
+            std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             16000,
             16000,
-            move |src, text, start_ms, end_ms| {
+            move |src, text, start_ms, end_ms, spk| {
+                let start_ms = start_ms + base_ms;
+                let end_ms = end_ms + base_ms;
                 // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
-                match writer_f.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms) {
+                match writer_f
+                    .lock()
+                    .unwrap()
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                {
                     Ok(()) => {
                         if degraded {
                             degraded = false;
@@ -225,7 +283,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 }
                 let _ = app_f.emit(
                     "final",
-                    ipc::FinalEvent { source: src.as_str().into(), text, start_ms, end_ms },
+                    ipc::FinalEvent { source: src.as_str().into(), text, start_ms, end_ms, speaker: spk },
                 );
             },
             move |src, text| {
@@ -234,13 +292,67 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     ipc::PartialEvent { source: src.as_str().into(), text },
                 );
             },
+            move |ev| match ev {
+                session::DiarEvent::SpeakersChanged(infos) => {
+                    let pairs: Vec<(String, Vec<String>)> = infos
+                        .iter()
+                        .map(|s| (s.id.clone(), s.sources.iter().cloned().collect()))
+                        .collect();
+                    let mut w = writer_d.lock().unwrap();
+                    if let Err(e) = w.sync_speakers(&pairs) {
+                        eprintln!("speakers.json 写入失败: {e}");
+                    }
+                    let speakers = w
+                        .speakers()
+                        .iter()
+                        .map(|(id, m)| ipc::SpeakerEntry {
+                            id: id.clone(),
+                            name: m.name.clone(),
+                            sources: m.sources.clone(),
+                        })
+                        .collect();
+                    drop(w);
+                    let _ = app_d.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
+                }
+                session::DiarEvent::Merged { loser, winner } => {
+                    let mut w = writer_d.lock().unwrap();
+                    // 落盘失败也照发 merged：内存/前端先统一（历史段徽章回写），
+                    // 磁盘落后由 storage degraded 告警，finalize 兜底再补。
+                    if let Err(e) = w.merge_speaker(&loser, &winner) {
+                        eprintln!("说话人合并重写失败({loser}->{winner}): {e}");
+                        let _ = app_d.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+                    }
+                    let speakers = w
+                        .speakers()
+                        .iter()
+                        .map(|(id, m)| ipc::SpeakerEntry {
+                            id: id.clone(),
+                            name: m.name.clone(),
+                            sources: m.sources.clone(),
+                        })
+                        .collect();
+                    drop(w);
+                    let _ = app_d.emit(
+                        "speakers",
+                        ipc::SpeakersEvent {
+                            speakers,
+                            merged: Some(ipc::MergedPair { loser, winner }),
+                        },
+                    );
+                }
+                session::DiarEvent::Snapshot(snaps) => {
+                    writer_d.lock().unwrap().store_centroids(&snaps);
+                }
+            },
         );
 
         match start {
             Ok(start) => {
                 // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
                 if !start.active.contains(&Source::Mic) {
-                    stash_recognizer(&recognizer_cache, start.handle.stop()); // 先排干可能已产生的 system finals
+                    let (r, e) = start.handle.stop(); // 先排干可能已产生的 system finals
+                    stash_model(&recognizer_cache, r);
+                    stash_model(&embedder_cache, e);
                     abort_or_finalize(&writer);
                     let mic_err = start.failed.iter()
                         .find(|(s, _)| *s == Source::Mic)
@@ -250,14 +362,14 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
                 // running 锁内完成（锁序 running → generation → session_slot）。
-                // stop_recording 和更新的 start_recording 都会递增 generation；
-                // stop_recording 一律先置 running=false 再取 session，且从不同时
-                // 持有两把锁，因此无论 stop/新 start 发生在加载前、加载中还是加载
-                // 后，与本线程的任意交错都是安全的：
+                // stop_recording 和更新的 spawn_session 调用（新 start 或 resume）都会
+                // 递增 generation；stop_recording 一律先置 running=false 再取 session，
+                // 且从不同时持有两把锁，因此无论 stop/新 start(/resume) 发生在加载前、
+                // 加载中还是加载后，与本线程的任意交错都是安全的：
                 //  - stop 先到（running=false）：这里检测到 running==false，不存
                 //    session、不发 "recording"，直接把刚起好的会话原地停掉，避免
                 //    孤儿会话。
-                //  - 更快的 start #2 先到（running 仍为 true，但 generation 已被
+                //  - 更快的 start/resume #2 先到（running 仍为 true，但 generation 已被
                 //    #2 抢先递增）：这里检测到 gen 不等于 my_gen，说明自己是过期
                 //    加载（T1），同样不存 session、不发 "recording"，原地停掉，让
                 //    路给 #2 稍后存入的 session——修复了"T1 的 handle 被 T2 覆盖
@@ -269,8 +381,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 if !*running_guard || *gen_guard != my_gen {
                     drop(gen_guard);
                     drop(running_guard);
-                    stash_recognizer(&recognizer_cache, start.handle.stop());
-                    abort_or_finalize(&writer); // 被 stop/新 start 抢先：有内容则收尾保全（flush 失败时留 recording）
+                    let (r, e) = start.handle.stop();
+                    stash_model(&recognizer_cache, r);
+                    stash_model(&embedder_cache, e);
+                    abort_or_finalize(&writer); // 被 stop/新 start(/resume) 抢先：有内容则收尾保全（flush 失败时留 recording）
                     return;
                 }
                 drop(gen_guard);
@@ -280,15 +394,17 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     writer: writer.clone(),
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
+                    diarization: diarization.clone(),
                 });
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone() },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization },
                 );
             }
             Err(se) => {
-                stash_recognizer(&recognizer_cache, Some(se.recognizer));
+                stash_model(&recognizer_cache, Some(se.recognizer));
+                stash_model(&embedder_cache, se.embedder);
                 abort_or_finalize(&writer);
                 return fail(&app, &running, &generation, my_gen, format!("error: {}", se.error));
             }
@@ -299,13 +415,41 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    spawn_session(
+        app,
+        state.running.clone(),
+        state.generation.clone(),
+        state.session.clone(),
+        state.recognizer_cache.clone(),
+        state.embedder_cache.clone(),
+        NoteTarget::New,
+    )
+}
+
+/// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
+/// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
+#[tauri::command]
+fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    spawn_session(
+        app,
+        state.running.clone(),
+        state.generation.clone(),
+        state.session.clone(),
+        state.recognizer_cache.clone(),
+        state.embedder_cache.clone(),
+        NoteTarget::Resume(note_id),
+    )
+}
+
+#[tauri::command]
 fn stop_recording(app: AppHandle, state: State<AppState>) {
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
     // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
     // capture → flush 尾段 → 排干 finals → join）。递增 generation 让任何仍在
     // 加载窗口内的旧线程（无论其 running 检查读到 true 还是 false）都会因
     // generation 不匹配而放弃存 session / 放弃清空 running，从而不会与本次
-    // stop 产生孤儿会话或误清 running 的竞态。与 start_recording 加载线程的
+    // stop 产生孤儿会话或误清 running 的竞态。与 spawn_session 加载线程的
     // 锁序一致（running → generation → session_slot），且本函数从不同时持有
     // 两把锁，所以与加载线程的任意交错都不会死锁。
     { *state.running.lock().unwrap() = false; }
@@ -313,8 +457,9 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     let sess = state.session.lock().unwrap().take();
     let mut note_id = String::new();
     if let Some(s) = sess {
-        let returned = s.handle.stop(); // 排干 finals：所有 append 在此完成
-        stash_recognizer(&state.recognizer_cache, returned);
+        let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
+        stash_model(&state.recognizer_cache, returned);
+        stash_model(&state.embedder_cache, embedder);
         note_id = s.note_id;
         if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
             eprintln!("stop_recording: finalize 失败: {e}");
@@ -323,7 +468,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     }
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new() },
     );
 }
 
@@ -335,11 +480,13 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
             state: "recording".into(),
             system_audio: s.system_audio.clone(),
             note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
         },
         None => ipc::StatusEvent {
             state: "idle".into(),
             system_audio: String::new(),
             note_id: String::new(),
+            diarization: String::new(),
         },
     }
 }
@@ -387,6 +534,50 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
     store::NoteStore::new(dir).delete(&id).map_err(|e| e.to_string())
 }
 
+/// 改说话人显示名：录制中的笔记也允许改。
+/// 活动会话走 writer 单写者路径——在 writer 锁内改内存表并 persist_speakers 原子落盘，
+/// 与 worker 线程的 sync_speakers 共用同一把锁、同一原子写，杜绝互相覆盖窗口（不再经
+/// NoteStore 直写）；非活动笔记才走 NoteStore::rename_speaker 直写磁盘。
+#[tauri::command]
+fn rename_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+    name: String,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名字不能为空".into());
+    }
+    // 活动会话：writer 锁内改名 + 落盘 + 广播，单写者不与 sync_speakers 竞争。
+    if let Some(s) = state.session.lock().unwrap().as_ref() {
+        if s.note_id == note_id {
+            let mut w = s.writer.lock().unwrap();
+            w.set_speaker_name(&speaker_id, name);
+            let persisted = w.persist_speakers();
+            let speakers = w
+                .speakers()
+                .iter()
+                .map(|(id, m)| ipc::SpeakerEntry {
+                    id: id.clone(),
+                    name: m.name.clone(),
+                    sources: m.sources.clone(),
+                })
+                .collect();
+            drop(w);
+            persisted.map_err(|e| format!("说话人改名落盘失败: {e}"))?;
+            let _ = app.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
+            return Ok(());
+        }
+    }
+    // 非活动笔记：直写磁盘。
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .rename_speaker(&note_id, &speaker_id, name)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn export_note(app: AppHandle, id: String, format: String) -> Result<String, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
@@ -404,6 +595,7 @@ pub fn run() {
         .setup(|app| {
             // 启动预载识别器：持锁加载，开录若赶上预载会在锁上等待至就绪。
             let cache = app.state::<AppState>().recognizer_cache.clone();
+            let embedder_cache = app.state::<AppState>().embedder_cache.clone();
             std::thread::spawn(move || {
                 let mut slot = cache.lock().unwrap();
                 if slot.is_none() {
@@ -412,18 +604,34 @@ pub fn run() {
                         Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
                     }
                 }
+                // 锁序：预载是唯一嵌套持两槽者——在仍持 recognizer 槽锁期间嵌套获取
+                // embedder 槽锁，消除释放 recognizer 锁到锁定 embedder 锁之间的间隙
+                // （否则开录线程可在间隙 take 到尚空的 embedder，静默无声纹）。开录
+                // 线程从不同时持两槽（先 take recognizer 后 take embedder，各自即刻释放），
+                // 故无死锁。
+                let mut eslot = embedder_cache.lock().unwrap();
+                if eslot.is_none() {
+                    match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                        Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+                        Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
+                    }
+                }
+                drop(eslot);
+                drop(slot);
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_recording,
+            resume_recording,
             stop_recording,
             recording_status,
             list_notes,
             get_note,
             rename_note,
             delete_note,
-            export_note
+            export_note,
+            rename_speaker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
