@@ -103,3 +103,9 @@ cargo run --example vpio_probe -- --backend hal    # 零帧
 cargo run --example vpio_probe -- --rms /tmp/vpio_raw.wav
 cargo run --example vpio_probe -- --asr /tmp/vpio_raw.wav
 ```
+
+## 补充(评审修正):线程模型与 Send 约束
+
+上文「不需要像 cpal 那样把 stream 塞后台线程」的说法有误导性:`AudioCapture: Send` 是 trait bound,而 `coreaudio::sys::AudioUnit` 是裸指针、不自动 Send——直接持有会在编译期撞墙。Task 8 二选一:
+1. **推荐**:与 `Microphone`(cpal)一致的后台线程模式——AudioUnit 在后台线程创建/启动/停止/销毁,`VpioMicrophone` 只持 stop 通道(天然 Send),ready 握手照抄 microphone.rs。
+2. 或者包一层 `struct UnitHandle(AudioUnit)` 并 `unsafe impl Send`,依据:本用例中对该句柄的所有调用(Start/Stop/Uninitialize/Dispose)都串行发生、无并发访问;若选此路须在代码注释里写明该论证。
