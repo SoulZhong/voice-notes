@@ -87,7 +87,7 @@ impl NoteStore {
         let mut speakers = read_speakers(&dir);
         speakers
             .entry(speaker_id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() })
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 })
             .name = name.to_string();
         write_speakers_atomic(&dir, &speakers)
     }

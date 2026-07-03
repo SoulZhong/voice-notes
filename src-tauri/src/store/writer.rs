@@ -83,7 +83,7 @@ impl NoteWriter {
     pub fn set_speaker_name(&mut self, id: &str, name: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() })
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 })
             .name = name.to_string();
     }
 
@@ -135,6 +135,50 @@ impl NoteWriter {
         write_speakers_atomic(&self.dir, &self.speakers)
     }
 
+    /// 合入 worker 结束时的质心快照(DiarEvent::Snapshot)：只 merge 质心/count 进
+    /// 已有或新建表项，不落盘（由既有 finalize→persist_speakers 落）。
+    /// 已有表项：只更新 centroid/count，不动 name/sources（sources 已由 sync_speakers 维护）。
+    /// 新建表项：name 空串，sources 取快照。
+    pub fn store_centroids(&mut self, snaps: &[crate::diar::registry::ClusterSnapshot]) {
+        for s in snaps {
+            match self.speakers.get_mut(&s.id) {
+                Some(entry) => {
+                    entry.centroid = Some(s.centroid.clone());
+                    entry.count = s.count;
+                }
+                None => {
+                    self.speakers.insert(
+                        s.id.clone(),
+                        SpeakerMeta {
+                            name: String::new(),
+                            sources: s.sources.iter().cloned().collect(),
+                            centroid: Some(s.centroid.clone()),
+                            count: s.count,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// 从内存说话人表中有质心的项构造 registry 快照，供续录时重建 SpeakerRegistry
+    /// （编号续接、质心延续）。本任务(Task 1)只实现，暂无调用者(Task 2 消费)——
+    /// 允许 dead_code。
+    #[allow(dead_code)]
+    pub fn registry_snapshot(&self) -> Vec<crate::diar::registry::ClusterSnapshot> {
+        self.speakers
+            .iter()
+            .filter_map(|(id, m)| {
+                m.centroid.as_ref().map(|c| crate::diar::registry::ClusterSnapshot {
+                    id: id.clone(),
+                    centroid: c.clone(),
+                    count: m.count,
+                    sources: m.sources.iter().cloned().collect(),
+                })
+            })
+            .collect()
+    }
+
     /// 合入声纹归簇产生的说话人信息：只增不删，已有名字保留，sources 取并集；
     /// 有实际变化时才原子写 speakers.json（避免无谓落盘）。
     pub fn sync_speakers(&mut self, infos: &[(String, Vec<String>)]) -> anyhow::Result<()> {
@@ -142,7 +186,7 @@ impl NoteWriter {
         for (id, sources) in infos {
             let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
                 changed = true;
-                SpeakerMeta { name: String::new(), sources: Vec::new() }
+                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 }
             });
             for s in sources {
                 if !entry.sources.contains(s) {
@@ -193,7 +237,7 @@ impl NoteWriter {
             let winner_entry = self
                 .speakers
                 .entry(winner.to_string())
-                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() });
+                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 });
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
             }
@@ -473,5 +517,102 @@ mod tests {
         let note = store.load(&id).unwrap();
         assert_eq!(note.speakers["S1"].name, "李四", "finalize 兜底落盘 speakers");
         assert_eq!(note.speakers, *w.speakers(), "speakers.json 与内存一致");
+    }
+
+    #[test]
+    fn store_centroids_persists_and_old_format_speakers_json_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+
+        // store_centroids 只 merge 质心/count,不落盘;显式 persist_speakers 后重读应在。
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S1".into(),
+            centroid: vec![0.1, 0.2, 0.3],
+            count: 4,
+            sources: std::collections::BTreeSet::from(["mic".to_string()]),
+        }]);
+        w.persist_speakers().unwrap();
+
+        let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.speakers["S1"].centroid, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(note.speakers["S1"].count, 4);
+
+        // 旧格式(P4 上线前产物,无 centroid/count 字段)speakers.json 仍可解析:
+        // serde default 兜底为 None / 0。
+        std::fs::write(
+            w.dir().join("speakers.json"),
+            r#"{"S9":{"name":"老王","sources":["mic"]}}"#,
+        )
+        .unwrap();
+        let note2 = store.load(&id).unwrap();
+        let s9 = &note2.speakers["S9"];
+        assert_eq!(s9.name, "老王");
+        assert_eq!(s9.centroid, None, "旧格式无 centroid 字段应兜底为 None");
+        assert_eq!(s9.count, 0, "旧格式无 count 字段应兜底为 0");
+    }
+
+    #[test]
+    fn store_centroids_creates_new_entry_with_empty_name_and_snapshot_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        // S7 此前不在表中(未经 sync_speakers)——store_centroids 应新建表项。
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S7".into(),
+            centroid: vec![1.0, 0.0],
+            count: 2,
+            sources: std::collections::BTreeSet::from(["system".to_string()]),
+        }]);
+        let s7 = &w.speakers()["S7"];
+        assert_eq!(s7.name, "", "新建项 name 空串");
+        assert_eq!(s7.sources, vec!["system".to_string()], "新建项 sources 取快照");
+        assert_eq!(s7.centroid, Some(vec![1.0, 0.0]));
+        assert_eq!(s7.count, 2);
+    }
+
+    #[test]
+    fn store_centroids_existing_entry_only_merges_centroid_and_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.set_speaker_name("S1", "张三");
+
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S1".into(),
+            centroid: vec![0.5, 0.5],
+            count: 9,
+            sources: std::collections::BTreeSet::from(["system".to_string()]),
+        }]);
+        let s1 = &w.speakers()["S1"];
+        assert_eq!(s1.name, "张三", "已有表项 name 不受影响");
+        assert_eq!(s1.sources, vec!["mic".to_string()], "已有表项 sources 不受快照影响");
+        assert_eq!(s1.centroid, Some(vec![0.5, 0.5]));
+        assert_eq!(s1.count, 9);
+    }
+
+    #[test]
+    fn registry_snapshot_builds_only_from_entries_with_centroid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["system".into()]),
+        ])
+        .unwrap();
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S1".into(),
+            centroid: vec![1.0, 0.0],
+            count: 3,
+            sources: std::collections::BTreeSet::from(["mic".to_string()]),
+        }]);
+        // S2 无质心,不应出现在 registry_snapshot 结果中。
+        let snaps = w.registry_snapshot();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].id, "S1");
+        assert_eq!(snaps[0].centroid, vec![1.0, 0.0]);
+        assert_eq!(snaps[0].count, 3);
+        assert!(snaps[0].sources.contains("mic"));
     }
 }

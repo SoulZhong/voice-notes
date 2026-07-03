@@ -307,6 +307,9 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                         },
                     );
                 }
+                session::DiarEvent::Snapshot(snaps) => {
+                    writer_d.lock().unwrap().store_centroids(&snaps);
+                }
             },
         );
 

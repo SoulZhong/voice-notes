@@ -18,6 +18,15 @@ pub struct SpeakerInfo {
     pub sources: BTreeSet<String>,
 }
 
+/// 一簇的可导出快照(质心/计数/来源),用于跨会话续接说话人编号(P4.5)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterSnapshot {
+    pub id: String,
+    pub centroid: Vec<f32>,
+    pub count: u64,
+    pub sources: BTreeSet<String>,
+}
+
 struct Cluster {
     id: String,
     /// 成员单位向量的均值,再归一化。
@@ -152,6 +161,42 @@ impl SpeakerRegistry {
             .map(|c| SpeakerInfo { id: c.id.clone(), sources: c.sources.clone() })
             .collect()
     }
+
+    /// 导出全部簇的质心快照(供会话结束时交给 DiarEvent::Snapshot,P4.5 续录铺底)。
+    pub fn snapshot(&self) -> Vec<ClusterSnapshot> {
+        self.clusters
+            .iter()
+            .map(|c| ClusterSnapshot {
+                id: c.id.clone(),
+                centroid: c.centroid.clone(),
+                count: c.count,
+                sources: c.sources.clone(),
+            })
+            .collect()
+    }
+
+    /// 从质心快照重建 registry:编号续接(解析所有 "S{n}" 取最大 n,next_id = n+1)；
+    /// 质心为空的项不建簇但计入编号。空切片 ≡ new()。
+    pub fn from_snapshot(snaps: &[ClusterSnapshot]) -> Self {
+        let mut next_id = 1u32;
+        let mut clusters = Vec::new();
+        for s in snaps {
+            if let Some(n) = s.id.strip_prefix('S').and_then(|rest| rest.parse::<u32>().ok()) {
+                if n + 1 > next_id {
+                    next_id = n + 1;
+                }
+            }
+            if !s.centroid.is_empty() {
+                clusters.push(Cluster {
+                    id: s.id.clone(),
+                    centroid: s.centroid.clone(),
+                    count: s.count,
+                    sources: s.sources.clone(),
+                });
+            }
+        }
+        Self { clusters, next_id, assigns: 0, pending_merges: Vec::new() }
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +317,60 @@ mod tests {
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG);
         assert_eq!(r.assign(&[1.0, 0.0], "mic", LONG), None, "维度不符丢弃");
         assert_eq!(r.assign(&[0.0, 0.0, 0.0], "mic", LONG), None, "零向量丢弃");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_clusters_and_continues_assign() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG);
+        r.assign(&v(0.0, 1.0, 0.0), "system", LONG);
+        let snaps = r.snapshot();
+        assert_eq!(snaps.len(), 2);
+        let s1 = snaps.iter().find(|s| s.id == "S1").unwrap();
+        assert_eq!(s1.count, 1);
+        assert!(s1.sources.contains("mic"));
+        assert!((s1.centroid[0] - 1.0).abs() < 1e-6);
+
+        let mut r2 = SpeakerRegistry::from_snapshot(&snaps);
+        assert_eq!(r2.speakers().len(), 2);
+        // 继续 assign 相同向量归入原簇(质心/簇结构被完整还原)
+        assert_eq!(r2.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S1".into()));
+        assert_eq!(r2.assign(&v(0.0, 1.0, 0.0), "system", LONG), Some("S2".into()));
+    }
+
+    #[test]
+    fn from_snapshot_continues_numbering_past_max_existing_id() {
+        let snaps = vec![ClusterSnapshot {
+            id: "S3".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 5,
+            sources: BTreeSet::from(["mic".to_string()]),
+        }];
+        let mut r = SpeakerRegistry::from_snapshot(&snaps);
+        // 与 S3 质心正交 → 新建簇,编号应续接为 S4(而非从 S1 重来)
+        assert_eq!(r.assign(&v(0.0, 1.0, 0.0), "system", LONG), Some("S4".into()));
+    }
+
+    #[test]
+    fn from_snapshot_empty_centroid_item_counts_id_but_builds_no_cluster() {
+        let snaps = vec![ClusterSnapshot {
+            id: "S5".into(),
+            centroid: Vec::new(),
+            count: 0,
+            sources: BTreeSet::new(),
+        }];
+        let mut r = SpeakerRegistry::from_snapshot(&snaps);
+        assert_eq!(r.speakers().len(), 0, "空质心项不建簇");
+        // 编号仍续接到 S6(计入编号)
+        assert_eq!(r.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S6".into()));
+    }
+
+    #[test]
+    fn from_snapshot_empty_slice_equals_new() {
+        let mut r = SpeakerRegistry::from_snapshot(&[]);
+        let mut r2 = SpeakerRegistry::new();
+        assert_eq!(r.speakers(), r2.speakers());
+        assert_eq!(r.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S1".into()));
+        assert_eq!(r2.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S1".into()));
     }
 }

@@ -35,10 +35,16 @@ pub struct SegmentRecord {
 
 /// 一位说话人的可持久化信息，存 speakers.json（键为说话人 id，如 "S1"）。
 /// name 空串 = 未改名，显示端兜底「说话人 N」。
+/// centroid/count 为 P4.5 续录铺底新增字段：serde default + skip_serializing_if 保证
+/// 旧 speakers.json（无这两字段）可解析，且无质心时序列化省去 centroid 键。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerMeta {
     pub name: String,
     pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centroid: Option<Vec<f32>>,
+    #[serde(default)]
+    pub count: u64,
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。

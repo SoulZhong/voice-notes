@@ -25,11 +25,13 @@ pub struct PartialJob {
     pub samples: Vec<f32>,
 }
 
-/// diarization 侧事件:说话人表变化 / 簇合并(需回写落盘与 UI)。
+/// diarization 侧事件:说话人表变化 / 簇合并(需回写落盘与 UI)/ worker 结束时的质心快照
+/// (仅存入 writer 内存表,不落盘、不 emit,由既有 finalize→persist_speakers 落盘,P4.5 续录铺底)。
 #[derive(Debug, Clone)]
 pub enum DiarEvent {
     SpeakersChanged(Vec<crate::diar::registry::SpeakerInfo>),
     Merged { loser: String, winner: String },
+    Snapshot(Vec<crate::diar::registry::ClusterSnapshot>),
 }
 
 /// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
@@ -111,7 +113,10 @@ pub fn run_asr_worker(
                     }
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                on_diar(DiarEvent::Snapshot(registry.snapshot()));
+                break;
+            }
         }
     }
     (recognizer, embedder)
@@ -504,6 +509,37 @@ mod asr_worker_tests {
         );
         assert!(e.is_none());
         assert_eq!(*finals.lock().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn worker_emits_snapshot_exactly_once_at_end_after_other_diar_events() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        drop(tx);
+
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]);
+        let events = Arc::new(Mutex::new(Vec::<DiarEvent>::new()));
+        let e2 = events.clone();
+        let _ = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            rx,
+            vec![],
+            |_, _, _, _, _| {},
+            |_, _| {},
+            move |ev| e2.lock().unwrap().push(ev),
+        );
+        let evs = events.lock().unwrap();
+        let snapshot_count = evs.iter().filter(|e| matches!(e, DiarEvent::Snapshot(_))).count();
+        assert_eq!(snapshot_count, 1, "worker 结束时应恰发一次 Snapshot");
+        assert!(matches!(evs.last().unwrap(), DiarEvent::Snapshot(_)), "Snapshot 应在末尾(既有 diar 事件之后)");
+        match evs.last().unwrap() {
+            DiarEvent::Snapshot(snaps) => {
+                assert_eq!(snaps.len(), 1);
+                assert_eq!(snaps[0].id, "S1");
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
