@@ -238,19 +238,23 @@ impl NoteWriter {
         }
     }
 
-    /// 从内存说话人表中有质心的项构造 registry 快照，供续录时重建 SpeakerRegistry
-    /// （编号续接、质心延续）。消费者：lib.rs 的 spawn_session（New/Resume 均调用，
-    /// New 路径表为空 ⇒ 等价 SpeakerRegistry::new()）。
+    /// 从内存说话人表构造 registry 快照，供续录时重建 SpeakerRegistry（编号续接、
+    /// 质心延续）。消费者：lib.rs 的 spawn_session（New/Resume 均调用，New 路径
+    /// 表为空 ⇒ 等价 SpeakerRegistry::new()）。
+    ///
+    /// 不过滤无质心的表项（P4.5 前的旧笔记、或曾因嵌入失败/降级而从未落过质心的
+    /// 说话人）：这些项以 `centroid: Vec::new()` 输出，仍带着原 id。若在此过滤掉，
+    /// `SpeakerRegistry::from_snapshot` 就看不到这些 id，编号会从 1 重来，续录时
+    /// 新说话人被分配到旧 id 上，`sync_speakers` 就会把新人的段挂上旧人的名字
+    /// （张冠李戴）。`from_snapshot` 按设计处理空质心项：只计入编号延续，不建簇。
     pub fn registry_snapshot(&self) -> Vec<crate::diar::registry::ClusterSnapshot> {
         self.speakers
             .iter()
-            .filter_map(|(id, m)| {
-                m.centroid.as_ref().map(|c| crate::diar::registry::ClusterSnapshot {
-                    id: id.clone(),
-                    centroid: c.clone(),
-                    count: m.count,
-                    sources: m.sources.iter().cloned().collect(),
-                })
+            .map(|(id, m)| crate::diar::registry::ClusterSnapshot {
+                id: id.clone(),
+                centroid: m.centroid.clone().unwrap_or_default(),
+                count: m.count,
+                sources: m.sources.iter().cloned().collect(),
             })
             .collect()
     }
@@ -671,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_snapshot_builds_only_from_entries_with_centroid() {
+    fn registry_snapshot_keeps_entries_without_centroid_as_empty_centroid() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         w.sync_speakers(&[
@@ -685,13 +689,45 @@ mod tests {
             count: 3,
             sources: std::collections::BTreeSet::from(["mic".to_string()]),
         }]);
-        // S2 无质心,不应出现在 registry_snapshot 结果中。
+        // S2 无质心：不应被过滤掉，须以空质心出现在快照中（否则编号会跳过 S2 的
+        // 位置，续录时新说话人可能被分配到 S2 的旧 id 上）。
         let snaps = w.registry_snapshot();
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].id, "S1");
-        assert_eq!(snaps[0].centroid, vec![1.0, 0.0]);
-        assert_eq!(snaps[0].count, 3);
-        assert!(snaps[0].sources.contains("mic"));
+        assert_eq!(snaps.len(), 2, "无质心项不应被过滤，仍计入快照");
+        let s1 = snaps.iter().find(|s| s.id == "S1").unwrap();
+        assert_eq!(s1.centroid, vec![1.0, 0.0]);
+        assert_eq!(s1.count, 3);
+        assert!(s1.sources.contains("mic"));
+        let s2 = snaps.iter().find(|s| s.id == "S2").unwrap();
+        assert!(s2.centroid.is_empty(), "无质心项应以空 centroid 输出");
+    }
+
+    /// 回归 P4.5 终审 Finding 1：P4.5 前的旧笔记（或曾降级会话）speakers 表里
+    /// S1/S2 从未有过质心。续录时 registry_snapshot → from_snapshot 必须让编号
+    /// 从 S3 续接，而不是从 S1 重来——否则新说话人会被分配到 S1/S2 的旧 id 上，
+    /// sync_speakers 就会把新人的段挂上旧人的名字（张冠李戴）。
+    #[test]
+    fn registry_snapshot_roundtrip_continues_numbering_past_old_note_without_centroids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        // 模拟旧笔记：S1/S2 只有 sync_speakers（无质心），从未 store_centroids。
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["system".into()]),
+        ])
+        .unwrap();
+
+        let snaps = w.registry_snapshot();
+        let mut registry = crate::diar::registry::SpeakerRegistry::from_snapshot(&snaps);
+        assert_eq!(registry.speakers().len(), 0, "空质心项不建簇");
+
+        // 新说话人一段够长的音频：应分配 S3（编号续接），不撞 S1/S2。
+        let long: Vec<f32> = {
+            let mut v = vec![0.0f32; 3];
+            v[0] = 1.0;
+            v
+        };
+        let id = registry.assign(&long, "mic", 32000 /* 2s，够长建簇 */);
+        assert_eq!(id, Some("S3".into()), "新说话人编号应续接旧笔记的最大 id，不撞旧 id");
     }
 
     #[test]

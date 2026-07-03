@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 // 若有时间邻近且文本高相似的 system 段出现则丢弃 mic 段；到期无匹配则正常处理。
 // 下列为首轮取值(未经真实会议数据校准),P4.5 二轮联调时应根据误伤/漏抓率回调。
 /// mic 段最长 hold 时长(ms)，超时未匹配到回声即释放正常处理。
+///
+/// 注：被 hold 的 mic 段落盘顺序晚于时间上更晚的 system 段（最多晚 echo_hold），
+/// 详情页按文件序（seq）渲染时，可能出现可接受的小幅时间交错（≤ echo_hold）。
 pub(crate) const ECHO_HOLD_MS: u64 = 2500;
 /// 判定「时间邻近」的窗口(ms)：两段时间区间交叠，或起点差小于此值。
 const ECHO_WINDOW_MS: u64 = 2500;
@@ -268,7 +271,14 @@ pub fn run_asr_worker(
                     Source::System => {
                         let sys_norm = normalize_text(&text);
                         // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
+                        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的
+                        // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
+                        // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
+                        // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
                         pending_mic.retain(|p| {
+                            if p.text == "[识别失败]" {
+                                return true;
+                            }
                             let echoed = time_near(p.start_ms, p.end_ms, job.start_ms, job.end_ms)
                                 && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
                             if echoed {
@@ -305,30 +315,50 @@ pub fn run_asr_worker(
                             .retain(|r| newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS);
                     }
                     Source::Mic => {
-                        let mic_norm = normalize_text(&text);
-                        let echo = recent_system.iter().find(|r| {
-                            time_near(job.start_ms, job.end_ms, r.start_ms, r.end_ms)
-                                && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
-                        });
-                        match echo {
-                            Some(r) => {
-                                eprintln!(
-                                    "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
-                                    text_prefix20(&text),
-                                    text_prefix20(&r.text)
-                                );
-                                // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
-                            }
-                            None => {
-                                pending_mic.push_back(PendingMic {
-                                    text,
-                                    norm: mic_norm,
-                                    start_ms: job.start_ms,
-                                    end_ms: job.end_ms,
-                                    samples_len: job.samples.len(),
-                                    embedding_input: job.samples,
-                                    held_at: Instant::now(),
-                                });
+                        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
+                        // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
+                        // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
+                        // hold，直接走完整处理链即时处理。
+                        if text == "[识别失败]" {
+                            process_final(
+                                job.source,
+                                text,
+                                job.start_ms,
+                                job.end_ms,
+                                job.samples.len(),
+                                &job.samples,
+                                &mut embedder,
+                                &mut registry,
+                                &mut last_sent,
+                                &mut on_final,
+                                &mut on_diar,
+                            );
+                        } else {
+                            let mic_norm = normalize_text(&text);
+                            let echo = recent_system.iter().find(|r| {
+                                time_near(job.start_ms, job.end_ms, r.start_ms, r.end_ms)
+                                    && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                            });
+                            match echo {
+                                Some(r) => {
+                                    eprintln!(
+                                        "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                                        text_prefix20(&text),
+                                        text_prefix20(&r.text)
+                                    );
+                                    // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
+                                }
+                                None => {
+                                    pending_mic.push_back(PendingMic {
+                                        text,
+                                        norm: mic_norm,
+                                        start_ms: job.start_ms,
+                                        end_ms: job.end_ms,
+                                        samples_len: job.samples.len(),
+                                        embedding_input: job.samples,
+                                        held_at: Instant::now(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -949,6 +979,49 @@ mod asr_worker_tests {
         assert!(got.contains(&(Source::System, "same phrase".to_string())));
         assert!(got.contains(&(Source::Mic, "aaaaaaaaaa".to_string())));
         assert!(got.contains(&(Source::Mic, "same phrase".to_string())));
+    }
+
+    /// 回归 P4.5 终审 Finding 2：mic 与 system 两路同时识别失败时，占位文本
+    /// ("[识别失败]")相同、时间邻近，若照常参与回声比对会被误判为回声、mic 段
+    /// 被误杀。占位段不该参与回声去重，两条都应被 emit（内容不丢，只是都不带
+    /// 有效转写文本）。
+    #[test]
+    fn both_sides_placeholder_text_do_not_echo_dedupe_each_other() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 1000, end_ms: 1625 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 100], start_ms: 1000, end_ms: 1625 }).unwrap();
+        drop(tx);
+
+        struct AlwaysFailRecognizer;
+        impl Recognizer for AlwaysFailRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                anyhow::bail!("boom")
+            }
+        }
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(AlwaysFailRecognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        // mic 段是占位文本，跳过 hold 直接即时处理，故先于 system 段 emit（送达顺序:
+        // mic 先、system 后）。
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![
+                (Source::Mic, "[识别失败]".to_string()),
+                (Source::System, "[识别失败]".to_string()),
+            ],
+            "双路各一段占位文本、时间邻近：两条都应 emit，不得被回声去重误杀"
+        );
     }
 
     #[test]

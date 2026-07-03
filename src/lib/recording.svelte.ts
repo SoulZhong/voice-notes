@@ -180,6 +180,7 @@ export const recording = {
         resuming = false;
         finals = []; // 回滚预灌注
         speakers = {};
+        noteId = ""; // 回滚预灌注（下方"已在录制"对账分支会用真实 noteId 覆盖）
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
         if (String(err).includes("已在录制")) {
           const s = await invoke<StatusEvent>("recording_status");
@@ -198,6 +199,7 @@ export const recording = {
       resuming = false; // 回滚预灌注
       finals = [];
       speakers = {};
+      noteId = "";
       status = `error: ${err}`;
       return false;
     } finally {

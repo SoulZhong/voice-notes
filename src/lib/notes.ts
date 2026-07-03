@@ -33,7 +33,12 @@ export type Note = {
   meta: NoteMeta;
   segments: SegmentRecord[];
   skipped_lines: number;
-  speakers: Record<string, { name: string; sources: string[] }>;
+  // centroid/count 是后端质心快照（P4.5 续录铺底），随 get_note 下发；前端不消费，
+  // 仅补齐类型以匹配后端 SpeakerMeta 的实际字段。
+  speakers: Record<
+    string,
+    { name: string; sources: string[]; centroid?: number[]; count?: number }
+  >;
 };
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
