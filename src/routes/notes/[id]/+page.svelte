@@ -81,8 +81,6 @@
 </script>
 
 <main class="container">
-  <p><a href="/">← 笔记列表</a></p>
-
   {#if error}
     <div class="banner">{error}</div>
   {/if}
