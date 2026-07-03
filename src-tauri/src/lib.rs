@@ -7,32 +7,65 @@ mod store;
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use audio::{AudioCapture, Source};
 use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
-// 锁序约定（必须在任何持锁场景下遵守）：running → generation → handle_slot。
+// 锁序约定（必须在任何持锁场景下遵守）：running → generation → session_slot。
 // 只有 start_recording 的加载线程会嵌套持有 running→generation（以及 running→
-// generation→handle_slot），且只在极短的检查/存储语句内完成；stop_recording
+// generation→session_slot），且只在极短的检查/存储语句内完成；stop_recording
 // 每条语句只持有一把锁，从不同时持有两把，因此不存在死锁风险。
 //
 // generation 协议：stop_recording 和每次新的 start_recording 都会递增
-// generation。加载线程在耗时的模型/会话初始化完成后，无论是要存 handle
+// generation。加载线程在耗时的模型/会话初始化完成后，无论是要存 session
 // （成功路径）还是要清空 running（失败路径 fail()），都必须先确认自己捕获的
 // my_gen 仍然等于当前 generation —— 只有仍是"当前代"时，才允许改动共享状态；
 // 否则说明该线程是被后续 stop/start 抢先淘汰的过期加载，直接静默让路，避免
 // 已被覆盖或已被终止的会话把自己的（过期的）结果错误地写回全局状态。
+
+/// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
+struct ActiveSession {
+    handle: RecordingHandle,
+    writer: Arc<Mutex<store::writer::NoteWriter>>,
+    note_id: String,
+}
+
 #[derive(Default)]
 struct AppState {
     running: Arc<Mutex<bool>>,
     generation: Arc<Mutex<u64>>,
-    handle: Arc<Mutex<Option<RecordingHandle>>>,
+    session: Arc<Mutex<Option<ActiveSession>>>,
 }
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
+}
+
+/// notes 根目录（不存在则创建）。
+fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?
+        .join("notes");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全，无内容则删掉空文件夹。
+fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
+    let mut w = writer.lock().unwrap();
+    if w.has_content() {
+        if let Err(e) = w.finalize(chrono::Local::now()) {
+            eprintln!("abort_or_finalize: finalize 失败: {e}");
+        }
+    } else {
+        let dir = w.dir().to_path_buf();
+        drop(w);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -67,7 +100,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
     };
     let running = state.running.clone();
     let generation = state.generation.clone();
-    let handle_slot = state.handle.clone();
+    let session_slot = state.session.clone();
 
     std::thread::spawn(move || {
         // fail()：加载过程中任何一步失败都会调用。必须先确认 my_gen 仍是当前代
@@ -86,7 +119,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new() });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new() });
         };
 
         // 1) 先建 recognizer（加载模型，耗时）——就绪后才发 recording，消除闪烁。
@@ -125,15 +158,42 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             }
         }
 
+        // 2.5) 创建笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
+        let writer = match notes_dir(&app)
+            .and_then(|d| store::writer::NoteWriter::create(&d, chrono::Local::now()))
+        {
+            Ok(w) => Arc::new(Mutex::new(w)),
+            Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: 创建笔记失败: {e}")),
+        };
+        let note_id = writer.lock().unwrap().note_id().to_string();
+
         // 3) 起会话。emit 回调带 source 字符串。
         let app_f = app.clone();
         let app_p = app.clone();
+        let writer_f = writer.clone();
+        let mut degraded = false;
         let start = session::start_session(
             sources,
             recognizer,
             16000,
             16000,
             move |src, text, start_ms, end_ms| {
+                // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
+                match writer_f.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms) {
+                    Ok(()) => {
+                        if degraded {
+                            degraded = false;
+                            let _ = app_f.emit("storage", ipc::StorageEvent { state: "ok".into() });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("append_final 失败（段暂存内存待重试）: {e}");
+                        if !degraded {
+                            degraded = true;
+                            let _ = app_f.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+                        }
+                    }
+                }
                 let _ = app_f.emit(
                     "final",
                     ipc::FinalEvent { source: src.as_str().into(), text, start_ms, end_ms },
@@ -151,47 +211,56 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             Ok(start) => {
                 // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
                 if !start.active.contains(&Source::Mic) {
-                    start.handle.stop();
+                    start.handle.stop(); // 先排干可能已产生的 system finals
+                    abort_or_finalize(&writer);
                     let mic_err = start.failed.iter()
                         .find(|(s, _)| *s == Source::Mic)
                         .map(|(_, msg)| format!("error: 麦克风未能启动: {msg}"))
                         .unwrap_or_else(|| "error: 麦克风未能启动".into());
                     return fail(&app, &running, &generation, my_gen, mic_err);
                 }
-                // 停/存竞态保护：存 handle、running 检查、generation 检查必须在同一把
-                // running 锁内完成（锁序 running → generation → handle_slot）。
+                // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
+                // running 锁内完成（锁序 running → generation → session_slot）。
                 // stop_recording 和更新的 start_recording 都会递增 generation；
-                // stop_recording 一律先置 running=false 再取 handle，且从不同时
+                // stop_recording 一律先置 running=false 再取 session，且从不同时
                 // 持有两把锁，因此无论 stop/新 start 发生在加载前、加载中还是加载
                 // 后，与本线程的任意交错都是安全的：
                 //  - stop 先到（running=false）：这里检测到 running==false，不存
-                //    handle、不发 "recording"，直接把刚起好的会话原地停掉，避免
+                //    session、不发 "recording"，直接把刚起好的会话原地停掉，避免
                 //    孤儿会话。
                 //  - 更快的 start #2 先到（running 仍为 true，但 generation 已被
                 //    #2 抢先递增）：这里检测到 gen 不等于 my_gen，说明自己是过期
-                //    加载（T1），同样不存 handle、不发 "recording"，原地停掉，让
-                //    路给 #2 稍后存入的 handle——修复了"T1 的 handle 被 T2 覆盖
+                //    加载（T1），同样不存 session、不发 "recording"，原地停掉，让
+                //    路给 #2 稍后存入的 session——修复了"T1 的 handle 被 T2 覆盖
                 //    而从未 stop()"的泄漏。
-                //  - 都没发生：这里已把 handle 存进 handle_slot 并发出
-                //    "recording"，stop_recording 随后正常取到该 handle 并停止。
+                //  - 都没发生：这里已把 session 存进 session_slot 并发出
+                //    "recording"，stop_recording 随后正常取到该 session 并停止。
                 let running_guard = running.lock().unwrap();
                 let gen_guard = generation.lock().unwrap();
                 if !*running_guard || *gen_guard != my_gen {
                     drop(gen_guard);
                     drop(running_guard);
                     start.handle.stop();
+                    abort_or_finalize(&writer); // 被 stop/新 start 抢先：内容保全为 complete
                     return;
                 }
                 drop(gen_guard);
                 let system_audio = classify_system(&start.active, &start.failed);
-                *handle_slot.lock().unwrap() = Some(start.handle);
+                *session_slot.lock().unwrap() = Some(ActiveSession {
+                    handle: start.handle,
+                    writer: writer.clone(),
+                    note_id: note_id.clone(),
+                });
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone() },
                 );
             }
-            Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
+            Err(e) => {
+                abort_or_finalize(&writer);
+                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+            }
         }
     });
 
@@ -201,23 +270,78 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 #[tauri::command]
 fn stop_recording(app: AppHandle, state: State<AppState>) {
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
-    // 锁，用完立即释放，从不同时持有两把），最后取 handle 并优雅停止（停
+    // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
     // capture → flush 尾段 → 排干 finals → join）。递增 generation 让任何仍在
     // 加载窗口内的旧线程（无论其 running 检查读到 true 还是 false）都会因
-    // generation 不匹配而放弃存 handle / 放弃清空 running，从而不会与本次
+    // generation 不匹配而放弃存 session / 放弃清空 running，从而不会与本次
     // stop 产生孤儿会话或误清 running 的竞态。与 start_recording 加载线程的
-    // 锁序一致（running → generation → handle_slot），且本函数从不同时持有
+    // 锁序一致（running → generation → session_slot），且本函数从不同时持有
     // 两把锁，所以与加载线程的任意交错都不会死锁。
     { *state.running.lock().unwrap() = false; }
     { *state.generation.lock().unwrap() += 1; }
-    let handle = state.handle.lock().unwrap().take();
-    if let Some(h) = handle {
-        h.stop();
+    let sess = state.session.lock().unwrap().take();
+    let mut note_id = String::new();
+    if let Some(s) = sess {
+        s.handle.stop(); // 排干 finals：所有 append 在此完成
+        note_id = s.note_id;
+        if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
+            eprintln!("stop_recording: finalize 失败: {e}");
+            let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+        }
     }
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new() },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id },
     );
+}
+
+#[tauri::command]
+fn list_notes(app: AppHandle, state: State<AppState>) -> Result<Vec<store::NoteSummary>, String> {
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let mut list = store::NoteStore::new(dir).list();
+    // 正在录制的笔记在磁盘上也是 recording 态；用活动会话区分「录制中」与「已中断」。
+    if let Some(active_id) = state.session.lock().unwrap().as_ref().map(|s| s.note_id.clone()) {
+        for n in &mut list {
+            if n.id == active_id {
+                n.state = "active".into();
+            }
+        }
+    }
+    Ok(list)
+}
+
+#[tauri::command]
+fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_note(app: AppHandle, id: String, title: String) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("标题不能为空".into());
+    }
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir).rename(&id, title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
+        return Err("录制中的笔记不能删除".into());
+    }
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir).delete(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_note(app: AppHandle, id: String, format: String) -> Result<String, String> {
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .export(&id, &format)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -225,7 +349,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            list_notes,
+            get_note,
+            rename_note,
+            delete_note,
+            export_note
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

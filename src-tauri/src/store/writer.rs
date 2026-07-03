@@ -211,4 +211,58 @@ mod tests {
         w.finalize(now()).unwrap();
         assert_eq!(read_meta(&dir).state, "complete");
     }
+
+    #[test]
+    fn full_session_persists_every_final() {
+        use crate::audio::mock::MockCapture;
+        use crate::audio::{AudioCapture, Source};
+        use crate::pipeline::segmenter::{MockSegmenter, Segmenter};
+        use crate::store::NoteStore;
+        use std::sync::{Arc, Mutex};
+
+        struct CountingRecognizer;
+        impl crate::asr::Recognizer for CountingRecognizer {
+            fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
+                Ok(crate::asr::Transcript { text: format!("len={}", s.len()) })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(Mutex::new(NoteWriter::create(tmp.path(), now()).unwrap()));
+        let id = writer.lock().unwrap().note_id().to_string();
+        let emitted = Arc::new(Mutex::new(0usize));
+
+        let cap = MockCapture::from_wav(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample_16k.wav"
+        ))
+        .expect("fixture");
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
+            vec![(Source::Mic, Box::new(cap), Box::new(MockSegmenter::new(2000)))];
+
+        let (w2, e2) = (writer.clone(), emitted.clone());
+        let start = crate::session::start_session(
+            sources,
+            Box::new(CountingRecognizer),
+            16000,
+            4000,
+            move |src, text, start_ms, end_ms| {
+                w2.lock().unwrap().append_final(src.as_str(), &text, start_ms, end_ms).unwrap();
+                *e2.lock().unwrap() += 1;
+            },
+            |_, _| {},
+        )
+        .expect("start_session");
+        start.handle.stop(); // MockCapture 已灌完帧；stop 排干全部 finals
+        writer.lock().unwrap().finalize(now()).unwrap();
+
+        let n = *emitted.lock().unwrap();
+        assert!(n > 0, "fixture 应产出至少一个 final");
+        let note = NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
+        assert_eq!(note.segments.len(), n, "jsonl 行数 = final 事件数，一段不丢");
+        assert!(note.segments.windows(2).all(|w| w[1].seq == w[0].seq + 1), "seq 单调");
+        assert!(note.segments.windows(2).all(|w| w[1].start_ms >= w[0].start_ms), "时间戳单调");
+        assert_eq!(note.meta.state, "complete");
+        assert_eq!(note.skipped_lines, 0);
+    }
 }
