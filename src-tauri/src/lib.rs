@@ -4,6 +4,7 @@ pub mod asr;
 mod ipc;
 mod session;
 mod store;
+pub mod diar;
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
@@ -42,6 +43,8 @@ struct AppState {
     /// 常驻识别器（启动预载、开录取用、停录归还）。叶子锁：绝不与上面三把锁嵌套持有；
     /// 预载线程持锁加载，使开录 take() 自然阻塞至就绪且永不双重加载。
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
 }
 
 fn models_dir() -> PathBuf {
@@ -85,6 +88,10 @@ fn stash_recognizer(
 
 fn sense_voice_dir() -> PathBuf {
     models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+}
+
+fn speaker_model_path() -> PathBuf {
+    models_dir().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -404,12 +411,22 @@ pub fn run() {
         .setup(|app| {
             // 启动预载识别器：持锁加载，开录若赶上预载会在锁上等待至就绪。
             let cache = app.state::<AppState>().recognizer_cache.clone();
+            let embedder_cache = app.state::<AppState>().embedder_cache.clone();
             std::thread::spawn(move || {
                 let mut slot = cache.lock().unwrap();
                 if slot.is_none() {
                     match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
                         Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
                         Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
+                    }
+                }
+                drop(slot);
+
+                let mut eslot = embedder_cache.lock().unwrap();
+                if eslot.is_none() {
+                    match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                        Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+                        Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
                     }
                 }
             });
