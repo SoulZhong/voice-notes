@@ -79,9 +79,21 @@ pub fn extract_and_install(
     for ff in files {
         verify_file(&tmp.join(ff.rel_path), ff)?;
     }
+    // 换位安装：旧安装先挪到备份位，新目录 rename 失败时可回滚——任何失败不触碰既有安装。
     let dst = root.join(dest_dir);
-    let _ = fs::remove_dir_all(&dst);
-    fs::rename(&src, &dst)?;
+    let backup = root.join(format!(".old-{dest_dir}"));
+    let _ = fs::remove_dir_all(&backup);
+    let had_old = dst.exists();
+    if had_old {
+        fs::rename(&dst, &backup)?;
+    }
+    if let Err(e) = fs::rename(&src, &dst) {
+        if had_old {
+            let _ = fs::rename(&backup, &dst); // 回滚旧安装
+        }
+        return Err(e.into());
+    }
+    let _ = fs::remove_dir_all(&backup);
     let _ = fs::remove_dir_all(&tmp);
     Ok(())
 }
@@ -161,6 +173,19 @@ mod tests {
         let files = [ff("sv-dir/model.onnx", b"MODEL")]; // 期望哈希对不上
         assert!(extract_and_install(&tarball, &root, "sv-dir", &files).is_err());
         assert!(!root.join("sv-dir").exists(), "校验失败不得半安装");
+    }
+
+    #[test]
+    fn extract_and_install_replaces_existing_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("sv-dir")).unwrap();
+        std::fs::write(root.join("sv-dir/model.onnx"), b"OLD").unwrap();
+        let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
+        let files = [ff("sv-dir/model.onnx", b"MODEL")];
+        extract_and_install(&tarball, &root, "sv-dir", &files).unwrap();
+        assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL", "旧安装被替换");
+        assert!(!root.join(".old-sv-dir").exists(), "备份目录成功后清除");
     }
 
     #[test]

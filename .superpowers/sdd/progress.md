@@ -213,3 +213,10 @@ Base: d12c665
 - P4.5 终审 (fable): With fixes → 修复 commit 7dc996f(Important: registry_snapshot 空质心项计编号防张冠李戴; Minor: 占位段不参与去重/resume 回滚补 noteId/注释/TS 类型)→ 复审 (sonnet): Ready to merge YES
 - P4.5 后续项(不阻塞): 已在录制对账分支不回灌真实会话 finals; 详情页可按 start_ms 稳定排序消除 hold 交错; ECHO 三常量二轮校准
 - P4/P4.5 人工冒烟: 用户确认测试通过 (2026-07-04) 
+
+## P5 — v1 收尾 (branch p5-v1-polish)
+Plan: docs/superpowers/plans/2026-07-04-voice-notes-p5-v1-polish.md
+Base: 2ffb6c3
+- Task 0: complete (分支已建, 基线绿: cargo 81 passed / npm check 0 errors 2 已知 a11y warnings)
+- Task 1: complete (commits 2ffb6c3..1eb33ee, review clean, Approved by sonnet, spec ✅; 四钉死真值逐字节核对一致, models_dir 零残留, 双入口 guard 在) — models 模块+lib.rs 收敛
+  - Minors(→终审 triage): status()/recording_ready() 无直接单测(仅积木有); guard 两入口重复(brief 规定); embedder_it.rs 首行 VN_MODELS 注释是 pre-existing 陈旧文档(代码未读该 env)
