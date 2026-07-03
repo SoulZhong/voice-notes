@@ -1,4 +1,6 @@
 pub mod writer;
+mod notes;
+pub use notes::NoteStore;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
