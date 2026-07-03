@@ -20,4 +20,7 @@ pub struct StatusEvent {
 pub struct FinalEvent {
     pub source: String, // "mic" | "system"
     pub text: String,
+    /// 相对会议开始的毫秒。
+    pub start_ms: u64,
+    pub end_ms: u64,
 }

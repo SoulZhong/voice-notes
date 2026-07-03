@@ -4,7 +4,7 @@ export type Source = "mic" | "system";
 export type SystemAudio = "on" | "denied" | "unavailable" | "";
 
 export type PartialEvent = { source: Source; text: string };
-export type FinalEvent = { source: Source; text: string };
+export type FinalEvent = { source: Source; text: string; start_ms: number; end_ms: number };
 export type StatusEvent = { state: string; system_audio: SystemAudio };
 
 export function onPartial(cb: (e: PartialEvent) => void) {

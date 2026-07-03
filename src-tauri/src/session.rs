@@ -11,6 +11,9 @@ use std::time::Duration;
 pub struct FinalJob {
     pub source: Source,
     pub samples: Vec<f32>,
+    /// 相对该源流开始的毫秒（16kHz 样本钟换算）。
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 /// 当前句预览任务：写入每源覆盖式槽，忙时被更新版本覆盖（best-effort）。
@@ -26,7 +29,7 @@ pub fn run_asr_worker(
     mut recognizer: Box<dyn Recognizer>,
     finals_rx: Receiver<FinalJob>,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
-    mut on_final: impl FnMut(Source, String),
+    mut on_final: impl FnMut(Source, String, u64, u64),
     mut on_partial: impl FnMut(Source, String),
 ) {
     loop {
@@ -45,7 +48,7 @@ pub fn run_asr_worker(
                         "[识别失败]".to_string()
                     }
                 };
-                on_final(job.source, text);
+                on_final(job.source, text, job.start_ms, job.end_ms);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // 空闲：服务每源最新 partial（取出即清空，只识别最新一版）。
@@ -112,7 +115,7 @@ pub fn start_session(
     recognizer: Box<dyn Recognizer>,
     target_rate: u32,
     partial_interval_samples: usize,
-    on_final: impl FnMut(Source, String) + Send + 'static,
+    on_final: impl FnMut(Source, String, u64, u64) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
 ) -> anyhow::Result<SessionStart> {
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
@@ -199,30 +202,33 @@ mod asr_worker_tests {
     #[test]
     fn emits_all_finals_tagged_in_order() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 10] }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 20] }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 10], start_ms: 0, end_ms: 625 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 20], start_ms: 625, end_ms: 1875 }).unwrap();
         drop(tx);
 
-        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String, u64, u64)>::new()));
         let f2 = finals.clone();
         run_asr_worker(
             Box::new(CountingRecognizer),
             rx,
             vec![],
-            move |s, t| f2.lock().unwrap().push((s, t)),
+            move |s, t, start_ms, end_ms| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
             |_, _| {},
         );
         assert_eq!(
             *finals.lock().unwrap(),
-            vec![(Source::Mic, "len=10".into()), (Source::System, "len=20".into())]
+            vec![
+                (Source::Mic, "len=10".into(), 0, 625),
+                (Source::System, "len=20".into(), 625, 1875)
+            ]
         );
     }
 
     #[test]
     fn failed_final_becomes_placeholder_and_worker_survives() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3] }).unwrap();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 4] }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3], start_ms: 0, end_ms: 0 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 4], start_ms: 0, end_ms: 0 }).unwrap();
         drop(tx);
 
         let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
@@ -231,7 +237,7 @@ mod asr_worker_tests {
             Box::new(FlakyRecognizer { n: 0 }),
             rx,
             vec![],
-            move |s, t| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
         );
         assert_eq!(
@@ -254,8 +260,8 @@ mod asr_worker_tests {
     #[test]
     fn recognize_panic_becomes_placeholder_worker_survives() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3] }).unwrap();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 5] }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 3], start_ms: 0, end_ms: 0 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 5], start_ms: 0, end_ms: 0 }).unwrap();
         drop(tx);
 
         let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
@@ -268,7 +274,7 @@ mod asr_worker_tests {
             Box::new(PanicRecognizer { n: 0 }),
             rx,
             vec![],
-            move |s, t| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
         );
         std::panic::set_hook(prev);
@@ -295,7 +301,7 @@ mod asr_worker_tests {
                 Box::new(CountingRecognizer),
                 rx,
                 vec![(Source::System, slot_for_worker)],
-                |_, _| {},
+                |_, _, _, _| {},
                 move |s, t| p2.lock().unwrap().push((s, t)),
             );
         });
@@ -387,7 +393,7 @@ mod session_tests {
             Box::new(CountingRecognizer),
             16000,
             4000,
-            move |s, t| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
         )
         .expect("start_session");
@@ -423,7 +429,7 @@ mod session_tests {
         }
         let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
             vec![(Source::System, Box::new(FailingCapture), Box::new(MockSegmenter::new(8000)))];
-        let r = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _| {}, |_, _| {});
+        let r = start_session(sources, Box::new(CountingRecognizer), 16000, 4000, |_, _, _, _| {}, |_, _| {});
         assert!(r.is_err(), "无源可启动应返回 Err");
     }
 }

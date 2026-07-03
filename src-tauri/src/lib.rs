@@ -132,10 +132,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
             recognizer,
             16000,
             16000,
-            move |src, text| {
+            move |src, text, start_ms, end_ms| {
                 let _ = app_f.emit(
                     "final",
-                    ipc::FinalEvent { source: src.as_str().into(), text },
+                    ipc::FinalEvent { source: src.as_str().into(), text, start_ms, end_ms },
                 );
             },
             move |src, text| {
