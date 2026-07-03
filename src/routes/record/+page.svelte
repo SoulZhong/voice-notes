@@ -6,6 +6,7 @@
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
+  import { formatTs } from "$lib/notes";
 
   let models = $state<ModelsStatus | null>(null);
   async function refreshModels() {
@@ -25,6 +26,15 @@
       "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
     );
   }
+
+  async function startRecording() {
+    await recording.start(); // 已在录制页，无需跳转
+  }
+  const levelPct = $derived.by(() => {
+    if (!recording.isLive || recording.level <= 0) return 0;
+    const db = 20 * Math.log10(recording.level);
+    return Math.max(0, Math.min(100, ((db + 50) / 50) * 100)); // -50dBFS..0dBFS → 0..100%
+  });
 </script>
 
 <div class="container">
@@ -37,9 +47,25 @@
   {/if}
 
   {#if !models || models.recording_ready}
+    <div class="controls">
+      {#if !recording.isLive}
+        <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>● 开始录制</button>
+      {:else}
+        {#if recording.paused}
+          <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>▶ 恢复</button>
+        {:else}
+          <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>⏸ 暂停</button>
+        {/if}
+        <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>■ 停止</button>
+      {/if}
+      <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
+      <div class="meter" title="麦克风电平"><div class="meter-fill" style="width:{levelPct}%"></div></div>
+      {#if recording.paused}<span class="paused-tag">已暂停</span>{/if}
+    </div>
+
     <p class="status" class:error={isError(recording.status)}>状态：{recording.status}</p>
 
-    {#if recording.isRecording && recording.systemAudio !== "on" && recording.systemAudio !== ""}
+    {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
       <div class="banner">
         系统声音不可用（未授权屏幕录制）。仅麦克风在录。
         <button class="link" onclick={openScreenRecordingSettings}>打开系统设置</button>
@@ -47,7 +73,7 @@
       </div>
     {/if}
 
-    {#if recording.isRecording && recording.diarization === "unavailable"}
+    {#if recording.isLive && recording.diarization === "unavailable"}
       <div class="banner">说话人区分不可用（声纹模型缺失）。转写与录音不受影响。</div>
     {/if}
 
@@ -86,6 +112,49 @@
 
   h1 {
     margin: 0 0 0.25rem;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0 0 0.75rem;
+  }
+  .ctl {
+    border-radius: 8px;
+    border: 1px solid #ccc;
+    padding: 0.45em 1.1em;
+    font-weight: 600;
+    cursor: pointer;
+    background: #fff;
+  }
+  .ctl.primary { background: #396cd8; color: #fff; border-color: transparent; }
+  .ctl.danger { background: #c0392b; color: #fff; border-color: transparent; }
+  .timer {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: #444;
+  }
+  .timer.pausedTimer { color: #d88a39; }
+  .meter {
+    width: 120px;
+    height: 8px;
+    background: #e0e0e3;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .meter-fill {
+    height: 100%;
+    background: #2e9e5b;
+    transition: width 0.1s linear;
+  }
+  .paused-tag {
+    background: #d88a39;
+    color: #fff;
+    font-size: 0.75em;
+    font-weight: 600;
+    border-radius: 6px;
+    padding: 0.1em 0.5em;
   }
 
   .status {
@@ -160,6 +229,11 @@
   .banner .hint { color: #a07a3a; }
 
   @media (prefers-color-scheme: dark) {
+    .ctl { background: #0f0f0f98; color: #fff; border-color: #555; }
+    .ctl.primary { background: #396cd8; }
+    .ctl.danger { background: #c0392b; }
+    .timer { color: #ccc; }
+    .meter { background: #444; }
     .status {
       color: #aaa;
     }

@@ -128,7 +128,7 @@
     <div class="row">
       <button onclick={() => doExport("md")}>导出 Markdown</button>
       <button onclick={() => doExport("txt")}>导出纯文本</button>
-      <button disabled={recording.isRecording} onclick={doResume}>继续录制</button>
+      <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
       {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
     </div>
 
