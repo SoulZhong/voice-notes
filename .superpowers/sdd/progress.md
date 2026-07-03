@@ -199,3 +199,11 @@ Base: e4c8df2
 - P4 终审 (fable): With fixes → 修复 commit c862f80(Critical: merge 读错误防清空; Important: 合并回写前端 finals / diarization 降级横幅 / rename 单写者 / SpeakersChanged 全量比较; Minor: 预载锁窗)→ 复审 (opus): Ready to merge YES
 - P4 后续项(不阻塞): rename 持 session 锁跨磁盘 IO+emit(可收窄); chips 编辑中遇合并可复活孤儿条目; speakerColor 对非 S<n> id 兜底; chips 排序 S10<S2; MERGE_CHECK_INTERVAL 冗余; teardown OSStatus 日志; merge 两文件崩溃窗口注释
 - 待人工冒烟(计划 Task 9 Step 2, 六项)+ 聚类阈值校准(Step 3)
+- P4 校准 round 1: complete (commit 02f2c8d, 目检通过; ASSIGN 0.62/MERGE 0.74/MIN_NEW 9600 + 短段不拖质心; 依据 18:34 会议实测 10+人只聚 7 簇) 
+
+## P4.5 — 续录 + 回声去重 (branch p4-diarization-aec 续)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p4.5-resume-echo-dedup.md
+Base: d12c665
+- P4.5 Task 1: complete (commits d12c665..a370003, review approved 零 findings) 
+- P4.5 Task 2: complete (待提交; cargo test 73/73 passed, build 无新 warning; NoteWriter::resume/base_ms + spawn_session(NoteTarget::New/Resume) + resume_recording command; 修复发现的截断尾行追加拼接 bug)
+- P4.5 Task 2: complete (commits a370003..f8b7565, opus review approved + 1 fix: abort 目录删除限本会话新建; 附带修复崩溃截断尾行粘行 bug) 

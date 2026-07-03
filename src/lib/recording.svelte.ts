@@ -94,6 +94,7 @@ export const recording = {
           statusVersion++;
         }
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
+        resuming = false; // 续录发起后异步失败，复位一次性标志
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
@@ -177,6 +178,8 @@ export const recording = {
         return true;
       } catch (err) {
         resuming = false;
+        finals = []; // 回滚预灌注
+        speakers = {};
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
         if (String(err).includes("已在录制")) {
           const s = await invoke<StatusEvent>("recording_status");
@@ -192,6 +195,9 @@ export const recording = {
         return false;
       }
     } catch (err) {
+      resuming = false; // 回滚预灌注
+      finals = [];
+      speakers = {};
       status = `error: ${err}`;
       return false;
     } finally {

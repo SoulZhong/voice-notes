@@ -82,6 +82,7 @@
   async function doResume() {
     const ok = await recording.resume(id);
     if (ok) goto("/record");
+    else error = "无法继续录制:请确认没有正在进行的录制";
   }
 </script>
 
