@@ -75,14 +75,14 @@
 
 - `NoteWriter::create(notes_dir, started_at) -> Result<NoteWriter>`:建文件夹、写 meta(`state=recording`)、打开 `segments.jsonl` append 句柄。
 - `append_final(&mut self, seg: SegmentRecord) -> Result<()>`:序列化一行 + `write + flush`。
-- `finalize(&mut self, ended_at) -> Result<()>`:原子更新 meta(`ended_at`、`state=complete`)。
-- **写失败不中断录制**:失败的段进内存待写队列,下次 `append_final`/`finalize` 时先重试队列;错误通过 status 事件上报 UI。
+- `finalize(&mut self, ended_at) -> Result<()>`:先补写待写队列,**失败则返回 Err 且不改 meta**(state 留 `recording`,笔记诚实显示「已中断」而非假 complete);成功才原子更新 meta(`ended_at`、`state=complete`)。
+- **写失败不中断录制**:失败的段进内存待写队列,下次 `append_final`/`finalize` 时先重试队列;错误通过 `storage` 事件上报 UI。
 
 ### NoteStore(静态读写,IPC command 用)
 
 - `list(notes_dir) -> Vec<NoteMeta>`:扫描子目录读 meta.json,按 `started_at` 倒序;meta 损坏的以文件夹名兜底展示。
 - `load(id) -> Note { meta, segments }`:逐行解析 jsonl;**不可解析的尾行跳过**(崩溃截断容忍),中间行损坏同样跳过并计数上报。
-- `rename(id, title)`:原子更新 meta。
+- `rename(id, title)`:原子更新 meta(command 层拒绝改名录制中的笔记,避免被 finalize 的内存 meta 覆写回滚)。
 - `delete(id)`:`remove_dir_all`(UI 已确认)。
 - `export(id, format: md|txt) -> PathBuf`:生成到会议文件夹内,返回路径。
 
@@ -90,8 +90,10 @@
 
 - `start_recording`:创建 `NoteWriter`,随会话编排传入 ASR worker;worker 每 emit 一条 `final` 事件,同步 `append_final`(同一结构,seq 单调递增)。
 - `stop_recording`:排干后 `finalize`。
-- 新增 5 个 Tauri command:`list_notes / get_note / rename_note / delete_note / export_note`;`start_recording` 返回值增加 `note_id`(停止后前端跳转详情用)。
-- `StatusEvent` 增加可选落盘警告字段(如 `storage: "ok" | "degraded"`),UI 据此显示横幅。
+- 新增 6 个 Tauri command:`list_notes / get_note / rename_note / delete_note / export_note / recording_status`。
+- `note_id` 经 `StatusEvent` 携带(`recording`/`stopped` 时),而非 `start_recording` 返回值——writer 在异步加载线程里创建,同步返回拿不到(实现期修正)。前端在 `stopped` 时据此跳转详情。
+- `recording_status` 查询 command 供 /record 重挂载时重建录制状态(Tauri 事件非粘性;录制中导航离开再回来仍能停止)。
+- 落盘健康度用独立 `"storage"` 事件(`{ state: "ok" | "degraded" }`)而非 StatusEvent 字段——与录制状态解耦(实现期修正)。UI 据此显示横幅。
 
 ### 崩溃恢复
 

@@ -243,7 +243,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
                     drop(gen_guard);
                     drop(running_guard);
                     start.handle.stop();
-                    abort_or_finalize(&writer); // 被 stop/新 start 抢先：内容保全为 complete
+                    abort_or_finalize(&writer); // 被 stop/新 start 抢先：有内容则收尾保全（flush 失败时留 recording）
                     return;
                 }
                 drop(gen_guard);

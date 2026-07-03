@@ -156,3 +156,20 @@ Base (branch start): 144474f
 - 端到端：我/对方徽章、双源转写、partial 边说边刷、停止→再开录不用重启，全部正常。
 - 回声串扰（外放场景）与多人拆分已明确为 P3 backlog（AEC / diarization）。
 - PR #2 squash 合并至 master。
+
+## P3 — 存储与笔记 (branch p3-storage-notes)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p3-storage-notes.md
+Base: 8569ec3
+- Task 1: complete (commits 8569ec3..cfe214d, review clean; minor: silero start 透传仅靠审读验证,无独立单测) 
+- Task 2: complete (commits cfe214d..4e0181c, review approved; Important[plan-mandated] 时间戳语义注释已对齐 spec §8; minors: segment_worker 递增断言在单 final fixture 下空转、ms 计算块两处重复(沿袭既有模式)) 
+- Task 3: complete (commits 4e0181c..3c21f0a, review approved; 注意: store 模块暂有 dead_code warnings(SCHEMA_VERSION/NoteWriter 全家),Task 6 接线后须核对清零; minors: id TOCTOU 假设加注释、file 字段 pub(super) 可收窄) 
+- Task 4: complete (commits 3c21f0a..cc099dc, review approved; minors: 多项列表沉底/空行不计数无回归测试、meta.id==目录名为隐式跨模块不变式、list 对 recording 项全量扫 jsonl) 
+- Task 5: complete (commits cc099dc..6c3032e, 1 fix round: 半角括号+header 三分支测试+txt 空行结构, re-review approved; minor: md 特殊字符不转义(非需求)) 
+- Task 6: complete (commits 6c3032e..350c0c2, opus review approved, 竞态矩阵/锁序核验通过; minor: 停止时不发 storage ok(靠前端 stopped 清横幅), gen/schemas 自动生成文件一并提交) 
+- Task 7: complete (commits 350c0c2..327f333, review approved, 迁移逐行核验一致) 
+- Task 8: complete (commits 327f333..08878e8, review approved; minors: active 行未禁用删改(靠后端拒绝+横幅)、失败后编辑态不保留、改名+删除并发的理论竞态) 
+- Task 9: complete (commits 08878e8..b4f852c, review approved; 偏差 as string 断言经核属必要; minors: $app/stores 为 legacy 路径、h1 改名无键盘入口、durationSecs 依赖 ended_at 隐式不变式) 
+- Task 10 (自动化部分): cargo test 40/40, npm check 0 errors(2 a11y warnings 属预期), npm build OK
+- 终审 (fable, 全分支): With fixes → 修复 commit 13ea1f0(Critical: recording_status 重建状态; Important: rename 录制中守卫; Important: finalize 失败不置 complete + stopped 清横幅)→ 复审 (opus): Ready to merge YES
+- 终审后续项(不阻塞): 加载窗口期新笔记短暂显示已中断且守卫未覆盖; 详情页不过滤空白段; 跨源时间戳非单调(P4 排序); take→finalize 亚秒级改名窗口; $app/stores legacy; h1 改名无键盘入口; 列表 active 行前端未禁用删改
+- 待人工冒烟(见计划 Task 10 Step 2 + 新增第 7 条: 录制中→回列表→再进 /record→停止)
