@@ -10,7 +10,6 @@ import {
   type SystemAudio,
   type StatusEvent,
 } from "./events";
-import { renameSpeaker as renameSpeakerCmd } from "./notes";
 
 export type Line = { source: Source; text: string; speaker: string | null };
 export type SpeakerMap = Record<string, { name: string; sources: string[] }>;
@@ -142,10 +141,5 @@ export const recording = {
     } finally {
       pending = false;
     }
-  },
-
-  /** 录制中改名说话人；本地 speakers 表由 "speakers" 事件回推更新，无需手动改。 */
-  async renameSpeaker(noteId: string, speakerId: string, name: string) {
-    await renameSpeakerCmd(noteId, speakerId, name);
   },
 };

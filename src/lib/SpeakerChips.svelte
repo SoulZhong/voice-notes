@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { speakerColor, renameSpeaker } from "$lib/notes";
+  import { speakerColor, speakerLabel, renameSpeaker } from "$lib/notes";
 
   let {
     speakers,
@@ -18,10 +18,8 @@
 
   const ids = $derived(Object.keys(speakers).sort());
 
-  function label(id: string): string {
-    const name = speakers[id]?.name;
-    return name || `说话人 ${id.replace(/^S/, "")}`;
-  }
+  // 非 null 分支与徽章共用同一兜底逻辑;source 参数在此分支无关,固定传 "mic"。
+  const label = (id: string) => speakerLabel(id, "mic", speakers);
 
   function beginEdit(id: string) {
     editingId = id;
