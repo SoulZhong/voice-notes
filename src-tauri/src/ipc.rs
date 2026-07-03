@@ -26,10 +26,25 @@ pub struct FinalEvent {
     /// 展示用途可接受，见设计文档 §8）。
     pub start_ms: u64,
     pub end_ms: u64,
+    /// 声纹归簇得到的说话人 id（如 "S1"）；无 embedder / 嵌入失败 / 短段则为 None。
+    pub speaker: Option<String>,
 }
 
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {
     pub state: String,
+}
+
+/// 说话人表(全量推送),事件名 "speakers"。name 空串 = 未改名(前端按 id 兜底)。
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakerEntry {
+    pub id: String,
+    pub name: String,
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakersEvent {
+    pub speakers: Vec<SpeakerEntry>,
 }

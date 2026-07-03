@@ -72,6 +72,21 @@ impl NoteWriter {
         &self.dir
     }
 
+    /// 说话人表只读访问（供 IPC 层组装 SpeakersEvent，不落盘）。
+    pub fn speakers(&self) -> &BTreeMap<String, SpeakerMeta> {
+        &self.speakers
+    }
+
+    /// 改说话人显示名：只更新内存表，不落盘（落盘由 NoteStore::rename_speaker
+    /// 那次直写完成）。防止后续 sync_speakers 覆写——它本就保留非空名，此处只是
+    /// 让活动会话的内存态与磁盘同步，避免下一次归簇事件把刚改的名字"打回原形"。
+    pub fn set_speaker_name(&mut self, id: &str, name: &str) {
+        self.speakers
+            .entry(id.to_string())
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new() })
+            .name = name.to_string();
+    }
+
     /// 追加一条定稿段。失败时段留在待写队列并返回 Err（调用方发 storage 降级事件），
     /// 后续调用先重试队列，保证顺序与 seq 单调。
     pub fn append_final(
