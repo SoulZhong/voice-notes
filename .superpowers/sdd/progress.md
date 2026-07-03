@@ -173,3 +173,13 @@ Base: 8569ec3
 - 终审 (fable, 全分支): With fixes → 修复 commit 13ea1f0(Critical: recording_status 重建状态; Important: rename 录制中守卫; Important: finalize 失败不置 complete + stopped 清横幅)→ 复审 (opus): Ready to merge YES
 - 终审后续项(不阻塞): 加载窗口期新笔记短暂显示已中断且守卫未覆盖; 详情页不过滤空白段; 跨源时间戳非单调(P4 排序); take→finalize 亚秒级改名窗口; $app/stores legacy; h1 改名无键盘入口; 列表 active 行前端未禁用删改
 - 待人工冒烟(见计划 Task 10 Step 2 + 新增第 7 条: 录制中→回列表→再进 /record→停止)
+
+## P3.5 — UX 重构 (branch p3-storage-notes 续)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p3.5-ux-rework.md
+Base: 569bf30
+- P3.5 Task 1: complete (commits 569bf30..51f82bd, 1 fix round: 中间失败路径归还+take 锁窗口, re-review approved) 
+- P3.5 Task 2: complete (commits 51f82bd..2a642ff, review approved, 零 findings) 
+- P3.5 Task 3: complete (commits 2a642ff..c5281e6, review approved, 全应用监听收敛核验) 
+- P3.5 终审 (fable): No→修复 commit 344d0de(Critical: 详情页参数导航不刷新; Important: notesVersion 跨组件同步 / `/` 避开录制中笔记 / 开录 pending 防重+已在录制对账)→ 复审 (opus): Ready to merge YES
+- P3.5 后续项(不阻塞): 冷刷新中途录制 finals 不回灌(可用 getNote 水合); 侧栏改名可能吹掉详情页未提交编辑态; 停止后立即开始若遇孤儿线程会冷加载一次; HMR 下 store 重估双监听(仅 dev)
+- P3.5 自动化: cargo 41/41, npm check 0 errors, build OK。待人工冒烟(计划 Task 4 Step 2)
