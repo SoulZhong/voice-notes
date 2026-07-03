@@ -5,8 +5,168 @@ use crate::diar::SpeakerEmbedder;
 use crate::pipeline::segment_worker::run_segment_worker;
 use crate::pipeline::segmenter::Segmenter;
 use crossbeam_channel::Receiver;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// 跨路回声去重(P4.5 Task 4)：同一人声经「他人电脑外放→房间→本机 mic」形成第二路,
+// 声道染色使声纹分裂、转写重复。策略：mic 段识别后先 hold(不落盘/不嵌入),期间
+// 若有时间邻近且文本高相似的 system 段出现则丢弃 mic 段；到期无匹配则正常处理。
+// 下列为首轮取值(未经真实会议数据校准),P4.5 二轮联调时应根据误伤/漏抓率回调。
+/// mic 段最长 hold 时长(ms)，超时未匹配到回声即释放正常处理。
+pub(crate) const ECHO_HOLD_MS: u64 = 2500;
+/// 判定「时间邻近」的窗口(ms)：两段时间区间交叠，或起点差小于此值。
+const ECHO_WINDOW_MS: u64 = 2500;
+/// 判定「文本高相似」的阈值(0~1，见 text_similarity)。
+const ECHO_SIM_THRESHOLD: f32 = 0.6;
+/// recent_system 缓冲的裁剪窗口(ms)：仅保留最近 10s 内的 system 段供 mic 端比对。
+const RECENT_SYSTEM_WINDOW_MS: u64 = 10_000;
+
+/// 归一化：去除空白与常见中英标点、ASCII 转小写，供回声去重的文本比对使用。
+fn normalize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if matches!(
+            c,
+            ',' | '.' | '?' | '!' | ';' | ':' | '，' | '。' | '？' | '！' | '、' | '；' | '：'
+        ) {
+            continue;
+        }
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+    }
+    out
+}
+
+/// 按字符计的 Levenshtein 编辑距离，O(nm)，用于短段文本比对。
+fn levenshtein(a: &[char], b: &[char]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// 文本相似度 = max(1 − 编辑距离/较长串字符数, 归一化后短串被长串完全包含 ? 1.0 : 0.0)。
+/// 任一侧归一化后为空串 → 0（避免空文本互相「完全包含」误判）。
+fn text_similarity(a: &str, b: &str) -> f32 {
+    let na = normalize_text(a);
+    let nb = normalize_text(b);
+    if na.is_empty() || nb.is_empty() {
+        return 0.0;
+    }
+    let ca: Vec<char> = na.chars().collect();
+    let cb: Vec<char> = nb.chars().collect();
+    let contains_score = if ca.len() <= cb.len() {
+        if nb.contains(&na) { 1.0 } else { 0.0 }
+    } else if na.contains(&nb) {
+        1.0
+    } else {
+        0.0
+    };
+    let max_len = ca.len().max(cb.len()) as f32;
+    let dist_score = if max_len == 0.0 {
+        0.0
+    } else {
+        1.0 - (levenshtein(&ca, &cb) as f32 / max_len)
+    };
+    dist_score.max(contains_score)
+}
+
+/// 两段 `[start,end]` 是否「时间邻近」：区间交叠，或起点差 < ECHO_WINDOW_MS。
+fn time_near(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    let overlap = a_start <= b_end && b_start <= a_end;
+    let start_close = (a_start as i64 - b_start as i64).abs() < ECHO_WINDOW_MS as i64;
+    overlap || start_close
+}
+
+/// 前 20 字符前缀，供丢弃日志裁剪展示（按 char 计，避免截断多字节字符）。
+fn text_prefix20(s: &str) -> String {
+    s.chars().take(20).collect()
+}
+
+/// hold 中的 mic 段：已识别文本，等待与 system 段比对；到期(echo_hold)无匹配则
+/// 走完整处理链(embed/assign/on_final)。`embedding_input` 为原始样本，供 release
+/// 时才做声纹嵌入（避免被丢弃的段产生任何嵌入副作用）。
+struct PendingMic {
+    text: String,
+    norm: String,
+    start_ms: u64,
+    end_ms: u64,
+    samples_len: usize,
+    embedding_input: Vec<f32>,
+    held_at: Instant,
+}
+
+/// 已处理的 system 段的轻量记录，供后续到达的 mic 段比对（回声去重）。
+struct RecentSystem {
+    text: String,
+    norm: String,
+    start_ms: u64,
+    end_ms: u64,
+}
+
+/// 完整处理链：embed → assign → take_merges/SpeakersChanged → on_final。
+/// 即时路径（system 段、无匹配的 mic 段）与 release 路径（hold 到期/排干的 mic 段）共用，
+/// 保证「被丢弃段零副作用、被处理段处理逻辑同源」。
+#[allow(clippy::too_many_arguments)]
+fn process_final<F1, F2>(
+    source: Source,
+    text: String,
+    start_ms: u64,
+    end_ms: u64,
+    samples_len: usize,
+    embedding_input: &[f32],
+    embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
+    registry: &mut SpeakerRegistry,
+    last_sent: &mut Vec<crate::diar::registry::SpeakerInfo>,
+    on_final: &mut F1,
+    on_diar: &mut F2,
+) where
+    F1: FnMut(Source, String, u64, u64, Option<String>),
+    F2: FnMut(DiarEvent),
+{
+    // 声纹:嵌入失败/无 embedder → None,绝不影响文本
+    let speaker = embedder.as_mut().and_then(|e| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.embed(embedding_input))) {
+            Ok(Ok(v)) => registry.assign(&v, source.as_str(), samples_len),
+            Ok(Err(err)) => {
+                eprintln!("声纹提取失败({:?} 段): {err}", source);
+                None
+            }
+            Err(_) => {
+                eprintln!("声纹提取 panic({:?} 段),该段无标签", source);
+                None
+            }
+        }
+    });
+    for (loser, winner) in registry.take_merges() {
+        on_diar(DiarEvent::Merged { loser, winner });
+    }
+    let speakers = registry.speakers();
+    if speakers != *last_sent {
+        *last_sent = speakers.clone();
+        on_diar(DiarEvent::SpeakersChanged(speakers));
+    }
+    on_final(source, text, start_ms, end_ms, speaker);
+}
 
 /// 完成句识别任务：进 finals 队列，永不丢弃（保证不丢内容）。
 #[derive(Debug, Clone)]
@@ -44,6 +204,7 @@ pub fn run_asr_worker(
     mut embedder: Option<Box<dyn SpeakerEmbedder>>,
     mut registry: SpeakerRegistry,
     finals_rx: Receiver<FinalJob>,
+    echo_hold: Duration,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
     mut on_final: impl FnMut(Source, String, u64, u64, Option<String>),
     mut on_partial: impl FnMut(Source, String),
@@ -52,9 +213,43 @@ pub fn run_asr_worker(
     // 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
     // 已有簇 sources 增长等变化都能被捕获并同步。
     let mut last_sent: Vec<crate::diar::registry::SpeakerInfo> = Vec::new();
+    // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）。
+    let mut pending_mic: VecDeque<PendingMic> = VecDeque::new();
+    let mut recent_system: VecDeque<RecentSystem> = VecDeque::new();
+
+    // release 一个到期/排干的 pending mic 段：走完整处理链，与即时路径同源。
+    macro_rules! release_pending {
+        ($p:expr) => {{
+            let p: PendingMic = $p;
+            process_final(
+                Source::Mic,
+                p.text,
+                p.start_ms,
+                p.end_ms,
+                p.samples_len,
+                &p.embedding_input,
+                &mut embedder,
+                &mut registry,
+                &mut last_sent,
+                &mut on_final,
+                &mut on_diar,
+            );
+        }};
+    }
+
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
+                // 到期检查(先于本条 final 的处理)：让长时间空转但持续来 final 的场景
+                // 也能及时 release，不必等到 timeout tick。
+                while pending_mic
+                    .front()
+                    .is_some_and(|p| p.held_at.elapsed() >= echo_hold)
+                {
+                    let p = pending_mic.pop_front().unwrap();
+                    release_pending!(p);
+                }
+
                 let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     recognizer.recognize(&job.samples)
                 })) {
@@ -68,33 +263,86 @@ pub fn run_asr_worker(
                         "[识别失败]".to_string()
                     }
                 };
-                // 声纹:嵌入失败/无 embedder → None,绝不影响文本
-                let speaker = embedder.as_mut().and_then(|e| {
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        e.embed(&job.samples)
-                    })) {
-                        Ok(Ok(v)) => registry.assign(&v, job.source.as_str(), job.samples.len()),
-                        Ok(Err(err)) => {
-                            eprintln!("声纹提取失败({:?} 段): {err}", job.source);
-                            None
-                        }
-                        Err(_) => {
-                            eprintln!("声纹提取 panic({:?} 段),该段无标签", job.source);
-                            None
+
+                match job.source {
+                    Source::System => {
+                        let sys_norm = normalize_text(&text);
+                        // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
+                        pending_mic.retain(|p| {
+                            let echoed = time_near(p.start_ms, p.end_ms, job.start_ms, job.end_ms)
+                                && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+                            if echoed {
+                                eprintln!(
+                                    "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                                    text_prefix20(&p.text),
+                                    text_prefix20(&text)
+                                );
+                            }
+                            !echoed
+                        });
+                        // system 段零延迟处理。
+                        process_final(
+                            job.source,
+                            text.clone(),
+                            job.start_ms,
+                            job.end_ms,
+                            job.samples.len(),
+                            &job.samples,
+                            &mut embedder,
+                            &mut registry,
+                            &mut last_sent,
+                            &mut on_final,
+                            &mut on_diar,
+                        );
+                        recent_system.push_back(RecentSystem {
+                            text,
+                            norm: sys_norm,
+                            start_ms: job.start_ms,
+                            end_ms: job.end_ms,
+                        });
+                        let newest_end = job.end_ms;
+                        recent_system
+                            .retain(|r| newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS);
+                    }
+                    Source::Mic => {
+                        let mic_norm = normalize_text(&text);
+                        let echo = recent_system.iter().find(|r| {
+                            time_near(job.start_ms, job.end_ms, r.start_ms, r.end_ms)
+                                && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                        });
+                        match echo {
+                            Some(r) => {
+                                eprintln!(
+                                    "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                                    text_prefix20(&text),
+                                    text_prefix20(&r.text)
+                                );
+                                // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
+                            }
+                            None => {
+                                pending_mic.push_back(PendingMic {
+                                    text,
+                                    norm: mic_norm,
+                                    start_ms: job.start_ms,
+                                    end_ms: job.end_ms,
+                                    samples_len: job.samples.len(),
+                                    embedding_input: job.samples,
+                                    held_at: Instant::now(),
+                                });
+                            }
                         }
                     }
-                });
-                for (loser, winner) in registry.take_merges() {
-                    on_diar(DiarEvent::Merged { loser, winner });
                 }
-                let speakers = registry.speakers();
-                if speakers != last_sent {
-                    last_sent = speakers.clone();
-                    on_diar(DiarEvent::SpeakersChanged(speakers));
-                }
-                on_final(job.source, text, job.start_ms, job.end_ms, speaker);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // 到期检查：无 final 到来时靠这个 100ms tick 兜底 release。
+                while pending_mic
+                    .front()
+                    .is_some_and(|p| p.held_at.elapsed() >= echo_hold)
+                {
+                    let p = pending_mic.pop_front().unwrap();
+                    release_pending!(p);
+                }
                 // 空闲：服务每源最新 partial（取出即清空，只识别最新一版）。
                 for (src, slot) in &partial_slots {
                     let job = slot.lock().unwrap().take();
@@ -115,6 +363,10 @@ pub fn run_asr_worker(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // 排干全部 pending（无论是否到期），保持入队序，再发 Snapshot。
+                while let Some(p) = pending_mic.pop_front() {
+                    release_pending!(p);
+                }
                 on_diar(DiarEvent::Snapshot(registry.snapshot()));
                 break;
             }
@@ -182,6 +434,7 @@ pub fn start_session(
     recognizer: Box<dyn Recognizer>,
     embedder: Option<Box<dyn SpeakerEmbedder>>,
     registry: SpeakerRegistry,
+    echo_hold: Duration,
     target_rate: u32,
     partial_interval_samples: usize,
     on_final: impl FnMut(Source, String, u64, u64, Option<String>) + Send + 'static,
@@ -238,7 +491,9 @@ pub fn start_session(
     }
 
     let asr = std::thread::spawn(move || {
-        run_asr_worker(recognizer, embedder, registry, finals_rx, slots, on_final, on_partial, on_diar)
+        run_asr_worker(
+            recognizer, embedder, registry, finals_rx, echo_hold, slots, on_final, on_partial, on_diar,
+        )
     });
 
     Ok(SessionStart {
@@ -255,6 +510,10 @@ mod asr_worker_tests {
     use crate::audio::Source;
     use crate::diar::MockEmbedder;
     use std::sync::{Arc, Mutex};
+
+    // 短 hold,避免慢测试;既有(非回声去重相关)测试用它即可——它们的段要么单源、
+    // 要么时间戳刻意分得够开,不会被误判为回声,hold 时长本身对结果无影响。
+    const TEST_ECHO_HOLD: Duration = Duration::from_millis(50);
 
     struct CountingRecognizer;
     impl Recognizer for CountingRecognizer {
@@ -277,8 +536,11 @@ mod asr_worker_tests {
     #[test]
     fn emits_all_finals_tagged_in_order() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 10], start_ms: 0, end_ms: 625 }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 20], start_ms: 625, end_ms: 1875 }).unwrap();
+        // System 先到、Mic 后到，且时间戳刻意拉开(> ECHO_WINDOW_MS 且不交叠)：System
+        // 零延迟处理，Mic 因回声去重会先 hold、在 Disconnected 排干时才 release——
+        // 这与本例送达顺序一致(system 先、mic 后)，故整体顺序不变，回声匹配也不误伤。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 20], start_ms: 0, end_ms: 625 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 10], start_ms: 5000, end_ms: 5625 }).unwrap();
         drop(tx);
 
         let finals = Arc::new(Mutex::new(Vec::<(Source, String, u64, u64)>::new()));
@@ -288,6 +550,7 @@ mod asr_worker_tests {
             None,
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |s, t, start_ms, end_ms, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
             |_, _| {},
@@ -296,8 +559,8 @@ mod asr_worker_tests {
         assert_eq!(
             *finals.lock().unwrap(),
             vec![
-                (Source::Mic, "len=10".into(), 0, 625),
-                (Source::System, "len=20".into(), 625, 1875)
+                (Source::System, "len=20".into(), 0, 625),
+                (Source::Mic, "len=10".into(), 5000, 5625)
             ]
         );
     }
@@ -316,6 +579,7 @@ mod asr_worker_tests {
             None,
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -356,6 +620,7 @@ mod asr_worker_tests {
             None,
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -386,6 +651,7 @@ mod asr_worker_tests {
                 None,
                 SpeakerRegistry::new(),
                 rx,
+                TEST_ECHO_HOLD,
                 vec![(Source::System, slot_for_worker)],
                 |_, _, _, _, _| {},
                 move |s, t| p2.lock().unwrap().push((s, t)),
@@ -413,9 +679,12 @@ mod asr_worker_tests {
     #[test]
     fn finals_get_speaker_labels_and_diar_events() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        // 两段长音频:第一段 → S1;第二段正交向量 → S2
+        // 两段长音频:第一段 → S1;第二段正交向量 → S2。
+        // 两段文本(均由 CountingRecognizer 按长度生成)恰好相似("len=32000" 相同)，
+        // 时间戳特意拉开(> ECHO_WINDOW_MS 且不交叠)以隔离本用例(测说话人聚类)与
+        // 回声去重逻辑,避免被误判丢弃。
         tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 2000, end_ms: 4000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 10000, end_ms: 12000 }).unwrap();
         drop(tx);
 
         let embedder = MockEmbedder::new(vec![
@@ -430,6 +699,7 @@ mod asr_worker_tests {
             Some(Box::new(embedder)),
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -447,8 +717,9 @@ mod asr_worker_tests {
     fn same_speaker_growing_sources_reemits_speakers() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
         // 同一说话人两段，不同 source（两次同向量 → 都归入 S1，sources 从 {mic} 增长到 {mic,system}）。
+        // 时间戳拉开(> ECHO_WINDOW_MS 且不交叠)，隔离本用例与回声去重逻辑。
         tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 2000, end_ms: 4000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 10000, end_ms: 12000 }).unwrap();
         drop(tx);
 
         let embedder = MockEmbedder::new(vec![
@@ -463,6 +734,7 @@ mod asr_worker_tests {
             Some(Box::new(embedder)),
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -492,6 +764,7 @@ mod asr_worker_tests {
             Some(Box::new(embedder)),
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -512,6 +785,7 @@ mod asr_worker_tests {
             None,
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -535,6 +809,7 @@ mod asr_worker_tests {
             Some(Box::new(embedder)),
             SpeakerRegistry::new(),
             rx,
+            TEST_ECHO_HOLD,
             vec![],
             |_, _, _, _, _| {},
             |_, _| {},
@@ -552,6 +827,202 @@ mod asr_worker_tests {
             _ => unreachable!(),
         }
     }
+
+    /// 测试用识别器：按队列依次返回预置文本（耗尽后返回空串），供回声去重测试
+    /// 精确控制每段的识别结果，而不依赖样本长度这类间接信号。
+    struct ScriptedRecognizer {
+        script: std::collections::VecDeque<String>,
+    }
+    impl ScriptedRecognizer {
+        fn new(texts: &[&str]) -> Self {
+            Self { script: texts.iter().map(|s| s.to_string()).collect() }
+        }
+    }
+    impl Recognizer for ScriptedRecognizer {
+        fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+            Ok(Transcript { text: self.script.pop_front().unwrap_or_default() })
+        }
+    }
+
+    // ---- P4.5 Task 4: 跨路回声去重(mic hold-and-release + 文本相似)----
+
+    #[test]
+    fn mic_first_then_matching_system_only_system_survives() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // 时间邻近(同区间) + 文本相同 → mic 段应被丢弃,只剩 system 一条。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 800], start_ms: 1000, end_ms: 1625 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 900], start_ms: 1000, end_ms: 1625 }).unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["hello world", "hello world"]);
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]); // 仅 system 段会 embed
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "hello world".to_string())],
+            "mic 先到、system 后到且同文本:mic 段应被回声去重丢弃,只留 system 一条"
+        );
+    }
+
+    #[test]
+    fn system_first_then_matching_mic_is_dropped() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 900], start_ms: 2000, end_ms: 2625 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 800], start_ms: 2000, end_ms: 2625 }).unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["foo bar", "foo bar"]);
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]); // 仅 system 段会 embed
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "foo bar".to_string())],
+            "system 先到、mic 后到且同文本:mic 到达时应对照 recent_system 命中即丢"
+        );
+    }
+
+    #[test]
+    fn dissimilar_text_or_far_apart_time_does_not_misfire() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // 组 1:时间邻近,但文本完全不同 → 不应误杀。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 3000, end_ms: 3625 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 100], start_ms: 3000, end_ms: 3625 }).unwrap();
+        // 组 2:文本相同,但时间相距甚远 → 不应误杀。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 0, end_ms: 625 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 100], start_ms: 90_000, end_ms: 90_625 }).unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&[
+            "aaaaaaaaaa",     // mic 组1
+            "zzzzzzzzzz",     // system 组1:与 mic 组1 文本完全不同
+            "same phrase",    // mic 组2
+            "same phrase",    // system 组2:与 mic 组2 文本相同,但时间相距 90s
+        ]);
+        let embedder = MockEmbedder::new(vec![
+            Ok(vec![1.0, 0.0, 0.0, 0.0]),
+            Ok(vec![0.0, 1.0, 0.0, 0.0]),
+            Ok(vec![0.0, 0.0, 1.0, 0.0]),
+            Ok(vec![0.0, 0.0, 0.0, 1.0]),
+        ]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        // system 段零延迟(到达即处理);mic 段本身不匹配任何 system,最终在 Disconnected
+        // 排干时按入队序 release——四段都不应被丢弃。
+        let got = finals.lock().unwrap().clone();
+        assert_eq!(got.len(), 4, "不相似/不邻近的两组都不应被回声去重误杀: {got:?}");
+        assert!(got.contains(&(Source::System, "zzzzzzzzzz".to_string())));
+        assert!(got.contains(&(Source::System, "same phrase".to_string())));
+        assert!(got.contains(&(Source::Mic, "aaaaaaaaaa".to_string())));
+        assert!(got.contains(&(Source::Mic, "same phrase".to_string())));
+    }
+
+    #[test]
+    fn drain_releases_all_pending_without_loss_at_disconnect() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 0, end_ms: 625 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 200], start_ms: 1000, end_ms: 1625 }).unwrap();
+        drop(tx); // Disconnected 几乎立即到达,远早于下面刻意设的 10s hold 到期
+
+        let recognizer = ScriptedRecognizer::new(&["first segment", "second segment"]);
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0]), Ok(vec![0.0, 1.0, 0.0])]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_secs(10), // 故意远长于测试运行时间:证明 release 靠 Disconnected 排干,而非到期
+            vec![],
+            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![
+                (Source::Mic, "first segment".to_string()),
+                (Source::Mic, "second segment".to_string())
+            ],
+            "会话结束应排干全部 pending mic(顺序保持入队序),不丢内容"
+        );
+    }
+
+    #[test]
+    fn pending_mic_releases_after_hold_expires_without_matching_system() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let recognizer = ScriptedRecognizer::new(&["lonely mic segment"]);
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(recognizer),
+                Some(Box::new(embedder)),
+                SpeakerRegistry::new(),
+                rx,
+                TEST_ECHO_HOLD,
+                vec![],
+                move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+                |_, _| {},
+                |_| {},
+            );
+        });
+
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 0, end_ms: 625 }).unwrap();
+
+        // 有界轮询等待到期 release:此时 tx 仍未 drop(channel 未断开),证明 release 由
+        // 到期检查(timeout tick / 下一条 final 前)触发,而非依赖会话结束时的排干。
+        let mut released = false;
+        for _ in 0..200 {
+            if !finals.lock().unwrap().is_empty() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(released, "hold 到期后应自动 release,无需等待会话结束");
+        assert_eq!(*finals.lock().unwrap(), vec![(Source::Mic, "lonely mic segment".to_string())]);
+
+        drop(tx);
+        worker.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -564,10 +1035,28 @@ mod session_tests {
     use crossbeam_channel::Sender;
     use std::sync::{Arc, Mutex};
 
+    // 短 hold,避免慢测试(与本文件顶部 ECHO_HOLD_MS 的生产值区分开)。
+    const TEST_ECHO_HOLD: Duration = Duration::from_millis(50);
+
     struct CountingRecognizer;
     impl Recognizer for CountingRecognizer {
         fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
             Ok(Transcript { text: format!("len={}", s.len()) })
+        }
+    }
+
+    /// 按内容(而非仅长度)生成文本的测试识别器：定长分段器(MockSegmenter)对不同音频也可能
+    /// 切出相同长度的段,若识别文本只看长度,两路不同内容的段会被回声去重误判为同一人。
+    /// 真实场景该由真实 ASR 输出的转写文本自然区分,这里用内容摘要模拟“文本不同”。
+    struct ContentDigestRecognizer;
+    impl Recognizer for ContentDigestRecognizer {
+        fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
+            let mut hash: u64 = 1469598103934665603; // FNV-1a offset basis
+            for &x in s {
+                hash ^= x.to_bits() as u64;
+                hash = hash.wrapping_mul(1099511628211);
+            }
+            Ok(Transcript { text: format!("h{hash:x}n{}", s.len()) })
         }
     }
 
@@ -578,11 +1067,10 @@ mod session_tests {
     }
     impl IdlingCapture {
         fn from_fixture() -> Self {
-            let mut cap = MockCapture::from_wav(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/sample_16k.wav"
-            ))
-            .expect("fixture");
+            Self::from_wav(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample_16k.wav"))
+        }
+        fn from_wav(path: &str) -> Self {
+            let mut cap = MockCapture::from_wav(path).expect("fixture");
             // 借 MockCapture 的分帧：把它的帧抽出来（通过一次性 start 到本地通道）。
             let (tx, rx) = crossbeam_channel::unbounded::<AudioFrame>();
             cap.start(tx).unwrap();
@@ -613,16 +1101,27 @@ mod session_tests {
         let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
         let f2 = finals.clone();
 
+        // 两源用不同 fixture(内容不同):真实场景 mic/system 音频不同才是常态；本用例只测
+        // 两源都能跑通落盘全链路，不是回声去重场景——用不同内容 + 按内容生成文本的识别器，
+        // 避免定长分段器切出的等长段被回声去重误判为同一人而丢弃(见 ContentDigestRecognizer)。
         let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![
             (Source::Mic, Box::new(IdlingCapture::from_fixture()), Box::new(MockSegmenter::new(2000))),
-            (Source::System, Box::new(IdlingCapture::from_fixture()), Box::new(MockSegmenter::new(2000))),
+            (
+                Source::System,
+                Box::new(IdlingCapture::from_wav(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/sample_zh_16k.wav"
+                ))),
+                Box::new(MockSegmenter::new(2000)),
+            ),
         ];
 
         let start = start_session(
             sources,
-            Box::new(CountingRecognizer),
+            Box::new(ContentDigestRecognizer),
             None,
             SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
             16000,
             4000,
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
@@ -663,6 +1162,7 @@ mod session_tests {
             Box::new(CountingRecognizer),
             None,
             SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
             16000,
             4000,
             |_, _, _, _, _| {},
@@ -690,6 +1190,7 @@ mod session_tests {
             Box::new(CountingRecognizer),
             None,
             SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
             16000,
             4000,
             |_, _, _, _, _| {},

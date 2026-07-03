@@ -504,6 +504,7 @@ mod tests {
             Box::new(CountingRecognizer),
             None,
             crate::diar::registry::SpeakerRegistry::new(),
+            std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
             move |src, text, start_ms, end_ms, spk| {
@@ -842,6 +843,7 @@ mod tests {
             Box::new(CountingRecognizer),
             None,
             SpeakerRegistry::new(),
+            std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
             move |src, text, start_ms, end_ms, spk| {
@@ -872,6 +874,7 @@ mod tests {
             Box::new(CountingRecognizer),
             None,
             SpeakerRegistry::from_snapshot(&writer2.lock().unwrap().registry_snapshot()),
+            std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
             move |src, text, start_ms, end_ms, spk| {

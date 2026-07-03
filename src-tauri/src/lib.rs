@@ -255,6 +255,7 @@ fn spawn_session(
             recognizer,
             embedder,
             registry,
+            std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             16000,
             16000,
             move |src, text, start_ms, end_ms, spk| {
