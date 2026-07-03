@@ -3,6 +3,8 @@ pub mod mock;
 pub mod microphone;
 #[cfg(target_os = "macos")]
 pub mod system;
+#[cfg(target_os = "macos")]
+pub mod vpio;
 
 use crossbeam_channel::Sender;
 

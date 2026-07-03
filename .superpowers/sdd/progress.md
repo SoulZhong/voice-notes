@@ -183,3 +183,33 @@ Base: 569bf30
 - P3.5 终审 (fable): No→修复 commit 344d0de(Critical: 详情页参数导航不刷新; Important: notesVersion 跨组件同步 / `/` 避开录制中笔记 / 开录 pending 防重+已在录制对账)→ 复审 (opus): Ready to merge YES
 - P3.5 后续项(不阻塞): 冷刷新中途录制 finals 不回灌(可用 getNote 水合); 侧栏改名可能吹掉详情页未提交编辑态; 停止后立即开始若遇孤儿线程会冷加载一次; HMR 下 store 重估双监听(仅 dev)
 - P3.5 自动化: cargo 41/41, npm check 0 errors, build OK。待人工冒烟(计划 Task 4 Step 2)
+
+## P4 — 说话人区分 + AEC (branch p4-diarization-aec)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p4-diarization-aec.md
+Base: e4c8df2
+- P4 Task 1: complete (commits e4c8df2..6cc199d, spike approved; 结论: coreaudio-sys 直调可行, 44.1kHz f32 mono, 回调须 initialize 前注册; AEC 消除量待冒烟机实测; 报告已补 Send 约束澄清) 
+- P4 Task 2: complete (commits 6cc199d..86431ff, review approved 零 findings, 真模型测试 PASS) 
+- P4 Task 3: complete (commits 86431ff..6999f11, 1 fix round: 合并测试语义如实化+删死代码, re-review approved 经独立仿真核验) 
+- P4 Task 4: complete (commits 6999f11..19f9b7b, review approved; 正当偏差: lib.rs 4 处调用点最小适配(None/noop), 真接线留 Task 6) 
+- P4 Task 5: complete (commits 19f9b7b..850f94f, review approved; minors: merge 两文件间崩溃窗口(与既有单文件原子哲学一致,建议补注释)、损坏行经重写保留仅靠走查无专测) 
+- P4 Task 6: complete (commits 850f94f..af94bcf, opus review approved, 六归还点+死锁面核验; minors: rename 持 session 锁跨 emit(顺序一致无环)、Merged 落盘失败时内存/磁盘瞬时分歧(重启自愈)) 
+- P4 Task 7: complete (commits af94bcf..83e8bd6, review approved, 2 minors 已清理) 
+- P4 Task 8: complete (commits 83e8bd6..1a181d5, opus review approved, FFI 安全六项核验; 真机自检 44.1kHz 产帧+stop 干净; minors: 回调可加 catch_unwind、teardown OSStatus 未打日志) 
+- P4 Task 9 (自动化部分): cargo 55/55 + 真模型嵌入测试 PASS + npm check 0 errors + build OK
+- P4 终审 (fable): With fixes → 修复 commit c862f80(Critical: merge 读错误防清空; Important: 合并回写前端 finals / diarization 降级横幅 / rename 单写者 / SpeakersChanged 全量比较; Minor: 预载锁窗)→ 复审 (opus): Ready to merge YES
+- P4 后续项(不阻塞): rename 持 session 锁跨磁盘 IO+emit(可收窄); chips 编辑中遇合并可复活孤儿条目; speakerColor 对非 S<n> id 兜底; chips 排序 S10<S2; MERGE_CHECK_INTERVAL 冗余; teardown OSStatus 日志; merge 两文件崩溃窗口注释
+- 待人工冒烟(计划 Task 9 Step 2, 六项)+ 聚类阈值校准(Step 3)
+- P4 校准 round 1: complete (commit 02f2c8d, 目检通过; ASSIGN 0.62/MERGE 0.74/MIN_NEW 9600 + 短段不拖质心; 依据 18:34 会议实测 10+人只聚 7 簇) 
+
+## P4.5 — 续录 + 回声去重 (branch p4-diarization-aec 续)
+Plan: docs/superpowers/plans/2026-07-03-voice-notes-p4.5-resume-echo-dedup.md
+Base: d12c665
+- P4.5 Task 1: complete (commits d12c665..a370003, review approved 零 findings) 
+- P4.5 Task 2: complete (待提交; cargo test 73/73 passed, build 无新 warning; NoteWriter::resume/base_ms + spawn_session(NoteTarget::New/Resume) + resume_recording command; 修复发现的截断尾行追加拼接 bug)
+- P4.5 Task 2: complete (commits a370003..f8b7565, opus review approved + 1 fix: abort 目录删除限本会话新建; 附带修复崩溃截断尾行粘行 bug) 
+- P4.5 Task 3: complete (commits f8b7565..35e6725, 1 fix round: resuming 全路径复位+预灌注回滚+失败反馈, re-review approved; 后续观察: 已在录制对账分支不回灌真实会话 finals) 
+- P4.5 Task 4: complete (commits 35e6725..4660f72, opus review approved; 已知边界: 到期后 system 迟到>hold 则漏网(偏保内容)、短语被包含可能误杀(留二轮校准)) 
+- P4.5 Task 5 (自动化部分): cargo 81/81, npm check 0 errors, build OK
+- P4.5 终审 (fable): With fixes → 修复 commit 7dc996f(Important: registry_snapshot 空质心项计编号防张冠李戴; Minor: 占位段不参与去重/resume 回滚补 noteId/注释/TS 类型)→ 复审 (sonnet): Ready to merge YES
+- P4.5 后续项(不阻塞): 已在录制对账分支不回灌真实会话 finals; 详情页可按 start_ms 稳定排序消除 hold 交错; ECHO 三常量二轮校准
+- P4/P4.5 人工冒烟: 用户确认测试通过 (2026-07-04) 
