@@ -207,3 +207,8 @@ Base: d12c665
 - P4.5 Task 1: complete (commits d12c665..a370003, review approved 零 findings) 
 - P4.5 Task 2: complete (待提交; cargo test 73/73 passed, build 无新 warning; NoteWriter::resume/base_ms + spawn_session(NoteTarget::New/Resume) + resume_recording command; 修复发现的截断尾行追加拼接 bug)
 - P4.5 Task 2: complete (commits a370003..f8b7565, opus review approved + 1 fix: abort 目录删除限本会话新建; 附带修复崩溃截断尾行粘行 bug) 
+- P4.5 Task 3: complete (commits f8b7565..35e6725, 1 fix round: resuming 全路径复位+预灌注回滚+失败反馈, re-review approved; 后续观察: 已在录制对账分支不回灌真实会话 finals) 
+- P4.5 Task 4: complete (commits 35e6725..4660f72, opus review approved; 已知边界: 到期后 system 迟到>hold 则漏网(偏保内容)、短语被包含可能误杀(留二轮校准)) 
+- P4.5 Task 5 (自动化部分): cargo 81/81, npm check 0 errors, build OK
+- P4.5 终审 (fable): With fixes → 修复 commit 7dc996f(Important: registry_snapshot 空质心项计编号防张冠李戴; Minor: 占位段不参与去重/resume 回滚补 noteId/注释/TS 类型)→ 复审 (sonnet): Ready to merge YES
+- P4.5 后续项(不阻塞): 已在录制对账分支不回灌真实会话 finals; 详情页可按 start_ms 稳定排序消除 hold 交错; ECHO 三常量二轮校准
