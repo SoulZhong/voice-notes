@@ -20,7 +20,8 @@ pub struct StatusEvent {
 pub struct FinalEvent {
     pub source: String, // "mic" | "system"
     pub text: String,
-    /// 相对会议开始的毫秒。
+    /// 相对该源流开始的毫秒（≈会议开始；双源起点存在毫秒级偏差，
+    /// 展示用途可接受，见设计文档 §8）。
     pub start_ms: u64,
     pub end_ms: u64,
 }
