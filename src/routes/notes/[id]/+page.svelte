@@ -182,7 +182,18 @@
         onblur={commitRename}
       />
     {:else}
-      <h1 class="title" title="点击改名" onclick={beginRename}>{note.meta.title}</h1>
+      <h1
+        class="title"
+        title="点击改名"
+        role="button"
+        tabindex="0"
+        onclick={beginRename}
+        onkeydown={(e) => {
+          if (e.key === "Enter") beginRename();
+        }}
+      >
+        {note.meta.title}
+      </h1>
     {/if}
 
     <p class="meta">

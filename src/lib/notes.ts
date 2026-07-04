@@ -63,12 +63,15 @@ export function speakerLabel(
   const name = speakers[speaker]?.name;
   return name || `说话人 ${speaker.replace(/^S/, "")}`;
 }
-/** 稳定调色板:S1..Sn 循环取色(亮/暗色下均可读) */
+/** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(亮/暗色下均可读) */
 const PALETTE = ["#396cd8", "#2e9e5b", "#b5651d", "#8e44ad", "#c0392b", "#16808a", "#946200", "#5d6d7e"];
 export function speakerColor(speaker: string | null, source: Source): string {
   if (!speaker) return source === "mic" ? "#396cd8" : "#2e9e5b";
-  const n = parseInt(speaker.replace(/^S/, ""), 10) || 0;
-  return PALETTE[(n - 1) % PALETTE.length];
+  const n = parseInt(speaker.replace(/^S/, ""), 10);
+  if (Number.isFinite(n) && n > 0) return PALETTE[(n - 1) % PALETTE.length];
+  let h = 0;
+  for (const c of speaker) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
 }
 
 /** 00:01:23 */
