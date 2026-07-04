@@ -239,6 +239,9 @@ impl NoteWriter {
             match self.speakers.get_mut(&s.id) {
                 Some(entry) => {
                     entry.centroid = Some(s.centroid.clone());
+                    // 注意 count 语义:snapshot() 导出的是本场净增量(种子/续录基数已扣,
+                    // 防库侧复利膨胀),故落盘与续录恢复的权重是"最近一场增量"而非历史累计
+                    // ——续录时质心漂移会比累计权重快,身份判定仍由阈值把守(backlog 复盘)。
                     entry.count = s.count;
                     if let Some(person) = &s.person {
                         entry.person_id = Some(person.clone());
