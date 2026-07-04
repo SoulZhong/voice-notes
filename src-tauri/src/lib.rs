@@ -378,6 +378,10 @@ fn spawn_session(
             },
             move |ev| match ev {
                 session::DiarEvent::SpeakersChanged(infos) => {
+                    // sources 为空 ⇔ 未命中的库种子簇（assign 命中必 sources.insert）：
+                    // 这类簇只是种子注入时铺的库人物候选，本场从未真正出现过，不该
+                    // 泄漏进说话人表/chips/落盘（否则每场笔记都会囤上全库人物）。
+                    let infos: Vec<_> = infos.into_iter().filter(|s| !s.sources.is_empty()).collect();
                     let pairs: Vec<(String, Vec<String>)> = infos
                         .iter()
                         .map(|s| (s.id.clone(), s.sources.iter().cloned().collect()))
@@ -850,6 +854,8 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
 fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
+        // 未命名是系统态(空 name 触发展示端"未命名 · 最近出现…"兜底),不是一个可以
+        // 被"改成"的普通名字;改回未命名无意义——清名走删除/合并，不走 rename。
         return Err("名字不能为空".into());
     }
     open_voiceprint_store(&app)?.rename(&id, name).map_err(|e| e.to_string())

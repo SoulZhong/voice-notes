@@ -60,6 +60,12 @@ struct Cluster {
     person_name: Option<String>,
     /// 累计长段时长(毫秒,仅长段更新质心时累加),供入库门槛与库时长统计。
     total_ms: u64,
+    /// count 里"非本场新增"的基数：种子簇 = 注入时携带的库 count;从快照恢复的簇 =
+    /// 快照里的 count(代表此前场次已上报过的历史累计)；会话内新建的普通簇恒 0。
+    /// snapshot() 导出 count 时减去这部分，只报告本场的净增量——否则种子/续录带来
+    /// 的历史 count 会随每场停止 upsert 与库里的 existing count 相加，几何级数膨胀
+    /// (见终审 triage②)。合并时两侧基数相加，增量语义在合并后仍然成立。
+    seed_base_count: u64,
 }
 
 pub struct SpeakerRegistry {
@@ -153,6 +159,8 @@ impl SpeakerRegistry {
             // 建簇本身要求 num_samples >= MIN_NEW_CLUSTER_SAMPLES(足够长的段),
             // 首个成员的时长直接计入,与既有簇长段累加同一口径。
             total_ms: (num_samples / 16) as u64,
+            // 会话内新建的普通簇没有"历史基数"，count 从 0 开始就是纯增量。
+            seed_base_count: 0,
         });
         Some(id)
     }
@@ -191,6 +199,7 @@ impl SpeakerRegistry {
                 winner.centroid = renorm;
             }
             winner.count += loser.count;
+            winner.seed_base_count += loser.seed_base_count;
             winner.total_ms += loser.total_ms;
             winner.sources.extend(loser.sources.iter().cloned());
             // winner 无 person 而 loser 有 → 继承(两者都 Some 的情形已被上面的冲突检查挡掉)。
@@ -215,13 +224,17 @@ impl SpeakerRegistry {
     }
 
     /// 导出全部簇的质心快照(供会话结束时交给 DiarEvent::Snapshot,P4.5 续录铺底)。
+    /// count 只导本场净增量(= 内部累计 count - seed_base_count):种子簇/续录恢复的
+    /// 簇带着历史基数,如果原样导出全量 count,停止时 upsert 会把这份历史基数再次
+    /// 加到库里已有的 count 上——每场近似翻倍,几何级数膨胀,质心学习率随之失真
+    /// (见终审 triage②)。saturating_sub 兜底:正常不应发生但防御 count 被异常改小。
     pub fn snapshot(&self) -> Vec<ClusterSnapshot> {
         self.clusters
             .iter()
             .map(|c| ClusterSnapshot {
                 id: c.id.clone(),
                 centroid: c.centroid.clone(),
-                count: c.count,
+                count: c.count.saturating_sub(c.seed_base_count),
                 sources: c.sources.clone(),
                 person: c.person.clone(),
                 total_ms: c.total_ms,
@@ -255,6 +268,11 @@ impl SpeakerRegistry {
                     // 只有种子注入路径才带上 person_name。
                     person_name: None,
                     total_ms: s.total_ms,
+                    // 恢复出的 count 本身就是"此前已上报过"的历史累计(上一场
+                    // snapshot() 导出的净增量,resume 时原样存进了 speakers.json 的
+                    // count 字段)。把它设为本簇的基数，本场结束再导出时才只报告
+                    // 本场新产生的净增量，不重复上报上一场已经报过的部分。
+                    seed_base_count: s.count,
                 });
             }
         }
@@ -276,14 +294,18 @@ impl SpeakerRegistry {
             };
             let id = format!("S{}", r.next_id);
             r.next_id += 1;
+            let base_count = s.count.max(1);
             r.clusters.push(Cluster {
                 id,
                 centroid,
-                count: s.count.max(1),
+                count: base_count,
                 sources: BTreeSet::new(),
                 person: Some(s.person.clone()),
                 person_name: Some(s.name.clone()),
                 total_ms: 0,
+                // 种子的 count 从库带(库里已有的历史样本数)，是纯基数：本场哪怕
+                // 一次都没命中，导出时也不该把这份库存量再报一遍给库自己。
+                seed_base_count: base_count,
             });
         }
         r
@@ -558,6 +580,44 @@ mod tests {
         r.assign(&v(1.0, 0.0, 0.0), "mic", 4800).unwrap(); // 0.3s 短段不计
         let snap = r.snapshot();
         assert_eq!(snap[0].total_ms, 2000);
+    }
+
+    /// 终审 triage①锁死判别式:sources 为空 ⇔ 未命中的种子簇。两个种子(甲/乙)注入,
+    /// 只对甲做一次命中 assign,乙从未被认领。speakers() 里能看到两个簇(种子铺底
+    /// 阶段就已存在),但只有命中的甲 sources 非空——这是 lib.rs/writer.rs 两处过滤
+    /// 用来分辨"真实说话人"与"未命中的库种子"的唯一依据,此测试锁死其正确性。
+    #[test]
+    fn unhit_seed_cluster_has_empty_sources_hit_one_has_nonempty() {
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 1.0, 0.0), count: 10 },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        // 只命中甲(与 e1 余弦 ≈0.99 ≥ 种子阈值 0.68);乙从未被 assign 到。
+        let hit_id = r.assign(&v(0.99, 0.14, 0.0), "mic", LONG).unwrap();
+        let infos = r.speakers();
+        assert_eq!(infos.len(), 2, "两个种子簇都在(种子铺底不因未命中而消失)");
+        let hit = infos.iter().find(|s| s.id == hit_id).unwrap();
+        assert_eq!(hit.person.as_deref(), Some("P1"));
+        assert!(!hit.sources.is_empty(), "命中的种子簇 sources 非空");
+        let unhit = infos.iter().find(|s| s.id != hit_id).unwrap();
+        assert_eq!(unhit.person.as_deref(), Some("P2"));
+        assert!(unhit.sources.is_empty(), "未命中的种子簇 sources 恒空——判别式的锁死点");
+    }
+
+    /// 终审 triage②:种子 count 增量导出防复利膨胀。种子带库 count=40,本场命中两次
+    /// 长段(assign 各更新一次 count),snapshot() 导出的 count 应只是本场净增量(2),
+    /// 而不是内部累计的全量(42)——否则每场停止 upsert 都会把库里已有的历史样本数
+    /// 再报一遍,库 count 几何级数膨胀,质心学习率随之衰减到接近失效。
+    #[test]
+    fn snapshot_exports_incremental_count_not_seed_base_for_seed_cluster() {
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 40 }];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].count, 2, "导出 count 应只是本场净增量,不含种子基数 40");
     }
 
     #[test]

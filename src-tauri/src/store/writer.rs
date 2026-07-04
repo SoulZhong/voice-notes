@@ -230,7 +230,10 @@ impl NoteWriter {
     /// 已有表项：只更新 centroid/count，不动 name/sources（sources 已由 sync_speakers 维护）；
     /// snap.person 为 None(种子未命中/悬空引用)时保留原有 person_id 不清空——种子命中是
     /// 一次性事件,后续快照没带 person 不代表关联失效。
-    /// 新建表项：name 空串，sources/person_id 取快照。
+    /// 新建表项：name 空串，sources/person_id 取快照——但 sources 为空(⇔ 未命中的库种子簇,
+    /// assign 命中必 sources.insert)时直接跳过，不建表项：否则种子注入的全库人物会在停止时
+    /// 被写进本场 speakers.json，每场笔记都囤上全库人物。已有表项不受此过滤影响，能进到这
+    /// 张表说明此前确曾被 sync_speakers/set_speaker_person 记录过，是曾命中或已关联的人。
     pub fn store_centroids(&mut self, snaps: &[crate::diar::registry::ClusterSnapshot]) {
         for s in snaps {
             match self.speakers.get_mut(&s.id) {
@@ -242,6 +245,9 @@ impl NoteWriter {
                     }
                 }
                 None => {
+                    if s.sources.is_empty() {
+                        continue; // 未命中的种子簇：本场从未真正出现过，不建表项
+                    }
                     self.speakers.insert(
                         s.id.clone(),
                         SpeakerMeta {
@@ -343,6 +349,12 @@ impl NoteWriter {
                 .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None });
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
+            }
+            // person_id 同 name 一样对称继承：winner 尚未关联库人物而 loser 已关联时，
+            // 合并不该把这份关联静默丢掉——否则 finalize 前若崩溃/未再触发一次种子
+            // 命中，本场就再也补不回这个人物关联。
+            if winner_entry.person_id.is_none() && loser_meta.person_id.is_some() {
+                winner_entry.person_id = loser_meta.person_id;
             }
             for s in loser_meta.sources {
                 if !winner_entry.sources.contains(&s) {
@@ -660,6 +672,24 @@ mod tests {
         assert_eq!(s9.name, "老王");
         assert_eq!(s9.centroid, None, "旧格式无 centroid 字段应兜底为 None");
         assert_eq!(s9.count, 0, "旧格式无 count 字段应兜底为 0");
+    }
+
+    /// 终审 triage①(writer 层):sources 为空(⇔ 未命中的库种子簇)且表中此前无该 id
+    /// 的快照,不应建表项——否则种子注入的全库人物会被写进本场 speakers.json，每场
+    /// 笔记都囤上全库人物。
+    #[test]
+    fn store_centroids_skips_unhit_seed_with_empty_sources_and_no_existing_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S9".into(),
+            centroid: vec![1.0, 0.0],
+            count: 10,
+            sources: std::collections::BTreeSet::new(),
+            person: Some("P1".into()),
+            total_ms: 0,
+        }]);
+        assert!(!w.speakers().contains_key("S9"), "未命中种子(sources 为空)不建表项");
     }
 
     #[test]
