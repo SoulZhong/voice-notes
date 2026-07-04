@@ -182,17 +182,8 @@
         onblur={commitRename}
       />
     {:else}
-      <h1
-        class="title"
-        title="点击改名"
-        role="button"
-        tabindex="0"
-        onclick={beginRename}
-        onkeydown={(e) => {
-          if (e.key === "Enter") beginRename();
-        }}
-      >
-        {note.meta.title}
+      <h1 class="title">
+        <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
       </h1>
     {/if}
 
@@ -299,6 +290,21 @@
   .title {
     cursor: text;
     margin: 0 0 0.25rem;
+  }
+  .title-btn {
+    background: none;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: text;
+    text-align: left;
+  }
+  .title-btn:focus-visible {
+    outline: 2px solid #396cd8;
+    border-radius: 4px;
   }
   .rename {
     font-size: 1.6em;
