@@ -110,30 +110,32 @@ impl SpeakerRegistry {
         let best = self
             .clusters
             .iter_mut()
-            .map(|c| (dot(&c.centroid, &unit), c))
+            .filter_map(|c| {
+                let sim = dot(&c.centroid, &unit);
+                // 种子簇(关联库 person)用更高阈值:跨会议信道差异大,误命名比不命名糟(待校准)。
+                // 阈值在候选过滤阶段生效——若全局最相似是"够不着的种子簇",不得挡住
+                // 本可命中的普通簇(否则会话内簇碎片化)。
+                let threshold = if c.person.is_some() { SEED_ASSIGN_THRESHOLD } else { ASSIGN_THRESHOLD };
+                (sim >= threshold).then_some((sim, c))
+            })
             .max_by(|(a, _), (b, _)| a.total_cmp(b));
 
-        if let Some((sim, cluster)) = best {
-            // 种子簇(关联库 person)用更高阈值:跨会议信道差异大,误命名比不命名糟。
-            // 待真实会议数据校准。
-            let threshold = if cluster.person.is_some() { SEED_ASSIGN_THRESHOLD } else { ASSIGN_THRESHOLD };
-            if sim >= threshold {
-                cluster.sources.insert(source.to_string());
-                // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
-                if num_samples >= MIN_NEW_CLUSTER_SAMPLES {
-                    // 质心 running mean(在单位向量上),再归一化
-                    let n = cluster.count as f32;
-                    for (ci, ui) in cluster.centroid.iter_mut().zip(&unit) {
-                        *ci = (*ci * n + ui) / (n + 1.0);
-                    }
-                    if let Some(renorm) = normalize(&cluster.centroid) {
-                        cluster.centroid = renorm;
-                    }
-                    cluster.count += 1;
-                    cluster.total_ms += (num_samples / 16) as u64;
+        if let Some((_sim, cluster)) = best {
+            cluster.sources.insert(source.to_string());
+            // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
+            if num_samples >= MIN_NEW_CLUSTER_SAMPLES {
+                // 质心 running mean(在单位向量上),再归一化
+                let n = cluster.count as f32;
+                for (ci, ui) in cluster.centroid.iter_mut().zip(&unit) {
+                    *ci = (*ci * n + ui) / (n + 1.0);
                 }
-                return Some(cluster.id.clone());
+                if let Some(renorm) = normalize(&cluster.centroid) {
+                    cluster.centroid = renorm;
+                }
+                cluster.count += 1;
+                cluster.total_ms += (num_samples / 16) as u64;
             }
+            return Some(cluster.id.clone());
         }
 
         if num_samples < MIN_NEW_CLUSTER_SAMPLES {
@@ -556,5 +558,24 @@ mod tests {
         r.assign(&v(1.0, 0.0, 0.0), "mic", 4800).unwrap(); // 0.3s 短段不计
         let snap = r.snapshot();
         assert_eq!(snap[0].total_ms, 2000);
+    }
+
+    #[test]
+    fn seed_threshold_no_longer_blocks_reachable_session_cluster() {
+        // 库种子簇 A = e1,阈值 0.68;会话普通簇 B = e2(与 A 正交,dot=0,清清白白的独立普通簇),阈值 0.62。
+        // 探针 P = (0.65, 0.63, sqrt(1-0.65²-0.63²)):与 A 余弦 0.65 ∈(0.62,0.68)(够不着种子阈值),
+        // 与 B 余弦 0.63 ∈(0.62,0.68)(够得着普通阈值),且 0.63 < 0.65(全局最相似是 A,不是 B)。
+        // 修前:全局 argmax 先选中 A(0.65 全局最大),再验 A 的阈值 0.68 → 失败 → 错误新建第三个簇。
+        // 修后:先按各簇自己的阈值过滤合格候选(A 不合格被滤掉,只剩 B),合格者中取最相似 → 命中 B。
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 }];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds); // S1 = 种子簇 A
+        let b_id = r.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap(); // S2 = 会话普通簇 B(与 A 正交)
+        assert_eq!(r.speakers().len(), 2);
+
+        let p3 = (1.0f32 - 0.65 * 0.65 - 0.63 * 0.63).sqrt();
+        let probe = v(0.65, 0.63, p3);
+        let id = r.assign(&probe, "mic", LONG).unwrap();
+        assert_eq!(id, b_id, "应命中够得着的普通簇 B,而非被够不着的种子簇 A 挡住去新建簇");
+        assert_eq!(r.speakers().len(), 2, "总簇数不变(命中已有簇,未新建)");
     }
 }
