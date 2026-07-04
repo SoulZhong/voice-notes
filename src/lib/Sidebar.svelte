@@ -313,7 +313,7 @@
   .banner {
     background: var(--danger-tint);
     border: 1px solid var(--danger-line);
-    color: var(--danger);
+    color: var(--danger-ink);
     border-radius: var(--radius-lg);
     padding: 0.5rem 0.6rem;
     margin-bottom: 0.5rem;

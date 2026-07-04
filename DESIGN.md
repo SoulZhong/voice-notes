@@ -30,7 +30,10 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 | accent-pressed | `#005bab` | `#3d85b5` | 主按钮按压 |
 | accent-tint | `rgba(0,117,222,.08)` | `rgba(82,156,202,.15)` | 可编辑悬停底、选中弱底 |
 | on-accent | `#ffffff` | `#ffffff` | 主按钮文字 |
-| danger | `#e03131` | `#ff6b6b` | 破坏性确认、错误 |
+| danger | `#e03131` | `#ff6b6b` | 破坏性确认、错误(按钮/图标) |
+| danger-ink | `#9b1c1c` | `#ffb3b3` | 错误横幅正文(浅红底上高饱和 danger 仅 3.9:1,需专用深色达 AA) |
+| danger-tint | `#fdeaea` | `#442a2a` | 错误横幅底 |
+| danger-line | `#f3c6c6` | `#5a3232` | 错误横幅边 |
 | record | `#eb5757` | `#eb5757` | 录制中红点/停止(双主题一致) |
 | warning-tint | `#fef7d6` | `#3a3222` | 提示横幅底 |
 | warning-ink | `#523410` | `#e8d49a` | 提示横幅文字 |
@@ -60,7 +63,7 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 | page-title | 1.45rem / 700 / 1.25, letter-spacing -0.3px | 页面 h1、笔记标题 |
 | section | 1.05rem / 600 / 1.35 | 卡片标题、分组头 |
 | body | 0.95rem / 400 / 1.55 | 常规 UI 文字 |
-| transcript | 1.02rem / 400 / 1.7 | 转写段正文(阅读优化,最大列宽 46rem) |
+| transcript | 1.02rem / 400 / 1.7 | 转写段正文(阅读优化;列宽上限经冒烟反馈撤销,当前铺满窗口) |
 | caption | 0.85rem / 400 / 1.45 | 元信息、说明 |
 | micro | 0.78rem / 500 / 1.4 | 徽章、时间戳 |
 | button | 0.9rem / 500 / 1.3 | 全部按钮 |

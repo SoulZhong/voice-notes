@@ -247,7 +247,7 @@
     border: none;
     border-radius: var(--radius-md);
     padding: 0.15em 0.8em;
-    font-size: 0.85em;
+    font-size: 0.9rem; /* button 字级 token,与全局按钮对齐 */
     font-weight: 500;
     cursor: pointer;
     margin-left: 0.5em;
@@ -334,7 +334,7 @@
   .banner {
     background: var(--danger-tint);
     border: 1px solid var(--danger-line);
-    color: var(--danger);
+    color: var(--danger-ink);
     border-radius: var(--radius-lg);
     padding: 0.6rem 0.8rem;
     margin: 0.5rem 0 1rem;

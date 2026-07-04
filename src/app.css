@@ -30,6 +30,9 @@
      的关系补齐，与 danger 主色同色系。 */
   --danger-tint: #fdeaea;
   --danger-line: #f3c6c6;
+  /* 横幅正文专用深红:高饱和 --danger 在浅红底上对比度仅 3.9:1(不达 AA),
+     文字色需要像 warning-ink 那样为可读性单独调深(≥4.5:1)。 */
+  --danger-ink: #9b1c1c;
 
   /* 录制中红点/停止字色：双主题一致，是唯一常驻彩色信号 */
   --record: #eb5757;
@@ -83,6 +86,7 @@
     --danger: #ff6b6b;
     --danger-tint: #442a2a;
     --danger-line: #5a3232;
+    --danger-ink: #ffb3b3;
 
     --record: #eb5757;
 

@@ -480,7 +480,7 @@
   .banner.banner-danger {
     background: var(--danger-tint);
     border-color: var(--danger-line);
-    color: var(--danger);
+    color: var(--danger-ink);
   }
   .hint {
     color: var(--ink-faint);
