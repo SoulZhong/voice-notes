@@ -173,6 +173,7 @@ impl NoteWriter {
         start_ms: u64,
         end_ms: u64,
         speaker: Option<&str>,
+        rms: Option<f32>,
     ) -> anyhow::Result<()> {
         let rec = SegmentRecord {
             seq: self.next_seq,
@@ -181,6 +182,7 @@ impl NoteWriter {
             start_ms,
             end_ms,
             speaker: speaker.map(String::from),
+            rms,
         };
         self.next_seq += 1;
         let line = serde_json::to_string(&rec)?;
@@ -400,8 +402,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         assert!(!w.has_content());
-        w.append_final("mic", "第一句", 0, 1500, None).unwrap();
-        w.append_final("system", "second", 1500, 3000, None).unwrap();
+        w.append_final("mic", "第一句", 0, 1500, None, None).unwrap();
+        w.append_final("system", "second", 1500, 3000, None, None).unwrap();
         assert!(w.has_content());
 
         let lines = read_lines(w.dir());
@@ -430,11 +432,11 @@ mod tests {
         // 模拟句柄失效 + 目录消失：追加必须失败但段保留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "丢不得", 0, 1000, None).is_err());
+        assert!(w.append_final("mic", "丢不得", 0, 1000, None, None).is_err());
 
         // 目录恢复后，下一次追加把队列里的段一并补写
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000, None).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None, None).unwrap();
         let lines = read_lines(&dir);
         assert_eq!(lines.len(), 2, "失败段重试补写，一段不丢");
         let r0: crate::store::SegmentRecord = serde_json::from_str(&lines[0]).unwrap();
@@ -455,7 +457,7 @@ mod tests {
         // 模拟句柄失效 + 目录消失：append 必须失败，段留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "会丢失吗", 0, 1000, None).is_err());
+        assert!(w.append_final("mic", "会丢失吗", 0, 1000, None, None).is_err());
 
         // 目录仍不存在：finalize 应失败，且不得把 state 标记为 complete
         // （此时磁盘上连 meta.json 都不存在，正是"不诚实的 complete"要避免的场景）。
@@ -464,7 +466,7 @@ mod tests {
         // 目录恢复后：finalize 应能补写队列并把 meta 正常置 complete，
         // 验证"失败不置 complete、恢复后可补救"的语义。
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000, None).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None, None).unwrap();
         w.finalize(now()).unwrap();
 
         let meta = read_meta(&dir);
@@ -514,7 +516,7 @@ mod tests {
             move |src, text, start_ms, end_ms, spk| {
                 w2.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), None)
                     .unwrap();
                 *e2.lock().unwrap() += 1;
             },
@@ -541,8 +543,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
-        w.append_final("system", "乙说", 2000, 4000, Some("S2")).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
         // 合并 S2 → S1：jsonl 重写 + speakers 表收缩
         w.merge_speaker("S2", "S1").unwrap();
@@ -560,8 +562,8 @@ mod tests {
     fn merge_speaker_read_failure_leaves_data_intact() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
-        w.append_final("system", "乙说", 2000, 4000, Some("S2")).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
 
         // 构造读失败：丢弃句柄、删掉 segments.jsonl 并在同名处建目录，
@@ -585,7 +587,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1")).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
 
         // set_speaker_name + persist_speakers 后重开 NoteStore.load，名字应在磁盘上。
@@ -754,8 +756,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "第一句", 0, 1500, None).unwrap();
-        w.append_final("system", "第二句", 1500, 3000, None).unwrap();
+        w.append_final("mic", "第一句", 0, 1500, None, None).unwrap();
+        w.append_final("system", "第二句", 1500, 3000, None, None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
         w.finalize(now()).unwrap();
         assert_eq!(read_meta(&tmp.path().join(&id)).state, "complete");
@@ -769,7 +771,7 @@ mod tests {
         assert!(r.speakers().contains_key("S1"), "speakers.json 应加载进内存表");
 
         // resume 后追加：seq 应从 2 续接（此前两段 seq=0,1）。
-        r.append_final("mic", "第三句", 0, 1000, None).unwrap();
+        r.append_final("mic", "第三句", 0, 1000, None, None).unwrap();
         let lines = read_lines(r.dir());
         assert_eq!(lines.len(), 3);
         let rec2: SegmentRecord = serde_json::from_str(&lines[2]).unwrap();
@@ -782,7 +784,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "崩溃前", 0, 800, None).unwrap();
+        w.append_final("mic", "崩溃前", 0, 800, None, None).unwrap();
         // 不 finalize，模拟崩溃：meta 仍是 recording。
 
         let r = NoteWriter::resume(tmp.path(), &id).unwrap();
@@ -796,7 +798,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "完整句", 0, 1000, None).unwrap();
+        w.append_final("mic", "完整句", 0, 1000, None, None).unwrap();
         w.finalize(now()).unwrap();
 
         // 模拟崩溃写了半行（不可解析，next_seq/base_ms 应只依据可解析行）。
@@ -810,7 +812,7 @@ mod tests {
 
         let mut r = NoteWriter::resume(tmp.path(), &id).unwrap();
         assert_eq!(r.base_ms(), 1000, "损坏尾行应被跳过，base_ms 取最大可解析 end_ms");
-        r.append_final("mic", "续录句", 0, 500, None).unwrap();
+        r.append_final("mic", "续录句", 0, 500, None, None).unwrap();
         // 续录追加的段 seq 应为 1（唯一可解析的前段 seq=0）——证明 next_seq 未被半行干扰到 2。
         let lines = read_lines(r.dir());
         let appended: SegmentRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
@@ -839,6 +841,24 @@ mod tests {
         for bad in ["../x", "a/b", "a\\b", "..", ""] {
             assert!(NoteWriter::resume(tmp.path(), bad).is_err(), "应拒绝非法 id: {bad}");
         }
+    }
+
+    #[test]
+    fn append_final_persists_rms_and_old_lines_tolerated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "有能量", 0, 900, None, Some(0.123)).unwrap();
+        w.append_final("mic", "无能量数据", 1000, 1900, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.segments[0].rms, Some(0.123));
+        assert_eq!(n.segments[1].rms, None);
+        // None 不序列化该键(旧行等价形状,双向兼容)
+        let raw = std::fs::read_to_string(tmp.path().join(&id).join("segments.jsonl")).unwrap();
+        assert!(raw.lines().next().unwrap().contains("\"rms\""));
+        assert!(!raw.lines().nth(1).unwrap().contains("\"rms\""));
     }
 
     /// 集成测试（仿 full_session_persists_every_final）：第一场会话落 N 段 →
@@ -886,7 +906,7 @@ mod tests {
             move |src, text, start_ms, end_ms, spk| {
                 w2.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), None)
                     .unwrap();
             },
             |_, _| {},
@@ -918,7 +938,7 @@ mod tests {
             move |src, text, start_ms, end_ms, spk| {
                 w3.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref())
+                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref(), None)
                     .unwrap();
             },
             |_, _| {},

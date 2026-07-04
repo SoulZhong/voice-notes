@@ -306,7 +306,7 @@ fn spawn_session(
                 match writer_f
                     .lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), None)
                 {
                     Ok(()) => {
                         if degraded {

@@ -315,7 +315,7 @@ mod tests {
         let mut w = NoteWriter::create(notes_dir, now()).unwrap();
         for (i, t) in texts.iter().enumerate() {
             let s = i as u64 * 1000;
-            w.append_final(if i % 2 == 0 { "mic" } else { "system" }, t, s, s + 900, None).unwrap();
+            w.append_final(if i % 2 == 0 { "mic" } else { "system" }, t, s, s + 900, None, None).unwrap();
         }
         if finalize {
             w.finalize(now()).unwrap();
@@ -438,7 +438,7 @@ mod tests {
         let mut w = NoteWriter::create(dir, now()).unwrap();
         for (i, (t, spk)) in segs.iter().enumerate() {
             let s = i as u64 * 1000;
-            w.append_final("mic", t, s, s + 900, *spk).unwrap();
+            w.append_final("mic", t, s, s + 900, *spk, None).unwrap();
         }
         if !known.is_empty() {
             let pairs: Vec<(String, Vec<String>)> =
@@ -520,7 +520,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "x", 0, 2000, Some("S1")).unwrap();
+        w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
         w.finalize(now()).unwrap();
         let store = NoteStore::new(tmp.path().to_path_buf());
@@ -543,8 +543,8 @@ mod tests {
         // 先创建笔记，确保目录存在
         let id = {
             let mut w = NoteWriter::create(&dir, now()).unwrap();
-            w.append_final("mic", "甲", 0, 900, Some("S1")).unwrap();
-            w.append_final("mic", "乙", 1000, 1900, Some("S1")).unwrap();
+            w.append_final("mic", "甲", 0, 900, Some("S1"), None).unwrap();
+            w.append_final("mic", "乙", 1000, 1900, Some("S1"), None).unwrap();
             w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
             w.finalize(now()).unwrap();
             w.note_id().to_string()
@@ -581,10 +581,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "后", 5000, 6000, None).unwrap();       // seq 0
-        w.append_final("system", "   ", 500, 900, None).unwrap();     // seq 1 空白段
-        w.append_final("mic", "前", 1000, 1500, None).unwrap();       // seq 2
-        w.append_final("system", "同前", 1000, 1400, None).unwrap();  // seq 3 同 start,按 seq 稳定
+        w.append_final("mic", "后", 5000, 6000, None, None).unwrap();       // seq 0
+        w.append_final("system", "   ", 500, 900, None, None).unwrap();     // seq 1 空白段
+        w.append_final("mic", "前", 1000, 1500, None, None).unwrap();       // seq 2
+        w.append_final("system", "同前", 1000, 1400, None, None).unwrap();  // seq 3 同 start,按 seq 稳定
         w.finalize(now()).unwrap();
         let n = NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
         let texts: Vec<&str> = n.segments.iter().map(|s| s.text.as_str()).collect();
