@@ -527,6 +527,8 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
+    // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
+    preload_models(state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
 
 /// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
@@ -747,10 +749,19 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
 /// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
 /// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
 fn preload_models(
+    session: Arc<Mutex<Option<ActiveSession>>>,
     cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
 ) {
     std::thread::spawn(move || {
+        // 会话活跃则整体跳过：开录已 take() 空槽，此刻加载纯属双载（瞬时 2x 内存），
+        // 且停录 stash 会把这份顶掉白载；停录收尾会补调预载。session 锁查完即放
+        // （锁序纪律：绝不持 session 锁再拿叶子槽锁）。检查后立刻开录的窗口仍可能
+        // 双载——用户级操作间隔，可忽略。
+        if session.lock().unwrap().is_some() {
+            eprintln!("预载跳过：录制会话进行中，停止后自动补载");
+            return;
+        }
         let mut slot = cache.lock().unwrap();
         if slot.is_none() {
             match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
@@ -783,6 +794,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
     state.download_cancel.store(false, Ordering::SeqCst);
     let running = state.download_running.clone();
     let cancel = state.download_cancel.clone();
+    let session = state.session.clone();
     let recognizer_cache = state.recognizer_cache.clone();
     let embedder_cache = state.embedder_cache.clone();
     std::thread::spawn(move || {
@@ -825,7 +837,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
         if all_ok {
             emit("all", "done", 0, 0, "");
             // 补齐后立即预载，无需重启即可开录。
-            preload_models(recognizer_cache, embedder_cache);
+            preload_models(session, recognizer_cache, embedder_cache);
         }
     });
     Ok(())
@@ -860,9 +872,8 @@ pub fn run() {
                 models::init_app_root(models_dir);
             }
             models::download::sweep_tmp(&models::root());
-            let cache = app.state::<AppState>().recognizer_cache.clone();
-            let embedder_cache = app.state::<AppState>().embedder_cache.clone();
-            preload_models(cache, embedder_cache);
+            let st = app.state::<AppState>();
+            preload_models(st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
