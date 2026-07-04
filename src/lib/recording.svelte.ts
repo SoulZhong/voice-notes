@@ -225,9 +225,7 @@ export const recording = {
     try {
       // getNote 失败：不灌注、不置 resuming，原样冒泡为 error 状态。
       const note = await getNote(noteId_);
-      finals = note.segments
-        .filter((s) => s.text.trim())
-        .map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
+      finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
       speakers = { ...note.speakers };
       noteId = noteId_;
       resuming = true;
@@ -285,9 +283,7 @@ async function hydrateFromDisk(id: string) {
   if (!id) return;
   try {
     const note = await getNote(id);
-    finals = note.segments
-      .filter((s) => s.text.trim())
-      .map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
+    finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
     speakers = { ...note.speakers };
   } catch {
     // 水合失败仅影响历史段回显，不阻塞录制状态重建。
