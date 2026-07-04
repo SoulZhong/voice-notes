@@ -60,6 +60,24 @@ pub fn sweep_tmp(root: &Path) {
     let _ = fs::remove_dir_all(tmp_extract_dir(root));
 }
 
+/// 包装 Reader：每次 read 前查取消标志，置位即返回 Err——把取消响应性带进
+/// 解压这类长同步调用（unpack 内部逐块拉取，取消在下一次 read 生效，字节级即时）。
+/// ErrorKind 用 Other 而非 Interrupted：Interrupted 会被多数 Read 消费者自动重试，
+/// 永远断不掉。
+struct CancelReader<'a, R: Read> {
+    inner: R,
+    cancel: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cancelled"));
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// 解压 tar.bz2 到 root/.tmp-extract，校验 files 后把 dest_dir 整体 rename 进位。
 /// 任何一步失败都不触碰 root 下的既有安装。
 pub fn extract_and_install(
@@ -67,12 +85,22 @@ pub fn extract_and_install(
     root: &Path,
     dest_dir: &str,
     files: &[FinalFile],
+    cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     let tmp = tmp_extract_dir(root);
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     let f = fs::File::open(tarball)?;
-    tar::Archive::new(bzip2::read::BzDecoder::new(f)).unpack(&tmp)?;
+    let reader = CancelReader { inner: f, cancel };
+    if let Err(e) = tar::Archive::new(bzip2::read::BzDecoder::new(reader)).unpack(&tmp) {
+        let _ = fs::remove_dir_all(&tmp);
+        // 归一取消错误：上层（download_artifact/lib.rs）以 msg=="cancelled" 识别，
+        // 走保留 .part 的取消路径而非删分片的失败路径。
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        return Err(e.into());
+    }
     let src = tmp.join(dest_dir);
     if !src.is_dir() {
         anyhow::bail!("压缩包内缺少目录 {dest_dir}");
@@ -103,6 +131,41 @@ pub fn extract_and_install(
 /// 进度回调：(artifact_id, phase, received_bytes, total_bytes, message)。
 pub type Progress = dyn Fn(&str, &str, u64, u64, &str);
 
+/// 下载完成（或 416 判定本地已有全量 .part）后的收尾：校验/解压安装，成功清 .part。
+/// 失败删 .part（脏数据不值得续）——唯 "cancelled" 例外：tarball 完好，保留供复装。
+fn finalize_artifact(
+    a: &super::Artifact,
+    root: &Path,
+    part: &Path,
+    cancel: &AtomicBool,
+    progress: &Progress,
+    received: u64,
+    total: u64,
+) -> anyhow::Result<()> {
+    match &a.kind {
+        super::ArtifactKind::File => {
+            progress(a.id, "verifying", received, total, "");
+            if let Err(e) = verify_file(part, &a.files[0]) {
+                let _ = fs::remove_file(part);
+                return Err(e);
+            }
+            fs::rename(part, root.join(a.files[0].rel_path))?;
+        }
+        super::ArtifactKind::TarBz2 { dest_dir } => {
+            progress(a.id, "extracting", received, total, "");
+            if let Err(e) = extract_and_install(part, root, dest_dir, a.files, cancel) {
+                if e.to_string() != "cancelled" {
+                    let _ = fs::remove_file(part);
+                }
+                return Err(e);
+            }
+            let _ = fs::remove_file(part);
+        }
+    }
+    progress(a.id, "done", received, total, "");
+    Ok(())
+}
+
 /// 下载并安装单个工件。断点：root/<id>.part（HTTP Range 续传；服务端不支持则重下）。
 /// cancel 置位 → Err 且消息恰为 "cancelled"（保留 .part 供续传）；
 /// 校验/解压失败 → 删 .part（脏数据不值得续）并 Err。
@@ -121,11 +184,17 @@ pub fn download_artifact(
     let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
     let resp = match req.call() {
         Ok(r) => r,
-        // ureq 对 4xx/5xx 返回 Err(Status)。416 = 续传偏移越界（上次崩溃残留
-        // 满尺寸 .part）：清掉重来，下次重试从头下载。
+        // 416 = 偏移 ≥ 服务端全量。两种来源：上次解压被取消（.part 是完好全量
+        // tarball，直接收尾复装，免整包重下）或崩溃残留脏分片（收尾校验失败 →
+        // finalize 已删分片，报错引导重试，同旧行为）。
         Err(ureq::Error::Status(416, _)) => {
-            let _ = fs::remove_file(&part);
-            anyhow::bail!("续传偏移越界，已清理残留分片，请重试");
+            return finalize_artifact(a, root, &part, cancel, progress, offset, offset).map_err(|e| {
+                if e.to_string() == "cancelled" {
+                    e
+                } else {
+                    anyhow::anyhow!("续传偏移越界，残留分片无效已清理，请重试（{e}）")
+                }
+            });
         }
         Err(e) => anyhow::bail!("请求失败: {e}"),
     };
@@ -168,26 +237,7 @@ pub fn download_artifact(
     out.flush()?;
     drop(out);
 
-    match &a.kind {
-        super::ArtifactKind::File => {
-            progress(a.id, "verifying", received, total, "");
-            if let Err(e) = verify_file(&part, &a.files[0]) {
-                let _ = fs::remove_file(&part);
-                return Err(e);
-            }
-            fs::rename(&part, root.join(a.files[0].rel_path))?;
-        }
-        super::ArtifactKind::TarBz2 { dest_dir } => {
-            progress(a.id, "extracting", received, total, "");
-            if let Err(e) = extract_and_install(&part, root, dest_dir, a.files) {
-                let _ = fs::remove_file(&part);
-                return Err(e);
-            }
-            let _ = fs::remove_file(&part);
-        }
-    }
-    progress(a.id, "done", received, total, "");
-    Ok(())
+    finalize_artifact(a, root, &part, cancel, progress, received, total)
 }
 
 #[cfg(test)]
@@ -251,7 +301,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL"), ("tokens.txt", b"TOK")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL"), ff("sv-dir/tokens.txt", b"TOK")];
-        extract_and_install(&tarball, &root, "sv-dir", &files).unwrap();
+        extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL");
         assert!(!tmp_extract_dir(&root).exists(), "临时解压目录应清掉");
     }
@@ -263,7 +313,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"CORRUPT")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")]; // 期望哈希对不上
-        assert!(extract_and_install(&tarball, &root, "sv-dir", &files).is_err());
+        assert!(extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).is_err());
         assert!(!root.join("sv-dir").exists(), "校验失败不得半安装");
     }
 
@@ -275,7 +325,7 @@ mod tests {
         std::fs::write(root.join("sv-dir/model.onnx"), b"OLD").unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")];
-        extract_and_install(&tarball, &root, "sv-dir", &files).unwrap();
+        extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL", "旧安装被替换");
         assert!(!root.join(".old-sv-dir").exists(), "备份目录成功后清除");
     }
@@ -288,5 +338,44 @@ mod tests {
         std::fs::File::create(d.join("junk")).unwrap().write_all(b"x").unwrap();
         sweep_tmp(tmp.path());
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn extract_cancel_is_prompt_and_preserves_tarball() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(&root).unwrap();
+        let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
+        let files = [ff("sv-dir/model.onnx", b"MODEL")];
+        let cancel = AtomicBool::new(true); // 预先置位：首次 read 即断
+        let err = extract_and_install(&tarball, &root, "sv-dir", &files, &cancel).unwrap_err();
+        assert_eq!(err.to_string(), "cancelled", "取消错误归一，供上层按消息识别");
+        assert!(!root.join("sv-dir").exists(), "取消不得半安装");
+        assert!(tarball.exists(), "tarball 由调用方保留（供免重下复装）");
+        assert!(!tmp_extract_dir(&root).exists(), "解压残留即时清理");
+    }
+
+    /// 416 免重下复装的核心路径：全量有效 .part 直接 finalize 完成安装（无网络）。
+    #[test]
+    fn finalize_artifact_installs_valid_full_part_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(&root).unwrap();
+        let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
+        let part = root.join("sv.part");
+        std::fs::copy(&tarball, &part).unwrap();
+        let a = crate::models::Artifact {
+            id: "sv",
+            label: "测试工件",
+            url: "http://unused.invalid/pkg.tar.bz2",
+            approx_mb: 1,
+            required_for_recording: false,
+            kind: crate::models::ArtifactKind::TarBz2 { dest_dir: "sv-dir" },
+            files: Box::leak(vec![ff("sv-dir/model.onnx", b"MODEL")].into_boxed_slice()),
+        };
+        let noop: &Progress = &|_, _, _, _, _| {};
+        finalize_artifact(&a, &root, &part, &AtomicBool::new(false), noop, 0, 0).unwrap();
+        assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL");
+        assert!(!part.exists(), "复装成功清 .part");
     }
 }
