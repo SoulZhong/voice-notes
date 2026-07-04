@@ -27,9 +27,8 @@
   let editingTitle = $state("");
   let exportMsg = $state("");
 
-  // 段落编辑状态
-  let editingSeq = $state<number | null>(null);
-  let editingText = $state("");
+  // 段落编辑状态(常驻编辑态:focusedSeq 只用于刷新守卫,防外部刷新吹掉输入中的内容)
+  let focusedSeq = $state<number | null>(null);
   let confirmSeq = $state<number | null>(null);
   let speakerMenuSeq = $state<number | null>(null);
 
@@ -68,7 +67,7 @@
   $effect(() => {
     void id;
     editing = false;
-    editingSeq = null;
+    focusedSeq = null;
     speakerMenuSeq = null;
     confirmSeq = null;
   });
@@ -76,28 +75,34 @@
   $effect(() => {
     void id;
     void recording.notesVersion;
-    if (editing || editingSeq !== null || speakerMenuSeq !== null) return;
+    if (editing || focusedSeq !== null || speakerMenuSeq !== null) return;
     exportMsg = "";
     refresh();
   });
 
-  function beginEditSeg(s: SegmentRecord) {
-    editingSeq = s.seq;
-    editingText = s.text;
+  function segFocus(s: SegmentRecord) {
+    focusedSeq = s.seq;
     speakerMenuSeq = null;
     confirmSeq = null;
   }
 
-  async function commitEditSeg(s: SegmentRecord) {
-    if (editingSeq !== s.seq) return;
-    const text = editingText.trim();
-    editingSeq = null;
-    if (!text || text === s.text) return;
+  /** 失焦提交:空文本或未变则还原显示(去段须走显式删除按钮)。
+      失败时手动把 DOM 文本还原为提交前基线——canonical 未变时 Svelte 不会重设
+      被用户敲过的文本节点,不还原会出现界面与落盘不一致。 */
+  async function segBlur(e: FocusEvent, s: SegmentRecord) {
+    const el = e.currentTarget as HTMLElement;
+    focusedSeq = null;
+    const text = (el.textContent ?? "").trim();
+    if (!text || text === s.text) {
+      el.textContent = s.text;
+      return;
+    }
     try {
       await editSegment(id, s.seq, s.text, text);
       await refresh();
-    } catch (e) {
-      error = `编辑失败: ${e}`;
+    } catch (err) {
+      el.textContent = s.text;
+      error = `编辑失败: ${err}`;
       await refresh(); // 乐观冲突：重载最新内容
     }
   }
@@ -242,33 +247,26 @@
             </button>
           {/if}
           <span class="ts">{formatTs(seg.start_ms)}</span>
-          {#if editingSeq === seg.seq}
-            <!-- svelte-ignore a11y_autofocus -->
-            <textarea
-              class="seg-edit"
-              autofocus
-              bind:value={editingText}
-              onkeydown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  commitEditSeg(seg);
-                }
-                if (e.key === "Escape") editingSeq = null;
-              }}
-              onblur={() => commitEditSeg(seg)}
-            ></textarea>
-          {:else if canEdit}
-            <!-- 文字本身即编辑入口：span+role 保持行内排版（button 是原子行内盒,长文无法跨行断行） -->
+          {#if canEdit}
+            <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
+                 失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
             <span
               class="seg-text editable"
-              role="button"
+              contenteditable="plaintext-only"
+              role="textbox"
               tabindex="0"
-              title="点击编辑"
-              onclick={() => beginEditSeg(seg)}
+              spellcheck="false"
+              onfocus={() => segFocus(seg)}
+              onblur={(e) => segBlur(e, seg)}
               onkeydown={(e) => {
+                const el = e.currentTarget as HTMLElement;
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  beginEditSeg(seg);
+                  el.blur();
+                }
+                if (e.key === "Escape") {
+                  el.textContent = seg.text;
+                  el.blur();
                 }
               }}>{seg.text}</span>
             <span class="seg-actions">
@@ -376,8 +374,9 @@
   .seg-text.editable:hover {
     background: rgba(57, 108, 216, 0.08);
   }
-  .seg-text.editable:focus-visible {
+  .seg-text.editable:focus {
     outline: 2px solid #396cd8;
+    background: #fff;
   }
   .seg-actions {
     visibility: hidden;
@@ -398,18 +397,6 @@
   .link.danger {
     color: #c0392b;
     font-weight: 600;
-  }
-  .seg-edit {
-    width: 100%;
-    box-sizing: border-box;
-    font: inherit;
-    line-height: 1.5;
-    border-radius: 6px;
-    border: 1px solid #396cd8;
-    padding: 0.3em 0.5em;
-    margin-top: 0.2em;
-    resize: vertical;
-    min-height: 2.4em;
   }
   .badge-menu {
     display: inline-flex;
@@ -490,9 +477,8 @@
     .hint {
       color: #555;
     }
-    .seg-edit {
+    .seg-text.editable:focus {
       background: #2a2a2a;
-      color: #f0f0f0;
     }
     .badge-menu {
       background: #2a2a2a;
