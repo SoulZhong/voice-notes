@@ -251,3 +251,14 @@ Base: 2ffb6c3
 
 ## ✅ P5 squash 合并至 master (2026-07-04, commit 7f1a01e, PR #5)
 v1 全范围完成。阈值校准(diar/registry.rs + session.rs ECHO 三常量)与终审 defer 项继续挂起,由真实使用反馈驱动。
+
+## P5 backlog 硬化(分支 p5-backlog-hardening,spec/plan: 2026-07-04-*-p5-backlog-hardening*)
+- Task 1: complete (commits cb8c830..645dc70, review Approved) — NoteStore 全局编辑锁
+  - Minors(→终审 triage): 测试里 Arc<PathBuf> 多余(PathBuf 本可 clone); edit_segment_text 空文本校验前持锁(无害)
+- Task 2: complete (commits 645dc70..5f939d2, review Approved) — load 下沉 filter+sort,export/详情页统一
+  - Minor(→终审 triage, 计划原文即如此): export 测试 `!txt.contains("00:00:00  \n")` 断言空转(实际三空格),真覆盖在 notes.rs 测试;建议改按段数断言
+- Task 3: complete (commits 5f939d2..0de2c7e, review Approved) — download_running RAII drop-guard
+- Task 4: complete (commits 0de2c7e..5cd4daf, review Approved) — preload 会话跳过+停录补载(无新单测,计划明示;冒烟④验证)
+- Task 5: complete (commits 5cd4daf..6a9dd1f, review Approved; 正当偏差: Artifact 测试构造补 required_for_recording 字段) — 解压 CancelReader+416 复装
+  - Minors(→终审 triage): 416 非取消失败包装文案无测试(brief 只要求成功路径); "字节级即时"注释实为按 read 块粒度(措辞)
+- Task 6: complete (commits 6a9dd1f..bbd3ae8, review Approved, 真值表核验三态等价) — 下载卡片单实例化
