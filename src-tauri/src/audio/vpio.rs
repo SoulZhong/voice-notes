@@ -346,7 +346,9 @@ unsafe fn build_vpio_unit(sink: Sender<AudioFrame>) -> Result<VpioHandle, String
     //      macOS 14+(kAUVoiceIOProperty_OtherAudioDuckingConfiguration),
     //      旧系统不识别:非致命,打日志沿用系统默认。
     let duck = AuVoiceIoOtherAudioDuckingConfiguration {
-        enable_advanced_ducking: 0, // 静态压低(不随语音活动动态调),行为可预期
+        // advanced=动态压低:仅检测到本端语音活动时才压外放,用户不说话时外放
+        // 基本原音量(冒烟反馈:静态 Min 档仍有恒定压低,听感偏低)。
+        enable_advanced_ducking: 1,
         ducking_level: AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN,
     };
     let st = AudioUnitSetProperty(
