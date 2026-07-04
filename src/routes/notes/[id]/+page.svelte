@@ -289,7 +289,9 @@
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;
-    max-width: 42rem;
+    /* 可读列宽上限 + 居中：大窗口下空白左右均分，不再整片堆在右侧 */
+    max-width: 56rem;
+    margin: 0 auto;
   }
   .title {
     cursor: text;
