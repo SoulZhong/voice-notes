@@ -60,9 +60,9 @@ pub fn sweep_tmp(root: &Path) {
     let _ = fs::remove_dir_all(tmp_extract_dir(root));
 }
 
-/// 包装 Reader：每次 read 前查取消标志，置位即返回 Err——把取消响应性带进
-/// 解压这类长同步调用（unpack 内部逐块拉取，取消在下一次 read 生效，字节级即时）。
-/// ErrorKind 用 Other 而非 Interrupted：Interrupted 会被多数 Read 消费者自动重试，
+/// 包装 Reader:每次 read 前查取消标志,置位即返回 Err——把取消响应性带进
+/// 解压这类长同步调用(unpack 内部逐块拉取,取消在下一次 read 生效,字节级即时)。
+/// ErrorKind 用 Other 而非 Interrupted:Interrupted 会被多数 Read 消费者自动重试,
 /// 永远断不掉。
 struct CancelReader<'a, R: Read> {
     inner: R,
@@ -94,7 +94,7 @@ pub fn extract_and_install(
     let reader = CancelReader { inner: f, cancel };
     if let Err(e) = tar::Archive::new(bzip2::read::BzDecoder::new(reader)).unpack(&tmp) {
         let _ = fs::remove_dir_all(&tmp);
-        // 归一取消错误：上层（download_artifact/lib.rs）以 msg=="cancelled" 识别，
+        // 归一取消错误:上层(download_artifact/lib.rs)以 msg=="cancelled" 识别,
         // 走保留 .part 的取消路径而非删分片的失败路径。
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
@@ -131,8 +131,8 @@ pub fn extract_and_install(
 /// 进度回调：(artifact_id, phase, received_bytes, total_bytes, message)。
 pub type Progress = dyn Fn(&str, &str, u64, u64, &str);
 
-/// 下载完成（或 416 判定本地已有全量 .part）后的收尾：校验/解压安装，成功清 .part。
-/// 失败删 .part（脏数据不值得续）——唯 "cancelled" 例外：tarball 完好，保留供复装。
+/// 下载完成(或 416 判定本地已有全量 .part)后的收尾:校验/解压安装,成功清 .part。
+/// 失败删 .part(脏数据不值得续)——唯 "cancelled" 例外:tarball 完好,保留供复装。
 fn finalize_artifact(
     a: &super::Artifact,
     root: &Path,
@@ -184,15 +184,15 @@ pub fn download_artifact(
     let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
     let resp = match req.call() {
         Ok(r) => r,
-        // 416 = 偏移 ≥ 服务端全量。两种来源：上次解压被取消（.part 是完好全量
-        // tarball，直接收尾复装，免整包重下）或崩溃残留脏分片（收尾校验失败 →
-        // finalize 已删分片，报错引导重试，同旧行为）。
+        // 416 = 偏移 ≥ 服务端全量。两种来源:上次解压被取消(.part 是完好全量
+        // tarball,直接收尾复装,免整包重下)或崩溃残留脏分片(收尾校验失败 →
+        // finalize 已删分片,报错引导重试,同旧行为)。
         Err(ureq::Error::Status(416, _)) => {
             return finalize_artifact(a, root, &part, cancel, progress, offset, offset).map_err(|e| {
                 if e.to_string() == "cancelled" {
                     e
                 } else {
-                    anyhow::anyhow!("续传偏移越界，残留分片无效已清理，请重试（{e}）")
+                    anyhow::anyhow!("续传偏移越界,残留分片无效已清理,请重试({e})")
                 }
             });
         }
@@ -347,15 +347,15 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")];
-        let cancel = AtomicBool::new(true); // 预先置位：首次 read 即断
+        let cancel = AtomicBool::new(true); // 预先置位:首次 read 即断
         let err = extract_and_install(&tarball, &root, "sv-dir", &files, &cancel).unwrap_err();
-        assert_eq!(err.to_string(), "cancelled", "取消错误归一，供上层按消息识别");
+        assert_eq!(err.to_string(), "cancelled", "取消错误归一,供上层按消息识别");
         assert!(!root.join("sv-dir").exists(), "取消不得半安装");
-        assert!(tarball.exists(), "tarball 由调用方保留（供免重下复装）");
+        assert!(tarball.exists(), "tarball 由调用方保留(供免重下复装)");
         assert!(!tmp_extract_dir(&root).exists(), "解压残留即时清理");
     }
 
-    /// 416 免重下复装的核心路径：全量有效 .part 直接 finalize 完成安装（无网络）。
+    /// 416 免重下复装的核心路径:全量有效 .part 直接 finalize 完成安装(无网络)。
     #[test]
     fn finalize_artifact_installs_valid_full_part_without_network() {
         let tmp = tempfile::tempdir().unwrap();
