@@ -124,7 +124,11 @@
             <a class="title" href={n.state === "active" ? "/record" : `/notes/${n.id}`}>
               {n.title}
               {#if stateBadge(n.state)}
-                <span class="state" class:interrupted={n.state === "recording"} class:active={n.state === "active"}>
+                <span
+                  class="state"
+                  class:interrupted={n.state === "recording"}
+                  class:active={n.state === "active"}
+                >
                   {stateBadge(n.state)}
                 </span>
               {/if}
@@ -147,56 +151,81 @@
 </aside>
 
 <style>
+  /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
+     当前页 surface-press + ink 加粗。 */
   .sidebar {
     width: 280px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid #e5e5e7;
-    background: #fafafa;
+    border-right: 1px solid var(--hairline);
+    background: var(--surface);
     padding: 0.75rem;
     box-sizing: border-box;
     overflow-y: auto;
   }
+  /* button-primary（未录制：开始录制）；录制中变为 button-secondary 形态，
+     字色用 --record（唯一常驻彩色信号），呼应“停止录制按钮:字 record”。 */
   .record-btn {
-    border: none;
-    border-radius: 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
     padding: 0.6em 1em;
-    font-size: 1em;
-    font-weight: 600;
+    font-size: 0.9rem;
+    font-weight: 500;
     cursor: pointer;
-    color: #fff;
-    background: #396cd8;
+    color: var(--on-accent);
+    background: var(--accent);
+  }
+  .record-btn:hover {
+    background: var(--accent-pressed);
   }
   .record-btn.recording {
-    background: #c0392b;
+    background: transparent;
+    border-color: var(--hairline-strong);
+    color: var(--record);
+  }
+  .record-btn.recording:hover {
+    background: var(--surface-soft);
+  }
+  .record-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
   .nav-link {
     display: block;
     box-sizing: border-box;
     margin-top: 0.6rem;
     padding: 0.45em 0.6em;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     color: inherit;
     text-decoration: none;
     font-size: 0.9em;
     font-weight: 500;
   }
   .nav-link:hover {
-    background: #eef2fb;
+    background: var(--surface-soft);
   }
   .nav-link.current {
-    background: #eef2fb;
-    color: #396cd8;
+    background: var(--surface-press);
+    color: var(--ink);
+    font-weight: 700;
   }
+  /* input 规范：hairline-strong 边，focus 变 accent + 1px 同色外环 */
   .search {
     box-sizing: border-box;
     width: 100%;
     margin: 0.75rem 0;
     padding: 0.4em 0.7em;
-    border-radius: 8px;
-    border: 1px solid #ccc;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: var(--canvas);
+    color: var(--ink);
     font-size: 0.9em;
+  }
+  .search:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
   }
   .list {
     list-style: none;
@@ -205,11 +234,11 @@
   }
   .item {
     padding: 0.55rem 0.4rem;
-    border-bottom: 1px solid #e5e5e7;
+    border-bottom: 1px solid var(--hairline);
   }
   .item.current {
-    background: #eef2fb;
-    border-radius: 6px;
+    background: var(--surface-press);
+    border-radius: var(--radius-md);
   }
   .main-line {
     display: flex;
@@ -227,95 +256,71 @@
     white-space: nowrap;
   }
   .title:hover {
-    color: #396cd8;
+    color: var(--accent);
   }
   .rename {
     font-size: 0.92em;
     padding: 0.15em 0.3em;
-    border-radius: 6px;
-    border: 1px solid #396cd8;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--accent);
+    background: var(--canvas);
+    color: var(--ink);
   }
   .meta {
-    color: #888;
+    color: var(--ink-faint);
     font-size: 0.75em;
   }
   .state {
     font-size: 0.72em;
     font-weight: 600;
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 0.05em 0.4em;
     margin-left: 0.35em;
     vertical-align: middle;
-    color: #fff;
   }
+  /* 已中断：沿用 warning 色系（浅色调+深文字），亮/暗色下都可读。 */
   .state.interrupted {
-    background: #d88a39;
+    background: var(--warning-line);
+    color: var(--warning-ink);
   }
+  /* 录制中：record 是双主题一致的常驻彩色信号，白字在两种主题下都清晰。 */
   .state.active {
-    background: #c0392b;
+    background: var(--record);
+    color: var(--on-accent);
   }
   .actions {
     display: flex;
     gap: 0.25rem;
     margin-top: 0.15rem;
   }
+  /* button-link：无底无边，accent 字，悬停加下划线 */
   .link {
     background: none;
     border: none;
-    color: #396cd8;
+    color: var(--accent);
     cursor: pointer;
     padding: 0.1em 0.25em;
     font-size: 0.78em;
-    box-shadow: none;
+  }
+  .link:hover {
+    text-decoration: underline;
   }
   .link.danger {
-    color: #c0392b;
+    color: var(--danger);
     font-weight: 600;
   }
+  /* 此处 banner 只用于加载失败，用 danger 色系（DESIGN.md：错误横幅换 danger） */
   .banner {
-    background: #fff4e5;
-    border: 1px solid #f0c98a;
-    color: #8a5a00;
-    border-radius: 8px;
+    background: var(--danger-tint);
+    border: 1px solid var(--danger-line);
+    color: var(--danger);
+    border-radius: var(--radius-lg);
     padding: 0.5rem 0.6rem;
     margin-bottom: 0.5rem;
     font-size: 0.85rem;
   }
   .hint {
-    color: #aaa;
+    color: var(--ink-faint);
     font-size: 0.85em;
-  }
-  @media (prefers-color-scheme: dark) {
-    .sidebar {
-      background: #1e1e1e;
-      border-color: #3a3a3a;
-    }
-    .item {
-      border-color: #3a3a3a;
-    }
-    .item.current {
-      background: #2a3348;
-    }
-    .nav-link:hover,
-    .nav-link.current {
-      background: #2a3348;
-    }
-    .nav-link.current {
-      color: #7ea3f0;
-    }
-    .search,
-    .rename {
-      background: #2a2a2a;
-      border-color: #444;
-      color: #f0f0f0;
-    }
-    .banner {
-      background: #3a2e18;
-      border-color: #6b5426;
-      color: #e8c88a;
-    }
-    .hint {
-      color: #555;
-    }
   }
 </style>

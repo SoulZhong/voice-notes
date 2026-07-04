@@ -1,0 +1,106 @@
+/* ============================================================
+ * voice-notes 设计系统 token
+ * 数值来自 DESIGN.md（Notion 式温暖极简），组件样式只引用这里的
+ * 自定义属性，禁止再出现硬编码色值。字体栈本身不作为 token（不引
+ * webfont，原生 -apple-system 即产品气质），继续在各组件里直写。
+ * ============================================================ */
+
+:root {
+  /* 中性色阶：画布纯白，表面/悬停带暖调，文字是炭墨而非纯黑 */
+  --canvas: #ffffff;
+  --surface: #f6f5f4;
+  --surface-soft: #fafaf9;
+  --surface-press: #efedeb;
+  --hairline: #e5e3df;
+  --hairline-strong: #c8c4be;
+  --ink: #37352f;
+  --ink-secondary: #5d5b54;
+  --ink-faint: #a4a097;
+
+  /* 唯一强调色：互动蓝表达“可交互/进行中” */
+  --accent: #0075de;
+  --accent-pressed: #005bab;
+  --accent-tint: rgba(0, 117, 222, 0.08);
+  --on-accent: #ffffff;
+
+  /* 破坏性操作/错误 */
+  --danger: #e03131;
+  /* danger-tint/line 是错误横幅专用的浅底+边框，DESIGN.md 组件说明里给了浅红底
+     数值（#fdeaea / dark #442a2a），边框色未列出，按 warning 横幅同款“底比边浅一档”
+     的关系补齐，与 danger 主色同色系。 */
+  --danger-tint: #fdeaea;
+  --danger-line: #f3c6c6;
+
+  /* 录制中红点/停止字色：双主题一致，是唯一常驻彩色信号 */
+  --record: #eb5757;
+
+  /* 提示横幅 */
+  --warning-tint: #fef7d6;
+  --warning-ink: #523410;
+  --warning-line: #f0e2a8;
+
+  /* 完成态 / 电平表填充 */
+  --success: #1aae39;
+
+  /* 说话人徽章粉彩 7 色：哈希循环取色，配 --ink 文字（暗色下 --ink 自动切换为浅色） */
+  --tint-sky: #dcecfa;
+  --tint-mint: #d9f3e1;
+  --tint-peach: #ffe8d4;
+  --tint-lavender: #e6e0f5;
+  --tint-rose: #fde0ec;
+  --tint-yellow: #fef7d6;
+  --tint-gray: #f0eeec;
+
+  /* 圆角刻度 */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+
+  /* 唯一允许的阴影：浮层菜单/弹层 */
+  --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* 暗色不是反色，是 Notion 式深暖灰（#191919 系），避免纯黑 */
+    --canvas: #191919;
+    --surface: #202020;
+    --surface-soft: #252525;
+    --surface-press: #2c2c2c;
+    --hairline: #373737;
+    --hairline-strong: #4a4a4a;
+    --ink: #d3d1cb;
+    --ink-secondary: #9b9998;
+    --ink-faint: #6f6e69;
+
+    --accent: #529cca;
+    --accent-pressed: #3d85b5;
+    --accent-tint: rgba(82, 156, 202, 0.15);
+    --on-accent: #ffffff;
+
+    --danger: #ff6b6b;
+    --danger-tint: #442a2a;
+    --danger-line: #5a3232;
+
+    --record: #eb5757;
+
+    --warning-tint: #3a3222;
+    --warning-ink: #e8d49a;
+    --warning-line: #5a4d2a;
+
+    --success: #4cc366;
+
+    --tint-sky: #2a4157;
+    --tint-mint: #2a4a37;
+    --tint-peach: #54402d;
+    --tint-lavender: #413a58;
+    --tint-rose: #513546;
+    --tint-yellow: #4d452a;
+    --tint-gray: #3a3a3a;
+
+    /* 暗色阴影更沉，避免浮层在深底上糊成一片 */
+    --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+}
