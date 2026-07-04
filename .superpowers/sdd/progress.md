@@ -248,3 +248,6 @@ Base: 2ffb6c3
 ## P5 收尾:已推送 origin/p5-v1-polish + 开 PR #5
 - https://github.com/SoulZhong/voice-notes/pull/5 (base: master)
 - 分支保留,未合并。合并前必须先过人工冒烟(PR 描述里 12 项)。
+
+## ✅ P5 squash 合并至 master (2026-07-04, commit 7f1a01e, PR #5)
+v1 全范围完成。阈值校准(diar/registry.rs + session.rs ECHO 三常量)与终审 defer 项继续挂起,由真实使用反馈驱动。
