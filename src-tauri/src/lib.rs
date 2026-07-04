@@ -670,6 +670,61 @@ fn rename_speaker(
         .map_err(|e| e.to_string())
 }
 
+/// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
+fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String> {
+    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false) {
+        return Err("录制中的笔记不能编辑".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn edit_segment(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+    new_text: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .edit_segment_text(&note_id, seq, &expected_text, &new_text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_segment(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .delete_segment(&note_id, seq, &expected_text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_segment_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+    speaker_id: String,
+) -> Result<String, String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .set_segment_speaker(&note_id, seq, &expected_text, &speaker_id)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn export_note(app: AppHandle, id: String, format: String) -> Result<String, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
@@ -812,6 +867,9 @@ pub fn run() {
             delete_note,
             export_note,
             rename_speaker,
+            edit_segment,
+            delete_segment,
+            set_segment_speaker,
             models_status,
             download_models,
             cancel_models_download,
