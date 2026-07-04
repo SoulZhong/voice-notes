@@ -21,10 +21,7 @@
 
 **现状**:非活动笔记编辑走 `NoteStore`(无状态,每命令 `new(dir)`),read-modify-write 无互斥。并发的 `rename_speaker`(非活动分支,lib.rs:666)与 `set_segment_speaker`(lib.rs:712)各自读旧表、改内存、整表原子写,后落盘者覆盖前者。segments.jsonl 的三个编辑原语(edit_segment_text / delete_segment / set_segment_speaker)之间同理。活动写者经 `Arc<Mutex<NoteWriter>>` 串行,不受影响。
 
-**设计**:`AppState` 增 `notes_edit_lock: Arc<Mutex<()>>` 一把全局锁。所有**非活动写路径**在调用 `NoteStore` 变更方法前持锁:
-- `rename_speaker` 非活动分支
-- `set_segment_speaker`、`set_segment_text`、`delete_segment` 三个编辑 command
-- `rename_note` 非活动分支(顺带,同类 RMW)
+**设计**:锁内建于 `NoteStore`——`store/notes.rs` 增模块级 `static EDIT_LOCK: Mutex<()>`,全部变更方法(`rename` / `delete` / `rename_speaker` / `edit_segment_text` / `delete_segment` / `set_segment_speaker`)入口持锁。调用方(lib.rs commands)零改动、无法遗忘;store 层可直接单测。锁毒化用 `into_inner` 忽略(单次写各自原子,毒化无残留)。
 
 跨笔记串行:这些都是毫秒级、单用户 UI 驱动的稀有操作,无感知代价;不做 per-note map(粒度收益为零,徒增管理)。锁只罩非活动路径,与活动写者的 `NoteWriter` 锁互不相干(非活动路径已由 `reject_if_active` 与活动写者隔离)。
 
@@ -68,15 +65,17 @@ export 与 getNote(详情页/录制页水合)自动继承。前端 `displaySegme
 
 **现状**:`cancel` 只在下载读循环检查(download.rs:152-156);`extract_and_install`(download.rs:65-101)的 `tar::Archive::unpack`(75)是同步一次性调用,解压期间取消无响应。
 
-**设计**:`extract_and_install` 增 `cancel: &AtomicBool` 参;新增 `CancelReader<R: Read>`(包装底层 File,每次 `read()` 先查标志,置位则返回 `io::Error`(ErrorKind::Interrupted 语义,消息 "cancelled")),套在 BzDecoder 之下——字节级响应,大文件中途即断。错误向上归一为现有 `bail!("cancelled")` 路径,前端收到既有 `cancelled` phase,无协议变化。取消后残留的解压 tmp 目录由既有 `sweep_tmp` 惯例清理(核实覆盖,不足则补)。
+**设计**:`extract_and_install` 增 `cancel: &AtomicBool` 参;新增 `CancelReader<R: Read>`(包装底层 File,每次 `read()` 先查标志,置位则返回 `io::Error`;ErrorKind 用 `Other` 而非 `Interrupted`——后者会被 Read 消费者自动重试,永远断不掉),套在 BzDecoder 之下——字节级响应,大文件中途即断。unpack 出错后按 cancel 标志归一为 `bail!("cancelled")`,前端收到既有 `cancelled` phase,无协议变化。解压 tmp 目录即时清理 + 既有 `sweep_tmp` 兜底。
 
-**测试**:解压启动后置 cancel → `download_artifact` 返回 "cancelled" 错误,目标目录无半装产物。
+**连带修复(取消后的续传)**:取消解压时 `.part` 已是全量 tarball,原逻辑重试会发 Range 全量偏移 → 416 → 删分片 → 整包重下。把下载成功后的收尾(校验/解压安装/清 .part)抽成 `finalize_artifact`,416 分支直接调它:全量完好的 tarball 免重下、原地复装;脏残留则校验失败 → 删分片报错(同旧行为)。取消的解压保留 `.part`(下载失败的脏数据才删)。
+
+**测试**:cancel 置位后 `extract_and_install` 返回 "cancelled"、无半装产物、tarball 保留;`finalize_artifact` 对全量有效 .part 免网络完成安装。
 
 ## 6. 下载卡片单实例化(compact 变响应式 prop)
 
 **现状**:record/+page.svelte:43-47 大卡片与小提示条分属 `{#if !recording_ready}` / `{:else if !diarization_ready}` 两分支,各自实例化 `ModelDownloadCard`。识别模型下完、仅剩声纹时切分支 → 组件销毁重建,`downloading/prog/error/cancelled` 全清零(后端下载仍在跑,UI 进度丢失)。
 
-**设计**:外层合并为单分支 `{#if models && !(recording_ready && diarization_ready)}`,单实例 `<ModelDownloadCard status={models} compact={models.recording_ready} ...>`;组件内 `compact` 从初始化常量改为响应式 prop,渲染按其切换,内部下载状态(事件订阅、进度表)跨切换保留。核实组件内没有依赖"compact 恒定"的初始化逻辑(如 onMount 里按 compact 分叉的订阅)。
+**设计**:外层合并为单分支 `{#if models && !(recording_ready && diarization_ready)}`,单实例 `<ModelDownloadCard status={models} compact={models.recording_ready} ...>`。组件自身零改动——`compact` 已是 `$props()` 响应式 prop,且仅在模板层消费(class 与两处条件渲染),onMount 订阅与 compact 无关,状态天然跨切换保留。
 
 **测试**:npm check 0/0;人工冒烟——录制模型下载中途 recording_ready 翻转,进度条不清零。
 
