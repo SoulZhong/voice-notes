@@ -246,12 +246,11 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
 
 fn summarize(dir: &Path) -> NoteSummary {
     let meta = read_meta(dir).unwrap_or_else(|| fallback_meta(dir));
-    let duration_secs = if meta.state == "complete" {
-        duration_from_meta(&meta)
-    } else {
-        // 中断会议：时长 = 最后一条可解析段的 end_ms
-        last_end_ms(&dir.join("segments.jsonl")).map(|ms| ms / 1000)
-    };
+    // 活跃时长优先：以段落时间轴最大 end_ms 为准（与转写时间戳/录制计时一致，
+    // 不含暂停与尾部静默）；无可解析段落的完成会议回退墙钟时长。
+    let duration_secs = max_end_ms(&dir.join("segments.jsonl"))
+        .map(|ms| ms / 1000)
+        .or_else(|| if meta.state == "complete" { duration_from_meta(&meta) } else { None });
     NoteSummary {
         id: meta.id,
         title: meta.title,
@@ -267,16 +266,16 @@ fn duration_from_meta(meta: &NoteMeta) -> Option<u64> {
     Some((end - start).num_seconds().max(0) as u64)
 }
 
-fn last_end_ms(jsonl: &Path) -> Option<u64> {
+fn max_end_ms(jsonl: &Path) -> Option<u64> {
     let f = fs::File::open(jsonl).ok()?;
-    let mut last = None;
+    let mut max = None;
     for line in std::io::BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
         if let Ok(r) = serde_json::from_str::<SegmentRecord>(&line) {
-            last = Some(r.end_ms);
+            max = Some(r.end_ms.max(max.unwrap_or(0)));
         }
     }
-    last
+    max
 }
 
 #[cfg(test)]
@@ -333,6 +332,17 @@ mod tests {
         assert_eq!(list[0].duration_secs, Some(2));
         let note = store.load(&id).unwrap();
         assert_eq!(note.segments.len(), 3, "崩溃前内容完好");
+    }
+
+    #[test]
+    fn duration_prefers_segment_timeline_over_wall_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 完成的会议，段落时间轴止于 1900ms → 时长应为 1 秒（活跃时长），而非墙钟差。
+        let id = make_note(tmp.path(), &["a", "b"], true);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let list = store.list();
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].duration_secs, Some(1), "以最大 end_ms(1900ms)为准");
     }
 
     #[test]

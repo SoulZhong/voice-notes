@@ -48,12 +48,16 @@
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
 
   function durationSecs(n: Note): number | null {
+    // 活跃时长优先：段落时间轴最大 end_ms（与转写时间戳/录制计时一致，不含暂停）；
+    // 无段落回退墙钟时长。
+    if (n.segments.length > 0) {
+      return Math.floor(Math.max(...n.segments.map((s) => s.end_ms)) / 1000);
+    }
     if (n.meta.ended_at && n.meta.started_at) {
       const d = (new Date(n.meta.ended_at).getTime() - new Date(n.meta.started_at).getTime()) / 1000;
       return isNaN(d) ? null : Math.max(0, Math.floor(d));
     }
-    const last = n.segments.at(-1);
-    return last ? Math.floor(last.end_ms / 1000) : null;
+    return null;
   }
 
   async function refresh() {

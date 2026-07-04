@@ -196,11 +196,14 @@ export const recording = {
       // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
       if (String(err).includes("已在录制")) {
         const s = await invoke<StatusEvent>("recording_status");
-        if (s.state === "recording") {
+        if (s.state === "recording" || s.state === "paused") {
           status = s.state;
           systemAudio = s.system_audio;
           diarization = s.diarization;
           noteId = s.note_id;
+          paused = s.state === "paused";
+          elapsedBaseMs = s.elapsed_ms;
+          tickAnchor = s.state === "recording" ? Date.now() : null;
           await hydrateFromDisk(s.note_id);
         }
         return false;
@@ -239,11 +242,14 @@ export const recording = {
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
         if (String(err).includes("已在录制")) {
           const s = await invoke<StatusEvent>("recording_status");
-          if (s.state === "recording") {
+          if (s.state === "recording" || s.state === "paused") {
             status = s.state;
             systemAudio = s.system_audio;
             diarization = s.diarization;
             noteId = s.note_id;
+            paused = s.state === "paused";
+            elapsedBaseMs = s.elapsed_ms;
+            tickAnchor = s.state === "recording" ? Date.now() : null;
             await hydrateFromDisk(s.note_id);
           }
           return false;
