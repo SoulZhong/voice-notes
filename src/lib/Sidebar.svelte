@@ -39,7 +39,7 @@
   });
 
   async function toggleRecording() {
-    if (recording.isRecording) {
+    if (recording.isLive) {
       await recording.stop(); // 跳详情由全局 status 监听驱动
     } else {
       const started = await recording.start();
@@ -85,11 +85,11 @@
 <aside class="sidebar">
   <button
     class="record-btn"
-    class:recording={recording.isRecording}
+    class:recording={recording.isLive}
     onclick={toggleRecording}
     disabled={recording.pending}
   >
-    {recording.isRecording ? "■ 停止" : "● 开始录制"}
+    {recording.isLive ? (recording.paused ? "⏸ 已暂停 · 停止" : "■ 停止") : "● 开始录制"}
   </button>
 
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
