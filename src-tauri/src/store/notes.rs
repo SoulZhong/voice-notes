@@ -7,6 +7,17 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+/// 非活动写者全局编辑锁。NoteStore 每命令新建、无状态,speakers.json /
+/// segments.jsonl 的 read-modify-write 之间没有任何互斥,并发编辑会整表互相
+/// 覆盖丢更新。锁内建于变更方法——调用方无法遗忘;编辑均为毫秒级稀有操作,
+/// 跨笔记串行无感知。活动写者走 NoteWriter 自己的锁,与此无关。
+/// 毒化忽略(into_inner):每次落盘各自原子,持锁线程 panic 不留半写状态。
+static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
+    EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 笔记静态读写：目录扫描出列表，逐行解析 jsonl，损坏容忍。
 pub struct NoteStore {
     notes_dir: PathBuf,
@@ -67,6 +78,7 @@ impl NoteStore {
     }
 
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
         meta.title = title.to_string();
@@ -74,6 +86,7 @@ impl NoteStore {
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         fs::remove_dir_all(dir)?;
         Ok(())
@@ -81,6 +94,7 @@ impl NoteStore {
 
     /// 改说话人显示名：读表（缺失则视为空表新建）→ 设 name → 原子写 speakers.json。
     pub fn rename_speaker(&self, id: &str, speaker_id: &str, name: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         let mut speakers = read_speakers(&dir);
         speakers
@@ -98,6 +112,7 @@ impl NoteStore {
         expected_text: &str,
         new_text: &str,
     ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
         let new_text = new_text.trim();
         if new_text.is_empty() {
             anyhow::bail!("文本不能为空（如需去掉这段请用删除）");
@@ -110,6 +125,7 @@ impl NoteStore {
 
     /// 物理删除段落行。speakers.json 不清孤儿说话人（无害，chips 仍可改名）。
     pub fn delete_segment(&self, id: &str, seq: u64, expected_text: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
@@ -127,6 +143,7 @@ impl NoteStore {
         expected_text: &str,
         speaker_id: &str,
     ) -> anyhow::Result<String> {
+        let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
@@ -507,5 +524,47 @@ mod tests {
         let id2 = make_note(tmp.path(), &["旧"], true);
         let n2 = store.load(&id2).unwrap();
         assert!(n2.speakers.is_empty());
+    }
+
+    /// 并发丢更新回归:rename_speaker 与 set_segment_speaker("new") 两线程互跑,
+    /// 无锁时各自 read-modify-write 整表覆盖,终态必然缺改动;EDIT_LOCK 下两者全存活。
+    #[test]
+    fn concurrent_speaker_edits_do_not_lose_updates() {
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tmp.path().to_path_buf());
+
+        // 先创建笔记，确保目录存在
+        let id = {
+            let mut w = NoteWriter::create(&dir, now()).unwrap();
+            w.append_final("mic", "甲", 0, 900, Some("S1")).unwrap();
+            w.append_final("mic", "乙", 1000, 1900, Some("S1")).unwrap();
+            w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+            w.finalize(now()).unwrap();
+            w.note_id().to_string()
+        };
+
+        let t1 = std::thread::spawn({
+            let (dir, id) = (Arc::clone(&dir), id.clone());
+            move || {
+                for i in 0..20 {
+                    NoteStore::new((*dir).clone()).rename_speaker(&id, "S1", &format!("名{i}")).unwrap();
+                }
+            }
+        });
+        let t2 = std::thread::spawn({
+            let (dir, id) = (Arc::clone(&dir), id.clone());
+            move || {
+                for _ in 0..20 {
+                    NoteStore::new((*dir).clone()).set_segment_speaker(&id, 1, "乙", "new").unwrap();
+                }
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let n = NoteStore::new((*dir).clone()).load(&id).unwrap();
+        assert_eq!(n.speakers["S1"].name, "名19", "rename 线程的最后写入存活");
+        // S1 + 20 个新建说话人:任何一次丢更新都会让计数不足 21。
+        assert_eq!(n.speakers.len(), 21, "20 次新建全部存活,无丢更新");
     }
 }
