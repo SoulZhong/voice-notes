@@ -485,7 +485,7 @@ mod tests {
         struct CountingRecognizer;
         impl crate::asr::Recognizer for CountingRecognizer {
             fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
-                Ok(crate::asr::Transcript { text: format!("len={}", s.len()) })
+                Ok(crate::asr::Transcript { text: format!("len={}", s.len()), ..Default::default() })
             }
         }
 
@@ -856,7 +856,7 @@ mod tests {
         struct CountingRecognizer;
         impl crate::asr::Recognizer for CountingRecognizer {
             fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
-                Ok(crate::asr::Transcript { text: format!("len={}", s.len()) })
+                Ok(crate::asr::Transcript { text: format!("len={}", s.len()), ..Default::default() })
             }
         }
 

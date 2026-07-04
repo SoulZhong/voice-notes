@@ -105,6 +105,40 @@ fn text_prefix20(s: &str) -> String {
     s.chars().take(20).collect()
 }
 
+/// 字符占比兜底的阈值:字母类字符中假名/谚文超三成即视为外语幻觉。
+#[allow(dead_code)]
+pub const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
+
+/// 语言白名单过滤(会议场景仅中英):模型标签为日/韩,或文本假名/谚文占比过阈 → 外语
+/// 幻觉段。SenseVoice 短段常把 AEC 残渣误判成日语;此类段漏过文本回声去重(残渣文
+/// 本与 system 段不相似)且会开出垃圾说话人,须在处理链之前整段丢弃。
+/// 纯汉字的日语幻觉读作中文,不拦(无损);占位段/空串占比为 0,天然放行。
+#[allow(dead_code)]
+pub fn is_foreign_final(lang: &str, text: &str) -> bool {
+    let tag: String = lang
+        .trim_matches(|c: char| c == '<' || c == '|' || c == '>')
+        .to_ascii_lowercase();
+    if tag == "ja" || tag == "ko" {
+        return true;
+    }
+    let (mut letters, mut foreign) = (0u32, 0u32);
+    for c in text.chars() {
+        if !c.is_alphabetic() {
+            continue;
+        }
+        letters += 1;
+        let u = c as u32;
+        let is_kana = (0x3040..=0x30FF).contains(&u) || (0x31F0..=0x31FF).contains(&u);
+        let is_hangul = (0xAC00..=0xD7AF).contains(&u)
+            || (0x1100..=0x11FF).contains(&u)
+            || (0x3130..=0x318F).contains(&u);
+        if is_kana || is_hangul {
+            foreign += 1;
+        }
+    }
+    letters > 0 && foreign as f32 / letters as f32 > FOREIGN_RATIO_THRESHOLD
+}
+
 /// hold 中的 mic 段：已识别文本，等待与 system 段比对；到期(echo_hold)无匹配则
 /// 走完整处理链(embed/assign/on_final)。`embedding_input` 为原始样本，供 release
 /// 时才做声纹嵌入（避免被丢弃的段产生任何嵌入副作用）。
@@ -562,7 +596,7 @@ mod asr_worker_tests {
     struct CountingRecognizer;
     impl Recognizer for CountingRecognizer {
         fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
-            Ok(Transcript { text: format!("len={}", s.len()) })
+            Ok(Transcript { text: format!("len={}", s.len()), ..Default::default() })
         }
     }
 
@@ -573,7 +607,7 @@ mod asr_worker_tests {
             if self.n == 1 {
                 anyhow::bail!("boom");
             }
-            Ok(Transcript { text: format!("len={}", s.len()) })
+            Ok(Transcript { text: format!("len={}", s.len()), ..Default::default() })
         }
     }
 
@@ -642,7 +676,7 @@ mod asr_worker_tests {
             if self.n == 1 {
                 panic!("boom");
             }
-            Ok(Transcript { text: format!("len={}", s.len()) })
+            Ok(Transcript { text: format!("len={}", s.len()), ..Default::default() })
         }
     }
 
@@ -884,7 +918,7 @@ mod asr_worker_tests {
     }
     impl Recognizer for ScriptedRecognizer {
         fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
-            Ok(Transcript { text: self.script.pop_front().unwrap_or_default() })
+            Ok(Transcript { text: self.script.pop_front().unwrap_or_default(), ..Default::default() })
         }
     }
 
@@ -1128,7 +1162,7 @@ mod session_tests {
     struct CountingRecognizer;
     impl Recognizer for CountingRecognizer {
         fn recognize(&mut self, s: &[f32]) -> anyhow::Result<Transcript> {
-            Ok(Transcript { text: format!("len={}", s.len()) })
+            Ok(Transcript { text: format!("len={}", s.len()), ..Default::default() })
         }
     }
 
@@ -1143,7 +1177,7 @@ mod session_tests {
                 hash ^= x.to_bits() as u64;
                 hash = hash.wrapping_mul(1099511628211);
             }
-            Ok(Transcript { text: format!("h{hash:x}n{}", s.len()) })
+            Ok(Transcript { text: format!("h{hash:x}n{}", s.len()), ..Default::default() })
         }
     }
 
@@ -1293,5 +1327,27 @@ mod session_tests {
         };
         assert!(err.error.to_string().contains("没有可用音频源"));
         let _reusable: Box<dyn Recognizer> = err.recognizer; // Err 携带 recognizer 返还
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_final_detection() {
+        // 模型标签命中(sherpa 原样格式与裸格式都认)
+        assert!(is_foreign_final("<|ja|>", "任意文本"));
+        assert!(is_foreign_final("ko", "任意文本"));
+        assert!(!is_foreign_final("<|zh|>", "正常中文"));
+        assert!(!is_foreign_final("en", "hello world"));
+        // 字符占比兜底(标签缺失时)
+        assert!(is_foreign_final("", "でかし"), "纯假名");
+        assert!(is_foreign_final("", "美国のポ調スパ"), "假名混杂占比过阈");
+        assert!(is_foreign_final("", "안녕하세요"), "谚文");
+        assert!(!is_foreign_final("", "中英 mixed 正常句子 ok"), "中英混合放行");
+        assert!(!is_foreign_final("", "純漢字幻覺讀作中文"), "纯汉字不拦(无损)");
+        assert!(!is_foreign_final("", "[识别失败]"), "占位段绝不误杀");
+        assert!(!is_foreign_final("", ""), "空串放行");
     }
 }
