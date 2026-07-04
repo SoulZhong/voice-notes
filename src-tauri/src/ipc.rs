@@ -69,6 +69,17 @@ pub struct SpeakersEvent {
     pub merged: Option<MergedPair>,
 }
 
+/// 声纹库人物摘要，供 `list_people` 返回、管理页展示。sources 取该人已有质心的信道集合
+/// （"mic"/"system"），不是"当前在场"，纯粹反映库里记录过哪些信道的声纹。
+#[derive(Debug, Clone, Serialize)]
+pub struct PersonSummary {
+    pub id: String,
+    pub name: String,
+    pub total_ms: u64,
+    pub last_seen: String,
+    pub sources: Vec<String>,
+}
+
 /// 模型下载进度，事件名 "model_download"。artifact="all" + phase="done" 表示整体完成。
 /// phase: downloading | verifying | extracting | done | error | cancelled。
 #[derive(Debug, Clone, Serialize)]

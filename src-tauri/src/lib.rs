@@ -97,6 +97,37 @@ fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// 声纹库种子导出：app_data_dir/voiceprints.json → 每个"有效"人物（经 resolve 校验，
+/// 排除已被合并掉/悬空的引用）的每个信道质心各生成一个 SeedCluster，供本场开录时
+/// SpeakerRegistry::with_seeds 优先命中，免得同一人在新会话里从零建簇。
+/// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
+/// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
+fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
+    let Ok(root) = app.path().app_data_dir() else {
+        eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
+        return Vec::new();
+    };
+    let vp = store::VoiceprintStore::new(root).load();
+    let mut seeds = Vec::new();
+    for (id, person) in &vp.people {
+        // 防御性校验：正常情况下 people 里的 key 都是当前有效引用（merge 已把 loser
+        // 从 people 移除），这里用 resolve 兜底，防止任何手工损坏数据把一个实际已被
+        // 重定向掉的 id 当种子注入。
+        if store::VoiceprintStore::resolve(&vp, id) != Some(id.as_str()) {
+            continue;
+        }
+        for centroid in person.centroids.values() {
+            seeds.push(crate::diar::registry::SeedCluster {
+                person: id.clone(),
+                name: person.name.clone(),
+                centroid: centroid.vec.clone(),
+                count: centroid.count,
+            });
+        }
+    }
+    seeds
+}
+
 /// 会话未正常存续时的笔记收尾：有内容则 finalize 保全；无内容且是本会话新建的才删空目录；
 /// 续录打开的既有笔记(即使零段)绝不删——留 recording 态(诚实显示「已中断」)。
 fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
@@ -278,10 +309,12 @@ fn spawn_session(
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.lock().unwrap().base_ms();
-        // 说话人编号/质心延续：New 路径表为空 ⇒ 等价 SpeakerRegistry::new()；
-        // Resume 路径从 speakers.json 已加载的质心表重建（同一人保持同一编号）。
-        let registry = crate::diar::registry::SpeakerRegistry::from_snapshot(
+        // 说话人编号/质心延续 + 库种子注入：快照（续录）优先，库中同 person 不重复注入。
+        // 库加载失败降级为无种子，绝不挡录制。
+        let seeds = load_voiceprint_seeds(&app);
+        let registry = crate::diar::registry::SpeakerRegistry::with_seeds(
             &writer.lock().unwrap().registry_snapshot(),
+            &seeds,
         );
 
         // 3) 起会话。emit 回调带 source 字符串。
@@ -290,6 +323,16 @@ fn spawn_session(
         let app_d = app.clone();
         let writer_f = writer.clone();
         let writer_d = writer.clone();
+        // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
+        // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
+        // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
+        let vp_store_d: Option<store::VoiceprintStore> = match app.path().app_data_dir() {
+            Ok(root) => Some(store::VoiceprintStore::new(root)),
+            Err(e) => {
+                eprintln!("声纹库路径不可用，本场停止时的库回写将被跳过（不影响笔记落盘）: {e}");
+                None
+            }
+        };
         let mut degraded = false;
         let start = session::start_session(
             sources,
@@ -343,6 +386,20 @@ fn spawn_session(
                     if let Err(e) = w.sync_speakers(&pairs) {
                         eprintln!("speakers.json 写入失败: {e}");
                     }
+                    // 种子命中显名：registry 里已关联库人物（seed 命中或续录带入）的簇，
+                    // 把 person_id 同步进本场 speakers 表；本地名为空时用库名兜底（本场
+                    // 手动改过名的一律保留，不被库名打回原形）。
+                    for s in &infos {
+                        let Some(person) = &s.person else { continue };
+                        w.set_speaker_person(&s.id, person);
+                        let local_name_empty =
+                            w.speakers().get(&s.id).map(|m| m.name.is_empty()).unwrap_or(true);
+                        if local_name_empty {
+                            if let Some(name) = s.name.as_deref().filter(|n| !n.is_empty()) {
+                                w.set_speaker_name(&s.id, name);
+                            }
+                        }
+                    }
                     let speakers = w
                         .speakers()
                         .iter()
@@ -382,7 +439,22 @@ fn spawn_session(
                     );
                 }
                 session::DiarEvent::Snapshot(snaps) => {
-                    writer_d.lock().unwrap().store_centroids(&snaps);
+                    let mut w = writer_d.lock().unwrap();
+                    w.store_centroids(&snaps);
+                    // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
+                    // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
+                    // join 前送达,故先于 stop_recording 的 finalize,person_id 随
+                    // finalize 落盘。
+                    if let Some(store) = &vp_store_d {
+                        match store.upsert_from_session(&snaps, &chrono::Local::now().to_rfc3339()) {
+                            Ok(enrolled) => {
+                                for (cluster_id, person_id) in &enrolled {
+                                    w.set_speaker_person(cluster_id, person_id);
+                                }
+                            }
+                            Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
+                        }
+                    }
                 }
             },
             {
@@ -745,6 +817,69 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
         .map_err(|e| e.to_string())
 }
 
+/// 声纹库四命令共用：打开 app_data_dir 根下的 VoiceprintStore（与逐场笔记目录并列，
+/// 不是 notes_dir 的子目录）。
+fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, String> {
+    app.path()
+        .app_data_dir()
+        .map(store::VoiceprintStore::new)
+        .map_err(|e| e.to_string())
+}
+
+/// 声纹库人物列表，供管理页展示。vp.people 本就只含经 redirects 解析后的有效人
+/// （merge 已把 loser 移出 people），无需再过一遍 resolve。
+#[tauri::command]
+fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
+    let vp = open_voiceprint_store(&app)?.load();
+    Ok(vp
+        .people
+        .iter()
+        .map(|(id, p)| ipc::PersonSummary {
+            id: id.clone(),
+            name: p.name.clone(),
+            total_ms: p.total_ms,
+            last_seen: p.last_seen.clone(),
+            sources: p.centroids.keys().cloned().collect(),
+        })
+        .collect())
+}
+
+/// 改库里人物的显示名：只影响后续会话的种子姓名与笔记侧只读 join，不涉及本场
+/// registry 引用结构，录制中也允许（同 rename_speaker 的"改名不挡录制"哲学）。
+#[tauri::command]
+fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名字不能为空".into());
+    }
+    open_voiceprint_store(&app)?.rename(&id, name).map_err(|e| e.to_string())
+}
+
+/// 录制中拒绝合并/删除：开录时种子已经按当前库结构注入本场 registry，若此刻改
+/// 动库的引用关系（合并/删除 person），本场 registry 里的种子锚点和库状态就脱节，
+/// "是谁"会变得混乱——比改名危险得多，故禁止，等停止录制后再操作。
+#[tauri::command]
+fn merge_person(
+    app: AppHandle,
+    state: State<AppState>,
+    loser: String,
+    winner: String,
+) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能合并说话人".into());
+    }
+    open_voiceprint_store(&app)?.merge(&loser, &winner).map_err(|e| e.to_string())
+}
+
+/// 录制中拒绝：理由同 merge_person。
+#[tauri::command]
+fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能删除说话人".into());
+    }
+    open_voiceprint_store(&app)?.delete(&id).map_err(|e| e.to_string())
+}
+
 /// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
 /// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
 /// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
@@ -896,7 +1031,11 @@ pub fn run() {
             download_models,
             cancel_models_download,
             get_settings,
-            set_settings
+            set_settings,
+            list_people,
+            rename_person,
+            merge_person,
+            delete_person
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

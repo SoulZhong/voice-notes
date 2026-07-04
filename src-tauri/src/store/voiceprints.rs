@@ -5,11 +5,8 @@
 //! 与 notes.rs 同一套原子写/静态锁/损坏容忍哲学,但库缺失/损坏绝不能挡住录制,
 //! 因此 load 侧永不返回 Err——降级为空库 + eprintln。
 //!
-//! 本任务只落地本模块;lib.rs/session.rs 的接线(种子注入、停止时 upsert)是
-//! 后续任务,在那之前生产代码路径不会调用这里的公开 API——本文件测试已覆盖
-//! 全部行为,允许 dead_code 是有意为之,不是遗漏。
-
-#![allow(dead_code)]
+//! lib.rs 已接线:种子注入(load_voiceprint_seeds)、停止时 upsert_from_session、
+//! 以及 list/rename/merge/delete 四个 Tauri command,全部公开 API 均被消费。
 
 use crate::diar::registry::ClusterSnapshot;
 use serde::{Deserialize, Serialize};
