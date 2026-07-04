@@ -121,6 +121,15 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
+/// RAII 复位守卫:下载线程无论正常结束还是 panic 展开,download_running 都必然
+/// 回 false——否则一次 panic 后"下载已在进行中"永久卡死,只能重启应用。
+struct ResetOnDrop(Arc<AtomicBool>);
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 fn sense_voice_dir() -> PathBuf {
     models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
@@ -777,6 +786,8 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
     let recognizer_cache = state.recognizer_cache.clone();
     let embedder_cache = state.embedder_cache.clone();
     std::thread::spawn(move || {
+        // guard 而非尾部手动清位:中途任何 panic 也必然复位,不卡死后续下载。
+        let guard = ResetOnDrop(running);
         let root = models::root();
         models::download::sweep_tmp(&root);
         let s = app
@@ -810,7 +821,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
                 break;
             }
         }
-        running.store(false, Ordering::SeqCst);
+        drop(guard); // 复位先于 done 事件,保持"收到 done 即可再次下载"的时序
         if all_ok {
             emit("all", "done", 0, 0, "");
             // 补齐后立即预载，无需重启即可开录。
@@ -893,5 +904,19 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    #[test]
+    fn download_running_resets_even_on_panic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(true));
+        let g = super::ResetOnDrop(flag.clone());
+        let h = std::thread::spawn(move || {
+            let _g = g;
+            panic!("模拟下载线程 panic");
+        });
+        assert!(h.join().is_err());
+        assert!(!flag.load(Ordering::SeqCst), "panic 展开也必须复位标志");
     }
 }
