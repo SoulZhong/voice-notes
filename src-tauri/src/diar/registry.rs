@@ -11,11 +11,18 @@ pub const MERGE_THRESHOLD: f32 = 0.74;
 pub const MIN_NEW_CLUSTER_SAMPLES: usize = 9600; // 0.6s
 /// 每 N 次 assign 做一次簇间合并检查。
 pub const MERGE_CHECK_INTERVAL: u64 = 8;
+/// 种子簇(已关联库人物)的归簇阈值,高于普通阈值。跨会议信道差异比同会议内大,
+/// 命错人比不命名更糟,故要求更高相似度才认领。待真实会议数据校准。
+pub const SEED_ASSIGN_THRESHOLD: f32 = 0.68;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerInfo {
     pub id: String,
     pub sources: BTreeSet<String>,
+    /// 关联的库人物 id(种子命中或续录带入);None = 尚未关联任何库人物。
+    pub person: Option<String>,
+    /// 库人物姓名(随 person 一起出现;快照恢复路径不带,需上层从库/笔记表补)。
+    pub name: Option<String>,
 }
 
 /// 一簇的可导出快照(质心/计数/来源),用于跨会话续接说话人编号(P4.5)。
@@ -25,6 +32,19 @@ pub struct ClusterSnapshot {
     pub centroid: Vec<f32>,
     pub count: u64,
     pub sources: BTreeSet<String>,
+    /// 关联的库人物 id(续录场景:上一场已关联,这一场铺底恢复)。
+    pub person: Option<String>,
+    /// 本簇累计的长段时长(毫秒),供停止时的入库门槛判定与库累计使用。
+    pub total_ms: u64,
+}
+
+/// 库里的一个种子人物:注入 registry 供本场优先命中,免得同一人在新会话里
+/// 从零建簇、需要用户重新点名。
+pub struct SeedCluster {
+    pub person: String,
+    pub name: String,
+    pub centroid: Vec<f32>,
+    pub count: u64,
 }
 
 struct Cluster {
@@ -33,6 +53,13 @@ struct Cluster {
     centroid: Vec<f32>,
     count: u64,
     sources: BTreeSet<String>,
+    /// 关联的库人物 id;Some 表示该簇已"认领"为库中某人(种子命中或续录恢复)。
+    person: Option<String>,
+    /// 种子携带的库人物姓名,只在种子注入路径设置——不进快照,名字真值在库/笔记表,
+    /// 避免快照成为姓名的第二份真源。
+    person_name: Option<String>,
+    /// 累计长段时长(毫秒,仅长段更新质心时累加),供入库门槛与库时长统计。
+    total_ms: u64,
 }
 
 pub struct SpeakerRegistry {
@@ -87,7 +114,10 @@ impl SpeakerRegistry {
             .max_by(|(a, _), (b, _)| a.total_cmp(b));
 
         if let Some((sim, cluster)) = best {
-            if sim >= ASSIGN_THRESHOLD {
+            // 种子簇(关联库 person)用更高阈值:跨会议信道差异大,误命名比不命名糟。
+            // 待真实会议数据校准。
+            let threshold = if cluster.person.is_some() { SEED_ASSIGN_THRESHOLD } else { ASSIGN_THRESHOLD };
+            if sim >= threshold {
                 cluster.sources.insert(source.to_string());
                 // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
                 if num_samples >= MIN_NEW_CLUSTER_SAMPLES {
@@ -100,6 +130,7 @@ impl SpeakerRegistry {
                         cluster.centroid = renorm;
                     }
                     cluster.count += 1;
+                    cluster.total_ms += (num_samples / 16) as u64;
                 }
                 return Some(cluster.id.clone());
             }
@@ -115,6 +146,11 @@ impl SpeakerRegistry {
             centroid: unit,
             count: 1,
             sources: BTreeSet::from([source.to_string()]),
+            person: None,
+            person_name: None,
+            // 建簇本身要求 num_samples >= MIN_NEW_CLUSTER_SAMPLES(足够长的段),
+            // 首个成员的时长直接计入,与既有簇长段累加同一口径。
+            total_ms: (num_samples / 16) as u64,
         });
         Some(id)
     }
@@ -130,7 +166,10 @@ impl SpeakerRegistry {
             let mut found: Option<(usize, usize)> = None;
             'outer: for i in 0..self.clusters.len() {
                 for j in (i + 1)..self.clusters.len() {
-                    if dot(&self.clusters[i].centroid, &self.clusters[j].centroid) >= MERGE_THRESHOLD {
+                    let (a, b) = (&self.clusters[i], &self.clusters[j]);
+                    // 不同 person 的簇禁止自动互并:"库里两人实为一人"只能由用户在管理页显式合并。
+                    let conflict = matches!((&a.person, &b.person), (Some(x), Some(y)) if x != y);
+                    if !conflict && dot(&a.centroid, &b.centroid) >= MERGE_THRESHOLD {
                         found = Some((i, j));
                         break 'outer;
                     }
@@ -150,7 +189,13 @@ impl SpeakerRegistry {
                 winner.centroid = renorm;
             }
             winner.count += loser.count;
+            winner.total_ms += loser.total_ms;
             winner.sources.extend(loser.sources.iter().cloned());
+            // winner 无 person 而 loser 有 → 继承(两者都 Some 的情形已被上面的冲突检查挡掉)。
+            if winner.person.is_none() {
+                winner.person = loser.person.clone();
+                winner.person_name = loser.person_name.clone();
+            }
             self.pending_merges.push((loser.id.clone(), winner.id.clone()));
         }
     }
@@ -158,7 +203,12 @@ impl SpeakerRegistry {
     pub fn speakers(&self) -> Vec<SpeakerInfo> {
         self.clusters
             .iter()
-            .map(|c| SpeakerInfo { id: c.id.clone(), sources: c.sources.clone() })
+            .map(|c| SpeakerInfo {
+                id: c.id.clone(),
+                sources: c.sources.clone(),
+                person: c.person.clone(),
+                name: c.person_name.clone(),
+            })
             .collect()
     }
 
@@ -171,13 +221,19 @@ impl SpeakerRegistry {
                 centroid: c.centroid.clone(),
                 count: c.count,
                 sources: c.sources.clone(),
+                person: c.person.clone(),
+                total_ms: c.total_ms,
             })
             .collect()
     }
 
     /// 从质心快照重建 registry:编号续接(解析所有 "S{n}" 取最大 n,next_id = n+1)；
-    /// 质心为空的项不建簇但计入编号。空切片 ≡ new()。
+    /// 质心为空的项不建簇但计入编号。空切片 ≡ new()。等价 `with_seeds(snaps, &[])`。
     pub fn from_snapshot(snaps: &[ClusterSnapshot]) -> Self {
+        Self::with_seeds(snaps, &[])
+    }
+
+    fn from_snapshot_inner(snaps: &[ClusterSnapshot]) -> Self {
         let mut next_id = 1u32;
         let mut clusters = Vec::new();
         for s in snaps {
@@ -192,10 +248,43 @@ impl SpeakerRegistry {
                     centroid: s.centroid.clone(),
                     count: s.count,
                     sources: s.sources.clone(),
+                    person: s.person.clone(),
+                    // 快照不带姓名(名字真值在库/笔记表,由上层从 writer 表/库补);
+                    // 只有种子注入路径才带上 person_name。
+                    person_name: None,
+                    total_ms: s.total_ms,
                 });
             }
         }
         Self { clusters, next_id, assigns: 0, pending_merges: Vec::new() }
+    }
+
+    /// 库种子注入:先铺会话快照(续录),再为快照中未出现的 person 建种子簇。
+    /// 快照优先:续录质心更贴近本场信道。count 从库带(权重大、漂移慢),
+    /// total_ms 归 0(只统计本场,供停止时的入库门槛与库累计)。
+    pub fn with_seeds(snaps: &[ClusterSnapshot], seeds: &[SeedCluster]) -> Self {
+        let mut r = Self::from_snapshot_inner(snaps);
+        let known: BTreeSet<String> = r.clusters.iter().filter_map(|c| c.person.clone()).collect();
+        for s in seeds {
+            if known.contains(&s.person) {
+                continue; // 快照中已关联该 person(续录场景),不重复建簇
+            }
+            let Some(centroid) = normalize(&s.centroid) else {
+                continue; // 零向量/非法种子质心丢弃,不建残废簇
+            };
+            let id = format!("S{}", r.next_id);
+            r.next_id += 1;
+            r.clusters.push(Cluster {
+                id,
+                centroid,
+                count: s.count.max(1),
+                sources: BTreeSet::new(),
+                person: Some(s.person.clone()),
+                person_name: Some(s.name.clone()),
+                total_ms: 0,
+            });
+        }
+        r
     }
 }
 
@@ -345,6 +434,8 @@ mod tests {
             centroid: v(1.0, 0.0, 0.0),
             count: 5,
             sources: BTreeSet::from(["mic".to_string()]),
+            person: None,
+            total_ms: 0,
         }];
         let mut r = SpeakerRegistry::from_snapshot(&snaps);
         // 与 S3 质心正交 → 新建簇,编号应续接为 S4(而非从 S1 重来)
@@ -358,6 +449,8 @@ mod tests {
             centroid: Vec::new(),
             count: 0,
             sources: BTreeSet::new(),
+            person: None,
+            total_ms: 0,
         }];
         let mut r = SpeakerRegistry::from_snapshot(&snaps);
         assert_eq!(r.speakers().len(), 0, "空质心项不建簇");
@@ -372,5 +465,96 @@ mod tests {
         assert_eq!(r.speakers(), r2.speakers());
         assert_eq!(r.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S1".into()));
         assert_eq!(r2.assign(&v(1.0, 0.0, 0.0), "mic", LONG), Some("S1".into()));
+    }
+
+    #[test]
+    fn seeds_inject_match_and_dedup() {
+        // 库里张三(P1)质心 e1;快照里已有 S2 关联 P9(续录场景)
+        let snap = ClusterSnapshot {
+            id: "S2".into(),
+            centroid: v(0.0, 1.0, 0.0),
+            count: 5,
+            sources: BTreeSet::from(["mic".to_string()]),
+            person: Some("P9".into()),
+            total_ms: 0,
+        };
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "张三".into(), centroid: v(1.0, 0.0, 0.0), count: 40 },
+            SeedCluster { person: "P9".into(), name: "旧人".into(), centroid: v(0.0, 1.0, 0.0), count: 7 },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
+        // P9 已在快照,种子去重:簇数 = 快照1 + P1 种子1
+        assert_eq!(r.speakers().len(), 2);
+        // 命中张三种子:余弦 0.98 > 0.68 → 返回其 S 号,speakers() 带 person/name
+        let id = r.assign(&v(0.98, 0.199, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("P1"));
+        assert_eq!(info.name.as_deref(), Some("张三"));
+    }
+
+    #[test]
+    fn seed_threshold_is_stricter_than_session_threshold() {
+        // 相似度 ~0.65:普通簇能命中(≥0.62),种子簇不能(<0.68)
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 }];
+        let mut seeded = SpeakerRegistry::with_seeds(&[], &seeds);
+        let probe = v(0.65, (1.0f32 - 0.65 * 0.65).sqrt(), 0.0);
+        let id = seeded.assign(&probe, "mic", LONG).unwrap();
+        let info = seeded.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person, None, "0.65 < 0.68,不得吸入种子簇,应新建普通簇");
+
+        let mut plain = SpeakerRegistry::new();
+        plain.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let id2 = plain.assign(&probe, "mic", LONG).unwrap();
+        assert_eq!(plain.speakers().len(), 1, "0.65 ≥ 0.62,普通簇应命中: {id2}");
+    }
+
+    #[test]
+    fn different_persons_never_automerge_and_winner_inherits_person() {
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.9805, 0.19612, 0.0), count: 10 },
+        ];
+        // 两种子余弦 ~0.98 ≥ MERGE_THRESHOLD,但 person 不同 → 永不自动合并
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        assert!(r.take_merges().is_empty());
+        assert_eq!(r.speakers().len(), 2);
+
+        // 无 person 簇与有 person 簇可并,winner 继承 person:
+        // S1 = 种子 P1(质心 e1,count 小);S2 = 普通簇,经相向漂移后与 S1 质心
+        // 余弦 ≥ MERGE_THRESHOLD,且 count 更大 → S2 胜出,继承 S1 的 person。
+        let mut r2 = SpeakerRegistry::with_seeds(
+            &[],
+            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1 }],
+        );
+        // 建 S2(与 e1 余弦 0.30,低于种子阈值 0.68 → 新建普通簇)
+        r2.assign(&v(0.30, (1.0f32 - 0.09f32).sqrt(), 0.0), "system", LONG).unwrap();
+        // 相向漂移(1):这批向量与 S2 当前质心更近 → 归入 S2,把 S2 拖向 e1
+        for k in 1..=10 {
+            let t = 0.30 + 0.05 * k as f32; // 0.35..0.80
+            let y = (1.0 - t * t).max(0.0).sqrt();
+            r2.assign(&v(t, y, 0.0), "system", LONG).unwrap();
+        }
+        // 相向漂移(2):这批与 S1(种子,阈值 0.68)质心(余弦 0.90)更近 → 归入 S1,
+        // 把 S1 拖向 S2;迭代次数(9)刻意少于 S2 的 count(11),让 S2 保持更大 count。
+        for _ in 0..9 {
+            r2.assign(&v(0.90, 0.436, 0.0), "mic", LONG).unwrap();
+        }
+
+        let merges = r2.take_merges();
+        assert_eq!(merges.len(), 1, "相向漂移后两簇应合并");
+        let (loser, winner) = &merges[0];
+        assert_eq!(winner, "S2", "S2 count(11) > S1 count(10),大簇胜出");
+        assert_eq!(loser, "S1");
+        let info = r2.speakers().into_iter().find(|s| &s.id == winner).unwrap();
+        assert_eq!(info.person.as_deref(), Some("P1"), "无 person 的胜者须继承败者的 person");
+    }
+
+    #[test]
+    fn total_ms_accumulates_only_on_long_segments() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", 32000).unwrap(); // 2s
+        r.assign(&v(1.0, 0.0, 0.0), "mic", 4800).unwrap(); // 0.3s 短段不计
+        let snap = r.snapshot();
+        assert_eq!(snap[0].total_ms, 2000);
     }
 }
