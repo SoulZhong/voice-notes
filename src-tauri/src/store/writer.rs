@@ -167,10 +167,7 @@ impl NoteWriter {
     /// 关联说话人到全局声纹库人物：只更新内存表，不落盘（同 set_speaker_name 落盘策略，
     /// 由后续 persist/finalize 统一写出）。缺项自动建（种子命中可能先于 sync_speakers
     /// 建表，例如种子解析先于本场首次归簇事件到达）。
-    /// 本任务只落地 store 层；lib.rs/session.rs 接线（种子命中时调用本方法）是
-    /// 后续任务，在那之前生产代码路径不会调用它——测试已覆盖行为，allow(dead_code)
-    /// 是有意为之，不是遗漏（同 voiceprints.rs 模块顶部的说明）。
-    #[allow(dead_code)]
+    /// lib.rs 已接线：SpeakersChanged（种子命中）与 Snapshot（停止入库回填）两处都会调用。
     pub fn set_speaker_person(&mut self, id: &str, person: &str) {
         self.speakers
             .entry(id.to_string())

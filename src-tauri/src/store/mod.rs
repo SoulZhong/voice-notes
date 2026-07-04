@@ -3,10 +3,12 @@ mod export;
 mod notes;
 mod voiceprints;
 pub use notes::NoteStore;
-// 本任务只落地 store 层;lib.rs/session.rs 的接线(种子注入、停止时 upsert)是后续任务,
-// 届时这些导出才会被消费——暂时允许 unused,避免虚设一个占位调用点。
+pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
+// 以下四项 lib.rs 暂不按名引用(经由 VoiceprintStore 方法间接使用/类型推断得出),
+// 但属于声纹库的公开数据形状,保留导出供未来前端类型生成或测试直接引用;缩小到
+// 这一条而非模块级,是因为 VoiceprintStore 本身已经"真的"被用到,不该整体 allow。
 #[allow(unused_imports)]
-pub use voiceprints::{Person, PersonCentroid, VoiceprintStore, Voiceprints, AUTO_ENROLL_MS};
+pub use voiceprints::{Person, PersonCentroid, Voiceprints, AUTO_ENROLL_MS};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
