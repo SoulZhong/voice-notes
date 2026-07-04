@@ -194,6 +194,8 @@ impl VoiceprintStore {
         let mut vp = self.load();
         let mut new_links = BTreeMap::new();
         for snap in snaps {
+            // sources 恒空 ⇔ 未命中的库种子簇,勿回写勿入库(终审 triage①):assign 命中
+            // 必 sources.insert,空集是种子铺底后本场从未被认领的信号,不是"真实说话人"。
             let Some(source) = snap.sources.iter().next().cloned() else { continue };
             if let Some(person_id) = &snap.person {
                 let Some(resolved) = Self::resolve(&vp, person_id).map(str::to_string) else {
@@ -227,6 +229,10 @@ impl VoiceprintStore {
 /// 同 source 质心按 count 加权平均后归一(与 diar/registry.rs detect_merges 同公式,
 /// 两处独立维护是因为一个是会话内簇合并、一个是跨会话库合并,数据结构不同不便复用);
 /// 异 source 直插(不同信道的声纹本就该独立保留,见 spec"数据模型"节)。
+/// incoming.count 恒为本场会话的净增量(registry::SpeakerRegistry::snapshot 已减去
+/// 种子/续录带入的历史基数,见终审 triage②)，而不是"种子基数 + 本场增量"的全量——
+/// 否则这里的加权平均会把库里已经计入过的历史样本数再计一遍，count 随每场停止
+/// 复利膨胀，把新会话的质心增量权重错误地稀释掉。
 fn merge_centroid(person: &mut Person, source: &str, incoming: PersonCentroid) {
     match person.centroids.get_mut(source) {
         Some(existing) => {
@@ -536,5 +542,42 @@ mod tests {
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         assert!(links.is_empty());
         assert!(store.load().people.is_empty());
+    }
+
+    /// 终审 triage②端到端:种子带库 count=40 注入本场 registry,命中两次长段后停止。
+    /// registry::snapshot() 应只导出本场净增量(2),upsert 回库后 count 应线性长到
+    /// 42,而不是把种子基数 40 再报一遍变成 82(40+42)——回归"每场停止近似翻倍,库
+    /// 质心学习率几何衰减"的复利膨胀问题。
+    #[test]
+    fn seed_count_does_not_compound_across_a_session_end_to_end() {
+        use crate::diar::registry::{SeedCluster, SpeakerRegistry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+
+        // 库里先有一个人,mic 质心 count=40(模拟此前多场累积的样本数)。
+        let seed_snap = vec![snap("S0", vec![1.0, 0.0, 0.0], 40, &["mic"], None, AUTO_ENROLL_MS)];
+        let links = store.upsert_from_session(&seed_snap, "t0").unwrap();
+        let pid = links["S0"].clone();
+        assert_eq!(store.load().people[&pid].centroids["mic"].count, 40);
+
+        // 本场:该人作为种子注入(count=40),命中两段长音频。
+        let seeds =
+            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40 }];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+        r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+        let session_snaps = r.snapshot();
+        assert_eq!(session_snaps.len(), 1);
+        assert_eq!(session_snaps[0].count, 2, "registry 导出应只是本场净增量,不含种子基数 40");
+        assert_eq!(session_snaps[0].person.as_deref(), Some(pid.as_str()));
+
+        // upsert 回库:应是 40+2=42,不该翻倍成 40+42=82。
+        store.upsert_from_session(&session_snaps, "t1").unwrap();
+        let vp = store.load();
+        assert_eq!(
+            vp.people[&pid].centroids["mic"].count, 42,
+            "库 count 应线性增长,不因种子基数被重复计入而复利膨胀"
+        );
     }
 }

@@ -4,11 +4,8 @@ mod notes;
 mod voiceprints;
 pub use notes::NoteStore;
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
-// 以下四项 lib.rs 暂不按名引用(经由 VoiceprintStore 方法间接使用/类型推断得出),
-// 但属于声纹库的公开数据形状,保留导出供未来前端类型生成或测试直接引用;缩小到
-// 这一条而非模块级,是因为 VoiceprintStore 本身已经"真的"被用到,不该整体 allow。
-#[allow(unused_imports)]
-pub use voiceprints::{Person, PersonCentroid, Voiceprints, AUTO_ENROLL_MS};
+// Person/PersonCentroid/Voiceprints/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型
+// 生成/测试引用),但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

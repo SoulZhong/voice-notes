@@ -35,10 +35,16 @@
 
   onMount(refresh);
 
-  function nameFocus() {
+  /** 聚焦时收起其它行内菜单/确认态；若当前显示的是"未命名 · 最近 …"占位文本
+   *（而非真名），先清空内容再进编辑态——否则直接打字会插在占位文本前后，
+   *提交成"未命名 · 最近 7月5日张三"这种把占位串当真名存进库的怪状态。 */
+  function nameFocus(e: FocusEvent, p: PersonSummary) {
     mergeMenuId = null;
     pendingMerge = null;
     confirmDeleteId = null;
+    if (!p.name) {
+      (e.currentTarget as HTMLElement).textContent = "";
+    }
   }
 
   /** 失焦提交：与段落编辑同模式——空文本或未变则还原展示态，不当真改名。 */
@@ -105,7 +111,7 @@
               role="textbox"
               tabindex="0"
               spellcheck="false"
-              onfocus={nameFocus}
+              onfocus={(e) => nameFocus(e, p)}
               onblur={(e) => nameBlur(e, p)}
               onkeydown={(e) => {
                 const el = e.currentTarget as HTMLElement;
