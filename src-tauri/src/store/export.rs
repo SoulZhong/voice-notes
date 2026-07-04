@@ -274,6 +274,6 @@ mod tests {
         let txt = std::fs::read_to_string(store.export(&id, "txt").unwrap()).unwrap();
         let (i_first, i_later) = (txt.find("先说的").unwrap(), txt.find("后说的").unwrap());
         assert!(i_first < i_later, "导出按 start_ms 序而非落盘序: {txt}");
-        assert!(!txt.contains("00:00:00  \n"), "空白段不出现在导出中");
+        assert_eq!(txt.lines().filter(|l| l.starts_with('[')).count(), 2, "空白段被过滤,只剩两段: {txt}");
     }
 }

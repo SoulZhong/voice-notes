@@ -61,7 +61,7 @@ pub fn sweep_tmp(root: &Path) {
 }
 
 /// 包装 Reader:每次 read 前查取消标志,置位即返回 Err——把取消响应性带进
-/// 解压这类长同步调用(unpack 内部逐块拉取,取消在下一次 read 生效,字节级即时)。
+/// 解压这类长同步调用(unpack 内部逐块拉取,取消在块级——下一次 read——响应)。
 /// ErrorKind 用 Other 而非 Interrupted:Interrupted 会被多数 Read 消费者自动重试,
 /// 永远断不掉。
 struct CancelReader<'a, R: Read> {
@@ -192,7 +192,7 @@ pub fn download_artifact(
                 if e.to_string() == "cancelled" {
                     e
                 } else {
-                    anyhow::anyhow!("续传偏移越界,残留分片无效已清理,请重试({e})")
+                    anyhow::anyhow!("续传偏移越界,残留分片无法直接安装,请重试({e})")
                 }
             });
         }
