@@ -244,3 +244,7 @@ Base: 2ffb6c3
 - 终审 Minors 全部判 defer-OK; 后续项(不阻塞, 记入 backlog): speakers.json 非活动写者(rename_speaker vs set_segment_speaker)加每笔记锁; export 复用详情页 filter+sort 语义; download_running 加 drop-guard 防线程 panic 卡死; 下载中 preload 双载瞬时 2x 内存; 解压阶段取消不即时; 大小卡片切换重建组件态
 - P5 自动化终值: cargo test 100 passed + 7 ignored(真模型)全过, npm check 0 errors 0 warnings(基线 2 条清零), build OK
 - 待人工冒烟(计划 Task 10 Step 6 六项 + 终审追加): 7) 断网中途→error 可读+重试续传不清零, 镜像无效前缀→错误可理解; 8) 手工造满尺寸 .part→416 路径自愈; 9) 长暂停(≥5min)恢复→VPIO/AEC/系统声音路仍活; 10) 录制中补下声纹→本场降级不变, 停止再开录 diarization=on 无重启; 11) 编辑已中断笔记(删末段/新建说话人)后续录→seq 接续+编号不撞; 12) 冷刷新暂停态→计时冻结正确, 恢复/停止可用
+
+## P5 收尾:已推送 origin/p5-v1-polish + 开 PR #5
+- https://github.com/SoulZhong/voice-notes/pull/5 (base: master)
+- 分支保留,未合并。合并前必须先过人工冒烟(PR 描述里 12 项)。
