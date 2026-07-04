@@ -35,14 +35,9 @@
 
   const id = $derived($page.params.id as string);
 
-  /** 展示序：过滤空白段(遗留#1) + 按 start_ms 稳定排序消除 ECHO hold 交错(遗留#2)。 */
-  const displaySegments = $derived(
-    note
-      ? [...note.segments]
-          .filter((s) => s.text.trim())
-          .sort((a, b) => a.start_ms - b.start_ms || a.seq - b.seq)
-      : [],
-  );
+  /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
+      按 (start_ms, seq) 升序,前端直接消费。 */
+  const displaySegments = $derived(note ? note.segments : []);
   /** 本笔记正在录制（含暂停）时禁用一切编辑入口（后端另有 guard 兜底）。 */
   const canEdit = $derived(!(recording.isLive && recording.noteId === id));
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);

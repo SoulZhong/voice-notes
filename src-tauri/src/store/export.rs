@@ -260,4 +260,20 @@ mod tests {
         assert!(md_corrupt.contains("# t"),
             "corrupt case should still contain title: {md_corrupt}");
     }
+
+    #[test]
+    fn export_inherits_display_order_and_blank_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "后说的", 5000, 6000, None).unwrap();
+        w.append_final("system", "  ", 500, 900, None).unwrap();
+        w.append_final("mic", "先说的", 1000, 1500, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let txt = std::fs::read_to_string(store.export(&id, "txt").unwrap()).unwrap();
+        let (i_first, i_later) = (txt.find("先说的").unwrap(), txt.find("后说的").unwrap());
+        assert!(i_first < i_later, "导出按 start_ms 序而非落盘序: {txt}");
+        assert!(!txt.contains("00:00:00  \n"), "空白段不出现在导出中");
+    }
 }

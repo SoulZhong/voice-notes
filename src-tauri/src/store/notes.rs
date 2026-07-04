@@ -73,6 +73,12 @@ impl NoteStore {
                 }
             }
         }
+        // 读侧单一真值源:过滤空白段 + 按 start_ms 稳定排序(同值按 seq),消除
+        // ECHO hold 造成的落盘交错——详情页与导出共同继承此语义,防两处漂移。
+        // 磁盘文件序不动:编辑重写走 read_jsonl_lines 原始行,续录 next_seq 由
+        // writer 自扫 jsonl,均不经此处。空白段非损坏,不计 skipped_lines。
+        segments.retain(|s| !s.text.trim().is_empty());
+        segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
         let speakers = read_speakers(&dir);
         Ok(Note { meta, segments, skipped_lines, speakers })
     }
@@ -566,5 +572,23 @@ mod tests {
         assert_eq!(n.speakers["S1"].name, "名19", "rename 线程的最后写入存活");
         // S1 + 20 个新建说话人:任何一次丢更新都会让计数不足 21。
         assert_eq!(n.speakers.len(), 21, "20 次新建全部存活,无丢更新");
+    }
+
+    /// 读侧单一真值源:load 过滤空白段、按 (start_ms, seq) 稳定排序——
+    /// 详情页与导出共同继承,消除 ECHO hold 落盘交错。
+    #[test]
+    fn load_filters_blank_and_sorts_by_start_ms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "后", 5000, 6000, None).unwrap();       // seq 0
+        w.append_final("system", "   ", 500, 900, None).unwrap();     // seq 1 空白段
+        w.append_final("mic", "前", 1000, 1500, None).unwrap();       // seq 2
+        w.append_final("system", "同前", 1000, 1400, None).unwrap();  // seq 3 同 start,按 seq 稳定
+        w.finalize(now()).unwrap();
+        let n = NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
+        let texts: Vec<&str> = n.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["前", "同前", "后"], "空白段滤除,start_ms 升序,同值按 seq");
+        assert_eq!(n.skipped_lines, 0, "空白段不是损坏行,不计 skipped");
     }
 }
