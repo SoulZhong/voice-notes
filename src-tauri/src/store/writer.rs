@@ -513,10 +513,10 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
-            move |src, text, start_ms, end_ms, spk| {
+            move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), None)
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), rms)
                     .unwrap();
                 *e2.lock().unwrap() += 1;
             },
@@ -903,10 +903,10 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
-            move |src, text, start_ms, end_ms, spk| {
+            move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), None)
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), rms)
                     .unwrap();
             },
             |_, _| {},
@@ -935,10 +935,10 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
-            move |src, text, start_ms, end_ms, spk| {
+            move |src, text, start_ms, end_ms, spk, rms| {
                 w3.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref(), None)
+                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref(), rms)
                     .unwrap();
             },
             |_, _| {},

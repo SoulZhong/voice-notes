@@ -105,16 +105,22 @@ fn text_prefix20(s: &str) -> String {
     s.chars().take(20).collect()
 }
 
+/// 段音频均方根。空段为 0(理论不出现,防御)。
+fn rms_of(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
 /// 字符占比兜底的阈值:字母类字符中假名/谚文超三成即视为外语幻觉。
-#[allow(dead_code)]
-pub const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
+const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
 
 /// 语言白名单过滤(会议场景仅中英):模型标签为日/韩,或文本假名/谚文占比过阈 → 外语
 /// 幻觉段。SenseVoice 短段常把 AEC 残渣误判成日语;此类段漏过文本回声去重(残渣文
 /// 本与 system 段不相似)且会开出垃圾说话人,须在处理链之前整段丢弃。
 /// 纯汉字的日语幻觉读作中文,不拦(无损);占位段/空串占比为 0,天然放行。
-#[allow(dead_code)]
-pub fn is_foreign_final(lang: &str, text: &str) -> bool {
+fn is_foreign_final(lang: &str, text: &str) -> bool {
     let tag: String = lang
         .trim_matches(|c: char| c == '<' || c == '|' || c == '>')
         .to_ascii_lowercase();
@@ -150,6 +156,8 @@ struct PendingMic {
     samples_len: usize,
     embedding_input: Vec<f32>,
     held_at: Instant,
+    /// hold 前已算好的段级 rms，release 时随 on_final 透传给落盘层。
+    rms: f32,
 }
 
 /// 已处理的 system 段的轻量记录，供后续到达的 mic 段比对（回声去重）。
@@ -171,13 +179,14 @@ fn process_final<F1, F2>(
     end_ms: u64,
     samples_len: usize,
     embedding_input: &[f32],
+    rms: f32,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     registry: &mut SpeakerRegistry,
     last_sent: &mut Vec<crate::diar::registry::SpeakerInfo>,
     on_final: &mut F1,
     on_diar: &mut F2,
 ) where
-    F1: FnMut(Source, String, u64, u64, Option<String>),
+    F1: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
     F2: FnMut(DiarEvent),
 {
     // 声纹:嵌入失败/无 embedder → None,绝不影响文本
@@ -202,7 +211,7 @@ fn process_final<F1, F2>(
         *last_sent = speakers.clone();
         on_diar(DiarEvent::SpeakersChanged(speakers));
     }
-    on_final(source, text, start_ms, end_ms, speaker);
+    on_final(source, text, start_ms, end_ms, speaker, Some(rms));
 }
 
 /// 完成句识别任务：进 finals 队列，永不丢弃（保证不丢内容）。
@@ -235,6 +244,9 @@ pub enum DiarEvent {
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
 /// 每条 final 定稿时额外提声纹嵌入并归簇（嵌入失败/无 embedder/panic 均降级为 None，绝不影响文本）；
 /// 归簇产生的簇合并 / 说话人表变化通过 on_diar 通知（顺序：先 Merged 后 SpeakersChanged）。
+/// 识别得到的语言标签命中外语白名单过滤（`is_foreign_final`）的整段直接丢弃，
+/// 与 ECHO 命中同待遇；未被丢弃的段额外算出段级 rms，随 `on_final` 尾参
+/// `Option<f32>` 透传给调用方落盘（partial 路径不参与语言过滤，也不算 rms）。
 #[allow(clippy::too_many_arguments)]
 pub fn run_asr_worker(
     mut recognizer: Box<dyn Recognizer>,
@@ -243,7 +255,7 @@ pub fn run_asr_worker(
     finals_rx: Receiver<FinalJob>,
     echo_hold: Duration,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
-    mut on_final: impl FnMut(Source, String, u64, u64, Option<String>),
+    mut on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
     mut on_partial: impl FnMut(Source, String),
     mut on_diar: impl FnMut(DiarEvent),
 ) -> (Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>) {
@@ -265,6 +277,7 @@ pub fn run_asr_worker(
                 p.end_ms,
                 p.samples_len,
                 &p.embedding_input,
+                p.rms,
                 &mut embedder,
                 &mut registry,
                 &mut last_sent,
@@ -287,19 +300,30 @@ pub fn run_asr_worker(
                     release_pending!(p);
                 }
 
-                let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (text, lang) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     recognizer.recognize(&job.samples)
                 })) {
-                    Ok(Ok(t)) => t.text,
-                    Ok(Err(_)) => "[识别失败]".to_string(),
+                    Ok(Ok(t)) => (t.text, t.lang),
+                    Ok(Err(_)) => ("[识别失败]".to_string(), String::new()),
                     Err(_) => {
                         eprintln!(
                             "run_asr_worker: recognize panicked on a {:?} final; 以占位继续",
                             job.source
                         );
-                        "[识别失败]".to_string()
+                        ("[识别失败]".to_string(), String::new())
                     }
                 };
+                // 语言白名单:外语幻觉段与 ECHO 命中同待遇——不 embed/不 assign/
+                // 不 emit/不落盘,从源头杜绝垃圾段污染说话人表。占位段占比 0 天然放行。
+                if is_foreign_final(&lang, &text) {
+                    eprintln!(
+                        "语言过滤: 丢弃 {:?} 段 lang=\"{lang}\" text=\"{}\"",
+                        job.source,
+                        text_prefix20(&text)
+                    );
+                    continue;
+                }
+                let seg_rms = rms_of(&job.samples);
 
                 match job.source {
                     Source::System => {
@@ -332,6 +356,7 @@ pub fn run_asr_worker(
                             job.end_ms,
                             job.samples.len(),
                             &job.samples,
+                            seg_rms,
                             &mut embedder,
                             &mut registry,
                             &mut last_sent,
@@ -361,6 +386,7 @@ pub fn run_asr_worker(
                                 job.end_ms,
                                 job.samples.len(),
                                 &job.samples,
+                                seg_rms,
                                 &mut embedder,
                                 &mut registry,
                                 &mut last_sent,
@@ -391,6 +417,7 @@ pub fn run_asr_worker(
                                         samples_len: job.samples.len(),
                                         embedding_input: job.samples,
                                         held_at: Instant::now(),
+                                        rms: seg_rms,
                                     });
                                 }
                             }
@@ -508,7 +535,7 @@ pub fn start_session(
     echo_hold: Duration,
     target_rate: u32,
     partial_interval_samples: usize,
-    on_final: impl FnMut(Source, String, u64, u64, Option<String>) + Send + 'static,
+    on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
     on_mic_level: Option<Box<dyn Fn(f32) + Send>>,
@@ -630,7 +657,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, start_ms, end_ms, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
+            move |s, t, start_ms, end_ms, _, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
             |_, _| {},
             |_| {},
         );
@@ -659,7 +686,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -700,7 +727,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -731,7 +758,7 @@ mod asr_worker_tests {
                 rx,
                 TEST_ECHO_HOLD,
                 vec![(Source::System, slot_for_worker)],
-                |_, _, _, _, _| {},
+                |_, _, _, _, _, _| {},
                 move |s, t| p2.lock().unwrap().push((s, t)),
                 |_| {},
             );
@@ -779,7 +806,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
             move |_ev| *d2.lock().unwrap() += 1,
         );
@@ -814,7 +841,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
             move |_ev| *d2.lock().unwrap() += 1,
         );
@@ -844,7 +871,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
             |_| {},
         );
@@ -865,7 +892,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |_, _, _, _, spk| f2.lock().unwrap().push(spk),
+            move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
             |_| {},
         );
@@ -889,7 +916,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            |_, _, _, _, _| {},
+            |_, _, _, _, _, _| {},
             |_, _| {},
             move |ev| e2.lock().unwrap().push(ev),
         );
@@ -943,7 +970,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -972,7 +999,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -1015,7 +1042,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -1056,7 +1083,7 @@ mod asr_worker_tests {
             rx,
             TEST_ECHO_HOLD,
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -1090,7 +1117,7 @@ mod asr_worker_tests {
             rx,
             Duration::from_secs(10), // 故意远长于测试运行时间:证明 release 靠 Disconnected 排干,而非到期
             vec![],
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
         );
@@ -1120,7 +1147,7 @@ mod asr_worker_tests {
                 rx,
                 TEST_ECHO_HOLD,
                 vec![],
-                move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+                move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
                 |_, _| {},
                 |_| {},
             );
@@ -1143,6 +1170,42 @@ mod asr_worker_tests {
 
         drop(tx);
         worker.join().unwrap();
+    }
+
+    /// 外语幻觉段整段丢弃:不 emit、不进说话人表;正常段带 rms 落到 on_final。
+    #[test]
+    fn worker_drops_foreign_final_and_reports_rms() {
+        // ScriptRecognizer: 第一条返回日语标签,第二条正常中文(lang 空,兜底不命中)。
+        struct ScriptRecognizer(std::collections::VecDeque<Transcript>);
+        impl Recognizer for ScriptRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(self.0.pop_front().unwrap_or_default())
+            }
+        }
+        let script = vec![
+            Transcript { text: "でかし".into(), lang: "<|ja|>".into() },
+            Transcript { text: "正常句子".into(), lang: "<|zh|>".into() },
+        ];
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 0, end_ms: 100 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 200, end_ms: 300 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<(String, Option<f32>)> = Vec::new();
+        run_asr_worker(
+            Box::new(ScriptRecognizer(script.into())),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0), // hold 归零,立即 release
+            Vec::new(),
+            |_src, text, _s, _e, _spk, rms| finals.push((text, rms)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(finals.len(), 1, "日语幻觉段被丢弃");
+        assert_eq!(finals[0].0, "正常句子");
+        let rms = finals[0].1.expect("正常段必须带 rms");
+        assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
     }
 }
 
@@ -1245,7 +1308,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
-            move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
             None,
@@ -1287,7 +1350,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
-            |_, _, _, _, _| {},
+            |_, _, _, _, _, _| {},
             |_, _| {},
             |_| {},
             None,
@@ -1316,7 +1379,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
-            |_, _, _, _, _| {},
+            |_, _, _, _, _, _| {},
             |_, _| {},
             |_| {},
             None,
