@@ -160,8 +160,22 @@ impl NoteWriter {
     pub fn set_speaker_name(&mut self, id: &str, name: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 })
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
             .name = name.to_string();
+    }
+
+    /// 关联说话人到全局声纹库人物：只更新内存表，不落盘（同 set_speaker_name 落盘策略，
+    /// 由后续 persist/finalize 统一写出）。缺项自动建（种子命中可能先于 sync_speakers
+    /// 建表，例如种子解析先于本场首次归簇事件到达）。
+    /// 本任务只落地 store 层；lib.rs/session.rs 接线（种子命中时调用本方法）是
+    /// 后续任务，在那之前生产代码路径不会调用它——测试已覆盖行为，allow(dead_code)
+    /// 是有意为之，不是遗漏（同 voiceprints.rs 模块顶部的说明）。
+    #[allow(dead_code)]
+    pub fn set_speaker_person(&mut self, id: &str, person: &str) {
+        self.speakers
+            .entry(id.to_string())
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
+            .person_id = Some(person.to_string());
     }
 
     /// 追加一条定稿段。失败时段留在待写队列并返回 Err（调用方发 storage 降级事件），
@@ -214,16 +228,21 @@ impl NoteWriter {
         write_speakers_atomic(&self.dir, &self.speakers)
     }
 
-    /// 合入 worker 结束时的质心快照(DiarEvent::Snapshot)：只 merge 质心/count 进
+    /// 合入 worker 结束时的质心快照(DiarEvent::Snapshot)：只 merge 质心/count/person 进
     /// 已有或新建表项，不落盘（由既有 finalize→persist_speakers 落）。
-    /// 已有表项：只更新 centroid/count，不动 name/sources（sources 已由 sync_speakers 维护）。
-    /// 新建表项：name 空串，sources 取快照。
+    /// 已有表项：只更新 centroid/count，不动 name/sources（sources 已由 sync_speakers 维护）；
+    /// snap.person 为 None(种子未命中/悬空引用)时保留原有 person_id 不清空——种子命中是
+    /// 一次性事件,后续快照没带 person 不代表关联失效。
+    /// 新建表项：name 空串，sources/person_id 取快照。
     pub fn store_centroids(&mut self, snaps: &[crate::diar::registry::ClusterSnapshot]) {
         for s in snaps {
             match self.speakers.get_mut(&s.id) {
                 Some(entry) => {
                     entry.centroid = Some(s.centroid.clone());
                     entry.count = s.count;
+                    if let Some(person) = &s.person {
+                        entry.person_id = Some(person.clone());
+                    }
                 }
                 None => {
                     self.speakers.insert(
@@ -233,6 +252,7 @@ impl NoteWriter {
                             sources: s.sources.iter().cloned().collect(),
                             centroid: Some(s.centroid.clone()),
                             count: s.count,
+                            person_id: s.person.clone(),
                         },
                     );
                 }
@@ -257,9 +277,9 @@ impl NoteWriter {
                 centroid: m.centroid.clone().unwrap_or_default(),
                 count: m.count,
                 sources: m.sources.iter().cloned().collect(),
-                // SpeakerMeta 暂未持有 person/total_ms(库联动是后续任务的事);
-                // 这里先给中性默认值,续录编号/质心的既有行为不变。
-                person: None,
+                person: m.person_id.clone(),
+                // total_ms 恒 0:这是"本场续录"快照,不是库里的人物,累计时长由
+                // VoiceprintStore 的 person.total_ms 记账,不在这里重复维护。
                 total_ms: 0,
             })
             .collect()
@@ -272,7 +292,7 @@ impl NoteWriter {
         for (id, sources) in infos {
             let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
                 changed = true;
-                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 }
+                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None }
             });
             for s in sources {
                 if !entry.sources.contains(s) {
@@ -323,7 +343,7 @@ impl NoteWriter {
             let winner_entry = self
                 .speakers
                 .entry(winner.to_string())
-                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 });
+                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None });
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
             }
@@ -714,6 +734,61 @@ mod tests {
         assert!(s1.sources.contains("mic"));
         let s2 = snaps.iter().find(|s| s.id == "S2").unwrap();
         assert!(s2.centroid.is_empty(), "无质心项应以空 centroid 输出");
+    }
+
+    /// person 关联往返：store_centroids 带 person 的快照 → finalize → resume →
+    /// registry_snapshot 应恢复出同一个 person，续录不丢关联。
+    #[test]
+    fn person_roundtrips_through_store_centroids_finalize_and_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S1".into(),
+            centroid: vec![1.0, 0.0],
+            count: 3,
+            sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: Some("P1".into()),
+            total_ms: 0,
+        }]);
+        assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P1"), "store_centroids 应回填 person_id");
+        w.finalize(now()).unwrap();
+
+        let resumed = NoteWriter::resume(tmp.path(), &id).unwrap();
+        let snaps = resumed.registry_snapshot();
+        let s1 = snaps.iter().find(|s| s.id == "S1").unwrap();
+        assert_eq!(s1.person, Some("P1".to_string()), "续录快照应恢复 person 关联");
+        assert_eq!(s1.total_ms, 0, "registry_snapshot 的 total_ms 恒 0（本场续录快照，非库计时）");
+
+        // 再喂一次不带 person 的快照（种子未命中/悬空）：既有 person_id 不应被清空。
+        let mut resumed = resumed;
+        resumed.store_centroids(&[crate::diar::registry::ClusterSnapshot {
+            id: "S1".into(),
+            centroid: vec![0.9, 0.1],
+            count: 4,
+            sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: None,
+            total_ms: 0,
+        }]);
+        assert_eq!(resumed.speakers()["S1"].person_id.as_deref(), Some("P1"), "snap.person=None 不清空既有关联");
+    }
+
+    /// set_speaker_person：既有项设值、缺项自动建（同 set_speaker_name 模式）。
+    #[test]
+    fn set_speaker_person_updates_existing_and_creates_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+
+        w.set_speaker_person("S1", "P1");
+        assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P1"));
+
+        // S9 此前不在表中：应自动新建（空名，空 sources）。
+        w.set_speaker_person("S9", "P2");
+        let s9 = &w.speakers()["S9"];
+        assert_eq!(s9.person_id.as_deref(), Some("P2"));
+        assert_eq!(s9.name, "");
+        assert!(s9.sources.is_empty());
     }
 
     /// 回归 P4.5 终审 Finding 1：P4.5 前的旧笔记（或曾降级会话）speakers 表里

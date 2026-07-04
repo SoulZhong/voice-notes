@@ -54,6 +54,11 @@ pub struct SpeakerMeta {
     pub centroid: Option<Vec<f32>>,
     #[serde(default)]
     pub count: u64,
+    /// 关联的全局声纹库人物 id(经 VoiceprintStore::resolve 解析)。P4 registry
+    /// 种子命中/入库时回填;serde default + skip_serializing_if 保证旧
+    /// speakers.json(无该键)可解析,且未关联时序列化省去该键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。
