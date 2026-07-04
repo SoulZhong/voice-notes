@@ -1,7 +1,12 @@
 pub mod writer;
 mod export;
 mod notes;
+mod voiceprints;
 pub use notes::NoteStore;
+// 本任务只落地 store 层;lib.rs/session.rs 的接线(种子注入、停止时 upsert)是后续任务,
+// 届时这些导出才会被消费——暂时允许 unused,避免虚设一个占位调用点。
+#[allow(unused_imports)]
+pub use voiceprints::{Person, PersonCentroid, VoiceprintStore, Voiceprints, AUTO_ENROLL_MS};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
