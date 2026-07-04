@@ -257,6 +257,10 @@ impl NoteWriter {
                 centroid: m.centroid.clone().unwrap_or_default(),
                 count: m.count,
                 sources: m.sources.iter().cloned().collect(),
+                // SpeakerMeta 暂未持有 person/total_ms(库联动是后续任务的事);
+                // 这里先给中性默认值,续录编号/质心的既有行为不变。
+                person: None,
+                total_ms: 0,
             })
             .collect()
     }
@@ -617,6 +621,8 @@ mod tests {
             centroid: vec![0.1, 0.2, 0.3],
             count: 4,
             sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: None,
+            total_ms: 0,
         }]);
         w.persist_speakers().unwrap();
 
@@ -649,6 +655,8 @@ mod tests {
             centroid: vec![1.0, 0.0],
             count: 2,
             sources: std::collections::BTreeSet::from(["system".to_string()]),
+            person: None,
+            total_ms: 0,
         }]);
         let s7 = &w.speakers()["S7"];
         assert_eq!(s7.name, "", "新建项 name 空串");
@@ -669,6 +677,8 @@ mod tests {
             centroid: vec![0.5, 0.5],
             count: 9,
             sources: std::collections::BTreeSet::from(["system".to_string()]),
+            person: None,
+            total_ms: 0,
         }]);
         let s1 = &w.speakers()["S1"];
         assert_eq!(s1.name, "张三", "已有表项 name 不受影响");
@@ -691,6 +701,8 @@ mod tests {
             centroid: vec![1.0, 0.0],
             count: 3,
             sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: None,
+            total_ms: 0,
         }]);
         // S2 无质心：不应被过滤掉，须以空质心出现在快照中（否则编号会跳过 S2 的
         // 位置，续录时新说话人可能被分配到 S2 的旧 id 上）。
