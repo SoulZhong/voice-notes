@@ -17,6 +17,15 @@ pub struct StatusEvent {
     pub note_id: String,
     /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（模型缺失，降级）| ""（非录制态）。
     pub diarization: String,
+    /// 活跃录制毫秒数（不含暂停期；续录含历史 base_ms）。仅 recording/paused 状态
+    /// 有意义，其余为 0。
+    pub elapsed_ms: u64,
+}
+
+/// 麦克风电平（闸前 RMS，0..1 量级），事件名 "level"，约 10Hz。
+#[derive(Debug, Clone, Serialize)]
+pub struct LevelEvent {
+    pub rms: f32,
 }
 
 /// 一句定稿文本，事件名 "final"。
@@ -58,4 +67,16 @@ pub struct SpeakersEvent {
     pub speakers: Vec<SpeakerEntry>,
     /// 本次事件伴随的簇合并（仅 Merged 分支非 None）；前端据此回写已上屏历史段。
     pub merged: Option<MergedPair>,
+}
+
+/// 模型下载进度，事件名 "model_download"。artifact="all" + phase="done" 表示整体完成。
+/// phase: downloading | verifying | extracting | done | error | cancelled。
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelDownloadEvent {
+    pub artifact: String,
+    pub phase: String,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+    /// error 时的原因说明，其余为空串。
+    pub message: String,
 }

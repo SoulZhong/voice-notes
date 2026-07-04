@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { speakerColor, speakerLabel, renameSpeaker } from "$lib/notes";
+  import { speakerColor, speakerLabel, renameSpeaker, speakerIdCompare } from "$lib/notes";
 
   let {
     speakers,
@@ -16,7 +16,7 @@
   let editingId = $state<string | null>(null);
   let editingName = $state("");
 
-  const ids = $derived(Object.keys(speakers).sort());
+  const ids = $derived(Object.keys(speakers).sort(speakerIdCompare));
 
   // 非 null 分支与徽章共用同一兜底逻辑;source 参数在此分支无关,固定传 "mic"。
   const label = (id: string) => speakerLabel(id, "mic", speakers);

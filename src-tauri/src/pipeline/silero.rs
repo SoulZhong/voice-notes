@@ -63,3 +63,41 @@ impl Segmenter for SileroSegmenter {
         self.current.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::segmenter::Segmenter;
+
+    /// 暂停功能依赖：flush 之后继续 accept，段的 start 样本偏移必须延续而非归零。
+    /// 需要真实模型：cargo test -- --ignored（或 VN_MODELS 指向模型目录）。
+    #[test]
+    #[ignore]
+    fn flush_midstream_keeps_timeline_monotonic() {
+        let model = crate::models::root().join("silero_vad.onnx");
+        let mut seg = SileroSegmenter::new(&model).expect("加载 VAD");
+        let wav = {
+            let mut r = hound::WavReader::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/sample_16k.wav"
+            ))
+            .expect("fixture");
+            r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect::<Vec<f32>>()
+        };
+        seg.accept(&wav);
+        seg.flush();
+        let a = seg.take_finished();
+        assert!(!a.is_empty(), "fixture 是真实语音，flush 应产段");
+        seg.accept(&wav);
+        seg.flush();
+        let b = seg.take_finished();
+        assert!(!b.is_empty());
+        let last_a = a.last().unwrap();
+        assert!(
+            b[0].start >= last_a.start + last_a.samples.len(),
+            "flush 后时间轴延续不重叠: b.start={} vs a.end={}",
+            b[0].start,
+            last_a.start + last_a.samples.len()
+        );
+    }
+}

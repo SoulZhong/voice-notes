@@ -17,6 +17,7 @@ export type StatusEvent = {
   system_audio: SystemAudio;
   note_id: string;
   diarization: Diarization;
+  elapsed_ms: number;
 };
 export type StorageEvent = { state: "ok" | "degraded" };
 export type SpeakerEntry = { id: string; name: string; sources: Source[] };
@@ -43,4 +44,10 @@ export function onStorage(cb: (e: StorageEvent) => void) {
 
 export function onSpeakers(cb: (e: SpeakersEvent) => void) {
   return listen<SpeakersEvent>("speakers", (ev) => cb(ev.payload));
+}
+
+export type LevelEvent = { rms: number };
+
+export function onLevel(cb: (e: LevelEvent) => void) {
+  return listen<LevelEvent>("level", (ev) => cb(ev.payload));
 }

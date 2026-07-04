@@ -410,9 +410,16 @@ pub struct RecordingHandle {
     captures: Vec<Box<dyn AudioCapture>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     asr: Option<std::thread::JoinHandle<(Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>)>>,
+    /// 各 segment_worker 共享的暂停闸（true = 丢帧，时间轴冻结）。
+    paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RecordingHandle {
+    /// 置暂停闸。跳变瞬间的在途语句 flush 由 worker 侧完成（见 run_segment_worker）。
+    pub fn set_paused(&self, v: bool) {
+        self.paused.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 优雅停止：停各 capture（关帧通道）→ 分段 worker flush 尾段后退出并 join
     /// →（其 finals 发送端随之 drop）ASR worker 排干剩余 finals 后退出并 join，
     /// 返还 recognizer / embedder 供复用（asr 线程 panic 时均返 None，调用方现场重载兜底）。
@@ -470,7 +477,10 @@ pub fn start_session(
     on_final: impl FnMut(Source, String, u64, u64, Option<String>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
+    on_mic_level: Option<Box<dyn Fn(f32) + Send>>,
 ) -> Result<SessionStart, StartError> {
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut mic_level = on_mic_level;
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
     let mut slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)> = Vec::new();
     let mut captures: Vec<Box<dyn AudioCapture>> = Vec::new();
@@ -485,6 +495,8 @@ pub fn start_session(
         let final_tx = finals_tx.clone();
         // 先起 worker（消费者），再启动 capture：兼容同步灌帧的 MockCapture，
         // 且若 capture 启动失败，ftx 在 start 内被 drop → frx 关闭 → worker 立即退出。
+        let level_cb = if source == Source::Mic { mic_level.take() } else { None };
+        let paused_w = paused.clone();
         let w = std::thread::spawn(move || {
             run_segment_worker(
                 source,
@@ -494,6 +506,8 @@ pub fn start_session(
                 final_tx,
                 slot_for_worker,
                 segmenter,
+                paused_w,
+                level_cb,
             );
         });
         match capture.start(ftx) {
@@ -527,7 +541,7 @@ pub fn start_session(
     });
 
     Ok(SessionStart {
-        handle: RecordingHandle { captures, workers, asr: Some(asr) },
+        handle: RecordingHandle { captures, workers, asr: Some(asr), paused },
         active,
         failed,
     })
@@ -1200,6 +1214,7 @@ mod session_tests {
             move |s, t, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
+            None,
         )
         .expect("start_session");
 
@@ -1241,6 +1256,7 @@ mod session_tests {
             |_, _, _, _, _| {},
             |_, _| {},
             |_| {},
+            None,
         )
         .expect("start_session");
         let (r, _e) = start.handle.stop();
@@ -1269,6 +1285,7 @@ mod session_tests {
             |_, _, _, _, _| {},
             |_, _| {},
             |_| {},
+            None,
         );
         let err = match r {
             Ok(_) => panic!("无源可启动应返回 Err"),

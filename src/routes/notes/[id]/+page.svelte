@@ -12,7 +12,12 @@
     formatDuration,
     speakerLabel,
     speakerColor,
+    speakerIdCompare,
+    editSegment,
+    deleteSegment,
+    setSegmentSpeaker,
     type Note,
+    type SegmentRecord,
   } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
 
@@ -22,15 +27,37 @@
   let editingTitle = $state("");
   let exportMsg = $state("");
 
+  // 段落编辑状态
+  let editingSeq = $state<number | null>(null);
+  let editingText = $state("");
+  let confirmSeq = $state<number | null>(null);
+  let speakerMenuSeq = $state<number | null>(null);
+
   const id = $derived($page.params.id as string);
 
+  /** 展示序：过滤空白段(遗留#1) + 按 start_ms 稳定排序消除 ECHO hold 交错(遗留#2)。 */
+  const displaySegments = $derived(
+    note
+      ? [...note.segments]
+          .filter((s) => s.text.trim())
+          .sort((a, b) => a.start_ms - b.start_ms || a.seq - b.seq)
+      : [],
+  );
+  /** 本笔记正在录制（含暂停）时禁用一切编辑入口（后端另有 guard 兜底）。 */
+  const canEdit = $derived(!(recording.isLive && recording.noteId === id));
+  const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
+
   function durationSecs(n: Note): number | null {
+    // 活跃时长优先：段落时间轴最大 end_ms（与转写时间戳/录制计时一致，不含暂停）；
+    // 无段落回退墙钟时长。
+    if (n.segments.length > 0) {
+      return Math.floor(Math.max(...n.segments.map((s) => s.end_ms)) / 1000);
+    }
     if (n.meta.ended_at && n.meta.started_at) {
       const d = (new Date(n.meta.ended_at).getTime() - new Date(n.meta.started_at).getTime()) / 1000;
       return isNaN(d) ? null : Math.max(0, Math.floor(d));
     }
-    const last = n.segments.at(-1);
-    return last ? Math.floor(last.end_ms / 1000) : null;
+    return null;
   }
 
   async function refresh() {
@@ -42,14 +69,65 @@
     }
   }
 
-  // id 变化（侧栏切换笔记时组件被复用）或笔记改名/删除时重新加载。
+  // id 切换：无条件复位一切编辑态。
+  $effect(() => {
+    void id;
+    editing = false;
+    editingSeq = null;
+    speakerMenuSeq = null;
+    confirmSeq = null;
+  });
+  // 刷新：任何编辑进行中都跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
   $effect(() => {
     void id;
     void recording.notesVersion;
-    editing = false;
+    if (editing || editingSeq !== null || speakerMenuSeq !== null) return;
     exportMsg = "";
     refresh();
   });
+
+  function beginEditSeg(s: SegmentRecord) {
+    editingSeq = s.seq;
+    editingText = s.text;
+    speakerMenuSeq = null;
+    confirmSeq = null;
+  }
+
+  async function commitEditSeg(s: SegmentRecord) {
+    if (editingSeq !== s.seq) return;
+    const text = editingText.trim();
+    editingSeq = null;
+    if (!text || text === s.text) return;
+    try {
+      await editSegment(id, s.seq, s.text, text);
+      await refresh();
+    } catch (e) {
+      error = `编辑失败: ${e}`;
+      await refresh(); // 乐观冲突：重载最新内容
+    }
+  }
+
+  async function doDeleteSeg(s: SegmentRecord) {
+    confirmSeq = null;
+    try {
+      await deleteSegment(id, s.seq, s.text);
+      await refresh();
+    } catch (e) {
+      error = `删除失败: ${e}`;
+      await refresh();
+    }
+  }
+
+  async function doSetSpeaker(s: SegmentRecord, speakerId: string) {
+    speakerMenuSeq = null;
+    try {
+      await setSegmentSpeaker(id, s.seq, s.text, speakerId);
+      await refresh();
+    } catch (e) {
+      error = `修改说话人失败: ${e}`;
+      await refresh();
+    }
+  }
 
   function beginRename() {
     if (!note) return;
@@ -108,7 +186,9 @@
         onblur={commitRename}
       />
     {:else}
-      <h1 class="title" title="点击改名" onclick={beginRename}>{note.meta.title}</h1>
+      <h1 class="title">
+        <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
+      </h1>
     {/if}
 
     <p class="meta">
@@ -128,7 +208,7 @@
     <div class="row">
       <button onclick={() => doExport("md")}>导出 Markdown</button>
       <button onclick={() => doExport("txt")}>导出纯文本</button>
-      <button disabled={recording.isRecording} onclick={doResume}>继续录制</button>
+      <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
       {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
     </div>
 
@@ -143,16 +223,62 @@
     />
 
     <div class="transcript">
-      {#each note.segments as seg (seg.seq)}
-        <p class="final">
-          <span class="badge" style="background: {speakerColor(seg.speaker, seg.source)}">
-            {speakerLabel(seg.speaker, seg.source, note.speakers)}
-          </span>
+      {#each displaySegments as seg (seg.seq)}
+        <div class="seg">
+          {#if canEdit && speakerMenuSeq === seg.seq}
+            <span class="badge-menu">
+              {#each speakerIds as sid (sid)}
+                <button class="menu-item" onclick={() => doSetSpeaker(seg, sid)}>
+                  {speakerLabel(sid, seg.source, note.speakers)}
+                </button>
+              {/each}
+              <button class="menu-item new" onclick={() => doSetSpeaker(seg, "new")}>＋ 新说话人</button>
+              <button class="menu-item" onclick={() => (speakerMenuSeq = null)}>取消</button>
+            </span>
+          {:else}
+            <button
+              class="badge as-btn"
+              style="background: {speakerColor(seg.speaker, seg.source)}"
+              disabled={!canEdit}
+              title={canEdit ? "点击改说话人" : ""}
+              onclick={() => (speakerMenuSeq = seg.seq)}
+            >
+              {speakerLabel(seg.speaker, seg.source, note.speakers)}
+            </button>
+          {/if}
           <span class="ts">{formatTs(seg.start_ms)}</span>
-          {seg.text}
-        </p>
+          {#if editingSeq === seg.seq}
+            <!-- svelte-ignore a11y_autofocus -->
+            <textarea
+              class="seg-edit"
+              autofocus
+              bind:value={editingText}
+              onkeydown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  commitEditSeg(seg);
+                }
+                if (e.key === "Escape") editingSeq = null;
+              }}
+              onblur={() => commitEditSeg(seg)}
+            ></textarea>
+          {:else}
+            <span class="seg-text">{seg.text}</span>
+            {#if canEdit}
+              <span class="seg-actions">
+                <button class="link" onclick={() => beginEditSeg(seg)}>编辑</button>
+                {#if confirmSeq === seg.seq}
+                  <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
+                  <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
+                {:else}
+                  <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
+                {/if}
+              </span>
+            {/if}
+          {/if}
+        </div>
       {/each}
-      {#if note.segments.length === 0}
+      {#if displaySegments.length === 0}
         <p class="hint">（这场会议没有转写内容）</p>
       {/if}
     </div>
@@ -168,6 +294,21 @@
   .title {
     cursor: text;
     margin: 0 0 0.25rem;
+  }
+  .title-btn {
+    background: none;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: text;
+    text-align: left;
+  }
+  .title-btn:focus-visible {
+    outline: 2px solid #396cd8;
+    border-radius: 4px;
   }
   .rename {
     font-size: 1.6em;
@@ -210,6 +351,71 @@
   }
   .transcript p {
     margin: 0 0 0.35rem;
+  }
+  .seg {
+    margin: 0 0 0.35rem;
+    line-height: 1.6;
+  }
+  .badge.as-btn {
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .badge.as-btn:disabled {
+    cursor: default;
+  }
+  .seg-actions {
+    visibility: hidden;
+    margin-left: 0.4em;
+  }
+  .seg:hover .seg-actions {
+    visibility: visible;
+  }
+  .link {
+    background: none;
+    border: none;
+    color: #396cd8;
+    cursor: pointer;
+    padding: 0.1em 0.25em;
+    font-size: 0.8em;
+    box-shadow: none;
+  }
+  .link.danger {
+    color: #c0392b;
+    font-weight: 600;
+  }
+  .seg-edit {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    line-height: 1.5;
+    border-radius: 6px;
+    border: 1px solid #396cd8;
+    padding: 0.3em 0.5em;
+    margin-top: 0.2em;
+    resize: vertical;
+    min-height: 2.4em;
+  }
+  .badge-menu {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.25em;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    padding: 0.2em 0.4em;
+    margin-right: 0.4em;
+  }
+  .menu-item {
+    background: none;
+    border: none;
+    color: #396cd8;
+    cursor: pointer;
+    font-size: 0.8em;
+    padding: 0.15em 0.4em;
+  }
+  .menu-item.new {
+    font-weight: 600;
   }
   .badge {
     display: inline-block;
@@ -268,6 +474,14 @@
     }
     .hint {
       color: #555;
+    }
+    .seg-edit {
+      background: #2a2a2a;
+      color: #f0f0f0;
+    }
+    .badge-menu {
+      background: #2a2a2a;
+      border-color: #555;
     }
   }
 </style>

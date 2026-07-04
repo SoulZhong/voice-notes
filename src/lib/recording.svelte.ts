@@ -6,6 +6,7 @@ import {
   onFinal,
   onStorage,
   onSpeakers,
+  onLevel,
   type Source,
   type SystemAudio,
   type Diarization,
@@ -30,6 +31,12 @@ let statusVersion = $state(0);
 /** 笔记改名/删除后 +1，供侧栏与详情页跨组件同步刷新。 */
 let notesVersion = $state(0);
 let pending = $state(false);
+let paused = $state(false);
+/** 计时基线（后端 elapsed_ms 快照）+ 本地锚点（recording 态才走表）。 */
+let elapsedBaseMs = $state(0);
+let tickAnchor = $state<number | null>(null);
+let nowTick = $state(Date.now());
+let level = $state(0);
 
 let initialized = false;
 /** 续录一次性标志：置位期间 "recording" 事件不清 finals/speakers（已由 resume() 灌注历史）。 */
@@ -53,9 +60,25 @@ export const recording = {
   get notesVersion() { return notesVersion; },
   get pending() { return pending; },
   get isRecording() { return status === "recording"; },
+  get paused() { return paused; },
+  get isLive() { return status === "recording" || status === "paused"; },
+  get level() { return level; },
+  /** 活跃录制毫秒：后端快照 + 本地走表（暂停/停止时不走）。 */
+  get elapsedMs() { return elapsedBaseMs + (tickAnchor !== null ? nowTick - tickAnchor : 0); },
 
   /** 笔记改名/删除后调用，驱动侧栏与详情页统一刷新。 */
   bumpNotes() { notesVersion++; },
+
+  async pause() {
+    if (pending || status !== "recording") return;
+    pending = true;
+    try { await invoke("pause_recording"); } finally { pending = false; }
+  },
+  async unpause() {
+    if (pending || status !== "paused") return;
+    pending = true;
+    try { await invoke("unpause_recording"); } finally { pending = false; }
+  },
 
   /** 幂等：注册事件监听 + 用 recording_status 重建冷启动状态。 */
   async init() {
@@ -73,13 +96,18 @@ export const recording = {
       else partialSystem = "";
     });
     onStatus((e) => {
-      status = e.state;
-      systemAudio = e.system_audio;
-      diarization = e.diarization;
       if (e.state === "recording") {
+        // 同一笔记且此前已是 live（暂停恢复/重复对账）：只更新计时与暂停位，不清屏。
+        const isUnpause = e.note_id === noteId && (status === "recording" || status === "paused");
+        status = e.state;
+        systemAudio = e.system_audio;
+        diarization = e.diarization;
+        paused = false;
+        elapsedBaseMs = e.elapsed_ms;
+        tickAnchor = Date.now();
+        if (isUnpause) return;
         noteId = e.note_id;
         if (resuming) {
-          // 续录：finals/speakers 已由 resume() 灌注历史段，此处只清瞬时状态。
           resuming = false;
           partialMic = "";
           partialSystem = "";
@@ -93,8 +121,22 @@ export const recording = {
           speakers = {};
           statusVersion++;
         }
+      } else if (e.state === "paused") {
+        status = "paused";
+        paused = true;
+        elapsedBaseMs = e.elapsed_ms;
+        tickAnchor = null;
+        partialMic = "";
+        partialSystem = "";
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
-        resuming = false; // 续录发起后异步失败，复位一次性标志
+        status = e.state;
+        systemAudio = e.system_audio;
+        diarization = e.diarization;
+        resuming = false;
+        paused = false;
+        elapsedBaseMs = 0;
+        tickAnchor = null;
+        level = 0;
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
@@ -102,8 +144,16 @@ export const recording = {
         if (e.state === "stopped" && e.note_id) {
           goto(`/notes/${e.note_id}`);
         }
+      } else {
+        status = e.state;
       }
     });
+    onLevel((e) => {
+      level = e.rms;
+    });
+    setInterval(() => {
+      nowTick = Date.now();
+    }, 1000);
     onStorage((e) => {
       storageDegraded = e.state === "degraded";
     });
@@ -120,11 +170,15 @@ export const recording = {
 
     // 事件非粘性：冷启动/刷新时主动查询一次。返回 idle 不覆盖，避免与真实事件竞争。
     const s = await invoke<StatusEvent>("recording_status");
-    if (s.state === "recording") {
+    if (s.state === "recording" || s.state === "paused") {
       status = s.state;
       systemAudio = s.system_audio;
       diarization = s.diarization;
       noteId = s.note_id;
+      paused = s.state === "paused";
+      elapsedBaseMs = s.elapsed_ms;
+      tickAnchor = s.state === "recording" ? Date.now() : null;
+      await hydrateFromDisk(s.note_id);
     }
   },
 
@@ -133,7 +187,7 @@ export const recording = {
    * 返回是否已发起（供调用方决定是否跳转）。
    */
   async start(): Promise<boolean> {
-    if (pending || status === "recording") return false;
+    if (pending || this.isLive) return false;
     pending = true;
     try {
       await invoke("start_recording");
@@ -142,11 +196,15 @@ export const recording = {
       // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
       if (String(err).includes("已在录制")) {
         const s = await invoke<StatusEvent>("recording_status");
-        if (s.state === "recording") {
+        if (s.state === "recording" || s.state === "paused") {
           status = s.state;
           systemAudio = s.system_audio;
           diarization = s.diarization;
           noteId = s.note_id;
+          paused = s.state === "paused";
+          elapsedBaseMs = s.elapsed_ms;
+          tickAnchor = s.state === "recording" ? Date.now() : null;
+          await hydrateFromDisk(s.note_id);
         }
         return false;
       }
@@ -162,7 +220,7 @@ export const recording = {
    * 返回是否已发起（供调用方决定是否跳转到 /record）。
    */
   async resume(noteId_: string): Promise<boolean> {
-    if (pending || status === "recording") return false;
+    if (pending || this.isLive) return false;
     pending = true;
     try {
       // getNote 失败：不灌注、不置 resuming，原样冒泡为 error 状态。
@@ -184,11 +242,15 @@ export const recording = {
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
         if (String(err).includes("已在录制")) {
           const s = await invoke<StatusEvent>("recording_status");
-          if (s.state === "recording") {
+          if (s.state === "recording" || s.state === "paused") {
             status = s.state;
             systemAudio = s.system_audio;
             diarization = s.diarization;
             noteId = s.note_id;
+            paused = s.state === "paused";
+            elapsedBaseMs = s.elapsed_ms;
+            tickAnchor = s.state === "recording" ? Date.now() : null;
+            await hydrateFromDisk(s.note_id);
           }
           return false;
         }
@@ -217,3 +279,17 @@ export const recording = {
     }
   },
 };
+
+/** 冷刷新/对账时用磁盘内容回灌 finals+speakers（录制中笔记边录边落盘，直接可读）。 */
+async function hydrateFromDisk(id: string) {
+  if (!id) return;
+  try {
+    const note = await getNote(id);
+    finals = note.segments
+      .filter((s) => s.text.trim())
+      .map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
+    speakers = { ...note.speakers };
+  } catch {
+    // 水合失败仅影响历史段回显，不阻塞录制状态重建。
+  }
+}

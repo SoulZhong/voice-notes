@@ -520,6 +520,7 @@ mod tests {
             },
             |_, _| {},
             |_| {},
+            None,
         )
         .expect("start_session");
         let _ = start.handle.stop(); // MockCapture 已灌完帧；stop 排干全部 finals
@@ -890,6 +891,7 @@ mod tests {
             },
             |_, _| {},
             |_| {},
+            None,
         )
         .expect("start_session");
         let _ = start.handle.stop();
@@ -921,6 +923,7 @@ mod tests {
             },
             |_, _| {},
             |_| {},
+            None,
         )
         .expect("start_session (resumed)");
         let _ = start2.handle.stop();

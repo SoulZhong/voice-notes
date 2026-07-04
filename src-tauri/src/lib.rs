@@ -2,10 +2,13 @@ mod audio;
 pub mod pipeline;
 pub mod asr;
 mod ipc;
+pub mod models;
 mod session;
+mod settings;
 mod store;
 pub mod diar;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -27,6 +30,20 @@ use session::RecordingHandle;
 // stop/start/resume 抢先淘汰的过期加载，直接静默让路，避免已被覆盖或已被终止的
 // 会话把自己的（过期的）结果错误地写回全局状态。
 
+/// 活跃时长 = 总 wall 时长 - 已累计暂停 - 当前暂停中时长，再加续录基线 base_ms。
+/// checked_sub 兜底：时钟异常倒挂时饱和为 0 而非 panic。
+fn active_elapsed_ms(
+    total: std::time::Duration,
+    paused_accum: std::time::Duration,
+    current_pause: Option<std::time::Duration>,
+    base_ms: u64,
+) -> u64 {
+    let active = total
+        .checked_sub(paused_accum + current_pause.unwrap_or_default())
+        .unwrap_or_default();
+    base_ms + active.as_millis() as u64
+}
+
 /// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
 struct ActiveSession {
     handle: RecordingHandle,
@@ -36,6 +53,22 @@ struct ActiveSession {
     system_audio: String,
     /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
     diarization: String,
+    /// 计时：会话入槽时刻、续录基线、暂停起点（Some=暂停中）、已累计暂停时长。
+    started: std::time::Instant,
+    base_ms: u64,
+    paused_at: Option<std::time::Instant>,
+    paused_accum: std::time::Duration,
+}
+
+impl ActiveSession {
+    fn elapsed_ms(&self) -> u64 {
+        active_elapsed_ms(
+            self.started.elapsed(),
+            self.paused_accum,
+            self.paused_at.map(|p| p.elapsed()),
+            self.base_ms,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -48,10 +81,9 @@ struct AppState {
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
-}
-
-fn models_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
+    /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
+    download_running: Arc<AtomicBool>,
+    download_cancel: Arc<AtomicBool>,
 }
 
 /// notes 根目录（不存在则创建）。
@@ -90,11 +122,11 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
 }
 
 fn sense_voice_dir() -> PathBuf {
-    models_dir().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+    models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
 
 fn speaker_model_path() -> PathBuf {
-    models_dir().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
+    models::root().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -162,7 +194,7 @@ fn spawn_session(
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new() });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -182,7 +214,7 @@ fn spawn_session(
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
         // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
-        let vad_path = models_dir().join("silero_vad.onnx");
+        let vad_path = models::root().join("silero_vad.onnx");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
             Err(e) => {
@@ -344,6 +376,12 @@ fn spawn_session(
                     writer_d.lock().unwrap().store_centroids(&snaps);
                 }
             },
+            {
+                let app_l = app.clone();
+                Some(Box::new(move |rms: f32| {
+                    let _ = app_l.emit("level", ipc::LevelEvent { rms });
+                }) as Box<dyn Fn(f32) + Send>)
+            },
         );
 
         match start {
@@ -395,11 +433,15 @@ fn spawn_session(
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
+                    started: std::time::Instant::now(),
+                    base_ms,
+                    paused_at: None,
+                    paused_accum: std::time::Duration::ZERO,
                 });
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
             }
             Err(se) => {
@@ -416,6 +458,9 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if !models::recording_ready() {
+        return Err("模型缺失：请先在录制页下载模型".into());
+    }
     spawn_session(
         app,
         state.running.clone(),
@@ -431,6 +476,9 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    if !models::recording_ready() {
+        return Err("模型缺失：请先在录制页下载模型".into());
+    }
     spawn_session(
         app,
         state.running.clone(),
@@ -468,7 +516,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
     }
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new() },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
 }
 
@@ -477,18 +525,62 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
 fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
     match state.session.lock().unwrap().as_ref() {
         Some(s) => ipc::StatusEvent {
-            state: "recording".into(),
+            state: if s.paused_at.is_some() { "paused".into() } else { "recording".into() },
             system_audio: s.system_audio.clone(),
             note_id: s.note_id.clone(),
             diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
         },
         None => ipc::StatusEvent {
             state: "idle".into(),
             system_audio: String::new(),
             note_id: String::new(),
             diarization: String::new(),
+            elapsed_ms: 0,
         },
     }
+}
+
+#[tauri::command]
+fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let ev = {
+        let mut slot = state.session.lock().unwrap();
+        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        if s.paused_at.is_some() {
+            return Ok(()); // 已暂停：幂等
+        }
+        s.handle.set_paused(true);
+        s.paused_at = Some(std::time::Instant::now());
+        ipc::StatusEvent {
+            state: "paused".into(),
+            system_audio: s.system_audio.clone(),
+            note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
+        }
+    };
+    let _ = app.emit("status", ev);
+    Ok(())
+}
+
+#[tauri::command]
+fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let ev = {
+        let mut slot = state.session.lock().unwrap();
+        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(p) = s.paused_at.take() else { return Ok(()) }; // 未暂停：幂等
+        s.paused_accum += p.elapsed();
+        s.handle.set_paused(false);
+        ipc::StatusEvent {
+            state: "recording".into(),
+            system_audio: s.system_audio.clone(),
+            note_id: s.note_id.clone(),
+            diarization: s.diarization.clone(),
+            elapsed_ms: s.elapsed_ms(),
+        }
+    };
+    let _ = app.emit("status", ev);
+    Ok(())
 }
 
 #[tauri::command]
@@ -578,6 +670,61 @@ fn rename_speaker(
         .map_err(|e| e.to_string())
 }
 
+/// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
+fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String> {
+    if state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false) {
+        return Err("录制中的笔记不能编辑".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn edit_segment(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+    new_text: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .edit_segment_text(&note_id, seq, &expected_text, &new_text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_segment(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .delete_segment(&note_id, seq, &expected_text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_segment_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seq: u64,
+    expected_text: String,
+    speaker_id: String,
+) -> Result<String, String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .set_segment_speaker(&note_id, seq, &expected_text, &speaker_id)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn export_note(app: AppHandle, id: String, format: String) -> Result<String, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
@@ -587,38 +734,124 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
         .map_err(|e| e.to_string())
 }
 
+/// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
+/// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
+/// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
+fn preload_models(
+    cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+) {
+    std::thread::spawn(move || {
+        let mut slot = cache.lock().unwrap();
+        if slot.is_none() {
+            match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
+                Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
+                Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
+            }
+        }
+        let mut eslot = embedder_cache.lock().unwrap();
+        if eslot.is_none() {
+            match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+                Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
+            }
+        }
+        drop(eslot);
+        drop(slot);
+    });
+}
+
+#[tauri::command]
+fn models_status() -> models::ModelsStatus {
+    models::status()
+}
+
+#[tauri::command]
+fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if state.download_running.swap(true, Ordering::SeqCst) {
+        return Err("下载已在进行中".into());
+    }
+    state.download_cancel.store(false, Ordering::SeqCst);
+    let running = state.download_running.clone();
+    let cancel = state.download_cancel.clone();
+    let recognizer_cache = state.recognizer_cache.clone();
+    let embedder_cache = state.embedder_cache.clone();
+    std::thread::spawn(move || {
+        let root = models::root();
+        models::download::sweep_tmp(&root);
+        let s = app
+            .path()
+            .app_data_dir()
+            .map(|d| settings::load(&d))
+            .unwrap_or_default();
+        let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
+            let _ = app.emit(
+                "model_download",
+                ipc::ModelDownloadEvent {
+                    artifact: id.into(),
+                    phase: phase.into(),
+                    received_bytes: received,
+                    total_bytes: total,
+                    message: message.into(),
+                },
+            );
+        };
+        let mut all_ok = true;
+        for a in models::ARTIFACTS {
+            if models::artifact_present(&root, a) {
+                continue;
+            }
+            let url = models::download::apply_mirror(a.url, s.mirror_enabled, &s.mirror_prefix);
+            if let Err(e) = models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+                all_ok = false;
+                let msg = e.to_string();
+                let phase = if msg == "cancelled" { "cancelled" } else { "error" };
+                emit(a.id, phase, 0, 0, &msg);
+                break;
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+        if all_ok {
+            emit("all", "done", 0, 0, "");
+            // 补齐后立即预载，无需重启即可开录。
+            preload_models(recognizer_cache, embedder_cache);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_models_download(state: State<AppState>) {
+    state.download_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
+    app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_settings(app: AppHandle, new_settings: settings::Settings) -> Result<(), String> {
+    let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    settings::save(&d, &new_settings).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
-            // 启动预载识别器：持锁加载，开录若赶上预载会在锁上等待至就绪。
+            // 生产模型根目录注入（VN_MODELS / dev 目录优先级更高，见 models::root）。
+            if let Ok(dir) = app.path().app_data_dir() {
+                let models_dir = dir.join("models");
+                let _ = std::fs::create_dir_all(&models_dir);
+                models::init_app_root(models_dir);
+            }
+            models::download::sweep_tmp(&models::root());
             let cache = app.state::<AppState>().recognizer_cache.clone();
             let embedder_cache = app.state::<AppState>().embedder_cache.clone();
-            std::thread::spawn(move || {
-                let mut slot = cache.lock().unwrap();
-                if slot.is_none() {
-                    match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                        Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
-                        Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
-                    }
-                }
-                // 锁序：预载是唯一嵌套持两槽者——在仍持 recognizer 槽锁期间嵌套获取
-                // embedder 槽锁，消除释放 recognizer 锁到锁定 embedder 锁之间的间隙
-                // （否则开录线程可在间隙 take 到尚空的 embedder，静默无声纹）。开录
-                // 线程从不同时持两槽（先 take recognizer 后 take embedder，各自即刻释放），
-                // 故无死锁。
-                let mut eslot = embedder_cache.lock().unwrap();
-                if eslot.is_none() {
-                    match diar::SherpaEmbedder::new(&speaker_model_path()) {
-                        Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
-                        Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
-                    }
-                }
-                drop(eslot);
-                drop(slot);
-            });
+            preload_models(cache, embedder_cache);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -626,13 +859,39 @@ pub fn run() {
             resume_recording,
             stop_recording,
             recording_status,
+            pause_recording,
+            unpause_recording,
             list_notes,
             get_note,
             rename_note,
             delete_note,
             export_note,
-            rename_speaker
+            rename_speaker,
+            edit_segment,
+            delete_segment,
+            set_segment_speaker,
+            models_status,
+            download_models,
+            cancel_models_download,
+            get_settings,
+            set_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_elapsed_ms;
+    use std::time::Duration;
+
+    #[test]
+    fn active_elapsed_subtracts_pauses_and_adds_base() {
+        let s = Duration::from_secs;
+        assert_eq!(active_elapsed_ms(s(10), s(0), None, 0), 10_000, "无暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(3), None, 0), 7_000, "扣已累计暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
+        assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
+        assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
 }

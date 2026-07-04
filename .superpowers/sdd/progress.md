@@ -213,3 +213,38 @@ Base: d12c665
 - P4.5 终审 (fable): With fixes → 修复 commit 7dc996f(Important: registry_snapshot 空质心项计编号防张冠李戴; Minor: 占位段不参与去重/resume 回滚补 noteId/注释/TS 类型)→ 复审 (sonnet): Ready to merge YES
 - P4.5 后续项(不阻塞): 已在录制对账分支不回灌真实会话 finals; 详情页可按 start_ms 稳定排序消除 hold 交错; ECHO 三常量二轮校准
 - P4/P4.5 人工冒烟: 用户确认测试通过 (2026-07-04) 
+
+## P5 — v1 收尾 (branch p5-v1-polish)
+Plan: docs/superpowers/plans/2026-07-04-voice-notes-p5-v1-polish.md
+Base: 2ffb6c3
+- Task 0: complete (分支已建, 基线绿: cargo 81 passed / npm check 0 errors 2 已知 a11y warnings)
+- Task 1: complete (commits 2ffb6c3..1eb33ee, review clean, Approved by sonnet, spec ✅; 四钉死真值逐字节核对一致, models_dir 零残留, 双入口 guard 在) — models 模块+lib.rs 收敛
+  - Minors(→终审 triage): status()/recording_ready() 无直接单测(仅积木有); guard 两入口重复(brief 规定); embedder_it.rs 首行 VN_MODELS 注释是 pre-existing 陈旧文档(代码未读该 env)
+- Task 2: complete (commits 1eb33ee..8c39435 + 修复 d54e2da, 1 fix round: extract_and_install 换位安装(备份/回滚)堵 rename 失败毁旧安装窗口, re-review Approved) — 下载器纯逻辑, 6 单测(fixture tar.bz2 现造)
+  - Minors(→终审 triage): 回滚分支本身无单测(rename 失败不可移植模拟, 走查核验); d54e2da 把 sdd 文档变更一并提交(squash 后无碍); 报告行数统计两次不准(cosmetic)
+- Task 3: complete (commits d54e2da..5d69c87 + 修复 d8300ab/41a1d98, opus review Approved; 偏差: emit 闭包加 move(brief 代码不编译)) — 下载引擎+settings+4 commands
+  - 修复链: 审查 Minor「416 满尺寸 .part 永久卡死」→ 首修放 status 分支是死代码(ureq 4xx 走 Err(Status), 控制器自查发现) → 二修挪到 call() 错误分支, 已核 diff
+  - Minors(→终审 triage): Content-Length 缺失时 total=offset, UI 可能 >100%(cosmetic); 网络路径无自动化(设计如此, 冒烟覆盖)
+- Task 4: complete (commits 41a1d98..bb18638, review Approved by sonnet, spec ✅; set_settings camelCase 映射已核) — 前端下载卡片+录制页集成
+  - Minors(→终审 triage, 均 plan-inherent): 下载中离开再回录制页按钮态短暂不一致(点击经「已在进行中」自愈); cancel/toggleMirror invoke 无 catch(失败仅 console); compact 卡片带进度条时的视觉待冒烟目检
+- Task 5: complete (commits bb18638..45b4f03, opus review Approved; 两次 API 过载中断经 SendMessage 续跑完成; 门控测试实锤 sherpa flush 中途不重置时间轴; 正当偏差: writer.rs 3 处测试调用点补 None) — 暂停闸+电平回调
+  - Minors(→终审 triage): set_paused 暂时 dead-code warning(T6 接线即消, 届时核实清零); 超大帧(>1600 样本)电平只回调一次无余数结转(cosmetic)
+- Task 6: complete (commits 45b4f03..ae55453, opus review Approved; 7 处 StatusEvent 构造点全补 elapsed_ms(grep 核), 锁外 emit/幂等/饱和防倒挂全核; T5 dead-code warning 清零(控制器实测 build 仅剩 2 条既有)) — pause/unpause commands+计时+level 事件
+- Task 7: complete (commits ae55453..2ab1722, opus review Approved; 七条状态迁移(fresh/resume/pause-unpause/stop-paused/冷刷新x2/双击对账)走查全过, unpause 守卫与 resuming 预灌注不碰撞) — 录制控制条+计时+电平+水合(遗留#7 清)
+  - Minors(→终审 triage): isRecording getter 迁移后零消费者(留作 API); record 页重复 import notes 一行(brief 原样); 水合与在途 final 竞态为计划已接受
+- Task 8: complete (commits 2ab1722..89b48f6, opus review Approved; serde 回写保真(speaker:null 往返对称)/delete 双查借用/崩溃窗口顺序(先 speakers 后段)全核) — 段落编辑原语+3 commands
+  - Minors(→终审 triage): set_segment_speaker 两次 find_seg 重扫(正确仅低效); write_jsonl_atomic 失败留 .tmp(沿既有惯例); reject_if_active 检查与写盘间理论竞态(与 rename_note 同模式)
+- Task 9: complete (commits 89b48f6..8c5624c, opus review Approved; 双 $effect 无环证明+三场景走查(改名中编辑保留/id 切换复位/Esc-blur 不双发)全过) — 详情页编辑 UI+遗留#1/#2/#6
+  - Minors(→终审 triage): 编辑提交成功路径双 refresh(effect 重跑+显式, 双 getNote 无害); confirmSeq 刻意不在刷新守卫内(brief 规定); speakerMenu/confirm 在途窗口(transient)
+- Task 10: complete (commits 8c5624c..276cf79 + 修复 6667948, review Approved + 1 fix round: h1 role="button" 吞标题语义(审查者点出) → 改 h1 内嵌真 button, npm check 0 errors 0 warnings(基线 2 条清零)) — 遗留#3/#4/#5+全量验证
+  - 全量验证: cargo test 99 passed / --ignored 7 passed(真模型) / check 0-0 / build OK
+  - Minor: speakerColor 修复顺带覆盖 S0 边界(严格超集); h1 单行变多行空白(Svelte 折叠, 冒烟目检)
+- 全部 10 任务实现+任务级审查完成, 待全分支终审
+- P5 终审 (fable, 全分支): With fixes → 修复 commit 05d6dfd(Important: 时长统一为段落时间轴活跃时长(暂停不计), last_end_ms→max_end_ms 防跨源交错; Minor: start/resume 对账分支补 paused 态)→ 复审 (opus): Ready to merge YES
+- 终审 Minors 全部判 defer-OK; 后续项(不阻塞, 记入 backlog): speakers.json 非活动写者(rename_speaker vs set_segment_speaker)加每笔记锁; export 复用详情页 filter+sort 语义; download_running 加 drop-guard 防线程 panic 卡死; 下载中 preload 双载瞬时 2x 内存; 解压阶段取消不即时; 大小卡片切换重建组件态
+- P5 自动化终值: cargo test 100 passed + 7 ignored(真模型)全过, npm check 0 errors 0 warnings(基线 2 条清零), build OK
+- 待人工冒烟(计划 Task 10 Step 6 六项 + 终审追加): 7) 断网中途→error 可读+重试续传不清零, 镜像无效前缀→错误可理解; 8) 手工造满尺寸 .part→416 路径自愈; 9) 长暂停(≥5min)恢复→VPIO/AEC/系统声音路仍活; 10) 录制中补下声纹→本场降级不变, 停止再开录 diarization=on 无重启; 11) 编辑已中断笔记(删末段/新建说话人)后续录→seq 接续+编号不撞; 12) 冷刷新暂停态→计时冻结正确, 恢复/停止可用
+
+## P5 收尾:已推送 origin/p5-v1-polish + 开 PR #5
+- https://github.com/SoulZhong/voice-notes/pull/5 (base: master)
+- 分支保留,未合并。合并前必须先过人工冒烟(PR 描述里 12 项)。
