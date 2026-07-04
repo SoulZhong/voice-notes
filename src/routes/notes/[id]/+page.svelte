@@ -262,19 +262,30 @@
               }}
               onblur={() => commitEditSeg(seg)}
             ></textarea>
+          {:else if canEdit}
+            <!-- 文字本身即编辑入口：span+role 保持行内排版（button 是原子行内盒,长文无法跨行断行） -->
+            <span
+              class="seg-text editable"
+              role="button"
+              tabindex="0"
+              title="点击编辑"
+              onclick={() => beginEditSeg(seg)}
+              onkeydown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  beginEditSeg(seg);
+                }
+              }}>{seg.text}</span>
+            <span class="seg-actions">
+              {#if confirmSeq === seg.seq}
+                <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
+                <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
+              {:else}
+                <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
+              {/if}
+            </span>
           {:else}
             <span class="seg-text">{seg.text}</span>
-            {#if canEdit}
-              <span class="seg-actions">
-                <button class="link" onclick={() => beginEditSeg(seg)}>编辑</button>
-                {#if confirmSeq === seg.seq}
-                  <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
-                  <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
-                {:else}
-                  <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
-                {/if}
-              </span>
-            {/if}
           {/if}
         </div>
       {/each}
@@ -289,9 +300,6 @@
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;
-    /* 可读列宽上限 + 居中：大窗口下空白左右均分，不再整片堆在右侧 */
-    max-width: 56rem;
-    margin: 0 auto;
   }
   .title {
     cursor: text;
@@ -365,6 +373,16 @@
   }
   .badge.as-btn:disabled {
     cursor: default;
+  }
+  .seg-text.editable {
+    cursor: text;
+    border-radius: 4px;
+  }
+  .seg-text.editable:hover {
+    background: rgba(57, 108, 216, 0.08);
+  }
+  .seg-text.editable:focus-visible {
+    outline: 2px solid #396cd8;
   }
   .seg-actions {
     visibility: hidden;
