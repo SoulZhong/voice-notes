@@ -40,10 +40,10 @@
 <div class="container">
   <h1>实时转写</h1>
 
-  {#if models && !models.recording_ready}
-    <ModelDownloadCard status={models} onComplete={refreshModels} />
-  {:else if models && !models.diarization_ready}
-    <ModelDownloadCard status={models} compact onComplete={refreshModels} />
+  <!-- 单实例:compact 由 recording_ready 驱动。若拆成两个 if 分支,识别模型下完
+       切小提示条时组件会销毁重建,进行中的下载进度/订阅状态全部清零。 -->
+  {#if models && !(models.recording_ready && models.diarization_ready)}
+    <ModelDownloadCard status={models} compact={models.recording_ready} onComplete={refreshModels} />
   {/if}
 
   {#if !models || models.recording_ready}
