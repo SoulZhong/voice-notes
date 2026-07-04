@@ -97,3 +97,20 @@ export function formatDate(rfc3339: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+export const editSegment = (noteId: string, seq: number, expectedText: string, newText: string) =>
+  invoke<void>("edit_segment", { noteId, seq, expectedText, newText });
+export const deleteSegment = (noteId: string, seq: number, expectedText: string) =>
+  invoke<void>("delete_segment", { noteId, seq, expectedText });
+/** 返回实际生效的 speaker id（speakerId="new" 时为后端分配的新 id） */
+export const setSegmentSpeaker = (noteId: string, seq: number, expectedText: string, speakerId: string) =>
+  invoke<string>("set_segment_speaker", { noteId, seq, expectedText, speakerId });
+
+/** 说话人 id 排序：S2 < S10（数值序）；非 S<n> 形态沉底按字典序。 */
+export function speakerIdCompare(a: string, b: string): number {
+  const num = (id: string) => {
+    const n = parseInt(id.replace(/^S/, ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : Number.MAX_SAFE_INTEGER;
+  };
+  return num(a) - num(b) || a.localeCompare(b);
+}
