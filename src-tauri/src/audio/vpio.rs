@@ -175,6 +175,20 @@ fn start_vpio(sink: Sender<AudioFrame>) -> anyhow::Result<Sender<()>> {
     }
 }
 
+/// SDK 常量 kAUVoiceIOProperty_OtherAudioDuckingConfiguration(macOS 14+,
+/// coreaudio-sys 绑定未包含,按 AudioUnitProperties.h 本地定义)。
+const AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION: u32 = 2108;
+/// kAUVoiceIOOtherAudioDuckingLevelMin(default=0/min=10/mid=20/max=30)。
+const AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN: u32 = 10;
+
+/// AUVoiceIOOtherAudioDuckingConfiguration 的 C 布局镜像:
+/// { Boolean(u8) mEnableAdvancedDucking; AUVoiceIOOtherAudioDuckingLevel(u32) mDuckingLevel }。
+#[repr(C)]
+struct AuVoiceIoOtherAudioDuckingConfiguration {
+    enable_advanced_ducking: u8,
+    ducking_level: u32,
+}
+
 /// 创建并启动 VPIO 单元。全部 OSStatus 逐一检查；任一步失败都会释放已分配资源后返回 Err。
 ///
 /// # Safety
@@ -324,6 +338,27 @@ unsafe fn build_vpio_unit(sink: Sender<AudioFrame>) -> Result<VpioHandle, String
             Some(ctx),
             format!("注册输入回调失败: OSStatus={st}"),
         ));
+    }
+
+    // 5.5) 其它 app 播放的自动压低(ducking)调到最小档。VPIO 启用后 macOS 进入
+    //      "通话模式"大幅压低全系统外放;本应用的对方声音走 ScreenCaptureKit 数字
+    //      直采(不经扬声器),压外放只伤听感不帮转写质量,故调最小。属性为
+    //      macOS 14+(kAUVoiceIOProperty_OtherAudioDuckingConfiguration),
+    //      旧系统不识别:非致命,打日志沿用系统默认。
+    let duck = AuVoiceIoOtherAudioDuckingConfiguration {
+        enable_advanced_ducking: 0, // 静态压低(不随语音活动动态调),行为可预期
+        ducking_level: AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN,
+    };
+    let st = AudioUnitSetProperty(
+        unit,
+        AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION,
+        kAudioUnitScope_Global,
+        0,
+        &duck as *const _ as *const c_void,
+        std::mem::size_of::<AuVoiceIoOtherAudioDuckingConfiguration>() as u32,
+    );
+    if st != 0 {
+        eprintln!("VPIO ducking 最小档设置失败(OSStatus={st}),沿用系统默认压低");
     }
 
     // 6) 初始化并启动。
