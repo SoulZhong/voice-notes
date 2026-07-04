@@ -177,9 +177,19 @@ impl SpeakerRegistry {
             'outer: for i in 0..self.clusters.len() {
                 for j in (i + 1)..self.clusters.len() {
                     let (a, b) = (&self.clusters[i], &self.clusters[j]);
-                    // 不同 person 的簇禁止自动互并:"库里两人实为一人"只能由用户在管理页显式合并。
-                    let conflict = matches!((&a.person, &b.person), (Some(x), Some(y)) if x != y);
-                    if !conflict && dot(&a.centroid, &b.centroid) >= MERGE_THRESHOLD {
+                    // 合并门槛按配对身份分档:
+                    // - 不同 person 禁止自动互并("库里两人实为一人"只能用户在管理页显式合并);
+                    // - 无主簇 ↔ 有主簇(或同 person 双簇)用归簇同款 SEED_ASSIGN_THRESHOLD:
+                    //   开场短段声纹噪声大、够不着种子门槛时会另立无主簇,若其质心本可归簇
+                    //   命中种子(≥0.68),就该并回去——否则卡在 [0.68, 0.74) 死区裂人
+                    //   (冒烟实锤:同人双簇余弦 0.711 永远等不到 0.74);
+                    // - 无主 ↔ 无主维持 MERGE_THRESHOLD(0.74 为首轮真实会议校准,防过度合并)。
+                    let pair_threshold = match (&a.person, &b.person) {
+                        (Some(x), Some(y)) if x != y => continue,
+                        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => SEED_ASSIGN_THRESHOLD,
+                        (None, None) => MERGE_THRESHOLD,
+                    };
+                    if dot(&a.centroid, &b.centroid) >= pair_threshold {
                         found = Some((i, j));
                         break 'outer;
                     }
@@ -530,6 +540,54 @@ mod tests {
         plain.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let id2 = plain.assign(&probe, "mic", LONG).unwrap();
         assert_eq!(plain.speakers().len(), 1, "0.65 ≥ 0.62,普通簇应命中: {id2}");
+    }
+
+    #[test]
+    fn unowned_cluster_in_dead_zone_merges_into_seed_at_assign_threshold() {
+        // 冒烟实锤场景:开场短段够不着种子 0.68 另立无主簇,漂到与种子余弦 0.711——
+        // 落在 [SEED_ASSIGN, MERGE) 死区,旧逻辑永不合并,同一人被裂成两个。
+        let snap = ClusterSnapshot {
+            id: "S9".into(),
+            centroid: v(0.71, 0.70413, 0.0), // 与 e1 余弦 ≈ 0.710
+            count: 2,
+            sources: BTreeSet::from(["system".to_string()]),
+            person: None,
+            total_ms: 3000,
+        };
+        let seeds = vec![SeedCluster {
+            person: "P1".into(),
+            name: "甲".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 10,
+        }];
+        let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
+        assert_eq!(r.take_merges().len(), 1, "无主↔有主在 0.71 应按归簇同款阈值合并");
+        let s = r.speakers();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].person.as_deref(), Some("P1"), "种子 count 大为 winner,person 保留");
+
+        // 对照:无主↔无主同样 0.71 不并——0.74 门槛(首轮真实会议校准)不受影响。
+        let snaps2 = [
+            ClusterSnapshot {
+                id: "S1".into(),
+                centroid: v(1.0, 0.0, 0.0),
+                count: 2,
+                sources: BTreeSet::from(["mic".to_string()]),
+                person: None,
+                total_ms: 0,
+            },
+            ClusterSnapshot {
+                id: "S2".into(),
+                centroid: v(0.71, 0.70413, 0.0),
+                count: 2,
+                sources: BTreeSet::from(["mic".to_string()]),
+                person: None,
+                total_ms: 0,
+            },
+        ];
+        let mut r2 = SpeakerRegistry::with_seeds(&snaps2, &[]);
+        assert!(r2.take_merges().is_empty(), "无主↔无主 0.71 < 0.74 不得合并");
+        assert_eq!(r2.speakers().len(), 2);
     }
 
     #[test]
