@@ -120,6 +120,9 @@ const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
 /// 幻觉段。SenseVoice 短段常把 AEC 残渣误判成日语;此类段漏过文本回声去重(残渣文
 /// 本与 system 段不相似)且会开出垃圾说话人,须在处理链之前整段丢弃。
 /// 纯汉字的日语幻觉读作中文,不拦(无损);占位段/空串占比为 0,天然放行。
+/// 占比兜底对模型标为 zh 的段同样生效(未提前用标签放行),系有意为之:混杂幻觉
+/// (如假名混中文)模型常仍标 zh,标签本身不可靠;误杀面(中文夹整句日语引用)
+/// 待 rms/误杀数据复盘时与阈值一并校准。
 fn is_foreign_final(lang: &str, text: &str) -> bool {
     let tag: String = lang
         .trim_matches(|c: char| c == '<' || c == '|' || c == '>')
@@ -321,6 +324,9 @@ pub fn run_asr_worker(
                         job.source,
                         text_prefix20(&text)
                     );
+                    // 被丢段无 final 接替，前端只在收到 final 时清 partial 预览，
+                    // 幻觉文本会残留成 UI 残影；主动推空 partial 顶掉它。
+                    on_partial(job.source, String::new());
                     continue;
                 }
                 let seg_rms = rms_of(&job.samples);
@@ -333,6 +339,10 @@ pub fn run_asr_worker(
                         // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
                         // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
                         // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
+                        // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 是
+                        // 外层 FnMut，闭包已捕获 job/sys_norm）；改用局部 flag，retain
+                        // 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
+                        let mut dropped_mic = false;
                         pending_mic.retain(|p| {
                             if p.text == "[识别失败]" {
                                 return true;
@@ -345,9 +355,13 @@ pub fn run_asr_worker(
                                     text_prefix20(&p.text),
                                     text_prefix20(&text)
                                 );
+                                dropped_mic = true;
                             }
                             !echoed
                         });
+                        if dropped_mic {
+                            on_partial(Source::Mic, String::new());
+                        }
                         // system 段零延迟处理。
                         process_final(
                             job.source,
@@ -407,6 +421,8 @@ pub fn run_asr_worker(
                                         text_prefix20(&r.text)
                                     );
                                     // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
+                                    // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
+                                    on_partial(job.source, String::new());
                                 }
                                 None => {
                                     pending_mic.push_back(PendingMic {
