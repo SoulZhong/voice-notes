@@ -145,9 +145,9 @@
   }
   .ctl:hover { background: var(--surface-soft); }
   .ctl:disabled { opacity: 0.6; cursor: default; }
-  .ctl.primary { background: var(--accent); color: var(--on-accent); }
-  .ctl.primary:hover { background: var(--accent-pressed); }
-  .ctl.danger { color: var(--record); font-weight: 600; }
+  .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); }
+  .ctl.primary:hover { background: var(--primary-pressed); }
+  .ctl.danger { color: var(--record); font-weight: 500; }
   /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */
   .sym {
     width: 9px;
@@ -160,7 +160,7 @@
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
     font-variant-numeric: tabular-nums;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 1rem;
     color: var(--ink-secondary);
   }
@@ -183,7 +183,7 @@
     border: 1px solid var(--warning-line);
     color: var(--warning-ink);
     font-size: 0.75em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.1em 0.5em;
   }
@@ -209,7 +209,7 @@
 
   .status.error {
     color: var(--danger);
-    font-weight: 600;
+    font-weight: 500;
   }
 
   /* transcript-container：surface 底、rounded-xl、正文用 transcript 字级(1.02rem/1.7) */

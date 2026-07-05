@@ -365,7 +365,7 @@
   }
   .section-title {
     font-size: 0.82rem;
-    font-weight: 600;
+    font-weight: 500;
     color: var(--ink-secondary);
     margin: 0;
     display: inline-flex;
@@ -374,7 +374,7 @@
   }
   .count {
     font-size: 0.72rem;
-    font-weight: 600;
+    font-weight: 500;
     color: var(--ink-faint);
     background: var(--surface-press);
     border-radius: var(--radius-full);
@@ -428,7 +428,7 @@
   }
   .initial {
     font-size: 0.95rem;
-    font-weight: 600;
+    font-weight: 500;
   }
   .info {
     flex: 1;
@@ -448,7 +448,7 @@
     background: none;
     border: none;
     font: inherit;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 1rem;
     color: inherit;
     cursor: pointer;
@@ -466,17 +466,17 @@
     color: var(--accent);
   }
   .unnamed {
-    font-weight: 600;
+    font-weight: 500;
     font-size: 1rem;
     font-style: italic;
     color: var(--ink-faint);
   }
   /* button-primary:命名是本行唯一主动作 */
   .name-cta {
-    background: var(--accent);
-    color: var(--on-accent);
+    background: var(--primary);
+    color: var(--on-primary);
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     padding: 0.15em 0.8em;
     font-size: 0.85rem;
     font-weight: 500;
@@ -484,11 +484,11 @@
     box-shadow: var(--shadow-btn);
   }
   .name-cta:hover {
-    background: var(--accent-pressed);
+    background: var(--primary-pressed);
   }
   .name-input {
     font: inherit;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 1rem;
     border: 1px solid var(--accent);
     border-radius: var(--radius-md);
@@ -670,7 +670,7 @@
   .mini.danger {
     border-color: var(--danger);
     color: var(--danger);
-    font-weight: 600;
+    font-weight: 500;
   }
   .mini.danger:hover {
     background: var(--danger);

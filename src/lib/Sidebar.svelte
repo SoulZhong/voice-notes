@@ -223,7 +223,7 @@
 
 <style>
   /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
-     当前页 surface-press + ink 加粗。 */
+     当前页 surface-press + ink 主色（层级靠亮度对比，不靠加粗）。 */
   .sidebar {
     width: 280px;
     flex-shrink: 0;
@@ -269,7 +269,7 @@
   }
   .record-btn.recording {
     color: var(--record);
-    font-weight: 600;
+    font-weight: 500;
   }
   .record-btn:disabled {
     opacity: 0.6;
@@ -302,7 +302,7 @@
   .nav-link.current {
     background: var(--surface-press);
     color: var(--ink);
-    font-weight: 700;
+    font-weight: 500;
   }
   /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,
      Notion 侧栏过滤即此形态;聚焦才浮出 canvas 底 + accent 环。 */
@@ -365,7 +365,7 @@
   .title {
     color: inherit;
     text-decoration: none;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 0.92em;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -388,7 +388,7 @@
   }
   .state {
     font-size: 0.72em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.05em 0.4em;
     margin-left: 0.35em;

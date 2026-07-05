@@ -419,7 +419,7 @@
   }
   .rename {
     font-size: 1.6em;
-    font-weight: 700;
+    font-weight: 500;
     width: 100%;
     box-sizing: border-box;
     padding: 0.1em 0.3em;
@@ -563,7 +563,7 @@
   }
   .link.danger {
     color: var(--danger);
-    font-weight: 600;
+    font-weight: 500;
   }
   /* menu/popover（改说话人菜单）：canvas 底、hairline 边、rounded-lg、shadow-popover */
   .badge-menu {
@@ -586,7 +586,7 @@
     padding: 0.15em 0.4em;
   }
   .menu-item.new {
-    font-weight: 600;
+    font-weight: 500;
   }
   /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级 */
   .badge {
@@ -624,7 +624,7 @@
     background: var(--warning-line);
     color: var(--warning-ink);
     font-size: 0.7em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.1em 0.45em;
     margin-left: 0.4em;
