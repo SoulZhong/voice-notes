@@ -19,6 +19,8 @@ export type Settings = {
   data_dir?: string | null;
   models_dir?: string | null;
   asr_model: string;
+  // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
+  theme: string;
 };
 export type ModelDownloadEvent = {
   artifact: string;
