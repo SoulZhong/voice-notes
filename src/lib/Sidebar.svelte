@@ -337,15 +337,20 @@
     min-height: 0; /* flex 子项默认 min-height:auto 会撑破容器,收掉才滚得起来 */
     overflow-y: auto;
   }
-  /* 底部工具区:hairline 分隔,与内容列表视觉分层 */
+  /* 底部工具区:单行两列工具条(Raycast 式 status bar)。竖排两行显松散零碎,
+     与顶部紧凑药丸不成体系;并排居中让两个次级入口成组且只占一行高。 */
   .nav-footer {
     margin-top: 0.5rem;
     padding-top: 0.5rem;
     border-top: 1px solid var(--hairline);
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     gap: 2px;
     flex-shrink: 0;
+  }
+  .nav-footer .nav-link {
+    flex: 1;
+    justify-content: center;
   }
   /* 整行可点(冒烟反馈):cursor 表意,操作走右键菜单,行内无常驻按钮 */
   .item {
