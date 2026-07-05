@@ -84,7 +84,7 @@ export function speakerLabel(
 }
 /** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(哈希逻辑不变)。
     调色板换成 DESIGN.md 粉彩 7 色，返回 CSS 变量引用——随 :root 的亮/暗色定义
-    自动换色，徽章文字统一用 var(--ink)(同样双主题自适应),不必在这里区分明暗。 */
+    自动换色。 */
 const PALETTE = [
   "var(--tint-sky)",
   "var(--tint-mint)",
@@ -94,13 +94,33 @@ const PALETTE = [
   "var(--tint-yellow)",
   "var(--tint-gray)",
 ];
-export function speakerColor(speaker: string | null, source: Source): string {
-  if (!speaker) return source === "mic" ? "var(--tint-sky)" : "var(--tint-mint)";
+/** 与 PALETTE 同索引的文字色(soft 底配同色相文字:亮色深文字/暗色亮文字,Raycast soft 公式)。 */
+const SPEAKER_INKS = [
+  "var(--tint-sky-ink)",
+  "var(--tint-mint-ink)",
+  "var(--tint-peach-ink)",
+  "var(--tint-lavender-ink)",
+  "var(--tint-rose-ink)",
+  "var(--tint-yellow-ink)",
+  "var(--tint-gray-ink)",
+];
+/** 说话人 id → 调色板索引:S<n> 数值循环;非 S<n> 形态用字符串散列兜底。
+    speakerColor/speakerInk 共用,保证背景色与文字色永远同色相。 */
+function speakerIndex(speaker: string): number {
   const n = parseInt(speaker.replace(/^S/, ""), 10);
-  if (Number.isFinite(n) && n > 0) return PALETTE[(n - 1) % PALETTE.length];
+  if (Number.isFinite(n) && n > 0) return (n - 1) % PALETTE.length;
   let h = 0;
   for (const c of speaker) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return PALETTE[h % PALETTE.length];
+  return h % PALETTE.length;
+}
+export function speakerColor(speaker: string | null, source: Source): string {
+  if (!speaker) return source === "mic" ? "var(--tint-sky)" : "var(--tint-mint)";
+  return PALETTE[speakerIndex(speaker)];
+}
+/** 徽章文字色:与 speakerColor 同索引(soft 底配同色相文字,Raycast soft 公式)。 */
+export function speakerInk(speaker: string | null, source: Source): string {
+  if (!speaker) return source === "mic" ? "var(--tint-sky-ink)" : "var(--tint-mint-ink)";
+  return SPEAKER_INKS[speakerIndex(speaker)];
 }
 
 /** 00:01:23 */

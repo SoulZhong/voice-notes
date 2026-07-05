@@ -141,7 +141,7 @@
     border-radius: var(--radius-lg);
     font-size: 0.95rem;
   }
-  h2 { margin: 0 0 0.25rem; font-size: 1.05rem; font-weight: 600; }
+  h2 { margin: 0 0 0.25rem; font-size: 1.05rem; font-weight: 500; }
   .desc { color: var(--ink-secondary); margin: 0 0 0.75rem; font-size: 0.9rem; }
   .row { margin: 0.4rem 0; }
   .label { font-size: 0.9rem; }
@@ -163,8 +163,8 @@
   }
   button:hover { background: var(--surface-soft); }
   /* button-primary：下载模型是本卡唯一主动作 */
-  button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 500; }
-  button.primary:hover { background: var(--accent-pressed); }
+  button.primary { background: var(--primary); color: var(--on-primary); border-color: transparent; border-radius: var(--radius-full); font-weight: 500; }
+  button.primary:hover { background: var(--primary-pressed); }
   .note { font-size: 0.85rem; color: var(--ink-faint); }
   .error { color: var(--danger); font-size: 0.9rem; margin-top: 0.5rem; }
   .hint { color: var(--warning-ink); font-size: 0.9rem; margin-top: 0.5rem; }

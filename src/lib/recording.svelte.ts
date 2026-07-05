@@ -30,6 +30,8 @@ let speakers = $state<SpeakerMap>({});
 let statusVersion = $state(0);
 /** 笔记改名/删除后 +1，供侧栏与详情页跨组件同步刷新。 */
 let notesVersion = $state(0);
+/** 声纹库人物改名/合并/删除后 +1，侧栏声纹库页签简表据此重拉,不滞留旧名。 */
+let peopleVersion = $state(0);
 let pending = $state(false);
 let paused = $state(false);
 /** 计时基线（后端 elapsed_ms 快照）+ 本地锚点（recording 态才走表）。 */
@@ -68,6 +70,9 @@ export const recording = {
 
   /** 笔记改名/删除后调用，驱动侧栏与详情页统一刷新。 */
   bumpNotes() { notesVersion++; },
+  get peopleVersion() { return peopleVersion; },
+  /** 声纹库人物变更后调用（管理页改名/合并/删除），驱动侧栏简表刷新。 */
+  bumpPeople() { peopleVersion++; },
 
   async pause() {
     if (pending || status !== "recording") return;
