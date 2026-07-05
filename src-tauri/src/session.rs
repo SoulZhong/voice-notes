@@ -29,6 +29,17 @@ const ECHO_SIM_THRESHOLD: f32 = 0.6;
 /// recent_system 缓冲的裁剪窗口(ms)：仅保留最近 10s 内的 system 段供 mic 端比对。
 const RECENT_SYSTEM_WINDOW_MS: u64 = 10_000;
 
+// AEC 残渣抑制(冒烟反馈)：外放场景下 mic 收到的 AEC 消除残渣被识别成垃圾中文/
+// 标点("大"/"。"/"The.")，文本与 system 段不相似躲过上面的文本回声去重，污染
+// 转写与说话人表。残渣必然与外放(system 路)同时发生，能量却远低于近场真人声，
+// 故用「时间重叠比例 + rms 上界」双条件识别，与文本回声去重同一批检查点。
+/// AEC 残渣判定:mic 段与 system 段时间重叠比例下限。
+/// 残渣必然与外放(system 路)同时发生;真人插话即使重叠,近场 rms 也远高于下面的上界。
+/// 待校准。
+pub const RESIDUE_OVERLAP_MIN: f32 = 0.8;
+/// AEC 残渣 rms 上界。2026-07-05 外放数据: 残渣 ≤0.0091,近场人声典型 ≥0.02,取 30% 余量。待校准。
+pub const RESIDUE_RMS_MAX: f32 = 0.012;
+
 /// 归一化：去除空白与常见中英标点、ASCII 转小写，供回声去重的文本比对使用。
 fn normalize_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -114,6 +125,19 @@ fn time_near(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
     overlap || start_close
 }
 
+/// `[a_start,a_end)` 与 `[b_start,b_end)` 的重叠时长占 a 段时长的比例(0~1)。
+/// a 段时长为 0 时返回 0(理论不出现零时长段,防御性避免除零)。
+fn overlap_fraction(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> f32 {
+    let a_dur = a_end.saturating_sub(a_start);
+    if a_dur == 0 {
+        return 0.0;
+    }
+    let overlap_start = a_start.max(b_start);
+    let overlap_end = a_end.min(b_end);
+    let overlap = overlap_end.saturating_sub(overlap_start);
+    overlap as f32 / a_dur as f32
+}
+
 /// 前 20 字符前缀，供丢弃日志裁剪展示（按 char 计，避免截断多字节字符）。
 fn text_prefix20(s: &str) -> String {
     s.chars().take(20).collect()
@@ -183,6 +207,20 @@ struct RecentSystem {
     norm: String,
     start_ms: u64,
     end_ms: u64,
+}
+
+/// AEC 残渣判定的原子条件：一对(mic, system)段的 rms + 时间重叠是否命中残渣特征。
+/// 供两个检查点共用（mic 到达时对照 recent_system；system 到达时对照 pending_mic）。
+fn is_residue_pair(rms: f32, a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    rms < RESIDUE_RMS_MAX && overlap_fraction(a_start, a_end, b_start, b_end) >= RESIDUE_OVERLAP_MIN
+}
+
+/// AEC 残渣判定：mic 段 rms 低于上界，且与某个最近处理过的 system 段有足够比例的
+/// 时间重叠——残渣必然与外放(system 路)同时发生，能量却达不到近场真人声门槛。
+fn is_aec_residue(sub_start: u64, sub_end: u64, rms: f32, recent_system: &VecDeque<RecentSystem>) -> bool {
+    recent_system
+        .iter()
+        .any(|r| is_residue_pair(rms, sub_start, sub_end, r.start_ms, r.end_ms))
 }
 
 /// 完整处理链：embed → assign → take_merges/SpeakersChanged → on_final。
@@ -529,6 +567,19 @@ pub fn run_asr_worker(
                                 if p.text == "[识别失败]" {
                                     return true;
                                 }
+                                // AEC 残渣抑制:与文本回声去重镜像的第二个检查点——新到 system
+                                // 段与某 pending mic 段重叠且 mic 段 rms 低,视为残渣,先于文本
+                                // 相似度判定丢弃(残渣文本本就与 system 段不相似,躲不过下面的
+                                // echoed 判定,须单独拦)。
+                                if is_residue_pair(p.rms, p.start_ms, p.end_ms, sub.start_ms, sub.end_ms) {
+                                    eprintln!(
+                                        "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                                        p.rms,
+                                        text_prefix20(&p.text)
+                                    );
+                                    dropped_mic = true;
+                                    return false;
+                                }
                                 let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
                                     && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
                                 if echoed {
@@ -590,6 +641,16 @@ pub fn run_asr_worker(
                                     &mut on_final,
                                     &mut on_diar,
                                 );
+                            } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &recent_system) {
+                                // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
+                                // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
+                                // ECHO 命中同待遇。
+                                eprintln!(
+                                    "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                                    seg_rms,
+                                    text_prefix20(&sub.text)
+                                );
+                                on_partial(job.source, String::new());
                             } else {
                                 let mic_norm = normalize_text(&sub.text);
                                 let echo = recent_system.iter().find(|r| {
@@ -1408,6 +1469,133 @@ mod asr_worker_tests {
         assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
     }
 
+    // ---- AEC 残渣抑制(冒烟反馈):能量+重叠双条件,与文本回声去重两个检查点镜像 ----
+
+    /// 检查点(a):mic 段到达时对照 recent_system——system 先到、已入 recent_system,
+    /// 随后到达的 mic 段幅度低(rms 低)且与该 system 段 90% 重叠 → 判定残渣丢弃。
+    #[test]
+    fn aec_residue_dropped_when_rms_low_and_overlap_high() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // system: 100..3000ms;mic: 0..1000ms → overlap_fraction(mic,system) = 900/1000 = 0.9。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 0, end_ms: 1000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "残渣文本大。"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "system speech here".to_string())],
+            "rms 低且与 system 段高度重叠的 mic 段应被判定为 AEC 残渣丢弃"
+        );
+    }
+
+    /// 同样 90% 重叠,但 mic 段幅度高(rms 高,近场真人声典型值)→ 不应误杀,应保留。
+    #[test]
+    fn aec_residue_kept_when_overlap_high_but_rms_high() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 0, end_ms: 1000 }).unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "真人插话内容"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        let got = finals.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "rms 高的真人插话不应被残渣抑制误杀: {got:?}");
+        assert!(got.contains(&(Source::System, "system speech here".to_string())));
+        assert!(got.contains(&(Source::Mic, "真人插话内容".to_string())));
+    }
+
+    /// rms 低但与 system 段无时间重叠 → 不应误杀,应保留。
+    #[test]
+    fn aec_residue_kept_when_rms_low_but_no_overlap() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        // mic 段远早于 system 段,零重叠。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 90_000, end_ms: 91_000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "远处安静片段"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        let got = finals.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "无时间重叠的低 rms 段不应被残渣抑制误杀: {got:?}");
+        assert!(got.contains(&(Source::System, "system speech here".to_string())));
+        assert!(got.contains(&(Source::Mic, "远处安静片段".to_string())));
+    }
+
+    /// 检查点(b):mic 段先到、进 pending_mic hold 中,随后到达的 system 段与其 90% 重叠
+    /// 且 mic rms 低 → retain 闭包内判定残渣丢弃(mic 段不会走到 release 那一步)。
+    #[test]
+    fn aec_residue_dropped_via_pending_mic_when_system_arrives_later() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // mic: 0..1000ms,先到,rms 低;system: 100..3000ms,后到,与 mic 重叠 90%。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 0, end_ms: 1000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["残渣文本大。", "system speech here"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "system speech here".to_string())],
+            "pending 中 rms 低的 mic 段应在 system 到达时经 retain 闭包判定残渣丢弃"
+        );
+    }
+
     // ---- 段内说话人分离(Task 3):滑窗嵌入 → 变更点 → 切子段,各自走既有链 ----
 
     /// 双说话人混说段被切成两个 final,各自说话人;单说话人段不乱切。
@@ -1799,6 +1987,14 @@ mod tests {
         assert!(!is_foreign_final("", "純漢字幻覺讀作中文"), "纯汉字不拦(无损)");
         assert!(!is_foreign_final("", "[识别失败]"), "占位段绝不误杀");
         assert!(!is_foreign_final("", ""), "空串放行");
+    }
+
+    #[test]
+    fn overlap_fraction_basic_cases() {
+        assert_eq!(overlap_fraction(0, 1000, 100, 3000), 0.9, "90% 重叠");
+        assert_eq!(overlap_fraction(0, 1000, 2000, 3000), 0.0, "无重叠");
+        assert_eq!(overlap_fraction(0, 1000, 0, 1000), 1.0, "完全重叠");
+        assert_eq!(overlap_fraction(5, 5, 0, 100), 0.0, "a 时长为 0,防御性返回 0");
     }
 
     #[test]
