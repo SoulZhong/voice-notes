@@ -15,7 +15,9 @@
   --hairline-strong: #c9cacc;
   --ink: #18191a;
   --ink-secondary: #5c5d5f;
-  --ink-faint: #949597;
+  /* 终审实测旧值 #949597 on canvas 仅 2.87:1,低于 3:1 底线(时间戳/占位发虚);
+     #737476 达 4.5:1 级 */
+  --ink-faint: #737476;
 
   /* accent 只表达链接/焦点/选中;主按钮走 primary 药丸(Raycast 签名) */
   --accent: #0f7fd1;

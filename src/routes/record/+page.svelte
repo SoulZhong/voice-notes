@@ -129,23 +129,26 @@
   /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
      “录制红点是唯一常驻彩色信号”。 */
+  /* button-secondary 形态：暗色第一公民下 canvas 底=页面底(#07080a 同色)，
+     无边+shadow-btn 会让按钮完全隐形；shadow-btn 是主按钮药丸专用高光，这里
+     改用 transparent + hairline-strong 描边，靠轮廓立住形状 */
   .ctl {
     display: inline-flex;
     align-items: center;
     gap: 0.45em;
     border-radius: var(--radius-md);
-    border: none;
+    border: 1px solid var(--hairline-strong);
     padding: 0.45em 1.1em;
     font-weight: 500;
     font-size: 0.9rem;
     cursor: pointer;
-    background: var(--canvas);
+    background: transparent;
     color: var(--ink);
-    box-shadow: var(--shadow-btn);
   }
   .ctl:hover { background: var(--surface-soft); }
   .ctl:disabled { opacity: 0.6; cursor: default; }
-  .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); }
+  /* 主停止按钮走 primary 药丸，不需要 secondary 的 hairline 描边 */
+  .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); border-color: transparent; }
   .ctl.primary:hover { background: var(--primary-pressed); }
   .ctl.danger { color: var(--record); font-weight: 500; }
   /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */

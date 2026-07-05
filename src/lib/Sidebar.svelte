@@ -267,8 +267,9 @@
   .rec-dot.square {
     border-radius: 2px;
   }
-  /* 录制中红字于药丸:dark 下白药丸 red-on-white 3.5:1 大字可读;light 下 primary 是 #18191a 黑药丸,
-     red #ff6161 on 黑更亮更清晰。两主题均成立,故保留 record 字色。 */
+  /* 录制中红字于药丸:dark 下白药丸上 #ff6161 实测 2.94:1 偏低,由旁侧红色方块符号
+     独立承担停止语义兜底,冒烟观察;light 下黑药丸上同色 5.98:1 无虞。两主题均保留
+     record 字色。 */
   .record-btn.recording {
     color: var(--record);
     font-weight: 500;
