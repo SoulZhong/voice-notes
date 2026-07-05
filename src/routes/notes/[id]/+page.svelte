@@ -235,30 +235,40 @@
   {/if}
 
   {#if note}
-    {#if editing}
-      <!-- svelte-ignore a11y_autofocus -->
-      <input
-        class="rename"
-        autofocus
-        bind:value={editingTitle}
-        onkeydown={(e) => {
-          if (e.key === "Enter") commitRename();
-          if (e.key === "Escape") editing = false;
-        }}
-        onblur={commitRename}
-      />
-    {:else}
-      <h1 class="title">
-        <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
-      </h1>
-    {/if}
+    <div class="header">
+      <div class="header-main">
+        {#if editing}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="rename"
+            autofocus
+            bind:value={editingTitle}
+            onkeydown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") editing = false;
+            }}
+            onblur={commitRename}
+          />
+        {:else}
+          <h1 class="title">
+            <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
+          </h1>
+        {/if}
 
-    <p class="meta">
-      {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
-      {#if note.meta.state === "recording"}
-        <span class="state interrupted">已中断</span>
-      {/if}
-    </p>
+        <p class="meta">
+          {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
+          {#if note.meta.state === "recording"}
+            <span class="state interrupted">已中断</span>
+          {/if}
+        </p>
+      </div>
+
+      <div class="row">
+        <button onclick={() => doExport("md")}>导出 Markdown</button>
+        <button onclick={() => doExport("txt")}>导出纯文本</button>
+        <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
+      </div>
+    </div>
 
     {#if note.meta.state === "recording"}
       <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
@@ -266,13 +276,7 @@
     {#if note.skipped_lines > 0}
       <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
     {/if}
-
-    <div class="row">
-      <button onclick={() => doExport("md")}>导出 Markdown</button>
-      <button onclick={() => doExport("txt")}>导出纯文本</button>
-      <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
-      {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
-    </div>
+    {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
 
     {#if canEdit && tracks.length > 0}
       <AudioPlayer bind:this={player} {tracks} bind:currentMs={playerMs} bind:playing={playerPlaying} />
@@ -404,11 +408,29 @@
     color: var(--ink-secondary);
     margin: 0 0 1rem;
   }
+  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上) */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .header-main {
+    flex: 1;
+    min-width: 0;
+  }
   .row {
     display: flex;
     gap: 0.75rem;
     align-items: center;
-    margin: 0 0 1rem;
+    flex: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    padding-top: 0.2rem;
+  }
+  .export-msg {
+    margin: 0 0 0.75rem;
+    font-size: 0.85rem;
   }
   /* button-secondary：导出/继续录制，透明底 + hairline-strong 边，无阴影 */
   button {
