@@ -27,6 +27,7 @@ export type SegmentRecord = {
   start_ms: number;
   end_ms: number;
   speaker: string | null;
+  rms?: number;
 };
 
 export type Note = {

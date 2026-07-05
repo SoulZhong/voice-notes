@@ -34,7 +34,7 @@ impl SenseVoiceRecognizer {
 impl Recognizer for SenseVoiceRecognizer {
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         let result = self.inner.transcribe(16000, samples);
-        Ok(Transcript { text: result.text })
+        Ok(Transcript { text: result.text, lang: result.lang })
     }
 }
 

@@ -31,6 +31,10 @@ pub struct SegmentRecord {
     pub start_ms: u64,
     pub end_ms: u64,
     pub speaker: Option<String>,
+    /// 段音频均方根(16k f32),纯诊断:为 AEC 残渣能量门槛攒真实数据(A1 backlog)。
+    /// 旧笔记无此键 → None;None 不写盘,新旧行形状双向兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rms: Option<f32>,
 }
 
 /// 一位说话人的可持久化信息，存 speakers.json（键为说话人 id，如 "S1"）。

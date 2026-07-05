@@ -39,7 +39,7 @@ impl Recognizer for WhisperRecognizer {
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         // sherpa-rs 0.6.8: transcribe(&mut self, sample_rate: u32, samples: &[f32]) -> WhisperRecognizerResult
         let result = self.inner.transcribe(16000, samples);
-        Ok(Transcript { text: result.text })
+        Ok(Transcript { text: result.text, ..Default::default() })
     }
 }
 

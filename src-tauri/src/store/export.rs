@@ -130,8 +130,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "今天开会讨论项目进度。", 83_000, 86_000, None).unwrap();
-        w.append_final("system", "好的，先看上周的问题。", 91_000, 94_000, None).unwrap();
+        w.append_final("mic", "今天开会讨论项目进度。", 83_000, 86_000, None, None).unwrap();
+        w.append_final("system", "好的，先看上周的问题。", 91_000, 94_000, None, None).unwrap();
         w.finalize(chrono::Local::now()).unwrap();
 
         let store = NoteStore::new(tmp.path().to_path_buf());
@@ -175,6 +175,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     speaker: Some("S1".into()),
+                    rms: None,
                 },
                 crate::store::SegmentRecord {
                     seq: 1,
@@ -183,6 +184,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     speaker: Some("S2".into()), // 表中无此 id
+                    rms: None,
                 },
                 crate::store::SegmentRecord {
                     seq: 2,
@@ -191,6 +193,7 @@ mod tests {
                     start_ms: 2000,
                     end_ms: 3000,
                     speaker: None,
+                    rms: None,
                 },
             ],
             skipped_lines: 0,
@@ -266,9 +269,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "后说的", 5000, 6000, None).unwrap();
-        w.append_final("system", "  ", 500, 900, None).unwrap();
-        w.append_final("mic", "先说的", 1000, 1500, None).unwrap();
+        w.append_final("mic", "后说的", 5000, 6000, None, None).unwrap();
+        w.append_final("system", "  ", 500, 900, None, None).unwrap();
+        w.append_final("mic", "先说的", 1000, 1500, None, None).unwrap();
         w.finalize(chrono::Local::now()).unwrap();
         let store = NoteStore::new(tmp.path().to_path_buf());
         let txt = std::fs::read_to_string(store.export(&id, "txt").unwrap()).unwrap();

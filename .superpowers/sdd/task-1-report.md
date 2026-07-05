@@ -1,105 +1,110 @@
-# Task 1 Report: NoteStore 全局编辑锁
+# Task 1 Report: Transcript.lang 透传 + 语言判定纯函数
 
 ## Status
-✅ **DONE** - All requirements implemented and tested.
+✅ **COMPLETE** - All requirements implemented, tested, and committed.
 
-## What Was Implemented
+## Implemented Changes
 
-### 1. Global Edit Lock & Guard Function
-- Added module-private static `EDIT_LOCK: std::sync::Mutex<()>` to serialize all non-active writer edits
-- Added helper function `edit_guard()` that acquires the lock with poison handling via `unwrap_or_else(into_inner)`
-- Lock rationale: NoteStore instances are created per-command and stateless; concurrent read-modify-write operations on `speakers.json` and `segments.jsonl` caused lost updates. The lock prevents this by serializing all mutations at the method entry point
-- Lock scope: Module-private; zero caller visibility. Active writers (NoteWriter) use their own Mutex; this lock only affects non-active (UI) edits
+### Step 1-3: Implementation Complete
 
-### 2. Concurrent Test
-- Added `concurrent_speaker_edits_do_not_lose_updates` regression test:
-  - Creates a note with 2 segments and speaker S1
-  - Spawns 2 threads:
-    - Thread 1: 20 iterations of `rename_speaker` (modifying S1 name to "名0" through "名19")
-    - Thread 2: 20 iterations of `set_segment_speaker(..., "new")` (allocating S2 through S21)
-  - Verifies final state:
-    - S1 name is "名19" (thread 1's last write survived)
-    - Speaker count is 21 (S1 + S2..S21, proving all 20 allocations persisted)
-  - Without the lock, either assertion would fail due to simultaneous read-modify-write clobbering
+**asr/mod.rs** - Added lang field to Transcript struct
+- Added `lang: String` field to struct definition
+- Added `#[derive(Default)]` for convenient initialization with mock data
 
-### 3. Lock Integration
-Applied `let _guard = edit_guard();` as the first statement in all 6 mutation methods:
-1. `rename(&self, id, title)` - writes meta.json
-2. `delete(&self, id)` - deletes entire directory
-3. `rename_speaker(&self, id, speaker_id, name)` - writes speakers.json
-4. `edit_segment_text(&self, id, seq, expected_text, new_text)` - writes segments.jsonl
-5. `delete_segment(&self, id, seq, expected_text)` - rewrites segments.jsonl
-6. `set_segment_speaker(&self, id, seq, expected_text, speaker_id)` - writes both speakers.json and segments.jsonl
+**asr/sense_voice.rs** - Pass through SenseVoice language detection
+- Modified recognizer to pass through `result.lang` from sherpa-rs
 
-Read-only methods (`load`, `list`) do not acquire the lock; correctness relies on per-write atomicity (tmp+rename pattern).
+**asr/whisper.rs** - Updated whisper recognizer
+- Updated to use `..Default::default()` pattern (found during testing)
+
+**session.rs** - Added language filtering logic
+- Added `pub const FOREIGN_RATIO_THRESHOLD: f32 = 0.3` constant
+- Added `pub fn is_foreign_final(lang: &str, text: &str) -> bool` pure function with:
+  - Model tag detection (handles both sherpa format `<|ja|>` and bare format `ja`/`ko`)
+  - Character ratio analysis for Japanese kana (0x3040-0x30FF, 0x31F0-0x31FF)
+  - Korean hangul detection (0xAC00-0xD7AF, 0x1100-0x11FF, 0x3130-0x318F)
+  - Threshold comparison: `foreign as f32 / letters as f32 > FOREIGN_RATIO_THRESHOLD`
+  - Edge cases: empty strings, pure Chinese, placeholder text all return false
+
+**Test Coverage** - Added comprehensive test suite
+- 11 assertions covering all specification cases
+- Tag detection (sherpa & bare format)
+- Character ratio thresholds
+- Edge cases verified
+
+**Mock Updates** - Updated all 8 Transcript constructions
+- session.rs asr_worker_tests: 4 locations
+- session.rs session_tests: 2 locations  
+- writer.rs: 2 test locations
+- All use `..Default::default()` pattern as specified
+
+### Step 4: Test Verification
+```bash
+cargo test foreign_final_detection
+  ✅ PASSED
+  
+cargo test
+  ✅ 107 passed, 0 failed, 2 ignored
+  ✅ No new warnings (added #[allow(dead_code)] for Task 3 future use)
+```
+
+### Step 5: Commit
+```bash
+Commit: 3209da9
+Message: feat(asr): Transcript 透传语言标签,session 增外语幻觉判定(标签+字符占比双保险)
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+```
 
 ## TDD Evidence
 
-### RED (Failing Test)
-The concurrent test fails without the lock because threads race to read-modify-write shared files:
+### RED Phase
+- Test added requiring non-existent `is_foreign_final` function
+- Compilation failed: `cannot find function is_foreign_final`
 
-Without implementing the lock, running the test shows:
-```
-test store::notes::tests::concurrent_speaker_edits_do_not_lose_updates ... FAILED
-thread panicked at src/store/notes.rs:562:93: 
-  called `Result::unwrap()` on an `Err` value
-```
-
-The race condition causes file access failures as threads clobber each other's reads and writes.
-
-### GREEN (Passing Test)
-After adding EDIT_LOCK and guard to all 6 mutation methods:
-
-```bash
-cargo test store:: --lib
-  → test store::notes::tests::concurrent_speaker_edits_do_not_lose_updates ... ok
-  → test result: ok. 41 passed; 0 failed
-```
-
-All 41 store tests pass, including the new regression test.
+### GREEN Phase
+- Implemented complete function with all logic branches
+- All 11 test assertions passing
+- Function correctly:
+  - Detects model tags (<|ja|>, ko, etc.)
+  - Analyzes character ratios for kana/hangul
+  - Handles edge cases (empty, pure Chinese, placeholders)
 
 ## Files Changed
 
-- **`src-tauri/src/store/notes.rs`**: +59 lines
-  - Lines 10-18: Static lock and guard function
-  - Lines 81, 89, 97, 115, 128, 146: Guard acquisition in mutation methods
-  - Lines 528-569: New concurrent test
+| File | Changes |
+|------|---------|
+| `src-tauri/src/asr/mod.rs` | Added `lang: String` + `#[derive(Default)]` |
+| `src-tauri/src/asr/sense_voice.rs` | Pass through `result.lang` |
+| `src-tauri/src/asr/whisper.rs` | Use `..Default::default()` |
+| `src-tauri/src/session.rs` | Function, constant, test, 6 mock updates |
+| `src-tauri/src/store/writer.rs` | 2 mock Transcript updates |
 
-## Self-Review Findings
+## Self-Review
 
 ### ✅ Correctness
-- Lock acquired at start of every mutation method, before any state read
-- Guard dropped at method exit (RAII), ensuring lock release on success or error
-- Poison handling matches spec: panicking writer doesn't leave half-written state (each atomic write is independent)
-- Test verifies both: final write survived AND all intermediate updates persisted
+- Character range validation for kana (hiragana/katakana) verified
+- Hangul range detection covers all Korean text blocks
+- Ratio calculation mathematically sound
+- All edge cases handled correctly
 
-### ✅ Performance & Scope
-- Lock only on mutations; reads (`list`, `load`) remain lock-free
-- Edit operations are millisecond-scale and rare; serialization is user-invisible
-- Zero API surface change
+### ✅ Test Coverage
+- Tag detection: both formats recognized
+- Ratio thresholds: boundary cases verified
+- Edge cases: placeholder/empty/pure-Chinese all handled
 
-### ✅ Test Quality
-- Regression test catches both lost-update scenarios (final and intermediate)
-- Realistic workload (20 concurrent iterations)
-- Both main edit patterns tested (speakers and segments)
+### ✅ No Regressions
+- All 107 existing tests still pass
+- No new compilation warnings for implemented code
 
-## Test Results Summary
+### ✅ Code Quality
+- Chinese comments explain the "why" throughout
+- Follows existing codebase patterns
+- Ready for Task 3 integration
 
-```
-cargo test store:: --lib
-  ✅ 41 passed (concurrent_speaker_edits_do_not_lose_updates + 40 existing)
-  ✅ 0 failed
-  ✅ No new compilation warnings
-```
+## Concerns
 
-## Commit
-
-```
-Commit: 645dc70
-Message: fix(store): NoteStore 变更方法加全局编辑锁,根治非活动写者并发丢更新
-Files: src-tauri/src/store/notes.rs (+59)
-```
+**None** - Implementation complete and verified.
 
 ---
 
-**Verification:** All 5 task steps completed. Lock is in place, test passes, commit created.
+**Branch:** `lang-filter-rms` | **Date:** 2026-07-04 | **Commit:** `3209da9`
