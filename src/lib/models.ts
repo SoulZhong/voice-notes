@@ -21,6 +21,18 @@ export type Settings = {
   asr_model: string;
   // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
   theme: string;
+  // 仅录系统声(不录麦克风)
+  record_system_only: boolean;
+  // 转写语言过滤开关
+  language_filter: boolean;
+  // 是否保留原始录音音频
+  keep_audio: boolean;
+  // 全局快捷键开关
+  shortcut_enabled: boolean;
+  // 全局快捷键组合(tauri accelerator 格式,如 "Alt+CmdOrCtrl+R")
+  shortcut: string;
+  // 系统托盘图标开关
+  tray_enabled: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
@@ -39,6 +51,12 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const setSettings = (s: Settings) => invoke<void>("set_settings", { newSettings: s });
 export const migrateDataDir = (newDir: string) => invoke<void>("migrate_data_dir", { newDir });
 export const migrateModelsDir = (newDir: string) => invoke<void>("migrate_models_dir", { newDir });
+// 将当前 settings.shortcut/shortcut_enabled 应用到系统全局快捷键(失败时后端会自动把 shortcut_enabled 落回 false)。
+export const applyShortcut = () => invoke<void>("apply_shortcut");
+// 查询录音音频文件占用的磁盘字节数,用于设置页展示。
+export const audioDiskUsage = () => invoke<number>("audio_disk_usage");
+// 清理录音音频;olderThanDays 为 null 时清理全部,否则只清理超过对应天数的文件。返回释放的字节数。
+export const purgeAudio = (olderThanDays: number | null) => invoke<number>("purge_audio", { olderThanDays });
 export function onModelDownload(cb: (e: ModelDownloadEvent) => void) {
   return listen<ModelDownloadEvent>("model_download", (ev) => cb(ev.payload));
 }
