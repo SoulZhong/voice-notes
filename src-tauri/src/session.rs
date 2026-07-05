@@ -312,6 +312,9 @@ fn split_final(
     transcript: &Transcript,
     recognizer: &mut Box<dyn Recognizer>,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
+    // 开关透传：子段重识别复核（见下方 is_foreign_final 调用）需与整段判定用
+    // 同一个开关状态，否则关闭过滤后仍会在回退路径误丢子段。
+    language_filter: bool,
 ) -> Vec<SubFinal> {
     let whole_segment = |job_samples: Vec<f32>| {
         vec![SubFinal {
@@ -396,7 +399,7 @@ fn split_final(
                         // AEC 残渣独立成段后更像纯外语幻觉）；沿用母段语言标签
                         // （lang 未变，仅 text 是新的）复核一次，命中则该子段
                         // 文本置空——下面的空文本判断会自然丢弃它，不单独处理。
-                        if is_foreign_final(&transcript.lang, &t.text) {
+                        if language_filter && is_foreign_final(&transcript.lang, &t.text) {
                             eprintln!("段内切分: 回退子段命中语言过滤,丢弃");
                             String::new()
                         } else {
@@ -492,6 +495,9 @@ pub fn run_asr_worker(
     mut registry: SpeakerRegistry,
     finals_rx: Receiver<FinalJob>,
     echo_hold: Duration,
+    // 语言幻觉过滤总开关：会议场景默认开(过滤中日韩误判幻觉段)，多语会议可关闭
+    // 以保留外语真实发言；关闭时下方两处 is_foreign_final 判定整体短路为不丢弃。
+    language_filter: bool,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
     mut on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
     mut on_partial: impl FnMut(Source, String),
@@ -556,7 +562,7 @@ pub fn run_asr_worker(
                 };
                 // 语言白名单:外语幻觉段与 ECHO 命中同待遇——不 embed/不 assign/
                 // 不 emit/不落盘,从源头杜绝垃圾段污染说话人表。占位段占比 0 天然放行。
-                if is_foreign_final(&t.lang, &t.text) {
+                if language_filter && is_foreign_final(&t.lang, &t.text) {
                     eprintln!(
                         "语言过滤: 丢弃 {:?} 段 lang=\"{}\" text=\"{}\"",
                         job.source,
@@ -581,7 +587,15 @@ pub fn run_asr_worker(
                         end_ms: job.end_ms,
                     }]
                 } else {
-                    split_final(job.samples, job.start_ms, job.end_ms, &t, &mut recognizer, &mut embedder)
+                    split_final(
+                        job.samples,
+                        job.start_ms,
+                        job.end_ms,
+                        &t,
+                        &mut recognizer,
+                        &mut embedder,
+                        language_filter,
+                    )
                 };
 
                 for sub in subs {
@@ -836,6 +850,9 @@ pub fn start_session(
     embedder: Option<Box<dyn SpeakerEmbedder>>,
     registry: SpeakerRegistry,
     echo_hold: Duration,
+    // 语言幻觉过滤总开关，见 run_asr_worker 同名参数注释；会议场景默认开(true)，
+    // 多语会议可在设置里关闭。
+    language_filter: bool,
     target_rate: u32,
     partial_interval_samples: usize,
     mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
@@ -906,7 +923,16 @@ pub fn start_session(
 
     let asr = std::thread::spawn(move || {
         run_asr_worker(
-            recognizer, embedder, registry, finals_rx, echo_hold, slots, on_final, on_partial, on_diar,
+            recognizer,
+            embedder,
+            registry,
+            finals_rx,
+            echo_hold,
+            language_filter,
+            slots,
+            on_final,
+            on_partial,
+            on_diar,
         )
     });
 
@@ -965,6 +991,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, start_ms, end_ms, _, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
             |_, _| {},
@@ -994,6 +1021,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1035,6 +1063,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1066,6 +1095,7 @@ mod asr_worker_tests {
                 SpeakerRegistry::new(),
                 rx,
                 TEST_ECHO_HOLD,
+                true, // language_filter: 既有测试语义不变(过滤开)
                 vec![(Source::System, slot_for_worker)],
                 |_, _, _, _, _, _| {},
                 move |s, t| p2.lock().unwrap().push((s, t)),
@@ -1114,6 +1144,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -1149,6 +1180,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -1179,6 +1211,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -1200,6 +1233,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |_, _, _, _, spk, _| f2.lock().unwrap().push(spk),
             |_, _| {},
@@ -1224,6 +1258,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},
@@ -1271,6 +1306,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},
@@ -1320,6 +1356,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1349,6 +1386,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1392,6 +1430,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1433,6 +1472,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1467,6 +1507,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             Duration::from_secs(10), // 故意远长于测试运行时间:证明 release 靠 Disconnected 排干,而非到期
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1497,6 +1538,7 @@ mod asr_worker_tests {
                 SpeakerRegistry::new(),
                 rx,
                 TEST_ECHO_HOLD,
+                true, // language_filter: 既有测试语义不变(过滤开)
                 vec![],
                 move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
                 |_, _| {},
@@ -1548,6 +1590,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             Duration::from_millis(0), // hold 归零,立即 release
+            true, // language_filter: 既有测试语义不变(过滤开)
             Vec::new(),
             |_src, text, _s, _e, _spk, rms| finals.push((text, rms)),
             |_, _| {},
@@ -1557,6 +1600,43 @@ mod asr_worker_tests {
         assert_eq!(finals[0].0, "正常句子");
         let rms = finals[0].1.expect("正常段必须带 rms");
         assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
+    }
+
+    /// language_filter=false:多语会议场景显式关闭本过滤后,即便命中中日韩白名单
+    /// 判定,也不应丢弃——应与"未过滤"路径行为一致,两段都正常落 final。
+    #[test]
+    fn worker_language_filter_disabled_keeps_foreign_final() {
+        // ScriptRecognizer: 第一条日语标签(若开关生效本应被丢弃),第二条正常中文。
+        struct ScriptRecognizer(std::collections::VecDeque<Transcript>);
+        impl Recognizer for ScriptRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(self.0.pop_front().unwrap_or_default())
+            }
+        }
+        let script = vec![
+            Transcript { text: "でかし".into(), lang: "<|ja|>".into(), ..Default::default() },
+            Transcript { text: "正常句子".into(), lang: "<|zh|>".into(), ..Default::default() },
+        ];
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 0, end_ms: 100 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 200, end_ms: 300 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<String> = Vec::new();
+        run_asr_worker(
+            Box::new(ScriptRecognizer(script.into())),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0), // hold 归零,立即 release
+            false, // language_filter 关:日语标签段也应正常落 final,不被丢弃
+            Vec::new(),
+            |_src, text, _s, _e, _spk, _rms| finals.push(text),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(finals.len(), 2, "关闭语言过滤后两段都应正常落 final,不丢日语段: {finals:?}");
+        assert_eq!(finals[0], "でかし");
+        assert_eq!(finals[1], "正常句子");
     }
 
     // ---- AEC 残渣抑制(冒烟反馈):能量+重叠双条件,与文本回声去重两个检查点镜像 ----
@@ -1582,6 +1662,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1612,6 +1693,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1643,6 +1725,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1674,6 +1757,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
@@ -1724,6 +1808,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             Duration::from_millis(0),
+            true, // language_filter: 既有测试语义不变(过滤开)
             Vec::new(),
             |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
             |_, _| {},
@@ -1770,6 +1855,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             Duration::from_millis(0),
+            true, // language_filter: 既有测试语义不变(过滤开)
             Vec::new(),
             |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
             |_, _| {},
@@ -1829,6 +1915,7 @@ mod asr_worker_tests {
             SpeakerRegistry::new(),
             rx,
             Duration::from_millis(0),
+            true, // language_filter: 既有测试语义不变(过滤开)
             Vec::new(),
             |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
             |_, _| {},
@@ -1867,7 +1954,7 @@ mod asr_worker_tests {
         };
         let mut recognizer: Box<dyn Recognizer> = Box::new(CountingRecognizer);
         let mut embedder: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ContentEmbedder));
-        let subs = split_final(samples, 0, 8000, &transcript, &mut recognizer, &mut embedder);
+        let subs = split_final(samples, 0, 8000, &transcript, &mut recognizer, &mut embedder, true);
         assert_eq!(subs.len(), 2, "应切成两个子段");
         let total_sub_samples: usize = subs.iter().map(|s| s.samples.len()).sum();
         assert_eq!(total_sub_samples, total_len, "子段样本总长应等于母段样本总长,不丢尾部样本");
@@ -1971,6 +2058,7 @@ mod session_tests {
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -2025,6 +2113,7 @@ mod session_tests {
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             sinks,
@@ -2069,6 +2158,7 @@ mod session_tests {
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -2099,6 +2189,7 @@ mod session_tests {
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],

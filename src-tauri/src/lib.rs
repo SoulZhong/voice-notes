@@ -466,12 +466,18 @@ fn spawn_session(
         }
 
         let mut degraded = false;
+        // 语言幻觉过滤开关:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里
+        // 关闭以保留外语真实发言;读取失败(app_data_dir 不可用等)保守地按默认值
+        // (过滤开)处理,与 Settings::default 一致,不因读设置失败改变现状行为。
+        let language_filter =
+            app.path().app_data_dir().map(|d| settings::load(&d).language_filter).unwrap_or(true);
         let start = session::start_session(
             sources,
             recognizer,
             embedder,
             registry,
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
+            language_filter,
             16000,
             16000,
             audio_sinks,

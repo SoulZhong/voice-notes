@@ -1,113 +1,80 @@
-# Task 3 报告:徽章文字色接 soft 公式
+# Task 3 报告:语言过滤开关接线
 
-**分支**: raycast-design-system
+**分支**: settings-enhancement
 
-(注:本文件路径此前存在一份内容完全无关的旧报告——audio-compression-settings 分支
-"下载器装好即删 prune 项"任务的报告,已整体覆盖为本任务的报告。)
+(注:本文件路径此前存有一份内容完全无关的旧报告——raycast-design-system 分支
+"徽章文字色接 soft 公式"任务的报告,已整体覆盖为本任务的报告。)
 
 ## 改动
 
-1. **`src/lib/notes.ts`**
-   - 抽出共用 `speakerIndex(speaker)`:取索引逻辑与原 `speakerColor` 完全一致(S<n> 数值
-     循环 / 非 S<n> 字符串散列兜底),`speakerColor` 与新增 `speakerInk` 两处消费,不复制。
-   - 新增 `SPEAKER_INKS`(与 `PALETTE` 同顺序七色 `-ink` 变量)与
-     `export function speakerInk(speaker, source)`,`!speaker` 兜底与 `speakerColor` 对齐
-     (mic→sky-ink,其它→mint-ink)。
+1. **`src-tauri/src/session.rs`**
+   - `run_asr_worker` 增参 `language_filter: bool`(紧邻 `echo_hold: Duration` 之后),
+     整段判定处 `if is_foreign_final(&t.lang, &t.text)` → `if language_filter &&
+     is_foreign_final(&t.lang, &t.text)`。
+   - `split_final` 增参 `language_filter: bool`(末位,`&mut embedder` 之后),
+     子段重识别复核处同样改为 `language_filter && is_foreign_final(...)`。
+     `run_asr_worker` 调用 `split_final` 时透传该 bool(Copy,闭包内直接捕获)。
+   - `start_session` 增参 `language_filter: bool`(紧邻 `echo_hold: Duration` 之后),
+     内部起 `asr` 线程的 `run_asr_worker(...)` 调用透传。
+   - 各签名处补中文注释,讲清"为什么可关":会议场景默认过滤中日韩误判幻觉段,
+     多语会议可关闭以保留外语真实发言。
+   - `is_foreign_final` 本体逻辑未动。
 
-2. **`src/lib/SpeakerChips.svelte:53`**:`style="background: ...; color: {speakerInk(id, 'mic')}"`,
-   import 同步补 `speakerInk`。
-   - 子元素检查:`.name`(标签文字)`color: inherit`,随 chip 新文字色走,正确。`.me`
-     ("这是我")与 `.edit`(改名输入框)本就各自显式设了 `color: var(--accent)` /
-     `color: var(--ink)`,不继承 chip 颜色——前者是链接态操作,后者浮在 `--canvas` 底而
-     非徽章底,语义上应保持独立,未改动。
-
-3. **`src/routes/notes/[id]/+page.svelte:335→336`**:同样追加
-   `; color: {speakerInk(seg.speaker, seg.source)}"`,import 同步。该 `.badge.as-btn` 内
-   只有纯文本(说话人标签),无继承色子元素需要处理。
-
-4. **`src/routes/speakers/+page.svelte`**:删除本地第 29-44 行的 `TINTS` 数组与
-   `avatarTint()` 函数,改为:
-   ```ts
-   const avatarTint = (id: string) => speakerColor(id, "mic");
-   const avatarInk = (id: string) => speakerInk(id, "mic");
+2. **`src-tauri/src/lib.rs`**(`spawn_session` 线程内,起 `session::start_session` 之前)
+   新增一次 settings 读取:
+   ```rust
+   let language_filter =
+       app.path().app_data_dir().map(|d| settings::load(&d).language_filter).unwrap_or(true);
    ```
-   `.avatar` 头像(第 187 行)追加 `color: {avatarInk(p.id)}`,内部 `.initial`(姓名首字)
-   与人形轮廓 SVG(`stroke="currentColor"`)均无自持色,正确继承。合并菜单里的
-   `.menu-dot`(第 285 行,纯色块无文字)不需要 ink,未改动。
+   读取失败(app_data_dir 不可用等)保守回退 `true`,与 `Settings::default` 一致,
+   不因读设置失败改变现状行为。`settings.language_filter` 字段(S1)已就绪,直接消费。
 
-   **索引逻辑差异(按要求以 notes.ts 为准统一,报告差异)**:本地原逻辑剥 `^P` 前缀做
-   数值循环(P1→色0, P2→色1…);`notes.ts` 的 `speakerIndex` 剥的是 `^S` 前缀,对 `P<n>`
-   形态不命中数值分支,统一后退化为字符串散列兜底。影响:声纹库头像色不再是
-   P1/P2/P3… 顺序循环,而是按 id 字符串散列取色——每个人的颜色仍然确定且稳定(同一 id
-   永远同色),只是不再保证相邻编号视觉相邻/循环有序。`source` 参数对该页无意义(id
-   恒为真值,`!speaker` 分支不会触发),固定传 `"mic"`。
+3. **既有调用点补参**(全部按"语义不变"传 `true`,不新增行为):
+   - `session.rs` 内 `run_asr_worker` 的全部 24 处测试调用、`start_session` 的全部
+     4 处测试调用。
+   - `session.rs` 内 `split_final` 的 1 处测试调用(`split_final_last_subsegment_keeps_full_sample_tail`)。
+   - `src-tauri/src/store/writer.rs` 的 3 处 `crate::session::start_session` 调用
+     (两处单场景测试 + 一处续录场景测试;这 3 处调用不在 brief 提及的 session.rs
+     范围内,是本任务开工后编译报错才发现的额外调用点,已一并补 `true`)。
+
+## TDD
+
+- 新增测试 `session::asr_worker_tests::worker_language_filter_disabled_keeps_foreign_final`:
+  脚本识别器产出 `["<|ja|>", "でかし"]` + `["<|zh|>", "正常句子"]` 两段,
+  `language_filter=false` 调 `run_asr_worker`,断言两段都正常落 `final`(不再只剩 1 段)。
+- **RED 验证**:临时把 `run_asr_worker` 内的判定改回不带 `language_filter &&` 短路,
+  单独跑该测试 → 失败(`left: 1, right: 2`,日语段仍被丢弃),证明测试确实在验证开关生效。
+  随后原样恢复实现代码。
+- **GREEN**:恢复后单独重跑该测试通过;全量 `cargo test` 207 passed(较改动前 206 多 1,
+  即新增用例),0 failed。
 
 ## 验证
 
-- `grep -rn '"var(--tint-' src/routes/speakers/+page.svelte` → 0 行(本地色数组已删,确认)。
-- `npm run check` → `0 ERRORS 0 WARNINGS`。
-- `npm run build` → 通过(client + server 均 `✓ built`)。
-- 布局/交互零改动:仅在既有 `style` 属性追加 `color:`,未碰任何 CSS class 规则、DOM
-  结构、事件绑定。
+- `cargo build --tests` → 编译通过(发现并修复了 `store/writer.rs` 里 3 处遗漏的
+  `start_session` 调用点)。
+- `cargo test`(workspace 全量)→ **207 passed; 0 failed; 2 ignored**。
+- `cargo build` → 通过,仅剩 2 条与本改动无关的既有 `dead_code` 警告
+  (`audio/mock.rs::MockCapture`/`from_wav`),无新增警告。
 
 ## Commit
 
 ```
-feat(design): 说话人徽章文字色接 soft 公式(同色相深/亮文字)
+feat(session): 语言幻觉过滤可开关(默认开)
 ```
 
 ## Files
 
-- Modified: `src/lib/notes.ts`、`src/lib/SpeakerChips.svelte`、
-  `src/routes/notes/[id]/+page.svelte`、`src/routes/speakers/+page.svelte`
+- Modified: `src-tauri/src/session.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/store/writer.rs`
 
 ## Self-Review / 关注点
 
-- 三个消费点(`SpeakerChips`、`notes/[id]` 转写徽章、`speakers` 头像)背景与文字色索引
-  逻辑完全共用同一个 `speakerIndex`,不会出现背景色与文字色错位。
-- `speakers/+page.svelte` 的索引口径差异已如上报告,按 brief 要求以 notes.ts 为准统一,
-  未额外保留本地 `^P` 前缀特判(brief 明确要求删除本地数组、统一消费)。
-- 超出范围未改动:`src/routes/record/+page.svelte:95` 的实时转写徽章
-  (`<span class="badge" style="background: {speakerColor(...)}">`)有完全相同的 soft
-  底配色缺文字色问题,但该文件不在本任务 brief 的文件清单内,未 touch。建议后续任务/
-  补丁跟进,否则录制中页面的徽章仍是背景 15% alpha + 默认 `--ink`,对比度问题依旧存在。
-- 工作区内 `.superpowers/sdd/task-1-report.md`、`src-tauri/gen/schemas/*.json` 三个文件
-  在本任务开始前就已是未提交的修改状态,与 Task 3 无关(疑似前序任务/工具链遗留),
-  本次 commit 只 `git add` 了本任务实际改动的 4 个文件。
-
----
-
-## 追加:复核修复(record 页缺口 + 两条 Minor)
-
-复核确认 record 页缺口需要补(计划遗漏,同一视觉一致性必须闭合),连同前一任务复核的
-两条一行级 Minor,单提交完成:
-
-1. **`src/routes/record/+page.svelte:95`** 转写行徽章:`style` 追加
-   `; color: {speakerInk(line.speaker, line.source)}`,import 补 `speakerInk`。
-2. **`src/routes/record/+page.svelte`(原约 158 行)**:`.sym.dot.on-blue` 的
-   `background: var(--on-accent)` → `var(--on-primary)`。该点渲染在已迁 primary 的
-   `.ctl.primary` 主按钮内(`color: var(--on-primary)`),语义对齐;现值巧合等值不可见,
-   但会随 token 漂移。
-3. **`src/routes/speakers/+page.svelte:346`**:`.section-title` 注释"小号加粗"改为
-   "小号标题(500 字重)",与实际 `font-weight: 500` 一致。
-
-**顺带闭合(同一缺口的另一半,超出清单但同属 record 页徽章一致性)**:
-`.badge.mic` / `.badge.system`(实时转写 partial 行的"我/对方"占位徽章,原 260-261 行)
-与最终行徽章共用同一 `.badge` 外观,原先靠 `.badge { color: var(--ink) }` 吃默认文字色。
-若只改最终行,同一个"我"徽章会在 partial→final 转正瞬间文字变色(soft ink ↔ 默认 ink),
-一致性反而更破。故:`.badge` 去掉 `color: var(--ink)`(现三处消费全部显式带色,无裸
-`.badge` 用法),`.badge.mic` 补 `color: var(--tint-sky-ink)`、`.badge.system` 补
-`color: var(--tint-mint-ink)`——与 `speakerInk()` 的 `!speaker` 兜底分支(mic→sky-ink/
-system→mint-ink)完全一致。注释同步更新。
-
-### 验证(追加改动后重跑)
-
-- `npm run check` → `0 ERRORS 0 WARNINGS`。
-- `npm run build` → 通过。
-- 布局/交互零改动:仅 color/background 值与注释文字。
-
-### Commit(追加)
-
-```
-fix(design): record 页徽章配对文字色,残留 on-accent/注释清理
-```
+- `is_foreign_final` 本体判定逻辑(白名单标签 + 字符占比兜底)完全未动,仅在其两个
+  调用点外挂 `language_filter &&` 短路开关,符合 brief"不动 is_foreign_final 本体逻辑"
+  的约束。
+- `language_filter` 为 `bool`(`Copy`),在 `thread::spawn(move || ...)` 与内部闭包中
+  直接按值捕获/透传,无需额外 `Arc`/克隆开销。
+- 发现范围外的 3 处 `store/writer.rs` 调用点:brief 只列了 `session.rs`/`lib.rs`,
+  但 `start_session` 签名变更是硬性破坏性改动,编译器强制暴露了这 3 处遗漏调用,
+  已一并按"语义不变"补 `true`,否则 `cargo build --tests`/`cargo test` 无法通过。
+- 工作区内 `.superpowers/sdd/task-1-report.md` 在本任务开始前就已是未提交的修改状态,
+  与本任务无关(前序任务遗留),本次 commit 未纳入该文件。
