@@ -1,6 +1,10 @@
-use crate::asr::Recognizer;
+use crate::asr::{Recognizer, Transcript};
 use crate::audio::{AudioCapture, AudioFrame, Source};
 use crate::diar::registry::SpeakerRegistry;
+use crate::diar::split::{
+    detect_change_points, group_tokens_by_boundaries, SPLIT_HOP_MS, SPLIT_MIN_SEGMENT_MS,
+    SPLIT_WIN_MS,
+};
 use crate::diar::SpeakerEmbedder;
 use crate::pipeline::segment_worker::run_segment_worker;
 use crate::pipeline::segmenter::Segmenter;
@@ -24,6 +28,17 @@ const ECHO_WINDOW_MS: u64 = 2500;
 const ECHO_SIM_THRESHOLD: f32 = 0.6;
 /// recent_system 缓冲的裁剪窗口(ms)：仅保留最近 10s 内的 system 段供 mic 端比对。
 const RECENT_SYSTEM_WINDOW_MS: u64 = 10_000;
+
+// AEC 残渣抑制(冒烟反馈)：外放场景下 mic 收到的 AEC 消除残渣被识别成垃圾中文/
+// 标点("大"/"。"/"The.")，文本与 system 段不相似躲过上面的文本回声去重，污染
+// 转写与说话人表。残渣必然与外放(system 路)同时发生，能量却远低于近场真人声，
+// 故用「时间重叠比例 + rms 上界」双条件识别，与文本回声去重同一批检查点。
+/// AEC 残渣判定:mic 段与 system 段时间重叠比例下限。
+/// 残渣必然与外放(system 路)同时发生;真人插话即使重叠,近场 rms 也远高于下面的上界。
+/// 待校准。
+pub(crate) const RESIDUE_OVERLAP_MIN: f32 = 0.8;
+/// AEC 残渣 rms 上界。2026-07-05 外放数据: 残渣 ≤0.0091,近场人声典型 ≥0.02,取 30% 余量。待校准。
+pub(crate) const RESIDUE_RMS_MAX: f32 = 0.012;
 
 /// 归一化：去除空白与常见中英标点、ASCII 转小写，供回声去重的文本比对使用。
 fn normalize_text(s: &str) -> String {
@@ -67,6 +82,13 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
     prev[m]
 }
 
+/// contains 满分捷径的最短长度门槛（归一化后按 char 计）：子段化后短句（语气词
+/// "嗯"/"对"之类）更容易被任意长文本"完全包含"而误拿满分，是段内切分带来的
+/// 连带效应，P4.5 校准时的素材里还没有这类超短子段。较短一方低于此长度时改走
+/// levenshtein 距离分（仍可能命中，但不再是 contains 的无条件 1.0）。阈值 4
+/// 待真实回声素材复核校准。
+const ECHO_CONTAINS_MIN_LEN: usize = 4;
+
 /// 文本相似度 = max(1 − 编辑距离/较长串字符数, 归一化后短串被长串完全包含 ? 1.0 : 0.0)。
 /// 任一侧归一化后为空串 → 0（避免空文本互相「完全包含」误判）。
 fn text_similarity(a: &str, b: &str) -> f32 {
@@ -77,7 +99,10 @@ fn text_similarity(a: &str, b: &str) -> f32 {
     }
     let ca: Vec<char> = na.chars().collect();
     let cb: Vec<char> = nb.chars().collect();
-    let contains_score = if ca.len() <= cb.len() {
+    let shorter_len = ca.len().min(cb.len());
+    let contains_score = if shorter_len < ECHO_CONTAINS_MIN_LEN {
+        0.0
+    } else if ca.len() <= cb.len() {
         if nb.contains(&na) { 1.0 } else { 0.0 }
     } else if na.contains(&nb) {
         1.0
@@ -98,6 +123,19 @@ fn time_near(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
     let overlap = a_start <= b_end && b_start <= a_end;
     let start_close = (a_start as i64 - b_start as i64).abs() < ECHO_WINDOW_MS as i64;
     overlap || start_close
+}
+
+/// `[a_start,a_end)` 与 `[b_start,b_end)` 的重叠时长占 a 段时长的比例(0~1)。
+/// a 段时长为 0 时返回 0(理论不出现零时长段,防御性避免除零)。
+fn overlap_fraction(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> f32 {
+    let a_dur = a_end.saturating_sub(a_start);
+    if a_dur == 0 {
+        return 0.0;
+    }
+    let overlap_start = a_start.max(b_start);
+    let overlap_end = a_end.min(b_end);
+    let overlap = overlap_end.saturating_sub(overlap_start);
+    overlap as f32 / a_dur as f32
 }
 
 /// 前 20 字符前缀，供丢弃日志裁剪展示（按 char 计，避免截断多字节字符）。
@@ -171,6 +209,20 @@ struct RecentSystem {
     end_ms: u64,
 }
 
+/// AEC 残渣判定的原子条件：一对(mic, system)段的 rms + 时间重叠是否命中残渣特征。
+/// 供两个检查点共用（mic 到达时对照 recent_system；system 到达时对照 pending_mic）。
+fn is_residue_pair(rms: f32, a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    rms < RESIDUE_RMS_MAX && overlap_fraction(a_start, a_end, b_start, b_end) >= RESIDUE_OVERLAP_MIN
+}
+
+/// AEC 残渣判定：mic 段 rms 低于上界，且与某个最近处理过的 system 段有足够比例的
+/// 时间重叠——残渣必然与外放(system 路)同时发生，能量却达不到近场真人声门槛。
+fn is_aec_residue(sub_start: u64, sub_end: u64, rms: f32, recent_system: &VecDeque<RecentSystem>) -> bool {
+    recent_system
+        .iter()
+        .any(|r| is_residue_pair(rms, sub_start, sub_end, r.start_ms, r.end_ms))
+}
+
 /// 完整处理链：embed → assign → take_merges/SpeakersChanged → on_final。
 /// 即时路径（system 段、无匹配的 mic 段）与 release 路径（hold 到期/排干的 mic 段）共用，
 /// 保证「被丢弃段零副作用、被处理段处理逻辑同源」。
@@ -215,6 +267,157 @@ fn process_final<F1, F2>(
         on_diar(DiarEvent::SpeakersChanged(speakers));
     }
     on_final(source, text, start_ms, end_ms, speaker, Some(rms));
+}
+
+/// 毫秒(相对段首)→ 样本下标：16kHz 单声道，1ms = 16 样本。
+fn ms_to_sample_idx(ms: u64) -> usize {
+    (ms * 16) as usize
+}
+
+/// 一个母段切出的子段:等价一个独立 final。
+struct SubFinal {
+    text: String,
+    samples: Vec<f32>,
+    start_ms: u64,
+    end_ms: u64,
+}
+
+/// 母段 → 子段列表(len ≥ 1)。任何"装不下/跑不动/切不出/切了也没内容"的情形都
+/// 回退单元素原段——不丢内容是本函数唯一不可违反的不变式，宁可不切也不能丢。
+///
+/// 失败/跳过路径：无 embedder；段时长 < SPLIT_MIN_SEGMENT_MS；变更点检测无点；
+/// 全部子段文本 trim 后为空。
+fn split_final(
+    job_samples: Vec<f32>,
+    job_start_ms: u64,
+    job_end_ms: u64,
+    transcript: &Transcript,
+    recognizer: &mut Box<dyn Recognizer>,
+    embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
+) -> Vec<SubFinal> {
+    let whole_segment = |job_samples: Vec<f32>| {
+        vec![SubFinal {
+            text: transcript.text.clone(),
+            samples: job_samples,
+            start_ms: job_start_ms,
+            end_ms: job_end_ms,
+        }]
+    };
+
+    let total_ms = job_end_ms.saturating_sub(job_start_ms);
+    if embedder.is_none() || total_ms < SPLIT_MIN_SEGMENT_MS {
+        return whole_segment(job_samples);
+    }
+
+    // 计时:滑窗嵌入 + 分组/重识别总耗时,仅在确有切分发生时随子段数一并打印
+    // (性能可观测;不影响回退路径——那些路径本身就没有这条日志)。
+    let split_started_at = Instant::now();
+
+    // 滑窗嵌入：窗起点 idx*hop，窗长 win；末窗不足窗长则止（不足一窗的尾音直接
+    // 不再开窗，其内容仍归属最后一个子段——不会丢样本，只是不参与切分判定）。
+    let mut embs: Vec<Option<Vec<f32>>> = Vec::new();
+    let mut win_start_ms = 0u64;
+    while win_start_ms + SPLIT_WIN_MS <= total_ms {
+        let start_idx = ms_to_sample_idx(win_start_ms).min(job_samples.len());
+        let end_idx = ms_to_sample_idx(win_start_ms + SPLIT_WIN_MS).min(job_samples.len());
+        let window = &job_samples[start_idx..end_idx];
+        // 与既有 embed 防护同款：panic 视同失败，该窗记 None（"与两侧都相似"，
+        // 宁可漏切不误切），绝不让滑窗嵌入的异常波及整段处理。
+        let emb = embedder.as_mut().and_then(|e| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.embed(window))) {
+                Ok(Ok(v)) => Some(v),
+                Ok(Err(err)) => {
+                    eprintln!("段内切分: 滑窗嵌入失败: {err}");
+                    None
+                }
+                Err(_) => {
+                    eprintln!("段内切分: 滑窗嵌入 panic,该窗视为与两侧相似");
+                    None
+                }
+            }
+        });
+        embs.push(emb);
+        win_start_ms += SPLIT_HOP_MS;
+    }
+
+    let boundaries = detect_change_points(&embs, total_ms);
+    if boundaries.is_empty() {
+        return whole_segment(job_samples);
+    }
+
+    // 文本按 token 时间戳分组；模型未提供时间戳（或与 tokens 不等长）时逐子段
+    // 重识别兜底（较慢但正确），保持"识别只跑一次"的常态优化不影响正确性。
+    let groups = group_tokens_by_boundaries(&transcript.tokens, &transcript.timestamps, &boundaries);
+    if groups.is_none() {
+        eprintln!("段内切分: 时间戳缺失,子段重识别回退");
+    }
+
+    let mut subs: Vec<SubFinal> = Vec::new();
+    let seg_count = boundaries.len() + 1;
+    for i in 0..seg_count {
+        let seg_start_ms = if i == 0 { 0 } else { boundaries[i - 1] };
+        let seg_end_ms = if i < boundaries.len() { boundaries[i] } else { total_ms };
+        let start_idx = ms_to_sample_idx(seg_start_ms).min(job_samples.len());
+        // 末子段直接取到样本末尾：ms 换算下取整会丢掉 <1ms 的尾部样本，母段
+        // 最后一个子段没有下一边界兜底，用真实样本长度消除这点误差。
+        let end_idx = if i == seg_count - 1 {
+            job_samples.len()
+        } else {
+            ms_to_sample_idx(seg_end_ms).min(job_samples.len())
+        };
+        let sub_samples = job_samples[start_idx..end_idx].to_vec();
+
+        let text = match &groups {
+            Some(g) => g[i].clone(),
+            None => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    recognizer.recognize(&sub_samples)
+                })) {
+                    Ok(Ok(t)) => {
+                        // 重识别产出的是全新转写，可能与母段整体判断不一致（如
+                        // AEC 残渣独立成段后更像纯外语幻觉）；沿用母段语言标签
+                        // （lang 未变，仅 text 是新的）复核一次，命中则该子段
+                        // 文本置空——下面的空文本判断会自然丢弃它，不单独处理。
+                        if is_foreign_final(&transcript.lang, &t.text) {
+                            eprintln!("段内切分: 回退子段命中语言过滤,丢弃");
+                            String::new()
+                        } else {
+                            t.text
+                        }
+                    }
+                    Ok(Err(_)) => "[识别失败]".to_string(),
+                    Err(_) => {
+                        eprintln!("段内切分: 子段重识别 panic,以占位继续");
+                        "[识别失败]".to_string()
+                    }
+                }
+            }
+        };
+
+        // 子段文本 trim 后为空 → 丢弃该子段（与空白段过滤同哲学：无文本内容
+        // 不产 final）。是否全部被丢在循环结束后统一检查、回退整段。
+        if text.trim().is_empty() {
+            continue;
+        }
+        subs.push(SubFinal {
+            text,
+            samples: sub_samples,
+            start_ms: job_start_ms + seg_start_ms,
+            end_ms: job_start_ms + seg_end_ms,
+        });
+    }
+
+    if subs.is_empty() {
+        // 全部子段文本被丢弃：不丢内容不变式 → 回退单元素原段。
+        return whole_segment(job_samples);
+    }
+
+    eprintln!(
+        "段内切分: 母段 {total_ms}ms 切为 {} 子段,耗时 {}ms",
+        subs.len(),
+        split_started_at.elapsed().as_millis()
+    );
+    subs
 }
 
 /// 完成句识别任务：进 finals 队列，永不丢弃（保证不丢内容）。
@@ -303,103 +506,103 @@ pub fn run_asr_worker(
                     release_pending!(p);
                 }
 
-                let (text, lang) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let t: Transcript = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     recognizer.recognize(&job.samples)
                 })) {
-                    Ok(Ok(t)) => (t.text, t.lang),
-                    Ok(Err(_)) => ("[识别失败]".to_string(), String::new()),
+                    Ok(Ok(t)) => t,
+                    Ok(Err(_)) => Transcript { text: "[识别失败]".to_string(), ..Default::default() },
                     Err(_) => {
                         eprintln!(
                             "run_asr_worker: recognize panicked on a {:?} final; 以占位继续",
                             job.source
                         );
-                        ("[识别失败]".to_string(), String::new())
+                        Transcript { text: "[识别失败]".to_string(), ..Default::default() }
                     }
                 };
                 // 语言白名单:外语幻觉段与 ECHO 命中同待遇——不 embed/不 assign/
                 // 不 emit/不落盘,从源头杜绝垃圾段污染说话人表。占位段占比 0 天然放行。
-                if is_foreign_final(&lang, &text) {
+                if is_foreign_final(&t.lang, &t.text) {
                     eprintln!(
-                        "语言过滤: 丢弃 {:?} 段 lang=\"{lang}\" text=\"{}\"",
+                        "语言过滤: 丢弃 {:?} 段 lang=\"{}\" text=\"{}\"",
                         job.source,
-                        text_prefix20(&text)
+                        t.lang,
+                        text_prefix20(&t.text)
                     );
                     // 被丢段无 final 接替，前端只在收到 final 时清 partial 预览，
                     // 幻觉文本会残留成 UI 残影；主动推空 partial 顶掉它。
                     on_partial(job.source, String::new());
                     continue;
                 }
-                let seg_rms = rms_of(&job.samples);
 
-                match job.source {
-                    Source::System => {
-                        let sys_norm = normalize_text(&text);
-                        // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
-                        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的
-                        // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
-                        // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
-                        // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
-                        // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 是
-                        // 外层 FnMut，闭包已捕获 job/sys_norm）；改用局部 flag，retain
-                        // 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
-                        let mut dropped_mic = false;
-                        pending_mic.retain(|p| {
-                            if p.text == "[识别失败]" {
-                                return true;
+                // 占位段("[识别失败]")没有时间戳也没有切分意义,不进滑窗切分,
+                // 沿既有专用路径原样走一个"子段"。真实段交给 split_final:装不下/
+                // 跑不动/切不出/切了也没内容 → 内部各失败路径回退单元素原段，
+                // 下面循环体在"无变更点"的绝大多数段上退化为原逻辑，零行为变化。
+                let subs: Vec<SubFinal> = if t.text == "[识别失败]" {
+                    vec![SubFinal {
+                        text: t.text,
+                        samples: job.samples,
+                        start_ms: job.start_ms,
+                        end_ms: job.end_ms,
+                    }]
+                } else {
+                    split_final(job.samples, job.start_ms, job.end_ms, &t, &mut recognizer, &mut embedder)
+                };
+
+                for sub in subs {
+                    let seg_rms = rms_of(&sub.samples);
+                    match job.source {
+                        Source::System => {
+                            let sys_norm = normalize_text(&sub.text);
+                            // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
+                            // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的
+                            // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
+                            // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
+                            // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
+                            // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 是
+                            // 外层 FnMut，闭包已捕获 sub/sys_norm）；改用局部 flag，retain
+                            // 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
+                            let mut dropped_mic = false;
+                            pending_mic.retain(|p| {
+                                if p.text == "[识别失败]" {
+                                    return true;
+                                }
+                                // AEC 残渣抑制:与文本回声去重镜像的第二个检查点——新到 system
+                                // 段与某 pending mic 段重叠且 mic 段 rms 低,视为残渣,先于文本
+                                // 相似度判定丢弃(残渣文本本就与 system 段不相似,躲不过下面的
+                                // echoed 判定,须单独拦)。
+                                if is_residue_pair(p.rms, p.start_ms, p.end_ms, sub.start_ms, sub.end_ms) {
+                                    eprintln!(
+                                        "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                                        p.rms,
+                                        text_prefix20(&p.text)
+                                    );
+                                    dropped_mic = true;
+                                    return false;
+                                }
+                                let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
+                                    && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+                                if echoed {
+                                    eprintln!(
+                                        "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                                        text_prefix20(&p.text),
+                                        text_prefix20(&sub.text)
+                                    );
+                                    dropped_mic = true;
+                                }
+                                !echoed
+                            });
+                            if dropped_mic {
+                                on_partial(Source::Mic, String::new());
                             }
-                            let echoed = time_near(p.start_ms, p.end_ms, job.start_ms, job.end_ms)
-                                && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
-                            if echoed {
-                                eprintln!(
-                                    "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
-                                    text_prefix20(&p.text),
-                                    text_prefix20(&text)
-                                );
-                                dropped_mic = true;
-                            }
-                            !echoed
-                        });
-                        if dropped_mic {
-                            on_partial(Source::Mic, String::new());
-                        }
-                        // system 段零延迟处理。
-                        process_final(
-                            job.source,
-                            text.clone(),
-                            job.start_ms,
-                            job.end_ms,
-                            job.samples.len(),
-                            &job.samples,
-                            seg_rms,
-                            &mut embedder,
-                            &mut registry,
-                            &mut last_sent,
-                            &mut on_final,
-                            &mut on_diar,
-                        );
-                        recent_system.push_back(RecentSystem {
-                            text,
-                            norm: sys_norm,
-                            start_ms: job.start_ms,
-                            end_ms: job.end_ms,
-                        });
-                        let newest_end = job.end_ms;
-                        recent_system
-                            .retain(|r| newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS);
-                    }
-                    Source::Mic => {
-                        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
-                        // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
-                        // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
-                        // hold，直接走完整处理链即时处理。
-                        if text == "[识别失败]" {
+                            // system 段零延迟处理。
                             process_final(
                                 job.source,
-                                text,
-                                job.start_ms,
-                                job.end_ms,
-                                job.samples.len(),
-                                &job.samples,
+                                sub.text.clone(),
+                                sub.start_ms,
+                                sub.end_ms,
+                                sub.samples.len(),
+                                &sub.samples,
                                 seg_rms,
                                 &mut embedder,
                                 &mut registry,
@@ -407,34 +610,76 @@ pub fn run_asr_worker(
                                 &mut on_final,
                                 &mut on_diar,
                             );
-                        } else {
-                            let mic_norm = normalize_text(&text);
-                            let echo = recent_system.iter().find(|r| {
-                                time_near(job.start_ms, job.end_ms, r.start_ms, r.end_ms)
-                                    && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                            recent_system.push_back(RecentSystem {
+                                text: sub.text,
+                                norm: sys_norm,
+                                start_ms: sub.start_ms,
+                                end_ms: sub.end_ms,
                             });
-                            match echo {
-                                Some(r) => {
-                                    eprintln!(
-                                        "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
-                                        text_prefix20(&text),
-                                        text_prefix20(&r.text)
-                                    );
-                                    // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
-                                    // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
-                                    on_partial(job.source, String::new());
-                                }
-                                None => {
-                                    pending_mic.push_back(PendingMic {
-                                        text,
-                                        norm: mic_norm,
-                                        start_ms: job.start_ms,
-                                        end_ms: job.end_ms,
-                                        samples_len: job.samples.len(),
-                                        embedding_input: job.samples,
-                                        held_at: Instant::now(),
-                                        rms: seg_rms,
-                                    });
+                            let newest_end = sub.end_ms;
+                            recent_system.retain(|r| {
+                                newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS
+                            });
+                        }
+                        Source::Mic => {
+                            // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
+                            // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
+                            // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
+                            // hold，直接走完整处理链即时处理。
+                            if sub.text == "[识别失败]" {
+                                process_final(
+                                    job.source,
+                                    sub.text,
+                                    sub.start_ms,
+                                    sub.end_ms,
+                                    sub.samples.len(),
+                                    &sub.samples,
+                                    seg_rms,
+                                    &mut embedder,
+                                    &mut registry,
+                                    &mut last_sent,
+                                    &mut on_final,
+                                    &mut on_diar,
+                                );
+                            } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &recent_system) {
+                                // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
+                                // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
+                                // ECHO 命中同待遇。
+                                eprintln!(
+                                    "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                                    seg_rms,
+                                    text_prefix20(&sub.text)
+                                );
+                                on_partial(job.source, String::new());
+                            } else {
+                                let mic_norm = normalize_text(&sub.text);
+                                let echo = recent_system.iter().find(|r| {
+                                    time_near(sub.start_ms, sub.end_ms, r.start_ms, r.end_ms)
+                                        && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                                });
+                                match echo {
+                                    Some(r) => {
+                                        eprintln!(
+                                            "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                                            text_prefix20(&sub.text),
+                                            text_prefix20(&r.text)
+                                        );
+                                        // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
+                                        // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
+                                        on_partial(job.source, String::new());
+                                    }
+                                    None => {
+                                        pending_mic.push_back(PendingMic {
+                                            text: sub.text,
+                                            norm: mic_norm,
+                                            start_ms: sub.start_ms,
+                                            end_ms: sub.end_ms,
+                                            samples_len: sub.samples.len(),
+                                            embedding_input: sub.samples,
+                                            held_at: Instant::now(),
+                                            rms: seg_rms,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1199,8 +1444,8 @@ mod asr_worker_tests {
             }
         }
         let script = vec![
-            Transcript { text: "でかし".into(), lang: "<|ja|>".into() },
-            Transcript { text: "正常句子".into(), lang: "<|zh|>".into() },
+            Transcript { text: "でかし".into(), lang: "<|ja|>".into(), ..Default::default() },
+            Transcript { text: "正常句子".into(), lang: "<|zh|>".into(), ..Default::default() },
         ];
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
         tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 0, end_ms: 100 }).unwrap();
@@ -1222,6 +1467,320 @@ mod asr_worker_tests {
         assert_eq!(finals[0].0, "正常句子");
         let rms = finals[0].1.expect("正常段必须带 rms");
         assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
+    }
+
+    // ---- AEC 残渣抑制(冒烟反馈):能量+重叠双条件,与文本回声去重两个检查点镜像 ----
+
+    /// 检查点(a):mic 段到达时对照 recent_system——system 先到、已入 recent_system,
+    /// 随后到达的 mic 段幅度低(rms 低)且与该 system 段 90% 重叠 → 判定残渣丢弃。
+    #[test]
+    fn aec_residue_dropped_when_rms_low_and_overlap_high() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // system: 100..3000ms;mic: 0..1000ms → overlap_fraction(mic,system) = 900/1000 = 0.9。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 0, end_ms: 1000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "残渣文本大。"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "system speech here".to_string())],
+            "rms 低且与 system 段高度重叠的 mic 段应被判定为 AEC 残渣丢弃"
+        );
+    }
+
+    /// 同样 90% 重叠,但 mic 段幅度高(rms 高,近场真人声典型值)→ 不应误杀,应保留。
+    #[test]
+    fn aec_residue_kept_when_overlap_high_but_rms_high() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 100], start_ms: 0, end_ms: 1000 }).unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "真人插话内容"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        let got = finals.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "rms 高的真人插话不应被残渣抑制误杀: {got:?}");
+        assert!(got.contains(&(Source::System, "system speech here".to_string())));
+        assert!(got.contains(&(Source::Mic, "真人插话内容".to_string())));
+    }
+
+    /// rms 低但与 system 段无时间重叠 → 不应误杀,应保留。
+    #[test]
+    fn aec_residue_kept_when_rms_low_but_no_overlap() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        // mic 段远早于 system 段,零重叠。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 90_000, end_ms: 91_000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["system speech here", "远处安静片段"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        let got = finals.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "无时间重叠的低 rms 段不应被残渣抑制误杀: {got:?}");
+        assert!(got.contains(&(Source::System, "system speech here".to_string())));
+        assert!(got.contains(&(Source::Mic, "远处安静片段".to_string())));
+    }
+
+    /// 检查点(b):mic 段先到、进 pending_mic hold 中,随后到达的 system 段与其 90% 重叠
+    /// 且 mic rms 低 → retain 闭包内判定残渣丢弃(mic 段不会走到 release 那一步)。
+    #[test]
+    fn aec_residue_dropped_via_pending_mic_when_system_arrives_later() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        // mic: 0..1000ms,先到,rms 低;system: 100..3000ms,后到,与 mic 重叠 90%。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.005; 100], start_ms: 0, end_ms: 1000 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.2; 100], start_ms: 100, end_ms: 3000 })
+            .unwrap();
+        drop(tx);
+
+        let recognizer = ScriptedRecognizer::new(&["残渣文本大。", "system speech here"]);
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let _ = run_asr_worker(
+            Box::new(recognizer),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            *finals.lock().unwrap(),
+            vec![(Source::System, "system speech here".to_string())],
+            "pending 中 rms 低的 mic 段应在 system 到达时经 retain 闭包判定残渣丢弃"
+        );
+    }
+
+    // ---- 段内说话人分离(Task 3):滑窗嵌入 → 变更点 → 切子段,各自走既有链 ----
+
+    /// 双说话人混说段被切成两个 final,各自说话人;单说话人段不乱切。
+    #[test]
+    fn worker_splits_mixed_segment_into_two_finals() {
+        // ContentEmbedder: 按窗样本均值返回 e1(<0.5) / e2(≥0.5)——前半 0.1、后半 0.9
+        // 的 8s 段,滑窗序列前半 e1 后半 e2,应检出 1 个变更点。
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // TimedRecognizer: 8 个 token,时间戳均匀分布 0..8s,文本 t0..t7
+        struct TimedRecognizer;
+        impl Recognizer for TimedRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(Transcript {
+                    text: "t0t1t2t3t4t5t6t7".into(),
+                    tokens: (0..8).map(|i| format!("t{i}")).collect(),
+                    timestamps: (0..8).map(|i| i as f32).collect(),
+                    ..Default::default()
+                })
+            }
+        }
+        let mut samples = vec![0.1f32; 4 * 16000];
+        samples.extend(vec![0.9f32; 4 * 16000]);
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples, start_ms: 0, end_ms: 8000 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<(String, u64, u64, Option<String>)> = Vec::new();
+        run_asr_worker(
+            Box::new(TimedRecognizer),
+            Some(Box::new(ContentEmbedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            Vec::new(),
+            |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(finals.len(), 2, "混说段应切成两个 final: {finals:?}");
+        assert!(finals[0].3 != finals[1].3, "两子段说话人应不同");
+        assert_eq!(finals[0].1, 0);
+        assert_eq!(finals[1].2, 8000, "时间轴首尾衔接母段");
+        assert!(finals[0].2 == finals[1].1, "子段边界无缝");
+        assert_eq!(format!("{}{}", finals[0].0, finals[1].0), "t0t1t2t3t4t5t6t7", "文本无损");
+    }
+
+    /// 单说话人长段:嵌入恒同 → 不切,单 final(现状不回归)。
+    #[test]
+    fn worker_keeps_uniform_segment_whole() {
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        struct TimedRecognizer;
+        impl Recognizer for TimedRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(Transcript {
+                    text: "t0t1t2t3t4t5t6t7".into(),
+                    tokens: (0..8).map(|i| format!("t{i}")).collect(),
+                    timestamps: (0..8).map(|i| i as f32).collect(),
+                    ..Default::default()
+                })
+            }
+        }
+        // 全段样本恒为 0.1 → 每窗嵌入均为 e1,detect_change_points 无变更点。
+        let samples = vec![0.1f32; 8 * 16000];
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples, start_ms: 0, end_ms: 8000 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<(String, u64, u64, Option<String>)> = Vec::new();
+        run_asr_worker(
+            Box::new(TimedRecognizer),
+            Some(Box::new(ContentEmbedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            Vec::new(),
+            |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(finals.len(), 1, "单说话人段不应被乱切: {finals:?}");
+        assert_eq!(finals[0].0, "t0t1t2t3t4t5t6t7");
+        assert_eq!((finals[0].1, finals[0].2), (0, 8000));
+    }
+
+    /// 回归终审 Finding：时间戳缺失走"子段重识别"回退时，重识别产出的新文本
+    /// 未经语言过滤——某子段（如 AEC 残渣独立成段后）重识别出纯外语幻觉文本本应
+    /// 被丢弃，却绕过了整段判定时用过的过滤器直接进入处理链。修复后：回退路径
+    /// 对每个重识别子段沿用母段的 lang 标签复核一次，命中即丢弃该子段（空文本
+    /// 走既有丢弃逻辑），不丢内容不变式仍成立（另一子段正常保留）。
+    #[test]
+    fn worker_split_fallback_reidentified_subseg_hits_language_filter() {
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // 第 1 次 recognize：整段初次识别，故意不带 tokens/timestamps → group_tokens
+        // 返回 None，split_final 走子段重识别回退。lang 标为中文（整段判定放行）。
+        // 第 2/3 次：两个子段各自的重识别结果——第一段正常中文，第二段纯假名幻觉。
+        struct ScriptedFallbackRecognizer {
+            calls: usize,
+        }
+        impl Recognizer for ScriptedFallbackRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    1 => Transcript {
+                        text: "占位母段文本".into(),
+                        lang: "<|zh|>".into(),
+                        ..Default::default()
+                    },
+                    2 => Transcript { text: "第一部分内容".into(), ..Default::default() },
+                    _ => {
+                        Transcript { text: "でかしでかしでかしでかしでかし".into(), ..Default::default() }
+                    }
+                })
+            }
+        }
+
+        let mut samples = vec![0.1f32; 4 * 16000];
+        samples.extend(vec![0.9f32; 4 * 16000]);
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples, start_ms: 0, end_ms: 8000 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<(String, u64, u64, Option<String>)> = Vec::new();
+        run_asr_worker(
+            Box::new(ScriptedFallbackRecognizer { calls: 0 }),
+            Some(Box::new(ContentEmbedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            Vec::new(),
+            |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            finals.len(),
+            1,
+            "重识别出的纯假名子段应被语言过滤丢弃,只留正常那一段: {finals:?}"
+        );
+        assert_eq!(finals[0].0, "第一部分内容");
+    }
+
+    /// 回归终审 Finding：末子段边界按 ms_to_sample_idx(total_ms) 换算会因 ms 记账
+    /// 与实际样本数不能整除而丢掉 <1ms 的尾部样本（真实采集里 ms 时长与样本数
+    /// 并非总能整除，是常见的记账误差来源，非本模块内部计算引入）。修复后末子段
+    /// 直接取到 job_samples 末尾，样本总量与母段完全一致。
+    #[test]
+    fn split_final_last_subsegment_keeps_full_sample_tail() {
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // 名义时长 8000ms 对应 128000 样本，实际样本多出 7 个(<1ms 的尾巴)。
+        let mut samples = vec![0.1f32; 4 * 16000];
+        samples.extend(vec![0.9f32; 4 * 16000 + 7]);
+        let total_len = samples.len();
+        let transcript = Transcript {
+            text: "t0t1t2t3t4t5t6t7".into(),
+            tokens: (0..8).map(|i| format!("t{i}")).collect(),
+            timestamps: (0..8).map(|i| i as f32).collect(),
+            ..Default::default()
+        };
+        let mut recognizer: Box<dyn Recognizer> = Box::new(CountingRecognizer);
+        let mut embedder: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ContentEmbedder));
+        let subs = split_final(samples, 0, 8000, &transcript, &mut recognizer, &mut embedder);
+        assert_eq!(subs.len(), 2, "应切成两个子段");
+        let total_sub_samples: usize = subs.iter().map(|s| s.samples.len()).sum();
+        assert_eq!(total_sub_samples, total_len, "子段样本总长应等于母段样本总长,不丢尾部样本");
     }
 }
 
@@ -1428,5 +1987,28 @@ mod tests {
         assert!(!is_foreign_final("", "純漢字幻覺讀作中文"), "纯汉字不拦(无损)");
         assert!(!is_foreign_final("", "[识别失败]"), "占位段绝不误杀");
         assert!(!is_foreign_final("", ""), "空串放行");
+    }
+
+    #[test]
+    fn overlap_fraction_basic_cases() {
+        assert_eq!(overlap_fraction(0, 1000, 100, 3000), 0.9, "90% 重叠");
+        assert_eq!(overlap_fraction(0, 1000, 2000, 3000), 0.0, "无重叠");
+        assert_eq!(overlap_fraction(0, 1000, 0, 1000), 1.0, "完全重叠");
+        assert_eq!(overlap_fraction(5, 5, 0, 100), 0.0, "a 时长为 0,防御性返回 0");
+    }
+
+    #[test]
+    fn text_similarity_contains_shortcut_needs_minimum_length() {
+        // 短语气词被长文本"完全包含"不应再拿满分捷径(子段化后短子段更容易撞上)。
+        assert!(
+            text_similarity("嗯", "嗯,今天我们讨论的议题是这样的") < 1.0,
+            "过短的一方不应触发 contains 满分"
+        );
+        // 双方都够长时,contains 捷径照常命中(不收窄正常场景)。
+        assert_eq!(
+            text_similarity("今天我们讨论的议题", "今天我们讨论的议题以及后续安排"),
+            1.0,
+            "较长文本仍应正常触发 contains 满分"
+        );
     }
 }
