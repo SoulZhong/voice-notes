@@ -17,10 +17,12 @@
   --ink-secondary: #5d5b54;
   --ink-faint: #a4a097;
 
-  /* 唯一强调色：互动蓝表达“可交互/进行中” */
-  --accent: #0075de;
-  --accent-pressed: #005bab;
-  --accent-tint: rgba(0, 117, 222, 0.08);
+  /* 唯一强调色：互动蓝表达“可交互/进行中”。
+     取 Notion 应用内的 #2383e2 而非官网链接蓝 #0075de——后者饱和度过高,
+     大面积填充(主按钮)时发艳显糙;应用内蓝更沉稳(质感反馈调整)。 */
+  --accent: #2383e2;
+  --accent-pressed: #1a6dc0;
+  --accent-tint: rgba(35, 131, 226, 0.08);
   --on-accent: #ffffff;
 
   /* 破坏性操作/错误 */
@@ -61,8 +63,10 @@
   --radius-xl: 12px;
   --radius-full: 9999px;
 
-  /* 唯一允许的阴影：浮层菜单/弹层 */
+  /* 阴影:浮层菜单/弹层用 popover;按钮允许 Notion 同款"1px 内描边 + 2px 微投影"
+     (纯平按钮显廉价——质感反馈调整,是"发丝线代替阴影"原则的唯一按钮级例外) */
   --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-btn: inset 0 0 0 1px rgba(15, 15, 15, 0.06), 0 1px 2px rgba(15, 15, 15, 0.07);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -78,9 +82,9 @@
     --ink-secondary: #9b9998;
     --ink-faint: #6f6e69;
 
-    --accent: #529cca;
-    --accent-pressed: #3d85b5;
-    --accent-tint: rgba(82, 156, 202, 0.15);
+    --accent: #4a94d8;
+    --accent-pressed: #3a7fbe;
+    --accent-tint: rgba(74, 148, 216, 0.15);
     --on-accent: #ffffff;
 
     --danger: #ff6b6b;
@@ -106,5 +110,35 @@
 
     /* 暗色阴影更沉，避免浮层在深底上糊成一片 */
     --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.4);
+    --shadow-btn: inset 0 0 0 1px rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.3);
   }
+}
+
+/* ============================================================
+ * 全局基调(质感层):标题字级统一、交互过渡、按钮微阴影。
+ * 元素级选择器只放"每个组件都该有、且无组件差异"的规则。
+ * ============================================================ */
+
+/* h1 不定字级时是浏览器默认 2em,页面标题失控巨大——统一为 page-title token */
+h1 {
+  font-size: 1.45rem;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.3px;
+}
+
+/* 悬停瞬变显糙:所有交互控件统一 120ms 缓动 */
+button,
+input,
+a {
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+/* 按压回馈:实体按钮各组件按需加 --shadow-btn(链接式按钮不加,全局一刀切会误伤) */
+button:active:not(:disabled) {
+  transform: translateY(0.5px);
 }

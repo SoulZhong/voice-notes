@@ -89,10 +89,17 @@
     onclick={toggleRecording}
     disabled={recording.pending}
   >
-    {recording.isLive ? (recording.paused ? "⏸ 已暂停 · 停止" : "■ 停止") : "● 开始录制"}
+    <span class="rec-dot" class:square={recording.isLive}></span>
+    {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
-  <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">👤 说话人</a>
+  <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+      <circle cx="8" cy="5.2" r="2.7" />
+      <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
+    </svg>
+    说话人
+  </a>
 
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
@@ -164,43 +171,66 @@
     box-sizing: border-box;
     overflow-y: auto;
   }
-  /* button-primary（未录制：开始录制）；录制中变为 button-secondary 形态，
-     字色用 --record（唯一常驻彩色信号），呼应“停止录制按钮:字 record”。 */
+  /* 录制按钮:白底 + 红点(语音备忘录式)。大面积强调蓝在侧栏太吵,主 CTA 的
+     "彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
   .record-btn {
-    border: 1px solid transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5em;
+    border: none;
     border-radius: var(--radius-md);
-    padding: 0.6em 1em;
+    padding: 0.55em 1em;
     font-size: 0.9rem;
     font-weight: 500;
     cursor: pointer;
-    color: var(--on-accent);
-    background: var(--accent);
+    color: var(--ink);
+    background: var(--canvas);
+    box-shadow: var(--shadow-btn);
   }
   .record-btn:hover {
-    background: var(--accent-pressed);
+    background: var(--surface-soft);
+  }
+  .rec-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: var(--radius-full);
+    background: var(--record);
+    flex-shrink: 0;
+  }
+  /* 录制中红点变方块 = 通用"停止"符号,文字不再需要 Unicode 符号凑数 */
+  .rec-dot.square {
+    border-radius: 2px;
   }
   .record-btn.recording {
-    background: transparent;
-    border-color: var(--hairline-strong);
     color: var(--record);
-  }
-  .record-btn.recording:hover {
-    background: var(--surface-soft);
+    font-weight: 600;
   }
   .record-btn:disabled {
     opacity: 0.6;
     cursor: default;
   }
   .nav-link {
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 0.45em;
     box-sizing: border-box;
     margin-top: 0.6rem;
     padding: 0.45em 0.6em;
     border-radius: var(--radius-md);
-    color: inherit;
+    color: var(--ink-secondary);
     text-decoration: none;
     font-size: 0.9em;
     font-weight: 500;
+  }
+  .nav-icon {
+    width: 15px;
+    height: 15px;
+    color: var(--ink-faint);
+  }
+  .nav-link.current .nav-icon,
+  .nav-link:hover .nav-icon {
+    color: var(--ink-secondary);
   }
   .nav-link:hover {
     background: var(--surface-soft);
@@ -210,20 +240,25 @@
     color: var(--ink);
     font-weight: 700;
   }
-  /* input 规范：hairline-strong 边，focus 变 accent + 1px 同色外环 */
+  /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,
+     Notion 侧栏过滤即此形态;聚焦才浮出 canvas 底 + accent 环。 */
   .search {
     box-sizing: border-box;
     width: 100%;
     margin: 0.75rem 0;
     padding: 0.4em 0.7em;
     border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--canvas);
+    border: 1px solid transparent;
+    background: var(--surface-press);
     color: var(--ink);
     font-size: 0.9em;
   }
+  .search::placeholder {
+    color: var(--ink-faint);
+  }
   .search:focus {
     outline: none;
+    background: var(--canvas);
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent);
   }
@@ -233,12 +268,22 @@
     padding: 0;
   }
   .item {
-    padding: 0.55rem 0.4rem;
-    border-bottom: 1px solid var(--hairline);
+    padding: 0.55rem 0.5rem;
+    border-radius: var(--radius-md);
+  }
+  .item:hover {
+    background: var(--surface-soft);
   }
   .item.current {
     background: var(--surface-press);
-    border-radius: var(--radius-md);
+  }
+  /* 悬停显影:行级操作默认隐身,列表保持安静(DESIGN.md 原则 5) */
+  .item .actions {
+    visibility: hidden;
+  }
+  .item:hover .actions,
+  .item.current .actions {
+    visibility: visible;
   }
   .main-line {
     display: flex;

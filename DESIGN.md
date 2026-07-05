@@ -9,7 +9,7 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 1. **内容优先**:转写段落是页面的主角。正文行高 1.7、可读列宽、无干扰底色;一切控件视觉权重低于正文。
 2. **温暖中性**:灰不是冷灰——画布纯白,表面/悬停用带暖调的 `surface` 系;文字用炭墨 `ink` 而非纯黑。
 3. **单一强调**:互动蓝 `accent` 只表达"可交互/正在进行";danger 红只在确认破坏性操作时出现;录制红点是唯一的常驻彩色信号。
-4. **发丝线代替阴影**:卡片、按钮、菜单一律 1px `hairline` 边界 + 悬停换底色;唯一允许的阴影是浮层菜单的 `shadow-popover`。
+4. **发丝线代替阴影**:卡片、列表、菜单一律 1px `hairline` 边界 + 悬停换底色;浮层菜单用 `shadow-popover`。**唯一例外**:实体按钮(有底色的 primary/secondary)用 `shadow-btn`(Notion 同款 1px 内描边 + 2px 微投影)——纯平按钮显廉价;链接式按钮不加。全部交互控件 120ms 缓动过渡,实体按钮按压下沉 0.5px。
 5. **悬停显影**:行级操作(删除/合并/改名角标)默认隐身,悬停浮现——保持列表安静。
 6. **双主题同权**:每个 token 都有暗色值;暗色不是反色,是 Notion 式深暖灰(#191919 系),避免纯黑。
 
@@ -26,9 +26,9 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 | ink | `#37352f` | `#d3d1cb` | 主文字(炭墨,非纯黑) |
 | ink-secondary | `#5d5b54` | `#9b9998` | 次要文字、说明 |
 | ink-faint | `#a4a097` | `#6f6e69` | 占位、时间戳、微文字 |
-| accent | `#0075de` | `#529cca` | 链接、可交互、主按钮底 |
-| accent-pressed | `#005bab` | `#3d85b5` | 主按钮按压 |
-| accent-tint | `rgba(0,117,222,.08)` | `rgba(82,156,202,.15)` | 可编辑悬停底、选中弱底 |
+| accent | `#2383e2` | `#4a94d8` | 链接、可交互、主按钮底(Notion 应用内蓝;官网链接蓝 #0075de 饱和过高,大面积填充发艳) |
+| accent-pressed | `#1a6dc0` | `#3a7fbe` | 主按钮按压 |
+| accent-tint | `rgba(35,131,226,.08)` | `rgba(74,148,216,.15)` | 可编辑悬停底、选中弱底 |
 | on-accent | `#ffffff` | `#ffffff` | 主按钮文字 |
 | danger | `#e03131` | `#ff6b6b` | 破坏性确认、错误(按钮/图标) |
 | danger-ink | `#9b1c1c` | `#ffb3b3` | 错误横幅正文(浅红底上高饱和 danger 仅 3.9:1,需专用深色达 AA) |
@@ -90,7 +90,9 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 - **button-link**:无底无边,`accent` 字,0.85em;行级操作(删除/合并/取消)。悬停加下划线。
 - **input**:1px `hairline-strong` 边、rounded-md、focus 边变 `accent` + 1px 同色外环(box-shadow 0 0 0 1px);底 `canvas`。
 - **list-row**(笔记列表/说话人列表):透明底、行间 1px `hairline` 分隔;hover `surface-soft`;选中/活动 `surface-press`。操作按钮 hover 显影。
-- **sidebar**:`surface` 底、右侧 1px `hairline`;条目 rounded-md,hover `surface-soft`,当前页 `surface-press` + `ink` 加粗;录制中条目前的红点用 `record`。
+- **sidebar**:`surface` 底、右侧 1px `hairline`;条目 rounded-md,hover `surface-soft`,当前页 `surface-press` + `ink` 加粗;行级操作悬停显影;行间不画分隔线(靠间距与 hover)。录制按钮 = `canvas` 底 + `shadow-btn` + 红点(录制中红点变圆角方块,字色 `record`)——大面积强调蓝在侧栏太吵,彩色由红点承担。侧栏过滤框用内嵌式(`surface-press` 底、无边),聚焦浮出 `canvas` 底 + accent 环。
+- **图形符号**:录制/停止等符号用 CSS 图形(圆点/圆角方块)或 16px 线性 SVG(stroke currentColor),**禁用 emoji 与 Unicode 符号字符**(●■▶⏸👤)——各平台字形与基线不一,是质感杀手。
+- **状态行**:辅助状态文字降为 caption 级 `ink-faint`,前缀 7px 状态点(活跃 `record`,空闲 `ink-faint`)。空态文案在容器内居中,不左对齐孤行。
 - **transcript-container**:`surface` 底、rounded-xl、padding 16-20px;段落间距 6px;正文 `transcript` 字级。
 - **speaker-badge**:粉彩 tint 底 + `ink` 字、rounded-sm、`micro` 字级;哈希取色循环上表 7 色。
 - **speaker-chip**(顶部说话人条):同徽章色系,rounded-full,可点击时 hover 加 `accent-tint` 外环。

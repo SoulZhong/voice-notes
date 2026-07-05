@@ -49,21 +49,27 @@
   {#if !models || models.recording_ready}
     <div class="controls">
       {#if !recording.isLive}
-        <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>● 开始录制</button>
+        <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
+          <span class="sym dot on-blue"></span>开始录制
+        </button>
       {:else}
         {#if recording.paused}
-          <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>▶ 恢复</button>
+          <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
         {:else}
-          <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>⏸ 暂停</button>
+          <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
         {/if}
-        <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>■ 停止</button>
+        <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
+          <span class="sym square"></span>停止
+        </button>
       {/if}
       <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
       <div class="meter" title="麦克风电平"><div class="meter-fill" style="width:{levelPct}%"></div></div>
       {#if recording.paused}<span class="paused-tag">已暂停</span>{/if}
     </div>
 
-    <p class="status" class:error={isError(recording.status)}>状态：{recording.status}</p>
+    <p class="status" class:error={isError(recording.status)}>
+      <span class="status-dot" class:live={recording.isLive && !recording.paused}></span>{recording.status}
+    </p>
 
     {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
       <div class="banner">
@@ -124,33 +130,47 @@
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
      “录制红点是唯一常驻彩色信号”。 */
   .ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45em;
     border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
+    border: none;
     padding: 0.45em 1.1em;
     font-weight: 500;
     font-size: 0.9rem;
     cursor: pointer;
-    background: transparent;
+    background: var(--canvas);
     color: var(--ink);
+    box-shadow: var(--shadow-btn);
   }
   .ctl:hover { background: var(--surface-soft); }
   .ctl:disabled { opacity: 0.6; cursor: default; }
-  .ctl.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+  .ctl.primary { background: var(--accent); color: var(--on-accent); }
   .ctl.primary:hover { background: var(--accent-pressed); }
-  .ctl.danger { color: var(--record); }
+  .ctl.danger { color: var(--record); font-weight: 600; }
+  /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */
+  .sym {
+    width: 9px;
+    height: 9px;
+    flex-shrink: 0;
+  }
+  .sym.dot { border-radius: var(--radius-full); background: var(--record); }
+  .sym.dot.on-blue { background: var(--on-accent); }
+  .sym.square { border-radius: 2px; background: var(--record); }
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
     font-variant-numeric: tabular-nums;
     font-weight: 600;
+    font-size: 1rem;
     color: var(--ink-secondary);
   }
   .timer.pausedTimer { color: var(--ink-faint); }
-  /* 电平表：轨 hairline、填充 success */
+  /* 电平表：细轨(5px)圆头,信息条不该比按钮抢眼 */
   .meter {
-    width: 120px;
-    height: 8px;
+    width: 96px;
+    height: 5px;
     background: var(--hairline);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-full);
     overflow: hidden;
   }
   .meter-fill {
@@ -168,9 +188,23 @@
     padding: 0.1em 0.5em;
   }
 
+  /* 状态行降为 caption 级:辅助信息不与正文争夺注意力;状态点是唯一动态信号 */
   .status {
-    color: var(--ink-secondary);
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    color: var(--ink-faint);
+    font-size: 0.85rem;
     margin: 0 0 1rem;
+  }
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--ink-faint);
+  }
+  .status-dot.live {
+    background: var(--record);
   }
 
   .status.error {
@@ -201,8 +235,12 @@
     font-style: italic;
   }
 
-  .hint {
+  /* 空态居中:一大块灰底里孤零零一行左对齐文字显得没做完 */
+  .transcript .hint {
     color: var(--ink-faint);
+    text-align: center;
+    padding: 2.6rem 0;
+    margin: 0;
   }
 
   /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级；mic/system 是尚未
