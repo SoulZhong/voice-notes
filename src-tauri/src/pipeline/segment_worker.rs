@@ -39,6 +39,9 @@ fn emit_finished(
 /// paused 置位期间丢帧（时间轴冻结）；false→true 跳变瞬间把在途语句 flush 定稿。
 /// on_level（仅 mic 路传入）在闸前对归一后样本算 RMS、按 LEVEL_INTERVAL_SAMPLES
 /// 节流上报——暂停期间持续，供 UI 确认麦克风存活。
+/// audio_sink（音频保留）在暂停闸之后、segmenter.accept 之前收到与 accept 严格
+/// 同源的样本——写成 WAV 后「文件位置 == 段时间轴」按构造对齐;暂停期不写。
+#[allow(clippy::too_many_arguments)]
 pub fn run_segment_worker(
     source: Source,
     frame_rx: Receiver<AudioFrame>,
@@ -49,6 +52,7 @@ pub fn run_segment_worker(
     mut segmenter: Box<dyn Segmenter>,
     paused: Arc<AtomicBool>,
     on_level: Option<Box<dyn Fn(f32) + Send>>,
+    mut audio_sink: Option<Box<dyn FnMut(&[f32]) + Send>>,
 ) {
     let mut since_partial: usize = 0;
     let mut was_paused = false;
@@ -81,6 +85,9 @@ pub fn run_segment_worker(
         }
         was_paused = false;
 
+        if let Some(sink) = &mut audio_sink {
+            sink(&resampled);
+        }
         since_partial += resampled.len();
         segmenter.accept(&resampled);
         if emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate) > 0 {
@@ -123,6 +130,7 @@ mod tests {
                 slot2,
                 Box::new(MockSegmenter::new(8000)),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 None,
             );
         });
@@ -181,6 +189,7 @@ mod tests {
                 Box::new(ScriptedSegmenter { calls: 0 }),
                 Arc::new(AtomicBool::new(false)),
                 None,
+                None,
             );
         });
 
@@ -213,7 +222,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_segment_worker(
                 Source::Mic, frx, 16000, 4000, final_tx, s2,
-                Box::new(MockSegmenter::new(2000)), p2, None,
+                Box::new(MockSegmenter::new(2000)), p2, None, None,
             );
         });
         let frame = |n: usize| AudioFrame { samples: vec![0.1; n], sample_rate: 16000, channels: 1 };
@@ -261,6 +270,7 @@ mod tests {
                 Source::Mic, frx, 16000, 4000, final_tx, slot,
                 Box::new(MockSegmenter::new(2000)), paused,
                 Some(Box::new(move |v| c2.lock().unwrap().push(v))),
+                None,
             );
         });
         // 两帧、每帧恰好 LEVEL_INTERVAL_SAMPLES(1600) 个 0.5 → 各触发一次回调，RMS≈0.5。
@@ -272,5 +282,41 @@ mod tests {
         let got = calls.lock().unwrap();
         assert_eq!(got.len(), 2, "按 1600 样本节流：两帧两次");
         assert!((got[0] - 0.5).abs() < 1e-3, "RMS 计算正确: {}", got[0]);
+    }
+
+    #[test]
+    fn audio_sink_receives_accepted_samples_and_skips_paused_frames() {
+        let sunk = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let s2 = sunk.clone();
+        let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(16);
+        let (final_tx, final_rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(None));
+        let paused = Arc::new(AtomicBool::new(false));
+        let p2 = paused.clone();
+        let worker = std::thread::spawn(move || {
+            run_segment_worker(
+                Source::Mic, frx, 16000, 4000, final_tx, slot,
+                Box::new(MockSegmenter::new(2000)), p2, None,
+                Some(Box::new(move |s: &[f32]| s2.lock().unwrap().extend_from_slice(s))),
+            );
+        });
+
+        // 1) 正常帧 2500 样本 → sink 全收(与 accept 同源同量)。
+        ftx.send(AudioFrame { samples: vec![0.25; 2500], sample_rate: 16000, channels: 1 }).unwrap();
+        let _ = final_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("首段定稿");
+        // 2) 暂停期帧不写(时间轴冻结,音频同步冻结)。
+        paused.store(true, Ordering::Relaxed);
+        ftx.send(AudioFrame { samples: vec![0.9; 800], sample_rate: 16000, channels: 1 }).unwrap();
+        let _ = final_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("暂停跳变 flush");
+        // 3) 恢复后继续写。
+        paused.store(false, Ordering::Relaxed);
+        ftx.send(AudioFrame { samples: vec![0.5; 300], sample_rate: 16000, channels: 1 }).unwrap();
+        drop(ftx);
+        worker.join().unwrap();
+
+        let got = sunk.lock().unwrap();
+        assert_eq!(got.len(), 2800, "sink 收到的样本数 = 非暂停期 accept 的样本数");
+        assert!(got[..2500].iter().all(|v| (*v - 0.25).abs() < 1e-6));
+        assert!(got[2500..].iter().all(|v| (*v - 0.5).abs() < 1e-6), "暂停期 0.9 帧未混入");
     }
 }

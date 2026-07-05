@@ -142,6 +142,8 @@ impl VoiceprintStore {
     /// 把 loser 合并进 winner:质心逐 source 并入(同 source 加权平均,异 source 直插),
     /// total_ms 相加,winner 无名而 loser 有名则继承 loser 名;loser 从 people 移除,
     /// redirects 记 loser->winner 且把既有指向 loser 的项一并改指 winner(压扁链条)。
+    /// 录音样本随合并迁移:winner 无样本则继承 loser 的,有则删 loser 的(best-effort,
+    /// 文件操作失败不回滚已保存的库——样本是试听增值层,库结构一致性优先)。
     pub fn merge(&self, loser: &str, winner: &str) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let mut vp = self.load();
@@ -166,17 +168,91 @@ impl VoiceprintStore {
             }
         }
         vp.redirects.insert(loser.to_string(), winner.to_string());
-        self.save(&vp)
+        self.save(&vp)?;
+
+        if let (Some(lw), Some(ww)) = (self.sample_path(loser), self.sample_path(winner)) {
+            if lw.exists() {
+                let res =
+                    if ww.exists() { std::fs::remove_file(&lw) } else { std::fs::rename(&lw, &ww) };
+                if let Err(e) = res {
+                    eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)。
+    /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)
+    /// + 连带删除录音样本(best-effort)。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let mut vp = self.load();
         vp.people.remove(id);
         vp.redirects.retain(|_, target| target != id);
         vp.redirects.remove(id);
-        self.save(&vp)
+        self.save(&vp)?;
+        if let Some(sample) = self.sample_path(id) {
+            if sample.exists() {
+                if let Err(e) = std::fs::remove_file(&sample) {
+                    eprintln!("声纹样本删除失败({id},不影响库): {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 人物录音样本路径:app_data/voiceprints/<id>.wav。id 含路径分隔等异常字符时
+    /// 返回 None(防御 IPC 传入构造路径;正常 id 恒为 P<n>)——绝不能映射到共享
+    /// 兜底名,否则两个异常 id 会互相覆盖/串听对方的样本。
+    fn sample_path(&self, id: &str) -> Option<PathBuf> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(self.root.join("voiceprints").join(format!("{id}.wav")))
+    }
+
+    /// 样本存在则返回绝对路径(list_people 用)。
+    pub fn sample_path_if_exists(&self, id: &str) -> Option<PathBuf> {
+        let p = self.sample_path(id)?;
+        p.exists().then_some(p)
+    }
+
+    /// 为人物写入代表性录音样本(16k 单声道 s16 WAV):
+    /// - id 先经 redirects 解析(会话快照里的 person 引用可能已被合并);
+    /// - 已有样本不覆盖(样本是「确认此人是谁」的稳定参照,不随会话滚动);
+    /// - 解析失败(人物已删)静默跳过。
+    /// 返回是否实际写入。
+    ///
+    /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,否则「停止入库写样本」
+    /// 与管理页并发合并/删除会写出无主孤儿样本或把错人的音频挂到 winner 上。
+    pub fn write_sample_if_missing(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
+        let _guard = vp_guard();
+        let vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
+            return Ok(false);
+        };
+        let Some(path) = self.sample_path(&resolved) else {
+            return Ok(false);
+        };
+        if path.exists() || samples.is_empty() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(path.parent().expect("sample_path 恒有父目录"))?;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: crate::store::audio::AUDIO_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // 先写 .tmp 再 rename:样本文件也保持「任何时刻磁盘上都是完整 WAV」。
+        let tmp = path.with_extension("wav.tmp");
+        let mut w = hound::WavWriter::create(&tmp, spec)?;
+        for s in samples {
+            w.write_sample(crate::store::audio::f32_to_s16(*s))?;
+        }
+        w.finalize()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(true)
     }
 
     /// 停止时把本场簇快照并入库。
@@ -542,6 +618,70 @@ mod tests {
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         assert!(links.is_empty());
         assert!(store.load().people.is_empty());
+    }
+
+    #[test]
+    fn sample_write_read_merge_delete_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
+
+        // 写入 + 不覆盖语义。
+        assert!(store.write_sample_if_missing(&p1, &[0.5; 160]).unwrap());
+        assert!(!store.write_sample_if_missing(&p1, &[0.9; 160]).unwrap(), "已有样本不覆盖");
+        assert!(store.sample_path_if_exists(&p1).is_some());
+        assert!(store.sample_path_if_exists(&p2).is_none());
+        let mut r = hound::WavReader::open(store.sample_path_if_exists(&p1).unwrap()).unwrap();
+        assert_eq!(r.spec().sample_rate, 16_000);
+        assert_eq!(r.samples::<i16>().count(), 160);
+
+        // 合并:winner(p2)无样本 → 继承 loser(p1)的。
+        store.merge(&p1, &p2).unwrap();
+        assert!(store.sample_path_if_exists(&p2).is_some(), "winner 继承 loser 样本");
+        assert!(store.sample_path_if_exists(&p1).is_none());
+
+        // 经 redirects 的写入解析到 winner:winner 已有样本 → 不写。
+        assert!(!store.write_sample_if_missing(&p1, &[0.1; 160]).unwrap());
+
+        // 删除连带删样本。
+        store.delete(&p2).unwrap();
+        assert!(store.sample_path_if_exists(&p2).is_none(), "删除人物连带删样本");
+    }
+
+    #[test]
+    fn merge_removes_loser_sample_when_winner_already_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
+        store.write_sample_if_missing(&p1, &[0.5; 16]).unwrap();
+        store.write_sample_if_missing(&p2, &[0.7; 32]).unwrap();
+        store.merge(&p1, &p2).unwrap();
+        assert!(store.sample_path_if_exists(&p1).is_none(), "loser 样本已清理");
+        let mut r = hound::WavReader::open(store.sample_path_if_exists(&p2).unwrap()).unwrap();
+        assert_eq!(r.samples::<i16>().count(), 32, "winner 自己的样本保留");
+    }
+
+    #[test]
+    fn sample_path_rejects_traversal_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        for bad in ["../x", "a/b", "", "a\\b", ".."] {
+            assert!(store.sample_path(bad).is_none(), "非法 id 应得 None(不得映射共享兜底名): {bad:?}");
+            assert!(store.sample_path_if_exists(bad).is_none());
+        }
+        // 写侧:未知 id 经 resolve 为 None,静默跳过不落文件。
+        assert!(!store.write_sample_if_missing("../x", &[0.1; 16]).unwrap());
+        assert!(!tmp.path().join("voiceprints").exists(), "非法 id 不产生任何样本文件");
     }
 
     /// 终审 triage②端到端:种子带库 count=40 注入本场 registry,命中两次长段后停止。
