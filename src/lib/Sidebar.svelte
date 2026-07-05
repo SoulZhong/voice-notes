@@ -18,6 +18,30 @@
   let editingTitle = $state("");
   let confirmingDeleteId = $state<string | null>(null);
 
+  // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
+  let menuForId = $state<string | null>(null);
+  let menuX = $state(0);
+  let menuY = $state(0);
+
+  function openMenu(e: MouseEvent, id: string) {
+    e.preventDefault();
+    menuForId = id;
+    confirmingDeleteId = null;
+    menuX = e.clientX;
+    menuY = e.clientY;
+  }
+
+  function closeMenu() {
+    menuForId = null;
+    confirmingDeleteId = null;
+  }
+
+  /** 整行可点跳转;行内的按钮/输入框/链接各有己任,不劫持。 */
+  function rowClick(e: MouseEvent, n: NoteSummary) {
+    if ((e.target as HTMLElement).closest("button, input, a")) return;
+    goto(n.state === "active" ? "/record" : `/notes/${n.id}`);
+  }
+
   const filtered = $derived(
     query.trim() ? notes.filter((n) => n.title.toLowerCase().includes(query.trim().toLowerCase())) : notes,
   );
@@ -98,7 +122,7 @@
       <circle cx="8" cy="5.2" r="2.7" />
       <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
     </svg>
-    说话人
+    声纹库
   </a>
 
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
@@ -113,7 +137,14 @@
 
   <ul class="list">
     {#each filtered as n (n.id)}
-      <li class="item" class:current={$page.url.pathname === `/notes/${n.id}`}>
+      <!-- 行内 .title 锚点已提供键盘路径(Tab+Enter),li 的 onclick 是指针便利层 -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+      <li
+        class="item"
+        class:current={$page.url.pathname === `/notes/${n.id}`}
+        onclick={(e) => rowClick(e, n)}
+        oncontextmenu={(e) => openMenu(e, n.id)}
+      >
         <div class="main-line">
           {#if editingId === n.id}
             <!-- svelte-ignore a11y_autofocus -->
@@ -143,19 +174,41 @@
           {/if}
           <span class="meta">{formatDate(n.started_at)} · {formatDuration(n.duration_secs)}</span>
         </div>
-        <div class="actions">
-          <button class="link" onclick={() => beginRename(n)}>改名</button>
-          {#if confirmingDeleteId === n.id}
-            <button class="link danger" onclick={() => confirmDelete(n.id)}>确认删除</button>
-            <button class="link" onclick={() => (confirmingDeleteId = null)}>取消</button>
-          {:else}
-            <button class="link" onclick={() => (confirmingDeleteId = n.id)}>删除</button>
-          {/if}
-        </div>
       </li>
     {/each}
   </ul>
 </aside>
+
+{#if menuForId}
+  {@const menuNote = notes.find((n) => n.id === menuForId)}
+  <!-- 点击任意处关闭;键盘路径由 svelte:window 的 Esc 承担,遮罩是纯指针便利层 -->
+  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+  <div class="menu-overlay" onclick={closeMenu} oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}></div>
+  <div class="ctx-menu" style="left: {menuX}px; top: {menuY}px">
+    {#if confirmingDeleteId === menuForId}
+      <button
+        class="ctx-item danger"
+        onclick={() => {
+          const id = menuForId!;
+          closeMenu();
+          confirmDelete(id);
+        }}>确认删除「{menuNote?.title ?? ""}」</button
+      >
+      <button class="ctx-item" onclick={closeMenu}>取消</button>
+    {:else}
+      <button
+        class="ctx-item"
+        onclick={() => {
+          if (menuNote) beginRename(menuNote);
+          menuForId = null;
+        }}>改名</button
+      >
+      <button class="ctx-item danger" onclick={() => (confirmingDeleteId = menuForId)}>删除</button>
+    {/if}
+  </div>
+{/if}
+
+<svelte:window onkeydown={(e) => { if (e.key === "Escape" && menuForId) closeMenu(); }} />
 
 <style>
   /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
@@ -267,23 +320,17 @@
     margin: 0;
     padding: 0;
   }
+  /* 整行可点(冒烟反馈):cursor 表意,操作走右键菜单,行内无常驻按钮 */
   .item {
     padding: 0.55rem 0.5rem;
     border-radius: var(--radius-md);
+    cursor: pointer;
   }
   .item:hover {
     background: var(--surface-soft);
   }
   .item.current {
     background: var(--surface-press);
-  }
-  /* 悬停显影:行级操作默认隐身,列表保持安静(DESIGN.md 原则 5) */
-  .item .actions {
-    visibility: hidden;
-  }
-  .item:hover .actions,
-  .item.current .actions {
-    visibility: visible;
   }
   .main-line {
     display: flex;
@@ -333,26 +380,40 @@
     background: var(--record);
     color: var(--on-accent);
   }
-  .actions {
-    display: flex;
-    gap: 0.25rem;
-    margin-top: 0.15rem;
+  /* 右键菜单:popover 规范(canvas 底 + hairline + shadow-popover);
+     透明遮罩承接"点击别处关闭",fixed 定位跟随鼠标坐标。 */
+  .menu-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
   }
-  /* button-link：无底无边，accent 字，悬停加下划线 */
-  .link {
+  .ctx-menu {
+    position: fixed;
+    z-index: 41;
+    min-width: 9rem;
+    background: var(--canvas);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+  }
+  .ctx-item {
     background: none;
     border: none;
-    color: var(--accent);
+    text-align: left;
+    color: var(--ink);
     cursor: pointer;
-    padding: 0.1em 0.25em;
-    font-size: 0.78em;
+    padding: 0.4em 0.7em;
+    border-radius: var(--radius-md);
+    font-size: 0.88rem;
   }
-  .link:hover {
-    text-decoration: underline;
+  .ctx-item:hover {
+    background: var(--surface-soft);
   }
-  .link.danger {
+  .ctx-item.danger {
     color: var(--danger);
-    font-weight: 600;
   }
   /* 此处 banner 只用于加载失败，用 danger 色系（DESIGN.md：错误横幅换 danger） */
   .banner {
