@@ -1,27 +1,40 @@
 //! 模型目录解析与工件清单：运行时定位模型、判定缺失，供下载器（download 子模块）补齐。
 //!
-//! 目录解析顺序：VN_MODELS 环境变量 → debug 构建下的 src-tauri/models（开发机零迁移）
-//! → 生产默认 app_data_dir/models（setup 时经 init_app_root 注入）。
+//! 目录解析顺序：VN_MODELS 环境变量 → 设置覆盖（set_models_override，settings.models_dir 注入）
+//! → debug 构建下的 src-tauri/models（开发机零迁移）→ 生产默认 app_data_dir/models
+//! （setup 时经 init_app_root 注入）。env 置顶是为让测试/临时调试能强制覆盖用户设置。
 
 pub mod download;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 static APP_MODELS_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// 设置层的模型目录覆盖。用 RwLock 而非 OnceLock：用户可在运行期改 settings.models_dir，
+/// 需要可重设（OnceLock 只能设一次）。const new 免运行时初始化。
+static MODELS_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// setup 时注入生产模型根目录（app_data_dir/models）。重复调用无害（首次生效）。
 pub fn init_app_root(dir: PathBuf) {
     let _ = APP_MODELS_ROOT.set(dir);
 }
 
-/// 模型根目录。见模块注释的解析顺序；三处兜底保证测试进程（未 init）行为与历史一致。
+/// 设置覆盖模型根目录（None = 清除，回落后续兜底）。settings.models_dir 变更时调用。
+pub fn set_models_override(dir: Option<PathBuf>) {
+    *MODELS_OVERRIDE.write().unwrap() = dir;
+}
+
+/// 模型根目录。见模块注释的解析顺序；多处兜底保证测试进程（未 init）行为与历史一致。
 pub fn root() -> PathBuf {
     if let Ok(p) = std::env::var("VN_MODELS") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
+    }
+    if let Some(p) = MODELS_OVERRIDE.read().unwrap().clone() {
+        return p;
     }
     #[cfg(debug_assertions)]
     {
@@ -60,8 +73,9 @@ pub struct Artifact {
     pub kind: ArtifactKind,
     /// 下载体积（约数，仅展示）。
     pub approx_mb: u64,
-    /// true = 录制必需（ASR/VAD）；false = 仅说话人区分（缺失只降级）。
-    pub required_for_recording: bool,
+    /// 装好后要删除的 root 相对路径：如 whisper 的 fp32 权重与测试音频，present 判定不看它们，
+    /// 留盘白占空间。既有三工件无需清理，给 &[]。（清理动作由下载器接入，Task 8。）
+    pub prune: &'static [&'static str],
     pub files: &'static [FinalFile],
 }
 
@@ -74,7 +88,7 @@ pub const ARTIFACTS: &[Artifact] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
         kind: ArtifactKind::File,
         approx_mb: 1,
-        required_for_recording: true,
+        prune: &[],
         files: &[FinalFile {
             rel_path: "silero_vad.onnx",
             bytes: 643_854,
@@ -88,7 +102,7 @@ pub const ARTIFACTS: &[Artifact] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
         kind: ArtifactKind::File,
         approx_mb: 27,
-        required_for_recording: false,
+        prune: &[],
         files: &[FinalFile {
             rel_path: "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
             bytes: 28_281_138,
@@ -101,7 +115,7 @@ pub const ARTIFACTS: &[Artifact] = &[
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
         kind: ArtifactKind::TarBz2 { dest_dir: SV_DIR },
         approx_mb: 1000,
-        required_for_recording: true,
+        prune: &[],
         files: &[
             FinalFile {
                 rel_path: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.onnx",
@@ -115,7 +129,48 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    Artifact {
+        id: "whisper",
+        label: "语音识别（Whisper base）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+        kind: ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" },
+        approx_mb: 198,
+        prune: &[
+            "sherpa-onnx-whisper-base/base-encoder.onnx",
+            "sherpa-onnx-whisper-base/base-decoder.onnx",
+            "sherpa-onnx-whisper-base/test_wavs",
+        ],
+        files: &[
+            FinalFile {
+                rel_path: "sherpa-onnx-whisper-base/base-encoder.int8.onnx",
+                bytes: 29_120_534,
+                sha256: "0b8fb1304b6109976038efff5ace81720e00386f3ff6b54ee8c75291ca0a1e11",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-whisper-base/base-decoder.int8.onnx",
+                bytes: 130_672_026,
+                sha256: "9759d217388a01b3a4c7c15533201067b48ae819c4daafc8624e64b9409dc02d",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-whisper-base/base-tokens.txt",
+                bytes: 816_730,
+                sha256: "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            },
+        ],
+    },
 ];
+
+/// 某工件在当前 ASR 选型下是否为「录制必需」。取代了静态 required_for_recording 字段：
+/// 就绪与否随选型变（选 whisper 就不需要 SenseVoice 的 asr，反之亦然），静态标记表达不了。
+/// vad 恒需；asr（SenseVoice）仅非 whisper 选型需要；whisper 仅 whisper 选型需要；speaker 等不影响录制。
+pub fn required_now(id: &str, asr_model: &str) -> bool {
+    match id {
+        "vad" => true,
+        "asr" => asr_model != crate::settings::ASR_WHISPER,
+        "whisper" => asr_model == crate::settings::ASR_WHISPER,
+        _ => false,
+    }
+}
 
 pub fn artifact_present(root: &Path, a: &Artifact) -> bool {
     a.files.iter().all(|f| {
@@ -144,7 +199,7 @@ pub struct ModelsStatus {
     pub diarization_ready: bool,
 }
 
-pub fn status() -> ModelsStatus {
+pub fn status(asr_model: &str) -> ModelsStatus {
     let root = root();
     let artifacts: Vec<ArtifactState> = ARTIFACTS
         .iter()
@@ -152,7 +207,8 @@ pub fn status() -> ModelsStatus {
             id: a.id.into(),
             label: a.label.into(),
             approx_mb: a.approx_mb,
-            required_for_recording: a.required_for_recording,
+            // required_for_recording 保留为前端契约，但值改为按当前选型动态算。
+            required_for_recording: required_now(a.id, asr_model),
             present: artifact_present(&root, a),
         })
         .collect();
@@ -163,12 +219,12 @@ pub fn status() -> ModelsStatus {
     }
 }
 
-/// start/resume_recording 入口的防御检查用。
-pub fn recording_ready() -> bool {
+/// start/resume_recording 入口的防御检查用。按当前 ASR 选型判定必需工件是否齐。
+pub fn recording_ready(asr_model: &str) -> bool {
     let root = root();
     ARTIFACTS
         .iter()
-        .filter(|a| a.required_for_recording)
+        .filter(|a| required_now(a.id, asr_model))
         .all(|a| artifact_present(&root, a))
 }
 
@@ -180,19 +236,9 @@ mod tests {
     fn test_artifact() -> Artifact {
         Artifact {
             id: "t", label: "测试", url: "http://example.invalid/t.bin",
-            kind: ArtifactKind::File, approx_mb: 1, required_for_recording: true,
+            kind: ArtifactKind::File, approx_mb: 1, prune: &[],
             files: &[FinalFile { rel_path: "t.bin", bytes: 4, sha256: "deadbeef" }],
         }
-    }
-
-    #[test]
-    fn root_prefers_env_var() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VN_MODELS", tmp.path());
-        assert_eq!(root(), tmp.path());
-        std::env::remove_var("VN_MODELS");
-        // env 清掉后回落 dev 目录（debug 构建、src-tauri/models 存在）
-        assert_eq!(root(), std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
     }
 
     #[test]
@@ -207,13 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_three_runtime_artifacts() {
+    fn manifest_covers_four_artifacts_with_whisper() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec!["vad", "speaker", "asr"]);
-        assert!(ARTIFACTS.iter().filter(|a| a.required_for_recording).count() == 2, "vad+asr 录制必需");
+        assert_eq!(ids, vec!["vad", "speaker", "asr", "whisper"]);
+        let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
+        assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
+        assert_eq!(w.files.len(), 3);
+        assert!(!w.prune.is_empty(), "fp32 与测试音频装好即删");
         for a in ARTIFACTS {
-            assert!(!a.files.is_empty());
-            for f in a.files { assert_eq!(f.sha256.len(), 64, "sha256 应为 64 位 hex"); }
+            for f in a.files { assert_eq!(f.sha256.len(), 64); }
         }
+    }
+
+    #[test]
+    fn required_now_follows_selection() {
+        assert!(required_now("vad", "sense_voice") && required_now("vad", "whisper"));
+        assert!(required_now("asr", "sense_voice") && !required_now("asr", "whisper"));
+        assert!(!required_now("whisper", "sense_voice") && required_now("whisper", "whisper"));
+        assert!(!required_now("speaker", "sense_voice"));
+    }
+
+    #[test]
+    fn root_prefers_env_then_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_models_override(Some(tmp.path().to_path_buf()));
+        std::env::set_var("VN_MODELS", "/env-wins");
+        assert_eq!(root(), PathBuf::from("/env-wins"));
+        std::env::remove_var("VN_MODELS");
+        assert_eq!(root(), tmp.path(), "override 次于 env、先于 dev 目录");
+        set_models_override(None);
+        // 回落 dev 目录(debug 构建、src-tauri/models 存在),与历史一致
+        assert_eq!(root(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
     }
 }

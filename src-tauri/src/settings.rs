@@ -1,9 +1,14 @@
 //! 轻量应用设置（app_data_dir/settings.json，原子写）。目前仅镜像加速配置。
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghproxy.net/";
+
+/// ASR 模型选型标识,供 settings.asr_model 与后续选型逻辑复用。
+pub const ASR_SENSE_VOICE: &str = "sense_voice";
+// whisper 选型标识;models::required_now 已消费,判定 whisper 工件是否录制必需。
+pub const ASR_WHISPER: &str = "whisper";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -11,15 +16,43 @@ pub struct Settings {
     pub mirror_enabled: bool,
     #[serde(default = "default_prefix")]
     pub mirror_prefix: String,
+    /// 自定义数据目录(录音/转写等落盘位置);None 时回退到 app_data_dir。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    /// 自定义模型目录覆盖;None 时使用内置默认路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
+    /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
+    #[serde(default = "default_asr")]
+    pub asr_model: String,
 }
 
 fn default_prefix() -> String {
     DEFAULT_MIRROR_PREFIX.into()
 }
 
+fn default_asr() -> String {
+    ASR_SENSE_VOICE.into()
+}
+
 impl Default for Settings {
     fn default() -> Self {
-        Self { mirror_enabled: false, mirror_prefix: default_prefix() }
+        Self {
+            mirror_enabled: false,
+            mirror_prefix: default_prefix(),
+            data_dir: None,
+            models_dir: None,
+            asr_model: default_asr(),
+        }
+    }
+}
+
+/// 数据根目录解析:配置了 data_dir 则用之,否则回退到系统 app_data_dir。
+/// 纯函数,供 lib.rs 的 data_root 组装路径与本模块测试复用。
+pub fn resolve_data_root(app_data: &Path, s: &Settings) -> PathBuf {
+    match &s.data_dir {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => app_data.to_path_buf(),
     }
 }
 
@@ -39,6 +72,23 @@ pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// settings.json 读-改-写串行化锁。为什么需要:load→改→save 这个序列若被并发穿插,会
+/// 发生丢写——例如迁移线程刚把 data_dir 指针 save 提交,而镜像开关命令用它更早 load 的
+/// 旧快照 save 覆盖回去 → 指针丢失,随后迁移的删旧逻辑把旧数据删掉 → 笔记"凭空消失"。
+/// 进程内单锁,单文件写入量小,串行代价可忽略。
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 原子化读-改-写:锁内 load → f(&mut s) → save,返回落盘后的新值。所有会修改
+/// settings.json 的路径都应走这里(而非各自 load 后 save),否则并发写互相覆盖(见
+/// WRITE_LOCK 注释)。中毒锁降级取值继续(设置写入不该因一次 panic 永久卡死)。
+pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<Settings> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = load(app_data);
+    f(&mut s);
+    save(app_data, &s)?;
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,11 +106,79 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = Settings { mirror_enabled: true, mirror_prefix: "https://mirror.example/".into() };
+        let s = Settings { mirror_enabled: true, mirror_prefix: "https://mirror.example/".into(), ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert!(got.mirror_enabled);
         assert_eq!(got.mirror_prefix, "https://mirror.example/");
         assert!(!tmp.path().join("settings.json.tmp").exists(), "原子写不留 tmp");
+    }
+
+    #[test]
+    fn new_fields_default_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 旧文件(仅镜像字段)→ 新字段全默认
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":true,"mirror_prefix":"x"}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.data_dir, None);
+        assert_eq!(s.models_dir, None);
+        assert_eq!(s.asr_model, ASR_SENSE_VOICE);
+        // 新字段 roundtrip
+        let s = Settings {
+            data_dir: Some("/tmp/d".into()),
+            models_dir: Some("/tmp/m".into()),
+            asr_model: ASR_WHISPER.into(),
+            ..Default::default()
+        };
+        save(tmp.path(), &s).unwrap();
+        let got = load(tmp.path());
+        assert_eq!(got.data_dir.as_deref(), Some("/tmp/d"));
+        assert_eq!(got.models_dir.as_deref(), Some("/tmp/m"));
+        assert_eq!(got.asr_model, "whisper");
+    }
+
+    #[test]
+    fn resolve_data_root_prefers_configured() {
+        let base = Path::new("/base");
+        assert_eq!(resolve_data_root(base, &Settings::default()), PathBuf::from("/base"));
+        let s = Settings { data_dir: Some("/custom".into()), ..Default::default() };
+        assert_eq!(resolve_data_root(base, &s), PathBuf::from("/custom"));
+        // 空串视同未配置,回落默认根(防止 Some("") 把根设成当前目录)。
+        let s = Settings { data_dir: Some("".into()), ..Default::default() };
+        assert_eq!(resolve_data_root(base, &s), PathBuf::from("/base"), "空串回落默认");
+    }
+
+    #[test]
+    fn update_roundtrip_applies_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got = update(tmp.path(), |s| s.mirror_enabled = true).unwrap();
+        assert!(got.mirror_enabled, "返回落盘后的新值");
+        assert!(load(tmp.path()).mirror_enabled, "已持久化到磁盘");
+    }
+
+    #[test]
+    fn concurrent_update_different_fields_no_lost_write() {
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tmp.path().to_path_buf());
+        // 两线程各反复改一字段:WRITE_LOCK 串行化 load-modify-save,终态两字段都应是新值。
+        // 无锁时后写者会用自己更早的 load 快照覆盖掉前写者刚提交的另一字段(丢写)。
+        let d1 = dir.clone();
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                update(&d1, |s| s.mirror_enabled = true).unwrap();
+            }
+        });
+        let d2 = dir.clone();
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                update(&d2, |s| s.asr_model = ASR_WHISPER.into()).unwrap();
+            }
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        let got = load(&dir);
+        assert!(got.mirror_enabled, "线程1 的写未被丢");
+        assert_eq!(got.asr_model, ASR_WHISPER, "线程2 的写未被丢");
     }
 }

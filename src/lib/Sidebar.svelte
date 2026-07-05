@@ -117,14 +117,6 @@
     {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
-  <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">
-    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-      <circle cx="8" cy="5.2" r="2.7" />
-      <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
-    </svg>
-    声纹库
-  </a>
-
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
   {#if error}
@@ -177,6 +169,25 @@
       </li>
     {/each}
   </ul>
+
+  <!-- 工具类入口固定底部(冒烟反馈:顶部挤在录制按钮下不符使用习惯;Notion/原生应用惯例是
+       内容列表居中滚动、设置类入口沉底常驻)。 -->
+  <nav class="nav-footer">
+    <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+        <circle cx="8" cy="5.2" r="2.7" />
+        <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
+      </svg>
+      声纹库
+    </a>
+    <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="8" r="2.2" />
+        <path d="M8 2.2V4.4 M8 11.6V13.8 M2.2 8H4.4 M11.6 8H13.8 M3.9 3.9L5.5 5.5 M10.5 10.5L12.1 12.1 M3.9 12.1L5.5 10.5 M10.5 5.5L12.1 3.9" />
+      </svg>
+      设置
+    </a>
+  </nav>
 </aside>
 
 {#if menuForId}
@@ -222,7 +233,8 @@
     background: var(--surface);
     padding: 0.75rem;
     box-sizing: border-box;
-    overflow-y: auto;
+    /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置/声纹库推出视口 */
+    overflow-y: hidden;
   }
   /* 录制按钮:白底 + 红点(语音备忘录式)。大面积强调蓝在侧栏太吵,主 CTA 的
      "彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
@@ -268,7 +280,6 @@
     align-items: center;
     gap: 0.45em;
     box-sizing: border-box;
-    margin-top: 0.6rem;
     padding: 0.45em 0.6em;
     border-radius: var(--radius-md);
     color: var(--ink-secondary);
@@ -319,6 +330,19 @@
     list-style: none;
     margin: 0;
     padding: 0;
+    flex: 1;
+    min-height: 0; /* flex 子项默认 min-height:auto 会撑破容器,收掉才滚得起来 */
+    overflow-y: auto;
+  }
+  /* 底部工具区:hairline 分隔,与内容列表视觉分层 */
+  .nav-footer {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--hairline);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
   }
   /* 整行可点(冒烟反馈):cursor 表意,操作走右键菜单,行内无常驻按钮 */
   .item {
