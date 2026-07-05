@@ -49,7 +49,18 @@ export type Note = {
   >;
 };
 
+/** 一条音频轨道(对应后端 store::audio::TrackInfo)。offset_ms:该 WAV 的 0 时刻
+    对应笔记时间轴的毫秒(轨道可中途出现:续录旧笔记/某源第二场才授权)。 */
+export type TrackInfo = {
+  source: Source;
+  path: string;
+  offset_ms: number;
+  duration_ms: number;
+};
+
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
+/** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */
+export const noteAudioInfo = (id: string) => invoke<TrackInfo[]>("note_audio_info", { id });
 export const getNote = (id: string) => invoke<Note>("get_note", { id });
 export const renameNote = (id: string, title: string) =>
   invoke<void>("rename_note", { id, title });

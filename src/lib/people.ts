@@ -8,6 +8,8 @@ export type PersonSummary = {
   total_ms: number;
   last_seen: string;
   sources: string[];
+  /** 代表性录音样本绝对路径;库中无样本(旧数据/写失败)为 null,不显示「试听」。 */
+  sample_path: string | null;
 };
 
 export const listPeople = () => invoke<PersonSummary[]>("list_people");

@@ -226,6 +226,8 @@ fn is_aec_residue(sub_start: u64, sub_end: u64, rms: f32, recent_system: &VecDeq
 /// 完整处理链：embed → assign → take_merges/SpeakersChanged → on_final。
 /// 即时路径（system 段、无匹配的 mic 段）与 release 路径（hold 到期/排干的 mic 段）共用，
 /// 保证「被丢弃段零副作用、被处理段处理逻辑同源」。
+/// sample_store 维护「簇 id → 该簇迄今最长段样本(截 SPEAKER_SAMPLE_CAP)」,
+/// 簇合并时随之迁移(loser 样本更长则归 winner),停止时随 Snapshot 导出供声纹库试听。
 #[allow(clippy::too_many_arguments)]
 fn process_final<F1, F2>(
     source: Source,
@@ -237,6 +239,7 @@ fn process_final<F1, F2>(
     rms: f32,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     registry: &mut SpeakerRegistry,
+    sample_store: &mut std::collections::HashMap<String, Vec<f32>>,
     last_sent: &mut Vec<crate::diar::registry::SpeakerInfo>,
     on_final: &mut F1,
     on_diar: &mut F2,
@@ -258,7 +261,22 @@ fn process_final<F1, F2>(
             }
         }
     });
+    // 样本更新先于合并处理:若本段归属簇随后被合并,下面的迁移会把样本一并带走。
+    // 已存样本 ≥ ENOUGH 即定格:更长不再有试听增益,不值一次整块克隆。
+    if let Some(id) = &speaker {
+        let keep = embedding_input.len().min(SPEAKER_SAMPLE_CAP);
+        let cur = sample_store.get(id).map(|v| v.len()).unwrap_or(0);
+        if keep > cur && cur < SPEAKER_SAMPLE_ENOUGH {
+            sample_store.insert(id.clone(), embedding_input[..keep].to_vec());
+        }
+    }
     for (loser, winner) in registry.take_merges() {
+        if let Some(ls) = sample_store.remove(&loser) {
+            let wl = sample_store.get(&winner).map(|v| v.len()).unwrap_or(0);
+            if ls.len() > wl {
+                sample_store.insert(winner.clone(), ls);
+            }
+        }
         on_diar(DiarEvent::Merged { loser, winner });
     }
     let speakers = registry.speakers();
@@ -439,12 +457,26 @@ pub struct PartialJob {
 
 /// diarization 侧事件:说话人表变化 / 簇合并(需回写落盘与 UI)/ worker 结束时的质心快照
 /// (仅存入 writer 内存表,不落盘、不 emit,由既有 finalize→persist_speakers 落盘,P4.5 续录铺底)。
+/// Snapshot 额外携带各簇的代表性音频样本(≤ SPEAKER_SAMPLE_CAP,声纹库试听用):
+/// 与质心同一时刻导出,消费方(lib.rs)在入库后为人物落样本 WAV。
 #[derive(Debug, Clone)]
 pub enum DiarEvent {
     SpeakersChanged(Vec<crate::diar::registry::SpeakerInfo>),
     Merged { loser: String, winner: String },
-    Snapshot(Vec<crate::diar::registry::ClusterSnapshot>),
+    Snapshot {
+        snaps: Vec<crate::diar::registry::ClusterSnapshot>,
+        samples: Vec<(String, Vec<f32>)>,
+    },
 }
+
+/// 声纹样本上限:15s。超长截头 15s——试听确认身份用不着更长,也把 worker 内存
+/// 占用限制在每簇 <1MB。
+pub(crate) const SPEAKER_SAMPLE_CAP: usize =
+    15 * crate::store::audio::AUDIO_SAMPLE_RATE as usize;
+/// 样本「够好」阈值:已存样本达到 10s 后不再升级替换——试听没有增益,却省掉长会中
+/// 每逢更长段就整块克隆(≤1MB)的 ASR 热路径开销。
+pub(crate) const SPEAKER_SAMPLE_ENOUGH: usize =
+    10 * crate::store::audio::AUDIO_SAMPLE_RATE as usize;
 
 /// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
@@ -471,6 +503,8 @@ pub fn run_asr_worker(
     // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）。
     let mut pending_mic: VecDeque<PendingMic> = VecDeque::new();
     let mut recent_system: VecDeque<RecentSystem> = VecDeque::new();
+    // 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
+    let mut sample_store: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
 
     // release 一个到期/排干的 pending mic 段：走完整处理链，与即时路径同源。
     macro_rules! release_pending {
@@ -486,6 +520,7 @@ pub fn run_asr_worker(
                 p.rms,
                 &mut embedder,
                 &mut registry,
+                &mut sample_store,
                 &mut last_sent,
                 &mut on_final,
                 &mut on_diar,
@@ -606,6 +641,7 @@ pub fn run_asr_worker(
                                 seg_rms,
                                 &mut embedder,
                                 &mut registry,
+                                &mut sample_store,
                                 &mut last_sent,
                                 &mut on_final,
                                 &mut on_diar,
@@ -637,6 +673,7 @@ pub fn run_asr_worker(
                                     seg_rms,
                                     &mut embedder,
                                     &mut registry,
+                                    &mut sample_store,
                                     &mut last_sent,
                                     &mut on_final,
                                     &mut on_diar,
@@ -719,7 +756,10 @@ pub fn run_asr_worker(
                 while let Some(p) = pending_mic.pop_front() {
                     release_pending!(p);
                 }
-                on_diar(DiarEvent::Snapshot(registry.snapshot()));
+                on_diar(DiarEvent::Snapshot {
+                    snaps: registry.snapshot(),
+                    samples: sample_store.drain().collect(),
+                });
                 break;
             }
         }
@@ -787,6 +827,8 @@ impl std::fmt::Debug for StartError {
 
 /// 起会话：每源一条分段 worker + 单 ASR worker，接好 finals 通道与每源 partial 槽。
 /// 某源 capture 启动失败 → 跳过该源并记入 failed（用于降级）；无任何源启动 → Err。
+/// audio_sinks:按源可选的音频旁路(录音保留),worker 在暂停闸后把重采样样本喂给它;
+/// 未提供的源不落音频。capture 启动失败的源其 sink 随 worker 一起丢弃(惰性建档不留空文件)。
 #[allow(clippy::too_many_arguments)]
 pub fn start_session(
     sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)>,
@@ -796,6 +838,7 @@ pub fn start_session(
     echo_hold: Duration,
     target_rate: u32,
     partial_interval_samples: usize,
+    mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
     on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
@@ -818,6 +861,10 @@ pub fn start_session(
         // 先起 worker（消费者），再启动 capture：兼容同步灌帧的 MockCapture，
         // 且若 capture 启动失败，ftx 在 start 内被 drop → frx 关闭 → worker 立即退出。
         let level_cb = if source == Source::Mic { mic_level.take() } else { None };
+        let audio_sink = audio_sinks
+            .iter()
+            .position(|(s, _)| *s == source)
+            .map(|i| audio_sinks.swap_remove(i).1);
         let paused_w = paused.clone();
         let w = std::thread::spawn(move || {
             run_segment_worker(
@@ -830,6 +877,7 @@ pub fn start_session(
                 segmenter,
                 paused_w,
                 level_cb,
+                audio_sink,
             );
         });
         match capture.start(ftx) {
@@ -1182,16 +1230,58 @@ mod asr_worker_tests {
             move |ev| e2.lock().unwrap().push(ev),
         );
         let evs = events.lock().unwrap();
-        let snapshot_count = evs.iter().filter(|e| matches!(e, DiarEvent::Snapshot(_))).count();
+        let snapshot_count = evs.iter().filter(|e| matches!(e, DiarEvent::Snapshot { .. })).count();
         assert_eq!(snapshot_count, 1, "worker 结束时应恰发一次 Snapshot");
-        assert!(matches!(evs.last().unwrap(), DiarEvent::Snapshot(_)), "Snapshot 应在末尾(既有 diar 事件之后)");
+        assert!(matches!(evs.last().unwrap(), DiarEvent::Snapshot { .. }), "Snapshot 应在末尾(既有 diar 事件之后)");
         match evs.last().unwrap() {
-            DiarEvent::Snapshot(snaps) => {
+            DiarEvent::Snapshot { snaps, samples } => {
                 assert_eq!(snaps.len(), 1);
                 assert_eq!(snaps[0].id, "S1");
+                // 样本随 Snapshot 导出:该簇唯一一段(32000 样本 > 15s 上限截断到上限)。
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].0, "S1");
+                assert_eq!(samples[0].1.len(), 32000.min(super::SPEAKER_SAMPLE_CAP));
             }
             _ => unreachable!(),
         }
+    }
+
+    /// 样本上限真实生效:送一段超过 SPEAKER_SAMPLE_CAP 的 final(15.625s),
+    /// Snapshot 导出的样本必须恰被截断到上限——防止 worker 内存随长独白无界增长。
+    /// (MockEmbedder 脚本耗尽后重复最后一个向量:滑窗嵌入全相同 → 无变更点 → 整段。)
+    #[test]
+    fn snapshot_sample_truncated_to_cap_for_long_segment() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let n = SPEAKER_SAMPLE_CAP + 10_000;
+        tx.send(FinalJob {
+            source: Source::Mic,
+            samples: vec![0.1; n],
+            start_ms: 0,
+            end_ms: (n / 16) as u64,
+        })
+        .unwrap();
+        drop(tx);
+
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]);
+        let events = Arc::new(Mutex::new(Vec::<DiarEvent>::new()));
+        let e2 = events.clone();
+        let _ = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            |_, _, _, _, _, _| {},
+            |_, _| {},
+            move |ev| e2.lock().unwrap().push(ev),
+        );
+        let evs = events.lock().unwrap();
+        let DiarEvent::Snapshot { samples, .. } = evs.last().unwrap() else {
+            panic!("末事件应为 Snapshot");
+        };
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].1.len(), SPEAKER_SAMPLE_CAP, "超长段样本截断到上限");
     }
 
     /// 测试用识别器：按队列依次返回预置文本（耗尽后返回空串），供回声去重测试
@@ -1883,6 +1973,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
+            vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
@@ -1910,6 +2001,61 @@ mod session_tests {
         assert!(ok, "两源都应产出带标记的 final");
     }
 
+    /// 音频保留接线:sink 按源路由,写出的 WAV 与段时间轴按构造对齐——
+    /// wav 样本数 == 全部 final 的样本数之和(CountingRecognizer 文本即段长),
+    /// 且 == 最大 end_ms 对应的样本数(MockSegmenter 不留尾巴时)。
+    #[test]
+    fn audio_sinks_route_per_source_and_wav_aligns_with_segments() {
+        use crate::store::audio::AudioTrackWriter;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut track = AudioTrackWriter::new(tmp.path(), "mic", 0);
+        let sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> =
+            vec![(Source::Mic, Box::new(move |s: &[f32]| track.append(s)))];
+
+        let finals = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
+        let f2 = finals.clone();
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
+            Source::Mic,
+            Box::new(IdlingCapture::from_fixture()),
+            Box::new(MockSegmenter::new(2000)),
+        )];
+        let start = start_session(
+            sources,
+            Box::new(CountingRecognizer),
+            None,
+            SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
+            16000,
+            4000,
+            sinks,
+            move |_, t, _, end_ms, _, _| f2.lock().unwrap().push((t, end_ms)),
+            |_, _| {},
+            |_| {},
+            None,
+        )
+        .expect("start_session");
+        // 等 fixture 全部产出(有界轮询):fixture 417ms,至少一个 final。
+        for _ in 0..300 {
+            if !finals.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = start.handle.stop(); // 停止排干尾段;sink 随 worker 退出 Drop 收尾
+
+        let g = finals.lock().unwrap();
+        assert!(!g.is_empty());
+        let total_final_samples: usize =
+            g.iter().map(|(t, _)| t.strip_prefix("len=").unwrap().parse::<usize>().unwrap()).sum();
+        let mut r = hound::WavReader::open(tmp.path().join("mic.wav")).expect("mic.wav 应存在");
+        let wav_samples = r.samples::<i16>().count();
+        assert_eq!(wav_samples, total_final_samples, "wav 样本数 == 各 final 样本数之和");
+        let max_end_ms = g.iter().map(|(_, e)| *e).max().unwrap();
+        // end_ms 由样本数换算毫秒时向下取整,允许 <1ms(16 样本)的舍入差。
+        let diff = wav_samples as u64 - max_end_ms * 16;
+        assert!(diff < 16, "最大 end_ms 指向 wav 末尾(容忍 <1ms 取整): diff={diff}");
+    }
+
     #[test]
     fn stop_returns_recognizer_for_reuse() {
         let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
@@ -1925,6 +2071,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
+            vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},
             |_| {},
@@ -1954,6 +2101,7 @@ mod session_tests {
             TEST_ECHO_HOLD,
             16000,
             4000,
+            vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},
             |_| {},

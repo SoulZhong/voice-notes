@@ -78,6 +78,9 @@ pub struct PersonSummary {
     pub total_ms: u64,
     pub last_seen: String,
     pub sources: Vec<String>,
+    /// 代表性录音样本的绝对路径(voiceprints/<id>.wav);库中无样本(旧数据/写失败)为 None,
+    /// 前端据此决定是否显示「试听」。
+    pub sample_path: Option<String>,
 }
 
 /// 模型下载进度，事件名 "model_download"。artifact="all" + phase="done" 表示整体完成。
