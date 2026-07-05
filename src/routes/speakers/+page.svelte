@@ -47,6 +47,9 @@
   const sorted = $derived(
     [...people].sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")),
   );
+  /** 分组:未命名的是"待处理项"排上面,已命名的是稳定资产。 */
+  const unnamed = $derived(sorted.filter((p) => !p.name));
+  const named = $derived(sorted.filter((p) => p.name));
 
   async function refresh() {
     try {
@@ -165,8 +168,31 @@
       <p class="hint">录一场会议(单人说话累计满 10 秒),停止后会自动出现在这里。</p>
     </div>
   {:else}
-    <ul class="list">
-      {#each sorted as p (p.id)}
+    {#if unnamed.length > 0}
+      <div class="section-head">
+        <h2 class="section-title">待命名<span class="count">{unnamed.length}</span></h2>
+        <span class="section-hint">命名后,之后的录制会自动认出并直接显示名字</span>
+      </div>
+      <ul class="list">
+        {#each unnamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      </ul>
+    {/if}
+
+    {#if named.length > 0}
+      <div class="section-head">
+        <h2 class="section-title">已命名<span class="count">{named.length}</span></h2>
+      </div>
+      <ul class="list">
+        {#each named as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      </ul>
+    {/if}
+  {/if}
+
+  {#snippet personRow(p: PersonSummary)}
         <li class="item" class:active-row={samplePlayingId === p.id}>
           <div class="avatar" style="background: {avatarTint(p.id)}">
             {#if p.name}
@@ -308,9 +334,7 @@
             {/if}
           </div>
         </li>
-      {/each}
-    </ul>
-  {/if}
+  {/snippet}
 </main>
 
 <style>
@@ -328,6 +352,38 @@
     line-height: 1.5;
     margin: 0 0 1.25rem;
     max-width: 46rem;
+  }
+  /* 分区标题:小号加粗 + 计数胶囊,待命名区带引导文案 */
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    margin: 1.1rem 0 0.45rem;
+  }
+  .section-head:first-of-type {
+    margin-top: 0;
+  }
+  .section-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink-secondary);
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .count {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--ink-faint);
+    background: var(--surface-press);
+    border-radius: var(--radius-full);
+    padding: 0 0.5em;
+    line-height: 1.5;
+  }
+  .section-hint {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
   }
   /* list-row 容器:surface 卡片承载各行 */
   .list {
