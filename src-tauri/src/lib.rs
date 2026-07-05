@@ -1407,6 +1407,7 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .setup(|app| {
             let handle = app.handle().clone();
