@@ -83,6 +83,15 @@ pub struct PersonSummary {
     pub sample_path: Option<String>,
 }
 
+/// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;
+/// phase∈{"copying","done","error"};error 时 message 带原因,其余为空串。
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateEvent {
+    pub kind: String,
+    pub phase: String,
+    pub message: String,
+}
+
 /// 模型下载进度，事件名 "model_download"。artifact="all" + phase="done" 表示整体完成。
 /// phase: downloading | verifying | extracting | done | error | cancelled。
 #[derive(Debug, Clone, Serialize)]

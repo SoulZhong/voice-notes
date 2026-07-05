@@ -80,11 +80,14 @@ impl<R: Read> Read for CancelReader<'_, R> {
 
 /// 解压 tar.bz2 到 root/.tmp-extract，校验 files 后把 dest_dir 整体 rename 进位。
 /// 任何一步失败都不触碰 root 下的既有安装。
+/// prune: 安装成功后即删的 root 相对路径（如 whisper fp32/test_wavs）——
+/// 只是省盘的增值清理，删不掉也不算安装失败。
 pub fn extract_and_install(
     tarball: &Path,
     root: &Path,
     dest_dir: &str,
     files: &[FinalFile],
+    prune: &[&str],
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     let tmp = tmp_extract_dir(root);
@@ -125,6 +128,15 @@ pub fn extract_and_install(
     }
     let _ = fs::remove_dir_all(&backup);
     let _ = fs::remove_dir_all(&tmp);
+    // 装好即删:fp32/test_wavs 这类只在装包校验期有用的大件，装完不留盘。
+    for p in prune {
+        let target = root.join(p);
+        if fs::remove_dir_all(&target).is_err() {
+            if let Err(e) = fs::remove_file(&target) {
+                eprintln!("prune {p} 失败(不影响安装): {e}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -153,7 +165,7 @@ fn finalize_artifact(
         }
         super::ArtifactKind::TarBz2 { dest_dir } => {
             progress(a.id, "extracting", received, total, "");
-            if let Err(e) = extract_and_install(part, root, dest_dir, a.files, cancel) {
+            if let Err(e) = extract_and_install(part, root, dest_dir, a.files, a.prune, cancel) {
                 if e.to_string() != "cancelled" {
                     let _ = fs::remove_file(part);
                 }
@@ -301,7 +313,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL"), ("tokens.txt", b"TOK")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL"), ff("sv-dir/tokens.txt", b"TOK")];
-        extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).unwrap();
+        extract_and_install(&tarball, &root, "sv-dir", &files, &[], &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL");
         assert!(!tmp_extract_dir(&root).exists(), "临时解压目录应清掉");
     }
@@ -313,7 +325,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"CORRUPT")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")]; // 期望哈希对不上
-        assert!(extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).is_err());
+        assert!(extract_and_install(&tarball, &root, "sv-dir", &files, &[], &AtomicBool::new(false)).is_err());
         assert!(!root.join("sv-dir").exists(), "校验失败不得半安装");
     }
 
@@ -325,9 +337,24 @@ mod tests {
         std::fs::write(root.join("sv-dir/model.onnx"), b"OLD").unwrap();
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")];
-        extract_and_install(&tarball, &root, "sv-dir", &files, &AtomicBool::new(false)).unwrap();
+        extract_and_install(&tarball, &root, "sv-dir", &files, &[], &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(root.join("sv-dir/model.onnx")).unwrap(), b"MODEL", "旧安装被替换");
         assert!(!root.join(".old-sv-dir").exists(), "备份目录成功后清除");
+    }
+
+    #[test]
+    fn extract_and_install_prunes_extras_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(&root).unwrap();
+        let tarball = make_tarball(tmp.path(), "sv-dir", &[
+            ("model.int8.onnx", b"MODEL".as_slice()),
+            ("model.onnx", b"BIGFP32".as_slice()),
+        ]);
+        let files = [ff("sv-dir/model.int8.onnx", b"MODEL")];
+        extract_and_install(&tarball, &root, "sv-dir", &files, &["sv-dir/model.onnx"], &AtomicBool::new(false)).unwrap();
+        assert!(root.join("sv-dir/model.int8.onnx").exists());
+        assert!(!root.join("sv-dir/model.onnx").exists(), "prune 项装好即删");
     }
 
     #[test]
@@ -348,7 +375,7 @@ mod tests {
         let tarball = make_tarball(tmp.path(), "sv-dir", &[("model.onnx", b"MODEL")]);
         let files = [ff("sv-dir/model.onnx", b"MODEL")];
         let cancel = AtomicBool::new(true); // 预先置位:首次 read 即断
-        let err = extract_and_install(&tarball, &root, "sv-dir", &files, &cancel).unwrap_err();
+        let err = extract_and_install(&tarball, &root, "sv-dir", &files, &[], &cancel).unwrap_err();
         assert_eq!(err.to_string(), "cancelled", "取消错误归一,供上层按消息识别");
         assert!(!root.join("sv-dir").exists(), "取消不得半安装");
         assert!(tarball.exists(), "tarball 由调用方保留(供免重下复装)");
@@ -369,7 +396,7 @@ mod tests {
             label: "测试工件",
             url: "http://unused.invalid/pkg.tar.bz2",
             approx_mb: 1,
-            required_for_recording: false,
+            prune: &[],
             kind: crate::models::ArtifactKind::TarBz2 { dest_dir: "sv-dir" },
             files: Box::leak(vec![ff("sv-dir/model.onnx", b"MODEL")].into_boxed_slice()),
         };

@@ -3,11 +3,8 @@
   import {
     downloadModels,
     cancelModelsDownload,
-    getSettings,
-    setSettings,
     onModelDownload,
     type ModelsStatus,
-    type Settings,
     type ModelDownloadEvent,
   } from "$lib/models";
 
@@ -17,7 +14,9 @@
     onComplete,
   }: { status: ModelsStatus; compact?: boolean; onComplete: () => void } = $props();
 
-  const missing = $derived(status.artifacts.filter((a) => !a.present));
+  const missing = $derived(
+    status.artifacts.filter((a) => !a.present && (a.required_for_recording || a.id === "speaker")),
+  );
   const totalMb = $derived(missing.reduce((s, a) => s + a.approx_mb, 0));
 
   let downloading = $state(false);
@@ -25,10 +24,8 @@
   let cancelled = $state(false);
   /** 各工件进度：received/total 字节 + phase。 */
   let prog = $state<Record<string, { received: number; total: number; phase: string }>>({});
-  let settings = $state<Settings | null>(null);
 
   onMount(() => {
-    getSettings().then((s) => (settings = s)).catch(() => {});
     // 事件监听随组件生命周期注册/解绑（下载跨页面继续，回到本页重新拿到进度流）。
     const un = onModelDownload(handle);
     return () => {
@@ -69,15 +66,6 @@
         error = String(e);
       }
     }
-  }
-
-  async function toggleMirror() {
-    if (!settings) return;
-    settings = { ...settings, mirror_enabled: !settings.mirror_enabled };
-    await setSettings(settings);
-  }
-  async function savePrefix() {
-    if (settings) await setSettings(settings);
   }
 
   const pct = (p: { received: number; total: number }) =>
@@ -127,14 +115,8 @@
     {:else}
       <button class="primary" onclick={start}>{error || cancelled ? "继续下载" : "下载模型"}</button>
     {/if}
-    {#if settings && !compact}
-      <label class="mirror">
-        <input type="checkbox" checked={settings.mirror_enabled} onchange={toggleMirror} />
-        使用镜像加速（国内网络推荐）
-      </label>
-      {#if settings.mirror_enabled}
-        <input class="prefix" bind:value={settings.mirror_prefix} onblur={savePrefix} placeholder="镜像前缀，如 https://ghproxy.net/" />
-      {/if}
+    {#if !compact}
+      <span class="note">下载镜像可在设置页配置。</span>
     {/if}
   </div>
 </div>
@@ -183,22 +165,7 @@
   /* button-primary：下载模型是本卡唯一主动作 */
   button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 500; }
   button.primary:hover { background: var(--accent-pressed); }
-  .mirror { font-size: 0.85rem; display: flex; align-items: center; gap: 0.3em; }
-  .prefix {
-    flex: 1;
-    min-width: 14rem;
-    padding: 0.3em 0.5em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--canvas);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .prefix:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
+  .note { font-size: 0.85rem; color: var(--ink-faint); }
   .error { color: var(--danger); font-size: 0.9rem; margin-top: 0.5rem; }
   .hint { color: var(--warning-ink); font-size: 0.9rem; margin-top: 0.5rem; }
 </style>

@@ -1,4 +1,6 @@
 pub mod audio;
+pub mod migrate;
+pub mod transcode;
 pub mod writer;
 mod export;
 mod notes;
