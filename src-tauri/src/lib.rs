@@ -299,14 +299,14 @@ fn spawn_session(
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             16000,
             16000,
-            move |src, text, start_ms, end_ms, spk| {
+            move |src, text, start_ms, end_ms, spk, rms| {
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
                 // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
                 match writer_f
                     .lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref())
+                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), rms)
                 {
                     Ok(()) => {
                         if degraded {
