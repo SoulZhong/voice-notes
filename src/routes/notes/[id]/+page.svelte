@@ -16,10 +16,13 @@
     editSegment,
     deleteSegment,
     setSegmentSpeaker,
+    noteAudioInfo,
     type Note,
     type SegmentRecord,
+    type TrackInfo,
   } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import AudioPlayer from "$lib/AudioPlayer.svelte";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -33,6 +36,13 @@
   let speakerMenuSeq = $state<number | null>(null);
 
   const id = $derived($page.params.id as string);
+
+  // 音频播放:轨道列表 + 播放器时钟(高亮跟随)。录制中(含暂停)不显示播放器,
+  // 文件正在写,不做边写边播的半态。
+  let tracks = $state<TrackInfo[]>([]);
+  let player = $state<ReturnType<typeof AudioPlayer> | null>(null);
+  let playerMs = $state(0);
+  let playerPlaying = $state(false);
 
   /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
       按 (start_ms, seq) 升序,前端直接消费。 */
@@ -63,6 +73,26 @@
     }
   }
 
+  // 轨道获取独立于 refresh:canEdit 必须在 await 之前同步读到才会成为 effect 依赖
+  // ——否则本页停录后(id/notesVersion 都没变)effect 不重跑,播放器永远不出现。
+  // await 后校验 id 未变,防快速切换笔记时旧响应覆盖新页面的轨道(错音频)。
+  // 音频是增值层:取失败(旧笔记无音频/后端异常)静默按无轨道处理,不打扰主内容。
+  $effect(() => {
+    const forId = id;
+    void recording.notesVersion;
+    if (!canEdit) {
+      tracks = [];
+      return;
+    }
+    noteAudioInfo(forId)
+      .then((t) => {
+        if (forId === id) tracks = t;
+      })
+      .catch(() => {
+        if (forId === id) tracks = [];
+      });
+  });
+
   // id 切换：无条件复位一切编辑态。
   $effect(() => {
     void id;
@@ -79,6 +109,38 @@
     exportMsg = "";
     refresh();
   });
+
+  /** 播放位置落在区间内的段(mic/system 可重叠,同帧可能多段)。 */
+  const activeSeqs = $derived.by(() => {
+    const s = new Set<number>();
+    if (tracks.length === 0) return s;
+    for (const seg of displaySegments) {
+      if (playerMs >= seg.start_ms && playerMs < seg.end_ms) s.add(seg.seq);
+    }
+    return s;
+  });
+
+  // 播放中自动跟随滚动到当前段(nearest:不打断用户往回翻看太远)。
+  let lastScrolledSeq = -1;
+  $effect(() => {
+    if (!playerPlaying) return;
+    const first = displaySegments.find((s) => activeSeqs.has(s.seq));
+    if (first && first.seq !== lastScrolledSeq) {
+      lastScrolledSeq = first.seq;
+      document
+        .querySelector(`[data-seq="${first.seq}"]`)
+        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
+
+  function playFrom(seg: SegmentRecord) {
+    if (!player) return;
+    // 段起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
+    // 否则 seek 被钳到末尾、play 又视作"播完重来",会莫名跳回 0:00。
+    if (seg.start_ms >= player.durationMs()) return;
+    player.seek(seg.start_ms);
+    player.play();
+  }
 
   function segFocus(s: SegmentRecord) {
     focusedSeq = s.seq;
@@ -173,30 +235,64 @@
   {/if}
 
   {#if note}
-    {#if editing}
-      <!-- svelte-ignore a11y_autofocus -->
-      <input
-        class="rename"
-        autofocus
-        bind:value={editingTitle}
-        onkeydown={(e) => {
-          if (e.key === "Enter") commitRename();
-          if (e.key === "Escape") editing = false;
-        }}
-        onblur={commitRename}
-      />
-    {:else}
-      <h1 class="title">
-        <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
-      </h1>
-    {/if}
+    <div class="header">
+      <div class="header-main">
+        {#if editing}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="rename"
+            autofocus
+            bind:value={editingTitle}
+            onkeydown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") editing = false;
+            }}
+            onblur={commitRename}
+          />
+        {:else}
+          <h1 class="title">
+            <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
+          </h1>
+        {/if}
 
-    <p class="meta">
-      {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
-      {#if note.meta.state === "recording"}
-        <span class="state interrupted">已中断</span>
-      {/if}
-    </p>
+        <p class="meta">
+          {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
+          {#if note.meta.state === "recording"}
+            <span class="state interrupted">已中断</span>
+          {/if}
+        </p>
+      </div>
+
+      <!-- 图标按钮(冒烟反馈):16px 线性 SVG + currentColor,悬停 title 说明 -->
+      <div class="row">
+        <button class="icon-btn" title="导出 Markdown" aria-label="导出 Markdown" onclick={() => doExport("md")}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+            <path d="M9.5 1.8V5h3.2" />
+            <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+          </svg>
+        </button>
+        <button class="icon-btn" title="导出纯文本" aria-label="导出纯文本" onclick={() => doExport("txt")}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+            <path d="M9.5 1.8V5h3.2" />
+            <path d="M5.5 8.4h5M5.5 10.4h5M5.5 12.4h3" stroke-width="1.2" />
+          </svg>
+        </button>
+        <button
+          class="icon-btn resume"
+          title="继续录制"
+          aria-label="继续录制"
+          disabled={recording.isLive}
+          onclick={doResume}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" />
+            <circle cx="8" cy="8" r="2.6" fill="currentColor" stroke="none" />
+          </svg>
+        </button>
+      </div>
+    </div>
 
     {#if note.meta.state === "recording"}
       <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
@@ -204,13 +300,11 @@
     {#if note.skipped_lines > 0}
       <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
     {/if}
+    {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
 
-    <div class="row">
-      <button onclick={() => doExport("md")}>导出 Markdown</button>
-      <button onclick={() => doExport("txt")}>导出纯文本</button>
-      <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
-      {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
-    </div>
+    {#if canEdit && tracks.length > 0}
+      <AudioPlayer bind:this={player} {tracks} bind:currentMs={playerMs} bind:playing={playerPlaying} />
+    {/if}
 
     <SpeakerChips
       speakers={note.speakers}
@@ -224,7 +318,7 @@
 
     <div class="transcript">
       {#each displaySegments as seg (seg.seq)}
-        <div class="seg">
+        <div class="seg" class:playing={activeSeqs.has(seg.seq)} data-seq={seg.seq}>
           {#if canEdit && speakerMenuSeq === seg.seq}
             <span class="badge-menu">
               {#each speakerIds as sid (sid)}
@@ -246,7 +340,13 @@
               {speakerLabel(seg.speaker, seg.source, note.speakers)}
             </button>
           {/if}
-          <span class="ts">{formatTs(seg.start_ms)}</span>
+          {#if tracks.length > 0}
+            <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom(seg)}>
+              {formatTs(seg.start_ms)}
+            </button>
+          {:else}
+            <span class="ts">{formatTs(seg.start_ms)}</span>
+          {/if}
           {#if canEdit}
             <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
                  失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
@@ -332,11 +432,55 @@
     color: var(--ink-secondary);
     margin: 0 0 1rem;
   }
+  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上) */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .header-main {
+    flex: 1;
+    min-width: 0;
+  }
   .row {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.5rem;
     align-items: center;
-    margin: 0 0 1rem;
+    flex: none;
+    justify-content: flex-end;
+    padding-top: 0.2rem;
+  }
+  /* icon-button:button-secondary 形态的方形图标钮,与播放键同语言 */
+  .icon-btn {
+    width: 2.1rem;
+    height: 2.1rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+  }
+  .icon-btn:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  /* 继续录制:红点承担彩色强调(与侧栏录制按钮同款语言) */
+  .icon-btn.resume {
+    color: var(--record);
+  }
+  .icon-btn.resume:hover {
+    color: var(--record);
+  }
+  .icon-btn.resume:disabled {
+    color: var(--ink-faint);
+  }
+  .export-msg {
+    margin: 0 0 0.75rem;
+    font-size: 0.85rem;
   }
   /* button-secondary：导出/继续录制，透明底 + hairline-strong 边，无阴影 */
   button {
@@ -370,6 +514,12 @@
   .seg {
     margin: 0 0 6px;
     line-height: 1.7;
+    border-radius: var(--radius-sm);
+    transition: background 120ms ease;
+  }
+  /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
+  .seg.playing {
+    background: var(--accent-tint);
   }
   .badge.as-btn {
     border: none;
@@ -455,6 +605,19 @@
     font-size: 0.8em;
     margin-right: 0.4em;
     font-variant-numeric: tabular-nums;
+  }
+  /* 时间戳按钮化(有音频时):无底无边,hover 变 accent 提示可点播 */
+  .ts-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    font-family: inherit;
+    border-radius: var(--radius-sm);
+  }
+  .ts-btn:hover {
+    color: var(--accent);
+    text-decoration: underline;
   }
   /* 已中断：沿用 warning 色系，与侧栏同款状态徽标一致 */
   .state.interrupted {

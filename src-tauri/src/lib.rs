@@ -58,6 +58,10 @@ struct ActiveSession {
     base_ms: u64,
     paused_at: Option<std::time::Instant>,
     paused_accum: std::time::Duration,
+    /// 音频写盘线程句柄:stop 时在 handle.stop()(join 分段 worker → sink drop →
+    /// 通道关闭)之后 join,保证 finalize 前 WAV 头已收尾。其余提前放弃路径不 join,
+    /// 线程随通道关闭自行退出(Drop 收尾)。
+    audio_joins: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ActiveSession {
@@ -333,6 +337,30 @@ fn spawn_session(
                 None
             }
         };
+        // 音频保留:每个配置的源一个惰性轨道写入器(首帧才建档;失败只降级,不影响转写)。
+        // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
+        // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
+        // 待写队列同哲学:内存暂存优于丢内容。base_ms 对齐语义见 AudioTrackWriter。
+        let note_dir = writer.lock().unwrap().dir().to_path_buf();
+        let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
+        let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for (source, _, _) in &sources {
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+            let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
+            audio_joins.push(std::thread::spawn(move || {
+                for chunk in rx.iter() {
+                    w.append(&chunk);
+                }
+                // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
+            }));
+            audio_sinks.push((
+                *source,
+                Box::new(move |s: &[f32]| {
+                    let _ = tx.send(s.to_vec());
+                }) as Box<dyn FnMut(&[f32]) + Send>,
+            ));
+        }
+
         let mut degraded = false;
         let start = session::start_session(
             sources,
@@ -342,6 +370,7 @@ fn spawn_session(
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             16000,
             16000,
+            audio_sinks,
             move |src, text, start_ms, end_ms, spk, rms| {
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
@@ -442,7 +471,7 @@ fn spawn_session(
                         },
                     );
                 }
-                session::DiarEvent::Snapshot(snaps) => {
+                session::DiarEvent::Snapshot { snaps, samples } => {
                     let mut w = writer_d.lock().unwrap();
                     w.store_centroids(&snaps);
                     // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
@@ -454,6 +483,23 @@ fn spawn_session(
                             Ok(enrolled) => {
                                 for (cluster_id, person_id) in &enrolled {
                                     w.set_speaker_person(cluster_id, person_id);
+                                }
+                                // 声纹样本落盘:已关联人物(既有命中或本次新入库)且库中尚无
+                                // 样本时写入,供管理页试听确认。失败同样只降级打日志。
+                                let sample_of = |cluster: &str| {
+                                    samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
+                                };
+                                for snap in &snaps {
+                                    let pid = snap
+                                        .person
+                                        .clone()
+                                        .or_else(|| enrolled.get(&snap.id).cloned());
+                                    let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
+                                        continue;
+                                    };
+                                    if let Err(e) = store.write_sample_if_missing(&pid, sample) {
+                                        eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
+                                    }
                                 }
                             }
                             Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
@@ -522,6 +568,7 @@ fn spawn_session(
                     base_ms,
                     paused_at: None,
                     paused_accum: std::time::Duration::ZERO,
+                    audio_joins,
                 });
                 drop(running_guard);
                 let _ = app.emit(
@@ -593,6 +640,11 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
         stash_model(&state.recognizer_cache, returned);
         stash_model(&state.embedder_cache, embedder);
+        // 分段 worker 已 join → audio sink 已 drop → 写盘线程排干后自退,join 保证
+        // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
+        for j in s.audio_joins {
+            let _ = j.join();
+        }
         note_id = s.note_id;
         if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
             eprintln!("stop_recording: finalize 失败: {e}");
@@ -689,6 +741,21 @@ fn list_notes(app: AppHandle, state: State<AppState>) -> Result<Vec<store::NoteS
 fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
+}
+
+/// 笔记音频轨道信息(详情页播放器用)。**纯读**:陈旧 WAV 头(硬崩残留)的修复
+/// 统一放在应用启动扫描(setup)与续录 open——此前放在这里做过"非活动才修",但
+/// stop 排干窗口 / 开录入槽窗口里 session 槽都是空的,check-then-act 挡不住与
+/// 写盘线程并发互踩,读路径必须无副作用。
+#[tauri::command]
+fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::TrackInfo>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note_dir = dir.join(&id);
+    if !note_dir.is_dir() {
+        return Err(format!("笔记不存在: {id}"));
+    }
+    Ok(store::audio::list_tracks(&note_dir))
 }
 
 #[tauri::command]
@@ -834,7 +901,8 @@ fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, Stri
 /// （merge 已把 loser 移出 people），无需再过一遍 resolve。
 #[tauri::command]
 fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
-    let vp = open_voiceprint_store(&app)?.load();
+    let store = open_voiceprint_store(&app)?;
+    let vp = store.load();
     Ok(vp
         .people
         .iter()
@@ -844,6 +912,9 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
             total_ms: p.total_ms,
             last_seen: p.last_seen.clone(),
             sources: p.centroids.keys().cloned().collect(),
+            sample_path: store
+                .sample_path_if_exists(id)
+                .map(|p| p.to_string_lossy().into_owned()),
         })
         .collect())
 }
@@ -1013,6 +1084,18 @@ pub fn run() {
                 models::init_app_root(models_dir);
             }
             models::download::sweep_tmp(&models::root());
+            // 启动修复陈旧 WAV 头(硬崩后头尺寸落后于数据,播放端看不到尾段)。
+            // 放在 setup 同步做:此刻必无录制会话,与写盘线程零竞态;逐笔记 44 字节
+            // 头校验,仅陈旧才回写,量级毫秒。
+            if let Ok(dir) = app.path().app_data_dir() {
+                if let Ok(rd) = std::fs::read_dir(dir.join("notes")) {
+                    for e in rd.flatten() {
+                        if e.path().is_dir() {
+                            store::audio::repair_stale_tracks(&e.path());
+                        }
+                    }
+                }
+            }
             let st = app.state::<AppState>();
             preload_models(st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             Ok(())
@@ -1026,6 +1109,7 @@ pub fn run() {
             unpause_recording,
             list_notes,
             get_note,
+            note_audio_info,
             rename_note,
             delete_note,
             export_note,

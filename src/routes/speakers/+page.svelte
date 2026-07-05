@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
     renamePerson,
@@ -12,7 +13,7 @@
   let people = $state<PersonSummary[]>([]);
   let error = $state("");
 
-  // 开始改名时顺带收起其它行内菜单/确认态，避免同屏多个操作态互相冲突。
+  // 同屏只允许一个操作态:开一个就收起其它(改名/合并菜单/删除确认/合并确认)。
   let mergeMenuId = $state<string | null>(null);
   let pendingMerge = $state<{ loser: string; winner: string } | null>(null);
   let confirmDeleteId = $state<string | null>(null);
@@ -23,6 +24,32 @@
   function displayName(p: PersonSummary): string {
     return p.name || `未命名 · 最近 ${formatDate(p.last_seen)}`;
   }
+
+  /** 头像粉彩底:P<n> 数值循环取 DESIGN 粉彩 7 色,异常 id 散列兜底。 */
+  const TINTS = [
+    "var(--tint-sky)",
+    "var(--tint-mint)",
+    "var(--tint-peach)",
+    "var(--tint-lavender)",
+    "var(--tint-rose)",
+    "var(--tint-yellow)",
+    "var(--tint-gray)",
+  ];
+  function avatarTint(id: string): string {
+    const n = parseInt(id.replace(/^P/, ""), 10);
+    if (Number.isFinite(n) && n > 0) return TINTS[(n - 1) % TINTS.length];
+    let h = 0;
+    for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    return TINTS[h % TINTS.length];
+  }
+
+  /** 最近出现的人排前面(BTreeMap 原序是 P1..Pn,对使用者没有意义)。 */
+  const sorted = $derived(
+    [...people].sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")),
+  );
+  /** 分组:未命名的是"待处理项"排上面,已命名的是稳定资产。 */
+  const unnamed = $derived(sorted.filter((p) => !p.name));
+  const named = $derived(sorted.filter((p) => p.name));
 
   async function refresh() {
     try {
@@ -35,17 +62,20 @@
 
   onMount(refresh);
 
-  // 显式编辑态(冒烟反馈:占位文本 contenteditable 让"能改名"完全不可发现)——
-  // 未命名人给显眼的「命名」按钮,已命名人名字带 ✎ 角标;点击换成真输入框。
+  // 显式编辑态:未命名人给显眼的「命名」按钮,已命名人点名字改;点击换成真输入框。
   let editingId = $state<string | null>(null);
   let editingName = $state("");
+
+  function closeAllOps() {
+    mergeMenuId = null;
+    pendingMerge = null;
+    confirmDeleteId = null;
+  }
 
   function beginRename(p: PersonSummary) {
     editingId = p.id;
     editingName = p.name;
-    mergeMenuId = null;
-    pendingMerge = null;
-    confirmDeleteId = null;
+    closeAllOps();
   }
 
   async function commitRename(p: PersonSummary) {
@@ -66,6 +96,7 @@
     if (!pendingMerge) return;
     const { loser, winner } = pendingMerge;
     pendingMerge = null;
+    mergeMenuId = null;
     try {
       await mergePerson(loser, winner);
       await refresh();
@@ -77,6 +108,7 @@
 
   async function doDelete(id: string) {
     confirmDeleteId = null;
+    if (samplePlayingId === id) stopSample();
     try {
       await deletePerson(id);
       await refresh();
@@ -84,13 +116,46 @@
       error = `删除失败: ${e}`;
     }
   }
+
+  // 录音样本试听:全页共享一个 Audio 实例,点击切换;换人先停上一个。
+  let sampleAudio: HTMLAudioElement | null = null;
+  let samplePlayingId = $state<string | null>(null);
+
+  function stopSample() {
+    sampleAudio?.pause();
+    sampleAudio = null;
+    samplePlayingId = null;
+  }
+
+  function toggleSample(p: PersonSummary) {
+    if (samplePlayingId === p.id) {
+      stopSample();
+      return;
+    }
+    stopSample();
+    if (!p.sample_path) return;
+    const a = new Audio(convertFileSrc(p.sample_path));
+    a.onended = () => {
+      if (samplePlayingId === p.id) stopSample();
+    };
+    sampleAudio = a;
+    samplePlayingId = p.id;
+    // 迟到的 play() 拒绝(文件已删/加载失败)只清自己:无身份守卫会把用户随后
+    // 点播的另一个人的样本一并停掉。
+    void a.play().catch(() => {
+      if (samplePlayingId === p.id) stopSample();
+    });
+  }
+
+  // 离开页面停播,不留幽灵声音。
+  $effect(() => stopSample);
 </script>
 
 <main class="container">
   <h1>声纹库</h1>
   <p class="desc">
-    这里是声纹库:录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,
-    之后的录制会自动认出他并直接显示名字;认错拆重了就用<strong>合并</strong>归到同一个人。
+    录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,之后的录制会自动认出他并直接显示名字;
+    认错拆重了就用<strong>合并</strong>归到同一个人。点<strong>试听</strong>可以听一段他的原声确认是谁。
   </p>
 
   {#if error}
@@ -98,84 +163,229 @@
   {/if}
 
   {#if people.length === 0}
-    <p class="hint">还没有说话人。录一场会议(单人说话累计满 10 秒),停止后会自动出现在这里。</p>
+    <div class="empty">
+      <p>还没有说话人。</p>
+      <p class="hint">录一场会议(单人说话累计满 10 秒),停止后会自动出现在这里。</p>
+    </div>
   {:else}
-    <ul class="list">
-      {#each people as p (p.id)}
-        <li class="item">
-          <div class="main-line">
-            {#if editingId === p.id}
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                class="name-input"
-                autofocus
-                placeholder="输入名字,如 张三"
-                bind:value={editingName}
-                onkeydown={(e) => {
-                  if (e.key === "Enter") commitRename(p);
-                  if (e.key === "Escape") editingId = null;
-                }}
-                onblur={() => commitRename(p)}
-              />
-            {:else if p.name}
-              <button class="name-btn" title="点击改名" onclick={() => beginRename(p)}>
-                {p.name}<span class="pencil">✎</span>
-              </button>
+    {#if unnamed.length > 0}
+      <div class="section-head">
+        <h2 class="section-title">待命名<span class="count">{unnamed.length}</span></h2>
+        <span class="section-hint">命名后,之后的录制会自动认出并直接显示名字</span>
+      </div>
+      <ul class="list">
+        {#each unnamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      </ul>
+    {/if}
+
+    {#if named.length > 0}
+      <div class="section-head">
+        <h2 class="section-title">已命名<span class="count">{named.length}</span></h2>
+      </div>
+      <ul class="list">
+        {#each named as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      </ul>
+    {/if}
+  {/if}
+
+  {#snippet personRow(p: PersonSummary)}
+        <li class="item" class:active-row={samplePlayingId === p.id}>
+          <div class="avatar" style="background: {avatarTint(p.id)}">
+            {#if p.name}
+              <span class="initial">{p.name.slice(0, 1)}</span>
             {:else}
-              <span class="unnamed">未命名</span>
-              <button class="name-cta" onclick={() => beginRename(p)}>命名</button>
+              <!-- 人形轮廓:16px 线性 SVG(DESIGN 禁用 👤 等 emoji) -->
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+                <circle cx="8" cy="5.2" r="2.7" />
+                <path d="M2.8 13.6c.8-2.6 2.8-3.9 5.2-3.9s4.4 1.3 5.2 3.9" />
+              </svg>
             {/if}
-            <span class="meta">
-              {#if !p.name}最近 {formatDate(p.last_seen)} · {/if}累计发声 {formatDuration(Math.floor(p.total_ms / 1000))}
+          </div>
+
+          <div class="info">
+            <div class="name-line">
+              {#if editingId === p.id}
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  class="name-input"
+                  autofocus
+                  placeholder="输入名字,如 张三"
+                  bind:value={editingName}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") commitRename(p);
+                    if (e.key === "Escape") editingId = null;
+                  }}
+                  onblur={() => commitRename(p)}
+                />
+              {:else if p.name}
+                <button class="name-btn" title="点击改名" onclick={() => beginRename(p)}>
+                  {p.name}
+                  <svg class="pencil" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M11.3 2.4l2.3 2.3L5.3 13l-3 .7.7-3z" />
+                  </svg>
+                </button>
+              {:else}
+                <span class="unnamed">未命名</span>
+                <button class="name-cta" onclick={() => beginRename(p)}>命名</button>
+              {/if}
+            </div>
+            <div class="meta-line">
+              最近 {formatDate(p.last_seen)} · 累计发声 {formatDuration(Math.floor(p.total_ms / 1000))}
               {#each p.sources as s (s)}
                 <span class="badge">{sourceLabel(s)}</span>
               {/each}
-            </span>
+            </div>
           </div>
-          <div class="actions">
-            {#if pendingMerge && pendingMerge.loser === p.id}
-              {@const target = people.find((o) => o.id === pendingMerge?.winner)}
-              <span class="confirm-text">
-                确认合并到「{target ? displayName(target) : "?"}」？合并后该人历史笔记显示目标人的名字。
-              </span>
-              <button class="link danger" onclick={doMerge}>确认合并</button>
-              <button class="link" onclick={() => (pendingMerge = null)}>取消</button>
-            {:else if mergeMenuId === p.id}
-              <span class="menu">
-                {#each people.filter((o) => o.id !== p.id) as o (o.id)}
-                  <button class="menu-item" onclick={() => (pendingMerge = { loser: p.id, winner: o.id })}>
-                    {displayName(o)}
-                  </button>
-                {/each}
-                <button class="menu-item" onclick={() => (mergeMenuId = null)}>取消</button>
-              </span>
-            {:else}
-              <button class="link" disabled={people.length < 2} onclick={() => (mergeMenuId = p.id)}>
-                合并到…
+
+          <div class="actions" class:pinned={samplePlayingId === p.id || mergeMenuId === p.id || pendingMerge?.loser === p.id || confirmDeleteId === p.id}>
+            {#if p.sample_path}
+              <button
+                class="icon-btn"
+                class:playing={samplePlayingId === p.id}
+                title={samplePlayingId === p.id ? "停止" : "试听本人原声"}
+                aria-label={samplePlayingId === p.id ? "停止" : "试听"}
+                onclick={() => toggleSample(p)}
+              >
+                {#if samplePlayingId === p.id}
+                  <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                {:else}
+                  <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
+                  </svg>
+                {/if}
               </button>
-            {/if}
-            {#if confirmDeleteId === p.id}
-              <button class="link danger" onclick={() => doDelete(p.id)}>确认删除</button>
-              <button class="link" onclick={() => (confirmDeleteId = null)}>取消</button>
             {:else}
-              <button class="link" onclick={() => (confirmDeleteId = p.id)}>删除</button>
+              <span class="icon-btn ghost" title="暂无录音样本:下次录到这个人并停止录制后会自动补上">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+                  <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" />
+                  <path d="M2 2l12 12" />
+                </svg>
+              </span>
+            {/if}
+
+            <div class="merge-anchor">
+              <button
+                class="icon-btn"
+                title="合并到另一个人"
+                aria-label="合并"
+                disabled={people.length < 2}
+                onclick={() => {
+                  const opening = mergeMenuId !== p.id;
+                  closeAllOps();
+                  editingId = null;
+                  if (opening) mergeMenuId = p.id;
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 4h3.2L10 12h3" />
+                  <path d="M3 12h3.2" />
+                  <path d="M10 4h3" />
+                  <path d="M11.4 2.4L13 4l-1.6 1.6M11.4 10.4L13 12l-1.6 1.6" />
+                </svg>
+              </button>
+              {#if mergeMenuId === p.id && !pendingMerge}
+                <div class="menu">
+                  <div class="menu-title">把「{displayName(p)}」并入…</div>
+                  {#each sorted.filter((o) => o.id !== p.id) as o (o.id)}
+                    <button class="menu-item" onclick={() => (pendingMerge = { loser: p.id, winner: o.id })}>
+                      <span class="menu-dot" style="background: {avatarTint(o.id)}"></span>
+                      {displayName(o)}
+                    </button>
+                  {/each}
+                </div>
+              {:else if pendingMerge && pendingMerge.loser === p.id}
+                {@const target = people.find((o) => o.id === pendingMerge?.winner)}
+                <div class="menu confirm">
+                  <div class="menu-title">
+                    并入「{target ? displayName(target) : "?"}」?合并后这个人历史笔记都显示对方的名字,不可撤销。
+                  </div>
+                  <div class="confirm-row">
+                    <button class="mini danger" onclick={doMerge}>确认合并</button>
+                    <button class="mini" onclick={() => { pendingMerge = null; mergeMenuId = null; }}>取消</button>
+                  </div>
+                </div>
+              {/if}
+            </div>
+
+            {#if confirmDeleteId === p.id}
+              <div class="confirm-inline">
+                <button class="mini danger" onclick={() => doDelete(p.id)}>确认删除</button>
+                <button class="mini" onclick={() => (confirmDeleteId = null)}>取消</button>
+              </div>
+            {:else}
+              <button
+                class="icon-btn danger-hover"
+                title="从声纹库删除(不影响已有笔记文字)"
+                aria-label="删除"
+                onclick={() => {
+                  closeAllOps();
+                  confirmDeleteId = p.id;
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 4.2h11M6.2 4V2.8c0-.4.3-.8.8-.8h2c.5 0 .8.4.8.8V4M4 4.2l.7 9c0 .5.4.8.9.8h4.8c.5 0 .9-.3.9-.8l.7-9" />
+                  <path d="M6.6 7v4.4M9.4 7v4.4" />
+                </svg>
+              </button>
             {/if}
           </div>
         </li>
-      {/each}
-    </ul>
-  {/if}
+  {/snippet}
 </main>
 
 <style>
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;
+    max-width: 52rem;
   }
   h1 {
-    margin: 0 0 1rem;
+    margin: 0 0 0.75rem;
   }
-  /* list-row 容器：以 surface 卡片形式承载各行，行内分隔见 .item */
+  .desc {
+    color: var(--ink-secondary);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    margin: 0 0 1.25rem;
+    max-width: 46rem;
+  }
+  /* 分区标题:小号加粗 + 计数胶囊,待命名区带引导文案 */
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    margin: 1.1rem 0 0.45rem;
+  }
+  .section-head:first-of-type {
+    margin-top: 0;
+  }
+  .section-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink-secondary);
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .count {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--ink-faint);
+    background: var(--surface-press);
+    border-radius: var(--radius-full);
+    padding: 0 0.5em;
+    line-height: 1.5;
+  }
+  .section-hint {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  /* list-row 容器:surface 卡片承载各行 */
   .list {
     list-style: none;
     margin: 0;
@@ -183,74 +393,95 @@
     background: var(--surface);
     border-radius: var(--radius-lg);
   }
-  /* list-row：透明底 + 行间 hairline 分隔，hover surface-soft */
+  /* list-row:行间 hairline 分隔,hover surface-soft;试听中整行微亮 */
   .item {
-    padding: 0.75rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.7rem 1rem;
     border-bottom: 1px solid var(--hairline);
+    transition: background 120ms ease;
+  }
+  .item:first-child {
+    border-top-left-radius: var(--radius-lg);
+    border-top-right-radius: var(--radius-lg);
   }
   .item:last-child {
     border-bottom: none;
+    border-bottom-left-radius: var(--radius-lg);
+    border-bottom-right-radius: var(--radius-lg);
   }
-  .item:hover {
+  .item:hover,
+  .item.active-row {
     background: var(--surface-soft);
   }
-  .main-line {
+  /* 头像:36px 圆形粉彩底,名字首字或人形轮廓 */
+  .avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    flex: none;
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
-    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    color: var(--ink);
   }
-  /* desc 用 caption 色阶（次要说明文字） */
-  .desc {
-    color: var(--ink-secondary);
-    font-size: 0.85rem;
-    line-height: 1.45;
-    margin: -0.5rem 0 1rem;
-    max-width: 46rem;
+  .initial {
+    font-size: 0.95rem;
+    font-weight: 600;
   }
-  /* editable-text（名字）：静态无边，hover accent-tint 底 + rounded-sm */
+  .info {
+    flex: 1;
+    min-width: 0;
+  }
+  .name-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 1.6em;
+  }
+  /* editable-text(名字):静态无边,hover accent-tint 底;✎ 改线性 SVG 角标 */
   .name-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
     background: none;
     border: none;
     font: inherit;
     font-weight: 600;
-    font-size: 1.05em;
+    font-size: 1rem;
     color: inherit;
     cursor: pointer;
     border-radius: var(--radius-sm);
-    padding: 0.1em 0.3em;
-    margin: -0.1em -0.3em;
+    padding: 0.1em 0.35em;
+    margin: -0.1em -0.35em;
   }
   .name-btn:hover {
     background: var(--accent-tint);
   }
-  /* 已命名说话人的 ✎ 角标：ink-faint，hover 变 accent */
   .pencil {
     color: var(--ink-faint);
-    font-size: 0.8em;
-    margin-left: 0.35em;
   }
   .name-btn:hover .pencil {
     color: var(--accent);
   }
   .unnamed {
     font-weight: 600;
-    font-size: 1.05em;
+    font-size: 1rem;
     font-style: italic;
     color: var(--ink-faint);
   }
-  /* button-primary：命名是本行唯一主动作 */
+  /* button-primary:命名是本行唯一主动作 */
   .name-cta {
     background: var(--accent);
     color: var(--on-accent);
     border: none;
     border-radius: var(--radius-md);
     padding: 0.15em 0.8em;
-    font-size: 0.9rem; /* button 字级 token,与全局按钮对齐 */
+    font-size: 0.85rem;
     font-weight: 500;
     cursor: pointer;
-    margin-left: 0.5em;
+    box-shadow: var(--shadow-btn);
   }
   .name-cta:hover {
     background: var(--accent-pressed);
@@ -258,7 +489,7 @@
   .name-input {
     font: inherit;
     font-weight: 600;
-    font-size: 1.05em;
+    font-size: 1rem;
     border: 1px solid var(--accent);
     border-radius: var(--radius-md);
     background: var(--canvas);
@@ -266,71 +497,195 @@
     padding: 0.1em 0.4em;
     min-width: 12rem;
   }
-  .meta {
+  .meta-line {
     color: var(--ink-faint);
-    font-size: 0.85em;
-    white-space: nowrap;
+    font-size: 0.82rem;
+    margin-top: 0.15rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
   }
   .badge {
-    display: inline-block;
-    font-size: 0.85em;
+    font-size: 0.78rem;
     border-radius: var(--radius-md);
-    padding: 0.05em 0.5em;
-    margin-left: 0.4em;
+    padding: 0.02em 0.5em;
     background: var(--surface-press);
     color: var(--ink-secondary);
   }
+  /* 行级操作:默认隐身,悬停显影;有活动操作态(播放/菜单/确认)时钉住 */
   .actions {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
     gap: 0.4rem;
-    margin-top: 0.4rem;
+    flex: none;
+    visibility: hidden;
   }
-  /* button-link：无底无边，accent 字，悬停加下划线 */
-  .link {
-    background: none;
-    border: none;
-    color: var(--accent);
+  .item:hover .actions,
+  .actions.pinned {
+    visibility: visible;
+  }
+  .icon-btn {
+    width: 1.9rem;
+    height: 1.9rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--ink-secondary);
     cursor: pointer;
-    padding: 0.15em 0.3em;
-    font-size: 0.85em;
+    transition: background 120ms ease, color 120ms ease;
   }
-  .link:hover {
-    text-decoration: underline;
+  .icon-btn:hover {
+    background: var(--surface-press);
+    color: var(--ink);
   }
-  .link:disabled {
+  .icon-btn:disabled {
     color: var(--ink-faint);
     cursor: default;
+    background: transparent;
   }
-  .link.danger {
+  .icon-btn.playing {
+    color: var(--accent);
+  }
+  .icon-btn.danger-hover:hover {
     color: var(--danger);
-    font-weight: 600;
   }
-  /* menu/popover（合并目标下拉）：canvas 底、hairline 边、rounded-lg、shadow-popover */
-  .menu {
+  /* 无样本占位:极淡、不可点,title 解释何时会有 */
+  .icon-btn.ghost {
+    color: var(--ink-faint);
+    opacity: 0.45;
+    cursor: default;
+  }
+  /* 试听中的跳动条(纯 CSS,无符号字符) */
+  .bars {
     display: inline-flex;
-    flex-wrap: wrap;
-    gap: 0.25em;
+    align-items: flex-end;
+    gap: 2.5px;
+    height: 13px;
+  }
+  .bars span {
+    width: 2.5px;
+    border-radius: 1px;
+    background: currentColor;
+    animation: eq 0.9s ease-in-out infinite;
+  }
+  .bars span:nth-child(1) {
+    height: 60%;
+    animation-delay: 0s;
+  }
+  .bars span:nth-child(2) {
+    height: 100%;
+    animation-delay: 0.25s;
+  }
+  .bars span:nth-child(3) {
+    height: 75%;
+    animation-delay: 0.5s;
+  }
+  @keyframes eq {
+    0%,
+    100% {
+      transform: scaleY(0.5);
+    }
+    50% {
+      transform: scaleY(1);
+    }
+  }
+  /* menu/popover(合并目标):canvas 底、hairline 边、rounded-lg、shadow-popover */
+  .merge-anchor {
+    position: relative;
+  }
+  .menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 10;
+    min-width: 15rem;
+    max-height: 16rem;
+    overflow-y: auto;
     background: var(--canvas);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
-    padding: 0.2em 0.4em;
+    padding: 0.35rem;
+  }
+  .menu-title {
+    color: var(--ink-secondary);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    padding: 0.25rem 0.5rem 0.35rem;
   }
   .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    text-align: left;
     background: none;
     border: none;
-    color: var(--accent);
+    color: var(--ink);
+    font-size: 0.85rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    font-size: 0.85em;
-    padding: 0.15em 0.4em;
   }
-  .confirm-text {
-    font-size: 0.85em;
+  .menu-item:hover {
+    background: var(--surface-soft);
+  }
+  .menu-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex: none;
+  }
+  .menu.confirm .menu-title {
     color: var(--warning-ink);
   }
-  /* 此处 banner 只用于加载/改名/合并/删除失败，用 danger 色系 */
+  .confirm-row {
+    display: flex;
+    gap: 0.4rem;
+    padding: 0.15rem 0.5rem 0.25rem;
+  }
+  .confirm-inline {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  /* mini 按钮:确认条里的小实体按钮 */
+  .mini {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    padding: 0.2em 0.7em;
+    cursor: pointer;
+  }
+  .mini:hover {
+    background: var(--surface-soft);
+  }
+  .mini.danger {
+    border-color: var(--danger);
+    color: var(--danger);
+    font-weight: 600;
+  }
+  .mini.danger:hover {
+    background: var(--danger);
+    color: var(--on-accent);
+  }
+  .empty {
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    padding: 2rem 1.5rem;
+    text-align: center;
+  }
+  .empty p {
+    margin: 0 0 0.4rem;
+    font-weight: 500;
+  }
   .banner {
     background: var(--danger-tint);
     border: 1px solid var(--danger-line);
@@ -342,5 +697,6 @@
   }
   .hint {
     color: var(--ink-faint);
+    font-weight: 400;
   }
 </style>
