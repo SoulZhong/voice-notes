@@ -549,6 +549,7 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
+            vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
@@ -1020,6 +1021,7 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
+            vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
@@ -1052,6 +1054,7 @@ mod tests {
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
             16000,
             4000,
+            vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w3.lock()
                     .unwrap()

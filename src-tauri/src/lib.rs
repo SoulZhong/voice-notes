@@ -333,6 +333,19 @@ fn spawn_session(
                 None
             }
         };
+        // 音频保留:每个配置的源一个惰性轨道写入器(首帧才建档;失败只降级,不影响转写)。
+        // base_ms 对齐语义见 store::audio::AudioTrackWriter。
+        let audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = {
+            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            sources
+                .iter()
+                .map(|(source, _, _)| {
+                    let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
+                    (*source, Box::new(move |s: &[f32]| w.append(s)) as Box<dyn FnMut(&[f32]) + Send>)
+                })
+                .collect()
+        };
+
         let mut degraded = false;
         let start = session::start_session(
             sources,
@@ -342,6 +355,7 @@ fn spawn_session(
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
             16000,
             16000,
+            audio_sinks,
             move |src, text, start_ms, end_ms, spk, rms| {
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
@@ -442,7 +456,7 @@ fn spawn_session(
                         },
                     );
                 }
-                session::DiarEvent::Snapshot(snaps) => {
+                session::DiarEvent::Snapshot { snaps, samples } => {
                     let mut w = writer_d.lock().unwrap();
                     w.store_centroids(&snaps);
                     // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
@@ -454,6 +468,23 @@ fn spawn_session(
                             Ok(enrolled) => {
                                 for (cluster_id, person_id) in &enrolled {
                                     w.set_speaker_person(cluster_id, person_id);
+                                }
+                                // 声纹样本落盘:已关联人物(既有命中或本次新入库)且库中尚无
+                                // 样本时写入,供管理页试听确认。失败同样只降级打日志。
+                                let sample_of = |cluster: &str| {
+                                    samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
+                                };
+                                for snap in &snaps {
+                                    let pid = snap
+                                        .person
+                                        .clone()
+                                        .or_else(|| enrolled.get(&snap.id).cloned());
+                                    let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
+                                        continue;
+                                    };
+                                    if let Err(e) = store.write_sample_if_missing(&pid, sample) {
+                                        eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
+                                    }
                                 }
                             }
                             Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
@@ -691,6 +722,28 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
     store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
 }
 
+/// 笔记音频轨道信息(详情页播放器用)。非活动笔记顺带修复陈旧 WAV 头(硬崩后头部
+/// 尺寸落后于实际数据,播放端会看不到尾段);活动笔记跳过修复——录制线程正按刷盘
+/// 节奏回写头部,两个写者互踩反而制造损坏。
+#[tauri::command]
+fn note_audio_info(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<Vec<store::audio::TrackInfo>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note_dir = dir.join(&id);
+    if !note_dir.is_dir() {
+        return Err(format!("笔记不存在: {id}"));
+    }
+    let active = state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false);
+    if !active {
+        store::audio::repair_stale_tracks(&note_dir);
+    }
+    Ok(store::audio::list_tracks(&note_dir))
+}
+
 #[tauri::command]
 fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
@@ -834,7 +887,8 @@ fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, Stri
 /// （merge 已把 loser 移出 people），无需再过一遍 resolve。
 #[tauri::command]
 fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
-    let vp = open_voiceprint_store(&app)?.load();
+    let store = open_voiceprint_store(&app)?;
+    let vp = store.load();
     Ok(vp
         .people
         .iter()
@@ -844,6 +898,9 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
             total_ms: p.total_ms,
             last_seen: p.last_seen.clone(),
             sources: p.centroids.keys().cloned().collect(),
+            sample_path: store
+                .sample_path_if_exists(id)
+                .map(|p| p.to_string_lossy().into_owned()),
         })
         .collect())
 }
@@ -1026,6 +1083,7 @@ pub fn run() {
             unpause_recording,
             list_notes,
             get_note,
+            note_audio_info,
             rename_note,
             delete_note,
             export_note,
