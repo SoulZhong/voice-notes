@@ -236,25 +236,25 @@
     /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置/声纹库推出视口 */
     overflow-y: hidden;
   }
-  /* 录制按钮:白底 + 红点(语音备忘录式)。大面积强调蓝在侧栏太吵,主 CTA 的
-     "彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
+  /* 录制按钮:主 CTA 药丸(primary 底 + on-primary 字 + radius-full,dark 下即白药丸)+ 红点。
+     大面积强调蓝在侧栏太吵,"彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
   .record-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 0.5em;
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     padding: 0.55em 1em;
     font-size: 0.9rem;
     font-weight: 500;
     cursor: pointer;
-    color: var(--ink);
-    background: var(--canvas);
+    color: var(--on-primary);
+    background: var(--primary);
     box-shadow: var(--shadow-btn);
   }
   .record-btn:hover {
-    background: var(--surface-soft);
+    background: var(--primary-pressed);
   }
   .rec-dot {
     width: 9px;
@@ -267,6 +267,8 @@
   .rec-dot.square {
     border-radius: 2px;
   }
+  /* 录制中红字于药丸:dark 下白药丸 red-on-white 3.5:1 大字可读;light 下 primary 是 #18191a 黑药丸,
+     red #ff6161 on 黑更亮更清晰。两主题均成立,故保留 record 字色。 */
   .record-btn.recording {
     color: var(--record);
     font-weight: 500;
@@ -399,12 +401,13 @@
     background: var(--warning-line);
     color: var(--warning-ink);
   }
-  /* 录制中：record 是双主题一致的常驻彩色信号，白字在两种主题下都清晰。 */
+  /* 录制中：record 是双主题一致的常驻彩色信号，白字于红底（暗色同值同白）。 */
   .state.active {
     background: var(--record);
-    color: var(--on-accent);
+    color: var(--on-record);
   }
-  /* 右键菜单:popover 规范(canvas 底 + hairline + shadow-popover);
+  /* 右键菜单:popover 规范(surface-press 底 + hairline + shadow-popover);
+     暗色下 canvas 比承载面更黑,浮层若用 canvas 会成"洞",故底走 surface-press。
      透明遮罩承接"点击别处关闭",fixed 定位跟随鼠标坐标。 */
   .menu-overlay {
     position: fixed;
@@ -415,7 +418,7 @@
     position: fixed;
     z-index: 41;
     min-width: 9rem;
-    background: var(--canvas);
+    background: var(--surface-press);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);

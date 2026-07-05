@@ -86,8 +86,7 @@
     display: flex;
     align-items: center;
     gap: 0.3rem;
-    /* 底色由内联 style 按说话人取粉彩色,此处不设默认(设了也恒被覆盖) */
-    color: var(--ink);
+    /* 底色与文字色均由内联 style 按说话人配对,此处不设默认(设了也恒被覆盖) */
     border-radius: var(--radius-full);
     padding: 0.2em 0.6em;
     font-size: 0.85em;

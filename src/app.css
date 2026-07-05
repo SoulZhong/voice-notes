@@ -35,6 +35,9 @@
 
   /* 录制红点:Raycast accent-red,双主题一致,仍是唯一常驻彩色信号 */
   --record: #ff6161;
+  /* record/danger 实底上的文字色:v1 即白字于红底,小徽章尺寸下沿用;对比度归冒烟观察项。
+     双主题同白,故遵循本分支"同值不重复"惯例只在 :root 定义一次;勿与 on-accent 混用防 token 漂移。 */
+  --on-record: #ffffff;
 
   --warning-tint: #fef6de;
   --warning-ink: #7a5a0e;

@@ -414,7 +414,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: var(--ink);
+    /* 文字色由内联 style 按说话人配对(avatarInk),此处不设默认——设了也恒被覆盖 */
   }
   .initial {
     font-size: 0.95rem;
@@ -584,7 +584,8 @@
       transform: scaleY(1);
     }
   }
-  /* menu/popover(合并目标):canvas 底、hairline 边、rounded-lg、shadow-popover */
+  /* menu/popover(合并目标):surface-press 底、hairline 边、rounded-lg、shadow-popover
+     (暗色下 canvas 比承载面更黑,浮层用 canvas 会成"洞",故底走 surface-press)。 */
   .merge-anchor {
     position: relative;
   }
@@ -596,7 +597,7 @@
     min-width: 15rem;
     max-height: 16rem;
     overflow-y: auto;
-    background: var(--canvas);
+    background: var(--surface-press);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
@@ -664,7 +665,7 @@
   }
   .mini.danger:hover {
     background: var(--danger);
-    color: var(--on-accent);
+    color: var(--on-record);
   }
   .empty {
     background: var(--surface);
