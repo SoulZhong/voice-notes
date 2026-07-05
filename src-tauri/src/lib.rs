@@ -1498,6 +1498,56 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     Ok(())
 }
 
+/// 设置页「音频占用磁盘」展示:遍历 notes 根统计所有笔记的音频文件字节数。
+/// 纯读操作,不需要任何守卫(不碰转码/录制状态)。
+#[tauri::command]
+fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
+    let notes = notes_dir(&app).map_err(|e| e.to_string())?;
+    Ok(store::disk::audio_usage_bytes(&notes))
+}
+
+/// 按时间清理已完成笔记的音频(保留转写文字,只删音频文件释放磁盘)。
+/// 守卫同迁移命令的思路:录制中直接拒绝(音频还在写,中途删必损坏);
+/// 通过后 `pause_and_wait` 静止转码队列(防止清理途中 worker 正把某笔记的 wav 转
+/// 成 m4a,清理和转码撞同一批文件),`UnpauseOnDrop` 保证无论正常返回还是提前 return
+/// 都必然解除暂停。
+///
+/// 与迁移不同:这里**不**开后台线程——遍历+删文件是百级笔记毫秒到秒级的量级,
+/// 同步跑完直接返回释放字节数即可,没必要为它另起一套进度事件。
+///
+/// 是否为「活动笔记」用 session 槽的 note_id 比对,而非 state 参数——此时 running 已经
+/// 确认为 false,正常不会有会话在槽里;这里仍查一次是纯防御(万一未来某处状态机出现
+/// running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
+#[tauri::command]
+fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u32>) -> Result<u64, String> {
+    if *state.running.lock().unwrap() {
+        return Err("录制中不能清理音频".into());
+    }
+    state.transcode.pause_and_wait();
+    let _unpause = UnpauseOnDrop(state.transcode.clone());
+    // cutoff 与 meta 里的 RFC3339 字符串同源(都来自 Local::now)，可直接字符串比较。
+    let cutoff = older_than_days
+        .map(|d| (chrono::Local::now() - chrono::Duration::days(d as i64)).to_rfc3339());
+    let active_id = state.session.lock().unwrap().as_ref().map(|s| s.note_id.clone());
+    let notes = notes_dir(&app).map_err(|e| e.to_string())?;
+    let Ok(rd) = std::fs::read_dir(&notes) else {
+        return Ok(0);
+    };
+    let mut freed = 0u64;
+    for entry in rd.flatten() {
+        let note_dir = entry.path();
+        if !note_dir.is_dir() {
+            continue;
+        }
+        let is_active = active_id.as_deref() == note_dir.file_name().and_then(|n| n.to_str());
+        if is_active || !store::disk::should_purge(&note_dir, cutoff.as_deref()) {
+            continue;
+        }
+        freed += store::disk::purge_note_audio(&note_dir);
+    }
+    Ok(freed)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1578,6 +1628,8 @@ pub fn run() {
             set_settings,
             migrate_data_dir,
             migrate_models_dir,
+            audio_disk_usage,
+            purge_audio,
             list_people,
             rename_person,
             merge_person,
