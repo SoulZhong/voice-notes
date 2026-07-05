@@ -590,7 +590,8 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    if !models::recording_ready() {
+    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
+    if !models::recording_ready(settings::ASR_SENSE_VOICE) {
         return Err("模型缺失：请先在录制页下载模型".into());
     }
     spawn_session(
@@ -608,7 +609,8 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
-    if !models::recording_ready() {
+    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
+    if !models::recording_ready(settings::ASR_SENSE_VOICE) {
         return Err("模型缺失：请先在录制页下载模型".into());
     }
     spawn_session(
@@ -995,7 +997,8 @@ fn preload_models(
 
 #[tauri::command]
 fn models_status() -> models::ModelsStatus {
-    models::status()
+    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
+    models::status(settings::ASR_SENSE_VOICE)
 }
 
 #[tauri::command]

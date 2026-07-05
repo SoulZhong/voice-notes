@@ -369,7 +369,7 @@ mod tests {
             label: "测试工件",
             url: "http://unused.invalid/pkg.tar.bz2",
             approx_mb: 1,
-            required_for_recording: false,
+            prune: &[],
             kind: crate::models::ArtifactKind::TarBz2 { dest_dir: "sv-dir" },
             files: Box::leak(vec![ff("sv-dir/model.onnx", b"MODEL")].into_boxed_slice()),
         };

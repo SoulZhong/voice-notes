@@ -7,8 +7,7 @@ pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghproxy.net/";
 
 /// ASR 模型选型标识,供 settings.asr_model 与后续选型逻辑复用。
 pub const ASR_SENSE_VOICE: &str = "sense_voice";
-// whisper 选型分支由后续任务(ASR 选型)接入,此处先落地常量避免魔法字符串。
-#[allow(dead_code)]
+// whisper 选型标识;models::required_now 已消费,判定 whisper 工件是否录制必需。
 pub const ASR_WHISPER: &str = "whisper";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
