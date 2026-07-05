@@ -28,6 +28,30 @@ impl SileroSegmenter {
     }
 }
 
+/// 段长硬上限(样本数,16kHz × 15s),与 config.max_speech_duration 对齐。
+/// 该配置一路透传 sherpa,但当前版本实测不强制(冒烟见 36s 超长段照常产出),
+/// 故在分段器出口自兜底:超长段按此硬切。混说场景一段多人,段越长声纹污染越重,
+/// 识别也劣化——上限必须真实生效。
+const MAX_SEGMENT_SAMPLES: usize = 15 * 16000;
+
+/// 超长段按 MAX_SEGMENT_SAMPLES 硬切,子段 start 顺延样本偏移(时间轴连续)。
+fn split_long(samples: Vec<f32>, start: usize) -> Vec<Segment> {
+    if samples.len() <= MAX_SEGMENT_SAMPLES {
+        return vec![Segment { samples, start }];
+    }
+    let mut out = Vec::new();
+    let mut off = 0;
+    while samples.len() - off > MAX_SEGMENT_SAMPLES {
+        out.push(Segment {
+            samples: samples[off..off + MAX_SEGMENT_SAMPLES].to_vec(),
+            start: start + off,
+        });
+        off += MAX_SEGMENT_SAMPLES;
+    }
+    out.push(Segment { samples: samples[off..].to_vec(), start: start + off });
+    out
+}
+
 impl Segmenter for SileroSegmenter {
     fn accept(&mut self, samples: &[f32]) {
         self.vad.accept_waveform(samples.to_vec());
@@ -44,7 +68,7 @@ impl Segmenter for SileroSegmenter {
         let mut out = Vec::new();
         while !self.vad.is_empty() {
             let seg = self.vad.front();
-            out.push(Segment { samples: seg.samples, start: seg.start.max(0) as usize });
+            out.extend(split_long(seg.samples, seg.start.max(0) as usize));
             self.vad.pop();
         }
         if !out.is_empty() {
@@ -68,6 +92,25 @@ impl Segmenter for SileroSegmenter {
 mod tests {
     use super::*;
     use crate::pipeline::segmenter::Segmenter;
+
+    /// 硬切纯逻辑:边界内不切、超长切块、尾块与时间轴偏移正确。
+    #[test]
+    fn split_long_caps_segment_length_and_keeps_offsets() {
+        // 恰好上限:原样一段
+        let one = split_long(vec![0.0; MAX_SEGMENT_SAMPLES], 100);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].samples.len(), MAX_SEGMENT_SAMPLES);
+        assert_eq!(one[0].start, 100);
+        // 2.5 倍上限:三块,偏移顺延,总样本无增无减
+        let n = MAX_SEGMENT_SAMPLES * 5 / 2;
+        let parts = split_long(vec![0.0; n], 1000);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].start, 1000);
+        assert_eq!(parts[1].start, 1000 + MAX_SEGMENT_SAMPLES);
+        assert_eq!(parts[2].start, 1000 + 2 * MAX_SEGMENT_SAMPLES);
+        assert_eq!(parts[2].samples.len(), n - 2 * MAX_SEGMENT_SAMPLES);
+        assert_eq!(parts.iter().map(|p| p.samples.len()).sum::<usize>(), n);
+    }
 
     /// 暂停功能依赖：flush 之后继续 accept，段的 start 样本偏移必须延续而非归零。
     /// 需要真实模型：cargo test -- --ignored（或 VN_MODELS 指向模型目录）。

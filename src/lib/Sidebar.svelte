@@ -92,6 +92,8 @@
     {recording.isLive ? (recording.paused ? "⏸ 已暂停 · 停止" : "■ 停止") : "● 开始录制"}
   </button>
 
+  <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">👤 说话人</a>
+
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
   {#if error}
@@ -168,6 +170,24 @@
   }
   .record-btn.recording {
     background: #c0392b;
+  }
+  .nav-link {
+    display: block;
+    box-sizing: border-box;
+    margin-top: 0.6rem;
+    padding: 0.45em 0.6em;
+    border-radius: 8px;
+    color: inherit;
+    text-decoration: none;
+    font-size: 0.9em;
+    font-weight: 500;
+  }
+  .nav-link:hover {
+    background: #eef2fb;
+  }
+  .nav-link.current {
+    background: #eef2fb;
+    color: #396cd8;
   }
   .search {
     box-sizing: border-box;
@@ -275,6 +295,13 @@
     }
     .item.current {
       background: #2a3348;
+    }
+    .nav-link:hover,
+    .nav-link.current {
+      background: #2a3348;
+    }
+    .nav-link.current {
+      color: #7ea3f0;
     }
     .search,
     .rename {

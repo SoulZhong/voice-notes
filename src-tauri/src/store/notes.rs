@@ -79,7 +79,8 @@ impl NoteStore {
         // writer 自扫 jsonl,均不经此处。空白段非损坏,不计 skipped_lines。
         segments.retain(|s| !s.text.trim().is_empty());
         segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
-        let speakers = read_speakers(&dir);
+        let mut speakers = read_speakers(&dir);
+        join_person_names(&self.notes_dir, &mut speakers);
         Ok(Note { meta, segments, skipped_lines, speakers })
     }
 
@@ -105,7 +106,7 @@ impl NoteStore {
         let mut speakers = read_speakers(&dir);
         speakers
             .entry(speaker_id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 })
+            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
             .name = name.to_string();
         write_speakers_atomic(&dir, &speakers)
     }
@@ -168,7 +169,7 @@ impl NoteStore {
             let new_id = format!("S{}", max_known + 1);
             speakers.insert(
                 new_id.clone(),
-                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0 },
+                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None },
             );
             write_speakers_atomic(&dir, &speakers)?;
             new_id
@@ -244,6 +245,34 @@ fn read_speakers(dir: &Path) -> BTreeMap<String, SpeakerMeta> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// 只读 join：speaker 本地未改名（name 空串）且关联了库人物（person_id 经
+/// redirects 可解析）且库中该人有现名 → 用库名填充返回值展示，绝不落盘——
+/// 笔记内既有 rename_speaker（本地改名）永远优先，这里只是"库里先有名字"时
+/// 的展示兜底，不改变 speakers.json 的磁盘内容。
+/// VoiceprintStore 挂在 notes_dir 的上一级（= app_data_dir，与 notes 目录并列，
+/// 见 lib.rs 的 notes_dir 构造）；拿不到上一级目录、库文件缺失/损坏、或无
+/// 匹配人物，一律静默跳过——声纹库是识别增强功能，绝不能因为它缺失/异常
+/// 而挡住笔记详情页的正常展示。
+fn join_person_names(notes_dir: &Path, speakers: &mut BTreeMap<String, SpeakerMeta>) {
+    if !speakers.values().any(|m| m.name.is_empty() && m.person_id.is_some()) {
+        return; // 没有待 join 的候选，不必碰声纹库文件
+    }
+    let Some(root) = notes_dir.parent() else { return };
+    let vp = super::VoiceprintStore::new(root.to_path_buf()).load();
+    for meta in speakers.values_mut() {
+        if !meta.name.is_empty() {
+            continue; // 本地名优先级最高，不覆盖
+        }
+        let Some(person_id) = &meta.person_id else { continue };
+        let Some(resolved) = super::VoiceprintStore::resolve(&vp, person_id) else { continue };
+        if let Some(person) = vp.people.get(resolved) {
+            if !person.name.is_empty() {
+                meta.name = person.name.clone();
+            }
+        }
+    }
 }
 
 fn read_meta(dir: &Path) -> Option<NoteMeta> {
@@ -572,6 +601,69 @@ mod tests {
         assert_eq!(n.speakers["S1"].name, "名19", "rename 线程的最后写入存活");
         // S1 + 20 个新建说话人:任何一次丢更新都会让计数不足 21。
         assert_eq!(n.speakers.len(), 21, "20 次新建全部存活,无丢更新");
+    }
+
+    /// notes join：speaker 本地 name 空 + person_id 可解析 + 库中该人有名 → load 后
+    /// 用库名填充；本地已有名字的 speaker 不被覆盖。
+    #[test]
+    fn load_joins_person_name_from_library_but_local_name_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        // notes_dir 与 voiceprints.json 并列在 app_data_dir 根下（notes_dir 的父级）。
+        let app_data_dir = tmp.path();
+        let notes_dir = app_data_dir.join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+
+        // 造库文件：P1 名"张三"。
+        std::fs::write(
+            app_data_dir.join("voiceprints.json"),
+            r#"{"schema_version":1,"next_person":2,"people":{"P1":{"name":"张三","total_ms":10000,"last_seen":"t1"}},"redirects":{}}"#,
+        )
+        .unwrap();
+
+        // 造笔记：S1 本地无名、关联 P1；S2 本地已有名"李四"、关联另一个 P2（库中不存在也无妨，
+        // 走不到 resolve 那步，因为本地名优先短路）。
+        let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
+        w.append_final("mic", "乙说", 1000, 1900, Some("S2"), None).unwrap();
+        w.finalize(now()).unwrap();
+        std::fs::write(
+            w.dir().join("speakers.json"),
+            r#"{"S1":{"name":"","sources":["mic"],"person_id":"P1"},"S2":{"name":"李四","sources":["mic"],"person_id":"P2"}}"#,
+        )
+        .unwrap();
+
+        let store = NoteStore::new(notes_dir.clone());
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.speakers["S1"].name, "张三", "本地无名 + 库有名 → 用库名填充");
+        assert_eq!(note.speakers["S2"].name, "李四", "本地已有名字不被库名覆盖");
+
+        // 磁盘上的 speakers.json 不应被 join 改写（只读视图）。
+        let raw = std::fs::read_to_string(w.dir().join("speakers.json")).unwrap();
+        assert!(raw.contains(r#""name":"""#), "join 只影响返回值，不落盘");
+    }
+
+    /// 库文件缺失（notes_dir 的上一级没有 voiceprints.json）时 load 不 panic，
+    /// name 保持本地原值（空串）。
+    #[test]
+    fn load_tolerates_missing_voiceprint_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notes_dir = tmp.path().join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+
+        let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
+        w.finalize(now()).unwrap();
+        std::fs::write(
+            w.dir().join("speakers.json"),
+            r#"{"S1":{"name":"","sources":["mic"],"person_id":"P1"}}"#,
+        )
+        .unwrap();
+
+        let store = NoteStore::new(notes_dir);
+        let note = store.load(&id).unwrap(); // 无库文件不 panic
+        assert_eq!(note.speakers["S1"].name, "", "库缺失，name 保持本地原值（空）");
     }
 
     /// 读侧单一真值源:load 过滤空白段、按 (start_ms, seq) 稳定排序——

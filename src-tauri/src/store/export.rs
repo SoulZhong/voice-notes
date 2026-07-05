@@ -156,7 +156,7 @@ mod tests {
         let mut speakers = std::collections::BTreeMap::new();
         speakers.insert(
             "S1".to_string(),
-            crate::store::SpeakerMeta { name: "张三".into(), sources: vec![], centroid: None, count: 0 },
+            crate::store::SpeakerMeta { name: "张三".into(), sources: vec![], centroid: None, count: 0, person_id: None },
         );
         let note = crate::store::Note {
             meta: crate::store::NoteMeta {

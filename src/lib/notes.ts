@@ -34,11 +34,18 @@ export type Note = {
   meta: NoteMeta;
   segments: SegmentRecord[];
   skipped_lines: number;
-  // centroid/count 是后端质心快照（P4.5 续录铺底），随 get_note 下发；前端不消费，
-  // 仅补齐类型以匹配后端 SpeakerMeta 的实际字段。
+  // centroid/count 是后端质心快照（P4.5 续录铺底），person_id 是关联的全局声纹库
+  // 人物 id（P5.5 铺底），随 get_note 下发；前端目前不消费这三者，仅补齐类型以
+  // 匹配后端 SpeakerMeta 的实际字段（name 已经过后端只读 join，可能是库现名）。
   speakers: Record<
     string,
-    { name: string; sources: string[]; centroid?: number[]; count?: number }
+    {
+      name: string;
+      sources: string[];
+      centroid?: number[];
+      count?: number;
+      person_id?: string;
+    }
   >;
 };
 
