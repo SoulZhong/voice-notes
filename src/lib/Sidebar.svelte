@@ -8,12 +8,42 @@
     deleteNote,
     formatDate,
     formatDuration,
+    speakerColor,
     type NoteSummary,
   } from "$lib/notes";
+  import { listPeople, type PersonSummary } from "$lib/people";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
   let error = $state("");
+
+  // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=声纹库,其余(笔记/录制/设置)=录音记录。
+  const tab = $derived($page.url.pathname.startsWith("/speakers") ? "people" : "notes");
+
+  let people = $state<PersonSummary[]>([]);
+  let peopleError = $state("");
+
+  async function refreshPeople() {
+    try {
+      people = await listPeople();
+      peopleError = "";
+    } catch (e) {
+      peopleError = `加载失败: ${e}`;
+    }
+  }
+
+  // 切到声纹库页签时拉取;详情页改名/合并/删除后经 peopleVersion 触发重拉,索引不滞留旧名。
+  $effect(() => {
+    void recording.peopleVersion;
+    if (tab === "people") refreshPeople();
+  });
+
+  // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
+  const peopleSorted = $derived(
+    [...people].sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")),
+  );
+  const peopleUnnamed = $derived(peopleSorted.filter((p) => !p.name));
+  const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   let confirmingDeleteId = $state<string | null>(null);
@@ -106,7 +136,42 @@
     s === "active" ? "录制中" : s === "recording" ? "已中断" : "";
 </script>
 
+{#snippet personRow(p: PersonSummary)}
+  <!-- 与笔记行同构:行内锚点提供键盘路径,li onclick 是指针便利层 -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+  <li
+    class="item person"
+    class:current={$page.url.pathname === `/speakers/${p.id}`}
+    onclick={(e) => {
+      if ((e.target as HTMLElement).closest("a")) return;
+      goto(`/speakers/${p.id}`);
+    }}
+  >
+    <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
+    <div class="main-line">
+      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || "未命名"}</a>
+      <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
+    </div>
+  </li>
+{/snippet}
+
 <aside class="sidebar">
+  <!-- 立体竖排页签(冒烟反馈):贴侧栏左缘,文件夹式——选中页签与内容面板同底、
+       交界边线断开融为一体(凸起),未选中退后;点击即导航,选中由路由派生。 -->
+  <nav class="tab-rail">
+    <button
+      class="vtab"
+      class:active={tab === "notes"}
+      onclick={() => { if (tab !== "notes") goto("/"); }}>录音记录</button
+    >
+    <button
+      class="vtab"
+      class:active={tab === "people"}
+      onclick={() => { if (tab !== "people") goto("/speakers"); }}>声纹库</button
+    >
+  </nav>
+
+  <div class="panel">
   <button
     class="record-btn"
     class:recording={recording.isLive}
@@ -117,6 +182,30 @@
     {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
+  {#if tab === "people"}
+    {#if peopleError}
+      <div class="banner">{peopleError}</div>
+    {/if}
+    {#if people.length === 0 && !peopleError}
+      <p class="hint">录一场会议,停止后本场说话人会自动出现在这里</p>
+    {/if}
+    <!-- 人物索引(主从结构的"主"):点击进主区详情页;待命名是待处理项排上面,
+         与旧管理页分区语义一致。行内无操作,管理动作全在详情页。 -->
+    <ul class="list">
+      {#if peopleUnnamed.length > 0}
+        <li class="group-label">待命名</li>
+        {#each peopleUnnamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      {/if}
+      {#if peopleNamed.length > 0}
+        <li class="group-label">已命名</li>
+        {#each peopleNamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      {/if}
+    </ul>
+  {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
   {#if error}
@@ -169,17 +258,10 @@
       </li>
     {/each}
   </ul>
+  {/if}
 
-  <!-- 工具类入口固定底部(冒烟反馈:顶部挤在录制按钮下不符使用习惯;Notion/原生应用惯例是
-       内容列表居中滚动、设置类入口沉底常驻)。 -->
+  <!-- 设置沉底常驻(冒烟确认位置);声纹库已升级为页签,footer 只剩工具入口。 -->
   <nav class="nav-footer">
-    <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-        <circle cx="8" cy="5.2" r="2.7" />
-        <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
-      </svg>
-      声纹库
-    </a>
     <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="2.2" />
@@ -188,6 +270,7 @@
       设置
     </a>
   </nav>
+  </div>
 </aside>
 
 {#if menuForId}
@@ -223,38 +306,85 @@
 
 <style>
   /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
-     当前页 surface-press + ink 加粗。 */
+     当前页 surface-press + ink 主色（层级靠亮度对比，不靠加粗）。 */
+  /* 侧栏 = 页签轨道(canvas 底) + 内容面板(surface 底)双列:面板比轨道亮一档,
+     选中页签借面板底色"长"在轨道上,立体感来自表面阶梯而非投影。 */
   .sidebar {
-    width: 280px;
+    width: 300px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    border-right: 1px solid var(--hairline);
+    background: var(--canvas);
+    box-sizing: border-box;
+    overflow-y: hidden;
+  }
+  .tab-rail {
+    width: 34px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid var(--hairline);
+    gap: 4px;
+    padding-top: 0.75rem;
+  }
+  /* 竖排文件夹页签:选中态与面板同底且右边线断开(margin-right 盖住面板左边线),
+     页签与面板融为一体=凸起;未选中透明退后,hover 半显影。 */
+  .vtab {
+    writing-mode: vertical-rl;
+    letter-spacing: 0.12em;
+    padding: 0.8em 0.3em;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    background: transparent;
+    border: 1px solid transparent;
+    border-right: none;
+    border-radius: var(--radius-md) 0 0 var(--radius-md);
+    cursor: pointer;
+  }
+  .vtab:hover {
+    background: var(--surface-soft);
+    color: var(--ink-secondary);
+  }
+  .vtab.active {
     background: var(--surface);
+    color: var(--ink);
+    border-color: var(--hairline);
+    margin-right: -1px;
+    position: relative;
+    z-index: 1;
+  }
+  .panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border-left: 1px solid var(--hairline);
     padding: 0.75rem;
     box-sizing: border-box;
-    /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置/声纹库推出视口 */
+    /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置推出视口 */
     overflow-y: hidden;
   }
-  /* 录制按钮:白底 + 红点(语音备忘录式)。大面积强调蓝在侧栏太吵,主 CTA 的
-     "彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
+  /* 录制按钮:主 CTA 药丸(primary 底 + on-primary 字 + radius-full,dark 下即白药丸)+ 红点。
+     大面积强调蓝在侧栏太吵,"彩色"由红点承担——红是本产品唯一常驻彩色信号,识别度反而更高。 */
   .record-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 0.5em;
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     padding: 0.55em 1em;
     font-size: 0.9rem;
     font-weight: 500;
     cursor: pointer;
-    color: var(--ink);
-    background: var(--canvas);
+    color: var(--on-primary);
+    background: var(--primary);
     box-shadow: var(--shadow-btn);
   }
   .record-btn:hover {
-    background: var(--surface-soft);
+    background: var(--primary-pressed);
   }
   .rec-dot {
     width: 9px;
@@ -267,9 +397,12 @@
   .rec-dot.square {
     border-radius: 2px;
   }
+  /* 录制中红字于药丸:dark 下白药丸上 #ff6161 实测 2.94:1 偏低,由旁侧红色方块符号
+     独立承担停止语义兜底,冒烟观察;light 下黑药丸上同色 5.98:1 无虞。两主题均保留
+     record 字色。 */
   .record-btn.recording {
     color: var(--record);
-    font-weight: 600;
+    font-weight: 500;
   }
   .record-btn:disabled {
     opacity: 0.6;
@@ -302,8 +435,34 @@
   .nav-link.current {
     background: var(--surface-press);
     color: var(--ink);
-    font-weight: 700;
+    font-weight: 500;
   }
+  /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
+     hover/选中与笔记行同语义 */
+  .item.person {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+  }
+  /* 分组标签:待命名/已命名,与详情域分区语义一致;非交互,安静小字 */
+  .group-label {
+    list-style: none;
+    color: var(--ink-faint);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 0.55rem 0.5rem 0.2rem;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: var(--radius-full);
+    flex-shrink: 0;
+  }
+  .title.unnamed {
+    color: var(--ink-faint);
+    font-weight: 400;
+  }
+
   /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,
      Notion 侧栏过滤即此形态;聚焦才浮出 canvas 底 + accent 环。 */
   .search {
@@ -334,15 +493,20 @@
     min-height: 0; /* flex 子项默认 min-height:auto 会撑破容器,收掉才滚得起来 */
     overflow-y: auto;
   }
-  /* 底部工具区:hairline 分隔,与内容列表视觉分层 */
+  /* 底部工具区:单行两列工具条(Raycast 式 status bar)。竖排两行显松散零碎,
+     与顶部紧凑药丸不成体系;并排居中让两个次级入口成组且只占一行高。 */
   .nav-footer {
     margin-top: 0.5rem;
     padding-top: 0.5rem;
     border-top: 1px solid var(--hairline);
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     gap: 2px;
     flex-shrink: 0;
+  }
+  .nav-footer .nav-link {
+    flex: 1;
+    justify-content: center;
   }
   /* 整行可点(冒烟反馈):cursor 表意,操作走右键菜单,行内无常驻按钮 */
   .item {
@@ -365,7 +529,7 @@
   .title {
     color: inherit;
     text-decoration: none;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 0.92em;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -388,7 +552,7 @@
   }
   .state {
     font-size: 0.72em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.05em 0.4em;
     margin-left: 0.35em;
@@ -399,12 +563,13 @@
     background: var(--warning-line);
     color: var(--warning-ink);
   }
-  /* 录制中：record 是双主题一致的常驻彩色信号，白字在两种主题下都清晰。 */
+  /* 录制中：record 是双主题一致的常驻彩色信号，白字于红底（暗色同值同白）。 */
   .state.active {
     background: var(--record);
-    color: var(--on-accent);
+    color: var(--on-record);
   }
-  /* 右键菜单:popover 规范(canvas 底 + hairline + shadow-popover);
+  /* 右键菜单:popover 规范(surface-press 底 + hairline + shadow-popover);
+     暗色下 canvas 比承载面更黑,浮层若用 canvas 会成"洞",故底走 surface-press。
      透明遮罩承接"点击别处关闭",fixed 定位跟随鼠标坐标。 */
   .menu-overlay {
     position: fixed;
@@ -415,7 +580,7 @@
     position: fixed;
     z-index: 41;
     min-width: 9rem;
-    background: var(--canvas);
+    background: var(--surface-press);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);

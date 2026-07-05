@@ -12,6 +12,7 @@
     formatDuration,
     speakerLabel,
     speakerColor,
+    speakerInk,
     speakerIdCompare,
     editSegment,
     deleteSegment,
@@ -332,7 +333,7 @@
           {:else}
             <button
               class="badge as-btn"
-              style="background: {speakerColor(seg.speaker, seg.source)}"
+              style="background: {speakerColor(seg.speaker, seg.source)}; color: {speakerInk(seg.speaker, seg.source)}"
               disabled={!canEdit}
               title={canEdit ? "点击改说话人" : ""}
               onclick={() => (speakerMenuSeq = seg.seq)}
@@ -419,7 +420,7 @@
   }
   .rename {
     font-size: 1.6em;
-    font-weight: 700;
+    font-weight: 500;
     width: 100%;
     box-sizing: border-box;
     padding: 0.1em 0.3em;
@@ -563,14 +564,15 @@
   }
   .link.danger {
     color: var(--danger);
-    font-weight: 600;
+    font-weight: 500;
   }
-  /* menu/popover（改说话人菜单）：canvas 底、hairline 边、rounded-lg、shadow-popover */
+  /* menu/popover（改说话人菜单）：surface-press 底、hairline 边、rounded-lg、shadow-popover
+     （暗色下 canvas 比承载面更黑，浮层用 canvas 会成"洞"，故底走 surface-press）。 */
   .badge-menu {
     display: inline-flex;
     flex-wrap: wrap;
     gap: 0.25em;
-    background: var(--canvas);
+    background: var(--surface-press);
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-popover);
@@ -586,9 +588,10 @@
     padding: 0.15em 0.4em;
   }
   .menu-item.new {
-    font-weight: 600;
+    font-weight: 500;
   }
-  /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级 */
+  /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
+     （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。 */
   .badge {
     display: inline-block;
     min-width: 2.2em;
@@ -598,7 +601,6 @@
     border-radius: var(--radius-sm);
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
-    color: var(--ink);
   }
   .ts {
     color: var(--ink-faint);
@@ -624,7 +626,7 @@
     background: var(--warning-line);
     color: var(--warning-ink);
     font-size: 0.7em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.1em 0.45em;
     margin-left: 0.4em;

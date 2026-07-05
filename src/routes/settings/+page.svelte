@@ -422,7 +422,7 @@
   }
   .section-title {
     font-size: 0.82rem;
-    font-weight: 600;
+    font-weight: 500;
     color: var(--ink-secondary);
     margin: 0 0 0.45rem;
   }
@@ -502,18 +502,18 @@
   /* button-primary:开始迁移是确认条唯一主动作 */
   .btn-primary {
     flex: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     border: 1px solid transparent;
     padding: 0.35em 0.9em;
     font-size: 0.85rem;
     font-weight: 500;
     cursor: pointer;
-    background: var(--accent);
-    color: var(--on-accent);
+    background: var(--primary);
+    color: var(--on-primary);
     box-shadow: var(--shadow-btn);
   }
   .btn-primary:hover {
-    background: var(--accent-pressed);
+    background: var(--primary-pressed);
   }
   /* button-link:行级删除/取消 */
   .link {
@@ -562,7 +562,7 @@
     line-height: 1.45;
   }
   .confirm-path {
-    font-weight: 600;
+    font-weight: 500;
     word-break: break-all;
   }
   .confirm-actions {
@@ -655,7 +655,7 @@
   }
   .radio-title {
     font-size: 0.92rem;
-    font-weight: 600;
+    font-weight: 500;
     color: var(--ink);
   }
   .radio-desc {
