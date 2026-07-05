@@ -406,7 +406,9 @@ fn spawn_session(
         // 阻塞等 in-flight 转完。锁序纪律：本调用点在加载线程、不持任何全局锁
         //（running/generation/session_slot 均未持有），符合「持全局锁时绝不调
         // cancel_and_wait 这类阻塞方法」。decode_note_to_wav 内部失败已降级打日志，无需包错。
-        // 放在读取 base_ms 之前：base_ms 的音频对齐要看到解回的 WAV 尾部长度。
+        // 解码先行(在建 AudioTrackWriter 之前)：建档时要按既有 WAV 尾部长度对既有轨道做
+        // 截断/零填充对齐，故必须先把已压缩音频解回 WAV。base_ms 本身来自 segments 时间轴
+        //（下方 writer.base_ms()），与解码顺序无关。
         if let NoteTarget::Resume(_) = &target {
             let note_dir = writer.lock().unwrap().dir().to_path_buf();
             transcode.cancel_and_wait(&note_dir);
@@ -1206,7 +1208,10 @@ fn cancel_models_download(state: State<AppState>) {
 #[tauri::command]
 fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
     // _app: root 走 models::root() 无需它,但保留形参与其它模型命令签名一致(Tauri 按类型注入)。
-    if state.session.lock().unwrap().is_some() {
+    // 查 running 而非 session 槽:开录命令同步置 running 后即返回,session 槽要数秒后才置
+    // Some;查槽会在这段加载窗口误判"空闲",删掉正在被常驻实例/写盘用的模型。running
+    // statement-scoped,查完即放。
+    if *state.running.lock().unwrap() {
         return Err("录制中不能删除模型".into());
     }
     if state.download_running.load(Ordering::SeqCst) {
@@ -1257,17 +1262,27 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }
     // ASR 选型变更:录制中切换会让常驻识别器与正在转写的会话对不上,拒绝;无会话则
     // save 后清掉旧选型的常驻识别器、按新选型重载,无需重启即可用新模型开录。
-    if old.asr_model != new_settings.asr_model {
-        if state.session.lock().unwrap().is_some() {
-            return Err("录制中不能切换识别模型".into());
-        }
-        settings::save(&d, &new_settings).map_err(|e| e.to_string())?;
+    // 查 running 而非 session 槽:同 delete_model,开录命令返回后 session 槽尚空的加载
+    // 窗口里切型会与即将取用的常驻识别器对不上。statement-scoped。
+    let asr_changed = old.asr_model != new_settings.asr_model;
+    if asr_changed && *state.running.lock().unwrap() {
+        return Err("录制中不能切换识别模型".into());
+    }
+    // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
+    //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
+    // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
+    settings::update(&d, |s| {
+        let data_dir = s.data_dir.clone();
+        let models_dir = s.models_dir.clone();
+        *s = new_settings;
+        s.data_dir = data_dir;
+        s.models_dir = models_dir;
+    }).map_err(|e| e.to_string())?;
+    if asr_changed {
         *state.recognizer_cache.lock().unwrap() = None;
         preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
-        return Ok(());
     }
-    // 其余（镜像等）直接保存。
-    settings::save(&d, &new_settings).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
@@ -1280,6 +1295,32 @@ impl Drop for UnpauseOnDrop {
     }
 }
 
+/// 迁移前置互斥守卫(两迁移命令共用):先抢下载/迁移互斥位(download_running),
+/// 再查录制中(running)。判"录制中"必须查 running 而非 session 槽:spawn_session 在
+/// 命令线程同步置 running=true 并即返回,而 session 槽要到加载线程数秒后才置 Some
+///(续录还要先解码,窗口最宽)。若这里查 session.is_some(),那段加载窗口内发起的迁移
+/// 会误判"空闲",把正在写的旧 notes 根删掉、吞掉录音。查 running 则开录命令一返回就已
+/// 挡住迁移。
+///
+/// 「先 swap download 再查 running」的次序与 start_recording 的「先查 download 再置
+/// running」是对称闭合的:migrate 抢先 swap download → start 的 download 检查必拒;
+/// start 抢先置 running → 本函数的 running 检查必拒。两侧各自的 check-then-act 交错窗口
+/// 被压到两条原子/加锁语句之间的微秒级(start 读到 download==false 之后、置 running
+/// 之前,恰被本函数插入并放行,是残留的微秒级同时放行窗口)——记为已知取舍,个人工具
+/// 可接受。running 锁 statement-scoped,查完即放,不与其它锁嵌套(遵守文件顶部锁序)。
+fn migrate_guard(running: &Arc<Mutex<bool>>, download_running: &Arc<AtomicBool>) -> Result<(), String> {
+    // 先抢互斥位(与 start 的 download 检查对称)。
+    if download_running.swap(true, Ordering::SeqCst) {
+        return Err("迁移或下载进行中".into());
+    }
+    // 再查录制中;拒绝时必须复位刚抢下的互斥位,否则迁移互斥位永久卡死。
+    if *running.lock().unwrap() {
+        download_running.store(false, Ordering::SeqCst);
+        return Err("录制中不能迁移".into());
+    }
+    Ok(())
+}
+
 /// 数据目录迁移:把 data_root 下的笔记/声纹整树搬到 new_dir。时序是「复制→校验→
 /// **写指针**→删旧」:settings.data_dir 写入是提交点,提交前任何失败都清理新目录、
 /// 旧数据与旧指针完好可重试;提交后删旧只是垃圾回收,失败不算迁移失败——消灭
@@ -1287,20 +1328,15 @@ impl Drop for UnpauseOnDrop {
 /// pause_and_wait 全在后台线程——绝不在命令线程(可能持 Tauri 内部锁)里跑阻塞搬运。
 #[tauri::command]
 fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
-    // 守卫一:有活动会话时迁移会与写盘线程撞笔记目录,拒绝。
-    if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能迁移".into());
-    }
-    // 守卫二:目标目录必须不存在或为空(不覆盖用户既有内容),且与当前根互不包含
-    //(嵌套会自拷/删旧连带删新)。旧根解析失败直接拒绝(此时还没抢互斥位,无需复位)。
+    // 守卫一:目标目录必须不存在或为空(不覆盖用户既有内容),且与当前根互不包含
+    //(嵌套会自拷/删旧连带删新)。旧根解析失败直接拒绝。全是只读检查,放在抢互斥位
+    // 之前,失败无需复位。
     let new_path = PathBuf::from(&new_dir);
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
     let old_root = data_root(&app).map_err(|e| e.to_string())?;
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    // 守卫三:复用 download_running 做全局互斥——迁移与下载/再次迁移彼此排斥。
-    if state.download_running.swap(true, Ordering::SeqCst) {
-        return Err("迁移或下载进行中".into());
-    }
+    // 守卫二:抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
+    migrate_guard(&state.running, &state.download_running)?;
     let running = state.download_running.clone();
     let transcode = state.transcode.clone();
     std::thread::spawn(move || {
@@ -1322,9 +1358,10 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
         // 第二步(提交点):读-改-写 settings(永在 app_data_dir,不随 data_dir 漂移)。
         // 失败 → 迁移未提交:清理新目录残留(保证可原地重试),旧数据与旧指针完好。
         let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
-            let mut s = settings::load(&d);
-            s.data_dir = Some(new_dir.clone());
-            settings::save(&d, &s).map_err(|e| e.to_string())
+            // update 锁内 load→改→save:与并发的镜像/asr 写入串行,防指针提交被旧快照覆盖。
+            settings::update(&d, |s| s.data_dir = Some(new_dir.clone()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         if let Err(e) = saved {
             store::migrate::cleanup_copied_entries(&new_path, entries);
@@ -1347,9 +1384,6 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
 /// 保存 + models::set_models_override 重设。
 #[tauri::command]
 fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
-    if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能迁移".into());
-    }
     // 比 data 多一道守卫:VN_MODELS 环境变量置顶于 models::root() 的解析顺序,此时改
     // settings.models_dir 也不生效,迁了等于白迁,直接拒绝并提示先移除环境变量。
     if let Ok(v) = std::env::var("VN_MODELS") {
@@ -1360,11 +1394,10 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     let new_path = PathBuf::from(&new_dir);
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
     let old_root = models::root();
-    // 嵌套守卫同 data:目标与当前模型根互不包含。
+    // 嵌套守卫同 data:目标与当前模型根互不包含。以上皆只读检查,失败无需复位。
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
-    if state.download_running.swap(true, Ordering::SeqCst) {
-        return Err("迁移或下载进行中".into());
-    }
+    // 抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
+    migrate_guard(&state.running, &state.download_running)?;
     // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
     let entries: Vec<String> = std::fs::read_dir(&old_root)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -1386,9 +1419,10 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
         }
         // 第二步(提交点):settings.models_dir 保存;失败清理新目录残留,旧指针完好可重试。
         let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
-            let mut s = settings::load(&d);
-            s.models_dir = Some(new_dir.clone());
-            settings::save(&d, &s).map_err(|e| e.to_string())
+            // update 锁内 load→改→save:与并发的镜像/asr 写入串行,防指针提交被旧快照覆盖。
+            settings::update(&d, |s| s.models_dir = Some(new_dir.clone()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         if let Err(e) = saved {
             store::migrate::cleanup_copied_entries(&new_path, &entry_refs);
@@ -1531,6 +1565,27 @@ mod tests {
         assert_eq!(ids, vec!["vad", "speaker", "asr"]);
         let ids = default_download_ids("whisper");
         assert_eq!(ids, vec!["vad", "speaker", "whisper"]);
+    }
+
+    #[test]
+    fn migrate_guard_rejects_recording_and_download() {
+        use super::migrate_guard;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        // running=true → 拒,且必须复位刚抢下的互斥位(否则迁移互斥位永久卡死)。
+        let running = Arc::new(Mutex::new(true));
+        let dl = Arc::new(AtomicBool::new(false));
+        assert!(migrate_guard(&running, &dl).is_err(), "录制中拒绝");
+        assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        // download_running 已 true(下载/另一迁移在跑）→ 拒。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(true));
+        assert!(migrate_guard(&running, &dl).is_err(), "下载/迁移进行中拒绝");
+        // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(false));
+        assert!(migrate_guard(&running, &dl).is_ok(), "空闲放行");
+        assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
     }
 
     #[test]

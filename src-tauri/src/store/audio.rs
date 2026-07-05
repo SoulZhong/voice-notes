@@ -326,6 +326,9 @@ fn known_sources(meta: &AudioMeta) -> Vec<String> {
     sources
 }
 
+/// 枚举笔记的音频轨道(详情页播放器用)。每源优先上报已转码的 m4a、否则回落 WAV。
+/// 时长口径按格式区分:WAV 由字节数换算(bytes_to_ms);m4a 例外——容器不能按字节换算,
+/// 时长取转码器实测后写进 audio.json 的记录(记录缺失即视为损坏,跳过该轨,不回落 WAV)。
 pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
     let meta = load_audio_meta(note_dir);
     let mut out = Vec::new();

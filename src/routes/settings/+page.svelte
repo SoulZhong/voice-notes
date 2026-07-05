@@ -197,6 +197,9 @@
       fresh.asr_model = model;
       await setSettings(fresh);
       settings = fresh;
+      // 幂等对齐本地绑定:bind:group 已把 asrChoice 改到新项,这里再显式对齐一次,
+      // 消掉后端 migrate 事件毫秒级竞态下 asrChoice 可能与 settings 短暂不一致的窗口。
+      asrChoice = model === "whisper" ? "whisper" : "sense_voice";
       await refreshStatus(); // required_for_recording 随选型重算
     } catch (e) {
       // 失败(如录制中被后端拒绝):danger 横幅 + 回弹选项显示。
@@ -281,8 +284,12 @@
               {:else}
                 <button
                   class="link danger row-action"
-                  disabled={recording.isLive}
-                  title={recording.isLive ? "录制中不能删除模型" : "删除本模型(可随时重新下载)"}
+                  disabled={recording.isLive || downloadingActive}
+                  title={recording.isLive
+                    ? "录制中不能删除模型"
+                    : downloadingActive
+                      ? "下载进行中不能删除模型"
+                      : "删除本模型(可随时重新下载)"}
                   onclick={() => {
                     confirmDeleteId = a.id;
                   }}>删除</button

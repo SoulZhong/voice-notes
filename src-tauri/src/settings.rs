@@ -72,6 +72,23 @@ pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// settings.json 读-改-写串行化锁。为什么需要:load→改→save 这个序列若被并发穿插,会
+/// 发生丢写——例如迁移线程刚把 data_dir 指针 save 提交,而镜像开关命令用它更早 load 的
+/// 旧快照 save 覆盖回去 → 指针丢失,随后迁移的删旧逻辑把旧数据删掉 → 笔记"凭空消失"。
+/// 进程内单锁,单文件写入量小,串行代价可忽略。
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 原子化读-改-写:锁内 load → f(&mut s) → save,返回落盘后的新值。所有会修改
+/// settings.json 的路径都应走这里(而非各自 load 后 save),否则并发写互相覆盖(见
+/// WRITE_LOCK 注释)。中毒锁降级取值继续(设置写入不该因一次 panic 永久卡死)。
+pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<Settings> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = load(app_data);
+    f(&mut s);
+    save(app_data, &s)?;
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +143,42 @@ mod tests {
         assert_eq!(resolve_data_root(base, &Settings::default()), PathBuf::from("/base"));
         let s = Settings { data_dir: Some("/custom".into()), ..Default::default() };
         assert_eq!(resolve_data_root(base, &s), PathBuf::from("/custom"));
+        // 空串视同未配置,回落默认根(防止 Some("") 把根设成当前目录)。
+        let s = Settings { data_dir: Some("".into()), ..Default::default() };
+        assert_eq!(resolve_data_root(base, &s), PathBuf::from("/base"), "空串回落默认");
+    }
+
+    #[test]
+    fn update_roundtrip_applies_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got = update(tmp.path(), |s| s.mirror_enabled = true).unwrap();
+        assert!(got.mirror_enabled, "返回落盘后的新值");
+        assert!(load(tmp.path()).mirror_enabled, "已持久化到磁盘");
+    }
+
+    #[test]
+    fn concurrent_update_different_fields_no_lost_write() {
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tmp.path().to_path_buf());
+        // 两线程各反复改一字段:WRITE_LOCK 串行化 load-modify-save,终态两字段都应是新值。
+        // 无锁时后写者会用自己更早的 load 快照覆盖掉前写者刚提交的另一字段(丢写)。
+        let d1 = dir.clone();
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                update(&d1, |s| s.mirror_enabled = true).unwrap();
+            }
+        });
+        let d2 = dir.clone();
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                update(&d2, |s| s.asr_model = ASR_WHISPER.into()).unwrap();
+            }
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        let got = load(&dir);
+        assert!(got.mirror_enabled, "线程1 的写未被丢");
+        assert_eq!(got.asr_model, ASR_WHISPER, "线程2 的写未被丢");
     }
 }

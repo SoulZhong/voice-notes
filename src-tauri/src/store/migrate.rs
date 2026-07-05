@@ -25,7 +25,7 @@ pub fn dir_is_usable_target(dir: &Path) -> anyhow::Result<()> {
     let mut rd = std::fs::read_dir(dir)
         .with_context(|| format!("无法读取目标目录: {}", dir.display()))?;
     if rd.next().is_some() {
-        anyhow::bail!("目标目录非空: {}", dir.display());
+        anyhow::bail!("目标目录非空(若为上次迁移中断的残留,请手动清空后重试): {}", dir.display());
     }
     Ok(())
 }
