@@ -48,8 +48,7 @@ impl Default for Settings {
 }
 
 /// 数据根目录解析:配置了 data_dir 则用之,否则回退到系统 app_data_dir。
-/// 纯函数,供 lib.rs 组装路径与本模块测试复用;lib.rs 接入见后续任务(数据目录解析)。
-#[allow(dead_code)]
+/// 纯函数,供 lib.rs 的 data_root 组装路径与本模块测试复用。
 pub fn resolve_data_root(app_data: &Path, s: &Settings) -> PathBuf {
     match &s.data_dir {
         Some(d) if !d.is_empty() => PathBuf::from(d),

@@ -104,7 +104,6 @@ fn sources_with_suffix(note_dir: &Path, suffix: &str) -> Vec<String> {
 /// 崩溃收敛靠两点:(1) 开始先扫掉本目录所有 `*.m4a.tmp` 半成品;(2) 若某源
 /// `<source>.m4a` 已存在(说明上次「rename 完成、删 WAV 前」崩了),直接删 WAV 收口,
 /// 不重复编码。任何一步失败:删掉本源的 tmp、留住 WAV、eprintln、继续下一轨。
-#[allow(dead_code)] // Task 7 接线 lib.rs 停录路径后摘除
 pub fn transcode_note_dir(note_dir: &Path) {
     // 清残留:上次编码写到一半 `<x>.m4a.tmp` 就崩,这些半成品既不完整也不该被枚举。
     for source in sources_with_suffix(note_dir, ".m4a.tmp") {
@@ -165,7 +164,6 @@ fn transcode_one(
 /// 续录前把整个笔记目录解回 WAV:逐 `<source>.m4a` 解成 `<source>.wav`,校验通过才替换。
 /// 失败即降级:删 tmp、把坏 m4a 挪成 `<source>.m4a.bad`(移出枚举、字节保留)、清压缩
 /// 标记(该源本场从 base_ms 重新建档)、eprintln。
-#[allow(dead_code)] // Task 7 接线 lib.rs 续录路径后摘除
 pub fn decode_note_to_wav(note_dir: &Path) {
     for source in sources_with_suffix(note_dir, ".m4a") {
         let m4a = note_dir.join(format!("{source}.m4a"));
@@ -282,7 +280,6 @@ pub struct TranscodeQueue {
     cv: Condvar,
 }
 
-#[allow(dead_code)] // Task 7 接线 lib.rs(spawn_worker 于启动;enqueue/cancel/pause 于停录/续录/迁移)后摘除
 impl TranscodeQueue {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -325,6 +322,7 @@ impl TranscodeQueue {
     /// 迁移前调用:置 `paused`(worker 从此不出队),并等 `current` 排空(等当前 in-flight
     /// 转完)。迁移要挪动笔记根目录,必须先让转码彻底静止:既不能有新的开转,也不能有正在
     /// 转的。返回后到 `unpause` 之间,worker 保证不碰任何目录。
+    #[allow(dead_code)] // Task 9 数据目录迁移接线后摘除
     pub fn pause_and_wait(&self) {
         let mut st = self.state.lock().unwrap();
         st.paused = true;
@@ -335,6 +333,7 @@ impl TranscodeQueue {
     }
 
     /// 迁移完成后解除暂停,并 `notify_all` 唤醒挂着等活的 worker,让它继续消费队列。
+    #[allow(dead_code)] // Task 9 数据目录迁移接线后摘除
     pub fn unpause(&self) {
         let mut st = self.state.lock().unwrap();
         st.paused = false;

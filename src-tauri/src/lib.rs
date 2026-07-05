@@ -75,7 +75,6 @@ impl ActiveSession {
     }
 }
 
-#[derive(Default)]
 struct AppState {
     running: Arc<Mutex<bool>>,
     generation: Arc<Mutex<u64>>,
@@ -88,17 +87,75 @@ struct AppState {
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
+    /// 全局串行转码队列。自带独立叶子锁：绝不在持有 running/generation/session_slot
+    /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
+    /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
+    transcode: Arc<store::transcode::TranscodeQueue>,
 }
 
-/// notes 根目录（不存在则创建）。
-fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
-    let dir = app
+// 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
+// 怎么来的一目了然。
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            running: Arc::new(Mutex::new(false)),
+            generation: Arc::new(Mutex::new(0)),
+            session: Arc::new(Mutex::new(None)),
+            recognizer_cache: Arc::new(Mutex::new(None)),
+            embedder_cache: Arc::new(Mutex::new(None)),
+            download_running: Arc::new(AtomicBool::new(false)),
+            download_cancel: Arc::new(AtomicBool::new(false)),
+            transcode: store::transcode::TranscodeQueue::new(),
+        }
+    }
+}
+
+/// 数据根目录：app_data_dir 读 settings.json（自举指针，永远在 app_data_dir，不随
+/// data_dir 漂移）→ resolve_data_root 得到用户配置的落盘根，未配置则回落 app_data_dir。
+/// 笔记/声纹等所有内容都挂这个根；settings 读写命令仍走 app_data_dir。
+fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?
-        .join("notes");
+        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?;
+    let s = settings::load(&app_data);
+    Ok(settings::resolve_data_root(&app_data, &s))
+}
+
+/// notes 根目录（不存在则创建），挂在 data_root 下。
+fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let dir = data_root(app)?.join("notes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// 启动回溯扫描的入队判定（抽成纯函数便于单测）：meta.json 可解析为 NoteMeta 且
+/// state=="complete"（已中断的 recording 态留给续录，不转码）且目录下存在 >44 字节的
+/// `*.wav`（44 字节是纯 WAV 头，>44 才有真实样本可压）。任一不满足即不入队。
+fn should_enqueue_transcode(note_dir: &std::path::Path) -> bool {
+    let Ok(meta_str) = std::fs::read_to_string(note_dir.join("meta.json")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<store::NoteMeta>(&meta_str) else {
+        return false; // 损坏 meta 跳过，不入队
+    };
+    if meta.state != "complete" {
+        return false;
+    }
+    let Ok(rd) = std::fs::read_dir(note_dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("wav") {
+            if let Ok(m) = std::fs::metadata(&path) {
+                if m.len() > 44 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 声纹库种子导出：app_data_dir/voiceprints.json → 每个"有效"人物（经 resolve 校验，
@@ -107,7 +164,7 @@ fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
 /// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
 /// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
 fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
-    let Ok(root) = app.path().app_data_dir() else {
+    let Ok(root) = data_root(app) else {
         eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
         return Vec::new();
     };
@@ -206,6 +263,7 @@ fn spawn_session(
     session_slot: Arc<Mutex<Option<ActiveSession>>>,
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    transcode: Arc<store::transcode::TranscodeQueue>,
     target: NoteTarget,
 ) -> Result<(), String> {
     let my_gen = {
@@ -310,6 +368,17 @@ fn spawn_session(
             }
         };
         let note_id = writer.lock().unwrap().note_id().to_string();
+        // 续录前把该目录的音频解回 WAV，供本场从尾部对齐续写。必须先 cancel_and_wait：
+        // 若转码 worker 此刻正把本目录的 wav 压成 m4a，解码会与它撞文件，故先摘队列 +
+        // 阻塞等 in-flight 转完。锁序纪律：本调用点在加载线程、不持任何全局锁
+        //（running/generation/session_slot 均未持有），符合「持全局锁时绝不调
+        // cancel_and_wait 这类阻塞方法」。decode_note_to_wav 内部失败已降级打日志，无需包错。
+        // 放在读取 base_ms 之前：base_ms 的音频对齐要看到解回的 WAV 尾部长度。
+        if let NoteTarget::Resume(_) = &target {
+            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            transcode.cancel_and_wait(&note_dir);
+            store::transcode::decode_note_to_wav(&note_dir);
+        }
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.lock().unwrap().base_ms();
@@ -330,7 +399,7 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
-        let vp_store_d: Option<store::VoiceprintStore> = match app.path().app_data_dir() {
+        let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
             Ok(root) => Some(store::VoiceprintStore::new(root)),
             Err(e) => {
                 eprintln!("声纹库路径不可用，本场停止时的库回写将被跳过（不影响笔记落盘）: {e}");
@@ -601,6 +670,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         state.session.clone(),
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
+        state.transcode.clone(),
         NoteTarget::New,
     )
 }
@@ -620,6 +690,7 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         state.session.clone(),
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
+        state.transcode.clone(),
         NoteTarget::Resume(note_id),
     )
 }
@@ -648,9 +719,21 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
             let _ = j.join();
         }
         note_id = s.note_id;
-        if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
-            eprintln!("stop_recording: finalize 失败: {e}");
-            let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+        // finalize 前在 writer 锁内克隆 note_dir，供 finalize 成功后入队转码。
+        let mut w = s.writer.lock().unwrap();
+        let note_dir = w.dir().to_path_buf();
+        let finalized = w.finalize(chrono::Local::now());
+        drop(w);
+        match finalized {
+            Ok(()) => {
+                // 仅 finalize 成功（state=complete、meta 落盘）才入队。enqueue 是 O(1)
+                // 非阻塞且走转码队列自己的叶子锁——此处不持任何全局锁，安全。
+                state.transcode.enqueue(note_dir);
+            }
+            Err(e) => {
+                eprintln!("stop_recording: finalize 失败: {e}");
+                let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+            }
         }
     }
     let _ = app.emit(
@@ -890,11 +973,10 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
         .map_err(|e| e.to_string())
 }
 
-/// 声纹库四命令共用：打开 app_data_dir 根下的 VoiceprintStore（与逐场笔记目录并列，
+/// 声纹库四命令共用：打开 data_root 下的 VoiceprintStore（与逐场笔记目录并列，
 /// 不是 notes_dir 的子目录）。
 fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, String> {
-    app.path()
-        .app_data_dir()
+    data_root(app)
         .map(store::VoiceprintStore::new)
         .map_err(|e| e.to_string())
 }
@@ -1080,26 +1162,51 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
-            // 生产模型根目录注入（VN_MODELS / dev 目录优先级更高，见 models::root）。
-            if let Ok(dir) = app.path().app_data_dir() {
+            let handle = app.handle().clone();
+            // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
+            let app_data = handle.path().app_data_dir().ok();
+            let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
+            // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
+            // 必须先于 models::root() 的任何使用。
+            models::set_models_override(s.models_dir.clone().map(PathBuf::from));
+            // 生产模型根目录注入（VN_MODELS / override / dev 目录优先级更高，见 models::root）。
+            if let Some(dir) = &app_data {
                 let models_dir = dir.join("models");
                 let _ = std::fs::create_dir_all(&models_dir);
                 models::init_app_root(models_dir);
             }
             models::download::sweep_tmp(&models::root());
-            // 启动修复陈旧 WAV 头(硬崩后头尺寸落后于数据,播放端看不到尾段)。
-            // 放在 setup 同步做:此刻必无录制会话,与写盘线程零竞态;逐笔记 44 字节
-            // 头校验,仅陈旧才回写,量级毫秒。
-            if let Ok(dir) = app.path().app_data_dir() {
-                if let Ok(rd) = std::fs::read_dir(dir.join("notes")) {
-                    for e in rd.flatten() {
-                        if e.path().is_dir() {
-                            store::audio::repair_stale_tracks(&e.path());
+
+            let st = app.state::<AppState>();
+            match data_root(&handle) {
+                Ok(root) => {
+                    // 自定义 data_dir(非默认 app_data_dir)落在 asset:// 默认作用域之外,
+                    // 详情页音频播放会被 scope 拦掉——显式放行整棵子树。失败只 eprintln
+                    // 降级(自定义目录音频可能无法播放,但绝不挡启动/录制)。
+                    if app_data.as_deref() != Some(root.as_path()) {
+                        if let Err(e) = app.asset_protocol_scope().allow_directory(&root, true) {
+                            eprintln!("asset 作用域放行 data_root 失败(自定义目录音频可能无法播放): {e}");
+                        }
+                    }
+                    // 启动扫描 data_root/notes:①修复陈旧 WAV 头(硬崩后头尺寸落后于数据,
+                    // 播放端看不到尾段);②对已 complete 且有真实 wav 的笔记入队转码(上次
+                    // 没转完 / 新迁入的历史 WAV)。此刻必无录制会话,与写盘线程零竞态。
+                    if let Ok(rd) = std::fs::read_dir(root.join("notes")) {
+                        for e in rd.flatten() {
+                            if e.path().is_dir() {
+                                store::audio::repair_stale_tracks(&e.path());
+                                if should_enqueue_transcode(&e.path()) {
+                                    st.transcode.enqueue(e.path());
+                                }
+                            }
                         }
                     }
                 }
+                Err(e) => eprintln!("data_root 解析失败,跳过启动扫描/转码回溯(不影响录制): {e}"),
             }
-            let st = app.state::<AppState>();
+            // 转码 worker 常驻:录制中让路,空闲时串行消费队列(启动回溯 + 后续停录入队)。
+            st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
+
             preload_models(st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             Ok(())
         })
@@ -1147,6 +1254,23 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    #[test]
+    fn should_enqueue_only_complete_notes_with_wav() {
+        use super::should_enqueue_transcode;
+        let tmp = tempfile::tempdir().unwrap();
+        // 无 meta → 否
+        assert!(!should_enqueue_transcode(tmp.path()));
+        let meta = |state: &str| format!(
+            r#"{{"schema_version":1,"id":"n","title":"t","started_at":"","ended_at":null,"state":"{state}"}}"#);
+        std::fs::write(tmp.path().join("meta.json"), meta("recording")).unwrap();
+        std::fs::write(tmp.path().join("mic.wav"), vec![0u8; 100]).unwrap();
+        assert!(!should_enqueue_transcode(tmp.path()), "已中断可续录,不转码");
+        std::fs::write(tmp.path().join("meta.json"), meta("complete")).unwrap();
+        assert!(should_enqueue_transcode(tmp.path()));
+        std::fs::remove_file(tmp.path().join("mic.wav")).unwrap();
+        assert!(!should_enqueue_transcode(tmp.path()), "无 wav 无事可做");
     }
 
     #[test]
