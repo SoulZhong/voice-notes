@@ -16,18 +16,27 @@
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
 
   let raf = 0;
-  // 墙钟锚点:无轨道可依时,currentMs = anchorMs + (now - anchorWall)。
+  // 连续播放位置(非响应式):驱动音频同步;currentMs 只按 100ms 粒度更新——
+  // 高亮/进度条用不到更细,也避免 60fps 触发全段落列表的派生重算。
+  let pos = 0;
+  // 墙钟锚点:无轨道可依时,pos = anchorMs + (now - anchorWall)。
   let anchorWall = 0;
   let anchorMs = 0;
 
   const DRIFT_MS = 300;
+  const UI_STEP_MS = 100;
+
+  function publishPos() {
+    const q = Math.min(Math.floor(pos / UI_STEP_MS) * UI_STEP_MS, totalMs);
+    if (q !== currentMs) currentMs = q;
+  }
 
   function audibleClock(): number | null {
     for (let i = 0; i < tracks.length; i++) {
       const el = els[i];
+      // 在播且未 seek 的轨道即真时钟(syncTracks 保证界外轨道已暂停)。
       if (!el || el.paused || el.seeking) continue;
-      const pos = el.currentTime * 1000 + tracks[i].offset_ms;
-      if (pos <= tracks[i].offset_ms + tracks[i].duration_ms) return pos;
+      return el.currentTime * 1000 + tracks[i].offset_ms;
     }
     return null;
   }
@@ -36,7 +45,7 @@
     for (let i = 0; i < tracks.length; i++) {
       const el = els[i];
       if (!el) continue;
-      const expected = currentMs - tracks[i].offset_ms;
+      const expected = pos - tracks[i].offset_ms;
       if (expected >= 0 && expected < tracks[i].duration_ms) {
         if (el.paused) {
           el.currentTime = expected / 1000;
@@ -53,27 +62,30 @@
   function tick() {
     const clock = audibleClock();
     if (clock != null) {
-      currentMs = clock;
+      pos = clock;
       anchorMs = clock;
       anchorWall = performance.now();
     } else {
-      currentMs = anchorMs + (performance.now() - anchorWall);
+      pos = anchorMs + (performance.now() - anchorWall);
     }
-    if (currentMs >= totalMs) {
+    if (pos >= totalMs) {
+      pos = totalMs;
+      publishPos();
       pause();
-      currentMs = totalMs;
       return;
     }
+    publishPos();
     syncTracks();
     raf = requestAnimationFrame(tick);
   }
 
   export function play() {
     if (tracks.length === 0) return;
-    if (currentMs >= totalMs) currentMs = 0; // 播完再按:从头来
+    if (pos >= totalMs) pos = 0; // 播完再按:从头来
     playing = true;
-    anchorMs = currentMs;
+    anchorMs = pos;
     anchorWall = performance.now();
+    publishPos();
     syncTracks();
     cancelAnimationFrame(raf);
     raf = requestAnimationFrame(tick);
@@ -86,10 +98,16 @@
   }
 
   export function seek(ms: number) {
-    currentMs = Math.max(0, Math.min(ms, totalMs));
-    anchorMs = currentMs;
+    pos = Math.max(0, Math.min(ms, totalMs));
+    anchorMs = pos;
     anchorWall = performance.now();
+    publishPos();
     if (playing) syncTracks();
+  }
+
+  /** 时间轴总长(页面用于判断某段是否落在音频覆盖范围内)。 */
+  export function durationMs(): number {
+    return totalMs;
   }
 
   function toggle() {
@@ -111,8 +129,18 @@
 </script>
 
 <div class="player">
+  <!-- 图标遵循 DESIGN.md:16px 线性/实心 SVG(currentColor),禁用 Unicode 符号字符 -->
   <button class="play-btn" onclick={toggle} title={playing ? "暂停" : "播放"}>
-    {playing ? "⏸" : "▶"}
+    {#if playing}
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="3" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
+        <rect x="9.6" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
+      </svg>
+    {:else}
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M4.5 2.8v10.4c0 .8.9 1.3 1.6.9l8-5.2c.6-.4.6-1.4 0-1.8l-8-5.2c-.7-.4-1.6.1-1.6.9z" fill="currentColor" />
+      </svg>
+    {/if}
   </button>
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
   <input
@@ -172,7 +200,7 @@
     -webkit-appearance: none;
     appearance: none;
     height: 6px;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     background: linear-gradient(
       to right,
       var(--accent) 0 var(--pct),

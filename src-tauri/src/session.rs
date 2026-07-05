@@ -262,10 +262,11 @@ fn process_final<F1, F2>(
         }
     });
     // 样本更新先于合并处理:若本段归属簇随后被合并,下面的迁移会把样本一并带走。
+    // 已存样本 ≥ ENOUGH 即定格:更长不再有试听增益,不值一次整块克隆。
     if let Some(id) = &speaker {
         let keep = embedding_input.len().min(SPEAKER_SAMPLE_CAP);
         let cur = sample_store.get(id).map(|v| v.len()).unwrap_or(0);
-        if keep > cur {
+        if keep > cur && cur < SPEAKER_SAMPLE_ENOUGH {
             sample_store.insert(id.clone(), embedding_input[..keep].to_vec());
         }
     }
@@ -468,9 +469,14 @@ pub enum DiarEvent {
     },
 }
 
-/// 声纹样本上限:15s @16kHz。样本选「该簇最长的一段」,超长截头 15s——试听确认
-/// 身份用不着更长,也把 worker 内存占用限制在每簇 <1MB。
-pub(crate) const SPEAKER_SAMPLE_CAP: usize = 15 * 16_000;
+/// 声纹样本上限:15s。超长截头 15s——试听确认身份用不着更长,也把 worker 内存
+/// 占用限制在每簇 <1MB。
+pub(crate) const SPEAKER_SAMPLE_CAP: usize =
+    15 * crate::store::audio::AUDIO_SAMPLE_RATE as usize;
+/// 样本「够好」阈值:已存样本达到 10s 后不再升级替换——试听没有增益,却省掉长会中
+/// 每逢更长段就整块克隆(≤1MB)的 ASR 热路径开销。
+pub(crate) const SPEAKER_SAMPLE_ENOUGH: usize =
+    10 * crate::store::audio::AUDIO_SAMPLE_RATE as usize;
 
 /// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
@@ -1238,6 +1244,44 @@ mod asr_worker_tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// 样本上限真实生效:送一段超过 SPEAKER_SAMPLE_CAP 的 final(15.625s),
+    /// Snapshot 导出的样本必须恰被截断到上限——防止 worker 内存随长独白无界增长。
+    /// (MockEmbedder 脚本耗尽后重复最后一个向量:滑窗嵌入全相同 → 无变更点 → 整段。)
+    #[test]
+    fn snapshot_sample_truncated_to_cap_for_long_segment() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let n = SPEAKER_SAMPLE_CAP + 10_000;
+        tx.send(FinalJob {
+            source: Source::Mic,
+            samples: vec![0.1; n],
+            start_ms: 0,
+            end_ms: (n / 16) as u64,
+        })
+        .unwrap();
+        drop(tx);
+
+        let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]);
+        let events = Arc::new(Mutex::new(Vec::<DiarEvent>::new()));
+        let e2 = events.clone();
+        let _ = run_asr_worker(
+            Box::new(CountingRecognizer),
+            Some(Box::new(embedder)),
+            SpeakerRegistry::new(),
+            rx,
+            TEST_ECHO_HOLD,
+            vec![],
+            |_, _, _, _, _, _| {},
+            |_, _| {},
+            move |ev| e2.lock().unwrap().push(ev),
+        );
+        let evs = events.lock().unwrap();
+        let DiarEvent::Snapshot { samples, .. } = evs.last().unwrap() else {
+            panic!("末事件应为 Snapshot");
+        };
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].1.len(), SPEAKER_SAMPLE_CAP, "超长段样本截断到上限");
     }
 
     /// 测试用识别器：按队列依次返回预置文本（耗尽后返回空串），供回声去重测试

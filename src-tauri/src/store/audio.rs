@@ -19,9 +19,27 @@ const BYTES_PER_SAMPLE: u64 = 2;
 const HEADER_LEN: u64 = 44;
 /// 追加多少样本后刷盘并回写头部尺寸(1s):任意时刻文件都是合法 WAV,崩溃最多丢约 1s。
 const FLUSH_INTERVAL_SAMPLES: u64 = AUDIO_SAMPLE_RATE as u64;
+/// RIFF 头 data 尺寸是 u32,单轨最大数据量(≈37 小时 @16k s16)。达到即停写,
+/// 绝不让尺寸字段回绕产生"头小体大"的损坏文件。
+const MAX_DATA_BYTES: u64 = u32::MAX as u64 - 36;
+
+/// f32 样本([-1,1] 外 clamp)→ s16。音频轨道与声纹样本共用,保证两处编码一致。
+pub fn f32_to_s16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32767.0) as i16
+}
+
+/// audio.json 全局写锁:mic/system 两个 worker 线程可能同时首次建档,
+/// load→insert→save 之间无互斥会互相覆盖丢掉对方的 offset 项。
+static META_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn meta_guard() -> std::sync::MutexGuard<'static, ()> {
+    META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn ms_to_bytes(ms: u64) -> u64 {
-    ms * AUDIO_SAMPLE_RATE as u64 / 1000 * BYTES_PER_SAMPLE
+    // 损坏的 segments.jsonl 可能带出天文数字 end_ms → base_ms:饱和乘法防回绕,
+    // 上限交由调用方(open 对照 MAX_DATA_BYTES 拒绝),不在这里 panic。
+    ms.saturating_mul(AUDIO_SAMPLE_RATE as u64) / 1000 * BYTES_PER_SAMPLE
 }
 
 fn bytes_to_ms(bytes: u64) -> u64 {
@@ -132,16 +150,35 @@ impl AudioTrackWriter {
 
     /// 建/开 note_dir 下 `<source>.wav` 并使其尾部对齐 base_ms:
     /// - 不存在:写空头,audio.json 记 offset_ms = base_ms;
-    /// - 已存在:修复陈旧头,再 set_len 到 (base_ms - offset_ms) 对应字节
-    ///   (截掉上场末尾静音/被丢段,不足则零填充)——续录新音频落位即对齐。
+    /// - 已存在:set_len 到 (base_ms - offset_ms) 对应字节(截掉上场末尾静音/被丢段,
+    ///   不足则零填充)并重写头——续录新音频落位即对齐(陈旧头也一并被这次重写覆盖)。
+    ///
+    /// 全程持 audio.json 写锁:两源 worker 可能同时首次建档,load→save 无互斥会丢项。
     fn open(&self) -> anyhow::Result<(File, PathBuf, u64)> {
+        let _guard = meta_guard();
         let path = self.note_dir.join(format!("{}.wav", self.source));
         let mut meta = load_audio_meta(&self.note_dir);
         if path.exists() {
-            repair_wav_header(&path)?;
-            let offset_ms = meta.tracks.get(&self.source).map(|t| t.offset_ms).unwrap_or(0);
+            let existing_data = std::fs::metadata(&path)?.len().saturating_sub(HEADER_LEN);
+            let offset_ms = match meta.tracks.get(&self.source) {
+                Some(t) => t.offset_ms,
+                None => {
+                    // audio.json 丢失/缺项:offset=0 会把中途出现的轨道整体前移并被
+                    // 破坏性 set_len 固化。按「上场停止时文件尾 ≈ base_ms」的对齐
+                    // 不变式反推 offset = base_ms - 时长(负值饱和为 0,等价旧行为),
+                    // 并立即回写补全,让重建只发生一次。
+                    let est = self.base_ms.saturating_sub(bytes_to_ms(existing_data));
+                    meta.schema_version = 1;
+                    meta.tracks.insert(self.source.clone(), TrackMeta { offset_ms: est });
+                    save_audio_meta(&self.note_dir, &meta)?;
+                    est
+                }
+            };
             // base_ms 只增不减且轨道创建时 offset = 当时的 base,故差值非负;防御 saturating。
             let target = ms_to_bytes(self.base_ms.saturating_sub(offset_ms));
+            if target > MAX_DATA_BYTES {
+                anyhow::bail!("对齐目标超出 WAV 尺寸上限(base_ms 异常?): {target} 字节");
+            }
             let mut f = OpenOptions::new().read(true).write(true).open(&path)?;
             f.set_len(HEADER_LEN + target)?; // 双向:超长截断,不足零填充
             f.seek(SeekFrom::Start(0))?;
@@ -175,14 +212,21 @@ impl AudioTrackWriter {
                 }
             }
         }
+        if let TrackState::Open { data_len, path, .. } = &self.state {
+            if *data_len + (samples.len() as u64) * BYTES_PER_SAMPLE > MAX_DATA_BYTES {
+                eprintln!("音频轨道达到 WAV 4GiB 尺寸上限,停写({})", path.display());
+                self.flush_header(); // 已写内容仍是合法 WAV
+                self.state = TrackState::Failed;
+                return;
+            }
+        }
         let TrackState::Open { file, path, data_len, since_flush, buf } = &mut self.state else {
             return;
         };
         buf.clear();
         buf.reserve(samples.len() * 2);
         for s in samples {
-            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-            buf.extend_from_slice(&v.to_le_bytes());
+            buf.extend_from_slice(&f32_to_s16(*s).to_le_bytes());
         }
         if let Err(e) = file.write_all(buf) {
             eprintln!("音频落盘失败,本轨道停写({}): {e}", path.display());
@@ -233,19 +277,31 @@ pub struct TrackInfo {
     pub duration_ms: u64,
 }
 
+/// 已知源集合 = audio.json 记录过的 ∪ 内建两源:写入端(lib.rs 按配置源建档)与
+/// 读取端由 audio.json 桥接对齐,未来新增源不会在这里被漏掉。
+fn known_sources(meta: &AudioMeta) -> Vec<String> {
+    let mut sources: Vec<String> = vec!["mic".into(), "system".into()];
+    for s in meta.tracks.keys() {
+        if !sources.iter().any(|x| x == s) {
+            sources.push(s.clone());
+        }
+    }
+    sources
+}
+
 pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
     let meta = load_audio_meta(note_dir);
     let mut out = Vec::new();
-    for source in ["mic", "system"] {
+    for source in known_sources(&meta) {
         let path = note_dir.join(format!("{source}.wav"));
         let Ok(md) = std::fs::metadata(&path) else { continue };
         if md.len() <= HEADER_LEN {
             continue; // 空轨道(刚建头没内容/损坏残留)不给前端,免得渲染空播放器
         }
         out.push(TrackInfo {
-            source: source.to_string(),
             path: path.to_string_lossy().into_owned(),
-            offset_ms: meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0),
+            offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
+            source,
             duration_ms: bytes_to_ms(md.len() - HEADER_LEN),
         });
     }
@@ -255,7 +311,8 @@ pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
 /// 陈旧头校验:实际长度与头部 data 尺寸不一致才重写(非活动笔记打开详情时调用;
 /// 活动笔记跳过,避免与录制线程的头回写互踩)。
 pub fn repair_stale_tracks(note_dir: &Path) {
-    for source in ["mic", "system"] {
+    let meta = load_audio_meta(note_dir);
+    for source in known_sources(&meta) {
         let path = note_dir.join(format!("{source}.wav"));
         let Ok(md) = std::fs::metadata(&path) else { continue };
         let mut head = [0u8; HEADER_LEN as usize];

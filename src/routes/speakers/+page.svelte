@@ -110,7 +110,11 @@
     };
     sampleAudio = a;
     samplePlayingId = p.id;
-    void a.play().catch(() => stopSample());
+    // 迟到的 play() 拒绝(文件已删/加载失败)只清自己:无身份守卫会把用户随后
+    // 点播的另一个人的样本一并停掉。
+    void a.play().catch(() => {
+      if (samplePlayingId === p.id) stopSample();
+    });
   }
 
   // 离开页面停播,不留幽灵声音。
@@ -164,9 +168,10 @@
             </span>
           </div>
           <div class="actions">
+            <!-- 纯文字标签:DESIGN.md 禁用 ▶/⏸ 等 Unicode 符号字符 -->
             {#if p.sample_path}
               <button class="link" onclick={() => toggleSample(p)}>
-                {samplePlayingId === p.id ? "⏸ 停止" : "▶ 试听"}
+                {samplePlayingId === p.id ? "停止" : "试听"}
               </button>
             {/if}
             {#if pendingMerge && pendingMerge.loser === p.id}

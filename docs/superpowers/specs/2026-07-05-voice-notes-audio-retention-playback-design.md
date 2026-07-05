@@ -60,7 +60,7 @@ voiceprints/<Pn>.wav   # 该人物的代表性样本(≤15s,16k mono s16)
 
 ## 写入路径(Rust)
 
-新模块 `store/audio.rs`:
+新模块 `store/audio.rs`(以下含 8 角度代码审查后的修订):
 
 - `AudioTrackWriter::open(note_dir, source, base_ms)`:
   - 文件不存在 → 写 44 字节头,`audio.json` 记 `offset_ms = base_ms`(新建笔记即 0)。
@@ -73,11 +73,20 @@ voiceprints/<Pn>.wav   # 该人物的代表性样本(≤15s,16k mono s16)
 接线:
 
 - `start_session` 新参 `audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>`;`run_segment_worker` 新参 `audio_sink: Option<…>`,在**暂停闸之后、VAD accept 之前**调用——写入的样本与 segmenter 计数的样本严格同源。
-- `spawn_session` 在 writer 建好后为每个成功配置的源 `AudioTrackWriter::open`,包成闭包传入。
+- **写盘走独立线程 + 无界通道**(sink 只 send):磁盘卡顿绝不反压分段 worker 与采集实时线程;stop 时在分段 worker join 后再 join 写盘线程,finalize 前头部已收尾。
+- `spawn_session` 在 writer 建好后为每个配置源建惰性 `AudioTrackWriter`(首帧才建档,源启动失败不留空文件)。
+
+审查修订(并发/健壮性):
+
+- `audio.json` 全局写锁:两源同时首次建档的 load→save 竞态会互相丢 offset 项。
+- audio.json 缺项但 WAV 存在时,按「上场停止时文件尾 ≈ base_ms」反推 offset(= base_ms − 时长)并回写,避免 offset=0 被破坏性 set_len 固化成永久错位。
+- 陈旧头修复只在**应用启动扫描(setup,必无会话)**与续录 open 时做;`note_audio_info` 纯读——"非活动才修"的 check-then-act 挡不住 stop 排干/开录入槽窗口的并发写者。
+- WAV data 尺寸达 u32 上限(≈37h)即停写,`ms_to_bytes` 饱和乘法,拒绝异常 base_ms 的对齐目标——绝不产出尺寸字段回绕的损坏文件。
+- 轨道枚举源集合 = audio.json 记录 ∪ 内建 {mic,system},未来加源不漏报。
 
 ## 播放路径(前端)
 
-- 新命令 `note_audio_info(id) -> Vec<TrackInfo>`(路径为绝对路径;非活动笔记顺带修复陈旧 WAV 头,活动笔记跳过修复避免与写入线程竞争)。
+- 新命令 `note_audio_info(id) -> Vec<TrackInfo>`(路径为绝对路径;**纯读**,陈旧头修复见上文「审查修订」——统一在启动扫描与续录 open 时做)。
 - `tauri.conf.json` 开启 asset 协议,scope 限 `$APPDATA/notes/**` 与 `$APPDATA/voiceprints/**`;前端 `convertFileSrc(path)`。
 - 新组件 `lib/AudioPlayer.svelte`:
   - 隐藏 `<audio>` × N;自有时钟(rAF + performance.now)驱动 UI 与文字跟随;有轨道覆盖当前时刻时以该轨道 `currentTime` 为准(音频即真时钟),否则墙钟推进(轨道间隙)。
@@ -88,10 +97,10 @@ voiceprints/<Pn>.wav   # 该人物的代表性样本(≤15s,16k mono s16)
 
 ## 声纹样本路径
 
-- ASR worker 维护 `簇id → 最长段样本(截 15s)`:`process_final` 返回归属簇 id 并在内部处理簇合并时迁移样本(loser 样本更长则归 winner)。
+- ASR worker 维护 `簇id → 最长段样本(截 15s;已存样本 ≥10s 即定格,不再为更长段整块克隆)`:`process_final` 内部更新并在簇合并时迁移样本(loser 样本更长则归 winner)。
 - `DiarEvent::Snapshot` 变体扩展为 `{ snaps, samples: Vec<(String, Vec<f32>)> }`。
 - lib.rs Snapshot 分支:`upsert_from_session` 后,对每个"已关联人物"(snap.person 或本次新入库 new_links)的簇,若 `voiceprints/<pid>.wav` **不存在**则写入样本(`VoiceprintStore::write_sample_if_missing`)。只写首个样本:样本是"确认此人是谁"的稳定参照,不随会话滚动。
-- `merge_person`:winner 无样本时继承 loser 的样本文件(rename),否则删 loser 的;`delete_person` 连带删样本。均在 VoiceprintStore 内完成(它持有 root)。
+- `merge_person`:winner 无样本时继承 loser 的样本文件(rename),否则删 loser 的;`delete_person` 连带删样本。均在 VoiceprintStore 内完成(它持有 root)。`write_sample_if_missing` 与 merge/delete 同持 VP_LOCK 串行化,防止停止入库与管理页操作并发写出无主孤儿样本;非法 id(非纯字母数字)一律 None,不映射任何兜底文件名。
 - `list_people` 返回值增加 `sample_path: Option<String>`;管理页出现「试听」按钮(共享一个 Audio 实例,点击切换播放)。
 
 ## 错误处理原则
@@ -108,3 +117,10 @@ voiceprints/<Pn>.wav   # 该人物的代表性样本(≤15s,16k mono s16)
 - asr worker:Snapshot 携带样本、上限截断、合并迁移。
 - voiceprints:write_sample_if_missing / merge 继承 / delete 连删。
 - 前端:`npm run build` + svelte-check 通过;播放器逻辑以纯函数拆出的部分(轨道期望位置计算)不单测(无 test harness),靠冒烟。
+- 播放器 `currentMs` 按 100ms 粒度对外发布(内部连续 pos 驱动音频同步),避免 60fps 触发全段落派生重算;轨道获取在 effect 中同步读 `canEdit` 成为依赖(本页停录后播放器能出现)并带 id 过期守卫。
+
+## 已知取舍(审查确认,暂不做)
+
+- CSP 仍为 null(沿用现状):asset 协议 scope 已限 notes/voiceprints 两目录;引入 CSP 需真机回归,另行处理。
+- 簇样本 map 放在 ASR worker 而非 SpeakerRegistry 内部:当前 take_merges 单消费点,迁移逻辑就地成立;若未来出现第二个合并路径,应把样本归属挪进 registry。
+- WAV 写入保持手写头(44 字节)而非 hound:需要「随刷盘回写头 + set_len 对齐 + 崩溃修复」三件 hound append 模型覆盖不了的事;声纹样本(一次性写)用 hound。

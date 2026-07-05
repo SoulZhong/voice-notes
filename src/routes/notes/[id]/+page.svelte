@@ -71,13 +71,27 @@
     } catch (e) {
       error = `加载失败: ${e}`;
     }
-    // 音频是增值层:取失败(旧笔记无音频/后端异常)静默按无轨道处理,不打扰主内容。
-    try {
-      tracks = canEdit ? await noteAudioInfo(id) : [];
-    } catch {
-      tracks = [];
-    }
   }
+
+  // 轨道获取独立于 refresh:canEdit 必须在 await 之前同步读到才会成为 effect 依赖
+  // ——否则本页停录后(id/notesVersion 都没变)effect 不重跑,播放器永远不出现。
+  // await 后校验 id 未变,防快速切换笔记时旧响应覆盖新页面的轨道(错音频)。
+  // 音频是增值层:取失败(旧笔记无音频/后端异常)静默按无轨道处理,不打扰主内容。
+  $effect(() => {
+    const forId = id;
+    void recording.notesVersion;
+    if (!canEdit) {
+      tracks = [];
+      return;
+    }
+    noteAudioInfo(forId)
+      .then((t) => {
+        if (forId === id) tracks = t;
+      })
+      .catch(() => {
+        if (forId === id) tracks = [];
+      });
+  });
 
   // id 切换：无条件复位一切编辑态。
   $effect(() => {
@@ -120,8 +134,12 @@
   });
 
   function playFrom(seg: SegmentRecord) {
-    player?.seek(seg.start_ms);
-    player?.play();
+    if (!player) return;
+    // 段起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
+    // 否则 seek 被钳到末尾、play 又视作"播完重来",会莫名跳回 0:00。
+    if (seg.start_ms >= player.durationMs()) return;
+    player.seek(seg.start_ms);
+    player.play();
   }
 
   function segFocus(s: SegmentRecord) {
