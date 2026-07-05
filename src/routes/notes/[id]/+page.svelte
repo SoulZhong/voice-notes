@@ -12,6 +12,7 @@
     formatDuration,
     speakerLabel,
     speakerColor,
+    speakerInk,
     speakerIdCompare,
     editSegment,
     deleteSegment,
@@ -332,7 +333,7 @@
           {:else}
             <button
               class="badge as-btn"
-              style="background: {speakerColor(seg.speaker, seg.source)}"
+              style="background: {speakerColor(seg.speaker, seg.source)}; color: {speakerInk(seg.speaker, seg.source)}"
               disabled={!canEdit}
               title={canEdit ? "点击改说话人" : ""}
               onclick={() => (speakerMenuSeq = seg.seq)}

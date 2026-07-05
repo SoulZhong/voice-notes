@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { speakerColor, speakerLabel, renameSpeaker, speakerIdCompare } from "$lib/notes";
+  import { speakerColor, speakerInk, speakerLabel, renameSpeaker, speakerIdCompare } from "$lib/notes";
 
   let {
     speakers,
@@ -50,7 +50,7 @@
   <div class="chips">
     {#each ids as id (id)}
       <!-- speaker-chip：同徽章色系(粉彩底+ink字)，chip 本身就是色块，不再需要单独的色点 -->
-      <div class="chip" class:editable style="background: {speakerColor(id, 'mic')}">
+      <div class="chip" class:editable style="background: {speakerColor(id, 'mic')}; color: {speakerInk(id, 'mic')}">
         {#if editable && editingId === id}
           <!-- svelte-ignore a11y_autofocus -->
           <input

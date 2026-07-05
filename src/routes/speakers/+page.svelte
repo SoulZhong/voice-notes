@@ -8,7 +8,7 @@
     deletePerson,
     type PersonSummary,
   } from "$lib/people";
-  import { formatDate, formatDuration } from "$lib/notes";
+  import { formatDate, formatDuration, speakerColor, speakerInk } from "$lib/notes";
 
   let people = $state<PersonSummary[]>([]);
   let error = $state("");
@@ -25,23 +25,13 @@
     return p.name || `未命名 · 最近 ${formatDate(p.last_seen)}`;
   }
 
-  /** 头像粉彩底:P<n> 数值循环取 DESIGN 粉彩 7 色,异常 id 散列兜底。 */
-  const TINTS = [
-    "var(--tint-sky)",
-    "var(--tint-mint)",
-    "var(--tint-peach)",
-    "var(--tint-lavender)",
-    "var(--tint-rose)",
-    "var(--tint-yellow)",
-    "var(--tint-gray)",
-  ];
-  function avatarTint(id: string): string {
-    const n = parseInt(id.replace(/^P/, ""), 10);
-    if (Number.isFinite(n) && n > 0) return TINTS[(n - 1) % TINTS.length];
-    let h = 0;
-    for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    return TINTS[h % TINTS.length];
-  }
+  /** 头像粉彩底/文字:统一走 $lib/notes 的 speakerColor/speakerInk(与说话人徽章同一套
+      soft 公式)。注意 id 是 P<n> 形态(本地曾按 "^P" 剥前缀数值循环),而 notes.ts 的
+      索引逻辑剥的是 "^S" 前缀——对 P<n> 不命中数值分支,统一后退化为字符串散列兜底
+      (仍确定性、每人色不变,但不再是 P1/P2/P3.. 顺序循环取色;差异已在任务报告中记录)。
+      source 参数在此页无意义(id 恒真值),固定传 "mic"。 */
+  const avatarTint = (id: string) => speakerColor(id, "mic");
+  const avatarInk = (id: string) => speakerInk(id, "mic");
 
   /** 最近出现的人排前面(BTreeMap 原序是 P1..Pn,对使用者没有意义)。 */
   const sorted = $derived(
@@ -194,7 +184,7 @@
 
   {#snippet personRow(p: PersonSummary)}
         <li class="item" class:active-row={samplePlayingId === p.id}>
-          <div class="avatar" style="background: {avatarTint(p.id)}">
+          <div class="avatar" style="background: {avatarTint(p.id)}; color: {avatarInk(p.id)}">
             {#if p.name}
               <span class="initial">{p.name.slice(0, 1)}</span>
             {:else}
