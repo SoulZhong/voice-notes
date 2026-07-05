@@ -322,7 +322,6 @@ impl TranscodeQueue {
     /// 迁移前调用:置 `paused`(worker 从此不出队),并等 `current` 排空(等当前 in-flight
     /// 转完)。迁移要挪动笔记根目录,必须先让转码彻底静止:既不能有新的开转,也不能有正在
     /// 转的。返回后到 `unpause` 之间,worker 保证不碰任何目录。
-    #[allow(dead_code)] // Task 9 数据目录迁移接线后摘除
     pub fn pause_and_wait(&self) {
         let mut st = self.state.lock().unwrap();
         st.paused = true;
@@ -333,7 +332,6 @@ impl TranscodeQueue {
     }
 
     /// 迁移完成后解除暂停,并 `notify_all` 唤醒挂着等活的 worker,让它继续消费队列。
-    #[allow(dead_code)] // Task 9 数据目录迁移接线后摘除
     pub fn unpause(&self) {
         let mut st = self.state.lock().unwrap();
         st.paused = false;

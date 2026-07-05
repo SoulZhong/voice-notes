@@ -692,6 +692,11 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
+    // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("正在迁移或下载,稍后再试".into());
+    }
     if !models::recording_ready(&current_asr(&app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
@@ -711,6 +716,10 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("正在迁移或下载,稍后再试".into());
+    }
     if !models::recording_ready(&current_asr(&app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
@@ -1261,6 +1270,138 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     settings::save(&d, &new_settings).map_err(|e| e.to_string())
 }
 
+/// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
+/// 都必然 unpause——否则一次迁移失败后转码永久静止,只能重启应用。与 ResetOnDrop
+/// （复位 download_running 互斥位）配套:两者一起挂在迁移线程头部,兜住所有退出路径。
+struct UnpauseOnDrop(Arc<store::transcode::TranscodeQueue>);
+impl Drop for UnpauseOnDrop {
+    fn drop(&mut self) {
+        self.0.unpause();
+    }
+}
+
+/// 数据目录迁移:把 data_root 下的笔记/声纹整树搬到 new_dir(复制→校验→删旧,失败回退),
+/// 成功后改写 settings.data_dir 并放行 asset 作用域。守卫只做同步检查与 spawn,搬运/
+/// pause_and_wait 全在后台线程——绝不在命令线程(可能持 Tauri 内部锁)里跑阻塞搬运。
+#[tauri::command]
+fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
+    // 守卫一:有活动会话时迁移会与写盘线程撞笔记目录,拒绝。
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能迁移".into());
+    }
+    // 守卫二:目标目录必须不存在或为空(不覆盖用户既有内容)。
+    let new_path = PathBuf::from(&new_dir);
+    store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    // 守卫三:复用 download_running 做全局互斥——迁移与下载/再次迁移彼此排斥。
+    if state.download_running.swap(true, Ordering::SeqCst) {
+        return Err("迁移或下载进行中".into());
+    }
+    // 抢到互斥位后再算旧根:失败必须先复位互斥位,否则永久卡死。
+    let old_root = match data_root(&app) {
+        Ok(r) => r,
+        Err(e) => {
+            state.download_running.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+    };
+    let running = state.download_running.clone();
+    let transcode = state.transcode.clone();
+    std::thread::spawn(move || {
+        // 两道 RAII:先复位互斥位(ResetOnDrop),再 unpause(UnpauseOnDrop)。Drop 逆序:
+        // 先 unpause 再复位 running,顺序无碍,关键是两者都必然发生(含 panic 展开)。
+        let _reset = ResetOnDrop(running);
+        // pause_and_wait 会阻塞等 in-flight 转码——只在后台线程调,命令线程绝不调。
+        transcode.pause_and_wait();
+        let _unpause = UnpauseOnDrop(transcode.clone());
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "copying".into(), message: String::new() });
+        let emit_err = |app: &AppHandle, msg: String| {
+            let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "error".into(), message: msg });
+        };
+        match store::migrate::migrate_entries(&old_root, &new_path, &["notes", "voiceprints.json", "voiceprints"]) {
+            Ok(()) => {
+                // 读-改-写 settings(永在 app_data_dir,不随 data_dir 漂移)。
+                let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+                    let mut s = settings::load(&d);
+                    s.data_dir = Some(new_dir.clone());
+                    settings::save(&d, &s).map_err(|e| e.to_string())
+                });
+                match saved {
+                    Ok(()) => {
+                        // 自定义目录落在 asset:// 默认作用域外,放行整棵子树供详情页音频播放。
+                        // 失败只降级打日志(音频可能无法播放,但迁移已成功)。
+                        if let Err(e) = app.asset_protocol_scope().allow_directory(&new_path, true) {
+                            eprintln!("asset 作用域放行新 data 目录失败(音频可能无法播放): {e}");
+                        }
+                        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "done".into(), message: String::new() });
+                    }
+                    // 数据已搬到新处但设置没存住:发 error,前端可提示并重试(重试会因新目录
+                    // 已有内容被 dir_is_usable_target 拦下,需用户手动收拾——属极端边角)。
+                    Err(e) => emit_err(&app, format!("迁移已完成但保存设置失败: {e}")),
+                }
+            }
+            Err(e) => emit_err(&app, format!("{e:#}")),
+        }
+    });
+    Ok(())
+}
+
+/// 模型目录迁移:同构于 migrate_data_dir,搬 models::root() 顶层全部条目(含断点续传
+/// 分片,整树搬最诚实),成功后改写 settings.models_dir 并重设 models::override。
+#[tauri::command]
+fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能迁移".into());
+    }
+    // 比 data 多一道守卫:VN_MODELS 环境变量置顶于 models::root() 的解析顺序,此时改
+    // settings.models_dir 也不生效,迁了等于白迁,直接拒绝并提示先移除环境变量。
+    if let Ok(v) = std::env::var("VN_MODELS") {
+        if !v.is_empty() {
+            return Err("VN_MODELS 环境变量生效中,请先移除再迁移".into());
+        }
+    }
+    let new_path = PathBuf::from(&new_dir);
+    store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    if state.download_running.swap(true, Ordering::SeqCst) {
+        return Err("迁移或下载进行中".into());
+    }
+    let old_root = models::root();
+    // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
+    let entries: Vec<String> = std::fs::read_dir(&old_root)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let running = state.download_running.clone();
+    let transcode = state.transcode.clone();
+    std::thread::spawn(move || {
+        let _reset = ResetOnDrop(running);
+        transcode.pause_and_wait();
+        let _unpause = UnpauseOnDrop(transcode.clone());
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "copying".into(), message: String::new() });
+        let emit_err = |app: &AppHandle, msg: String| {
+            let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "error".into(), message: msg });
+        };
+        let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        match store::migrate::migrate_entries(&old_root, &new_path, &entry_refs) {
+            Ok(()) => {
+                let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+                    let mut s = settings::load(&d);
+                    s.models_dir = Some(new_dir.clone());
+                    settings::save(&d, &s).map_err(|e| e.to_string())
+                });
+                match saved {
+                    Ok(()) => {
+                        // 立即重设 override,后续 models::root() 即指向新处,无需重启。
+                        models::set_models_override(Some(new_path.clone()));
+                        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "done".into(), message: String::new() });
+                    }
+                    Err(e) => emit_err(&app, format!("迁移已完成但保存设置失败: {e}")),
+                }
+            }
+            Err(e) => emit_err(&app, format!("{e:#}")),
+        }
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1338,6 +1479,8 @@ pub fn run() {
             delete_model,
             get_settings,
             set_settings,
+            migrate_data_dir,
+            migrate_models_dir,
             list_people,
             rename_person,
             merge_person,
