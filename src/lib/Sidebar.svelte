@@ -8,12 +8,35 @@
     deleteNote,
     formatDate,
     formatDuration,
+    speakerColor,
     type NoteSummary,
   } from "$lib/notes";
+  import { listPeople, type PersonSummary } from "$lib/people";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
   let error = $state("");
+
+  // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=声纹库,其余(笔记/录制/设置)=录音记录。
+  const tab = $derived($page.url.pathname.startsWith("/speakers") ? "people" : "notes");
+
+  let people = $state<PersonSummary[]>([]);
+  let peopleError = $state("");
+
+  async function refreshPeople() {
+    try {
+      people = await listPeople();
+      peopleError = "";
+    } catch (e) {
+      peopleError = `加载失败: ${e}`;
+    }
+  }
+
+  // 切到声纹库页签时拉取;管理页改名/合并/删除后经 peopleVersion 触发重拉,简表不滞留旧名。
+  $effect(() => {
+    void recording.peopleVersion;
+    if (tab === "people") refreshPeople();
+  });
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   let confirmingDeleteId = $state<string | null>(null);
@@ -117,6 +140,40 @@
     {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
+  <!-- 页签组织侧栏(冒烟反馈):录音记录=笔记索引,声纹库=人物索引,各自成世界;
+       选中态复用 surface-press+ink 既有语义,点击即导航,选中由路由派生。 -->
+  <nav class="tabs">
+    <button
+      class="tab"
+      class:active={tab === "notes"}
+      onclick={() => { if (tab !== "notes") goto("/"); }}>录音记录</button
+    >
+    <button
+      class="tab"
+      class:active={tab === "people"}
+      onclick={() => { if (tab !== "people") goto("/speakers"); }}>声纹库</button
+    >
+  </nav>
+
+  {#if tab === "people"}
+    {#if peopleError}
+      <div class="banner">{peopleError}</div>
+    {/if}
+    {#if people.length === 0 && !peopleError}
+      <p class="hint">录一场会议,停止后本场说话人会自动出现在这里</p>
+    {/if}
+    <ul class="list">
+      {#each people as p (p.id)}
+        <li class="item person">
+          <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
+          <div class="main-line">
+            <span class="title" class:unnamed={!p.name}>{p.name || "未命名"}</span>
+            <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
+          </div>
+        </li>
+      {/each}
+    </ul>
+  {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
   {#if error}
@@ -169,17 +226,10 @@
       </li>
     {/each}
   </ul>
+  {/if}
 
-  <!-- 工具类入口固定底部(冒烟反馈:顶部挤在录制按钮下不符使用习惯;Notion/原生应用惯例是
-       内容列表居中滚动、设置类入口沉底常驻)。 -->
+  <!-- 设置沉底常驻(冒烟确认位置);声纹库已升级为页签,footer 只剩工具入口。 -->
   <nav class="nav-footer">
-    <a class="nav-link" class:current={$page.url.pathname === "/speakers"} href="/speakers">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-        <circle cx="8" cy="5.2" r="2.7" />
-        <path d="M2.8 13.4c1-2.3 3-3.4 5.2-3.4s4.2 1.1 5.2 3.4" />
-      </svg>
-      声纹库
-    </a>
     <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="2.2" />
@@ -307,6 +357,52 @@
     color: var(--ink);
     font-weight: 500;
   }
+  /* 页签:两枚并排,选中态复用"surface-press 底 + ink"既有语义(与列表选中/nav 当前页同源),
+     不引新形态;未选中安静(ink-secondary),hover surface-soft。 */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    margin-top: 0.6rem;
+  }
+  .tab {
+    flex: 1;
+    border: none;
+    background: transparent;
+    color: var(--ink-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.4em 0;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+  }
+  .tab:hover {
+    background: var(--surface-soft);
+  }
+  .tab.active {
+    background: var(--surface-press);
+    color: var(--ink);
+  }
+  /* 人物行:小色点(与管理页头像同色源)+ 名字/最近出现;整块是只读索引,管理走主区页面 */
+  .item.person {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+    cursor: default;
+  }
+  .item.person:hover {
+    background: transparent;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: var(--radius-full);
+    flex-shrink: 0;
+  }
+  .title.unnamed {
+    color: var(--ink-faint);
+    font-weight: 400;
+  }
+
   /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,
      Notion 侧栏过滤即此形态;聚焦才浮出 canvas 底 + accent 环。 */
   .search {

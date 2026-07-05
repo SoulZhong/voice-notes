@@ -9,6 +9,7 @@
     type PersonSummary,
   } from "$lib/people";
   import { formatDate, formatDuration, speakerColor, speakerInk } from "$lib/notes";
+  import { recording } from "$lib/recording.svelte";
 
   let people = $state<PersonSummary[]>([]);
   let error = $state("");
@@ -76,6 +77,7 @@
     try {
       await renamePerson(p.id, text);
       await refresh();
+      recording.bumpPeople(); // 侧栏声纹库简表同步新名
     } catch (err) {
       error = `改名失败: ${err}`;
       await refresh();
@@ -90,6 +92,7 @@
     try {
       await mergePerson(loser, winner);
       await refresh();
+      recording.bumpPeople();
     } catch (e) {
       // 录制中后端拒绝等错误文案原样展示。
       error = `${e}`;
@@ -102,6 +105,7 @@
     try {
       await deletePerson(id);
       await refresh();
+      recording.bumpPeople();
     } catch (e) {
       error = `删除失败: ${e}`;
     }
