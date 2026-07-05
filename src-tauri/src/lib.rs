@@ -75,7 +75,6 @@ impl ActiveSession {
     }
 }
 
-#[derive(Default)]
 struct AppState {
     running: Arc<Mutex<bool>>,
     generation: Arc<Mutex<u64>>,
@@ -88,17 +87,75 @@ struct AppState {
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
+    /// 全局串行转码队列。自带独立叶子锁：绝不在持有 running/generation/session_slot
+    /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
+    /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
+    transcode: Arc<store::transcode::TranscodeQueue>,
 }
 
-/// notes 根目录（不存在则创建）。
-fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
-    let dir = app
+// 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
+// 怎么来的一目了然。
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            running: Arc::new(Mutex::new(false)),
+            generation: Arc::new(Mutex::new(0)),
+            session: Arc::new(Mutex::new(None)),
+            recognizer_cache: Arc::new(Mutex::new(None)),
+            embedder_cache: Arc::new(Mutex::new(None)),
+            download_running: Arc::new(AtomicBool::new(false)),
+            download_cancel: Arc::new(AtomicBool::new(false)),
+            transcode: store::transcode::TranscodeQueue::new(),
+        }
+    }
+}
+
+/// 数据根目录：app_data_dir 读 settings.json（自举指针，永远在 app_data_dir，不随
+/// data_dir 漂移）→ resolve_data_root 得到用户配置的落盘根，未配置则回落 app_data_dir。
+/// 笔记/声纹等所有内容都挂这个根；settings 读写命令仍走 app_data_dir。
+fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?
-        .join("notes");
+        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?;
+    let s = settings::load(&app_data);
+    Ok(settings::resolve_data_root(&app_data, &s))
+}
+
+/// notes 根目录（不存在则创建），挂在 data_root 下。
+fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let dir = data_root(app)?.join("notes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// 启动回溯扫描的入队判定（抽成纯函数便于单测）：meta.json 可解析为 NoteMeta 且
+/// state=="complete"（已中断的 recording 态留给续录，不转码）且目录下存在 >44 字节的
+/// `*.wav`（44 字节是纯 WAV 头，>44 才有真实样本可压）。任一不满足即不入队。
+fn should_enqueue_transcode(note_dir: &std::path::Path) -> bool {
+    let Ok(meta_str) = std::fs::read_to_string(note_dir.join("meta.json")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<store::NoteMeta>(&meta_str) else {
+        return false; // 损坏 meta 跳过，不入队
+    };
+    if meta.state != "complete" {
+        return false;
+    }
+    let Ok(rd) = std::fs::read_dir(note_dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("wav") {
+            if let Ok(m) = std::fs::metadata(&path) {
+                if m.len() > 44 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 声纹库种子导出：app_data_dir/voiceprints.json → 每个"有效"人物（经 resolve 校验，
@@ -107,7 +164,7 @@ fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
 /// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
 /// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
 fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
-    let Ok(root) = app.path().app_data_dir() else {
+    let Ok(root) = data_root(app) else {
         eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
         return Vec::new();
     };
@@ -169,6 +226,39 @@ fn sense_voice_dir() -> PathBuf {
     models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
 
+fn whisper_dir() -> PathBuf {
+    models::root().join("sherpa-onnx-whisper-base")
+}
+
+/// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
+/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
+fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+    if asr_model == settings::ASR_WHISPER {
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir())?) as Box<dyn asr::Recognizer>)
+    } else {
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir())?) as Box<dyn asr::Recognizer>)
+    }
+}
+
+/// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
+/// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
+fn current_asr(app: &AppHandle) -> String {
+    match app.path().app_data_dir() {
+        Ok(d) => settings::load(&d).asr_model,
+        Err(_) => settings::ASR_SENSE_VOICE.into(),
+    }
+}
+
+/// 默认下载集：遍历 ARTIFACTS 保序收集「当前选型录制必需」或声纹（speaker，增值但默认装）。
+/// 与旧行为等价：vad + 选中 ASR + speaker。download_models 的 None 分支用它。
+fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
+    models::ARTIFACTS
+        .iter()
+        .filter(|a| models::required_now(a.id, asr_model) || a.id == "speaker")
+        .map(|a| a.id)
+        .collect()
+}
+
 fn speaker_model_path() -> PathBuf {
     models::root().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
@@ -206,6 +296,7 @@ fn spawn_session(
     session_slot: Arc<Mutex<Option<ActiveSession>>>,
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    transcode: Arc<store::transcode::TranscodeQueue>,
     target: NoteTarget,
 ) -> Result<(), String> {
     let my_gen = {
@@ -245,8 +336,8 @@ fn spawn_session(
         let taken = recognizer_cache.lock().unwrap().take();
         let recognizer = match taken {
             Some(r) => r,
-            None => match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
+            None => match new_recognizer(&current_asr(&app)) {
+                Ok(r) => r,
                 Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
             },
         };
@@ -310,6 +401,19 @@ fn spawn_session(
             }
         };
         let note_id = writer.lock().unwrap().note_id().to_string();
+        // 续录前把该目录的音频解回 WAV，供本场从尾部对齐续写。必须先 cancel_and_wait：
+        // 若转码 worker 此刻正把本目录的 wav 压成 m4a，解码会与它撞文件，故先摘队列 +
+        // 阻塞等 in-flight 转完。锁序纪律：本调用点在加载线程、不持任何全局锁
+        //（running/generation/session_slot 均未持有），符合「持全局锁时绝不调
+        // cancel_and_wait 这类阻塞方法」。decode_note_to_wav 内部失败已降级打日志，无需包错。
+        // 解码先行(在建 AudioTrackWriter 之前)：建档时要按既有 WAV 尾部长度对既有轨道做
+        // 截断/零填充对齐，故必须先把已压缩音频解回 WAV。base_ms 本身来自 segments 时间轴
+        //（下方 writer.base_ms()），与解码顺序无关。
+        if let NoteTarget::Resume(_) = &target {
+            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            transcode.cancel_and_wait(&note_dir);
+            store::transcode::decode_note_to_wav(&note_dir);
+        }
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.lock().unwrap().base_ms();
@@ -330,7 +434,7 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
-        let vp_store_d: Option<store::VoiceprintStore> = match app.path().app_data_dir() {
+        let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
             Ok(root) => Some(store::VoiceprintStore::new(root)),
             Err(e) => {
                 eprintln!("声纹库路径不可用，本场停止时的库回写将被跳过（不影响笔记落盘）: {e}");
@@ -590,8 +694,13 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    if !models::recording_ready() {
-        return Err("模型缺失：请先在录制页下载模型".into());
+    // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
+    // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("正在迁移或下载,稍后再试".into());
+    }
+    if !models::recording_ready(&current_asr(&app)) {
+        return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
         app,
@@ -600,6 +709,7 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         state.session.clone(),
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
+        state.transcode.clone(),
         NoteTarget::New,
     )
 }
@@ -608,8 +718,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
-    if !models::recording_ready() {
-        return Err("模型缺失：请先在录制页下载模型".into());
+    // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("正在迁移或下载,稍后再试".into());
+    }
+    if !models::recording_ready(&current_asr(&app)) {
+        return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
         app,
@@ -618,6 +732,7 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         state.session.clone(),
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
+        state.transcode.clone(),
         NoteTarget::Resume(note_id),
     )
 }
@@ -646,9 +761,21 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
             let _ = j.join();
         }
         note_id = s.note_id;
-        if let Err(e) = s.writer.lock().unwrap().finalize(chrono::Local::now()) {
-            eprintln!("stop_recording: finalize 失败: {e}");
-            let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+        // finalize 前在 writer 锁内克隆 note_dir，供 finalize 成功后入队转码。
+        let mut w = s.writer.lock().unwrap();
+        let note_dir = w.dir().to_path_buf();
+        let finalized = w.finalize(chrono::Local::now());
+        drop(w);
+        match finalized {
+            Ok(()) => {
+                // 仅 finalize 成功（state=complete、meta 落盘）才入队。enqueue 是 O(1)
+                // 非阻塞且走转码队列自己的叶子锁——此处不持任何全局锁，安全。
+                state.transcode.enqueue(note_dir);
+            }
+            Err(e) => {
+                eprintln!("stop_recording: finalize 失败: {e}");
+                let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+            }
         }
     }
     let _ = app.emit(
@@ -656,7 +783,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
-    preload_models(state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
 
 /// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
@@ -888,11 +1015,10 @@ fn export_note(app: AppHandle, id: String, format: String) -> Result<String, Str
         .map_err(|e| e.to_string())
 }
 
-/// 声纹库四命令共用：打开 app_data_dir 根下的 VoiceprintStore（与逐场笔记目录并列，
+/// 声纹库四命令共用：打开 data_root 下的 VoiceprintStore（与逐场笔记目录并列，
 /// 不是 notes_dir 的子目录）。
 fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, String> {
-    app.path()
-        .app_data_dir()
+    data_root(app)
         .map(store::VoiceprintStore::new)
         .map_err(|e| e.to_string())
 }
@@ -961,6 +1087,7 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
 /// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
 /// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
 fn preload_models(
+    app: AppHandle,
     session: Arc<Mutex<Option<ActiveSession>>>,
     cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
@@ -974,10 +1101,12 @@ fn preload_models(
             eprintln!("预载跳过：录制会话进行中，停止后自动补载");
             return;
         }
+        // 按当前选型预载（session 锁已放，此处才读设置：叶子锁纪律不变）。
+        let asr_model = current_asr(&app);
         let mut slot = cache.lock().unwrap();
         if slot.is_none() {
-            match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
+            match new_recognizer(&asr_model) {
+                Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
         }
@@ -994,12 +1123,12 @@ fn preload_models(
 }
 
 #[tauri::command]
-fn models_status() -> models::ModelsStatus {
-    models::status()
+fn models_status(app: AppHandle) -> models::ModelsStatus {
+    models::status(&current_asr(&app))
 }
 
 #[tauri::command]
-fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<String>>) -> Result<(), String> {
     if state.download_running.swap(true, Ordering::SeqCst) {
         return Err("下载已在进行中".into());
     }
@@ -1019,6 +1148,18 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
             .app_data_dir()
             .map(|d| settings::load(&d))
             .unwrap_or_default();
+        // 要下载的工件:显式 ids → 按 id 过滤;None → 按当前选型默认集(vad+选中 ASR+speaker)。
+        // 两者都保 ARTIFACTS 原顺序(过滤而非按传入顺序),下载/进度次序稳定。
+        let want: Vec<&str> = match &ids {
+            Some(ids) => ids.iter().map(|s| s.as_str()).collect(),
+            None => default_download_ids(&s.asr_model),
+        };
+        let selected: Vec<&models::Artifact> = models::ARTIFACTS
+            .iter()
+            .filter(|a| want.iter().any(|w| *w == a.id))
+            .collect();
+        // preload 需要 app,但 app 随即被 emit 闭包 move 走,先克隆一份留给补预载。
+        let app_pl = app.clone();
         let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
             let _ = app.emit(
                 "model_download",
@@ -1032,7 +1173,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
             );
         };
         let mut all_ok = true;
-        for a in models::ARTIFACTS {
+        for a in selected {
             if models::artifact_present(&root, a) {
                 continue;
             }
@@ -1049,7 +1190,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
         if all_ok {
             emit("all", "done", 0, 0, "");
             // 补齐后立即预载，无需重启即可开录。
-            preload_models(session, recognizer_cache, embedder_cache);
+            preload_models(app_pl, session, recognizer_cache, embedder_cache);
         }
     });
     Ok(())
@@ -1060,44 +1201,295 @@ fn cancel_models_download(state: State<AppState>) {
     state.download_cancel.store(true, Ordering::SeqCst);
 }
 
+/// 删除单个模型工件（设置页管理用）。守卫:录制中删会与常驻槽在用实例互踩、下载中删会
+/// 与写盘线程撞文件,一律拒绝。File → 删单文件;TarBz2 → 删整个 dest_dir 目录。删完清掉
+/// 对应常驻槽（asr/whisper 清识别器、speaker 清嵌入器）,否则删了盘上文件、槽里旧实例
+/// 还在,下次开录仍拿旧模型转写,状态与磁盘不一致。清槽是叶子锁单独持有,不与 session 锁嵌套。
+#[tauri::command]
+fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    // _app: root 走 models::root() 无需它,但保留形参与其它模型命令签名一致(Tauri 按类型注入)。
+    // 查 running 而非 session 槽:开录命令同步置 running 后即返回,session 槽要数秒后才置
+    // Some;查槽会在这段加载窗口误判"空闲",删掉正在被常驻实例/写盘用的模型。running
+    // statement-scoped,查完即放。
+    if *state.running.lock().unwrap() {
+        return Err("录制中不能删除模型".into());
+    }
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("下载进行中，稍后再试".into());
+    }
+    let a = models::ARTIFACTS
+        .iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("未知模型: {id}"))?;
+    let root = models::root();
+    match &a.kind {
+        models::ArtifactKind::File => {
+            let p = root.join(a.files[0].rel_path);
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(|e| format!("删除失败: {e}"))?;
+            }
+        }
+        models::ArtifactKind::TarBz2 { dest_dir } => {
+            let p = root.join(dest_dir);
+            if p.exists() {
+                std::fs::remove_dir_all(&p).map_err(|e| format!("删除失败: {e}"))?;
+            }
+        }
+    }
+    // 叶子锁单独持有,不与其它锁嵌套。
+    match id.as_str() {
+        "asr" | "whisper" => *state.recognizer_cache.lock().unwrap() = None,
+        "speaker" => *state.embedder_cache.lock().unwrap() = None,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
     app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, new_settings: settings::Settings) -> Result<(), String> {
+fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::Settings) -> Result<(), String> {
     let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    settings::save(&d, &new_settings).map_err(|e| e.to_string())
+    let old = settings::load(&d);
+    // 存储目录（data_dir/models_dir）不走普通设置保存:改它涉及既有数据/模型的搬迁,
+    // 必须经专门的迁移功能（负责移动文件 + 重设 override），这里直接拒绝防止指针漂移
+    // 而数据不动导致"找不到笔记/模型"。
+    if old.data_dir != new_settings.data_dir || old.models_dir != new_settings.models_dir {
+        return Err("存储目录变更请使用迁移功能".into());
+    }
+    // ASR 选型变更:录制中切换会让常驻识别器与正在转写的会话对不上,拒绝;无会话则
+    // save 后清掉旧选型的常驻识别器、按新选型重载,无需重启即可用新模型开录。
+    // 查 running 而非 session 槽:同 delete_model,开录命令返回后 session 槽尚空的加载
+    // 窗口里切型会与即将取用的常驻识别器对不上。statement-scoped。
+    let asr_changed = old.asr_model != new_settings.asr_model;
+    if asr_changed && *state.running.lock().unwrap() {
+        return Err("录制中不能切换识别模型".into());
+    }
+    // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
+    //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
+    // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
+    settings::update(&d, |s| {
+        let data_dir = s.data_dir.clone();
+        let models_dir = s.models_dir.clone();
+        *s = new_settings;
+        s.data_dir = data_dir;
+        s.models_dir = models_dir;
+    }).map_err(|e| e.to_string())?;
+    if asr_changed {
+        *state.recognizer_cache.lock().unwrap() = None;
+        preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    }
+    Ok(())
+}
+
+/// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
+/// 都必然 unpause——否则一次迁移失败后转码永久静止,只能重启应用。与 ResetOnDrop
+/// （复位 download_running 互斥位）配套:两者一起挂在迁移线程头部,兜住所有退出路径。
+struct UnpauseOnDrop(Arc<store::transcode::TranscodeQueue>);
+impl Drop for UnpauseOnDrop {
+    fn drop(&mut self) {
+        self.0.unpause();
+    }
+}
+
+/// 迁移前置互斥守卫(两迁移命令共用):先抢下载/迁移互斥位(download_running),
+/// 再查录制中(running)。判"录制中"必须查 running 而非 session 槽:spawn_session 在
+/// 命令线程同步置 running=true 并即返回,而 session 槽要到加载线程数秒后才置 Some
+///(续录还要先解码,窗口最宽)。若这里查 session.is_some(),那段加载窗口内发起的迁移
+/// 会误判"空闲",把正在写的旧 notes 根删掉、吞掉录音。查 running 则开录命令一返回就已
+/// 挡住迁移。
+///
+/// 「先 swap download 再查 running」的次序与 start_recording 的「先查 download 再置
+/// running」是对称闭合的:migrate 抢先 swap download → start 的 download 检查必拒;
+/// start 抢先置 running → 本函数的 running 检查必拒。两侧各自的 check-then-act 交错窗口
+/// 被压到两条原子/加锁语句之间的微秒级(start 读到 download==false 之后、置 running
+/// 之前,恰被本函数插入并放行,是残留的微秒级同时放行窗口)——记为已知取舍,个人工具
+/// 可接受。running 锁 statement-scoped,查完即放,不与其它锁嵌套(遵守文件顶部锁序)。
+fn migrate_guard(running: &Arc<Mutex<bool>>, download_running: &Arc<AtomicBool>) -> Result<(), String> {
+    // 先抢互斥位(与 start 的 download 检查对称)。
+    if download_running.swap(true, Ordering::SeqCst) {
+        return Err("迁移或下载进行中".into());
+    }
+    // 再查录制中;拒绝时必须复位刚抢下的互斥位,否则迁移互斥位永久卡死。
+    if *running.lock().unwrap() {
+        download_running.store(false, Ordering::SeqCst);
+        return Err("录制中不能迁移".into());
+    }
+    Ok(())
+}
+
+/// 数据目录迁移:把 data_root 下的笔记/声纹整树搬到 new_dir。时序是「复制→校验→
+/// **写指针**→删旧」:settings.data_dir 写入是提交点,提交前任何失败都清理新目录、
+/// 旧数据与旧指针完好可重试;提交后删旧只是垃圾回收,失败不算迁移失败——消灭
+/// 「数据在新处、指针指旧处」的崩溃窗口。守卫只做同步检查与 spawn,搬运/
+/// pause_and_wait 全在后台线程——绝不在命令线程(可能持 Tauri 内部锁)里跑阻塞搬运。
+#[tauri::command]
+fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
+    // 守卫一:目标目录必须不存在或为空(不覆盖用户既有内容),且与当前根互不包含
+    //(嵌套会自拷/删旧连带删新)。旧根解析失败直接拒绝。全是只读检查,放在抢互斥位
+    // 之前,失败无需复位。
+    let new_path = PathBuf::from(&new_dir);
+    store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    let old_root = data_root(&app).map_err(|e| e.to_string())?;
+    store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
+    // 守卫二:抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
+    migrate_guard(&state.running, &state.download_running)?;
+    let running = state.download_running.clone();
+    let transcode = state.transcode.clone();
+    std::thread::spawn(move || {
+        // 两道 RAII:先复位互斥位(ResetOnDrop),再 unpause(UnpauseOnDrop)。Drop 逆序:
+        // 先 unpause 再复位 running,顺序无碍,关键是两者都必然发生(含 panic 展开)。
+        let _reset = ResetOnDrop(running);
+        // pause_and_wait 会阻塞等 in-flight 转码——只在后台线程调,命令线程绝不调。
+        transcode.pause_and_wait();
+        let _unpause = UnpauseOnDrop(transcode.clone());
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "copying".into(), message: String::new() });
+        let emit_err = |app: &AppHandle, msg: String| {
+            let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "error".into(), message: msg });
+        };
+        let entries: &[&str] = &["notes", "voiceprints.json", "voiceprints"];
+        // 第一步:复制+校验(失败已自清新目录,旧数据未动)。
+        if let Err(e) = store::migrate::copy_and_verify_entries(&old_root, &new_path, entries) {
+            return emit_err(&app, format!("{e:#}"));
+        }
+        // 第二步(提交点):读-改-写 settings(永在 app_data_dir,不随 data_dir 漂移)。
+        // 失败 → 迁移未提交:清理新目录残留(保证可原地重试),旧数据与旧指针完好。
+        let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+            // update 锁内 load→改→save:与并发的镜像/asr 写入串行,防指针提交被旧快照覆盖。
+            settings::update(&d, |s| s.data_dir = Some(new_dir.clone()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = saved {
+            store::migrate::cleanup_copied_entries(&new_path, entries);
+            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+        }
+        // 自定义目录落在 asset:// 默认作用域外,放行整棵子树供详情页音频播放。
+        // 失败只降级打日志(音频可能无法播放,但迁移已提交)。
+        if let Err(e) = app.asset_protocol_scope().allow_directory(&new_path, true) {
+            eprintln!("asset 作用域放行新 data 目录失败(音频可能无法播放): {e}");
+        }
+        // 第三步(提交后垃圾回收):删旧。内部失败只打日志,不影响迁移成立。
+        store::migrate::remove_old_entries(&old_root, entries);
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "done".into(), message: String::new() });
+    });
+    Ok(())
+}
+
+/// 模型目录迁移:同构于 migrate_data_dir(复制→校验→写指针→删旧,指针写入是提交点),
+/// 搬 models::root() 顶层全部条目(含断点续传分片,整树搬最诚实),提交 = settings.models_dir
+/// 保存 + models::set_models_override 重设。
+#[tauri::command]
+fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
+    // 比 data 多一道守卫:VN_MODELS 环境变量置顶于 models::root() 的解析顺序,此时改
+    // settings.models_dir 也不生效,迁了等于白迁,直接拒绝并提示先移除环境变量。
+    if let Ok(v) = std::env::var("VN_MODELS") {
+        if !v.is_empty() {
+            return Err("VN_MODELS 环境变量生效中,请先移除再迁移".into());
+        }
+    }
+    let new_path = PathBuf::from(&new_dir);
+    store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    let old_root = models::root();
+    // 嵌套守卫同 data:目标与当前模型根互不包含。以上皆只读检查,失败无需复位。
+    store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
+    // 抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
+    migrate_guard(&state.running, &state.download_running)?;
+    // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
+    let entries: Vec<String> = std::fs::read_dir(&old_root)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let running = state.download_running.clone();
+    let transcode = state.transcode.clone();
+    std::thread::spawn(move || {
+        let _reset = ResetOnDrop(running);
+        transcode.pause_and_wait();
+        let _unpause = UnpauseOnDrop(transcode.clone());
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "copying".into(), message: String::new() });
+        let emit_err = |app: &AppHandle, msg: String| {
+            let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "error".into(), message: msg });
+        };
+        let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        // 第一步:复制+校验(失败已自清新目录,旧模型未动)。
+        if let Err(e) = store::migrate::copy_and_verify_entries(&old_root, &new_path, &entry_refs) {
+            return emit_err(&app, format!("{e:#}"));
+        }
+        // 第二步(提交点):settings.models_dir 保存;失败清理新目录残留,旧指针完好可重试。
+        let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+            // update 锁内 load→改→save:与并发的镜像/asr 写入串行,防指针提交被旧快照覆盖。
+            settings::update(&d, |s| s.models_dir = Some(new_dir.clone()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = saved {
+            store::migrate::cleanup_copied_entries(&new_path, &entry_refs);
+            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+        }
+        // 提交生效:立即重设 override,后续 models::root() 即指向新处,无需重启。
+        models::set_models_override(Some(new_path.clone()));
+        // 第三步(提交后垃圾回收):删旧。内部失败只打日志,不影响迁移成立。
+        store::migrate::remove_old_entries(&old_root, &entry_refs);
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "done".into(), message: String::new() });
+    });
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .setup(|app| {
-            // 生产模型根目录注入（VN_MODELS / dev 目录优先级更高，见 models::root）。
-            if let Ok(dir) = app.path().app_data_dir() {
+            let handle = app.handle().clone();
+            // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
+            let app_data = handle.path().app_data_dir().ok();
+            let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
+            // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
+            // 必须先于 models::root() 的任何使用。
+            models::set_models_override(s.models_dir.clone().map(PathBuf::from));
+            // 生产模型根目录注入（VN_MODELS / override / dev 目录优先级更高，见 models::root）。
+            if let Some(dir) = &app_data {
                 let models_dir = dir.join("models");
                 let _ = std::fs::create_dir_all(&models_dir);
                 models::init_app_root(models_dir);
             }
             models::download::sweep_tmp(&models::root());
-            // 启动修复陈旧 WAV 头(硬崩后头尺寸落后于数据,播放端看不到尾段)。
-            // 放在 setup 同步做:此刻必无录制会话,与写盘线程零竞态;逐笔记 44 字节
-            // 头校验,仅陈旧才回写,量级毫秒。
-            if let Ok(dir) = app.path().app_data_dir() {
-                if let Ok(rd) = std::fs::read_dir(dir.join("notes")) {
-                    for e in rd.flatten() {
-                        if e.path().is_dir() {
-                            store::audio::repair_stale_tracks(&e.path());
+
+            let st = app.state::<AppState>();
+            match data_root(&handle) {
+                Ok(root) => {
+                    // 自定义 data_dir(非默认 app_data_dir)落在 asset:// 默认作用域之外,
+                    // 详情页音频播放会被 scope 拦掉——显式放行整棵子树。失败只 eprintln
+                    // 降级(自定义目录音频可能无法播放,但绝不挡启动/录制)。
+                    if app_data.as_deref() != Some(root.as_path()) {
+                        if let Err(e) = app.asset_protocol_scope().allow_directory(&root, true) {
+                            eprintln!("asset 作用域放行 data_root 失败(自定义目录音频可能无法播放): {e}");
+                        }
+                    }
+                    // 启动扫描 data_root/notes:①修复陈旧 WAV 头(硬崩后头尺寸落后于数据,
+                    // 播放端看不到尾段);②对已 complete 且有真实 wav 的笔记入队转码(上次
+                    // 没转完 / 新迁入的历史 WAV)。此刻必无录制会话,与写盘线程零竞态。
+                    if let Ok(rd) = std::fs::read_dir(root.join("notes")) {
+                        for e in rd.flatten() {
+                            if e.path().is_dir() {
+                                store::audio::repair_stale_tracks(&e.path());
+                                if should_enqueue_transcode(&e.path()) {
+                                    st.transcode.enqueue(e.path());
+                                }
+                            }
                         }
                     }
                 }
+                Err(e) => eprintln!("data_root 解析失败,跳过启动扫描/转码回溯(不影响录制): {e}"),
             }
-            let st = app.state::<AppState>();
-            preload_models(st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
+            // 转码 worker 常驻:录制中让路,空闲时串行消费队列(启动回溯 + 后续停录入队)。
+            st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
+
+            preload_models(handle.clone(), st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1120,8 +1512,11 @@ pub fn run() {
             models_status,
             download_models,
             cancel_models_download,
+            delete_model,
             get_settings,
             set_settings,
+            migrate_data_dir,
+            migrate_models_dir,
             list_people,
             rename_person,
             merge_person,
@@ -1144,6 +1539,53 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    #[test]
+    fn should_enqueue_only_complete_notes_with_wav() {
+        use super::should_enqueue_transcode;
+        let tmp = tempfile::tempdir().unwrap();
+        // 无 meta → 否
+        assert!(!should_enqueue_transcode(tmp.path()));
+        let meta = |state: &str| format!(
+            r#"{{"schema_version":1,"id":"n","title":"t","started_at":"","ended_at":null,"state":"{state}"}}"#);
+        std::fs::write(tmp.path().join("meta.json"), meta("recording")).unwrap();
+        std::fs::write(tmp.path().join("mic.wav"), vec![0u8; 100]).unwrap();
+        assert!(!should_enqueue_transcode(tmp.path()), "已中断可续录,不转码");
+        std::fs::write(tmp.path().join("meta.json"), meta("complete")).unwrap();
+        assert!(should_enqueue_transcode(tmp.path()));
+        std::fs::remove_file(tmp.path().join("mic.wav")).unwrap();
+        assert!(!should_enqueue_transcode(tmp.path()), "无 wav 无事可做");
+    }
+
+    #[test]
+    fn download_selection_defaults_to_required_plus_speaker() {
+        use super::default_download_ids;
+        let ids = default_download_ids("sense_voice");
+        assert_eq!(ids, vec!["vad", "speaker", "asr"]);
+        let ids = default_download_ids("whisper");
+        assert_eq!(ids, vec!["vad", "speaker", "whisper"]);
+    }
+
+    #[test]
+    fn migrate_guard_rejects_recording_and_download() {
+        use super::migrate_guard;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        // running=true → 拒,且必须复位刚抢下的互斥位(否则迁移互斥位永久卡死)。
+        let running = Arc::new(Mutex::new(true));
+        let dl = Arc::new(AtomicBool::new(false));
+        assert!(migrate_guard(&running, &dl).is_err(), "录制中拒绝");
+        assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        // download_running 已 true(下载/另一迁移在跑）→ 拒。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(true));
+        assert!(migrate_guard(&running, &dl).is_err(), "下载/迁移进行中拒绝");
+        // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(false));
+        assert!(migrate_guard(&running, &dl).is_ok(), "空闲放行");
+        assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
     }
 
     #[test]
