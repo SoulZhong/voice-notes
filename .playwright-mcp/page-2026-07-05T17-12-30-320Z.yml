@@ -1,0 +1,20 @@
+- generic [ref=f9e3]:
+  - complementary [ref=f9e4]:
+    - navigation [ref=f9e5]:
+      - button "录音记录" [ref=f9e6] [cursor=pointer]
+      - button "声纹库" [ref=f9e7] [cursor=pointer]
+    - generic [ref=f9e8]:
+      - button "开始录制" [ref=f9e9] [cursor=pointer]: 开始录制
+      - searchbox "按标题过滤…" [ref=f9e11]
+      - generic [ref=f9e12]: "加载失败: TypeError: Cannot read properties of undefined (reading 'invoke')"
+      - paragraph [ref=f9e13]: 还没有笔记
+      - list [ref=f9e14]
+      - navigation [ref=f9e15]:
+        - link "设置" [ref=f9e16] [cursor=pointer]:
+          - /url: /settings
+          - img [ref=f9e17]
+          - text: 设置
+  - main [ref=f9e20]:
+    - generic [ref=f9e21]:
+      - paragraph [ref=f9e22]: 还没有会议笔记。
+      - paragraph [ref=f9e23]: 点击左上角「● 开始录制」来第一场。

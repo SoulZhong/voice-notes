@@ -5,6 +5,7 @@ mod ipc;
 pub mod models;
 mod session;
 mod settings;
+mod shortcuts;
 mod store;
 pub mod diar;
 
@@ -753,18 +754,21 @@ fn spawn_session(
     Ok(())
 }
 
-#[tauri::command]
-fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 开录共用实现(命令壳、快捷键共用):守卫 + spawn_session。逐语句搬自原
+/// start_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
+/// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
+fn do_start_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
     // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(&app)) {
+    if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
-        app,
+        app.clone(),
         state.running.clone(),
         state.generation.clone(),
         state.session.clone(),
@@ -773,6 +777,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         state.transcode.clone(),
         NoteTarget::New,
     )
+}
+
+#[tauri::command]
+fn start_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("start_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_start_recording(&app)
 }
 
 /// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
@@ -798,8 +808,11 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     )
 }
 
-#[tauri::command]
-fn stop_recording(app: AppHandle, state: State<AppState>) {
+/// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取、末尾 preload_models 的 app 因签名为 &AppHandle 而
+/// clone——逻辑零变化(含全部锁序注释)。
+fn do_stop_recording(app: &AppHandle) {
+    let state = app.state::<AppState>();
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
     // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
     // capture → flush 尾段 → 排干 finals → join）。递增 generation 让任何仍在
@@ -844,7 +857,25 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
-    preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+}
+
+#[tauri::command]
+fn stop_recording(app: AppHandle) {
+    // 薄壳:前端 invoke("stop_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_stop_recording(&app)
+}
+
+/// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
+/// 没有 UI 上下文,错误无处弹窗(设置缺失/模型未就绪等),静默进日志避免打断用户。
+/// running 读取用 statement-scoped 的锁,读完即放,不与 do_* 内部锁嵌套。
+pub(crate) fn toggle_recording(app: &AppHandle) {
+    let running = *app.state::<AppState>().running.lock().unwrap();
+    if running {
+        do_stop_recording(app);
+    } else if let Err(e) = do_start_recording(app) {
+        eprintln!("快捷键触发开录失败(静默进日志): {e}");
+    }
 }
 
 /// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
@@ -1548,6 +1579,20 @@ fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u
     Ok(freed)
 }
 
+/// 设置页保存快捷键后调用:按最新设置(重)注册。失败时把 shortcut_enabled 写回 false
+/// (S9 之前后端自洽的"注册失败回落关":坏快捷键不会残留开启态、下次启动反复失败),再把
+/// 原始中文错误上抛给设置页提示用户。回落写盘失败不掩盖原错误,仍返回注册失败原因。
+#[tauri::command]
+fn apply_shortcut(app: AppHandle) -> Result<(), String> {
+    if let Err(e) = shortcuts::apply_from_settings(&app) {
+        if let Ok(d) = app.path().app_data_dir() {
+            let _ = settings::update(&d, |s| s.shortcut_enabled = false);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1559,10 +1604,7 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|_app, _shortcut, _event| {
-                    // 空实现占位：Task 7 接入实际快捷键分发（shortcuts::on_shortcut），
-                    // 本任务只负责插件接线。
-                })
+                .with_handler(shortcuts::on_shortcut)
                 .build(),
         )
         .manage(AppState::default())
@@ -1613,6 +1655,11 @@ pub fn run() {
             st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
 
             preload_models(handle.clone(), st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
+            // 依设置注册全局快捷键;坏快捷键(格式错/与系统冲突)绝不挡启动,仅 eprintln。
+            // 与设置页保存路径(apply_shortcut,失败上抛并回落关)是两个消费点。
+            if let Err(e) = shortcuts::apply_from_settings(&handle) {
+                eprintln!("全局快捷键注册失败(不影响启动): {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1638,6 +1685,7 @@ pub fn run() {
             delete_model,
             get_settings,
             set_settings,
+            apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,
             audio_disk_usage,

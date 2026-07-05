@@ -1,0 +1,29 @@
+- generic [ref=f10e3]:
+  - complementary [ref=f10e4]:
+    - navigation [ref=f10e5]:
+      - button "录音记录" [ref=f10e6] [cursor=pointer]
+      - button "声纹库" [ref=f10e7] [cursor=pointer]
+    - generic [ref=f10e8]:
+      - button "开始录制" [ref=f10e9] [cursor=pointer]: 开始录制
+      - generic [ref=f10e11]: "加载失败: TypeError: Cannot read properties of undefined (reading 'invoke')"
+      - list [ref=f10e12]
+      - navigation [ref=f10e13]:
+        - link "设置" [ref=f10e14] [cursor=pointer]:
+          - /url: /settings
+          - img [ref=f10e15]
+          - text: 设置
+  - main [ref=f10e18]:
+    - main [ref=f10e19]:
+      - heading "声纹库" [level=1] [ref=f10e20]
+      - paragraph [ref=f10e21]:
+        - text: 录到的说话人会自动登记。给"未命名"的人
+        - strong [ref=f10e22]: 命名
+        - text: 后,之后的录制会自动认出他并直接显示名字; 认错拆重了就用
+        - strong [ref=f10e23]: 合并
+        - text: 归到同一个人。点
+        - strong [ref=f10e24]: 试听
+        - text: 可以听一段他的原声确认是谁。
+      - generic [ref=f10e25]: "加载失败: TypeError: Cannot read properties of undefined (reading 'invoke')"
+      - generic [ref=f10e26]:
+        - paragraph [ref=f10e27]: 还没有说话人。
+        - paragraph [ref=f10e28]: 录一场会议(单人说话累计满 10 秒),停止后会自动出现在这里。
