@@ -1199,8 +1199,8 @@ mod asr_worker_tests {
             }
         }
         let script = vec![
-            Transcript { text: "でかし".into(), lang: "<|ja|>".into() },
-            Transcript { text: "正常句子".into(), lang: "<|zh|>".into() },
+            Transcript { text: "でかし".into(), lang: "<|ja|>".into(), ..Default::default() },
+            Transcript { text: "正常句子".into(), lang: "<|zh|>".into(), ..Default::default() },
         ];
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
         tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 0, end_ms: 100 }).unwrap();
