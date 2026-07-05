@@ -14,8 +14,11 @@ use crate::store::audio::{
     bytes_to_ms, clear_track_compressed, load_audio_meta, repair_wav_header, set_track_compressed,
     wav_header, HEADER_LEN,
 };
-use std::path::Path;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// afconvert(m4af/aac/32kbps)与源 WAV 的时长可能有几十毫秒的编码器边界差,
 /// 用它做「编码后时长 ≈ 编码前时长」的收敛校验,超差即判失败、留住 WAV。
@@ -242,6 +245,185 @@ fn extract_wav_data(path: &Path) -> anyhow::Result<Vec<u8>> {
         pos = start.saturating_add(size).saturating_add(size & 1);
     }
     anyhow::bail!("WAV 无 data 块: {}", path.display())
+}
+
+/// 受锁保护的队列状态。三者必须一起改、一起看,所以塞进同一个 `Mutex`:
+/// - `queue`:待转码的笔记目录(FIFO);
+/// - `current`:worker 此刻正在转的目录(放锁后转码期间一直挂着,供 cancel/pause 观测);
+/// - `paused`:迁移期间置真,worker 见真就不出队(让底层目录静止,不被转码改写)。
+struct QState {
+    queue: VecDeque<PathBuf>,
+    current: Option<PathBuf>,
+    paused: bool,
+}
+
+/// 全局串行转码队列:整个进程只有一个 worker 线程按序转码,永不并发跑 afconvert。
+///
+/// 为什么要队列而不是「停录就地转」:转一笔要跑数秒的 afconvert 子进程,若停录线程
+/// 内联转码,会阻塞停录返回;多笔记接连停录还会叠着跑、抢 CPU。改为入队 + 单 worker
+/// 串行消费:停录只是 O(1) 入队即返回,转码在后台一笔接一笔。
+///
+/// 为什么 `Mutex<QState>` + `Condvar` 而不是 channel:本队列不是纯生产者-消费者,
+/// 还要支持「摘除某个待转项」「等某个 in-flight 转完」「暂停并等排空」这些需要审视/
+/// 修改队列内部状态的操作,channel 的黑盒 FIFO 做不到。Condvar 让 worker 空闲时挂起、
+/// 有活时被 `notify` 唤醒,不空转烧 CPU。
+///
+/// 锁协议(全类型统一遵守,避免死锁/丢唤醒):
+/// - 任何读写 `queue`/`current`/`paused` 都必须先拿 `state` 锁;
+/// - 任何**改变**这三者的路径,改完都要 `cv.notify_all()`,否则等在 cv 上的
+///   cancel/pause/worker 可能永久错过这次状态变化(丢唤醒);
+/// - 所有 `cv.wait` 都套在「重新检查条件」的循环里(worker 是外层 `loop`,cancel/pause
+///   是 `while`),因为 Condvar 允许虚假唤醒 + 唤醒后条件可能已被别人改回;
+/// - **绝不持 `state` 锁调 `process`**:afconvert 要跑数秒,若持锁转码,这数秒内所有
+///   enqueue/cancel_and_wait/pause_and_wait 全堵在锁上 —— 停录/续录直接卡死。故 worker
+///   取到队头、置好 `current` 后立刻放锁,再调 `process`。
+pub struct TranscodeQueue {
+    state: Mutex<QState>,
+    cv: Condvar,
+}
+
+#[allow(dead_code)] // Task 7 接线 lib.rs(spawn_worker 于启动;enqueue/cancel/pause 于停录/续录/迁移)后摘除
+impl TranscodeQueue {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(QState {
+                queue: VecDeque::new(),
+                current: None,
+                paused: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// 入队一个待转目录。去重:已在队列中、或正是 worker 此刻在转的 `current`,都跳过 ——
+    /// 同一目录重复转码是纯浪费(幂等但白跑一遍 afconvert),启动回溯扫描 + 停录可能对同
+    /// 一目录各入一次,这里挡住。改了队列就 `notify_all` 唤醒可能在等活的 worker。
+    pub fn enqueue(&self, note_dir: PathBuf) {
+        let mut st = self.state.lock().unwrap();
+        if st.current.as_deref() == Some(note_dir.as_path())
+            || st.queue.iter().any(|p| p == &note_dir)
+        {
+            return;
+        }
+        st.queue.push_back(note_dir);
+        self.cv.notify_all();
+    }
+
+    /// 续录某目录前调用:把它从队列摘掉,并阻塞到它「不再是 in-flight」为止。
+    /// 为什么必须等 in-flight:续录要把 m4a 解回 wav,若此刻 worker 正把该目录的 wav
+    /// 转成 m4a,两者会撞文件。摘队列 `retain` 处理「还没轮到」的情况;`while current==它`
+    /// 等 cv 处理「正在转」的情况 —— worker 转完清 `current` 会 `notify_all`,唤醒本等待。
+    pub fn cancel_and_wait(&self, note_dir: &Path) {
+        let mut st = self.state.lock().unwrap();
+        st.queue.retain(|p| p != note_dir);
+        // while 而非 if:虚假唤醒 + 每次唤醒都要重判 current 是否仍等于本目录。
+        while st.current.as_deref() == Some(note_dir) {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// 迁移前调用:置 `paused`(worker 从此不出队),并等 `current` 排空(等当前 in-flight
+    /// 转完)。迁移要挪动笔记根目录,必须先让转码彻底静止:既不能有新的开转,也不能有正在
+    /// 转的。返回后到 `unpause` 之间,worker 保证不碰任何目录。
+    pub fn pause_and_wait(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.paused = true;
+        // while:等到确实没有 in-flight;worker 清 current 时 notify_all 唤醒这里复查。
+        while st.current.is_some() {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// 迁移完成后解除暂停,并 `notify_all` 唤醒挂着等活的 worker,让它继续消费队列。
+    pub fn unpause(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.paused = false;
+        self.cv.notify_all();
+    }
+
+    /// 启动常驻 worker 线程,串行消费队列。`running` 传 AppState 的录制标志、`process`
+    /// 传 `transcode_note_dir`(测试传桩)—— 参数化是为了单测能用假处理函数验时序。
+    pub fn spawn_worker(self: &Arc<Self>, running: Arc<Mutex<bool>>, process: fn(&Path)) {
+        let me = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            // 录制中让路:转码要抢 CPU,录制阶段优先保采集不卡顿,所以录制中只 sleep 不出队。
+            // 用短睡眠轮询而非 cv:`running` 不归本锁管(是 AppState 的),没法在它变化时被
+            // notify;停录属低频事件,2s 的让路延迟无感。
+            if *running.lock().unwrap() {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            // 取一笔活:置好 current 后立刻放锁(块结束即解锁),再在锁外调 process。
+            let next = {
+                let mut st = me.state.lock().unwrap();
+                if st.paused || st.queue.is_empty() {
+                    // 无活可做:带 2s 超时挂起。超时是为了周期性回到外层重判 `running`
+                    //(它不受本 cv 管,只能靠超时轮询);被 enqueue/unpause 的 notify 提前
+                    // 唤醒则更及时。无论哪种唤醒,都 continue 回外层从头重判所有条件。
+                    let _ = me.cv.wait_timeout(st, Duration::from_secs(2)).unwrap();
+                    continue;
+                }
+                let dir = st.queue.pop_front().unwrap();
+                st.current = Some(dir.clone());
+                dir
+            }; // ← 锁在此释放:process 期间不持锁,enqueue/cancel/pause 可自由推进。
+            process(&next);
+            // 转完清 current 并唤醒:可能有 cancel_and_wait/pause_and_wait 正等这一刻。
+            let mut st = me.state.lock().unwrap();
+            st.current = None;
+            me.cv.notify_all();
+        });
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static PROCESSED: AtomicUsize = AtomicUsize::new(0);
+    fn slow_stub(_: &Path) {
+        PROCESSED.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn queue_dedups_pauses_and_cancel_waits_inflight() {
+        PROCESSED.store(0, Ordering::SeqCst);
+        let q = TranscodeQueue::new();
+        let running = Arc::new(Mutex::new(false));
+        q.spawn_worker(running.clone(), slow_stub);
+
+        let a = PathBuf::from("/tmp/note-a");
+        q.enqueue(a.clone());
+        q.enqueue(a.clone()); // 去重
+                              // 等 worker 拾起 a
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while PROCESSED.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "worker 未拾起任务");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // cancel_and_wait 必须阻塞到 in-flight 完成
+        let t0 = std::time::Instant::now();
+        q.cancel_and_wait(&a);
+        // 去重生效:只处理了一次
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(PROCESSED.load(Ordering::SeqCst), 1, "重复入队被去重");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(50), "等待了 in-flight");
+
+        // paused 期间不出队
+        q.pause_and_wait();
+        q.enqueue(PathBuf::from("/tmp/note-b"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(PROCESSED.load(Ordering::SeqCst), 1, "暂停期间不处理");
+        q.unpause();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while PROCESSED.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "恢复后应继续处理");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]
