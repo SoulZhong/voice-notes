@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
     renamePerson,
@@ -77,6 +78,7 @@
 
   async function doDelete(id: string) {
     confirmDeleteId = null;
+    if (samplePlayingId === id) stopSample();
     try {
       await deletePerson(id);
       await refresh();
@@ -84,6 +86,35 @@
       error = `删除失败: ${e}`;
     }
   }
+
+  // 录音样本试听:全页共享一个 Audio 实例,点击切换;换人先停上一个。
+  let sampleAudio: HTMLAudioElement | null = null;
+  let samplePlayingId = $state<string | null>(null);
+
+  function stopSample() {
+    sampleAudio?.pause();
+    sampleAudio = null;
+    samplePlayingId = null;
+  }
+
+  function toggleSample(p: PersonSummary) {
+    if (samplePlayingId === p.id) {
+      stopSample();
+      return;
+    }
+    stopSample();
+    if (!p.sample_path) return;
+    const a = new Audio(convertFileSrc(p.sample_path));
+    a.onended = () => {
+      if (samplePlayingId === p.id) stopSample();
+    };
+    sampleAudio = a;
+    samplePlayingId = p.id;
+    void a.play().catch(() => stopSample());
+  }
+
+  // 离开页面停播,不留幽灵声音。
+  $effect(() => stopSample);
 </script>
 
 <main class="container">
@@ -133,6 +164,11 @@
             </span>
           </div>
           <div class="actions">
+            {#if p.sample_path}
+              <button class="link" onclick={() => toggleSample(p)}>
+                {samplePlayingId === p.id ? "⏸ 停止" : "▶ 试听"}
+              </button>
+            {/if}
             {#if pendingMerge && pendingMerge.loser === p.id}
               {@const target = people.find((o) => o.id === pendingMerge?.winner)}
               <span class="confirm-text">

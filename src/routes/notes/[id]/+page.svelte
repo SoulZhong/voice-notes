@@ -16,10 +16,13 @@
     editSegment,
     deleteSegment,
     setSegmentSpeaker,
+    noteAudioInfo,
     type Note,
     type SegmentRecord,
+    type TrackInfo,
   } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import AudioPlayer from "$lib/AudioPlayer.svelte";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -33,6 +36,13 @@
   let speakerMenuSeq = $state<number | null>(null);
 
   const id = $derived($page.params.id as string);
+
+  // 音频播放:轨道列表 + 播放器时钟(高亮跟随)。录制中(含暂停)不显示播放器,
+  // 文件正在写,不做边写边播的半态。
+  let tracks = $state<TrackInfo[]>([]);
+  let player = $state<ReturnType<typeof AudioPlayer> | null>(null);
+  let playerMs = $state(0);
+  let playerPlaying = $state(false);
 
   /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
       按 (start_ms, seq) 升序,前端直接消费。 */
@@ -61,6 +71,12 @@
     } catch (e) {
       error = `加载失败: ${e}`;
     }
+    // 音频是增值层:取失败(旧笔记无音频/后端异常)静默按无轨道处理,不打扰主内容。
+    try {
+      tracks = canEdit ? await noteAudioInfo(id) : [];
+    } catch {
+      tracks = [];
+    }
   }
 
   // id 切换：无条件复位一切编辑态。
@@ -79,6 +95,34 @@
     exportMsg = "";
     refresh();
   });
+
+  /** 播放位置落在区间内的段(mic/system 可重叠,同帧可能多段)。 */
+  const activeSeqs = $derived.by(() => {
+    const s = new Set<number>();
+    if (tracks.length === 0) return s;
+    for (const seg of displaySegments) {
+      if (playerMs >= seg.start_ms && playerMs < seg.end_ms) s.add(seg.seq);
+    }
+    return s;
+  });
+
+  // 播放中自动跟随滚动到当前段(nearest:不打断用户往回翻看太远)。
+  let lastScrolledSeq = -1;
+  $effect(() => {
+    if (!playerPlaying) return;
+    const first = displaySegments.find((s) => activeSeqs.has(s.seq));
+    if (first && first.seq !== lastScrolledSeq) {
+      lastScrolledSeq = first.seq;
+      document
+        .querySelector(`[data-seq="${first.seq}"]`)
+        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
+
+  function playFrom(seg: SegmentRecord) {
+    player?.seek(seg.start_ms);
+    player?.play();
+  }
 
   function segFocus(s: SegmentRecord) {
     focusedSeq = s.seq;
@@ -212,6 +256,10 @@
       {#if exportMsg}<span class="hint">{exportMsg}</span>{/if}
     </div>
 
+    {#if canEdit && tracks.length > 0}
+      <AudioPlayer bind:this={player} {tracks} bind:currentMs={playerMs} bind:playing={playerPlaying} />
+    {/if}
+
     <SpeakerChips
       speakers={note.speakers}
       noteId={id}
@@ -224,7 +272,7 @@
 
     <div class="transcript">
       {#each displaySegments as seg (seg.seq)}
-        <div class="seg">
+        <div class="seg" class:playing={activeSeqs.has(seg.seq)} data-seq={seg.seq}>
           {#if canEdit && speakerMenuSeq === seg.seq}
             <span class="badge-menu">
               {#each speakerIds as sid (sid)}
@@ -246,7 +294,13 @@
               {speakerLabel(seg.speaker, seg.source, note.speakers)}
             </button>
           {/if}
-          <span class="ts">{formatTs(seg.start_ms)}</span>
+          {#if tracks.length > 0}
+            <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom(seg)}>
+              {formatTs(seg.start_ms)}
+            </button>
+          {:else}
+            <span class="ts">{formatTs(seg.start_ms)}</span>
+          {/if}
           {#if canEdit}
             <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
                  失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
@@ -370,6 +424,12 @@
   .seg {
     margin: 0 0 6px;
     line-height: 1.7;
+    border-radius: var(--radius-sm);
+    transition: background 120ms ease;
+  }
+  /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
+  .seg.playing {
+    background: var(--accent-tint);
   }
   .badge.as-btn {
     border: none;
@@ -455,6 +515,19 @@
     font-size: 0.8em;
     margin-right: 0.4em;
     font-variant-numeric: tabular-nums;
+  }
+  /* 时间戳按钮化(有音频时):无底无边,hover 变 accent 提示可点播 */
+  .ts-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    font-family: inherit;
+    border-radius: var(--radius-sm);
+  }
+  .ts-btn:hover {
+    color: var(--accent);
+    text-decoration: underline;
   }
   /* 已中断：沿用 warning 色系，与侧栏同款状态徽标一致 */
   .state.interrupted {
