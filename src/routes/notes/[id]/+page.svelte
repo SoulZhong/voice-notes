@@ -263,10 +263,34 @@
         </p>
       </div>
 
+      <!-- 图标按钮(冒烟反馈):16px 线性 SVG + currentColor,悬停 title 说明 -->
       <div class="row">
-        <button onclick={() => doExport("md")}>导出 Markdown</button>
-        <button onclick={() => doExport("txt")}>导出纯文本</button>
-        <button disabled={recording.isLive} onclick={doResume}>继续录制</button>
+        <button class="icon-btn" title="导出 Markdown" aria-label="导出 Markdown" onclick={() => doExport("md")}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+            <path d="M9.5 1.8V5h3.2" />
+            <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+          </svg>
+        </button>
+        <button class="icon-btn" title="导出纯文本" aria-label="导出纯文本" onclick={() => doExport("txt")}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+            <path d="M9.5 1.8V5h3.2" />
+            <path d="M5.5 8.4h5M5.5 10.4h5M5.5 12.4h3" stroke-width="1.2" />
+          </svg>
+        </button>
+        <button
+          class="icon-btn resume"
+          title="继续录制"
+          aria-label="继续录制"
+          disabled={recording.isLive}
+          onclick={doResume}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" />
+            <circle cx="8" cy="8" r="2.6" fill="currentColor" stroke="none" />
+          </svg>
+        </button>
       </div>
     </div>
 
@@ -421,12 +445,38 @@
   }
   .row {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.5rem;
     align-items: center;
     flex: none;
-    flex-wrap: wrap;
     justify-content: flex-end;
     padding-top: 0.2rem;
+  }
+  /* icon-button:button-secondary 形态的方形图标钮,与播放键同语言 */
+  .icon-btn {
+    width: 2.1rem;
+    height: 2.1rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+  }
+  .icon-btn:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  /* 继续录制:红点承担彩色强调(与侧栏录制按钮同款语言) */
+  .icon-btn.resume {
+    color: var(--record);
+  }
+  .icon-btn.resume:hover {
+    color: var(--record);
+  }
+  .icon-btn.resume:disabled {
+    color: var(--ink-faint);
   }
   .export-msg {
     margin: 0 0 0.75rem;
