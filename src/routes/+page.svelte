@@ -37,10 +37,10 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    color: #888;
+    color: var(--ink-secondary);
   }
   .hint {
-    color: #aaa;
+    color: var(--ink-faint);
     font-size: 0.9em;
   }
 </style>
