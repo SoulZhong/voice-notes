@@ -1,4 +1,5 @@
 <script lang="ts">
+  import "../app.css";
   import { onMount } from "svelte";
   import Sidebar from "$lib/Sidebar.svelte";
   import { recording } from "$lib/recording.svelte";
@@ -20,14 +21,8 @@
 <style>
   :global(body) {
     margin: 0;
-    background: #ffffff;
-    color: #1a1a1a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :global(body) {
-      background: #1c1c1e;
-      color: #f0f0f0;
-    }
+    background: var(--canvas);
+    color: var(--ink);
   }
   .shell {
     display: flex;

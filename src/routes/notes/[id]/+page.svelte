@@ -169,7 +169,7 @@
 
 <main class="container">
   {#if error}
-    <div class="banner">{error}</div>
+    <div class="banner banner-danger">{error}</div>
   {/if}
 
   {#if note}
@@ -298,20 +298,24 @@
     cursor: text;
     margin: 0 0 0.25rem;
   }
+  /* editable-text（标题）：静态时无边，hover accent-tint 底 + rounded-sm，focus accent outline */
   .title-btn {
     background: none;
     border: none;
-    box-shadow: none;
     padding: 0;
     margin: 0;
     font: inherit;
     color: inherit;
     cursor: text;
     text-align: left;
+    border-radius: var(--radius-sm);
+  }
+  .title-btn:hover {
+    background: var(--accent-tint);
   }
   .title-btn:focus-visible {
-    outline: 2px solid #396cd8;
-    border-radius: 4px;
+    outline: 2px solid var(--accent);
+    border-radius: var(--radius-sm);
   }
   .rename {
     font-size: 1.6em;
@@ -319,11 +323,13 @@
     width: 100%;
     box-sizing: border-box;
     padding: 0.1em 0.3em;
-    border-radius: 8px;
-    border: 1px solid #396cd8;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--accent);
+    background: var(--canvas);
+    color: var(--ink);
   }
   .meta {
-    color: #888;
+    color: var(--ink-secondary);
     margin: 0 0 1rem;
   }
   .row {
@@ -332,32 +338,38 @@
     align-items: center;
     margin: 0 0 1rem;
   }
+  /* button-secondary：导出/继续录制，透明底 + hairline-strong 边，无阴影 */
   button {
-    border-radius: 8px;
-    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
     padding: 0.5em 1.2em;
-    font-size: 0.95em;
+    font-size: 0.9rem;
     font-weight: 500;
     cursor: pointer;
-    background-color: #ffffff;
-    box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+    background: transparent;
+    color: var(--ink);
   }
   button:hover {
-    border-color: #396cd8;
+    background: var(--surface-soft);
   }
+  button:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  /* transcript-container：surface 底、rounded-xl，正文用 transcript 字级(1.02rem/1.7) */
   .transcript {
-    background: #f5f5f7;
-    border-radius: 8px;
-    padding: 1rem;
-    font-size: 1.05rem;
-    line-height: 1.6;
+    background: var(--surface);
+    border-radius: var(--radius-xl);
+    padding: 20px;
+    font-size: 1.02rem;
+    line-height: 1.7;
   }
   .transcript p {
-    margin: 0 0 0.35rem;
+    margin: 0 0 6px;
   }
   .seg {
-    margin: 0 0 0.35rem;
-    line-height: 1.6;
+    margin: 0 0 6px;
+    line-height: 1.7;
   }
   .badge.as-btn {
     border: none;
@@ -367,17 +379,19 @@
   .badge.as-btn:disabled {
     cursor: default;
   }
+  /* editable-text（段落）：静态时无边，hover accent-tint 底 + rounded-sm，focus accent outline */
   .seg-text.editable {
     cursor: text;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .seg-text.editable:hover {
-    background: rgba(57, 108, 216, 0.08);
+    background: var(--accent-tint);
   }
   .seg-text.editable:focus {
-    outline: 2px solid #396cd8;
-    background: #fff;
+    outline: 2px solid var(--accent);
+    background: var(--canvas);
   }
+  /* 行级操作默认隐身，悬停浮现，保持列表安静 */
   .seg-actions {
     visibility: hidden;
     margin-left: 0.4em;
@@ -385,33 +399,38 @@
   .seg:hover .seg-actions {
     visibility: visible;
   }
+  /* button-link：无底无边，accent 字，悬停加下划线 */
   .link {
     background: none;
     border: none;
-    color: #396cd8;
+    color: var(--accent);
     cursor: pointer;
     padding: 0.1em 0.25em;
     font-size: 0.8em;
-    box-shadow: none;
+  }
+  .link:hover {
+    text-decoration: underline;
   }
   .link.danger {
-    color: #c0392b;
+    color: var(--danger);
     font-weight: 600;
   }
+  /* menu/popover（改说话人菜单）：canvas 底、hairline 边、rounded-lg、shadow-popover */
   .badge-menu {
     display: inline-flex;
     flex-wrap: wrap;
     gap: 0.25em;
-    background: #fff;
-    border: 1px solid #ccc;
-    border-radius: 8px;
+    background: var(--canvas);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
     padding: 0.2em 0.4em;
     margin-right: 0.4em;
   }
   .menu-item {
     background: none;
     border: none;
-    color: #396cd8;
+    color: var(--accent);
     cursor: pointer;
     font-size: 0.8em;
     padding: 0.15em 0.4em;
@@ -419,70 +438,51 @@
   .menu-item.new {
     font-weight: 600;
   }
+  /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级 */
   .badge {
     display: inline-block;
     min-width: 2.2em;
     text-align: center;
-    font-size: 0.75em;
-    font-weight: 600;
-    border-radius: 6px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
-    color: #fff;
+    color: var(--ink);
   }
   .ts {
-    color: #999;
+    color: var(--ink-faint);
     font-size: 0.8em;
     margin-right: 0.4em;
     font-variant-numeric: tabular-nums;
   }
+  /* 已中断：沿用 warning 色系，与侧栏同款状态徽标一致 */
   .state.interrupted {
-    background: #d88a39;
-    color: #fff;
+    background: var(--warning-line);
+    color: var(--warning-ink);
     font-size: 0.7em;
     font-weight: 600;
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 0.1em 0.45em;
     margin-left: 0.4em;
   }
+  /* banner：提示/警告横幅默认 warning 色系（中断提示/跳过行提示） */
   .banner {
-    background: #fff4e5;
-    border: 1px solid #f0c98a;
-    color: #8a5a00;
-    border-radius: 8px;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    color: var(--warning-ink);
+    border-radius: var(--radius-lg);
     padding: 0.6rem 0.8rem;
     margin: 0.5rem 0 1rem;
     font-size: 0.95rem;
   }
-  .hint {
-    color: #aaa;
+  /* 错误横幅换 danger 色系（加载/编辑/删除等失败提示） */
+  .banner.banner-danger {
+    background: var(--danger-tint);
+    border-color: var(--danger-line);
+    color: var(--danger-ink);
   }
-  @media (prefers-color-scheme: dark) {
-    .transcript {
-      background: #2a2a2a;
-    }
-    .rename {
-      background: #2a2a2a;
-      color: #f0f0f0;
-    }
-    button {
-      color: #ffffff;
-      background-color: #0f0f0f98;
-    }
-    .banner {
-      background: #3a2e18;
-      border-color: #6b5426;
-      color: #e8c88a;
-    }
-    .hint {
-      color: #555;
-    }
-    .seg-text.editable:focus {
-      background: #2a2a2a;
-    }
-    .badge-menu {
-      background: #2a2a2a;
-      border-color: #555;
-    }
+  .hint {
+    color: var(--ink-faint);
   }
 </style>

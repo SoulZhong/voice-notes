@@ -140,42 +140,65 @@
 </div>
 
 <style>
+  /* download-card：大卡 surface 底 + rounded-xl */
   .card {
-    background: #f5f5f7;
-    border-radius: 10px;
+    background: var(--surface);
+    border-radius: var(--radius-xl);
     padding: 1rem 1.2rem;
     margin: 0.5rem 0 1rem;
   }
+  /* compact：改用 banner 形态（warning 色系），只在识别模型已就绪、仅缺声纹模型时出现 */
   .card.compact {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 0.6rem;
-    background: #fff4e5;
-    border: 1px solid #f0c98a;
-    color: #8a5a00;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    color: var(--warning-ink);
+    border-radius: var(--radius-lg);
     font-size: 0.95rem;
   }
-  h2 { margin: 0 0 0.25rem; font-size: 1.1rem; }
-  .desc { color: #666; margin: 0 0 0.75rem; font-size: 0.9rem; }
+  h2 { margin: 0 0 0.25rem; font-size: 1.05rem; font-weight: 600; }
+  .desc { color: var(--ink-secondary); margin: 0 0 0.75rem; font-size: 0.9rem; }
   .row { margin: 0.4rem 0; }
   .label { font-size: 0.9rem; }
-  .phase { color: #666; font-size: 0.8rem; margin-left: 0.5em; }
-  .bar { height: 6px; background: #e0e0e3; border-radius: 3px; margin-top: 0.25rem; overflow: hidden; }
-  .fill { height: 100%; background: #396cd8; transition: width 0.3s; }
+  .phase { color: var(--ink-secondary); font-size: 0.8rem; margin-left: 0.5em; }
+  /* 进度条：轨 hairline、填充 accent、rounded-full */
+  .bar { height: 6px; background: var(--hairline); border-radius: var(--radius-full); margin-top: 0.25rem; overflow: hidden; }
+  .fill { height: 100%; background: var(--accent); transition: width 0.3s; }
   .actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.8rem; flex-wrap: wrap; }
-  button { border-radius: 8px; border: 1px solid #ccc; padding: 0.45em 1.1em; cursor: pointer; background: #fff; }
-  button.primary { background: #396cd8; color: #fff; border-color: transparent; font-weight: 600; }
-  .mirror { font-size: 0.85rem; display: flex; align-items: center; gap: 0.3em; }
-  .prefix { flex: 1; min-width: 14rem; padding: 0.3em 0.5em; border-radius: 6px; border: 1px solid #ccc; font-size: 0.85rem; }
-  .error { color: #c0392b; font-size: 0.9rem; margin-top: 0.5rem; }
-  .hint { color: #8a5a00; font-size: 0.9rem; margin-top: 0.5rem; }
-  @media (prefers-color-scheme: dark) {
-    .card { background: #2a2a2a; }
-    .card.compact { background: #3a2e18; border-color: #6b5426; color: #e8c88a; }
-    .desc, .phase { color: #aaa; }
-    .bar { background: #444; }
-    button { background: #0f0f0f98; color: #fff; border-color: #555; }
-    .prefix { background: #2a2a2a; color: #f0f0f0; border-color: #555; }
+  /* button-secondary（暂停下载/继续下载默认态） */
+  button {
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    padding: 0.45em 1.1em;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    background: transparent;
+    color: var(--ink);
   }
+  button:hover { background: var(--surface-soft); }
+  /* button-primary：下载模型是本卡唯一主动作 */
+  button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 500; }
+  button.primary:hover { background: var(--accent-pressed); }
+  .mirror { font-size: 0.85rem; display: flex; align-items: center; gap: 0.3em; }
+  .prefix {
+    flex: 1;
+    min-width: 14rem;
+    padding: 0.3em 0.5em;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: var(--canvas);
+    color: var(--ink);
+    font-size: 0.85rem;
+  }
+  .prefix:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .error { color: var(--danger); font-size: 0.9rem; margin-top: 0.5rem; }
+  .hint { color: var(--warning-ink); font-size: 0.9rem; margin-top: 0.5rem; }
 </style>

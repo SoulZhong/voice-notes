@@ -1,0 +1,144 @@
+/* ============================================================
+ * voice-notes 设计系统 token
+ * 数值来自 DESIGN.md（Notion 式温暖极简），组件样式只引用这里的
+ * 自定义属性，禁止再出现硬编码色值。字体栈本身不作为 token（不引
+ * webfont，原生 -apple-system 即产品气质），继续在各组件里直写。
+ * ============================================================ */
+
+:root {
+  /* 中性色阶：画布纯白，表面/悬停带暖调，文字是炭墨而非纯黑 */
+  --canvas: #ffffff;
+  --surface: #f6f5f4;
+  --surface-soft: #fafaf9;
+  --surface-press: #efedeb;
+  --hairline: #e5e3df;
+  --hairline-strong: #c8c4be;
+  --ink: #37352f;
+  --ink-secondary: #5d5b54;
+  --ink-faint: #a4a097;
+
+  /* 唯一强调色：互动蓝表达“可交互/进行中”。
+     取 Notion 应用内的 #2383e2 而非官网链接蓝 #0075de——后者饱和度过高,
+     大面积填充(主按钮)时发艳显糙;应用内蓝更沉稳(质感反馈调整)。 */
+  --accent: #2383e2;
+  --accent-pressed: #1a6dc0;
+  --accent-tint: rgba(35, 131, 226, 0.08);
+  --on-accent: #ffffff;
+
+  /* 破坏性操作/错误 */
+  --danger: #e03131;
+  /* danger-tint/line 是错误横幅专用的浅底+边框，DESIGN.md 组件说明里给了浅红底
+     数值（#fdeaea / dark #442a2a），边框色未列出，按 warning 横幅同款“底比边浅一档”
+     的关系补齐，与 danger 主色同色系。 */
+  --danger-tint: #fdeaea;
+  --danger-line: #f3c6c6;
+  /* 横幅正文专用深红:高饱和 --danger 在浅红底上对比度仅 3.9:1(不达 AA),
+     文字色需要像 warning-ink 那样为可读性单独调深(≥4.5:1)。 */
+  --danger-ink: #9b1c1c;
+
+  /* 录制中红点/停止字色：双主题一致，是唯一常驻彩色信号 */
+  --record: #eb5757;
+
+  /* 提示横幅 */
+  --warning-tint: #fef7d6;
+  --warning-ink: #523410;
+  --warning-line: #f0e2a8;
+
+  /* 完成态 / 电平表填充 */
+  --success: #1aae39;
+
+  /* 说话人徽章粉彩 7 色：哈希循环取色，配 --ink 文字（暗色下 --ink 自动切换为浅色） */
+  --tint-sky: #dcecfa;
+  --tint-mint: #d9f3e1;
+  --tint-peach: #ffe8d4;
+  --tint-lavender: #e6e0f5;
+  --tint-rose: #fde0ec;
+  --tint-yellow: #fef7d6;
+  --tint-gray: #f0eeec;
+
+  /* 圆角刻度 */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+
+  /* 阴影:浮层菜单/弹层用 popover;按钮允许 Notion 同款"1px 内描边 + 2px 微投影"
+     (纯平按钮显廉价——质感反馈调整,是"发丝线代替阴影"原则的唯一按钮级例外) */
+  --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-btn: inset 0 0 0 1px rgba(15, 15, 15, 0.06), 0 1px 2px rgba(15, 15, 15, 0.07);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* 暗色不是反色，是 Notion 式深暖灰（#191919 系），避免纯黑 */
+    --canvas: #191919;
+    --surface: #202020;
+    --surface-soft: #252525;
+    --surface-press: #2c2c2c;
+    --hairline: #373737;
+    --hairline-strong: #4a4a4a;
+    --ink: #d3d1cb;
+    --ink-secondary: #9b9998;
+    --ink-faint: #6f6e69;
+
+    --accent: #4a94d8;
+    --accent-pressed: #3a7fbe;
+    --accent-tint: rgba(74, 148, 216, 0.15);
+    --on-accent: #ffffff;
+
+    --danger: #ff6b6b;
+    --danger-tint: #442a2a;
+    --danger-line: #5a3232;
+    --danger-ink: #ffb3b3;
+
+    --record: #eb5757;
+
+    --warning-tint: #3a3222;
+    --warning-ink: #e8d49a;
+    --warning-line: #5a4d2a;
+
+    --success: #4cc366;
+
+    --tint-sky: #2a4157;
+    --tint-mint: #2a4a37;
+    --tint-peach: #54402d;
+    --tint-lavender: #413a58;
+    --tint-rose: #513546;
+    --tint-yellow: #4d452a;
+    --tint-gray: #3a3a3a;
+
+    /* 暗色阴影更沉，避免浮层在深底上糊成一片 */
+    --shadow-popover: 0 4px 16px rgba(0, 0, 0, 0.4);
+    --shadow-btn: inset 0 0 0 1px rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* ============================================================
+ * 全局基调(质感层):标题字级统一、交互过渡、按钮微阴影。
+ * 元素级选择器只放"每个组件都该有、且无组件差异"的规则。
+ * ============================================================ */
+
+/* h1 不定字级时是浏览器默认 2em,页面标题失控巨大——统一为 page-title token */
+h1 {
+  font-size: 1.45rem;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.3px;
+}
+
+/* 悬停瞬变显糙:所有交互控件统一 120ms 缓动 */
+button,
+input,
+a {
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+/* 按压回馈:实体按钮各组件按需加 --shadow-btn(链接式按钮不加,全局一刀切会误伤) */
+button:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
