@@ -1,11 +1,11 @@
 //! 段内变更点检测(滑窗声纹) + token 按变更点分组。纯逻辑,无外部依赖,
 //! 供 session.rs worker 在长段上做"同一 final 内部按说话人切分"。
 
-/// 段时长门槛:短于此不跑滑窗嵌入(短段装不下两个人,diarization off 时零开销)。
+/// 段时长门槛:短于此不跑滑窗嵌入(短段装不下两个人,diarization off 时零开销)。待真实会议数据校准。
 pub const SPLIT_MIN_SEGMENT_MS: u64 = 3000;
-/// 滑窗窗长(ms)。
+/// 滑窗窗长(ms)。待真实会议数据校准。
 pub const SPLIT_WIN_MS: u64 = 1500;
-/// 滑窗步长(ms)。
+/// 滑窗步长(ms)。待真实会议数据校准。
 pub const SPLIT_HOP_MS: u64 = 500;
 /// 相邻有效窗余弦低于此值 → 候选变更点。待真实会议数据校准。
 pub const CHANGE_SIM_THRESHOLD: f32 = 0.55;
