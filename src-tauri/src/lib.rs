@@ -1280,8 +1280,10 @@ impl Drop for UnpauseOnDrop {
     }
 }
 
-/// 数据目录迁移:把 data_root 下的笔记/声纹整树搬到 new_dir(复制→校验→删旧,失败回退),
-/// 成功后改写 settings.data_dir 并放行 asset 作用域。守卫只做同步检查与 spawn,搬运/
+/// 数据目录迁移:把 data_root 下的笔记/声纹整树搬到 new_dir。时序是「复制→校验→
+/// **写指针**→删旧」:settings.data_dir 写入是提交点,提交前任何失败都清理新目录、
+/// 旧数据与旧指针完好可重试;提交后删旧只是垃圾回收,失败不算迁移失败——消灭
+/// 「数据在新处、指针指旧处」的崩溃窗口。守卫只做同步检查与 spawn,搬运/
 /// pause_and_wait 全在后台线程——绝不在命令线程(可能持 Tauri 内部锁)里跑阻塞搬运。
 #[tauri::command]
 fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
@@ -1289,21 +1291,16 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能迁移".into());
     }
-    // 守卫二:目标目录必须不存在或为空(不覆盖用户既有内容)。
+    // 守卫二:目标目录必须不存在或为空(不覆盖用户既有内容),且与当前根互不包含
+    //(嵌套会自拷/删旧连带删新)。旧根解析失败直接拒绝(此时还没抢互斥位,无需复位)。
     let new_path = PathBuf::from(&new_dir);
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    let old_root = data_root(&app).map_err(|e| e.to_string())?;
+    store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
     // 守卫三:复用 download_running 做全局互斥——迁移与下载/再次迁移彼此排斥。
     if state.download_running.swap(true, Ordering::SeqCst) {
         return Err("迁移或下载进行中".into());
     }
-    // 抢到互斥位后再算旧根:失败必须先复位互斥位,否则永久卡死。
-    let old_root = match data_root(&app) {
-        Ok(r) => r,
-        Err(e) => {
-            state.download_running.store(false, Ordering::SeqCst);
-            return Err(e.to_string());
-        }
-    };
     let running = state.download_running.clone();
     let transcode = state.transcode.clone();
     std::thread::spawn(move || {
@@ -1317,36 +1314,37 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
         let emit_err = |app: &AppHandle, msg: String| {
             let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "error".into(), message: msg });
         };
-        match store::migrate::migrate_entries(&old_root, &new_path, &["notes", "voiceprints.json", "voiceprints"]) {
-            Ok(()) => {
-                // 读-改-写 settings(永在 app_data_dir,不随 data_dir 漂移)。
-                let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
-                    let mut s = settings::load(&d);
-                    s.data_dir = Some(new_dir.clone());
-                    settings::save(&d, &s).map_err(|e| e.to_string())
-                });
-                match saved {
-                    Ok(()) => {
-                        // 自定义目录落在 asset:// 默认作用域外,放行整棵子树供详情页音频播放。
-                        // 失败只降级打日志(音频可能无法播放,但迁移已成功)。
-                        if let Err(e) = app.asset_protocol_scope().allow_directory(&new_path, true) {
-                            eprintln!("asset 作用域放行新 data 目录失败(音频可能无法播放): {e}");
-                        }
-                        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "done".into(), message: String::new() });
-                    }
-                    // 数据已搬到新处但设置没存住:发 error,前端可提示并重试(重试会因新目录
-                    // 已有内容被 dir_is_usable_target 拦下,需用户手动收拾——属极端边角)。
-                    Err(e) => emit_err(&app, format!("迁移已完成但保存设置失败: {e}")),
-                }
-            }
-            Err(e) => emit_err(&app, format!("{e:#}")),
+        let entries: &[&str] = &["notes", "voiceprints.json", "voiceprints"];
+        // 第一步:复制+校验(失败已自清新目录,旧数据未动)。
+        if let Err(e) = store::migrate::copy_and_verify_entries(&old_root, &new_path, entries) {
+            return emit_err(&app, format!("{e:#}"));
         }
+        // 第二步(提交点):读-改-写 settings(永在 app_data_dir,不随 data_dir 漂移)。
+        // 失败 → 迁移未提交:清理新目录残留(保证可原地重试),旧数据与旧指针完好。
+        let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+            let mut s = settings::load(&d);
+            s.data_dir = Some(new_dir.clone());
+            settings::save(&d, &s).map_err(|e| e.to_string())
+        });
+        if let Err(e) = saved {
+            store::migrate::cleanup_copied_entries(&new_path, entries);
+            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+        }
+        // 自定义目录落在 asset:// 默认作用域外,放行整棵子树供详情页音频播放。
+        // 失败只降级打日志(音频可能无法播放,但迁移已提交)。
+        if let Err(e) = app.asset_protocol_scope().allow_directory(&new_path, true) {
+            eprintln!("asset 作用域放行新 data 目录失败(音频可能无法播放): {e}");
+        }
+        // 第三步(提交后垃圾回收):删旧。内部失败只打日志,不影响迁移成立。
+        store::migrate::remove_old_entries(&old_root, entries);
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "done".into(), message: String::new() });
     });
     Ok(())
 }
 
-/// 模型目录迁移:同构于 migrate_data_dir,搬 models::root() 顶层全部条目(含断点续传
-/// 分片,整树搬最诚实),成功后改写 settings.models_dir 并重设 models::override。
+/// 模型目录迁移:同构于 migrate_data_dir(复制→校验→写指针→删旧,指针写入是提交点),
+/// 搬 models::root() 顶层全部条目(含断点续传分片,整树搬最诚实),提交 = settings.models_dir
+/// 保存 + models::set_models_override 重设。
 #[tauri::command]
 fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
@@ -1361,10 +1359,12 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     }
     let new_path = PathBuf::from(&new_dir);
     store::migrate::dir_is_usable_target(&new_path).map_err(|e| e.to_string())?;
+    let old_root = models::root();
+    // 嵌套守卫同 data:目标与当前模型根互不包含。
+    store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
     if state.download_running.swap(true, Ordering::SeqCst) {
         return Err("迁移或下载进行中".into());
     }
-    let old_root = models::root();
     // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
     let entries: Vec<String> = std::fs::read_dir(&old_root)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -1380,24 +1380,25 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
             let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "error".into(), message: msg });
         };
         let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
-        match store::migrate::migrate_entries(&old_root, &new_path, &entry_refs) {
-            Ok(()) => {
-                let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
-                    let mut s = settings::load(&d);
-                    s.models_dir = Some(new_dir.clone());
-                    settings::save(&d, &s).map_err(|e| e.to_string())
-                });
-                match saved {
-                    Ok(()) => {
-                        // 立即重设 override,后续 models::root() 即指向新处,无需重启。
-                        models::set_models_override(Some(new_path.clone()));
-                        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "done".into(), message: String::new() });
-                    }
-                    Err(e) => emit_err(&app, format!("迁移已完成但保存设置失败: {e}")),
-                }
-            }
-            Err(e) => emit_err(&app, format!("{e:#}")),
+        // 第一步:复制+校验(失败已自清新目录,旧模型未动)。
+        if let Err(e) = store::migrate::copy_and_verify_entries(&old_root, &new_path, &entry_refs) {
+            return emit_err(&app, format!("{e:#}"));
         }
+        // 第二步(提交点):settings.models_dir 保存;失败清理新目录残留,旧指针完好可重试。
+        let saved = app.path().app_data_dir().map_err(|e| e.to_string()).and_then(|d| {
+            let mut s = settings::load(&d);
+            s.models_dir = Some(new_dir.clone());
+            settings::save(&d, &s).map_err(|e| e.to_string())
+        });
+        if let Err(e) = saved {
+            store::migrate::cleanup_copied_entries(&new_path, &entry_refs);
+            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+        }
+        // 提交生效:立即重设 override,后续 models::root() 即指向新处,无需重启。
+        models::set_models_override(Some(new_path.clone()));
+        // 第三步(提交后垃圾回收):删旧。内部失败只打日志,不影响迁移成立。
+        store::migrate::remove_old_entries(&old_root, &entry_refs);
+        let _ = app.emit("migrate", ipc::MigrateEvent { kind: "models".into(), phase: "done".into(), message: String::new() });
     });
     Ok(())
 }

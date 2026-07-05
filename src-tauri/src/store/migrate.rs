@@ -1,9 +1,10 @@
-//! 目录迁移引擎（纯文件逻辑，不碰 tauri）：复制 → 校验 → 删旧，任何失败回退。
+//! 目录迁移引擎（纯文件逻辑，不碰 tauri）：复制 → 校验 → [命令层写指针] → 删旧。
 //!
-//! 语义定位：改数据/模型目录时把既有内容整树搬到新位置。「先复制到新处、校验一致、
-//! 全部成功后才逐条删旧」是为了让失败姿态干净——中途任何一步炸了，旧数据必须原封
-//! 未动（用户点重试或什么都不做都不丢东西），新目录只留我们刚复制的残留、清理掉即可。
-//! 绝不采用「边移边删」那种一旦中断就两头都不完整的搬法。
+//! 语义定位：改数据/模型目录时把既有内容整树搬到新位置。settings 里的目录指针写入
+//! 是迁移的**提交点**：提交前任何失败（复制/校验/写指针）都回滚新目录、旧数据原封
+//! 未动，用户可安全重试；提交后删旧只是垃圾回收，失败也不影响迁移成立。这样中途
+//! 崩溃永远不会出现「数据在新处、指针指旧处」的 split-brain。绝不采用「边移边删」
+//! 那种一旦中断就两头都不完整的搬法。
 
 use anyhow::Context;
 use std::path::Path;
@@ -103,24 +104,23 @@ pub fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 把 old_root 下的若干顶层 entry 迁到 new_root:
-/// create_dir_all(new_root) → 对**存在的** entry 逐个 copy_tree + verify_tree(缺项跳过,
-/// 不报错) → 全部成功后逐 entry 删旧。任何一步失败:清理 new_root 下已复制的这些 entry
-/// 后 Err 返回,旧数据全程未被触碰。
-pub fn migrate_entries(old_root: &Path, new_root: &Path, entries: &[&str]) -> anyhow::Result<()> {
+/// 迁移时序是「复制 → 校验 → **写指针** → 删旧」:settings 里的目录指针写入才是迁移的
+/// 提交点,删旧只是提交后的垃圾回收。因此引擎拆成两步供命令层在中间插入指针写入:
+/// copy_and_verify_entries(可失败,失败必回滚新目录)→ [命令层 save settings] →
+/// remove_old_entries(不可失败——指针已指新,旧残留只是多占盘,绝不能把已提交的迁移
+/// 标成失败)。若删旧发生在写指针之前,中途崩溃会留下"数据在新处、指针指旧处"的
+/// split-brain,用户重启后找不到笔记——这正是本顺序要消灭的窗口。
+///
+/// 第一步:create_dir_all(new_root) → 对**存在的** entry 逐个 copy_tree + verify_tree
+/// (缺项跳过,不报错)。任何失败:清理 new_root 下已复制的这些 entry 后 Err,旧数据
+/// 全程未被触碰,可安全重试。
+pub fn copy_and_verify_entries(
+    old_root: &Path,
+    new_root: &Path,
+    entries: &[&str],
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(new_root)
         .with_context(|| format!("无法创建新目录: {}", new_root.display()))?;
-
-    // 失败清理助手:把本次可能复制进 new_root 的 entry 逐个删掉(旧数据不动)。
-    let cleanup = || {
-        for e in entries {
-            let p = new_root.join(e);
-            let _ = std::fs::remove_dir_all(&p); // 目录残留
-            let _ = std::fs::remove_file(&p); // 文件残留(remove_dir_all 对文件是 Err,这里补删)
-        }
-    };
-
-    // 第一阶段:复制 + 校验。任何失败 → 清理 + Err,绝不进入删旧阶段。
     for e in entries {
         let src = old_root.join(e);
         if !src.exists() {
@@ -128,24 +128,55 @@ pub fn migrate_entries(old_root: &Path, new_root: &Path, entries: &[&str]) -> an
         }
         let dst = new_root.join(e);
         if let Err(err) = copy_tree(&src, &dst).and_then(|_| verify_tree(&src, &dst)) {
-            cleanup();
+            cleanup_copied_entries(new_root, entries);
             return Err(err).with_context(|| format!("迁移 {e} 失败,已回滚(旧数据未动)"));
         }
     }
+    Ok(())
+}
 
-    // 第二阶段:复制+校验全过,才逐 entry 删旧(此时新处已是完整副本)。
+/// 清理 new_root 下本次复制进去的 entry(旧数据不动)。copy_and_verify_entries 失败时
+/// 内部自调;命令层在「复制成功但指针写入失败」时也要调它——那种情况迁移未提交,
+/// 新目录必须清干净,让用户可以原地重试(否则重试会被"目标非空"守卫拦下)。
+pub fn cleanup_copied_entries(new_root: &Path, entries: &[&str]) {
+    for e in entries {
+        let p = new_root.join(e);
+        let _ = std::fs::remove_dir_all(&p); // 目录残留
+        let _ = std::fs::remove_file(&p); // 文件残留(remove_dir_all 对文件是 Err,这里补删)
+    }
+}
+
+/// 第二步(指针已写入之后):逐 entry 删旧。删除失败只 eprintln 不返回 Err——此刻
+/// 迁移已提交(指针指新),旧处残留仅是多占磁盘,把它上报成"迁移失败"反而误导用户
+/// 重试一个已经成功的操作。不存在的 entry 静默跳过。
+pub fn remove_old_entries(old_root: &Path, entries: &[&str]) {
     for e in entries {
         let src = old_root.join(e);
         if !src.exists() {
             continue;
         }
-        if src.is_dir() {
+        let result = if src.is_dir() {
             std::fs::remove_dir_all(&src)
-                .with_context(|| format!("删除旧目录失败: {}", src.display()))?;
         } else {
             std::fs::remove_file(&src)
-                .with_context(|| format!("删除旧文件失败: {}", src.display()))?;
+        };
+        if let Err(err) = result {
+            eprintln!("删除旧数据失败(迁移已完成,残留仅占磁盘): {}: {err}", src.display());
         }
+    }
+}
+
+/// 目标目录与当前根目录必须互不包含:目标在当前根内部会被 copy_tree 自拷进死循环/
+/// 随后删旧连带删新;当前根在目标内部则"空目录"守卫必然不成立且语义混乱。路径比较
+/// 前用 std::path::absolute 归一(不解 symlink):new_dir 可能尚不存在,canonicalize
+/// 会直接失败,absolute 只做词法归一恰好够用。
+pub fn ensure_disjoint(old_root: &Path, new_dir: &Path) -> anyhow::Result<()> {
+    let old = std::path::absolute(old_root)
+        .with_context(|| format!("无法解析当前目录: {}", old_root.display()))?;
+    let new = std::path::absolute(new_dir)
+        .with_context(|| format!("无法解析目标目录: {}", new_dir.display()))?;
+    if new.starts_with(&old) || old.starts_with(&new) {
+        anyhow::bail!("目标目录不能与当前目录互相包含");
     }
     Ok(())
 }
@@ -162,12 +193,52 @@ mod tests {
         std::fs::create_dir_all(old.join("notes/n1")).unwrap();
         std::fs::write(old.join("notes/n1/meta.json"), b"{}").unwrap();
         std::fs::write(old.join("voiceprints.json"), b"{}").unwrap();
-        // "voiceprints" 目录不存在:缺项跳过不报错
-        migrate_entries(&old, &new, &["notes", "voiceprints.json", "voiceprints"]).unwrap();
+        let entries = &["notes", "voiceprints.json", "voiceprints"];
+        // "voiceprints" 目录不存在:缺项跳过不报错。两步驱动模拟命令层的完整时序
+        //(中间是指针写入,引擎不管):copy_and_verify → remove_old。
+        copy_and_verify_entries(&old, &new, entries).unwrap();
         assert!(new.join("notes/n1/meta.json").exists());
         assert!(new.join("voiceprints.json").exists());
+        assert!(old.join("notes/n1/meta.json").exists(), "删旧前旧数据完好(提交点在两步之间)");
+        remove_old_entries(&old, entries);
         assert!(!old.join("notes").exists(), "成功后删旧");
         assert!(!old.join("voiceprints.json").exists());
+        assert!(new.join("notes/n1/meta.json").exists(), "删旧不伤新处");
+    }
+
+    #[test]
+    fn remove_old_skips_missing_entries() {
+        // 指针已写入后的删旧是垃圾回收:不存在的 entry 静默跳过,任何失败都不算迁移
+        // 失败(签名返回 (),本测试同时锁死"不 Err/不 panic"的契约)。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("present"), b"x").unwrap();
+        remove_old_entries(tmp.path(), &["present", "absent-dir", "absent.json"]);
+        assert!(!tmp.path().join("present").exists(), "存在的照删");
+    }
+
+    #[test]
+    fn cleanup_copied_entries_removes_only_listed() {
+        // 「复制成功但指针写入失败」路径:命令层调 cleanup 清新目录残留,
+        // 未列出的既有内容不受牵连。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        std::fs::write(tmp.path().join("notes/a"), b"1").unwrap();
+        std::fs::write(tmp.path().join("voiceprints.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("unrelated"), b"keep").unwrap();
+        cleanup_copied_entries(tmp.path(), &["notes", "voiceprints.json"]);
+        assert!(!tmp.path().join("notes").exists());
+        assert!(!tmp.path().join("voiceprints.json").exists());
+        assert!(tmp.path().join("unrelated").exists(), "未列出的不动");
+    }
+
+    #[test]
+    fn disjoint_rejects_nested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        assert!(ensure_disjoint(&root, &root.join("sub")).is_err(), "目标是子目录:拒绝");
+        assert!(ensure_disjoint(&root.join("sub"), &root).is_err(), "目标是父目录:拒绝");
+        assert!(ensure_disjoint(&root, &root).is_err(), "同一目录:拒绝");
+        assert!(ensure_disjoint(&root, &tmp.path().join("other")).is_ok(), "无关目录:放行");
     }
 
     #[test]
