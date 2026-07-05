@@ -367,11 +367,33 @@ impl TranscodeQueue {
                 st.current = Some(dir.clone());
                 dir
             }; // ← 锁在此释放:process 期间不持锁,enqueue/cancel/pause 可自由推进。
-            process(&next);
-            // 转完清 current 并唤醒:可能有 cancel_and_wait/pause_and_wait 正等这一刻。
-            let mut st = me.state.lock().unwrap();
-            st.current = None;
-            me.cv.notify_all();
+
+            // panic 防护,双保险 —— 转码是增值层,一次 panic 绝不能被队列放大成全局死锁:
+            // 若 process panic 而无防护,worker 在锁外(Mutex 不中毒),线程直接 unwind
+            // 死亡,「清 current + notify」永不执行 → current 永久 Some(dir),此后
+            // cancel_and_wait(该目录) 与 pause_and_wait 的 while 条件恒真且无人再唤醒,
+            // 续录/迁移被彻底锁死。
+            // ① Drop 守卫:清理动作放进守卫的 Drop,正常返回、panic unwind、乃至将来
+            //    有人改掉 catch_unwind,清理都必达(unwind 也会跑 Drop)。
+            // ② catch_unwind:把 panic 拦在本次迭代内,worker 线程本身不死,队列里
+            //    其余笔记照常消费。AssertUnwindSafe 成立:闭包只捕获 &next(PathBuf,
+            //    panic 后不再被读)与 fn 指针,无跨 panic 共享可变状态。
+            struct CurrentGuard<'a>(&'a TranscodeQueue);
+            impl Drop for CurrentGuard<'_> {
+                fn drop(&mut self) {
+                    // 转完(或炸完)清 current 并唤醒:cancel_and_wait/pause_and_wait
+                    // 可能正等这一刻。
+                    let mut st = self.0.state.lock().unwrap();
+                    st.current = None;
+                    self.0.cv.notify_all();
+                }
+            }
+            let _guard = CurrentGuard(&me);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(&next))).is_err()
+            {
+                eprintln!("转码任务 panic,跳过该目录继续消费队列: {}", next.display());
+            }
+            // _guard 在此 drop → 清 current + notify_all。
         });
     }
 }
@@ -423,6 +445,56 @@ mod queue_tests {
             assert!(std::time::Instant::now() < deadline, "恢复后应继续处理");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    static BOOM_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static OK_PROCESSED: AtomicUsize = AtomicUsize::new(0);
+    /// 路径含 "boom" 就 panic 的桩:先置观测位再睡 100ms 再炸,让主线程能确认
+    /// worker 确实已把该目录置为 in-flight(current)后才炸,而非还没拾起。
+    fn panicky_stub(p: &Path) {
+        if p.to_string_lossy().contains("boom") {
+            BOOM_SEEN.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            panic!("预期 panic:验证 worker panic 防护");
+        }
+        OK_PROCESSED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// process panic 后:worker 必须存活继续消费,current 必须被清(cancel/pause 不死等)。
+    /// 注:catch_unwind 拦截前 panic hook 会向 stderr 打一条 panic 记录 —— 这是本测试的
+    /// 预期噪声(不用 set_hook 静音:hook 是进程全局的,并行测试下会吞掉别的测试的
+    /// panic 信息,得不偿失)。
+    #[test]
+    fn worker_survives_process_panic_and_clears_current() {
+        BOOM_SEEN.store(0, Ordering::SeqCst);
+        OK_PROCESSED.store(0, Ordering::SeqCst);
+        let q = TranscodeQueue::new();
+        let running = Arc::new(Mutex::new(false));
+        q.spawn_worker(running, panicky_stub);
+
+        let boom = PathBuf::from("/tmp/note-boom");
+        q.enqueue(boom.clone());
+        // 等 worker 确实拾起 boom(已置 current、即将 panic)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while BOOM_SEEN.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "worker 未拾起 boom");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // ① panic 后 worker 仍存活:后续任务照常被处理
+        q.enqueue(PathBuf::from("/tmp/note-ok"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while OK_PROCESSED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process panic 后 worker 应存活并继续处理后续任务"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // ② current 已被清:对 panic 过的目录 cancel_and_wait / pause_and_wait 不死等。
+        //(若 current 卡死为 Some(boom),这两行会永久阻塞,测试超时挂死即失败。)
+        q.cancel_and_wait(&boom);
+        q.pause_and_wait();
+        q.unpause();
     }
 }
 
