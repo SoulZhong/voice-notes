@@ -125,6 +125,14 @@
     声纹库
   </a>
 
+  <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="8" cy="8" r="2.2" />
+      <path d="M8 2.2V4.4 M8 11.6V13.8 M2.2 8H4.4 M11.6 8H13.8 M3.9 3.9L5.5 5.5 M10.5 10.5L12.1 12.1 M3.9 12.1L5.5 10.5 M10.5 5.5L12.1 3.9" />
+    </svg>
+    设置
+  </a>
+
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
   {#if error}
