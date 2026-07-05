@@ -7,6 +7,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod store;
+mod tray;
 pub mod diar;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -354,6 +355,9 @@ fn spawn_session(
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
+            // 加载失败且确属当前代:running 已复位，托盘同步回 idle（过期线程在上面已提前
+            // return，走不到这里，不会误把托盘打回 idle）。托盘不存在则内部静默跳过。
+            tray::set_recording(app, false);
             let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
         };
 
@@ -741,6 +745,8 @@ fn spawn_session(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
+                // 会话已入槽、"recording" 已发：托盘切红点态（图标+菜单文案「停止录制」）。
+                tray::set_recording(&app, true);
             }
             Err(se) => {
                 stash_model(&recognizer_cache, Some(se.recognizer));
@@ -856,6 +862,8 @@ fn do_stop_recording(app: &AppHandle) {
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
+    // 停录：托盘回 idle 态（图标+菜单文案「开始录制」）。托盘不存在则内部静默跳过。
+    tray::set_recording(app, false);
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
     preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
@@ -1360,6 +1368,8 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     if asr_changed && *state.running.lock().unwrap() {
         return Err("录制中不能切换识别模型".into());
     }
+    // 托盘开关是否变更(落盘后据此建/拆托盘,即时生效无需重启)。
+    let tray_changed = old.tray_enabled != new_settings.tray_enabled;
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
@@ -1372,7 +1382,12 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }).map_err(|e| e.to_string())?;
     if asr_changed {
         *state.recognizer_cache.lock().unwrap() = None;
-        preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+        preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    }
+    // 托盘开关变更 → 建/拆托盘（apply_enabled 现读设置后幂等处理）。放在 asr 之后,
+    // app 已 clone 给 preload,此处直接用 &app。
+    if tray_changed {
+        tray::apply_enabled(&app);
     }
     Ok(())
 }
@@ -1608,6 +1623,27 @@ pub fn run() {
                 .build(),
         )
         .manage(AppState::default())
+        .on_window_event(|window, event| {
+            // 关窗即隐藏（而非退出）:仅当 tray_enabled 时拦截关闭并隐藏主窗——托盘常驻
+            // 才有"隐藏后再打开"的入口。每次事件现读 settings（不缓存），故设置里开关托盘
+            // 后关窗行为即时生效。录制不中断是本特性核心承诺:hide 只是隐藏窗口，会话线程
+            // 与录制状态完全不受影响。读不到 app_data_dir → 默认 true（与 Settings 一致）。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                let enabled = window
+                    .app_handle()
+                    .path()
+                    .app_data_dir()
+                    .map(|d| settings::load(&d).tray_enabled)
+                    .unwrap_or(true);
+                if enabled {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
@@ -1660,6 +1696,8 @@ pub fn run() {
             if let Err(e) = shortcuts::apply_from_settings(&handle) {
                 eprintln!("全局快捷键注册失败(不影响启动): {e}");
             }
+            // 菜单栏托盘：tray_enabled 时建（内部读设置判定）。增值层，一切失败只降级。
+            tray::setup(&handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
