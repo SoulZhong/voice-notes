@@ -20,6 +20,12 @@
 
   let settings = $state<Settings | null>(null);
   let status = $state<ModelsStatus | null>(null);
+  /**
+   * ASR radio 的本地绑定值(bind:group)。不直接从 settings 派生:切型失败回弹时
+   * settings.asr_model 前后同值,派生 checked 可能跳过 DOM 回写,而浏览器原生已把
+   * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
+   */
+  let asrChoice = $state("sense_voice");
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
 
@@ -64,6 +70,7 @@
   async function refreshSettings() {
     try {
       settings = await getSettings();
+      asrChoice = settings.asr_model === "whisper" ? "whisper" : "sense_voice";
     } catch (e) {
       error = `读取设置失败: ${e}`;
     }
@@ -195,6 +202,9 @@
       // 失败(如录制中被后端拒绝):danger 横幅 + 回弹选项显示。
       error = `${e}`;
       settings = await getSettings().catch(() => settings);
+      // 回弹本地绑定值:与点击前同值也必然不同于 bind:group 已改的新值,
+      // 本地 state 变更强制触发 DOM 回写,浏览器原生移走的 checked 被拉回。
+      asrChoice = settings?.asr_model === "whisper" ? "whisper" : "sense_voice";
     }
   }
 
@@ -313,7 +323,8 @@
         <input
           type="radio"
           name="asr"
-          checked={settings?.asr_model !== "whisper"}
+          value="sense_voice"
+          bind:group={asrChoice}
           disabled={recording.isLive || !settings}
           onchange={() => changeAsr("sense_voice")}
         />
@@ -328,7 +339,8 @@
         <input
           type="radio"
           name="asr"
-          checked={settings?.asr_model === "whisper"}
+          value="whisper"
+          bind:group={asrChoice}
           disabled={recording.isLive || !settings}
           onchange={() => changeAsr("whisper")}
         />
