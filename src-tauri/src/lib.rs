@@ -279,6 +279,30 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
     }
 }
 
+/// 本场录制的「必备源集合」：这些源必须全部出现在 start.active 里，任一缺失即整场
+/// 拆除报错（不做静默降级）。为什么随 system_only 变：
+///  - 默认场景 → [Mic]：会议里本机说话人主要走麦克风，mic 是刚需；系统声音则可降级
+///    （拿不到就只录 mic），故 System 不在必备集合。
+///  - 仅系统声音场景 → [System]：这是「纯外放」用法（会议软件把远端声音从扬声器放出、
+///    本机不对着 mic 说话）。此时刻意不建 mic 源——即便有 AEC，mic 路仍会漏进扬声器
+///    回声的残渣污染转写；关掉 mic 从根上消除这条污染路径，System 随之升格为该场景下
+///    唯一且必备的源。纯函数（单测覆盖），供 spawn_session 的源构建与 Fix A 守卫共用。
+fn required_sources(system_only: bool) -> Vec<Source> {
+    if system_only {
+        vec![Source::System]
+    } else {
+        vec![Source::Mic]
+    }
+}
+
+/// 源的中文显示名，仅用于「XX未能启动」失败文案（沿用既有文案风格）。
+fn source_display(s: Source) -> &'static str {
+    match s {
+        Source::Mic => "麦克风",
+        Source::System => "系统声音",
+    }
+}
+
 /// 会话加载线程要落盘的目标笔记：New = 新建，Resume = 续录既有非活动笔记
 /// （已中断或已完成均可）。spawn_session 据此分支 writer 的创建方式。
 enum NoteTarget {
@@ -348,23 +372,42 @@ fn spawn_session(
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
-        // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
+        // 一次性读设置：record_system_only / keep_audio / language_filter 同源同快照
+        //（避免三次 load 读到并发写入的不同代）。app_data_dir 不可用时全部保守回落
+        // Settings::default（仅系统声=否、保留音频=是、语言过滤=开），绝不因读设置
+        // 失败改变现状行为。language_filter 在下方 start_session 处消费。
+        let (record_system_only, keep_audio, language_filter) = app
+            .path()
+            .app_data_dir()
+            .map(|d| {
+                let s = settings::load(&d);
+                (s.record_system_only, s.keep_audio, s.language_filter)
+            })
+            .unwrap_or((false, true, true));
+
+        // 2) 构建源（各自 VAD）。默认建麦克风（必备）+ 系统声音（可降级）；
+        // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
         let vad_path = models::root().join("silero_vad.onnx");
-        let mic_seg = match new_silero(&vad_path) {
-            Ok(s) => s,
-            Err(e) => {
-                stash_model(&recognizer_cache, Some(recognizer));
-                stash_model(&embedder_cache, embedder);
-                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
-            }
-        };
-        // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
-        #[cfg(target_os = "macos")]
-        let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
-        #[cfg(not(target_os = "macos"))]
-        let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
-        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
-            vec![(Source::Mic, mic, mic_seg)];
+        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
+        if !record_system_only {
+            let mic_seg = match new_silero(&vad_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    stash_model(&recognizer_cache, Some(recognizer));
+                    stash_model(&embedder_cache, embedder);
+                    return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+                }
+            };
+            // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
+            #[cfg(target_os = "macos")]
+            let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
+            #[cfg(not(target_os = "macos"))]
+            let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+            sources.push((Source::Mic, mic, mic_seg));
+        }
+        // record_system_only 且非 macOS：System 源不存在（下方块仅 macOS 编译），
+        // 源列表将为空，start_session 会因无源可启动返回 Err、开录失败——正是 required
+        // 守卫要兜住的场景（本应用 macOS-only，可接受）。
 
         #[cfg(target_os = "macos")]
         {
@@ -445,32 +488,36 @@ fn spawn_session(
         // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
         // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
         // 待写队列同哲学:内存暂存优于丢内容。base_ms 对齐语义见 AudioTrackWriter。
-        let note_dir = writer.lock().unwrap().dir().to_path_buf();
+        // keep_audio=false 时完全跳过写盘器/写盘线程构建(两者留空 Vec):关闭音频保留,
+        // 转写/声纹零影响——音频落盘是纯增值旁路,sink 仅把采集帧复制一份写 WAV,不在
+        // 转写热路径上;audio_joins 空 Vec 在 stop 时 join 无害(空循环),start_session
+        // 签名不变(空 sinks 即不落任何音频轨)。
         let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
         let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        for (source, _, _) in &sources {
-            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-            let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
-            audio_joins.push(std::thread::spawn(move || {
-                for chunk in rx.iter() {
-                    w.append(&chunk);
-                }
-                // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
-            }));
-            audio_sinks.push((
-                *source,
-                Box::new(move |s: &[f32]| {
-                    let _ = tx.send(s.to_vec());
-                }) as Box<dyn FnMut(&[f32]) + Send>,
-            ));
+        if keep_audio {
+            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            for (source, _, _) in &sources {
+                let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+                let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
+                audio_joins.push(std::thread::spawn(move || {
+                    for chunk in rx.iter() {
+                        w.append(&chunk);
+                    }
+                    // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
+                }));
+                audio_sinks.push((
+                    *source,
+                    Box::new(move |s: &[f32]| {
+                        let _ = tx.send(s.to_vec());
+                    }) as Box<dyn FnMut(&[f32]) + Send>,
+                ));
+            }
         }
 
         let mut degraded = false;
-        // 语言幻觉过滤开关:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里
-        // 关闭以保留外语真实发言;读取失败(app_data_dir 不可用等)保守地按默认值
-        // (过滤开)处理,与 Settings::default 一致,不因读设置失败改变现状行为。
-        let language_filter =
-            app.path().app_data_dir().map(|d| settings::load(&d).language_filter).unwrap_or(true);
+        // language_filter:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里关闭以
+        // 保留外语真实发言。值在上方与 record_system_only/keep_audio 同一次 settings
+        // load 读出(读取失败已保守回落默认过滤开,与 Settings::default 一致)。
         let start = session::start_session(
             sources,
             recognizer,
@@ -627,17 +674,25 @@ fn spawn_session(
 
         match start {
             Ok(start) => {
-                // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
-                if !start.active.contains(&Source::Mic) {
-                    let (r, e) = start.handle.stop(); // 先排干可能已产生的 system finals
+                // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
+                // 就整场拆除报错(不静默降级)。默认配置 required=[Mic],与原先"mic 必备"
+                // 逐字节等价(同样先 stop 排干可能已产生的其它源 finals → stash 模型 →
+                // abort_or_finalize → 带源名 fail);system_only 下 required=[System],改由
+                // System 缺失触发同一条拆除路径。
+                if let Some(&missing) = required_sources(record_system_only)
+                    .iter()
+                    .find(|s| !start.active.contains(s))
+                {
+                    let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
                     abort_or_finalize(&writer);
-                    let mic_err = start.failed.iter()
-                        .find(|(s, _)| *s == Source::Mic)
-                        .map(|(_, msg)| format!("error: 麦克风未能启动: {msg}"))
-                        .unwrap_or_else(|| "error: 麦克风未能启动".into());
-                    return fail(&app, &running, &generation, my_gen, mic_err);
+                    let name = source_display(missing);
+                    let err = start.failed.iter()
+                        .find(|(s, _)| *s == missing)
+                        .map(|(_, msg)| format!("error: {name}未能启动: {msg}"))
+                        .unwrap_or_else(|| format!("error: {name}未能启动"));
+                    return fail(&app, &running, &generation, my_gen, err);
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
                 // running 锁内完成（锁序 running → generation → session_slot）。
@@ -1545,6 +1600,13 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    #[test]
+    fn required_sources_follow_system_only() {
+        use crate::audio::Source;
+        assert_eq!(super::required_sources(false), vec![Source::Mic]);
+        assert_eq!(super::required_sources(true), vec![Source::System]);
     }
 
     #[test]
