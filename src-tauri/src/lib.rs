@@ -226,6 +226,39 @@ fn sense_voice_dir() -> PathBuf {
     models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 }
 
+fn whisper_dir() -> PathBuf {
+    models::root().join("sherpa-onnx-whisper-base")
+}
+
+/// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
+/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
+fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+    if asr_model == settings::ASR_WHISPER {
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir())?) as Box<dyn asr::Recognizer>)
+    } else {
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir())?) as Box<dyn asr::Recognizer>)
+    }
+}
+
+/// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
+/// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
+fn current_asr(app: &AppHandle) -> String {
+    match app.path().app_data_dir() {
+        Ok(d) => settings::load(&d).asr_model,
+        Err(_) => settings::ASR_SENSE_VOICE.into(),
+    }
+}
+
+/// 默认下载集：遍历 ARTIFACTS 保序收集「当前选型录制必需」或声纹（speaker，增值但默认装）。
+/// 与旧行为等价：vad + 选中 ASR + speaker。download_models 的 None 分支用它。
+fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
+    models::ARTIFACTS
+        .iter()
+        .filter(|a| models::required_now(a.id, asr_model) || a.id == "speaker")
+        .map(|a| a.id)
+        .collect()
+}
+
 fn speaker_model_path() -> PathBuf {
     models::root().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 }
@@ -303,8 +336,8 @@ fn spawn_session(
         let taken = recognizer_cache.lock().unwrap().take();
         let recognizer = match taken {
             Some(r) => r,
-            None => match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                Ok(r) => Box::new(r) as Box<dyn asr::Recognizer>,
+            None => match new_recognizer(&current_asr(&app)) {
+                Ok(r) => r,
                 Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
             },
         };
@@ -659,9 +692,8 @@ fn spawn_session(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
-    if !models::recording_ready(settings::ASR_SENSE_VOICE) {
-        return Err("模型缺失：请先在录制页下载模型".into());
+    if !models::recording_ready(&current_asr(&app)) {
+        return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
         app,
@@ -679,9 +711,8 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 /// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
 #[tauri::command]
 fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
-    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
-    if !models::recording_ready(settings::ASR_SENSE_VOICE) {
-        return Err("模型缺失：请先在录制页下载模型".into());
+    if !models::recording_ready(&current_asr(&app)) {
+        return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
         app,
@@ -741,7 +772,7 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
-    preload_models(state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
 
 /// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
@@ -1045,6 +1076,7 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
 /// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
 /// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
 fn preload_models(
+    app: AppHandle,
     session: Arc<Mutex<Option<ActiveSession>>>,
     cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
@@ -1058,10 +1090,12 @@ fn preload_models(
             eprintln!("预载跳过：录制会话进行中，停止后自动补载");
             return;
         }
+        // 按当前选型预载（session 锁已放，此处才读设置：叶子锁纪律不变）。
+        let asr_model = current_asr(&app);
         let mut slot = cache.lock().unwrap();
         if slot.is_none() {
-            match asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir()) {
-                Ok(r) => *slot = Some(Box::new(r) as Box<dyn asr::Recognizer>),
+            match new_recognizer(&asr_model) {
+                Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
         }
@@ -1078,13 +1112,12 @@ fn preload_models(
 }
 
 #[tauri::command]
-fn models_status() -> models::ModelsStatus {
-    // TODO(Task 8): 换 current_asr(&app) 按设置取选型
-    models::status(settings::ASR_SENSE_VOICE)
+fn models_status(app: AppHandle) -> models::ModelsStatus {
+    models::status(&current_asr(&app))
 }
 
 #[tauri::command]
-fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<String>>) -> Result<(), String> {
     if state.download_running.swap(true, Ordering::SeqCst) {
         return Err("下载已在进行中".into());
     }
@@ -1104,6 +1137,18 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
             .app_data_dir()
             .map(|d| settings::load(&d))
             .unwrap_or_default();
+        // 要下载的工件:显式 ids → 按 id 过滤;None → 按当前选型默认集(vad+选中 ASR+speaker)。
+        // 两者都保 ARTIFACTS 原顺序(过滤而非按传入顺序),下载/进度次序稳定。
+        let want: Vec<&str> = match &ids {
+            Some(ids) => ids.iter().map(|s| s.as_str()).collect(),
+            None => default_download_ids(&s.asr_model),
+        };
+        let selected: Vec<&models::Artifact> = models::ARTIFACTS
+            .iter()
+            .filter(|a| want.iter().any(|w| *w == a.id))
+            .collect();
+        // preload 需要 app,但 app 随即被 emit 闭包 move 走,先克隆一份留给补预载。
+        let app_pl = app.clone();
         let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
             let _ = app.emit(
                 "model_download",
@@ -1117,7 +1162,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
             );
         };
         let mut all_ok = true;
-        for a in models::ARTIFACTS {
+        for a in selected {
             if models::artifact_present(&root, a) {
                 continue;
             }
@@ -1134,7 +1179,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> Result<(), String>
         if all_ok {
             emit("all", "done", 0, 0, "");
             // 补齐后立即预载，无需重启即可开录。
-            preload_models(session, recognizer_cache, embedder_cache);
+            preload_models(app_pl, session, recognizer_cache, embedder_cache);
         }
     });
     Ok(())
@@ -1145,14 +1190,74 @@ fn cancel_models_download(state: State<AppState>) {
     state.download_cancel.store(true, Ordering::SeqCst);
 }
 
+/// 删除单个模型工件（设置页管理用）。守卫:录制中删会与常驻槽在用实例互踩、下载中删会
+/// 与写盘线程撞文件,一律拒绝。File → 删单文件;TarBz2 → 删整个 dest_dir 目录。删完清掉
+/// 对应常驻槽（asr/whisper 清识别器、speaker 清嵌入器）,否则删了盘上文件、槽里旧实例
+/// 还在,下次开录仍拿旧模型转写,状态与磁盘不一致。清槽是叶子锁单独持有,不与 session 锁嵌套。
+#[tauri::command]
+fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    // _app: root 走 models::root() 无需它,但保留形参与其它模型命令签名一致(Tauri 按类型注入)。
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能删除模型".into());
+    }
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err("下载进行中，稍后再试".into());
+    }
+    let a = models::ARTIFACTS
+        .iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("未知模型: {id}"))?;
+    let root = models::root();
+    match &a.kind {
+        models::ArtifactKind::File => {
+            let p = root.join(a.files[0].rel_path);
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(|e| format!("删除失败: {e}"))?;
+            }
+        }
+        models::ArtifactKind::TarBz2 { dest_dir } => {
+            let p = root.join(dest_dir);
+            if p.exists() {
+                std::fs::remove_dir_all(&p).map_err(|e| format!("删除失败: {e}"))?;
+            }
+        }
+    }
+    // 叶子锁单独持有,不与其它锁嵌套。
+    match id.as_str() {
+        "asr" | "whisper" => *state.recognizer_cache.lock().unwrap() = None,
+        "speaker" => *state.embedder_cache.lock().unwrap() = None,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
     app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, new_settings: settings::Settings) -> Result<(), String> {
+fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::Settings) -> Result<(), String> {
     let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let old = settings::load(&d);
+    // 存储目录（data_dir/models_dir）不走普通设置保存:改它涉及既有数据/模型的搬迁,
+    // 必须经专门的迁移功能（负责移动文件 + 重设 override），这里直接拒绝防止指针漂移
+    // 而数据不动导致"找不到笔记/模型"。
+    if old.data_dir != new_settings.data_dir || old.models_dir != new_settings.models_dir {
+        return Err("存储目录变更请使用迁移功能".into());
+    }
+    // ASR 选型变更:录制中切换会让常驻识别器与正在转写的会话对不上,拒绝;无会话则
+    // save 后清掉旧选型的常驻识别器、按新选型重载,无需重启即可用新模型开录。
+    if old.asr_model != new_settings.asr_model {
+        if state.session.lock().unwrap().is_some() {
+            return Err("录制中不能切换识别模型".into());
+        }
+        settings::save(&d, &new_settings).map_err(|e| e.to_string())?;
+        *state.recognizer_cache.lock().unwrap() = None;
+        preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+        return Ok(());
+    }
+    // 其余（镜像等）直接保存。
     settings::save(&d, &new_settings).map_err(|e| e.to_string())
 }
 
@@ -1207,7 +1312,7 @@ pub fn run() {
             // 转码 worker 常驻:录制中让路,空闲时串行消费队列(启动回溯 + 后续停录入队)。
             st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
 
-            preload_models(st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
+            preload_models(handle.clone(), st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1230,6 +1335,7 @@ pub fn run() {
             models_status,
             download_models,
             cancel_models_download,
+            delete_model,
             get_settings,
             set_settings,
             list_people,
@@ -1271,6 +1377,15 @@ mod tests {
         assert!(should_enqueue_transcode(tmp.path()));
         std::fs::remove_file(tmp.path().join("mic.wav")).unwrap();
         assert!(!should_enqueue_transcode(tmp.path()), "无 wav 无事可做");
+    }
+
+    #[test]
+    fn download_selection_defaults_to_required_plus_speaker() {
+        use super::default_download_ids;
+        let ids = default_download_ids("sense_voice");
+        assert_eq!(ids, vec!["vad", "speaker", "asr"]);
+        let ids = default_download_ids("whisper");
+        assert_eq!(ids, vec!["vad", "speaker", "whisper"]);
     }
 
     #[test]
