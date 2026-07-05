@@ -343,7 +343,7 @@
     margin: 0 0 1.25rem;
     max-width: 46rem;
   }
-  /* 分区标题:小号加粗 + 计数胶囊,待命名区带引导文案 */
+  /* 分区标题:小号标题(500 字重) + 计数胶囊,待命名区带引导文案 */
   .section-head {
     display: flex;
     align-items: baseline;

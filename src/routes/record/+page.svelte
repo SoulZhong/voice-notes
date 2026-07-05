@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
-  import { speakerLabel, speakerColor } from "$lib/notes";
+  import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
@@ -92,7 +92,7 @@
     <div class="transcript">
       {#each recording.finals as line}
         <p class="final">
-          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}">
+          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}; color: {speakerInk(line.speaker, line.source)}">
             {speakerLabel(line.speaker, line.source, recording.speakers)}
           </span>
           {line.text}
@@ -155,7 +155,7 @@
     flex-shrink: 0;
   }
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
-  .sym.dot.on-blue { background: var(--on-accent); }
+  .sym.dot.on-blue { background: var(--on-primary); }
   .sym.square { border-radius: 2px; background: var(--record); }
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
@@ -243,9 +243,9 @@
     margin: 0;
   }
 
-  /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级；mic/system 是尚未
-     解析出说话人时的占位色，固定取 tint-sky/tint-mint，与 speakerColor() 的
-     兜底分支保持一致视觉。 */
+  /* speaker-badge：粉彩底 + 同色相文字(soft 公式)、rounded-sm、micro 字级；
+     mic/system 是尚未解析出说话人时的占位色，固定取 tint-sky/tint-mint，与
+     speakerColor()/speakerInk() 的兜底分支保持一致视觉。 */
   .badge {
     display: inline-block;
     min-width: 2.2em;
@@ -255,10 +255,9 @@
     border-radius: var(--radius-sm);
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
-    color: var(--ink);
   }
-  .badge.mic { background: var(--tint-sky); }
-  .badge.system { background: var(--tint-mint); }
+  .badge.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
+  .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
 
   .banner {
     background: var(--warning-tint);

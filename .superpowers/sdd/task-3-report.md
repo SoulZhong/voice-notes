@@ -74,3 +74,40 @@ feat(design): 说话人徽章文字色接 soft 公式(同色相深/亮文字)
 - 工作区内 `.superpowers/sdd/task-1-report.md`、`src-tauri/gen/schemas/*.json` 三个文件
   在本任务开始前就已是未提交的修改状态,与 Task 3 无关(疑似前序任务/工具链遗留),
   本次 commit 只 `git add` 了本任务实际改动的 4 个文件。
+
+---
+
+## 追加:复核修复(record 页缺口 + 两条 Minor)
+
+复核确认 record 页缺口需要补(计划遗漏,同一视觉一致性必须闭合),连同前一任务复核的
+两条一行级 Minor,单提交完成:
+
+1. **`src/routes/record/+page.svelte:95`** 转写行徽章:`style` 追加
+   `; color: {speakerInk(line.speaker, line.source)}`,import 补 `speakerInk`。
+2. **`src/routes/record/+page.svelte`(原约 158 行)**:`.sym.dot.on-blue` 的
+   `background: var(--on-accent)` → `var(--on-primary)`。该点渲染在已迁 primary 的
+   `.ctl.primary` 主按钮内(`color: var(--on-primary)`),语义对齐;现值巧合等值不可见,
+   但会随 token 漂移。
+3. **`src/routes/speakers/+page.svelte:346`**:`.section-title` 注释"小号加粗"改为
+   "小号标题(500 字重)",与实际 `font-weight: 500` 一致。
+
+**顺带闭合(同一缺口的另一半,超出清单但同属 record 页徽章一致性)**:
+`.badge.mic` / `.badge.system`(实时转写 partial 行的"我/对方"占位徽章,原 260-261 行)
+与最终行徽章共用同一 `.badge` 外观,原先靠 `.badge { color: var(--ink) }` 吃默认文字色。
+若只改最终行,同一个"我"徽章会在 partial→final 转正瞬间文字变色(soft ink ↔ 默认 ink),
+一致性反而更破。故:`.badge` 去掉 `color: var(--ink)`(现三处消费全部显式带色,无裸
+`.badge` 用法),`.badge.mic` 补 `color: var(--tint-sky-ink)`、`.badge.system` 补
+`color: var(--tint-mint-ink)`——与 `speakerInk()` 的 `!speaker` 兜底分支(mic→sky-ink/
+system→mint-ink)完全一致。注释同步更新。
+
+### 验证(追加改动后重跑)
+
+- `npm run check` → `0 ERRORS 0 WARNINGS`。
+- `npm run build` → 通过。
+- 布局/交互零改动:仅 color/background 值与注释文字。
+
+### Commit(追加)
+
+```
+fix(design): record 页徽章配对文字色,残留 on-accent/注释清理
+```
