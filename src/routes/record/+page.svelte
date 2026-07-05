@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
-  import { speakerLabel, speakerColor } from "$lib/notes";
+  import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
@@ -92,7 +92,7 @@
     <div class="transcript">
       {#each recording.finals as line}
         <p class="final">
-          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}">
+          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}; color: {speakerInk(line.speaker, line.source)}">
             {speakerLabel(line.speaker, line.source, recording.speakers)}
           </span>
           {line.text}
@@ -129,25 +129,28 @@
   /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
      “录制红点是唯一常驻彩色信号”。 */
+  /* button-secondary 形态：暗色第一公民下 canvas 底=页面底(#07080a 同色)，
+     无边+shadow-btn 会让按钮完全隐形；shadow-btn 是主按钮药丸专用高光，这里
+     改用 transparent + hairline-strong 描边，靠轮廓立住形状 */
   .ctl {
     display: inline-flex;
     align-items: center;
     gap: 0.45em;
     border-radius: var(--radius-md);
-    border: none;
+    border: 1px solid var(--hairline-strong);
     padding: 0.45em 1.1em;
     font-weight: 500;
     font-size: 0.9rem;
     cursor: pointer;
-    background: var(--canvas);
+    background: transparent;
     color: var(--ink);
-    box-shadow: var(--shadow-btn);
   }
   .ctl:hover { background: var(--surface-soft); }
   .ctl:disabled { opacity: 0.6; cursor: default; }
-  .ctl.primary { background: var(--accent); color: var(--on-accent); }
-  .ctl.primary:hover { background: var(--accent-pressed); }
-  .ctl.danger { color: var(--record); font-weight: 600; }
+  /* 主停止按钮走 primary 药丸，不需要 secondary 的 hairline 描边 */
+  .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); border-color: transparent; }
+  .ctl.primary:hover { background: var(--primary-pressed); }
+  .ctl.danger { color: var(--record); font-weight: 500; }
   /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */
   .sym {
     width: 9px;
@@ -155,12 +158,12 @@
     flex-shrink: 0;
   }
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
-  .sym.dot.on-blue { background: var(--on-accent); }
+  .sym.dot.on-blue { background: var(--on-primary); }
   .sym.square { border-radius: 2px; background: var(--record); }
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
     font-variant-numeric: tabular-nums;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 1rem;
     color: var(--ink-secondary);
   }
@@ -183,7 +186,7 @@
     border: 1px solid var(--warning-line);
     color: var(--warning-ink);
     font-size: 0.75em;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: var(--radius-md);
     padding: 0.1em 0.5em;
   }
@@ -209,7 +212,7 @@
 
   .status.error {
     color: var(--danger);
-    font-weight: 600;
+    font-weight: 500;
   }
 
   /* transcript-container：surface 底、rounded-xl、正文用 transcript 字级(1.02rem/1.7) */
@@ -243,9 +246,9 @@
     margin: 0;
   }
 
-  /* speaker-badge：粉彩底 + ink 字、rounded-sm、micro 字级；mic/system 是尚未
-     解析出说话人时的占位色，固定取 tint-sky/tint-mint，与 speakerColor() 的
-     兜底分支保持一致视觉。 */
+  /* speaker-badge：粉彩底 + 同色相文字(soft 公式)、rounded-sm、micro 字级；
+     mic/system 是尚未解析出说话人时的占位色，固定取 tint-sky/tint-mint，与
+     speakerColor()/speakerInk() 的兜底分支保持一致视觉。 */
   .badge {
     display: inline-block;
     min-width: 2.2em;
@@ -255,10 +258,9 @@
     border-radius: var(--radius-sm);
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
-    color: var(--ink);
   }
-  .badge.mic { background: var(--tint-sky); }
-  .badge.system { background: var(--tint-mint); }
+  .badge.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
+  .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
 
   .banner {
     background: var(--warning-tint);
