@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod split;
 
 use std::path::Path;
 
