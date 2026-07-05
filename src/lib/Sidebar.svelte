@@ -130,6 +130,22 @@
 </script>
 
 <aside class="sidebar">
+  <!-- 立体竖排页签(冒烟反馈):贴侧栏左缘,文件夹式——选中页签与内容面板同底、
+       交界边线断开融为一体(凸起),未选中退后;点击即导航,选中由路由派生。 -->
+  <nav class="tab-rail">
+    <button
+      class="vtab"
+      class:active={tab === "notes"}
+      onclick={() => { if (tab !== "notes") goto("/"); }}>录音记录</button
+    >
+    <button
+      class="vtab"
+      class:active={tab === "people"}
+      onclick={() => { if (tab !== "people") goto("/speakers"); }}>声纹库</button
+    >
+  </nav>
+
+  <div class="panel">
   <button
     class="record-btn"
     class:recording={recording.isLive}
@@ -139,21 +155,6 @@
     <span class="rec-dot" class:square={recording.isLive}></span>
     {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
-
-  <!-- 页签组织侧栏(冒烟反馈):录音记录=笔记索引,声纹库=人物索引,各自成世界;
-       选中态复用 surface-press+ink 既有语义,点击即导航,选中由路由派生。 -->
-  <nav class="tabs">
-    <button
-      class="tab"
-      class:active={tab === "notes"}
-      onclick={() => { if (tab !== "notes") goto("/"); }}>录音记录</button
-    >
-    <button
-      class="tab"
-      class:active={tab === "people"}
-      onclick={() => { if (tab !== "people") goto("/speakers"); }}>声纹库</button
-    >
-  </nav>
 
   {#if tab === "people"}
     {#if peopleError}
@@ -238,6 +239,7 @@
       设置
     </a>
   </nav>
+  </div>
 </aside>
 
 {#if menuForId}
@@ -274,16 +276,63 @@
 <style>
   /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
      当前页 surface-press + ink 主色（层级靠亮度对比，不靠加粗）。 */
+  /* 侧栏 = 页签轨道(canvas 底) + 内容面板(surface 底)双列:面板比轨道亮一档,
+     选中页签借面板底色"长"在轨道上,立体感来自表面阶梯而非投影。 */
   .sidebar {
-    width: 280px;
+    width: 300px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    border-right: 1px solid var(--hairline);
+    background: var(--canvas);
+    box-sizing: border-box;
+    overflow-y: hidden;
+  }
+  .tab-rail {
+    width: 34px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid var(--hairline);
+    gap: 4px;
+    padding-top: 0.75rem;
+  }
+  /* 竖排文件夹页签:选中态与面板同底且右边线断开(margin-right 盖住面板左边线),
+     页签与面板融为一体=凸起;未选中透明退后,hover 半显影。 */
+  .vtab {
+    writing-mode: vertical-rl;
+    letter-spacing: 0.12em;
+    padding: 0.8em 0.3em;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    background: transparent;
+    border: 1px solid transparent;
+    border-right: none;
+    border-radius: var(--radius-md) 0 0 var(--radius-md);
+    cursor: pointer;
+  }
+  .vtab:hover {
+    background: var(--surface-soft);
+    color: var(--ink-secondary);
+  }
+  .vtab.active {
     background: var(--surface);
+    color: var(--ink);
+    border-color: var(--hairline);
+    margin-right: -1px;
+    position: relative;
+    z-index: 1;
+  }
+  .panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border-left: 1px solid var(--hairline);
     padding: 0.75rem;
     box-sizing: border-box;
-    /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置/声纹库推出视口 */
+    /* 滚动收敛到 .list:footer 沉底常驻,长列表不会把设置推出视口 */
     overflow-y: hidden;
   }
   /* 录制按钮:主 CTA 药丸(primary 底 + on-primary 字 + radius-full,dark 下即白药丸)+ 红点。
@@ -356,31 +405,6 @@
     background: var(--surface-press);
     color: var(--ink);
     font-weight: 500;
-  }
-  /* 页签:两枚并排,选中态复用"surface-press 底 + ink"既有语义(与列表选中/nav 当前页同源),
-     不引新形态;未选中安静(ink-secondary),hover surface-soft。 */
-  .tabs {
-    display: flex;
-    gap: 2px;
-    margin-top: 0.6rem;
-  }
-  .tab {
-    flex: 1;
-    border: none;
-    background: transparent;
-    color: var(--ink-secondary);
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.4em 0;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-  }
-  .tab:hover {
-    background: var(--surface-soft);
-  }
-  .tab.active {
-    background: var(--surface-press);
-    color: var(--ink);
   }
   /* 人物行:小色点(与管理页头像同色源)+ 名字/最近出现;整块是只读索引,管理走主区页面 */
   .item.person {
