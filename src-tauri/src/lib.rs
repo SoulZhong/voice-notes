@@ -1553,6 +1553,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|_app, _shortcut, _event| {
+                    // 空实现占位：Task 7 接入实际快捷键分发（shortcuts::on_shortcut），
+                    // 本任务只负责插件接线。
+                })
+                .build(),
+        )
         .manage(AppState::default())
         .setup(|app| {
             let handle = app.handle().clone();
