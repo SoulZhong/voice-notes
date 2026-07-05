@@ -244,7 +244,8 @@ fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
 /// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
-fn current_asr(app: &AppHandle) -> String {
+/// pub(crate)：托盘 build_menu 也要按当前选型算 recording_ready 决定 toggle 项禁用。
+pub(crate) fn current_asr(app: &AppHandle) -> String {
     match app.path().app_data_dir() {
         Ok(d) => settings::load(&d).asr_model,
         Err(_) => settings::ASR_SENSE_VOICE.into(),
@@ -1553,22 +1554,30 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 }
 
 /// 按时间清理已完成笔记的音频(保留转写文字,只删音频文件释放磁盘)。
-/// 守卫同迁移命令的思路:录制中直接拒绝(音频还在写,中途删必损坏);
-/// 通过后 `pause_and_wait` 静止转码队列(防止清理途中 worker 正把某笔记的 wav 转
-/// 成 m4a,清理和转码撞同一批文件),`UnpauseOnDrop` 保证无论正常返回还是提前 return
-/// 都必然解除暂停。
+/// 守卫改用与两迁移命令共用的 `migrate_guard`(swap `download_running` 兼作迁移/下载
+/// 互斥位 + 查 `running`),而非只查 running:
+///   - 若只查 running,清理会与 `migrate_data_dir` 并发——迁移复制途中的音频被清理删掉,
+///     迁移的复制/校验会伪失败(明明是被并发删的,却报成迁移出错)。互斥后二者不再并发。
+///   - `TranscodeQueue.paused` 是布尔而非计数:清理与迁移原先各自独立 pause/unpause,谁先
+///     解除就打掉对方的暂停(clobber)。互斥闭合后两者永不并发,pause 布尔 clobber 随之消失。
+/// 通过后 `pause_and_wait` 静止转码队列(防止清理途中 worker 正把某笔记的 wav 转成 m4a,
+/// 清理和转码撞同一批文件),`UnpauseOnDrop` 保证无论正常返回还是提前 return 都必然解除暂停。
+/// `ResetOnDrop` 复位迁移/下载互斥位:purge 是同步命令(不开后台线程),函数尾自然 drop 复位,
+/// 无需照 migrate 那样挂到后台线程头部。
+/// 已知取舍:命令线程会在 `pause_and_wait` 处最多阻塞等一个 in-flight 转码(秒级)才返回。
 ///
 /// 与迁移不同:这里**不**开后台线程——遍历+删文件是百级笔记毫秒到秒级的量级,
 /// 同步跑完直接返回释放字节数即可,没必要为它另起一套进度事件。
 ///
-/// 是否为「活动笔记」用 session 槽的 note_id 比对,而非 state 参数——此时 running 已经
-/// 确认为 false,正常不会有会话在槽里;这里仍查一次是纯防御(万一未来某处状态机出现
-/// running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
+/// 是否为「活动笔记」用 session 槽的 note_id 比对,而非 state 参数——此时 running 已由
+/// migrate_guard 确认为 false,正常不会有会话在槽里;这里仍查一次是纯防御(万一未来某处
+/// 状态机出现 running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
+/// 这与 `reject_if_active`(单笔记编辑命令按 note_id 拒绝活动笔记)同源:那边有具体 note_id
+/// 可比对,这边是批量清理、无单一 note_id,故退化为「跳过 == session 槽笔记」的防御性比对。
 #[tauri::command]
 fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u32>) -> Result<u64, String> {
-    if *state.running.lock().unwrap() {
-        return Err("录制中不能清理音频".into());
-    }
+    migrate_guard(&state.running, &state.download_running)?;
+    let _reset = ResetOnDrop(state.download_running.clone());
     state.transcode.pause_and_wait();
     let _unpause = UnpauseOnDrop(state.transcode.clone());
     // cutoff 与 meta 里的 RFC3339 字符串同源(都来自 Local::now)，可直接字符串比较。
@@ -1624,21 +1633,16 @@ pub fn run() {
         )
         .manage(AppState::default())
         .on_window_event(|window, event| {
-            // 关窗即隐藏（而非退出）:仅当 tray_enabled 时拦截关闭并隐藏主窗——托盘常驻
-            // 才有"隐藏后再打开"的入口。每次事件现读 settings（不缓存），故设置里开关托盘
-            // 后关窗行为即时生效。录制不中断是本特性核心承诺:hide 只是隐藏窗口，会话线程
-            // 与录制状态完全不受影响。读不到 app_data_dir → 默认 true（与 Settings 一致）。
+            // 关窗即隐藏（而非退出）:仅当托盘**实际存在**时拦截关闭并隐藏主窗——托盘常驻
+            // 才有"隐藏后再打开"的入口。判定按 tray_by_id 查托盘实存,而非读 settings.tray_enabled:
+            // 设置只是"意图",托盘可能因创建失败而不存在;若按意图拦截,托盘建失败时关窗仍被隐藏
+            // 却再无召回窗口的路径,窗口彻底消失。以托盘实存为准才保证隐藏后一定有召回入口。
+            // 录制不中断是本特性核心承诺:hide 只是隐藏窗口，会话线程与录制状态完全不受影响。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() != "main" {
                     return;
                 }
-                let enabled = window
-                    .app_handle()
-                    .path()
-                    .app_data_dir()
-                    .map(|d| settings::load(&d).tray_enabled)
-                    .unwrap_or(true);
-                if enabled {
+                if window.app_handle().tray_by_id(tray::TRAY_ID).is_some() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
