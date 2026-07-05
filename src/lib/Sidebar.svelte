@@ -32,11 +32,18 @@
     }
   }
 
-  // 切到声纹库页签时拉取;管理页改名/合并/删除后经 peopleVersion 触发重拉,简表不滞留旧名。
+  // 切到声纹库页签时拉取;详情页改名/合并/删除后经 peopleVersion 触发重拉,索引不滞留旧名。
   $effect(() => {
     void recording.peopleVersion;
     if (tab === "people") refreshPeople();
   });
+
+  // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
+  const peopleSorted = $derived(
+    [...people].sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")),
+  );
+  const peopleUnnamed = $derived(peopleSorted.filter((p) => !p.name));
+  const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   let confirmingDeleteId = $state<string | null>(null);
@@ -129,6 +136,25 @@
     s === "active" ? "录制中" : s === "recording" ? "已中断" : "";
 </script>
 
+{#snippet personRow(p: PersonSummary)}
+  <!-- 与笔记行同构:行内锚点提供键盘路径,li onclick 是指针便利层 -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+  <li
+    class="item person"
+    class:current={$page.url.pathname === `/speakers/${p.id}`}
+    onclick={(e) => {
+      if ((e.target as HTMLElement).closest("a")) return;
+      goto(`/speakers/${p.id}`);
+    }}
+  >
+    <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
+    <div class="main-line">
+      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || "未命名"}</a>
+      <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
+    </div>
+  </li>
+{/snippet}
+
 <aside class="sidebar">
   <!-- 立体竖排页签(冒烟反馈):贴侧栏左缘,文件夹式——选中页签与内容面板同底、
        交界边线断开融为一体(凸起),未选中退后;点击即导航,选中由路由派生。 -->
@@ -163,16 +189,21 @@
     {#if people.length === 0 && !peopleError}
       <p class="hint">录一场会议,停止后本场说话人会自动出现在这里</p>
     {/if}
+    <!-- 人物索引(主从结构的"主"):点击进主区详情页;待命名是待处理项排上面,
+         与旧管理页分区语义一致。行内无操作,管理动作全在详情页。 -->
     <ul class="list">
-      {#each people as p (p.id)}
-        <li class="item person">
-          <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
-          <div class="main-line">
-            <span class="title" class:unnamed={!p.name}>{p.name || "未命名"}</span>
-            <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
-          </div>
-        </li>
-      {/each}
+      {#if peopleUnnamed.length > 0}
+        <li class="group-label">待命名</li>
+        {#each peopleUnnamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      {/if}
+      {#if peopleNamed.length > 0}
+        <li class="group-label">已命名</li>
+        {#each peopleNamed as p (p.id)}
+          {@render personRow(p)}
+        {/each}
+      {/if}
     </ul>
   {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
@@ -406,15 +437,20 @@
     color: var(--ink);
     font-weight: 500;
   }
-  /* 人物行:小色点(与管理页头像同色源)+ 名字/最近出现;整块是只读索引,管理走主区页面 */
+  /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
+     hover/选中与笔记行同语义 */
   .item.person {
     display: flex;
     align-items: center;
     gap: 0.55em;
-    cursor: default;
   }
-  .item.person:hover {
-    background: transparent;
+  /* 分组标签:待命名/已命名,与详情域分区语义一致;非交互,安静小字 */
+  .group-label {
+    list-style: none;
+    color: var(--ink-faint);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 0.55rem 0.5rem 0.2rem;
   }
   .dot {
     width: 10px;
