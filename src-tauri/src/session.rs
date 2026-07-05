@@ -36,9 +36,9 @@ const RECENT_SYSTEM_WINDOW_MS: u64 = 10_000;
 /// AEC 残渣判定:mic 段与 system 段时间重叠比例下限。
 /// 残渣必然与外放(system 路)同时发生;真人插话即使重叠,近场 rms 也远高于下面的上界。
 /// 待校准。
-pub const RESIDUE_OVERLAP_MIN: f32 = 0.8;
+pub(crate) const RESIDUE_OVERLAP_MIN: f32 = 0.8;
 /// AEC 残渣 rms 上界。2026-07-05 外放数据: 残渣 ≤0.0091,近场人声典型 ≥0.02,取 30% 余量。待校准。
-pub const RESIDUE_RMS_MAX: f32 = 0.012;
+pub(crate) const RESIDUE_RMS_MAX: f32 = 0.012;
 
 /// 归一化：去除空白与常见中英标点、ASCII 转小写，供回声去重的文本比对使用。
 fn normalize_text(s: &str) -> String {
