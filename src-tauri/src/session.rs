@@ -71,6 +71,13 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
     prev[m]
 }
 
+/// contains 满分捷径的最短长度门槛（归一化后按 char 计）：子段化后短句（语气词
+/// "嗯"/"对"之类）更容易被任意长文本"完全包含"而误拿满分，是段内切分带来的
+/// 连带效应，P4.5 校准时的素材里还没有这类超短子段。较短一方低于此长度时改走
+/// levenshtein 距离分（仍可能命中，但不再是 contains 的无条件 1.0）。阈值 4
+/// 待真实回声素材复核校准。
+const ECHO_CONTAINS_MIN_LEN: usize = 4;
+
 /// 文本相似度 = max(1 − 编辑距离/较长串字符数, 归一化后短串被长串完全包含 ? 1.0 : 0.0)。
 /// 任一侧归一化后为空串 → 0（避免空文本互相「完全包含」误判）。
 fn text_similarity(a: &str, b: &str) -> f32 {
@@ -81,7 +88,10 @@ fn text_similarity(a: &str, b: &str) -> f32 {
     }
     let ca: Vec<char> = na.chars().collect();
     let cb: Vec<char> = nb.chars().collect();
-    let contains_score = if ca.len() <= cb.len() {
+    let shorter_len = ca.len().min(cb.len());
+    let contains_score = if shorter_len < ECHO_CONTAINS_MIN_LEN {
+        0.0
+    } else if ca.len() <= cb.len() {
         if nb.contains(&na) { 1.0 } else { 0.0 }
     } else if na.contains(&nb) {
         1.0
@@ -261,6 +271,10 @@ fn split_final(
         return whole_segment(job_samples);
     }
 
+    // 计时:滑窗嵌入 + 分组/重识别总耗时,仅在确有切分发生时随子段数一并打印
+    // (性能可观测;不影响回退路径——那些路径本身就没有这条日志)。
+    let split_started_at = Instant::now();
+
     // 滑窗嵌入：窗起点 idx*hop，窗长 win；末窗不足窗长则止（不足一窗的尾音直接
     // 不再开窗，其内容仍归属最后一个子段——不会丢样本，只是不参与切分判定）。
     let mut embs: Vec<Option<Vec<f32>>> = Vec::new();
@@ -306,7 +320,13 @@ fn split_final(
         let seg_start_ms = if i == 0 { 0 } else { boundaries[i - 1] };
         let seg_end_ms = if i < boundaries.len() { boundaries[i] } else { total_ms };
         let start_idx = ms_to_sample_idx(seg_start_ms).min(job_samples.len());
-        let end_idx = ms_to_sample_idx(seg_end_ms).min(job_samples.len());
+        // 末子段直接取到样本末尾：ms 换算下取整会丢掉 <1ms 的尾部样本，母段
+        // 最后一个子段没有下一边界兜底，用真实样本长度消除这点误差。
+        let end_idx = if i == seg_count - 1 {
+            job_samples.len()
+        } else {
+            ms_to_sample_idx(seg_end_ms).min(job_samples.len())
+        };
         let sub_samples = job_samples[start_idx..end_idx].to_vec();
 
         let text = match &groups {
@@ -315,7 +335,18 @@ fn split_final(
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     recognizer.recognize(&sub_samples)
                 })) {
-                    Ok(Ok(t)) => t.text,
+                    Ok(Ok(t)) => {
+                        // 重识别产出的是全新转写，可能与母段整体判断不一致（如
+                        // AEC 残渣独立成段后更像纯外语幻觉）；沿用母段语言标签
+                        // （lang 未变，仅 text 是新的）复核一次，命中则该子段
+                        // 文本置空——下面的空文本判断会自然丢弃它，不单独处理。
+                        if is_foreign_final(&transcript.lang, &t.text) {
+                            eprintln!("段内切分: 回退子段命中语言过滤,丢弃");
+                            String::new()
+                        } else {
+                            t.text
+                        }
+                    }
                     Ok(Err(_)) => "[识别失败]".to_string(),
                     Err(_) => {
                         eprintln!("段内切分: 子段重识别 panic,以占位继续");
@@ -343,7 +374,11 @@ fn split_final(
         return whole_segment(job_samples);
     }
 
-    eprintln!("段内切分: 母段 {total_ms}ms 切为 {} 子段", subs.len());
+    eprintln!(
+        "段内切分: 母段 {total_ms}ms 切为 {} 子段,耗时 {}ms",
+        subs.len(),
+        split_started_at.elapsed().as_millis()
+    );
     subs
 }
 
@@ -1466,6 +1501,99 @@ mod asr_worker_tests {
         assert_eq!(finals[0].0, "t0t1t2t3t4t5t6t7");
         assert_eq!((finals[0].1, finals[0].2), (0, 8000));
     }
+
+    /// 回归终审 Finding：时间戳缺失走"子段重识别"回退时，重识别产出的新文本
+    /// 未经语言过滤——某子段（如 AEC 残渣独立成段后）重识别出纯外语幻觉文本本应
+    /// 被丢弃，却绕过了整段判定时用过的过滤器直接进入处理链。修复后：回退路径
+    /// 对每个重识别子段沿用母段的 lang 标签复核一次，命中即丢弃该子段（空文本
+    /// 走既有丢弃逻辑），不丢内容不变式仍成立（另一子段正常保留）。
+    #[test]
+    fn worker_split_fallback_reidentified_subseg_hits_language_filter() {
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // 第 1 次 recognize：整段初次识别，故意不带 tokens/timestamps → group_tokens
+        // 返回 None，split_final 走子段重识别回退。lang 标为中文（整段判定放行）。
+        // 第 2/3 次：两个子段各自的重识别结果——第一段正常中文，第二段纯假名幻觉。
+        struct ScriptedFallbackRecognizer {
+            calls: usize,
+        }
+        impl Recognizer for ScriptedFallbackRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    1 => Transcript {
+                        text: "占位母段文本".into(),
+                        lang: "<|zh|>".into(),
+                        ..Default::default()
+                    },
+                    2 => Transcript { text: "第一部分内容".into(), ..Default::default() },
+                    _ => {
+                        Transcript { text: "でかしでかしでかしでかしでかし".into(), ..Default::default() }
+                    }
+                })
+            }
+        }
+
+        let mut samples = vec![0.1f32; 4 * 16000];
+        samples.extend(vec![0.9f32; 4 * 16000]);
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::System, samples, start_ms: 0, end_ms: 8000 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<(String, u64, u64, Option<String>)> = Vec::new();
+        run_asr_worker(
+            Box::new(ScriptedFallbackRecognizer { calls: 0 }),
+            Some(Box::new(ContentEmbedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            Vec::new(),
+            |_src, text, s, e, spk, _rms| finals.push((text, s, e, spk)),
+            |_, _| {},
+            |_| {},
+        );
+        assert_eq!(
+            finals.len(),
+            1,
+            "重识别出的纯假名子段应被语言过滤丢弃,只留正常那一段: {finals:?}"
+        );
+        assert_eq!(finals[0].0, "第一部分内容");
+    }
+
+    /// 回归终审 Finding：末子段边界按 ms_to_sample_idx(total_ms) 换算会因 ms 记账
+    /// 与实际样本数不能整除而丢掉 <1ms 的尾部样本（真实采集里 ms 时长与样本数
+    /// 并非总能整除，是常见的记账误差来源，非本模块内部计算引入）。修复后末子段
+    /// 直接取到 job_samples 末尾，样本总量与母段完全一致。
+    #[test]
+    fn split_final_last_subsegment_keeps_full_sample_tail() {
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // 名义时长 8000ms 对应 128000 样本，实际样本多出 7 个(<1ms 的尾巴)。
+        let mut samples = vec![0.1f32; 4 * 16000];
+        samples.extend(vec![0.9f32; 4 * 16000 + 7]);
+        let total_len = samples.len();
+        let transcript = Transcript {
+            text: "t0t1t2t3t4t5t6t7".into(),
+            tokens: (0..8).map(|i| format!("t{i}")).collect(),
+            timestamps: (0..8).map(|i| i as f32).collect(),
+            ..Default::default()
+        };
+        let mut recognizer: Box<dyn Recognizer> = Box::new(CountingRecognizer);
+        let mut embedder: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ContentEmbedder));
+        let subs = split_final(samples, 0, 8000, &transcript, &mut recognizer, &mut embedder);
+        assert_eq!(subs.len(), 2, "应切成两个子段");
+        let total_sub_samples: usize = subs.iter().map(|s| s.samples.len()).sum();
+        assert_eq!(total_sub_samples, total_len, "子段样本总长应等于母段样本总长,不丢尾部样本");
+    }
 }
 
 #[cfg(test)]
@@ -1671,5 +1799,20 @@ mod tests {
         assert!(!is_foreign_final("", "純漢字幻覺讀作中文"), "纯汉字不拦(无损)");
         assert!(!is_foreign_final("", "[识别失败]"), "占位段绝不误杀");
         assert!(!is_foreign_final("", ""), "空串放行");
+    }
+
+    #[test]
+    fn text_similarity_contains_shortcut_needs_minimum_length() {
+        // 短语气词被长文本"完全包含"不应再拿满分捷径(子段化后短子段更容易撞上)。
+        assert!(
+            text_similarity("嗯", "嗯,今天我们讨论的议题是这样的") < 1.0,
+            "过短的一方不应触发 contains 满分"
+        );
+        // 双方都够长时,contains 捷径照常命中(不收窄正常场景)。
+        assert_eq!(
+            text_similarity("今天我们讨论的议题", "今天我们讨论的议题以及后续安排"),
+            1.0,
+            "较长文本仍应正常触发 contains 满分"
+        );
     }
 }

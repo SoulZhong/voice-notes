@@ -110,7 +110,7 @@ pub fn detect_change_points(embs: &[Option<Vec<f32>>], total_ms: u64) -> Vec<u64
 fn min_boundary_in_run(pairs: &[Pair], start: usize, end: usize) -> u64 {
     pairs[start..end]
         .iter()
-        .min_by(|a, b| a.sim.partial_cmp(&b.sim).expect("相似度不应为 NaN"))
+        .min_by(|a, b| a.sim.total_cmp(&b.sim))
         .map(|p| p.boundary)
         .expect("run 非空")
 }
@@ -118,6 +118,12 @@ fn min_boundary_in_run(pairs: &[Pair], start: usize, end: usize) -> u64 {
 /// 按变更点把 tokens 分组拼接为子文本(变更点 n 个 → n+1 段;token 时刻(秒)
 /// 换算 ms 后 < 边界归前段)。返回 None 表示时间戳不可用(空/与 tokens 不等长),
 /// 调用方走"子段重识别"回退。子文本 trim 后可为空,由调用方丢弃该子段。
+///
+/// sherpa BPE 分词对英文片带 `▁`(U+2581)词首标记(表示"此 token 前有一个
+/// 空格"),token 本身是原始 symbol(如 "▁hello"、"world" 无该前缀的延续片)。
+/// 直接拼接会把字面 `▁` 混进文本("▁hello▁world");这里按 sherpa 语义把
+/// `▁` 替换为普通空格再拼接,分组结束后整体 trim 掉可能残留的首尾空格。
+/// 中文 token 无该前缀,替换/trim 对其行为无影响。
 pub fn group_tokens_by_boundaries(
     tokens: &[String],
     timestamps: &[f32],
@@ -132,9 +138,9 @@ pub fn group_tokens_by_boundaries(
         let ts_ms = (ts * 1000.0).round() as u64;
         // 第一个满足 ts_ms < 边界的下标即所属段;越过全部边界则归最后一段。
         let seg = boundaries_ms.iter().position(|&b| ts_ms < b).unwrap_or(boundaries_ms.len());
-        groups[seg].push_str(tok);
+        groups[seg].push_str(&tok.replace('\u{2581}', " "));
     }
-    Some(groups)
+    Some(groups.into_iter().map(|g| g.trim().to_string()).collect())
 }
 
 #[cfg(test)]
@@ -250,6 +256,18 @@ mod tests {
         let tokens: Vec<String> = vec!["a".to_string(), "b".to_string()];
         let timestamps: Vec<f32> = vec![0.1];
         assert_eq!(group_tokens_by_boundaries(&tokens, &timestamps, &[1000]), None);
+    }
+
+    #[test]
+    fn group_tokens_bpe_leading_space_marker_becomes_space_not_literal() {
+        // sherpa BPE 英文片:"▁he" + "llo" + "▁world" 语义上是 " he" + "llo" + " world"
+        // = " hello world",trim 掉首空格 → "hello world"。若不替换 ▁,会直拼出
+        // "▁hello▁world"(字面下划线符号混入文本)。
+        let tokens: Vec<String> =
+            ["▁he", "llo", "▁world"].iter().map(|s| s.to_string()).collect();
+        let timestamps = vec![0.1, 0.2, 0.3];
+        let groups = group_tokens_by_boundaries(&tokens, &timestamps, &[]);
+        assert_eq!(groups, Some(vec!["hello world".to_string()]));
     }
 
     #[test]

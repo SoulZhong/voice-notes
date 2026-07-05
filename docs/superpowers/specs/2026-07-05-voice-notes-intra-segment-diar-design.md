@@ -36,7 +36,7 @@ sherpa-rs 0.6.8 `OfflineRecognizerResult` 暴露 `tokens: Vec<String>` + `timest
 ### 4. 子段接入既有流程(复用最大化)
 
 一个 FinalJob 检测出 N ≥ 2 个子段后,**每个子段等价于一个独立 final**依序走完全既有的处理链:
-- 语言过滤:对子段文本分别判定(整段先判一次不变——外语段整段丢弃优先,不进切分)。
+- 语言过滤:整段判一次(在切分之前,现状不变)即可——子文本源自已放行的整段,不重复判。
 - mic 子段:逐个进 ECHO hold/比对(PendingMic per 子段);system 子段:逐个即时 process_final。
 - 每子段:embed(子段全音频)→ assign(声纹库种子/阈值照常)→ speaker;`rms_of(子段)`;on_final(source, sub_text, sub_start_ms, sub_end_ms, spk, rms)。
 - start/end:段首偏移 + 变更点边界换算,时间轴与母段无缝衔接。
@@ -56,6 +56,9 @@ sherpa-rs 0.6.8 `OfflineRecognizerResult` 暴露 `tokens: Vec<String>` + `timest
 ## 明确不做(backlog)
 
 重叠语音(两人同时说)的分离;子段级质心回写声纹库策略调整(沿既有);变更点的 ASR 语义对齐(按 token 时间戳硬切,不做词边界回退);已落盘历史笔记的回溯切分。
+
+ECHO 去重在两路不对称切分下的漏杀面(system 切分 vs mic 未切,子段 vs 整段相似度上限低于阈值)——带回声素材冒烟观察,必要时 system 子段额外对比 mic 母段全文。
+滑窗 hop 750ms 降耗 / 长段处理间隙插 partial 服务(partial 冻结缓解)。
 
 ## 测试
 
