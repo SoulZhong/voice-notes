@@ -71,10 +71,20 @@ export function speakerLabel(
   const name = speakers[speaker]?.name;
   return name || `说话人 ${speaker.replace(/^S/, "")}`;
 }
-/** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(亮/暗色下均可读) */
-const PALETTE = ["#396cd8", "#2e9e5b", "#b5651d", "#8e44ad", "#c0392b", "#16808a", "#946200", "#5d6d7e"];
+/** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(哈希逻辑不变)。
+    调色板换成 DESIGN.md 粉彩 7 色，返回 CSS 变量引用——随 :root 的亮/暗色定义
+    自动换色，徽章文字统一用 var(--ink)(同样双主题自适应),不必在这里区分明暗。 */
+const PALETTE = [
+  "var(--tint-sky)",
+  "var(--tint-mint)",
+  "var(--tint-peach)",
+  "var(--tint-lavender)",
+  "var(--tint-rose)",
+  "var(--tint-yellow)",
+  "var(--tint-gray)",
+];
 export function speakerColor(speaker: string | null, source: Source): string {
-  if (!speaker) return source === "mic" ? "#396cd8" : "#2e9e5b";
+  if (!speaker) return source === "mic" ? "var(--tint-sky)" : "var(--tint-mint)";
   const n = parseInt(speaker.replace(/^S/, ""), 10);
   if (Number.isFinite(n) && n > 0) return PALETTE[(n - 1) % PALETTE.length];
   let h = 0;

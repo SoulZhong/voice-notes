@@ -87,7 +87,7 @@
 </script>
 
 <main class="container">
-  <h1>说话人</h1>
+  <h1>声纹库</h1>
   <p class="desc">
     这里是声纹库:录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,
     之后的录制会自动认出他并直接显示名字;认错拆重了就用<strong>合并</strong>归到同一个人。
@@ -175,19 +175,24 @@
   h1 {
     margin: 0 0 1rem;
   }
+  /* list-row 容器：以 surface 卡片形式承载各行，行内分隔见 .item */
   .list {
     list-style: none;
     margin: 0;
     padding: 0;
-    background: #f5f5f7;
-    border-radius: 8px;
+    background: var(--surface);
+    border-radius: var(--radius-lg);
   }
+  /* list-row：透明底 + 行间 hairline 分隔，hover surface-soft */
   .item {
     padding: 0.75rem 1rem;
-    border-bottom: 1px solid #e5e5e7;
+    border-bottom: 1px solid var(--hairline);
   }
   .item:last-child {
     border-bottom: none;
+  }
+  .item:hover {
+    background: var(--surface-soft);
   }
   .main-line {
     display: flex;
@@ -196,79 +201,84 @@
     gap: 1rem;
     flex-wrap: wrap;
   }
+  /* desc 用 caption 色阶（次要说明文字） */
   .desc {
-    color: #666;
-    font-size: 0.92em;
+    color: var(--ink-secondary);
+    font-size: 0.85rem;
+    line-height: 1.45;
     margin: -0.5rem 0 1rem;
     max-width: 46rem;
   }
+  /* editable-text（名字）：静态无边，hover accent-tint 底 + rounded-sm */
   .name-btn {
     background: none;
     border: none;
-    box-shadow: none;
     font: inherit;
     font-weight: 600;
     font-size: 1.05em;
     color: inherit;
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: 0.1em 0.3em;
     margin: -0.1em -0.3em;
   }
   .name-btn:hover {
-    background: rgba(57, 108, 216, 0.08);
+    background: var(--accent-tint);
   }
+  /* 已命名说话人的 ✎ 角标：ink-faint，hover 变 accent */
   .pencil {
-    color: #aaa;
+    color: var(--ink-faint);
     font-size: 0.8em;
     margin-left: 0.35em;
   }
   .name-btn:hover .pencil {
-    color: #396cd8;
+    color: var(--accent);
   }
   .unnamed {
     font-weight: 600;
     font-size: 1.05em;
     font-style: italic;
-    color: #999;
+    color: var(--ink-faint);
   }
+  /* button-primary：命名是本行唯一主动作 */
   .name-cta {
-    background: #396cd8;
-    color: #fff;
+    background: var(--accent);
+    color: var(--on-accent);
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 0.15em 0.8em;
-    font-size: 0.85em;
-    font-weight: 600;
+    font-size: 0.9rem; /* button 字级 token,与全局按钮对齐 */
+    font-weight: 500;
     cursor: pointer;
     margin-left: 0.5em;
-    box-shadow: none;
   }
   .name-cta:hover {
-    background: #2f5ec4;
+    background: var(--accent-pressed);
   }
   .name-input {
     font: inherit;
     font-weight: 600;
     font-size: 1.05em;
-    border: 1px solid #396cd8;
-    border-radius: 6px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    background: var(--canvas);
+    color: var(--ink);
     padding: 0.1em 0.4em;
     min-width: 12rem;
   }
   .meta {
-    color: #888;
+    color: var(--ink-faint);
     font-size: 0.85em;
     white-space: nowrap;
   }
   .badge {
     display: inline-block;
     font-size: 0.85em;
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 0.05em 0.5em;
     margin-left: 0.4em;
-    background: #e5e5e7;
-    color: #555;
+    background: var(--surface-press);
+    color: var(--ink-secondary);
   }
   .actions {
     display: flex;
@@ -277,91 +287,60 @@
     gap: 0.4rem;
     margin-top: 0.4rem;
   }
+  /* button-link：无底无边，accent 字，悬停加下划线 */
   .link {
     background: none;
     border: none;
-    color: #396cd8;
+    color: var(--accent);
     cursor: pointer;
     padding: 0.15em 0.3em;
     font-size: 0.85em;
-    box-shadow: none;
+  }
+  .link:hover {
+    text-decoration: underline;
   }
   .link:disabled {
-    color: #aaa;
+    color: var(--ink-faint);
     cursor: default;
   }
   .link.danger {
-    color: #c0392b;
+    color: var(--danger);
     font-weight: 600;
   }
+  /* menu/popover（合并目标下拉）：canvas 底、hairline 边、rounded-lg、shadow-popover */
   .menu {
     display: inline-flex;
     flex-wrap: wrap;
     gap: 0.25em;
-    background: #fff;
-    border: 1px solid #ccc;
-    border-radius: 8px;
+    background: var(--canvas);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
     padding: 0.2em 0.4em;
   }
   .menu-item {
     background: none;
     border: none;
-    color: #396cd8;
+    color: var(--accent);
     cursor: pointer;
     font-size: 0.85em;
     padding: 0.15em 0.4em;
   }
   .confirm-text {
     font-size: 0.85em;
-    color: #8a5a00;
+    color: var(--warning-ink);
   }
+  /* 此处 banner 只用于加载/改名/合并/删除失败，用 danger 色系 */
   .banner {
-    background: #fff4e5;
-    border: 1px solid #f0c98a;
-    color: #8a5a00;
-    border-radius: 8px;
+    background: var(--danger-tint);
+    border: 1px solid var(--danger-line);
+    color: var(--danger-ink);
+    border-radius: var(--radius-lg);
     padding: 0.6rem 0.8rem;
     margin: 0.5rem 0 1rem;
     font-size: 0.95rem;
   }
   .hint {
-    color: #aaa;
-  }
-  @media (prefers-color-scheme: dark) {
-    .list {
-      background: #2a2a2a;
-    }
-    .item {
-      border-color: #3a3a3a;
-    }
-    .desc {
-      color: #999;
-    }
-    .name-input {
-      background: #2a2a2a;
-      color: #f0f0f0;
-    }
-    .unnamed {
-      color: #777;
-    }
-    .badge {
-      background: #3a3a3a;
-      color: #ccc;
-    }
-    .menu {
-      background: #2a2a2a;
-      border-color: #555;
-    }
-    .banner {
-      background: #3a2e18;
-      border-color: #6b5426;
-      color: #e8c88a;
-    }
-    .hint {
-      color: #555;
-    }
-    .confirm-text {
-      color: #e8c88a;
-    }
+    color: var(--ink-faint);
   }
 </style>
