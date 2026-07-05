@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 /// 固定录制格式:16kHz 单声道 s16le。
 pub const AUDIO_SAMPLE_RATE: u32 = 16_000;
 const BYTES_PER_SAMPLE: u64 = 2;
-const HEADER_LEN: u64 = 44;
+/// pub(crate):转码模块(transcode.rs)复用同一 WAV 头长常量,避免两处各写 44 漂移。
+pub(crate) const HEADER_LEN: u64 = 44;
 /// 追加多少样本后刷盘并回写头部尺寸(1s):任意时刻文件都是合法 WAV,崩溃最多丢约 1s。
 const FLUSH_INTERVAL_SAMPLES: u64 = AUDIO_SAMPLE_RATE as u64;
 /// RIFF 头 data 尺寸是 u32,单轨最大数据量(≈37 小时 @16k s16)。达到即停写,
@@ -42,7 +43,9 @@ fn ms_to_bytes(ms: u64) -> u64 {
     ms.saturating_mul(AUDIO_SAMPLE_RATE as u64) / 1000 * BYTES_PER_SAMPLE
 }
 
-fn bytes_to_ms(bytes: u64) -> u64 {
+/// pub(crate):转码模块用它把 WAV data 字节数换算成毫秒(编码前后时长核对),
+/// 与本模块的枚举/对齐共用同一换算,防两处公式分叉。
+pub(crate) fn bytes_to_ms(bytes: u64) -> u64 {
     bytes / BYTES_PER_SAMPLE * 1000 / AUDIO_SAMPLE_RATE as u64
 }
 
@@ -89,7 +92,6 @@ fn save_audio_meta(note_dir: &Path, meta: &AudioMeta) -> anyhow::Result<()> {
 /// list_tracks 据此把该轨道的枚举从 WAV 切到 m4a。
 /// 持 META_LOCK:与 AudioTrackWriter::open 等其它 load→改→save 序列互斥,
 /// 避免并发建档/转码互相覆盖 audio.json。
-#[allow(dead_code)] // Task 5 摘除:转码流水线接入后即有生产调用方
 pub fn set_track_compressed(note_dir: &Path, source: &str, duration_ms: u64) -> anyhow::Result<()> {
     let _guard = meta_guard();
     let mut meta = load_audio_meta(note_dir);
@@ -100,7 +102,6 @@ pub fn set_track_compressed(note_dir: &Path, source: &str, duration_ms: u64) -> 
 }
 
 /// 回落到 WAV 逻辑(如转码失败需要撤销/重录):清掉 codec/duration_ms,offset_ms 不动。
-#[allow(dead_code)] // Task 5 摘除:转码流水线接入后即有生产调用方
 pub fn clear_track_compressed(note_dir: &Path, source: &str) -> anyhow::Result<()> {
     let _guard = meta_guard();
     let mut meta = load_audio_meta(note_dir);
@@ -112,7 +113,9 @@ pub fn clear_track_compressed(note_dir: &Path, source: &str) -> anyhow::Result<(
 }
 
 /// 44 字节标准 PCM WAV 头。data_len 为 data 块字节数。
-fn wav_header(data_len: u32) -> [u8; HEADER_LEN as usize] {
+/// pub(crate):转码模块解码后需把 afconvert 产出的非标准头 WAV(带 FLLR 对齐填充块、
+/// 40 字节 fmt 块)重写回这套标准 44 头,续录端(AudioTrackWriter 假定 44 头)才不踩坑。
+pub(crate) fn wav_header(data_len: u32) -> [u8; HEADER_LEN as usize] {
     let mut h = [0u8; HEADER_LEN as usize];
     h[0..4].copy_from_slice(b"RIFF");
     h[4..8].copy_from_slice(&(36u32.wrapping_add(data_len)).to_le_bytes());
