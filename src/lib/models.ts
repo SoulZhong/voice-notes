@@ -23,6 +23,8 @@ export type Settings = {
   theme: string;
   // 仅录系统声(不录麦克风)
   record_system_only: boolean;
+  // 录制时保持外放音量:麦克风用普通输入代替 VPIO(无 ducking,失去系统回声消除)
+  keep_output_volume: boolean;
   // 转写语言过滤开关
   language_filter: boolean;
   // 是否保留原始录音音频

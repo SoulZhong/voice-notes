@@ -149,7 +149,7 @@
   >
     <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
     <div class="main-line">
-      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || "未命名"}</a>
+      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || `说话人 ${p.id.replace(/^P/, "")}`}</a>
       <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
     </div>
   </li>

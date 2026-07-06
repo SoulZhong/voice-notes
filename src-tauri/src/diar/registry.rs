@@ -1,5 +1,7 @@
 //! 在线增量声纹聚类:两路(mic/system)嵌入汇入同一 Registry,
-//! 得全局「S1..Sn」。纯逻辑、无模型依赖、单线程持有于 ASR worker。
+//! 得全局「S1..Sn」。无模型依赖、单线程持有于 ASR worker。
+//! 唯一的外部副作用点是可选的 enroller 回调(会话中实时入库拿全局 person id),
+//! 由 lib.rs 注入、enroll_pending 触发;不注入时保持纯逻辑。
 
 use std::collections::BTreeSet;
 
@@ -65,14 +67,36 @@ struct Cluster {
     /// snapshot() 导出 count 时减去这部分，只报告本场的净增量——否则种子/续录带来
     /// 的历史 count 会随每场停止 upsert 与库里的 existing count 相加，几何级数膨胀
     /// (见终审 triage②)。合并时两侧基数相加，增量语义在合并后仍然成立。
+    /// 会话中实时入库(mark_enrolled)同样把已上报的 count 记入此基数。
     seed_base_count: u64,
+    /// total_ms 里"已上报给库"的基数(会话中实时入库时记账)。snapshot() 导出
+    /// total_ms 时减去它，停止时的 upsert 才不会把入库时已累加过的时长再加一遍。
+    /// 合并时两侧相加，与 seed_base_count 同一套增量语义。
+    reported_ms: u64,
+    /// 本场实时入库标记。区分「跨会话种子/续录恢复的关联」与「本场新识别出的人」：
+    /// 前者质心来自别的信道/场次，归簇与合并都要用更严的种子阈值防误认；后者质心
+    /// 就是本场刚聚出来的，拿到全局 id 不该反而让归簇变严(否则同一人会话内碎片化)。
+    session_enrolled: bool,
 }
+
+impl Cluster {
+    /// 是否按"跨会话种子"对待(套严格阈值)：关联库人物且非本场实时入库。
+    fn is_seed(&self) -> bool {
+        self.person.is_some() && !self.session_enrolled
+    }
+}
+
+/// 会话中实时入库回调：入参为够料的无主簇快照,返回库分配的全局 person id
+/// (None = 库不可用/入库失败,该簇留待下条 final 重试)。
+pub type EnrollFn = Box<dyn FnMut(&ClusterSnapshot) -> Option<String> + Send>;
 
 pub struct SpeakerRegistry {
     clusters: Vec<Cluster>,
     next_id: u32,
     assigns: u64,
     pending_merges: Vec<(String, String)>,
+    /// (够料门槛 ms, 入库回调)。None = 不做实时入库(测试/库路径不可用)。
+    enroller: Option<(u64, EnrollFn)>,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -95,7 +119,25 @@ impl Default for SpeakerRegistry {
 
 impl SpeakerRegistry {
     pub fn new() -> Self {
-        Self { clusters: Vec::new(), next_id: 1, assigns: 0, pending_merges: Vec::new() }
+        Self { clusters: Vec::new(), next_id: 1, assigns: 0, pending_merges: Vec::new(), enroller: None }
+    }
+
+    /// 装配会话中实时入库回调(lib.rs 在 with_seeds 之后调用)。
+    pub fn set_enroller(&mut self, min_ms: u64, f: EnrollFn) {
+        self.enroller = Some((min_ms, f));
+    }
+
+    /// 跑一轮实时入库：把够料(≥ min_ms)的无主簇经回调入库并 mark_enrolled。
+    /// ASR worker 每条 final 定稿后调用;无回调/无候选时零开销。回调返回 None
+    /// (库降级)不做任何标记,下轮自然重试。
+    pub fn enroll_pending(&mut self) {
+        let Some((min_ms, mut f)) = self.enroller.take() else { return };
+        for cand in self.enroll_candidates(min_ms) {
+            if let Some(pid) = f(&cand) {
+                self.mark_enrolled(&cand.id, &pid);
+            }
+        }
+        self.enroller = Some((min_ms, f));
     }
 
     /// 归簇:与各质心比余弦,≥ 阈值归入最相似簇;
@@ -118,10 +160,12 @@ impl SpeakerRegistry {
             .iter_mut()
             .filter_map(|c| {
                 let sim = dot(&c.centroid, &unit);
-                // 种子簇(关联库 person)用更高阈值:跨会议信道差异大,误命名比不命名糟(待校准)。
+                // 种子簇(关联库 person 且非本场实时入库)用更高阈值:跨会议信道差异大,
+                // 误命名比不命名糟(待校准)。本场实时入库的簇质心是本场新鲜聚出的,
+                // 维持普通阈值——拿到全局 id 不该让归簇变严。
                 // 阈值在候选过滤阶段生效——若全局最相似是"够不着的种子簇",不得挡住
                 // 本可命中的普通簇(否则会话内簇碎片化)。
-                let threshold = if c.person.is_some() { SEED_ASSIGN_THRESHOLD } else { ASSIGN_THRESHOLD };
+                let threshold = if c.is_seed() { SEED_ASSIGN_THRESHOLD } else { ASSIGN_THRESHOLD };
                 (sim >= threshold).then_some((sim, c))
             })
             .max_by(|(a, _), (b, _)| a.total_cmp(b));
@@ -161,6 +205,8 @@ impl SpeakerRegistry {
             total_ms: (num_samples / 16) as u64,
             // 会话内新建的普通簇没有"历史基数"，count 从 0 开始就是纯增量。
             seed_base_count: 0,
+            reported_ms: 0,
+            session_enrolled: false,
         });
         Some(id)
     }
@@ -186,7 +232,12 @@ impl SpeakerRegistry {
                     // - 无主 ↔ 无主维持 MERGE_THRESHOLD(0.74 为首轮真实会议校准,防过度合并)。
                     let pair_threshold = match (&a.person, &b.person) {
                         (Some(x), Some(y)) if x != y => continue,
-                        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => SEED_ASSIGN_THRESHOLD,
+                        // 放宽到归簇同款阈值只适用于"跨会话种子"参与的配对(死区修复的
+                        // 本意)：本场实时入库的簇不是种子,与无主簇合并仍走普通门槛,
+                        // 行为与"尚未入库"时完全一致。
+                        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                            if a.is_seed() || b.is_seed() { SEED_ASSIGN_THRESHOLD } else { MERGE_THRESHOLD }
+                        }
                         (None, None) => MERGE_THRESHOLD,
                     };
                     if dot(&a.centroid, &b.centroid) >= pair_threshold {
@@ -211,11 +262,14 @@ impl SpeakerRegistry {
             winner.count += loser.count;
             winner.seed_base_count += loser.seed_base_count;
             winner.total_ms += loser.total_ms;
+            winner.reported_ms += loser.reported_ms;
             winner.sources.extend(loser.sources.iter().cloned());
-            // winner 无 person 而 loser 有 → 继承(两者都 Some 的情形已被上面的冲突检查挡掉)。
+            // winner 无 person 而 loser 有 → 继承(person 冲突的情形已被上面的检查挡掉)；
+            // session_enrolled 随 person 一起继承，阈值档位跟着身份走。
             if winner.person.is_none() {
                 winner.person = loser.person.clone();
                 winner.person_name = loser.person_name.clone();
+                winner.session_enrolled = loser.session_enrolled;
             }
             self.pending_merges.push((loser.id.clone(), winner.id.clone()));
         }
@@ -247,9 +301,47 @@ impl SpeakerRegistry {
                 count: c.count.saturating_sub(c.seed_base_count),
                 sources: c.sources.clone(),
                 person: c.person.clone(),
+                // 会话中实时入库(mark_enrolled)已把入库时刻的 total_ms 报给库,
+                // 这里同 count 一样只导净增量,防停止时 upsert 重复累加。
+                total_ms: c.total_ms.saturating_sub(c.reported_ms),
+            })
+            .collect()
+    }
+
+    /// 会话中实时入库候选：无主(person=None)、有质心、本场确有出现(sources 非空,
+    /// 排除未命中种子)、累计发声 ≥ min_ms 的簇快照。调用方(lib.rs)入库拿到全局
+    /// person id 后须回调 mark_enrolled，否则每条 final 都会重复导出同一批候选。
+    pub fn enroll_candidates(&self, min_ms: u64) -> Vec<ClusterSnapshot> {
+        self.clusters
+            .iter()
+            .filter(|c| {
+                c.person.is_none()
+                    && !c.centroid.is_empty()
+                    && !c.sources.is_empty()
+                    && c.total_ms >= min_ms
+            })
+            .map(|c| ClusterSnapshot {
+                id: c.id.clone(),
+                centroid: c.centroid.clone(),
+                count: c.count.saturating_sub(c.seed_base_count),
+                sources: c.sources.clone(),
+                person: None,
                 total_ms: c.total_ms,
             })
             .collect()
+    }
+
+    /// 标记簇已实时入库为全局人物：设 person、置 session_enrolled(维持普通归簇/
+    /// 合并阈值,见 is_seed)，并把当前 count/total_ms 记为已上报基数——停止时
+    /// snapshot() 只再导出入库之后的净增量，库侧不双计。未知 id 静默忽略
+    /// (入库与归簇之间该簇可能已被合并掉，person 已由合并继承逻辑处理)。
+    pub fn mark_enrolled(&mut self, id: &str, person: &str) {
+        if let Some(c) = self.clusters.iter_mut().find(|c| c.id == id) {
+            c.person = Some(person.to_string());
+            c.session_enrolled = true;
+            c.seed_base_count = c.count;
+            c.reported_ms = c.total_ms;
+        }
     }
 
     /// 从质心快照重建 registry:编号续接(解析所有 "S{n}" 取最大 n,next_id = n+1)；
@@ -283,10 +375,13 @@ impl SpeakerRegistry {
                     // count 字段)。把它设为本簇的基数，本场结束再导出时才只报告
                     // 本场新产生的净增量，不重复上报上一场已经报过的部分。
                     seed_base_count: s.count,
+                    reported_ms: 0,
+                    // 快照恢复的关联是"上一场"建立的：本场视作跨会话种子(严格阈值)。
+                    session_enrolled: false,
                 });
             }
         }
-        Self { clusters, next_id, assigns: 0, pending_merges: Vec::new() }
+        Self { clusters, next_id, assigns: 0, pending_merges: Vec::new(), enroller: None }
     }
 
     /// 库种子注入:先铺会话快照(续录),再为快照中未出现的 person 建种子簇。
@@ -316,6 +411,8 @@ impl SpeakerRegistry {
                 // 种子的 count 从库带(库里已有的历史样本数)，是纯基数：本场哪怕
                 // 一次都没命中，导出时也不该把这份库存量再报一遍给库自己。
                 seed_base_count: base_count,
+                reported_ms: 0,
+                session_enrolled: false,
             });
         }
         r
@@ -676,6 +773,137 @@ mod tests {
         let snap = r.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].count, 2, "导出 count 应只是本场净增量,不含种子基数 40");
+    }
+
+    #[test]
+    fn enroll_candidates_filters_by_person_centroid_sources_and_ms() {
+        let mut r = SpeakerRegistry::new();
+        // S1: 32000 样本 = 2000ms 长段。
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        assert!(r.enroll_candidates(3000).is_empty(), "累计 2000ms < 3000ms 不够料");
+        let c = r.enroll_candidates(2000);
+        assert_eq!(c.len(), 1, "达到门槛应导出候选");
+        assert_eq!(c[0].id, "S1");
+        assert_eq!(c[0].person, None);
+        assert_eq!(c[0].total_ms, 2000);
+
+        // 已关联 person 的簇不再是候选。
+        r.mark_enrolled("S1", "P7");
+        assert!(r.enroll_candidates(2000).is_empty(), "已入库簇不重复候选");
+
+        // 未命中的种子簇(sources 空)不是候选。
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(0.0, 1.0, 0.0), count: 10 }];
+        let r2 = SpeakerRegistry::with_seeds(&[], &seeds);
+        assert!(r2.enroll_candidates(0).is_empty(), "种子簇有主且 sources 空,不候选");
+    }
+
+    #[test]
+    fn enroll_pending_enrolls_once_and_tolerates_callback_failure() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0u32));
+        let calls2 = calls.clone();
+        let mut r = SpeakerRegistry::new();
+        // 第一次回调失败(库降级),之后成功发 P9。
+        r.set_enroller(
+            2000,
+            Box::new(move |snap| {
+                assert_eq!(snap.id, "S1");
+                let mut n = calls2.lock().unwrap();
+                *n += 1;
+                if *n == 1 { None } else { Some("P9".into()) }
+            }),
+        );
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // 2000ms 够料
+        r.enroll_pending(); // 回调失败 → 不标记,留待重试
+        assert_eq!(r.speakers()[0].person, None);
+        r.enroll_pending(); // 重试成功
+        assert_eq!(r.speakers()[0].person.as_deref(), Some("P9"));
+        r.enroll_pending(); // 已入库,不再候选
+        assert_eq!(*calls.lock().unwrap(), 2, "入库成功后不再重复回调");
+    }
+
+    #[test]
+    fn mark_enrolled_sets_person_and_snapshot_exports_only_increments() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // count=1, 2000ms
+        r.mark_enrolled("S1", "P3");
+        let info = &r.speakers()[0];
+        assert_eq!(info.person.as_deref(), Some("P3"));
+
+        // 入库后再来一条长段:snapshot 只报入库之后的净增量。
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let snap = r.snapshot();
+        assert_eq!(snap[0].count, 1, "count 只报入库后增量(入库前 1 条已上报)");
+        assert_eq!(snap[0].total_ms, 2000, "total_ms 只报入库后增量");
+        assert_eq!(snap[0].person.as_deref(), Some("P3"));
+    }
+
+    #[test]
+    fn session_enrolled_cluster_keeps_normal_assign_threshold() {
+        // 相似度 ~0.65:普通阈值(0.62)可命中,种子阈值(0.68)不可。
+        // 实时入库后仍应命中——拿到全局 id 不该让归簇变严。
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        r.mark_enrolled("S1", "P1");
+        let probe = v(0.65, (1.0f32 - 0.65 * 0.65).sqrt(), 0.0);
+        assert_eq!(r.assign(&probe, "mic", LONG), Some("S1".into()), "0.65 ≥ 0.62 应命中本场入库簇");
+    }
+
+    #[test]
+    fn session_enrolled_cluster_merges_at_normal_threshold_not_seed_threshold() {
+        // 死区修复(0.68 放宽)只适用于跨会话种子:本场入库簇 ↔ 无主簇在 0.71 不得合并
+        // (行为与未入库时一致,无主↔无主 0.71 < 0.74 不并)。
+        let snaps = [
+            ClusterSnapshot {
+                id: "S1".into(),
+                centroid: v(1.0, 0.0, 0.0),
+                count: 2,
+                sources: BTreeSet::from(["mic".to_string()]),
+                person: None,
+                total_ms: 0,
+            },
+            ClusterSnapshot {
+                id: "S2".into(),
+                centroid: v(0.71, 0.70413, 0.0), // 与 e1 余弦 ≈ 0.710
+                count: 1,
+                sources: BTreeSet::from(["mic".to_string()]),
+                person: None,
+                total_ms: 0,
+            },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&snaps, &[]);
+        r.mark_enrolled("S1", "P1");
+        assert!(r.take_merges().is_empty(), "本场入库簇按普通门槛,0.71 < 0.74 不并");
+
+        // 对照:同构型但 S1 是快照恢复的有主簇(跨会话) → 0.68 档,0.71 应并。
+        let mut snaps_seeded = snaps.clone();
+        snaps_seeded[0].person = Some("P1".into());
+        let mut r2 = SpeakerRegistry::with_seeds(&snaps_seeded, &[]);
+        assert_eq!(r2.take_merges().len(), 1, "跨会话有主簇维持死区修复档,0.71 应并");
+    }
+
+    #[test]
+    fn merge_sums_reported_ms_and_stop_snapshot_stays_incremental() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1 2000ms
+        r.mark_enrolled("S1", "P1"); // 报掉 2000ms
+        // S2 无主,与 S1 相向漂移后合并(S1 已入库,S2 并入)。
+        r.assign(&v(0.30, 0.954, 0.0), "mic", LONG).unwrap(); // S2 2000ms
+        for k in 1..=10 {
+            let t = 0.30 + 0.05 * k as f32;
+            let y = (1.0 - t * t).max(0.0).sqrt();
+            r.assign(&v(t, y, 0.0), "mic", LONG).unwrap();
+        }
+        for _ in 0..12 {
+            r.assign(&v(0.90, 0.436, 0.0), "mic", LONG).unwrap();
+        }
+        let merges = r.take_merges();
+        assert_eq!(merges.len(), 1, "相向漂移后应合并");
+        assert_eq!(r.speakers().len(), 1);
+        assert_eq!(r.speakers()[0].person.as_deref(), Some("P1"), "person 随合并保留");
+        let snap = r.snapshot();
+        // 全部长段 24 条 × 2000ms = 48000ms,入库时已报 2000ms → 增量 46000ms。
+        assert_eq!(snap[0].total_ms, 46000, "合并后 reported_ms 基数保留,导出仍是净增量");
     }
 
     #[test]

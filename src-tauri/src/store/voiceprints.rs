@@ -684,6 +684,55 @@ mod tests {
         assert!(!tmp.path().join("voiceprints").exists(), "非法 id 不产生任何样本文件");
     }
 
+    /// 会话中实时入库端到端:enroller 装配后,无主簇够料(≥AUTO_ENROLL_MS)当场入库
+    /// 领 P id;停止时的 snapshot→upsert 只再报入库之后的净增量,库 count/total_ms
+    /// 线性增长不双计(与种子 triage②同一套增量语义)。
+    #[test]
+    fn live_enroll_then_stop_upsert_does_not_double_count() {
+        use crate::diar::registry::SpeakerRegistry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let store_cb = VoiceprintStore::new(tmp.path().to_path_buf());
+
+        let mut r = SpeakerRegistry::new();
+        r.set_enroller(
+            AUTO_ENROLL_MS,
+            Box::new(move |snap| {
+                store_cb.upsert_from_session(std::slice::from_ref(snap), "t-live").ok()
+                    .and_then(|links| links.get(&snap.id).cloned())
+            }),
+        );
+
+        // 5 段 × 2s = 10s 恰达门槛;每段后跑一轮 enroll_pending(仿 process_final 节奏)。
+        for _ in 0..5 {
+            r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+            r.enroll_pending();
+        }
+        let pid = r.speakers()[0].person.clone().expect("够料后应已实时入库");
+        {
+            let vp = store.load();
+            assert_eq!(vp.people[&pid].centroids["mic"].count, 5);
+            assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS);
+        }
+
+        // 入库后又说 2 段(4s),停止:snapshot 应只报增量,upsert 后线性累计。
+        r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+        r.enroll_pending();
+        r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+        r.enroll_pending();
+        let snaps = r.snapshot();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].person.as_deref(), Some(pid.as_str()));
+        assert_eq!(snaps[0].count, 2, "停止快照只报入库后的净增量");
+        assert_eq!(snaps[0].total_ms, 4000);
+        store.upsert_from_session(&snaps, "t-stop").unwrap();
+        let vp = store.load();
+        assert_eq!(vp.people[&pid].centroids["mic"].count, 7, "5+2 线性增长,不双计");
+        assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS + 4000);
+        assert_eq!(vp.people[&pid].last_seen, "t-stop");
+    }
+
     /// 终审 triage②端到端:种子带库 count=40 注入本场 registry,命中两次长段后停止。
     /// registry::snapshot() 应只导出本场净增量(2),upsert 回库后 count 应线性长到
     /// 42,而不是把种子基数 40 再报一遍变成 82(40+42)——回归"每场停止近似翻倍,库

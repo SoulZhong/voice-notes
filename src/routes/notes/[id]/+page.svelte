@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -121,17 +122,62 @@
     return s;
   });
 
-  // 播放中自动跟随滚动到当前段(nearest:不打断用户往回翻看太远)。
-  let lastScrolledSeq = -1;
-  $effect(() => {
-    if (!playerPlaying) return;
-    const first = displaySegments.find((s) => activeSeqs.has(s.seq));
-    if (first && first.seq !== lastScrolledSeq) {
-      lastScrolledSeq = first.seq;
-      document
-        .querySelector(`[data-seq="${first.seq}"]`)
-        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  // ── 播放歌词式跟随(与录制页同一交互):当前段钉屏幕垂直中央、放大高亮;
+  //    用户 wheel 上滑即暂停跟随,浮出「回到播放位置」;点击或重新播放恢复。 ──
+  let transcriptEl = $state<HTMLElement | null>(null);
+  let follow = $state(true);
+
+  /** 最近的可滚动祖先(布局里的 .main);不硬编码布局选择器。 */
+  function scrollParent(): HTMLElement | null {
+    for (let p = transcriptEl?.parentElement; p; p = p.parentElement) {
+      if (/(auto|scroll)/.test(getComputedStyle(p).overflowY)) return p;
     }
+    return null;
+  }
+
+  /** 当前播放段(时间轴首个命中;mic/system 重叠时两段都高亮,居中锚定首个)。 */
+  const currentSeq = $derived.by(() => {
+    const first = displaySegments.find((s) => activeSeqs.has(s.seq));
+    return first ? first.seq : null;
+  });
+
+  function centerCurrent() {
+    if (currentSeq === null) return;
+    document
+      .querySelector(`[data-seq="${currentSeq}"]`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function resumeFollow() {
+    follow = true;
+    lastScrolledSeq = -1;
+    centerCurrent();
+  }
+
+  let lastScrolledSeq = -1;
+  // 按下播放 = 想跟着听:恢复跟随并立即居中一次。untrack 隔离 resumeFollow 内部
+  // 读到的 currentSeq,否则播放推进会不断重跑本 effect,把用户的"暂停跟随"顶掉。
+  $effect(() => {
+    if (playerPlaying) untrack(resumeFollow);
+  });
+  $effect(() => {
+    if (!playerPlaying || !follow) return;
+    if (currentSeq !== null && currentSeq !== lastScrolledSeq) {
+      lastScrolledSeq = currentSeq;
+      centerCurrent();
+    }
+  });
+
+  // wheel 上滑 = 主动离开(平滑滚动只产生 scroll 事件,不会误判);内容不足一屏不触发。
+  $effect(() => {
+    if (!transcriptEl) return;
+    const sc = scrollParent();
+    if (!sc) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0 && playerPlaying && sc.scrollHeight > sc.clientHeight + 4) follow = false;
+    };
+    sc.addEventListener("wheel", onWheel, { passive: true });
+    return () => sc.removeEventListener("wheel", onWheel);
   });
 
   function playFrom(seg: SegmentRecord) {
@@ -141,6 +187,7 @@
     if (seg.start_ms >= player.durationMs()) return;
     player.seek(seg.start_ms);
     player.play();
+    resumeFollow(); // 点时间戳跳播 = 想跟着听
   }
 
   function segFocus(s: SegmentRecord) {
@@ -317,7 +364,7 @@
       }}
     />
 
-    <div class="transcript">
+    <div class="transcript" class:live={playerPlaying} bind:this={transcriptEl}>
       {#each displaySegments as seg (seg.seq)}
         <div class="seg" class:playing={activeSeqs.has(seg.seq)} data-seq={seg.seq}>
           {#if canEdit && speakerMenuSeq === seg.seq}
@@ -333,7 +380,7 @@
           {:else}
             <button
               class="badge as-btn"
-              style="background: {speakerColor(seg.speaker, seg.source)}; color: {speakerInk(seg.speaker, seg.source)}"
+              style="background: {speakerColor(seg.speaker, seg.source, note.speakers)}; color: {speakerInk(seg.speaker, seg.source, note.speakers)}"
               disabled={!canEdit}
               title={canEdit ? "点击改说话人" : ""}
               onclick={() => (speakerMenuSeq = seg.seq)}
@@ -385,6 +432,13 @@
       {/each}
       {#if displaySegments.length === 0}
         <p class="hint">（这场会议没有转写内容）</p>
+      {/if}
+    </div>
+
+    <!-- 跟随被用户上滑打断时的返回入口(与录制页同款):sticky 钉滚动视口底部 -->
+    <div class="jump-anchor">
+      {#if !follow && playerPlaying}
+        <button class="jump" onclick={resumeFollow}>↓ 回到播放位置</button>
       {/if}
     </div>
   {/if}
@@ -512,15 +566,63 @@
   .transcript p {
     margin: 0 0 6px;
   }
+  /* 播放中(歌词式,与录制页同构):底部 50vh 留白让最后几段也能居中;
+     历史/未播段退次级墨色,当前段放大高亮钉屏幕中央。暂停即全部还原。 */
+  .transcript.live {
+    /* 顶部留白:开头几段也能被 scrollIntoView 推到中央(上方内容不够高时没它推不动) */
+    padding-top: 40vh;
+    padding-bottom: 50vh;
+  }
+  .transcript.live .seg {
+    color: var(--ink-secondary);
+  }
   .seg {
     margin: 0 0 6px;
     line-height: 1.7;
     border-radius: var(--radius-sm);
-    transition: background 120ms ease;
+    transition:
+      background 120ms ease,
+      font-size 0.2s ease,
+      color 0.2s ease;
   }
   /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
   .seg.playing {
     background: var(--accent-tint);
+  }
+  /* 当前播放段(仅播放中):放大 + 主墨色 + 轻投影,歌词感;负边距抵掉内缩,行左缘对齐不跳 */
+  .transcript.live .seg.playing {
+    font-size: 1.5em;
+    line-height: 1.55;
+    color: var(--ink);
+    padding: 0.3em 0.55em;
+    margin-left: -0.55em;
+    margin-right: -0.55em;
+    border-radius: var(--radius-md);
+    box-shadow: 0 4px 14px light-dark(rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.45));
+  }
+
+  /* 「回到播放位置」药丸:零高锚点 + sticky bottom(与录制页同款) */
+  .jump-anchor {
+    position: sticky;
+    bottom: 1rem;
+    height: 0;
+    display: flex;
+    justify-content: center;
+  }
+  .jump {
+    transform: translateY(-100%);
+    border: none;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    color: var(--on-primary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.4em 1em;
+    cursor: pointer;
+    box-shadow: var(--shadow-popover);
+  }
+  .jump:hover {
+    background: var(--primary-pressed);
   }
   .badge.as-btn {
     border: none;

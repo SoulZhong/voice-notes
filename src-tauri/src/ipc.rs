@@ -53,6 +53,9 @@ pub struct SpeakerEntry {
     pub id: String,
     pub name: String,
     pub sources: Vec<String>,
+    /// 关联的全局声纹库人物 id(P<n>)：实时入库/种子命中后即有。前端以它为
+    /// 说话人的全局唯一编号展示;None = 尚未够料入库(新声音的短暂过渡态)。
+    pub person_id: Option<String>,
 }
 
 /// 一次簇合并：loser 的历史段应在前端改写为 winner，使历史徽章与新段统一。
