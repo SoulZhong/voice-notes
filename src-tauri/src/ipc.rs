@@ -106,3 +106,13 @@ pub struct ModelDownloadEvent {
     /// error 时的原因说明，其余为空串。
     pub message: String,
 }
+
+/// 会后精修进度，事件名 "refine"。stage ∈ {"filter","recluster","llm","all"}；
+/// state ∈ {"running","done","failed","partial","skipped","off"}（含义随 stage 而定，
+/// 语义与 store::RefineStages/RefinedDoc.stages 的字符串一致）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RefineEvent {
+    pub note_id: String,
+    pub stage: String,
+    pub state: String,
+}

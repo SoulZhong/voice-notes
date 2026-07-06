@@ -31,6 +31,11 @@ export type SpeakersEvent = {
   speakers: SpeakerEntry[];
   merged: { loser: string; winner: string } | null;
 };
+export type RefineEvent = {
+  note_id: string;
+  stage: string;
+  state: string;
+};
 
 export function onPartial(cb: (e: PartialEvent) => void) {
   return listen<PartialEvent>("partial", (ev) => cb(ev.payload));
@@ -56,4 +61,8 @@ export type LevelEvent = { rms: number };
 
 export function onLevel(cb: (e: LevelEvent) => void) {
   return listen<LevelEvent>("level", (ev) => cb(ev.payload));
+}
+
+export function onRefine(cb: (e: RefineEvent) => void) {
+  return listen<RefineEvent>("refine", (ev) => cb(ev.payload));
 }

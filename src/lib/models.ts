@@ -35,6 +35,14 @@ export type Settings = {
   shortcut: string;
   // 系统托盘图标开关
   tray_enabled: boolean;
+  // ASR 精修开关
+  refine_enabled: boolean;
+  // ASR 精修服务基础 URL
+  refine_base_url: string;
+  // ASR 精修 LLM 模型
+  refine_model: string;
+  // ASR 精修 API 密钥
+  refine_api_key: string;
 };
 export type ModelDownloadEvent = {
   artifact: string;

@@ -255,6 +255,37 @@ struct QState {
     paused: bool,
 }
 
+/// 16k 单声道 s16le WAV → f32 samples(复用 extract_wav_data 的胖头兼容)。
+pub fn read_wav_f32(wav: &Path) -> anyhow::Result<Vec<f32>> {
+    let data = extract_wav_data(wav)?;
+    Ok(data
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect())
+}
+
+/// 取某音轨全场 PCM:停止后 wav 尚在盘上直读;转码完成后仅剩 m4a 则解码到临时 wav 再读。
+pub fn track_pcm(note_dir: &Path, source: &str) -> anyhow::Result<Vec<f32>> {
+    let wav = note_dir.join(format!("{source}.wav"));
+    if wav.exists() {
+        return read_wav_f32(&wav);
+    }
+    let m4a = note_dir.join(format!("{source}.m4a"));
+    if !m4a.exists() {
+        anyhow::bail!("音轨 {source} 的 wav/m4a 均不存在于 {:?}", note_dir);
+    }
+    let tmp = note_dir.join(format!(".{source}.refine.wav.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    // 失败也要清 tmp:afconvert 可能已写出半截文件,不清就永久残留在笔记目录。
+    if let Err(e) = afconvert_decode(&m4a, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let out = read_wav_f32(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
 /// 全局串行转码队列:整个进程只有一个 worker 线程按序转码,永不并发跑 afconvert。
 ///
 /// 为什么要队列而不是「停录就地转」:转一笔要跑数秒的 afconvert 子进程,若停录线程
@@ -500,6 +531,46 @@ mod queue_tests {
 mod tests {
     use super::*;
     use crate::store::audio::AudioTrackWriter;
+
+    #[test]
+    fn read_wav_f32_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("t.wav");
+        let spec = hound::WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..1600 { w.write_sample(((i % 100) * 300) as i16).unwrap(); }
+        w.finalize().unwrap();
+        let pcm = read_wav_f32(&wav).unwrap();
+        assert_eq!(pcm.len(), 1600);
+        assert!(pcm.iter().all(|x| x.abs() <= 1.0));
+    }
+
+    #[test]
+    fn track_pcm_prefers_wav_and_falls_back_to_m4a() {
+        let dir = tempfile::tempdir().unwrap();
+        // 只有 wav:直读
+        let wav = dir.path().join("mic.wav");
+        let spec = hound::WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..320 { w.write_sample(1000i16).unwrap(); }
+        w.finalize().unwrap();
+        assert_eq!(track_pcm(dir.path(), "mic").unwrap().len(), 320);
+        // 两者皆无:报错带路径
+        let err = track_pcm(dir.path(), "system").unwrap_err();
+        assert!(err.to_string().contains("system"));
+    }
+
+    #[test]
+    fn track_pcm_decode_failure_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        // 垃圾字节的假 m4a:afconvert 解码必失败,失败路径也不得残留 tmp。
+        std::fs::write(dir.path().join("system.m4a"), b"not an m4a").unwrap();
+        assert!(track_pcm(dir.path(), "system").is_err());
+        assert!(
+            !dir.path().join(".system.refine.wav.tmp").exists(),
+            "解码失败后临时文件必须被清理"
+        );
+    }
 
     fn make_note_with_wav(ms: u64) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

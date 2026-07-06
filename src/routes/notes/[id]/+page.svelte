@@ -4,10 +4,13 @@
   import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
+  import { onRefine } from "$lib/events";
   import {
     getNote,
     renameNote,
     exportNote,
+    getRefined,
+    refineNote,
     formatTs,
     formatDate,
     formatDuration,
@@ -22,6 +25,7 @@
     type Note,
     type SegmentRecord,
     type TrackInfo,
+    type RefinedDoc,
   } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -36,6 +40,12 @@
   let focusedSeq = $state<number | null>(null);
   let confirmSeq = $state<number | null>(null);
   let speakerMenuSeq = $state<number | null>(null);
+
+  // 精修稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
+  let refined = $state<RefinedDoc | null>(null);
+  let refining = $state(false);
+  let refineErr = $state("");
+  let viewMode = $state<"refined" | "raw">("refined");
 
   const id = $derived($page.params.id as string);
 
@@ -53,6 +63,13 @@
   const canEdit = $derived(!(recording.isLive && recording.noteId === id));
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
 
+  /** 精修稿是否可展示：无精修结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
+  const refinedAvailable = $derived(!!refined && note?.meta.state === "complete");
+  /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
+  const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
+  /** 原始稿中被精修过滤掉的段（灰显用）。 */
+  const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
+
   function durationSecs(n: Note): number | null {
     // 活跃时长优先：段落时间轴最大 end_ms（与转写时间戳/录制计时一致，不含暂停）；
     // 无段落回退墙钟时长。
@@ -67,12 +84,16 @@
   }
 
   async function refresh() {
+    // 并行发起，note 失败才是真正的加载失败；refined 是增值层，取不到静默按无精修处理。
+    const notePromise = getNote(id);
+    const refinedPromise = getRefined(id).catch(() => null);
     try {
-      note = await getNote(id);
+      note = await notePromise;
       error = "";
     } catch (e) {
       error = `加载失败: ${e}`;
     }
+    refined = await refinedPromise;
   }
 
   // 轨道获取独立于 refresh:canEdit 必须在 await 之前同步读到才会成为 effect 依赖
@@ -95,13 +116,42 @@
       });
   });
 
-  // id 切换：无条件复位一切编辑态。
+  // id 切换：无条件复位一切编辑态 + 精修视图态（否则会短暂展示上一篇笔记的精修稿/进度）。
   $effect(() => {
     void id;
     editing = false;
     focusedSeq = null;
     speakerMenuSeq = null;
     confirmSeq = null;
+    refined = null;
+    refining = false;
+    refineErr = "";
+    viewMode = "refined";
+  });
+
+  // 精修进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
+  // running 置 refining=true；stage="all" 是整体完成信号，done/failed 都要重新拉取 refined 并复位。
+  $effect(() => {
+    const forId = id;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    onRefine((e) => {
+      if (e.note_id !== forId) return;
+      if (e.state === "running") refining = true;
+      if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
+        refining = false;
+        getRefined(forId).then((r) => {
+          if (forId === id) refined = r;
+        });
+      }
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   });
   // 刷新：任何编辑进行中都跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
   $effect(() => {
@@ -180,12 +230,13 @@
     return () => sc.removeEventListener("wheel", onWheel);
   });
 
-  function playFrom(seg: SegmentRecord) {
+  /** 只需要 start_ms：原始段(SegmentRecord)与精修段(RefinedParagraph)都结构兼容,共用同一播放逻辑。 */
+  function playFrom(pos: { start_ms: number }) {
     if (!player) return;
-    // 段起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
+    // 起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
     // 否则 seek 被钳到末尾、play 又视作"播完重来",会莫名跳回 0:00。
-    if (seg.start_ms >= player.durationMs()) return;
-    player.seek(seg.start_ms);
+    if (pos.start_ms >= player.durationMs()) return;
+    player.seek(pos.start_ms);
     player.play();
     resumeFollow(); // 点时间戳跳播 = 想跟着听
   }
@@ -264,6 +315,17 @@
       await revealItemInDir(path);
     } catch (e) {
       error = `导出失败: ${e}`;
+    }
+  }
+
+  async function rerunRefine() {
+    refineErr = "";
+    refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次精修
+    try {
+      await refineNote(id);
+    } catch (e) {
+      refining = false;
+      refineErr = `重新精修失败: ${e}`;
     }
   }
 
@@ -364,74 +426,132 @@
       }}
     />
 
+    <div class="view-switch">
+      <button
+        class="link"
+        class:active={effectiveView === "refined"}
+        disabled={!refinedAvailable}
+        title={refinedAvailable ? "" : "尚无精修稿"}
+        onclick={() => (viewMode = "refined")}
+      >
+        精修稿
+      </button>
+      <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
+        原始逐字稿
+      </button>
+      <span class="spacer"></span>
+      <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
+        {refining ? "正在精修…" : "重新精修"}
+      </button>
+    </div>
+
+    {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
+    {#if effectiveView === "refined" && refined}
+      {#if refined.stages.llm === "partial"}
+        <div class="banner">部分段落精修失败，已保留原文，可重新精修。</div>
+      {:else if refined.stages.llm === "failed"}
+        <div class="banner banner-danger">LLM 精修失败，当前展示本地精修结果。</div>
+      {/if}
+    {/if}
+
     <div class="transcript" class:live={playerPlaying} bind:this={transcriptEl}>
-      {#each displaySegments as seg (seg.seq)}
-        <div class="seg" class:playing={activeSeqs.has(seg.seq)} data-seq={seg.seq}>
-          {#if canEdit && speakerMenuSeq === seg.seq}
-            <span class="badge-menu">
-              {#each speakerIds as sid (sid)}
-                <button class="menu-item" onclick={() => doSetSpeaker(seg, sid)}>
-                  {speakerLabel(sid, seg.source, note.speakers)}
-                </button>
-              {/each}
-              <button class="menu-item new" onclick={() => doSetSpeaker(seg, "new")}>＋ 新说话人</button>
-              <button class="menu-item" onclick={() => (speakerMenuSeq = null)}>取消</button>
-            </span>
-          {:else}
-            <button
-              class="badge as-btn"
-              style="background: {speakerColor(seg.speaker, seg.source, note.speakers)}; color: {speakerInk(seg.speaker, seg.source, note.speakers)}"
-              disabled={!canEdit}
-              title={canEdit ? "点击改说话人" : ""}
-              onclick={() => (speakerMenuSeq = seg.seq)}
-            >
-              {speakerLabel(seg.speaker, seg.source, note.speakers)}
-            </button>
-          {/if}
-          {#if tracks.length > 0}
-            <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom(seg)}>
-              {formatTs(seg.start_ms)}
-            </button>
-          {:else}
-            <span class="ts">{formatTs(seg.start_ms)}</span>
-          {/if}
-          {#if canEdit}
-            <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
-                 失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
+      {#if effectiveView === "refined" && refined}
+        {#each refined.paragraphs as p, i (i)}
+          <div class="para">
             <span
-              class="seg-text editable"
-              contenteditable="plaintext-only"
-              role="textbox"
-              tabindex="0"
-              spellcheck="false"
-              onfocus={() => segFocus(seg)}
-              onblur={(e) => segBlur(e, seg)}
-              onkeydown={(e) => {
-                const el = e.currentTarget as HTMLElement;
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  el.blur();
-                }
-                if (e.key === "Escape") {
-                  el.textContent = seg.text;
-                  el.blur();
-                }
-              }}>{seg.text}</span>
-            <span class="seg-actions">
-              {#if confirmSeq === seg.seq}
-                <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
-                <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
-              {:else}
-                <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
-              {/if}
+              class="badge"
+              style="background: {speakerColor(p.speaker, 'mic', note.speakers)}; color: {speakerInk(p.speaker, 'mic', note.speakers)}"
+            >
+              {p.name ?? p.speaker}
             </span>
-          {:else}
-            <span class="seg-text">{seg.text}</span>
-          {/if}
-        </div>
-      {/each}
-      {#if displaySegments.length === 0}
-        <p class="hint">（这场会议没有转写内容）</p>
+            {#if tracks.length > 0}
+              <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom({ start_ms: p.start_ms })}>
+                {formatTs(p.start_ms)}
+              </button>
+            {:else}
+              <span class="ts">{formatTs(p.start_ms)}</span>
+            {/if}
+            <span class="para-text">{p.text}</span>
+          </div>
+        {/each}
+        {#if refined.paragraphs.length === 0}
+          <p class="hint">（精修稿为空）</p>
+        {/if}
+      {:else}
+        {#each displaySegments as seg (seg.seq)}
+          <div
+            class="seg"
+            class:playing={activeSeqs.has(seg.seq)}
+            class:discarded={discardedSeqs.has(seg.seq)}
+            title={discardedSeqs.has(seg.seq) ? "已被精修过滤" : undefined}
+            data-seq={seg.seq}
+          >
+            {#if canEdit && speakerMenuSeq === seg.seq}
+              <span class="badge-menu">
+                {#each speakerIds as sid (sid)}
+                  <button class="menu-item" onclick={() => doSetSpeaker(seg, sid)}>
+                    {speakerLabel(sid, seg.source, note.speakers)}
+                  </button>
+                {/each}
+                <button class="menu-item new" onclick={() => doSetSpeaker(seg, "new")}>＋ 新说话人</button>
+                <button class="menu-item" onclick={() => (speakerMenuSeq = null)}>取消</button>
+              </span>
+            {:else}
+              <button
+                class="badge as-btn"
+                style="background: {speakerColor(seg.speaker, seg.source, note.speakers)}; color: {speakerInk(seg.speaker, seg.source, note.speakers)}"
+                disabled={!canEdit}
+                title={canEdit ? "点击改说话人" : ""}
+                onclick={() => (speakerMenuSeq = seg.seq)}
+              >
+                {speakerLabel(seg.speaker, seg.source, note.speakers)}
+              </button>
+            {/if}
+            {#if tracks.length > 0}
+              <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom(seg)}>
+                {formatTs(seg.start_ms)}
+              </button>
+            {:else}
+              <span class="ts">{formatTs(seg.start_ms)}</span>
+            {/if}
+            {#if canEdit}
+              <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
+                   失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
+              <span
+                class="seg-text editable"
+                contenteditable="plaintext-only"
+                role="textbox"
+                tabindex="0"
+                spellcheck="false"
+                onfocus={() => segFocus(seg)}
+                onblur={(e) => segBlur(e, seg)}
+                onkeydown={(e) => {
+                  const el = e.currentTarget as HTMLElement;
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    el.blur();
+                  }
+                  if (e.key === "Escape") {
+                    el.textContent = seg.text;
+                    el.blur();
+                  }
+                }}>{seg.text}</span>
+              <span class="seg-actions">
+                {#if confirmSeq === seg.seq}
+                  <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
+                  <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
+                {:else}
+                  <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
+                {/if}
+              </span>
+            {:else}
+              <span class="seg-text">{seg.text}</span>
+            {/if}
+          </div>
+        {/each}
+        {#if displaySegments.length === 0}
+          <p class="hint">（这场会议没有转写内容）</p>
+        {/if}
       {/if}
     </div>
 
@@ -589,6 +709,18 @@
   .seg.playing {
     background: var(--accent-tint);
   }
+  /* 被精修过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
+  .seg.discarded {
+    opacity: 0.38;
+  }
+  /* 精修稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
+  .para {
+    margin: 0 0 6px;
+    line-height: 1.7;
+  }
+  .para-text {
+    white-space: pre-wrap;
+  }
   /* 当前播放段(仅播放中):放大 + 主墨色 + 轻投影,歌词感;负边距抵掉内缩,行左缘对齐不跳 */
   .transcript.live .seg.playing {
     font-size: 1.5em;
@@ -667,6 +799,33 @@
   .link.danger {
     color: var(--danger);
     font-weight: 500;
+  }
+  .link:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .link:disabled:hover {
+    text-decoration: none;
+  }
+  /* 视图切换条:精修稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新精修(默认 button-secondary)。 */
+  .view-switch {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+    margin: 0 0 0.75rem;
+  }
+  .view-switch .link {
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.35em 0.7em;
+    border-radius: var(--radius-md);
+  }
+  .view-switch .link.active {
+    background: var(--accent-tint);
+    color: var(--accent);
+  }
+  .view-switch .spacer {
+    flex: 1;
   }
   /* menu/popover（改说话人菜单）：surface-press 底、hairline 边、rounded-lg、shadow-popover
      （暗色下 canvas 比承载面更黑，浮层用 canvas 会成"洞"，故底走 surface-press）。 */

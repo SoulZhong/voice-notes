@@ -1,5 +1,6 @@
 pub mod whisper;
 pub mod sense_voice;
+pub mod paraformer;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone, Default)]

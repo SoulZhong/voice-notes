@@ -9,6 +9,7 @@ mod shortcuts;
 mod store;
 mod tray;
 pub mod diar;
+mod refine;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,6 +94,9 @@ struct AppState {
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
     transcode: Arc<store::transcode::TranscodeQueue>,
+    /// 正在精修的 note id 集，防重入：停止钩子与手动重跑（refine_note）共用同一把锁；
+    /// 自带独立叶子锁，与上面几把锁完全解耦（spawn_refine 只在极短语句内持有）。
+    refining: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -108,6 +112,7 @@ impl Default for AppState {
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
+            refining: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -215,6 +220,151 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
+/// LLM 精修配置是否齐备（四项均非空/非关闭才可跑）：抽成纯函数供 spawn_refine 判定与单测，
+/// 避免把「要不要发起网络请求」这条判断逻辑埋进整个后台线程闭包里难以单独验证。
+fn refine_llm_ready(s: &settings::Settings) -> bool {
+    s.refine_enabled
+        && !s.refine_base_url.is_empty()
+        && !s.refine_model.is_empty()
+        && !s.refine_api_key.is_empty()
+}
+
+/// resume_recording 是否应因该笔记正在精修而拒绝：抽成纯函数供命令层判定与单测。
+///
+/// 背景（F1 音频丢失窗口）：精修完成后才把该目录 `transcode.enqueue`（见 spawn_refine），
+/// 而 `resume_recording` 会先 `transcode.cancel_and_wait` 再开始向 mic.wav 追加写。若精修
+/// 仍在跑（尚未 enqueue），cancel_and_wait 看到空队列直接放行，续录写入照常开始；随后精修
+/// 收尾时才 enqueue，转码 worker 对着"活跃在追加"的 WAV 编码并 `remove_file`，续录段音频
+/// 永久丢失。故续录入口必须挡在最前面：该 id 仍在 `state.refining` 集中就直接拒绝。
+fn resume_blocked_by_refining(refining: &std::collections::HashSet<String>, id: &str) -> bool {
+    refining.contains(id)
+}
+
+/// 会后精修：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
+/// 移交转码 → 视配置可选 LLM。全程 catch_unwind，任何一步失败/panic 只留日志与
+/// "failed" 事件，绝不影响已落盘的 segments/speakers——refined.json 是纯增值产物。
+///
+/// 转码入队保证：`enqueue_transcode_after_local` 为真时，`state.transcode.enqueue`
+/// 在本函数返回前必然被调用至少一次（多次调用因 TranscodeQueue::enqueue 按目录去重
+/// 而完全无害）。正常路径下 run_local 本身不返回 Result（内部已把嵌入/重聚类失败降级
+/// 编码进 stages 里），因此唯一可能"来不及入队就退出"的窗口，是入队那行代码之前的
+/// dir/note 解析（notes_dir 不可用、NoteStore::load 失败）或任意一步 panic；这些情形
+/// 由 catch_unwind 之后的兜底分支统一补一次 enqueue（用 `enqueued` 标记避免语义混淆，
+/// 但即使漏标也不会重复造成问题，因为 enqueue 本身幂等）。
+fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
+    let state: tauri::State<AppState> = app.state();
+    {
+        let mut set = state.refining.lock().unwrap();
+        if !set.insert(note_id.clone()) {
+            // 已在精修中：命令层（refine_note）已提前拒绝重复手动触发，这里只是双保险，
+            // 静默跳过——原本那次精修仍会走完自己的转码承诺。
+            return;
+        }
+    }
+    let refining = state.refining.clone();
+    let transcode = state.transcode.clone();
+    let session = state.session.clone();
+    std::thread::spawn(move || {
+        // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在精修完成前重开
+        // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
+        // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
+        // 持有。跳过不等于丢转码:续录自身在其最终停止时会重新走一遍精修+转码移交。
+        let is_resumed_by_active_session = |note_id: &str| -> bool {
+            session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false)
+        };
+        let emit = |stage: &str, st: &str| {
+            let _ = app.emit(
+                "refine",
+                ipc::RefineEvent { note_id: note_id.clone(), stage: stage.into(), state: st.into() },
+            );
+        };
+        let enqueued = std::cell::Cell::new(false);
+        let result: std::thread::Result<anyhow::Result<()>> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit("all", "running");
+                let root = notes_dir(&app)?;
+                let dir = root.join(&note_id);
+                // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
+                // 排序）+ speakers 表。
+                let note = store::NoteStore::new(root).load(&note_id)?;
+                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        eprintln!("refine: 声纹模型不可用，跳过重聚类: {e}");
+                        None
+                    }
+                };
+                let seeds = load_voiceprint_seeds(&app);
+                let mut doc = refine::run_local(
+                    &dir,
+                    &note.segments,
+                    &note.speakers,
+                    embedder.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
+                    &seeds,
+                    &chrono::Local::now().to_rfc3339(),
+                );
+                emit("filter", &doc.stages.filter);
+                emit("recluster", &doc.stages.recluster);
+                if enqueue_transcode_after_local {
+                    if is_resumed_by_active_session(&note_id) {
+                        eprintln!(
+                            "refine({note_id}): 续录已在本笔记上重新开始,跳过本轮转码入队(续录停止时会再次入队)。"
+                        );
+                    } else {
+                        // 本地两段已读完 WAV：此刻移交转码最早也最安全（不再有人读原始 WAV）。
+                        transcode.enqueue(dir.clone());
+                    }
+                    enqueued.set(true);
+                }
+                let s = match app.path().app_data_dir() {
+                    Ok(d) => settings::load(&d),
+                    Err(_) => settings::Settings::default(),
+                };
+                if refine_llm_ready(&s) {
+                    emit("llm", "running");
+                    let cfg = refine::llm::LlmConfig {
+                        base_url: s.refine_base_url.clone(),
+                        model: s.refine_model.clone(),
+                        api_key: s.refine_api_key.clone(),
+                    };
+                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model) {
+                        eprintln!("refine: llm 落盘失败: {e}");
+                    }
+                }
+                emit("llm", &doc.stages.llm);
+                anyhow::Ok(())
+            }));
+        match &result {
+            Ok(Ok(())) => emit("all", "done"),
+            Ok(Err(e)) => {
+                eprintln!("refine({note_id}): 管线失败: {e}");
+                emit("all", "failed");
+            }
+            Err(_) => {
+                eprintln!("refine({note_id}): 管线 panic");
+                emit("all", "failed");
+            }
+        }
+        // 兜底：前置失败/panic 导致上面从未走到 enqueue 那一行时补一次；enqueue 幂等，
+        // 重复调用（包括与正常路径里已入队的那次重复）绝对安全。
+        if enqueue_transcode_after_local && !enqueued.get() {
+            if is_resumed_by_active_session(&note_id) {
+                eprintln!(
+                    "refine({note_id}): 续录已在本笔记上重新开始,跳过兜底转码入队(续录停止时会再次入队)。"
+                );
+            } else {
+                match notes_dir(&app) {
+                    Ok(root) => transcode.enqueue(root.join(&note_id)),
+                    Err(e) => {
+                        eprintln!("refine({note_id}): notes_dir 不可用，转码补偿也失败，需人工核实 WAV 是否已压缩: {e}");
+                    }
+                }
+            }
+        }
+        refining.lock().unwrap().remove(&note_id);
+    });
+}
+
 /// RAII 复位守卫:下载线程无论正常结束还是 panic 展开,download_running 都必然
 /// 回 false——否则一次 panic 后"下载已在进行中"永久卡死,只能重启应用。
 struct ResetOnDrop(Arc<AtomicBool>);
@@ -232,11 +382,17 @@ fn whisper_dir() -> PathBuf {
     models::root().join("sherpa-onnx-whisper-base")
 }
 
+fn paraformer_dir() -> PathBuf {
+    models::root().join(models::PF_DIR)
+}
+
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
 /// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
 fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
     if asr_model == settings::ASR_WHISPER {
         Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir())?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_PARAFORMER {
+        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir())?) as Box<dyn asr::Recognizer>)
     } else {
         Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir())?) as Box<dyn asr::Recognizer>)
     }
@@ -856,6 +1012,11 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
+    // F1 修复:该笔记正在精修中就拒绝续录,避免精修收尾时才 enqueue 的转码把续录正在
+    // 追加写的 WAV 当成"已完成"编码后删除(见 resume_blocked_by_refining 文档)。
+    if resume_blocked_by_refining(&state.refining.lock().unwrap(), &note_id) {
+        return Err("该笔记正在精修,请稍后再试".into());
+    }
     if !models::recording_ready(&current_asr(&app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
@@ -898,16 +1059,17 @@ fn do_stop_recording(app: &AppHandle) {
             let _ = j.join();
         }
         note_id = s.note_id;
-        // finalize 前在 writer 锁内克隆 note_dir，供 finalize 成功后入队转码。
         let mut w = s.writer.lock().unwrap();
-        let note_dir = w.dir().to_path_buf();
         let finalized = w.finalize(chrono::Local::now());
         drop(w);
         match finalized {
             Ok(()) => {
-                // 仅 finalize 成功（state=complete、meta 落盘）才入队。enqueue 是 O(1)
-                // 非阻塞且走转码队列自己的叶子锁——此处不持任何全局锁，安全。
-                state.transcode.enqueue(note_dir);
+                // 仅 finalize 成功（state=complete、meta 落盘）才发起精修。精修管线接管了
+                // 转码移交时机：本地两段（filter/recluster）读完 WAV 后才在 spawn_refine
+                // 内部 enqueue，避免转码 worker 与精修读 WAV 打架；spawn_refine 自身对
+                // 任何前置失败/panic 都兜底保证转码仍会入队一次（见其文档注释），故换掉
+                // 这里的直接 enqueue 不会让 WAV 永不压缩，只是入队时点后移到精修线程内。
+                spawn_refine(app.clone(), note_id.clone(), true);
             }
             Err(e) => {
                 eprintln!("stop_recording: finalize 失败: {e}");
@@ -1025,6 +1187,32 @@ fn list_notes(app: AppHandle, state: State<AppState>) -> Result<Vec<store::NoteS
 fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
+}
+
+/// 手动（重）触发一次会后精修：录制中该 id 拒绝（内容未定稿，段落还在变），正在精修中
+/// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。手动重跑时 m4a 早已在盘上
+/// （首次精修已经移交过转码），故 `enqueue_transcode_after_local=false`，不再重复入队。
+#[tauri::command]
+fn refine_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    if let Some(s) = state.session.lock().unwrap().as_ref() {
+        if s.note_id == id {
+            return Err("该笔记正在录制，停止后才能精修".into());
+        }
+    }
+    if state.refining.lock().unwrap().contains(&id) {
+        return Err("该笔记正在精修中".into());
+    }
+    spawn_refine(app, id, false);
+    Ok(())
+}
+
+/// 读取已落盘的精修结果（refined.json）；从未精修过 / 精修在前置阶段就失败到没能落盘
+/// 时返回 None，前端据此回落展示原始 segments。
+#[tauri::command]
+fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    Ok(store::load_refined(&dir))
 }
 
 /// 笔记音频轨道信息(详情页播放器用)。**纯读**:陈旧 WAV 头(硬崩残留)的修复
@@ -1772,6 +1960,8 @@ pub fn run() {
             unpause_recording,
             list_notes,
             get_note,
+            refine_note,
+            get_refined,
             note_audio_info,
             rename_note,
             delete_note,
@@ -1867,6 +2057,45 @@ mod tests {
         let dl = Arc::new(AtomicBool::new(false));
         assert!(migrate_guard(&running, &dl).is_ok(), "空闲放行");
         assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
+    }
+
+    #[test]
+    fn refine_llm_ready_requires_all_four_fields() {
+        use super::refine_llm_ready;
+        let base = crate::settings::Settings::default();
+        assert!(!refine_llm_ready(&base), "默认全空/关闭 → 未就绪");
+
+        let mut s = base.clone();
+        s.refine_base_url = "https://api.deepseek.com".into();
+        s.refine_model = "deepseek-chat".into();
+        s.refine_api_key = "sk-xxx".into();
+        assert!(!refine_llm_ready(&s), "四项齐全但总开关未开 → 仍未就绪");
+
+        s.refine_enabled = true;
+        assert!(refine_llm_ready(&s), "开关开且四项齐全 → 就绪");
+
+        for field in ["base_url", "model", "api_key"] {
+            let mut s2 = s.clone();
+            match field {
+                "base_url" => s2.refine_base_url.clear(),
+                "model" => s2.refine_model.clear(),
+                _ => s2.refine_api_key.clear(),
+            }
+            assert!(!refine_llm_ready(&s2), "{field} 为空 → 未就绪");
+        }
+    }
+
+    #[test]
+    fn resume_blocked_by_refining_matches_refining_set() {
+        use super::resume_blocked_by_refining;
+        use std::collections::HashSet;
+
+        let mut refining: HashSet<String> = HashSet::new();
+        assert!(!resume_blocked_by_refining(&refining, "note-a"), "精修集不含该 id → 放行");
+
+        refining.insert("note-a".into());
+        assert!(resume_blocked_by_refining(&refining, "note-a"), "该 id 正在精修中 → 拒绝续录");
+        assert!(!resume_blocked_by_refining(&refining, "note-b"), "只挡命中的 id,不误伤其它笔记");
     }
 
     #[test]

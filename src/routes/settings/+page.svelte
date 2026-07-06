@@ -32,6 +32,10 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
+  /** asr_model 后端值 → radio 本地 value 的三态映射(whisper/paraformer/sense_voice)。 */
+  function asrModelToChoice(m: string | undefined): string {
+    return m === "whisper" ? "whisper" : m === "paraformer" ? "paraformer" : "sense_voice";
+  }
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
 
@@ -52,6 +56,19 @@
   let autostartEnabled = $state(false);
   /** 快捷键录入框聚焦态:聚焦时清空显示并提示「按下组合键…」。 */
   let capturingShortcut = $state(false);
+
+  /** 智能精修:开关 + 接口三字段的本地镜像(与其余区块同理,失败回弹靠本地 state 强制 DOM 对齐)。 */
+  let refineOn = $state(false);
+  let refineBaseUrl = $state("");
+  let refineModel = $state("");
+  let refineKey = $state("");
+  const REFINE_PRESETS = [
+    { label: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+    { label: "通义千问", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+    { label: "豆包", base: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-1-6-250615" },
+    { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
+    { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  ];
 
   /** 磁盘:录音音频占用字节(null=统计中);清理展开态与选项;上次释放量文案。 */
   let audioBytes = $state<number | null>(null);
@@ -77,8 +94,10 @@
     ),
   );
 
-  // 当前 ASR 选型对应的工件 id:sense_voice→asr,whisper→whisper。
-  const asrArtifactId = $derived(settings?.asr_model === "whisper" ? "whisper" : "asr");
+  // 当前 ASR 选型对应的工件 id:sense_voice→asr,whisper→whisper,paraformer→paraformer。
+  const asrArtifactId = $derived(
+    settings?.asr_model === "whisper" ? "whisper" : settings?.asr_model === "paraformer" ? "paraformer" : "asr",
+  );
   const asrModelMissing = $derived(
     !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
@@ -100,7 +119,7 @@
   async function refreshSettings() {
     try {
       settings = await getSettings();
-      asrChoice = settings.asr_model === "whisper" ? "whisper" : "sense_voice";
+      asrChoice = asrModelToChoice(settings.asr_model);
       syncLocalFromSettings(settings);
     } catch (e) {
       error = `读取设置失败: ${e}`;
@@ -116,6 +135,10 @@
     keepAudio = s.keep_audio;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
+    refineOn = s.refine_enabled;
+    refineBaseUrl = s.refine_base_url;
+    refineModel = s.refine_model;
+    refineKey = s.refine_api_key;
   }
 
   async function refreshDiskUsage() {
@@ -365,7 +388,7 @@
       settings = fresh;
       // 幂等对齐本地绑定:bind:group 已把 asrChoice 改到新项,这里再显式对齐一次,
       // 消掉后端 migrate 事件毫秒级竞态下 asrChoice 可能与 settings 短暂不一致的窗口。
-      asrChoice = model === "whisper" ? "whisper" : "sense_voice";
+      asrChoice = asrModelToChoice(model);
       await refreshStatus(); // required_for_recording 随选型重算
     } catch (e) {
       // 失败(如录制中被后端拒绝):danger 横幅 + 回弹选项显示。
@@ -373,8 +396,22 @@
       settings = await getSettings().catch(() => settings);
       // 回弹本地绑定值:与点击前同值也必然不同于 bind:group 已改的新值,
       // 本地 state 变更强制触发 DOM 回写,浏览器原生移走的 checked 被拉回。
-      asrChoice = settings?.asr_model === "whisper" ? "whisper" : "sense_voice";
+      asrChoice = asrModelToChoice(settings?.asr_model);
     }
+  }
+
+  function applyPreset(p: { base: string; model: string }) {
+    refineBaseUrl = p.base;
+    refineModel = p.model;
+    saveRefine();
+  }
+  function saveRefine() {
+    saveSetting((s) => {
+      s.refine_enabled = refineOn;
+      s.refine_base_url = refineBaseUrl.trim();
+      s.refine_model = refineModel.trim();
+      s.refine_api_key = refineKey.trim();
+    });
   }
 
   // —— 镜像加速(逻辑照搬 ModelDownloadCard)——
@@ -727,12 +764,80 @@
           >
         </span>
       </label>
+      <label class="radio" class:disabled={recording.isLive}>
+        <input
+          type="radio"
+          name="asr"
+          value="paraformer"
+          bind:group={asrChoice}
+          disabled={recording.isLive || !settings}
+          onchange={() => changeAsr("paraformer")}
+        />
+        <span class="radio-body">
+          <span class="radio-title">Paraformer</span>
+          <span class="radio-desc"
+            >中文准确率更高,英文较弱,约 230MB。保留段内说话人分离;语言过滤按文本兜底。切换后下一场录制生效。</span
+          >
+        </span>
+      </label>
     </div>
     {#if asrModelMissing}
       <div class="banner warn">所选识别模型未下载,请在上方模型区块下载。</div>
     {/if}
     {#if recording.isLive}
       <p class="lock-hint">录制进行中,识别引擎切换已锁定,停止录制后可更改。</p>
+    {/if}
+  </section>
+
+  <!-- —— 智能精修 —— -->
+  <section>
+    <h2 class="section-title">智能精修</h2>
+    <div class="toggles">
+      <label class="toggle">
+        <input type="checkbox" bind:checked={refineOn} disabled={!settings} onchange={saveRefine} />
+        <span class="toggle-body">
+          <span class="toggle-title">会后 LLM 精修</span>
+          <span class="toggle-desc"
+            >录制结束后用大模型纠错字、统一术语、清理口头语并合并段落。会议文本将发送至下方所选服务商;key
+            明文存于本机设置文件。</span
+          >
+        </span>
+      </label>
+    </div>
+    {#if refineOn}
+      <div class="preset-row">
+        {#each REFINE_PRESETS as p}
+          <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+        {/each}
+      </div>
+      <div class="refine-fields">
+        <label class="field">
+          <span>接口地址(含版本段)</span>
+          <input
+            class="shortcut-input"
+            placeholder="https://api.deepseek.com/v1"
+            bind:value={refineBaseUrl}
+            onblur={saveRefine}
+          />
+        </label>
+        <label class="field">
+          <span>模型</span>
+          <input class="shortcut-input" placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input
+            class="shortcut-input"
+            type="password"
+            placeholder="sk-..."
+            bind:value={refineKey}
+            onblur={saveRefine}
+          />
+        </label>
+      </div>
+      {#if !refineBaseUrl || !refineModel || !refineKey}
+        <div class="banner warn">接口地址、模型、API Key 三项配齐后精修才会生效。</div>
+      {/if}
     {/if}
   </section>
 </main>
@@ -1141,5 +1246,27 @@
     border-color: var(--warning-line);
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
+  }
+  /* 智能精修:预设一键填充按钮行 + 三字段表单 */
+  .preset-row {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-top: 0.8rem;
+  }
+  .refine-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin-top: 0.8rem;
+  }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .field > span {
+    font-size: 0.78rem;
+    color: var(--ink-secondary);
   }
 </style>
