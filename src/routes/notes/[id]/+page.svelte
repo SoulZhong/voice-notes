@@ -733,16 +733,17 @@
     box-shadow: 0 4px 14px light-dark(rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.45));
   }
 
-  /* 「回到播放位置」药丸:零高锚点 + sticky bottom(与录制页同款) */
+  /* 「回到播放位置」药丸:零高锚点 + sticky bottom(与录制页同款)。
+     flex-end 替代 translateY(-100%):零高容器 stretch 会压扁按钮使百分比位移失效。 */
   .jump-anchor {
     position: sticky;
     bottom: 1rem;
     height: 0;
     display: flex;
     justify-content: center;
+    align-items: flex-end;
   }
   .jump {
-    transform: translateY(-100%);
     border: none;
     border-radius: var(--radius-full);
     background: var(--primary);

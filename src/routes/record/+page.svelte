@@ -356,16 +356,18 @@
   .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
 
   /* 「回到最新」药丸：零高锚点 + sticky bottom，钉在滚动视口底部居中，
-     不占版面高度、不遮转写（按钮向上偏出锚点自身）。 */
+     不占版面高度、不遮转写。flex-end 让按钮底边贴锚点线向上生长——不能用
+     translateY(-100%)：零高容器的默认 stretch 会把按钮使用高度压成 0，
+     百分比位移随之失效，药丸会沉到视口底边被裁半截。 */
   .jump-anchor {
     position: sticky;
     bottom: 1rem;
     height: 0;
     display: flex;
     justify-content: center;
+    align-items: flex-end;
   }
   .jump {
-    transform: translateY(-100%);
     border: none;
     border-radius: var(--radius-full);
     background: var(--primary);
