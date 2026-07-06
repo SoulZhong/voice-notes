@@ -5,7 +5,9 @@ mod ipc;
 pub mod models;
 mod session;
 mod settings;
+mod shortcuts;
 mod store;
+mod tray;
 pub mod diar;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -242,7 +244,8 @@ fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
 /// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
-fn current_asr(app: &AppHandle) -> String {
+/// pub(crate)：托盘 build_menu 也要按当前选型算 recording_ready 决定 toggle 项禁用。
+pub(crate) fn current_asr(app: &AppHandle) -> String {
     match app.path().app_data_dir() {
         Ok(d) => settings::load(&d).asr_model,
         Err(_) => settings::ASR_SENSE_VOICE.into(),
@@ -276,6 +279,30 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
         Some((_, msg)) if msg.contains("unauthorized") => "denied".into(),
         Some(_) => "unavailable".into(),
         None => "unavailable".into(),
+    }
+}
+
+/// 本场录制的「必备源集合」：这些源必须全部出现在 start.active 里，任一缺失即整场
+/// 拆除报错（不做静默降级）。为什么随 system_only 变：
+///  - 默认场景 → [Mic]：会议里本机说话人主要走麦克风，mic 是刚需；系统声音则可降级
+///    （拿不到就只录 mic），故 System 不在必备集合。
+///  - 仅系统声音场景 → [System]：这是「纯外放」用法（会议软件把远端声音从扬声器放出、
+///    本机不对着 mic 说话）。此时刻意不建 mic 源——即便有 AEC，mic 路仍会漏进扬声器
+///    回声的残渣污染转写；关掉 mic 从根上消除这条污染路径，System 随之升格为该场景下
+///    唯一且必备的源。纯函数（单测覆盖），供 spawn_session 的源构建与 Fix A 守卫共用。
+fn required_sources(system_only: bool) -> Vec<Source> {
+    if system_only {
+        vec![Source::System]
+    } else {
+        vec![Source::Mic]
+    }
+}
+
+/// 源的中文显示名，仅用于「XX未能启动」失败文案（沿用既有文案风格）。
+fn source_display(s: Source) -> &'static str {
+    match s {
+        Source::Mic => "麦克风",
+        Source::System => "系统声音",
     }
 }
 
@@ -329,6 +356,9 @@ fn spawn_session(
             let mut running_guard = running_guard;
             *running_guard = false;
             drop(running_guard);
+            // 加载失败且确属当前代:running 已复位，托盘同步回 idle（过期线程在上面已提前
+            // return，走不到这里，不会误把托盘打回 idle）。托盘不存在则内部静默跳过。
+            tray::set_recording(app, false);
             let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
         };
 
@@ -348,23 +378,42 @@ fn spawn_session(
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
-        // 2) 构建两路源（各自 VAD）。麦克风必备；系统声音失败则由 start_session 降级。
+        // 一次性读设置：record_system_only / keep_audio / language_filter 同源同快照
+        //（避免三次 load 读到并发写入的不同代）。app_data_dir 不可用时全部保守回落
+        // Settings::default（仅系统声=否、保留音频=是、语言过滤=开），绝不因读设置
+        // 失败改变现状行为。language_filter 在下方 start_session 处消费。
+        let (record_system_only, keep_audio, language_filter) = app
+            .path()
+            .app_data_dir()
+            .map(|d| {
+                let s = settings::load(&d);
+                (s.record_system_only, s.keep_audio, s.language_filter)
+            })
+            .unwrap_or((false, true, true));
+
+        // 2) 构建源（各自 VAD）。默认建麦克风（必备）+ 系统声音（可降级）；
+        // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
         let vad_path = models::root().join("silero_vad.onnx");
-        let mic_seg = match new_silero(&vad_path) {
-            Ok(s) => s,
-            Err(e) => {
-                stash_model(&recognizer_cache, Some(recognizer));
-                stash_model(&embedder_cache, embedder);
-                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
-            }
-        };
-        // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
-        #[cfg(target_os = "macos")]
-        let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
-        #[cfg(not(target_os = "macos"))]
-        let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
-        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
-            vec![(Source::Mic, mic, mic_seg)];
+        let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
+        if !record_system_only {
+            let mic_seg = match new_silero(&vad_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    stash_model(&recognizer_cache, Some(recognizer));
+                    stash_model(&embedder_cache, embedder);
+                    return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+                }
+            };
+            // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
+            #[cfg(target_os = "macos")]
+            let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
+            #[cfg(not(target_os = "macos"))]
+            let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+            sources.push((Source::Mic, mic, mic_seg));
+        }
+        // record_system_only 且非 macOS：System 源不存在（下方块仅 macOS 编译），
+        // 源列表将为空，start_session 会因无源可启动返回 Err、开录失败——正是 required
+        // 守卫要兜住的场景（本应用 macOS-only，可接受）。
 
         #[cfg(target_os = "macos")]
         {
@@ -445,33 +494,43 @@ fn spawn_session(
         // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
         // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
         // 待写队列同哲学:内存暂存优于丢内容。base_ms 对齐语义见 AudioTrackWriter。
-        let note_dir = writer.lock().unwrap().dir().to_path_buf();
+        // keep_audio=false 时完全跳过写盘器/写盘线程构建(两者留空 Vec):关闭音频保留,
+        // 转写/声纹零影响——音频落盘是纯增值旁路,sink 仅把采集帧复制一份写 WAV,不在
+        // 转写热路径上;audio_joins 空 Vec 在 stop 时 join 无害(空循环),start_session
+        // 签名不变(空 sinks 即不落任何音频轨)。
         let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
         let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        for (source, _, _) in &sources {
-            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-            let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
-            audio_joins.push(std::thread::spawn(move || {
-                for chunk in rx.iter() {
-                    w.append(&chunk);
-                }
-                // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
-            }));
-            audio_sinks.push((
-                *source,
-                Box::new(move |s: &[f32]| {
-                    let _ = tx.send(s.to_vec());
-                }) as Box<dyn FnMut(&[f32]) + Send>,
-            ));
+        if keep_audio {
+            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            for (source, _, _) in &sources {
+                let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+                let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
+                audio_joins.push(std::thread::spawn(move || {
+                    for chunk in rx.iter() {
+                        w.append(&chunk);
+                    }
+                    // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
+                }));
+                audio_sinks.push((
+                    *source,
+                    Box::new(move |s: &[f32]| {
+                        let _ = tx.send(s.to_vec());
+                    }) as Box<dyn FnMut(&[f32]) + Send>,
+                ));
+            }
         }
 
         let mut degraded = false;
+        // language_filter:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里关闭以
+        // 保留外语真实发言。值在上方与 record_system_only/keep_audio 同一次 settings
+        // load 读出(读取失败已保守回落默认过滤开,与 Settings::default 一致)。
         let start = session::start_session(
             sources,
             recognizer,
             embedder,
             registry,
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
+            language_filter,
             16000,
             16000,
             audio_sinks,
@@ -621,17 +680,25 @@ fn spawn_session(
 
         match start {
             Ok(start) => {
-                // Fix A: mic is mandatory — if it failed to start, tear down and surface as error.
-                if !start.active.contains(&Source::Mic) {
-                    let (r, e) = start.handle.stop(); // 先排干可能已产生的 system finals
+                // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
+                // 就整场拆除报错(不静默降级)。默认配置 required=[Mic],与原先"mic 必备"
+                // 逐字节等价(同样先 stop 排干可能已产生的其它源 finals → stash 模型 →
+                // abort_or_finalize → 带源名 fail);system_only 下 required=[System],改由
+                // System 缺失触发同一条拆除路径。
+                if let Some(&missing) = required_sources(record_system_only)
+                    .iter()
+                    .find(|s| !start.active.contains(s))
+                {
+                    let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
                     abort_or_finalize(&writer);
-                    let mic_err = start.failed.iter()
-                        .find(|(s, _)| *s == Source::Mic)
-                        .map(|(_, msg)| format!("error: 麦克风未能启动: {msg}"))
-                        .unwrap_or_else(|| "error: 麦克风未能启动".into());
-                    return fail(&app, &running, &generation, my_gen, mic_err);
+                    let name = source_display(missing);
+                    let err = start.failed.iter()
+                        .find(|(s, _)| *s == missing)
+                        .map(|(_, msg)| format!("error: {name}未能启动: {msg}"))
+                        .unwrap_or_else(|| format!("error: {name}未能启动"));
+                    return fail(&app, &running, &generation, my_gen, err);
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
                 // running 锁内完成（锁序 running → generation → session_slot）。
@@ -679,6 +746,8 @@ fn spawn_session(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
+                // 会话已入槽、"recording" 已发：托盘切红点态（图标+菜单文案「停止录制」）。
+                tray::set_recording(&app, true);
             }
             Err(se) => {
                 stash_model(&recognizer_cache, Some(se.recognizer));
@@ -692,18 +761,21 @@ fn spawn_session(
     Ok(())
 }
 
-#[tauri::command]
-fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 开录共用实现(命令壳、快捷键共用):守卫 + spawn_session。逐语句搬自原
+/// start_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
+/// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
+fn do_start_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
     // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(&app)) {
+    if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     spawn_session(
-        app,
+        app.clone(),
         state.running.clone(),
         state.generation.clone(),
         state.session.clone(),
@@ -712,6 +784,12 @@ fn start_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
         state.transcode.clone(),
         NoteTarget::New,
     )
+}
+
+#[tauri::command]
+fn start_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("start_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_start_recording(&app)
 }
 
 /// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
@@ -737,8 +815,11 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     )
 }
 
-#[tauri::command]
-fn stop_recording(app: AppHandle, state: State<AppState>) {
+/// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取、末尾 preload_models 的 app 因签名为 &AppHandle 而
+/// clone——逻辑零变化(含全部锁序注释)。
+fn do_stop_recording(app: &AppHandle) {
+    let state = app.state::<AppState>();
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
     // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
     // capture → flush 尾段 → 排干 finals → join）。递增 generation 让任何仍在
@@ -782,8 +863,28 @@ fn stop_recording(app: AppHandle, state: State<AppState>) {
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
+    // 停录：托盘回 idle 态（图标+菜单文案「开始录制」）。托盘不存在则内部静默跳过。
+    tray::set_recording(app, false);
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
-    preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+}
+
+#[tauri::command]
+fn stop_recording(app: AppHandle) {
+    // 薄壳:前端 invoke("stop_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_stop_recording(&app)
+}
+
+/// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
+/// 没有 UI 上下文,错误无处弹窗(设置缺失/模型未就绪等),静默进日志避免打断用户。
+/// running 读取用 statement-scoped 的锁,读完即放,不与 do_* 内部锁嵌套。
+pub(crate) fn toggle_recording(app: &AppHandle) {
+    let running = *app.state::<AppState>().running.lock().unwrap();
+    if running {
+        do_stop_recording(app);
+    } else if let Err(e) = do_start_recording(app) {
+        eprintln!("快捷键触发开录失败(静默进日志): {e}");
+    }
 }
 
 /// 供前端重挂载时重建录制状态(Tauri 事件非粘性)。
@@ -1268,6 +1369,8 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     if asr_changed && *state.running.lock().unwrap() {
         return Err("录制中不能切换识别模型".into());
     }
+    // 托盘开关是否变更(落盘后据此建/拆托盘,即时生效无需重启)。
+    let tray_changed = old.tray_enabled != new_settings.tray_enabled;
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
@@ -1280,7 +1383,12 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }).map_err(|e| e.to_string())?;
     if asr_changed {
         *state.recognizer_cache.lock().unwrap() = None;
-        preload_models(app, state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+        preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    }
+    // 托盘开关变更 → 建/拆托盘（apply_enabled 现读设置后幂等处理）。放在 asr 之后,
+    // app 已 clone 给 preload,此处直接用 &app。
+    if tray_changed {
+        tray::apply_enabled(&app);
     }
     Ok(())
 }
@@ -1437,12 +1545,109 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     Ok(())
 }
 
+/// 设置页「音频占用磁盘」展示:遍历 notes 根统计所有笔记的音频文件字节数。
+/// 纯读操作,不需要任何守卫(不碰转码/录制状态)。
+#[tauri::command]
+fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
+    let notes = notes_dir(&app).map_err(|e| e.to_string())?;
+    Ok(store::disk::audio_usage_bytes(&notes))
+}
+
+/// 按时间清理已完成笔记的音频(保留转写文字,只删音频文件释放磁盘)。
+/// 守卫改用与两迁移命令共用的 `migrate_guard`(swap `download_running` 兼作迁移/下载
+/// 互斥位 + 查 `running`),而非只查 running:
+///   - 若只查 running,清理会与 `migrate_data_dir` 并发——迁移复制途中的音频被清理删掉,
+///     迁移的复制/校验会伪失败(明明是被并发删的,却报成迁移出错)。互斥后二者不再并发。
+///   - `TranscodeQueue.paused` 是布尔而非计数:清理与迁移原先各自独立 pause/unpause,谁先
+///     解除就打掉对方的暂停(clobber)。互斥闭合后两者永不并发,pause 布尔 clobber 随之消失。
+/// 通过后 `pause_and_wait` 静止转码队列(防止清理途中 worker 正把某笔记的 wav 转成 m4a,
+/// 清理和转码撞同一批文件),`UnpauseOnDrop` 保证无论正常返回还是提前 return 都必然解除暂停。
+/// `ResetOnDrop` 复位迁移/下载互斥位:purge 是同步命令(不开后台线程),函数尾自然 drop 复位,
+/// 无需照 migrate 那样挂到后台线程头部。
+/// 已知取舍:命令线程会在 `pause_and_wait` 处最多阻塞等一个 in-flight 转码(秒级)才返回。
+///
+/// 与迁移不同:这里**不**开后台线程——遍历+删文件是百级笔记毫秒到秒级的量级,
+/// 同步跑完直接返回释放字节数即可,没必要为它另起一套进度事件。
+///
+/// 是否为「活动笔记」用 session 槽的 note_id 比对,而非 state 参数——此时 running 已由
+/// migrate_guard 确认为 false,正常不会有会话在槽里;这里仍查一次是纯防御(万一未来某处
+/// 状态机出现 running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
+/// 这与 `reject_if_active`(单笔记编辑命令按 note_id 拒绝活动笔记)同源:那边有具体 note_id
+/// 可比对,这边是批量清理、无单一 note_id,故退化为「跳过 == session 槽笔记」的防御性比对。
+#[tauri::command]
+fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u32>) -> Result<u64, String> {
+    migrate_guard(&state.running, &state.download_running)?;
+    let _reset = ResetOnDrop(state.download_running.clone());
+    state.transcode.pause_and_wait();
+    let _unpause = UnpauseOnDrop(state.transcode.clone());
+    // cutoff 与 meta 里的 RFC3339 字符串同源(都来自 Local::now)，可直接字符串比较。
+    let cutoff = older_than_days
+        .map(|d| (chrono::Local::now() - chrono::Duration::days(d as i64)).to_rfc3339());
+    let active_id = state.session.lock().unwrap().as_ref().map(|s| s.note_id.clone());
+    let notes = notes_dir(&app).map_err(|e| e.to_string())?;
+    let Ok(rd) = std::fs::read_dir(&notes) else {
+        return Ok(0);
+    };
+    let mut freed = 0u64;
+    for entry in rd.flatten() {
+        let note_dir = entry.path();
+        if !note_dir.is_dir() {
+            continue;
+        }
+        let is_active = active_id.as_deref() == note_dir.file_name().and_then(|n| n.to_str());
+        if is_active || !store::disk::should_purge(&note_dir, cutoff.as_deref()) {
+            continue;
+        }
+        freed += store::disk::purge_note_audio(&note_dir);
+    }
+    Ok(freed)
+}
+
+/// 设置页保存快捷键后调用:按最新设置(重)注册。失败时把 shortcut_enabled 写回 false
+/// (S9 之前后端自洽的"注册失败回落关":坏快捷键不会残留开启态、下次启动反复失败),再把
+/// 原始中文错误上抛给设置页提示用户。回落写盘失败不掩盖原错误,仍返回注册失败原因。
+#[tauri::command]
+fn apply_shortcut(app: AppHandle) -> Result<(), String> {
+    if let Err(e) = shortcuts::apply_from_settings(&app) {
+        if let Ok(d) = app.path().app_data_dir() {
+            let _ = settings::update(&d, |s| s.shortcut_enabled = false);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(shortcuts::on_shortcut)
+                .build(),
+        )
         .manage(AppState::default())
+        .on_window_event(|window, event| {
+            // 关窗即隐藏（而非退出）:仅当托盘**实际存在**时拦截关闭并隐藏主窗——托盘常驻
+            // 才有"隐藏后再打开"的入口。判定按 tray_by_id 查托盘实存,而非读 settings.tray_enabled:
+            // 设置只是"意图",托盘可能因创建失败而不存在;若按意图拦截,托盘建失败时关窗仍被隐藏
+            // 却再无召回窗口的路径,窗口彻底消失。以托盘实存为准才保证隐藏后一定有召回入口。
+            // 录制不中断是本特性核心承诺:hide 只是隐藏窗口，会话线程与录制状态完全不受影响。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                if window.app_handle().tray_by_id(tray::TRAY_ID).is_some() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
@@ -1490,6 +1695,13 @@ pub fn run() {
             st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
 
             preload_models(handle.clone(), st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
+            // 依设置注册全局快捷键;坏快捷键(格式错/与系统冲突)绝不挡启动,仅 eprintln。
+            // 与设置页保存路径(apply_shortcut,失败上抛并回落关)是两个消费点。
+            if let Err(e) = shortcuts::apply_from_settings(&handle) {
+                eprintln!("全局快捷键注册失败(不影响启动): {e}");
+            }
+            // 菜单栏托盘：tray_enabled 时建（内部读设置判定）。增值层，一切失败只降级。
+            tray::setup(&handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1515,8 +1727,11 @@ pub fn run() {
             delete_model,
             get_settings,
             set_settings,
+            apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,
+            audio_disk_usage,
+            purge_audio,
             list_people,
             rename_person,
             merge_person,
@@ -1539,6 +1754,13 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    #[test]
+    fn required_sources_follow_system_only() {
+        use crate::audio::Source;
+        assert_eq!(super::required_sources(false), vec![Source::Mic]);
+        assert_eq!(super::required_sources(true), vec![Source::System]);
     }
 
     #[test]

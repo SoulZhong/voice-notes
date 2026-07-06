@@ -547,6 +547,7 @@ mod tests {
             None,
             crate::diar::registry::SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -1019,6 +1020,7 @@ mod tests {
             None,
             SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -1052,6 +1054,7 @@ mod tests {
             None,
             SpeakerRegistry::from_snapshot(&writer2.lock().unwrap().registry_snapshot()),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
+            true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],

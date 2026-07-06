@@ -25,6 +25,27 @@ pub struct Settings {
     /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
     #[serde(default = "default_asr")]
     pub asr_model: String,
+    /// 外观主题,消费任务:主题切换。"system"/"light"/"dark"。
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// 仅录系统声(不录麦克风),消费任务:录制开关。
+    #[serde(default)]
+    pub record_system_only: bool,
+    /// 语言过滤开关,消费任务:转写语言过滤;默认开启。
+    #[serde(default = "default_true")]
+    pub language_filter: bool,
+    /// 保留原始录音音频,消费任务:录制开关;默认开启。
+    #[serde(default = "default_true")]
+    pub keep_audio: bool,
+    /// 全局快捷键开关,消费任务:快捷键;默认关闭(避免未经用户同意即占用系统快捷键)。
+    #[serde(default)]
+    pub shortcut_enabled: bool,
+    /// 全局快捷键组合,消费任务:快捷键。
+    #[serde(default = "default_shortcut")]
+    pub shortcut: String,
+    /// 系统托盘图标开关,消费任务:托盘;默认开启。
+    #[serde(default = "default_true")]
+    pub tray_enabled: bool,
 }
 
 fn default_prefix() -> String {
@@ -35,6 +56,21 @@ fn default_asr() -> String {
     ASR_SENSE_VOICE.into()
 }
 
+fn default_theme() -> String {
+    "system".into()
+}
+
+fn default_shortcut() -> String {
+    "Alt+CmdOrCtrl+R".into()
+}
+
+/// serde `#[derive(Deserialize)]` 的裸 `#[serde(default)]` 总是取字段类型的
+/// `Default::default()`(bool → false)。language_filter/keep_audio/tray_enabled
+/// 三个字段的产品默认值是 true,所以必须显式挂这个辅助函数,不能偷懒裸写 default。
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -43,6 +79,13 @@ impl Default for Settings {
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
+            theme: default_theme(),
+            record_system_only: false,
+            language_filter: true,
+            keep_audio: true,
+            shortcut_enabled: false,
+            shortcut: default_shortcut(),
+            tray_enabled: true,
         }
     }
 }
@@ -154,6 +197,27 @@ mod tests {
         let got = update(tmp.path(), |s| s.mirror_enabled = true).unwrap();
         assert!(got.mirror_enabled, "返回落盘后的新值");
         assert!(load(tmp.path()).mirror_enabled, "已持久化到磁盘");
+    }
+
+    #[test]
+    fn enhancement_fields_default_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":false,"mirror_prefix":"x"}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.theme, "system");
+        assert!(!s.record_system_only && s.language_filter && s.keep_audio);
+        assert!(!s.shortcut_enabled);
+        assert_eq!(s.shortcut, "Alt+CmdOrCtrl+R");
+        assert!(s.tray_enabled);
+        let s = Settings { theme: "dark".into(), record_system_only: true, language_filter: false,
+            keep_audio: false, shortcut_enabled: true, shortcut: "Alt+CmdOrCtrl+K".into(),
+            tray_enabled: false, ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        let got = load(tmp.path());
+        assert_eq!(got.theme, "dark");
+        assert!(got.record_system_only && !got.language_filter && !got.keep_audio);
+        assert!(got.shortcut_enabled && !got.tray_enabled);
+        assert_eq!(got.shortcut, "Alt+CmdOrCtrl+K");
     }
 
     #[test]

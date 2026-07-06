@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
+  import { applyTheme } from "$lib/theme";
+  import { acceleratorFromEvent, displayShortcut } from "$lib/shortcut";
   import {
     modelsStatus,
     getSettings,
@@ -10,6 +13,9 @@
     deleteModel,
     migrateDataDir,
     migrateModelsDir,
+    applyShortcut,
+    audioDiskUsage,
+    purgeAudio,
     onMigrate,
     onModelDownload,
     type ModelsStatus,
@@ -28,6 +34,29 @@
   let asrChoice = $state("sense_voice");
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
+
+  // —— 新四区块的本地绑定值 ——
+  // 一律用本地 $state + bind(group/checked),不直接从 settings 派生 checked：
+  // 失败回弹时后端值可能与点击前同值,派生表达式因缓存相等而跳过 DOM 回写(浏览器已把
+  // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
+  /** 外观主题 radio:"light" | "dark" | "system"。 */
+  let themeChoice = $state("system");
+  /** 录制三开关的本地镜像。 */
+  let sysOnly = $state(false);
+  let langFilter = $state(false);
+  let keepAudio = $state(false);
+  /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
+  let shortcutEnabled = $state(false);
+  let trayEnabled = $state(false);
+  let autostartEnabled = $state(false);
+  /** 快捷键录入框聚焦态:聚焦时清空显示并提示「按下组合键…」。 */
+  let capturingShortcut = $state(false);
+
+  /** 磁盘:录音音频占用字节(null=统计中);清理展开态与选项;上次释放量文案。 */
+  let audioBytes = $state<number | null>(null);
+  let showPurge = $state(false);
+  let purgeChoice = $state<"30" | "90" | "all">("30");
+  let freedText = $state("");
 
   /** 选好新目录待确认的迁移项(一次只允许一项)。 */
   let pendingMigrate = $state<{ kind: "data" | "models"; path: string } | null>(null);
@@ -71,9 +100,36 @@
     try {
       settings = await getSettings();
       asrChoice = settings.asr_model === "whisper" ? "whisper" : "sense_voice";
+      syncLocalFromSettings(settings);
     } catch (e) {
       error = `读取设置失败: ${e}`;
     }
+  }
+
+  /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
+  function syncLocalFromSettings(s: Settings) {
+    themeChoice = s.theme;
+    sysOnly = s.record_system_only;
+    langFilter = s.language_filter;
+    keepAudio = s.keep_audio;
+    shortcutEnabled = s.shortcut_enabled;
+    trayEnabled = s.tray_enabled;
+  }
+
+  async function refreshDiskUsage() {
+    try {
+      audioBytes = await audioDiskUsage();
+    } catch {
+      audioBytes = null;
+    }
+  }
+
+  /** 字节格式化:<1MB 用 KB,<1GB 用 MB,否则 GB。 */
+  function fmtBytes(n: number): string {
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    const inMb = n / 1024 / 1024;
+    if (inMb < 1024) return `${inMb.toFixed(1)} MB`;
+    return `${(inMb / 1024).toFixed(2)} GB`;
   }
   async function refreshStatus() {
     try {
@@ -127,6 +183,11 @@
   onMount(() => {
     refreshSettings();
     refreshStatus();
+    refreshDiskUsage();
+    // 开机自启读系统真值(与 settings 无关);失败静默,保持未勾选。
+    isEnabled()
+      .then((v) => (autostartEnabled = v))
+      .catch(() => {});
     // 事件监听随页面生命周期注册/解绑(下载/迁移跨页面继续,回到本页续接进度流)。
     const unD = onModelDownload(handleDownload);
     const unM = onMigrate(handleMigrate);
@@ -188,6 +249,109 @@
     }
   }
 
+  // —— 外观 / 录制 / 系统:通用「取新鲜值→改→存」保存 ——
+  // 成功后 settings 与本地镜像同步;失败时 danger 横幅 + 从后端真值回弹本地镜像。
+  async function saveSetting(mut: (s: Settings) => void) {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      mut(fresh);
+      await setSettings(fresh);
+      settings = fresh;
+      syncLocalFromSettings(fresh);
+    } catch (e) {
+      error = `保存失败: ${e}`;
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings);
+    }
+  }
+
+  // 外观:存 settings 后立即 applyTheme(即时生效)。themeChoice 已由 bind:group 改到新值。
+  async function changeTheme() {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.theme = themeChoice;
+      await setSettings(fresh);
+      settings = fresh;
+      applyTheme(themeChoice);
+    } catch (e) {
+      error = `切换主题失败: ${e}`;
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings); // 回弹 themeChoice
+    }
+  }
+
+  // —— 全局快捷键 ——
+  // 开关:存 settings 后 applyShortcut。失败时后端已把 shortcut_enabled 落回 false,
+  // 重新 getSettings 同步,shortcutEnabled 随之回弹为未勾选。
+  async function toggleShortcutEnabled() {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.shortcut_enabled = shortcutEnabled;
+      await setSettings(fresh);
+      settings = fresh;
+      await applyShortcut();
+    } catch (e) {
+      error = `快捷键设置失败: ${e}`;
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings);
+    }
+  }
+
+  // 录入框:preventDefault 拦截浏览器默认;Esc 失焦取消;组合键经 acceleratorFromEvent
+  // 组装,非 null 才落库并 applyShortcut(enabled 不变)。
+  async function onShortcutKeydown(e: KeyboardEvent) {
+    e.preventDefault();
+    const input = e.currentTarget as HTMLInputElement;
+    if (e.key === "Escape") {
+      input.blur();
+      return;
+    }
+    const acc = acceleratorFromEvent(e);
+    if (acc === null) return;
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.shortcut = acc;
+      await setSettings(fresh);
+      settings = fresh;
+      await applyShortcut();
+      input.blur();
+    } catch (err) {
+      error = `快捷键设置失败: ${err}`;
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings);
+    }
+  }
+
+  // —— 开机自启:直连插件真值,onMount 读、toggle 写 ——
+  async function toggleAutostart() {
+    error = "";
+    try {
+      if (autostartEnabled) await enable();
+      else await disable();
+    } catch (e) {
+      error = `开机自启设置失败: ${e}`;
+      autostartEnabled = await isEnabled().catch(() => autostartEnabled); // 回读真值回弹
+    }
+  }
+
+  // —— 磁盘:清理录音音频(两段确认后)——
+  async function doPurge() {
+    error = "";
+    const days = purgeChoice === "all" ? null : purgeChoice === "30" ? 30 : 90;
+    try {
+      const freed = await purgeAudio(days);
+      freedText = `已释放 ${fmtBytes(freed)}`;
+      showPurge = false;
+      await refreshDiskUsage();
+    } catch (e) {
+      error = `清理失败: ${e}`;
+    }
+  }
+
   // —— ASR 选型 ——
   async function changeAsr(model: string) {
     if (settings?.asr_model === model) return;
@@ -241,6 +405,193 @@
   {#if error}
     <div class="banner">{error}</div>
   {/if}
+
+  <!-- —— 外观 —— -->
+  <section>
+    <h2 class="section-title">外观</h2>
+    <div class="radios">
+      <label class="radio">
+        <input
+          type="radio"
+          name="theme"
+          value="light"
+          bind:group={themeChoice}
+          disabled={!settings}
+          onchange={changeTheme}
+        />
+        <span class="radio-body"><span class="radio-title">亮色</span></span>
+      </label>
+      <label class="radio">
+        <input
+          type="radio"
+          name="theme"
+          value="dark"
+          bind:group={themeChoice}
+          disabled={!settings}
+          onchange={changeTheme}
+        />
+        <span class="radio-body"><span class="radio-title">暗色</span></span>
+      </label>
+      <label class="radio">
+        <input
+          type="radio"
+          name="theme"
+          value="system"
+          bind:group={themeChoice}
+          disabled={!settings}
+          onchange={changeTheme}
+        />
+        <span class="radio-body">
+          <span class="radio-title">跟随系统</span>
+          <span class="radio-desc">随 macOS 外观在亮色与暗色间自动切换。</span>
+        </span>
+      </label>
+    </div>
+  </section>
+
+  <!-- —— 录制 —— -->
+  <section>
+    <h2 class="section-title">录制</h2>
+    <div class="toggles">
+      <label class="toggle">
+        <input
+          type="checkbox"
+          bind:checked={sysOnly}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.record_system_only = sysOnly))}
+        />
+        <span class="toggle-body">
+          <span class="toggle-title">仅录制系统声音</span>
+          <span class="toggle-desc"
+            >只录扬声器外放,不录麦克风。纯外放场景(直播/视频)推荐开启:既根治麦克风串入的残渣,
+            也避免麦克风通话模式压低外放音量与录音电平(macOS 固有行为)。</span
+          >
+        </span>
+      </label>
+      <label class="toggle">
+        <input
+          type="checkbox"
+          bind:checked={langFilter}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
+        />
+        <span class="toggle-body">
+          <span class="toggle-title">语言幻觉过滤</span>
+          <span class="toggle-desc"
+            >过滤识别引擎在静音或噪声段产生的幻觉文字。多语种会议中若误伤可关闭。</span
+          >
+        </span>
+      </label>
+      <label class="toggle">
+        <input
+          type="checkbox"
+          bind:checked={keepAudio}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
+        />
+        <span class="toggle-body">
+          <span class="toggle-title">保留录音音频</span>
+          <span class="toggle-desc">保留原始录音以便回放核对。关闭可节省磁盘占用。</span>
+        </span>
+      </label>
+    </div>
+    <p class="lock-hint">录制中可随时更改,下一场录制生效。</p>
+  </section>
+
+  <!-- —— 磁盘 —— -->
+  <section>
+    <h2 class="section-title">磁盘</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">录音音频占用</span>
+          <span class="row-path">
+            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
+          </span>
+        </div>
+        {#if !showPurge}
+          <button
+            class="btn-secondary row-action"
+            disabled={recording.isLive}
+            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
+            onclick={() => {
+              freedText = "";
+              showPurge = true;
+            }}>清理…</button
+          >
+        {/if}
+      </div>
+    </div>
+    {#if showPurge}
+      <div class="purge-bar">
+        <div class="purge-choices">
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
+          </label>
+        </div>
+        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
+        <div class="purge-actions">
+          <button class="link danger" onclick={doPurge}>确认清理</button>
+          <button class="link" onclick={() => (showPurge = false)}>取消</button>
+        </div>
+      </div>
+    {/if}
+  </section>
+
+  <!-- —— 系统 —— -->
+  <section>
+    <h2 class="section-title">系统</h2>
+    <div class="toggles">
+      <div class="toggle toggle-col">
+        <label class="toggle-head">
+          <input
+            type="checkbox"
+            bind:checked={shortcutEnabled}
+            disabled={!settings}
+            onchange={toggleShortcutEnabled}
+          />
+          <span class="toggle-body">
+            <span class="toggle-title">全局快捷键</span>
+            <span class="toggle-desc">在任意应用中按下组合键即可开始或停止录制。</span>
+          </span>
+        </label>
+        <input
+          class="shortcut-input"
+          readonly
+          value={capturingShortcut ? "" : displayShortcut(settings?.shortcut ?? "")}
+          placeholder="按下组合键…"
+          onfocus={() => (capturingShortcut = true)}
+          onblur={() => (capturingShortcut = false)}
+          onkeydown={onShortcutKeydown}
+        />
+      </div>
+      <label class="toggle">
+        <input type="checkbox" bind:checked={autostartEnabled} onchange={toggleAutostart} />
+        <span class="toggle-body">
+          <span class="toggle-title">开机自动启动</span>
+          <span class="toggle-desc">登录 macOS 后在后台自动运行。</span>
+        </span>
+      </label>
+      <label class="toggle">
+        <input
+          type="checkbox"
+          bind:checked={trayEnabled}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
+        />
+        <span class="toggle-body">
+          <span class="toggle-title">菜单栏常驻</span>
+          <span class="toggle-desc">开启时关闭窗口只隐藏到菜单栏,录制不中断。</span>
+        </span>
+      </label>
+    </div>
+  </section>
 
   <!-- —— 存储位置 —— -->
   <section>
@@ -667,6 +1018,95 @@
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0.5rem 0 0;
+  }
+  /* 开关组:checkbox + 标题 + 说明小字(录制/系统区共用) */
+  .toggles {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+  }
+  .toggle,
+  .toggle-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    cursor: pointer;
+  }
+  .toggle-col {
+    flex-direction: column;
+    gap: 0.5rem;
+    cursor: default;
+  }
+  .toggle input[type="checkbox"],
+  .toggle-head input[type="checkbox"] {
+    margin-top: 0.2rem;
+    flex: none;
+  }
+  .toggle-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .toggle-title {
+    font-size: 0.92rem;
+    color: var(--ink);
+  }
+  .toggle-desc {
+    font-size: 0.82rem;
+    color: var(--ink-secondary);
+    line-height: 1.45;
+  }
+  /* 快捷键录入框:input 形态(surface-press 底、聚焦浮出 canvas + accent 环) */
+  .shortcut-input {
+    margin-left: 1.6rem;
+    width: 12rem;
+    box-sizing: border-box;
+    padding: 0.35em 0.6em;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: var(--surface-press);
+    color: var(--ink);
+    font-size: 0.9rem;
+    font-family: -apple-system, system-ui, sans-serif;
+    cursor: pointer;
+  }
+  .shortcut-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+    background: var(--canvas);
+  }
+  /* 磁盘清理确认条:warning 色系,行内展开三选 + 两段确认 */
+  .purge-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.7rem 1rem;
+    margin: 0.4rem 0 0.6rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+  }
+  .purge-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.1rem;
+  }
+  .mini-radio {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+    color: var(--warning-ink);
+    cursor: pointer;
+  }
+  .purge-bar .confirm-text {
+    color: var(--warning-ink);
+  }
+  .purge-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
   /* banner:错误用 danger 色系,提示用 warning 色系 */
   .banner {
