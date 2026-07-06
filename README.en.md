@@ -33,6 +33,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 - macOS 13 or later (system-audio capture relies on ScreenCaptureKit)
 - [Rust](https://rustup.rs) (stable) and Node.js 18+
+- meson and ninja (to build the vendored WebRTC echo-cancellation module): `pip3 install --user meson ninja`
 - Permissions: Microphone (your speech), Screen Recording (used **only** to capture system audio — no frames are read)
 
 ### Run from source
@@ -72,7 +73,7 @@ Download in-app on first launch (**Settings → Models**, with a mirror for rest
 | Scenario | Recommendation |
 | --- | --- |
 | Listening only (you don't speak) | Enable **System audio only**: the mic never starts, playback volume and quality are untouched |
-| Speaker-phone meeting where your own speech must be recorded | Enable **Keep output volume while recording**: bypasses macOS voice-processing's volume ducking; bleed-through is handled by echo dedup |
+| Speaker-phone meeting where your own speech must be recorded | Enable **Keep output volume while recording**: bypasses macOS voice-processing's volume ducking; echo is removed by the built-in software canceller (WebRTC AEC3) |
 | Wearing headphones | Leave both off: system echo cancellation stays on for the cleanest transcript |
 
 ## FAQ

@@ -34,8 +34,9 @@ pub struct Settings {
     #[serde(default)]
     pub record_system_only: bool,
     /// 录制时保持外放音量:麦克风采集用普通输入代替 VPIO(通话模式)。VPIO 启动即触发
-    /// macOS 把其它音频压低 12-16dB(ducking,Min 档仍生效,固有行为);普通输入无 ducking
-    /// 但失去 Apple AEC,外放串音靠文本回声去重+残渣抑制兜底。默认关(保留 AEC)。
+    /// macOS 把其它音频压低 12-16dB(ducking,Min 档仍生效,固有行为);普通输入无 ducking,
+    /// 回声改由软件 AEC(WebRTC AEC3,system 采集流为参考,见 audio::aec)消除,
+    /// 文本回声去重链保留为兜底。默认关(走 VPIO)。
     #[serde(default)]
     pub keep_output_volume: bool,
     /// 语言过滤开关,消费任务:转写语言过滤;默认开启。

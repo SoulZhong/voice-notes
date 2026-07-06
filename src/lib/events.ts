@@ -20,6 +20,8 @@ export type StatusEvent = {
   elapsed_ms: number;
 };
 export type StorageEvent = { state: "ok" | "degraded" };
+/** 追溯回声撤回:已上屏的 mic 段被 system 定稿追认为回声,应从 finals 移除匹配行。 */
+export type RetractEvent = { source: Source; start_ms: number; end_ms: number; text: string };
 export type SpeakerEntry = {
   id: string;
   name: string;
@@ -55,6 +57,10 @@ export function onStorage(cb: (e: StorageEvent) => void) {
 
 export function onSpeakers(cb: (e: SpeakersEvent) => void) {
   return listen<SpeakersEvent>("speakers", (ev) => cb(ev.payload));
+}
+
+export function onRetract(cb: (e: RetractEvent) => void) {
+  return listen<RetractEvent>("final_retract", (ev) => cb(ev.payload));
 }
 
 export type LevelEvent = { rms: number };

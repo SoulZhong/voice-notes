@@ -28,6 +28,16 @@ const ECHO_WINDOW_MS: u64 = 2500;
 const ECHO_SIM_THRESHOLD: f32 = 0.6;
 /// recent_system 缓冲的裁剪窗口(ms)：仅保留最近 10s 内的 system 段供 mic 端比对。
 const RECENT_SYSTEM_WINDOW_MS: u64 = 10_000;
+/// 自适应 hold 的延长倍数:system 侧有在途语句(last_system_partial 非空)时,mic 段
+/// 的 hold 延长为 echo_hold × 此倍数(默认 2.5s×6=15s,覆盖 VAD 15s 硬切上限)。
+/// 外放场景 mic 回声段常先于 system 长句定稿,固定 2.5s 一到就放行,等 system 句
+/// 落地时 pending 里已无从比对——冒烟实锤的主要漏杀形态。真实发言被误延时预览
+/// 仍即时可见,且 system 句一定稿(last_system_partial 清空)下个 tick 就放行。
+const ECHO_HOLD_EXTEND_FACTOR: u32 = 6;
+/// 已放行 mic 段的追溯窗口(ms):system 段定稿时回查最近这么久内已发出的 mic 段,
+/// 命中回声即撤回(DiarEvent::EchoRetract)。兜住自适应 hold 也没罩住的极端时序
+/// (system 无 partial 期间 mic 到期放行等)。按流时间裁剪。
+const RETRACT_WINDOW_MS: u64 = 30_000;
 
 // AEC 残渣抑制(冒烟反馈)：外放场景下 mic 收到的 AEC 消除残渣被识别成垃圾中文/
 // 标点("大"/"。"/"The.")，文本与 system 段不相似躲过上面的文本回声去重，污染
@@ -199,6 +209,15 @@ struct PendingMic {
     held_at: Instant,
     /// hold 前已算好的段级 rms，release 时随 on_final 透传给落盘层。
     rms: f32,
+}
+
+/// 已放行(on_final 已发出)的 mic 段的轻量记录:system 段定稿时回查,命中回声即
+/// 通过 DiarEvent::EchoRetract 撤回(调用方负责从落盘/UI 移除)。
+struct EmittedMic {
+    text: String,
+    norm: String,
+    start_ms: u64,
+    end_ms: u64,
 }
 
 /// 已处理的 system 段的轻量记录，供后续到达的 mic 段比对（回声去重）。
@@ -473,6 +492,11 @@ pub enum DiarEvent {
         snaps: Vec<crate::diar::registry::ClusterSnapshot>,
         samples: Vec<(String, Vec<f32>)>,
     },
+    /// 追溯回声撤回:一条已放行(on_final 已发出)的 mic 段事后被确认是 system 段的
+    /// 回声。调用方须把这条段从落盘与 UI 中移除(按 start_ms/end_ms/text 精确匹配,
+    /// 时间戳为会话相对值,消费方自行加续录 base_ms)。挂在 DiarEvent 总线上是复用
+    /// 既有事件通道(避免为单一事件再扩 run_asr_worker 签名),并非声纹语义。
+    EchoRetract { start_ms: u64, end_ms: u64, text: String },
 }
 
 /// 声纹样本上限:15s。超长截头 15s——试听确认身份用不着更长,也把 worker 内存
@@ -509,9 +533,15 @@ pub fn run_asr_worker(
     // 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
     // 已有簇 sources 增长等变化都能被捕获并同步。
     let mut last_sent: Vec<crate::diar::registry::SpeakerInfo> = Vec::new();
-    // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）。
+    // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）
+    // + 已放行的 mic 段（供 system 定稿后的追溯撤回）。
     let mut pending_mic: VecDeque<PendingMic> = VecDeque::new();
     let mut recent_system: VecDeque<RecentSystem> = VecDeque::new();
+    let mut recent_mic: VecDeque<EmittedMic> = VecDeque::new();
+    // system 路当前在途预览文本(预览级回声抑制用):随 system partial 更新,该句
+    // 定稿(进 recent_system)即清——staleness 被限制在"当前在途一句"内,不会拿几分钟前
+    // 的旧预览误杀 mic 新语句。
+    let mut last_system_partial = String::new();
     // 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
     let mut sample_store: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
 
@@ -519,6 +549,15 @@ pub fn run_asr_worker(
     macro_rules! release_pending {
         ($p:expr) => {{
             let p: PendingMic = $p;
+            // 记录已放行 mic 段(占位段除外),供 system 定稿后的追溯回声撤回。
+            if p.text != "[识别失败]" {
+                recent_mic.push_back(EmittedMic {
+                    text: p.text.clone(),
+                    norm: p.norm.clone(),
+                    start_ms: p.start_ms,
+                    end_ms: p.end_ms,
+                });
+            }
             process_final(
                 Source::Mic,
                 p.text,
@@ -542,9 +581,17 @@ pub fn run_asr_worker(
             Ok(job) => {
                 // 到期检查(先于本条 final 的处理)：让长时间空转但持续来 final 的场景
                 // 也能及时 release，不必等到 timeout tick。
+                // 自适应 hold:system 侧有在途语句(预览未定稿)时延长——mic 回声段常先于
+                // system 长句定稿,固定 2.5s 放行就错过比对(冒烟实锤主漏杀形态);system
+                // 句一定稿 last_system_partial 即清,下个检查点就按普通 hold 放行。
+                let hold_now = if last_system_partial.is_empty() {
+                    echo_hold
+                } else {
+                    echo_hold * ECHO_HOLD_EXTEND_FACTOR
+                };
                 while pending_mic
                     .front()
-                    .is_some_and(|p| p.held_at.elapsed() >= echo_hold)
+                    .is_some_and(|p| p.held_at.elapsed() >= hold_now)
                 {
                     let p = pending_mic.pop_front().unwrap();
                     release_pending!(p);
@@ -663,6 +710,44 @@ pub fn run_asr_worker(
                                 &mut on_final,
                                 &mut on_diar,
                             );
+                            // 追溯回声撤回:该 system 句可能对应一条已放行的 mic 回声段
+                            // (hold 到期先落盘了)。命中(时间邻近+文本高相似,与击杀
+                            // pending 同一套判据)即发 EchoRetract,由调用方从落盘与 UI
+                            // 移除。占位段不参与(双路同时识别失败文本雷同,会互相误杀)。
+                            if sub.text != "[识别失败]" {
+                                let mut i = 0;
+                                while i < recent_mic.len() {
+                                    let hit = time_near(
+                                        recent_mic[i].start_ms,
+                                        recent_mic[i].end_ms,
+                                        sub.start_ms,
+                                        sub.end_ms,
+                                    ) && text_similarity(&recent_mic[i].norm, &sys_norm)
+                                        >= ECHO_SIM_THRESHOLD;
+                                    if hit {
+                                        let m = recent_mic.remove(i).unwrap();
+                                        eprintln!(
+                                            "追溯回声撤回: mic=\"{}\" system=\"{}\"",
+                                            text_prefix20(&m.text),
+                                            text_prefix20(&sub.text)
+                                        );
+                                        on_diar(DiarEvent::EchoRetract {
+                                            start_ms: m.start_ms,
+                                            end_ms: m.end_ms,
+                                            text: m.text,
+                                        });
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                                let newest_end = sub.end_ms;
+                                recent_mic.retain(|m| {
+                                    newest_end.saturating_sub(m.end_ms) <= RETRACT_WINDOW_MS
+                                });
+                            }
+                            // 该句已定稿:预览级抑制改由 recent_system(带 10s 窗)接力,
+                            // 清掉在途预览文本,防其无限期滞留误杀后续 mic 预览。
+                            last_system_partial.clear();
                             recent_system.push_back(RecentSystem {
                                 text: sub.text,
                                 norm: sys_norm,
@@ -742,9 +827,15 @@ pub fn run_asr_worker(
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // 到期检查：无 final 到来时靠这个 100ms tick 兜底 release。
+                // 自适应 hold 同上(system 在途语句期间延长)。
+                let hold_now = if last_system_partial.is_empty() {
+                    echo_hold
+                } else {
+                    echo_hold * ECHO_HOLD_EXTEND_FACTOR
+                };
                 while pending_mic
                     .front()
-                    .is_some_and(|p| p.held_at.elapsed() >= echo_hold)
+                    .is_some_and(|p| p.held_at.elapsed() >= hold_now)
                 {
                     let p = pending_mic.pop_front().unwrap();
                     release_pending!(p);
@@ -756,7 +847,37 @@ pub fn run_asr_worker(
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             recognizer.recognize(&job.samples)
                         })) {
-                            Ok(Ok(t)) => on_partial(*src, t.text),
+                            Ok(Ok(t)) => {
+                                // 预览级回声抑制:外放场景 mic 路会实时"跟读"system 路
+                                // 正在说的话——定稿级去重(hold/recent_system)不管预览,
+                                // UI 上会出现「我」「对方」两行同字齐蹦的回音观感。mic
+                                // 预览与 system 在途预览或最近 system 定稿(10s 窗)高相似
+                                // 即按回声压掉(推空清残影)。只影响预览:若真是本人发言,
+                                // 定稿仍走完整判定链(hold+时间邻近+rms),不丢内容。
+                                let text = match *src {
+                                    Source::System => {
+                                        last_system_partial = t.text.clone();
+                                        t.text
+                                    }
+                                    Source::Mic => {
+                                        let echoed = text_similarity(&t.text, &last_system_partial)
+                                            >= ECHO_SIM_THRESHOLD
+                                            || recent_system.iter().any(|r| {
+                                                text_similarity(&t.text, &r.text) >= ECHO_SIM_THRESHOLD
+                                            });
+                                        if echoed {
+                                            eprintln!(
+                                                "预览回声抑制: 隐藏 mic 预览 \"{}\"",
+                                                text_prefix20(&t.text)
+                                            );
+                                            String::new()
+                                        } else {
+                                            t.text
+                                        }
+                                    }
+                                };
+                                on_partial(*src, text);
+                            }
                             Ok(Err(_)) => {}
                             Err(_) => {
                                 eprintln!(
@@ -846,6 +967,8 @@ impl std::fmt::Debug for StartError {
 /// 某源 capture 启动失败 → 跳过该源并记入 failed（用于降级）；无任何源启动 → Err。
 /// audio_sinks:按源可选的音频旁路(录音保留),worker 在暂停闸后把重采样样本喂给它;
 /// 未提供的源不落音频。capture 启动失败的源其 sink 随 worker 一起丢弃(惰性建档不留空文件)。
+/// aec_roles:按源可选的软件回声消除角色(System=Render 参考,Mic=Capture 消回声,
+/// 见 audio::aec);capture 启动失败的源其角色随 worker 一起丢弃。
 #[allow(clippy::too_many_arguments)]
 pub fn start_session(
     sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)>,
@@ -859,6 +982,7 @@ pub fn start_session(
     target_rate: u32,
     partial_interval_samples: usize,
     mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
+    mut aec_roles: Vec<(Source, crate::audio::aec::AecRole)>,
     on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
@@ -885,6 +1009,10 @@ pub fn start_session(
             .iter()
             .position(|(s, _)| *s == source)
             .map(|i| audio_sinks.swap_remove(i).1);
+        let aec_role = aec_roles
+            .iter()
+            .position(|(s, _)| *s == source)
+            .map(|i| aec_roles.swap_remove(i).1);
         let paused_w = paused.clone();
         let w = std::thread::spawn(move || {
             run_segment_worker(
@@ -898,6 +1026,7 @@ pub fn start_session(
                 paused_w,
                 level_cb,
                 audio_sink,
+                aec_role,
             );
         });
         match capture.start(ftx) {
@@ -1121,6 +1250,216 @@ mod asr_worker_tests {
         assert!(serviced, "空闲时应服务 partial 槽");
         assert_eq!(*partials.lock().unwrap(), vec![(Source::System, "len=7".into())]);
         assert!(slot.lock().unwrap().is_none(), "partial 取出后槽应清空");
+    }
+
+    /// 有界轮询直到谓词为真(避免固定 sleep 假设),超时返回 false。
+    fn poll_until(mut pred: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// 预览级回声抑制:mic 预览与 system 在途预览同文本 → 压成空串(UI 不出现
+    /// 「我」「对方」同字齐蹦);不相似的 mic 预览原样透传。
+    #[test]
+    fn mic_partial_echoing_system_partial_is_suppressed_in_preview() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let mic_slot = Arc::new(Mutex::new(None::<PartialJob>));
+        let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let (p2, sys2, mic2) = (partials.clone(), sys_slot.clone(), mic_slot.clone());
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(CountingRecognizer),
+                None,
+                SpeakerRegistry::new(),
+                rx,
+                TEST_ECHO_HOLD,
+                true,
+                vec![(Source::System, sys2), (Source::Mic, mic2)],
+                |_, _, _, _, _, _| {},
+                move |s, t| p2.lock().unwrap().push((s, t)),
+                |_| {},
+            );
+        });
+
+        // 1) system 预览先被服务,in-flight 文本 = "len=7"。
+        assert!(
+            poll_until(|| partials.lock().unwrap().contains(&(Source::System, "len=7".into()))),
+            "system 预览应被服务"
+        );
+        // 2) mic 预览同文本("len=7")→ 判回声,压成空串。
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 7] });
+        assert!(
+            poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, String::new()))),
+            "同文本 mic 预览应被压成空串"
+        );
+        assert!(
+            !partials.lock().unwrap().contains(&(Source::Mic, "len=7".into())),
+            "被抑制的 mic 预览文本不得透出"
+        );
+        // 3) mic 预览不相似("len=1234" vs "len=7",编辑距离分 0.5 < 0.6)→ 原样透传。
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 1234] });
+        assert!(
+            poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, "len=1234".into()))),
+            "不相似的 mic 预览应原样透传"
+        );
+
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// 追溯回声撤回:mic 段 hold 到期先放行(on_final 已发出),随后 system 同句定稿
+    /// → 应发 EchoRetract(带被撤段的时间戳与文本),供调用方从落盘/UI 移除。
+    #[test]
+    fn late_system_final_retracts_already_emitted_mic_echo() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let diar = Arc::new(Mutex::new(Vec::<DiarEvent>::new()));
+        let (f2, d2) = (finals.clone(), diar.clone());
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(CountingRecognizer),
+                None,
+                SpeakerRegistry::new(),
+                rx,
+                TEST_ECHO_HOLD, // 50ms:mic 段快速到期放行,制造"先放行后定稿"时序
+                true,
+                vec![],
+                move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+                |_, _| {},
+                move |ev| d2.lock().unwrap().push(ev),
+            );
+        });
+
+        // mic 回声段先到,hold 到期(50ms)放行上屏。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 4000], start_ms: 0, end_ms: 250 })
+            .unwrap();
+        assert!(
+            poll_until(|| finals.lock().unwrap().contains(&(Source::Mic, "len=4000".into()))),
+            "mic 段应先被放行"
+        );
+        // system 同句(同文本、时间邻近)晚定稿 → 追溯撤回。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 4000], start_ms: 0, end_ms: 250 })
+            .unwrap();
+        assert!(
+            poll_until(|| {
+                diar.lock().unwrap().iter().any(|e| matches!(
+                    e,
+                    DiarEvent::EchoRetract { start_ms: 0, end_ms: 250, text } if text == "len=4000"
+                ))
+            }),
+            "system 定稿后应追溯撤回已放行的 mic 回声段"
+        );
+
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// 自适应 hold:system 侧有在途预览时,mic 段 hold 延长(×ECHO_HOLD_EXTEND_FACTOR),
+    /// 等到 system 同句定稿仍在 pending 中被击杀——mic 回声段从头到尾不上屏。
+    #[test]
+    fn pending_mic_hold_extends_while_system_partial_in_flight() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let sys_slot = Arc::new(Mutex::new(Some(PartialJob { source: Source::System, samples: vec![0.0; 7] })));
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let (f2, p2, sys2) = (finals.clone(), partials.clone(), sys_slot.clone());
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(CountingRecognizer),
+                None,
+                SpeakerRegistry::new(),
+                rx,
+                Duration::from_millis(100), // 普通 hold 100ms,延长后 600ms
+                true,
+                vec![(Source::System, sys2)],
+                move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+                move |s, t| p2.lock().unwrap().push((s, t)),
+                |_| {},
+            );
+        });
+
+        // 1) system 预览被服务 → last_system_partial = "len=7"(在途语句标志)。
+        assert!(
+            poll_until(|| partials.lock().unwrap().contains(&(Source::System, "len=7".into()))),
+            "system 预览应被服务"
+        );
+        // 2) mic 同文本段进 hold;普通 hold(100ms)过后远未到延长档(600ms),不得放行。
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.0; 7], start_ms: 0, end_ms: 250 })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !finals.lock().unwrap().iter().any(|(s, _)| *s == Source::Mic),
+            "system 在途语句期间 mic 段不应放行(hold 已延长)"
+        );
+        // 3) system 同句定稿 → pending 中的 mic 回声被击杀,永不上屏。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.0; 7], start_ms: 0, end_ms: 250 })
+            .unwrap();
+        assert!(
+            poll_until(|| finals.lock().unwrap().contains(&(Source::System, "len=7".into()))),
+            "system 段应定稿"
+        );
+        drop(tx);
+        worker.join().unwrap();
+        assert!(
+            !finals.lock().unwrap().iter().any(|(s, _)| *s == Source::Mic),
+            "mic 回声段应在 pending 中被击杀,从未上屏"
+        );
+    }
+
+    /// 预览级回声抑制的第二判据:system 句已定稿(进 recent_system,在途预览已清)后,
+    /// mic 路仍在"跟读"同句 → 预览同样被压掉。
+    #[test]
+    fn mic_partial_echoing_recent_system_final_is_suppressed_in_preview() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let mic_slot = Arc::new(Mutex::new(None::<PartialJob>));
+        let partials = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let finals = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (p2, f2, mic2) = (partials.clone(), finals.clone(), mic_slot.clone());
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(CountingRecognizer),
+                None,
+                SpeakerRegistry::new(),
+                rx,
+                TEST_ECHO_HOLD,
+                true,
+                vec![(Source::Mic, mic2)],
+                move |_, t, _, _, _, _| f2.lock().unwrap().push(t),
+                move |s, t| p2.lock().unwrap().push((s, t)),
+                |_| {},
+            );
+        });
+
+        // system 段定稿 → 文本 "len=4000" 进 recent_system。
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 4000], start_ms: 0, end_ms: 250 })
+            .unwrap();
+        assert!(
+            poll_until(|| finals.lock().unwrap().contains(&"len=4000".to_string())),
+            "system 段应先定稿"
+        );
+        // mic 预览同文本 → 被 recent_system 判据压掉。
+        *mic_slot.lock().unwrap() = Some(PartialJob { source: Source::Mic, samples: vec![0.0; 4000] });
+        assert!(
+            poll_until(|| partials.lock().unwrap().contains(&(Source::Mic, String::new()))),
+            "与最近 system 定稿同文本的 mic 预览应被压掉"
+        );
+        assert!(
+            !partials.lock().unwrap().contains(&(Source::Mic, "len=4000".into())),
+            "被抑制的 mic 预览文本不得透出"
+        );
+
+        drop(tx);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -2065,6 +2404,7 @@ mod session_tests {
             16000,
             4000,
             vec![],
+            vec![],
             move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
             |_, _| {},
             |_| {},
@@ -2120,6 +2460,7 @@ mod session_tests {
             16000,
             4000,
             sinks,
+            vec![],
             move |_, t, _, end_ms, _, _| f2.lock().unwrap().push((t, end_ms)),
             |_, _| {},
             |_| {},
@@ -2165,6 +2506,7 @@ mod session_tests {
             16000,
             4000,
             vec![],
+            vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},
             |_| {},
@@ -2195,6 +2537,7 @@ mod session_tests {
             true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
+            vec![],
             vec![],
             |_, _, _, _, _, _| {},
             |_, _| {},

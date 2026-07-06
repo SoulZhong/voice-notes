@@ -1,3 +1,4 @@
+pub mod aec;
 pub mod resample;
 pub mod mock;
 pub mod microphone;
