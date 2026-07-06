@@ -58,6 +58,30 @@ export type TrackInfo = {
   duration_ms: number;
 };
 
+export interface RefinedParagraph {
+  speaker: string;
+  name?: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  source_seqs: number[];
+}
+
+export interface RefineStages {
+  filter: string;
+  recluster: string;
+  llm: string;
+}
+
+export interface RefinedDoc {
+  schema_version: number;
+  generated_at: string;
+  llm_model?: string;
+  stages: RefineStages;
+  discarded_seqs: number[];
+  paragraphs: RefinedParagraph[];
+}
+
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */
 export const noteAudioInfo = (id: string) => invoke<TrackInfo[]>("note_audio_info", { id });
@@ -71,6 +95,8 @@ export const renameSpeaker = (noteId: string, speakerId: string, name: string) =
 /** 返回导出文件绝对路径 */
 export const exportNote = (id: string, format: "md" | "txt") =>
   invoke<string>("export_note", { id, format });
+export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
+export const refineNote = (id: string) => invoke<void>("refine_note", { id });
 
 /** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
     Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */

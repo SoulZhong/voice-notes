@@ -80,6 +80,7 @@ pub struct Artifact {
 }
 
 const SV_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
+pub const PF_DIR: &str = "sherpa-onnx-paraformer-zh-2023-09-14";
 
 pub const ARTIFACTS: &[Artifact] = &[
     Artifact {
@@ -158,16 +159,41 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    Artifact {
+        id: "paraformer",
+        label: "语音识别（Paraformer 中文大模型）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2",
+        kind: ArtifactKind::TarBz2 { dest_dir: PF_DIR },
+        approx_mb: 224,
+        prune: &["sherpa-onnx-paraformer-zh-2023-09-14/test_wavs"],
+        files: &[
+            FinalFile {
+                rel_path: "sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
+                bytes: 243_371_218,
+                sha256: "f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
+                bytes: 75_756,
+                sha256: "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
+            },
+        ],
+    },
 ];
 
 /// 某工件在当前 ASR 选型下是否为「录制必需」。取代了静态 required_for_recording 字段：
-/// 就绪与否随选型变（选 whisper 就不需要 SenseVoice 的 asr，反之亦然），静态标记表达不了。
-/// vad 恒需；asr（SenseVoice）仅非 whisper 选型需要；whisper 仅 whisper 选型需要；speaker 等不影响录制。
+/// 就绪与否随选型变（三选型互斥：选中哪个就只需要哪个的工件），静态标记表达不了。
+/// vad 恒需；asr（SenseVoice）仅 sense_voice 选型需要；whisper 仅 whisper 选型需要；
+/// paraformer 仅 paraformer 选型需要；speaker 等不影响录制。
 pub fn required_now(id: &str, asr_model: &str) -> bool {
     match id {
         "vad" => true,
-        "asr" => asr_model != crate::settings::ASR_WHISPER,
+        "asr" => {
+            asr_model != crate::settings::ASR_WHISPER
+                && asr_model != crate::settings::ASR_PARAFORMER
+        }
         "whisper" => asr_model == crate::settings::ASR_WHISPER,
+        "paraformer" => asr_model == crate::settings::ASR_PARAFORMER,
         _ => false,
     }
 }
@@ -253,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_four_artifacts_with_whisper() {
+    fn manifest_covers_five_artifacts_with_whisper_and_paraformer() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec!["vad", "speaker", "asr", "whisper"]);
+        assert_eq!(ids, vec!["vad", "speaker", "asr", "whisper", "paraformer"]);
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
         assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
         assert_eq!(w.files.len(), 3);
@@ -271,6 +297,19 @@ mod tests {
         assert!(required_now("asr", "sense_voice") && !required_now("asr", "whisper"));
         assert!(!required_now("whisper", "sense_voice") && required_now("whisper", "whisper"));
         assert!(!required_now("speaker", "sense_voice"));
+    }
+
+    #[test]
+    fn paraformer_artifact_registered_and_required_semantics() {
+        let a = ARTIFACTS.iter().find(|a| a.id == "paraformer").expect("paraformer 工件已注册");
+        assert!(matches!(a.kind, ArtifactKind::TarBz2 { dest_dir: PF_DIR }));
+        assert!(a.files.iter().any(|f| f.rel_path.ends_with("model.int8.onnx")));
+        // 三选型互斥语义
+        assert!(required_now("paraformer", crate::settings::ASR_PARAFORMER));
+        assert!(!required_now("paraformer", crate::settings::ASR_SENSE_VOICE));
+        assert!(!required_now("asr", crate::settings::ASR_PARAFORMER));
+        assert!(required_now("asr", crate::settings::ASR_SENSE_VOICE));
+        assert!(!required_now("whisper", crate::settings::ASR_PARAFORMER));
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghproxy.net/";
 pub const ASR_SENSE_VOICE: &str = "sense_voice";
 // whisper 选型标识;models::required_now 已消费,判定 whisper 工件是否录制必需。
 pub const ASR_WHISPER: &str = "whisper";
+/// Paraformer-large 中文选型。
+pub const ASR_PARAFORMER: &str = "paraformer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -51,6 +53,18 @@ pub struct Settings {
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
     #[serde(default = "default_true")]
     pub tray_enabled: bool,
+    /// 会后 LLM 精修总开关(A2)。默认关,配好 key 后由用户打开。
+    #[serde(default)]
+    pub refine_enabled: bool,
+    /// OpenAI 兼容 chat completions 的 base_url,如 https://api.deepseek.com。
+    #[serde(default)]
+    pub refine_base_url: String,
+    /// 模型名,如 deepseek-chat。
+    #[serde(default)]
+    pub refine_model: String,
+    /// API key。明文存本机 settings.json(单机应用,设置页已注明)。
+    #[serde(default)]
+    pub refine_api_key: String,
 }
 
 fn default_prefix() -> String {
@@ -92,6 +106,10 @@ impl Default for Settings {
             shortcut_enabled: false,
             shortcut: default_shortcut(),
             tray_enabled: true,
+            refine_enabled: false,
+            refine_base_url: String::new(),
+            refine_model: String::new(),
+            refine_api_key: String::new(),
         }
     }
 }
@@ -252,5 +270,22 @@ mod tests {
         let got = load(&dir);
         assert!(got.mirror_enabled, "线程1 的写未被丢");
         assert_eq!(got.asr_model, ASR_WHISPER, "线程2 的写未被丢");
+    }
+
+    #[test]
+    fn refine_defaults_off_and_empty() {
+        let s = Settings::default();
+        assert!(!s.refine_enabled);
+        assert!(s.refine_base_url.is_empty() && s.refine_model.is_empty() && s.refine_api_key.is_empty());
+        assert_eq!(ASR_PARAFORMER, "paraformer");
+    }
+
+    #[test]
+    fn old_settings_json_without_refine_fields_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), r#"{"asr_model":"whisper"}"#).unwrap();
+        let s = load(dir.path());
+        assert_eq!(s.asr_model, "whisper");
+        assert!(!s.refine_enabled);
     }
 }
