@@ -3,11 +3,18 @@
   import { onMount } from "svelte";
   import Sidebar from "$lib/Sidebar.svelte";
   import { recording } from "$lib/recording.svelte";
+  import { getSettings } from "$lib/models";
+  import { applyTheme } from "$lib/theme";
 
   let { children } = $props();
 
   onMount(() => {
     recording.init();
+    // 启动即按已保存设置切主题;取不到设置(如首启动/IPC 失败)时静默放弃——
+    // 根元素 color-scheme 保持默认,等价于跟随系统,不需要额外兜底分支
+    getSettings()
+      .then((s) => applyTheme(s.theme))
+      .catch(() => {});
   });
 </script>
 

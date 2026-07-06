@@ -13,7 +13,7 @@ description: voice-notes 是 macOS 本地实时会议转写笔记工具。设计
 5. **发丝线代替阴影**:卡片、列表、菜单一律 1px `hairline` 边界 + 表面阶梯换底色;浮层菜单用 `shadow-popover` 加深。**唯一例外**:主按钮药丸用 `shadow-btn`(1px 内描边 + 2px 微投影),按压下沉 0.5px;链接式按钮不加。全部交互控件 120ms 缓动过渡。
 6. **悬停显影**:行级操作(删除 / 合并 / 改名角标)默认隐身,悬停浮现——保持列表安静。
 7. **禁 emoji 与 Unicode 符号图标**:录制 / 停止等符号用 CSS 图形(圆点 / 圆角方块)或 16px 线性 SVG(stroke currentColor),**禁用 emoji 与 Unicode 符号字符**(●■▶⏸👤)——各平台字形与基线不一,是质感杀手。
-8. **双主题同权**:每个 token 都有双主题值;暗色为第一公民(Raycast 原值),亮色为同一灰阶纪律下的极性反推。
+8. **双主题同权**:每个 token 都有双主题值;暗色为第一公民(Raycast 原值),亮色为同一灰阶纪律下的极性反推。落地上,`src/app.css` 用 CSS `light-dark()` 把每个 token 的两个值合并到 `:root` 一处声明,不再拆 `@media (prefers-color-scheme)` 两块;手动指定主题时只覆盖根元素的 `color-scheme`(`src/lib/theme.ts` 的 `applyTheme`),不改任何 token,跟随系统与手动切换共用同一套取值。
 
 ## colors
 

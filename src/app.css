@@ -3,37 +3,48 @@
  * 数值来自 DESIGN.md（Raycast 化命令面板质感），组件样式只引用这里的
  * 自定义属性，禁止再出现硬编码色值。字体栈本身不作为 token（不引
  * webfont，原生 -apple-system 即产品气质），继续在各组件里直写。
+ *
+ * 亮暗值用 CSS light-dark() 在同一处声明为单条 token，不再拆两个
+ * 按系统配色分别覆盖的样式块：两处维护同名 token 容易改一处忘另一处
+ * （漂移风险);合并后"跟随系统"与"手动切换主题"复用同一套取值——只
+ * 需要切根元素的 color-scheme(见 src/lib/theme.ts 的 applyTheme),
+ * light-dark() 按 color-scheme 自动取对应分支的值，组件样式零改动。
  * ============================================================ */
 
 :root {
-  /* 亮色 = Raycast 暗色灰阶的极性反推(Raycast 无官方亮色),冒烟后可调 */
-  --canvas: #fafafa;
-  --surface: #f1f1f2;
-  --surface-soft: #ebebec;
-  --surface-press: #e3e3e5;
-  --hairline: #e4e5e6;
-  --hairline-strong: #c9cacc;
-  --ink: #18191a;
-  --ink-secondary: #5c5d5f;
+  /* 声明本页支持亮暗两种配色方案，是下面所有 light-dark() 取值的开关;
+     跟随系统时保持浏览器默认解析，手动切换时由 JS 覆盖这一个属性 */
+  color-scheme: light dark;
+
+  /* 亮色 = Raycast 暗色灰阶的极性反推(Raycast 无官方亮色),冒烟后可调;
+     暗色是第一公民:Raycast 原值(近黑画布 + 表面阶梯 + 发丝线) */
+  --canvas: light-dark(#fafafa, #07080a);
+  --surface: light-dark(#f1f1f2, #0d0d0d);
+  --surface-soft: light-dark(#ebebec, #121212);
+  --surface-press: light-dark(#e3e3e5, #1a1b1c);
+  --hairline: light-dark(#e4e5e6, #242728);
+  --hairline-strong: light-dark(#c9cacc, #3a3d40);
+  --ink: light-dark(#18191a, #f4f4f6);
+  --ink-secondary: light-dark(#5c5d5f, #9c9c9d);
   /* 终审实测旧值 #949597 on canvas 仅 2.87:1,低于 3:1 底线(时间戳/占位发虚);
-     #737476 达 4.5:1 级 */
-  --ink-faint: #737476;
+     #737476 达 4.5:1 级(暗色侧沿用原 Raycast 值) */
+  --ink-faint: light-dark(#737476, #6a6b6c);
 
   /* accent 只表达链接/焦点/选中;主按钮走 primary 药丸(Raycast 签名) */
-  --accent: #0f7fd1;
-  --accent-pressed: #0c6ab0;
-  --accent-tint: rgba(15, 127, 209, 0.1);
-  --on-accent: #ffffff;
+  --accent: light-dark(#0f7fd1, #57c1ff);
+  --accent-pressed: light-dark(#0c6ab0, #3fa9e8);
+  --accent-tint: light-dark(rgba(15, 127, 209, 0.1), rgba(87, 193, 255, 0.15));
+  --on-accent: light-dark(#ffffff, #07080a);
 
   /* 主按钮药丸:亮色黑底白字(暗色白底黑字的极性翻转) */
-  --primary: #18191a;
-  --primary-pressed: #2c2d2f;
-  --on-primary: #ffffff;
+  --primary: light-dark(#18191a, #ffffff);
+  --primary-pressed: light-dark(#2c2d2f, #e8e8e8);
+  --on-primary: light-dark(#ffffff, #18191a);
 
-  --danger: #d63a3a;
-  --danger-tint: #fdecec;
-  --danger-line: #f3c6c6;
-  --danger-ink: #9b1c1c;
+  --danger: light-dark(#d63a3a, #ff6161);
+  --danger-tint: light-dark(#fdecec, rgba(255, 97, 97, 0.12));
+  --danger-line: light-dark(#f3c6c6, rgba(255, 97, 97, 0.3));
+  --danger-ink: light-dark(#9b1c1c, #ffb4b4);
 
   /* 录制红点:Raycast accent-red,双主题一致,仍是唯一常驻彩色信号 */
   --record: #ff6161;
@@ -41,28 +52,30 @@
      双主题同白,故遵循本分支"同值不重复"惯例只在 :root 定义一次;勿与 on-accent 混用防 token 漂移。 */
   --on-record: #ffffff;
 
-  --warning-tint: #fef6de;
-  --warning-ink: #7a5a0e;
-  --warning-line: #f0e0ac;
+  --warning-tint: light-dark(#fef6de, rgba(255, 197, 51, 0.1));
+  --warning-ink: light-dark(#7a5a0e, #ffd980);
+  --warning-line: light-dark(#f0e0ac, rgba(255, 197, 51, 0.3));
 
-  --success: #1d9e63;
+  --success: light-dark(#1d9e63, #59d499);
 
   /* 说话人徽章:饱和色 15% alpha soft 底 + 同色相深文字(soft 公式,双主题同底)。
-     红色不进池(独占录制/danger 语义);tint-peach 名下语义改为青色(改名牵连组件,保名加注)。 */
+     红色不进池(独占录制/danger 语义);tint-peach 名下语义改为青色(改名牵连组件,保名加注)。
+     soft 底(tint-*)双主题同值(15% alpha 对暗底同样成立),只有对应 -ink 随主题切换,
+     故底色维持原样不进 light-dark(),只有 -ink 后缀的文字色改用 light-dark() */
   --tint-sky: rgba(87, 193, 255, 0.15);
-  --tint-sky-ink: #0b6bb8;
+  --tint-sky-ink: light-dark(#0b6bb8, #57c1ff);
   --tint-mint: rgba(89, 212, 153, 0.15);
-  --tint-mint-ink: #157a4c;
+  --tint-mint-ink: light-dark(#157a4c, #59d499);
   --tint-peach: rgba(79, 210, 201, 0.15);
-  --tint-peach-ink: #0e7d74;
+  --tint-peach-ink: light-dark(#0e7d74, #4fd2c9);
   --tint-lavender: rgba(178, 139, 244, 0.15);
-  --tint-lavender-ink: #6d3fc2;
+  --tint-lavender-ink: light-dark(#6d3fc2, #b28bf4);
   --tint-rose: rgba(255, 122, 194, 0.15);
-  --tint-rose-ink: #b8347e;
+  --tint-rose-ink: light-dark(#b8347e, #ff7ac2);
   --tint-yellow: rgba(255, 197, 51, 0.15);
-  --tint-yellow-ink: #8a6510;
+  --tint-yellow-ink: light-dark(#8a6510, #ffc533);
   --tint-gray: rgba(156, 156, 157, 0.15);
-  --tint-gray-ink: #55565a;
+  --tint-gray-ink: light-dark(#55565a, #c9c9ca);
 
   /* 圆角:Raycast 紧圆角(6-10px);药丸仅主按钮与录制点 */
   --radius-sm: 4px;
@@ -71,58 +84,13 @@
   --radius-xl: 10px;
   --radius-full: 9999px;
 
-  /* 深度靠表面阶梯不靠投影;浮层深阴影;shadow-btn 为主按钮药丸专用 */
-  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.16);
-  --shadow-btn: inset 0 0 0 1px rgba(255, 255, 255, 0.12), 0 1px 2px rgba(0, 0, 0, 0.18);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    /* 暗色是第一公民:Raycast 原值(近黑画布 + 表面阶梯 + 发丝线) */
-    --canvas: #07080a;
-    --surface: #0d0d0d;
-    --surface-soft: #121212;
-    --surface-press: #1a1b1c;
-    --hairline: #242728;
-    --hairline-strong: #3a3d40;
-    --ink: #f4f4f6;
-    --ink-secondary: #9c9c9d;
-    --ink-faint: #6a6b6c;
-
-    --accent: #57c1ff;
-    --accent-pressed: #3fa9e8;
-    --accent-tint: rgba(87, 193, 255, 0.15);
-    --on-accent: #07080a;
-
-    --primary: #ffffff;
-    --primary-pressed: #e8e8e8;
-    --on-primary: #18191a;
-
-    --danger: #ff6161;
-    --danger-tint: rgba(255, 97, 97, 0.12);
-    --danger-line: rgba(255, 97, 97, 0.3);
-    --danger-ink: #ffb4b4;
-
-    --record: #ff6161;
-
-    --warning-tint: rgba(255, 197, 51, 0.1);
-    --warning-ink: #ffd980;
-    --warning-line: rgba(255, 197, 51, 0.3);
-
-    --success: #59d499;
-
-    /* 徽章 soft 底双主题同值(15% alpha 对暗底同样成立),只切文字色 */
-    --tint-sky-ink: #57c1ff;
-    --tint-mint-ink: #59d499;
-    --tint-peach-ink: #4fd2c9;
-    --tint-lavender-ink: #b28bf4;
-    --tint-rose-ink: #ff7ac2;
-    --tint-yellow-ink: #ffc533;
-    --tint-gray-ink: #c9c9ca;
-
-    --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
-    --shadow-btn: inset 0 0 0 1px rgba(0, 0, 0, 0.2), 0 1px 2px rgba(0, 0, 0, 0.4);
-  }
+  /* 深度靠表面阶梯不靠投影;浮层深阴影;shadow-btn 为主按钮药丸专用。
+     light-dark() 只接受 <color>,box-shadow 的 offset/blur 不能整体塞进去,
+     所以只把每层阴影里的颜色部分换成 light-dark(),结构(含分层用的逗号)保持不动 */
+  --shadow-popover: 0 8px 24px light-dark(rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.5));
+  --shadow-btn:
+    inset 0 0 0 1px light-dark(rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.2)),
+    0 1px 2px light-dark(rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.4));
 }
 
 /* ============================================================
