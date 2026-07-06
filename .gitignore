@@ -8,6 +8,8 @@ dist/
 /src-tauri/models/
 /build
 /.svelte-kit
+# 本地录音素材(用户自己的音频/纪要,不进仓库)
+/samples/
 /package
 .env
 .env.*
