@@ -41,6 +41,9 @@ fn emit_finished(
 /// 节流上报——暂停期间持续，供 UI 确认麦克风存活。
 /// audio_sink（音频保留）在暂停闸之后、segmenter.accept 之前收到与 accept 严格
 /// 同源的样本——写成 WAV 后「文件位置 == 段时间轴」按构造对齐;暂停期不写。
+/// aec（软件回声消除,「保持外放音量」模式）:system 路 Render 喂远端参考(样本不变),
+/// mic 路 Capture 消回声——sink 与 accept 收到的都是消除后的干净样本,录音回放与
+/// 转写一致。电平表在 AEC 之前:反映麦克风真实听到的(含外放),供确认设备存活。
 #[allow(clippy::too_many_arguments)]
 pub fn run_segment_worker(
     source: Source,
@@ -53,6 +56,7 @@ pub fn run_segment_worker(
     paused: Arc<AtomicBool>,
     on_level: Option<Box<dyn Fn(f32) + Send>>,
     mut audio_sink: Option<Box<dyn FnMut(&[f32]) + Send>>,
+    mut aec: Option<crate::audio::aec::AecRole>,
 ) {
     let mut since_partial: usize = 0;
     let mut was_paused = false;
@@ -84,6 +88,20 @@ pub fn run_segment_worker(
             continue; // 丢帧：暂停期时间轴冻结
         }
         was_paused = false;
+
+        // 软件回声消除:mic 路消回声(输出为 10ms 整帧倍数,余量滞留 AEC 内部),
+        // system 路喂远端参考后原样继续。暂停期在闸前丢帧,两侧都不喂 AEC。
+        let resampled = match aec.as_mut() {
+            Some(crate::audio::aec::AecRole::Capture(c)) => c.process(&resampled),
+            Some(crate::audio::aec::AecRole::Render(r)) => {
+                r.push(&resampled);
+                resampled
+            }
+            None => resampled,
+        };
+        if resampled.is_empty() {
+            continue; // capture 侧不足一个 10ms 帧:本轮无输出,等凑齐
+        }
 
         if let Some(sink) = &mut audio_sink {
             sink(&resampled);
@@ -130,6 +148,7 @@ mod tests {
                 slot2,
                 Box::new(MockSegmenter::new(8000)),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 None,
                 None,
             );
@@ -190,6 +209,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 None,
                 None,
+                None,
             );
         });
 
@@ -223,6 +243,7 @@ mod tests {
             run_segment_worker(
                 Source::Mic, frx, 16000, 4000, final_tx, s2,
                 Box::new(MockSegmenter::new(2000)), p2, None, None,
+                None,
             );
         });
         let frame = |n: usize| AudioFrame { samples: vec![0.1; n], sample_rate: 16000, channels: 1 };
@@ -271,6 +292,7 @@ mod tests {
                 Box::new(MockSegmenter::new(2000)), paused,
                 Some(Box::new(move |v| c2.lock().unwrap().push(v))),
                 None,
+                None,
             );
         });
         // 两帧、每帧恰好 LEVEL_INTERVAL_SAMPLES(1600) 个 0.5 → 各触发一次回调，RMS≈0.5。
@@ -298,6 +320,7 @@ mod tests {
                 Source::Mic, frx, 16000, 4000, final_tx, slot,
                 Box::new(MockSegmenter::new(2000)), p2, None,
                 Some(Box::new(move |s: &[f32]| s2.lock().unwrap().extend_from_slice(s))),
+                None,
             );
         });
 

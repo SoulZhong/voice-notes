@@ -368,6 +368,50 @@ impl NoteWriter {
         write_speakers_atomic(&self.dir, &self.speakers)
     }
 
+    /// 追溯撤回一条已落盘段(回声段事后被 system 定稿确认):按 (source, start_ms,
+    /// end_ms, text) 精确匹配,只删首个命中行。与 merge_speaker 同一套安全姿势:
+    /// 先 flush 保证 jsonl 完整;读失败中止(绝不能把整场转写覆写成空);不可解析行
+    /// 原样保留;临时文件原子替换后丢弃旧句柄。无命中(已被编辑/删除)静默成功。
+    pub fn retract_segment(
+        &mut self,
+        source: &str,
+        start_ms: u64,
+        end_ms: u64,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.flush_pending()?;
+        let path = self.dir.join("segments.jsonl");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（撤回中止，避免清空）: {e}"))?;
+        let mut out = String::new();
+        let mut removed = false;
+        for line in content.lines() {
+            if !removed {
+                if let Ok(rec) = serde_json::from_str::<SegmentRecord>(line) {
+                    if rec.source == source
+                        && rec.start_ms == start_ms
+                        && rec.end_ms == end_ms
+                        && rec.text == text
+                    {
+                        removed = true;
+                        continue; // 命中:跳过该行 = 删除
+                    }
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !removed {
+            return Ok(()); // 已被用户编辑/删除:无事可做,不动文件
+        }
+        let tmp = self.dir.join("segments.jsonl.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &path)?;
+        // 同 merge_speaker:重写替换了磁盘文件,旧句柄指向被替换前的 inode,丢弃待重开。
+        self.file = None;
+        Ok(())
+    }
+
     fn flush_pending(&mut self) -> anyhow::Result<()> {
         while let Some(line) = self.pending.front() {
             if self.file.is_none() {
@@ -551,6 +595,7 @@ mod tests {
             16000,
             4000,
             vec![],
+            vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
@@ -594,6 +639,35 @@ mod tests {
         assert!(note.speakers.contains_key("S1"));
         assert!(!note.speakers.contains_key("S2"));
         assert!(note.speakers["S1"].sources.contains(&"system".to_string()), "sources 并入");
+    }
+
+    #[test]
+    fn retract_segment_removes_exact_match_only_and_tolerates_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "回声段", 100, 900, None, Some(0.1)).unwrap();
+        w.append_final("system", "回声段", 100, 900, None, None).unwrap();
+        w.append_final("mic", "真实发言", 1000, 1900, None, None).unwrap();
+
+        // 精确命中(source+start+end+text):只删那一行,同文本的 system 行不受影响。
+        w.retract_segment("mic", 100, 900, "回声段").unwrap();
+        let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.segments.len(), 2);
+        assert!(note.segments.iter().all(|s| !(s.source == "mic" && s.text == "回声段")));
+        assert!(note.segments.iter().any(|s| s.source == "system" && s.text == "回声段"), "同文本 system 行保留");
+        assert!(note.segments.iter().any(|s| s.text == "真实发言"));
+
+        // 无命中(已被编辑/删除):静默成功,文件不动。
+        w.retract_segment("mic", 100, 900, "回声段").unwrap();
+        assert_eq!(store.load(&id).unwrap().segments.len(), 2);
+
+        // 撤回后继续追加:句柄重开,seq 续接不冲突。
+        w.append_final("mic", "后续", 2000, 2900, None, None).unwrap();
+        let note = store.load(&id).unwrap();
+        assert_eq!(note.segments.len(), 3);
+        assert!(note.segments.windows(2).all(|p| p[1].seq > p[0].seq), "seq 仍单调");
     }
 
     #[test]
@@ -1024,6 +1098,7 @@ mod tests {
             16000,
             4000,
             vec![],
+            vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w2.lock()
                     .unwrap()
@@ -1057,6 +1132,7 @@ mod tests {
             true, // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
+            vec![],
             vec![],
             move |src, text, start_ms, end_ms, spk, rms| {
                 w3.lock()

@@ -41,6 +41,17 @@ pub struct FinalEvent {
     pub speaker: Option<String>,
 }
 
+/// 追溯回声撤回，事件名 "final_retract"：一条已上屏的 mic 段事后被确认为 system
+/// 段的回声（system 长句晚于 mic 回声段定稿）。前端应从已显示的 finals 中移除
+/// (source, start_ms, text) 精确匹配的那一行；磁盘侧由后端同步删除。
+#[derive(Debug, Clone, Serialize)]
+pub struct RetractEvent {
+    pub source: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {

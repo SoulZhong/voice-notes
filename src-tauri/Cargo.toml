@@ -38,6 +38,7 @@ sha2 = "0.10"
 hex = "0.4"
 bzip2 = "0.5"
 tar = "0.4"
+webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

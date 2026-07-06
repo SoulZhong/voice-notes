@@ -565,8 +565,8 @@ fn spawn_session(
             // 「保持外放音量」开启时改用普通 cpal 输入——VPIO(通话模式)一启动 macOS
             // 就把其它音频压低 12-16dB(ducking,Min 档配置下仍如此,系统固有行为),
             // 外放开会场景既听不清、录下的系统声轨电平也小;普通输入无 ducking,
-            // 代价是失去 Apple AEC,外放串进麦克风的回声靠既有文本回声去重+残渣
-            // 抑制兜底。其他平台恒用 cpal。
+            // 回声由下方装配的软件 AEC(WebRTC AEC3)消除,文本回声去重链保留为兜底。
+            // 其他平台恒用 cpal。
             #[cfg(target_os = "macos")]
             let mic: Box<dyn AudioCapture> = if keep_output_volume {
                 Box::new(audio::microphone::Microphone::new())
@@ -594,6 +594,27 @@ fn spawn_session(
                     // 静默跳过该源；classify_system 会因 System 既不在 active 也不在
                     // failed 里而归类为 "unavailable"，UI 仍会显示降级横幅。
                     eprintln!("系统声音 VAD 构建失败，降级为仅麦克风: {e}");
+                }
+            }
+        }
+
+        // 软件回声消除(WebRTC AEC3):「保持外放音量」下 VPIO 不启动,改由本模块以
+        // system 采集流为远端参考,把外放回声从 mic 波形里消掉——mic 路只剩本人声音,
+        // 文本级回声去重链降级为兜底。仅 mic+system 双源齐备才有意义;初始化失败
+        // 降级为无 AEC(行为同引入前),绝不挡录制。VPIO 模式(默认)不叠加软件 AEC。
+        let mut aec_roles: Vec<(Source, audio::aec::AecRole)> = Vec::new();
+        if keep_output_volume
+            && sources.iter().any(|(s, _, _)| *s == Source::Mic)
+            && sources.iter().any(|(s, _, _)| *s == Source::System)
+        {
+            match audio::aec::new_pair(16000) {
+                Ok((render, capture)) => {
+                    eprintln!("软件回声消除已启用(WebRTC AEC3): system 路为参考,mic 路消回声");
+                    aec_roles.push((Source::System, audio::aec::AecRole::Render(render)));
+                    aec_roles.push((Source::Mic, audio::aec::AecRole::Capture(capture)));
+                }
+                Err(e) => {
+                    eprintln!("软件回声消除初始化失败,本场降级为无 AEC(不影响录制): {e}");
                 }
             }
         }
@@ -734,6 +755,7 @@ fn spawn_session(
             16000,
             16000,
             audio_sinks,
+            aec_roles,
             move |src, text, start_ms, end_ms, spk, rms| {
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
@@ -834,6 +856,23 @@ fn spawn_session(
                             speakers,
                             merged: Some(ipc::MergedPair { loser, winner }),
                         },
+                    );
+                }
+                session::DiarEvent::EchoRetract { start_ms, end_ms, text } => {
+                    // 已放行的 mic 回声段被 system 定稿追认:磁盘删行 + 通知前端撤回显示。
+                    // 时间戳加续录偏移,与 on_final 落盘口径一致。落盘失败仍撤 UI(显示
+                    // 优先干净),磁盘差异走 storage 降级告警。
+                    let start_ms = start_ms + base_ms;
+                    let end_ms = end_ms + base_ms;
+                    let mut w = writer_d.lock().unwrap();
+                    if let Err(e) = w.retract_segment("mic", start_ms, end_ms, &text) {
+                        eprintln!("回声撤回落盘失败({start_ms}-{end_ms}): {e}");
+                        let _ = app_d.emit("storage", ipc::StorageEvent { state: "degraded".into() });
+                    }
+                    drop(w);
+                    let _ = app_d.emit(
+                        "final_retract",
+                        ipc::RetractEvent { source: "mic".into(), start_ms, end_ms, text },
                     );
                 }
                 session::DiarEvent::Snapshot { snaps, samples } => {

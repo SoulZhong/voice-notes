@@ -6,6 +6,7 @@ import {
   onFinal,
   onStorage,
   onSpeakers,
+  onRetract,
   onLevel,
   type Source,
   type SystemAudio,
@@ -14,7 +15,8 @@ import {
 } from "./events";
 import { getNote, resumeRecording } from "./notes";
 
-export type Line = { source: Source; text: string; speaker: string | null };
+/** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。 */
+export type Line = { source: Source; text: string; speaker: string | null; start_ms: number };
 export type SpeakerMap = Record<
   string,
   { name: string; sources: string[]; person_id?: string | null }
@@ -99,9 +101,16 @@ export const recording = {
     });
     onFinal((e) => {
       if (e.text.trim())
-        finals = [...finals, { source: e.source, text: e.text, speaker: e.speaker }];
+        finals = [...finals, { source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
       if (e.source === "mic") partialMic = "";
       else partialSystem = "";
+    });
+    onRetract((e) => {
+      // 追溯回声撤回:该行事后被确认为对方声音的回声,从已上屏内容移除(磁盘已同步删)。
+      const idx = finals.findIndex(
+        (l) => l.source === e.source && l.start_ms === e.start_ms && l.text === e.text,
+      );
+      if (idx >= 0) finals = [...finals.slice(0, idx), ...finals.slice(idx + 1)];
     });
     onStatus((e) => {
       if (e.state === "recording") {
@@ -233,7 +242,7 @@ export const recording = {
     try {
       // getNote 失败：不灌注、不置 resuming，原样冒泡为 error 状态。
       const note = await getNote(noteId_);
-      finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
+      finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
       speakers = { ...note.speakers };
       noteId = noteId_;
       resuming = true;
@@ -291,7 +300,7 @@ async function hydrateFromDisk(id: string) {
   if (!id) return;
   try {
     const note = await getNote(id);
-    finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker }));
+    finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
     speakers = { ...note.speakers };
   } catch {
     // 水合失败仅影响历史段回显，不阻塞录制状态重建。
