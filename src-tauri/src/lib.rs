@@ -483,6 +483,11 @@ fn spawn_session(
             &writer.lock().unwrap().registry_snapshot(),
             &seeds,
         );
+        // 本场实时入库产生的 person id 集合:enroller(ASR worker 线程)写入,停止时的
+        // Snapshot 分支读取,用于区分「本场新入库的陌生声音」与「种子命中的老熟人」——
+        // 样本只为前者写(见 Snapshot 分支注释)。
+        let live_enrolled: Arc<Mutex<std::collections::HashSet<String>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         // 实时全局入库：新识别出的声纹一旦够料(≥AUTO_ENROLL_MS)当场入库领全局
         // person id(P<n>)，说话人从此刻起就有全局唯一身份，不必等停止。回调在
         // ASR worker 线程同步执行,一个新说话人只发生一次,库写失败降级为 None
@@ -490,13 +495,20 @@ fn spawn_session(
         // 停止时的 Snapshot upsert 仍是兜底入库路径,行为同旧版。
         if let Ok(root) = data_root(&app) {
             let vp_store_e = store::VoiceprintStore::new(root);
+            let live_enrolled_e = live_enrolled.clone();
             registry.set_enroller(
                 store::AUTO_ENROLL_MS,
                 Box::new(move |snap| {
                     match vp_store_e
                         .upsert_from_session(std::slice::from_ref(snap), &chrono::Local::now().to_rfc3339())
                     {
-                        Ok(links) => links.get(&snap.id).cloned(),
+                        Ok(links) => {
+                            let pid = links.get(&snap.id).cloned();
+                            if let Some(pid) = &pid {
+                                live_enrolled_e.lock().unwrap().insert(pid.clone());
+                            }
+                            pid
+                        }
                         Err(e) => {
                             eprintln!("声纹实时入库失败(不影响录制,稍后自动重试): {e}");
                             None
@@ -681,11 +693,16 @@ fn spawn_session(
                                 for (cluster_id, person_id) in &enrolled {
                                     w.set_speaker_person(cluster_id, person_id);
                                 }
-                                // 声纹样本落盘:已关联人物(既有命中或本次新入库)且库中尚无
-                                // 样本时写入,供管理页试听确认。失败同样只降级打日志。
+                                // 声纹样本落盘:只为「本场新入库的陌生声音」写(实时入库或停止
+                                // 兜底入库)。种子命中的老熟人不再追加——识别成功说明既有声纹
+                                // 已覆盖这条声音,再存一份没有新信息;识别精度的提升靠质心加权
+                                // 回写 + 用户把认错拆重的条目合并进来(样本/质心随合并归一)。
+                                // 兜底:老人物一份样本都没有(样本功能上线前的数据/历史写失败)
+                                // 时补第一份,兑现管理页"下次录到会自动补上"的承诺。
                                 let sample_of = |cluster: &str| {
                                     samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
                                 };
+                                let newly = live_enrolled.lock().unwrap();
                                 for snap in &snaps {
                                     let pid = snap
                                         .person
@@ -694,7 +711,12 @@ fn spawn_session(
                                     let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
                                         continue;
                                     };
-                                    if let Err(e) = store.write_sample_if_missing(&pid, sample) {
+                                    let newly_enrolled =
+                                        newly.contains(&pid) || enrolled.contains_key(&snap.id);
+                                    if !newly_enrolled && !store.sample_paths_existing(&pid).is_empty() {
+                                        continue; // 识别出的老熟人且已有样本:不再累积
+                                    }
+                                    if let Err(e) = store.append_sample(&pid, sample) {
                                         eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
                                     }
                                 }
@@ -1174,9 +1196,11 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
             total_ms: p.total_ms,
             last_seen: p.last_seen.clone(),
             sources: p.centroids.keys().cloned().collect(),
-            sample_path: store
-                .sample_path_if_exists(id)
-                .map(|p| p.to_string_lossy().into_owned()),
+            sample_paths: store
+                .sample_paths_existing(id)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         })
         .collect())
 }

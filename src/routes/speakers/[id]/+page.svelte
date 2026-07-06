@@ -120,29 +120,32 @@
     }
   }
 
-  // ── 录音样本试听(单实例;换页/离开即停) ──
+  // ── 录音样本试听(单实例:同一时刻只放一份;换页/离开即停) ──
   let sampleAudio: HTMLAudioElement | null = null;
-  let samplePlaying = $state(false);
+  /** 正在播放的样本下标;null = 未在播放。多样本时点另一份 = 停旧起新。 */
+  let playingIdx = $state<number | null>(null);
 
   function stopSample() {
     sampleAudio?.pause();
     sampleAudio = null;
-    samplePlaying = false;
+    playingIdx = null;
   }
 
-  function toggleSample() {
-    if (samplePlaying) {
+  function toggleSample(idx: number) {
+    if (playingIdx === idx) {
       stopSample();
       return;
     }
-    if (!person?.sample_path) return;
-    const id = person.id;
-    const a = new Audio(convertFileSrc(person.sample_path));
+    stopSample(); // 换份样本:先停当前
+    const path = person?.sample_paths[idx];
+    if (!path) return;
+    const id = person!.id;
+    const a = new Audio(convertFileSrc(path));
     a.onended = () => {
-      if (samplePlaying && personId === id) stopSample();
+      if (playingIdx === idx && personId === id) stopSample();
     };
     sampleAudio = a;
-    samplePlaying = true;
+    playingIdx = idx;
     void a.play().catch(() => {
       if (personId === id) stopSample();
     });
@@ -219,19 +222,25 @@
     <!-- 试听:确认"这个声纹是谁"的主要手段,给成块的卡而非藏在角标里 -->
     <section class="card">
       <div class="card-title">原声试听</div>
-      {#if person.sample_path}
-        <button class="listen" class:playing={samplePlaying} onclick={toggleSample}>
-          {#if samplePlaying}
-            <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
-            停止
-          {:else}
-            <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-              <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
-            </svg>
-            播放样本
-          {/if}
-        </button>
-        <span class="card-hint">听一段这个人的原声,确认声纹认的是谁。</span>
+      {#if person.sample_paths.length > 0}
+        <div class="listen-row">
+          {#each person.sample_paths as _, i (i)}
+            <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
+              {#if playingIdx === i}
+                <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                停止
+              {:else}
+                <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
+                </svg>
+                {person.sample_paths.length === 1 ? "播放样本" : `样本 ${i + 1}`}
+              {/if}
+            </button>
+          {/each}
+        </div>
+        <span class="card-hint">
+          听一段这个人的原声,确认声纹认的是谁。{#if person.sample_paths.length > 1}多份样本来自合并带入的不同条目,可逐份核对。{/if}
+        </span>
       {:else}
         <span class="card-hint">暂无录音样本:下次录到这个人并停止录制后会自动补上。</span>
       {/if}
@@ -433,6 +442,13 @@
   .card-hint {
     color: var(--ink-faint);
     font-size: 0.82rem;
+  }
+  /* 多份样本按钮排一行,窄卡自动换行 */
+  .listen-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
   }
   /* 试听按钮:secondary 形态,播放中 accent 文字 + 跳动条 */
   .listen {
