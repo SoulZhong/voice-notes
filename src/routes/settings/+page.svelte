@@ -463,7 +463,8 @@
         <span class="toggle-body">
           <span class="toggle-title">仅录制系统声音</span>
           <span class="toggle-desc"
-            >只录扬声器外放,不录麦克风。纯外放的会议开启后可根治麦克风串入的残渣。</span
+            >只录扬声器外放,不录麦克风。纯外放场景(直播/视频)推荐开启:既根治麦克风串入的残渣,
+            也避免麦克风通话模式压低外放音量与录音电平(macOS 固有行为)。</span
           >
         </span>
       </label>
