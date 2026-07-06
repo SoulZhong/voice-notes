@@ -8,6 +8,7 @@ mod notes;
 mod voiceprints;
 pub use notes::NoteStore;
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
+pub use voiceprints::AUTO_ENROLL_MS; // lib.rs 实时入库回调(registry enroller)用同一门槛。
 // Person/PersonCentroid/Voiceprints/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型
 // 生成/测试引用),但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。
 

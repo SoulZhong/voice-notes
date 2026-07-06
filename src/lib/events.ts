@@ -20,7 +20,13 @@ export type StatusEvent = {
   elapsed_ms: number;
 };
 export type StorageEvent = { state: "ok" | "degraded" };
-export type SpeakerEntry = { id: string; name: string; sources: Source[] };
+export type SpeakerEntry = {
+  id: string;
+  name: string;
+  sources: Source[];
+  /** 全局声纹库人物 id(P<n>)：实时入库/种子命中后即有；null = 尚未够料入库。 */
+  person_id: string | null;
+};
 export type SpeakersEvent = {
   speakers: SpeakerEntry[];
   merged: { loser: string; winner: string } | null;

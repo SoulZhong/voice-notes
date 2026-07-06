@@ -256,20 +256,29 @@ fn read_speakers(dir: &Path) -> BTreeMap<String, SpeakerMeta> {
 /// 匹配人物，一律静默跳过——声纹库是识别增强功能，绝不能因为它缺失/异常
 /// 而挡住笔记详情页的正常展示。
 fn join_person_names(notes_dir: &Path, speakers: &mut BTreeMap<String, SpeakerMeta>) {
-    if !speakers.values().any(|m| m.name.is_empty() && m.person_id.is_some()) {
+    if !speakers.values().any(|m| m.person_id.is_some()) {
         return; // 没有待 join 的候选，不必碰声纹库文件
     }
     let Some(root) = notes_dir.parent() else { return };
     let vp = super::VoiceprintStore::new(root.to_path_buf()).load();
     for meta in speakers.values_mut() {
-        if !meta.name.is_empty() {
-            continue; // 本地名优先级最高，不覆盖
-        }
         let Some(person_id) = &meta.person_id else { continue };
-        let Some(resolved) = super::VoiceprintStore::resolve(&vp, person_id) else { continue };
-        if let Some(person) = vp.people.get(resolved) {
-            if !person.name.is_empty() {
-                meta.name = person.name.clone();
+        let Some(resolved) =
+            super::VoiceprintStore::resolve(&vp, person_id).map(str::to_string)
+        else {
+            continue;
+        };
+        // 库合并归一(展示层)：loser 引用改写为 winner——同一个人在所有笔记里
+        // 呈现同一个全局编号/名字。只改返回值不落盘,与名字 join 同一哲学。
+        if meta.person_id.as_deref() != Some(resolved.as_str()) {
+            meta.person_id = Some(resolved.clone());
+        }
+        if meta.name.is_empty() {
+            // 本地名优先级最高;本地未改名才用库现名兜底展示。
+            if let Some(person) = vp.people.get(&resolved) {
+                if !person.name.is_empty() {
+                    meta.name = person.name.clone();
+                }
             }
         }
     }
@@ -641,6 +650,40 @@ mod tests {
         // 磁盘上的 speakers.json 不应被 join 改写（只读视图）。
         let raw = std::fs::read_to_string(w.dir().join("speakers.json")).unwrap();
         assert!(raw.contains(r#""name":"""#), "join 只影响返回值，不落盘");
+    }
+
+    /// 库合并归一(展示层)：笔记里 speaker 引用的 person_id 已被库 merge 重定向
+    /// (loser→winner)时，load 应把 person_id 改写为 winner 并 join winner 的名字——
+    /// 同一个人在旧笔记里也呈现合并后的全局身份;磁盘不落。
+    #[test]
+    fn load_resolves_merged_person_id_to_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data_dir = tmp.path();
+        let notes_dir = app_data_dir.join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+
+        // 库：P2 已并入 P1(redirects),P1 名"张三"。
+        std::fs::write(
+            app_data_dir.join("voiceprints.json"),
+            r#"{"schema_version":1,"next_person":3,"people":{"P1":{"name":"张三","total_ms":10000,"last_seen":"t1"}},"redirects":{"P2":"P1"}}"#,
+        )
+        .unwrap();
+
+        let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
+        w.finalize(now()).unwrap();
+        std::fs::write(
+            w.dir().join("speakers.json"),
+            r#"{"S1":{"name":"","sources":["mic"],"person_id":"P2"}}"#,
+        )
+        .unwrap();
+
+        let note = NoteStore::new(notes_dir).load(&id).unwrap();
+        assert_eq!(note.speakers["S1"].person_id.as_deref(), Some("P1"), "loser 引用归一到 winner");
+        assert_eq!(note.speakers["S1"].name, "张三", "名字随 winner join");
+        let raw = std::fs::read_to_string(w.dir().join("speakers.json")).unwrap();
+        assert!(raw.contains(r#""person_id":"P2""#), "归一只影响返回值，不落盘");
     }
 
     /// 库文件缺失（notes_dir 的上一级没有 voiceprints.json）时 load 不 panic，

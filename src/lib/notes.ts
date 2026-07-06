@@ -72,15 +72,22 @@ export const renameSpeaker = (noteId: string, speakerId: string, name: string) =
 export const exportNote = (id: string, format: "md" | "txt") =>
   invoke<string>("export_note", { id, format });
 
-/** 显示名:名字 > 「说话人 N」;null → 按来源 我/对方 */
+/** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
+    Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */
+export type SpeakerMetaLite = { name?: string; person_id?: string | null };
+
+/** 显示名:名字 > 全局编号「说话人 N」(N = 声纹库 P 号,跨笔记恒定) >
+    「新说话人 N」(尚未够料入库的过渡态,N = 本场簇号);null → 按来源 我/对方 */
 export function speakerLabel(
   speaker: string | null,
   source: Source,
-  speakers: Record<string, { name: string }>,
+  speakers: Record<string, SpeakerMetaLite>,
 ): string {
   if (!speaker) return source === "mic" ? "我" : "对方";
-  const name = speakers[speaker]?.name;
-  return name || `说话人 ${speaker.replace(/^S/, "")}`;
+  const meta = speakers[speaker];
+  if (meta?.name) return meta.name;
+  if (meta?.person_id) return `说话人 ${meta.person_id.replace(/^P/, "")}`;
+  return `新说话人 ${speaker.replace(/^S/, "")}`;
 }
 /** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(哈希逻辑不变)。
     调色板换成 DESIGN.md 粉彩 7 色，返回 CSS 变量引用——随 :root 的亮/暗色定义
@@ -104,23 +111,38 @@ const SPEAKER_INKS = [
   "var(--tint-yellow-ink)",
   "var(--tint-gray-ink)",
 ];
-/** 说话人 id → 调色板索引:S<n> 数值循环;非 S<n> 形态用字符串散列兜底。
+/** 说话人 id → 调色板索引:S<n>/P<n> 数值循环;其余形态用字符串散列兜底。
     speakerColor/speakerInk 共用,保证背景色与文字色永远同色相。 */
 function speakerIndex(speaker: string): number {
-  const n = parseInt(speaker.replace(/^S/, ""), 10);
+  const n = parseInt(speaker.replace(/^[SP]/, ""), 10);
   if (Number.isFinite(n) && n > 0) return (n - 1) % PALETTE.length;
   let h = 0;
   for (const c of speaker) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return h % PALETTE.length;
 }
-export function speakerColor(speaker: string | null, source: Source): string {
+/** 取色键:已关联全局人物按 P 号取色(同一个人跨笔记同色),否则按本场簇号。 */
+function speakerColorKey(
+  speaker: string,
+  speakers?: Record<string, SpeakerMetaLite>,
+): string {
+  return speakers?.[speaker]?.person_id || speaker;
+}
+export function speakerColor(
+  speaker: string | null,
+  source: Source,
+  speakers?: Record<string, SpeakerMetaLite>,
+): string {
   if (!speaker) return source === "mic" ? "var(--tint-sky)" : "var(--tint-mint)";
-  return PALETTE[speakerIndex(speaker)];
+  return PALETTE[speakerIndex(speakerColorKey(speaker, speakers))];
 }
 /** 徽章文字色:与 speakerColor 同索引(soft 底配同色相文字,Raycast soft 公式)。 */
-export function speakerInk(speaker: string | null, source: Source): string {
+export function speakerInk(
+  speaker: string | null,
+  source: Source,
+  speakers?: Record<string, SpeakerMetaLite>,
+): string {
   if (!speaker) return source === "mic" ? "var(--tint-sky-ink)" : "var(--tint-mint-ink)";
-  return SPEAKER_INKS[speakerIndex(speaker)];
+  return SPEAKER_INKS[speakerIndex(speakerColorKey(speaker, speakers))];
 }
 
 /** 00:01:23 */

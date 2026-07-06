@@ -279,6 +279,9 @@ fn process_final<F1, F2>(
         }
         on_diar(DiarEvent::Merged { loser, winner });
     }
+    // 实时全局入库：够料的无主簇当场经回调入库拿全局 person id(mark_enrolled),
+    // 新说话人不必等停止就获得全局唯一身份;person 变化随下方 speakers 差分广播。
+    registry.enroll_pending();
     let speakers = registry.speakers();
     if speakers != *last_sent {
         *last_sent = speakers.clone();

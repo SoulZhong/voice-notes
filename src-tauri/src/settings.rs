@@ -31,6 +31,11 @@ pub struct Settings {
     /// 仅录系统声(不录麦克风),消费任务:录制开关。
     #[serde(default)]
     pub record_system_only: bool,
+    /// 录制时保持外放音量:麦克风采集用普通输入代替 VPIO(通话模式)。VPIO 启动即触发
+    /// macOS 把其它音频压低 12-16dB(ducking,Min 档仍生效,固有行为);普通输入无 ducking
+    /// 但失去 Apple AEC,外放串音靠文本回声去重+残渣抑制兜底。默认关(保留 AEC)。
+    #[serde(default)]
+    pub keep_output_volume: bool,
     /// 语言过滤开关,消费任务:转写语言过滤;默认开启。
     #[serde(default = "default_true")]
     pub language_filter: bool,
@@ -81,6 +86,7 @@ impl Default for Settings {
             asr_model: default_asr(),
             theme: default_theme(),
             record_system_only: false,
+            keep_output_volume: false,
             language_filter: true,
             keep_audio: true,
             shortcut_enabled: false,
@@ -206,16 +212,18 @@ mod tests {
         let s = load(tmp.path());
         assert_eq!(s.theme, "system");
         assert!(!s.record_system_only && s.language_filter && s.keep_audio);
+        assert!(!s.keep_output_volume, "保持外放音量默认关(保留 AEC)");
         assert!(!s.shortcut_enabled);
         assert_eq!(s.shortcut, "Alt+CmdOrCtrl+R");
         assert!(s.tray_enabled);
         let s = Settings { theme: "dark".into(), record_system_only: true, language_filter: false,
-            keep_audio: false, shortcut_enabled: true, shortcut: "Alt+CmdOrCtrl+K".into(),
-            tray_enabled: false, ..Default::default() };
+            keep_audio: false, keep_output_volume: true, shortcut_enabled: true,
+            shortcut: "Alt+CmdOrCtrl+K".into(), tray_enabled: false, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert_eq!(got.theme, "dark");
         assert!(got.record_system_only && !got.language_filter && !got.keep_audio);
+        assert!(got.keep_output_volume);
         assert!(got.shortcut_enabled && !got.tray_enabled);
         assert_eq!(got.shortcut, "Alt+CmdOrCtrl+K");
     }

@@ -81,7 +81,11 @@ impl AudioCapture for Microphone {
 
         // 等待后台线程确认流是否真正开启，把静默失败变成可见错误。
         match ready_rx.recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // 与 vpio.rs 的启动日志对仗:「保持外放音量」排障时靠这行确认
+                // 本场走的是普通输入(无 ducking)而非 VPIO。
+                eprintln!("普通麦克风已启动(无 AEC/ducking): {sample_rate} Hz, f32 x{channels}");
+            }
             Ok(Err(e)) => return Err(anyhow::anyhow!(e)),
             Err(_) => return Err(anyhow::anyhow!("麦克风线程意外退出，未能开启音频流")),
         }

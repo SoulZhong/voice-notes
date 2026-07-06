@@ -15,7 +15,10 @@ import {
 import { getNote, resumeRecording } from "./notes";
 
 export type Line = { source: Source; text: string; speaker: string | null };
-export type SpeakerMap = Record<string, { name: string; sources: string[] }>;
+export type SpeakerMap = Record<
+  string,
+  { name: string; sources: string[]; person_id?: string | null }
+>;
 
 let status = $state("idle");
 let systemAudio = $state<SystemAudio>("");
@@ -169,7 +172,7 @@ export const recording = {
         finals = finals.map((l) => (l.speaker === loser ? { ...l, speaker: winner } : l));
       }
       speakers = Object.fromEntries(
-        e.speakers.map((s) => [s.id, { name: s.name, sources: s.sources }]),
+        e.speakers.map((s) => [s.id, { name: s.name, sources: s.sources, person_id: s.person_id }]),
       );
     });
 

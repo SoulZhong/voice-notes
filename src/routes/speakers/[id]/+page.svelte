@@ -29,9 +29,9 @@
 
   const sourceLabel = (s: string) => (s === "mic" ? "麦克风" : s === "system" ? "系统声音" : s);
 
-  /** 合并菜单里的展示名(未命名人也要能被当成合并目标指认)。 */
+  /** 合并菜单里的展示名(未命名人用全局编号 + 最近出现指认)。 */
   function displayName(p: PersonSummary): string {
-    return p.name || `未命名 · 最近 ${formatDate(p.last_seen)}`;
+    return p.name || `说话人 ${p.id.replace(/^P/, "")} · 最近 ${formatDate(p.last_seen)}`;
   }
 
   async function refresh() {
@@ -200,7 +200,7 @@
               </svg>
             </button>
           {:else}
-            <h1 class="unnamed">未命名</h1>
+            <h1 class="unnamed">说话人 {person.id.replace(/^P/, "")}</h1>
             <button class="name-cta" onclick={beginRename}>命名</button>
           {/if}
         </div>

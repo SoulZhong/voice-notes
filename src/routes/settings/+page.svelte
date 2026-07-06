@@ -43,6 +43,7 @@
   let themeChoice = $state("system");
   /** 录制三开关的本地镜像。 */
   let sysOnly = $state(false);
+  let keepVol = $state(false);
   let langFilter = $state(false);
   let keepAudio = $state(false);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
@@ -110,6 +111,7 @@
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
     sysOnly = s.record_system_only;
+    keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
     keepAudio = s.keep_audio;
     shortcutEnabled = s.shortcut_enabled;
@@ -465,6 +467,22 @@
           <span class="toggle-desc"
             >只录扬声器外放,不录麦克风。纯外放场景(直播/视频)推荐开启:既根治麦克风串入的残渣,
             也避免麦克风通话模式压低外放音量与录音电平(macOS 固有行为)。</span
+          >
+        </span>
+      </label>
+      <label class="toggle">
+        <input
+          type="checkbox"
+          bind:checked={keepVol}
+          disabled={!settings || sysOnly}
+          onchange={() => saveSetting((s) => (s.keep_output_volume = keepVol))}
+        />
+        <span class="toggle-body">
+          <span class="toggle-title">录制时保持外放音量</span>
+          <span class="toggle-desc"
+            >麦克风改用普通输入,避开通话模式对外放音量与录音电平的压低。代价是失去系统回声消除,
+            外放声音会串进麦克风,靠回声去重过滤,转写可能偶发重复段。适合外放开会且需要录自己发言的场景;
+            「仅录制系统声音」开启时无效(麦克风不启动)。</span
           >
         </span>
       </label>

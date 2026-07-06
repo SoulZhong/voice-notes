@@ -378,18 +378,19 @@ fn spawn_session(
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
-        // 一次性读设置：record_system_only / keep_audio / language_filter 同源同快照
-        //（避免三次 load 读到并发写入的不同代）。app_data_dir 不可用时全部保守回落
-        // Settings::default（仅系统声=否、保留音频=是、语言过滤=开），绝不因读设置
-        // 失败改变现状行为。language_filter 在下方 start_session 处消费。
-        let (record_system_only, keep_audio, language_filter) = app
+        // 一次性读设置：record_system_only / keep_audio / language_filter /
+        // keep_output_volume 同源同快照（避免多次 load 读到并发写入的不同代）。
+        // app_data_dir 不可用时全部保守回落 Settings::default（仅系统声=否、保留音频=是、
+        // 语言过滤=开、保持外放音量=否），绝不因读设置失败改变现状行为。
+        // language_filter 在下方 start_session 处消费。
+        let (record_system_only, keep_audio, language_filter, keep_output_volume) = app
             .path()
             .app_data_dir()
             .map(|d| {
                 let s = settings::load(&d);
-                (s.record_system_only, s.keep_audio, s.language_filter)
+                (s.record_system_only, s.keep_audio, s.language_filter, s.keep_output_volume)
             })
-            .unwrap_or((false, true, true));
+            .unwrap_or((false, true, true, false));
 
         // 2) 构建源（各自 VAD）。默认建麦克风（必备）+ 系统声音（可降级）；
         // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
@@ -404,9 +405,18 @@ fn spawn_session(
                     return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
                 }
             };
-            // 麦克风源：macOS 用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；其他平台用 cpal。
+            // 麦克风源：macOS 默认用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；
+            // 「保持外放音量」开启时改用普通 cpal 输入——VPIO(通话模式)一启动 macOS
+            // 就把其它音频压低 12-16dB(ducking,Min 档配置下仍如此,系统固有行为),
+            // 外放开会场景既听不清、录下的系统声轨电平也小;普通输入无 ducking,
+            // 代价是失去 Apple AEC,外放串进麦克风的回声靠既有文本回声去重+残渣
+            // 抑制兜底。其他平台恒用 cpal。
             #[cfg(target_os = "macos")]
-            let mic: Box<dyn AudioCapture> = Box::new(audio::vpio::VpioMicrophone::new());
+            let mic: Box<dyn AudioCapture> = if keep_output_volume {
+                Box::new(audio::microphone::Microphone::new())
+            } else {
+                Box::new(audio::vpio::VpioMicrophone::new())
+            };
             #[cfg(not(target_os = "macos"))]
             let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
             sources.push((Source::Mic, mic, mic_seg));
@@ -469,10 +479,32 @@ fn spawn_session(
         // 说话人编号/质心延续 + 库种子注入：快照（续录）优先，库中同 person 不重复注入。
         // 库加载失败降级为无种子，绝不挡录制。
         let seeds = load_voiceprint_seeds(&app);
-        let registry = crate::diar::registry::SpeakerRegistry::with_seeds(
+        let mut registry = crate::diar::registry::SpeakerRegistry::with_seeds(
             &writer.lock().unwrap().registry_snapshot(),
             &seeds,
         );
+        // 实时全局入库：新识别出的声纹一旦够料(≥AUTO_ENROLL_MS)当场入库领全局
+        // person id(P<n>)，说话人从此刻起就有全局唯一身份，不必等停止。回调在
+        // ASR worker 线程同步执行,一个新说话人只发生一次,库写失败降级为 None
+        // (下条 final 自动重试),绝不影响转写主流程。库路径不可用则不装配——
+        // 停止时的 Snapshot upsert 仍是兜底入库路径,行为同旧版。
+        if let Ok(root) = data_root(&app) {
+            let vp_store_e = store::VoiceprintStore::new(root);
+            registry.set_enroller(
+                store::AUTO_ENROLL_MS,
+                Box::new(move |snap| {
+                    match vp_store_e
+                        .upsert_from_session(std::slice::from_ref(snap), &chrono::Local::now().to_rfc3339())
+                    {
+                        Ok(links) => links.get(&snap.id).cloned(),
+                        Err(e) => {
+                            eprintln!("声纹实时入库失败(不影响录制,稍后自动重试): {e}");
+                            None
+                        }
+                    }
+                }),
+            );
+        }
 
         // 3) 起会话。emit 回调带 source 字符串。
         let app_f = app.clone();
@@ -603,6 +635,7 @@ fn spawn_session(
                             id: id.clone(),
                             name: m.name.clone(),
                             sources: m.sources.clone(),
+                            person_id: m.person_id.clone(),
                         })
                         .collect();
                     drop(w);
@@ -623,6 +656,7 @@ fn spawn_session(
                             id: id.clone(),
                             name: m.name.clone(),
                             sources: m.sources.clone(),
+                            person_id: m.person_id.clone(),
                         })
                         .collect();
                     drop(w);
@@ -1037,6 +1071,7 @@ fn rename_speaker(
                     id: id.clone(),
                     name: m.name.clone(),
                     sources: m.sources.clone(),
+                    person_id: m.person_id.clone(),
                 })
                 .collect();
             drop(w);

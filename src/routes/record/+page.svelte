@@ -35,6 +35,61 @@
     const db = 20 * Math.log10(recording.level);
     return Math.max(0, Math.min(100, ((db + 50) / 50) * 100)); // -50dBFS..0dBFS → 0..100%
   });
+
+  // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
+  // 录制中转写容器带 50vh 底部留白(见 .transcript.live)，「滚到底」因此恰好把
+  // 当前句钉在屏幕垂直中央——居中定位与跟随/回到最新共用同一套滚动逻辑。
+  let transcriptEl = $state<HTMLElement | null>(null);
+  let follow = $state(true);
+  /** 有在途预览时预览是"当前句"；否则最新定稿是当前句(放大+高亮,历史行变暗)。 */
+  const hasPartial = $derived(!!(recording.partialMic || recording.partialSystem));
+  /** 距底部多少像素内视为"在底部"（恢复跟随的判定带）。 */
+  const BOTTOM_SLOP = 48;
+
+  /** 最近的可滚动祖先（布局里的 .main）；不硬编码布局选择器。 */
+  function scrollParent(): HTMLElement | null {
+    for (let p = transcriptEl?.parentElement; p; p = p.parentElement) {
+      if (/(auto|scroll)/.test(getComputedStyle(p).overflowY)) return p;
+    }
+    return null;
+  }
+
+  function jumpToLatest() {
+    follow = true;
+    const sc = scrollParent();
+    sc?.scrollTo({ top: sc.scrollHeight, behavior: "smooth" });
+  }
+
+  // 新定稿/预览更新 → 跟随滚动。依赖显式读取，转写为空时也无副作用。
+  $effect(() => {
+    void recording.finals.length;
+    void recording.partialMic;
+    void recording.partialSystem;
+    if (!follow || !recording.isLive) return;
+    const sc = scrollParent();
+    sc?.scrollTo({ top: sc.scrollHeight, behavior: "smooth" });
+  });
+
+  // 用户意图判定：wheel 上滑 = 主动离开（平滑滚动只产生 scroll 事件，不会误判）；
+  // scroll 回到底部判定带内 = 恢复跟随。监听挂可滚动祖先，卸载时清理。
+  $effect(() => {
+    if (!transcriptEl) return;
+    const sc = scrollParent();
+    if (!sc) return;
+    const onWheel = (e: WheelEvent) => {
+      // 内容不足一屏时无处可滚,上滑不算"离开最新",不亮返回按钮。
+      if (e.deltaY < 0 && recording.isLive && sc.scrollHeight > sc.clientHeight + 4) follow = false;
+    };
+    const onScroll = () => {
+      if (sc.scrollHeight - sc.scrollTop - sc.clientHeight <= BOTTOM_SLOP) follow = true;
+    };
+    sc.addEventListener("wheel", onWheel, { passive: true });
+    sc.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      sc.removeEventListener("wheel", onWheel);
+      sc.removeEventListener("scroll", onScroll);
+    };
+  });
 </script>
 
 <div class="container">
@@ -89,23 +144,30 @@
 
     <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
 
-    <div class="transcript">
-      {#each recording.finals as line}
-        <p class="final">
-          <span class="badge" style="background: {speakerColor(line.speaker, line.source)}; color: {speakerInk(line.speaker, line.source)}">
+    <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
+      {#each recording.finals as line, i}
+        <p class="final" class:current={recording.isLive && !hasPartial && i === recording.finals.length - 1}>
+          <span class="badge" style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}">
             {speakerLabel(line.speaker, line.source, recording.speakers)}
           </span>
           {line.text}
         </p>
       {/each}
       {#if recording.partialMic}
-        <p class="partial"><span class="badge mic">我</span>{recording.partialMic}</p>
+        <p class="partial" class:current={recording.isLive}><span class="badge mic">我</span>{recording.partialMic}</p>
       {/if}
       {#if recording.partialSystem}
-        <p class="partial"><span class="badge system">对方</span>{recording.partialSystem}</p>
+        <p class="partial" class:current={recording.isLive}><span class="badge system">对方</span>{recording.partialSystem}</p>
       {/if}
       {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
         <p class="hint">（开始说话…）</p>
+      {/if}
+    </div>
+
+    <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失 -->
+    <div class="jump-anchor" aria-hidden={follow || !recording.isLive}>
+      {#if !follow && recording.isLive}
+        <button class="jump" onclick={jumpToLatest}>↓ 回到最新</button>
       {/if}
     </div>
   {/if}
@@ -227,15 +289,46 @@
 
   .transcript p {
     margin: 0 0 6px 0;
+    /* 当前句放大/变色/亮底的切换做成过渡,高亮随语句推进平滑下移(歌词感) */
+    transition:
+      font-size 0.2s ease,
+      color 0.2s ease,
+      background 0.2s ease;
+  }
+
+  /* 录制中：底部 50vh 留白,使"滚到底"恰好把最后一行(当前句)钉在屏幕垂直中央;
+     顶部 40vh 留白保证开场内容还很少时容器已可滚——第一句话就能落在中央,
+     不用等内容攒满半屏。停止后留白撤掉,恢复普通文档流。 */
+  .transcript.live {
+    padding-top: 40vh;
+    padding-bottom: 50vh;
   }
 
   .final {
     color: var(--ink);
   }
+  /* 录制中历史行退后(次级墨色),把注意力让给中央的当前句 */
+  .transcript.live .final {
+    color: var(--ink-secondary);
+  }
 
   .partial {
     color: var(--ink-faint);
     font-style: italic;
+  }
+
+  /* 当前句(在途预览,或无预览时的最新定稿):放大 + 主墨色 + accent 亮底高亮,
+     轻投影让高亮块从页面上浮起一层(歌词舞台感) */
+  .transcript.live p.current {
+    font-size: 1.5em;
+    line-height: 1.55;
+    color: var(--ink);
+    background: var(--accent-tint);
+    border-radius: var(--radius-md);
+    padding: 0.3em 0.55em;
+    margin-left: -0.55em;
+    margin-right: -0.55em;
+    box-shadow: 0 4px 14px light-dark(rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.45));
   }
 
   /* 空态居中:一大块灰底里孤零零一行左对齐文字显得没做完 */
@@ -261,6 +354,31 @@
   }
   .badge.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
   .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
+
+  /* 「回到最新」药丸：零高锚点 + sticky bottom，钉在滚动视口底部居中，
+     不占版面高度、不遮转写（按钮向上偏出锚点自身）。 */
+  .jump-anchor {
+    position: sticky;
+    bottom: 1rem;
+    height: 0;
+    display: flex;
+    justify-content: center;
+  }
+  .jump {
+    transform: translateY(-100%);
+    border: none;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    color: var(--on-primary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.4em 1em;
+    cursor: pointer;
+    box-shadow: var(--shadow-popover);
+  }
+  .jump:hover {
+    background: var(--primary-pressed);
+  }
 
   .banner {
     background: var(--warning-tint);
