@@ -18,6 +18,11 @@ const SCHEMA_VERSION: u32 = 1;
 /// 停止时够料自动入库的门槛(累计发声毫秒)。待真实会议数据校准。
 pub const AUTO_ENROLL_MS: u64 = 10_000;
 
+/// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时 loser 的
+/// 样本迁入 winner 空槽;超出上限的不再写/迁移时删除,防止长期使用无界膨胀
+/// (每份 ≤15s 16k s16 ≈ 480KB)。
+pub const MAX_SAMPLES: usize = 5;
+
 /// resolve 跟随 redirects 链的步数上限。merge 已做链条压扁,正常情况下一跳到底;
 /// 这里是纯防御性上限,防止任何异常写入(例如手工改坏文件成环)导致死循环。
 const MAX_REDIRECT_HOPS: u32 = 8;
@@ -170,20 +175,23 @@ impl VoiceprintStore {
         vp.redirects.insert(loser.to_string(), winner.to_string());
         self.save(&vp)?;
 
-        if let (Some(lw), Some(ww)) = (self.sample_path(loser), self.sample_path(winner)) {
-            if lw.exists() {
-                let res =
-                    if ww.exists() { std::fs::remove_file(&lw) } else { std::fs::rename(&lw, &ww) };
-                if let Err(e) = res {
-                    eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}");
-                }
+        // 样本随合并迁移:loser 的每份样本迁入 winner 的空槽,winner 满员(MAX_SAMPLES)
+        // 后余下的删除(best-effort,文件操作失败不回滚已保存的库——样本是试听增值层,
+        // 库结构一致性优先)。
+        for lp in self.sample_paths_existing(loser) {
+            let res = match self.next_free_sample_slot(winner) {
+                Some(wp) => std::fs::rename(&lp, &wp),
+                None => std::fs::remove_file(&lp),
+            };
+            if let Err(e) = res {
+                eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}");
             }
         }
         Ok(())
     }
 
     /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)
-    /// + 连带删除录音样本(best-effort)。
+    /// + 连带删除全部录音样本(best-effort)。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let mut vp = self.load();
@@ -191,52 +199,62 @@ impl VoiceprintStore {
         vp.redirects.retain(|_, target| target != id);
         vp.redirects.remove(id);
         self.save(&vp)?;
-        if let Some(sample) = self.sample_path(id) {
-            if sample.exists() {
-                if let Err(e) = std::fs::remove_file(&sample) {
-                    eprintln!("声纹样本删除失败({id},不影响库): {e}");
-                }
+        for sample in self.sample_paths_existing(id) {
+            if let Err(e) = std::fs::remove_file(&sample) {
+                eprintln!("声纹样本删除失败({id},不影响库): {e}");
             }
         }
         Ok(())
     }
 
-    /// 人物录音样本路径:app_data/voiceprints/<id>.wav。id 含路径分隔等异常字符时
-    /// 返回 None(防御 IPC 传入构造路径;正常 id 恒为 P<n>)——绝不能映射到共享
-    /// 兜底名,否则两个异常 id 会互相覆盖/串听对方的样本。
-    fn sample_path(&self, id: &str) -> Option<PathBuf> {
+    /// 人物第 slot 份样本的路径:slot=1 沿用历史布局 voiceprints/<id>.wav(多样本
+    /// 之前写下的旧样本天然是第 1 份),slot≥2 为 <id>-<slot>.wav。id 含路径分隔等
+    /// 异常字符时返回 None(防御 IPC 传入构造路径;正常 id 恒为 P<n>)——绝不能映射
+    /// 到共享兜底名,否则两个异常 id 会互相覆盖/串听对方的样本。
+    fn sample_slot_path(&self, id: &str, slot: usize) -> Option<PathBuf> {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
-        Some(self.root.join("voiceprints").join(format!("{id}.wav")))
+        let name = if slot == 1 { format!("{id}.wav") } else { format!("{id}-{slot}.wav") };
+        Some(self.root.join("voiceprints").join(name))
     }
 
-    /// 样本存在则返回绝对路径(list_people 用)。
-    pub fn sample_path_if_exists(&self, id: &str) -> Option<PathBuf> {
-        let p = self.sample_path(id)?;
-        p.exists().then_some(p)
+    /// 人物现存的全部样本绝对路径,按槽位序(list_people 与合并迁移用)。
+    /// 中间槽位缺失(历史删除)不影响后续槽位被列出。
+    pub fn sample_paths_existing(&self, id: &str) -> Vec<PathBuf> {
+        (1..=MAX_SAMPLES)
+            .filter_map(|n| self.sample_slot_path(id, n))
+            .filter(|p| p.exists())
+            .collect()
     }
 
-    /// 为人物写入代表性录音样本(16k 单声道 s16 WAV):
+    /// 首个空样本槽(≤ MAX_SAMPLES);满员/非法 id 返回 None。
+    fn next_free_sample_slot(&self, id: &str) -> Option<PathBuf> {
+        (1..=MAX_SAMPLES)
+            .filter_map(|n| self.sample_slot_path(id, n))
+            .find(|p| !p.exists())
+    }
+
+    /// 为人物追加一份录音样本(16k 单声道 s16 WAV),写入首个空槽:
     /// - id 先经 redirects 解析(会话快照里的 person 引用可能已被合并);
-    /// - 已有样本不覆盖(样本是「确认此人是谁」的稳定参照,不随会话滚动);
-    /// - 解析失败(人物已删)静默跳过。
+    /// - 已有样本不覆盖(每场会议至多追加一份,试听可区分"哪场的声音");
+    /// - 满员(MAX_SAMPLES)/解析失败(人物已删)/空样本静默跳过。
     /// 返回是否实际写入。
     ///
     /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,否则「停止入库写样本」
     /// 与管理页并发合并/删除会写出无主孤儿样本或把错人的音频挂到 winner 上。
-    pub fn write_sample_if_missing(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
+    pub fn append_sample(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
         let _guard = vp_guard();
         let vp = self.load();
         let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
             return Ok(false);
         };
-        let Some(path) = self.sample_path(&resolved) else {
-            return Ok(false);
-        };
-        if path.exists() || samples.is_empty() {
+        if samples.is_empty() {
             return Ok(false);
         }
+        let Some(path) = self.next_free_sample_slot(&resolved) else {
+            return Ok(false); // 满员:样本够用了,不再累积
+        };
         std::fs::create_dir_all(path.parent().expect("sample_path 恒有父目录"))?;
         let spec = hound::WavSpec {
             channels: 1,
@@ -631,30 +649,49 @@ mod tests {
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
 
-        // 写入 + 不覆盖语义。
-        assert!(store.write_sample_if_missing(&p1, &[0.5; 160]).unwrap());
-        assert!(!store.write_sample_if_missing(&p1, &[0.9; 160]).unwrap(), "已有样本不覆盖");
-        assert!(store.sample_path_if_exists(&p1).is_some());
-        assert!(store.sample_path_if_exists(&p2).is_none());
-        let mut r = hound::WavReader::open(store.sample_path_if_exists(&p1).unwrap()).unwrap();
+        // 逐份追加:第 1 份走历史布局 <id>.wav,第 2 份 <id>-2.wav。
+        assert!(store.append_sample(&p1, &[0.5; 160]).unwrap());
+        assert!(store.append_sample(&p1, &[0.9; 320]).unwrap());
+        let paths = store.sample_paths_existing(&p1);
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with(format!("{p1}.wav")), "首份沿用旧布局: {paths:?}");
+        assert!(paths[1].ends_with(format!("{p1}-2.wav")));
+        assert!(store.sample_paths_existing(&p2).is_empty());
+        let mut r = hound::WavReader::open(&paths[0]).unwrap();
         assert_eq!(r.spec().sample_rate, 16_000);
         assert_eq!(r.samples::<i16>().count(), 160);
 
-        // 合并:winner(p2)无样本 → 继承 loser(p1)的。
+        // 合并:winner(p2)无样本 → 继承 loser(p1)的全部两份。
         store.merge(&p1, &p2).unwrap();
-        assert!(store.sample_path_if_exists(&p2).is_some(), "winner 继承 loser 样本");
-        assert!(store.sample_path_if_exists(&p1).is_none());
+        assert_eq!(store.sample_paths_existing(&p2).len(), 2, "winner 继承 loser 全部样本");
+        assert!(store.sample_paths_existing(&p1).is_empty());
 
-        // 经 redirects 的写入解析到 winner:winner 已有样本 → 不写。
-        assert!(!store.write_sample_if_missing(&p1, &[0.1; 160]).unwrap());
+        // 经 redirects 的追加解析到 winner:winner 未满 → 继续追加成第 3 份。
+        assert!(store.append_sample(&p1, &[0.1; 160]).unwrap());
+        assert_eq!(store.sample_paths_existing(&p2).len(), 3);
 
-        // 删除连带删样本。
+        // 删除连带删全部样本。
         store.delete(&p2).unwrap();
-        assert!(store.sample_path_if_exists(&p2).is_none(), "删除人物连带删样本");
+        assert!(store.sample_paths_existing(&p2).is_empty(), "删除人物连带删全部样本");
     }
 
     #[test]
-    fn merge_removes_loser_sample_when_winner_already_has_one() {
+    fn append_sample_stops_at_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1")
+            .unwrap();
+        let p1 = links["S1"].clone();
+        for _ in 0..MAX_SAMPLES {
+            assert!(store.append_sample(&p1, &[0.5; 16]).unwrap());
+        }
+        assert!(!store.append_sample(&p1, &[0.5; 16]).unwrap(), "满员后不再追加");
+        assert_eq!(store.sample_paths_existing(&p1).len(), MAX_SAMPLES);
+    }
+
+    #[test]
+    fn merge_migrates_loser_samples_into_free_slots_and_drops_excess() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![
@@ -663,12 +700,16 @@ mod tests {
         ];
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
-        store.write_sample_if_missing(&p1, &[0.5; 16]).unwrap();
-        store.write_sample_if_missing(&p2, &[0.7; 32]).unwrap();
+        // loser 3 份、winner 4 份:迁移只能填 1 个空槽,loser 余下 2 份删除。
+        for _ in 0..3 {
+            store.append_sample(&p1, &[0.5; 16]).unwrap();
+        }
+        for _ in 0..4 {
+            store.append_sample(&p2, &[0.7; 32]).unwrap();
+        }
         store.merge(&p1, &p2).unwrap();
-        assert!(store.sample_path_if_exists(&p1).is_none(), "loser 样本已清理");
-        let mut r = hound::WavReader::open(store.sample_path_if_exists(&p2).unwrap()).unwrap();
-        assert_eq!(r.samples::<i16>().count(), 32, "winner 自己的样本保留");
+        assert!(store.sample_paths_existing(&p1).is_empty(), "loser 样本全部离场");
+        assert_eq!(store.sample_paths_existing(&p2).len(), MAX_SAMPLES, "winner 填满即止,超额删除");
     }
 
     #[test]
@@ -676,11 +717,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         for bad in ["../x", "a/b", "", "a\\b", ".."] {
-            assert!(store.sample_path(bad).is_none(), "非法 id 应得 None(不得映射共享兜底名): {bad:?}");
-            assert!(store.sample_path_if_exists(bad).is_none());
+            assert!(store.sample_paths_existing(bad).is_empty(), "非法 id 应得空(不得映射共享兜底名): {bad:?}");
         }
         // 写侧:未知 id 经 resolve 为 None,静默跳过不落文件。
-        assert!(!store.write_sample_if_missing("../x", &[0.1; 16]).unwrap());
+        assert!(!store.append_sample("../x", &[0.1; 16]).unwrap());
         assert!(!tmp.path().join("voiceprints").exists(), "非法 id 不产生任何样本文件");
     }
 

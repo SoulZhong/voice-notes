@@ -81,9 +81,9 @@ pub struct PersonSummary {
     pub total_ms: u64,
     pub last_seen: String,
     pub sources: Vec<String>,
-    /// 代表性录音样本的绝对路径(voiceprints/<id>.wav);库中无样本(旧数据/写失败)为 None,
-    /// 前端据此决定是否显示「试听」。
-    pub sample_path: Option<String>,
+    /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES;合并会带入对方的样本)。
+    /// 空 = 库中无样本(旧数据/写失败),前端据此决定是否显示「试听」。
+    pub sample_paths: Vec<String>,
 }
 
 /// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;
