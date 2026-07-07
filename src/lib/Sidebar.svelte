@@ -2,6 +2,7 @@
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { ask } from "@tauri-apps/plugin-dialog";
+  import { onNoteRenamed } from "$lib/events";
   import { recording } from "$lib/recording.svelte";
   import {
     listNotes,
@@ -96,6 +97,20 @@
     void recording.statusVersion;
     void recording.notesVersion;
     refresh();
+  });
+
+  // 后端自动改名(LLM 主题标题)发生在精修后台线程,前端版本号不会变,靠事件刷新。
+  $effect(() => {
+    let un: (() => void) | null = null;
+    let disposed = false;
+    onNoteRenamed(() => refresh()).then((u) => {
+      if (disposed) u();
+      else un = u;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
   });
 
   async function toggleRecording() {

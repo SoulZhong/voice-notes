@@ -5,7 +5,7 @@
   import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
-  import { onRefine } from "$lib/events";
+  import { onRefine, onNoteRenamed } from "$lib/events";
   import {
     getNote,
     renameNote,
@@ -183,6 +183,23 @@
     return () => {
       disposed = true;
       unlisten?.();
+    };
+  });
+
+  // 后端自动改名(LLM 主题标题):只改标题字段,不整页 refresh(编辑中也安全)。
+  $effect(() => {
+    const forId = id;
+    let un: (() => void) | null = null;
+    let disposed = false;
+    onNoteRenamed((e) => {
+      if (e.note_id === forId && note) note.meta.title = e.title;
+    }).then((u) => {
+      if (disposed) u();
+      else un = u;
+    });
+    return () => {
+      disposed = true;
+      un?.();
     };
   });
   // 刷新：任何编辑进行中都跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。

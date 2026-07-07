@@ -59,6 +59,14 @@ pub struct TranscodeEvent {
     pub note_id: String,
 }
 
+/// 后端自动改名(LLM 主题标题),事件名 "note_renamed":侧栏列表与详情页据此刷新
+/// 标题——改名发生在后台精修线程,前端不会主动重拉。
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteRenamedEvent {
+    pub note_id: String,
+    pub title: String,
+}
+
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {

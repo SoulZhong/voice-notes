@@ -105,6 +105,52 @@ fn call_chunk(cfg: &LlmConfig, glossary: &Value, texts: &[&str]) -> Result<(Valu
     Ok((parsed["glossary"].clone(), texts_out))
 }
 
+/// 为整场笔记生成主题标题(精修完成后调用,替换未被用户改过的默认标题)。
+/// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响精修结果。
+pub fn gen_title(cfg: &LlmConfig, paragraphs: &[RefinedParagraph]) -> anyhow::Result<String> {
+    let mut text = String::new();
+    for p in paragraphs {
+        if text.chars().count() > 1500 {
+            break;
+        }
+        text.push_str(&p.text);
+        text.push('\n');
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("精修稿无内容,不生成标题");
+    }
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let body = json!({
+        "model": cfg.model,
+        "temperature": 0.3,
+        "messages": [
+            { "role": "system", "content": "你为会议转写起标题。只输出一个不超过 12 个字的中文标题,概括这场对话的核心主题;不要引号、标点或任何解释。" },
+            { "role": "user", "content": text },
+        ],
+    })
+    .to_string();
+    let resp_text = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+        .set("authorization", &format!("Bearer {}", cfg.api_key))
+        .set("content-type", "application/json")
+        .send_string(&body)?
+        .into_string()?;
+    let resp: Value = serde_json::from_str(&resp_text)?;
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
+    let title = content
+        .trim()
+        .trim_matches(['"', '“', '”', '「', '」', '《', '》', '。'])
+        .trim()
+        .to_string();
+    // 长度守卫:空或离谱地长(不服从指令,可能把解释吐出来了)都放弃。
+    if title.is_empty() || title.chars().count() > 20 || title.contains('\n') {
+        anyhow::bail!("标题不合规,放弃: {title:?}");
+    }
+    Ok(title)
+}
+
 /// 逐块精修,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
 pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph]) -> LlmOutcome {

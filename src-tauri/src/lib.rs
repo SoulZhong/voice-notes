@@ -333,6 +333,35 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 emit("llm", &doc.stages.llm);
+                // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
+                // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
+                // 失败静默:标题是锦上添花,不影响精修完成态。
+                if (doc.stages.llm == "done" || doc.stages.llm == "partial")
+                    && store::writer::is_default_title(&note.meta.title)
+                {
+                    let cfg = refine::llm::LlmConfig {
+                        base_url: s.refine_base_url.clone(),
+                        model: s.refine_model.clone(),
+                        api_key: s.refine_api_key.clone(),
+                    };
+                    match refine::llm::gen_title(&cfg, &doc.paragraphs) {
+                        Ok(title) => {
+                            match store::NoteStore::new(notes_dir(&app)?).rename(&note_id, &title) {
+                                Ok(()) => {
+                                    let _ = app.emit(
+                                        "note_renamed",
+                                        ipc::NoteRenamedEvent {
+                                            note_id: note_id.clone(),
+                                            title,
+                                        },
+                                    );
+                                }
+                                Err(e) => eprintln!("refine({note_id}): 主题标题落盘失败: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("refine({note_id}): 主题标题生成失败(保留默认名): {e}"),
+                    }
+                }
                 anyhow::Ok(())
             }));
         match &result {

@@ -78,3 +78,10 @@ export function onLevel(cb: (e: LevelEvent) => void) {
 export function onRefine(cb: (e: RefineEvent) => void) {
   return listen<RefineEvent>("refine", (ev) => cb(ev.payload));
 }
+
+/** 后端自动改名(LLM 主题标题)。侧栏与详情页据此刷新标题。 */
+export type NoteRenamedEvent = { note_id: string; title: string };
+
+export function onNoteRenamed(cb: (e: NoteRenamedEvent) => void) {
+  return listen<NoteRenamedEvent>("note_renamed", (ev) => cb(ev.payload));
+}
