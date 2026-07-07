@@ -1,5 +1,5 @@
 use super::{write_meta_atomic, write_speakers_atomic, NoteMeta, SegmentRecord, SpeakerMeta, SCHEMA_VERSION};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -29,6 +29,79 @@ pub struct NoteWriter {
     created_this_session: bool,
 }
 
+/// 默认标题:「周X时段的会议」。列表副标题已有精确「日期时间 · 时长」,标题再放
+/// 数字时间戳就是逐字重复(冒烟反馈)——标题承载人话语义,精确时间交给副标题。
+pub fn default_title(now: &DateTime<Local>) -> String {
+    let wd = ["一", "二", "三", "四", "五", "六", "日"]
+        [now.weekday().num_days_from_monday() as usize];
+    let slot = match now.hour() {
+        0..=4 => "凌晨",
+        5..=8 => "早上",
+        9..=11 => "上午",
+        12..=13 => "中午",
+        14..=17 => "下午",
+        _ => "晚上",
+    };
+    format!("周{wd}{slot}的会议")
+}
+
+/// 标题是否仍是默认样式(新「周X时段的会议[ N]」或旧「YYYY-MM-DD HH:MM 会议」):
+/// LLM 主题标题只在用户没手动改过名时才自动替换,这里是那条判定。
+pub fn is_default_title(t: &str) -> bool {
+    for wd in ["一", "二", "三", "四", "五", "六", "日"] {
+        for slot in ["凌晨", "早上", "上午", "中午", "下午", "晚上"] {
+            if let Some(rest) = t.strip_prefix(&format!("周{wd}{slot}的会议")) {
+                let rest = rest.trim_start();
+                if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+    }
+    // 旧样式:前缀恰为 "YYYY-MM-DD HH:MM"(16 字符,数字与固定分隔符)。
+    if let Some(prefix) = t.strip_suffix(" 会议") {
+        return prefix.chars().count() == 16
+            && prefix.chars().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                10 => c == ' ',
+                13 => c == ':',
+                _ => c.is_ascii_digit(),
+            });
+    }
+    false
+}
+
+/// 同日重名去重:「周二晚上的会议」已存在 → 「周二晚上的会议 2」。只扫同日(id 前缀
+/// 同 YYYYmmdd)兄弟目录的 meta 标题,一天内笔记数量级小,线性扫可忽略。
+fn unique_default_title(notes_dir: &Path, now: &DateTime<Local>) -> String {
+    let base = default_title(now);
+    let day = now.format("%Y%m%d").to_string();
+    let mut taken: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(notes_dir) {
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().starts_with(&day) {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(e.path().join("meta.json")) {
+                if let Ok(m) = serde_json::from_str::<NoteMeta>(&s) {
+                    taken.push(m.title);
+                }
+            }
+        }
+    }
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let cand = format!("{base} {n}");
+        if !taken.iter().any(|t| t == &cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
 impl NoteWriter {
     /// 在 notes_dir 下建会议文件夹（id = 本地时间 YYYYmmdd-HHMMSS，同秒冲突加 -2/-3 后缀），
     /// 写入 state=recording 的 meta，打开 segments.jsonl。
@@ -49,7 +122,7 @@ impl NoteWriter {
         let meta = NoteMeta {
             schema_version: SCHEMA_VERSION,
             id: id.clone(),
-            title: now.format("%Y-%m-%d %H:%M 会议").to_string(),
+            title: unique_default_title(&notes_dir, &now),
             started_at: now.to_rfc3339(),
             ended_at: None,
             state: "recording".into(),
@@ -526,6 +599,39 @@ mod tests {
 
     fn now() -> chrono::DateTime<chrono::Local> {
         chrono::Local::now()
+    }
+
+    #[test]
+    fn default_title_is_human_and_detectable() {
+        let t = default_title(&now());
+        assert!(t.starts_with('周') && t.ends_with("的会议"));
+        // 生成的默认名必须被 is_default_title 认出(LLM 替换判定依赖这条闭环)。
+        assert!(is_default_title(&t));
+        assert!(is_default_title(&format!("{t} 2")));
+        // 旧样式与用户手动名
+        assert!(is_default_title("2026-07-07 18:44 会议"));
+        assert!(!is_default_title("发布计划与分工"));
+        assert!(!is_default_title("周二晚上的会议记录")); // 后缀多字 = 用户改过
+    }
+
+    #[test]
+    fn same_day_default_titles_get_numbered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let n = now();
+        let w1 = NoteWriter::create(tmp.path(), n).unwrap();
+        let base = default_title(&n);
+        assert_eq!(load_meta(tmp.path(), w1.note_id()).title, base);
+        let w2 = NoteWriter::create(tmp.path(), n).unwrap();
+        assert_eq!(load_meta(tmp.path(), w2.note_id()).title, format!("{base} 2"));
+        let w3 = NoteWriter::create(tmp.path(), n).unwrap();
+        assert_eq!(load_meta(tmp.path(), w3.note_id()).title, format!("{base} 3"));
+    }
+
+    fn load_meta(root: &std::path::Path, id: &str) -> NoteMeta {
+        serde_json::from_str(
+            &std::fs::read_to_string(root.join(id).join("meta.json")).unwrap(),
+        )
+        .unwrap()
     }
 
     fn read_meta(dir: &std::path::Path) -> NoteMeta {
