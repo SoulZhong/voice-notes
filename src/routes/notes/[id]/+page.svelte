@@ -452,7 +452,7 @@
       </div>
 
       {#if note.meta.state === "recording"}
-        <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
+        <div class="banner">这场录音曾意外中断，中断前的内容已保存。点击下方播放器右侧的红色录音键可接着录。</div>
       {/if}
       {#if note.skipped_lines > 0}
         <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
