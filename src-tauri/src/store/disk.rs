@@ -200,7 +200,7 @@ mod tests {
         std::fs::write(tmp.path().join("mic.wav"), vec![0u8; 30]).unwrap();
         std::fs::write(tmp.path().join("system.m4a"), vec![0u8; 40]).unwrap();
         std::fs::write(tmp.path().join("mic.m4a.bad"), vec![0u8; 5]).unwrap();
-        audio::set_track_compressed(tmp.path(), "system", 1234).unwrap();
+        audio::set_track_compressed(tmp.path(), "system", 1234, None).unwrap();
 
         let freed = purge_note_audio(tmp.path());
         assert_eq!(freed, 75, "wav+m4a+m4a.bad 三类都计入释放字节"); // 30+40+5=75

@@ -71,6 +71,75 @@ pub struct TrackMeta {
     /// 必须由转码器实测后写入这里,list_tracks 直接读取。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// 真实音频波形:WAVEFORM_BUCKETS 桶等分时长,每桶峰值 |sample| 映射 0..255。
+    /// 转码时从 WAV 流式预计算(m4a 解码贵,WAV 删除后无从再算);播放器据此画
+    /// 音轨,替代按转写段落 rms 聚合的包络(说话稀疏时后者近乎空白,像显示故障)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<Vec<u8>>,
+}
+
+/// 波形桶数,与前端 WAVE_BARS 对齐(260 桶约 1KB JSON,audio.json 体积可忽略)。
+pub const WAVEFORM_BUCKETS: usize = 260;
+
+/// 从 16k/mono/s16 WAV 流式计算波形桶:每桶取峰值 |i16| 折算 0..255。
+/// BufReader 顺序读,1 小时音频(~230MB)亚秒级;不整读进内存。
+pub fn waveform_from_wav(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    let f = std::fs::File::open(path)?;
+    let data_len = f.metadata()?.len().saturating_sub(HEADER_LEN);
+    let total_samples = (data_len / 2) as usize;
+    if total_samples == 0 {
+        return Ok(vec![0; WAVEFORM_BUCKETS]);
+    }
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    r.seek(SeekFrom::Start(HEADER_LEN))?;
+    let mut out = vec![0u8; WAVEFORM_BUCKETS];
+    let mut buf = vec![0u8; 1 << 20];
+    let mut idx = 0usize;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for ch in buf[..n].chunks_exact(2) {
+            let s = i16::from_le_bytes([ch[0], ch[1]]).unsigned_abs();
+            // 桶号按样本序号等分;末尾越界样本(header 修复竞态)并入最后一桶。
+            let b = (idx * WAVEFORM_BUCKETS / total_samples).min(WAVEFORM_BUCKETS - 1);
+            let v = (s >> 7).min(255) as u8; // 32768 满幅 → 256 档,饱和到 255
+            if v > out[b] {
+                out[b] = v;
+            }
+            idx += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// 纯 PCM 字节(s16le)桶化,公式与 waveform_from_wav 一致。旧笔记回填用:
+/// m4a 解码产物经 extract_wav_data 拿到的就是纯 data 字节,没有 44 头可跳。
+pub fn waveform_from_pcm(bytes: &[u8]) -> Vec<u8> {
+    let total_samples = bytes.len() / 2;
+    let mut out = vec![0u8; WAVEFORM_BUCKETS];
+    if total_samples == 0 {
+        return out;
+    }
+    for (idx, ch) in bytes.chunks_exact(2).enumerate() {
+        let s = i16::from_le_bytes([ch[0], ch[1]]).unsigned_abs();
+        let b = (idx * WAVEFORM_BUCKETS / total_samples).min(WAVEFORM_BUCKETS - 1);
+        let v = (s >> 7).min(255) as u8;
+        if v > out[b] {
+            out[b] = v;
+        }
+    }
+    out
+}
+
+/// 单独写入某轨波形(旧笔记懒回填)。持 META_LOCK,同 set_track_compressed。
+pub fn set_track_waveform(note_dir: &Path, source: &str, waveform: Vec<u8>) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.tracks.entry(source.to_string()).or_default().waveform = Some(waveform);
+    save_audio_meta(note_dir, &meta)
 }
 
 /// 缺失/损坏 → 默认空表(全 0 offset 由 tracks 缺项兜底),不 Err:与本仓损坏容忍哲学一致。
@@ -92,12 +161,20 @@ fn save_audio_meta(note_dir: &Path, meta: &AudioMeta) -> anyhow::Result<()> {
 /// list_tracks 据此把该轨道的枚举从 WAV 切到 m4a。
 /// 持 META_LOCK:与 AudioTrackWriter::open 等其它 load→改→save 序列互斥,
 /// 避免并发建档/转码互相覆盖 audio.json。
-pub fn set_track_compressed(note_dir: &Path, source: &str, duration_ms: u64) -> anyhow::Result<()> {
+pub fn set_track_compressed(
+    note_dir: &Path,
+    source: &str,
+    duration_ms: u64,
+    waveform: Option<Vec<u8>>,
+) -> anyhow::Result<()> {
     let _guard = meta_guard();
     let mut meta = load_audio_meta(note_dir);
     let track = meta.tracks.entry(source.to_string()).or_default();
     track.codec = Some("aac".to_string());
     track.duration_ms = Some(duration_ms);
+    if waveform.is_some() {
+        track.waveform = waveform;
+    }
     save_audio_meta(note_dir, &meta)
 }
 
@@ -312,6 +389,9 @@ pub struct TrackInfo {
     pub path: String,
     pub offset_ms: u64,
     pub duration_ms: u64,
+    /// 真实音频波形(0..255 峰值桶,见 TrackMeta::waveform)。已转码轨取预计算值;
+    /// 未转码 WAV 现算(流式读,亚秒级);None = 旧笔记无从取得,前端回退段落包络。
+    pub waveform: Option<Vec<u8>>,
 }
 
 /// 已知源集合 = audio.json 记录过的 ∪ 内建两源:写入端(lib.rs 按配置源建档)与
@@ -344,6 +424,7 @@ pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
             out.push(TrackInfo {
                 path: m4a_path.to_string_lossy().into_owned(),
                 offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
+                waveform: meta.tracks.get(&source).and_then(|t| t.waveform.clone()),
                 source,
                 duration_ms,
             });
@@ -357,6 +438,9 @@ pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
         out.push(TrackInfo {
             path: path.to_string_lossy().into_owned(),
             offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
+            // 未转码 WAV(中断笔记/转码失败降级)现算:流式读亚秒级,详情页打开是
+            // 低频动作;失败回 None,前端退段落包络,不挡枚举。
+            waveform: waveform_from_wav(&path).ok(),
             source,
             duration_ms: bytes_to_ms(md.len() - HEADER_LEN),
         });
@@ -393,6 +477,31 @@ pub fn repair_stale_tracks(note_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waveform_buckets_track_peaks_and_pcm_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("t.wav");
+        // 前半静音、后半半幅(16384 → 桶值 128):前半桶应为 0,后半桶应为 128。
+        let half = WAVEFORM_BUCKETS * 100; // 每桶 100 样本,整除避免边界桶混采
+        let mut data = Vec::with_capacity(half * 4);
+        for _ in 0..half {
+            data.extend_from_slice(&0i16.to_le_bytes());
+        }
+        for _ in 0..half {
+            data.extend_from_slice(&16384i16.to_le_bytes());
+        }
+        let mut file = wav_header(data.len() as u32).to_vec();
+        file.extend_from_slice(&data);
+        std::fs::write(&wav, &file).unwrap();
+
+        let wf = waveform_from_wav(&wav).unwrap();
+        assert_eq!(wf.len(), WAVEFORM_BUCKETS);
+        assert!(wf[..WAVEFORM_BUCKETS / 2].iter().all(|&v| v == 0), "前半应静音");
+        assert!(wf[WAVEFORM_BUCKETS / 2..].iter().all(|&v| v == 128), "后半应半幅");
+        // 流式(waveform_from_wav)与整块(waveform_from_pcm,回填路径)必须同答案。
+        assert_eq!(wf, waveform_from_pcm(&data));
+    }
 
     fn read_wav(path: &Path) -> (hound::WavSpec, Vec<i16>) {
         let mut r = hound::WavReader::open(path).unwrap();
@@ -555,7 +664,7 @@ mod tests {
         drop(w);
         // 模拟转码完成:m4a 文件(内容不重要,枚举只看存在性)+ meta 标记
         std::fs::write(tmp.path().join("mic.m4a"), b"fake m4a").unwrap();
-        set_track_compressed(tmp.path(), "mic", 100).unwrap();
+        set_track_compressed(tmp.path(), "mic", 100, None).unwrap();
         std::fs::remove_file(tmp.path().join("mic.wav")).unwrap();
 
         let tracks = list_tracks(tmp.path());

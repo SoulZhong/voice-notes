@@ -202,6 +202,26 @@
   const audioTotalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
   const waveform = $derived.by(() => {
     if (audioTotalMs <= 0) return [];
+    // 真实音频波形优先(后端转码预计算/懒回填):有声音就有波形,与录音机直觉一致。
+    // 多轨(mic/system)按全局时间轴对位取 max;真实数据自带起伏,不加抖动纹理。
+    const real: number[] = new Array(WAVE_BARS).fill(0);
+    let hasReal = false;
+    for (const t of tracks) {
+      if (!t.waveform?.length) continue;
+      hasReal = true;
+      const n = t.waveform.length;
+      for (let j = 0; j < n; j++) {
+        const ms = t.offset_ms + ((j + 0.5) / n) * t.duration_ms;
+        const g = Math.max(0, Math.min(WAVE_BARS - 1, Math.floor((ms / audioTotalMs) * WAVE_BARS)));
+        const v = t.waveform[j] / 255;
+        if (v > real[g]) real[g] = v;
+      }
+    }
+    if (hasReal) {
+      const peak = Math.max(0.12, ...real);
+      return real.map((v) => (v > 0 ? Math.min(1, Math.pow(v / peak, 0.7)) : 0));
+    }
+    // 回退:按转写段落 rms 聚合的包络(无波形数据的旧笔记)。
     const bars: number[] = new Array(WAVE_BARS).fill(0);
     for (const s of displaySegments) {
       const r = s.rms ?? 0.05;
