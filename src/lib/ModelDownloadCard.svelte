@@ -12,7 +12,8 @@
     status,
     compact = false,
     onComplete,
-  }: { status: ModelsStatus; compact?: boolean; onComplete: () => void } = $props();
+    primaryLabel = "下载模型",
+  }: { status: ModelsStatus; compact?: boolean; onComplete: () => void; primaryLabel?: string } = $props();
 
   const missing = $derived(
     status.artifacts.filter((a) => !a.present && (a.required_for_recording || a.id === "speaker")),
@@ -113,7 +114,7 @@
     {#if downloading}
       <button onclick={() => cancelModelsDownload()}>暂停下载</button>
     {:else}
-      <button class="primary" onclick={start}>{error || cancelled ? "继续下载" : "下载模型"}</button>
+      <button class="primary" onclick={start}>{error || cancelled ? "继续下载" : primaryLabel}</button>
     {/if}
     {#if !compact}
       <span class="note">下载镜像可在设置页配置。</span>

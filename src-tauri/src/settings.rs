@@ -66,6 +66,11 @@ pub struct Settings {
     /// API key。明文存本机 settings.json(单机应用,设置页已注明)。
     #[serde(default)]
     pub refine_api_key: String,
+    /// 首启引导已完成(欢迎层「开始使用」下载完成或进入「高级设置」时置 true)。
+    /// 老用户升级(字段缺失)反序列化为 false,但 layout 侧发现模型已就绪会静默补 true,
+    /// 不会对老用户弹引导。
+    #[serde(default)]
+    pub onboarded: bool,
 }
 
 fn default_prefix() -> String {
@@ -111,6 +116,7 @@ impl Default for Settings {
             refine_base_url: String::new(),
             refine_model: String::new(),
             refine_api_key: String::new(),
+            onboarded: false,
         }
     }
 }
