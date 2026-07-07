@@ -113,6 +113,8 @@ export function speakerLabel(
   const meta = speakers[speaker];
   if (meta?.name) return meta.name;
   if (meta?.person_id) return `说话人 ${meta.person_id.replace(/^P/, "")}`;
+  // 精修稿重聚类标签(R1..Rk):终稿命名空间,不叫"新说话人"(它是全场收敛结果而非新面孔)
+  if (/^R\d+$/.test(speaker)) return `说话人 ${speaker.slice(1)}`;
   return `新说话人 ${speaker.replace(/^S/, "")}`;
 }
 /** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(哈希逻辑不变)。

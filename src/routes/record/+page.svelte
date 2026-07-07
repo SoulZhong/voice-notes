@@ -36,6 +36,23 @@
     return Math.max(0, Math.min(100, ((db + 50) / 50) * 100)); // -50dBFS..0dBFS → 0..100%
   });
 
+  // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移,
+  //    滚动保留最近 240 条(约 29s);暂停冻结不清空,停止清空。interval 回调里读
+  //    levelPct 是瞬时值,不进 effect 依赖。 ──
+  const LIVE_BARS = 240;
+  let liveBars = $state<number[]>([]);
+  $effect(() => {
+    if (!recording.isLive) {
+      liveBars = [];
+      return;
+    }
+    if (recording.paused) return; // 冻结:不采样,已有波形保留
+    const t = setInterval(() => {
+      liveBars = [...liveBars.slice(-(LIVE_BARS - 1)), levelPct];
+    }, 120);
+    return () => clearInterval(t);
+  });
+
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
   // 录制中转写容器带 50vh 底部留白(见 .transcript.live)，「滚到底」因此恰好把
   // 当前句钉在屏幕垂直中央——居中定位与跟随/回到最新共用同一套滚动逻辑。
@@ -93,38 +110,49 @@
 </script>
 
 <div class="container">
-  <h1>实时转写</h1>
+  <!-- 头部整体吸顶(标题/下载卡/控制条/状态行):录制中转写自动滚到最新,操作不能跟着滚出视口 -->
+  <div class="topbar">
+    <h1>实时转写</h1>
 
-  <!-- 单实例:compact 由 recording_ready 驱动。若拆成两个 if 分支,识别模型下完
-       切小提示条时组件会销毁重建,进行中的下载进度/订阅状态全部清零。 -->
-  {#if models && !(models.recording_ready && models.diarization_ready)}
-    <ModelDownloadCard status={models} compact={models.recording_ready} onComplete={refreshModels} />
-  {/if}
+    <!-- 单实例:compact 由 recording_ready 驱动。若拆成两个 if 分支,识别模型下完
+         切小提示条时组件会销毁重建,进行中的下载进度/订阅状态全部清零。 -->
+    {#if models && !(models.recording_ready && models.diarization_ready)}
+      <ModelDownloadCard status={models} compact={models.recording_ready} onComplete={refreshModels} />
+    {/if}
+
+    {#if !models || models.recording_ready}
+      <div class="controls">
+        {#if !recording.isLive}
+          <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
+            <span class="sym dot on-blue"></span>开始录制
+          </button>
+        {:else}
+          {#if recording.paused}
+            <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
+          {:else}
+            <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
+          {/if}
+          <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
+            <span class="sym square"></span>停止
+          </button>
+        {/if}
+        <!-- 实时音轨:滚动电平波形,兼任电平表(录音机式,新声从右缘进入) -->
+        <div class="wave-live" class:frozen={recording.paused} title="麦克风电平" aria-hidden="true">
+          {#each liveBars as h, i (i)}
+            <span class="bar" style="height: {Math.max(6, h)}%"></span>
+          {/each}
+        </div>
+        {#if recording.paused}<span class="paused-tag">已暂停</span>{/if}
+        <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
+      </div>
+
+      <p class="status" class:error={isError(recording.status)}>
+        <span class="status-dot" class:live={recording.isLive && !recording.paused}></span>{recording.status}
+      </p>
+    {/if}
+  </div>
 
   {#if !models || models.recording_ready}
-    <div class="controls">
-      {#if !recording.isLive}
-        <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
-          <span class="sym dot on-blue"></span>开始录制
-        </button>
-      {:else}
-        {#if recording.paused}
-          <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
-        {:else}
-          <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
-        {/if}
-        <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
-          <span class="sym square"></span>停止
-        </button>
-      {/if}
-      <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
-      <div class="meter" title="麦克风电平"><div class="meter-fill" style="width:{levelPct}%"></div></div>
-      {#if recording.paused}<span class="paused-tag">已暂停</span>{/if}
-    </div>
-
-    <p class="status" class:error={isError(recording.status)}>
-      <span class="status-dot" class:live={recording.isLive && !recording.paused}></span>{recording.status}
-    </p>
 
     {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
       <div class="banner">
@@ -182,6 +210,26 @@
     margin: 0 0 0.25rem;
   }
 
+  /* 操作栏吸顶:canvas 不透明底钉在滚动视口顶端,转写文字从底下滚过;
+     底缘用渐隐代替分隔线,静止在页首时不显突兀,滚动时文字平滑没入。 */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--canvas);
+    padding-top: 0.4rem;
+    margin-top: -0.4rem;
+  }
+  .topbar::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    height: 14px;
+    background: linear-gradient(var(--canvas), transparent);
+    pointer-events: none;
+  }
   .controls {
     display: flex;
     align-items: center;
@@ -230,18 +278,28 @@
     color: var(--ink-secondary);
   }
   .timer.pausedTimer { color: var(--ink-faint); }
-  /* 电平表：细轨(5px)圆头,信息条不该比按钮抢眼 */
-  .meter {
-    width: 96px;
-    height: 5px;
-    background: var(--hairline);
-    border-radius: var(--radius-full);
+  /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
+     record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
+     空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
+  .wave-live {
+    flex: 1;
+    min-width: 0;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
     overflow: hidden;
   }
-  .meter-fill {
-    height: 100%;
-    background: var(--success);
-    transition: width 0.1s linear;
+  .wave-live .bar {
+    width: 2px;
+    flex: none;
+    min-height: 2px;
+    border-radius: var(--radius-full);
+    background: var(--record);
+  }
+  .wave-live.frozen .bar {
+    background: var(--ink-faint);
   }
   .paused-tag {
     background: var(--warning-tint);
