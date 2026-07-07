@@ -87,6 +87,14 @@ fn split_long(samples: Vec<f32>, start: usize) -> Vec<Segment> {
 
 impl Segmenter for SileroSegmenter {
     fn accept(&mut self, samples: &[f32]) {
+        // 非有限值消毒:AEC/AGC/重采样链的数值边界可能产出 NaN/Inf,喂进 ONNX 轻则
+        // 概率失真,重则 ORT 报错抛 C++ 异常——sherpa C 接口不接异常,直接 SIGABRT
+        // 全进程闪退(2026-07-07 两例,栈在 SileroVadModel::RunV4)。在唯一入口消毒。
+        let samples: Vec<f32> = samples
+            .iter()
+            .map(|&x| if x.is_finite() { x } else { 0.0 })
+            .collect();
+        let samples = samples.as_slice();
         self.vad.accept_waveform(samples.to_vec());
         if self.vad.is_speech() {
             self.current.extend_from_slice(samples);

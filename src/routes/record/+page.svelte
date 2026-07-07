@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
@@ -16,7 +17,37 @@
       /* 查询失败按就绪处理，不挡老用户 */
     }
   }
-  onMount(refreshModels);
+
+  // 屏幕录制权限预检:未授权时系统声音只会在开录后静默降级,这里在开录前就常驻
+  // 提示(2026-07-07 实锤:用户所有笔记都没有 system 轨,自己毫无察觉)。
+  // 查询失败按已授权处理,不误伤非 macOS/老系统。
+  let screenPerm = $state(true);
+  async function refreshScreenPerm() {
+    try {
+      screenPerm = await invoke<boolean>("screen_capture_permission");
+    } catch {
+      screenPerm = true;
+    }
+  }
+  async function requestScreenPerm() {
+    try {
+      // 系统授权弹窗一生只弹一次;已弹过(返回 false)就直接带去系统设置。
+      const ok = await invoke<boolean>("request_screen_capture_permission");
+      if (!ok) await openScreenRecordingSettings();
+    } catch {
+      await openScreenRecordingSettings();
+    }
+    await refreshScreenPerm();
+  }
+
+  onMount(() => {
+    refreshModels();
+    refreshScreenPerm();
+    // 用户去系统设置勾选后切回来,焦点事件驱动横幅消失,无需重启页面。
+    const onFocus = () => refreshScreenPerm();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
 
   function isError(s: string) {
     return s.startsWith("error:");
@@ -153,6 +184,14 @@
   </div>
 
   {#if !models || models.recording_ready}
+
+    {#if !screenPerm && !recording.isLive}
+      <div class="banner">
+        系统声音未授权：只能录到麦克风，对方/外放的声音不会进笔记。
+        <button class="link" onclick={requestScreenPerm}>立即授权</button>
+        <span class="hint">系统设置里勾选 voice-notes 后切回本页即可。</span>
+      </div>
+    {/if}
 
     {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
       <div class="banner">
