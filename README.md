@@ -7,7 +7,7 @@
 中文 | [English](./README.en.md)
 
 [![platform](https://img.shields.io/badge/platform-macOS%2013%2B-black)](#系统要求)
-[![license](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](#license)
 [![tauri](https://img.shields.io/badge/Tauri-2-24C8DB)](https://tauri.app)
 [![rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
 
@@ -146,4 +146,8 @@ cd src-tauri && cargo test    # 后端测试
 
 ## License
 
-[MIT](./LICENSE)
+[AGPL-3.0](./LICENSE) © zhongweijian (SoulZhong)
+
+个人使用、学习、修改、自部署完全自由。若要把本项目（或其衍生作品）作为**闭源产品或服务**分发/运营，AGPL 要求你开源全部衍生代码；不希望开源的商业集成，请通过 [GitHub Issues](https://github.com/SoulZhong/voice-notes/issues) 联系作者获取**商业授权**（双许可）。
+
+> 注：v0.1.0 及更早版本以 MIT 发布，该许可对已获取的副本永久有效；自本次变更起的新版本适用 AGPL-3.0。
