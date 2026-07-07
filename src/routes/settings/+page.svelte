@@ -506,6 +506,54 @@
     </div>
   </section>
 
+  <!-- —— 存储 ——(紧随通用:目录选择要在下载模型前被看到,新装用户价值最高) -->
+  <section>
+    <h2 class="section-title">存储</h2>
+    <div class="rows">
+      {@render storeRow("data", "数据存储目录", dataDirLabel)}
+      {@render storeRow("models", "模型存储目录", modelsDirLabel)}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">录音音频占用</span>
+          <span class="row-path">
+            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
+          </span>
+        </div>
+        {#if !showPurge}
+          <button
+            class="btn-secondary row-action"
+            disabled={recording.isLive}
+            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
+            onclick={() => {
+              freedText = "";
+              showPurge = true;
+            }}>清理…</button
+          >
+        {/if}
+      </div>
+    </div>
+    {#if showPurge}
+      <div class="purge-bar">
+        <div class="purge-choices">
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
+          </label>
+        </div>
+        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
+        <div class="purge-actions">
+          <button class="link danger" onclick={doPurge}>确认清理</button>
+          <button class="link" onclick={() => (showPurge = false)}>取消</button>
+        </div>
+      </div>
+    {/if}
+  </section>
+
   <!-- —— 录制 —— -->
   <section>
     <h2 class="section-title">录制</h2>
@@ -726,53 +774,6 @@
     </div>
   </section>
 
-  <!-- —— 存储 —— -->
-  <section>
-    <h2 class="section-title">存储</h2>
-    <div class="rows">
-      {@render storeRow("data", "数据存储目录", dataDirLabel)}
-      {@render storeRow("models", "模型存储目录", modelsDirLabel)}
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label">录音音频占用</span>
-          <span class="row-path">
-            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
-          </span>
-        </div>
-        {#if !showPurge}
-          <button
-            class="btn-secondary row-action"
-            disabled={recording.isLive}
-            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
-            onclick={() => {
-              freedText = "";
-              showPurge = true;
-            }}>清理…</button
-          >
-        {/if}
-      </div>
-    </div>
-    {#if showPurge}
-      <div class="purge-bar">
-        <div class="purge-choices">
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
-          </label>
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
-          </label>
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
-          </label>
-        </div>
-        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
-        <div class="purge-actions">
-          <button class="link danger" onclick={doPurge}>确认清理</button>
-          <button class="link" onclick={() => (showPurge = false)}>取消</button>
-        </div>
-      </div>
-    {/if}
-  </section>
 </main>
 
 {#snippet storeRow(kind: "data" | "models", label: string, path: string)}
