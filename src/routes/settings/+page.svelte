@@ -437,53 +437,71 @@
 
 <main class="container">
   <h1>设置</h1>
-  <p class="desc">
-    管理数据与模型的存储位置、下载或删除语音模型、选择语音识别引擎。全部处理在本机完成,不上传任何音频。
-  </p>
+  <p class="desc">所有录音与识别都在本机完成,不上传任何音频。</p>
 
   {#if error}
     <div class="banner">{error}</div>
   {/if}
 
-  <!-- —— 外观 —— -->
+  <!-- —— 通用 —— -->
   <section>
-    <h2 class="section-title">外观</h2>
-    <div class="radios">
-      <label class="radio">
+    <h2 class="section-title">通用</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info"><span class="row-label">外观</span></div>
+        <div class="seg">
+          <label class="seg-item">
+            <input type="radio" name="theme" value="light" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />亮色
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="theme" value="dark" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />暗色
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="theme" value="system" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />跟随系统
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">全局快捷键</span>
+          <span class="row-desc">在任意应用中按组合键开始 / 停止录制</span>
+        </div>
+        {#if shortcutEnabled}
+          <input
+            class="shortcut-input"
+            readonly
+            value={capturingShortcut ? "" : displayShortcut(settings?.shortcut ?? "")}
+            placeholder="按下组合键…"
+            onfocus={() => (capturingShortcut = true)}
+            onblur={() => (capturingShortcut = false)}
+            onkeydown={onShortcutKeydown}
+          />
+        {/if}
         <input
-          type="radio"
-          name="theme"
-          value="light"
-          bind:group={themeChoice}
+          type="checkbox"
+          class="ctl"
+          aria-label="启用全局快捷键"
+          bind:checked={shortcutEnabled}
           disabled={!settings}
-          onchange={changeTheme}
+          onchange={toggleShortcutEnabled}
         />
-        <span class="radio-body"><span class="radio-title">亮色</span></span>
+      </div>
+      <label class="row">
+        <div class="row-info"><span class="row-label">开机自动启动</span></div>
+        <input type="checkbox" class="ctl" bind:checked={autostartEnabled} onchange={toggleAutostart} />
       </label>
-      <label class="radio">
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">菜单栏常驻</span>
+          <span class="row-desc">关闭窗口只隐藏到菜单栏,录制不中断</span>
+        </div>
         <input
-          type="radio"
-          name="theme"
-          value="dark"
-          bind:group={themeChoice}
+          type="checkbox"
+          class="ctl"
+          bind:checked={trayEnabled}
           disabled={!settings}
-          onchange={changeTheme}
+          onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
         />
-        <span class="radio-body"><span class="radio-title">暗色</span></span>
-      </label>
-      <label class="radio">
-        <input
-          type="radio"
-          name="theme"
-          value="system"
-          bind:group={themeChoice}
-          disabled={!settings}
-          onchange={changeTheme}
-        />
-        <span class="radio-body">
-          <span class="radio-title">跟随系统</span>
-          <span class="radio-desc">随 macOS 外观在亮色与暗色间自动切换。</span>
-        </span>
       </label>
     </div>
   </section>
@@ -491,169 +509,150 @@
   <!-- —— 录制 —— -->
   <section>
     <h2 class="section-title">录制</h2>
-    <div class="toggles">
-      <label class="toggle">
+    <div class="rows">
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">仅录制系统声音</span>
+          <span class="row-desc">不开麦克风,只录电脑播放的声音。适合直播、网课等旁听场景</span>
+        </div>
         <input
           type="checkbox"
+          class="ctl"
           bind:checked={sysOnly}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.record_system_only = sysOnly))}
         />
-        <span class="toggle-body">
-          <span class="toggle-title">仅录制系统声音</span>
-          <span class="toggle-desc"
-            >只录扬声器外放,不录麦克风。纯外放场景(直播/视频)推荐开启:既根治麦克风串入的残渣,
-            也避免麦克风通话模式压低外放音量与录音电平(macOS 固有行为)。</span
-          >
-        </span>
       </label>
-      <label class="toggle">
+      <label class="row" class:dim={sysOnly}>
+        <div class="row-info">
+          <span class="row-label">保持外放音量</span>
+          <span class="row-desc">外放开会时音量不再被系统压低,回声自动消除{sysOnly ? "(仅录系统声音时无效)" : ""}</span>
+        </div>
         <input
           type="checkbox"
+          class="ctl"
           bind:checked={keepVol}
           disabled={!settings || sysOnly}
           onchange={() => saveSetting((s) => (s.keep_output_volume = keepVol))}
         />
-        <span class="toggle-body">
-          <span class="toggle-title">录制时保持外放音量</span>
-          <span class="toggle-desc"
-            >麦克风改用普通输入,避开系统通话模式对外放音量与录音电平的压低(你听会议不再变小,
-            对方听你也不受影响);回声改由内置软件消除(以系统声音为参考)处理。适合外放开会
-            且需要录自己发言的场景;「仅录制系统声音」开启时无效(麦克风不启动)。</span
-          >
-        </span>
       </label>
-      <label class="toggle">
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">乱码过滤</span>
+          <span class="row-desc">丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭</span>
+        </div>
         <input
           type="checkbox"
+          class="ctl"
           bind:checked={langFilter}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
         />
-        <span class="toggle-body">
-          <span class="toggle-title">语言幻觉过滤</span>
-          <span class="toggle-desc"
-            >过滤识别引擎在静音或噪声段产生的幻觉文字。多语种会议中若误伤可关闭。</span
-          >
-        </span>
       </label>
-      <label class="toggle">
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">保留录音音频</span>
+          <span class="row-desc">录完可回放核对;关闭可节省磁盘</span>
+        </div>
         <input
           type="checkbox"
+          class="ctl"
           bind:checked={keepAudio}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
         />
-        <span class="toggle-body">
-          <span class="toggle-title">保留录音音频</span>
-          <span class="toggle-desc">保留原始录音以便回放核对。关闭可节省磁盘占用。</span>
-        </span>
       </label>
-    </div>
-    <p class="lock-hint">录制中可随时更改,下一场录制生效。</p>
-  </section>
-
-  <!-- —— 磁盘 —— -->
-  <section>
-    <h2 class="section-title">磁盘</h2>
-    <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">录音音频占用</span>
-          <span class="row-path">
-            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
+          <span class="row-label">识别引擎</span>
+          <span class="row-desc">
+            {asrChoice === "whisper"
+              ? "多语种支持广,说话人区分较粗"
+              : asrChoice === "paraformer"
+                ? "中文更准、英文较弱"
+                : "推荐 · 中英日韩粤语,功能最全"}
           </span>
         </div>
-        {#if !showPurge}
-          <button
-            class="btn-secondary row-action"
-            disabled={recording.isLive}
-            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
-            onclick={() => {
-              freedText = "";
-              showPurge = true;
-            }}>清理…</button
-          >
-        {/if}
+        <div class="seg" class:disabled={recording.isLive}>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="asr"
+              value="sense_voice"
+              bind:group={asrChoice}
+              disabled={recording.isLive || !settings}
+              onchange={() => changeAsr("sense_voice")}
+            />SenseVoice
+          </label>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="asr"
+              value="whisper"
+              bind:group={asrChoice}
+              disabled={recording.isLive || !settings}
+              onchange={() => changeAsr("whisper")}
+            />Whisper
+          </label>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="asr"
+              value="paraformer"
+              bind:group={asrChoice}
+              disabled={recording.isLive || !settings}
+              onchange={() => changeAsr("paraformer")}
+            />Paraformer
+          </label>
+        </div>
       </div>
     </div>
-    {#if showPurge}
-      <div class="purge-bar">
-        <div class="purge-choices">
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
-          </label>
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
-          </label>
-          <label class="mini-radio">
-            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
-          </label>
-        </div>
-        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
-        <div class="purge-actions">
-          <button class="link danger" onclick={doPurge}>确认清理</button>
-          <button class="link" onclick={() => (showPurge = false)}>取消</button>
-        </div>
-      </div>
+    {#if asrModelMissing}
+      <div class="banner warn">所选识别引擎的模型未下载,请在下方「语音模型」中下载。</div>
     {/if}
+    <p class="lock-hint">
+      {recording.isLive ? "录制进行中:识别引擎已锁定,其余更改下一场录制生效。" : "更改在下一场录制生效。"}
+    </p>
   </section>
 
-  <!-- —— 系统 —— -->
+  <!-- —— 智能精修 —— -->
   <section>
-    <h2 class="section-title">系统</h2>
-    <div class="toggles">
-      <div class="toggle toggle-col">
-        <label class="toggle-head">
-          <input
-            type="checkbox"
-            bind:checked={shortcutEnabled}
-            disabled={!settings}
-            onchange={toggleShortcutEnabled}
-          />
-          <span class="toggle-body">
-            <span class="toggle-title">全局快捷键</span>
-            <span class="toggle-desc">在任意应用中按下组合键即可开始或停止录制。</span>
-          </span>
-        </label>
-        <input
-          class="shortcut-input"
-          readonly
-          value={capturingShortcut ? "" : displayShortcut(settings?.shortcut ?? "")}
-          placeholder="按下组合键…"
-          onfocus={() => (capturingShortcut = true)}
-          onblur={() => (capturingShortcut = false)}
-          onkeydown={onShortcutKeydown}
-        />
-      </div>
-      <label class="toggle">
-        <input type="checkbox" bind:checked={autostartEnabled} onchange={toggleAutostart} />
-        <span class="toggle-body">
-          <span class="toggle-title">开机自动启动</span>
-          <span class="toggle-desc">登录 macOS 后在后台自动运行。</span>
-        </span>
-      </label>
-      <label class="toggle">
-        <input
-          type="checkbox"
-          bind:checked={trayEnabled}
-          disabled={!settings}
-          onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
-        />
-        <span class="toggle-body">
-          <span class="toggle-title">菜单栏常驻</span>
-          <span class="toggle-desc">开启时关闭窗口只隐藏到菜单栏,录制不中断。</span>
-        </span>
-      </label>
-    </div>
-  </section>
-
-  <!-- —— 存储位置 —— -->
-  <section>
-    <h2 class="section-title">存储位置</h2>
+    <h2 class="section-title">智能精修</h2>
     <div class="rows">
-      {@render storeRow("data", "数据存储目录", dataDirLabel)}
-      {@render storeRow("models", "模型存储目录", modelsDirLabel)}
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">会后 AI 精修</span>
+          <span class="row-desc">录完自动纠错字、清理口头语、合并段落。会议文字会发送给所选服务商</span>
+        </div>
+        <input type="checkbox" class="ctl" bind:checked={refineOn} disabled={!settings} onchange={saveRefine} />
+      </label>
+      {#if refineOn}
+        <div class="config">
+          <div class="preset-row">
+            <span class="preset-label">一键填充</span>
+            {#each REFINE_PRESETS as p (p.label)}
+              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+            {/each}
+          </div>
+          <div class="refine-fields">
+            <label class="field">
+              <span>接口地址</span>
+              <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+            </label>
+            <label class="field">
+              <span>模型</span>
+              <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+            </label>
+            <label class="field">
+              <span>API Key</span>
+              <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
+            </label>
+          </div>
+          {#if !refineBaseUrl || !refineModel || !refineKey}
+            <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
+          {/if}
+        </div>
+      {/if}
     </div>
   </section>
 
@@ -707,137 +706,71 @@
           </div>
         {/each}
       {/if}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">镜像加速</span>
+          <span class="row-desc">国内网络下载模型更快</span>
+        </div>
+        {#if settings?.mirror_enabled}
+          <input class="prefix" bind:value={settings.mirror_prefix} onblur={savePrefix} placeholder="https://ghproxy.net/" />
+        {/if}
+        <input
+          type="checkbox"
+          class="ctl"
+          aria-label="使用镜像加速"
+          checked={settings?.mirror_enabled ?? false}
+          disabled={!settings}
+          onchange={toggleMirror}
+        />
+      </div>
     </div>
-
-    <label class="mirror">
-      <input
-        type="checkbox"
-        checked={settings?.mirror_enabled ?? false}
-        disabled={!settings}
-        onchange={toggleMirror}
-      />
-      使用镜像加速(国内网络推荐)
-    </label>
-    {#if settings?.mirror_enabled}
-      <input
-        class="prefix"
-        bind:value={settings.mirror_prefix}
-        onblur={savePrefix}
-        placeholder="镜像前缀,如 https://ghproxy.net/"
-      />
-    {/if}
   </section>
 
-  <!-- —— 语音识别 —— -->
+  <!-- —— 存储 —— -->
   <section>
-    <h2 class="section-title">语音识别</h2>
-    <div class="radios">
-      <label class="radio" class:disabled={recording.isLive}>
-        <input
-          type="radio"
-          name="asr"
-          value="sense_voice"
-          bind:group={asrChoice}
-          disabled={recording.isLive || !settings}
-          onchange={() => changeAsr("sense_voice")}
-        />
-        <span class="radio-body">
-          <span class="radio-title">SenseVoice</span>
-          <span class="radio-desc"
-            >推荐。中英日韩粤,带语言幻觉过滤与段内说话人分离的完整功能。</span
+    <h2 class="section-title">存储</h2>
+    <div class="rows">
+      {@render storeRow("data", "数据存储目录", dataDirLabel)}
+      {@render storeRow("models", "模型存储目录", modelsDirLabel)}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">录音音频占用</span>
+          <span class="row-path">
+            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
+          </span>
+        </div>
+        {#if !showPurge}
+          <button
+            class="btn-secondary row-action"
+            disabled={recording.isLive}
+            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
+            onclick={() => {
+              freedText = "";
+              showPurge = true;
+            }}>清理…</button
           >
-        </span>
-      </label>
-      <label class="radio" class:disabled={recording.isLive}>
-        <input
-          type="radio"
-          name="asr"
-          value="whisper"
-          bind:group={asrChoice}
-          disabled={recording.isLive || !settings}
-          onchange={() => changeAsr("whisper")}
-        />
-        <span class="radio-body">
-          <span class="radio-title">Whisper</span>
-          <span class="radio-desc"
-            >多语种。段内说话人分离退化为段级标签,语言过滤仅按文本兜底。切换后下一场录制生效。</span
-          >
-        </span>
-      </label>
-      <label class="radio" class:disabled={recording.isLive}>
-        <input
-          type="radio"
-          name="asr"
-          value="paraformer"
-          bind:group={asrChoice}
-          disabled={recording.isLive || !settings}
-          onchange={() => changeAsr("paraformer")}
-        />
-        <span class="radio-body">
-          <span class="radio-title">Paraformer</span>
-          <span class="radio-desc"
-            >中文准确率更高,英文较弱,约 230MB。保留段内说话人分离;语言过滤按文本兜底。切换后下一场录制生效。</span
-          >
-        </span>
-      </label>
-    </div>
-    {#if asrModelMissing}
-      <div class="banner warn">所选识别模型未下载,请在上方模型区块下载。</div>
-    {/if}
-    {#if recording.isLive}
-      <p class="lock-hint">录制进行中,识别引擎切换已锁定,停止录制后可更改。</p>
-    {/if}
-  </section>
-
-  <!-- —— 智能精修 —— -->
-  <section>
-    <h2 class="section-title">智能精修</h2>
-    <div class="toggles">
-      <label class="toggle">
-        <input type="checkbox" bind:checked={refineOn} disabled={!settings} onchange={saveRefine} />
-        <span class="toggle-body">
-          <span class="toggle-title">会后 LLM 精修</span>
-          <span class="toggle-desc"
-            >录制结束后用大模型纠错字、统一术语、清理口头语并合并段落。会议文本将发送至下方所选服务商;key
-            明文存于本机设置文件。</span
-          >
-        </span>
-      </label>
-    </div>
-    {#if refineOn}
-      <div class="preset-row">
-        {#each REFINE_PRESETS as p}
-          <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
-        {/each}
+        {/if}
       </div>
-      <div class="refine-fields">
-        <label class="field">
-          <span>接口地址(含版本段)</span>
-          <input
-            class="shortcut-input"
-            placeholder="https://api.deepseek.com/v1"
-            bind:value={refineBaseUrl}
-            onblur={saveRefine}
-          />
-        </label>
-        <label class="field">
-          <span>模型</span>
-          <input class="shortcut-input" placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
-        </label>
-        <label class="field">
-          <span>API Key</span>
-          <input
-            class="shortcut-input"
-            type="password"
-            placeholder="sk-..."
-            bind:value={refineKey}
-            onblur={saveRefine}
-          />
-        </label>
+    </div>
+    {#if showPurge}
+      <div class="purge-bar">
+        <div class="purge-choices">
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
+          </label>
+          <label class="mini-radio">
+            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
+          </label>
+        </div>
+        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
+        <div class="purge-actions">
+          <button class="link danger" onclick={doPurge}>确认清理</button>
+          <button class="link" onclick={() => (showPurge = false)}>取消</button>
+        </div>
       </div>
-      {#if !refineBaseUrl || !refineModel || !refineKey}
-        <div class="banner warn">接口地址、模型、API Key 三项配齐后精修才会生效。</div>
-      {/if}
     {/if}
   </section>
 </main>
@@ -879,20 +812,18 @@
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;
-    max-width: 52rem;
-  }
-  h1 {
-    margin: 0 0 0.75rem;
-  }
-  .desc {
-    color: var(--ink-secondary);
-    font-size: 0.85rem;
-    line-height: 1.5;
-    margin: 0 0 1.25rem;
     max-width: 46rem;
   }
+  h1 {
+    margin: 0 0 0.3rem;
+  }
+  .desc {
+    color: var(--ink-faint);
+    font-size: 0.85rem;
+    margin: 0 0 0.5rem;
+  }
   section {
-    margin-top: 1.6rem;
+    margin-top: 1.3rem;
   }
   .section-title {
     font-size: 0.82rem;
@@ -900,40 +831,48 @@
     color: var(--ink-secondary);
     margin: 0 0 0.45rem;
   }
-  /* list 卡片:surface 底承载各行,行间 hairline 分隔 */
+  /* 设置行卡片(macOS 系统设置式):surface 底承载各行,行间 hairline 分隔,
+     左标题+一行说明、右侧控件;label 行整行可点切换开关 */
   .rows {
     background: var(--surface);
     border-radius: var(--radius-lg);
+    overflow: hidden;
   }
   .row {
     display: flex;
     align-items: center;
     gap: 0.9rem;
-    padding: 0.7rem 1rem;
+    padding: 0.55rem 1rem;
     border-bottom: 1px solid var(--hairline);
   }
-  .rows .row:first-child {
-    border-top-left-radius: var(--radius-lg);
-    border-top-right-radius: var(--radius-lg);
-  }
+  .rows > :last-child,
   .rows .row:last-child {
     border-bottom: none;
-    border-bottom-left-radius: var(--radius-lg);
-    border-bottom-right-radius: var(--radius-lg);
+  }
+  label.row {
+    cursor: pointer;
+  }
+  .row.dim {
+    opacity: 0.55;
   }
   .row-info {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
+    gap: 0.1rem;
   }
   .row-label {
     font-size: 0.92rem;
     color: var(--ink);
   }
+  .row-desc {
+    font-size: 0.8rem;
+    color: var(--ink-secondary);
+    line-height: 1.4;
+  }
   .row-path {
-    font-size: 0.82rem;
+    font-size: 0.8rem;
     color: var(--ink-secondary);
     word-break: break-all;
   }
@@ -946,12 +885,54 @@
     align-items: baseline;
     gap: 0.6rem;
   }
-  /* 行级操作:悬停显影(有确认/进度态时常驻显示) */
+  /* 右侧控件与行级操作 */
+  .ctl {
+    flex: none;
+    margin: 0;
+  }
   .row-action {
     visibility: hidden;
   }
   .row:hover .row-action {
     visibility: visible;
+  }
+  /* segmented(分段选择):surface-press 槽 + 选中项 canvas 浮起,单行放下多选一 */
+  .seg {
+    display: flex;
+    gap: 2px;
+    flex: none;
+    background: var(--surface-press);
+    border-radius: var(--radius-md);
+    padding: 2px;
+  }
+  .seg-item {
+    position: relative;
+    padding: 0.26em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    border-radius: calc(var(--radius-md) - 2px);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .seg-item:hover {
+    color: var(--ink);
+  }
+  .seg-item:has(input:checked) {
+    background: var(--canvas);
+    color: var(--ink);
+    box-shadow: var(--shadow-btn);
+  }
+  .seg-item input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .seg.disabled {
+    opacity: 0.6;
+  }
+  .seg.disabled .seg-item {
+    cursor: default;
   }
   /* button-secondary */
   .btn-secondary {
@@ -1023,10 +1004,9 @@
     gap: 0.8rem;
     flex-wrap: wrap;
     padding: 0.6rem 1rem;
-    margin: 0.4rem 0 0.6rem;
     background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
-    border-radius: var(--radius-lg);
+    border-top: 1px solid var(--warning-line);
+    border-bottom: 1px solid var(--hairline);
   }
   .confirm-text {
     flex: 1;
@@ -1070,126 +1050,39 @@
     background: var(--accent);
     transition: width 0.3s;
   }
-  /* 镜像开关 + 前缀(照搬 ModelDownloadCard) */
-  .mirror {
-    display: flex;
-    align-items: center;
-    gap: 0.4em;
-    font-size: 0.85rem;
-    color: var(--ink);
-    margin: 0.8rem 0 0;
-  }
+  /* 镜像前缀:行内窄输入框(勾选后出现在开关左侧) */
   .prefix {
-    width: 100%;
+    flex: none;
+    width: 15rem;
     box-sizing: border-box;
-    margin-top: 0.5rem;
-    padding: 0.35em 0.6em;
+    padding: 0.3em 0.6em;
     border-radius: var(--radius-md);
     border: 1px solid var(--hairline-strong);
     background: var(--canvas);
     color: var(--ink);
-    font-size: 0.85rem;
+    font-size: 0.82rem;
   }
   .prefix:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent);
   }
-  /* ASR 单选:整块可点,选中/悬停换底 */
-  .radios {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-  .radio {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.6rem;
-    padding: 0.7rem 0.9rem;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    background: var(--surface);
-    cursor: pointer;
-  }
-  .radio:hover {
-    background: var(--surface-soft);
-  }
-  .radio input {
-    margin-top: 0.15rem;
-    flex: none;
-  }
-  .radio.disabled {
-    cursor: default;
-    opacity: 0.7;
-  }
-  .radio-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-  }
-  .radio-title {
-    font-size: 0.92rem;
-    font-weight: 500;
-    color: var(--ink);
-  }
-  .radio-desc {
-    font-size: 0.82rem;
-    color: var(--ink-secondary);
-    line-height: 1.45;
-  }
   .lock-hint {
     font-size: 0.8rem;
     color: var(--ink-faint);
-    margin: 0.5rem 0 0;
+    margin: 0.45rem 0 0;
   }
-  /* 开关组:checkbox + 标题 + 说明小字(录制/系统区共用) */
-  .toggles {
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
-  }
-  .toggle,
-  .toggle-head {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.6rem;
-    cursor: pointer;
-  }
-  .toggle-col {
-    flex-direction: column;
-    gap: 0.5rem;
-    cursor: default;
-  }
-  .toggle input[type="checkbox"],
-  .toggle-head input[type="checkbox"] {
-    margin-top: 0.2rem;
-    flex: none;
-  }
-  .toggle-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-  }
-  .toggle-title {
-    font-size: 0.92rem;
-    color: var(--ink);
-  }
-  .toggle-desc {
-    font-size: 0.82rem;
-    color: var(--ink-secondary);
-    line-height: 1.45;
-  }
-  /* 快捷键录入框:input 形态(surface-press 底、聚焦浮出 canvas + accent 环) */
+  /* 快捷键录入框:input 形态(聚焦浮出 canvas + accent 环) */
   .shortcut-input {
-    margin-left: 1.6rem;
-    width: 12rem;
+    flex: none;
+    width: 10rem;
     box-sizing: border-box;
-    padding: 0.35em 0.6em;
+    padding: 0.3em 0.6em;
     border-radius: var(--radius-md);
     border: 1px solid var(--hairline-strong);
     background: var(--surface-press);
     color: var(--ink);
-    font-size: 0.9rem;
+    font-size: 0.88rem;
     font-family: -apple-system, system-ui, sans-serif;
     cursor: pointer;
   }
@@ -1205,7 +1098,7 @@
     flex-direction: column;
     gap: 0.6rem;
     padding: 0.7rem 1rem;
-    margin: 0.4rem 0 0.6rem;
+    margin: 0.4rem 0 0;
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);
     border-radius: var(--radius-lg);
@@ -1247,26 +1140,57 @@
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
   }
-  /* 智能精修:预设一键填充按钮行 + 三字段表单 */
-  .preset-row {
-    display: flex;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-top: 0.8rem;
-  }
-  .refine-fields {
+  /* 智能精修配置块:卡片内嵌面板(开关行下方展开) */
+  .config {
     display: flex;
     flex-direction: column;
+    gap: 0.7rem;
+    padding: 0.8rem 1rem 0.9rem;
+  }
+  .preset-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+  }
+  .preset-label {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+    margin-right: 0.15rem;
+  }
+  .refine-fields {
+    display: grid;
+    grid-template-columns: minmax(13rem, 2fr) minmax(8rem, 1fr) minmax(8rem, 1fr);
     gap: 0.6rem;
-    margin-top: 0.8rem;
   }
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: 0.25rem;
+    min-width: 0;
   }
   .field > span {
     font-size: 0.78rem;
     color: var(--ink-secondary);
+  }
+  .field input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.32em 0.6em;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: var(--canvas);
+    color: var(--ink);
+    font-size: 0.85rem;
+  }
+  .field input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .config-hint {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+    margin: 0;
   }
 </style>

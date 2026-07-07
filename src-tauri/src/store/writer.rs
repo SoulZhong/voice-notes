@@ -20,6 +20,10 @@ pub struct NoteWriter {
     /// 续录时间轴偏移：resume 路径 = 上一场最大 end_ms，create 路径恒 0。
     /// on_final 落盘/emit 前 start_ms/end_ms 均需 + base_ms，保证时间轴连续。
     base_ms: u64,
+    /// 本场说话人合并史(loser → winner)。merge_speaker 重写 segments.jsonl 时,
+    /// 仍可能有带 loser 标签的在途段(如回声 hold 队列里的)在重写**之后**才落盘,
+    /// 成为表里查无此人的孤儿标签;finalize 用这份映射把孤儿段追认到 winner。
+    merged: BTreeMap<String, String>,
     /// 本会话新建标记：create() 置 true，resume() 置 false。
     /// 用于 abort_or_finalize 区分：零段新建空笔记删除；零段既有笔记保留（不丢内容）。
     created_this_session: bool,
@@ -63,6 +67,7 @@ impl NoteWriter {
             pending: VecDeque::new(),
             speakers: BTreeMap::new(),
             base_ms: 0,
+            merged: BTreeMap::new(),
             created_this_session: true,
         })
     }
@@ -121,6 +126,7 @@ impl NoteWriter {
             pending: VecDeque::new(),
             speakers,
             base_ms,
+            merged: BTreeMap::new(),
             created_this_session: false,
         })
     }
@@ -207,6 +213,12 @@ impl NoteWriter {
     /// ended_at 写入、state 置 complete 并原子落盘。
     pub fn finalize(&mut self, now: DateTime<Local>) -> anyhow::Result<()> {
         self.flush_pending()?;
+        // 孤儿说话人清理：段落引用而表里没有的 id(合并重写与在途段的竞态残留)
+        // 按合并史追认到 winner;无从追溯的补空表项,保证段与表一致。
+        // 失败不阻塞收尾(与下方 speakers 落盘同策略):孤儿只影响徽章显示。
+        if let Err(e) = self.cleanup_orphan_speakers() {
+            eprintln!("finalize: 孤儿说话人清理失败（不阻塞收尾）: {e}");
+        }
         // 兜底落盘说话人表：活动会话期间改名/归簇均只改内存 + 增量落盘，
         // 收尾时再确保磁盘与内存一致（失败不阻塞主流程，仅告警）。
         if !self.speakers.is_empty() {
@@ -319,6 +331,8 @@ impl NoteWriter {
     /// speakers 表移除 loser、sources 并入 winner（winner 已有名字保留，否则继承 loser 的名字），原子写。
     pub fn merge_speaker(&mut self, loser: &str, winner: &str) -> anyhow::Result<()> {
         self.flush_pending()?;
+        // 先记合并史再重写:即使下方重写失败,finalize 的孤儿清理仍知道去向。
+        self.merged.insert(loser.to_string(), winner.to_string());
 
         let path = self.dir.join("segments.jsonl");
         // 读失败（瞬时 IO 错误）绝不能当空串：否则下方原子替换会把整场转写
@@ -366,6 +380,71 @@ impl NoteWriter {
             }
         }
         write_speakers_atomic(&self.dir, &self.speakers)
+    }
+
+    /// 孤儿说话人清理（finalize 兜底）：扫 segments.jsonl，凡 speaker 引用了表里
+    /// 不存在的 id——典型是合并重写后才落盘的在途段（见 merged 字段注释）——按本场
+    /// 合并史（可传递：S24→S30、S30→S46 ⇒ S24→S46）追认到 winner 并重写；无从追溯
+    /// 的补一个空表项，保证「段落里出现的说话人必在表里」。无需改写段时不动文件。
+    fn cleanup_orphan_speakers(&mut self) -> anyhow::Result<()> {
+        let path = self.dir.join("segments.jsonl");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let merged = &self.merged;
+
+        let mut changed = false;
+        let mut out = String::new();
+        for line in content.lines() {
+            match serde_json::from_str::<SegmentRecord>(line) {
+                Ok(mut rec) => {
+                    if let Some(spk) = rec.speaker.clone() {
+                        if !self.speakers.contains_key(&spk) {
+                            // 沿合并史追到最终 winner;步数以映射大小封顶防环(环不应
+                            // 发生——合并后 loser 即从注册表消失,不可能再当 winner)。
+                            let mut cur = spk.clone();
+                            let mut hops = 0usize;
+                            while let Some(next) = merged.get(&cur) {
+                                hops += 1;
+                                if hops > merged.len() {
+                                    break;
+                                }
+                                cur = next.clone();
+                            }
+                            if cur != spk && self.speakers.contains_key(&cur) {
+                                rec.speaker = Some(cur);
+                                changed = true;
+                            } else {
+                                // 无从追溯(如旧场次残留):补空表项,只保证表段一致。
+                                self.speakers.insert(
+                                    spk,
+                                    SpeakerMeta {
+                                        name: String::new(),
+                                        sources: vec![rec.source.clone()],
+                                        centroid: None,
+                                        count: 0,
+                                        person_id: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    out.push_str(&serde_json::to_string(&rec)?);
+                }
+                Err(_) => out.push_str(line), // 不可解析行原样保留(与 merge_speaker 一致)
+            }
+            out.push('\n');
+        }
+        if changed {
+            let tmp = self.dir.join("segments.jsonl.tmp");
+            std::fs::write(&tmp, out)?;
+            std::fs::rename(&tmp, &path)?;
+            // 同 merge_speaker:重写替换了磁盘文件,丢弃指向旧 inode 的句柄。
+            self.file = None;
+        }
+        Ok(())
     }
 
     /// 追溯撤回一条已落盘段(回声段事后被 system 定稿确认):按 (source, start_ms,
@@ -639,6 +718,50 @@ mod tests {
         assert!(note.speakers.contains_key("S1"));
         assert!(!note.speakers.contains_key("S2"));
         assert!(note.speakers["S1"].sources.contains(&"system".to_string()), "sources 并入");
+    }
+
+    #[test]
+    fn finalize_relabels_orphans_via_merge_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
+        w.append_final("mic", "乙说", 2000, 4000, Some("S2"), None).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["mic".into()])]).unwrap();
+        // 传递合并:S2→S3、S3→S1。随后一条带 S2 旧标签的在途段在重写之后才落盘,
+        // 复现合并重写与在途段(如回声 hold 队列)的竞态孤儿。
+        w.sync_speakers(&[("S3".into(), vec!["mic".into()])]).unwrap();
+        w.merge_speaker("S2", "S3").unwrap();
+        w.merge_speaker("S3", "S1").unwrap();
+        w.append_final("mic", "迟到的在途段", 4000, 6000, Some("S2"), None).unwrap();
+        w.finalize(now()).unwrap();
+
+        let note = crate::store::NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
+        assert!(
+            note.segments.iter().all(|s| s.speaker.as_deref() == Some("S1")),
+            "孤儿 S2 段应沿合并史(S2→S3→S1)追认为 S1: {:?}",
+            note.segments.iter().map(|s| s.speaker.clone()).collect::<Vec<_>>()
+        );
+        assert!(!note.speakers.contains_key("S2"), "不应为可追溯孤儿补表项");
+        assert!(!note.speakers.contains_key("S3"));
+    }
+
+    #[test]
+    fn finalize_backfills_untraceable_orphan_into_speakers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        // S9 无合并史可追(如续录前旧场次残留):补空表项保证表段一致,段不改写。
+        w.append_final("mic", "来历不明", 2000, 4000, Some("S9"), None).unwrap();
+        w.finalize(now()).unwrap();
+
+        let note = crate::store::NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
+        assert_eq!(note.segments[1].speaker.as_deref(), Some("S9"), "无从追溯的段保持原标签");
+        let s9 = note.speakers.get("S9").expect("应为 S9 补空表项");
+        assert!(s9.name.is_empty());
+        assert_eq!(s9.sources, vec!["mic".to_string()]);
     }
 
     #[test]

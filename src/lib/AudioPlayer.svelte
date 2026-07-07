@@ -8,9 +8,16 @@
      在界内则确保播放、偏差 >0.3s 回拉;界外则暂停。 */
   let {
     tracks,
+    waveform = [],
     currentMs = $bindable(0),
     playing = $bindable(false),
-  }: { tracks: TrackInfo[]; currentMs?: number; playing?: boolean } = $props();
+  }: {
+    tracks: TrackInfo[];
+    /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
+    waveform?: number[];
+    currentMs?: number;
+    playing?: boolean;
+  } = $props();
 
   let els = $state<(HTMLAudioElement | null)[]>([]);
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -136,10 +143,6 @@
     else play();
   }
 
-  function onScrub(e: Event) {
-    seek(Number((e.currentTarget as HTMLInputElement).value));
-  }
-
   // 组件卸载/笔记切换:停干净,不留幽灵声音。
   $effect(() => {
     void tracks;
@@ -147,6 +150,40 @@
   });
 
   const pct = $derived(totalMs > 0 ? (Math.min(currentMs, totalMs) / totalMs) * 100 : 0);
+
+  // ── 波形音轨即进度条:点击/拖拽定位,方向键微调 ──
+  /** 无波形数据(旧笔记全段无 rms 也会有零值数组;真空数组=无段落)退化为平轨。 */
+  const bars = $derived(waveform.length > 0 ? waveform : new Array(90).fill(0));
+  const playedBars = $derived(Math.round((bars.length * pct) / 100));
+
+  let waveEl = $state<HTMLElement | null>(null);
+  let scrubbing = false;
+  function waveSeek(e: PointerEvent) {
+    if (!waveEl || totalMs <= 0) return;
+    const r = waveEl.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    seek(ratio * totalMs);
+  }
+  function onWaveDown(e: PointerEvent) {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    scrubbing = true;
+    waveSeek(e);
+  }
+  function onWaveMove(e: PointerEvent) {
+    if (scrubbing) waveSeek(e);
+  }
+  function onWaveUp() {
+    scrubbing = false;
+  }
+  function onWaveKey(e: KeyboardEvent) {
+    const STEP = 5000;
+    if (e.key === "ArrowLeft") seek(currentMs - STEP);
+    else if (e.key === "ArrowRight") seek(currentMs + STEP);
+    else if (e.key === "Home") seek(0);
+    else if (e.key === "End") seek(totalMs);
+    else return;
+    e.preventDefault();
+  }
 </script>
 
 <div class="player">
@@ -164,16 +201,27 @@
     {/if}
   </button>
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
-  <input
-    class="scrub"
-    type="range"
-    min="0"
-    max={totalMs}
-    step="100"
-    value={Math.min(currentMs, totalMs)}
-    style="--pct: {pct}%"
-    oninput={onScrub}
-  />
+  <!-- 波形音轨(即进度条):条高来自段落 rms,已播部分 accent;点击/拖拽定位 -->
+  <div
+    class="wave"
+    bind:this={waveEl}
+    role="slider"
+    tabindex="0"
+    aria-label="播放进度"
+    aria-valuemin={0}
+    aria-valuemax={totalMs}
+    aria-valuenow={Math.min(currentMs, totalMs)}
+    aria-valuetext={formatTs(Math.min(currentMs, totalMs))}
+    onpointerdown={onWaveDown}
+    onpointermove={onWaveMove}
+    onpointerup={onWaveUp}
+    onpointercancel={onWaveUp}
+    onkeydown={onWaveKey}
+  >
+    {#each bars as h, i (i)}
+      <span class="bar" class:played={i < playedBars} style="height: {6 + h * 94}%"></span>
+    {/each}
+  </div>
   <span class="time">{formatTs(totalMs)}</span>
   {#each tracks as t, i (t.source)}
     <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto" onerror={() => onAudioError(i)}></audio>
@@ -196,7 +244,8 @@
     background: var(--surface);
     border-radius: var(--radius-lg);
     padding: 0.5rem 0.9rem;
-    margin: 0 0 1rem;
+    /* 间距由页面的 transport 行统一控制,组件自身不带外边距 */
+    margin: 0;
   }
   /* button-secondary 形态的圆形播放键 */
   .play-btn {
@@ -222,29 +271,33 @@
     font-variant-numeric: tabular-nums;
     flex: none;
   }
-  /* 进度条:沿用 DESIGN.md 进度条形态——轨 hairline、填充 accent、高 6px、rounded-full */
-  .scrub {
+  /* 波形音轨:未播条 hairline-strong、已播条 accent(进度条色语言不变,形态升级);
+     等分条宽靠 flex:1+gap,条高内联(rms 归一)。touch-action:none 保拖拽定位不被
+     滚动手势抢走。focus 用 accent 外环(与 editable-text 同语言)。 */
+  .wave {
     flex: 1;
-    -webkit-appearance: none;
-    appearance: none;
-    height: 6px;
-    border-radius: var(--radius-full);
-    background: linear-gradient(
-      to right,
-      var(--accent) 0 var(--pct),
-      var(--hairline) var(--pct) 100%
-    );
+    min-width: 0;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 1px;
     cursor: pointer;
+    touch-action: none;
+    border-radius: var(--radius-sm);
   }
-  .scrub::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: var(--canvas);
-    border: 1px solid var(--hairline-strong);
-    box-shadow: var(--shadow-btn);
+  .wave:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .bar {
+    flex: 1;
+    min-width: 1px;
+    min-height: 3px;
+    border-radius: var(--radius-full);
+    background: var(--hairline-strong);
+  }
+  .bar.played {
+    background: var(--accent);
   }
   audio {
     display: none;
@@ -253,6 +306,6 @@
   .track-errors {
     color: var(--danger);
     font-size: 0.8rem;
-    margin: -0.6rem 0 1rem 0.2rem;
+    margin: 0.3rem 0 0 0.2rem;
   }
 </style>

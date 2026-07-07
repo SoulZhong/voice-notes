@@ -71,6 +71,24 @@
   /** 原始稿中被精修过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
+  /** 精修稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
+      徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。 */
+  const refinedSpeakers = $derived.by(() => {
+    const m: Record<string, { name: string; sources: string[] }> = {};
+    for (const p of refined?.paragraphs ?? []) {
+      if (!m[p.speaker]) m[p.speaker] = { name: p.name ?? "", sources: ["mic"] };
+    }
+    return m;
+  });
+  /** 原始稿各说话人的段数：说话人条按此排序，并折叠只出现 1 段的碎片。 */
+  const segCounts = $derived.by(() => {
+    const c: Record<string, number> = {};
+    for (const s of displaySegments) {
+      if (s.speaker) c[s.speaker] = (c[s.speaker] ?? 0) + 1;
+    }
+    return c;
+  });
+
   function durationSecs(n: Note): number | null {
     // 活跃时长优先：段落时间轴最大 end_ms（与转写时间戳/录制计时一致，不含暂停）；
     // 无段落回退墙钟时长。
@@ -174,6 +192,29 @@
     if (editing || focusedSeq !== null || speakerMenuSeq !== null) return;
     exportMsg = "";
     refresh();
+  });
+
+  // ── 波形音轨:按音频总长等分 260 桶,取桶内段落 rms 峰值。观感三件套(首版全高
+  //    平顶像方块阵,冒烟反馈"不像声音波形"):①按本条录音的 rms 峰值归一(AGC 后
+  //    普遍 0.2+,固定封顶会齐刷刷顶格)+γ0.7 拉开动态;②确定性抖动纹理(段级 rms
+  //    在段内是平台,乘 ±18% 伪随机破平顶,真实响度包络仍在);③桶多条细。 ──
+  const WAVE_BARS = 260;
+  const audioTotalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
+  const waveform = $derived.by(() => {
+    if (audioTotalMs <= 0) return [];
+    const bars: number[] = new Array(WAVE_BARS).fill(0);
+    for (const s of displaySegments) {
+      const r = s.rms ?? 0.05;
+      const b0 = Math.max(0, Math.min(WAVE_BARS - 1, Math.floor((s.start_ms / audioTotalMs) * WAVE_BARS)));
+      const b1 = Math.max(b0, Math.min(WAVE_BARS - 1, Math.ceil((s.end_ms / audioTotalMs) * WAVE_BARS) - 1));
+      for (let b = b0; b <= b1; b++) bars[b] = Math.max(bars[b], r);
+    }
+    const peak = Math.max(0.12, ...bars); // 下限防全场轻声被归一放大成满高噪声
+    const jitter = (i: number) => {
+      const x = Math.sin(i * 12.9898) * 43758.5453;
+      return 0.82 + 0.36 * (x - Math.floor(x)); // 0.82..1.18,确定性(不随刷新跳变)
+    };
+    return bars.map((r, i) => (r > 0 ? Math.min(1, Math.pow(r / peak, 0.7) * jitter(i)) : 0));
   });
 
   /** 播放位置落在区间内的段(mic/system 可重叠,同帧可能多段)。 */
@@ -359,104 +400,119 @@
   {/if}
 
   {#if note}
-    <div class="header">
-      <div class="header-main">
-        {#if editing}
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="rename"
-            autofocus
-            bind:value={editingTitle}
-            onkeydown={(e) => {
-              if (e.key === "Enter") commitRename();
-              if (e.key === "Escape") editing = false;
-            }}
-            onblur={commitRename}
-          />
-        {:else}
-          <h1 class="title">
-            <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
-          </h1>
-        {/if}
-
-        <p class="meta">
-          {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
-          {#if note.meta.state === "recording"}
-            <span class="state interrupted">已中断</span>
+    <!-- 操作栏吸顶:标题/播放器/视图切换钉在滚动视口顶端,长转写滚动或播放跟随时操作不失联 -->
+    <div class="topbar">
+      <div class="header">
+        <div class="header-main">
+          {#if editing}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="rename"
+              autofocus
+              bind:value={editingTitle}
+              onkeydown={(e) => {
+                if (e.key === "Enter") commitRename();
+                if (e.key === "Escape") editing = false;
+              }}
+              onblur={commitRename}
+            />
+          {:else}
+            <h1 class="title">
+              <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
+            </h1>
           {/if}
-        </p>
+
+          <p class="meta">
+            {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
+            {#if note.meta.state === "recording"}
+              <span class="state interrupted">已中断</span>
+            {/if}
+          </p>
+        </div>
+
+        <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态 -->
+        <div class="row">
+          <button class="act-btn" onclick={() => doExport("md")}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+              <path d="M9.5 1.8V5h3.2" />
+              <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+            </svg>
+            导出 MD
+          </button>
+          <button class="act-btn" onclick={() => doExport("txt")}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+              <path d="M9.5 1.8V5h3.2" />
+              <path d="M5.5 8.4h5M5.5 10.4h5M5.5 12.4h3" stroke-width="1.2" />
+            </svg>
+            导出 TXT
+          </button>
+        </div>
       </div>
 
-      <!-- 图标按钮(冒烟反馈):16px 线性 SVG + currentColor,悬停 title 说明 -->
-      <div class="row">
-        <button class="icon-btn" title="导出 Markdown" aria-label="导出 Markdown" onclick={() => doExport("md")}>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-            <path d="M9.5 1.8V5h3.2" />
-            <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
-          </svg>
-        </button>
-        <button class="icon-btn" title="导出纯文本" aria-label="导出纯文本" onclick={() => doExport("txt")}>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-            <path d="M9.5 1.8V5h3.2" />
-            <path d="M5.5 8.4h5M5.5 10.4h5M5.5 12.4h3" stroke-width="1.2" />
-          </svg>
-        </button>
+      {#if note.meta.state === "recording"}
+        <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
+      {/if}
+      {#if note.skipped_lines > 0}
+        <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
+      {/if}
+      {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
+
+      <!-- 控制行(录音机式,整合一行):播放/暂停 + 波形音轨,行尾圆形红点录音键。
+           录制中(含暂停)不出播放器:文件正在写,不做边写边播的半态。 -->
+      <div class="transport">
+        {#if canEdit && tracks.length > 0}
+          <div class="player-slot">
+            <AudioPlayer bind:this={player} {tracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} />
+          </div>
+        {/if}
         <button
-          class="icon-btn resume"
-          title="继续录制"
-          aria-label="继续录制"
+          class="rec-btn"
           disabled={recording.isLive}
+          title={recording.isLive ? "已有录制进行中" : "继续录制"}
+          aria-label="继续录制"
           onclick={doResume}
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
-            <circle cx="8" cy="8" r="6" />
-            <circle cx="8" cy="8" r="2.6" fill="currentColor" stroke="none" />
-          </svg>
+          <span class="rec-dot"></span>
         </button>
       </div>
-    </div>
 
-    {#if note.meta.state === "recording"}
-      <div class="banner">这场会议曾意外中断，以下是中断前保存的全部内容。可点击上方「继续录制」接着记。</div>
-    {/if}
-    {#if note.skipped_lines > 0}
-      <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
-    {/if}
-    {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
+      {#if effectiveView === "refined"}
+        <!-- 精修稿视图:只展示重聚类终稿的说话人(通常 2-3 人),不摊开在线 S* 临时簇。
+             R 标签不存在于 speakers.json,不可在此改名(切原始逐字稿或声纹库改)。 -->
+        <SpeakerChips speakers={refinedSpeakers} noteId={id} editable={false} />
+      {:else}
+        <SpeakerChips
+          speakers={note.speakers}
+          noteId={id}
+          editable={true}
+          counts={segCounts}
+          onRenamed={() => {
+            refresh();
+            recording.bumpNotes();
+          }}
+        />
+      {/if}
 
-    {#if canEdit && tracks.length > 0}
-      <AudioPlayer bind:this={player} {tracks} bind:currentMs={playerMs} bind:playing={playerPlaying} />
-    {/if}
-
-    <SpeakerChips
-      speakers={note.speakers}
-      noteId={id}
-      editable={true}
-      onRenamed={() => {
-        refresh();
-        recording.bumpNotes();
-      }}
-    />
-
-    <div class="view-switch">
-      <button
-        class="link"
-        class:active={effectiveView === "refined"}
-        disabled={!refinedAvailable}
-        title={refinedAvailable ? "" : "尚无精修稿"}
-        onclick={() => (viewMode = "refined")}
-      >
-        精修稿
-      </button>
-      <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
-        原始逐字稿
-      </button>
-      <span class="spacer"></span>
-      <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
-        {refining ? "正在精修…" : "重新精修"}
-      </button>
+      <div class="view-switch">
+        <button
+          class="link"
+          class:active={effectiveView === "refined"}
+          disabled={!refinedAvailable}
+          title={refinedAvailable ? "" : "尚无精修稿"}
+          onclick={() => (viewMode = "refined")}
+        >
+          精修稿
+        </button>
+        <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
+          原始逐字稿
+        </button>
+        <span class="spacer"></span>
+        <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
+          {refining ? "正在精修…" : "重新精修"}
+        </button>
+      </div>
     </div>
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
@@ -476,7 +532,7 @@
               class="badge"
               style="background: {speakerColor(p.speaker, 'mic', note.speakers)}; color: {speakerInk(p.speaker, 'mic', note.speakers)}"
             >
-              {p.name ?? p.speaker}
+              {speakerLabel(p.speaker, "mic", refinedSpeakers)}
             </span>
             {#if tracks.length > 0}
               <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom({ start_ms: p.start_ms })}>
@@ -621,6 +677,26 @@
     color: var(--ink-secondary);
     margin: 0 0 1rem;
   }
+  /* 操作栏吸顶:canvas 不透明底钉在滚动视口顶端,转写从底下滚过;
+     底缘用渐隐代替分隔线,未滚动时不显突兀,滚动时文字平滑没入。 */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--canvas);
+    padding-top: 0.4rem;
+    margin-top: -0.4rem;
+  }
+  .topbar::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    height: 14px;
+    background: linear-gradient(var(--canvas), transparent);
+    pointer-events: none;
+  }
   /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上) */
   .header {
     display: flex;
@@ -640,32 +716,51 @@
     justify-content: flex-end;
     padding-top: 0.2rem;
   }
-  /* icon-button:button-secondary 形态的方形图标钮,与播放键同语言 */
-  .icon-btn {
-    width: 2.1rem;
-    height: 2.1rem;
+  /* 头部动作钮:button-secondary 形态 + 图标与文字并排(纯图标看不出功能) */
+  .act-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    padding: 0.4em 0.8em;
+    font-size: 0.85rem;
+    color: var(--ink-secondary);
+  }
+  .act-btn:hover {
+    color: var(--ink);
+  }
+  /* 控制行:录音 + 播放器整合一行(录音机式) */
+  .transport {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0 0 1rem;
+  }
+  .player-slot {
+    flex: 1;
+    min-width: 0;
+  }
+  /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
+     无播放器时 margin-left:auto 仍靠右。 */
+  .rec-btn {
+    width: 2.4rem;
+    height: 2.4rem;
     padding: 0;
+    flex: none;
+    margin-left: auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
   }
-  .icon-btn:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
+  .rec-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: var(--radius-full);
+    background: var(--record);
+    flex: none;
   }
-  /* 继续录制:红点承担彩色强调(与侧栏录制按钮同款语言) */
-  .icon-btn.resume {
-    color: var(--record);
-  }
-  .icon-btn.resume:hover {
-    color: var(--record);
-  }
-  .icon-btn.resume:disabled {
-    color: var(--ink-faint);
+  .rec-btn:disabled .rec-dot {
+    background: var(--ink-faint);
   }
   .export-msg {
     margin: 0 0 0.75rem;

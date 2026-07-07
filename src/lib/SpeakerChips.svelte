@@ -5,18 +5,44 @@
     speakers,
     noteId,
     editable,
+    counts,
     onRenamed,
   }: {
     speakers: Record<string, { name: string; sources: string[]; person_id?: string | null }>;
     noteId: string;
     editable: boolean;
+    /** 各说话人的段数(可选)。传入则按段数降序排,并折叠只出现 1 段的碎片说话人;
+        不传(如录制页实时条)保持原 id 序、不折叠。 */
+    counts?: Record<string, number>;
     onRenamed?: () => void;
   } = $props();
 
   let editingId = $state<string | null>(null);
   let editingName = $state("");
 
-  const ids = $derived(Object.keys(speakers).sort(speakerIdCompare));
+  const ids = $derived.by(() => {
+    const all = Object.keys(speakers).sort(speakerIdCompare);
+    // 稳定排序:段数降序为主键,id 序(上面已排好)为次键
+    return counts ? all.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0)) : all;
+  });
+
+  /** 碎片:只出现 1 段且未命名/未关联人物的说话人(命过名或已关联的不折叠)。 */
+  const fragmentIds = $derived(
+    counts
+      ? ids.filter((id) => (counts[id] ?? 0) <= 1 && !speakers[id]?.name && !speakers[id]?.person_id)
+      : [],
+  );
+  let showFragments = $state(false);
+  // 换笔记复位折叠态,别把上一篇的展开带过来
+  $effect(() => {
+    void noteId;
+    showFragments = false;
+  });
+  /** 少于 3 个碎片不值得折叠:展开钮本身比一两枚 chip 更占地。 */
+  const collapsible = $derived(fragmentIds.length >= 3);
+  const visibleIds = $derived(
+    collapsible && !showFragments ? ids.filter((id) => !fragmentIds.includes(id)) : ids,
+  );
 
   // 非 null 分支与徽章共用同一兜底逻辑;source 参数在此分支无关,固定传 "mic"。
   const label = (id: string) => speakerLabel(id, "mic", speakers);
@@ -48,7 +74,7 @@
 
 {#if ids.length > 0}
   <div class="chips">
-    {#each ids as id (id)}
+    {#each visibleIds as id (id)}
       <!-- speaker-chip：同徽章色系(粉彩底+ink字)，chip 本身就是色块，不再需要单独的色点 -->
       <div class="chip" class:editable style="background: {speakerColor(id, 'mic', speakers)}; color: {speakerInk(id, 'mic', speakers)}">
         {#if editable && editingId === id}
@@ -71,6 +97,12 @@
         {/if}
       </div>
     {/each}
+    {#if collapsible}
+      <!-- 碎片折叠钮:声纹没归成簇的一次性说话人收进来,别摊满一整条 -->
+      <button class="chip more" onclick={() => (showFragments = !showFragments)}>
+        {showFragments ? "收起" : `+${fragmentIds.length} 位偶现说话人`}
+      </button>
+    {/if}
   </div>
 {/if}
 
@@ -94,6 +126,19 @@
   /* 可点击时 hover 加 accent-tint 外环 */
   .chip.editable:hover {
     box-shadow: 0 0 0 2px var(--accent-tint);
+  }
+  /* 碎片折叠钮:button-secondary 语言(透明底+hairline 边),不与粉彩说话人色争 */
+  .chip.more {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    font: inherit;
+    font-size: 0.85em;
+    cursor: pointer;
+  }
+  .chip.more:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
   }
   .name {
     background: none;
