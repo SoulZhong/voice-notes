@@ -16,6 +16,17 @@ BIN="src-tauri/target/release/voice-notes"
 ABSL_DIR="/opt/homebrew/opt/abseil/lib"
 ABSL_VER="2407.0.0"
 
+# abseil 的 9 个 dylib 暂存为可写副本(brew 原件 555 只读,bundler 保留权限后
+# 签名前置的 xattr -cr 会 Permission denied)。tauri.conf frameworks 指向这里。
+STAGE="src-tauri/target/bundle-libs"
+mkdir -p "$STAGE"
+for lib in libabsl_base libabsl_raw_logging_internal libabsl_log_severity \
+           libabsl_spinlock_wait libabsl_strings libabsl_strings_internal \
+           libabsl_int128 libabsl_string_view libabsl_throw_delegate; do
+    cp -f "$ABSL_DIR/$lib.$ABSL_VER.dylib" "$STAGE/"
+    chmod u+w "$STAGE/$lib.$ABSL_VER.dylib"
+done
+
 for lib in libabsl_base libabsl_raw_logging_internal libabsl_log_severity \
            libabsl_spinlock_wait libabsl_strings; do
     install_name_tool -change \
