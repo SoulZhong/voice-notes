@@ -27,32 +27,62 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 - **Native system integration**: menu bar tray, global shortcut for start/stop, launch at login, light & dark themes.
 - **Tuned for Chinese-centric meetings**: SenseVoice (zh/en/ja/ko/yue) by default with optional Whisper, plus a language-hallucination filter that drops garbage output on silence.
 
-## Quick Start
+## Installation
 
 ### Requirements
 
-- macOS 13 or later (system-audio capture relies on ScreenCaptureKit)
+- **macOS 13 or later**, Apple Silicon (M-series) Mac — system-audio capture relies on ScreenCaptureKit, and only arm64 packages are provided for now
+- Disk space: ~60 MB for the app, ~1 GB for recognition models (downloaded on first launch)
+
+### Steps
+
+1. Download the latest `voice-notes_x.y.z_aarch64.dmg` from [Releases](https://github.com/SoulZhong/voice-notes/releases).
+2. Open the DMG and drag **voice-notes** into Applications.
+3. **First open**: the package is not code-signed yet, so double-clicking gets blocked by macOS. **Right-click the app → Open → Open** (one time only), or run:
+   ```bash
+   xattr -d com.apple.quarantine /Applications/voice-notes.app
+   ```
+4. On first launch you'll see a **welcome screen**: hit "Get Started" to download the recognition models (~1 GB, mirrored, resumable). When it finishes you land on the recording page, ready to go.
+   Want models/data on a custom location (e.g. an external drive)? Click "Advanced settings →" on the welcome screen and set the directories under **Settings → Storage** *before* downloading.
+
+### Grant two system permissions
+
+Both are on-demand; denying them degrades gracefully:
+
+| Permission | When it appears | Used for | If denied |
+| --- | --- | --- | --- |
+| Microphone | First time you start recording | Transcribing your speech | System audio only |
+| Screen Recording | First time system audio is captured | Audio stream of other apps only — **no frames are read** | Microphone only (with an in-app notice) |
+
+If you denied one, re-enable it later under **System Settings → Privacy & Security**.
+
+## Configuration
+
+Works out of the box — every setting has a sensible default. Adjust as needed (all in **Settings**):
+
+| Group | Item | Notes |
+| --- | --- | --- |
+| General | Appearance / launch at login / menu bar icon / global shortcut | Shortcut defaults to `⌥⌘R`, opt-in |
+| Storage | **Data directory / models directory** | Relocatable anywhere (iCloud / external drive); existing content is migrated automatically |
+| Storage | Audio disk usage & cleanup | Deletes audio only; transcripts and speakers are kept |
+| Recording | System audio only / keep output volume / garbage filter / keep audio | Scenario guide below under "Recording options" |
+| AI polish | LLM post-processing (optional) | Any OpenAI-compatible API (DeepSeek / Qwen / Doubao / Kimi presets); fixes typos and merges speakers after the meeting. Works fine without it |
+| Speech models | SenseVoice (default) / Whisper / Paraformer | The default is best for Chinese-centric meetings |
+
+### Run from source (developers)
+
 - [Rust](https://rustup.rs) (stable) and Node.js 18+
 - meson and ninja (to build the vendored WebRTC echo-cancellation module): `pip3 install --user meson ninja`
-- Permissions: Microphone (your speech), Screen Recording (used **only** to capture system audio — no frames are read)
-
-### Run from source
 
 ```bash
 git clone https://github.com/SoulZhong/voice-notes.git
 cd voice-notes
 npm install
 npm run tauri dev      # development
-npm run tauri build    # build the .app
+npm run tauri build    # build the .app + .dmg
 ```
 
-### Models
-
-Download in-app on first launch (**Settings → Models**, with a mirror for restricted networks), or prefetch:
-
-```bash
-./scripts/fetch_models.sh
-```
+Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 
 | Model | Purpose | Notes |
 | --- | --- | --- |
@@ -77,6 +107,12 @@ Download in-app on first launch (**Settings → Models**, with a mirror for rest
 | Wearing headphones | Leave both off: system echo cancellation stays on for the cleanest transcript |
 
 ## FAQ
+
+**"App is damaged" / "cannot be opened" on double-click?**
+That's macOS Gatekeeper blocking the unsigned package, not corruption. Right-click → Open → Open, or run `xattr -d com.apple.quarantine /Applications/voice-notes.app` and open normally.
+
+**"Start Recording" does nothing / says models are missing?**
+The recognition models haven't finished downloading. Return to the welcome screen or **Settings → Speech models** to continue (downloads resume); you can also switch the download mirror in Settings.
 
 **Why does it need Screen Recording permission?**
 Capturing system audio (sound played by other apps) on macOS is only possible through ScreenCaptureKit, which lives under the Screen Recording permission. Only the audio stream is consumed; no screen content is read.
