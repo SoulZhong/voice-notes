@@ -153,7 +153,21 @@
 
   // ── 波形音轨即进度条:点击/拖拽定位,方向键微调 ──
   /** 无波形数据(旧笔记全段无 rms 也会有零值数组;真空数组=无段落)退化为平轨。 */
-  const bars = $derived(waveform.length > 0 ? waveform : new Array(90).fill(0));
+  const srcBars = $derived(waveform.length > 0 ? waveform : new Array(90).fill(0));
+  /** 容器实测宽度(bind:clientWidth),0=未挂载。 */
+  let waveWidth = $state(0);
+  /** 条数按容器宽度自适应(每条约 3px 含 gap),窄窗按 max 降采样——固定 260 条
+      每条 min-width 1px + 1px gap 必然溢出容器,垫到右侧按钮底下(冒烟实锤)。 */
+  const bars = $derived.by(() => {
+    const n = Math.max(30, Math.min(srcBars.length, Math.floor(waveWidth / 3) || srcBars.length));
+    if (n >= srcBars.length) return srcBars;
+    const out: number[] = new Array(n).fill(0);
+    for (let i = 0; i < srcBars.length; i++) {
+      const b = Math.min(n - 1, Math.floor((i * n) / srcBars.length));
+      if (srcBars[i] > out[b]) out[b] = srcBars[i];
+    }
+    return out;
+  });
   const playedBars = $derived(Math.round((bars.length * pct) / 100));
 
   let waveEl = $state<HTMLElement | null>(null);
@@ -205,6 +219,7 @@
   <div
     class="wave"
     bind:this={waveEl}
+    bind:clientWidth={waveWidth}
     role="slider"
     tabindex="0"
     aria-label="播放进度"
