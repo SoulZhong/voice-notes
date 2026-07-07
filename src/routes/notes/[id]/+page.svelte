@@ -472,7 +472,7 @@
       </div>
 
       {#if note.meta.state === "recording"}
-        <div class="banner">这场录音曾意外中断，中断前的内容已保存。点击下方的「继续录制」可接着录。</div>
+        <div class="banner">这场录音曾意外中断，中断前的内容已保存。点击下方播放器右侧的红色录音键可接着录。</div>
       {/if}
       {#if note.skipped_lines > 0}
         <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
@@ -494,7 +494,7 @@
           aria-label="继续录制"
           onclick={doResume}
         >
-          <span class="rec-dot"></span>继续录制
+          <span class="rec-dot"></span>
         </button>
       </div>
 
@@ -760,18 +760,17 @@
     min-width: 0;
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
-     无播放器时 margin-left:auto 仍靠右。 */
-  /* 续录键:图标+文字(全应用禁纯图标按钮,红点保留录音机记号),胶囊形与行高协调 */
+     纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占
+     音轨宽度),悬停 title/aria-label 兜底可达性。无播放器时 margin-left:auto 仍靠右。 */
   .rec-btn {
+    width: 2.4rem;
     height: 2.4rem;
-    padding: 0 1em;
+    padding: 0;
     flex: none;
     margin-left: auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 0.5em;
-    white-space: nowrap;
     border-radius: var(--radius-full);
   }
   .rec-dot {
