@@ -1,4 +1,5 @@
 mod audio;
+mod logging;
 pub mod pipeline;
 pub mod asr;
 mod ipc;
@@ -1904,6 +1905,34 @@ fn apply_shortcut(app: AppHandle) -> Result<(), String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 屏幕录制权限预检(macOS):系统声音采集(ScreenCaptureKit)依赖该权限,未授权时
+/// System 源只会在开录后静默降级为仅麦克风——录制页据此在**开录前**就给出常驻
+/// 提示与授权入口,终结"录了半天发现对方声音全没进笔记"。
+#[tauri::command]
+fn screen_capture_permission() -> bool {
+    #[cfg(target_os = "macos")]
+    return unsafe { CGPreflightScreenCaptureAccess() };
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// 触发系统授权弹窗并把本应用登记进「屏幕录制」列表。macOS 对每个 App 一生只弹
+/// 一次,之后调用只返回当前状态——前端拿到 false 时应引导去系统设置手动开。
+#[tauri::command]
+fn request_screen_capture_permission() -> bool {
+    #[cfg(target_os = "macos")]
+    return unsafe { CGRequestScreenCaptureAccess() };
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1938,6 +1967,11 @@ pub fn run() {
             let handle = app.handle().clone();
             // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
             let app_data = handle.path().app_data_dir().ok();
+            // 最先执行:stderr/stdout 黑匣子(见 logging.rs)。后续任何 eprintln 与
+            // ONNX Runtime 的错误输出都要进日志,晚一步就可能漏掉启动期报错。
+            if let Some(dir) = &app_data {
+                logging::redirect_stdio_to_file(dir);
+            }
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
             // 必须先于 models::root() 的任何使用。
@@ -2018,6 +2052,8 @@ pub fn run() {
             edit_segment,
             delete_segment,
             set_segment_speaker,
+            screen_capture_permission,
+            request_screen_capture_permission,
             models_status,
             download_models,
             cancel_models_download,
