@@ -1267,7 +1267,35 @@ fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::Track
     if !note_dir.is_dir() {
         return Err(format!("笔记不存在: {id}"));
     }
-    Ok(store::audio::list_tracks(&note_dir))
+    let tracks = store::audio::list_tracks(&note_dir);
+    // 旧笔记波形懒回填(读路径本身仍纯读,重活在后台线程):波形功能上线前转码的
+    // m4a 无预计算波形,解码回填一次,完成发 transcode_done 让详情页重拉音轨
+    // (复用停录转码的刷新链)。in-flight 集合防同一轨并发重复回填。
+    for t in &tracks {
+        if t.waveform.is_none() && t.path.ends_with(".m4a") {
+            static INFLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+            let key = format!("{id}/{}", t.source);
+            {
+                let mut g = INFLIGHT.lock().unwrap();
+                let set = g.get_or_insert_with(Default::default);
+                if !set.insert(key.clone()) {
+                    continue;
+                }
+            }
+            let (app, note_dir, source, note_id) =
+                (app.clone(), note_dir.clone(), t.source.clone(), id.clone());
+            std::thread::spawn(move || {
+                match store::transcode::backfill_waveform(&note_dir, &source) {
+                    Ok(()) => {
+                        let _ = app.emit("transcode_done", ipc::TranscodeEvent { note_id });
+                    }
+                    Err(e) => eprintln!("波形回填失败({note_id}/{source}),维持段落包络: {e}"),
+                }
+                INFLIGHT.lock().unwrap().as_mut().map(|s| s.remove(&key));
+            });
+        }
+    }
+    Ok(tracks)
 }
 
 #[tauri::command]

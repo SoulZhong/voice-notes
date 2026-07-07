@@ -56,6 +56,9 @@ export type TrackInfo = {
   path: string;
   offset_ms: number;
   duration_ms: number;
+  // 真实音频波形(0..255 峰值桶,260 桶等分时长);null/缺失 = 旧笔记未回填,
+  // 页面回退按转写段落 rms 聚合的包络。
+  waveform?: number[] | null;
 };
 
 export interface RefinedParagraph {

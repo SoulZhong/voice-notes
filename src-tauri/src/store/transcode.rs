@@ -150,9 +150,18 @@ fn transcode_one(
     if drift > DURATION_TOLERANCE_MS {
         anyhow::bail!("编码后时长 {encoded_ms}ms 与源 {wav_ms}ms 相差 {drift}ms,超允差");
     }
+    // 波形预计算必须赶在 WAV 删除前(m4a 解码贵,之后无从再算);失败不阻塞转码,
+    // 播放器回退段落包络。
+    let waveform = match crate::store::audio::waveform_from_wav(wav) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("波形预计算失败,播放器将回退段落包络({}): {e}", wav.display());
+            None
+        }
+    };
     // 先记 meta(m4a 时长无法按字节反推,list_tracks 只能读这里)再 rename:
     // 若记 meta 后 rename 崩,下次进来 m4a 不存在 → 走正常编码重记,幂等。
-    set_track_compressed(note_dir, source, wav_ms)?;
+    set_track_compressed(note_dir, source, wav_ms, waveform)?;
     std::fs::rename(m4a_tmp, m4a)?;
     // WAV 删除是收尾:即便失败,m4a 已就位,下次 transcode 的「并存收敛」分支会补删。
     if let Err(e) = std::fs::remove_file(wav) {
@@ -243,6 +252,18 @@ fn extract_wav_data(path: &Path) -> anyhow::Result<Vec<u8>> {
         pos = start.saturating_add(size).saturating_add(size & 1);
     }
     anyhow::bail!("WAV 无 data 块: {}", path.display())
+}
+
+/// 旧笔记波形懒回填:波形预计算上线前转码的 m4a 没有 waveform——解码到临时 WAV、
+/// 取纯 PCM 桶化、写回 audio.json。秒级阻塞,调用方放后台线程;失败只降级
+/// (播放器继续用段落包络),临时文件成败都清。
+pub fn backfill_waveform(note_dir: &Path, source: &str) -> anyhow::Result<()> {
+    let m4a = note_dir.join(format!("{source}.m4a"));
+    let tmp = note_dir.join(format!(".{source}.waveform.wav.tmp"));
+    let pcm = afconvert_decode(&m4a, &tmp).and_then(|_| extract_wav_data(&tmp));
+    let _ = std::fs::remove_file(&tmp);
+    let wf = crate::store::audio::waveform_from_pcm(&pcm?);
+    crate::store::audio::set_track_waveform(note_dir, source, wf)
 }
 
 /// 受锁保护的队列状态。三者必须一起改、一起看,所以塞进同一个 `Mutex`:
@@ -638,7 +659,7 @@ mod tests {
     fn corrupt_m4a_degrades_to_bad_rename() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("mic.m4a"), b"not audio").unwrap();
-        crate::store::audio::set_track_compressed(tmp.path(), "mic", 1000).unwrap();
+        crate::store::audio::set_track_compressed(tmp.path(), "mic", 1000, None).unwrap();
         decode_note_to_wav(tmp.path());
         assert!(tmp.path().join("mic.m4a.bad").exists(), "坏 m4a 移出枚举,字节保留");
         assert!(!tmp.path().join("mic.wav").exists());
