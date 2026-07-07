@@ -96,8 +96,10 @@
     if (recording.isLive) {
       await recording.stop(); // 跳详情由全局 status 监听驱动
     } else {
-      const started = await recording.start();
-      if (started) goto("/record");
+      await recording.start();
+      // 无论成败都进录制页:失败时错误状态与模型下载卡只在录制页渲染,
+      // 留在原地会表现为"点了没反应"(模型缺失场景实测踩坑)。
+      goto("/record");
     }
   }
 
