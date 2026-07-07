@@ -7,7 +7,7 @@
 [中文](./README.md) | English
 
 [![platform](https://img.shields.io/badge/platform-macOS%2013%2B-black)](#requirements)
-[![license](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](#license)
 [![tauri](https://img.shields.io/badge/Tauri-2-24C8DB)](https://tauri.app)
 [![rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
 
@@ -146,4 +146,8 @@ cd src-tauri && cargo test    # backend tests
 
 ## License
 
-[MIT](./LICENSE)
+[AGPL-3.0](./LICENSE) © zhongweijian (SoulZhong)
+
+Free to use, study, modify, and self-host. If you distribute or operate this project (or a derivative) as a **closed-source product or service**, AGPL requires you to open-source the derived code. For commercial integrations that can't be open-sourced, contact the author via [GitHub Issues](https://github.com/SoulZhong/voice-notes/issues) for a **commercial license** (dual licensing).
+
+> Note: v0.1.0 and earlier were released under MIT, which remains valid for copies already obtained; versions from this change onward are AGPL-3.0.
