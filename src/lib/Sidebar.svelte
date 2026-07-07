@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
+  import { ask } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import {
     listNotes,
@@ -46,24 +47,29 @@
   const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
-  let confirmingDeleteId = $state<string | null>(null);
-
   // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
   let menuForId = $state<string | null>(null);
   let menuX = $state(0);
   let menuY = $state(0);
+  let menuEl = $state<HTMLElement | null>(null);
+  // 视口钳制:菜单在光标处展开,靠近右/下缘时整体收回视口内(原生菜单惯例),
+  // 渲染后按实测尺寸修正一次。
+  $effect(() => {
+    if (!menuEl) return;
+    const r = menuEl.getBoundingClientRect();
+    if (r.right > window.innerWidth - 8) menuX = Math.max(8, window.innerWidth - 8 - r.width);
+    if (r.bottom > window.innerHeight - 8) menuY = Math.max(8, window.innerHeight - 8 - r.height);
+  });
 
   function openMenu(e: MouseEvent, id: string) {
     e.preventDefault();
     menuForId = id;
-    confirmingDeleteId = null;
     menuX = e.clientX;
     menuY = e.clientY;
   }
 
   function closeMenu() {
     menuForId = null;
-    confirmingDeleteId = null;
   }
 
   /** 整行可点跳转;行内的按钮/输入框/链接各有己任,不劫持。 */
@@ -120,8 +126,16 @@
     }
   }
 
-  async function confirmDelete(id: string) {
-    confirmingDeleteId = null;
+  /// 删除走系统原生确认对话框(plugin-dialog):平台惯例体验,替代旧的
+  /// 「菜单原地变形成确认项」自造交互(冒烟反馈:不符合正常预期)。
+  async function confirmDelete(id: string, title: string) {
+    const yes = await ask(`「${title}」的转写与录音将一并删除，此操作不可恢复。`, {
+      title: "删除笔记",
+      kind: "warning",
+      okLabel: "删除",
+      cancelLabel: "取消",
+    });
+    if (!yes) return;
     try {
       await deleteNote(id);
       recording.bumpNotes();
@@ -280,27 +294,23 @@
   <!-- 点击任意处关闭;键盘路径由 svelte:window 的 Esc 承担,遮罩是纯指针便利层 -->
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div class="menu-overlay" onclick={closeMenu} oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}></div>
-  <div class="ctx-menu" style="left: {menuX}px; top: {menuY}px">
-    {#if confirmingDeleteId === menuForId}
-      <button
-        class="ctx-item danger"
-        onclick={() => {
-          const id = menuForId!;
-          closeMenu();
-          confirmDelete(id);
-        }}>确认删除「{menuNote?.title ?? ""}」</button
-      >
-      <button class="ctx-item" onclick={closeMenu}>取消</button>
-    {:else}
-      <button
-        class="ctx-item"
-        onclick={() => {
-          if (menuNote) beginRename(menuNote);
-          menuForId = null;
-        }}>改名</button
-      >
-      <button class="ctx-item danger" onclick={() => (confirmingDeleteId = menuForId)}>删除</button>
-    {/if}
+  <div class="ctx-menu" bind:this={menuEl} style="left: {menuX}px; top: {menuY}px">
+    <button
+      class="ctx-item"
+      onclick={() => {
+        if (menuNote) beginRename(menuNote);
+        closeMenu();
+      }}>改名</button
+    >
+    <button
+      class="ctx-item danger"
+      onclick={() => {
+        const id = menuForId!;
+        const title = menuNote?.title ?? "";
+        closeMenu();
+        confirmDelete(id, title);
+      }}>删除</button
+    >
   </div>
 {/if}
 

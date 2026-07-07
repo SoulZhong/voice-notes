@@ -124,7 +124,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **transcript-container**:`surface` 底、radius-xl、padding 16-20px;段落间距 6px;正文 `transcript` 字级(行高 1.6)。
 - **speaker-badge**:soft tint 底 + `--tint-*-ink` 文字、radius-sm、`micro` 字级;哈希取色循环上表 7 色。
 - **speaker-chip**(顶部说话人条):同徽章色系,radius-full,可点击时 hover 加 `accent-tint` 外环。
-- **menu / popover**(右键菜单、说话人选择、合并目标):`surface-press` 底、1px `hairline` 边、radius-lg、`shadow-popover`(dark `.5` / light `.16`)。
+- **menu / popover**(右键菜单、说话人选择、合并目标):`surface-press` 底、1px `hairline` 边、radius-lg、`shadow-popover`(dark `.5` / light `.16`)。光标处展开,靠近视口右/下缘按实测尺寸整体收回(留 8px 边距);**菜单项不承载确认态**(不原地变形成「确认删除/取消」)——破坏性菜单动作一律弹系统原生确认对话框(plugin-dialog `ask`,warning 档,正文写清删什么、不可恢复);页面内(非菜单)的破坏性按钮仍可用行内二段式确认(清理/删段落既有模式)。
 - **banner**(横幅三件套):tint 底 + line 边 + ink 文字。提示横幅 `warning-tint` / `warning-line` / `warning-ink`;错误横幅同形态换 `danger-tint` / `danger-line` / `danger-ink`;radius-lg。
 - **progress**(进度条):轨 `hairline`、填充 `accent`、高 6px、radius-full。
 - **waveform-track**(播放器音轨,即进度条):260 桶等宽细条(flex 等分 + 1px gap、radius-full),条高优先取**真实音频波形**(转码时从 WAV 预计算峰值桶存 audio.json,旧笔记打开时从 m4a 懒回填;多轨按时间轴对位取 max,按本条峰值归一 γ0.7 拉动态,不加抖动——真实数据自带起伏。有声音就有波形,与录音机直觉一致,说话稀疏不再近乎空白);无波形数据回退旧「段落 rms 包络 × ±18% 确定性抖动」;未播 `hairline-strong`、已播 `accent`;整条可点击/拖拽定位、方向键 ±5s。空数据退化为平轨。
