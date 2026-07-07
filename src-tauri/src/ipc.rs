@@ -52,6 +52,13 @@ pub struct RetractEvent {
     pub text: String,
 }
 
+/// 音频转码完成，事件名 "transcode_done"。停录后 WAV→m4a 转码结束(源 WAV 已删),
+/// 打开中的详情页应重拉音轨——否则播放器仍握着已删除 WAV 的引用,呈现"无声播放"。
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscodeEvent {
+    pub note_id: String,
+}
+
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {

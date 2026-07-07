@@ -609,7 +609,7 @@ fn spawn_session(
         {
             match audio::aec::new_pair(16000) {
                 Ok((render, capture)) => {
-                    eprintln!("软件回声消除已启用(WebRTC AEC3): system 路为参考,mic 路消回声");
+                    eprintln!("软件回声消除已启用(WebRTC AEC3 + AGC2 自适应增益): system 路为参考,mic 路消回声+自动增益");
                     aec_roles.push((Source::System, audio::aec::AecRole::Render(render)));
                     aec_roles.push((Source::Mic, audio::aec::AecRole::Capture(capture)));
                 }
@@ -1978,7 +1978,16 @@ pub fn run() {
                 Err(e) => eprintln!("data_root 解析失败,跳过启动扫描/转码回溯(不影响录制): {e}"),
             }
             // 转码 worker 常驻:录制中让路,空闲时串行消费队列(启动回溯 + 后续停录入队)。
-            st.transcode.spawn_worker(st.running.clone(), store::transcode::transcode_note_dir);
+            // 真实转码函数外包一层完成通知:转码完成瞬间源 WAV 被删,已打开的详情页
+            // 播放器引用失效(停录后立即点播放的竞态窗口)——发事件让前端重拉音轨。
+            let transcode_emit = handle.clone();
+            st.transcode.spawn_worker(st.running.clone(), move |dir: &std::path::Path| {
+                store::transcode::transcode_note_dir(dir);
+                if let Some(id) = dir.file_name().and_then(|s| s.to_str()) {
+                    let _ = transcode_emit
+                        .emit("transcode_done", ipc::TranscodeEvent { note_id: id.to_string() });
+                }
+            });
 
             preload_models(handle.clone(), st.session.clone(), st.recognizer_cache.clone(), st.embedder_cache.clone());
             // 依设置注册全局快捷键;坏快捷键(格式错/与系统冲突)绝不挡启动,仅 eprintln。

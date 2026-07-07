@@ -15,6 +15,24 @@
   let els = $state<(HTMLAudioElement | null)[]>([]);
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
 
+  /** 轨道加载/播放失败的可视化(排障关键:加载失败时走表逻辑仍会推进度条,
+      看起来在播实际无声——错误必须浮出水面,不许静默)。 */
+  let trackErrors = $state<string[]>([]);
+  function reportError(source: string, detail: string) {
+    const msg = `${source} 音轨: ${detail}`;
+    if (!trackErrors.includes(msg)) trackErrors = [...trackErrors, msg];
+  }
+  function onAudioError(i: number) {
+    const el = els[i];
+    const media = el?.error;
+    const code =
+      media?.code === 1 ? "加载被中止" :
+      media?.code === 2 ? "网络/协议错误(资源读取失败)" :
+      media?.code === 3 ? "解码失败(文件损坏或编码不支持)" :
+      media?.code === 4 ? "资源不可用(路径被拒或文件不存在)" : `错误码 ${media?.code}`;
+    reportError(tracks[i]?.source ?? `#${i}`, code);
+  }
+
   let raf = 0;
   // 连续播放位置(非响应式):驱动音频同步;currentMs 只按 100ms 粒度更新——
   // 高亮/进度条用不到更细,也避免 60fps 触发全段落列表的派生重算。
@@ -49,7 +67,10 @@
       if (expected >= 0 && expected < tracks[i].duration_ms) {
         if (el.paused) {
           el.currentTime = expected / 1000;
-          void el.play().catch(() => {});
+          void el.play().catch((e) => {
+            // 播放被拒也要浮出水面(自动播放策略/资源失效),不再静默吞掉。
+            reportError(tracks[i]?.source ?? `#${i}`, `播放被拒: ${e?.name ?? e}`);
+          });
         } else if (Math.abs(el.currentTime * 1000 - expected) > DRIFT_MS) {
           el.currentTime = expected / 1000;
         }
@@ -155,9 +176,16 @@
   />
   <span class="time">{formatTs(totalMs)}</span>
   {#each tracks as t, i (t.source)}
-    <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto"></audio>
+    <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto" onerror={() => onAudioError(i)}></audio>
   {/each}
 </div>
+{#if trackErrors.length > 0}
+  <div class="track-errors">
+    {#each trackErrors as e (e)}
+      <div>{e}</div>
+    {/each}
+  </div>
+{/if}
 
 <style>
   /* 播放器容器:surface 卡片,与 transcript 容器同语言 */
@@ -220,5 +248,11 @@
   }
   audio {
     display: none;
+  }
+  /* 音轨错误可视化:danger 色小字,贴在播放器下方 */
+  .track-errors {
+    color: var(--danger);
+    font-size: 0.8rem;
+    margin: -0.6rem 0 1rem 0.2rem;
   }
 </style>
