@@ -63,6 +63,12 @@ export function onRetract(cb: (e: RetractEvent) => void) {
   return listen<RetractEvent>("final_retract", (ev) => cb(ev.payload));
 }
 
+/** 停录后音频转码完成(源 WAV 已删):详情页应重拉音轨,否则播放器握着失效引用无声播放。 */
+export type TranscodeEvent = { note_id: string };
+export function onTranscodeDone(cb: (e: TranscodeEvent) => void) {
+  return listen<TranscodeEvent>("transcode_done", (ev) => cb(ev.payload));
+}
+
 export type LevelEvent = { rms: number };
 
 export function onLevel(cb: (e: LevelEvent) => void) {

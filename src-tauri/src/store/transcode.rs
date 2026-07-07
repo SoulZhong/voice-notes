@@ -371,7 +371,13 @@ impl TranscodeQueue {
 
     /// 启动常驻 worker 线程,串行消费队列。`running` 传 AppState 的录制标志、`process`
     /// 传 `transcode_note_dir`(测试传桩)—— 参数化是为了单测能用假处理函数验时序。
-    pub fn spawn_worker(self: &Arc<Self>, running: Arc<Mutex<bool>>, process: fn(&Path)) {
+    /// process 为泛型闭包:lib.rs 在真实转码函数外再包一层"完成事件"通知(转码完成
+    /// 瞬间源 WAV 被删,已打开详情页的播放器引用失效——前端收事件重拉音轨修此竞态)。
+    pub fn spawn_worker(
+        self: &Arc<Self>,
+        running: Arc<Mutex<bool>>,
+        process: impl Fn(&Path) + Send + 'static,
+    ) {
         let me = Arc::clone(self);
         std::thread::spawn(move || loop {
             // 录制中让路:转码要抢 CPU,录制阶段优先保采集不卡顿,所以录制中只 sleep 不出队。

@@ -21,11 +21,33 @@ use webrtc_audio_processing::{config, Config, Processor};
 const FRAME: usize = 160;
 
 /// 建一对 AEC 句柄(render 给 system worker,capture 给 mic worker)。
-/// 只开回声消除子模块;AGC/降噪等保持关闭,不引入额外音色变化。
+/// 开两个子模块:回声消除 + AGC2 自适应数字增益;降噪等保持关闭。
 pub fn new_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
     let ap = Processor::new(sample_rate).map_err(|e| anyhow::anyhow!("AEC 初始化失败: {e}"))?;
     ap.set_config(Config {
         echo_canceller: Some(config::EchoCanceller::default()),
+        // 自动增益(AGC2 自适应数字):普通麦克风模式没有 VPIO 的增益管理,系统输入
+        // 音量被会议软件拉低/说话偏轻时波形过小——VAD 概率过不了阈,句子根本不切段
+        // (观感"声音小就不转写"),录音回放也听不见。自适应数字增益作用在回声消除
+        // 之后(不放大回声),把人声抬到正常电平。input_volume_controller 关死:
+        // 绝不碰系统输入音量旋钮——那个旋钮会被会议软件抢,抢完不还(2026-07-06
+        // 排障实锤),我们只做进程内数字增益,不参与系统层拉锯。
+        gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+            input_volume_controller_enabled: false,
+            // 平衡档(0.002/0.005/0.05/0.15 四电平实验选定,见 agc_experiments):
+            // 真耳语(0.002≈-54dBFS)抬 158x 功率进 VAD 可识别区间;正常人声(0.05)
+            // 温和 5x 改善回放响度;响亮人声(0.15)不动。默认参数的噪声地板 -50dBFS
+            // 会把真耳语当噪声拒掉,故放宽到 -44 并提高 max_gain/爬坡速度。
+            // 底噪会被抬到约 -44dBFS(轻微可闻),VAD/语言过滤/会后精修三层兜幻觉段。
+            adaptive_digital: Some(config::AdaptiveDigital {
+                headroom_db: 3.0,
+                max_gain_db: 60.0,
+                initial_gain_db: 22.0,
+                max_gain_change_db_per_second: 12.0,
+                max_output_noise_level_dbfs: -44.0,
+            }),
+            fixed_digital: config::FixedDigital::default(),
+        })),
         ..Default::default()
     });
     let ap = Arc::new(ap);
@@ -89,7 +111,7 @@ mod tests {
     use super::*;
 
     /// 确定性伪随机噪声(LCG),噪声类信号让自适应滤波快速收敛,且测试可复现。
-    fn noise(len: usize, seed: &mut u64) -> Vec<f32> {
+    pub(crate) fn noise(len: usize, seed: &mut u64) -> Vec<f32> {
         (0..len)
             .map(|_| {
                 *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -98,7 +120,7 @@ mod tests {
             .collect()
     }
 
-    fn power(s: &[f32]) -> f32 {
+    pub(crate) fn power(s: &[f32]) -> f32 {
         s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32
     }
 
@@ -149,5 +171,186 @@ mod tests {
             out_power < echo_power / 4.0,
             "收敛后回声应至少衰减 6dB: 回声功率 {echo_power:.6}, 输出功率 {out_power:.6}"
         );
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+    use tests::{noise, power};
+
+    /// 诊断:render 全程静音(远端没人说话)时,近端人声应该原样通过,不得被压制。
+    #[test]
+    fn near_end_passes_through_when_render_is_silent() {
+        let (mut r, mut c) = new_pair(16_000).unwrap();
+        let mut seed = 7u64;
+        let near = noise(16_000 * 4, &mut seed);
+        let silence = vec![0.0f32; near.len()];
+        let tail_from = near.len() - 16_000 / 2;
+        let mut out_tail = Vec::new();
+        for (i, (f, n)) in silence.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+            r.push(f);
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        let in_p = power(&near[tail_from..]);
+        let out_p = power(&out_tail);
+        eprintln!("静音参考: 输入功率 {in_p:.6} 输出功率 {out_p:.6} 比值 {:.3}", out_p / in_p);
+        assert!(out_p > in_p * 0.25, "近端不应被压超过 6dB: in={in_p:.6} out={out_p:.6}");
+    }
+
+    /// AGC2:低电平近端(模拟系统输入音量被拉低)不得被进一步衰减,且应获得增益抬升。
+    /// 阈值宽松(≥1.5x 功率)防跨版本波动;实际自适应增益远高于此。
+    #[test]
+    fn quiet_near_end_gets_boosted_by_agc() {
+        let (mut r, mut c) = new_pair(16_000).unwrap();
+        let mut seed = 11u64;
+        // 0.02 振幅 ≈ 被拉低的近场人声电平;带 4Hz 包络调制,更接近语音的时变特性。
+        let near: Vec<f32> = noise(16_000 * 6, &mut seed)
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let t = i as f32 / 16_000.0;
+                x * 0.04 * (0.6 + 0.4 * (t * 4.0 * std::f32::consts::TAU).sin())
+            })
+            .collect();
+        let silence = vec![0.0f32; near.len()];
+        let tail_from = near.len() - 16_000;
+        let mut out_tail = Vec::new();
+        for (i, (f, n)) in silence.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+            r.push(f);
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        let in_p = power(&near[tail_from..]);
+        let out_p = power(&out_tail);
+        eprintln!("AGC: 输入功率 {in_p:.8} 输出功率 {out_p:.8} 比值 {:.2}", out_p / in_p);
+        assert!(out_p > in_p * 1.5, "低电平近端应被 AGC 抬升: in={in_p:.8} out={out_p:.8}");
+    }
+
+    /// 诊断:完全不喂 render(系统源无帧)时近端表现。
+    #[test]
+    fn near_end_without_any_render_frames() {
+        let (_r, mut c) = new_pair(16_000).unwrap();
+        let mut seed = 9u64;
+        let near = noise(16_000 * 4, &mut seed);
+        let tail_from = near.len() - 16_000 / 2;
+        let mut out_tail = Vec::new();
+        for (i, n) in near.chunks(FRAME).enumerate() {
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        let in_p = power(&near[tail_from..]);
+        let out_p = power(&out_tail);
+        eprintln!("无参考帧: 输入功率 {in_p:.6} 输出功率 {out_p:.6} 比值 {:.3}", out_p / in_p);
+        assert!(out_p > in_p * 0.25, "近端不应被压超过 6dB: in={in_p:.6} out={out_p:.6}");
+    }
+}
+
+#[cfg(test)]
+mod agc_experiments {
+    use super::*;
+    use tests::{noise, power};
+    use webrtc_audio_processing::{config, Config, Processor};
+
+    fn run_with(cfg: Config, amp: f32) -> f32 {
+        let ap = Processor::new(16_000).unwrap();
+        ap.set_config(cfg);
+        let mut seed = 5u64;
+        let near: Vec<f32> = noise(16_000 * 8, &mut seed)
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let t = i as f32 / 16_000.0;
+                x * amp * (0.6 + 0.4 * (t * 4.0 * std::f32::consts::TAU).sin())
+            })
+            .collect();
+        let tail = near.len() - 16_000;
+        let mut out_tail = Vec::new();
+        let mut buf = near.clone();
+        for (i, chunk) in buf.chunks_mut(FRAME).enumerate() {
+            let _ = ap.process_capture_frame([&mut chunk[..]]);
+            if i * FRAME >= tail {
+                out_tail.extend_from_slice(chunk);
+            }
+        }
+        power(&out_tail) / power(&near[tail..])
+    }
+
+
+    #[test]
+    #[ignore] // 实验用
+    fn compare_on_true_whisper_level() {
+        let mk2 = |ad: config::AdaptiveDigital| Config {
+            gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+                input_volume_controller_enabled: false,
+                adaptive_digital: Some(ad),
+                fixed_digital: config::FixedDigital::default(),
+            })),
+            ..Default::default()
+        };
+        let default_ad = config::AdaptiveDigital::default();
+        let balanced = config::AdaptiveDigital {
+            headroom_db: 3.0,
+            max_gain_db: 60.0,
+            initial_gain_db: 22.0,
+            max_gain_change_db_per_second: 12.0,
+            max_output_noise_level_dbfs: -44.0,
+        };
+        for amp in [0.002f32, 0.005, 0.05, 0.15] {
+            eprintln!("amp {amp}: 默认 {:.1}x | balanced {:.1}x", run_with(mk2(default_ad), amp), run_with(mk2(balanced), amp));
+        }
+    }
+    #[test]
+    #[ignore] // 实验用:cargo test agc_experiments -- --ignored --nocapture
+    fn compare_agc_configs_on_whisper_level() {
+        let amp = 0.005f32; // ≈ -46dBFS,实测耳语段电平
+        let agc2_default = Config {
+            gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+                input_volume_controller_enabled: false,
+                adaptive_digital: Some(config::AdaptiveDigital::default()),
+                fixed_digital: config::FixedDigital::default(),
+            })),
+            ..Default::default()
+        };
+        let agc2_aggressive = Config {
+            gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+                input_volume_controller_enabled: false,
+                adaptive_digital: Some(config::AdaptiveDigital {
+                    headroom_db: 1.0,
+                    max_gain_db: 60.0,
+                    initial_gain_db: 30.0,
+                    max_gain_change_db_per_second: 20.0,
+                    max_output_noise_level_dbfs: -40.0,
+                }),
+                fixed_digital: config::FixedDigital::default(),
+            })),
+            ..Default::default()
+        };
+        let agc1_adaptive = Config {
+            gain_controller: Some(config::GainController::GainController1(config::GainController1 {
+                mode: config::GainControllerMode::AdaptiveDigital,
+                target_level_dbfs: 3,
+                compression_gain_db: 20,
+                enable_limiter: true,
+                analog_gain_controller: None,
+            })),
+            ..Default::default()
+        };
+        eprintln!("耳语电平 0.005 增益比(功率):");
+        eprintln!("  AGC2 默认   : {:.2}x", run_with(agc2_default, amp));
+        eprintln!("  AGC2 激进   : {:.2}x", run_with(agc2_aggressive, amp));
+        eprintln!("  AGC1 自适应 : {:.2}x", run_with(agc1_adaptive, amp));
+        eprintln!("正常电平 0.05 增益比(不应过度放大):");
+        let agc2_aggressive2 = agc2_aggressive.clone();
+        eprintln!("  AGC2 激进   : {:.2}x", run_with(agc2_aggressive2, 0.05));
+        let agc1_2 = agc1_adaptive.clone();
+        eprintln!("  AGC1 自适应 : {:.2}x", run_with(agc1_2, 0.05));
     }
 }

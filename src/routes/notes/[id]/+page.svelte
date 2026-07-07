@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { onTranscodeDone } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -100,9 +101,22 @@
   // ——否则本页停录后(id/notesVersion 都没变)effect 不重跑,播放器永远不出现。
   // await 后校验 id 未变,防快速切换笔记时旧响应覆盖新页面的轨道(错音频)。
   // 音频是增值层:取失败(旧笔记无音频/后端异常)静默按无轨道处理,不打扰主内容。
+  /** 转码完成计数:transcode_done 事件驱动音轨重拉(停录后立即点播放的竞态窗口:
+      转码完成瞬间源 WAV 被删,播放器握着失效引用会无声播放,此处自动切到 m4a)。 */
+  let tracksVersion = $state(0);
+  $effect(() => {
+    const un = onTranscodeDone((e) => {
+      if (e.note_id === id) tracksVersion++;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   $effect(() => {
     const forId = id;
     void recording.notesVersion;
+    void tracksVersion;
     if (!canEdit) {
       tracks = [];
       return;
