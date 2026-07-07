@@ -131,6 +131,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **waveform-live**(录制实时音轨,兼任电平表):2px 细条自右缘进入左移滚动(120ms 采样、保留约 29s),条色 `record`(录制中是唯一常驻彩色信号的延伸),暂停冻结退 `ink-faint`;空闲时容器空置占位保行高。
 - **transport**(控制行,录音机式):录音/播放控制整合一行——笔记页 `[▶ 播放/暂停][时间][waveform-track][总时长][⏺]`(行尾圆形红点录音键=录音机通识标志,圆环+12px `record` 红点,禁用点退 `ink-faint`),录制页 `[控制钮组][waveform-live][计时]`;其余动作按钮一律图标+文字(纯图标看不出功能,冒烟反馈)。
 - **download-card**:`surface` 底 radius-xl(大卡);compact 提示条改用 banner 形态(warning 色系)。
+- **welcome-overlay**(首启引导):`canvas` 底全屏覆盖(z-index 置顶),居中 30rem 面板。品牌记号=录制按钮同构「primary 药丸 + 14px `record` 红点」;标题下一句话简介(`ink-secondary`);下载流整体复用 download-card(主按钮文案换「开始使用」),不另造进度 UI;权限预告两行 caption 级 `ink-faint`;右下「高级设置 →」文字链接(`ink-secondary`,hover `ink` + `surface-soft`)为唯一逃生口。仅当未 onboarded 且识别模型未就绪时出现;下载完成自动进录制页。
 - **timer / meter**:计时数字用等宽数字(`font-variant-numeric: tabular-nums`)、`ink-secondary`;暂停态 `ink-faint`。电平表轨 `hairline`、填充 `success`、radius-full。
 - **editable-text**(段落 / 标题 / 名字):静态时无边;hover `accent-tint` 底 + radius-sm;focus `accent` 2px outline。已命名说话人的改名角标(线性 SVG,非 Unicode)`ink-faint`,hover 变 `accent`。
 

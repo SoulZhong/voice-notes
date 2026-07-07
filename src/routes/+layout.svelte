@@ -1,12 +1,36 @@
 <script lang="ts">
   import "../app.css";
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import Sidebar from "$lib/Sidebar.svelte";
+  import WelcomeOverlay from "$lib/WelcomeOverlay.svelte";
   import { recording } from "$lib/recording.svelte";
-  import { getSettings } from "$lib/models";
+  import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
 
   let { children } = $props();
+
+  // 首启引导:未 onboarded 且模型未就绪才弹欢迎层;模型已就绪(老用户升级出新字段)
+  // 静默补 onboarded,不打扰。任何 IPC 失败都按"不弹"处理——引导是增强,不能挡主界面。
+  let welcomeStatus = $state<ModelsStatus | null>(null);
+  async function checkOnboarding() {
+    try {
+      const s = await getSettings();
+      if (s.onboarded) return;
+      const m = await modelsStatus();
+      if (m.recording_ready) {
+        await setSettings({ ...s, onboarded: true });
+      } else {
+        welcomeStatus = m;
+      }
+    } catch {
+      /* 静默:见上 */
+    }
+  }
+  function onWelcomeDone(target: "/record" | "/settings") {
+    welcomeStatus = null;
+    goto(target);
+  }
 
   onMount(() => {
     recording.init();
@@ -15,6 +39,7 @@
     getSettings()
       .then((s) => applyTheme(s.theme))
       .catch(() => {});
+    checkOnboarding();
   });
 </script>
 
@@ -24,6 +49,9 @@
     {@render children()}
   </main>
 </div>
+{#if welcomeStatus}
+  <WelcomeOverlay status={welcomeStatus} onDone={onWelcomeDone} />
+{/if}
 
 <style>
   :global(body) {

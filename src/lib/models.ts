@@ -43,6 +43,8 @@ export type Settings = {
   refine_model: string;
   // ASR 精修 API 密钥
   refine_api_key: string;
+  // 首启引导已完成(欢迎层走完或模型已就绪时静默补 true)
+  onboarded: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
