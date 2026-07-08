@@ -193,12 +193,12 @@
     <button
       class="vtab"
       class:active={tab === "notes"}
-      onclick={() => { if (tab !== "notes") goto("/"); }}>我的录音</button
+      onclick={() => { if (tab !== "notes") goto("/"); }}>录音</button
     >
     <button
       class="vtab"
       class:active={tab === "people"}
-      onclick={() => { if (tab !== "people") goto("/speakers"); }}>我的会议搭子</button
+      onclick={() => { if (tab !== "people") goto("/speakers"); }}>会议搭子</button
     >
   </nav>
 

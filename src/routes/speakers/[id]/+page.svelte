@@ -163,8 +163,8 @@
     <!-- 首拉中不闪"不存在" -->
   {:else if !person}
     <div class="empty">
-      <p>这个人不在「我的会议搭子」里。</p>
-      <p class="hint">可能已被合并或删除。<a href="/speakers">回到我的会议搭子</a></p>
+      <p>这个人不在「会议搭子」里。</p>
+      <p class="hint">可能已被合并或删除。<a href="/speakers">回到会议搭子</a></p>
     </div>
   {:else}
     <header class="head">
