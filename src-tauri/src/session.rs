@@ -1469,8 +1469,8 @@ mod asr_worker_tests {
         // 两段文本(均由 CountingRecognizer 按长度生成)恰好相似("len=32000" 相同)，
         // 时间戳特意拉开(> ECHO_WINDOW_MS 且不交叠)以隔离本用例(测说话人聚类)与
         // 回声去重逻辑,避免被误判丢弃。
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 10000, end_ms: 12000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 44800], start_ms: 0, end_ms: 2800 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 44800], start_ms: 10000, end_ms: 12800 }).unwrap();
         drop(tx);
 
         let embedder = MockEmbedder::new(vec![
@@ -1505,8 +1505,8 @@ mod asr_worker_tests {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
         // 同一说话人两段，不同 source（两次同向量 → 都归入 S1，sources 从 {mic} 增长到 {mic,system}）。
         // 时间戳拉开(> ECHO_WINDOW_MS 且不交叠)，隔离本用例与回声去重逻辑。
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
-        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 32000], start_ms: 10000, end_ms: 12000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 44800], start_ms: 0, end_ms: 2800 }).unwrap();
+        tx.send(FinalJob { source: Source::System, samples: vec![0.1; 44800], start_ms: 10000, end_ms: 12800 }).unwrap();
         drop(tx);
 
         let embedder = MockEmbedder::new(vec![
@@ -1542,7 +1542,7 @@ mod asr_worker_tests {
     #[test]
     fn embed_failure_degrades_to_null_speaker() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 44800], start_ms: 0, end_ms: 2800 }).unwrap();
         drop(tx);
         let embedder = MockEmbedder::new(vec![Err(anyhow::anyhow!("boom"))]);
         let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
@@ -1565,7 +1565,7 @@ mod asr_worker_tests {
     #[test]
     fn no_embedder_all_speakers_null() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 44800], start_ms: 0, end_ms: 2800 }).unwrap();
         drop(tx);
         let finals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         let f2 = finals.clone();
@@ -1588,7 +1588,7 @@ mod asr_worker_tests {
     #[test]
     fn worker_emits_snapshot_exactly_once_at_end_after_other_diar_events() {
         let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
-        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 32000], start_ms: 0, end_ms: 2000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.1; 44800], start_ms: 0, end_ms: 2800 }).unwrap();
         drop(tx);
 
         let embedder = MockEmbedder::new(vec![Ok(vec![1.0, 0.0, 0.0])]);
@@ -1614,10 +1614,10 @@ mod asr_worker_tests {
             DiarEvent::Snapshot { snaps, samples } => {
                 assert_eq!(snaps.len(), 1);
                 assert_eq!(snaps[0].id, "S1");
-                // 样本随 Snapshot 导出:该簇唯一一段(32000 样本 > 15s 上限截断到上限)。
+                // 样本随 Snapshot 导出:该簇唯一一段(44800 样本,超 15s 上限则截断)。
                 assert_eq!(samples.len(), 1);
                 assert_eq!(samples[0].0, "S1");
-                assert_eq!(samples[0].1.len(), 32000.min(super::SPEAKER_SAMPLE_CAP));
+                assert_eq!(samples[0].1.len(), 44800.min(super::SPEAKER_SAMPLE_CAP));
             }
             _ => unreachable!(),
         }

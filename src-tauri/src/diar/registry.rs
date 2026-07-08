@@ -9,8 +9,21 @@ use std::collections::BTreeSet;
 pub const ASSIGN_THRESHOLD: f32 = 0.62;
 /// 簇间合并阈值(余弦,高于归簇阈值防过度合并)。首轮真实会议校准(10+人短句场景)调整:原 0.68 下触发过度合并。
 pub const MERGE_THRESHOLD: f32 = 0.74;
-/// 低于此样本数(16kHz)的段不允许新建簇(短段声纹不可靠)。首轮真实会议校准(10+人短句场景)调整:原 16000(1.0s) 下 0.9s 真句子被拦截。
-pub const MIN_NEW_CLUSTER_SAMPLES: usize = 9600; // 0.6s
+/// 低于此样本数(16kHz)的段不允许新建簇(短段声纹不可靠)。二轮校准(2026-07-08,
+/// 用户实锤三场会议在线 17/54/108 簇、单段簇占比 65%+,精修后收敛 2/8 人):
+/// 0.6s 太松,短段嵌入落在灰区就开新簇是单段簇的主因;提到 2.5s 与精修管线的
+/// 短段判定(refine SHORT_MS)对齐——不足 2.5s 的段走软归属或留空,绝不开簇。
+/// (历史:1.0s 首轮校准降到 0.6s 是因为拦了 0.9s 真句子——那个问题由软归属
+/// 兜住:真句子仍拿到最近簇的标签,只是无权开簇。)
+pub const MIN_NEW_CLUSTER_SAMPLES: usize = 40_000; // 2.5s
+/// 低于此样本数(16kHz)的段不参与质心更新(短段声纹噪声大,防拖歪质心)。
+/// 维持首轮校准的 0.6s:质心更新的容错比建簇高(running mean 稀释单段噪声)。
+pub const MIN_CENTROID_UPDATE_SAMPLES: usize = 9600; // 0.6s
+/// 软归属下限(余弦):相似度落在 [SOFT_ASSIGN_THRESHOLD, ASSIGN_THRESHOLD) 灰区的段,
+/// 归入最近的普通簇(打标签但不更新质心/计数,防弱证据污染),而非开新簇——近场 mic
+/// 同人嵌入散布 0.4~0.67(2026-07-06 校准记录),灰区裂簇是同人多簇的主因。
+/// 种子簇不参与软归属:弱证据错认領人名比碎片化更糟。
+pub const SOFT_ASSIGN_THRESHOLD: f32 = 0.45;
 /// 每 N 次 assign 做一次簇间合并检查。
 pub const MERGE_CHECK_INTERVAL: u64 = 8;
 /// 种子簇(已关联库人物)的归簇阈值,高于普通阈值。跨会议信道差异比同会议内大,
@@ -173,7 +186,7 @@ impl SpeakerRegistry {
         if let Some((_sim, cluster)) = best {
             cluster.sources.insert(source.to_string());
             // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
-            if num_samples >= MIN_NEW_CLUSTER_SAMPLES {
+            if num_samples >= MIN_CENTROID_UPDATE_SAMPLES {
                 // 质心 running mean(在单位向量上),再归一化
                 let n = cluster.count as f32;
                 for (ci, ui) in cluster.centroid.iter_mut().zip(&unit) {
@@ -188,8 +201,27 @@ impl SpeakerRegistry {
             return Some(cluster.id.clone());
         }
 
+        // 软归属:严格阈值未命中,但与某个**普通簇**(非种子)的相似度落在灰区
+        // [SOFT, ASSIGN) → 归入该簇打标签,不更新质心/计数/时长(弱证据不留痕:
+        // 不拖质心、不计入自动入库时长)。种子簇除外——弱证据错认领人名比碎片化更糟。
+        let soft = self
+            .clusters
+            .iter_mut()
+            .filter_map(|c| {
+                if c.is_seed() {
+                    return None;
+                }
+                let sim = dot(&c.centroid, &unit);
+                (sim >= SOFT_ASSIGN_THRESHOLD).then_some((sim, c))
+            })
+            .max_by(|(a, _), (b, _)| a.total_cmp(b));
+        if let Some((_sim, cluster)) = soft {
+            cluster.sources.insert(source.to_string());
+            return Some(cluster.id.clone());
+        }
+
         if num_samples < MIN_NEW_CLUSTER_SAMPLES {
-            return None; // 短段不建簇
+            return None; // 短段不建簇(也够不着任何软归属 → 留空,精修兜底)
         }
         let id = format!("S{}", self.next_id);
         self.next_id += 1;
@@ -427,7 +459,7 @@ mod tests {
     fn v(x: f32, y: f32, z: f32) -> Vec<f32> {
         vec![x, y, z]
     }
-    const LONG: usize = 32000; // 2s,足以建簇
+    const LONG: usize = 48000; // 3s,足以建簇(≥ MIN_NEW_CLUSTER_SAMPLES 2.5s)
 
     #[test]
     fn first_assign_creates_s1() {
@@ -437,6 +469,56 @@ mod tests {
         assert_eq!(sp.len(), 1);
         assert_eq!(sp[0].id, "S1");
         assert!(sp[0].sources.contains("mic"));
+    }
+
+    /// 二轮校准(2026-07-08)核心行为:灰区 [SOFT, ASSIGN) 软归属最近普通簇,
+    /// 不建簇、不拖质心;低于 SOFT 且够长才建簇;短段(<2.5s)永远无权建簇。
+    #[test]
+    fn gray_zone_soft_assigns_without_touching_centroid() {
+        let mut r = SpeakerRegistry::new();
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1
+        // 余弦 0.5(灰区):软归属 S1,不开新簇
+        let y = (1.0f32 - 0.25).sqrt();
+        assert_eq!(r.assign(&v(0.5, y, 0.0), "system", LONG), Some("S1".into()));
+        assert_eq!(r.speakers().len(), 1, "灰区不得开新簇");
+        assert!(r.speakers()[0].sources.contains("system"), "软归属应记录来源");
+        // 质心未被拖动:snapshot 的 count/total_ms 均不含软归属段
+        let snap = r.snapshot();
+        assert_eq!(snap[0].count, 1, "软归属不更新计数");
+        assert_eq!(snap[0].total_ms, 3000, "软归属不累计时长(不影响自动入库门槛)");
+        // 质心仍是 (1,0,0):正交向量余弦 0 < SOFT → 长段建新簇
+        assert_eq!(r.assign(&v(0.0, 0.0, 1.0), "mic", LONG), Some("S2".into()));
+    }
+
+    #[test]
+    fn short_segment_soft_assigns_but_never_creates_cluster() {
+        let mut r = SpeakerRegistry::new();
+        // 短段(1s)在空表上:无簇可归 → None(留空,精修兜底),绝不建簇
+        assert_eq!(r.assign(&v(1.0, 0.0, 0.0), "mic", 16000), None);
+        assert_eq!(r.speakers().len(), 0);
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1
+        // 短段灰区(余弦 0.5)→ 软归属 S1
+        let y = (1.0f32 - 0.25).sqrt();
+        assert_eq!(r.assign(&v(0.5, y, 0.0), "mic", 16000), Some("S1".into()));
+        // 中段(1s,不足 2.5s)即使与所有簇正交也无权建簇 → None
+        assert_eq!(r.assign(&v(0.0, 0.0, 1.0), "mic", 16000), None);
+        assert_eq!(r.speakers().len(), 1);
+    }
+
+    #[test]
+    fn seed_cluster_excluded_from_soft_assign() {
+        let seeds = vec![SeedCluster {
+            person: "P1".into(),
+            name: "甲".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 5,
+        }];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        // 与种子余弦 0.5(灰区):不得软归属领走人名 → 长段落地为新普通簇
+        let y = (1.0f32 - 0.25).sqrt();
+        let id = r.assign(&v(0.5, y, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person, None, "灰区弱证据不得认领种子人物");
     }
 
     #[test]
@@ -731,10 +813,12 @@ mod tests {
     #[test]
     fn total_ms_accumulates_only_on_long_segments() {
         let mut r = SpeakerRegistry::new();
-        r.assign(&v(1.0, 0.0, 0.0), "mic", 32000).unwrap(); // 2s
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // 3s
         r.assign(&v(1.0, 0.0, 0.0), "mic", 4800).unwrap(); // 0.3s 短段不计
+        // 中段(0.6s~2.5s):可更新质心与时长,但无权建簇(见 assign 的双门槛)。
+        r.assign(&v(1.0, 0.0, 0.0), "mic", 16000).unwrap(); // 1s
         let snap = r.snapshot();
-        assert_eq!(snap[0].total_ms, 2000);
+        assert_eq!(snap[0].total_ms, 3000 + 1000);
     }
 
     /// 终审 triage①锁死判别式:sources 为空 ⇔ 未命中的种子簇。两个种子(甲/乙)注入,
@@ -778,14 +862,14 @@ mod tests {
     #[test]
     fn enroll_candidates_filters_by_person_centroid_sources_and_ms() {
         let mut r = SpeakerRegistry::new();
-        // S1: 32000 样本 = 2000ms 长段。
+        // S1: 48000 样本 = 3000ms 长段。
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
-        assert!(r.enroll_candidates(3000).is_empty(), "累计 2000ms < 3000ms 不够料");
-        let c = r.enroll_candidates(2000);
+        assert!(r.enroll_candidates(4000).is_empty(), "累计 3000ms < 4000ms 不够料");
+        let c = r.enroll_candidates(3000);
         assert_eq!(c.len(), 1, "达到门槛应导出候选");
         assert_eq!(c[0].id, "S1");
         assert_eq!(c[0].person, None);
-        assert_eq!(c[0].total_ms, 2000);
+        assert_eq!(c[0].total_ms, 3000);
 
         // 已关联 person 的簇不再是候选。
         r.mark_enrolled("S1", "P7");
@@ -825,7 +909,7 @@ mod tests {
     #[test]
     fn mark_enrolled_sets_person_and_snapshot_exports_only_increments() {
         let mut r = SpeakerRegistry::new();
-        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // count=1, 2000ms
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // count=1, 3000ms
         r.mark_enrolled("S1", "P3");
         let info = &r.speakers()[0];
         assert_eq!(info.person.as_deref(), Some("P3"));
@@ -834,7 +918,7 @@ mod tests {
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let snap = r.snapshot();
         assert_eq!(snap[0].count, 1, "count 只报入库后增量(入库前 1 条已上报)");
-        assert_eq!(snap[0].total_ms, 2000, "total_ms 只报入库后增量");
+        assert_eq!(snap[0].total_ms, 3000, "total_ms 只报入库后增量");
         assert_eq!(snap[0].person.as_deref(), Some("P3"));
     }
 
@@ -885,8 +969,8 @@ mod tests {
     #[test]
     fn merge_sums_reported_ms_and_stop_snapshot_stays_incremental() {
         let mut r = SpeakerRegistry::new();
-        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1 2000ms
-        r.mark_enrolled("S1", "P1"); // 报掉 2000ms
+        r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1 3000ms
+        r.mark_enrolled("S1", "P1"); // 报掉 3000ms
         // S2 无主,与 S1 相向漂移后合并(S1 已入库,S2 并入)。
         r.assign(&v(0.30, 0.954, 0.0), "mic", LONG).unwrap(); // S2 2000ms
         for k in 1..=10 {
@@ -902,8 +986,8 @@ mod tests {
         assert_eq!(r.speakers().len(), 1);
         assert_eq!(r.speakers()[0].person.as_deref(), Some("P1"), "person 随合并保留");
         let snap = r.snapshot();
-        // 全部长段 24 条 × 2000ms = 48000ms,入库时已报 2000ms → 增量 46000ms。
-        assert_eq!(snap[0].total_ms, 46000, "合并后 reported_ms 基数保留,导出仍是净增量");
+        // 全部长段 24 条 × 3000ms = 72000ms,入库时已报 3000ms → 增量 69000ms。
+        assert_eq!(snap[0].total_ms, 69000, "合并后 reported_ms 基数保留,导出仍是净增量");
     }
 
     #[test]

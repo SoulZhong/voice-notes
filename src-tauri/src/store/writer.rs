@@ -1151,7 +1151,7 @@ mod tests {
             v[0] = 1.0;
             v
         };
-        let id = registry.assign(&long, "mic", 32000 /* 2s，够长建簇 */);
+        let id = registry.assign(&long, "mic", 48000 /* 3s，够长建簇 */);
         assert_eq!(id, Some("S3".into()), "新说话人编号应续接旧笔记的最大 id，不撞旧 id");
     }
 
