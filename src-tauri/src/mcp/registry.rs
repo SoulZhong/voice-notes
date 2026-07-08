@@ -238,6 +238,39 @@ impl Registry {
 
 /// 写前把现有文件备份为 `<file>.vn.bak`(覆盖旧备份),再 tmp+rename 原子写。
 /// 父目录不存在则创建(如 .cursor/mcp.json 首次注册)。
+///
+/// 权限位保留:这些配置文件(如 ~/.claude.json)可能含 token,用户可能已
+/// `chmod 600` 收紧过权限。tmp 文件是新建的,权限由 umask 决定(通常 0644),
+/// 若直接 rename 覆盖,会静默把用户收紧过的权限重置成默认权限——启动自愈
+/// (heal)会在用户毫无察觉的情况下触发这个问题。因此:原文件存在时,写完
+/// tmp 后、rename 前把原文件的 mode 应用到 tmp 文件。
+/// `.vn.bak` 副本无需额外处理:`fs::copy` 本身就会保留源文件的权限位
+/// (标准库文档:目标文件的权限与源文件一致),不是仅拷贝内容。
+#[cfg(unix)]
+fn write_with_backup(path: &Path, content: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing_mode = std::fs::metadata(path).ok().map(|m| m.permissions().mode());
+    if path.exists() {
+        let mut bak = path.as_os_str().to_owned();
+        bak.push(".vn.bak");
+        std::fs::copy(path, PathBuf::from(&bak))?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".vn.tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, content)?;
+    if let Some(mode) = existing_mode {
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn write_with_backup(path: &Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -306,6 +339,23 @@ mod tests {
         assert_eq!(v["theme"], "dark", "无关顶层键保留");
         assert_eq!(v["mcpServers"]["other"]["command"], "/bin/x", "别人的 server 条目保留");
         assert!(v["mcpServers"]["voice-notes"].is_object());
+    }
+
+    /// 权限位保留回归:用户可能已把含 token 的配置文件 chmod 600,注册/自愈不得
+    /// 把权限重置成 umask 默认(0644)。
+    #[test]
+    fn register_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let r = reg(tmp.path());
+        r.register("claude-code").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "注册后原文件权限位保留");
+        let bak_mode = std::fs::metadata(tmp.path().join(".claude.json.vn.bak")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(bak_mode, 0o600, ".vn.bak 副本权限位随 fs::copy 保留");
     }
 
     #[test]

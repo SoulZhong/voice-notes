@@ -39,14 +39,25 @@ pub fn list_notes(
         .filter(|n| to.map(|t| n.started_at.as_str() <= t).unwrap_or(true))
         .collect();
     let total = filtered.len();
+    // speaker_count/has_refined 需要探目录(speakers.json/refined.json 是否存在/可解析)。
+    // 只对分页后、真正要返回的这一页做探测,不对全量 filtered 做——大库(数百场笔记)
+    // 分页浏览时不会因为这两个字段整体变慢。
     let page: Vec<_> = filtered
         .into_iter()
         .skip(offset)
         .take(limit.clamp(1, 100))
         .map(|n| {
+            let dir = notes_dir(roots).join(&n.id);
+            let speaker_count = std::fs::read_to_string(dir.join("speakers.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<BTreeMap<String, SpeakerMeta>>(&text).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let has_refined = dir.join("refined.json").exists();
             serde_json::json!({
                 "id": n.id, "title": n.title, "started_at": n.started_at,
                 "duration_secs": n.duration_secs, "state": n.state,
+                "speaker_count": speaker_count, "has_refined": has_refined,
             })
         })
         .collect();
@@ -231,9 +242,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture_note(tmp.path(), "20260101-100000", "一月会", "2026-01-01T10:00:00+08:00", &[("S1", "a", 0)]);
         fixture_note(tmp.path(), "20260301-100000", "三月会", "2026-03-01T10:00:00+08:00", &[("S1", "b", 0)]);
+        // 三月会补一份精修稿:断言 has_refined 能区分有/无。
+        store::write_refined_atomic(
+            &tmp.path().join("notes/20260301-100000"),
+            &store::RefinedDoc {
+                schema_version: 1,
+                generated_at: "2026-03-01T11:00:00+08:00".into(),
+                llm_model: None,
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+                discarded_seqs: vec![],
+                paragraphs: vec![store::RefinedParagraph {
+                    speaker: "S1".into(),
+                    name: Some("张三".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "精修句".into(),
+                    source_seqs: vec![0],
+                }],
+            },
+        )
+        .unwrap();
         let v = list_notes(&roots(tmp.path()), 10, 0, None, None);
         assert_eq!(v["notes"].as_array().unwrap().len(), 2);
         assert_eq!(v["notes"][0]["title"], "三月会", "倒序:新的在前");
+        assert_eq!(v["notes"][0]["speaker_count"], 1, "fixture 只登记了 S1/张三 一人");
+        assert_eq!(v["notes"][0]["has_refined"], true, "三月会已落精修稿");
+        assert_eq!(v["notes"][1]["title"], "一月会");
+        assert_eq!(v["notes"][1]["speaker_count"], 1);
+        assert_eq!(v["notes"][1]["has_refined"], false, "一月会无精修稿");
         let v = list_notes(&roots(tmp.path()), 10, 0, Some("2026-02-01"), None);
         assert_eq!(v["notes"].as_array().unwrap().len(), 1);
         assert_eq!(v["notes"][0]["id"], "20260301-100000");
