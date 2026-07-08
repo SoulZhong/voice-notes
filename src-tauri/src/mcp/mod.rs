@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 pub mod registry;
+pub mod server;
 pub mod tools;
 
 /// 无 tauri 环境下的 app_data_dir。identifier 与 tauri.conf.json 保持一致——
@@ -23,10 +24,7 @@ pub fn app_data_dir() -> PathBuf {
 pub fn cli_main(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
     match sub {
-        "serve" => {
-            eprintln!("mcp serve: 尚未实现");
-            1
-        }
+        "serve" => server::serve_stdio(),
         "register" | "unregister" | "status" => run_registry_cli(sub, &args[1..]),
         _ => {
             eprintln!(
