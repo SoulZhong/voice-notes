@@ -11,6 +11,7 @@ mod store;
 mod tray;
 pub mod diar;
 mod refine;
+pub mod mcp;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1197,8 +1198,10 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
     }
 }
 
-#[tauri::command]
-fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 暂停共用实现(命令壳、UDS 桥共用)。逐语句搬自原 pause_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取(与 `State<AppState>` 注入等价)——逻辑零变化。
+fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
         let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
@@ -1220,7 +1223,15 @@ fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn pause_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("pause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_pause_recording(&app)
+}
+
+/// 续录共用实现(命令壳、UDS 桥共用)。逐语句搬自原 unpause_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取(与 `State<AppState>` 注入等价)——逻辑零变化。
+fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
         let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
@@ -1237,6 +1248,12 @@ fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), Strin
     };
     let _ = app.emit("status", ev);
     Ok(())
+}
+
+#[tauri::command]
+fn unpause_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("unpause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_resume_recording(&app)
 }
 
 #[tauri::command]
@@ -1610,6 +1627,51 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
         return Err("录制中不能删除说话人".into());
     }
     open_voiceprint_store(&app)?.delete(&id).map_err(|e| e.to_string())
+}
+
+// —— MCP 注册(设置页/欢迎页消费;registry 真值源是各 Agent 配置文件) ——
+
+#[derive(serde::Serialize)]
+struct RegisterOutcome {
+    key: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+/// 启动自愈修复的条目数,设置页读一次并展示提示条。AtomicU32 而非事件:setup 时
+/// 前端尚未挂监听,事件会丢。
+static MCP_HEALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[tauri::command]
+fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> {
+    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
+}
+
+#[tauri::command]
+fn mcp_register(agents: Vec<String>) -> Result<Vec<RegisterOutcome>, String> {
+    let reg = mcp::registry::Registry::new().map_err(|e| e.to_string())?;
+    Ok(agents
+        .into_iter()
+        .map(|key| match reg.register(&key) {
+            Ok(()) => RegisterOutcome { key, ok: true, error: None },
+            Err(e) => RegisterOutcome { key, ok: false, error: Some(e.to_string()) },
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn mcp_unregister(agent: String) -> Result<(), String> {
+    mcp::registry::Registry::new().map_err(|e| e.to_string())?.unregister(&agent).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn mcp_manual_snippet() -> Result<String, String> {
+    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
+}
+
+#[tauri::command]
+fn mcp_healed_count() -> u32 {
+    MCP_HEALED.swap(0, Ordering::SeqCst) // 读即清:提示只出一次
 }
 
 /// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
@@ -2206,6 +2268,19 @@ pub fn run() {
             }
             // 菜单栏托盘：tray_enabled 时建（内部读设置判定）。增值层，一切失败只降级。
             tray::setup(&handle);
+            // MCP 注册路径自愈:App 被移动/换装后,各 Agent 配置里的 command 指向旧路径,
+            // Agent spawn 会失败。启动时静默改正;开发态二进制(target/)在 heal 内部跳过。
+            std::thread::spawn(|| {
+                if let Ok(reg) = mcp::registry::Registry::new() {
+                    if let Ok(n) = reg.heal() {
+                        if n > 0 {
+                            MCP_HEALED.store(n, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+            // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
+            mcp::uds::spawn_listener(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2244,7 +2319,12 @@ pub fn run() {
             list_people,
             rename_person,
             merge_person,
-            delete_person
+            delete_person,
+            mcp_agents_status,
+            mcp_register,
+            mcp_unregister,
+            mcp_manual_snippet,
+            mcp_healed_count
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

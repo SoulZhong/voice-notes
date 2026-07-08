@@ -118,6 +118,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **input**:`surface-press` 底、无边、radius-md;聚焦换 `canvas` 底 + `accent` 1px 环(box-shadow `0 0 0 1px`)。侧栏过滤框同款内嵌式。
 - **list-row**(笔记列表 / 说话人列表):透明底、行间 1px `hairline` 分隔;hover `surface-soft`;选中 / 活动 `surface-press`;整行可点。操作按钮 hover 显影。
 - **settings-row**(设置页,macOS 系统设置式):`surface` 卡片承载多行,行间 1px `hairline`;每行=左「标题(0.92rem `ink`)+一行大白话说明(0.8rem `ink-secondary`)」右控件;纯开关行整行可点(label);行级按钮 hover 显影。说明文案禁术语,一行说清。
+- **AI 助手接入**(设置页分组,settings-row 卡片内):Agent 列表逐行——row-label 是名字,row-desc 是状态(未检测到安装/未注册/已注册/已注册(路径已由自愈修复或待修复)),行尾 `button-secondary`(注册/移除)按钮;下方「允许 AI 控制录制」toggle 行(纯开关行,整行可点);再下「手动配置」折叠卡——`button-secondary` 展开/收起,展开后 `.snippet` 等宽代码块(JSON 片段)+ `button-secondary`「复制」按钮。
 - **segmented**(分段选择,设置行内多选一):`surface-press` 槽(radius-md、2px 内距),选中项 `canvas` 底浮起 + `shadow-btn`,未选中 `ink-secondary` 字 hover 变 `ink`;radio 视觉隐藏。用于外观主题/识别引擎等 2-4 项互斥选择。
 - **sidebar**:`surface` 底、右侧 1px `hairline`;条目 radius-md,hover `surface-soft`,当前页 `surface-press` + `ink` 加重;行级操作悬停显影;行间不画分隔线(靠间距与 hover)。录制按钮见上;过滤框内嵌式(`surface-press` 底、无边,聚焦浮出 `canvas` 底 + accent 环)。
 - **状态行**:辅助状态文字降为 caption 级 `ink-faint`,前缀 7px 状态点(活跃 `record`,空闲 `ink-faint`)。空态文案在容器内居中,不左对齐孤行。
@@ -131,7 +132,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **waveform-live**(录制实时音轨,兼任电平表):2px 细条自右缘进入左移滚动(120ms 采样、保留约 29s),条色 `record`(录制中是唯一常驻彩色信号的延伸),暂停冻结退 `ink-faint`;空闲时容器空置占位保行高。
 - **transport**(控制行,录音机式):录音/播放控制整合一行——笔记页 `[▶ 播放/暂停][轨道开关][时间][waveform-track][总时长][⏺]`(轨道开关=双轨笔记才出现的「麦克风/系统声」文字胶囊,点击静音该轨:静音态划线退 `ink-faint` 虚线边;串音笔记静掉一轨即无回音)(行尾续录键=圆形纯红点录音键,圆环+12px `record` 点,禁用点退 `ink-faint`;「图标必带文字」原则的**用户拍板特例**——录音红点是录音机通识符号,加文字反而挤占音轨,以 title/aria 兜底),录制页 `[控制钮组][waveform-live][计时]`;其余动作按钮一律图标+文字(纯图标看不出功能,冒烟反馈)。
 - **download-card**:`surface` 底 radius-xl(大卡);compact 提示条改用 banner 形态(warning 色系)。
-- **welcome-overlay**(首启引导):`canvas` 底全屏覆盖(z-index 置顶),居中 30rem 面板。品牌记号=录制按钮同构「primary 药丸 + 14px `record` 红点」;标题下一句话简介(`ink-secondary`);下载流整体复用 download-card(主按钮文案换「开始使用」),不另造进度 UI;权限预告两行 caption 级 `ink-faint`;右下「高级设置 →」文字链接(`ink-secondary`,hover `ink` + `surface-soft`)为唯一逃生口。仅当未 onboarded 且识别模型未就绪时出现;下载完成自动进录制页。
+- **welcome-overlay**(首启引导):`canvas` 底全屏覆盖(z-index 置顶),居中 30rem 面板。品牌记号=录制按钮同构「primary 药丸 + 14px `record` 红点」;标题下一句话简介(`ink-secondary`);下载流整体复用 download-card(主按钮文案换「开始使用」),不另造进度 UI;权限预告两行 caption 级 `ink-faint`;右下「高级设置 →」文字链接(`ink-secondary`,hover `ink` + `surface-soft`)为唯一逃生口。仅当未 onboarded 且识别模型未就绪时出现;下载完成后若检测到本机已装 Agent,先进「连接 AI 助手」步(勾选列表默认全选,可跳过),完成/跳过后再进录制页;未检测到任何 Agent 时直接进录制页。
 - **timer / meter**:计时数字用等宽数字(`font-variant-numeric: tabular-nums`)、`ink-secondary`;暂停态 `ink-faint`。电平表轨 `hairline`、填充 `success`、radius-full。
 - **editable-text**(段落 / 标题 / 名字):静态时无边;hover `accent-tint` 底 + radius-sm;focus `accent` 2px outline。已命名说话人的改名角标(线性 SVG,非 Unicode)`ink-faint`,hover 变 `accent`。
 

@@ -71,6 +71,13 @@ pub struct Settings {
     /// 不会对老用户弹引导。
     #[serde(default)]
     pub onboarded: bool,
+    /// 允许 MCP(AI 助手)控制录制(start/stop/pause/resume)。默认关:开录是隐私
+    /// 敏感操作,必须用户显式授权。
+    #[serde(default)]
+    pub mcp_allow_control: bool,
+    /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
+    #[serde(default)]
+    pub mcp_onboarded: bool,
 }
 
 fn default_prefix() -> String {
@@ -117,6 +124,8 @@ impl Default for Settings {
             refine_model: String::new(),
             refine_api_key: String::new(),
             onboarded: false,
+            mcp_allow_control: false,
+            mcp_onboarded: false,
         }
     }
 }
@@ -296,5 +305,18 @@ mod tests {
         let s = load(dir.path());
         assert_eq!(s.asr_model, "whisper");
         assert!(!s.refine_enabled);
+    }
+
+    #[test]
+    fn mcp_fields_default_off_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"asr_model":"whisper"}"#).unwrap();
+        let s = load(tmp.path());
+        assert!(!s.mcp_allow_control, "控制录制默认关(隐私敏感)");
+        assert!(!s.mcp_onboarded);
+        let s = Settings { mcp_allow_control: true, mcp_onboarded: true, ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        let got = load(tmp.path());
+        assert!(got.mcp_allow_control && got.mcp_onboarded);
     }
 }

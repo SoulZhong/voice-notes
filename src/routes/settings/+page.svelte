@@ -23,6 +23,8 @@
     type ModelDownloadEvent,
     type MigrateEvent,
   } from "$lib/models";
+  import { mcpAgentsStatus, mcpRegister, mcpUnregister, mcpManualSnippet, mcpHealedCount, type AgentStatus } from "$lib/mcp";
+  import { openUrl } from "@tauri-apps/plugin-opener";
 
   let settings = $state<Settings | null>(null);
   let status = $state<ModelsStatus | null>(null);
@@ -69,6 +71,15 @@
     { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   ];
+
+  // —— MCP(AI 助手接入):列表现扫现示,注册/移除后重拉;真值源是 Agent 配置文件 ——
+  let mcpAgents = $state<AgentStatus[]>([]);
+  let mcpAllowControl = $state(false);
+  let mcpSnippet = $state("");
+  let mcpSnippetOpen = $state(false);
+  let mcpHealed = $state(0);
+  let mcpBusy = $state<string | null>(null); // 正在操作的 agent key,防连点
+  let mcpError = $state("");
 
   /** 磁盘:录音音频占用字节(null=统计中);清理展开态与选项;上次释放量文案。 */
   let audioBytes = $state<number | null>(null);
@@ -139,6 +150,7 @@
     refineBaseUrl = s.refine_base_url;
     refineModel = s.refine_model;
     refineKey = s.refine_api_key;
+    mcpAllowControl = s.mcp_allow_control;
   }
 
   async function refreshDiskUsage() {
@@ -209,6 +221,9 @@
     refreshSettings();
     refreshStatus();
     refreshDiskUsage();
+    refreshMcp();
+    mcpManualSnippet().then((s) => (mcpSnippet = s)).catch(() => {});
+    mcpHealedCount().then((n) => (mcpHealed = n)).catch(() => {});
     // 开机自启读系统真值(与 settings 无关);失败静默,保持未勾选。
     isEnabled()
       .then((v) => (autostartEnabled = v))
@@ -412,6 +427,61 @@
       s.refine_model = refineModel.trim();
       s.refine_api_key = refineKey.trim();
     });
+  }
+
+  // —— MCP(AI 助手接入)——
+  async function refreshMcp() {
+    try {
+      mcpAgents = await mcpAgentsStatus();
+    } catch (e) {
+      mcpError = String(e);
+    }
+  }
+
+  async function mcpToggleRegister(a: AgentStatus) {
+    mcpBusy = a.key;
+    mcpError = "";
+    try {
+      if (a.registered) {
+        await mcpUnregister(a.key);
+      } else {
+        const [r] = await mcpRegister([a.key]);
+        if (r && !r.ok) mcpError = `${a.name}: ${r.error ?? "注册失败"}`;
+      }
+      // refreshMcp 也在 try 内:按钮解禁必须等列表真正刷新完成,否则刷新期间
+      // 有一个窄窗口按钮已可点,连点可能撞上刷新中的旧数据。
+      await refreshMcp();
+    } catch (e) {
+      mcpError = String(e);
+    } finally {
+      // finally 保证复位:即使 refreshMcp reject,按钮也不会永久禁用。
+      mcpBusy = null;
+    }
+  }
+
+  /** 手动配置片段复制。剪贴板权限被拒/不可用时静默失败会让用户以为复制成功却粘贴出空内容——
+   *  失败时改提示手动选择文本;成功不额外提示(与现状一致)。 */
+  async function copyMcpSnippet() {
+    try {
+      await navigator.clipboard.writeText(mcpSnippet);
+    } catch {
+      mcpError = "复制失败,请展开后手动选择文本复制";
+    }
+  }
+
+  async function openMcpReadme() {
+    await openUrl("https://github.com/SoulZhong/voice-notes#%E6%8E%A5%E5%85%A5-ai-%E5%8A%A9%E6%89%8B%EF%BC%88mcp%EF%BC%89");
+  }
+
+  async function saveMcpAllowControl() {
+    if (!settings) return;
+    const next = { ...settings, mcp_allow_control: mcpAllowControl };
+    try {
+      await setSettings(next);
+      settings = next;
+    } catch {
+      if (settings) mcpAllowControl = settings.mcp_allow_control; // 失败回弹
+    }
   }
 
   // —— 镜像加速(逻辑照搬 ModelDownloadCard)——
@@ -701,6 +771,63 @@
           {/if}
         </div>
       {/if}
+    </div>
+  </section>
+
+  <!-- —— AI 助手接入(MCP) —— -->
+  <section>
+    <h2 class="section-title">AI 助手接入</h2>
+    <div class="rows">
+      {#if mcpError}
+        <div class="banner warn">{mcpError}</div>
+      {/if}
+      {#each mcpAgents as a (a.key)}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">{a.name}</span>
+            <span class="row-desc">
+              {#if !a.installed && !a.registered}未检测到安装
+              {:else if a.stale}已注册(路径已由自愈修复或待修复)
+              {:else if a.registered}已注册
+              {:else}未注册{/if}
+            </span>
+          </div>
+          {#if a.installed || a.registered}
+            <button class="btn-secondary" disabled={mcpBusy === a.key} onclick={() => mcpToggleRegister(a)}>
+              {a.registered ? "移除" : "注册"}
+            </button>
+          {/if}
+        </div>
+      {/each}
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">允许 AI 控制录制</span>
+          <span class="row-desc">开启后,已接入的 AI 助手可远程开始/停止/暂停录制。默认关闭</span>
+        </div>
+        <input type="checkbox" class="ctl" bind:checked={mcpAllowControl} disabled={!settings} onchange={saveMcpAllowControl} />
+      </label>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">手动配置</span>
+          <span class="row-desc">未内置的 Agent(Windsurf/Cline 等)把左侧片段加进其 MCP 配置即可</span>
+        </div>
+        <button class="btn-secondary" onclick={() => (mcpSnippetOpen = !mcpSnippetOpen)}>
+          {mcpSnippetOpen ? "收起" : "查看"}
+        </button>
+      </div>
+      {#if mcpSnippetOpen}
+        <div class="config">
+          <pre class="snippet">{mcpSnippet}</pre>
+          <button class="btn-secondary" onclick={copyMcpSnippet}>复制</button>
+        </div>
+      {/if}
+      {#if mcpHealed > 0}
+        <p class="config-hint">应用位置变更:已自动更新 {mcpHealed} 个 AI 助手的注册路径。</p>
+      {/if}
+      <p class="config-hint">
+        笔记内容经 AI 助手检索后会进入其模型上下文;本应用自身不联网上传任何内容。
+        <button class="link" onclick={openMcpReadme}>详见 README</button>
+      </p>
     </div>
   </section>
 
@@ -1193,5 +1320,14 @@
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0;
+  }
+  .snippet {
+    margin: 0 0 0.5rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--surface-soft);
+    border-radius: var(--radius-sm);
+    font-size: 0.8rem;
+    overflow-x: auto;
+    user-select: text;
   }
 </style>
