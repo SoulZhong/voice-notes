@@ -239,7 +239,7 @@
           {/each}
         </div>
         <span class="card-hint">
-          听一段这个人的原声,确认声纹认的是谁。{#if person.sample_paths.length > 1}多份样本来自合并带入的不同条目,可逐份核对。{/if}
+          听一段这个人的原声,确认认对了人。{#if person.sample_paths.length > 1}多份样本来自合并带入的不同条目,可逐份核对。{/if}
         </span>
       {:else}
         <span class="card-hint">暂无录音样本:下次录到这个人并停止录制后会自动补上。</span>

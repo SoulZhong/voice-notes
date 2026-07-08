@@ -98,7 +98,7 @@ pub const ARTIFACTS: &[Artifact] = &[
     },
     Artifact {
         id: "speaker",
-        label: "声纹（说话人区分）",
+        label: "说话人区分",
         // 注意 URL 里 "recongition" 是上游 release 页的原始拼写，勿"修正"。
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
         kind: ArtifactKind::File,

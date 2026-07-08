@@ -228,7 +228,7 @@
     {/if}
 
     {#if recording.isLive && recording.diarization === "unavailable"}
-      <div class="banner">说话人区分不可用（声纹模型缺失）。转写与录音不受影响。</div>
+      <div class="banner">说话人区分不可用（相关模型未下载）。转写与录音不受影响。</div>
     {/if}
 
     {#if recording.storageDegraded}

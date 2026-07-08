@@ -82,7 +82,7 @@
 
 <div class="card" class:compact>
   {#if compact}
-    <span>说话人区分需补下声纹模型（约 {totalMb}MB）。</span>
+    <span>区分「谁在说话」还需补一个小模型（约 {totalMb}MB）。</span>
   {:else}
     <h2>下载语音模型</h2>
     <p class="desc">首次使用需下载识别模型（共约 {totalMb}MB），全程本地运行、不上传任何音频。</p>
