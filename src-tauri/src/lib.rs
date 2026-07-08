@@ -2279,6 +2279,8 @@ pub fn run() {
                     }
                 }
             });
+            // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
+            mcp::uds::spawn_listener(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
