@@ -159,11 +159,26 @@ impl Registry {
             .ok()?;
         if out.status.success() {
             Some(format!(
-                "警告: {} 带 com.apple.quarantine 隔离标记,Agent 可能无法启动它。\n请执行: xattr -dr com.apple.quarantine /Applications/voice-notes.app",
-                self.exe.display()
+                "警告: {} 带 com.apple.quarantine 隔离标记,Agent 可能无法启动它。\n请执行: xattr -dr com.apple.quarantine {}",
+                self.exe.display(),
+                self.quarantine_fix_target().display()
             ))
         } else {
             None
+        }
+    }
+
+    /// 从 exe 路径推导 xattr 修复命令应作用的目标。安装态 exe 路径形如
+    /// `/Applications/voice-notes.app/Contents/MacOS/voice-notes`——隔离标记
+    /// 是整个 bundle 一起打的,只对可执行文件本身 `xattr -dr` 清不掉 bundle 内
+    /// 其余资源上的标记,下次 Gatekeeper 校验可能又触发;因此要拼到 bundle
+    /// 根目录(`.../voice-notes.app`)。开发态(cargo 产物路径不含 `.app`)则
+    /// 没有 bundle 概念,直接作用于 exe 本身即可。
+    fn quarantine_fix_target(&self) -> PathBuf {
+        let s = self.exe.to_string_lossy();
+        match s.find(".app/") {
+            Some(idx) => PathBuf::from(&s[..idx + 4]),
+            None => self.exe.clone(),
         }
     }
 
@@ -294,6 +309,16 @@ mod tests {
 
     fn reg(home: &Path) -> Registry {
         Registry::with(home.to_path_buf(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"))
+    }
+
+    #[test]
+    fn entry_snippet_json_is_parseable_and_matches_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = reg(tmp.path());
+        let snippet = r.entry_snippet_json();
+        let v: serde_json::Value = serde_json::from_str(&snippet).expect("必须是合法 JSON");
+        assert_eq!(v["voice-notes"]["command"], "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
+        assert_eq!(v["voice-notes"]["args"], serde_json::json!(["mcp", "serve"]));
     }
 
     #[test]

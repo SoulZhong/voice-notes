@@ -67,12 +67,14 @@ pub fn list_notes(
 /// 全文检索:遍历全部笔记逐段子串匹配(大小写不敏感)。个人量级(百场×百句)
 /// 全扫毫秒级,不建索引(YAGNI,见设计文档 §三)。
 pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json::Value {
-    let store = NoteStore::new(notes_dir(roots));
+    // 命名为 notes_store 而非 store:后者会遮蔽本文件顶部 `use crate::store` 的
+    // 模块导入,函数体内若要用 `store::` 前缀访问模块级函数会撞名。
+    let notes_store = NoteStore::new(notes_dir(roots));
     let needle = query.to_lowercase();
     let mut hits = Vec::new();
     let mut scanned = 0usize;
-    'outer: for summary in store.list() {
-        let Ok(note) = store.load(&summary.id) else { continue };
+    'outer: for summary in notes_store.list() {
+        let Ok(note) = notes_store.load(&summary.id) else { continue };
         scanned += 1;
         for (i, seg) in note.segments.iter().enumerate() {
             if !seg.text.to_lowercase().contains(&needle) {
@@ -134,7 +136,9 @@ pub fn get_note(
             let was_refined = refined.is_some();
             let content = match refined {
                 Some(doc) => render_refined(&note.meta.title, &doc, format == "markdown"),
-                None => store.render(id, if format == "markdown" { "md" } else { "txt" })?,
+                // note 已在函数开头 load 过一次;render_loaded 直接渲染内存里的
+                // Note,避免 render(id, ..) 对同一笔记再触发一次磁盘 load。
+                None => store.render_loaded(&note, if format == "markdown" { "md" } else { "txt" })?,
             };
             Ok(serde_json::json!({
                 "id": note.meta.id, "title": note.meta.title,
@@ -337,6 +341,17 @@ mod tests {
         assert!(md["content"].as_str().unwrap().contains("精修句"));
         assert!(get_note(&roots(tmp.path()), "no-such", "segments", true).is_err());
         assert!(get_note(&roots(tmp.path()), "../evil", "segments", true).is_err(), "id 穿越防护");
+    }
+
+    #[test]
+    fn get_note_text_format_has_no_markdown_and_bogus_format_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_note(tmp.path(), "20260101-100000", "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "原始句", 0)]);
+        let txt = get_note(&roots(tmp.path()), "20260101-100000", "text", false).unwrap();
+        let content = txt["content"].as_str().unwrap();
+        assert!(content.contains("原始句"), "text 内容含原句: {content}");
+        assert!(!content.contains("# "), "text 格式不带 markdown 标题标记: {content}");
+        assert!(get_note(&roots(tmp.path()), "20260101-100000", "bogus", false).is_err(), "未知 format 报错");
     }
 
     #[test]

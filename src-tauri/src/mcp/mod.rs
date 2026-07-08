@@ -43,14 +43,18 @@ pub fn cli_main(args: &[String]) -> i32 {
 
 /// --agent X 解析:未给或 auto = 所有"已检测到安装"的家;显式指名不要求已安装
 /// (用户可能装在非常规位置,检测只是启发)。
-fn parse_agent(args: &[String]) -> Option<String> {
+/// 返回 `Err(())` 表示 `--agent` 悬空(有 flag 无值,如 `mcp register --agent`)——
+/// 这与「未给 flag」是完全不同的用户意图,若静默当 None 处理会被 auto 语义吞掉,
+/// 变成"注册到所有已检测到的家"这种危险的意外行为,因此必须让调用方能区分
+/// 两种情况并对悬空显式报错,而不是静默兜底。
+fn parse_agent(args: &[String]) -> Result<Option<String>, ()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--agent" {
-            return it.next().cloned();
+            return it.next().cloned().map(Some).ok_or(());
         }
     }
-    None
+    Ok(None)
 }
 
 fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
@@ -61,11 +65,11 @@ fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
-    let agent = parse_agent(args).unwrap_or_else(|| "auto".into());
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let json = args.iter().any(|a| a == "--json");
 
     if sub == "status" {
+        // status 不看 --agent,悬空与否都不影响它——不在此分支做悬空校验。
         let st = reg.status();
         if json {
             println!("{}", serde_json::to_string_pretty(&st).expect("Serialize 派生结构不会失败"));
@@ -86,6 +90,14 @@ fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
         return 0;
     }
 
+    let agent = match parse_agent(args) {
+        Ok(a) => a.unwrap_or_else(|| "auto".into()),
+        Err(()) => {
+            eprintln!("--agent 需要一个值(claude-code|claude-desktop|cursor|codex|gemini|auto)");
+            return 2;
+        }
+    };
+
     // register / unregister 的目标集合
     let targets: Vec<String> = if agent == "auto" {
         reg.status().into_iter().filter(|s| s.installed).map(|s| s.key).collect()
@@ -96,8 +108,11 @@ fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
         eprintln!("未检测到任何已安装的 Agent;可用 --agent 显式指定,或在 App 设置页复制手动配置。");
         return 1;
     }
-    if let Some(w) = reg.quarantine_warning() {
-        eprintln!("{w}");
+    // quarantine 提示只跟"即将 spawn 本程序"相关,unregister 不会 spawn,提示无意义。
+    if sub == "register" {
+        if let Some(w) = reg.quarantine_warning() {
+            eprintln!("{w}");
+        }
     }
     if dry_run {
         println!("将写入的条目:\n{}", reg.entry_snippet_json());
@@ -145,5 +160,12 @@ mod tests {
     fn cli_unknown_subcommand_exits_2() {
         assert_eq!(cli_main(&["nope".into()]), 2);
         assert_eq!(cli_main(&[]), 2);
+    }
+
+    #[test]
+    fn parse_agent_distinguishes_absent_present_and_dangling() {
+        assert_eq!(parse_agent(&[]), Ok(None), "未给 flag");
+        assert_eq!(parse_agent(&["--agent".into(), "cursor".into()]), Ok(Some("cursor".into())), "正常取值");
+        assert_eq!(parse_agent(&["--agent".into()]), Err(()), "悬空:有 flag 无值");
     }
 }
