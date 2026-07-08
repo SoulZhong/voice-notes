@@ -5,17 +5,39 @@ use std::path::PathBuf;
 impl NoteStore {
     /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
     pub fn export(&self, id: &str, format: &str) -> anyhow::Result<PathBuf> {
-        let note = self.load(id)?;
+        let content = self.render(id, format)?;
         let dir = self.note_dir(id)?;
-        let (name, content) = match format {
-            "md" => ("transcript.md", render_markdown(&note)),
-            "txt" => ("transcript.txt", render_text(&note)),
-            _ => anyhow::bail!("未知导出格式: {format}"),
+        let name = match format {
+            "md" => "transcript.md",
+            _ => "transcript.txt",
         };
         let path = dir.join(name);
         std::fs::write(&path, content)?;
         Ok(path)
     }
+
+    /// 渲染导出内容字符串(不落盘)。MCP get_note 与 export 共用同一渲染,防两处漂移。
+    pub fn render(&self, id: &str, format: &str) -> anyhow::Result<String> {
+        let note = self.load(id)?;
+        render_note(&note, format)
+    }
+
+    /// 渲染一个已经在内存里的 `Note`,跳过磁盘 load。给 MCP get_note 用——它
+    /// 自己已经 load 过同一笔记,再调 `render(id, ..)` 会对同一笔记二次磁盘读取。
+    /// export 模块本身是私有 `mod export;`,外部拿不到 `render_note`,所以在
+    /// NoteStore 上开一个转发方法。
+    pub fn render_loaded(&self, note: &Note, format: &str) -> anyhow::Result<String> {
+        render_note(note, format)
+    }
+}
+
+/// 渲染逻辑本体,供 `render`(先 load 再渲染)与 `render_loaded`(已有 Note,直接渲染)共用。
+pub(crate) fn render_note(note: &Note, format: &str) -> anyhow::Result<String> {
+    Ok(match format {
+        "md" => render_markdown(note),
+        "txt" => render_text(note),
+        _ => anyhow::bail!("未知导出格式: {format}"),
+    })
 }
 
 /// 毫秒 → hh:mm:ss。

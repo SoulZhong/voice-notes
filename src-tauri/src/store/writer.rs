@@ -310,6 +310,14 @@ impl NoteWriter {
         write_speakers_atomic(&self.dir, &self.speakers)
     }
 
+    /// 录制中改标题:唯一安全路径。rename_note 命令拒绝活动笔记(改盘会被 finalize
+    /// 的内存 meta 覆盖),MCP start_recording(title) 由 UDS handler 经 writer 走
+    /// 这里——内存与磁盘同步更新,finalize 自然保留。
+    pub fn set_title(&mut self, title: &str) -> anyhow::Result<()> {
+        self.meta.title = title.to_string();
+        write_meta_atomic(&self.dir, &self.meta)
+    }
+
     /// 合入 worker 结束时的质心快照(DiarEvent::Snapshot)：只 merge 质心/count/person 进
     /// 已有或新建表项，不落盘（由既有 finalize→persist_speakers 落）。
     /// 已有表项：只更新 centroid/count，不动 name/sources（sources 已由 sync_speakers 维护）；
@@ -739,6 +747,24 @@ mod tests {
         assert!(meta.ended_at.is_some());
         let lines = read_lines(&dir);
         assert_eq!(lines.len(), 2, "两段都应补写，一段不丢");
+    }
+
+    #[test]
+    fn set_title_persists_and_survives_finalize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let dir = w.dir().to_path_buf();
+        w.set_title("需求评审").unwrap();
+        // 落盘立即可见
+        let meta: crate::store::NoteMeta =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.title, "需求评审");
+        // finalize 用内存 meta 重写 —— set_title 走内存路径,标题必须存活
+        w.finalize(now()).unwrap();
+        let meta: crate::store::NoteMeta =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.title, "需求评审", "finalize 不得回滚标题");
+        assert_eq!(meta.state, "complete");
     }
 
     #[test]

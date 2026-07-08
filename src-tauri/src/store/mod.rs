@@ -7,6 +7,7 @@ pub mod writer;
 mod export;
 mod notes;
 mod voiceprints;
+pub use export::format_ts;
 pub use notes::NoteStore;
 pub use refined::{load_refined, write_refined_atomic, RefineStages, RefinedDoc, RefinedParagraph};
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
