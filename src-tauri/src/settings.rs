@@ -14,7 +14,7 @@ pub const ASR_PARAFORMER: &str = "paraformer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub mirror_enabled: bool,
     #[serde(default = "default_prefix")]
     pub mirror_prefix: String,
@@ -99,7 +99,7 @@ fn default_true() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mirror_enabled: false,
+            mirror_enabled: true,
             mirror_prefix: default_prefix(),
             data_dir: None,
             models_dir: None,
@@ -171,10 +171,10 @@ mod tests {
     fn load_missing_or_corrupt_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         let s = load(tmp.path());
-        assert!(!s.mirror_enabled);
+        assert!(s.mirror_enabled);
         assert_eq!(s.mirror_prefix, DEFAULT_MIRROR_PREFIX);
         std::fs::write(tmp.path().join("settings.json"), "not json").unwrap();
-        assert!(!load(tmp.path()).mirror_enabled, "损坏 → 默认值");
+        assert!(load(tmp.path()).mirror_enabled, "损坏 → 默认值");
     }
 
     #[test]
@@ -197,6 +197,8 @@ mod tests {
         assert_eq!(s.data_dir, None);
         assert_eq!(s.models_dir, None);
         assert_eq!(s.asr_model, ASR_SENSE_VOICE);
+        std::fs::write(tmp.path().join("settings.json"), "{}").unwrap();
+        assert!(load(tmp.path()).mirror_enabled, "旧配置缺镜像字段时应默认启用内置加速");
         // 新字段 roundtrip
         let s = Settings {
             data_dir: Some("/tmp/d".into()),

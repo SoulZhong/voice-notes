@@ -21,6 +21,8 @@ use audio::{AudioCapture, Source};
 use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
+const DOWNLOAD_ATTEMPTS_PER_URL: usize = 3;
+
 // 锁序约定（必须在任何持锁场景下遵守）：running → generation → session_slot。
 // 只有 spawn_session 的加载线程会嵌套持有 running→generation（以及 running→
 // generation→session_slot），且只在极短的检查/存储语句内完成；stop_recording
@@ -1622,10 +1624,41 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
             if models::artifact_present(&root, a) {
                 continue;
             }
-            let url = models::download::apply_mirror(a.url, s.mirror_enabled, &s.mirror_prefix);
-            if let Err(e) = models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+            let urls = models::download::download_urls(a.url, s.mirror_enabled, &s.mirror_prefix);
+            let mut last_err: Option<String> = None;
+            'download_urls: for url in urls {
+                for attempt in 1..=DOWNLOAD_ATTEMPTS_PER_URL {
+                    match models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+                        Ok(()) => {
+                            last_err = None;
+                            break 'download_urls;
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg == "cancelled" {
+                                last_err = Some(msg);
+                                break 'download_urls;
+                            }
+                            let retryable = models::download::retryable_download_error(&msg);
+                            last_err = Some(format!("{url}: {msg}"));
+                            if !retryable || attempt == DOWNLOAD_ATTEMPTS_PER_URL {
+                                break;
+                            }
+                        }
+                    }
+                    if cancel.load(Ordering::Relaxed) {
+                        last_err = Some("cancelled".into());
+                        break 'download_urls;
+                    }
+                }
+                if let Some(msg) = last_err.as_deref() {
+                    if msg == "cancelled" {
+                        break;
+                    }
+                }
+            }
+            if let Some(msg) = last_err {
                 all_ok = false;
-                let msg = e.to_string();
                 let phase = if msg == "cancelled" { "cancelled" } else { "error" };
                 emit(a.id, phase, 0, 0, &msg);
                 break;
