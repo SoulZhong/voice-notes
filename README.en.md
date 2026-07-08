@@ -158,7 +158,7 @@ The 10 tools:
 | `list_speakers` | Global voiceprint library / speakers (stable cross-meeting id / name) | App need not be running |
 | `recording_status` | Current recording state | App running |
 | `get_live_transcript` | Live transcript of the in-progress session | App running |
-| `start` / `stop` / `pause` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
+| `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
 
 The four query tools read local data files directly and work even when the app is closed; the rest go through an in-app local socket and need the app running.
 

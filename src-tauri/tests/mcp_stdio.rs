@@ -109,6 +109,18 @@ fn stdio_initialize_list_and_call_tools() {
         assert!(names.contains(&expect), "缺工具 {expect}: {names:?}");
     }
 
+    // 漂移守卫:实际注册的每个工具都必须出现在 README 工具表里(反引号包裹)。
+    // README/CLI/MCP 三处描述同一套能力,这条让"改了工具却漏更新 README"在 CI 就红,
+    // 不必靠人眼在终审时逐字段核对(真值源纪律的自动化兜底)。README 双语,以中文为准。
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md"))
+        .expect("读取 README.md");
+    for name in &names {
+        assert!(
+            readme.contains(&format!("`{name}`")),
+            "工具 {name} 已注册但 README.md 工具表未列出——三面描述漂移了",
+        );
+    }
+
     let r = mcp.request("tools/call", serde_json::json!({ "name": "list_notes", "arguments": {} }));
     let v = tool_json(&r);
     assert_eq!(v["total"], 1);

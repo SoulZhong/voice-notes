@@ -102,92 +102,236 @@ fn control_allowed(app: &tauri::AppHandle) -> bool {
 
 const CONTROL_DENIED: &str = "已被用户在设置中禁用:请在 voice-notes 的「设置 → AI 助手接入」开启「允许 AI 控制录制」";
 
+/// dispatch 依赖的能力抽象:把「读授权开关、取状态、执行录制操作」从 AppHandle 解耦,
+/// 使门控判定与 op 路由这层策略可脱离 GUI 单测(控制面最该锁住的不变量是"某个控制
+/// op 别漏了门控")。生产实现是 AppBackend;测试用 mock 覆盖门控矩阵与路由。
+trait UdsBackend {
+    fn control_allowed(&self) -> bool;
+    fn status(&self) -> serde_json::Value;
+    fn live(&self, tail: usize) -> Result<serde_json::Value, String>;
+    fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String>;
+    fn stop(&self) -> Result<serde_json::Value, String>;
+    fn pause(&self) -> Result<serde_json::Value, String>;
+    fn resume(&self) -> Result<serde_json::Value, String>;
+}
+
+/// 策略层:控制类 op 统一先过门控(集中一处,新增控制 op 不会漏挂门控),再路由到
+/// backend;tail clamp 与 title trim 也在此,便于单测。未知 op 报错。
+fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
+    let op = req.op.as_str();
+    if matches!(op, "start" | "stop" | "pause" | "resume") && !b.control_allowed() {
+        return err(CONTROL_DENIED);
+    }
+    let result = match op {
+        "status" => Ok(b.status()),
+        "live" => b.live(req.tail.unwrap_or(50).clamp(1, 500)),
+        "start" => b.start(req.title.as_deref().map(str::trim).filter(|t| !t.is_empty())),
+        "stop" => b.stop(),
+        "pause" => b.pause(),
+        "resume" => b.resume(),
+        other => return err(format!("未知 op: {other}")),
+    };
+    match result {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
+    }
+}
+
 fn dispatch(app: &tauri::AppHandle, req: &Req) -> Resp {
-    match req.op.as_str() {
-        "status" => ok(status_json(app)),
-        "live" => {
-            let note_id = {
-                let state = app.state::<crate::AppState>();
-                let slot = state.session.lock().unwrap();
-                match slot.as_ref() {
-                    Some(s) => s.note_id.clone(),
-                    None => return err("没有正在进行的录制"),
-                }
-            };
-            let tail = req.tail.unwrap_or(50).clamp(1, 500);
-            let Ok(dir) = crate::notes_dir(app) else { return err("数据目录不可用") };
-            match crate::store::NoteStore::new(dir).load(&note_id) {
-                Ok(note) => {
-                    let start = note.segments.len().saturating_sub(tail);
-                    ok(serde_json::json!({
-                        "note_id": note_id, "title": note.meta.title,
-                        "segments": note.segments[start..].iter().map(|s| serde_json::json!({
-                            "seq": s.seq, "source": s.source, "speaker": s.speaker,
-                            "start_ms": s.start_ms, "text": s.text,
-                        })).collect::<Vec<_>>(),
-                    }))
-                }
-                Err(e) => err(e.to_string()),
+    dispatch_with(&AppBackend(app), req)
+}
+
+/// 生产实现:各能力逐块搬自原 dispatch 分支(仅错误从 `return err(..)` 改 `Err(..)`,
+/// 门控上移到 dispatch_with),行为等价。
+struct AppBackend<'a>(&'a tauri::AppHandle);
+
+impl UdsBackend for AppBackend<'_> {
+    fn control_allowed(&self) -> bool {
+        control_allowed(self.0)
+    }
+
+    fn status(&self) -> serde_json::Value {
+        status_json(self.0)
+    }
+
+    fn live(&self, tail: usize) -> Result<serde_json::Value, String> {
+        let app = self.0;
+        let note_id = {
+            let state = app.state::<crate::AppState>();
+            let slot = state.session.lock().unwrap();
+            match slot.as_ref() {
+                Some(s) => s.note_id.clone(),
+                None => return Err("没有正在进行的录制".into()),
             }
-        }
-        "start" => {
-            if !control_allowed(app) {
-                return err(CONTROL_DENIED);
-            }
-            if let Err(e) = crate::do_start_recording(app) {
-                return err(e);
-            }
-            // spawn_session 异步加载模型后才入槽:轮询等 note_id(最多 20s,模型冷加载
-            // 可能秒级);拿到后如带 title,经 writer 单写者路径改题(见 set_title 注释)。
-            for _ in 0..200 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let state = app.state::<crate::AppState>();
-                let slot = state.session.lock().unwrap();
-                if let Some(s) = slot.as_ref() {
-                    if let Some(title) = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                        if let Err(e) = s.writer.lock().unwrap().set_title(title) {
-                            eprintln!("mcp start: 设标题失败(录制已开始,不回滚): {e}");
-                        }
+        };
+        let dir = crate::notes_dir(app).map_err(|_| "数据目录不可用".to_string())?;
+        let note = crate::store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+        let start = note.segments.len().saturating_sub(tail);
+        Ok(serde_json::json!({
+            "note_id": note_id, "title": note.meta.title,
+            "segments": note.segments[start..].iter().map(|s| serde_json::json!({
+                "seq": s.seq, "source": s.source, "speaker": s.speaker,
+                "start_ms": s.start_ms, "text": s.text,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String> {
+        let app = self.0;
+        crate::do_start_recording(app)?;
+        // spawn_session 异步加载模型后才入槽:轮询等 note_id(最多 20s,模型冷加载
+        // 可能秒级);拿到后如带 title,经 writer 单写者路径改题(见 set_title 注释)。
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let state = app.state::<crate::AppState>();
+            let slot = state.session.lock().unwrap();
+            if let Some(s) = slot.as_ref() {
+                if let Some(title) = title {
+                    if let Err(e) = s.writer.lock().unwrap().set_title(title) {
+                        eprintln!("mcp start: 设标题失败(录制已开始,不回滚): {e}");
                     }
-                    return ok(serde_json::json!({ "note_id": s.note_id }));
                 }
-                drop(slot);
-                // 会话未入槽且 running 已被清(启动失败路径)→ 提前报错
-                if !*state.running.lock().unwrap() {
-                    return err("录制未能进入进行中状态(设备/模型异常,或已被手动停止;详见应用日志)");
-                }
+                return Ok(serde_json::json!({ "note_id": s.note_id }));
             }
-            err("录制启动超时")
-        }
-        "stop" => {
-            if !control_allowed(app) {
-                return err(CONTROL_DENIED);
-            }
-            let note_id = status_json(app)["note_id"].as_str().unwrap_or_default().to_string();
-            if note_id.is_empty() {
-                return err("没有正在进行的录制");
-            }
-            crate::do_stop_recording(app); // 阻塞至排干,本线程等待无妨
-            ok(serde_json::json!({ "note_id": note_id }))
-        }
-        "pause" => {
-            if !control_allowed(app) {
-                return err(CONTROL_DENIED);
-            }
-            match crate::do_pause_recording(app) {
-                Ok(()) => ok(status_json(app)),
-                Err(e) => err(e),
+            drop(slot);
+            // 会话未入槽且 running 已被清(启动失败路径)→ 提前报错
+            if !*state.running.lock().unwrap() {
+                return Err("录制未能进入进行中状态(设备/模型异常,或已被手动停止;详见应用日志)".into());
             }
         }
-        "resume" => {
-            if !control_allowed(app) {
-                return err(CONTROL_DENIED);
-            }
-            match crate::do_resume_recording(app) {
-                Ok(()) => ok(status_json(app)),
-                Err(e) => err(e),
-            }
+        Err("录制启动超时".into())
+    }
+
+    fn stop(&self) -> Result<serde_json::Value, String> {
+        let app = self.0;
+        let note_id = status_json(app)["note_id"].as_str().unwrap_or_default().to_string();
+        if note_id.is_empty() {
+            return Err("没有正在进行的录制".into());
         }
-        other => err(format!("未知 op: {other}")),
+        crate::do_stop_recording(app); // 阻塞至排干,本线程等待无妨
+        Ok(serde_json::json!({ "note_id": note_id }))
+    }
+
+    fn pause(&self) -> Result<serde_json::Value, String> {
+        crate::do_pause_recording(self.0)?;
+        Ok(status_json(self.0))
+    }
+
+    fn resume(&self) -> Result<serde_json::Value, String> {
+        crate::do_resume_recording(self.0)?;
+        Ok(status_json(self.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// 记录被调方法 + 可配置 control_allowed 的假后端。
+    struct MockBackend {
+        control: bool,
+        calls: RefCell<Vec<String>>,
+    }
+    impl MockBackend {
+        fn new(control: bool) -> Self {
+            Self { control, calls: RefCell::new(Vec::new()) }
+        }
+        fn log(&self, s: impl Into<String>) {
+            self.calls.borrow_mut().push(s.into());
+        }
+        fn called(&self, s: &str) -> bool {
+            self.calls.borrow().iter().any(|c| c == s)
+        }
+    }
+    impl UdsBackend for MockBackend {
+        fn control_allowed(&self) -> bool {
+            self.control
+        }
+        fn status(&self) -> serde_json::Value {
+            self.log("status");
+            serde_json::json!({ "state": "idle" })
+        }
+        fn live(&self, tail: usize) -> Result<serde_json::Value, String> {
+            self.log(format!("live:{tail}"));
+            Ok(serde_json::json!({ "tail": tail }))
+        }
+        fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String> {
+            self.log(format!("start:{title:?}"));
+            Ok(serde_json::json!({ "note_id": "N1" }))
+        }
+        fn stop(&self) -> Result<serde_json::Value, String> {
+            self.log("stop");
+            Ok(serde_json::json!({ "note_id": "N1" }))
+        }
+        fn pause(&self) -> Result<serde_json::Value, String> {
+            self.log("pause");
+            Ok(serde_json::json!({ "state": "paused" }))
+        }
+        fn resume(&self) -> Result<serde_json::Value, String> {
+            self.log("resume");
+            Ok(serde_json::json!({ "state": "recording" }))
+        }
+    }
+
+    fn req(op: &str) -> Req {
+        Req { op: op.into(), title: None, tail: None }
+    }
+
+    #[test]
+    fn control_ops_gated_when_disabled() {
+        let b = MockBackend::new(false);
+        for op in ["start", "stop", "pause", "resume"] {
+            let r = dispatch_with(&b, &req(op));
+            assert!(!r.ok, "{op} 应被门控拒绝");
+            assert_eq!(r.error.as_deref(), Some(CONTROL_DENIED));
+        }
+        // 门控在 backend 调用之前:被拒的 op 绝不触达真实操作。
+        assert!(b.calls.borrow().is_empty(), "门控关时不得调用任何控制方法: {:?}", b.calls.borrow());
+    }
+
+    #[test]
+    fn query_ops_not_gated() {
+        let b = MockBackend::new(false); // 即便控制关
+        assert!(dispatch_with(&b, &req("status")).ok, "status 不受门控");
+        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None }).ok, "live 不受门控");
+        assert!(b.called("status") && b.called("live:50"));
+    }
+
+    #[test]
+    fn control_ops_routed_when_enabled() {
+        let b = MockBackend::new(true);
+        for op in ["start", "stop", "pause", "resume"] {
+            assert!(dispatch_with(&b, &req(op)).ok, "{op} 门控开时应放行");
+        }
+        assert!(b.called("start:None") && b.called("stop") && b.called("pause") && b.called("resume"));
+    }
+
+    #[test]
+    fn live_tail_clamped_and_defaulted() {
+        let b = MockBackend::new(true);
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000) });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0) });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None });
+        assert!(b.called("live:500"), "上限 500");
+        assert!(b.called("live:1"), "下限 1");
+        assert!(b.called("live:50"), "缺省 50");
+    }
+
+    #[test]
+    fn start_title_trimmed() {
+        let b = MockBackend::new(true);
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None });
+        assert!(b.called("start:Some(\"评审会\")"), "两端空白应 trim: {:?}", b.calls.borrow());
+        assert!(b.called("start:None"), "纯空白 title → None");
+    }
+
+    #[test]
+    fn unknown_op_errors() {
+        let b = MockBackend::new(true);
+        let r = dispatch_with(&b, &req("bogus"));
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("未知 op: bogus"));
     }
 }
