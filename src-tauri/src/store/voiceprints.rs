@@ -744,15 +744,15 @@ mod tests {
             }),
         );
 
-        // 5 段 × 2s = 10s 恰达门槛;每段后跑一轮 enroll_pending(仿 process_final 节奏)。
-        for _ in 0..5 {
-            r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
+        // 4 段 × 2.5s = 10s 恰达门槛;每段后跑一轮 enroll_pending(仿 process_final 节奏)。
+        for _ in 0..4 {
+            r.assign(&[1.0, 0.0, 0.0], "mic", 40000).unwrap();
             r.enroll_pending();
         }
         let pid = r.speakers()[0].person.clone().expect("够料后应已实时入库");
         {
             let vp = store.load();
-            assert_eq!(vp.people[&pid].centroids["mic"].count, 5);
+            assert_eq!(vp.people[&pid].centroids["mic"].count, 4);
             assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS);
         }
 
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(snaps[0].total_ms, 4000);
         store.upsert_from_session(&snaps, "t-stop").unwrap();
         let vp = store.load();
-        assert_eq!(vp.people[&pid].centroids["mic"].count, 7, "5+2 线性增长,不双计");
+        assert_eq!(vp.people[&pid].centroids["mic"].count, 6, "4+2 线性增长,不双计");
         assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS + 4000);
         assert_eq!(vp.people[&pid].last_seen, "t-stop");
     }
