@@ -1622,10 +1622,26 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
             if models::artifact_present(&root, a) {
                 continue;
             }
-            let url = models::download::apply_mirror(a.url, s.mirror_enabled, &s.mirror_prefix);
-            if let Err(e) = models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+            let urls = models::download::download_urls(a.url, s.mirror_enabled, &s.mirror_prefix);
+            let mut last_err: Option<String> = None;
+            for url in urls {
+                match models::download::download_artifact(a, &root, &url, &cancel, &emit) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let cancelled = msg == "cancelled";
+                        last_err = Some(if cancelled { msg } else { format!("{url}: {msg}") });
+                        if cancelled {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(msg) = last_err {
                 all_ok = false;
-                let msg = e.to_string();
                 let phase = if msg == "cancelled" { "cancelled" } else { "error" };
                 emit(a.id, phase, 0, 0, &msg);
                 break;

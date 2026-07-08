@@ -23,6 +23,15 @@ pub fn apply_mirror(url: &str, enabled: bool, prefix: &str) -> String {
     }
 }
 
+pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Vec<String> {
+    let mirrored = apply_mirror(url, mirror_enabled, mirror_prefix);
+    if mirrored == url {
+        vec![url.to_string()]
+    } else {
+        vec![mirrored, url.to_string()]
+    }
+}
+
 /// 流式计算文件 SHA256（hex 小写）。
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut f = fs::File::open(path)?;
@@ -292,6 +301,17 @@ mod tests {
         assert_eq!(apply_mirror(u, true, ""), u, "空前缀视同关闭");
         assert_eq!(apply_mirror(u, true, "https://ghproxy.net/"), format!("https://ghproxy.net/{u}"));
         assert_eq!(apply_mirror(u, true, "https://ghproxy.net"), format!("https://ghproxy.net/{u}"), "自动补尾斜杠");
+    }
+
+    #[test]
+    fn download_urls_try_mirror_first_then_origin_when_enabled() {
+        let u = "https://github.com/a/b.onnx";
+        assert_eq!(download_urls(u, false, "https://ghproxy.net/"), vec![u.to_string()]);
+        assert_eq!(download_urls(u, true, ""), vec![u.to_string()]);
+        assert_eq!(
+            download_urls(u, true, "https://ghproxy.net/"),
+            vec![format!("https://ghproxy.net/{u}"), u.to_string()],
+        );
     }
 
     #[test]
