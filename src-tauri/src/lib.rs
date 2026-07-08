@@ -1198,8 +1198,10 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
     }
 }
 
-#[tauri::command]
-fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+/// 暂停共用实现(命令壳、UDS 桥共用)。逐语句搬自原 pause_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取(与 `State<AppState>` 注入等价)——逻辑零变化。
+fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
         let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
@@ -1221,7 +1223,15 @@ fn pause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn pause_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("pause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_pause_recording(&app)
+}
+
+/// 续录共用实现(命令壳、UDS 桥共用)。逐语句搬自原 unpause_recording 命令体,唯一改动是
+/// state 由 `app.state()` 取(与 `State<AppState>` 注入等价)——逻辑零变化。
+fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
         let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
@@ -1238,6 +1248,12 @@ fn unpause_recording(app: AppHandle, state: State<AppState>) -> Result<(), Strin
     };
     let _ = app.emit("status", ev);
     Ok(())
+}
+
+#[tauri::command]
+fn unpause_recording(app: AppHandle) -> Result<(), String> {
+    // 薄壳:前端 invoke("unpause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
+    do_resume_recording(&app)
 }
 
 #[tauri::command]
