@@ -156,7 +156,7 @@ npm run tauri build    # 构建 .app + .dmg
 | `list_speakers` | 全局声纹库人物(跨会议一致的编号 / 名字) | 无需 App 运行 |
 | `recording_status` | 当前录制状态 | App 运行中 |
 | `get_live_transcript` | 正在录制会话的实时转写 | App 运行中 |
-| `start` / `stop` / `pause` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
+| `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
 
 查询类四工具直读本机数据文件,App 没开也能用;其余经 App 内本地 socket,需 App 运行。
 
