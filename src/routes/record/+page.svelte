@@ -5,7 +5,7 @@
   import { recording } from "$lib/recording.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
-  import { modelsStatus, type ModelsStatus } from "$lib/models";
+  import { modelsStatus, getSettings, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
 
@@ -40,11 +40,31 @@
     await refreshScreenPerm();
   }
 
+  // 蓝牙外放预警:「保持外放音量」+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件
+  // 回声消除的追踪范围,mic 会混入近乎全量的对方声音(面试录音实锤)。开录前提示,
+  // 查询失败按"无风险"静默。
+  let btEchoRisk = $state(false);
+  async function refreshBtRisk() {
+    try {
+      const [s, bt] = await Promise.all([
+        getSettings(),
+        invoke<boolean>("output_is_bluetooth"),
+      ]);
+      btEchoRisk = s.keep_output_volume && bt;
+    } catch {
+      btEchoRisk = false;
+    }
+  }
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
-    // 用户去系统设置勾选后切回来,焦点事件驱动横幅消失,无需重启页面。
-    const onFocus = () => refreshScreenPerm();
+    refreshBtRisk();
+    // 用户去系统设置勾选/换音频设备后切回来,焦点事件驱动横幅刷新,无需重启页面。
+    const onFocus = () => {
+      refreshScreenPerm();
+      refreshBtRisk();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   });
@@ -184,6 +204,12 @@
   </div>
 
   {#if !models || models.recording_ready}
+
+    {#if btEchoRisk && !recording.isLive}
+      <div class="banner">
+        检测到蓝牙外放 + 「保持外放音量」：蓝牙延迟会让回声消除失效，录音会混入对方声音（回放像回音）。建议改用有线外放/耳机，或到设置关闭「保持外放音量」。
+      </div>
+    {/if}
 
     {#if !screenPerm && !recording.isLive}
       <div class="banner">

@@ -40,10 +40,27 @@
     reportError(tracks[i]?.source ?? `#${i}`, code);
   }
 
-  let raf = 0;
+  // 驱动循环用 setInterval 而非 requestAnimationFrame:窗口被遮挡/最小化时
+  // WebKit 停发 rAF,同步循环停摆(后台播放停止的根因之一,2026-07-08 实锤;
+  // 另一半根因是页面级节流,由窗口配置 backgroundThrottling=disabled 关掉)。
+  // interval 即使在未关节流的环境也只会被钳到 1s,同步照常存活。
+  let timer: ReturnType<typeof setInterval> | 0 = 0;
+  const TICK_MS = 100;
   // 连续播放位置(非响应式):驱动音频同步;currentMs 只按 100ms 粒度更新——
-  // 高亮/进度条用不到更细,也避免 60fps 触发全段落列表的派生重算。
+  // 高亮/进度条用不到更细,也避免高频触发全段落列表的派生重算。
   let pos = 0;
+
+  // 每轨静音(源名 → 静音)。用 el.muted 而非暂停:静音轨仍在走表,可继续充当
+  // audibleClock,双轨同步语义零改动。用途:双轨串音的笔记(外放+蓝牙延迟致
+  // AEC 失效,同一句话两轨相隔数百毫秒各有一份)静掉一轨即无回音。
+  let muted = $state<Record<string, boolean>>({});
+  function toggleMute(source: string) {
+    muted = { ...muted, [source]: !muted[source] };
+    for (let i = 0; i < tracks.length; i++) {
+      const el = els[i];
+      if (el) el.muted = !!muted[tracks[i].source];
+    }
+  }
   // 墙钟锚点:无轨道可依时,pos = anchorMs + (now - anchorWall)。
   let anchorWall = 0;
   let anchorMs = 0;
@@ -71,6 +88,7 @@
       const el = els[i];
       if (!el) continue;
       const expected = pos - tracks[i].offset_ms;
+      el.muted = !!muted[tracks[i].source];
       if (expected >= 0 && expected < tracks[i].duration_ms) {
         if (el.paused) {
           el.currentTime = expected / 1000;
@@ -104,7 +122,6 @@
     }
     publishPos();
     syncTracks();
-    raf = requestAnimationFrame(tick);
   }
 
   export function play() {
@@ -115,13 +132,14 @@
     anchorWall = performance.now();
     publishPos();
     syncTracks();
-    cancelAnimationFrame(raf);
-    raf = requestAnimationFrame(tick);
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, TICK_MS);
   }
 
   export function pause() {
     playing = false;
-    cancelAnimationFrame(raf);
+    if (timer) clearInterval(timer);
+    timer = 0;
     for (const el of els) el?.pause();
   }
 
@@ -214,6 +232,19 @@
       </svg>
     {/if}
   </button>
+  {#if tracks.length > 1}
+    <!-- 轨道静音开关:双轨串音笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音 -->
+    <div class="track-toggles">
+      {#each tracks as t (t.source)}
+        <button
+          class="track-toggle"
+          class:off={muted[t.source]}
+          onclick={() => toggleMute(t.source)}
+          title={muted[t.source] ? "恢复播放该音轨" : "静音该音轨(回放有回音时静掉一轨)"}
+        >{t.source === "mic" ? "麦克风" : "系统声"}</button>
+      {/each}
+    </div>
+  {/if}
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
   <!-- 波形音轨(即进度条):条高来自段落 rms,已播部分 accent;点击/拖拽定位 -->
   <div
@@ -279,6 +310,31 @@
   }
   .play-btn:hover {
     background: var(--surface-soft);
+  }
+  /* 轨道静音开关:开=正常字色,关(静音)=划线退灰。文字按钮,与全应用「图标必带文字」一致 */
+  .track-toggles {
+    display: inline-flex;
+    gap: 4px;
+    flex: none;
+  }
+  .track-toggle {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.15em 0.7em;
+    font-size: 0.75rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .track-toggle:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .track-toggle.off {
+    text-decoration: line-through;
+    color: var(--ink-faint);
+    border-style: dashed;
   }
   .time {
     color: var(--ink-secondary);

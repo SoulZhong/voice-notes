@@ -1991,6 +1991,13 @@ fn apply_shortcut(app: AppHandle) -> Result<(), String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 当前默认输出是否蓝牙:录制页在「保持外放音量」开启时预警蓝牙外放
+/// (蓝牙延迟超出软件 AEC 的延迟估计范围,回声消除失效,见 audio::default_output_is_bluetooth)。
+#[tauri::command]
+fn output_is_bluetooth() -> bool {
+    audio::default_output_is_bluetooth()
+}
+
 /// 屏幕录制权限预检(macOS):系统声音采集(ScreenCaptureKit)依赖该权限,未授权时
 /// System 源只会在开录后静默降级为仅麦克风——录制页据此在**开录前**就给出常驻
 /// 提示与授权入口,终结"录了半天发现对方声音全没进笔记"。
@@ -2140,6 +2147,7 @@ pub fn run() {
             set_segment_speaker,
             screen_capture_permission,
             request_screen_capture_permission,
+            output_is_bluetooth,
             models_status,
             download_models,
             cancel_models_download,
