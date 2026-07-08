@@ -56,7 +56,7 @@ voice-notes mcp status [--json]
 
 ### UDS 桥(GUI ⇄ stdio)
 
-- GUI 启动时在 `app_data/mcp.sock` 上 listen(权限 0600),退出时清理;socket 路径固定在 app_data(不随数据目录迁移)。
+- GUI 启动时在 `app_data/mcp.sock` 上 listen(权限 0600);退出后残留 socket 由下次启动清理(bind 前 remove)——连接死 socket 得到 ECONNREFUSED,桥转为「未在运行」指引,不影响查询类工具。socket 路径固定在 app_data(不随数据目录迁移)。
 - 协议:每行一个 JSON 请求/响应(`{"op":"recording_status"}` → `{"ok":true,...}`),薄封装现有 `#[tauri::command]` 同名逻辑;不复用 tauri IPC。
 - stdio 进程按需连接:连不上 = App 未运行,依赖 UDS 的工具返回带指引的错误(isError=true,文本「voice-notes 未在运行,请先启动应用」)。
 
@@ -68,10 +68,10 @@ voice-notes mcp status [--json]
 
 | 工具 | 参数 | 返回 |
 |---|---|---|
-| `list_notes` | `limit`(默认 20,≤100)、`offset`、`from`/`to`(RFC3339,可选) | 笔记摘要数组:id、标题、开始时间、时长 ms、说话人数、是否有精修稿 |
+| `list_notes` | `limit`(默认 20,≤100)、`offset`、`from`/`to`(RFC3339,可选) | 笔记摘要数组:id、标题、开始时间、时长秒(duration_secs)、说话人数、是否有精修稿 |
 | `search_notes` | `query`(必填)、`limit`(默认 20) | 命中数组:note_id、标题、命中句(seq、text、speaker、start_ms)、上下文各一句 |
 | `get_note` | `note_id`(必填)、`format`:`"segments"`(默认,逐句含说话人/时间戳)/`"markdown"`/`"text"`、`prefer_refined`(默认 true,有精修稿给精修稿并标注) | 笔记全文 |
-| `list_speakers` | — | 全局声纹库人物:id、名字、登记时间、出现的笔记数 |
+| `list_speakers` | — | 全局声纹库人物:id、名字、最近出现时间(last_seen;声纹库无登记时间字段,以 last_seen 代)、出现的笔记数 |
 
 搜索实现:遍历笔记目录做子串匹配(大小写不敏感),不建索引。个人会议笔记量级(数百场 × 每场几百句)全扫 <100ms,YAGNI;若未来量级上来再谈索引。
 
