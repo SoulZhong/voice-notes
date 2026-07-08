@@ -1505,6 +1505,70 @@ fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String>
     open_voiceprint_store(&app)?.rename(&id, name).map_err(|e| e.to_string())
 }
 
+/// 从 person 出现过的最近一条笔记的音频里截取其发言(≤ 试听样本上限)。
+/// 合并兜底用:loser 没有既存样本文件(样本功能上线前的老数据/历史写失败)时,
+/// 把"被并入的那个声音"物化成 winner 的可试听样本——否则合并后试听列表
+/// 无从体现新并入的声音(2026-07-08 用户反馈)。
+/// 新→旧扫最近 MAX_NOTES 条;任何失败返回 None(样本是纯增值,不挡合并)。
+fn cut_person_sample_from_notes(notes_root: &std::path::Path, person: &str) -> Option<Vec<f32>> {
+    const MAX_NOTES: usize = 30;
+    let mut ids: Vec<String> = std::fs::read_dir(notes_root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a)); // id 即时间戳,倒序=新在前
+    let ns = store::NoteStore::new(notes_root.to_path_buf());
+    for id in ids.into_iter().take(MAX_NOTES) {
+        let Ok(note) = ns.load(&id) else { continue };
+        // 该 person 关联的本地 speaker id 集(speakers.json 存的是入库时的 pid,原样匹配)。
+        let spk_ids: std::collections::HashSet<&String> = note
+            .speakers
+            .iter()
+            .filter(|(_, m)| m.person_id.as_deref() == Some(person))
+            .map(|(k, _)| k)
+            .collect();
+        if spk_ids.is_empty() {
+            continue;
+        }
+        // 按信道分组取段(时长最长优先),选发言最多的信道解一次码。
+        let mut by_source: std::collections::BTreeMap<&str, Vec<&store::SegmentRecord>> =
+            Default::default();
+        for s in &note.segments {
+            if s.speaker.as_ref().map(|x| spk_ids.contains(x)).unwrap_or(false) {
+                by_source.entry(s.source.as_str()).or_default().push(s);
+            }
+        }
+        let (source, mut segs) = by_source
+            .into_iter()
+            .max_by_key(|(_, v)| v.iter().map(|s| s.end_ms - s.start_ms).sum::<u64>())?;
+        let note_dir = notes_root.join(&id);
+        let Ok(pcm) = store::transcode::track_pcm(&note_dir, source) else { continue };
+        let offset_ms =
+            store::audio::load_audio_meta(&note_dir).tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+        segs.sort_unstable_by_key(|s| std::cmp::Reverse(s.end_ms - s.start_ms));
+        let cap = session::SPEAKER_SAMPLE_CAP;
+        let mut out: Vec<f32> = Vec::with_capacity(cap);
+        for s in segs {
+            if out.len() >= cap {
+                break;
+            }
+            let a = ((s.start_ms.saturating_sub(offset_ms)) * 16) as usize;
+            let b = (((s.end_ms.saturating_sub(offset_ms)) * 16) as usize).min(pcm.len());
+            if a >= b {
+                continue;
+            }
+            let take = (b - a).min(cap - out.len());
+            out.extend_from_slice(&pcm[a..a + take]);
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// 录制中拒绝合并/删除：开录时种子已经按当前库结构注入本场 registry，若此刻改
 /// 动库的引用关系（合并/删除 person），本场 registry 里的种子锚点和库状态就脱节，
 /// "是谁"会变得混乱——比改名危险得多，故禁止，等停止录制后再操作。
@@ -1518,7 +1582,25 @@ fn merge_person(
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能合并说话人".into());
     }
-    open_voiceprint_store(&app)?.merge(&loser, &winner).map_err(|e| e.to_string())
+    let store = open_voiceprint_store(&app)?;
+    // 合并前记住 loser 是否有样本:有则 merge 内部迁移;没有则合并后从笔记音频
+    // 现场截一份补给 winner(被并入的声音必须能在试听列表里听到)。
+    let loser_had_samples = !store.sample_paths_existing(&loser).is_empty();
+    store.merge(&loser, &winner).map_err(|e| e.to_string())?;
+    if !loser_had_samples {
+        match notes_dir(&app) {
+            Ok(root) => match cut_person_sample_from_notes(&root, &loser) {
+                Some(sample) => {
+                    if let Err(e) = store.append_sample(&winner, &sample) {
+                        eprintln!("合并兜底样本写入失败({loser}->{winner},不影响合并): {e}");
+                    }
+                }
+                None => eprintln!("合并兜底:未能从笔记音频截到 {loser} 的样本(可能无笔记/无音频)"),
+            },
+            Err(e) => eprintln!("合并兜底样本跳过(notes_dir 不可用): {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// 录制中拒绝：理由同 merge_person。
@@ -2166,6 +2248,52 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod cut_sample_tests {
+    use super::cut_person_sample_from_notes;
+
+    /// 合并兜底截样端到端:合成一条带 mic.wav 的笔记,speaker S1 关联 P9,
+    /// 截出的样本应等于 S1 两段之和(长段优先)且不超上限;查无此人返回 None。
+    #[test]
+    fn cuts_person_speech_from_note_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("20260101-000000");
+        std::fs::create_dir_all(&note).unwrap();
+        // mic.wav:10s @16k s16,样本值=下标 mod 1000(可校验切片位置)
+        let n = 16000 * 10;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            data.extend_from_slice(&(((i % 1000) as i16) - 500).to_le_bytes());
+        }
+        let mut wav = crate::store::audio::wav_header(data.len() as u32).to_vec();
+        wav.extend_from_slice(&data);
+        std::fs::write(note.join("mic.wav"), &wav).unwrap();
+        std::fs::write(
+            note.join("speakers.json"),
+            r#"{"S1":{"name":"","sources":["mic"],"person_id":"P9"},"S2":{"name":"","sources":["mic"],"person_id":"P8"}}"#,
+        )
+        .unwrap();
+        // S1: 1000..3000ms 与 5000..6000ms;S2(别人)夹在中间不得混入
+        std::fs::write(
+            note.join("segments.jsonl"),
+            concat!(
+                r#"{"seq":1,"source":"mic","text":"a","start_ms":1000,"end_ms":3000,"speaker":"S1"}"#, "\n",
+                r#"{"seq":2,"source":"mic","text":"b","start_ms":3000,"end_ms":5000,"speaker":"S2"}"#, "\n",
+                r#"{"seq":3,"source":"mic","text":"c","start_ms":5000,"end_ms":6000,"speaker":"S1"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let sample = cut_person_sample_from_notes(tmp.path(), "P9").expect("应截到样本");
+        assert_eq!(sample.len(), 16000 * 3, "S1 两段共 3s");
+        // 长段优先:开头应是 1000ms 处的样本(值 (16000%1000)-500=... 按下标校验首值)
+        let first_idx = 1000 * 16; // 1000ms → 样本下标 16000
+        let expect = (((first_idx % 1000) as i16) - 500) as f32 / 32768.0;
+        assert!((sample[0] - expect).abs() < 1e-3, "首样本应来自 1000ms 处");
+        assert!(cut_person_sample_from_notes(tmp.path(), "P404").is_none(), "查无此人");
+    }
 }
 
 #[cfg(test)]
