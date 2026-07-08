@@ -90,6 +90,8 @@ voice-notes mcp status [--json]
 |---|---|---|
 | `start_recording` | `title`(可选) | 等价于点「开始录制」;返回 note_id |
 | `stop_recording` | — | 停止并返回 note_id |
+| `pause_recording` | — | 暂停当前录制 |
+| `resume_recording` | — | 恢复暂停中的录制 |
 
 设置项 `mcp_allow_control`(默认 false)关闭时,这两个工具**仍出现在 tools/list**(便于 Agent 发现能力)但调用返回「已被用户在设置中禁用,请到 设置 → AI 助手接入 开启」。始终列出的理由:多数客户端缓存 tools 列表,动态增删易踩客户端兼容坑。
 
@@ -222,4 +224,9 @@ M1 独立可发版(纯增量,不碰 GUI);M2/M3 各自单 PR。
 - **rmcp 版本尚在快速演进**:锁定 minor 版本,升级走显式 PR;若其 stdio 接口与 tokio 版本同 Tauri 冲突,回退方案是手写 JSON-RPC(协议面小,工具 schema 手写)。
 - **App 未签名**:Agent 侧 spawn 一个被 quarantine 的二进制会失败——README 安装步骤已含 `xattr -d`,注册 CLI 在检测到 quarantine 属性时给出明确报错。
 - **多版本并存**(用户同时有 /Applications 与 target/debug):路径自愈的 `target/` 豁免已覆盖;仍以「最后一次注册者为准」为语义,不做进一步仲裁。
-- 开放问题(待用户拍板):① 控制类工具是否连 `pause/resume` 也要;② 欢迎页默认全选还是默认不选(当前设计:检测到即全选,倾向转化率;若更重隐私可改默认不选);③ 第二梯队 Agent(Windsurf/Cline/iFlow)是否有实际需求。
+
+## 十、已拍板决策(2026-07-08 用户确认)
+
+- ① 控制类工具含 `pause_recording` / `resume_recording`(与 start/stop 同受 `mcp_allow_control` 门控)。
+- ② 欢迎页检测到的 Agent **默认全选**。
+- ③ 第二梯队 Agent(Windsurf/Cline/iFlow)**不内置**,由手动配置卡片覆盖。
