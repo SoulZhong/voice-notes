@@ -5,16 +5,25 @@ use std::path::PathBuf;
 impl NoteStore {
     /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
     pub fn export(&self, id: &str, format: &str) -> anyhow::Result<PathBuf> {
-        let note = self.load(id)?;
+        let content = self.render(id, format)?;
         let dir = self.note_dir(id)?;
-        let (name, content) = match format {
-            "md" => ("transcript.md", render_markdown(&note)),
-            "txt" => ("transcript.txt", render_text(&note)),
-            _ => anyhow::bail!("未知导出格式: {format}"),
+        let name = match format {
+            "md" => "transcript.md",
+            _ => "transcript.txt",
         };
         let path = dir.join(name);
         std::fs::write(&path, content)?;
         Ok(path)
+    }
+
+    /// 渲染导出内容字符串(不落盘)。MCP get_note 与 export 共用同一渲染,防两处漂移。
+    pub fn render(&self, id: &str, format: &str) -> anyhow::Result<String> {
+        let note = self.load(id)?;
+        Ok(match format {
+            "md" => render_markdown(&note),
+            "txt" => render_text(&note),
+            _ => anyhow::bail!("未知导出格式: {format}"),
+        })
     }
 }
 

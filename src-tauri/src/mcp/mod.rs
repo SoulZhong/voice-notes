@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 pub mod registry;
+pub mod tools;
 
 /// 无 tauri 环境下的 app_data_dir。identifier 与 tauri.conf.json 保持一致——
 /// GUI 侧 `app.path().app_data_dir()` 解析到的正是这个目录。VN_APP_DATA 供
