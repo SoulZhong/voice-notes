@@ -448,13 +448,15 @@
         const [r] = await mcpRegister([a.key]);
         if (r && !r.ok) mcpError = `${a.name}: ${r.error ?? "注册失败"}`;
       }
+      // refreshMcp 也在 try 内:按钮解禁必须等列表真正刷新完成,否则刷新期间
+      // 有一个窄窗口按钮已可点,连点可能撞上刷新中的旧数据。
+      await refreshMcp();
     } catch (e) {
       mcpError = String(e);
+    } finally {
+      // finally 保证复位:即使 refreshMcp reject,按钮也不会永久禁用。
+      mcpBusy = null;
     }
-    // mcpBusy 复位放在 refreshMcp 之后(finally 语义):按钮解禁必须等列表真正
-    // 刷新完成,否则刷新期间有一个窄窗口按钮已可点,连点可能撞上刷新中的旧数据。
-    await refreshMcp();
-    mcpBusy = null;
   }
 
   /** 手动配置片段复制。剪贴板权限被拒/不可用时静默失败会让用户以为复制成功却粘贴出空内容——
