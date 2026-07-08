@@ -122,12 +122,18 @@ fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
     }
 }
 
+/// VN_APP_DATA 是进程级环境变量,cargo test 默认多线程并行——本模块与
+/// `bridge` 模块的测试都要读写它,共用这把锁串行化,避免互相踩。
+#[cfg(test)]
+pub(crate) static ENV_VAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn app_data_respects_env_override() {
+        let _guard = ENV_VAR_LOCK.lock().unwrap();
         std::env::set_var("VN_APP_DATA", "/tmp/vn-test-app-data");
         assert_eq!(app_data_dir(), PathBuf::from("/tmp/vn-test-app-data"));
         std::env::remove_var("VN_APP_DATA");

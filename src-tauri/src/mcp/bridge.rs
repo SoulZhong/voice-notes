@@ -30,3 +30,58 @@ pub fn call(op: &str, extra: serde_json::Value) -> Result<serde_json::Value, Str
         Err(resp["error"].as_str().unwrap_or("未知错误").to_string())
     }
 }
+
+/// UDS 桥集成测试:起一个假"GUI"监听端,按 uds.rs 的行协议(`{"ok":..,"data"/"error":..}`)
+/// 应答,断言 stdio 侧 `call` 的成功/拒绝两条路径都正确往返;并覆盖 socket 不存在时的
+/// "未运行"错误路径(设计文档 §七「UDS 桥集成」测试项)。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn call_round_trips_success_and_denied_over_uds() {
+        let _guard = super::super::ENV_VAR_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VN_APP_DATA", tmp.path());
+        let listener = UnixListener::bind(tmp.path().join("mcp.sock")).unwrap();
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut writer = conn;
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let resp = if req["op"] == "status" {
+                    serde_json::json!({ "ok": true, "data": { "state": "recording", "note_id": "n1", "elapsed_ms": 1234 } })
+                } else {
+                    serde_json::json!({ "ok": false, "error": "denied" })
+                };
+                writeln!(writer, "{resp}").unwrap();
+            }
+        });
+
+        let data = call("status", serde_json::json!({})).expect("status 应成功往返");
+        assert_eq!(data["note_id"], "n1");
+        assert_eq!(data["elapsed_ms"], 1234);
+
+        let err = call("start", serde_json::json!({ "title": "x" })).expect_err("拒绝态应回 Err");
+        assert_eq!(err, "denied");
+
+        server.join().unwrap();
+        std::env::remove_var("VN_APP_DATA");
+    }
+
+    #[test]
+    fn call_reports_not_running_when_socket_absent() {
+        let _guard = super::super::ENV_VAR_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VN_APP_DATA", tmp.path());
+        let err = call("status", serde_json::json!({})).expect_err("无 socket 应报未运行");
+        assert_eq!(err, NOT_RUNNING);
+        std::env::remove_var("VN_APP_DATA");
+    }
+}
