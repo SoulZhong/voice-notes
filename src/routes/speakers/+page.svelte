@@ -28,7 +28,7 @@
 </script>
 
 <main class="container">
-  <h1>我的会议搭子</h1>
+  <h1>会议搭子</h1>
   <p class="desc">
     录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,之后的录制会自动认出他并直接显示名字;
     认错拆重了就用<strong>合并</strong>归到同一个人。从左侧选择一个人查看详情、试听原声或管理。
