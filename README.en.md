@@ -29,6 +29,20 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 ## Installation
 
+> **Let an AI assistant install it for you**: paste the block below verbatim to your AI coding assistant (Claude Code / Codex, etc.) and it will download, install, and register the MCP integration for you:
+>
+> ```text
+> Please install voice-notes and set up its MCP integration for me:
+> 1. Download the latest voice-notes_*_aarch64.dmg from
+>    https://github.com/SoulZhong/voice-notes/releases;
+> 2. Mount the DMG, copy voice-notes.app into /Applications, then run
+>    xattr -dr com.apple.quarantine /Applications/voice-notes.app;
+> 3. Run /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto
+>    to register the MCP server, and confirm with ... mcp status --json;
+> 4. Remind me to open the app once manually to finish downloading the
+>    recognition models (~1GB, requires the GUI).
+> ```
+
 ### Requirements
 
 - **macOS 13 or later**, Apple Silicon (M-series) Mac — system-audio capture relies on ScreenCaptureKit, and only arm64 packages are provided for now
@@ -90,6 +104,49 @@ Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 | SenseVoice | Speech recognition (zh/en/ja/ko/yue) | Default ASR |
 | Whisper base | Speech recognition (multilingual) | Optional, switchable in Settings |
 | CAM++ (3D-Speaker) | Speaker embeddings | Optional; without it you get transcription only |
+
+## Connecting an AI assistant (MCP)
+
+voice-notes ships a built-in MCP (Model Context Protocol) server. Once registered, Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI can query your meeting notes directly — "What delivery date did we agree with Zhang San last week?", "Turn today's standup into an email."
+
+> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** "Allow AI to control recording" is off by default; enable it under Settings → AI Assistant Access.
+
+Three ways to connect (pick one):
+
+1. **In-app**: check the box on the first-launch welcome screen, or go to Settings → AI Assistant Access anytime to register/remove.
+2. **Command line** (no UI needed; an agent can run this directly):
+
+   ```bash
+   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto   # register with every detected agent
+   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp status --json           # check registration status
+   ```
+
+3. **Manual configuration** (for agents not auto-detected): add this to its MCP config:
+
+   ```json
+   { "mcpServers": { "voice-notes": {
+       "command": "/Applications/voice-notes.app/Contents/MacOS/voice-notes",
+       "args": ["mcp", "serve"] } } }
+   ```
+
+   Codex CLI (`~/.codex/config.toml`):
+
+   ```toml
+   [mcp_servers.voice-notes]
+   command = "/Applications/voice-notes.app/Contents/MacOS/voice-notes"
+   args = ["mcp", "serve"]
+   ```
+
+Tools provided:
+
+| Tool | Purpose | Requires the app running |
+| --- | --- | --- |
+| `list_notes` | List notes (pagination / time filter) | No |
+| `search_notes` | Full-text search over transcripts | No |
+| `get_note` | Read a note's full text (AI-polished version preferred) | No |
+| `list_speakers` | Global voiceprint library / speakers | No |
+| `recording_status` / `get_live_transcript` | Recording status / live transcript | Yes |
+| `start/stop/pause/resume_recording` | Control recording (disabled by default, enable in Settings) | Yes |
 
 ## Usage
 

@@ -29,6 +29,18 @@
 
 ## 安装
 
+> **让 AI 助手帮你装**:把下面这段话原样发给你的 AI 编程助手(Claude Code / Codex 等),它会完成下载、安装与 MCP 接入:
+>
+> ```text
+> 请帮我安装 voice-notes 并接入 MCP:
+> 1. 从 https://github.com/SoulZhong/voice-notes/releases 下载最新的 voice-notes_*_aarch64.dmg;
+> 2. 挂载 DMG,把 voice-notes.app 拷入 /Applications,然后执行
+>    xattr -dr com.apple.quarantine /Applications/voice-notes.app;
+> 3. 执行 /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto
+>    注册 MCP,并用 ... mcp status --json 确认注册成功;
+> 4. 提醒我手动打开一次 App 完成识别模型下载(约 1GB,需要 GUI)。
+> ```
+
 ### 系统要求
 
 - **macOS 13 或更高**、Apple Silicon（M 系列）Mac —— 系统声音采集依赖 ScreenCaptureKit，目前只提供 arm64 安装包
@@ -90,6 +102,49 @@ npm run tauri build    # 构建 .app + .dmg
 | SenseVoice | 语音识别（中/英/日/韩/粤） | 默认 ASR |
 | Whisper base | 语音识别（多语） | 可选，设置里切换 |
 | CAM++ (3D-Speaker) | 说话人声纹 | 可选，缺失时仅转写不区分说话人 |
+
+## 接入 AI 助手(MCP)
+
+voice-notes 内置 MCP(Model Context Protocol)服务:注册后,Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI 可以直接检索你的会议笔记——"上周和张三定的交付日期是哪天?"、"把今天的周会整理成邮件"。
+
+> **隐私提示**:笔记内容经 Agent 检索后会进入其 LLM 上下文,是否上云取决于你所用的 Agent 与模型;**voice-notes 自身仍然不联网上传任何内容**。"允许 AI 控制录制"默认关闭,可在 设置 → AI 助手接入 开启。
+
+三种接入方式(任选其一):
+
+1. **应用内**:首次启动的欢迎页勾选,或随时到 设置 → AI 助手接入 注册/移除。
+2. **命令行**(免打开界面,Agent 亦可直接执行):
+
+   ```bash
+   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto   # 注册到所有检测到的 Agent
+   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp status --json           # 查看注册状态
+   ```
+
+3. **手动配置**(未内置的 Agent):在其 MCP 配置里加:
+
+   ```json
+   { "mcpServers": { "voice-notes": {
+       "command": "/Applications/voice-notes.app/Contents/MacOS/voice-notes",
+       "args": ["mcp", "serve"] } } }
+   ```
+
+   Codex CLI(`~/.codex/config.toml`):
+
+   ```toml
+   [mcp_servers.voice-notes]
+   command = "/Applications/voice-notes.app/Contents/MacOS/voice-notes"
+   args = ["mcp", "serve"]
+   ```
+
+提供的工具:
+
+| 工具 | 用途 | 需要 App 运行 |
+| --- | --- | --- |
+| `list_notes` | 笔记列表(分页/时间过滤) | 否 |
+| `search_notes` | 全文检索转写内容 | 否 |
+| `get_note` | 读一场笔记全文(优先 AI 精修稿) | 否 |
+| `list_speakers` | 全局声纹库人物 | 否 |
+| `recording_status` / `get_live_transcript` | 录制状态 / 实时转写 | 是 |
+| `start/stop/pause/resume_recording` | 控制录制(默认禁用,设置里开启) | 是 |
 
 ## 使用
 
