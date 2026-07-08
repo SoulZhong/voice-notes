@@ -32,6 +32,15 @@ pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Ve
     }
 }
 
+pub fn retryable_download_error(message: &str) -> bool {
+    message != "cancelled"
+        && !message.contains("大小不符")
+        && !message.contains("SHA256 校验失败")
+        && !message.contains("压缩包内缺少目录")
+        && !message.contains("续传偏移越界")
+        && !message.starts_with("HTTP 4")
+}
+
 /// 流式计算文件 SHA256（hex 小写）。
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut f = fs::File::open(path)?;
@@ -244,7 +253,14 @@ pub fn download_artifact(
             drop(out); // 落盘已写字节，保留 .part
             anyhow::bail!("cancelled");
         }
-        let n = reader.read(&mut buf)?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = out.flush();
+                drop(out);
+                anyhow::bail!("下载中断: {e}");
+            }
+        };
         if n == 0 {
             break;
         }
@@ -312,6 +328,15 @@ mod tests {
             download_urls(u, true, "https://ghproxy.net/"),
             vec![format!("https://ghproxy.net/{u}"), u.to_string()],
         );
+    }
+
+    #[test]
+    fn retryable_download_error_keeps_transient_failures_retryable() {
+        assert!(retryable_download_error("下载中断: response body closed before all bytes were read"));
+        assert!(retryable_download_error("请求失败: Network Error: Operation timed out"));
+        assert!(!retryable_download_error("cancelled"));
+        assert!(!retryable_download_error("m.bin SHA256 校验失败"));
+        assert!(!retryable_download_error("HTTP 404"));
     }
 
     #[test]
