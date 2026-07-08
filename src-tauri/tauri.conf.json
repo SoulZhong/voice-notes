@@ -40,6 +40,7 @@
       "infoPlist": "Info.plist",
       "minimumSystemVersion": "13.0",
       "signingIdentity": "voice-notes Dev",
+      "entitlements": "./Entitlements.plist",
       "frameworks": [
         "target/release/libonnxruntime.1.17.1.dylib",
         "target/release/libsherpa-onnx-c-api.dylib",
