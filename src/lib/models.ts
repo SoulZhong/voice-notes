@@ -45,6 +45,10 @@ export type Settings = {
   refine_api_key: string;
   // 首启引导已完成(欢迎层走完或模型已就绪时静默补 true)
   onboarded: boolean;
+  // 允许 MCP(AI 助手)控制录制
+  mcp_allow_control: boolean;
+  // MCP 接入引导已展示过
+  mcp_onboarded: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
