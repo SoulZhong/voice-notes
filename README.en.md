@@ -96,7 +96,7 @@ Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 1. Hit **Start Recording** (or the global shortcut, default `⌥⌘R`).
 2. Talk — the current sentence stays centered and enlarged, speaker badges are assigned live, and any new voice that accumulates 10 seconds gets a global speaker number.
 3. Stop to land in the note view: play back, edit text, name speakers (name once, applies everywhere), export.
-4. Manage everyone in the **Voiceprints** page: audition their voice sample, rename, merge mis-split entries.
+4. Manage everyone in the **Buddies** page: audition their voice sample, rename, merge mis-split entries.
 
 ### Recording options (Settings → Recording)
 
