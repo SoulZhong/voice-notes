@@ -102,7 +102,10 @@ impl Registry {
                 let v: serde_json::Value = serde_json::from_str(&text).ok()?;
                 Some(v.get("mcpServers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
             }
-            Fmt::Toml => None, // Task 3
+            Fmt::Toml => {
+                let doc: toml_edit::DocumentMut = text.parse().ok()?;
+                Some(doc.get("mcp_servers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
+            }
         }
     }
 
@@ -111,7 +114,7 @@ impl Registry {
         let path = self.config_path(def);
         match def.fmt {
             Fmt::Json => self.upsert_json(&path),
-            Fmt::Toml => anyhow::bail!("TOML 注册未实现(Task 3)"),
+            Fmt::Toml => self.upsert_toml(&path),
         }
     }
 
@@ -123,7 +126,7 @@ impl Registry {
         }
         match def.fmt {
             Fmt::Json => self.remove_json(&path),
-            Fmt::Toml => anyhow::bail!("TOML 注销未实现(Task 3)"),
+            Fmt::Toml => self.remove_toml(&path),
         }
     }
 
@@ -157,6 +160,42 @@ impl Registry {
             return Ok(()); // 本就没有:不产生写入(也就不产生备份)
         }
         write_with_backup(path, &(serde_json::to_string_pretty(&root)? + "\n"))
+    }
+
+    fn upsert_toml(&self, path: &Path) -> anyhow::Result<()> {
+        let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(path) {
+            Ok(text) => text.parse().map_err(|e| {
+                anyhow::anyhow!("{} 不是合法 TOML,拒绝写入(请手动修复或手动配置): {e}", path.display())
+            })?,
+            Err(_) => toml_edit::DocumentMut::new(),
+        };
+        let mut args = toml_edit::Array::new();
+        args.push("mcp");
+        args.push("serve");
+        let servers = doc.entry("mcp_servers").or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let servers = servers.as_table_mut().ok_or_else(|| anyhow::anyhow!("{} 的 mcp_servers 不是表,拒绝写入", path.display()))?;
+        servers.set_implicit(false);
+        let mut entry = toml_edit::Table::new();
+        entry["command"] = toml_edit::value(self.exe.to_string_lossy().as_ref());
+        entry["args"] = toml_edit::value(args);
+        servers.insert("voice-notes", toml_edit::Item::Table(entry));
+        write_with_backup(path, &doc.to_string())
+    }
+
+    fn remove_toml(&self, path: &Path) -> anyhow::Result<()> {
+        let text = std::fs::read_to_string(path)?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{} 不是合法 TOML,拒绝写入: {e}", path.display()))?;
+        let removed = doc
+            .get_mut("mcp_servers")
+            .and_then(|t| t.as_table_mut())
+            .map(|t| t.remove("voice-notes").is_some())
+            .unwrap_or(false);
+        if !removed {
+            return Ok(());
+        }
+        write_with_backup(path, &doc.to_string())
     }
 }
 
@@ -265,5 +304,41 @@ mod tests {
         let cc = st.iter().find(|s| s.key == "claude-code").unwrap();
         assert!(cc.registered && cc.stale);
         assert_eq!(cc.command.as_deref(), Some("/old/path/voice-notes"));
+    }
+
+    #[test]
+    fn codex_toml_roundtrip_preserves_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            "# 用户自己的注释\nmodel = \"o3\"\n\n[mcp_servers.other]\ncommand = \"/bin/x\"\n",
+        )
+        .unwrap();
+        let r = reg(tmp.path());
+        r.register("codex").unwrap();
+        let text = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
+        assert!(text.contains("# 用户自己的注释"), "toml_edit 保注释:{text}");
+        assert!(text.contains("model = \"o3\""));
+        assert!(text.contains("[mcp_servers.other]"));
+        let st = r.status();
+        let codex = st.iter().find(|s| s.key == "codex").unwrap();
+        assert!(codex.registered && !codex.stale, "TOML read_command 也要通:{codex:?}");
+        // 注销后条目消失、其余保留
+        r.unregister("codex").unwrap();
+        let text = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
+        assert!(!text.contains("voice-notes"));
+        assert!(text.contains("[mcp_servers.other]"));
+    }
+
+    #[test]
+    fn codex_toml_created_when_missing_and_corrupt_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = reg(tmp.path());
+        r.register("codex").unwrap(); // 文件不存在 → 创建最小结构
+        let text = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
+        assert!(text.contains("[mcp_servers.voice-notes]"), "{text}");
+        std::fs::write(tmp.path().join(".codex/config.toml"), "= 不是 toml =").unwrap();
+        assert!(r.register("codex").is_err(), "坏 TOML 拒写");
     }
 }
