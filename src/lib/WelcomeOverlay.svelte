@@ -31,6 +31,9 @@
   let picked = $state<Record<string, boolean>>({});
   let outcomes = $state<RegisterOutcome[] | null>(null);
   let registering = $state(false);
+  // 防重入门闩:全部注册成功后 600ms 的自动收尾窗口里,用户仍可点「跳过/高级设置」,
+  // 不加闩会 finish 两次(点击一次 + 定时器一次;组件卸载不清定时器)。
+  let finishing = $state(false);
 
   /** 置 onboarded(含 mcp_onboarded:欢迎流即 MCP 引导,不再二次提示)。 */
   async function markOnboarded() {
@@ -43,6 +46,8 @@
   }
 
   async function finish(target: "/record" | "/settings") {
+    if (finishing) return;
+    finishing = true;
     await markOnboarded();
     onDone(target);
   }
@@ -121,7 +126,7 @@
           </label>
         {/each}
         <div class="connect-actions">
-          <button class="btn-primary" disabled={registering} onclick={registerPicked}>注册所选</button>
+          <button class="btn-primary" disabled={registering || finishing || outcomes !== null} onclick={registerPicked}>注册所选</button>
           <button class="link" disabled={registering} onclick={() => finish("/record")}>跳过</button>
         </div>
       </div>
