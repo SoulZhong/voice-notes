@@ -163,8 +163,8 @@
     <!-- 首拉中不闪"不存在" -->
   {:else if !person}
     <div class="empty">
-      <p>这个人不在声纹库里。</p>
-      <p class="hint">可能已被合并或删除。<a href="/speakers">回到声纹库</a></p>
+      <p>这个人不在「我的会议搭子」里。</p>
+      <p class="hint">可能已被合并或删除。<a href="/speakers">回到我的会议搭子</a></p>
     </div>
   {:else}
     <header class="head">
@@ -296,13 +296,13 @@
           <button
             class="op-btn danger-hover"
             disabled={recording.isLive}
-            title={recording.isLive ? "录制中不能删除" : "从声纹库删除(不影响已有笔记文字)"}
+            title={recording.isLive ? "录制中不能删除" : "从搭子中删除(不影响已有笔记文字)"}
             onclick={() => {
               closeAllOps();
               confirmDelete = true;
             }}
           >
-            从声纹库删除
+            从搭子中删除
           </button>
         {/if}
       </div>
