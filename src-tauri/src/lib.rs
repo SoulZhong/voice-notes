@@ -11,6 +11,7 @@ mod store;
 mod tray;
 pub mod diar;
 mod refine;
+pub mod mcp;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
