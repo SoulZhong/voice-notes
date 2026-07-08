@@ -23,7 +23,17 @@
     type ModelDownloadEvent,
     type MigrateEvent,
   } from "$lib/models";
-  import { mcpAgentsStatus, mcpRegister, mcpUnregister, mcpManualSnippet, mcpHealedCount, type AgentStatus } from "$lib/mcp";
+  import {
+    mcpAgentsStatus,
+    mcpRegister,
+    mcpUnregister,
+    mcpManualSnippet,
+    mcpHealedCount,
+    mcpSkillStatus,
+    mcpSkillInstall,
+    mcpSkillUninstall,
+    type AgentStatus,
+  } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
 
   let settings = $state<Settings | null>(null);
@@ -80,6 +90,10 @@
   let mcpHealed = $state(0);
   let mcpBusy = $state<string | null>(null); // 正在操作的 agent key,防连点
   let mcpError = $state("");
+
+  // Claude Code 技能:与 Agent 注册同理,真值源是磁盘文件,现查现示。
+  let skillState = $state<string | null>(null);
+  let skillBusy = $state(false);
 
   /** 磁盘:录音音频占用字节(null=统计中);清理展开态与选项;上次释放量文案。 */
   let audioBytes = $state<number | null>(null);
@@ -222,6 +236,7 @@
     refreshStatus();
     refreshDiskUsage();
     refreshMcp();
+    refreshSkill();
     mcpManualSnippet().then((s) => (mcpSnippet = s)).catch(() => {});
     mcpHealedCount().then((n) => (mcpHealed = n)).catch(() => {});
     // 开机自启读系统真值(与 settings 无关);失败静默,保持未勾选。
@@ -435,6 +450,30 @@
       mcpAgents = await mcpAgentsStatus();
     } catch (e) {
       mcpError = String(e);
+    }
+  }
+
+  async function refreshSkill() {
+    try {
+      skillState = await mcpSkillStatus();
+    } catch (e) {
+      mcpError = String(e);
+    }
+  }
+
+  async function toggleSkill() {
+    skillBusy = true;
+    try {
+      if (skillState === "not_installed") {
+        await mcpSkillInstall();
+      } else {
+        await mcpSkillUninstall();
+      }
+      await refreshSkill();
+    } catch (e) {
+      mcpError = String(e);
+    } finally {
+      skillBusy = false;
     }
   }
 
@@ -799,6 +838,23 @@
           {/if}
         </div>
       {/each}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">Claude Code 技能</span>
+          <span class="row-desc">
+            {#if skillState === "current"}已安装:Claude 掌握会议纪要/周报/检索工作流
+            {:else if skillState === "stale"}已安装(旧版,应用启动时自动更新)
+            {:else if skillState === "unmanaged"}检测到自定义同名技能,不自动管理
+            {:else}让 Claude Code 掌握会议纪要/周报/检索工作流(写入 ~/.claude/skills)
+            {/if}
+          </span>
+        </div>
+        {#if skillState !== null && skillState !== "unmanaged"}
+          <button class="btn-secondary" disabled={skillBusy} onclick={toggleSkill}>
+            {skillState === "not_installed" ? "安装" : "移除"}
+          </button>
+        {/if}
+      </div>
       <label class="row">
         <div class="row-info">
           <span class="row-label">允许 AI 控制录制</span>
