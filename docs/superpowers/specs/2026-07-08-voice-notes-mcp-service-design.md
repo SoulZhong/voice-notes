@@ -107,7 +107,7 @@ voice-notes mcp status [--json]
 
 | Agent | 检测依据 | 配置文件 | 写法 |
 |---|---|---|---|
-| Claude Code | `~/.claude` 或 PATH 有 `claude` | `~/.claude.json` 顶层 `mcpServers`(user scope) | JSON |
+| Claude Code | `~/.claude` 目录存在 | `~/.claude.json` 顶层 `mcpServers`(user scope) | JSON |
 | Claude Desktop | `~/Library/Application Support/Claude/` | 同目录 `claude_desktop_config.json` | JSON |
 | Cursor | `~/.cursor/` | `~/.cursor/mcp.json` | JSON |
 | Codex CLI | `~/.codex/` | `~/.codex/config.toml` `[mcp_servers.voice-notes]` | TOML |

@@ -51,6 +51,8 @@ pub fn spawn_listener(app: tauri::AppHandle) {
                 return;
             }
         };
+        // bind→chmod 间的 umask 窗口不可达:app_data 位于 ~/Library(700)之下,其它
+        // uid 无法遍历到本目录(终审已验证,接受这个理论上存在但实际打不到的窗口)。
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
         for conn in listener.incoming().flatten() {
             let app = app.clone();
@@ -152,7 +154,7 @@ fn dispatch(app: &tauri::AppHandle, req: &Req) -> Resp {
                 drop(slot);
                 // 会话未入槽且 running 已被清(启动失败路径)→ 提前报错
                 if !*state.running.lock().unwrap() {
-                    return err("录制启动失败(设备或模型异常,详见应用日志)");
+                    return err("录制未能进入进行中状态(设备/模型异常,或已被手动停止;详见应用日志)");
                 }
             }
             err("录制启动超时")

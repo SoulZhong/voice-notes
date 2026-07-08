@@ -118,7 +118,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **input**:`surface-press` 底、无边、radius-md;聚焦换 `canvas` 底 + `accent` 1px 环(box-shadow `0 0 0 1px`)。侧栏过滤框同款内嵌式。
 - **list-row**(笔记列表 / 说话人列表):透明底、行间 1px `hairline` 分隔;hover `surface-soft`;选中 / 活动 `surface-press`;整行可点。操作按钮 hover 显影。
 - **settings-row**(设置页,macOS 系统设置式):`surface` 卡片承载多行,行间 1px `hairline`;每行=左「标题(0.92rem `ink`)+一行大白话说明(0.8rem `ink-secondary`)」右控件;纯开关行整行可点(label);行级按钮 hover 显影。说明文案禁术语,一行说清。
-- **AI 助手接入**(设置页分组,settings-row 卡片内):Agent 列表逐行——左状态徽章(已注册/已注册(路径已由自愈修复或待修复)/未注册)+ 名字,右 `button-secondary`(注册/移除)按钮;下方「允许 AI 控制录制」toggle 行(纯开关行,整行可点);再下「手动配置」折叠卡——`button-secondary` 展开/收起,展开后 `.snippet` 等宽代码块(JSON 片段)+ `button-secondary`「复制」按钮。
+- **AI 助手接入**(设置页分组,settings-row 卡片内):Agent 列表逐行——row-label 是名字,row-desc 是状态(未检测到安装/未注册/已注册/已注册(路径已由自愈修复或待修复)),行尾 `button-secondary`(注册/移除)按钮;下方「允许 AI 控制录制」toggle 行(纯开关行,整行可点);再下「手动配置」折叠卡——`button-secondary` 展开/收起,展开后 `.snippet` 等宽代码块(JSON 片段)+ `button-secondary`「复制」按钮。
 - **segmented**(分段选择,设置行内多选一):`surface-press` 槽(radius-md、2px 内距),选中项 `canvas` 底浮起 + `shadow-btn`,未选中 `ink-secondary` 字 hover 变 `ink`;radio 视觉隐藏。用于外观主题/识别引擎等 2-4 项互斥选择。
 - **sidebar**:`surface` 底、右侧 1px `hairline`;条目 radius-md,hover `surface-soft`,当前页 `surface-press` + `ink` 加重;行级操作悬停显影;行间不画分隔线(靠间距与 hover)。录制按钮见上;过滤框内嵌式(`surface-press` 底、无边,聚焦浮出 `canvas` 底 + accent 环)。
 - **状态行**:辅助状态文字降为 caption 级 `ink-faint`,前缀 7px 状态点(活跃 `record`,空闲 `ink-faint`)。空态文案在容器内居中,不左对齐孤行。
