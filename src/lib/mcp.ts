@@ -19,3 +19,8 @@ export const mcpUnregister = (agent: string) => invoke<void>("mcp_unregister", {
 export const mcpManualSnippet = () => invoke<string>("mcp_manual_snippet");
 /** 启动自愈修复数(读即清零,提示条只出一次)。 */
 export const mcpHealedCount = () => invoke<number>("mcp_healed_count");
+
+/** Claude Code 技能状态:not_installed | current | stale | unmanaged。 */
+export const mcpSkillStatus = () => invoke<string>("mcp_skill_status");
+export const mcpSkillInstall = () => invoke<void>("mcp_skill_install");
+export const mcpSkillUninstall = () => invoke<void>("mcp_skill_uninstall");

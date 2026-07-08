@@ -6,8 +6,12 @@ fn main() {
     // 拦截——MCP 客户端 spawn 本进程时绝不能弹窗口/托盘。LaunchServices 正常打开
     // App 不带参数,不受影响。
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("mcp") {
-        std::process::exit(app_lib::mcp::cli_main(&args[2..]));
+    // CLI 词表与 mcp::cli_entry 的分发表一一对应;新增子命令两处同改。
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("mcp" | "notes" | "speakers" | "skill")
+    ) {
+        std::process::exit(app_lib::mcp::cli_entry(&args[1..]));
     }
     app_lib::run()
 }

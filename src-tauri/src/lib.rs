@@ -1674,6 +1674,28 @@ fn mcp_healed_count() -> u32 {
     MCP_HEALED.swap(0, Ordering::SeqCst) // 读即清:提示只出一次
 }
 
+#[tauri::command]
+fn mcp_skill_status() -> Result<String, String> {
+    use mcp::skill::SkillState::*;
+    Ok(match mcp::skill::status().map_err(|e| e.to_string())? {
+        NotInstalled => "not_installed",
+        Current => "current",
+        Stale => "stale",
+        Unmanaged => "unmanaged",
+    }
+    .into())
+}
+
+#[tauri::command]
+fn mcp_skill_install() -> Result<(), String> {
+    mcp::skill::install().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn mcp_skill_uninstall() -> Result<(), String> {
+    mcp::skill::uninstall().map_err(|e| e.to_string())
+}
+
 /// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
 /// 锁序：预载是唯一嵌套持两槽者——持 recognizer 槽锁期间嵌套获取 embedder 槽锁，
 /// 消除间隙内开录线程 take 到空 embedder 的静默降级（详见原 setup 注释）。
@@ -2278,6 +2300,8 @@ pub fn run() {
                         }
                     }
                 }
+                // Skill 同步:受管且过期(应用升级后)静默重写为当前版本。
+                let _ = crate::mcp::skill::heal();
             });
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
@@ -2324,7 +2348,10 @@ pub fn run() {
             mcp_register,
             mcp_unregister,
             mcp_manual_snippet,
-            mcp_healed_count
+            mcp_healed_count,
+            mcp_skill_status,
+            mcp_skill_install,
+            mcp_skill_uninstall
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

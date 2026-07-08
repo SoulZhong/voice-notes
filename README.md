@@ -29,17 +29,16 @@
 
 ## 安装
 
-> **让 AI 助手帮你装**:把下面这段话原样发给你的 AI 编程助手(Claude Code / Codex 等),它会完成下载、安装与 MCP 接入:
+> **给 AI 助手**:你正在读的这份 README 就是给你的操作说明。如果你在帮用户安装 voice-notes,直接按以下步骤执行(无需用户转达);装完后的接入与用法见下方[接入 AI 助手](#接入-ai-助手mcp--cli--skill)章节。
 >
-> ```text
-> 请帮我安装 voice-notes 并接入 MCP:
-> 1. 从 https://github.com/SoulZhong/voice-notes/releases 下载最新的 voice-notes_*_aarch64.dmg;
-> 2. 挂载 DMG,把 voice-notes.app 拷入 /Applications,然后执行
->    xattr -dr com.apple.quarantine /Applications/voice-notes.app;
-> 3. 执行 /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto
->    注册 MCP,并用 ... mcp status --json 确认注册成功;
-> 4. 提醒我手动打开一次 App 完成识别模型下载(约 1GB,需要 GUI)。
-> ```
+> 1. 从 https://github.com/SoulZhong/voice-notes/releases 下载最新的 `voice-notes_*_aarch64.dmg`;
+> 2. 挂载 DMG,把 `voice-notes.app` 拷入 `/Applications`,再执行
+>    `xattr -dr com.apple.quarantine /Applications/voice-notes.app`;
+> 3. 执行 `/Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto` 注册 MCP、
+>    `... skill install` 安装 Claude Code 技能(可选),用 `... mcp status --json` 确认;
+> 4. 提醒用户手动打开一次 App 完成识别模型下载(约 1GB,需要 GUI)。
+>
+> 以下是人工安装步骤。
 
 ### 系统要求
 
@@ -103,20 +102,32 @@ npm run tauri build    # 构建 .app + .dmg
 | Whisper base | 语音识别（多语） | 可选，设置里切换 |
 | CAM++ (3D-Speaker) | 说话人声纹 | 可选，缺失时仅转写不区分说话人 |
 
-## 接入 AI 助手(MCP)
+## 接入 AI 助手(MCP · CLI · Skill)
 
-voice-notes 内置 MCP(Model Context Protocol)服务:注册后,Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI 可以直接检索你的会议笔记——"上周和张三定的交付日期是哪天?"、"把今天的周会整理成邮件"。
+让本地 Agent(Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI)读你的会议笔记来回答问题、整理纪要、写周报——"上周和张三定的交付日期是哪天?"、"把今天的周会整理成邮件"、"这周开了哪些会、各自的待办是什么"。三个接入面,按需选:
 
-> **隐私提示**:笔记内容经 Agent 检索后会进入其 LLM 上下文,是否上云取决于你所用的 Agent 与模型;**voice-notes 自身仍然不联网上传任何内容**。"允许 AI 控制录制"默认关闭,可在 设置 → AI 助手接入 开启。
+| 接入面 | 是什么 | 用在哪 |
+| --- | --- | --- |
+| **MCP 服务** | Agent 的标准工具协议,10 个工具(检索 / 读全文 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
+| **命令行 CLI** | 同一套查询能力的命令行版,可 `--json` | 脚本、CI,或 Agent 没配 MCP 时的降级 |
+| **Claude Code 技能** | 教 Claude Code 何时怎么组合上面的工具(纪要 / 周报 / 检索工作流) | 锦上添花,让 Claude 开箱会用 |
 
-三种接入方式(任选其一):
+> **隐私提示**:笔记内容一旦被 Agent 检索就进入其 LLM 上下文,是否上云取决于你所用的 Agent 与模型;**voice-notes 自身仍然不联网上传任何内容**。录制控制类工具默认禁用,需在 设置 → AI 助手接入 开启「允许 AI 控制录制」。
 
-1. **应用内**:首次启动的欢迎页勾选,或随时到 设置 → AI 助手接入 注册/移除。
-2. **命令行**(免打开界面,Agent 亦可直接执行):
+**最快上手**:打开 设置 → AI 助手接入,一键注册 MCP + 安装技能。(AI 助手可直接按[安装](#安装)章节的步骤自行完成。)
+
+### MCP 服务
+
+三种注册方式(任选其一):
+
+1. **应用内**:欢迎页勾选,或 设置 → AI 助手接入 注册/移除。
+2. **命令行**(Agent 亦可直接执行):
 
    ```bash
-   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto   # 注册到所有检测到的 Agent
-   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp status --json           # 查看注册状态
+   VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
+   "$VN" mcp register --agent auto    # 注册到所有检测到的 Agent(claude-code/claude-desktop/cursor/codex/gemini)
+   "$VN" mcp status --json            # 查看各 Agent 注册状态
+   "$VN" mcp unregister --agent cursor
    ```
 
 3. **手动配置**(未内置的 Agent):在其 MCP 配置里加:
@@ -135,16 +146,51 @@ voice-notes 内置 MCP(Model Context Protocol)服务:注册后,Claude Code / Cla
    args = ["mcp", "serve"]
    ```
 
-提供的工具:
+提供的 10 个工具:
 
-| 工具 | 用途 | 需要 App 运行 |
+| 工具 | 用途 | 前提 |
 | --- | --- | --- |
-| `list_notes` | 笔记列表(分页/时间过滤) | 否 |
-| `search_notes` | 全文检索转写内容 | 否 |
-| `get_note` | 读一场笔记全文(优先 AI 精修稿) | 否 |
-| `list_speakers` | 全局声纹库人物 | 否 |
-| `recording_status` / `get_live_transcript` | 录制状态 / 实时转写 | 是 |
-| `start/stop/pause/resume_recording` | 控制录制(默认禁用,设置里开启) | 是 |
+| `list_notes` | 笔记列表(分页 / 时间过滤;含说话人数、是否有精修稿) | 无需 App 运行 |
+| `search_notes` | 全文检索转写内容,命中带前后一句上下文 | 无需 App 运行 |
+| `get_note` | 读一场笔记全文(默认优先 AI 精修稿) | 无需 App 运行 |
+| `list_speakers` | 全局声纹库人物(跨会议一致的编号 / 名字) | 无需 App 运行 |
+| `recording_status` | 当前录制状态 | App 运行中 |
+| `get_live_transcript` | 正在录制会话的实时转写 | App 运行中 |
+| `start` / `stop` / `pause` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
+
+查询类四工具直读本机数据文件,App 没开也能用;其余经 App 内本地 socket,需 App 运行。
+
+### 命令行直查(无需 MCP)
+
+脚本、CI,或 Agent 没配 MCP 时用。默认人读表格,`--json` 与对应 MCP 工具**同一份 JSON**:
+
+```bash
+VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
+"$VN" notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]
+"$VN" notes search "交付日期" [--limit N] [--json]
+"$VN" notes get <note-id> [--format md|txt|json] [--raw]   # 默认 md;--raw 取原始逐字稿(忽略精修)
+"$VN" speakers list [--json]
+```
+
+退出码:`0` 成功 / `1` 执行错(如 note-id 不存在)/ `2` 用法错(参数缺失或未知);未知参数一律报错,不静默忽略。
+
+### Claude Code 技能
+
+一行命令让 Claude Code 掌握会议纪要、周报汇总、决议检索等工作流(也可在 设置 → AI 助手接入 一键安装 / 移除):
+
+```bash
+/Applications/voice-notes.app/Contents/MacOS/voice-notes skill install   # status 查看 / uninstall 移除
+```
+
+写入 `~/.claude/skills/voice-notes/`,应用升级时自动更新(不覆盖你自己改过的同名技能)。
+
+### 给 Agent 的调用要点
+
+- **首选 MCP 工具;不可用时降级到 CLI**(`notes … --json`、`speakers list --json`,与 MCP 同一份 JSON)。两者都不通时按上方指令注册:`mcp register --agent auto`。
+- **先检索再取全文**:`search_notes` 拿 note_id → `get_note`,别把 `list_notes` 全量拉回逐个读。
+- `get_note` 默认给 AI 精修稿(响应 `refined` 字段标注来源);要原始逐字稿用 CLI `--raw` 或 MCP `prefer_refined=false`。
+- 录制控制默认禁用;被拒时把「去 设置 → AI 助手接入 开启」转告用户,不要反复重试。
+- 笔记是用户本机隐私数据,进入你的上下文即离开本机——按需检索,引用大段原文前先确认意图。
 
 ## 使用
 

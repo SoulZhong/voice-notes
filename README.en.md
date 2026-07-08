@@ -29,19 +29,18 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 ## Installation
 
-> **Let an AI assistant install it for you**: paste the block below verbatim to your AI coding assistant (Claude Code / Codex, etc.) and it will download, install, and register the MCP integration for you:
+> **For AI assistants**: the README you're reading is your operating manual. If you're helping the user install voice-notes, run these steps directly (no need for the user to relay them); for connecting and usage after install, see the [Connecting an AI assistant](#connecting-an-ai-assistant-mcp--cli--skill) section below.
 >
-> ```text
-> Please install voice-notes and set up its MCP integration for me:
-> 1. Download the latest voice-notes_*_aarch64.dmg from
+> 1. Download the latest `voice-notes_*_aarch64.dmg` from
 >    https://github.com/SoulZhong/voice-notes/releases;
-> 2. Mount the DMG, copy voice-notes.app into /Applications, then run
->    xattr -dr com.apple.quarantine /Applications/voice-notes.app;
-> 3. Run /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto
->    to register the MCP server, and confirm with ... mcp status --json;
-> 4. Remind me to open the app once manually to finish downloading the
+> 2. Mount the DMG, copy `voice-notes.app` into `/Applications`, then run
+>    `xattr -dr com.apple.quarantine /Applications/voice-notes.app`;
+> 3. Run `/Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto` to register MCP,
+>    `... skill install` to install the Claude Code skill (optional), and confirm with `... mcp status --json`;
+> 4. Remind the user to open the app once manually to finish downloading the
 >    recognition models (~1GB, requires the GUI).
-> ```
+>
+> Manual installation steps follow below.
 
 ### Requirements
 
@@ -105,20 +104,32 @@ Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 | Whisper base | Speech recognition (multilingual) | Optional, switchable in Settings |
 | CAM++ (3D-Speaker) | Speaker embeddings | Optional; without it you get transcription only |
 
-## Connecting an AI assistant (MCP)
+## Connecting an AI assistant (MCP · CLI · Skill)
 
-voice-notes ships a built-in MCP (Model Context Protocol) server. Once registered, Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI can query your meeting notes directly — "What delivery date did we agree with Zhang San last week?", "Turn today's standup into an email."
+Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI) read your meeting notes to answer questions, draft recaps, write weekly summaries — "What delivery date did we agree with Zhang San last week?", "Turn today's standup into an email", "Which meetings did we have this week and what are the action items?" Three surfaces, pick as needed:
 
-> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** "Allow AI to control recording" is off by default; enable it under Settings → AI Assistant Access.
+| Surface | What it is | When to use |
+| --- | --- | --- |
+| **MCP server** | The standard agent tool protocol, 10 tools (search / read full text / recording status & control) | Preferred, for MCP-capable agents |
+| **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
+| **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
-Three ways to connect (pick one):
+> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** Recording-control tools are disabled by default; enable "Allow AI to control recording" under Settings → AI Assistant Access.
 
-1. **In-app**: check the box on the first-launch welcome screen, or go to Settings → AI Assistant Access anytime to register/remove.
-2. **Command line** (no UI needed; an agent can run this directly):
+**Fastest start**: open Settings → AI Assistant Access to register MCP and install the skill in one click. (An AI assistant can just follow the [Installation](#installation) steps and do it itself.)
+
+### MCP server
+
+Three ways to register (pick one):
+
+1. **In-app**: check the box on the welcome screen, or go to Settings → AI Assistant Access to register/remove.
+2. **Command line** (an agent can run this directly):
 
    ```bash
-   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto   # register with every detected agent
-   /Applications/voice-notes.app/Contents/MacOS/voice-notes mcp status --json           # check registration status
+   VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
+   "$VN" mcp register --agent auto    # register with every detected agent (claude-code/claude-desktop/cursor/codex/gemini)
+   "$VN" mcp status --json            # check each agent's registration status
+   "$VN" mcp unregister --agent cursor
    ```
 
 3. **Manual configuration** (for agents not auto-detected): add this to its MCP config:
@@ -137,16 +148,51 @@ Three ways to connect (pick one):
    args = ["mcp", "serve"]
    ```
 
-Tools provided:
+The 10 tools:
 
-| Tool | Purpose | Requires the app running |
+| Tool | Purpose | Prerequisite |
 | --- | --- | --- |
-| `list_notes` | List notes (pagination / time filter) | No |
-| `search_notes` | Full-text search over transcripts | No |
-| `get_note` | Read a note's full text (AI-polished version preferred) | No |
-| `list_speakers` | Global voiceprint library / speakers | No |
-| `recording_status` / `get_live_transcript` | Recording status / live transcript | Yes |
-| `start/stop/pause/resume_recording` | Control recording (disabled by default, enable in Settings) | Yes |
+| `list_notes` | List notes (pagination / time filter; includes speaker count and whether a polished version exists) | App need not be running |
+| `search_notes` | Full-text search over transcripts, hits carry one sentence of context on each side | App need not be running |
+| `get_note` | Read a note's full text (AI-polished version preferred by default) | App need not be running |
+| `list_speakers` | Global voiceprint library / speakers (stable cross-meeting id / name) | App need not be running |
+| `recording_status` | Current recording state | App running |
+| `get_live_transcript` | Live transcript of the in-progress session | App running |
+| `start` / `stop` / `pause` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
+
+The four query tools read local data files directly and work even when the app is closed; the rest go through an in-app local socket and need the app running.
+
+### Query from the command line (no MCP needed)
+
+For scripts, CI, or when an agent has no MCP configured. Human-readable tables by default; `--json` returns **the same JSON** as the corresponding MCP tool:
+
+```bash
+VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
+"$VN" notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]
+"$VN" notes search "delivery date" [--limit N] [--json]
+"$VN" notes get <note-id> [--format md|txt|json] [--raw]   # md by default; --raw = raw transcript (ignore the polished version)
+"$VN" speakers list [--json]
+```
+
+Exit codes: `0` success / `1` execution error (e.g. note-id not found) / `2` usage error (missing or unknown argument); unknown flags always error out rather than being silently ignored.
+
+### Claude Code skill
+
+One command teaches Claude Code the workflows for meeting recaps, weekly summaries, and finding decisions/action items (or install/remove it with one click under Settings → AI Assistant Access):
+
+```bash
+/Applications/voice-notes.app/Contents/MacOS/voice-notes skill install   # status to check / uninstall to remove
+```
+
+Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (without overwriting a same-named skill you've customized).
+
+### Notes for agents
+
+- **Prefer MCP tools; fall back to the CLI when unavailable** (`notes … --json`, `speakers list --json` — the same JSON as MCP). If neither works, register per the commands above: `mcp register --agent auto`.
+- **Search before fetching full text**: `search_notes` for the note_id → `get_note`; don't pull all of `list_notes` and read each one.
+- `get_note` returns the AI-polished version by default (the `refined` field marks the source); for the raw transcript use CLI `--raw` or MCP `prefer_refined=false`.
+- Recording control is disabled by default; when refused, relay "enable it under Settings → AI Assistant Access" to the user instead of retrying.
+- Notes are the user's private local data — once in your context they've left the machine. Retrieve only as needed, and confirm intent before quoting long passages.
 
 ## Usage
 
