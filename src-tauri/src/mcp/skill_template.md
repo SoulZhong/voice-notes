@@ -12,15 +12,15 @@ description: 查询本机 voice-notes 会议笔记(实时转写+说话人识别)
 优先用 MCP 工具(server 名 `voice-notes`)。MCP 工具不可用时改用 CLI,输出与 MCP 同一 JSON 形状:
 
 ```bash
-/Applications/voice-notes.app/Contents/MacOS/voice-notes notes list --json
-/Applications/voice-notes.app/Contents/MacOS/voice-notes notes search "关键词" --json
-/Applications/voice-notes.app/Contents/MacOS/voice-notes notes get <note-id> --format md
-/Applications/voice-notes.app/Contents/MacOS/voice-notes speakers list --json
+{{BINARY}} notes list --json
+{{BINARY}} notes search "关键词" --json
+{{BINARY}} notes get <note-id> --format md
+{{BINARY}} speakers list --json
 ```
 
 需要原始逐字稿时加 --raw。
 
-MCP 未注册时,**先征得用户同意**后可代为注册:`/Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto`。
+MCP 未注册时,**先征得用户同意**后可代为注册:`{{BINARY}} mcp register --agent auto`。
 
 ## 使用策略
 
