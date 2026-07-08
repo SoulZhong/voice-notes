@@ -94,7 +94,18 @@ fn stdio_initialize_list_and_call_tools() {
 
     let tools = mcp.request("tools/list", serde_json::json!({}));
     let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expect in ["list_notes", "search_notes", "get_note", "list_speakers"] {
+    for expect in [
+        "list_notes",
+        "search_notes",
+        "get_note",
+        "list_speakers",
+        "recording_status",
+        "get_live_transcript",
+        "start_recording",
+        "stop_recording",
+        "pause_recording",
+        "resume_recording",
+    ] {
         assert!(names.contains(&expect), "缺工具 {expect}: {names:?}");
     }
 
@@ -118,4 +129,9 @@ fn stdio_initialize_list_and_call_tools() {
         serde_json::json!({ "name": "get_note", "arguments": { "note_id": "no-such" } }),
     );
     assert_eq!(r["isError"], true, "{r}");
+
+    // App 未运行(VN_APP_DATA 指向 tempdir,必无 mcp.sock):UDS 工具给指引性错误而非崩溃
+    let r = mcp.request("tools/call", serde_json::json!({ "name": "recording_status", "arguments": {} }));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("未在运行"), "{r}");
 }

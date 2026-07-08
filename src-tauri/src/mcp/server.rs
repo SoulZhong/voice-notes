@@ -1,4 +1,4 @@
-//! rmcp stdio MCP 服务。查询工具直读数据文件;UDS 工具(状态/实时/控制)见 Task 14。
+//! rmcp stdio MCP 服务。查询工具直读数据文件;UDS 工具(状态/实时/控制)经 bridge 连 GUI。
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -52,6 +52,27 @@ pub struct GetNoteParams {
     pub prefer_refined: Option<bool>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LiveParams {
+    /// 返回最近几句,默认 50,最大 500
+    pub tail: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct StartParams {
+    /// 可选:本场录制的标题
+    pub title: Option<String>,
+}
+
+/// UDS 桥的阻塞 IO 包一层 spawn_blocking,避免占用 tokio 工作线程。
+async fn bridge_call(op: &'static str, extra: serde_json::Value) -> CallToolResult {
+    match tokio::task::spawn_blocking(move || super::bridge::call(op, extra)).await {
+        Ok(Ok(data)) => ok_json(data),
+        Ok(Err(msg)) => err_text(msg),
+        Err(e) => err_text(format!("内部错误: {e}")),
+    }
+}
+
 #[tool_router]
 impl VnMcp {
     #[tool(description = "列出会议笔记(倒序分页;from/to 可按时间过滤)。返回 id/标题/开始时间/时长/状态。")]
@@ -79,6 +100,36 @@ impl VnMcp {
     async fn list_speakers(&self) -> Result<CallToolResult, McpError> {
         let roots = tools::resolve_roots();
         Ok(ok_json(tools::list_speakers(&roots)))
+    }
+
+    #[tool(description = "查询录制状态(idle/recording/paused)、当前笔记 id 与已录时长。需要 voice-notes 应用正在运行。")]
+    async fn recording_status(&self) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("status", serde_json::json!({})).await)
+    }
+
+    #[tool(description = "获取正在录制会话的实时转写(最近 N 句,含说话人与时间戳)。需要应用正在运行且正在录制。")]
+    async fn get_live_transcript(&self, Parameters(p): Parameters<LiveParams>) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("live", serde_json::json!({ "tail": p.tail })).await)
+    }
+
+    #[tool(description = "开始录制一场会议(可选标题)。需要应用正在运行,且用户已在 设置 → AI 助手接入 开启「允许 AI 控制录制」。")]
+    async fn start_recording(&self, Parameters(p): Parameters<StartParams>) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("start", serde_json::json!({ "title": p.title })).await)
+    }
+
+    #[tool(description = "停止当前录制并返回笔记 id。需要应用运行 + 用户开启「允许 AI 控制录制」。")]
+    async fn stop_recording(&self) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("stop", serde_json::json!({})).await)
+    }
+
+    #[tool(description = "暂停当前录制。需要应用运行 + 用户开启「允许 AI 控制录制」。")]
+    async fn pause_recording(&self) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("pause", serde_json::json!({})).await)
+    }
+
+    #[tool(description = "恢复已暂停的录制。需要应用运行 + 用户开启「允许 AI 控制录制」。")]
+    async fn resume_recording(&self) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("resume", serde_json::json!({})).await)
     }
 }
 

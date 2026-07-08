@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+pub mod bridge;
 pub mod registry;
 pub mod server;
 pub mod tools;
