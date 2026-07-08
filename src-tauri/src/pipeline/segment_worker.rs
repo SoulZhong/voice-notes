@@ -1,4 +1,4 @@
-use crate::audio::{resample::resample_linear, to_mono, AudioFrame, Source};
+use crate::audio::{resample::StreamResampler, to_mono, AudioFrame, Source};
 use crate::pipeline::segmenter::Segmenter;
 use crate::session::{FinalJob, PartialJob};
 use crossbeam_channel::{Receiver, Sender};
@@ -62,9 +62,17 @@ pub fn run_segment_worker(
     let mut was_paused = false;
     let mut level_sumsq: f64 = 0.0;
     let mut level_count: usize = 0;
+    // 流式重采样器(跨块相位连续):逐块独立重采样会因每块取整注入 ~0.2% 时钟
+    // 漂移(两轨每分钟漂 ~110ms,AEC 参考流脱锁,见 StreamResampler 文档)。
+    // 设备中途换率(如拔插耳机)时按新率重建——相位清零可接受,率切换本身就是断点。
+    let mut resampler: Option<StreamResampler> = None;
     for frame in frame_rx.iter() {
         let mono = to_mono(&frame.samples, frame.channels);
-        let resampled = resample_linear(&mono, frame.sample_rate, target_rate);
+        let rs = match &mut resampler {
+            Some(r) if r.from_rate() == frame.sample_rate => r,
+            _ => resampler.insert(StreamResampler::new(frame.sample_rate, target_rate)),
+        };
+        let resampled = rs.process(&mono);
 
         if let Some(cb) = &on_level {
             level_sumsq += resampled.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
