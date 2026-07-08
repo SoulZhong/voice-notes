@@ -9,6 +9,7 @@
     setSettings,
     type ModelsStatus,
   } from "$lib/models";
+  import { mcpAgentsStatus, mcpRegister, type AgentStatus, type RegisterOutcome } from "$lib/mcp";
 
   let {
     status,
@@ -23,13 +24,55 @@
   // svelte-ignore state_referenced_locally
   let current = $state(status);
 
-  /** 置 onboarded 前重取 settings:引导期间用户不可能改设置,但避免覆写并发状态的姿势要统一。 */
+  // 相位:download(模型下载,现状) → connect(连接 AI 助手,可跳过) → 结束。
+  // 未检测到任何 Agent 时 connect 整步自动跳过(spec §四)。
+  let phase = $state<"download" | "connect">("download");
+  let agents = $state<AgentStatus[]>([]);
+  let picked = $state<Record<string, boolean>>({});
+  let outcomes = $state<RegisterOutcome[] | null>(null);
+  let registering = $state(false);
+
+  /** 置 onboarded(含 mcp_onboarded:欢迎流即 MCP 引导,不再二次提示)。 */
   async function markOnboarded() {
     try {
       const s = await getSettings();
-      await setSettings({ ...s, onboarded: true });
+      await setSettings({ ...s, onboarded: true, mcp_onboarded: true });
     } catch {
       /* 落盘失败下次启动会再见到欢迎层,幂等,不打断跳转 */
+    }
+  }
+
+  async function finish(target: "/record" | "/settings") {
+    await markOnboarded();
+    onDone(target);
+  }
+
+  async function maybeConnect() {
+    try {
+      agents = (await mcpAgentsStatus()).filter((a) => a.installed);
+    } catch {
+      agents = [];
+    }
+    if (agents.length === 0) {
+      await finish("/record");
+      return;
+    }
+    // 已拍板:默认全选
+    picked = Object.fromEntries(agents.map((a) => [a.key, true]));
+    phase = "connect";
+  }
+
+  async function registerPicked() {
+    registering = true;
+    const keys = agents.filter((a) => picked[a.key]).map((a) => a.key);
+    try {
+      outcomes = keys.length ? await mcpRegister(keys) : [];
+    } catch {
+      outcomes = keys.map((key) => ({ key, ok: false, error: "调用失败" }));
+    }
+    registering = false;
+    if ((outcomes ?? []).every((o) => o.ok)) {
+      setTimeout(() => finish("/record"), 600); // 让用户看见打勾再走
     }
   }
 
@@ -40,14 +83,12 @@
       return;
     }
     if (current.recording_ready) {
-      await markOnboarded();
-      onDone("/record");
+      await maybeConnect(); // 原直接 finish("/record"),现插入 connect 步
     }
   }
 
   async function advanced() {
-    await markOnboarded();
-    onDone("/settings");
+    await finish("/settings");
   }
 </script>
 
@@ -59,9 +100,32 @@
       <p class="tagline">会议实时转写与说话人分离，全程本地运行</p>
     </div>
 
-    <ModelDownloadCard status={current} onComplete={refresh} primaryLabel="开 始 使 用" />
-
-    <p class="hints">首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。</p>
+    {#if phase === "download"}
+      <ModelDownloadCard status={current} onComplete={refresh} primaryLabel="开 始 使 用" />
+      <p class="hints">首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。</p>
+    {:else}
+      <div class="connect">
+        <h2>连接 AI 助手</h2>
+        <p class="hints">
+          让 Claude / Cursor 等直接检索你的会议笔记。注册后,AI 助手查到的笔记内容会进入其模型上下文;随时可在
+          设置 → AI 助手接入 移除。
+        </p>
+        {#each agents as a (a.key)}
+          <label class="agent-row">
+            <input type="checkbox" bind:checked={picked[a.key]} disabled={registering || outcomes !== null} />
+            <span>{a.name}</span>
+            {#if outcomes}
+              {@const o = outcomes.find((x) => x.key === a.key)}
+              {#if o}<span class="mark-txt" class:bad={!o.ok}>{o.ok ? "✓ 已注册" : `✕ ${o.error ?? "失败"}`}</span>{/if}
+            {/if}
+          </label>
+        {/each}
+        <div class="connect-actions">
+          <button class="btn-primary" disabled={registering} onclick={registerPicked}>注册所选</button>
+          <button class="link" disabled={registering} onclick={() => finish("/record")}>跳过</button>
+        </div>
+      </div>
+    {/if}
 
     <div class="foot">
       <button class="link" onclick={advanced}>高级设置 →</button>
@@ -140,5 +204,34 @@
   .link:hover {
     color: var(--ink);
     background: var(--surface-soft);
+  }
+  .connect { text-align: left; }
+  .connect h2 { margin: 0 0 0.4rem; font-size: 1.1rem; text-align: center; }
+  .agent-row {
+    display: flex; align-items: center; gap: 0.6rem;
+    padding: 0.55rem 0.4rem; border-radius: var(--radius-sm);
+  }
+  .agent-row:hover { background: var(--surface-soft); }
+  .mark-txt { margin-left: auto; font-size: 0.85rem; color: var(--ink-secondary); }
+  .mark-txt.bad { color: var(--record); }
+  .connect-actions { display: flex; justify-content: center; gap: 0.8rem; margin-top: 1rem; }
+  /* button-primary:本组件此前无主按钮类,样式对齐 ModelDownloadCard/settings 页的 primary 药丸 */
+  .btn-primary {
+    border-radius: var(--radius-full);
+    border: 1px solid transparent;
+    padding: 0.5em 1.4em;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    background: var(--primary);
+    color: var(--on-primary);
+    box-shadow: var(--shadow-btn);
+  }
+  .btn-primary:hover {
+    background: var(--primary-pressed);
+  }
+  .btn-primary:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 </style>

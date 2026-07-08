@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
-  import { modelsStatus, getSettings, type ModelsStatus } from "$lib/models";
+  import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
 
@@ -56,10 +57,27 @@
     }
   }
 
+  // 存量用户 MCP 引导:onboarded(老用户)且 mcp_onboarded 为 false 时出一次提示条。
+  // 新用户在欢迎页已走过(markOnboarded 同置两标记),不会看到。
+  let showMcpHint = $state(false);
+  async function dismissMcpHint(goSettings: boolean) {
+    showMcpHint = false;
+    try {
+      const s = await getSettings();
+      await setSettings({ ...s, mcp_onboarded: true });
+    } catch {
+      /* 置失败下次再提示,可接受 */
+    }
+    if (goSettings) goto("/settings");
+  }
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
     refreshBtRisk();
+    getSettings().then((s) => {
+      showMcpHint = s.onboarded && !s.mcp_onboarded;
+    }).catch(() => {});
     // 用户去系统设置勾选/换音频设备后切回来,焦点事件驱动横幅刷新,无需重启页面。
     const onFocus = () => {
       refreshScreenPerm();
@@ -204,6 +222,14 @@
   </div>
 
   {#if !models || models.recording_ready}
+
+    {#if showMcpHint}
+      <div class="banner">
+        新功能：把会议笔记接入 Claude / Cursor 等 AI 助手（MCP）。
+        <button class="link" onclick={() => dismissMcpHint(true)}>去设置</button>
+        <button class="link" onclick={() => dismissMcpHint(false)}>知道了</button>
+      </div>
+    {/if}
 
     {#if btEchoRisk && !recording.isLive}
       <div class="banner">
