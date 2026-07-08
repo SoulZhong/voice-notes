@@ -24,6 +24,7 @@
     type MigrateEvent,
   } from "$lib/models";
   import { mcpAgentsStatus, mcpRegister, mcpUnregister, mcpManualSnippet, mcpHealedCount, type AgentStatus } from "$lib/mcp";
+  import { openUrl } from "@tauri-apps/plugin-opener";
 
   let settings = $state<Settings | null>(null);
   let status = $state<ModelsStatus | null>(null);
@@ -450,8 +451,24 @@
     } catch (e) {
       mcpError = String(e);
     }
-    mcpBusy = null;
+    // mcpBusy 复位放在 refreshMcp 之后(finally 语义):按钮解禁必须等列表真正
+    // 刷新完成,否则刷新期间有一个窄窗口按钮已可点,连点可能撞上刷新中的旧数据。
     await refreshMcp();
+    mcpBusy = null;
+  }
+
+  /** 手动配置片段复制。剪贴板权限被拒/不可用时静默失败会让用户以为复制成功却粘贴出空内容——
+   *  失败时改提示手动选择文本;成功不额外提示(与现状一致)。 */
+  async function copyMcpSnippet() {
+    try {
+      await navigator.clipboard.writeText(mcpSnippet);
+    } catch {
+      mcpError = "复制失败,请展开后手动选择文本复制";
+    }
+  }
+
+  async function openMcpReadme() {
+    await openUrl("https://github.com/SoulZhong/voice-notes#%E6%8E%A5%E5%85%A5-ai-%E5%8A%A9%E6%89%8B%EF%BC%88mcp%EF%BC%89");
   }
 
   async function saveMcpAllowControl() {
@@ -799,13 +816,16 @@
       {#if mcpSnippetOpen}
         <div class="config">
           <pre class="snippet">{mcpSnippet}</pre>
-          <button class="btn-secondary" onclick={() => navigator.clipboard.writeText(mcpSnippet)}>复制</button>
+          <button class="btn-secondary" onclick={copyMcpSnippet}>复制</button>
         </div>
       {/if}
       {#if mcpHealed > 0}
         <p class="config-hint">应用位置变更:已自动更新 {mcpHealed} 个 AI 助手的注册路径。</p>
       {/if}
-      <p class="config-hint">笔记内容经 AI 助手检索后会进入其模型上下文;本应用自身不联网上传任何内容。</p>
+      <p class="config-hint">
+        笔记内容经 AI 助手检索后会进入其模型上下文;本应用自身不联网上传任何内容。
+        <button class="link" onclick={openMcpReadme}>详见 README</button>
+      </p>
     </div>
   </section>
 

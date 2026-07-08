@@ -34,6 +34,9 @@
   // 防重入门闩:全部注册成功后 600ms 的自动收尾窗口里,用户仍可点「跳过/高级设置」,
   // 不加闩会 finish 两次(点击一次 + 定时器一次;组件卸载不清定时器)。
   let finishing = $state(false);
+  // 失败可原地重试(改选后再点「注册所选」),只有全成功才锁定 checkbox/按钮——
+  // 否则用户看到失败结果却无法调整勾选重试,只能靠「跳过」放弃整个引导步骤。
+  const registerLocked = $derived(registering || finishing || (outcomes !== null && outcomes.every((o) => o.ok)));
 
   /** 置 onboarded(含 mcp_onboarded:欢迎流即 MCP 引导,不再二次提示)。 */
   async function markOnboarded() {
@@ -68,6 +71,9 @@
   }
 
   async function registerPicked() {
+    // 失败可原地重试,只有全成功才锁定:先清掉上一轮 outcomes,让 UI 回到「待注册」态,
+    // 否则 disabled 表达式里的 outcomes !== null 会一直挡住这次重试的点击。
+    outcomes = null;
     registering = true;
     const keys = agents.filter((a) => picked[a.key]).map((a) => a.key);
     try {
@@ -117,7 +123,7 @@
         </p>
         {#each agents as a (a.key)}
           <label class="agent-row">
-            <input type="checkbox" bind:checked={picked[a.key]} disabled={registering || outcomes !== null} />
+            <input type="checkbox" bind:checked={picked[a.key]} disabled={registerLocked} />
             <span>{a.name}</span>
             {#if outcomes}
               {@const o = outcomes.find((x) => x.key === a.key)}
@@ -126,7 +132,7 @@
           </label>
         {/each}
         <div class="connect-actions">
-          <button class="btn-primary" disabled={registering || finishing || outcomes !== null} onclick={registerPicked}>注册所选</button>
+          <button class="btn-primary" disabled={registerLocked} onclick={registerPicked}>注册所选</button>
           <button class="link" disabled={registering} onclick={() => finish("/record")}>跳过</button>
         </div>
       </div>
