@@ -7,9 +7,22 @@ use std::path::{Path, PathBuf};
 const TEMPLATE: &str = include_str!("skill_template.md");
 const MANAGED_MARK: &str = "managed-by: voice-notes";
 
+/// 安装时二进制的绝对路径,填进模板的 CLI 降级命令。用 current_exe 而非硬编码
+/// `/Applications/...`:装在别处、开发态构建、App 移动位置后,模板里的路径才指向
+/// 真实二进制;App 移动后 rendered() 变→已装 skill 变 stale→启动自愈重写(与注册
+/// 路径自愈同理)。current_exe 取不到时回落标准安装路径。
+fn binary_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/Applications/voice-notes.app/Contents/MacOS/voice-notes".into())
+}
+
 /// 渲染当前版本的 SKILL.md 内容(也是 status 判 stale 的比较基准)。
 pub fn rendered() -> String {
-    TEMPLATE.replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+    TEMPLATE
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{BINARY}}", &binary_path())
 }
 
 fn skill_file(home: &Path) -> PathBuf {
