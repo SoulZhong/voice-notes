@@ -130,6 +130,43 @@ impl Registry {
         }
     }
 
+    /// 修复 stale 注册(App 被移动/重装后 command 指向旧路径):重写为当前 exe。
+    /// 开发态二进制(路径含 /target/)跳过——否则开发机会把用户配置指向 debug 构建。
+    pub fn heal(&self) -> anyhow::Result<u32> {
+        if self.exe.components().any(|c| c.as_os_str() == "target") {
+            return Ok(0);
+        }
+        let mut healed = 0u32;
+        for st in self.status() {
+            if st.registered && st.stale {
+                // register 即覆盖式 upsert,天然就是"改正"。单家失败不挡其余家。
+                if self.register(&st.key).is_ok() {
+                    healed += 1;
+                }
+            }
+        }
+        Ok(healed)
+    }
+
+    /// exe 带 com.apple.quarantine 时的提示(未签名 App 被 Agent spawn 会失败)。
+    /// 纯提示不阻断;xattr 不存在/查询失败按无隔离处理。
+    pub fn quarantine_warning(&self) -> Option<String> {
+        let out = std::process::Command::new("/usr/bin/xattr")
+            .arg("-p")
+            .arg("com.apple.quarantine")
+            .arg(&self.exe)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(format!(
+                "警告: {} 带 com.apple.quarantine 隔离标记,Agent 可能无法启动它。\n请执行: xattr -dr com.apple.quarantine /Applications/voice-notes.app",
+                self.exe.display()
+            ))
+        } else {
+            None
+        }
+    }
+
     fn upsert_json(&self, path: &Path) -> anyhow::Result<()> {
         let mut root: serde_json::Value = match std::fs::read_to_string(path) {
             Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|e| {
@@ -341,5 +378,28 @@ mod tests {
         assert!(text.contains("[mcp_servers.voice-notes]"), "{text}");
         std::fs::write(tmp.path().join(".codex/config.toml"), "= 不是 toml =").unwrap();
         assert!(r.register("codex").is_err(), "坏 TOML 拒写");
+    }
+
+    #[test]
+    fn heal_rewrites_stale_and_skips_dev_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{"mcpServers":{"voice-notes":{"command":"/old/voice-notes","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+        // 生产二进制:自愈生效
+        let r = reg(tmp.path());
+        assert_eq!(r.heal().unwrap(), 1);
+        assert!(!r.status().iter().find(|s| s.key == "claude-code").unwrap().stale);
+        // 开发二进制(路径含 /target/):不动用户配置
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{"mcpServers":{"voice-notes":{"command":"/old/voice-notes","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+        let dev = Registry::with(tmp.path().to_path_buf(), PathBuf::from("/repo/src-tauri/target/debug/voice-notes"));
+        assert_eq!(dev.heal().unwrap(), 0);
+        assert!(dev.status().iter().find(|s| s.key == "claude-code").unwrap().stale, "开发态保持 stale 不改写");
     }
 }

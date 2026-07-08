@@ -22,10 +22,11 @@ pub fn app_data_dir() -> PathBuf {
 pub fn cli_main(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
     match sub {
-        "serve" | "register" | "unregister" | "status" => {
-            eprintln!("mcp {sub}: 尚未实现");
+        "serve" => {
+            eprintln!("mcp serve: 尚未实现");
             1
         }
+        "register" | "unregister" | "status" => run_registry_cli(sub, &args[1..]),
         _ => {
             eprintln!(
                 "用法: voice-notes mcp <serve|register|unregister|status>\n\
@@ -36,6 +37,87 @@ pub fn cli_main(args: &[String]) -> i32 {
             );
             2
         }
+    }
+}
+
+/// --agent X 解析:未给或 auto = 所有"已检测到安装"的家;显式指名不要求已安装
+/// (用户可能装在非常规位置,检测只是启发)。
+fn parse_agent(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--agent" {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+fn run_registry_cli(sub: &str, args: &[String]) -> i32 {
+    let reg = match registry::Registry::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("初始化失败: {e}");
+            return 1;
+        }
+    };
+    let agent = parse_agent(args).unwrap_or_else(|| "auto".into());
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let json = args.iter().any(|a| a == "--json");
+
+    if sub == "status" {
+        let st = reg.status();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&st).expect("Serialize 派生结构不会失败"));
+        } else {
+            for s in &st {
+                let state = if !s.installed {
+                    "未检测到"
+                } else if s.stale {
+                    "已注册(路径过期)"
+                } else if s.registered {
+                    "已注册"
+                } else {
+                    "未注册"
+                };
+                println!("{:<16} {}", s.key, state);
+            }
+        }
+        return 0;
+    }
+
+    // register / unregister 的目标集合
+    let targets: Vec<String> = if agent == "auto" {
+        reg.status().into_iter().filter(|s| s.installed).map(|s| s.key).collect()
+    } else {
+        vec![agent]
+    };
+    if targets.is_empty() {
+        eprintln!("未检测到任何已安装的 Agent;可用 --agent 显式指定,或在 App 设置页复制手动配置。");
+        return 1;
+    }
+    if let Some(w) = reg.quarantine_warning() {
+        eprintln!("{w}");
+    }
+    if dry_run {
+        println!("将写入的条目:\n{}", reg.entry_snippet_json());
+        println!("目标: {}", targets.join(", "));
+        return 0;
+    }
+    let mut failed = 0;
+    for key in &targets {
+        let r = if sub == "register" { reg.register(key) } else { reg.unregister(key) };
+        match r {
+            Ok(()) => println!("{key}: ok"),
+            Err(e) => {
+                eprintln!("{key}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    if failed == 0 {
+        0
+    } else {
+        1
     }
 }
 
