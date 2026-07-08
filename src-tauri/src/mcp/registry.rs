@@ -174,7 +174,7 @@ impl Registry {
         args.push("serve");
         let servers = doc.entry("mcp_servers").or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
         let servers = servers.as_table_mut().ok_or_else(|| anyhow::anyhow!("{} 的 mcp_servers 不是表,拒绝写入", path.display()))?;
-        servers.set_implicit(false);
+        servers.set_implicit(true);
         let mut entry = toml_edit::Table::new();
         entry["command"] = toml_edit::value(self.exe.to_string_lossy().as_ref());
         entry["args"] = toml_edit::value(args);
@@ -321,6 +321,7 @@ mod tests {
         assert!(text.contains("# 用户自己的注释"), "toml_edit 保注释:{text}");
         assert!(text.contains("model = \"o3\""));
         assert!(text.contains("[mcp_servers.other]"));
+        assert!(!text.contains("[mcp_servers]\n"), "不得注入空的 [mcp_servers] 表头: {text}");
         let st = r.status();
         let codex = st.iter().find(|s| s.key == "codex").unwrap();
         assert!(codex.registered && !codex.stale, "TOML read_command 也要通:{codex:?}");
