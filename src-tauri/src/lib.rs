@@ -1651,11 +1651,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                         break 'download_urls;
                     }
                 }
-                if let Some(msg) = last_err.as_deref() {
-                    if msg == "cancelled" {
-                        break;
-                    }
-                }
+                // (cancelled 的所有路径都在上方直接 break 'download_urls,此处无需再判)
             }
             if let Some(msg) = last_err {
                 all_ok = false;

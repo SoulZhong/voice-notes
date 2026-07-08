@@ -38,6 +38,11 @@ pub fn retryable_download_error(message: &str) -> bool {
         && !message.contains("SHA256 校验失败")
         && !message.contains("压缩包内缺少目录")
         && !message.contains("续传偏移越界")
+        // 4xx 是永久失败,重试同一 URL 纯浪费(直接换下一个 URL)。ureq 对非 2xx 走
+        // Err(Status),经 download_artifact 包装后的真实文案是
+        // 「请求失败: <url>: status code 404」(ureq error.rs 的 Display 格式);
+        // 本仓自己的 "HTTP {n}" 分支只有 204 等非 200/206 的 2xx 才可达,一并保留。
+        && !message.contains(": status code 4")
         && !message.starts_with("HTTP 4")
 }
 
@@ -336,7 +341,14 @@ mod tests {
         assert!(retryable_download_error("请求失败: Network Error: Operation timed out"));
         assert!(!retryable_download_error("cancelled"));
         assert!(!retryable_download_error("m.bin SHA256 校验失败"));
-        assert!(!retryable_download_error("HTTP 404"));
+        // 4xx 的**真实**文案(ureq Status Display 经 "请求失败: {e}" 包装),
+        // 不是虚构的 "HTTP 404"——PR #16 评审实证,勿改回纯 starts_with 匹配。
+        assert!(!retryable_download_error(
+            "请求失败: https://github.com/a/b.onnx: status code 404"
+        ));
+        assert!(!retryable_download_error("HTTP 404")); // 非 200/206 的 2xx 分支格式
+        // 5xx 是服务端瞬态,保持可重试。
+        assert!(retryable_download_error("请求失败: https://x/y: status code 503"));
     }
 
     #[test]
