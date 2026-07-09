@@ -149,6 +149,9 @@
   }
 
   function tick() {
+    // 后台/遮挡时 WKWebView 可能挂起 AudioContext;播放中每帧检查并恢复,守住后台播放
+    // (本项目此前为后台播放做过两次根因修复,勿让经 AudioContext 路由后重新回归)。
+    if (audioCtx?.state === "suspended") void audioCtx.resume();
     const clock = audibleClock();
     if (clock != null) {
       pos = clock;
