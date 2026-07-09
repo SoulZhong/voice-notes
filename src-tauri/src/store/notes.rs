@@ -33,6 +33,17 @@ static LOAD_CACHE: std::sync::Mutex<BTreeMap<String, (LoadSig, Note)>> =
     std::sync::Mutex::new(BTreeMap::new());
 const CACHE_CAP: usize = 32;
 
+/// 侧栏 list() 的时长扫描记忆化。summarize 为算「活跃时长」要把每篇会议的
+/// segments.jsonl 全行解析取 max end_ms;而侧栏在挂载/录制状态翻转(录制中
+/// statusVersion 频繁自增)/改名/删除时都会重刷整表,等于每次把所有会议的
+/// 转写全扫一遍——会议多且长时是侧栏刷新卡顿源。按 segments.jsonl 的
+/// (mtime, 字节数) 签名缓存扫描结果:只有正在增长的活动会议签名会变而重扫,
+/// 其余命中直接还值。条目极小(路径+签名+一个 u64),上限放宽到能容下整库;
+/// 超限整清(库超大时退化为再扫一次,便宜且罕见)。
+static MAX_END_CACHE: std::sync::Mutex<BTreeMap<String, (FileSig, Option<u64>)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+const MAX_END_CACHE_CAP: usize = 8192;
+
 /// 单文件签名:(mtime 纳秒, 字节数)。文件缺失 → None(缺失本身也是签名的一部分:
 /// speakers.json 从无到有、声纹库被删都能触发失配)。
 type FileSig = Option<(u128, u64)>;
@@ -378,7 +389,28 @@ fn duration_from_meta(meta: &NoteMeta) -> Option<u64> {
     Some((end - start).num_seconds().max(0) as u64)
 }
 
+/// 按 segments.jsonl 签名缓存的时长扫描(见 MAX_END_CACHE)。签名 stat 先于内容读,
+/// 与 load 缓存同哲学:并发写至多让条目落后而永不命中,绝不还陈旧值。
 fn max_end_ms(jsonl: &Path) -> Option<u64> {
+    let sig = file_sig(jsonl);
+    let key = jsonl.to_string_lossy().into_owned();
+    if let Some((cached_sig, val)) = MAX_END_CACHE.lock().unwrap().get(&key) {
+        if *cached_sig == sig {
+            return *val;
+        }
+    }
+    let val = scan_max_end_ms(jsonl);
+    {
+        let mut cache = MAX_END_CACHE.lock().unwrap();
+        if cache.len() >= MAX_END_CACHE_CAP && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (sig, val));
+    }
+    val
+}
+
+fn scan_max_end_ms(jsonl: &Path) -> Option<u64> {
     let f = fs::File::open(jsonl).ok()?;
     let mut max = None;
     for line in std::io::BufReader::new(f).lines() {
@@ -444,6 +476,22 @@ mod tests {
         assert_eq!(list[0].duration_secs, Some(2));
         let note = store.load(&id).unwrap();
         assert_eq!(note.segments.len(), 3, "崩溃前内容完好");
+    }
+
+    /// 侧栏时长扫描缓存:命中稳定,且 segments.jsonl 增长(续录)后按新末段刷新,
+    /// 不粘旧值——签名(mtime,len)失配触发重扫。
+    #[test]
+    fn list_duration_cache_hits_but_invalidates_on_growth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_note(tmp.path(), &["一", "二"], false); // 末段 end_ms=1900 → 1s
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        assert_eq!(store.list()[0].duration_secs, Some(1), "首次扫描");
+        assert_eq!(store.list()[0].duration_secs, Some(1), "再取命中缓存,值一致");
+        // 续录追加更靠后的段:segments.jsonl 增长,签名变 → 重扫。
+        let mut w = NoteWriter::resume(tmp.path(), &id).unwrap();
+        w.append_final("mic", "三", 5000, 6000, None, None).unwrap();
+        drop(w); // 保持中断态(不 finalize)
+        assert_eq!(store.list()[0].duration_secs, Some(6), "增长后按新末段(6000ms)刷新,缓存不粘旧值");
     }
 
     #[test]
