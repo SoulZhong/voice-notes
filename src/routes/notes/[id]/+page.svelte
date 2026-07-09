@@ -149,8 +149,13 @@
   });
 
   // id 切换：无条件复位一切编辑态 + 精修视图态（否则会短暂展示上一篇笔记的精修稿/进度）。
+  // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
+  // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
+  // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
   $effect(() => {
     void id;
+    note = null;
+    error = "";
     editing = false;
     focusedSeq = null;
     speakerMenuSeq = null;
@@ -668,6 +673,10 @@
         <button class="jump" onclick={resumeFollow}>↓ 回到播放位置</button>
       {/if}
     </div>
+  {:else if !error}
+    <!-- 加载态:切换会议到 note 就绪之间的空窗(长会议 load 可能数百毫秒),
+         给一个安静的占位,避免"点了没反应"的错觉。error 分支已在上方单独渲染。 -->
+    <p class="loading">加载中…</p>
   {/if}
 </main>
 
@@ -1058,5 +1067,10 @@
   }
   .hint {
     color: var(--ink-faint);
+  }
+  /* 切换会议的加载占位:安静的次级墨色文字,不抢眼 */
+  .loading {
+    color: var(--ink-faint);
+    padding: 1rem 0;
   }
 </style>
