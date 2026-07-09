@@ -9,24 +9,8 @@
   import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
-  import {
-    checkUpdateOncePerSession,
-    updateDismissed,
-    dismissUpdate,
-    type UpdateInfo,
-  } from "$lib/update";
 
   let models = $state<ModelsStatus | null>(null);
-
-  // 升级提示:启动静默查一次 GitHub 最新版,有新版且未被「知道了」忽略时顶部出可关闭横幅。
-  let update = $state<UpdateInfo | null>(null);
-  function openUpdate() {
-    if (update) openUrl(update.url);
-  }
-  function dismissUpdateBanner() {
-    if (update) dismissUpdate(update.latest);
-    update = null;
-  }
 
   async function refreshModels() {
     try {
@@ -122,9 +106,6 @@
     refreshScreenPerm();
     refreshBtRisk();
     refreshInputVol();
-    checkUpdateOncePerSession().then((u) => {
-      if (u && !updateDismissed(u.latest)) update = u;
-    });
     getSettings().then((s) => {
       showMcpHint = s.onboarded && !s.mcp_onboarded;
     }).catch(() => {});
@@ -255,14 +236,6 @@
 </script>
 
 <div class="container">
-  <!-- 升级提示:有新版且未忽略时置顶,复用 banner 语言;查看=开发布页,知道了=记住该版本不再提示 -->
-  {#if update}
-    <div class="banner update-banner">
-      <span class="upd-dot"></span>发现新版 v{update.latest}(当前 v{update.current})
-      <button class="link" onclick={openUpdate}>查看更新</button>
-      <button class="link" onclick={dismissUpdateBanner}>知道了</button>
-    </div>
-  {/if}
   <!-- 头部整体吸顶(标题/下载卡/控制条/状态行):录制中转写自动滚到最新,操作不能跟着滚出视口 -->
   <div class="topbar">
     <h1>实时转写</h1>
@@ -676,14 +649,4 @@
     font-size: inherit;
   }
   .banner .hint { color: var(--warning-ink); }
-  /* 升级横幅的前缀点:accent 色小圆点,提示「有新东西」 */
-  .upd-dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: var(--radius-full);
-    background: var(--accent);
-    margin-right: 0.4em;
-    vertical-align: middle;
-  }
 </style>

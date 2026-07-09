@@ -13,25 +13,10 @@ export type UpdateInfo = {
   notes: string;
 };
 
-/** 一次性检查(设置页手动「检查更新」用):每次都发新请求,失败向上抛。 */
+/** 检查更新:每次都发新请求。设置页手动「检查更新」向上抛错误;录制页启动静默查(catch)。
+    不做会话缓存——录制页极少重复挂载,直接新查更简单也更稳(缓存失败会拖成永远不提示)。 */
 export function checkUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_update");
-}
-
-// 本会话是否已自动查过(录制页每次挂载都会跑,避免重复请求 GitHub)。
-// undefined=未查过;null=查过但无更新/失败;UpdateInfo=有更新。
-let sessionResult: UpdateInfo | null | undefined;
-
-/** 启动/进录制页时静默查一次,整个会话缓存结果。失败静默(返回 null)。 */
-export async function checkUpdateOncePerSession(): Promise<UpdateInfo | null> {
-  if (sessionResult !== undefined) return sessionResult;
-  try {
-    const u = await checkUpdate();
-    sessionResult = u.has_update ? u : null;
-  } catch {
-    sessionResult = null; // 断网/限流:静默,不打扰
-  }
-  return sessionResult;
 }
 
 const DISMISS_KEY = "vn.updateDismissed";
