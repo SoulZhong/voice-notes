@@ -126,6 +126,19 @@
   function isError(s: string) {
     return s.startsWith("error:");
   }
+  /** 状态机原值(idle/recording/paused/stopped/error:…)映射成右侧簇里的友好短标签;
+      错误详情(可能很长)不塞这里,另在下方红色行完整展开。 */
+  const statusLabel = $derived(
+    isError(recording.status)
+      ? "出错"
+      : recording.status === "recording"
+        ? "录制中"
+        : recording.status === "paused"
+          ? "已暂停"
+          : recording.status === "stopped"
+            ? "已停止"
+            : "就绪",
+  );
   async function openScreenRecordingSettings() {
     await openUrl(
       "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
@@ -226,34 +239,53 @@
     {/if}
 
     {#if !models || models.recording_ready}
+      <!-- 两端对齐:控制钮组贴左、计时+状态贴右、实时波形限宽居中(space-between 把
+           富余横向空间分到两侧间隙,波形不再 flex:1 拉满整屏成一根横贯全宽的细带)。 -->
       <div class="controls">
-        {#if !recording.isLive}
-          <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
-            <span class="sym dot on-blue"></span>开始录制
-          </button>
-        {:else}
-          {#if recording.paused}
-            <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
+        <!-- 左:控制钮组 -->
+        <div class="ctl-group">
+          {#if !recording.isLive}
+            <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
+              <span class="sym dot on-blue"></span>开始录制
+            </button>
           {:else}
-            <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
+            {#if recording.paused}
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
+            {:else}
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
+            {/if}
+            <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
+              <span class="sym square"></span>停止
+            </button>
           {/if}
-          <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
-            <span class="sym square"></span>停止
-          </button>
-        {/if}
-        <!-- 实时音轨:滚动电平波形,兼任电平表(录音机式,新声从右缘进入) -->
-        <div class="wave-live" class:frozen={recording.paused} title="麦克风电平" aria-hidden="true">
-          {#each liveBars as h, i (i)}
-            <span class="bar" style="height: {Math.max(6, h)}%"></span>
-          {/each}
         </div>
-        {#if recording.paused}<span class="paused-tag">已暂停</span>{/if}
-        <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
+
+        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
+        {#if recording.isLive}
+          <div class="wave-live" class:frozen={recording.paused} title="麦克风电平" aria-hidden="true">
+            {#each liveBars as h, i (i)}
+              <span class="bar" style="height: {Math.max(6, h)}%"></span>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- 右:计时 + 状态,同一簇(不再单挂一行);状态点是唯一动态信号。
+             仅录制中出现——空闲态只需左侧「开始录制」CTA,不让一个「就绪」标签
+             孤浮右缘重演失衡;空闲若开录失败,错误仍由下方红色详情行兜底。 -->
+        {#if recording.isLive}
+          <div class="live-meta">
+            <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
+            <span class="status-inline">
+              <span class="status-dot" class:live={!recording.paused}></span>{statusLabel}
+            </span>
+          </div>
+        {/if}
       </div>
 
-      <p class="status" class:error={isError(recording.status)}>
-        <span class="status-dot" class:live={recording.isLive && !recording.paused}></span>{recording.status}
-      </p>
+      <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
+      {#if isError(recording.status)}
+        <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      {/if}
     {/if}
   </div>
 
@@ -364,11 +396,36 @@
     background: linear-gradient(var(--canvas), transparent);
     pointer-events: none;
   }
+  /* 两端对齐:左控制钮组 / 中限宽波形 / 右计时+状态。space-between 把富余空间分到
+     两侧间隙,中间限宽波形因此浮在中央,而非 flex:1 拉满整屏。 */
   .controls {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 0.75rem;
-    margin: 0 0 0.75rem;
+    margin: 0 0 1rem;
+  }
+  .ctl-group {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex: none;
+  }
+  /* 右簇:计时 + 状态标签同一组 */
+  .live-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex: none;
+  }
+  /* 状态短标签(并进右簇):caption 级次要信息,状态点是唯一动态信号;出错转 danger */
+  .status-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    color: var(--ink-faint);
+    font-size: 0.85rem;
+    white-space: nowrap;
   }
   /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
@@ -416,8 +473,10 @@
      record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
      空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
   .wave-live {
-    flex: 1;
-    min-width: 0;
+    /* 限宽居中:不再 flex:1 拉满。grow0/shrink1/basis340 → 有余量时定宽居中,
+       窄窗可收缩;min-width 保底可读。 */
+    flex: 0 1 340px;
+    min-width: 90px;
     height: 32px;
     display: flex;
     align-items: center;
@@ -435,17 +494,8 @@
   .wave-live.frozen .bar {
     background: var(--ink-faint);
   }
-  .paused-tag {
-    background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
-    color: var(--warning-ink);
-    font-size: 0.75em;
-    font-weight: 500;
-    border-radius: var(--radius-md);
-    padding: 0.1em 0.5em;
-  }
 
-  /* 状态行降为 caption 级:辅助信息不与正文争夺注意力;状态点是唯一动态信号 */
+  /* 错误详情行(仅出错时):danger 色,完整展开可能较长的错误文案 */
   .status {
     display: flex;
     align-items: center;
