@@ -9,6 +9,7 @@ mod settings;
 mod shortcuts;
 mod store;
 mod tray;
+mod update;
 pub mod diar;
 mod refine;
 pub mod mcp;
@@ -2411,7 +2412,8 @@ pub fn run() {
             mcp_healed_count,
             mcp_skill_status,
             mcp_skill_install,
-            mcp_skill_uninstall
+            mcp_skill_uninstall,
+            update::check_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
