@@ -311,6 +311,15 @@
       {/each}
     </div>
   {/if}
+  {#if noteGain > 1}
+    <!-- 响度归一化开关:仅当本条真能被放大时出现,避免死开关。默认开。 -->
+    <button
+      class="norm-toggle"
+      class:off={!normalize}
+      onclick={() => setNormalize(!normalize)}
+      title={normalize ? "关闭响度归一化(听原始电平)" : "打开响度归一化(把偏轻的录音抬到正常响度)"}
+    >响度</button>
+  {/if}
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
   <!-- 波形音轨(即进度条):条高来自段落 rms,已播部分 accent;点击/拖拽定位 -->
   <div
@@ -398,6 +407,27 @@
     color: var(--ink);
   }
   .track-toggle.off {
+    text-decoration: line-through;
+    color: var(--ink-faint);
+    border-style: dashed;
+  }
+  /* 响度开关:复用 track-toggle 胶囊语言;off=划线退灰 */
+  .norm-toggle {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    padding: 0.15em 0.7em;
+    font-size: 0.75rem;
+    cursor: pointer;
+    white-space: nowrap;
+    flex: none;
+  }
+  .norm-toggle:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .norm-toggle.off {
     text-decoration: line-through;
     color: var(--ink-faint);
     border-style: dashed;
