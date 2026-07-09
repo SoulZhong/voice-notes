@@ -2585,5 +2585,6 @@ mod input_volume_parse_tests {
         assert_eq!(parse_input_volume(" 42 \n"), Some(42)); // 含空白
         assert_eq!(parse_input_volume(""), None);
         assert_eq!(parse_input_volume("abc"), None);
+        assert_eq!(parse_input_volume("missing value"), None); // 无输入设备时 osascript 的输出
     }
 }
