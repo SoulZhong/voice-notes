@@ -170,6 +170,13 @@
     }, 120);
     return () => clearInterval(t);
   });
+  /** 渲染用:前导补零到 LIVE_BARS,让波形从开录起就铺满整行(与详情页全宽波形一致),
+      而非少量样本挤在右缘、左侧留大片空——补的零段是低平基线,新声仍从右侧进入。 */
+  const liveBarsView = $derived(
+    liveBars.length >= LIVE_BARS
+      ? liveBars
+      : [...new Array(LIVE_BARS - liveBars.length).fill(0), ...liveBars],
+  );
 
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
   // 录制中转写容器带 50vh 底部留白(见 .transcript.live)，「滚到底」因此恰好把
@@ -263,7 +270,7 @@
         <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
         {#if recording.isLive}
           <div class="wave-live" class:frozen={recording.paused} title="麦克风电平" aria-hidden="true">
-            {#each liveBars as h, i (i)}
+            {#each liveBarsView as h, i (i)}
               <span class="bar" style="height: {Math.max(6, h)}%"></span>
             {/each}
           </div>
@@ -396,12 +403,11 @@
     background: linear-gradient(var(--canvas), transparent);
     pointer-events: none;
   }
-  /* 两端对齐:左控制钮组 / 中限宽波形 / 右计时+状态。space-between 把富余空间分到
-     两侧间隙,中间限宽波形因此浮在中央,而非 flex:1 拉满整屏。 */
+  /* 单行整合(与详情页播放 transport 一致):左控制钮组 / 全宽波形 / 右计时+状态。
+     波形 flex:1 吃掉中间空间,把右簇顶到行尾。 */
   .controls {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 0.75rem;
     margin: 0 0 1rem;
   }
@@ -473,20 +479,19 @@
      record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
      空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
   .wave-live {
-    /* 限宽居中:不再 flex:1 拉满。grow0/shrink1/basis340 → 有余量时定宽居中,
-       窄窗可收缩;min-width 保底可读。 */
-    flex: 0 1 340px;
-    min-width: 90px;
+    /* 全宽填充:与详情页播放 transport 的 waveform-track 一致——条 flex:1 均分铺满
+       控制与右侧计时之间的整行(配合前导补零,开录起就满行,不缩在右缘)。 */
+    flex: 1;
+    min-width: 0;
     height: 32px;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
-    gap: 2px;
+    gap: 1px;
     overflow: hidden;
   }
   .wave-live .bar {
-    width: 2px;
-    flex: none;
+    flex: 1;
+    min-width: 1px;
     min-height: 2px;
     border-radius: var(--radius-full);
     background: var(--record);
