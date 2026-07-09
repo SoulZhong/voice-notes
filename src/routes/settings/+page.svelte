@@ -35,8 +35,27 @@
     type AgentStatus,
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { checkUpdate, type UpdateInfo } from "$lib/update";
 
   let settings = $state<Settings | null>(null);
+
+  // —— 关于 / 更新 ——
+  let appVersion = $state("");
+  let updateInfo = $state<UpdateInfo | null>(null);
+  let updateChecking = $state(false);
+  let updateError = $state("");
+  async function doCheckUpdate() {
+    updateChecking = true;
+    updateError = "";
+    try {
+      updateInfo = await checkUpdate();
+    } catch (e) {
+      updateError = `检查失败: ${e}`;
+    } finally {
+      updateChecking = false;
+    }
+  }
   let status = $state<ModelsStatus | null>(null);
   /**
    * ASR radio 的本地绑定值(bind:group)。不直接从 settings 派生:切型失败回弹时
@@ -239,6 +258,7 @@
     refreshSkill();
     mcpManualSnippet().then((s) => (mcpSnippet = s)).catch(() => {});
     mcpHealedCount().then((n) => (mcpHealed = n)).catch(() => {});
+    getVersion().then((v) => (appVersion = v)).catch(() => {});
     // 开机自启读系统真值(与 settings 无关);失败静默,保持未勾选。
     isEnabled()
       .then((v) => (autostartEnabled = v))
@@ -953,6 +973,38 @@
           disabled={!settings}
           onchange={toggleMirror}
         />
+      </div>
+    </div>
+  </section>
+
+  <!-- —— 关于 / 更新 —— -->
+  <section>
+    <h2 class="section-title">关于</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">当前版本 v{appVersion || updateInfo?.current || "…"}</span>
+          <span class="row-desc">
+            {#if updateChecking}
+              正在检查…
+            {:else if updateError}
+              {updateError}
+            {:else if updateInfo?.has_update}
+              发现新版 v{updateInfo.latest}，前往下载页更新
+            {:else if updateInfo}
+              已是最新版本
+            {:else}
+              从 GitHub Releases 检查是否有新版
+            {/if}
+          </span>
+        </div>
+        {#if updateInfo?.has_update}
+          <button class="btn-secondary" onclick={() => updateInfo && openUrl(updateInfo.url)}>下载 v{updateInfo.latest}</button>
+        {:else}
+          <button class="btn-secondary" disabled={updateChecking} onclick={doCheckUpdate}>
+            {updateChecking ? "检查中…" : "检查更新"}
+          </button>
+        {/if}
       </div>
     </div>
   </section>
