@@ -57,6 +57,35 @@
     }
   }
 
+  // 输入音量过低预警(普通麦克风模式):系统输入音量被会议软件拉低会录得很轻。
+  // 开录前 + 录制中都检测,一键调回可用电平;VPIO 模式(自带 AGC)/仅系统声不检测。
+  const LOW_INPUT_THRESHOLD = 50;
+  const INPUT_TARGET = 75;
+  const POLL_MS = 4000;
+  let lowInputVol = $state<{ vol: number } | null>(null);
+  async function refreshInputVol() {
+    try {
+      const [s, vol] = await Promise.all([
+        getSettings(),
+        invoke<number | null>("input_volume"),
+      ]);
+      lowInputVol =
+        s.keep_output_volume && !s.record_system_only && vol != null && vol < LOW_INPUT_THRESHOLD
+          ? { vol }
+          : null;
+    } catch {
+      lowInputVol = null;
+    }
+  }
+  async function fixInputVol() {
+    try {
+      await invoke("set_input_volume", { v: INPUT_TARGET });
+    } catch {
+      /* 设置失败:回读后横幅仍在,用户可见未生效 */
+    }
+    await refreshInputVol();
+  }
+
   // 存量用户 MCP 引导:onboarded(老用户)且 mcp_onboarded 为 false 时出一次提示条。
   // 新用户在欢迎页已走过(markOnboarded 同置两标记),不会看到。
   let showMcpHint = $state(false);
@@ -75,6 +104,7 @@
     refreshModels();
     refreshScreenPerm();
     refreshBtRisk();
+    refreshInputVol();
     getSettings().then((s) => {
       showMcpHint = s.onboarded && !s.mcp_onboarded;
     }).catch(() => {});
@@ -82,9 +112,15 @@
     const onFocus = () => {
       refreshScreenPerm();
       refreshBtRisk();
+      refreshInputVol();
     };
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    // 录制中也检测(会议软件中途拉低输入音量):轮询与录制状态无关,一直跑。
+    const volTimer = setInterval(refreshInputVol, POLL_MS);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      clearInterval(volTimer);
+    };
   });
 
   function isError(s: string) {
@@ -234,6 +270,13 @@
     {#if btEchoRisk && !recording.isLive}
       <div class="banner">
         检测到蓝牙外放 + 「保持外放音量」：蓝牙延迟会让回声消除失效，录音会混入对方声音（回放像回音）。建议改用有线外放/耳机，或到设置关闭「保持外放音量」。
+      </div>
+    {/if}
+
+    {#if lowInputVol}
+      <div class="banner">
+        麦克风输入音量偏低（{lowInputVol.vol}%），可能录得很轻。
+        <button class="link" onclick={fixInputVol}>调到 {INPUT_TARGET}%</button>
       </div>
     {/if}
 
