@@ -1,6 +1,7 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { formatTs, type TrackInfo } from "$lib/notes";
+  import { computeNoteGain } from "$lib/gain";
 
   /* 多轨播放器:每轨一个隐藏 <audio>(asset 协议流式,内存恒定),自有时钟驱动
      UI 与文字跟随。有轨道覆盖当前时刻时以该轨 currentTime 为真时钟(音频即时钟),
@@ -21,6 +22,48 @@
 
   let els = $state<(HTMLAudioElement | null)[]>([]);
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
+
+  // ── 回放响度归一化(A1):el.volume 封顶 1.0 无法放大老笔记,经共享 GainNode 提升 ──
+  const NORMALIZE_KEY = "vn.playbackNormalize";
+  // 默认开(「自动」语义):localStorage 存 "0" 才关。SSR/无 localStorage 时按开。
+  let normalize = $state(
+    typeof localStorage !== "undefined" ? localStorage.getItem(NORMALIZE_KEY) !== "0" : true,
+  );
+  const noteGain = $derived(computeNoteGain(tracks));
+
+  let audioCtx: AudioContext | null = null;
+  let gainNode: GainNode | null = null;
+  // 每个 <audio> 只能建一次 MediaElementSource;按元素缓存,tracks 变化时增量重连。
+  const srcNodes = new Map<HTMLAudioElement, MediaElementAudioSourceNode>();
+
+  function ensureGraph() {
+    if (typeof AudioContext === "undefined") return;
+    if (!audioCtx) {
+      audioCtx = new AudioContext();
+      gainNode = audioCtx.createGain();
+      gainNode.connect(audioCtx.destination);
+    }
+    for (const el of els) {
+      if (el && !srcNodes.has(el)) {
+        const node = audioCtx.createMediaElementSource(el);
+        node.connect(gainNode!);
+        srcNodes.set(el, node);
+      }
+    }
+  }
+
+  function applyGain() {
+    if (!audioCtx || !gainNode) return;
+    const g = normalize ? noteGain : 1;
+    // 平滑过渡防咔哒(~20ms 时间常数)。
+    gainNode.gain.setTargetAtTime(g, audioCtx.currentTime, 0.02);
+  }
+
+  export function setNormalize(on: boolean) {
+    normalize = on;
+    if (typeof localStorage !== "undefined") localStorage.setItem(NORMALIZE_KEY, on ? "1" : "0");
+    applyGain();
+  }
 
   /** 轨道加载/播放失败的可视化(排障关键:加载失败时走表逻辑仍会推进度条,
       看起来在播实际无声——错误必须浮出水面,不许静默)。 */
@@ -126,6 +169,9 @@
 
   export function play() {
     if (tracks.length === 0) return;
+    ensureGraph();
+    if (audioCtx?.state === "suspended") void audioCtx.resume();
+    applyGain();
     if (pos >= totalMs) pos = 0; // 播完再按:从头来
     playing = true;
     anchorMs = pos;
@@ -164,7 +210,22 @@
   // 组件卸载/笔记切换:停干净,不留幽灵声音。
   $effect(() => {
     void tracks;
-    return () => pause();
+    return () => {
+      pause();
+      srcNodes.clear();
+      void audioCtx?.close();
+      audioCtx = null;
+      gainNode = null;
+    };
+  });
+
+  // tracks 变化(续录/transcode_done 重拉音轨)后:已建图则增量接新 <audio> 并重算增益。
+  $effect(() => {
+    void noteGain; // 追踪 tracks → noteGain
+    if (audioCtx) {
+      ensureGraph();
+      applyGain();
+    }
   });
 
   const pct = $derived(totalMs > 0 ? (Math.min(currentMs, totalMs) / totalMs) * 100 : 0);
