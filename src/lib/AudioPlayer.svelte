@@ -104,6 +104,30 @@
       if (el) el.muted = !!muted[tracks[i].source];
     }
   }
+
+  // ── 音轨菜单(收纳每轨静音开关):双轨会议才有,主控制行只留一个「音轨」按钮 ──
+  let menuOpen = $state(false);
+  let menuEl = $state<HTMLElement | null>(null);
+  /** 任一轨被静音:换静音图标。 */
+  const anyMuted = $derived(tracks.some((t) => muted[t.source]));
+  /** 改过任一默认(静音某轨 / 关掉响度归一化):按钮点亮,收起状态也能看出「动过」。 */
+  const audioTouched = $derived(anyMuted || (noteGain > 1 && !normalize));
+  // 点面板外或按 Esc 关闭(仅开启时挂监听)。capture 阶段:开关按钮本身在 menuEl 内不误关。
+  $effect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (menuEl && !menuEl.contains(e.target as Node)) menuOpen = false;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") menuOpen = false;
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  });
   // 墙钟锚点:无轨道可依时,pos = anchorMs + (now - anchorWall)。
   let anchorWall = 0;
   let anchorMs = 0;
@@ -301,28 +325,6 @@
       </svg>
     {/if}
   </button>
-  {#if tracks.length > 1}
-    <!-- 轨道静音开关:双轨串音笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音 -->
-    <div class="track-toggles">
-      {#each tracks as t (t.source)}
-        <button
-          class="track-toggle"
-          class:off={muted[t.source]}
-          onclick={() => toggleMute(t.source)}
-          title={muted[t.source] ? "恢复播放该音轨" : "静音该音轨(回放有回音时静掉一轨)"}
-        >{t.source === "mic" ? "麦克风" : "系统声"}</button>
-      {/each}
-    </div>
-  {/if}
-  {#if noteGain > 1}
-    <!-- 响度归一化开关:仅当本条真能被放大时出现,避免死开关。默认开。 -->
-    <button
-      class="norm-toggle"
-      class:off={!normalize}
-      onclick={() => setNormalize(!normalize)}
-      title={normalize ? "关闭响度归一化(听原始电平)" : "打开响度归一化(把偏轻的录音抬到正常响度)"}
-    >响度</button>
-  {/if}
   <span class="time">{formatTs(Math.min(currentMs, totalMs))}</span>
   <!-- 波形音轨(即进度条):条高来自段落 rms,已播部分 accent;点击/拖拽定位 -->
   <div
@@ -347,6 +349,60 @@
     {/each}
   </div>
   <span class="time">{formatTs(totalMs)}</span>
+  {#if tracks.length > 1 || noteGain > 1}
+    <!-- 音频菜单:把回放相关的低频设置(双轨静音、响度归一化)收进一个「音频」按钮,
+         主控制行保持干净,每项用途一句话只在点开时出现,解决「不知道能点/干嘛用」。
+         静音=双轨会议才有(回音笔记静掉一轨即无回音);响度=本条真能被放大时才有。
+         有轨被静音或关了响度=改过默认,按钮点亮 accent,收起也看得出动过。 -->
+    <div class="track-menu" bind:this={menuEl}>
+      <button
+        class="track-btn"
+        class:has-touched={audioTouched}
+        onclick={() => (menuOpen = !menuOpen)}
+        aria-expanded={menuOpen}
+        title="音频设置(静音音轨 / 响度归一化)"
+      >
+        {#if anyMuted}
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8.4 3.2 5 6H2.7v4H5l3.4 2.8z" />
+            <path d="M11.3 6.4l3.2 3.2M14.5 6.4l-3.2 3.2" />
+          </svg>
+        {:else}
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8.4 3.2 5 6H2.7v4H5l3.4 2.8z" />
+            <path d="M11.1 6.2a2.8 2.8 0 0 1 0 3.6" />
+            <path d="M12.9 4.6a5.3 5.3 0 0 1 0 6.8" />
+          </svg>
+        {/if}
+        音频
+        <svg class="chev" class:open={menuOpen} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 6l4 4 4-4" />
+        </svg>
+      </button>
+      {#if menuOpen}
+        <div class="track-pop" role="menu">
+          {#if tracks.length > 1}
+            <p class="track-pop-hint">回放有回音?静掉一轨</p>
+            {#each tracks as t (t.source)}
+              <label class="track-row">
+                <input type="checkbox" checked={!muted[t.source]} onchange={() => toggleMute(t.source)} />
+                <span class="track-row-name">{t.source === "mic" ? "麦克风" : "系统声"}</span>
+                {#if muted[t.source]}<span class="track-row-tag">已静音</span>{/if}
+              </label>
+            {/each}
+          {/if}
+          {#if noteGain > 1}
+            {#if tracks.length > 1}<div class="track-pop-sep"></div>{/if}
+            <label class="track-row">
+              <input type="checkbox" checked={normalize} onchange={() => setNormalize(!normalize)} />
+              <span class="track-row-name">响度归一化</span>
+            </label>
+            <p class="track-pop-sub">把偏轻的录音抬到正常响度</p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
   {#each tracks as t, i (t.source)}
     <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto" onerror={() => onAudioError(i)}></audio>
   {/each}
@@ -389,51 +445,92 @@
   .play-btn:hover {
     background: var(--surface-soft);
   }
-  /* 轨道静音开关:开=正常字色,关(静音)=划线退灰。文字按钮,与全应用「图标必带文字」一致 */
-  .track-toggles {
+  /* 音轨菜单:主控制行只放一个「音轨」胶囊按钮(图标+文字+chevron),静音开关收进弹出面板 */
+  .track-menu {
+    position: relative;
+    flex: none;
+  }
+  .track-btn {
     display: inline-flex;
-    gap: 4px;
-    flex: none;
-  }
-  .track-toggle {
+    align-items: center;
+    gap: 0.3em;
     border: 1px solid var(--hairline-strong);
     background: transparent;
     color: var(--ink-secondary);
     border-radius: var(--radius-full);
-    padding: 0.15em 0.7em;
+    padding: 0.15em 0.6em;
     font-size: 0.75rem;
     cursor: pointer;
     white-space: nowrap;
   }
-  .track-toggle:hover {
+  .track-btn:hover {
     background: var(--surface-soft);
     color: var(--ink);
   }
-  .track-toggle.off {
-    text-decoration: line-through;
-    color: var(--ink-faint);
-    border-style: dashed;
+  /* 改过任一默认(静音/关响度):点亮 accent,收起状态也看得出动过 */
+  .track-btn.has-touched {
+    color: var(--accent);
+    border-color: var(--accent);
   }
-  /* 响度开关:复用 track-toggle 胶囊语言;off=划线退灰 */
-  .norm-toggle {
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
+  .chev {
+    transition: transform 120ms ease;
+    opacity: 0.7;
+  }
+  .chev.open {
+    transform: rotate(180deg);
+  }
+  /* 弹出面板:与改说话人菜单同语言(surface-press 底、hairline 边、rounded-lg、shadow-popover)。
+     播放器贴近视口顶,故向上弹(bottom:100%),右对齐避免溢出右缘。 */
+  .track-pop {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    min-width: 11rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    padding: 0.5rem;
+  }
+  .track-pop-hint {
+    margin: 0 0 0.4rem;
+    padding: 0 0.15rem;
     color: var(--ink-secondary);
-    border-radius: var(--radius-full);
-    padding: 0.15em 0.7em;
     font-size: 0.75rem;
-    cursor: pointer;
-    white-space: nowrap;
-    flex: none;
   }
-  .norm-toggle:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
+  /* 分组分隔线(静音组 / 响度组) */
+  .track-pop-sep {
+    height: 1px;
+    background: var(--hairline);
+    margin: 0.4rem 0;
   }
-  .norm-toggle.off {
-    text-decoration: line-through;
+  /* 单项副说明(如响度归一化用途):贴在该项下方,次级墨色小字 */
+  .track-pop-sub {
+    margin: 0.1rem 0 0;
+    padding: 0 0.15rem 0 1.7rem;
     color: var(--ink-faint);
-    border-style: dashed;
+    font-size: 0.72rem;
+  }
+  .track-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    padding: 0.3em 0.15rem;
+    font-size: 0.85rem;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .track-row input {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .track-row-name {
+    flex: 1;
+  }
+  .track-row-tag {
+    color: var(--ink-faint);
+    font-size: 0.75rem;
   }
   .time {
     color: var(--ink-secondary);
