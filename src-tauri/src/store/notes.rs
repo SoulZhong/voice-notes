@@ -18,6 +18,35 @@ fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
     EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// load 结果记忆化。详情页切换会议会反复对同一 id 调 load(切走再切回、编辑后
+/// refresh),而 load 每次都全量重解析 segments.jsonl + join 整个声纹库——长会议
+/// (数千段)或声纹多时,这是切换卡顿的主因之一。
+///
+/// 缓存键为笔记目录路径,值带一份「参与 load 的文件签名」(每文件 (mtime, 字节数)):
+/// meta.json / segments.jsonl / speakers.json / 声纹库 voiceprints.json。任一源被写
+/// (所有写路径都走原子 tmp+rename,mtime 必变;声纹库合并/改名同理),签名即不匹配,
+/// 自动重读——因此编辑后一致性不受影响,不违反 NoteStore「每命令新建、无状态」的写入
+/// 哲学(这里只是纯读侧记忆化)。签名 stat 先于内容读,并发写至多让某条目 sig 落后于
+/// 其内容而永不再命中(mtime 单调递增,不会回到旧值),绝不会把陈旧内容当命中还出。
+/// 上限 CACHE_CAP,超出即整清,重新变热只是再读一次,便宜。
+static LOAD_CACHE: std::sync::Mutex<BTreeMap<String, (LoadSig, Note)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+const CACHE_CAP: usize = 32;
+
+/// 单文件签名:(mtime 纳秒, 字节数)。文件缺失 → None(缺失本身也是签名的一部分:
+/// speakers.json 从无到有、声纹库被删都能触发失配)。
+type FileSig = Option<(u128, u64)>;
+/// (meta.json, segments.jsonl, speakers.json, voiceprints.json) 四源签名——
+/// 覆盖 load 读到的全部文件,任一被写(改名写 meta.json、编辑写 segments/speakers、
+/// 声纹库合并)签名即失配,不会还出陈旧标题/内容。
+type LoadSig = (FileSig, FileSig, FileSig, FileSig);
+
+fn file_sig(path: &Path) -> FileSig {
+    let md = fs::metadata(path).ok()?;
+    let mtime = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some((mtime, md.len()))
+}
+
 /// 笔记静态读写：目录扫描出列表，逐行解析 jsonl，损坏容忍。
 pub struct NoteStore {
     notes_dir: PathBuf,
@@ -55,6 +84,20 @@ impl NoteStore {
 
     pub fn load(&self, id: &str) -> anyhow::Result<Note> {
         let dir = self.note_dir(id)?;
+        // 签名基于 load 真正读的三个文件;命中且签名未变直接还缓存副本,省掉全量解析。
+        let vp_path = self.notes_dir.parent().map(|p| p.join("voiceprints.json"));
+        let sig: LoadSig = (
+            file_sig(&dir.join("meta.json")),
+            file_sig(&dir.join("segments.jsonl")),
+            file_sig(&dir.join("speakers.json")),
+            vp_path.as_deref().map(file_sig).unwrap_or(None),
+        );
+        let cache_key = dir.to_string_lossy().into_owned();
+        if let Some((cached_sig, note)) = LOAD_CACHE.lock().unwrap().get(&cache_key) {
+            if *cached_sig == sig {
+                return Ok(note.clone());
+            }
+        }
         let meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
         let mut segments = Vec::new();
         let mut skipped_lines = 0u32;
@@ -81,7 +124,15 @@ impl NoteStore {
         segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
         let mut speakers = read_speakers(&dir);
         join_person_names(&self.notes_dir, &mut speakers);
-        Ok(Note { meta, segments, skipped_lines, speakers })
+        let note = Note { meta, segments, skipped_lines, speakers };
+        {
+            let mut cache = LOAD_CACHE.lock().unwrap();
+            if cache.len() >= CACHE_CAP && !cache.contains_key(&cache_key) {
+                cache.clear(); // 无 LRU,超上限整清重新变热(只是再读一次,便宜);防无界增长
+            }
+            cache.insert(cache_key, (sig, note.clone()));
+        }
+        Ok(note)
     }
 
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {

@@ -142,6 +142,16 @@ pub fn set_track_waveform(note_dir: &Path, source: &str, waveform: Vec<u8>) -> a
     save_audio_meta(note_dir, &meta)
 }
 
+/// 未转码 WAV 轨(中断笔记/转码失败降级)的波形懒回填:流式算完写回 audio.json。
+/// 与 m4a 的 transcode::backfill_waveform 同角色,只是源是盘上现成的 WAV,无需解码。
+/// 秒级阻塞(数小时录音数百 MB),调用方放后台线程;算好后 list_tracks 直读缓存,
+/// 不再每次打开详情重扫。失败只降级(前端退段落包络),不影响枚举。
+pub fn backfill_wav_waveform(note_dir: &Path, source: &str) -> anyhow::Result<()> {
+    let wav = note_dir.join(format!("{source}.wav"));
+    let wf = waveform_from_wav(&wav)?;
+    set_track_waveform(note_dir, source, wf)
+}
+
 /// 缺失/损坏 → 默认空表(全 0 offset 由 tracks 缺项兜底),不 Err:与本仓损坏容忍哲学一致。
 pub fn load_audio_meta(note_dir: &Path) -> AudioMeta {
     std::fs::read_to_string(note_dir.join("audio.json"))
@@ -288,6 +298,17 @@ impl AudioTrackWriter {
                     est
                 }
             };
+            // 续录即将改写这条 WAV(对齐 set_len + 追加新音频),之前详情页懒回填算好并
+            // 写进 audio.json 的波形按新内容作废:清掉。否则若本场又中断(没走到转码),
+            // 下次打开详情会 waveform.is_some() 而跳过重算,把旧短波形拉伸到新(更长)时长
+            // 上错位显示。清空后 list_tracks 报 None → 详情页按新长度重新懒回填。
+            let stale_wf = meta.tracks.get(&self.source).map(|t| t.waveform.is_some()).unwrap_or(false);
+            if stale_wf {
+                if let Some(t) = meta.tracks.get_mut(&self.source) {
+                    t.waveform = None;
+                }
+                save_audio_meta(&self.note_dir, &meta)?;
+            }
             // base_ms 只增不减且轨道创建时 offset = 当时的 base,故差值非负;防御 saturating。
             let target = ms_to_bytes(self.base_ms.saturating_sub(offset_ms));
             if target > MAX_DATA_BYTES {
@@ -438,9 +459,12 @@ pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
         out.push(TrackInfo {
             path: path.to_string_lossy().into_owned(),
             offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
-            // 未转码 WAV(中断笔记/转码失败降级)现算:流式读亚秒级,详情页打开是
-            // 低频动作;失败回 None,前端退段落包络,不挡枚举。
-            waveform: waveform_from_wav(&path).ok(),
+            // 未转码 WAV(中断笔记/转码失败降级):波形与 m4a 同策略——读 audio.json 里
+            // 预算好的桶,没有(首次打开)就报 None。曾在这里同步 waveform_from_wav 现算,
+            // 但长会议(数小时 WAV 达数百 MB)全扫是切换卡顿主因,已移交 note_audio_info
+            // 的后台懒回填(backfill_wav_waveform 算完写回 meta 并发 transcode_done 重拉),
+            // 不再阻塞枚举;缺波形期间前端自动退段落包络。
+            waveform: meta.tracks.get(&source).and_then(|t| t.waveform.clone()),
             source,
             duration_ms: bytes_to_ms(md.len() - HEADER_LEN),
         });
@@ -631,6 +655,26 @@ mod tests {
         assert_eq!(tracks[0].source, "mic");
         assert_eq!(tracks[0].offset_ms, 0);
         assert_eq!(tracks[0].duration_ms, 1000);
+    }
+
+    #[test]
+    fn resume_clears_stale_waveform_for_recompute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
+        w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
+        drop(w);
+        // 模拟详情页懒回填把波形写进 audio.json。
+        set_track_waveform(tmp.path(), "mic", vec![7u8; WAVEFORM_BUCKETS]).unwrap();
+        assert!(load_audio_meta(tmp.path()).tracks["mic"].waveform.is_some());
+        // 续录:新 writer 从 base_ms=1000 接着写,open() 改写 WAV 前应清掉过期波形,
+        // 否则本场再中断时旧短波形会被拉伸到新时长错位显示。
+        let mut w2 = AudioTrackWriter::new(tmp.path(), "mic", 1000);
+        w2.append(&vec![0.2f32; AUDIO_SAMPLE_RATE as usize]); // +1s
+        drop(w2);
+        assert!(
+            load_audio_meta(tmp.path()).tracks["mic"].waveform.is_none(),
+            "续录改写 WAV 后旧波形作废,list_tracks 报 None 触发按新长度重算"
+        );
     }
 
     #[test]
