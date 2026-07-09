@@ -2185,6 +2185,51 @@ fn request_screen_capture_permission() -> bool {
     true
 }
 
+/// 解析 `osascript -e 'input volume of (get volume settings)'` 的 stdout(0..100)。
+/// trim 后按十进制解析,越界截到 100,空/非数字 → None。
+fn parse_input_volume(stdout: &str) -> Option<u8> {
+    let v: u32 = stdout.trim().parse().ok()?;
+    Some(v.min(100) as u8)
+}
+
+/// 读取 macOS 系统输入音量(0..100)。非 macOS / 读取失败 → None。录制页据此在普通
+/// 麦克风模式下预警"输入音量被会议软件拉低,会录得很轻"。
+#[tauri::command]
+fn input_volume() -> Option<u8> {
+    #[cfg(not(target_os = "macos"))]
+    return None;
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "input volume of (get volume settings)"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_input_volume(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// 设置 macOS 系统输入音量(0..100)。成功返回 true。非 macOS → false。
+#[tauri::command]
+fn set_input_volume(v: u8) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = v;
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let v = v.min(100);
+        std::process::Command::new("osascript")
+            .args(["-e", &format!("set volume input volume {v}")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -2328,6 +2373,8 @@ pub fn run() {
             set_segment_speaker,
             screen_capture_permission,
             request_screen_capture_permission,
+            input_volume,
+            set_input_volume,
             output_is_bluetooth,
             models_status,
             download_models,
@@ -2523,5 +2570,21 @@ mod tests {
         });
         assert!(h.join().is_err());
         assert!(!flag.load(Ordering::SeqCst), "panic 展开也必须复位标志");
+    }
+}
+
+#[cfg(test)]
+mod input_volume_parse_tests {
+    use super::parse_input_volume;
+
+    #[test]
+    fn parses_trims_and_clamps() {
+        assert_eq!(parse_input_volume("30\n"), Some(30));
+        assert_eq!(parse_input_volume("100"), Some(100));
+        assert_eq!(parse_input_volume("150"), Some(100)); // 越界截到 100
+        assert_eq!(parse_input_volume(" 42 \n"), Some(42)); // 含空白
+        assert_eq!(parse_input_volume(""), None);
+        assert_eq!(parse_input_volume("abc"), None);
+        assert_eq!(parse_input_volume("missing value"), None); // 无输入设备时 osascript 的输出
     }
 }
