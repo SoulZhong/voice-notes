@@ -207,15 +207,20 @@
     else play();
   }
 
-  // 组件卸载/笔记切换:停干净,不留幽灵声音。
+  // 组件卸载/笔记切换:停播,不留幽灵声音。不在此拆图——<audio> 跨笔记复用,
+  // MediaElementSource 每元素一生只能建一次,拆了再建会 InvalidStateError。
   $effect(() => {
     void tracks;
+    return () => pause();
+  });
+
+  // 仅组件真正卸载时关掉 AudioContext(effect 体不读任何响应式值→cleanup 只在销毁时跑)。
+  $effect(() => {
     return () => {
-      pause();
-      srcNodes.clear();
       void audioCtx?.close();
       audioCtx = null;
       gainNode = null;
+      srcNodes.clear();
     };
   });
 
