@@ -8,6 +8,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod store;
+mod player;
 mod tray;
 mod update;
 pub mod diar;
@@ -2286,6 +2287,7 @@ pub fn run() {
                 .build(),
         )
         .manage(AppState::default())
+        .manage(player::PlayerHandle::default())
         .on_window_event(|window, event| {
             // 关窗即隐藏（而非退出）:仅当托盘**实际存在**时拦截关闭并隐藏主窗——托盘常驻
             // 才有"隐藏后再打开"的入口。判定按 tray_by_id 查托盘实存,而非读 settings.tray_enabled:
@@ -2322,6 +2324,7 @@ pub fn run() {
                 models::init_app_root(models_dir);
             }
             models::download::sweep_tmp(&models::root());
+            player::clean_playback_cache(&handle); // 回收超期的回放解码缓存(可再生)
 
             let st = app.state::<AppState>();
             match data_root(&handle) {
@@ -2435,7 +2438,13 @@ pub fn run() {
             mcp_skill_status,
             mcp_skill_install,
             mcp_skill_uninstall,
-            update::check_update
+            update::check_update,
+            player::player_load,
+            player::player_play,
+            player::player_pause,
+            player::player_seek,
+            player::player_set_muted,
+            player::player_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

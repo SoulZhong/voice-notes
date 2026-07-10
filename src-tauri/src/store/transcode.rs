@@ -232,6 +232,30 @@ fn decode_one(
     Ok(())
 }
 
+/// m4a 解码为**标准 44 头** WAV 到任意目标路径(原生播放器的解码缓存用)。
+/// afconvert 产物是胖头(40 字节 fmt + FLLR 填充),mmap 按 `44+2i` 直接索引会错位,
+/// 必须解析 RIFF 取纯 data 后用标准头重写——与 decode_one 的续录路径同一策略。
+/// tmp 同目录写、rename 原子落位,失败清 tmp。
+pub fn decode_m4a_to_standard_wav(m4a: &Path, dest: &Path) -> anyhow::Result<()> {
+    let tmp = dest.with_extension("wav.tmp");
+    let run = || -> anyhow::Result<()> {
+        afconvert_decode(m4a, &tmp)?;
+        let pcm = extract_wav_data(&tmp)?;
+        if pcm.is_empty() {
+            anyhow::bail!("解码得到空 WAV: {}", m4a.display());
+        }
+        let mut canonical = Vec::with_capacity(HEADER_LEN as usize + pcm.len());
+        canonical.extend_from_slice(&wav_header(pcm.len() as u32));
+        canonical.extend_from_slice(&pcm);
+        std::fs::write(&tmp, &canonical)?;
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    };
+    run().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// 从任意合法 WAV(含 afconvert 的 FLLR 填充块变体)里取出 `data` 块的纯 PCM 字节。
 /// 逐块跳过 fmt/FLLR 等,只认 data;找不到即 Err(交由 decode 降级)。
 fn extract_wav_data(path: &Path) -> anyhow::Result<Vec<u8>> {
