@@ -122,3 +122,45 @@ a {
 button:active:not(:disabled) {
   transform: translateY(0.5px);
 }
+
+/* switch(macOS 系统设置式拨动开关):替代原生方框 checkbox,承载全应用布尔行(设置页/AI 页
+   等 settings-row 里「纯开关行」的右侧控件)。轨道 34x20、radius-full;关 hairline-strong 底、
+   开 accent 底;滑块 16px 白圆、2px 内缩,随选中态位移;120ms 与全局 transition 节奏一致。 */
+input[type="checkbox"].switch {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border-radius: var(--radius-full);
+  background: var(--hairline-strong);
+  position: relative;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+input[type="checkbox"].switch::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.12s ease;
+}
+input[type="checkbox"].switch:checked {
+  background: var(--accent);
+}
+input[type="checkbox"].switch:checked::before {
+  transform: translateX(14px);
+}
+input[type="checkbox"].switch:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+input[type="checkbox"].switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

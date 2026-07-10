@@ -18,7 +18,7 @@ description: 查询本机 voice-notes 会议笔记(实时转写+说话人识别)
 {{BINARY}} speakers list --json
 ```
 
-控制录制(需 App 运行;`start/stop/pause/resume` 还需用户在设置开启「允许 AI 控制录制」):
+控制录制(需 App 运行;`start/stop/pause/resume` 还需用户在左侧「AI」页开启「允许 AI 控制录制」):
 
     {{BINARY}} record status
     {{BINARY}} record start --title "评审会"
@@ -35,7 +35,7 @@ MCP 未注册时,**先征得用户同意**后可代为注册:`{{BINARY}} mcp reg
 
 - **先定位再取全文**:`search_notes`(大小写不敏感子串,试关键词的多个说法)拿 note_id,再 `get_note`;不要 list 全部后逐个 get。
 - `get_note` 默认 prefer_refined=true:有 AI 精修稿(错字修正/段落归并)时返回精修稿,响应的 `refined` 字段标注来源;需要逐句时间戳或原始逐字稿时用 format="segments"、prefer_refined=false。
-- 查询类(list/search/get/speakers)无需 App 运行;`recording_status`/`get_live_transcript` 需要 App 正在运行;`start/stop/pause/resume_recording` 还需用户在「设置 → AI 助手接入」开启「允许 AI 控制录制」——被拒时把这句指引转告用户,不要自行重试。
+- 查询类(list/search/get/speakers)无需 App 运行;`recording_status`/`get_live_transcript` 需要 App 正在运行;`start/stop/pause/resume_recording` 还需用户在左侧「AI」页开启「允许 AI 控制录制」——被拒时把这句指引转告用户,不要自行重试。
 - 说话人:人名以响应里的 `speakers` 表(name/person_id)为准;P 号是跨会议一致的人物编号;`speaker_count` 是聚类结果仅供参考。
 
 ## 常用工作流

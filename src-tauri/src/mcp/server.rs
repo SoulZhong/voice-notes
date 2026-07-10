@@ -112,7 +112,7 @@ impl VnMcp {
         Ok(bridge_call("live", serde_json::json!({ "tail": p.tail })).await)
     }
 
-    #[tool(description = "开始录制一场会议(可选标题)。需要应用正在运行,且用户已在 设置 → AI 助手接入 开启「允许 AI 控制录制」。")]
+    #[tool(description = "开始录制一场会议(可选标题)。需要应用正在运行,且用户已在左侧 AI 页开启「允许 AI 控制录制」。")]
     async fn start_recording(&self, Parameters(p): Parameters<StartParams>) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("start", serde_json::json!({ "title": p.title })).await)
     }
@@ -140,6 +140,87 @@ impl ServerHandler for VnMcp {
             "voice-notes 本地会议笔记。查询类工具(list/search/get/speakers)随时可用;\
              录制状态与控制类工具需要 voice-notes 应用正在运行。所有数据均在本机。",
         )
+    }
+}
+
+/// `/ai` 页展示用的静态能力清单:MCP 十工具 + CLI 命令一行用法。与上方 `#[tool]`
+/// 定义相邻放置,便于人工同步;`catalog_matches_tool_router` 测试做防漂移守卫。
+/// gate:`none` 随时可用,`app` 需 App 运行,`control` 还需用户开启「允许 AI 控制录制」。
+pub fn catalog() -> serde_json::Value {
+    let tools: &[(&str, &str, &str)] = &[
+        ("list_notes", "列出会议笔记(倒序分页;from/to 可按时间过滤)。返回 id/标题/开始时间/时长/状态。", "none"),
+        ("search_notes", "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。", "none"),
+        (
+            "get_note",
+            "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 精修稿时默认优先精修稿。",
+            "none",
+        ),
+        ("list_speakers", "列出全局声纹库中的说话人(跨会议一致的人物编号/名字/累计说话时长/出现的笔记数)。", "none"),
+        ("recording_status", "查询录制状态(idle/recording/paused)、当前笔记 id 与已录时长。", "app"),
+        ("get_live_transcript", "获取正在录制会话的实时转写(最近 N 句,含说话人与时间戳)。", "app"),
+        ("start_recording", "开始录制一场会议(可选标题)。", "control"),
+        ("stop_recording", "停止当前录制并返回笔记 id。", "control"),
+        ("pause_recording", "暂停当前录制。", "control"),
+        ("resume_recording", "恢复已暂停的录制。", "control"),
+    ];
+    let cli: &[(&str, &str)] = &[
+        ("voice-notes notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]", "列出会议笔记"),
+        ("voice-notes notes search \"关键词\" [--limit N] [--json]", "全文检索会议笔记"),
+        (
+            "voice-notes notes get <note-id> [--format md|txt|json] [--json] [--raw]",
+            "读取一场会议笔记全文(默认 md;--json 是 --format json 的别名;--raw 取原始逐字稿)",
+        ),
+        ("voice-notes speakers list [--json]", "列出全局声纹库中的说话人"),
+        ("voice-notes record status", "查询录制状态(需应用运行)"),
+        ("voice-notes record start [--title \"评审会\"]", "开始录制(需应用运行 + 允许 AI 控制)"),
+        ("voice-notes record stop", "停止录制并返回笔记 id(需应用运行 + 允许 AI 控制)"),
+        ("voice-notes record pause", "暂停录制(需应用运行 + 允许 AI 控制)"),
+        ("voice-notes record resume", "恢复已暂停的录制(需应用运行 + 允许 AI 控制)"),
+        ("voice-notes record live [--tail N]", "获取实时转写(需应用运行)"),
+    ];
+    serde_json::json!({
+        "tools": tools.iter().map(|(name, desc, gate)| serde_json::json!({ "name": name, "desc": desc, "gate": gate })).collect::<Vec<_>>(),
+        "cli": cli.iter().map(|(cmd, desc)| serde_json::json!({ "cmd": cmd, "desc": desc })).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// 防漂移守卫:catalog 的工具名集合必须与 rmcp `#[tool_router]` 生成的
+    /// 路由(`VnMcp::tool_router().list_all()`)完全一致——新增/改名/删除工具
+    /// 时若忘了同步 catalog,这个测试会先炸。
+    #[test]
+    fn catalog_matches_tool_router() {
+        let router_names: std::collections::BTreeSet<String> =
+            VnMcp::tool_router().list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let cat = catalog();
+        let cat_tools = cat["tools"].as_array().expect("tools 是数组");
+        let cat_names: std::collections::BTreeSet<String> =
+            cat_tools.iter().map(|t| t["name"].as_str().expect("name 是字符串").to_string()).collect();
+        assert_eq!(cat_names.len(), cat_tools.len(), "catalog 不应有重复工具名");
+        assert_eq!(cat_names, router_names, "catalog.tools 必须与 tool_router 注册的工具名完全一致");
+    }
+
+    #[test]
+    fn catalog_gates_are_known_values() {
+        let cat = catalog();
+        for t in cat["tools"].as_array().unwrap() {
+            let gate = t["gate"].as_str().unwrap();
+            assert!(matches!(gate, "none" | "app" | "control"), "未知 gate: {gate}");
+        }
+    }
+
+    #[test]
+    fn catalog_cli_nonempty_and_well_formed() {
+        let cat = catalog();
+        let cli = cat["cli"].as_array().expect("cli 是数组");
+        assert_eq!(cli.len(), 10, "notes 3 + speakers 1 + record 6");
+        for c in cli {
+            assert!(c["cmd"].as_str().unwrap().starts_with("voice-notes "));
+            assert!(!c["desc"].as_str().unwrap().is_empty());
+        }
     }
 }
 

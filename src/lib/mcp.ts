@@ -24,3 +24,17 @@ export const mcpHealedCount = () => invoke<number>("mcp_healed_count");
 export const mcpSkillStatus = () => invoke<string>("mcp_skill_status");
 export const mcpSkillInstall = () => invoke<void>("mcp_skill_install");
 export const mcpSkillUninstall = () => invoke<void>("mcp_skill_uninstall");
+
+export type ToolCatalogEntry = { name: string; desc: string; gate: "none" | "app" | "control" };
+export type CliCatalogEntry = { cmd: string; desc: string };
+export type Capabilities = { tools: ToolCatalogEntry[]; cli: CliCatalogEntry[] };
+
+/** `/ai` 页「Agent 能调用什么」清单:MCP 工具 + CLI 命令,纯静态数据。 */
+export const mcpCapabilities = () => invoke<Capabilities>("mcp_capabilities");
+
+export type SkillRead = { content: string; state: string };
+
+/** 读取 skill 正文;未安装时返回渲染默认稿(state 仍如实为 not_installed)。 */
+export const mcpSkillRead = () => invoke<SkillRead>("mcp_skill_read");
+/** 保存 = 编辑即接管:剥离受管标记后落盘,保存后状态变 unmanaged。 */
+export const mcpSkillSave = (content: string) => invoke<void>("mcp_skill_save", { content });
