@@ -104,7 +104,7 @@ npm run tauri build    # 构建 .app + .dmg
 
 ## 接入 AI 助手(MCP · CLI · Skill)
 
-让本地 Agent(Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI)读你的会议笔记来回答问题、整理纪要、写周报——"上周和张三定的交付日期是哪天?"、"把今天的周会整理成邮件"、"这周开了哪些会、各自的待办是什么"。三个接入面,按需选:
+让本地 Agent(Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI / WorkBuddy / OpenClaw / Hermes Agent,内置支持八家)读你的会议笔记来回答问题、整理纪要、写周报——"上周和张三定的交付日期是哪天?"、"把今天的周会整理成邮件"、"这周开了哪些会、各自的待办是什么"。三个接入面,按需选:
 
 | 接入面 | 是什么 | 用在哪 |
 | --- | --- | --- |
@@ -125,7 +125,7 @@ npm run tauri build    # 构建 .app + .dmg
 
    ```bash
    VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
-   "$VN" mcp register --agent auto    # 注册到所有检测到的 Agent(claude-code/claude-desktop/cursor/codex/gemini)
+   "$VN" mcp register --agent auto    # 注册到所有检测到的 Agent(claude-code/claude-desktop/cursor/codex/gemini/workbuddy/openclaw/hermes)
    "$VN" mcp status --json            # 查看各 Agent 注册状态
    "$VN" mcp unregister --agent cursor
    ```
@@ -170,6 +170,15 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" notes search "交付日期" [--limit N] [--json]
 "$VN" notes get <note-id> [--format md|txt|json] [--raw]   # 默认 md;--raw 取原始逐字稿(忽略精修)
 "$VN" speakers list [--json]
+```
+
+录制控制(需 App 运行;`start/stop/pause/resume` 还需在 设置 → AI 助手接入 开启「允许 AI 控制录制」):
+
+```bash
+"$VN" record status
+"$VN" record start --title "评审会"
+"$VN" record stop
+"$VN" record live [--tail N]
 ```
 
 退出码:`0` 成功 / `1` 执行错(如 note-id 不存在)/ `2` 用法错(参数缺失或未知);未知参数一律报错,不静默忽略。
