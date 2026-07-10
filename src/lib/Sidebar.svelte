@@ -20,7 +20,11 @@
   let error = $state("");
 
   // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=声纹库,其余(笔记/录制/设置)=录音记录。
-  const tab = $derived($page.url.pathname.startsWith("/speakers") ? "people" : "notes");
+  const tab = $derived(
+    $page.url.pathname.startsWith("/speakers") ? "people"
+    : $page.url.pathname.startsWith("/ai") ? "ai"
+    : "notes",
+  );
 
   let people = $state<PersonSummary[]>([]);
   let peopleError = $state("");
@@ -200,6 +204,11 @@
       class:active={tab === "people"}
       onclick={() => { if (tab !== "people") goto("/speakers"); }}>会议搭子</button
     >
+    <button
+      class="vtab"
+      class:active={tab === "ai"}
+      onclick={() => { if (tab !== "ai") goto("/ai"); }}>AI</button
+    >
   </nav>
 
   <div class="panel">
@@ -236,6 +245,8 @@
         {/each}
       {/if}
     </ul>
+  {:else if tab === "ai"}
+    <!-- AI 页签无列表内容(拍板留空) -->
   {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
