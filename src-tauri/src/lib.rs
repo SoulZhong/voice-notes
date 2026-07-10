@@ -2199,6 +2199,27 @@ fn request_screen_capture_permission() -> bool {
     true
 }
 
+/// 清除本应用在「屏幕录制」里的 TCC 授权记录(tccutil reset)。修复授权残留:
+/// 换签名后(如 v0.1.x ad-hoc → 稳定证书)旧条目的 csreq 与新二进制不匹配,系统
+/// 设置里开关看似已开、实际 SCShareableContent 始终被拒,且拨动开关/重启均无效
+/// (2026-07-10 实锤:一个 bundle id 下积了 3 条残留)。清除后由前端引导重新授权。
+#[tauri::command]
+fn reset_screen_capture_permission(app: tauri::AppHandle) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/tccutil")
+            .args(["reset", "ScreenCapture", &app.config().identifier])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 /// 解析 `osascript -e 'input volume of (get volume settings)'` 的 stdout(0..100)。
 /// trim 后按十进制解析,越界截到 100,空/非数字 → None。
 fn parse_input_volume(stdout: &str) -> Option<u8> {
@@ -2387,6 +2408,7 @@ pub fn run() {
             set_segment_speaker,
             screen_capture_permission,
             request_screen_capture_permission,
+            reset_screen_capture_permission,
             input_volume,
             set_input_volume,
             output_is_bluetooth,
