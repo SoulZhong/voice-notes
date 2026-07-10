@@ -100,7 +100,7 @@ fn control_allowed(app: &tauri::AppHandle) -> bool {
     app.path().app_data_dir().map(|d| crate::settings::load(&d).mcp_allow_control).unwrap_or(false)
 }
 
-const CONTROL_DENIED: &str = "已被用户在设置中禁用:请在 voice-notes 的「设置 → AI 助手接入」开启「允许 AI 控制录制」";
+const CONTROL_DENIED: &str = "已被用户禁用:请在 voice-notes 左侧「AI」页开启「允许 AI 控制录制」";
 
 /// dispatch 依赖的能力抽象:把「读授权开关、取状态、执行录制操作」从 AppHandle 解耦,
 /// 使门控判定与 op 路由这层策略可脱离 GUI 单测(控制面最该锁住的不变量是"某个控制

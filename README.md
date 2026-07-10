@@ -112,15 +112,15 @@ npm run tauri build    # 构建 .app + .dmg
 | **命令行 CLI** | 同一套查询能力的命令行版,可 `--json` | 脚本、CI,或 Agent 没配 MCP 时的降级 |
 | **Claude Code 技能** | 教 Claude Code 何时怎么组合上面的工具(纪要 / 周报 / 检索工作流) | 锦上添花,让 Claude 开箱会用 |
 
-> **隐私提示**:笔记内容一旦被 Agent 检索就进入其 LLM 上下文,是否上云取决于你所用的 Agent 与模型;**voice-notes 自身仍然不联网上传任何内容**。录制控制类工具默认禁用,需在 设置 → AI 助手接入 开启「允许 AI 控制录制」。
+> **隐私提示**:笔记内容一旦被 Agent 检索就进入其 LLM 上下文,是否上云取决于你所用的 Agent 与模型;**voice-notes 自身仍然不联网上传任何内容**。录制控制类工具默认禁用,需在左侧「AI」页开启「允许 AI 控制录制」。
 
-**最快上手**:打开 设置 → AI 助手接入,一键注册 MCP + 安装技能。(AI 助手可直接按[安装](#安装)章节的步骤自行完成。)
+**最快上手**:打开左侧「AI」页,一键注册 MCP + 安装技能。(AI 助手可直接按[安装](#安装)章节的步骤自行完成。)
 
 ### MCP 服务
 
 三种注册方式(任选其一):
 
-1. **应用内**:欢迎页勾选,或 设置 → AI 助手接入 注册/移除。
+1. **应用内**:欢迎页勾选,或左侧「AI」页注册/移除。
 2. **命令行**(Agent 亦可直接执行):
 
    ```bash
@@ -172,7 +172,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" speakers list [--json]
 ```
 
-录制控制(需 App 运行;`start/stop/pause/resume` 还需在 设置 → AI 助手接入 开启「允许 AI 控制录制」):
+录制控制(需 App 运行;`start/stop/pause/resume` 还需在左侧「AI」页开启「允许 AI 控制录制」):
 
 ```bash
 "$VN" record status
@@ -185,7 +185,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 
 ### Claude Code 技能
 
-一行命令让 Claude Code 掌握会议纪要、周报汇总、决议检索等工作流(也可在 设置 → AI 助手接入 一键安装 / 移除):
+一行命令让 Claude Code 掌握会议纪要、周报汇总、决议检索等工作流(也可在左侧「AI」页一键安装 / 移除):
 
 ```bash
 /Applications/voice-notes.app/Contents/MacOS/voice-notes skill install   # status 查看 / uninstall 移除
@@ -198,7 +198,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 - **首选 MCP 工具;不可用时降级到 CLI**(`notes … --json`、`speakers list --json`,与 MCP 同一份 JSON)。两者都不通时按上方指令注册:`mcp register --agent auto`。
 - **先检索再取全文**:`search_notes` 拿 note_id → `get_note`,别把 `list_notes` 全量拉回逐个读。
 - `get_note` 默认给 AI 精修稿(响应 `refined` 字段标注来源);要原始逐字稿用 CLI `--raw` 或 MCP `prefer_refined=false`。
-- 录制控制默认禁用;被拒时把「去 设置 → AI 助手接入 开启」转告用户,不要反复重试。
+- 录制控制默认禁用;被拒时把「去左侧 AI 页开启」转告用户,不要反复重试。
 - 笔记是用户本机隐私数据,进入你的上下文即离开本机——按需检索,引用大段原文前先确认意图。
 
 ## 使用

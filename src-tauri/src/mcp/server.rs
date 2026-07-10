@@ -112,7 +112,7 @@ impl VnMcp {
         Ok(bridge_call("live", serde_json::json!({ "tail": p.tail })).await)
     }
 
-    #[tool(description = "开始录制一场会议(可选标题)。需要应用正在运行,且用户已在 设置 → AI 助手接入 开启「允许 AI 控制录制」。")]
+    #[tool(description = "开始录制一场会议(可选标题)。需要应用正在运行,且用户已在左侧 AI 页开启「允许 AI 控制录制」。")]
     async fn start_recording(&self, Parameters(p): Parameters<StartParams>) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("start", serde_json::json!({ "title": p.title })).await)
     }
