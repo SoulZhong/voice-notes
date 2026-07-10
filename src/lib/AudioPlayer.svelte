@@ -1,11 +1,14 @@
 <script lang="ts">
-  import { convertFileSrc } from "@tauri-apps/api/core";
+  import { invoke } from "@tauri-apps/api/core";
+  import { onPlayerPos } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
 
-  /* 多轨播放器:每轨一个隐藏 <audio>(asset 协议流式,内存恒定),自有时钟驱动
-     UI 与文字跟随。有轨道覆盖当前时刻时以该轨 currentTime 为真时钟(音频即时钟),
-     轨道间隙(offset 之前/短轨结束后)由墙钟推进。各轨每帧向时钟收敛:期望位置
-     在界内则确保播放、偏差 >0.3s 回拉;界外则暂停。 */
+  /* 多轨播放器(原生引擎):音频在 Rust 里单条 cpal 输出流按 offset 混音——WebView
+     只画 UI。此前 <audio> 方案在打包版(tauri:// 文档源)被 WKWebView 按自动播放策略
+     处理:窗口不可见 5 秒宽限后媒体会话被打断,后台播放必停(2026-07-10 系统日志实锤);
+     Web Audio 增益路由更是整体静音。原生化后这一类 WebView 媒体坑全消。
+     时钟在 Rust:player_pos 事件(~200ms,播/停/seek 立即补发)驱动 currentMs/playing;
+     双轨对齐由单输出流按构造保证,前端不再有同步循环。 */
   let {
     tracks,
     waveform = [],
@@ -19,47 +22,53 @@
     playing?: boolean;
   } = $props();
 
-  let els = $state<(HTMLAudioElement | null)[]>([]);
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
 
-  /** 轨道加载/播放失败的可视化(排障关键:加载失败时走表逻辑仍会推进度条,
-      看起来在播实际无声——错误必须浮出水面,不许静默)。 */
+  /** 装载失败/播放失败的可视化(排障关键:错误必须浮出水面,不许静默)。 */
   let trackErrors = $state<string[]>([]);
   function reportError(source: string, detail: string) {
-    const msg = `${source} 音轨: ${detail}`;
+    const msg = `${source}: ${detail}`;
     if (!trackErrors.includes(msg)) trackErrors = [...trackErrors, msg];
   }
-  function onAudioError(i: number) {
-    const el = els[i];
-    const media = el?.error;
-    const code =
-      media?.code === 1 ? "加载被中止" :
-      media?.code === 2 ? "网络/协议错误(资源读取失败)" :
-      media?.code === 3 ? "解码失败(文件损坏或编码不支持)" :
-      media?.code === 4 ? "资源不可用(路径被拒或文件不存在)" : `错误码 ${media?.code}`;
-    reportError(tracks[i]?.source ?? `#${i}`, code);
-  }
 
-  // 驱动循环用 setInterval 而非 requestAnimationFrame:窗口被遮挡/最小化时
-  // WebKit 停发 rAF,同步循环停摆(后台播放停止的根因之一,2026-07-08 实锤;
-  // 另一半根因是页面级节流,由窗口配置 backgroundThrottling=disabled 关掉)。
-  // interval 即使在未关节流的环境也只会被钳到 1s,同步照常存活。
-  let timer: ReturnType<typeof setInterval> | 0 = 0;
-  const TICK_MS = 100;
-  // 连续播放位置(非响应式):驱动音频同步;currentMs 只按 100ms 粒度更新——
-  // 高亮/进度条用不到更细,也避免高频触发全段落列表的派生重算。
-  let pos = 0;
+  // 装载:tracks 变化(进页/续录/transcode_done 重拉)即重载原生播放器。
+  // m4a 首次播放需解码到缓存(秒级、命令内完成),play() await 此 promise 即拿到就绪;
+  // 缓存跨会话复用,二次装载瞬时。卸载/切笔记 → player_stop 停流放资源。
+  let loadPromise: Promise<number> | null = null;
+  $effect(() => {
+    trackErrors = [];
+    loadPromise =
+      tracks.length === 0
+        ? null
+        : invoke<number>("player_load", {
+            tracks: tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source })),
+          }).catch((e) => {
+            reportError("音轨装载", `${e}`);
+            throw e;
+          });
+    return () => {
+      loadPromise = null;
+      void invoke("player_stop").catch(() => {});
+    };
+  });
 
-  // 每轨静音(源名 → 静音)。用 el.muted 而非暂停:静音轨仍在走表,可继续充当
-  // audibleClock,双轨同步语义零改动。用途:双轨串音的笔记(外放+蓝牙延迟致
-  // AEC 失效,同一句话两轨相隔数百毫秒各有一份)静掉一轨即无回音。
+  // Rust 时钟 → UI:位置事件驱动进度/歌词跟随;播完事件自带 playing=false。
+  $effect(() => {
+    const un = onPlayerPos((e) => {
+      currentMs = Math.min(e.pos_ms, totalMs);
+      playing = e.playing;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  // 每轨静音(源名 → 静音):Rust 混音时跳过该轨,双轨同步与时钟零影响。
+  // 用途:双轨串音的笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音。
   let muted = $state<Record<string, boolean>>({});
   function toggleMute(source: string) {
     muted = { ...muted, [source]: !muted[source] };
-    for (let i = 0; i < tracks.length; i++) {
-      const el = els[i];
-      if (el) el.muted = !!muted[tracks[i].source];
-    }
+    void invoke("player_set_muted", { source, muted: !!muted[source] }).catch(() => {});
   }
 
   // ── 音轨菜单(收纳每轨静音开关):双轨会议才有,主控制行只留一个「音轨」按钮 ──
@@ -83,94 +92,27 @@
       document.removeEventListener("keydown", onKey);
     };
   });
-  // 墙钟锚点:无轨道可依时,pos = anchorMs + (now - anchorWall)。
-  let anchorWall = 0;
-  let anchorMs = 0;
-
-  const DRIFT_MS = 300;
-  const UI_STEP_MS = 100;
-
-  function publishPos() {
-    const q = Math.min(Math.floor(pos / UI_STEP_MS) * UI_STEP_MS, totalMs);
-    if (q !== currentMs) currentMs = q;
-  }
-
-  function audibleClock(): number | null {
-    for (let i = 0; i < tracks.length; i++) {
-      const el = els[i];
-      // 在播且未 seek 的轨道即真时钟(syncTracks 保证界外轨道已暂停)。
-      if (!el || el.paused || el.seeking) continue;
-      return el.currentTime * 1000 + tracks[i].offset_ms;
-    }
-    return null;
-  }
-
-  function syncTracks() {
-    for (let i = 0; i < tracks.length; i++) {
-      const el = els[i];
-      if (!el) continue;
-      const expected = pos - tracks[i].offset_ms;
-      el.muted = !!muted[tracks[i].source];
-      if (expected >= 0 && expected < tracks[i].duration_ms) {
-        if (el.paused) {
-          el.currentTime = expected / 1000;
-          void el.play().catch((e) => {
-            // 播放被拒也要浮出水面(自动播放策略/资源失效),不再静默吞掉。
-            reportError(tracks[i]?.source ?? `#${i}`, `播放被拒: ${e?.name ?? e}`);
-          });
-        } else if (Math.abs(el.currentTime * 1000 - expected) > DRIFT_MS) {
-          el.currentTime = expected / 1000;
-        }
-      } else if (!el.paused) {
-        el.pause();
-      }
-    }
-  }
-
-  function tick() {
-    const clock = audibleClock();
-    if (clock != null) {
-      pos = clock;
-      anchorMs = clock;
-      anchorWall = performance.now();
-    } else {
-      pos = anchorMs + (performance.now() - anchorWall);
-    }
-    if (pos >= totalMs) {
-      pos = totalMs;
-      publishPos();
-      pause();
-      return;
-    }
-    publishPos();
-    syncTracks();
-  }
-
   export function play() {
-    if (tracks.length === 0) return;
-    if (pos >= totalMs) pos = 0; // 播完再按:从头来
-    playing = true;
-    anchorMs = pos;
-    anchorWall = performance.now();
-    publishPos();
-    syncTracks();
-    if (timer) clearInterval(timer);
-    timer = setInterval(tick, TICK_MS);
+    if (!loadPromise) return;
+    playing = true; // 乐观置位:事件到达前按钮即时反馈;失败在 catch 复位
+    loadPromise
+      .then(() => invoke("player_play"))
+      .catch((e) => {
+        playing = false;
+        reportError("播放", `${e}`);
+      });
   }
 
   export function pause() {
     playing = false;
-    if (timer) clearInterval(timer);
-    timer = 0;
-    for (const el of els) el?.pause();
+    void invoke("player_pause").catch(() => {});
   }
 
   export function seek(ms: number) {
-    pos = Math.max(0, Math.min(ms, totalMs));
-    anchorMs = pos;
-    anchorWall = performance.now();
-    publishPos();
-    if (playing) syncTracks();
+    const target = Math.max(0, Math.min(ms, totalMs));
+    currentMs = target; // 乐观更新:拖拽跟手,事件到达后以 Rust 为准
+    if (!loadPromise) return;
+    void loadPromise.then(() => invoke("player_seek", { ms: Math.round(target) })).catch(() => {});
   }
 
   /** 时间轴总长(页面用于判断某段是否落在音频覆盖范围内)。 */
@@ -182,12 +124,6 @@
     if (playing) pause();
     else play();
   }
-
-  // 组件卸载/笔记切换:停播,不留幽灵声音。
-  $effect(() => {
-    void tracks;
-    return () => pause();
-  });
 
   const pct = $derived(totalMs > 0 ? (Math.min(currentMs, totalMs) / totalMs) * 100 : 0);
 
@@ -321,12 +257,6 @@
       {/if}
     </div>
   {/if}
-  {#each tracks as t, i (t.source)}
-    <!-- 直接播 asset 协议 URL(流式、内存恒定)。不再经 Web Audio:WKWebView 在打包版
-         tauri:// 文档源下,<audio> 经 MediaElementSource 路由进图会静音输出(dev 的 http
-         源无此问题),故回放不走增益节点;响度归一化改在转码时做。 -->
-    <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto" onerror={() => onAudioError(i)}></audio>
-  {/each}
 </div>
 {#if trackErrors.length > 0}
   <div class="track-errors">
@@ -473,9 +403,6 @@
   }
   .bar.played {
     background: var(--accent);
-  }
-  audio {
-    display: none;
   }
   /* 音轨错误可视化:danger 色小字,贴在播放器下方 */
   .track-errors {
