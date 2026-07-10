@@ -79,6 +79,12 @@ export function onRefine(cb: (e: RefineEvent) => void) {
   return listen<RefineEvent>("refine", (ev) => cb(ev.payload));
 }
 
+/** 原生播放器位置事件(~200ms 一发,播/停/seek 立即补发):前端只画 UI,时钟在 Rust。 */
+export type PlayerPosEvent = { pos_ms: number; playing: boolean };
+export function onPlayerPos(cb: (e: PlayerPosEvent) => void) {
+  return listen<PlayerPosEvent>("player_pos", (ev) => cb(ev.payload));
+}
+
 /** 后端自动改名(LLM 主题标题)。侧栏与详情页据此刷新标题。 */
 export type NoteRenamedEvent = { note_id: string; title: string };
 
