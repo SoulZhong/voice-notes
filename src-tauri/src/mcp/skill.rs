@@ -65,6 +65,52 @@ pub fn install_in(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 读取安装文件;未安装时给出渲染稿供预览/首次编辑(state 仍如实为 NotInstalled)。
+pub fn read_in(home: &Path) -> (String, SkillState) {
+    let state = status_in(home);
+    if state == SkillState::NotInstalled {
+        return (rendered(), SkillState::NotInstalled);
+    }
+    let content = std::fs::read_to_string(skill_file(home)).unwrap_or_else(|_| rendered());
+    (content, state)
+}
+
+/// 剥离受管标记所在整行;若剥离后该行原先的前后邻居都是空行,顺带吞掉一行,
+/// 避免文中留一个双空行的空洞。无标记时原样返回(不受影响)。
+fn strip_managed_mark(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.contains(MANAGED_MARK)) else {
+        return content.to_string();
+    };
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len().saturating_sub(1));
+    out.extend_from_slice(&lines[..idx]);
+    out.extend_from_slice(&lines[idx + 1..]);
+    if idx > 0 && idx < out.len() && out[idx - 1].trim().is_empty() && out[idx].trim().is_empty() {
+        out.remove(idx);
+    }
+    let mut result = out.join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
+/// 保存 = 编辑即接管:剥离受管标记 → 目录按需创建 → tmp+rename 原子写。
+/// 保存后 `status_in` 自然判 Unmanaged(不含标记),升级自愈不再触碰此文件。
+pub fn save_in(home: &Path, content: &str) -> anyhow::Result<()> {
+    if content.trim().is_empty() {
+        anyhow::bail!("内容为空");
+    }
+    let stripped = strip_managed_mark(content);
+    let file = skill_file(home);
+    let dir = file.parent().expect("skill_file 恒有父目录");
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join("SKILL.md.tmp");
+    std::fs::write(&tmp, &stripped)?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
+}
+
 pub fn uninstall_in(home: &Path) -> anyhow::Result<()> {
     let file = skill_file(home);
     if file.exists() {
@@ -96,6 +142,14 @@ pub fn install() -> anyhow::Result<()> {
 
 pub fn uninstall() -> anyhow::Result<()> {
     uninstall_in(&real_home()?)
+}
+
+pub fn read() -> anyhow::Result<(String, SkillState)> {
+    Ok(read_in(&real_home()?))
+}
+
+pub fn save(content: &str) -> anyhow::Result<()> {
+    save_in(&real_home()?, content)
 }
 
 /// GUI 启动自愈的真实入口。开发机 `cargo run`(exe 路径含 `target` 组件)时
@@ -207,5 +261,60 @@ mod tests {
         );
         install_in(tmp.path()).unwrap(); // 显式安装=用户主动,覆盖
         assert_eq!(status_in(tmp.path()), SkillState::Current);
+    }
+
+    #[test]
+    fn read_in_not_installed_returns_rendered_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (content, state) = read_in(tmp.path());
+        assert_eq!(state, SkillState::NotInstalled);
+        assert_eq!(content, rendered());
+    }
+
+    #[test]
+    fn save_in_strips_managed_mark_and_becomes_unmanaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_in(tmp.path()).unwrap();
+        assert_eq!(status_in(tmp.path()), SkillState::Current);
+
+        let edited = rendered().replace("会议纪要", "会议纪要(我加的)");
+        assert!(edited.contains(MANAGED_MARK), "编辑稿仍带标记,交给 save_in 剥离");
+        save_in(tmp.path(), &edited).unwrap();
+
+        assert_eq!(status_in(tmp.path()), SkillState::Unmanaged, "保存后应即刻变自管");
+        let saved = std::fs::read_to_string(skill_file(tmp.path())).unwrap();
+        assert!(!saved.contains(MANAGED_MARK), "受管标记行必须被剥离");
+        assert!(saved.contains("会议纪要(我加的)"), "用户内容保留");
+        assert!(!saved.contains("\n\n\n"), "标记行前后的空行需归一,不留双空行空洞");
+    }
+
+    #[test]
+    fn save_in_without_mark_saved_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "用户完全自定义的 skill 正文,没有受管标记。";
+        save_in(tmp.path(), content).unwrap();
+        assert_eq!(std::fs::read_to_string(skill_file(tmp.path())).unwrap(), content);
+        assert_eq!(status_in(tmp.path()), SkillState::Unmanaged);
+    }
+
+    #[test]
+    fn save_in_rejects_blank_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = save_in(tmp.path(), "   \n\t\n").unwrap_err();
+        assert!(err.to_string().contains("内容为空"));
+        assert_eq!(status_in(tmp.path()), SkillState::NotInstalled, "拒绝时不应落盘");
+    }
+
+    #[test]
+    fn save_in_creates_missing_dir_atomically_and_roundtrips_via_read_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!tmp.path().join(".claude").exists());
+        let content = "首次以自管身份落盘的内容";
+        save_in(tmp.path(), content).unwrap();
+        let (read_back, state) = read_in(tmp.path());
+        assert_eq!(state, SkillState::Unmanaged);
+        assert_eq!(read_back, content);
+        // tmp 文件不应残留(原子写完成)
+        assert!(!skill_file(tmp.path()).parent().unwrap().join("SKILL.md.tmp").exists());
     }
 }

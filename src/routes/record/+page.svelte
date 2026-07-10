@@ -113,7 +113,7 @@
     } catch {
       /* 置失败下次再提示,可接受 */
     }
-    if (goSettings) goto("/settings");
+    if (goSettings) goto("/ai");
   }
 
   onMount(() => {
@@ -317,7 +317,7 @@
     {#if showMcpHint}
       <div class="banner">
         新功能：把会议笔记接入 Claude / Cursor 等 AI 助手（MCP）。
-        <button class="link" onclick={() => dismissMcpHint(true)}>去设置</button>
+        <button class="link" onclick={() => dismissMcpHint(true)}>去 AI 页</button>
         <button class="link" onclick={() => dismissMcpHint(false)}>知道了</button>
       </div>
     {/if}

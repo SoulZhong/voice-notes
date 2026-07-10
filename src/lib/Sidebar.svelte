@@ -293,6 +293,12 @@
 
   <!-- 设置沉底常驻(冒烟确认位置);声纹库已升级为页签,footer 只剩工具入口。 -->
   <nav class="nav-footer">
+    <a class="nav-link" class:current={$page.url.pathname === "/ai"} href="/ai">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 1.8L9.6 6.4L14.2 8L9.6 9.6L8 14.2L6.4 9.6L1.8 8L6.4 6.4Z" />
+      </svg>
+      AI
+    </a>
     <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="2.2" />

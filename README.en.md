@@ -114,15 +114,15 @@ Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CL
 | **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
 | **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
-> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** Recording-control tools are disabled by default; enable "Allow AI to control recording" under Settings → AI Assistant Access.
+> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** Recording-control tools are disabled by default; enable "Allow AI to control recording" on the "AI" tab in the sidebar.
 
-**Fastest start**: open Settings → AI Assistant Access to register MCP and install the skill in one click. (An AI assistant can just follow the [Installation](#installation) steps and do it itself.)
+**Fastest start**: open the "AI" tab in the sidebar to register MCP and install the skill in one click. (An AI assistant can just follow the [Installation](#installation) steps and do it itself.)
 
 ### MCP server
 
 Three ways to register (pick one):
 
-1. **In-app**: check the box on the welcome screen, or go to Settings → AI Assistant Access to register/remove.
+1. **In-app**: check the box on the welcome screen, or go to the "AI" tab in the sidebar to register/remove.
 2. **Command line** (an agent can run this directly):
 
    ```bash
@@ -174,7 +174,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" speakers list [--json]
 ```
 
-Recording control (needs the app running; `start/stop/pause/resume` also need "Allow AI to control recording" enabled under Settings → AI Assistant Access):
+Recording control (needs the app running; `start/stop/pause/resume` also need "Allow AI to control recording" enabled on the "AI" tab in the sidebar):
 
 ```bash
 "$VN" record status
@@ -200,7 +200,7 @@ Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (wit
 - **Prefer MCP tools; fall back to the CLI when unavailable** (`notes … --json`, `speakers list --json` — the same JSON as MCP). If neither works, register per the commands above: `mcp register --agent auto`.
 - **Search before fetching full text**: `search_notes` for the note_id → `get_note`; don't pull all of `list_notes` and read each one.
 - `get_note` returns the AI-polished version by default (the `refined` field marks the source); for the raw transcript use CLI `--raw` or MCP `prefer_refined=false`.
-- Recording control is disabled by default; when refused, relay "enable it under Settings → AI Assistant Access" to the user instead of retrying.
+- Recording control is disabled by default; when refused, relay "enable it on the AI tab in the sidebar" to the user instead of retrying.
 - Notes are the user's private local data — once in your context they've left the machine. Retrieve only as needed, and confirm intent before quoting long passages.
 
 ## Usage

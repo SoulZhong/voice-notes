@@ -119,7 +119,7 @@
         <h2>连接 AI 助手</h2>
         <p class="hints">
           让 Claude / Cursor 等直接检索你的会议笔记。注册后,AI 助手查到的笔记内容会进入其模型上下文;随时可在
-          设置 → AI 助手接入 移除。
+          左侧 AI 页移除。
         </p>
         {#each agents as a (a.key)}
           <label class="agent-row">

@@ -1689,16 +1689,19 @@ fn mcp_healed_count() -> u32 {
     MCP_HEALED.swap(0, Ordering::SeqCst) // 读即清:提示只出一次
 }
 
-#[tauri::command]
-fn mcp_skill_status() -> Result<String, String> {
+fn skill_state_str(state: mcp::skill::SkillState) -> &'static str {
     use mcp::skill::SkillState::*;
-    Ok(match mcp::skill::status().map_err(|e| e.to_string())? {
+    match state {
         NotInstalled => "not_installed",
         Current => "current",
         Stale => "stale",
         Unmanaged => "unmanaged",
     }
-    .into())
+}
+
+#[tauri::command]
+fn mcp_skill_status() -> Result<String, String> {
+    Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
 }
 
 #[tauri::command]
@@ -1709,6 +1712,30 @@ fn mcp_skill_install() -> Result<(), String> {
 #[tauri::command]
 fn mcp_skill_uninstall() -> Result<(), String> {
     mcp::skill::uninstall().map_err(|e| e.to_string())
+}
+
+/// `/ai` 页的静态能力清单(MCP 工具 + CLI 命令),纯数据、不依赖 App 运行状态。
+#[tauri::command]
+fn mcp_capabilities() -> serde_json::Value {
+    mcp::server::catalog()
+}
+
+#[derive(serde::Serialize)]
+struct SkillRead {
+    content: String,
+    state: String,
+}
+
+#[tauri::command]
+fn mcp_skill_read() -> Result<SkillRead, String> {
+    let (content, state) = mcp::skill::read().map_err(|e| e.to_string())?;
+    Ok(SkillRead { content, state: skill_state_str(state).into() })
+}
+
+/// 保存 = 编辑即接管:落盘后受管标记已被剥离,状态自然变 Unmanaged。
+#[tauri::command]
+fn mcp_skill_save(content: String) -> Result<(), String> {
+    mcp::skill::save(&content).map_err(|e| e.to_string())
 }
 
 /// 后台预载识别器与声纹嵌入器进常驻槽（幂等：槽已有则跳过）。
@@ -2438,6 +2465,9 @@ pub fn run() {
             mcp_skill_status,
             mcp_skill_install,
             mcp_skill_uninstall,
+            mcp_capabilities,
+            mcp_skill_read,
+            mcp_skill_save,
             update::check_update,
             player::player_load,
             player::player_play,
