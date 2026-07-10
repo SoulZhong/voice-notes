@@ -4,5 +4,8 @@
 <dict>
   <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
+  <!-- 硬化运行时下访问麦克风必须带此权利,否则采集拿到全零静音(录音无声、无转录)。 -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
 </dict>
 </plist>
