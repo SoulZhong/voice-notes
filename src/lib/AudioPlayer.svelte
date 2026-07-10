@@ -1,7 +1,6 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { formatTs, type TrackInfo } from "$lib/notes";
-  import { computeNoteGain } from "$lib/gain";
 
   /* 多轨播放器:每轨一个隐藏 <audio>(asset 协议流式,内存恒定),自有时钟驱动
      UI 与文字跟随。有轨道覆盖当前时刻时以该轨 currentTime 为真时钟(音频即时钟),
@@ -22,48 +21,6 @@
 
   let els = $state<(HTMLAudioElement | null)[]>([]);
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
-
-  // ── 回放响度归一化(A1):el.volume 封顶 1.0 无法放大老笔记,经共享 GainNode 提升 ──
-  const NORMALIZE_KEY = "vn.playbackNormalize";
-  // 默认开(「自动」语义):localStorage 存 "0" 才关。SSR/无 localStorage 时按开。
-  let normalize = $state(
-    typeof localStorage !== "undefined" ? localStorage.getItem(NORMALIZE_KEY) !== "0" : true,
-  );
-  const noteGain = $derived(computeNoteGain(tracks));
-
-  let audioCtx: AudioContext | null = null;
-  let gainNode: GainNode | null = null;
-  // 每个 <audio> 只能建一次 MediaElementSource;按元素缓存,tracks 变化时增量重连。
-  const srcNodes = new Map<HTMLAudioElement, MediaElementAudioSourceNode>();
-
-  function ensureGraph() {
-    if (typeof AudioContext === "undefined") return;
-    if (!audioCtx) {
-      audioCtx = new AudioContext();
-      gainNode = audioCtx.createGain();
-      gainNode.connect(audioCtx.destination);
-    }
-    for (const el of els) {
-      if (el && !srcNodes.has(el)) {
-        const node = audioCtx.createMediaElementSource(el);
-        node.connect(gainNode!);
-        srcNodes.set(el, node);
-      }
-    }
-  }
-
-  function applyGain() {
-    if (!audioCtx || !gainNode) return;
-    const g = normalize ? noteGain : 1;
-    // 平滑过渡防咔哒(~20ms 时间常数)。
-    gainNode.gain.setTargetAtTime(g, audioCtx.currentTime, 0.02);
-  }
-
-  export function setNormalize(on: boolean) {
-    normalize = on;
-    if (typeof localStorage !== "undefined") localStorage.setItem(NORMALIZE_KEY, on ? "1" : "0");
-    applyGain();
-  }
 
   /** 轨道加载/播放失败的可视化(排障关键:加载失败时走表逻辑仍会推进度条,
       看起来在播实际无声——错误必须浮出水面,不许静默)。 */
@@ -108,10 +65,8 @@
   // ── 音轨菜单(收纳每轨静音开关):双轨会议才有,主控制行只留一个「音轨」按钮 ──
   let menuOpen = $state(false);
   let menuEl = $state<HTMLElement | null>(null);
-  /** 任一轨被静音:换静音图标。 */
+  /** 任一轨被静音:按钮点亮 + 换静音图标,收起状态也能看出「动过」。 */
   const anyMuted = $derived(tracks.some((t) => muted[t.source]));
-  /** 改过任一默认(静音某轨 / 关掉响度归一化):按钮点亮,收起状态也能看出「动过」。 */
-  const audioTouched = $derived(anyMuted || (noteGain > 1 && !normalize));
   // 点面板外或按 Esc 关闭(仅开启时挂监听)。capture 阶段:开关按钮本身在 menuEl 内不误关。
   $effect(() => {
     if (!menuOpen) return;
@@ -173,9 +128,6 @@
   }
 
   function tick() {
-    // 后台/遮挡时 WKWebView 可能挂起 AudioContext;播放中每帧检查并恢复,守住后台播放
-    // (本项目此前为后台播放做过两次根因修复,勿让经 AudioContext 路由后重新回归)。
-    if (audioCtx?.state === "suspended") void audioCtx.resume();
     const clock = audibleClock();
     if (clock != null) {
       pos = clock;
@@ -196,9 +148,6 @@
 
   export function play() {
     if (tracks.length === 0) return;
-    ensureGraph();
-    if (audioCtx?.state === "suspended") void audioCtx.resume();
-    applyGain();
     if (pos >= totalMs) pos = 0; // 播完再按:从头来
     playing = true;
     anchorMs = pos;
@@ -234,30 +183,10 @@
     else play();
   }
 
-  // 组件卸载/笔记切换:停播,不留幽灵声音。不在此拆图——<audio> 跨笔记复用,
-  // MediaElementSource 每元素一生只能建一次,拆了再建会 InvalidStateError。
+  // 组件卸载/笔记切换:停播,不留幽灵声音。
   $effect(() => {
     void tracks;
     return () => pause();
-  });
-
-  // 仅组件真正卸载时关掉 AudioContext(effect 体不读任何响应式值→cleanup 只在销毁时跑)。
-  $effect(() => {
-    return () => {
-      void audioCtx?.close();
-      audioCtx = null;
-      gainNode = null;
-      srcNodes.clear();
-    };
-  });
-
-  // tracks 变化(续录/transcode_done 重拉音轨)后:已建图则增量接新 <audio> 并重算增益。
-  $effect(() => {
-    void noteGain; // 追踪 tracks → noteGain
-    if (audioCtx) {
-      ensureGraph();
-      applyGain();
-    }
   });
 
   const pct = $derived(totalMs > 0 ? (Math.min(currentMs, totalMs) / totalMs) * 100 : 0);
@@ -349,18 +278,17 @@
     {/each}
   </div>
   <span class="time">{formatTs(totalMs)}</span>
-  {#if tracks.length > 1 || noteGain > 1}
-    <!-- 音频菜单:把回放相关的低频设置(双轨静音、响度归一化)收进一个「音频」按钮,
-         主控制行保持干净,每项用途一句话只在点开时出现,解决「不知道能点/干嘛用」。
-         静音=双轨会议才有(回音笔记静掉一轨即无回音);响度=本条真能被放大时才有。
-         有轨被静音或关了响度=改过默认,按钮点亮 accent,收起也看得出动过。 -->
+  {#if tracks.length > 1}
+    <!-- 音轨菜单:双轨会议才有。回放有回音(外放+蓝牙延迟致 AEC 失效,同句两轨各一份)时
+         点开静掉一轨即无回音。收进菜单——主控制行保持干净,用途一句话只在点开时出现;
+         有轨被静音时按钮点亮 accent、喇叭换静音图标,收起也看得出动过。 -->
     <div class="track-menu" bind:this={menuEl}>
       <button
         class="track-btn"
-        class:has-touched={audioTouched}
+        class:has-touched={anyMuted}
         onclick={() => (menuOpen = !menuOpen)}
         aria-expanded={menuOpen}
-        title="音频设置(静音音轨 / 响度归一化)"
+        title={anyMuted ? "音轨(有音轨已静音)" : "音轨(回放有回音时可静掉一轨)"}
       >
         {#if anyMuted}
           <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -374,36 +302,29 @@
             <path d="M12.9 4.6a5.3 5.3 0 0 1 0 6.8" />
           </svg>
         {/if}
-        音频
+        音轨
         <svg class="chev" class:open={menuOpen} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />
         </svg>
       </button>
       {#if menuOpen}
         <div class="track-pop" role="menu">
-          {#if tracks.length > 1}
-            <p class="track-pop-hint">回放有回音?静掉一轨</p>
-            {#each tracks as t (t.source)}
-              <label class="track-row">
-                <input type="checkbox" checked={!muted[t.source]} onchange={() => toggleMute(t.source)} />
-                <span class="track-row-name">{t.source === "mic" ? "麦克风" : "系统声"}</span>
-                {#if muted[t.source]}<span class="track-row-tag">已静音</span>{/if}
-              </label>
-            {/each}
-          {/if}
-          {#if noteGain > 1}
-            {#if tracks.length > 1}<div class="track-pop-sep"></div>{/if}
+          <p class="track-pop-hint">回放有回音?静掉一轨</p>
+          {#each tracks as t (t.source)}
             <label class="track-row">
-              <input type="checkbox" checked={normalize} onchange={() => setNormalize(!normalize)} />
-              <span class="track-row-name">响度归一化</span>
+              <input type="checkbox" checked={!muted[t.source]} onchange={() => toggleMute(t.source)} />
+              <span class="track-row-name">{t.source === "mic" ? "麦克风" : "系统声"}</span>
+              {#if muted[t.source]}<span class="track-row-tag">已静音</span>{/if}
             </label>
-            <p class="track-pop-sub">把偏轻的录音抬到正常响度</p>
-          {/if}
+          {/each}
         </div>
       {/if}
     </div>
   {/if}
   {#each tracks as t, i (t.source)}
+    <!-- 直接播 asset 协议 URL(流式、内存恒定)。不再经 Web Audio:WKWebView 在打包版
+         tauri:// 文档源下,<audio> 经 MediaElementSource 路由进图会静音输出(dev 的 http
+         源无此问题),故回放不走增益节点;响度归一化改在转码时做。 -->
     <audio bind:this={els[i]} src={convertFileSrc(t.path)} preload="auto" onerror={() => onAudioError(i)}></audio>
   {/each}
 </div>
@@ -498,19 +419,6 @@
     padding: 0 0.15rem;
     color: var(--ink-secondary);
     font-size: 0.75rem;
-  }
-  /* 分组分隔线(静音组 / 响度组) */
-  .track-pop-sep {
-    height: 1px;
-    background: var(--hairline);
-    margin: 0.4rem 0;
-  }
-  /* 单项副说明(如响度归一化用途):贴在该项下方,次级墨色小字 */
-  .track-pop-sub {
-    margin: 0.1rem 0 0;
-    padding: 0 0.15rem 0 1.7rem;
-    color: var(--ink-faint);
-    font-size: 0.72rem;
   }
   .track-row {
     display: flex;
