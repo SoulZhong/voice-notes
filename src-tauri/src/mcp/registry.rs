@@ -23,7 +23,7 @@ pub struct AgentDef {
     pub fmt: Fmt,
 }
 
-/// 内置支持的五家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
+/// 内置支持的八家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
 pub const AGENTS: &[AgentDef] = &[
     AgentDef { key: "claude-code", name: "Claude Code", detect_rel: ".claude", config_rel: ".claude.json", fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "claude-desktop", name: "Claude Desktop", detect_rel: "Library/Application Support/Claude", config_rel: "Library/Application Support/Claude/claude_desktop_config.json", fmt: Fmt::Json(&["mcpServers"]) },
@@ -32,6 +32,7 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", fmt: Fmt::Json(&["mcp", "servers"]) },
+    AgentDef { key: "hermes", name: "Hermes Agent", detect_rel: ".hermes", config_rel: ".hermes/config.yaml", fmt: Fmt::Yaml },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,7 +115,10 @@ impl Registry {
                 let doc: toml_edit::DocumentMut = text.parse().ok()?;
                 Some(doc.get("mcp_servers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
             }
-            Fmt::Yaml => None, // Task 3 替换为真实现
+            Fmt::Yaml => {
+                let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+                Some(v.get("mcp_servers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
+            }
         }
     }
 
@@ -275,11 +279,45 @@ impl Registry {
         write_with_backup(path, &doc.to_string())
     }
 
-    fn upsert_yaml(&self, _path: &Path) -> anyhow::Result<()> {
-        anyhow::bail!("YAML 写入未实现") // Task 3 替换
+    fn upsert_yaml(&self, path: &Path) -> anyhow::Result<()> {
+        use serde_yaml_ng::Value;
+        let mut root: Value = match std::fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => serde_yaml_ng::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("{} 不是合法 YAML,拒绝写入(请手动修复或手动配置): {e}", path.display())
+            })?,
+            _ => Value::Mapping(Default::default()),
+        };
+        let map = root
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} 顶层不是映射,拒绝写入", path.display()))?;
+        let servers = map
+            .entry(Value::String("mcp_servers".into()))
+            .or_insert_with(|| Value::Mapping(Default::default()));
+        let servers = servers
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} 的 mcp_servers 不是映射,拒绝写入", path.display()))?;
+        let mut entry = serde_yaml_ng::Mapping::new();
+        entry.insert(Value::String("command".into()), Value::String(self.exe.to_string_lossy().into_owned()));
+        entry.insert(
+            Value::String("args".into()),
+            Value::Sequence(vec![Value::String("mcp".into()), Value::String("serve".into())]),
+        );
+        servers.insert(Value::String("voice-notes".into()), Value::Mapping(entry));
+        write_with_backup(path, &serde_yaml_ng::to_string(&root)?)
     }
-    fn remove_yaml(&self, _path: &Path) -> anyhow::Result<()> {
-        Ok(()) // Task 3 替换
+
+    fn remove_yaml(&self, path: &Path) -> anyhow::Result<()> {
+        use serde_yaml_ng::Value;
+        let text = std::fs::read_to_string(path)?;
+        let mut root: Value = serde_yaml_ng::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{} 不是合法 YAML,拒绝写入: {e}", path.display()))?;
+        let Some(servers) = root.get_mut("mcp_servers").and_then(|v| v.as_mapping_mut()) else {
+            return Ok(());
+        };
+        if servers.remove(Value::String("voice-notes".into())).is_none() {
+            return Ok(());
+        }
+        write_with_backup(path, &serde_yaml_ng::to_string(&root)?)
     }
 }
 
@@ -548,6 +586,29 @@ mod tests {
         reg.unregister("workbuddy").unwrap();
         let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(v2["mcpServers"].get("voice-notes").is_none());
+    }
+
+    #[test]
+    fn hermes_registers_yaml_preserving_other_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".hermes")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        let cfg = home.join(".hermes/config.yaml");
+        // 预置一个已有 server,断言不被动
+        std::fs::write(&cfg, "mcp_servers:\n  github:\n    command: npx\n    args: [\"-y\", \"srv\"]\n").unwrap();
+
+        reg.register("hermes").unwrap();
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcp_servers"]["voice-notes"]["command"].as_str().unwrap(), "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
+        assert_eq!(v["mcp_servers"]["voice-notes"]["args"][0].as_str().unwrap(), "mcp");
+        assert_eq!(v["mcp_servers"]["github"]["command"].as_str().unwrap(), "npx", "既有 server 保留");
+        assert_eq!(reg.read_command(Registry::def("hermes").unwrap()).as_deref(), Some("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+
+        reg.unregister("hermes").unwrap();
+        let v2: serde_yaml_ng::Value = serde_yaml_ng::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v2["mcp_servers"].get("voice-notes").is_none());
+        assert_eq!(v2["mcp_servers"]["github"]["command"].as_str().unwrap(), "npx", "移除 voice-notes 不动其它");
     }
 
     #[test]
