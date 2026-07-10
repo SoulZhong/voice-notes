@@ -70,6 +70,7 @@
   let keepVol = $state(false);
   let langFilter = $state(false);
   let keepAudio = $state(false);
+  let refineOn = $state(false);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
@@ -140,6 +141,7 @@
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
     keepAudio = s.keep_audio;
+    refineOn = s.refine_enabled;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
   }
@@ -469,7 +471,7 @@
         {/if}
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           aria-label="启用全局快捷键"
           bind:checked={shortcutEnabled}
           disabled={!settings}
@@ -478,7 +480,7 @@
       </div>
       <label class="row">
         <div class="row-info"><span class="row-label">开机自动启动</span></div>
-        <input type="checkbox" class="ctl" bind:checked={autostartEnabled} onchange={toggleAutostart} />
+        <input type="checkbox" class="ctl switch" bind:checked={autostartEnabled} onchange={toggleAutostart} />
       </label>
       <label class="row">
         <div class="row-info">
@@ -487,7 +489,7 @@
         </div>
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           bind:checked={trayEnabled}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
@@ -555,7 +557,7 @@
         </div>
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           bind:checked={sysOnly}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.record_system_only = sysOnly))}
@@ -568,7 +570,7 @@
         </div>
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           bind:checked={keepVol}
           disabled={!settings || sysOnly}
           onchange={() => saveSetting((s) => (s.keep_output_volume = keepVol))}
@@ -581,7 +583,7 @@
         </div>
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           bind:checked={langFilter}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
@@ -594,7 +596,7 @@
         </div>
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           bind:checked={keepAudio}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
@@ -644,6 +646,19 @@
           </label>
         </div>
       </div>
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">会后精修</span>
+          <span class="row-desc">停止录制后自动用大模型精修转写稿(错字修正、段落归并);模型接口在左侧 AI 页配置</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={refineOn}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
+        />
+      </label>
     </div>
     {#if asrModelMissing}
       <div class="banner warn">所选识别引擎的模型未下载,请在下方「语音模型」中下载。</div>
@@ -713,7 +728,7 @@
         {/if}
         <input
           type="checkbox"
-          class="ctl"
+          class="ctl switch"
           aria-label="使用镜像加速"
           checked={settings?.mirror_enabled ?? false}
           disabled={!settings}

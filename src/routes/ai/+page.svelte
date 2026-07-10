@@ -19,8 +19,7 @@
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
   let error = $state("");
 
-  /** 智能精修:开关 + 接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。 */
-  let refineOn = $state(false);
+  /** 智能精修:接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。开关已移至设置页「录制」区。 */
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
@@ -50,7 +49,6 @@
       try {
         const s = await getSettings();
         settings = s;
-        refineOn = s.refine_enabled;
         refineBaseUrl = s.refine_base_url;
         refineModel = s.refine_model;
         refineKey = s.refine_api_key;
@@ -71,7 +69,6 @@
       mut(fresh);
       await setSettings(fresh);
       settings = fresh;
-      refineOn = fresh.refine_enabled;
       refineBaseUrl = fresh.refine_base_url;
       refineModel = fresh.refine_model;
       refineKey = fresh.refine_api_key;
@@ -80,7 +77,6 @@
       error = `保存失败: ${e}`;
       settings = await getSettings().catch(() => settings);
       if (settings) {
-        refineOn = settings.refine_enabled;
         refineBaseUrl = settings.refine_base_url;
         refineModel = settings.refine_model;
         refineKey = settings.refine_api_key;
@@ -96,7 +92,6 @@
   }
   function saveRefine() {
     saveSetting((s) => {
-      s.refine_enabled = refineOn;
       s.refine_base_url = refineBaseUrl.trim();
       s.refine_model = refineModel.trim();
       s.refine_api_key = refineKey.trim();
@@ -193,40 +188,31 @@
   <!-- —— 智能精修 —— -->
   <section>
     <div class="rows">
-      <label class="row">
-        <div class="row-info">
-          <span class="row-label">会后 AI 精修</span>
-          <span class="row-desc">录完自动纠错字、清理口头语、合并段落。会议文字会发送给所选服务商</span>
+      <div class="config">
+        <div class="preset-row">
+          <span class="preset-label">一键填充</span>
+          {#each REFINE_PRESETS as p (p.label)}
+            <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+          {/each}
         </div>
-        <input type="checkbox" class="ctl" bind:checked={refineOn} disabled={!settings} onchange={saveRefine} />
-      </label>
-      {#if refineOn}
-        <div class="config">
-          <div class="preset-row">
-            <span class="preset-label">一键填充</span>
-            {#each REFINE_PRESETS as p (p.label)}
-              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
-            {/each}
-          </div>
-          <div class="refine-fields">
-            <label class="field">
-              <span>接口地址</span>
-              <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
-            </label>
-            <label class="field">
-              <span>模型</span>
-              <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
-            </label>
-            <label class="field">
-              <span>API Key</span>
-              <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
-            </label>
-          </div>
-          {#if !refineBaseUrl || !refineModel || !refineKey}
-            <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
-          {/if}
+        <div class="refine-fields">
+          <label class="field">
+            <span>接口地址</span>
+            <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
+          </label>
         </div>
-      {/if}
+        {#if !refineBaseUrl || !refineModel || !refineKey}
+          <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
+        {/if}
+      </div>
     </div>
   </section>
 
@@ -276,7 +262,7 @@
           <span class="row-label">允许 AI 控制录制</span>
           <span class="row-desc">开启后,已接入的 AI 助手可远程开始/停止/暂停录制。默认关闭</span>
         </div>
-        <input type="checkbox" class="ctl" bind:checked={mcpAllowControl} disabled={!settings} onchange={saveMcpAllowControl} />
+        <input type="checkbox" class="ctl switch" bind:checked={mcpAllowControl} disabled={!settings} onchange={saveMcpAllowControl} />
       </label>
       <div class="row">
         <div class="row-info">
@@ -403,7 +389,7 @@
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
   }
-  /* 智能精修配置块:卡片内嵌面板(开关行下方展开) */
+  /* 大模型接口配置块:卡片内嵌面板(常显;启用开关在 设置 → 录制) */
   .config {
     display: flex;
     flex-direction: column;
