@@ -106,7 +106,7 @@ Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 
 ## Connecting an AI assistant (MCP · CLI · Skill)
 
-Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI) read your meeting notes to answer questions, draft recaps, write weekly summaries — "What delivery date did we agree with Zhang San last week?", "Turn today's standup into an email", "Which meetings did we have this week and what are the action items?" Three surfaces, pick as needed:
+Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CLI / WorkBuddy / OpenClaw / Hermes Agent — eight agents supported out of the box) read your meeting notes to answer questions, draft recaps, write weekly summaries — "What delivery date did we agree with Zhang San last week?", "Turn today's standup into an email", "Which meetings did we have this week and what are the action items?" Three surfaces, pick as needed:
 
 | Surface | What it is | When to use |
 | --- | --- | --- |
@@ -127,7 +127,7 @@ Three ways to register (pick one):
 
    ```bash
    VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
-   "$VN" mcp register --agent auto    # register with every detected agent (claude-code/claude-desktop/cursor/codex/gemini)
+   "$VN" mcp register --agent auto    # register with every detected agent (claude-code/claude-desktop/cursor/codex/gemini/workbuddy/openclaw/hermes)
    "$VN" mcp status --json            # check each agent's registration status
    "$VN" mcp unregister --agent cursor
    ```
@@ -172,6 +172,15 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" notes search "delivery date" [--limit N] [--json]
 "$VN" notes get <note-id> [--format md|txt|json] [--raw]   # md by default; --raw = raw transcript (ignore the polished version)
 "$VN" speakers list [--json]
+```
+
+Recording control (needs the app running; `start/stop/pause/resume` also need "Allow AI to control recording" enabled under Settings → AI Assistant Access):
+
+```bash
+"$VN" record status
+"$VN" record start --title "Design review"
+"$VN" record stop
+"$VN" record live [--tail N]
 ```
 
 Exit codes: `0` success / `1` execution error (e.g. note-id not found) / `2` usage error (missing or unknown argument); unknown flags always error out rather than being silently ignored.

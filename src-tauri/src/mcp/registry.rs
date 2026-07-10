@@ -4,11 +4,13 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-/// 配置文件格式。JSON 家族统一顶层键 "mcpServers";Codex 是 TOML 的 [mcp_servers.*]。
+/// 配置文件格式。Json 携带 server 容器的键路径(如 &["mcpServers"] 或嵌套 &["mcp","servers"]);
+/// Codex 是 TOML 的 [mcp_servers.*];Hermes 是 YAML 的 mcp_servers:。
 #[derive(Clone, Copy, PartialEq)]
 pub enum Fmt {
-    Json,
+    Json(&'static [&'static str]),
     Toml,
+    Yaml,
 }
 
 pub struct AgentDef {
@@ -21,13 +23,16 @@ pub struct AgentDef {
     pub fmt: Fmt,
 }
 
-/// 内置支持的五家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
+/// 内置支持的八家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
 pub const AGENTS: &[AgentDef] = &[
-    AgentDef { key: "claude-code", name: "Claude Code", detect_rel: ".claude", config_rel: ".claude.json", fmt: Fmt::Json },
-    AgentDef { key: "claude-desktop", name: "Claude Desktop", detect_rel: "Library/Application Support/Claude", config_rel: "Library/Application Support/Claude/claude_desktop_config.json", fmt: Fmt::Json },
-    AgentDef { key: "cursor", name: "Cursor", detect_rel: ".cursor", config_rel: ".cursor/mcp.json", fmt: Fmt::Json },
+    AgentDef { key: "claude-code", name: "Claude Code", detect_rel: ".claude", config_rel: ".claude.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "claude-desktop", name: "Claude Desktop", detect_rel: "Library/Application Support/Claude", config_rel: "Library/Application Support/Claude/claude_desktop_config.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "cursor", name: "Cursor", detect_rel: ".cursor", config_rel: ".cursor/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "codex", name: "Codex CLI", detect_rel: ".codex", config_rel: ".codex/config.toml", fmt: Fmt::Toml },
-    AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", fmt: Fmt::Json },
+    AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", fmt: Fmt::Json(&["mcp", "servers"]) },
+    AgentDef { key: "hermes", name: "Hermes Agent", detect_rel: ".hermes", config_rel: ".hermes/config.yaml", fmt: Fmt::Yaml },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,13 +103,21 @@ impl Registry {
     fn read_command(&self, def: &AgentDef) -> Option<String> {
         let text = std::fs::read_to_string(self.config_path(def)).ok()?;
         match def.fmt {
-            Fmt::Json => {
+            Fmt::Json(key_path) => {
                 let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-                Some(v.get("mcpServers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
+                let mut cur = &v;
+                for k in key_path {
+                    cur = cur.get(*k)?;
+                }
+                Some(cur.get("voice-notes")?.get("command")?.as_str()?.to_string())
             }
             Fmt::Toml => {
                 let doc: toml_edit::DocumentMut = text.parse().ok()?;
                 Some(doc.get("mcp_servers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
+            }
+            Fmt::Yaml => {
+                let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+                Some(v.get("mcp_servers")?.get("voice-notes")?.get("command")?.as_str()?.to_string())
             }
         }
     }
@@ -113,8 +126,9 @@ impl Registry {
         let def = Self::def(key)?;
         let path = self.config_path(def);
         match def.fmt {
-            Fmt::Json => self.upsert_json(&path),
+            Fmt::Json(key_path) => self.upsert_json(&path, key_path),
             Fmt::Toml => self.upsert_toml(&path),
+            Fmt::Yaml => self.upsert_yaml(&path),
         }
     }
 
@@ -125,8 +139,9 @@ impl Registry {
             return Ok(()); // 幂等:没有配置文件自然没有条目
         }
         match def.fmt {
-            Fmt::Json => self.remove_json(&path),
+            Fmt::Json(key_path) => self.remove_json(&path, key_path),
             Fmt::Toml => self.remove_toml(&path),
+            Fmt::Yaml => self.remove_yaml(&path),
         }
     }
 
@@ -182,34 +197,48 @@ impl Registry {
         }
     }
 
-    fn upsert_json(&self, path: &Path) -> anyhow::Result<()> {
+    fn upsert_json(&self, path: &Path, key_path: &[&str]) -> anyhow::Result<()> {
         let mut root: serde_json::Value = match std::fs::read_to_string(path) {
             Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|e| {
                 anyhow::anyhow!("{} 不是合法 JSON,拒绝写入(请手动修复或手动配置): {e}", path.display())
             })?,
             _ => serde_json::json!({}),
         };
-        let obj = root.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} 顶层不是对象,拒绝写入", path.display()))?;
-        let servers = obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
-        let servers = servers
+        // 逐级下钻到 server 容器,缺失级建对象;任一级非对象则拒写。
+        let mut cur = root
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("{} 的 mcpServers 不是对象,拒绝写入", path.display()))?;
-        servers.insert(
+            .ok_or_else(|| anyhow::anyhow!("{} 顶层不是对象,拒绝写入", path.display()))?;
+        for k in key_path {
+            cur = cur
+                .entry(*k)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("{} 的键 {k} 不是对象,拒绝写入", path.display()))?;
+        }
+        cur.insert(
             "voice-notes".into(),
             serde_json::json!({ "command": self.exe.to_string_lossy(), "args": ["mcp", "serve"] }),
         );
         write_with_backup(path, &(serde_json::to_string_pretty(&root)? + "\n"))
     }
 
-    fn remove_json(&self, path: &Path) -> anyhow::Result<()> {
+    fn remove_json(&self, path: &Path, key_path: &[&str]) -> anyhow::Result<()> {
         let text = std::fs::read_to_string(path)?;
         let mut root: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("{} 不是合法 JSON,拒绝写入: {e}", path.display()))?;
-        let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
+        // 逐级下钻;任一级缺失即视为无条目(幂等)。
+        let mut cur = &mut root;
+        for k in key_path {
+            let Some(next) = cur.get_mut(*k) else {
+                return Ok(());
+            };
+            cur = next;
+        }
+        let Some(servers) = cur.as_object_mut() else {
             return Ok(());
         };
         if servers.remove("voice-notes").is_none() {
-            return Ok(()); // 本就没有:不产生写入(也就不产生备份)
+            return Ok(());
         }
         write_with_backup(path, &(serde_json::to_string_pretty(&root)? + "\n"))
     }
@@ -248,6 +277,47 @@ impl Registry {
             return Ok(());
         }
         write_with_backup(path, &doc.to_string())
+    }
+
+    fn upsert_yaml(&self, path: &Path) -> anyhow::Result<()> {
+        use serde_yaml_ng::Value;
+        let mut root: Value = match std::fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => serde_yaml_ng::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("{} 不是合法 YAML,拒绝写入(请手动修复或手动配置): {e}", path.display())
+            })?,
+            _ => Value::Mapping(Default::default()),
+        };
+        let map = root
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} 顶层不是映射,拒绝写入", path.display()))?;
+        let servers = map
+            .entry(Value::String("mcp_servers".into()))
+            .or_insert_with(|| Value::Mapping(Default::default()));
+        let servers = servers
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} 的 mcp_servers 不是映射,拒绝写入", path.display()))?;
+        let mut entry = serde_yaml_ng::Mapping::new();
+        entry.insert(Value::String("command".into()), Value::String(self.exe.to_string_lossy().into_owned()));
+        entry.insert(
+            Value::String("args".into()),
+            Value::Sequence(vec![Value::String("mcp".into()), Value::String("serve".into())]),
+        );
+        servers.insert(Value::String("voice-notes".into()), Value::Mapping(entry));
+        write_with_backup(path, &serde_yaml_ng::to_string(&root)?)
+    }
+
+    fn remove_yaml(&self, path: &Path) -> anyhow::Result<()> {
+        use serde_yaml_ng::Value;
+        let text = std::fs::read_to_string(path)?;
+        let mut root: Value = serde_yaml_ng::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{} 不是合法 YAML,拒绝写入: {e}", path.display()))?;
+        let Some(servers) = root.get_mut("mcp_servers").and_then(|v| v.as_mapping_mut()) else {
+            return Ok(());
+        };
+        if servers.remove(Value::String("voice-notes".into())).is_none() {
+            return Ok(());
+        }
+        write_with_backup(path, &serde_yaml_ng::to_string(&root)?)
     }
 }
 
@@ -476,5 +546,88 @@ mod tests {
         let dev = Registry::with(tmp.path().to_path_buf(), PathBuf::from("/repo/src-tauri/target/debug/voice-notes"));
         assert_eq!(dev.heal().unwrap(), 0);
         assert!(dev.status().iter().find(|s| s.key == "claude-code").unwrap().stale, "开发态保持 stale 不改写");
+    }
+
+    #[test]
+    fn json_writer_walks_nested_key_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cfg = home.join("nested.json");
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+
+        // 嵌套路径 mcp.servers(OpenClaw 式):首次写建出两级容器
+        reg.upsert_json(&cfg, &["mcp", "servers"]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            v["mcp"]["servers"]["voice-notes"]["command"],
+            "/Applications/voice-notes.app/Contents/MacOS/voice-notes"
+        );
+        assert_eq!(v["mcp"]["servers"]["voice-notes"]["args"][0], "mcp");
+
+        // remove 幂等移除
+        reg.remove_json(&cfg, &["mcp", "servers"]).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v2["mcp"]["servers"].get("voice-notes").is_none());
+        reg.remove_json(&cfg, &["mcp", "servers"]).unwrap(); // 再删不报错
+    }
+
+    #[test]
+    fn workbuddy_registers_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".workbuddy")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        reg.register("workbuddy").unwrap();
+        let cfg = home.join(".workbuddy/mcp.json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["voice-notes"]["args"][1], "serve");
+        let st = reg.status().into_iter().find(|s| s.key == "workbuddy").unwrap();
+        assert!(st.installed && st.registered && !st.stale);
+        reg.unregister("workbuddy").unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v2["mcpServers"].get("voice-notes").is_none());
+    }
+
+    #[test]
+    fn hermes_registers_yaml_preserving_other_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".hermes")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        let cfg = home.join(".hermes/config.yaml");
+        // 预置一个已有 server,断言不被动
+        std::fs::write(&cfg, "mcp_servers:\n  github:\n    command: npx\n    args: [\"-y\", \"srv\"]\n").unwrap();
+
+        reg.register("hermes").unwrap();
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcp_servers"]["voice-notes"]["command"].as_str().unwrap(), "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
+        assert_eq!(v["mcp_servers"]["voice-notes"]["args"][0].as_str().unwrap(), "mcp");
+        assert_eq!(v["mcp_servers"]["github"]["command"].as_str().unwrap(), "npx", "既有 server 保留");
+        assert_eq!(reg.read_command(Registry::def("hermes").unwrap()).as_deref(), Some("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+
+        reg.unregister("hermes").unwrap();
+        let v2: serde_yaml_ng::Value = serde_yaml_ng::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v2["mcp_servers"].get("voice-notes").is_none());
+        assert_eq!(v2["mcp_servers"]["github"]["command"].as_str().unwrap(), "npx", "移除 voice-notes 不动其它");
+    }
+
+    #[test]
+    fn openclaw_registers_nested_and_rejects_json5_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".openclaw")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        let cfg = home.join(".openclaw/openclaw.json");
+
+        reg.register("openclaw").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcp"]["servers"]["voice-notes"]["command"], "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
+        assert_eq!(reg.status().into_iter().find(|s| s.key == "openclaw").unwrap().registered, true);
+
+        // JSON5 注释文件:拒写不损坏(保留原文)
+        let commented = "{\n  // 我的配置\n  \"mcp\": { \"servers\": {} }\n}\n";
+        std::fs::write(&cfg, commented).unwrap();
+        assert!(reg.register("openclaw").is_err(), "带注释的 JSON5 应拒写");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), commented, "拒写后原文不变");
     }
 }

@@ -18,6 +18,15 @@ description: 查询本机 voice-notes 会议笔记(实时转写+说话人识别)
 {{BINARY}} speakers list --json
 ```
 
+控制录制(需 App 运行;`start/stop/pause/resume` 还需用户在设置开启「允许 AI 控制录制」):
+
+    {{BINARY}} record status
+    {{BINARY}} record start --title "评审会"
+    {{BINARY}} record stop
+    {{BINARY}} record live --tail 20
+
+被门控拒绝或 App 未运行时命令会返回指引原文,把它转告用户、不要自行重试。
+
 需要原始逐字稿时加 --raw。
 
 MCP 未注册时,**先征得用户同意**后可代为注册:`{{BINARY}} mcp register --agent auto`。
