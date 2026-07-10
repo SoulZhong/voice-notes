@@ -30,6 +30,8 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef { key: "cursor", name: "Cursor", detect_rel: ".cursor", config_rel: ".cursor/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
     AgentDef { key: "codex", name: "Codex CLI", detect_rel: ".codex", config_rel: ".codex/config.toml", fmt: Fmt::Toml },
     AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", fmt: Fmt::Json(&["mcp", "servers"]) },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -529,5 +531,42 @@ mod tests {
         let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(v2["mcp"]["servers"].get("voice-notes").is_none());
         reg.remove_json(&cfg, &["mcp", "servers"]).unwrap(); // 再删不报错
+    }
+
+    #[test]
+    fn workbuddy_registers_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".workbuddy")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        reg.register("workbuddy").unwrap();
+        let cfg = home.join(".workbuddy/mcp.json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["voice-notes"]["args"][1], "serve");
+        let st = reg.status().into_iter().find(|s| s.key == "workbuddy").unwrap();
+        assert!(st.installed && st.registered && !st.stale);
+        reg.unregister("workbuddy").unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v2["mcpServers"].get("voice-notes").is_none());
+    }
+
+    #[test]
+    fn openclaw_registers_nested_and_rejects_json5_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".openclaw")).unwrap();
+        let reg = Registry::with(home.clone(), PathBuf::from("/Applications/voice-notes.app/Contents/MacOS/voice-notes"));
+        let cfg = home.join(".openclaw/openclaw.json");
+
+        reg.register("openclaw").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcp"]["servers"]["voice-notes"]["command"], "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
+        assert_eq!(reg.status().into_iter().find(|s| s.key == "openclaw").unwrap().registered, true);
+
+        // JSON5 注释文件:拒写不损坏(保留原文)
+        let commented = "{\n  // 我的配置\n  \"mcp\": { \"servers\": {} }\n}\n";
+        std::fs::write(&cfg, commented).unwrap();
+        assert!(reg.register("openclaw").is_err(), "带注释的 JSON5 应拒写");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), commented, "拒写后原文不变");
     }
 }
