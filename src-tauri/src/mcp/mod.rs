@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 pub mod bridge;
+mod cli_control;
 pub mod cli_query;
 pub mod registry;
 pub mod server;
@@ -24,7 +25,7 @@ pub fn app_data_dir() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/com.teemo.voice-notes")
 }
 
-/// 顶层 CLI 分发:main.rs 把 mcp|notes|speakers|skill 都送到这里(args[0] 即
+/// 顶层 CLI 分发:main.rs 把 mcp|notes|speakers|skill|record 都送到这里(args[0] 即
 /// 顶层词)。集中一处是为了 main.rs 的拦截集合与分发表永远一致。
 pub fn cli_entry(args: &[String]) -> i32 {
     match args.first().map(String::as_str).unwrap_or("") {
@@ -32,8 +33,9 @@ pub fn cli_entry(args: &[String]) -> i32 {
         "notes" => cli_query::notes_cli(&args[1..]),
         "speakers" => cli_query::speakers_cli(&args[1..]),
         "skill" => skill::cli(&args[1..]),
+        "record" => cli_control::record_cli(&args[1..]),
         _ => {
-            eprintln!("用法: voice-notes <mcp|notes|speakers|skill> ...");
+            eprintln!("用法: voice-notes <mcp|notes|speakers|skill|record> ...");
             2
         }
     }
