@@ -11,7 +11,11 @@
     mcpSkillStatus,
     mcpSkillInstall,
     mcpSkillUninstall,
+    mcpCapabilities,
+    mcpSkillRead,
+    mcpSkillSave,
     type AgentStatus,
+    type Capabilities,
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -43,6 +47,14 @@
   // Claude Code 技能:与 Agent 注册同理,真值源是磁盘文件,现查现示。
   let skillState = $state<string | null>(null);
   let skillBusy = $state(false);
+  // 技能查看/编辑卡:展开后持有一份正文的本地拷贝,保存/恢复默认都走「拉新内容→替换」。
+  let skillEditOpen = $state(false);
+  let skillEditBusy = $state(false);
+  let skillContent = $state("");
+
+  // —— Agent 能调用什么(MCP 工具 + CLI 清单):纯静态数据,onMount 拉一次即可 ——
+  let capabilities = $state<Capabilities | null>(null);
+  let capError = $state("");
 
   onMount(() => {
     (async () => {
@@ -59,6 +71,7 @@
     refreshSkill();
     mcpManualSnippet().then((v) => (mcpSnippet = v)).catch(() => {});
     mcpHealedCount().then((n) => (mcpHealed = n)).catch(() => {});
+    mcpCapabilities().then((v) => (capabilities = v)).catch((e) => (capError = String(e)));
   });
 
   // —— 通用「取新鲜值→改→存」保存(精简自设置页 saveSetting:只回弹本页用到的字段) ——
@@ -122,12 +135,64 @@
         await mcpSkillInstall();
       } else {
         await mcpSkillUninstall();
+        // 卸载成功即关闭并清空编辑卡:否则残留的旧正文再点「保存」会把文件写回磁盘,
+        // 悄悄复活刚删除的 skill(save 会按需重建目录)。
+        skillEditOpen = false;
+        skillContent = "";
       }
       await refreshSkill();
     } catch (e) {
       mcpError = String(e);
     } finally {
       skillBusy = false;
+    }
+  }
+
+  /** 查看/编辑卡展开(未安装时也可展开:拉到的是渲染默认稿,保存即以自管身份首次落盘)。 */
+  async function openSkillEdit() {
+    mcpError = "";
+    skillEditBusy = true;
+    try {
+      const r = await mcpSkillRead();
+      skillContent = r.content;
+      skillEditOpen = true;
+    } catch (e) {
+      mcpError = String(e);
+    } finally {
+      skillEditBusy = false;
+    }
+  }
+
+  /** 保存 = 编辑即接管。失败保留 textarea 当前内容(不回拉覆盖),经既有 error 横幅提示。 */
+  async function saveSkillEdit() {
+    mcpError = "";
+    skillEditBusy = true;
+    try {
+      await mcpSkillSave(skillContent);
+      const r = await mcpSkillRead();
+      skillContent = r.content;
+      await refreshSkill();
+    } catch (e) {
+      mcpError = String(e);
+    } finally {
+      skillEditBusy = false;
+    }
+  }
+
+  /** 恢复默认:危险操作(覆盖用户编辑),confirm 二次确认后重装受管渲染稿并重拉内容。 */
+  async function restoreSkillDefault() {
+    if (!confirm("将覆盖当前内容，恢复为应用内置版本？")) return;
+    mcpError = "";
+    skillEditBusy = true;
+    try {
+      await mcpSkillInstall();
+      const r = await mcpSkillRead();
+      skillContent = r.content;
+      await refreshSkill();
+    } catch (e) {
+      mcpError = String(e);
+    } finally {
+      skillEditBusy = false;
     }
   }
 
@@ -242,7 +307,13 @@
       {/each}
       <div class="row">
         <div class="row-info">
-          <span class="row-label">Claude Code 技能</span>
+          <span class="row-label-line">
+            <span class="row-label">Claude Code 技能</span>
+            {#if skillState === "current"}<span class="pill">当前版本</span>
+            {:else if skillState === "stale"}<span class="pill warn">待更新</span>
+            {:else if skillState === "unmanaged"}<span class="pill">已自定义</span>
+            {/if}
+          </span>
           <span class="row-desc">
             {#if skillState === "current"}已安装:Claude 掌握会议纪要/周报/检索工作流
             {:else if skillState === "stale"}已安装(旧版,应用启动时自动更新)
@@ -251,12 +322,39 @@
             {/if}
           </span>
         </div>
-        {#if skillState !== null && skillState !== "unmanaged"}
-          <button class="btn-secondary" disabled={skillBusy} onclick={toggleSkill}>
-            {skillState === "not_installed" ? "安装" : "移除"}
-          </button>
+        {#if skillState !== null}
+          <div class="row-actions">
+            <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
+              查看 / 编辑
+            </button>
+            {#if skillState !== "unmanaged"}
+              <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
+              <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
+                {skillState === "not_installed" ? "安装" : "移除"}
+              </button>
+            {/if}
+          </div>
         {/if}
       </div>
+      {#if skillEditOpen}
+        <div class="config">
+          <textarea
+            class="skill-textarea mono"
+            bind:value={skillContent}
+            spellcheck="false"
+            disabled={skillEditBusy}
+          ></textarea>
+          <div class="skill-edit-actions">
+            <div class="skill-edit-buttons">
+              <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
+              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>保存</button>
+              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>恢复默认</button>
+              <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>收起</button>
+            </div>
+            <p class="config-hint">保存后应用升级不再自动更新此文件</p>
+          </div>
+        </div>
+      {/if}
       <label class="row">
         <div class="row-info">
           <span class="row-label">允许 AI 控制录制</span>
@@ -288,6 +386,39 @@
       </p>
     </div>
   </section>
+
+  <!-- —— Agent 能调用什么(MCP 工具 + CLI 命令清单,与后端 catalog 同源,纯只读展示) —— -->
+  <section>
+    <h2 class="section-title">Agent 能调用什么</h2>
+    <div class="rows">
+      {#if capError}
+        <div class="banner warn">{capError}</div>
+      {/if}
+      {#if capabilities}
+        <div class="group-title">MCP 工具</div>
+        {#each capabilities.tools as t (t.name)}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label mono">{t.name}</span>
+              <span class="row-desc">{t.desc}</span>
+            </div>
+            {#if t.gate === "app"}<span class="pill">需应用运行</span>
+            {:else if t.gate === "control"}<span class="pill warn">需允许控制</span>
+            {/if}
+          </div>
+        {/each}
+        <div class="group-title">CLI 命令</div>
+        {#each capabilities.cli as c (c.cmd)}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label mono">{c.cmd}</span>
+              <span class="row-desc">{c.desc}</span>
+            </div>
+          </div>
+        {/each}
+      {/if}
+    </div>
+  </section>
 </div>
 
 <style>
@@ -297,6 +428,21 @@
 
   section {
     margin-top: 1.3rem;
+  }
+  /* 区块标题(settings 页 .section-title 同款):卡片上方的次级标题,只用于新增的
+     「Agent 能调用什么」区块——既有区块靠位置隐含上下文,不追加改动。 */
+  .section-title {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    margin: 0 0 0.45rem;
+  }
+  /* 卡片内的分组小标题(MCP 工具 / CLI 命令):不是 .row,不参与 hairline 分隔逻辑。 */
+  .group-title {
+    padding: 0.6rem 1rem 0.2rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--ink-faint);
   }
   /* 设置行卡片(macOS 系统设置式):surface 底承载各行,行间 hairline 分隔,
      左标题+一行说明、右侧控件;label 行整行可点切换开关 */
@@ -334,6 +480,39 @@
     font-size: 0.8rem;
     color: var(--ink-secondary);
     line-height: 1.4;
+  }
+  /* 行标题 + 状态徽章同一行(技能行的四态徽章用) */
+  .row-label-line {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  /* 等宽:工具名/CLI 命令/技能正文,与其余说明文字区分 */
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* 多按钮并排的行尾控件(技能行:查看/编辑 + 安装/移除) */
+  .row-actions {
+    display: flex;
+    flex: none;
+    gap: 0.4rem;
+  }
+  /* 徽章:soft 底 + 中性文字色,micro 字级(尺寸沿用说话人徽章的形态,颜色改中性/warning 语义) */
+  .pill {
+    flex: none;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    padding: 0.1em 0.5em;
+    background: var(--surface-soft);
+    color: var(--ink-secondary);
+    border: 1px solid var(--hairline);
+    white-space: nowrap;
+  }
+  .pill.warn {
+    background: var(--warning-tint);
+    color: var(--warning-ink);
+    border-color: var(--warning-line);
   }
   /* 右侧控件 */
   .ctl {
@@ -450,5 +629,38 @@
     font-size: 0.8rem;
     overflow-x: auto;
     user-select: text;
+  }
+  /* 技能查看/编辑卡:.snippet 同族(surface-soft 底、radius-sm),可拖高、等宽字体 */
+  .skill-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    height: 360px;
+    margin: 0 0 0.5rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--surface-soft);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-sm);
+    color: var(--ink);
+    font-size: 0.8rem;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .skill-textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .skill-textarea:disabled {
+    opacity: 0.7;
+  }
+  .skill-edit-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .skill-edit-buttons {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
   }
 </style>

@@ -166,9 +166,12 @@ pub fn catalog() -> serde_json::Value {
     let cli: &[(&str, &str)] = &[
         ("voice-notes notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]", "列出会议笔记"),
         ("voice-notes notes search \"关键词\" [--limit N] [--json]", "全文检索会议笔记"),
-        ("voice-notes notes get <note-id> [--format md|txt|json] [--raw]", "读取一场会议笔记全文(默认 md;--raw 取原始逐字稿)"),
+        (
+            "voice-notes notes get <note-id> [--format md|txt|json] [--json] [--raw]",
+            "读取一场会议笔记全文(默认 md;--json 是 --format json 的别名;--raw 取原始逐字稿)",
+        ),
         ("voice-notes speakers list [--json]", "列出全局声纹库中的说话人"),
-        ("voice-notes record status", "查询录制状态"),
+        ("voice-notes record status", "查询录制状态(需应用运行)"),
         ("voice-notes record start [--title \"评审会\"]", "开始录制(需应用运行 + 允许 AI 控制)"),
         ("voice-notes record stop", "停止录制并返回笔记 id(需应用运行 + 允许 AI 控制)"),
         ("voice-notes record pause", "暂停录制(需应用运行 + 允许 AI 控制)"),
