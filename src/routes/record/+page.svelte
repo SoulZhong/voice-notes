@@ -39,7 +39,22 @@
     } catch {
       await openScreenRecordingSettings();
     }
+    triedScreenAuth = true;
     await refreshScreenPerm();
+  }
+
+  // 授权残留自愈:换签名后旧 TCC 条目压住新二进制——系统设置里开关已开却仍未授权,
+  // 拨动开关/重启都无效。走过一轮「立即授权」仍失败才亮出修复入口(避免吓到首次
+  // 授权的用户);修复=清掉本应用的屏幕录制授权记录,再重走一遍系统授权。
+  let triedScreenAuth = $state(false);
+  const showPermFix = $derived(triedScreenAuth && !screenPerm);
+  async function fixScreenPerm() {
+    try {
+      await invoke<boolean>("reset_screen_capture_permission");
+    } catch {
+      /* 清除失败:下面重走授权仍可能带用户到系统设置,不中断 */
+    }
+    await requestScreenPerm();
   }
 
   // 蓝牙外放预警:「保持外放音量」+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件
@@ -325,6 +340,13 @@
         系统声音未授权：只能录到麦克风，对方/外放的声音不会进笔记。
         <button class="link" onclick={requestScreenPerm}>立即授权</button>
         <span class="hint">系统设置里勾选 voice-notes 后切回本页即可。</span>
+        {#if showPermFix}
+          <div class="fixline">
+            系统设置里已勾选却仍提示未授权？多半是旧版本的授权记录残留，开关是失效的。
+            <button class="link" onclick={fixScreenPerm}>修复授权</button>
+            <span class="hint">清除残留后重新弹出系统授权；若未弹出，退出并重新打开应用后再点「立即授权」。</span>
+          </div>
+        {/if}
       </div>
     {/if}
 
@@ -649,4 +671,9 @@
     font-size: inherit;
   }
   .banner .hint { color: var(--warning-ink); }
+  .banner .fixline {
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--warning-line);
+  }
 </style>
