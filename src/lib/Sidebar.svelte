@@ -20,11 +20,7 @@
   let error = $state("");
 
   // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=声纹库,其余(笔记/录制/设置)=录音记录。
-  const tab = $derived(
-    $page.url.pathname.startsWith("/speakers") ? "people"
-    : $page.url.pathname.startsWith("/ai") ? "ai"
-    : "notes",
-  );
+  const tab = $derived($page.url.pathname.startsWith("/speakers") ? "people" : "notes");
 
   let people = $state<PersonSummary[]>([]);
   let peopleError = $state("");
@@ -204,11 +200,6 @@
       class:active={tab === "people"}
       onclick={() => { if (tab !== "people") goto("/speakers"); }}>会议搭子</button
     >
-    <button
-      class="vtab"
-      class:active={tab === "ai"}
-      onclick={() => { if (tab !== "ai") goto("/ai"); }}>AI</button
-    >
   </nav>
 
   <div class="panel">
@@ -245,8 +236,6 @@
         {/each}
       {/if}
     </ul>
-  {:else if tab === "ai"}
-    <!-- AI 页签无列表内容(拍板留空) -->
   {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
@@ -304,6 +293,12 @@
 
   <!-- 设置沉底常驻(冒烟确认位置);声纹库已升级为页签,footer 只剩工具入口。 -->
   <nav class="nav-footer">
+    <a class="nav-link" class:current={$page.url.pathname === "/ai"} href="/ai">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 1.8L9.6 6.4L14.2 8L9.6 9.6L8 14.2L6.4 9.6L1.8 8L6.4 6.4Z" />
+      </svg>
+      AI
+    </a>
     <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="2.2" />
