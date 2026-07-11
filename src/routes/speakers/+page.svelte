@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
     mergePerson,
@@ -51,6 +52,38 @@
   const suggestedIds = $derived(new Set(tidy.suggestions.flatMap((s) => [s.loser, s.winner])));
   const checkedIds = $derived(noSample.filter((p) => checked[p.id]).map((p) => p.id));
 
+  // ── 建议行内试听(单实例):不听原声没法拍板该不该合,双方名字旁都给 ▶。
+  //    播的是该人第一份录音样本;无样本的不出钮(点名字进详情页也没得听)。 ──
+  const personById = $derived(new Map(people.map((p) => [p.id, p])));
+  let sugAudio: HTMLAudioElement | null = null;
+  let sugPlayingId = $state<string | null>(null);
+
+  function stopSug() {
+    sugAudio?.pause();
+    sugAudio = null;
+    sugPlayingId = null;
+  }
+
+  function toggleSugSample(pid: string) {
+    if (sugPlayingId === pid) {
+      stopSug();
+      return;
+    }
+    stopSug();
+    const path = personById.get(pid)?.sample_paths[0];
+    if (!path) return;
+    const a = new Audio(convertFileSrc(path));
+    a.onended = () => {
+      if (sugPlayingId === pid) stopSug();
+    };
+    sugAudio = a;
+    sugPlayingId = pid;
+    void a.play().catch(() => stopSug());
+  }
+
+  // 离开页面/收起整理即停,别让声音悬在半空
+  $effect(() => stopSug);
+
   /** 重算建议 + 清理区默认勾选(未命名且无归属建议的无样本条目)。 */
   async function recomputeTidy() {
     await tidy.refresh();
@@ -62,7 +95,10 @@
 
   async function toggleTidy() {
     tidyOpen = !tidyOpen;
-    if (!tidyOpen) return;
+    if (!tidyOpen) {
+      stopSug();
+      return;
+    }
     tidyErr = "";
     confirmCleanup = false;
     await recomputeTidy();
@@ -71,6 +107,7 @@
   /** 采纳建议:并入推荐归属。合并会改变库(质心/样本迁移),其余建议随之重算。 */
   async function applySuggestion(s: PersonMergeSuggestion) {
     tidyErr = "";
+    stopSug();
     try {
       await mergePerson(s.loser, s.winner);
       recording.bumpPeople();
@@ -85,6 +122,7 @@
     confirmCleanup = false;
     cleaning = true;
     tidyErr = "";
+    stopSug();
     let failed = 0;
     for (const id of checkedIds) {
       try {
@@ -116,6 +154,29 @@
     refresh();
   });
 </script>
+
+{#snippet listenBtn(pid: string)}
+  <!-- 行内试听小钮:播该人第一份样本;无样本不出钮。播放中换成停止方块+accent -->
+  {#if (personById.get(pid)?.sample_paths.length ?? 0) > 0}
+    <button
+      class="listen-mini"
+      class:playing={sugPlayingId === pid}
+      title={sugPlayingId === pid ? "停止" : "试听原声"}
+      aria-label={sugPlayingId === pid ? "停止" : "试听原声"}
+      onclick={() => toggleSugSample(pid)}
+    >
+      {#if sugPlayingId === pid}
+        <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" />
+        </svg>
+      {:else}
+        <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
+        </svg>
+      {/if}
+    </button>
+  {/if}
+{/snippet}
 
 <main class="container">
   <h1>会议搭子</h1>
@@ -193,11 +254,13 @@
                 <div class="sug-row">
                   <span class="dot" style="background: {speakerInk(s.loser, 'mic')}"></span>
                   <a class="sug-name" href="/speakers/{s.loser}">{plabel(s.loser, s.loser_name)}</a>
+                  {@render listenBtn(s.loser)}
                   <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
                   </svg>
                   <span class="dot" style="background: {speakerInk(s.winner, 'mic')}"></span>
                   <a class="sug-name" href="/speakers/{s.winner}">{plabel(s.winner, s.winner_name)}</a>
+                  {@render listenBtn(s.winner)}
                   <span class="sim" class:strong={s.similarity >= 0.74}>
                     相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""}
                   </span>
@@ -205,13 +268,13 @@
                   <button
                     class="mini accent"
                     disabled={recording.isLive}
-                    title={recording.isLive ? "录制中不能合并" : "并入推荐归属(点名字可先试听核对)"}
+                    title={recording.isLive ? "录制中不能合并" : "并入推荐归属(先点两边的试听核对)"}
                     onclick={() => applySuggestion(s)}>合并</button
                   >
                   <button class="mini" onclick={() => tidy.ignore(s)}>忽略</button>
                 </div>
               {/each}
-              <p class="hint">点名字可进详情页试听核对;合并会保留双方声纹数据,认得更准。</p>
+              <p class="hint">先点两边的播放键听原声,确认是同一个人再合并;合并会保留双方声纹数据,认得更准。</p>
             {/if}
           </div>
 
@@ -423,6 +486,29 @@
   .arrow {
     color: var(--ink-faint);
     flex: none;
+  }
+  /* 行内试听:圆形小图标钮,hairline 边;播放中 accent 描边+字色 */
+  .listen-mini {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.35rem;
+    height: 1.35rem;
+    padding: 0;
+    flex: none;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .listen-mini:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .listen-mini.playing {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .sim {
     color: var(--ink-faint);
