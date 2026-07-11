@@ -25,3 +25,6 @@ export const renamePerson = (id: string, name: string) => invoke<void>("rename_p
 export const mergePerson = (loser: string, winner: string) =>
   invoke<void>("merge_person", { loser, winner });
 export const deletePerson = (id: string) => invoke<void>("delete_person", { id });
+/** 删除一份录音样本(试听纠错;样本不参与识别)。path 须取自该人的 sample_paths。 */
+export const deletePersonSample = (id: string, path: string) =>
+  invoke<void>("delete_person_sample", { id, path });

@@ -273,6 +273,24 @@ impl VoiceprintStore {
         Ok(true)
     }
 
+    /// 删除某人的一份录音样本(按绝对路径指认,试听纠错用;样本不参与识别,删除
+    /// 不影响认人)。路径必须是该人现存样本之一——IPC 传入的任意路径不可信,
+    /// 绝不能直接 remove_file。id 先经 redirects 解析(详情页可能拿着旧引用)。
+    /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,防删到正在迁移的文件。
+    /// 删出的空槽由下一场会议的 append_sample(找首个空槽)自然补上。
+    pub fn delete_sample(&self, id: &str, path: &std::path::Path) -> anyhow::Result<()> {
+        let _guard = vp_guard();
+        let vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
+            anyhow::bail!("未知人物: {id}");
+        };
+        if !self.sample_paths_existing(&resolved).iter().any(|p| p == path) {
+            anyhow::bail!("不是该人物的样本文件");
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     /// 停止时把本场簇快照并入库。
     /// - person=Some(经 redirects 解析) 的簇:按簇 sources 的主 source(BTreeSet 首个)
     ///   加权并入该 person 的质心,total_ms 累加,last_seen=now。
@@ -673,6 +691,42 @@ mod tests {
         // 删除连带删全部样本。
         store.delete(&p2).unwrap();
         assert!(store.sample_paths_existing(&p2).is_empty(), "删除人物连带删全部样本");
+    }
+
+    #[test]
+    fn delete_sample_removes_named_slot_rejects_foreign_and_slot_gets_refilled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1")
+            .unwrap();
+        let p1 = links["S1"].clone();
+        for _ in 0..3 {
+            store.append_sample(&p1, &[0.5; 16]).unwrap();
+        }
+        let paths = store.sample_paths_existing(&p1);
+        assert_eq!(paths.len(), 3);
+
+        // 删中间槽(第 2 份):只少这一份,其余槽位不动。
+        store.delete_sample(&p1, &paths[1]).unwrap();
+        let left = store.sample_paths_existing(&p1);
+        assert_eq!(left.len(), 2);
+        assert!(!left.contains(&paths[1]));
+
+        // 再删同一路径:文件已不存在 → 不再属于该人样本,拒绝。
+        assert!(store.delete_sample(&p1, &paths[1]).is_err());
+        // 外来路径(存在但不是他的样本):拒绝且文件安然无恙。
+        let foreign = tmp.path().join("innocent.wav");
+        std::fs::write(&foreign, b"x").unwrap();
+        assert!(store.delete_sample(&p1, &foreign).is_err());
+        assert!(foreign.exists(), "校验失败绝不能碰无关文件");
+        // 未知人物:拒绝。
+        assert!(store.delete_sample("P999", &left[0]).is_err());
+
+        // 删出的空槽被下一份样本自然补上(append 找首个空槽)。
+        assert!(store.append_sample(&p1, &[0.7; 16]).unwrap());
+        assert_eq!(store.sample_paths_existing(&p1).len(), 3);
+        assert!(store.sample_paths_existing(&p1).contains(&paths[1]), "新样本落回被删的槽位");
     }
 
     #[test]
