@@ -14,6 +14,7 @@
     type NoteSummary,
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
+  import { tidy } from "$lib/tidy.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -35,9 +36,13 @@
   }
 
   // 切到声纹库页签时拉取;详情页改名/合并/删除后经 peopleVersion 触发重拉,索引不滞留旧名。
+  // 整理建议同步重算:「概览与整理」徽标要跟库同步,不能挂着旧数。
   $effect(() => {
     void recording.peopleVersion;
-    if (tab === "people") refreshPeople();
+    if (tab === "people") {
+      refreshPeople();
+      tidy.refresh();
+    }
   });
 
   // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
@@ -46,6 +51,20 @@
   );
   const peopleUnnamed = $derived(peopleSorted.filter((p) => !p.name));
   const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
+
+  /** 同名分组数(疑似重复):与概览页同一判定,计入徽标。 */
+  const dupGroupCount = $derived.by(() => {
+    const seen = new Set<string>();
+    const dup = new Set<string>();
+    for (const p of people) {
+      if (!p.name) continue;
+      if (seen.has(p.name)) dup.add(p.name);
+      seen.add(p.name);
+    }
+    return dup.size;
+  });
+  /** 「概览与整理」徽标:待办数=可归属建议 + 疑似重复组。0 不显示。 */
+  const tidyBadge = $derived(tidy.visible.length + dupGroupCount);
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
@@ -190,15 +209,17 @@
   <!-- 立体竖排页签(冒烟反馈):贴侧栏左缘,文件夹式——选中页签与内容面板同底、
        交界边线断开融为一体(凸起),未选中退后;点击即导航,选中由路由派生。 -->
   <nav class="tab-rail">
+    <!-- 页签点击=导航到该页签的根:已在页签内(如笔记/人物详情页)再点一次回根,
+         iOS/macOS 通用的"点当前 tab 回根"模式——概览页不再是只有第一跳能到的死角。 -->
     <button
       class="vtab"
       class:active={tab === "notes"}
-      onclick={() => { if (tab !== "notes") goto("/"); }}>录音</button
+      onclick={() => { if ($page.url.pathname !== "/") goto("/"); }}>录音</button
     >
     <button
       class="vtab"
       class:active={tab === "people"}
-      onclick={() => { if (tab !== "people") goto("/speakers"); }}>会议搭子</button
+      onclick={() => { if ($page.url.pathname !== "/speakers") goto("/speakers"); }}>会议搭子</button
     >
   </nav>
 
@@ -223,6 +244,31 @@
     <!-- 人物索引(主从结构的"主"):点击进主区详情页;待命名是待处理项排上面,
          与旧管理页分区语义一致。行内无操作,管理动作全在详情页。 -->
     <ul class="list">
+      <!-- 固定行:概览与整理(库级功能的常驻入口,不随人物列表滚没)。徽标=可归属
+           建议+疑似重复组的待办数,像收件箱未读——有活儿要干时主动提示。 -->
+      {#if people.length > 0}
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+        <li
+          class="item overview"
+          class:current={$page.url.pathname === "/speakers"}
+          onclick={(e) => {
+            if ((e.target as HTMLElement).closest("a")) return;
+            goto("/speakers");
+          }}
+        >
+          <svg class="overview-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="2.5" width="12" height="4" rx="1.2" />
+            <rect x="2" y="9.5" width="7" height="4" rx="1.2" />
+            <path d="M11.5 11.5h2.5M12.75 10.25v2.5" />
+          </svg>
+          <div class="main-line">
+            <a class="title" href="/speakers">概览与整理</a>
+          </div>
+          {#if tidyBadge > 0}
+            <span class="tidy-badge" title="{tidy.visible.length} 条归属建议 · {dupGroupCount} 组同名">{tidyBadge}</span>
+          {/if}
+        </li>
+      {/if}
       {#if peopleUnnamed.length > 0}
         <li class="group-label">待命名</li>
         {#each peopleUnnamed as p (p.id)}
@@ -476,6 +522,33 @@
     display: flex;
     align-items: center;
     gap: 0.55em;
+  }
+  /* 概览与整理固定行:与人物行同形态,图标代色点;徽标=待办数(warning 色药丸) */
+  .item.overview {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+  }
+  .overview-icon {
+    color: var(--ink-faint);
+    flex: none;
+  }
+  .item.overview.current .overview-icon,
+  .item.overview:hover .overview-icon {
+    color: var(--ink-secondary);
+  }
+  .tidy-badge {
+    margin-left: auto;
+    flex: none;
+    min-width: 1.3em;
+    text-align: center;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    color: var(--warning-ink);
+    font-size: 0.72rem;
+    font-weight: 500;
+    border-radius: var(--radius-full);
+    padding: 0.05em 0.45em;
   }
   /* 分组标签:待命名/已命名,与详情域分区语义一致;非交互,安静小字 */
   .group-label {
