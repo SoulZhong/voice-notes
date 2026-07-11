@@ -182,6 +182,18 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
         return Vec::new();
     };
     let vp = store::VoiceprintStore::new(root).load();
+    // 嵌入模型标签与当前选型不一致(切换后台重建尚未完成的窗口)时不注入种子:
+    // 不同模型的向量空间不可混比,错认比不认糟。此门禁足以杜绝一切跨空间比较——
+    // 种子被跳过后,本场新簇只在新空间内互比;既有人物无种子即不会被命中回写。
+    let cur = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d).speaker_model)
+        .unwrap_or_default();
+    if vp.embedding_model != cur {
+        eprintln!("声纹库模型标签({})与当前选型({cur})不一致,本场跳过种子注入(重建完成后恢复)", vp.embedding_model);
+        return Vec::new();
+    }
     // 种子构建下沉 store::seed_clusters(主质心 + 会话状态变体,同人多种子取 max 命中)。
     store::seed_clusters(&vp)
 }
@@ -277,7 +289,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
-                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path()) {
+                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
                     Ok(e) => Some(e),
                     Err(e) => {
                         eprintln!("refine: 声纹模型不可用，跳过重聚类: {e}");
@@ -437,8 +449,14 @@ fn default_download_ids(asr_model: &str) -> Vec<&'static str> {
         .collect()
 }
 
-fn speaker_model_path() -> PathBuf {
-    models::root().join("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
+/// 当前声纹模型文件路径(按设置选型;调用点均为低频路径,现场读一次 settings)。
+fn speaker_model_path(app: &AppHandle) -> PathBuf {
+    let model = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d).speaker_model)
+        .unwrap_or_default();
+    models::root().join(models::speaker_model_file(&model))
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -1796,7 +1814,7 @@ fn merge_person(
         + store.sample_paths_existing(&winner).len()
         > store::MAX_SAMPLES;
     let mut emb = if overflow {
-        match diar::SherpaEmbedder::new(&speaker_model_path()) {
+        match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
             Ok(e) => Some(e),
             Err(e) => {
                 eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}");
@@ -1957,7 +1975,7 @@ fn preload_models(
         }
         let mut eslot = embedder_cache.lock().unwrap();
         if eslot.is_none() {
-            match diar::SherpaEmbedder::new(&speaker_model_path()) {
+            match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
                 Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
                 Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
             }
@@ -2140,6 +2158,13 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     if asr_changed && *state.running.lock().unwrap() {
         return Err("录制中不能切换识别模型".into());
     }
+    // 声纹模型切换:录制中拒绝(与 ASR 同理);保存后清旧嵌入器缓存,并起后台线程
+    // 用新模型从录音样本重建整库质心(不同模型空间不可混用)。重建期间录制可用,
+    // 只是种子注入被门禁跳过(不自动认人),完成后自动恢复。
+    let speaker_changed = old.speaker_model != new_settings.speaker_model;
+    if speaker_changed && *state.running.lock().unwrap() {
+        return Err("录制中不能切换声纹模型".into());
+    }
     // 托盘开关是否变更(落盘后据此建/拆托盘,即时生效无需重启)。
     let tray_changed = old.tray_enabled != new_settings.tray_enabled;
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
@@ -2158,6 +2183,34 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }
     // 托盘开关变更 → 建/拆托盘（apply_enabled 现读设置后幂等处理）。放在 asr 之后,
     // app 已 clone 给 preload,此处直接用 &app。
+    if speaker_changed {
+        *state.embedder_cache.lock().unwrap() = None; // 旧模型常驻嵌入器作废
+        let app2 = app.clone();
+        let cache = state.embedder_cache.clone();
+        std::thread::spawn(move || {
+            let tag = app2
+                .path()
+                .app_data_dir()
+                .map(|d| settings::load(&d).speaker_model)
+                .unwrap_or_default();
+            match diar::SherpaEmbedder::new(&speaker_model_path(&app2)) {
+                Ok(mut e) => {
+                    match data_root(&app2).map(store::VoiceprintStore::new) {
+                        Ok(vps) => match vps.rebuild_for_model(&tag, &mut e) {
+                            Ok(n) => eprintln!("声纹库已按 {tag} 重建({n} 人有样本可建)"),
+                            Err(err) => eprintln!("声纹库重建失败(种子注入将持续跳过): {err}"),
+                        },
+                        Err(err) => eprintln!("声纹库路径不可用,未重建: {err}"),
+                    }
+                    // 新模型嵌入器顺手入常驻槽,下一场开录直接可用。
+                    stash_model(&cache, Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>));
+                }
+                Err(err) => {
+                    eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
+                }
+            }
+        });
+    }
     if tray_changed {
         tray::apply_enabled(&app);
     }
