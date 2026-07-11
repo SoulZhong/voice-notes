@@ -15,8 +15,10 @@ use std::path::PathBuf;
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// 停止时够料自动入库的门槛(累计发声毫秒)。待真实会议数据校准。
-pub const AUTO_ENROLL_MS: u64 = 10_000;
+/// 够料自动入库的门槛(累计发声毫秒)。2026-07-11 按真实库复盘上调 10s→30s:
+/// 10s 时代攒出 37 个 0-8 分钟的未命名碎片(低电平/杂音段凑够即领 P 号),质心近
+/// 随机、谁都认不出还污染种子池;30s 才够格算"真实参会者"。
+pub const AUTO_ENROLL_MS: u64 = 30_000;
 
 /// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
 /// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
@@ -454,73 +456,167 @@ pub(crate) fn select_diverse(embs: &[Option<Vec<f32>>], k: usize) -> Vec<usize> 
     picked
 }
 
-/// 读样本 WAV 并算整段声纹嵌入(归一化)。<1s 的样本嵌不出稳定声纹,视为不可得;
-/// 读失败/嵌入失败一律 None——调用方按"排最后补位"容忍。
+/// 嵌入前响度归一的目标 RMS。样本横跨不同增益时代(输入音量修复前后/AGC 演进),
+/// 电平差会渗进嵌入拉低同人相似度;比较域内所有样本统一归到同一响度再嵌入。
+const EMBED_TARGET_RMS: f32 = 0.08;
+
+/// 波形响度归一:整体缩放到目标 RMS,削波保护(峰值封 0.99)。近静音(RMS<1e-4)
+/// 不放大——那是无声/噪声底,抬上来只会放大垃圾。
+pub(crate) fn normalize_loudness(samples: &mut [f32]) {
+    let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+    if rms < 1e-4 {
+        return;
+    }
+    let peak = samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let scale = (EMBED_TARGET_RMS / rms).min(0.99 / peak.max(1e-6));
+    for x in samples.iter_mut() {
+        *x *= scale;
+    }
+}
+
+/// 读样本 WAV 并算整段声纹嵌入(响度归一 + 向量归一化)。<1s 的样本嵌不出稳定
+/// 声纹,视为不可得;读失败/嵌入失败一律 None——调用方按"排最后补位"容忍。
 fn embed_wav_sample(path: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
     let mut r = hound::WavReader::open(path).ok()?;
-    let samples: Vec<f32> =
+    let mut samples: Vec<f32> =
         r.samples::<i16>().filter_map(|s| s.ok()).map(|v| v as f32 / 32768.0).collect();
     if samples.len() < 16_000 {
         return None;
     }
+    normalize_loudness(&mut samples);
     e.embed(&samples).ok().and_then(|v| normalize(&v))
 }
 
-/// 整理·合并建议的相似度下限(余弦)。与种子命中(SEED_ASSIGN 0.68)/离线重聚类
-/// (AHC 0.68)同档:建议只是推荐,最终由用户试听拍板,取比在线自动合并(0.74)
-/// 宽一档的标定;≥0.74 的建议前端可另标"很可能"。
+/// 整理·合并建议的**绝对档**相似度下限(裸余弦)。与种子命中(SEED_ASSIGN 0.68)/
+/// 离线重聚类(AHC 0.68)同档;≥0.74 前端标"很可能"。
 pub const SUGGEST_MERGE_THRESHOLD: f32 = 0.68;
+/// **相对显著档**(S-Norm)的 z 分数下限:同人跨场信道漂移会把裸余弦压到 0.4-0.6,
+/// 绝对档看不见;把分数换算成"相对这两人各自与全库其他人相似度分布的显著性"
+/// (z=均值化的标准分)后,鹤立鸡群的配对即使裸分不高也值得推荐。
+/// 校准依据(2026-07-11 真实库 63 人):raw≥0.68 建议数为 0;z≥2.5 浮出 12 对,
+/// 人工核验方向合理(多个未命名指向同一真人)。
+pub const SUGGEST_Z_THRESHOLD: f32 = 2.5;
+/// 相对档的裸余弦地板:z 再高,裸分低于此值大概率是统计巧合,不推。
+pub const SUGGEST_RAW_FLOOR: f32 = 0.45;
+/// "很可能"徽标的显著性档(供前端与 ipc 层判断)。
+pub const SUGGEST_STRONG_Z: f32 = 3.0;
+/// cohort 统计的最少对比人数:库太小算不出稳定分布,只走绝对档。
+const SNORM_MIN_COHORT: usize = 3;
 
 /// 一条整理合并建议:把 loser 并入 winner。方向=未命名并入已命名;双方都未命名
 /// 时数据薄的并入厚的。similarity 取双方共有信道质心余弦的最大值,source 是取到
-/// 最大值的那个信道。
+/// 最大值的那个信道;salience 是该配对的 S-Norm 显著性(库太小算不出时 None)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeSuggestion {
     pub loser: String,
     pub winner: String,
     pub similarity: f32,
     pub source: String,
+    pub salience: Option<f32>,
 }
 
-/// 整理·再辨认:未命名人物("待辨认"对象)逐一与库中其他人比对声纹质心,
-/// ≥ SUGGEST_MERGE_THRESHOLD 者给出合并建议。纯函数不做 IO,只读不改库——
-/// 建议由用户确认后走既有 merge_person。每人只报最相似的一个归属;两个未命名
-/// 互相命中只产出一条(配对去重)。
+/// 整理·再辨认:未命名人物("待辨认"对象)逐一与库中其他人比对声纹质心,给出
+/// 合并建议。准入=绝对档(raw ≥ 0.68)或相对档(S-Norm z ≥ 2.5 且 raw ≥ 0.45)。
+/// 纯函数不做 IO,只读不改库——建议由用户确认后走既有 merge_person。每人只报
+/// 最显著的一个归属;两个未命名互相命中只产出一条(配对去重)。
 pub fn suggest_merges(vp: &Voiceprints) -> Vec<MergeSuggestion> {
-    let mut out: Vec<MergeSuggestion> = Vec::new();
-    let mut seen_pairs: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-    for (id, p) in vp.people.iter().filter(|(_, p)| p.name.is_empty()) {
-        // (对方 id, 相似度, 信道, 对方是否已命名)
-        let mut best: Option<(&String, f32, &String, bool)> = None;
-        for (oid, o) in vp.people.iter().filter(|(oid, _)| *oid != id) {
-            for (src, c) in &p.centroids {
-                let Some(oc) = o.centroids.get(src) else { continue };
-                let (Some(a), Some(b)) = (normalize(&c.vec), normalize(&oc.vec)) else { continue };
-                let sim: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-                if best.map_or(true, |(_, s, _, _)| sim > s) {
-                    best = Some((oid, sim, src, !o.name.is_empty()));
+    let ids: Vec<&String> = vp.people.keys().collect();
+    let n = ids.len();
+    let units: Vec<BTreeMap<&String, Vec<f32>>> = ids
+        .iter()
+        .map(|id| {
+            vp.people[*id]
+                .centroids
+                .iter()
+                .filter_map(|(src, c)| normalize(&c.vec).map(|u| (src, u)))
+                .collect()
+        })
+        .collect();
+
+    // 全配对相似度矩阵:共有信道余弦取最大,记录取到最大值的信道。
+    let mut sim: Vec<Vec<Option<(f32, String)>>> = vec![vec![None; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut best: Option<(f32, String)> = None;
+            for (src, a) in &units[i] {
+                let Some(b) = units[j].get(*src) else { continue };
+                let s: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                    best = Some((s, src.to_string()));
                 }
             }
+            sim[i][j] = best.clone();
+            sim[j][i] = best;
         }
-        let Some((oid, sim, src, other_named)) = best else { continue };
-        if sim < SUGGEST_MERGE_THRESHOLD {
-            continue;
+    }
+
+    // 每人的 cohort 统计(与全库其他人的相似度均值/标准差),不足样本给 None。
+    let stats: Vec<Option<(f32, f32)>> = (0..n)
+        .map(|i| {
+            let vals: Vec<f32> = (0..n).filter_map(|j| sim[i][j].as_ref().map(|(s, _)| *s)).collect();
+            if vals.len() < SNORM_MIN_COHORT {
+                return None;
+            }
+            let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / (vals.len() - 1) as f32;
+            Some((mean, var.sqrt().max(1e-3)))
+        })
+        .collect();
+    let z_of = |i: usize, j: usize, s: f32| -> Option<f32> {
+        let (ma, sa) = stats[i]?;
+        let (mb, sb) = stats[j]?;
+        Some(((s - ma) / sa + (s - mb) / sb) / 2.0)
+    };
+
+    let mut out: Vec<MergeSuggestion> = Vec::new();
+    let mut seen_pairs: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for i in 0..n {
+        if !vp.people[ids[i]].name.is_empty() {
+            continue; // 只有未命名者是"待辨认"对象
         }
+        // 候选目标里挑最显著者:有 z 按 z,全无 z(小库)按裸分。
+        let mut best: Option<(usize, f32, String, Option<f32>)> = None;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let Some((s, src)) = sim[i][j].clone() else { continue };
+            let z = z_of(i, j, s);
+            let eligible = s >= SUGGEST_MERGE_THRESHOLD
+                || (z.map_or(false, |z| z >= SUGGEST_Z_THRESHOLD) && s >= SUGGEST_RAW_FLOOR);
+            if !eligible {
+                continue;
+            }
+            let key = (z.unwrap_or(f32::NEG_INFINITY), s);
+            if best
+                .as_ref()
+                .map_or(true, |(_, bs, _, bz)| key > (bz.unwrap_or(f32::NEG_INFINITY), *bs))
+            {
+                best = Some((j, s, src, z));
+            }
+        }
+        let Some((j, s, src, z)) = best else { continue };
+        let (a, b) = (ids[i], ids[j]);
+        let other_named = !vp.people[b].name.is_empty();
         let (loser, winner) = if other_named {
-            (id.clone(), oid.clone())
-        } else if p.total_ms > vp.people[oid].total_ms {
-            (oid.clone(), id.clone())
+            (a.clone(), b.clone())
+        } else if vp.people[a].total_ms > vp.people[b].total_ms {
+            (b.clone(), a.clone())
         } else {
-            (id.clone(), oid.clone())
+            (a.clone(), b.clone())
         };
-        let pair =
-            (loser.clone().min(winner.clone()), loser.clone().max(winner.clone()));
+        let pair = (loser.clone().min(winner.clone()), loser.clone().max(winner.clone()));
         if !seen_pairs.insert(pair) {
             continue;
         }
-        out.push(MergeSuggestion { loser, winner, similarity: sim, source: src.clone() });
+        out.push(MergeSuggestion { loser, winner, similarity: s, source: src, salience: z });
     }
-    out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+    // 最显著的排前(小库无 z 时按裸分)。
+    out.sort_by(|a, b| {
+        let ka = (a.salience.unwrap_or(f32::NEG_INFINITY), a.similarity);
+        let kb = (b.salience.unwrap_or(f32::NEG_INFINITY), b.similarity);
+        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -944,6 +1040,88 @@ mod tests {
         assert!(suggest_merges(&named).is_empty());
     }
 
+    /// 相对显著档(S-Norm):裸余弦 0.55 达不到绝对档,但在"其他人全是陌生方向"的
+    /// 库里鹤立鸡群 → 必须给建议且带 salience;反之在"大家彼此都 0.55"的拥挤库里,
+    /// 同样的 0.55 毫无显著性 → 不给建议。
+    #[test]
+    fn suggest_merges_snorm_surfaces_standout_pair_and_rejects_crowded_cohort() {
+        // 12 维:P1 张三=[1,0,...],候选 P2 与他 cos=0.55;其余 10 个已命名人各占一个
+        // 正交基(与两者余弦 0)。
+        let dim = 12usize;
+        let mut ppl: Vec<(String, String, Vec<f32>, u64)> = Vec::new();
+        let mut e1 = vec![0.0; dim];
+        e1[0] = 1.0;
+        ppl.push(("P1".into(), "张三".into(), e1, 60_000));
+        let mut cand = vec![0.0; dim];
+        cand[0] = 0.55;
+        cand[1] = (1.0f32 - 0.55 * 0.55).sqrt();
+        ppl.push(("P2".into(), String::new(), cand, 12_000));
+        for k in 0..10 {
+            let mut v = vec![0.0; dim];
+            v[k + 2] = 1.0;
+            ppl.push((format!("P{}", k + 3), format!("路人{k}"), v, 30_000));
+        }
+        let mut vp = Voiceprints::default();
+        for (id, name, vec, ms) in &ppl {
+            let mut centroids = BTreeMap::new();
+            centroids.insert("mic".to_string(), PersonCentroid { vec: vec.clone(), count: 5 });
+            vp.people.insert(
+                id.clone(),
+                Person { name: name.clone(), centroids, total_ms: *ms, last_seen: "t".into() },
+            );
+        }
+        let s = suggest_merges(&vp);
+        assert_eq!(s.len(), 1, "鹤立鸡群的 0.55 必须浮出: {s:?}");
+        assert_eq!((s[0].loser.as_str(), s[0].winner.as_str()), ("P2", "P1"));
+        assert!(s[0].similarity > 0.54 && s[0].similarity < 0.56);
+        assert!(s[0].salience.unwrap() >= SUGGEST_Z_THRESHOLD, "{:?}", s[0].salience);
+
+        // 拥挤库:同样 0.55,但其余 10 人与双方也都 ~0.55(全库彼此都半像)→ z≈0,不推。
+        let mut vp2 = Voiceprints::default();
+        let mk = |theta: f32| -> Vec<f32> {
+            // 全部向量与 e1 夹角相同(cos=0.55),彼此之间也大致同距:绕 e1 的锥面取点。
+            let r = (1.0f32 - 0.55 * 0.55).sqrt();
+            let mut v = vec![0.0; dim];
+            v[0] = 0.55;
+            v[1] = r * theta.cos();
+            v[2] = r * theta.sin();
+            v
+        };
+        let mut e1b = vec![0.0; dim];
+        e1b[0] = 1.0;
+        vp2.people.insert("P1".into(), Person { name: "张三".into(), centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: e1b, count: 5 })]), total_ms: 60_000, last_seen: "t".into() });
+        for k in 0..11 {
+            let name = if k == 0 { String::new() } else { format!("路人{k}") };
+            vp2.people.insert(
+                format!("P{}", k + 2),
+                Person { name, centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: mk(k as f32 * 0.5), count: 5 })]), total_ms: 30_000, last_seen: "t".into() },
+            );
+        }
+        let s2 = suggest_merges(&vp2);
+        assert!(
+            s2.iter().all(|m| m.similarity >= SUGGEST_MERGE_THRESHOLD),
+            "拥挤 cohort 里 0.55 无显著性,只允许绝对档建议冒头: {s2:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_loudness_scales_quiet_up_clamps_peak_and_skips_silence() {
+        // 小声:RMS 0.01 → 抬到目标 0.08。
+        let mut quiet = vec![0.01f32; 1000];
+        normalize_loudness(&mut quiet);
+        let rms = (quiet.iter().map(|x| x * x).sum::<f32>() / 1000.0).sqrt();
+        assert!((rms - 0.08).abs() < 1e-3, "{rms}");
+        // 高峰值:目标增益会削波 → 按峰值封顶(≤0.99)。
+        let mut peaky: Vec<f32> = vec![0.01; 999];
+        peaky.push(0.5);
+        normalize_loudness(&mut peaky);
+        assert!(peaky.iter().fold(0f32, |m, x| m.max(x.abs())) <= 0.99);
+        // 近静音:不放大(抬上来只是噪声底)。
+        let mut silent = vec![1e-5f32; 1000];
+        normalize_loudness(&mut silent);
+        assert!((silent[0] - 1e-5).abs() < 1e-9);
+    }
+
     #[test]
     fn delete_sample_removes_named_slot_rejects_foreign_and_slot_gets_refilled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1018,11 +1196,13 @@ mod tests {
         assert_eq!(store.sample_paths_existing(&p2).len(), MAX_SAMPLES, "winner 填满即止,超额删除");
     }
 
-    /// 假嵌入器:按整段样本首值分档出方向向量(同档=同声线,异档=不同声线)。
-    struct AmpEmbedder;
-    impl crate::diar::SpeakerEmbedder for AmpEmbedder {
+    /// 假嵌入器:按信号符号翻转次数分档(响度不变特征——嵌入前的响度归一不该
+    /// 影响分档,恒定直流=声线 A,交替方波=声线 B)。
+    struct FlipEmbedder;
+    impl crate::diar::SpeakerEmbedder for FlipEmbedder {
         fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
-            Ok(if s[0] > 0.5 { vec![0.0, 1.0] } else { vec![1.0, 0.0] })
+            let flips = s.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+            Ok(if flips > 100 { vec![0.0, 1.0] } else { vec![1.0, 0.0] })
         }
     }
 
@@ -1036,14 +1216,15 @@ mod tests {
         ];
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
-        // winner 满员 10 份、全是同一声线(幅值 0.1);loser 1 份独特声线(幅值 0.9)。
+        // winner 满员 10 份、全是同一声线(恒定直流);loser 1 份独特声线(交替方波)。
         // 旧行为会因 winner 满员直接丢掉 loser 的独特样本;多样性挑选必须留下它。
         for _ in 0..MAX_SAMPLES {
             store.append_sample(&winner, &vec![0.1; 16_000]).unwrap();
         }
-        store.append_sample(&loser, &vec![0.9; 16_000]).unwrap();
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        store.append_sample(&loser, &square).unwrap();
 
-        let mut e = AmpEmbedder;
+        let mut e = FlipEmbedder;
         store
             .merge_with_embedder(&loser, &winner, Some(&mut e as &mut dyn crate::diar::SpeakerEmbedder))
             .unwrap();
@@ -1051,11 +1232,10 @@ mod tests {
         let kept = store.sample_paths_existing(&winner);
         assert_eq!(kept.len(), MAX_SAMPLES, "保留数=上限");
         assert!(store.sample_paths_existing(&loser).is_empty());
-        // 独特声线的那份必须幸存(读回首采样辨认)。
+        // 独特声线的那份必须幸存(方波含负采样,直流样本全为正)。
         let has_unique = kept.iter().any(|p| {
             let mut r = hound::WavReader::open(p).unwrap();
-            let first: i16 = r.samples::<i16>().next().unwrap().unwrap();
-            (first as f32 / 32768.0 - 0.9).abs() < 0.01
+            r.samples::<i16>().filter_map(|s| s.ok()).any(|v| v < 0)
         });
         assert!(has_unique, "最不相似的样本必须保留,不能按槽位序丢弃: {kept:?}");
     }
@@ -1108,15 +1288,16 @@ mod tests {
             }),
         );
 
-        // 4 段 × 2.5s = 10s 恰达门槛;每段后跑一轮 enroll_pending(仿 process_final 节奏)。
-        for _ in 0..4 {
+        // N 段 × 2.5s 恰达 AUTO_ENROLL_MS 门槛;每段后跑一轮 enroll_pending(仿 process_final 节奏)。
+        let n_segs = (AUTO_ENROLL_MS / 2500) as usize;
+        for _ in 0..n_segs {
             r.assign(&[1.0, 0.0, 0.0], "mic", 40000).unwrap();
             r.enroll_pending();
         }
         let pid = r.speakers()[0].person.clone().expect("够料后应已实时入库");
         {
             let vp = store.load();
-            assert_eq!(vp.people[&pid].centroids["mic"].count, 4);
+            assert_eq!(vp.people[&pid].centroids["mic"].count, n_segs as u64);
             assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS);
         }
 
@@ -1132,7 +1313,7 @@ mod tests {
         assert_eq!(snaps[0].total_ms, 4000);
         store.upsert_from_session(&snaps, "t-stop").unwrap();
         let vp = store.load();
-        assert_eq!(vp.people[&pid].centroids["mic"].count, 6, "4+2 线性增长,不双计");
+        assert_eq!(vp.people[&pid].centroids["mic"].count, n_segs as u64 + 2, "入库段+2 线性增长,不双计");
         assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS + 4000);
         assert_eq!(vp.people[&pid].last_seen, "t-stop");
     }
