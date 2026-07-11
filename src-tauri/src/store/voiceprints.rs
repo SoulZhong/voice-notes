@@ -79,11 +79,25 @@ pub struct Voiceprints {
     /// 合并产生的旧引用重定向:loser id -> winner id。resolve 时链式跟随。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub redirects: BTreeMap<String, String>,
+    /// 产生质心的嵌入模型标签("campplus"/"eres2netv2")。不同模型的向量空间不可
+    /// 混比;与当前选型不一致时种子注入/停止回写被 lib.rs 门禁跳过,直到重建完成。
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+}
+
+fn default_embedding_model() -> String {
+    "campplus".into()
 }
 
 impl Default for Voiceprints {
     fn default() -> Self {
-        Self { schema_version: SCHEMA_VERSION, next_person: 1, people: BTreeMap::new(), redirects: BTreeMap::new() }
+        Self {
+            schema_version: SCHEMA_VERSION,
+            next_person: 1,
+            people: BTreeMap::new(),
+            redirects: BTreeMap::new(),
+            embedding_model: default_embedding_model(),
+        }
     }
 }
 
@@ -359,6 +373,65 @@ impl VoiceprintStore {
         w.finalize()?;
         std::fs::rename(&tmp, &path)?;
         Ok(true)
+    }
+
+    /// 切换嵌入模型后的库重建:每人用其录音样本按新模型重算质心(样本=人工核验过
+    /// 的原声真值)。主质心=样本嵌入均值;会话变体=各样本嵌入(样本本就是历史场次
+    /// 快照);样本无从追溯信道,统一写入该人既有信道键(无则 "mic")。无样本/嵌入
+    /// 全失败的人清空质心——身份与历史保留,但新空间里无从匹配,等下次录到重新积累。
+    /// 返回成功重建的人数。持 vp_guard 整程串行。
+    pub fn rebuild_for_model(
+        &self,
+        model_tag: &str,
+        e: &mut dyn crate::diar::SpeakerEmbedder,
+    ) -> anyhow::Result<usize> {
+        let _guard = vp_guard();
+        let mut vp = self.load();
+        let ids: Vec<String> = vp.people.keys().cloned().collect();
+        let mut rebuilt = 0usize;
+        for id in ids {
+            let embs: Vec<Vec<f32>> = self
+                .sample_paths_existing(&id)
+                .iter()
+                .filter_map(|p| embed_wav_sample(p, e))
+                .collect();
+            let person = vp.people.get_mut(&id).expect("刚枚举的 key");
+            person.session_centroids.clear();
+            if embs.is_empty() {
+                person.centroids.clear();
+                continue;
+            }
+            let dim = embs[0].len();
+            let mut mean = vec![0f32; dim];
+            for v in &embs {
+                for (m, x) in mean.iter_mut().zip(v) {
+                    *m += x;
+                }
+            }
+            let mean = normalize(&mean).unwrap_or(mean);
+            let count = embs.len() as u64;
+            let sources: Vec<String> = if person.centroids.is_empty() {
+                vec!["mic".into()]
+            } else {
+                person.centroids.keys().cloned().collect()
+            };
+            person.centroids.clear();
+            let variants: Vec<PersonCentroid> = embs
+                .iter()
+                .take(SESSION_CENTROIDS_MAX)
+                .map(|v| PersonCentroid { vec: v.clone(), count: 1, seen: String::new() })
+                .collect();
+            for src in &sources {
+                person
+                    .centroids
+                    .insert(src.clone(), PersonCentroid { vec: mean.clone(), count, seen: String::new() });
+                person.session_centroids.insert(src.clone(), variants.clone());
+            }
+            rebuilt += 1;
+        }
+        vp.embedding_model = model_tag.to_string();
+        self.save(&vp)?;
+        Ok(rebuilt)
     }
 
     /// 删除某人的一份录音样本(按绝对路径指认,试听纠错用;样本不参与识别,删除
@@ -1330,6 +1403,39 @@ mod tests {
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!((s[0].loser.as_str(), s[0].winner.as_str()), ("P2", "P1"));
         assert!(s[0].similarity > 0.99, "取全组 max 应命中变体: {}", s[0].similarity);
+    }
+
+    #[test]
+    fn rebuild_for_model_reembeds_from_samples_and_tags_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(
+                &[
+                    snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S2", vec![0.0, 1.0], 5, &["system"], None, AUTO_ENROLL_MS),
+                ],
+                "t1",
+            )
+            .unwrap();
+        let (pa, pb) = (links["S1"].clone(), links["S2"].clone());
+        assert_eq!(store.load().embedding_model, "campplus", "旧库缺省标签");
+        // pa 有一份方波样本;pb 无样本。
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        store.append_sample(&pa, &square).unwrap();
+        // pb 的样本文件删掉(upsert 不写样本,本就无)。
+        let mut e = FlipEmbedder;
+        let n = store.rebuild_for_model("eres2netv2", &mut e).unwrap();
+        assert_eq!(n, 1, "只有 pa 有样本可重建");
+        let vp = store.load();
+        assert_eq!(vp.embedding_model, "eres2netv2");
+        let a = &vp.people[&pa];
+        // 方波经 FlipEmbedder → [0,1];主质心与变体都应是新空间向量。
+        assert!((normalize(&a.centroids["mic"].vec).unwrap()[1] - 1.0).abs() < 1e-4);
+        assert_eq!(a.session_centroids["mic"].len(), 1, "变体=各样本嵌入");
+        let b = &vp.people[&pb];
+        assert!(b.centroids.is_empty(), "无样本者清空质心(身份保留,等重新积累)");
+        assert!(b.session_centroids.is_empty());
     }
 
     #[test]

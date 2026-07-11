@@ -111,6 +111,21 @@ pub const ARTIFACTS: &[Artifact] = &[
         }],
     },
     Artifact {
+        id: "speaker-eres2netv2",
+        label: "声纹模型(ERes2NetV2)",
+        // 备选声纹嵌入模型(设置页可切换);与 CAM++ 嵌入空间不可混用,切换会触发
+        // 声纹库从录音样本重建。URL 里 "recongition" 同上游原始拼写。
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+        kind: ArtifactKind::File,
+        approx_mb: 68,
+        prune: &[],
+        files: &[FinalFile {
+            rel_path: "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+            bytes: 71_441_526,
+            sha256: "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239",
+        }],
+    },
+    Artifact {
         id: "asr",
         label: "语音识别（SenseVoice）",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
@@ -279,9 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_five_artifacts_with_whisper_and_paraformer() {
+    fn manifest_covers_six_artifacts_with_whisper_and_paraformer() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec!["vad", "speaker", "asr", "whisper", "paraformer"]);
+        assert_eq!(ids, vec!["vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer"]);
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
         assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
         assert_eq!(w.files.len(), 3);
@@ -323,5 +338,13 @@ mod tests {
         set_models_override(None);
         // 回落 dev 目录(debug 构建、src-tauri/models 存在),与历史一致
         assert_eq!(root(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
+    }
+}
+
+/// 声纹模型选型 → 模型文件名(settings.speaker_model 消费;未知值回退 CAM++)。
+pub fn speaker_model_file(model: &str) -> &'static str {
+    match model {
+        "eres2netv2" => "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+        _ => "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
     }
 }
