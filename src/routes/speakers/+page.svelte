@@ -1,7 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listPeople, type PersonSummary } from "$lib/people";
-  import { formatDate } from "$lib/notes";
+  import {
+    listPeople,
+    mergePerson,
+    deletePerson,
+    suggestPersonMerges,
+    type PersonSummary,
+    type PersonMergeSuggestion,
+  } from "$lib/people";
+  import { formatDate, formatDuration, speakerInk } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
   // 主从结构的落地页:人物索引在侧栏,本页只做概览引导——不再重复列一遍名单。
@@ -25,6 +32,84 @@
     const d = formatDate(p.last_seen);
     return d === "—" ? p.id : d.slice(5, 10);
   };
+
+  // ── 整理:①未命名者再辨认(声纹比对给合并建议);②清理无样本条目 ──
+  const plabel = (id: string, name: string) => name || `说话人 ${id.replace(/^P/, "")}`;
+  const noSample = $derived(people.filter((p) => p.sample_paths.length === 0));
+  /** 有可整理内容才出卡:无样本条目或存在待辨认(未命名)者。 */
+  const tidyAvailable = $derived(noSample.length > 0 || unnamed > 0);
+
+  let tidyOpen = $state(false);
+  let suggestions = $state<PersonMergeSuggestion[]>([]);
+  let sugLoading = $state(false);
+  /** 本次会话内被「忽略」的建议(不持久;下次打开整理重新给)。 */
+  let ignoredSugs = $state(new Set<string>());
+  let checked = $state<Record<string, boolean>>({});
+  let confirmCleanup = $state(false);
+  let cleaning = $state(false);
+  let tidyErr = $state("");
+
+  const sugKey = (s: PersonMergeSuggestion) => `${s.loser}>${s.winner}`;
+  const visibleSuggestions = $derived(suggestions.filter((s) => !ignoredSugs.has(sugKey(s))));
+  /** 出现在任一建议里的人:清理区默认不勾(有归属先合并,合并保数据,删除丢数据)。 */
+  const suggestedIds = $derived(new Set(suggestions.flatMap((s) => [s.loser, s.winner])));
+  const checkedIds = $derived(noSample.filter((p) => checked[p.id]).map((p) => p.id));
+
+  /** 重算建议 + 清理区默认勾选(未命名且无归属建议的无样本条目)。 */
+  async function recomputeTidy() {
+    sugLoading = true;
+    try {
+      suggestions = await suggestPersonMerges();
+    } catch (e) {
+      suggestions = [];
+      tidyErr = `声纹比对失败: ${e}`;
+    }
+    sugLoading = false;
+    const c: Record<string, boolean> = {};
+    const suggested = new Set(suggestions.flatMap((s) => [s.loser, s.winner]));
+    for (const p of noSample) c[p.id] = !p.name && !suggested.has(p.id);
+    checked = c;
+  }
+
+  async function toggleTidy() {
+    tidyOpen = !tidyOpen;
+    if (!tidyOpen) return;
+    tidyErr = "";
+    confirmCleanup = false;
+    await recomputeTidy();
+  }
+
+  /** 采纳建议:并入推荐归属。合并会改变库(质心/样本迁移),其余建议随之重算。 */
+  async function applySuggestion(s: PersonMergeSuggestion) {
+    tidyErr = "";
+    try {
+      await mergePerson(s.loser, s.winner);
+      recording.bumpPeople();
+      await refresh();
+      await recomputeTidy();
+    } catch (e) {
+      tidyErr = `${e}`; // 录制中后端拒绝等文案原样透出
+    }
+  }
+
+  async function doCleanup() {
+    confirmCleanup = false;
+    cleaning = true;
+    tidyErr = "";
+    let failed = 0;
+    for (const id of checkedIds) {
+      try {
+        await deletePerson(id);
+      } catch {
+        failed++;
+      }
+    }
+    cleaning = false;
+    if (failed > 0) tidyErr = `${failed} 项删除失败(录制中不能删除)`;
+    recording.bumpPeople();
+    await refresh();
+    await recomputeTidy();
+  }
 
   async function refresh() {
     try {
@@ -91,6 +176,93 @@
           </div>
         {/each}
       </div>
+    {/if}
+    {#if tidyAvailable}
+      <!-- 整理:再辨认(声纹比对给合并建议)+ 清理无样本条目。surface 卡,展开式 -->
+      <section class="tidy">
+        <div class="tidy-head">
+          <div>
+            <div class="tidy-title">整理</div>
+            <div class="tidy-desc">
+              {#if unnamed > 0}{unnamed} 个待辨认的说话人可尝试自动归属{/if}{#if unnamed > 0 && noSample.length > 0} · {/if}{#if noSample.length > 0}{noSample.length} 个条目没有录音样本{/if}
+            </div>
+          </div>
+          <button class="tidy-toggle" onclick={toggleTidy}>{tidyOpen ? "收起" : "开始整理"}</button>
+        </div>
+
+        {#if tidyOpen}
+          {#if tidyErr}<div class="banner tidy-banner">{tidyErr}</div>{/if}
+
+          <div class="tidy-sec">
+            <div class="tidy-sec-title">可归属建议</div>
+            {#if sugLoading}
+              <p class="hint">正在比对声纹…</p>
+            {:else if visibleSuggestions.length === 0}
+              <p class="hint">没有比对出可归属的说话人。声纹够相似才会出建议,拿不准的不猜。</p>
+            {:else}
+              {#each visibleSuggestions as s (sugKey(s))}
+                <div class="sug-row">
+                  <span class="dot" style="background: {speakerInk(s.loser, 'mic')}"></span>
+                  <a class="sug-name" href="/speakers/{s.loser}">{plabel(s.loser, s.loser_name)}</a>
+                  <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
+                  </svg>
+                  <span class="dot" style="background: {speakerInk(s.winner, 'mic')}"></span>
+                  <a class="sug-name" href="/speakers/{s.winner}">{plabel(s.winner, s.winner_name)}</a>
+                  <span class="sim" class:strong={s.similarity >= 0.74}>
+                    相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""}
+                  </span>
+                  <span class="sug-spacer"></span>
+                  <button
+                    class="mini accent"
+                    disabled={recording.isLive}
+                    title={recording.isLive ? "录制中不能合并" : "并入推荐归属(点名字可先试听核对)"}
+                    onclick={() => applySuggestion(s)}>合并</button
+                  >
+                  <button class="mini" onclick={() => (ignoredSugs = new Set([...ignoredSugs, sugKey(s)]))}>忽略</button>
+                </div>
+              {/each}
+              <p class="hint">点名字可进详情页试听核对;合并会保留双方声纹数据,认得更准。</p>
+            {/if}
+          </div>
+
+          <div class="tidy-sec">
+            <div class="tidy-sec-title">无样本条目</div>
+            {#if noSample.length === 0}
+              <p class="hint">每个条目都有录音样本。</p>
+            {:else}
+              {#each noSample as p (p.id)}
+                <label class="clean-row">
+                  <input type="checkbox" bind:checked={checked[p.id]} disabled={cleaning} />
+                  <span class="dot" style="background: {speakerInk(p.id, 'mic')}"></span>
+                  <a class="sug-name" href="/speakers/{p.id}">{plabel(p.id, p.name)}</a>
+                  <span class="row-meta">最近 {recent(p)} · 累计 {formatDuration(Math.floor(p.total_ms / 1000))}</span>
+                  {#if suggestedIds.has(p.id)}
+                    <span class="row-flag">有归属建议,先合并更好</span>
+                  {/if}
+                </label>
+              {/each}
+              <div class="clean-act">
+                {#if confirmCleanup}
+                  <span class="warn-text">删除后历史笔记中这些说话人恢复显示为编号,不可恢复。</span>
+                  <button class="mini danger" onclick={doCleanup}>确认清理 {checkedIds.length} 项</button>
+                  <button class="mini" onclick={() => (confirmCleanup = false)}>取消</button>
+                {:else}
+                  <button
+                    class="mini"
+                    disabled={checkedIds.length === 0 || cleaning || recording.isLive}
+                    title={recording.isLive ? "录制中不能删除" : ""}
+                    onclick={() => (confirmCleanup = true)}
+                  >
+                    {cleaning ? "正在清理…" : `清理选中 ${checkedIds.length} 项`}
+                  </button>
+                  <span class="hint-inline">没有原声可核对、也认不出是谁的条目,占着列表不如清掉。</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </section>
     {/if}
     <p class="pick-hint">
       从左侧列表选择一个人查看详情。
@@ -176,6 +348,163 @@
   .dup-link {
     color: var(--accent);
     font-size: 0.82rem;
+  }
+  /* 整理卡:surface 底、rounded-lg,头部一行(标题+摘要 | 展开钮),展开分两节 */
+  .tidy {
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+  }
+  .tidy-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .tidy-title {
+    font-weight: 500;
+    font-size: 0.92rem;
+    color: var(--ink);
+  }
+  .tidy-desc {
+    color: var(--ink-secondary);
+    font-size: 0.8rem;
+    margin-top: 0.15rem;
+  }
+  .tidy-toggle {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-md);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.35em 1em;
+    cursor: pointer;
+    flex: none;
+  }
+  .tidy-toggle:hover {
+    background: var(--surface-soft);
+  }
+  .tidy-banner {
+    margin: 0.6rem 0 0;
+  }
+  .tidy-sec {
+    margin-top: 0.8rem;
+  }
+  .tidy-sec-title {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    margin-bottom: 0.3rem;
+  }
+  .sug-row,
+  .clean-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.3rem 0.2rem;
+    font-size: 0.88rem;
+  }
+  .clean-row {
+    cursor: pointer;
+  }
+  .clean-row input[type="checkbox"] {
+    accent-color: var(--accent);
+    margin: 0;
+  }
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: var(--radius-full);
+    flex: none;
+  }
+  .sug-name {
+    color: var(--ink);
+    text-decoration: none;
+    max-width: 11rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sug-name:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .arrow {
+    color: var(--ink-faint);
+    flex: none;
+  }
+  .sim {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+  }
+  .sim.strong {
+    color: var(--accent);
+  }
+  .sug-spacer {
+    flex: 1;
+  }
+  .row-meta {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+  }
+  .row-flag {
+    color: var(--warning-ink);
+    font-size: 0.75rem;
+  }
+  .clean-act {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .warn-text {
+    color: var(--warning-ink);
+    font-size: 0.78rem;
+  }
+  .hint-inline {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+  }
+  /* mini 按钮族(与详情页同款):secondary 形态,accent 主推,danger 破坏 */
+  .mini {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    padding: 0.2em 0.7em;
+    cursor: pointer;
+  }
+  .mini:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .mini:disabled {
+    color: var(--ink-faint);
+    cursor: default;
+  }
+  .mini.accent {
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .mini.accent:hover:not(:disabled) {
+    background: var(--accent-tint);
+  }
+  .mini.accent:disabled {
+    border-color: var(--hairline-strong);
+    color: var(--ink-faint);
+  }
+  .mini.danger {
+    border-color: var(--danger);
+    color: var(--danger);
+    font-weight: 500;
+  }
+  .mini.danger:hover {
+    background: var(--danger);
+    color: var(--on-record);
   }
   .empty {
     background: var(--surface);
