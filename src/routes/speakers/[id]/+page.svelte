@@ -59,6 +59,7 @@
   $effect(() => {
     void personId;
     stopSample();
+    stopCtx();
     closeAllOps();
     editingId = null;
     dupRename = null;
@@ -218,6 +219,8 @@
       : { id: s.loser, name: s.loser_name };
 
   async function applyCtxSuggestion(s: PersonMergeSuggestion) {
+    stopCtx();
+    stopSample();
     try {
       await mergePerson(s.loser, s.winner);
       recording.bumpPeople();
@@ -231,6 +234,36 @@
       error = `${e}`;
     }
   }
+
+  // 提示卡内的对方试听:不听原声没法拍板该不该合。与本人样本试听单实例互斥。
+  let ctxAudio: HTMLAudioElement | null = null;
+  let ctxPlayingId = $state<string | null>(null);
+
+  function stopCtx() {
+    ctxAudio?.pause();
+    ctxAudio = null;
+    ctxPlayingId = null;
+  }
+
+  function toggleCtxSample(pid: string) {
+    if (ctxPlayingId === pid) {
+      stopCtx();
+      return;
+    }
+    stopSample();
+    stopCtx();
+    const path = people.find((o) => o.id === pid)?.sample_paths[0];
+    if (!path) return;
+    const a = new Audio(convertFileSrc(path));
+    a.onended = () => {
+      if (ctxPlayingId === pid) stopCtx();
+    };
+    ctxAudio = a;
+    ctxPlayingId = pid;
+    void a.play().catch(() => stopCtx());
+  }
+
+  $effect(() => stopCtx);
 
   // ── 录音样本试听(单实例:同一时刻只放一份;换页/离开即停) ──
   let sampleAudio: HTMLAudioElement | null = null;
@@ -249,6 +282,7 @@
       return;
     }
     stopSample(); // 换份样本:先停当前
+    stopCtx(); // 提示卡的对方试听同属单实例
     const path = person?.sample_paths[idx];
     if (!path) return;
     const id = person!.id;
@@ -367,6 +401,22 @@
               <a href="/speakers/{other.id}">「{other.name || `说话人 ${other.id.replace(/^P/, "")}`}」</a>
               是同一人(相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""})
             </span>
+            {#if (people.find((o) => o.id === other.id)?.sample_paths.length ?? 0) > 0}
+              <!-- 对方原声试听:不听没法拍板该不该合 -->
+              <button
+                class="listen-mini"
+                class:playing={ctxPlayingId === other.id}
+                title={ctxPlayingId === other.id ? "停止" : "试听对方原声"}
+                aria-label={ctxPlayingId === other.id ? "停止" : "试听对方原声"}
+                onclick={() => toggleCtxSample(other.id)}
+              >
+                {#if ctxPlayingId === other.id}
+                  <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" /></svg>
+                {:else}
+                  <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" /></svg>
+                {/if}
+              </button>
+            {/if}
             <button
               class="mini accent"
               disabled={recording.isLive}
@@ -381,6 +431,21 @@
             <span class="ctx-text">
               另有一位也叫「{person.name}」(最近出现 {formatDate(sameName.last_seen)}),可能是重复条目。
             </span>
+            {#if sameName.sample_paths.length > 0}
+              <button
+                class="listen-mini"
+                class:playing={ctxPlayingId === sameName.id}
+                title={ctxPlayingId === sameName.id ? "停止" : "试听对方原声"}
+                aria-label={ctxPlayingId === sameName.id ? "停止" : "试听对方原声"}
+                onclick={() => toggleCtxSample(sameName.id)}
+              >
+                {#if ctxPlayingId === sameName.id}
+                  <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" /></svg>
+                {:else}
+                  <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" /></svg>
+                {/if}
+              </button>
+            {/if}
             <a class="mini ctx-link" href="/speakers/{sameName.id}">查看对方</a>
           </div>
         {/if}
@@ -694,6 +759,29 @@
     text-decoration: none;
     display: inline-flex;
     align-items: center;
+  }
+  /* 行内试听小钮(与概览整理卡同形态):圆形图标钮,播放中 accent */
+  .listen-mini {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.35rem;
+    height: 1.35rem;
+    padding: 0;
+    flex: none;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .listen-mini:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .listen-mini.playing {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   h1 {
     margin: 0;
