@@ -338,6 +338,64 @@ impl VoiceprintStore {
     }
 }
 
+/// 整理·合并建议的相似度下限(余弦)。与种子命中(SEED_ASSIGN 0.68)/离线重聚类
+/// (AHC 0.68)同档:建议只是推荐,最终由用户试听拍板,取比在线自动合并(0.74)
+/// 宽一档的标定;≥0.74 的建议前端可另标"很可能"。
+pub const SUGGEST_MERGE_THRESHOLD: f32 = 0.68;
+
+/// 一条整理合并建议:把 loser 并入 winner。方向=未命名并入已命名;双方都未命名
+/// 时数据薄的并入厚的。similarity 取双方共有信道质心余弦的最大值,source 是取到
+/// 最大值的那个信道。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeSuggestion {
+    pub loser: String,
+    pub winner: String,
+    pub similarity: f32,
+    pub source: String,
+}
+
+/// 整理·再辨认:未命名人物("待辨认"对象)逐一与库中其他人比对声纹质心,
+/// ≥ SUGGEST_MERGE_THRESHOLD 者给出合并建议。纯函数不做 IO,只读不改库——
+/// 建议由用户确认后走既有 merge_person。每人只报最相似的一个归属;两个未命名
+/// 互相命中只产出一条(配对去重)。
+pub fn suggest_merges(vp: &Voiceprints) -> Vec<MergeSuggestion> {
+    let mut out: Vec<MergeSuggestion> = Vec::new();
+    let mut seen_pairs: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for (id, p) in vp.people.iter().filter(|(_, p)| p.name.is_empty()) {
+        // (对方 id, 相似度, 信道, 对方是否已命名)
+        let mut best: Option<(&String, f32, &String, bool)> = None;
+        for (oid, o) in vp.people.iter().filter(|(oid, _)| *oid != id) {
+            for (src, c) in &p.centroids {
+                let Some(oc) = o.centroids.get(src) else { continue };
+                let (Some(a), Some(b)) = (normalize(&c.vec), normalize(&oc.vec)) else { continue };
+                let sim: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                if best.map_or(true, |(_, s, _, _)| sim > s) {
+                    best = Some((oid, sim, src, !o.name.is_empty()));
+                }
+            }
+        }
+        let Some((oid, sim, src, other_named)) = best else { continue };
+        if sim < SUGGEST_MERGE_THRESHOLD {
+            continue;
+        }
+        let (loser, winner) = if other_named {
+            (id.clone(), oid.clone())
+        } else if p.total_ms > vp.people[oid].total_ms {
+            (oid.clone(), id.clone())
+        } else {
+            (id.clone(), oid.clone())
+        };
+        let pair =
+            (loser.clone().min(winner.clone()), loser.clone().max(winner.clone()));
+        if !seen_pairs.insert(pair) {
+            continue;
+        }
+        out.push(MergeSuggestion { loser, winner, similarity: sim, source: src.clone() });
+    }
+    out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+    out
+}
+
 /// 同 source 质心按 count 加权平均后归一(与 diar/registry.rs detect_merges 同公式,
 /// 两处独立维护是因为一个是会话内簇合并、一个是跨会话库合并,数据结构不同不便复用);
 /// 异 source 直插(不同信道的声纹本就该独立保留,见 spec"数据模型"节)。
@@ -691,6 +749,71 @@ mod tests {
         // 删除连带删全部样本。
         store.delete(&p2).unwrap();
         assert!(store.sample_paths_existing(&p2).is_empty(), "删除人物连带删全部样本");
+    }
+
+    /// suggest_merges 用的库构造:直接拼 Voiceprints(不经 upsert,好精确控制质心)。
+    fn vp_with(people: &[(&str, &str, &str, Vec<f32>, u64)]) -> Voiceprints {
+        // (id, name, source, centroid, total_ms)
+        let mut vp = Voiceprints::default();
+        for (id, name, src, vec, ms) in people {
+            let mut centroids = BTreeMap::new();
+            centroids.insert(src.to_string(), PersonCentroid { vec: vec.clone(), count: 5 });
+            vp.people.insert(
+                id.to_string(),
+                Person { name: name.to_string(), centroids, total_ms: *ms, last_seen: "t".into() },
+            );
+        }
+        vp
+    }
+
+    #[test]
+    fn suggest_merges_attributes_unnamed_to_similar_named_person() {
+        // P1 张三 与 P2(未命名)同方向;P3(未命名)方向相反,不该有归属。
+        let vp = vp_with(&[
+            ("P1", "张三", "mic", vec![1.0, 0.0, 0.02], 60_000),
+            ("P2", "", "mic", vec![0.99, 0.0, 0.0], 12_000),
+            ("P3", "", "mic", vec![0.0, 1.0, 0.0], 12_000),
+        ]);
+        let s = suggest_merges(&vp);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].loser, "P2");
+        assert_eq!(s[0].winner, "P1", "未命名并入已命名");
+        assert!(s[0].similarity >= SUGGEST_MERGE_THRESHOLD);
+        assert_eq!(s[0].source, "mic");
+    }
+
+    #[test]
+    fn suggest_merges_pairs_unnamed_thin_into_thick_and_dedups() {
+        let vp = vp_with(&[
+            ("P1", "", "mic", vec![1.0, 0.0], 30_000),
+            ("P2", "", "mic", vec![0.98, 0.05], 10_000),
+        ]);
+        let s = suggest_merges(&vp);
+        assert_eq!(s.len(), 1, "双未命名互相命中只产出一条: {s:?}");
+        assert_eq!(s[0].loser, "P2", "薄并入厚");
+        assert_eq!(s[0].winner, "P1");
+    }
+
+    #[test]
+    fn suggest_merges_ignores_below_threshold_disjoint_sources_and_named_candidates() {
+        // 相似度不够:两方向余弦 ≈ 0.5 < 0.68。
+        let low = vp_with(&[
+            ("P1", "张三", "mic", vec![1.0, 0.0], 60_000),
+            ("P2", "", "mic", vec![0.5, 0.87], 12_000),
+        ]);
+        assert!(suggest_merges(&low).is_empty());
+        // 无共有信道:mic vs system 不可比。
+        let disjoint = vp_with(&[
+            ("P1", "张三", "mic", vec![1.0, 0.0], 60_000),
+            ("P2", "", "system", vec![1.0, 0.0], 12_000),
+        ]);
+        assert!(suggest_merges(&disjoint).is_empty());
+        // 已命名的人不是"待辨认"对象:两个同声纹的已命名人不产建议(重名有另一套流程)。
+        let named = vp_with(&[
+            ("P1", "张三", "mic", vec![1.0, 0.0], 60_000),
+            ("P2", "李四", "mic", vec![1.0, 0.0], 30_000),
+        ]);
+        assert!(suggest_merges(&named).is_empty());
     }
 
     #[test]

@@ -28,3 +28,18 @@ export const deletePerson = (id: string) => invoke<void>("delete_person", { id }
 /** 删除一份录音样本(试听纠错;样本不参与识别)。path 须取自该人的 sample_paths。 */
 export const deletePersonSample = (id: string, path: string) =>
   invoke<void>("delete_person_sample", { id, path });
+
+/** 整理·合并建议:把 loser 并入 winner 的推荐。similarity=共有信道质心余弦最大值,
+    ≥0.74 可视为"很可能";name 空串=未命名(展示按「说话人 N」兜底)。 */
+export type PersonMergeSuggestion = {
+  loser: string;
+  loser_name: string;
+  winner: string;
+  winner_name: string;
+  similarity: number;
+  source: string;
+};
+/** 整理·再辨认:未命名人物与库中其他人比对声纹,可归属者给出合并建议(纯推荐,
+    不落修改;确认合并走 mergePerson)。 */
+export const suggestPersonMerges = () =>
+  invoke<PersonMergeSuggestion[]>("suggest_person_merges");

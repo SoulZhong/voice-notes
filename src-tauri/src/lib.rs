@@ -1684,6 +1684,24 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     Ok(people)
 }
 
+/// 整理·再辨认：未命名人物与库中其他人比对声纹质心，可归属者给出合并建议。
+/// 纯推荐不落任何修改——确认合并由前端走既有 merge_person（含录制中拒绝等守卫）。
+#[tauri::command]
+fn suggest_person_merges(app: AppHandle) -> Result<Vec<ipc::PersonMergeSuggestion>, String> {
+    let vp = open_voiceprint_store(&app)?.load();
+    Ok(store::suggest_merges(&vp)
+        .into_iter()
+        .map(|s| ipc::PersonMergeSuggestion {
+            loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+            winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+            loser: s.loser,
+            winner: s.winner,
+            similarity: s.similarity,
+            source: s.source,
+        })
+        .collect())
+}
+
 /// 删除声纹库人物的一份录音样本（详情页试听区,录坏/混音的样本可单独删）。
 /// 样本不参与识别（认人靠质心），删除不影响准确率;路径归属校验在 store 层。
 #[tauri::command]
@@ -2631,6 +2649,7 @@ pub fn run() {
             merge_person,
             delete_person,
             delete_person_sample,
+            suggest_person_merges,
             mcp_agents_status,
             mcp_register,
             mcp_unregister,

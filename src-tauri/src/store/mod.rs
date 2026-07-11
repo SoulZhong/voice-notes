@@ -12,6 +12,7 @@ pub use notes::NoteStore;
 pub use refined::{load_refined, write_refined_atomic, RefineStages, RefinedDoc, RefinedParagraph};
 pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // 精修稿说话人编辑三件套(lib.rs 命令层消费)。
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
+pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
 pub use voiceprints::AUTO_ENROLL_MS; // lib.rs 实时入库回调(registry enroller)用同一门槛。
 // Person/PersonCentroid/Voiceprints/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型
 // 生成/测试引用),但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。
