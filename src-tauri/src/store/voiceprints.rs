@@ -32,21 +32,34 @@ const MAX_REDIRECT_HOPS: u32 = 8;
 
 /// 单一信道(mic/system)的声纹质心。count 是加权样本数——merge/upsert 按
 /// (旧质心, count) 与 (新质心, count) 做加权平均,而非简单替换,防止新会话的
-/// 短样本把稳定质心带偏。
+/// 短样本把稳定质心带偏。seen 是产生时间(会话质心用,主质心历史数据为空串)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersonCentroid {
     pub vec: Vec<f32>,
     #[serde(default)]
     pub count: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seen: String,
 }
 
+/// 每人每信道保留的会话质心("状态变体")上限:环形,满了挤最旧。
+pub const SESSION_CENTROIDS_MAX: usize = 5;
+/// 一场净增量够此时长才记会话质心:太短的出场代表不了一种"状态"。
+pub const SESSION_CENTROID_MIN_MS: u64 = 10_000;
+
 /// 库中一个人。name 空串 = 未命名,展示端兜底"未命名 · 最近出现 …"。
+/// centroids 是每信道**主质心**(全部历史加权平均,识别的稳定锚);
+/// session_centroids 是每信道最近若干场的**会话质心**——同一个人不同状态
+/// (戴耳机/外放/不同增益时代)各有代表向量,匹配取 max 解决"平均把状态搅在
+/// 一起"的跨场认不回问题。旧 voiceprints.json 无此字段,serde default 兼容。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Person {
     #[serde(default)]
     pub name: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub centroids: BTreeMap<String, PersonCentroid>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_centroids: BTreeMap<String, Vec<PersonCentroid>>,
     #[serde(default)]
     pub total_ms: u64,
     #[serde(default)]
@@ -179,12 +192,34 @@ impl VoiceprintStore {
         {
             let winner_person =
                 vp.people.get_mut(winner).ok_or_else(|| anyhow::anyhow!("未知人物: {winner}"))?;
-            for (source, lc) in loser_person.centroids {
-                merge_centroid(winner_person, &source, lc);
+            for (source, lc) in &loser_person.centroids {
+                merge_centroid(winner_person, source, lc.clone());
+                // loser 主质心降级为 winner 的会话变体:合并常见于"同一人不同状态被
+                // 拆开",被并一方的状态画像正是要保留可匹配的信息。
+                let mut v = lc.clone();
+                if v.seen.is_empty() {
+                    v.seen = loser_person.last_seen.clone();
+                }
+                winner_person.session_centroids.entry(source.clone()).or_default().push(v);
+            }
+            for (source, list) in &loser_person.session_centroids {
+                winner_person
+                    .session_centroids
+                    .entry(source.clone())
+                    .or_default()
+                    .extend(list.iter().cloned());
+            }
+            // 变体归序截容:seen 升序(空串=最老的历史数据沉底优先淘汰),超限挤最旧。
+            for list in winner_person.session_centroids.values_mut() {
+                list.sort_by(|a, b| a.seen.cmp(&b.seen));
+                let overflow = list.len().saturating_sub(SESSION_CENTROIDS_MAX);
+                if overflow > 0 {
+                    list.drain(0..overflow);
+                }
             }
             winner_person.total_ms += loser_person.total_ms;
             if winner_person.name.is_empty() && !loser_person.name.is_empty() {
-                winner_person.name = loser_person.name;
+                winner_person.name = loser_person.name.clone();
             }
         }
         for target in vp.redirects.values_mut() {
@@ -370,25 +405,84 @@ impl VoiceprintStore {
                     continue;
                 }
                 let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
-                let incoming = PersonCentroid { vec: snap.centroid.clone(), count: snap.count.max(1) };
+                let incoming =
+                    PersonCentroid { vec: snap.centroid.clone(), count: snap.count.max(1), seen: String::new() };
                 merge_centroid(person, &source, incoming);
                 person.total_ms += snap.total_ms;
                 person.last_seen = now.to_string();
+                push_session_centroid(person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
             } else if snap.total_ms >= AUTO_ENROLL_MS && !snap.centroid.is_empty() {
                 let id = format!("P{}", vp.next_person);
                 vp.next_person += 1;
                 let mut centroids = BTreeMap::new();
-                centroids.insert(source, PersonCentroid { vec: snap.centroid.clone(), count: snap.count.max(1) });
-                vp.people.insert(
-                    id.clone(),
-                    Person { name: String::new(), centroids, total_ms: snap.total_ms, last_seen: now.to_string() },
+                centroids.insert(
+                    source.clone(),
+                    PersonCentroid { vec: snap.centroid.clone(), count: snap.count.max(1), seen: String::new() },
                 );
+                let mut person = Person {
+                    name: String::new(),
+                    centroids,
+                    session_centroids: BTreeMap::new(),
+                    total_ms: snap.total_ms,
+                    last_seen: now.to_string(),
+                };
+                push_session_centroid(&mut person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
+                vp.people.insert(id.clone(), person);
                 new_links.insert(snap.id.clone(), id);
             }
         }
         self.save(&vp)?;
         Ok(new_links)
     }
+}
+
+/// 会话质心入环:本场净增量够料(≥SESSION_CENTROID_MIN_MS)才记为一个"状态代表";
+/// Vec 序即时间序,超限挤最旧。
+fn push_session_centroid(
+    person: &mut Person,
+    source: &str,
+    vec: &[f32],
+    count: u64,
+    total_ms: u64,
+    now: &str,
+) {
+    if total_ms < SESSION_CENTROID_MIN_MS || vec.is_empty() {
+        return;
+    }
+    let list = person.session_centroids.entry(source.to_string()).or_default();
+    list.push(PersonCentroid { vec: vec.to_vec(), count, seen: now.to_string() });
+    if list.len() > SESSION_CENTROIDS_MAX {
+        list.remove(0);
+    }
+}
+
+/// 声纹库 → 开录/精修种子(纯函数):每人每信道的主质心 + 各会话质心各成一个种子
+/// 簇——同一个人不同状态各有代表向量,任一被命中即认出此人(匹配取 max 的簇级
+/// 实现,registry 本就支持同 person 多种子簇)。已被合并/悬空引用剔除。
+pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {
+    let mut seeds = Vec::new();
+    for (id, person) in &vp.people {
+        if VoiceprintStore::resolve(vp, id) != Some(id.as_str()) {
+            continue;
+        }
+        for c in person.centroids.values() {
+            seeds.push(crate::diar::registry::SeedCluster {
+                person: id.clone(),
+                name: person.name.clone(),
+                centroid: c.vec.clone(),
+                count: c.count,
+            });
+        }
+        for c in person.session_centroids.values().flatten() {
+            seeds.push(crate::diar::registry::SeedCluster {
+                person: id.clone(),
+                name: person.name.clone(),
+                centroid: c.vec.clone(),
+                count: c.count,
+            });
+        }
+    }
+    seeds
 }
 
 /// 样本保留集选择:给定各样本的嵌入(None=取不到),容量 k,返回保留下标(升序)。
@@ -522,27 +616,42 @@ pub struct MergeSuggestion {
 pub fn suggest_merges(vp: &Voiceprints) -> Vec<MergeSuggestion> {
     let ids: Vec<&String> = vp.people.keys().collect();
     let n = ids.len();
-    let units: Vec<BTreeMap<&String, Vec<f32>>> = ids
+    // 每人每信道的向量组:主质心 + 各会话质心(状态变体),配对相似度取全组 max。
+    let units: Vec<BTreeMap<&String, Vec<Vec<f32>>>> = ids
         .iter()
         .map(|id| {
-            vp.people[*id]
-                .centroids
-                .iter()
-                .filter_map(|(src, c)| normalize(&c.vec).map(|u| (src, u)))
-                .collect()
+            let p = &vp.people[*id];
+            let mut m: BTreeMap<&String, Vec<Vec<f32>>> = BTreeMap::new();
+            for (src, c) in &p.centroids {
+                if let Some(u) = normalize(&c.vec) {
+                    m.entry(src).or_default().push(u);
+                }
+            }
+            for (src, list) in &p.session_centroids {
+                for c in list {
+                    if let Some(u) = normalize(&c.vec) {
+                        m.entry(src).or_default().push(u);
+                    }
+                }
+            }
+            m
         })
         .collect();
 
-    // 全配对相似度矩阵:共有信道余弦取最大,记录取到最大值的信道。
+    // 全配对相似度矩阵:共有信道内全组交叉取最大,记录取到最大值的信道。
     let mut sim: Vec<Vec<Option<(f32, String)>>> = vec![vec![None; n]; n];
     for i in 0..n {
         for j in (i + 1)..n {
             let mut best: Option<(f32, String)> = None;
-            for (src, a) in &units[i] {
-                let Some(b) = units[j].get(*src) else { continue };
-                let s: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
-                    best = Some((s, src.to_string()));
+            for (src, avs) in &units[i] {
+                let Some(bvs) = units[j].get(*src) else { continue };
+                for a in avs {
+                    for b in bvs {
+                        let s: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                        if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                            best = Some((s, src.to_string()));
+                        }
+                    }
                 }
             }
             sim[i][j] = best.clone();
@@ -981,10 +1090,10 @@ mod tests {
         let mut vp = Voiceprints::default();
         for (id, name, src, vec, ms) in people {
             let mut centroids = BTreeMap::new();
-            centroids.insert(src.to_string(), PersonCentroid { vec: vec.clone(), count: 5 });
+            centroids.insert(src.to_string(), PersonCentroid { vec: vec.clone(), count: 5, seen: String::new() });
             vp.people.insert(
                 id.to_string(),
-                Person { name: name.to_string(), centroids, total_ms: *ms, last_seen: "t".into() },
+                Person { name: name.to_string(), centroids, total_ms: *ms, last_seen: "t".into(), ..Default::default() },
             );
         }
         vp
@@ -1064,10 +1173,10 @@ mod tests {
         let mut vp = Voiceprints::default();
         for (id, name, vec, ms) in &ppl {
             let mut centroids = BTreeMap::new();
-            centroids.insert("mic".to_string(), PersonCentroid { vec: vec.clone(), count: 5 });
+            centroids.insert("mic".to_string(), PersonCentroid { vec: vec.clone(), count: 5, seen: String::new() });
             vp.people.insert(
                 id.clone(),
-                Person { name: name.clone(), centroids, total_ms: *ms, last_seen: "t".into() },
+                Person { name: name.clone(), centroids, total_ms: *ms, last_seen: "t".into(), ..Default::default() },
             );
         }
         let s = suggest_merges(&vp);
@@ -1089,12 +1198,12 @@ mod tests {
         };
         let mut e1b = vec![0.0; dim];
         e1b[0] = 1.0;
-        vp2.people.insert("P1".into(), Person { name: "张三".into(), centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: e1b, count: 5 })]), total_ms: 60_000, last_seen: "t".into() });
+        vp2.people.insert("P1".into(), Person { name: "张三".into(), centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: e1b, count: 5, seen: String::new() })]), total_ms: 60_000, last_seen: "t".into(), ..Default::default() });
         for k in 0..11 {
             let name = if k == 0 { String::new() } else { format!("路人{k}") };
             vp2.people.insert(
                 format!("P{}", k + 2),
-                Person { name, centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: mk(k as f32 * 0.5), count: 5 })]), total_ms: 30_000, last_seen: "t".into() },
+                Person { name, centroids: BTreeMap::from([("mic".to_string(), PersonCentroid { vec: mk(k as f32 * 0.5), count: 5, seen: String::new() })]), total_ms: 30_000, last_seen: "t".into(), ..Default::default() },
             );
         }
         let s2 = suggest_merges(&vp2);
@@ -1120,6 +1229,107 @@ mod tests {
         let mut silent = vec![1e-5f32; 1000];
         normalize_loudness(&mut silent);
         assert!((silent[0] - 1e-5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn upsert_records_session_centroids_with_gate_and_ring_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .unwrap();
+        let pid = links["S1"].clone();
+        assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "入库场即第一份变体");
+
+        // 净增量 <10s 的场不记变体;≥10s 的记,环形上限 5(挤最旧)。
+        store.upsert_from_session(&[snap("Sx", vec![0.9, 0.1], 2, &["mic"], Some(&pid), 5_000)], "t-short").unwrap();
+        assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "短场不记");
+        for i in 0..6 {
+            store
+                .upsert_from_session(&[snap("Sx", vec![1.0, i as f32 * 0.1], 3, &["mic"], Some(&pid), 12_000)], &format!("t{}", i + 1))
+                .unwrap();
+        }
+        let list = &store.load().people[&pid].session_centroids["mic"];
+        assert_eq!(list.len(), SESSION_CENTROIDS_MAX);
+        assert_eq!(list[0].seen, "t2", "最旧的(t0/t1)被挤出");
+        assert_eq!(list.last().unwrap().seen, "t6");
+    }
+
+    #[test]
+    fn merge_demotes_loser_main_centroid_to_winner_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(
+                &[
+                    snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                ],
+                "t1",
+            )
+            .unwrap();
+        let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
+        store.merge(&loser, &winner).unwrap();
+        let vp = store.load();
+        let variants = &vp.people[&winner].session_centroids["mic"];
+        // winner 自己的入库变体 + loser 的入库变体 + loser 主质心降级 = 3
+        assert_eq!(variants.len(), 3, "{variants:?}");
+        assert!(
+            variants.iter().any(|v| { let u = normalize(&v.vec).unwrap(); u[0] > 0.99 }),
+            "loser 的状态向量([1,0])必须以变体形式保留"
+        );
+    }
+
+    #[test]
+    fn seed_clusters_include_session_variants_and_skip_dangling() {
+        let mut vp = Voiceprints::default();
+        let pc = |x: f32, y: f32| PersonCentroid { vec: vec![x, y], count: 5, seen: "t".into() };
+        vp.people.insert(
+            "P1".into(),
+            Person {
+                name: "张三".into(),
+                centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
+                session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(0.0, 1.0), pc(0.7, 0.7)])]),
+                total_ms: 60_000,
+                last_seen: "t".into(),
+            },
+        );
+        vp.redirects.insert("P2".into(), "P1".into()); // 悬空/重定向不产种子
+        let seeds = seed_clusters(&vp);
+        assert_eq!(seeds.len(), 3, "主质心 1 + 变体 2");
+        assert!(seeds.iter().all(|s| s.person == "P1" && s.name == "张三"));
+    }
+
+    #[test]
+    fn suggest_merges_matches_via_session_variant_when_main_drifted() {
+        // P1 张三主质心已被平均"搅偏"([0,1]),但留有一份 [1,0] 状态变体;
+        // 未命名 P2 主质心 [1,0] → 全组 max 命中变体,裸分 1.0 走绝对档。
+        let mut vp = Voiceprints::default();
+        let pc = |x: f32, y: f32| PersonCentroid { vec: vec![x, y], count: 5, seen: "t".into() };
+        vp.people.insert(
+            "P1".into(),
+            Person {
+                name: "张三".into(),
+                centroids: BTreeMap::from([("mic".to_string(), pc(0.0, 1.0))]),
+                session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(1.0, 0.0)])]),
+                total_ms: 60_000,
+                last_seen: "t".into(),
+            },
+        );
+        vp.people.insert(
+            "P2".into(),
+            Person {
+                name: String::new(),
+                centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
+                total_ms: 12_000,
+                last_seen: "t".into(),
+                ..Default::default()
+            },
+        );
+        let s = suggest_merges(&vp);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!((s[0].loser.as_str(), s[0].winner.as_str()), ("P2", "P1"));
+        assert!(s[0].similarity > 0.99, "取全组 max 应命中变体: {}", s[0].similarity);
     }
 
     #[test]

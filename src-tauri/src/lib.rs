@@ -182,24 +182,8 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
         return Vec::new();
     };
     let vp = store::VoiceprintStore::new(root).load();
-    let mut seeds = Vec::new();
-    for (id, person) in &vp.people {
-        // 防御性校验：正常情况下 people 里的 key 都是当前有效引用（merge 已把 loser
-        // 从 people 移除），这里用 resolve 兜底，防止任何手工损坏数据把一个实际已被
-        // 重定向掉的 id 当种子注入。
-        if store::VoiceprintStore::resolve(&vp, id) != Some(id.as_str()) {
-            continue;
-        }
-        for centroid in person.centroids.values() {
-            seeds.push(crate::diar::registry::SeedCluster {
-                person: id.clone(),
-                name: person.name.clone(),
-                centroid: centroid.vec.clone(),
-                count: centroid.count,
-            });
-        }
-    }
-    seeds
+    // 种子构建下沉 store::seed_clusters(主质心 + 会话状态变体,同人多种子取 max 命中)。
+    store::seed_clusters(&vp)
 }
 
 /// 会话未正常存续时的笔记收尾：有内容则 finalize 保全；无内容且是本会话新建的才删空目录；
