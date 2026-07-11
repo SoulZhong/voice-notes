@@ -23,11 +23,15 @@
     deleteSegment,
     setSegmentSpeaker,
     noteAudioInfo,
+    renameRefinedSpeaker,
+    assignRefinedPerson,
+    assignNoteSpeakerPerson,
     type Note,
     type SegmentRecord,
     type TrackInfo,
     type RefinedDoc,
   } from "$lib/notes";
+  import { listPeople, type PersonSummary } from "$lib/people";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
 
@@ -47,6 +51,8 @@
   let refining = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
+  // 会议搭子人物列表:精修稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
+  let people = $state<PersonSummary[]>([]);
 
   const id = $derived($page.params.id as string);
 
@@ -72,11 +78,12 @@
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
   /** 精修稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
-      徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。 */
+      徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。
+      person_id 一并带上:关联库人物的说话人跨笔记同色、无名时按全局编号兜底。 */
   const refinedSpeakers = $derived.by(() => {
-    const m: Record<string, { name: string; sources: string[] }> = {};
+    const m: Record<string, { name: string; sources: string[]; person_id?: string | null }> = {};
     for (const p of refined?.paragraphs ?? []) {
-      if (!m[p.speaker]) m[p.speaker] = { name: p.name ?? "", sources: ["mic"] };
+      if (!m[p.speaker]) m[p.speaker] = { name: p.name ?? "", sources: ["mic"], person_id: p.person_id ?? null };
     }
     return m;
   });
@@ -103,9 +110,10 @@
   }
 
   async function refresh() {
-    // 并行发起，note 失败才是真正的加载失败；refined 是增值层，取不到静默按无精修处理。
+    // 并行发起，note 失败才是真正的加载失败；refined/people 是增值层，取不到静默降级。
     const notePromise = getNote(id);
     const refinedPromise = getRefined(id).catch(() => null);
+    const peoplePromise = listPeople().catch(() => []);
     try {
       note = await notePromise;
       error = "";
@@ -113,6 +121,7 @@
       error = `加载失败: ${e}`;
     }
     refined = await refinedPromise;
+    people = await peoplePromise;
   }
 
   // 轨道获取独立于 refresh:canEdit 必须在 await 之前同步读到才会成为 effect 依赖
@@ -163,6 +172,7 @@
     refined = null;
     refining = false;
     refineErr = "";
+    confirmRefine = false;
     viewMode = "refined";
   });
 
@@ -407,7 +417,8 @@
   async function doExport(format: "md" | "txt") {
     exportMsg = "";
     try {
-      const path = await exportNote(id, format);
+      // 所见即所得:看着精修稿点导出就导精修稿,原始稿视图导原始逐字稿。
+      const path = await exportNote(id, format, effectiveView === "refined");
       exportMsg = `已导出：${path}`;
       await revealItemInDir(path);
     } catch (e) {
@@ -415,7 +426,18 @@
     }
   }
 
+  /** 重新精修会整写 refined.json:未关联搭子的说话人改名会被冲掉,这种情况下二段确认。 */
+  const refineWouldLoseNames = $derived(
+    !!refined?.paragraphs.some((p) => p.name && !p.person_id),
+  );
+  let confirmRefine = $state(false);
+
   async function rerunRefine() {
+    if (refineWouldLoseNames && !confirmRefine) {
+      confirmRefine = true;
+      return;
+    }
+    confirmRefine = false;
     refineErr = "";
     refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次精修
     try {
@@ -521,15 +543,31 @@
       </div>
 
       {#if effectiveView === "refined"}
-        <!-- 精修稿视图:只展示重聚类终稿的说话人(通常 2-3 人),不摊开在线 S* 临时簇。
-             R 标签不存在于 speakers.json,不可在此改名(切原始逐字稿或声纹库改)。 -->
-        <SpeakerChips speakers={refinedSpeakers} noteId={id} editable={false} />
+        <!-- 精修稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
+             可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
+             精修中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
+        <SpeakerChips
+          speakers={refinedSpeakers}
+          noteId={id}
+          editable={!refining}
+          {people}
+          onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
+          onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
+          onRenamed={() => {
+            refresh();
+            recording.bumpNotes();
+          }}
+        />
       {:else}
+        <!-- 原始稿说话人条:改名仍是笔记内本地名;选人关联(写 speakers.json person_id)
+             与精修稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
         <SpeakerChips
           speakers={note.speakers}
           noteId={id}
           editable={true}
           counts={segCounts}
+          people={canEdit ? people : undefined}
+          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onRenamed={() => {
             refresh();
             recording.bumpNotes();
@@ -551,9 +589,16 @@
           原始逐字稿
         </button>
         <span class="spacer"></span>
-        <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
-          {refining ? "正在精修…" : "重新精修"}
-        </button>
+        {#if confirmRefine}
+          <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
+          <span class="refine-warn">未关联搭子的说话人改名将丢失</span>
+          <button class="link danger" onclick={rerunRefine}>确认重新精修</button>
+          <button class="link" onclick={() => (confirmRefine = false)}>取消</button>
+        {:else}
+          <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
+            {refining ? "正在精修…" : "重新精修"}
+          </button>
+        {/if}
       </div>
     </div>
 
@@ -572,7 +617,7 @@
           <div class="para">
             <span
               class="badge"
-              style="background: {speakerColor(p.speaker, 'mic', note.speakers)}; color: {speakerInk(p.speaker, 'mic', note.speakers)}"
+              style="background: {speakerColor(p.speaker, 'mic', refinedSpeakers)}; color: {speakerInk(p.speaker, 'mic', refinedSpeakers)}"
             >
               {speakerLabel(p.speaker, "mic", refinedSpeakers)}
             </span>
@@ -983,6 +1028,11 @@
   }
   .view-switch .spacer {
     flex: 1;
+  }
+  /* 重新精修二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
+  .refine-warn {
+    color: var(--warning-ink);
+    font-size: 0.8rem;
   }
   /* menu/popover（改说话人菜单）：surface-press 底、hairline 边、rounded-lg、shadow-popover
      （暗色下 canvas 比承载面更黑，浮层用 canvas 会成"洞"，故底走 surface-press）。 */

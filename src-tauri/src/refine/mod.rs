@@ -135,6 +135,7 @@ fn fallback_assign(inputs: &[recluster::SegInput]) -> Vec<recluster::Assignment>
             seq: i.seq,
             speaker: i.old_speaker.clone().unwrap_or_else(|| "R1".into()),
             name: None,
+            person: None,
         })
         .collect()
 }
@@ -152,13 +153,13 @@ pub(crate) fn build_paragraphs(
             continue;
         }
         let Some(a) = by_seq.get(&s.seq) else { continue };
+        let old_meta = s.speaker.as_ref().and_then(|old| speakers.get(old));
         let name = a.name.clone().or_else(|| {
-            s.speaker
-                .as_ref()
-                .and_then(|old| speakers.get(old))
-                .filter(|m| !m.name.is_empty())
-                .map(|m| m.name.clone())
+            old_meta.filter(|m| !m.name.is_empty()).map(|m| m.name.clone())
         });
+        // 人物关联:重聚类种子命中优先;降级路径(沿用旧 S 标签)继承该说话人在
+        // speakers.json 里已有的关联——与 name 同一套兜底逻辑。
+        let person_id = a.person.clone().or_else(|| old_meta.and_then(|m| m.person_id.clone()));
         let merge = out.last().map_or(false, |p: &RefinedParagraph| {
             p.speaker == a.speaker && s.end_ms.saturating_sub(p.start_ms) <= MAX_PARA_MS
         });
@@ -171,6 +172,7 @@ pub(crate) fn build_paragraphs(
             out.push(RefinedParagraph {
                 speaker: a.speaker.clone(),
                 name,
+                person_id,
                 start_ms: s.start_ms,
                 end_ms: s.end_ms,
                 text: s.text.clone(),
@@ -293,7 +295,7 @@ mod tests {
                 sources: vec!["mic".into()],
                 centroid: None,
                 count: 1,
-                person_id: None,
+                person_id: Some("P2".into()),
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
@@ -301,6 +303,7 @@ mod tests {
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert_eq!(doc.paragraphs[0].name.as_deref(), Some("老板"), "旧标签沿用用户改名");
+        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P2"), "降级路径继承既有人物关联");
     }
 
     #[test]
@@ -309,7 +312,7 @@ mod tests {
             .map(|i| seg(i, "mic", "内容。", i * 20_000, (i + 1) * 20_000, "S1"))
             .collect();
         let assign: Vec<_> = (0..5)
-            .map(|i| recluster::Assignment { seq: i, speaker: "R1".into(), name: None })
+            .map(|i| recluster::Assignment { seq: i, speaker: "R1".into(), name: None, person: None })
             .collect();
         let ps = build_paragraphs(&segs, &[], &assign, &BTreeMap::new());
         assert!(ps.len() >= 2, "100s 同人内容必须按 MAX_PARA_MS 切段");
