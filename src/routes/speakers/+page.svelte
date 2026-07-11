@@ -4,10 +4,10 @@
     listPeople,
     mergePerson,
     deletePerson,
-    suggestPersonMerges,
     type PersonSummary,
     type PersonMergeSuggestion,
   } from "$lib/people";
+  import { tidy, sugKey } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerInk } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
@@ -40,33 +40,22 @@
   const tidyAvailable = $derived(noSample.length > 0 || unnamed > 0);
 
   let tidyOpen = $state(false);
-  let suggestions = $state<PersonMergeSuggestion[]>([]);
-  let sugLoading = $state(false);
-  /** 本次会话内被「忽略」的建议(不持久;下次打开整理重新给)。 */
-  let ignoredSugs = $state(new Set<string>());
   let checked = $state<Record<string, boolean>>({});
   let confirmCleanup = $state(false);
   let cleaning = $state(false);
   let tidyErr = $state("");
 
-  const sugKey = (s: PersonMergeSuggestion) => `${s.loser}>${s.winner}`;
-  const visibleSuggestions = $derived(suggestions.filter((s) => !ignoredSugs.has(sugKey(s))));
+  // 建议与忽略集走共享 tidy store:侧栏徽标、详情页上下文提示与本卡三处同源。
+  const visibleSuggestions = $derived(tidy.visible);
   /** 出现在任一建议里的人:清理区默认不勾(有归属先合并,合并保数据,删除丢数据)。 */
-  const suggestedIds = $derived(new Set(suggestions.flatMap((s) => [s.loser, s.winner])));
+  const suggestedIds = $derived(new Set(tidy.suggestions.flatMap((s) => [s.loser, s.winner])));
   const checkedIds = $derived(noSample.filter((p) => checked[p.id]).map((p) => p.id));
 
   /** 重算建议 + 清理区默认勾选(未命名且无归属建议的无样本条目)。 */
   async function recomputeTidy() {
-    sugLoading = true;
-    try {
-      suggestions = await suggestPersonMerges();
-    } catch (e) {
-      suggestions = [];
-      tidyErr = `声纹比对失败: ${e}`;
-    }
-    sugLoading = false;
+    await tidy.refresh();
     const c: Record<string, boolean> = {};
-    const suggested = new Set(suggestions.flatMap((s) => [s.loser, s.winner]));
+    const suggested = new Set(tidy.suggestions.flatMap((s) => [s.loser, s.winner]));
     for (const p of noSample) c[p.id] = !p.name && !suggested.has(p.id);
     checked = c;
   }
@@ -195,7 +184,7 @@
 
           <div class="tidy-sec">
             <div class="tidy-sec-title">可归属建议</div>
-            {#if sugLoading}
+            {#if tidy.loading}
               <p class="hint">正在比对声纹…</p>
             {:else if visibleSuggestions.length === 0}
               <p class="hint">没有比对出可归属的说话人。声纹够相似才会出建议,拿不准的不猜。</p>
@@ -219,7 +208,7 @@
                     title={recording.isLive ? "录制中不能合并" : "并入推荐归属(点名字可先试听核对)"}
                     onclick={() => applySuggestion(s)}>合并</button
                   >
-                  <button class="mini" onclick={() => (ignoredSugs = new Set([...ignoredSugs, sugKey(s)]))}>忽略</button>
+                  <button class="mini" onclick={() => tidy.ignore(s)}>忽略</button>
                 </div>
               {/each}
               <p class="hint">点名字可进详情页试听核对;合并会保留双方声纹数据,认得更准。</p>

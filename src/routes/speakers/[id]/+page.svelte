@@ -10,7 +10,9 @@
     deletePerson,
     deletePersonSample,
     type PersonSummary,
+    type PersonMergeSuggestion,
   } from "$lib/people";
+  import { tidy, sugKey } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
@@ -203,6 +205,33 @@
     }
   }
 
+  // ── 上下文整理提示(建议跟人走):当前这个人涉及归属建议/同名重复时,详情页
+  //    头部直接给出,不必回概览找「整理」。数据走共享 tidy store(侧栏徽标同源)。 ──
+  const related = $derived(tidy.involving(personId));
+  /** 同名的另一人(重名十有八九=同一人被拆重,给直达入口)。 */
+  const sameName = $derived(person?.name ? (others.find((o) => o.name === person!.name) ?? null) : null);
+
+  /** 建议行里"对方"的一侧(当前人可能是 loser 也可能是 winner)。 */
+  const ctxOther = (s: PersonMergeSuggestion) =>
+    s.loser === personId
+      ? { id: s.winner, name: s.winner_name }
+      : { id: s.loser, name: s.loser_name };
+
+  async function applyCtxSuggestion(s: PersonMergeSuggestion) {
+    try {
+      await mergePerson(s.loser, s.winner);
+      recording.bumpPeople();
+      await tidy.refresh();
+      if (s.loser === personId) {
+        goto(`/speakers/${s.winner}`); // 本人被并走:跳到归属后的人
+      } else {
+        await refresh();
+      }
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
   // ── 录音样本试听(单实例:同一时刻只放一份;换页/离开即停) ──
   let sampleAudio: HTMLAudioElement | null = null;
   /** 正在播放的样本下标;null = 未在播放。多样本时点另一份 = 停旧起新。 */
@@ -326,6 +355,37 @@
         {/if}
       </div>
     </header>
+
+    {#if related.length > 0 || sameName}
+      <!-- 上下文整理提示:这个人自己的归属建议/同名重复,就地处理不必回概览 -->
+      <div class="ctx-card">
+        {#each related as s (sugKey(s))}
+          {@const other = ctxOther(s)}
+          <div class="ctx-row">
+            <span class="ctx-text">
+              这个人可能与
+              <a href="/speakers/{other.id}">「{other.name || `说话人 ${other.id.replace(/^P/, "")}`}」</a>
+              是同一人(相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""})
+            </span>
+            <button
+              class="mini accent"
+              disabled={recording.isLive}
+              title={recording.isLive ? "录制中不能合并" : "合并成一个人(可先试听核对)"}
+              onclick={() => applyCtxSuggestion(s)}>合并</button
+            >
+            <button class="mini" onclick={() => tidy.ignore(s)}>忽略</button>
+          </div>
+        {/each}
+        {#if sameName}
+          <div class="ctx-row">
+            <span class="ctx-text">
+              另有一位也叫「{person.name}」(最近出现 {formatDate(sameName.last_seen)}),可能是重复条目。
+            </span>
+            <a class="mini ctx-link" href="/speakers/{sameName.id}">查看对方</a>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <!-- 试听:确认"这个声纹是谁"的主要手段,给成块的卡而非藏在角标里 -->
     <section class="card">
@@ -606,6 +666,34 @@
     font-size: 0.78rem;
     max-width: 24rem;
     line-height: 1.45;
+  }
+  /* 上下文整理提示:warning 横幅家族(与概览疑似重复卡同语义=待办),行内直达动作 */
+  .ctx-card {
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    padding: 0.55rem 0.8rem;
+    margin-bottom: 0.9rem;
+  }
+  .ctx-row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.15rem 0;
+    flex-wrap: wrap;
+  }
+  .ctx-text {
+    color: var(--warning-ink);
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .ctx-text a {
+    color: var(--accent);
+  }
+  .ctx-link {
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
   }
   h1 {
     margin: 0;
