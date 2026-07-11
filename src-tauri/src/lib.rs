@@ -1805,7 +1805,25 @@ fn merge_person(
     // 合并前记住 loser 是否有样本:有则 merge 内部迁移;没有则合并后从笔记音频
     // 现场截一份补给 winner(被并入的声音必须能在试听列表里听到)。
     let loser_had_samples = !store.sample_paths_existing(&loser).is_empty();
-    store.merge(&loser, &winner).map_err(|e| e.to_string())?;
+    // 双方样本合计超上限才需要按声纹多样性挑保留集,此时才付模型加载成本;
+    // 模型不可用只影响挑法(退回按序保留),不挡合并。
+    let overflow = store.sample_paths_existing(&loser).len()
+        + store.sample_paths_existing(&winner).len()
+        > store::MAX_SAMPLES;
+    let mut emb = if overflow {
+        match diar::SherpaEmbedder::new(&speaker_model_path()) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    store
+        .merge_with_embedder(&loser, &winner, emb.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder))
+        .map_err(|e| e.to_string())?;
     if !loser_had_samples {
         match notes_dir(&app) {
             Ok(root) => match cut_person_sample_from_notes(&root, &loser) {

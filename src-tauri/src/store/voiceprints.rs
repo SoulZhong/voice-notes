@@ -18,10 +18,11 @@ const SCHEMA_VERSION: u32 = 1;
 /// 停止时够料自动入库的门槛(累计发声毫秒)。待真实会议数据校准。
 pub const AUTO_ENROLL_MS: u64 = 10_000;
 
-/// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时 loser 的
-/// 样本迁入 winner 空槽;超出上限的不再写/迁移时删除,防止长期使用无界膨胀
-/// (每份 ≤15s 16k s16 ≈ 480KB)。
-pub const MAX_SAMPLES: usize = 5;
+/// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
+/// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
+/// "保留最不相似的组合"丢弃,防止长期使用无界膨胀(每份 ≤15s 16k s16 ≈ 480KB,
+/// 10 份 ≈ 4.8MB/人封顶)。
+pub const MAX_SAMPLES: usize = 10;
 
 /// resolve 跟随 redirects 链的步数上限。merge 已做链条压扁,正常情况下一跳到底;
 /// 这里是纯防御性上限,防止任何异常写入(例如手工改坏文件成环)导致死循环。
@@ -144,12 +145,29 @@ impl VoiceprintStore {
         self.save(&vp)
     }
 
+    /// 把 loser 合并进 winner(无嵌入器变体:样本超额时退回"winner 全留、loser 按序
+    /// 补空槽"的旧行为)。命令层能拿到声纹模型时请走 merge_with_embedder。
+    pub fn merge(&self, loser: &str, winner: &str) -> anyhow::Result<()> {
+        self.merge_with_embedder(loser, winner, None)
+    }
+
     /// 把 loser 合并进 winner:质心逐 source 并入(同 source 加权平均,异 source 直插),
     /// total_ms 相加,winner 无名而 loser 有名则继承 loser 名;loser 从 people 移除,
     /// redirects 记 loser->winner 且把既有指向 loser 的项一并改指 winner(压扁链条)。
-    /// 录音样本随合并迁移:winner 无样本则继承 loser 的,有则删 loser 的(best-effort,
-    /// 文件操作失败不回滚已保存的库——样本是试听增值层,库结构一致性优先)。
-    pub fn merge(&self, loser: &str, winner: &str) -> anyhow::Result<()> {
+    ///
+    /// 录音样本随合并**合池保留**:双方样本合计 ≤ MAX_SAMPLES 时全部保留(loser 的迁入
+    /// winner 空槽);超额时按**声纹多样性**挑保留集——对每份样本算嵌入,farthest-point
+    /// 贪心保留彼此最不相似的 MAX_SAMPLES 份(样本的价值是"这个人听起来的不同样子",
+    /// 留最不相似的组合比按时间/槽位序保留信息量大),winner 侧未入选的也会删。嵌入
+    /// 不可得(embedder=None/模型损坏/文件读失败)的样本排最后按序补位,全部不可得时
+    /// 即退化为旧行为。文件操作 best-effort,失败不回滚已保存的库——样本是试听增值层,
+    /// 库结构一致性优先。
+    pub fn merge_with_embedder(
+        &self,
+        loser: &str,
+        winner: &str,
+        mut embedder: Option<&mut dyn crate::diar::SpeakerEmbedder>,
+    ) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let mut vp = self.load();
         if loser == winner {
@@ -175,10 +193,43 @@ impl VoiceprintStore {
         vp.redirects.insert(loser.to_string(), winner.to_string());
         self.save(&vp)?;
 
-        // 样本随合并迁移:loser 的每份样本迁入 winner 的空槽,winner 满员(MAX_SAMPLES)
-        // 后余下的删除(best-effort,文件操作失败不回滚已保存的库——样本是试听增值层,
-        // 库结构一致性优先)。
-        for lp in self.sample_paths_existing(loser) {
+        // ── 样本归并 ──
+        let w_paths = self.sample_paths_existing(winner);
+        let l_paths = self.sample_paths_existing(loser);
+        let mut keep_loser: Vec<PathBuf> = l_paths.clone();
+        if w_paths.len() + l_paths.len() > MAX_SAMPLES {
+            // 超额:全体候选(winner 在前,loser 在后——嵌入全不可得时的兜底序即旧行为)
+            // 算嵌入,按多样性选保留集。
+            let all: Vec<&PathBuf> = w_paths.iter().chain(l_paths.iter()).collect();
+            let embs: Vec<Option<Vec<f32>>> = all
+                .iter()
+                .map(|p| embedder.as_deref_mut().and_then(|e| embed_wav_sample(p, e)))
+                .collect();
+            let keep = select_diverse(&embs, MAX_SAMPLES);
+            // winner 侧未入选的就地删(腾出槽位),loser 侧只迁移入选的。
+            for (i, p) in w_paths.iter().enumerate() {
+                if !keep.contains(&i) {
+                    if let Err(e) = std::fs::remove_file(p) {
+                        eprintln!("声纹样本淘汰失败({winner},不影响库): {e}");
+                    }
+                }
+            }
+            keep_loser = l_paths
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(&(w_paths.len() + i)))
+                .map(|(_, p)| p.clone())
+                .collect();
+            for lp in &l_paths {
+                if !keep_loser.contains(lp) {
+                    if let Err(e) = std::fs::remove_file(lp) {
+                        eprintln!("声纹样本淘汰失败({loser},不影响库): {e}");
+                    }
+                }
+            }
+        }
+        // 迁移保留的 loser 样本进 winner 空槽(容量经上面淘汰后必然足够)。
+        for lp in keep_loser {
             let res = match self.next_free_sample_slot(winner) {
                 Some(wp) => std::fs::rename(&lp, &wp),
                 None => std::fs::remove_file(&lp),
@@ -336,6 +387,83 @@ impl VoiceprintStore {
         self.save(&vp)?;
         Ok(new_links)
     }
+}
+
+/// 样本保留集选择:给定各样本的嵌入(None=取不到),容量 k,返回保留下标(升序)。
+/// 原则=最大化两两不相似(farthest-point 贪心):种子取相似度最低的一对,之后每轮
+/// 选"与已选集合的最大相似度最小"者。嵌入缺失的样本排最后按原序补位——能比对的
+/// 优先按多样性选,比不了的听天由命;全部缺失时退化为按原序取前 k(=旧行为)。
+pub(crate) fn select_diverse(embs: &[Option<Vec<f32>>], k: usize) -> Vec<usize> {
+    let n = embs.len();
+    if n <= k {
+        return (0..n).collect();
+    }
+    let unit: Vec<Option<Vec<f32>>> =
+        embs.iter().map(|e| e.as_ref().and_then(|v| normalize(v))).collect();
+    let valid: Vec<usize> = (0..n).filter(|&i| unit[i].is_some()).collect();
+    let mut picked: Vec<usize> = Vec::new();
+
+    if valid.len() >= 2 {
+        let sim = |a: usize, b: usize| -> f32 {
+            let (x, y) = (unit[a].as_ref().unwrap(), unit[b].as_ref().unwrap());
+            x.iter().zip(y).map(|(p, q)| p * q).sum()
+        };
+        // 种子:最不相似的一对(平手取下标序,保证确定性)。
+        let (mut si, mut sj, mut smin) = (valid[0], valid[1], f32::INFINITY);
+        for (ai, &a) in valid.iter().enumerate() {
+            for &b in &valid[ai + 1..] {
+                let s = sim(a, b);
+                if s < smin {
+                    (si, sj, smin) = (a, b, s);
+                }
+            }
+        }
+        picked.push(si);
+        if picked.len() < k {
+            picked.push(sj);
+        }
+        // 贪心扩:每轮加入"与已选的最大相似度最小"者。
+        while picked.len() < k {
+            let cand = valid
+                .iter()
+                .filter(|i| !picked.contains(i))
+                .min_by(|&&a, &&b| {
+                    let ma = picked.iter().map(|&p| sim(a, p)).fold(f32::NEG_INFINITY, f32::max);
+                    let mb = picked.iter().map(|&p| sim(b, p)).fold(f32::NEG_INFINITY, f32::max);
+                    ma.total_cmp(&mb)
+                })
+                .copied();
+            match cand {
+                Some(c) => picked.push(c),
+                None => break, // 有效样本用尽,余量给无嵌入的补
+            }
+        }
+    } else if valid.len() == 1 {
+        picked.push(valid[0]);
+    }
+    // 无嵌入的按原序补满容量。
+    for i in 0..n {
+        if picked.len() >= k {
+            break;
+        }
+        if unit[i].is_none() && !picked.contains(&i) {
+            picked.push(i);
+        }
+    }
+    picked.sort_unstable();
+    picked
+}
+
+/// 读样本 WAV 并算整段声纹嵌入(归一化)。<1s 的样本嵌不出稳定声纹,视为不可得;
+/// 读失败/嵌入失败一律 None——调用方按"排最后补位"容忍。
+fn embed_wav_sample(path: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
+    let mut r = hound::WavReader::open(path).ok()?;
+    let samples: Vec<f32> =
+        r.samples::<i16>().filter_map(|s| s.ok()).map(|v| v as f32 / 32768.0).collect();
+    if samples.len() < 16_000 {
+        return None;
+    }
+    e.embed(&samples).ok().and_then(|v| normalize(&v))
 }
 
 /// 整理·合并建议的相似度下限(余弦)。与种子命中(SEED_ASSIGN 0.68)/离线重聚类
@@ -868,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_migrates_loser_samples_into_free_slots_and_drops_excess() {
+    fn merge_without_embedder_falls_back_to_slot_order_and_drops_excess() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![
@@ -877,16 +1005,75 @@ mod tests {
         ];
         let links = store.upsert_from_session(&snaps, "t1").unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
-        // loser 3 份、winner 4 份:迁移只能填 1 个空槽,loser 余下 2 份删除。
+        // loser 3 份、winner 上限-1 份:无嵌入器(旧行为)= winner 全留,loser 按序补
+        // 1 个空槽,余下 2 份删除。样本 <1s,即使有嵌入器也嵌不出(排最后补位同序)。
         for _ in 0..3 {
             store.append_sample(&p1, &[0.5; 16]).unwrap();
         }
-        for _ in 0..4 {
+        for _ in 0..(MAX_SAMPLES - 1) {
             store.append_sample(&p2, &[0.7; 32]).unwrap();
         }
         store.merge(&p1, &p2).unwrap();
         assert!(store.sample_paths_existing(&p1).is_empty(), "loser 样本全部离场");
         assert_eq!(store.sample_paths_existing(&p2).len(), MAX_SAMPLES, "winner 填满即止,超额删除");
+    }
+
+    /// 假嵌入器:按整段样本首值分档出方向向量(同档=同声线,异档=不同声线)。
+    struct AmpEmbedder;
+    impl crate::diar::SpeakerEmbedder for AmpEmbedder {
+        fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(if s[0] > 0.5 { vec![0.0, 1.0] } else { vec![1.0, 0.0] })
+        }
+    }
+
+    #[test]
+    fn merge_with_embedder_keeps_most_dissimilar_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
+        // winner 满员 10 份、全是同一声线(幅值 0.1);loser 1 份独特声线(幅值 0.9)。
+        // 旧行为会因 winner 满员直接丢掉 loser 的独特样本;多样性挑选必须留下它。
+        for _ in 0..MAX_SAMPLES {
+            store.append_sample(&winner, &vec![0.1; 16_000]).unwrap();
+        }
+        store.append_sample(&loser, &vec![0.9; 16_000]).unwrap();
+
+        let mut e = AmpEmbedder;
+        store
+            .merge_with_embedder(&loser, &winner, Some(&mut e as &mut dyn crate::diar::SpeakerEmbedder))
+            .unwrap();
+
+        let kept = store.sample_paths_existing(&winner);
+        assert_eq!(kept.len(), MAX_SAMPLES, "保留数=上限");
+        assert!(store.sample_paths_existing(&loser).is_empty());
+        // 独特声线的那份必须幸存(读回首采样辨认)。
+        let has_unique = kept.iter().any(|p| {
+            let mut r = hound::WavReader::open(p).unwrap();
+            let first: i16 = r.samples::<i16>().next().unwrap().unwrap();
+            (first as f32 / 32768.0 - 0.9).abs() < 0.01
+        });
+        assert!(has_unique, "最不相似的样本必须保留,不能按槽位序丢弃: {kept:?}");
+    }
+
+    #[test]
+    fn select_diverse_prefers_dissimilar_and_backfills_missing() {
+        let v = |x: f32, y: f32| Some(vec![x, y]);
+        // 3 选 2:两份近同 + 一份正交 → 保留正交那份 + 近同二选一。
+        let picked = select_diverse(&[v(1.0, 0.0), v(0.99, 0.01), v(0.0, 1.0)], 2);
+        assert!(picked.contains(&2), "{picked:?}");
+        assert_eq!(picked.len(), 2);
+        // 容量足够:全保留。
+        assert_eq!(select_diverse(&[v(1.0, 0.0), None], 5), vec![0, 1]);
+        // 嵌入缺失排最后补位:2 个有效正交 + 2 个 None,取 3 → 两个有效 + 第一个 None。
+        let picked = select_diverse(&[None, v(1.0, 0.0), None, v(0.0, 1.0)], 3);
+        assert_eq!(picked, vec![0, 1, 3], "有效优先,None 按原序补第一个: {picked:?}");
+        // 全部缺失:退化为按原序取前 k(旧行为)。
+        assert_eq!(select_diverse(&[None, None, None], 2), vec![0, 1]);
     }
 
     #[test]
