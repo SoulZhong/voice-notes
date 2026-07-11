@@ -1684,6 +1684,15 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     Ok(people)
 }
 
+/// 删除声纹库人物的一份录音样本（详情页试听区,录坏/混音的样本可单独删）。
+/// 样本不参与识别（认人靠质心），删除不影响准确率;路径归属校验在 store 层。
+#[tauri::command]
+fn delete_person_sample(app: AppHandle, id: String, path: String) -> Result<(), String> {
+    open_voiceprint_store(&app)?
+        .delete_sample(&id, std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
+}
+
 /// 改库里人物的显示名：只影响后续会话的种子姓名与笔记侧只读 join，不涉及本场
 /// registry 引用结构，录制中也允许（同 rename_speaker 的"改名不挡录制"哲学）。
 #[tauri::command]
@@ -2621,6 +2630,7 @@ pub fn run() {
             rename_person,
             merge_person,
             delete_person,
+            delete_person_sample,
             mcp_agents_status,
             mcp_register,
             mcp_unregister,

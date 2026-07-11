@@ -8,6 +8,7 @@
     renamePerson,
     mergePerson,
     deletePerson,
+    deletePersonSample,
     type PersonSummary,
   } from "$lib/people";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
@@ -152,6 +153,25 @@
     mergeOpen = false;
     pendingMergeWinner = null;
     confirmDelete = false;
+    confirmSampleIdx = null;
+  }
+
+  /** 样本删除的行内二段确认:记下标(与 sample_paths 对齐)。 */
+  let confirmSampleIdx = $state<number | null>(null);
+
+  async function doDeleteSample(i: number) {
+    const p = person;
+    if (!p) return;
+    const path = p.sample_paths[i];
+    confirmSampleIdx = null;
+    stopSample(); // 删除后下标会移位,正在播的一律先停,别让播放态指错样本
+    try {
+      await deletePersonSample(p.id, path);
+      await refresh();
+    } catch (e) {
+      error = `删除样本失败: ${e}`;
+      await refresh();
+    }
   }
 
   async function doMerge() {
@@ -312,22 +332,46 @@
       <div class="card-title">原声试听</div>
       {#if person.sample_paths.length > 0}
         <div class="listen-row">
-          {#each person.sample_paths as _, i (i)}
-            <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
-              {#if playingIdx === i}
-                <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
-                停止
-              {:else}
-                <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-                  <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
-                </svg>
-                {person.sample_paths.length === 1 ? "播放样本" : `样本 ${i + 1}`}
-                {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
-                  <!-- 样本录制日期(文件时间):标出"哪场的声音",多样本核对时才分得清 -->
-                  <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
-                {/if}
-              {/if}
-            </button>
+          {#each person.sample_paths as sp, i (sp)}
+            {#if confirmSampleIdx === i}
+              <!-- 行内二段确认(页面级破坏性动作既有模式);样本不参与识别,删了不影响认人 -->
+              <span class="confirm-inline">
+                <button class="mini danger" onclick={() => doDeleteSample(i)}>删除这份样本</button>
+                <button class="mini" onclick={() => (confirmSampleIdx = null)}>取消</button>
+              </span>
+            {:else}
+              <span class="sample-wrap">
+                <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
+                  {#if playingIdx === i}
+                    <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                    停止
+                  {:else}
+                    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                      <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
+                    </svg>
+                    {person.sample_paths.length === 1 ? "播放样本" : `样本 ${i + 1}`}
+                    {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
+                      <!-- 样本录制日期(文件时间):标出"哪场的声音",多样本核对时才分得清 -->
+                      <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
+                    {/if}
+                  {/if}
+                </button>
+                <!-- 悬停显影的删除叉:录坏/混进别人声音的样本可单独删 -->
+                <button
+                  class="sample-x"
+                  title="删除这份样本"
+                  aria-label="删除这份样本"
+                  onclick={() => {
+                    closeAllOps();
+                    confirmSampleIdx = i;
+                  }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                    <path d="M4 4l8 8M12 4l-8 8" />
+                  </svg>
+                </button>
+              </span>
+            {/if}
           {/each}
         </div>
         <span class="card-hint">
@@ -492,6 +536,34 @@
     color: var(--ink-faint);
     font-size: 0.76rem;
     font-weight: 400;
+  }
+  /* 样本删除叉:悬停样本才显影(行级操作隐身惯例),hover 转 danger */
+  .sample-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .sample-x {
+    visibility: hidden;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.35rem;
+    height: 1.35rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    border-radius: var(--radius-full);
+    cursor: pointer;
+  }
+  .sample-wrap:hover .sample-x,
+  .sample-x:focus-visible {
+    visibility: visible;
+  }
+  .sample-x:hover {
+    color: var(--danger);
+    background: var(--danger-tint);
   }
   /* 列表型卡片(出现过的会议):纵排,标题行与列表上下排布 */
   .card.col {
