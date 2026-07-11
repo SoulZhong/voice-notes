@@ -27,6 +27,10 @@ pub struct Settings {
     /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
     #[serde(default = "default_asr")]
     pub asr_model: String,
+    /// 声纹嵌入模型选型:"campplus"(默认)/"eres2netv2"。不同模型嵌入空间不可混用,
+    /// 切换会触发声纹库从录音样本后台重建(见 lib.rs set_settings)。
+    #[serde(default = "default_speaker_model")]
+    pub speaker_model: String,
     /// 外观主题,消费任务:主题切换。"system"/"light"/"dark"。
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -84,6 +88,10 @@ fn default_prefix() -> String {
     DEFAULT_MIRROR_PREFIX.into()
 }
 
+fn default_speaker_model() -> String {
+    "campplus".into()
+}
+
 fn default_asr() -> String {
     ASR_SENSE_VOICE.into()
 }
@@ -111,6 +119,7 @@ impl Default for Settings {
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
+            speaker_model: default_speaker_model(),
             theme: default_theme(),
             record_system_only: false,
             keep_output_volume: false,
@@ -213,6 +222,7 @@ mod tests {
             data_dir: Some("/tmp/d".into()),
             models_dir: Some("/tmp/m".into()),
             asr_model: ASR_WHISPER.into(),
+            speaker_model: default_speaker_model(),
             ..Default::default()
         };
         save(tmp.path(), &s).unwrap();

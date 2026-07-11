@@ -128,6 +128,7 @@
     try {
       settings = await getSettings();
       asrChoice = asrModelToChoice(settings.asr_model);
+      speakerChoice = settings.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
       syncLocalFromSettings(settings);
     } catch (e) {
       error = `读取设置失败: ${e}`;
@@ -380,6 +381,26 @@
       await refreshDiskUsage();
     } catch (e) {
       error = `清理失败: ${e}`;
+    }
+  }
+
+  // —— 声纹模型选型 ——
+  let speakerChoice = $state("campplus");
+  const eres2Missing = $derived(
+    !!status && !status.artifacts.find((a) => a.id === "speaker-eres2netv2")?.present,
+  );
+  async function changeSpeakerModel(model: string) {
+    if (settings?.speaker_model === model) return;
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.speaker_model = model;
+      await setSettings(fresh);
+      settings = fresh;
+      speakerChoice = model;
+    } catch (e) {
+      error = `${e}`;
+      speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
     }
   }
 
@@ -643,6 +664,41 @@
               disabled={recording.isLive || !settings}
               onchange={() => changeAsr("paraformer")}
             />Paraformer
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">声纹模型</span>
+          <span class="row-desc">
+            {speakerChoice === "eres2netv2"
+              ? "备选模型;切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"
+              : "推荐 · 切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"}
+          </span>
+        </div>
+        <div class="seg" class:disabled={recording.isLive}>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="speaker-model"
+              value="campplus"
+              bind:group={speakerChoice}
+              disabled={recording.isLive || !settings}
+              onchange={() => changeSpeakerModel("campplus")}
+            />CAM++
+          </label>
+          <label
+            class="seg-item"
+            title={eres2Missing ? "模型未下载:请先在下方「语音模型」中下载 ERes2NetV2" : ""}
+          >
+            <input
+              type="radio"
+              name="speaker-model"
+              value="eres2netv2"
+              bind:group={speakerChoice}
+              disabled={recording.isLive || !settings || eres2Missing}
+              onchange={() => changeSpeakerModel("eres2netv2")}
+            />ERes2NetV2
           </label>
         </div>
       </div>
