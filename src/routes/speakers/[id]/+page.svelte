@@ -12,7 +12,7 @@
     type PersonSummary,
     type PersonMergeSuggestion,
   } from "$lib/people";
-  import { tidy, sugKey } from "$lib/tidy.svelte";
+  import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
@@ -399,7 +399,7 @@
             <span class="ctx-text">
               这个人可能与
               <a href="/speakers/{other.id}">「{other.name || `说话人 ${other.id.replace(/^P/, "")}`}」</a>
-              是同一人(相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""})
+              是同一人(相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""})
             </span>
             {#if (people.find((o) => o.id === other.id)?.sample_paths.length ?? 0) > 0}
               <!-- 对方原声试听:不听没法拍板该不该合 -->

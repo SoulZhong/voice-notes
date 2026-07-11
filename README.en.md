@@ -19,7 +19,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 - **Dual-source live transcription**: captures the microphone and system audio (ScreenCaptureKit) simultaneously, so both what you say and what you hear in online meetings end up in the note. Cross-channel echo dedup keeps speaker bleed-through from being transcribed twice.
 - **Fully local & offline**: ASR / VAD / speaker models all run on-device via sherpa-onnx. Works without a network connection; nothing is uploaded, ever.
-- **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 10+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Mis-split entries can be merged, samples and all.
+- **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 30+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Mis-split entries can be merged, samples and all.
 - **Lyrics-style following**: while recording or playing back, the sentence being spoken stays pinned to the center of the screen, enlarged and highlighted, with history dimming above. Scroll up to review anytime; one tap returns to live.
 - **Never lose a sentence**: every finalized segment is flushed to disk as it happens. Crashes, power loss, or accidental quits don't lose transcribed content, and interrupted meetings can be resumed with seamless timeline and speaker numbering.
 - **Playback & verification**: original audio is kept per track (auto-compressed to AAC, ~14 MB/hour/source). Click any sentence's timestamp to listen from there, with the playhead followed lyrics-style.
@@ -206,7 +206,7 @@ Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (wit
 ## Usage
 
 1. Hit **Start Recording** (or the global shortcut, default `⌥⌘R`).
-2. Talk — the current sentence stays centered and enlarged, speaker badges are assigned live, and any new voice that accumulates 10 seconds gets a global speaker number.
+2. Talk — the current sentence stays centered and enlarged, speaker badges are assigned live, and any new voice that accumulates 30 seconds gets a global speaker number.
 3. Stop to land in the note view: play back, edit text, name speakers (name once, applies everywhere), export.
 4. Manage everyone in the **Buddies (voiceprint library)** page: audition their voice sample, rename, merge mis-split entries.
 

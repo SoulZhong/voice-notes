@@ -5,6 +5,11 @@ import { suggestPersonMerges, type PersonMergeSuggestion } from "$lib/people";
 
 export const sugKey = (s: PersonMergeSuggestion) => `${s.loser}>${s.winner}`;
 
+/** "很可能"判定:裸余弦够高(绝对档 0.74),或 S-Norm 显著性够强(z≥3,鹤立鸡群)。
+    与后端 SUGGEST_STRONG_Z 同值。 */
+export const isStrong = (s: PersonMergeSuggestion) =>
+  s.similarity >= 0.74 || (s.salience ?? 0) >= 3.0;
+
 class TidyState {
   suggestions = $state<PersonMergeSuggestion[]>([]);
   ignored = $state<Set<string>>(new Set());

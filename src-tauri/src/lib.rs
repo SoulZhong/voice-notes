@@ -1698,6 +1698,7 @@ fn suggest_person_merges(app: AppHandle) -> Result<Vec<ipc::PersonMergeSuggestio
             winner: s.winner,
             similarity: s.similarity,
             source: s.source,
+            salience: s.salience,
         })
         .collect())
 }

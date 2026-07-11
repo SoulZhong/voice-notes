@@ -116,7 +116,8 @@ pub struct PersonSummary {
 }
 
 /// 整理·合并建议(suggest_person_merges 返回):把 loser 并入 winner 的推荐,
-/// 相似度是共有信道质心余弦的最大值;name 空串=未命名(前端按「说话人 N」兜底)。
+/// 相似度是共有信道质心余弦的最大值;salience 是 S-Norm 显著性 z 分数(库太小
+/// 算不出分布时 None);name 空串=未命名(前端按「说话人 N」兜底)。
 #[derive(Debug, Clone, Serialize)]
 pub struct PersonMergeSuggestion {
     pub loser: String,
@@ -125,6 +126,7 @@ pub struct PersonMergeSuggestion {
     pub winner_name: String,
     pub similarity: f32,
     pub source: String,
+    pub salience: Option<f32>,
 }
 
 /// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;

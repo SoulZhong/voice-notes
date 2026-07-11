@@ -8,7 +8,7 @@
     type PersonSummary,
     type PersonMergeSuggestion,
   } from "$lib/people";
-  import { tidy, sugKey } from "$lib/tidy.svelte";
+  import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerInk } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
@@ -192,7 +192,7 @@
   {#if people.length === 0}
     <div class="empty">
       <p>还没有说话人。</p>
-      <p class="hint">录一场会议(单人说话累计满 10 秒),停止后会自动出现在左侧。</p>
+      <p class="hint">录一场会议(单人说话累计满 30 秒),停止后会自动出现在左侧。</p>
     </div>
   {:else}
     <div class="stats">
@@ -261,8 +261,8 @@
                   <span class="dot" style="background: {speakerInk(s.winner, 'mic')}"></span>
                   <a class="sug-name" href="/speakers/{s.winner}">{plabel(s.winner, s.winner_name)}</a>
                   {@render listenBtn(s.winner)}
-                  <span class="sim" class:strong={s.similarity >= 0.74}>
-                    相似度 {Math.round(s.similarity * 100)}%{s.similarity >= 0.74 ? " · 很可能" : ""}
+                  <span class="sim" class:strong={isStrong(s)}>
+                    相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
                   </span>
                   <span class="sug-spacer"></span>
                   <button
