@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
+  import { formatDate } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
   // 主从结构的落地页:人物索引在侧栏,本页只做概览引导——不再重复列一遍名单。
@@ -9,6 +10,21 @@
 
   const named = $derived(people.filter((p) => p.name).length);
   const unnamed = $derived(people.length - named);
+
+  /** 同名分组(疑似重复:多半是同一个人被声纹拆成了多条)。people 已按 last_seen 降序。 */
+  const dupGroups = $derived.by(() => {
+    const by = new Map<string, PersonSummary[]>();
+    for (const p of people) {
+      if (!p.name) continue;
+      by.set(p.name, [...(by.get(p.name) ?? []), p]);
+    }
+    return [...by.values()].filter((g) => g.length > 1);
+  });
+
+  const recent = (p: PersonSummary) => {
+    const d = formatDate(p.last_seen);
+    return d === "—" ? p.id : d.slice(5, 10);
+  };
 
   async function refresh() {
     try {
@@ -60,6 +76,22 @@
         </div>
       {/if}
     </div>
+    {#if dupGroups.length > 0}
+      <!-- 疑似重复:同名多条多半是同一个人被声纹拆重,引导去详情页合并 -->
+      <div class="dup-card">
+        <div class="dup-head">
+          有 {dupGroups.length} 组搭子同名,可能是同一个人被拆成了多条——进入任意一条的详情页,用「合并到…」归成一个人。
+        </div>
+        {#each dupGroups as g (g[0].name)}
+          <div class="dup-row">
+            <span class="dup-name">「{g[0].name}」× {g.length}</span>
+            {#each g as p (p.id)}
+              <a class="dup-link" href="/speakers/{p.id}">最近 {recent(p)}</a>
+            {/each}
+          </div>
+        {/each}
+      </div>
+    {/if}
     <p class="pick-hint">
       从左侧列表选择一个人查看详情。
       {#if unnamed > 0}「待命名」的人命名后,之后的录制会自动显示名字。{/if}
@@ -115,6 +147,35 @@
   .pick-hint {
     color: var(--ink-faint);
     font-size: 0.85rem;
+  }
+  /* 疑似重复卡:warning 色系横幅形态(banner 家族),行内链接直达各同名条目 */
+  .dup-card {
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    padding: 0.7rem 0.9rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+  }
+  .dup-head {
+    color: var(--warning-ink);
+    line-height: 1.5;
+    margin-bottom: 0.35rem;
+  }
+  .dup-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    padding: 0.15rem 0;
+  }
+  .dup-name {
+    color: var(--ink);
+    font-weight: 500;
+  }
+  .dup-link {
+    color: var(--accent);
+    font-size: 0.82rem;
   }
   .empty {
     background: var(--surface);

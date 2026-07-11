@@ -135,7 +135,7 @@ pub fn get_note(
         "markdown" | "text" => {
             let was_refined = refined.is_some();
             let content = match refined {
-                Some(doc) => render_refined(&note.meta.title, &doc, format == "markdown"),
+                Some(doc) => store::render_refined(&note.meta.title, &doc, format == "markdown"),
                 // note 已在函数开头 load 过一次;render_loaded 直接渲染内存里的
                 // Note,避免 render(id, ..) 对同一笔记再触发一次磁盘 load。
                 None => store.render_loaded(&note, if format == "markdown" { "md" } else { "txt" })?,
@@ -150,25 +150,7 @@ pub fn get_note(
     }
 }
 
-/// 精修稿的 md/txt 渲染(原始稿渲染在 store::export,精修段形状不同,单独渲染)。
-fn render_refined(title: &str, doc: &store::RefinedDoc, md: bool) -> String {
-    let mut out = String::new();
-    if md {
-        out.push_str(&format!("# {title}\n\n"));
-    } else {
-        out.push_str(&format!("{title}\n\n"));
-    }
-    for p in &doc.paragraphs {
-        let label = p.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| p.speaker.clone());
-        let ts = crate::store::format_ts(p.start_ms);
-        if md {
-            out.push_str(&format!("**{label}** `[{ts}]`\n\n{}\n\n", p.text));
-        } else {
-            out.push_str(&format!("{label} [{ts}]\n{}\n\n", p.text));
-        }
-    }
-    out
-}
+// 精修稿的 md/txt 渲染已下沉 store::export::render_refined(GUI 导出与此处共用,防漂移)。
 
 /// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id)。
 pub fn list_speakers(roots: &DataRoots) -> serde_json::Value {
@@ -258,6 +240,7 @@ mod tests {
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
+                    person_id: None,
                     start_ms: 0,
                     end_ms: 1000,
                     text: "精修句".into(),
@@ -326,6 +309,7 @@ mod tests {
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
+                    person_id: None,
                     start_ms: 0,
                     end_ms: 1000,
                     text: "精修句".into(),

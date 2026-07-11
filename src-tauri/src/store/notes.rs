@@ -173,6 +173,26 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// 把说话人关联到全局声纹库人物:写 person_id 并清空本地改名(展示走只读 join
+    /// 显示库中现名,本地名留着会永远压过库名)。说话人必须已存在——关联是"指认
+    /// 现有声音",不凭空造表项(与 rename 的 or_insert 语义不同)。
+    pub fn assign_speaker_person(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        person_id: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        meta.person_id = Some(person_id.to_string());
+        meta.name = String::new();
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 改段落文本。空文本拒绝（如需去段请用 delete_segment）。
     pub fn edit_segment_text(
         &self,
@@ -667,6 +687,25 @@ mod tests {
         let id2 = make_note(tmp.path(), &["旧"], true);
         let n2 = store.load(&id2).unwrap();
         assert!(n2.speakers.is_empty());
+    }
+
+    #[test]
+    fn assign_speaker_person_sets_link_clears_local_name_and_rejects_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.finalize(now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.rename_speaker(&id, "S1", "本地名").unwrap();
+        store.assign_speaker_person(&id, "S1", "P7").unwrap();
+        // 直读盘上原始表(load 会做库 join,person 悬空时不动 name):person 已写、本地名已清。
+        let raw = std::fs::read_to_string(tmp.path().join(&id).join("speakers.json")).unwrap();
+        assert!(raw.contains(r#""person_id": "P7""#) || raw.contains(r#""person_id":"P7""#), "{raw}");
+        assert!(!raw.contains("本地名"), "关联须清空本地改名,否则永远压过库名: {raw}");
+        // 未知说话人拒绝,不凭空造表项。
+        assert!(store.assign_speaker_person(&id, "S9", "P7").is_err());
     }
 
     /// 并发丢更新回归:rename_speaker 与 set_segment_speaker("new") 两线程互跑,

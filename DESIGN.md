@@ -125,7 +125,7 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 - **状态行**:辅助状态文字降为 caption 级 `ink-faint`,前缀 7px 状态点(活跃 `record`,空闲 `ink-faint`)。录制页把状态映射成友好短标签(录制中/已暂停/就绪)并进控制行右簇、不单挂一行;仅出错时在控制行下方展开完整 `danger` 错误详情行(文案可能较长)。空态文案在容器内居中,不左对齐孤行。
 - **transcript-container**:`surface` 底、radius-xl、padding 16-20px;段落间距 6px;正文 `transcript` 字级(行高 1.6)。
 - **speaker-badge**:soft tint 底 + `--tint-*-ink` 文字、radius-sm、`micro` 字级;哈希取色循环上表 7 色。
-- **speaker-chip**(顶部说话人条):同徽章色系,radius-full,可点击时 hover 加 `accent-tint` 外环。
+- **speaker-chip**(顶部说话人条):同徽章色系,radius-full,可点击时 hover 加 `accent-tint` 外环。可编辑时点击在 chip 下缘 6px 处展开**编辑面板**(标准 menu/popover 语言,120ms 缓动浮现,贴视口右缘按实测尺寸左收留 8px)——chip 本身不变形,展开期间保持 `accent-tint` 外环;「这是我」不再作 chip 常驻钮,收进面板。面板结构:①首行无框改名输入(预填现名并全选,回车提交/Esc 关闭/失焦提交,下缘全出血发丝线);②「这是我」快捷行(人形图标+文字);③人物区=`ink-faint` 小标题「会议搭子」+人物行列表(9px 色点用调色板 **ink 变体**——soft 底 15% alpha 做小色点不可见;未命名显示「说话人 N」;已关联行尾 `accent` SVG 勾),输入即按包含匹配过滤(过滤中隐藏快捷行),人多限高 13rem 内滚。精修稿视图:改名同步声纹库现名、选人关联库人物,会议搭子里改名经只读 join 反映回历史精修稿;精修进行中 chip 退回只读。原始稿视图同一面板,改名仍是笔记内本地名,选人区在非录制时可用(关联写 speakers.json);录制页无人物区。**重名拦截**:提交的新名撞库中他人现名时面板转确认条(`warning-ink` 提示语)——未关联说话人给 [是,关联他](accent 主推)/[不是,保留同名],已关联说话人给「可能是重复条目」提示+详情页链接+[仍要改名];人物行的未命名/重名条目行尾补「最近 MM-DD」`ink-faint` 副文案。
 - **menu / popover**(右键菜单、说话人选择、合并目标):`surface-press` 底、1px `hairline` 边、radius-lg、`shadow-popover`(dark `.5` / light `.16`)。光标处展开,靠近视口右/下缘按实测尺寸整体收回(留 8px 边距);**菜单项不承载确认态**(不原地变形成「确认删除/取消」)——破坏性菜单动作一律弹系统原生确认对话框(plugin-dialog `ask`,warning 档,正文写清删什么、不可恢复);页面内(非菜单)的破坏性按钮仍可用行内二段式确认(清理/删段落既有模式)。
 - **banner**(横幅三件套):tint 底 + line 边 + ink 文字。提示横幅 `warning-tint` / `warning-line` / `warning-ink`;错误横幅同形态换 `danger-tint` / `danger-line` / `danger-ink`;radius-lg。
 - **progress**(进度条):轨 `hairline`、填充 `accent`、高 6px、radius-full。

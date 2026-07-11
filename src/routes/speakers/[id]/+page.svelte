@@ -4,16 +4,17 @@
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
+    personNotes,
     renamePerson,
     mergePerson,
     deletePerson,
     type PersonSummary,
   } from "$lib/people";
-  import { formatDate, formatDuration, speakerColor, speakerInk } from "$lib/notes";
+  import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
 
   // 主从结构的"从":本页只呈现/操作一个人;人物索引在侧栏声纹库页签。
-  const personId = $derived($page.params.id);
+  const personId = $derived($page.params.id as string);
 
   let people = $state<PersonSummary[]>([]);
   let loaded = $state(false);
@@ -34,13 +35,20 @@
     return p.name || `说话人 ${p.id.replace(/^P/, "")} · 最近 ${formatDate(p.last_seen)}`;
   }
 
+  // 出现过的会议(试听之外确认"认对了人"的第二手段);增值层,取失败静默按空处理。
+  let appearNotes = $state<NoteSummary[]>([]);
+
   async function refresh() {
+    const forId = personId;
+    const notesPromise = personNotes(forId).catch(() => [] as NoteSummary[]);
     try {
       people = await listPeople();
       error = "";
     } catch (e) {
       error = `加载失败: ${e}`;
     }
+    const notes = await notesPromise;
+    if (forId === personId) appearNotes = notes;
     loaded = true;
   }
 
@@ -50,28 +58,45 @@
     stopSample();
     closeAllOps();
     editingId = null;
+    dupRename = null;
+    appearNotes = [];
     refresh();
   });
 
   // ── 改名(沿旧管理页语义:未命名给显眼「命名」,已命名点名字改) ──
   let editingId = $state<string | null>(null);
   let editingName = $state("");
+  /** 改名撞库中另一人现名:大概率是同一个人被声纹拆重,先确认合并还是真重名。 */
+  let dupRename = $state<{ name: string; other: PersonSummary } | null>(null);
 
   function beginRename() {
     if (!person) return;
     editingId = person.id;
     editingName = person.name;
+    dupRename = null;
     closeAllOps();
   }
 
   async function commitRename() {
     const p = person;
-    if (!p || editingId !== p.id) return;
+    if (!p || editingId !== p.id || dupRename) return;
     const text = editingName.trim();
+    if (!text || text === p.name) {
+      editingId = null;
+      return; // 空/未变:静默还原,不当真改名
+    }
+    const other = others.find((o) => o.name === text);
+    if (other) {
+      dupRename = { name: text, other };
+      return; // 输入框保留,下方出确认条
+    }
     editingId = null;
-    if (!text || text === p.name) return; // 空/未变:静默还原,不当真改名
+    await applyRename(p.id, text);
+  }
+
+  async function applyRename(id: string, text: string) {
     try {
-      await renamePerson(p.id, text);
+      await renamePerson(id, text);
       await refresh();
       recording.bumpPeople(); // 侧栏索引同步新名
     } catch (err) {
@@ -80,10 +105,48 @@
     }
   }
 
+  /** 重名确认:就是同一个人 → 当前人并入已有同名者,跳转对方详情。 */
+  async function dupMerge() {
+    const p = person;
+    const d = dupRename;
+    if (!p || !d) return;
+    editingId = null;
+    dupRename = null;
+    try {
+      await mergePerson(p.id, d.other.id);
+      recording.bumpPeople();
+      goto(`/speakers/${d.other.id}`);
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
+  /** 重名确认:确实是另一个人 → 照常改名,允许重名(列表以最近出现区分)。 */
+  async function dupKeep() {
+    const p = person;
+    const d = dupRename;
+    if (!p || !d) return;
+    editingId = null;
+    dupRename = null;
+    await applyRename(p.id, d.name);
+  }
+
   // ── 合并/删除(同屏只开一个操作态) ──
   let mergeOpen = $state(false);
   let pendingMergeWinner = $state<string | null>(null);
   let confirmDelete = $state(false);
+
+  /** 合并结果预览:名字继承规则(winner 名优先,winner 无名继承 loser 名)对用户是
+      黑盒,确认前把结果摆出来;loser 数据比 winner 厚时提示通常反向合并更好。 */
+  const mergePreview = $derived.by(() => {
+    const t = people.find((o) => o.id === pendingMergeWinner);
+    if (!t || !person) return null;
+    return {
+      name: t.name || person.name,
+      total: t.total_ms + person.total_ms,
+      thickerLoser: person.total_ms > t.total_ms,
+    };
+  });
 
   function closeAllOps() {
     mergeOpen = false;
@@ -189,12 +252,37 @@
               autofocus
               placeholder="输入名字,如 张三"
               bind:value={editingName}
+              oninput={() => (dupRename = null)}
               onkeydown={(e) => {
                 if (e.key === "Enter") commitRename();
-                if (e.key === "Escape") editingId = null;
+                if (e.key === "Escape") {
+                  editingId = null;
+                  dupRename = null;
+                }
               }}
               onblur={commitRename}
             />
+            {#if dupRename}
+              <!-- 重名确认(menu 语言):撞名十有八九=同一个人被拆重,先问合并 -->
+              <div class="menu dup-menu">
+                <div class="menu-title">
+                  已有一位「{dupRename.other.name}」(最近出现 {formatDate(dupRename.other.last_seen)} ·
+                  累计 {formatDuration(Math.floor(dupRename.other.total_ms / 1000))})。是同一个人吗?
+                </div>
+                <div class="confirm-row">
+                  <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={dupMerge}>是,合并成一个</button>
+                  <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>不是,保留同名</button>
+                  <button
+                    class="mini quiet"
+                    onmousedown={(e) => e.preventDefault()}
+                    onclick={() => {
+                      editingId = null;
+                      dupRename = null;
+                    }}>取消</button
+                  >
+                </div>
+              </div>
+            {/if}
           {:else if person.name}
             <button class="name-btn" title="点击改名" onclick={beginRename}>
               <h1>{person.name}</h1>
@@ -234,6 +322,10 @@
                   <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
                 </svg>
                 {person.sample_paths.length === 1 ? "播放样本" : `样本 ${i + 1}`}
+                {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
+                  <!-- 样本录制日期(文件时间):标出"哪场的声音",多样本核对时才分得清 -->
+                  <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
+                {/if}
               {/if}
             </button>
           {/each}
@@ -243,6 +335,23 @@
         </span>
       {:else}
         <span class="card-hint">暂无录音样本:下次录到这个人并停止录制后会自动补上。</span>
+      {/if}
+    </section>
+
+    <!-- 出现过的会议:试听之外确认"认对了人"的第二手段;点击直达笔记 -->
+    <section class="card col">
+      <div class="card-title">出现过的会议</div>
+      {#if appearNotes.length > 0}
+        <ul class="appear-list">
+          {#each appearNotes as n (n.id)}
+            <li class="appear-row">
+              <a href="/notes/{n.id}">{n.title}</a>
+              <span class="appear-meta">{formatDate(n.started_at)}</span>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <span class="card-hint">还没有会议记录到这个人(早期笔记可能没有关联信息)。</span>
       {/if}
     </section>
 
@@ -277,8 +386,17 @@
             {@const target = people.find((o) => o.id === pendingMergeWinner)}
             <div class="menu confirm">
               <div class="menu-title">
-                并入「{target ? displayName(target) : "?"}」?合并后这个人历史笔记都显示对方的名字,不可撤销。
+                并入「{target ? displayName(target) : "?"}」?合并后是一个人:
+                {#if mergePreview}名字为「{mergePreview.name || "未命名"}」,累计发声
+                  {formatDuration(Math.floor(mergePreview.total / 1000))};{/if}
+                历史笔记都显示合并后的名字,不可撤销。
               </div>
+              {#if mergePreview?.thickerLoser}
+                <div class="menu-note">
+                  提示:当前这位的录音数据更多。通常把数据少的一方并入数据多的一方——
+                  如需反向,可取消后到对方页面操作。
+                </div>
+              {/if}
               <div class="confirm-row">
                 <button class="mini danger" onclick={doMerge}>确认合并</button>
                 <button class="mini" onclick={closeAllOps}>取消</button>
@@ -289,6 +407,8 @@
 
         {#if confirmDelete}
           <div class="confirm-inline">
+            <!-- 删除后果一句话说清:笔记文字不动,只是不再认得这个人 -->
+            <span class="delete-hint">删除后历史笔记里他恢复显示为编号,录音样本一并删除,之后录到他会当作新面孔。</span>
             <button class="mini danger" onclick={doDelete}>确认删除</button>
             <button class="mini" onclick={() => (confirmDelete = false)}>取消</button>
           </div>
@@ -344,6 +464,76 @@
     align-items: center;
     gap: 0.6rem;
     min-height: 2rem;
+    /* 改名重名确认条以本行为锚点向下弹出 */
+    position: relative;
+  }
+  .dup-menu {
+    top: calc(100% + 4px);
+    min-width: 20rem;
+  }
+  .menu-note {
+    color: var(--ink-faint);
+    font-size: 0.76rem;
+    line-height: 1.45;
+    padding: 0 0.5rem 0.35rem;
+  }
+  .mini.accent {
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .mini.accent:hover {
+    background: var(--accent-tint);
+  }
+  .mini.quiet {
+    color: var(--ink-faint);
+  }
+  .listen-date {
+    color: var(--ink-faint);
+    font-size: 0.76rem;
+    font-weight: 400;
+  }
+  /* 列表型卡片(出现过的会议):纵排,标题行与列表上下排布 */
+  .card.col {
+    display: block;
+  }
+  .card.col .card-title {
+    margin-bottom: 0.45rem;
+  }
+  .appear-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 14rem;
+    overflow-y: auto;
+  }
+  .appear-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.28rem 0;
+  }
+  .appear-row a {
+    color: var(--ink);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .appear-row a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .appear-meta {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+    flex: none;
+  }
+  .delete-hint {
+    color: var(--warning-ink);
+    font-size: 0.78rem;
+    max-width: 24rem;
+    line-height: 1.45;
   }
   h1 {
     margin: 0;

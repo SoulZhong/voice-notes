@@ -267,6 +267,7 @@ mod tests {
         crate::store::RefinedParagraph {
             speaker: "R1".into(),
             name: None,
+            person_id: None,
             start_ms: 0,
             end_ms: 1000,
             text: text.into(),
