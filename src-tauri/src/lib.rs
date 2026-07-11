@@ -1298,11 +1298,140 @@ fn refine_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
 
 /// 读取已落盘的精修结果（refined.json）；从未精修过 / 精修在前置阶段就失败到没能落盘
 /// 时返回 None，前端据此回落展示原始 segments。
+/// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史精修稿
+/// 跟着变），person_id 归一到 merge 后的 winner。只影响返回值，不落盘。
 #[tauri::command]
 fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
-    Ok(store::load_refined(&dir))
+    Ok(store::load_refined(&dir).map(|mut doc| {
+        if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
+            if let Ok(root) = data_root(&app) {
+                let vp = store::VoiceprintStore::new(root).load();
+                store::join_library_names(&mut doc, &vp);
+            }
+        }
+        doc
+    }))
+}
+
+/// 精修稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
+/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇精修稿。精修中拒绝（管线
+/// 随后整写 refined.json 会吞掉本次编辑），录制中拒绝（speakers.json 由 writer 独占）。
+#[tauri::command]
+fn rename_refined_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+    name: String,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名字不能为空".into());
+    }
+    if state.refining.lock().unwrap().contains(&note_id) {
+        return Err("该笔记正在精修中，稍后再改".into());
+    }
+    reject_if_active(&state, &note_id)?;
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    let person_id = store::rename_refined_speaker(&root.join(&note_id), &speaker_id, name)
+        .map_err(|e| e.to_string())?;
+    // 降级精修稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
+    // 原始逐字稿视图不与精修稿打架。R* 标签不存在于 speakers.json,不碰。
+    if speaker_id.starts_with('S') {
+        if let Err(e) = store::NoteStore::new(root).rename_speaker(&note_id, &speaker_id, name) {
+            eprintln!("精修稿改名已生效,但同步 speakers.json 失败({speaker_id}): {e}");
+        }
+    }
+    // 同步会议搭子:人已被删除/合并成悬空引用时静默跳过——本地改名已生效,不回滚。
+    if let Some(pid) = person_id {
+        let vp_store = open_voiceprint_store(&app)?;
+        let vp = vp_store.load();
+        if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
+            if let Err(e) = vp_store.rename(&resolved, name) {
+                eprintln!("精修稿改名已生效,但同步声纹库失败({pid}): {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 原始稿说话人关联声纹库人物（会议搭子选人）：speakers.json 写 person_id 并清空
+/// 本地改名，展示走既有只读 join 显示库中现名。录制中拒绝（speakers.json 由 writer
+/// 独占）；person_id 经 resolve 归一，悬空报错。
+#[tauri::command]
+fn assign_note_speaker_person(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+    person_id: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let vp = open_voiceprint_store(&app)?.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
+        return Err(format!("声纹库中没有该人物: {person_id}"));
+    };
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .assign_speaker_person(&note_id, &speaker_id, &resolved)
+        .map_err(|e| e.to_string())
+}
+
+/// 某声纹库人物出现过的会议（详情页「出现过的会议」卡）：扫各笔记 speakers.json 的
+/// person_id，经 redirects 归一后比对（笔记里可能还留着已被合并的 loser 引用）。
+/// 按开始时间倒序。纯读，损坏/缺失的 speakers.json 静默跳过。
+#[tauri::command]
+fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSummary>, String> {
+    let vp = open_voiceprint_store(&app)?.load();
+    let target = store::VoiceprintStore::resolve(&vp, &person_id)
+        .map(str::to_string)
+        .ok_or_else(|| format!("声纹库中没有该人物: {person_id}"))?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let notes = store::NoteStore::new(dir.clone()).list(); // list 已按开始时间倒序
+    Ok(notes
+        .into_iter()
+        .filter(|n| {
+            let Ok(text) = std::fs::read_to_string(dir.join(&n.id).join("speakers.json")) else {
+                return false;
+            };
+            let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, store::SpeakerMeta>>(&text) else {
+                return false;
+            };
+            map.values().any(|m| {
+                m.person_id
+                    .as_deref()
+                    .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+                    .map(|r| r == target)
+                    .unwrap_or(false)
+            })
+        })
+        .collect())
+}
+
+/// 把精修稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
+/// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
+#[tauri::command]
+fn assign_refined_person(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+    person_id: String,
+) -> Result<(), String> {
+    if state.refining.lock().unwrap().contains(&note_id) {
+        return Err("该笔记正在精修中，稍后再改".into());
+    }
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let vp = open_voiceprint_store(&app)?.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
+        return Err(format!("声纹库中没有该人物: {person_id}"));
+    };
+    let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+    store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())
 }
 
 /// 笔记音频轨道信息(详情页播放器用)。**纯读**:陈旧 WAV 头(硬崩残留)的修复
@@ -1483,11 +1612,28 @@ fn set_segment_speaker(
         .map_err(|e| e.to_string())
 }
 
+/// 导出笔记。prefer_refined=真且精修稿在盘时导精修稿(所见即所得:用户看着哪个视图
+/// 点导出就得到哪个),否则导原始逐字稿;精修稿导出前与 get_refined 同款只读 join,
+/// 库中现名(会议搭子改名)一并带出。
 #[tauri::command]
-fn export_note(app: AppHandle, id: String, format: String) -> Result<String, String> {
+fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool) -> Result<String, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let refined = if prefer_refined {
+        store::load_refined(&dir.join(&id)).map(|mut doc| {
+            if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
+                if let Ok(root) = data_root(&app) {
+                    let vp = store::VoiceprintStore::new(root).load();
+                    store::join_library_names(&mut doc, &vp);
+                }
+            }
+            doc
+        })
+    } else {
+        None
+    };
     store::NoteStore::new(dir)
-        .export(&id, &format)
+        .export(&id, &format, refined.as_ref())
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| e.to_string())
 }
@@ -1502,26 +1648,40 @@ fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, Stri
 
 /// 声纹库人物列表，供管理页展示。vp.people 本就只含经 redirects 解析后的有效人
 /// （merge 已把 loser 移出 people），无需再过一遍 resolve。
+/// 按 last_seen 降序返回（BTreeMap 原生是 P1,P10,P2… 字典序，对用户毫无意义）——
+/// 侧栏索引、选人面板、合并菜单三处同源，排序统一放这里。
 #[tauri::command]
 fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     let store = open_voiceprint_store(&app)?;
     let vp = store.load();
-    Ok(vp
+    let mut people: Vec<ipc::PersonSummary> = vp
         .people
         .iter()
-        .map(|(id, p)| ipc::PersonSummary {
-            id: id.clone(),
-            name: p.name.clone(),
-            total_ms: p.total_ms,
-            last_seen: p.last_seen.clone(),
-            sources: p.centroids.keys().cloned().collect(),
-            sample_paths: store
-                .sample_paths_existing(id)
+        .map(|(id, p)| {
+            let sample_paths = store.sample_paths_existing(id);
+            // 样本录制日期 = 文件 mtime(停止录制时写入,≈该场会议时间);取不到给空串。
+            let sample_dates = sample_paths
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
+                .map(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339())
+                        .unwrap_or_default()
+                })
+                .collect();
+            ipc::PersonSummary {
+                id: id.clone(),
+                name: p.name.clone(),
+                total_ms: p.total_ms,
+                last_seen: p.last_seen.clone(),
+                sources: p.centroids.keys().cloned().collect(),
+                sample_paths: sample_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+                sample_dates,
+            }
         })
-        .collect())
+        .collect();
+    people.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    Ok(people)
 }
 
 /// 改库里人物的显示名：只影响后续会话的种子姓名与笔记侧只读 join，不涉及本场
@@ -2428,6 +2588,10 @@ pub fn run() {
             get_note,
             refine_note,
             get_refined,
+            rename_refined_speaker,
+            assign_refined_person,
+            assign_note_speaker_person,
+            person_notes,
             note_audio_info,
             rename_note,
             delete_note,

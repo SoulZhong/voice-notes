@@ -64,6 +64,8 @@ export type TrackInfo = {
 export interface RefinedParagraph {
   speaker: string;
   name?: string;
+  /** 关联的全局声纹库人物 id(P<n>):种子命中或用户在说话人条手动关联时存在。 */
+  person_id?: string;
   start_ms: number;
   end_ms: number;
   text: string;
@@ -95,11 +97,20 @@ export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
 export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
-/** 返回导出文件绝对路径 */
-export const exportNote = (id: string, format: "md" | "txt") =>
-  invoke<string>("export_note", { id, format });
+/** 返回导出文件绝对路径。preferRefined=真且精修稿在盘时导精修稿(所见即所得)。 */
+export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean) =>
+  invoke<string>("export_note", { id, format, preferRefined });
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
+/** 精修稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
+export const renameRefinedSpeaker = (noteId: string, speakerId: string, name: string) =>
+  invoke<void>("rename_refined_speaker", { noteId, speakerId, name });
+/** 把精修稿说话人关联到声纹库人物(会议搭子选人),采用库中现名。 */
+export const assignRefinedPerson = (noteId: string, speakerId: string, personId: string) =>
+  invoke<void>("assign_refined_person", { noteId, speakerId, personId });
+/** 原始稿说话人关联声纹库人物:speakers.json 写 person_id 并清本地名(join 显库名)。 */
+export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, personId: string) =>
+  invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId });
 
 /** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
     Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */

@@ -110,6 +110,9 @@ pub struct PersonSummary {
     /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES;合并会带入对方的样本)。
     /// 空 = 库中无样本(旧数据/写失败),前端据此决定是否显示「试听」。
     pub sample_paths: Vec<String>,
+    /// 与 sample_paths 一一对应的录制日期(文件 mtime,RFC3339;取不到给空串)。
+    /// 样本文件在会议停止时写入,mtime≈该场会议时间,足够做「哪场的声音」标注。
+    pub sample_dates: Vec<String>,
 }
 
 /// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;

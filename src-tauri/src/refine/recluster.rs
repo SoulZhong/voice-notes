@@ -25,6 +25,8 @@ pub struct Assignment {
     pub seq: u64,
     pub speaker: String,
     pub name: Option<String>,
+    /// 命中的声纹库人物 id(P<n>):有它精修稿才能把改名同步进声纹库。
+    pub person: Option<String>,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -137,17 +139,18 @@ pub fn recluster(inputs: &[SegInput], embs: &[Option<Vec<f32>>], seeds: &[SeedCl
     // 4. 按总时长降序编号 R1..Rk。
     cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
 
-    // 5. 种子命名:簇质心对每个 seed 算余弦,最高且 ≥ SEED_ASSIGN_THRESHOLD 者取其 name。
-    let names: Vec<Option<String>> = cls
+    // 5. 种子命名/认人:簇质心对每个 seed 算余弦,最高且 ≥ SEED_ASSIGN_THRESHOLD 者
+    //    取其 (person, name)。未命名的库人物也参与——person id 是精修稿改名同步进
+    //    声纹库的锚点,不能因为还没名字就丢掉身份。
+    let matches: Vec<Option<(String, String)>> = cls
         .iter()
         .map(|c| {
             seeds
                 .iter()
-                .filter(|s| !s.name.is_empty())
                 .filter_map(|s| normalize(&s.centroid).map(|u| (s, dot(&c.centroid, &u))))
                 .filter(|(_, sim)| *sim >= SEED_ASSIGN_THRESHOLD)
                 .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(s, _)| s.name.clone())
+                .map(|(s, _)| (s.person.clone(), s.name.clone()))
         })
         .collect();
 
@@ -184,12 +187,17 @@ pub fn recluster(inputs: &[SegInput], embs: &[Option<Vec<f32>>], seeds: &[SeedCl
                 Some(k) => Assignment {
                     seq: inputs[i].seq,
                     speaker: format!("R{}", k + 1),
-                    name: names[k].clone(),
+                    name: matches[k]
+                        .as_ref()
+                        .map(|(_, n)| n.clone())
+                        .filter(|n| !n.is_empty()),
+                    person: matches[k].as_ref().map(|(p, _)| p.clone()),
                 },
                 None => Assignment {
                     seq: inputs[i].seq,
                     speaker: inputs[i].old_speaker.clone().unwrap_or_else(|| "R1".into()),
                     name: None,
+                    person: None,
                 },
             }
         })
@@ -247,6 +255,21 @@ mod tests {
         }];
         let out = recluster(&inputs, &embs, &seeds);
         assert_eq!(out[0].name.as_deref(), Some("张三"));
+        assert_eq!(out[0].person.as_deref(), Some("P1"), "命中种子须带出人物 id");
+    }
+
+    /// 未命名的库人物命中也要建立 person 关联(改名同步的锚点),name 保持 None。
+    #[test]
+    fn unnamed_seed_links_person_without_name() {
+        let a = [1.0, 0.0, 0.0];
+        let inputs = vec![seg(0, 0, 10_000), seg(1, 10_000, 20_000)];
+        let embs = vec![v(a, 0.0), v(a, 0.01)];
+        let seeds = vec![crate::diar::registry::SeedCluster {
+            person: "P4".into(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 5,
+        }];
+        let out = recluster(&inputs, &embs, &seeds);
+        assert!(out[0].name.is_none(), "未命名人物不产生名字");
+        assert_eq!(out[0].person.as_deref(), Some("P4"));
     }
 
     #[test]
