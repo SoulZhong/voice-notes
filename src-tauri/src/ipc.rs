@@ -115,6 +115,18 @@ pub struct PersonSummary {
     pub sample_dates: Vec<String>,
 }
 
+/// 整理·合并建议(suggest_person_merges 返回):把 loser 并入 winner 的推荐,
+/// 相似度是共有信道质心余弦的最大值;name 空串=未命名(前端按「说话人 N」兜底)。
+#[derive(Debug, Clone, Serialize)]
+pub struct PersonMergeSuggestion {
+    pub loser: String,
+    pub loser_name: String,
+    pub winner: String,
+    pub winner_name: String,
+    pub similarity: f32,
+    pub source: String,
+}
+
 /// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;
 /// phase∈{"copying","done","error"};error 时 message 带原因,其余为空串。
 #[derive(Debug, Clone, Serialize)]
