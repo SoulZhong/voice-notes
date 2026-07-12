@@ -15,6 +15,7 @@ pub mod diar;
 mod ailog;
 mod refine;
 pub mod mcp;
+mod telemetry;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2653,7 +2654,7 @@ extern "C" {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
@@ -2664,7 +2665,14 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(shortcuts::on_shortcut)
                 .build(),
-        )
+        );
+    // 遥测插件:未配 App-Key 时不注册,track 亦会短路,双保险。
+    let builder = if telemetry::APP_KEY.is_empty() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_aptabase::Builder::new(telemetry::APP_KEY).build())
+    };
+    builder
         .manage(AppState::default())
         .manage(player::PlayerHandle::default())
         .on_window_event(|window, event| {
@@ -2767,6 +2775,7 @@ pub fn run() {
             });
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
+            telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
