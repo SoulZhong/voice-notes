@@ -44,11 +44,12 @@
   /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
   let agentProbe = $state<Record<string, string | null>>({});
   const AGENT_OPTIONS = [
-    { key: "claude", label: "Claude Code" },
-    { key: "codex", label: "Codex" },
-    { key: "gemini", label: "Gemini" },
-    { key: "cursor", label: "Cursor" },
+    { key: "claude", label: "Claude Code", modelHint: "如 haiku、sonnet" },
+    { key: "codex", label: "Codex", modelHint: "如 gpt-5-codex" },
+    { key: "gemini", label: "Gemini", modelHint: "如 gemini-2.5-flash" },
+    { key: "cursor", label: "Cursor", modelHint: "如 sonnet-4.5" },
   ];
+  const selectedAgentOption = $derived(AGENT_OPTIONS.find((a) => a.key === refineAgent) ?? AGENT_OPTIONS[0]);
 
   // —— MCP(AI 助手接入):列表现扫现示,注册/移除后重拉;真值源是 Agent 配置文件 ——
   let mcpAgents = $state<AgentStatus[]>([]);
@@ -306,28 +307,35 @@
             <span class="preset-label">Agent</span>
             <div class="seg">
               {#each AGENT_OPTIONS as a (a.key)}
-                <label class="seg-item" title={agentProbe[a.key] ?? "未检测到,可在下方指定可执行文件路径"}>
+                <label class="seg-item">
                   <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={saveRefineAgent} />
-                  {a.label}{#if a.key in agentProbe}{agentProbe[a.key] ? " ✓" : " ⚠"}{/if}
+                  {a.label}
                 </label>
               {/each}
             </div>
+            {#if refineAgentBin.trim()}
+              <span class="agent-status">使用指定路径</span>
+            {:else if agentProbe[refineAgent]}
+              <span class="agent-status">已找到 {agentProbe[refineAgent]}</span>
+            {:else if refineAgent in agentProbe}
+              <span class="agent-status warn">未找到命令行工具</span>
+            {/if}
           </div>
           <div class="refine-fields agent-fields">
             <label class="field">
-              <span>模型(可选,空 = 该 Agent 默认)</span>
-              <input placeholder="如 haiku / gpt-5 / gemini-2.5-flash" bind:value={refineAgentModel} onblur={saveRefineAgent} />
+              <span>模型</span>
+              <input placeholder="留空用默认,{selectedAgentOption.modelHint}" bind:value={refineAgentModel} onblur={saveRefineAgent} />
             </label>
             <label class="field">
-              <span>CLI 路径(可选,空 = 自动探测)</span>
-              <input placeholder={agentProbe[refineAgent] ?? "如 ~/.local/bin/claude"} bind:value={refineAgentBin} onblur={saveRefineAgent} />
+              <span>CLI 路径</span>
+              <input placeholder="留空自动探测" bind:value={refineAgentBin} onblur={saveRefineAgent} />
             </label>
           </div>
           <p class="config-hint">
-            {#if agentProbe[refineAgent]}
-              已检测到 {agentProbe[refineAgent]}。精修由本机 Agent 完成:经 MCP 读取并写回精修稿,走该 Agent 自己的登录与额度,无需 API Key。
+            {#if refineAgentBin.trim() || agentProbe[refineAgent]}
+              无需 API Key,精修用 {selectedAgentOption.label} 本机已登录的账号和额度;未登录时精修会失败并保留原文。
             {:else}
-              未检测到所选 Agent 的命令行工具:请先安装并登录,或在上方指定可执行文件路径。
+              请先安装并登录 {selectedAgentOption.label},或在上方填写它的可执行文件路径。
             {/if}
           </p>
         {:else}
@@ -734,6 +742,14 @@
   /* Agent 模式两个可选项字段并排 */
   .agent-fields {
     grid-template-columns: minmax(10rem, 1fr) minmax(13rem, 2fr);
+  }
+  /* 所选 Agent 的探测状态:caption 级,跟在分段选择右侧 */
+  .agent-status {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  .agent-status.warn {
+    color: var(--warning-ink);
   }
   .snippet {
     margin: 0 0 0.5rem;
