@@ -71,6 +71,7 @@
   let langFilter = $state(false);
   let keepAudio = $state(false);
   let refineOn = $state(false);
+  let telemetryOn = $state(true);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
@@ -145,6 +146,7 @@
     refineOn = s.refine_enabled;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
+    telemetryOn = s.telemetry_enabled;
   }
 
   async function refreshDiskUsage() {
@@ -514,6 +516,19 @@
           bind:checked={trayEnabled}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
+        />
+      </label>
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">匿名使用统计</span>
+          <span class="row-desc">仅上报功能使用次数与版本信息，绝不包含任何会议内容</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={telemetryOn}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.telemetry_enabled = telemetryOn))}
         />
       </label>
     </div>
