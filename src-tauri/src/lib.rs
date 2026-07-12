@@ -339,6 +339,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
                 if refine_agent_ready(&s) {
+                    telemetry::track(
+                        &app,
+                        telemetry::Event::NoteRefined {
+                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
+                        },
+                    );
                     emit("llm", "running");
                     let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
                         .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
@@ -374,6 +380,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         }
                     }
                 } else if refine_llm_ready(&s) {
+                    telemetry::track(
+                        &app,
+                        telemetry::Event::NoteRefined {
+                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
+                        },
+                    );
                     emit("llm", "running");
                     let cfg = refine::llm::LlmConfig {
                         base_url: s.refine_base_url.clone(),
@@ -1135,7 +1147,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
-    spawn_session(
+    let result = spawn_session(
         app.clone(),
         state.running.clone(),
         state.generation.clone(),
@@ -1144,7 +1156,15 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         state.embedder_cache.clone(),
         state.transcode.clone(),
         NoteTarget::New,
-    )
+    );
+    if result.is_ok() {
+        if let Ok(dir) = app.path().app_data_dir() {
+            let source =
+                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
+            telemetry::track(app, telemetry::Event::RecordingStarted { source });
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -1169,8 +1189,8 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     if !models::recording_ready(&current_asr(&app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
-    spawn_session(
-        app,
+    let result = spawn_session(
+        app.clone(),
         state.running.clone(),
         state.generation.clone(),
         state.session.clone(),
@@ -1178,7 +1198,15 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         state.embedder_cache.clone(),
         state.transcode.clone(),
         NoteTarget::Resume(note_id),
-    )
+    );
+    if result.is_ok() {
+        if let Ok(dir) = app.path().app_data_dir() {
+            let source =
+                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
+            telemetry::track(&app, telemetry::Event::RecordingStarted { source });
+        }
+    }
+    result
 }
 
 /// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
@@ -1199,6 +1227,9 @@ fn do_stop_recording(app: &AppHandle) {
     let sess = state.session.lock().unwrap().take();
     let mut note_id = String::new();
     if let Some(s) = sess {
+        // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
+        // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
+        telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
         let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
         stash_model(&state.recognizer_cache, returned);
         stash_model(&state.embedder_cache, embedder);
@@ -1707,10 +1738,16 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool)
     } else {
         None
     };
-    store::NoteStore::new(dir)
+    let result = store::NoteStore::new(dir)
         .export(&id, &format, refined.as_ref())
         .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if result.is_ok() {
+        if let Some(fmt) = telemetry::ExportFormat::parse(&format) {
+            telemetry::track(&app, telemetry::Event::NoteExported { format: fmt });
+        }
+    }
+    result
 }
 
 /// 声纹库四命令共用：打开 data_root 下的 VoiceprintStore（与逐场笔记目录并列，

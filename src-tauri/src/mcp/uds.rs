@@ -138,6 +138,9 @@ fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
 }
 
 fn dispatch(app: &tauri::AppHandle, req: &Req) -> Resp {
+    if let Some(op) = crate::telemetry::McpOp::parse(&req.op) {
+        crate::telemetry::track(app, crate::telemetry::Event::McpToolUsed { op });
+    }
     dispatch_with(&AppBackend(app), req)
 }
 
