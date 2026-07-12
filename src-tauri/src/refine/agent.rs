@@ -270,10 +270,58 @@ fn title_command(kind: AgentKind, bin: &Path, model: &str, prompt: &str, scratch
     cmd
 }
 
+/// GUI 从 Finder/launchd 启动不继承 shell 的代理变量;需经本地代理出海的网络环境
+/// 下,Agent CLI 直连 API 会被 403(真机实锤:同一台机器终端带 proxy 环境变量即成功,
+/// GUI spawn 无代理变量即 403 Request not allowed)。spawn 前若环境里没有任何代理
+/// 变量,读 macOS 系统代理(scutil --proxy)注入;环境已有代理(终端 dev/CLI 场景)
+/// 一律不动——显式配置永远优先。
+fn proxy_env_to_inject() -> Vec<(String, String)> {
+    const KEYS: [&str; 4] = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"];
+    if KEYS.iter().any(|k| std::env::var_os(k).is_some()) {
+        return Vec::new();
+    }
+    let Ok(out) = Command::new("scutil").arg("--proxy").output() else { return Vec::new() };
+    parse_scutil_proxy(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 解析 `scutil --proxy` 输出为待注入的代理环境变量(纯函数供单测)。
+/// 只认显式启用(XxxEnable=1)且主机/端口齐全的条目;有注入时补 no_proxy 本机段,
+/// 免得经代理绕一圈去连 localhost(MCP serve 是 stdio 不走网,这是对未来的防御)。
+fn parse_scutil_proxy(text: &str) -> Vec<(String, String)> {
+    let get = |key: &str| -> Option<String> {
+        text.lines().find_map(|l| {
+            l.trim().strip_prefix(key)?.trim().strip_prefix(':').map(|v| v.trim().to_string())
+        })
+    };
+    let enabled = |key: &str| get(key).as_deref() == Some("1");
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push_pair = |lower: &str, upper: &str, host: Option<String>, port: Option<String>| {
+        if let (Some(h), Some(p)) = (host, port) {
+            let url = format!("http://{h}:{p}");
+            out.push((lower.into(), url.clone()));
+            out.push((upper.into(), url));
+        }
+    };
+    if enabled("HTTPEnable") {
+        push_pair("http_proxy", "HTTP_PROXY", get("HTTPProxy"), get("HTTPPort"));
+    }
+    if enabled("HTTPSEnable") {
+        push_pair("https_proxy", "HTTPS_PROXY", get("HTTPSProxy"), get("HTTPSPort"));
+    }
+    if !out.is_empty() {
+        out.push(("no_proxy".into(), "localhost,127.0.0.1".into()));
+        out.push(("NO_PROXY".into(), "localhost,127.0.0.1".into()));
+    }
+    out
+}
+
 /// spawn + 限时等待。stdout/stderr 重定向到 scratch 下的文件——用管道的话,子进程
 /// 输出超过管道缓冲而这边只在轮询 try_wait 不读管道,会互相卡死。超时 kill 判失败。
 /// 返回 (exit_ok, stdout, stderr尾部)。
 fn run_with_timeout(mut cmd: Command, scratch: &Path, timeout_s: u64) -> anyhow::Result<(bool, String, String)> {
+    for (k, v) in proxy_env_to_inject() {
+        cmd.env(k, v);
+    }
     let out_path = scratch.join("agent-stdout.log");
     let err_path = scratch.join("agent-stderr.log");
     let child_out = std::fs::File::create(&out_path)?;
@@ -613,6 +661,24 @@ mod tests {
         let ps = doc("done", &["讨论了发布计划。"]).paragraphs;
         assert_eq!(gen_title(AgentKind::Claude, &bin, "", &ps, None).unwrap(), "发布计划评审");
         assert!(gen_title(AgentKind::Claude, &bin, "", &[], None).is_err(), "空稿不发起");
+    }
+
+    #[test]
+    fn parse_scutil_proxy_extracts_enabled_entries_only() {
+        let real = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 127.0.0.1\n  }\n  HTTPEnable : 1\n  HTTPPort : 7890\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 7890\n  HTTPSProxy : 127.0.0.1\n  ProxyAutoConfigEnable : 0\n  SOCKSEnable : 1\n  SOCKSPort : 7890\n  SOCKSProxy : 127.0.0.1\n}";
+        let pairs = parse_scutil_proxy(real);
+        let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("http_proxy"), Some("http://127.0.0.1:7890"));
+        assert_eq!(get("HTTPS_PROXY"), Some("http://127.0.0.1:7890"));
+        assert_eq!(get("no_proxy"), Some("localhost,127.0.0.1"), "有注入必带本机豁免");
+        assert_eq!(pairs.len(), 6, "http/https 大小写各一 + no_proxy 两份");
+
+        // 系统代理关闭 → 不注入任何东西
+        let off = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n}";
+        assert!(parse_scutil_proxy(off).is_empty());
+        // 启用但缺端口 → 跳过该条目,不造出残缺 URL
+        let broken = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n}";
+        assert!(parse_scutil_proxy(broken).is_empty());
     }
 
     #[test]
