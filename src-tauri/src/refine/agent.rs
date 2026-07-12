@@ -131,7 +131,14 @@ fn refine_prompt(note_id: &str) -> String {
 }
 
 /// voice-notes 自身二进制路径(Agent spawn `<exe> mcp serve` 用)。
+/// VN_SELF_EXE 供 e2e 注入(cargo test 进程的 current_exe 是测试二进制,充当不了
+/// MCP server;与 mcp::app_data_dir 的 VN_APP_DATA 同一惯例,生产不设)。
 fn self_exe() -> anyhow::Result<PathBuf> {
+    if let Ok(p) = std::env::var("VN_SELF_EXE") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     Ok(std::env::current_exe()?)
 }
 
@@ -612,5 +619,85 @@ mod tests {
     fn probe_all_covers_four_agents() {
         let keys: Vec<&str> = probe_all().into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, vec!["claude", "codex", "gemini", "cursor"]);
+    }
+
+    /// 真机 e2e(默认 ignore):真 claude 走完整 run_refine 链路——spawn → 自家
+    /// mcp serve → get_note → apply_refined_texts 写回 → 盘上校验,并断言 AI 日志
+    /// 两侧留痕(本进程 agent_refine + serve 子进程 mcp_apply)。
+    /// 运行:VN_SELF_EXE=<voice-notes 二进制绝对路径> cargo test --lib \
+    ///       e2e_claude_refine -- --ignored --nocapture
+    /// 依赖:claude CLI 已装已登录;消耗少量订阅额度(haiku,一次精修)。
+    #[test]
+    #[ignore]
+    fn e2e_claude_refine_leaves_full_ailog_trail() {
+        let Ok(self_exe) = std::env::var("VN_SELF_EXE") else {
+            eprintln!("跳过:未设 VN_SELF_EXE(需指向 voice-notes 二进制)");
+            return;
+        };
+        assert!(Path::new(&self_exe).is_file(), "VN_SELF_EXE 不存在: {self_exe}");
+        let Some(bin) = resolve_bin(AgentKind::Claude, "") else {
+            eprintln!("跳过:本机未检测到 claude CLI");
+            return;
+        };
+        let _guard =
+            crate::mcp::ENV_VAR_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VN_APP_DATA", tmp.path()); // serve 子进程经环境继承同一数据根
+        let note_id = "20260712-090000";
+        let note_dir = tmp.path().join("notes").join(note_id);
+        std::fs::create_dir_all(&note_dir).unwrap();
+        std::fs::write(
+            note_dir.join("meta.json"),
+            serde_json::json!({
+                "schema_version": 1, "id": note_id, "title": "e2e 会议",
+                "started_at": "2026-07-12T09:00:00+08:00",
+                "ended_at": "2026-07-12T09:10:00+08:00", "state": "complete"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            note_dir.join("segments.jsonl"),
+            r#"{"seq":0,"source":"mic","text":"我们肯计要在下周发布新版本","start_ms":0,"end_ms":4000,"speaker":"S1"}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            note_dir.join("speakers.json"),
+            serde_json::json!({ "S1": { "name": "张三", "sources": ["mic"], "count": 1 } }).to_string(),
+        )
+        .unwrap();
+        write_refined_atomic(
+            &note_dir,
+            &doc("off", &["我们肯计要在下周发布新版本", "嗯嗯这个这个方案我觉得可以", "用claude code来做精修没问题"]),
+        )
+        .unwrap();
+
+        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: note_id.into() };
+        run_refine(&note_dir, note_id, AgentKind::Claude, &bin, "haiku", Some(&ctx))
+            .expect("真 claude 精修应成功(需已登录)");
+
+        let after = load_refined(&note_dir).unwrap();
+        assert_eq!(after.stages.llm, "done");
+        assert_eq!(after.paragraphs.len(), 3);
+        assert!(!after.paragraphs[0].text.contains("肯计"), "错字应被纠正: {}", after.paragraphs[0].text);
+
+        // 日志两侧齐:本进程的 agent_refine + serve 子进程的 mcp_apply。
+        let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        eprintln!("=== AI 日志({} 条)===", v["total"]);
+        for e in v["entries"].as_array().unwrap() {
+            eprintln!("{}", serde_json::to_string_pretty(e).unwrap());
+        }
+        let entries = v["entries"].as_array().unwrap();
+        let agent = entries.iter().find(|e| e["kind"] == "agent_refine").expect("缺 agent_refine 条目");
+        assert_eq!(agent["status"], "ok");
+        assert_eq!(agent["provider"], "claude");
+        assert!(agent["request"]["prompt"].as_str().unwrap().contains(note_id));
+        assert!(agent["response"]["exit_ok"].as_bool().unwrap());
+        let apply = entries.iter().find(|e| e["kind"] == "mcp_apply").expect("缺 mcp_apply 条目(serve 子进程写)");
+        assert_eq!(apply["status"], "ok");
+        assert!(!apply["request"]["updates"].as_array().unwrap().is_empty(), "写回应含逐段修订全文");
+        std::env::remove_var("VN_APP_DATA");
     }
 }
