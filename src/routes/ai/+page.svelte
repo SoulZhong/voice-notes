@@ -620,7 +620,11 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 0.9rem;
+    /* 默认窗宽(800,内容区 ~500px)下右侧控件簇可能放不下:允许换行,
+       控件整体落到下一行(margin-left:auto 保持右对齐),绝不把左侧说明列
+       压成竖排单字。 */
+    flex-wrap: wrap;
+    gap: 0.5rem 0.9rem;
     padding: 0.55rem 1rem;
     border-bottom: 1px solid var(--hairline);
   }
@@ -633,7 +637,8 @@
   }
   .row-info {
     flex: 1;
-    min-width: 0;
+    /* 保底宽:窄窗时宁可让右侧控件换行,也不许说明列被压扁 */
+    min-width: 11rem;
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
@@ -741,24 +746,26 @@
     gap: 0.7rem;
     padding: 0.8rem 1rem 0.9rem;
   }
-  /* 一键填充按钮簇(settings-row 右侧,窄窗允许换行右对齐) */
+  /* 一键填充按钮簇(settings-row 右侧,窄窗随 .row 换行整体落下一行,右对齐) */
   .preset-btns {
     display: flex;
     align-items: center;
     justify-content: flex-end;
     gap: 0.45rem;
     flex-wrap: wrap;
+    margin-left: auto;
   }
   .config-hint {
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0;
   }
-  /* 分段单选(与设置页 .seg 同一控件语言) */
+  /* 分段单选(与设置页 .seg 同一控件语言);margin-left:auto 保证窄窗换行后仍右对齐 */
   .seg {
     display: flex;
     gap: 2px;
     flex: none;
+    margin-left: auto;
     background: var(--surface-press);
     border-radius: var(--radius-md);
     padding: 2px;
@@ -790,6 +797,7 @@
   .row-input {
     flex: none;
     width: 11rem;
+    margin-left: auto;
     box-sizing: border-box;
     padding: 0.32em 0.6em;
     border: none;
