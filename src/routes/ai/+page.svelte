@@ -30,13 +30,32 @@
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
+  /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案。
+      豆包(火山方舟)的调用凭据是控制台创建的「推理接入点」ID(ep- 开头),不是
+      裸模型名——预填模型名对要求接入点的账号是坏值,故 model 留空、整行换文案。 */
   const REFINE_PRESETS = [
     { label: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
     { label: "通义千问", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
-    { label: "豆包", base: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-1-6-250615" },
+    {
+      label: "豆包",
+      base: "https://ark.cn-beijing.volces.com/api/v3",
+      model: "",
+      modelLabel: "接入点",
+      modelDesc: "火山方舟的推理接入点 ID,在方舟控制台「在线推理」创建;部分模型也可直接填模型名",
+      modelPlaceholder: "ep-20250712…",
+    },
     { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-  ];
+  ] as {
+    label: string;
+    base: string;
+    model: string;
+    modelLabel?: string;
+    modelDesc?: string;
+    modelPlaceholder?: string;
+  }[];
+  /** 当前接口地址命中的预设(用户手改过地址就不再套预设文案)。 */
+  const activePreset = $derived(REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim()));
 
   // —— 精修执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
   let refineProvider = $state("openai");
@@ -387,10 +406,15 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">模型</span>
-            <span class="row-desc">该服务商的模型名</span>
+            <span class="row-label">{activePreset?.modelLabel ?? "模型"}</span>
+            <span class="row-desc">{activePreset?.modelDesc ?? "该服务商的模型名"}</span>
           </div>
-          <input class="row-input" placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+          <input
+            class="row-input"
+            placeholder={activePreset?.modelPlaceholder ?? "deepseek-chat"}
+            bind:value={refineModel}
+            onblur={saveRefine}
+          />
         </div>
         <div class="row">
           <div class="row-info">
