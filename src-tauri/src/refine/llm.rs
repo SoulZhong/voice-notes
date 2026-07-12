@@ -58,7 +58,12 @@ impl std::fmt::Display for ChunkErr {
     }
 }
 
-fn call_chunk(cfg: &LlmConfig, glossary: &Value, texts: &[&str]) -> Result<(Value, Vec<String>), ChunkErr> {
+fn call_chunk(
+    cfg: &LlmConfig,
+    glossary: &Value,
+    texts: &[&str],
+    log: Option<&crate::ailog::Ctx>,
+) -> Result<(Value, Vec<String>), ChunkErr> {
     let numbered: String = texts
         .iter()
         .enumerate()
@@ -66,7 +71,7 @@ fn call_chunk(cfg: &LlmConfig, glossary: &Value, texts: &[&str]) -> Result<(Valu
         .collect();
     let user = format!("术语表(沿用并可扩充):{glossary}\n段落:\n{numbered}");
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = json!({
+    let body_json = json!({
         "model": cfg.model,
         "temperature": 0.1,
         "response_format": { "type": "json_object" },
@@ -74,13 +79,45 @@ fn call_chunk(cfg: &LlmConfig, glossary: &Value, texts: &[&str]) -> Result<(Valu
             { "role": "system", "content": SYSTEM_PROMPT },
             { "role": "user", "content": user },
         ],
-    })
-    .to_string();
-    let resp_text = ureq::post(&url)
+    });
+    let started = std::time::Instant::now();
+    let result = do_call_chunk(cfg, &url, &body_json.to_string(), texts.len());
+    // AI 日志:请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
+    if let Some(ctx) = log {
+        let (response, status, error) = match &result {
+            Ok((raw, _, _)) => (Value::String(raw.clone()), "ok", None),
+            Err(e) => (Value::Null, "error", Some(e.to_string())),
+        };
+        crate::ailog::record(
+            ctx,
+            crate::ailog::Draft {
+                kind: "refine_chunk",
+                provider: "openai".into(),
+                model: Some(cfg.model.clone()),
+                endpoint: Some(url.clone()),
+                request: body_json,
+                response,
+                status,
+                error,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
+    result.map(|(_, glossary, texts)| (glossary, texts))
+}
+
+/// 网络+解析的本体,返回 (响应原文, glossary, texts) 供 call_chunk 记日志后拆用。
+fn do_call_chunk(
+    cfg: &LlmConfig,
+    url: &str,
+    body: &str,
+    expect_len: usize,
+) -> Result<(String, Value, Vec<String>), ChunkErr> {
+    let resp_text = ureq::post(url)
         .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
         .set("content-type", "application/json")
-        .send_string(&body)
+        .send_string(body)
         .map_err(|e| ChunkErr::Network(e.into()))?
         .into_string()
         .map_err(|e| ChunkErr::Network(e.into()))?;
@@ -95,19 +132,23 @@ fn call_chunk(cfg: &LlmConfig, glossary: &Value, texts: &[&str]) -> Result<(Valu
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    if texts_out.len() != texts.len() {
+    if texts_out.len() != expect_len {
         return Err(ChunkErr::Content(anyhow::anyhow!(
             "texts 长度不符: 期望 {} 实得 {}",
-            texts.len(),
+            expect_len,
             texts_out.len()
         )));
     }
-    Ok((parsed["glossary"].clone(), texts_out))
+    Ok((resp_text, parsed["glossary"].clone(), texts_out))
 }
 
 /// 为整场笔记生成主题标题(精修完成后调用,替换未被用户改过的默认标题)。
 /// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响精修结果。
-pub fn gen_title(cfg: &LlmConfig, paragraphs: &[RefinedParagraph]) -> anyhow::Result<String> {
+pub fn gen_title(
+    cfg: &LlmConfig,
+    paragraphs: &[RefinedParagraph],
+    log: Option<&crate::ailog::Ctx>,
+) -> anyhow::Result<String> {
     let mut text = String::new();
     for p in paragraphs {
         if text.chars().count() > 1500 {
@@ -120,21 +161,44 @@ pub fn gen_title(cfg: &LlmConfig, paragraphs: &[RefinedParagraph]) -> anyhow::Re
         anyhow::bail!("精修稿无内容,不生成标题");
     }
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = json!({
+    let body_json = json!({
         "model": cfg.model,
         "temperature": 0.3,
         "messages": [
             { "role": "system", "content": "你为会议转写起标题。只输出一个不超过 12 个字的中文标题,概括这场对话的核心主题;不要引号、标点或任何解释。" },
             { "role": "user", "content": text },
         ],
-    })
-    .to_string();
-    let resp_text = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
-        .set("authorization", &format!("Bearer {}", cfg.api_key))
-        .set("content-type", "application/json")
-        .send_string(&body)?
-        .into_string()?;
+    });
+    let started = std::time::Instant::now();
+    let resp_result: anyhow::Result<String> = (|| {
+        Ok(ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+            .set("authorization", &format!("Bearer {}", cfg.api_key))
+            .set("content-type", "application/json")
+            .send_string(&body_json.to_string())?
+            .into_string()?)
+    })();
+    if let Some(ctx) = log {
+        let (response, status, error) = match &resp_result {
+            Ok(raw) => (Value::String(raw.clone()), "ok", None),
+            Err(e) => (Value::Null, "error", Some(e.to_string())),
+        };
+        crate::ailog::record(
+            ctx,
+            crate::ailog::Draft {
+                kind: "title",
+                provider: "openai".into(),
+                model: Some(cfg.model.clone()),
+                endpoint: Some(url.clone()),
+                request: body_json,
+                response,
+                status,
+                error,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
+    let resp_text = resp_result?;
     let resp: Value = serde_json::from_str(&resp_text)?;
     let content = resp["choices"][0]["message"]["content"]
         .as_str()
@@ -153,7 +217,8 @@ pub fn gen_title(cfg: &LlmConfig, paragraphs: &[RefinedParagraph]) -> anyhow::Re
 
 /// 逐块精修,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
-pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph]) -> LlmOutcome {
+/// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响精修)。
+pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<&crate::ailog::Ctx>) -> LlmOutcome {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
         return LlmOutcome::Done;
@@ -163,7 +228,7 @@ pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph]) -> LlmOutcom
     let mut network_failed = 0usize;
     for chunk in &chunks {
         let texts: Vec<&str> = chunk.iter().map(|&i| paragraphs[i].text.as_str()).collect();
-        match call_chunk(cfg, &glossary, &texts) {
+        match call_chunk(cfg, &glossary, &texts, log) {
             Ok((g, outs)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {
@@ -280,7 +345,7 @@ mod tests {
         let base = mock_server(vec![chat_body(&["我们肯定要做。"], r#"{"肯计":"肯定"}"#)]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("我们肯计要做。")];
-        assert!(matches!(polish(&cfg, &mut ps), LlmOutcome::Done));
+        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Done));
         assert_eq!(ps[0].text, "我们肯定要做。");
     }
 
@@ -289,7 +354,7 @@ mod tests {
         let base = mock_server(vec![chat_body(&["只有一段", "但输入两段之外多了一段"], "{}")]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文一")];
-        assert!(matches!(polish(&cfg, &mut ps), LlmOutcome::Partial(1)));
+        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Partial(1)));
         assert_eq!(ps[0].text, "原文一", "长度不符必须保留原文");
     }
 
@@ -297,8 +362,35 @@ mod tests {
     fn connection_refused_is_failed_and_keeps_originals() {
         let cfg = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文")];
-        assert!(matches!(polish(&cfg, &mut ps), LlmOutcome::Failed));
+        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Failed));
         assert_eq!(ps[0].text, "原文");
+    }
+
+    /// AI 日志:成功块记完整请求体+响应原文,失败块记 error;key 绝不落盘。
+    #[test]
+    fn polish_logs_request_and_response_per_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: "n1".into() };
+        let base = mock_server(vec![chat_body(&["修订。"], "{}")]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "SECRET-KEY".into() };
+        let mut ps = vec![para("原文。")];
+        assert!(matches!(polish(&cfg, &mut ps, Some(&ctx)), LlmOutcome::Done));
+        // 连不上的一轮:同样要留痕
+        let cfg_bad = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let mut ps2 = vec![para("原文。")];
+        assert!(matches!(polish(&cfg_bad, &mut ps2, Some(&ctx)), LlmOutcome::Failed));
+        let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        assert_eq!(v["total"], 2);
+        let all = serde_json::to_string(&v);
+        assert!(!all.unwrap().contains("SECRET-KEY"), "api key 绝不落日志");
+        let entries = v["entries"].as_array().unwrap();
+        let ok = entries.iter().find(|e| e["status"] == "ok").unwrap();
+        assert_eq!(ok["kind"], "refine_chunk");
+        assert_eq!(ok["note_id"], "n1");
+        assert!(ok["request"]["messages"][1]["content"].as_str().unwrap().contains("原文。"), "请求体全量");
+        assert!(ok["response"].as_str().unwrap().contains("choices"), "响应原文全量");
+        let err = entries.iter().find(|e| e["status"] == "error").unwrap();
+        assert!(err["error"].as_str().unwrap().len() > 0);
     }
 
     #[test]

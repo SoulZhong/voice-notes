@@ -14,10 +14,13 @@
     mcpCapabilities,
     mcpSkillRead,
     mcpSkillSave,
+    refineAgentsProbe,
     type AgentStatus,
     type Capabilities,
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { goto } from "$app/navigation";
+  import { aiLogsQuery } from "$lib/ailog";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
@@ -34,6 +37,23 @@
     { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   ];
+
+  // —— 精修执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
+  let refineProvider = $state("openai");
+  let refineAgent = $state("claude");
+  let refineAgentBin = $state("");
+  let refineAgentModel = $state("");
+  /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
+  let agentProbe = $state<Record<string, string | null>>({});
+  const AGENT_OPTIONS = [
+    { key: "claude", label: "Claude Code", modelHint: "如 haiku、sonnet" },
+    { key: "codex", label: "Codex", modelHint: "如 gpt-5-codex" },
+    { key: "gemini", label: "Gemini", modelHint: "如 gemini-2.5-flash" },
+    { key: "cursor", label: "Cursor", modelHint: "如 sonnet-4.5" },
+  ];
+  const selectedAgentOption = $derived(AGENT_OPTIONS.find((a) => a.key === refineAgent) ?? AGENT_OPTIONS[0]);
+  /** 家目录缩写为 ~,长路径在 row-desc 里不至于喧宾夺主。 */
+  const shortPath = (p: string) => p.replace(/^\/Users\/[^/]+/, "~");
 
   // —— MCP(AI 助手接入):列表现扫现示,注册/移除后重拉;真值源是 Agent 配置文件 ——
   let mcpAgents = $state<AgentStatus[]>([]);
@@ -56,7 +76,20 @@
   let capabilities = $state<Capabilities | null>(null);
   let capError = $state("");
 
+  // —— AI 调用日志:本页只留入口行(浏览/导出/打开目录在 /ai/logs 独立页),
+  //    条数仅作说明位展示,拉取失败静默(入口不因统计失败而残缺)。 ——
+  let aiLogsTotal = $state(0);
+
+  async function loadAiLogsTotal() {
+    try {
+      aiLogsTotal = (await aiLogsQuery({ limit: 1 })).total;
+    } catch {
+      /* 静默 */
+    }
+  }
+
   onMount(() => {
+    loadAiLogsTotal();
     (async () => {
       try {
         const s = await getSettings();
@@ -64,9 +97,14 @@
         refineBaseUrl = s.refine_base_url;
         refineModel = s.refine_model;
         refineKey = s.refine_api_key;
+        refineProvider = s.refine_provider;
+        refineAgent = s.refine_agent;
+        refineAgentBin = s.refine_agent_bin;
+        refineAgentModel = s.refine_agent_model;
         mcpAllowControl = s.mcp_allow_control;
       } catch { /* 首载失败:控件保持默认,操作时会再报错 */ }
     })();
+    refineAgentsProbe().then((v) => (agentProbe = v)).catch(() => {});
     refreshMcp();
     refreshSkill();
     mcpManualSnippet().then((v) => (mcpSnippet = v)).catch(() => {});
@@ -85,6 +123,10 @@
       refineBaseUrl = fresh.refine_base_url;
       refineModel = fresh.refine_model;
       refineKey = fresh.refine_api_key;
+      refineProvider = fresh.refine_provider;
+      refineAgent = fresh.refine_agent;
+      refineAgentBin = fresh.refine_agent_bin;
+      refineAgentModel = fresh.refine_agent_model;
       mcpAllowControl = fresh.mcp_allow_control;
     } catch (e) {
       error = `保存失败: ${e}`;
@@ -93,6 +135,10 @@
         refineBaseUrl = settings.refine_base_url;
         refineModel = settings.refine_model;
         refineKey = settings.refine_api_key;
+        refineProvider = settings.refine_provider;
+        refineAgent = settings.refine_agent;
+        refineAgentBin = settings.refine_agent_bin;
+        refineAgentModel = settings.refine_agent_model;
         mcpAllowControl = settings.mcp_allow_control;
       }
     }
@@ -108,6 +154,14 @@
       s.refine_base_url = refineBaseUrl.trim();
       s.refine_model = refineModel.trim();
       s.refine_api_key = refineKey.trim();
+    });
+  }
+  function saveRefineAgent() {
+    saveSetting((s) => {
+      s.refine_provider = refineProvider;
+      s.refine_agent = refineAgent;
+      s.refine_agent_bin = refineAgentBin.trim();
+      s.refine_agent_model = refineAgentModel.trim();
     });
   }
 
@@ -250,39 +304,111 @@
     <div class="banner">{error}</div>
   {/if}
 
-  <!-- —— 智能精修 —— -->
+  <!-- —— 智能精修:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
   <section>
+    <h2 class="section-title">智能精修</h2>
     <div class="rows">
-      <div class="config">
-        <div class="preset-row">
-          <span class="preset-label">一键填充</span>
-          {#each REFINE_PRESETS as p (p.label)}
-            <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
-          {/each}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">精修方式</span>
+          <span class="row-desc">
+            {refineProvider === "agent"
+              ? "用本机已登录的 AI 助手精修,不需要 API Key"
+              : "用 OpenAI 兼容的在线接口精修,需要 API Key"}
+          </span>
         </div>
-        <div class="refine-fields">
-          <label class="field">
-            <span>接口地址</span>
-            <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+        <div class="seg">
+          <label class="seg-item">
+            <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />在线接口
           </label>
-          <label class="field">
-            <span>模型</span>
-            <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+          <label class="seg-item">
+            <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />本机 Agent
           </label>
-          <label class="field">
-            <span>API Key</span>
-            <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
-          </label>
+        </div>
+      </div>
+      {#if refineProvider === "agent"}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">Agent</span>
+            <span class="row-desc">
+              {#if refineAgentBin.trim()}
+                使用指定路径 {shortPath(refineAgentBin)}
+              {:else if agentProbe[refineAgent]}
+                已找到 {shortPath(agentProbe[refineAgent] ?? "")}
+              {:else if refineAgent in agentProbe}
+                <span class="desc-warn">未找到命令行工具:请先安装并登录,或在下方指定路径</span>
+              {:else}
+                检测中…
+              {/if}
+            </span>
+          </div>
+          <div class="seg">
+            {#each AGENT_OPTIONS as a (a.key)}
+              <label class="seg-item">
+                <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={saveRefineAgent} />
+                {a.label}
+              </label>
+            {/each}
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">模型</span>
+            <span class="row-desc">留空使用 {selectedAgentOption.label} 的默认模型</span>
+          </div>
+          <input class="row-input" placeholder={selectedAgentOption.modelHint} bind:value={refineAgentModel} onblur={saveRefineAgent} />
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">CLI 路径</span>
+            <span class="row-desc">自动探测不到时,手动指定可执行文件</span>
+          </div>
+          <input class="row-input wide" placeholder="自动探测" bind:value={refineAgentBin} onblur={saveRefineAgent} />
+        </div>
+        <p class="config-hint">精修失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
+      {:else}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">一键填充</span>
+            <span class="row-desc">选择常用服务商,自动填入接口地址与模型</span>
+          </div>
+          <div class="preset-btns">
+            {#each REFINE_PRESETS as p (p.label)}
+              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+            {/each}
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">接口地址</span>
+            <span class="row-desc">OpenAI 兼容服务的 Base URL</span>
+          </div>
+          <input class="row-input wide" placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">模型</span>
+            <span class="row-desc">该服务商的模型名</span>
+          </div>
+          <input class="row-input" placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">API Key</span>
+            <span class="row-desc">只保存在本机,不随笔记上传</span>
+          </div>
+          <input class="row-input wide" type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
         </div>
         {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
+          <p class="config-hint">三项配齐后精修生效。</p>
         {/if}
-      </div>
+      {/if}
     </div>
   </section>
 
   <!-- —— AI 助手接入(MCP) —— -->
   <section>
+    <h2 class="section-title">AI 助手接入</h2>
     <div class="rows">
       {#if mcpError}
         <div class="banner warn">{mcpError}</div>
@@ -417,6 +543,22 @@
           </div>
         {/each}
       {/if}
+    </div>
+  </section>
+
+  <!-- —— AI 调用日志:入口行,浏览/导出/打开目录在独立页 /ai/logs —— -->
+  <section>
+    <h2 class="section-title">AI 调用日志</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">调用记录</span>
+          <span class="row-desc">
+            精修与标题生成的每次对外 AI 调用,请求与响应全量留痕{aiLogsTotal > 0 ? `;共 ${aiLogsTotal} 条` : ""}
+          </span>
+        </div>
+        <button class="btn-secondary" onclick={() => goto("/ai/logs")}>查看</button>
+      </div>
     </div>
   </section>
 </div>
@@ -568,58 +710,83 @@
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
   }
-  /* 大模型接口配置块:卡片内嵌面板(常显;启用开关在 设置 → 录制) */
+  /* 卡片内嵌面板(skill 查看/编辑卡、手动配置折叠卡用) */
   .config {
     display: flex;
     flex-direction: column;
     gap: 0.7rem;
     padding: 0.8rem 1rem 0.9rem;
   }
-  .preset-row {
+  /* 一键填充按钮簇(settings-row 右侧,窄窗允许换行右对齐) */
+  .preset-btns {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.45rem;
     flex-wrap: wrap;
-  }
-  .preset-label {
-    font-size: 0.8rem;
-    color: var(--ink-faint);
-    margin-right: 0.15rem;
-  }
-  .refine-fields {
-    display: grid;
-    grid-template-columns: minmax(13rem, 2fr) minmax(8rem, 1fr) minmax(8rem, 1fr);
-    gap: 0.6rem;
-  }
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    min-width: 0;
-  }
-  .field > span {
-    font-size: 0.78rem;
-    color: var(--ink-secondary);
-  }
-  .field input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--canvas);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .field input:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
   }
   .config-hint {
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0;
+  }
+  /* 分段单选(与设置页 .seg 同一控件语言) */
+  .seg {
+    display: flex;
+    gap: 2px;
+    flex: none;
+    background: var(--surface-press);
+    border-radius: var(--radius-md);
+    padding: 2px;
+  }
+  .seg-item {
+    position: relative;
+    padding: 0.26em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    border-radius: calc(var(--radius-md) - 2px);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .seg-item:hover {
+    color: var(--ink);
+  }
+  .seg-item:has(input:checked) {
+    background: var(--canvas);
+    color: var(--ink);
+    box-shadow: var(--shadow-btn);
+  }
+  .seg-item input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* 行内输入(settings-row 右侧控件版 input:surface-press 底、无边,聚焦浮出 canvas + accent 环) */
+  .row-input {
+    flex: none;
+    width: 11rem;
+    box-sizing: border-box;
+    padding: 0.32em 0.6em;
+    border: none;
+    border-radius: var(--radius-md);
+    background: var(--surface-press);
+    color: var(--ink);
+    font-size: 0.85rem;
+  }
+  .row-input.wide {
+    width: 18rem;
+  }
+  .row-input:focus {
+    outline: none;
+    background: var(--canvas);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .row-input::placeholder {
+    color: var(--ink-faint);
+  }
+  .desc-warn {
+    color: var(--warning-ink);
   }
   .snippet {
     margin: 0 0 0.5rem;

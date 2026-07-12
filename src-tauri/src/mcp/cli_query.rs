@@ -72,11 +72,14 @@ fn first_positional(args: &[String]) -> Option<String> {
     None
 }
 
-const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get> ...\n\
-  list   [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
-  search <关键词> [--limit N] [--json]\n\
-  get    <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
-  get    … [--raw]  # 忽略精修稿,取原始逐字稿";
+const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle> ...\n\
+  list    [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
+  search  <关键词> [--limit N] [--json]\n\
+  get     <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
+  get     … [--raw]  # 忽略精修稿,取原始逐字稿\n\
+  retitle [--dry-run] [--agent claude|codex|gemini|cursor] [--model M]\n\
+          # AI 为仍是默认标题的会议生成主题标题(手动命名的绝不动);\n\
+          # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI";
 
 pub fn notes_cli(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -85,6 +88,7 @@ pub fn notes_cli(args: &[String]) -> i32 {
         "list" => run_list(rest),
         "search" => run_search(rest),
         "get" => run_get(rest),
+        "retitle" => run_retitle(rest),
         _ => {
             eprintln!("{NOTES_USAGE}");
             return 2;
@@ -251,6 +255,199 @@ fn render_speakers_human(v: &serde_json::Value) -> String {
     out
 }
 
+/// 批量补标题的执行体:按 App 设置解析,--agent 显式覆盖。
+enum TitleProvider {
+    Agent(crate::refine::agent::AgentKind, std::path::PathBuf, String),
+    Http(crate::refine::llm::LlmConfig),
+}
+
+/// AI 为默认标题的会议批量生成主题标题。手动命名(is_default_title=false)与
+/// 未完成(state!=complete,含录制中)的一律跳过;单场失败不中断,保默认标题继续。
+fn run_retitle(args: &[String]) -> Result<i32, String> {
+    reject_unknown_flags(args, &["--agent", "--model"], &["--dry-run", "--json"])?;
+    let roots = tools::resolve_roots();
+    let store = crate::store::NoteStore::new(roots.data_root.join("notes"));
+    let candidates: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|n| n.state == "complete" && crate::store::writer::is_default_title(&n.title))
+        .collect();
+    if candidates.is_empty() {
+        println!("没有需要补标题的会议(全部已是主题标题或手动命名)。");
+        return Ok(0);
+    }
+    if has_flag(args, "--dry-run") {
+        println!("将为以下 {} 场会议生成标题(--dry-run,未改动):", candidates.len());
+        for n in &candidates {
+            println!("  {}\t{}", n.id, n.title);
+        }
+        return Ok(0);
+    }
+
+    let s = crate::settings::load(&roots.app_data);
+    let model_override = opt_value(args, "--model")?;
+    let provider = match opt_value(args, "--agent")? {
+        Some(key) => {
+            let kind = crate::refine::agent::AgentKind::from_key(&key)
+                .ok_or_else(|| format!("未知 agent: {key}(可用 claude|codex|gemini|cursor)"))?;
+            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin).ok_or_else(|| {
+                format!("未检测到 {} 的命令行工具,请先安装并登录", kind.bin_name())
+            })?;
+            TitleProvider::Agent(kind, bin, model_override.unwrap_or_default())
+        }
+        None if s.refine_provider == "agent" => {
+            let kind = crate::refine::agent::AgentKind::from_key(&s.refine_agent)
+                .ok_or_else(|| format!("设置里的 refine_agent 不认识: {}", s.refine_agent))?;
+            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin)
+                .ok_or_else(|| format!("未检测到 {} 的命令行工具", kind.bin_name()))?;
+            TitleProvider::Agent(kind, bin, model_override.unwrap_or(s.refine_agent_model))
+        }
+        None => {
+            if s.refine_base_url.is_empty() || s.refine_model.is_empty() || s.refine_api_key.is_empty() {
+                return Err("App 设置里没有可用的 AI 执行体(在线接口三项未配齐);\
+                            可在 AI 页配置,或用 --agent claude 直接走本机 Agent"
+                    .into());
+            }
+            TitleProvider::Http(crate::refine::llm::LlmConfig {
+                base_url: s.refine_base_url.clone(),
+                model: model_override.unwrap_or_else(|| s.refine_model.clone()),
+                api_key: s.refine_api_key.clone(),
+            })
+        }
+    };
+
+    let mut renamed = 0usize;
+    let mut failed = 0usize;
+    for n in &candidates {
+        let paragraphs = note_paragraphs_for_title(&roots, &n.id);
+        let ctx = crate::ailog::Ctx { data_root: roots.data_root.clone(), note_id: n.id.clone() };
+        let title = match &provider {
+            TitleProvider::Agent(kind, bin, model) => {
+                crate::refine::agent::gen_title(*kind, bin, model, &paragraphs, Some(&ctx))
+            }
+            TitleProvider::Http(cfg) => crate::refine::llm::gen_title(cfg, &paragraphs, Some(&ctx)),
+        };
+        match title.and_then(|t| store.rename(&n.id, &t).map(|()| t)) {
+            Ok(t) => {
+                println!("{}\t{} → {}", n.id, n.title, t);
+                renamed += 1;
+            }
+            Err(e) => {
+                eprintln!("{}\t失败(保留默认标题): {e}", n.id);
+                failed += 1;
+            }
+        }
+    }
+    println!("完成:改名 {renamed} 场,失败 {failed} 场,共 {} 场候选。", candidates.len());
+    Ok(if failed == 0 { 0 } else { 1 })
+}
+
+/// 标题素材:精修稿段落优先(错字已修、噪声已滤),没有精修稿用原始 segments
+/// 拼最小段落结构。gen_title 自己截前 1500 字。
+fn note_paragraphs_for_title(roots: &tools::DataRoots, id: &str) -> Vec<crate::store::RefinedParagraph> {
+    let dir = roots.data_root.join("notes").join(id);
+    if let Some(doc) = crate::store::load_refined(&dir) {
+        return doc.paragraphs;
+    }
+    let Ok(note) = crate::store::NoteStore::new(roots.data_root.join("notes")).load(id) else {
+        return Vec::new();
+    };
+    note.segments
+        .iter()
+        .map(|s| crate::store::RefinedParagraph {
+            speaker: s.speaker.clone().unwrap_or_default(),
+            name: None,
+            person_id: None,
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            text: s.text.clone(),
+            source_seqs: vec![s.seq],
+        })
+        .collect()
+}
+
+const AILOG_USAGE: &str = "用法: voice-notes ailog <list|export> ...\n\
+  list   [--limit N] [--offset N] [--kind refine_chunk|title|agent_refine|mcp_apply] [--note ID] [--from RFC3339] [--to RFC3339] [--json]\n\
+  export [--out 文件路径]   # 全量合并为 JSONL;缺省写数据目录 ai_logs/export-<时间>.jsonl";
+
+/// AI 调用日志 CLI:查询与导出,与 GUI 命令同源(crate::ailog 纯函数)。
+pub fn ailog_cli(args: &[String]) -> i32 {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let rest = args.get(1..).unwrap_or(&[]);
+    let result = match sub {
+        "list" => run_ailog_list(rest),
+        "export" => run_ailog_export(rest),
+        _ => {
+            eprintln!("{AILOG_USAGE}");
+            return 2;
+        }
+    };
+    match result {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("{msg}\n{AILOG_USAGE}");
+            2
+        }
+    }
+}
+
+fn run_ailog_list(args: &[String]) -> Result<i32, String> {
+    reject_unknown_flags(args, &["--limit", "--offset", "--kind", "--note", "--from", "--to"], &["--json"])?;
+    let filter = crate::ailog::Filter {
+        kind: opt_value(args, "--kind")?,
+        note_id: opt_value(args, "--note")?,
+        from: opt_value(args, "--from")?,
+        to: opt_value(args, "--to")?,
+        offset: Some(opt_usize(args, "--offset", 0)?),
+        limit: Some(opt_usize(args, "--limit", 20)?),
+    };
+    let v = crate::ailog::query(&tools::resolve_roots().data_root, &filter);
+    if has_flag(args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&v).expect("静态结构序列化不会失败"));
+    } else {
+        print!("{}", render_ailog_human(&v));
+    }
+    Ok(0)
+}
+
+fn run_ailog_export(args: &[String]) -> Result<i32, String> {
+    reject_unknown_flags(args, &["--out"], &[])?;
+    let out = opt_value(args, "--out")?;
+    match crate::ailog::export_jsonl(&tools::resolve_roots().data_root, out.as_deref().map(std::path::Path::new)) {
+        Ok((path, count)) => {
+            println!("已导出 {count} 条 → {}", path.display());
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("导出失败: {e}");
+            Ok(1)
+        }
+    }
+}
+
+/// 人读渲染:列表只给概览列(请求/响应全文用 --json 或导出取)。
+fn render_ailog_human(v: &serde_json::Value) -> String {
+    let entries = v["entries"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        return "暂无 AI 调用日志。\n".into();
+    }
+    let mut out = String::from("时间\t类别\t执行方\t模型\t状态\t耗时\t笔记\n");
+    for e in &entries {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}ms\t{}\n",
+            e["ts"].as_str().unwrap_or(""),
+            e["kind"].as_str().unwrap_or(""),
+            e["provider"].as_str().unwrap_or(""),
+            e["model"].as_str().unwrap_or("-"),
+            e["status"].as_str().unwrap_or(""),
+            e["duration_ms"].as_u64().unwrap_or(0),
+            e["note_id"].as_str().unwrap_or("-"),
+        ));
+    }
+    out.push_str(&format!("共 {} 条(本页 {} 条)\n", v["total"].as_u64().unwrap_or(0), entries.len()));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +462,53 @@ mod tests {
         assert!(opt_usize(&dangling, "--limit", 20).is_err(), "悬空必须报错");
         let bad: Vec<String> = ["--limit", "abc"].iter().map(|s| s.to_string()).collect();
         assert!(opt_usize(&bad, "--limit", 20).is_err(), "非整数必须报错");
+    }
+
+    #[test]
+    fn ailog_cli_lists_queries_and_exports() {
+        let _guard = crate::mcp::ENV_VAR_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VN_APP_DATA", tmp.path());
+        // 用法错/未知 flag → 2
+        assert_eq!(ailog_cli(&[]), 2);
+        assert_eq!(ailog_cli(&["bogus".into()]), 2);
+        assert_eq!(ailog_cli(&["list".into(), "--bogus".into()]), 2);
+        // 空库 list 可用
+        assert_eq!(ailog_cli(&["list".into()]), 0);
+        // 落两条再查
+        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: "n1".into() };
+        for kind in ["refine_chunk", "title"] {
+            crate::ailog::record(
+                &ctx,
+                crate::ailog::Draft {
+                    kind,
+                    provider: "openai".into(),
+                    model: Some("m".into()),
+                    endpoint: None,
+                    request: serde_json::json!({}),
+                    response: serde_json::json!({}),
+                    status: "ok",
+                    error: None,
+                    duration_ms: 1,
+                },
+            );
+        }
+        assert_eq!(ailog_cli(&["list".into(), "--kind".into(), "title".into(), "--json".into()]), 0);
+        let out = tmp.path().join("logs.jsonl");
+        assert_eq!(ailog_cli(&["export".into(), "--out".into(), out.to_string_lossy().into_owned()]), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 2, "导出全量 2 条");
+        std::env::remove_var("VN_APP_DATA");
+    }
+
+    #[test]
+    fn render_ailog_human_formats_and_handles_empty() {
+        assert!(render_ailog_human(&serde_json::json!({ "entries": [] })).contains("暂无"));
+        let v = serde_json::json!({ "total": 1, "entries": [{
+            "ts": "2026-07-12T09:00:00+08:00", "kind": "agent_refine", "provider": "claude",
+            "model": "haiku", "status": "ok", "duration_ms": 1234, "note_id": "n1"
+        }]});
+        let out = render_ailog_human(&v);
+        assert!(out.contains("agent_refine\tclaude\thaiku\tok\t1234ms\tn1"), "{out}");
     }
 
     #[test]

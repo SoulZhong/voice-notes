@@ -705,7 +705,7 @@
       <label class="row">
         <div class="row-info">
           <span class="row-label">会后精修</span>
-          <span class="row-desc">停止录制后自动用大模型精修转写稿(错字修正、段落归并);模型接口在左侧 AI 页配置</span>
+          <span class="row-desc">停止录制后自动用大模型精修转写稿(错字修正、段落归并);在线接口或本机 Agent,在左侧 AI 页配置</span>
         </div>
         <input
           type="checkbox"
