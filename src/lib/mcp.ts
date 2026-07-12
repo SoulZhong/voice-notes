@@ -32,6 +32,9 @@ export type Capabilities = { tools: ToolCatalogEntry[]; cli: CliCatalogEntry[] }
 /** `/ai` 页「Agent 能调用什么」清单:MCP 工具 + CLI 命令,纯静态数据。 */
 export const mcpCapabilities = () => invoke<Capabilities>("mcp_capabilities");
 
+/** Agent 精修:四家 CLI 的本机探测(key → 可执行路径或 null)。 */
+export const refineAgentsProbe = () => invoke<Record<string, string | null>>("refine_agents_probe");
+
 export type SkillRead = { content: string; state: string };
 
 /** 读取 skill 正文;未安装时返回渲染默认稿(state 仍如实为 not_installed)。 */

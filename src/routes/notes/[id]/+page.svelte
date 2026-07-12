@@ -87,6 +87,43 @@
     }
     return m;
   });
+  // ── 说话人试听:chips 面板「试听他的声音」——不听声音没法确认「说话人 N」是谁。
+  //    播该说话人时长最长的一段(代表性最好),重复点击按时长降序换下一段(取前 5,
+  //    循环);单段最多听 15s,段尾自动停;用户手动暂停/拖走即退出试听态。 ──
+  const PREVIEW_MAX_MS = 15_000;
+  let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+
+  function previewSpeaker(sid: string) {
+    const source: { speaker?: string | null; start_ms: number; end_ms: number }[] =
+      effectiveView === "refined" ? (refined?.paragraphs ?? []) : displaySegments;
+    const segs = source
+      .filter((p) => p.speaker === sid)
+      .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
+      .slice(0, 5);
+    if (segs.length === 0 || !player) return;
+    const idx = preview?.sid === sid ? (preview.idx + 1) % segs.length : 0;
+    const seg = segs[idx];
+    preview = { sid, idx, endMs: Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS) };
+    player.seek(seg.start_ms);
+    player.play();
+  }
+
+  // 段尾自动停:只在试听态生效,停完清态(不影响用户随后正常播放)。
+  $effect(() => {
+    if (preview && playerPlaying && playerMs >= preview.endMs) {
+      player?.pause();
+      preview = null;
+    }
+  });
+  // 用户手动暂停(未到段尾)即视为退出试听;换笔记同样清态。
+  $effect(() => {
+    if (preview && !playerPlaying && playerMs < preview.endMs - 200) preview = null;
+  });
+  $effect(() => {
+    void id;
+    preview = null;
+  });
+
   /** 原始稿各说话人的段数：说话人条按此排序，并折叠只出现 1 段的碎片。 */
   const segCounts = $derived.by(() => {
     const c: Record<string, number> = {};
@@ -553,6 +590,8 @@
           {people}
           onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
           onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
+          onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
+          previewingId={preview?.sid ?? null}
           onRenamed={() => {
             refresh();
             recording.bumpNotes();
@@ -568,6 +607,8 @@
           counts={segCounts}
           people={canEdit ? people : undefined}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
+          previewingId={preview?.sid ?? null}
           onRenamed={() => {
             refresh();
             recording.bumpNotes();

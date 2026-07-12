@@ -11,6 +11,8 @@
     onRename,
     people,
     onPick,
+    onPreview,
+    previewingId,
   }: {
     speakers: Record<string, { name: string; sources: string[]; person_id?: string | null }>;
     noteId: string;
@@ -26,6 +28,12 @@
         点选即把该说话人关联到库中人物。 */
     people?: PersonSummary[];
     onPick?: (id: string, personId: string) => Promise<void>;
+    /** 试听(可选)。传入则编辑面板附「试听他的声音」行——不听声音没法确认
+        「说话人 N」是谁。点击播该说话人的代表片段,重复点击换一段;
+        面板保持展开,听完可直接改名/选人。 */
+    onPreview?: (id: string) => void;
+    /** 正在试听的说话人 id(供行内提示「播放中,点击换一段」)。 */
+    previewingId?: string | null;
   } = $props();
 
   let editingId = $state<string | null>(null);
@@ -255,6 +263,15 @@
               </div>
             {:else}
               {#if !editingDirty}
+                {#if onPreview}
+                  <button class="row" onclick={() => onPreview(id)}>
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 3.5v9l7.5-4.5z" />
+                    </svg>
+                    试听他的声音
+                    {#if previewingId === id}<span class="row-sub">播放中,点击换一段</span>{/if}
+                  </button>
+                {/if}
                 <button class="row" onclick={() => markAsMe(id)}>
                   <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
                     <circle cx="8" cy="5.2" r="2.6" />

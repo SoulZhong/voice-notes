@@ -61,6 +61,19 @@ pub struct Settings {
     /// 会后 LLM 精修总开关(A2)。默认关,配好 key 后由用户打开。
     #[serde(default)]
     pub refine_enabled: bool,
+    /// A2 执行体:"openai"(HTTP chat completions)| "agent"(本机 Agent CLI 经
+    /// MCP 读写回)。老配置缺字段 → openai,行为不变。
+    #[serde(default = "default_refine_provider")]
+    pub refine_provider: String,
+    /// provider=agent 时用哪家 CLI:claude|codex|gemini|cursor。
+    #[serde(default = "default_refine_agent")]
+    pub refine_agent: String,
+    /// Agent CLI 可执行文件路径覆盖;空 = 按常见安装位置自动探测。
+    #[serde(default)]
+    pub refine_agent_bin: String,
+    /// Agent 模型名(传给 CLI 的 --model/-m);空 = 该 CLI 自己的默认模型。
+    #[serde(default)]
+    pub refine_agent_model: String,
     /// OpenAI 兼容 chat completions 的 base_url,如 https://api.deepseek.com。
     #[serde(default)]
     pub refine_base_url: String,
@@ -104,6 +117,14 @@ fn default_shortcut() -> String {
     "Alt+CmdOrCtrl+R".into()
 }
 
+fn default_refine_provider() -> String {
+    "openai".into()
+}
+
+fn default_refine_agent() -> String {
+    "claude".into()
+}
+
 /// serde `#[derive(Deserialize)]` 的裸 `#[serde(default)]` 总是取字段类型的
 /// `Default::default()`(bool → false)。language_filter/keep_audio/tray_enabled
 /// 三个字段的产品默认值是 true,所以必须显式挂这个辅助函数,不能偷懒裸写 default。
@@ -129,6 +150,10 @@ impl Default for Settings {
             shortcut: default_shortcut(),
             tray_enabled: true,
             refine_enabled: false,
+            refine_provider: default_refine_provider(),
+            refine_agent: default_refine_agent(),
+            refine_agent_bin: String::new(),
+            refine_agent_model: String::new(),
             refine_base_url: String::new(),
             refine_model: String::new(),
             refine_api_key: String::new(),
@@ -305,6 +330,9 @@ mod tests {
         let s = Settings::default();
         assert!(!s.refine_enabled);
         assert!(s.refine_base_url.is_empty() && s.refine_model.is_empty() && s.refine_api_key.is_empty());
+        assert_eq!(s.refine_provider, "openai", "默认执行体是 HTTP,老用户行为不变");
+        assert_eq!(s.refine_agent, "claude");
+        assert!(s.refine_agent_bin.is_empty() && s.refine_agent_model.is_empty());
         assert_eq!(ASR_PARAFORMER, "paraformer");
     }
 
@@ -315,6 +343,8 @@ mod tests {
         let s = load(dir.path());
         assert_eq!(s.asr_model, "whisper");
         assert!(!s.refine_enabled);
+        assert_eq!(s.refine_provider, "openai", "缺字段回落 openai");
+        assert_eq!(s.refine_agent, "claude");
     }
 
     #[test]

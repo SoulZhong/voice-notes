@@ -9,7 +9,7 @@ fn main() {
     // CLI 词表与 mcp::cli_entry 的分发表一一对应;新增子命令两处同改。
     if matches!(
         args.get(1).map(String::as_str),
-        Some("mcp" | "notes" | "speakers" | "skill" | "record")
+        Some("mcp" | "notes" | "speakers" | "skill" | "record" | "ailog")
     ) {
         std::process::exit(app_lib::mcp::cli_entry(&args[1..]));
     }

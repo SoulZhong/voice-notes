@@ -34,8 +34,9 @@ pub fn cli_entry(args: &[String]) -> i32 {
         "speakers" => cli_query::speakers_cli(&args[1..]),
         "skill" => skill::cli(&args[1..]),
         "record" => cli_control::record_cli(&args[1..]),
+        "ailog" => cli_query::ailog_cli(&args[1..]),
         _ => {
-            eprintln!("用法: voice-notes <mcp|notes|speakers|skill|record> ...");
+            eprintln!("用法: voice-notes <mcp|notes|speakers|skill|record|ailog> ...");
             2
         }
     }

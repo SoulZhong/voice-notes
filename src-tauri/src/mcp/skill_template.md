@@ -43,6 +43,7 @@ MCP 未注册时,**先征得用户同意**后可代为注册:`{{BINARY}} mcp reg
 1. **会议纪要**:`get_note(note_id, format="markdown")` → 按「主题 / 结论与决议 / 待办(负责人+时限)/ 遗留问题」归纳;引用原话时带说话人名与时间戳。
 2. **周报/日报汇总**:`list_notes(from=<周一日期>)` → 逐条 `get_note` 提取 1-3 个要点合并;标题与时长直接用 list 字段。
 3. **找决议/待办/承诺**:`search_notes` 用关键词族(决定/定了/负责/下周/deadline/跟进),命中自带前后一句上下文,必要时 get 全文核对。
+4. **代精修**(用户明确要求时):`get_note(format="segments")` 拿精修稿 paragraphs → 只做错字纠正/实体统一/去语气词/中英排版,禁止改写语义 → `apply_refined_texts` 按下标提交有改动的段落(整段全文),确认无需修订则提交空 updates。笔记须已有精修稿(refined=true),否则请用户先在 App 里精修一次。
 
 ## 隐私
 

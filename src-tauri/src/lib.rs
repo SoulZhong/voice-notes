@@ -12,6 +12,7 @@ mod player;
 mod tray;
 mod update;
 pub mod diar;
+mod ailog;
 mod refine;
 pub mod mcp;
 
@@ -222,13 +223,22 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
-/// LLM 精修配置是否齐备（四项均非空/非关闭才可跑）：抽成纯函数供 spawn_refine 判定与单测，
-/// 避免把「要不要发起网络请求」这条判断逻辑埋进整个后台线程闭包里难以单独验证。
+/// HTTP(OpenAI 兼容)精修配置是否齐备（开关开、provider 非 agent、三项均非空）：
+/// 抽成纯函数供 spawn_refine 判定与单测，避免把「要不要发起网络请求」这条判断逻辑
+/// 埋进整个后台线程闭包里难以单独验证。provider 值未知(手改 settings.json)时按
+/// openai 对待——那是默认执行体,坏值不该让精修整个哑掉。
 fn refine_llm_ready(s: &settings::Settings) -> bool {
     s.refine_enabled
+        && s.refine_provider != "agent"
         && !s.refine_base_url.is_empty()
         && !s.refine_model.is_empty()
         && !s.refine_api_key.is_empty()
+}
+
+/// Agent(本机 CLI 经 MCP 读写回)精修是否应当尝试。bin 探测留到运行时——探测结果
+/// 随用户装/卸 CLI 变化,不该在这里静态判定;解析失败由 agent 分支落 failed 并留日志。
+fn refine_agent_ready(s: &settings::Settings) -> bool {
+    s.refine_enabled && s.refine_provider == "agent"
 }
 
 /// resume_recording 是否应因该笔记正在精修而拒绝：抽成纯函数供命令层判定与单测。
@@ -322,14 +332,54 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     Ok(d) => settings::load(&d),
                     Err(_) => settings::Settings::default(),
                 };
-                if refine_llm_ready(&s) {
+                // AI 日志上下文:所有对外 AI 调用(HTTP/Agent/标题)全量留痕。
+                // data_root 拿不到时降级为不记录,绝不影响精修本身。
+                let log_ctx = data_root(&app)
+                    .ok()
+                    .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+                if refine_agent_ready(&s) {
+                    emit("llm", "running");
+                    let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
+                        .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
+                    match resolved {
+                        Some((kind, bin)) => {
+                            if let Err(e) = refine::agent::run_refine(
+                                &dir,
+                                &note_id,
+                                kind,
+                                &bin,
+                                &s.refine_agent_model,
+                                log_ctx.as_ref(),
+                            ) {
+                                eprintln!("refine: agent 精修失败: {e}");
+                            }
+                            // Agent 经 MCP 写的是盘上文件:重载同步内存 doc(成功时
+                            // llm=done + 修订文本;失败时盘上仍是 off,下面统一降级)。
+                            if let Some(d) = store::load_refined(&dir) {
+                                doc = d;
+                            }
+                        }
+                        None => eprintln!(
+                            "refine: 未找到 {} 的 CLI(可在 AI 页指定可执行文件路径),Agent 精修跳过",
+                            s.refine_agent
+                        ),
+                    }
+                    // 与 run_llm 的 F4 同一语义:本轮没落成 done 就是 failed,盘上与
+                    // 事件保持一致,不把「off」留给 UI 当作"没配置"误读。
+                    if doc.stages.llm != "done" {
+                        doc.stages.llm = "failed".into();
+                        if let Err(e) = store::write_refined_atomic(&dir, &doc) {
+                            eprintln!("refine: agent 失败态落盘失败: {e}");
+                        }
+                    }
+                } else if refine_llm_ready(&s) {
                     emit("llm", "running");
                     let cfg = refine::llm::LlmConfig {
                         base_url: s.refine_base_url.clone(),
                         model: s.refine_model.clone(),
                         api_key: s.refine_api_key.clone(),
                     };
-                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model) {
+                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model, log_ctx.as_ref()) {
                         eprintln!("refine: llm 落盘失败: {e}");
                     }
                 }
@@ -337,15 +387,37 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
                 // 失败静默:标题是锦上添花,不影响精修完成态。
-                if (doc.stages.llm == "done" || doc.stages.llm == "partial")
+                // 主题标题:只要 AI 执行体就绪且标题仍是默认样式就尝试——不再要求
+                // LLM 精修阶段成功(标题是独立的小调用,精修分块失败不代表标题也会
+                // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
+                // 失败静默保默认名。
+                if (refine_agent_ready(&s) || refine_llm_ready(&s))
                     && store::writer::is_default_title(&note.meta.title)
                 {
-                    let cfg = refine::llm::LlmConfig {
-                        base_url: s.refine_base_url.clone(),
-                        model: s.refine_model.clone(),
-                        api_key: s.refine_api_key.clone(),
+                    // 标题跟随精修执行体:Agent 模式一发一收(无 MCP、无工具),
+                    // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
+                    let title = if refine_agent_ready(&s) {
+                        refine::agent::AgentKind::from_key(&s.refine_agent)
+                            .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)))
+                            .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
+                            .and_then(|(kind, bin)| {
+                                refine::agent::gen_title(
+                                    kind,
+                                    &bin,
+                                    &s.refine_agent_model,
+                                    &doc.paragraphs,
+                                    log_ctx.as_ref(),
+                                )
+                            })
+                    } else {
+                        let cfg = refine::llm::LlmConfig {
+                            base_url: s.refine_base_url.clone(),
+                            model: s.refine_model.clone(),
+                            api_key: s.refine_api_key.clone(),
+                        };
+                        refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
                     };
-                    match refine::llm::gen_title(&cfg, &doc.paragraphs) {
+                    match title {
                         Ok(title) => {
                             match store::NoteStore::new(notes_dir(&app)?).rename(&note_id, &title) {
                                 Ok(()) => {
@@ -1928,6 +2000,43 @@ fn mcp_capabilities() -> serde_json::Value {
     mcp::server::catalog()
 }
 
+/// 四家 Agent CLI 的本机探测结果(key → 解析到的可执行路径或 null),供 /ai 页
+/// Agent 精修模式展示「已检测到/未检测到」。探测只做文件存在性检查,毫秒级。
+#[tauri::command]
+fn refine_agents_probe() -> serde_json::Value {
+    refine::agent::probe_all()
+        .into_iter()
+        .map(|(k, p)| (k.to_string(), serde_json::json!(p)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// AI 调用日志查询(倒序分页,过滤条件见 ailog::Filter)。
+#[tauri::command]
+fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(ailog::query(&root, &filter))
+}
+
+/// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
+/// 「写数据目录、把路径给用户」约定)。
+#[tauri::command]
+fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let (path, count) = ailog::export_jsonl(&root, None).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
+}
+
+/// 在访达中打开 AI 日志目录(macOS `open`;目录不存在先建,空目录也可打开)。
+#[tauri::command]
+fn ai_logs_open_dir(app: AppHandle) -> Result<String, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let dir = ailog::log_dir(&root);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::process::Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 #[derive(serde::Serialize)]
 struct SkillRead {
     content: String,
@@ -2715,6 +2824,10 @@ pub fn run() {
             mcp_skill_install,
             mcp_skill_uninstall,
             mcp_capabilities,
+            refine_agents_probe,
+            ai_logs_query,
+            ai_logs_export,
+            ai_logs_open_dir,
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
@@ -2868,6 +2981,23 @@ mod tests {
             }
             assert!(!refine_llm_ready(&s2), "{field} 为空 → 未就绪");
         }
+
+        let mut s3 = s.clone();
+        s3.refine_provider = "agent".into();
+        assert!(!refine_llm_ready(&s3), "provider=agent 时不走 HTTP,即使三项齐全");
+        s3.refine_provider = "bogus".into();
+        assert!(refine_llm_ready(&s3), "未知 provider 按默认 openai 对待,精修不哑掉");
+    }
+
+    #[test]
+    fn refine_agent_ready_follows_switch_and_provider() {
+        use super::refine_agent_ready;
+        let mut s = crate::settings::Settings::default();
+        assert!(!refine_agent_ready(&s), "默认 provider=openai → 不走 Agent");
+        s.refine_provider = "agent".into();
+        assert!(!refine_agent_ready(&s), "总开关未开 → 不走");
+        s.refine_enabled = true;
+        assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
     }
 
     #[test]

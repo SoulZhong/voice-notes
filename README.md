@@ -172,6 +172,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]
 "$VN" notes search "交付日期" [--limit N] [--json]
 "$VN" notes get <note-id> [--format md|txt|json] [--raw]   # 默认 md;--raw 取原始逐字稿(忽略精修)
+"$VN" notes retitle [--dry-run] [--agent claude] [--model M]   # AI 为默认标题的会议批量生成主题标题(手动命名不动)
 "$VN" speakers list [--json]
 ```
 
@@ -182,6 +183,13 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" record start --title "评审会"
 "$VN" record stop
 "$VN" record live [--tail N]
+```
+
+AI 调用日志(精修/标题生成的每次对外 AI 调用,请求与响应全量留痕;也可在左侧「AI」页查看与导出):
+
+```bash
+"$VN" ailog list [--limit N] [--kind refine_chunk|title|agent_refine|mcp_apply] [--note ID] [--json]
+"$VN" ailog export [--out 文件路径]   # 全量合并为 JSONL
 ```
 
 退出码:`0` 成功 / `1` 执行错(如 note-id 不存在)/ `2` 用法错(参数缺失或未知);未知参数一律报错,不静默忽略。

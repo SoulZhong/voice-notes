@@ -112,6 +112,35 @@ pub fn assign_refined_person(
     })
 }
 
+/// Agent 精修写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
+/// 约束式写入——只能改文本,说话人/时间戳/段落数一概不可动,这是把「外部 Agent 可写」
+/// 的面收到最小的关键:哪怕 Agent 行为失常,最坏也只是文本变差,结构不会被破坏。
+/// 任一下标越界或文本为空即整体拒绝(不落盘半份结果)。updates 为空是合法输入,
+/// 语义为「已审阅,确无需要修订之处」——同样把 llm 置 done,否则干净稿会被误报失败。
+pub fn apply_refined_texts(
+    note_dir: &Path,
+    updates: &[(usize, String)],
+    llm_model: &str,
+) -> anyhow::Result<usize> {
+    update_refined(note_dir, |doc| {
+        for (i, text) in updates {
+            anyhow::ensure!(
+                *i < doc.paragraphs.len(),
+                "段落下标越界: {i}(共 {} 段)",
+                doc.paragraphs.len()
+            );
+            anyhow::ensure!(!text.trim().is_empty(), "第 {i} 段修订文本为空");
+        }
+        for (i, text) in updates {
+            doc.paragraphs[*i].text = text.clone();
+        }
+        doc.stages.llm = "done".into();
+        doc.llm_model = Some(llm_model.to_string());
+        Ok(())
+    })?;
+    Ok(updates.len())
+}
+
 /// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史精修稿
 /// 跟着变),person_id 经 redirects 归一到 winner。只改返回值,不落盘——与
 /// notes.rs join_person_names 同一哲学。库中无名/人已删除时保留段落原 name。
@@ -241,6 +270,46 @@ mod tests {
         let doc = load_refined(dir.path()).unwrap();
         assert!(doc.paragraphs[0].name.is_none());
         assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P8"));
+    }
+
+    #[test]
+    fn apply_refined_texts_updates_and_marks_llm_done() {
+        let dir = tempfile::tempdir().unwrap();
+        write_doc(dir.path(), vec![para("R1", None, None, 0), para("R2", None, None, 1000)]);
+        let n = apply_refined_texts(dir.path(), &[(1, "修订后。".into())], "claude-agent").unwrap();
+        assert_eq!(n, 1);
+        let doc = load_refined(dir.path()).unwrap();
+        assert_eq!(doc.paragraphs[0].text, "内容。", "未提交的段落不动");
+        assert_eq!(doc.paragraphs[1].text, "修订后。");
+        assert_eq!(doc.stages.llm, "done");
+        assert_eq!(doc.llm_model.as_deref(), Some("claude-agent"));
+        assert_eq!(doc.paragraphs.len(), 2, "段落数不可变");
+    }
+
+    #[test]
+    fn apply_refined_texts_empty_updates_means_reviewed_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        write_doc(dir.path(), vec![para("R1", None, None, 0)]);
+        assert_eq!(apply_refined_texts(dir.path(), &[], "m").unwrap(), 0);
+        let doc = load_refined(dir.path()).unwrap();
+        assert_eq!(doc.stages.llm, "done", "空 updates = 已审阅无需修订,同样算完成");
+        assert_eq!(doc.paragraphs[0].text, "内容。");
+    }
+
+    #[test]
+    fn apply_refined_texts_rejects_bad_input_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_doc(dir.path(), vec![para("R1", None, None, 0)]);
+        assert!(apply_refined_texts(dir.path(), &[(9, "x".into())], "m").is_err(), "下标越界");
+        assert!(apply_refined_texts(dir.path(), &[(0, "  ".into())], "m").is_err(), "空文本");
+        // 混合提交里带一个坏项:整体拒绝,好项也不落盘
+        assert!(apply_refined_texts(dir.path(), &[(0, "好的。".into()), (5, "x".into())], "m").is_err());
+        let doc = load_refined(dir.path()).unwrap();
+        assert_eq!(doc.paragraphs[0].text, "内容。", "整体拒绝,未落盘任何修改");
+        assert_eq!(doc.stages.llm, "off");
+        // 无精修稿时报错,不凭空造文件
+        let empty = tempfile::tempdir().unwrap();
+        assert!(apply_refined_texts(empty.path(), &[(0, "x".into())], "m").is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! 会后精修管线编排:过滤(A3)→重聚类(A1)→段落化,可选 LLM 精修(A2)。
 //! 原始三文件只读;一切产物写 refined.json。
 
+pub mod agent;
 pub mod filter;
 pub mod llm;
 pub mod recluster;
@@ -193,8 +194,9 @@ pub fn run_llm(
     doc: &mut RefinedDoc,
     cfg: &llm::LlmConfig,
     llm_model: &str,
+    log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
-    let state = match llm::polish(cfg, &mut doc.paragraphs) {
+    let state = match llm::polish(cfg, &mut doc.paragraphs, log) {
         llm::LlmOutcome::Done => "done",
         llm::LlmOutcome::Partial(_) => "partial",
         llm::LlmOutcome::Failed => "failed",
@@ -396,7 +398,7 @@ mod tests {
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
-        run_llm(dir.path(), &mut doc, &cfg, "m").expect("空段落路径不应触网,写盘应成功");
+        run_llm(dir.path(), &mut doc, &cfg, "m", None).expect("空段落路径不应触网,写盘应成功");
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(doc.llm_model.as_deref(), Some("m"));
         assert!(crate::store::load_refined(dir.path()).is_some(), "已落盘");
@@ -419,7 +421,7 @@ mod tests {
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
-        let err = run_llm(&missing_dir, &mut doc, &cfg, "m");
+        let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None);
         assert!(err.is_err(), "目录不存在,写盘必须失败");
         assert_eq!(doc.stages.llm, "failed", "写盘失败必须把内存态降级为 failed");
     }

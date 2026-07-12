@@ -39,6 +39,14 @@ export type Settings = {
   tray_enabled: boolean;
   // ASR 精修开关
   refine_enabled: boolean;
+  // 精修执行体:"openai"(HTTP 接口)| "agent"(本机 Agent CLI 经 MCP 读写回)
+  refine_provider: string;
+  // provider=agent 时用哪家 CLI:"claude" | "codex" | "gemini" | "cursor"
+  refine_agent: string;
+  // Agent CLI 可执行文件路径覆盖;空 = 自动探测
+  refine_agent_bin: string;
+  // Agent 模型名(--model);空 = CLI 默认
+  refine_agent_model: string;
   // ASR 精修服务基础 URL
   refine_base_url: string;
   // ASR 精修 LLM 模型

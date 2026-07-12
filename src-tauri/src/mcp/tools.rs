@@ -152,6 +152,49 @@ pub fn get_note(
 
 // 精修稿的 md/txt 渲染已下沉 store::export::render_refined(GUI 导出与此处共用,防漂移)。
 
+/// Agent 精修写回:按 get_note(segments) 返回的 paragraphs 下标批量替换文本。
+/// 先 NoteStore::load 走 validate_note_id 防穿越 + 存在性检查,再落到 store 层的
+/// 约束式写入(只能改文本,越界/空文本整体拒绝,详见 store::refined)。
+pub fn apply_refined_texts(
+    roots: &DataRoots,
+    note_id: &str,
+    updates: &[(usize, String)],
+    model: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let started = std::time::Instant::now();
+    let result = (|| -> anyhow::Result<serde_json::Value> {
+        NoteStore::new(notes_dir(roots)).load(note_id)?;
+        let dir = notes_dir(roots).join(note_id);
+        anyhow::ensure!(
+            dir.join("refined.json").exists(),
+            "该笔记还没有精修稿:请先在 App 里完成一次精修(或等停止录制后自动精修),再写回修订"
+        );
+        let updated = store::apply_refined_texts(&dir, updates, model)?;
+        let total = store::load_refined(&dir).map(|d| d.paragraphs.len()).unwrap_or(0);
+        Ok(serde_json::json!({ "updated": updated, "paragraphs": total }))
+    })();
+    // AI 日志:写回是 Agent 精修产出真正落地的那一步,修订全文在这里(Agent 的
+    // stdout 只有一句"完成"),必须全量留痕,否则日志数据不可复用。
+    let ctx = crate::ailog::Ctx { data_root: roots.data_root.clone(), note_id: note_id.to_string() };
+    crate::ailog::record(
+        &ctx,
+        crate::ailog::Draft {
+            kind: "mcp_apply",
+            provider: "mcp".into(),
+            model: Some(model.to_string()),
+            endpoint: None,
+            request: serde_json::json!({
+                "updates": updates.iter().map(|(i, t)| serde_json::json!({ "index": i, "text": t })).collect::<Vec<_>>(),
+            }),
+            response: result.as_ref().map(|v| v.clone()).unwrap_or(serde_json::Value::Null),
+            status: if result.is_ok() { "ok" } else { "error" },
+            error: result.as_ref().err().map(|e| e.to_string()),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+    );
+    result
+}
+
 /// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id)。
 pub fn list_speakers(roots: &DataRoots) -> serde_json::Value {
     let vp = store::VoiceprintStore::new(roots.data_root.clone()).load();
@@ -336,6 +379,49 @@ mod tests {
         assert!(content.contains("原始句"), "text 内容含原句: {content}");
         assert!(!content.contains("# "), "text 格式不带 markdown 标题标记: {content}");
         assert!(get_note(&roots(tmp.path()), "20260101-100000", "bogus", false).is_err(), "未知 format 报错");
+    }
+
+    #[test]
+    fn apply_refined_texts_validates_note_then_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_note(tmp.path(), "20260101-100000", "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "我们肯计要做", 0)]);
+        // 无精修稿:拒绝并给出可操作的提示
+        let err = apply_refined_texts(&roots(tmp.path()), "20260101-100000", &[(0, "x".into())], "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("精修稿"), "缺精修稿的报错要说明原因: {err}");
+        // 落一份精修稿后写回成功
+        let dir = tmp.path().join("notes/20260101-100000");
+        store::write_refined_atomic(
+            &dir,
+            &store::RefinedDoc {
+                schema_version: 1,
+                generated_at: "t".into(),
+                llm_model: None,
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+                discarded_seqs: vec![],
+                paragraphs: vec![store::RefinedParagraph {
+                    speaker: "S1".into(), name: Some("张三".into()), person_id: None,
+                    start_ms: 0, end_ms: 1000, text: "我们肯计要做".into(), source_seqs: vec![0],
+                }],
+            },
+        )
+        .unwrap();
+        let v = apply_refined_texts(&roots(tmp.path()), "20260101-100000", &[(0, "我们肯定要做".into())], "claude-agent").unwrap();
+        assert_eq!(v["updated"], 1);
+        assert_eq!(v["paragraphs"], 1);
+        let doc = store::load_refined(&dir).unwrap();
+        assert_eq!(doc.paragraphs[0].text, "我们肯定要做");
+        assert_eq!(doc.stages.llm, "done");
+        // 穿越 id 拒绝
+        assert!(apply_refined_texts(&roots(tmp.path()), "../evil", &[(0, "x".into())], "m").is_err());
+        // AI 日志:写回(成功与失败)都留痕,修订全文可回读。
+        let logs = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        let entries = logs["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|e| e["kind"] == "mcp_apply"
+            && e["status"] == "ok"
+            && e["request"]["updates"][0]["text"] == "我们肯定要做"));
+        assert!(entries.iter().any(|e| e["kind"] == "mcp_apply" && e["status"] == "error"), "拒绝的调用也留痕");
     }
 
     #[test]
