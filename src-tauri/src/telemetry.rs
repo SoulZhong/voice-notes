@@ -200,8 +200,9 @@ impl Event {
     }
 }
 
-/// 上报门:key 未配置或用户关闭开关 → 不发。settings 读取失败按关闭处理
-/// (宁可丢数据,不可在异常路径上报)。
+/// 上报门:key 未配置或用户关闭开关 → 不发。app_data_dir 拿不到 → 按关闭处理;
+/// settings.json 缺失/损坏 → settings::load 回退默认值(telemetry_enabled=true),
+/// 等同新装默认开——opt-out 语义下这是预期行为,不是异常路径上报。
 fn gate(app_key: &str, telemetry_enabled: bool) -> bool {
     !app_key.is_empty() && telemetry_enabled
 }
@@ -219,7 +220,7 @@ pub fn track(app: &AppHandle, event: Event) {
     }
     use tauri_plugin_aptabase::EventTracker;
     let (name, props) = event.payload();
-    app.track_event(name, props);
+    let _ = app.track_event(name, props); // 上报失败静默(设计约束)
 }
 
 #[cfg(test)]
