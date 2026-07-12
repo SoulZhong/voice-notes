@@ -352,31 +352,41 @@
         </div>
         <p class="config-hint">精修失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
       {:else}
-        <div class="config">
-          <div class="preset-row">
-            <span class="preset-label">一键填充</span>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">一键填充</span>
+            <span class="row-desc">选择常用服务商,自动填入接口地址与模型</span>
+          </div>
+          <div class="preset-btns">
             {#each REFINE_PRESETS as p (p.label)}
               <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
             {/each}
           </div>
-          <div class="refine-fields">
-            <label class="field">
-              <span>接口地址</span>
-              <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
-            </label>
-            <label class="field">
-              <span>模型</span>
-              <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
-            </label>
-            <label class="field">
-              <span>API Key</span>
-              <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
-            </label>
-          </div>
-          {#if !refineBaseUrl || !refineModel || !refineKey}
-            <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
-          {/if}
         </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">接口地址</span>
+            <span class="row-desc">OpenAI 兼容服务的 Base URL</span>
+          </div>
+          <input class="row-input wide" placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">模型</span>
+            <span class="row-desc">该服务商的模型名</span>
+          </div>
+          <input class="row-input" placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+        </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">API Key</span>
+            <span class="row-desc">只保存在本机,不随笔记上传</span>
+          </div>
+          <input class="row-input wide" type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
+        </div>
+        {#if !refineBaseUrl || !refineModel || !refineKey}
+          <p class="config-hint">三项配齐后精修生效。</p>
+        {/if}
       {/if}
     </div>
   </section>
@@ -669,53 +679,20 @@
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
   }
-  /* 大模型接口配置块:卡片内嵌面板(常显;启用开关在 设置 → 录制) */
+  /* 卡片内嵌面板(skill 查看/编辑卡、手动配置折叠卡用) */
   .config {
     display: flex;
     flex-direction: column;
     gap: 0.7rem;
     padding: 0.8rem 1rem 0.9rem;
   }
-  .preset-row {
+  /* 一键填充按钮簇(settings-row 右侧,窄窗允许换行右对齐) */
+  .preset-btns {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.45rem;
     flex-wrap: wrap;
-  }
-  .preset-label {
-    font-size: 0.8rem;
-    color: var(--ink-faint);
-    margin-right: 0.15rem;
-  }
-  .refine-fields {
-    display: grid;
-    grid-template-columns: minmax(13rem, 2fr) minmax(8rem, 1fr) minmax(8rem, 1fr);
-    gap: 0.6rem;
-  }
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    min-width: 0;
-  }
-  .field > span {
-    font-size: 0.78rem;
-    color: var(--ink-secondary);
-  }
-  .field input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--canvas);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .field input:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
   }
   .config-hint {
     font-size: 0.8rem;
