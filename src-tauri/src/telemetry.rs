@@ -210,6 +210,10 @@ fn gate(app_key: &str, telemetry_enabled: bool) -> bool {
 /// 唯一上报入口。每次现读设置(与 spawn_session/spawn_refine 同哲学,
 /// 事件稀疏、读盘便宜),开关翻转即时生效、无需重启。
 pub fn track(app: &AppHandle, event: Event) {
+    // key 未配置时提前短路:不必为注定丢弃的事件读盘(MCP 轮询频繁)。
+    if APP_KEY.is_empty() {
+        return;
+    }
     let enabled = app
         .path()
         .app_data_dir()

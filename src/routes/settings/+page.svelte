@@ -65,7 +65,7 @@
   // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
   /** 外观主题 radio:"light" | "dark" | "system"。 */
   let themeChoice = $state("system");
-  /** 录制三开关的本地镜像。 */
+  /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
   let sysOnly = $state(false);
   let keepVol = $state(false);
   let langFilter = $state(false);

@@ -27,7 +27,7 @@ Aptabase 看板开箱提供，无需自己开发展示端：
 | `recording_started` | `source`: `mic` / `system` / `both` | 核心功能使用 |
 | `recording_stopped` | `duration_bucket`: `<5m` / `5-30m` / `30-60m` / `>1h` | 时长只报桶，不报精确值 |
 | `note_refined` | `provider`: 预设类别（如 `doubao` / `openai` / `custom`） | 精修使用率；只报预设名 |
-| `note_exported` | `format`: `md` | 导出使用率 |
+| `note_exported` | `format`: `md / txt` | 导出使用率；后端导出命令仍支持 txt,枚举防御性覆盖 |
 | `mcp_tool_used` | `tool`: 工具名（固定枚举） | MCP/Agent 接入面使用 |
 
 次要事件（删除笔记、说话人合并等）首批不埋，要用再加。

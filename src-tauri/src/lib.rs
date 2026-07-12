@@ -1229,6 +1229,7 @@ fn do_stop_recording(app: &AppHandle) {
     if let Some(s) = sess {
         // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
         // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
+        // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
         telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
         let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
         stash_model(&state.recognizer_cache, returned);
