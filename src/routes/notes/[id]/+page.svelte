@@ -451,7 +451,7 @@
     }
   }
 
-  async function doExport(format: "md" | "txt") {
+  async function doExport(format: "md") {
     exportMsg = "";
     try {
       // 所见即所得:看着精修稿点导出就导精修稿,原始稿视图导原始逐字稿。
@@ -531,7 +531,9 @@
           </p>
         </div>
 
-        <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态 -->
+        <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态。
+             只留 MD(冒烟反馈:TXT 用不上,按钮撤了);txt 渲染能力在导出层与
+             CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
           <button class="act-btn" onclick={() => doExport("md")}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -540,14 +542,6 @@
               <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
             </svg>
             导出 MD
-          </button>
-          <button class="act-btn" onclick={() => doExport("txt")}>
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-              <path d="M9.5 1.8V5h3.2" />
-              <path d="M5.5 8.4h5M5.5 10.4h5M5.5 12.4h3" stroke-width="1.2" />
-            </svg>
-            导出 TXT
           </button>
         </div>
       </div>
