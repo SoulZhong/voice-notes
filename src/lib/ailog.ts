@@ -33,6 +33,8 @@ export type AiLogPage = { total: number; entries: AiLogEntry[] };
 export const aiLogsQuery = (filter: AiLogFilter = {}) => invoke<AiLogPage>("ai_logs_query", { filter });
 /** 全量导出 JSONL,返回 { path, count }。 */
 export const aiLogsExport = () => invoke<{ path: string; count: number }>("ai_logs_export");
+/** 在访达中打开日志目录(不存在则先创建),返回目录路径。 */
+export const aiLogsOpenDir = () => invoke<string>("ai_logs_open_dir");
 
 export const AI_LOG_KIND_LABELS: Record<string, string> = {
   refine_chunk: "精修分块",

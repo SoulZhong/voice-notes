@@ -2023,6 +2023,16 @@ fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
 }
 
+/// 在访达中打开 AI 日志目录(macOS `open`;目录不存在先建,空目录也可打开)。
+#[tauri::command]
+fn ai_logs_open_dir(app: AppHandle) -> Result<String, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let dir = ailog::log_dir(&root);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::process::Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 #[derive(serde::Serialize)]
 struct SkillRead {
     content: String,
@@ -2813,6 +2823,7 @@ pub fn run() {
             refine_agents_probe,
             ai_logs_query,
             ai_logs_export,
+            ai_logs_open_dir,
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
