@@ -212,6 +212,8 @@ pub fn catalog() -> serde_json::Value {
         ("voice-notes record pause", "暂停录制(需应用运行 + 允许 AI 控制)"),
         ("voice-notes record resume", "恢复已暂停的录制(需应用运行 + 允许 AI 控制)"),
         ("voice-notes record live [--tail N]", "获取实时转写(需应用运行)"),
+        ("voice-notes ailog list [--limit N] [--kind K] [--note ID] [--json]", "查询 AI 调用日志(精修/标题的请求与响应全量留痕)"),
+        ("voice-notes ailog export [--out PATH]", "AI 调用日志全量导出为 JSONL"),
     ];
     serde_json::json!({
         "tools": tools.iter().map(|(name, desc, gate)| serde_json::json!({ "name": name, "desc": desc, "gate": gate })).collect::<Vec<_>>(),
@@ -251,7 +253,7 @@ mod catalog_tests {
     fn catalog_cli_nonempty_and_well_formed() {
         let cat = catalog();
         let cli = cat["cli"].as_array().expect("cli 是数组");
-        assert_eq!(cli.len(), 10, "notes 3 + speakers 1 + record 6");
+        assert_eq!(cli.len(), 12, "notes 3 + speakers 1 + record 6 + ailog 2");
         for c in cli {
             assert!(c["cmd"].as_str().unwrap().starts_with("voice-notes "));
             assert!(!c["desc"].as_str().unwrap().is_empty());

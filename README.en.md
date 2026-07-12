@@ -186,6 +186,13 @@ Recording control (needs the app running; `start/stop/pause/resume` also need "A
 "$VN" record live [--tail N]
 ```
 
+AI call log (every outbound AI call made for refinement/title generation is fully recorded — request and response; also viewable and exportable on the "AI" page):
+
+```bash
+"$VN" ailog list [--limit N] [--kind refine_chunk|title|agent_refine|mcp_apply] [--note ID] [--json]
+"$VN" ailog export [--out PATH]   # merge everything into one JSONL file
+```
+
 Exit codes: `0` success / `1` execution error (e.g. note-id not found) / `2` usage error (missing or unknown argument); unknown flags always error out rather than being silently ignored.
 
 ### Claude Code skill

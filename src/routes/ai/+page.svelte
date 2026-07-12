@@ -19,6 +19,7 @@
     type Capabilities,
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { aiLogsQuery, aiLogsExport, AI_LOG_KIND_LABELS, type AiLogEntry } from "$lib/ailog";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
@@ -74,7 +75,47 @@
   let capabilities = $state<Capabilities | null>(null);
   let capError = $state("");
 
+  // —— AI 调用日志:现查现示,导出返回落盘路径 ——
+  let aiLogs = $state<AiLogEntry[]>([]);
+  let aiLogsTotal = $state(0);
+  let aiLogsError = $state("");
+  let aiLogsBusy = $state(false);
+  let expandedLogId = $state<string | null>(null);
+  let aiLogExportMsg = $state("");
+
+  async function loadAiLogs() {
+    aiLogsBusy = true;
+    aiLogsError = "";
+    aiLogExportMsg = "";
+    try {
+      const page = await aiLogsQuery({ limit: 20 });
+      aiLogs = page.entries;
+      aiLogsTotal = page.total;
+    } catch (e) {
+      aiLogsError = String(e);
+    } finally {
+      aiLogsBusy = false;
+    }
+  }
+
+  async function exportAiLogs() {
+    aiLogsBusy = true;
+    aiLogsError = "";
+    try {
+      const r = await aiLogsExport();
+      aiLogExportMsg = `已导出 ${r.count} 条 → ${r.path}`;
+    } catch (e) {
+      aiLogsError = String(e);
+    } finally {
+      aiLogsBusy = false;
+    }
+  }
+
+  /** "2026-07-12T09:15:00.123+08:00" → "07-12 09:15" */
+  const fmtLogTs = (ts: string) => ts.slice(5, 16).replace("T", " ");
+
   onMount(() => {
+    loadAiLogs();
     (async () => {
       try {
         const s = await getSettings();
@@ -530,6 +571,52 @@
       {/if}
     </div>
   </section>
+
+  <!-- —— AI 调用日志:所有对外 AI 调用(精修/标题/写回)的请求与响应留痕 —— -->
+  <section>
+    <h2 class="section-title">AI 调用日志</h2>
+    <div class="rows">
+      {#if aiLogsError}
+        <div class="banner warn">{aiLogsError}</div>
+      {/if}
+      {#if aiLogs.length === 0}
+        <p class="config-hint">暂无记录。精修与标题生成的每次对外 AI 调用(请求与响应全量)都会在这里留痕。</p>
+      {:else}
+        {#each aiLogs as e (e.id)}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label-line">
+                <span class="row-label">{AI_LOG_KIND_LABELS[e.kind] ?? e.kind}</span>
+                {#if e.status !== "ok"}<span class="pill warn">失败</span>{/if}
+                {#if e.truncated}<span class="pill">超长已截断</span>{/if}
+              </span>
+              <span class="row-desc">
+                {fmtLogTs(e.ts)} · {e.provider}{e.model ? ` · ${e.model}` : ""} · {e.duration_ms}ms{e.note_id
+                  ? ` · ${e.note_id}`
+                  : ""}{#if e.status !== "ok" && e.error}<span class="desc-warn"> · {e.error.slice(0, 80)}</span>{/if}
+              </span>
+            </div>
+            <button class="link" onclick={() => (expandedLogId = expandedLogId === e.id ? null : e.id)}>
+              {expandedLogId === e.id ? "收起" : "详情"}
+            </button>
+          </div>
+          {#if expandedLogId === e.id}
+            <pre class="snippet log-detail">{JSON.stringify(e, null, 2)}</pre>
+          {/if}
+        {/each}
+      {/if}
+      <div class="row">
+        <div class="row-info">
+          <span class="row-desc">
+            {#if aiLogExportMsg}{aiLogExportMsg}
+            {:else}共 {aiLogsTotal} 条,此处显示最近 20 条;导出为 JSONL 含全部字段,完整清单可用命令行 voice-notes ailog{/if}
+          </span>
+        </div>
+        <button class="btn-secondary" disabled={aiLogsBusy} onclick={loadAiLogs}>刷新</button>
+        <button class="btn-secondary" disabled={aiLogsBusy || aiLogsTotal === 0} onclick={exportAiLogs}>导出 JSONL</button>
+      </div>
+    </div>
+  </section>
 </div>
 
 <style>
@@ -756,6 +843,14 @@
   }
   .desc-warn {
     color: var(--warning-ink);
+  }
+  /* 日志详情:snippet 同族,嵌在行下、限高内滚 */
+  .log-detail {
+    margin: 0 1rem 0.6rem;
+    max-height: 20rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
   .snippet {
     margin: 0 0 0.5rem;

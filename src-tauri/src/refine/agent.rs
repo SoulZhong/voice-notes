@@ -306,35 +306,84 @@ fn make_scratch(tag: &str) -> anyhow::Result<PathBuf> {
 /// Agent 精修主入口。前置:管线刚整写过 refined.json(stages.llm=="off")。
 /// 成功判据(与 Agent 输出无关):跑完后盘上 refined.json 可读且 stages.llm=="done"、
 /// 段落数不变(写回工具本就不可能改段落数,这里是对「Agent 绕开工具直写文件」的兜底)。
-pub fn run_refine(note_dir: &Path, note_id: &str, kind: AgentKind, bin: &Path, model: &str) -> anyhow::Result<()> {
+/// log=Some 时整轮调用(命令行+提示词+stdout/stderr+以盘上判定的结果)记入 AI 日志。
+pub fn run_refine(
+    note_dir: &Path,
+    note_id: &str,
+    kind: AgentKind,
+    bin: &Path,
+    model: &str,
+    log: Option<&crate::ailog::Ctx>,
+) -> anyhow::Result<()> {
     let before = load_refined(note_dir)
         .ok_or_else(|| anyhow::anyhow!("盘上没有可精修的 refined.json(应先跑本地两段)"))?;
     anyhow::ensure!(before.stages.llm != "done", "refined.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败");
     let scratch = make_scratch(note_id)?;
-    let result = (|| -> anyhow::Result<()> {
+    let prompt = refine_prompt(note_id);
+    let started = std::time::Instant::now();
+    let result = (|| -> anyhow::Result<(Vec<String>, bool, String, String)> {
         let exe = self_exe()?;
-        let cmd = refine_command(kind, bin, model, &refine_prompt(note_id), &exe, &scratch)?;
-        let (exit_ok, _stdout, err_tail) = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S)?;
-        let after = load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("跑完后 refined.json 不可读"))?;
-        anyhow::ensure!(
-            after.paragraphs.len() == before.paragraphs.len(),
-            "段落数改变({} → {}),疑似绕开写回工具,判失败",
-            before.paragraphs.len(),
-            after.paragraphs.len()
-        );
-        anyhow::ensure!(
-            after.stages.llm == "done",
-            "Agent 未完成写回(exit_ok={exit_ok},盘上 llm={});stderr 尾部:\n{err_tail}",
-            after.stages.llm
-        );
-        Ok(())
+        let cmd = refine_command(kind, bin, model, &prompt, &exe, &scratch)?;
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let (exit_ok, stdout, err_tail) = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S)?;
+        Ok((args, exit_ok, stdout, err_tail))
     })();
+    let verdict: anyhow::Result<()> = match &result {
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+        Ok((_, exit_ok, _, err_tail)) => (|| {
+            let after =
+                load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("跑完后 refined.json 不可读"))?;
+            anyhow::ensure!(
+                after.paragraphs.len() == before.paragraphs.len(),
+                "段落数改变({} → {}),疑似绕开写回工具,判失败",
+                before.paragraphs.len(),
+                after.paragraphs.len()
+            );
+            anyhow::ensure!(
+                after.stages.llm == "done",
+                "Agent 未完成写回(exit_ok={exit_ok},盘上 llm={});stderr 尾部:\n{err_tail}",
+                after.stages.llm
+            );
+            Ok(())
+        })(),
+    };
+    if let Some(ctx) = log {
+        let response = match &result {
+            Ok((_, exit_ok, stdout, err_tail)) => serde_json::json!({
+                "exit_ok": exit_ok, "stdout": stdout, "stderr_tail": err_tail,
+            }),
+            Err(_) => serde_json::Value::Null,
+        };
+        crate::ailog::record(
+            ctx,
+            crate::ailog::Draft {
+                kind: "agent_refine",
+                provider: kind.key().into(),
+                model: Some(model.to_string()).filter(|m| !m.is_empty()),
+                endpoint: Some(bin.display().to_string()),
+                request: serde_json::json!({
+                    "args": result.as_ref().map(|(args, ..)| args.clone()).unwrap_or_default(),
+                    "prompt": prompt,
+                }),
+                response,
+                status: if verdict.is_ok() { "ok" } else { "error" },
+                error: verdict.as_ref().err().map(|e| e.to_string()),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
     let _ = std::fs::remove_dir_all(&scratch);
-    result
+    verdict
 }
 
 /// 为整场笔记生成主题标题(语义与 llm::gen_title 一致:锦上添花,失败即放弃)。
-pub fn gen_title(kind: AgentKind, bin: &Path, model: &str, paragraphs: &[RefinedParagraph]) -> anyhow::Result<String> {
+pub fn gen_title(
+    kind: AgentKind,
+    bin: &Path,
+    model: &str,
+    paragraphs: &[RefinedParagraph],
+    log: Option<&crate::ailog::Ctx>,
+) -> anyhow::Result<String> {
     let mut text = String::new();
     for p in paragraphs {
         if text.chars().count() > 1500 {
@@ -350,12 +399,40 @@ pub fn gen_title(kind: AgentKind, bin: &Path, model: &str, paragraphs: &[Refined
         "只输出一个不超过 12 个字的中文标题,概括下面这场对话的核心主题;不要引号、标点或任何解释。\n\n{text}"
     );
     let scratch = make_scratch("title")?;
-    let result = (|| -> anyhow::Result<String> {
+    let started = std::time::Instant::now();
+    let run = (|| -> anyhow::Result<(bool, String, String)> {
         let cmd = title_command(kind, bin, model, &prompt, &scratch);
-        let (exit_ok, stdout, err_tail) = run_with_timeout(cmd, &scratch, TITLE_TIMEOUT_S)?;
-        anyhow::ensure!(exit_ok, "标题进程退出非 0;stderr 尾部:\n{err_tail}");
-        extract_title(&stdout)
+        run_with_timeout(cmd, &scratch, TITLE_TIMEOUT_S)
     })();
+    let result: anyhow::Result<String> = match &run {
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+        Ok((exit_ok, stdout, err_tail)) => (|| {
+            anyhow::ensure!(*exit_ok, "标题进程退出非 0;stderr 尾部:\n{err_tail}");
+            extract_title(stdout)
+        })(),
+    };
+    if let Some(ctx) = log {
+        let response = match &run {
+            Ok((exit_ok, stdout, err_tail)) => serde_json::json!({
+                "exit_ok": exit_ok, "stdout": stdout, "stderr_tail": err_tail,
+            }),
+            Err(_) => serde_json::Value::Null,
+        };
+        crate::ailog::record(
+            ctx,
+            crate::ailog::Draft {
+                kind: "title",
+                provider: kind.key().into(),
+                model: Some(model.to_string()).filter(|m| !m.is_empty()),
+                endpoint: Some(bin.display().to_string()),
+                request: serde_json::json!({ "prompt": prompt }),
+                response,
+                status: if result.is_ok() { "ok" } else { "error" },
+                error: result.as_ref().err().map(|e| e.to_string()),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
@@ -470,27 +547,39 @@ mod tests {
         write_refined_atomic(note.path(), &doc("off", &["原文"])).unwrap();
         let bins = tempfile::tempdir().unwrap();
         let lazy = fake_bin(bins.path(), "exit 0");
-        let err = run_refine(note.path(), "n1", AgentKind::Claude, &lazy, "").unwrap_err().to_string();
+        let err = run_refine(note.path(), "n1", AgentKind::Claude, &lazy, "", None).unwrap_err().to_string();
         assert!(err.contains("未完成写回"), "退出 0 不算成功: {err}");
 
-        // 烤进真实路径的假 Agent:模拟经写回工具完成(llm→done)。
+        // 烤进真实路径的假 Agent:模拟经写回工具完成(llm→done)。带 AI 日志上下文,
+        // 顺带断言整轮调用(命令行+提示词+盘上判定结果)全量留痕。
         let refined_path = note.path().join("refined.json");
         let done_json = serde_json::to_string(&doc("done", &["修订"])).unwrap();
         let diligent = fake_bin(
             bins.path(),
             &format!("cat > {} <<'EOF'\n{}\nEOF\nexit 0", refined_path.display(), done_json),
         );
-        run_refine(note.path(), "n1", AgentKind::Claude, &diligent, "").unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let ctx = crate::ailog::Ctx { data_root: logs.path().to_path_buf(), note_id: "n1".into() };
+        run_refine(note.path(), "n1", AgentKind::Claude, &diligent, "", Some(&ctx)).unwrap();
+        let v = crate::ailog::query(logs.path(), &crate::ailog::Filter::default());
+        assert_eq!(v["total"], 1);
+        let e = &v["entries"][0];
+        assert_eq!(e["kind"], "agent_refine");
+        assert_eq!(e["provider"], "claude");
+        assert_eq!(e["status"], "ok");
+        assert!(e["request"]["prompt"].as_str().unwrap().contains("apply_refined_texts"), "提示词全量");
+        assert!(e["request"]["args"].as_array().unwrap().iter().any(|a| a == "--strict-mcp-config"), "命令行全量");
+        assert_eq!(e["response"]["exit_ok"], true);
     }
 
     #[test]
     fn run_refine_rejects_paragraph_count_change_and_requires_baseline() {
         let note = tempfile::tempdir().unwrap();
         // 无基线 refined.json → 拒绝
-        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "").is_err());
+        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "", None).is_err());
         // llm 已是 done → 拒绝(无法判定本轮)
         write_refined_atomic(note.path(), &doc("done", &["a"])).unwrap();
-        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "").is_err());
+        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "", None).is_err());
         // 段落数被改 → 判失败
         write_refined_atomic(note.path(), &doc("off", &["a", "b"])).unwrap();
         let bins = tempfile::tempdir().unwrap();
@@ -499,7 +588,7 @@ mod tests {
             bins.path(),
             &format!("cat > {} <<'EOF'\n{}\nEOF\nexit 0", note.path().join("refined.json").display(), mutant_json),
         );
-        let err = run_refine(note.path(), "n1", AgentKind::Claude, &mutant, "").unwrap_err().to_string();
+        let err = run_refine(note.path(), "n1", AgentKind::Claude, &mutant, "", None).unwrap_err().to_string();
         assert!(err.contains("段落数"), "{err}");
     }
 
@@ -515,8 +604,8 @@ mod tests {
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_bin(bins.path(), "echo 发布计划评审");
         let ps = doc("done", &["讨论了发布计划。"]).paragraphs;
-        assert_eq!(gen_title(AgentKind::Claude, &bin, "", &ps).unwrap(), "发布计划评审");
-        assert!(gen_title(AgentKind::Claude, &bin, "", &[]).is_err(), "空稿不发起");
+        assert_eq!(gen_title(AgentKind::Claude, &bin, "", &ps, None).unwrap(), "发布计划评审");
+        assert!(gen_title(AgentKind::Claude, &bin, "", &[], None).is_err(), "空稿不发起");
     }
 
     #[test]

@@ -161,15 +161,38 @@ pub fn apply_refined_texts(
     updates: &[(usize, String)],
     model: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    NoteStore::new(notes_dir(roots)).load(note_id)?;
-    let dir = notes_dir(roots).join(note_id);
-    anyhow::ensure!(
-        dir.join("refined.json").exists(),
-        "该笔记还没有精修稿:请先在 App 里完成一次精修(或等停止录制后自动精修),再写回修订"
+    let started = std::time::Instant::now();
+    let result = (|| -> anyhow::Result<serde_json::Value> {
+        NoteStore::new(notes_dir(roots)).load(note_id)?;
+        let dir = notes_dir(roots).join(note_id);
+        anyhow::ensure!(
+            dir.join("refined.json").exists(),
+            "该笔记还没有精修稿:请先在 App 里完成一次精修(或等停止录制后自动精修),再写回修订"
+        );
+        let updated = store::apply_refined_texts(&dir, updates, model)?;
+        let total = store::load_refined(&dir).map(|d| d.paragraphs.len()).unwrap_or(0);
+        Ok(serde_json::json!({ "updated": updated, "paragraphs": total }))
+    })();
+    // AI 日志:写回是 Agent 精修产出真正落地的那一步,修订全文在这里(Agent 的
+    // stdout 只有一句"完成"),必须全量留痕,否则日志数据不可复用。
+    let ctx = crate::ailog::Ctx { data_root: roots.data_root.clone(), note_id: note_id.to_string() };
+    crate::ailog::record(
+        &ctx,
+        crate::ailog::Draft {
+            kind: "mcp_apply",
+            provider: "mcp".into(),
+            model: Some(model.to_string()),
+            endpoint: None,
+            request: serde_json::json!({
+                "updates": updates.iter().map(|(i, t)| serde_json::json!({ "index": i, "text": t })).collect::<Vec<_>>(),
+            }),
+            response: result.as_ref().map(|v| v.clone()).unwrap_or(serde_json::Value::Null),
+            status: if result.is_ok() { "ok" } else { "error" },
+            error: result.as_ref().err().map(|e| e.to_string()),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
     );
-    let updated = store::apply_refined_texts(&dir, updates, model)?;
-    let total = store::load_refined(&dir).map(|d| d.paragraphs.len()).unwrap_or(0);
-    Ok(serde_json::json!({ "updated": updated, "paragraphs": total }))
+    result
 }
 
 /// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id)。
@@ -392,6 +415,13 @@ mod tests {
         assert_eq!(doc.stages.llm, "done");
         // 穿越 id 拒绝
         assert!(apply_refined_texts(&roots(tmp.path()), "../evil", &[(0, "x".into())], "m").is_err());
+        // AI 日志:写回(成功与失败)都留痕,修订全文可回读。
+        let logs = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        let entries = logs["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|e| e["kind"] == "mcp_apply"
+            && e["status"] == "ok"
+            && e["request"]["updates"][0]["text"] == "我们肯定要做"));
+        assert!(entries.iter().any(|e| e["kind"] == "mcp_apply" && e["status"] == "error"), "拒绝的调用也留痕");
     }
 
     #[test]

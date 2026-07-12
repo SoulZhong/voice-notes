@@ -12,6 +12,7 @@ mod player;
 mod tray;
 mod update;
 pub mod diar;
+mod ailog;
 mod refine;
 pub mod mcp;
 
@@ -331,15 +332,25 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     Ok(d) => settings::load(&d),
                     Err(_) => settings::Settings::default(),
                 };
+                // AI 日志上下文:所有对外 AI 调用(HTTP/Agent/标题)全量留痕。
+                // data_root 拿不到时降级为不记录,绝不影响精修本身。
+                let log_ctx = data_root(&app)
+                    .ok()
+                    .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
                 if refine_agent_ready(&s) {
                     emit("llm", "running");
                     let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
                         .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
                     match resolved {
                         Some((kind, bin)) => {
-                            if let Err(e) =
-                                refine::agent::run_refine(&dir, &note_id, kind, &bin, &s.refine_agent_model)
-                            {
+                            if let Err(e) = refine::agent::run_refine(
+                                &dir,
+                                &note_id,
+                                kind,
+                                &bin,
+                                &s.refine_agent_model,
+                                log_ctx.as_ref(),
+                            ) {
                                 eprintln!("refine: agent 精修失败: {e}");
                             }
                             // Agent 经 MCP 写的是盘上文件:重载同步内存 doc(成功时
@@ -368,7 +379,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         model: s.refine_model.clone(),
                         api_key: s.refine_api_key.clone(),
                     };
-                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model) {
+                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model, log_ctx.as_ref()) {
                         eprintln!("refine: llm 落盘失败: {e}");
                     }
                 }
@@ -386,7 +397,13 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)))
                             .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
                             .and_then(|(kind, bin)| {
-                                refine::agent::gen_title(kind, &bin, &s.refine_agent_model, &doc.paragraphs)
+                                refine::agent::gen_title(
+                                    kind,
+                                    &bin,
+                                    &s.refine_agent_model,
+                                    &doc.paragraphs,
+                                    log_ctx.as_ref(),
+                                )
                             })
                     } else {
                         let cfg = refine::llm::LlmConfig {
@@ -394,7 +411,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             model: s.refine_model.clone(),
                             api_key: s.refine_api_key.clone(),
                         };
-                        refine::llm::gen_title(&cfg, &doc.paragraphs)
+                        refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
                     };
                     match title {
                         Ok(title) => {
@@ -1990,6 +2007,22 @@ fn refine_agents_probe() -> serde_json::Value {
         .into()
 }
 
+/// AI 调用日志查询(倒序分页,过滤条件见 ailog::Filter)。
+#[tauri::command]
+fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(ailog::query(&root, &filter))
+}
+
+/// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
+/// 「写数据目录、把路径给用户」约定)。
+#[tauri::command]
+fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let (path, count) = ailog::export_jsonl(&root, None).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
+}
+
 #[derive(serde::Serialize)]
 struct SkillRead {
     content: String,
@@ -2778,6 +2811,8 @@ pub fn run() {
             mcp_skill_uninstall,
             mcp_capabilities,
             refine_agents_probe,
+            ai_logs_query,
+            ai_logs_export,
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
