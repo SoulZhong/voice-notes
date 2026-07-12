@@ -72,11 +72,14 @@ fn first_positional(args: &[String]) -> Option<String> {
     None
 }
 
-const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get> ...\n\
-  list   [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
-  search <关键词> [--limit N] [--json]\n\
-  get    <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
-  get    … [--raw]  # 忽略精修稿,取原始逐字稿";
+const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle> ...\n\
+  list    [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
+  search  <关键词> [--limit N] [--json]\n\
+  get     <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
+  get     … [--raw]  # 忽略精修稿,取原始逐字稿\n\
+  retitle [--dry-run] [--agent claude|codex|gemini|cursor] [--model M]\n\
+          # AI 为仍是默认标题的会议生成主题标题(手动命名的绝不动);\n\
+          # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI";
 
 pub fn notes_cli(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -85,6 +88,7 @@ pub fn notes_cli(args: &[String]) -> i32 {
         "list" => run_list(rest),
         "search" => run_search(rest),
         "get" => run_get(rest),
+        "retitle" => run_retitle(rest),
         _ => {
             eprintln!("{NOTES_USAGE}");
             return 2;
@@ -249,6 +253,117 @@ fn render_speakers_human(v: &serde_json::Value) -> String {
         ));
     }
     out
+}
+
+/// 批量补标题的执行体:按 App 设置解析,--agent 显式覆盖。
+enum TitleProvider {
+    Agent(crate::refine::agent::AgentKind, std::path::PathBuf, String),
+    Http(crate::refine::llm::LlmConfig),
+}
+
+/// AI 为默认标题的会议批量生成主题标题。手动命名(is_default_title=false)与
+/// 未完成(state!=complete,含录制中)的一律跳过;单场失败不中断,保默认标题继续。
+fn run_retitle(args: &[String]) -> Result<i32, String> {
+    reject_unknown_flags(args, &["--agent", "--model"], &["--dry-run", "--json"])?;
+    let roots = tools::resolve_roots();
+    let store = crate::store::NoteStore::new(roots.data_root.join("notes"));
+    let candidates: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|n| n.state == "complete" && crate::store::writer::is_default_title(&n.title))
+        .collect();
+    if candidates.is_empty() {
+        println!("没有需要补标题的会议(全部已是主题标题或手动命名)。");
+        return Ok(0);
+    }
+    if has_flag(args, "--dry-run") {
+        println!("将为以下 {} 场会议生成标题(--dry-run,未改动):", candidates.len());
+        for n in &candidates {
+            println!("  {}\t{}", n.id, n.title);
+        }
+        return Ok(0);
+    }
+
+    let s = crate::settings::load(&roots.app_data);
+    let model_override = opt_value(args, "--model")?;
+    let provider = match opt_value(args, "--agent")? {
+        Some(key) => {
+            let kind = crate::refine::agent::AgentKind::from_key(&key)
+                .ok_or_else(|| format!("未知 agent: {key}(可用 claude|codex|gemini|cursor)"))?;
+            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin).ok_or_else(|| {
+                format!("未检测到 {} 的命令行工具,请先安装并登录", kind.bin_name())
+            })?;
+            TitleProvider::Agent(kind, bin, model_override.unwrap_or_default())
+        }
+        None if s.refine_provider == "agent" => {
+            let kind = crate::refine::agent::AgentKind::from_key(&s.refine_agent)
+                .ok_or_else(|| format!("设置里的 refine_agent 不认识: {}", s.refine_agent))?;
+            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin)
+                .ok_or_else(|| format!("未检测到 {} 的命令行工具", kind.bin_name()))?;
+            TitleProvider::Agent(kind, bin, model_override.unwrap_or(s.refine_agent_model))
+        }
+        None => {
+            if s.refine_base_url.is_empty() || s.refine_model.is_empty() || s.refine_api_key.is_empty() {
+                return Err("App 设置里没有可用的 AI 执行体(在线接口三项未配齐);\
+                            可在 AI 页配置,或用 --agent claude 直接走本机 Agent"
+                    .into());
+            }
+            TitleProvider::Http(crate::refine::llm::LlmConfig {
+                base_url: s.refine_base_url.clone(),
+                model: model_override.unwrap_or_else(|| s.refine_model.clone()),
+                api_key: s.refine_api_key.clone(),
+            })
+        }
+    };
+
+    let mut renamed = 0usize;
+    let mut failed = 0usize;
+    for n in &candidates {
+        let paragraphs = note_paragraphs_for_title(&roots, &n.id);
+        let ctx = crate::ailog::Ctx { data_root: roots.data_root.clone(), note_id: n.id.clone() };
+        let title = match &provider {
+            TitleProvider::Agent(kind, bin, model) => {
+                crate::refine::agent::gen_title(*kind, bin, model, &paragraphs, Some(&ctx))
+            }
+            TitleProvider::Http(cfg) => crate::refine::llm::gen_title(cfg, &paragraphs, Some(&ctx)),
+        };
+        match title.and_then(|t| store.rename(&n.id, &t).map(|()| t)) {
+            Ok(t) => {
+                println!("{}\t{} → {}", n.id, n.title, t);
+                renamed += 1;
+            }
+            Err(e) => {
+                eprintln!("{}\t失败(保留默认标题): {e}", n.id);
+                failed += 1;
+            }
+        }
+    }
+    println!("完成:改名 {renamed} 场,失败 {failed} 场,共 {} 场候选。", candidates.len());
+    Ok(if failed == 0 { 0 } else { 1 })
+}
+
+/// 标题素材:精修稿段落优先(错字已修、噪声已滤),没有精修稿用原始 segments
+/// 拼最小段落结构。gen_title 自己截前 1500 字。
+fn note_paragraphs_for_title(roots: &tools::DataRoots, id: &str) -> Vec<crate::store::RefinedParagraph> {
+    let dir = roots.data_root.join("notes").join(id);
+    if let Some(doc) = crate::store::load_refined(&dir) {
+        return doc.paragraphs;
+    }
+    let Ok(note) = crate::store::NoteStore::new(roots.data_root.join("notes")).load(id) else {
+        return Vec::new();
+    };
+    note.segments
+        .iter()
+        .map(|s| crate::store::RefinedParagraph {
+            speaker: s.speaker.clone().unwrap_or_default(),
+            name: None,
+            person_id: None,
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            text: s.text.clone(),
+            source_seqs: vec![s.seq],
+        })
+        .collect()
 }
 
 const AILOG_USAGE: &str = "用法: voice-notes ailog <list|export> ...\n\

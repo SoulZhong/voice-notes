@@ -205,6 +205,7 @@ pub fn catalog() -> serde_json::Value {
             "voice-notes notes get <note-id> [--format md|txt|json] [--json] [--raw]",
             "读取一场会议笔记全文(默认 md;--json 是 --format json 的别名;--raw 取原始逐字稿)",
         ),
+        ("voice-notes notes retitle [--dry-run] [--agent claude]", "AI 为默认标题的会议批量生成主题标题(手动命名不动)"),
         ("voice-notes speakers list [--json]", "列出全局声纹库中的说话人"),
         ("voice-notes record status", "查询录制状态(需应用运行)"),
         ("voice-notes record start [--title \"评审会\"]", "开始录制(需应用运行 + 允许 AI 控制)"),
@@ -253,7 +254,7 @@ mod catalog_tests {
     fn catalog_cli_nonempty_and_well_formed() {
         let cat = catalog();
         let cli = cat["cli"].as_array().expect("cli 是数组");
-        assert_eq!(cli.len(), 12, "notes 3 + speakers 1 + record 6 + ailog 2");
+        assert_eq!(cli.len(), 13, "notes 4 + speakers 1 + record 6 + ailog 2");
         for c in cli {
             assert!(c["cmd"].as_str().unwrap().starts_with("voice-notes "));
             assert!(!c["desc"].as_str().unwrap().is_empty());

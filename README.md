@@ -172,6 +172,7 @@ VN=/Applications/voice-notes.app/Contents/MacOS/voice-notes
 "$VN" notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]
 "$VN" notes search "交付日期" [--limit N] [--json]
 "$VN" notes get <note-id> [--format md|txt|json] [--raw]   # 默认 md;--raw 取原始逐字稿(忽略精修)
+"$VN" notes retitle [--dry-run] [--agent claude] [--model M]   # AI 为默认标题的会议批量生成主题标题(手动命名不动)
 "$VN" speakers list [--json]
 ```
 

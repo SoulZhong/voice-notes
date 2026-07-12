@@ -186,6 +186,12 @@ Recording control (needs the app running; `start/stop/pause/resume` also need "A
 "$VN" record live [--tail N]
 ```
 
+Batch title backfill — AI generates topic titles for meetings still carrying the default title (manually named notes are never touched):
+
+```bash
+"$VN" notes retitle [--dry-run] [--agent claude] [--model M]
+```
+
 AI call log (every outbound AI call made for refinement/title generation is fully recorded — request and response; also viewable and exportable on the "AI" page):
 
 ```bash

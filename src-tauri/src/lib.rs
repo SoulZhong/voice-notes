@@ -387,7 +387,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
                 // 失败静默:标题是锦上添花,不影响精修完成态。
-                if (doc.stages.llm == "done" || doc.stages.llm == "partial")
+                // 主题标题:只要 AI 执行体就绪且标题仍是默认样式就尝试——不再要求
+                // LLM 精修阶段成功(标题是独立的小调用,精修分块失败不代表标题也会
+                // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
+                // 失败静默保默认名。
+                if (refine_agent_ready(&s) || refine_llm_ready(&s))
                     && store::writer::is_default_title(&note.meta.title)
                 {
                     // 标题跟随精修执行体:Agent 模式一发一收(无 MCP、无工具),
