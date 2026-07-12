@@ -14,6 +14,7 @@
     mcpCapabilities,
     mcpSkillRead,
     mcpSkillSave,
+    refineAgentsProbe,
     type AgentStatus,
     type Capabilities,
   } from "$lib/mcp";
@@ -33,6 +34,20 @@
     { label: "豆包", base: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-1-6-250615" },
     { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  ];
+
+  // —— 精修执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
+  let refineProvider = $state("openai");
+  let refineAgent = $state("claude");
+  let refineAgentBin = $state("");
+  let refineAgentModel = $state("");
+  /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
+  let agentProbe = $state<Record<string, string | null>>({});
+  const AGENT_OPTIONS = [
+    { key: "claude", label: "Claude Code" },
+    { key: "codex", label: "Codex" },
+    { key: "gemini", label: "Gemini" },
+    { key: "cursor", label: "Cursor" },
   ];
 
   // —— MCP(AI 助手接入):列表现扫现示,注册/移除后重拉;真值源是 Agent 配置文件 ——
@@ -64,9 +79,14 @@
         refineBaseUrl = s.refine_base_url;
         refineModel = s.refine_model;
         refineKey = s.refine_api_key;
+        refineProvider = s.refine_provider;
+        refineAgent = s.refine_agent;
+        refineAgentBin = s.refine_agent_bin;
+        refineAgentModel = s.refine_agent_model;
         mcpAllowControl = s.mcp_allow_control;
       } catch { /* 首载失败:控件保持默认,操作时会再报错 */ }
     })();
+    refineAgentsProbe().then((v) => (agentProbe = v)).catch(() => {});
     refreshMcp();
     refreshSkill();
     mcpManualSnippet().then((v) => (mcpSnippet = v)).catch(() => {});
@@ -85,6 +105,10 @@
       refineBaseUrl = fresh.refine_base_url;
       refineModel = fresh.refine_model;
       refineKey = fresh.refine_api_key;
+      refineProvider = fresh.refine_provider;
+      refineAgent = fresh.refine_agent;
+      refineAgentBin = fresh.refine_agent_bin;
+      refineAgentModel = fresh.refine_agent_model;
       mcpAllowControl = fresh.mcp_allow_control;
     } catch (e) {
       error = `保存失败: ${e}`;
@@ -93,6 +117,10 @@
         refineBaseUrl = settings.refine_base_url;
         refineModel = settings.refine_model;
         refineKey = settings.refine_api_key;
+        refineProvider = settings.refine_provider;
+        refineAgent = settings.refine_agent;
+        refineAgentBin = settings.refine_agent_bin;
+        refineAgentModel = settings.refine_agent_model;
         mcpAllowControl = settings.mcp_allow_control;
       }
     }
@@ -108,6 +136,14 @@
       s.refine_base_url = refineBaseUrl.trim();
       s.refine_model = refineModel.trim();
       s.refine_api_key = refineKey.trim();
+    });
+  }
+  function saveRefineAgent() {
+    saveSetting((s) => {
+      s.refine_provider = refineProvider;
+      s.refine_agent = refineAgent;
+      s.refine_agent_bin = refineAgentBin.trim();
+      s.refine_agent_model = refineAgentModel.trim();
     });
   }
 
@@ -255,27 +291,69 @@
     <div class="rows">
       <div class="config">
         <div class="preset-row">
-          <span class="preset-label">一键填充</span>
-          {#each REFINE_PRESETS as p (p.label)}
-            <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
-          {/each}
+          <span class="preset-label">执行方式</span>
+          <div class="seg">
+            <label class="seg-item">
+              <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />在线接口
+            </label>
+            <label class="seg-item">
+              <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />本机 Agent
+            </label>
+          </div>
         </div>
-        <div class="refine-fields">
-          <label class="field">
-            <span>接口地址</span>
-            <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
-          </label>
-          <label class="field">
-            <span>模型</span>
-            <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
-          </label>
-          <label class="field">
-            <span>API Key</span>
-            <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
-          </label>
-        </div>
-        {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
+        {#if refineProvider === "agent"}
+          <div class="preset-row">
+            <span class="preset-label">Agent</span>
+            <div class="seg">
+              {#each AGENT_OPTIONS as a (a.key)}
+                <label class="seg-item" title={agentProbe[a.key] ?? "未检测到,可在下方指定可执行文件路径"}>
+                  <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={saveRefineAgent} />
+                  {a.label}{#if a.key in agentProbe}{agentProbe[a.key] ? " ✓" : " ⚠"}{/if}
+                </label>
+              {/each}
+            </div>
+          </div>
+          <div class="refine-fields agent-fields">
+            <label class="field">
+              <span>模型(可选,空 = 该 Agent 默认)</span>
+              <input placeholder="如 haiku / gpt-5 / gemini-2.5-flash" bind:value={refineAgentModel} onblur={saveRefineAgent} />
+            </label>
+            <label class="field">
+              <span>CLI 路径(可选,空 = 自动探测)</span>
+              <input placeholder={agentProbe[refineAgent] ?? "如 ~/.local/bin/claude"} bind:value={refineAgentBin} onblur={saveRefineAgent} />
+            </label>
+          </div>
+          <p class="config-hint">
+            {#if agentProbe[refineAgent]}
+              已检测到 {agentProbe[refineAgent]}。精修由本机 Agent 完成:经 MCP 读取并写回精修稿,走该 Agent 自己的登录与额度,无需 API Key。
+            {:else}
+              未检测到所选 Agent 的命令行工具:请先安装并登录,或在上方指定可执行文件路径。
+            {/if}
+          </p>
+        {:else}
+          <div class="preset-row">
+            <span class="preset-label">一键填充</span>
+            {#each REFINE_PRESETS as p (p.label)}
+              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+            {/each}
+          </div>
+          <div class="refine-fields">
+            <label class="field">
+              <span>接口地址</span>
+              <input placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+            </label>
+            <label class="field">
+              <span>模型</span>
+              <input placeholder="deepseek-chat" bind:value={refineModel} onblur={saveRefine} />
+            </label>
+            <label class="field">
+              <span>API Key</span>
+              <input type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
+            </label>
+          </div>
+          {#if !refineBaseUrl || !refineModel || !refineKey}
+            <p class="config-hint">三项配齐后生效;Key 只保存在本机。</p>
+          {/if}
         {/if}
       </div>
     </div>
@@ -620,6 +698,42 @@
     font-size: 0.8rem;
     color: var(--ink-faint);
     margin: 0;
+  }
+  /* 分段单选(与设置页 .seg 同一控件语言) */
+  .seg {
+    display: flex;
+    gap: 2px;
+    flex: none;
+    background: var(--surface-press);
+    border-radius: var(--radius-md);
+    padding: 2px;
+  }
+  .seg-item {
+    position: relative;
+    padding: 0.26em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    border-radius: calc(var(--radius-md) - 2px);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .seg-item:hover {
+    color: var(--ink);
+  }
+  .seg-item:has(input:checked) {
+    background: var(--canvas);
+    color: var(--ink);
+    box-shadow: var(--shadow-btn);
+  }
+  .seg-item input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* Agent 模式两个可选项字段并排 */
+  .agent-fields {
+    grid-template-columns: minmax(10rem, 1fr) minmax(13rem, 2fr);
   }
   .snippet {
     margin: 0 0 0.5rem;

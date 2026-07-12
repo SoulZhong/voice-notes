@@ -1,6 +1,7 @@
 //! 会后精修管线编排:过滤(A3)→重聚类(A1)→段落化,可选 LLM 精修(A2)。
 //! 原始三文件只读;一切产物写 refined.json。
 
+pub mod agent;
 pub mod filter;
 pub mod llm;
 pub mod recluster;

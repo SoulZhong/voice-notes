@@ -52,6 +52,24 @@ pub struct GetNoteParams {
     pub prefer_refined: Option<bool>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RefinedTextUpdate {
+    /// 段落下标(get_note segments 格式返回的 paragraphs 数组下标,0 起)
+    pub index: usize,
+    /// 该段修订后的完整文本(整段替换,不是 diff)
+    pub text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ApplyRefinedParams {
+    /// 笔记 id(须已有精修稿,即 get_note 返回 refined=true)
+    pub note_id: String,
+    /// 有改动的段落集合;确认全文无需修订时传空数组(同样标记精修完成)
+    pub updates: Vec<RefinedTextUpdate>,
+    /// 执行精修的模型名(记入精修稿元数据),如 "claude-sonnet-4-5"
+    pub model: Option<String>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LiveParams {
     /// 返回最近几句,默认 50,最大 500
@@ -91,6 +109,18 @@ impl VnMcp {
     async fn get_note(&self, Parameters(p): Parameters<GetNoteParams>) -> Result<CallToolResult, McpError> {
         let roots = tools::resolve_roots();
         match tools::get_note(&roots, &p.note_id, p.format.as_deref().unwrap_or("segments"), p.prefer_refined.unwrap_or(true)) {
+            Ok(v) => Ok(ok_json(v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
+    }
+
+    #[tool(description = "把精修修订写回笔记的精修稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。\
+                          流程:先 get_note(format=segments) 拿 paragraphs,修订后只提交有改动的段落;全文无需修订则传空 updates。")]
+    async fn apply_refined_texts(&self, Parameters(p): Parameters<ApplyRefinedParams>) -> Result<CallToolResult, McpError> {
+        let roots = tools::resolve_roots();
+        let updates: Vec<(usize, String)> = p.updates.into_iter().map(|u| (u.index, u.text)).collect();
+        let model = p.model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or("agent");
+        match tools::apply_refined_texts(&roots, &p.note_id, &updates, model) {
             Ok(v) => Ok(ok_json(v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
@@ -153,6 +183,11 @@ pub fn catalog() -> serde_json::Value {
         (
             "get_note",
             "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 精修稿时默认优先精修稿。",
+            "none",
+        ),
+        (
+            "apply_refined_texts",
+            "把精修修订写回笔记的精修稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。",
             "none",
         ),
         ("list_speakers", "列出全局声纹库中的说话人(跨会议一致的人物编号/名字/累计说话时长/出现的笔记数)。", "none"),

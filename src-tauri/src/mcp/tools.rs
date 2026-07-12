@@ -152,6 +152,26 @@ pub fn get_note(
 
 // 精修稿的 md/txt 渲染已下沉 store::export::render_refined(GUI 导出与此处共用,防漂移)。
 
+/// Agent 精修写回:按 get_note(segments) 返回的 paragraphs 下标批量替换文本。
+/// 先 NoteStore::load 走 validate_note_id 防穿越 + 存在性检查,再落到 store 层的
+/// 约束式写入(只能改文本,越界/空文本整体拒绝,详见 store::refined)。
+pub fn apply_refined_texts(
+    roots: &DataRoots,
+    note_id: &str,
+    updates: &[(usize, String)],
+    model: &str,
+) -> anyhow::Result<serde_json::Value> {
+    NoteStore::new(notes_dir(roots)).load(note_id)?;
+    let dir = notes_dir(roots).join(note_id);
+    anyhow::ensure!(
+        dir.join("refined.json").exists(),
+        "该笔记还没有精修稿:请先在 App 里完成一次精修(或等停止录制后自动精修),再写回修订"
+    );
+    let updated = store::apply_refined_texts(&dir, updates, model)?;
+    let total = store::load_refined(&dir).map(|d| d.paragraphs.len()).unwrap_or(0);
+    Ok(serde_json::json!({ "updated": updated, "paragraphs": total }))
+}
+
 /// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id)。
 pub fn list_speakers(roots: &DataRoots) -> serde_json::Value {
     let vp = store::VoiceprintStore::new(roots.data_root.clone()).load();
@@ -336,6 +356,42 @@ mod tests {
         assert!(content.contains("原始句"), "text 内容含原句: {content}");
         assert!(!content.contains("# "), "text 格式不带 markdown 标题标记: {content}");
         assert!(get_note(&roots(tmp.path()), "20260101-100000", "bogus", false).is_err(), "未知 format 报错");
+    }
+
+    #[test]
+    fn apply_refined_texts_validates_note_then_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_note(tmp.path(), "20260101-100000", "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "我们肯计要做", 0)]);
+        // 无精修稿:拒绝并给出可操作的提示
+        let err = apply_refined_texts(&roots(tmp.path()), "20260101-100000", &[(0, "x".into())], "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("精修稿"), "缺精修稿的报错要说明原因: {err}");
+        // 落一份精修稿后写回成功
+        let dir = tmp.path().join("notes/20260101-100000");
+        store::write_refined_atomic(
+            &dir,
+            &store::RefinedDoc {
+                schema_version: 1,
+                generated_at: "t".into(),
+                llm_model: None,
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+                discarded_seqs: vec![],
+                paragraphs: vec![store::RefinedParagraph {
+                    speaker: "S1".into(), name: Some("张三".into()), person_id: None,
+                    start_ms: 0, end_ms: 1000, text: "我们肯计要做".into(), source_seqs: vec![0],
+                }],
+            },
+        )
+        .unwrap();
+        let v = apply_refined_texts(&roots(tmp.path()), "20260101-100000", &[(0, "我们肯定要做".into())], "claude-agent").unwrap();
+        assert_eq!(v["updated"], 1);
+        assert_eq!(v["paragraphs"], 1);
+        let doc = store::load_refined(&dir).unwrap();
+        assert_eq!(doc.paragraphs[0].text, "我们肯定要做");
+        assert_eq!(doc.stages.llm, "done");
+        // 穿越 id 拒绝
+        assert!(apply_refined_texts(&roots(tmp.path()), "../evil", &[(0, "x".into())], "m").is_err());
     }
 
     #[test]
