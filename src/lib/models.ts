@@ -59,6 +59,8 @@ export type Settings = {
   mcp_allow_control: boolean;
   // 防重复引导:欢迎页走完或提示条关闭后置 true,两处引导只出现一次
   mcp_onboarded: boolean;
+  // 匿名使用统计:默认开,设置页可关;绝不含会议内容
+  telemetry_enabled: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
