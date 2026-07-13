@@ -12,9 +12,13 @@ pub enum SessionState {
     /// 会话装配中(模型加载/音频源构建在后台线程)。resume_id=Some 为续录。
     Starting { resume_id: Option<String> },
     Recording { note_id: String, paused: bool },
-    /// 停止中(handle.stop+finalize 在工作线程)。P1 阶段停止仍同步委托,
-    /// 此态在 P1 只在 Delegate 前后瞬间存在,为 P2 预留。
-    /// P1 运行期不构造(仅被 actor/回报对账匹配),P2 停止异步化后由内核构造。
+    /// 停止中(handle.stop+finalize 在工作线程)。P3 落地后停止仍是信封层
+    /// 特化同步路径(teardown 后自投 Finalize,见 actor.rs::spawn 主循环与
+    /// run_delegate 里 `Delegate(Stop) 不应到达` 的防御性日志),Cmd::Stop
+    /// 从未预演进此态——P1 设想的「P2 停止异步化后由内核构造」并未发生。
+    /// 至今仅被 actor/consumers 的模式匹配读取(对账 Recording|Stopping 归
+    /// Idle、托盘 Stopping→Idle 判定),从未被真实构造。预留:若未来停止收尾
+    /// 也改为内核驱动的异步态,此变体是落点;当前无消费者、无明确排期。
     #[allow(dead_code)]
     Stopping { note_id: String },
 }
@@ -73,8 +77,10 @@ pub enum Cmd {
     Stop,
     Pause,
     Unpause,
-    /// P1 运行期不构造:recording_status 保持直读 session 槽(P1 内核非权威,
-    /// 经信箱回答只会引入无意义排队);P2 权威翻转时命令壳改发此命令。
+    /// P0-P3 全程未构造:recording_status/status 查询命令壳仍直读 session 槽
+    /// ——这是 P1 声明的偏离延续至今的结果:内核在 P3 仍非唯一权威源,改经
+    /// 信箱回答只会引入无意义排队,收益为负。预留:内核翻权成唯一权威源那天,
+    /// 命令壳才应改发此命令;当前无消费者、无明确排期。
     #[allow(dead_code)]
     QueryStatus,
 }
@@ -120,8 +126,10 @@ pub enum Msg {
     Cmd(Cmd),
     SessionStarted { note_id: String },
     SessionFailed,
-    /// 生产不再构造(停录已改自投 Finalize 收敛状态),分支保留兼容——迁移矩阵
-    /// 测试仍全覆盖,P3 若确认无外部消费者再删。
+    /// 生产不再构造(停录已改自投 Finalize 收敛状态,见 Msg::Finalize)——P3
+    /// 落地后已核实全代码库无生产侧构造点。分支保留仅为兼容:迁移矩阵测试
+    /// (every_report_in_every_state_reconciles 等)仍全覆盖其对账语义,删除
+    /// 会连带削掉这份历史回报路径的测试证据,故暂留而非删除。
     #[allow(dead_code)]
     SessionEnded { note_id: String },
     // —— P2 新增 ——

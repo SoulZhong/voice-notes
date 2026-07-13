@@ -8,8 +8,10 @@
 use super::machine::SessionState;
 
 pub struct TransitionCtx<'a> {
-    // note_id 目前尚无消费者读取(留给未来按笔记过滤的 hook,如外部 webhook 只关心
-    // 某条笔记);单独标注 allow,不因暂无读者产生 dead_code 警告。
+    // note_id 至今(P0-P3)无消费者读取——TrayHook 只用 from/to,不看 note_id。
+    // 预留给未来按笔记过滤的 hook(如外部 webhook 只关心某条笔记的迁移);
+    // spec 未指定实现阶段,无消费者时保持该字段不动。单独标注 allow,不因
+    // 暂无读者产生 dead_code 警告。
     #[allow(dead_code)]
     pub note_id: Option<&'a str>,
     pub from: &'a SessionState,
@@ -33,7 +35,8 @@ pub struct HookBus {
     hooks: Vec<Box<dyn LifecycleHook>>,
 }
 
-/// 外部 hook 配置占位(下期实现执行体:shell 命令/webhook)。
+/// 外部 hook 配置占位(用户可配置 shell 命令/webhook)。spec 只承诺「为未来
+/// 预留接口,本期不实现执行体」,未指定实现阶段;预留,无消费者时保持。
 #[allow(dead_code)]
 pub struct ExternalHookCfg {
     pub event: String,
@@ -46,7 +49,8 @@ impl HookBus {
         self.hooks.push(hook);
     }
 
-    /// 预留:外部 hook 注册入口。本期不实现执行体——记日志并忽略,不 panic。
+    /// 预留:外部 hook 注册入口。本期不实现执行体——记日志并忽略,不 panic;
+    /// 与 ExternalHookCfg 同理由,无明确排期,无消费者时保持。
     #[allow(dead_code)]
     pub fn register_external(&mut self, _cfg: ExternalHookCfg) {
         eprintln!("lifecycle: 外部 hook 尚未支持(接口预留),已忽略");
