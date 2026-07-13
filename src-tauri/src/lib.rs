@@ -2705,10 +2705,18 @@ pub fn run() {
                 .build(),
         );
     // 遥测插件:未配 App-Key 时不注册,track 亦会短路,双保险。
+    // host 恒传:自托管 key(A-SH-)必需;托管云 key(A-EU-/A-US-)由插件忽略。
     let builder = if telemetry::APP_KEY.is_empty() {
         builder
     } else {
-        builder.plugin(tauri_plugin_aptabase::Builder::new(telemetry::APP_KEY).build())
+        builder.plugin(
+            tauri_plugin_aptabase::Builder::new(telemetry::APP_KEY)
+                .with_options(tauri_plugin_aptabase::InitOptions {
+                    host: Some(telemetry::APTABASE_HOST.into()),
+                    flush_interval: None,
+                })
+                .build(),
+        )
     };
     builder
         .manage(AppState::default())

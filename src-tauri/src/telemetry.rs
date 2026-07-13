@@ -9,9 +9,14 @@
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
-/// Aptabase App-Key。空串 = 遥测整体停用(插件不注册、track 短路),
-/// 代码可先合入,拿到 key 后填入即激活。形如 "A-EU-xxxxxxxxxx"。
-pub const APP_KEY: &str = "";
+/// Aptabase App-Key。空串 = 遥测整体停用(插件不注册、track 短路)。
+/// A-SH- 前缀 = 自托管实例,必须同时配置 APTABASE_HOST,否则插件静默停用。
+/// App-Key 是写进客户端的公开标识(等同前端可见的写入端点),不是机密,可入库。
+pub const APP_KEY: &str = "A-SH-4723952967";
+
+/// 自托管 Aptabase 实例地址(不带尾斜杠:插件按 "{host}/api/v0/events" 拼接)。
+/// 仅 A-SH- key 时被插件读取;托管云 key(A-EU-/A-US-)会忽略此值。
+pub const APTABASE_HOST: &str = "https://aptabase.tutorkin.com";
 
 /// 录制源类别。由设置推断而非实际启动结果:遥测只要低基数类别,不追精确。
 #[derive(Debug, PartialEq)]
