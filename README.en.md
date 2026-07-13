@@ -275,8 +275,6 @@ cd src-tauri && cargo test    # backend tests
 
 ## License
 
-[AGPL-3.0](./LICENSE) © zhongweijian (SoulZhong)
+[AGPL-3.0](./LICENSE)
 
 Free to use, study, modify, and self-host. If you distribute or operate this project (or a derivative) as a **closed-source product or service**, AGPL requires you to open-source the derived code. For commercial integrations that can't be open-sourced, contact the author via [GitHub Issues](https://github.com/SoulZhong/voice-notes/issues) for a **commercial license** (dual licensing).
-
-> Note: v0.1.0 and earlier were released under MIT, which remains valid for copies already obtained; versions from this change onward are AGPL-3.0.
