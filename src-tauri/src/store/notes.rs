@@ -24,7 +24,7 @@ fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
 fn write_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
     super::notelock::NoteLock::try_exclusive(dir)
         .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("该笔记正在录制中(可能来自另一个应用实例),请停止录制后再试"))
+        .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),请稍后再试"))
 }
 
 /// load 结果记忆化。详情页切换会议会反复对同一 id 调 load(切走再切回、编辑后
@@ -894,6 +894,6 @@ mod tests {
         let _lock = crate::store::notelock::NoteLock::try_exclusive(&dir).unwrap().unwrap();
         let store = NoteStore::new(tmp.path().to_path_buf());
         let err = store.edit_segment_text(&id, 0, "原文", "改").unwrap_err().to_string();
-        assert!(err.contains("正在录制"), "锁占用时编辑应被明确拒绝,实际: {err}");
+        assert!(err.contains("正被占用"), "锁占用时编辑应被明确拒绝,实际: {err}");
     }
 }

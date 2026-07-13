@@ -746,6 +746,18 @@ fn spawn_session(
         }
 
         // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
+        // 续录先握手再取锁:转码 worker 现在持锁覆盖整个转码窗口(见下方 worker 内
+        // NoteLock::try_exclusive 处注释),若不先 cancel_and_wait 就直接调
+        // NoteWriter::resume 去抢同一把 flock,在途转码会让 resume 拿锁失败,把「转码中」
+        // 误判成「另一实例在录制/编辑」而拒绝续录。此处在加载线程、未持任何全局锁
+        // （running/generation/session_slot 均未持有），符合「持全局锁时绝不调
+        // cancel_and_wait 这类阻塞方法」的锁序纪律。notes_dir 解析失败就跳过握手，
+        // 交给下面的 create/resume 走正常报错路径。
+        if let NoteTarget::Resume(id) = &target {
+            if let Ok(d) = notes_dir(&app) {
+                transcode.cancel_and_wait(&d.join(id));
+            }
+        }
         // New → NoteWriter::create；Resume → NoteWriter::resume（meta 损坏/id 不存在 → Err）。
         let writer = match notes_dir(&app).and_then(|d| match &target {
             NoteTarget::New => store::writer::NoteWriter::create(&d, chrono::Local::now()),
@@ -2819,13 +2831,17 @@ pub fn run() {
                     if let Ok(rd) = std::fs::read_dir(root.join("notes")) {
                         for e in rd.flatten() {
                             if e.path().is_dir() {
-                                // 探锁即释放:这里只是排除活会话(含另一实例的),真正的持锁
-                                // 保护在转码 worker 内部(覆盖转码到删 WAV 的整个窗口)。
-                                match store::notelock::NoteLock::try_exclusive(&e.path()) {
-                                    Ok(Some(_probe)) => {}
+                                // 探锁并把它绑定为存活值(不是探完即放):repair_stale_tracks
+                                // 直接改写 WAV 头,若锁在探完那一刻就释放，另一实例可能在
+                                // repair 与 enqueue 之间的窗口期开始续录并发写同一 WAV，
+                                // 修头操作与它的写入相撞。锁必须覆盖到 repair 完成之后，
+                                // enqueue 只是入队(不动这个目录的文件)，之前 drop 即可。
+                                let _probe = match store::notelock::NoteLock::try_exclusive(&e.path()) {
+                                    Ok(Some(probe)) => probe,
                                     _ => continue,
-                                }
+                                };
                                 store::audio::repair_stale_tracks(&e.path());
+                                drop(_probe);
                                 if should_enqueue_transcode(&e.path()) {
                                     st.transcode.enqueue(e.path());
                                 }

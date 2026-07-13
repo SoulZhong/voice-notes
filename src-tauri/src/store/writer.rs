@@ -125,7 +125,7 @@ impl NoteWriter {
         // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::try_exclusive(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("该笔记正被另一实例录制或编辑,无法开始"))?;
+            .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
         let meta = NoteMeta {
             schema_version: SCHEMA_VERSION,
             id: id.clone(),
@@ -167,7 +167,7 @@ impl NoteWriter {
         // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::try_exclusive(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("该笔记正被另一实例录制或编辑,无法开始"))?;
+            .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
 
         let meta_str = std::fs::read_to_string(dir.join("meta.json"))
             .map_err(|e| anyhow::anyhow!("读 meta.json 失败: {e}"))?;
