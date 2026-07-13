@@ -97,10 +97,7 @@ pub enum Effect {
     /// P2 Task 3 消费后删(runner 用持有的 writer 执行 PipelineOp)。
     #[allow(dead_code)]
     DoPipeline,
-    /// 当前未构造:Finalize 迁移与 SessionEnded 同规则(teardown 已由 runner 做完,
-    /// 内核只收敛状态),故 handle() 不产生本效果。P2 Task 3/4 若需要内核主动
-    /// 触发 finalize 的路径,由那时的迁移规则构造并消费,并删除本 allow。
-    #[allow(dead_code)]
+    /// P2 Task 3/4 消费后由 runner 持 writer 执行真实收尾(finalize IO)。
     DoFinalize { note_id: String },
     /// P2 Task 4 消费后删(runner 执行 abort_or_finalize)。
     #[allow(dead_code)]
@@ -176,15 +173,18 @@ pub fn handle(state: &SessionState, msg: &Msg) -> (SessionState, Vec<Effect>) {
                 name: name.clone(),
             }],
         ),
-        // Finalize:与 SessionEnded 完全同规则——runner 已在自投本消息前跑完 teardown
-        // (finalize IO 已发生),此消息只做内核状态收敛,不产生 DoFinalize 效果。
+        // Finalize:状态收敛与 SessionEnded 同规则(Recording{id}/Stopping{id} 顺流
+        // Idle 零噪音,其余态 Idle+ShadowMismatch),但任何状态下都恒产出恰一个
+        // DoFinalize——runner 持 writer 执行真实收尾。即使态不符也发效果:writer
+        // 若在槽里就必须收尾,宁可对账噪音不可漏 finalize。
         Msg::Finalize { note_id } => {
-            let effects = match state {
-                Recording { note_id: id, .. } | Stopping { note_id: id } if id == note_id => vec![],
-                other => vec![ShadowMismatch(format!(
+            let mut effects = vec![DoFinalize { note_id: note_id.clone() }];
+            match state {
+                Recording { note_id: id, .. } | Stopping { note_id: id } if id == note_id => {}
+                other => effects.push(ShadowMismatch(format!(
                     "Finalize({note_id}) 抵达时内核态为 {other:?}"
-                ))],
-            };
+                ))),
+            }
             (Idle, effects)
         }
     }
@@ -441,9 +441,8 @@ mod tests {
         }
     }
 
-    /// Finalize 与 SessionEnded 完全同规则:runner 自投本消息前已跑完 teardown
-    /// (finalize IO 已发生),内核只做状态收敛——Recording{n1}/Stopping{n1} 顺流
-    /// 到 Idle 零噪音,其余态到 Idle + 一个 ShadowMismatch。
+    /// Finalize:状态收敛与 SessionEnded 同规则(顺流零噪音/其余 ShadowMismatch),
+    /// 但任何状态下都恒产出恰一个 DoFinalize{note_id}——即使态不符也不许漏收尾。
     #[test]
     fn finalize_follows_session_ended_rule_in_every_state() {
         let states = vec![
@@ -457,16 +456,26 @@ mod tests {
         for (name, state) in &states {
             let (next_state, effects) = handle(state, &finalize_msg);
             assert_eq!(next_state, Idle, "{name} 收 Finalize(n1) 应归 Idle");
+            // 任何状态下都恰有一个 DoFinalize,note_id 原样携带
+            let do_finalize_count = effects
+                .iter()
+                .filter(|e| matches!(e, Effect::DoFinalize { note_id } if note_id == "n1"))
+                .count();
+            assert_eq!(do_finalize_count, 1, "{name} + Finalize(n1) 必须恰产出一个 DoFinalize(n1):{effects:?}");
             let is_compatible = matches!(
                 state,
                 Recording { note_id, .. } | Stopping { note_id }
                     if note_id == "n1"
             );
             if is_compatible {
-                assert!(effects.is_empty(), "{name} + Finalize(n1) 是顺流组合,effects 应为空");
+                assert_eq!(effects.len(), 1, "{name} + Finalize(n1) 是顺流组合,除 DoFinalize 外应零噪音:{effects:?}");
             } else {
-                assert_eq!(effects.len(), 1, "{name} + Finalize(n1) 不兼容,应有一个 ShadowMismatch");
-                assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
+                assert_eq!(effects.len(), 2, "{name} + Finalize(n1) 不兼容,应为 DoFinalize + 一个 ShadowMismatch:{effects:?}");
+                assert_eq!(
+                    effects.iter().filter(|e| matches!(e, Effect::ShadowMismatch(_))).count(),
+                    1,
+                    "{name} + Finalize(n1) 不兼容,应恰有一个 ShadowMismatch:{effects:?}"
+                );
             }
         }
     }
