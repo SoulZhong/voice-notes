@@ -113,7 +113,7 @@ Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CL
 
 | Surface | What it is | When to use |
 | --- | --- | --- |
-| **MCP server** | The standard agent tool protocol, 10 tools (search / read full text / recording status & control) | Preferred, for MCP-capable agents |
+| **MCP server** | The standard agent tool protocol, 11 tools (search / read full text / recording status & control) | Preferred, for MCP-capable agents |
 | **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
 | **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
@@ -151,7 +151,7 @@ Three ways to register (pick one):
    args = ["mcp", "serve"]
    ```
 
-The 10 tools:
+The 11 tools:
 
 | Tool | Purpose | Prerequisite |
 | --- | --- | --- |
@@ -159,6 +159,7 @@ The 10 tools:
 | `search_notes` | Full-text search over transcripts, hits carry one sentence of context on each side | App need not be running |
 | `get_note` | Read a note's full text (AI-polished version preferred by default) | App need not be running |
 | `list_speakers` | Global voiceprint library / speakers (stable cross-meeting id / name) | App need not be running |
+| `apply_refined_texts` | Agent-assisted refinement write-back: submit revised paragraph texts by index (text only, structure untouchable) | App not required; note must already have a refined draft |
 | `recording_status` | Current recording state | App running |
 | `get_live_transcript` | Live transcript of the in-progress session | App running |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
