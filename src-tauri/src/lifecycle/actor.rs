@@ -92,8 +92,16 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 let mut result: Result<(), String> = Ok(());
                 for fx in &effects {
                     match fx {
-                        Effect::Delegate(cmd) => result = run_delegate(&app, cmd),
-                        Effect::ReplyErr(e) => result = Err(e.clone()),
+                        Effect::Delegate(cmd) => {
+                            let r = run_delegate(&app, cmd);
+                            // sticky-error: 首个失败即定局,后续效果不得漂白结果。
+                            // Delegate 即使 result 已 Err 仍执行(保持现状语义:效果序列全部跑完,
+                            // 只是 result 不被覆盖)。
+                            if result.is_ok() { result = r; }
+                        }
+                        Effect::ReplyErr(e) => {
+                            if result.is_ok() { result = Err(e.clone()); }
+                        }
                         Effect::ShadowMismatch(d) => {
                             eprintln!("lifecycle 影子对账: {d}");
                         }
