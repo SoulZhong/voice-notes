@@ -105,6 +105,15 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         Effect::ShadowMismatch(d) => {
                             eprintln!("lifecycle 影子对账: {d}");
                         }
+                        // P2 Task 2 只扩内核形状,writer 语义效果尚未接线(runner 不持 writer)。
+                        // Task 3/4 逐个落地执行体后,把对应分支从这里迁出、删除本通配。
+                        #[allow(unused_variables)]
+                        Effect::DoAdopt
+                        | Effect::DoPipeline
+                        | Effect::DoFinalize { .. }
+                        | Effect::DoAbort
+                        | Effect::DoSetTitle { .. }
+                        | Effect::DoRenameActiveSpeaker { .. } => {}
                     }
                 }
                 // 委托失败 → 回退预演迁移:状态不动、不通知 hook。

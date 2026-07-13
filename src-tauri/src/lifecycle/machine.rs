@@ -31,12 +31,53 @@ pub enum Cmd {
     QueryStatus,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// 管线事件载荷(ASR worker 线程原样转发,actor 持 writer 执行)。
+/// 仅 Debug:内部 `DiarEvent` 无 PartialEq,载荷不参与内核判定(内核不读 writer),
+/// 故无需可比较——与 Msg 整体不再 Clone/PartialEq 的理由一致(见下)。
+/// P2 Task 2 只定义形状,尚无生产路径构造(仅矩阵测试);Task 3/4 由 ASR worker 接线后
+/// 各分支转为可达,届时可去掉 dead_code allow。
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum PipelineOp {
+    Final {
+        source: String,
+        text: String,
+        start_ms: u64,
+        end_ms: u64,
+        speaker: Option<String>,
+        rms: Option<f32>,
+    },
+    Diar(crate::session::DiarEvent),
+}
+
+/// Msg 不再 derive Clone/PartialEq/Debug:`AdoptWriter` 携带 `Box<NoteWriter>`,
+/// 而 `NoteWriter` 本身无 Clone/PartialEq/Debug(File 句柄语义上不可比较/打印)。
+/// 这是新增 writer 语义变体的直接后果——runner 侧只消费一次(Box 转移所有权),
+/// 内核也从不比较或打印 Msg 本身,故无需这些 trait。
 pub enum Msg {
     Cmd(Cmd),
     SessionStarted { note_id: String },
     SessionFailed,
+    /// 保留:P1 兼容,Task 4 停录改造后由 Finalize 取代发送。
     SessionEnded { note_id: String },
+    // —— P2 新增 ——
+    /// P2 Task 2 只定义形状,尚无生产路径构造(仅矩阵测试);
+    /// Task 3 接线 actor 持有 writer 后可去掉 dead_code allow。
+    #[allow(dead_code)]
+    AdoptWriter { writer: Box<crate::store::writer::NoteWriter> },
+    #[allow(dead_code)]
+    Pipeline(PipelineOp),
+    /// 停止中 teardown 完成后自投:runner 已执行完 finalize IO,此消息只做
+    /// 内核状态收敛(与 SessionEnded 同规则),故不产生 DoFinalize 效果。
+    #[allow(dead_code)]
+    Finalize { note_id: String },
+    /// 加载失败路径:abort_or_finalize 语义。
+    #[allow(dead_code)]
+    AbortSession,
+    #[allow(dead_code)]
+    SetTitle { note_id: String, title: String },
+    #[allow(dead_code)]
+    RenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +90,27 @@ pub enum Effect {
     ReplyErr(String),
     /// 影子对账不一致:仅记日志,绝不影响主流程。
     ShadowMismatch(String),
+    // —— P2 新增(runner 持 writer 执行;内核只发指令不做 IO) ——
+    /// P2 Task 3 消费后删(runner 落 AdoptWriter 携带的 writer)。
+    #[allow(dead_code)]
+    DoAdopt,
+    /// P2 Task 3 消费后删(runner 用持有的 writer 执行 PipelineOp)。
+    #[allow(dead_code)]
+    DoPipeline,
+    /// 当前未构造:Finalize 迁移与 SessionEnded 同规则(teardown 已由 runner 做完,
+    /// 内核只收敛状态),故 handle() 不产生本效果。P2 Task 3/4 若需要内核主动
+    /// 触发 finalize 的路径,由那时的迁移规则构造并消费,并删除本 allow。
+    #[allow(dead_code)]
+    DoFinalize { note_id: String },
+    /// P2 Task 4 消费后删(runner 执行 abort_or_finalize)。
+    #[allow(dead_code)]
+    DoAbort,
+    /// P2 Task 3/4 消费后删(runner 落标题)。
+    #[allow(dead_code)]
+    DoSetTitle { note_id: String, title: String },
+    /// P2 Task 3/4 消费后删(runner 落说话人改名)。
+    #[allow(dead_code)]
+    DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
 }
 
 /// 迁移表。P1 铁律:凡 Cmd 一律产生 Delegate(旧守卫是权威,内核不抢答),
@@ -90,6 +152,37 @@ pub fn handle(state: &SessionState, msg: &Msg) -> (SessionState, Vec<Effect>) {
                 Recording { note_id: id, .. } | Stopping { note_id: id } if id == note_id => vec![],
                 other => vec![ShadowMismatch(format!(
                     "SessionEnded({note_id}) 抵达时内核态为 {other:?}"
+                ))],
+            };
+            (Idle, effects)
+        }
+        // —— P2 新增:writer 语义消息 ——
+        // AdoptWriter/Pipeline/SetTitle/RenameActiveSpeaker/AbortSession 均不改会话态
+        // (writer 归属、说话人表、标题都是 runner 侧状态,内核只转发一个 Do* 指令),
+        // 也从不产生 ShadowMismatch——它们与「录制中/停止中」这条主时间轴正交,
+        // 任何状态下发生都不构成对账矛盾。
+        Msg::AdoptWriter { .. } => (state.clone(), vec![DoAdopt]),
+        Msg::Pipeline(_) => (state.clone(), vec![DoPipeline]),
+        Msg::AbortSession => (state.clone(), vec![DoAbort]),
+        Msg::SetTitle { note_id, title } => (
+            state.clone(),
+            vec![DoSetTitle { note_id: note_id.clone(), title: title.clone() }],
+        ),
+        Msg::RenameActiveSpeaker { note_id, speaker_id, name } => (
+            state.clone(),
+            vec![DoRenameActiveSpeaker {
+                note_id: note_id.clone(),
+                speaker_id: speaker_id.clone(),
+                name: name.clone(),
+            }],
+        ),
+        // Finalize:与 SessionEnded 完全同规则——runner 已在自投本消息前跑完 teardown
+        // (finalize IO 已发生),此消息只做内核状态收敛,不产生 DoFinalize 效果。
+        Msg::Finalize { note_id } => {
+            let effects = match state {
+                Recording { note_id: id, .. } | Stopping { note_id: id } if id == note_id => vec![],
+                other => vec![ShadowMismatch(format!(
+                    "Finalize({note_id}) 抵达时内核态为 {other:?}"
                 ))],
             };
             (Idle, effects)
@@ -278,5 +371,103 @@ mod tests {
         let a = handle(&s, &m);
         let b = handle(&s, &m);
         assert_eq!(a, b, "纯函数:同输入必同输出,runner 才能安全回退预演");
+    }
+
+    fn writer_box() -> Box<crate::store::writer::NoteWriter> {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = crate::store::writer::NoteWriter::create(tmp.path(), chrono::Local::now())
+            .expect("NoteWriter::create 不应失败");
+        Box::new(w)
+    }
+
+    /// P2 迁移规则矩阵(5 类新消息 × 4 状态):AdoptWriter/Pipeline/SetTitle/
+    /// RenameActiveSpeaker/AbortSession 与「录制中/停止中」主时间轴正交——writer
+    /// 归属、说话人表、标题都是 runner 侧状态,内核只转发指令。任何状态下都应
+    /// 状态不变 + 恰一个对应 Do* 效果 + 零 ShadowMismatch(载荷不进内核判定)。
+    #[test]
+    fn writer_semantic_msgs_are_state_orthogonal_in_every_state() {
+        let states = [Idle, Starting { resume_id: None }, rec("n1"), Stopping { note_id: "n1".into() }];
+
+        for s in &states {
+            let (next, fx) = handle(s, &Msg::AdoptWriter { writer: writer_box() });
+            assert_eq!(&next, s, "AdoptWriter 不应改变状态:state={s:?}");
+            assert!(matches!(fx.as_slice(), [Effect::DoAdopt]), "state={s:?} fx={fx:?}");
+
+            let op = PipelineOp::Final {
+                source: "mic".into(),
+                text: "hi".into(),
+                start_ms: 0,
+                end_ms: 1,
+                speaker: None,
+                rms: None,
+            };
+            let (next, fx) = handle(s, &Msg::Pipeline(op));
+            assert_eq!(&next, s, "Pipeline 不应改变状态:state={s:?}");
+            assert!(matches!(fx.as_slice(), [Effect::DoPipeline]), "state={s:?} fx={fx:?}");
+
+            let (next, fx) = handle(s, &Msg::AbortSession);
+            assert_eq!(&next, s, "AbortSession 不应改变状态:state={s:?}");
+            assert!(matches!(fx.as_slice(), [Effect::DoAbort]), "state={s:?} fx={fx:?}");
+
+            let (next, fx) =
+                handle(s, &Msg::SetTitle { note_id: "n1".into(), title: "新标题".into() });
+            assert_eq!(&next, s, "SetTitle 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoSetTitle { note_id, title }]
+                        if note_id == "n1" && title == "新标题"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let (next, fx) = handle(
+                s,
+                &Msg::RenameActiveSpeaker {
+                    note_id: "n1".into(),
+                    speaker_id: "spk1".into(),
+                    name: "张三".into(),
+                },
+            );
+            assert_eq!(&next, s, "RenameActiveSpeaker 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoRenameActiveSpeaker { note_id, speaker_id, name }]
+                        if note_id == "n1" && speaker_id == "spk1" && name == "张三"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+        }
+    }
+
+    /// Finalize 与 SessionEnded 完全同规则:runner 自投本消息前已跑完 teardown
+    /// (finalize IO 已发生),内核只做状态收敛——Recording{n1}/Stopping{n1} 顺流
+    /// 到 Idle 零噪音,其余态到 Idle + 一个 ShadowMismatch。
+    #[test]
+    fn finalize_follows_session_ended_rule_in_every_state() {
+        let states = vec![
+            ("Idle", Idle),
+            ("Starting", Starting { resume_id: None }),
+            ("Recording n1", rec("n1")),
+            ("Stopping n1", Stopping { note_id: "n1".into() }),
+        ];
+        let finalize_msg = Msg::Finalize { note_id: "n1".into() };
+
+        for (name, state) in &states {
+            let (next_state, effects) = handle(state, &finalize_msg);
+            assert_eq!(next_state, Idle, "{name} 收 Finalize(n1) 应归 Idle");
+            let is_compatible = matches!(
+                state,
+                Recording { note_id, .. } | Stopping { note_id }
+                    if note_id == "n1"
+            );
+            if is_compatible {
+                assert!(effects.is_empty(), "{name} + Finalize(n1) 是顺流组合,effects 应为空");
+            } else {
+                assert_eq!(effects.len(), 1, "{name} + Finalize(n1) 不兼容,应有一个 ShadowMismatch");
+                assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
+            }
+        }
     }
 }
