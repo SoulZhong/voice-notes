@@ -15,6 +15,7 @@ pub mod diar;
 mod ailog;
 mod refine;
 pub mod mcp;
+mod telemetry;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -338,6 +339,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
                 if refine_agent_ready(&s) {
+                    telemetry::track(
+                        &app,
+                        telemetry::Event::NoteRefined {
+                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
+                        },
+                    );
                     emit("llm", "running");
                     let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
                         .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
@@ -373,6 +380,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         }
                     }
                 } else if refine_llm_ready(&s) {
+                    telemetry::track(
+                        &app,
+                        telemetry::Event::NoteRefined {
+                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
+                        },
+                    );
                     emit("llm", "running");
                     let cfg = refine::llm::LlmConfig {
                         base_url: s.refine_base_url.clone(),
@@ -1134,7 +1147,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
-    spawn_session(
+    let result = spawn_session(
         app.clone(),
         state.running.clone(),
         state.generation.clone(),
@@ -1143,7 +1156,15 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         state.embedder_cache.clone(),
         state.transcode.clone(),
         NoteTarget::New,
-    )
+    );
+    if result.is_ok() {
+        if let Ok(dir) = app.path().app_data_dir() {
+            let source =
+                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
+            telemetry::track(app, telemetry::Event::RecordingStarted { source });
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -1168,8 +1189,8 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     if !models::recording_ready(&current_asr(&app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
-    spawn_session(
-        app,
+    let result = spawn_session(
+        app.clone(),
         state.running.clone(),
         state.generation.clone(),
         state.session.clone(),
@@ -1177,7 +1198,15 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         state.embedder_cache.clone(),
         state.transcode.clone(),
         NoteTarget::Resume(note_id),
-    )
+    );
+    if result.is_ok() {
+        if let Ok(dir) = app.path().app_data_dir() {
+            let source =
+                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
+            telemetry::track(&app, telemetry::Event::RecordingStarted { source });
+        }
+    }
+    result
 }
 
 /// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
@@ -1198,6 +1227,10 @@ fn do_stop_recording(app: &AppHandle) {
     let sess = state.session.lock().unwrap().take();
     let mut note_id = String::new();
     if let Some(s) = sess {
+        // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
+        // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
+        // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
+        telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
         let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
         stash_model(&state.recognizer_cache, returned);
         stash_model(&state.embedder_cache, embedder);
@@ -1706,10 +1739,16 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool)
     } else {
         None
     };
-    store::NoteStore::new(dir)
+    let result = store::NoteStore::new(dir)
         .export(&id, &format, refined.as_ref())
         .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if result.is_ok() {
+        if let Some(fmt) = telemetry::ExportFormat::parse(&format) {
+            telemetry::track(&app, telemetry::Event::NoteExported { format: fmt });
+        }
+    }
+    result
 }
 
 /// 声纹库四命令共用：打开 data_root 下的 VoiceprintStore（与逐场笔记目录并列，
@@ -2653,7 +2692,7 @@ extern "C" {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
@@ -2664,7 +2703,29 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(shortcuts::on_shortcut)
                 .build(),
+        );
+    // 遥测插件:未配 App-Key 时不注册,track 亦会短路,双保险。
+    // host 恒传:自托管 key(A-SH-)必需;托管云 key(A-EU-/A-US-)由插件忽略。
+    // 插件内部用裸 tokio::spawn 起批量发送循环、reqwest 发请求、退出时 block_on 冲队列,
+    // 都要求线程环境里有 Tokio reactor;GUI 主线程本身不在 runtime 里(真机启动即 panic:
+    // "there is no reactor running"),这里 enter Tauri 自带 runtime 的 handle 兜底——
+    // guard 与 handle 须存活到 builder.run()(插件 setup/退出 flush 都在其中执行),
+    // 故绑定在 run() 作用域而非 if 内。EnterGuard 只设线程本地标记,不影响主线程其余逻辑。
+    let telemetry_rt = tauri::async_runtime::handle();
+    let _telemetry_reactor_guard = telemetry_rt.inner().enter();
+    let builder = if telemetry::APP_KEY.is_empty() {
+        builder
+    } else {
+        builder.plugin(
+            tauri_plugin_aptabase::Builder::new(telemetry::APP_KEY)
+                .with_options(tauri_plugin_aptabase::InitOptions {
+                    host: Some(telemetry::APTABASE_HOST.into()),
+                    flush_interval: None,
+                })
+                .build(),
         )
+    };
+    builder
         .manage(AppState::default())
         .manage(player::PlayerHandle::default())
         .on_window_event(|window, event| {
@@ -2767,6 +2828,7 @@ pub fn run() {
             });
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
+            telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

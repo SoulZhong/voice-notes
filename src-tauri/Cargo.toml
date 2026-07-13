@@ -24,6 +24,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-aptabase = "1"
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
