@@ -55,12 +55,18 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             }
         }
         "quit" => {
-            // 录制中先收尾再退：do_stop_recording 会 flush 尾段 + finalize 落盘，
-            // 秒级延迟是 spec 已知取舍——绝不能为了退得快而丢掉正在写的笔记。
-            // running 锁 statement-scoped：读完即放，绝不与 do_stop_recording 内部锁嵌套。
+            // 录制中先收尾再退：经 actor 发 Cmd::Stop(P1 改道,委托 do_stop_recording,
+            // 阻塞至 flush 尾段 + finalize 落盘完成),秒级延迟是 spec 已知取舍——绝不能
+            // 为了退得快而丢掉正在写的笔记。Err 仅 actor 已退出时出现,仍继续退出。
+            // running 锁 statement-scoped：读完即放，绝不与停录内部锁嵌套。
             let running = *app.state::<crate::AppState>().running.lock().unwrap();
             if running {
-                crate::do_stop_recording(app);
+                if let Err(e) = app
+                    .state::<crate::lifecycle::LifecycleHandle>()
+                    .command(crate::lifecycle::Cmd::Stop)
+                {
+                    eprintln!("退出前停录失败(仍继续退出): {e}");
+                }
             }
             app.exit(0);
         }
@@ -103,7 +109,21 @@ pub fn setup(app: &AppHandle) {
 
 /// 录制态变化时刷新托盘：切图标（red/idle）+ 模板开关 + 重建菜单文案。
 /// 托盘不存在（未启用/建失败）→ tray_by_id 为 None，静默跳过。失败只 eprintln。
+///
+/// P1 actor 改道后,本函数可能在 lifecycle-actor 线程上执行,而发起命令的主线程正阻塞
+/// 等待 actor 回复;托盘/菜单 API(set_icon_with_as_template/set_menu/MenuItem 构建)
+/// 内部是「派发到主线程并同步等结果」——此时同步等待即死锁(actor.rs 死锁注记③的前提)。
+/// 故整段更新改为 fire-and-forget 派发:在主线程上调用时 run_on_main_thread 原地内联
+/// 执行(与旧行为逐位一致);在其它线程上调用时入队主线程事件循环,主线程空闲后按入队
+/// 序执行,托盘态与录制态最终一致(此前从后台加载线程调用本就等价于稍后生效)。
 pub fn set_recording(app: &AppHandle, recording: bool) {
+    let app2 = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || set_recording_on_main(&app2, recording)) {
+        eprintln!("托盘更新派发失败（不影响录制）: {e}");
+    }
+}
+
+fn set_recording_on_main(app: &AppHandle, recording: bool) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };

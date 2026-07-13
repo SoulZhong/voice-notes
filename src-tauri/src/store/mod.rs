@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod disk;
 pub mod migrate;
+pub mod notelock;
 pub mod refined;
 pub mod transcode;
 pub mod writer;
