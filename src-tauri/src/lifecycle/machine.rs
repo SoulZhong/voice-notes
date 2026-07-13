@@ -34,10 +34,9 @@ pub enum Cmd {
 /// 管线事件载荷(ASR worker 线程原样转发,actor 持 writer 执行)。
 /// 仅 Debug:内部 `DiarEvent` 无 PartialEq,载荷不参与内核判定(内核不读 writer),
 /// 故无需可比较——与 Msg 整体不再 Clone/PartialEq 的理由一致(见下)。
-/// P2 Task 2 只定义形状,尚无生产路径构造(仅矩阵测试);Task 3/4 由 ASR worker 接线后
-/// 各分支转为可达,届时可去掉 dead_code allow。
+/// 生产路径:lib.rs 的 on_final/on_diar 回调构造(时间戳已在回调侧加好续录偏移,
+/// 消息里恒为落盘口径的绝对时间轴),actor 的 run_pipeline 消费。
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum PipelineOp {
     Final {
         source: String,
@@ -58,25 +57,21 @@ pub enum Msg {
     Cmd(Cmd),
     SessionStarted { note_id: String },
     SessionFailed,
-    /// 保留:P1 兼容,Task 4 停录改造后由 Finalize 取代发送。
+    /// 生产不再构造(停录已改自投 Finalize 收敛状态),分支保留兼容——迁移矩阵
+    /// 测试仍全覆盖,P3 若确认无外部消费者再删。
+    #[allow(dead_code)]
     SessionEnded { note_id: String },
     // —— P2 新增 ——
-    /// P2 Task 2 只定义形状,尚无生产路径构造(仅矩阵测试);
-    /// Task 3 接线 actor 持有 writer 后可去掉 dead_code allow。
-    #[allow(dead_code)]
+    /// 加载线程在 writer 创建、读完元信息后整体移交所有权(Box 入信箱),
+    /// 此后该线程不得再持 writer 引用;runner 装入 Owned 槽。
     AdoptWriter { writer: Box<crate::store::writer::NoteWriter> },
-    #[allow(dead_code)]
     Pipeline(PipelineOp),
-    /// 停止中 teardown 完成后自投:runner 已执行完 finalize IO,此消息只做
-    /// 内核状态收敛(与 SessionEnded 同规则),故不产生 DoFinalize 效果。
-    #[allow(dead_code)]
+    /// 停录 teardown(排干)完成后由 actor 自投:该消息排在排干期间入队的全部
+    /// Pipeline 消息之后,「先落盘后 finalize」由信箱 FIFO 保证。
     Finalize { note_id: String },
-    /// 加载失败路径:abort_or_finalize 语义。
-    #[allow(dead_code)]
+    /// 加载失败路径:abort_or_finalize 语义(作用于 runner 槽内 writer)。
     AbortSession,
-    #[allow(dead_code)]
     SetTitle { note_id: String, title: String },
-    #[allow(dead_code)]
     RenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
 }
 
@@ -91,22 +86,19 @@ pub enum Effect {
     /// 影子对账不一致:仅记日志,绝不影响主流程。
     ShadowMismatch(String),
     // —— P2 新增(runner 持 writer 执行;内核只发指令不做 IO) ——
-    /// P2 Task 3 消费后删(runner 落 AdoptWriter 携带的 writer)。
-    #[allow(dead_code)]
+    // Do* 效果刻意不带 writer/管线载荷:Box<NoteWriter> 不可克隆,管线文本克隆也
+    // 无谓——runner 在效果执行时从本轮原始 Msg 一次性取走(每条消息恰一个对应效果)。
+    /// runner 把 AdoptWriter 携带的 writer 装入 Owned 槽。
     DoAdopt,
-    /// P2 Task 3 消费后删(runner 用持有的 writer 执行 PipelineOp)。
-    #[allow(dead_code)]
+    /// runner 用槽内 writer 执行 PipelineOp(append/说话人事件,含对应 emit)。
     DoPipeline,
-    /// P2 Task 3/4 消费后由 runner 持 writer 执行真实收尾(finalize IO)。
+    /// runner 持槽内 writer 执行真实收尾(finalize IO+精修/stopped 尾段)。
     DoFinalize { note_id: String },
-    /// P2 Task 4 消费后删(runner 执行 abort_or_finalize)。
-    #[allow(dead_code)]
+    /// runner 对槽内 writer 执行 abort_or_finalize 语义并清槽。
     DoAbort,
-    /// P2 Task 3/4 消费后删(runner 落标题)。
-    #[allow(dead_code)]
+    /// runner 落录制中标题(writer 单写者路径,UDS start --title 消费)。
     DoSetTitle { note_id: String, title: String },
-    /// P2 Task 3/4 消费后删(runner 落说话人改名)。
-    #[allow(dead_code)]
+    /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
     DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
 }
 
