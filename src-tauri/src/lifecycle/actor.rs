@@ -28,7 +28,7 @@ use crossbeam_channel::{unbounded, Sender};
 use tauri::{AppHandle, Emitter};
 
 use super::hooks::{HookBus, TransitionCtx};
-use super::machine::{self, Cmd, Effect, Msg, PipelineOp, SessionState};
+use super::machine::{self, Cmd, Effect, LifecycleState, Msg, PipelineOp, RefineState, SessionState};
 
 pub enum Envelope {
     Cmd { cmd: Cmd, reply: Sender<Result<(), String>> },
@@ -36,6 +36,10 @@ pub enum Envelope {
     /// 带回执的非命令消息(P2):SetTitle/RenameActiveSpeaker/自投 Finalize 等
     /// 需要同步结果的投递;处理完本条消息的全部效果后按 sticky-error 结果回复。
     Request { msg: Msg, reply: Sender<Result<(), String>> },
+    /// 精修态查询(P3):不经 machine::handle(查询不该在迁移表里制造伪迁移,
+    /// 与 recording_status 直读同理),actor 直答自身内核态。供 rename/assign_
+    /// refined_* 的「精修中拒绝」守卫读取(原 AppState.refining.contains)。
+    QueryRefine { note_id: String, reply: Sender<bool> },
 }
 
 #[derive(Clone)]
@@ -66,6 +70,21 @@ impl LifecycleHandle {
             .send(Envelope::Request { msg, reply: rtx })
             .map_err(|_| "lifecycle actor 已退出".to_string())?;
         rrx.recv().map_err(|_| "lifecycle actor 未回复".to_string())?
+    }
+
+    /// 该笔记是否正在精修(P3,内核精修态快照)。取代旧 AppState.refining 集合的
+    /// contains 查询;经信箱串行化,读到的是与命令处理一致的快照。actor 已退出按
+    /// 「未在精修」处理(仅进程退出路径)。死锁纪律同注记③:调用方不得持全局锁。
+    pub fn is_refining(&self, note_id: &str) -> bool {
+        let (rtx, rrx) = crossbeam_channel::bounded(1);
+        if self
+            .tx
+            .send(Envelope::QueryRefine { note_id: note_id.to_string(), reply: rtx })
+            .is_err()
+        {
+            return false;
+        }
+        rrx.recv().unwrap_or(false)
     }
 }
 
@@ -255,7 +274,8 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
     std::thread::Builder::new()
         .name("lifecycle-actor".into())
         .spawn(move || {
-            let mut state = SessionState::Idle;
+            // P3:状态升维(会话+精修两维,见 machine::LifecycleState)。
+            let mut state = LifecycleState::init();
             // P2:writer 所有权槽。AdoptWriter 装入,Abort/Finalize 取出;线程局部
             // 无锁——唯一触碰者是本线程(单写者)。
             let mut owned: Option<Owned> = None;
@@ -302,6 +322,14 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     Envelope::Cmd { cmd, reply } => (Msg::Cmd(cmd), Some(reply)),
                     Envelope::Report(m) => (m, None),
                     Envelope::Request { msg, reply } => (msg, Some(reply)),
+                    // 查询直答(不进迁移表):回执后处理下一封。
+                    Envelope::QueryRefine { note_id, reply } => {
+                        let _ = reply.send(matches!(
+                            &state.refine,
+                            RefineState::Running { note_id: r } if r == &note_id
+                        ));
+                        continue;
+                    }
                 };
                 let (next, effects) = machine::handle(&state, &msg);
                 let is_cmd = matches!(msg, Msg::Cmd(_));
@@ -410,6 +438,11 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                         Ok(()) => {
                                             // 仅 finalize 成功（state=complete、meta 落盘）才发起精修。
                                             // 转码移交时机与失败兜底见 spawn_refine 文档注释。
+                                            // 自动精修是保障类直调,不经 RefineRequest 守卫(与旧
+                                            // 世界停录钩子直调一致);内核精修态由 spawn_refine 入口
+                                            // 同步自投的 RefineProgress("all","running") 置 Running,
+                                            // 该消息排在本条 Finalize 之后、停录 reply 之前入队——
+                                            // 停录返回后到达的续录命令必然排在它后面,守卫不漏挡。
                                             // 精修目标用 o.note_id(槽内笔记,真正被上面 finalize 的那条)
                                             // 而非消息携带的 note_id:错配分支(上方 eprintln)已表明二者
                                             // 可能不同——finalize 的 IO 只作用于槽内 writer,精修必须
@@ -442,6 +475,25 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 _ => Err("录制已结束或笔记不匹配,标题未设置".into()),
                             };
                             if result.is_ok() { result = r; }
+                        }
+                        Effect::DoSpawnRefine { note_id, enqueue_transcode } => {
+                            // 手动精修路径(refine_note → RefineRequest 裁决通过):守卫
+                            // 已在内核抢答,这里只负责发起。spawn_refine 入口会同步
+                            // report RefineProgress("all","running")(自投,unbounded 不
+                            // 阻塞——死锁注记①),对本路径是幂等重置(内核已置 Running)。
+                            crate::spawn_refine(app.clone(), note_id.clone(), *enqueue_transcode);
+                        }
+                        Effect::DoEmitRefine { note_id, stage, state } => {
+                            // 原 spawn_refine worker 的 emit("refine",..) 改道至此:同一
+                            // worker 串行 report + 信箱 FIFO,事件种类/载荷/顺序逐位不变。
+                            let _ = app.emit(
+                                "refine",
+                                crate::ipc::RefineEvent {
+                                    note_id: note_id.clone(),
+                                    stage: stage.clone(),
+                                    state: state.clone(),
+                                },
+                            );
                         }
                         Effect::DoRenameActiveSpeaker { note_id, speaker_id, name } => {
                             // 原 lib.rs rename_speaker 活动分支逐语句搬移(writer 锁改槽
@@ -480,15 +532,22 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 // 否则守卫拒绝的 Start 会留下幻影 Starting + 幻影迁移通知,
                 // P3 挂上消费者后 hook 将收到从未真实发生的迁移。
                 let commit = if is_cmd && result.is_err() { state.clone() } else { next };
-                if commit != state {
-                    let note_id = match &commit {
+                // hook 只关心会话主时间轴:TransitionCtx from/to 维持 SessionState,
+                // 精修维变化(置 Running/置回 Idle)不通知——托盘等消费者与精修无关。
+                if commit.session != state.session {
+                    let note_id = match &commit.session {
                         SessionState::Recording { note_id, .. }
                         | SessionState::Stopping { note_id } => Some(note_id.as_str()),
                         _ => None,
                     };
-                    bus.notify(&TransitionCtx { note_id, from: &state, to: &commit, app: Some(&app) });
-                    state = commit;
+                    bus.notify(&TransitionCtx {
+                        note_id,
+                        from: &state.session,
+                        to: &commit.session,
+                        app: Some(&app),
+                    });
                 }
+                state = commit;
                 if let Some(r) = reply {
                     let _ = r.send(result);
                 }

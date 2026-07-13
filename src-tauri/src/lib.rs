@@ -104,9 +104,8 @@ struct AppState {
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
     transcode: Arc<store::transcode::TranscodeQueue>,
-    /// 正在精修的 note id 集，防重入：停止钩子与手动重跑（refine_note）共用同一把锁；
-    /// 自带独立叶子锁，与上面几把锁完全解耦（spawn_refine 只在极短语句内持有）。
-    refining: Arc<Mutex<std::collections::HashSet<String>>>,
+    // refining 集合已删(P3):精修态入 lifecycle 内核(machine::RefineState),
+    // 防重入/续录拦截由内核裁决,精修中查询走 LifecycleHandle::is_refining。
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -122,7 +121,6 @@ impl Default for AppState {
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
-            refining: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -231,16 +229,9 @@ fn refine_agent_ready(s: &settings::Settings) -> bool {
     s.refine_enabled && s.refine_provider == "agent"
 }
 
-/// resume_recording 是否应因该笔记正在精修而拒绝：抽成纯函数供命令层判定与单测。
-///
-/// 背景（F1 音频丢失窗口）：精修完成后才把该目录 `transcode.enqueue`（见 spawn_refine），
-/// 而 `resume_recording` 会先 `transcode.cancel_and_wait` 再开始向 mic.wav 追加写。若精修
-/// 仍在跑（尚未 enqueue），cancel_and_wait 看到空队列直接放行，续录写入照常开始；随后精修
-/// 收尾时才 enqueue，转码 worker 对着"活跃在追加"的 WAV 编码并 `remove_file`，续录段音频
-/// 永久丢失。故续录入口必须挡在最前面：该 id 仍在 `state.refining` 集中就直接拒绝。
-fn resume_blocked_by_refining(refining: &std::collections::HashSet<String>, id: &str) -> bool {
-    refining.contains(id)
-}
+// resume_blocked_by_refining 已上移 lifecycle 内核(machine.rs Cmd::Start 抢答,
+// F1 音频丢失窗口的背景论证随迁至该处注释):Delegate 到 do_resume_note_recording
+// 时守卫已通过,本文件不再持有精修集合。
 
 /// 会后精修：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
 /// 移交转码 → 视配置可选 LLM。全程 catch_unwind，任何一步失败/panic 只留日志与
@@ -255,17 +246,19 @@ fn resume_blocked_by_refining(refining: &std::collections::HashSet<String>, id: 
 /// 但即使漏标也不会重复造成问题，因为 enqueue 本身幂等）。
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
-    {
-        let mut set = state.refining.lock().unwrap();
-        if !set.insert(note_id.clone()) {
-            // 已在精修中：命令层（refine_note）已提前拒绝重复手动触发，这里只是双保险，
-            // 静默跳过——原本那次精修仍会走完自己的转码承诺。
-            return;
-        }
-    }
-    let refining = state.refining.clone();
     let transcode = state.transcode.clone();
     let session = state.session.clone();
+    let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+    // 精修态置 Running 的信号(原 refining.insert 的时机)同步先行——必须在 spawn
+    // 线程之前发出:自动路径(DoFinalize 直调)在 actor 线程上执行,这条自投消息
+    // 排在停录 reply 之前入队,停录返回后到达的续录命令必然在它后面,内核守卫才
+    // 不会因 worker 线程起步慢而漏挡(与旧世界入口同步 insert 的窗口对齐)。
+    // 它同时就是旧 worker 的第一条 emit("all","running"),事件序列起点不变。
+    lc.report(lifecycle::machine::Msg::RefineProgress {
+        note_id: note_id.clone(),
+        stage: "all".into(),
+        state: "running".into(),
+    });
     std::thread::spawn(move || {
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在精修完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
@@ -274,16 +267,19 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         let is_resumed_by_active_session = |note_id: &str| -> bool {
             session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false)
         };
-        let emit = |stage: &str, st: &str| {
-            let _ = app.emit(
-                "refine",
-                ipc::RefineEvent { note_id: note_id.clone(), stage: stage.into(), state: st.into() },
-            );
+        // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
+        // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
+        let report = |stage: &str, st: &str| {
+            lc.report(lifecycle::machine::Msg::RefineProgress {
+                note_id: note_id.clone(),
+                stage: stage.into(),
+                state: st.into(),
+            });
         };
         let enqueued = std::cell::Cell::new(false);
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit("all", "running");
+                // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
@@ -305,8 +301,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
                 );
-                emit("filter", &doc.stages.filter);
-                emit("recluster", &doc.stages.recluster);
+                report("filter", &doc.stages.filter);
+                report("recluster", &doc.stages.recluster);
                 if enqueue_transcode_after_local {
                     if is_resumed_by_active_session(&note_id) {
                         eprintln!(
@@ -334,7 +330,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
                         },
                     );
-                    emit("llm", "running");
+                    report("llm", "running");
                     let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
                         .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
                     match resolved {
@@ -375,7 +371,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
                         },
                     );
-                    emit("llm", "running");
+                    report("llm", "running");
                     let cfg = refine::llm::LlmConfig {
                         base_url: s.refine_base_url.clone(),
                         model: s.refine_model.clone(),
@@ -385,7 +381,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         eprintln!("refine: llm 落盘失败: {e}");
                     }
                 }
-                emit("llm", &doc.stages.llm);
+                report("llm", &doc.stages.llm);
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
                 // 失败静默:标题是锦上添花,不影响精修完成态。
@@ -440,14 +436,14 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 anyhow::Ok(())
             }));
         match &result {
-            Ok(Ok(())) => emit("all", "done"),
+            Ok(Ok(())) => report("all", "done"),
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
-                emit("all", "failed");
+                report("all", "failed");
             }
             Err(_) => {
                 eprintln!("refine({note_id}): 管线 panic");
-                emit("all", "failed");
+                report("all", "failed");
             }
         }
         // 兜底：前置失败/panic 导致上面从未走到 enqueue 那一行时补一次；enqueue 幂等，
@@ -466,7 +462,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
             }
         }
-        refining.lock().unwrap().remove(&note_id);
+        // 原 refining.remove 的时机(收尾事件与兜底转码之后):精修态置回 Idle。
+        // 内核按 id 对账,单槽被更晚的精修顶替时这条迟到收尾不会误清别人的 Running。
+        lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
     });
 }
 
@@ -1146,11 +1144,8 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String) -> Result<(), Stri
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    // F1 修复:该笔记正在精修中就拒绝续录,避免精修收尾时才 enqueue 的转码把续录正在
-    // 追加写的 WAV 当成"已完成"编码后删除(见 resume_blocked_by_refining 文档)。
-    if resume_blocked_by_refining(&state.refining.lock().unwrap(), &note_id) {
-        return Err("该笔记正在精修,请稍后再试".into());
-    }
+    // F1「正在精修拒绝续录」守卫已上移 lifecycle 内核(machine.rs Cmd::Start 抢答):
+    // 本函数在 actor 线程被 Delegate 调用,走到这里守卫必已通过,不再查精修态。
     if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
@@ -1360,20 +1355,14 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 }
 
 /// 手动（重）触发一次会后精修：录制中该 id 拒绝（内容未定稿，段落还在变），正在精修中
-/// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。手动重跑时 m4a 早已在盘上
-/// （首次精修已经移交过转码），故 `enqueue_transcode_after_local=false`，不再重复入队。
+/// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。两条守卫已入 lifecycle 内核
+/// （Msg::RefineRequest 裁决，文案逐字不变）；通过则内核置 Running 并以 DoSpawnRefine
+/// 调回 spawn_refine——手动重跑时 m4a 早已在盘上（首次精修已经移交过转码），故
+/// enqueue_transcode 恒 false，不再重复入队。
 #[tauri::command]
-fn refine_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    if let Some(s) = state.session.lock().unwrap().as_ref() {
-        if s.note_id == id {
-            return Err("该笔记正在录制，停止后才能精修".into());
-        }
-    }
-    if state.refining.lock().unwrap().contains(&id) {
-        return Err("该笔记正在精修中".into());
-    }
-    spawn_refine(app, id, false);
-    Ok(())
+fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
+    app.state::<lifecycle::LifecycleHandle>()
+        .request(lifecycle::machine::Msg::RefineRequest { note_id: id })
 }
 
 /// 读取已落盘的精修结果（refined.json）；从未精修过 / 精修在前置阶段就失败到没能落盘
@@ -1410,7 +1399,8 @@ fn rename_refined_speaker(
     if name.is_empty() {
         return Err("名字不能为空".into());
     }
-    if state.refining.lock().unwrap().contains(&note_id) {
+    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
         return Err("该笔记正在精修中，稍后再改".into());
     }
     reject_if_active(&state, &note_id)?;
@@ -1496,12 +1486,12 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
 #[tauri::command]
 fn assign_refined_person(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     speaker_id: String,
     person_id: String,
 ) -> Result<(), String> {
-    if state.refining.lock().unwrap().contains(&note_id) {
+    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
         return Err("该笔记正在精修中，稍后再改".into());
     }
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -3052,18 +3042,9 @@ mod tests {
         assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
     }
 
-    #[test]
-    fn resume_blocked_by_refining_matches_refining_set() {
-        use super::resume_blocked_by_refining;
-        use std::collections::HashSet;
-
-        let mut refining: HashSet<String> = HashSet::new();
-        assert!(!resume_blocked_by_refining(&refining, "note-a"), "精修集不含该 id → 放行");
-
-        refining.insert("note-a".into());
-        assert!(resume_blocked_by_refining(&refining, "note-a"), "该 id 正在精修中 → 拒绝续录");
-        assert!(!resume_blocked_by_refining(&refining, "note-b"), "只挡命中的 id,不误伤其它笔记");
-    }
+    // resume_blocked_by_refining_matches_refining_set 已随守卫上移内核而删除:
+    // 同一语义(只挡命中 id 的续录/不误伤其它笔记)由 lifecycle::machine 的
+    // resume_rejected_only_while_same_note_refining 矩阵测试接管。
 
     #[test]
     fn download_running_resets_even_on_panic() {
