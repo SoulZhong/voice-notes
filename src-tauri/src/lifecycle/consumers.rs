@@ -12,9 +12,9 @@ use super::machine::SessionState;
 /// - 从非 Recording 进入 Recording(开录/续录成功)→ Some(true)。
 /// - 从 Recording/Stopping 退到 Idle(停录收尾/空停)→ Some(false)。
 /// - 其余一律 None,不触发托盘调用——尤其是 Recording{paused} 内部翻转
-///   (暂停/恢复):from/to 都是 Recording{..}(仅 paused 字段不同),必须落在
-///   第一条臂(Recording→Recording)才不会被下面「进入 Recording」的宽匹配
-///   误判成"重新开始录制"。
+///   (暂停/恢复):当前内核不追踪 paused 翻转(Cmd::Pause/Unpause 不预演状态),
+///   该分支现阶段不可达,是为未来暂停态入内核的防御性预留;等价性由「内核
+///   不追踪 paused」间接达成。
 pub fn tray_flag(from: &SessionState, to: &SessionState) -> Option<bool> {
     use SessionState::*;
     match (from, to) {
@@ -39,7 +39,10 @@ impl LifecycleHook for TrayHook {
         let Some(recording) = tray_flag(ctx.from, ctx.to) else { return };
         // ctx.app 仅测试态为 None(见 TransitionCtx.app 字段注释);生产路径
         // (actor.rs::spawn)恒传 Some,这里静默跳过不影响真实运行时行为。
-        let Some(app) = ctx.app else { return };
+        let Some(app) = ctx.app else {
+            eprintln!("lifecycle: TrayHook 收到无 app 的 ctx(仅测试路径应出现),跳过");
+            return;
+        };
         crate::tray::set_recording(app, recording);
     }
 }
@@ -87,5 +90,15 @@ mod tests {
     #[test]
     fn unrelated_transition_is_none() {
         assert_eq!(tray_flag(&Idle, &Starting { resume_id: None }), None);
+    }
+
+    #[test]
+    fn load_failure_starting_to_idle_is_none() {
+        // 加载失败(启动→空闲)不得触发 set_recording(false):这是生产真实可达路径,
+        // 防未来重排 match 臂时意外误判。
+        assert_eq!(
+            tray_flag(&Starting { resume_id: None }, &Idle),
+            None
+        );
     }
 }
