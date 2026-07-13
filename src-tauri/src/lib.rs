@@ -16,6 +16,7 @@ mod ailog;
 mod refine;
 pub mod mcp;
 mod telemetry;
+mod lifecycle;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
