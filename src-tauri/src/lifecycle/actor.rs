@@ -268,6 +268,13 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     // 「先全部落盘、再 finalize、再 emit stopped」由队列结构保证,
                     // 停录命令的同步语义(返回=收尾完成)也随 reply 转移而保持。
                     // catch_unwind 与 run_delegate 同理:teardown panic 不许杀 actor。
+                    // 极端窗口注记:teardown 排干期间(handle.stop 内部)若有 Resume
+                    // 同一笔记的 Start 命令抢先入队并在此刻被处理,会因 w1(本次会话)
+                    // 的 NoteWriter flock 尚未随 Owned 槽清空/drop 而释放,一次性误报
+                    // 「笔记正被占用」。可达性极低(需精确落在 teardown 未完成、Finalize
+                    // 未自投的窄窗内)且自愈(下次 Resume 重试即通过,不留脏状态)——
+                    // 与本次 note_id 对账加固同源(P2 单信箱串行化带来的新窗口),
+                    // 留痕说明,不做额外处理。
                     Envelope::Cmd { cmd: Cmd::Stop, reply } => {
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             crate::do_stop_teardown(&app)
@@ -299,7 +306,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 // 原始消息一次性取走——内核对每条这类消息恰发一个对应效果。
                 let (mut adopt_payload, mut pipeline_payload) = match msg {
                     Msg::AdoptWriter { writer } => (Some(writer), None),
-                    Msg::Pipeline(op) => (None, Some(op)),
+                    Msg::Pipeline { op, .. } => (None, Some(op)),
                     _ => (None, None),
                 };
                 let mut result: Result<(), String> = Ok(());
@@ -336,9 +343,23 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 eprintln!("lifecycle: DoAdopt 无对应 AdoptWriter 载荷(不应发生)");
                             }
                         }
-                        Effect::DoPipeline => {
+                        Effect::DoPipeline { note_id } => {
                             match (pipeline_payload.take(), owned.as_mut()) {
-                                (Some(op), Some(o)) => run_pipeline(&app, o, op),
+                                (Some(op), Some(o)) if &o.note_id == note_id => {
+                                    run_pipeline(&app, o, op)
+                                }
+                                // 对账不过:双加载线程重叠窗口下(start→S1 卡住数秒→
+                                // stop→start),S1 迟到的管线消息与槽内 S2 的会话不是
+                                // 同一笔记——旧世界里各会话独占 Arc,这类消息只会写进
+                                // S1 自己那个孤儿 writer 而被静默丢弃,从未真正影响
+                                // S2;新世界单写者槽对齐同一后果:核对不上就丢弃,
+                                // 绝不误写进新会话的 writer。
+                                (Some(_op), Some(o)) => {
+                                    eprintln!(
+                                        "lifecycle: 迟到管线消息丢弃(会话已更替): {note_id}(槽内={})",
+                                        o.note_id
+                                    );
+                                }
                                 // 会话已放弃/收尾后的迟到管线事件:旧世界写进注定被
                                 // abort 的 writer,新世界无处可写,丢弃并留痕(只记种类,
                                 // 不整条 Debug——Snapshot 载荷含整组质心向量,拒绝刷屏)。
@@ -352,10 +373,19 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 (None, _) => eprintln!("lifecycle: DoPipeline 无载荷(不应发生)"),
                             }
                         }
-                        Effect::DoAbort => {
-                            // 原 lib.rs abort_or_finalize 语义作用于槽内 writer + 清槽。
-                            match owned.take() {
-                                Some(o) => abort_owned(o),
+                        Effect::DoAbort { note_id } => {
+                            // 原 lib.rs abort_or_finalize 语义作用于槽内 writer + 清槽,
+                            // 但先对账:note_id 与槽内 owned.note_id 不一致(同样是双
+                            // 加载线程重叠窗口下 S1 迟到的 AbortSession)绝不能动槽——
+                            // 那会误杀 S2 刚装入的新会话 writer,整场丢失。旧世界里
+                            // S1 的 abort 只作用于自己独占的 Arc,天然不会波及 S2;
+                            // 新世界靠这次对账补回等价保证。
+                            match &owned {
+                                Some(o) if &o.note_id == note_id => abort_owned(owned.take().unwrap()),
+                                Some(o) => eprintln!(
+                                    "lifecycle: 迟到放弃消息跳过(会话已更替): {note_id}(槽内={},不动新会话 writer)",
+                                    o.note_id
+                                ),
                                 None => eprintln!("lifecycle: AbortSession 抵达但槽内无 writer(可能已被清理)"),
                             }
                         }
@@ -376,7 +406,12 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                         Ok(()) => {
                                             // 仅 finalize 成功（state=complete、meta 落盘）才发起精修。
                                             // 转码移交时机与失败兜底见 spawn_refine 文档注释。
-                                            crate::spawn_refine(app.clone(), note_id.clone(), true);
+                                            // 精修目标用 o.note_id(槽内笔记,真正被上面 finalize 的那条)
+                                            // 而非消息携带的 note_id:错配分支(上方 eprintln)已表明二者
+                                            // 可能不同——finalize 的 IO 只作用于槽内 writer,精修必须
+                                            // 跟随真正落盘的那条笔记,否则会给一条根本没被收尾的笔记
+                                            // 触发精修(内容还在 owned 槽或已被后续会话占用)。
+                                            crate::spawn_refine(app.clone(), o.note_id.clone(), true);
                                         }
                                         Err(e) => {
                                             eprintln!("stop_recording: finalize 失败: {e}");

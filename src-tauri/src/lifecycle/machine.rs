@@ -65,12 +65,17 @@ pub enum Msg {
     /// 加载线程在 writer 创建、读完元信息后整体移交所有权(Box 入信箱),
     /// 此后该线程不得再持 writer 引用;runner 装入 Owned 槽。
     AdoptWriter { writer: Box<crate::store::writer::NoteWriter> },
-    Pipeline(PipelineOp),
+    /// note_id 携带发送侧认定的归属会话:双加载线程重叠窗口下(start→卡住→
+    /// stop→start),迟到的管线消息可能与槽内新会话不属同一笔记——actor 执行
+    /// DoPipeline 时按 note_id 对账,不匹配则丢弃,绝不误写进新会话的 writer。
+    Pipeline { note_id: String, op: PipelineOp },
     /// 停录 teardown(排干)完成后由 actor 自投:该消息排在排干期间入队的全部
     /// Pipeline 消息之后,「先落盘后 finalize」由信箱 FIFO 保证。
     Finalize { note_id: String },
-    /// 加载失败路径:abort_or_finalize 语义(作用于 runner 槽内 writer)。
-    AbortSession,
+    /// 加载失败路径:abort_or_finalize 语义(作用于 runner 槽内 writer)。note_id
+    /// 携带发送侧认定的归属会话——理由同 Pipeline:迟到的 AbortSession 若不
+    /// 对账,可能误杀槽内已入驻的新会话 writer(整场丢失),actor 侧不匹配则跳过。
+    AbortSession { note_id: String },
     SetTitle { note_id: String, title: String },
     RenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
 }
@@ -88,14 +93,19 @@ pub enum Effect {
     // —— P2 新增(runner 持 writer 执行;内核只发指令不做 IO) ——
     // Do* 效果刻意不带 writer/管线载荷:Box<NoteWriter> 不可克隆,管线文本克隆也
     // 无谓——runner 在效果执行时从本轮原始 Msg 一次性取走(每条消息恰一个对应效果)。
+    // note_id 例外:String 廉价可克隆,随效果本身携带(与 DoFinalize/DoSetTitle
+    // 同例),供 runner 与槽内 owned.note_id 对账,核对不上就丢弃/跳过——防双加载
+    // 线程重叠窗口下迟到消息误写/误杀新会话的 writer(见下方 P2 对账加固注记)。
     /// runner 把 AdoptWriter 携带的 writer 装入 Owned 槽。
     DoAdopt,
     /// runner 用槽内 writer 执行 PipelineOp(append/说话人事件,含对应 emit)。
-    DoPipeline,
+    /// note_id 与槽内 owned.note_id 不一致(迟到消息、会话已更替)则整条丢弃。
+    DoPipeline { note_id: String },
     /// runner 持槽内 writer 执行真实收尾(finalize IO+精修/stopped 尾段)。
     DoFinalize { note_id: String },
-    /// runner 对槽内 writer 执行 abort_or_finalize 语义并清槽。
-    DoAbort,
+    /// runner 对槽内 writer 执行 abort_or_finalize 语义并清槽。note_id 与槽内
+    /// owned.note_id 不一致(迟到放弃、会话已更替)则跳过,绝不动新会话 writer。
+    DoAbort { note_id: String },
     /// runner 落录制中标题(writer 单写者路径,UDS start --title 消费)。
     DoSetTitle { note_id: String, title: String },
     /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
@@ -151,8 +161,12 @@ pub fn handle(state: &SessionState, msg: &Msg) -> (SessionState, Vec<Effect>) {
         // 也从不产生 ShadowMismatch——它们与「录制中/停止中」这条主时间轴正交,
         // 任何状态下发生都不构成对账矛盾。
         Msg::AdoptWriter { .. } => (state.clone(), vec![DoAdopt]),
-        Msg::Pipeline(_) => (state.clone(), vec![DoPipeline]),
-        Msg::AbortSession => (state.clone(), vec![DoAbort]),
+        Msg::Pipeline { note_id, .. } => {
+            (state.clone(), vec![DoPipeline { note_id: note_id.clone() }])
+        }
+        Msg::AbortSession { note_id } => {
+            (state.clone(), vec![DoAbort { note_id: note_id.clone() }])
+        }
         Msg::SetTitle { note_id, title } => (
             state.clone(),
             vec![DoSetTitle { note_id: note_id.clone(), title: title.clone() }],
@@ -393,13 +407,19 @@ mod tests {
                 speaker: None,
                 rms: None,
             };
-            let (next, fx) = handle(s, &Msg::Pipeline(op));
+            let (next, fx) = handle(s, &Msg::Pipeline { note_id: "n1".into(), op });
             assert_eq!(&next, s, "Pipeline 不应改变状态:state={s:?}");
-            assert!(matches!(fx.as_slice(), [Effect::DoPipeline]), "state={s:?} fx={fx:?}");
+            assert!(
+                matches!(fx.as_slice(), [Effect::DoPipeline { note_id }] if note_id == "n1"),
+                "state={s:?} fx={fx:?}"
+            );
 
-            let (next, fx) = handle(s, &Msg::AbortSession);
+            let (next, fx) = handle(s, &Msg::AbortSession { note_id: "n1".into() });
             assert_eq!(&next, s, "AbortSession 不应改变状态:state={s:?}");
-            assert!(matches!(fx.as_slice(), [Effect::DoAbort]), "state={s:?} fx={fx:?}");
+            assert!(
+                matches!(fx.as_slice(), [Effect::DoAbort { note_id }] if note_id == "n1"),
+                "state={s:?} fx={fx:?}"
+            );
 
             let (next, fx) =
                 handle(s, &Msg::SetTitle { note_id: "n1".into(), title: "新标题".into() });

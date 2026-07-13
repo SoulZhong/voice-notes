@@ -834,6 +834,11 @@ fn spawn_session(
         let app_p = app.clone();
         let lc_f = lc.clone();
         let lc_d = lc.clone();
+        // Pipeline 消息携带 note_id(P2 对账加固):双加载线程重叠窗口下(start→
+        // 本线程卡住数秒→stop→start),本线程迟到的管线消息可能与届时槽内的新
+        // 会话不是同一笔记——actor 侧按 note_id 核对,不匹配即丢弃,不误写。
+        let note_id_f = note_id.clone();
+        let note_id_d = note_id.clone();
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
@@ -894,8 +899,9 @@ fn spawn_session(
                 // 续录偏移在此处加定:消息里恒为落盘口径的绝对时间轴,runner 不再加。
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
-                lc_f.report(lifecycle::machine::Msg::Pipeline(
-                    lifecycle::machine::PipelineOp::Final {
+                lc_f.report(lifecycle::machine::Msg::Pipeline {
+                    note_id: note_id_f.clone(),
+                    op: lifecycle::machine::PipelineOp::Final {
                         source: src.as_str().into(),
                         text,
                         start_ms,
@@ -903,7 +909,7 @@ fn spawn_session(
                         speaker: spk,
                         rms,
                     },
-                ));
+                });
             },
             move |src, text| {
                 let _ = app_p.emit(
@@ -979,9 +985,10 @@ fn spawn_session(
                     }
                     other => other,
                 };
-                lc_d.report(lifecycle::machine::Msg::Pipeline(
-                    lifecycle::machine::PipelineOp::Diar(ev),
-                ));
+                lc_d.report(lifecycle::machine::Msg::Pipeline {
+                    note_id: note_id_d.clone(),
+                    op: lifecycle::machine::PipelineOp::Diar(ev),
+                });
             },
             {
                 let app_l = app.clone();
@@ -1007,7 +1014,8 @@ fn spawn_session(
                     stash_model(&embedder_cache, e);
                     // 排干的 finals 已作为 Pipeline 消息入队(worker 已 join,happens-before
                     // 本条投递),abort 恒在它们之后执行——内容先落盘再按 abort 语义收尾。
-                    lc.report(lifecycle::machine::Msg::AbortSession);
+                    // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                    lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                     let name = source_display(missing);
                     let err = start.failed.iter()
                         .find(|(s, _)| *s == missing)
@@ -1041,7 +1049,8 @@ fn spawn_session(
                     stash_model(&embedder_cache, e);
                     // 被 stop/新 start(/resume) 抢先:经信箱 abort——有内容则收尾保全
                     // (flush 失败时留 recording)。排干的 finals 先于本条入队,不丢内容。
-                    lc.report(lifecycle::machine::Msg::AbortSession);
+                    // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                    lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                     return;
                 }
                 drop(gen_guard);
@@ -1075,7 +1084,8 @@ fn spawn_session(
                 stash_model(&recognizer_cache, Some(se.recognizer));
                 stash_model(&embedder_cache, se.embedder);
                 // 会话未能启动:经信箱 abort(此路径无 worker,不存在在途管线消息)。
-                lc.report(lifecycle::machine::Msg::AbortSession);
+                // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                 return fail(&app, &running, &generation, my_gen, format!("error: {}", se.error));
             }
         }
