@@ -97,6 +97,21 @@ pub enum PipelineOp {
     Diar(crate::session::DiarEvent),
 }
 
+/// 非活动编辑七操作(P3):与 store/notes.rs 七个 NoteStore 方法一一对应,字段/
+/// 类型照抄各命令壳现有签名(含 expected_text 乐观并发校验字段、set_segment_
+/// speaker 的 speaker_id="new" 分配语义)。仅 Debug:内核不比较/打印 op 本身
+/// (与 PipelineOp 同理由——见下方 Msg 整体放弃 Clone/PartialEq 的说明)。
+#[derive(Debug)]
+pub enum EditOp {
+    Rename { id: String, title: String },
+    Delete { id: String },
+    RenameSpeaker { id: String, speaker_id: String, name: String },
+    AssignPerson { id: String, speaker_id: String, person_id: String },
+    EditText { id: String, seq: u64, expected_text: String, new_text: String },
+    DeleteSegment { id: String, seq: u64, expected_text: String },
+    SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },
+}
+
 /// Msg 不再 derive Clone/PartialEq/Debug:`AdoptWriter` 携带 `Box<NoteWriter>`,
 /// 而 `NoteWriter` 本身无 Clone/PartialEq/Debug(File 句柄语义上不可比较/打印)。
 /// 这是新增 writer 语义变体的直接后果——runner 侧只消费一次(Box 转移所有权),
@@ -138,6 +153,14 @@ pub enum Msg {
     /// spawn_refine worker 线程结束前的最后一条回报(原 refining.remove 的时机:
     /// 在收尾 emit 与兜底转码入队之后):把该 id 移出精修集,不波及并发的其它精修。
     RefineFinished { note_id: String },
+    /// 非活动编辑命令壳经 request 带回执(七合一)。生产路径(命令壳)统一改经
+    /// actor 单线程串行执行,不再各自裸调 NoteStore;store/notes.rs 的
+    /// EDIT_LOCK 本身未删——有并发测试直接绕过命令壳/actor、多线程裸调
+    /// NoteStore(见该文件 concurrent_speaker_edits_do_not_lose_updates),
+    /// 删锁会让它丢更新失败,故锁保留,详见 P3 Task 3 报告。操作的是磁盘文件
+    /// 而非 runner 槽内 writer,故不像 Pipeline/AbortSession 那样需要 note_id
+    /// 对账。
+    EditNote { op: EditOp },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +192,10 @@ pub enum Effect {
     DoSetTitle { note_id: String, title: String },
     /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
     DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
+    /// runner 执行七个非活动编辑操作之一。op 不随效果携带,从本轮原始
+    /// `Msg::EditNote` 一次性取走(与 DoAdopt/DoPipeline 同模式——EditOp 无需
+    /// Clone,内核对每条 EditNote 消息恰发一个 DoEdit)。
+    DoEdit,
     // —— P3 新增:精修维度 ——
     /// runner 调 spawn_refine 发起手动精修(守卫已在内核裁决通过,该 id 已插入
     /// 精修集)。enqueue_transcode 恒 false:手动重跑时 m4a 早已在盘上(首次精修
@@ -243,6 +270,11 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
         Msg::AbortSession { note_id } => {
             (state.clone(), vec![DoAbort { note_id: note_id.clone() }])
         }
+        // P3:七个非活动编辑操作,命令壳生产路径改经此处走 actor 串行(EDIT_LOCK
+        // 保留原因见上方 Msg::EditNote 注释)——与会话/精修两维正交,任何状态下
+        // 都状态不变 + 恰一个 DoEdit,零 ShadowMismatch(理由同上:操作的是磁盘
+        // 文件,不进内核判定的会话时间轴)。
+        Msg::EditNote { .. } => (state.clone(), vec![DoEdit]),
         // —— P3 新增:精修维度(会话维度一律原样带过) ——
         Msg::RefineRequest { note_id } => {
             // 守卫序与原 refine_note 命令壳一致:先查录制、再查精修——两者同时
@@ -645,6 +677,23 @@ mod tests {
                     "{name} + Finalize(n1) 不兼容,应恰有一个 ShadowMismatch:{effects:?}"
                 );
             }
+        }
+    }
+
+    /// P3:EditNote(七个非活动编辑操作合一)与会话/精修两维正交——任何状态下
+    /// 状态不变 + 恰一个 DoEdit,命令壳生产路径改经 actor 单线程串行执行
+    /// (EDIT_LOCK 本身是否能删见 Msg::EditNote 注释)。
+    #[test]
+    fn edit_note_is_state_orthogonal_in_every_state() {
+        let states = [Idle, Starting { resume_id: None }, rec("n1"), Stopping { note_id: "n1".into() }]
+            .map(ls);
+        for s in &states {
+            let (next, fx) = handle(
+                s,
+                &Msg::EditNote { op: EditOp::Rename { id: "n1".into(), title: "新标题".into() } },
+            );
+            assert_eq!(&next, s, "EditNote 不应改变状态:state={s:?}");
+            assert!(matches!(fx.as_slice(), [Effect::DoEdit]), "state={s:?} fx={fx:?}");
         }
     }
 

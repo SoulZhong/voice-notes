@@ -28,7 +28,9 @@ use crossbeam_channel::{unbounded, Sender};
 use tauri::{AppHandle, Emitter};
 
 use super::hooks::{HookBus, TransitionCtx};
-use super::machine::{self, Cmd, Effect, LifecycleState, Msg, PipelineOp, RefineState, SessionState};
+use super::machine::{
+    self, Cmd, Effect, EditOp, LifecycleState, Msg, PipelineOp, RefineState, SessionState,
+};
 
 pub enum Envelope {
     Cmd { cmd: Cmd, reply: Sender<Result<(), String>> },
@@ -130,6 +132,42 @@ fn run_delegate(app: &AppHandle, cmd: &Cmd, refine: &RefineState) -> Result<(), 
             eprintln!("lifecycle: 命令执行体 panic(已捕获,actor 存活): {cmd:?}");
             Err("内部错误:命令执行失败".into())
         }
+    }
+}
+
+/// 执行 DoEdit:非活动编辑七操作与 store/notes.rs 七个 NoteStore 方法一一对应。
+/// 活动笔记拒绝等前置守卫已在命令壳原位判定完毕(见 lib.rs 各命令壳),这里只
+/// 负责 NoteStore 调用本身——经本线程串行执行,命令壳生产路径不再需要额外
+/// 互斥。store/notes.rs 的 EDIT_LOCK 本身未删:有并发测试直接绕过命令壳/actor
+/// 多线程裸调 NoteStore(见 concurrent_speaker_edits_do_not_lose_updates),
+/// 删锁会让它丢更新失败,故留原防线,详见 P3 Task 3 报告。
+///
+/// set_segment_speaker 返回新分配的说话人 id(旧命令壳直接透传给前端),此处
+/// 丢弃、统一收敛成 Result<(),String>,与其余六个编辑操作同形状——actor 的
+/// 请求面不为它单开回执类型。命令壳在 request 成功后重查 note 拿回该值(actor
+/// 已把写入落盘完成才回执 Ok,重查读到的必是刚写入的最终值,不构成竞态)。
+fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
+    let dir = crate::notes_dir(app).map_err(|e| e.to_string())?;
+    let store = crate::store::NoteStore::new(dir);
+    match op {
+        EditOp::Rename { id, title } => store.rename(&id, &title).map_err(|e| e.to_string()),
+        EditOp::Delete { id } => store.delete(&id).map_err(|e| e.to_string()),
+        EditOp::RenameSpeaker { id, speaker_id, name } => {
+            store.rename_speaker(&id, &speaker_id, &name).map_err(|e| e.to_string())
+        }
+        EditOp::AssignPerson { id, speaker_id, person_id } => store
+            .assign_speaker_person(&id, &speaker_id, &person_id)
+            .map_err(|e| e.to_string()),
+        EditOp::EditText { id, seq, expected_text, new_text } => store
+            .edit_segment_text(&id, seq, &expected_text, &new_text)
+            .map_err(|e| e.to_string()),
+        EditOp::DeleteSegment { id, seq, expected_text } => {
+            store.delete_segment(&id, seq, &expected_text).map_err(|e| e.to_string())
+        }
+        EditOp::SetSegmentSpeaker { id, seq, expected_text, speaker_id } => store
+            .set_segment_speaker(&id, seq, &expected_text, &speaker_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
     }
 }
 
@@ -339,10 +377,11 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 let is_cmd = matches!(msg, Msg::Cmd(_));
                 // 效果不带 writer/管线载荷(见 machine.rs Effect 注释),载荷从本轮
                 // 原始消息一次性取走——内核对每条这类消息恰发一个对应效果。
-                let (mut adopt_payload, mut pipeline_payload) = match msg {
-                    Msg::AdoptWriter { writer } => (Some(writer), None),
-                    Msg::Pipeline { op, .. } => (None, Some(op)),
-                    _ => (None, None),
+                let (mut adopt_payload, mut pipeline_payload, mut edit_payload) = match msg {
+                    Msg::AdoptWriter { writer } => (Some(writer), None, None),
+                    Msg::Pipeline { op, .. } => (None, Some(op), None),
+                    Msg::EditNote { op } => (None, None, Some(op)),
+                    _ => (None, None, None),
                 };
                 let mut result: Result<(), String> = Ok(());
                 for fx in &effects {
@@ -529,6 +568,14 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 Ok(())
                             })();
                             if result.is_ok() { result = r; }
+                        }
+                        Effect::DoEdit => {
+                            if let Some(op) = edit_payload.take() {
+                                let r = run_edit(&app, op);
+                                if result.is_ok() { result = r; }
+                            } else {
+                                eprintln!("lifecycle: DoEdit 无对应 EditNote 载荷(不应发生)");
+                            }
                         }
                     }
                 }

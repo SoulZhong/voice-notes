@@ -1452,10 +1452,13 @@ fn assign_note_speaker_person(
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
         return Err(format!("声纹库中没有该人物: {person_id}"));
     };
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .assign_speaker_person(&note_id, &speaker_id, &resolved)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::AssignPerson {
+            id: note_id,
+            speaker_id,
+            person_id: resolved,
+        },
+    })
 }
 
 /// 某声纹库人物出现过的会议（详情页「出现过的会议」卡）：扫各笔记 speakers.json 的
@@ -1577,8 +1580,10 @@ fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String
     if title.is_empty() {
         return Err("标题不能为空".into());
     }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir).rename(&id, title).map_err(|e| e.to_string())
+    // 非活动编辑经 actor 串行执行(取代 NoteStore 直写,见 lifecycle/actor.rs run_edit)。
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::Rename { id, title: title.to_string() },
+    })
 }
 
 #[tauri::command]
@@ -1586,8 +1591,9 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
         return Err("录制中的笔记不能删除".into());
     }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir).delete(&id).map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::Delete { id },
+    })
 }
 
 /// 改说话人显示名：录制中的笔记也允许改。
@@ -1622,11 +1628,14 @@ fn rename_speaker(
             lifecycle::machine::Msg::RenameActiveSpeaker { note_id, speaker_id, name: name.into() },
         );
     }
-    // 非活动笔记：直写磁盘。
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .rename_speaker(&note_id, &speaker_id, name)
-        .map_err(|e| e.to_string())
+    // 非活动笔记：经 actor 串行执行(取代 NoteStore 直写)。
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::RenameSpeaker {
+            id: note_id,
+            speaker_id,
+            name: name.to_string(),
+        },
+    })
 }
 
 /// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
@@ -1647,10 +1656,9 @@ fn edit_segment(
     new_text: String,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .edit_segment_text(&note_id, seq, &expected_text, &new_text)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::EditText { id: note_id, seq, expected_text, new_text },
+    })
 }
 
 #[tauri::command]
@@ -1662,10 +1670,9 @@ fn delete_segment(
     expected_text: String,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .delete_segment(&note_id, seq, &expected_text)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::DeleteSegment { id: note_id, seq, expected_text },
+    })
 }
 
 #[tauri::command]
@@ -1678,10 +1685,24 @@ fn set_segment_speaker(
     speaker_id: String,
 ) -> Result<String, String> {
     reject_if_active(&state, &note_id)?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::SetSegmentSpeaker {
+            id: note_id.clone(),
+            seq,
+            expected_text,
+            speaker_id,
+        },
+    })?;
+    // DoEdit 的回执统一收窄成 Result<(),String>(与其余六个编辑操作同形状,见
+    // actor.rs run_edit 注释),新分配的说话人 id 靠这次重查取回——actor 已把
+    // 写入落盘完成才回执 Ok,重查读到的必是刚写入的最终值,不构成竞态。
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .set_segment_speaker(&note_id, seq, &expected_text, &speaker_id)
-        .map_err(|e| e.to_string())
+    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    note.segments
+        .iter()
+        .find(|s| s.seq == seq)
+        .and_then(|s| s.speaker.clone())
+        .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
 }
 
 /// 导出笔记。prefer_refined=真且精修稿在盘时导精修稿(所见即所得:用户看着哪个视图
