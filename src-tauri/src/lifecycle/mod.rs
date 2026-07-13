@@ -2,3 +2,4 @@
 //! docs/superpowers/specs/2026-07-13-voice-notes-lifecycle-actor-design.md
 #[allow(dead_code)] // P1 Task 6 接线后删除
 pub mod machine;
+pub mod hooks;
