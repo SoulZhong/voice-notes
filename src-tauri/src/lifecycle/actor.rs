@@ -259,7 +259,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // P2:writer 所有权槽。AdoptWriter 装入,Abort/Finalize 取出;线程局部
             // 无锁——唯一触碰者是本线程(单写者)。
             let mut owned: Option<Owned> = None;
-            let bus = HookBus::default(); // P1 无注册消费者;P3 起接遥测/UI 等
+            let mut bus = HookBus::default();
+            // P3 首批消费者:托盘图标由迁移驱动(取代 lib.rs 里 tray::set_recording
+            // 的散点直调)。启动前注册完再进循环,符合 HookBus「注册序执行」契约。
+            bus.register(Box::new(super::consumers::TrayHook));
             for env in rx {
                 let (msg, reply) = match env {
                     // 停录特化(P2):teardown 同步执行(handle.stop 排干期间,管线
@@ -483,7 +486,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         | SessionState::Stopping { note_id } => Some(note_id.as_str()),
                         _ => None,
                     };
-                    bus.notify(&TransitionCtx { note_id, from: &state, to: &commit });
+                    bus.notify(&TransitionCtx { note_id, from: &state, to: &commit, app: Some(&app) });
                     state = commit;
                 }
                 if let Some(r) = reply {

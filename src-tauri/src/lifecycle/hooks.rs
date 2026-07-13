@@ -7,12 +7,20 @@
 
 use super::machine::SessionState;
 
-// 字段在 P1 无注册消费者时仅被测试读取(actor 只构造不读),P3 接遥测/UI 消费者后消费。
-#[allow(dead_code)]
 pub struct TransitionCtx<'a> {
+    // note_id 目前尚无消费者读取(留给未来按笔记过滤的 hook,如外部 webhook 只关心
+    // 某条笔记);单独标注 allow,不因暂无读者产生 dead_code 警告。
+    #[allow(dead_code)]
     pub note_id: Option<&'a str>,
     pub from: &'a SessionState,
     pub to: &'a SessionState,
+    /// 消费者发系统调用需要的句柄(如 TrayHook 调 tray::set_recording)。
+    /// Option 而非裸引用:构造一个可用于单测的 `tauri::AppHandle` 离不开 tauri
+    /// 的 `test` feature(mock runtime),会牵出 Cargo.toml 改动——本任务提交范围
+    /// 只动 lifecycle/ 与 lib.rs,故留 None 供 hooks.rs 自身的总线机制测试(顺序/
+    /// 隔离)构造 ctx 而不依赖真实 AppHandle。生产路径(actor.rs)恒传 Some;
+    /// 消费者对 None 静默跳过即可(该分支只在测试出现)。
+    pub app: Option<&'a tauri::AppHandle>,
 }
 
 pub trait LifecycleHook: Send + Sync {
@@ -33,8 +41,7 @@ pub struct ExternalHookCfg {
 }
 
 impl HookBus {
-    /// P1 无运行期注册者(仅测试消费);P3 起在 actor spawn 处注册遥测/UI 消费者。
-    #[allow(dead_code)]
+    /// P3 起在 actor spawn 处注册消费者(见 actor.rs::spawn 首个 TrayHook)。
     pub fn register(&mut self, hook: Box<dyn LifecycleHook>) {
         self.hooks.push(hook);
     }
@@ -83,8 +90,10 @@ mod tests {
         fn on_transition(&self, _ctx: &TransitionCtx) { self.0.fetch_add(1, Ordering::SeqCst); }
     }
 
+    // app: None —— 本文件测的是总线机制(注册序/panic 隔离),与消费者要发的系统调用
+    // 无关,构造真实 AppHandle 无必要也不可行(见 TransitionCtx.app 字段注释)。
     fn ctx_fixture<'a>(from: &'a SessionState, to: &'a SessionState) -> TransitionCtx<'a> {
-        TransitionCtx { note_id: Some("n1"), from, to }
+        TransitionCtx { note_id: Some("n1"), from, to, app: None }
     }
 
     #[test]

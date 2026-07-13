@@ -1075,10 +1075,12 @@ fn spawn_session(
                 );
                 // P1 影子回报:会话已真实入槽并广播 recording,通知 actor 内核演进。
                 // 本回报来自后台加载线程,只投递不等待(见 actor.rs 死锁注记②)。
+                // 托盘红点态(图标+菜单文案「停止录制」)不再在此直调:actor 内核收到
+                // 本回报后 Starting→Recording 迁移落地,TrayHook 经 hook 总线驱动
+                // (P3 consumers.rs)。翻转时点从「emit 后紧邻」变为「actor 处理完
+                // 本条消息后」,同为毫秒级异步投递,不可感知。
                 app.state::<lifecycle::LifecycleHandle>()
                     .report(lifecycle::machine::Msg::SessionStarted { note_id: note_id_for_report });
-                // 会话已入槽、"recording" 已发：托盘切红点态（图标+菜单文案「停止录制」）。
-                tray::set_recording(&app, true);
             }
             Err(se) => {
                 stash_model(&recognizer_cache, Some(se.recognizer));
@@ -1213,18 +1215,20 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     Some(s.note_id)
 }
 
-/// 停录尾段(P2 下半,原 do_stop_recording 的收尾段逐语句搬移):emit stopped、托盘
-/// 回 idle、补预载。有会话路径由 actor 的 DoFinalize 执行器在 finalize 之后调用
-/// (stopped 恒在 finalize 之后,与旧实现顺序一致);空停路径由 actor 的 Cmd::Stop
-/// 分支直接调用(note_id 空串,与旧实现「无会话也发 stopped」一致)。
+/// 停录尾段(P2 下半,原 do_stop_recording 的收尾段逐语句搬移):emit stopped、补预载。
+/// 有会话路径由 actor 的 DoFinalize 执行器在 finalize 之后调用(stopped 恒在
+/// finalize 之后,与旧实现顺序一致);空停路径由 actor 的 Cmd::Stop 分支直接调用
+/// (note_id 空串,与旧实现「无会话也发 stopped」一致)。
+/// 托盘回 idle 态不再在此直调:有会话路径随 DoFinalize 前的状态迁移
+/// (Recording/Stopping→Idle)经 hook 总线驱动(P3 consumers.rs::TrayHook);
+/// 空停路径本就没有真实迁移(从未进过 Recording,托盘本来就是 idle 态),
+/// 故无需补触发。
 pub(crate) fn do_stop_tail(app: &AppHandle, note_id: String) {
     let state = app.state::<AppState>();
     let _ = app.emit(
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
-    // 停录：托盘回 idle 态（图标+菜单文案「开始录制」）。托盘不存在则内部静默跳过。
-    tray::set_recording(app, false);
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
     preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
