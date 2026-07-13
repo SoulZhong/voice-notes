@@ -2779,10 +2779,17 @@ pub fn run() {
                     }
                     // 启动扫描 data_root/notes:①修复陈旧 WAV 头(硬崩后头尺寸落后于数据,
                     // 播放端看不到尾段);②对已 complete 且有真实 wav 的笔记入队转码(上次
-                    // 没转完 / 新迁入的历史 WAV)。此刻必无录制会话,与写盘线程零竞态。
+                    // 没转完 / 新迁入的历史 WAV)。本进程此刻必无录制会话,但同一数据目录可能
+                    // 被另一实例正在录制——那种目录绝不能被当孤儿去修头/入队,故逐目录先探锁。
                     if let Ok(rd) = std::fs::read_dir(root.join("notes")) {
                         for e in rd.flatten() {
                             if e.path().is_dir() {
+                                // 探锁即释放:这里只是排除活会话(含另一实例的),真正的持锁
+                                // 保护在转码 worker 内部(覆盖转码到删 WAV 的整个窗口)。
+                                match store::notelock::NoteLock::try_exclusive(&e.path()) {
+                                    Ok(Some(_probe)) => {}
+                                    _ => continue,
+                                }
                                 store::audio::repair_stale_tracks(&e.path());
                                 if should_enqueue_transcode(&e.path()) {
                                     st.transcode.enqueue(e.path());
@@ -2798,7 +2805,16 @@ pub fn run() {
             // 播放器引用失效(停录后立即点播放的竞态窗口)——发事件让前端重拉音轨。
             let transcode_emit = handle.clone();
             st.transcode.spawn_worker(st.running.clone(), move |dir: &std::path::Path| {
+                // 转码会编码后删除源 WAV——必须独占持锁到转码结束,防止与
+                // (本进程续录 cancel_and_wait 之外的)另一实例的活动会话相撞。
+                let lock = match store::notelock::NoteLock::try_exclusive(dir) {
+                    Ok(Some(l)) => l,
+                    // 拿不到锁=该目录有活会话(含另一实例)在用;此次转码任务作废,
+                    // 但队列语义幂等按目录去重——续录结束后精修路径会重新入队,不丢。
+                    _ => return,
+                };
                 store::transcode::transcode_note_dir(dir);
+                drop(lock); // 锁只需护住"转码+删 WAV"窗口,完成通知不必持锁。
                 if let Some(id) = dir.file_name().and_then(|s| s.to_str()) {
                     let _ = transcode_emit
                         .emit("transcode_done", ipc::TranscodeEvent { note_id: id.to_string() });
