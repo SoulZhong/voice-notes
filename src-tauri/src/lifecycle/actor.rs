@@ -49,8 +49,12 @@ impl LifecycleHandle {
 }
 
 /// 执行 Delegate:P1 的旧世界执行体映射表。返回值即 reply。
+///
+/// catch_unwind:do_* 若 panic(现实来源仅锁中毒),actor 线程绝不能死——
+/// 否则控制面(按钮/托盘/快捷键/MCP)全部静默失联,比旧世界的显性崩溃更糟。
+/// 捕获后转 Err 回给调用方并响亮记日志。
 fn run_delegate(app: &AppHandle, cmd: &Cmd) -> Result<(), String> {
-    match cmd {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match cmd {
         Cmd::Start { resume_id: None } => crate::do_start_recording(app),
         Cmd::Start { resume_id: Some(id) } => crate::do_resume_note_recording(app, id.clone()),
         Cmd::Stop => {
@@ -61,6 +65,13 @@ fn run_delegate(app: &AppHandle, cmd: &Cmd) -> Result<(), String> {
         Cmd::Unpause => crate::do_resume_recording(app),
         // 状态查询在命令壳直接读旧路径(P1 不经内核回答,见计划 Task 6 Step 3)
         Cmd::QueryStatus => Ok(()),
+    }));
+    match r {
+        Ok(inner) => inner,
+        Err(_) => {
+            eprintln!("lifecycle: 命令执行体 panic(已捕获,actor 存活): {cmd:?}");
+            Err("内部错误:命令执行失败".into())
+        }
     }
 }
 
@@ -88,14 +99,18 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         }
                     }
                 }
-                if next != state {
-                    let note_id = match &next {
+                // 委托失败 → 回退预演迁移:状态不动、不通知 hook。
+                // 否则守卫拒绝的 Start 会留下幻影 Starting + 幻影迁移通知,
+                // P3 挂上消费者后 hook 将收到从未真实发生的迁移。
+                let commit = if matches!(msg, Msg::Cmd(_)) && result.is_err() { state.clone() } else { next };
+                if commit != state {
+                    let note_id = match &commit {
                         SessionState::Recording { note_id, .. }
                         | SessionState::Stopping { note_id } => Some(note_id.as_str()),
                         _ => None,
                     };
-                    bus.notify(&TransitionCtx { note_id, from: &state, to: &next });
-                    state = next;
+                    bus.notify(&TransitionCtx { note_id, from: &state, to: &commit });
+                    state = commit;
                 }
                 if let Some(r) = reply {
                     let _ = r.send(result);

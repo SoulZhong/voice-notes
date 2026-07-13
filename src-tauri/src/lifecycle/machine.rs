@@ -268,4 +268,15 @@ mod tests {
         assert_eq!(effects.len(), 1, "不兼容的组合应有一个 ShadowMismatch");
         assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
     }
+
+    /// P2 前提:Cmd 产生的预演迁移必须可由 runner 回退——handle 本身无副作用,
+    /// 同一状态重放同一 Cmd 结果恒定(幂等),runner 丢弃 next 即等于未发生。
+    #[test]
+    fn cmd_handling_is_pure_and_replayable() {
+        let s = SessionState::Idle;
+        let m = Msg::Cmd(Cmd::Start { resume_id: None });
+        let a = handle(&s, &m);
+        let b = handle(&s, &m);
+        assert_eq!(a, b, "纯函数:同输入必同输出,runner 才能安全回退预演");
+    }
 }
