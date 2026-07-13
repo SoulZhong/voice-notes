@@ -251,7 +251,8 @@
 </script>
 
 <div class="container">
-  <!-- 头部整体吸顶(标题/下载卡/控制条/状态行):录制中转写自动滚到最新,操作不能跟着滚出视口 -->
+  <!-- 头部整体吸顶(标题/下载卡/控制条/状态行/说话人条):录制中转写自动滚到最新,
+       操作与说话人对照都不能跟着滚出视口 -->
   <div class="topbar">
     <h1>实时转写</h1>
 
@@ -309,6 +310,10 @@
       {#if isError(recording.status)}
         <p class="status error"><span class="status-dot"></span>{recording.status}</p>
       {/if}
+
+      <!-- 说话人条随头部整体吸顶:滚到会中段落时仍要能对着条上的名字辨认发言人/改名,
+           条不在视口内这个对照就断了(用户反馈)。空说话人时组件自身不渲染,不占高。 -->
+      <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
     {/if}
   </div>
 
@@ -365,8 +370,6 @@
     {#if recording.storageDegraded}
       <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
     {/if}
-
-    <SpeakerChips speakers={recording.speakers} noteId={recording.noteId} editable={true} />
 
     <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
       {#each recording.finals as line, i}
