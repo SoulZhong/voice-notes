@@ -111,7 +111,7 @@ npm run tauri build    # 构建 .app + .dmg
 
 | 接入面 | 是什么 | 用在哪 |
 | --- | --- | --- |
-| **MCP 服务** | Agent 的标准工具协议,10 个工具(检索 / 读全文 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
+| **MCP 服务** | Agent 的标准工具协议,11 个工具(检索 / 读全文 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
 | **命令行 CLI** | 同一套查询能力的命令行版,可 `--json` | 脚本、CI,或 Agent 没配 MCP 时的降级 |
 | **Claude Code 技能** | 教 Claude Code 何时怎么组合上面的工具(纪要 / 周报 / 检索工作流) | 锦上添花,让 Claude 开箱会用 |
 
@@ -149,7 +149,7 @@ npm run tauri build    # 构建 .app + .dmg
    args = ["mcp", "serve"]
    ```
 
-提供的 10 个工具:
+提供的 11 个工具:
 
 | 工具 | 用途 | 前提 |
 | --- | --- | --- |
@@ -157,6 +157,7 @@ npm run tauri build    # 构建 .app + .dmg
 | `search_notes` | 全文检索转写内容,命中带前后一句上下文 | 无需 App 运行 |
 | `get_note` | 读一场笔记全文(默认优先 AI 精修稿) | 无需 App 运行 |
 | `list_speakers` | 全局声纹库人物(跨会议一致的编号 / 名字) | 无需 App 运行 |
+| `apply_refined_texts` | Agent 代精修写回:按段落下标提交修订文本(只能改文本,结构不可动) | 无需 App 运行,笔记须已有精修稿 |
 | `recording_status` | 当前录制状态 | App 运行中 |
 | `get_live_transcript` | 正在录制会话的实时转写 | App 运行中 |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
