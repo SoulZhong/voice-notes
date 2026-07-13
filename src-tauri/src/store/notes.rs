@@ -7,10 +7,14 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-/// 非活动写者全局编辑锁。NoteStore 每命令新建、无状态,speakers.json /
-/// segments.jsonl 的 read-modify-write 之间没有任何互斥,并发编辑会整表互相
-/// 覆盖丢更新。锁内建于变更方法——调用方无法遗忘;编辑均为毫秒级稀有操作,
-/// 跨笔记串行无感知。活动写者走 NoteWriter 自己的锁,与此无关。
+/// 非活动写者进程内互斥(P3 起为第二道防线)。命令路径已由 lifecycle actor
+/// 单线程串行(七个编辑命令壳经 Msg::EditNote 入信箱,见 lifecycle/actor.rs
+/// run_edit),不再依赖此锁;此锁保障**直接调用 store 层的路径**(单测/未来
+/// 代码)不丢更新——NoteStore 每命令新建、无状态,speakers.json /
+/// segments.jsonl 的 read-modify-write 之间若无互斥,并发编辑会整表互相
+/// 覆盖丢更新(见 concurrent_speaker_edits_do_not_lose_updates)。锁内建于
+/// 变更方法——调用方无法遗忘;编辑均为毫秒级稀有操作,零成本保留。
+/// 跨进程互斥由 write_lock(flock)承担;活动写者走 actor 的 writer 槽,与此无关。
 /// 毒化忽略(into_inner):每次落盘各自原子,持锁线程 panic 不留半写状态。
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
