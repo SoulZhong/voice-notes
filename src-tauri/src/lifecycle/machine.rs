@@ -66,6 +66,7 @@ pub fn handle(state: &SessionState, msg: &Msg) -> (SessionState, Vec<Effect>) {
                     "SessionStarted 抵达时内核态为 {other:?}(预期 Starting)"
                 ))],
             };
+            // 回报为准:重置 paused 是有意行为(真实世界刚启动的会话必然未暂停)
             (Recording { note_id: note_id.clone(), paused: false }, effects)
         }
         Msg::SessionFailed => {
@@ -148,5 +149,116 @@ mod tests {
         let (s, fx) = handle(&rec("n1"), &Msg::SessionEnded { note_id: "n2".into() });
         assert_eq!(s, Idle);
         assert!(matches!(fx.as_slice(), [Effect::ShadowMismatch(_)]));
+    }
+
+    /// 回报消息 4 状态 × 3 消息类型穷举矩阵。
+    /// 验证:终态正确、对账噪音预期、paused 重置语义。
+    #[test]
+    fn every_report_in_every_state_reconciles() {
+        // 测试状态
+        let states = vec![
+            ("Idle", Idle),
+            ("Starting", Starting { resume_id: None }),
+            ("Recording paused=false", rec("n1")),
+            ("Stopping", Stopping { note_id: "n1".into() }),
+        ];
+
+        // 测试消息
+        let started_msg = Msg::SessionStarted { note_id: "n1".into() };
+        let failed_msg = Msg::SessionFailed;
+        let ended_msg = Msg::SessionEnded { note_id: "n1".into() };
+
+        for (state_name, state) in &states {
+            // === SessionStarted 消息 ===
+            let (next_state, effects) = handle(state, &started_msg);
+            // 终态:始终进入 Recording{"n1", paused:false}
+            assert_eq!(
+                next_state,
+                rec("n1"),
+                "{state_name} 收 SessionStarted 应转入 Recording"
+            );
+            // 对账:只有 Starting 是顺流(无噪音),其余都有一个 ShadowMismatch
+            let is_compatible = matches!(state, Starting { .. });
+            if is_compatible {
+                assert!(
+                    effects.is_empty(),
+                    "{state_name} + SessionStarted 是顺流组合,effects 应为空"
+                );
+            } else {
+                assert_eq!(
+                    effects.len(),
+                    1,
+                    "{state_name} + SessionStarted 不兼容,应有一个 ShadowMismatch"
+                );
+                assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
+            }
+
+            // === SessionFailed 消息 ===
+            let (next_state, effects) = handle(state, &failed_msg);
+            // 终态:始终返回 Idle
+            assert_eq!(
+                next_state, Idle,
+                "{state_name} 收 SessionFailed 应返回 Idle"
+            );
+            // 对账:只有 Starting 是顺流,其余都有一个 ShadowMismatch
+            let is_compatible = matches!(state, Starting { .. });
+            if is_compatible {
+                assert!(
+                    effects.is_empty(),
+                    "{state_name} + SessionFailed 是顺流组合,effects 应为空"
+                );
+            } else {
+                assert_eq!(
+                    effects.len(),
+                    1,
+                    "{state_name} + SessionFailed 不兼容,应有一个 ShadowMismatch"
+                );
+                assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
+            }
+
+            // === SessionEnded 消息 ===
+            let (next_state, effects) = handle(state, &ended_msg);
+            // 终态:始终返回 Idle
+            assert_eq!(
+                next_state, Idle,
+                "{} 收 SessionEnded(n1) 应返回 Idle",
+                state_name
+            );
+            // 对账:只有 Recording{"n1"} 和 Stopping{"n1"} 是顺流,其余都有一个 ShadowMismatch
+            let is_compatible = matches!(
+                state,
+                Recording { note_id, .. } | Stopping { note_id }
+                    if note_id == "n1"
+            );
+            if is_compatible {
+                assert!(
+                    effects.is_empty(),
+                    "{} + SessionEnded(n1) 是顺流组合,effects 应为空",
+                    state_name
+                );
+            } else {
+                assert_eq!(
+                    effects.len(),
+                    1,
+                    "{} + SessionEnded(n1) 不兼容,应有一个 ShadowMismatch",
+                    state_name
+                );
+                assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
+            }
+        }
+
+        // 特殊验证:Recording 状态下 paused 被重置为 false
+        // 先构造 paused=true 的 Recording 状态
+        let recording_paused = Recording { note_id: "n1".into(), paused: true };
+        let (next_state, effects) = handle(&recording_paused, &started_msg);
+        // 验证 paused 被重置为 false
+        assert_eq!(
+            next_state,
+            rec("n1"),
+            "Recording(paused=true) 收 SessionStarted 应重置 paused 为 false"
+        );
+        // Recording + SessionStarted 产生一个 ShadowMismatch
+        assert_eq!(effects.len(), 1, "不兼容的组合应有一个 ShadowMismatch");
+        assert!(matches!(effects[0], Effect::ShadowMismatch(_)));
     }
 }
