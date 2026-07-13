@@ -99,13 +99,20 @@ struct Owned {
 
 /// 执行 Delegate:P1 的旧世界执行体映射表。返回值即 reply。
 ///
+/// refine 参数(P3):内核精修集的只读引用。续录执行体需要「该笔记是否正在精修」
+/// 来做 F1 守卫,且必须在其自身的「迁移/下载中」检查之后原位判定(旧守卫顺序
+/// 逐位还原,谁先判谁先报)——故不由内核抢答,而是把查询结果随 Delegate 传入。
+/// 同一消息处理内读取,快照与内核裁决一致。
+///
 /// catch_unwind:do_* 若 panic(现实来源仅锁中毒),actor 线程绝不能死——
 /// 否则控制面(按钮/托盘/快捷键/MCP)全部静默失联,比旧世界的显性崩溃更糟。
 /// 捕获后转 Err 回给调用方并响亮记日志。
-fn run_delegate(app: &AppHandle, cmd: &Cmd) -> Result<(), String> {
+fn run_delegate(app: &AppHandle, cmd: &Cmd, refine: &RefineState) -> Result<(), String> {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match cmd {
         Cmd::Start { resume_id: None } => crate::do_start_recording(app),
-        Cmd::Start { resume_id: Some(id) } => crate::do_resume_note_recording(app, id.clone()),
+        Cmd::Start { resume_id: Some(id) } => {
+            crate::do_resume_note_recording(app, id.clone(), refine.is_running(id))
+        }
         Cmd::Stop => {
             // P2:停录在信封层特化(teardown+自投 Finalize,见 spawn 主循环),
             // Delegate(Stop) 运行期不可达;防御性只记日志,不做半套拆除。
@@ -324,10 +331,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     Envelope::Request { msg, reply } => (msg, Some(reply)),
                     // 查询直答(不进迁移表):回执后处理下一封。
                     Envelope::QueryRefine { note_id, reply } => {
-                        let _ = reply.send(matches!(
-                            &state.refine,
-                            RefineState::Running { note_id: r } if r == &note_id
-                        ));
+                        let _ = reply.send(state.refine.is_running(&note_id));
                         continue;
                     }
                 };
@@ -344,7 +348,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 for fx in &effects {
                     match fx {
                         Effect::Delegate(cmd) => {
-                            let r = run_delegate(&app, cmd);
+                            let r = run_delegate(&app, cmd, &state.refine);
                             // sticky-error: 首个失败即定局,后续效果不得漂白结果。
                             // Delegate 即使 result 已 Err 仍执行(保持现状语义:效果序列全部跑完,
                             // 只是 result 不被覆盖)。
@@ -480,7 +484,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             // 手动精修路径(refine_note → RefineRequest 裁决通过):守卫
                             // 已在内核抢答,这里只负责发起。spawn_refine 入口会同步
                             // report RefineProgress("all","running")(自投,unbounded 不
-                            // 阻塞——死锁注记①),对本路径是幂等重置(内核已置 Running)。
+                            // 阻塞——死锁注记①),对本路径是幂等重插(内核已插入精修集)。
                             crate::spawn_refine(app.clone(), note_id.clone(), *enqueue_transcode);
                         }
                         Effect::DoEmitRefine { note_id, stage, state } => {

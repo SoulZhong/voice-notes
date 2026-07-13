@@ -229,9 +229,9 @@ fn refine_agent_ready(s: &settings::Settings) -> bool {
     s.refine_enabled && s.refine_provider == "agent"
 }
 
-// resume_blocked_by_refining 已上移 lifecycle 内核(machine.rs Cmd::Start 抢答,
-// F1 音频丢失窗口的背景论证随迁至该处注释):Delegate 到 do_resume_note_recording
-// 时守卫已通过,本文件不再持有精修集合。
+// resume_blocked_by_refining 纯函数已删:精修集入 lifecycle 内核(machine::RefineState),
+// 守卫仍在 do_resume_note_recording 原位判定(顺序不变:下载→精修→模型),判定值
+// 由 actor 执行 Delegate 时从内核精修集读出传入(见该函数 refining 参数注释)。
 
 /// 会后精修：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
 /// 移交转码 → 视配置可选 LLM。全程 catch_unwind，任何一步失败/panic 只留日志与
@@ -462,8 +462,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
             }
         }
-        // 原 refining.remove 的时机(收尾事件与兜底转码之后):精修态置回 Idle。
-        // 内核按 id 对账,单槽被更晚的精修顶替时这条迟到收尾不会误清别人的 Running。
+        // 原 refining.remove 的时机(收尾事件与兜底转码之后):把该 id 移出内核
+        // 精修集。按 id 移除,并发精修的其它笔记不受波及(与旧 set.remove 一致)。
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
     });
 }
@@ -1138,14 +1138,22 @@ fn start_recording(app: AppHandle) -> Result<(), String> {
 /// 完全一致（同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。逐语句搬自
 /// 原 resume_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
 /// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
-fn do_resume_note_recording(app: &AppHandle, note_id: String) -> Result<(), String> {
+///
+/// refining(P3):该笔记是否正在精修,由 actor 执行 Delegate 时从内核精修集读出
+/// 传入(本函数在 actor 线程上运行,数据源即内核、同一消息处理内快照一致)。守卫
+/// 留在此处而非内核抢答,是为逐位还原旧判定顺序:下载→精修→模型,谁先判谁先报。
+fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    // F1「正在精修拒绝续录」守卫已上移 lifecycle 内核(machine.rs Cmd::Start 抢答):
-    // 本函数在 actor 线程被 Delegate 调用,走到这里守卫必已通过,不再查精修态。
+    // F1 修复:该笔记正在精修中就拒绝续录——精修完成后才 transcode.enqueue,而续录
+    // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,精修收尾时才入队的转码会把
+    // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
+    if refining {
+        return Err("该笔记正在精修,请稍后再试".into());
+    }
     if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
@@ -3042,9 +3050,9 @@ mod tests {
         assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
     }
 
-    // resume_blocked_by_refining_matches_refining_set 已随守卫上移内核而删除:
-    // 同一语义(只挡命中 id 的续录/不误伤其它笔记)由 lifecycle::machine 的
-    // resume_rejected_only_while_same_note_refining 矩阵测试接管。
+    // resume_blocked_by_refining_matches_refining_set 已随精修集入内核而删除:
+    // 同一语义(按 id 查集合/不误伤其它笔记)由 lifecycle::machine 的
+    // concurrent_refines_tracked_independently_by_id 与 RefineRequest 裁决表接管。
 
     #[test]
     fn download_running_resets_even_on_panic() {

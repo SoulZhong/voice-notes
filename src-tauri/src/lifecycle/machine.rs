@@ -19,20 +19,41 @@ pub enum SessionState {
     Stopping { note_id: String },
 }
 
-/// 精修维度(P3):取代 AppState.refining 集合。单槽只记「最近一次发起的精修」——
-/// 旧集合可同时容纳多条笔记并发精修(手动精修 A 期间停录 B 触发自动精修),单槽
-/// 下先启动的那条会被顶掉、其守卫(续录拦截/重复精修拒绝)在被顶掉期间失效。
-/// 可达但罕见(需要精修 A 未完成时恰好又停录 B),且数据安全由 spawn_refine 的
-/// is_resumed_by_active_session 入队检查兜底(见 lib.rs),故按设计取单槽。
-#[derive(Debug, Clone, PartialEq)]
-pub enum RefineState {
-    Idle,
-    Running { note_id: String },
+/// 精修维度(P3):取代 AppState.refining 集合,语义与旧 HashSet 逐位对齐——
+/// 多条笔记可并发精修(手动精修 A 期间停录 B 触发自动精修 B,二者互不干扰),
+/// 一切守卫按 id 查集合。BTreeSet 而非 HashSet:内核状态要求 PartialEq 可比较、
+/// Debug 输出确定有序,矩阵测试断言才稳定。字段私有:插入/移除只发生在迁移表内
+/// (all/running 插入、RefineFinished 移除),外界(actor 查询/测试)走 is_running。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RefineState {
+    running: std::collections::BTreeSet<String>,
+}
+
+impl RefineState {
+    /// 该笔记是否正在精修(旧 refining.contains 的等价物,按 id 查)。
+    pub fn is_running(&self, note_id: &str) -> bool {
+        self.running.contains(note_id)
+    }
+
+    /// 纯函数式插入(handle 不改入参,返回新集合;重复插入幂等,同旧 set.insert)。
+    fn with_inserted(&self, note_id: &str) -> Self {
+        let mut next = self.clone();
+        next.running.insert(note_id.to_string());
+        next
+    }
+
+    /// 纯函数式移除(同旧 set.remove;不含该 id 时由调用处记对账噪音)。
+    fn with_removed(&self, note_id: &str) -> Self {
+        let mut next = self.clone();
+        next.running.remove(note_id);
+        next
+    }
 }
 
 /// 内核状态升维(P3):会话主时间轴 + 精修维度。两维正交——会话消息不动 refine,
-/// Refine* 消息不动 session;唯一交叉点是两条守卫(RefineRequest 查 session、
-/// Start{resume} 查 refine),都只读不写对方维度。
+/// Refine* 消息不动 session;唯一交叉点是 RefineRequest 的录制守卫(查 session),
+/// 只读不写对方维度。续录被精修阻塞的守卫在 do_resume_note_recording 原位判定
+/// (精修态由 actor 从本集合读出传入),保持旧守卫顺序:下载→精修→模型。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleState {
     pub session: SessionState,
@@ -42,7 +63,7 @@ pub struct LifecycleState {
 impl LifecycleState {
     /// 初始态:无会话、无精修。
     pub fn init() -> Self {
-        LifecycleState { session: SessionState::Idle, refine: RefineState::Idle }
+        LifecycleState { session: SessionState::Idle, refine: RefineState::default() }
     }
 }
 
@@ -111,11 +132,11 @@ pub enum Msg {
     RefineRequest { note_id: String },
     /// spawn_refine 的进度回报(原 worker 直发 emit("refine",..) 改道,由 actor
     /// 统一对外发事件)。"all/running" 兼作精修开始的置态信号:spawn_refine 在
-    /// spawn 线程之前同步发出这一条(见 lib.rs),内核收到即置 Running——自动
-    /// 精修路径(DoFinalize 保障类直调,不经 RefineRequest)靠它置态。
+    /// spawn 线程之前同步发出这一条(见 lib.rs),内核收到即把该 id 插入精修集
+    /// ——自动精修路径(DoFinalize 保障类直调,不经 RefineRequest)靠它置态。
     RefineProgress { note_id: String, stage: String, state: String },
     /// spawn_refine worker 线程结束前的最后一条回报(原 refining.remove 的时机:
-    /// 在收尾 emit 与兜底转码入队之后):按 id 对账,命中才把精修态置回 Idle。
+    /// 在收尾 emit 与兜底转码入队之后):把该 id 移出精修集,不波及并发的其它精修。
     RefineFinished { note_id: String },
 }
 
@@ -123,8 +144,8 @@ pub enum Msg {
 pub enum Effect {
     /// 委托既有 do_* 执行体(P1 绞杀者语义:执行结果即 reply)。
     Delegate(Cmd),
-    /// 内核直接拒绝。P3 起真实产生:RefineRequest 的两条守卫与「续录目标正在
-    /// 精修」的 Start 抢答(此前 P1/P2 只有 actor 的执行分支,运行期不构造)。
+    /// 内核直接拒绝。P3 起真实产生:RefineRequest 的两条守卫(录制中/精修中)
+    /// (此前 P1/P2 只有 actor 的执行分支,运行期不构造)。
     ReplyErr(String),
     /// 影子对账不一致:仅记日志,绝不影响主流程。
     ShadowMismatch(String),
@@ -149,8 +170,8 @@ pub enum Effect {
     /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
     DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
     // —— P3 新增:精修维度 ——
-    /// runner 调 spawn_refine 发起手动精修(守卫已在内核裁决通过,refine 已置
-    /// Running)。enqueue_transcode 恒 false:手动重跑时 m4a 早已在盘上(首次精修
+    /// runner 调 spawn_refine 发起手动精修(守卫已在内核裁决通过,该 id 已插入
+    /// 精修集)。enqueue_transcode 恒 false:手动重跑时 m4a 早已在盘上(首次精修
     /// 已移交过转码),与原 refine_note 调用一致;自动精修不经此效果(DoFinalize
     /// 内保障类直调 spawn_refine(.., true),不受守卫约束——与旧世界一致)。
     DoSpawnRefine { note_id: String, enqueue_transcode: bool },
@@ -161,9 +182,10 @@ pub enum Effect {
 
 /// 迁移表。P1 铁律:凡 Cmd 一律产生 Delegate(旧守卫是权威,内核不抢答),
 /// 内核状态只由回报消息驱动;回报与当前态矛盾时记 ShadowMismatch 并
-/// 以回报为准(回报来自真实世界)。
-/// P3 唯一例外:Start{resume_id} 命中「同一笔记正在精修」由内核抢答拒绝
-/// (原 lib.rs resume_blocked_by_refining 守卫上移,见 Cmd 分支注释)。
+/// 以回报为准(回报来自真实世界)。续录被精修阻塞的守卫不在此抢答:它必须
+/// 排在 do_resume_note_recording 的「迁移/下载中」检查之后(旧守卫顺序逐位
+/// 还原,谁先判谁先报),故由 actor 在执行 Delegate 时把精修集查询结果传入
+/// 执行体原位判定(数据源仍是本内核,同一消息处理内快照一致)。
 pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>) {
     use Effect::*;
     use SessionState::*;
@@ -174,15 +196,6 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
         |refine: RefineState| LifecycleState { session: state.session.clone(), refine };
     match msg {
         Msg::Cmd(c) => {
-            // P3 守卫上移(原 lib.rs resume_blocked_by_refining,文案逐字):精修完成
-            // 后才 transcode.enqueue,而续录先 cancel_and_wait 再向 mic.wav 追加写;
-            // 若放行,精修收尾时才入队的转码会把「活跃在追加」的 WAV 编码后删除,
-            // 续录段音频永久丢失(F1)。故必须挡在 Delegate 之前。只挡命中的 id。
-            if let Cmd::Start { resume_id: Some(id) } = c {
-                if matches!(&state.refine, RefineState::Running { note_id } if note_id == id) {
-                    return (state.clone(), vec![ReplyErr("该笔记正在精修,请稍后再试".into())]);
-                }
-            }
             let next = match (&state.session, c) {
                 (Idle, Cmd::Start { resume_id }) => Starting { resume_id: resume_id.clone() },
                 // 其余组合不预演状态——委托后旧守卫可能拒绝,状态由回报驱动
@@ -240,23 +253,24 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
             ) {
                 return (state.clone(), vec![ReplyErr("该笔记正在录制，停止后才能精修".into())]);
             }
-            // 按 id 判(旧世界 refining 是集合,refine_note 只查该 id):别的笔记在
-            // 精修不挡本笔记。单槽顶替语义见 RefineState 文档注释。
-            if matches!(&state.refine, RefineState::Running { note_id: r } if r == note_id) {
+            // 按 id 查集合(与旧 refining.contains 逐位一致):别的笔记在精修不挡
+            // 本笔记,多笔记并发精修各自独立。
+            if state.refine.is_running(note_id) {
                 return (state.clone(), vec![ReplyErr("该笔记正在精修中".into())]);
             }
             (
-                with_refine(RefineState::Running { note_id: note_id.clone() }),
+                with_refine(state.refine.with_inserted(note_id)),
                 vec![DoSpawnRefine { note_id: note_id.clone(), enqueue_transcode: false }],
             )
         }
         Msg::RefineProgress { note_id, stage, state: st } => {
             // "all/running" 是 spawn_refine 的第一条回报(spawn 线程前同步发出):
-            // 手动路径 RefineRequest 已置 Running(此处幂等重置),自动路径靠它置态。
-            // 其余进度只转发事件不动状态;置回 Idle 由 RefineFinished 负责——对齐
-            // 旧世界 refining.remove 在收尾 emit 与兜底转码入队之后的时机。
+            // 对应旧世界入口的 refining.insert——手动路径 RefineRequest 已插入(此处
+            // 幂等重插),自动路径(DoFinalize 直调)靠它插入。其余进度只转发事件不动
+            // 状态;移除由 RefineFinished 负责——对齐旧世界 refining.remove 在收尾
+            // emit 与兜底转码入队之后的时机。
             let next = if stage == "all" && st == "running" {
-                with_refine(RefineState::Running { note_id: note_id.clone() })
+                with_refine(state.refine.with_inserted(note_id))
             } else {
                 state.clone()
             };
@@ -269,19 +283,22 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
                 }],
             )
         }
-        Msg::RefineFinished { note_id } => match &state.refine {
-            RefineState::Running { note_id: r } if r == note_id => {
-                (with_refine(RefineState::Idle), vec![])
+        Msg::RefineFinished { note_id } => {
+            if state.refine.is_running(note_id) {
+                // 按 id 移除(旧 set.remove):并发精修下绝不波及其它笔记的在跑记录。
+                (with_refine(state.refine.with_removed(note_id)), vec![])
+            } else {
+                // 集合里没有该 id 的收尾回报:插入/移除在 spawn_refine 内一一配对,
+                // 不应发生;不动状态,只记对账噪音。
+                (
+                    state.clone(),
+                    vec![ShadowMismatch(format!(
+                        "RefineFinished({note_id}) 抵达时该笔记不在精修集中(当前 {:?})",
+                        state.refine
+                    ))],
+                )
             }
-            // 不命中(单槽被更晚的精修顶替后,先前 worker 的迟到收尾)或已 Idle:
-            // 不动状态,只记对账噪音——绝不能把别的笔记的 Running 误清掉。
-            other => (
-                state.clone(),
-                vec![ShadowMismatch(format!(
-                    "RefineFinished({note_id}) 抵达时精修态为 {other:?}"
-                ))],
-            ),
-        },
+        }
         Msg::SetTitle { note_id, title } => (
             state.clone(),
             vec![DoSetTitle { note_id: note_id.clone(), title: title.clone() }],
@@ -320,28 +337,37 @@ mod tests {
         Recording { note_id: id.into(), paused: false }
     }
 
-    /// 会话态包装成完整内核态(精修维 Idle):既有会话矩阵测试的机械适配入口。
+    /// 会话态包装成完整内核态(精修集为空):既有会话矩阵测试的机械适配入口。
     fn ls(session: SessionState) -> LifecycleState {
-        LifecycleState { session, refine: RefineState::Idle }
+        LifecycleState { session, refine: RefineState::default() }
+    }
+
+    /// 构造含指定 id 的精修集(测试专用,生产插入只走迁移表)。
+    fn refining(ids: &[&str]) -> RefineState {
+        ids.iter().fold(RefineState::default(), |acc, id| acc.with_inserted(id))
     }
 
     /// P1 铁律:任何状态收任何 Cmd 都且仅产生一个 Delegate(旧守卫是权威)。
-    /// P3 起唯一例外——Start{resume} 命中「同一笔记正在精修」由内核抢答拒绝,
-    /// 由 resume_rejected_only_while_same_note_refining 单独锁死;本表覆盖的
-    /// refine=Idle 维度下铁律不变。
+    /// P3 精修维入内核后铁律不变:续录被精修阻塞的守卫在 do_resume_note_recording
+    /// 原位判定(actor 传入精修集查询结果),内核对 Cmd 仍不抢答——矩阵覆盖
+    /// 精修集空/含续录目标两个维度。
     #[test]
     fn every_cmd_in_every_state_delegates() {
-        let states = [Idle, Starting { resume_id: None }, rec("n1"), Stopping { note_id: "n1".into() }]
-            .map(ls);
+        let sessions =
+            [Idle, Starting { resume_id: None }, rec("n1"), Stopping { note_id: "n1".into() }];
+        let refines = [RefineState::default(), refining(&["n1"])];
         let cmds = [
             Cmd::Start { resume_id: None },
             Cmd::Start { resume_id: Some("n1".into()) },
             Cmd::Stop, Cmd::Pause, Cmd::Unpause, Cmd::QueryStatus,
         ];
-        for s in &states {
-            for c in &cmds {
-                let (_, fx) = handle(s, &Msg::Cmd(c.clone()));
-                assert_eq!(fx, vec![Effect::Delegate(c.clone())], "state={s:?} cmd={c:?}");
+        for sess in &sessions {
+            for rf in &refines {
+                let s = LifecycleState { session: sess.clone(), refine: rf.clone() };
+                for c in &cmds {
+                    let (_, fx) = handle(&s, &Msg::Cmd(c.clone()));
+                    assert_eq!(fx, vec![Effect::Delegate(c.clone())], "state={s:?} cmd={c:?}");
+                }
             }
         }
     }
@@ -624,10 +650,10 @@ mod tests {
 
     // ======== P3:精修维度 ========
 
-    /// RefineRequest 裁决表:4 会话态 × 3 精修态全组合(请求 id 恒为 n1)。
-    /// 守卫序:录制中(该 id 的 Recording/Stopping)最先拒;其次同 id 精修中拒;
-    /// 其余放行——置 Running{n1} + 恰一个 DoSpawnRefine(手动路径 enqueue=false)。
-    /// 拒绝路径状态两维都不许动;放行路径会话维不许动。文案逐字锁死。
+    /// RefineRequest 裁决表:4 会话态 × 3 精修集全组合(请求 id 恒为 n1)。
+    /// 守卫序:录制中(该 id 的 Recording/Stopping)最先拒;其次该 id 已在精修集拒;
+    /// 其余放行——n1 插入精修集(既有成员保留) + 恰一个 DoSpawnRefine(手动路径
+    /// enqueue=false)。拒绝路径状态两维都不许动;放行路径会话维不许动。文案逐字。
     #[test]
     fn refine_request_decision_matrix() {
         let sessions = [
@@ -637,10 +663,10 @@ mod tests {
             ("Stopping n1", Stopping { note_id: "n1".into() }),
         ];
         let refines = [
-            ("refine=Idle", RefineState::Idle),
-            ("refine=Running n1", RefineState::Running { note_id: "n1".into() }),
-            // 单槽语义:别的笔记在精修不挡本笔记(旧集合按 id 查),放行并顶替。
-            ("refine=Running n2", RefineState::Running { note_id: "n2".into() }),
+            ("refine={}", refining(&[])),
+            ("refine={n1}", refining(&["n1"])),
+            // 集合语义:别的笔记在精修不挡本笔记(旧 HashSet 按 id 查),放行并共存。
+            ("refine={n2}", refining(&["n2"])),
         ];
         let msg = Msg::RefineRequest { note_id: "n1".into() };
         for (sn, sess) in &sessions {
@@ -651,8 +677,6 @@ mod tests {
                     sess,
                     Recording { note_id, .. } | Stopping { note_id } if note_id == "n1"
                 );
-                let refining_same =
-                    matches!(rf, RefineState::Running { note_id } if note_id == "n1");
                 if recording_same {
                     assert_eq!(next, st, "{sn}/{rn}: 录制中拒绝不得改状态");
                     assert_eq!(
@@ -660,7 +684,7 @@ mod tests {
                         vec![Effect::ReplyErr("该笔记正在录制，停止后才能精修".into())],
                         "{sn}/{rn}: 录制守卫优先,文案逐字"
                     );
-                } else if refining_same {
+                } else if rf.is_running("n1") {
                     assert_eq!(next, st, "{sn}/{rn}: 精修中拒绝不得改状态");
                     assert_eq!(
                         fx,
@@ -671,8 +695,8 @@ mod tests {
                     assert_eq!(next.session, *sess, "{sn}/{rn}: 放行不动会话维");
                     assert_eq!(
                         next.refine,
-                        RefineState::Running { note_id: "n1".into() },
-                        "{sn}/{rn}: 放行即置 Running"
+                        rf.with_inserted("n1"),
+                        "{sn}/{rn}: 放行即插入 n1 且保留既有成员"
                     );
                     assert_eq!(
                         fx,
@@ -684,65 +708,75 @@ mod tests {
         }
     }
 
-    /// 续录被精修阻塞的守卫(原 lib.rs resume_blocked_by_refining 上移内核):
-    /// 只挡「命中 id 的续录」,不误伤其它笔记/其它命令;文案逐字。
-    /// (原 lib.rs resume_blocked_by_refining_matches_refining_set 的语义由本测试接管。)
+    /// 集合语义与旧 HashSet 逐位对齐:A 精修中触发 B 的自动精修(all/running 插入),
+    /// A 的守卫仍生效——RefineRequest{A} 照拒、is_running("A")(续录守卫/is_refining
+    /// 查询的数据源)照真;B 收尾只移除 B,A 不受波及。
+    /// (原 lib.rs resume_blocked_by_refining_matches_refining_set 的「只挡命中 id/
+    /// 不误伤其它笔记」语义由本测试与上面裁决表共同接管。)
     #[test]
-    fn resume_rejected_only_while_same_note_refining() {
-        let refining_n1 = LifecycleState {
-            session: Idle,
-            refine: RefineState::Running { note_id: "n1".into() },
-        };
-        // 命中:拒绝、不 Delegate、状态两维都不动
-        let (next, fx) = handle(&refining_n1, &Msg::Cmd(Cmd::Start { resume_id: Some("n1".into()) }));
-        assert_eq!(next, refining_n1, "拒绝不得改状态(不预演 Starting)");
-        assert_eq!(fx, vec![Effect::ReplyErr("该笔记正在精修,请稍后再试".into())], "文案逐字");
+    fn concurrent_refines_tracked_independently_by_id() {
+        // A 经手动路径入集
+        let (st, fx) = handle(&ls(Idle), &Msg::RefineRequest { note_id: "A".into() });
+        assert!(matches!(fx.as_slice(), [Effect::DoSpawnRefine { .. }]));
+        assert!(st.refine.is_running("A"));
 
-        // 不命中的续录/新开录/其余命令:照常 Delegate(精修不影响)
-        let others = [
-            Cmd::Start { resume_id: Some("n2".into()) },
-            Cmd::Start { resume_id: None },
-            Cmd::Stop,
-            Cmd::Pause,
-            Cmd::Unpause,
-        ];
-        for c in &others {
-            let (_, fx) = handle(&refining_n1, &Msg::Cmd(c.clone()));
-            assert_eq!(fx, vec![Effect::Delegate(c.clone())], "cmd={c:?} 不该被精修守卫拦截");
-        }
+        // B 经自动路径入集(DoFinalize 直调 spawn_refine → 入口 all/running 回报)
+        let (st, fx) = handle(
+            &st,
+            &Msg::RefineProgress { note_id: "B".into(), stage: "all".into(), state: "running".into() },
+        );
+        assert!(matches!(fx.as_slice(), [Effect::DoEmitRefine { .. }]));
+        assert!(st.refine.is_running("A") && st.refine.is_running("B"), "A/B 并发共存:{:?}", st.refine);
 
-        // 精修空闲:同 id 续录照常 Delegate
-        let (_, fx) = handle(&ls(Idle), &Msg::Cmd(Cmd::Start { resume_id: Some("n1".into()) }));
-        assert_eq!(fx, vec![Effect::Delegate(Cmd::Start { resume_id: Some("n1".into()) })]);
+        // A 的守卫仍生效:重复精修 A 照拒(文案逐字),续录守卫数据源 is_running(A) 照真
+        let (unchanged, fx) = handle(&st, &Msg::RefineRequest { note_id: "A".into() });
+        assert_eq!(unchanged, st, "拒绝不得改状态");
+        assert_eq!(fx, vec![Effect::ReplyErr("该笔记正在精修中".into())]);
+        assert!(st.refine.is_running("A"));
+
+        // B 收尾:只移除 B,A 仍在精修
+        let (st, fx) = handle(&st, &Msg::RefineFinished { note_id: "B".into() });
+        assert!(fx.is_empty(), "顺流收尾零噪音:{fx:?}");
+        assert!(st.refine.is_running("A"), "B 收尾不得波及 A");
+        assert!(!st.refine.is_running("B"));
+
+        // A 收尾:集合清空
+        let (st, fx) = handle(&st, &Msg::RefineFinished { note_id: "A".into() });
+        assert!(fx.is_empty());
+        assert_eq!(st, ls(Idle), "全部收尾后回到初始态");
     }
 
     /// RefineProgress:任何会话态下恒转发恰一个 DoEmitRefine(载荷原样);
-    /// 仅 "all/running" 置 Running(精修开始信号),其余进度不动精修态。
+    /// 仅 "all/running" 把该 id 插入精修集(精修开始信号,重复插入幂等),
+    /// 其余进度不动精修集。
     #[test]
     fn refine_progress_forwards_and_only_all_running_sets_state() {
         let sessions =
             [Idle, Starting { resume_id: None }, rec("n1"), Stopping { note_id: "n1".into() }];
         for sess in &sessions {
-            // 开始信号:置 Running,会话维不动
-            let st = LifecycleState { session: sess.clone(), refine: RefineState::Idle };
+            // 开始信号:插入 n1,会话维不动
+            let st = LifecycleState { session: sess.clone(), refine: RefineState::default() };
             let (next, fx) = handle(
                 &st,
                 &Msg::RefineProgress { note_id: "n1".into(), stage: "all".into(), state: "running".into() },
             );
             assert_eq!(next.session, *sess, "session={sess:?}: 会话维不动");
-            assert_eq!(next.refine, RefineState::Running { note_id: "n1".into() });
+            assert_eq!(next.refine, refining(&["n1"]));
             assert_eq!(
                 fx,
                 vec![Effect::DoEmitRefine { note_id: "n1".into(), stage: "all".into(), state: "running".into() }],
                 "载荷原样转发"
             );
+            // 幂等重插(手动路径:RefineRequest 已插入,入口回报再到):状态不变
+            let (again, _) = handle(
+                &next,
+                &Msg::RefineProgress { note_id: "n1".into(), stage: "all".into(), state: "running".into() },
+            );
+            assert_eq!(again, next, "重复 all/running 幂等");
 
-            // 中途进度与收尾事件:只转发,不动状态(置回 Idle 是 RefineFinished 的事,
+            // 中途进度与收尾事件:只转发,不动状态(移除是 RefineFinished 的事,
             // 对齐旧 refining.remove 在收尾 emit 之后的时机)
-            let running = LifecycleState {
-                session: sess.clone(),
-                refine: RefineState::Running { note_id: "n1".into() },
-            };
+            let running = LifecycleState { session: sess.clone(), refine: refining(&["n1"]) };
             for (stage, st_val) in [("filter", "done"), ("llm", "running"), ("all", "done"), ("all", "failed")] {
                 let (next, fx) = handle(
                     &running,
@@ -758,34 +792,31 @@ mod tests {
         }
     }
 
-    /// RefineFinished 按 id 对账:命中置回 Idle 零噪音;不命中(单槽被顶替后的迟到
-    /// 收尾)/已 Idle 不动状态、恰一个 ShadowMismatch——绝不误清别的笔记的 Running。
+    /// RefineFinished 按 id 移除:命中零噪音且不波及集合中其它 id;不命中/空集
+    /// 不动状态、恰一个 ShadowMismatch——绝不误清别的笔记的在跑记录。
     #[test]
-    fn refine_finished_resets_idle_only_on_matching_id() {
-        let running_n1 = LifecycleState {
-            session: Idle,
-            refine: RefineState::Running { note_id: "n1".into() },
-        };
-        let (next, fx) = handle(&running_n1, &Msg::RefineFinished { note_id: "n1".into() });
-        assert_eq!(next, ls(Idle), "命中:精修态归 Idle");
+    fn refine_finished_removes_only_matching_id() {
+        let running = LifecycleState { session: Idle, refine: refining(&["n1", "n3"]) };
+        let (next, fx) = handle(&running, &Msg::RefineFinished { note_id: "n1".into() });
+        assert_eq!(next.refine, refining(&["n3"]), "命中:只移除 n1,n3 保留");
         assert!(fx.is_empty(), "顺流收尾零噪音:{fx:?}");
 
-        let (next, fx) = handle(&running_n1, &Msg::RefineFinished { note_id: "n2".into() });
-        assert_eq!(next, running_n1, "不命中:不动 n1 的 Running");
+        let (next, fx) = handle(&running, &Msg::RefineFinished { note_id: "n2".into() });
+        assert_eq!(next, running, "不命中:集合不动");
         assert!(matches!(fx.as_slice(), [Effect::ShadowMismatch(_)]), "{fx:?}");
 
         let (next, fx) = handle(&ls(Idle), &Msg::RefineFinished { note_id: "n1".into() });
-        assert_eq!(next, ls(Idle), "已 Idle:状态不动");
+        assert_eq!(next, ls(Idle), "空集:状态不动");
         assert!(matches!(fx.as_slice(), [Effect::ShadowMismatch(_)]), "{fx:?}");
     }
 
     /// 两维正交(反方向):会话回报/收尾消息穿过内核时,精修维必须原样保留——
-    /// 停录 Finalize 绝不能把并行精修的 Running 冲掉(旧世界二者本就无关)。
+    /// 停录 Finalize 绝不能把并行精修的集合冲掉(旧世界二者本就无关)。
     #[test]
     fn session_reports_preserve_refine_dimension() {
         let base = LifecycleState {
             session: Starting { resume_id: None },
-            refine: RefineState::Running { note_id: "nX".into() },
+            refine: refining(&["nX"]),
         };
         let (next, _) = handle(&base, &Msg::SessionStarted { note_id: "n1".into() });
         assert_eq!(next.refine, base.refine, "SessionStarted 不动精修维");
