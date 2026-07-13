@@ -95,6 +95,9 @@ pub struct Settings {
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
     #[serde(default)]
     pub mcp_onboarded: bool,
+    /// 匿名使用统计:仅上报功能使用计数与版本信息,绝不含会议内容;默认开,设置页可关。
+    #[serde(default = "default_true")]
+    pub telemetry_enabled: bool,
 }
 
 fn default_prefix() -> String {
@@ -160,6 +163,7 @@ impl Default for Settings {
             onboarded: false,
             mcp_allow_control: false,
             mcp_onboarded: false,
+            telemetry_enabled: true,
         }
     }
 }
@@ -358,5 +362,22 @@ mod tests {
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert!(got.mcp_allow_control && got.mcp_onboarded);
+    }
+
+    #[test]
+    fn telemetry_default_on_and_roundtrip() {
+        // 新装默认开
+        assert!(Settings::default().telemetry_enabled);
+        // 显式关闭可往返
+        let mut s = Settings::default();
+        s.telemetry_enabled = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!back.telemetry_enabled);
+        // 旧配置文件(无此键)反序列化默认开
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("telemetry_enabled");
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert!(old.telemetry_enabled);
     }
 }

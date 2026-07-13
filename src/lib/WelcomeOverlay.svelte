@@ -114,6 +114,7 @@
     {#if phase === "download"}
       <ModelDownloadCard status={current} onComplete={refresh} primaryLabel="开 始 使 用" />
       <p class="hints">首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。</p>
+      <p class="hints">已开启匿名使用统计（仅功能使用次数与版本，绝不含会议内容），可在设置中关闭。</p>
     {:else}
       <div class="connect">
         <h2>连接 AI 助手</h2>
