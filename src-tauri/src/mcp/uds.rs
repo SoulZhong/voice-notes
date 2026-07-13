@@ -181,22 +181,33 @@ impl UdsBackend for AppBackend<'_> {
 
     fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String> {
         let app = self.0;
-        crate::do_start_recording(app)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_start_recording。
+        app.state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Start { resume_id: None })?;
         // spawn_session 异步加载模型后才入槽:轮询等 note_id(最多 20s,模型冷加载
-        // 可能秒级);拿到后如带 title,经 writer 单写者路径改题(见 set_title 注释)。
+        // 可能秒级);拿到后如带 title,经信箱走 writer 单写者路径改题(P2:writer 归
+        // actor;录制中改题唯一安全路径,直写盘会被 finalize 的内存 meta 覆盖)。
         for _ in 0..200 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let state = app.state::<crate::AppState>();
-            let slot = state.session.lock().unwrap();
-            if let Some(s) = slot.as_ref() {
+            // statement-scoped 取 note_id 即放锁:request() 阻塞等 actor,而 actor 的
+            // 执行体可能要取 session 锁,持锁等待会成环(见 actor.rs 死锁注记③)。
+            let note_id = state.session.lock().unwrap().as_ref().map(|s| s.note_id.clone());
+            if let Some(note_id) = note_id {
                 if let Some(title) = title {
-                    if let Err(e) = s.writer.lock().unwrap().set_title(title) {
+                    // 入槽晚于 AdoptWriter 入信箱(同一加载线程先采纳后入槽),故此刻
+                    // 消息必落在采纳之后;失败(如恰逢停录)不回滚录制,与旧行为一致。
+                    if let Err(e) = app.state::<crate::lifecycle::LifecycleHandle>().request(
+                        crate::lifecycle::machine::Msg::SetTitle {
+                            note_id: note_id.clone(),
+                            title: title.into(),
+                        },
+                    ) {
                         eprintln!("mcp start: 设标题失败(录制已开始,不回滚): {e}");
                     }
                 }
-                return Ok(serde_json::json!({ "note_id": s.note_id }));
+                return Ok(serde_json::json!({ "note_id": note_id }));
             }
-            drop(slot);
             // 会话未入槽且 running 已被清(启动失败路径)→ 提前报错
             if !*state.running.lock().unwrap() {
                 return Err("录制未能进入进行中状态(设备/模型异常,或已被手动停止;详见应用日志)".into());
@@ -211,17 +222,25 @@ impl UdsBackend for AppBackend<'_> {
         if note_id.is_empty() {
             return Err("没有正在进行的录制".into());
         }
-        crate::do_stop_recording(app); // 阻塞至排干,本线程等待无妨
+        // 经 actor 串行执行停录(P2:teardown+自投 Finalize)——阻塞至收尾完成,本线程等待无妨。
+        app.state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Stop)?;
         Ok(serde_json::json!({ "note_id": note_id }))
     }
 
     fn pause(&self) -> Result<serde_json::Value, String> {
-        crate::do_pause_recording(self.0)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_pause_recording。
+        self.0
+            .state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Pause)?;
         Ok(status_json(self.0))
     }
 
     fn resume(&self) -> Result<serde_json::Value, String> {
-        crate::do_resume_recording(self.0)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_recording。
+        self.0
+            .state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Unpause)?;
         Ok(status_json(self.0))
     }
 }

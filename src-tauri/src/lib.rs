@@ -16,6 +16,7 @@ mod ailog;
 mod refine;
 pub mod mcp;
 mod telemetry;
+mod lifecycle;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,10 +56,11 @@ fn active_elapsed_ms(
     base_ms + active.as_millis() as u64
 }
 
-/// 一次活动录制：会话句柄 + 落盘器 + 笔记 id。
+/// 一次活动录制：会话句柄 + 笔记 id。
+/// P2 起不再持 writer——落盘器所有权在 lifecycle actor 的 Owned 槽里
+///（加载线程创建后经 AdoptWriter 消息移交），录制中的一切写经信箱串行。
 struct ActiveSession {
     handle: RecordingHandle,
-    writer: Arc<Mutex<store::writer::NoteWriter>>,
     note_id: String,
     /// classify_system 的结果："on" | "denied" | "unavailable"，供重挂载时重建状态。
     system_audio: String,
@@ -102,9 +104,8 @@ struct AppState {
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
     transcode: Arc<store::transcode::TranscodeQueue>,
-    /// 正在精修的 note id 集，防重入：停止钩子与手动重跑（refine_note）共用同一把锁；
-    /// 自带独立叶子锁，与上面几把锁完全解耦（spawn_refine 只在极短语句内持有）。
-    refining: Arc<Mutex<std::collections::HashSet<String>>>,
+    // refining 集合已删(P3):精修态入 lifecycle 内核(machine::RefineState),
+    // 防重入/续录拦截由内核裁决,精修中查询走 LifecycleHandle::is_refining。
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -120,7 +121,6 @@ impl Default for AppState {
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
-            refining: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -200,21 +200,8 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
     store::seed_clusters(&vp)
 }
 
-/// 会话未正常存续时的笔记收尾：有内容则 finalize 保全；无内容且是本会话新建的才删空目录；
-/// 续录打开的既有笔记(即使零段)绝不删——留 recording 态(诚实显示「已中断」)。
-fn abort_or_finalize(writer: &Arc<Mutex<store::writer::NoteWriter>>) {
-    let mut w = writer.lock().unwrap();
-    if w.has_content() {
-        if let Err(e) = w.finalize(chrono::Local::now()) {
-            eprintln!("abort_or_finalize: finalize 失败: {e}");
-        }
-    } else if w.created_this_session() {
-        let dir = w.dir().to_path_buf();
-        drop(w);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    // 既有笔记零段:什么都不做,meta 留 recording,内容零损失。
-}
+// abort_or_finalize 已随 writer 所有权迁入 lifecycle actor(actor.rs::abort_owned,
+// 逐语句等价):失败路径改发 Msg::AbortSession,由 runner 对槽内 writer 执行。
 
 /// 归还识别器/嵌入器进常驻槽（None = 没取到、asr 线程 panic 等，不回收）。
 /// recognizer_cache 与 embedder_cache 策略完全一致，故共用一个泛型实现。
@@ -242,16 +229,9 @@ fn refine_agent_ready(s: &settings::Settings) -> bool {
     s.refine_enabled && s.refine_provider == "agent"
 }
 
-/// resume_recording 是否应因该笔记正在精修而拒绝：抽成纯函数供命令层判定与单测。
-///
-/// 背景（F1 音频丢失窗口）：精修完成后才把该目录 `transcode.enqueue`（见 spawn_refine），
-/// 而 `resume_recording` 会先 `transcode.cancel_and_wait` 再开始向 mic.wav 追加写。若精修
-/// 仍在跑（尚未 enqueue），cancel_and_wait 看到空队列直接放行，续录写入照常开始；随后精修
-/// 收尾时才 enqueue，转码 worker 对着"活跃在追加"的 WAV 编码并 `remove_file`，续录段音频
-/// 永久丢失。故续录入口必须挡在最前面：该 id 仍在 `state.refining` 集中就直接拒绝。
-fn resume_blocked_by_refining(refining: &std::collections::HashSet<String>, id: &str) -> bool {
-    refining.contains(id)
-}
+// resume_blocked_by_refining 纯函数已删:精修集入 lifecycle 内核(machine::RefineState),
+// 守卫仍在 do_resume_note_recording 原位判定(顺序不变:下载→精修→模型),判定值
+// 由 actor 执行 Delegate 时从内核精修集读出传入(见该函数 refining 参数注释)。
 
 /// 会后精修：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
 /// 移交转码 → 视配置可选 LLM。全程 catch_unwind，任何一步失败/panic 只留日志与
@@ -266,17 +246,19 @@ fn resume_blocked_by_refining(refining: &std::collections::HashSet<String>, id: 
 /// 但即使漏标也不会重复造成问题，因为 enqueue 本身幂等）。
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
-    {
-        let mut set = state.refining.lock().unwrap();
-        if !set.insert(note_id.clone()) {
-            // 已在精修中：命令层（refine_note）已提前拒绝重复手动触发，这里只是双保险，
-            // 静默跳过——原本那次精修仍会走完自己的转码承诺。
-            return;
-        }
-    }
-    let refining = state.refining.clone();
     let transcode = state.transcode.clone();
     let session = state.session.clone();
+    let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+    // 精修态置 Running 的信号(原 refining.insert 的时机)同步先行——必须在 spawn
+    // 线程之前发出:自动路径(DoFinalize 直调)在 actor 线程上执行,这条自投消息
+    // 排在停录 reply 之前入队,停录返回后到达的续录命令必然在它后面,内核守卫才
+    // 不会因 worker 线程起步慢而漏挡(与旧世界入口同步 insert 的窗口对齐)。
+    // 它同时就是旧 worker 的第一条 emit("all","running"),事件序列起点不变。
+    lc.report(lifecycle::machine::Msg::RefineProgress {
+        note_id: note_id.clone(),
+        stage: "all".into(),
+        state: "running".into(),
+    });
     std::thread::spawn(move || {
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在精修完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
@@ -285,16 +267,19 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         let is_resumed_by_active_session = |note_id: &str| -> bool {
             session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false)
         };
-        let emit = |stage: &str, st: &str| {
-            let _ = app.emit(
-                "refine",
-                ipc::RefineEvent { note_id: note_id.clone(), stage: stage.into(), state: st.into() },
-            );
+        // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
+        // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
+        let report = |stage: &str, st: &str| {
+            lc.report(lifecycle::machine::Msg::RefineProgress {
+                note_id: note_id.clone(),
+                stage: stage.into(),
+                state: st.into(),
+            });
         };
         let enqueued = std::cell::Cell::new(false);
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit("all", "running");
+                // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
@@ -316,8 +301,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
                 );
-                emit("filter", &doc.stages.filter);
-                emit("recluster", &doc.stages.recluster);
+                report("filter", &doc.stages.filter);
+                report("recluster", &doc.stages.recluster);
                 if enqueue_transcode_after_local {
                     if is_resumed_by_active_session(&note_id) {
                         eprintln!(
@@ -345,7 +330,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
                         },
                     );
-                    emit("llm", "running");
+                    report("llm", "running");
                     let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
                         .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
                     match resolved {
@@ -386,7 +371,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
                         },
                     );
-                    emit("llm", "running");
+                    report("llm", "running");
                     let cfg = refine::llm::LlmConfig {
                         base_url: s.refine_base_url.clone(),
                         model: s.refine_model.clone(),
@@ -396,7 +381,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         eprintln!("refine: llm 落盘失败: {e}");
                     }
                 }
-                emit("llm", &doc.stages.llm);
+                report("llm", &doc.stages.llm);
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
                 // 失败静默:标题是锦上添花,不影响精修完成态。
@@ -451,14 +436,14 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 anyhow::Ok(())
             }));
         match &result {
-            Ok(Ok(())) => emit("all", "done"),
+            Ok(Ok(())) => report("all", "done"),
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
-                emit("all", "failed");
+                report("all", "failed");
             }
             Err(_) => {
                 eprintln!("refine({note_id}): 管线 panic");
-                emit("all", "failed");
+                report("all", "failed");
             }
         }
         // 兜底：前置失败/panic 导致上面从未走到 enqueue 那一行时补一次；enqueue 幂等，
@@ -477,7 +462,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
             }
         }
-        refining.lock().unwrap().remove(&note_id);
+        // 原 refining.remove 的时机(收尾事件与兜底转码之后):把该 id 移出内核
+        // 精修集。按 id 移除,并发精修的其它笔记不受波及(与旧 set.remove 一致)。
+        lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
     });
 }
 
@@ -638,6 +625,9 @@ fn spawn_session(
             // return，走不到这里，不会误把托盘打回 idle）。托盘不存在则内部静默跳过。
             tray::set_recording(app, false);
             let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
+            // P1 影子回报:仅当前代的启动失败走到这里(过期线程已提前 return),
+            // 通知 actor 内核回到 Idle。后台线程投递,不等待(见 actor.rs 死锁注记②)。
+            app.state::<lifecycle::LifecycleHandle>().report(lifecycle::machine::Msg::SessionFailed);
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -741,13 +731,25 @@ fn spawn_session(
             }
         }
 
-        // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要 abort_or_finalize 清理）。
+        // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要发 AbortSession 清理）。
+        // 续录先握手再取锁:转码 worker 现在持锁覆盖整个转码窗口(见下方 worker 内
+        // NoteLock::try_exclusive 处注释),若不先 cancel_and_wait 就直接调
+        // NoteWriter::resume 去抢同一把 flock,在途转码会让 resume 拿锁失败,把「转码中」
+        // 误判成「另一实例在录制/编辑」而拒绝续录。此处在加载线程、未持任何全局锁
+        // （running/generation/session_slot 均未持有），符合「持全局锁时绝不调
+        // cancel_and_wait 这类阻塞方法」的锁序纪律。notes_dir 解析失败就跳过握手，
+        // 交给下面的 create/resume 走正常报错路径。
+        if let NoteTarget::Resume(id) = &target {
+            if let Ok(d) = notes_dir(&app) {
+                transcode.cancel_and_wait(&d.join(id));
+            }
+        }
         // New → NoteWriter::create；Resume → NoteWriter::resume（meta 损坏/id 不存在 → Err）。
         let writer = match notes_dir(&app).and_then(|d| match &target {
             NoteTarget::New => store::writer::NoteWriter::create(&d, chrono::Local::now()),
             NoteTarget::Resume(id) => store::writer::NoteWriter::resume(&d, id),
         }) {
-            Ok(w) => Arc::new(Mutex::new(w)),
+            Ok(w) => w,
             Err(e) => {
                 stash_model(&recognizer_cache, Some(recognizer));
                 stash_model(&embedder_cache, embedder);
@@ -758,7 +760,11 @@ fn spawn_session(
                 return fail(&app, &running, &generation, my_gen, msg);
             }
         };
-        let note_id = writer.lock().unwrap().note_id().to_string();
+        // —— 移交前一次性读完全部元信息(note_id/dir/base_ms/registry 快照):writer
+        // 即将整体移交 lifecycle actor(单写者),此后本线程不得再持它的任何引用,
+        // 一切写经信箱。——
+        let note_id = writer.note_id().to_string();
+        let note_dir = writer.dir().to_path_buf();
         // 续录前把该目录的音频解回 WAV，供本场从尾部对齐续写。必须先 cancel_and_wait：
         // 若转码 worker 此刻正把本目录的 wav 压成 m4a，解码会与它撞文件，故先摘队列 +
         // 阻塞等 in-flight 转完。锁序纪律：本调用点在加载线程、不持任何全局锁
@@ -768,20 +774,23 @@ fn spawn_session(
         // 截断/零填充对齐，故必须先把已压缩音频解回 WAV。base_ms 本身来自 segments 时间轴
         //（下方 writer.base_ms()），与解码顺序无关。
         if let NoteTarget::Resume(_) = &target {
-            let note_dir = writer.lock().unwrap().dir().to_path_buf();
             transcode.cancel_and_wait(&note_dir);
             store::transcode::decode_note_to_wav(&note_dir);
         }
         // 续录时间轴偏移：New 路径恒 0；Resume 路径 = 续录前最大 end_ms。
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
-        let base_ms = writer.lock().unwrap().base_ms();
+        let base_ms = writer.base_ms();
+        let registry_snap = writer.registry_snapshot();
+        // writer 所有权移交 lifecycle actor:装入 runner 的 Owned 槽后,append/说话人
+        // 事件/改题/改名/收尾全部在 actor 线程串行执行。失败路径不再本地清理,改发
+        // AbortSession(同信箱 FIFO,恒排在本会话已入队的管线消息之后)。
+        let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+        lc.report(lifecycle::machine::Msg::AdoptWriter { writer: Box::new(writer) });
         // 说话人编号/质心延续 + 库种子注入：快照（续录）优先，库中同 person 不重复注入。
         // 库加载失败降级为无种子，绝不挡录制。
         let seeds = load_voiceprint_seeds(&app);
-        let mut registry = crate::diar::registry::SpeakerRegistry::with_seeds(
-            &writer.lock().unwrap().registry_snapshot(),
-            &seeds,
-        );
+        let mut registry =
+            crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
         // 本场实时入库产生的 person id 集合:enroller(ASR worker 线程)写入,停止时的
         // Snapshot 分支读取,用于区分「本场新入库的陌生声音」与「种子命中的老熟人」——
         // 样本只为前者写(见 Snapshot 分支注释)。
@@ -817,12 +826,17 @@ fn spawn_session(
             );
         }
 
-        // 3) 起会话。emit 回调带 source 字符串。
-        let app_f = app.clone();
+        // 3) 起会话。管线回调只发消息(writer 归 actor):on_final/on_diar 的 writer
+        // 触发块已逐字搬进 actor 的 run_pipeline,回调侧仅保留不触 writer 的声纹库
+        // 回写(见 on_diar 闭包注释)与时间戳偏移加定。
         let app_p = app.clone();
-        let app_d = app.clone();
-        let writer_f = writer.clone();
-        let writer_d = writer.clone();
+        let lc_f = lc.clone();
+        let lc_d = lc.clone();
+        // Pipeline 消息携带 note_id(P2 对账加固):双加载线程重叠窗口下(start→
+        // 本线程卡住数秒→stop→start),本线程迟到的管线消息可能与届时槽内的新
+        // 会话不是同一笔记——actor 侧按 note_id 核对,不匹配即丢弃,不误写。
+        let note_id_f = note_id.clone();
+        let note_id_d = note_id.clone();
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
@@ -844,7 +858,7 @@ fn spawn_session(
         let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
         let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
         if keep_audio {
-            let note_dir = writer.lock().unwrap().dir().to_path_buf();
+            // note_dir 在 writer 移交前已快照(见上),此处只用路径,不触 writer。
             for (source, _, _) in &sources {
                 let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
                 let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
@@ -863,7 +877,6 @@ fn spawn_session(
             }
         }
 
-        let mut degraded = false;
         // language_filter:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里关闭以
         // 保留外语真实发言。值在上方与 record_system_only/keep_audio 同一次 settings
         // load 读出(读取失败已保守回落默认过滤开,与 Settings::default 一致)。
@@ -879,32 +892,22 @@ fn spawn_session(
             audio_sinks,
             aec_roles,
             move |src, text, start_ms, end_ms, spk, rms| {
+                // P2:定稿段转成消息入信箱(unbounded send 不阻塞,不反压 ASR 热路径),
+                // 落盘/降级翻转/emit 由 actor 串行执行(run_pipeline,块逐字搬移)。
+                // 续录偏移在此处加定:消息里恒为落盘口径的绝对时间轴,runner 不再加。
                 let start_ms = start_ms + base_ms;
                 let end_ms = end_ms + base_ms;
-                // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
-                match writer_f
-                    .lock()
-                    .unwrap()
-                    .append_final(src.as_str(), &text, start_ms, end_ms, spk.as_deref(), rms)
-                {
-                    Ok(()) => {
-                        if degraded {
-                            degraded = false;
-                            let _ = app_f.emit("storage", ipc::StorageEvent { state: "ok".into() });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("append_final 失败（段暂存内存待重试）: {e}");
-                        if !degraded {
-                            degraded = true;
-                            let _ = app_f.emit("storage", ipc::StorageEvent { state: "degraded".into() });
-                        }
-                    }
-                }
-                let _ = app_f.emit(
-                    "final",
-                    ipc::FinalEvent { source: src.as_str().into(), text, start_ms, end_ms, speaker: spk },
-                );
+                lc_f.report(lifecycle::machine::Msg::Pipeline {
+                    note_id: note_id_f.clone(),
+                    op: lifecycle::machine::PipelineOp::Final {
+                        source: src.as_str().into(),
+                        text,
+                        start_ms,
+                        end_ms,
+                        speaker: spk,
+                        rms,
+                    },
+                });
             },
             move |src, text| {
                 let _ = app_p.emit(
@@ -912,136 +915,78 @@ fn spawn_session(
                     ipc::PartialEvent { source: src.as_str().into(), text },
                 );
             },
-            move |ev| match ev {
-                session::DiarEvent::SpeakersChanged(infos) => {
-                    // sources 为空 ⇔ 未命中的库种子簇（assign 命中必 sources.insert）：
-                    // 这类簇只是种子注入时铺的库人物候选，本场从未真正出现过，不该
-                    // 泄漏进说话人表/chips/落盘（否则每场笔记都会囤上全库人物）。
-                    let infos: Vec<_> = infos.into_iter().filter(|s| !s.sources.is_empty()).collect();
-                    let pairs: Vec<(String, Vec<String>)> = infos
-                        .iter()
-                        .map(|s| (s.id.clone(), s.sources.iter().cloned().collect()))
-                        .collect();
-                    let mut w = writer_d.lock().unwrap();
-                    if let Err(e) = w.sync_speakers(&pairs) {
-                        eprintln!("speakers.json 写入失败: {e}");
-                    }
-                    // 种子命中显名：registry 里已关联库人物（seed 命中或续录带入）的簇，
-                    // 把 person_id 同步进本场 speakers 表；本地名为空时用库名兜底（本场
-                    // 手动改过名的一律保留，不被库名打回原形）。
-                    for s in &infos {
-                        let Some(person) = &s.person else { continue };
-                        w.set_speaker_person(&s.id, person);
-                        let local_name_empty =
-                            w.speakers().get(&s.id).map(|m| m.name.is_empty()).unwrap_or(true);
-                        if local_name_empty {
-                            if let Some(name) = s.name.as_deref().filter(|n| !n.is_empty()) {
-                                w.set_speaker_name(&s.id, name);
-                            }
+            move |ev| {
+                // P2 拆分决策:触 writer 的四分支块(SpeakersChanged/Merged/EchoRetract/
+                // Snapshot 的 store_centroids)逐字搬进 actor 的 run_pipeline,经消息串行;
+                // 不触 writer 的声纹库回写/样本落盘(vp_store_d/live_enrolled 只在此消费)
+                // 留在本回调线程原地执行——库自带 VP_LOCK 全局互斥,不依赖 writer 锁。
+                let ev = match ev {
+                    session::DiarEvent::EchoRetract { start_ms, end_ms, text } => {
+                        // 时间戳加续录偏移,与 on_final 同口径在发送侧加定:消息里恒为
+                        // 落盘口径的绝对时间轴,runner 侧不再二次加 base_ms。
+                        session::DiarEvent::EchoRetract {
+                            start_ms: start_ms + base_ms,
+                            end_ms: end_ms + base_ms,
+                            text,
                         }
                     }
-                    let speakers = w
-                        .speakers()
-                        .iter()
-                        .map(|(id, m)| ipc::SpeakerEntry {
-                            id: id.clone(),
-                            name: m.name.clone(),
-                            sources: m.sources.clone(),
-                            person_id: m.person_id.clone(),
-                        })
-                        .collect();
-                    drop(w);
-                    let _ = app_d.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
-                }
-                session::DiarEvent::Merged { loser, winner } => {
-                    let mut w = writer_d.lock().unwrap();
-                    // 落盘失败也照发 merged：内存/前端先统一（历史段徽章回写），
-                    // 磁盘落后由 storage degraded 告警，finalize 兜底再补。
-                    if let Err(e) = w.merge_speaker(&loser, &winner) {
-                        eprintln!("说话人合并重写失败({loser}->{winner}): {e}");
-                        let _ = app_d.emit("storage", ipc::StorageEvent { state: "degraded".into() });
-                    }
-                    let speakers = w
-                        .speakers()
-                        .iter()
-                        .map(|(id, m)| ipc::SpeakerEntry {
-                            id: id.clone(),
-                            name: m.name.clone(),
-                            sources: m.sources.clone(),
-                            person_id: m.person_id.clone(),
-                        })
-                        .collect();
-                    drop(w);
-                    let _ = app_d.emit(
-                        "speakers",
-                        ipc::SpeakersEvent {
-                            speakers,
-                            merged: Some(ipc::MergedPair { loser, winner }),
-                        },
-                    );
-                }
-                session::DiarEvent::EchoRetract { start_ms, end_ms, text } => {
-                    // 已放行的 mic 回声段被 system 定稿追认:磁盘删行 + 通知前端撤回显示。
-                    // 时间戳加续录偏移,与 on_final 落盘口径一致。落盘失败仍撤 UI(显示
-                    // 优先干净),磁盘差异走 storage 降级告警。
-                    let start_ms = start_ms + base_ms;
-                    let end_ms = end_ms + base_ms;
-                    let mut w = writer_d.lock().unwrap();
-                    if let Err(e) = w.retract_segment("mic", start_ms, end_ms, &text) {
-                        eprintln!("回声撤回落盘失败({start_ms}-{end_ms}): {e}");
-                        let _ = app_d.emit("storage", ipc::StorageEvent { state: "degraded".into() });
-                    }
-                    drop(w);
-                    let _ = app_d.emit(
-                        "final_retract",
-                        ipc::RetractEvent { source: "mic".into(), start_ms, end_ms, text },
-                    );
-                }
-                session::DiarEvent::Snapshot { snaps, samples } => {
-                    let mut w = writer_d.lock().unwrap();
-                    w.store_centroids(&snaps);
-                    // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
-                    // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
-                    // join 前送达,故先于 stop_recording 的 finalize,person_id 随
-                    // finalize 落盘。
-                    if let Some(store) = &vp_store_d {
-                        match store.upsert_from_session(&snaps, &chrono::Local::now().to_rfc3339()) {
-                            Ok(enrolled) => {
-                                for (cluster_id, person_id) in &enrolled {
-                                    w.set_speaker_person(cluster_id, person_id);
-                                }
-                                // 声纹样本落盘:只为「本场新入库的陌生声音」写(实时入库或停止
-                                // 兜底入库)。种子命中的老熟人不再追加——识别成功说明既有声纹
-                                // 已覆盖这条声音,再存一份没有新信息;识别精度的提升靠质心加权
-                                // 回写 + 用户把认错拆重的条目合并进来(样本/质心随合并归一)。
-                                // 兜底:老人物一份样本都没有(样本功能上线前的数据/历史写失败)
-                                // 时补第一份,兑现管理页"下次录到会自动补上"的承诺。
-                                let sample_of = |cluster: &str| {
-                                    samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
-                                };
-                                let newly = live_enrolled.lock().unwrap();
-                                for snap in &snaps {
-                                    let pid = snap
-                                        .person
-                                        .clone()
-                                        .or_else(|| enrolled.get(&snap.id).cloned());
-                                    let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
-                                        continue;
+                    session::DiarEvent::Snapshot { mut snaps, samples } => {
+                        // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
+                        // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
+                        // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
+                        // person_id 随 finalize 落盘。
+                        if let Some(store) = &vp_store_d {
+                            match store.upsert_from_session(&snaps, &chrono::Local::now().to_rfc3339()) {
+                                Ok(enrolled) => {
+                                    // 原 set_speaker_person(cluster, person) 循环改为把新关联
+                                    // 注进 snaps[].person 随消息走:runner 的 store_centroids
+                                    // 落表时一并写 person_id,终态逐位等价(enrolled 只含
+                                    // person 原为 None 的新入库簇)。
+                                    for snap in &mut snaps {
+                                        if let Some(pid) = enrolled.get(&snap.id) {
+                                            snap.person = Some(pid.clone());
+                                        }
+                                    }
+                                    // 声纹样本落盘:只为「本场新入库的陌生声音」写(实时入库或停止
+                                    // 兜底入库)。种子命中的老熟人不再追加——识别成功说明既有声纹
+                                    // 已覆盖这条声音,再存一份没有新信息;识别精度的提升靠质心加权
+                                    // 回写 + 用户把认错拆重的条目合并进来(样本/质心随合并归一)。
+                                    // 兜底:老人物一份样本都没有(样本功能上线前的数据/历史写失败)
+                                    // 时补第一份,兑现管理页"下次录到会自动补上"的承诺。
+                                    let sample_of = |cluster: &str| {
+                                        samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
                                     };
-                                    let newly_enrolled =
-                                        newly.contains(&pid) || enrolled.contains_key(&snap.id);
-                                    if !newly_enrolled && !store.sample_paths_existing(&pid).is_empty() {
-                                        continue; // 识别出的老熟人且已有样本:不再累积
-                                    }
-                                    if let Err(e) = store.append_sample(&pid, sample) {
-                                        eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
+                                    let newly = live_enrolled.lock().unwrap();
+                                    for snap in &snaps {
+                                        let pid = snap
+                                            .person
+                                            .clone()
+                                            .or_else(|| enrolled.get(&snap.id).cloned());
+                                        let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
+                                            continue;
+                                        };
+                                        let newly_enrolled =
+                                            newly.contains(&pid) || enrolled.contains_key(&snap.id);
+                                        if !newly_enrolled && !store.sample_paths_existing(&pid).is_empty() {
+                                            continue; // 识别出的老熟人且已有样本:不再累积
+                                        }
+                                        if let Err(e) = store.append_sample(&pid, sample) {
+                                            eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
+                                        }
                                     }
                                 }
+                                Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
                             }
-                            Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
                         }
+                        // samples 已在上方消费完,不随消息复运(嵌入样本可达 MB 级)。
+                        session::DiarEvent::Snapshot { snaps, samples: Vec::new() }
                     }
-                }
+                    other => other,
+                };
+                lc_d.report(lifecycle::machine::Msg::Pipeline {
+                    note_id: note_id_d.clone(),
+                    op: lifecycle::machine::PipelineOp::Diar(ev),
+                });
             },
             {
                 let app_l = app.clone();
@@ -1056,7 +1001,7 @@ fn spawn_session(
                 // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
                 // 就整场拆除报错(不静默降级)。默认配置 required=[Mic],与原先"mic 必备"
                 // 逐字节等价(同样先 stop 排干可能已产生的其它源 finals → stash 模型 →
-                // abort_or_finalize → 带源名 fail);system_only 下 required=[System],改由
+                // AbortSession → 带源名 fail);system_only 下 required=[System],改由
                 // System 缺失触发同一条拆除路径。
                 if let Some(&missing) = required_sources(record_system_only)
                     .iter()
@@ -1065,7 +1010,10 @@ fn spawn_session(
                     let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
-                    abort_or_finalize(&writer);
+                    // 排干的 finals 已作为 Pipeline 消息入队(worker 已 join,happens-before
+                    // 本条投递),abort 恒在它们之后执行——内容先落盘再按 abort 语义收尾。
+                    // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                    lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                     let name = source_display(missing);
                     let err = start.failed.iter()
                         .find(|(s, _)| *s == missing)
@@ -1097,14 +1045,18 @@ fn spawn_session(
                     let (r, e) = start.handle.stop();
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
-                    abort_or_finalize(&writer); // 被 stop/新 start(/resume) 抢先：有内容则收尾保全（flush 失败时留 recording）
+                    // 被 stop/新 start(/resume) 抢先:经信箱 abort——有内容则收尾保全
+                    // (flush 失败时留 recording)。排干的 finals 先于本条入队,不丢内容。
+                    // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                    lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                     return;
                 }
                 drop(gen_guard);
                 let system_audio = classify_system(&start.active, &start.failed);
+                // P1 影子回报用:在入槽块前克隆,入槽/emit 各自 clone 不受影响。
+                let note_id_for_report = note_id.clone();
                 *session_slot.lock().unwrap() = Some(ActiveSession {
                     handle: start.handle,
-                    writer: writer.clone(),
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
@@ -1119,13 +1071,21 @@ fn spawn_session(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
-                // 会话已入槽、"recording" 已发：托盘切红点态（图标+菜单文案「停止录制」）。
-                tray::set_recording(&app, true);
+                // P1 影子回报:会话已真实入槽并广播 recording,通知 actor 内核演进。
+                // 本回报来自后台加载线程,只投递不等待(见 actor.rs 死锁注记②)。
+                // 托盘红点态(图标+菜单文案「停止录制」)不再在此直调:actor 内核收到
+                // 本回报后 Starting→Recording 迁移落地,TrayHook 经 hook 总线驱动
+                // (P3 consumers.rs)。翻转时点从「emit 后紧邻」变为「actor 处理完
+                // 本条消息后」,同为毫秒级异步投递,不可感知。
+                app.state::<lifecycle::LifecycleHandle>()
+                    .report(lifecycle::machine::Msg::SessionStarted { note_id: note_id_for_report });
             }
             Err(se) => {
                 stash_model(&recognizer_cache, Some(se.recognizer));
                 stash_model(&embedder_cache, se.embedder);
-                abort_or_finalize(&writer);
+                // 会话未能启动:经信箱 abort(此路径无 worker,不存在在途管线消息)。
+                // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
+                lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                 return fail(&app, &running, &generation, my_gen, format!("error: {}", se.error));
             }
         }
@@ -1169,24 +1129,32 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("start_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_start_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_start_recording。
+    app.state::<lifecycle::LifecycleHandle>()
+        .command(lifecycle::Cmd::Start { resume_id: None })
 }
 
-/// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
-/// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
-#[tauri::command]
-fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+/// 续录一场非活动（已中断或已完成）笔记的共用实现：运行守卫与 do_start_recording
+/// 完全一致（同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。逐语句搬自
+/// 原 resume_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
+/// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
+///
+/// refining(P3):该笔记是否正在精修,由 actor 执行 Delegate 时从内核精修集读出
+/// 传入(本函数在 actor 线程上运行,数据源即内核、同一消息处理内快照一致)。守卫
+/// 留在此处而非内核抢答,是为逐位还原旧判定顺序:下载→精修→模型,谁先判谁先报。
+fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    // F1 修复:该笔记正在精修中就拒绝续录,避免精修收尾时才 enqueue 的转码把续录正在
-    // 追加写的 WAV 当成"已完成"编码后删除(见 resume_blocked_by_refining 文档)。
-    if resume_blocked_by_refining(&state.refining.lock().unwrap(), &note_id) {
+    // F1 修复:该笔记正在精修中就拒绝续录——精修完成后才 transcode.enqueue,而续录
+    // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,精修收尾时才入队的转码会把
+    // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
+    if refining {
         return Err("该笔记正在精修,请稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(&app)) {
+    if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     let result = spawn_session(
@@ -1203,16 +1171,25 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         if let Ok(dir) = app.path().app_data_dir() {
             let source =
                 telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
-            telemetry::track(&app, telemetry::Event::RecordingStarted { source });
+            telemetry::track(app, telemetry::Event::RecordingStarted { source });
         }
     }
     result
 }
 
-/// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
-/// state 由 `app.state()` 取、末尾 preload_models 的 app 因签名为 &AppHandle 而
-/// clone——逻辑零变化(含全部锁序注释)。
-fn do_stop_recording(app: &AppHandle) {
+#[tauri::command]
+fn resume_recording(app: AppHandle, note_id: String) -> Result<(), String> {
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_note_recording。
+    app.state::<lifecycle::LifecycleHandle>()
+        .command(lifecycle::Cmd::Start { resume_id: Some(note_id) })
+}
+
+/// 停录 teardown(P2 上半,原 do_stop_recording 的拆除段逐语句搬移):running 复位、
+/// generation 递增、取会话、时长埋点、handle.stop 排干、模型归还、音频写盘线程 join。
+/// finalize 不在这里——writer 归 lifecycle actor,由调用方(actor 的 Cmd::Stop 特化
+/// 分支)在本函数返回后自投 Finalize{note_id}:该消息排在排干期间入队的全部管线消息
+/// 之后,「先落盘后收尾」由信箱 FIFO 保证。返回 None=本就无会话(空停)。
+pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     let state = app.state::<AppState>();
     // 真停止协议：先置 running=false，再递增 generation（各自 statement-scoped
     // 锁，用完立即释放，从不同时持有两把），最后取 session 并优雅停止（停
@@ -1225,53 +1202,48 @@ fn do_stop_recording(app: &AppHandle) {
     { *state.running.lock().unwrap() = false; }
     { *state.generation.lock().unwrap() += 1; }
     let sess = state.session.lock().unwrap().take();
-    let mut note_id = String::new();
-    if let Some(s) = sess {
-        // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
-        // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
-        // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
-        telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
-        let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 在此完成
-        stash_model(&state.recognizer_cache, returned);
-        stash_model(&state.embedder_cache, embedder);
-        // 分段 worker 已 join → audio sink 已 drop → 写盘线程排干后自退,join 保证
-        // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
-        for j in s.audio_joins {
-            let _ = j.join();
-        }
-        note_id = s.note_id;
-        let mut w = s.writer.lock().unwrap();
-        let finalized = w.finalize(chrono::Local::now());
-        drop(w);
-        match finalized {
-            Ok(()) => {
-                // 仅 finalize 成功（state=complete、meta 落盘）才发起精修。精修管线接管了
-                // 转码移交时机：本地两段（filter/recluster）读完 WAV 后才在 spawn_refine
-                // 内部 enqueue，避免转码 worker 与精修读 WAV 打架；spawn_refine 自身对
-                // 任何前置失败/panic 都兜底保证转码仍会入队一次（见其文档注释），故换掉
-                // 这里的直接 enqueue 不会让 WAV 永不压缩，只是入队时点后移到精修线程内。
-                spawn_refine(app.clone(), note_id.clone(), true);
-            }
-            Err(e) => {
-                eprintln!("stop_recording: finalize 失败: {e}");
-                let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
-            }
-        }
+    let s = sess?;
+    // 埋点先取时长:下面 s.handle.stop() 起会逐字段搬空 s,搬空后不能再整体借用取
+    // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
+    // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
+    telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
+    let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
+    stash_model(&state.recognizer_cache, returned);
+    stash_model(&state.embedder_cache, embedder);
+    // 分段 worker 已 join → audio sink 已 drop → 写盘线程排干后自退,join 保证
+    // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
+    for j in s.audio_joins {
+        let _ = j.join();
     }
+    Some(s.note_id)
+}
+
+/// 停录尾段(P2 下半,原 do_stop_recording 的收尾段逐语句搬移):emit stopped、补预载。
+/// 有会话路径由 actor 的 DoFinalize 执行器在 finalize 之后调用(stopped 恒在
+/// finalize 之后,与旧实现顺序一致);空停路径由 actor 的 Cmd::Stop 分支直接调用
+/// (note_id 空串,与旧实现「无会话也发 stopped」一致)。
+/// 托盘回 idle 态不再在此直调:有会话路径随 DoFinalize 前的状态迁移
+/// (Recording/Stopping→Idle)经 hook 总线驱动(P3 consumers.rs::TrayHook);
+/// 空停路径本就没有真实迁移(从未进过 Recording,托盘本来就是 idle 态),
+/// 故无需补触发。
+pub(crate) fn do_stop_tail(app: &AppHandle, note_id: String) {
+    let state = app.state::<AppState>();
     let _ = app.emit(
         "status",
         ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
     );
-    // 停录：托盘回 idle 态（图标+菜单文案「开始录制」）。托盘不存在则内部静默跳过。
-    tray::set_recording(app, false);
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
     preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
 
 #[tauri::command]
 fn stop_recording(app: AppHandle) {
-    // 薄壳:前端 invoke("stop_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_stop_recording(&app)
+    // 薄壳:经 actor 串行执行停录(P2:teardown+自投 Finalize,reply 在收尾完成后
+    // 才回,同步语义与旧直调一致)。Err 仅在 actor 已退出(进程收尾)时出现;
+    // 原直调无返回值,保持壳签名不变,记日志即可。
+    if let Err(e) = app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Stop) {
+        eprintln!("stop_recording: {e}");
+    }
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -1279,9 +1251,13 @@ fn stop_recording(app: AppHandle) {
 /// running 读取用 statement-scoped 的锁,读完即放,不与 do_* 内部锁嵌套。
 pub(crate) fn toggle_recording(app: &AppHandle) {
     let running = *app.state::<AppState>().running.lock().unwrap();
+    let lc = app.state::<lifecycle::LifecycleHandle>();
     if running {
-        do_stop_recording(app);
-    } else if let Err(e) = do_start_recording(app) {
+        // P1 改道:经 actor 串行(委托 do_stop_recording,恒 Ok);Err 仅 actor 退出时出现。
+        if let Err(e) = lc.command(lifecycle::Cmd::Stop) {
+            eprintln!("快捷键触发停录失败(静默进日志): {e}");
+        }
+    } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
     }
 }
@@ -1333,8 +1309,8 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn pause_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("pause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_pause_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_pause_recording。
+    app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Pause)
 }
 
 /// 续录共用实现(命令壳、UDS 桥共用)。逐语句搬自原 unpause_recording 命令体,唯一改动是
@@ -1361,8 +1337,8 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn unpause_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("unpause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_resume_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_recording。
+    app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Unpause)
 }
 
 #[tauri::command]
@@ -1387,20 +1363,14 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 }
 
 /// 手动（重）触发一次会后精修：录制中该 id 拒绝（内容未定稿，段落还在变），正在精修中
-/// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。手动重跑时 m4a 早已在盘上
-/// （首次精修已经移交过转码），故 `enqueue_transcode_after_local=false`，不再重复入队。
+/// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。两条守卫已入 lifecycle 内核
+/// （Msg::RefineRequest 裁决，文案逐字不变）；通过则内核置 Running 并以 DoSpawnRefine
+/// 调回 spawn_refine——手动重跑时 m4a 早已在盘上（首次精修已经移交过转码），故
+/// enqueue_transcode 恒 false，不再重复入队。
 #[tauri::command]
-fn refine_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    if let Some(s) = state.session.lock().unwrap().as_ref() {
-        if s.note_id == id {
-            return Err("该笔记正在录制，停止后才能精修".into());
-        }
-    }
-    if state.refining.lock().unwrap().contains(&id) {
-        return Err("该笔记正在精修中".into());
-    }
-    spawn_refine(app, id, false);
-    Ok(())
+fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
+    app.state::<lifecycle::LifecycleHandle>()
+        .request(lifecycle::machine::Msg::RefineRequest { note_id: id })
 }
 
 /// 读取已落盘的精修结果（refined.json）；从未精修过 / 精修在前置阶段就失败到没能落盘
@@ -1437,7 +1407,8 @@ fn rename_refined_speaker(
     if name.is_empty() {
         return Err("名字不能为空".into());
     }
-    if state.refining.lock().unwrap().contains(&note_id) {
+    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
         return Err("该笔记正在精修中，稍后再改".into());
     }
     reject_if_active(&state, &note_id)?;
@@ -1481,10 +1452,13 @@ fn assign_note_speaker_person(
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
         return Err(format!("声纹库中没有该人物: {person_id}"));
     };
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .assign_speaker_person(&note_id, &speaker_id, &resolved)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::AssignPerson {
+            id: note_id,
+            speaker_id,
+            person_id: resolved,
+        },
+    })
 }
 
 /// 某声纹库人物出现过的会议（详情页「出现过的会议」卡）：扫各笔记 speakers.json 的
@@ -1523,12 +1497,12 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
 #[tauri::command]
 fn assign_refined_person(
     app: AppHandle,
-    state: State<AppState>,
     note_id: String,
     speaker_id: String,
     person_id: String,
 ) -> Result<(), String> {
-    if state.refining.lock().unwrap().contains(&note_id) {
+    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
         return Err("该笔记正在精修中，稍后再改".into());
     }
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -1606,8 +1580,10 @@ fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String
     if title.is_empty() {
         return Err("标题不能为空".into());
     }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir).rename(&id, title).map_err(|e| e.to_string())
+    // 非活动编辑经 actor 串行执行(取代 NoteStore 直写,见 lifecycle/actor.rs run_edit)。
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::Rename { id, title: title.to_string() },
+    })
 }
 
 #[tauri::command]
@@ -1615,14 +1591,15 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
         return Err("录制中的笔记不能删除".into());
     }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir).delete(&id).map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::Delete { id },
+    })
 }
 
 /// 改说话人显示名：录制中的笔记也允许改。
-/// 活动会话走 writer 单写者路径——在 writer 锁内改内存表并 persist_speakers 原子落盘，
-/// 与 worker 线程的 sync_speakers 共用同一把锁、同一原子写，杜绝互相覆盖窗口（不再经
-/// NoteStore 直写）；非活动笔记才走 NoteStore::rename_speaker 直写磁盘。
+/// 活动会话经 lifecycle 信箱走 writer 单写者路径(P2:writer 归 actor)——改内存表、
+/// persist_speakers 原子落盘、广播都在 actor 线程串行执行,与管线事件同线程,天然
+/// 杜绝互相覆盖窗口(不再经 NoteStore 直写);非活动笔记才走 NoteStore 直写磁盘。
 #[tauri::command]
 fn rename_speaker(
     app: AppHandle,
@@ -1635,33 +1612,30 @@ fn rename_speaker(
     if name.is_empty() {
         return Err("名字不能为空".into());
     }
-    // 活动会话：writer 锁内改名 + 落盘 + 广播，单写者不与 sync_speakers 竞争。
-    if let Some(s) = state.session.lock().unwrap().as_ref() {
-        if s.note_id == note_id {
-            let mut w = s.writer.lock().unwrap();
-            w.set_speaker_name(&speaker_id, name);
-            let persisted = w.persist_speakers();
-            let speakers = w
-                .speakers()
-                .iter()
-                .map(|(id, m)| ipc::SpeakerEntry {
-                    id: id.clone(),
-                    name: m.name.clone(),
-                    sources: m.sources.clone(),
-                    person_id: m.person_id.clone(),
-                })
-                .collect();
-            drop(w);
-            persisted.map_err(|e| format!("说话人改名落盘失败: {e}"))?;
-            let _ = app.emit("speakers", ipc::SpeakersEvent { speakers, merged: None });
-            return Ok(());
-        }
+    // 活动判定读 session 槽(与旧实现一致;槽与 actor 的 writer 槽同源于同一会话)。
+    // statement-scoped 取值:request() 阻塞等 actor,而 actor 的执行体可能要取
+    // session 锁——持锁等待会成环(见 actor.rs 死锁注记③)。判定与执行之间恰逢
+    // 停录的竞态窗口由执行器按槽内 note_id 对账兜底报错。
+    let active = state
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.note_id == note_id)
+        .unwrap_or(false);
+    if active {
+        return app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::RenameActiveSpeaker { note_id, speaker_id, name: name.into() },
+        );
     }
-    // 非活动笔记：直写磁盘。
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .rename_speaker(&note_id, &speaker_id, name)
-        .map_err(|e| e.to_string())
+    // 非活动笔记：经 actor 串行执行(取代 NoteStore 直写)。
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::RenameSpeaker {
+            id: note_id,
+            speaker_id,
+            name: name.to_string(),
+        },
+    })
 }
 
 /// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
@@ -1682,10 +1656,9 @@ fn edit_segment(
     new_text: String,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .edit_segment_text(&note_id, seq, &expected_text, &new_text)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::EditText { id: note_id, seq, expected_text, new_text },
+    })
 }
 
 #[tauri::command]
@@ -1697,10 +1670,9 @@ fn delete_segment(
     expected_text: String,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .delete_segment(&note_id, seq, &expected_text)
-        .map_err(|e| e.to_string())
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::DeleteSegment { id: note_id, seq, expected_text },
+    })
 }
 
 #[tauri::command]
@@ -1713,10 +1685,24 @@ fn set_segment_speaker(
     speaker_id: String,
 ) -> Result<String, String> {
     reject_if_active(&state, &note_id)?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::SetSegmentSpeaker {
+            id: note_id.clone(),
+            seq,
+            expected_text,
+            speaker_id,
+        },
+    })?;
+    // DoEdit 的回执统一收窄成 Result<(),String>(与其余六个编辑操作同形状,见
+    // actor.rs run_edit 注释),新分配的说话人 id 靠这次重查取回——actor 已把
+    // 写入落盘完成才回执 Ok,重查读到的必是刚写入的最终值,不构成竞态。
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir)
-        .set_segment_speaker(&note_id, seq, &expected_text, &speaker_id)
-        .map_err(|e| e.to_string())
+    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    note.segments
+        .iter()
+        .find(|s| s.seq == seq)
+        .and_then(|s| s.speaker.clone())
+        .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
 }
 
 /// 导出笔记。prefer_refined=真且精修稿在盘时导精修稿(所见即所得:用户看着哪个视图
@@ -2746,6 +2732,9 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // 生命周期 actor:命令面(五命令/toggle/UDS/tray)经其信箱串行执行(P1 绞杀者)。
+            // 必须在任何命令可达之前 manage——setup 先于 webview 加载/UDS server/托盘构建。
+            app.manage(lifecycle::spawn(handle.clone()));
             // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
             let app_data = handle.path().app_data_dir().ok();
             // 最先执行:stderr/stdout 黑匣子(见 logging.rs)。后续任何 eprintln 与
@@ -2779,11 +2768,22 @@ pub fn run() {
                     }
                     // 启动扫描 data_root/notes:①修复陈旧 WAV 头(硬崩后头尺寸落后于数据,
                     // 播放端看不到尾段);②对已 complete 且有真实 wav 的笔记入队转码(上次
-                    // 没转完 / 新迁入的历史 WAV)。此刻必无录制会话,与写盘线程零竞态。
+                    // 没转完 / 新迁入的历史 WAV)。本进程此刻必无录制会话,但同一数据目录可能
+                    // 被另一实例正在录制——那种目录绝不能被当孤儿去修头/入队,故逐目录先探锁。
                     if let Ok(rd) = std::fs::read_dir(root.join("notes")) {
                         for e in rd.flatten() {
                             if e.path().is_dir() {
+                                // 探锁并把它绑定为存活值(不是探完即放):repair_stale_tracks
+                                // 直接改写 WAV 头,若锁在探完那一刻就释放，另一实例可能在
+                                // repair 与 enqueue 之间的窗口期开始续录并发写同一 WAV，
+                                // 修头操作与它的写入相撞。锁必须覆盖到 repair 完成之后，
+                                // enqueue 只是入队(不动这个目录的文件)，之前 drop 即可。
+                                let _probe = match store::notelock::NoteLock::try_exclusive(&e.path()) {
+                                    Ok(Some(probe)) => probe,
+                                    _ => continue,
+                                };
                                 store::audio::repair_stale_tracks(&e.path());
+                                drop(_probe);
                                 if should_enqueue_transcode(&e.path()) {
                                     st.transcode.enqueue(e.path());
                                 }
@@ -2798,7 +2798,16 @@ pub fn run() {
             // 播放器引用失效(停录后立即点播放的竞态窗口)——发事件让前端重拉音轨。
             let transcode_emit = handle.clone();
             st.transcode.spawn_worker(st.running.clone(), move |dir: &std::path::Path| {
+                // 转码会编码后删除源 WAV——必须独占持锁到转码结束,防止与
+                // (本进程续录 cancel_and_wait 之外的)另一实例的活动会话相撞。
+                let lock = match store::notelock::NoteLock::try_exclusive(dir) {
+                    Ok(Some(l)) => l,
+                    // 拿不到锁=该目录有活会话(含另一实例)在用;此次转码任务作废,
+                    // 但队列语义幂等按目录去重——续录结束后精修路径会重新入队,不丢。
+                    _ => return,
+                };
                 store::transcode::transcode_note_dir(dir);
+                drop(lock); // 锁只需护住"转码+删 WAV"窗口,完成通知不必持锁。
                 if let Some(id) = dir.file_name().and_then(|s| s.to_str()) {
                     let _ = transcode_emit
                         .emit("transcode_done", ipc::TranscodeEvent { note_id: id.to_string() });
@@ -3062,18 +3071,9 @@ mod tests {
         assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
     }
 
-    #[test]
-    fn resume_blocked_by_refining_matches_refining_set() {
-        use super::resume_blocked_by_refining;
-        use std::collections::HashSet;
-
-        let mut refining: HashSet<String> = HashSet::new();
-        assert!(!resume_blocked_by_refining(&refining, "note-a"), "精修集不含该 id → 放行");
-
-        refining.insert("note-a".into());
-        assert!(resume_blocked_by_refining(&refining, "note-a"), "该 id 正在精修中 → 拒绝续录");
-        assert!(!resume_blocked_by_refining(&refining, "note-b"), "只挡命中的 id,不误伤其它笔记");
-    }
+    // resume_blocked_by_refining_matches_refining_set 已随精修集入内核而删除:
+    // 同一语义(按 id 查集合/不误伤其它笔记)由 lifecycle::machine 的
+    // concurrent_refines_tracked_independently_by_id 与 RefineRequest 裁决表接管。
 
     #[test]
     fn download_running_resets_even_on_panic() {
