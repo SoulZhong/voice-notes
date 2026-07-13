@@ -639,6 +639,9 @@ fn spawn_session(
             // return，走不到这里，不会误把托盘打回 idle）。托盘不存在则内部静默跳过。
             tray::set_recording(app, false);
             let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
+            // P1 影子回报:仅当前代的启动失败走到这里(过期线程已提前 return),
+            // 通知 actor 内核回到 Idle。后台线程投递,不等待(见 actor.rs 死锁注记②)。
+            app.state::<lifecycle::LifecycleHandle>().report(lifecycle::machine::Msg::SessionFailed);
         };
 
         // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
@@ -1103,6 +1106,8 @@ fn spawn_session(
                 }
                 drop(gen_guard);
                 let system_audio = classify_system(&start.active, &start.failed);
+                // P1 影子回报用:在入槽块前克隆,入槽/emit 各自 clone 不受影响。
+                let note_id_for_report = note_id.clone();
                 *session_slot.lock().unwrap() = Some(ActiveSession {
                     handle: start.handle,
                     writer: writer.clone(),
@@ -1120,6 +1125,10 @@ fn spawn_session(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
                 );
+                // P1 影子回报:会话已真实入槽并广播 recording,通知 actor 内核演进。
+                // 本回报来自后台加载线程,只投递不等待(见 actor.rs 死锁注记②)。
+                app.state::<lifecycle::LifecycleHandle>()
+                    .report(lifecycle::machine::Msg::SessionStarted { note_id: note_id_for_report });
                 // 会话已入槽、"recording" 已发：托盘切红点态（图标+菜单文案「停止录制」）。
                 tray::set_recording(&app, true);
             }
@@ -1170,14 +1179,17 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("start_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_start_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_start_recording。
+    app.state::<lifecycle::LifecycleHandle>()
+        .command(lifecycle::Cmd::Start { resume_id: None })
 }
 
-/// 续录一场非活动（已中断或已完成）笔记：运行守卫与 start_recording 完全一致
-/// （同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。
-#[tauri::command]
-fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+/// 续录一场非活动（已中断或已完成）笔记的共用实现：运行守卫与 do_start_recording
+/// 完全一致（同一份 spawn_session 实现），仅 target 换成 Resume(note_id)。逐语句搬自
+/// 原 resume_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
+/// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
+fn do_resume_note_recording(app: &AppHandle, note_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
@@ -1187,7 +1199,7 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
     if resume_blocked_by_refining(&state.refining.lock().unwrap(), &note_id) {
         return Err("该笔记正在精修,请稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(&app)) {
+    if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
     }
     let result = spawn_session(
@@ -1204,10 +1216,17 @@ fn resume_recording(app: AppHandle, state: State<AppState>, note_id: String) -> 
         if let Ok(dir) = app.path().app_data_dir() {
             let source =
                 telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
-            telemetry::track(&app, telemetry::Event::RecordingStarted { source });
+            telemetry::track(app, telemetry::Event::RecordingStarted { source });
         }
     }
     result
+}
+
+#[tauri::command]
+fn resume_recording(app: AppHandle, note_id: String) -> Result<(), String> {
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_note_recording。
+    app.state::<lifecycle::LifecycleHandle>()
+        .command(lifecycle::Cmd::Start { resume_id: Some(note_id) })
 }
 
 /// 停录共用实现(命令壳、快捷键共用)。逐语句搬自原 stop_recording 命令体,唯一改动是
@@ -1258,6 +1277,11 @@ fn do_stop_recording(app: &AppHandle) {
                 let _ = app.emit("storage", ipc::StorageEvent { state: "degraded".into() });
             }
         }
+        // P1 影子回报:会话已真实拆除(排干+finalize 已收尾),通知 actor 内核回到 Idle。
+        // 本函数经命令改道后通常正运行在 actor 线程上——report 是向自己信箱做
+        // unbounded send,不阻塞,无自锁(见 actor.rs 死锁注记①)。
+        app.state::<lifecycle::LifecycleHandle>()
+            .report(lifecycle::machine::Msg::SessionEnded { note_id: note_id.clone() });
     }
     let _ = app.emit(
         "status",
@@ -1271,8 +1295,11 @@ fn do_stop_recording(app: &AppHandle) {
 
 #[tauri::command]
 fn stop_recording(app: AppHandle) {
-    // 薄壳:前端 invoke("stop_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_stop_recording(&app)
+    // 薄壳(P1 改道):经 actor 串行执行 do_stop_recording(委托恒 Ok)。Err 仅在 actor
+    // 已退出(进程收尾)时出现;原直调无返回值,保持壳签名不变,记日志即可。
+    if let Err(e) = app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Stop) {
+        eprintln!("stop_recording: {e}");
+    }
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -1280,9 +1307,13 @@ fn stop_recording(app: AppHandle) {
 /// running 读取用 statement-scoped 的锁,读完即放,不与 do_* 内部锁嵌套。
 pub(crate) fn toggle_recording(app: &AppHandle) {
     let running = *app.state::<AppState>().running.lock().unwrap();
+    let lc = app.state::<lifecycle::LifecycleHandle>();
     if running {
-        do_stop_recording(app);
-    } else if let Err(e) = do_start_recording(app) {
+        // P1 改道:经 actor 串行(委托 do_stop_recording,恒 Ok);Err 仅 actor 退出时出现。
+        if let Err(e) = lc.command(lifecycle::Cmd::Stop) {
+            eprintln!("快捷键触发停录失败(静默进日志): {e}");
+        }
+    } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
     }
 }
@@ -1334,8 +1365,8 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn pause_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("pause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_pause_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_pause_recording。
+    app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Pause)
 }
 
 /// 续录共用实现(命令壳、UDS 桥共用)。逐语句搬自原 unpause_recording 命令体,唯一改动是
@@ -1362,8 +1393,8 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn unpause_recording(app: AppHandle) -> Result<(), String> {
-    // 薄壳:前端 invoke("unpause_recording") 无参,去掉 State 参数(实现里 app.state() 取)。
-    do_resume_recording(&app)
+    // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_recording。
+    app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Unpause)
 }
 
 #[tauri::command]
@@ -2747,6 +2778,9 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // 生命周期 actor:命令面(五命令/toggle/UDS/tray)经其信箱串行执行(P1 绞杀者)。
+            // 必须在任何命令可达之前 manage——setup 先于 webview 加载/UDS server/托盘构建。
+            app.manage(lifecycle::spawn(handle.clone()));
             // settings.json 是自举指针,永远读写 app_data_dir(不随 data_dir 漂移)。
             let app_data = handle.path().app_data_dir().ok();
             // 最先执行:stderr/stdout 黑匣子(见 logging.rs)。后续任何 eprintln 与

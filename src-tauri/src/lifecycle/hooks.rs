@@ -1,5 +1,3 @@
-#![allow(dead_code)] // P1 Task 6 接线后删除
-
 //! 迁移 hook 总线(通知类副作用的唯一挂点)。
 //!
 //! 契约:注册序执行;每个 hook 逐个 catch_unwind——任何 hook panic/失败只记
@@ -9,6 +7,8 @@
 
 use super::machine::SessionState;
 
+// 字段在 P1 无注册消费者时仅被测试读取(actor 只构造不读),P3 接遥测/UI 消费者后消费。
+#[allow(dead_code)]
 pub struct TransitionCtx<'a> {
     pub note_id: Option<&'a str>,
     pub from: &'a SessionState,
@@ -33,6 +33,8 @@ pub struct ExternalHookCfg {
 }
 
 impl HookBus {
+    /// P1 无运行期注册者(仅测试消费);P3 起在 actor spawn 处注册遥测/UI 消费者。
+    #[allow(dead_code)]
     pub fn register(&mut self, hook: Box<dyn LifecycleHook>) {
         self.hooks.push(hook);
     }

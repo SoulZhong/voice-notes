@@ -181,7 +181,9 @@ impl UdsBackend for AppBackend<'_> {
 
     fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String> {
         let app = self.0;
-        crate::do_start_recording(app)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_start_recording。
+        app.state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Start { resume_id: None })?;
         // spawn_session 异步加载模型后才入槽:轮询等 note_id(最多 20s,模型冷加载
         // 可能秒级);拿到后如带 title,经 writer 单写者路径改题(见 set_title 注释)。
         for _ in 0..200 {
@@ -211,17 +213,25 @@ impl UdsBackend for AppBackend<'_> {
         if note_id.is_empty() {
             return Err("没有正在进行的录制".into());
         }
-        crate::do_stop_recording(app); // 阻塞至排干,本线程等待无妨
+        // P1 改道:经 actor 串行执行 do_stop_recording——阻塞至排干,本线程等待无妨。
+        app.state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Stop)?;
         Ok(serde_json::json!({ "note_id": note_id }))
     }
 
     fn pause(&self) -> Result<serde_json::Value, String> {
-        crate::do_pause_recording(self.0)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_pause_recording。
+        self.0
+            .state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Pause)?;
         Ok(status_json(self.0))
     }
 
     fn resume(&self) -> Result<serde_json::Value, String> {
-        crate::do_resume_recording(self.0)?;
+        // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_resume_recording。
+        self.0
+            .state::<crate::lifecycle::LifecycleHandle>()
+            .command(crate::lifecycle::Cmd::Unpause)?;
         Ok(status_json(self.0))
     }
 }

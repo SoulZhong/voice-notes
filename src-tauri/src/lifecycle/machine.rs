@@ -14,6 +14,8 @@ pub enum SessionState {
     Recording { note_id: String, paused: bool },
     /// 停止中(handle.stop+finalize 在工作线程)。P1 阶段停止仍同步委托,
     /// 此态在 P1 只在 Delegate 前后瞬间存在,为 P2 预留。
+    /// P1 运行期不构造(仅被 actor/回报对账匹配),P2 停止异步化后由内核构造。
+    #[allow(dead_code)]
     Stopping { note_id: String },
 }
 
@@ -23,6 +25,9 @@ pub enum Cmd {
     Stop,
     Pause,
     Unpause,
+    /// P1 运行期不构造:recording_status 保持直读 session 槽(P1 内核非权威,
+    /// 经信箱回答只会引入无意义排队);P2 权威翻转时命令壳改发此命令。
+    #[allow(dead_code)]
     QueryStatus,
 }
 
@@ -39,6 +44,8 @@ pub enum Effect {
     /// 委托既有 do_* 执行体(P1 绞杀者语义:执行结果即 reply)。
     Delegate(Cmd),
     /// 内核直接拒绝(P1 不启用拒绝路径,全部 Delegate 让旧守卫发挥;见表)。
+    /// P1 运行期不构造(actor 已实现其执行分支),P2 内核抢答守卫后由迁移表产生。
+    #[allow(dead_code)]
     ReplyErr(String),
     /// 影子对账不一致:仅记日志,绝不影响主流程。
     ShadowMismatch(String),
