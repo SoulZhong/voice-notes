@@ -27,6 +27,9 @@ pub struct NoteWriter {
     /// 本会话新建标记：create() 置 true，resume() 置 false。
     /// 用于 abort_or_finalize 区分：零段新建空笔记删除；零段既有笔记保留（不丢内容）。
     created_this_session: bool,
+    /// 笔记目录跨进程写锁:create/resume 时获取,随 NoteWriter 一起落幕。
+    /// 拿不到锁 = 另一实例正在录制/编辑本笔记,开录失败并明确报错。
+    _lock: super::notelock::NoteLock,
 }
 
 /// 默认标题:「周X时段的会议」。列表副标题已有精确「日期时间 · 时长」,标题再放
@@ -119,6 +122,10 @@ impl NoteWriter {
             id = format!("{base}-{n}");
         };
         std::fs::create_dir(&dir)?;
+        // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
+        let lock = super::notelock::NoteLock::try_exclusive(&dir)
+            .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("该笔记正被另一实例录制或编辑,无法开始"))?;
         let meta = NoteMeta {
             schema_version: SCHEMA_VERSION,
             id: id.clone(),
@@ -142,6 +149,7 @@ impl NoteWriter {
             base_ms: 0,
             merged: BTreeMap::new(),
             created_this_session: true,
+            _lock: lock,
         })
     }
 
@@ -156,6 +164,10 @@ impl NoteWriter {
         if !dir.is_dir() {
             anyhow::bail!("笔记不存在: {id}");
         }
+        // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
+        let lock = super::notelock::NoteLock::try_exclusive(&dir)
+            .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("该笔记正被另一实例录制或编辑,无法开始"))?;
 
         let meta_str = std::fs::read_to_string(dir.join("meta.json"))
             .map_err(|e| anyhow::anyhow!("读 meta.json 失败: {e}"))?;
@@ -201,6 +213,7 @@ impl NoteWriter {
             base_ms,
             merged: BTreeMap::new(),
             created_this_session: false,
+            _lock: lock,
         })
     }
 
@@ -1114,6 +1127,7 @@ mod tests {
         }]);
         assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P1"), "store_centroids 应回填 person_id");
         w.finalize(now()).unwrap();
+        drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         let resumed = NoteWriter::resume(tmp.path(), &id).unwrap();
         let snaps = resumed.registry_snapshot();
@@ -1194,6 +1208,7 @@ mod tests {
         let w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
         assert!(w.created_this_session(), "create() 应设 created_this_session=true");
+        drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         let r = NoteWriter::resume(tmp.path(), &id).unwrap();
         assert!(!r.created_this_session(), "resume() 应设 created_this_session=false");
@@ -1209,6 +1224,7 @@ mod tests {
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
         w.finalize(now()).unwrap();
         assert_eq!(read_meta(&tmp.path().join(&id)).state, "complete");
+        drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         let mut r = NoteWriter::resume(tmp.path(), &id).unwrap();
         assert_eq!(r.note_id(), id, "续录复用同一 id/目录");
@@ -1234,6 +1250,7 @@ mod tests {
         let id = w.note_id().to_string();
         w.append_final("mic", "崩溃前", 0, 800, None, None).unwrap();
         // 不 finalize，模拟崩溃：meta 仍是 recording。
+        drop(w); // 崩溃时内核会代为释放 flock;这里用 drop 模拟锁已释放
 
         let r = NoteWriter::resume(tmp.path(), &id).unwrap();
         assert_eq!(r.base_ms(), 800);
@@ -1248,6 +1265,7 @@ mod tests {
         let id = w.note_id().to_string();
         w.append_final("mic", "完整句", 0, 1000, None, None).unwrap();
         w.finalize(now()).unwrap();
+        drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         // 模拟崩溃写了半行（不可解析，next_seq/base_ms 应只依据可解析行）。
         use std::io::Write;
@@ -1279,8 +1297,12 @@ mod tests {
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
         w.finalize(now()).unwrap();
+        // 必须先 drop 释放目录锁:否则 resume 会因锁冲突先行 Err,断言虽仍通过,
+        // 但测的就不再是「meta 损坏 → Err」这条本意路径了。
+        drop(w);
         std::fs::write(tmp.path().join(&id).join("meta.json"), "not json").unwrap();
-        assert!(NoteWriter::resume(tmp.path(), &id).is_err());
+        let err = NoteWriter::resume(tmp.path(), &id).err().expect("meta 损坏应 Err").to_string();
+        assert!(err.contains("meta.json 解析失败"), "应因 meta 损坏而拒,实际: {err}");
     }
 
     #[test]
@@ -1367,6 +1389,9 @@ mod tests {
         .expect("start_session");
         let _ = start.handle.stop();
         writer.lock().unwrap().finalize(now()).unwrap();
+        // stop() 已 join 全部 worker(闭包里的 Arc 克隆随之销毁),此处 drop 掉
+        // 最后一个强引用,NoteWriter 落幕、目录锁释放,下方 resume 才能取锁。
+        drop(writer);
 
         let store = NoteStore::new(tmp.path().to_path_buf());
         let n = store.load(&id).unwrap().segments.len();
@@ -1414,5 +1439,17 @@ mod tests {
             "续录段 start_ms 均 ≥ base_ms（时间轴连续）"
         );
         assert_eq!(note.meta.state, "complete", "续录后 stop 仍正常收尾为 complete");
+    }
+
+    #[test]
+    fn writer_holds_note_lock_for_whole_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = NoteWriter::create(dir.path(), chrono::Local::now()).unwrap();
+        let note_dir = w.dir().to_path_buf();
+        // 会话期间:任何人拿不到锁
+        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir).unwrap().is_none());
+        drop(w);
+        // writer 落幕:锁释放
+        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir).unwrap().is_some());
     }
 }

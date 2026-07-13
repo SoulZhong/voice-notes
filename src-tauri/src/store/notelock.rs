@@ -12,15 +12,12 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-#[allow(dead_code)]
 pub const LOCK_FILE: &str = ".note.lock";
 
-#[allow(dead_code)]
 pub struct NoteLock {
     _file: File,
 }
 
-#[allow(dead_code)]
 impl NoteLock {
     /// 非阻塞尝试独占。Ok(None) = 已被其他持有者(进程或本进程另一句柄)占用。
     pub fn try_exclusive(dir: &Path) -> std::io::Result<Option<NoteLock>> {

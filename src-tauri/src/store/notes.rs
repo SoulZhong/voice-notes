@@ -18,6 +18,15 @@ fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
     EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// 编辑前的跨进程写锁:录制会话(本进程或另一实例)持锁期间,一切整表
+/// 重写被明确拒绝——这是对「双实例重写丢转写」事故的直接防线。
+/// 返回值须存活到写盘完成(锁生命周期即保护窗口)。
+fn write_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
+    super::notelock::NoteLock::try_exclusive(dir)
+        .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("该笔记正在录制中(可能来自另一个应用实例),请停止录制后再试"))
+}
+
 /// load 结果记忆化。详情页切换会议会反复对同一 id 调 load(切走再切回、编辑后
 /// refresh),而 load 每次都全量重解析 segments.jsonl + join 整个声纹库——长会议
 /// (数千段)或声纹多时,这是切换卡顿的主因之一。
@@ -149,6 +158,7 @@ impl NoteStore {
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
         meta.title = title.to_string();
         write_meta_atomic(&dir, &meta)
@@ -157,6 +167,7 @@ impl NoteStore {
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -165,6 +176,7 @@ impl NoteStore {
     pub fn rename_speaker(&self, id: &str, speaker_id: &str, name: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut speakers = read_speakers(&dir);
         speakers
             .entry(speaker_id.to_string())
@@ -184,6 +196,7 @@ impl NoteStore {
     ) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut speakers = read_speakers(&dir);
         let meta = speakers
             .get_mut(speaker_id)
@@ -207,6 +220,7 @@ impl NoteStore {
             anyhow::bail!("文本不能为空（如需去掉这段请用删除）");
         }
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?.text = new_text.to_string();
         write_jsonl_atomic(&dir, &lines)
@@ -216,6 +230,7 @@ impl NoteStore {
     pub fn delete_segment(&self, id: &str, seq: u64, expected_text: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
         lines.retain(|l| !matches!(l, JsonlLine::Seg(r) if r.seq == seq));
@@ -234,6 +249,7 @@ impl NoteStore {
     ) -> anyhow::Result<String> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         find_seg(&mut lines, seq, expected_text)?;
         let mut speakers = read_speakers(&dir);
@@ -680,6 +696,7 @@ mod tests {
         w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
         w.finalize(now()).unwrap();
+        drop(w); // writer 持锁到 Drop:释放目录锁后编辑路径才能取锁
         let store = NoteStore::new(tmp.path().to_path_buf());
         store.rename_speaker(&id, "S1", "张三").unwrap();
         assert_eq!(store.load(&id).unwrap().speakers["S1"].name, "张三");
@@ -697,6 +714,7 @@ mod tests {
         w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
         w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
         w.finalize(now()).unwrap();
+        drop(w); // writer 持锁到 Drop:释放目录锁后编辑路径才能取锁
         let store = NoteStore::new(tmp.path().to_path_buf());
         store.rename_speaker(&id, "S1", "本地名").unwrap();
         store.assign_speaker_person(&id, "S1", "P7").unwrap();
@@ -863,5 +881,19 @@ mod tests {
         let texts: Vec<&str> = n.segments.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["前", "同前", "后"], "空白段滤除,start_ms 升序,同值按 seq");
         assert_eq!(n.skipped_lines, 0, "空白段不是损坏行,不计 skipped");
+    }
+
+    /// 笔记目录被 flock 独占期间(录制中/另一实例持有),编辑路径应被明确拒绝，
+    /// 而不是与持锁方互相覆盖 segments.jsonl。make_spk_note 内部已 finalize 并
+    /// 落 writer 出作用域(锁随之释放)，这里额外用独立句柄模拟"另一持有者"。
+    #[test]
+    fn edit_rejected_while_note_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("原文", None)], &[]);
+        let dir = tmp.path().join(&id);
+        let _lock = crate::store::notelock::NoteLock::try_exclusive(&dir).unwrap().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let err = store.edit_segment_text(&id, 0, "原文", "改").unwrap_err().to_string();
+        assert!(err.contains("正在录制"), "锁占用时编辑应被明确拒绝,实际: {err}");
     }
 }
