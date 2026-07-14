@@ -1024,7 +1024,7 @@ mod calibrate {
 
 - [ ] **Step 2: 蓝牙场次标定**
 
-Run: 2026-07-08 面试那场（蓝牙外放实锤,lag≈600ms;在 `~/Documents/voice-notes/notes/` 下按日期找 20260708 开头的笔记目录）:
+Run: 2026-07-08 蓝牙实锤场（lag≈600ms;具体笔记本地选取,id 不入库）:
 `VN_NOTE_DIR=<该目录> cargo test calibrate_note -- --ignored --nocapture`
 Expected: 多数窗置信度显著（预期 >2），延迟 ≈600ms；清洗输出可试听确认回声消失、本人声音完好
 
