@@ -57,6 +57,26 @@ pub fn new_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
     ))
 }
 
+/// 离线清洗用的一对句柄:AEC3 + 降噪(NS High),不开 AGC。
+/// 与实时录制的 new_pair 区别:清洗输入是录制时已经 AGC 过的波形,再增益会把
+/// 底噪二次抬升;降噪在这里开(实时链路二期再评估),清掉普通麦克风路径的底噪。
+pub fn new_clean_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
+    let ap = Processor::new(sample_rate).map_err(|e| anyhow::anyhow!("清洗 APM 初始化失败: {e}"))?;
+    ap.set_config(Config {
+        echo_canceller: Some(config::EchoCanceller::default()),
+        noise_suppression: Some(config::NoiseSuppression {
+            level: config::NoiseSuppressionLevel::High,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let ap = Arc::new(ap);
+    Ok((
+        AecRender { ap: ap.clone(), buf: Vec::new() },
+        AecCapture { ap, buf: Vec::new() },
+    ))
+}
+
 /// 分段 worker 的 AEC 角色:随源分发(system=Render 喂参考,mic=Capture 消回声)。
 pub enum AecRole {
     Render(AecRender),
@@ -171,6 +191,31 @@ mod tests {
             out_power < echo_power / 4.0,
             "收敛后回声应至少衰减 6dB: 回声功率 {echo_power:.6}, 输出功率 {out_power:.6}"
         );
+    }
+
+    /// 清洗对(AEC3+NS,无AGC):回声照样消,且不做增益(输出功率不该高于输入)。
+    #[test]
+    fn clean_pair_cancels_echo_without_gain() {
+        let (mut r, mut c) = new_clean_pair(16_000).unwrap();
+        let mut seed = 42u64;
+        let far = noise(16_000 * 4, &mut seed);
+        let delay = 960;
+        let mut near = vec![0.0f32; far.len()];
+        for i in delay..far.len() {
+            near[i] = far[i - delay] * 0.5;
+        }
+        let tail_from = far.len() - 16_000 / 2;
+        let mut out_tail = Vec::new();
+        for (i, (f, n)) in far.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+            r.push(f);
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        let echo_power = power(&near[tail_from..]);
+        let out_power = power(&out_tail);
+        assert!(out_power < echo_power / 4.0, "回声至少衰减 6dB: {echo_power:.6} -> {out_power:.6}");
     }
 }
 
