@@ -104,7 +104,7 @@ pub fn estimate_windows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// 分块调幅噪声:每 300ms 一个 LCG 随机增益,包络非周期,互相关峰唯一。
