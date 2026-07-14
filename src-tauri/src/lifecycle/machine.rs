@@ -52,6 +52,20 @@ impl RefineState {
         next.running.remove(note_id);
         next
     }
+
+    /// 与另一集合的差异(供外部钩子事件映射:新增=refine_started,移除=refine_finished)。
+    /// 返回 (after 新增的 id, after 移除的 id),BTreeSet 差集天然升序,断言稳定。
+    pub fn diff(&self, after: &RefineState) -> (Vec<String>, Vec<String>) {
+        let added = after.running.difference(&self.running).cloned().collect();
+        let removed = self.running.difference(&after.running).cloned().collect();
+        (added, removed)
+    }
+
+    /// 仅测试用:构造含指定 id 的集合(with_inserted 私有,外部测试无法搭台)。
+    #[cfg(test)]
+    pub fn diff_test_insert(&self, note_id: &str) -> RefineState {
+        self.with_inserted(note_id)
+    }
 }
 
 /// 内核状态升维(P3):会话主时间轴 + 精修维度。两维正交——会话消息不动 refine,
@@ -884,5 +898,19 @@ mod tests {
         assert_eq!(next.refine, base.refine, "Finalize 不动精修维");
         let (next, _) = handle(&rec_state, &Msg::SessionEnded { note_id: "n1".into() });
         assert_eq!(next.refine, base.refine, "SessionEnded 不动精修维");
+    }
+
+    #[test]
+    fn refine_diff_reports_added_and_removed() {
+        let empty = RefineState::default();
+        let one = empty.with_inserted("n1");
+        let two = one.with_inserted("n2");
+
+        assert_eq!(empty.diff(&one), (vec!["n1".to_string()], vec![]), "新增 n1");
+        assert_eq!(one.diff(&empty), (vec![], vec!["n1".to_string()]), "移除 n1");
+        let (added, removed) = one.diff(&two.with_removed("n1"));
+        assert_eq!(added, vec!["n2".to_string()]);
+        assert_eq!(removed, vec!["n1".to_string()]);
+        assert_eq!(one.diff(&one), (vec![], vec![]), "无变化 → 双空");
     }
 }
