@@ -217,12 +217,57 @@ pub fn note_envs(c: &NoteContent) -> Vec<(String, String)> {
     v
 }
 
+/// 笔记内容构建核心(可测):notes_dir 定笔记,data_root 有值时精修稿做声纹库
+/// 现名 join(与 export_note 同款只读语义)。任何读盘失败回 None——内容是增值
+/// 信息,由调用方决定跳过附带照常执行。
+fn note_content_from_dirs(
+    notes_dir: &std::path::Path,
+    data_root: Option<&std::path::Path>,
+    note_id: &str,
+) -> Option<NoteContent> {
+    let store = crate::store::NoteStore::new(notes_dir.to_path_buf());
+    let note = store.load(note_id).ok()?;
+    let text = match crate::store::load_refined(&notes_dir.join(note_id)) {
+        Some(mut doc) => {
+            if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
+                if let Some(root) = data_root {
+                    let vp = crate::store::VoiceprintStore::new(root.to_path_buf()).load();
+                    crate::store::join_library_names(&mut doc, &vp);
+                }
+            }
+            crate::store::render_refined(&note.meta.title, &doc, true)
+        }
+        None => store.render(note_id, "md").ok()?,
+    };
+    let (text, truncated) = truncate_utf8(text, NOTE_TEXT_MAX);
+    let duration_secs = note.segments.iter().map(|s| s.end_ms).max().unwrap_or(0) / 1000;
+    Some(NoteContent {
+        started_at: note.meta.started_at.clone(),
+        ended_at: note.meta.ended_at.clone().unwrap_or_default(),
+        duration_secs,
+        speakers: note.speakers.iter().map(|(id, m)| speaker_display(id, &m.name)).collect(),
+        text,
+        truncated,
+    })
+}
+
+/// AppHandle 薄壳:解析两个根目录后进核心。
+fn note_content(app: &tauri::AppHandle, note_id: &str) -> Option<NoteContent> {
+    let notes = crate::notes_dir(app).ok()?;
+    let root = crate::data_root(app).ok();
+    note_content_from_dirs(&notes, root.as_deref(), note_id)
+}
+
 fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
     let Ok(app_data) = app.path().app_data_dir() else {
         eprintln!("hooks: app_data_dir 不可用,本批事件放弃");
         return;
     };
     let cfgs = load(&app_data).hooks;
+    // 批内内容缓存:停录+自动精修同帧多事件共享同一 note_id,只构建一次。
+    // Option 也缓存——构建失败(笔记刚删)同批不再重试,只记一次日志。
+    let mut contents: std::collections::HashMap<String, Option<NoteContent>> =
+        std::collections::HashMap::new();
     for f in &fires {
         let event = f.event.as_str();
         let matched: Vec<&HookCfg> =
@@ -236,17 +281,39 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
             .and_then(|d| crate::store::NoteStore::new(d).title(&f.note_id))
             .unwrap_or_default();
         let occurred_at = chrono::Local::now().to_rfc3339();
+        let need_note = matched.iter().any(|c| c.include_note);
+        let content = if need_note {
+            contents
+                .entry(f.note_id.clone())
+                .or_insert_with(|| {
+                    let c = note_content(app, &f.note_id);
+                    if c.is_none() {
+                        eprintln!("hooks: 笔记内容构建失败({}),照常触发但不附带", f.note_id);
+                    }
+                    c
+                })
+                .as_ref()
+        } else {
+            None
+        };
         for cfg in matched {
+            let note = if cfg.include_note { content } else { None };
             let r = match cfg.kind.as_str() {
-                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at, None), WEBHOOK_LIMIT)
+                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at, note), WEBHOOK_LIMIT)
                     .map(|s| format!("HTTP {s}")),
                 // 非 0 退出码算失败,与 test_run 语义一致——否则"完成"日志会把真实的
                 // 命令失败盖过去,排查通道形同虚设。
-                _ => match run_shell(&cfg.command, &shell_envs(event, &f.note_id, &title), SHELL_LIMIT) {
-                    Ok(0) => Ok("退出码 0".into()),
-                    Ok(c) => Err(format!("退出码 {c}")),
-                    Err(e) => Err(e),
-                },
+                _ => {
+                    let mut envs = shell_envs(event, &f.note_id, &title);
+                    if let Some(c) = note {
+                        envs.extend(note_envs(c));
+                    }
+                    match run_shell(&cfg.command, &envs, SHELL_LIMIT) {
+                        Ok(0) => Ok("退出码 0".into()),
+                        Ok(c) => Err(format!("退出码 {c}")),
+                        Err(e) => Err(e),
+                    }
+                }
             };
             match r {
                 Ok(msg) => eprintln!("hooks: '{}' [{}] 完成({msg})", cfg.name, event),
@@ -261,14 +328,29 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
 pub fn test_run(cfg: &HookCfg) -> Result<String, String> {
     let event = if cfg.event.is_empty() { "recording_stopped" } else { cfg.event.as_str() };
     let occurred_at = chrono::Local::now().to_rfc3339();
+    // 假内容:测试不读库,注入固定占位——用户看得出变量有值即可。
+    let fake = cfg.include_note.then(|| NoteContent {
+        started_at: "2026-07-14T10:00:00+08:00".into(),
+        ended_at: "2026-07-14T11:00:00+08:00".into(),
+        duration_secs: 3600,
+        speakers: vec!["测试说话人".into()],
+        text: "测试正文".into(),
+        truncated: false,
+    });
     match cfg.kind.as_str() {
-        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at, None), WEBHOOK_LIMIT)
+        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at, fake.as_ref()), WEBHOOK_LIMIT)
             .map(|s| format!("HTTP {s}")),
-        _ => match run_shell(&cfg.command, &shell_envs(event, "note-test", "测试笔记"), Duration::from_secs(10)) {
-            Ok(0) => Ok("退出码 0".into()),
-            Ok(c) => Err(format!("退出码 {c}")),
-            Err(e) => Err(e),
-        },
+        _ => {
+            let mut envs = shell_envs(event, "note-test", "测试笔记");
+            if let Some(c) = &fake {
+                envs.extend(note_envs(c));
+            }
+            match run_shell(&cfg.command, &envs, Duration::from_secs(10)) {
+                Ok(0) => Ok("退出码 0".into()),
+                Ok(c) => Err(format!("退出码 {c}")),
+                Err(e) => Err(e),
+            }
+        }
     }
 }
 
@@ -569,5 +651,62 @@ mod tests {
         let p0 = payload("refine_finished", "n1", "周会", "2026-07-14T11:00:01+08:00", None);
         assert!(p0.get("note").is_none());
         assert_eq!(p0["event"], "refine_finished");
+    }
+
+    fn write_note_fixture(notes_dir: &std::path::Path, id: &str) {
+        let dir = notes_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"schema_version":1,"id":"n1","title":"占位标题","started_at":"2026-07-14T10:00:00+08:00","ended_at":"2026-07-14T11:00:00+08:00","state":"complete"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            r#"{"seq":1,"source":"mic","text":"占位甲","start_ms":0,"end_ms":2000,"speaker":"S1"}
+{"seq":2,"source":"mic","text":"占位乙","start_ms":2000,"end_ms":5000,"speaker":"S2"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("speakers.json"),
+            r#"{"S1":{"name":"张三","sources":["mic"]},"S2":{"name":"","sources":["mic"]}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn note_content_raw_fallback_and_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_note_fixture(tmp.path(), "n1");
+        let c = note_content_from_dirs(tmp.path(), None, "n1").unwrap();
+        assert_eq!(c.started_at, "2026-07-14T10:00:00+08:00");
+        assert_eq!(c.ended_at, "2026-07-14T11:00:00+08:00");
+        assert_eq!(c.duration_secs, 5, "时长=段落最大 end_ms(5000)/1000");
+        assert_eq!(c.speakers, vec!["张三".to_string(), "说话人 2".to_string()]);
+        assert!(c.text.contains("占位甲"), "无精修稿回落原始稿渲染");
+        assert!(!c.truncated);
+    }
+
+    #[test]
+    fn note_content_prefers_refined() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_note_fixture(tmp.path(), "n1");
+        // 字段形状以 store/refined.rs 的 RefinedDoc/RefinedParagraph 为准:
+        // generated_at 无 serde default 必须给,段落显示名字段是 name 不是 label。
+        std::fs::write(
+            tmp.path().join("n1").join("refined.json"),
+            r#"{"schema_version":1,"generated_at":"2026-07-14T11:00:00+08:00","stages":{"filter":"done","recluster":"done","llm":"done"},"paragraphs":[{"speaker":"R1","name":"张三","start_ms":0,"end_ms":5000,"text":"精修占位正文","source_seqs":[1,2]}]}"#,
+        )
+        .unwrap();
+        let c = note_content_from_dirs(tmp.path(), None, "n1").unwrap();
+        assert!(c.text.contains("精修占位正文"), "精修稿在盘时优先");
+        assert!(!c.text.contains("占位甲"), "不再是原始稿");
+    }
+
+    #[test]
+    fn note_content_missing_note_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(note_content_from_dirs(tmp.path(), None, "nope").is_none());
     }
 }

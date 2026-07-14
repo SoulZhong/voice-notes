@@ -129,7 +129,7 @@ impl Default for AppState {
 /// 数据根目录：app_data_dir 读 settings.json（自举指针，永远在 app_data_dir，不随
 /// data_dir 漂移）→ resolve_data_root 得到用户配置的落盘根，未配置则回落 app_data_dir。
 /// 笔记/声纹等所有内容都挂这个根；settings 读写命令仍走 app_data_dir。
-fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
+pub(crate) fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let app_data = app
         .path()
         .app_data_dir()
