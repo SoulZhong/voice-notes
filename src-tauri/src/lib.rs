@@ -719,9 +719,15 @@ fn spawn_session(
             && sources.iter().any(|(s, _, _)| *s == Source::Mic)
             && sources.iter().any(|(s, _, _)| *s == Source::System)
         {
-            match audio::aec::new_pair(16000) {
-                Ok((render, capture)) => {
-                    eprintln!("软件回声消除已启用(WebRTC AEC3 + AGC2 自适应增益): system 路为参考,mic 路消回声+自动增益");
+            // 二期:实时预对齐——蓝牙外放延迟(实测可漂至 1200ms)远超 AEC3 内置
+            // 估计范围,由 AlignState 滑窗实测扣压参考;初值按当前输出设备给,
+            // 之后实测接管。探测失败按非蓝牙(0ms),等同现状。
+            let initial_predelay_ms = if audio::default_output_is_bluetooth() { 450 } else { 0 };
+            match audio::aec::new_aligned_pair(16000, initial_predelay_ms) {
+                Ok((render, capture, _align)) => {
+                    eprintln!(
+                        "软件回声消除已启用(WebRTC AEC3 + AGC2 + NS + 实时预对齐 初值{initial_predelay_ms}ms): system 路为参考,mic 路消回声"
+                    );
                     aec_roles.push((Source::System, audio::aec::AecRole::Render(render)));
                     aec_roles.push((Source::Mic, audio::aec::AecRole::Capture(capture)));
                 }
