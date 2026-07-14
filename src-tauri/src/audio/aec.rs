@@ -317,6 +317,13 @@ mod tests {
     /// 二期端到端判别测试:600ms 回声(蓝牙量级,远超 AEC3 内置 ~250ms 估计范围),
     /// aligned pair 从预延迟 0 起步,应在滑窗重估+预对齐后把回声消下去。
     /// 这正是 new_pair 做不到的场景(一期背景:蓝牙外放软件消回声完全失效)。
+    ///
+    /// 与一期"单抽头冻结"实锤的关系(echo_clean.rs 同名注释):那次冻结在离线
+    /// 双 pass 重喂+无 AGC 构型下复现,探针集未含 AGC2;本测试为单次流式+AGC2,
+    /// 单抽头实测未冻结(尾段 ~78dB 衰减),机理未定论(AGC2 持续增益扰动或
+    /// 单次流式无重喂,皆为候选解释)。刻意保留单抽头:若未来配置变更让冻结在
+    /// 此构型复现,本断言当场红——这正是要的哨兵行为,届时按一期方法换 4 抽头
+    /// 并记录构型差异。
     #[test]
     fn aligned_pair_cancels_600ms_echo_after_adjustment() {
         use crate::audio::delay_estimate::tests::block_modulated_noise;
