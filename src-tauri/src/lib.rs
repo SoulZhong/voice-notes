@@ -17,6 +17,7 @@ mod refine;
 pub mod mcp;
 mod telemetry;
 mod lifecycle;
+mod hooks_external;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
