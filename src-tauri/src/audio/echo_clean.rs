@@ -82,7 +82,8 @@ pub fn clean_wav(
         return Ok(None);
     }
 
-    // 相邻置信窗延迟差 ≤MERGE_MS 归并为段;每段延迟取窗中位数。
+    // 相邻置信窗延迟差 ≤MERGE_MS 归并为段;每段延迟取该段首个置信窗的值
+    // (MERGE_MS 保证段内窗间差≤40ms)。
     // 无置信度的窗并入前一段(没检测到回声的窗,照常处理无害)。
     let mut segments: Vec<(usize, u32)> = Vec::new(); // (起始窗序号, delay_ms)
     for (i, e) in &confident {
@@ -116,6 +117,14 @@ pub fn clean_wav(
             render.push(&rframe);
             let _ = capture.process(&mic[t0..t1]);
         }
+        // 暖机残帧冲洗:暖机段非 160 倍数时,capture/render 内部滞留 <10ms 残样,
+        // 不冲掉会混进正式 pass 的首帧并使输出越出段界(守恒破坏,审查实锤)。
+        let warm_rem = (warm_end - seg_start) % 160;
+        if warm_rem != 0 {
+            let pad = vec![0.0f32; 160 - warm_rem];
+            render.push(&pad);
+            let _ = capture.process(&pad);
+        }
         // 正式:整段重喂,取输出。
         for t0 in (seg_start..seg_end).step_by(160) {
             let t1 = (t0 + 160).min(seg_end);
@@ -123,6 +132,8 @@ pub fn clean_wav(
             render.push(&rframe);
             cleaned.extend_from_slice(&capture.process(&mic[t0..t1]));
         }
+        // 守恒是硬不变式:任何越出段界的输出一律裁回,再按原样补齐不足。
+        cleaned.truncate(seg_end);
         // capture 内部滞留的 <10ms 余量:原样补足,样本数守恒。
         while cleaned.len() < seg_end {
             cleaned.push(mic[cleaned.len()]);
@@ -258,6 +269,31 @@ mod tests {
         let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out).unwrap();
         assert!(r.is_none(), "无关轨道应跳过");
         assert!(!out.exists(), "跳过时不得写输出");
+    }
+
+    /// 末段短于暖机(warm_end==seg_end)且长度非 160 倍数:暖机残帧不得泄漏,
+    /// 输出样本数必须与输入严格相等(审查发现的守恒破坏布局)。
+    #[test]
+    fn short_tail_segment_conserves_sample_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s1 = 33u64;
+        let n = 16_000 * 8 + 90; // 8s+90样本:短于 10s 暖机,且 n % 160 == 90
+        let system = block_modulated_noise(n, &mut s1);
+        let delay = 3200; // 200ms
+        let mut mic = vec![0.0f32; n];
+        for i in delay..n {
+            mic[i] = system[i - delay] * 0.5; // 只断言守恒,不断言消除量,单 tap 足够
+        }
+        let mic_wav = dir.path().join("mic.wav");
+        let sys_wav = dir.path().join("system.wav");
+        let out = dir.path().join("mic.clean.tmp");
+        write_wav(&mic_wav, &mic);
+        write_wav(&sys_wav, &system);
+        let report = clean_wav(&mic_wav, &sys_wav, 0, 0, &out).unwrap();
+        let report = report.expect("短录音纯回声应过双门限");
+        assert_eq!(report.segments, 1);
+        let cleaned = read_wav_f32(&out);
+        assert_eq!(cleaned.len(), mic.len(), "暖机残帧不得改变样本总数");
     }
 
     /// 轨道太短(<3s):直接跳过,不 panic。
