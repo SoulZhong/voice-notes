@@ -89,7 +89,10 @@ mic 采集 → AecCapture.process（消回声，链路加开 NS）
 - 预延迟环形缓冲插在 system 采集与 `AecRender.push` 之间，初值由现有
   `default_output_is_bluetooth()` 探测给：蓝牙 ≈450ms，其他 0。
 - 后台估计 worker：每 5s 对最近 20s 包络跑同一估计器；panic 隔离
-  （catch_unwind，与 HookBus 同哲学）。
+  （catch_unwind，与 HookBus 同哲学）。**（落地对账：估计计算实测亚毫秒级，
+  内联在 render 线程 5s 一触发，独立 worker 与隔离层整体取消；调整条件升级
+  为一期标定的双门限并直接引用其导出常量；NS 取 Moderate——实时流同时供
+  ASR/声纹。详见二期计划「三处预定偏差」节。）**
 - 调整策略：仅当置信度过门限 且 与当前预延迟差 >80ms 时调整；调整点
   对参考流做丢弃/补零，AEC3 随后重收敛（几百 ms，期间残余回声由现有
   文本去重兜底）。低置信度永不动时间轴——行为等同现状。

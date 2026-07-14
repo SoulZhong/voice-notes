@@ -23,10 +23,11 @@ const MAX_DELAY_MS: u32 = 1200;
 const HEADROOM_MS: u32 = 100;
 /// 滞回带:与现值差超过才调整(调整触发 AEC3 重收敛,不能抖)。
 const HYSTERESIS_MS: u32 = 80;
-/// 双门限与一期离线清洗同源(echo_clean 真实录音标定):conf 保证峰唯一,
-/// peak 保证回声真实存在。20s 窗与标定的 60s 窗分布同域,沿用定值。
-const CONFIDENCE_GATE: f32 = 2.0;
-const PEAK_GATE: f32 = 0.30;
+/// 双门限直接引用一期离线清洗的导出常量(echo_clean 真实录音标定,依据见
+/// 该处注释)——单一定义点,将来重标定只改一处,实时/离线永不漂移。
+/// 20s 实时窗与标定的 60s 窗分布同域假设未实测(冒烟见 peak 0.301 贴 0.30
+/// 门限通过,余量薄);失败方向安全:漏检只退化为不调整=现状。
+use crate::audio::echo_clean::{CONFIDENCE_GATE, PEAK_GATE};
 /// 包络滑窗容量(30s,留窗外余量)与环形缓冲硬上限(防病态预延迟吃内存)。
 const ENV_CAP: usize = 3000;
 const RING_CAP: usize = (MAX_DELAY_MS as usize) * 2 * 16;
@@ -56,9 +57,13 @@ impl Inner {
 }
 
 pub fn new(initial_predelay_ms: u32) -> Arc<AlignState> {
+    // 钳到搜索上限:预延迟超过 RING_CAP 会让 take 恒为 0、render 输出永久饿死
+    // (静默禁用回声消除)。正常路径(初值 450/估计上限 1100)远够不着,钳制只防
+    // 越界入参这一潜在脚枪(终审跟进)。
+    let clamped = initial_predelay_ms.min(MAX_DELAY_MS);
     Arc::new(AlignState {
         inner: Mutex::new(Inner {
-            predelay: (initial_predelay_ms as usize) * 16,
+            predelay: (clamped as usize) * 16,
             ring: VecDeque::new(),
             ref_env: VecDeque::new(),
             ref_carry: Vec::new(),
