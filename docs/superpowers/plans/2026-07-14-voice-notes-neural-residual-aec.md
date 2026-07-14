@@ -4,9 +4,9 @@
 
 **Goal:** 离线清洗在 AEC3 线性消除后追加 DTLN-aec 神经残余级，把 mic 轨残余互相关从 ~0.13/0.29 压到 ≤0.15（spike 实测 0.116），本人声音无损（spike -0.01dB）。
 
-**Architecture:** 新纯模块 `audio/neural_aec.rs`（tract-tflite 双阶段推理 + 官方块算法移植）+ 模型注册表两条目 + `echo_clean` 的 `Ok(Some)` 路径追加一级 + `CleanInfo.neural` 观测。任何失败保留 AEC3 输出照常落盘。
+**Architecture:** 新纯模块 `audio/neural_aec.rs`（tract-onnx 双阶段推理 + 官方块算法移植）+ 模型注册表两条目 + `echo_clean` 的 `Ok(Some)` 路径追加一级 + `CleanInfo.neural` 观测。任何失败保留 AEC3 输出照常落盘。
 
-**Tech Stack:** Rust;新依赖 `tract-tflite`(纯 Rust,T1 可行性硬闸,失败切 `tflitec`)与 `realfft`(纯 Rust FFT);DTLN-aec 官方 256 档 TF-Lite 模型(MIT 含权重)。
+**Tech Stack:** Rust;新依赖 `tract-onnx = "0.21"`(纯 Rust)与 `realfft = "3"`;DTLN-aec 256 档模型的 ONNX 转换工件(MIT,挂本仓 release,详见 Global Constraints)。
 
 **规格:** `docs/superpowers/specs/2026-07-14-voice-notes-neural-residual-aec-design.md`
 **分支:** `soft-aec-p3b`(叠栈于 soft-aec-p2;#41/#43 合入后改基)
@@ -52,8 +52,8 @@ num_blocks = (padded_len - 384) / 128
 
 | 文件 | 职责 |
 |---|---|
-| Create `src-tauri/src/audio/neural_aec.rs` | tract-tflite 加载/双阶段块推理/suppress_residual 纯入口 |
-| Modify `src-tauri/Cargo.toml` | 增 tract-tflite、realfft |
+| Create `src-tauri/src/audio/neural_aec.rs` | tract-onnx 加载/双阶段块推理/suppress_residual 纯入口 |
+| Modify `src-tauri/Cargo.toml` | 增 tract-onnx、realfft |
 | Modify `src-tauri/src/models/mod.rs` | 注册表增 dtln_aec_256 两工件 |
 | Modify `src-tauri/src/audio/echo_clean.rs` | Ok(Some) 路径追加神经级+前后 NCC 日志 |
 | Modify `src-tauri/src/store/audio.rs` | CleanInfo 增 `neural: Option<bool>` |
@@ -78,7 +78,7 @@ num_blocks = (padded_len - 384) / 128
 mod tests {
     use super::*;
 
-    /// 可行性硬闸:tract-tflite 能加载官方双模型并对全零输入出数。
+    /// 可行性硬闸:tract-onnx 能加载转换后双模型并对全零输入出数。
     /// 运行: VN_DTLN_DIR=<模型目录> cargo test neural_aec -- --ignored --nocapture
     #[test]
     #[ignore]
