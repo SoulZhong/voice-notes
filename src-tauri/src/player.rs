@@ -261,9 +261,17 @@ pub async fn player_load(
         Some(dir) => {
             let seg_path = dir.join("segments.jsonl");
             let segs = crate::player_gate::parse_segments_jsonl(&seg_path);
-            if segs.is_empty() { Vec::new() } else { crate::player_gate::build_gate(&segs) }
+            if segs.is_empty() {
+                eprintln!("回放门控: segments 缺失或为空,本次回放不做门控");
+                Vec::new()
+            } else {
+                crate::player_gate::build_gate(&segs)
+            }
         }
-        None => Vec::new(),
+        None => {
+            eprintln!("回放门控: 无法定位笔记目录,本次回放不做门控");
+            Vec::new()
+        }
     };
     if !gate_spans.is_empty() {
         eprintln!("回放门控: {} 个压低区间(mic 轨,-15dB,双讲保护)", gate_spans.len());
