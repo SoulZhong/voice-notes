@@ -194,6 +194,36 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    // DTLN-aec 256 档：增值层神经残余回声消除。两个裸 onnx 工件（非压缩包），
+    // 各自独立 URL/哈希，形状照抄 vad/speaker 的单文件 Artifact（File kind 一 url 一 file，
+    // TarBz2 不适用——非压缩包）。not required_for_recording：模型不在场时清洗管线
+    // 回落 AEC3-only（见 Task 4），因此不进 required_now。
+    Artifact {
+        id: "dtln_aec_256_1",
+        label: "神经回声消除（DTLN-aec）· 掩码模型",
+        url: "https://github.com/SoulZhong/voice-notes/releases/download/models-dtln-aec-v1/dtln_aec_256_1.onnx",
+        kind: ArtifactKind::File,
+        approx_mb: 6,
+        prune: &[],
+        files: &[FinalFile {
+            rel_path: "dtln_aec_256_1.onnx",
+            bytes: 5_551_837,
+            sha256: "61250b397616146e79371b58b34da068ce0adb09f43edfac5421f4faf6990917",
+        }],
+    },
+    Artifact {
+        id: "dtln_aec_256_2",
+        label: "神经回声消除（DTLN-aec）· 合成模型",
+        url: "https://github.com/SoulZhong/voice-notes/releases/download/models-dtln-aec-v1/dtln_aec_256_2.onnx",
+        kind: ArtifactKind::File,
+        approx_mb: 10,
+        prune: &[],
+        files: &[FinalFile {
+            rel_path: "dtln_aec_256_2.onnx",
+            bytes: 10_007_544,
+            sha256: "b79a9efca5b7e33e6bbd088acc60fc946250b23e104b103c47a24783a0c0b13a",
+        }],
+    },
 ];
 
 /// 某工件在当前 ASR 选型下是否为「录制必需」。取代了静态 required_for_recording 字段：
@@ -294,15 +324,33 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_six_artifacts_with_whisper_and_paraformer() {
+    fn manifest_covers_eight_artifacts_with_whisper_paraformer_and_dtln_aec() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec!["vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer"]);
+        assert_eq!(
+            ids,
+            vec![
+                "vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer",
+                "dtln_aec_256_1", "dtln_aec_256_2",
+            ]
+        );
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
         assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
         assert_eq!(w.files.len(), 3);
         assert!(!w.prune.is_empty(), "fp32 与测试音频装好即删");
         for a in ARTIFACTS {
             for f in a.files { assert_eq!(f.sha256.len(), 64); }
+        }
+    }
+
+    #[test]
+    fn dtln_aec_artifacts_are_bare_onnx_files_not_required_for_recording() {
+        for id in ["dtln_aec_256_1", "dtln_aec_256_2"] {
+            let a = ARTIFACTS.iter().find(|a| a.id == id).unwrap_or_else(|| panic!("{id} 工件已注册"));
+            assert!(matches!(a.kind, ArtifactKind::File), "裸 onnx，非压缩包");
+            assert_eq!(a.files.len(), 1);
+            assert!(!required_now(id, crate::settings::ASR_SENSE_VOICE), "增值层，非录制必需");
+            assert!(!required_now(id, crate::settings::ASR_WHISPER));
+            assert!(!required_now(id, crate::settings::ASR_PARAFORMER));
         }
     }
 
