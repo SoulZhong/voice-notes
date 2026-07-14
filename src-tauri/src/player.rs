@@ -56,6 +56,8 @@ struct Track {
     len_samples: u64,
     muted: AtomicBool,
     source: String,
+    /// 回放压低区间(player_gate 构建;system/无段数据轨为空表=行为同现状)。
+    gate: Vec<crate::player_gate::GateSpan>,
 }
 
 impl Track {
@@ -109,7 +111,12 @@ fn mix_frames(core: &Core, out: &mut [f32], channels: usize, step: f64) -> f64 {
                     let a = t.sample(idx);
                     // 末采样右邻越界时取自身(等价 clamp),不读 0 免得尾部半帧塌陷。
                     let b = if idx + 1 < t.len_samples { t.sample(idx + 1) } else { a };
-                    acc += a + (b - a) * frac;
+                    let g = if t.gate.is_empty() {
+                        1.0
+                    } else {
+                        crate::player_gate::gain_at(&t.gate, cursor as u64)
+                    };
+                    acc += (a + (b - a) * frac) * g;
                 }
             }
             cursor += step;
@@ -215,9 +222,15 @@ pub async fn player_load(
     stop_stream(&state);
 
     // 路径校验 + m4a 解码规划(阻塞段全部挪到 spawn_blocking)。
+    // note_dir:取首条轨校验后路径的父目录(m4a 会被换成缓存路径,故须在换之前取,
+    // 各轨同属一个笔记,取一次即可)——segments.jsonl 与音轨文件同目录。
+    let mut note_dir: Option<PathBuf> = None;
     let mut plan: Vec<(PathBuf, u64, String)> = Vec::new();
     for t in &tracks {
         let src = validate_under_notes(&app, Path::new(&t.path))?;
+        if note_dir.is_none() {
+            note_dir = src.parent().map(|p| p.to_path_buf());
+        }
         let wav = if src.extension().and_then(|e| e.to_str()) == Some("m4a") {
             let cache = cache_path_for(&app, &src).map_err(|e| e.to_string())?;
             let fresh = match (std::fs::metadata(&cache), std::fs::metadata(&src)) {
@@ -243,6 +256,19 @@ pub async fn player_load(
         plan.push((wav, t.offset_ms, t.source.clone()));
     }
 
+    // 回放门控:按转写段活跃度构建 mic 轨压低区间(任何失败空表降级=现状)。
+    let gate_spans = match &note_dir {
+        Some(dir) => {
+            let seg_path = dir.join("segments.jsonl");
+            let segs = crate::player_gate::parse_segments_jsonl(&seg_path);
+            if segs.is_empty() { Vec::new() } else { crate::player_gate::build_gate(&segs) }
+        }
+        None => Vec::new(),
+    };
+    if !gate_spans.is_empty() {
+        eprintln!("回放门控: {} 个压低区间(mic 轨,-15dB,双讲保护)", gate_spans.len());
+    }
+
     // mmap 装载 + Core 组装。
     let mut loaded = Vec::new();
     for (wav, offset_ms, source) in plan {
@@ -264,6 +290,7 @@ pub async fn player_load(
             offset_samples: offset_ms * SRC_RATE as u64 / 1000,
             len_samples: (len - HEADER_LEN) / 2,
             muted: AtomicBool::new(false),
+            gate: if source == "mic" { gate_spans.clone() } else { Vec::new() },
             source,
         });
     }
@@ -414,6 +441,7 @@ mod tests {
             len_samples: samples.len() as u64,
             muted: AtomicBool::new(false),
             source: source.into(),
+            gate: Vec::new(),
         }
     }
 
@@ -499,5 +527,40 @@ mod tests {
         let mut out = vec![0f32; 1];
         mix_frames(&core, &mut out, 1, 1.0);
         assert!((out[0] - 30000.0 / 32768.0).abs() < 1e-3, "从 seek 点取样: {}", out[0]);
+    }
+
+    /// 门控混音:mic 轨在压低区间内乘 DUCK_GAIN,区间外全量;system 轨(空表)不受影响。
+    #[test]
+    fn gated_mic_is_ducked_in_span_and_full_outside() {
+        use crate::player_gate::{GateSpan, DUCK_GAIN};
+        // mic 全程常值 8000;区间 [16000,48000) 压低(带 1280 渐变沿)。
+        let mut mic = mem_track(&vec![8000i16; 64_000], 0, "mic");
+        mic.gate = vec![GateSpan { start: 16_000, end: 48_000 }];
+        let core = core_of(vec![mic]);
+        let mut out = vec![0f32; 2]; // 单帧双声道,逐点采样
+        let probe = |core: &Core, at: u64, out: &mut Vec<f32>| -> f32 {
+            core.set_cursor(at as f64);
+            mix_frames(core, out, 2, 1.0);
+            out[0]
+        };
+        let full = 8000f32 / 32768.0;
+        assert!((probe(&core, 1000, &mut out) - full).abs() < 1e-4, "区间外全量");
+        let ducked = probe(&core, 30_000, &mut out);
+        assert!((ducked - full * DUCK_GAIN).abs() < 1e-3, "腹地=DUCK: {ducked}");
+        let edge = probe(&core, 16_000 + 640, &mut out);
+        assert!(edge > ducked && edge < full, "渐变沿介于两者之间: {edge}");
+    }
+
+    /// 空 gate 表 = 现状:与未加门控的输出逐采样一致(既有测试的行为锚)。
+    #[test]
+    fn empty_gate_is_identity() {
+        let a = mem_track(&[1000, 2000, 3000], 0, "mic");
+        let core = core_of(vec![a]);
+        let mut out = vec![0f32; 6];
+        mix_frames(&core, &mut out, 2, 1.0);
+        let expect = [1000f32, 1000., 2000., 2000., 3000., 3000.].map(|v| v / 32768.0);
+        for (o, e) in out.iter().zip(expect) {
+            assert!((o - e).abs() < 1e-6, "空表必须逐采样等于现状");
+        }
     }
 }
