@@ -23,8 +23,13 @@
 
 ## 用户决策（约束）
 
-- 推理路线：**tract-tflite 纯 Rust 优先**（零原生构建依赖），可行性硬闸失败
-  则自动切 tflitec（官方 TFLite C）兜底——两条路线都入实施计划，切换即偏差记录。
+- 推理路线：~~tract-tflite 优先、tflitec 兜底~~ **两条原路线经可行性硬闸实测
+  双双失败**（tract 的 tflite 导入器 ReduceMean 负轴越界 panic,最新版未修;
+  tflitec 无预编译库需 bazel 从源码编 TF,不适合桌面依赖）。**改走第三路线并已
+  spike 验证到底（用户批准）**：tflite→ONNX 离线转换一次（tf2onnx 1.17.0/
+  opset 13,数值最大差 ~1e-6）+ **tract-onnx 纯 Rust**（0.21,rustc 1.89 兼容,
+  双模型加载运行实证）。转换后工件挂本仓 release `models-dtln-aec-v1`,注册表
+  指向之,release 说明含来源/转换方式/哈希/MIT 许可。
 - 零用户配置：模型在场即启用，不在场静默跳过；无设置项。
 
 ## 架构
