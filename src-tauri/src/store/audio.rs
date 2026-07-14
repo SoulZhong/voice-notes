@@ -326,7 +326,9 @@ impl AudioTrackWriter {
                     // 并立即回写补全,让重建只发生一次。
                     let est = self.base_ms.saturating_sub(bytes_to_ms(existing_data));
                     meta.schema_version = 1;
-                    meta.tracks.insert(self.source.clone(), TrackMeta { offset_ms: est, ..Default::default() });
+                    // 只改 offset、保留其它字段(soft_aec 等先于建档写入):
+                    // 整条替换会把建档之前已写入的标记一并抹掉。
+                    meta.tracks.entry(self.source.clone()).or_default().offset_ms = est;
                     save_audio_meta(&self.note_dir, &meta)?;
                     est
                 }
@@ -357,7 +359,9 @@ impl AudioTrackWriter {
             let mut f = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
             f.write_all(&wav_header(0))?;
             meta.schema_version = 1;
-            meta.tracks.insert(self.source.clone(), TrackMeta { offset_ms: self.base_ms, ..Default::default() });
+            // 只改 offset、保留其它字段(soft_aec 等先于建档写入):
+            // 整条替换会把建档之前已写入的标记一并抹掉。
+            meta.tracks.entry(self.source.clone()).or_default().offset_ms = self.base_ms;
             save_audio_meta(&self.note_dir, &meta)?;
             Ok((f, path, 0))
         }
@@ -793,6 +797,21 @@ mod tests {
         let meta = load_audio_meta(dir.path());
         let c = meta.tracks["mic"].clean.as_ref().unwrap();
         assert_eq!((c.delay_ms, c.segments), (600, 1));
+    }
+
+    /// 冒烟实锤回归:soft_aec 标记先于轨道建档写入,建档(open)不得整条替换抹掉它。
+    #[test]
+    fn track_open_preserves_prior_soft_aec_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_soft_aec(dir.path(), "mic").unwrap();
+
+        let mut w = AudioTrackWriter::new(dir.path(), "mic", 0);
+        w.append(&vec![0.1f32; 160]); // 触发首次 open 建档
+        drop(w);
+
+        let meta = load_audio_meta(dir.path());
+        assert_eq!(meta.tracks["mic"].soft_aec, Some(true), "建档不得抹掉先写入的 soft_aec 标记");
+        assert_eq!(meta.tracks["mic"].offset_ms, 0);
     }
 
     /// 旧 audio.json(无新字段)必须照常反序列化——新字段全 default。
