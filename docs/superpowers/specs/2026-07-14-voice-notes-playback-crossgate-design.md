@@ -29,7 +29,7 @@ source/start_ms/end_ms），比信号包络检测更准。
 ```
 player load(note_id)
   → 读 segments.jsonl(复用既有解析:空白段过滤+start_ms 排序)
-  → player_gate::build_gate(&segments, total_ms) -> Vec<GateSpan>   ← 纯函数
+  → player_gate::build_gate(&segments) -> Vec<GateSpan>   ← 纯函数
   → spans 挂在 mic 轨的 Track 上(system 轨恒空表)
 mix_frames(逐采样)
   → mic 采样 × player_gate::gain_at(spans, cursor_sample)
@@ -40,7 +40,7 @@ mix_frames(逐采样)
 
 - `pub struct GateSpan { pub start: u64, pub end: u64 }` — 16k 源域采样数，
   表示「压低区间」。
-- `pub fn build_gate(segments: &[(String, u64, u64)], total_ms: u64) -> Vec<GateSpan>`
+- `pub fn build_gate(segments: &[(String, u64, u64)]) -> Vec<GateSpan>`
   输入 (source, start_ms, end_ms) 列表：
   1. 收集 system 段区间并集；
   2. 减去 mic 段区间并集（重叠即双讲，剔除）；
