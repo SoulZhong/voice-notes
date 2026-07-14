@@ -99,12 +99,18 @@ fn read_wav_f32(path: &Path) -> anyhow::Result<Vec<f32>> {
 
 /// 清洗主入口。Ok(None)=置信度不足或轨道过短,未写 out_tmp;
 /// Ok(Some)=out_tmp 已写好完整合法 WAV,调用方负责 rename。
+///
+/// `models_dir`:神经残余级模型工件所在目录(调用方传 `models::root()`)。参数化而非
+/// 内部直接调 `models::root()`,是为了让测试能传空 tempdir、与全局模型目录状态解耦——
+/// 全局目录一旦被真实模型工件占用(如 Task 5 验收拷入 dtln 权重),内部直接读全局的写法
+/// 会让本该纯合成的单测意外切换成真推理、且断言 `!neural` 永久翻红(教训见开发记录)。
 pub fn clean_wav(
     mic_wav: &Path,
     system_wav: &Path,
     mic_offset_ms: u64,
     system_offset_ms: u64,
     out_tmp: &Path,
+    models_dir: &Path,
 ) -> anyhow::Result<Option<CleanReport>> {
     let mic = read_wav_f32(mic_wav)?;
     let system = read_wav_f32(system_wav)?;
@@ -197,9 +203,8 @@ pub fn clean_wav(
 
     // 神经残余级(增值层):模型在场才跑;失败保留 AEC3 输出,永不 panic、不阻塞转码。
     let mut neural = false;
-    let dtln_dir = crate::models::root();
-    if dtln_dir.join("dtln_aec_256_1.onnx").exists() {
-        match crate::audio::neural_aec::suppress_residual(&cleaned, &system_aligned, &dtln_dir) {
+    if models_dir.join("dtln_aec_256_1.onnx").exists() {
+        match crate::audio::neural_aec::suppress_residual(&cleaned, &system_aligned, models_dir) {
             Ok(out) => {
                 let before = residual_peak(&system_aligned, &cleaned);
                 let after = residual_peak(&system_aligned, &out);
@@ -307,7 +312,10 @@ mod tests {
         write_wav(&mic_wav, &mic);
         write_wav(&sys_wav, &system);
 
-        let report = clean_wav(&mic_wav, &sys_wav, 0, 0, &out).unwrap().expect("应过置信度门限");
+        // models_dir 传本测试自己的空 tempdir(与 mic/system 同目录,天然无 dtln 工件):
+        // 神经级判定与全局 models::root() 解耦,不受其它测试/T5 真机验收拷模型影响。
+        let report =
+            clean_wav(&mic_wav, &sys_wav, 0, 0, &out, dir.path()).unwrap().expect("应过置信度门限");
         assert!((report.delay_ms as i64 - 600).unsigned_abs() <= 20, "报告延迟 {}ms", report.delay_ms);
 
         let cleaned = read_wav_f32(&out);
@@ -335,7 +343,8 @@ mod tests {
         let loc_out = power(&cleaned[16_000 * 35..16_000 * 55]);
         assert!(loc_out > loc_in / 8.0 && loc_out < loc_in * 8.0,
             "本地声应保持 ±9dB: {loc_in:.6} -> {loc_out:.6}");
-        // 测试环境 models::root() 无 dtln_aec_256_1.onnx,神经级天然走跳过路径。
+        // models_dir 是本测试专属空 tempdir,无 dtln_aec_256_1.onnx,神经级判定确定性跳过
+        // (不再依赖全局 models::root() 是否被其它验收流程放了真模型)。
         assert!(!report.neural, "无模型时神经级不应标记");
     }
 
@@ -348,7 +357,8 @@ mod tests {
         write_wav(&dir.path().join("mic.wav"), &block_modulated_noise(16_000 * 60, &mut s1));
         write_wav(&dir.path().join("system.wav"), &block_modulated_noise(16_000 * 60, &mut s2));
         let out = dir.path().join("mic.clean.tmp");
-        let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out).unwrap();
+        let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out, dir.path())
+            .unwrap();
         assert!(r.is_none(), "无关轨道应跳过");
         assert!(!out.exists(), "跳过时不得写输出");
     }
@@ -371,7 +381,7 @@ mod tests {
         let out = dir.path().join("mic.clean.tmp");
         write_wav(&mic_wav, &mic);
         write_wav(&sys_wav, &system);
-        let report = clean_wav(&mic_wav, &sys_wav, 0, 0, &out).unwrap();
+        let report = clean_wav(&mic_wav, &sys_wav, 0, 0, &out, dir.path()).unwrap();
         let report = report.expect("短录音纯回声应过双门限");
         assert_eq!(report.segments, 1);
         let cleaned = read_wav_f32(&out);
@@ -386,7 +396,8 @@ mod tests {
         write_wav(&dir.path().join("mic.wav"), &block_modulated_noise(16_000, &mut s));
         write_wav(&dir.path().join("system.wav"), &block_modulated_noise(16_000, &mut s));
         let out = dir.path().join("mic.clean.tmp");
-        let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out).unwrap();
+        let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out, dir.path())
+            .unwrap();
         assert!(r.is_none());
     }
 }
@@ -447,7 +458,8 @@ mod calibrate {
             .unwrap_or_else(|_| std::env::temp_dir().join("voice-notes-calibrate"));
         std::fs::create_dir_all(&scratch).unwrap();
         eprintln!("输出目录: {}", scratch.display());
-        match clean_wav(&mic, &sys, 0, 0, &out).unwrap() {
+        // 手动标定用真实全局模型目录:模型在场则神经级也一并跑,便于试听对比。
+        match clean_wav(&mic, &sys, 0, 0, &out, &crate::models::root()).unwrap() {
             Some(r) => {
                 eprintln!("清洗完成: {r:?}");
                 // 试听文件拷到输出目录(tmp 目录测试结束即删),按笔记目录名归档。
