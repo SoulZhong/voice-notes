@@ -1,5 +1,5 @@
 //! 回放跨轨门控(纯函数):按转写段活跃度构建 mic 轨压低区间,消混音重影。
-//! 设计见 specs/2026-07-14-voice-notes-playback-crossgate-design.md。
+//! 设计见 docs/superpowers/specs/2026-07-14-voice-notes-playback-crossgate-design.md。
 //! 根因:软件 AEC 场次清洗后 mic 仍有 ~-25dB 对方残影,与 system 全电平同内容
 //! 混播成"同源迟到复本"重影(真实笔记实测残余互相关 0.128@170ms)。
 //! 门控单向只压 mic;双讲保护;一切失败空表降级=现状。
@@ -187,5 +187,20 @@ mod tests {
         std::fs::write(&p, "{\"source\":\"system\",\"start_ms\":1,\"end_ms\":2}\ngarbage\n{\"source\":\"mic\",\"start_ms\":3,\"end_ms\":4,\"text\":\"x\"}\n").unwrap();
         let v = parse_segments_jsonl(&p);
         assert_eq!(v, vec![("system".into(),1,2),("mic".into(),3,4)], "坏行跳过");
+    }
+
+    /// 回归锁:mic 区间横跨两个 sys 段(brief 点名的 mi 指针风险场景)。
+    /// 数值刻意 ≥200ms,避开 MIN_SPAN 过滤,直接检验差集扫描本身。
+    #[test]
+    fn mic_spanning_two_sys_segments_carves_both() {
+        let g = build_gate(&[sys(0, 1000), sys(2000, 3000), mic(900, 2100)]);
+        assert_eq!(
+            g,
+            vec![
+                GateSpan { start: 0, end: 900 * MS },
+                GateSpan { start: 2100 * MS, end: 3000 * MS },
+            ],
+            "mic 跨段必须同时挖到两个 sys 段"
+        );
     }
 }
