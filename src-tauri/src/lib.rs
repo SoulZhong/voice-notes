@@ -2909,8 +2909,19 @@ pub fn run() {
             player::player_set_muted,
             player::player_stop
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // macOS 点击 dock 图标触发 Reopen:关窗被托盘拦截成 hide 后,dock 是用户最
+        // 本能的召回手势——之前只有托盘图标能唤回,dock 点击石沉大海(实测用户以为
+        // 程序卡死)。召回语义与托盘 show 菜单项一致:show + set_focus。
+        .run(|app, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
