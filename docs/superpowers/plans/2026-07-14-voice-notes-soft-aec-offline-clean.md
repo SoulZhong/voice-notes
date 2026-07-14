@@ -151,6 +151,9 @@ const ENV_FRAME: usize = 160;
 const ENV_FRAME_MS: u32 = 10;
 /// 最少需要的重叠包络帧数(3s):再短互相关峰不可信。
 const MIN_OVERLAP_FRAMES: usize = 300;
+/// 次峰排除主峰邻域的半宽(帧,±300ms)。语音/音乐包络自相关宽度约数百 ms:
+/// 邻域太窄会把主峰肩膀当"次峰",真回声的置信度被压到 1 附近(实施中踩过)。
+const PEAK_EXCLUSION_FRAMES: i64 = 30;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DelayEstimate {
@@ -200,19 +203,21 @@ pub fn estimate_delay(ref_env: &[f32], obs_env: &[f32], max_delay_ms: u32) -> Op
     if best.1 <= 0.0 {
         return None;
     }
-    // 次峰:排除主峰 ±3 帧邻域后的最大值。
+    // 次峰:排除主峰 ±PEAK_EXCLUSION_FRAMES 邻域后的最大值。
     let second = scores
         .iter()
         .enumerate()
-        .filter(|(i, _)| (*i as i64 - best.0 as i64).unsigned_abs() > 3)
+        .filter(|(i, _)| (*i as i64 - best.0 as i64).abs() > PEAK_EXCLUSION_FRAMES)
         .map(|(_, s)| *s)
         .fold(f32::MIN, f32::max);
     let confidence = if second > 1e-6 { best.1 / second } else { best.1 / 1e-6 };
     Some(DelayEstimate { delay_ms: best.0 as u32 * ENV_FRAME_MS, confidence })
 }
 
-/// 按 obs 时间轴分窗(win_ms)逐窗估计。每窗的参考段从窗起点向前多取
-/// max_delay_ms,保证窗内回声的来源帧在参考段里。
+/// 按 obs 时间轴分窗(win_ms)逐窗估计。ref 与 obs 取同一 [start..end) 窗口,
+/// lag 语义即全局延迟;窗首 lag 帧因参考越窗不参与相关(60s 窗 vs ≤1.2s 延迟,
+/// 损失可忽略)。不得给 ref 段前伸提前量——那会让真实延迟对应的 lag 变负,
+/// 掉出 0..=max_lag 搜索域(实施中踩过:窗估计撞 1200ms 边界)。
 pub fn estimate_windows(
     ref_env: &[f32],
     obs_env: &[f32],
@@ -220,38 +225,22 @@ pub fn estimate_windows(
     max_delay_ms: u32,
 ) -> Vec<Option<DelayEstimate>> {
     let win = (win_ms / ENV_FRAME_MS) as usize;
-    let back = (max_delay_ms / ENV_FRAME_MS) as usize;
     let n = obs_env.len();
     let mut out = Vec::new();
     let mut start = 0usize;
     while start < n {
         let end = (start + win).min(n);
-        let ref_from = start.saturating_sub(back);
-        let ref_to = end.min(ref_env.len());
-        if ref_from >= ref_to {
+        let end_r = end.min(ref_env.len());
+        if start >= end_r {
             out.push(None);
         } else {
-            // 窗内相对延迟 = 全局延迟 - (start - ref_from)*10ms 的补偿:直接把
-            // obs 窗与提前起头的 ref 段送入 estimate_delay,得到的 lag 是相对
-            // ref_from 的,换算回全局延迟。
-            let est = estimate_delay(&ref_env[ref_from..ref_to], &obs_env[start..end], max_delay_ms)
-                .map(|e| {
-                    let head_ms = ((start - ref_from) as u32) * ENV_FRAME_MS;
-                    // lag 相对 ref_from;全局延迟 = lag - (提前量 - 0) + 提前量 == lag,
-                    // 但 estimate_delay 内部把两段都当 0 起点,obs 窗起点对 ref_from 的
-                    // 真实偏移是 head_ms,故全局延迟 = lag + head_ms - head_ms = lag。
-                    // 保留换算式防将来改窗对齐时漏账。
-                    DelayEstimate { delay_ms: e.delay_ms + head_ms - head_ms, confidence: e.confidence }
-                });
-            out.push(est);
+            out.push(estimate_delay(&ref_env[start..end_r], &obs_env[start..end], max_delay_ms));
         }
         start = end;
     }
     out
 }
 ```
-
-注意 `estimate_windows` 里 obs 窗与 ref 段起点不同(`ref_from` 提前 `back` 帧)，而 `estimate_delay` 把两个切片都当 0 起点——lag 语义是「obs 窗内位置 - ref 段内位置」。obs 窗起点在全局是 `start`，ref 段起点是 `ref_from = start - back`，所以全局延迟 = `lag - back*10ms + (start - ref_from)*10ms = lag`。实现时直接用 lag 即可（上面代码里已如实注释；若测试发现偏差按此公式排查）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
