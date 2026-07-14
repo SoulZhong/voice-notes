@@ -144,7 +144,7 @@ Expected: 编译错误（模块/函数不存在）
 
 ```rust
 //! 延迟估计(两期共用核心):10ms 能量包络 + 归一化互相关。
-//! 纯函数无状态;置信度 = 主峰/次峰比(排除主峰 ±3 帧邻域)。
+//! 纯函数无状态;置信度 = 主峰/次峰比(排除主峰 ±300ms 邻域)。
 //! 门限不在本模块定——离线清洗(echo_clean)与二期实时侧各自持有并标定。
 
 /// 10ms @16k 一帧。
@@ -177,7 +177,7 @@ pub fn envelope(samples: &[f32]) -> Vec<f32> {
 }
 
 /// 在 0..=max_delay_ms 搜索 obs 相对 ref 的延迟。输入为包络(envelope 的输出)。
-/// 相关按去均值归一化(NCC);置信度=主峰/次峰(次峰排除主峰±3帧)。
+/// 相关按去均值归一化(NCC);置信度=主峰/次峰(次峰排除主峰±300ms邻域)。
 pub fn estimate_delay(ref_env: &[f32], obs_env: &[f32], max_delay_ms: u32) -> Option<DelayEstimate> {
     let max_lag = (max_delay_ms / ENV_FRAME_MS) as usize;
     let n = ref_env.len().min(obs_env.len());
@@ -361,7 +361,7 @@ git commit -m "清洗用 APM 构造器:AEC3+NS(High)无AGC,离线重跑不二次
 - Produces:
   - `pub struct CleanReport { pub delay_ms: u32, pub confidence: f32, pub segments: u32 }`
   - `pub fn clean_wav(mic_wav: &Path, system_wav: &Path, mic_offset_ms: u64, system_offset_ms: u64, out_tmp: &Path) -> anyhow::Result<Option<CleanReport>>` — `Ok(None)`=置信度不足跳过（不写 out_tmp）；`Ok(Some)`=out_tmp 写好合法 WAV
-  - `pub const CONFIDENCE_GATE: f32 = 2.0;` — **临时值**，Task 6 用真实录音标定后更新
+  - `pub const CONFIDENCE_GATE: f32 = 2.0;` 与 `pub const PEAK_GATE: f32 = 0.25;` — **临时值**（双门限:比值+绝对峰值），Task 6 用真实录音标定后更新
 
 - [ ] **Step 1: 写失败测试**
 
