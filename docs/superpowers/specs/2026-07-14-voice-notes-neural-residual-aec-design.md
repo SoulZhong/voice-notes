@@ -38,7 +38,8 @@
 echo_clean::clean_wav(AEC3 pass 完成,Ok(Some) 路径)
   → [新] 神经残余级(增值层,失败保留 AEC3 输出):
       audio/neural_aec.rs::suppress_residual(mic_aec3, system_aligned, models_dir)
-        - tract-tflite 加载 dtln_aec_256_1/2.tflite(共 ~15.5MB)
+        - tract-onnx(纯 Rust 运行时)加载 dtln_aec_256_1/2.onnx(共 ~15.5MB,
+          tflite→ONNX 离线转换工件,详见「用户决策」)
         - 官方块参数:512 块长 / 128 移位(8ms 步进)双阶段推理
         - LSTM 状态为显式输入/输出张量,逐块循环回喂(无内部状态,正适合 tract)
         - 样本守恒(输出 len == 输入 len,块尾余量原样)
@@ -52,10 +53,13 @@ echo_clean::clean_wav(AEC3 pass 完成,Ok(Some) 路径)
 
 ### 模型分发
 
-复用既有模型管理（models 目录 + 镜像下载机制）：新增 `dtln_aec_256_1.tflite`
-(5.5MB) 与 `dtln_aec_256_2.tflite`(10MB)，来源 github.com/breizhn/DTLN-aec
-（MIT,权重同库分发;商业再分发有 Shiguredo 先例）。工件哈希钉死（与 whisper
-工件同哲学）。模型未下载时神经级跳过,清洗报告与日志可见。
+复用既有模型管理（models 目录 + 镜像下载机制）：新增 `dtln_aec_256_1.onnx`
+(~5.5MB) 与 `dtln_aec_256_2.onnx`(~10MB)，源权重来自
+github.com/breizhn/DTLN-aec（MIT,权重同库分发;商业再分发有 Shiguredo 先例），
+本地离线转换为 ONNX（tf2onnx 1.17.0/opset 13,数值最大差 ~1e-6）后挂本仓
+release `models-dtln-aec-v1` 分发,注册表 URL 指向该 release,release 说明含
+来源/转换方式/哈希/MIT 许可。工件哈希钉死（与 whisper 工件同哲学）。模型未
+下载时神经级跳过,清洗报告与日志可见。
 
 ### 观测
 
@@ -68,10 +72,23 @@ echo_clean::clean_wav(AEC3 pass 完成,Ok(Some) 路径)
 增值层三连:模型不在场→跳过;加载/推理失败→保留 AEC3 输出;任何路径不 panic、
 不阻塞转码。神经级失败不回滚 AEC3 清洗成果。
 
+## 已知局限
+
+- **配对工件 UX 风险**：`dtln_aec_256_1.onnx` 与 `dtln_aec_256_2.onnx` 是模型
+  管理里两条独立的下载行,用户可能只下载其中一个。这种半下载态下神经残余级
+  的启用闸门（`models_dir` 内 `dtln_aec_256_1.onnx` 是否存在）仍会判定"在场"
+  并尝试跑,但 `load()` 会因缺第二个文件报错——结果是每条笔记清洗都记一次
+  失败日志（`神经残余级失败,保留 AEC3 输出: ...`），静默退回 AEC3-only,不
+  影响清洗产出正确性。当前接受该风险（失败路径本就设计为安全降级,不阻塞
+  转码）；后续如需消除,可选项：①下载器层面把两个工件合并为一次下载事务
+  （all-or-nothing）；②模型管理 UI 对这对工件加"配对"提示,提醒用户两者需
+  同时下载。
+
 ## 测试与验收
 
-- 可行性硬闸（首任务）：tract-tflite 加载双模型、对 1s 合成音频出数——失败即
-  切 tflitec 并记录，后续任务不变。
+- 可行性硬闸（首任务，已跑到底）：tract-tflite / tflitec 两条原路线双双实测
+  失败（见「用户决策」），改走 tract-onnx 加载转换后双 ONNX 模型、对 1s
+  合成音频出数——已通过，后续任务不再变。
 - 合成单测：回声衰减（远端延迟拷贝 → 输出能量显著低于输入）;样本守恒;
   参考全零时近端直通（不被误削）。
 - 真实录音验收（spike 同口径,同切片）：残余互相关 ≤0.15（spike 0.116）;
