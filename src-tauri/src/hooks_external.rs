@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use crate::lifecycle::machine::{LifecycleState, SessionState};
 
 /// 一条钩子配置。event/kind 存字符串而非枚举:未知值只让该条失配,不让整个
@@ -121,10 +122,78 @@ pub fn hook_events(before: &LifecycleState, after: &LifecycleState) -> Vec<HookF
     out
 }
 
+/// 构造钩子执行的环境变量向量。
+pub fn shell_envs(event: &str, note_id: &str, title: &str) -> Vec<(String, String)> {
+    vec![
+        ("VN_EVENT".into(), event.into()),
+        ("VN_NOTE_ID".into(), note_id.into()),
+        ("VN_NOTE_TITLE".into(), title.into()),
+    ]
+}
+
+/// 构造 webhook 载荷 JSON。
+pub fn payload(event: &str, note_id: &str, title: &str, occurred_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "event": event,
+        "note_id": note_id,
+        "note_title": title,
+        "occurred_at": occurred_at,
+    })
+}
+
+/// 轮询 try_wait 实现超时:std 没有 wait_timeout,200ms 步进对 30s 上限的
+/// 精度足够;超时 kill+wait 收尸,不留僵尸。
+fn wait_timeout(child: &mut std::process::Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            return Some(st);
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// /bin/sh -c 执行;stdio 全接 null——钩子输出不是产品数据,要日志请命令自己重定向。
+pub fn run_shell(command: &str, envs: &[(String, String)], limit: Duration) -> Result<i32, String> {
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    let mut child = c.spawn().map_err(|e| format!("启动失败: {e}"))?;
+    match wait_timeout(&mut child, limit) {
+        Some(st) => Ok(st.code().unwrap_or(-1)),
+        None => Err(format!("超时({}s),已终止", limit.as_secs())),
+    }
+}
+
+/// 发送 webhook POST 请求,返回 HTTP 状态码;非 2xx 为错误。
+pub fn run_webhook(url: &str, payload: &serde_json::Value, limit: Duration) -> Result<u16, String> {
+    match ureq::post(url)
+        .timeout(limit)
+        .set("content-type", "application/json")
+        .send_string(&payload.to_string())
+    {
+        Ok(resp) => Ok(resp.status()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(e) => Err(format!("请求失败: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lifecycle::machine::{LifecycleState, SessionState};
+    use std::time::Duration;
 
     fn st(session: SessionState) -> LifecycleState {
         LifecycleState { session, refine: Default::default() }
@@ -224,5 +293,33 @@ mod tests {
         // 精修完成
         let done = LifecycleState { session: SessionState::Idle, refine: Default::default() };
         assert_eq!(hook_events(&after, &done), vec![fire(HookEvent::RefineFinished, "n1")]);
+    }
+
+    #[test]
+    fn shell_envs_and_payload_shape() {
+        let envs = shell_envs("recording_stopped", "n1", "周会");
+        assert!(envs.contains(&("VN_EVENT".into(), "recording_stopped".into())));
+        assert!(envs.contains(&("VN_NOTE_ID".into(), "n1".into())));
+        assert!(envs.contains(&("VN_NOTE_TITLE".into(), "周会".into())));
+
+        let p = payload("refine_finished", "n1", "周会", "2026-07-14T10:00:00+08:00");
+        assert_eq!(p["event"], "refine_finished");
+        assert_eq!(p["note_id"], "n1");
+        assert_eq!(p["note_title"], "周会");
+        assert_eq!(p["occurred_at"], "2026-07-14T10:00:00+08:00");
+    }
+
+    #[test]
+    fn run_shell_exit_code_env_and_timeout() {
+        let t = Duration::from_secs(5);
+        assert_eq!(run_shell("exit 0", &[], t).unwrap(), 0);
+        assert_eq!(run_shell("exit 3", &[], t).unwrap(), 3);
+        // 环境变量注入:变量对得上才退 0
+        let envs = shell_envs("recording_started", "n1", "t");
+        assert_eq!(run_shell(r#"[ "$VN_EVENT" = recording_started ]"#, &envs, t).unwrap(), 0);
+        // 超时:1s 限制跑 sleep 10 → Err 且不悬挂
+        let start = std::time::Instant::now();
+        assert!(run_shell("sleep 10", &[], Duration::from_secs(1)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(5), "超时后必须立刻返回");
     }
 }
