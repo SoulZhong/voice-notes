@@ -95,6 +95,10 @@ pub struct CleanInfo {
     pub delay_ms: u32,
     pub confidence: f32,
     pub segments: u32,
+    /// 神经残余级(DTLN-aec)是否实际参与:None=旧记录(该字段引入前写入,未知);
+    /// Some(false)=AEC3-only(模型未在场或推理失败);Some(true)=神经级已叠加。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neural: Option<bool>,
 }
 
 /// 从 16k/mono/s16 WAV 流式计算波形桶:每桶取峰值 |i16| 折算 0..255。
@@ -791,12 +795,14 @@ mod tests {
                 delay_ms: 600,
                 confidence: 3.2,
                 segments: 1,
+                neural: Some(true),
             },
         )
         .unwrap();
         let meta = load_audio_meta(dir.path());
         let c = meta.tracks["mic"].clean.as_ref().unwrap();
         assert_eq!((c.delay_ms, c.segments), (600, 1));
+        assert_eq!(c.neural, Some(true), "neural 应随 CleanInfo 往返");
     }
 
     /// 冒烟实锤回归:soft_aec 标记先于轨道建档写入,建档(open)不得整条替换抹掉它。
@@ -826,5 +832,21 @@ mod tests {
         let meta = load_audio_meta(dir.path());
         assert_eq!(meta.tracks["mic"].soft_aec, None);
         assert!(meta.tracks["mic"].clean.is_none());
+    }
+
+    /// 旧 clean 记录(P3b 引入 neural 字段前写入,无 neural 键)必须照常反序列化,
+    /// 缺字段落到 None(而非 Some(false)),如实区分"未知"与"AEC3-only"。
+    #[test]
+    fn old_clean_info_without_neural_field_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("audio.json"),
+            r#"{"schema_version":1,"tracks":{"mic":{"offset_ms":0,"clean":{"delay_ms":600,"confidence":3.2,"segments":1}}}}"#,
+        )
+        .unwrap();
+        let meta = load_audio_meta(dir.path());
+        let c = meta.tracks["mic"].clean.as_ref().unwrap();
+        assert_eq!((c.delay_ms, c.segments), (600, 1));
+        assert_eq!(c.neural, None, "旧记录缺 neural 键应落到 None");
     }
 }
