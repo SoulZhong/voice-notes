@@ -193,10 +193,16 @@ pub fn truncate_utf8(s: String, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-/// 说话人显示名兜底,与前端 speakerLabel 同语义:名字 > 「说话人 N」。
-pub fn speaker_display(id: &str, name: &str) -> String {
+/// 说话人显示名兜底,对齐精修正文标签(store/export.rs render_refined)的
+/// 名字 > 关联人物全局编号(P 号)兜底语义——未命名但已关联库人物时,正文里
+/// 印的是 P 号,这里若仍退回原始 speakers.json 的 S/P id 会与正文编号对不上。
+/// person_id 有值时优先用它(去 P 前缀),否则退回 id 自身(去 P/S 前缀)。
+pub fn speaker_display(id: &str, name: &str, person_id: Option<&str>) -> String {
     if !name.is_empty() {
         return name.to_string();
+    }
+    if let Some(pid) = person_id {
+        return format!("说话人 {}", pid.trim_start_matches('P'));
     }
     format!("说话人 {}", id.trim_start_matches(['P', 'S']))
 }
@@ -237,7 +243,7 @@ fn note_content_from_dirs(
             }
             crate::store::render_refined(&note.meta.title, &doc, true)
         }
-        None => store.render(note_id, "md").ok()?,
+        None => store.render_loaded(&note, "md").ok()?,
     };
     let (text, truncated) = truncate_utf8(text, NOTE_TEXT_MAX);
     let duration_secs = note.segments.iter().map(|s| s.end_ms).max().unwrap_or(0) / 1000;
@@ -245,7 +251,11 @@ fn note_content_from_dirs(
         started_at: note.meta.started_at.clone(),
         ended_at: note.meta.ended_at.clone().unwrap_or_default(),
         duration_secs,
-        speakers: note.speakers.iter().map(|(id, m)| speaker_display(id, &m.name)).collect(),
+        speakers: note
+            .speakers
+            .iter()
+            .map(|(id, m)| speaker_display(id, &m.name, m.person_id.as_deref()))
+            .collect(),
         text,
         truncated,
     })
@@ -611,9 +621,15 @@ mod tests {
 
     #[test]
     fn speaker_display_prefers_name_falls_back_to_number() {
-        assert_eq!(speaker_display("P3", "张三"), "张三");
-        assert_eq!(speaker_display("P3", ""), "说话人 3");
-        assert_eq!(speaker_display("S1", ""), "说话人 1");
+        // 有名字:忽略 person_id,直接用名字
+        assert_eq!(speaker_display("P3", "张三", Some("P9")), "张三");
+        assert_eq!(speaker_display("P3", "张三", None), "张三");
+        // 无名字但已关联库人物(person_id 有值):对齐精修正文标签的 P 号,不用原始 id
+        assert_eq!(speaker_display("S1", "", Some("P9")), "说话人 9");
+        assert_eq!(speaker_display("P3", "", Some("P9")), "说话人 9");
+        // 无名字且未关联(person_id 为 None):退回原始 speakers.json id,去 P/S 前缀
+        assert_eq!(speaker_display("P3", "", None), "说话人 3");
+        assert_eq!(speaker_display("S1", "", None), "说话人 1");
     }
 
     fn content_fixture() -> NoteContent {
