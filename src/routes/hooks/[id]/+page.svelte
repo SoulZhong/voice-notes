@@ -32,8 +32,13 @@
       cfg = newHook();
       return;
     }
+    // 先清掉上一条的数据,避免加载窗口期短暂展示旧钩子内容
+    cfg = null;
     listHooks()
       .then((list) => {
+        // 过期守卫:快速切换 A→B 时,A 的响应可能晚于 B 返回,若不校验会把 B 页
+        // 的表单覆盖成 A 的数据(此后保存还会静默写回 A)。闭包 id ≠ 当前 routeId 即丢弃。
+        if (id !== routeId) return;
         const found = list.find((h) => h.id === id);
         if (found) cfg = { ...found };
         else {
@@ -42,6 +47,7 @@
         }
       })
       .catch((e) => {
+        if (id !== routeId) return; // 同上:过期请求的失败也不该污染当前页
         cfg = null;
         loadError = `加载失败: ${e}`;
       });
