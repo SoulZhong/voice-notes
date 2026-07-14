@@ -31,6 +31,10 @@ pub struct HookCfg {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 附带笔记内容:开启时执行注入笔记详情与全文(精修稿优先)。默认关,
+    /// serde default 兼容老 hooks.json。
+    #[serde(default)]
+    pub include_note: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -161,6 +165,58 @@ pub fn dispatch(app: &tauri::AppHandle, before: &LifecycleState, after: &Lifecyc
 const SHELL_LIMIT: Duration = Duration::from_secs(30);
 const WEBHOOK_LIMIT: Duration = Duration::from_secs(10);
 
+/// 内嵌全文的字节上限:macOS execve 的 env+argv 总预算约 1MB,超限 spawn 直接
+/// E2BIG 失败——截断是"都内嵌文本"方案的硬约束,不是优化。
+pub const NOTE_TEXT_MAX: usize = 200_000;
+
+/// 钩子附带的笔记内容(详情+全文)。text 为 markdown,可能被截断。
+pub struct NoteContent {
+    pub started_at: String,
+    /// 空串 = 未结束。
+    pub ended_at: String,
+    pub duration_secs: u64,
+    /// 显示名:名字 > 「说话人 N」。
+    pub speakers: Vec<String>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// 按 UTF-8 字符边界安全截断:上限落在多字节字符中间时回退,绝不产生半个字符。
+pub fn truncate_utf8(s: String, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
+/// 说话人显示名兜底,与前端 speakerLabel 同语义:名字 > 「说话人 N」。
+pub fn speaker_display(id: &str, name: &str) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    format!("说话人 {}", id.trim_start_matches(['P', 'S']))
+}
+
+/// include_note 追加的环境变量(在 shell_envs 三件之上)。截断标记只在截断时
+/// 注入——存在即真,脚本用 [ -n "$VN_NOTE_TEXT_TRUNCATED" ] 判断。
+pub fn note_envs(c: &NoteContent) -> Vec<(String, String)> {
+    let mut v = vec![
+        ("VN_NOTE_TEXT".into(), c.text.clone()),
+        ("VN_NOTE_STARTED_AT".into(), c.started_at.clone()),
+        ("VN_NOTE_ENDED_AT".into(), c.ended_at.clone()),
+        ("VN_NOTE_DURATION_SECS".into(), c.duration_secs.to_string()),
+        ("VN_NOTE_SPEAKERS".into(), c.speakers.join("、")),
+    ];
+    if c.truncated {
+        v.push(("VN_NOTE_TEXT_TRUNCATED".into(), "1".into()));
+    }
+    v
+}
+
 fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
     let Ok(app_data) = app.path().app_data_dir() else {
         eprintln!("hooks: app_data_dir 不可用,本批事件放弃");
@@ -182,7 +238,7 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
         let occurred_at = chrono::Local::now().to_rfc3339();
         for cfg in matched {
             let r = match cfg.kind.as_str() {
-                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at), WEBHOOK_LIMIT)
+                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at, None), WEBHOOK_LIMIT)
                     .map(|s| format!("HTTP {s}")),
                 // 非 0 退出码算失败,与 test_run 语义一致——否则"完成"日志会把真实的
                 // 命令失败盖过去,排查通道形同虚设。
@@ -206,7 +262,7 @@ pub fn test_run(cfg: &HookCfg) -> Result<String, String> {
     let event = if cfg.event.is_empty() { "recording_stopped" } else { cfg.event.as_str() };
     let occurred_at = chrono::Local::now().to_rfc3339();
     match cfg.kind.as_str() {
-        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at), WEBHOOK_LIMIT)
+        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at, None), WEBHOOK_LIMIT)
             .map(|s| format!("HTTP {s}")),
         _ => match run_shell(&cfg.command, &shell_envs(event, "note-test", "测试笔记"), Duration::from_secs(10)) {
             Ok(0) => Ok("退出码 0".into()),
@@ -226,13 +282,30 @@ pub fn shell_envs(event: &str, note_id: &str, title: &str) -> Vec<(String, Strin
 }
 
 /// 构造 webhook 载荷 JSON。
-pub fn payload(event: &str, note_id: &str, title: &str, occurred_at: &str) -> serde_json::Value {
-    serde_json::json!({
+pub fn payload(
+    event: &str,
+    note_id: &str,
+    title: &str,
+    occurred_at: &str,
+    note: Option<&NoteContent>,
+) -> serde_json::Value {
+    let mut p = serde_json::json!({
         "event": event,
         "note_id": note_id,
         "note_title": title,
         "occurred_at": occurred_at,
-    })
+    });
+    if let Some(c) = note {
+        p["note"] = serde_json::json!({
+            "started_at": c.started_at,
+            "ended_at": c.ended_at,
+            "duration_secs": c.duration_secs,
+            "speakers": c.speakers,
+            "text": c.text,
+            "text_truncated": c.truncated,
+        });
+    }
+    p
 }
 
 /// 轮询 try_wait 实现超时:std 没有 wait_timeout,200ms 步进对 30s 上限的
@@ -328,6 +401,7 @@ mod tests {
                 command: "echo done".into(),
                 url: String::new(),
                 enabled: true,
+                include_note: false,
             }],
         };
         save(tmp.path(), &f).unwrap();
@@ -407,7 +481,7 @@ mod tests {
         assert!(envs.contains(&("VN_NOTE_ID".into(), "n1".into())));
         assert!(envs.contains(&("VN_NOTE_TITLE".into(), "周会".into())));
 
-        let p = payload("refine_finished", "n1", "周会", "2026-07-14T10:00:00+08:00");
+        let p = payload("refine_finished", "n1", "周会", "2026-07-14T10:00:00+08:00", None);
         assert_eq!(p["event"], "refine_finished");
         assert_eq!(p["note_id"], "n1");
         assert_eq!(p["note_title"], "周会");
@@ -426,5 +500,74 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(run_shell("sleep 10", &[], Duration::from_secs(1)).is_err());
         assert!(start.elapsed() < Duration::from_secs(5), "超时后必须立刻返回");
+    }
+
+    #[test]
+    fn include_note_defaults_false_on_old_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("hooks.json"),
+            r#"{"hooks":[{"id":"h_old","event":"recording_stopped","command":"true"}]}"#,
+        )
+        .unwrap();
+        assert!(!load(tmp.path()).hooks[0].include_note, "老配置缺字段 → false");
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundary() {
+        // 「会」UTF-8 三字节:上限落在字符中间必须回退到边界,不产生半个字符
+        let (out, cut) = truncate_utf8("会议纪要".to_string(), 4);
+        assert_eq!(out, "会");
+        assert!(cut);
+        let (out, cut) = truncate_utf8("会议".to_string(), 6);
+        assert_eq!(out, "会议");
+        assert!(!cut, "恰好等长不算截断");
+        let (out, cut) = truncate_utf8(String::new(), 10);
+        assert_eq!(out, "");
+        assert!(!cut);
+    }
+
+    #[test]
+    fn speaker_display_prefers_name_falls_back_to_number() {
+        assert_eq!(speaker_display("P3", "张三"), "张三");
+        assert_eq!(speaker_display("P3", ""), "说话人 3");
+        assert_eq!(speaker_display("S1", ""), "说话人 1");
+    }
+
+    fn content_fixture() -> NoteContent {
+        NoteContent {
+            started_at: "2026-07-14T10:00:00+08:00".into(),
+            ended_at: "2026-07-14T11:00:00+08:00".into(),
+            duration_secs: 3600,
+            speakers: vec!["张三".into(), "说话人 2".into()],
+            text: "# 占位正文".into(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn note_envs_and_payload_shapes() {
+        let c = content_fixture();
+        let envs = note_envs(&c);
+        assert!(envs.contains(&("VN_NOTE_TEXT".into(), "# 占位正文".into())));
+        assert!(envs.contains(&("VN_NOTE_STARTED_AT".into(), "2026-07-14T10:00:00+08:00".into())));
+        assert!(envs.contains(&("VN_NOTE_ENDED_AT".into(), "2026-07-14T11:00:00+08:00".into())));
+        assert!(envs.contains(&("VN_NOTE_DURATION_SECS".into(), "3600".into())));
+        assert!(envs.contains(&("VN_NOTE_SPEAKERS".into(), "张三、说话人 2".into())));
+        assert!(!envs.iter().any(|(k, _)| k == "VN_NOTE_TEXT_TRUNCATED"), "未截断不注入标记");
+
+        let mut cut = content_fixture();
+        cut.truncated = true;
+        assert!(note_envs(&cut).contains(&("VN_NOTE_TEXT_TRUNCATED".into(), "1".into())));
+
+        let p = payload("refine_finished", "n1", "周会", "2026-07-14T11:00:01+08:00", Some(&c));
+        assert_eq!(p["note"]["duration_secs"], 3600);
+        assert_eq!(p["note"]["speakers"][0], "张三");
+        assert_eq!(p["note"]["text"], "# 占位正文");
+        assert_eq!(p["note"]["text_truncated"], false);
+        // 未附带时与现状逐字一致(回归防漂移):没有 note 键
+        let p0 = payload("refine_finished", "n1", "周会", "2026-07-14T11:00:01+08:00", None);
+        assert!(p0.get("note").is_none());
+        assert_eq!(p0["event"], "refine_finished");
     }
 }
