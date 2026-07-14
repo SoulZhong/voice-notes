@@ -15,7 +15,12 @@ const PEAK_EXCLUSION_FRAMES: i64 = 30;
 #[derive(Debug, Clone, Copy)]
 pub struct DelayEstimate {
     pub delay_ms: u32,
+    /// 主峰/次峰比(次峰排除主峰±300ms邻域):峰的唯一性。无关信号下噪声大
+    /// (少量有效样本的最大值比,实测可到 4+),不可单独作真回声判据。
     pub confidence: f32,
+    /// 主峰 NCC 绝对值:回声强度。真回声(参考的衰减拷贝)接近 1,无关信号
+    /// 通常 <0.2——与 confidence 联合门限才可靠。
+    pub peak: f32,
 }
 
 /// 10ms RMS 能量包络。尾部不足一帧的样本并入最后一帧。
@@ -68,7 +73,7 @@ pub fn estimate_delay(ref_env: &[f32], obs_env: &[f32], max_delay_ms: u32) -> Op
         .map(|(_, s)| *s)
         .fold(f32::MIN, f32::max);
     let confidence = if second > 1e-6 { best.1 / second } else { best.1 / 1e-6 };
-    Some(DelayEstimate { delay_ms: best.0 as u32 * ENV_FRAME_MS, confidence })
+    Some(DelayEstimate { delay_ms: best.0 as u32 * ENV_FRAME_MS, confidence, peak: best.1 })
 }
 
 /// 按 obs 时间轴分窗(win_ms)逐窗估计。ref 与 obs 取同一 [start..end) 窗口,
@@ -138,18 +143,20 @@ mod tests {
         }
         let est = estimate_delay(&envelope(&reference), &envelope(&observed), 1200).unwrap();
         assert!((est.delay_ms as i64 - 600).unsigned_abs() <= 20, "估计 {}ms", est.delay_ms);
-        assert!(est.confidence >= 2.0, "真回声置信度应显著: {}", est.confidence);
+        assert!(est.confidence >= 2.0, "真回声峰唯一性应显著: {}", est.confidence);
+        assert!(est.peak >= 0.5, "真回声主峰 NCC 应高: {}", est.peak);
     }
 
     #[test]
-    fn unrelated_signals_yield_low_confidence() {
+    fn unrelated_signals_yield_low_peak() {
         let mut s1 = 7u64;
         let mut s2 = 1234u64;
         let a = block_modulated_noise(16_000 * 60, &mut s1);
         let b = block_modulated_noise(16_000 * 60, &mut s2);
         let est = estimate_delay(&envelope(&a), &envelope(&b), 1200);
+        // 无关信号的比值(confidence)噪声大不可断言;判别力在绝对峰值。
         if let Some(e) = est {
-            assert!(e.confidence < 2.0, "无关信号不该有显著峰: {}", e.confidence);
+            assert!(e.peak < 0.25, "无关信号主峰 NCC 应低: {}", e.peak);
         }
     }
 
