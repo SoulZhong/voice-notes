@@ -39,6 +39,8 @@ use realfft::RealFftPlanner;
 use tract_onnx::prelude::*;
 
 const BLOCK_LEN: usize = 512;
+/// 测试专用（`run_block_for_test` 的 rfft bin 数断言）；生产块循环走 `process()`,不引用本常量。
+#[cfg(test)]
 const FREQ_BINS: usize = BLOCK_LEN / 2 + 1;
 const BLOCK_SHIFT: usize = 128;
 /// 两端 pad 长度：block_len - block_shift。
@@ -80,8 +82,15 @@ fn shape_to_usize(shape: &ShapeFact) -> Result<Vec<usize>> {
         .collect()
 }
 
-/// 打印一个已优化 TypedModel 全部输入/输出的 name/shape/dtype（T2 依赖这份 dump 做名字映射）。
+/// 打印一个已优化 TypedModel 全部输入/输出的 name/shape/dtype（T1/T2 调试名字映射用的）。
+/// 仅在设了环境变量 `VN_DTLN_DEBUG` 时才打印:`load_stage` 每次清洗都会调用本函数,
+/// 生产环境无条件 eprintln 会把张量 dump 灌进每条笔记的 stderr(P3b 收尾审查实锤)。
+/// 用环境变量而非 `cfg(test)`:开发时排查真实模型加载问题也需要这份 dump,
+/// 而单测（`models_load_and_run_one_block` 等）走的正是同一条生产路径。
 fn dump_io(label: &str, model: &TypedModel) -> Result<()> {
+    if std::env::var_os("VN_DTLN_DEBUG").is_none() {
+        return Ok(());
+    }
     for (i, outlet) in model.input_outlets()?.iter().enumerate() {
         let name = &model.node(outlet.node).name;
         let fact = model.outlet_fact(*outlet)?;
@@ -228,6 +237,8 @@ impl StageModel {
 impl DtlnAec {
     /// T1/T2 共用的单块前向探针：对齐「官方块算法」一节。输入/输出均为定长 512 样本块。
     /// T1 阶段：mic_block/lpb_block 直接视为待变换的 512 长缓冲（多块滑窗与状态回喂留给 T2）。
+    /// 测试专用（仅 `models_load_and_run_one_block` 调用）；生产路径是 `process()` 的完整块循环。
+    #[cfg(test)]
     pub(crate) fn run_block_for_test(
         &self,
         mic_block: &[f32; BLOCK_LEN],
@@ -284,19 +295,22 @@ impl DtlnAec {
     fn process(&self, mic: &[f32], reference: &[f32]) -> Result<Vec<f32>> {
         let len_audio = mic.len();
 
-        // reference 对齐 mic 长度:短则零垫齐,长则截断。
-        let mut lpb = reference.to_vec();
-        lpb.resize(len_audio, 0.0);
-
         // 右侧额外补零到 BLOCK_SHIFT 整数倍,保证滑窗块数足以覆盖 PAD+len_audio,
         // 否则末尾非 128 整数倍的样本会在整除取块数时被悄悄丢弃(样本守恒要求见 brief)。
         let tail_extra = (BLOCK_SHIFT - (len_audio % BLOCK_SHIFT)) % BLOCK_SHIFT;
         let padded_len = PAD + len_audio + PAD + tail_extra;
 
-        let mut mic_padded = vec![0.0f32; padded_len];
-        mic_padded[PAD..PAD + len_audio].copy_from_slice(mic);
+        // mic 不物化 padded 副本:按索引直读 mic,pad 区(< PAD 或 >= PAD+len_audio)取零,
+        // 与「mic_padded[PAD..PAD+len_audio]=mic,其余零」的旧语义逐样本一致。
+        let mic_at = |i: usize| -> f32 {
+            if i >= PAD && i < PAD + len_audio { mic[i - PAD] } else { 0.0 }
+        };
+
+        // reference 对齐 mic 长度直接构建 lpb_padded,跳过中间 `lpb` 全长副本:
+        // 短则零垫齐(vec 初始化已是零)、长则截断(只拷贝前 len_audio 个)。
         let mut lpb_padded = vec![0.0f32; padded_len];
-        lpb_padded[PAD..PAD + len_audio].copy_from_slice(&lpb);
+        let ref_copy_len = reference.len().min(len_audio);
+        lpb_padded[PAD..PAD + ref_copy_len].copy_from_slice(&reference[..ref_copy_len]);
 
         let num_blocks = (padded_len - PAD) / BLOCK_SHIFT;
 
@@ -316,8 +330,9 @@ impl DtlnAec {
             let start = idx * BLOCK_SHIFT;
 
             in_buffer.copy_within(BLOCK_SHIFT.., 0);
-            in_buffer[BLOCK_LEN - BLOCK_SHIFT..]
-                .copy_from_slice(&mic_padded[start..start + BLOCK_SHIFT]);
+            for (j, slot) in in_buffer[BLOCK_LEN - BLOCK_SHIFT..].iter_mut().enumerate() {
+                *slot = mic_at(start + j);
+            }
             in_buffer_lpb.copy_within(BLOCK_SHIFT.., 0);
             in_buffer_lpb[BLOCK_LEN - BLOCK_SHIFT..]
                 .copy_from_slice(&lpb_padded[start..start + BLOCK_SHIFT]);
@@ -373,7 +388,10 @@ impl DtlnAec {
             collected.len(),
             PAD + len_audio
         );
-        Ok(collected[PAD..PAD + len_audio].to_vec())
+        // 就地产出:drain 掉前 PAD 个 pad 样本、truncate 到 len_audio,不再整段复制。
+        collected.drain(..PAD);
+        collected.truncate(len_audio);
+        Ok(collected)
     }
 }
 
