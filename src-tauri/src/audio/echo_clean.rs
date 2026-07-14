@@ -65,6 +65,19 @@ pub struct CleanReport {
     pub delay_ms: u32,
     pub confidence: f32,
     pub segments: u32,
+    /// 神经残余级(DTLN-aec)是否实际参与本次清洗:模型工件在场且推理未报错才为 true。
+    pub neural: bool,
+}
+
+/// 参考与观测的残余互相关峰值(观测性小助手,不影响清洗结果):
+/// 包络后在 ±MAX_DELAY_MS 内取 [`delay_estimate::estimate_delay`] 的 peak,
+/// 估不出(轨道过短等)时如实报 0.0,不 panic。
+fn residual_peak(reference: &[f32], observed: &[f32]) -> f32 {
+    let ref_env = delay_estimate::envelope(reference);
+    let obs_env = delay_estimate::envelope(observed);
+    delay_estimate::estimate_delay(&ref_env, &obs_env, MAX_DELAY_MS)
+        .map(|e| e.peak)
+        .unwrap_or(0.0)
 }
 
 /// 读 WAV(跳 44 头)为 f32 样本。
@@ -182,6 +195,22 @@ pub fn clean_wav(
         }
     }
 
+    // 神经残余级(增值层):模型在场才跑;失败保留 AEC3 输出,永不 panic、不阻塞转码。
+    let mut neural = false;
+    let dtln_dir = crate::models::root();
+    if dtln_dir.join("dtln_aec_256_1.onnx").exists() {
+        match crate::audio::neural_aec::suppress_residual(&cleaned, &system_aligned, &dtln_dir) {
+            Ok(out) => {
+                let before = residual_peak(&system_aligned, &cleaned);
+                let after = residual_peak(&system_aligned, &out);
+                eprintln!("神经残余级完成: 残余互相关 {before:.3} -> {after:.3}");
+                cleaned = out;
+                neural = true;
+            }
+            Err(e) => eprintln!("神经残余级失败,保留 AEC3 输出: {e:#}"),
+        }
+    }
+
     // 写 out_tmp:合法 WAV + fsync。
     let pcm: Vec<u8> = cleaned
         .iter()
@@ -195,7 +224,12 @@ pub fn clean_wav(
     let best = confident.iter().map(|(_, e)| *e).fold(confident[0].1, |a, b| {
         if b.confidence > a.confidence { b } else { a }
     });
-    Ok(Some(CleanReport { delay_ms: best.delay_ms, confidence: best.confidence, segments: seg_count }))
+    Ok(Some(CleanReport {
+        delay_ms: best.delay_ms,
+        confidence: best.confidence,
+        segments: seg_count,
+        neural,
+    }))
 }
 
 #[cfg(test)]
@@ -301,6 +335,8 @@ mod tests {
         let loc_out = power(&cleaned[16_000 * 35..16_000 * 55]);
         assert!(loc_out > loc_in / 8.0 && loc_out < loc_in * 8.0,
             "本地声应保持 ±9dB: {loc_in:.6} -> {loc_out:.6}");
+        // 测试环境 models::root() 无 dtln_aec_256_1.onnx,神经级天然走跳过路径。
+        assert!(!report.neural, "无模型时神经级不应标记");
     }
 
     /// mic 与 system 无关(没回声):置信度不足,返回 None,不写输出文件。

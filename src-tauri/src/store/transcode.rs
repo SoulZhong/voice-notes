@@ -205,6 +205,7 @@ fn clean_mic_before_encode(note_dir: &Path) {
                 delay_ms: report.delay_ms,
                 confidence: report.confidence,
                 segments: report.segments,
+                neural: Some(report.neural),
             };
             if let Err(e) = crate::store::audio::set_track_clean_info(note_dir, "mic", info) {
                 eprintln!("清洗报告写 meta 失败(音频已清洗): {e}");
