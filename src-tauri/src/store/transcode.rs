@@ -190,13 +190,9 @@ fn clean_mic_before_encode(note_dir: &Path) {
     }
     let mic_off = meta.tracks.get("mic").map(|t| t.offset_ms).unwrap_or(0);
     let sys_off = meta.tracks.get("system").map(|t| t.offset_ms).unwrap_or(0);
-    // 头部按实际长度修正,防止陈旧头让清洗读到截断数据(同 transcode_one 首步)。
-    for p in [&mic, &system] {
-        if let Err(e) = repair_wav_header(p) {
-            eprintln!("清洗跳过(修 WAV 头失败 {}): {e}", p.display());
-            return;
-        }
-    }
+    // 刻意不预修 WAV 头:清洗引擎按字节读(44 头后全量,不看头内长度字段),陈旧头
+    // 不影响;encode 前的修头由 transcode_one 统一做。跳过清洗的路径必须严格
+    // 字节不动(审查约束)。
     let out_tmp = note_dir.join("mic.wav.clean.tmp");
     match crate::audio::echo_clean::clean_wav(&mic, &system, mic_off, sys_off, &out_tmp) {
         Ok(Some(report)) => {
@@ -824,5 +820,22 @@ mod tests {
         std::fs::write(dir.path().join("mic.wav.clean.tmp"), b"garbage").unwrap();
         transcode_note_dir(dir.path());
         assert!(!dir.path().join("mic.wav.clean.tmp").exists());
+    }
+
+    /// 陈旧 WAV 头(头内 data 长度小于实际)在跳过清洗的路径上必须字节不动——
+    /// 预修头已刻意移除,此测试锁住该约束。
+    #[test]
+    fn stale_header_untouched_when_cleaning_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        clean_fixture(dir.path(), true, true, false); // 齐备+标记,但无回声(置信度拒)
+        // 人为做旧 mic.wav 头:把 data 长度字段改小 1000 字节(模拟崩溃后未回写)。
+        let mic = dir.path().join("mic.wav");
+        let mut bytes = std::fs::read(&mic).unwrap();
+        let data_len = (bytes.len() - 44) as u32 - 1000;
+        bytes[40..44].copy_from_slice(&data_len.to_le_bytes());
+        std::fs::write(&mic, &bytes).unwrap();
+        let before = std::fs::read(&mic).unwrap();
+        clean_mic_before_encode(dir.path());
+        assert_eq!(before, std::fs::read(&mic).unwrap(), "跳过清洗必须连头字节都不动");
     }
 }
