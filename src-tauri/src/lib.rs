@@ -2352,6 +2352,28 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     Ok(())
 }
 
+/// 钩子配置读取(独立 hooks.json,不掺和 settings)。
+#[tauri::command]
+fn list_hooks(app: AppHandle) -> Result<Vec<hooks_external::HookCfg>, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(hooks_external::load(&dir).hooks)
+}
+
+/// 整表覆盖保存:前端是唯一写者,配置量小,不做逐条 CRUD。
+#[tauri::command]
+fn save_hooks(app: AppHandle, hooks: Vec<hooks_external::HookCfg>) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    hooks_external::save(&dir, &hooks_external::HooksFile { hooks }).map_err(|e| e.to_string())
+}
+
+/// 配置页「测试」:同步执行体最长 10s,走 spawn_blocking 别占 IPC 线程。
+#[tauri::command]
+async fn test_hook(cfg: hooks_external::HookCfg) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || hooks_external::test_run(&cfg))
+        .await
+        .map_err(|e| format!("执行线程失败: {e}"))?
+}
+
 /// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
 /// 都必然 unpause——否则一次迁移失败后转码永久静止,只能重启应用。与 ResetOnDrop
 /// （复位 download_running 互斥位）配套:两者一起挂在迁移线程头部,兜住所有退出路径。
@@ -2876,6 +2898,9 @@ pub fn run() {
             delete_model,
             get_settings,
             set_settings,
+            list_hooks,
+            save_hooks,
+            test_hook,
             apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,
