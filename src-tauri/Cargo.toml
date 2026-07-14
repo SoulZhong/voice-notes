@@ -49,6 +49,12 @@ rmcp = { version = "~2.1", features = ["server", "transport-io", "macros", "sche
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-std", "time"] }
 schemars = "1.2.1"
 serde_yaml_ng = "0.10.0"
+# 神经残余级(DTLN-aec):tract-onnx 纯 Rust 推理 + 纯 Rust FFT。
+# 路线定版 ONNX:tflite 双路线硬闸双败(tract-tflite 负轴 ReduceMean panic;tflitec 要
+# bazel 整编 TF 源码,不可维护),模型已离线转 ONNX(数值最大差 ~1e-6)挂本仓 release,
+# 详见 .superpowers/sdd/p3b-task-1-report.md 偏差记录。0.21 与 rustc 1.89 兼容(spike 实证)。
+tract-onnx = "0.21"
+realfft = "3"
 
 [dev-dependencies]
 tempfile = "3"
