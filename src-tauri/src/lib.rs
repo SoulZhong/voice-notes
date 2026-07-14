@@ -139,7 +139,7 @@ fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
 }
 
 /// notes 根目录（不存在则创建），挂在 data_root 下。
-fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+pub(crate) fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let dir = data_root(app)?.join("notes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)

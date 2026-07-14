@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use crate::lifecycle::machine::{LifecycleState, SessionState};
+use tauri::Manager;
 
 /// 一条钩子配置。event/kind 存字符串而非枚举:未知值只让该条失配,不让整个
 /// hooks.json 反序列化失败(枚举会连带炸掉全表,老文件升级即中招)。
@@ -120,6 +121,70 @@ pub fn hook_events(before: &LifecycleState, after: &LifecycleState) -> Vec<HookF
     out.extend(added.into_iter().map(|id| HookFire { event: HookEvent::RefineStarted, note_id: id }));
     out.extend(removed.into_iter().map(|id| HookFire { event: HookEvent::RefineFinished, note_id: id }));
     out
+}
+
+/// actor 提交点唯一入口:同步映射(纯内存,不拖累 actor),有事件才起线程。
+/// 契约与 HookBus 相同:执行层任何失败只记日志,绝不回传 actor。
+pub fn dispatch(app: &tauri::AppHandle, before: &LifecycleState, after: &LifecycleState) {
+    let fires = hook_events(before, after);
+    if fires.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || run_fires(&app, fires));
+}
+
+const SHELL_LIMIT: Duration = Duration::from_secs(30);
+const WEBHOOK_LIMIT: Duration = Duration::from_secs(10);
+
+fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
+    let Ok(app_data) = app.path().app_data_dir() else {
+        eprintln!("hooks: app_data_dir 不可用,本批事件放弃");
+        return;
+    };
+    let cfgs = load(&app_data).hooks;
+    for f in &fires {
+        let event = f.event.as_str();
+        let matched: Vec<&HookCfg> =
+            cfgs.iter().filter(|c| c.enabled && c.event == event).collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // 标题尽力而为:拿不到(笔记刚建/已删)用空串,不因标题挡执行。
+        let title = crate::notes_dir(app)
+            .ok()
+            .and_then(|d| crate::store::NoteStore::new(d).title(&f.note_id))
+            .unwrap_or_default();
+        let occurred_at = chrono::Local::now().to_rfc3339();
+        for cfg in matched {
+            let r = match cfg.kind.as_str() {
+                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at), WEBHOOK_LIMIT)
+                    .map(|s| format!("HTTP {s}")),
+                _ => run_shell(&cfg.command, &shell_envs(event, &f.note_id, &title), SHELL_LIMIT)
+                    .map(|c| format!("退出码 {c}")),
+            };
+            match r {
+                Ok(msg) => eprintln!("hooks: '{}' [{}] 完成({msg})", cfg.name, event),
+                Err(e) => eprintln!("hooks: '{}' [{}] 失败: {e}(已忽略,不影响主流程)", cfg.name, event),
+            }
+        }
+    }
+}
+
+/// 配置页「测试」按钮:以假载荷立即执行一次,结果如实回传 UI。
+/// 超时收紧到 10s——测试是交互动作,30s 转圈没人等得起。
+pub fn test_run(cfg: &HookCfg) -> Result<String, String> {
+    let event = if cfg.event.is_empty() { "recording_stopped" } else { cfg.event.as_str() };
+    let occurred_at = chrono::Local::now().to_rfc3339();
+    match cfg.kind.as_str() {
+        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at), WEBHOOK_LIMIT)
+            .map(|s| format!("HTTP {s}")),
+        _ => match run_shell(&cfg.command, &shell_envs(event, "note-test", "测试笔记"), Duration::from_secs(10)) {
+            Ok(0) => Ok("退出码 0".into()),
+            Ok(c) => Err(format!("退出码 {c}")),
+            Err(e) => Err(e),
+        },
+    }
 }
 
 /// 构造钩子执行的环境变量向量。
