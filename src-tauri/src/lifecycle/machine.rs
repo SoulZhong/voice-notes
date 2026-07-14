@@ -60,6 +60,12 @@ impl RefineState {
         let removed = self.running.difference(&after.running).cloned().collect();
         (added, removed)
     }
+
+    /// 仅测试用:构造含指定 id 的集合(with_inserted 私有,外部测试无法搭台)。
+    #[cfg(test)]
+    pub fn diff_test_insert(&self, note_id: &str) -> RefineState {
+        self.with_inserted(note_id)
+    }
 }
 
 /// 内核状态升维(P3):会话主时间轴 + 精修维度。两维正交——会话消息不动 refine,
