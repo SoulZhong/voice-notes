@@ -17,6 +17,7 @@ mod refine;
 pub mod mcp;
 mod telemetry;
 mod lifecycle;
+mod hooks_external;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -128,7 +129,7 @@ impl Default for AppState {
 /// 数据根目录：app_data_dir 读 settings.json（自举指针，永远在 app_data_dir，不随
 /// data_dir 漂移）→ resolve_data_root 得到用户配置的落盘根，未配置则回落 app_data_dir。
 /// 笔记/声纹等所有内容都挂这个根；settings 读写命令仍走 app_data_dir。
-fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
+pub(crate) fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let app_data = app
         .path()
         .app_data_dir()
@@ -138,7 +139,7 @@ fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
 }
 
 /// notes 根目录（不存在则创建），挂在 data_root 下。
-fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+pub(crate) fn notes_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let dir = data_root(app)?.join("notes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -2351,6 +2352,32 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     Ok(())
 }
 
+/// 钩子配置读取(独立 hooks.json,不掺和 settings)。用 load_checked 而非
+/// load:损坏时必须如实回 Err,让 Sidebar 的 hooksError 横幅、编辑页的
+/// loadError 点亮;同时编辑页 save 流程(先 listHooks 读旧配置、改、再
+/// saveHooks 整表写回)会因这里抛错而在第一步就中止,不会拿着「损坏当空表」
+/// 的假象把用户手编但只是格式有误的原文件静默覆盖。
+#[tauri::command]
+fn list_hooks(app: AppHandle) -> Result<Vec<hooks_external::HookCfg>, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(hooks_external::load_checked(&dir)?.hooks)
+}
+
+/// 整表覆盖保存:前端是唯一写者,配置量小,不做逐条 CRUD。
+#[tauri::command]
+fn save_hooks(app: AppHandle, hooks: Vec<hooks_external::HookCfg>) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    hooks_external::save(&dir, &hooks_external::HooksFile { hooks }).map_err(|e| e.to_string())
+}
+
+/// 配置页「测试」:同步执行体最长 10s,走 spawn_blocking 别占 IPC 线程。
+#[tauri::command]
+async fn test_hook(cfg: hooks_external::HookCfg) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || hooks_external::test_run(&cfg))
+        .await
+        .map_err(|e| format!("执行线程失败: {e}"))?
+}
+
 /// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
 /// 都必然 unpause——否则一次迁移失败后转码永久静止,只能重启应用。与 ResetOnDrop
 /// （复位 download_running 互斥位）配套:两者一起挂在迁移线程头部,兜住所有退出路径。
@@ -2875,6 +2902,9 @@ pub fn run() {
             delete_model,
             get_settings,
             set_settings,
+            list_hooks,
+            save_hooks,
+            test_hook,
             apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,

@@ -15,13 +15,21 @@
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
+  import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
   let error = $state("");
 
-  // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=声纹库,其余(笔记/录制/设置)=录音记录。
-  const tab = $derived($page.url.pathname.startsWith("/speakers") ? "people" : "notes");
+  // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=会议搭子,/hooks 域=钩子,
+  // 其余(笔记/录制/设置)=录音记录。
+  const tab = $derived(
+    $page.url.pathname.startsWith("/speakers")
+      ? "people"
+      : $page.url.pathname.startsWith("/hooks")
+        ? "hooks"
+        : "notes",
+  );
 
   let people = $state<PersonSummary[]>([]);
   let peopleError = $state("");
@@ -34,6 +42,31 @@
       peopleError = `加载失败: ${e}`;
     }
   }
+
+  let hookList = $state<HookCfg[]>([]);
+  let hooksError = $state("");
+
+  async function refreshHooks() {
+    try {
+      hookList = await listHooks();
+      hooksError = "";
+    } catch (e) {
+      hooksError = `加载失败: ${e}`;
+    }
+  }
+
+  // 切到钩子页签时拉取;编辑页保存/删除后经 version 触发重拉(与 peopleVersion 同套路)。
+  $effect(() => {
+    void hooksStore.version;
+    if (tab === "hooks") refreshHooks();
+  });
+
+  /** 按事件分组(有配置的事件才出组,组序=白名单序)。 */
+  const hookGroups = $derived(
+    HOOK_EVENTS.map((e) => ({ ...e, items: hookList.filter((h) => h.event === e.value) })).filter(
+      (g) => g.items.length > 0,
+    ),
+  );
 
   // 切到声纹库页签时拉取;详情页改名/合并/删除后经 peopleVersion 触发重拉,索引不滞留旧名。
   // 整理建议同步重算:「概览与整理」徽标要跟库同步,不能挂着旧数。
@@ -221,6 +254,11 @@
       class:active={tab === "people"}
       onclick={() => { if ($page.url.pathname !== "/speakers") goto("/speakers"); }}>会议搭子</button
     >
+    <button
+      class="vtab"
+      class:active={tab === "hooks"}
+      onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
+    >
   </nav>
 
   <div class="panel">
@@ -234,7 +272,53 @@
     {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
-  {#if tab === "people"}
+  {#if tab === "hooks"}
+    {#if hooksError}
+      <div class="banner">{hooksError}</div>
+    {/if}
+    <ul class="list">
+      <!-- 固定行:新建钩子(常驻入口,与「概览与整理」同形态) -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+      <li
+        class="item overview"
+        class:current={$page.url.pathname === "/hooks/new"}
+        onclick={(e) => {
+          if ((e.target as HTMLElement).closest("a")) return;
+          goto("/hooks/new");
+        }}
+      >
+        <svg class="overview-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M8 3.5v9M3.5 8h9" />
+        </svg>
+        <div class="main-line">
+          <a class="title" href="/hooks/new">新建钩子</a>
+        </div>
+      </li>
+      {#if hookList.length === 0 && !hooksError}
+        <p class="hint">事件发生时自动执行命令或调用接口,先新建一条试试</p>
+      {/if}
+      {#each hookGroups as g (g.value)}
+        <li class="group-label">{g.label}</li>
+        {#each g.items as h (h.id)}
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+          <li
+            class="item hook"
+            class:off={!h.enabled}
+            class:current={$page.url.pathname === `/hooks/${h.id}`}
+            onclick={(e) => {
+              if ((e.target as HTMLElement).closest("a")) return;
+              goto(`/hooks/${h.id}`);
+            }}
+          >
+            <div class="main-line">
+              <a class="title" href="/hooks/{h.id}">{h.name || "未命名钩子"}</a>
+              <span class="meta">{h.kind === "webhook" ? "Webhook" : "Shell 命令"}{h.enabled ? "" : " · 已停用"}</span>
+            </div>
+          </li>
+        {/each}
+      {/each}
+    </ul>
+  {:else if tab === "people"}
     {#if peopleError}
       <div class="banner">{peopleError}</div>
     {/if}
@@ -567,6 +651,12 @@
   .title.unnamed {
     color: var(--ink-faint);
     font-weight: 400;
+  }
+
+  /* 钩子行:禁用的整行淡显,一眼分辨在岗/停用 */
+  .item.hook.off .title,
+  .item.hook.off .meta {
+    color: var(--ink-faint);
   }
 
   /* 过滤框:内嵌式(surface-press 底、无边)——侧栏里带边框的输入框比正文还抢眼,

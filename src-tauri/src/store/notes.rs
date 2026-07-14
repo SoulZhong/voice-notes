@@ -159,6 +159,13 @@ impl NoteStore {
         Ok(note)
     }
 
+    /// 只读 meta.json 取标题(钩子载荷用):load 会全量解析 segments,对着长会议
+    /// 只为拿标题太重;meta 缺失/损坏回 None,调用方自行兜底。
+    pub fn title(&self, id: &str) -> Option<String> {
+        let dir = self.note_dir(id).ok()?;
+        read_meta(&dir).map(|m| m.title)
+    }
+
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
@@ -899,5 +906,20 @@ mod tests {
         let store = NoteStore::new(tmp.path().to_path_buf());
         let err = store.edit_segment_text(&id, 0, "原文", "改").unwrap_err().to_string();
         assert!(err.contains("正被占用"), "锁占用时编辑应被明确拒绝,实际: {err}");
+    }
+
+    #[test]
+    fn title_reads_meta_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("n1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"schema_version":1,"id":"n1","title":"周会","started_at":"2026-07-14T10:00:00+08:00","ended_at":null,"state":"complete"}"#,
+        )
+        .unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        assert_eq!(store.title("n1").as_deref(), Some("周会"));
+        assert_eq!(store.title("nope"), None, "不存在的笔记 → None");
     }
 }
