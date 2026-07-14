@@ -2352,11 +2352,15 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     Ok(())
 }
 
-/// 钩子配置读取(独立 hooks.json,不掺和 settings)。
+/// 钩子配置读取(独立 hooks.json,不掺和 settings)。用 load_checked 而非
+/// load:损坏时必须如实回 Err,让 Sidebar 的 hooksError 横幅、编辑页的
+/// loadError 点亮;同时编辑页 save 流程(先 listHooks 读旧配置、改、再
+/// saveHooks 整表写回)会因这里抛错而在第一步就中止,不会拿着「损坏当空表」
+/// 的假象把用户手编但只是格式有误的原文件静默覆盖。
 #[tauri::command]
 fn list_hooks(app: AppHandle) -> Result<Vec<hooks_external::HookCfg>, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(hooks_external::load(&dir).hooks)
+    Ok(hooks_external::load_checked(&dir)?.hooks)
 }
 
 /// 整表覆盖保存:前端是唯一写者,配置量小,不做逐条 CRUD。

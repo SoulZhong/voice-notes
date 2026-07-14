@@ -48,11 +48,35 @@ fn default_true() -> bool {
 }
 
 /// 缺失/损坏 → 空表(容忍,不报错;与 settings::load 同策略)。
+///
+/// 这是「派发容错」读取口:执行钩子的后台线程(run_fires)靠它取配置,任何原因
+/// 读不到都不能让事件派发链路挂掉,所以损坏时静默退化为空表——但静默不等于
+/// 无迹可查,存在且解析失败时打一条日志,方便用户/开发者事后翻日志定位。
+/// 若要在 UI 层如实报错(不掩盖损坏、不让保存流程覆盖用户数据),用下面的
+/// load_checked。
 pub fn load(app_data: &Path) -> HooksFile {
-    std::fs::read_to_string(app_data.join("hooks.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let path = app_data.join("hooks.json");
+    match std::fs::read_to_string(&path) {
+        Err(_) => HooksFile::default(), // 文件不存在(或不可读):首次使用的正常状态,不是错误
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("hooks: hooks.json 存在但解析失败,派发本轮按空表处理: {e}");
+            HooksFile::default()
+        }),
+    }
+}
+
+/// 这是「UI 如实报错」读取口:`list_hooks` 命令用它把配置文件的真实状态如实
+/// 回传前端。文件缺失是正常的空表初始状态,但文件存在且解析失败必须 Err——
+/// 否则编辑页的 保存流程(listHooks → 改 → saveHooks)会在 listHooks 静默拿到
+/// 空表后,把这份"假空表"整表写回,永久覆盖用户手编但仅仅是格式有误的原配置。
+pub fn load_checked(app_data: &Path) -> Result<HooksFile, String> {
+    let path = app_data.join("hooks.json");
+    match std::fs::read_to_string(&path) {
+        Err(_) => Ok(HooksFile::default()), // 文件缺失:未配置过,不是错误
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!("hooks.json 已损坏,无法解析: {e}。请手动修复该文件或删除后重新配置。")
+        }),
+    }
 }
 
 pub fn save(app_data: &Path, f: &HooksFile) -> anyhow::Result<()> {
@@ -160,8 +184,13 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
             let r = match cfg.kind.as_str() {
                 "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at), WEBHOOK_LIMIT)
                     .map(|s| format!("HTTP {s}")),
-                _ => run_shell(&cfg.command, &shell_envs(event, &f.note_id, &title), SHELL_LIMIT)
-                    .map(|c| format!("退出码 {c}")),
+                // 非 0 退出码算失败,与 test_run 语义一致——否则"完成"日志会把真实的
+                // 命令失败盖过去,排查通道形同虚设。
+                _ => match run_shell(&cfg.command, &shell_envs(event, &f.note_id, &title), SHELL_LIMIT) {
+                    Ok(0) => Ok("退出码 0".into()),
+                    Ok(c) => Err(format!("退出码 {c}")),
+                    Err(e) => Err(e),
+                },
             };
             match r {
                 Ok(msg) => eprintln!("hooks: '{}' [{}] 完成({msg})", cfg.name, event),
@@ -273,7 +302,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(load(tmp.path()).hooks.is_empty(), "缺文件 → 空表");
         std::fs::write(tmp.path().join("hooks.json"), "not json").unwrap();
-        assert!(load(tmp.path()).hooks.is_empty(), "损坏 → 空表");
+        assert!(load(tmp.path()).hooks.is_empty(), "损坏 → 空表(派发路径容错语义不变)");
+    }
+
+    #[test]
+    fn load_checked_errs_on_corrupt_but_oks_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 缺失文件:未配置过的正常初始状态,不是错误
+        assert!(load_checked(tmp.path()).unwrap().hooks.is_empty(), "缺文件 → Ok(空表)");
+        // 存在且解析失败:必须如实报错,UI 才能点亮横幅、编辑页 save 流程才会中止而非覆盖
+        std::fs::write(tmp.path().join("hooks.json"), "not json").unwrap();
+        let err = load_checked(tmp.path()).expect_err("损坏文件必须 Err");
+        assert!(err.contains("损坏"), "错误信息应提示文件已损坏: {err}");
     }
 
     #[test]

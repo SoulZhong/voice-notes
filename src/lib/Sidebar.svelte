@@ -15,7 +15,7 @@
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
-  import { listHooks, eventLabel, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
+  import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -257,7 +257,7 @@
     <button
       class="vtab"
       class:active={tab === "hooks"}
-      onclick={() => { if (($page.url.pathname as string) !== "/hooks") goto("/hooks"); }}>钩子</button
+      onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
     >
   </nav>
 
@@ -281,7 +281,7 @@
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
       <li
         class="item overview"
-        class:current={($page.url.pathname as string) === "/hooks/new"}
+        class:current={$page.url.pathname === "/hooks/new"}
         onclick={(e) => {
           if ((e.target as HTMLElement).closest("a")) return;
           goto("/hooks/new");
