@@ -204,6 +204,20 @@
 
       <label class="row">
         <div class="row-info">
+          <span class="row-label">附带笔记内容</span>
+          <span class="row-desc">把笔记详情与全文交给命令/接口,精修稿优先;想要精修全文请挂「精修完成」</span>
+        </div>
+        <!-- 与启用开关不同:附带与否改变测试注入的内容,旧测试结果不再作数 -->
+        <input
+          type="checkbox"
+          class="switch"
+          bind:checked={cfg.include_note}
+          onchange={() => (testResult = null)}
+        />
+      </label>
+
+      <label class="row">
+        <div class="row-info">
           <span class="row-label">启用</span>
           <span class="row-desc">停用后保留配置,事件不再触发</span>
         </div>

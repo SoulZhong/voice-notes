@@ -12,6 +12,7 @@ export type HookCfg = {
   command: string;
   url: string;
   enabled: boolean;
+  include_note: boolean;
 };
 
 /** 事件白名单(与后端 HookEvent::as_str 逐字对齐,顺序即下拉顺序)。 */
@@ -57,5 +58,6 @@ export function newHook(): HookCfg {
     command: "",
     url: "",
     enabled: true,
+    include_note: false,
   };
 }

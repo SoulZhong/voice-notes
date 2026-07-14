@@ -45,6 +45,36 @@
           <span class="row-desc">笔记标题(取不到时为空)</span>
         </div>
       </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label"><code>VN_NOTE_TEXT</code></span>
+          <span class="row-desc">笔记全文 markdown,精修稿优先——仅钩子勾选「附带笔记内容」时注入,下同</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label"><code>VN_NOTE_STARTED_AT</code> / <code>VN_NOTE_ENDED_AT</code></span>
+          <span class="row-desc">开始/结束时间(RFC3339),未结束时结束为空</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label"><code>VN_NOTE_DURATION_SECS</code></span>
+          <span class="row-desc">时长秒数</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label"><code>VN_NOTE_SPEAKERS</code></span>
+          <span class="row-desc">说话人名单,顿号分隔</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label"><code>VN_NOTE_TEXT_TRUNCATED</code></span>
+          <span class="row-desc">全文超 200KB 被截断时为 1,未截断不注入</span>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -57,8 +87,13 @@ content-type: application/json
   "event": "recording_stopped",
   "note_id": "…",
   "note_title": "…",
-  "occurred_at": "2026-07-14T10:00:00+08:00"
+  "occurred_at": "2026-07-14T10:00:00+08:00",
+  "note": {
+    "started_at": "…", "ended_at": "…", "duration_secs": 3600,
+    "speakers": ["张三"], "text": "…markdown…", "text_truncated": false
+  }
 }`}</pre>
+    <p class="hint">note 字段仅在钩子勾选「附带笔记内容」时出现;停止录制时通常是原始稿,想要精修全文请挂「精修完成」事件。</p>
   </section>
 </div>
 
@@ -110,5 +145,10 @@ content-type: application/json
     color: var(--ink-secondary);
     overflow-x: auto;
     margin: 0;
+  }
+  .hint {
+    color: var(--ink-faint);
+    font-size: 0.8rem;
+    margin: 0.5rem 0 0;
   }
 </style>
