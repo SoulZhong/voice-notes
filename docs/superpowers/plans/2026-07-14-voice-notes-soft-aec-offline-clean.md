@@ -41,7 +41,7 @@
 
 **Interfaces:**
 - Produces:
-  - `pub struct DelayEstimate { pub delay_ms: u32, pub confidence: f32 }`
+  - `pub struct DelayEstimate { pub delay_ms: u32, pub confidence: f32, pub peak: f32 }` — confidence=主峰/次峰比(排除±300ms邻域,峰唯一性)；peak=主峰 NCC 绝对值(回声强度)。判别真回声需两者联合:无关信号的比值噪声大(实测可到 4.5),但绝对峰值低
   - `pub fn envelope(samples: &[f32]) -> Vec<f32>` — 10ms(160样本)一帧的 RMS 包络
   - `pub fn estimate_delay(ref_env: &[f32], obs_env: &[f32], max_delay_ms: u32) -> Option<DelayEstimate>` — 输入是**包络**（不是原始样本），None=重叠不足
   - `pub fn estimate_windows(ref_env: &[f32], obs_env: &[f32], win_ms: u32, max_delay_ms: u32) -> Vec<Option<DelayEstimate>>` — 按 obs 时间轴分窗逐个估计
@@ -91,18 +91,20 @@ mod tests {
         }
         let est = estimate_delay(&envelope(&reference), &envelope(&observed), 1200).unwrap();
         assert!((est.delay_ms as i64 - 600).unsigned_abs() <= 20, "估计 {}ms", est.delay_ms);
-        assert!(est.confidence >= 2.0, "真回声置信度应显著: {}", est.confidence);
+        assert!(est.confidence >= 2.0, "真回声峰唯一性应显著: {}", est.confidence);
+        assert!(est.peak >= 0.5, "真回声主峰 NCC 应高: {}", est.peak);
     }
 
     #[test]
-    fn unrelated_signals_yield_low_confidence() {
+    fn unrelated_signals_yield_low_peak() {
         let mut s1 = 7u64;
         let mut s2 = 1234u64;
         let a = block_modulated_noise(16_000 * 60, &mut s1);
         let b = block_modulated_noise(16_000 * 60, &mut s2);
         let est = estimate_delay(&envelope(&a), &envelope(&b), 1200);
+        // 无关信号的比值(confidence)噪声大不可断言;判别力在绝对峰值。
         if let Some(e) = est {
-            assert!(e.confidence < 2.0, "无关信号不该有显著峰: {}", e.confidence);
+            assert!(e.peak < 0.25, "无关信号主峰 NCC 应低: {}", e.peak);
         }
     }
 
@@ -158,7 +160,12 @@ const PEAK_EXCLUSION_FRAMES: i64 = 30;
 #[derive(Debug, Clone, Copy)]
 pub struct DelayEstimate {
     pub delay_ms: u32,
+    /// 主峰/次峰比(次峰排除主峰±300ms邻域):峰的唯一性。无关信号下噪声大
+    /// (少量有效样本的最大值比,实测可到 4+),不可单独作真回声判据。
     pub confidence: f32,
+    /// 主峰 NCC 绝对值:回声强度。真回声(参考的衰减拷贝)接近 1,无关信号
+    /// 通常 <0.2——与 confidence 联合门限才可靠。
+    pub peak: f32,
 }
 
 /// 10ms RMS 能量包络。尾部不足一帧的样本并入最后一帧。
@@ -211,7 +218,7 @@ pub fn estimate_delay(ref_env: &[f32], obs_env: &[f32], max_delay_ms: u32) -> Op
         .map(|(_, s)| *s)
         .fold(f32::MIN, f32::max);
     let confidence = if second > 1e-6 { best.1 / second } else { best.1 / 1e-6 };
-    Some(DelayEstimate { delay_ms: best.0 as u32 * ENV_FRAME_MS, confidence })
+    Some(DelayEstimate { delay_ms: best.0 as u32 * ENV_FRAME_MS, confidence, peak: best.1 })
 }
 
 /// 按 obs 时间轴分窗(win_ms)逐窗估计。ref 与 obs 取同一 [start..end) 窗口,
@@ -476,9 +483,11 @@ use crate::audio::delay_estimate::{self, DelayEstimate};
 use std::io::Write;
 use std::path::Path;
 
-/// 置信度门限(主峰/次峰)。临时值 2.0——Task 6 用真实录音标定后更新,
-/// 标定依据(蓝牙场次通过率/内置扬声器场次拒绝率)写在这条注释里。
+/// 双门限(Task 6 用真实录音标定后更新,标定依据写在这条注释里):
+/// confidence(主峰/次峰比)保证峰唯一,peak(主峰 NCC 绝对值)保证回声真实存在——
+/// 无关信号的比值噪声大(实测 4+),单靠比值会误清洗。
 pub const CONFIDENCE_GATE: f32 = 2.0;
+pub const PEAK_GATE: f32 = 0.25;
 
 /// 分窗宽度与延迟搜索上限。
 const WIN_MS: u32 = 60_000;
@@ -537,7 +546,11 @@ pub fn clean_wav(
     let confident: Vec<(usize, DelayEstimate)> = wins
         .iter()
         .enumerate()
-        .filter_map(|(i, w)| w.as_ref().filter(|e| e.confidence >= CONFIDENCE_GATE).map(|e| (i, *e)))
+        .filter_map(|(i, w)| {
+            w.as_ref()
+                .filter(|e| e.confidence >= CONFIDENCE_GATE && e.peak >= PEAK_GATE)
+                .map(|e| (i, *e))
+        })
         .collect();
     if confident.is_empty() {
         return Ok(None);
@@ -915,8 +928,9 @@ fn clean_mic_before_encode(note_dir: &Path) {
             );
         }
         Ok(None) => {
-            eprintln!("离线回声清洗跳过: 未检出显著回声(置信度门限 {})",
-                crate::audio::echo_clean::CONFIDENCE_GATE);
+            eprintln!("离线回声清洗跳过: 未检出显著回声(门限 conf≥{} peak≥{})",
+                crate::audio::echo_clean::CONFIDENCE_GATE,
+                crate::audio::echo_clean::PEAK_GATE);
         }
         Err(e) => {
             let _ = std::fs::remove_file(&out_tmp);
@@ -993,7 +1007,7 @@ mod calibrate {
             60_000, 1200);
         for (i, w) in wins.iter().enumerate() {
             match w {
-                Some(e) => eprintln!("窗{i}: 延迟 {}ms 置信度 {:.2}", e.delay_ms, e.confidence),
+                Some(e) => eprintln!("窗{i}: 延迟 {}ms conf {:.2} peak {:.3}", e.delay_ms, e.confidence, e.peak),
                 None => eprintln!("窗{i}: 无估计(过短)"),
             }
         }
@@ -1021,7 +1035,7 @@ Expected: 各窗置信度低（AEC3 实时已消掉,残余弱）,`clean_wav` 返
 
 - [ ] **Step 4: 定值并写依据**
 
-把两轮实测的置信度分布写进 `CONFIDENCE_GATE` 注释（例:「蓝牙场次窗中位 X.X,内置场次窗最大 Y.Y,取几何中点 Z.Z」），更新常量。
+把两轮实测的 confidence/peak 分布写进 `CONFIDENCE_GATE`/`PEAK_GATE` 注释（例:「蓝牙场次窗中位 conf X.X peak X.XX,内置场次窗最大 conf Y.Y peak Y.YY,取几何中点」），更新两常量。
 
 - [ ] **Step 5: 全量回归 + 提交**
 
