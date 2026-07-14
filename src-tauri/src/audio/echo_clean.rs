@@ -71,13 +71,12 @@ pub struct CleanReport {
 
 /// 参考与观测的残余互相关峰值(观测性小助手,不影响清洗结果):
 /// 包络后在 ±MAX_DELAY_MS 内取 [`delay_estimate::estimate_delay`] 的 peak,
-/// 估不出(轨道过短等)时如实报 0.0,不 panic。
-fn residual_peak(reference: &[f32], observed: &[f32]) -> f32 {
+/// 估不出(轨道过短等)时返回 `None`,不 panic、不伪造 0.0(真实测得的 0.000 峰值
+/// 与"估不出"是两回事,混在一起会误导日志读者——见 T5 实测旗舰指标就是真 0.000)。
+fn residual_peak(reference: &[f32], observed: &[f32]) -> Option<f32> {
     let ref_env = delay_estimate::envelope(reference);
     let obs_env = delay_estimate::envelope(observed);
-    delay_estimate::estimate_delay(&ref_env, &obs_env, MAX_DELAY_MS)
-        .map(|e| e.peak)
-        .unwrap_or(0.0)
+    delay_estimate::estimate_delay(&ref_env, &obs_env, MAX_DELAY_MS).map(|e| e.peak)
 }
 
 /// 读 WAV(跳 44 头)为 f32 样本。
@@ -208,7 +207,15 @@ pub fn clean_wav(
             Ok(out) => {
                 let before = residual_peak(&system_aligned, &cleaned);
                 let after = residual_peak(&system_aligned, &out);
-                eprintln!("神经残余级完成: 残余互相关 {before:.3} -> {after:.3}");
+                let fmt = |p: Option<f32>| match p {
+                    Some(v) => format!("{v:.3}"),
+                    None => "n/a".to_string(),
+                };
+                eprintln!(
+                    "神经残余级完成: 残余互相关 {} -> {}",
+                    fmt(before),
+                    fmt(after)
+                );
                 cleaned = out;
                 neural = true;
             }
