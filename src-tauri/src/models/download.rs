@@ -439,6 +439,31 @@ mod tests {
         assert!(!tmp_extract_dir(&root).exists(), "解压残留即时清理");
     }
 
+    /// 真机验证(网络依赖,与既有 7 个模型依赖测试同惯例 #[ignore]):走生产同款
+    /// download_artifact 实际拉取 dtln_aec_256_1(~5.5MB,注册表最小的一个),校验落位
+    /// models 根目录 + SHA256 与 Global Constraints 钉死值一致,证明镜像/下载/校验链路
+    /// 对新工件同样生效,无需为此新写任何下载逻辑。
+    /// Run: cd src-tauri && cargo test --lib real_download_installs_dtln_aec_256_1 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_download_installs_dtln_aec_256_1_with_verified_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let a = crate::models::ARTIFACTS
+            .iter()
+            .find(|a| a.id == "dtln_aec_256_1")
+            .expect("dtln_aec_256_1 已注册");
+        let noop: &Progress = &|id, phase, received, total, msg| {
+            eprintln!("[{id}] {phase} {received}/{total} {msg}");
+        };
+        download_artifact(a, root, a.url, &AtomicBool::new(false), noop)
+            .expect("真机下载应成功");
+        let installed = root.join(a.files[0].rel_path);
+        assert!(installed.is_file(), "应落位 models 根目录");
+        assert_eq!(std::fs::metadata(&installed).unwrap().len(), a.files[0].bytes);
+        verify_file(&installed, &a.files[0]).expect("SHA256 应与钉死值一致");
+    }
+
     /// 416 免重下复装的核心路径:全量有效 .part 直接 finalize 完成安装(无网络)。
     #[test]
     fn finalize_artifact_installs_valid_full_part_without_network() {
