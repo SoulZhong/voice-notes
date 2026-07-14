@@ -1079,6 +1079,14 @@ git commit -m "离线回声清洗一期收尾:真机冒烟记录与注释修正"
 
 ---
 
+## 实施偏差记录（正文代码块为设计时点,以本节为准）
+
+- **T1** 分窗估计去掉参考前伸(负 lag 出域)、次峰排除邻域 ±3 帧→±300ms、`DelayEstimate` 增 `peak` 字段并改双门限——正文已同步修真(commits 4e331c5/95e613b)。`delay_estimate` 的 `mod tests` 改 `pub(crate) mod tests`(跨模块引用 helper 需模块本身可见)。
+- **T2** 补无增益判别测试 `clean_pair_applies_no_gain_on_quiet_near_end`(与 AGC 抬升测试同形输入、断言区间不相交,审查跟进)。
+- **T3 e2e 测试**回声合成从单 tap 改 4-tap 衰减路径:本 AEC3 构建对理想单 tap 收敛 ~6s 后线性滤波冻结(ratio≈1.0,跨 Full/Mobile/开关 NS 均复现);多 tap 更接近真实声学路径。
+- **T3 e2e 测试**本地声保持容差 ±6dB→±9dB:NS(High) 对无谐波结构的合成噪声过度抑制(纯 NS 探针实测 ~3.7x),系合成信号局限非引擎缺陷;真实语音行为由 T6 真实录音验收兜底。
+- **T3 引擎**审查实锤守恒破坏并修复(commit 69edf7f):暖机段非 160 倍数时残帧泄漏进正式 pass——补零冲洗+`cleaned.truncate(seg_end)` 硬保证;新增 `short_tail_segment_conserves_sample_count`(8s+90 样本布局)。段延迟取该段首个置信窗的值(非中位数,正文注释已过时)。
+
 ## 二期预告（另立计划,不在本计划内）
 
 一期落地并验证延迟估计器可靠后,把 `delay_estimate` 以滑窗方式接入实时链路:预延迟环形缓冲(蓝牙探测给初值)+ 每 5s 重估 + `stats().delay_ms` 观测。届时用一期标定的门限与真实分布数据定二期的调整滞回参数(80ms/置信度阈)。
