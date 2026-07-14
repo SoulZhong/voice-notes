@@ -9,11 +9,48 @@ use crate::audio::delay_estimate::{self, DelayEstimate};
 use std::io::Write;
 use std::path::Path;
 
-/// 双门限(Task 6 用真实录音标定后更新,标定依据写在这条注释里):
-/// confidence(主峰/次峰比)保证峰唯一,peak(主峰 NCC 绝对值)保证回声真实存在——
-/// 无关信号的比值噪声大(实测 4+),单靠比值会误清洗。
+/// 双门限:Task 6 用真实录音标定,标定依据如下(calibrate_note 测试,窗宽 60s)。
+///
+/// 具体笔记 id/标题不入库(隐私红线,公开仓库)——正负例与笔记的对应关系见
+/// 本地标定报告 .superpowers/sdd/task-6-report.md(git-ignored)。
+///
+/// 蓝牙重回声正例(三场,合计 70 个有效窗,应通过):
+///   正例A(complete,26 窗):conf 中位 6.46(2.47~320586.72),
+///     peak 中位 0.7815(0.321~0.864)。
+///   正例B(录制未完结态,26 窗):conf 中位 8.075(2.45~592671.69),
+///     peak 中位 0.6595(0.142~0.848)。
+///   正例C(complete,~25min,即 specs 与 audio/mod.rs 注释所引用的蓝牙外放
+///     lag≈600ms 实锤场——本次首次实际标定):26 窗中 8 窗段过短无估计,
+///     18 个有效窗 conf 中位 24045.56(1.34~358514.66),peak 中位
+///     0.1365(0.001~0.440),明显弱于前两场。仅 3 窗(窗1/2/4)同时过
+///     conf≥2.0 与新 PEAK_GATE,延迟分别为 400/500/720ms——如实记录:窗宽
+///     60s 的分窗估计下并未稳定复现文档所称的 600ms,延迟随窗口明显漂移,
+///     其余多数窗峰值过弱、无法可靠估计;该场景对回声算法而言是比前两场
+///     更严苛的边缘案例,而非典型正例,但三个过闸窗的 conf 仍有余量
+///     (最小 5.81),未推翻双闸设计。
+///   合并 70 窗:conf 中位 7.05(最小 1.34),peak 中位 0.646(最小 0.001,
+///     系正例C弱信号窗拉低)。
+/// 内置扬声器负例D(realtime AEC3 已收敛,应拒绝,15 窗:窗0 段过短无估计,
+///   其余 14 窗均有估计):
+///   peak 全部 ≤0.141(0.005~0.141);conf 反而常见破千上万(37231.22 等)——
+///   系无关信号次峰趋近 0 导致比值失真的已知现象(delay_estimate 文档已注明,
+///   此处实测幅度比原估的"4+"更极端),confidence 单独不可靠,peak 才是能把
+///   这批负例与正例分开的判据,与本文件顶部设计说明一致。
+///
+/// PEAK_GATE 取三场合并中位(0.646)与负例最大(0.141)的几何中点
+/// √(0.646×0.141)≈0.30,从 0.32 下调:正例C的大量弱信号窗把合并中位数从
+/// 仅两场时的 0.724 拉低到 0.646,新门限比旧值(仅用前两场推出的 0.32)略低,
+/// 但负例最大峰 0.141 距新门限仍有 2.1 倍余量。合计 70 窗中 18 个边缘窗被新
+/// 门限排除(正例A 无、正例B 3 个、正例C 15 个),不影响三场次各自仍有
+/// 过双闸的窗、整体判定为"应清洗"。
+/// CONFIDENCE_GATE 维持 2.0(控制者签认保持 2.0):内置负例的 conf 经
+/// best/second(second≤1e-6 时退化为 best/1e-6)分支放大到千万级,conf 分布
+/// 本就没有能把正负例分开的有意义中点,分离职责始终在 peak;正例C过
+/// PEAK_GATE 的 3 个窗 conf 最小 5.81,仍留有余量。confidence 只是 peak 的
+/// 辅助闸而非主判据,故不因这批数据上调,以免误伤未来更安静场次的边缘
+/// 正例窗。
 pub const CONFIDENCE_GATE: f32 = 2.0;
-pub const PEAK_GATE: f32 = 0.25;
+pub const PEAK_GATE: f32 = 0.30;
 
 /// 分窗宽度与延迟搜索上限。
 const WIN_MS: u32 = 60_000;
@@ -31,6 +68,11 @@ pub struct CleanReport {
 }
 
 /// 读 WAV(跳 44 头)为 f32 样本。
+///
+/// 刻意用「固定跳 44 字节 + 全量读」而非 transcode::extract_wav_data 的 RIFF
+/// 解析:①管线内 WAV 恒为标准 44 头(录制端与 decode 端都保证);②不读头内
+/// 长度字段是「跳过清洗则 mic.wav 字节不动」约束的前提——陈旧头无需预修,
+/// 别把这里"修"成 RIFF 解析器,会破坏 transcode 跳过路径的字节稳定性契约。
 fn read_wav_f32(path: &Path) -> anyhow::Result<Vec<f32>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < 44 {
@@ -306,5 +348,75 @@ mod tests {
         let out = dir.path().join("mic.clean.tmp");
         let r = clean_wav(&dir.path().join("mic.wav"), &dir.path().join("system.wav"), 0, 0, &out).unwrap();
         assert!(r.is_none());
+    }
+}
+
+#[cfg(test)]
+mod calibrate {
+    use super::*;
+
+    /// 手动标定:VN_NOTE_DIR 指向一个笔记目录(含 mic/system 的 m4a 或 wav),
+    /// 打印分窗延迟与置信度、若过门限则输出清洗文件供试听。
+    /// 清洗产物写入 VN_CALIBRATE_OUT 指定目录(未设时默认
+    /// `std::env::temp_dir()/voice-notes-calibrate`),解析后的路径总会打印。
+    /// 用法(蓝牙场次与内置扬声器场次各跑一遍):
+    ///   VN_NOTE_DIR=~/Documents/voice-notes/notes/20260708-XXXXXX \
+    ///   VN_CALIBRATE_OUT=/path/to/out \
+    ///   cargo test calibrate_note -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn calibrate_note() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("VN_NOTE_DIR").expect("需设 VN_NOTE_DIR"));
+        let tmp = tempfile::tempdir().unwrap();
+        // m4a → 16k 单声道 WAV(afconvert,与转码模块同参数)
+        let prep = |src: &str| -> std::path::PathBuf {
+            let wav = dir.join(format!("{src}.wav"));
+            if wav.exists() {
+                return wav;
+            }
+            let out = tmp.path().join(format!("{src}.wav"));
+            let st = std::process::Command::new("/usr/bin/afconvert")
+                .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+                .arg(dir.join(format!("{src}.m4a")))
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(st.success(), "afconvert 解码失败: {src}");
+            out
+        };
+        let mic = prep("mic");
+        let sys = prep("system");
+        let mic_s = read_wav_f32(&mic).unwrap();
+        let sys_s = read_wav_f32(&sys).unwrap();
+        let wins = crate::audio::delay_estimate::estimate_windows(
+            &crate::audio::delay_estimate::envelope(&sys_s),
+            &crate::audio::delay_estimate::envelope(&mic_s),
+            60_000, 1200);
+        for (i, w) in wins.iter().enumerate() {
+            match w {
+                Some(e) => eprintln!("窗{i}: 延迟 {}ms conf {:.2} peak {:.3}", e.delay_ms, e.confidence, e.peak),
+                None => eprintln!("窗{i}: 无估计(过短)"),
+            }
+        }
+        let out = tmp.path().join("mic.cleaned.wav");
+        // 输出目录:VN_CALIBRATE_OUT 环境变量指定;未设时默认系统临时目录下
+        // voice-notes-calibrate 子目录(不写死任何一次性 scratchpad 路径)。
+        let scratch = std::env::var("VN_CALIBRATE_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("voice-notes-calibrate"));
+        std::fs::create_dir_all(&scratch).unwrap();
+        eprintln!("输出目录: {}", scratch.display());
+        match clean_wav(&mic, &sys, 0, 0, &out).unwrap() {
+            Some(r) => {
+                eprintln!("清洗完成: {r:?}");
+                // 试听文件拷到输出目录(tmp 目录测试结束即删),按笔记目录名归档。
+                let note_id = dir.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+                let dest = scratch.join(format!("cleaned-{note_id}.wav"));
+                std::fs::copy(&out, &dest).unwrap();
+                eprintln!("试听文件: {}", dest.display());
+            }
+            None => eprintln!("置信度不足,跳过清洗"),
+        }
     }
 }
