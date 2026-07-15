@@ -9,6 +9,7 @@ mod settings;
 mod shortcuts;
 mod store;
 mod player;
+mod player_gate;
 mod tray;
 mod update;
 pub mod diar;
