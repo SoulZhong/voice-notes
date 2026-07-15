@@ -731,6 +731,7 @@ fn spawn_session(
                 }
             }
         }
+        let soft_aec_on = aec_roles.iter().any(|(_, r)| matches!(r, audio::aec::AecRole::Capture(_)));
 
         // 2.5) 创建/续录笔记落盘器（此后任何失败路径都要发 AbortSession 清理）。
         // 续录先握手再取锁:转码 worker 现在持锁覆盖整个转码窗口(见下方 worker 内
@@ -782,6 +783,12 @@ fn spawn_session(
         // on_final 落盘/emit 前 start_ms/end_ms 均 + base_ms（partial 无时间戳，不受影响）。
         let base_ms = writer.base_ms();
         let registry_snap = writer.registry_snapshot();
+        // 标记本笔记的 mic 轨道已启用软件 AEC（离线清洗只认这类场次）。
+        if soft_aec_on {
+            if let Err(e) = store::audio::set_track_soft_aec(&note_dir, "mic") {
+                eprintln!("软件AEC标记写入失败(不影响录制,本场将跳过离线清洗): {e}");
+            }
+        }
         // writer 所有权移交 lifecycle actor:装入 runner 的 Owned 槽后,append/说话人
         // 事件/改题/改名/收尾全部在 actor 线程串行执行。失败路径不再本地清理,改发
         // AbortSession(同信箱 FIFO,恒排在本会话已入队的管线消息之后)。

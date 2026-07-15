@@ -2,6 +2,8 @@ pub mod aec;
 pub mod resample;
 pub mod mock;
 pub mod microphone;
+pub mod delay_estimate;
+pub mod echo_clean;
 #[cfg(target_os = "macos")]
 pub mod system;
 #[cfg(target_os = "macos")]
@@ -44,8 +46,8 @@ pub trait AudioCapture: Send {
 
 /// 当前默认输出设备是否蓝牙(macOS)。用途:「保持外放音量」+ 蓝牙外放时,
 /// 蓝牙播放延迟(300~600ms+)远超 WebRTC AEC3 的延迟估计范围(约 250ms),
-/// 软件回声消除完全失效,mic 轨会混入近乎全量的对方声音(2026-07-08 面试
-/// 录音实锤:两轨互相关包络峰 lag≈600ms、mic 残余电平与 system 同量级)——
+/// 软件回声消除完全失效,mic 轨会混入近乎全量的对方声音(2026-07-08 蓝牙
+/// 实录实锤:两轨互相关包络峰 lag≈600ms、mic 残余电平与 system 同量级)——
 /// 录制页据此在开录前给出预警。查询失败一律按"非蓝牙"处理,不挡任何流程。
 #[cfg(target_os = "macos")]
 pub fn default_output_is_bluetooth() -> bool {
