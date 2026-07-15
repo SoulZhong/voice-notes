@@ -1884,7 +1884,7 @@ git commit -m "feat(note-ui): 精修稿视图/原始稿切换,重新精修与过
 - Create: `scripts/refine_golden.py`(python3 标准库,无第三方依赖)
 - Modify: `src-tauri/src/refine/recluster.rs` / `filter.rs`(仅当校准结果要求调常量)
 
-**背景与数据(不入库,本机路径):** 会话 `~/Documents/voice-notes/notes/20260706-095122`(豆包对照 `samples/智能纪要：金融相关业务架构规划 2026年7月6日.md`,时间轴偏移 0)。真实值:7 人;垃圾段 seq {1,2,21,26,27,63,233,246,319,333,414,446};保护段 seq {394,399}。
+**背景与数据(不入库,本机路径):** 一场真实会话录音(具体笔记 id 与第三方对照纪要文件均不入库,见本机 `~/Documents/voice-notes/notes/` 与 `samples/`,时间轴偏移 0)。真实值:7 人;垃圾段 seq {1,2,21,26,27,63,233,246,319,333,414,446};保护段 seq {394,399}。
 
 - [ ] **Step 1: 写 scripts/refine_golden.py**
 
@@ -1961,7 +1961,7 @@ if __name__ == "__main__":
 
 Run(依次):
 1. `npm run tauri dev` 起应用,对 golden 会议点「重新精修」(LLM 关,先校本地两段);或后续加 dev 命令直跑。
-2. `python3 scripts/refine_golden.py ~/Documents/voice-notes/notes/20260706-095122 "samples/智能纪要：金融相关业务架构规划 2026年7月6日.md"`
+2. `python3 scripts/refine_golden.py ~/Documents/voice-notes/notes/<笔记id> "samples/<第三方对照纪要>.md"`（具体文件本机选取，不入库）
 Expected: `PASS`,聚类标签数 ≤ 12,Top2 纯度 ≥ 0.80
 
 - [ ] **Step 3: 不达标则调参重跑**
