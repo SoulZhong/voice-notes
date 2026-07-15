@@ -18,6 +18,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 ## Features
 
 - **Dual-source live transcription**: captures the microphone and system audio (ScreenCaptureKit) simultaneously, so both what you say and what you hear in online meetings end up in the note. Cross-channel echo dedup keeps speaker bleed-through from being transcribed twice.
+- **No echo when meeting on speakers**: with "keep speaker volume" on, the other party's sound bleeding into your mic is handled by a multi-stage software echo canceller — real-time WebRTC AEC3 plus automatic Bluetooth-latency pre-alignment (a sliding window measures the actual speaker delay, so it keeps up even when the delay drifts), followed by an offline clean-up pass after you stop. An optional neural residual model (DTLN-aec, ~15 MB) can be downloaded to push the leftover echo below the audible floor (measured on a real meeting: residual cross-correlation 0.13→0, your own voice untouched). On playback, a cross-track gate keyed to who's speaking removes the doubling from mixing both tracks. All on-device; speaker volume is never lowered.
 - **Fully local & offline**: ASR / VAD / speaker models all run on-device via sherpa-onnx. Works without a network connection; nothing is uploaded, ever.
 - **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 30+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Mis-split entries can be merged, samples and all.
 - **Buddy tidy-up & attribution suggestions**: unnamed speakers are automatically re-identified against the library (S-Norm score normalization survives cross-meeting channel drift); audition both sides inline before merging. Duplicate names guide you to link/merge; sample-less fragment entries can be cleaned in one pass. Each person keeps multiple "session centroids" (headset / speakerphone / other conditions each get a representative voiceprint) — accuracy compounds with use.
@@ -233,7 +234,7 @@ Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (wit
 | Scenario | Recommendation |
 | --- | --- |
 | Listening only (you don't speak) | Enable **System audio only**: the mic never starts, playback volume and quality are untouched |
-| Speaker-phone meeting where your own speech must be recorded | Enable **Keep output volume while recording**: bypasses macOS voice-processing's volume ducking; echo is removed by the built-in software canceller (WebRTC AEC3) |
+| Speaker-phone meeting where your own speech must be recorded | Enable **Keep output volume while recording**: bypasses macOS voice-processing's volume ducking; echo is removed by a multi-stage software canceller — real-time WebRTC AEC3 with Bluetooth-latency pre-alignment, an offline clean-up after you stop, an optional neural residual stage (auto-enabled once the DTLN-aec model is downloaded), and a playback cross-track gate to remove mix doubling |
 | Wearing headphones | Leave both off: system echo cancellation stays on for the cleanest transcript |
 
 ## FAQ
