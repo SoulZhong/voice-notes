@@ -93,6 +93,21 @@ impl Core {
     }
 }
 
+/// 混音软限幅:多轨相加在双讲响处会越过 ±1.0,旧代码硬 clamp 会削顶产生刺耳失真。
+/// KNEE(0.95)以下逐位透传——单轨回放/多轨轻响时行为与旧版逐采样一致;越过 KNEE 才按
+/// `e/(e+r)` 拐点把超出量平滑压入 (KNEE,1.0),渐近 1.0、恒不越界、无硬削顶。KNEE 取 0.95
+/// 而非更低,是为了让绝大多数语音峰值(远低于 0.95)完全不被触碰,只驯服真正的叠加过冲。
+fn soft_limit(x: f32) -> f32 {
+    const KNEE: f32 = 0.95;
+    let a = x.abs();
+    if a <= KNEE {
+        return x;
+    }
+    let room = 1.0 - KNEE;
+    let e = a - KNEE;
+    x.signum() * (KNEE + room * (e / (e + room)))
+}
+
 /// 混音核心(纯函数,单测覆盖):从 cursor 起以 step 源采样/帧填充 frames 帧,
 /// 每帧写 channels 个声道(同值)。返回新 cursor。播完(cursor≥total)置停并静音填充。
 fn mix_frames(core: &Core, out: &mut [f32], channels: usize, step: f64) -> f64 {
@@ -125,7 +140,7 @@ fn mix_frames(core: &Core, out: &mut [f32], channels: usize, step: f64) -> f64 {
                 core.playing.store(false, Ordering::Relaxed); // 播完自动停,事件如实带出
             }
         }
-        let v = acc.clamp(-1.0, 1.0);
+        let v = soft_limit(acc);
         for ch in frame.iter_mut() {
             *ch = v;
         }
@@ -461,6 +476,128 @@ mod tests {
             cursor_bits: AtomicU64::new(0f64.to_bits()),
             playing: AtomicBool::new(true),
         }
+    }
+
+    fn track_from_canonical_wav(
+        bytes: Vec<u8>,
+        offset_ms: u64,
+        source: &str,
+        gate: Vec<crate::player_gate::GateSpan>,
+    ) -> Track {
+        let len_samples = (bytes.len() as u64 - HEADER_LEN) / 2;
+        Track {
+            data: TrackBytes::Mem(bytes),
+            offset_samples: offset_ms * 16,
+            len_samples,
+            muted: AtomicBool::new(false),
+            source: source.into(),
+            gate,
+        }
+    }
+
+    /// 离线复现真实播放器混音,供排查"叠放两遍/门控错位"类回放 bug。
+    /// 解码走生产同款 `decode_m4a_to_standard_wav`(44 头 canonical),门控走真 build_gate,
+    /// 采样/插值/门控全部经真 `mix_frames`,48k 设备率(与真机同 step=1/3)。
+    /// 输出 48k 单声道 WAV,可直接试听或做自相关看有没有被叠出回声。
+    /// env: VN_MIX_NOTE=笔记目录  VN_MIX_OUT=输出wav  VN_MIX_START_MS(默0) VN_MIX_DUR_MS(默600000)
+    #[test]
+    #[ignore]
+    fn render_playback_mix() {
+        let note = std::path::PathBuf::from(std::env::var("VN_MIX_NOTE").expect("VN_MIX_NOTE"));
+        let out_p = std::env::var("VN_MIX_OUT").expect("VN_MIX_OUT");
+        let start_ms: u64 =
+            std::env::var("VN_MIX_START_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dur_ms: u64 =
+            std::env::var("VN_MIX_DUR_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(600_000);
+
+        // 生产同款解码:m4a → 44 头 canonical WAV(afconvert 的 FLLR 头已被 extract 掉)。
+        let tmp = tempfile::tempdir().unwrap();
+        let decode = |src: &str| -> Vec<u8> {
+            let m4a = note.join(format!("{src}.m4a"));
+            let wav = note.join(format!("{src}.wav"));
+            if wav.exists() {
+                return std::fs::read(&wav).unwrap();
+            }
+            let dest = tmp.path().join(format!("{src}.wav"));
+            crate::store::transcode::decode_m4a_to_standard_wav(&m4a, &dest).unwrap();
+            std::fs::read(&dest).unwrap()
+        };
+
+        // 真门控:segments.jsonl → build_gate(只压 mic)。
+        let segs = crate::player_gate::parse_segments_jsonl(&note.join("segments.jsonl"));
+        let gate = crate::player_gate::build_gate(&segs);
+        eprintln!("门控压低区间: {} 个", gate.len());
+
+        // 真轨道偏移:audio.json。
+        let meta = crate::store::audio::load_audio_meta(&note);
+        let off = |s: &str| meta.tracks.get(s).map(|t| t.offset_ms).unwrap_or(0);
+        let mic = track_from_canonical_wav(decode("mic"), off("mic"), "mic", gate);
+        let sys = track_from_canonical_wav(decode("system"), off("system"), "system", Vec::new());
+        eprintln!(
+            "mic {} 采样 offset {}ms | system {} 采样 offset {}ms",
+            mic.len_samples, off("mic"), sys.len_samples, off("system")
+        );
+        let core = core_of(vec![mic, sys]);
+
+        // 48k 设备(真机同 step),从 start_ms 渲染 dur_ms。
+        let device_rate = 48_000u32;
+        let step = SRC_RATE / device_rate as f64;
+        core.set_cursor((start_ms * 16) as f64);
+        let out_frames = (dur_ms * device_rate as u64 / 1000) as usize;
+        let mut pcm: Vec<i16> = Vec::with_capacity(out_frames);
+        let mut buf = vec![0f32; device_rate as usize]; // 每次 1s,单声道
+        let mut done = 0usize;
+        while done < out_frames {
+            let n = (out_frames - done).min(buf.len());
+            let slice = &mut buf[..n];
+            slice.iter_mut().for_each(|v| *v = 0.0);
+            mix_frames(&core, slice, 1, step);
+            pcm.extend(slice.iter().map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16));
+            done += n;
+        }
+
+        // 写 44 头 WAV @ device_rate 单声道 16-bit。
+        let data_len = (pcm.len() * 2) as u32;
+        let mut h: Vec<u8> = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&(36 + data_len).to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"fmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&device_rate.to_le_bytes());
+        h.extend_from_slice(&(device_rate * 2).to_le_bytes());
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&data_len.to_le_bytes());
+        let mut bytes = h;
+        bytes.reserve(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&out_p, &bytes).unwrap();
+        eprintln!("渲染完成: {} 帧 @ {}Hz → {}", pcm.len(), device_rate, out_p);
+    }
+
+    /// 软限幅:KNEE 下逐位透传,过冲平滑压入且恒不越界。
+    #[test]
+    fn soft_limit_transparent_below_knee_and_bounded_above() {
+        // 透传区:单轨/轻响逐位不变。
+        for x in [0.0f32, 0.25, -0.5, 0.75, 0.9, 0.95, -0.95] {
+            assert_eq!(soft_limit(x), x, "KNEE 下必须逐位透传: {x}");
+        }
+        // 过冲区:被压、但绝不越界,且单调保号。
+        for x in [0.96f32, 1.0, 1.5, 2.0, 5.0] {
+            let y = soft_limit(x);
+            assert!(y > 0.95 && y < 1.0, "过冲压入 (0.95,1.0): {x}->{y}");
+            assert_eq!(soft_limit(-x), -y, "奇对称");
+        }
+        // 双讲典型过冲 acc=2.0 不再硬削顶到 1.0。
+        assert!((soft_limit(2.0) - 0.9976).abs() < 1e-3);
+        // 连续:KNEE 两侧不跳变。
+        assert!((soft_limit(0.9501) - 0.95).abs() < 1e-3);
     }
 
     /// step=1(设备率=源率)双声道:两轨错位叠加,offset 之前只有先行轨。
