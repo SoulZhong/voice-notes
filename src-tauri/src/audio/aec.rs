@@ -52,8 +52,45 @@ pub fn new_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
     });
     let ap = Arc::new(ap);
     Ok((
-        AecRender { ap: ap.clone(), buf: Vec::new() },
-        AecCapture { ap, buf: Vec::new() },
+        AecRender { ap: ap.clone(), buf: Vec::new(), align: None },
+        AecCapture { ap, buf: Vec::new(), align: None, frames_since_stats: 0 },
+    ))
+}
+
+/// 二期生产实时对:AEC3 + AGC2(同 new_pair 参数) + NS(Moderate,实时流同时供
+/// ASR/声纹,取温和档;离线清洗的 High 档见 new_clean_pair) + 实时预对齐。
+/// initial_predelay_ms 由调用方按输出设备给(蓝牙 ≈450,其他 0);之后由
+/// AlignState 滑窗实测接管。
+pub fn new_aligned_pair(
+    sample_rate: u32,
+    initial_predelay_ms: u32,
+) -> anyhow::Result<(AecRender, AecCapture, Arc<crate::audio::aec_align::AlignState>)> {
+    let ap = Processor::new(sample_rate).map_err(|e| anyhow::anyhow!("AEC 初始化失败: {e}"))?;
+    ap.set_config(Config {
+        echo_canceller: Some(config::EchoCanceller::default()),
+        noise_suppression: Some(config::NoiseSuppression {
+            level: config::NoiseSuppressionLevel::Moderate,
+            ..Default::default()
+        }),
+        gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+            input_volume_controller_enabled: false,
+            adaptive_digital: Some(config::AdaptiveDigital {
+                headroom_db: 3.0,
+                max_gain_db: 60.0,
+                initial_gain_db: 22.0,
+                max_gain_change_db_per_second: 12.0,
+                max_output_noise_level_dbfs: -44.0,
+            }),
+            fixed_digital: config::FixedDigital::default(),
+        })),
+        ..Default::default()
+    });
+    let ap = Arc::new(ap);
+    let align = crate::audio::aec_align::new(initial_predelay_ms);
+    Ok((
+        AecRender { ap: ap.clone(), buf: Vec::new(), align: Some(align.clone()) },
+        AecCapture { ap, buf: Vec::new(), align: Some(align.clone()), frames_since_stats: 0 },
+        align,
     ))
 }
 
@@ -72,8 +109,8 @@ pub fn new_clean_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture
     });
     let ap = Arc::new(ap);
     Ok((
-        AecRender { ap: ap.clone(), buf: Vec::new() },
-        AecCapture { ap, buf: Vec::new() },
+        AecRender { ap: ap.clone(), buf: Vec::new(), align: None },
+        AecCapture { ap, buf: Vec::new(), align: None, frames_since_stats: 0 },
     ))
 }
 
@@ -87,12 +124,21 @@ pub enum AecRole {
 pub struct AecRender {
     ap: Arc<Processor>,
     buf: Vec<f32>,
+    align: Option<Arc<crate::audio::aec_align::AlignState>>,
 }
 
 impl AecRender {
     /// 喂入 system 路重采样后的 16k 单声道样本。逐 10ms 帧 analyze;
     /// 失败只打日志(远端分析失败不该影响 system 路自身的转写)。
-    pub fn push(&mut self, samples: &[f32]) {
+    /// align 为 Some 时先经预对齐(扣压/放行按实测延迟调节)再分帧喂入。
+    pub fn push(&mut self, input: &[f32]) {
+        let aligned: Vec<f32>;
+        let samples: &[f32] = if let Some(a) = &self.align {
+            aligned = a.on_render(input);
+            &aligned
+        } else {
+            input
+        };
         self.buf.extend_from_slice(samples);
         let full = (self.buf.len() / FRAME) * FRAME;
         for chunk in self.buf[..full].chunks(FRAME) {
@@ -108,18 +154,37 @@ impl AecRender {
 pub struct AecCapture {
     ap: Arc<Processor>,
     buf: Vec<f32>,
+    align: Option<Arc<crate::audio::aec_align::AlignState>>,
+    frames_since_stats: usize,
 }
+
+/// 每 1000 个 10ms 帧(10s)打一次 AEC3 内部延迟估计观测日志。
+const STATS_EVERY_FRAMES: usize = 1000;
 
 impl AecCapture {
     /// 处理 mic 路 16k 单声道样本,返回消回声后的样本(10ms 整帧倍数;不足一帧的
     /// 余量滞留到下次调用)。单帧处理失败原样透传——宁可留回声也不丢波形。
+    /// align 为 Some 时先累积 obs 包络(消回声之前,供滑窗重估用),再走既有
+    /// 消回声流程。
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
+        if let Some(a) = &self.align {
+            a.on_capture(samples);
+        }
         self.buf.extend_from_slice(samples);
         let full = (self.buf.len() / FRAME) * FRAME;
         let mut out: Vec<f32> = self.buf.drain(..full).collect();
         for chunk in out.chunks_mut(FRAME) {
             if let Err(e) = self.ap.process_capture_frame([&mut chunk[..]]) {
                 eprintln!("AEC capture 处理失败(该帧原样透传): {e}");
+            }
+            if self.align.is_some() {
+                self.frames_since_stats += 1;
+                if self.frames_since_stats >= STATS_EVERY_FRAMES {
+                    self.frames_since_stats = 0;
+                    if let Some(d) = self.ap.get_stats().delay_ms {
+                        eprintln!("AEC3 内部延迟估计: {d}ms (预对齐已扣压部分不计入)");
+                    }
+                }
             }
         }
         out
@@ -247,6 +312,48 @@ mod tests {
         let in_p = power(&near[tail_from..]);
         let out_p = power(&out_tail);
         assert!(out_p <= in_p * 1.2, "清洗对不得放大近端: in={in_p:.8} out={out_p:.8}");
+    }
+
+    /// 二期端到端判别测试:600ms 回声(蓝牙量级,远超 AEC3 内置 ~250ms 估计范围),
+    /// aligned pair 从预延迟 0 起步,应在滑窗重估+预对齐后把回声消下去。
+    /// 这正是 new_pair 做不到的场景(一期背景:蓝牙外放软件消回声完全失效)。
+    ///
+    /// 与一期"单抽头冻结"实锤的关系(echo_clean.rs 同名注释):那次冻结在离线
+    /// 双 pass 重喂+无 AGC 构型下复现,探针集未含 AGC2;本测试为单次流式+AGC2,
+    /// 单抽头实测未冻结(尾段 ~78dB 衰减),机理未定论(AGC2 持续增益扰动或
+    /// 单次流式无重喂,皆为候选解释)。刻意保留单抽头:若未来配置变更让冻结在
+    /// 此构型复现,本断言当场红——这正是要的哨兵行为,届时按一期方法换 4 抽头
+    /// 并记录构型差异。
+    #[test]
+    fn aligned_pair_cancels_600ms_echo_after_adjustment() {
+        use crate::audio::delay_estimate::tests::block_modulated_noise;
+        let (mut r, mut c, align) = new_aligned_pair(16_000, 0).unwrap();
+        let mut seed = 77u64;
+        let far = block_modulated_noise(16_000 * 45, &mut seed); // 45s
+        let delay = 9600; // 600ms
+        let echo_gain = 0.5f32;
+        let mut near = vec![0.0f32; far.len()];
+        for i in delay..far.len() {
+            near[i] = far[i - delay] * echo_gain;
+        }
+        let tail_from = far.len() - 16_000 * 5; // 只评估最后 5s(调整+重收敛之后)
+        let mut out_tail = Vec::new();
+        for (i, (f, n)) in far.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+            r.push(f); // align 为 Some 时 push 内部先过 AlignState 再分帧喂入
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        // 预对齐应已发生(600-100=500ms 附近)。
+        let p = align.predelay_ms() as i64;
+        assert!((p - 500).unsigned_abs() <= 60, "预延迟应≈500ms,实际 {p}ms");
+        let echo_power = power(&near[tail_from..]);
+        let out_power = power(&out_tail);
+        assert!(
+            out_power < echo_power / 4.0,
+            "预对齐后 600ms 回声应至少衰减 6dB: {echo_power:.6} -> {out_power:.6}"
+        );
     }
 }
 
