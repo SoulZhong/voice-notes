@@ -200,9 +200,13 @@ pub fn clean_wav(
         }
     }
 
-    // 神经残余级(增值层):模型在场才跑;失败保留 AEC3 输出,永不 panic、不阻塞转码。
+    // 神经残余级(增值层):两个模型文件都在才跑;失败保留 AEC3 输出,永不 panic、不阻塞转码。
+    // 要求配对齐全(而非只探第一个)——两工件是独立下载行,半下载态下只探第一个会让
+    // load 每条笔记都因缺第二个文件报错刷日志;齐备才启用,缺任一等同"未下载"静默跳过。
     let mut neural = false;
-    if models_dir.join("dtln_aec_256_1.onnx").exists() {
+    if models_dir.join("dtln_aec_256_1.onnx").exists()
+        && models_dir.join("dtln_aec_256_2.onnx").exists()
+    {
         match crate::audio::neural_aec::suppress_residual(&cleaned, &system_aligned, models_dir) {
             Ok(out) => {
                 let before = residual_peak(&system_aligned, &cleaned);
