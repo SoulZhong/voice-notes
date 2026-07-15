@@ -5,6 +5,7 @@ pub mod microphone;
 pub mod delay_estimate;
 pub mod echo_clean;
 pub mod aec_align;
+pub mod neural_aec;
 #[cfg(target_os = "macos")]
 pub mod system;
 #[cfg(target_os = "macos")]

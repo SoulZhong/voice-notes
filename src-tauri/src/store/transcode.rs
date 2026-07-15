@@ -113,7 +113,7 @@ pub fn transcode_note_dir(note_dir: &Path) {
     }
     // 离线回声清洗(增值层,内部消化一切失败):必须在 encode 循环前——
     // 清洗改写 mic.wav,encode 后 WAV 已删。
-    clean_mic_before_encode(note_dir);
+    clean_mic_before_encode(note_dir, &crate::models::root());
     for source in sources_with_suffix(note_dir, ".wav") {
         let wav = note_dir.join(format!("{source}.wav"));
         let m4a = note_dir.join(format!("{source}.m4a"));
@@ -177,7 +177,10 @@ fn transcode_one(
 
 /// encode 前的离线回声清洗:仅当 mic.wav+system.wav 都在、mic 轨带 soft_aec
 /// 标记、且延迟估计过置信度门限。任何失败/跳过只 eprintln,转码照旧。
-fn clean_mic_before_encode(note_dir: &Path) {
+///
+/// `models_dir` 透传给 `echo_clean::clean_wav` 的神经残余级判定(生产调用方传
+/// `models::root()`;测试传专属空 tempdir,与全局模型目录状态解耦,见 echo_clean 注释)。
+fn clean_mic_before_encode(note_dir: &Path, models_dir: &Path) {
     let mic = note_dir.join("mic.wav");
     let system = note_dir.join("system.wav");
     if !mic.exists() || !system.exists() {
@@ -194,7 +197,7 @@ fn clean_mic_before_encode(note_dir: &Path) {
     // 不影响;encode 前的修头由 transcode_one 统一做。跳过清洗的路径必须严格
     // 字节不动(审查约束)。
     let out_tmp = note_dir.join("mic.wav.clean.tmp");
-    match crate::audio::echo_clean::clean_wav(&mic, &system, mic_off, sys_off, &out_tmp) {
+    match crate::audio::echo_clean::clean_wav(&mic, &system, mic_off, sys_off, &out_tmp, models_dir) {
         Ok(Some(report)) => {
             if let Err(e) = std::fs::rename(&out_tmp, &mic) {
                 let _ = std::fs::remove_file(&out_tmp);
@@ -205,6 +208,7 @@ fn clean_mic_before_encode(note_dir: &Path) {
                 delay_ms: report.delay_ms,
                 confidence: report.confidence,
                 segments: report.segments,
+                neural: Some(report.neural),
             };
             if let Err(e) = crate::store::audio::set_track_clean_info(note_dir, "mic", info) {
                 eprintln!("清洗报告写 meta 失败(音频已清洗): {e}");
@@ -778,11 +782,14 @@ mod tests {
 
     #[test]
     fn clean_runs_only_with_flag_system_and_confidence() {
+        // models_dir 每情形传各自的空 tempdir(与 fixture 同目录,天然无 dtln 工件):
+        // 神经级判定与全局 models::root() 解耦,不受其它测试/T5 真机验收拷模型影响。
+
         // 情形1:齐备+有回声 → mic.wav 被替换,meta 记报告
         let d1 = tempfile::tempdir().unwrap();
         clean_fixture(d1.path(), true, true, true);
         let before = std::fs::read(d1.path().join("mic.wav")).unwrap();
-        clean_mic_before_encode(d1.path());
+        clean_mic_before_encode(d1.path(), d1.path());
         let after = std::fs::read(d1.path().join("mic.wav")).unwrap();
         assert_ne!(before, after, "有回声应被清洗");
         let meta = crate::store::audio::load_audio_meta(d1.path());
@@ -793,21 +800,21 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         clean_fixture(d2.path(), true, false, true);
         let before = std::fs::read(d2.path().join("mic.wav")).unwrap();
-        clean_mic_before_encode(d2.path());
+        clean_mic_before_encode(d2.path(), d2.path());
         assert_eq!(before, std::fs::read(d2.path().join("mic.wav")).unwrap());
 
         // 情形3:无 system 轨 → 字节不动
         let d3 = tempfile::tempdir().unwrap();
         clean_fixture(d3.path(), false, true, true);
         let before = std::fs::read(d3.path().join("mic.wav")).unwrap();
-        clean_mic_before_encode(d3.path());
+        clean_mic_before_encode(d3.path(), d3.path());
         assert_eq!(before, std::fs::read(d3.path().join("mic.wav")).unwrap());
 
         // 情形4:齐备但无回声(置信度不过门限) → 字节不动,meta 无报告
         let d4 = tempfile::tempdir().unwrap();
         clean_fixture(d4.path(), true, true, false);
         let before = std::fs::read(d4.path().join("mic.wav")).unwrap();
-        clean_mic_before_encode(d4.path());
+        clean_mic_before_encode(d4.path(), d4.path());
         assert_eq!(before, std::fs::read(d4.path().join("mic.wav")).unwrap());
         let meta = crate::store::audio::load_audio_meta(d4.path());
         assert!(meta.tracks["mic"].clean.is_none());
@@ -835,7 +842,7 @@ mod tests {
         bytes[40..44].copy_from_slice(&data_len.to_le_bytes());
         std::fs::write(&mic, &bytes).unwrap();
         let before = std::fs::read(&mic).unwrap();
-        clean_mic_before_encode(dir.path());
+        clean_mic_before_encode(dir.path(), dir.path());
         assert_eq!(before, std::fs::read(&mic).unwrap(), "跳过清洗必须连头字节都不动");
     }
 }
