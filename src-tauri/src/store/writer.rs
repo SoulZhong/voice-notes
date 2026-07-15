@@ -122,8 +122,9 @@ impl NoteWriter {
             id = format!("{base}-{n}");
         };
         std::fs::create_dir(&dir)?;
-        // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
-        let lock = super::notelock::NoteLock::try_exclusive(&dir)
+        // 目录已定、segments 句柄未开:此处取锁(有界重试吸收瞬时竞争,见 NoteLock::acquire),
+        // 全部重试仍拿不到说明另一实例正占着本笔记。
+        let lock = super::notelock::NoteLock::acquire(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
         let meta = NoteMeta {
@@ -164,8 +165,9 @@ impl NoteWriter {
         if !dir.is_dir() {
             anyhow::bail!("笔记不存在: {id}");
         }
-        // 目录已定、segments 句柄未开:此处取锁,拿不到说明另一实例正占着本笔记。
-        let lock = super::notelock::NoteLock::try_exclusive(&dir)
+        // 目录已定、segments 句柄未开:此处取锁(有界重试吸收瞬时竞争,见 NoteLock::acquire),
+        // 全部重试仍拿不到说明另一实例正占着本笔记。
+        let lock = super::notelock::NoteLock::acquire(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
 
