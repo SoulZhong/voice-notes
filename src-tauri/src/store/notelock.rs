@@ -19,6 +19,24 @@ pub struct NoteLock {
 }
 
 impl NoteLock {
+    /// 有界重试获取独占锁:非阻塞 flock 在瞬时竞争下会假性 EWOULDBLOCK
+    /// (同进程串行编辑的锁交接窗口、macOS 高负载下 close 释放 flock 的传播延迟),
+    /// 短退避重试(~100ms 内)把瞬时占用转成短暂等待;真正被长期持有(别的进程在
+    /// 录制/转码,持锁数秒~数分钟)则全部失败返回 None。生产编辑/录制路径与并发单测
+    /// 都应走这里,而非裸 try_exclusive(后者留给需断言"立即拒绝"语义的场景)。
+    pub fn acquire(dir: &Path) -> std::io::Result<Option<NoteLock>> {
+        const RETRIES: u32 = 5;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+        for attempt in 0..RETRIES {
+            match Self::try_exclusive(dir)? {
+                Some(lock) => return Ok(Some(lock)),
+                None if attempt + 1 < RETRIES => std::thread::sleep(BACKOFF),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// 非阻塞尝试独占。Ok(None) = 已被其他持有者(进程或本进程另一句柄)占用。
     pub fn try_exclusive(dir: &Path) -> std::io::Result<Option<NoteLock>> {
         let f = OpenOptions::new().create(true).write(true).open(dir.join(LOCK_FILE))?;

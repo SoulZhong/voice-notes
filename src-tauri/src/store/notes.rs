@@ -26,7 +26,8 @@ fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
 /// 重写被明确拒绝——这是对「双实例重写丢转写」事故的直接防线。
 /// 返回值须存活到写盘完成(锁生命周期即保护窗口)。
 fn write_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
-    super::notelock::NoteLock::try_exclusive(dir)
+    // 有界重试获取(见 NoteLock::acquire):吸收非阻塞 flock 在瞬时竞争下的假性占用。
+    super::notelock::NoteLock::acquire(dir)
         .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),请稍后再试"))
 }
