@@ -105,10 +105,15 @@ fn sources_with_suffix(note_dir: &Path, suffix: &str) -> Vec<String> {
 /// `<source>.m4a` 已存在(说明上次「rename 完成、删 WAV 前」崩了),直接删 WAV 收口,
 /// 不重复编码。任何一步失败:删掉本源的 tmp、留住 WAV、eprintln、继续下一轨。
 pub fn transcode_note_dir(note_dir: &Path) {
+    // 清残留:上次清洗写到一半的 tmp(与 .m4a.tmp 同理)。
+    let _ = std::fs::remove_file(note_dir.join("mic.wav.clean.tmp"));
     // 清残留:上次编码写到一半 `<x>.m4a.tmp` 就崩,这些半成品既不完整也不该被枚举。
     for source in sources_with_suffix(note_dir, ".m4a.tmp") {
         let _ = std::fs::remove_file(note_dir.join(format!("{source}.m4a.tmp")));
     }
+    // 离线回声清洗(增值层,内部消化一切失败):必须在 encode 循环前——
+    // 清洗改写 mic.wav,encode 后 WAV 已删。
+    clean_mic_before_encode(note_dir);
     for source in sources_with_suffix(note_dir, ".wav") {
         let wav = note_dir.join(format!("{source}.wav"));
         let m4a = note_dir.join(format!("{source}.m4a"));
@@ -168,6 +173,57 @@ fn transcode_one(
         eprintln!("转码成功但删原始 WAV 失败,留待下次收敛({}): {e}", wav.display());
     }
     Ok(())
+}
+
+/// encode 前的离线回声清洗:仅当 mic.wav+system.wav 都在、mic 轨带 soft_aec
+/// 标记、且延迟估计过置信度门限。任何失败/跳过只 eprintln,转码照旧。
+fn clean_mic_before_encode(note_dir: &Path) {
+    let mic = note_dir.join("mic.wav");
+    let system = note_dir.join("system.wav");
+    if !mic.exists() || !system.exists() {
+        return;
+    }
+    // load_audio_meta 不可失败:损坏/缺失回落空表 → 无 soft_aec 标记 → 下一行返回。
+    let meta = crate::store::audio::load_audio_meta(note_dir);
+    if meta.tracks.get("mic").and_then(|t| t.soft_aec) != Some(true) {
+        return; // VPIO 场次/旧笔记:无标记不清洗
+    }
+    let mic_off = meta.tracks.get("mic").map(|t| t.offset_ms).unwrap_or(0);
+    let sys_off = meta.tracks.get("system").map(|t| t.offset_ms).unwrap_or(0);
+    // 刻意不预修 WAV 头:清洗引擎按字节读(44 头后全量,不看头内长度字段),陈旧头
+    // 不影响;encode 前的修头由 transcode_one 统一做。跳过清洗的路径必须严格
+    // 字节不动(审查约束)。
+    let out_tmp = note_dir.join("mic.wav.clean.tmp");
+    match crate::audio::echo_clean::clean_wav(&mic, &system, mic_off, sys_off, &out_tmp) {
+        Ok(Some(report)) => {
+            if let Err(e) = std::fs::rename(&out_tmp, &mic) {
+                let _ = std::fs::remove_file(&out_tmp);
+                eprintln!("清洗产物替换失败,保留原 mic.wav: {e}");
+                return;
+            }
+            let info = crate::store::audio::CleanInfo {
+                delay_ms: report.delay_ms,
+                confidence: report.confidence,
+                segments: report.segments,
+            };
+            if let Err(e) = crate::store::audio::set_track_clean_info(note_dir, "mic", info) {
+                eprintln!("清洗报告写 meta 失败(音频已清洗): {e}");
+            }
+            eprintln!(
+                "离线回声清洗完成: 延迟 {}ms 置信度 {:.2} 分段 {}",
+                report.delay_ms, report.confidence, report.segments
+            );
+        }
+        Ok(None) => {
+            eprintln!("离线回声清洗跳过: 未检出显著回声(门限 conf≥{} peak≥{})",
+                crate::audio::echo_clean::CONFIDENCE_GATE,
+                crate::audio::echo_clean::PEAK_GATE);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_tmp);
+            eprintln!("离线回声清洗失败,原样转码: {e}");
+        }
+    }
 }
 
 /// 续录前把整个笔记目录解回 WAV:逐 `<source>.m4a` 解成 `<source>.wav`,校验通过才替换。
@@ -687,5 +743,99 @@ mod tests {
         decode_note_to_wav(tmp.path());
         assert!(tmp.path().join("mic.m4a.bad").exists(), "坏 m4a 移出枚举,字节保留");
         assert!(!tmp.path().join("mic.wav").exists());
+    }
+
+    /// 清洗触发矩阵。合成信号同 echo_clean 测试:system 60s,mic 前半纯回声。
+    fn clean_fixture(dir: &std::path::Path, with_system: bool, with_flag: bool, echo: bool) {
+        use crate::audio::delay_estimate::tests::block_modulated_noise;
+        let mut s1 = 21u64;
+        let system = block_modulated_noise(16_000 * 60, &mut s1);
+        let mut mic = vec![0.0f32; 16_000 * 60];
+        if echo {
+            for i in 9600..mic.len() {
+                mic[i] = system[i - 9600] * 0.5;
+            }
+        } else {
+            let mut s2 = 888u64;
+            mic = block_modulated_noise(16_000 * 60, &mut s2); // 与 system 无关
+        }
+        let write = |name: &str, samples: &[f32]| {
+            let pcm: Vec<u8> = samples.iter()
+                .flat_map(|s| crate::store::audio::f32_to_s16(*s).to_le_bytes()).collect();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&wav_header(pcm.len() as u32));
+            buf.extend_from_slice(&pcm);
+            std::fs::write(dir.join(name), buf).unwrap();
+        };
+        write("mic.wav", &mic);
+        if with_system {
+            write("system.wav", &system);
+        }
+        if with_flag {
+            crate::store::audio::set_track_soft_aec(dir, "mic").unwrap();
+        }
+    }
+
+    #[test]
+    fn clean_runs_only_with_flag_system_and_confidence() {
+        // 情形1:齐备+有回声 → mic.wav 被替换,meta 记报告
+        let d1 = tempfile::tempdir().unwrap();
+        clean_fixture(d1.path(), true, true, true);
+        let before = std::fs::read(d1.path().join("mic.wav")).unwrap();
+        clean_mic_before_encode(d1.path());
+        let after = std::fs::read(d1.path().join("mic.wav")).unwrap();
+        assert_ne!(before, after, "有回声应被清洗");
+        let meta = crate::store::audio::load_audio_meta(d1.path());
+        assert!(meta.tracks["mic"].clean.is_some(), "清洗报告应落 meta");
+        assert!(!d1.path().join("mic.wav.clean.tmp").exists(), "tmp 应被 rename 走");
+
+        // 情形2:无 soft_aec 标记 → 字节不动
+        let d2 = tempfile::tempdir().unwrap();
+        clean_fixture(d2.path(), true, false, true);
+        let before = std::fs::read(d2.path().join("mic.wav")).unwrap();
+        clean_mic_before_encode(d2.path());
+        assert_eq!(before, std::fs::read(d2.path().join("mic.wav")).unwrap());
+
+        // 情形3:无 system 轨 → 字节不动
+        let d3 = tempfile::tempdir().unwrap();
+        clean_fixture(d3.path(), false, true, true);
+        let before = std::fs::read(d3.path().join("mic.wav")).unwrap();
+        clean_mic_before_encode(d3.path());
+        assert_eq!(before, std::fs::read(d3.path().join("mic.wav")).unwrap());
+
+        // 情形4:齐备但无回声(置信度不过门限) → 字节不动,meta 无报告
+        let d4 = tempfile::tempdir().unwrap();
+        clean_fixture(d4.path(), true, true, false);
+        let before = std::fs::read(d4.path().join("mic.wav")).unwrap();
+        clean_mic_before_encode(d4.path());
+        assert_eq!(before, std::fs::read(d4.path().join("mic.wav")).unwrap());
+        let meta = crate::store::audio::load_audio_meta(d4.path());
+        assert!(meta.tracks["mic"].clean.is_none());
+    }
+
+    /// 崩溃残留的 .clean.tmp 在下次转码时被清扫。
+    #[test]
+    fn stale_clean_tmp_swept_on_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mic.wav.clean.tmp"), b"garbage").unwrap();
+        transcode_note_dir(dir.path());
+        assert!(!dir.path().join("mic.wav.clean.tmp").exists());
+    }
+
+    /// 陈旧 WAV 头(头内 data 长度小于实际)在跳过清洗的路径上必须字节不动——
+    /// 预修头已刻意移除,此测试锁住该约束。
+    #[test]
+    fn stale_header_untouched_when_cleaning_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        clean_fixture(dir.path(), true, true, false); // 齐备+标记,但无回声(置信度拒)
+        // 人为做旧 mic.wav 头:把 data 长度字段改小 1000 字节(模拟崩溃后未回写)。
+        let mic = dir.path().join("mic.wav");
+        let mut bytes = std::fs::read(&mic).unwrap();
+        let data_len = (bytes.len() - 44) as u32 - 1000;
+        bytes[40..44].copy_from_slice(&data_len.to_le_bytes());
+        std::fs::write(&mic, &bytes).unwrap();
+        let before = std::fs::read(&mic).unwrap();
+        clean_mic_before_encode(dir.path());
+        assert_eq!(before, std::fs::read(&mic).unwrap(), "跳过清洗必须连头字节都不动");
     }
 }

@@ -76,10 +76,26 @@ pub struct TrackMeta {
     /// 音轨,替代按转写段落 rms 聚合的包络(说话稀疏时后者近乎空白,像显示故障)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waveform: Option<Vec<u8>>,
+    /// 本轨录制时走了软件 AEC 路径(「保持外放音量」):转码前的离线回声清洗
+    /// 只对这类轨道启动。录制启用时写 true,从不清除(续录混合场景由清洗端的
+    /// 置信度门限兜底)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_aec: Option<bool>,
+    /// 离线清洗结果(排障用):估计延迟/置信度/分段数。None=未清洗过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean: Option<CleanInfo>,
 }
 
 /// 波形桶数,与前端 WAVE_BARS 对齐(260 桶约 1KB JSON,audio.json 体积可忽略)。
 pub const WAVEFORM_BUCKETS: usize = 260;
+
+/// 离线清洗结果:估计延迟/置信度/分段数。存进 audio.json 用于排障。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanInfo {
+    pub delay_ms: u32,
+    pub confidence: f32,
+    pub segments: u32,
+}
 
 /// 从 16k/mono/s16 WAV 流式计算波形桶:每桶取峰值 |i16| 折算 0..255。
 /// BufReader 顺序读,1 小时音频(~230MB)亚秒级;不整读进内存。
@@ -199,6 +215,23 @@ pub fn clear_track_compressed(note_dir: &Path, source: &str) -> anyhow::Result<(
     save_audio_meta(note_dir, &meta)
 }
 
+/// 录制装配软件 AEC 成功后调用:给 <source> 轨打 soft_aec 标记。幂等。
+/// 持 META_LOCK,与 set_track_compressed 同模板。
+pub fn set_track_soft_aec(note_dir: &Path, source: &str) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.tracks.entry(source.to_string()).or_default().soft_aec = Some(true);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 离线清洗完成后调用:记录清洗报告。持 META_LOCK。
+pub fn set_track_clean_info(note_dir: &Path, source: &str, info: CleanInfo) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.tracks.entry(source.to_string()).or_default().clean = Some(info);
+    save_audio_meta(note_dir, &meta)
+}
+
 /// 44 字节标准 PCM WAV 头。data_len 为 data 块字节数。
 /// pub(crate):转码模块解码后需把 afconvert 产出的非标准头 WAV(带 FLLR 对齐填充块、
 /// 40 字节 fmt 块)重写回这套标准 44 头,续录端(AudioTrackWriter 假定 44 头)才不踩坑。
@@ -293,7 +326,9 @@ impl AudioTrackWriter {
                     // 并立即回写补全,让重建只发生一次。
                     let est = self.base_ms.saturating_sub(bytes_to_ms(existing_data));
                     meta.schema_version = 1;
-                    meta.tracks.insert(self.source.clone(), TrackMeta { offset_ms: est, ..Default::default() });
+                    // 只改 offset、保留其它字段(soft_aec 等先于建档写入):
+                    // 整条替换会把建档之前已写入的标记一并抹掉。
+                    meta.tracks.entry(self.source.clone()).or_default().offset_ms = est;
                     save_audio_meta(&self.note_dir, &meta)?;
                     est
                 }
@@ -324,7 +359,9 @@ impl AudioTrackWriter {
             let mut f = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
             f.write_all(&wav_header(0))?;
             meta.schema_version = 1;
-            meta.tracks.insert(self.source.clone(), TrackMeta { offset_ms: self.base_ms, ..Default::default() });
+            // 只改 offset、保留其它字段(soft_aec 等先于建档写入):
+            // 整条替换会把建档之前已写入的标记一并抹掉。
+            meta.tracks.entry(self.source.clone()).or_default().offset_ms = self.base_ms;
             save_audio_meta(&self.note_dir, &meta)?;
             Ok((f, path, 0))
         }
@@ -736,5 +773,58 @@ mod tests {
         // 只有 offset 的旧形状 audio.json(无 codec/duration)→ 可解析;m4a 无 duration 记录 → 跳过
         std::fs::write(tmp.path().join("audio.json"), r#"{"schema_version":1,"tracks":{"mic":{"offset_ms":0}}}"#).unwrap();
         assert!(list_tracks(tmp.path()).is_empty(), "无 duration 记录的 m4a 不上报");
+    }
+
+    #[test]
+    fn soft_aec_flag_and_clean_info_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_soft_aec(dir.path(), "mic").unwrap();
+        set_track_soft_aec(dir.path(), "mic").unwrap(); // 幂等
+        let meta = load_audio_meta(dir.path());
+        assert_eq!(meta.tracks["mic"].soft_aec, Some(true));
+        assert!(meta.tracks["mic"].clean.is_none());
+
+        set_track_clean_info(
+            dir.path(),
+            "mic",
+            CleanInfo {
+                delay_ms: 600,
+                confidence: 3.2,
+                segments: 1,
+            },
+        )
+        .unwrap();
+        let meta = load_audio_meta(dir.path());
+        let c = meta.tracks["mic"].clean.as_ref().unwrap();
+        assert_eq!((c.delay_ms, c.segments), (600, 1));
+    }
+
+    /// 冒烟实锤回归:soft_aec 标记先于轨道建档写入,建档(open)不得整条替换抹掉它。
+    #[test]
+    fn track_open_preserves_prior_soft_aec_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_soft_aec(dir.path(), "mic").unwrap();
+
+        let mut w = AudioTrackWriter::new(dir.path(), "mic", 0);
+        w.append(&vec![0.1f32; 160]); // 触发首次 open 建档
+        drop(w);
+
+        let meta = load_audio_meta(dir.path());
+        assert_eq!(meta.tracks["mic"].soft_aec, Some(true), "建档不得抹掉先写入的 soft_aec 标记");
+        assert_eq!(meta.tracks["mic"].offset_ms, 0);
+    }
+
+    /// 旧 audio.json(无新字段)必须照常反序列化——新字段全 default。
+    #[test]
+    fn old_audio_json_without_new_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("audio.json"),
+            r#"{"schema_version":1,"tracks":{"mic":{"offset_ms":0}}}"#,
+        )
+        .unwrap();
+        let meta = load_audio_meta(dir.path());
+        assert_eq!(meta.tracks["mic"].soft_aec, None);
+        assert!(meta.tracks["mic"].clean.is_none());
     }
 }
