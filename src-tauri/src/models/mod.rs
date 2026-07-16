@@ -198,6 +198,9 @@ pub const ARTIFACTS: &[Artifact] = &[
     // 各自独立 URL/哈希，形状照抄 vad/speaker 的单文件 Artifact（File kind 一 url 一 file，
     // TarBz2 不适用——非压缩包）。not required_for_recording：模型不在场时清洗管线
     // 回落 AEC3-only（见 Task 4），因此不进 required_now。
+    // 维护提醒:这两个 onnx 靠手动发布的 public GitHub release(tag models-dtln-aec-v1)
+    // 分发,全网无官方 onnx 源。今后更新模型或改 tag,必须同步发布对应 public release 并
+    // 上传资产,否则匿名用户下载 404(曾因 release 从未发布导致全体用户下不了)。
     Artifact {
         id: "dtln_aec_256_1",
         label: "神经回声消除（DTLN-aec）· 掩码模型",
@@ -259,6 +262,8 @@ pub struct ArtifactState {
     pub approx_mb: u64,
     pub required_for_recording: bool,
     pub present: bool,
+    /// 该工件的原始下载地址(GitHub release 直链),供设置页展示。
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +286,7 @@ pub fn status(asr_model: &str) -> ModelsStatus {
             // required_for_recording 保留为前端契约，但值改为按当前选型动态算。
             required_for_recording: required_now(a.id, asr_model),
             present: artifact_present(&root, a),
+            url: a.url.into(),
         })
         .collect();
     ModelsStatus {
@@ -386,6 +392,17 @@ mod tests {
         set_models_override(None);
         // 回落 dev 目录(debug 构建、src-tauri/models 存在),与历史一致
         assert_eq!(root(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
+    }
+
+    #[test]
+    fn status_exposes_artifact_urls() {
+        let st = status("sense_voice");
+        assert_eq!(st.artifacts.len(), ARTIFACTS.len());
+        for s in &st.artifacts {
+            let a = ARTIFACTS.iter().find(|a| a.id == s.id).expect("id 应在注册表");
+            assert_eq!(s.url, a.url, "DTO url 应等于注册表 url");
+            assert!(!s.url.is_empty(), "url 不应为空");
+        }
     }
 }
 
