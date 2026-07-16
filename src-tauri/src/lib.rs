@@ -30,6 +30,8 @@ use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
 const DOWNLOAD_ATTEMPTS_PER_URL: usize = 3;
+/// 同时下载的模型工件数上限。大文件占带宽,取小值折中;不做用户可配。
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
 // 锁序约定（必须在任何持锁场景下遵守）：running → generation → session_slot。
 // 只有 spawn_session 的加载线程会嵌套持有 running→generation（以及 running→
@@ -2139,6 +2141,45 @@ fn models_status(app: AppHandle) -> models::ModelsStatus {
     models::status(&current_asr(&app))
 }
 
+/// 下载单个工件:按 download_urls 的候选顺序尝试。代理候选各试 1 次(死代理快速跳过,
+/// 压回退延迟),原站(候选列表最后一项,== a.url)给足 DOWNLOAD_ATTEMPTS_PER_URL 次。
+/// 返回 Err(msg):msg=="cancelled" 表示被取消,其余为可展示错误文案。
+fn download_one(
+    a: &models::Artifact,
+    root: &std::path::Path,
+    mirror_enabled: bool,
+    mirror_prefix: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    emit: &(impl Fn(&str, &str, u64, u64, &str) + 'static),
+) -> Result<(), String> {
+    let urls = models::download::download_urls(a.url, mirror_enabled, mirror_prefix);
+    let mut last_err: Option<String> = None;
+    for url in &urls {
+        // 原站(无前缀,恒等于 a.url)多重试;代理候选各 1 次快速跳过。
+        let attempts = if url == a.url { DOWNLOAD_ATTEMPTS_PER_URL } else { 1 };
+        for attempt in 1..=attempts {
+            match models::download::download_artifact(a, root, url, cancel, emit) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg == "cancelled" {
+                        return Err("cancelled".into());
+                    }
+                    let retryable = models::download::retryable_download_error(&msg);
+                    last_err = Some(format!("{url}: {msg}"));
+                    if !retryable || attempt == attempts {
+                        break; // 换下一个候选 URL
+                    }
+                }
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "下载失败".into()))
+}
+
 #[tauri::command]
 fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<String>>) -> Result<(), String> {
     if state.download_running.swap(true, Ordering::SeqCst) {
@@ -2170,65 +2211,80 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
             .iter()
             .filter(|a| want.iter().any(|w| *w == a.id))
             .collect();
-        // preload 需要 app,但 app 随即被 emit 闭包 move 走,先克隆一份留给补预载。
+        // preload 需要 app,但 app 随即被 worker 闭包 clone 走,先克隆留给补预载与 done 事件。
         let app_pl = app.clone();
-        let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
-            let _ = app.emit(
+        let app_done = app.clone();
+        let mirror_enabled = s.mirror_enabled;
+        let mirror_prefix = s.mirror_prefix.clone();
+        let items: Vec<&models::Artifact> = selected; // ARTIFACTS 原顺序,进度/展示稳定
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let all_ok = std::sync::atomic::AtomicBool::new(true);
+        let worker_count = items.len().min(MAX_CONCURRENT_DOWNLOADS).max(1);
+        // scope:worker 借用 items/next/all_ok/cancel/root,块结束自动 join,无需 Arc。
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let app_w = app.clone();
+                let cancel = &cancel;
+                let next = &next;
+                let all_ok = &all_ok;
+                let root = &root;
+                let items = &items;
+                let mirror_prefix = mirror_prefix.as_str();
+                scope.spawn(move || {
+                    let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
+                        let _ = app_w.emit(
+                            "model_download",
+                            ipc::ModelDownloadEvent {
+                                artifact: id.into(),
+                                phase: phase.into(),
+                                received_bytes: received,
+                                total_bytes: total,
+                                message: message.into(),
+                            },
+                        );
+                    };
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        if i >= items.len() {
+                            break;
+                        }
+                        let a = items[i];
+                        if models::artifact_present(root, a) {
+                            continue;
+                        }
+                        match download_one(a, root, mirror_enabled, mirror_prefix, cancel, &emit) {
+                            Ok(()) => {}
+                            Err(msg) if msg == "cancelled" => {
+                                emit(a.id, "cancelled", 0, 0, "cancelled");
+                                all_ok.store(false, Ordering::SeqCst);
+                                break; // 取消:本 worker 停止取新工件
+                            }
+                            Err(msg) => {
+                                // 失败隔离:标记整体失败,但继续下载其余工件(不再连带中断)。
+                                emit(a.id, "error", 0, 0, &msg);
+                                all_ok.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        drop(guard); // 复位先于 done 事件,保持"收到 done 即可再次下载"的时序
+        if all_ok.load(Ordering::SeqCst) {
+            let _ = app_done.emit(
                 "model_download",
                 ipc::ModelDownloadEvent {
-                    artifact: id.into(),
-                    phase: phase.into(),
-                    received_bytes: received,
-                    total_bytes: total,
-                    message: message.into(),
+                    artifact: "all".into(),
+                    phase: "done".into(),
+                    received_bytes: 0,
+                    total_bytes: 0,
+                    message: String::new(),
                 },
             );
-        };
-        let mut all_ok = true;
-        for a in selected {
-            if models::artifact_present(&root, a) {
-                continue;
-            }
-            let urls = models::download::download_urls(a.url, s.mirror_enabled, &s.mirror_prefix);
-            let mut last_err: Option<String> = None;
-            'download_urls: for url in urls {
-                for attempt in 1..=DOWNLOAD_ATTEMPTS_PER_URL {
-                    match models::download::download_artifact(a, &root, &url, &cancel, &emit) {
-                        Ok(()) => {
-                            last_err = None;
-                            break 'download_urls;
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if msg == "cancelled" {
-                                last_err = Some(msg);
-                                break 'download_urls;
-                            }
-                            let retryable = models::download::retryable_download_error(&msg);
-                            last_err = Some(format!("{url}: {msg}"));
-                            if !retryable || attempt == DOWNLOAD_ATTEMPTS_PER_URL {
-                                break;
-                            }
-                        }
-                    }
-                    if cancel.load(Ordering::Relaxed) {
-                        last_err = Some("cancelled".into());
-                        break 'download_urls;
-                    }
-                }
-                // (cancelled 的所有路径都在上方直接 break 'download_urls,此处无需再判)
-            }
-            if let Some(msg) = last_err {
-                all_ok = false;
-                let phase = if msg == "cancelled" { "cancelled" } else { "error" };
-                emit(a.id, phase, 0, 0, &msg);
-                break;
-            }
-        }
-        drop(guard); // 复位先于 done 事件,保持"收到 done 即可再次下载"的时序
-        if all_ok {
-            emit("all", "done", 0, 0, "");
-            // 补齐后立即预载，无需重启即可开录。
+            // 补齐后立即预载,无需重启即可开录。
             preload_models(app_pl, session, recognizer_cache, embedder_cache);
         }
     });
