@@ -37,9 +37,9 @@ export type Settings = {
   shortcut: string;
   // 系统托盘图标开关
   tray_enabled: boolean;
-  // ASR 精修开关
+  // ASR Aing 开关
   refine_enabled: boolean;
-  // 精修执行体:"openai"(HTTP 接口)| "agent"(本机 Agent CLI 经 MCP 读写回)
+  // Aing 执行体:"openai"(HTTP 接口)| "agent"(本机 Agent CLI 经 MCP 读写回)
   refine_provider: string;
   // provider=agent 时用哪家 CLI:"claude" | "codex" | "gemini" | "cursor"
   refine_agent: string;
@@ -47,11 +47,11 @@ export type Settings = {
   refine_agent_bin: string;
   // Agent 模型名(--model);空 = CLI 默认
   refine_agent_model: string;
-  // ASR 精修服务基础 URL
+  // ASR Aing 服务基础 URL
   refine_base_url: string;
-  // ASR 精修 LLM 模型
+  // ASR Aing LLM 模型
   refine_model: string;
-  // ASR 精修 API 密钥
+  // ASR Aing API 密钥
   refine_api_key: string;
   // 首启引导已完成(欢迎层走完或模型已就绪时静默补 true)
   onboarded: boolean;

@@ -21,7 +21,7 @@
         不传(如录制页实时条)保持原 id 序、不折叠。 */
     counts?: Record<string, number>;
     onRenamed?: () => void;
-    /** 改名落点(可选)。缺省走笔记内 renameSpeaker;精修稿视图传 renameRefinedSpeaker
+    /** 改名落点(可选)。缺省走笔记内 renameSpeaker;Aing 稿视图传 renameRefinedSpeaker
         (改名同步声纹库)。 */
     onRename?: (id: string, name: string) => Promise<void>;
     /** 会议搭子人物列表(可选)。传入(连同 onPick)则编辑面板附带人物区,
