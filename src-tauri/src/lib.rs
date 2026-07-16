@@ -15,6 +15,7 @@ mod update;
 pub mod diar;
 mod ailog;
 mod refine;
+mod graph;
 pub mod mcp;
 mod telemetry;
 mod lifecycle;
@@ -386,6 +387,17 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 report("llm", &doc.stages.llm);
+                // 图谱是纯增值产物:仅成功 Aing 的笔记入图,失败只记日志不打断本轮 Aing。
+                if doc.stages.llm == "done" {
+                    match data_root(&app) {
+                        Ok(root) => {
+                            if let Err(e) = graph::upsert_note(&root, &note_id, &doc) {
+                                eprintln!("graph: upsert {note_id} 失败(不影响 Aing): {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("graph: data_root 不可用,跳过入图: {e}"),
+                    }
+                }
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
                 // 失败静默:标题是锦上添花,不影响 Aing 完成态。
@@ -2962,6 +2974,18 @@ pub fn run() {
                 }
                 // Skill 同步:受管且过期(应用升级后)静默重写为当前版本。
                 let _ = crate::mcp::skill::heal();
+            });
+            // 图谱存量兜底:存量笔记(升级前已有 aing.json)入图——后台整库重建一次,
+            // 兜底 spawn_refine 的尾部 upsert 只覆盖本次会话新 Aing 的空白。纯增值,
+            // 失败只 eprintln,不挡启动。
+            let app_for_graph = handle.clone();
+            std::thread::spawn(move || {
+                if let Ok(root) = data_root(&app_for_graph) {
+                    match graph::rebuild_all(&root) {
+                        Ok(n) => eprintln!("graph: 启动重建完成,{n} 篇入图"),
+                        Err(e) => eprintln!("graph: 启动重建失败(不影响运行): {e}"),
+                    }
+                }
             });
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
