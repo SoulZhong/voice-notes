@@ -61,16 +61,29 @@ pub fn classify_http_status(status: u16) -> &'static str {
     }
 }
 
+/// 火山方舟(Volcengine Ark)的深度思考模型(doubao-seed 等)默认走思维链:单批
+/// refine 常需 100s+(思维链先行)而撞破 REQ_TIMEOUT_S 超时。方舟 OpenAI 兼容接口
+/// 支持 `thinking:{type:disabled}` 关闭思考。仅对方舟端点注入——其它 OpenAI 兼容
+/// provider(OpenAI/DeepSeek/Kimi…)不认此顶层字段,注入可能 400,故按 host 判定。
+pub(crate) fn apply_thinking_off(base_url: &str, body: &mut Value) {
+    if base_url.to_ascii_lowercase().contains("volces.com") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        }
+    }
+}
+
 /// 「测试连接」:发一条最小 chat/completions,验证端点可达 + 鉴权通过 + 模型可用。
 /// 成功返回简短摘要;失败返回归类原因。不落 AI 日志(测试噪音不入库)。
 pub fn probe(cfg: &LlmConfig) -> Result<String, String> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = json!({
+    let mut body_json = json!({
         "model": cfg.model,
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "回复 OK" }],
-    })
-    .to_string();
+    });
+    apply_thinking_off(&cfg.base_url, &mut body_json);
+    let body = body_json.to_string();
     let resp = ureq::post(&url)
         .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
@@ -132,7 +145,7 @@ fn call_chunk(
         .collect();
     let user = format!("术语表(沿用并可扩充):{glossary}\n段落:\n{numbered}");
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body_json = json!({
+    let mut body_json = json!({
         "model": cfg.model,
         "temperature": 0.1,
         "response_format": { "type": "json_object" },
@@ -141,6 +154,7 @@ fn call_chunk(
             { "role": "user", "content": user },
         ],
     });
+    apply_thinking_off(&cfg.base_url, &mut body_json);
     let started = std::time::Instant::now();
     let result = do_call_chunk(cfg, &url, &body_json.to_string(), texts.len());
     // AI 日志:请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
@@ -249,7 +263,7 @@ pub fn gen_title(
         anyhow::bail!("修订稿无内容,不生成标题");
     }
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body_json = json!({
+    let mut body_json = json!({
         "model": cfg.model,
         "temperature": 0.3,
         "messages": [
@@ -257,6 +271,7 @@ pub fn gen_title(
             { "role": "user", "content": text },
         ],
     });
+    apply_thinking_off(&cfg.base_url, &mut body_json);
     let started = std::time::Instant::now();
     let resp_result: anyhow::Result<String> = (|| {
         Ok(ureq::post(&url)
@@ -433,6 +448,24 @@ mod tests {
             text: text.into(),
             source_seqs: vec![0],
             mentions: vec![],
+        }
+    }
+
+    #[test]
+    fn thinking_off_only_for_volces_ark() {
+        // 方舟端点:注入 thinking:disabled
+        let mut b = json!({ "model": "m" });
+        apply_thinking_off("https://ark.cn-beijing.volces.com/api/v3", &mut b);
+        assert_eq!(b["thinking"]["type"], "disabled");
+        // 大小写不敏感
+        let mut b2 = json!({ "model": "m" });
+        apply_thinking_off("HTTPS://ARK.CN-BEIJING.VOLCES.COM/api/v3", &mut b2);
+        assert_eq!(b2["thinking"]["type"], "disabled");
+        // 其它 OpenAI 兼容 provider:绝不注入(否则可能 400)
+        for u in ["https://api.openai.com/v1", "https://api.deepseek.com", "https://api.moonshot.cn/v1"] {
+            let mut o = json!({ "model": "m" });
+            apply_thinking_off(u, &mut o);
+            assert!(o.get("thinking").is_none(), "非方舟端点不应注入 thinking: {u}");
         }
     }
 
