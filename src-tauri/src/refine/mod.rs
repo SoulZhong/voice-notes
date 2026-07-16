@@ -9,7 +9,7 @@ pub mod recluster;
 use crate::diar::registry::SeedCluster;
 use crate::diar::SpeakerEmbedder;
 use crate::store::{
-    self, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
+    write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
     SegmentRecord, SpeakerMeta,
 };
 use std::collections::BTreeMap;
@@ -324,6 +324,7 @@ pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Enti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
     use crate::store::{SegmentRecord, SpeakerMeta};
     use std::collections::BTreeMap;
 
