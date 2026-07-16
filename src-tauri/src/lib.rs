@@ -15,6 +15,7 @@ mod update;
 pub mod diar;
 mod ailog;
 mod refine;
+mod graph;
 pub mod mcp;
 mod telemetry;
 mod lifecycle;

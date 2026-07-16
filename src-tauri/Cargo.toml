@@ -55,6 +55,9 @@ serde_yaml_ng = "0.10.0"
 # 详见 .superpowers/sdd/p3b-task-1-report.md 偏差记录。0.21 与 rustc 1.89 兼容(spike 实证)。
 tract-onnx = "0.21"
 realfft = "3"
+# Aing 知识图谱:全局实体注册表 + 笔记↔实体边,从所有 aing.json 派生可整库重建。
+# bundled 静态编译 libsqlite3,不依赖系统库(与本仓其余原生依赖 bundled 风格一致)。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
