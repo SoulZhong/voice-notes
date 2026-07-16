@@ -187,6 +187,33 @@ pub(crate) fn list_entities(data_root: &Path) -> anyhow::Result<Vec<EntityRow>> 
     Ok(rows)
 }
 
+/// 某实体出现在哪些笔记(按该笔记内提及数降序)。
+pub(crate) fn entity_notes(data_root: &Path, entity_id: &str) -> anyhow::Result<Vec<String>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT note_id FROM note_entities WHERE entity_id = ?1 ORDER BY mention_count DESC, note_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([entity_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 与给定笔记共享实体的其他笔记 + 共享实体数,降序(相关笔记)。
+pub(crate) fn related_notes(data_root: &Path, note_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT ne2.note_id, COUNT(*) AS shared
+         FROM note_entities ne1 JOIN note_entities ne2 ON ne1.entity_id = ne2.entity_id
+         WHERE ne1.note_id = ?1 AND ne2.note_id != ?1
+         GROUP BY ne2.note_id ORDER BY shared DESC, ne2.note_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([note_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +331,34 @@ mod tests {
         // 幂等:再 rebuild 一次结果一致
         rebuild_all(root.path()).unwrap();
         assert_eq!(list_entities(root.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn entity_notes_lists_notes_for_entity() {
+        let root = tempfile::tempdir().unwrap();
+        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1","project","灯塔计划",&[])], vec![para("灯塔计划",vec![Mention{entity:"ent_1".into(),start:0,end:4}])])).unwrap();
+        upsert_note(root.path(), "n2", &doc_with(vec![ent("ent_1","project","灯塔计划",&[])], vec![para("灯塔计划",vec![])])).unwrap();
+        let notes = entity_notes(root.path(), "e:灯塔计划").unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.contains(&"n1".to_string()) && notes.contains(&"n2".to_string()));
+    }
+
+    #[test]
+    fn related_notes_ranks_by_shared_entities() {
+        let root = tempfile::tempdir().unwrap();
+        // n1: {灯塔计划, Acme};n2: {灯塔计划, Acme};n3: {灯塔计划}
+        let mk = |names: &[&str]| doc_with(
+            names.iter().enumerate().map(|(i,nm)| ent(&format!("ent_{}",i+1), "term", nm, &[])).collect(),
+            vec![para("x", vec![])],
+        );
+        upsert_note(root.path(), "n1", &mk(&["灯塔计划","Acme"])).unwrap();
+        upsert_note(root.path(), "n2", &mk(&["灯塔计划","Acme"])).unwrap();
+        upsert_note(root.path(), "n3", &mk(&["灯塔计划"])).unwrap();
+        let rel = related_notes(root.path(), "n1").unwrap();
+        assert_eq!(rel[0].0, "n2", "n2 共享 2 个实体排最前");
+        assert_eq!(rel[0].1, 2);
+        assert!(rel.iter().any(|(id, c)| id == "n3" && *c == 1));
+        assert!(!rel.iter().any(|(id, _)| id == "n1"), "不含自己");
     }
 
     #[test]
