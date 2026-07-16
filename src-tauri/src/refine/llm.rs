@@ -8,7 +8,7 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。";
+const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。";
 
 pub struct LlmConfig {
     pub base_url: String,
@@ -20,6 +20,14 @@ pub enum LlmOutcome {
     Done,
     Partial(usize),
     Failed,
+}
+
+/// 大模型每块吐出的原始实体(未去重、未分配 id)。解析层(refine/mod.rs)再规范化。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawEntity {
+    pub name: String,
+    pub kind: String,
+    pub aliases: Vec<String>,
 }
 
 /// 按累计字符预算切块,返回每块的段落下标。单段超预算独占一块。
@@ -116,7 +124,7 @@ fn call_chunk(
     glossary: &Value,
     texts: &[&str],
     log: Option<&crate::ailog::Ctx>,
-) -> Result<(Value, Vec<String>), ChunkErr> {
+) -> Result<(Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
     let numbered: String = texts
         .iter()
         .enumerate()
@@ -138,7 +146,7 @@ fn call_chunk(
     // AI 日志:请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
     if let Some(ctx) = log {
         let (response, status, error) = match &result {
-            Ok((raw, _, _)) => (Value::String(raw.clone()), "ok", None),
+            Ok((raw, _, _, _)) => (Value::String(raw.clone()), "ok", None),
             Err(e) => (Value::Null, "error", Some(e.to_string())),
         };
         crate::ailog::record(
@@ -156,16 +164,42 @@ fn call_chunk(
             },
         );
     }
-    result.map(|(_, glossary, texts)| (glossary, texts))
+    result.map(|(_, glossary, texts, ents)| (glossary, texts, ents))
 }
 
-/// 网络+解析的本体,返回 (响应原文, glossary, texts) 供 call_chunk 记日志后拆用。
+/// 宽松解析实体数组:非数组 → 空;逐项跳过缺 name 的;kind 缺省 "term";aliases 缺省空。
+/// 绝不返回错误——实体是增值层,坏数据只当没有,不拖垮 texts。
+fn parse_raw_entities(v: &Value) -> Vec<RawEntity> {
+    let Some(arr) = v.as_array() else { return Vec::new() };
+    arr.iter()
+        .filter_map(|e| {
+            let name = e["name"].as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let kind = e["kind"].as_str().unwrap_or("term").trim();
+            let kind = if kind.is_empty() { "term" } else { kind };
+            let aliases = e["aliases"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(RawEntity { name: name.to_string(), kind: kind.to_string(), aliases })
+        })
+        .collect()
+}
+
+/// 网络+解析的本体,返回 (响应原文, glossary, texts, entities) 供 call_chunk 记日志后拆用。
 fn do_call_chunk(
     cfg: &LlmConfig,
     url: &str,
     body: &str,
     expect_len: usize,
-) -> Result<(String, Value, Vec<String>), ChunkErr> {
+) -> Result<(String, Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
     let resp_text = ureq::post(url)
         .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
@@ -192,7 +226,8 @@ fn do_call_chunk(
             texts_out.len()
         )));
     }
-    Ok((resp_text, parsed["glossary"].clone(), texts_out))
+    let entities = parse_raw_entities(&parsed["entities"]);
+    Ok((resp_text, parsed["glossary"].clone(), texts_out, entities))
 }
 
 /// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
@@ -271,18 +306,23 @@ pub fn gen_title(
 /// 逐块 Aing,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
 /// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响 Aing)。
-pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<&crate::ailog::Ctx>) -> LlmOutcome {
+pub fn polish(
+    cfg: &LlmConfig,
+    paragraphs: &mut [RefinedParagraph],
+    log: Option<&crate::ailog::Ctx>,
+) -> (LlmOutcome, Vec<RawEntity>) {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
-        return LlmOutcome::Done;
+        return (LlmOutcome::Done, Vec::new());
     }
     let mut glossary = json!({});
     let mut failed = 0usize;
     let mut network_failed = 0usize;
+    let mut all_entities: Vec<RawEntity> = Vec::new();
     for chunk in &chunks {
         let texts: Vec<&str> = chunk.iter().map(|&i| paragraphs[i].text.as_str()).collect();
         match call_chunk(cfg, &glossary, &texts, log) {
-            Ok((g, outs)) => {
+            Ok((g, outs, ents)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {
                         acc.extend(map);
@@ -293,6 +333,7 @@ pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<
                         paragraphs[i].text = t;
                     }
                 }
+                all_entities.extend(ents);
             }
             Err(e) => {
                 if matches!(e, ChunkErr::Network(_)) {
@@ -303,13 +344,14 @@ pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<
             }
         }
     }
-    if failed == 0 {
+    let outcome = if failed == 0 {
         LlmOutcome::Done
     } else if network_failed == chunks.len() {
         LlmOutcome::Failed
     } else {
         LlmOutcome::Partial(failed)
-    }
+    };
+    (outcome, all_entities)
 }
 
 #[cfg(test)]
@@ -399,7 +441,8 @@ mod tests {
         let base = mock_server(vec![chat_body(&["我们肯定要做。"], r#"{"肯计":"肯定"}"#)]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("我们肯计要做。")];
-        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Done));
+        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Done));
         assert_eq!(ps[0].text, "我们肯定要做。");
     }
 
@@ -408,7 +451,8 @@ mod tests {
         let base = mock_server(vec![chat_body(&["只有一段", "但输入两段之外多了一段"], "{}")]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文一")];
-        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Partial(1)));
+        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Partial(1)));
         assert_eq!(ps[0].text, "原文一", "长度不符必须保留原文");
     }
 
@@ -416,7 +460,8 @@ mod tests {
     fn connection_refused_is_failed_and_keeps_originals() {
         let cfg = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
         let mut ps = vec![para("原文")];
-        assert!(matches!(polish(&cfg, &mut ps, None), LlmOutcome::Failed));
+        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Failed));
         assert_eq!(ps[0].text, "原文");
     }
 
@@ -428,11 +473,13 @@ mod tests {
         let base = mock_server(vec![chat_body(&["修订。"], "{}")]);
         let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "SECRET-KEY".into() };
         let mut ps = vec![para("原文。")];
-        assert!(matches!(polish(&cfg, &mut ps, Some(&ctx)), LlmOutcome::Done));
+        let (outcome, _ents) = polish(&cfg, &mut ps, Some(&ctx));
+        assert!(matches!(outcome, LlmOutcome::Done));
         // 连不上的一轮:同样要留痕
         let cfg_bad = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
         let mut ps2 = vec![para("原文。")];
-        assert!(matches!(polish(&cfg_bad, &mut ps2, Some(&ctx)), LlmOutcome::Failed));
+        let (outcome2, _ents2) = polish(&cfg_bad, &mut ps2, Some(&ctx));
+        assert!(matches!(outcome2, LlmOutcome::Failed));
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
         assert_eq!(v["total"], 2);
         let all = serde_json::to_string(&v);
@@ -445,6 +492,32 @@ mod tests {
         assert!(ok["response"].as_str().unwrap().contains("choices"), "响应原文全量");
         let err = entries.iter().find(|e| e["status"] == "error").unwrap();
         assert!(err["error"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn parses_entities_from_response() {
+        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"灯塔计划下周启动\"],\"entities\":[{\"name\":\"灯塔计划\",\"kind\":\"project\",\"aliases\":[\"Lighthouse\"]}]}"}}]}"#;
+        let base = mock_server(vec![body.to_string()]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("灯塔计划下周启动")];
+        let (outcome, ents) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Done));
+        assert_eq!(ps[0].text, "灯塔计划下周启动");
+        assert_eq!(ents.len(), 1);
+        assert_eq!(ents[0].name, "灯塔计划");
+        assert_eq!(ents[0].kind, "project");
+        assert_eq!(ents[0].aliases, vec!["Lighthouse".to_string()]);
+    }
+
+    #[test]
+    fn missing_entities_key_degrades_to_empty_without_failing_texts() {
+        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"你好\"]}"}}]}"#;
+        let base = mock_server(vec![body.to_string()]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("你好")];
+        let (outcome, ents) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Done), "缺 entities 不影响 texts 成败");
+        assert!(ents.is_empty());
     }
 
     #[test]

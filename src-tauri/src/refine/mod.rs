@@ -199,7 +199,9 @@ pub fn run_llm(
     llm_model: &str,
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
-    let state = match llm::polish(cfg, &mut doc.paragraphs, log) {
+    // 实体在本任务(Aing P1·Plan3 T1)先只做抽取,规范化/入库是后续任务,这里暂丢弃。
+    let (outcome, _entities) = llm::polish(cfg, &mut doc.paragraphs, log);
+    let state = match outcome {
         llm::LlmOutcome::Done => "done",
         llm::LlmOutcome::Partial(_) => "partial",
         llm::LlmOutcome::Failed => "failed",
