@@ -228,13 +228,15 @@ mod tests {
             end_ms: 2000,
             text: text.into(),
             source_seqs: vec![0],
+            mentions: vec![],
         };
         let doc = RefinedDoc {
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: vec![
                 para("R1", Some("张三"), Some("P1"), "有名字用名字。"),
                 para("R2", None, Some("P4"), "无名有关联用全局编号。"),

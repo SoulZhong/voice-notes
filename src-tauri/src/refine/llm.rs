@@ -390,6 +390,7 @@ mod tests {
             end_ms: 1000,
             text: text.into(),
             source_seqs: vec![0],
+            mentions: vec![],
         }
     }
 
