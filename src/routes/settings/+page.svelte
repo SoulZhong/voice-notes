@@ -18,6 +18,7 @@
     purgeAudio,
     onMigrate,
     onModelDownload,
+    testMirror,
     type ModelsStatus,
     type Settings,
     type ModelDownloadEvent,
@@ -34,6 +35,20 @@
   let updateInfo = $state<UpdateInfo | null>(null);
   let updateChecking = $state(false);
   let updateError = $state("");
+  let mirrorTest = $state<{ ok: boolean; msg: string } | null>(null);
+  let mirrorTesting = $state(false);
+  async function runMirrorTest() {
+    if (!settings) return;
+    mirrorTesting = true;
+    mirrorTest = null;
+    try {
+      mirrorTest = { ok: true, msg: await testMirror(settings.mirror_prefix) };
+    } catch (e) {
+      mirrorTest = { ok: false, msg: String(e) };
+    } finally {
+      mirrorTesting = false;
+    }
+  }
   async function doCheckUpdate() {
     updateChecking = true;
     updateError = "";
@@ -431,6 +446,7 @@
 
   // —— 镜像加速(逻辑照搬 ModelDownloadCard)——
   async function toggleMirror() {
+    mirrorTest = null;
     if (!settings) return;
     settings = { ...settings, mirror_enabled: !settings.mirror_enabled };
     await setSettings(settings);
@@ -789,8 +805,21 @@
       <div class="row">
         <div class="row-info">
           <span class="row-label">镜像加速</span>
-          <span class="row-desc">国内网络下载模型更快</span>
+          <span class="row-desc">
+            {#if mirrorTest}
+              <span class={mirrorTest.ok ? "mtest-ok" : "mtest-err"}>
+                {mirrorTest.ok ? `测试成功(${mirrorTest.msg})` : `测试失败: ${mirrorTest.msg}`}
+              </span>
+            {:else}
+              国内网络下载模型更快
+            {/if}
+          </span>
         </div>
+        {#if settings?.mirror_enabled}
+          <button class="btn-secondary" onclick={runMirrorTest} disabled={mirrorTesting}>
+            {mirrorTesting ? "测试中…" : "测试"}
+          </button>
+        {/if}
         <input
           type="checkbox"
           class="ctl switch"
@@ -996,6 +1025,8 @@
   .seg.disabled .seg-item {
     cursor: default;
   }
+  .mtest-ok { color: var(--success, var(--ink-secondary)); }
+  .mtest-err { color: var(--danger-ink); }
   /* button-secondary */
   .btn-secondary {
     flex: none;
