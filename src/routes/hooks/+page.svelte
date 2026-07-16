@@ -2,14 +2,14 @@
   <header class="topbar"><h1>钩子</h1></header>
 
   <p class="intro">
-    笔记状态变化时自动执行你的命令或调用接口:停止录制后归档、精修完成后发通知——
+    笔记状态变化时自动执行你的命令或调用接口:停止录制后归档、Aing 完成后发通知——
     左侧新建一条钩子,选事件、填命令,配置完可以立即测试。
   </p>
 
   <section>
     <h2 class="section-title">可用事件</h2>
     <div class="flow-card">
-      <svg class="flow-svg diagram" viewBox="0 0 600 268" role="img" aria-label="笔记生命周期状态图:录制中、已暂停、精修中依次转移,停止后进入精修,精修完成即结束">
+      <svg class="flow-svg diagram" viewBox="0 0 600 268" role="img" aria-label="笔记生命周期状态图:录制中、已暂停、Aing 中依次转移,停止后进入 Aing,Aing 完成即结束">
         <defs>
           <marker id="hk-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" class="arrowhead" />
@@ -19,9 +19,9 @@
         <!-- 转移边(先画,压在节点下) -->
         <!-- 起点 → 录制中 -->
         <line class="edge" x1="46" y1="90" x2="93" y2="90" marker-end="url(#hk-arrow)" />
-        <!-- 录制中 → 精修中(停止即结束录制并自动开始精修) -->
+        <!-- 录制中 → Aing 中(停止即结束录制并自动开始 Aing) -->
         <line class="edge" x1="206" y1="90" x2="353" y2="90" marker-end="url(#hk-arrow)" />
-        <!-- 精修中 → 结束 -->
+        <!-- Aing 中 → 结束 -->
         <line class="edge" x1="466" y1="90" x2="548" y2="90" marker-end="url(#hk-arrow)" />
         <!-- 录制中 → 已暂停 -->
         <line class="edge" x1="135" y1="119" x2="135" y2="184" marker-end="url(#hk-arrow)" />
@@ -40,7 +40,7 @@
         </g>
         <g class="node">
           <rect class="node-box" x="356" y="63" width="108" height="54" rx="10" />
-          <text class="node-label" x="410" y="90" text-anchor="middle" dominant-baseline="central">精修中</text>
+          <text class="node-label" x="410" y="90" text-anchor="middle" dominant-baseline="central">Aing 中</text>
         </g>
         <g class="node">
           <rect class="node-box" x="96" y="187" width="108" height="54" rx="10" />
@@ -57,11 +57,11 @@
           <tspan class="key" x="280" dy="15">recording_stopped</tspan>
         </text>
         <text class="edge-label" text-anchor="middle" x="280" y="133">
-          <tspan class="cn">精修开始</tspan>
+          <tspan class="cn">Aing 开始</tspan>
           <tspan class="key" x="280" dy="15">refine_started</tspan>
         </text>
         <text class="edge-label" text-anchor="middle" x="507" y="44">
-          <tspan class="cn">精修完成</tspan>
+          <tspan class="cn">Aing 完成</tspan>
           <tspan class="key" x="507" dy="15">refine_finished</tspan>
         </text>
         <text class="edge-label" text-anchor="end" x="125" y="140">
@@ -73,7 +73,7 @@
           <tspan class="key" x="175" dy="15">recording_resumed</tspan>
         </text>
       </svg>
-      <p class="flow-caption">停止录制即结束录制并自动开始精修;精修完成即到达终态。暂停 / 恢复只在录制途中来回。</p>
+      <p class="flow-caption">停止录制即结束录制并自动开始 Aing;Aing 完成即到达终态。暂停 / 恢复只在录制途中来回。</p>
     </div>
   </section>
 
@@ -101,7 +101,7 @@
       <div class="row">
         <div class="row-info">
           <span class="row-label"><code>VN_NOTE_TEXT</code></span>
-          <span class="row-desc">笔记全文 markdown,精修稿优先——仅钩子勾选「附带笔记内容」时注入,下同</span>
+          <span class="row-desc">笔记全文 markdown,Aing 稿优先——仅钩子勾选「附带笔记内容」时注入,下同</span>
         </div>
       </div>
       <div class="row">
@@ -146,7 +146,7 @@ content-type: application/json
     "speakers": ["张三"], "text": "…markdown…", "text_truncated": false
   }
 }`}</pre>
-    <p class="hint">note 字段仅在钩子勾选「附带笔记内容」时出现;停止录制时通常是原始稿,想要精修全文请挂「精修完成」事件。</p>
+    <p class="hint">note 字段仅在钩子勾选「附带笔记内容」时出现;停止录制时通常是原始稿,想要 Aing 全文请挂「Aing 完成」事件。</p>
   </section>
 </div>
 
