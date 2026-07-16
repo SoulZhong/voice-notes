@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghproxy.net/";
+pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghfast.top/";
+/// 旧默认前缀(v0.4.1 及之前)。仅用于一次性迁移判定:UI 从不允许编辑前缀,故存量等于此
+/// 值者必是旧默认而非用户自定义,可安全抬到新默认。
+pub const LEGACY_MIRROR_PREFIX: &str = "https://ghproxy.net/";
 
 /// ASR 模型选型标识,供 settings.asr_model 与后续选型逻辑复用。
 pub const ASR_SENSE_VOICE: &str = "sense_voice";
@@ -210,6 +213,16 @@ pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<
     Ok(s)
 }
 
+/// 一次性迁移:存量 mirror_prefix 若等于旧默认(ghproxy.net),抬到新默认(ghfast.top)。
+/// 幂等——非旧默认值(新默认 / 未来自定义)不动。走 update 复用 WRITE_LOCK 串行化。
+pub fn migrate_mirror_prefix(app_data: &Path) -> anyhow::Result<Settings> {
+    update(app_data, |s| {
+        if s.mirror_prefix == LEGACY_MIRROR_PREFIX {
+            s.mirror_prefix = DEFAULT_MIRROR_PREFIX.into();
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +375,43 @@ mod tests {
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert!(got.mcp_allow_control && got.mcp_onboarded);
+    }
+
+    #[test]
+    fn migrate_bumps_legacy_prefix_to_new_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 存量:旧默认 ghproxy.net
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            format!(r#"{{"mirror_enabled":true,"mirror_prefix":"{LEGACY_MIRROR_PREFIX}"}}"#),
+        )
+        .unwrap();
+        let got = migrate_mirror_prefix(tmp.path()).unwrap();
+        assert_eq!(got.mirror_prefix, DEFAULT_MIRROR_PREFIX, "旧默认应被抬到新默认");
+        assert_eq!(load(tmp.path()).mirror_prefix, DEFAULT_MIRROR_PREFIX, "已持久化");
+    }
+
+    #[test]
+    fn migrate_leaves_non_legacy_prefix_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 非旧默认值(模拟用户/未来自定义)不应被迁移改动。
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"mirror_enabled":true,"mirror_prefix":"https://custom.example/"}"#,
+        )
+        .unwrap();
+        let got = migrate_mirror_prefix(tmp.path()).unwrap();
+        assert_eq!(got.mirror_prefix, "https://custom.example/", "自定义值不动");
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_new_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 无文件:load 得新默认;迁移后仍是新默认,不误改。
+        let got = migrate_mirror_prefix(tmp.path()).unwrap();
+        assert_eq!(got.mirror_prefix, DEFAULT_MIRROR_PREFIX);
+        let again = migrate_mirror_prefix(tmp.path()).unwrap();
+        assert_eq!(again.mirror_prefix, DEFAULT_MIRROR_PREFIX);
     }
 
     #[test]
