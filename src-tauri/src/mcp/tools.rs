@@ -53,7 +53,7 @@ pub fn list_notes(
                 .and_then(|text| serde_json::from_str::<BTreeMap<String, SpeakerMeta>>(&text).ok())
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let has_refined = dir.join("refined.json").exists();
+            let has_refined = store::aing_exists(&dir);
             serde_json::json!({
                 "id": n.id, "title": n.title, "started_at": n.started_at,
                 "duration_secs": n.duration_secs, "state": n.state,
@@ -166,7 +166,7 @@ pub fn apply_refined_texts(
         NoteStore::new(notes_dir(roots)).load(note_id)?;
         let dir = notes_dir(roots).join(note_id);
         anyhow::ensure!(
-            dir.join("refined.json").exists(),
+            store::aing_exists(&dir),
             "该笔记还没有精修稿:请先在 App 里完成一次精修(或等停止录制后自动精修),再写回修订"
         );
         let updated = store::apply_refined_texts(&dir, updates, model)?;

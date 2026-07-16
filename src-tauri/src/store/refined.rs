@@ -5,6 +5,11 @@ use std::path::Path;
 
 pub const REFINED_SCHEMA_VERSION: u32 = 1;
 
+/// 每笔记修订稿产物文件名(人读真值)。
+pub const AING_DOC_FILE: &str = "aing.json";
+/// 旧文件名:一次性迁移到 `AING_DOC_FILE`,迁移后保留供回滚。
+pub const LEGACY_REFINED_FILE: &str = "refined.json";
+
 fn stage_off() -> String {
     "off".into()
 }
@@ -75,15 +80,28 @@ pub struct RefinedDoc {
 }
 
 pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
-    let tmp = note_dir.join("refined.json.tmp");
+    let tmp = note_dir.join("aing.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(doc)?)?;
-    std::fs::rename(&tmp, note_dir.join("refined.json"))?;
+    std::fs::rename(&tmp, note_dir.join(AING_DOC_FILE))?;
     Ok(())
 }
 
+/// 读修订稿:优先 `aing.json`;缺失时从旧 `refined.json` 一次性迁移(读旧格式→写
+/// aing.json,旧文件保留供回滚)。两者皆无或损坏 → None(UI 回落原始逐字稿)。
 pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
-    let bytes = std::fs::read(note_dir.join("refined.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    if let Ok(bytes) = std::fs::read(note_dir.join(AING_DOC_FILE)) {
+        return serde_json::from_slice(&bytes).ok();
+    }
+    let bytes = std::fs::read(note_dir.join(LEGACY_REFINED_FILE)).ok()?;
+    let doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+    // 迁移落盘;失败不致命(下次加载再试),旧文件不删
+    let _ = write_refined_atomic(note_dir, &doc);
+    Some(doc)
+}
+
+/// aing.json 或旧 refined.json 是否存在(供「是否有修订稿」判断,迁移感知)。
+pub fn aing_exists(note_dir: &Path) -> bool {
+    note_dir.join(AING_DOC_FILE).exists() || note_dir.join(LEGACY_REFINED_FILE).exists()
 }
 
 /// refined.json 编辑锁:改名/关联是 read-modify-write,无互斥的并发调用会互相覆盖
@@ -221,8 +239,53 @@ mod tests {
         assert_eq!(got.discarded_seqs, vec![1, 2]);
         assert_eq!(got.paragraphs[0].name.as_deref(), Some("张三"));
         assert_eq!(got.paragraphs[0].person_id.as_deref(), Some("P1"));
-        std::fs::write(dir.path().join("refined.json"), "{broken").unwrap();
+        std::fs::write(dir.path().join(AING_DOC_FILE), "{broken").unwrap();
         assert!(load_refined(dir.path()).is_none(), "损坏返回 None 不 panic");
+    }
+
+    #[test]
+    fn legacy_refined_json_migrates_to_aing_json_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // 只有旧 refined.json,没有 aing.json
+        let legacy = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-01T09:00:00+08:00",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "S1", "start_ms": 0, "end_ms": 500, "text": "旧稿", "source_seqs": [0] }
+            ]
+        }"#;
+        std::fs::write(dir.path().join("refined.json"), legacy).unwrap();
+        assert!(!dir.path().join("aing.json").exists());
+
+        let doc = load_refined(dir.path()).expect("应从旧 refined.json 迁移出");
+        assert_eq!(doc.paragraphs[0].text, "旧稿");
+        // 迁移把 aing.json 落盘,旧文件保留供回滚
+        assert!(dir.path().join("aing.json").exists(), "迁移应写出 aing.json");
+        assert!(dir.path().join("refined.json").exists(), "旧文件保留");
+    }
+
+    #[test]
+    fn aing_json_takes_precedence_over_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |text: &str| format!(
+            r#"{{"schema_version":1,"generated_at":"t","stages":{{"filter":"done","recluster":"done","llm":"done"}},"discarded_seqs":[],"paragraphs":[{{"speaker":"S1","start_ms":0,"end_ms":1,"text":"{text}","source_seqs":[0]}}]}}"#
+        );
+        std::fs::write(dir.path().join("aing.json"), mk("新稿")).unwrap();
+        std::fs::write(dir.path().join("refined.json"), mk("旧稿")).unwrap();
+        assert_eq!(load_refined(dir.path()).unwrap().paragraphs[0].text, "新稿");
+    }
+
+    #[test]
+    fn aing_exists_considers_both_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!aing_exists(dir.path()));
+        std::fs::write(dir.path().join("refined.json"), "{}").unwrap();
+        assert!(aing_exists(dir.path()), "只有旧文件也算有");
+        std::fs::remove_file(dir.path().join("refined.json")).unwrap();
+        std::fs::write(dir.path().join("aing.json"), "{}").unwrap();
+        assert!(aing_exists(dir.path()));
     }
 
     #[test]

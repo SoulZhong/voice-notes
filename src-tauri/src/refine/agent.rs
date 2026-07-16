@@ -4,9 +4,10 @@
 //! settings.refine_provider 二选一。
 //!
 //! 核心原则:**成败判定不信 Agent 的任何输出**——各家 CLI 输出格式互不相同且随版本
-//! 漂移,唯一可信的是盘上 refined.json 的终态(写回工具会把 stages.llm 置 "done",
-//! 见 store::refined::apply_refined_texts)。spawn 前管线刚整写过 refined.json
-//! (stages.llm=="off"),因此「跑完后盘上 llm=="done"」当且仅当 Agent 真调过写回工具。
+//! 漂移,唯一可信的是盘上 aing.json(原 refined.json,见 store::refined 迁移)的终态
+//! (写回工具会把 stages.llm 置 "done",见 store::refined::apply_refined_texts)。
+//! spawn 前管线刚整写过 aing.json(stages.llm=="off"),因此「跑完后盘上
+//! llm=="done"」当且仅当 Agent 真调过写回工具。
 //!
 //! 每次调用在系统临时目录建一次性工作区(scratch dir)作为子进程 cwd:
 //! - 隔离:避免 Agent 把用户某个项目目录当工作区,加载到无关的项目级配置/记忆;
@@ -395,10 +396,13 @@ fn make_scratch(tag: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Agent 精修主入口。前置:管线刚整写过 refined.json(stages.llm=="off")。
-/// 成功判据(与 Agent 输出无关):跑完后盘上 refined.json 可读且 stages.llm=="done"、
+/// Agent 精修主入口。前置:管线刚整写过 aing.json(stages.llm=="off")。
+/// 成功判据(与 Agent 输出无关):跑完后盘上 aing.json 可读且 stages.llm=="done"、
 /// 段落数不变(写回工具本就不可能改段落数,这里是对「Agent 绕开工具直写文件」的兜底)。
 /// log=Some 时整轮调用(命令行+提示词+stdout/stderr+以盘上判定的结果)记入 AI 日志。
+///
+/// 基线读取经 `load_refined`——它对旧笔记(只有 refined.json、尚未迁移)一样迁移感知,
+/// 未迁移的老笔记同样能解析出基线,不因文件名历史而误判「无基线」。
 pub fn run_refine(
     note_dir: &Path,
     note_id: &str,
@@ -408,8 +412,8 @@ pub fn run_refine(
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
     let before = load_refined(note_dir)
-        .ok_or_else(|| anyhow::anyhow!("盘上没有可精修的 refined.json(应先跑本地两段)"))?;
-    anyhow::ensure!(before.stages.llm != "done", "refined.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败");
+        .ok_or_else(|| anyhow::anyhow!("盘上没有可精修的 aing.json(应先跑本地两段)"))?;
+    anyhow::ensure!(before.stages.llm != "done", "aing.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败");
     let scratch = make_scratch(note_id)?;
     let prompt = refine_prompt(note_id);
     let started = std::time::Instant::now();
@@ -424,7 +428,7 @@ pub fn run_refine(
         Err(e) => Err(anyhow::anyhow!("{e}")),
         Ok((_, exit_ok, _, err_tail)) => (|| {
             let after =
-                load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("跑完后 refined.json 不可读"))?;
+                load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("跑完后 aing.json 不可读"))?;
             anyhow::ensure!(
                 after.paragraphs.len() == before.paragraphs.len(),
                 "段落数改变({} → {}),疑似绕开写回工具,判失败",
@@ -645,8 +649,11 @@ mod tests {
         assert!(err.contains("未完成写回"), "退出 0 不算成功: {err}");
 
         // 烤进真实路径的假 Agent:模拟经写回工具完成(llm→done)。带 AI 日志上下文,
-        // 顺带断言整轮调用(命令行+提示词+盘上判定结果)全量留痕。
-        let refined_path = note.path().join("refined.json");
+        // 顺带断言整轮调用(命令行+提示词+盘上判定结果)全量留痕。真 Agent 经写回工具
+        // 写的是 aing.json(现行落盘文件名),假 bin 同样直写 aing.json 才能让
+        // run_refine 的「after」读到这份写回——旧 refined.json 已不是 load_refined
+        // 的优先读取目标(见 store::refined::load_refined)。
+        let refined_path = note.path().join(crate::store::AING_DOC_FILE);
         let done_json = serde_json::to_string(&doc("done", &["修订"])).unwrap();
         let diligent = fake_bin(
             bins.path(),
@@ -669,7 +676,7 @@ mod tests {
     #[test]
     fn run_refine_rejects_paragraph_count_change_and_requires_baseline() {
         let note = tempfile::tempdir().unwrap();
-        // 无基线 refined.json → 拒绝
+        // 无基线 aing.json(旧 refined.json 同理,均无)→ 拒绝
         assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "", None).is_err());
         // llm 已是 done → 拒绝(无法判定本轮)
         write_refined_atomic(note.path(), &doc("done", &["a"])).unwrap();
@@ -680,7 +687,11 @@ mod tests {
         let mutant_json = serde_json::to_string(&doc("done", &["只剩一段"])).unwrap();
         let mutant = fake_bin(
             bins.path(),
-            &format!("cat > {} <<'EOF'\n{}\nEOF\nexit 0", note.path().join("refined.json").display(), mutant_json),
+            &format!(
+                "cat > {} <<'EOF'\n{}\nEOF\nexit 0",
+                note.path().join(crate::store::AING_DOC_FILE).display(),
+                mutant_json
+            ),
         );
         let err = run_refine(note.path(), "n1", AgentKind::Claude, &mutant, "", None).unwrap_err().to_string();
         assert!(err.contains("段落数"), "{err}");
