@@ -46,12 +46,12 @@
   let confirmSeq = $state<number | null>(null);
   let speakerMenuSeq = $state<number | null>(null);
 
-  // 精修稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
+  // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
   let refining = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
-  // 会议搭子人物列表:精修稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
+  // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
 
   const id = $derived($page.params.id as string);
@@ -70,14 +70,14 @@
   const canEdit = $derived(!(recording.isLive && recording.noteId === id));
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
 
-  /** 精修稿是否可展示：无精修结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
+  /** 修订稿是否可展示：无 Aing 结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
   const refinedAvailable = $derived(!!refined && note?.meta.state === "complete");
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
-  /** 原始稿中被精修过滤掉的段（灰显用）。 */
+  /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** 精修稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
+  /** 修订稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
       徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。
       person_id 一并带上:关联库人物的说话人跨笔记同色、无名时按全局编号兜底。 */
   const refinedSpeakers = $derived.by(() => {
@@ -194,7 +194,7 @@
       });
   });
 
-  // id 切换：无条件复位一切编辑态 + 精修视图态（否则会短暂展示上一篇笔记的精修稿/进度）。
+  // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的修订稿/进度）。
   // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
   // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
   // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
@@ -213,7 +213,7 @@
     viewMode = "refined";
   });
 
-  // 精修进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
+  // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
   // running 置 refining=true；stage="all" 是整体完成信号，done/failed 都要重新拉取 refined 并复位。
   $effect(() => {
     const forId = id;
@@ -374,7 +374,7 @@
     return () => sc.removeEventListener("wheel", onWheel);
   });
 
-  /** 只需要 start_ms：原始段(SegmentRecord)与精修段(RefinedParagraph)都结构兼容,共用同一播放逻辑。 */
+  /** 只需要 start_ms：原始段(SegmentRecord)与 Aing 段(RefinedParagraph)都结构兼容,共用同一播放逻辑。 */
   function playFrom(pos: { start_ms: number }) {
     if (!player) return;
     // 起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
@@ -454,7 +454,7 @@
   async function doExport(format: "md") {
     exportMsg = "";
     try {
-      // 所见即所得:看着精修稿点导出就导精修稿,原始稿视图导原始逐字稿。
+      // 所见即所得:看着修订稿点导出就导修订稿,原始稿视图导原始逐字稿。
       const path = await exportNote(id, format, effectiveView === "refined");
       exportMsg = `已导出：${path}`;
       await revealItemInDir(path);
@@ -463,7 +463,7 @@
     }
   }
 
-  /** 重新精修会整写 refined.json:未关联搭子的说话人改名会被冲掉,这种情况下二段确认。 */
+  /** 重新 Aing 会整写 refined.json:未关联搭子的说话人改名会被冲掉,这种情况下二段确认。 */
   const refineWouldLoseNames = $derived(
     !!refined?.paragraphs.some((p) => p.name && !p.person_id),
   );
@@ -476,12 +476,12 @@
     }
     confirmRefine = false;
     refineErr = "";
-    refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次精修
+    refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次 Aing
     try {
       await refineNote(id);
     } catch (e) {
       refining = false;
-      refineErr = `重新精修失败: ${e}`;
+      refineErr = `重新 Aing 失败: ${e}`;
     }
   }
 
@@ -574,9 +574,9 @@
       </div>
 
       {#if effectiveView === "refined"}
-        <!-- 精修稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
+        <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
              可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
-             精修中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
+             Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
         <SpeakerChips
           speakers={refinedSpeakers}
           noteId={id}
@@ -593,7 +593,7 @@
         />
       {:else}
         <!-- 原始稿说话人条:改名仍是笔记内本地名;选人关联(写 speakers.json person_id)
-             与精修稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
+             与修订稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
         <SpeakerChips
           speakers={note.speakers}
           noteId={id}
@@ -615,10 +615,10 @@
           class="link"
           class:active={effectiveView === "refined"}
           disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : "尚无精修稿"}
+          title={refinedAvailable ? "" : "尚无修订稿"}
           onclick={() => (viewMode = "refined")}
         >
-          精修稿
+          修订稿
         </button>
         <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
           原始逐字稿
@@ -627,11 +627,11 @@
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
           <span class="refine-warn">未关联搭子的说话人改名将丢失</span>
-          <button class="link danger" onclick={rerunRefine}>确认重新精修</button>
+          <button class="link danger" onclick={rerunRefine}>确认重新 Aing</button>
           <button class="link" onclick={() => (confirmRefine = false)}>取消</button>
         {:else}
           <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
-            {refining ? "正在精修…" : "重新精修"}
+            {refining ? "Aing 中…" : "重新 Aing"}
           </button>
         {/if}
       </div>
@@ -640,9 +640,9 @@
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
     {#if effectiveView === "refined" && refined}
       {#if refined.stages.llm === "partial"}
-        <div class="banner">部分段落精修失败，已保留原文，可重新精修。</div>
+        <div class="banner">部分段落 Aing 失败，已保留原文，可重新 Aing。</div>
       {:else if refined.stages.llm === "failed"}
-        <div class="banner banner-danger">LLM 精修失败，当前展示本地精修结果。</div>
+        <div class="banner banner-danger">LLM Aing 失败，当前展示本地 Aing 结果。</div>
       {/if}
     {/if}
 
@@ -667,7 +667,7 @@
           </div>
         {/each}
         {#if refined.paragraphs.length === 0}
-          <p class="hint">（精修稿为空）</p>
+          <p class="hint">（修订稿为空）</p>
         {/if}
       {:else}
         {#each displaySegments as seg (seg.seq)}
@@ -675,7 +675,7 @@
             class="seg"
             class:playing={activeSeqs.has(seg.seq)}
             class:discarded={discardedSeqs.has(seg.seq)}
-            title={discardedSeqs.has(seg.seq) ? "已被精修过滤" : undefined}
+            title={discardedSeqs.has(seg.seq) ? "已被 Aing 过滤" : undefined}
             data-seq={seg.seq}
           >
             {#if canEdit && speakerMenuSeq === seg.seq}
@@ -945,11 +945,11 @@
   .seg.playing {
     background: var(--accent-tint);
   }
-  /* 被精修过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
+  /* 被 Aing 过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
   .seg.discarded {
     opacity: 0.38;
   }
-  /* 精修稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
+  /* 修订稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
   .para {
     margin: 0 0 6px;
     line-height: 1.7;
@@ -1044,7 +1044,7 @@
   .link:disabled:hover {
     text-decoration: none;
   }
-  /* 视图切换条:精修稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新精修(默认 button-secondary)。 */
+  /* 视图切换条:修订稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新 Aing(默认 button-secondary)。 */
   .view-switch {
     display: flex;
     align-items: center;
@@ -1064,7 +1064,7 @@
   .view-switch .spacer {
     flex: 1;
   }
-  /* 重新精修二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
+  /* 重新 Aing 二段确认的警示语:warning 色小字,和确认/取消链接排一行 */
   .refine-warn {
     color: var(--warning-ink);
     font-size: 0.8rem;

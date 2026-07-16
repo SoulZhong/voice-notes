@@ -60,7 +60,7 @@ pub struct TranscodeEvent {
 }
 
 /// 后端自动改名(LLM 主题标题),事件名 "note_renamed":侧栏列表与详情页据此刷新
-/// 标题——改名发生在后台精修线程,前端不会主动重拉。
+/// 标题——改名发生在后台 Aing 线程,前端不会主动重拉。
 #[derive(Debug, Clone, Serialize)]
 pub struct NoteRenamedEvent {
     pub note_id: String,
@@ -150,7 +150,7 @@ pub struct ModelDownloadEvent {
     pub message: String,
 }
 
-/// 会后精修进度，事件名 "refine"。stage ∈ {"filter","recluster","llm","all"}；
+/// 会后 Aing 进度，事件名 "refine"。stage ∈ {"filter","recluster","llm","all"}；
 /// state ∈ {"running","done","failed","partial","skipped","off"}（含义随 stage 而定，
 /// 语义与 store::RefineStages/RefinedDoc.stages 的字符串一致）。
 #[derive(Debug, Clone, Serialize)]

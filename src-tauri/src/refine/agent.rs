@@ -1,5 +1,5 @@
-//! A2 精修的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini /
-//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读精修稿并调
+//! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini /
+//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读修订稿并调
 //! `apply_refined_texts` 写回。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按
 //! settings.refine_provider 二选一。
 //!
@@ -18,11 +18,11 @@ use crate::store::{load_refined, RefinedParagraph};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Agent 一次完整精修(读稿+逐段修订+写回)的墙钟上限。跑满视为挂死,杀进程判失败。
+/// Agent 一次完整 Aing(读稿+逐段修订+写回)的墙钟上限。跑满视为挂死,杀进程判失败。
 pub const REFINE_TIMEOUT_S: u64 = 900;
 /// 标题一发一收的上限。
 pub const TITLE_TIMEOUT_S: u64 = 120;
-/// 「测试运行」探测的超时:只验能启动+能产出,远短于精修的 REFINE_TIMEOUT_S。
+/// 「测试运行」探测的超时:只验能启动+能产出,远短于 Aing 的 REFINE_TIMEOUT_S。
 pub const PROBE_TIMEOUT_S: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +146,7 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
     }
 }
 
-/// 精修指令。与 llm.rs SYSTEM_PROMPT 同一套四类修订规则,但流程改为「读稿→修订→
+/// Aing 指令。与 llm.rs SYSTEM_PROMPT 同一套四类修订规则,但流程改为「读稿→修订→
 /// 工具写回」;各家 CLI 对 MCP 工具的暴露名前缀不同(claude 是 mcp__server__tool,
 /// gemini/cursor 是裸名),提示词里只用裸名,由各家自行映射。
 fn refine_prompt(note_id: &str) -> String {
@@ -188,7 +188,7 @@ fn mcp_servers_json(exe: &Path) -> serde_json::Value {
     })
 }
 
-/// 组装一次精修调用:返回配置好参数/cwd 的 Command。scratch 已存在;按 kind 落好
+/// 组装一次 Aing 调用:返回配置好参数/cwd 的 Command。scratch 已存在;按 kind 落好
 /// 工作区配置文件。纯组装不 spawn,供单测检查参数面。
 fn refine_command(
     kind: AgentKind,
@@ -395,7 +395,7 @@ fn make_scratch(tag: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Agent 精修主入口。前置:管线刚整写过 refined.json(stages.llm=="off")。
+/// Agent Aing 主入口。前置:管线刚整写过 refined.json(stages.llm=="off")。
 /// 成功判据(与 Agent 输出无关):跑完后盘上 refined.json 可读且 stages.llm=="done"、
 /// 段落数不变(写回工具本就不可能改段落数,这里是对「Agent 绕开工具直写文件」的兜底)。
 /// log=Some 时整轮调用(命令行+提示词+stdout/stderr+以盘上判定的结果)记入 AI 日志。
@@ -408,7 +408,7 @@ pub fn run_refine(
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
     let before = load_refined(note_dir)
-        .ok_or_else(|| anyhow::anyhow!("盘上没有可精修的 refined.json(应先跑本地两段)"))?;
+        .ok_or_else(|| anyhow::anyhow!("盘上没有可 Aing 的 refined.json(应先跑本地两段)"))?;
     anyhow::ensure!(before.stages.llm != "done", "refined.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败");
     let scratch = make_scratch(note_id)?;
     let prompt = refine_prompt(note_id);
@@ -485,7 +485,7 @@ pub fn gen_title(
         text.push('\n');
     }
     if text.trim().is_empty() {
-        anyhow::bail!("精修稿无内容,不生成标题");
+        anyhow::bail!("修订稿无内容,不生成标题");
     }
     let prompt = format!(
         "只输出一个不超过 12 个字的中文标题,概括下面这场对话的核心主题;不要引号、标点或任何解释。\n\n{text}"
@@ -742,7 +742,7 @@ mod tests {
     /// 两侧留痕(本进程 agent_refine + serve 子进程 mcp_apply)。
     /// 运行:VN_SELF_EXE=<voice-notes 二进制绝对路径> cargo test --lib \
     ///       e2e_claude_refine -- --ignored --nocapture
-    /// 依赖:claude CLI 已装已登录;消耗少量订阅额度(haiku,一次精修)。
+    /// 依赖:claude CLI 已装已登录;消耗少量订阅额度(haiku,一次 Aing)。
     #[test]
     #[ignore]
     fn e2e_claude_refine_leaves_full_ailog_trail() {
@@ -786,13 +786,13 @@ mod tests {
         .unwrap();
         write_refined_atomic(
             &note_dir,
-            &doc("off", &["我们肯计要在下周发布新版本", "嗯嗯这个这个方案我觉得可以", "用claude code来做精修没问题"]),
+            &doc("off", &["我们肯计要在下周发布新版本", "嗯嗯这个这个方案我觉得可以", "用claude code来做 Aing 没问题"]),
         )
         .unwrap();
 
         let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: note_id.into() };
         run_refine(&note_dir, note_id, AgentKind::Claude, &bin, "haiku", Some(&ctx))
-            .expect("真 claude 精修应成功(需已登录)");
+            .expect("真 claude Aing 应成功(需已登录)");
 
         let after = load_refined(&note_dir).unwrap();
         assert_eq!(after.stages.llm, "done");

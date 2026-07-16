@@ -38,9 +38,9 @@ pub enum Envelope {
     /// 带回执的非命令消息(P2):SetTitle/RenameActiveSpeaker/自投 Finalize 等
     /// 需要同步结果的投递;处理完本条消息的全部效果后按 sticky-error 结果回复。
     Request { msg: Msg, reply: Sender<Result<(), String>> },
-    /// 精修态查询(P3):不经 machine::handle(查询不该在迁移表里制造伪迁移,
+    /// Aing 态查询(P3):不经 machine::handle(查询不该在迁移表里制造伪迁移,
     /// 与 recording_status 直读同理),actor 直答自身内核态。供 rename/assign_
-    /// refined_* 的「精修中拒绝」守卫读取(原 AppState.refining.contains)。
+    /// refined_* 的「Aing 中拒绝」守卫读取(原 AppState.refining.contains)。
     QueryRefine { note_id: String, reply: Sender<bool> },
 }
 
@@ -74,9 +74,9 @@ impl LifecycleHandle {
         rrx.recv().map_err(|_| "lifecycle actor 未回复".to_string())?
     }
 
-    /// 该笔记是否正在精修(P3,内核精修态快照)。取代旧 AppState.refining 集合的
+    /// 该笔记是否正在 Aing(P3,内核 Aing 态快照)。取代旧 AppState.refining 集合的
     /// contains 查询;经信箱串行化,读到的是与命令处理一致的快照。actor 已退出按
-    /// 「未在精修」处理(仅进程退出路径)。死锁纪律同注记③:调用方不得持全局锁。
+    /// 「未在 Aing」处理(仅进程退出路径)。死锁纪律同注记③:调用方不得持全局锁。
     pub fn is_refining(&self, note_id: &str) -> bool {
         let (rtx, rrx) = crossbeam_channel::bounded(1);
         if self
@@ -101,7 +101,7 @@ struct Owned {
 
 /// 执行 Delegate:P1 的旧世界执行体映射表。返回值即 reply。
 ///
-/// refine 参数(P3):内核精修集的只读引用。续录执行体需要「该笔记是否正在精修」
+/// refine 参数(P3):内核 Aing 集的只读引用。续录执行体需要「该笔记是否正在 Aing」
 /// 来做 F1 守卫,且必须在其自身的「迁移/下载中」检查之后原位判定(旧守卫顺序
 /// 逐位还原,谁先判谁先报)——故不由内核抢答,而是把查询结果随 Delegate 传入。
 /// 同一消息处理内读取,快照与内核裁决一致。
@@ -319,7 +319,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
     std::thread::Builder::new()
         .name("lifecycle-actor".into())
         .spawn(move || {
-            // P3:状态升维(会话+精修两维,见 machine::LifecycleState)。
+            // P3:状态升维(会话+Aing 两维,见 machine::LifecycleState)。
             let mut state = LifecycleState::init();
             // P2:writer 所有权槽。AdoptWriter 装入,Abort/Finalize 取出;线程局部
             // 无锁——唯一触碰者是本线程(单写者)。
@@ -479,18 +479,18 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     let finalized = o.writer.finalize(chrono::Local::now());
                                     match finalized {
                                         Ok(()) => {
-                                            // 仅 finalize 成功（state=complete、meta 落盘）才发起精修。
+                                            // 仅 finalize 成功（state=complete、meta 落盘）才发起 Aing。
                                             // 转码移交时机与失败兜底见 spawn_refine 文档注释。
-                                            // 自动精修是保障类直调,不经 RefineRequest 守卫(与旧
-                                            // 世界停录钩子直调一致);内核精修态由 spawn_refine 入口
+                                            // 自动 Aing 是保障类直调,不经 RefineRequest 守卫(与旧
+                                            // 世界停录钩子直调一致);内核 Aing 态由 spawn_refine 入口
                                             // 同步自投的 RefineProgress("all","running") 置 Running,
                                             // 该消息排在本条 Finalize 之后、停录 reply 之前入队——
                                             // 停录返回后到达的续录命令必然排在它后面,守卫不漏挡。
-                                            // 精修目标用 o.note_id(槽内笔记,真正被上面 finalize 的那条)
+                                            // Aing 目标用 o.note_id(槽内笔记,真正被上面 finalize 的那条)
                                             // 而非消息携带的 note_id:错配分支(上方 eprintln)已表明二者
-                                            // 可能不同——finalize 的 IO 只作用于槽内 writer,精修必须
+                                            // 可能不同——finalize 的 IO 只作用于槽内 writer,Aing 必须
                                             // 跟随真正落盘的那条笔记,否则会给一条根本没被收尾的笔记
-                                            // 触发精修(内容还在 owned 槽或已被后续会话占用)。
+                                            // 触发 Aing(内容还在 owned 槽或已被后续会话占用)。
                                             crate::spawn_refine(app.clone(), o.note_id.clone(), true);
                                         }
                                         Err(e) => {
@@ -520,10 +520,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             if result.is_ok() { result = r; }
                         }
                         Effect::DoSpawnRefine { note_id, enqueue_transcode } => {
-                            // 手动精修路径(refine_note → RefineRequest 裁决通过):守卫
+                            // 手动 Aing 路径(refine_note → RefineRequest 裁决通过):守卫
                             // 已在内核抢答,这里只负责发起。spawn_refine 入口会同步
                             // report RefineProgress("all","running")(自投,unbounded 不
-                            // 阻塞——死锁注记①),对本路径是幂等重插(内核已插入精修集)。
+                            // 阻塞——死锁注记①),对本路径是幂等重插(内核已插入 Aing 集)。
                             crate::spawn_refine(app.clone(), note_id.clone(), *enqueue_transcode);
                         }
                         Effect::DoEmitRefine { note_id, stage, state } => {
@@ -584,7 +584,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 // P3 挂上消费者后 hook 将收到从未真实发生的迁移。
                 let commit = if is_cmd && result.is_err() { state.clone() } else { next };
                 // hook 只关心会话主时间轴:TransitionCtx from/to 维持 SessionState,
-                // 精修维变化(置 Running/置回 Idle)不通知——托盘等消费者与精修无关。
+                // Aing 维变化(置 Running/置回 Idle)不通知——托盘等消费者与 Aing 无关。
                 if commit.session != state.session {
                     let note_id = match &commit.session {
                         SessionState::Recording { note_id, .. }
@@ -599,10 +599,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     });
                 }
                 // 外部钩子(用户配置 shell/webhook):与 HookBus 不同,要看完整内核
-                // 状态(session+refine 两维)——精修开始/完成也是白名单事件。
+                // 状态(session+refine 两维)——Aing 开始/完成也是白名单事件。
                 // 映射是纯内存比较,无事件零开销;执行在 dispatch 内起线程,不占 actor。
                 crate::hooks_external::dispatch(&app, &state, &commit);
-                // 托盘图标动画:录制中抖动、停止即静止(精修在后台不驱动图标)。与 HookBus
+                // 托盘图标动画:录制中抖动、停止即静止(Aing 在后台不驱动图标)。与 HookBus
                 // (只驱动菜单文案)分工——图标由本调用按会话状态边沿驱动。
                 crate::tray::update(&app, &state, &commit);
                 state = commit;
