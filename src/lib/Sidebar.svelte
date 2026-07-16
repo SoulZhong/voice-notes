@@ -155,7 +155,7 @@
     refresh();
   });
 
-  // 后端自动改名(LLM 主题标题)发生在精修后台线程,前端版本号不会变,靠事件刷新。
+  // 后端自动改名(LLM 主题标题)发生在 Aing 后台线程,前端版本号不会变,靠事件刷新。
   $effect(() => {
     let un: (() => void) | null = null;
     let disposed = false;

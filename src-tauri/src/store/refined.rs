@@ -1,4 +1,4 @@
-//! 精修产物 refined.json:原始三文件之外的独立终稿,损坏/缺失时 UI 回落原始逐字稿。
+//! Aing 产物 refined.json:原始三文件之外的独立终稿,损坏/缺失时 UI 回落原始逐字稿。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -42,7 +42,7 @@ pub struct RefinedParagraph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// 关联的全局声纹库人物 id(P<n>):重聚类种子命中时写入,或用户在说话人条
-    /// 手动关联。有它才能把精修稿改名同步进声纹库(会议搭子)。
+    /// 手动关联。有它才能把修订稿改名同步进声纹库(会议搭子)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_id: Option<String>,
     pub start_ms: u64,
@@ -105,24 +105,24 @@ pub fn aing_exists(note_dir: &Path) -> bool {
 }
 
 /// refined.json 编辑锁:改名/关联是 read-modify-write,无互斥的并发调用会互相覆盖
-/// 丢更新(与 notes.rs EDIT_LOCK 同一哲学,独立锁——精修稿编辑与笔记编辑互不相干)。
-/// 精修管线整写 refined.json 的竞争由命令层「精修中拒绝编辑」guard 挡住,不进此锁。
+/// 丢更新(与 notes.rs EDIT_LOCK 同一哲学,独立锁——修订稿编辑与笔记编辑互不相干)。
+/// Aing 管线整写 refined.json 的竞争由命令层「Aing 中拒绝编辑」guard 挡住,不进此锁。
 static REFINED_EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 锁内 read-modify-write 骨架:加载 → 就地修改 → 原子落盘。缺失/损坏 → Err
-/// (编辑必须以「盘上有可编辑的精修稿」为前提,不能凭空造一份)。
+/// (编辑必须以「盘上有可编辑的修订稿」为前提,不能凭空造一份)。
 fn update_refined(
     note_dir: &Path,
     f: impl FnOnce(&mut RefinedDoc) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let _guard = REFINED_EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut doc =
-        load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("精修稿不存在或已损坏"))?;
+        load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("修订稿不存在或已损坏"))?;
     f(&mut doc)?;
     write_refined_atomic(note_dir, &doc)
 }
 
-/// 精修稿说话人改名:该 speaker 的全部段落 name 置为新名。
+/// 修订稿说话人改名:该 speaker 的全部段落 name 置为新名。
 /// 返回该说话人已关联的 person_id(若有),供调用方把改名同步进声纹库。
 pub fn rename_refined_speaker(
     note_dir: &Path,
@@ -139,13 +139,13 @@ pub fn rename_refined_speaker(
                 person_id = p.person_id.clone();
             }
         }
-        anyhow::ensure!(hit, "精修稿中没有该说话人: {speaker_id}");
+        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
         Ok(())
     })?;
     Ok(person_id)
 }
 
-/// 把精修稿说话人关联到声纹库人物:该 speaker 的全部段落写入 person_id,
+/// 把修订稿说话人关联到声纹库人物:该 speaker 的全部段落写入 person_id,
 /// name 采用库中现名(空名传 None,展示端按「说话人 N」兜底)。
 pub fn assign_refined_person(
     note_dir: &Path,
@@ -160,12 +160,12 @@ pub fn assign_refined_person(
             p.person_id = Some(person_id.to_string());
             p.name = if person_name.is_empty() { None } else { Some(person_name.to_string()) };
         }
-        anyhow::ensure!(hit, "精修稿中没有该说话人: {speaker_id}");
+        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
         Ok(())
     })
 }
 
-/// Agent 精修写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
+/// Agent Aing 写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
 /// 约束式写入——只能改文本,说话人/时间戳/段落数一概不可动,这是把「外部 Agent 可写」
 /// 的面收到最小的关键:哪怕 Agent 行为失常,最坏也只是文本变差,结构不会被破坏。
 /// 任一下标越界或文本为空即整体拒绝(不落盘半份结果)。updates 为空是合法输入,
@@ -194,7 +194,7 @@ pub fn apply_refined_texts(
     Ok(updates.len())
 }
 
-/// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史精修稿
+/// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史修订稿
 /// 跟着变),person_id 经 redirects 归一到 winner。只改返回值,不落盘——与
 /// notes.rs join_person_names 同一哲学。库中无名/人已删除时保留段落原 name。
 pub fn join_library_names(doc: &mut RefinedDoc, vp: &super::voiceprints::Voiceprints) {
@@ -410,7 +410,7 @@ mod tests {
         assert!(rename_refined_speaker(dir.path(), "R9", "张三").is_err());
         let doc = load_refined(dir.path()).unwrap();
         assert!(doc.paragraphs[0].name.is_none(), "未命中不落盘任何修改");
-        // 无精修稿时同样报错,不凭空造文件。
+        // 无修订稿时同样报错,不凭空造文件。
         let empty = tempfile::tempdir().unwrap();
         assert!(rename_refined_speaker(empty.path(), "R1", "张三").is_err());
     }
@@ -467,7 +467,7 @@ mod tests {
         let doc = load_refined(dir.path()).unwrap();
         assert_eq!(doc.paragraphs[0].text, "内容。", "整体拒绝,未落盘任何修改");
         assert_eq!(doc.stages.llm, "off");
-        // 无精修稿时报错,不凭空造文件
+        // 无修订稿时报错,不凭空造文件
         let empty = tempfile::tempdir().unwrap();
         assert!(apply_refined_texts(empty.path(), &[(0, "x".into())], "m").is_err());
     }

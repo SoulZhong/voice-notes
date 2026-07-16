@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 impl NoteStore {
     /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
-    /// refined=Some 时导精修稿(所见即所得:用户看着精修稿点导出,不能给他原始逐字稿);
+    /// refined=Some 时导修订稿(所见即所得:用户看着修订稿点导出,不能给他原始逐字稿);
     /// None 走原始 segments 渲染。两者写同一文件名,后导覆盖先导。
     pub fn export(&self, id: &str, format: &str, refined: Option<&RefinedDoc>) -> anyhow::Result<PathBuf> {
         let content = match refined {
@@ -48,7 +48,7 @@ pub(crate) fn render_note(note: &Note, format: &str) -> anyhow::Result<String> {
     })
 }
 
-/// 精修稿的 md/txt 渲染(原始稿渲染在下方 render_note,精修段形状不同单独渲染;
+/// 修订稿的 md/txt 渲染(原始稿渲染在下方 render_note,Aing 段形状不同单独渲染;
 /// GUI 导出与 MCP get_note 共用本函数,防两处漂移)。
 /// 段落标签兜底与前端 speakerLabel 同序:名字 > 关联人物全局编号 > R 簇号。
 pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
@@ -249,7 +249,7 @@ mod tests {
         assert!(md.contains("**说话人 4**"), "关联人物按 P 号: {md}");
         assert!(md.contains("**说话人 3**"), "未关联按 R 号: {md}");
         assert!(md.contains("有名字用名字。"), "{md}");
-        assert!(!md.contains("原始句。"), "精修导出不含原始段: {md}");
+        assert!(!md.contains("原始句。"), "Aing 导出不含原始段: {md}");
         // 同名文件:再按原始稿导出,覆盖为原始内容(所见即所得,后导为准)。
         let md2 = std::fs::read_to_string(store.export(&id, "md", None).unwrap()).unwrap();
         assert!(md2.contains("原始句。"), "{md2}");

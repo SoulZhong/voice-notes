@@ -47,7 +47,7 @@ impl RecordSource {
     }
 }
 
-/// 精修 provider 类别。预设 base_url 前缀与前端 REFINE_PRESETS
+/// Aing provider 类别。预设 base_url 前缀与前端 REFINE_PRESETS
 /// (src/routes/ai/+page.svelte)对齐;匹配不上一律 custom,绝不报原始 URL。
 #[derive(Debug, PartialEq)]
 pub enum Provider {

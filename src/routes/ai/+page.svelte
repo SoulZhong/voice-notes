@@ -1,5 +1,5 @@
 <script lang="ts">
-  // AI 页:智能精修大模型配置 + AI 助手接入(Task 2 自设置页迁入)。
+  // AI 页:Aing 大模型配置 + AI 助手接入(Task 2 自设置页迁入)。
   import { onMount } from "svelte";
   import { getSettings, setSettings, testRefineLlm, testRefineAgent, type Settings } from "$lib/models";
   import {
@@ -26,7 +26,7 @@
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
   let error = $state("");
 
-  /** 智能精修:接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。开关已移至设置页「录制」区。 */
+  /** Aing:接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。开关已移至设置页「录制」区。 */
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
@@ -57,7 +57,7 @@
   /** 当前接口地址命中的预设(用户手改过地址就不再套预设文案)。 */
   const activePreset = $derived(REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim()));
 
-  // —— 精修执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
+  // —— Aing 执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
   let refineProvider = $state("openai");
   let refineAgent = $state("claude");
   let refineAgentBin = $state("");
@@ -354,17 +354,17 @@
     <div class="banner">{error}</div>
   {/if}
 
-  <!-- —— 智能精修:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
+  <!-- —— Aing:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
   <section>
-    <h2 class="section-title">智能精修</h2>
+    <h2 class="section-title">Aing</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">精修方式</span>
+          <span class="row-label">Aing 方式</span>
           <span class="row-desc">
             {refineProvider === "agent"
-              ? "用本机已登录的 AI 助手精修,不需要 API Key"
-              : "用 OpenAI 兼容的在线接口精修,需要 API Key"}
+              ? "用本机已登录的 AI 助手 Aing,不需要 API Key"
+              : "用 OpenAI 兼容的在线接口 Aing,需要 API Key"}
           </span>
         </div>
         <div class="seg">
@@ -441,7 +441,7 @@
             {agentTest.ok ? `测试成功(${agentTest.msg})` : `测试失败: ${agentTest.msg}`}
           </p>
         {/if}
-        <p class="config-hint">精修失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
+        <p class="config-hint">Aing 失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
       {:else}
         <div class="row">
           <div class="row-info">
@@ -509,7 +509,7 @@
           </p>
         {/if}
         {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">三项配齐后精修生效。</p>
+          <p class="config-hint">三项配齐后 Aing 生效。</p>
         {/if}
       {/if}
     </div>
@@ -663,7 +663,7 @@
         <div class="row-info">
           <span class="row-label">调用记录</span>
           <span class="row-desc">
-            精修与标题生成的每次对外 AI 调用,请求与响应全量留痕{aiLogsTotal > 0 ? `;共 ${aiLogsTotal} 条` : ""}
+            Aing 与标题生成的每次对外 AI 调用,请求与响应全量留痕{aiLogsTotal > 0 ? `;共 ${aiLogsTotal} 条` : ""}
           </span>
         </div>
         <button class="btn-secondary" onclick={() => goto("/ai/logs")}>查看</button>
