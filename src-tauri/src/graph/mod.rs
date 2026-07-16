@@ -96,7 +96,7 @@ pub(crate) fn upsert_note(data_root: &Path, note_id: &str, doc: &store::RefinedD
         )?;
         tx.execute(
             "INSERT INTO note_entities(note_id, entity_id, mention_count) VALUES(?1,?2,?3)
-             ON CONFLICT(note_id, entity_id) DO UPDATE SET mention_count=?3",
+             ON CONFLICT(note_id, entity_id) DO UPDATE SET mention_count = mention_count + excluded.mention_count",
             rusqlite::params![note_id, gid, count],
         )?;
     }
@@ -266,6 +266,31 @@ mod tests {
         let ents = list_entities(root.path()).unwrap();
         assert_eq!(ents.len(), 1);
         assert_eq!(ents[0].note_count, 1, "重跑不产生重复边");
+    }
+
+    #[test]
+    fn upsert_sums_mentions_when_two_locals_resolve_to_same_global() {
+        let root = tempfile::tempdir().unwrap();
+        write_vp(root.path(), r#"{"schema_version":1,"next_person":2,"people":{"P1":{"name":"张三"}}}"#);
+        // ent_1 名"张三"(3 提及);ent_2 名"老张" alias"张三"(1 提及)——都精确匹配 P1
+        let d = doc_with(
+            vec![ent("ent_1", "person", "张三", &[]), ent("ent_2", "person", "老张", &["张三"])],
+            vec![para("张三张三张三老张", vec![
+                Mention { entity: "ent_1".into(), start: 0, end: 2 },
+                Mention { entity: "ent_1".into(), start: 2, end: 4 },
+                Mention { entity: "ent_1".into(), start: 4, end: 6 },
+                Mention { entity: "ent_2".into(), start: 6, end: 8 },
+            ])],
+        );
+        write_note(root.path(), "n1", &d);
+        upsert_note(root.path(), "n1", &d).unwrap();
+        let ents = list_entities(root.path()).unwrap();
+        // 两个局部实体都归到 P1,mention 求和 = 4(不是被覆盖成 1)
+        let p1 = ents.iter().find(|e| e.id == "P1").expect("张三/老张 都归 P1");
+        assert_eq!(p1.mention_total, 4, "两个局部实体的提及应求和,不被覆盖");
+        // 幂等:再 upsert 一次仍是 4(DELETE 先清)
+        upsert_note(root.path(), "n1", &d).unwrap();
+        assert_eq!(list_entities(root.path()).unwrap().iter().find(|e| e.id == "P1").unwrap().mention_total, 4, "重跑幂等,不翻倍");
     }
 
     #[test]
