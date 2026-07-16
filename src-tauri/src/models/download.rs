@@ -23,13 +23,27 @@ pub fn apply_mirror(url: &str, enabled: bool, prefix: &str) -> String {
     }
 }
 
+/// 备用 GitHub 下载代理(主代理失败后按序回退)。均为「前缀 + 完整原始 URL」的 ghproxy 风格。
+/// 存活实测(2026-07-16)健在;公共代理会波动,失效时改此列表并发版。列表短以压回退延迟。
+pub const BACKUP_MIRROR_PREFIXES: &[&str] = &["https://gh-proxy.com/", "https://ghproxy.net/"];
+
+/// 下载候选 URL(按序尝试):启用镜像时 = [主代理+url, 备用代理+url(去重), 原站url];
+/// 停用/空前缀 = [原站url]。原站恒为最后一项。Task 4 依此区分「代理少重试、原站多重试」。
 pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Vec<String> {
-    let mirrored = apply_mirror(url, mirror_enabled, mirror_prefix);
-    if mirrored == url {
-        vec![url.to_string()]
-    } else {
-        vec![mirrored, url.to_string()]
+    let primary = apply_mirror(url, mirror_enabled, mirror_prefix);
+    if primary == url {
+        // 镜像停用或空前缀:只有原站。
+        return vec![url.to_string()];
     }
+    let mut out = vec![primary];
+    for bp in BACKUP_MIRROR_PREFIXES {
+        let candidate = apply_mirror(url, true, bp);
+        if candidate != url && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out.push(url.to_string()); // 原站兜底,恒最后
+    out
 }
 
 /// 「测试」镜像:经前缀对一个已知模型资源发 Range 探测请求(只取 1 字节,不拉正文),
@@ -363,11 +377,38 @@ mod tests {
     fn download_urls_try_mirror_first_then_origin_when_enabled() {
         let u = "https://github.com/a/b.onnx";
         assert_eq!(download_urls(u, false, "https://ghproxy.net/"), vec![u.to_string()]);
-        assert_eq!(download_urls(u, true, ""), vec![u.to_string()]);
-        assert_eq!(
-            download_urls(u, true, "https://ghproxy.net/"),
-            vec![format!("https://ghproxy.net/{u}"), u.to_string()],
-        );
+        assert_eq!(download_urls(u, true, ""), vec![u.to_string()], "空前缀视同停用");
+        let urls = download_urls(u, true, "https://ghproxy.net/");
+        assert_eq!(urls.first().unwrap(), &format!("https://ghproxy.net/{u}"), "主代理在最前");
+        assert_eq!(urls.last().unwrap(), u, "原站恒为最后");
+    }
+
+    #[test]
+    fn download_urls_multi_proxy_dedup_and_origin_last() {
+        let u = "https://github.com/a/b.onnx";
+        // 主代理恰好等于某个备用代理时,该代理只应出现一次。
+        let backup0 = format!("{}{u}", BACKUP_MIRROR_PREFIXES[0]);
+        let urls = download_urls(u, true, BACKUP_MIRROR_PREFIXES[0]);
+        assert_eq!(urls.iter().filter(|x| **x == backup0).count(), 1, "主/备重复应去重");
+        assert_eq!(urls.last().unwrap(), u, "原站恒为最后");
+        // 全程无重复项。
+        let mut sorted = urls.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), urls.len(), "候选列表不应有重复");
+    }
+
+    #[test]
+    fn download_urls_includes_backup_proxies() {
+        let u = "https://github.com/a/b.onnx";
+        let urls = download_urls(u, true, "https://ghfast.top/");
+        // 主代理 + 至少一个备用代理 + 原站。
+        assert!(urls.len() >= 3, "应含主代理、备用代理与原站, got {urls:?}");
+        for bp in BACKUP_MIRROR_PREFIXES {
+            if *bp != "https://ghfast.top/" {
+                assert!(urls.iter().any(|x| x == &format!("{bp}{u}")), "应含备用代理 {bp}");
+            }
+        }
     }
 
     #[test]

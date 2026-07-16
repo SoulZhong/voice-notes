@@ -7,6 +7,8 @@ export type ArtifactState = {
   approx_mb: number;
   required_for_recording: boolean;
   present: boolean;
+  /** 原始下载地址(GitHub release 直链),设置页展开展示用。 */
+  url: string;
 };
 export type ModelsStatus = {
   artifacts: ArtifactState[];

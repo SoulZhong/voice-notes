@@ -37,6 +37,14 @@
   let updateError = $state("");
   let mirrorTest = $state<{ ok: boolean; msg: string } | null>(null);
   let mirrorTesting = $state(false);
+  let expandedId = $state<string | null>(null);
+
+  /** 镜像开启时返回「前缀+原始url」(等同后端 apply_mirror);关闭/空前缀返回原始 url。 */
+  function effectiveUrl(url: string): string {
+    const p = (settings?.mirror_prefix ?? "").trim();
+    if (!settings?.mirror_enabled || !p) return url;
+    return p.endsWith("/") ? `${p}${url}` : `${p}/${url}`;
+  }
   async function runMirrorTest() {
     if (!settings) return;
     mirrorTesting = true;
@@ -760,7 +768,15 @@
         {#each status.artifacts as a (a.id)}
           <div class="row">
             <div class="row-info">
-              <span class="row-label">{a.label} · 约 {a.approx_mb}MB</span>
+              <button
+                class="url-toggle"
+                aria-expanded={expandedId === a.id}
+                aria-label={expandedId === a.id ? "收起下载地址" : "展开下载地址"}
+                onclick={() => (expandedId = expandedId === a.id ? null : a.id)}
+              >
+                <span class="caret" class:open={expandedId === a.id}>▸</span>
+                <span class="row-label">{a.label} · 约 {a.approx_mb}MB</span>
+              </button>
               {#if a.present}
                 <span class="present">已下载</span>
               {/if}
@@ -800,6 +816,24 @@
               <button class="btn-secondary" onclick={() => download(a.id)}>下载</button>
             {/if}
           </div>
+          {#if expandedId === a.id}
+            <div class="url-detail">
+              <div class="url-line">
+                <span class="url-tag">原始地址</span>
+                <code class="url-text">{a.url}</code>
+                <button class="link" onclick={() => navigator.clipboard.writeText(a.url)}>复制</button>
+              </div>
+              <div class="url-line">
+                <span class="url-tag">镜像地址</span>
+                {#if settings?.mirror_enabled && (settings?.mirror_prefix ?? "").trim()}
+                  <code class="url-text">{effectiveUrl(a.url)}</code>
+                  <button class="link" onclick={() => navigator.clipboard.writeText(effectiveUrl(a.url))}>复制</button>
+                {:else}
+                  <span class="url-muted">未启用镜像加速</span>
+                {/if}
+              </div>
+            </div>
+          {/if}
         {/each}
       {/if}
       <div class="row">
@@ -1215,5 +1249,56 @@
     border-color: var(--warning-line);
     color: var(--warning-ink);
     margin: 0.6rem 0 0;
+  }
+  .url-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+  }
+  .caret {
+    display: inline-block;
+    transition: transform 0.15s ease;
+    opacity: 0.6;
+    font-size: 0.85em;
+  }
+  .caret.open {
+    transform: rotate(90deg);
+  }
+  .url-detail {
+    padding: 6px 0 10px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .url-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .url-tag {
+    flex: 0 0 auto;
+    font-size: 0.8em;
+    opacity: 0.6;
+  }
+  .url-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    white-space: nowrap;
+    font-size: 0.8em;
+    opacity: 0.85;
+  }
+  .url-muted {
+    font-size: 0.8em;
+    opacity: 0.5;
   }
 </style>
