@@ -630,8 +630,37 @@
           <button class="link danger" onclick={rerunRefine}>确认重新 Aing</button>
           <button class="link" onclick={() => (confirmRefine = false)}>取消</button>
         {:else}
-          <button disabled={refining || note.meta.state !== "complete"} onclick={rerunRefine}>
-            {refining ? "Aing 中…" : "重新 Aing"}
+          <button
+            class="reaing"
+            class:casting={refining}
+            disabled={refining || note.meta.state !== "complete"}
+            onclick={rerunRefine}
+            title={refining ? "Aing 中…" : "重新 Aing"}
+          >
+            <svg class="wand" viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+              <path
+                class="wand-stick"
+                d="M3.5 18.5 11.5 10.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.7"
+                stroke-linecap="round"
+              />
+              <path class="wand-star" d="M15 2.8 16 6 19.2 7 16 8 15 11.2 14 8 10.8 7 14 6Z" />
+              <path
+                class="spark spark-a"
+                d="M6.5 3.6 6.9 4.6 7.9 5 6.9 5.4 6.5 6.4 6.1 5.4 5.1 5 6.1 4.6Z"
+              />
+              <path
+                class="spark spark-b"
+                d="M18.5 12.7 18.85 13.65 19.8 14 18.85 14.35 18.5 15.3 18.15 14.35 17.2 14 18.15 13.65Z"
+              />
+              <path
+                class="spark spark-c"
+                d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
+              />
+            </svg>
+            <span>{refining ? "Aing 中…" : "重新 Aing"}</span>
           </button>
         {/if}
       </div>
@@ -1068,6 +1097,160 @@
   .refine-warn {
     color: var(--warning-ink);
     font-size: 0.8rem;
+  }
+  /* 重新 Aing = Aing 的「施法键」:22px 彩色魔杖(手柄 currentColor,杖头金色星芒 + 紫/青/粉星火,禁 emoji)。
+     idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +
+     金星芒 360° 旋转脉动发光 + 三色星火依次飞出闪烁。用户要「彩色/更大/动效夸张」——放开 DESIGN 的克制,
+     但仍克制在一颗按钮内;respect prefers-reduced-motion。 */
+  .reaing {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5em;
+    --wand-gold: #f6b02e;
+    --wand-violet: #a678ff;
+    --wand-cyan: #46bcff;
+    --wand-pink: #ff5fae;
+  }
+  .reaing .wand {
+    flex: none;
+    overflow: visible;
+  }
+  .reaing .wand-star,
+  .reaing .spark {
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  .reaing .wand-star {
+    fill: var(--wand-gold);
+    transition:
+      transform 0.3s cubic-bezier(0.2, 0.9, 0.2, 1),
+      filter 0.3s ease;
+  }
+  .reaing .spark {
+    opacity: 0;
+    transform: scale(0.3);
+    transition:
+      opacity 0.25s ease,
+      transform 0.3s cubic-bezier(0.2, 0.9, 0.2, 1);
+  }
+  .reaing .spark-a {
+    fill: var(--wand-violet);
+  }
+  .reaing .spark-b {
+    fill: var(--wand-cyan);
+  }
+  .reaing .spark-c {
+    fill: var(--wand-pink);
+  }
+  /* hover:星火向外迸射、金星芒放大旋转带光晕 */
+  .reaing:hover:not(:disabled) .wand-star {
+    transform: scale(1.3) rotate(20deg);
+    filter: drop-shadow(0 0 3px rgba(246, 176, 46, 0.75));
+  }
+  .reaing:hover:not(:disabled) .spark {
+    opacity: 1;
+  }
+  .reaing:hover:not(:disabled) .spark-a {
+    transform: translate(-2px, -2px) scale(1.25);
+  }
+  .reaing:hover:not(:disabled) .spark-b {
+    transform: translate(2.5px, 2px) scale(1.25);
+    transition-delay: 0.05s;
+  }
+  .reaing:hover:not(:disabled) .spark-c {
+    transform: translate(-1.5px, 2.5px) scale(1.25);
+    transition-delay: 0.1s;
+  }
+  /* 施法态:覆盖 disabled 变暗(进行中≠不可用),夸张动效全开 */
+  .reaing.casting {
+    opacity: 1;
+    color: var(--ink-secondary);
+  }
+  .reaing.casting .wand {
+    transform-origin: 18% 84%;
+    animation: wand-wave-big 1.15s ease-in-out infinite;
+  }
+  .reaing.casting .wand-star {
+    animation: star-spin 1.6s ease-in-out infinite;
+  }
+  .reaing.casting .spark-a {
+    animation: spark-fly-a 1.1s ease-in-out infinite;
+  }
+  .reaing.casting .spark-b {
+    animation: spark-fly-b 1.1s ease-in-out infinite 0.35s;
+  }
+  .reaing.casting .spark-c {
+    animation: spark-fly-c 1.1s ease-in-out infinite 0.7s;
+  }
+  @keyframes wand-wave-big {
+    0%,
+    100% {
+      transform: rotate(-14deg);
+    }
+    50% {
+      transform: rotate(16deg);
+    }
+  }
+  @keyframes star-spin {
+    0% {
+      transform: rotate(0) scale(0.85);
+      filter: drop-shadow(0 0 0 rgba(246, 176, 46, 0));
+    }
+    50% {
+      transform: rotate(180deg) scale(1.32);
+      filter: drop-shadow(0 0 5px rgba(246, 176, 46, 0.9));
+    }
+    100% {
+      transform: rotate(360deg) scale(0.85);
+      filter: drop-shadow(0 0 0 rgba(246, 176, 46, 0));
+    }
+  }
+  @keyframes spark-fly-a {
+    0%,
+    100% {
+      opacity: 0;
+      transform: translate(0, 0) scale(0.3);
+    }
+    50% {
+      opacity: 1;
+      transform: translate(-3px, -3px) scale(1.4);
+    }
+  }
+  @keyframes spark-fly-b {
+    0%,
+    100% {
+      opacity: 0;
+      transform: translate(0, 0) scale(0.3);
+    }
+    50% {
+      opacity: 1;
+      transform: translate(3.5px, 2.5px) scale(1.4);
+    }
+  }
+  @keyframes spark-fly-c {
+    0%,
+    100% {
+      opacity: 0;
+      transform: translate(0, 0) scale(0.3);
+    }
+    50% {
+      opacity: 1;
+      transform: translate(-1.5px, 3.5px) scale(1.4);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .reaing.casting .wand,
+    .reaing.casting .wand-star,
+    .reaing.casting .spark {
+      animation: none;
+    }
+    .reaing.casting .spark {
+      opacity: 0.7;
+      transform: scale(1);
+    }
+    .reaing:hover:not(:disabled) .wand-star {
+      transform: none;
+    }
   }
   /* menu/popover（改说话人菜单）：surface-press 底、hairline 边、rounded-lg、shadow-popover
      （暗色下 canvas 比承载面更黑，浮层用 canvas 会成"洞"，故底走 surface-press）。 */
