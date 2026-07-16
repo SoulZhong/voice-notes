@@ -11,7 +11,7 @@ mod voiceprints;
 pub use export::render_refined; // GUI 导出与 MCP get_note 共用的 Aing 渲染(format_ts 已无 store:: 路径消费者,不再 re-export)。
 pub use notes::NoteStore;
 pub use refined::{load_refined, write_refined_atomic, RefineStages, RefinedDoc, RefinedParagraph};
-pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // Aing 稿说话人编辑三件套(lib.rs 命令层消费)。
+pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
 pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。

@@ -101,7 +101,7 @@
       <div class="row">
         <div class="row-info">
           <span class="row-label"><code>VN_NOTE_TEXT</code></span>
-          <span class="row-desc">笔记全文 markdown,Aing 稿优先——仅钩子勾选「附带笔记内容」时注入,下同</span>
+          <span class="row-desc">笔记全文 markdown,修订稿优先——仅钩子勾选「附带笔记内容」时注入,下同</span>
         </div>
       </div>
       <div class="row">

@@ -46,12 +46,12 @@
   let confirmSeq = $state<number | null>(null);
   let speakerMenuSeq = $state<number | null>(null);
 
-  // Aing 稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
+  // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
   let refining = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
-  // 会议搭子人物列表:Aing 稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
+  // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
 
   const id = $derived($page.params.id as string);
@@ -70,14 +70,14 @@
   const canEdit = $derived(!(recording.isLive && recording.noteId === id));
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
 
-  /** Aing 稿是否可展示：无 Aing 结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
+  /** 修订稿是否可展示：无 Aing 结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
   const refinedAvailable = $derived(!!refined && note?.meta.state === "complete");
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** Aing 稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
+  /** 修订稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
       徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。
       person_id 一并带上:关联库人物的说话人跨笔记同色、无名时按全局编号兜底。 */
   const refinedSpeakers = $derived.by(() => {
@@ -194,7 +194,7 @@
       });
   });
 
-  // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的 Aing 稿/进度）。
+  // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的 修订稿/进度）。
   // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
   // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
   // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
@@ -454,7 +454,7 @@
   async function doExport(format: "md") {
     exportMsg = "";
     try {
-      // 所见即所得:看着 Aing 稿点导出就导 Aing 稿,原始稿视图导原始逐字稿。
+      // 所见即所得:看着 修订稿点导出就导 修订稿,原始稿视图导原始逐字稿。
       const path = await exportNote(id, format, effectiveView === "refined");
       exportMsg = `已导出：${path}`;
       await revealItemInDir(path);
@@ -574,7 +574,7 @@
       </div>
 
       {#if effectiveView === "refined"}
-        <!-- Aing 稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
+        <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
              可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
              Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
         <SpeakerChips
@@ -593,7 +593,7 @@
         />
       {:else}
         <!-- 原始稿说话人条:改名仍是笔记内本地名;选人关联(写 speakers.json person_id)
-             与 Aing 稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
+             与 修订稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
         <SpeakerChips
           speakers={note.speakers}
           noteId={id}
@@ -615,10 +615,10 @@
           class="link"
           class:active={effectiveView === "refined"}
           disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : "尚无 Aing 稿"}
+          title={refinedAvailable ? "" : "尚无 修订稿"}
           onclick={() => (viewMode = "refined")}
         >
-          Aing 稿
+          修订稿
         </button>
         <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
           原始逐字稿
@@ -667,7 +667,7 @@
           </div>
         {/each}
         {#if refined.paragraphs.length === 0}
-          <p class="hint">（Aing 稿为空）</p>
+          <p class="hint">（修订稿为空）</p>
         {/if}
       {:else}
         {#each displaySegments as seg (seg.seq)}
@@ -949,7 +949,7 @@
   .seg.discarded {
     opacity: 0.38;
   }
-  /* Aing 稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
+  /* 修订稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
   .para {
     margin: 0 0 6px;
     line-height: 1.7;
@@ -1044,7 +1044,7 @@
   .link:disabled:hover {
     text-decoration: none;
   }
-  /* 视图切换条:Aing 稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新 Aing(默认 button-secondary)。 */
+  /* 视图切换条:修订稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新 Aing(默认 button-secondary)。 */
   .view-switch {
     display: flex;
     align-items: center;

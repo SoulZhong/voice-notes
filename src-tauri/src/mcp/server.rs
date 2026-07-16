@@ -48,7 +48,7 @@ pub struct GetNoteParams {
     pub note_id: String,
     /// "segments"(默认,逐句结构化) | "markdown" | "text"
     pub format: Option<String>,
-    /// 有 Aing 稿时优先返回 Aing 稿,默认 true
+    /// 有 修订稿时优先返回 修订稿,默认 true
     pub prefer_refined: Option<bool>,
 }
 
@@ -62,11 +62,11 @@ pub struct RefinedTextUpdate {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ApplyRefinedParams {
-    /// 笔记 id(须已有 Aing 稿,即 get_note 返回 refined=true)
+    /// 笔记 id(须已有 修订稿,即 get_note 返回 refined=true)
     pub note_id: String,
     /// 有改动的段落集合;确认全文无需修订时传空数组(同样标记 Aing 完成)
     pub updates: Vec<RefinedTextUpdate>,
-    /// 执行 Aing 的模型名(记入 Aing 稿元数据),如 "claude-sonnet-4-5"
+    /// 执行 Aing 的模型名(记入 修订稿元数据),如 "claude-sonnet-4-5"
     pub model: Option<String>,
 }
 
@@ -105,7 +105,7 @@ impl VnMcp {
         Ok(ok_json(tools::search_notes(&roots, &p.query, p.limit.unwrap_or(20))))
     }
 
-    #[tool(description = "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI Aing 稿时默认优先 Aing 稿。")]
+    #[tool(description = "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先 修订稿。")]
     async fn get_note(&self, Parameters(p): Parameters<GetNoteParams>) -> Result<CallToolResult, McpError> {
         let roots = tools::resolve_roots();
         match tools::get_note(&roots, &p.note_id, p.format.as_deref().unwrap_or("segments"), p.prefer_refined.unwrap_or(true)) {
@@ -114,7 +114,7 @@ impl VnMcp {
         }
     }
 
-    #[tool(description = "把 Aing 修订写回笔记的 Aing 稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。\
+    #[tool(description = "把 Aing 修订写回笔记的 修订稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。\
                           流程:先 get_note(format=segments) 拿 paragraphs,修订后只提交有改动的段落;全文无需修订则传空 updates。")]
     async fn apply_refined_texts(&self, Parameters(p): Parameters<ApplyRefinedParams>) -> Result<CallToolResult, McpError> {
         let roots = tools::resolve_roots();
@@ -182,12 +182,12 @@ pub fn catalog() -> serde_json::Value {
         ("search_notes", "全文检索所有会议笔记的转写内容,返回命中句与上下文各一句、说话人与时间戳。", "none"),
         (
             "get_note",
-            "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI Aing 稿时默认优先 Aing 稿。",
+            "读取一场会议笔记全文。segments 给逐句结构化(含说话人/时间戳),markdown/text 给渲染稿;有 AI 修订稿时默认优先 修订稿。",
             "none",
         ),
         (
             "apply_refined_texts",
-            "把 Aing 修订写回笔记的 Aing 稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。",
+            "把 Aing 修订写回笔记的 修订稿:按段落下标整段替换文本(只能改文本,说话人/时间戳/段落数不可变)。",
             "none",
         ),
         ("list_speakers", "列出全局声纹库中的说话人(跨会议一致的人物编号/名字/累计说话时长/出现的笔记数)。", "none"),

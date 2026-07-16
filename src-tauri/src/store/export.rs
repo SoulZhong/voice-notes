@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 impl NoteStore {
     /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
-    /// refined=Some 时导 Aing 稿(所见即所得:用户看着 Aing 稿点导出,不能给他原始逐字稿);
+    /// refined=Some 时导 修订稿(所见即所得:用户看着 修订稿点导出,不能给他原始逐字稿);
     /// None 走原始 segments 渲染。两者写同一文件名,后导覆盖先导。
     pub fn export(&self, id: &str, format: &str, refined: Option<&RefinedDoc>) -> anyhow::Result<PathBuf> {
         let content = match refined {
@@ -48,7 +48,7 @@ pub(crate) fn render_note(note: &Note, format: &str) -> anyhow::Result<String> {
     })
 }
 
-/// Aing 稿的 md/txt 渲染(原始稿渲染在下方 render_note,Aing 段形状不同单独渲染;
+/// 修订稿的 md/txt 渲染(原始稿渲染在下方 render_note,Aing 段形状不同单独渲染;
 /// GUI 导出与 MCP get_note 共用本函数,防两处漂移)。
 /// 段落标签兜底与前端 speakerLabel 同序:名字 > 关联人物全局编号 > R 簇号。
 pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {

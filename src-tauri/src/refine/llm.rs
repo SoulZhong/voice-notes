@@ -211,7 +211,7 @@ pub fn gen_title(
         text.push('\n');
     }
     if text.trim().is_empty() {
-        anyhow::bail!("Aing 稿无内容,不生成标题");
+        anyhow::bail!("修订稿无内容,不生成标题");
     }
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body_json = json!({

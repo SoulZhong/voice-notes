@@ -1,5 +1,5 @@
 //! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini /
-//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读 Aing 稿并调
+//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读 修订稿并调
 //! `apply_refined_texts` 写回。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按
 //! settings.refine_provider 二选一。
 //!
@@ -485,7 +485,7 @@ pub fn gen_title(
         text.push('\n');
     }
     if text.trim().is_empty() {
-        anyhow::bail!("Aing 稿无内容,不生成标题");
+        anyhow::bail!("修订稿无内容,不生成标题");
     }
     let prompt = format!(
         "只输出一个不超过 12 个字的中文标题,概括下面这场对话的核心主题;不要引号、标点或任何解释。\n\n{text}"

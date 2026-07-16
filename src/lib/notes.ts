@@ -97,15 +97,15 @@ export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
 export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
-/** 返回导出文件绝对路径。preferRefined=真且 Aing 稿在盘时导 Aing 稿(所见即所得)。 */
+/** 返回导出文件绝对路径。preferRefined=真且 修订稿在盘时导 修订稿(所见即所得)。 */
 export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean) =>
   invoke<string>("export_note", { id, format, preferRefined });
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
-/** Aing 稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
+/** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
 export const renameRefinedSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_refined_speaker", { noteId, speakerId, name });
-/** 把 Aing 稿说话人关联到声纹库人物(会议搭子选人),采用库中现名。 */
+/** 把 修订稿说话人关联到声纹库人物(会议搭子选人),采用库中现名。 */
 export const assignRefinedPerson = (noteId: string, speakerId: string, personId: string) =>
   invoke<void>("assign_refined_person", { noteId, speakerId, personId });
 /** 原始稿说话人关联声纹库人物:speakers.json 写 person_id 并清本地名(join 显库名)。 */
@@ -127,7 +127,7 @@ export function speakerLabel(
   const meta = speakers[speaker];
   if (meta?.name) return meta.name;
   if (meta?.person_id) return `说话人 ${meta.person_id.replace(/^P/, "")}`;
-  // Aing 稿重聚类标签(R1..Rk):终稿命名空间,不叫"新说话人"(它是全场收敛结果而非新面孔)
+  // 修订稿重聚类标签(R1..Rk):终稿命名空间,不叫"新说话人"(它是全场收敛结果而非新面孔)
   if (/^R\d+$/.test(speaker)) return `说话人 ${speaker.slice(1)}`;
   return `新说话人 ${speaker.replace(/^S/, "")}`;
 }
