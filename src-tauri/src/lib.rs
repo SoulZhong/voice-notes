@@ -2410,6 +2410,14 @@ async fn test_refine_agent(provider: String, bin: String, model: String) -> Resu
         .map_err(|e| format!("执行线程失败: {e}"))?
 }
 
+/// 设置页「测试」镜像:经镜像前缀探一个已知资源验证可达。
+#[tauri::command]
+async fn test_mirror(prefix: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || models::download::probe_mirror(&prefix))
+        .await
+        .map_err(|e| format!("执行线程失败: {e}"))?
+}
+
 /// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
 /// 都必然 unpause——否则一次迁移失败后转码永久静止,只能重启应用。与 ResetOnDrop
 /// （复位 download_running 互斥位）配套:两者一起挂在迁移线程头部,兜住所有退出路径。
@@ -2939,6 +2947,7 @@ pub fn run() {
             test_hook,
             test_refine_llm,
             test_refine_agent,
+            test_mirror,
             apply_shortcut,
             migrate_data_dir,
             migrate_models_dir,
