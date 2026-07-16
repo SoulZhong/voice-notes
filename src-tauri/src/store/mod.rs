@@ -15,12 +15,14 @@ pub use refined::{assign_refined_person, join_library_names, rename_refined_spea
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
+pub use voiceprints::Voiceprints; // graph::resolve_global_id 命名此类型(人实体→person_id 匹配)。
 pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
 pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
 pub use voiceprints::AUTO_ENROLL_MS; // lib.rs 实时入库回调(registry enroller)用同一门槛。
 pub use voiceprints::MAX_SAMPLES; // merge_person 判断样本是否超额(超额才付声纹模型加载成本)。
-// Person/PersonCentroid/Voiceprints/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型
-// 生成/测试引用),但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。
+// Person/PersonCentroid/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型生成/测试引用),
+// 但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。Voiceprints 例外:
+// graph::resolve_global_id 需要具名此类型,已于上方重新导出。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
