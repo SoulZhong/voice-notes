@@ -1,21 +1,47 @@
 //! 菜单栏常驻托盘（增值层）。设计姿态：托盘一切失败只 eprintln 降级，应用照常运行——
 //! 建不出托盘、切不了图标都不许影响录制/转写这些核心功能。
 //!
-//! 图标语义：idle = 黑色圆环，作为 macOS 模板图（icon_as_template(true)），系统按亮/暗
-//! 菜单栏自动反色；recording = 实心红点 #ff6161，必须显色，故此时关掉模板（模板会把颜色
-//! 抹成单色，红点就没了）。图标由 scripts/gen_tray_icons.py 生成并提交入库，此处 include_bytes。
+//! 图标语义：菜单栏直接用 App Logo（戴眼镜的小姑娘拿笔记本）。空闲 = 静止 Logo；
+//! 录制中 = 逐帧循环的「疯狂记笔记」抖动动画；停止录制即静止（精修在后台安静进行，
+//! 不驱动图标——否则按了停止还在抖，像没停下）。图标是彩色 Logo，故全程非模板图
+//! （icon_as_template(false)）——macOS 模板会把颜色抹成单色。
+//!
+//! 为何靠逐帧切图而非 GIF：macOS 菜单栏是静态 NSImage，不解析 GIF 帧；要「动」只能
+//! 由运行时定时器逐帧 set_icon。帧 PNG 由 scripts/gen_tray_logo_frames.py 生成并提交
+//! 入库，此处 include_bytes。活跃判定（是否录制）由 actor 提交点调 `update` 边沿驱动
+//! （见本文件 update / start_anim）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager};
 
+use crate::lifecycle::machine::{LifecycleState, SessionState};
+
 /// 托盘唯一 id：setup / set_recording / apply_enabled 都按它 tray_by_id 取用。
 /// pub(crate)：关窗事件按 tray_by_id(TRAY_ID) 判托盘实存,决定是否拦截关闭并隐藏。
 pub(crate) const TRAY_ID: &str = "main-tray";
 
-const IDLE_ICON: &[u8] = include_bytes!("../icons/tray-idle.png");
-const RECORDING_ICON: &[u8] = include_bytes!("../icons/tray-recording.png");
+/// 空闲静止帧。彩色 App Logo，非模板图。
+const IDLE_ICON: &[u8] = include_bytes!("../icons/tray-logo-idle.png");
+/// 录制/精修抖动帧（循环播放）。与 IDLE 同源 Logo，逐帧轻微旋转+位移。
+const REC_FRAMES: &[&[u8]] = &[
+    include_bytes!("../icons/tray-logo-rec-0.png"),
+    include_bytes!("../icons/tray-logo-rec-1.png"),
+    include_bytes!("../icons/tray-logo-rec-2.png"),
+    include_bytes!("../icons/tray-logo-rec-3.png"),
+    include_bytes!("../icons/tray-logo-rec-4.png"),
+    include_bytes!("../icons/tray-logo-rec-5.png"),
+];
+/// 逐帧间隔：约 9fps，忙碌但不抽搐；低频省电（菜单栏动画不追高帧率）。
+const FRAME_MS: u64 = 110;
+
+/// 动画代际计数。每次 start_anim 领取新一代并起一条动画线程按该代循环；代际一变
+/// （再次 start 或 stop）旧线程下一 tick 自然退出——保证任一时刻至多一条动画线程在跑，
+/// 无需 join。全局单托盘，单计数器即可。
+static ANIM_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 读 settings.tray_enabled（读不到 app_data_dir → 回落默认 true，与 Settings::default 一致）。
 fn tray_enabled(app: &AppHandle) -> bool {
@@ -98,46 +124,41 @@ pub fn setup(app: &AppHandle) {
     };
     let built = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .icon_as_template(true)
+        // 彩色 Logo 全程非模板（模板会抹成单色）。
+        .icon_as_template(false)
         .menu(&menu)
         .on_menu_event(|app, event| on_menu_event(app, event.id.as_ref()))
         .build(app);
     if let Err(e) = built {
         eprintln!("托盘创建失败，跳过托盘（不影响应用）: {e}");
+        return;
+    }
+    // 冷启动即在录制中（设置里现开托盘，或崩溃恢复）：立即进入抖动动画，
+    // 否则要等到下一次状态迁移才动。精修态冷启动不可达，无需处理。
+    if recording {
+        start_anim(app);
     }
 }
 
-/// 录制态变化时刷新托盘：切图标（red/idle）+ 模板开关 + 重建菜单文案。
-/// 托盘不存在（未启用/建失败）→ tray_by_id 为 None，静默跳过。失败只 eprintln。
+/// 会话录制态变化时刷新托盘**菜单**文案（开始/停止录制 + 模型就绪禁用位）。
+/// 图标不在此处理——图标（静止/抖动）由 `update` 按「录制 OR 精修」活跃度独立驱动，
+/// 避免会话钩子与精修钩子争抢同一图标。托盘不存在则 tray_by_id 为 None，静默跳过。
 ///
 /// P1 actor 改道后,本函数可能在 lifecycle-actor 线程上执行,而发起命令的主线程正阻塞
-/// 等待 actor 回复;托盘/菜单 API(set_icon_with_as_template/set_menu/MenuItem 构建)
-/// 内部是「派发到主线程并同步等结果」——此时同步等待即死锁(actor.rs 死锁注记③的前提)。
-/// 故整段更新改为 fire-and-forget 派发:在主线程上调用时 run_on_main_thread 原地内联
-/// 执行(与旧行为逐位一致);在其它线程上调用时入队主线程事件循环,主线程空闲后按入队
-/// 序执行,托盘态与录制态最终一致(此前从后台加载线程调用本就等价于稍后生效)。
+/// 等待 actor 回复;托盘/菜单 API 内部是「派发到主线程并同步等结果」——此时同步等待即
+/// 死锁(actor.rs 死锁注记③的前提)。故改为 fire-and-forget 派发:在主线程上调用时
+/// run_on_main_thread 原地内联执行;在其它线程上调用时入队主线程事件循环,最终一致。
 pub fn set_recording(app: &AppHandle, recording: bool) {
     let app2 = app.clone();
-    if let Err(e) = app.run_on_main_thread(move || set_recording_on_main(&app2, recording)) {
-        eprintln!("托盘更新派发失败（不影响录制）: {e}");
+    if let Err(e) = app.run_on_main_thread(move || set_menu_on_main(&app2, recording)) {
+        eprintln!("托盘菜单派发失败（不影响录制）: {e}");
     }
 }
 
-fn set_recording_on_main(app: &AppHandle, recording: bool) {
+fn set_menu_on_main(app: &AppHandle, recording: bool) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let bytes = if recording { RECORDING_ICON } else { IDLE_ICON };
-    match Image::from_bytes(bytes) {
-        Ok(icon) => {
-            // 原子设图标+模板位：避免 macOS 上先 set_icon 再 set_icon_as_template 的二次渲染闪烁。
-            // recording 关模板（红点要显色），idle 开模板（黑环随菜单栏亮暗反色）。
-            if let Err(e) = tray.set_icon_with_as_template(Some(icon), !recording) {
-                eprintln!("托盘图标切换失败（不影响录制）: {e}");
-            }
-        }
-        Err(e) => eprintln!("托盘图标解码失败（不影响录制）: {e}"),
-    }
     match build_menu(app, recording) {
         Ok(menu) => {
             if let Err(e) = tray.set_menu(Some(menu)) {
@@ -145,6 +166,82 @@ fn set_recording_on_main(app: &AppHandle, recording: bool) {
             }
         }
         Err(e) => eprintln!("托盘菜单构建失败（不影响录制）: {e}"),
+    }
+}
+
+// —— 图标动画：仅录制中逐帧循环抖动，停止即静止 —— //
+
+/// 「活跃」= 会话正在录制。**只看录制**：停止录制通常紧接自动精修，若把精修也算
+/// 活跃，抖动会一路延续到精修结束——用户按了停止却还在抖，读起来像「没停下」。
+/// 故停录（会话离开 Recording）即停回静止 Logo，精修在后台安静进行、不再驱动图标。
+fn is_active(s: &LifecycleState) -> bool {
+    matches!(s.session, SessionState::Recording { .. })
+}
+
+/// 内核状态提交后由 actor 调用（见 actor.rs 提交点）：按活跃度**边沿**驱动图标动画。
+/// 每条消息都会调用，故非活跃↔活跃无变化时零动作（不起线程、不派发）。
+pub fn update(app: &AppHandle, before: &LifecycleState, after: &LifecycleState) {
+    let (was, now) = (is_active(before), is_active(after));
+    if was == now {
+        return;
+    }
+    if now {
+        start_anim(app);
+    } else {
+        stop_anim(app);
+    }
+}
+
+/// 起动画：领取新一代 gen，起一条 tray-anim 线程按 gen 循环切帧；gen 变化即令旧线程退出。
+fn start_anim(app: &AppHandle) {
+    let generation = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let app_thread = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tray-anim".into())
+        .spawn(move || {
+            let mut i = 0usize;
+            loop {
+                if ANIM_GEN.load(Ordering::SeqCst) != generation {
+                    return; // 被 stop 或新一轮 start 取代
+                }
+                dispatch_icon(&app_thread, REC_FRAMES[i % REC_FRAMES.len()]);
+                i = i.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(FRAME_MS));
+            }
+        });
+    if let Err(e) = spawned {
+        // 线程起不来：降级为静止 Logo（下面 dispatch），绝不影响录制。
+        eprintln!("托盘动画线程创建失败（降级静止，不影响录制）: {e}");
+        dispatch_icon(app, IDLE_ICON);
+    }
+}
+
+/// 停动画：作废当前代（令动画线程下一 tick 退出）并把图标切回静止 Logo。
+fn stop_anim(app: &AppHandle) {
+    ANIM_GEN.fetch_add(1, Ordering::SeqCst);
+    dispatch_icon(app, IDLE_ICON);
+}
+
+/// 把某帧图标 fire-and-forget 派发到主线程设置（彩色 Logo，非模板）。
+fn dispatch_icon(app: &AppHandle, bytes: &'static [u8]) {
+    let app2 = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || set_icon_on_main(&app2, bytes)) {
+        eprintln!("托盘图标派发失败（不影响录制）: {e}");
+    }
+}
+
+fn set_icon_on_main(app: &AppHandle, bytes: &'static [u8]) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    match Image::from_bytes(bytes) {
+        // 原子设图标+模板位（false=彩色 Logo 显色）：避免二次渲染闪烁。
+        Ok(icon) => {
+            if let Err(e) = tray.set_icon_with_as_template(Some(icon), false) {
+                eprintln!("托盘图标切换失败（不影响录制）: {e}");
+            }
+        }
+        Err(e) => eprintln!("托盘图标解码失败（不影响录制）: {e}"),
     }
 }
 

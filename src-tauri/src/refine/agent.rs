@@ -22,6 +22,8 @@ use std::process::{Command, Stdio};
 pub const REFINE_TIMEOUT_S: u64 = 900;
 /// 标题一发一收的上限。
 pub const TITLE_TIMEOUT_S: u64 = 120;
+/// 「测试运行」探测的超时:只验能启动+能产出,远短于精修的 REFINE_TIMEOUT_S。
+pub const PROBE_TIMEOUT_S: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -107,6 +109,41 @@ pub fn probe_all() -> Vec<(&'static str, Option<String>)> {
         .into_iter()
         .map(|k| (k.key(), resolve_bin(k, "").map(|p| p.display().to_string())))
         .collect()
+}
+
+/// 「测试运行」:用配好的 CLI 跑一句极短提示,验证能启动并产出。不依赖任何笔记,
+/// 不落 AI 日志。成功返回 stdout 摘要;失败返回归类原因。
+pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<String, String> {
+    let kind = AgentKind::from_key(provider).ok_or_else(|| format!("未知 Agent: {provider}"))?;
+    let bin = resolve_bin(kind, bin_override)
+        .ok_or_else(|| format!("未找到 {} 命令行工具:请先安装并登录,或指定 CLI 路径", kind.bin_name()))?;
+    let scratch = make_scratch("probe").map_err(|e| format!("建工作区失败: {e}"))?;
+    let prompt = "只回复两个字:正常。不要任何解释。";
+    let run = (|| -> anyhow::Result<(bool, String, String)> {
+        let cmd = title_command(kind, &bin, model, prompt, &scratch);
+        run_with_timeout(cmd, &scratch, PROBE_TIMEOUT_S)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    match run {
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("超时") {
+                Err(format!("测试超时({PROBE_TIMEOUT_S}s):CLI 可能未登录或卡住"))
+            } else {
+                Err(format!("启动失败:{s}"))
+            }
+        }
+        Ok((exit_ok, stdout, err_tail)) => {
+            if !exit_ok {
+                Err(format!("退出码非 0;stderr 尾部:\n{err_tail}"))
+            } else if stdout.trim().is_empty() {
+                Err("无输出:CLI 可能未登录或未产出结果".to_string())
+            } else {
+                let first: String = stdout.trim().lines().next().unwrap_or("").chars().take(30).collect();
+                Ok(format!("CLI 可用,返回:{first}"))
+            }
+        }
+    }
 }
 
 /// 精修指令。与 llm.rs SYSTEM_PROMPT 同一套四类修订规则,但流程改为「读稿→修订→
@@ -679,6 +716,19 @@ mod tests {
         // 启用但缺端口 → 跳过该条目,不造出残缺 URL
         let broken = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n}";
         assert!(parse_scutil_proxy(broken).is_empty());
+    }
+
+    #[test]
+    fn probe_run_unknown_provider_errs() {
+        let e = super::probe_run("nope", "", "").unwrap_err();
+        assert!(e.contains("未知 Agent"), "得到: {e}");
+    }
+
+    #[test]
+    fn probe_run_missing_bin_errs() {
+        // override 指向不存在路径 → resolve_bin 返回 None,不 spawn 任何进程。
+        let e = super::probe_run("claude", "/definitely/not/here/claude", "").unwrap_err();
+        assert!(e.contains("未找到"), "得到: {e}");
     }
 
     #[test]

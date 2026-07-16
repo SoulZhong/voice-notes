@@ -32,6 +32,41 @@ pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Ve
     }
 }
 
+/// 「测试」镜像:经前缀对一个已知模型资源发 Range 探测请求(只取 1 字节,不拉正文),
+/// 验证镜像可达。空前缀直接报错(未启用/未填无可测)。成功返回 HTTP 状态。
+pub fn probe_mirror(prefix: &str) -> Result<String, String> {
+    let p = prefix.trim();
+    if p.is_empty() {
+        return Err("镜像前缀为空".to_string());
+    }
+    // 取注册表里一个稳定的小资源(vad,~1MB)做探测;Range 只要头 1 字节。
+    let origin = crate::models::ARTIFACTS
+        .iter()
+        .find(|a| a.id == "vad")
+        .map(|a| a.url)
+        .unwrap_or("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx");
+    let url = apply_mirror(origin, true, p);
+    match ureq::get(&url)
+        .timeout(Duration::from_secs(10))
+        .set("Range", "bytes=0-0")
+        .call()
+    {
+        Ok(r) => Ok(format!("镜像可达(HTTP {})", r.status())),
+        Err(ureq::Error::Status(code, _)) if (200..400).contains(&code) => {
+            Ok(format!("镜像可达(HTTP {code})"))
+        }
+        Err(ureq::Error::Status(code, _)) => Err(format!("镜像返回 HTTP {code}")),
+        Err(ureq::Error::Transport(t)) => {
+            let s = t.to_string();
+            if s.contains("timed out") || s.contains("timeout") {
+                Err("镜像连接超时".to_string())
+            } else {
+                Err(format!("镜像不可达:{s}"))
+            }
+        }
+    }
+}
+
 pub fn retryable_download_error(message: &str) -> bool {
     message != "cancelled"
         && !message.contains("大小不符")
@@ -437,6 +472,11 @@ mod tests {
         assert!(!root.join("sv-dir").exists(), "取消不得半安装");
         assert!(tarball.exists(), "tarball 由调用方保留(供免重下复装)");
         assert!(!tmp_extract_dir(&root).exists(), "解压残留即时清理");
+    }
+
+    #[test]
+    fn probe_mirror_empty_prefix_errs() {
+        assert!(probe_mirror("   ").unwrap_err().contains("为空"));
     }
 
     /// 真机验证(网络依赖,与既有 7 个模型依赖测试同惯例 #[ignore]):走生产同款

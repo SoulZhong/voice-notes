@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 
 pub const CHUNK_CHARS: usize = 3000;
 pub const REQ_TIMEOUT_S: u64 = 60;
+/// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
+pub const PROBE_TIMEOUT_S: u64 = 15;
 
 const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。";
 
@@ -38,6 +40,57 @@ pub(crate) fn chunk_indices(ps: &[RefinedParagraph]) -> Vec<Vec<usize>> {
         out.push(cur);
     }
     out
+}
+
+/// HTTP 状态码 → 归类原因(供「测试连接」按钮显示具体原因)。纯函数,可单测。
+pub fn classify_http_status(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "认证失败(API Key 无效或无权限)",
+        404 => "模型不存在或接口地址错误",
+        429 => "触发限流",
+        s if s >= 500 => "服务端错误",
+        _ => "返回异常",
+    }
+}
+
+/// 「测试连接」:发一条最小 chat/completions,验证端点可达 + 鉴权通过 + 模型可用。
+/// 成功返回简短摘要;失败返回归类原因。不落 AI 日志(测试噪音不入库)。
+pub fn probe(cfg: &LlmConfig) -> Result<String, String> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let body = json!({
+        "model": cfg.model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "回复 OK" }],
+    })
+    .to_string();
+    let resp = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_S))
+        .set("authorization", &format!("Bearer {}", cfg.api_key))
+        .set("content-type", "application/json")
+        .send_string(&body);
+    match resp {
+        Ok(r) => {
+            let txt = r.into_string().map_err(|e| format!("读取响应失败: {e}"))?;
+            let v: Value = serde_json::from_str(&txt)
+                .map_err(|_| "返回非 JSON,可能不是 OpenAI 兼容接口".to_string())?;
+            if v["choices"][0]["message"]["content"].is_string() {
+                Ok(format!("连接正常,模型 {} 可用", cfg.model))
+            } else {
+                Err("返回内容异常(缺 choices[0].message.content)".to_string())
+            }
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            Err(format!("{}(HTTP {code})", classify_http_status(code)))
+        }
+        Err(ureq::Error::Transport(t)) => {
+            let s = t.to_string();
+            if s.contains("timed out") || s.contains("timeout") {
+                Err("连接超时".to_string())
+            } else {
+                Err(format!("连不上端点:{s}"))
+            }
+        }
+    }
 }
 
 /// 分块调用失败的两种性质:
@@ -403,5 +456,20 @@ mod tests {
             let total: usize = c.iter().map(|&i| ps[i].text.chars().count()).sum();
             assert!(total <= CHUNK_CHARS || c.len() == 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::classify_http_status;
+
+    #[test]
+    fn classify_maps_status_to_reason() {
+        assert!(classify_http_status(401).contains("认证"));
+        assert!(classify_http_status(403).contains("认证"));
+        assert!(classify_http_status(404).contains("模型不存在"));
+        assert!(classify_http_status(429).contains("限流"));
+        assert!(classify_http_status(500).contains("服务端"));
+        assert_eq!(classify_http_status(418), "返回异常");
     }
 }

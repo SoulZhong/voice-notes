@@ -22,13 +22,17 @@
   let error = $state("");
 
   // 页签完全由路由派生(点击=导航,零独立状态):/speakers 域=会议搭子,/hooks 域=钩子,
-  // 其余(笔记/录制/设置)=录音记录。
+  // /ai 域=AI,/settings=设置,其余(笔记/录制)=录音记录。
   const tab = $derived(
     $page.url.pathname.startsWith("/speakers")
       ? "people"
       : $page.url.pathname.startsWith("/hooks")
         ? "hooks"
-        : "notes",
+        : $page.url.pathname.startsWith("/ai")
+          ? "ai"
+          : $page.url.pathname === "/settings"
+            ? "settings"
+            : "notes",
   );
 
   let people = $state<PersonSummary[]>([]);
@@ -259,6 +263,16 @@
       class:active={tab === "hooks"}
       onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
     >
+    <button
+      class="vtab vtab-upright"
+      class:active={tab === "ai"}
+      onclick={() => { if (!$page.url.pathname.startsWith("/ai")) goto("/ai"); }}>AI</button
+    >
+    <button
+      class="vtab"
+      class:active={tab === "settings"}
+      onclick={() => { if ($page.url.pathname !== "/settings") goto("/settings"); }}>设置</button
+    >
   </nav>
 
   <div class="panel">
@@ -277,25 +291,17 @@
       <div class="banner">{hooksError}</div>
     {/if}
     <ul class="list">
-      <!-- 固定行:新建钩子(常驻入口,与「概览与整理」同形态) -->
-      <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-      <li
-        class="item overview"
-        class:current={$page.url.pathname === "/hooks/new"}
-        onclick={(e) => {
-          if ((e.target as HTMLElement).closest("a")) return;
-          goto("/hooks/new");
-        }}
-      >
-        <svg class="overview-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
-          <path d="M8 3.5v9M3.5 8h9" />
-        </svg>
-        <div class="main-line">
-          <a class="title" href="/hooks/new">新建钩子</a>
-        </div>
+      <!-- 固定入口:新建钩子——虚线「添加」按钮,与下方钩子列表行明确区分 -->
+      <li class="new-hook-row">
+        <a class="new-hook" class:current={$page.url.pathname === "/hooks/new"} href="/hooks/new">
+          <svg class="new-hook-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+            <path d="M8 3.5v9M3.5 8h9" />
+          </svg>
+          新建钩子
+        </a>
       </li>
       {#if hookList.length === 0 && !hooksError}
-        <p class="hint">事件发生时自动执行命令或调用接口,先新建一条试试</p>
+        <p class="empty-hint">事件发生时自动执行命令或调用接口<br />先新建一条试试</p>
       {/if}
       {#each hookGroups as g (g.value)}
         <li class="group-label">{g.label}</li>
@@ -421,22 +427,6 @@
   </ul>
   {/if}
 
-  <!-- 设置沉底常驻(冒烟确认位置);声纹库已升级为页签,footer 只剩工具入口。 -->
-  <nav class="nav-footer">
-    <a class="nav-link" class:current={$page.url.pathname.startsWith("/ai")} href="/ai">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M8 1.8L9.6 6.4L14.2 8L9.6 9.6L8 14.2L6.4 9.6L1.8 8L6.4 6.4Z" />
-      </svg>
-      AI
-    </a>
-    <a class="nav-link" class:current={$page.url.pathname === "/settings"} href="/settings">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="8" cy="8" r="2.2" />
-        <path d="M8 2.2V4.4 M8 11.6V13.8 M2.2 8H4.4 M11.6 8H13.8 M3.9 3.9L5.5 5.5 M10.5 10.5L12.1 12.1 M3.9 12.1L5.5 10.5 M10.5 5.5L12.1 3.9" />
-      </svg>
-      设置
-    </a>
-  </nav>
   </div>
 </aside>
 
@@ -505,6 +495,11 @@
     border-radius: var(--radius-md) 0 0 var(--radius-md);
     cursor: pointer;
   }
+  /* 拉丁标签(AI):竖排会把字母放倒或上下堆叠,改横排让「AI」两字母同行并排 */
+  .vtab-upright {
+    writing-mode: horizontal-tb;
+    letter-spacing: 0.04em;
+  }
   .vtab:hover {
     background: var(--surface-soft);
     color: var(--ink-secondary);
@@ -571,35 +566,6 @@
     opacity: 0.6;
     cursor: default;
   }
-  .nav-link {
-    display: flex;
-    align-items: center;
-    gap: 0.45em;
-    box-sizing: border-box;
-    padding: 0.45em 0.6em;
-    border-radius: var(--radius-md);
-    color: var(--ink-secondary);
-    text-decoration: none;
-    font-size: 0.9em;
-    font-weight: 500;
-  }
-  .nav-icon {
-    width: 15px;
-    height: 15px;
-    color: var(--ink-faint);
-  }
-  .nav-link.current .nav-icon,
-  .nav-link:hover .nav-icon {
-    color: var(--ink-secondary);
-  }
-  .nav-link:hover {
-    background: var(--surface-soft);
-  }
-  .nav-link.current {
-    background: var(--surface-press);
-    color: var(--ink);
-    font-weight: 500;
-  }
   /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
      hover/选中与笔记行同语义 */
   .item.person {
@@ -608,6 +574,36 @@
     gap: 0.55em;
   }
   /* 概览与整理固定行:与人物行同形态,图标代色点;徽标=待办数(warning 色药丸) */
+  /* 新建钩子:本页的主操作入口——实心 accent 按钮,与上方录制药丸拉开间距、
+     并以蓝色区分红点录制;虚线/幽灵态表达太弱,看不出这是入口。 */
+  .new-hook-row { list-style: none; }
+  .new-hook {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45em;
+    margin-top: 0.9rem;
+    padding: 0.55em 1em;
+    border-radius: var(--radius-full);
+    background: var(--accent);
+    color: var(--on-accent);
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 600;
+    box-shadow: var(--shadow-btn);
+    transition: background 0.12s;
+  }
+  .new-hook-icon { flex: none; }
+  .new-hook:hover { background: var(--accent-pressed); }
+  .new-hook.current { background: var(--accent-pressed); }
+  .empty-hint {
+    color: var(--ink-faint);
+    font-size: 0.82em;
+    line-height: 1.5;
+    text-align: center;
+    padding: 0.9rem 0.5rem 0;
+    margin: 0;
+  }
   .item.overview {
     display: flex;
     align-items: center;
@@ -688,21 +684,6 @@
     flex: 1;
     min-height: 0; /* flex 子项默认 min-height:auto 会撑破容器,收掉才滚得起来 */
     overflow-y: auto;
-  }
-  /* 底部工具区:单行两列工具条(Raycast 式 status bar)。竖排两行显松散零碎,
-     与顶部紧凑药丸不成体系;并排居中让两个次级入口成组且只占一行高。 */
-  .nav-footer {
-    margin-top: 0.5rem;
-    padding-top: 0.5rem;
-    border-top: 1px solid var(--hairline);
-    display: flex;
-    flex-direction: row;
-    gap: 2px;
-    flex-shrink: 0;
-  }
-  .nav-footer .nav-link {
-    flex: 1;
-    justify-content: center;
   }
   /* 整行可点(冒烟反馈):cursor 表意,操作走右键菜单,行内无常驻按钮 */
   .item {

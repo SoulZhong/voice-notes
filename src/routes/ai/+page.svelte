@@ -1,7 +1,7 @@
 <script lang="ts">
   // AI 页:智能精修大模型配置 + AI 助手接入(Task 2 自设置页迁入)。
   import { onMount } from "svelte";
-  import { getSettings, setSettings, type Settings } from "$lib/models";
+  import { getSettings, setSettings, testRefineLlm, testRefineAgent, type Settings } from "$lib/models";
   import {
     mcpAgentsStatus,
     mcpRegister,
@@ -62,8 +62,37 @@
   let refineAgent = $state("claude");
   let refineAgentBin = $state("");
   let refineAgentModel = $state("");
+  // 测试三态(null=没测过);改相关字段即清空,防旧「通过」给改过的配置背书。
+  let llmTest = $state<{ ok: boolean; msg: string } | null>(null);
+  let llmTesting = $state(false);
+  let agentTest = $state<{ ok: boolean; msg: string } | null>(null);
+  let agentTesting = $state(false);
+  const llmMissing = $derived(!refineBaseUrl.trim() || !refineModel.trim() || !refineKey.trim());
+  async function runLlmTest() {
+    llmTesting = true;
+    llmTest = null;
+    try {
+      llmTest = { ok: true, msg: await testRefineLlm(refineBaseUrl.trim(), refineModel.trim(), refineKey.trim()) };
+    } catch (e) {
+      llmTest = { ok: false, msg: String(e) };
+    } finally {
+      llmTesting = false;
+    }
+  }
+  async function runAgentTest() {
+    agentTesting = true;
+    agentTest = null;
+    try {
+      agentTest = { ok: true, msg: await testRefineAgent(refineAgent, refineAgentBin.trim(), refineAgentModel.trim()) };
+    } catch (e) {
+      agentTest = { ok: false, msg: String(e) };
+    } finally {
+      agentTesting = false;
+    }
+  }
   /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
   let agentProbe = $state<Record<string, string | null>>({});
+  const agentMissing = $derived(!refineAgentBin.trim() && !agentProbe[refineAgent]);
   const AGENT_OPTIONS = [
     { key: "claude", label: "Claude Code", modelHint: "如 haiku、sonnet" },
     { key: "codex", label: "Codex", modelHint: "如 gpt-5-codex" },
@@ -169,6 +198,7 @@
     saveRefine();
   }
   function saveRefine() {
+    llmTest = null;
     saveSetting((s) => {
       s.refine_base_url = refineBaseUrl.trim();
       s.refine_model = refineModel.trim();
@@ -176,6 +206,7 @@
     });
   }
   function saveRefineAgent() {
+    agentTest = null;
     saveSetting((s) => {
       s.refine_provider = refineProvider;
       s.refine_agent = refineAgent;
@@ -375,15 +406,41 @@
             <span class="row-label">模型</span>
             <span class="row-desc">留空使用 {selectedAgentOption.label} 的默认模型</span>
           </div>
-          <input class="row-input" placeholder={selectedAgentOption.modelHint} bind:value={refineAgentModel} onblur={saveRefineAgent} />
+          <input
+            class="row-input"
+            placeholder={selectedAgentOption.modelHint}
+            bind:value={refineAgentModel}
+            onblur={saveRefineAgent}
+            oninput={() => (agentTest = null)}
+          />
         </div>
         <div class="row">
           <div class="row-info">
             <span class="row-label">CLI 路径</span>
             <span class="row-desc">自动探测不到时,手动指定可执行文件</span>
           </div>
-          <input class="row-input wide" placeholder="自动探测" bind:value={refineAgentBin} onblur={saveRefineAgent} />
+          <input
+            class="row-input wide"
+            placeholder="自动探测"
+            bind:value={refineAgentBin}
+            onblur={saveRefineAgent}
+            oninput={() => (agentTest = null)}
+          />
         </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">测试运行</span>
+            <span class="row-desc">用该 CLI 跑一句极短提示,验证能启动并产出(约 1 分钟内)</span>
+          </div>
+          <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
+            {agentTesting ? "测试中…" : "测试"}
+          </button>
+        </div>
+        {#if agentTest}
+          <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
+            {agentTest.ok ? `测试成功(${agentTest.msg})` : `测试失败: ${agentTest.msg}`}
+          </p>
+        {/if}
         <p class="config-hint">精修失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
       {:else}
         <div class="row">
@@ -402,7 +459,13 @@
             <span class="row-label">接口地址</span>
             <span class="row-desc">OpenAI 兼容服务的 Base URL</span>
           </div>
-          <input class="row-input wide" placeholder="https://api.deepseek.com/v1" bind:value={refineBaseUrl} onblur={saveRefine} />
+          <input
+            class="row-input wide"
+            placeholder="https://api.deepseek.com/v1"
+            bind:value={refineBaseUrl}
+            onblur={saveRefine}
+            oninput={() => (llmTest = null)}
+          />
         </div>
         <div class="row">
           <div class="row-info">
@@ -414,6 +477,7 @@
             placeholder={activePreset?.modelPlaceholder ?? "deepseek-chat"}
             bind:value={refineModel}
             onblur={saveRefine}
+            oninput={() => (llmTest = null)}
           />
         </div>
         <div class="row">
@@ -421,8 +485,29 @@
             <span class="row-label">API Key</span>
             <span class="row-desc">只保存在本机,不随笔记上传</span>
           </div>
-          <input class="row-input wide" type="password" placeholder="sk-..." bind:value={refineKey} onblur={saveRefine} />
+          <input
+            class="row-input wide"
+            type="password"
+            placeholder="sk-..."
+            bind:value={refineKey}
+            onblur={saveRefine}
+            oninput={() => (llmTest = null)}
+          />
         </div>
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">测试连接</span>
+            <span class="row-desc">发一条最小请求,验证接口地址 / 密钥 / 模型可用</span>
+          </div>
+          <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
+            {llmTesting ? "测试中…" : "测试"}
+          </button>
+        </div>
+        {#if llmTest}
+          <p class="test-result" class:ok={llmTest.ok} class:err={!llmTest.ok}>
+            {llmTest.ok ? `测试成功(${llmTest.msg})` : `测试失败: ${llmTest.msg}`}
+          </p>
+        {/if}
         {#if !refineBaseUrl || !refineModel || !refineKey}
           <p class="config-hint">三项配齐后精修生效。</p>
         {/if}
@@ -760,6 +845,9 @@
     color: var(--ink-faint);
     margin: 0;
   }
+  .test-result { font-size: 0.85rem; margin: 0.4rem 0 0.2rem; }
+  .test-result.ok { color: var(--success, var(--ink-secondary)); }
+  .test-result.err { color: var(--danger-ink); }
   /* 分段单选(与设置页 .seg 同一控件语言);margin-left:auto 保证窄窗换行后仍右对齐 */
   .seg {
     display: flex;
