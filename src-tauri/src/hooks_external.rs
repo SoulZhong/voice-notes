@@ -223,7 +223,7 @@ pub fn note_envs(c: &NoteContent) -> Vec<(String, String)> {
     v
 }
 
-/// 笔记内容构建核心(可测):notes_dir 定笔记,data_root 有值时 修订稿做声纹库
+/// 笔记内容构建核心(可测):notes_dir 定笔记,data_root 有值时修订稿做声纹库
 /// 现名 join(与 export_note 同款只读语义)。任何读盘失败回 None——内容是增值
 /// 信息,由调用方决定跳过附带照常执行。
 fn note_content_from_dirs(
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(c.ended_at, "2026-07-14T11:00:00+08:00");
         assert_eq!(c.duration_secs, 5, "时长=段落最大 end_ms(5000)/1000");
         assert_eq!(c.speakers, vec!["张三".to_string(), "说话人 2".to_string()]);
-        assert!(c.text.contains("占位甲"), "无 修订稿回落原始稿渲染");
+        assert!(c.text.contains("占位甲"), "无修订稿回落原始稿渲染");
         assert!(!c.truncated);
     }
 

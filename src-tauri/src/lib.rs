@@ -1390,7 +1390,7 @@ fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
 
 /// 读取已落盘的 Aing 结果（refined.json）；从未 Aing 过 / Aing 在前置阶段就失败到没能落盘
 /// 时返回 None，前端据此回落展示原始 segments。
-/// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史 修订稿
+/// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史修订稿
 /// 跟着变），person_id 归一到 merge 后的 winner。只影响返回值，不落盘。
 #[tauri::command]
 fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
@@ -1408,7 +1408,7 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
 }
 
 /// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
-/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇 修订稿。Aing 中拒绝（管线
+/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇修订稿。Aing 中拒绝（管线
 /// 随后整写 refined.json 会吞掉本次编辑），录制中拒绝（speakers.json 由 writer 独占）。
 #[tauri::command]
 fn rename_refined_speaker(
@@ -1431,8 +1431,8 @@ fn rename_refined_speaker(
     let root = notes_dir(&app).map_err(|e| e.to_string())?;
     let person_id = store::rename_refined_speaker(&root.join(&note_id), &speaker_id, name)
         .map_err(|e| e.to_string())?;
-    // 降级 修订稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
-    // 原始逐字稿视图不与 修订稿打架。R* 标签不存在于 speakers.json,不碰。
+    // 降级修订稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
+    // 原始逐字稿视图不与修订稿打架。R* 标签不存在于 speakers.json,不碰。
     if speaker_id.starts_with('S') {
         if let Err(e) = store::NoteStore::new(root).rename_speaker(&note_id, &speaker_id, name) {
             eprintln!("修订稿改名已生效,但同步 speakers.json 失败({speaker_id}): {e}");
@@ -1507,7 +1507,7 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
         .collect())
 }
 
-/// 把 修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
+/// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
 /// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
 #[tauri::command]
 fn assign_refined_person(
@@ -1720,7 +1720,7 @@ fn set_segment_speaker(
         .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
 }
 
-/// 导出笔记。prefer_refined=真且 修订稿在盘时导 修订稿(所见即所得:用户看着哪个视图
+/// 导出笔记。prefer_refined=真且修订稿在盘时导修订稿(所见即所得:用户看着哪个视图
 /// 点导出就得到哪个),否则导原始逐字稿;修订稿导出前与 get_refined 同款只读 join,
 /// 库中现名(会议搭子改名)一并带出。
 #[tauri::command]

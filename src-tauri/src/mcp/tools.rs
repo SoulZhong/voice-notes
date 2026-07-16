@@ -96,7 +96,7 @@ pub fn search_notes(roots: &DataRoots, query: &str, limit: usize) -> serde_json:
 }
 
 /// 笔记全文。format: segments(结构化) / markdown / text;prefer_refined 且
-/// refined.json 存在时返回 修订稿(结构化给 paragraphs,md/txt 现场渲染 Aing 段)。
+/// refined.json 存在时返回修订稿(结构化给 paragraphs,md/txt 现场渲染 Aing 段)。
 pub fn get_note(
     roots: &DataRoots,
     id: &str,
@@ -167,7 +167,7 @@ pub fn apply_refined_texts(
         let dir = notes_dir(roots).join(note_id);
         anyhow::ensure!(
             dir.join("refined.json").exists(),
-            "该笔记还没有 修订稿:请先在 App 里完成一次 Aing(或等停止录制后自动 Aing),再写回修订"
+            "该笔记还没有修订稿:请先在 App 里完成一次 Aing(或等停止录制后自动 Aing),再写回修订"
         );
         let updated = store::apply_refined_texts(&dir, updates, model)?;
         let total = store::load_refined(&dir).map(|d| d.paragraphs.len()).unwrap_or(0);
@@ -271,7 +271,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture_note(tmp.path(), "20260101-100000", "一月会", "2026-01-01T10:00:00+08:00", &[("S1", "a", 0)]);
         fixture_note(tmp.path(), "20260301-100000", "三月会", "2026-03-01T10:00:00+08:00", &[("S1", "b", 0)]);
-        // 三月会补一份 修订稿:断言 has_refined 能区分有/无。
+        // 三月会补一份修订稿:断言 has_refined 能区分有/无。
         store::write_refined_atomic(
             &tmp.path().join("notes/20260301-100000"),
             &store::RefinedDoc {
@@ -296,10 +296,10 @@ mod tests {
         assert_eq!(v["notes"].as_array().unwrap().len(), 2);
         assert_eq!(v["notes"][0]["title"], "三月会", "倒序:新的在前");
         assert_eq!(v["notes"][0]["speaker_count"], 1, "fixture 只登记了 S1/张三 一人");
-        assert_eq!(v["notes"][0]["has_refined"], true, "三月会已落 修订稿");
+        assert_eq!(v["notes"][0]["has_refined"], true, "三月会已落修订稿");
         assert_eq!(v["notes"][1]["title"], "一月会");
         assert_eq!(v["notes"][1]["speaker_count"], 1);
-        assert_eq!(v["notes"][1]["has_refined"], false, "一月会无 修订稿");
+        assert_eq!(v["notes"][1]["has_refined"], false, "一月会无修订稿");
         let v = list_notes(&roots(tmp.path()), 10, 0, Some("2026-02-01"), None);
         assert_eq!(v["notes"].as_array().unwrap().len(), 1);
         assert_eq!(v["notes"][0]["id"], "20260301-100000");
@@ -334,12 +334,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fixture_note(tmp.path(), "20260101-100000", "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "原始句", 0)]);
         let v = get_note(&roots(tmp.path()), "20260101-100000", "segments", true).unwrap();
-        assert_eq!(v["refined"], false, "无 修订稿回落原始");
+        assert_eq!(v["refined"], false, "无修订稿回落原始");
         assert_eq!(v["segments"][0]["text"], "原始句");
         assert_eq!(v["speakers"]["S1"]["name"], "张三");
         let md = get_note(&roots(tmp.path()), "20260101-100000", "markdown", false).unwrap();
         assert!(md["content"].as_str().unwrap().contains("原始句"));
-        // 落一份 修订稿:prefer_refined=true 时取 Aing
+        // 落一份修订稿:prefer_refined=true 时取 Aing
         let dir = tmp.path().join("notes/20260101-100000");
         store::write_refined_atomic(
             &dir,
@@ -385,12 +385,12 @@ mod tests {
     fn apply_refined_texts_validates_note_then_writes() {
         let tmp = tempfile::tempdir().unwrap();
         fixture_note(tmp.path(), "20260101-100000", "评审会", "2026-01-01T10:00:00+08:00", &[("S1", "我们肯计要做", 0)]);
-        // 无 修订稿:拒绝并给出可操作的提示
+        // 无修订稿:拒绝并给出可操作的提示
         let err = apply_refined_texts(&roots(tmp.path()), "20260101-100000", &[(0, "x".into())], "m")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("修订稿"), "缺 修订稿的报错要说明原因: {err}");
-        // 落一份 修订稿后写回成功
+        assert!(err.contains("修订稿"), "缺修订稿的报错要说明原因: {err}");
+        // 落一份修订稿后写回成功
         let dir = tmp.path().join("notes/20260101-100000");
         store::write_refined_atomic(
             &dir,

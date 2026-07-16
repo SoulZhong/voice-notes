@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 impl NoteStore {
     /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
-    /// refined=Some 时导 修订稿(所见即所得:用户看着 修订稿点导出,不能给他原始逐字稿);
+    /// refined=Some 时导修订稿(所见即所得:用户看着修订稿点导出,不能给他原始逐字稿);
     /// None 走原始 segments 渲染。两者写同一文件名,后导覆盖先导。
     pub fn export(&self, id: &str, format: &str, refined: Option<&RefinedDoc>) -> anyhow::Result<PathBuf> {
         let content = match refined {

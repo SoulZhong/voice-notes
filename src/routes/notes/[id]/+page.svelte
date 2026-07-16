@@ -194,7 +194,7 @@
       });
   });
 
-  // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的 修订稿/进度）。
+  // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的修订稿/进度）。
   // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
   // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
   // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
@@ -454,7 +454,7 @@
   async function doExport(format: "md") {
     exportMsg = "";
     try {
-      // 所见即所得:看着 修订稿点导出就导 修订稿,原始稿视图导原始逐字稿。
+      // 所见即所得:看着修订稿点导出就导修订稿,原始稿视图导原始逐字稿。
       const path = await exportNote(id, format, effectiveView === "refined");
       exportMsg = `已导出：${path}`;
       await revealItemInDir(path);
@@ -593,7 +593,7 @@
         />
       {:else}
         <!-- 原始稿说话人条:改名仍是笔记内本地名;选人关联(写 speakers.json person_id)
-             与 修订稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
+             与修订稿同一面板,录制中(canEdit=false)不给选人区(后端 writer 独占)。 -->
         <SpeakerChips
           speakers={note.speakers}
           noteId={id}
@@ -615,7 +615,7 @@
           class="link"
           class:active={effectiveView === "refined"}
           disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : "尚无 修订稿"}
+          title={refinedAvailable ? "" : "尚无修订稿"}
           onclick={() => (viewMode = "refined")}
         >
           修订稿

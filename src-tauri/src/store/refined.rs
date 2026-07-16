@@ -11,7 +11,7 @@ pub struct RefinedParagraph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// 关联的全局声纹库人物 id(P<n>):重聚类种子命中时写入,或用户在说话人条
-    /// 手动关联。有它才能把 修订稿改名同步进声纹库(会议搭子)。
+    /// 手动关联。有它才能把修订稿改名同步进声纹库(会议搭子)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_id: Option<String>,
     pub start_ms: u64,
@@ -57,7 +57,7 @@ pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
 static REFINED_EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 锁内 read-modify-write 骨架:加载 → 就地修改 → 原子落盘。缺失/损坏 → Err
-/// (编辑必须以「盘上有可编辑的 修订稿」为前提,不能凭空造一份)。
+/// (编辑必须以「盘上有可编辑的修订稿」为前提,不能凭空造一份)。
 fn update_refined(
     note_dir: &Path,
     f: impl FnOnce(&mut RefinedDoc) -> anyhow::Result<()>,
@@ -92,7 +92,7 @@ pub fn rename_refined_speaker(
     Ok(person_id)
 }
 
-/// 把 修订稿说话人关联到声纹库人物:该 speaker 的全部段落写入 person_id,
+/// 把修订稿说话人关联到声纹库人物:该 speaker 的全部段落写入 person_id,
 /// name 采用库中现名(空名传 None,展示端按「说话人 N」兜底)。
 pub fn assign_refined_person(
     note_dir: &Path,
@@ -141,7 +141,7 @@ pub fn apply_refined_texts(
     Ok(updates.len())
 }
 
-/// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史 修订稿
+/// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史修订稿
 /// 跟着变),person_id 经 redirects 归一到 winner。只改返回值,不落盘——与
 /// notes.rs join_person_names 同一哲学。库中无名/人已删除时保留段落原 name。
 pub fn join_library_names(doc: &mut RefinedDoc, vp: &super::voiceprints::Voiceprints) {
@@ -250,7 +250,7 @@ mod tests {
         assert!(rename_refined_speaker(dir.path(), "R9", "张三").is_err());
         let doc = load_refined(dir.path()).unwrap();
         assert!(doc.paragraphs[0].name.is_none(), "未命中不落盘任何修改");
-        // 无 修订稿时同样报错,不凭空造文件。
+        // 无修订稿时同样报错,不凭空造文件。
         let empty = tempfile::tempdir().unwrap();
         assert!(rename_refined_speaker(empty.path(), "R1", "张三").is_err());
     }
@@ -307,7 +307,7 @@ mod tests {
         let doc = load_refined(dir.path()).unwrap();
         assert_eq!(doc.paragraphs[0].text, "内容。", "整体拒绝,未落盘任何修改");
         assert_eq!(doc.stages.llm, "off");
-        // 无 修订稿时报错,不凭空造文件
+        // 无修订稿时报错,不凭空造文件
         let empty = tempfile::tempdir().unwrap();
         assert!(apply_refined_texts(empty.path(), &[(0, "x".into())], "m").is_err());
     }

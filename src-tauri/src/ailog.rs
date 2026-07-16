@@ -25,7 +25,7 @@ pub const AILOG_SCHEMA_VERSION: u32 = 1;
 pub const MAX_FIELD_CHARS: usize = 200_000;
 
 // 调用类别(kind 取值):refine_chunk=HTTP Aing 分块;title=标题生成(HTTP 或 Agent);
-// agent_refine=Agent CLI Aing 一整轮;mcp_apply=Agent 经 MCP 写回 修订稿。
+// agent_refine=Agent CLI Aing 一整轮;mcp_apply=Agent 经 MCP 写回修订稿。
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiLogEntry {

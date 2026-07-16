@@ -76,7 +76,7 @@ const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle> .
   list    [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
   search  <关键词> [--limit N] [--json]\n\
   get     <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
-  get     … [--raw]  # 忽略 修订稿,取原始逐字稿\n\
+  get     … [--raw]  # 忽略修订稿,取原始逐字稿\n\
   retitle [--dry-run] [--agent claude|codex|gemini|cursor] [--model M]\n\
           # AI 为仍是默认标题的会议生成主题标题(手动命名的绝不动);\n\
           # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI";
@@ -342,7 +342,7 @@ fn run_retitle(args: &[String]) -> Result<i32, String> {
     Ok(if failed == 0 { 0 } else { 1 })
 }
 
-/// 标题素材:修订稿段落优先(错字已修、噪声已滤),没有 修订稿用原始 segments
+/// 标题素材:修订稿段落优先(错字已修、噪声已滤),没有修订稿用原始 segments
 /// 拼最小段落结构。gen_title 自己截前 1500 字。
 fn note_paragraphs_for_title(roots: &tools::DataRoots, id: &str) -> Vec<crate::store::RefinedParagraph> {
     let dir = roots.data_root.join("notes").join(id);
@@ -590,7 +590,7 @@ mod tests {
         // --json 是 --format json 的别名(渲染层已按 inner=="segments" 走 JSON 分支;
         // 这里只能断言退出码,行为一致性由 run_get 的 format 归一化逻辑保证)。
         assert_eq!(notes_cli(&["get".into(), "20260101-100000".into(), "--json".into()]), 0, "--json 别名");
-        // --raw:忽略 修订稿取原始逐字稿,fixture 无 修订稿故仅验证不因新 flag 报错
+        // --raw:忽略修订稿取原始逐字稿,fixture 无修订稿故仅验证不因新 flag 报错
         assert_eq!(notes_cli(&["get".into(), "20260101-100000".into(), "--raw".into()]), 0, "--raw 取原始稿");
         // 错误面
         assert_eq!(notes_cli(&[]), 2, "裸命令用法错");

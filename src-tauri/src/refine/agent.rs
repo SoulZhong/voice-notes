@@ -1,5 +1,5 @@
 //! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini /
-//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读 修订稿并调
+//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读修订稿并调
 //! `apply_refined_texts` 写回。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按
 //! settings.refine_provider 二选一。
 //!
