@@ -151,10 +151,10 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
 /// gemini/cursor 是裸名),提示词里只用裸名,由各家自行映射。
 fn refine_prompt(note_id: &str) -> String {
     format!(
-        "你是会议逐字稿 Aing 助手。任务:Aing voice-notes 笔记 {note_id} 的 Aing 稿文本。\n\
+        "你是会议逐字稿精修助手。任务:精修 voice-notes 笔记 {note_id} 的精修稿文本。\n\
          步骤:\n\
          1. 调用 MCP 工具 get_note,参数 {{\"note_id\":\"{note_id}\",\"format\":\"segments\"}},\
-         取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有 Aing 稿,直接结束并说明)。\n\
+         取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。\n\
          2. 逐段检查,只做四类修订,除此之外禁止任何改动(不改句式和语义,不合并/拆分段落):\n\
          a) 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文;\
          b) 实体归一:同一人名/产品名/术语全文统一为最常见写法;\
