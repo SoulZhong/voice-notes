@@ -249,6 +249,13 @@ fn refine_agent_ready(s: &settings::Settings) -> bool {
 /// dir/note 解析（notes_dir 不可用、NoteStore::load 失败）或任意一步 panic；这些情形
 /// 由 catch_unwind 之后的兜底分支统一补一次 enqueue（用 `enqueued` 标记避免语义混淆，
 /// 但即使漏标也不会重复造成问题，因为 enqueue 本身幂等）。
+/// 全局 Aing 并发闸(限 1 篇串行)。每篇 Aing 都会起一整套 onnxruntime 线程池(重聚类
+/// 嵌入)+ 本地重活;多篇并行各起一套 ORT 池互相抢核——在多核机上吵、低配机上直接卡死
+/// (点 N 篇 = N 套完整管线)。串行既把 CPU/RAM 钉死上限,又通常更快(ORT 本身已跨核并行,
+/// 叠第二套只增争用)。内核守卫只拦「同 note_id 重复 Aing」,跨笔记无闸,故在此加全局串行。
+/// 需放宽到 N 并行,把此 Mutex 换成计数信号量即可。
+static AING_GATE: Mutex<()> = Mutex::new(());
+
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
     let transcode = state.transcode.clone();
@@ -282,6 +289,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             });
         };
         let enqueued = std::cell::Cell::new(false);
+        // 全局串行闸:在起 ORT 线程池的重活之前排队,同一时刻只放一篇过。守卫在 catch_unwind
+        // 之前取、随线程体自然释放——被捕获的 panic 不经此守卫展开,不会毒化(仍加 poison 兜底)。
+        // 多篇同时点会各自先发一条 "all/running"(显示「Aing 中…」),但实际串行等锁逐篇跑。
+        let _aing_gate = AING_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
