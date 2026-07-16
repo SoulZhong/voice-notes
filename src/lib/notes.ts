@@ -61,6 +61,18 @@ export type TrackInfo = {
   waveform?: number[] | null;
 };
 
+export interface Mention {
+  entity: string;
+  start: number;
+  end: number;
+}
+export interface Entity {
+  id: string;
+  kind: string;
+  name: string;
+  aliases?: string[];
+}
+
 export interface RefinedParagraph {
   speaker: string;
   name?: string;
@@ -70,12 +82,14 @@ export interface RefinedParagraph {
   end_ms: number;
   text: string;
   source_seqs: number[];
+  mentions?: Mention[];
 }
 
 export interface RefineStages {
   filter: string;
   recluster: string;
   llm: string;
+  entities?: string;
 }
 
 export interface RefinedDoc {
@@ -85,7 +99,39 @@ export interface RefinedDoc {
   stages: RefineStages;
   discarded_seqs: number[];
   paragraphs: RefinedParagraph[];
+  entities?: Entity[];
 }
+
+/** 按 char 下标把段落文本切成 { 普通片段 | 实体片段 } 序列(实体片段 entityId 非空)。
+ *  用 Array.from 按 code point 切分(BMP 中文一致、astral 安全);mentions 排序 + 跳过重叠/越界。 */
+export function splitMentions(
+  text: string,
+  mentions?: Mention[],
+): { text: string; entityId: string | null }[] {
+  const chars = Array.from(text);
+  const valid = (mentions ?? [])
+    .filter((m) => Number.isInteger(m.start) && Number.isInteger(m.end) && m.start >= 0 && m.end <= chars.length && m.start < m.end)
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+  const out: { text: string; entityId: string | null }[] = [];
+  let cur = 0;
+  for (const m of valid) {
+    if (m.start < cur) continue; // 与已产出区间重叠 → 跳过
+    if (m.start > cur) out.push({ text: chars.slice(cur, m.start).join(""), entityId: null });
+    out.push({ text: chars.slice(m.start, m.end).join(""), entityId: m.entity });
+    cur = m.end;
+  }
+  if (cur < chars.length) out.push({ text: chars.slice(cur).join(""), entityId: null });
+  if (out.length === 0) out.push({ text, entityId: null });
+  return out;
+}
+
+export interface RelatedNote {
+  id: string;
+  title: string;
+  started_at: string;
+  shared_entities: number;
+}
+export const noteRelated = (id: string) => invoke<RelatedNote[]>("note_related", { id });
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */

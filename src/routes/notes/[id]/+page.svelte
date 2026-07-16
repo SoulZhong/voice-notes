@@ -30,6 +30,9 @@
     type SegmentRecord,
     type TrackInfo,
     type RefinedDoc,
+    splitMentions,
+    noteRelated,
+    type RelatedNote,
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
@@ -53,6 +56,8 @@
   let viewMode = $state<"refined" | "raw">("refined");
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
+  // 相关笔记(经知识图谱共享实体):增值层,取失败静默按空。
+  let related = $state<RelatedNote[]>([]);
 
   const id = $derived($page.params.id as string);
 
@@ -192,6 +197,25 @@
       .catch(() => {
         if (forId === id) tracks = [];
       });
+  });
+
+  // 相关笔记:增值层,取失败静默按空。id 切换即重取。
+  $effect(() => {
+    const forId = id;
+    noteRelated(forId)
+      .then((r) => {
+        if (forId === id) related = r;
+      })
+      .catch(() => {
+        if (forId === id) related = [];
+      });
+  });
+
+  /** 段落内实体片段 → 实体名(tooltip 用):从本篇 refined.entities 按局部 id 查。 */
+  const entityName = $derived.by(() => {
+    const m: Record<string, string> = {};
+    for (const e of refined?.entities ?? []) m[e.id] = e.name;
+    return (eid: string) => m[eid] ?? "";
   });
 
   // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的修订稿/进度）。
@@ -692,7 +716,7 @@
             {:else}
               <span class="ts">{formatTs(p.start_ms)}</span>
             {/if}
-            <span class="para-text">{p.text}</span>
+            <span class="para-text">{#each splitMentions(p.text, p.mentions) as seg}{#if seg.entityId}<span class="entity-mention" title={entityName(seg.entityId)}>{seg.text}</span>{:else}{seg.text}{/if}{/each}</span>
           </div>
         {/each}
         {#if refined.paragraphs.length === 0}
@@ -775,6 +799,20 @@
         {/if}
       {/if}
     </div>
+
+    {#if related.length > 0}
+      <section class="card col related">
+        <div class="card-title">相关笔记</div>
+        <ul class="appear-list">
+          {#each related as n (n.id)}
+            <li class="appear-row">
+              <a href="/notes/{n.id}">{n.title}</a>
+              <span class="appear-meta">共享 {n.shared_entities} 个实体</span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
     <!-- 跟随被用户上滑打断时的返回入口(与录制页同款):sticky 钉滚动视口底部 -->
     <div class="jump-anchor">
@@ -985,6 +1023,18 @@
   }
   .para-text {
     white-space: pre-wrap;
+  }
+  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字 */
+  .entity-mention {
+    border-radius: var(--radius-sm);
+    cursor: default;
+    transition:
+      background 120ms ease,
+      color 120ms ease;
+  }
+  .entity-mention:hover {
+    background: var(--accent-tint);
+    color: var(--accent);
   }
   /* 当前播放段(仅播放中):放大 + 主墨色 + 轻投影,歌词感;负边距抵掉内缩,行左缘对齐不跳 */
   .transcript.live .seg.playing {
@@ -1340,5 +1390,48 @@
   .loading {
     color: var(--ink-faint);
     padding: 1rem 0;
+  }
+  /* 相关笔记卡(照会议搭子详情页 .card.col/.appear-list) */
+  .related.card.col {
+    display: block;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    padding: 14px 16px;
+    margin: 0.75rem 0 0;
+  }
+  .related .card-title {
+    font-size: 0.85rem;
+    font-weight: 500;
+    margin-bottom: 0.45rem;
+  }
+  .related .appear-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 14rem;
+    overflow-y: auto;
+  }
+  .related .appear-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.28rem 0;
+  }
+  .related .appear-row a {
+    color: var(--ink);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .related .appear-row a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .related .appear-meta {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+    flex: none;
   }
 </style>
