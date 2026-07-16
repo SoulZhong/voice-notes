@@ -200,20 +200,35 @@ pub fn run_llm(
     llm_model: &str,
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
-    // 实体在本任务(Aing P1·Plan3 T1)先只做抽取,规范化/入库是后续任务,这里暂丢弃。
-    let (outcome, _entities) = llm::polish(cfg, &mut doc.paragraphs, log);
-    let state = match outcome {
+    let (text_outcome, raw_entities) = llm::polish(cfg, &mut doc.paragraphs, log);
+    let state = match text_outcome {
         llm::LlmOutcome::Done => "done",
         llm::LlmOutcome::Partial(_) => "partial",
         llm::LlmOutcome::Failed => "failed",
     };
     doc.stages.llm = state.into();
     doc.llm_model = Some(llm_model.to_string());
+    // 实体维度:与文本同一批调用产出,stages.entities 跟随 state;实体环节绝不回退修订文本。
+    fill_entities(doc, raw_entities, state);
     if let Err(e) = write_refined_atomic(note_dir, doc) {
         doc.stages.llm = "failed".into();
+        doc.stages.entities = "failed".into();
         return Err(e);
     }
     Ok(())
+}
+
+/// 把原始实体落进 doc:解析规范实体 + 逐段算 mention,`stages.entities` 置为 text_state
+/// (与文本 outcome 同源——同一批调用产出)。抽成纯函数便于无网络单测,也隔离实体环节:
+/// 无论实体多寡,都不触碰 doc.paragraphs[].text(修订文本已由 polish 定稿)。
+pub(crate) fn fill_entities(doc: &mut RefinedDoc, raw: Vec<llm::RawEntity>, text_state: &str) {
+    doc.stages.entities = text_state.into();
+    let entities = resolve_note_entities(raw);
+    let mentions = compute_mentions(&doc.paragraphs, &entities);
+    for (p, m) in doc.paragraphs.iter_mut().zip(mentions) {
+        p.mentions = m;
+    }
+    doc.entities = entities;
 }
 
 /// 大模型原始实体 → 本篇规范实体:按规范名(trim + 不分大小写)去重,合并别名,
@@ -322,6 +337,18 @@ mod tests {
             text: text.into(),
             source_seqs: vec![0],
             mentions: vec![],
+        }
+    }
+
+    fn doc_with(texts: &[&str]) -> RefinedDoc {
+        RefinedDoc {
+            schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
 
@@ -580,6 +607,48 @@ mod tests {
         let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None);
         assert!(err.is_err(), "目录不存在,写盘必须失败");
         assert_eq!(doc.stages.llm, "failed", "写盘失败必须把内存态降级为 failed");
+    }
+
+    #[test]
+    fn fill_entities_populates_entities_and_mentions() {
+        let mut doc = doc_with(&["灯塔计划下周启动"]);
+        let raw = vec![llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec![] }];
+        fill_entities(&mut doc, raw, "done");
+        assert_eq!(doc.stages.entities, "done");
+        assert_eq!(doc.entities.len(), 1);
+        assert_eq!(doc.entities[0].id, "ent_1");
+        assert_eq!(doc.paragraphs[0].mentions, vec![store::Mention { entity: "ent_1".into(), start: 0, end: 4 }]);
+    }
+
+    #[test]
+    fn fill_entities_empty_raw_sets_stage_but_no_entities() {
+        let mut doc = doc_with(&["你好"]);
+        fill_entities(&mut doc, vec![], "done");
+        assert_eq!(doc.stages.entities, "done", "成功抽取但无实体也是 done");
+        assert!(doc.entities.is_empty());
+        assert!(doc.paragraphs[0].mentions.is_empty());
+    }
+
+    #[test]
+    fn fill_entities_follows_text_state_on_failure() {
+        let mut doc = doc_with(&["原文"]);
+        fill_entities(&mut doc, vec![], "failed"); // 文本失败 → 实体也 failed、空
+        assert_eq!(doc.stages.entities, "failed");
+        assert!(doc.entities.is_empty());
+    }
+
+    #[test]
+    fn run_llm_wires_entities_stage_no_network() {
+        // 空段落 → polish 早退 Done 不触网(沿用现有 run_llm 测试同款零网络路径),
+        // 验证 run_llm 确实调了 fill_entities:stages.entities 被置位(done)、entities 空。
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = doc_with(&[]);
+        let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        run_llm(dir.path(), &mut doc, &cfg, "m", None).unwrap();
+        assert_eq!(doc.stages.llm, "done");
+        assert_eq!(doc.stages.entities, "done", "run_llm 应经 fill_entities 置位 stages.entities");
+        let reloaded = crate::store::load_refined(dir.path()).unwrap();
+        assert_eq!(reloaded.stages.entities, "done", "落盘也带上 entities 阶段");
     }
 
     fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
