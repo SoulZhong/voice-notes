@@ -25,7 +25,7 @@ pub struct Assignment {
     pub seq: u64,
     pub speaker: String,
     pub name: Option<String>,
-    /// 命中的声纹库人物 id(P<n>):有它精修稿才能把改名同步进声纹库。
+    /// 命中的声纹库人物 id(P<n>):有它 Aing 稿才能把改名同步进声纹库。
     pub person: Option<String>,
 }
 
@@ -140,7 +140,7 @@ pub fn recluster(inputs: &[SegInput], embs: &[Option<Vec<f32>>], seeds: &[SeedCl
     cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
 
     // 5. 种子命名/认人:簇质心对每个 seed 算余弦,最高且 ≥ SEED_ASSIGN_THRESHOLD 者
-    //    取其 (person, name)。未命名的库人物也参与——person id 是精修稿改名同步进
+    //    取其 (person, name)。未命名的库人物也参与——person id 是 Aing 稿改名同步进
     //    声纹库的锚点,不能因为还没名字就丢掉身份。
     let matches: Vec<Option<(String, String)>> = cls
         .iter()

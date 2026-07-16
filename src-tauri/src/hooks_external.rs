@@ -3,7 +3,7 @@
 //! 配置存 app_data_dir/hooks.json(原子写,模式同 settings.rs;独立文件,
 //! 不与设置页抢 settings.json 的读-改-写窗口)。后端每次事件读快照,无内存
 //! 状态同步。执行契约与 lifecycle::hooks::HookBus 一致:任何失败只记日志,
-//! 绝不影响录制/精修主流程。
+//! 绝不影响录制/Aing 主流程。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -31,7 +31,7 @@ pub struct HookCfg {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 附带笔记内容:开启时执行注入笔记详情与全文(精修稿优先)。默认关,
+    /// 附带笔记内容:开启时执行注入笔记详情与全文(Aing 稿优先)。默认关,
     /// serde default 兼容老 hooks.json。
     #[serde(default)]
     pub include_note: bool,
@@ -123,7 +123,7 @@ pub struct HookFire {
 }
 
 /// 提交前后完整内核状态 → 业务事件列表(纯函数)。一次提交可能产出多个事件
-/// (停录+自动精修同帧);顺序固定 session 先、refine 后,断言与日志都稳定。
+/// (停录+自动 Aing 同帧);顺序固定 session 先、refine 后,断言与日志都稳定。
 pub fn hook_events(before: &LifecycleState, after: &LifecycleState) -> Vec<HookFire> {
     let mut out = Vec::new();
     match (&before.session, &after.session) {
@@ -193,7 +193,7 @@ pub fn truncate_utf8(s: String, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-/// 说话人显示名兜底,对齐精修正文标签(store/export.rs render_refined)的
+/// 说话人显示名兜底,对齐 Aing 正文标签(store/export.rs render_refined)的
 /// 名字 > 关联人物全局编号(P 号)兜底语义——未命名但已关联库人物时,正文里
 /// 印的是 P 号,这里若仍退回原始 speakers.json 的 S/P id 会与正文编号对不上。
 /// person_id 有值时优先用它(去 P 前缀),否则退回 id 自身(去 P/S 前缀)。
@@ -223,7 +223,7 @@ pub fn note_envs(c: &NoteContent) -> Vec<(String, String)> {
     v
 }
 
-/// 笔记内容构建核心(可测):notes_dir 定笔记,data_root 有值时精修稿做声纹库
+/// 笔记内容构建核心(可测):notes_dir 定笔记,data_root 有值时 Aing 稿做声纹库
 /// 现名 join(与 export_note 同款只读语义)。任何读盘失败回 None——内容是增值
 /// 信息,由调用方决定跳过附带照常执行。
 fn note_content_from_dirs(
@@ -274,7 +274,7 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
         return;
     };
     let cfgs = load(&app_data).hooks;
-    // 批内内容缓存:停录+自动精修同帧多事件共享同一 note_id,只构建一次。
+    // 批内内容缓存:停录+自动 Aing 同帧多事件共享同一 note_id,只构建一次。
     // Option 也缓存——构建失败(笔记刚删)同批不再重试,只记一次日志。
     let mut contents: std::collections::HashMap<String, Option<NoteContent>> =
         std::collections::HashMap::new();
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn refine_diff_maps_to_events_and_composes_with_session() {
-        // 停录 + 同帧自动精修启动:一次提交两个事件,顺序 = session 事件在前
+        // 停录 + 同帧自动 Aing 启动:一次提交两个事件,顺序 = session 事件在前
         let before = LifecycleState {
             session: SessionState::Recording { note_id: "n1".into(), paused: false },
             refine: Default::default(),
@@ -561,7 +561,7 @@ mod tests {
             got,
             vec![fire(HookEvent::RecordingStopped, "n1"), fire(HookEvent::RefineStarted, "n1")]
         );
-        // 精修完成
+        // Aing 完成
         let done = LifecycleState { session: SessionState::Idle, refine: Default::default() };
         assert_eq!(hook_events(&after, &done), vec![fire(HookEvent::RefineFinished, "n1")]);
     }
@@ -624,7 +624,7 @@ mod tests {
         // 有名字:忽略 person_id,直接用名字
         assert_eq!(speaker_display("P3", "张三", Some("P9")), "张三");
         assert_eq!(speaker_display("P3", "张三", None), "张三");
-        // 无名字但已关联库人物(person_id 有值):对齐精修正文标签的 P 号,不用原始 id
+        // 无名字但已关联库人物(person_id 有值):对齐 Aing 正文标签的 P 号,不用原始 id
         assert_eq!(speaker_display("S1", "", Some("P9")), "说话人 9");
         assert_eq!(speaker_display("P3", "", Some("P9")), "说话人 9");
         // 无名字且未关联(person_id 为 None):退回原始 speakers.json id,去 P/S 前缀
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(c.ended_at, "2026-07-14T11:00:00+08:00");
         assert_eq!(c.duration_secs, 5, "时长=段落最大 end_ms(5000)/1000");
         assert_eq!(c.speakers, vec!["张三".to_string(), "说话人 2".to_string()]);
-        assert!(c.text.contains("占位甲"), "无精修稿回落原始稿渲染");
+        assert!(c.text.contains("占位甲"), "无 Aing 稿回落原始稿渲染");
         assert!(!c.truncated);
     }
 
@@ -712,11 +712,11 @@ mod tests {
         // generated_at 无 serde default 必须给,段落显示名字段是 name 不是 label。
         std::fs::write(
             tmp.path().join("n1").join("refined.json"),
-            r#"{"schema_version":1,"generated_at":"2026-07-14T11:00:00+08:00","stages":{"filter":"done","recluster":"done","llm":"done"},"paragraphs":[{"speaker":"R1","name":"张三","start_ms":0,"end_ms":5000,"text":"精修占位正文","source_seqs":[1,2]}]}"#,
+            r#"{"schema_version":1,"generated_at":"2026-07-14T11:00:00+08:00","stages":{"filter":"done","recluster":"done","llm":"done"},"paragraphs":[{"speaker":"R1","name":"张三","start_ms":0,"end_ms":5000,"text":"Aing 占位正文","source_seqs":[1,2]}]}"#,
         )
         .unwrap();
         let c = note_content_from_dirs(tmp.path(), None, "n1").unwrap();
-        assert!(c.text.contains("精修占位正文"), "精修稿在盘时优先");
+        assert!(c.text.contains("Aing 占位正文"), "Aing 稿在盘时优先");
         assert!(!c.text.contains("占位甲"), "不再是原始稿");
     }
 

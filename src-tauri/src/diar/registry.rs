@@ -10,8 +10,8 @@ pub const ASSIGN_THRESHOLD: f32 = 0.62;
 /// 簇间合并阈值(余弦,高于归簇阈值防过度合并)。首轮真实会议校准(10+人短句场景)调整:原 0.68 下触发过度合并。
 pub const MERGE_THRESHOLD: f32 = 0.74;
 /// 低于此样本数(16kHz)的段不允许新建簇(短段声纹不可靠)。二轮校准(2026-07-08,
-/// 用户实锤三场会议在线 17/54/108 簇、单段簇占比 65%+,精修后收敛 2/8 人):
-/// 0.6s 太松,短段嵌入落在灰区就开新簇是单段簇的主因;提到 2.5s 与精修管线的
+/// 用户实锤三场会议在线 17/54/108 簇、单段簇占比 65%+,Aing 后收敛 2/8 人):
+/// 0.6s 太松,短段嵌入落在灰区就开新簇是单段簇的主因;提到 2.5s 与 Aing 管线的
 /// 短段判定(refine SHORT_MS)对齐——不足 2.5s 的段走软归属或留空,绝不开簇。
 /// (历史:1.0s 首轮校准降到 0.6s 是因为拦了 0.9s 真句子——那个问题由软归属
 /// 兜住:真句子仍拿到最近簇的标签,只是无权开簇。)
@@ -221,7 +221,7 @@ impl SpeakerRegistry {
         }
 
         if num_samples < MIN_NEW_CLUSTER_SAMPLES {
-            return None; // 短段不建簇(也够不着任何软归属 → 留空,精修兜底)
+            return None; // 短段不建簇(也够不着任何软归属 → 留空,Aing 兜底)
         }
         let id = format!("S{}", self.next_id);
         self.next_id += 1;
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn short_segment_soft_assigns_but_never_creates_cluster() {
         let mut r = SpeakerRegistry::new();
-        // 短段(1s)在空表上:无簇可归 → None(留空,精修兜底),绝不建簇
+        // 短段(1s)在空表上:无簇可归 → None(留空,Aing 兜底),绝不建簇
         assert_eq!(r.assign(&v(1.0, 0.0, 0.0), "mic", 16000), None);
         assert_eq!(r.speakers().len(), 0);
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap(); // S1

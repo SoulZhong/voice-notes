@@ -1,9 +1,9 @@
-//! AI 调用日志:所有对外 AI 调用(HTTP 精修/标题、Agent CLI 精修/标题)与 Agent 经
-//! MCP 的精修写回,请求与响应全量落盘,可查询、可导出。
+//! AI 调用日志:所有对外 AI 调用(HTTP Aing/标题、Agent CLI Aing/标题)与 Agent 经
+//! MCP 的 Aing 写回,请求与响应全量落盘,可查询、可导出。
 //!
 //! 存储形态:`data_root/ai_logs/` 下**每条一个 JSON 文件**,文件名
 //! `<UTC紧凑时间戳毫秒>-<pid>-<seq>.json` 字典序即时间序。选一条一文件而不是共享
-//! JSONL,是因为写入方横跨两类进程(GUI 精修管线、`voice-notes mcp serve` 子进程,
+//! JSONL,是因为写入方横跨两类进程(GUI Aing 管线、`voice-notes mcp serve` 子进程,
 //! 后者由外部 Agent spawn、生命周期不受我们控制),大条目(整块转写文本)的跨进程
 //! append 无法保证行原子性;一条一文件天然零锁零撕裂。个人量级(每场会议约
 //! 分块数+1 条)扫目录毫秒级。
@@ -14,7 +14,7 @@
 //!   才截断并标记 truncated,不静默丢内容。
 //! - **绝不记密钥**:HTTP 的 api key 在请求头不在 body,天然不落;Agent 命令行
 //!   不含凭据。新增记录点时保持这一不变量。
-//! - **记录失败绝不影响业务**:所有写入错误只 eprintln,精修照常。
+//! - **记录失败绝不影响业务**:所有写入错误只 eprintln,Aing 照常。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -24,8 +24,8 @@ pub const AILOG_SCHEMA_VERSION: u32 = 1;
 /// Agent stdout 信封 ~10k 字,正常远低于此;上限只防病态输出撑爆磁盘。
 pub const MAX_FIELD_CHARS: usize = 200_000;
 
-// 调用类别(kind 取值):refine_chunk=HTTP 精修分块;title=标题生成(HTTP 或 Agent);
-// agent_refine=Agent CLI 精修一整轮;mcp_apply=Agent 经 MCP 写回精修稿。
+// 调用类别(kind 取值):refine_chunk=HTTP Aing 分块;title=标题生成(HTTP 或 Agent);
+// agent_refine=Agent CLI Aing 一整轮;mcp_apply=Agent 经 MCP 写回 Aing 稿。
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiLogEntry {
@@ -93,7 +93,7 @@ fn cap_value(v: serde_json::Value) -> (serde_json::Value, bool) {
     (serde_json::Value::String(format!("{head}…[超长已截断]")), true)
 }
 
-/// 落一条日志。任何失败只留 stderr,绝不向调用方冒泡——日志是旁路,不许影响精修。
+/// 落一条日志。任何失败只留 stderr,绝不向调用方冒泡——日志是旁路,不许影响 Aing。
 pub fn record(ctx: &Ctx, draft: Draft) {
     if let Err(e) = record_inner(ctx, draft) {
         eprintln!("ailog: 记录失败(不影响业务): {e}");

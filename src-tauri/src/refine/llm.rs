@@ -1,4 +1,4 @@
-//! A2 LLM 精修:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
+//! A2 LLM Aing:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
 
 use crate::store::RefinedParagraph;
 use serde_json::{json, Value};
@@ -8,7 +8,7 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。";
+const SYSTEM_PROMPT: &str = "你是会议逐字稿 Aing 助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。";
 
 pub struct LlmConfig {
     pub base_url: String,
@@ -195,8 +195,8 @@ fn do_call_chunk(
     Ok((resp_text, parsed["glossary"].clone(), texts_out))
 }
 
-/// 为整场笔记生成主题标题(精修完成后调用,替换未被用户改过的默认标题)。
-/// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响精修结果。
+/// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
+/// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响 Aing 结果。
 pub fn gen_title(
     cfg: &LlmConfig,
     paragraphs: &[RefinedParagraph],
@@ -211,7 +211,7 @@ pub fn gen_title(
         text.push('\n');
     }
     if text.trim().is_empty() {
-        anyhow::bail!("精修稿无内容,不生成标题");
+        anyhow::bail!("Aing 稿无内容,不生成标题");
     }
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body_json = json!({
@@ -268,9 +268,9 @@ pub fn gen_title(
     Ok(title)
 }
 
-/// 逐块精修,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
+/// 逐块 Aing,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
-/// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响精修)。
+/// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响 Aing)。
 pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<&crate::ailog::Ctx>) -> LlmOutcome {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
