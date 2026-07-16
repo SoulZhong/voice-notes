@@ -550,8 +550,9 @@ mod tests {
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: llm.into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: llm.into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: texts
                 .iter()
                 .map(|t| RefinedParagraph {
@@ -562,6 +563,7 @@ mod tests {
                     end_ms: 1000,
                     text: (*t).into(),
                     source_seqs: vec![0],
+                    mentions: vec![],
                 })
                 .collect(),
         }

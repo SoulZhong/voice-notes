@@ -59,8 +59,10 @@ pub fn run_local(
             filter: "done".into(),
             recluster: recluster_state.into(),
             llm: "off".into(),
+            entities: "off".into(),
         },
         discarded_seqs: discarded,
+        entities: vec![],
         paragraphs,
     };
     if let Err(e) = write_refined_atomic(note_dir, &doc) {
@@ -178,6 +180,7 @@ pub(crate) fn build_paragraphs(
                 end_ms: s.end_ms,
                 text: s.text.clone(),
                 source_seqs: vec![s.seq],
+                mentions: vec![],
             });
         }
     }
@@ -393,8 +396,9 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
@@ -416,8 +420,9 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };

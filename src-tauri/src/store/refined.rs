@@ -5,6 +5,32 @@ use std::path::Path;
 
 pub const REFINED_SCHEMA_VERSION: u32 = 1;
 
+fn stage_off() -> String {
+    "off".into()
+}
+
+/// 实体在段落正文中的一次提及(笔记页高亮 + 图谱建边用)。`start`/`end` 是本段
+/// `text` 的字符(char)下标,半开区间 [start, end);`entity` 引用本篇
+/// `RefinedDoc.entities[].id`。Plan 3 由大模型产出,本 plan 恒为空。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Mention {
+    pub entity: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// 本篇出现的一个实体(人读真值;全局知识图谱由所有 aing.json 派生、可整库重建)。
+/// `id`:人实体复用全局 `person_id`(P<n>),非人实体为新分配 `ent_id`。
+/// `kind`:person/org/project/term/decision/task/place/date… 用字符串免枚举迁移。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Entity {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefinedParagraph {
     pub speaker: String,
@@ -18,6 +44,9 @@ pub struct RefinedParagraph {
     pub end_ms: u64,
     pub text: String,
     pub source_seqs: Vec<u64>,
+    /// 本段实体提及区间(Plan 3 填,本 plan 恒空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +54,9 @@ pub struct RefineStages {
     pub filter: String,
     pub recluster: String,
     pub llm: String,
+    /// 实体抽取阶段:off/running/done/partial/failed(Plan 3 用,本 plan 恒 off)。
+    #[serde(default = "stage_off")]
+    pub entities: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +68,9 @@ pub struct RefinedDoc {
     pub stages: RefineStages,
     #[serde(default)]
     pub discarded_seqs: Vec<u64>,
+    /// 本篇实体清单(Plan 3 填,本 plan 恒空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<Entity>,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
@@ -171,11 +206,13 @@ mod tests {
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
             llm_model: Some("deepseek-chat".into()),
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![1, 2],
+            entities: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
+                mentions: vec![],
             }],
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
@@ -186,6 +223,64 @@ mod tests {
         assert_eq!(got.paragraphs[0].person_id.as_deref(), Some("P1"));
         std::fs::write(dir.path().join("refined.json"), "{broken").unwrap();
         assert!(load_refined(dir.path()).is_none(), "损坏返回 None 不 panic");
+    }
+
+    #[test]
+    fn aing_fields_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = RefinedDoc {
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "2026-07-16T10:00:00+08:00".into(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+            },
+            discarded_seqs: vec![],
+            entities: vec![Entity {
+                id: "ent_1".into(),
+                kind: "project".into(),
+                name: "灯塔计划".into(),
+                aliases: vec!["Lighthouse".into()],
+            }],
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "灯塔计划下周启动".into(),
+                source_seqs: vec![0],
+                mentions: vec![Mention { entity: "ent_1".into(), start: 0, end: 4 }],
+            }],
+        };
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        let back = load_refined(dir.path()).unwrap();
+        assert_eq!(back.entities, doc.entities);
+        assert_eq!(back.paragraphs[0].mentions, doc.paragraphs[0].mentions);
+        assert_eq!(back.stages.entities, "off");
+    }
+
+    #[test]
+    fn old_doc_without_aing_fields_still_loads_with_empty_defaults() {
+        // 旧 refined.json:没有 entities / mentions / stages.entities 键
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-01T09:00:00+08:00",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "S1", "start_ms": 0, "end_ms": 500, "text": "你好", "source_seqs": [0] }
+            ]
+        }"#;
+        std::fs::write(dir.path().join("refined.json"), old).unwrap();
+        let doc = load_refined(dir.path()).expect("旧结构应能加载");
+        assert!(doc.entities.is_empty());
+        assert!(doc.paragraphs[0].mentions.is_empty());
+        assert_eq!(doc.stages.entities, "off", "缺 stages.entities 键默认 off");
     }
 
     /// 旧版 refined.json(无 person_id 字段)必须照常解析——字段缺省为 None。
@@ -213,6 +308,7 @@ mod tests {
             end_ms: start + 1000,
             text: "内容。".into(),
             source_seqs: vec![start / 1000],
+            mentions: vec![],
         }
     }
 
@@ -221,8 +317,9 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -322,8 +419,9 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留

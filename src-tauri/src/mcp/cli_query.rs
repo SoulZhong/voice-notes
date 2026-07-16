@@ -362,6 +362,7 @@ fn note_paragraphs_for_title(roots: &tools::DataRoots, id: &str) -> Vec<crate::s
             end_ms: s.end_ms,
             text: s.text.clone(),
             source_seqs: vec![s.seq],
+            mentions: vec![],
         })
         .collect()
 }

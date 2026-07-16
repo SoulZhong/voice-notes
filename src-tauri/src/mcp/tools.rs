@@ -278,8 +278,9 @@ mod tests {
                 schema_version: 1,
                 generated_at: "2026-03-01T11:00:00+08:00".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -288,6 +289,7 @@ mod tests {
                     end_ms: 1000,
                     text: "精修句".into(),
                     source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )
@@ -347,8 +349,9 @@ mod tests {
                 schema_version: 1,
                 generated_at: "2026-01-01T11:00:00+08:00".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -357,6 +360,7 @@ mod tests {
                     end_ms: 1000,
                     text: "精修句".into(),
                     source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )
@@ -398,11 +402,13 @@ mod tests {
                 schema_version: 1,
                 generated_at: "t".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(), name: Some("张三".into()), person_id: None,
                     start_ms: 0, end_ms: 1000, text: "我们肯计要做".into(), source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )
