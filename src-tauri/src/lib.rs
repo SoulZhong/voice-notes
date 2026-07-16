@@ -2809,6 +2809,11 @@ pub fn run() {
             if let Some(dir) = &app_data {
                 logging::redirect_stdio_to_file(dir);
             }
+            // 一次性迁移:把存量旧默认镜像前缀抬到新默认(见 settings::migrate_mirror_prefix)。
+            // 必须先于本函数后续的 settings::load,使其读到迁移后的值。
+            if let Some(dir) = &app_data {
+                let _ = settings::migrate_mirror_prefix(dir);
+            }
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
             // 必须先于 models::root() 的任何使用。
