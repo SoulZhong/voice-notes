@@ -1519,6 +1519,40 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
         .collect())
 }
 
+/// 相关笔记:与该笔记共享 Aing 实体的其他笔记(经知识图谱),按共享实体数降序。
+/// 纯增值:图谱缺失/查询失败 → 返回空列表(前端据此隐藏该区块),绝不 Err 拖垮详情页。
+#[tauri::command]
+fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let Ok(root) = data_root(&app) else { return Ok(vec![]) };
+    let pairs = match graph::related_notes(&root, &id) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("note_related: 图谱查询失败,返回空: {e}");
+            return Ok(vec![]);
+        }
+    };
+    if pairs.is_empty() {
+        return Ok(vec![]);
+    }
+    let notes_root = notes_dir(&app).map_err(|e| e.to_string())?;
+    let summaries = store::NoteStore::new(notes_root).list();
+    let by_id: std::collections::HashMap<String, &store::NoteSummary> =
+        summaries.iter().map(|n| (n.id.clone(), n)).collect();
+    let out = pairs
+        .into_iter()
+        .filter_map(|(nid, shared)| {
+            by_id.get(&nid).map(|n| ipc::RelatedNote {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                started_at: n.started_at.clone(),
+                shared_entities: shared,
+            })
+        })
+        .collect();
+    Ok(out)
+}
+
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
 /// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
 #[tauri::command]
@@ -2946,6 +2980,7 @@ pub fn run() {
             assign_refined_person,
             assign_note_speaker_person,
             person_notes,
+            note_related,
             note_audio_info,
             rename_note,
             delete_note,

@@ -115,6 +115,15 @@ pub struct PersonSummary {
     pub sample_dates: Vec<String>,
 }
 
+/// 相关笔记(笔记详情页「相关笔记」区):与当前笔记共享 Aing 实体的其他笔记 + 共享实体数。
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedNote {
+    pub id: String,
+    pub title: String,
+    pub started_at: String,
+    pub shared_entities: i64,
+}
+
 /// 整理·合并建议(suggest_person_merges 返回):把 loser 并入 winner 的推荐,
 /// 相似度是共有信道质心余弦的最大值;salience 是 S-Norm 显著性 z 分数(库太小
 /// 算不出分布时 None);name 空串=未命名(前端按「说话人 N」兜底)。
