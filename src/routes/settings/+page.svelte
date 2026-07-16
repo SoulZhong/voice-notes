@@ -435,9 +435,6 @@
     settings = { ...settings, mirror_enabled: !settings.mirror_enabled };
     await setSettings(settings);
   }
-  async function savePrefix() {
-    if (settings) await setSettings(settings);
-  }
 
   const pct = (p: { received: number; total: number }) =>
     p.total > 0 ? Math.min(100, Math.floor((p.received / p.total) * 100)) : 0;
@@ -794,9 +791,6 @@
           <span class="row-label">镜像加速</span>
           <span class="row-desc">国内网络下载模型更快</span>
         </div>
-        {#if settings?.mirror_enabled}
-          <input class="prefix" bind:value={settings.mirror_prefix} onblur={savePrefix} placeholder="https://ghproxy.net/" />
-        {/if}
         <input
           type="checkbox"
           class="ctl switch"
@@ -1117,23 +1111,6 @@
     height: 100%;
     background: var(--accent);
     transition: width 0.3s;
-  }
-  /* 镜像前缀:行内窄输入框(勾选后出现在开关左侧) */
-  .prefix {
-    flex: none;
-    width: 15rem;
-    box-sizing: border-box;
-    padding: 0.3em 0.6em;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--hairline-strong);
-    background: var(--canvas);
-    color: var(--ink);
-    font-size: 0.82rem;
-  }
-  .prefix:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
   }
   .lock-hint {
     font-size: 0.8rem;
