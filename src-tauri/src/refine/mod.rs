@@ -9,7 +9,8 @@ pub mod recluster;
 use crate::diar::registry::SeedCluster;
 use crate::diar::SpeakerEmbedder;
 use crate::store::{
-    write_refined_atomic, RefineStages, RefinedDoc, RefinedParagraph, SegmentRecord, SpeakerMeta,
+    self, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
+    SegmentRecord, SpeakerMeta,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -215,11 +216,159 @@ pub fn run_llm(
     Ok(())
 }
 
+/// 大模型原始实体 → 本篇规范实体:按规范名(trim + 不分大小写)去重,合并别名,
+/// 按首次出现顺序分配局部 id `ent_N`。首现的原名即规范名。**不做全局 person 归并**
+/// (跨笔记/声纹匹配是 Plan 4 的解析层)。
+pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
+    let mut out: Vec<Entity> = Vec::new();
+    for r in raw {
+        let name = r.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if let Some(e) = out.iter_mut().find(|e| e.name.to_lowercase() == key) {
+            for a in r.aliases {
+                let a = a.trim().to_string();
+                if !a.is_empty()
+                    && a.to_lowercase() != key
+                    && !e.aliases.iter().any(|x| x.to_lowercase() == a.to_lowercase())
+                {
+                    e.aliases.push(a);
+                }
+            }
+        } else {
+            let id = format!("ent_{}", out.len() + 1);
+            let mut aliases: Vec<String> = Vec::new();
+            for a in r.aliases {
+                let a = a.trim().to_string();
+                if !a.is_empty()
+                    && a.to_lowercase() != key
+                    && !aliases.iter().any(|x| x.to_lowercase() == a.to_lowercase())
+                {
+                    aliases.push(a);
+                }
+            }
+            out.push(Entity { id, kind: r.kind.trim().to_string(), name: name.to_string(), aliases });
+        }
+    }
+    out
+}
+
+/// 在 hay 中找 needle 的所有非重叠出现,返回 char 下标半开区间 [start,end)。
+/// 空 needle 返回空。用于把实体名/别名映射到修订后正文的高亮区间。
+fn find_char_spans(hay: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle_chars = needle.chars().count();
+    let mut spans = Vec::new();
+    let mut byte = 0usize;
+    while let Some(pos) = hay[byte..].find(needle) {
+        let abs = byte + pos;
+        let char_start = hay[..abs].chars().count();
+        spans.push((char_start, char_start + needle_chars));
+        byte = abs + needle.len(); // 非重叠推进
+    }
+    spans
+}
+
+/// 对每段,在修订后 `text` 里按各实体 name+aliases 子串搜索,产出提及区间。
+/// 单段内所有实体的命中合一起按 (start 升序, 长度降序) 贪心去重叠,保证高亮不交叠、
+/// 长匹配优先(别名「灯塔」与全名「灯塔计划」重叠时留全名)。返回与 paragraphs 逐段对齐。
+pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Entity]) -> Vec<Vec<Mention>> {
+    paragraphs
+        .iter()
+        .map(|p| {
+            // 收集 (start, end, entity_id)
+            let mut hits: Vec<(usize, usize, &str)> = Vec::new();
+            for e in entities {
+                for needle in std::iter::once(&e.name).chain(e.aliases.iter()) {
+                    for (s, en) in find_char_spans(&p.text, needle) {
+                        hits.push((s, en, e.id.as_str()));
+                    }
+                }
+            }
+            // start 升序、长度降序;贪心保留不与已选重叠者
+            hits.sort_by(|a, b| a.0.cmp(&b.0).then((b.1 - b.0).cmp(&(a.1 - a.0))));
+            let mut chosen: Vec<Mention> = Vec::new();
+            let mut last_end = 0usize;
+            let mut first = true;
+            for (s, en, id) in hits {
+                if first || s >= last_end {
+                    chosen.push(Mention { entity: id.to_string(), start: s, end: en });
+                    last_end = en;
+                    first = false;
+                }
+            }
+            chosen
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{SegmentRecord, SpeakerMeta};
     use std::collections::BTreeMap;
+
+    fn para(text: &str) -> crate::store::RefinedParagraph {
+        crate::store::RefinedParagraph {
+            speaker: "R1".into(),
+            name: None,
+            person_id: None,
+            start_ms: 0,
+            end_ms: 1000,
+            text: text.into(),
+            source_seqs: vec![0],
+            mentions: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_dedups_by_name_case_insensitive_and_merges_aliases() {
+        let raw = vec![
+            llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec!["Lighthouse".into()] },
+            llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec!["灯塔".into()] },
+            llm::RawEntity { name: "Acme".into(), kind: "org".into(), aliases: vec![] },
+            llm::RawEntity { name: "acme".into(), kind: "org".into(), aliases: vec!["ACME 公司".into()] },
+        ];
+        let ents = resolve_note_entities(raw);
+        assert_eq!(ents.len(), 2, "灯塔计划 与 Acme 各归一为一个");
+        assert_eq!(ents[0].id, "ent_1");
+        assert_eq!(ents[0].name, "灯塔计划");
+        // 合并别名(去重、顺序稳定)
+        assert!(ents[0].aliases.contains(&"Lighthouse".to_string()));
+        assert!(ents[0].aliases.contains(&"灯塔".to_string()));
+        assert_eq!(ents[1].id, "ent_2");
+        assert_eq!(ents[1].name, "Acme", "首现写法为规范名");
+        assert!(ents[1].aliases.contains(&"ACME 公司".to_string()));
+    }
+
+    #[test]
+    fn compute_mentions_finds_name_and_alias_by_char_offset() {
+        let ents = vec![store::Entity {
+            id: "ent_1".into(),
+            kind: "project".into(),
+            name: "灯塔计划".into(),
+            aliases: vec!["Lighthouse".into()],
+        }];
+        // 段落0:开头是「灯塔计划」(char 0..4);段落1:含别名 Lighthouse
+        let ps = vec![
+            para("灯塔计划下周启动"),
+            para("我们叫它 Lighthouse 吧"), // "我们叫它 " 是 5 个 char(含空格),Lighthouse 从 char 5 起
+        ];
+        let ms = compute_mentions(&ps, &ents);
+        assert_eq!(ms[0], vec![store::Mention { entity: "ent_1".into(), start: 0, end: 4 }]);
+        assert_eq!(ms[1], vec![store::Mention { entity: "ent_1".into(), start: 5, end: 15 }]);
+    }
+
+    #[test]
+    fn compute_mentions_non_overlapping_and_empty_when_absent() {
+        let ents = vec![store::Entity { id: "ent_1".into(), kind: "term".into(), name: "AB".into(), aliases: vec![] }];
+        let ps = vec![para("无关文本")];
+        assert!(compute_mentions(&ps, &ents)[0].is_empty());
+    }
 
     /// 假嵌入器:按调用顺序(=段 seq 序)依次返回预置方向向量。
     struct SeqEmbedder {
