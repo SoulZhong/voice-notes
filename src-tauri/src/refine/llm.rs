@@ -1,4 +1,4 @@
-//! A2 LLM 精修:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
+//! A2 LLM Aing:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
 
 use crate::store::RefinedParagraph;
 use serde_json::{json, Value};
@@ -195,8 +195,8 @@ fn do_call_chunk(
     Ok((resp_text, parsed["glossary"].clone(), texts_out))
 }
 
-/// 为整场笔记生成主题标题(精修完成后调用,替换未被用户改过的默认标题)。
-/// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响精修结果。
+/// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
+/// 单次请求、失败即放弃:标题是锦上添花,不进 stages、不重试、不影响 Aing 结果。
 pub fn gen_title(
     cfg: &LlmConfig,
     paragraphs: &[RefinedParagraph],
@@ -211,7 +211,7 @@ pub fn gen_title(
         text.push('\n');
     }
     if text.trim().is_empty() {
-        anyhow::bail!("精修稿无内容,不生成标题");
+        anyhow::bail!("修订稿无内容,不生成标题");
     }
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body_json = json!({
@@ -268,9 +268,9 @@ pub fn gen_title(
     Ok(title)
 }
 
-/// 逐块精修,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
+/// 逐块 Aing,glossary 串行前传。全部成功 Done;有内容级失败(或网络与内容混合失败)
 /// 计入 Partial;全部分块都是网络级失败(服务完全不可达)判 Failed。
-/// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响精修)。
+/// log=Some 时每个分块的请求/响应记入 AI 日志(旁路,失败不影响 Aing)。
 pub fn polish(cfg: &LlmConfig, paragraphs: &mut [RefinedParagraph], log: Option<&crate::ailog::Ctx>) -> LlmOutcome {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {

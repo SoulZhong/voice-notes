@@ -21,8 +21,8 @@ export const HOOK_EVENTS: { value: string; label: string }[] = [
   { value: "recording_stopped", label: "录制停止" },
   { value: "recording_paused", label: "录制暂停" },
   { value: "recording_resumed", label: "录制恢复" },
-  { value: "refine_started", label: "精修开始" },
-  { value: "refine_finished", label: "精修完成" },
+  { value: "refine_started", label: "Aing 开始" },
+  { value: "refine_finished", label: "Aing 完成" },
 ];
 
 export const eventLabel = (v: string) => HOOK_EVENTS.find((e) => e.value === v)?.label ?? v;

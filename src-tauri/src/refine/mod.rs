@@ -1,4 +1,4 @@
-//! 会后精修管线编排:过滤(A3)→重聚类(A1)→段落化,可选 LLM 精修(A2)。
+//! 会后 Aing 管线编排:过滤(A3)→重聚类(A1)→段落化,可选 LLM Aing(A2)。
 //! 原始三文件只读;一切产物写 refined.json。
 
 pub mod agent;
@@ -187,7 +187,7 @@ pub(crate) fn build_paragraphs(
 /// F4 修复:落盘失败时把 `doc.stages.llm` 降级为 "failed",不留在 polish 算出的
 /// "done"/"partial"——否则内存态(以及 lib.rs 随后 `emit("llm", &doc.stages.llm)`
 /// 发出的事件)会报告"完成",但盘上 refined.json 因写失败仍是旧值(通常 "off"),
-/// 前后端状态互相矛盾。落盘失败一律视为"本轮精修没能生效"，与其它阶段"没能
+/// 前后端状态互相矛盾。落盘失败一律视为"本轮 Aing 没能生效"，与其它阶段"没能
 /// 落成盘就不算完成"的语义看齐;错误照样返回给调用方记日志,不吞掉。
 pub fn run_llm(
     note_dir: &Path,
@@ -441,7 +441,7 @@ mod tests {
         Ok(())
     }
 
-    /// golden 校准工具(长期保留,非一次性):对真实会议样本跑本地精修管线,
+    /// golden 校准工具(长期保留,非一次性):对真实会议样本跑本地 Aing 管线,
     /// 产物落在临时工作目录下供 scripts/refine_golden.py 核验聚类/过滤指标。
     /// 源目录只读——先整份拷到 `$TMPDIR/vn-golden-work/<note_id>`,绝不碰用户原始数据。
     ///

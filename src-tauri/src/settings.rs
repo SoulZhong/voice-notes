@@ -58,7 +58,7 @@ pub struct Settings {
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
     #[serde(default = "default_true")]
     pub tray_enabled: bool,
-    /// 会后 LLM 精修总开关(A2)。默认关,配好 key 后由用户打开。
+    /// 会后 LLM Aing 总开关(A2)。默认关,配好 key 后由用户打开。
     #[serde(default)]
     pub refine_enabled: bool,
     /// A2 执行体:"openai"(HTTP chat completions)| "agent"(本机 Agent CLI 经

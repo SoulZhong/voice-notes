@@ -38,7 +38,7 @@ pub fn new_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
             // 真耳语(0.002≈-54dBFS)抬 158x 功率进 VAD 可识别区间;正常人声(0.05)
             // 温和 5x 改善回放响度;响亮人声(0.15)不动。默认参数的噪声地板 -50dBFS
             // 会把真耳语当噪声拒掉,故放宽到 -44 并提高 max_gain/爬坡速度。
-            // 底噪会被抬到约 -44dBFS(轻微可闻),VAD/语言过滤/会后精修三层兜幻觉段。
+            // 底噪会被抬到约 -44dBFS(轻微可闻),VAD/语言过滤/会后 Aing 三层兜幻觉段。
             adaptive_digital: Some(config::AdaptiveDigital {
                 headroom_db: 3.0,
                 max_gain_db: 60.0,

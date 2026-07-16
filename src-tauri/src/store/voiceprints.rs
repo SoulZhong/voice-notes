@@ -529,7 +529,7 @@ fn push_session_centroid(
     }
 }
 
-/// 声纹库 → 开录/精修种子(纯函数):每人每信道的主质心 + 各会话质心各成一个种子
+/// 声纹库 → 开录/Aing 种子(纯函数):每人每信道的主质心 + 各会话质心各成一个种子
 /// 簇——同一个人不同状态各有代表向量,任一被命中即认出此人(匹配取 max 的簇级
 /// 实现,registry 本就支持同 person 多种子簇)。已被合并/悬空引用剔除。
 pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster> {

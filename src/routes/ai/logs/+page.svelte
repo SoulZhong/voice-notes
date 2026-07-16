@@ -102,7 +102,7 @@
 
   <div class="rows">
     {#if entries.length === 0}
-      <p class="empty">暂无记录。精修与标题生成的每次对外 AI 调用(请求与响应全量)都会在这里留痕。</p>
+      <p class="empty">暂无记录。Aing 与标题生成的每次对外 AI 调用(请求与响应全量)都会在这里留痕。</p>
     {:else}
       {#each entries as e (e.id)}
         <div class="row">

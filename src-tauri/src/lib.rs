@@ -106,8 +106,8 @@ struct AppState {
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
     transcode: Arc<store::transcode::TranscodeQueue>,
-    // refining 集合已删(P3):精修态入 lifecycle 内核(machine::RefineState),
-    // 防重入/续录拦截由内核裁决,精修中查询走 LifecycleHandle::is_refining。
+    // refining 集合已删(P3):Aing 态入 lifecycle 内核(machine::RefineState),
+    // 防重入/续录拦截由内核裁决,Aing 中查询走 LifecycleHandle::is_refining。
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -213,10 +213,10 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
-/// HTTP(OpenAI 兼容)精修配置是否齐备（开关开、provider 非 agent、三项均非空）：
+/// HTTP(OpenAI 兼容)Aing 配置是否齐备（开关开、provider 非 agent、三项均非空）：
 /// 抽成纯函数供 spawn_refine 判定与单测，避免把「要不要发起网络请求」这条判断逻辑
 /// 埋进整个后台线程闭包里难以单独验证。provider 值未知(手改 settings.json)时按
-/// openai 对待——那是默认执行体,坏值不该让精修整个哑掉。
+/// openai 对待——那是默认执行体,坏值不该让 Aing 整个哑掉。
 fn refine_llm_ready(s: &settings::Settings) -> bool {
     s.refine_enabled
         && s.refine_provider != "agent"
@@ -225,17 +225,17 @@ fn refine_llm_ready(s: &settings::Settings) -> bool {
         && !s.refine_api_key.is_empty()
 }
 
-/// Agent(本机 CLI 经 MCP 读写回)精修是否应当尝试。bin 探测留到运行时——探测结果
+/// Agent(本机 CLI 经 MCP 读写回)Aing 是否应当尝试。bin 探测留到运行时——探测结果
 /// 随用户装/卸 CLI 变化,不该在这里静态判定;解析失败由 agent 分支落 failed 并留日志。
 fn refine_agent_ready(s: &settings::Settings) -> bool {
     s.refine_enabled && s.refine_provider == "agent"
 }
 
-// resume_blocked_by_refining 纯函数已删:精修集入 lifecycle 内核(machine::RefineState),
-// 守卫仍在 do_resume_note_recording 原位判定(顺序不变:下载→精修→模型),判定值
-// 由 actor 执行 Delegate 时从内核精修集读出传入(见该函数 refining 参数注释)。
+// resume_blocked_by_refining 纯函数已删:Aing 集入 lifecycle 内核(machine::RefineState),
+// 守卫仍在 do_resume_note_recording 原位判定(顺序不变:下载→Aing→模型),判定值
+// 由 actor 执行 Delegate 时从内核 Aing 集读出传入(见该函数 refining 参数注释)。
 
-/// 会后精修：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
+/// 会后 Aing：后台线程跑 filter+recluster（读 WAV）→ 视 `enqueue_transcode_after_local`
 /// 移交转码 → 视配置可选 LLM。全程 catch_unwind，任何一步失败/panic 只留日志与
 /// "failed" 事件，绝不影响已落盘的 segments/speakers——refined.json 是纯增值产物。
 ///
@@ -251,7 +251,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     let transcode = state.transcode.clone();
     let session = state.session.clone();
     let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
-    // 精修态置 Running 的信号(原 refining.insert 的时机)同步先行——必须在 spawn
+    // Aing 态置 Running 的信号(原 refining.insert 的时机)同步先行——必须在 spawn
     // 线程之前发出:自动路径(DoFinalize 直调)在 actor 线程上执行,这条自投消息
     // 排在停录 reply 之前入队,停录返回后到达的续录命令必然在它后面,内核守卫才
     // 不会因 worker 线程起步慢而漏挡(与旧世界入口同步 insert 的窗口对齐)。
@@ -262,10 +262,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         state: "running".into(),
     });
     std::thread::spawn(move || {
-        // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在精修完成前重开
+        // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
         // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
-        // 持有。跳过不等于丢转码:续录自身在其最终停止时会重新走一遍精修+转码移交。
+        // 持有。跳过不等于丢转码:续录自身在其最终停止时会重新走一遍 Aing+转码移交。
         let is_resumed_by_active_session = |note_id: &str| -> bool {
             session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false)
         };
@@ -321,7 +321,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     Err(_) => settings::Settings::default(),
                 };
                 // AI 日志上下文:所有对外 AI 调用(HTTP/Agent/标题)全量留痕。
-                // data_root 拿不到时降级为不记录,绝不影响精修本身。
+                // data_root 拿不到时降级为不记录,绝不影响 Aing 本身。
                 let log_ctx = data_root(&app)
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
@@ -345,7 +345,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 &s.refine_agent_model,
                                 log_ctx.as_ref(),
                             ) {
-                                eprintln!("refine: agent 精修失败: {e}");
+                                eprintln!("refine: agent Aing 失败: {e}");
                             }
                             // Agent 经 MCP 写的是盘上文件:重载同步内存 doc(成功时
                             // llm=done + 修订文本;失败时盘上仍是 off,下面统一降级)。
@@ -354,7 +354,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             }
                         }
                         None => eprintln!(
-                            "refine: 未找到 {} 的 CLI(可在 AI 页指定可执行文件路径),Agent 精修跳过",
+                            "refine: 未找到 {} 的 CLI(可在 AI 页指定可执行文件路径),Agent Aing 跳过",
                             s.refine_agent
                         ),
                     }
@@ -386,15 +386,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 report("llm", &doc.stages.llm);
                 // 主题标题:LLM 阶段产出可用(done/partial 都行,标题只要大意)且标题
                 // 仍是默认样式(用户没手动改过)才自动替换——手动命名永远最高优先级。
-                // 失败静默:标题是锦上添花,不影响精修完成态。
+                // 失败静默:标题是锦上添花,不影响 Aing 完成态。
                 // 主题标题:只要 AI 执行体就绪且标题仍是默认样式就尝试——不再要求
-                // LLM 精修阶段成功(标题是独立的小调用,精修分块失败不代表标题也会
+                // LLM Aing 阶段成功(标题是独立的小调用,Aing 分块失败不代表标题也会
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
                 if (refine_agent_ready(&s) || refine_llm_ready(&s))
                     && store::writer::is_default_title(&note.meta.title)
                 {
-                    // 标题跟随精修执行体:Agent 模式一发一收(无 MCP、无工具),
+                    // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
                     let title = if refine_agent_ready(&s) {
                         refine::agent::AgentKind::from_key(&s.refine_agent)
@@ -465,7 +465,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             }
         }
         // 原 refining.remove 的时机(收尾事件与兜底转码之后):把该 id 移出内核
-        // 精修集。按 id 移除,并发精修的其它笔记不受波及(与旧 set.remove 一致)。
+        // Aing 集。按 id 移除,并发 Aing 的其它笔记不受波及(与旧 set.remove 一致)。
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
     });
 }
@@ -1154,20 +1154,20 @@ fn start_recording(app: AppHandle) -> Result<(), String> {
 /// 原 resume_recording 命令体,唯一改动是 state 由 `app.state()` 取(与 `State<AppState>`
 /// 注入等价)、app 因签名为 &AppHandle 而在传入 spawn_session 时 clone——逻辑零变化。
 ///
-/// refining(P3):该笔记是否正在精修,由 actor 执行 Delegate 时从内核精修集读出
+/// refining(P3):该笔记是否正在 Aing,由 actor 执行 Delegate 时从内核 Aing 集读出
 /// 传入(本函数在 actor 线程上运行,数据源即内核、同一消息处理内快照一致)。守卫
-/// 留在此处而非内核抢答,是为逐位还原旧判定顺序:下载→精修→模型,谁先判谁先报。
+/// 留在此处而非内核抢答,是为逐位还原旧判定顺序:下载→Aing→模型,谁先判谁先报。
 fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    // F1 修复:该笔记正在精修中就拒绝续录——精修完成后才 transcode.enqueue,而续录
-    // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,精修收尾时才入队的转码会把
+    // F1 修复:该笔记正在 Aing 中就拒绝续录——Aing 完成后才 transcode.enqueue,而续录
+    // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,Aing 收尾时才入队的转码会把
     // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
     if refining {
-        return Err("该笔记正在精修,请稍后再试".into());
+        return Err("该笔记正在 Aing,请稍后再试".into());
     }
     if !models::recording_ready(&current_asr(app)) {
         return Err("模型缺失：请先在设置页下载所选识别模型".into());
@@ -1377,10 +1377,10 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
     store::NoteStore::new(dir).load(&id).map_err(|e| e.to_string())
 }
 
-/// 手动（重）触发一次会后精修：录制中该 id 拒绝（内容未定稿，段落还在变），正在精修中
+/// 手动（重）触发一次会后 Aing：录制中该 id 拒绝（内容未定稿，段落还在变），正在 Aing 中
 /// 也拒绝（并发跑两遍纯浪费且会互相覆盖 refined.json）。两条守卫已入 lifecycle 内核
 /// （Msg::RefineRequest 裁决，文案逐字不变）；通过则内核置 Running 并以 DoSpawnRefine
-/// 调回 spawn_refine——手动重跑时 m4a 早已在盘上（首次精修已经移交过转码），故
+/// 调回 spawn_refine——手动重跑时 m4a 早已在盘上（首次 Aing 已经移交过转码），故
 /// enqueue_transcode 恒 false，不再重复入队。
 #[tauri::command]
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
@@ -1388,9 +1388,9 @@ fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
         .request(lifecycle::machine::Msg::RefineRequest { note_id: id })
 }
 
-/// 读取已落盘的精修结果（refined.json）；从未精修过 / 精修在前置阶段就失败到没能落盘
+/// 读取已落盘的 Aing 结果（refined.json）；从未 Aing 过 / Aing 在前置阶段就失败到没能落盘
 /// 时返回 None，前端据此回落展示原始 segments。
-/// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史精修稿
+/// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史修订稿
 /// 跟着变），person_id 归一到 merge 后的 winner。只影响返回值，不落盘。
 #[tauri::command]
 fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
@@ -1407,8 +1407,8 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
     }))
 }
 
-/// 精修稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
-/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇精修稿。精修中拒绝（管线
+/// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
+/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇修订稿。Aing 中拒绝（管线
 /// 随后整写 refined.json 会吞掉本次编辑），录制中拒绝（speakers.json 由 writer 独占）。
 #[tauri::command]
 fn rename_refined_speaker(
@@ -1422,20 +1422,20 @@ fn rename_refined_speaker(
     if name.is_empty() {
         return Err("名字不能为空".into());
     }
-    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err("该笔记正在精修中，稍后再改".into());
+        return Err("该笔记正在 Aing 中，稍后再改".into());
     }
     reject_if_active(&state, &note_id)?;
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
     let root = notes_dir(&app).map_err(|e| e.to_string())?;
     let person_id = store::rename_refined_speaker(&root.join(&note_id), &speaker_id, name)
         .map_err(|e| e.to_string())?;
-    // 降级精修稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
-    // 原始逐字稿视图不与精修稿打架。R* 标签不存在于 speakers.json,不碰。
+    // 降级修订稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
+    // 原始逐字稿视图不与修订稿打架。R* 标签不存在于 speakers.json,不碰。
     if speaker_id.starts_with('S') {
         if let Err(e) = store::NoteStore::new(root).rename_speaker(&note_id, &speaker_id, name) {
-            eprintln!("精修稿改名已生效,但同步 speakers.json 失败({speaker_id}): {e}");
+            eprintln!("修订稿改名已生效,但同步 speakers.json 失败({speaker_id}): {e}");
         }
     }
     // 同步会议搭子:人已被删除/合并成悬空引用时静默跳过——本地改名已生效,不回滚。
@@ -1444,7 +1444,7 @@ fn rename_refined_speaker(
         let vp = vp_store.load();
         if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
             if let Err(e) = vp_store.rename(&resolved, name) {
-                eprintln!("精修稿改名已生效,但同步声纹库失败({pid}): {e}");
+                eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}");
             }
         }
     }
@@ -1507,7 +1507,7 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
         .collect())
 }
 
-/// 把精修稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
+/// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
 /// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
 #[tauri::command]
 fn assign_refined_person(
@@ -1516,9 +1516,9 @@ fn assign_refined_person(
     speaker_id: String,
     person_id: String,
 ) -> Result<(), String> {
-    // 精修中拒绝:改读 lifecycle 内核精修态(原 AppState.refining 集合已删)。
+    // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err("该笔记正在精修中，稍后再改".into());
+        return Err("该笔记正在 Aing 中，稍后再改".into());
     }
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
     let vp = open_voiceprint_store(&app)?.load();
@@ -1720,8 +1720,8 @@ fn set_segment_speaker(
         .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
 }
 
-/// 导出笔记。prefer_refined=真且精修稿在盘时导精修稿(所见即所得:用户看着哪个视图
-/// 点导出就得到哪个),否则导原始逐字稿;精修稿导出前与 get_refined 同款只读 join,
+/// 导出笔记。prefer_refined=真且修订稿在盘时导修订稿(所见即所得:用户看着哪个视图
+/// 点导出就得到哪个),否则导原始逐字稿;修订稿导出前与 get_refined 同款只读 join,
 /// 库中现名(会议搭子改名)一并带出。
 #[tauri::command]
 fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool) -> Result<String, String> {
@@ -2041,7 +2041,7 @@ fn mcp_capabilities() -> serde_json::Value {
 }
 
 /// 四家 Agent CLI 的本机探测结果(key → 解析到的可执行路径或 null),供 /ai 页
-/// Agent 精修模式展示「已检测到/未检测到」。探测只做文件存在性检查,毫秒级。
+/// Agent Aing 模式展示「已检测到/未检测到」。探测只做文件存在性检查,毫秒级。
 #[tauri::command]
 fn refine_agents_probe() -> serde_json::Value {
     refine::agent::probe_all()
@@ -2392,7 +2392,7 @@ async fn test_hook(cfg: hooks_external::HookCfg) -> Result<String, String> {
         .map_err(|e| format!("执行线程失败: {e}"))?
 }
 
-/// 配置页「测试连接」:发一条最小 chat/completions 验证大模型精修配置。
+/// 配置页「测试连接」:发一条最小 chat/completions 验证大模型 Aing 配置。
 #[tauri::command]
 async fn test_refine_llm(base_url: String, model: String, api_key: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2870,7 +2870,7 @@ pub fn run() {
                 let lock = match store::notelock::NoteLock::try_exclusive(dir) {
                     Ok(Some(l)) => l,
                     // 拿不到锁=该目录有活会话(含另一实例)在用;此次转码任务作废,
-                    // 但队列语义幂等按目录去重——续录结束后精修路径会重新入队,不丢。
+                    // 但队列语义幂等按目录去重——续录结束后 Aing 路径会重新入队,不丢。
                     _ => return,
                 };
                 store::transcode::transcode_note_dir(dir);
@@ -3141,7 +3141,7 @@ mod tests {
         s3.refine_provider = "agent".into();
         assert!(!refine_llm_ready(&s3), "provider=agent 时不走 HTTP,即使三项齐全");
         s3.refine_provider = "bogus".into();
-        assert!(refine_llm_ready(&s3), "未知 provider 按默认 openai 对待,精修不哑掉");
+        assert!(refine_llm_ready(&s3), "未知 provider 按默认 openai 对待,Aing 不哑掉");
     }
 
     #[test]
@@ -3155,7 +3155,7 @@ mod tests {
         assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
     }
 
-    // resume_blocked_by_refining_matches_refining_set 已随精修集入内核而删除:
+    // resume_blocked_by_refining_matches_refining_set 已随 Aing 集入内核而删除:
     // 同一语义(按 id 查集合/不误伤其它笔记)由 lifecycle::machine 的
     // concurrent_refines_tracked_independently_by_id 与 RefineRequest 裁决表接管。
 

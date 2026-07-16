@@ -2,7 +2,7 @@
 //! 建不出托盘、切不了图标都不许影响录制/转写这些核心功能。
 //!
 //! 图标语义：菜单栏直接用 App Logo（戴眼镜的小姑娘拿笔记本）。空闲 = 静止 Logo；
-//! 录制中 = 逐帧循环的「疯狂记笔记」抖动动画；停止录制即静止（精修在后台安静进行，
+//! 录制中 = 逐帧循环的「疯狂记笔记」抖动动画；停止录制即静止（Aing 在后台安静进行，
 //! 不驱动图标——否则按了停止还在抖，像没停下）。图标是彩色 Logo，故全程非模板图
 //! （icon_as_template(false)）——macOS 模板会把颜色抹成单色。
 //!
@@ -26,7 +26,7 @@ pub(crate) const TRAY_ID: &str = "main-tray";
 
 /// 空闲静止帧。彩色 App Logo，非模板图。
 const IDLE_ICON: &[u8] = include_bytes!("../icons/tray-logo-idle.png");
-/// 录制/精修抖动帧（循环播放）。与 IDLE 同源 Logo，逐帧轻微旋转+位移。
+/// 录制/Aing 抖动帧（循环播放）。与 IDLE 同源 Logo，逐帧轻微旋转+位移。
 const REC_FRAMES: &[&[u8]] = &[
     include_bytes!("../icons/tray-logo-rec-0.png"),
     include_bytes!("../icons/tray-logo-rec-1.png"),
@@ -134,15 +134,15 @@ pub fn setup(app: &AppHandle) {
         return;
     }
     // 冷启动即在录制中（设置里现开托盘，或崩溃恢复）：立即进入抖动动画，
-    // 否则要等到下一次状态迁移才动。精修态冷启动不可达，无需处理。
+    // 否则要等到下一次状态迁移才动。Aing 态冷启动不可达，无需处理。
     if recording {
         start_anim(app);
     }
 }
 
 /// 会话录制态变化时刷新托盘**菜单**文案（开始/停止录制 + 模型就绪禁用位）。
-/// 图标不在此处理——图标（静止/抖动）由 `update` 按「录制 OR 精修」活跃度独立驱动，
-/// 避免会话钩子与精修钩子争抢同一图标。托盘不存在则 tray_by_id 为 None，静默跳过。
+/// 图标不在此处理——图标（静止/抖动）由 `update` 按「录制 OR Aing」活跃度独立驱动，
+/// 避免会话钩子与 Aing 钩子争抢同一图标。托盘不存在则 tray_by_id 为 None，静默跳过。
 ///
 /// P1 actor 改道后,本函数可能在 lifecycle-actor 线程上执行,而发起命令的主线程正阻塞
 /// 等待 actor 回复;托盘/菜单 API 内部是「派发到主线程并同步等结果」——此时同步等待即
@@ -171,9 +171,9 @@ fn set_menu_on_main(app: &AppHandle, recording: bool) {
 
 // —— 图标动画：仅录制中逐帧循环抖动，停止即静止 —— //
 
-/// 「活跃」= 会话正在录制。**只看录制**：停止录制通常紧接自动精修，若把精修也算
-/// 活跃，抖动会一路延续到精修结束——用户按了停止却还在抖，读起来像「没停下」。
-/// 故停录（会话离开 Recording）即停回静止 Logo，精修在后台安静进行、不再驱动图标。
+/// 「活跃」= 会话正在录制。**只看录制**：停止录制通常紧接自动 Aing，若把 Aing 也算
+/// 活跃，抖动会一路延续到 Aing 结束——用户按了停止却还在抖，读起来像「没停下」。
+/// 故停录（会话离开 Recording）即停回静止 Logo，Aing 在后台安静进行、不再驱动图标。
 fn is_active(s: &LifecycleState) -> bool {
     matches!(s.session, SessionState::Recording { .. })
 }

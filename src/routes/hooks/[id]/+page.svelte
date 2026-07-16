@@ -205,7 +205,7 @@
       <label class="row">
         <div class="row-info">
           <span class="row-label">附带笔记内容</span>
-          <span class="row-desc">把笔记详情与全文交给命令/接口,精修稿优先;想要精修全文请挂「精修完成」,变量清单见概览页</span>
+          <span class="row-desc">把笔记详情与全文交给命令/接口,修订稿优先;想要 Aing 全文请挂「Aing 完成」,变量清单见概览页</span>
         </div>
         <!-- 与启用开关不同:附带与否改变测试注入的内容,旧测试结果不再作数 -->
         <input
