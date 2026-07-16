@@ -91,3 +91,9 @@ export function onModelDownload(cb: (e: ModelDownloadEvent) => void) {
 export function onMigrate(cb: (e: MigrateEvent) => void) {
   return listen<MigrateEvent>("migrate", (ev) => cb(ev.payload));
 }
+// —— 外部集成配置测试(失败时命令 reject,前端 catch 出归类原因) ——
+export const testRefineLlm = (baseUrl: string, model: string, apiKey: string) =>
+  invoke<string>("test_refine_llm", { baseUrl, model, apiKey });
+export const testRefineAgent = (provider: string, bin: string, model: string) =>
+  invoke<string>("test_refine_agent", { provider, bin, model });
+export const testMirror = (prefix: string) => invoke<string>("test_mirror", { prefix });

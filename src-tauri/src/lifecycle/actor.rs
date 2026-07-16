@@ -602,6 +602,9 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                 // 状态(session+refine 两维)——精修开始/完成也是白名单事件。
                 // 映射是纯内存比较,无事件零开销;执行在 dispatch 内起线程,不占 actor。
                 crate::hooks_external::dispatch(&app, &state, &commit);
+                // 托盘图标动画:录制中抖动、停止即静止(精修在后台不驱动图标)。与 HookBus
+                // (只驱动菜单文案)分工——图标由本调用按会话状态边沿驱动。
+                crate::tray::update(&app, &state, &commit);
                 state = commit;
                 if let Some(r) = reply {
                     let _ = r.send(result);
