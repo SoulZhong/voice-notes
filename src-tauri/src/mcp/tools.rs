@@ -53,7 +53,7 @@ pub fn list_notes(
                 .and_then(|text| serde_json::from_str::<BTreeMap<String, SpeakerMeta>>(&text).ok())
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let has_refined = dir.join("refined.json").exists();
+            let has_refined = store::aing_exists(&dir);
             serde_json::json!({
                 "id": n.id, "title": n.title, "started_at": n.started_at,
                 "duration_secs": n.duration_secs, "state": n.state,
@@ -166,7 +166,7 @@ pub fn apply_refined_texts(
         NoteStore::new(notes_dir(roots)).load(note_id)?;
         let dir = notes_dir(roots).join(note_id);
         anyhow::ensure!(
-            dir.join("refined.json").exists(),
+            store::aing_exists(&dir),
             "该笔记还没有修订稿:请先在 App 里完成一次 Aing(或等停止录制后自动 Aing),再写回修订"
         );
         let updated = store::apply_refined_texts(&dir, updates, model)?;
@@ -278,8 +278,9 @@ mod tests {
                 schema_version: 1,
                 generated_at: "2026-03-01T11:00:00+08:00".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -288,6 +289,7 @@ mod tests {
                     end_ms: 1000,
                     text: "Aing 句".into(),
                     source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )
@@ -347,8 +349,9 @@ mod tests {
                 schema_version: 1,
                 generated_at: "2026-01-01T11:00:00+08:00".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -357,6 +360,7 @@ mod tests {
                     end_ms: 1000,
                     text: "Aing 句".into(),
                     source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )
@@ -398,11 +402,13 @@ mod tests {
                 schema_version: 1,
                 generated_at: "t".into(),
                 llm_model: None,
-                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+                stages: store::RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
                 discarded_seqs: vec![],
+                entities: vec![],
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(), name: Some("张三".into()), person_id: None,
                     start_ms: 0, end_ms: 1000, text: "我们肯计要做".into(), source_seqs: vec![0],
+                    mentions: vec![],
                 }],
             },
         )

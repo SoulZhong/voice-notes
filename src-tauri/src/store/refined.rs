@@ -5,6 +5,37 @@ use std::path::Path;
 
 pub const REFINED_SCHEMA_VERSION: u32 = 1;
 
+/// 每笔记修订稿产物文件名(人读真值)。
+pub const AING_DOC_FILE: &str = "aing.json";
+/// 旧文件名:一次性迁移到 `AING_DOC_FILE`,迁移后保留供回滚。
+pub const LEGACY_REFINED_FILE: &str = "refined.json";
+
+fn stage_off() -> String {
+    "off".into()
+}
+
+/// 实体在段落正文中的一次提及(笔记页高亮 + 图谱建边用)。`start`/`end` 是本段
+/// `text` 的字符(char)下标,半开区间 [start, end);`entity` 引用本篇
+/// `RefinedDoc.entities[].id`。Plan 3 由大模型产出,本 plan 恒为空。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Mention {
+    pub entity: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// 本篇出现的一个实体(人读真值;全局知识图谱由所有 aing.json 派生、可整库重建)。
+/// `id`:人实体复用全局 `person_id`(P<n>),非人实体为新分配 `ent_id`。
+/// `kind`:person/org/project/term/decision/task/place/date… 用字符串免枚举迁移。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Entity {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefinedParagraph {
     pub speaker: String,
@@ -18,6 +49,9 @@ pub struct RefinedParagraph {
     pub end_ms: u64,
     pub text: String,
     pub source_seqs: Vec<u64>,
+    /// 本段实体提及区间(Plan 3 填,本 plan 恒空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +59,9 @@ pub struct RefineStages {
     pub filter: String,
     pub recluster: String,
     pub llm: String,
+    /// 实体抽取阶段:off/running/done/partial/failed(Plan 3 用,本 plan 恒 off)。
+    #[serde(default = "stage_off")]
+    pub entities: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,19 +73,35 @@ pub struct RefinedDoc {
     pub stages: RefineStages,
     #[serde(default)]
     pub discarded_seqs: Vec<u64>,
+    /// 本篇实体清单(Plan 3 填,本 plan 恒空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<Entity>,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
 pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
-    let tmp = note_dir.join("refined.json.tmp");
+    let tmp = note_dir.join("aing.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(doc)?)?;
-    std::fs::rename(&tmp, note_dir.join("refined.json"))?;
+    std::fs::rename(&tmp, note_dir.join(AING_DOC_FILE))?;
     Ok(())
 }
 
+/// 读修订稿:优先 `aing.json`;缺失时从旧 `refined.json` 一次性迁移(读旧格式→写
+/// aing.json,旧文件保留供回滚)。两者皆无或损坏 → None(UI 回落原始逐字稿)。
 pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
-    let bytes = std::fs::read(note_dir.join("refined.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    if let Ok(bytes) = std::fs::read(note_dir.join(AING_DOC_FILE)) {
+        return serde_json::from_slice(&bytes).ok();
+    }
+    let bytes = std::fs::read(note_dir.join(LEGACY_REFINED_FILE)).ok()?;
+    let doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+    // 迁移落盘;失败不致命(下次加载再试),旧文件不删
+    let _ = write_refined_atomic(note_dir, &doc);
+    Some(doc)
+}
+
+/// aing.json 或旧 refined.json 是否存在(供「是否有修订稿」判断,迁移感知)。
+pub fn aing_exists(note_dir: &Path) -> bool {
+    note_dir.join(AING_DOC_FILE).exists() || note_dir.join(LEGACY_REFINED_FILE).exists()
 }
 
 /// refined.json 编辑锁:改名/关联是 read-modify-write,无互斥的并发调用会互相覆盖
@@ -171,11 +224,13 @@ mod tests {
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
             llm_model: Some("deepseek-chat".into()),
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![1, 2],
+            entities: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
+                mentions: vec![],
             }],
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
@@ -184,8 +239,111 @@ mod tests {
         assert_eq!(got.discarded_seqs, vec![1, 2]);
         assert_eq!(got.paragraphs[0].name.as_deref(), Some("张三"));
         assert_eq!(got.paragraphs[0].person_id.as_deref(), Some("P1"));
-        std::fs::write(dir.path().join("refined.json"), "{broken").unwrap();
+        std::fs::write(dir.path().join(AING_DOC_FILE), "{broken").unwrap();
         assert!(load_refined(dir.path()).is_none(), "损坏返回 None 不 panic");
+    }
+
+    #[test]
+    fn legacy_refined_json_migrates_to_aing_json_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // 只有旧 refined.json,没有 aing.json
+        let legacy = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-01T09:00:00+08:00",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "S1", "start_ms": 0, "end_ms": 500, "text": "旧稿", "source_seqs": [0] }
+            ]
+        }"#;
+        std::fs::write(dir.path().join("refined.json"), legacy).unwrap();
+        assert!(!dir.path().join("aing.json").exists());
+
+        let doc = load_refined(dir.path()).expect("应从旧 refined.json 迁移出");
+        assert_eq!(doc.paragraphs[0].text, "旧稿");
+        // 迁移把 aing.json 落盘,旧文件保留供回滚
+        assert!(dir.path().join("aing.json").exists(), "迁移应写出 aing.json");
+        assert!(dir.path().join("refined.json").exists(), "旧文件保留");
+    }
+
+    #[test]
+    fn aing_json_takes_precedence_over_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |text: &str| format!(
+            r#"{{"schema_version":1,"generated_at":"t","stages":{{"filter":"done","recluster":"done","llm":"done"}},"discarded_seqs":[],"paragraphs":[{{"speaker":"S1","start_ms":0,"end_ms":1,"text":"{text}","source_seqs":[0]}}]}}"#
+        );
+        std::fs::write(dir.path().join("aing.json"), mk("新稿")).unwrap();
+        std::fs::write(dir.path().join("refined.json"), mk("旧稿")).unwrap();
+        assert_eq!(load_refined(dir.path()).unwrap().paragraphs[0].text, "新稿");
+    }
+
+    #[test]
+    fn aing_exists_considers_both_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!aing_exists(dir.path()));
+        std::fs::write(dir.path().join("refined.json"), "{}").unwrap();
+        assert!(aing_exists(dir.path()), "只有旧文件也算有");
+        std::fs::remove_file(dir.path().join("refined.json")).unwrap();
+        std::fs::write(dir.path().join("aing.json"), "{}").unwrap();
+        assert!(aing_exists(dir.path()));
+    }
+
+    #[test]
+    fn aing_fields_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = RefinedDoc {
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "2026-07-16T10:00:00+08:00".into(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+            },
+            discarded_seqs: vec![],
+            entities: vec![Entity {
+                id: "ent_1".into(),
+                kind: "project".into(),
+                name: "灯塔计划".into(),
+                aliases: vec!["Lighthouse".into()],
+            }],
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "灯塔计划下周启动".into(),
+                source_seqs: vec![0],
+                mentions: vec![Mention { entity: "ent_1".into(), start: 0, end: 4 }],
+            }],
+        };
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        let back = load_refined(dir.path()).unwrap();
+        assert_eq!(back.entities, doc.entities);
+        assert_eq!(back.paragraphs[0].mentions, doc.paragraphs[0].mentions);
+        assert_eq!(back.stages.entities, "off");
+    }
+
+    #[test]
+    fn old_doc_without_aing_fields_still_loads_with_empty_defaults() {
+        // 旧 refined.json:没有 entities / mentions / stages.entities 键
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-01T09:00:00+08:00",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "S1", "start_ms": 0, "end_ms": 500, "text": "你好", "source_seqs": [0] }
+            ]
+        }"#;
+        std::fs::write(dir.path().join("refined.json"), old).unwrap();
+        let doc = load_refined(dir.path()).expect("旧结构应能加载");
+        assert!(doc.entities.is_empty());
+        assert!(doc.paragraphs[0].mentions.is_empty());
+        assert_eq!(doc.stages.entities, "off", "缺 stages.entities 键默认 off");
     }
 
     /// 旧版 refined.json(无 person_id 字段)必须照常解析——字段缺省为 None。
@@ -213,6 +371,7 @@ mod tests {
             end_ms: start + 1000,
             text: "内容。".into(),
             source_seqs: vec![start / 1000],
+            mentions: vec![],
         }
     }
 
@@ -221,8 +380,9 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -322,8 +482,9 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
             discarded_seqs: vec![],
+            entities: vec![],
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留
