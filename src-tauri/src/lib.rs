@@ -1566,6 +1566,126 @@ fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, Str
     Ok(out)
 }
 
+/// 图谱全部实体(列表视图),按出现笔记数降序。图谱失败/空 → 空列表,不 Err。
+#[tauri::command]
+fn graph_entities(app: AppHandle) -> Result<Vec<ipc::EntitySummary>, String> {
+    let Ok(root) = data_root(&app) else { return Ok(vec![]) };
+    let rows = match graph::list_entities(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("graph_entities: 查询失败,返回空: {e}");
+            return Ok(vec![]);
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| ipc::EntitySummary {
+            id: r.id,
+            kind: r.kind,
+            name: r.name,
+            aliases: r.aliases,
+            is_person: r.is_person,
+            note_count: r.note_count,
+            mention_total: r.mention_total,
+        })
+        .collect())
+}
+
+/// 力导图数据:节点(全部实体)+ 共现边。任一子查询失败 → 该部分空,整体不 Err。
+#[tauri::command]
+fn graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
+    let Ok(root) = data_root(&app) else { return Ok(ipc::GraphData { nodes: vec![], edges: vec![] }) };
+    let nodes = graph::list_entities(&root)
+        .unwrap_or_else(|e| {
+            eprintln!("graph_data: 实体查询失败,返回空: {e}");
+            vec![]
+        })
+        .into_iter()
+        .map(|r| ipc::EntitySummary {
+            id: r.id,
+            kind: r.kind,
+            name: r.name,
+            aliases: r.aliases,
+            is_person: r.is_person,
+            note_count: r.note_count,
+            mention_total: r.mention_total,
+        })
+        .collect();
+    let edges = graph::cooccurrence_edges(&root)
+        .unwrap_or_else(|e| {
+            eprintln!("graph_data: 共现边查询失败,返回空: {e}");
+            vec![]
+        })
+        .into_iter()
+        .map(|(a, b, weight)| ipc::EdgeRow { a, b, weight })
+        .collect();
+    Ok(ipc::GraphData { nodes, edges })
+}
+
+/// 单个实体详情(右侧面板)。实体不存在/图谱失败 → None,不 Err。
+#[tauri::command]
+fn entity_detail(app: AppHandle, id: String) -> Result<Option<ipc::EntityDetail>, String> {
+    let Ok(root) = data_root(&app) else { return Ok(None) };
+    let detail = match graph::entity_detail(&root, &id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("entity_detail: 查询失败,返回 None: {e}");
+            return Ok(None);
+        }
+    };
+    let Some(d) = detail else { return Ok(None) };
+    // 联查笔记标题(NoteStore.list);查不到标题的笔记跳过
+    let by_id: std::collections::HashMap<String, store::NoteSummary> = match notes_dir(&app) {
+        Ok(nr) => store::NoteStore::new(nr).list().into_iter().map(|n| (n.id.clone(), n)).collect(),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    let notes = d
+        .notes
+        .into_iter()
+        .filter_map(|(nid, cnt)| {
+            by_id.get(&nid).map(|n| ipc::EntityNoteRef {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                started_at: n.started_at.clone(),
+                mention_count: cnt,
+            })
+        })
+        .collect();
+    let related = d
+        .related
+        .into_iter()
+        .map(|r| ipc::RelatedEntity { id: r.id, kind: r.kind, name: r.name, shared_notes: r.shared_notes })
+        .collect();
+    Ok(Some(ipc::EntityDetail {
+        id: d.row.id,
+        kind: d.row.kind,
+        name: d.row.name,
+        aliases: d.row.aliases,
+        is_person: d.row.is_person,
+        note_count: d.row.note_count,
+        mention_total: d.row.mention_total,
+        notes,
+        related,
+    }))
+}
+
+/// 笔记页高亮点击导航:该笔记局部实体 → 全局 id(+是否人)。失败/无实体 → 空。
+#[tauri::command]
+fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let Ok(root) = data_root(&app) else { return Ok(vec![]) };
+    match graph::resolve_local_ids(&root, &id) {
+        Ok(v) => Ok(v
+            .into_iter()
+            .map(|(local_id, global_id, is_person)| ipc::EntityLink { local_id, global_id, is_person })
+            .collect()),
+        Err(e) => {
+            eprintln!("note_entity_links: 解析失败,返回空: {e}");
+            Ok(vec![])
+        }
+    }
+}
+
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
 /// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
 #[tauri::command]
@@ -3053,6 +3173,10 @@ pub fn run() {
             assign_note_speaker_person,
             person_notes,
             note_related,
+            graph_entities,
+            graph_data,
+            entity_detail,
+            note_entity_links,
             note_audio_info,
             rename_note,
             delete_note,

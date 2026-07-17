@@ -63,6 +63,24 @@ pub(crate) fn resolve_global_id(vp: &store::Voiceprints, e: &store::Entity) -> (
     (format!("e:{}", norm(&e.name)), false)
 }
 
+/// 把一篇笔记 aing.json 里的局部实体(ent_N)逐个解析成全局 id,供笔记页高亮点击导航用。
+/// 无 aing.json/无实体 → 空;名为空的实体跳过。读盘失败不 panic(load_refined 返回 None)。
+pub(crate) fn resolve_local_ids(data_root: &Path, note_id: &str) -> anyhow::Result<Vec<(String, String, bool)>> {
+    store::validate_note_id(note_id)?;
+    let dir = data_root.join("notes").join(note_id);
+    let Some(doc) = store::load_refined(&dir) else { return Ok(Vec::new()) };
+    let vp = store::VoiceprintStore::new(data_root.to_path_buf()).load();
+    Ok(doc
+        .entities
+        .iter()
+        .filter(|e| !e.name.trim().is_empty())
+        .map(|e| {
+            let (gid, is_person) = resolve_global_id(&vp, e);
+            (e.id.clone(), gid, is_person)
+        })
+        .collect())
+}
+
 /// 把一篇笔记的实体/提及写入图谱:整篇替换该笔记的边(先删后插,幂等)。
 /// 调用方负责"失败只 eprintln,不打断 Aing"。
 pub(crate) fn upsert_note(data_root: &Path, note_id: &str, doc: &store::RefinedDoc) -> anyhow::Result<()> {
@@ -161,6 +179,23 @@ pub(crate) struct EntityRow {
     pub mention_total: i64,
 }
 
+/// 与某实体共现的实体(实体详情面板「相关实体」用)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CoEntity {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub shared_notes: i64,
+}
+
+/// 单个实体的详情:聚合行 + 出现笔记(含提及数)+ 共现实体。
+#[derive(Debug, Clone)]
+pub(crate) struct EntityDetail {
+    pub row: EntityRow,
+    pub notes: Vec<(String, i64)>,
+    pub related: Vec<CoEntity>,
+}
+
 /// 列全部有边的实体,按出现笔记数降序(孤儿实体——无边——不列)。
 pub(crate) fn list_entities(data_root: &Path) -> anyhow::Result<Vec<EntityRow>> {
     let conn = open(data_root)?;
@@ -212,6 +247,76 @@ pub(crate) fn related_notes(data_root: &Path, note_id: &str) -> anyhow::Result<V
         .query_map([note_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 实体共现边:两实体在同一笔记出现即连边,边权 = 共同出现的笔记数。`a < b` 去重,
+/// 降序返回。力导图用。孤立实体(无任何共现)不产生边,由列表视图承载。
+pub(crate) fn cooccurrence_edges(data_root: &Path) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT ne1.entity_id, ne2.entity_id, COUNT(DISTINCT ne1.note_id) AS shared
+         FROM note_entities ne1
+         JOIN note_entities ne2 ON ne1.note_id = ne2.note_id AND ne1.entity_id < ne2.entity_id
+         GROUP BY ne1.entity_id, ne2.entity_id
+         ORDER BY shared DESC, ne1.entity_id ASC, ne2.entity_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 查单个实体详情。实体不存在 → Ok(None)。只读,不加锁。
+pub(crate) fn entity_detail(data_root: &Path, gid: &str) -> anyhow::Result<Option<EntityDetail>> {
+    let conn = open(data_root)?;
+    // 基本聚合行(LEFT JOIN 容错;正常每实体都有边)
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.kind, e.name, e.aliases, e.is_person,
+                COUNT(ne.note_id), COALESCE(SUM(ne.mention_count),0)
+         FROM entities e LEFT JOIN note_entities ne ON e.id = ne.entity_id
+         WHERE e.id = ?1 GROUP BY e.id",
+    )?;
+    let row = stmt
+        .query_map([gid], |r| {
+            let aliases_json: String = r.get(3)?;
+            Ok(EntityRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                name: r.get(2)?,
+                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+                is_person: r.get::<_, i64>(4)? != 0,
+                note_count: r.get(5)?,
+                mention_total: r.get(6)?,
+            })
+        })?
+        .next()
+        .transpose()?;
+    let Some(row) = row else { return Ok(None) };
+    drop(stmt);
+    // 出现笔记(提及降序)
+    let mut s2 = conn.prepare(
+        "SELECT note_id, mention_count FROM note_entities WHERE entity_id = ?1
+         ORDER BY mention_count DESC, note_id ASC",
+    )?;
+    let notes = s2
+        .query_map([gid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(s2);
+    // 共现实体(共享笔记数降序)
+    let mut s3 = conn.prepare(
+        "SELECT e2.id, e2.kind, e2.name, COUNT(DISTINCT ne1.note_id) AS shared
+         FROM note_entities ne1
+         JOIN note_entities ne2 ON ne1.note_id = ne2.note_id AND ne2.entity_id != ne1.entity_id
+         JOIN entities e2 ON e2.id = ne2.entity_id
+         WHERE ne1.entity_id = ?1
+         GROUP BY e2.id ORDER BY shared DESC, e2.name ASC",
+    )?;
+    let related = s3
+        .query_map([gid], |r| {
+            Ok(CoEntity { id: r.get(0)?, kind: r.get(1)?, name: r.get(2)?, shared_notes: r.get(3)? })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(EntityDetail { row, notes, related }))
 }
 
 #[cfg(test)]
@@ -378,5 +483,68 @@ mod tests {
         // 再开一次不报错(IF NOT EXISTS)
         let _ = open(dir.path()).unwrap();
         assert!(dir.path().join("graph.sqlite").exists());
+    }
+
+    #[test]
+    fn cooccurrence_edges_dedup_and_weight() {
+        let root = tempfile::tempdir().unwrap();
+        // 每篇给一组实体(各一次提及);n1/n2={A,B},n3={A,C}
+        let mk = |names: &[&str]| doc_with(
+            names.iter().enumerate().map(|(i, nm)| ent(&format!("ent_{}", i + 1), "term", nm, &[])).collect(),
+            vec![para("x", vec![])],
+        );
+        upsert_note(root.path(), "n1", &mk(&["A", "B"])).unwrap();
+        upsert_note(root.path(), "n2", &mk(&["A", "B"])).unwrap();
+        upsert_note(root.path(), "n3", &mk(&["A", "C"])).unwrap();
+        let edges = cooccurrence_edges(root.path()).unwrap();
+        // (e:a,e:b) 共现 2 篇;(e:a,e:c) 共现 1 篇;B、C 从不共现
+        assert!(edges.iter().any(|(a, b, w)| a == "e:a" && b == "e:b" && *w == 2), "A,B 共享 2");
+        assert!(edges.iter().any(|(a, b, w)| a == "e:a" && b == "e:c" && *w == 1), "A,C 共享 1");
+        assert!(!edges.iter().any(|(a, b, _)| (a == "e:b" && b == "e:c") || (a == "e:c" && b == "e:b")), "B,C 不共现");
+        assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重,不出现反向对");
+    }
+
+    #[test]
+    fn entity_detail_aggregates_notes_and_related() {
+        let root = tempfile::tempdir().unwrap();
+        // n1={A(2 提及),B};n2={A(1 提及),C}
+        let mk = |names: &[&str], a_mentions: usize| {
+            let ents: Vec<_> = names.iter().enumerate()
+                .map(|(i, nm)| ent(&format!("ent_{}", i + 1), "term", nm, &[])).collect();
+            let ms = (0..a_mentions).map(|_| Mention { entity: "ent_1".into(), start: 0, end: 1 }).collect();
+            doc_with(ents, vec![para("x", ms)])
+        };
+        upsert_note(root.path(), "n1", &mk(&["A", "B"], 2)).unwrap();
+        upsert_note(root.path(), "n2", &mk(&["A", "C"], 1)).unwrap();
+
+        let d = entity_detail(root.path(), "e:a").unwrap().expect("A 存在");
+        assert_eq!(d.row.note_count, 2, "出现在 2 篇");
+        assert_eq!(d.row.mention_total, 3, "提及 2+1");
+        assert_eq!(d.notes.len(), 2);
+        assert_eq!(d.notes[0].1, 2, "提及最多的笔记排前(n1=2)");
+        let rel: Vec<&str> = d.related.iter().map(|r| r.name.as_str()).collect();
+        assert!(rel.contains(&"B") && rel.contains(&"C"), "共现 B 与 C");
+        assert!(d.related.iter().all(|r| r.shared_notes == 1), "各共享 1 篇");
+        assert!(entity_detail(root.path(), "e:zzz").unwrap().is_none(), "不存在实体 → None");
+    }
+
+    #[test]
+    fn resolve_local_ids_maps_person_and_nonperson() {
+        let root = tempfile::tempdir().unwrap();
+        write_vp(root.path(), r#"{"schema_version":1,"next_person":2,"people":{"P1":{"name":"张三"}}}"#);
+        let d = doc_with(
+            vec![
+                ent("ent_1", "person", "张三", &[]),
+                ent("ent_2", "project", "灯塔计划", &[]),
+                ent("ent_3", "person", "李四", &[]),
+            ],
+            vec![para("张三推进灯塔计划,李四列席", vec![])],
+        );
+        write_note(root.path(), "n1", &d);
+        let links = resolve_local_ids(root.path(), "n1").unwrap();
+        assert!(links.iter().any(|(l, g, p)| l == "ent_1" && g == "P1" && *p), "张三→P1 人");
+        assert!(links.iter().any(|(l, g, p)| l == "ent_2" && g == "e:灯塔计划" && !*p), "灯塔计划→非人");
+        assert!(links.iter().any(|(l, g, p)| l == "ent_3" && g == "e:李四" && !*p), "李四无匹配→退化非人");
+        assert!(resolve_local_ids(root.path(), "no-such-note").unwrap().is_empty(), "无 aing.json → 空");
     }
 }
