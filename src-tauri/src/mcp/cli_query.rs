@@ -72,14 +72,16 @@ fn first_positional(args: &[String]) -> Option<String> {
     None
 }
 
-const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle> ...\n\
+const NOTES_USAGE: &str = "用法: voice-notes notes <list|search|get|retitle|reaing> ...\n\
   list    [--limit N] [--offset N] [--from RFC3339] [--to RFC3339] [--json]\n\
   search  <关键词> [--limit N] [--json]\n\
   get     <note-id> [--format md|txt|json] [--json]   # 默认 md;json = 逐句结构化;--json 是 --format json 的别名\n\
   get     … [--raw]  # 忽略修订稿,取原始逐字稿\n\
   retitle [--dry-run] [--agent claude|codex|gemini|cursor] [--model M]\n\
           # AI 为仍是默认标题的会议生成主题标题(手动命名的绝不动);\n\
-          # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI";
+          # 缺省按 App 设置选执行体,--agent 强制走本机 Agent CLI\n\
+  reaing  <note-id> | --all   # 触发「重新 Aing」(经运行中的 App,后台串行);\n\
+          # --all 跑所有未 Aing(无实体)的 complete 笔记;需在 AI 页开「允许 AI 控制录制」";
 
 pub fn notes_cli(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -89,6 +91,7 @@ pub fn notes_cli(args: &[String]) -> i32 {
         "search" => run_search(rest),
         "get" => run_get(rest),
         "retitle" => run_retitle(rest),
+        "reaing" => run_reaing(rest),
         _ => {
             eprintln!("{NOTES_USAGE}");
             return 2;
@@ -340,6 +343,39 @@ fn run_retitle(args: &[String]) -> Result<i32, String> {
     }
     println!("完成:改名 {renamed} 场,失败 {failed} 场,共 {} 场候选。", candidates.len());
     Ok(if failed == 0 { 0 } else { 1 })
+}
+
+/// `notes reaing <id> | --all`:经运行中的 App(UDS 桥)触发「重新 Aing」。单篇给 note-id;
+/// --all 让 App 把所有未 Aing(无实体)的 complete 笔记逐篇排队(AING_GATE 串行,不爆核)。
+/// 受 App 的「允许 AI 控制录制」门控;App 未运行则桥连失败。
+fn run_reaing(args: &[String]) -> Result<i32, String> {
+    reject_unknown_flags(args, &[], &["--all", "--json"])?;
+    let all = has_flag(args, "--all");
+    let id = first_positional(args);
+    if all == id.is_some() {
+        return Err("reaing 需要一个 note-id,或用 --all 跑所有未 Aing 的笔记(二者选一)".into());
+    }
+    let extra = match &id {
+        Some(id) => serde_json::json!({ "note_id": id }),
+        None => serde_json::json!({}),
+    };
+    match super::bridge::call("reaing", extra) {
+        Ok(v) => {
+            if has_flag(args, "--json") {
+                println!("{}", serde_json::to_string_pretty(&v).expect("响应序列化不会失败"));
+            } else {
+                let n = v.get("queued").and_then(|q| q.as_u64()).unwrap_or(0);
+                println!(
+                    "已排队 {n} 篇重新 Aing(经运行中的 App,后台串行处理;用 `voice-notes ailog list` 看进度)"
+                );
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("重新 Aing 失败: {e}");
+            Ok(1)
+        }
+    }
 }
 
 /// 标题素材:修订稿段落优先(错字已修、噪声已滤),没有修订稿用原始 segments
