@@ -16,6 +16,7 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
+  import { graphEntities, kindLabel, type EntitySummary } from "$lib/graph";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -26,13 +27,15 @@
   const tab = $derived(
     $page.url.pathname.startsWith("/speakers")
       ? "people"
-      : $page.url.pathname.startsWith("/hooks")
-        ? "hooks"
-        : $page.url.pathname.startsWith("/ai")
-          ? "ai"
-          : $page.url.pathname === "/settings"
-            ? "settings"
-            : "notes",
+      : $page.url.pathname.startsWith("/graph")
+        ? "graph"
+        : $page.url.pathname.startsWith("/hooks")
+          ? "hooks"
+          : $page.url.pathname.startsWith("/ai")
+            ? "ai"
+            : $page.url.pathname === "/settings"
+              ? "settings"
+              : "notes",
   );
 
   let people = $state<PersonSummary[]>([]);
@@ -81,6 +84,42 @@
       tidy.refresh();
     }
   });
+
+  // ── 图谱:实体列表作为主从结构的 master(搜索 + kind 过滤在侧栏,主区放详情面板)──
+  let graphEnts = $state<EntitySummary[]>([]);
+  let graphQuery = $state("");
+  let graphKind = $state("all");
+
+  async function refreshGraph() {
+    try {
+      graphEnts = await graphEntities();
+    } catch {
+      graphEnts = [];
+    }
+  }
+  $effect(() => {
+    if (tab === "graph") refreshGraph();
+  });
+
+  const graphKinds = $derived.by(() => {
+    const c = new Map<string, number>();
+    for (const e of graphEnts) c.set(e.kind, (c.get(e.kind) ?? 0) + 1);
+    return [...c.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  });
+  const graphShown = $derived(
+    graphEnts.filter((e) => {
+      if (graphKind !== "all" && e.kind !== graphKind) return false;
+      const q = graphQuery.trim().toLowerCase();
+      if (!q) return true;
+      return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
+    }),
+  );
+  const graphSelected = $derived($page.url.searchParams.get("e"));
+  function pickEntity(e: EntitySummary) {
+    // 人→会议搭子;非人→主区详情面板(经 query 深链,id 含冒号/中文需编码)。
+    if (e.is_person) goto("/speakers/" + e.id);
+    else goto("/graph?e=" + encodeURIComponent(e.id));
+  }
 
   // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
   const peopleSorted = $derived(
@@ -260,6 +299,11 @@
     >
     <button
       class="vtab"
+      class:active={tab === "graph"}
+      onclick={() => { if ($page.url.pathname !== "/graph") goto("/graph"); }}>图谱</button
+    >
+    <button
+      class="vtab"
       class:active={tab === "hooks"}
       onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
     >
@@ -371,6 +415,29 @@
           {@render personRow(p)}
         {/each}
       {/if}
+    </ul>
+  {:else if tab === "graph"}
+    <input class="search" type="search" placeholder="搜索实体…" bind:value={graphQuery} />
+    <div class="gchips">
+      <button class="gchip" class:on={graphKind === "all"} onclick={() => (graphKind = "all")}>全部</button>
+      {#each graphKinds as k (k)}
+        <button class="gchip" class:on={graphKind === k} onclick={() => (graphKind = k)}>{kindLabel(k)}</button>
+      {/each}
+    </div>
+    {#if graphShown.length === 0}
+      <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+    {/if}
+    <ul class="list">
+      {#each graphShown as e (e.id)}
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+        <li class="item" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
+          <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : 'var(--hairline-strong)'}"></span>
+          <div class="main-line">
+            <span class="title">{e.name}</span>
+            <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
+          </div>
+        </li>
+      {/each}
     </ul>
   {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
@@ -676,6 +743,27 @@
     background: var(--canvas);
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent);
+  }
+  /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
+  .gchips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 0.5rem;
+  }
+  .gchip {
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 0.72em;
+    font-weight: 500;
+    background: var(--surface-press);
+    color: var(--ink-secondary);
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .gchip.on {
+    background: var(--accent-tint);
+    color: var(--accent);
   }
   .list {
     list-style: none;
