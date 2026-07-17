@@ -124,6 +124,73 @@ pub struct RelatedNote {
     pub shared_entities: i64,
 }
 
+/// 图谱实体摘要(列表 / 力导图节点)。镜像 graph::EntityRow(后者无 Serialize)。
+#[derive(Debug, Clone, Serialize)]
+pub struct EntitySummary {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub is_person: bool,
+    pub note_count: i64,
+    pub mention_total: i64,
+}
+
+/// 力导图一条共现边(a<b,weight=共享笔记数)。
+#[derive(Debug, Clone, Serialize)]
+pub struct EdgeRow {
+    pub a: String,
+    pub b: String,
+    pub weight: i64,
+}
+
+/// 力导图数据:节点(全部实体)+ 边(共现)。
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphData {
+    pub nodes: Vec<EntitySummary>,
+    pub edges: Vec<EdgeRow>,
+}
+
+/// 实体详情面板里「出现的笔记」一项(联查了标题)。
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityNoteRef {
+    pub id: String,
+    pub title: String,
+    pub started_at: String,
+    pub mention_count: i64,
+}
+
+/// 实体详情面板里「相关(共现)实体」一项。
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedEntity {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub shared_notes: i64,
+}
+
+/// 实体详情(右侧面板)。
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityDetail {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub is_person: bool,
+    pub note_count: i64,
+    pub mention_total: i64,
+    pub notes: Vec<EntityNoteRef>,
+    pub related: Vec<RelatedEntity>,
+}
+
+/// 笔记页高亮点击导航:局部实体 id → 全局 id(+是否人实体)。
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityLink {
+    pub local_id: String,
+    pub global_id: String,
+    pub is_person: bool,
+}
+
 /// 整理·合并建议(suggest_person_merges 返回):把 loser 并入 winner 的推荐,
 /// 相似度是共有信道质心余弦的最大值;salience 是 S-Norm 显著性 z 分数(库太小
 /// 算不出分布时 None);name 空串=未命名(前端按「说话人 N」兜底)。
