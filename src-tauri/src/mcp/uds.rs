@@ -16,6 +16,8 @@ struct Req {
     title: Option<String>,
     #[serde(default)]
     tail: Option<usize>,
+    #[serde(default)]
+    note_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,13 +115,15 @@ trait UdsBackend {
     fn stop(&self) -> Result<serde_json::Value, String>;
     fn pause(&self) -> Result<serde_json::Value, String>;
     fn resume(&self) -> Result<serde_json::Value, String>;
+    /// 触发「重新 Aing」:Some(id)=单篇;None=全部未 Aing(entities 空)的 complete 笔记。
+    fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String>;
 }
 
 /// 策略层:控制类 op 统一先过门控(集中一处,新增控制 op 不会漏挂门控),再路由到
 /// backend;tail clamp 与 title trim 也在此,便于单测。未知 op 报错。
 fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
     let op = req.op.as_str();
-    if matches!(op, "start" | "stop" | "pause" | "resume") && !b.control_allowed() {
+    if matches!(op, "start" | "stop" | "pause" | "resume" | "reaing") && !b.control_allowed() {
         return err(CONTROL_DENIED);
     }
     let result = match op {
@@ -129,6 +133,7 @@ fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
         "stop" => b.stop(),
         "pause" => b.pause(),
         "resume" => b.resume(),
+        "reaing" => b.reaing(req.note_id.as_deref().map(str::trim).filter(|s| !s.is_empty())),
         other => return err(format!("未知 op: {other}")),
     };
     match result {
@@ -243,6 +248,44 @@ impl UdsBackend for AppBackend<'_> {
             .command(crate::lifecycle::Cmd::Unpause)?;
         Ok(status_json(self.0))
     }
+
+    fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String> {
+        let app = self.0;
+        // 与笔记页「重新 Aing」魔杖同路径:经 lifecycle actor 单写者投 RefineRequest,内核守卫
+        // 只放行 complete、非活动会话;spawn 后即返回,重活受 AING_GATE 串行闸约束(逐篇跑不爆核)。
+        let fire = |id: &str| -> Result<(), String> {
+            crate::store::validate_note_id(id).map_err(|e| e.to_string())?;
+            app.state::<crate::lifecycle::LifecycleHandle>()
+                .request(crate::lifecycle::machine::Msg::RefineRequest { note_id: id.to_string() })
+        };
+        match note_id {
+            Some(id) => {
+                fire(id)?;
+                Ok(serde_json::json!({ "queued": 1, "ids": [id] }))
+            }
+            None => {
+                // --all:所有「未 Aing」(aing.json 无 entities)的 complete 笔记逐篇排队;
+                // 活动会话由内核守卫挡下(fire 返 Err 即跳过),已 Aing 的直接跳过省钱。
+                let root = crate::notes_dir(app).map_err(|e| e.to_string())?;
+                let mut ids: Vec<String> = Vec::new();
+                for n in crate::store::NoteStore::new(root.clone()).list() {
+                    if n.state != "complete" {
+                        continue;
+                    }
+                    let has_entities = crate::store::load_refined(&root.join(&n.id))
+                        .map(|d| !d.entities.is_empty())
+                        .unwrap_or(false);
+                    if has_entities {
+                        continue;
+                    }
+                    if fire(&n.id).is_ok() {
+                        ids.push(n.id);
+                    }
+                }
+                Ok(serde_json::json!({ "queued": ids.len(), "ids": ids }))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -294,16 +337,20 @@ mod tests {
             self.log("resume");
             Ok(serde_json::json!({ "state": "recording" }))
         }
+        fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String> {
+            self.log(format!("reaing:{note_id:?}"));
+            Ok(serde_json::json!({ "queued": note_id.map(|_| 1).unwrap_or(0) }))
+        }
     }
 
     fn req(op: &str) -> Req {
-        Req { op: op.into(), title: None, tail: None }
+        Req { op: op.into(), title: None, tail: None, note_id: None }
     }
 
     #[test]
     fn control_ops_gated_when_disabled() {
         let b = MockBackend::new(false);
-        for op in ["start", "stop", "pause", "resume"] {
+        for op in ["start", "stop", "pause", "resume", "reaing"] {
             let r = dispatch_with(&b, &req(op));
             assert!(!r.ok, "{op} 应被门控拒绝");
             assert_eq!(r.error.as_deref(), Some(CONTROL_DENIED));
@@ -316,25 +363,26 @@ mod tests {
     fn query_ops_not_gated() {
         let b = MockBackend::new(false); // 即便控制关
         assert!(dispatch_with(&b, &req("status")).ok, "status 不受门控");
-        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None }).ok, "live 不受门控");
+        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None }).ok, "live 不受门控");
         assert!(b.called("status") && b.called("live:50"));
     }
 
     #[test]
     fn control_ops_routed_when_enabled() {
         let b = MockBackend::new(true);
-        for op in ["start", "stop", "pause", "resume"] {
+        for op in ["start", "stop", "pause", "resume", "reaing"] {
             assert!(dispatch_with(&b, &req(op)).ok, "{op} 门控开时应放行");
         }
         assert!(b.called("start:None") && b.called("stop") && b.called("pause") && b.called("resume"));
+        assert!(b.called("reaing:None"), "reaing 门控开时应路由到 backend");
     }
 
     #[test]
     fn live_tail_clamped_and_defaulted() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000) });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0) });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000), note_id: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0), note_id: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None });
         assert!(b.called("live:500"), "上限 500");
         assert!(b.called("live:1"), "下限 1");
         assert!(b.called("live:50"), "缺省 50");
@@ -343,8 +391,8 @@ mod tests {
     #[test]
     fn start_title_trimmed() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None });
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None, note_id: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None, note_id: None });
         assert!(b.called("start:Some(\"评审会\")"), "两端空白应 trim: {:?}", b.calls.borrow());
         assert!(b.called("start:None"), "纯空白 title → None");
     }
