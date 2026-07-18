@@ -698,8 +698,9 @@
   .item.overview:hover .overview-icon {
     color: var(--ink-secondary);
   }
-  /* 全局图谱固定行:轻量文字链接(ink-faint 图标 + ink-secondary 字),只有 hover 才
-     着色/变深——常驻实底会比录制药丸还抢眼,故不借用 .item.current 那套高亮。 */
+  /* 全局图谱固定行:描边"幽灵按钮"(hairline 边框 + 透明底),既不像 .item.current
+     那样常驻实底抢戏,又靠边框把"这是可点的东西"的信号亮出来——纯文字链接(上一版)
+     太朴素,用户反馈看不出能点。 */
   .graph-global {
     display: flex;
     align-items: center;
@@ -707,8 +708,8 @@
     width: 100%;
     box-sizing: border-box;
     margin: 0.7rem 0 0.15rem;
-    padding: 0.3rem 0.5rem;
-    border: none;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--hairline);
     border-radius: var(--radius-md);
     background: transparent;
     font: inherit;
@@ -721,6 +722,7 @@
   .graph-global:hover {
     background: var(--surface-soft);
     color: var(--ink);
+    border-color: var(--hairline-strong);
   }
   .graph-global-icon {
     flex: none;
