@@ -85,3 +85,13 @@ export const graphData = () => invoke<GraphData>("graph_data");
 export const entityDetail = (id: string) => invoke<EntityDetail | null>("entity_detail", { id });
 /** 笔记局部实体→全局 id(Plan C 笔记页)。 */
 export const noteEntityLinks = (id: string) => invoke<EntityLink[]>("note_entity_links", { id });
+
+/** 改实体名结果:new_id=改后的规范 id(人实体不变);merged=撞已存在实体自动合并了。 */
+export interface RenameEntityResult {
+  new_id: string;
+  merged: boolean;
+}
+/** 改实体显示名(纠 ASR 提取错的名字)。人实体委托声纹库、id 不变;非人实体 id 随名字
+    重算,撞已存在实体自动合并。 */
+export const renameEntity = (id: string, newName: string) =>
+  invoke<RenameEntityResult>("rename_entity", { id, newName });

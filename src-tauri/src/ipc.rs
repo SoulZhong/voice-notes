@@ -191,6 +191,14 @@ pub struct EntityLink {
     pub is_person: bool,
 }
 
+/// 实体改名结果:new_id 是改名后的规范 id(人实体不变,非人随名字重算);
+/// merged=true 表示撞上已存在的同名实体,已自动合并。
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameEntityResult {
+    pub new_id: String,
+    pub merged: bool,
+}
+
 /// 整理·合并建议(suggest_person_merges 返回):把 loser 并入 winner 的推荐,
 /// 相似度是共有信道质心余弦的最大值;salience 是 S-Norm 显著性 z 分数(库太小
 /// 算不出分布时 None);name 空串=未命名(前端按「说话人 N」兜底)。

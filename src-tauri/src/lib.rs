@@ -1686,6 +1686,16 @@ fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>,
     }
 }
 
+/// 改实体显示名。很多录音提取的名字不对(ASR 同音异写),这是纠错入口——与查询类命令不同,
+/// 这是写操作,失败要如实报给用户(不能静默降级)。人实体委托声纹库改名(id 不变);非人
+/// 实体 id 随名字重算,撞已存在实体自动合并。
+#[tauri::command]
+fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let outcome = graph::rename_entity(&root, &id, &new_name).map_err(|e| e.to_string())?;
+    Ok(ipc::RenameEntityResult { new_id: outcome.new_id, merged: outcome.merged })
+}
+
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
 /// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
 #[tauri::command]
@@ -3177,6 +3187,7 @@ pub fn run() {
             graph_data,
             entity_detail,
             note_entity_links,
+            rename_entity,
             note_audio_info,
             rename_note,
             delete_note,
