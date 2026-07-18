@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, entityDetail, renameEntity, kindLabel, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
+  import { graphData, entityDetail, renameEntity, kindLabel, kindInk, kindSoft, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { formatDate } from "$lib/notes";
   import ForceGraph from "$lib/ForceGraph.svelte";
 
@@ -196,7 +196,7 @@
                视觉上跟名字脱节,看不出改的是谁) -->
           <button class="d-rename-btn" onclick={() => startRename(d)} title="改名(纠正提取错误)">改名</button>
         {/if}
-        <span class="kind">{kindLabel(detail.kind)}</span>
+        <span class="kind" style="background:{kindSoft(detail.kind)}; color:{kindInk(detail.kind)}">{kindLabel(detail.kind)}</span>
       </div>
       {#if renameErr}
         <p class="d-rename-err">{renameErr}</p>

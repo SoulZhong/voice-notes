@@ -77,6 +77,47 @@ export function kindLabel(kind: string): string {
   return KIND_LABELS[kind] ?? kind;
 }
 
+// kind 分类色(与 ForceGraph.svelte 节点色同一份定义,原先只在那一处内联,侧栏 kind
+// 过滤药丸/实体列表色点/详情面板 kind 徽章各画各的没对上号——现在唯一真值源在这里,
+// 谁要给 kind 上色都从这两个函数取,保证跟力导图上的圆圈永远同色。
+const KIND_INKS = [
+  "var(--tint-sky-ink)",
+  "var(--tint-mint-ink)",
+  "var(--tint-peach-ink)",
+  "var(--tint-lavender-ink)",
+  "var(--tint-rose-ink)",
+  "var(--tint-yellow-ink)",
+  "var(--tint-gray-ink)",
+];
+const KIND_SOFTS = [
+  "var(--tint-sky)",
+  "var(--tint-mint)",
+  "var(--tint-peach)",
+  "var(--tint-lavender)",
+  "var(--tint-rose)",
+  "var(--tint-yellow)",
+  "var(--tint-gray)",
+];
+const KIND_ORDER = ["person", "term", "org", "project", "product", "decision", "task", "place", "date"];
+function kindIdx(kind: string): number {
+  let idx = KIND_ORDER.indexOf(kind);
+  if (idx < 0) {
+    let h = 0;
+    for (const c of kind) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    idx = h;
+  }
+  return idx % KIND_INKS.length;
+}
+/** kind→饱和字色(力导图节点填色同款;人实体在图上另走 speakerInk 个体色,这里给的是
+    「人」这个分类本身的代表色,用于过滤药丸/徽章等类别级别的展示)。 */
+export function kindInk(kind: string): string {
+  return KIND_INKS[kindIdx(kind)];
+}
+/** kind→15% alpha 软底(配 kindInk 同色相文字,标准 soft 徽标公式)。 */
+export function kindSoft(kind: string): string {
+  return KIND_SOFTS[kindIdx(kind)];
+}
+
 /** 全部实体(列表),note_count 降序。图谱失败/空 → []。 */
 export const graphEntities = () => invoke<EntitySummary[]>("graph_entities");
 /** 力导图数据(Plan C)。 */

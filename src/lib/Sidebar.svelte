@@ -16,7 +16,7 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
-  import { graphEntities, kindLabel, type EntitySummary } from "$lib/graph";
+  import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -435,7 +435,11 @@
     <div class="gchips">
       <button class="gchip" class:on={graphKind === "all"} onclick={() => (graphKind = "all")}>全部</button>
       {#each graphKinds as k (k)}
-        <button class="gchip" class:on={graphKind === k} onclick={() => (graphKind = k)}>{kindLabel(k)}</button>
+        <!-- 圆点=该 kind 在力导图上的节点色(kindInk,与 ForceGraph.svelte 同一份取色
+             逻辑),让过滤药丸跟图上的圆圈对得上号,不再是一片同色灰药丸 -->
+        <button class="gchip" class:on={graphKind === k} onclick={() => (graphKind = k)}>
+          <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
+        </button>
       {/each}
     </div>
     {#if graphShown.length === 0}
@@ -444,8 +448,9 @@
     <ul class="list">
       {#each graphShown as e (e.id)}
         <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-        <li class="item" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
-          <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : 'var(--hairline-strong)'}"></span>
+        <li class="item entity" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
+          <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
+          <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
           <div class="main-line">
             <span class="title">{e.name}</span>
             <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
@@ -648,8 +653,10 @@
     cursor: default;
   }
   /* 人物行:小色点(与详情页头像同色源)+ 名字/最近出现;点击进主区详情(主从结构),
-     hover/选中与笔记行同语义 */
-  .item.person {
+     hover/选中与笔记行同语义。图谱实体行(.entity)是同一形态——之前漏了这条 flex
+     规则,色点(.dot)没有行内布局撑不开,视觉上完全不可见,现在一并补上。 */
+  .item.person,
+  .item.entity {
     display: flex;
     align-items: center;
     gap: 0.55em;
@@ -799,6 +806,9 @@
     margin-bottom: 0.5rem;
   }
   .gchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     padding: 2px 9px;
     border-radius: 999px;
     font-size: 0.72em;
@@ -811,6 +821,14 @@
   .gchip.on {
     background: var(--accent-tint);
     color: var(--accent);
+  }
+  /* kind 色点(kindInk):选中态仍统一走 accent 高亮(哪个药丸被选清清楚楚),
+     色点只在未选中时充当"这是什么类别"的视觉索引,不跟 accent 抢语义。 */
+  .gchip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    flex: none;
   }
   .list {
     list-style: none;
