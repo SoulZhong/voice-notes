@@ -2,10 +2,11 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphEntities, entityDetail, kindLabel, type EntityDetail } from "$lib/graph";
+  import { graphData, entityDetail, kindLabel, type EntityDetail, type GraphData } from "$lib/graph";
   import { speakerInk, formatDate } from "$lib/notes";
+  import ForceGraph from "$lib/ForceGraph.svelte";
 
-  let hasEntities = $state(true);
+  let graph = $state<GraphData>({ nodes: [], edges: [] });
   let loaded = $state(false);
   let detail = $state<EntityDetail | null>(null);
   let detailLoading = $state(false);
@@ -16,12 +17,17 @@
 
   onMount(async () => {
     try {
-      hasEntities = (await graphEntities()).length > 0;
+      graph = await graphData();
     } catch {
-      hasEntities = false;
+      graph = { nodes: [], edges: [] };
     }
     loaded = true;
   });
+
+  function pickNode(id: string, isPerson: boolean) {
+    if (isPerson) goto("/speakers/" + id);
+    else goto("/graph?e=" + encodeURIComponent(id));
+  }
 
   // 选中变化 → 拉详情。侧栏点人实体已直接跳 /speakers,这里只处理非人。
   $effect(() => {
@@ -49,16 +55,18 @@
 </script>
 
 <div class="graph-main">
-  {#if loaded && !hasEntities}
+  {#if loaded && graph.nodes.length === 0}
     <div class="empty">
       <p class="empty-title">还没有知识图谱</p>
       <p class="empty-desc">配置大模型并对笔记「重新 Aing」后,人物、组织、项目等实体会自动汇入这里,按共享的笔记彼此关联。</p>
       <button class="empty-cta" onclick={() => goto("/ai")}>去 AI 设置</button>
     </div>
   {:else if selected && detailLoading && !detail}
+    <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
     <p class="hint">加载中…</p>
   {:else if selected && detail}
     <div class="detail">
+      <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
       <div class="d-head">
         <span class="d-name">{detail.name}</span>
         <span class="kind">{kindLabel(detail.kind)}</span>
@@ -105,7 +113,10 @@
       {/if}
     </div>
   {:else if selected}
+    <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
     <p class="hint">该实体还未进入图谱(可能刚 Aing 完,稍后重试)。</p>
+  {:else if graph.edges.length > 0 && graph.nodes.length >= 2}
+    <ForceGraph nodes={graph.nodes} edges={graph.edges} onPick={pickNode} />
   {:else}
     <div class="placeholder">
       <p class="ph-title">知识图谱</p>
@@ -119,6 +130,13 @@
 
   /* 单列居中,舒适可读宽度 */
   .detail { max-width: 640px; margin: 0 auto; padding: 28px 36px 48px; }
+  .back {
+    display: block; margin: 20px 0 18px 36px;
+    background: none; border: 0; padding: 0; cursor: pointer;
+    font-size: 12.5px; font-weight: 500; color: var(--ink-secondary); font-family: inherit;
+  }
+  .back:hover { color: var(--ink); }
+  .detail .back { margin-left: 0; }
   .d-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
   .d-name { font-size: 20px; font-weight: 500; color: var(--ink); }
   .kind {

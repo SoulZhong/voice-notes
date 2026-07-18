@@ -34,6 +34,7 @@
     noteRelated,
     type RelatedNote,
   } from "$lib/notes";
+  import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { listPeople, type PersonSummary } from "$lib/people";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -210,6 +211,29 @@
         if (forId === id) related = [];
       });
   });
+
+  // 实体高亮点击导航:局部 ent_N → 全局 id(人 person_id / 非人 e:名)。增值层,
+  // 取失败/无映射静默按空——旧笔记或图谱未就绪时高亮退回 Phase2a 的纯文本不可点。
+  let entityLinks = $state<Record<string, EntityLink>>({});
+  $effect(() => {
+    const forId = id;
+    noteEntityLinks(forId)
+      .then((links) => {
+        if (forId !== id) return;
+        const m: Record<string, EntityLink> = {};
+        for (const l of links) m[l.local_id] = l;
+        entityLinks = m;
+      })
+      .catch(() => {
+        if (forId === id) entityLinks = {};
+      });
+  });
+  function gotoEntity(eid: string) {
+    const link = entityLinks[eid];
+    if (!link) return;
+    if (link.is_person) goto("/speakers/" + link.global_id);
+    else goto("/graph?e=" + encodeURIComponent(link.global_id));
+  }
 
   /** 段落内实体片段 → 实体名(tooltip 用):从本篇 refined.entities 按局部 id 查。 */
   const entityName = $derived.by(() => {
@@ -716,7 +740,14 @@
             {:else}
               <span class="ts">{formatTs(p.start_ms)}</span>
             {/if}
-            <span class="para-text">{#each splitMentions(p.text, p.mentions) as seg}{#if seg.entityId}<span class="entity-mention" title={entityName(seg.entityId)}>{seg.text}</span>{:else}{seg.text}{/if}{/each}</span>
+            <span class="para-text">{#each splitMentions(p.text, p.mentions) as seg}{#if seg.entityId}{@const eid = seg.entityId}{#if entityLinks[eid]}<span
+                    class="entity-mention linkable"
+                    title={entityName(eid)}
+                    role="link"
+                    tabindex="0"
+                    onclick={() => gotoEntity(eid)}
+                    onkeydown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), gotoEntity(eid))}
+                  >{seg.text}</span>{:else}<span class="entity-mention" title={entityName(eid)}>{seg.text}</span>{/if}{:else}{seg.text}{/if}{/each}</span>
           </div>
         {/each}
         {#if refined.paragraphs.length === 0}
@@ -1035,6 +1066,14 @@
   .entity-mention:hover {
     background: var(--accent-tint);
     color: var(--accent);
+  }
+  /* 可导航的实体提及(能解析到全局 id):区别于纯 tooltip 态,给出可点信号 */
+  .entity-mention.linkable {
+    cursor: pointer;
+  }
+  .entity-mention.linkable:hover {
+    text-decoration: underline;
+    text-decoration-color: var(--accent);
   }
   /* 当前播放段(仅播放中):放大 + 主墨色 + 轻投影,歌词感;负边距抵掉内缩,行左缘对齐不跳 */
   .transcript.live .seg.playing {
