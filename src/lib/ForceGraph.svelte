@@ -49,6 +49,9 @@
   /** 用户点了「显示全部」:build() 里忽略 maxNodes/minEdgeWeight/backboneK 的封顶,
       画出这份数据里全部有共现边的实体。 */
   let expanded = $state(false);
+  /** 用户点了「展开一层」的次数:以当前骨架图为种子,逐层把邻居(不看边权重,弱连接
+      也算)并进来,一步步长大而不是从 60 个直接跳到全部——避免"一下爆炸"。 */
+  let expandHops = $state(0);
 
   // 渲染快照(每 tick 刷新;与 d3 mutate 的节点对象解耦,保证 Svelte 反应式更新)。
   let snap = $state<{
@@ -89,17 +92,20 @@
   }
 
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
-  // expanded 时放宽节点数/边权重下限封顶,画出这份数据里全部有共现关系的实体——
-  // 用户点「显示全部」之后才走这条路径,默认仍是可读骨架图。
-  // **backbone 稀疏化即便 expanded 也不能真的解除**:实测撞过真实卡死——900+ 实体
-  // 数据集全量共现边有几万条,forceLink 每 tick 都要过一遍全部边,配合每 tick 全量
-  // 重渲染上千个 DOM 节点,浏览器直接卡死。放宽到 6(默认 3)已经比骨架图丰富得多,
-  // 边数量级仍被按节点数线性封顶,不会随原始边数暴涨。
+  // expanded(显示全部)/expandHops(展开一层,可重复点)都会放宽这份封顶——
+  // 前者一步到位画出全部,后者以当前骨架图为种子逐层并入邻居,一步步长大,不用
+  // 一下从 60 跳到全部。
+  // **backbone 稀疏化即便放宽也不能真的解除**:实测撞过真实卡死——900+ 实体数据集
+  // 全量共现边有几万条,forceLink 每 tick 都要过一遍全部边,配合每 tick 全量重渲染
+  // 上千个 DOM 节点,浏览器直接卡死。放宽到 6(默认 3)已经比骨架图丰富得多,边数量级
+  // 仍被按节点数线性封顶,不会随原始边数暴涨。
   function build() {
+    const growing = expanded || expandHops > 0;
     const effMinWeight = expanded ? 1 : minEdgeWeight;
     const effMaxNodes = expanded ? 2000 : maxNodes;
-    const effBackboneK = expanded ? Math.max(6, backboneK) : backboneK;
-    // 只用「权重≥effMinWeight」的强边:度数、选点、连线都基于强边。
+    const effBackboneK = growing ? Math.max(6, backboneK) : backboneK;
+    // 只用「权重≥effMinWeight」的强边定种子:度数、选点都基于强边,骨架图不被
+    // 大量弱共现噪声撑大。
     const strong = allEdges.filter((e) => e.weight >= effMinWeight);
     const deg = new Set<string>();
     for (const e of strong) {
@@ -107,16 +113,74 @@
       deg.add(e.b);
     }
     const candidates = allNodes.filter((n) => deg.has(n.id)).sort((a, b) => b.note_count - a.note_count);
-    truncated = Math.max(0, candidates.length - effMaxNodes);
-    const chosen = candidates.slice(0, effMaxNodes);
-    const idset = new Set(chosen.map((n) => n.id));
+
+    let idset: Set<string>;
+    if (expanded) {
+      truncated = Math.max(0, candidates.length - effMaxNodes);
+      idset = new Set(candidates.slice(0, effMaxNodes).map((n) => n.id));
+    } else {
+      const seed = candidates.slice(0, maxNodes);
+      idset = new Set(seed.map((n) => n.id));
+      // 展开一层:以当前 idset 为种子,逐层并入邻居——看全部边不局限于强边,
+      // 展开就是要看到弱连接,不然跟骨架图没区别。BFS 一圈圈往外长,2000 是硬上限
+      // (与「显示全部」共用的安全兜底)。
+      // **每个节点每层最多带入 NEIGHBOR_CAP 个新邻居(取权重最高的几个),不能来者
+      // 不拒**:实测种子里的枢纽实体(如「AI」共现过几百个不同实体)一层就能把
+      // 几乎全图(959/975)拖进来,跟直接「显示全部」没区别,完全违背"避免一下
+      // 爆炸、一层层看"的初衷。按权重排序取前几个,既控制了每层的膨胀速度,又
+      // 优先带出关系最紧的邻居。
+      if (expandHops > 0) {
+        const NEIGHBOR_CAP = 8;
+        let frontier = idset;
+        for (let h = 0; h < expandHops && idset.size < 2000; h++) {
+          const byNode = new Map<string, { id: string; w: number }[]>();
+          for (const e of allEdges) {
+            if (frontier.has(e.a) && !idset.has(e.b)) {
+              const arr = byNode.get(e.a) ?? [];
+              arr.push({ id: e.b, w: e.weight });
+              byNode.set(e.a, arr);
+            }
+            if (frontier.has(e.b) && !idset.has(e.a)) {
+              const arr = byNode.get(e.b) ?? [];
+              arr.push({ id: e.a, w: e.weight });
+              byNode.set(e.b, arr);
+            }
+          }
+          const next = new Set<string>();
+          for (const [, arr] of byNode) {
+            arr.sort((a, b) => b.w - a.w).slice(0, NEIGHBOR_CAP).forEach((x) => next.add(x.id));
+          }
+          if (next.size === 0) break; // 已经长到头,没有更多邻居可扩了
+          for (const id of next) idset.add(id);
+          frontier = next;
+        }
+      }
+      if (expandHops === 0) {
+        truncated = Math.max(0, candidates.length - maxNodes);
+      } else {
+        // 展开态的"还有多少"改按全量边(不局限强边)的度数论域算——种子阶段的
+        // strong 论域跟这里不是一回事。
+        const universeDeg = new Set<string>();
+        for (const e of allEdges) {
+          universeDeg.add(e.a);
+          universeDeg.add(e.b);
+        }
+        const universe = allNodes.filter((n) => universeDeg.has(n.id)).length;
+        truncated = Math.max(0, universe - idset.size);
+      }
+    }
+
+    const chosen = allNodes.filter((n) => idset.has(n.id));
     const maxNoteCount = chosen.reduce((m, n) => Math.max(m, n.note_count), 0);
     dNodes = chosen.map((n) => {
       const { r, label } = sizeFor(n.name, n.note_count, maxNoteCount);
       return { ...n, r, label };
     });
     const byId = new Map(dNodes.map((n) => [n.id, n]));
-    let candLinks = strong
+    // 已经放宽/展开了就不再局限于强边——节点都决定要画出来了,哪怕只共享 1 篇笔记
+    // 也该连起来,不然图会显得比实际更散(也是本节点跟主团断联的一个常见成因)。
+    const edgePool = growing ? allEdges : strong;
+    let candLinks = edgePool
       .filter((e) => idset.has(e.a) && idset.has(e.b))
       .map((e) => ({ source: byId.get(e.a)!, target: byId.get(e.b)!, weight: e.weight }));
     // 稀疏化 backbone:每个节点只保留最强的 backboneK 条边(union),把超密共现图收成可读骨架。
@@ -178,22 +242,28 @@
     build();
     heavy = dNodes.length > 150 || dLinks.length > 800;
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
+    // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
+    // 跟主团完全没有边连接的孤岛,互斥力(charge)会把它们越推越远,越推越飘。
+    // forceX/forceY 是逐节点的独立向心力,才能真正把孤岛拽回可见范围内。
+    // **heavy 图斥力调弱、向心力调强很多**:默认 60 节点视图的参数是照顾"少数节点
+    // 撑满容器"调的,直接套到几百上千节点的展开图上,孤岛会被推得离主团很远、画布
+    // 大片黑边空着(冒烟反馈"不利于充分利用空间"——单靠 fit 排除离群点只解决了缩放
+    // 框选,没解决节点实际位置分散、空间没用满的问题)。
+    const chargeStrength = heavy ? -55 : -190;
+    const gravityStrength = heavy ? 0.4 : 0.08;
     sim = forceSimulation<SimNode>(dNodes)
-      .force("charge", forceManyBody().strength(-190))
+      .force("charge", forceManyBody().strength(chargeStrength))
       .force(
         "link",
         forceLink<SimNode, SimLink>(dLinks)
           .id((d) => d.id)
-          .distance(54)
+          .distance(heavy ? 36 : 54)
           .strength(0.35),
       )
       .force("center", forceCenter(width / 2, height / 2))
-      // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
-      // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
-      // 跟主团完全没有边连接的孤岛,互斥力(charge)会把它们越推越远,越推越飘。
-      // forceX/forceY 是逐节点的独立向心力,才能真正把孤岛拽回可见范围内。
-      .force("gravityX", forceX<SimNode>(width / 2).strength(0.08))
-      .force("gravityY", forceY<SimNode>(height / 2).strength(0.08))
+      .force("gravityX", forceX<SimNode>(width / 2).strength(gravityStrength))
+      .force("gravityY", forceY<SimNode>(height / 2).strength(gravityStrength))
       .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6))
       .on("tick", refreshSnap);
     if (reduce || heavy) {
@@ -235,6 +305,7 @@
     void minEdgeWeight;
     void backboneK;
     void expanded;
+    void expandHops;
     if (container) rebuild();
   });
 
@@ -505,13 +576,27 @@
       </g>
     </g>
   </svg>
-  {#if truncated > 0}
+  {#if expanded}
+    <div class="trunc">
+      已显示全部 {snap.nodes.length} 个实体
+      <button class="trunc-btn" onclick={() => { expanded = false; expandHops = 0; }}>收起</button>
+    </div>
+  {:else if expandHops > 0}
+    <!-- 展开一层可重复点,一圈圈往外长,不像「显示全部」一步到位——避免一下爆炸 -->
+    <div class="trunc">
+      已展开 {expandHops} 层 · 共 {snap.nodes.length} 个实体
+      {#if truncated > 0}
+        <button class="trunc-btn" onclick={() => (expandHops += 1)}>继续展开</button>
+        <button class="trunc-btn" onclick={() => (expanded = true)}>显示全部</button>
+      {/if}
+      <button class="trunc-btn" onclick={() => (expandHops = 0)}>收起</button>
+    </div>
+  {:else if truncated > 0}
     <div class="trunc">
       显示连接最紧的 {snap.nodes.length} 个实体
+      <button class="trunc-btn" onclick={() => (expandHops = 1)}>展开一层</button>
       <button class="trunc-btn" onclick={() => (expanded = true)}>显示全部</button>
     </div>
-  {:else if expanded}
-    <div class="trunc">已显示全部 {snap.nodes.length} 个实体 <button class="trunc-btn" onclick={() => (expanded = false)}>收起</button></div>
   {/if}
   {#if legend.length > 0}
     <div class="legend">
