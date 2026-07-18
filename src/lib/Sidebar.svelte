@@ -417,6 +417,21 @@
       {/if}
     </ul>
   {:else if tab === "graph"}
+    <!-- 固定行:全局图谱(清空选中,回到力导图总览;紧跟录制按钮,不随实体列表滚动
+         消失——详情态下从任何深度都能一键退回,与「概览与整理」同一惯例) -->
+    <button
+      class="item overview graph-global"
+      class:current={!graphSelected}
+      onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
+    >
+      <svg class="overview-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="8" cy="3.6" r="1.6" />
+        <circle cx="3.4" cy="12" r="1.6" />
+        <circle cx="12.6" cy="12" r="1.6" />
+        <path d="M8 5.2L4.4 10.6M8 5.2l3.6 5.4M5 12h6" />
+      </svg>
+      <span class="title">全局图谱</span>
+    </button>
     <input class="search" type="search" placeholder="搜索实体…" bind:value={graphQuery} />
     <div class="gchips">
       <button class="gchip" class:on={graphKind === "all"} onclick={() => (graphKind = "all")}>全部</button>
@@ -683,6 +698,19 @@
   .item.overview.current .overview-icon,
   .item.overview:hover .overview-icon {
     color: var(--ink-secondary);
+  }
+  /* 全局图谱固定行:与「概览与整理」同一套 .item.overview 视觉(flex/间距/hover/current
+     都来自那两个类),这里只需把原生 <button> 的默认外观清空、撑满侧栏宽度。 */
+  .graph-global {
+    display: flex;
+    width: 100%;
+    box-sizing: border-box;
+    border: none;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    color: var(--ink);
+    margin: 0 0 0.4rem;
   }
   .tidy-badge {
     margin-left: auto;

@@ -191,10 +191,12 @@
         {:else}
           <span class="d-name">{detail.name}</span>
         {/if}
-        <span class="kind">{kindLabel(detail.kind)}</span>
         {#if !renaming}
+          <!-- 紧跟在名字右边(冒烟反馈:原先 margin-left:auto 甩到整行最右端,
+               视觉上跟名字脱节,看不出改的是谁) -->
           <button class="d-rename-btn" onclick={() => startRename(d)} title="改名(纠正提取错误)">改名</button>
         {/if}
+        <span class="kind">{kindLabel(detail.kind)}</span>
       </div>
       {#if renameErr}
         <p class="d-rename-err">{renameErr}</p>
@@ -303,12 +305,15 @@
     height: 100%; max-width: 1400px; margin: 0 auto;
     padding: 24px 36px 28px; box-sizing: border-box;
   }
+  /* 醒目一些:从纯文字链接改药丸按钮(冒烟反馈"太不起眼"),字号/内边距放大到
+     与其他主要操作按钮同一量级,才配得上"退回全局图谱"这个高频动作。 */
   .back {
-    display: block; flex: none; margin: 0 0 16px;
-    background: none; border: 0; padding: 0; cursor: pointer;
-    font-size: 12.5px; font-weight: 500; color: var(--ink-secondary); font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px; flex: none; align-self: flex-start; margin: 0 0 20px;
+    background: var(--surface-soft); border: 1px solid var(--hairline); border-radius: var(--radius-full);
+    padding: 8px 18px; cursor: pointer;
+    font-size: 14px; font-weight: 500; color: var(--ink-secondary); font-family: inherit;
   }
-  .back:hover { color: var(--ink); }
+  .back:hover { color: var(--ink); background: var(--surface-press); border-color: var(--hairline-strong); }
   .d-head { flex: none; display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
   .d-rename-input {
     font-size: 20px; font-weight: 500; color: var(--ink); font-family: inherit;
@@ -316,7 +321,7 @@
     padding: 1px 6px; min-width: 8em;
   }
   .d-rename-btn {
-    background: none; border: 0; padding: 0; cursor: pointer; margin-left: auto;
+    background: none; border: 0; padding: 0; cursor: pointer;
     font-size: 12px; font-weight: 500; color: var(--ink-faint); font-family: inherit;
   }
   .d-rename-btn:hover { color: var(--accent); }
