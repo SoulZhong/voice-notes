@@ -2,9 +2,12 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, entityDetail, kindLabel, type EntityDetail, type GraphData } from "$lib/graph";
-  import { speakerInk, formatDate } from "$lib/notes";
+  import { graphData, entityDetail, kindLabel, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
+  import { formatDate } from "$lib/notes";
   import ForceGraph from "$lib/ForceGraph.svelte";
+
+  /** 详情页小型关系图的节点容量——比全局图(60)小得多,一个实体的最强关系够看清。 */
+  const EGO_MAX_RELATED = 30;
 
   let graph = $state<GraphData>({ nodes: [], edges: [] });
   let loaded = $state(false);
@@ -52,6 +55,35 @@
     if (isPersonId(id)) goto("/speakers/" + id);
     else goto("/graph?e=" + encodeURIComponent(id));
   }
+
+  /** 以当前实体为中心的小型关系图数据:中心 + 最相关的 N 个(后端已按共享笔记数降序),
+      节点优先取自已加载的全局图(真实 note_count/kind/aliases,渲染更准确),取不到就用
+      detail/related 自带的字段兜底合成,保证图谱数据未就绪时也能渲染。边 = 中心↔各相关
+      实体(权重=共享笔记数,来自 detail,始终可靠)+ 相关实体彼此之间的共现(取自全局图,
+      展示邻居间的聚簇——非必需但更有信息量,全局图未加载时自然为空)。 */
+  const ego = $derived.by(() => {
+    const d = detail;
+    if (!d) return { nodes: [] as EntitySummary[], edges: [] as EdgeRow[] };
+    const relatedTop = d.related.slice(0, EGO_MAX_RELATED);
+    const idSet = new Set<string>([d.id, ...relatedTop.map((r) => r.id)]);
+    const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+    const center: EntitySummary = byId.get(d.id) ?? {
+      id: d.id, kind: d.kind, name: d.name, aliases: d.aliases,
+      is_person: d.is_person, note_count: d.note_count, mention_total: d.mention_total,
+    };
+    const relatedNodes: EntitySummary[] = relatedTop.map(
+      (r) =>
+        byId.get(r.id) ?? {
+          id: r.id, kind: r.kind, name: r.name, aliases: [],
+          is_person: !r.id.startsWith("e:"), note_count: r.shared_notes, mention_total: 0,
+        },
+    );
+    const centerEdges: EdgeRow[] = relatedTop.map((r) => ({ a: d.id, b: r.id, weight: r.shared_notes }));
+    const neighborEdges = graph.edges.filter(
+      (e) => idSet.has(e.a) && idSet.has(e.b) && e.a !== d.id && e.b !== d.id,
+    );
+    return { nodes: [center, ...relatedNodes], edges: [...centerEdges, ...neighborEdges] };
+  });
 </script>
 
 <div class="graph-main">
@@ -81,9 +113,9 @@
       <p class="d-stat">出现在 {detail.note_count} 篇 · {detail.mention_total} 次提及</p>
 
       <div class="d-cols">
-        {#if detail.notes.length}
-          <section class="d-section">
-            <h3>出现的笔记 <span class="d-count">{detail.notes.length}</span></h3>
+        <section class="d-section notes-col">
+          <h3>出现的笔记 <span class="d-count">{detail.notes.length}</span></h3>
+          {#if detail.notes.length}
             <ul class="d-scroll">
               {#each detail.notes as n (n.id)}
                 <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
@@ -93,25 +125,29 @@
                 </li>
               {/each}
             </ul>
-          </section>
-        {/if}
+          {/if}
+        </section>
 
-        {#if detail.related.length}
-          <section class="d-section">
-            <h3>相关实体 <span class="d-count">{detail.related.length}</span></h3>
-            <ul class="d-scroll">
-              {#each detail.related as r (r.id)}
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-                <li class="d-rel" onclick={() => pickRelated(r.id)}>
-                  <span class="dot" style={isPersonId(r.id) ? `background:${speakerInk(r.id, "mic")}` : ""}></span>
-                  <span class="d-rel-name">{r.name}</span>
-                  <span class="kind">{kindLabel(r.kind)}</span>
-                  <span class="d-rel-shared">{r.shared_notes} 篇共现</span>
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
+        <section class="d-section graph-col">
+          <h3>
+            相关实体 <span class="d-count">{detail.related.length}</span>
+            {#if detail.related.length > EGO_MAX_RELATED}
+              <span class="d-cap">只画最相关的 {EGO_MAX_RELATED} 个</span>
+            {/if}
+          </h3>
+          {#if ego.nodes.length >= 2}
+            <div class="ego-wrap">
+              <ForceGraph
+                nodes={ego.nodes}
+                edges={ego.edges}
+                onPick={pickRelated}
+                maxNodes={EGO_MAX_RELATED + 1}
+                minEdgeWeight={1}
+                backboneK={999}
+              />
+            </div>
+          {/if}
+        </section>
       </div>
     </div>
   {:else if selected}
@@ -128,55 +164,73 @@
 </div>
 
 <style>
-  .graph-main { height: 100%; overflow-y: auto; }
+  .graph-main { height: 100%; overflow: hidden; }
 
-  /* 居中,拓宽以承载两栏列表(原 640 在宽屏下过窄,长列表全靠纵向滚) */
-  .detail { max-width: 880px; margin: 0 auto; padding: 28px 36px 48px; }
+  /* 撑满可用高度(不再是纵向长滚的文档流):居中但拓宽上限,让相关实体力导图有
+     足够画布——纯文字列表挤在窄列里既浪费横向空间、又逼出大片纵向留白。 */
+  .detail {
+    display: flex; flex-direction: column;
+    height: 100%; max-width: 1400px; margin: 0 auto;
+    padding: 24px 36px 28px; box-sizing: border-box;
+  }
   .back {
-    display: block; margin: 20px 0 18px 36px;
+    display: block; flex: none; margin: 0 0 16px;
     background: none; border: 0; padding: 0; cursor: pointer;
     font-size: 12.5px; font-weight: 500; color: var(--ink-secondary); font-family: inherit;
   }
   .back:hover { color: var(--ink); }
-  .detail .back { margin-left: 0; }
-  .d-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .d-head { flex: none; display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
   .d-name { font-size: 20px; font-weight: 500; color: var(--ink); }
   .kind {
     font-size: 11px; color: var(--ink-secondary);
     padding: 1px 7px; border-radius: 5px; background: var(--surface-soft);
   }
-  .d-aliases { font-size: 13px; color: var(--ink-secondary); margin: 0 0 6px; line-height: 1.6; }
-  .d-stat { font-size: 13px; color: var(--ink-faint); margin: 0 0 26px; }
+  .d-aliases { flex: none; font-size: 13px; color: var(--ink-secondary); margin: 0 0 6px; line-height: 1.6; }
+  .d-stat { flex: none; font-size: 13px; color: var(--ink-faint); margin: 0 0 20px; }
 
-  /* 两栏并排(笔记 / 相关实体):各自限高内部滚动,不逼页面纵向滚很长——
-     与会议搭子详情页「出现过的会议」同一惯例(max-height + overflow-y:auto)。 */
-  .d-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
-  @media (max-width: 720px) {
-    .d-cols { grid-template-columns: 1fr; }
+  /* 两栏并排(笔记 / 相关实体关系图):填满剩余高度,而非按内容撑开——
+     笔记列表内部滚(与会议搭子详情页「出现过的会议」同一惯例),关系图直接
+     用满这块画布把「大片留白」变成有效可视化。 */
+  .d-cols { flex: 1; min-height: 0; display: flex; gap: 28px; }
+  @media (max-width: 760px) {
+    .d-cols { flex-direction: column; }
+  }
+  .d-section {
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .notes-col { flex: 0 0 340px; }
+  .graph-col { flex: 1; min-width: 0; }
+  @media (max-width: 760px) {
+    .notes-col { flex: 0 0 auto; max-height: 40%; }
+    .graph-col { flex: 1; }
   }
   .d-section h3 {
-    display: flex; align-items: center; gap: 6px;
+    flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
     font-size: 12px; font-weight: 500; color: var(--ink-secondary); margin: 0 0 8px;
   }
   .d-count {
     font-size: 10.5px; color: var(--ink-faint);
     background: var(--surface-soft); border-radius: 999px; padding: 0 6px;
   }
+  .d-cap { font-size: 11px; color: var(--ink-faint); }
   .d-scroll {
-    list-style: none; margin: 0; padding: 0;
-    max-height: 14rem; overflow-y: auto;
+    flex: 1; min-height: 0;
+    list-style: none; margin: 0; padding: 0; overflow-y: auto;
   }
-  .d-note, .d-rel {
-    display: flex; align-items: center; gap: 8px;
+  .d-note {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
     padding: 8px 10px; border-radius: 8px; cursor: pointer;
   }
-  .d-note { flex-direction: column; align-items: flex-start; gap: 2px; }
-  .d-note:hover, .d-rel:hover { background: var(--surface-soft); }
+  .d-note:hover { background: var(--surface-soft); }
   .d-note-title { font-size: 13px; color: var(--ink); font-weight: 500; }
   .d-note-meta { font-size: 11px; color: var(--ink-faint); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--hairline-strong); flex: none; }
-  .d-rel-name { font-size: 13px; color: var(--ink); font-weight: 500; }
-  .d-rel-shared { margin-left: auto; font-size: 11px; color: var(--ink-faint); }
+
+  /* 相关实体关系图:填满 graph-col 剩余空间的画布 */
+  .ego-wrap {
+    flex: 1; min-height: 0;
+    border: 1px solid var(--hairline); border-radius: 12px;
+    background: var(--surface); overflow: hidden;
+  }
 
   .placeholder, .empty { max-width: 420px; margin: 18vh auto 0; text-align: center; padding: 0 20px; }
   .ph-title, .empty-title { font-weight: 500; color: var(--ink); font-size: 17px; margin: 0 0 8px; }

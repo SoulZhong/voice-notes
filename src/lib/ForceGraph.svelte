@@ -8,14 +8,24 @@
     nodes: allNodes,
     edges: allEdges,
     onPick,
+    maxNodes = 60,
+    minEdgeWeight = 2,
+    backboneK = 3,
+    truncHint = "用左侧列表看全部",
   }: {
     nodes: EntitySummary[];
     edges: EdgeRow[];
     onPick: (id: string, isPerson: boolean) => void;
+    /** 规模封顶(默认给全局图用);实体详情页的小型关系图会传更小的值。 */
+    maxNodes?: number;
+    /** 只连接权重≥此值的边(默认 2,过滤共享 1 篇的噪声连接);中心实体的直连关系
+        本身已被后端筛过,详情页小图应传 1,不丢真实但较弱的关联。 */
+    minEdgeWeight?: number;
+    /** 每节点保留最强 K 条边的 backbone 稀疏化;详情页小图数据量小,可传大值关闭稀疏化。 */
+    backboneK?: number;
+    /** 节点被截断时角标提示文案的落款(「显示连接最紧的 N 个 · {truncHint}」)。 */
+    truncHint?: string;
   } = $props();
-
-  const MAX_NODES = 60;
-  const MIN_EDGE_WEIGHT = 2; // 只连「共享≥2篇」的实体——共享 1 篇太泛,会糊成一团
 
   interface SimNode extends EntitySummary {
     x?: number;
@@ -85,16 +95,16 @@
 
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
   function build() {
-    // 只用「共享≥2篇」的强边:度数、选点、连线都基于强边,去掉共享 1 篇的噪声连接。
-    const strong = allEdges.filter((e) => e.weight >= MIN_EDGE_WEIGHT);
+    // 只用「权重≥minEdgeWeight」的强边:度数、选点、连线都基于强边。
+    const strong = allEdges.filter((e) => e.weight >= minEdgeWeight);
     const deg = new Set<string>();
     for (const e of strong) {
       deg.add(e.a);
       deg.add(e.b);
     }
     const candidates = allNodes.filter((n) => deg.has(n.id)).sort((a, b) => b.note_count - a.note_count);
-    truncated = Math.max(0, candidates.length - MAX_NODES);
-    const chosen = candidates.slice(0, MAX_NODES);
+    truncated = Math.max(0, candidates.length - maxNodes);
+    const chosen = candidates.slice(0, maxNodes);
     const idset = new Set(chosen.map((n) => n.id));
     const maxNoteCount = chosen.reduce((m, n) => Math.max(m, n.note_count), 0);
     dNodes = chosen.map((n) => {
@@ -105,8 +115,7 @@
     let candLinks = strong
       .filter((e) => idset.has(e.a) && idset.has(e.b))
       .map((e) => ({ source: byId.get(e.a)!, target: byId.get(e.b)!, weight: e.weight }));
-    // 稀疏化 backbone:每个节点只保留最强的 K 条边(union),把超密共现图收成可读骨架。
-    const K = 3;
+    // 稀疏化 backbone:每个节点只保留最强的 backboneK 条边(union),把超密共现图收成可读骨架。
     const perNode = new Map<string, { l: SimLink; w: number }[]>();
     for (const l of candLinks) {
       for (const id of [l.source.id, l.target.id]) {
@@ -117,7 +126,7 @@
     }
     const keep = new Set<SimLink>();
     for (const [, arr] of perNode) {
-      arr.sort((a, b) => b.w - a.w).slice(0, K).forEach((x) => keep.add(x.l));
+      arr.sort((a, b) => b.w - a.w).slice(0, backboneK).forEach((x) => keep.add(x.l));
     }
     dLinks = candLinks.filter((l) => keep.has(l));
   }
@@ -146,11 +155,10 @@
     };
   }
 
-  onMount(() => {
-    if (container) {
-      width = container.clientWidth || 800;
-      height = container.clientHeight || 560;
-    }
+  /** (重)建仿真:首次挂载与之后每次 nodes/edges/规模参数变化(如详情页切换中心实体)都要
+      重跑,否则组件被复用时 props 换了但内部仿真停留在旧数据,图不更新。 */
+  function rebuild() {
+    sim?.stop();
     build();
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     sim = forceSimulation<SimNode>(dNodes)
@@ -170,7 +178,13 @@
       sim.tick(120);
       refreshSnap();
     }
+  }
 
+  onMount(() => {
+    if (container) {
+      width = container.clientWidth || 800;
+      height = container.clientHeight || 560;
+    }
     const ro = new ResizeObserver(() => {
       if (!container) return;
       width = container.clientWidth || width;
@@ -180,6 +194,16 @@
     });
     if (container) ro.observe(container);
     return () => ro.disconnect();
+  });
+
+  $effect(() => {
+    // 读取这些 props 建立依赖:任一变化(换了中心实体/规模参数)即重建。
+    void allNodes;
+    void allEdges;
+    void maxNodes;
+    void minEdgeWeight;
+    void backboneK;
+    if (container) rebuild();
   });
 
   onDestroy(() => sim?.stop());
@@ -270,7 +294,7 @@
     </g>
   </svg>
   {#if truncated > 0}
-    <div class="trunc">显示连接最紧的 {snap.nodes.length} 个实体 · 用左侧列表看全部</div>
+    <div class="trunc">显示连接最紧的 {snap.nodes.length} 个实体 · {truncHint}</div>
   {/if}
 </div>
 
