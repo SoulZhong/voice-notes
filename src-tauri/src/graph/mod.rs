@@ -24,7 +24,32 @@ CREATE TABLE IF NOT EXISTS note_entities (
   PRIMARY KEY (note_id, entity_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ne_entity ON note_entities(entity_id);
+CREATE TABLE IF NOT EXISTS entity_redirects (
+  old_id TEXT PRIMARY KEY,
+  new_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_name_overrides (
+  id   TEXT PRIMARY KEY,
+  name TEXT NOT NULL
+);
 ";
+
+/// 沿重定向链追到底(改名/合并留下的 old_id→new_id 映射),供解析层与查询层统一收口。
+/// **不随 rebuild_all 清空**——它是用户显式改名/合并的留痕,不是从 aing.json 可重建的派生
+/// 数据,必须跨重建存活,否则改名下次启动就被冲掉。步数上限防环。
+fn resolve_redirect(conn: &rusqlite::Connection, id: &str) -> String {
+    let mut cur = id.to_string();
+    for _ in 0..8 {
+        let next: Option<String> = conn
+            .query_row("SELECT new_id FROM entity_redirects WHERE old_id = ?1", [&cur], |r| r.get(0))
+            .ok();
+        match next {
+            Some(n) if n != cur => cur = n,
+            _ => return cur,
+        }
+    }
+    cur
+}
 
 /// 打开(必要时创建)图谱库,建表 + 设 WAL/busy_timeout。幂等。
 pub(crate) fn open(data_root: &Path) -> anyhow::Result<rusqlite::Connection> {
@@ -70,12 +95,14 @@ pub(crate) fn resolve_local_ids(data_root: &Path, note_id: &str) -> anyhow::Resu
     let dir = data_root.join("notes").join(note_id);
     let Some(doc) = store::load_refined(&dir) else { return Ok(Vec::new()) };
     let vp = store::VoiceprintStore::new(data_root.to_path_buf()).load();
+    let conn = open(data_root)?;
     Ok(doc
         .entities
         .iter()
         .filter(|e| !e.name.trim().is_empty())
         .map(|e| {
             let (gid, is_person) = resolve_global_id(&vp, e);
+            let gid = resolve_redirect(&conn, &gid);
             (e.id.clone(), gid, is_person)
         })
         .collect())
@@ -95,6 +122,14 @@ pub(crate) fn upsert_note(data_root: &Path, note_id: &str, doc: &store::RefinedD
             continue;
         }
         let (gid, is_person) = resolve_global_id(&vp, e);
+        // 过一遍改名/合并留下的重定向:旧名下次 Aing/整库重建也收口到用户纠正后的规范 id。
+        let gid = resolve_redirect(&tx, &gid);
+        // 显示名覆盖:用户手动改过名的实体,重建/重灌时不用 aing.json 里的原始提取名,
+        // 否则 rebuild_all 清表重插会把改好的名字冲回原样(id 靠 redirect 收口了,名字不会)。
+        let name_override: Option<String> = tx
+            .query_row("SELECT name FROM entity_name_overrides WHERE id = ?1", [&gid], |r| r.get(0))
+            .ok();
+        let display_name = name_override.as_deref().unwrap_or(&e.name);
         // mention_count:本篇 paragraphs 里引用该实体**局部 id** 的提及数
         let count: i64 = doc
             .paragraphs
@@ -107,11 +142,20 @@ pub(crate) fn upsert_note(data_root: &Path, note_id: &str, doc: &store::RefinedD
             .query_row("SELECT aliases FROM entities WHERE id = ?1", [&gid], |r| r.get(0))
             .ok();
         let merged = merge_aliases(existing_aliases.as_deref(), &e.name, &e.aliases);
-        tx.execute(
-            "INSERT INTO entities(id, kind, name, aliases, is_person, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(id) DO UPDATE SET aliases=?4, updated_at=?6",
-            rusqlite::params![gid, e.kind, e.name, merged, is_person as i64, doc.generated_at],
-        )?;
+        if name_override.is_some() {
+            // 有显示名覆盖:名字也强制跟着覆盖走(不是"首见胜"),否则改名后半路又混进旧名。
+            tx.execute(
+                "INSERT INTO entities(id, kind, name, aliases, is_person, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET name=?3, aliases=?4, updated_at=?6",
+                rusqlite::params![gid, e.kind, display_name, merged, is_person as i64, doc.generated_at],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO entities(id, kind, name, aliases, is_person, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET aliases=?4, updated_at=?6",
+                rusqlite::params![gid, e.kind, e.name, merged, is_person as i64, doc.generated_at],
+            )?;
+        }
         tx.execute(
             "INSERT INTO note_entities(note_id, entity_id, mention_count) VALUES(?1,?2,?3)
              ON CONFLICT(note_id, entity_id) DO UPDATE SET mention_count = mention_count + excluded.mention_count",
@@ -135,6 +179,121 @@ fn merge_aliases(existing_json: Option<&str>, name: &str, new_aliases: &[String]
         }
     }
     serde_json::to_string(&set).unwrap_or_else(|_| "[]".into())
+}
+
+/// 实体改名结果:new_id 是改名后的规范 id(人实体 id 不变,非人实体 id 随名字重算);
+/// merged=true 表示撞上已存在的同名实体,已自动合并(边计数相加、别名并集、旧行删除)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RenameOutcome {
+    pub new_id: String,
+    pub merged: bool,
+}
+
+/// 改实体显示名。人实体(id 不以 e: 开头)委托 VoiceprintStore::rename——那是全应用统一
+/// 的人物改名入口(会议搭子/精修稿改名走的同一处),id 本身不变,图这边顺带把 entities.name
+/// 现地更新一份便于图谱页即时反映(声纹库仍是真值源)。非人实体 id=e:<规范名>,改名即换 id:
+/// 若新规范名与某个已存在的**不同**实体撞了,自动合并(边计数相加/别名并集/删旧行);否则
+/// 就是纯改名(迁移该实体的所有边到新 id)。两种情形都在 entity_redirects 留一条旧→新的
+/// 记录,保证下次 Aing/rebuild_all 时旧名的提及依然收口到这个新规范 id,不会改了又被冲回去。
+pub(crate) fn rename_entity(data_root: &Path, old_id: &str, new_name: &str) -> anyhow::Result<RenameOutcome> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        anyhow::bail!("名字不能为空");
+    }
+    if !old_id.starts_with("e:") {
+        // 人实体:id 是 person_id,不随名字变;真值源是声纹库。
+        store::VoiceprintStore::new(data_root.to_path_buf()).rename(old_id, new_name)?;
+        let _guard = GRAPH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = open(data_root)?;
+        // 现地更新图谱展示名,失败不影响改名本身(声纹库已是真值源,图谱下次 upsert 会追上)。
+        let _ = conn.execute(
+            "UPDATE entities SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![new_name, chrono::Local::now().to_rfc3339(), old_id],
+        );
+        return Ok(RenameOutcome { new_id: old_id.to_string(), merged: false });
+    }
+
+    let new_id = format!("e:{}", norm(new_name));
+    let _guard = GRAPH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut conn = open(data_root)?;
+    let now = chrono::Local::now().to_rfc3339();
+
+    if new_id == old_id {
+        // 规范名不变(仅大小写/首尾空白差异):纯换展示名,id 不变;仍记覆盖,防 rebuild 冲回。
+        conn.execute(
+            "UPDATE entities SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![new_name, now, old_id],
+        )?;
+        conn.execute(
+            "INSERT INTO entity_name_overrides(id, name) VALUES(?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET name = ?2",
+            rusqlite::params![old_id, new_name],
+        )?;
+        return Ok(RenameOutcome { new_id, merged: false });
+    }
+
+    let tx = conn.transaction()?;
+    let target_exists: bool = tx
+        .query_row("SELECT 1 FROM entities WHERE id = ?1", [&new_id], |_| Ok(()))
+        .is_ok();
+
+    if target_exists {
+        // 合并:old 的边并入 new(计数相加,与 upsert_note 的求和公式一致),别名并集,删旧行。
+        tx.execute(
+            "INSERT INTO note_entities(note_id, entity_id, mention_count)
+             SELECT note_id, ?1, mention_count FROM note_entities WHERE entity_id = ?2
+             ON CONFLICT(note_id, entity_id) DO UPDATE SET mention_count = mention_count + excluded.mention_count",
+            rusqlite::params![new_id, old_id],
+        )?;
+        tx.execute("DELETE FROM note_entities WHERE entity_id = ?1", [old_id])?;
+        let old_name: Option<String> =
+            tx.query_row("SELECT name FROM entities WHERE id = ?1", [old_id], |r| r.get(0)).ok();
+        let old_aliases: Option<String> =
+            tx.query_row("SELECT aliases FROM entities WHERE id = ?1", [old_id], |r| r.get(0)).ok();
+        let existing_aliases: Option<String> =
+            tx.query_row("SELECT aliases FROM entities WHERE id = ?1", [&new_id], |r| r.get(0)).ok();
+        let mut merged_aliases = existing_aliases.clone().unwrap_or_else(|| "[]".into());
+        if let Some(on) = &old_name {
+            merged_aliases = merge_aliases(Some(&merged_aliases), on, &[]);
+        }
+        if let Some(oa) = old_aliases.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()) {
+            let target_name: String =
+                tx.query_row("SELECT name FROM entities WHERE id = ?1", [&new_id], |r| r.get(0))?;
+            merged_aliases = merge_aliases(Some(&merged_aliases), &target_name, &oa);
+        }
+        tx.execute(
+            "UPDATE entities SET name = ?1, aliases = ?2, updated_at = ?3 WHERE id = ?4",
+            rusqlite::params![new_name, merged_aliases, now, new_id],
+        )?;
+        tx.execute("DELETE FROM entities WHERE id = ?1", [old_id])?;
+    } else {
+        // 纯改名:整行连同它的边一起迁到新 id(new_id 尚不存在,不会撞主键)。
+        tx.execute(
+            "UPDATE entities SET id = ?1, name = ?2, updated_at = ?3 WHERE id = ?4",
+            rusqlite::params![new_id, new_name, now, old_id],
+        )?;
+        tx.execute(
+            "UPDATE note_entities SET entity_id = ?1 WHERE entity_id = ?2",
+            rusqlite::params![new_id, old_id],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO entity_redirects(old_id, new_id) VALUES(?1, ?2)
+         ON CONFLICT(old_id) DO UPDATE SET new_id = ?2",
+        rusqlite::params![old_id, new_id],
+    )?;
+    // 路径压缩:曾经重定向到 old_id 的旧记录,一并转向新的 new_id,避免链越拖越长。
+    tx.execute(
+        "UPDATE entity_redirects SET new_id = ?1 WHERE new_id = ?2 AND old_id != ?2",
+        rusqlite::params![new_id, old_id],
+    )?;
+    tx.execute(
+        "INSERT INTO entity_name_overrides(id, name) VALUES(?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET name = ?2",
+        rusqlite::params![new_id, new_name],
+    )?;
+    tx.commit()?;
+    Ok(RenameOutcome { new_id, merged: target_exists })
 }
 
 /// 清表后遍历 notes 根下所有笔记目录,逐篇 load_refined 重灌。返回入图笔记数。
@@ -546,5 +705,70 @@ mod tests {
         assert!(links.iter().any(|(l, g, p)| l == "ent_2" && g == "e:灯塔计划" && !*p), "灯塔计划→非人");
         assert!(links.iter().any(|(l, g, p)| l == "ent_3" && g == "e:李四" && !*p), "李四无匹配→退化非人");
         assert!(resolve_local_ids(root.path(), "no-such-note").unwrap().is_empty(), "无 aing.json → 空");
+    }
+
+    #[test]
+    fn rename_entity_pure_rename_migrates_id_and_edges() {
+        let root = tempfile::tempdir().unwrap();
+        upsert_note(
+            root.path(), "n1",
+            &doc_with(vec![ent("ent_1", "term", "B端", &[])], vec![para("B端", vec![Mention { entity: "ent_1".into(), start: 0, end: 2 }])]),
+        ).unwrap();
+        let outcome = rename_entity(root.path(), "e:b端", "B 端").unwrap();
+        assert_eq!(outcome.new_id, "e:b 端");
+        assert!(!outcome.merged);
+        let ents = list_entities(root.path()).unwrap();
+        assert_eq!(ents.len(), 1, "旧行迁移不重复");
+        assert_eq!(ents[0].id, "e:b 端");
+        assert_eq!(ents[0].name, "B 端");
+        assert_eq!(ents[0].note_count, 1, "边跟着迁,不丢");
+    }
+
+    #[test]
+    fn rename_entity_merges_on_collision_and_sums_counts() {
+        let root = tempfile::tempdir().unwrap();
+        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1", "term", "B端", &["旧名"])], vec![para("x", vec![])])).unwrap();
+        upsert_note(root.path(), "n2", &doc_with(vec![ent("ent_1", "term", "B 端", &[])], vec![para("x", vec![])])).unwrap();
+        let outcome = rename_entity(root.path(), "e:b端", "B 端").unwrap();
+        assert_eq!(outcome.new_id, "e:b 端");
+        assert!(outcome.merged, "撞上已存在的 B 端 → 合并");
+        let ents = list_entities(root.path()).unwrap();
+        assert_eq!(ents.len(), 1, "旧行被删,只剩合并后的一个");
+        assert_eq!(ents[0].note_count, 2, "两篇笔记都算上");
+        assert!(ents[0].aliases.iter().any(|a| a == "旧名"), "旧实体的别名并入");
+    }
+
+    #[test]
+    fn rename_entity_redirect_survives_rebuild_all() {
+        let root = tempfile::tempdir().unwrap();
+        let d = doc_with(vec![ent("ent_1", "term", "B端", &[])], vec![para("x", vec![])]);
+        write_note(root.path(), "n1", &d); // rebuild_all 从磁盘 aing.json 扫,upsert_note 本身不落盘
+        upsert_note(root.path(), "n1", &d).unwrap();
+        rename_entity(root.path(), "e:b端", "B 端").unwrap();
+        // 整库重建(从 aing.json 重灌,aing.json 里存的还是旧名"B端")
+        rebuild_all(root.path()).unwrap();
+        let ents = list_entities(root.path()).unwrap();
+        assert_eq!(ents.len(), 1, "重建后没有裂成新旧两个实体");
+        assert_eq!(ents[0].id, "e:b 端", "旧名经重定向收口到改名后的规范 id");
+        assert_eq!(ents[0].name, "B 端");
+    }
+
+    #[test]
+    fn rename_entity_person_delegates_to_voiceprint_store() {
+        let root = tempfile::tempdir().unwrap();
+        write_vp(root.path(), r#"{"schema_version":1,"next_person":2,"people":{"P1":{"name":"张三"}}}"#);
+        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1", "person", "张三", &[])], vec![para("x", vec![])])).unwrap();
+        let outcome = rename_entity(root.path(), "P1", "张三丰").unwrap();
+        assert_eq!(outcome.new_id, "P1", "人实体 id 不变");
+        assert!(!outcome.merged);
+        let vp = store::VoiceprintStore::new(root.path().to_path_buf()).load();
+        assert_eq!(vp.people["P1"].name, "张三丰", "声纹库才是人物改名的真值源");
+    }
+
+    #[test]
+    fn rename_entity_rejects_empty_name() {
+        let root = tempfile::tempdir().unwrap();
+        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1", "term", "X", &[])], vec![para("x", vec![])])).unwrap();
+        assert!(rename_entity(root.path(), "e:x", "   ").is_err());
     }
 }

@@ -2,9 +2,39 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, entityDetail, kindLabel, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
+  import { graphData, entityDetail, renameEntity, kindLabel, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { formatDate } from "$lib/notes";
   import ForceGraph from "$lib/ForceGraph.svelte";
+
+  // 改名(纠 ASR 提取错的实体名)。
+  let renaming = $state(false);
+  let renameValue = $state("");
+  let renameErr = $state("");
+  let renameBusy = $state(false);
+  function startRename(d: EntityDetail) {
+    renameValue = d.name;
+    renameErr = "";
+    renaming = true;
+  }
+  async function submitRename(oldId: string) {
+    const name = renameValue.trim();
+    if (!name || renameBusy) return;
+    renameBusy = true;
+    try {
+      const r = await renameEntity(oldId, name);
+      renaming = false;
+      if (r.new_id === oldId) {
+        // id 没变(人实体改名 / 纯大小写归一后相同):URL 没变,goto 不会重新拉取,手动刷新。
+        detail = await entityDetail(r.new_id).catch(() => detail);
+      } else {
+        goto("/graph?e=" + encodeURIComponent(r.new_id));
+      }
+    } catch (e) {
+      renameErr = `改名失败: ${e}`;
+    } finally {
+      renameBusy = false;
+    }
+  }
 
   /** 详情页小型关系图的节点容量——比全局图(60)小得多,一个实体的最强关系够看清。 */
   const EGO_MAX_RELATED = 30;
@@ -35,6 +65,8 @@
   // 选中变化 → 拉详情。侧栏点人实体已直接跳 /speakers,这里只处理非人。
   $effect(() => {
     const id = selected;
+    renaming = false;
+    renameErr = "";
     if (!id) {
       detail = null;
       return;
@@ -97,12 +129,34 @@
     <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
     <p class="hint">加载中…</p>
   {:else if selected && detail}
+    {@const d = detail}
     <div class="detail">
       <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
       <div class="d-head">
-        <span class="d-name">{detail.name}</span>
+        {#if renaming}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="d-rename-input"
+            autofocus
+            bind:value={renameValue}
+            disabled={renameBusy}
+            onkeydown={(e) => {
+              if (e.key === "Enter") submitRename(d.id);
+              if (e.key === "Escape") renaming = false;
+            }}
+            onblur={() => submitRename(d.id)}
+          />
+        {:else}
+          <span class="d-name">{detail.name}</span>
+        {/if}
         <span class="kind">{kindLabel(detail.kind)}</span>
+        {#if !renaming}
+          <button class="d-rename-btn" onclick={() => startRename(d)} title="改名(纠正提取错误)">改名</button>
+        {/if}
       </div>
+      {#if renameErr}
+        <p class="d-rename-err">{renameErr}</p>
+      {/if}
       {#if detail.aliases.length}
         <p class="d-aliases">
           别名:{detail.aliases.slice(0, 6).join("、")}{detail.aliases.length > 6
@@ -180,6 +234,17 @@
   }
   .back:hover { color: var(--ink); }
   .d-head { flex: none; display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .d-rename-input {
+    font-size: 20px; font-weight: 500; color: var(--ink); font-family: inherit;
+    background: var(--surface-soft); border: 1px solid var(--accent); border-radius: 6px;
+    padding: 1px 6px; min-width: 8em;
+  }
+  .d-rename-btn {
+    background: none; border: 0; padding: 0; cursor: pointer; margin-left: auto;
+    font-size: 12px; font-weight: 500; color: var(--ink-faint); font-family: inherit;
+  }
+  .d-rename-btn:hover { color: var(--accent); }
+  .d-rename-err { font-size: 12px; color: var(--danger-ink); margin: -4px 0 8px; }
   .d-name { font-size: 20px; font-weight: 500; color: var(--ink); }
   .kind {
     font-size: 11px; color: var(--ink-secondary);
