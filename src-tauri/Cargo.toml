@@ -41,7 +41,8 @@ sha2 = "0.10"
 hex = "0.4"
 bzip2 = "0.5"
 tar = "0.4"
-webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
+# webrtc-audio-processing 移至下方 [target.'cfg(not(windows))'.dependencies]:
+# 上游官方不支持 MSVC,Windows 由 audio/aec_stub.rs 顶替同形 API。
 # logging.rs 的 stderr 重定向(dup2/isatty)。
 libc = "0.2"
 toml_edit = "0.25.12"
@@ -61,6 +62,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Windows 排除:上游官方不支持 MSVC(CI 无 windows、issue #34 维护者明言无测试机、
+# build.rs 走 meson+GCC 旗标),Windows 侧由 audio/aec_stub.rs 顶替同形 API
+# (构造返回 Err → 无 AEC 降级,文本级回声去重兜底)。
+[target.'cfg(not(windows))'.dependencies]
+webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_13_0"] }

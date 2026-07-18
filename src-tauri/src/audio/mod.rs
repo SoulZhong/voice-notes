@@ -1,3 +1,9 @@
+// 软件 AEC(WebRTC AEC3):Windows 上依赖不可构建(见 aec_stub.rs 头注),
+// 用 #[path] 顶替同形桩模块——消费方(session/segment_worker/echo_clean)零分叉。
+#[cfg(not(windows))]
+pub mod aec;
+#[cfg(windows)]
+#[path = "aec_stub.rs"]
 pub mod aec;
 pub mod resample;
 pub mod mock;
@@ -11,6 +17,8 @@ pub mod neural_aec;
 pub mod system;
 #[cfg(target_os = "macos")]
 pub mod vpio;
+#[cfg(windows)]
+pub mod loopback;
 
 use crossbeam_channel::Sender;
 

@@ -745,7 +745,7 @@ fn spawn_session(
                 )
             });
             let mic_health = Arc::new(SourceHealth::default());
-            let mut mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
+            let mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
                 let app = app.clone();
                 let health = mic_health.clone();
                 let app2 = app.clone();
@@ -786,9 +786,9 @@ fn spawn_session(
             session_health.push((Source::Mic, mic_health));
             sources.push((Source::Mic, mic, mic_seg));
         }
-        // record_system_only 且非 macOS：System 源不存在（下方块仅 macOS 编译），
-        // 源列表将为空，start_session 会因无源可启动返回 Err、开录失败——正是 required
-        // 守卫要兜住的场景（本应用 macOS-only，可接受）。
+        // record_system_only 且非 macOS/Windows(如 Linux):System 源不存在,源列表
+        // 将为空,start_session 会因无源可启动返回 Err、开录失败——正是 required
+        // 守卫要兜住的场景。macOS 走 SCK、Windows 走 WASAPI loopback(下方两块)。
 
         #[cfg(target_os = "macos")]
         {
@@ -804,7 +804,7 @@ fn spawn_session(
                         )
                     });
                     let sys_health = Arc::new(SourceHealth::default());
-                    let mut sys_resilient =
+                    let sys_resilient =
                         audio::resilient::ResilientCapture::new(sys_factory, {
                             let app = app.clone();
                             let health = sys_health.clone();
@@ -858,12 +858,76 @@ fn spawn_session(
             }
         }
 
+        // Windows:系统声音走 WASAPI loopback(对默认输出设备建环回流)。无授权
+        // 概念,失败即 unavailable 降级。静默期不回调由 TapPolicy::system_loopback
+        // 的 250ms 补零维持时间轴;设备切换/流错误经 CaptureEvent 触发自愈重启,
+        // 重启重新解析默认输出设备,天然跟随用户换设备。
+        #[cfg(windows)]
+        {
+            match new_silero(&vad_path) {
+                Ok(sys_seg) => {
+                    let sys_factory: audio::resilient::CaptureFactory = Box::new(|| {
+                        let (etx, erx) = crossbeam_channel::unbounded();
+                        (
+                            Box::new(audio::loopback::LoopbackCapture::with_events(etx))
+                                as Box<dyn AudioCapture>,
+                            erx,
+                        )
+                    });
+                    let sys_health = Arc::new(SourceHealth::default());
+                    let sys_resilient =
+                        audio::resilient::ResilientCapture::new(sys_factory, {
+                            let app = app.clone();
+                            let health = sys_health.clone();
+                            let app2 = app.clone();
+                            audio::resilient::ResilientNotify {
+                                on_recovered: Some(Box::new(move || {
+                                    health.restarts.fetch_add(1, Ordering::Relaxed);
+                                    let _ = app.emit(
+                                        "source_health",
+                                        ipc::SourceHealthEvent {
+                                            source: "system".into(),
+                                            state: "recovered".into(),
+                                        },
+                                    );
+                                })),
+                                on_lost: Some(Box::new(move || {
+                                    let _ = app2.emit(
+                                        "source_health",
+                                        ipc::SourceHealthEvent {
+                                            source: "system".into(),
+                                            state: "lost".into(),
+                                        },
+                                    );
+                                })),
+                            }
+                        });
+                    // 环回静默是常态(policy stall_after=None,tap 不判失联),
+                    // 自愈只由 cpal 错误事件驱动,kicker 不接。
+                    let sys: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
+                        Box::new(sys_resilient),
+                        Source::System,
+                        TapPolicy::system_loopback(),
+                        sys_health.clone(),
+                        TapNotify::none(),
+                    ));
+                    session_health.push((Source::System, sys_health));
+                    sources.push((Source::System, sys, sys_seg));
+                }
+                Err(e) => {
+                    eprintln!("系统声音 VAD 构建失败，降级为仅麦克风: {e}");
+                }
+            }
+        }
+
         // 软件回声消除(WebRTC AEC3):「保持外放音量」下 VPIO 不启动,改由本模块以
         // system 采集流为远端参考,把外放回声从 mic 波形里消掉——mic 路只剩本人声音,
         // 文本级回声去重链降级为兜底。仅 mic+system 双源齐备才有意义;初始化失败
         // 降级为无 AEC(行为同引入前),绝不挡录制。VPIO 模式(默认)不叠加软件 AEC。
+        // Windows 恒尝试:该平台无 VPIO 可选,软件 AEC 是唯一声学消回声路径
+        // (当前为 stub,构造返回 Err → 走下方降级日志,文本级回声去重兜底)。
         let mut aec_roles: Vec<(Source, audio::aec::AecRole)> = Vec::new();
-        if keep_output_volume
+        if (keep_output_volume || cfg!(windows))
             && sources.iter().any(|(s, _, _)| *s == Source::Mic)
             && sources.iter().any(|(s, _, _)| *s == Source::System)
         {
