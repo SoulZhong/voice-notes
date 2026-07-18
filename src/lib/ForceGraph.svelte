@@ -224,11 +224,16 @@
     };
   }
 
-  /** 图大(展开显示全部实体后常见)时不能走逐帧动画——每 tick 触发 refreshSnap 意味着
-      每 tick 都要重渲染成百上千个 DOM 节点,几十上百次叠加实测能把页面直接卡死。
-      heavy 时改走「冷启动」:关掉 tick 事件监听,同步跑够 tick 数直接定格,只渲染一次。
-      拖拽/resize 等交互也要查这个标记,不然事后重新热起 alphaTarget 一样会卡。 */
+  /** heavy(>150 节点/>800 边):只影响物理参数(弱斥力/强向心力,把孤岛拉近、填满
+      画布),不等于要放弃逐帧动画——backbone 已经把边数按节点线性封顶了,几百节点
+      的「展开一层」逐帧渲染完全跑得动,直接冻结定格反而让用户看不出发生了什么
+      (冒烟反馈"为什么没有动效")。
+      skipAnimation(阈值高得多,>450 节点):真正巨大的图(「显示全部」常见的
+      900+ 节点)才需要跳过逐帧动画直接冷启动定格,不然照样卡死。拖拽/resize 等
+      交互要查的是这个标记,而不是 heavy——178/335 节点的展开态该有动画,也该在
+      拖拽时正常重热仿真。 */
   let heavy = false;
+  let skipAnimation = false;
 
   /** (重)建仿真:首次挂载与之后每次 nodes/edges/规模参数变化(如详情页切换中心实体)都要
       重跑,否则组件被复用时 props 换了但内部仿真停留在旧数据,图不更新。 */
@@ -265,10 +270,17 @@
       .force("gravityX", forceX<SimNode>(width / 2).strength(gravityStrength))
       .force("gravityY", forceY<SimNode>(height / 2).strength(gravityStrength))
       .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6))
+      // heavy 图默认衰减(alphaDecay≈0.0228,~300 tick、5 秒+)配合弱化过的斥力,
+      // 动画拖得很长、过程飘来飘去看着乱(冒烟反馈"动的时间太长了很混乱")。
+      // 调快衰减(~150 tick、3 秒内)+ 加大阻尼(velocityDecay,抑制过冲/来回摆动),
+      // 让"展开一层"的生长动画短平快、不慌乱。
+      .alphaDecay(heavy ? 0.3 : 0.0228)
+      .velocityDecay(heavy ? 0.45 : 0.4)
       .on("tick", refreshSnap);
-    if (reduce || heavy) {
+    skipAnimation = dNodes.length > 450 || dLinks.length > 2500;
+    if (reduce || skipAnimation) {
       sim.stop();
-      if (heavy) {
+      if (skipAnimation) {
         // 固定 tick 数是猜的,猜错了就是这样:弱化过斥力(-55)之后收敛变慢,固定
         // 90 tick 根本不够把碰撞力(collide)真正撑开,新长出来的节点(没有旧位置
         // 可继承,d3 从零初始化)挤成一坨、圆圈和文字互相重叠(冒烟反馈"是不是要
@@ -296,9 +308,9 @@
       width = container.clientWidth || width;
       height = container.clientHeight || height;
       sim?.force("center", forceCenter(width / 2, height / 2));
-      // heavy 图 resize 不走 alphaTarget 持续重热(会重新触发逐 tick 全量重渲染),
+      // 巨图 resize 不走 alphaTarget 持续重热(会重新触发逐 tick 全量重渲染),
       // 冷启动重定格一次即可——容器大小变化不需要重新物理仿真,只是换个中心点。
-      if (heavy) {
+      if (skipAnimation) {
         sim?.tick(20);
         refreshSnap();
       } else {
