@@ -222,7 +222,30 @@
   const dimLink = (aid: string, bid: string) =>
     hovered !== null && aid !== hovered && bid !== hovered;
 
-  // 拖拽 + 点击(位移小判点击)。
+  /** 自适应缩放:力导仿真的间距是固定物理单位,跟容器大小无关——图少、容器大时会挤成
+      一小团、四周大片空白。每次渲染都按节点实际占据的包围盒(含半径留白)算一个整体
+      缩放+居中变换,让图形永远撑满容器,而不是死守仿真给的绝对像素间距。 */
+  const fit = $derived.by(() => {
+    const ns = snap.nodes;
+    if (ns.length === 0) return { scale: 1, tx: 0, ty: 0 };
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of ns) {
+      minX = Math.min(minX, n.x - n.r);
+      minY = Math.min(minY, n.y - n.r);
+      maxX = Math.max(maxX, n.x + n.r);
+      maxY = Math.max(maxY, n.y + n.r);
+    }
+    const bw = Math.max(1, maxX - minX);
+    const bh = Math.max(1, maxY - minY);
+    // 封顶 2.5x:防止节点很少时被放大到失真;留 8% 边距不贴边。
+    const scale = Math.min((width / bw) * 0.92, (height / bh) * 0.92, 2.5);
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    return { scale, tx: width / 2 - cx * scale, ty: height / 2 - cy * scale };
+  });
+
+  // 拖拽 + 点击(位移小判点击)。拖拽落点要经 fit 变换逆运算转回仿真坐标系,
+  // 否则缩放不为 1 时鼠标与节点视觉位置对不上。
   let dragId: string | null = null;
   let moved = false;
   function onDown(id: string, e: PointerEvent) {
@@ -242,8 +265,8 @@
     const rect = container.getBoundingClientRect();
     const n = dNodes.find((d) => d.id === dragId);
     if (n) {
-      n.fx = e.clientX - rect.left;
-      n.fy = e.clientY - rect.top;
+      n.fx = (e.clientX - rect.left - fit.tx) / fit.scale;
+      n.fy = (e.clientY - rect.top - fit.ty) / fit.scale;
     }
   }
   function onUp(id: string, isPerson: boolean) {
@@ -260,37 +283,42 @@
 
 <div class="fg" bind:this={container}>
   <svg {width} {height} role="img" aria-label="知识图谱力导向图">
-    <g class="edges">
-      {#each snap.links as l (l.aid + "-" + l.bid)}
-        <!-- 边粗细=关系强弱(共享笔记数),连续映射而非固定档;title 给 hover 原生提示 -->
-        <line
-          x1={l.x1}
-          y1={l.y1}
-          x2={l.x2}
-          y2={l.y2}
-          stroke="var(--hairline-strong)"
-          stroke-width={Math.min(5, 0.5 + l.w * 0.7)}
-          opacity={dimLink(l.aid, l.bid) ? 0.06 : 0.35}
-        ><title>共享 {l.w} 篇笔记</title></line>
-      {/each}
-    </g>
-    <g class="nodes">
-      {#each snap.nodes as n (n.id)}
-        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-        <g
-          transform="translate({n.x},{n.y})"
-          opacity={dimNode(n.id) ? 0.22 : 1}
-          style="cursor:pointer"
-          onpointerdown={(e) => onDown(n.id, e)}
-          onpointermove={onMove}
-          onpointerup={() => onUp(n.id, n.is_person)}
-          onmouseenter={() => (hovered = n.id)}
-          onmouseleave={() => (hovered = null)}
-        >
-          <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}><title>{n.name}</title></circle>
-          <text class="lbl" font-size={Math.min(14, Math.max(8, 6 + n.r * 0.22))}>{n.label}</text>
-        </g>
-      {/each}
+    <!-- 自适应缩放+居中:见 fit 的注释,让图形永远撑满容器而非挤成一小团。 -->
+    <g transform="translate({fit.tx},{fit.ty}) scale({fit.scale})">
+      <g class="edges">
+        {#each snap.links as l (l.aid + "-" + l.bid)}
+          <!-- 边粗细=关系强弱(共享笔记数),连续映射而非固定档;title 给 hover 原生提示;
+               non-scaling-stroke 防 fit 缩放把线宽也跟着放大失真 -->
+          <line
+            x1={l.x1}
+            y1={l.y1}
+            x2={l.x2}
+            y2={l.y2}
+            stroke="var(--hairline-strong)"
+            stroke-width={Math.min(5, 0.5 + l.w * 0.7)}
+            opacity={dimLink(l.aid, l.bid) ? 0.06 : 0.35}
+            vector-effect="non-scaling-stroke"
+          ><title>共享 {l.w} 篇笔记</title></line>
+        {/each}
+      </g>
+      <g class="nodes">
+        {#each snap.nodes as n (n.id)}
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+          <g
+            transform="translate({n.x},{n.y})"
+            opacity={dimNode(n.id) ? 0.22 : 1}
+            style="cursor:pointer"
+            onpointerdown={(e) => onDown(n.id, e)}
+            onpointermove={onMove}
+            onpointerup={() => onUp(n.id, n.is_person)}
+            onmouseenter={() => (hovered = n.id)}
+            onmouseleave={() => (hovered = null)}
+          >
+            <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}><title>{n.name}</title></circle>
+            <text class="lbl" font-size={Math.min(14, Math.max(8, 6 + n.r * 0.22))}>{n.label}</text>
+          </g>
+        {/each}
+      </g>
     </g>
   </svg>
   {#if truncated > 0}
