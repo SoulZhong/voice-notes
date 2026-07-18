@@ -89,12 +89,16 @@
   }
 
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
-  // expanded 时三道封顶(节点数/边权重下限/每节点 backbone)全部解除,画出这份数据里
-  // 全部有共现关系的实体——用户点「显示全部」之后才走这条路径,默认仍是可读骨架图。
+  // expanded 时放宽节点数/边权重下限封顶,画出这份数据里全部有共现关系的实体——
+  // 用户点「显示全部」之后才走这条路径,默认仍是可读骨架图。
+  // **backbone 稀疏化即便 expanded 也不能真的解除**:实测撞过真实卡死——900+ 实体
+  // 数据集全量共现边有几万条,forceLink 每 tick 都要过一遍全部边,配合每 tick 全量
+  // 重渲染上千个 DOM 节点,浏览器直接卡死。放宽到 6(默认 3)已经比骨架图丰富得多,
+  // 边数量级仍被按节点数线性封顶,不会随原始边数暴涨。
   function build() {
     const effMinWeight = expanded ? 1 : minEdgeWeight;
-    const effMaxNodes = expanded ? Infinity : maxNodes;
-    const effBackboneK = expanded ? Infinity : backboneK;
+    const effMaxNodes = expanded ? 2000 : maxNodes;
+    const effBackboneK = expanded ? Math.max(6, backboneK) : backboneK;
     // 只用「权重≥effMinWeight」的强边:度数、选点、连线都基于强边。
     const strong = allEdges.filter((e) => e.weight >= effMinWeight);
     const deg = new Set<string>();
@@ -156,6 +160,12 @@
     };
   }
 
+  /** 图大(展开显示全部实体后常见)时不能走逐帧动画——每 tick 触发 refreshSnap 意味着
+      每 tick 都要重渲染成百上千个 DOM 节点,几十上百次叠加实测能把页面直接卡死。
+      heavy 时改走「冷启动」:关掉 tick 事件监听,同步跑够 tick 数直接定格,只渲染一次。
+      拖拽/resize 等交互也要查这个标记,不然事后重新热起 alphaTarget 一样会卡。 */
+  let heavy = false;
+
   /** (重)建仿真:首次挂载与之后每次 nodes/edges/规模参数变化(如详情页切换中心实体)都要
       重跑,否则组件被复用时 props 换了但内部仿真停留在旧数据,图不更新。 */
   function rebuild() {
@@ -166,6 +176,7 @@
     viewX = 0;
     viewY = 0;
     build();
+    heavy = dNodes.length > 150 || dLinks.length > 800;
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     sim = forceSimulation<SimNode>(dNodes)
       .force("charge", forceManyBody().strength(-190))
@@ -179,9 +190,9 @@
       .force("center", forceCenter(width / 2, height / 2))
       .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6))
       .on("tick", refreshSnap);
-    if (reduce) {
+    if (reduce || heavy) {
       sim.stop();
-      sim.tick(120);
+      sim.tick(heavy ? 90 : 120);
       refreshSnap();
     }
   }
@@ -196,7 +207,14 @@
       width = container.clientWidth || width;
       height = container.clientHeight || height;
       sim?.force("center", forceCenter(width / 2, height / 2));
-      sim?.alpha(0.3).restart();
+      // heavy 图 resize 不走 alphaTarget 持续重热(会重新触发逐 tick 全量重渲染),
+      // 冷启动重定格一次即可——容器大小变化不需要重新物理仿真,只是换个中心点。
+      if (heavy) {
+        sim?.tick(20);
+        refreshSnap();
+      } else {
+        sim?.alpha(0.3).restart();
+      }
     });
     if (container) ro.observe(container);
     return () => ro.disconnect();
@@ -360,7 +378,9 @@
     moved = false;
     const n = dNodes.find((d) => d.id === id);
     if (n) {
-      sim?.alphaTarget(0.3).restart();
+      // heavy 图不重热仿真(alphaTarget 持续重启=逐 tick 全量重渲染,卡死元凶之一),
+      // 只把这一个节点钉在指针位置、手动单帧刷新——其余节点保持冷却定格不陪着抖。
+      if (!heavy) sim?.alphaTarget(0.3).restart();
       n.fx = n.x;
       n.fy = n.y;
     }
@@ -373,6 +393,7 @@
     if (n) {
       n.fx = ((e.clientX - rect.left - viewX) / viewZoom - fit.tx) / fit.scale;
       n.fy = ((e.clientY - rect.top - viewY) / viewZoom - fit.ty) / fit.scale;
+      if (heavy) refreshSnap();
     }
   }
   function onUp(id: string, isPerson: boolean) {
@@ -381,7 +402,7 @@
       n.fx = null;
       n.fy = null;
     }
-    sim?.alphaTarget(0);
+    if (!heavy) sim?.alphaTarget(0);
     // dragId 只在左键 onDown 时被置位(见上方注释);右键释放时 dragId 仍是上次左键交互
     // 遗留值(通常是 null),不等于当前 id,故不会误触发导航。
     if (dragId === id && !moved) onPick(id, isPerson);
