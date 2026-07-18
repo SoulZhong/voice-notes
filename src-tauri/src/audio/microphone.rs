@@ -1,4 +1,4 @@
-use super::{AudioCapture, AudioFrame};
+use super::{AudioCapture, AudioFrame, CaptureEvent};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use crossbeam_channel::Sender;
@@ -11,11 +11,18 @@ use crossbeam_channel::Sender;
 pub struct Microphone {
     /// Dropping this sender signals the background thread to stop the stream.
     stop_tx: Option<crossbeam_channel::Sender<()>>,
+    /// 运行期流错误上报口(断连自愈消费);未接线时仅落日志,行为同引入前。
+    events: Option<Sender<CaptureEvent>>,
 }
 
 impl Microphone {
     pub fn new() -> Self {
-        Self { stop_tx: None }
+        Self { stop_tx: None, events: None }
+    }
+
+    /// 带流错误上报的构造:err_fn 触发时把错误升格为 CaptureEvent(仍保留日志)。
+    pub fn with_events(events: Sender<CaptureEvent>) -> Self {
+        Self { stop_tx: None, events: Some(events) }
     }
 }
 
@@ -48,8 +55,14 @@ impl AudioCapture for Microphone {
         let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
 
         // --- background thread owns the !Send stream ---
+        let events = self.events.clone();
         std::thread::spawn(move || {
-            let err_fn = |e: cpal::StreamError| eprintln!("麦克风流错误: {e}");
+            let err_fn = move |e: cpal::StreamError| {
+                eprintln!("麦克风流错误: {e}");
+                if let Some(tx) = &events {
+                    let _ = tx.send(CaptureEvent::Error(e.to_string()));
+                }
+            };
             let stream = match device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {

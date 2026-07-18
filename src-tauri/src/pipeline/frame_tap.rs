@@ -87,7 +87,9 @@ impl TapPolicy {
     pub fn system_sck() -> Self {
         Self {
             fill_after: Duration::from_secs(1),
-            stall_after: None,
+            // SCK 静音也持续回调,帧荒 5s 基本可判流死亡(权限被撤/内部崩溃)。
+            // 阈值比 mic 宽:SCK 偶发调度毛刺比 cpal 常见,宁慢勿误杀。
+            stall_after: Some(Duration::from_secs(5)),
             tick: Duration::from_millis(100),
         }
     }

@@ -73,6 +73,16 @@ pub struct StorageEvent {
     pub state: String,
 }
 
+/// 采集源运行期健康,事件名 "source_health"。录制中某源断流自愈的结局通报:
+/// "recovered" = 重启成功帧已续上;"lost" = 一轮重试耗尽本场放弃(该源时间轴
+/// 由静音填充维持,另一源不受影响)。前端可据此提示"麦克风已断开/已恢复";
+/// 未接监听也不影响任何现有流程。
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceHealthEvent {
+    pub source: String, // "mic" | "system"
+    pub state: String,  // "recovered" | "lost"
+}
+
 /// 说话人表(全量推送),事件名 "speakers"。name 空串 = 未改名(前端按 id 兜底)。
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeakerEntry {
