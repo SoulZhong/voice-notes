@@ -300,7 +300,7 @@
     <button
       class="vtab"
       class:active={tab === "graph"}
-      onclick={() => { if ($page.url.pathname !== "/graph") goto("/graph"); }}>图谱</button
+      onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>图谱</button
     >
     <button
       class="vtab"
