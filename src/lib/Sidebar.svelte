@@ -17,6 +17,7 @@
   import { tidy } from "$lib/tidy.svelte";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
+  import { graphFilter } from "$lib/graphFilter.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -87,8 +88,6 @@
 
   // ── 图谱:实体列表作为主从结构的 master(搜索 + kind 过滤在侧栏,主区放详情面板)──
   let graphEnts = $state<EntitySummary[]>([]);
-  let graphQuery = $state("");
-  let graphKind = $state("all");
 
   async function refreshGraph() {
     try {
@@ -108,8 +107,8 @@
   });
   const graphShown = $derived(
     graphEnts.filter((e) => {
-      if (graphKind !== "all" && e.kind !== graphKind) return false;
-      const q = graphQuery.trim().toLowerCase();
+      if (graphFilter.kind !== "all" && e.kind !== graphFilter.kind) return false;
+      const q = graphFilter.query.trim().toLowerCase();
       if (!q) return true;
       return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
     }),
@@ -431,13 +430,13 @@
       </svg>
       全局图谱
     </button>
-    <input class="search" type="search" placeholder="搜索实体…" bind:value={graphQuery} />
+    <input class="search" type="search" placeholder="搜索实体…" bind:value={graphFilter.query} />
     <div class="gchips">
-      <button class="gchip" class:on={graphKind === "all"} onclick={() => (graphKind = "all")}>全部</button>
+      <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
       {#each graphKinds as k (k)}
         <!-- 圆点=该 kind 在力导图上的节点色(kindInk,与 ForceGraph.svelte 同一份取色
              逻辑),让过滤药丸跟图上的圆圈对得上号,不再是一片同色灰药丸 -->
-        <button class="gchip" class:on={graphKind === k} onclick={() => (graphKind = k)}>
+        <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
           <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
         </button>
       {/each}
