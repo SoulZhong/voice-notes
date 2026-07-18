@@ -3,6 +3,12 @@
 
 use std::path::PathBuf;
 
+// GUI↔stdio 的 UDS 桥:std 不在 Windows 暴露 Unix socket,#[path] 顶替同形桩
+// (控制类降级为人话指引,查询类直读磁盘不受影响),与 audio/aec 的门控手法一致。
+#[cfg(unix)]
+pub mod bridge;
+#[cfg(windows)]
+#[path = "bridge_stub.rs"]
 pub mod bridge;
 mod cli_control;
 pub mod cli_query;
@@ -10,6 +16,10 @@ pub mod registry;
 pub mod server;
 pub mod skill;
 pub mod tools;
+#[cfg(unix)]
+pub mod uds;
+#[cfg(windows)]
+#[path = "uds_stub.rs"]
 pub mod uds;
 
 /// 无 tauri 环境下的 app_data_dir。identifier 与 tauri.conf.json 保持一致——
