@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, type Simulation } from "d3-force";
   import type { EntitySummary, EdgeRow } from "$lib/graph";
-  import { speakerColor } from "$lib/notes";
+  import { speakerInk } from "$lib/notes";
 
   let {
     nodes: allNodes,
@@ -35,7 +35,7 @@
 
   // 渲染快照(每 tick 刷新;与 d3 mutate 的节点对象解耦,保证 Svelte 反应式更新)。
   let snap = $state<{
-    nodes: { id: string; label: string; is_person: boolean; x: number; y: number; r: number }[];
+    nodes: { id: string; label: string; kind: string; is_person: boolean; x: number; y: number; r: number }[];
     links: { aid: string; bid: string; x1: number; y1: number; x2: number; y2: number; w: number }[];
   }>({ nodes: [], links: [] });
 
@@ -43,17 +43,40 @@
   let dNodes: SimNode[] = [];
   let dLinks: SimLink[] = [];
 
-  const MIN_R = 16;
-  const MAX_R = 30;
+  const MIN_R = 13;
+  const MAX_R = 32;
   const CHAR_PX = 8; // 中英混排近似字宽(10px 字号)
-  const nodeColor = (id: string, isPerson: boolean) => (isPerson ? speakerColor(id, "mic") : "var(--ink-faint)");
 
-  /** 半径按「装得下文字」算,note_count 只在文字很短时略微加权;文字太长则截断保 MAX_R。 */
-  function sizeFor(name: string, noteCount: number): { r: number; label: string } {
-    const noteBased = Math.min(MAX_R, MIN_R + Math.sqrt(noteCount) * 2.2);
-    const fullTextR = Math.min(MAX_R, name.length * CHAR_PX * 0.5 + 8);
-    const r = Math.max(MIN_R, noteBased, Math.min(fullTextR, MAX_R));
-    const maxChars = Math.max(2, Math.floor(((r - 8) * 2) / CHAR_PX));
+  // kind 分类色(次信号):固定序对应常见 kind,未知 kind 按字符散列兜底,7 色循环
+  // (与说话人调色板同一套 tint-ink,但按 kind 而非身份取色——同类实体同色)。
+  const KIND_INKS = [
+    "var(--tint-sky-ink)",
+    "var(--tint-mint-ink)",
+    "var(--tint-peach-ink)",
+    "var(--tint-lavender-ink)",
+    "var(--tint-rose-ink)",
+    "var(--tint-yellow-ink)",
+    "var(--tint-gray-ink)",
+  ];
+  const KIND_ORDER = ["person", "term", "org", "project", "product", "decision", "task", "place", "date"];
+  function kindInk(kind: string): string {
+    let idx = KIND_ORDER.indexOf(kind);
+    if (idx < 0) {
+      let h = 0;
+      for (const c of kind) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+      idx = h;
+    }
+    return KIND_INKS[idx % KIND_INKS.length];
+  }
+  // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色。
+  const nodeColor = (id: string, kind: string, isPerson: boolean) =>
+    isPerson ? speakerInk(id, "mic") : kindInk(kind);
+
+  /** 半径=重要度(主信号,相对当前渲染集合归一化);文字装不下就截断,不反过来撑大圆。 */
+  function sizeFor(name: string, noteCount: number, maxNoteCount: number): { r: number; label: string } {
+    const t = maxNoteCount > 0 ? Math.sqrt(noteCount) / Math.sqrt(maxNoteCount) : 0;
+    const r = MIN_R + t * (MAX_R - MIN_R);
+    const maxChars = Math.max(2, Math.floor(((r - 6) * 2) / CHAR_PX));
     const label = name.length > maxChars ? name.slice(0, maxChars - 1) + "…" : name;
     return { r, label };
   }
@@ -71,8 +94,9 @@
     truncated = Math.max(0, candidates.length - MAX_NODES);
     const chosen = candidates.slice(0, MAX_NODES);
     const idset = new Set(chosen.map((n) => n.id));
+    const maxNoteCount = chosen.reduce((m, n) => Math.max(m, n.note_count), 0);
     dNodes = chosen.map((n) => {
-      const { r, label } = sizeFor(n.name, n.note_count);
+      const { r, label } = sizeFor(n.name, n.note_count, maxNoteCount);
       return { ...n, r, label };
     });
     const byId = new Map(dNodes.map((n) => [n.id, n]));
@@ -101,6 +125,7 @@
       nodes: dNodes.map((n) => ({
         id: n.id,
         label: n.label ?? n.name,
+        kind: n.kind,
         is_person: n.is_person,
         x: n.x ?? width / 2,
         y: n.y ?? height / 2,
@@ -210,15 +235,16 @@
   <svg {width} {height} role="img" aria-label="知识图谱力导向图">
     <g class="edges">
       {#each snap.links as l (l.aid + "-" + l.bid)}
+        <!-- 边粗细=关系强弱(共享笔记数),连续映射而非固定档;title 给 hover 原生提示 -->
         <line
           x1={l.x1}
           y1={l.y1}
           x2={l.x2}
           y2={l.y2}
           stroke="var(--hairline-strong)"
-          stroke-width={Math.min(3, l.w)}
+          stroke-width={Math.min(4, 0.6 + l.w * 0.5)}
           opacity={dimLink(l.aid, l.bid) ? 0.06 : 0.35}
-        />
+        ><title>共享 {l.w} 篇笔记</title></line>
       {/each}
     </g>
     <g class="nodes">
@@ -234,7 +260,7 @@
           onmouseenter={() => (hovered = n.id)}
           onmouseleave={() => (hovered = null)}
         >
-          <circle r={n.r} fill={nodeColor(n.id, n.is_person)} />
+          <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)} />
           <text class="lbl" font-size={n.r >= 22 ? 11 : 9.5}>{n.label}</text>
         </g>
       {/each}
