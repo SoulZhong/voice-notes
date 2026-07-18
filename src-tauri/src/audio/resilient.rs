@@ -282,6 +282,12 @@ mod tests {
         }
         assert_eq!(got, 4, "两个实例各 2 帧都应到达同一 sink");
         assert_eq!(built.load(Ordering::SeqCst), 2, "恰重建一次");
+        // 帧在重建实例的 start() 内同步发出,而 on_recovered 在 start() 返回后才调
+        // ——收满帧不代表回调已执行,这里必须有界轮询而非立即断言。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while recovered.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(recovered.load(Ordering::SeqCst), 1, "恢复回调恰一次");
         cap.stop();
     }
