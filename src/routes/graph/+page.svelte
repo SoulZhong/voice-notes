@@ -80,37 +80,39 @@
       {/if}
       <p class="d-stat">出现在 {detail.note_count} 篇 · {detail.mention_total} 次提及</p>
 
-      {#if detail.notes.length}
-        <section class="d-section">
-          <h3>出现的笔记</h3>
-          <ul>
-            {#each detail.notes as n (n.id)}
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-              <li class="d-note" onclick={() => goto("/notes/" + n.id)}>
-                <span class="d-note-title">{n.title}</span>
-                <span class="d-note-meta">{formatDate(n.started_at)} · {n.mention_count} 提及</span>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/if}
+      <div class="d-cols">
+        {#if detail.notes.length}
+          <section class="d-section">
+            <h3>出现的笔记 <span class="d-count">{detail.notes.length}</span></h3>
+            <ul class="d-scroll">
+              {#each detail.notes as n (n.id)}
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+                <li class="d-note" onclick={() => goto("/notes/" + n.id)}>
+                  <span class="d-note-title">{n.title}</span>
+                  <span class="d-note-meta">{formatDate(n.started_at)} · {n.mention_count} 提及</span>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
 
-      {#if detail.related.length}
-        <section class="d-section">
-          <h3>相关实体</h3>
-          <ul>
-            {#each detail.related as r (r.id)}
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-              <li class="d-rel" onclick={() => pickRelated(r.id)}>
-                <span class="dot" style={isPersonId(r.id) ? `background:${speakerInk(r.id, "mic")}` : ""}></span>
-                <span class="d-rel-name">{r.name}</span>
-                <span class="kind">{kindLabel(r.kind)}</span>
-                <span class="d-rel-shared">{r.shared_notes} 篇共现</span>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/if}
+        {#if detail.related.length}
+          <section class="d-section">
+            <h3>相关实体 <span class="d-count">{detail.related.length}</span></h3>
+            <ul class="d-scroll">
+              {#each detail.related as r (r.id)}
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+                <li class="d-rel" onclick={() => pickRelated(r.id)}>
+                  <span class="dot" style={isPersonId(r.id) ? `background:${speakerInk(r.id, "mic")}` : ""}></span>
+                  <span class="d-rel-name">{r.name}</span>
+                  <span class="kind">{kindLabel(r.kind)}</span>
+                  <span class="d-rel-shared">{r.shared_notes} 篇共现</span>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
+      </div>
     </div>
   {:else if selected}
     <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
@@ -128,8 +130,8 @@
 <style>
   .graph-main { height: 100%; overflow-y: auto; }
 
-  /* 单列居中,舒适可读宽度 */
-  .detail { max-width: 640px; margin: 0 auto; padding: 28px 36px 48px; }
+  /* 居中,拓宽以承载两栏列表(原 640 在宽屏下过窄,长列表全靠纵向滚) */
+  .detail { max-width: 880px; margin: 0 auto; padding: 28px 36px 48px; }
   .back {
     display: block; margin: 20px 0 18px 36px;
     background: none; border: 0; padding: 0; cursor: pointer;
@@ -146,9 +148,24 @@
   .d-aliases { font-size: 13px; color: var(--ink-secondary); margin: 0 0 6px; line-height: 1.6; }
   .d-stat { font-size: 13px; color: var(--ink-faint); margin: 0 0 26px; }
 
-  .d-section { margin-bottom: 22px; }
-  .d-section h3 { font-size: 12px; font-weight: 500; color: var(--ink-secondary); margin: 0 0 8px; }
-  .d-section ul { list-style: none; margin: 0; padding: 0; }
+  /* 两栏并排(笔记 / 相关实体):各自限高内部滚动,不逼页面纵向滚很长——
+     与会议搭子详情页「出现过的会议」同一惯例(max-height + overflow-y:auto)。 */
+  .d-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  @media (max-width: 720px) {
+    .d-cols { grid-template-columns: 1fr; }
+  }
+  .d-section h3 {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 500; color: var(--ink-secondary); margin: 0 0 8px;
+  }
+  .d-count {
+    font-size: 10.5px; color: var(--ink-faint);
+    background: var(--surface-soft); border-radius: 999px; padding: 0 6px;
+  }
+  .d-scroll {
+    list-style: none; margin: 0; padding: 0;
+    max-height: 14rem; overflow-y: auto;
+  }
   .d-note, .d-rel {
     display: flex; align-items: center; gap: 8px;
     padding: 8px 10px; border-radius: 8px; cursor: pointer;
