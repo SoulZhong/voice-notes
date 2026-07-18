@@ -404,6 +404,102 @@ mod tests {
         cap.stop(); // join tap,不悬挂
     }
 
+    /// 装配栈组合测试:TappedCapture(ResilientCapture(脚本采集))——lib.rs 生产
+    /// 装配的同款层叠。脚本第一实例发帧后报流错误,自愈重建第二实例继续发帧;
+    /// 断言:两实例的帧到达同一 sink、恢复回调驱动 restarts 计数、且(实例间
+    /// 退避窗口 > fill_after)断流被 tap 计入 gaps 并补零维持时间轴。
+    #[test]
+    fn full_stack_tapped_resilient_survives_stream_error() {
+        use crate::audio::resilient::{CaptureFactory, ResilientCapture, ResilientNotify};
+        use crate::audio::CaptureEvent;
+
+        struct Scripted {
+            frames: usize,
+            error_after_start: bool,
+            events_tx: crossbeam_channel::Sender<CaptureEvent>,
+        }
+        impl AudioCapture for Scripted {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                for _ in 0..self.frames {
+                    let _ = sink.send(AudioFrame {
+                        samples: vec![0.3; 160],
+                        sample_rate: 16000,
+                        channels: 1,
+                    });
+                }
+                if self.error_after_start {
+                    let _ = self.events_tx.send(CaptureEvent::Error("gone".into()));
+                }
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+
+        let built = Arc::new(StdAtomicU32::new(0));
+        let b2 = built.clone();
+        let factory: CaptureFactory = Box::new(move || {
+            let n = b2.fetch_add(1, Ordering::SeqCst);
+            let (etx, erx) = crossbeam_channel::unbounded();
+            (
+                Box::new(Scripted { frames: 2, error_after_start: n == 0, events_tx: etx })
+                    as Box<dyn AudioCapture>,
+                erx,
+            )
+        });
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let resilient = ResilientCapture::with_backoff(
+            factory,
+            ResilientNotify {
+                // 生产装配同款:恢复回调递增健康计数(lib.rs 里另发 ipc 事件)。
+                on_recovered: Some(Box::new(move || {
+                    h2.restarts.fetch_add(1, Ordering::Relaxed);
+                })),
+                on_lost: None,
+            },
+            // 退避 120ms > fill_after 50ms:重建窗口内 tap 必然观察到断流并补零。
+            vec![Duration::from_millis(120)],
+        );
+        let mut cap = TappedCapture::new(
+            Box::new(resilient),
+            Source::Mic,
+            fast_policy(),
+            health.clone(),
+            TapNotify::none(),
+        );
+        let (sink_tx, sink_rx) = crossbeam_channel::unbounded();
+        cap.start(sink_tx).expect("start");
+
+        // 有界等待:两实例各 2 帧真实样本(0.3)到达;其间夹杂补零帧。
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut real = 0;
+        let mut zeros = 0usize;
+        while real < 4 && std::time::Instant::now() < deadline {
+            if let Ok(f) = sink_rx.recv_timeout(Duration::from_millis(50)) {
+                if f.samples.iter().any(|s| *s != 0.0) {
+                    real += 1;
+                } else {
+                    zeros += f.samples.len();
+                }
+            }
+        }
+        assert_eq!(real, 4, "两实例的真实帧全部到达同一 sink");
+        assert_eq!(built.load(Ordering::SeqCst), 2, "自愈恰重建一次");
+        // 帧在重建实例 start() 内同步发出,on_recovered 在 start() 返回后才调:
+        // 收满帧≠回调已执行,restarts 须有界轮询(与 resilient 单测同教训)。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while health.restarts.load(Ordering::Relaxed) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let snap = health.snapshot(Source::Mic);
+        assert_eq!(snap.restarts, 1, "恢复回调驱动 restarts 计数");
+        assert!(snap.gaps >= 1, "重建窗口的断流应计入 gaps");
+        assert!(zeros > 0 && snap.silence_ms > 0, "断流期补零维持时间轴");
+        cap.stop();
+    }
+
     /// 下游关闭(会话拆除)时 tap 退出,不 panic 不空转。
     #[test]
     fn exits_when_worker_side_closed() {
