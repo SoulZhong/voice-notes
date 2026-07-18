@@ -11,9 +11,24 @@ use std::path::Path;
 const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn redirect_stdio_to_file(app_data: &Path) {
-    // dev（cargo/终端启动）不重定向:isatty 判定,比 debug_assertions 更准
+    // Windows 首版无 fd 级重定向:dup2/STDERR_FILENO 是 unix 概念,Windows GUI 子系统
+    // 的 stdout/stderr 需 SetStdHandle + CRT fd 双重接管,留作后续(计划文档已记);
+    // dev 构建带控制台,输出仍可见,不至于两眼一抹黑。
+    #[cfg(not(unix))]
+    {
+        let _ = app_data;
+        return;
+    }
+    #[cfg(unix)]
+    redirect_stdio_to_file_unix(app_data);
+}
+
+#[cfg(unix)]
+fn redirect_stdio_to_file_unix(app_data: &Path) {
+    // dev（cargo/终端启动）不重定向:is_terminal 判定,比 debug_assertions 更准
     //（release 二进制手动从终端跑时也能看到输出）。
-    if unsafe { libc::isatty(libc::STDERR_FILENO) } == 1 {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
         return;
     }
     let logs = app_data.join("logs");
@@ -29,7 +44,7 @@ pub fn redirect_stdio_to_file(app_data: &Path) {
     let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
     let fd = f.as_raw_fd();
     unsafe {
         libc::dup2(fd, libc::STDOUT_FILENO);

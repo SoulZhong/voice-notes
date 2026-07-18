@@ -105,6 +105,12 @@ fn sources_with_suffix(note_dir: &Path, suffix: &str) -> Vec<String> {
 /// `<source>.m4a` 已存在(说明上次「rename 完成、删 WAV 前」崩了),直接删 WAV 收口,
 /// 不重复编码。任何一步失败:删掉本源的 tmp、留住 WAV、eprintln、继续下一轨。
 pub fn transcode_note_dir(note_dir: &Path) {
+    // afconvert 是 macOS 内建工具,其他平台既压不了也不该反复报错刷日志:
+    // WAV 即最终形态,直接返回(离线回声清洗同属 macOS 后处理链,一并留待平台化)。
+    // 用运行时 cfg! 而非属性门控:非 macOS 上函数体仍参与类型检查,不留死代码警告。
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
     // 清残留:上次清洗写到一半的 tmp(与 .m4a.tmp 同理)。
     let _ = std::fs::remove_file(note_dir.join("mic.wav.clean.tmp"));
     // 清残留:上次编码写到一半 `<x>.m4a.tmp` 就崩,这些半成品既不完整也不该被枚举。
@@ -234,6 +240,12 @@ fn clean_mic_before_encode(note_dir: &Path, models_dir: &Path) {
 /// 失败即降级:删 tmp、把坏 m4a 挪成 `<source>.m4a.bad`(移出枚举、字节保留)、清压缩
 /// 标记(该源本场从 base_ms 重新建档)、eprintln。
 pub fn decode_note_to_wav(note_dir: &Path) {
+    // 非 macOS 必须整体跳过而不是让 decode_one 失败:失败路径会把 m4a 挪成 .bad
+    // 并清压缩标记(降级无音频建档)——在只是"没有 afconvert"的平台上,这对
+    // 从 macOS 同步来的笔记是破坏性的。跳过则 m4a 原样保留,不损数据。
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
     for source in sources_with_suffix(note_dir, ".m4a") {
         let m4a = note_dir.join(format!("{source}.m4a"));
         let wav = note_dir.join(format!("{source}.wav"));

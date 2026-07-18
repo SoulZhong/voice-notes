@@ -1,15 +1,18 @@
-//! 笔记目录跨进程写锁(flock 独占)。
+//! 笔记目录跨进程写锁(独占文件锁)。
 //!
 //! 动机:2026-07-13 事故——第二个应用实例整表重写 segments.jsonl,录制实例的
 //! 追加句柄从此指向被替换的孤儿 inode,35 分钟转写静默丢失。进程内锁
-//! (EDIT_LOCK / writer Mutex)对跨进程无效,flock 是最小充分武器。
+//! (EDIT_LOCK / writer Mutex)对跨进程无效,文件锁是最小充分武器。
 //!
-//! 语义:flock 按 open file description 计——同进程再 open 也互斥,因此
+//! 实现走 std `File::try_lock`(rustc 1.89 稳定):unix 底层即 flock(LOCK_EX|LOCK_NB),
+//! 语义与旧 libc 直调完全一致;Windows 底层是 LockFileEx,同样按句柄独占——
+//! 借此免去 libc 平台分叉,Windows 构建开箱即用。
+//!
+//! 语义:锁按 open file description/句柄计——同进程再 open 也互斥,因此
 //! 「本进程录制中」与「另一进程录制中」在编辑路径上得到同一种拒绝,无需区分。
 //! 锁生命周期即值生命周期:Drop 关 fd 自动释放,崩溃时内核代为释放,无残留。
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
 pub const LOCK_FILE: &str = ".note.lock";
@@ -40,16 +43,10 @@ impl NoteLock {
     /// 非阻塞尝试独占。Ok(None) = 已被其他持有者(进程或本进程另一句柄)占用。
     pub fn try_exclusive(dir: &Path) -> std::io::Result<Option<NoteLock>> {
         let f = OpenOptions::new().create(true).write(true).open(dir.join(LOCK_FILE))?;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            Ok(Some(NoteLock { _file: f }))
-        } else {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                Ok(None)
-            } else {
-                Err(e)
-            }
+        match f.try_lock() {
+            Ok(()) => Ok(Some(NoteLock { _file: f })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => Err(e),
         }
     }
 }
