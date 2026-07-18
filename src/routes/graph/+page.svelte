@@ -4,6 +4,7 @@
   import { page } from "$app/stores";
   import { graphData, entityDetail, renameEntity, kindLabel, kindInk, kindSoft, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { formatDate } from "$lib/notes";
+  import { graphFilter } from "$lib/graphFilter.svelte";
   import ForceGraph from "$lib/ForceGraph.svelte";
 
   // 改名(纠 ASR 提取错的实体名)。头部改名入口(针对当前选中实体)+ 图上右键菜单
@@ -158,6 +159,20 @@
     );
     return { nodes: [center, ...relatedNodes], edges: [...centerEdges, ...neighborEdges] };
   });
+
+  /** 主区未选实体态(全局力导图)按侧栏 kind 药丸过滤——只保留匹配 kind 的节点,
+      边要求两端都保留(否则会有指向已隐藏节点的悬空边)。搜索关键词不在这里过滤掉
+      节点,而是整份原样传给 ForceGraph 走高亮+聚焦镜头(见 query prop),这样搜索
+      命中的节点即使不在 top-N 骨架里也可能通过力导图自身的封顶规则显示不出来——
+      这是已知取舍,搜不到就点"显示全部"。 */
+  const filteredGraph = $derived.by(() => {
+    if (graphFilter.kind === "all") return graph;
+    const keep = new Set(graph.nodes.filter((n) => n.kind === graphFilter.kind).map((n) => n.id));
+    return {
+      nodes: graph.nodes.filter((n) => keep.has(n.id)),
+      edges: graph.edges.filter((e) => keep.has(e.a) && keep.has(e.b)),
+    };
+  });
 </script>
 
 <div class="graph-main">
@@ -253,7 +268,21 @@
     <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
     <p class="hint">该实体还未进入图谱(可能刚 Aing 完,稍后重试)。</p>
   {:else if graph.edges.length > 0 && graph.nodes.length >= 2}
-    <ForceGraph nodes={graph.nodes} edges={graph.edges} onPick={pickNode} onContextMenu={openCtxMenu} />
+    {#if filteredGraph.nodes.length >= 2}
+      <ForceGraph
+        nodes={filteredGraph.nodes}
+        edges={filteredGraph.edges}
+        onPick={pickNode}
+        onContextMenu={openCtxMenu}
+        query={graphFilter.query}
+      />
+    {:else}
+      <div class="placeholder">
+        <p class="ph-title">没有匹配的实体</p>
+        <p class="ph-desc">当前类型筛选下画布里没有足够的关系可画,换一个类型试试。</p>
+        <button class="empty-cta" onclick={() => (graphFilter.kind = "all")}>清除筛选</button>
+      </div>
+    {/if}
   {:else}
     <div class="placeholder">
       <p class="ph-title">知识图谱</p>
