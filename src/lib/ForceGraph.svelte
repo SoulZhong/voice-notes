@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, type Simulation } from "d3-force";
-  import type { EntitySummary, EdgeRow } from "$lib/graph";
+  import { kindInk, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { speakerInk } from "$lib/notes";
 
   let {
@@ -60,28 +60,9 @@
   const MAX_R = 38;
   const CHAR_PX = 8; // 中英混排近似字宽(10px 字号)
 
-  // kind 分类色(次信号):固定序对应常见 kind,未知 kind 按字符散列兜底,7 色循环
-  // (与说话人调色板同一套 tint-ink,但按 kind 而非身份取色——同类实体同色)。
-  const KIND_INKS = [
-    "var(--tint-sky-ink)",
-    "var(--tint-mint-ink)",
-    "var(--tint-peach-ink)",
-    "var(--tint-lavender-ink)",
-    "var(--tint-rose-ink)",
-    "var(--tint-yellow-ink)",
-    "var(--tint-gray-ink)",
-  ];
-  const KIND_ORDER = ["person", "term", "org", "project", "product", "decision", "task", "place", "date"];
-  function kindInk(kind: string): string {
-    let idx = KIND_ORDER.indexOf(kind);
-    if (idx < 0) {
-      let h = 0;
-      for (const c of kind) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-      idx = h;
-    }
-    return KIND_INKS[idx % KIND_INKS.length];
-  }
-  // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色。
+  // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色
+  // (`kindInk` 来自 $lib/graph,是全应用唯一真值源——侧栏 kind 过滤药丸/实体列表
+  // 色点/详情面板 kind 徽章都从那取,保证跟这里的圆圈同色)。
   const nodeColor = (id: string, kind: string, isPerson: boolean) =>
     isPerson ? speakerInk(id, "mic") : kindInk(kind);
 
