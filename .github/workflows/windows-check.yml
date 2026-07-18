@@ -1,0 +1,25 @@
+# Windows 编译真验证:开发机是 macOS,交叉 cargo check 被原生依赖 build script
+# 卡死(ring 的 cc、webrtc-ap 的 meson 均需目标平台工具链,2026-07-18 实测),
+# 唯一可行的类型检查/build script 验证是真 Windows runner。
+# 只做 cargo check --lib(类型检查 + 全部 build script),不打包不签名——
+# 真机行为验收(环回采集/静默填充/断连自愈)仍需人工,见计划文档「验证边界」。
+name: windows-check
+
+on:
+  push:
+    branches: [feature/meetily-borrow-windows]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: cargo check (lib, Windows msvc)
+        working-directory: src-tauri
+        run: cargo check --lib
