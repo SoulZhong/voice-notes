@@ -2,6 +2,7 @@ pub mod aec;
 pub mod resample;
 pub mod mock;
 pub mod microphone;
+pub mod resilient;
 pub mod delay_estimate;
 pub mod echo_clean;
 pub mod aec_align;
@@ -44,6 +45,15 @@ pub trait AudioCapture: Send {
     fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()>;
     /// 停止采集并释放设备。
     fn stop(&mut self);
+}
+
+/// 采集流运行期事件(启动期错误走 start 的 Err,不在此列)。
+/// cpal 系后端把流错误回调升格为本事件供断连自愈消费;未接线的后端
+/// (VPIO/SCK)其运行期死亡由 FrameTap 帧荒检测兜底——两条探测路径互补。
+#[derive(Debug, Clone)]
+pub enum CaptureEvent {
+    /// 流错误(设备拔出/被系统回收等),流已不可用。
+    Error(String),
 }
 
 /// 当前默认输出设备是否蓝牙(macOS)。用途:「保持外放音量」+ 蓝牙外放时,

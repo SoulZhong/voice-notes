@@ -712,26 +712,72 @@ fn spawn_session(
             // 外放开会场景既听不清、录下的系统声轨电平也小;普通输入无 ducking,
             // 回声由下方装配的软件 AEC(WebRTC AEC3)消除,文本回声去重链保留为兜底。
             // 其他平台恒用 cpal。
+            // 采集栈:TappedCapture(ResilientCapture(真实采集))。
+            //  - Resilient:流错误/失联时工厂重建采集,复用同一帧通道,worker 无感;
+            //  - Tap:健康统计 + 断流期按墙钟补零(时间轴不塌,双轨对齐不断裂),
+            //    其失联通知(>3s 无帧)踢 Resilient 重启——覆盖 VPIO 这类未接
+            //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
             #[cfg(target_os = "macos")]
-            let mic_inner: Box<dyn AudioCapture> = if keep_output_volume {
-                Box::new(audio::microphone::Microphone::new())
+            let mic_factory: audio::resilient::CaptureFactory = if keep_output_volume {
+                Box::new(|| {
+                    let (etx, erx) = crossbeam_channel::unbounded();
+                    (
+                        Box::new(audio::microphone::Microphone::with_events(etx))
+                            as Box<dyn AudioCapture>,
+                        erx,
+                    )
+                })
             } else {
-                Box::new(audio::vpio::VpioMicrophone::new())
+                Box::new(|| {
+                    // VPIO 无运行期错误回调:事件通道空置(发送端即弃),
+                    // 死亡由 Tap 帧荒检测兜底。
+                    let (_etx, erx) = crossbeam_channel::unbounded::<audio::CaptureEvent>();
+                    (Box::new(audio::vpio::VpioMicrophone::new()) as Box<dyn AudioCapture>, erx)
+                })
             };
             #[cfg(not(target_os = "macos"))]
-            let mic_inner: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
-            // FrameTap 包装(对 session 透明):健康统计 + 设备断流时按墙钟补零,
-            // 时间轴不塌(否则 mic 轨时钟落后,双轨时间戳从此错位)。失联/恢复
-            // 先落日志,断连自愈接入后升级为 UI 事件。
+            let mic_factory: audio::resilient::CaptureFactory = Box::new(|| {
+                let (etx, erx) = crossbeam_channel::unbounded();
+                (
+                    Box::new(audio::microphone::Microphone::with_events(etx))
+                        as Box<dyn AudioCapture>,
+                    erx,
+                )
+            });
             let mic_health = Arc::new(SourceHealth::default());
+            let mut mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
+                let app = app.clone();
+                let health = mic_health.clone();
+                let app2 = app.clone();
+                audio::resilient::ResilientNotify {
+                    on_recovered: Some(Box::new(move || {
+                        health.restarts.fetch_add(1, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "source_health",
+                            ipc::SourceHealthEvent {
+                                source: "mic".into(),
+                                state: "recovered".into(),
+                            },
+                        );
+                    })),
+                    on_lost: Some(Box::new(move || {
+                        let _ = app2.emit(
+                            "source_health",
+                            ipc::SourceHealthEvent { source: "mic".into(), state: "lost".into() },
+                        );
+                    })),
+                }
+            });
+            let mic_kicker = mic_resilient.kicker();
             let mic_notify = TapNotify {
-                on_stall: Some(Box::new(|| {
-                    eprintln!("麦克风采集失联(>3s 无帧):时间轴以静音填充维持,等待设备恢复")
+                on_stall: Some(Box::new(move || {
+                    eprintln!("麦克风采集失联(>3s 无帧):静音填充维持时间轴,触发自愈重启");
+                    let _ = mic_kicker.try_send(());
                 })),
                 on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
             };
             let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
-                mic_inner,
+                Box::new(mic_resilient),
                 Source::Mic,
                 TapPolicy::mic(),
                 mic_health.clone(),
@@ -748,13 +794,57 @@ fn spawn_session(
         {
             match new_silero(&vad_path) {
                 Ok(sys_seg) => {
+                    // SCK 无运行期错误回调:自愈全靠 Tap 帧荒(5s)踢重启。
+                    let sys_factory: audio::resilient::CaptureFactory = Box::new(|| {
+                        let (_etx, erx) = crossbeam_channel::unbounded::<audio::CaptureEvent>();
+                        (
+                            Box::new(audio::system::SystemAudioCapture::new())
+                                as Box<dyn AudioCapture>,
+                            erx,
+                        )
+                    });
                     let sys_health = Arc::new(SourceHealth::default());
+                    let mut sys_resilient =
+                        audio::resilient::ResilientCapture::new(sys_factory, {
+                            let app = app.clone();
+                            let health = sys_health.clone();
+                            let app2 = app.clone();
+                            audio::resilient::ResilientNotify {
+                                on_recovered: Some(Box::new(move || {
+                                    health.restarts.fetch_add(1, Ordering::Relaxed);
+                                    let _ = app.emit(
+                                        "source_health",
+                                        ipc::SourceHealthEvent {
+                                            source: "system".into(),
+                                            state: "recovered".into(),
+                                        },
+                                    );
+                                })),
+                                on_lost: Some(Box::new(move || {
+                                    let _ = app2.emit(
+                                        "source_health",
+                                        ipc::SourceHealthEvent {
+                                            source: "system".into(),
+                                            state: "lost".into(),
+                                        },
+                                    );
+                                })),
+                            }
+                        });
+                    let sys_kicker = sys_resilient.kicker();
+                    let sys_notify = TapNotify {
+                        on_stall: Some(Box::new(move || {
+                            eprintln!("系统声音采集失联(>5s 无帧):静音填充维持时间轴,触发自愈重启");
+                            let _ = sys_kicker.try_send(());
+                        })),
+                        on_recover: Some(Box::new(|| eprintln!("系统声音采集恢复"))),
+                    };
                     let sys: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
-                        Box::new(audio::system::SystemAudioCapture::new()),
+                        Box::new(sys_resilient),
                         Source::System,
                         TapPolicy::system_sck(),
                         sys_health.clone(),
-                        TapNotify::none(),
+                        sys_notify,
                     ));
                     session_health.push((Source::System, sys_health));
                     sources.push((Source::System, sys, sys_seg));
