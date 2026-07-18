@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use audio::{AudioCapture, Source};
+use pipeline::frame_tap::{self, SourceHealth, TapNotify, TapPolicy, TappedCapture};
 use pipeline::segmenter::Segmenter;
 use session::RecordingHandle;
 
@@ -80,6 +81,9 @@ struct ActiveSession {
     /// 通道关闭)之后 join,保证 finalize 前 WAV 头已收尾。其余提前放弃路径不 join,
     /// 线程随通道关闭自行退出(Drop 收尾)。
     audio_joins: Vec<std::thread::JoinHandle<()>>,
+    /// 每源管线健康计数(FrameTap 写入):pipeline_health 命令随时快照,
+    /// 会话拆除即随本结构丢弃——健康数据只描述"这一场",无跨场语义。
+    health: Vec<(Source, Arc<SourceHealth>)>,
 }
 
 impl ActiveSession {
@@ -691,6 +695,8 @@ fn spawn_session(
         // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
         let vad_path = models::root().join("silero_vad.onnx");
         let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
+        // 每源健康计数(FrameTap 写、pipeline_health 读),随 ActiveSession 存活一场。
+        let mut session_health: Vec<(Source, Arc<SourceHealth>)> = Vec::new();
         if !record_system_only {
             let mic_seg = match new_silero(&vad_path) {
                 Ok(s) => s,
@@ -707,13 +713,31 @@ fn spawn_session(
             // 回声由下方装配的软件 AEC(WebRTC AEC3)消除,文本回声去重链保留为兜底。
             // 其他平台恒用 cpal。
             #[cfg(target_os = "macos")]
-            let mic: Box<dyn AudioCapture> = if keep_output_volume {
+            let mic_inner: Box<dyn AudioCapture> = if keep_output_volume {
                 Box::new(audio::microphone::Microphone::new())
             } else {
                 Box::new(audio::vpio::VpioMicrophone::new())
             };
             #[cfg(not(target_os = "macos"))]
-            let mic: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+            let mic_inner: Box<dyn AudioCapture> = Box::new(audio::microphone::Microphone::new());
+            // FrameTap 包装(对 session 透明):健康统计 + 设备断流时按墙钟补零,
+            // 时间轴不塌(否则 mic 轨时钟落后,双轨时间戳从此错位)。失联/恢复
+            // 先落日志,断连自愈接入后升级为 UI 事件。
+            let mic_health = Arc::new(SourceHealth::default());
+            let mic_notify = TapNotify {
+                on_stall: Some(Box::new(|| {
+                    eprintln!("麦克风采集失联(>3s 无帧):时间轴以静音填充维持,等待设备恢复")
+                })),
+                on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
+            };
+            let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
+                mic_inner,
+                Source::Mic,
+                TapPolicy::mic(),
+                mic_health.clone(),
+                mic_notify,
+            ));
+            session_health.push((Source::Mic, mic_health));
             sources.push((Source::Mic, mic, mic_seg));
         }
         // record_system_only 且非 macOS：System 源不存在（下方块仅 macOS 编译），
@@ -723,11 +747,18 @@ fn spawn_session(
         #[cfg(target_os = "macos")]
         {
             match new_silero(&vad_path) {
-                Ok(sys_seg) => sources.push((
-                    Source::System,
-                    Box::new(audio::system::SystemAudioCapture::new()),
-                    sys_seg,
-                )),
+                Ok(sys_seg) => {
+                    let sys_health = Arc::new(SourceHealth::default());
+                    let sys: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
+                        Box::new(audio::system::SystemAudioCapture::new()),
+                        Source::System,
+                        TapPolicy::system_sck(),
+                        sys_health.clone(),
+                        TapNotify::none(),
+                    ));
+                    session_health.push((Source::System, sys_health));
+                    sources.push((Source::System, sys, sys_seg));
+                }
                 Err(e) => {
                     // 系统声音 VAD 构建失败非致命：不发 error 状态（避免闪烁），
                     // 静默跳过该源；classify_system 会因 System 既不在 active 也不在
@@ -1105,6 +1136,7 @@ fn spawn_session(
                     paused_at: None,
                     paused_accum: std::time::Duration::ZERO,
                     audio_joins,
+                    health: session_health,
                 });
                 drop(running_guard);
                 let _ = app.emit(
@@ -2893,6 +2925,21 @@ fn output_is_bluetooth() -> bool {
     audio::default_output_is_bluetooth()
 }
 
+/// 每源管线健康快照(借鉴 meetily BufferStats 的可观测性设计):录制中返回各源
+/// 帧数/样本数/断流次数/填充静音时长/重启次数,未录制返回空表。用途:用户报
+/// "少了半句话"时可即时判断是设备断流(gaps/silence_ms>0)还是别的环节问题,
+/// 不再靠猜。也是断连自愈的观测面。
+#[tauri::command]
+fn pipeline_health(state: State<AppState>) -> Vec<frame_tap::HealthSnapshot> {
+    state
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.health.iter().map(|(src, h)| h.snapshot(*src)).collect())
+        .unwrap_or_default()
+}
+
 /// 屏幕录制权限预检(macOS):系统声音采集(ScreenCaptureKit)依赖该权限,未授权时
 /// System 源只会在开录后静默降级为仅麦克风——录制页据此在**开录前**就给出常驻
 /// 提示与授权入口,终结"录了半天发现对方声音全没进笔记"。
@@ -3196,6 +3243,7 @@ pub fn run() {
             edit_segment,
             delete_segment,
             set_segment_speaker,
+            pipeline_health,
             screen_capture_permission,
             request_screen_capture_permission,
             reset_screen_capture_permission,
