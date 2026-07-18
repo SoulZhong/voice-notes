@@ -8,6 +8,7 @@
     nodes: allNodes,
     edges: allEdges,
     onPick,
+    onContextMenu,
     maxNodes = 60,
     minEdgeWeight = 2,
     backboneK = 3,
@@ -16,6 +17,8 @@
     nodes: EntitySummary[];
     edges: EdgeRow[];
     onPick: (id: string, isPerson: boolean) => void;
+    /** 右键节点(改名等次要操作入口);不传则节点不响应右键,走浏览器默认菜单。 */
+    onContextMenu?: (id: string, name: string, isPerson: boolean, clientX: number, clientY: number) => void;
     /** 规模封顶(默认给全局图用);实体详情页的小型关系图会传更小的值。 */
     maxNodes?: number;
     /** 只连接权重≥此值的边(默认 2,过滤共享 1 篇的噪声连接);中心实体的直连关系
@@ -249,6 +252,9 @@
   let dragId: string | null = null;
   let moved = false;
   function onDown(id: string, e: PointerEvent) {
+    // 只有主键(左键)才算拖拽/点击起点——右键的 pointerdown+pointerup 也会触发这对回调,
+    // 不拦下的话右键点节点会在打开右键菜单的同时把页面导航走(onUp 误判为点击)。
+    if (e.button !== 0) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     dragId = id;
     moved = false;
@@ -276,7 +282,9 @@
       n.fy = null;
     }
     sim?.alphaTarget(0);
-    if (!moved) onPick(id, isPerson);
+    // dragId 只在左键 onDown 时被置位(见上方注释);右键释放时 dragId 仍是上次左键交互
+    // 遗留值(通常是 null),不等于当前 id,故不会误触发导航。
+    if (dragId === id && !moved) onPick(id, isPerson);
     dragId = null;
   }
 </script>
@@ -313,6 +321,11 @@
             onpointerup={() => onUp(n.id, n.is_person)}
             onmouseenter={() => (hovered = n.id)}
             onmouseleave={() => (hovered = null)}
+            oncontextmenu={(e) => {
+              if (!onContextMenu) return;
+              e.preventDefault();
+              onContextMenu(n.id, n.name, n.is_person, e.clientX, e.clientY);
+            }}
           >
             <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}><title>{n.name}</title></circle>
             <text class="lbl" font-size={Math.min(14, Math.max(8, 6 + n.r * 0.22))}>{n.label}</text>

@@ -6,7 +6,8 @@
   import { formatDate } from "$lib/notes";
   import ForceGraph from "$lib/ForceGraph.svelte";
 
-  // 改名(纠 ASR 提取错的实体名)。
+  // 改名(纠 ASR 提取错的实体名)。头部改名入口(针对当前选中实体)+ 图上右键菜单
+  // (针对任意节点,不必先选中/导航过去)共用这一套提交逻辑。
   let renaming = $state(false);
   let renameValue = $state("");
   let renameErr = $state("");
@@ -16,6 +17,15 @@
     renameErr = "";
     renaming = true;
   }
+  /** 改名成功后的收尾:图数据整体刷新(反映新名字/合并),若改的正是当前选中实体则
+      同步刷新详情面板或跳到新 id。 */
+  async function afterRename(oldId: string, newId: string) {
+    graph = await graphData().catch(() => graph);
+    if (selected === oldId) {
+      if (newId === oldId) detail = await entityDetail(newId).catch(() => detail);
+      else goto("/graph?e=" + encodeURIComponent(newId));
+    }
+  }
   async function submitRename(oldId: string) {
     const name = renameValue.trim();
     if (!name || renameBusy) return;
@@ -23,16 +33,48 @@
     try {
       const r = await renameEntity(oldId, name);
       renaming = false;
-      if (r.new_id === oldId) {
-        // id 没变(人实体改名 / 纯大小写归一后相同):URL 没变,goto 不会重新拉取,手动刷新。
-        detail = await entityDetail(r.new_id).catch(() => detail);
-      } else {
-        goto("/graph?e=" + encodeURIComponent(r.new_id));
-      }
+      await afterRename(oldId, r.new_id);
     } catch (e) {
       renameErr = `改名失败: ${e}`;
     } finally {
       renameBusy = false;
+    }
+  }
+
+  // 图上右键菜单:任意节点(不管是不是当前选中实体)右键→改名。
+  let ctxMenu = $state<{ id: string; name: string; isPerson: boolean; x: number; y: number } | null>(null);
+  let ctxRenaming = $state(false);
+  let ctxRenameValue = $state("");
+  let ctxRenameErr = $state("");
+  let ctxRenameBusy = $state(false);
+  function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
+    ctxMenu = { id, name, isPerson, x: clientX, y: clientY };
+    ctxRenaming = false;
+    ctxRenameErr = "";
+  }
+  function closeCtxMenu() {
+    ctxMenu = null;
+    ctxRenaming = false;
+  }
+  function startCtxRename() {
+    if (!ctxMenu) return;
+    ctxRenameValue = ctxMenu.name;
+    ctxRenameErr = "";
+    ctxRenaming = true;
+  }
+  async function submitCtxRename() {
+    if (!ctxMenu || ctxRenameBusy) return;
+    const name = ctxRenameValue.trim();
+    if (!name) return;
+    ctxRenameBusy = true;
+    try {
+      const r = await renameEntity(ctxMenu.id, name);
+      await afterRename(ctxMenu.id, r.new_id);
+      closeCtxMenu();
+    } catch (e) {
+      ctxRenameErr = `改名失败: ${e}`;
+    } finally {
+      ctxRenameBusy = false;
     }
   }
 
@@ -195,6 +237,7 @@
                 nodes={ego.nodes}
                 edges={ego.edges}
                 onPick={pickRelated}
+                onContextMenu={openCtxMenu}
                 maxNodes={EGO_MAX_RELATED + 1}
                 minEdgeWeight={1}
                 backboneK={999}
@@ -208,7 +251,7 @@
     <button class="back" onclick={() => goto("/graph")}>← 返回图谱</button>
     <p class="hint">该实体还未进入图谱(可能刚 Aing 完,稍后重试)。</p>
   {:else if graph.edges.length > 0 && graph.nodes.length >= 2}
-    <ForceGraph nodes={graph.nodes} edges={graph.edges} onPick={pickNode} />
+    <ForceGraph nodes={graph.nodes} edges={graph.edges} onPick={pickNode} onContextMenu={openCtxMenu} />
   {:else}
     <div class="placeholder">
       <p class="ph-title">知识图谱</p>
@@ -216,6 +259,39 @@
     </div>
   {/if}
 </div>
+
+{#if ctxMenu}
+  <!-- 点击任意处关闭;遮罩是纯指针便利层,与 Sidebar.svelte 的行右键菜单同一惯例 -->
+  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+  <div
+    class="menu-overlay"
+    onclick={closeCtxMenu}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      closeCtxMenu();
+    }}
+  ></div>
+  <div class="ctx-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px">
+    {#if ctxRenaming}
+      <!-- svelte-ignore a11y_autofocus -->
+      <input
+        class="ctx-rename-input"
+        autofocus
+        bind:value={ctxRenameValue}
+        disabled={ctxRenameBusy}
+        onkeydown={(e) => {
+          if (e.key === "Enter") submitCtxRename();
+          if (e.key === "Escape") closeCtxMenu();
+        }}
+      />
+      {#if ctxRenameErr}
+        <p class="ctx-rename-err">{ctxRenameErr}</p>
+      {/if}
+    {:else}
+      <button class="ctx-item" onclick={startCtxRename}>改名</button>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .graph-main { height: 100%; overflow: hidden; }
@@ -305,4 +381,44 @@
     padding: 7px 15px; font-weight: 500; font-size: 13px; cursor: pointer; font-family: inherit;
   }
   .hint { color: var(--ink-faint); font-size: 13px; text-align: center; margin: 18vh auto 0; }
+
+  /* 图上节点右键菜单:复用 Sidebar.svelte 笔记行右键菜单同一套视觉语言
+     (popover 规范 = surface-press 底 + hairline + shadow-popover)。 */
+  .menu-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+  }
+  .ctx-menu {
+    position: fixed;
+    z-index: 41;
+    min-width: 9rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+  }
+  .ctx-item {
+    background: none;
+    border: none;
+    text-align: left;
+    color: var(--ink);
+    cursor: pointer;
+    padding: 0.4em 0.7em;
+    border-radius: var(--radius-md);
+    font-size: 0.88rem;
+    font-family: inherit;
+  }
+  .ctx-item:hover {
+    background: var(--surface-soft);
+  }
+  .ctx-rename-input {
+    font-size: 0.88rem; font-family: inherit; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--accent); border-radius: var(--radius-md);
+    padding: 0.4em 0.7em; margin: 0; width: 100%; box-sizing: border-box;
+  }
+  .ctx-rename-err { font-size: 11px; color: var(--danger-ink); margin: 4px 4px 0; }
 </style>
