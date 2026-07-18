@@ -418,19 +418,18 @@
     </ul>
   {:else if tab === "graph"}
     <!-- 固定行:全局图谱(清空选中,回到力导图总览;紧跟录制按钮,不随实体列表滚动
-         消失——详情态下从任何深度都能一键退回,与「概览与整理」同一惯例) -->
-    <button
-      class="item overview graph-global"
-      class:current={!graphSelected}
-      onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
-    >
-      <svg class="overview-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+         消失——详情态下从任何深度都能一键退回)。轻量文字链接而非常驻实底卡片——
+         `!graphSelected` 是常态(大多数时候没选中任何实体),用 .item.current 那种
+         实底高亮会让这行几乎永远是侧栏里最重的一块,比白色录制药丸还抢眼(冒烟反馈
+         "不够美观"),故只保留 hover 反馈,不常驻着色。 -->
+    <button class="graph-global" onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>
+      <svg class="graph-global-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="8" cy="3.6" r="1.6" />
         <circle cx="3.4" cy="12" r="1.6" />
         <circle cx="12.6" cy="12" r="1.6" />
         <path d="M8 5.2L4.4 10.6M8 5.2l3.6 5.4M5 12h6" />
       </svg>
-      <span class="title">全局图谱</span>
+      全局图谱
     </button>
     <input class="search" type="search" placeholder="搜索实体…" bind:value={graphQuery} />
     <div class="gchips">
@@ -699,18 +698,36 @@
   .item.overview:hover .overview-icon {
     color: var(--ink-secondary);
   }
-  /* 全局图谱固定行:与「概览与整理」同一套 .item.overview 视觉(flex/间距/hover/current
-     都来自那两个类),这里只需把原生 <button> 的默认外观清空、撑满侧栏宽度。 */
+  /* 全局图谱固定行:轻量文字链接(ink-faint 图标 + ink-secondary 字),只有 hover 才
+     着色/变深——常驻实底会比录制药丸还抢眼,故不借用 .item.current 那套高亮。 */
   .graph-global {
     display: flex;
+    align-items: center;
+    gap: 0.5em;
     width: 100%;
     box-sizing: border-box;
+    margin: 0.7rem 0 0.15rem;
+    padding: 0.3rem 0.5rem;
     border: none;
+    border-radius: var(--radius-md);
     background: transparent;
     font: inherit;
+    font-size: 0.86em;
+    font-weight: 500;
     text-align: left;
+    cursor: pointer;
+    color: var(--ink-secondary);
+  }
+  .graph-global:hover {
+    background: var(--surface-soft);
     color: var(--ink);
-    margin: 0 0 0.4rem;
+  }
+  .graph-global-icon {
+    flex: none;
+    color: var(--ink-faint);
+  }
+  .graph-global:hover .graph-global-icon {
+    color: var(--ink-secondary);
   }
   .tidy-badge {
     margin-left: auto;
