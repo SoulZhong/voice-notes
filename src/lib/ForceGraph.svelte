@@ -268,7 +268,20 @@
       .on("tick", refreshSnap);
     if (reduce || heavy) {
       sim.stop();
-      sim.tick(heavy ? 90 : 120);
+      if (heavy) {
+        // 固定 tick 数是猜的,猜错了就是这样:弱化过斥力(-55)之后收敛变慢,固定
+        // 90 tick 根本不够把碰撞力(collide)真正撑开,新长出来的节点(没有旧位置
+        // 可继承,d3 从零初始化)挤成一坨、圆圈和文字互相重叠(冒烟反馈"是不是要
+        // 重新渲染,现在都挤到了一起")。改成跑到仿真真正收敛(alpha 降到 alphaMin
+        // 以下)为止,而不是赌一个数字够不够——400 tick 是防跑飞的安全上限。
+        let iterations = 0;
+        while (sim.alpha() > sim.alphaMin() && iterations < 400) {
+          sim.tick();
+          iterations++;
+        }
+      } else {
+        sim.tick(120);
+      }
       refreshSnap();
     }
   }
@@ -566,25 +579,25 @@
     </g>
   </svg>
   {#if expanded}
-    <div class="trunc">
-      已显示全部 {snap.nodes.length} 个实体
-      <button class="trunc-btn" onclick={() => { expanded = false; expandHops = 0; }}>收起</button>
+    <div class="trunc-bar">
+      <span class="trunc-label">已显示全部 {snap.nodes.length} 个实体</span>
+      <button class="trunc-action" onclick={() => { expanded = false; expandHops = 0; }}>收起</button>
     </div>
   {:else if expandHops > 0}
     <!-- 展开一层可重复点,一圈圈往外长,不像「显示全部」一步到位——避免一下爆炸 -->
-    <div class="trunc">
-      已展开 {expandHops} 层 · 共 {snap.nodes.length} 个实体
+    <div class="trunc-bar">
+      <span class="trunc-label">已展开 {expandHops} 层 · 共 {snap.nodes.length} 个实体</span>
       {#if truncated > 0}
-        <button class="trunc-btn" onclick={() => (expandHops += 1)}>继续展开</button>
-        <button class="trunc-btn" onclick={() => (expanded = true)}>显示全部</button>
+        <button class="trunc-action" onclick={() => (expandHops += 1)}>继续展开</button>
+        <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>显示全部</button>
       {/if}
-      <button class="trunc-btn" onclick={() => (expandHops = 0)}>收起</button>
+      <button class="trunc-action" onclick={() => (expandHops = 0)}>收起</button>
     </div>
   {:else if truncated > 0}
-    <div class="trunc">
-      显示连接最紧的 {snap.nodes.length} 个实体
-      <button class="trunc-btn" onclick={() => (expandHops = 1)}>展开一层</button>
-      <button class="trunc-btn" onclick={() => (expanded = true)}>显示全部</button>
+    <div class="trunc-bar">
+      <span class="trunc-label">显示连接最紧的 {snap.nodes.length} 个实体</span>
+      <button class="trunc-action" onclick={() => (expandHops = 1)}>展开一层</button>
+      <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>显示全部</button>
     </div>
   {/if}
   {#if legend.length > 0}
@@ -615,31 +628,58 @@
     dominant-baseline: central;
     pointer-events: none;
   }
-  .trunc {
+  /* 规模控制条:说明文字(纯信息,不可点)+ 独立的药丸按钮群(可点),不再是一整块
+     文字链接挤在一个胶囊里分不清哪段是说明哪段是按钮(冒烟反馈"很粗糙,不够精美")。
+     每个按钮自成一个 hairline 描边药丸,跟侧栏「全局图谱」/「返回图谱」同一套
+     视觉语言,拉开彼此间距,touch target 也更大。 */
+  .trunc-bar {
     position: absolute;
     left: 16px;
     bottom: 14px;
+    max-width: calc(100% - 32px);
     display: flex;
     align-items: center;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .trunc-label {
     font-size: 11px;
     color: var(--ink-faint);
     background: var(--surface);
-    padding: 3px 9px;
+    padding: 5px 11px;
     border-radius: 999px;
     border: 1px solid var(--hairline);
+    white-space: nowrap;
   }
-  .trunc-btn {
-    background: none;
-    border: 0;
-    padding: 0;
+  .trunc-action {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 5px 12px;
     margin: 0;
     cursor: pointer;
     font: inherit;
+    font-size: 11px;
     font-weight: 500;
-    color: var(--accent);
+    color: var(--ink-secondary);
+    white-space: nowrap;
   }
-  .trunc-btn:hover { text-decoration: underline; }
+  .trunc-action:hover {
+    background: var(--surface-soft);
+    border-color: var(--hairline-strong);
+    color: var(--ink);
+  }
+  /* 「显示全部」是分量最重的一步(直接跳到底,而非逐层展开),用 accent 区分出来,
+     不能跟「继续展开」「收起」这些平级操作长得一样。 */
+  .trunc-action-strong {
+    color: var(--accent);
+    border-color: var(--accent-tint);
+    background: var(--accent-tint);
+  }
+  .trunc-action-strong:hover {
+    background: var(--accent-tint);
+    border-color: var(--accent);
+  }
   /* 图例:kind→色 对照,不用记药丸圆点代表什么颜色。人物没有单一代表色(按个体上色),
      渐变点如实传达"这类颜色因人而异"而不是编一个假色骗大家。 */
   .legend {
