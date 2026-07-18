@@ -361,29 +361,18 @@
   /** 自适应缩放:力导仿真的间距是固定物理单位,跟容器大小无关——图少、容器大时会挤成
       一小团、四周大片空白。每次渲染都按节点实际占据的包围盒(含半径留白)算一个整体
       缩放+居中变换,让图形永远撑满容器,而不是死守仿真给的绝对像素间距。
-      **孤岛不该支配整体缩放**:跟主图完全没有边连接的小簇(只互相共现的几个实体)
-      会被斥力推得比主团远得多——若把它们也算进包围盒,为了照顾这几个孤岛,主图
-      (通常是最有信息量的部分)反而被挤成小小一团。节点数较多时改用「去掉离质心
-      最远 10%」的核心包围盒来定缩放,孤岛仍会被画出来,只是不再反过来支配整体
-      缩放比例——想看它们,拖一下或滚轮缩小即可找到。 */
+      **孤岛/留白问题不该靠这里的"排除离群点"来治**:早先试过「去掉离质心最远 10%」
+      的核心包围盒,结果适得其反——排除的那 10% 依然会被画出来,只是不再参与居中
+      计算,分布一旦不对称(不是均匀往四周散,而是明显偏一侧),排除后算出的"核心
+      中心"就会偏离全体节点的真实视觉中心,导致整体构图被推向一边、留出大片不对称
+      黑边(实测反馈"变成这样了"——比不排除还难看)。真正的解法在 rebuild() 里调
+      物理参数(heavy 图弱斥力/强向心力,把点群本身聚拢紧凑),这里老老实实用全部
+      节点的真实包围盒即可。 */
   const fit = $derived.by(() => {
     const ns = snap.nodes;
     if (ns.length === 0) return { scale: 1, tx: 0, ty: 0 };
-    // 阈值刻意设得比默认 60 节点视图高——那个视图已经调过很多轮、不想被这个后加的
-    // 逻辑意外改变框选范围,孤岛问题主要出现在「显示全部」这种大图场景。
-    let core = ns;
-    if (ns.length > 100) {
-      const cx0 = ns.reduce((s, n) => s + n.x, 0) / ns.length;
-      const cy0 = ns.reduce((s, n) => s + n.y, 0) / ns.length;
-      const sorted = [...ns].sort((a, b) => {
-        const da = (a.x - cx0) ** 2 + (a.y - cy0) ** 2;
-        const db = (b.x - cx0) ** 2 + (b.y - cy0) ** 2;
-        return da - db;
-      });
-      core = sorted.slice(0, Math.ceil(sorted.length * 0.9));
-    }
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of core) {
+    for (const n of ns) {
       minX = Math.min(minX, n.x - n.r);
       minY = Math.min(minY, n.y - n.r);
       maxX = Math.max(maxX, n.x + n.r);
