@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, type Simulation } from "d3-force";
+  import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, forceX, forceY, type Simulation } from "d3-force";
   import { kindInk, kindLabel, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { speakerInk } from "$lib/notes";
 
@@ -188,6 +188,12 @@
           .strength(0.35),
       )
       .force("center", forceCenter(width / 2, height / 2))
+      // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
+      // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
+      // 跟主团完全没有边连接的孤岛,互斥力(charge)会把它们越推越远,越推越飘。
+      // forceX/forceY 是逐节点的独立向心力,才能真正把孤岛拽回可见范围内。
+      .force("gravityX", forceX<SimNode>(width / 2).strength(0.08))
+      .force("gravityY", forceY<SimNode>(height / 2).strength(0.08))
       .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6))
       .on("tick", refreshSnap);
     if (reduce || heavy) {
@@ -283,12 +289,30 @@
 
   /** 自适应缩放:力导仿真的间距是固定物理单位,跟容器大小无关——图少、容器大时会挤成
       一小团、四周大片空白。每次渲染都按节点实际占据的包围盒(含半径留白)算一个整体
-      缩放+居中变换,让图形永远撑满容器,而不是死守仿真给的绝对像素间距。 */
+      缩放+居中变换,让图形永远撑满容器,而不是死守仿真给的绝对像素间距。
+      **孤岛不该支配整体缩放**:跟主图完全没有边连接的小簇(只互相共现的几个实体)
+      会被斥力推得比主团远得多——若把它们也算进包围盒,为了照顾这几个孤岛,主图
+      (通常是最有信息量的部分)反而被挤成小小一团。节点数较多时改用「去掉离质心
+      最远 10%」的核心包围盒来定缩放,孤岛仍会被画出来,只是不再反过来支配整体
+      缩放比例——想看它们,拖一下或滚轮缩小即可找到。 */
   const fit = $derived.by(() => {
     const ns = snap.nodes;
     if (ns.length === 0) return { scale: 1, tx: 0, ty: 0 };
+    // 阈值刻意设得比默认 60 节点视图高——那个视图已经调过很多轮、不想被这个后加的
+    // 逻辑意外改变框选范围,孤岛问题主要出现在「显示全部」这种大图场景。
+    let core = ns;
+    if (ns.length > 100) {
+      const cx0 = ns.reduce((s, n) => s + n.x, 0) / ns.length;
+      const cy0 = ns.reduce((s, n) => s + n.y, 0) / ns.length;
+      const sorted = [...ns].sort((a, b) => {
+        const da = (a.x - cx0) ** 2 + (a.y - cy0) ** 2;
+        const db = (b.x - cx0) ** 2 + (b.y - cy0) ** 2;
+        return da - db;
+      });
+      core = sorted.slice(0, Math.ceil(sorted.length * 0.9));
+    }
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of ns) {
+    for (const n of core) {
       minX = Math.min(minX, n.x - n.r);
       minY = Math.min(minY, n.y - n.r);
       maxX = Math.max(maxX, n.x + n.r);
