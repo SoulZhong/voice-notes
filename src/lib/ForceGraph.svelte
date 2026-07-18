@@ -35,7 +35,7 @@
 
   // 渲染快照(每 tick 刷新;与 d3 mutate 的节点对象解耦,保证 Svelte 反应式更新)。
   let snap = $state<{
-    nodes: { id: string; label: string; kind: string; is_person: boolean; x: number; y: number; r: number }[];
+    nodes: { id: string; label: string; name: string; kind: string; is_person: boolean; x: number; y: number; r: number }[];
     links: { aid: string; bid: string; x1: number; y1: number; x2: number; y2: number; w: number }[];
   }>({ nodes: [], links: [] });
 
@@ -43,8 +43,8 @@
   let dNodes: SimNode[] = [];
   let dLinks: SimLink[] = [];
 
-  const MIN_R = 13;
-  const MAX_R = 32;
+  const MIN_R = 12;
+  const MAX_R = 38;
   const CHAR_PX = 8; // 中英混排近似字宽(10px 字号)
 
   // kind 分类色(次信号):固定序对应常见 kind,未知 kind 按字符散列兜底,7 色循环
@@ -72,9 +72,11 @@
   const nodeColor = (id: string, kind: string, isPerson: boolean) =>
     isPerson ? speakerInk(id, "mic") : kindInk(kind);
 
-  /** 半径=重要度(主信号,相对当前渲染集合归一化);文字装不下就截断,不反过来撑大圆。 */
+  /** 半径=重要度(主信号,相对当前渲染集合归一化);文字装不下就截断,不反过来撑大圆。
+      线性比例(非 sqrt)——sqrt 会把低值往上拉、高值往下压,大多数低 note_count 节点
+      挤在一个窄区间里看不出差别;线性 + 拉宽 MIN_R..MAX_R 让差距在视觉上真正显著。 */
   function sizeFor(name: string, noteCount: number, maxNoteCount: number): { r: number; label: string } {
-    const t = maxNoteCount > 0 ? Math.sqrt(noteCount) / Math.sqrt(maxNoteCount) : 0;
+    const t = maxNoteCount > 0 ? noteCount / maxNoteCount : 0;
     const r = MIN_R + t * (MAX_R - MIN_R);
     const maxChars = Math.max(2, Math.floor(((r - 6) * 2) / CHAR_PX));
     const label = name.length > maxChars ? name.slice(0, maxChars - 1) + "…" : name;
@@ -125,6 +127,7 @@
       nodes: dNodes.map((n) => ({
         id: n.id,
         label: n.label ?? n.name,
+        name: n.name,
         kind: n.kind,
         is_person: n.is_person,
         x: n.x ?? width / 2,
@@ -242,7 +245,7 @@
           x2={l.x2}
           y2={l.y2}
           stroke="var(--hairline-strong)"
-          stroke-width={Math.min(4, 0.6 + l.w * 0.5)}
+          stroke-width={Math.min(5, 0.5 + l.w * 0.7)}
           opacity={dimLink(l.aid, l.bid) ? 0.06 : 0.35}
         ><title>共享 {l.w} 篇笔记</title></line>
       {/each}
@@ -260,8 +263,8 @@
           onmouseenter={() => (hovered = n.id)}
           onmouseleave={() => (hovered = null)}
         >
-          <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)} />
-          <text class="lbl" font-size={n.r >= 22 ? 11 : 9.5}>{n.label}</text>
+          <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}><title>{n.name}</title></circle>
+          <text class="lbl" font-size={Math.min(14, Math.max(8, 6 + n.r * 0.22))}>{n.label}</text>
         </g>
       {/each}
     </g>
