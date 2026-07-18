@@ -74,6 +74,27 @@
 - 全仓 `cargo test` 绿;`cargo check` Windows target 结果留档;macOS 真机冒烟:正常录一段(VPIO 路径不回退)+ 拔设备自愈演示。
 - 更新本计划「依赖调研结论」与各任务偏差记录;写验收说明(用户可验项/待 Windows 真机项清单)。
 
+## 实施偏差记录(2026-07-18)
+
+- **Tap 不进 start_session,改 TappedCapture 包装器**:原计划在 start_session 源循环里插 tap;实施发现那会把填充语义暴露给全部既有 Mock 流测试、并把平台策略渗进 session 层。改为装配层包装(`TappedCapture(ResilientCapture(真实采集))`),session.rs **零改动**,既有 527 测试原样绿。
+- **周期日志改事件驱动**:原计划"每 ~30s 一行摘要";实施改为断流/恢复/自愈结局时才落日志——Windows 环回的静默填充是常态,周期日志会刷屏,事件驱动才符合"静默场次零输出干扰"的本意。统计随时可查(pipeline_health)。
+- **SCK 失联阈值**:原计划 System 不判失联;定稿为 SCK 5s 判失联(它静音也持续回调,帧荒即流死亡)、仅 Windows 环回不判(静默=常态)。
+- **CI 首轮实收 5 个 Windows 编译错**(正是要真 runner 的原因):mcp uds/bridge 的 Unix socket(std 不在 Windows 暴露)→ #[path] 桩顶替,控制类 MCP 降级人话指引、查询类不受影响;`RunEvent::Reopen` 是 macOS 独有变体 → cfg 圈起。
+- **测试竞态教训 ×2**:重建实例的帧在 start() 内同步发出,on_recovered 在 start() 返回后才调——"收满帧"不代表"回调已执行",两处断言都改为有界轮询。
+
+## 验收清单(交付用户)
+
+**本机(macOS)已验:**
+- `cargo test --lib` 528 通过 0 失败(frame_tap 7 项、resilient 4 项、组合全链 1 项为新增;flaky 排查:frame_tap 15/15、resilient 20/20 轮次稳定)。
+- 真设备 ignored 测试:VPIO 真麦克风出帧 ✓;DTLN 双模型加载/守恒/静默参考 3/3 ✓(`VN_DTLN_DIR` 指向已装模型)。
+- 前端 `npm run check` 0/0、`npm test` 7/7。
+- Windows 编译:GitHub Actions windows-latest `cargo check --lib`(分支每次 push 自动跑)。
+
+**待用户验收(需人工/真机):**
+- macOS 整机:开录正常一场(默认 VPIO 路径不回退)→ 录制中拔 USB/蓝牙麦克风 → 观察 stderr 自愈日志 + `source_health` 事件 + 恢复后转写继续、时间轴不错位;`pipeline_health` 命令可查各源计数。
+- Windows 真机(本机无以验证):双源录制、环回静默期时间轴、设备切换自愈、sherpa 预编译包下载路径。
+- 决定是否合并:分支 `feature/meetily-borrow-windows`,未合 master。
+
 ## Self-Review
 - 三项借鉴(统计/静音填充+断连自愈/跨平台采集)全部落在双路架构内,无混音渗入 ✓
 - meetily 的坑已规避:统计不是死代码(接线+命令)、静音填充有单测口径、错误面有两条互补探测 ✓
