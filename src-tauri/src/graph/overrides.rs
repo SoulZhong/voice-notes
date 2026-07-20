@@ -38,6 +38,12 @@ pub struct RegistryEntity {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RegistryState {
+    pub entity_id: String,
+    pub entity: Option<RegistryEntity>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeOperation {
     pub id: String,
@@ -147,10 +153,24 @@ pub fn allocate_split_entity_id(operation_id: &str) -> String {
 }
 
 pub fn load(data_root: &Path) -> Result<KnowledgeLedger, KnowledgeLoadError> {
+    load_with_bootstrap_reader(data_root, bootstrap_legacy)
+}
+
+fn load_with_bootstrap_reader(
+    data_root: &Path,
+    read_bootstrap: impl FnOnce(&Path) -> anyhow::Result<KnowledgeLedger>,
+) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     let path = data_root.join(KNOWLEDGE_FILE);
     match read_ledger(&path) {
         Ok(Some(ledger)) => Ok(ledger),
-        Ok(None) => initialize_missing(data_root),
+        Ok(None) => {
+            let bootstrap =
+                read_bootstrap(data_root).map_err(|error| KnowledgeLoadError::Corrupt {
+                    path: data_root.join(super::GRAPH_FILE),
+                    message: error.to_string(),
+                })?;
+            initialize_missing(data_root, bootstrap)
+        }
         Err(error) => Err(error),
     }
 }
@@ -160,20 +180,35 @@ pub fn update<T>(
     change: impl FnOnce(&mut KnowledgeLedger) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     fs::create_dir_all(data_root)?;
+    let path = data_root.join(KNOWLEDGE_FILE);
+    let bootstrap = match read_ledger(&path)? {
+        Some(_) => None,
+        None => Some(bootstrap_legacy(data_root)?),
+    };
     let _lock = KnowledgeLock::acquire(data_root)?;
-    let mut ledger = load_locked(data_root)?;
+    let mut ledger = load_locked(data_root, bootstrap)?;
+    let original_baseline = registry_baseline(&ledger)?;
     let existing_operations = ledger.operations.clone();
     let result = change(&mut ledger)?;
     anyhow::ensure!(
         ledger.operations.starts_with(&existing_operations),
         "knowledge operations are append-only"
     );
+    canonicalize_new_content(&mut ledger, existing_operations.len())?;
     validate_ledger(&ledger).map_err(anyhow::Error::msg)?;
+    let updated_baseline = registry_baseline(&ledger)?;
+    anyhow::ensure!(
+        updated_baseline == original_baseline,
+        "materialized registry mutation is not explained by appended operations"
+    );
     write_ledger_atomic(data_root, &ledger)?;
     Ok(result)
 }
 
-fn initialize_missing(data_root: &Path) -> Result<KnowledgeLedger, KnowledgeLoadError> {
+fn initialize_missing(
+    data_root: &Path,
+    bootstrap: KnowledgeLedger,
+) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     fs::create_dir_all(data_root).map_err(|source| KnowledgeLoadError::Io {
         path: data_root.into(),
         source,
@@ -182,17 +217,23 @@ fn initialize_missing(data_root: &Path) -> Result<KnowledgeLedger, KnowledgeLoad
         path: data_root.join(KNOWLEDGE_LOCK_FILE),
         source,
     })?;
-    load_locked(data_root)
+    load_locked(data_root, Some(bootstrap))
 }
 
-fn load_locked(data_root: &Path) -> Result<KnowledgeLedger, KnowledgeLoadError> {
+fn load_locked(
+    data_root: &Path,
+    bootstrap: Option<KnowledgeLedger>,
+) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     let path = data_root.join(KNOWLEDGE_FILE);
     if let Some(ledger) = read_ledger(&path)? {
         return Ok(ledger);
     }
-    let ledger = bootstrap_legacy(data_root).map_err(|error| KnowledgeLoadError::Corrupt {
-        path: data_root.join(super::GRAPH_FILE),
-        message: error.to_string(),
+    let ledger = bootstrap.ok_or_else(|| KnowledgeLoadError::Io {
+        path: path.clone(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "knowledge ledger disappeared while acquiring its lock",
+        ),
     })?;
     let write_result = if ledger == KnowledgeLedger::empty() {
         write_bytes_atomic_with(data_root, INITIAL_BYTES, || Ok(()))
@@ -236,6 +277,13 @@ fn validate_ledger(ledger: &KnowledgeLedger) -> Result<(), String> {
             ledger.schema_version
         ));
     }
+    for (entity_id, entity) in &ledger.registry {
+        if !is_canonical_set(&entity.aliases) {
+            return Err(format!(
+                "registry entity {entity_id} aliases are not canonical"
+            ));
+        }
+    }
     let mut operation_ids = std::collections::BTreeSet::new();
     for operation in &ledger.operations {
         if operation.id.trim().is_empty() {
@@ -251,9 +299,283 @@ fn validate_ledger(ledger: &KnowledgeLedger) -> Result<(), String> {
                     operation.id
                 ));
             }
+            if !is_canonical_set(&relation.evidence_ids) {
+                return Err(format!(
+                    "operation {} evidence_ids are not canonical",
+                    operation.id
+                ));
+            }
+        }
+        if let KnowledgeAction::CreateEntity { entity } = &operation.action {
+            if !is_canonical_set(&entity.aliases) {
+                return Err(format!(
+                    "operation {} aliases are not canonical",
+                    operation.id
+                ));
+            }
+        }
+        super::resolve::validate_decision_snapshot(operation).map_err(|error| error.to_string())?;
+    }
+    registry_baseline(ledger).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn canonicalize_new_content(
+    ledger: &mut KnowledgeLedger,
+    existing_operation_count: usize,
+) -> anyhow::Result<()> {
+    for entity in ledger.registry.values_mut() {
+        canonicalize_set(&mut entity.aliases);
+    }
+    for operation in ledger.operations.iter_mut().skip(existing_operation_count) {
+        match &mut operation.action {
+            KnowledgeAction::RenameEntity { .. }
+            | KnowledgeAction::AddAlias { .. }
+            | KnowledgeAction::RemoveAlias { .. }
+            | KnowledgeAction::CreateEntity { .. } => {
+                canonicalize_registry_state(&mut operation.before, &operation.id, "before")?;
+                canonicalize_registry_state(&mut operation.after, &operation.id, "after")?;
+                if let KnowledgeAction::CreateEntity { entity } = &mut operation.action {
+                    canonicalize_set(&mut entity.aliases);
+                }
+            }
+            KnowledgeAction::CreateRelation { relation } => {
+                canonicalize_set(&mut relation.evidence_ids)
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn canonicalize_registry_state(
+    value: &mut serde_json::Value,
+    operation_id: &str,
+    field: &str,
+) -> anyhow::Result<()> {
+    let mut state: RegistryState = serde_json::from_value(value.clone()).map_err(|error| {
+        anyhow::anyhow!("operation {operation_id} {field} snapshot is invalid: {error}")
+    })?;
+    if let Some(entity) = &mut state.entity {
+        canonicalize_set(&mut entity.aliases);
+    }
+    *value = serde_json::to_value(state)?;
+    Ok(())
+}
+
+fn canonicalize_set(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+fn is_canonical_set(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+pub(crate) fn active_operation_mask(
+    operations: &[KnowledgeOperation],
+) -> anyhow::Result<Vec<bool>> {
+    let indexes: BTreeMap<&str, usize> = operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| (operation.id.as_str(), index))
+        .collect();
+    anyhow::ensure!(
+        indexes.len() == operations.len(),
+        "duplicate knowledge operation id"
+    );
+    let mut active = vec![true; operations.len()];
+    for index in (0..operations.len()).rev() {
+        if !active[index] {
+            continue;
+        }
+        if let KnowledgeAction::Undo { operation_id } = &operations[index].action {
+            let target = indexes.get(operation_id.as_str()).copied().ok_or_else(|| {
+                anyhow::anyhow!("undo references unknown operation {operation_id}")
+            })?;
+            anyhow::ensure!(
+                target < index,
+                "undo operation {} must reference an earlier operation",
+                operations[index].id
+            );
+            active[target] = !active[target];
+        }
+    }
+    Ok(active)
+}
+
+pub(crate) fn registry_baseline(
+    ledger: &KnowledgeLedger,
+) -> anyhow::Result<BTreeMap<String, RegistryEntity>> {
+    let active = active_operation_mask(&ledger.operations)?;
+    let transitions: Vec<_> = ledger
+        .operations
+        .iter()
+        .map(validate_entity_transition)
+        .collect::<anyhow::Result<_>>()?;
+    let mut baseline = ledger.registry.clone();
+    for (index, transition) in transitions.iter().enumerate().rev() {
+        if !active[index] {
+            continue;
+        }
+        let Some((before, after)) = transition else {
+            continue;
+        };
+        let current = baseline.get(&after.entity_id).cloned();
+        anyhow::ensure!(
+            current == after.entity,
+            "operation {} after snapshot does not match materialized registry",
+            ledger.operations[index].id
+        );
+        set_registry_state(&mut baseline, before);
+    }
+
+    let mut replayed = baseline.clone();
+    for (index, transition) in transitions.iter().enumerate() {
+        if !active[index] {
+            continue;
+        }
+        let Some((before, after)) = transition else {
+            continue;
+        };
+        let current = replayed.get(&before.entity_id).cloned();
+        anyhow::ensure!(
+            current == before.entity,
+            "operation {} before snapshot does not match immutable baseline replay",
+            ledger.operations[index].id
+        );
+        set_registry_state(&mut replayed, after);
+    }
+    anyhow::ensure!(
+        replayed == ledger.registry,
+        "materialized registry does not match active operation replay"
+    );
+    Ok(baseline)
+}
+
+fn set_registry_state(registry: &mut BTreeMap<String, RegistryEntity>, state: &RegistryState) {
+    match &state.entity {
+        Some(entity) => {
+            registry.insert(state.entity_id.clone(), entity.clone());
+        }
+        None => {
+            registry.remove(&state.entity_id);
+        }
+    }
+}
+
+fn validate_entity_transition(
+    operation: &KnowledgeOperation,
+) -> anyhow::Result<Option<(RegistryState, RegistryState)>> {
+    let entity_action = matches!(
+        operation.action,
+        KnowledgeAction::RenameEntity { .. }
+            | KnowledgeAction::AddAlias { .. }
+            | KnowledgeAction::RemoveAlias { .. }
+            | KnowledgeAction::CreateEntity { .. }
+    );
+    if !entity_action {
+        return Ok(None);
+    }
+    let before: RegistryState =
+        serde_json::from_value(operation.before.clone()).map_err(|error| {
+            anyhow::anyhow!(
+                "operation {} before snapshot is invalid: {error}",
+                operation.id
+            )
+        })?;
+    let after: RegistryState =
+        serde_json::from_value(operation.after.clone()).map_err(|error| {
+            anyhow::anyhow!(
+                "operation {} after snapshot is invalid: {error}",
+                operation.id
+            )
+        })?;
+    anyhow::ensure!(
+        before.entity_id == after.entity_id,
+        "operation {} changes entity id in snapshots",
+        operation.id
+    );
+    for (field, state) in [("before", &before), ("after", &after)] {
+        if let Some(entity) = &state.entity {
+            anyhow::ensure!(
+                is_canonical_set(&entity.aliases),
+                "operation {} {field} aliases are not canonical",
+                operation.id
+            );
+        }
+    }
+    match &operation.action {
+        KnowledgeAction::RenameEntity { entity_id, name } => {
+            anyhow::ensure!(
+                before.entity_id == *entity_id,
+                "operation {} entity id mismatch",
+                operation.id
+            );
+            let mut expected = before.entity.clone().ok_or_else(|| {
+                anyhow::anyhow!("operation {} rename before entity is missing", operation.id)
+            })?;
+            expected.name = name.clone();
+            anyhow::ensure!(
+                after.entity == Some(expected),
+                "operation {} rename after snapshot mismatch",
+                operation.id
+            );
+        }
+        KnowledgeAction::AddAlias { entity_id, alias } => {
+            anyhow::ensure!(
+                before.entity_id == *entity_id,
+                "operation {} entity id mismatch",
+                operation.id
+            );
+            let mut expected = before.entity.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "operation {} add-alias before entity is missing",
+                    operation.id
+                )
+            })?;
+            expected.aliases.push(alias.clone());
+            canonicalize_set(&mut expected.aliases);
+            anyhow::ensure!(
+                after.entity == Some(expected),
+                "operation {} add-alias after snapshot mismatch",
+                operation.id
+            );
+        }
+        KnowledgeAction::RemoveAlias { entity_id, alias } => {
+            anyhow::ensure!(
+                before.entity_id == *entity_id,
+                "operation {} entity id mismatch",
+                operation.id
+            );
+            let mut expected = before.entity.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "operation {} remove-alias before entity is missing",
+                    operation.id
+                )
+            })?;
+            expected.aliases.retain(|value| value != alias);
+            anyhow::ensure!(
+                after.entity == Some(expected),
+                "operation {} remove-alias after snapshot mismatch",
+                operation.id
+            );
+        }
+        KnowledgeAction::CreateEntity { entity } => {
+            anyhow::ensure!(
+                before.entity.is_none(),
+                "operation {} create before entity must be null",
+                operation.id
+            );
+            anyhow::ensure!(
+                after.entity.as_ref() == Some(entity),
+                "operation {} create after snapshot mismatch",
+                operation.id
+            );
+        }
+        _ => unreachable!(),
+    }
+    Ok(Some((before, after)))
 }
 
 struct KnowledgeLock {
@@ -262,16 +584,24 @@ struct KnowledgeLock {
 
 impl KnowledgeLock {
     fn acquire(data_root: &Path) -> std::io::Result<Self> {
+        Self::acquire_with_observer(data_root, || {})
+    }
+
+    fn acquire_with_observer(
+        data_root: &Path,
+        mut on_attempt: impl FnMut(),
+    ) -> std::io::Result<Self> {
         const RETRIES: u32 = 5;
         const BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
-        for attempt in 0..RETRIES {
+        for attempt in 0..=RETRIES {
+            on_attempt();
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(data_root.join(KNOWLEDGE_LOCK_FILE))?;
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
-                Err(TryLockError::WouldBlock) if attempt + 1 < RETRIES => {
+                Err(TryLockError::WouldBlock) if attempt < RETRIES => {
                     std::thread::sleep(BACKOFF);
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -394,15 +724,23 @@ fn bootstrap_legacy(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
     for row in rows {
         let (old_id, kind, extracted_name, aliases_json) = row?;
         let name = overrides.get(&old_id).cloned().unwrap_or(extracted_name);
+        let mut aliases: Vec<String> = serde_json::from_str(&aliases_json).map_err(|error| {
+            anyhow::anyhow!("legacy entity {old_id} aliases JSON is invalid: {error}")
+        })?;
+        canonicalize_set(&mut aliases);
         let entity = RegistryEntity {
             kind: kind.clone(),
             name: name.clone(),
-            aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+            aliases,
             status: "confirmed".into(),
         };
-        let entity_id = allocate_entity_id(&kind, &name, "legacy", &old_id);
+        let entity_id = if kind == "person" {
+            old_id.clone()
+        } else {
+            allocate_entity_id(&kind, &name, "legacy", &old_id)
+        };
         ledger.registry.insert(entity_id.clone(), entity.clone());
-        ledger.legacy_ids.insert(old_id.clone(), entity_id);
+        ledger.legacy_ids.insert(old_id.clone(), entity_id.clone());
         let operation_id = stable_id("op_", &["legacy_create".into(), old_id.clone()]);
         ordered_operations.push((
             old_id,
@@ -410,8 +748,14 @@ fn bootstrap_legacy(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
             KnowledgeOperation {
                 id: operation_id,
                 at: "legacy_bootstrap".into(),
-                before: serde_json::Value::Null,
-                after: serde_json::to_value(&entity)?,
+                before: serde_json::to_value(RegistryState {
+                    entity_id: entity_id.clone(),
+                    entity: None,
+                })?,
+                after: serde_json::to_value(RegistryState {
+                    entity_id,
+                    entity: Some(entity.clone()),
+                })?,
                 action: KnowledgeAction::CreateEntity { entity },
             },
         ));
@@ -487,6 +831,30 @@ mod tests {
         }
     }
 
+    fn entity_state(entity_id: &str, entity: Option<&RegistryEntity>) -> serde_json::Value {
+        serde_json::to_value(RegistryState {
+            entity_id: entity_id.into(),
+            entity: entity.cloned(),
+        })
+        .unwrap()
+    }
+
+    fn entity_operation(
+        id: &str,
+        entity_id: &str,
+        before: Option<&RegistryEntity>,
+        after: Option<&RegistryEntity>,
+        action: KnowledgeAction,
+    ) -> KnowledgeOperation {
+        KnowledgeOperation {
+            id: id.into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: entity_state(entity_id, before),
+            after: entity_state(entity_id, after),
+            action,
+        }
+    }
+
     #[test]
     fn missing_ledger_initializes_to_exact_v1_bytes() {
         let root = tempfile::tempdir().unwrap();
@@ -497,6 +865,34 @@ mod tests {
             fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap(),
             br#"{"schema_version":1,"registry":{},"legacy_ids":{},"operations":[]}"#
         );
+    }
+
+    #[test]
+    fn legacy_snapshot_reader_runs_before_initialization_lock_is_acquired() {
+        let root = tempfile::tempdir().unwrap();
+        let reader_ran = std::cell::Cell::new(false);
+
+        let ledger = load_with_bootstrap_reader(root.path(), |data_root| {
+            let probe = KnowledgeLock::acquire(data_root)
+                .expect("snapshot reader must run before ledger lock is held");
+            reader_ran.set(true);
+            drop(probe);
+            Ok(KnowledgeLedger::empty())
+        })
+        .unwrap();
+
+        assert!(reader_ran.get());
+        assert_eq!(ledger, KnowledgeLedger::empty());
+    }
+
+    #[test]
+    fn locked_recheck_does_not_replace_a_disappeared_existing_ledger() {
+        let root = tempfile::tempdir().unwrap();
+
+        let error = load_locked(root.path(), None).unwrap_err();
+
+        assert!(matches!(error, KnowledgeLoadError::Io { .. }));
+        assert!(!root.path().join(KNOWLEDGE_FILE).exists());
     }
 
     #[test]
@@ -525,14 +921,17 @@ mod tests {
     fn update_preserves_entity_id_across_rename_and_appends_operation() {
         let root = tempfile::tempdir().unwrap();
         let id = allocate_entity_id("project", "Apollo", "n1", "ent_1");
+        let original = entity("project", "Apollo");
+        let renamed = entity("project", "Artemis");
         update(root.path(), |ledger| {
-            ledger
-                .registry
-                .insert(id.clone(), entity("project", "Apollo"));
-            ledger.operations.push(operation(
+            ledger.registry.insert(id.clone(), original.clone());
+            ledger.operations.push(entity_operation(
                 "op_create",
+                &id,
+                None,
+                Some(&original),
                 KnowledgeAction::CreateEntity {
-                    entity: entity("project", "Apollo"),
+                    entity: original.clone(),
                 },
             ));
             Ok(())
@@ -540,8 +939,11 @@ mod tests {
         .unwrap();
         update(root.path(), |ledger| {
             ledger.registry.get_mut(&id).unwrap().name = "Artemis".into();
-            ledger.operations.push(operation(
+            ledger.operations.push(entity_operation(
                 "op_rename",
+                &id,
+                Some(&original),
+                Some(&renamed),
                 KnowledgeAction::RenameEntity {
                     entity_id: id.clone(),
                     name: "Artemis".into(),
@@ -564,9 +966,8 @@ mod tests {
         update(root.path(), |ledger| {
             ledger.operations.push(operation(
                 "op_1",
-                KnowledgeAction::AddAlias {
-                    entity_id: "kg_a".into(),
-                    alias: "A".into(),
+                KnowledgeAction::ConfirmRelation {
+                    relation_id: "rf_1".into(),
                 },
             ));
             Ok(())
@@ -582,6 +983,84 @@ mod tests {
 
         assert!(error.to_string().contains("append-only"));
         assert_eq!(fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn update_rejects_materialized_registry_mutation_without_matching_operation() {
+        let root = tempfile::tempdir().unwrap();
+        load(root.path()).unwrap();
+        let before = fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap();
+
+        let error = update(root.path(), |ledger| {
+            ledger
+                .registry
+                .insert("kg_unlogged".into(), entity("project", "Unlogged"));
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("materialized registry"));
+        assert_eq!(fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn update_requires_undo_to_restore_the_materialized_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "kg_1";
+        let original = entity("project", "Apollo");
+        let renamed = entity("project", "Artemis");
+        update(root.path(), |ledger| {
+            ledger.registry.insert(id.into(), original.clone());
+            ledger.operations.push(entity_operation(
+                "op_create",
+                id,
+                None,
+                Some(&original),
+                KnowledgeAction::CreateEntity {
+                    entity: original.clone(),
+                },
+            ));
+            ledger.registry.insert(id.into(), renamed.clone());
+            ledger.operations.push(entity_operation(
+                "op_rename",
+                id,
+                Some(&original),
+                Some(&renamed),
+                KnowledgeAction::RenameEntity {
+                    entity_id: id.into(),
+                    name: renamed.name.clone(),
+                },
+            ));
+            Ok(())
+        })
+        .unwrap();
+        let before = fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap();
+
+        let error = update(root.path(), |ledger| {
+            ledger.operations.push(operation(
+                "op_undo",
+                KnowledgeAction::Undo {
+                    operation_id: "op_rename".into(),
+                },
+            ));
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("materialized registry"));
+        assert_eq!(fs::read(root.path().join(KNOWLEDGE_FILE)).unwrap(), before);
+
+        update(root.path(), |ledger| {
+            ledger.registry.insert(id.into(), original.clone());
+            ledger.operations.push(operation(
+                "op_undo",
+                KnowledgeAction::Undo {
+                    operation_id: "op_rename".into(),
+                },
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(load(root.path()).unwrap().registry[id], original);
     }
 
     #[test]
@@ -653,6 +1132,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_decision_snapshot_is_corrupt_on_load_and_bytes_stay_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(KNOWLEDGE_FILE);
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_merge".into(),
+            at: "t".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_a".into(),
+                target_id: "kg_b".into(),
+            },
+        });
+        let bytes = serde_json::to_vec_pretty(&ledger).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let error = load(root.path()).unwrap_err();
+
+        assert!(matches!(error, KnowledgeLoadError::Corrupt { .. }));
+        assert!(error.to_string().contains("op_merge"));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn held_file_lock_rejects_second_writer_after_bounded_retries() {
         let root = tempfile::tempdir().unwrap();
         let _held = KnowledgeLock::acquire(root.path()).unwrap();
@@ -661,8 +1165,24 @@ mod tests {
         let error = update(root.path(), |_| Ok(())).unwrap_err();
 
         assert!(error.to_string().contains("lock"));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(90));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lock_uses_one_initial_attempt_plus_five_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let _held = KnowledgeLock::acquire(root.path()).unwrap();
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let error = KnowledgeLock::acquire_with_observer(root.path(), || {
+            attempts.set(attempts.get() + 1);
+        })
+        .err()
+        .expect("held lock must reject acquisition");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(attempts.get(), 6);
     }
 
     #[test]
@@ -682,9 +1202,8 @@ mod tests {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         ledger.operations.push(operation(
                             id,
-                            KnowledgeAction::AddAlias {
-                                entity_id: "kg_1".into(),
-                                alias: id.into(),
+                            KnowledgeAction::ConfirmRelation {
+                                relation_id: id.into(),
                             },
                         ));
                         Ok(())
@@ -807,6 +1326,181 @@ mod tests {
         let bytes = fs::read(a.path().join(KNOWLEDGE_FILE)).unwrap();
         assert_eq!(load(a.path()).unwrap(), first);
         assert_eq!(fs::read(a.path().join(KNOWLEDGE_FILE)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn bootstrap_preserves_legacy_person_id_without_allocating_kg_fork() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = super::super::open(root.path()).unwrap();
+        conn.execute(
+            "INSERT INTO entities(id, kind, name, aliases, is_person) VALUES('P1','person','Ada','[]',1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ledger = load(root.path()).unwrap();
+
+        assert_eq!(ledger.legacy_ids["P1"], "P1");
+        assert_eq!(ledger.registry["P1"].name, "Ada");
+        assert!(!ledger.registry.keys().any(|id| id.starts_with("kg_")));
+        let snapshot = crate::graph::resolve::replay(&ledger).unwrap();
+        let resolution = crate::graph::resolve::resolve_entity(
+            &snapshot,
+            &serde_json::from_value::<crate::store::Voiceprints>(serde_json::json!({
+                "schema_version": 1,
+                "next_person": 2,
+                "people": {"P1": {"name": "Ada"}}
+            }))
+            .unwrap(),
+            "n1",
+            &crate::store::Entity {
+                id: "P1".into(),
+                kind: "person".into(),
+                name: "Ada".into(),
+                aliases: Vec::new(),
+            },
+            &[],
+        );
+        assert_eq!(resolution.entity_id.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn malformed_legacy_aliases_abort_bootstrap_and_leave_ledger_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = super::super::open(root.path()).unwrap();
+        conn.execute(
+            "INSERT INTO entities(id, kind, name, aliases, is_person) VALUES('e:bad','project','Bad','not-json',0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = load(root.path()).unwrap_err();
+
+        assert!(matches!(error, KnowledgeLoadError::Corrupt { .. }));
+        assert!(error.to_string().contains("e:bad"));
+        assert!(error.to_string().contains("aliases"));
+        assert!(!root.path().join(KNOWLEDGE_FILE).exists());
+    }
+
+    #[test]
+    fn set_like_vectors_are_canonicalized_before_persistence() {
+        fn write(root: &Path, aliases: &[&str], evidence: &[&str]) -> Vec<u8> {
+            update(root, |ledger| {
+                ledger.registry.insert(
+                    "kg_1".into(),
+                    RegistryEntity {
+                        kind: "project".into(),
+                        name: "Apollo".into(),
+                        aliases: aliases.iter().map(|value| (*value).into()).collect(),
+                        status: "confirmed".into(),
+                    },
+                );
+                let created = ledger.registry["kg_1"].clone();
+                ledger.operations.push(entity_operation(
+                    "op_entity",
+                    "kg_1",
+                    None,
+                    Some(&created),
+                    KnowledgeAction::CreateEntity {
+                        entity: created.clone(),
+                    },
+                ));
+                ledger.operations.push(operation(
+                    "op_relation",
+                    KnowledgeAction::CreateRelation {
+                        relation: UserRelation {
+                            subject_id: "kg_1".into(),
+                            predicate: crate::store::RelationPredicate {
+                                kind: "uses".into(),
+                                label: None,
+                            },
+                            object_id: "kg_2".into(),
+                            valid_from: None,
+                            valid_to: None,
+                            note: None,
+                            evidence_ids: evidence.iter().map(|value| (*value).into()).collect(),
+                            user_assertion: false,
+                        },
+                    },
+                ));
+                Ok(())
+            })
+            .unwrap();
+            fs::read(root.join(KNOWLEDGE_FILE)).unwrap()
+        }
+
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let first = write(
+            a.path(),
+            &["Zulu", "Alpha", "Zulu"],
+            &["ev_2", "ev_1", "ev_2"],
+        );
+        let second = write(b.path(), &["Alpha", "Zulu"], &["ev_1", "ev_2"]);
+
+        assert_eq!(first, second);
+        let ledger = load(a.path()).unwrap();
+        assert_eq!(ledger.registry["kg_1"].aliases, vec!["Alpha", "Zulu"]);
+        let KnowledgeAction::CreateRelation { relation } = &ledger.operations[1].action else {
+            panic!("expected create relation")
+        };
+        assert_eq!(relation.evidence_ids, vec!["ev_1", "ev_2"]);
+    }
+
+    #[test]
+    fn load_rejects_noncanonical_registry_and_operation_sets() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let mut registry_ledger = KnowledgeLedger::empty();
+        registry_ledger.registry.insert(
+            "kg_1".into(),
+            RegistryEntity {
+                kind: "project".into(),
+                name: "Apollo".into(),
+                aliases: vec!["Zulu".into(), "Alpha".into()],
+                status: "confirmed".into(),
+            },
+        );
+        fs::write(
+            registry_root.path().join(KNOWLEDGE_FILE),
+            serde_json::to_vec(&registry_ledger).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(registry_root.path()),
+            Err(KnowledgeLoadError::Corrupt { .. })
+        ));
+
+        let evidence_root = tempfile::tempdir().unwrap();
+        let mut evidence_ledger = KnowledgeLedger::empty();
+        evidence_ledger.operations.push(operation(
+            "op_relation",
+            KnowledgeAction::CreateRelation {
+                relation: UserRelation {
+                    subject_id: "kg_1".into(),
+                    predicate: crate::store::RelationPredicate {
+                        kind: "uses".into(),
+                        label: None,
+                    },
+                    object_id: "kg_2".into(),
+                    valid_from: None,
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: vec!["ev_2".into(), "ev_1".into()],
+                    user_assertion: false,
+                },
+            },
+        ));
+        fs::write(
+            evidence_root.path().join(KNOWLEDGE_FILE),
+            serde_json::to_vec(&evidence_ledger).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(evidence_root.path()),
+            Err(KnowledgeLoadError::Corrupt { .. })
+        ));
     }
 
     #[test]

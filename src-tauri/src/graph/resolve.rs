@@ -1,6 +1,6 @@
 use super::overrides::{
-    allocate_entity_id, allocate_split_entity_id, KnowledgeAction, KnowledgeLedger, RegistryEntity,
-    UserRelation,
+    active_operation_mask, allocate_entity_id, registry_baseline, KnowledgeAction, KnowledgeLedger,
+    KnowledgeOperation, RegistryEntity, UserRelation,
 };
 use crate::store::{Entity, RelationPredicate, VoiceprintStore, Voiceprints};
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,6 +82,8 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         ledger.schema_version == 1,
         "unsupported knowledge ledger schema"
     );
+    registry_baseline(ledger)?;
+    let active = active_operation_mask(&ledger.operations)?;
     let mut snapshot = ResolverSnapshot {
         registry: ledger.registry.clone(),
         redirects: BTreeMap::new(),
@@ -89,88 +91,49 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         relation_decisions: RelationDecisions::default(),
         legacy_ids: ledger.legacy_ids.clone(),
     };
-    let operations_by_id: BTreeMap<_, _> = ledger
-        .operations
-        .iter()
-        .map(|operation| (operation.id.as_str(), operation))
-        .collect();
-    anyhow::ensure!(
-        operations_by_id.len() == ledger.operations.len(),
-        "duplicate knowledge operation id"
-    );
-
-    let mut undone = BTreeSet::new();
-    for operation in &ledger.operations {
-        if let KnowledgeAction::Undo { operation_id } = &operation.action {
-            anyhow::ensure!(
-                operations_by_id.contains_key(operation_id.as_str()),
-                "undo references unknown operation {operation_id}"
-            );
-            if let KnowledgeAction::Undo {
-                operation_id: nested,
-            } = &operations_by_id[operation_id.as_str()].action
-            {
-                undone.insert(operation_id.clone());
-                undone.remove(nested);
-            } else {
-                undone.insert(operation_id.clone());
-            }
-        }
-    }
     let restored: BTreeSet<String> = ledger
         .operations
         .iter()
-        .filter(|operation| !undone.contains(&operation.id))
-        .filter_map(|operation| match &operation.action {
+        .enumerate()
+        .filter(|(index, _)| active[*index])
+        .filter_map(|(_, operation)| match &operation.action {
             KnowledgeAction::RestoreRelation { operation_id } => Some(operation_id.clone()),
             _ => None,
         })
         .collect();
 
     for operation in &ledger.operations {
-        if undone.contains(&operation.id)
+        validate_decision_snapshot(operation)?;
+    }
+
+    for (index, operation) in ledger.operations.iter().enumerate() {
+        if !active[index]
             || restored.contains(&operation.id)
             || matches!(operation.action, KnowledgeAction::Undo { .. })
         {
             continue;
         }
         match &operation.action {
-            KnowledgeAction::RenameEntity { entity_id, name } => {
-                snapshot
-                    .registry
-                    .get_mut(entity_id)
-                    .ok_or_else(|| anyhow::anyhow!("rename references unknown entity {entity_id}"))?
-                    .name = name.clone();
-            }
-            KnowledgeAction::AddAlias { entity_id, alias } => {
-                let entity = snapshot.registry.get_mut(entity_id).ok_or_else(|| {
-                    anyhow::anyhow!("alias references unknown entity {entity_id}")
-                })?;
-                if !entity.aliases.iter().any(|value| value == alias) {
-                    entity.aliases.push(alias.clone());
-                }
-            }
-            KnowledgeAction::RemoveAlias { entity_id, alias } => {
-                let entity = snapshot.registry.get_mut(entity_id).ok_or_else(|| {
-                    anyhow::anyhow!("alias references unknown entity {entity_id}")
-                })?;
-                entity.aliases.retain(|value| value != alias);
-            }
+            KnowledgeAction::RenameEntity { .. }
+            | KnowledgeAction::AddAlias { .. }
+            | KnowledgeAction::RemoveAlias { .. }
+            | KnowledgeAction::CreateEntity { .. } => {}
             KnowledgeAction::MergeEntity {
                 source_id,
                 target_id,
             } => {
-                snapshot
-                    .redirects
-                    .insert(source_id.clone(), target_id.clone());
+                apply_decision(&mut snapshot.redirects, source_id, operation, target_id)?;
             }
             KnowledgeAction::BindMention {
                 mention_id,
                 entity_id,
             } => {
-                snapshot
-                    .mention_bindings
-                    .insert(mention_id.clone(), entity_id.clone());
+                apply_decision(
+                    &mut snapshot.mention_bindings,
+                    mention_id,
+                    operation,
+                    entity_id,
+                )?;
             }
             KnowledgeAction::ConfirmRelation { relation_id } => {
                 snapshot
@@ -229,17 +192,6 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .restored_operations
                     .insert(operation_id.clone());
             }
-            KnowledgeAction::CreateEntity { entity } => {
-                if !snapshot
-                    .registry
-                    .values()
-                    .any(|existing| existing == entity)
-                {
-                    snapshot
-                        .registry
-                        .insert(allocate_split_entity_id(&operation.id), entity.clone());
-                }
-            }
             KnowledgeAction::CreateRelation { relation } => {
                 anyhow::ensure!(
                     !relation.evidence_ids.is_empty() || relation.user_assertion,
@@ -255,6 +207,56 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
     }
     snapshot.relation_decisions.restored_operations = restored;
     Ok(snapshot)
+}
+
+pub(crate) fn validate_decision_snapshot(operation: &KnowledgeOperation) -> anyhow::Result<()> {
+    let expected = match &operation.action {
+        KnowledgeAction::MergeEntity { target_id, .. } => Some(target_id),
+        KnowledgeAction::BindMention { entity_id, .. } => Some(entity_id),
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let _ = optional_string(&operation.before, operation, "before")?;
+    let after = optional_string(&operation.after, operation, "after")?;
+    anyhow::ensure!(
+        after.as_deref() == Some(expected.as_str()),
+        "operation {} after decision snapshot mismatch",
+        operation.id
+    );
+    Ok(())
+}
+
+fn apply_decision(
+    decisions: &mut BTreeMap<String, String>,
+    key: &str,
+    operation: &KnowledgeOperation,
+    expected_after: &str,
+) -> anyhow::Result<()> {
+    let before = optional_string(&operation.before, operation, "before")?;
+    anyhow::ensure!(
+        decisions.get(key) == before.as_ref(),
+        "operation {} before decision snapshot mismatch",
+        operation.id
+    );
+    decisions.insert(key.to_string(), expected_after.to_string());
+    Ok(())
+}
+
+fn optional_string(
+    value: &serde_json::Value,
+    operation: &KnowledgeOperation,
+    field: &str,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(Some(value.clone())),
+        _ => anyhow::bail!(
+            "operation {} {field} decision snapshot must be null or string",
+            operation.id
+        ),
+    }
 }
 
 pub fn resolve_entity(
@@ -405,6 +407,40 @@ mod tests {
         }
     }
 
+    fn entity_state(entity_id: &str, entity: Option<&RegistryEntity>) -> Value {
+        serde_json::json!({"entity_id": entity_id, "entity": entity})
+    }
+
+    fn entity_operation(
+        id: &str,
+        before: (&str, Option<&RegistryEntity>),
+        after: (&str, Option<&RegistryEntity>),
+        action: KnowledgeAction,
+    ) -> KnowledgeOperation {
+        KnowledgeOperation {
+            id: id.into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: entity_state(before.0, before.1),
+            after: entity_state(after.0, after.1),
+            action,
+        }
+    }
+
+    fn decision_operation(
+        id: &str,
+        before: Option<&str>,
+        after: &str,
+        action: KnowledgeAction,
+    ) -> KnowledgeOperation {
+        KnowledgeOperation {
+            id: id.into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: before.map_or(Value::Null, |value| Value::String(value.into())),
+            after: Value::String(after.into()),
+            action,
+        }
+    }
+
     fn local(id: &str, kind: &str, name: &str) -> Entity {
         Entity {
             id: id.into(),
@@ -417,19 +453,24 @@ mod tests {
     #[test]
     fn replay_applies_entity_edits_without_changing_stable_id() {
         let mut ledger = KnowledgeLedger::empty();
-        ledger
-            .registry
-            .insert("kg_1".into(), registry_entity("project", "Apollo", &[]));
+        let original = registry_entity("project", "Apollo", &[]);
+        let renamed = registry_entity("project", "Artemis", &[]);
+        let aliased = registry_entity("project", "Artemis", &["Moonshot"]);
+        ledger.registry.insert("kg_1".into(), aliased.clone());
         ledger.operations.extend([
-            operation(
+            entity_operation(
                 "op_rename",
+                ("kg_1", Some(&original)),
+                ("kg_1", Some(&renamed)),
                 KnowledgeAction::RenameEntity {
                     entity_id: "kg_1".into(),
                     name: "Artemis".into(),
                 },
             ),
-            operation(
+            entity_operation(
                 "op_alias",
+                ("kg_1", Some(&renamed)),
+                ("kg_1", Some(&aliased)),
                 KnowledgeAction::AddAlias {
                     entity_id: "kg_1".into(),
                     alias: "Moonshot".into(),
@@ -444,6 +485,186 @@ mod tests {
     }
 
     #[test]
+    fn direct_undo_compensates_materialized_rename() {
+        let original = registry_entity("project", "Apollo", &[]);
+        let renamed = registry_entity("project", "Artemis", &[]);
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert("kg_1".into(), original.clone());
+        ledger.operations.extend([
+            entity_operation(
+                "op_rename",
+                ("kg_1", Some(&original)),
+                ("kg_1", Some(&renamed)),
+                KnowledgeAction::RenameEntity {
+                    entity_id: "kg_1".into(),
+                    name: "Artemis".into(),
+                },
+            ),
+            operation(
+                "op_undo",
+                KnowledgeAction::Undo {
+                    operation_id: "op_rename".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(replay(&ledger).unwrap().registry["kg_1"], original);
+    }
+
+    #[test]
+    fn nested_undo_parity_handles_two_and_three_levels() {
+        let original = registry_entity("project", "Apollo", &[]);
+        let renamed = registry_entity("project", "Artemis", &[]);
+        let rename = entity_operation(
+            "op_rename",
+            ("kg_1", Some(&original)),
+            ("kg_1", Some(&renamed)),
+            KnowledgeAction::RenameEntity {
+                entity_id: "kg_1".into(),
+                name: "Artemis".into(),
+            },
+        );
+        let undo_1 = operation(
+            "op_undo_1",
+            KnowledgeAction::Undo {
+                operation_id: "op_rename".into(),
+            },
+        );
+        let undo_2 = operation(
+            "op_undo_2",
+            KnowledgeAction::Undo {
+                operation_id: "op_undo_1".into(),
+            },
+        );
+        let undo_3 = operation(
+            "op_undo_3",
+            KnowledgeAction::Undo {
+                operation_id: "op_undo_2".into(),
+            },
+        );
+
+        let mut two = KnowledgeLedger::empty();
+        two.registry.insert("kg_1".into(), renamed.clone());
+        two.operations = vec![rename.clone(), undo_1.clone(), undo_2.clone()];
+        assert_eq!(replay(&two).unwrap().registry["kg_1"], renamed);
+
+        let mut three = KnowledgeLedger::empty();
+        three.registry.insert("kg_1".into(), original.clone());
+        three.operations = vec![rename, undo_1, undo_2, undo_3];
+        assert_eq!(replay(&three).unwrap().registry["kg_1"], original);
+    }
+
+    #[test]
+    fn undo_compensates_alias_and_create_entity() {
+        let original = registry_entity("project", "Apollo", &[]);
+        let aliased = registry_entity("project", "Apollo", &["Moonshot"]);
+        let created = registry_entity("term", "Rust", &[]);
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert("kg_1".into(), original.clone());
+        ledger.operations.extend([
+            entity_operation(
+                "op_alias",
+                ("kg_1", Some(&original)),
+                ("kg_1", Some(&aliased)),
+                KnowledgeAction::AddAlias {
+                    entity_id: "kg_1".into(),
+                    alias: "Moonshot".into(),
+                },
+            ),
+            operation(
+                "op_undo_alias",
+                KnowledgeAction::Undo {
+                    operation_id: "op_alias".into(),
+                },
+            ),
+            entity_operation(
+                "op_create",
+                ("kg_created", None),
+                ("kg_created", Some(&created)),
+                KnowledgeAction::CreateEntity {
+                    entity: created.clone(),
+                },
+            ),
+            operation(
+                "op_undo_create",
+                KnowledgeAction::Undo {
+                    operation_id: "op_create".into(),
+                },
+            ),
+        ]);
+
+        let snapshot = replay(&ledger).unwrap();
+        assert_eq!(snapshot.registry["kg_1"], original);
+        assert!(!snapshot.registry.contains_key("kg_created"));
+    }
+
+    #[test]
+    fn undo_compensates_merge_and_mention_binding_decisions() {
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.extend([
+            KnowledgeOperation {
+                id: "op_merge".into(),
+                at: "t".into(),
+                before: Value::Null,
+                after: Value::String("kg_b".into()),
+                action: KnowledgeAction::MergeEntity {
+                    source_id: "kg_a".into(),
+                    target_id: "kg_b".into(),
+                },
+            },
+            operation(
+                "op_undo_merge",
+                KnowledgeAction::Undo {
+                    operation_id: "op_merge".into(),
+                },
+            ),
+            KnowledgeOperation {
+                id: "op_bind".into(),
+                at: "t".into(),
+                before: Value::Null,
+                after: Value::String("kg_a".into()),
+                action: KnowledgeAction::BindMention {
+                    mention_id: "mn_1".into(),
+                    entity_id: "kg_a".into(),
+                },
+            },
+            operation(
+                "op_undo_bind",
+                KnowledgeAction::Undo {
+                    operation_id: "op_bind".into(),
+                },
+            ),
+        ]);
+
+        let snapshot = replay(&ledger).unwrap();
+        assert!(snapshot.redirects.is_empty());
+        assert!(snapshot.mention_bindings.is_empty());
+    }
+
+    #[test]
+    fn malformed_entity_snapshots_fail_closed() {
+        let original = registry_entity("project", "Apollo", &[]);
+        let renamed = registry_entity("project", "Artemis", &[]);
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert("kg_1".into(), renamed.clone());
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_rename".into(),
+            at: "t".into(),
+            before: Value::Null,
+            after: entity_state("kg_1", Some(&renamed)),
+            action: KnowledgeAction::RenameEntity {
+                entity_id: "kg_1".into(),
+                name: "Artemis".into(),
+            },
+        });
+
+        let error = replay(&ledger).unwrap_err();
+        assert!(error.to_string().contains("op_rename"));
+        assert!(error.to_string().contains("before"));
+        assert_ne!(original, renamed);
+    }
+
+    #[test]
     fn mention_binding_has_priority_over_all_other_matches() {
         let mut ledger = KnowledgeLedger::empty();
         ledger
@@ -452,8 +673,10 @@ mod tests {
         ledger
             .registry
             .insert("kg_name".into(), registry_entity("project", "Apollo", &[]));
-        ledger.operations.push(operation(
+        ledger.operations.push(decision_operation(
             "op_bind",
+            None,
+            "kg_bound",
             KnowledgeAction::BindMention {
                 mention_id: "mn_1".into(),
                 entity_id: "kg_bound".into(),
@@ -534,15 +757,19 @@ mod tests {
             registry_entity("project", "Canonical", &[]),
         );
         ledger.operations.extend([
-            operation(
+            decision_operation(
                 "op_1",
+                None,
+                "kg_target",
                 KnowledgeAction::MergeEntity {
                     source_id: "kg_a".into(),
                     target_id: "kg_target".into(),
                 },
             ),
-            operation(
+            decision_operation(
                 "op_2",
+                None,
+                "kg_target",
                 KnowledgeAction::MergeEntity {
                     source_id: "kg_b".into(),
                     target_id: "kg_target".into(),
@@ -611,22 +838,28 @@ mod tests {
     fn redirect_cycles_become_pending_conflicts() {
         let mut ledger = KnowledgeLedger::empty();
         ledger.operations.extend([
-            operation(
+            decision_operation(
                 "op_1",
+                None,
+                "kg_b",
                 KnowledgeAction::MergeEntity {
                     source_id: "kg_a".into(),
                     target_id: "kg_b".into(),
                 },
             ),
-            operation(
+            decision_operation(
                 "op_2",
+                None,
+                "kg_a",
                 KnowledgeAction::MergeEntity {
                     source_id: "kg_b".into(),
                     target_id: "kg_a".into(),
                 },
             ),
-            operation(
+            decision_operation(
                 "op_3",
+                None,
+                "kg_a",
                 KnowledgeAction::BindMention {
                     mention_id: "mn_1".into(),
                     entity_id: "kg_a".into(),
