@@ -460,7 +460,13 @@
     const bw = Math.max(1, maxX - minX);
     const bh = Math.max(1, maxY - minY);
     const pad = 70;
-    const targetZoom = Math.min(3.5, Math.max(1, Math.min((width - pad) / bw, (height - pad) / bh)));
+    const bboxZoom = Math.max(1, Math.min((width - pad) / bw, (height - pad) / bh));
+    // 单个命中时 bbox 几乎就是节点自身,直接套 3.5x 上限会把已经经过 fit 放大的
+    // 圆再次放到占满画布、甚至被裁切。除了相对倍率上限,再给最终节点半径一个画布
+    // 尺寸相关的绝对上限:聚焦后仍保留邻居上下文,也不因窗口大小写死像素。
+    const maxRenderedRadius = Math.max(...pts.map((n) => n.r * fit.scale));
+    const radiusZoom = (Math.min(width, height) * 0.12) / Math.max(1, maxRenderedRadius);
+    const targetZoom = Math.min(3.5, bboxZoom, Math.max(1, radiusZoom));
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
     viewZoom = targetZoom;
