@@ -16,8 +16,9 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
-  import { graphEntities, noteGraphData, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
+  import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
+  import { noteGraphState } from "$lib/noteGraph.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -88,24 +89,24 @@
 
   // ── 图谱:实体/文章两视角,列表作为主从结构的 master(搜索 + 过滤在侧栏,主区放画布)──
   let graphEnts = $state<EntitySummary[]>([]);
-  let graphNotes = $state<EntitySummary[]>([]); // 文章视角:节点=笔记(name=标题)
+  const graphNotes = $derived(noteGraphState.data.nodes); // 文章视角:节点=笔记(name=标题)
 
-  async function refreshGraph() {
+  async function refreshGraphEntities() {
     try {
-      if (graphFilter.mode === "note") {
-        graphNotes = (await noteGraphData()).nodes;
-      } else {
-        graphEnts = await graphEntities();
-      }
+      graphEnts = await graphEntities();
     } catch {
-      if (graphFilter.mode === "note") graphNotes = [];
-      else graphEnts = [];
+      graphEnts = [];
     }
   }
   $effect(() => {
-    // 依赖 mode:切视角时重新拉对应数据。
-    void graphFilter.mode;
-    if (tab === "graph") refreshGraph();
+    if (tab !== "graph") return;
+    if (graphFilter.mode === "note") {
+      // error 不自动重试:否则 load() 写 status 会反向触发这个 effect，持续失败时形成
+      // invoke 循环。主画布错误态的“重新加载”是唯一重试入口。
+      if (noteGraphState.status === "idle") void noteGraphState.load();
+    } else {
+      void refreshGraphEntities();
+    }
   });
 
   const graphKinds = $derived.by(() => {
@@ -499,7 +500,13 @@
       <!-- 文章视角:节点=笔记,列表=笔记(标题 + 含实体数),点击直接进笔记详情页
            (笔记本身已有相关笔记/实体高亮,无需再在图上开面板)。 -->
       {#if graphNotesShown.length === 0}
-        <p class="hint">{graphNotes.length === 0 ? "还没有进入图谱的笔记" : "没有匹配的笔记"}</p>
+        <p class="hint">
+          {noteGraphState.status === "error"
+            ? "文章图谱加载失败"
+            : graphNotes.length === 0
+              ? "还没有进入图谱的笔记"
+              : "没有匹配的笔记"}
+        </p>
       {/if}
       <ul class="list">
         {#each graphNotesShown as n (n.id)}
