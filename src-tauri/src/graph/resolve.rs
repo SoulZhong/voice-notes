@@ -83,6 +83,7 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         "unsupported knowledge ledger schema"
     );
     registry_baseline(ledger)?;
+    validate_decision_history(&ledger.operations)?;
     let active = active_operation_mask(&ledger.operations)?;
     let mut snapshot = ResolverSnapshot {
         registry: ledger.registry.clone(),
@@ -102,10 +103,6 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         })
         .collect();
 
-    for operation in &ledger.operations {
-        validate_decision_snapshot(operation)?;
-    }
-
     for (index, operation) in ledger.operations.iter().enumerate() {
         if !active[index]
             || restored.contains(&operation.id)
@@ -122,18 +119,17 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                 source_id,
                 target_id,
             } => {
-                apply_decision(&mut snapshot.redirects, source_id, operation, target_id)?;
+                snapshot
+                    .redirects
+                    .insert(source_id.clone(), target_id.clone());
             }
             KnowledgeAction::BindMention {
                 mention_id,
                 entity_id,
             } => {
-                apply_decision(
-                    &mut snapshot.mention_bindings,
-                    mention_id,
-                    operation,
-                    entity_id,
-                )?;
+                snapshot
+                    .mention_bindings
+                    .insert(mention_id.clone(), entity_id.clone());
             }
             KnowledgeAction::ConfirmRelation { relation_id } => {
                 snapshot
@@ -209,6 +205,70 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
     Ok(snapshot)
 }
 
+pub(crate) fn validate_decision_history(operations: &[KnowledgeOperation]) -> anyhow::Result<()> {
+    validate_restore_targets(operations)?;
+    let mut redirects = BTreeMap::new();
+    let mut mention_bindings = BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        validate_decision_snapshot(operation)?;
+        match &operation.action {
+            KnowledgeAction::MergeEntity {
+                source_id,
+                target_id,
+            } => validate_historical_decision(&mut redirects, source_id, operation, target_id)?,
+            KnowledgeAction::BindMention {
+                mention_id,
+                entity_id,
+            } => validate_historical_decision(
+                &mut mention_bindings,
+                mention_id,
+                operation,
+                entity_id,
+            )?,
+            KnowledgeAction::Undo { .. } => {
+                let prefix = &operations[..=index];
+                let active = active_operation_mask(prefix)?;
+                (redirects, mention_bindings) = project_decisions(prefix, &active);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_targets(operations: &[KnowledgeOperation]) -> anyhow::Result<()> {
+    let indexes: BTreeMap<&str, usize> = operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| (operation.id.as_str(), index))
+        .collect();
+    for (index, operation) in operations.iter().enumerate() {
+        let KnowledgeAction::RestoreRelation { operation_id } = &operation.action else {
+            continue;
+        };
+        let target_index = indexes.get(operation_id.as_str()).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "restore operation {} references unknown operation {operation_id}",
+                operation.id
+            )
+        })?;
+        anyhow::ensure!(
+            target_index < index,
+            "restore operation {} must reference an earlier operation",
+            operation.id
+        );
+        anyhow::ensure!(
+            matches!(
+                operations[target_index].action,
+                KnowledgeAction::SuppressRelation { .. } | KnowledgeAction::EndRelation { .. }
+            ),
+            "restore operation {} targets an operation that cannot restore a relation",
+            operation.id
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_decision_snapshot(operation: &KnowledgeOperation) -> anyhow::Result<()> {
     let expected = match &operation.action {
         KnowledgeAction::MergeEntity { target_id, .. } => Some(target_id),
@@ -228,7 +288,7 @@ pub(crate) fn validate_decision_snapshot(operation: &KnowledgeOperation) -> anyh
     Ok(())
 }
 
-fn apply_decision(
+fn validate_historical_decision(
     decisions: &mut BTreeMap<String, String>,
     key: &str,
     operation: &KnowledgeOperation,
@@ -242,6 +302,35 @@ fn apply_decision(
     );
     decisions.insert(key.to_string(), expected_after.to_string());
     Ok(())
+}
+
+fn project_decisions(
+    operations: &[KnowledgeOperation],
+    active: &[bool],
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut redirects = BTreeMap::new();
+    let mut mention_bindings = BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        if !active[index] {
+            continue;
+        }
+        match &operation.action {
+            KnowledgeAction::MergeEntity {
+                source_id,
+                target_id,
+            } => {
+                redirects.insert(source_id.clone(), target_id.clone());
+            }
+            KnowledgeAction::BindMention {
+                mention_id,
+                entity_id,
+            } => {
+                mention_bindings.insert(mention_id.clone(), entity_id.clone());
+            }
+            _ => {}
+        }
+    }
+    (redirects, mention_bindings)
 }
 
 fn optional_string(
@@ -552,6 +641,111 @@ mod tests {
         three.registry.insert("kg_1".into(), original.clone());
         three.operations = vec![rename, undo_1, undo_2, undo_3];
         assert_eq!(replay(&three).unwrap().registry["kg_1"], original);
+    }
+
+    #[test]
+    fn non_lifo_undo_replays_create_rename_and_alias_by_field_semantics() {
+        let original = registry_entity("project", "Apollo", &[]);
+        let renamed = registry_entity("project", "Artemis", &[]);
+        let renamed_with_alias = registry_entity("project", "Artemis", &["Moonshot"]);
+        let projected = registry_entity("project", "Apollo", &["Moonshot"]);
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert("kg_1".into(), projected.clone());
+        ledger.operations.extend([
+            entity_operation(
+                "op_create",
+                ("kg_1", None),
+                ("kg_1", Some(&original)),
+                KnowledgeAction::CreateEntity {
+                    entity: original.clone(),
+                },
+            ),
+            entity_operation(
+                "op_rename",
+                ("kg_1", Some(&original)),
+                ("kg_1", Some(&renamed)),
+                KnowledgeAction::RenameEntity {
+                    entity_id: "kg_1".into(),
+                    name: "Artemis".into(),
+                },
+            ),
+            entity_operation(
+                "op_alias",
+                ("kg_1", Some(&renamed)),
+                ("kg_1", Some(&renamed_with_alias)),
+                KnowledgeAction::AddAlias {
+                    entity_id: "kg_1".into(),
+                    alias: "Moonshot".into(),
+                },
+            ),
+            operation(
+                "op_undo_rename",
+                KnowledgeAction::Undo {
+                    operation_id: "op_rename".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(replay(&ledger).unwrap().registry["kg_1"], projected);
+    }
+
+    #[test]
+    fn non_lifo_undo_keeps_later_merge_and_binding_for_the_same_key() {
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.extend([
+            decision_operation(
+                "op_merge_a",
+                None,
+                "kg_a",
+                KnowledgeAction::MergeEntity {
+                    source_id: "kg_source".into(),
+                    target_id: "kg_a".into(),
+                },
+            ),
+            decision_operation(
+                "op_merge_b",
+                Some("kg_a"),
+                "kg_b",
+                KnowledgeAction::MergeEntity {
+                    source_id: "kg_source".into(),
+                    target_id: "kg_b".into(),
+                },
+            ),
+            decision_operation(
+                "op_bind_a",
+                None,
+                "kg_a",
+                KnowledgeAction::BindMention {
+                    mention_id: "mn_1".into(),
+                    entity_id: "kg_a".into(),
+                },
+            ),
+            decision_operation(
+                "op_bind_b",
+                Some("kg_a"),
+                "kg_b",
+                KnowledgeAction::BindMention {
+                    mention_id: "mn_1".into(),
+                    entity_id: "kg_b".into(),
+                },
+            ),
+            operation(
+                "op_undo_merge_a",
+                KnowledgeAction::Undo {
+                    operation_id: "op_merge_a".into(),
+                },
+            ),
+            operation(
+                "op_undo_bind_a",
+                KnowledgeAction::Undo {
+                    operation_id: "op_bind_a".into(),
+                },
+            ),
+        ]);
+
+        let snapshot = replay(&ledger).unwrap();
+        assert_eq!(snapshot.redirects["kg_source"], "kg_b");
+        assert_eq!(snapshot.mention_bindings["mn_1"], "kg_b");
     }
 
     #[test]
@@ -908,5 +1102,88 @@ mod tests {
 
         assert!(!snapshot.relation_decisions.confirmed.contains("rf_1"));
         assert_eq!(snapshot.relation_decisions.ended["rf_2"], "2026-07-20");
+    }
+
+    #[test]
+    fn undo_and_undo_of_undo_toggle_restore_relation_semantics() {
+        let suppress = operation(
+            "op_suppress",
+            KnowledgeAction::SuppressRelation {
+                subject_id: "kg_a".into(),
+                predicate: RelationPredicate {
+                    kind: "uses".into(),
+                    label: None,
+                },
+                object_id: "kg_b".into(),
+            },
+        );
+        let restore = operation(
+            "op_restore",
+            KnowledgeAction::RestoreRelation {
+                operation_id: "op_suppress".into(),
+            },
+        );
+        let undo_restore = operation(
+            "op_undo_restore",
+            KnowledgeAction::Undo {
+                operation_id: "op_restore".into(),
+            },
+        );
+
+        let mut direct = KnowledgeLedger::empty();
+        direct.operations = vec![suppress.clone(), restore.clone(), undo_restore.clone()];
+        let direct_snapshot = replay(&direct).unwrap();
+        assert_eq!(direct_snapshot.relation_decisions.suppressed.len(), 1);
+        assert!(direct_snapshot
+            .relation_decisions
+            .restored_operations
+            .is_empty());
+
+        let mut nested = KnowledgeLedger::empty();
+        nested.operations = vec![
+            suppress,
+            restore,
+            undo_restore,
+            operation(
+                "op_undo_undo_restore",
+                KnowledgeAction::Undo {
+                    operation_id: "op_undo_restore".into(),
+                },
+            ),
+        ];
+        let nested_snapshot = replay(&nested).unwrap();
+        assert!(nested_snapshot.relation_decisions.suppressed.is_empty());
+        assert!(nested_snapshot
+            .relation_decisions
+            .restored_operations
+            .contains("op_suppress"));
+    }
+
+    #[test]
+    fn restore_relation_accepts_an_earlier_end_decision() {
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations = vec![
+            operation(
+                "op_end",
+                KnowledgeAction::EndRelation {
+                    relation_id: "rf_1".into(),
+                    valid_to: "2026-07-20".into(),
+                },
+            ),
+            operation(
+                "op_restore",
+                KnowledgeAction::RestoreRelation {
+                    operation_id: "op_end".into(),
+                },
+            ),
+        ];
+
+        let snapshot = replay(&ledger).unwrap();
+
+        assert!(!snapshot.relation_decisions.ended.contains_key("rf_1"));
+        assert!(snapshot
+            .relation_decisions
+            .restored_operations
+            .contains("op_end"));
     }
 }
