@@ -361,7 +361,7 @@ pub fn resolve_entity(
         .collect();
     let mut bound = match canonicalize_candidates(snapshot, people, bound) {
         Ok(bound) => bound,
-        Err(cycle) => return Resolution::pending(cycle, "redirect cycle detected"),
+        Err(failure) => return Resolution::pending(failure.candidates, failure.reason),
     };
     bound.sort();
     bound.dedup();
@@ -372,20 +372,20 @@ pub fn resolve_entity(
         return resolved_through_redirects(snapshot, people, entity_id);
     }
 
+    if snapshot.redirects.contains_key(&local.id) || people.redirects.contains_key(&local.id) {
+        return resolved_through_redirects(snapshot, people, local.id.clone());
+    }
+
     if local.kind == "person" {
         if let Some(person_id) = VoiceprintStore::resolve(people, &local.id) {
             return resolved_through_redirects(snapshot, people, person_id.to_string());
         }
     }
 
-    if snapshot.redirects.contains_key(&local.id) {
-        return resolved_through_redirects(snapshot, people, local.id.clone());
-    }
-
     let exact_matches = confirmed_registry_matches(&snapshot.registry, local);
     let mut exact_matches = match canonicalize_candidates(snapshot, people, exact_matches) {
         Ok(matches) => matches,
-        Err(cycle) => return Resolution::pending(cycle, "redirect cycle detected"),
+        Err(failure) => return Resolution::pending(failure.candidates, failure.reason),
     };
     match exact_matches.len() {
         1 => return resolved_through_redirects(snapshot, people, exact_matches.remove(0)),
@@ -430,7 +430,7 @@ pub fn resolve_reference_id(
             Resolution::resolved(entity_id)
         }
         Ok(entity_id) => Resolution::pending(vec![entity_id], "resolved target entity is missing"),
-        Err(candidates) => Resolution::pending(candidates, "redirect cycle detected"),
+        Err(failure) => Resolution::pending(failure.candidates, failure.reason),
     }
 }
 
@@ -471,12 +471,17 @@ fn canonicalize_candidates(
     snapshot: &ResolverSnapshot,
     people: &Voiceprints,
     candidates: Vec<String>,
-) -> Result<Vec<String>, Vec<String>> {
+) -> Result<Vec<String>, RedirectFailure> {
     let mut canonical = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let resolution = resolve_reference_id(snapshot, people, &candidate);
         let Some(entity_id) = resolution.entity_id else {
-            return Err(resolution.candidates);
+            return Err(RedirectFailure {
+                candidates: resolution.candidates,
+                reason: resolution
+                    .reason
+                    .unwrap_or_else(|| "redirect resolution failed".into()),
+            });
         };
         canonical.push(entity_id);
     }
@@ -485,23 +490,42 @@ fn canonicalize_candidates(
     Ok(canonical)
 }
 
+struct RedirectFailure {
+    candidates: Vec<String>,
+    reason: String,
+}
+
 fn follow_all_redirects(
     snapshot: &ResolverSnapshot,
     people: &Voiceprints,
     entity_id: &str,
-) -> Result<String, Vec<String>> {
+) -> Result<String, RedirectFailure> {
     let mut current = entity_id.to_string();
     let mut visited = BTreeSet::new();
     loop {
         if !visited.insert(current.clone()) {
             let mut candidates: Vec<_> = visited.into_iter().collect();
             candidates.sort();
-            return Err(candidates);
+            return Err(RedirectFailure {
+                candidates,
+                reason: "redirect cycle detected".into(),
+            });
         }
-        let next = snapshot
-            .redirects
-            .get(&current)
-            .or_else(|| people.redirects.get(&current));
+        let registry_next = snapshot.redirects.get(&current);
+        let voiceprint_next = people.redirects.get(&current);
+        let next = match (registry_next, voiceprint_next) {
+            (Some(registry), Some(voiceprint)) if registry != voiceprint => {
+                let mut candidates = vec![registry.clone(), voiceprint.clone()];
+                candidates.sort();
+                candidates.dedup();
+                return Err(RedirectFailure {
+                    candidates,
+                    reason: "registry and voiceprint redirects disagree".into(),
+                });
+            }
+            (Some(next), _) | (_, Some(next)) => Some(next),
+            (None, None) => None,
+        };
         match next {
             Some(next) => current = next.clone(),
             None => return Ok(current),
@@ -1084,6 +1108,41 @@ mod tests {
         let conflict = resolve_reference_id(&cyclic_snapshot, &cyclic_people, "P1");
         assert_eq!(conflict.status, ResolutionStatus::PendingConflict);
         assert!(conflict.reason.as_deref().unwrap().contains("cycle"));
+    }
+
+    #[test]
+    fn conflicting_registry_and_voiceprint_redirects_are_pending_everywhere() {
+        let mut ledger = KnowledgeLedger::empty();
+        for (id, name) in [("P2", "Old"), ("kg_x", "Registry target")] {
+            ledger
+                .registry
+                .insert(id.into(), registry_entity("person", name, &[]));
+        }
+        ledger.operations.push(decision_operation(
+            "merge",
+            None,
+            "kg_x",
+            KnowledgeAction::MergeEntity {
+                source_id: "P2".into(),
+                target_id: "kg_x".into(),
+            },
+        ));
+        let snapshot = replay(&ledger).unwrap();
+        let people: Voiceprints = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "next_person": 3,
+            "people": {"P1": {"name": "Voice target"}},
+            "redirects": {"P2": "P1"}
+        }))
+        .unwrap();
+
+        let reference = resolve_reference_id(&snapshot, &people, "P2");
+        let mention = resolve_entity(&snapshot, &people, "n1", &local("P2", "person", "Old"), &[]);
+        for resolution in [reference, mention] {
+            assert_eq!(resolution.status, ResolutionStatus::PendingConflict);
+            assert_eq!(resolution.entity_id, None);
+            assert_eq!(resolution.candidates, vec!["P1", "kg_x"]);
+        }
     }
 
     #[test]

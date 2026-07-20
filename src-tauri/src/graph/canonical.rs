@@ -372,15 +372,20 @@ pub fn build_canonical_graph(
         &mut pending,
         now,
     );
-    let candidates: Vec<_> = relation_groups.into_values().collect();
+    let mut candidates = Vec::new();
+    for mut relation in relation_groups.into_values() {
+        if let Err(item) =
+            prepare_final_relation(&mut relation, &mention_index, &mut entities, &people)
+        {
+            pending.push(item);
+            continue;
+        }
+        candidates.push(relation);
+    }
     let (conflicting_ids, time_pending) = find_time_conflicts(&candidates);
     pending.extend(time_pending);
     let mut relations = Vec::new();
     for relation in candidates {
-        if let Err(item) = validate_final_relation(&relation, &mention_index) {
-            pending.push(item);
-            continue;
-        }
         let time_conflict = conflicting_ids.contains(&relation.id);
         let tier = canonical_publish_tier(&relation, time_conflict);
         let tier = if relation.origin == RelationOrigin::UserAssertion {
@@ -555,6 +560,16 @@ fn project_model_relation(
                     .collect();
             }
         }
+        let predicate = match normalized_predicate(&predicate) {
+            Ok(predicate) => predicate,
+            Err(()) => {
+                pending.push(PendingItem::RelationReview {
+                    note_id: document.note_id.clone(),
+                    relation_id: source.id.clone(),
+                });
+                continue;
+            }
+        };
         if is_suppressed(snapshot, people, &subject_id, &predicate, &object_id) {
             continue;
         }
@@ -719,7 +734,7 @@ fn is_suppressed(
             let decision_object =
                 resolve::resolve_reference_id(snapshot, people, &decision.object_id).entity_id;
             decision_subject.as_deref() == Some(subject_id)
-                && decision.predicate == *predicate
+                && normalized_predicate(&decision.predicate).as_ref() == Ok(predicate)
                 && decision_object.as_deref() == Some(object_id)
         })
 }
@@ -799,6 +814,22 @@ fn project_created_relations(
     now: DateTime<FixedOffset>,
 ) {
     for relation in snapshot.relation_decisions.created.values() {
+        let predicate = match normalized_predicate(&relation.predicate) {
+            Ok(predicate) => predicate,
+            Err(()) => {
+                pending.push(PendingItem::RelationReview {
+                    note_id: String::new(),
+                    relation_id: canonical_relation_id(
+                        &relation.subject_id,
+                        &relation.predicate,
+                        &relation.object_id,
+                        relation.valid_from.as_deref(),
+                        relation.valid_to.as_deref(),
+                    ),
+                });
+                continue;
+            }
+        };
         let subject = resolve::resolve_reference_id(snapshot, people, &relation.subject_id);
         let object = resolve::resolve_reference_id(snapshot, people, &relation.object_id);
         let (Some(subject_id), Some(object_id)) = (subject.entity_id, object.entity_id) else {
@@ -814,13 +845,7 @@ fn project_created_relations(
             });
             continue;
         };
-        if is_suppressed(
-            snapshot,
-            people,
-            &subject_id,
-            &relation.predicate,
-            &object_id,
-        ) {
+        if is_suppressed(snapshot, people, &subject_id, &predicate, &object_id) {
             continue;
         }
         let mut evidence: Vec<_> = relation
@@ -833,7 +858,7 @@ fn project_created_relations(
                 note_id: String::new(),
                 relation_id: canonical_relation_id(
                     &subject_id,
-                    &relation.predicate,
+                    &predicate,
                     &object_id,
                     relation.valid_from.as_deref(),
                     relation.valid_to.as_deref(),
@@ -860,19 +885,31 @@ fn project_created_relations(
         canonicalize_evidence(&mut evidence);
         let valid_from = relation.valid_from.clone();
         let mut valid_to = relation.valid_to.clone();
-        let pre_end_id = canonical_relation_id(
+        let original_pre_end_id = canonical_relation_id(
+            &relation.subject_id,
+            &predicate,
+            &relation.object_id,
+            valid_from.as_deref(),
+            valid_to.as_deref(),
+        );
+        let canonical_pre_end_id = canonical_relation_id(
             &subject_id,
-            &relation.predicate,
+            &predicate,
             &object_id,
             valid_from.as_deref(),
             valid_to.as_deref(),
         );
-        if let Some(ended) = snapshot.relation_decisions.ended.get(&pre_end_id) {
+        if let Some(ended) = snapshot
+            .relation_decisions
+            .ended
+            .get(&original_pre_end_id)
+            .or_else(|| snapshot.relation_decisions.ended.get(&canonical_pre_end_id))
+        {
             valid_to = Some(ended.clone());
         }
         let id = canonical_relation_id(
             &subject_id,
-            &relation.predicate,
+            &predicate,
             &object_id,
             valid_from.as_deref(),
             valid_to.as_deref(),
@@ -885,7 +922,7 @@ fn project_created_relations(
             CanonicalRelation {
                 id,
                 subject_id,
-                predicate: relation.predicate.clone(),
+                predicate,
                 object_id,
                 confidence: 1.0,
                 valid_from,
@@ -924,6 +961,9 @@ fn find_time_conflicts(relations: &[CanonicalRelation]) -> (BTreeSet<String>, Ve
     let mut conflicts = BTreeSet::new();
     let mut relation_ids = BTreeSet::new();
     for left in 0..relations.len() {
+        if relations[left].status != RelationStatus::Current {
+            continue;
+        }
         if !matches!(
             relations[left].predicate.kind.as_str(),
             "responsible_for" | "assigned_to"
@@ -934,6 +974,9 @@ fn find_time_conflicts(relations: &[CanonicalRelation]) -> (BTreeSet<String>, Ve
             continue;
         };
         for right in left + 1..relations.len() {
+            if relations[right].status != RelationStatus::Current {
+                continue;
+            }
             let Ok(right_interval) = relation_interval(&relations[right]) else {
                 continue;
             };
@@ -983,12 +1026,34 @@ fn intervals_overlap(left: &RelationInterval, right: &RelationInterval) -> bool 
             .is_none_or(|right_end| left.0.is_none_or(|left_start| left_start < right_end))
 }
 
-fn validate_final_relation(
-    relation: &CanonicalRelation,
+fn prepare_final_relation(
+    relation: &mut CanonicalRelation,
     mentions: &BTreeMap<(String, String), CanonicalMention>,
+    entities: &mut BTreeMap<String, CanonicalEntity>,
+    people: &store::Voiceprints,
 ) -> Result<(), PendingItem> {
     let note_id = relation.note_ids.first().cloned().unwrap_or_default();
-    if relation.subject_id == relation.object_id || relation_interval(relation).is_err() {
+    let Ok(predicate) = normalized_predicate(&relation.predicate) else {
+        return Err(PendingItem::RelationReview {
+            note_id,
+            relation_id: relation.id.clone(),
+        });
+    };
+    relation.predicate = predicate;
+    relation.id = canonical_relation_id(
+        &relation.subject_id,
+        &relation.predicate,
+        &relation.object_id,
+        relation.valid_from.as_deref(),
+        relation.valid_to.as_deref(),
+    );
+    let endpoints_exist = [&relation.subject_id, &relation.object_id]
+        .into_iter()
+        .all(|entity_id| materialize_endpoint_entity(entity_id, entities, people));
+    if !endpoints_exist
+        || relation.subject_id == relation.object_id
+        || relation_interval(relation).is_err()
+    {
         return Err(PendingItem::RelationReview {
             note_id,
             relation_id: relation.id.clone(),
@@ -1025,6 +1090,50 @@ fn validate_final_relation(
         }
     }
     Ok(())
+}
+
+fn normalized_predicate(predicate: &RelationPredicate) -> Result<RelationPredicate, ()> {
+    if predicate.kind == "custom" {
+        let label = predicate
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty());
+        return label
+            .map(|label| RelationPredicate {
+                kind: "custom".into(),
+                label: Some(label.into()),
+            })
+            .ok_or(());
+    }
+    store::aing_graph::CORE_PREDICATES
+        .contains(&predicate.kind.as_str())
+        .then(|| predicate.clone())
+        .ok_or(())
+}
+
+fn materialize_endpoint_entity(
+    entity_id: &str,
+    entities: &mut BTreeMap<String, CanonicalEntity>,
+    people: &store::Voiceprints,
+) -> bool {
+    if entities.contains_key(entity_id) {
+        return true;
+    }
+    let Some(person) = people.people.get(entity_id) else {
+        return false;
+    };
+    entities.insert(
+        entity_id.into(),
+        CanonicalEntity {
+            id: entity_id.into(),
+            kind: "person".into(),
+            name: person.name.clone(),
+            aliases: Vec::new(),
+            confirmed: true,
+        },
+    );
+    true
 }
 
 fn canonical_publish_tier(relation: &CanonicalRelation, time_conflict: bool) -> PublishTier {
@@ -1077,15 +1186,23 @@ fn scan_documents(
     data_root: &Path,
 ) -> anyhow::Result<Vec<Result<ScannedDocument, InvalidDocument>>> {
     let notes = data_root.join("notes");
+    let root_metadata = match std::fs::symlink_metadata(&notes) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        !root_metadata.file_type().is_symlink() && root_metadata.is_dir(),
+        "notes root must be a regular directory"
+    );
     let entries = match std::fs::read_dir(&notes) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
     let mut note_entries = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let note_id = entry.file_name().to_string_lossy().into_owned();
+        let note_id = note_id_from_file_name(entry.file_name())?;
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             note_entries.push(Err(InvalidDocument {
@@ -1101,6 +1218,12 @@ fn scan_documents(
     }
     note_entries.sort_by(|left, right| document_note_id(left).cmp(document_note_id(right)));
     Ok(note_entries)
+}
+
+fn note_id_from_file_name(file_name: std::ffi::OsString) -> anyhow::Result<String> {
+    file_name.into_string().map_err(|file_name| {
+        anyhow::anyhow!("note directory name is not valid UTF-8: {:?}", file_name)
+    })
 }
 
 fn load_document(note_dir: PathBuf, note_id: String) -> Result<ScannedDocument, InvalidDocument> {
@@ -1141,7 +1264,108 @@ fn load_document(note_dir: PathBuf, note_id: String) -> Result<ScannedDocument, 
         message: error.to_string(),
     })?;
     store::ensure_graph_ids(&note_id, &mut doc);
+    let validation_relations = relations_for_document_validation(&note_id, &doc);
+    store::aing_graph::validate_graph(&note_id, &doc, validation_relations).map_err(|issues| {
+        InvalidDocument {
+            note_id: note_id.clone(),
+            message: issues
+                .into_iter()
+                .map(|issue| format!("{}: {}", issue.field, issue.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    })?;
     Ok(ScannedDocument { note_id, doc })
+}
+
+// Provenance staleness is a canonicalization concern: validate the complete Task 2 relation
+// contract against a temporary current-position projection, while retaining the stored spans for
+// resolve_evidence to classify as current, uniquely relocatable, ambiguous, or stale.
+fn relations_for_document_validation(note_id: &str, doc: &RefinedDoc) -> Vec<RelationFact> {
+    let mention_ids: BTreeMap<_, _> = doc
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| {
+            paragraph.mentions.iter().map(move |mention| {
+                (
+                    mention.id.clone(),
+                    store::mention_id(
+                        note_id,
+                        paragraph,
+                        &mention.entity,
+                        mention.start,
+                        mention.end,
+                    ),
+                )
+            })
+        })
+        .collect();
+    let mut relations = doc.relations.clone();
+    for relation in &mut relations {
+        for mention_id in relation
+            .subject_mentions
+            .iter_mut()
+            .chain(relation.object_mentions.iter_mut())
+        {
+            if let Some(current_id) = mention_ids.get(mention_id) {
+                *mention_id = current_id.clone();
+            }
+        }
+        for evidence in &mut relation.evidence {
+            let current = doc
+                .paragraphs
+                .get(evidence.paragraph_index)
+                .is_some_and(|paragraph| {
+                    !evidence.source_seqs.is_empty()
+                        && evidence
+                            .source_seqs
+                            .iter()
+                            .all(|seq| paragraph.source_seqs.contains(seq))
+                        && char_slice(&paragraph.text, evidence.start, evidence.end).as_deref()
+                            == Some(evidence.quote.as_str())
+                });
+            if current {
+                continue;
+            }
+            if let Some((paragraph_index, start, end)) =
+                first_evidence_match(doc, &evidence.quote, &evidence.source_seqs)
+            {
+                evidence.paragraph_index = paragraph_index;
+                evidence.start = start;
+                evidence.end = end;
+            }
+        }
+    }
+    relations
+}
+
+fn first_evidence_match(
+    doc: &RefinedDoc,
+    quote: &str,
+    source_seqs: &[u64],
+) -> Option<(usize, usize, usize)> {
+    if quote.is_empty() || source_seqs.is_empty() {
+        return None;
+    }
+    for (paragraph_index, paragraph) in doc.paragraphs.iter().enumerate() {
+        if !source_seqs
+            .iter()
+            .all(|seq| paragraph.source_seqs.contains(seq))
+        {
+            continue;
+        }
+        let text: Vec<_> = paragraph.text.chars().collect();
+        let quote: Vec<_> = quote.chars().collect();
+        if quote.len() > text.len() {
+            continue;
+        }
+        for start in 0..=text.len() - quote.len() {
+            if text[start..start + quote.len()] == quote {
+                return Some((paragraph_index, start, start + quote.len()));
+            }
+        }
+    }
+    None
 }
 
 fn document_note_id(document: &Result<ScannedDocument, InvalidDocument>) -> &str {
@@ -1238,6 +1462,20 @@ mod tests {
         let note_dir = root.join("notes").join(note_id);
         std::fs::create_dir_all(&note_dir).unwrap();
         write_refined_atomic(&note_dir, doc).unwrap();
+    }
+
+    fn push_user_relation(
+        ledger: &mut KnowledgeLedger,
+        id: &str,
+        relation: super::super::overrides::UserRelation,
+    ) {
+        ledger.operations.push(KnowledgeOperation {
+            id: id.into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::CreateRelation { relation },
+        });
     }
 
     fn relation_doc(note_id: &str, confidence: f64) -> RefinedDoc {
@@ -2375,6 +2613,311 @@ mod tests {
             item,
             PendingItem::IdentityConflict { local_entity_id, candidates, .. }
                 if local_entity_id == "kg_source" && candidates == &["kg_missing"]
+        )));
+    }
+
+    #[test]
+    fn time_conflicts_ignore_rejected_and_historical_relations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_a", "kg_b", "kg_c"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "project".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        for (id, object_id, valid_to) in [
+            ("self_loop", "kg_a", None),
+            ("historical", "kg_b", Some("2026-07-20T00:00:00Z")),
+            ("current", "kg_c", None),
+        ] {
+            push_user_relation(
+                &mut ledger,
+                id,
+                super::super::overrides::UserRelation {
+                    subject_id: "kg_a".into(),
+                    predicate: RelationPredicate {
+                        kind: "responsible_for".into(),
+                        label: None,
+                    },
+                    object_id: object_id.into(),
+                    valid_from: None,
+                    valid_to: valid_to.map(str::to_string),
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            );
+        }
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(graph.relations.len(), 2);
+        assert!(!graph
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::TimeConflict { .. })));
+        let published_ids: BTreeSet<_> = graph
+            .relations
+            .iter()
+            .map(|relation| relation.id.as_str())
+            .collect();
+        assert!(graph.pending.iter().all(|item| match item {
+            PendingItem::RelationReview { relation_id, .. }
+            | PendingItem::StaleEvidence { relation_id, .. }
+            | PendingItem::SplitConflict { relation_id, .. } =>
+                !published_ids.contains(relation_id.as_str()),
+            PendingItem::TimeConflict { relation_ids } => relation_ids
+                .iter()
+                .all(|id| published_ids.contains(id.as_str())),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn successful_user_assertions_materialize_voiceprint_terminal_entities() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "next_person": 2,
+                "people": {"P1": {"name": "Alice"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert(
+            "kg_project".into(),
+            RegistryEntity {
+                kind: "project".into(),
+                name: "Apollo".into(),
+                aliases: Vec::new(),
+                status: "confirmed".into(),
+            },
+        );
+        push_user_relation(
+            &mut ledger,
+            "create",
+            super::super::overrides::UserRelation {
+                subject_id: "P1".into(),
+                predicate: RelationPredicate {
+                    kind: "uses".into(),
+                    label: None,
+                },
+                object_id: "kg_project".into(),
+                valid_from: None,
+                valid_to: None,
+                note: None,
+                evidence_ids: Vec::new(),
+                user_assertion: true,
+            },
+        );
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.entities["P1"].name, "Alice");
+        assert!(graph.relations.iter().all(|relation| {
+            graph.entities.contains_key(&relation.subject_id)
+                && graph.entities.contains_key(&relation.object_id)
+        }));
+    }
+
+    #[test]
+    fn created_relation_end_survives_later_endpoint_redirect() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_old", "kg_new", "kg_project"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "project".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        let predicate = RelationPredicate {
+            kind: "uses".into(),
+            label: None,
+        };
+        let original_id = canonical_relation_id("kg_old", &predicate, "kg_project", None, None);
+        push_user_relation(
+            &mut ledger,
+            "create",
+            super::super::overrides::UserRelation {
+                subject_id: "kg_old".into(),
+                predicate: predicate.clone(),
+                object_id: "kg_project".into(),
+                valid_from: None,
+                valid_to: None,
+                note: None,
+                evidence_ids: Vec::new(),
+                user_assertion: true,
+            },
+        );
+        ledger.operations.push(KnowledgeOperation {
+            id: "end".into(),
+            at: "2026-07-20T00:00:00Z".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EndRelation {
+                relation_id: original_id,
+                valid_to: "2026-07-20T00:00:00Z".into(),
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge".into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String("kg_new".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_old".into(),
+                target_id: "kg_new".into(),
+            },
+        });
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(graph.relations[0].subject_id, "kg_new");
+        assert_eq!(graph.relations[0].status, RelationStatus::Historical);
+        assert_eq!(
+            graph.relations[0].id,
+            canonical_relation_id(
+                "kg_new",
+                &predicate,
+                "kg_project",
+                None,
+                Some("2026-07-20T00:00:00Z")
+            )
+        );
+    }
+
+    #[test]
+    fn user_assertions_still_validate_and_normalize_predicates() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_a", "kg_b"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "term".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        for (id, kind, label) in [
+            ("unknown", "invented", None),
+            ("blank_custom", "custom", Some("   ")),
+            ("trimmed_custom", "custom", Some("  works with  ")),
+        ] {
+            push_user_relation(
+                &mut ledger,
+                id,
+                super::super::overrides::UserRelation {
+                    subject_id: "kg_a".into(),
+                    predicate: RelationPredicate {
+                        kind: kind.into(),
+                        label: label.map(str::to_string),
+                    },
+                    object_id: "kg_b".into(),
+                    valid_from: None,
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            );
+        }
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.relations[0].predicate.kind, "custom");
+        assert_eq!(
+            graph.relations[0].predicate.label.as_deref(),
+            Some("works with")
+        );
+        assert_eq!(
+            graph
+                .pending
+                .iter()
+                .filter(|item| matches!(item, PendingItem::RelationReview { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notes_root_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_note(outside.path(), "escaped", &relation_doc("escaped", 0.9));
+        symlink(outside.path().join("notes"), root.path().join("notes")).unwrap();
+
+        assert!(build_canonical_graph(
+            root.path(),
+            &KnowledgeLedger::empty(),
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_note_names_fail_closed_without_lossy_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let file_name = std::ffi::OsString::from_vec(b"bad\xff".to_vec());
+        let error = note_id_from_file_name(file_name).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[test]
+    fn semantically_invalid_task2_documents_are_invalid_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let mut invalid = relation_doc("invalid", 0.9);
+        invalid.relations[0].predicate.kind = "invented".into();
+        write_note(root.path(), "invalid", &invalid);
+        let graph = build_canonical_graph(
+            root.path(),
+            &KnowledgeLedger::empty(),
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(graph.relations.is_empty());
+        assert!(graph.pending.iter().any(|item| matches!(
+            item,
+            PendingItem::InvalidDocument { note_id, message }
+                if note_id == "invalid" && message.contains("predicate")
         )));
     }
 
