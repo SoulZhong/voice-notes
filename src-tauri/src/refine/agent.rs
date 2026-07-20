@@ -554,9 +554,11 @@ mod tests {
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: llm.into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: llm.into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: texts
                 .iter()
                 .map(|t| RefinedParagraph {

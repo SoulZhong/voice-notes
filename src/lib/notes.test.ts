@@ -1,5 +1,35 @@
 import { describe, it, expect } from "vitest";
 import { splitMentions } from "./notes";
+import type { GraphExtraction, RefinedDoc, RelationFact } from "./notes";
+
+const legacyGraphFixture: RefinedDoc = {
+  schema_version: 1,
+  generated_at: "2026-07-01T09:00:00+08:00",
+  stages: { filter: "done", recluster: "done", llm: "done" },
+  discarded_seqs: [],
+  paragraphs: [{ speaker: "S1", start_ms: 0, end_ms: 500, text: "旧稿", source_seqs: [] }],
+};
+
+const graphWriteShape: Pick<RefinedDoc, "graph_extraction" | "relations"> = {
+  graph_extraction: {
+    contract_version: 2,
+    provider: "test",
+    model: "test-model",
+    run_id: "run-1",
+    generated_at: "2026-07-01T09:00:00+08:00",
+    source_hash: "hash",
+    mode: "full",
+  } satisfies GraphExtraction,
+  relations: [] satisfies RelationFact[],
+};
+
+describe("graph type compatibility", () => {
+  it("accepts a schema-v1 document without graph fields", () => {
+    expect(legacyGraphFixture.graph_extraction).toBeUndefined();
+    expect(legacyGraphFixture.relations).toBeUndefined();
+    expect(graphWriteShape.relations).toEqual([]);
+  });
+});
 
 describe("splitMentions", () => {
   it("splits a paragraph into plain + entity segments by char offset", () => {

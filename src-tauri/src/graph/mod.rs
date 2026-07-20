@@ -520,8 +520,8 @@ mod tests {
     fn doc_with(entities: Vec<Entity>, paras: Vec<RefinedParagraph>) -> RefinedDoc {
         RefinedDoc {
             schema_version: 1, generated_at: "t".into(), llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into() },
-            discarded_seqs: vec![], entities, paragraphs: paras,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![], entities, graph_extraction: None, relations: vec![], paragraphs: paras,
         }
     }
     fn para(text: &str, mentions: Vec<Mention>) -> RefinedParagraph {
@@ -541,13 +541,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let d1 = doc_with(
             vec![ent("ent_1", "project", "灯塔计划", &["Lighthouse"])],
-            vec![para("灯塔计划下周启动", vec![Mention { entity: "ent_1".into(), start: 0, end: 4 }])],
+            vec![para("灯塔计划下周启动", vec![Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }])],
         );
         let d2 = doc_with(
             vec![ent("ent_1", "project", "灯塔计划", &[])],
             vec![para("继续灯塔计划,灯塔计划排期", vec![
-                Mention { entity: "ent_1".into(), start: 2, end: 6 },
-                Mention { entity: "ent_1".into(), start: 7, end: 11 },
+                Mention { id: String::new(), entity: "ent_1".into(), start: 2, end: 6 },
+                Mention { id: String::new(), entity: "ent_1".into(), start: 7, end: 11 },
             ])],
         );
         write_note(root.path(), "n1", &d1);
@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn upsert_is_idempotent_and_replaces_note_edges() {
         let root = tempfile::tempdir().unwrap();
-        let d = doc_with(vec![ent("ent_1", "term", "AB", &[])], vec![para("AB", vec![Mention { entity: "ent_1".into(), start: 0, end: 2 }])]);
+        let d = doc_with(vec![ent("ent_1", "term", "AB", &[])], vec![para("AB", vec![Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 2 }])]);
         write_note(root.path(), "n1", &d);
         upsert_note(root.path(), "n1", &d).unwrap();
         upsert_note(root.path(), "n1", &d).unwrap(); // 重跑
@@ -598,10 +598,10 @@ mod tests {
         let d = doc_with(
             vec![ent("ent_1", "person", "张三", &[]), ent("ent_2", "person", "老张", &["张三"])],
             vec![para("张三张三张三老张", vec![
-                Mention { entity: "ent_1".into(), start: 0, end: 2 },
-                Mention { entity: "ent_1".into(), start: 2, end: 4 },
-                Mention { entity: "ent_1".into(), start: 4, end: 6 },
-                Mention { entity: "ent_2".into(), start: 6, end: 8 },
+                Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 2 },
+                Mention { id: String::new(), entity: "ent_1".into(), start: 2, end: 4 },
+                Mention { id: String::new(), entity: "ent_1".into(), start: 4, end: 6 },
+                Mention { id: String::new(), entity: "ent_2".into(), start: 6, end: 8 },
             ])],
         );
         write_note(root.path(), "n1", &d);
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn entity_notes_lists_notes_for_entity() {
         let root = tempfile::tempdir().unwrap();
-        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1","project","灯塔计划",&[])], vec![para("灯塔计划",vec![Mention{entity:"ent_1".into(),start:0,end:4}])])).unwrap();
+        upsert_note(root.path(), "n1", &doc_with(vec![ent("ent_1","project","灯塔计划",&[])], vec![para("灯塔计划",vec![Mention{id:String::new(),entity:"ent_1".into(),start:0,end:4}])])).unwrap();
         upsert_note(root.path(), "n2", &doc_with(vec![ent("ent_1","project","灯塔计划",&[])], vec![para("灯塔计划",vec![])])).unwrap();
         let notes = entity_notes(root.path(), "e:灯塔计划").unwrap();
         assert_eq!(notes.len(), 2);
@@ -729,7 +729,7 @@ mod tests {
         let mk = |names: &[&str], a_mentions: usize| {
             let ents: Vec<_> = names.iter().enumerate()
                 .map(|(i, nm)| ent(&format!("ent_{}", i + 1), "term", nm, &[])).collect();
-            let ms = (0..a_mentions).map(|_| Mention { entity: "ent_1".into(), start: 0, end: 1 }).collect();
+            let ms = (0..a_mentions).map(|_| Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 1 }).collect();
             doc_with(ents, vec![para("x", ms)])
         };
         upsert_note(root.path(), "n1", &mk(&["A", "B"], 2)).unwrap();
@@ -771,7 +771,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         upsert_note(
             root.path(), "n1",
-            &doc_with(vec![ent("ent_1", "term", "B端", &[])], vec![para("B端", vec![Mention { entity: "ent_1".into(), start: 0, end: 2 }])]),
+            &doc_with(vec![ent("ent_1", "term", "B端", &[])], vec![para("B端", vec![Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 2 }])]),
         ).unwrap();
         let outcome = rename_entity(root.path(), "e:b端", "B 端").unwrap();
         assert_eq!(outcome.new_id, "e:b 端");

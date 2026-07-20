@@ -62,6 +62,8 @@ export type TrackInfo = {
 };
 
 export interface Mention {
+  /** Schema-v1 payloads omit this stable mention id. */
+  id?: string;
   entity: string;
   start: number;
   end: number;
@@ -90,6 +92,48 @@ export interface RefineStages {
   recluster: string;
   llm: string;
   entities?: string;
+  /** Schema-v1 payloads omit the relation extraction stage. */
+  relations?: string;
+}
+
+export interface RelationPredicate {
+  type: string;
+  label?: string;
+}
+
+export interface RelationEvidence {
+  /** Schema-v1-compatible default; populated for schema-v2 writes. */
+  id?: string;
+  paragraph_index: number;
+  start: number;
+  end: number;
+  quote: string;
+  source_seqs?: number[];
+  source_hash?: string;
+}
+
+export interface RelationFact {
+  /** Schema-v1-compatible default; populated for schema-v2 writes. */
+  id?: string;
+  subject: string;
+  predicate: RelationPredicate;
+  object: string;
+  subject_mentions?: string[];
+  object_mentions?: string[];
+  confidence: number;
+  valid_from?: string;
+  valid_to?: string;
+  evidence?: RelationEvidence[];
+}
+
+export interface GraphExtraction {
+  contract_version: number;
+  provider: string;
+  model: string;
+  run_id: string;
+  generated_at: string;
+  source_hash: string;
+  mode: string;
 }
 
 export interface RefinedDoc {
@@ -100,6 +144,10 @@ export interface RefinedDoc {
   discarded_seqs: number[];
   paragraphs: RefinedParagraph[];
   entities?: Entity[];
+  /** Omitted by schema-v1 documents. */
+  graph_extraction?: GraphExtraction;
+  /** Omitted by schema-v1 documents. */
+  relations?: RelationFact[];
 }
 
 /** 按 char 下标把段落文本切成 { 普通片段 | 实体片段 } 序列(实体片段 entityId 非空)。
