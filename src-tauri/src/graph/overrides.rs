@@ -136,6 +136,21 @@ pub enum KnowledgeLoadError {
     Corrupt { path: PathBuf, message: String },
 }
 
+#[derive(Debug)]
+struct ValidatedLedger {
+    ledger: KnowledgeLedger,
+    baseline: BTreeMap<String, RegistryEntity>,
+}
+
+struct ValidatedBootstrap(ValidatedLedger);
+
+impl ValidatedBootstrap {
+    fn new(ledger: KnowledgeLedger) -> Result<Self, String> {
+        let baseline = validate_ledger(&ledger)?;
+        Ok(Self(ValidatedLedger { ledger, baseline }))
+    }
+}
+
 pub fn allocate_entity_id(kind: &str, name: &str, note_id: &str, local_id: &str) -> String {
     stable_id(
         "kg_",
@@ -162,13 +177,19 @@ fn load_with_bootstrap_reader(
 ) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     let path = data_root.join(KNOWLEDGE_FILE);
     match read_ledger(&path) {
-        Ok(Some(ledger)) => Ok(ledger),
+        Ok(Some(validated)) => Ok(validated.ledger),
         Ok(None) => {
             let bootstrap =
                 read_bootstrap(data_root).map_err(|error| KnowledgeLoadError::Corrupt {
                     path: data_root.join(super::GRAPH_FILE),
                     message: error.to_string(),
                 })?;
+            let bootstrap = ValidatedBootstrap::new(bootstrap).map_err(|message| {
+                KnowledgeLoadError::Corrupt {
+                    path: data_root.join(super::GRAPH_FILE),
+                    message,
+                }
+            })?;
             initialize_missing(data_root, bootstrap)
         }
         Err(error) => Err(error),
@@ -183,11 +204,14 @@ pub fn update<T>(
     let path = data_root.join(KNOWLEDGE_FILE);
     let bootstrap = match read_ledger(&path)? {
         Some(_) => None,
-        None => Some(bootstrap_legacy(data_root)?),
+        None => Some(
+            ValidatedBootstrap::new(bootstrap_legacy(data_root)?).map_err(anyhow::Error::msg)?,
+        ),
     };
     let _lock = KnowledgeLock::acquire(data_root)?;
-    let mut ledger = load_locked(data_root, bootstrap)?;
-    let original_baseline = registry_baseline(&ledger)?;
+    let loaded = load_locked(data_root, bootstrap)?;
+    let mut ledger = loaded.ledger;
+    let original_baseline = loaded.baseline;
     let original_legacy_ids = ledger.legacy_ids.clone();
     let existing_operations = ledger.operations.clone();
     let result = change(&mut ledger)?;
@@ -208,7 +232,7 @@ pub fn update<T>(
 
 fn initialize_missing(
     data_root: &Path,
-    bootstrap: KnowledgeLedger,
+    bootstrap: ValidatedBootstrap,
 ) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     fs::create_dir_all(data_root).map_err(|source| KnowledgeLoadError::Io {
         path: data_root.into(),
@@ -218,37 +242,39 @@ fn initialize_missing(
         path: data_root.join(KNOWLEDGE_LOCK_FILE),
         source,
     })?;
-    load_locked(data_root, Some(bootstrap))
+    load_locked(data_root, Some(bootstrap)).map(|validated| validated.ledger)
 }
 
 fn load_locked(
     data_root: &Path,
-    bootstrap: Option<KnowledgeLedger>,
-) -> Result<KnowledgeLedger, KnowledgeLoadError> {
+    bootstrap: Option<ValidatedBootstrap>,
+) -> Result<ValidatedLedger, KnowledgeLoadError> {
     let path = data_root.join(KNOWLEDGE_FILE);
     if let Some(ledger) = read_ledger(&path)? {
         return Ok(ledger);
     }
-    let ledger = bootstrap.ok_or_else(|| KnowledgeLoadError::Io {
-        path: path.clone(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "knowledge ledger disappeared while acquiring its lock",
-        ),
-    })?;
-    let write_result = if ledger == KnowledgeLedger::empty() {
+    let validated = bootstrap
+        .ok_or_else(|| KnowledgeLoadError::Io {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "knowledge ledger disappeared while acquiring its lock",
+            ),
+        })?
+        .0;
+    let write_result = if validated.ledger == KnowledgeLedger::empty() {
         write_bytes_atomic_with(data_root, INITIAL_BYTES, || Ok(()))
     } else {
-        write_ledger_atomic(data_root, &ledger)
+        write_ledger_atomic(data_root, &validated.ledger)
     };
     write_result.map_err(|error| KnowledgeLoadError::Io {
         path,
         source: std::io::Error::other(error),
     })?;
-    Ok(ledger)
+    Ok(validated)
 }
 
-fn read_ledger(path: &Path) -> Result<Option<KnowledgeLedger>, KnowledgeLoadError> {
+fn read_ledger(path: &Path) -> Result<Option<ValidatedLedger>, KnowledgeLoadError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -264,11 +290,11 @@ fn read_ledger(path: &Path) -> Result<Option<KnowledgeLedger>, KnowledgeLoadErro
             path: path.into(),
             message: error.to_string(),
         })?;
-    validate_ledger(&ledger).map_err(|message| KnowledgeLoadError::Corrupt {
+    let baseline = validate_ledger(&ledger).map_err(|message| KnowledgeLoadError::Corrupt {
         path: path.into(),
         message,
     })?;
-    Ok(Some(ledger))
+    Ok(Some(ValidatedLedger { ledger, baseline }))
 }
 
 fn validate_ledger(ledger: &KnowledgeLedger) -> Result<BTreeMap<String, RegistryEntity>, String> {
@@ -350,14 +376,13 @@ fn validate_legacy_targets(ledger: &KnowledgeLedger) -> anyhow::Result<()> {
             redirects.insert(source_id.clone(), target_id.clone());
         }
     }
-    for (legacy_id, target_id) in &ledger.legacy_ids {
+    'mapping: for (legacy_id, target_id) in &ledger.legacy_ids {
         let mut current = target_id.as_str();
         let mut visited = std::collections::BTreeSet::new();
         while let Some(next) = redirects.get(current) {
-            anyhow::ensure!(
-                visited.insert(current.to_string()),
-                "legacy_ids entry {legacy_id} resolves through a redirect cycle"
-            );
+            if !visited.insert(current.to_string()) {
+                continue 'mapping;
+            }
             current = next;
         }
         anyhow::ensure!(
@@ -1820,6 +1845,25 @@ mod tests {
         assert!(matches!(error, KnowledgeLoadError::Corrupt { .. }));
         assert!(error.to_string().contains("e:bad"));
         assert!(error.to_string().contains("aliases"));
+        assert!(!root.path().join(KNOWLEDGE_FILE).exists());
+    }
+
+    #[test]
+    fn invalid_first_bootstrap_is_rejected_without_persisting_a_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = super::super::open(root.path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO entity_redirects(old_id, new_id) VALUES('e:old', 'e:missing')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = load(root.path()).unwrap_err();
+
+        assert!(matches!(error, KnowledgeLoadError::Corrupt { .. }));
+        assert!(error.to_string().contains("invalid target"));
         assert!(!root.path().join(KNOWLEDGE_FILE).exists());
     }
 

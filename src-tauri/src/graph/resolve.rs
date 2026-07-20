@@ -359,7 +359,7 @@ pub fn resolve_entity(
         .iter()
         .filter_map(|mention_id| snapshot.mention_bindings.get(mention_id).cloned())
         .collect();
-    let mut bound = match canonicalize_candidates(snapshot, bound) {
+    let mut bound = match canonicalize_candidates(snapshot, people, bound) {
         Ok(bound) => bound,
         Err(cycle) => return Resolution::pending(cycle, "redirect cycle detected"),
     };
@@ -369,17 +369,17 @@ pub fn resolve_entity(
         return Resolution::pending(bound, "mention bindings are ambiguous");
     }
     if let Some(entity_id) = bound.pop() {
-        return resolved_through_redirects(snapshot, entity_id);
+        return resolved_through_redirects(snapshot, people, entity_id);
     }
 
     if local.kind == "person" {
         if let Some(person_id) = VoiceprintStore::resolve(people, &local.id) {
-            return resolved_through_redirects(snapshot, person_id.to_string());
+            return resolved_through_redirects(snapshot, people, person_id.to_string());
         }
     }
 
     if snapshot.redirects.contains_key(&local.id) {
-        return resolved_through_redirects(snapshot, local.id.clone());
+        return resolved_through_redirects(snapshot, people, local.id.clone());
     }
 
     let name = normalize(&local.name);
@@ -393,12 +393,12 @@ pub fn resolve_entity(
         })
         .map(|(entity_id, _)| entity_id.clone())
         .collect();
-    let mut exact_matches = match canonicalize_candidates(snapshot, exact_matches) {
+    let mut exact_matches = match canonicalize_candidates(snapshot, people, exact_matches) {
         Ok(matches) => matches,
         Err(cycle) => return Resolution::pending(cycle, "redirect cycle detected"),
     };
     match exact_matches.len() {
-        1 => return resolved_through_redirects(snapshot, exact_matches.remove(0)),
+        1 => return resolved_through_redirects(snapshot, people, exact_matches.remove(0)),
         count if count > 1 => {
             return Resolution::pending(exact_matches, "exact confirmed entity match is ambiguous");
         }
@@ -406,7 +406,7 @@ pub fn resolve_entity(
     }
 
     if let Some(entity_id) = snapshot.registry_id_for_legacy(&local.id) {
-        return resolved_through_redirects(snapshot, entity_id);
+        return resolved_through_redirects(snapshot, people, entity_id);
     }
 
     Resolution {
@@ -428,20 +428,36 @@ impl ResolverSnapshot {
     }
 }
 
-fn resolved_through_redirects(snapshot: &ResolverSnapshot, entity_id: String) -> Resolution {
+fn resolved_through_redirects(
+    snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
+    entity_id: String,
+) -> Resolution {
     match follow_redirects(snapshot, entity_id) {
-        Ok(entity_id) => Resolution::resolved(entity_id),
+        Ok(entity_id) if snapshot.registry.contains_key(&entity_id) => {
+            Resolution::resolved(entity_id)
+        }
+        Ok(entity_id) => match VoiceprintStore::resolve(people, &entity_id) {
+            Some(person_id) => Resolution::resolved(person_id.to_string()),
+            None => Resolution::pending(vec![entity_id], "resolved target entity is missing"),
+        },
         Err(candidates) => Resolution::pending(candidates, "redirect cycle detected"),
     }
 }
 
 fn canonicalize_candidates(
     snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
     candidates: Vec<String>,
 ) -> Result<Vec<String>, Vec<String>> {
     let mut canonical = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        canonical.push(follow_redirects(snapshot, candidate)?);
+        let candidate = follow_redirects(snapshot, candidate)?;
+        canonical.push(
+            VoiceprintStore::resolve(people, &candidate)
+                .unwrap_or(&candidate)
+                .to_string(),
+        );
     }
     canonical.sort();
     canonical.dedup();
@@ -891,6 +907,107 @@ mod tests {
     }
 
     #[test]
+    fn bound_mention_with_a_missing_terminal_is_pending_after_load_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.push(decision_operation(
+            "op_bind",
+            None,
+            "kg_missing",
+            KnowledgeAction::BindMention {
+                mention_id: "mn_1".into(),
+                entity_id: "kg_missing".into(),
+            },
+        ));
+        std::fs::write(
+            root.path().join(crate::graph::overrides::KNOWLEDGE_FILE),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        let loaded = crate::graph::overrides::load(root.path()).unwrap();
+        let snapshot = replay(&loaded).unwrap();
+
+        let resolution = resolve_entity(
+            &snapshot,
+            &Voiceprints::default(),
+            "n1",
+            &local("ent_1", "project", "Apollo"),
+            &["mn_1".into()],
+        );
+
+        assert_eq!(resolution.status, ResolutionStatus::PendingConflict);
+        assert_eq!(resolution.entity_id, None);
+        assert_eq!(resolution.candidates, vec!["kg_missing"]);
+    }
+
+    #[test]
+    fn merge_with_a_missing_terminal_is_pending_after_load_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.push(decision_operation(
+            "op_merge",
+            None,
+            "kg_missing",
+            KnowledgeAction::MergeEntity {
+                source_id: "kg_source".into(),
+                target_id: "kg_missing".into(),
+            },
+        ));
+        std::fs::write(
+            root.path().join(crate::graph::overrides::KNOWLEDGE_FILE),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        let loaded = crate::graph::overrides::load(root.path()).unwrap();
+        let snapshot = replay(&loaded).unwrap();
+
+        let resolution = resolve_entity(
+            &snapshot,
+            &Voiceprints::default(),
+            "n1",
+            &local("kg_source", "project", "Anything"),
+            &[],
+        );
+
+        assert_eq!(resolution.status, ResolutionStatus::PendingConflict);
+        assert_eq!(resolution.entity_id, None);
+        assert_eq!(resolution.candidates, vec!["kg_missing"]);
+    }
+
+    #[test]
+    fn bound_mention_accepts_and_canonicalizes_a_voiceprint_terminal() {
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.operations.push(decision_operation(
+            "op_bind",
+            None,
+            "P0",
+            KnowledgeAction::BindMention {
+                mention_id: "mn_1".into(),
+                entity_id: "P0".into(),
+            },
+        ));
+        let snapshot = replay(&ledger).unwrap();
+        let people: Voiceprints = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "next_person": 2,
+            "people": {"P1": {"name": "Ada"}},
+            "redirects": {"P0": "P1"}
+        }))
+        .unwrap();
+
+        let resolution = resolve_entity(
+            &snapshot,
+            &people,
+            "n1",
+            &local("ent_1", "person", "Ada"),
+            &["mn_1".into()],
+        );
+
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.entity_id.as_deref(), Some("P1"));
+    }
+
+    #[test]
     fn exact_confirmed_name_or_alias_requires_matching_kind() {
         let mut ledger = KnowledgeLedger::empty();
         ledger.registry.insert(
@@ -1005,6 +1122,52 @@ mod tests {
         );
         assert_eq!(resolution.entity_id.as_deref(), Some("kg_existing"));
         assert_eq!(resolution.status, ResolutionStatus::Resolved);
+    }
+
+    #[test]
+    fn legacy_mapping_into_a_redirect_cycle_loads_as_pending_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.legacy_ids.insert("e:old".into(), "kg_a".into());
+        ledger.operations.extend([
+            decision_operation(
+                "op_merge_a",
+                None,
+                "kg_b",
+                KnowledgeAction::MergeEntity {
+                    source_id: "kg_a".into(),
+                    target_id: "kg_b".into(),
+                },
+            ),
+            decision_operation(
+                "op_merge_b",
+                None,
+                "kg_a",
+                KnowledgeAction::MergeEntity {
+                    source_id: "kg_b".into(),
+                    target_id: "kg_a".into(),
+                },
+            ),
+        ]);
+        std::fs::write(
+            root.path().join(crate::graph::overrides::KNOWLEDGE_FILE),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = crate::graph::overrides::load(root.path()).unwrap();
+        let snapshot = replay(&loaded).unwrap();
+        let resolution = resolve_entity(
+            &snapshot,
+            &Voiceprints::default(),
+            "n1",
+            &local("e:old", "project", "Anything"),
+            &[],
+        );
+
+        assert_eq!(resolution.status, ResolutionStatus::PendingConflict);
+        assert_eq!(resolution.entity_id, None);
+        assert!(resolution.reason.unwrap().contains("cycle"));
     }
 
     #[test]
