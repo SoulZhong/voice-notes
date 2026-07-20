@@ -80,9 +80,9 @@ pub struct RefinedDoc {
     /// 本篇实体清单(Plan 3 填,本 plan 恒空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<Entity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub graph_extraction: Option<super::aing_graph::GraphExtraction>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub relations: Vec<super::aing_graph::RelationFact>,
     pub paragraphs: Vec<RefinedParagraph>,
 }
@@ -264,6 +264,8 @@ mod tests {
         assert!(first_id.starts_with("mn_"));
         assert_eq!(first_id.len(), 27);
         assert_eq!(second["paragraphs"][0]["mentions"][0]["id"].as_str(), Some(first_id.as_str()));
+        assert_eq!(first.get("graph_extraction"), Some(&serde_json::Value::Null));
+        assert_eq!(first.get("relations"), Some(&serde_json::json!([])));
     }
 
     #[test]

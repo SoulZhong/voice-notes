@@ -23,12 +23,12 @@ const graphWriteShape: Pick<RefinedDoc, "graph_extraction" | "relations"> = {
   relations: [] satisfies RelationFact[],
 };
 
-const v2WriteFixture: RefinedDocV2 = {
+const v2RelationsOffWriteFixture: RefinedDocV2 = {
   schema_version: 2,
   generated_at: "2026-07-21T00:00:00+08:00",
   stages: { filter: "done", recluster: "done", llm: "done", entities: "done", relations: "done" },
   discarded_seqs: [],
-  graph_extraction: graphWriteShape.graph_extraction!,
+  graph_extraction: null,
   relations: [],
   paragraphs: [{
     speaker: "S1",
@@ -40,12 +40,60 @@ const v2WriteFixture: RefinedDocV2 = {
   }],
 };
 
+const v2RelationWriteFixture: RefinedDocV2 = {
+  ...v2RelationsOffWriteFixture,
+  graph_extraction: graphWriteShape.graph_extraction!,
+  relations: [{
+    id: "rf_000000000000000000000000",
+    subject: "ent_1",
+    predicate: { type: "related_to" },
+    object: "ent_2",
+    subject_mentions: ["mn_000000000000000000000000"],
+    object_mentions: [],
+    confidence: 0.9,
+    evidence: [{
+      id: "ev_000000000000000000000000",
+      paragraph_index: 0,
+      start: 0,
+      end: 4,
+      quote: "灯塔计划",
+      source_seqs: [7],
+      source_hash: "source-hash",
+    }],
+  }],
+};
+
+const v2MissingMentionId: RefinedDocV2 = {
+  ...v2RelationsOffWriteFixture,
+  paragraphs: [{
+    ...v2RelationsOffWriteFixture.paragraphs[0],
+    // @ts-expect-error Schema-v2 mentions require stable IDs.
+    mentions: [{ entity: "ent_1", start: 0, end: 4 }],
+  }],
+};
+
+const v2MissingEvidenceIds: RefinedDocV2 = {
+  ...v2RelationsOffWriteFixture,
+  relations: [{
+    id: "rf_000000000000000000000000",
+    subject: "ent_1",
+    predicate: { type: "related_to" },
+    object: "ent_2",
+    subject_mentions: [],
+    object_mentions: [],
+    confidence: 0.9,
+    // @ts-expect-error Schema-v2 evidence requires its own ID and source hash.
+    evidence: [{ paragraph_index: 0, start: 0, end: 4, quote: "灯塔计划", source_seqs: [7] }],
+  }],
+};
+
 describe("graph type compatibility", () => {
   it("accepts a schema-v1 document without graph fields", () => {
     expect(legacyGraphFixture.graph_extraction).toBeUndefined();
     expect(legacyGraphFixture.relations).toBeUndefined();
     expect(graphWriteShape.relations).toEqual([]);
-    expect(v2WriteFixture.schema_version).toBe(2);
+    expect(v2RelationsOffWriteFixture.graph_extraction).toBeNull();
+    expect(v2RelationWriteFixture.relations).toHaveLength(1);
   });
 });
 
