@@ -40,7 +40,12 @@
     fx?: number | null;
     fy?: number | null;
     r?: number;
-    label?: string;
+    labelLines?: string[];
+    labelW?: number;
+    labelH?: number;
+    labelRank?: number;
+    showLabelByDefault?: boolean;
+    collisionR?: number;
   }
   type SimLink = { source: SimNode; target: SimNode; weight: number };
 
@@ -58,7 +63,21 @@
 
   // 渲染快照(每 tick 刷新;与 d3 mutate 的节点对象解耦,保证 Svelte 反应式更新)。
   let snap = $state<{
-    nodes: { id: string; label: string; name: string; kind: string; is_person: boolean; aliases: string[]; x: number; y: number; r: number }[];
+    nodes: {
+      id: string;
+      name: string;
+      kind: string;
+      is_person: boolean;
+      aliases: string[];
+      x: number;
+      y: number;
+      r: number;
+      labelLines: string[];
+      labelW: number;
+      labelH: number;
+      labelRank: number;
+      showLabelByDefault: boolean;
+    }[];
     links: { aid: string; bid: string; x1: number; y1: number; x2: number; y2: number; w: number }[];
   }>({ nodes: [], links: [] });
 
@@ -75,9 +94,10 @@
 
   const MIN_R = 12;
   const MAX_R = 38;
-  // 标签字号必须跟 <text> 渲染处同一公式,否则按小字号算能装几个字、却按大字号渲染,
-  // 长标签(尤其文章视角的笔记标题)会溢出圆圈、糊到相邻节点上。
-  const labelFontSize = (r: number) => Math.min(14, Math.max(8, 6 + r * 0.22));
+  const LABEL_FONT = 11;
+  const LABEL_LINE = 14;
+  const ALL_LABELS_LIMIT = 30;
+  const DEFAULT_LARGE_LABELS = 32;
 
   // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色
   // (`kindInk` 来自 $lib/graph,是全应用唯一真值源——侧栏 kind 过滤药丸/实体列表
@@ -85,12 +105,12 @@
   const nodeColor = (id: string, kind: string, isPerson: boolean) =>
     isPerson ? speakerInk(id, "mic") : kindInk(kind);
 
-  /** 半径=重要度(主信号,相对当前渲染集合归一化);文字装不下就截断,不反过来撑大圆。
+  /** 半径=重要度(主信号,相对当前渲染集合归一化);完整名称直接锚定圆心,
+      圆点和文字共同构成一个节点,不再用额外卡片拆成两个视觉对象。
       线性比例(非 sqrt)——sqrt 会把低值往上拉、高值往下压,大多数低 note_count 节点
       挤在一个窄区间里看不出差别;线性 + 拉宽 MIN_R..MAX_R 让差距在视觉上真正显著。 */
-  // 逐字估宽:CJK/全角 ≈ 1em、ASCII ≈ 0.55em。统一按字符数算宽度会让纯英文名(agent)
-  // 被当成跟中文一样宽而过度截断,又会让长中文标题(笔记标题)按英文宽度算能装下、实际
-  // 溢出——必须分字型估。
+  // 逐字估宽:CJK/全角 ≈ 1em、ASCII ≈ 0.55em。用于 SVG 标签换行与碰撞范围,
+  // 避免依赖 foreignObject(桌面 WebView 兼容性和测量时序都更不稳定)。
   const isWide = (ch: string) => /[⺀-鿿＀-￯　-〿]/.test(ch);
   function estWidth(str: string, fontSize: number): number {
     let w = 0;
@@ -98,19 +118,79 @@
     return w;
   }
 
-  function sizeFor(name: string, noteCount: number, maxNoteCount: number): { r: number; label: string } {
+  /** 按词/CJK 字符贪心换行。每个字符都进入某一行,只换行不截断。 */
+  function wrapLabel(name: string, maxWidth: number): string[] {
+    const normalized = name.trim() || "未命名";
+    const tokens: string[] = [];
+    let word = "";
+    const flushWord = () => {
+      if (word) tokens.push(word);
+      word = "";
+    };
+    for (const ch of normalized) {
+      if (isWide(ch)) {
+        flushWord();
+        tokens.push(ch);
+      } else if (/\s/.test(ch)) {
+        flushWord();
+        if (tokens.at(-1) !== " ") tokens.push(" ");
+      } else {
+        word += ch;
+      }
+    }
+    flushWord();
+
+    const lines: string[] = [];
+    let line = "";
+    const pushLine = () => {
+      const clean = line.trimEnd();
+      if (clean) lines.push(clean);
+      line = "";
+    };
+    for (const token of tokens) {
+      const candidate = line + token;
+      if (!line || estWidth(candidate, LABEL_FONT) <= maxWidth) {
+        line = candidate;
+        continue;
+      }
+      pushLine();
+      const cleanToken = token.trimStart();
+      if (estWidth(cleanToken, LABEL_FONT) <= maxWidth) {
+        line = cleanToken;
+        continue;
+      }
+      // 极长的英文单词/URL 没有自然断点,逐字拆行仍保留全部内容。
+      for (const ch of cleanToken) {
+        if (line && estWidth(line + ch, LABEL_FONT) > maxWidth) pushLine();
+        line += ch;
+      }
+    }
+    pushLine();
+    return lines.length > 0 ? lines : ["未命名"];
+  }
+
+  function layoutFor(
+    name: string,
+    kind: string,
+    noteCount: number,
+    maxNoteCount: number,
+    labelRank: number,
+    showAllLabels: boolean,
+  ) {
     const t = maxNoteCount > 0 ? noteCount / maxNoteCount : 0;
     const r = MIN_R + t * (MAX_R - MIN_R);
-    const fontSize = labelFontSize(r);
-    const avail = (r - 4) * 2; // 圆内直径留 4px 边距
-    if (estWidth(name, fontSize) <= avail) return { r, label: name };
-    // 逐字累加直到「已选文字 + 省略号」正好放得下,保证截断后仍不溢出。
-    let label = "";
-    for (const ch of name) {
-      if (estWidth(label + ch + "…", fontSize) > avail) break;
-      label += ch;
-    }
-    return { r, label: label + "…" };
+    const maxLabelW = kind === "note" ? 176 : 136;
+    const labelLines = wrapLabel(name, maxLabelW);
+    const textW = Math.max(...labelLines.map((line) => estWidth(line, LABEL_FONT)));
+    const labelW = Math.max(36, Math.min(maxLabelW, textW));
+    const labelH = labelLines.length * LABEL_LINE;
+    const showLabelByDefault = showAllLabels || labelRank < DEFAULT_LARGE_LABELS;
+    // 标签与圆点同心:用文字包围盒的外接圆做碰撞半径,既能避免名称互相压住,
+    // 又不再为「圆点 + 下方方框」重复占两份纵向空间。
+    const collisionR = showLabelByDefault
+      ? Math.max(r + 8, Math.hypot(labelW / 2, labelH / 2) + 8)
+      : r + 6;
+    return { r, labelLines, labelW, labelH, labelRank, showLabelByDefault, collisionR };
   }
 
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
@@ -192,11 +272,27 @@
       }
     }
 
-    const chosen = allNodes.filter((n) => idset.has(n.id));
+    // 重要节点最后绘制,它们的标记和标签自然位于较弱节点之上。
+    const chosen = allNodes
+      .filter((n) => idset.has(n.id))
+      .sort((a, b) => a.note_count - b.note_count);
     const maxNoteCount = chosen.reduce((m, n) => Math.max(m, n.note_count), 0);
+    const rankById = new Map(
+      [...chosen]
+        .sort((a, b) => b.note_count - a.note_count || a.name.localeCompare(b.name))
+        .map((n, rank) => [n.id, rank]),
+    );
+    const showAllLabels = chosen.length <= ALL_LABELS_LIMIT;
     dNodes = chosen.map((n) => {
-      const { r, label } = sizeFor(n.name, n.note_count, maxNoteCount);
-      return { ...n, r, label };
+      const layout = layoutFor(
+        n.name,
+        n.kind,
+        n.note_count,
+        maxNoteCount,
+        rankById.get(n.id) ?? chosen.length,
+        showAllLabels,
+      );
+      return { ...n, ...layout };
     });
     const byId = new Map(dNodes.map((n) => [n.id, n]));
     // 已经放宽/展开了就不再局限于强边——节点都决定要画出来了,哪怕只共享 1 篇笔记
@@ -225,7 +321,6 @@
     snap = {
       nodes: dNodes.map((n) => ({
         id: n.id,
-        label: n.label ?? n.name,
         name: n.name,
         kind: n.kind,
         is_person: n.is_person,
@@ -233,6 +328,11 @@
         x: n.x ?? width / 2,
         y: n.y ?? height / 2,
         r: n.r ?? MIN_R,
+        labelLines: n.labelLines ?? [n.name],
+        labelW: n.labelW ?? 42,
+        labelH: n.labelH ?? LABEL_LINE,
+        labelRank: n.labelRank ?? Number.MAX_SAFE_INTEGER,
+        showLabelByDefault: n.showLabelByDefault ?? true,
       })),
       links: dLinks.map((l) => ({
         aid: l.source.id,
@@ -295,7 +395,7 @@
       // 碰撞力每 tick 只推一次的话根本来不及把重叠分开、仿真就冷却停了(冒烟反馈
       // "位置没好就停止了")。加迭代=每 tick 多推几轮,少 tick 也能分干净——用
       // "推得更狠"换"跑得更快",而不是靠拖时间。
-      .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6).iterations(4))
+      .force("collide", forceCollide<SimNode>((d) => d.collisionR ?? (d.r ?? MIN_R) + 6).iterations(4))
       // heavy 图默认衰减(alphaDecay≈0.0228,~300 tick、5 秒+)配合弱化过的斥力,
       // 动画拖得很长、过程飘来飘去看着乱(冒烟反馈"动的时间太长了很混乱")。
       // 调快衰减(~40 tick、1 秒内)+ 加大阻尼(velocityDecay,抑制过冲/来回摆动),
@@ -390,6 +490,14 @@
     return s;
   });
   const dimForSearch = (id: string) => matchedIds.size > 0 && !matchedIds.has(id);
+  /** 语义缩放:大型图先显示最重要的一组完整标签,放大后逐级揭示更多。悬停时把
+      一阶邻居的名字一起展开,让用户沿着关系读图;搜索命中永远可见。 */
+  const labelVisible = (n: (typeof snap.nodes)[number]) =>
+    n.showLabelByDefault ||
+    matchedIds.has(n.id) ||
+    (neighbors?.has(n.id) ?? false) ||
+    viewZoom >= 2.2 ||
+    (viewZoom >= 1.45 && n.labelRank < 180);
 
   // kind 图例:按当前渲染集合里实际出现的类别生成,不是全量枚举(没出现的类别列出来
   // 也没用)。人实体在图上按个体上色(speakerInk),没有单一代表色,图例用渐变点说明
@@ -426,6 +534,8 @@
     if (ns.length === 0) return { scale: 1, tx: 0, ty: 0 };
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of ns) {
+      // 标签使用逆缩放保持屏幕字号稳定,不属于仿真坐标系的几何尺寸。fit 只看标记,
+      // 再用更宽的画布边距给同心文字留空间,避免文字反过来把节点缩成小点。
       minX = Math.min(minX, n.x - n.r);
       minY = Math.min(minY, n.y - n.r);
       maxX = Math.max(maxX, n.x + n.r);
@@ -433,8 +543,8 @@
     }
     const bw = Math.max(1, maxX - minX);
     const bh = Math.max(1, maxY - minY);
-    // 封顶 2.5x:防止节点很少时被放大到失真;留 8% 边距不贴边。
-    const scale = Math.min((width / bw) * 0.92, (height / bh) * 0.92, 2.5);
+    // 封顶 2.5x:防止节点很少时被放大到失真;留 14% 边距给屏幕定宽标签。
+    const scale = Math.min((width / bw) * 0.86, (height / bh) * 0.86, 2.5);
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
     return { scale, tx: width / 2 - cx * scale, ty: height / 2 - cy * scale };
@@ -452,10 +562,13 @@
       const px = n.x * fit.scale + fit.tx;
       const py = n.y * fit.scale + fit.ty;
       const pr = n.r * fit.scale;
-      minX = Math.min(minX, px - pr);
-      minY = Math.min(minY, py - pr);
-      maxX = Math.max(maxX, px + pr);
-      maxY = Math.max(maxY, py + pr);
+      // 标签在屏幕坐标中保持定宽,这里不能再乘 fit.scale。
+      const labelHalfW = n.labelW / 2;
+      const labelHalfH = n.labelH / 2;
+      minX = Math.min(minX, px - Math.max(pr, labelHalfW));
+      minY = Math.min(minY, py - Math.max(pr, labelHalfH));
+      maxX = Math.max(maxX, px + Math.max(pr, labelHalfW));
+      maxY = Math.max(maxY, py + Math.max(pr, labelHalfH));
     }
     const bw = Math.max(1, maxX - minX);
     const bh = Math.max(1, maxY - minY);
@@ -606,7 +719,17 @@
                 onContextMenu(n.id, n.name, n.is_person, e.clientX, e.clientY);
               }}
             >
-              <circle r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}><title>{n.name}</title></circle>
+              <circle
+                class="node-halo"
+                r={n.r + 3}
+                fill="none"
+                stroke={nodeColor(n.id, n.kind, n.is_person)}
+                stroke-width="1"
+                vector-effect="non-scaling-stroke"
+              />
+              <circle class="node-marker" r={n.r} fill={nodeColor(n.id, n.kind, n.is_person)}>
+                <title>{n.name}</title>
+              </circle>
               {#if matchedIds.has(n.id)}
                 <!-- 搜索命中描边:比节点本身粗一圈,vector-effect 防镜头缩放把线宽带跑 -->
                 <circle
@@ -617,13 +740,29 @@
                   vector-effect="non-scaling-stroke"
                 />
               {/if}
-              <text class="lbl" font-size={labelFontSize(n.r)}>{n.label}</text>
+              {#if labelVisible(n)}
+                <!-- 名称与圆点同心,共同构成一个节点。逆缩放让文字在缩放时保持可读字号。 -->
+                {@const renderScale = Math.max(0.001, fit.scale * viewZoom)}
+                <g class="node-label" transform="scale({1 / renderScale})">
+                  <text>
+                    {#each n.labelLines as line, i}
+                      <tspan
+                        x="0"
+                        y={(i - (n.labelLines.length - 1) / 2) * LABEL_LINE}
+                      >{line}</tspan>
+                    {/each}
+                  </text>
+                </g>
+              {/if}
             </g>
           {/each}
         </g>
       </g>
     </g>
   </svg>
+  {#if snap.nodes.length > ALL_LABELS_LIMIT && viewZoom < 2.2}
+    <div class="semantic-hint">滚轮放大显示更多名称 · 悬停探索相邻关系</div>
+  {/if}
   {#if expanded}
     <div class="trunc-bar">
       <span class="trunc-label">已显示全部 {snap.nodes.length} 个实体</span>
@@ -666,12 +805,39 @@
   .fg { position: relative; height: 100%; overflow: hidden; }
   svg { display: block; touch-action: none; }
   .bg { cursor: grab; }
-  .lbl {
-    fill: var(--surface);
+  .node-halo { opacity: 0.2; }
+  .node-marker {
+    stroke: var(--surface);
+    stroke-width: 1.5px;
+    vector-effect: non-scaling-stroke;
+  }
+  .node-label text {
+    fill: var(--ink);
+    stroke: var(--surface);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+    paint-order: stroke fill;
     font-family: inherit;
-    font-weight: 500;
+    font-size: 11px;
+    font-weight: 650;
     text-anchor: middle;
     dominant-baseline: central;
+    letter-spacing: 0.01em;
+  }
+  .nodes > g:hover .node-label text { font-weight: 750; }
+  .semantic-hint {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 6px 10px;
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--ink-faint);
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
     pointer-events: none;
   }
   /* 规模控制条:说明文字(纯信息,不可点)+ 独立的药丸按钮群(可点),不再是一整块
