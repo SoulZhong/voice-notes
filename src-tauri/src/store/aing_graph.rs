@@ -453,6 +453,8 @@ pub fn validate_graph(
                     );
                 }
             }
+            evidence.source_seqs.sort_unstable();
+            evidence.source_seqs.dedup();
             if evidence.source_seqs.is_empty()
                 || evidence
                     .source_seqs
@@ -790,6 +792,26 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_negative_confidence_on_an_otherwise_valid_relation() {
+        let issues = validate_graph("note-1", &validator_doc(), vec![valid_fact(-0.01, "uses")])
+            .unwrap_err();
+
+        assert_eq!(fields(&issues), vec!["relations[0].confidence"]);
+    }
+
+    #[test]
+    fn validator_rejects_empty_source_seqs_on_an_otherwise_valid_evidence() {
+        let mut relation = valid_fact(0.8, "uses");
+        relation.evidence[0].source_seqs.clear();
+
+        let issues = validate_graph("note-1", &validator_doc(), vec![relation]).unwrap_err();
+        assert_eq!(
+            fields(&issues),
+            vec!["relations[0].evidence[0].source_seqs"]
+        );
+    }
+
+    #[test]
     fn validator_rejects_invalid_mentions_and_evidence_with_unicode_offsets() {
         let mut relation = valid_fact(0.8, "uses");
         relation.object = "ent_zhang".into();
@@ -843,6 +865,26 @@ mod tests {
             .evidence
             .windows(2)
             .all(|pair| pair[0].id <= pair[1].id));
+    }
+
+    #[test]
+    fn validator_canonicalizes_source_seqs_before_deduplicating_evidence() {
+        let forward = valid_fact(0.8, "uses");
+        let mut reversed = valid_fact(0.8, "uses");
+        reversed.evidence[0].source_seqs.reverse();
+        let mut duplicates = forward.clone();
+        duplicates.evidence.push(reversed.evidence[0].clone());
+
+        let forward = validate_graph("note-1", &validator_doc(), vec![forward]).unwrap();
+        let reversed = validate_graph("note-1", &validator_doc(), vec![reversed]).unwrap();
+        let duplicates = validate_graph("note-1", &validator_doc(), vec![duplicates]).unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&forward).unwrap(),
+            serde_json::to_vec(&reversed).unwrap()
+        );
+        assert_eq!(duplicates.relations[0].evidence.len(), 1);
+        assert_eq!(duplicates.relations[0].evidence[0].source_seqs, vec![7, 8]);
     }
 
     #[test]
