@@ -1,0 +1,34 @@
+{
+  "relations": [
+    {
+      "subject": "ent_zhang",
+      "predicate": { "type": "uses" },
+      "object": "ent_rust",
+      "subject_mentions": ["mn_77e5b56629940663716b4cee"],
+      "object_mentions": ["mn_d1b273870931a4bf337d88f9"],
+      "confidence": 0.8,
+      "evidence": [{
+        "paragraph_index": 0,
+        "start": 0,
+        "end": 8,
+        "quote": "张三使用Rust",
+        "source_seqs": [7, 8]
+      }]
+    },
+    {
+      "subject": "ent_zhang",
+      "predicate": { "type": "uses" },
+      "object": "ent_rust",
+      "subject_mentions": ["mn_77e5b56629940663716b4cee"],
+      "object_mentions": ["mn_d1b273870931a4bf337d88f9"],
+      "confidence": 0.8,
+      "evidence": [{
+        "paragraph_index": 0,
+        "start": 4,
+        "end": 8,
+        "quote": "Rust",
+        "source_seqs": [7]
+      }]
+    }
+  ]
+}
