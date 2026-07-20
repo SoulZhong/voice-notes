@@ -405,7 +405,10 @@ pub fn resolve_entity(
         _ => {}
     }
 
-    if let Some(entity_id) = snapshot.registry_id_for_legacy(&local.id) {
+    if let Some(entity_id) = snapshot
+        .registry_id_for_legacy(&format!("{note_id}/{}", local.id))
+        .or_else(|| snapshot.registry_id_for_legacy(&local.id))
+    {
         return resolved_through_redirects(snapshot, people, entity_id);
     }
 
@@ -420,6 +423,16 @@ pub fn resolve_entity(
         candidates: Vec::new(),
         reason: None,
     }
+}
+
+/// Resolve an already-stable registry/person reference through entity and voiceprint redirects.
+/// Canonical relation decisions use this so merges apply equally to model and user-authored edges.
+pub fn resolve_reference_id(
+    snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
+    entity_id: &str,
+) -> Resolution {
+    resolved_through_redirects(snapshot, people, entity_id.to_string())
 }
 
 impl ResolverSnapshot {

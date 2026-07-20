@@ -5,6 +5,8 @@ use std::path::Path;
 
 #[allow(dead_code)] // Durable graph contract; command/API consumers land in subsequent tasks.
 pub(crate) mod overrides;
+#[allow(dead_code)] // Canonical graph consumers land in the following indexing/API tasks.
+pub(crate) mod canonical;
 #[allow(dead_code)] // Pure snapshot contract; canonical projection consumes it next.
 pub(crate) mod resolve;
 
