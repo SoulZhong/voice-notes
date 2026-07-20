@@ -382,17 +382,7 @@ pub fn resolve_entity(
         return resolved_through_redirects(snapshot, people, local.id.clone());
     }
 
-    let name = normalize(&local.name);
-    let exact_matches: Vec<String> = snapshot
-        .registry
-        .iter()
-        .filter(|(_, entity)| entity.status == "confirmed" && entity.kind == local.kind)
-        .filter(|(_, entity)| {
-            normalize(&entity.name) == name
-                || entity.aliases.iter().any(|alias| normalize(alias) == name)
-        })
-        .map(|(entity_id, _)| entity_id.clone())
-        .collect();
+    let exact_matches = confirmed_registry_matches(&snapshot.registry, local);
     let mut exact_matches = match canonicalize_candidates(snapshot, people, exact_matches) {
         Ok(matches) => matches,
         Err(cycle) => return Resolution::pending(cycle, "redirect cycle detected"),
@@ -432,7 +422,35 @@ pub fn resolve_reference_id(
     people: &Voiceprints,
     entity_id: &str,
 ) -> Resolution {
-    resolved_through_redirects(snapshot, people, entity_id.to_string())
+    match follow_all_redirects(snapshot, people, entity_id) {
+        Ok(entity_id)
+            if snapshot.registry.contains_key(&entity_id)
+                || people.people.contains_key(&entity_id) =>
+        {
+            Resolution::resolved(entity_id)
+        }
+        Ok(entity_id) => Resolution::pending(vec![entity_id], "resolved target entity is missing"),
+        Err(candidates) => Resolution::pending(candidates, "redirect cycle detected"),
+    }
+}
+
+pub(crate) fn confirmed_registry_matches(
+    registry: &BTreeMap<String, RegistryEntity>,
+    local: &Entity,
+) -> Vec<String> {
+    let mut local_names = BTreeSet::from([normalize(&local.name)]);
+    local_names.extend(local.aliases.iter().map(|alias| normalize(alias)));
+    registry
+        .iter()
+        .filter(|(_, entity)| entity.status == "confirmed" && entity.kind == local.kind)
+        .filter(|(_, entity)| {
+            std::iter::once(&entity.name)
+                .chain(entity.aliases.iter())
+                .map(|name| normalize(name))
+                .any(|name| local_names.contains(&name))
+        })
+        .map(|(entity_id, _)| entity_id.clone())
+        .collect()
 }
 
 impl ResolverSnapshot {
@@ -446,16 +464,7 @@ fn resolved_through_redirects(
     people: &Voiceprints,
     entity_id: String,
 ) -> Resolution {
-    match follow_redirects(snapshot, entity_id) {
-        Ok(entity_id) if snapshot.registry.contains_key(&entity_id) => {
-            Resolution::resolved(entity_id)
-        }
-        Ok(entity_id) => match VoiceprintStore::resolve(people, &entity_id) {
-            Some(person_id) => Resolution::resolved(person_id.to_string()),
-            None => Resolution::pending(vec![entity_id], "resolved target entity is missing"),
-        },
-        Err(candidates) => Resolution::pending(candidates, "redirect cycle detected"),
-    }
+    resolve_reference_id(snapshot, people, &entity_id)
 }
 
 fn canonicalize_candidates(
@@ -465,32 +474,39 @@ fn canonicalize_candidates(
 ) -> Result<Vec<String>, Vec<String>> {
     let mut canonical = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let candidate = follow_redirects(snapshot, candidate)?;
-        canonical.push(
-            VoiceprintStore::resolve(people, &candidate)
-                .unwrap_or(&candidate)
-                .to_string(),
-        );
+        let resolution = resolve_reference_id(snapshot, people, &candidate);
+        let Some(entity_id) = resolution.entity_id else {
+            return Err(resolution.candidates);
+        };
+        canonical.push(entity_id);
     }
     canonical.sort();
     canonical.dedup();
     Ok(canonical)
 }
 
-fn follow_redirects(snapshot: &ResolverSnapshot, entity_id: String) -> Result<String, Vec<String>> {
-    let mut current = entity_id;
+fn follow_all_redirects(
+    snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
+    entity_id: &str,
+) -> Result<String, Vec<String>> {
+    let mut current = entity_id.to_string();
     let mut visited = BTreeSet::new();
-    while let Some(next) = snapshot.redirects.get(&current) {
-        if !visited.insert(current.clone()) || visited.contains(next) {
+    loop {
+        if !visited.insert(current.clone()) {
             let mut candidates: Vec<_> = visited.into_iter().collect();
-            candidates.push(next.clone());
             candidates.sort();
-            candidates.dedup();
             return Err(candidates);
         }
-        current = next.clone();
+        let next = snapshot
+            .redirects
+            .get(&current)
+            .or_else(|| people.redirects.get(&current));
+        match next {
+            Some(next) => current = next.clone(),
+            None => return Ok(current),
+        }
     }
-    Ok(current)
 }
 
 fn normalize(value: &str) -> String {
@@ -1018,6 +1034,56 @@ mod tests {
 
         assert_eq!(resolution.status, ResolutionStatus::Resolved);
         assert_eq!(resolution.entity_id.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn stable_reference_composes_registry_and_voiceprint_redirects_and_detects_cross_cycles() {
+        let mut ledger = KnowledgeLedger::empty();
+        ledger
+            .registry
+            .insert("P2".into(), registry_entity("person", "Old", &[]));
+        ledger
+            .registry
+            .insert("P1".into(), registry_entity("person", "New", &[]));
+        let snapshot = replay(&ledger).unwrap();
+        let people: Voiceprints = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "next_person": 3,
+            "people": {"P1": {"name": "New"}},
+            "redirects": {"P2": "P1"}
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_reference_id(&snapshot, &people, "P2")
+                .entity_id
+                .as_deref(),
+            Some("P1")
+        );
+
+        let mut cyclic = KnowledgeLedger::empty();
+        cyclic
+            .registry
+            .insert("P1".into(), registry_entity("person", "One", &[]));
+        cyclic.operations.push(decision_operation(
+            "merge",
+            None,
+            "P2",
+            KnowledgeAction::MergeEntity {
+                source_id: "P1".into(),
+                target_id: "P2".into(),
+            },
+        ));
+        let cyclic_snapshot = replay(&cyclic).unwrap();
+        let cyclic_people: Voiceprints = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "next_person": 3,
+            "people": {"P1": {"name": "One"}},
+            "redirects": {"P2": "P1"}
+        }))
+        .unwrap();
+        let conflict = resolve_reference_id(&cyclic_snapshot, &cyclic_people, "P1");
+        assert_eq!(conflict.status, ResolutionStatus::PendingConflict);
+        assert!(conflict.reason.as_deref().unwrap().contains("cycle"));
     }
 
     #[test]

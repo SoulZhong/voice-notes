@@ -126,7 +126,7 @@ struct RelationKey {
 
 pub fn reconcile_registry(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
     overrides::update(data_root, |ledger| {
-        let documents = scan_documents(data_root);
+        let documents = scan_documents(data_root)?;
         for document in documents.into_iter().filter_map(|document| document.ok()) {
             for local in &document.doc.entities {
                 if local.name.trim().is_empty() {
@@ -136,7 +136,7 @@ pub fn reconcile_registry(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
                 if ledger.legacy_ids.contains_key(&legacy_key) {
                     continue;
                 }
-                let candidates = registry_matches(&ledger.registry, local);
+                let candidates = resolve::confirmed_registry_matches(&ledger.registry, local);
                 if candidates.len() > 1 {
                     // Ambiguity is a governance decision: leave it unbound for the pure builder
                     // to surface instead of manufacturing a third identity.
@@ -192,37 +192,62 @@ pub fn reconcile_registry(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
 pub fn build_canonical_graph(
     data_root: &Path,
     ledger: &KnowledgeLedger,
-    _now: DateTime<FixedOffset>,
+    now: DateTime<FixedOffset>,
 ) -> anyhow::Result<CanonicalGraph> {
     let snapshot = resolve::replay(ledger)?;
     let people = VoiceprintStore::new(data_root.to_path_buf()).load();
-    let entities = snapshot
-        .registry
-        .iter()
-        .filter(|(id, _)| !snapshot.redirects.contains_key(*id))
-        .filter_map(|(id, entity)| {
-            let canonical_id = resolve::resolve_reference_id(&snapshot, &people, id).entity_id?;
-            Some((
-                canonical_id.clone(),
-                CanonicalEntity {
-                    id: canonical_id,
-                    kind: entity.kind.clone(),
-                    name: entity.name.clone(),
-                    aliases: entity.aliases.clone(),
-                    confirmed: entity.status == "confirmed",
-                },
-            ))
-        })
-        .collect();
-    let mut mentions = Vec::new();
+    let documents = scan_documents(data_root)?;
+    let mut entities = BTreeMap::new();
     let mut pending = Vec::new();
-    for document in scan_documents(data_root) {
+    for (id, entity) in &snapshot.registry {
+        let resolution = resolve::resolve_reference_id(&snapshot, &people, id);
+        let Some(canonical_id) = resolution.entity_id else {
+            pending.push(PendingItem::IdentityConflict {
+                note_id: String::new(),
+                local_entity_id: id.clone(),
+                candidates: resolution.candidates,
+                reason: resolution
+                    .reason
+                    .unwrap_or_else(|| "registry redirect conflict".into()),
+            });
+            continue;
+        };
+        if canonical_id != *id {
+            if snapshot.registry.contains_key(&canonical_id) {
+                continue;
+            }
+            if let Some(person) = people.people.get(&canonical_id) {
+                entities
+                    .entry(canonical_id.clone())
+                    .or_insert_with(|| CanonicalEntity {
+                        id: canonical_id,
+                        kind: "person".into(),
+                        name: person.name.clone(),
+                        aliases: Vec::new(),
+                        confirmed: true,
+                    });
+                continue;
+            }
+        }
+        entities.insert(
+            canonical_id.clone(),
+            CanonicalEntity {
+                id: canonical_id,
+                kind: entity.kind.clone(),
+                name: entity.name.clone(),
+                aliases: entity.aliases.clone(),
+                confirmed: entity.status == "confirmed",
+            },
+        );
+    }
+    let mut mentions = Vec::new();
+    for document in &documents {
         let document = match document {
             Ok(document) => document,
             Err(invalid) => {
                 pending.push(PendingItem::InvalidDocument {
-                    note_id: invalid.note_id,
-                    message: invalid.message,
+                    note_id: invalid.note_id.clone(),
+                    message: invalid.message.clone(),
                 });
                 continue;
             }
@@ -265,6 +290,29 @@ pub fn build_canonical_graph(
                 if resolution.status == ResolutionStatus::PendingConflict {
                     continue;
                 }
+                if !entities.contains_key(&entity_id) {
+                    if let Some(person) = people.people.get(&entity_id) {
+                        entities.insert(
+                            entity_id.clone(),
+                            CanonicalEntity {
+                                id: entity_id.clone(),
+                                kind: "person".into(),
+                                name: person.name.clone(),
+                                aliases: Vec::new(),
+                                confirmed: true,
+                            },
+                        );
+                    } else {
+                        pending.push(PendingItem::IdentityConflict {
+                            note_id: document.note_id.clone(),
+                            local_entity_id: local.id.clone(),
+                            candidates: vec![entity_id],
+                            reason: "resolved mention target is absent from the canonical registry"
+                                .into(),
+                        });
+                        continue;
+                    }
+                }
                 let Some(quote) = char_slice(&paragraph.text, mention.start, mention.end) else {
                     pending.push(PendingItem::IdentityConflict {
                         note_id: document.note_id.clone(),
@@ -297,8 +345,11 @@ pub fn build_canonical_graph(
         })
         .collect();
     let mut relation_groups: BTreeMap<(RelationKey, String), CanonicalRelation> = BTreeMap::new();
-    let mut evidence_catalog = BTreeMap::new();
-    for document in scan_documents(data_root).into_iter().filter_map(Result::ok) {
+    let evidence_catalog = collect_evidence_catalog(&documents);
+    for document in documents
+        .iter()
+        .filter_map(|document| document.as_ref().ok())
+    {
         for relation in &document.doc.relations {
             project_model_relation(
                 &document,
@@ -307,9 +358,8 @@ pub fn build_canonical_graph(
                 &people,
                 &mention_index,
                 &mut relation_groups,
-                &mut evidence_catalog,
                 &mut pending,
-                _now,
+                now,
             );
         }
     }
@@ -320,10 +370,36 @@ pub fn build_canonical_graph(
         &mention_index,
         &mut relation_groups,
         &mut pending,
-        _now,
+        now,
     );
-    let mut relations: Vec<_> = relation_groups.into_values().collect();
-    mark_time_conflicts(&mut relations, &mut pending, _now);
+    let candidates: Vec<_> = relation_groups.into_values().collect();
+    let (conflicting_ids, time_pending) = find_time_conflicts(&candidates);
+    pending.extend(time_pending);
+    let mut relations = Vec::new();
+    for relation in candidates {
+        if let Err(item) = validate_final_relation(&relation, &mention_index) {
+            pending.push(item);
+            continue;
+        }
+        let time_conflict = conflicting_ids.contains(&relation.id);
+        let tier = canonical_publish_tier(&relation, time_conflict);
+        let tier = if relation.origin == RelationOrigin::UserAssertion {
+            PublishTier::Published
+        } else {
+            tier
+        };
+        match tier {
+            PublishTier::RawOnly => continue,
+            PublishTier::Pending if !time_conflict => {
+                pending.push(PendingItem::RelationReview {
+                    note_id: relation.note_ids.first().cloned().unwrap_or_default(),
+                    relation_id: relation.id.clone(),
+                });
+            }
+            PublishTier::Pending | PublishTier::Published => {}
+        }
+        relations.push(relation);
+    }
     relations.sort_by(|left, right| left.id.cmp(&right.id));
     pending.sort_by_key(pending_sort_key);
     Ok(CanonicalGraph {
@@ -341,16 +417,22 @@ fn project_model_relation(
     people: &store::Voiceprints,
     mentions: &BTreeMap<(String, String), CanonicalMention>,
     groups: &mut BTreeMap<(RelationKey, String), CanonicalRelation>,
-    evidence_catalog: &mut BTreeMap<String, CanonicalEvidence>,
     pending: &mut Vec<PendingItem>,
     now: DateTime<FixedOffset>,
 ) {
-    let resolved_evidence = match resolve_evidence(document, source, pending) {
-        Some(evidence) => evidence,
-        None => return,
-    };
-    for evidence in &resolved_evidence {
-        evidence_catalog.insert(evidence.id.clone(), evidence.clone());
+    if source.confidence < 0.5 {
+        return;
+    }
+    let resolved = resolve_evidence(document, source);
+    for evidence_id in resolved.stale {
+        pending.push(PendingItem::StaleEvidence {
+            note_id: document.note_id.clone(),
+            relation_id: source.id.clone(),
+            evidence_id,
+        });
+    }
+    if resolved.valid.is_empty() {
+        return;
     }
     let subject_mentions: Vec<_> = source
         .subject_mentions
@@ -372,7 +454,7 @@ fn project_model_relation(
     }
 
     let mut split: BTreeMap<(String, String), Vec<CanonicalEvidence>> = BTreeMap::new();
-    for evidence in resolved_evidence {
+    for evidence in resolved.valid {
         let subject_ids: BTreeSet<_> = subject_mentions
             .iter()
             .filter(|mention| evidence_contains(&evidence, mention))
@@ -499,43 +581,6 @@ fn project_model_relation(
             valid_from.as_deref(),
             valid_to.as_deref(),
         );
-        let fact = RelationFact {
-            id: source.id.clone(),
-            subject: subject_id.clone(),
-            predicate: predicate.clone(),
-            object: object_id.clone(),
-            subject_mentions: evidence
-                .iter()
-                .flat_map(|item| item.subject_mentions.clone())
-                .collect(),
-            object_mentions: evidence
-                .iter()
-                .flat_map(|item| item.object_mentions.clone())
-                .collect(),
-            confidence: source.confidence,
-            valid_from: valid_from.clone(),
-            valid_to: valid_to.clone(),
-            evidence: evidence
-                .iter()
-                .map(|item| store::RelationEvidence {
-                    id: item.id.clone(),
-                    paragraph_index: item.paragraph_index,
-                    start: item.start,
-                    end: item.end,
-                    quote: item.quote.clone(),
-                    source_seqs: item.source_seqs.clone(),
-                    source_hash: item.source_hash.clone(),
-                })
-                .collect(),
-        };
-        match store::aing_graph::publish_tier(&fact, false, false) {
-            PublishTier::RawOnly => continue,
-            PublishTier::Pending => pending.push(PendingItem::RelationReview {
-                note_id: document.note_id.clone(),
-                relation_id: relation_id.clone(),
-            }),
-            PublishTier::Published => {}
-        }
         let extraction = document.doc.graph_extraction.as_ref();
         insert_relation(
             groups,
@@ -558,12 +603,15 @@ fn project_model_relation(
     }
 }
 
-fn resolve_evidence(
-    document: &ScannedDocument,
-    relation: &RelationFact,
-    pending: &mut Vec<PendingItem>,
-) -> Option<Vec<CanonicalEvidence>> {
-    let mut result = Vec::new();
+struct EvidenceResolution {
+    valid: Vec<CanonicalEvidence>,
+    stale: Vec<String>,
+}
+
+fn resolve_evidence(document: &ScannedDocument, relation: &RelationFact) -> EvidenceResolution {
+    let mut valid = Vec::new();
+    let mut stale = Vec::new();
+    let current_source_hash = store::source_hash(&document.doc.paragraphs);
     for evidence in &relation.evidence {
         let location = document
             .doc
@@ -572,6 +620,7 @@ fn resolve_evidence(
             .and_then(|paragraph| {
                 (char_slice(&paragraph.text, evidence.start, evidence.end).as_deref()
                     == Some(evidence.quote.as_str())
+                    && evidence.source_hash == current_source_hash
                     && evidence
                         .source_seqs
                         .iter()
@@ -580,14 +629,10 @@ fn resolve_evidence(
             })
             .or_else(|| unique_evidence_location(&document.doc, evidence));
         let Some((paragraph_index, start, end)) = location else {
-            pending.push(PendingItem::StaleEvidence {
-                note_id: document.note_id.clone(),
-                relation_id: relation.id.clone(),
-                evidence_id: evidence.id.clone(),
-            });
+            stale.push(evidence.id.clone());
             continue;
         };
-        result.push(CanonicalEvidence {
+        valid.push(CanonicalEvidence {
             id: evidence.id.clone(),
             note_id: document.note_id.clone(),
             paragraph_index,
@@ -600,7 +645,24 @@ fn resolve_evidence(
             object_mentions: Vec::new(),
         });
     }
-    (!result.is_empty()).then_some(result)
+    EvidenceResolution { valid, stale }
+}
+
+fn collect_evidence_catalog(
+    documents: &[Result<ScannedDocument, InvalidDocument>],
+) -> BTreeMap<String, CanonicalEvidence> {
+    let mut catalog = BTreeMap::new();
+    for document in documents
+        .iter()
+        .filter_map(|document| document.as_ref().ok())
+    {
+        for relation in &document.doc.relations {
+            for evidence in resolve_evidence(document, relation).valid {
+                catalog.entry(evidence.id.clone()).or_insert(evidence);
+            }
+        }
+    }
+    catalog
 }
 
 fn unique_evidence_location(
@@ -796,49 +858,25 @@ fn project_created_relations(
                 .collect();
         }
         canonicalize_evidence(&mut evidence);
+        let valid_from = relation.valid_from.clone();
+        let mut valid_to = relation.valid_to.clone();
+        let pre_end_id = canonical_relation_id(
+            &subject_id,
+            &relation.predicate,
+            &object_id,
+            valid_from.as_deref(),
+            valid_to.as_deref(),
+        );
+        if let Some(ended) = snapshot.relation_decisions.ended.get(&pre_end_id) {
+            valid_to = Some(ended.clone());
+        }
         let id = canonical_relation_id(
             &subject_id,
             &relation.predicate,
             &object_id,
-            relation.valid_from.as_deref(),
-            relation.valid_to.as_deref(),
+            valid_from.as_deref(),
+            valid_to.as_deref(),
         );
-        let fact = RelationFact {
-            id: id.clone(),
-            subject: subject_id.clone(),
-            predicate: relation.predicate.clone(),
-            object: object_id.clone(),
-            subject_mentions: Vec::new(),
-            object_mentions: Vec::new(),
-            confidence: 1.0,
-            valid_from: relation.valid_from.clone(),
-            valid_to: relation.valid_to.clone(),
-            evidence: evidence
-                .iter()
-                .map(|item| store::RelationEvidence {
-                    id: item.id.clone(),
-                    paragraph_index: item.paragraph_index,
-                    start: item.start,
-                    end: item.end,
-                    quote: item.quote.clone(),
-                    source_seqs: item.source_seqs.clone(),
-                    source_hash: item.source_hash.clone(),
-                })
-                .collect(),
-        };
-        match store::aing_graph::publish_tier(&fact, false, false) {
-            PublishTier::RawOnly => continue,
-            PublishTier::Pending if !relation.user_assertion => {
-                pending.push(PendingItem::RelationReview {
-                    note_id: evidence
-                        .first()
-                        .map(|item| item.note_id.clone())
-                        .unwrap_or_default(),
-                    relation_id: id.clone(),
-                });
-            }
-            PublishTier::Pending | PublishTier::Published => {}
-        }
         let mut note_ids: Vec<_> = evidence.iter().map(|item| item.note_id.clone()).collect();
         note_ids.sort();
         note_ids.dedup();
@@ -850,9 +888,9 @@ fn project_created_relations(
                 predicate: relation.predicate.clone(),
                 object_id,
                 confidence: 1.0,
-                valid_from: relation.valid_from.clone(),
-                valid_to: relation.valid_to.clone(),
-                status: relation_status(relation.valid_to.as_deref(), now),
+                valid_from,
+                valid_to: valid_to.clone(),
+                status: relation_status(valid_to.as_deref(), now),
                 origin: if relation.user_assertion {
                     RelationOrigin::UserAssertion
                 } else {
@@ -880,41 +918,113 @@ fn canonicalize_evidence(evidence: &mut Vec<CanonicalEvidence>) {
     evidence.dedup_by(|left, right| left.id == right.id);
 }
 
-fn mark_time_conflicts(
-    relations: &mut [CanonicalRelation],
-    pending: &mut Vec<PendingItem>,
-    _now: DateTime<FixedOffset>,
-) {
+type RelationInterval = (Option<DateTime<FixedOffset>>, Option<DateTime<FixedOffset>>);
+
+fn find_time_conflicts(relations: &[CanonicalRelation]) -> (BTreeSet<String>, Vec<PendingItem>) {
     let mut conflicts = BTreeSet::new();
+    let mut relation_ids = BTreeSet::new();
     for left in 0..relations.len() {
-        if relations[left].status != RelationStatus::Current
-            || !matches!(
-                relations[left].predicate.kind.as_str(),
-                "responsible_for" | "assigned_to"
-            )
-        {
+        if !matches!(
+            relations[left].predicate.kind.as_str(),
+            "responsible_for" | "assigned_to"
+        ) {
             continue;
         }
+        let Ok(left_interval) = relation_interval(&relations[left]) else {
+            continue;
+        };
         for right in left + 1..relations.len() {
-            if relations[right].status == RelationStatus::Current
-                && relations[left].subject_id == relations[right].subject_id
+            let Ok(right_interval) = relation_interval(&relations[right]) else {
+                continue;
+            };
+            if relations[left].subject_id == relations[right].subject_id
                 && relations[left].predicate == relations[right].predicate
                 && relations[left].object_id != relations[right].object_id
+                && intervals_overlap(&left_interval, &right_interval)
             {
-                // The shared Task 2 policy is the final authority for conflict tiering.
-                let _ = canonical_publish_tier(&relations[left], true);
-                let _ = canonical_publish_tier(&relations[right], true);
                 let mut ids = vec![relations[left].id.clone(), relations[right].id.clone()];
                 ids.sort();
+                relation_ids.extend(ids.iter().cloned());
                 conflicts.insert(ids);
             }
         }
     }
-    pending.extend(
+    (
+        relation_ids,
         conflicts
             .into_iter()
-            .map(|relation_ids| PendingItem::TimeConflict { relation_ids }),
+            .map(|relation_ids| PendingItem::TimeConflict { relation_ids })
+            .collect(),
+    )
+}
+
+fn relation_interval(relation: &CanonicalRelation) -> anyhow::Result<RelationInterval> {
+    let parse = |value: &Option<String>, field: &str| -> anyhow::Result<_> {
+        value
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))
+    };
+    let start = parse(&relation.valid_from, "valid_from")?;
+    let end = parse(&relation.valid_to, "valid_to")?;
+    anyhow::ensure!(
+        !matches!((start, end), (Some(start), Some(end)) if end <= start),
+        "valid_to must be later than valid_from"
     );
+    Ok((start, end))
+}
+
+fn intervals_overlap(left: &RelationInterval, right: &RelationInterval) -> bool {
+    left.1
+        .is_none_or(|left_end| right.0.is_none_or(|right_start| right_start < left_end))
+        && right
+            .1
+            .is_none_or(|right_end| left.0.is_none_or(|left_start| left_start < right_end))
+}
+
+fn validate_final_relation(
+    relation: &CanonicalRelation,
+    mentions: &BTreeMap<(String, String), CanonicalMention>,
+) -> Result<(), PendingItem> {
+    let note_id = relation.note_ids.first().cloned().unwrap_or_default();
+    if relation.subject_id == relation.object_id || relation_interval(relation).is_err() {
+        return Err(PendingItem::RelationReview {
+            note_id,
+            relation_id: relation.id.clone(),
+        });
+    }
+    if relation.origin == RelationOrigin::UserAssertion {
+        return Ok(());
+    }
+    if relation.evidence.is_empty() {
+        return Err(PendingItem::RelationReview {
+            note_id,
+            relation_id: relation.id.clone(),
+        });
+    }
+    for evidence in &relation.evidence {
+        let valid_subject = !evidence.subject_mentions.is_empty()
+            && evidence.subject_mentions.iter().all(|mention_id| {
+                mentions
+                    .get(&(evidence.note_id.clone(), mention_id.clone()))
+                    .is_some_and(|mention| mention.entity_id == relation.subject_id)
+            });
+        let valid_object = !evidence.object_mentions.is_empty()
+            && evidence.object_mentions.iter().all(|mention_id| {
+                mentions
+                    .get(&(evidence.note_id.clone(), mention_id.clone()))
+                    .is_some_and(|mention| mention.entity_id == relation.object_id)
+            });
+        if !valid_subject || !valid_object {
+            return Err(PendingItem::SplitConflict {
+                note_id: evidence.note_id.clone(),
+                relation_id: relation.id.clone(),
+                evidence_id: evidence.id.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn canonical_publish_tier(relation: &CanonicalRelation, time_conflict: bool) -> PublishTier {
@@ -963,48 +1073,82 @@ struct InvalidDocument {
     message: String,
 }
 
-fn scan_documents(data_root: &Path) -> Vec<Result<ScannedDocument, InvalidDocument>> {
+fn scan_documents(
+    data_root: &Path,
+) -> anyhow::Result<Vec<Result<ScannedDocument, InvalidDocument>>> {
     let notes = data_root.join("notes");
-    let mut paths: Vec<PathBuf> = match std::fs::read_dir(&notes) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join(store::AING_DOC_FILE))
-            .filter(|path| path.is_file())
-            .collect(),
-        Err(_) => Vec::new(),
+    let entries = match std::fs::read_dir(&notes) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    paths.sort_by(|left, right| {
-        note_id_for_path(left)
-            .unwrap_or_default()
-            .cmp(&note_id_for_path(right).unwrap_or_default())
-    });
-    paths
-        .into_iter()
-        .map(|path| {
-            let note_id = note_id_for_path(&path).unwrap_or_default();
-            if let Err(error) = store::validate_note_id(&note_id) {
-                return Err(InvalidDocument {
-                    note_id,
-                    message: error.to_string(),
-                });
+    let mut note_entries = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let note_id = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            note_entries.push(Err(InvalidDocument {
+                note_id,
+                message: "note directory must not be a symbolic link".into(),
+            }));
+        } else if file_type.is_dir() {
+            match std::fs::symlink_metadata(entry.path().join(store::AING_DOC_FILE)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => note_entries.push(load_document(entry.path(), note_id)),
             }
-            let bytes = std::fs::read(&path).map_err(|error| InvalidDocument {
-                note_id: note_id.clone(),
-                message: error.to_string(),
-            })?;
-            let mut doc: RefinedDoc =
-                serde_json::from_slice(&bytes).map_err(|error| InvalidDocument {
-                    note_id: note_id.clone(),
-                    message: error.to_string(),
-                })?;
-            store::ensure_graph_ids(&note_id, &mut doc);
-            Ok(ScannedDocument { note_id, doc })
-        })
-        .collect()
+        }
+    }
+    note_entries.sort_by(|left, right| document_note_id(left).cmp(document_note_id(right)));
+    Ok(note_entries)
 }
 
-fn note_id_for_path(path: &Path) -> Option<String> {
-    path.parent()?.file_name()?.to_str().map(str::to_string)
+fn load_document(note_dir: PathBuf, note_id: String) -> Result<ScannedDocument, InvalidDocument> {
+    if let Err(error) = store::validate_note_id(&note_id) {
+        return Err(InvalidDocument {
+            note_id,
+            message: error.to_string(),
+        });
+    }
+    let path = note_dir.join(store::AING_DOC_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InvalidDocument {
+                note_id,
+                message: "aing.json is missing".into(),
+            })
+        }
+        Err(error) => {
+            return Err(InvalidDocument {
+                note_id,
+                message: error.to_string(),
+            })
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(InvalidDocument {
+            note_id,
+            message: "aing.json must be a regular file".into(),
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|error| InvalidDocument {
+        note_id: note_id.clone(),
+        message: error.to_string(),
+    })?;
+    let mut doc: RefinedDoc = serde_json::from_slice(&bytes).map_err(|error| InvalidDocument {
+        note_id: note_id.clone(),
+        message: error.to_string(),
+    })?;
+    store::ensure_graph_ids(&note_id, &mut doc);
+    Ok(ScannedDocument { note_id, doc })
+}
+
+fn document_note_id(document: &Result<ScannedDocument, InvalidDocument>) -> &str {
+    match document {
+        Ok(document) => &document.note_id,
+        Err(document) => &document.note_id,
+    }
 }
 
 fn local_key(note_id: &str, local_id: &str) -> String {
@@ -1015,29 +1159,6 @@ fn is_person_id(id: &str) -> bool {
     id.strip_prefix('P').is_some_and(|suffix| {
         !suffix.is_empty() && suffix.chars().all(|char| char.is_ascii_digit())
     })
-}
-
-fn registry_matches(
-    registry: &BTreeMap<String, RegistryEntity>,
-    local: &store::Entity,
-) -> Vec<String> {
-    let mut local_names = BTreeSet::from([normalize(&local.name)]);
-    local_names.extend(local.aliases.iter().map(|alias| normalize(alias)));
-    registry
-        .iter()
-        .filter(|(_, entity)| entity.status == "confirmed" && entity.kind == local.kind)
-        .filter(|(_, entity)| {
-            std::iter::once(&entity.name)
-                .chain(entity.aliases.iter())
-                .map(|name| normalize(name))
-                .any(|name| local_names.contains(&name))
-        })
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-fn normalize(value: &str) -> String {
-    value.trim().to_lowercase()
 }
 
 fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
@@ -1590,7 +1711,16 @@ mod tests {
         let mut ledger = reconcile_registry(root.path()).unwrap();
         let person_id = ledger.legacy_ids["n1/P1"].clone();
         let project_id = ledger.legacy_ids["n1/ent_project"].clone();
-        for (id, object_id) in [("op_user_1", project_id), ("op_user_2", person_id.clone())] {
+        ledger.registry.insert(
+            "kg_other".into(),
+            RegistryEntity {
+                kind: "project".into(),
+                name: "Other".into(),
+                aliases: Vec::new(),
+                status: "confirmed".into(),
+            },
+        );
+        for (id, object_id) in [("op_user_1", project_id), ("op_user_2", "kg_other".into())] {
             ledger.operations.push(KnowledgeOperation {
                 id: id.into(),
                 at: "2026-07-21T00:00:00Z".into(),
@@ -1710,6 +1840,17 @@ mod tests {
             .pending
             .iter()
             .any(|item| matches!(item, PendingItem::StaleEvidence { .. })));
+
+        moved.relations[0].evidence[0].paragraph_index = 0;
+        moved.relations[0].evidence[0].start = 0;
+        moved.relations[0].evidence[0].end = 17;
+        write_note(root.path(), "n1", &moved);
+        let wrong_fast_path = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert!(wrong_fast_path.relations.is_empty());
+        assert!(wrong_fast_path
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::StaleEvidence { .. })));
     }
 
     #[test]
@@ -1750,6 +1891,7 @@ mod tests {
             ("kg_source", "Old"),
             ("kg_mid", "Middle"),
             ("kg_target", "New"),
+            ("kg_other", "Other"),
         ] {
             ledger.registry.insert(
                 id.into(),
@@ -1791,7 +1933,7 @@ mod tests {
                         kind: "uses".into(),
                         label: None,
                     },
-                    object_id: "kg_target".into(),
+                    object_id: "kg_other".into(),
                     valid_from: None,
                     valid_to: None,
                     note: None,
@@ -1810,8 +1952,450 @@ mod tests {
         assert_eq!(graph.mentions[0].entity_id, "kg_target");
         assert_eq!(
             graph.entities.keys().collect::<Vec<_>>(),
-            vec![&"kg_target".to_string()]
+            vec![&"kg_other".to_string(), &"kg_target".to_string()]
         );
         assert_eq!(graph.relations[0].subject_id, "kg_target");
+    }
+
+    #[test]
+    fn registry_entities_redirected_to_voiceprints_use_the_terminal_person() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "next_person": 3,
+                "people": {"P1": {"name": "Canonical person"}},
+                "redirects": {"P2": "P1"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        ledger.registry.insert(
+            "P2".into(),
+            RegistryEntity {
+                kind: "person".into(),
+                name: "Stale person".into(),
+                aliases: Vec::new(),
+                status: "confirmed".into(),
+            },
+        );
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.entities.keys().collect::<Vec<_>>(),
+            vec![&"P1".to_string()]
+        );
+        assert_eq!(graph.entities["P1"].name, "Canonical person");
+    }
+
+    #[test]
+    fn final_tiering_happens_after_grouping_and_raw_failures_stay_silent() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mixed = relation_doc("n1", 0.6);
+        let mut high = mixed.relations[0].clone();
+        high.confidence = 0.9;
+        high.id.clear();
+        mixed.relations.push(high);
+        ensure_graph_ids("n1", &mut mixed);
+        write_note(root.path(), "n1", &mixed);
+        let ledger = reconcile_registry(root.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let graph = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.relations[0].confidence, 0.9);
+        assert!(
+            graph.pending.is_empty(),
+            "the grouped 0.9 fact is published once"
+        );
+
+        let raw_root = tempfile::tempdir().unwrap();
+        let mut raw = relation_doc("raw", 0.4);
+        raw.relations[0].evidence[0].paragraph_index = 99;
+        raw.relations[0].evidence[0].source_hash = "stale".into();
+        write_note(raw_root.path(), "raw", &raw);
+        let raw_ledger = reconcile_registry(raw_root.path()).unwrap();
+        let raw_graph = build_canonical_graph(raw_root.path(), &raw_ledger, now).unwrap();
+        assert!(raw_graph.relations.is_empty());
+        assert!(
+            raw_graph.pending.is_empty(),
+            "RawOnly never leaks stale/split pending"
+        );
+    }
+
+    #[test]
+    fn created_relation_end_restore_and_undo_recompute_temporal_identity() {
+        let root = tempfile::tempdir().unwrap();
+        write_note(root.path(), "n1", &relation_doc("n1", 0.4));
+        let mut ledger = reconcile_registry(root.path()).unwrap();
+        let subject_id = ledger.legacy_ids["n1/P1"].clone();
+        let object_id = ledger.legacy_ids["n1/ent_project"].clone();
+        let predicate = RelationPredicate {
+            kind: "uses".into(),
+            label: None,
+        };
+        let pre_end_id = canonical_relation_id(&subject_id, &predicate, &object_id, None, None);
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_create_temporal".into(),
+            at: "t1".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::CreateRelation {
+                relation: super::super::overrides::UserRelation {
+                    subject_id: subject_id.clone(),
+                    predicate: predicate.clone(),
+                    object_id: object_id.clone(),
+                    valid_from: None,
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_end_created".into(),
+            at: "t2".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EndRelation {
+                relation_id: pre_end_id,
+                valid_to: "2026-07-20T00:00:00+08:00".into(),
+            },
+        });
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let ended = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(ended.relations[0].status, RelationStatus::Historical);
+
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_restore_created".into(),
+            at: "t3".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::RestoreRelation {
+                operation_id: "op_end_created".into(),
+            },
+        });
+        let restored = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(restored.relations[0].status, RelationStatus::Current);
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_undo_restore_created".into(),
+            at: "t4".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::Undo {
+                operation_id: "op_restore_created".into(),
+            },
+        });
+        assert_eq!(
+            build_canonical_graph(root.path(), &ledger, now)
+                .unwrap()
+                .relations[0]
+                .status,
+            RelationStatus::Historical
+        );
+    }
+
+    #[test]
+    fn final_relation_validation_rejects_self_loops_and_unrelated_edited_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut document = relation_doc("n1", 0.9);
+        document
+            .entities
+            .push(entity("ent_other", "term", "Other", &[]));
+        write_note(root.path(), "n1", &document);
+        let mut ledger = reconcile_registry(root.path()).unwrap();
+        let source_id = document.relations[0].id.clone();
+        let person_id = ledger.legacy_ids["n1/P1"].clone();
+        let other_id = ledger.legacy_ids["n1/ent_other"].clone();
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_edit_unrelated".into(),
+            at: "t".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EditRelation {
+                relation_id: source_id,
+                subject_id: person_id.clone(),
+                predicate: RelationPredicate {
+                    kind: "uses".into(),
+                    label: None,
+                },
+                object_id: other_id,
+                valid_from: None,
+                valid_to: None,
+                note: None,
+            },
+        });
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let unrelated = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert!(unrelated.relations.is_empty());
+        assert!(unrelated
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::SplitConflict { .. })));
+
+        let mut self_loop = KnowledgeLedger::empty();
+        self_loop.registry.insert(
+            "kg_a".into(),
+            RegistryEntity {
+                kind: "term".into(),
+                name: "A".into(),
+                aliases: Vec::new(),
+                status: "confirmed".into(),
+            },
+        );
+        self_loop.operations.push(KnowledgeOperation {
+            id: "op_self".into(),
+            at: "t".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::CreateRelation {
+                relation: super::super::overrides::UserRelation {
+                    subject_id: "kg_a".into(),
+                    predicate: RelationPredicate {
+                        kind: "uses".into(),
+                        label: None,
+                    },
+                    object_id: "kg_a".into(),
+                    valid_from: None,
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            },
+        });
+        let invalid = build_canonical_graph(root.path(), &self_loop, now).unwrap();
+        assert!(invalid.relations.is_empty());
+        assert!(invalid
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::RelationReview { .. })));
+    }
+
+    #[test]
+    fn alias_ambiguity_and_unreconciled_new_ids_never_create_dangling_mentions() {
+        let root = tempfile::tempdir().unwrap();
+        write_note(
+            root.path(),
+            "n1",
+            &doc(
+                vec![entity("ent_1", "project", "X", &["A", "B"])],
+                "X",
+                vec![mention("ent_1", 0, 1)],
+            ),
+        );
+        let mut ledger = KnowledgeLedger::empty();
+        for (id, name) in [("kg_a", "A"), ("kg_b", "B")] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "project".into(),
+                    name: name.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(graph.mentions.is_empty());
+        assert!(graph.pending.iter().any(
+            |item| matches!(item, PendingItem::IdentityConflict { candidates, .. } if candidates == &["kg_a", "kg_b"])
+        ));
+
+        let dangling = tempfile::tempdir().unwrap();
+        write_note(
+            dangling.path(),
+            "n1",
+            &doc(
+                vec![entity("ent_new", "term", "New", &[])],
+                "New",
+                vec![mention("ent_new", 0, 3)],
+            ),
+        );
+        let graph = build_canonical_graph(
+            dangling.path(),
+            &KnowledgeLedger::empty(),
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(graph.mentions.is_empty());
+        assert!(graph
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::IdentityConflict { .. })));
+    }
+
+    #[test]
+    fn temporal_conflicts_require_real_interval_overlap_and_invalid_times_are_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_person", "kg_a", "kg_b"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "term".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        for (id, object, from, to) in [
+            (
+                "op_future_a",
+                "kg_a",
+                "2026-08-01T00:00:00+08:00",
+                "2026-08-10T00:00:00+08:00",
+            ),
+            (
+                "op_future_b",
+                "kg_b",
+                "2026-08-11T00:00:00+08:00",
+                "2026-08-20T00:00:00+08:00",
+            ),
+        ] {
+            ledger.operations.push(KnowledgeOperation {
+                id: id.into(),
+                at: "t".into(),
+                before: serde_json::Value::Null,
+                after: serde_json::Value::Null,
+                action: KnowledgeAction::CreateRelation {
+                    relation: super::super::overrides::UserRelation {
+                        subject_id: "kg_person".into(),
+                        predicate: RelationPredicate {
+                            kind: "assigned_to".into(),
+                            label: None,
+                        },
+                        object_id: object.into(),
+                        valid_from: Some(from.into()),
+                        valid_to: Some(to.into()),
+                        note: None,
+                        evidence_ids: Vec::new(),
+                        user_assertion: true,
+                    },
+                },
+            });
+        }
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let graph = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert!(!graph
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::TimeConflict { .. })));
+
+        ledger.operations.push(KnowledgeOperation {
+            id: "op_invalid_time".into(),
+            at: "t".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::CreateRelation {
+                relation: super::super::overrides::UserRelation {
+                    subject_id: "kg_a".into(),
+                    predicate: RelationPredicate {
+                        kind: "uses".into(),
+                        label: None,
+                    },
+                    object_id: "kg_b".into(),
+                    valid_from: Some("not-a-time".into()),
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            },
+        });
+        let invalid = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(invalid.relations.len(), 2);
+        assert!(invalid
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::RelationReview { .. })));
+    }
+
+    #[test]
+    fn unreferenced_registry_cycles_and_missing_terminals_are_explicit_identity_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_a", "kg_b", "kg_source"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "term".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        for (id, source, target) in [
+            ("m1", "kg_a", "kg_b"),
+            ("m2", "kg_b", "kg_a"),
+            ("m3", "kg_source", "kg_missing"),
+        ] {
+            ledger.operations.push(KnowledgeOperation {
+                id: id.into(),
+                at: "t".into(),
+                before: serde_json::Value::Null,
+                after: serde_json::Value::String(target.into()),
+                action: KnowledgeAction::MergeEntity {
+                    source_id: source.into(),
+                    target_id: target.into(),
+                },
+            });
+        }
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(graph.entities.is_empty());
+        assert_eq!(
+            graph
+                .pending
+                .iter()
+                .filter(|item| matches!(item, PendingItem::IdentityConflict { .. }))
+                .count(),
+            3
+        );
+        assert!(graph.pending.iter().any(|item| matches!(
+            item,
+            PendingItem::IdentityConflict { local_entity_id, candidates, .. }
+                if local_entity_id == "kg_source" && candidates == &["kg_missing"]
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn note_symlinks_are_rejected_as_invalid_documents() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_note = outside.path().join("escaped");
+        std::fs::create_dir_all(&outside_note).unwrap();
+        write_refined_atomic(&outside_note, &relation_doc("escaped", 0.9)).unwrap();
+        std::fs::create_dir_all(root.path().join("notes")).unwrap();
+        symlink(&outside_note, root.path().join("notes").join("escaped")).unwrap();
+        let graph = build_canonical_graph(
+            root.path(),
+            &KnowledgeLedger::empty(),
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(graph.relations.is_empty());
+        assert!(graph.pending.iter().any(|item| matches!(item, PendingItem::InvalidDocument { note_id, .. } if note_id == "escaped")));
     }
 }
