@@ -61,9 +61,12 @@ pub fn run_local(
             recluster: recluster_state.into(),
             llm: "off".into(),
             entities: "off".into(),
+            relations: "off".into(),
         },
         discarded_seqs: discarded,
         entities: vec![],
+        graph_extraction: None,
+        relations: vec![],
         paragraphs,
     };
     if let Err(e) = write_refined_atomic(note_dir, &doc) {
@@ -311,7 +314,7 @@ pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Enti
             let mut first = true;
             for (s, en, id) in hits {
                 if first || s >= last_end {
-                    chosen.push(Mention { entity: id.to_string(), start: s, end: en });
+                    chosen.push(Mention { id: String::new(), entity: id.to_string(), start: s, end: en });
                     last_end = en;
                     first = false;
                 }
@@ -346,9 +349,11 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
@@ -387,8 +392,8 @@ mod tests {
             para("我们叫它 Lighthouse 吧"), // "我们叫它 " 是 5 个 char(含空格),Lighthouse 从 char 5 起
         ];
         let ms = compute_mentions(&ps, &ents);
-        assert_eq!(ms[0], vec![store::Mention { entity: "ent_1".into(), start: 0, end: 4 }]);
-        assert_eq!(ms[1], vec![store::Mention { entity: "ent_1".into(), start: 5, end: 15 }]);
+        assert_eq!(ms[0], vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }]);
+        assert_eq!(ms[1], vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 5, end: 15 }]);
     }
 
     #[test]
@@ -575,9 +580,11 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
@@ -599,9 +606,11 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
@@ -618,7 +627,7 @@ mod tests {
         assert_eq!(doc.stages.entities, "done");
         assert_eq!(doc.entities.len(), 1);
         assert_eq!(doc.entities[0].id, "ent_1");
-        assert_eq!(doc.paragraphs[0].mentions, vec![store::Mention { entity: "ent_1".into(), start: 0, end: 4 }]);
+        assert_eq!(doc.paragraphs[0].mentions, vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }]);
     }
 
     #[test]

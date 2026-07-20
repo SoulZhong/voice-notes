@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const REFINED_SCHEMA_VERSION: u32 = 1;
+pub const REFINED_SCHEMA_VERSION: u32 = 2;
 
 /// 每笔记修订稿产物文件名(人读真值)。
 pub const AING_DOC_FILE: &str = "aing.json";
@@ -19,6 +19,8 @@ fn stage_off() -> String {
 /// `RefinedDoc.entities[].id`。Plan 3 由大模型产出,本 plan 恒为空。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Mention {
+    #[serde(default)]
+    pub id: String,
     pub entity: String,
     pub start: usize,
     pub end: usize,
@@ -62,6 +64,8 @@ pub struct RefineStages {
     /// 实体抽取阶段:off/running/done/partial/failed(Plan 3 用,本 plan 恒 off)。
     #[serde(default = "stage_off")]
     pub entities: String,
+    #[serde(default = "stage_off")]
+    pub relations: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +80,10 @@ pub struct RefinedDoc {
     /// 本篇实体清单(Plan 3 填,本 plan 恒空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<Entity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_extraction: Option<super::aing_graph::GraphExtraction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<super::aing_graph::RelationFact>,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
@@ -90,10 +98,15 @@ pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result
 /// aing.json,旧文件保留供回滚)。两者皆无或损坏 → None(UI 回落原始逐字稿)。
 pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
     if let Ok(bytes) = std::fs::read(note_dir.join(AING_DOC_FILE)) {
-        return serde_json::from_slice(&bytes).ok();
+        let mut doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+        let note_id = note_dir.file_name()?.to_str()?;
+        crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+        return Some(doc);
     }
     let bytes = std::fs::read(note_dir.join(LEGACY_REFINED_FILE)).ok()?;
-    let doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+    let mut doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+    let note_id = note_dir.file_name()?.to_str()?;
+    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
     // 迁移落盘;失败不致命(下次加载再试),旧文件不删
     let _ = write_refined_atomic(note_dir, &doc);
     Some(doc)
@@ -215,6 +228,44 @@ pub fn join_library_names(doc: &mut RefinedDoc, vp: &super::voiceprints::Voicepr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{ensure_graph_ids, evidence_id};
+
+    #[test]
+    fn schema_v1_defaults_graph_fields() {
+        let legacy = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-01T09:00:00+08:00",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [{
+                "speaker": "S1", "start_ms": 0, "end_ms": 500,
+                "text": "灯塔计划启动", "source_seqs": [7],
+                "mentions": [{ "entity": "ent_1", "start": 0, "end": 4 }]
+            }]
+        }"#;
+        let mut doc: RefinedDoc = serde_json::from_str(legacy).unwrap();
+
+        ensure_graph_ids("note-1", &mut doc);
+        let first_id = doc.paragraphs[0].mentions[0].id.clone();
+        ensure_graph_ids("note-1", &mut doc);
+
+        assert_eq!(doc.stages.relations, "off");
+        assert!(doc.graph_extraction.is_none());
+        assert!(doc.relations.is_empty());
+        assert!(doc.paragraphs[0].mentions[0].id.starts_with("mn_"));
+        assert_eq!(doc.paragraphs[0].mentions[0].id, first_id);
+        assert_eq!(doc.paragraphs[0].mentions[0].id.len(), 27);
+    }
+
+    #[test]
+    fn evidence_ids_include_normalized_quote() {
+        let first = evidence_id("note-1", &[7], 1, 3, "  灯塔   计划 ");
+        let same_normalized = evidence_id("note-1", &[7], 1, 3, "灯塔 计划");
+        let changed_quote = evidence_id("note-1", &[7], 1, 3, "灯塔项目");
+
+        assert_eq!(first, same_normalized);
+        assert_ne!(first, changed_quote);
+    }
 
     #[test]
     fn roundtrip_and_corrupt_returns_none() {
@@ -224,9 +275,11 @@ mod tests {
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
             llm_model: Some("deepseek-chat".into()),
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![1, 2],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
@@ -300,6 +353,7 @@ mod tests {
                 recluster: "done".into(),
                 llm: "off".into(),
                 entities: "off".into(),
+                relations: "off".into(),
             },
             discarded_seqs: vec![],
             entities: vec![Entity {
@@ -316,8 +370,10 @@ mod tests {
                 end_ms: 1000,
                 text: "灯塔计划下周启动".into(),
                 source_seqs: vec![0],
-                mentions: vec![Mention { entity: "ent_1".into(), start: 0, end: 4 }],
+                mentions: vec![Mention { id: "mn_000000000000000000000000".into(), entity: "ent_1".into(), start: 0, end: 4 }],
             }],
+            graph_extraction: None,
+            relations: vec![],
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
         let back = load_refined(dir.path()).unwrap();
@@ -380,9 +436,11 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -482,9 +540,11 @@ mod tests {
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into() },
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
             entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留
