@@ -124,6 +124,11 @@ struct RelationKey {
     object_id: String,
 }
 
+struct ModelRelationGroup {
+    relation: CanonicalRelation,
+    raw_ids: BTreeSet<String>,
+}
+
 pub fn reconcile_registry(data_root: &Path) -> anyhow::Result<KnowledgeLedger> {
     overrides::update(data_root, |ledger| {
         let documents = scan_documents(data_root)?;
@@ -344,6 +349,7 @@ pub fn build_canonical_graph(
             )
         })
         .collect();
+    let mut model_groups: BTreeMap<(RelationKey, String), ModelRelationGroup> = BTreeMap::new();
     let mut relation_groups: BTreeMap<(RelationKey, String), CanonicalRelation> = BTreeMap::new();
     let evidence_catalog = collect_evidence_catalog(&documents);
     for document in documents
@@ -354,15 +360,22 @@ pub fn build_canonical_graph(
             project_model_relation(
                 &document,
                 relation,
-                &snapshot,
-                &people,
                 &mention_index,
-                &mut relation_groups,
+                &mut model_groups,
                 &mut pending,
                 now,
             );
         }
     }
+    project_model_groups(
+        model_groups,
+        &snapshot,
+        &people,
+        &mention_index,
+        &mut relation_groups,
+        &mut pending,
+        now,
+    );
     project_created_relations(
         &snapshot,
         &people,
@@ -388,7 +401,11 @@ pub fn build_canonical_graph(
     for relation in candidates {
         let time_conflict = conflicting_ids.contains(&relation.id);
         let tier = canonical_publish_tier(&relation, time_conflict);
-        let tier = if relation.origin == RelationOrigin::UserAssertion {
+        let human_decision = matches!(
+            relation.origin,
+            RelationOrigin::Confirmed | RelationOrigin::Manual | RelationOrigin::UserAssertion
+        );
+        let tier = if human_decision && !time_conflict && tier == PublishTier::Pending {
             PublishTier::Published
         } else {
             tier
@@ -418,10 +435,8 @@ pub fn build_canonical_graph(
 fn project_model_relation(
     document: &ScannedDocument,
     source: &RelationFact,
-    snapshot: &resolve::ResolverSnapshot,
-    people: &store::Voiceprints,
     mentions: &BTreeMap<(String, String), CanonicalMention>,
-    groups: &mut BTreeMap<(RelationKey, String), CanonicalRelation>,
+    groups: &mut BTreeMap<(RelationKey, String), ModelRelationGroup>,
     pending: &mut Vec<PendingItem>,
     now: DateTime<FixedOffset>,
 ) {
@@ -503,64 +518,8 @@ fn project_model_relation(
         }
     }
 
-    for ((mut subject_id, mut object_id), mut evidence) in split {
-        let mut predicate = source.predicate.clone();
-        let mut valid_from = source.valid_from.clone();
-        let mut valid_to = source.valid_to.clone();
-        let mut origin = if snapshot.relation_decisions.confirmed.contains(&source.id) {
-            RelationOrigin::Confirmed
-        } else {
-            RelationOrigin::Model
-        };
-        if let Some(edit) = snapshot.relation_decisions.edited.get(&source.id) {
-            let subject = resolve::resolve_reference_id(snapshot, people, &edit.subject_id);
-            let object = resolve::resolve_reference_id(snapshot, people, &edit.object_id);
-            let (Some(edited_subject), Some(edited_object)) = (subject.entity_id, object.entity_id)
-            else {
-                pending.push(PendingItem::IdentityConflict {
-                    note_id: document.note_id.clone(),
-                    local_entity_id: source.id.clone(),
-                    candidates: subject
-                        .candidates
-                        .into_iter()
-                        .chain(object.candidates)
-                        .collect(),
-                    reason: "edited relation references an unresolved entity".into(),
-                });
-                continue;
-            };
-            subject_id = edited_subject;
-            predicate = edit.predicate.clone();
-            object_id = edited_object;
-            valid_from = edit.valid_from.clone();
-            valid_to = edit.valid_to.clone();
-            origin = RelationOrigin::Manual;
-            for item in &mut evidence {
-                let mut mention_ids = item.subject_mentions.clone();
-                mention_ids.extend(item.object_mentions.clone());
-                mention_ids.sort();
-                mention_ids.dedup();
-                item.subject_mentions = mention_ids
-                    .iter()
-                    .filter(|mention_id| {
-                        mentions
-                            .get(&(document.note_id.clone(), (*mention_id).clone()))
-                            .is_some_and(|mention| mention.entity_id == subject_id)
-                    })
-                    .cloned()
-                    .collect();
-                item.object_mentions = mention_ids
-                    .iter()
-                    .filter(|mention_id| {
-                        mentions
-                            .get(&(document.note_id.clone(), (*mention_id).clone()))
-                            .is_some_and(|mention| mention.entity_id == object_id)
-                    })
-                    .cloned()
-                    .collect();
-            }
-        }
-        let predicate = match normalized_predicate(&predicate) {
+    for ((subject_id, object_id), mut evidence) in split {
+        let predicate = match normalized_predicate(&source.predicate) {
             Ok(predicate) => predicate,
             Err(()) => {
                 pending.push(PendingItem::RelationReview {
@@ -570,34 +529,16 @@ fn project_model_relation(
                 continue;
             }
         };
-        if is_suppressed(snapshot, people, &subject_id, &predicate, &object_id) {
-            continue;
-        }
-        let pre_end_relation_id = canonical_relation_id(
-            &subject_id,
-            &predicate,
-            &object_id,
-            valid_from.as_deref(),
-            valid_to.as_deref(),
-        );
-        if let Some(ended) = snapshot
-            .relation_decisions
-            .ended
-            .get(&source.id)
-            .or_else(|| snapshot.relation_decisions.ended.get(&pre_end_relation_id))
-        {
-            valid_to = Some(ended.clone());
-        }
         canonicalize_evidence(&mut evidence);
         let relation_id = canonical_relation_id(
             &subject_id,
             &predicate,
             &object_id,
-            valid_from.as_deref(),
-            valid_to.as_deref(),
+            source.valid_from.as_deref(),
+            source.valid_to.as_deref(),
         );
         let extraction = document.doc.graph_extraction.as_ref();
-        insert_relation(
+        insert_model_relation(
             groups,
             CanonicalRelation {
                 id: relation_id,
@@ -605,15 +546,16 @@ fn project_model_relation(
                 predicate,
                 object_id,
                 confidence: source.confidence,
-                valid_from,
-                valid_to: valid_to.clone(),
-                status: relation_status(valid_to.as_deref(), now),
-                origin,
+                valid_from: source.valid_from.clone(),
+                valid_to: source.valid_to.clone(),
+                status: relation_status(source.valid_to.as_deref(), now),
+                origin: RelationOrigin::Model,
                 provider: extraction.map(|value| value.provider.clone()),
                 model: extraction.map(|value| value.model.clone()),
                 note_ids: vec![document.note_id.clone()],
                 evidence,
             },
+            source.id.clone(),
         );
     }
 }
@@ -770,36 +712,274 @@ fn insert_relation(
     groups: &mut BTreeMap<(RelationKey, String), CanonicalRelation>,
     relation: CanonicalRelation,
 ) {
-    let key = RelationKey {
-        subject_id: relation.subject_id.clone(),
-        predicate_type: relation.predicate.kind.clone(),
-        predicate_label: relation.predicate.label.clone(),
-        object_id: relation.object_id.clone(),
-    };
-    let temporal = format!(
-        "{}\0{}",
-        relation.valid_from.as_deref().unwrap_or_default(),
-        relation.valid_to.as_deref().unwrap_or_default()
-    );
+    let (key, temporal) = relation_group_key(&relation);
     match groups.get_mut(&(key.clone(), temporal.clone())) {
-        Some(existing) => {
-            existing.confidence = existing.confidence.max(relation.confidence);
-            existing.note_ids.extend(relation.note_ids);
-            existing.note_ids.sort();
-            existing.note_ids.dedup();
-            existing.evidence.extend(relation.evidence);
-            existing
-                .evidence
-                .sort_by(|left, right| left.id.cmp(&right.id));
-            existing
-                .evidence
-                .dedup_by(|left, right| left.id == right.id);
-            if relation.origin as u8 > existing.origin as u8 {
-                existing.origin = relation.origin;
-            }
-        }
+        Some(existing) => merge_relation(existing, relation),
         None => {
             groups.insert((key, temporal), relation);
+        }
+    }
+}
+
+fn insert_model_relation(
+    groups: &mut BTreeMap<(RelationKey, String), ModelRelationGroup>,
+    relation: CanonicalRelation,
+    raw_id: String,
+) {
+    let (key, temporal) = relation_group_key(&relation);
+    match groups.get_mut(&(key.clone(), temporal.clone())) {
+        Some(existing) => {
+            merge_relation(&mut existing.relation, relation);
+            existing.raw_ids.insert(raw_id);
+        }
+        None => {
+            groups.insert(
+                (key, temporal),
+                ModelRelationGroup {
+                    relation,
+                    raw_ids: BTreeSet::from([raw_id]),
+                },
+            );
+        }
+    }
+}
+
+fn relation_group_key(relation: &CanonicalRelation) -> (RelationKey, String) {
+    (
+        RelationKey {
+            subject_id: relation.subject_id.clone(),
+            predicate_type: relation.predicate.kind.clone(),
+            predicate_label: relation.predicate.label.clone(),
+            object_id: relation.object_id.clone(),
+        },
+        format!(
+            "{}\0{}",
+            relation.valid_from.as_deref().unwrap_or_default(),
+            relation.valid_to.as_deref().unwrap_or_default()
+        ),
+    )
+}
+
+fn merge_relation(existing: &mut CanonicalRelation, relation: CanonicalRelation) {
+    existing.confidence = existing.confidence.max(relation.confidence);
+    existing.note_ids.extend(relation.note_ids);
+    existing.note_ids.sort();
+    existing.note_ids.dedup();
+    existing.evidence.extend(relation.evidence);
+    canonicalize_evidence(&mut existing.evidence);
+    if relation.origin as u8 > existing.origin as u8 {
+        existing.origin = relation.origin;
+    }
+}
+
+fn project_model_groups(
+    groups: BTreeMap<(RelationKey, String), ModelRelationGroup>,
+    snapshot: &resolve::ResolverSnapshot,
+    people: &store::Voiceprints,
+    mentions: &BTreeMap<(String, String), CanonicalMention>,
+    output: &mut BTreeMap<(RelationKey, String), CanonicalRelation>,
+    pending: &mut Vec<PendingItem>,
+    now: DateTime<FixedOffset>,
+) {
+    for mut group in groups.into_values() {
+        let mut aliases = historical_relation_aliases(&group.relation, snapshot, people);
+        aliases.extend(group.raw_ids);
+        if !apply_relation_events(
+            &mut group.relation,
+            &mut aliases,
+            snapshot,
+            people,
+            mentions,
+            pending,
+            now,
+        ) {
+            continue;
+        }
+        if is_suppressed(
+            snapshot,
+            people,
+            &group.relation.subject_id,
+            &group.relation.predicate,
+            &group.relation.object_id,
+        ) {
+            continue;
+        }
+        insert_relation(output, group.relation);
+    }
+}
+
+fn apply_relation_events(
+    relation: &mut CanonicalRelation,
+    aliases: &mut BTreeSet<String>,
+    snapshot: &resolve::ResolverSnapshot,
+    people: &store::Voiceprints,
+    mentions: &BTreeMap<(String, String), CanonicalMention>,
+    pending: &mut Vec<PendingItem>,
+    now: DateTime<FixedOffset>,
+) -> bool {
+    aliases.insert(relation.id.clone());
+    for event in &snapshot.relation_decisions.events {
+        match event {
+            resolve::RelationEvent::Confirm { relation_id } if aliases.contains(relation_id) => {
+                if relation.origin == RelationOrigin::Model {
+                    relation.origin = RelationOrigin::Confirmed;
+                }
+            }
+            resolve::RelationEvent::Edit { relation_id, edit } if aliases.contains(relation_id) => {
+                let subject = resolve::resolve_reference_id(snapshot, people, &edit.subject_id);
+                let object = resolve::resolve_reference_id(snapshot, people, &edit.object_id);
+                let (Some(subject_id), Some(object_id)) = (subject.entity_id, object.entity_id)
+                else {
+                    pending.push(PendingItem::IdentityConflict {
+                        note_id: relation.note_ids.first().cloned().unwrap_or_default(),
+                        local_entity_id: relation_id.clone(),
+                        candidates: subject
+                            .candidates
+                            .into_iter()
+                            .chain(object.candidates)
+                            .collect(),
+                        reason: "edited relation references an unresolved entity".into(),
+                    });
+                    return false;
+                };
+                relation.subject_id = subject_id;
+                relation.predicate = match normalized_predicate(&edit.predicate) {
+                    Ok(predicate) => predicate,
+                    Err(()) => {
+                        pending.push(PendingItem::RelationReview {
+                            note_id: relation.note_ids.first().cloned().unwrap_or_default(),
+                            relation_id: relation_id.clone(),
+                        });
+                        return false;
+                    }
+                };
+                relation.object_id = object_id;
+                relation.valid_from = edit.valid_from.clone();
+                relation.valid_to = edit.valid_to.clone();
+                relation.origin = RelationOrigin::Manual;
+                redirect_evidence_mentions(relation, mentions);
+                relation.id = canonical_relation_id(
+                    &relation.subject_id,
+                    &relation.predicate,
+                    &relation.object_id,
+                    relation.valid_from.as_deref(),
+                    relation.valid_to.as_deref(),
+                );
+                aliases.extend(historical_relation_aliases(relation, snapshot, people));
+                aliases.insert(relation.id.clone());
+            }
+            resolve::RelationEvent::End {
+                relation_id,
+                valid_to,
+            } if aliases.contains(relation_id) => {
+                relation.valid_to = Some(valid_to.clone());
+                relation.id = canonical_relation_id(
+                    &relation.subject_id,
+                    &relation.predicate,
+                    &relation.object_id,
+                    relation.valid_from.as_deref(),
+                    relation.valid_to.as_deref(),
+                );
+                aliases.insert(relation.id.clone());
+            }
+            _ => {}
+        }
+    }
+    relation.status = relation_status(relation.valid_to.as_deref(), now);
+    true
+}
+
+fn redirect_evidence_mentions(
+    relation: &mut CanonicalRelation,
+    mentions: &BTreeMap<(String, String), CanonicalMention>,
+) {
+    for evidence in &mut relation.evidence {
+        let mut mention_ids = evidence.subject_mentions.clone();
+        mention_ids.extend(evidence.object_mentions.clone());
+        mention_ids.sort();
+        mention_ids.dedup();
+        evidence.subject_mentions = mention_ids
+            .iter()
+            .filter(|mention_id| {
+                mentions
+                    .get(&(evidence.note_id.clone(), (*mention_id).clone()))
+                    .is_some_and(|mention| mention.entity_id == relation.subject_id)
+            })
+            .cloned()
+            .collect();
+        evidence.object_mentions = mention_ids
+            .iter()
+            .filter(|mention_id| {
+                mentions
+                    .get(&(evidence.note_id.clone(), (*mention_id).clone()))
+                    .is_some_and(|mention| mention.entity_id == relation.object_id)
+            })
+            .cloned()
+            .collect();
+    }
+}
+
+fn historical_relation_aliases(
+    relation: &CanonicalRelation,
+    snapshot: &resolve::ResolverSnapshot,
+    people: &store::Voiceprints,
+) -> BTreeSet<String> {
+    let subjects = historical_endpoint_aliases(&relation.subject_id, snapshot, people);
+    let objects = historical_endpoint_aliases(&relation.object_id, snapshot, people);
+    subjects
+        .iter()
+        .flat_map(|subject| {
+            objects.iter().map(move |object| {
+                canonical_relation_id(
+                    subject,
+                    &relation.predicate,
+                    object,
+                    relation.valid_from.as_deref(),
+                    relation.valid_to.as_deref(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn historical_endpoint_aliases(
+    terminal: &str,
+    snapshot: &resolve::ResolverSnapshot,
+    people: &store::Voiceprints,
+) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::from([terminal.to_string()]);
+    candidates.extend(snapshot.registry.keys().cloned());
+    candidates.extend(snapshot.redirects.keys().cloned());
+    candidates.extend(snapshot.redirects.values().cloned());
+    candidates.extend(people.people.keys().cloned());
+    candidates.extend(people.redirects.keys().cloned());
+    candidates.extend(people.redirects.values().cloned());
+    let mut aliases: BTreeSet<_> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            resolve::resolve_reference_id(snapshot, people, candidate)
+                .entity_id
+                .as_deref()
+                == Some(terminal)
+        })
+        .collect();
+    let mut edges = snapshot.redirect_history.clone();
+    edges.extend(
+        people
+            .redirects
+            .iter()
+            .map(|(source, target)| (source.clone(), target.clone())),
+    );
+    loop {
+        let before = aliases.len();
+        for (source, target) in &edges {
+            if aliases.contains(source) || aliases.contains(target) {
+                aliases.insert(source.clone());
+                aliases.insert(target.clone());
+            }
+        }
+        if aliases.len() == before {
+            return aliases;
         }
     }
 }
@@ -845,9 +1025,6 @@ fn project_created_relations(
             });
             continue;
         };
-        if is_suppressed(snapshot, people, &subject_id, &predicate, &object_id) {
-            continue;
-        }
         let mut evidence: Vec<_> = relation
             .evidence_ids
             .iter()
@@ -884,29 +1061,14 @@ fn project_created_relations(
         }
         canonicalize_evidence(&mut evidence);
         let valid_from = relation.valid_from.clone();
-        let mut valid_to = relation.valid_to.clone();
-        let original_pre_end_id = canonical_relation_id(
+        let valid_to = relation.valid_to.clone();
+        let original_id = canonical_relation_id(
             &relation.subject_id,
             &predicate,
             &relation.object_id,
             valid_from.as_deref(),
             valid_to.as_deref(),
         );
-        let canonical_pre_end_id = canonical_relation_id(
-            &subject_id,
-            &predicate,
-            &object_id,
-            valid_from.as_deref(),
-            valid_to.as_deref(),
-        );
-        if let Some(ended) = snapshot
-            .relation_decisions
-            .ended
-            .get(&original_pre_end_id)
-            .or_else(|| snapshot.relation_decisions.ended.get(&canonical_pre_end_id))
-        {
-            valid_to = Some(ended.clone());
-        }
         let id = canonical_relation_id(
             &subject_id,
             &predicate,
@@ -917,28 +1079,48 @@ fn project_created_relations(
         let mut note_ids: Vec<_> = evidence.iter().map(|item| item.note_id.clone()).collect();
         note_ids.sort();
         note_ids.dedup();
-        insert_relation(
-            groups,
-            CanonicalRelation {
-                id,
-                subject_id,
-                predicate,
-                object_id,
-                confidence: 1.0,
-                valid_from,
-                valid_to: valid_to.clone(),
-                status: relation_status(valid_to.as_deref(), now),
-                origin: if relation.user_assertion {
-                    RelationOrigin::UserAssertion
-                } else {
-                    RelationOrigin::Manual
-                },
-                provider: None,
-                model: None,
-                note_ids,
-                evidence,
+        let mut canonical = CanonicalRelation {
+            id,
+            subject_id,
+            predicate,
+            object_id,
+            confidence: 1.0,
+            valid_from,
+            valid_to: valid_to.clone(),
+            status: relation_status(valid_to.as_deref(), now),
+            origin: if relation.user_assertion {
+                RelationOrigin::UserAssertion
+            } else {
+                RelationOrigin::Manual
             },
-        );
+            provider: None,
+            model: None,
+            note_ids,
+            evidence,
+        };
+        let mut aliases = historical_relation_aliases(&canonical, snapshot, people);
+        aliases.insert(original_id);
+        if !apply_relation_events(
+            &mut canonical,
+            &mut aliases,
+            snapshot,
+            people,
+            mentions,
+            pending,
+            now,
+        ) {
+            continue;
+        }
+        if is_suppressed(
+            snapshot,
+            people,
+            &canonical.subject_id,
+            &canonical.predicate,
+            &canonical.object_id,
+        ) {
+            continue;
+        }
+        insert_relation(groups, canonical);
     }
 }
 
@@ -1264,79 +1446,130 @@ fn load_document(note_dir: PathBuf, note_id: String) -> Result<ScannedDocument, 
         message: error.to_string(),
     })?;
     store::ensure_graph_ids(&note_id, &mut doc);
-    let validation_relations = relations_for_document_validation(&note_id, &doc);
-    store::aing_graph::validate_graph(&note_id, &doc, validation_relations).map_err(|issues| {
-        InvalidDocument {
-            note_id: note_id.clone(),
-            message: issues
-                .into_iter()
-                .map(|issue| format!("{}: {}", issue.field, issue.message))
-                .collect::<Vec<_>>()
-                .join("; "),
-        }
+    normalize_document_graph(&note_id, &mut doc).map_err(|issues| InvalidDocument {
+        note_id: note_id.clone(),
+        message: issues
+            .into_iter()
+            .map(|issue| format!("{}: {}", issue.field, issue.message))
+            .collect::<Vec<_>>()
+            .join("; "),
     })?;
     Ok(ScannedDocument { note_id, doc })
 }
 
-// Provenance staleness is a canonicalization concern: validate the complete Task 2 relation
-// contract against a temporary current-position projection, while retaining the stored spans for
-// resolve_evidence to classify as current, uniquely relocatable, ambiguous, or stale.
-fn relations_for_document_validation(note_id: &str, doc: &RefinedDoc) -> Vec<RelationFact> {
-    let mention_ids: BTreeMap<_, _> = doc
-        .paragraphs
-        .iter()
-        .flat_map(|paragraph| {
-            paragraph.mentions.iter().map(move |mention| {
-                (
-                    mention.id.clone(),
-                    store::mention_id(
-                        note_id,
-                        paragraph,
-                        &mention.entity,
-                        mention.start,
-                        mention.end,
-                    ),
-                )
-            })
-        })
-        .collect();
-    let mut relations = doc.relations.clone();
-    for relation in &mut relations {
-        for mention_id in relation
-            .subject_mentions
-            .iter_mut()
-            .chain(relation.object_mentions.iter_mut())
-        {
-            if let Some(current_id) = mention_ids.get(mention_id) {
-                *mention_id = current_id.clone();
-            }
+// Consume Task 2 semantic/ID normalization, but restore the original provenance fields afterward
+// so Task 4 remains solely responsible for current/relocated/ambiguous/stale classification.
+fn normalize_document_graph(
+    note_id: &str,
+    doc: &mut RefinedDoc,
+) -> Result<(), Vec<store::aing_graph::ValidationIssue>> {
+    let mut mention_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for paragraph in &mut doc.paragraphs {
+        let identity = paragraph.clone();
+        for mention in &mut paragraph.mentions {
+            let original = mention.id.clone();
+            let normalized = store::mention_id(
+                note_id,
+                &identity,
+                &mention.entity,
+                mention.start,
+                mention.end,
+            );
+            mention_ids
+                .entry((original, mention.entity.clone()))
+                .or_default()
+                .push(normalized.clone());
+            mention.id = normalized;
         }
-        for evidence in &mut relation.evidence {
-            let current = doc
-                .paragraphs
-                .get(evidence.paragraph_index)
-                .is_some_and(|paragraph| {
-                    !evidence.source_seqs.is_empty()
-                        && evidence
-                            .source_seqs
-                            .iter()
-                            .all(|seq| paragraph.source_seqs.contains(seq))
-                        && char_slice(&paragraph.text, evidence.start, evidence.end).as_deref()
-                            == Some(evidence.quote.as_str())
-                });
-            if current {
-                continue;
-            }
-            if let Some((paragraph_index, start, end)) =
-                first_evidence_match(doc, &evidence.quote, &evidence.source_seqs)
-            {
+    }
+
+    let mut validation_doc = doc.clone();
+    let mut validation_relations = doc.relations.clone();
+    let mut original_evidence = BTreeMap::new();
+    let mut synthetic_index = 0_u64;
+    for (relation_index, relation) in validation_relations.iter_mut().enumerate() {
+        relation.subject_mentions = normalize_mention_references(
+            &relation.subject_mentions,
+            &relation.subject,
+            &mention_ids,
+        );
+        relation.object_mentions =
+            normalize_mention_references(&relation.object_mentions, &relation.object, &mention_ids);
+        for (evidence_index, evidence) in relation.evidence.iter_mut().enumerate() {
+            let original = evidence.clone();
+            let location = evidence_location_for_validation(doc, evidence);
+            if let Some((paragraph_index, start, end)) = location {
                 evidence.paragraph_index = paragraph_index;
                 evidence.start = start;
                 evidence.end = end;
+            } else {
+                synthetic_index += 1;
+                let quote = format!("semantic evidence {relation_index} {evidence_index}");
+                let source_seq = u64::MAX - synthetic_index;
+                let paragraph_index = validation_doc.paragraphs.len();
+                validation_doc.paragraphs.push(store::RefinedParagraph {
+                    speaker: "validation".into(),
+                    name: None,
+                    person_id: None,
+                    start_ms: 0,
+                    end_ms: 0,
+                    text: quote.clone(),
+                    source_seqs: vec![source_seq],
+                    mentions: Vec::new(),
+                });
+                evidence.paragraph_index = paragraph_index;
+                evidence.start = 0;
+                evidence.end = quote.chars().count();
+                evidence.quote = quote;
+                evidence.source_seqs = vec![source_seq];
+            }
+            evidence.source_seqs.sort_unstable();
+            evidence.source_seqs.dedup();
+            let normalized_id = store::evidence_id(
+                note_id,
+                &evidence.source_seqs,
+                evidence.start,
+                evidence.end,
+                &evidence.quote,
+            );
+            original_evidence.insert(normalized_id, original);
+        }
+    }
+
+    let mut validated =
+        store::aing_graph::validate_graph(note_id, &validation_doc, validation_relations)?;
+    for relation in &mut validated.relations {
+        for evidence in &mut relation.evidence {
+            if let Some(original) = original_evidence.get(&evidence.id) {
+                let normalized_id = evidence.id.clone();
+                *evidence = original.clone();
+                evidence.id = normalized_id;
+                evidence.source_seqs.sort_unstable();
+                evidence.source_seqs.dedup();
             }
         }
     }
-    relations
+    doc.relations = validated.relations;
+    Ok(())
+}
+
+fn normalize_mention_references(
+    references: &[String],
+    entity_id: &str,
+    mention_ids: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<String> {
+    let mut normalized: Vec<_> = references
+        .iter()
+        .flat_map(|reference| {
+            mention_ids
+                .get(&(reference.clone(), entity_id.to_string()))
+                .cloned()
+                .unwrap_or_else(|| vec![reference.clone()])
+        })
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn first_evidence_match(
@@ -1366,6 +1599,25 @@ fn first_evidence_match(
         }
     }
     None
+}
+
+fn evidence_location_for_validation(
+    doc: &RefinedDoc,
+    evidence: &store::RelationEvidence,
+) -> Option<(usize, usize, usize)> {
+    doc.paragraphs
+        .get(evidence.paragraph_index)
+        .filter(|paragraph| {
+            !evidence.source_seqs.is_empty()
+                && evidence
+                    .source_seqs
+                    .iter()
+                    .all(|seq| paragraph.source_seqs.contains(seq))
+                && char_slice(&paragraph.text, evidence.start, evidence.end).as_deref()
+                    == Some(evidence.quote.as_str())
+        })
+        .map(|_| (evidence.paragraph_index, evidence.start, evidence.end))
+        .or_else(|| first_evidence_match(doc, &evidence.quote, &evidence.source_seqs))
 }
 
 fn document_note_id(document: &Result<ScannedDocument, InvalidDocument>) -> &str {
@@ -2919,6 +3171,324 @@ mod tests {
             PendingItem::InvalidDocument { note_id, message }
                 if note_id == "invalid" && message.contains("predicate")
         )));
+    }
+
+    #[test]
+    fn stale_no_match_is_relation_pending_but_raw_only_is_silent() {
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        for (note_id, confidence, expect_pending) in [("pending", 0.9, true), ("raw", 0.4, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let mut document = relation_doc(note_id, confidence);
+            let evidence = &mut document.relations[0].evidence[0];
+            evidence.paragraph_index = 99;
+            evidence.start = 99;
+            evidence.end = 120;
+            evidence.quote = "quote absent from every paragraph".into();
+            evidence.source_hash = "stale".into();
+            write_note(root.path(), note_id, &document);
+            let ledger = reconcile_registry(root.path()).unwrap();
+            let graph = build_canonical_graph(root.path(), &ledger, now).unwrap();
+            assert!(graph.relations.is_empty());
+            assert_eq!(
+                graph
+                    .pending
+                    .iter()
+                    .any(|item| matches!(item, PendingItem::StaleEvidence { .. })),
+                expect_pending
+            );
+            assert!(!graph
+                .pending
+                .iter()
+                .any(|item| matches!(item, PendingItem::InvalidDocument { .. })));
+            if !expect_pending {
+                assert!(graph.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn visible_and_raw_alias_decisions_apply_once_to_a_multi_note_group() {
+        let root = tempfile::tempdir().unwrap();
+        let first = relation_doc("n1", 0.6);
+        let second = relation_doc("n2", 0.6);
+        let second_raw_id = second.relations[0].id.clone();
+        write_note(root.path(), "n1", &first);
+        write_note(root.path(), "n2", &second);
+        let mut ledger = reconcile_registry(root.path()).unwrap();
+        let first_project = ledger.legacy_ids["n1/ent_project"].clone();
+        let second_project = ledger.legacy_ids["n2/ent_project"].clone();
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge_note_projects".into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String(first_project.clone()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: second_project,
+                target_id: first_project,
+            },
+        });
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let undecided = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(undecided.relations.len(), 1, "{:?}", undecided.relations);
+        assert_eq!(undecided.relations[0].note_ids, vec!["n1", "n2"]);
+        let visible_id = undecided.relations[0].id.clone();
+
+        for (operation_id, decision_id) in [
+            ("confirm_visible", visible_id),
+            ("confirm_raw", second_raw_id),
+        ] {
+            let mut confirmed = ledger.clone();
+            confirmed.operations.push(KnowledgeOperation {
+                id: operation_id.into(),
+                at: "2026-07-21T00:00:00Z".into(),
+                before: serde_json::Value::Null,
+                after: serde_json::Value::Null,
+                action: KnowledgeAction::ConfirmRelation {
+                    relation_id: decision_id,
+                },
+            });
+            let graph = build_canonical_graph(root.path(), &confirmed, now).unwrap();
+            assert_eq!(graph.relations.len(), 1);
+            assert_eq!(graph.relations[0].origin, RelationOrigin::Confirmed);
+            assert_eq!(graph.relations[0].note_ids, vec!["n1", "n2"]);
+            assert!(!graph
+                .pending
+                .iter()
+                .any(|item| matches!(item, PendingItem::RelationReview { .. })));
+        }
+
+        let project_id = ledger.legacy_ids["n1/ent_project"].clone();
+        let person_id = ledger.legacy_ids["n1/P1"].clone();
+        let mut edited = ledger;
+        edited.operations.push(KnowledgeOperation {
+            id: "edit_visible".into(),
+            at: "2026-07-21T00:00:00Z".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EditRelation {
+                relation_id: undecided.relations[0].id.clone(),
+                subject_id: project_id,
+                predicate: RelationPredicate {
+                    kind: "uses".into(),
+                    label: None,
+                },
+                object_id: person_id,
+                valid_from: None,
+                valid_to: None,
+                note: None,
+            },
+        });
+        let graph = build_canonical_graph(root.path(), &edited, now).unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.relations[0].origin, RelationOrigin::Manual);
+        assert_eq!(graph.relations[0].note_ids, vec!["n1", "n2"]);
+        assert!(!graph
+            .pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::RelationReview { .. })));
+    }
+
+    #[test]
+    fn end_matches_historical_visible_ids_across_later_redirects_and_restore_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_a", "kg_b", "kg_mid", "kg_c"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "term".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        let predicate = RelationPredicate {
+            kind: "uses".into(),
+            label: None,
+        };
+        push_user_relation(
+            &mut ledger,
+            "create",
+            super::super::overrides::UserRelation {
+                subject_id: "kg_a".into(),
+                predicate: predicate.clone(),
+                object_id: "kg_b".into(),
+                valid_from: None,
+                valid_to: None,
+                note: None,
+                evidence_ids: Vec::new(),
+                user_assertion: true,
+            },
+        );
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge_b_mid".into(),
+            at: "t1".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String("kg_mid".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_b".into(),
+                target_id: "kg_mid".into(),
+            },
+        });
+        let intermediate_id = canonical_relation_id("kg_a", &predicate, "kg_mid", None, None);
+        ledger.operations.push(KnowledgeOperation {
+            id: "end_mid".into(),
+            at: "t2".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EndRelation {
+                relation_id: intermediate_id,
+                valid_to: "2026-07-20T00:00:00Z".into(),
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge_mid_c".into(),
+            at: "t3".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String("kg_c".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_mid".into(),
+                target_id: "kg_c".into(),
+            },
+        });
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let ended = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(ended.relations[0].object_id, "kg_c");
+        assert_eq!(ended.relations[0].status, RelationStatus::Historical);
+
+        ledger.operations.push(KnowledgeOperation {
+            id: "restore".into(),
+            at: "t4".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::RestoreRelation {
+                operation_id: "end_mid".into(),
+            },
+        });
+        assert_eq!(
+            build_canonical_graph(root.path(), &ledger, now)
+                .unwrap()
+                .relations[0]
+                .status,
+            RelationStatus::Current
+        );
+        ledger.operations.push(KnowledgeOperation {
+            id: "undo_restore".into(),
+            at: "t5".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::Undo {
+                operation_id: "restore".into(),
+            },
+        });
+        assert_eq!(
+            build_canonical_graph(root.path(), &ledger, now)
+                .unwrap()
+                .relations[0]
+                .status,
+            RelationStatus::Historical
+        );
+    }
+
+    #[test]
+    fn model_visible_end_survives_a_later_endpoint_merge() {
+        let root = tempfile::tempdir().unwrap();
+        write_note(root.path(), "n1", &relation_doc("n1", 0.9));
+        let mut ledger = reconcile_registry(root.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap();
+        let visible_id = build_canonical_graph(root.path(), &ledger, now)
+            .unwrap()
+            .relations[0]
+            .id
+            .clone();
+        let old_project = ledger.legacy_ids["n1/ent_project"].clone();
+        ledger.registry.insert(
+            "kg_new_project".into(),
+            RegistryEntity {
+                kind: "project".into(),
+                name: "New project".into(),
+                aliases: Vec::new(),
+                status: "confirmed".into(),
+            },
+        );
+        ledger.operations.push(KnowledgeOperation {
+            id: "end_visible".into(),
+            at: "t1".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EndRelation {
+                relation_id: visible_id,
+                valid_to: "2026-07-20T00:00:00Z".into(),
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge_after_end".into(),
+            at: "t2".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String("kg_new_project".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: old_project,
+                target_id: "kg_new_project".into(),
+            },
+        });
+
+        let graph = build_canonical_graph(root.path(), &ledger, now).unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.relations[0].object_id, "kg_new_project");
+        assert_eq!(graph.relations[0].status, RelationStatus::Historical);
+    }
+
+    #[test]
+    fn task2_normalized_ids_replace_forged_relation_and_evidence_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let mut forged = split_relation_doc("n1");
+        forged.relations[0].id = "rf_forged".into();
+        for evidence in &mut forged.relations[0].evidence {
+            evidence.id = "ev_forged".into();
+        }
+        let expected =
+            store::aing_graph::validate_graph("n1", &forged, forged.relations.clone()).unwrap();
+        let expected_raw_id = expected.relations[0].id.clone();
+        assert_ne!(expected_raw_id, "rf_forged");
+        assert_eq!(
+            expected.relations[0]
+                .evidence
+                .iter()
+                .map(|evidence| &evidence.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        write_note(root.path(), "n1", &forged);
+        let mut ledger = reconcile_registry(root.path()).unwrap();
+        ledger.operations.push(KnowledgeOperation {
+            id: "confirm_normalized".into(),
+            at: "t".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::ConfirmRelation {
+                relation_id: expected_raw_id,
+            },
+        });
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(graph.relations.len(), 1);
+        assert_eq!(graph.relations[0].origin, RelationOrigin::Confirmed);
+        assert_eq!(graph.relations[0].evidence.len(), 2);
+        assert_eq!(
+            graph.relations[0]
+                .evidence
+                .iter()
+                .map(|evidence| &evidence.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
     }
 
     #[cfg(unix)]

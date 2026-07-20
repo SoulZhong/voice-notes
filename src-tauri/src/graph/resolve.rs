@@ -11,6 +11,7 @@ pub struct ResolverSnapshot {
     pub redirects: BTreeMap<String, String>,
     pub mention_bindings: BTreeMap<String, String>,
     pub relation_decisions: RelationDecisions,
+    pub redirect_history: Vec<(String, String)>,
     legacy_ids: BTreeMap<String, String>,
 }
 
@@ -22,6 +23,22 @@ pub struct RelationDecisions {
     pub ended: BTreeMap<String, String>,
     pub restored_operations: BTreeSet<String>,
     pub created: BTreeMap<String, UserRelation>,
+    pub events: Vec<RelationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelationEvent {
+    Confirm {
+        relation_id: String,
+    },
+    Edit {
+        relation_id: String,
+        edit: EditedRelation,
+    },
+    End {
+        relation_id: String,
+        valid_to: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +107,19 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         redirects: BTreeMap::new(),
         mention_bindings: BTreeMap::new(),
         relation_decisions: RelationDecisions::default(),
+        redirect_history: ledger
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| active[*index])
+            .filter_map(|(_, operation)| match &operation.action {
+                KnowledgeAction::MergeEntity {
+                    source_id,
+                    target_id,
+                } => Some((source_id.clone(), target_id.clone())),
+                _ => None,
+            })
+            .collect(),
         legacy_ids: ledger.legacy_ids.clone(),
     };
     let restored: BTreeSet<String> = ledger
@@ -136,6 +166,12 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .relation_decisions
                     .confirmed
                     .insert(relation_id.clone());
+                snapshot
+                    .relation_decisions
+                    .events
+                    .push(RelationEvent::Confirm {
+                        relation_id: relation_id.clone(),
+                    });
             }
             KnowledgeAction::EditRelation {
                 relation_id,
@@ -146,17 +182,25 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                 valid_to,
                 note,
             } => {
-                snapshot.relation_decisions.edited.insert(
-                    relation_id.clone(),
-                    EditedRelation {
-                        subject_id: subject_id.clone(),
-                        predicate: predicate.clone(),
-                        object_id: object_id.clone(),
-                        valid_from: valid_from.clone(),
-                        valid_to: valid_to.clone(),
-                        note: note.clone(),
-                    },
-                );
+                let edit = EditedRelation {
+                    subject_id: subject_id.clone(),
+                    predicate: predicate.clone(),
+                    object_id: object_id.clone(),
+                    valid_from: valid_from.clone(),
+                    valid_to: valid_to.clone(),
+                    note: note.clone(),
+                };
+                snapshot
+                    .relation_decisions
+                    .edited
+                    .insert(relation_id.clone(), edit.clone());
+                snapshot
+                    .relation_decisions
+                    .events
+                    .push(RelationEvent::Edit {
+                        relation_id: relation_id.clone(),
+                        edit,
+                    });
             }
             KnowledgeAction::SuppressRelation {
                 subject_id,
@@ -181,6 +225,10 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .relation_decisions
                     .ended
                     .insert(relation_id.clone(), valid_to.clone());
+                snapshot.relation_decisions.events.push(RelationEvent::End {
+                    relation_id: relation_id.clone(),
+                    valid_to: valid_to.clone(),
+                });
             }
             KnowledgeAction::RestoreRelation { operation_id } => {
                 snapshot
