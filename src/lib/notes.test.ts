@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { splitMentions } from "./notes";
-import type { GraphExtraction, RefinedDoc, RelationFact } from "./notes";
+import type { GraphExtraction, RefinedDoc, RefinedDocV2, RelationFact } from "./notes";
 
 const legacyGraphFixture: RefinedDoc = {
   schema_version: 1,
@@ -23,11 +23,29 @@ const graphWriteShape: Pick<RefinedDoc, "graph_extraction" | "relations"> = {
   relations: [] satisfies RelationFact[],
 };
 
+const v2WriteFixture: RefinedDocV2 = {
+  schema_version: 2,
+  generated_at: "2026-07-21T00:00:00+08:00",
+  stages: { filter: "done", recluster: "done", llm: "done", entities: "done", relations: "done" },
+  discarded_seqs: [],
+  graph_extraction: graphWriteShape.graph_extraction!,
+  relations: [],
+  paragraphs: [{
+    speaker: "S1",
+    start_ms: 0,
+    end_ms: 1000,
+    text: "灯塔计划启动",
+    source_seqs: [7],
+    mentions: [{ id: "mn_000000000000000000000000", entity: "ent_1", start: 0, end: 4 }],
+  }],
+};
+
 describe("graph type compatibility", () => {
   it("accepts a schema-v1 document without graph fields", () => {
     expect(legacyGraphFixture.graph_extraction).toBeUndefined();
     expect(legacyGraphFixture.relations).toBeUndefined();
     expect(graphWriteShape.relations).toEqual([]);
+    expect(v2WriteFixture.schema_version).toBe(2);
   });
 });
 

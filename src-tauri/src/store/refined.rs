@@ -88,8 +88,14 @@ pub struct RefinedDoc {
 }
 
 pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
+    let mut doc = doc.clone();
+    let note_id = note_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
+    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
     let tmp = note_dir.join("aing.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(doc)?)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
     std::fs::rename(&tmp, note_dir.join(AING_DOC_FILE))?;
     Ok(())
 }
@@ -229,6 +235,36 @@ pub fn join_library_names(doc: &mut RefinedDoc, vp: &super::voiceprints::Voicepr
 mod tests {
     use super::*;
     use crate::store::{ensure_graph_ids, evidence_id};
+
+    #[test]
+    fn v2_writes_synthesize_stable_mention_ids_without_a_repair_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = RefinedDoc {
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "2026-07-21T00:00:00+08:00".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            paragraphs: vec![RefinedParagraph {
+                speaker: "S1".into(), name: None, person_id: None,
+                start_ms: 0, end_ms: 1000, text: "灯塔计划启动".into(), source_seqs: vec![7],
+                mentions: vec![Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }],
+            }],
+        };
+
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(AING_DOC_FILE)).unwrap()).unwrap();
+        let first_id = first["paragraphs"][0]["mentions"][0]["id"].as_str().unwrap().to_string();
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(AING_DOC_FILE)).unwrap()).unwrap();
+
+        assert!(first_id.starts_with("mn_"));
+        assert_eq!(first_id.len(), 27);
+        assert_eq!(second["paragraphs"][0]["mentions"][0]["id"].as_str(), Some(first_id.as_str()));
+    }
 
     #[test]
     fn schema_v1_defaults_graph_fields() {

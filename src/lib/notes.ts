@@ -150,6 +150,21 @@ export interface RefinedDoc {
   relations?: RelationFact[];
 }
 
+/** Required graph fields for schema-v2 writes; `RefinedDoc` remains permissive for legacy reads. */
+export type MentionV2 = Omit<Mention, "id"> & { id: string };
+export type RefinedParagraphV2 = Omit<RefinedParagraph, "mentions"> & { mentions: MentionV2[] };
+export type RefineStagesV2 = Omit<RefineStages, "relations"> & { relations: string };
+export type RefinedDocV2 = Omit<
+  RefinedDoc,
+  "schema_version" | "stages" | "paragraphs" | "graph_extraction" | "relations"
+> & {
+  schema_version: 2;
+  stages: RefineStagesV2;
+  paragraphs: RefinedParagraphV2[];
+  graph_extraction: GraphExtraction;
+  relations: RelationFact[];
+};
+
 /** 按 char 下标把段落文本切成 { 普通片段 | 实体片段 } 序列(实体片段 entityId 非空)。
  *  用 Array.from 按 code point 切分(BMP 中文一致、astral 安全);mentions 排序 + 跳过重叠/越界。 */
 export function splitMentions(
