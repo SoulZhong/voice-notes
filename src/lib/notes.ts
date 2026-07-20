@@ -154,6 +154,17 @@ export interface RefinedDoc {
 export type MentionV2 = Omit<Mention, "id"> & { id: string };
 export type RefinedParagraphV2 = Omit<RefinedParagraph, "mentions"> & { mentions: MentionV2[] };
 export type RefineStagesV2 = Omit<RefineStages, "relations"> & { relations: string };
+export type RelationEvidenceV2 = Omit<RelationEvidence, "id" | "source_seqs" | "source_hash"> & {
+  id: string;
+  source_seqs: number[];
+  source_hash: string;
+};
+export type RelationFactV2 = Omit<RelationFact, "id" | "subject_mentions" | "object_mentions" | "evidence"> & {
+  id: string;
+  subject_mentions: string[];
+  object_mentions: string[];
+  evidence: RelationEvidenceV2[];
+};
 export type RefinedDocV2 = Omit<
   RefinedDoc,
   "schema_version" | "stages" | "paragraphs" | "graph_extraction" | "relations"
@@ -161,8 +172,8 @@ export type RefinedDocV2 = Omit<
   schema_version: 2;
   stages: RefineStagesV2;
   paragraphs: RefinedParagraphV2[];
-  graph_extraction: GraphExtraction;
-  relations: RelationFact[];
+  graph_extraction: GraphExtraction | null;
+  relations: RelationFactV2[];
 };
 
 /** 按 char 下标把段落文本切成 { 普通片段 | 实体片段 } 序列(实体片段 entityId 非空)。
