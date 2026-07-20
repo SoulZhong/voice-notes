@@ -128,10 +128,11 @@
     }),
   );
   const graphSelected = $derived($page.url.searchParams.get("e"));
-  function pickEntity(e: EntitySummary) {
-    // 人→会议搭子;非人→主区详情面板(经 query 深链,id 含冒号/中文需编码)。
-    if (e.is_person) goto("/speakers/" + e.id);
-    else goto("/graph?e=" + encodeURIComponent(e.id));
+  // 人→会议搭子;非人→主区详情面板(经 query 深链,id 含冒号/中文需编码)。
+  function entityHref(e: EntitySummary): string {
+    return e.is_person
+      ? "/speakers/" + encodeURIComponent(e.id)
+      : "/graph?e=" + encodeURIComponent(e.id);
   }
 
   // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
@@ -461,6 +462,8 @@
     <input
       class="search"
       type="search"
+      name="graph-search"
+      aria-label={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
       placeholder={graphFilter.mode === "note" ? "搜索笔记标题…" : "搜索实体…"}
       bind:value={graphFilter.query}
     />
@@ -480,14 +483,15 @@
       {/if}
       <ul class="list">
         {#each graphShown as e (e.id)}
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-          <li class="item entity" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
-            <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
-            <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
-            <div class="main-line">
-              <span class="title">{e.name}</span>
-              <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
-            </div>
+          <li>
+            <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
+              <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
+              <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
+              <div class="main-line">
+                <span class="title">{e.name}</span>
+                <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
+              </div>
+            </a>
           </li>
         {/each}
       </ul>
@@ -499,13 +503,14 @@
       {/if}
       <ul class="list">
         {#each graphNotesShown as n (n.id)}
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-          <li class="item entity" onclick={() => goto("/notes/" + n.id)}>
-            <span class="dot" style="background: {kindInk('note')}"></span>
-            <div class="main-line">
-              <span class="title">{n.name}</span>
-              <span class="meta">{n.note_count} 个实体 · {n.mention_total} 提及</span>
-            </div>
+          <li>
+            <a class="item entity" href={"/notes/" + encodeURIComponent(n.id)}>
+              <span class="dot" style="background: {kindInk('note')}"></span>
+              <div class="main-line">
+                <span class="title">{n.name}</span>
+                <span class="meta">{n.note_count} 个实体 · {n.mention_total} 提及</span>
+              </div>
+            </a>
           </li>
         {/each}
       </ul>
@@ -712,6 +717,10 @@
     display: flex;
     align-items: center;
     gap: 0.55em;
+  }
+  a.item.entity {
+    color: inherit;
+    text-decoration: none;
   }
   /* 概览与整理固定行:与人物行同形态,图标代色点;徽标=待办数(warning 色药丸) */
   /* 新建钩子:本页的主操作入口——实心 accent 按钮,与上方录制药丸拉开间距、
