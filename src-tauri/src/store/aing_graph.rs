@@ -413,6 +413,26 @@ pub fn validate_graph(
                     &format!("evidence[{evidence_index}].{name}"),
                 )
             };
+            evidence.source_seqs.sort_unstable();
+            evidence.source_seqs.dedup();
+            let has_nonempty_source_seqs = !evidence.source_seqs.is_empty();
+            if !has_nonempty_source_seqs {
+                issue(
+                    &mut issues,
+                    relation_index,
+                    evidence_field("source_seqs"),
+                    "source_seqs must be a non-empty subset of the paragraph source_seqs",
+                );
+            }
+            let has_nonempty_span = evidence.start < evidence.end;
+            if !has_nonempty_span {
+                issue(
+                    &mut issues,
+                    relation_index,
+                    evidence_field("end"),
+                    "evidence start must be before end",
+                );
+            }
             let Some(paragraph) = doc.paragraphs.get(evidence.paragraph_index) else {
                 issue(
                     &mut issues,
@@ -423,13 +443,7 @@ pub fn validate_graph(
                 continue;
             };
             let text_chars: Vec<_> = paragraph.text.chars().collect();
-            let valid_span = if evidence.start >= evidence.end {
-                issue(
-                    &mut issues,
-                    relation_index,
-                    evidence_field("end"),
-                    "evidence start must be before end",
-                );
+            let valid_span = if !has_nonempty_span {
                 false
             } else if evidence.end > text_chars.len() {
                 issue(
@@ -453,10 +467,8 @@ pub fn validate_graph(
                     );
                 }
             }
-            evidence.source_seqs.sort_unstable();
-            evidence.source_seqs.dedup();
-            if evidence.source_seqs.is_empty()
-                || evidence
+            if has_nonempty_source_seqs
+                && evidence
                     .source_seqs
                     .iter()
                     .any(|source_seq| !paragraph.source_seqs.contains(source_seq))
@@ -469,7 +481,7 @@ pub fn validate_graph(
                 );
             }
             if valid_span
-                && !evidence.source_seqs.is_empty()
+                && has_nonempty_source_seqs
                 && evidence
                     .source_seqs
                     .iter()
@@ -789,6 +801,8 @@ mod tests {
         assert!(fields.contains(&"relations[0].subject_mentions"));
         assert!(fields.contains(&"relations[0].object_mentions[0]"));
         assert!(fields.contains(&"relations[0].evidence[0].paragraph_index"));
+        assert!(fields.contains(&"relations[0].evidence[0].end"));
+        assert!(fields.contains(&"relations[0].evidence[0].source_seqs"));
     }
 
     #[test]
