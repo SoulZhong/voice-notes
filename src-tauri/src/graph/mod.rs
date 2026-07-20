@@ -425,6 +425,37 @@ pub(crate) fn cooccurrence_edges(data_root: &Path) -> anyhow::Result<Vec<(String
     Ok(rows)
 }
 
+/// 笔记节点(文章视角力导图):每篇笔记 + 它含多少个不同实体(节点大小)+ 总提及数。
+/// 返回 (note_id, entity_count, mention_total),entity_count 降序。标题由上层 join。
+pub(crate) fn note_nodes(data_root: &Path) -> anyhow::Result<Vec<(String, i64, i64)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT note_id, COUNT(DISTINCT entity_id) AS ecount, COALESCE(SUM(mention_count),0) AS mtotal
+         FROM note_entities GROUP BY note_id ORDER BY ecount DESC, note_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 笔记共享边(文章视角,实体共现图的对偶):两篇笔记共享实体即连边,边权 = 共享的
+/// 不同实体数。`a < b` 去重,降序返回。只共享 0 个实体的笔记对不产生边。
+pub(crate) fn note_shared_edges(data_root: &Path) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT ne1.note_id, ne2.note_id, COUNT(DISTINCT ne1.entity_id) AS shared
+         FROM note_entities ne1
+         JOIN note_entities ne2 ON ne1.entity_id = ne2.entity_id AND ne1.note_id < ne2.note_id
+         GROUP BY ne1.note_id, ne2.note_id
+         ORDER BY shared DESC, ne1.note_id ASC, ne2.note_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// 查单个实体详情。实体不存在 → Ok(None)。只读,不加锁。
 pub(crate) fn entity_detail(data_root: &Path, gid: &str) -> anyhow::Result<Option<EntityDetail>> {
     let conn = open(data_root)?;
@@ -661,6 +692,34 @@ mod tests {
         assert!(edges.iter().any(|(a, b, w)| a == "e:a" && b == "e:c" && *w == 1), "A,C 共享 1");
         assert!(!edges.iter().any(|(a, b, _)| (a == "e:b" && b == "e:c") || (a == "e:c" && b == "e:b")), "B,C 不共现");
         assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重,不出现反向对");
+    }
+
+    #[test]
+    fn note_graph_nodes_and_edges_are_entity_graph_dual() {
+        let root = tempfile::tempdir().unwrap();
+        // n1={A,B};n2={A,B};n3={A,C}——与 cooccurrence 用例同布局,验证对偶关系。
+        let mk = |names: &[&str]| doc_with(
+            names.iter().enumerate().map(|(i, nm)| ent(&format!("ent_{}", i + 1), "term", nm, &[])).collect(),
+            vec![para("x", vec![])],
+        );
+        upsert_note(root.path(), "n1", &mk(&["A", "B"])).unwrap();
+        upsert_note(root.path(), "n2", &mk(&["A", "B"])).unwrap();
+        upsert_note(root.path(), "n3", &mk(&["A", "C"])).unwrap();
+
+        // 节点:每篇笔记 + 它含的不同实体数(节点大小信号)。
+        let nodes = note_nodes(root.path()).unwrap();
+        let n1 = nodes.iter().find(|(id, ..)| id == "n1").expect("n1");
+        assert_eq!(n1.1, 2, "n1 含 A、B 两个实体");
+        let n3 = nodes.iter().find(|(id, ..)| id == "n3").expect("n3");
+        assert_eq!(n3.1, 2, "n3 含 A、C 两个实体");
+
+        // 边:两篇笔记共享实体即连边,边权=共享的不同实体数。
+        let edges = note_shared_edges(root.path()).unwrap();
+        // n1、n2 都是 {A,B} → 共享 2 个实体;n1、n3 共享 A → 1;n2、n3 共享 A → 1。
+        assert!(edges.iter().any(|(a, b, w)| a == "n1" && b == "n2" && *w == 2), "n1,n2 共享 2");
+        assert!(edges.iter().any(|(a, b, w)| a == "n1" && b == "n3" && *w == 1), "n1,n3 共享 1");
+        assert!(edges.iter().any(|(a, b, w)| a == "n2" && b == "n3" && *w == 1), "n2,n3 共享 1");
+        assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重");
     }
 
     #[test]

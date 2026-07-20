@@ -1808,6 +1808,48 @@ fn graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
     Ok(ipc::GraphData { nodes, edges })
 }
 
+/// 文章视角力导图:节点=笔记(name=标题,note_count 字段复用为「该笔记含的实体数」
+/// 驱动节点大小),边=两篇笔记共享的不同实体数。实体视角(graph_data)的对偶。
+/// 任一子查询失败 → 该部分空,整体不 Err。没标题的笔记(已删/找不到)跳过。
+#[tauri::command]
+fn note_graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
+    let Ok(root) = data_root(&app) else { return Ok(ipc::GraphData { nodes: vec![], edges: vec![] }) };
+    let raw_nodes = graph::note_nodes(&root).unwrap_or_else(|e| {
+        eprintln!("note_graph_data: 笔记节点查询失败,返回空: {e}");
+        vec![]
+    });
+    let Ok(notes_root) = notes_dir(&app) else { return Ok(ipc::GraphData { nodes: vec![], edges: vec![] }) };
+    let summaries = store::NoteStore::new(notes_root).list();
+    let by_id: std::collections::HashMap<String, &store::NoteSummary> =
+        summaries.iter().map(|n| (n.id.clone(), n)).collect();
+    let nodes: Vec<ipc::EntitySummary> = raw_nodes
+        .into_iter()
+        .filter_map(|(nid, ecount, mtotal)| {
+            by_id.get(&nid).map(|n| ipc::EntitySummary {
+                id: n.id.clone(),
+                kind: "note".into(),
+                name: n.title.clone(),
+                aliases: vec![],
+                is_person: false,
+                note_count: ecount,   // 复用为节点大小信号(该笔记含的实体数)
+                mention_total: mtotal,
+            })
+        })
+        .collect();
+    // 边两端都得是有标题的笔记(跳过被过滤掉的节点),否则力导图会有指向不存在节点的悬空边。
+    let live: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let edges = graph::note_shared_edges(&root)
+        .unwrap_or_else(|e| {
+            eprintln!("note_graph_data: 笔记共享边查询失败,返回空: {e}");
+            vec![]
+        })
+        .into_iter()
+        .filter(|(a, b, _)| live.contains(a) && live.contains(b))
+        .map(|(a, b, weight)| ipc::EdgeRow { a, b, weight })
+        .collect();
+    Ok(ipc::GraphData { nodes, edges })
+}
+
 /// 单个实体详情(右侧面板)。实体不存在/图谱失败 → None,不 Err。
 #[tauri::command]
 fn entity_detail(app: AppHandle, id: String) -> Result<Option<ipc::EntityDetail>, String> {
@@ -3386,6 +3428,7 @@ pub fn run() {
             note_related,
             graph_entities,
             graph_data,
+            note_graph_data,
             entity_detail,
             note_entity_links,
             rename_entity,
