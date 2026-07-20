@@ -3,6 +3,11 @@
 
 use std::path::Path;
 
+#[allow(dead_code)] // Durable graph contract; command/API consumers land in subsequent tasks.
+pub(crate) mod overrides;
+#[allow(dead_code)] // Pure snapshot contract; canonical projection consumes it next.
+pub(crate) mod resolve;
+
 pub(crate) const GRAPH_FILE: &str = "graph.sqlite";
 
 /// 写路径进程内串行(rusqlite::Connection 非 Sync;沿用全仓"每次操作现开连接 + Mutex 门禁"惯例)。
