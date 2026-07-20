@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, entityDetail, renameEntity, kindLabel, kindInk, kindSoft, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
+  import { graphData, noteGraphData, entityDetail, renameEntity, kindLabel, kindInk, kindSoft, type EntityDetail, type GraphData, type EntitySummary, type EdgeRow } from "$lib/graph";
   import { formatDate } from "$lib/notes";
   import { graphFilter } from "$lib/graphFilter.svelte";
   import ForceGraph from "$lib/ForceGraph.svelte";
@@ -83,6 +83,9 @@
   const EGO_MAX_RELATED = 30;
 
   let graph = $state<GraphData>({ nodes: [], edges: [] });
+  let noteGraph = $state<GraphData>({ nodes: [], edges: [] });
+  let noteGraphLoading = $state(false);
+  let noteGraphLoaded = $state(false);
   let loaded = $state(false);
   let detail = $state<EntityDetail | null>(null);
   let detailLoading = $state(false);
@@ -100,9 +103,33 @@
     loaded = true;
   });
 
+  async function loadNoteGraph() {
+    if (noteGraphLoading || noteGraphLoaded) return;
+    noteGraphLoading = true;
+    try {
+      noteGraph = await noteGraphData();
+    } catch {
+      noteGraph = { nodes: [], edges: [] };
+    } finally {
+      // 空图也是一次完整结果。单靠 nodes.length 判断会让空库反复 invoke，且 UI
+      // 永远停在“正在加载”。显式记录 settled 状态才能区分“尚未拉取”和“确实为空”。
+      noteGraphLoaded = true;
+      noteGraphLoading = false;
+    }
+  }
+
+  // 文章视角数据按需懒加载(首次切到"文章"才拉),之后缓存。切回不重拉。
+  $effect(() => {
+    if (graphFilter.mode === "note") void loadNoteGraph();
+  });
+
   function pickNode(id: string, isPerson: boolean) {
     if (isPerson) goto("/speakers/" + id);
     else goto("/graph?e=" + encodeURIComponent(id));
+  }
+  /** 文章视角点节点=直接进笔记详情页(笔记页本身承载相关笔记/实体高亮)。 */
+  function pickNoteNode(id: string) {
+    goto("/notes/" + id);
   }
 
   // 选中变化 → 拉详情。侧栏点人实体已直接跳 /speakers,这里只处理非人。
@@ -176,7 +203,34 @@
 </script>
 
 <div class="graph-main">
-  {#if loaded && graph.nodes.length === 0}
+  {#if graphFilter.mode === "note"}
+    <!-- 文章视角:节点=笔记,边=共享实体。没有实体详情面板(点节点直接进笔记页),
+         所以这条分支不受 ?e= 选中态影响,独立于实体视角的整套导航。 -->
+    {#if noteGraph.edges.length > 0 && noteGraph.nodes.length >= 2}
+      <ForceGraph
+        nodes={noteGraph.nodes}
+        edges={noteGraph.edges}
+        onPick={(id) => pickNoteNode(id)}
+        query={graphFilter.query}
+        showLegend={false}
+      />
+    {:else if noteGraph.nodes.length > 0}
+      <div class="placeholder">
+        <p class="ph-title">笔记之间还没有连接</p>
+        <p class="ph-desc">当两篇笔记提到同一个实体时,它们会在这里连成一条边。多 Aing 几篇笔记后就会出现关联。</p>
+      </div>
+    {:else if noteGraphLoading || !noteGraphLoaded}
+      <div class="placeholder">
+        <p class="ph-title">文章视角</p>
+        <p class="ph-desc">这里把每篇笔记画成一个节点,共享实体越多的笔记靠得越近。稍等,正在加载…</p>
+      </div>
+    {:else}
+      <div class="placeholder">
+        <p class="ph-title">还没有进入图谱的笔记</p>
+        <p class="ph-desc">配置大模型并对笔记「重新 Aing」后,笔记会按共享实体在这里建立连接。</p>
+      </div>
+    {/if}
+  {:else if loaded && graph.nodes.length === 0}
     <div class="empty">
       <p class="empty-title">还没有知识图谱</p>
       <p class="empty-desc">配置大模型并对笔记「重新 Aing」后,人物、组织、项目等实体会自动汇入这里,按共享的笔记彼此关联。</p>

@@ -120,8 +120,11 @@ export function kindSoft(kind: string): string {
 
 /** 全部实体(列表),note_count 降序。图谱失败/空 → []。 */
 export const graphEntities = () => invoke<EntitySummary[]>("graph_entities");
-/** 力导图数据(Plan C)。 */
+/** 力导图数据(实体视角:节点=实体,边=共现的共享笔记数)。 */
 export const graphData = () => invoke<GraphData>("graph_data");
+/** 力导图数据(文章视角:节点=笔记[name=标题、note_count=该笔记实体数],边=两篇笔记
+    共享的实体数)。实体视角的对偶,复用同一 GraphData/ForceGraph。 */
+export const noteGraphData = () => invoke<GraphData>("note_graph_data");
 /** 单实体详情;不存在/失败 → null。 */
 export const entityDetail = (id: string) => invoke<EntityDetail | null>("entity_detail", { id });
 /** 笔记局部实体→全局 id(Plan C 笔记页)。 */

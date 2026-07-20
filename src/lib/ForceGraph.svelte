@@ -13,6 +13,7 @@
     minEdgeWeight = 2,
     backboneK = 3,
     query,
+    showLegend = true,
   }: {
     nodes: EntitySummary[];
     edges: EdgeRow[];
@@ -29,6 +30,8 @@
     backboneK?: number;
     /** 搜索关键词(侧栏搜索框同源):命中的节点画布上高亮+自动聚焦镜头,不传则不启用。 */
     query?: string;
+    /** kind 图例开关;文章视角(节点全是笔记、单一类型)传 false,图例无信息量。 */
+    showLegend?: boolean;
   } = $props();
 
   interface SimNode extends EntitySummary {
@@ -72,7 +75,9 @@
 
   const MIN_R = 12;
   const MAX_R = 38;
-  const CHAR_PX = 8; // 中英混排近似字宽(10px 字号)
+  // 标签字号必须跟 <text> 渲染处同一公式,否则按小字号算能装几个字、却按大字号渲染,
+  // 长标签(尤其文章视角的笔记标题)会溢出圆圈、糊到相邻节点上。
+  const labelFontSize = (r: number) => Math.min(14, Math.max(8, 6 + r * 0.22));
 
   // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色
   // (`kindInk` 来自 $lib/graph,是全应用唯一真值源——侧栏 kind 过滤药丸/实体列表
@@ -83,12 +88,29 @@
   /** 半径=重要度(主信号,相对当前渲染集合归一化);文字装不下就截断,不反过来撑大圆。
       线性比例(非 sqrt)——sqrt 会把低值往上拉、高值往下压,大多数低 note_count 节点
       挤在一个窄区间里看不出差别;线性 + 拉宽 MIN_R..MAX_R 让差距在视觉上真正显著。 */
+  // 逐字估宽:CJK/全角 ≈ 1em、ASCII ≈ 0.55em。统一按字符数算宽度会让纯英文名(agent)
+  // 被当成跟中文一样宽而过度截断,又会让长中文标题(笔记标题)按英文宽度算能装下、实际
+  // 溢出——必须分字型估。
+  const isWide = (ch: string) => /[⺀-鿿＀-￯　-〿]/.test(ch);
+  function estWidth(str: string, fontSize: number): number {
+    let w = 0;
+    for (const ch of str) w += isWide(ch) ? fontSize : fontSize * 0.55;
+    return w;
+  }
+
   function sizeFor(name: string, noteCount: number, maxNoteCount: number): { r: number; label: string } {
     const t = maxNoteCount > 0 ? noteCount / maxNoteCount : 0;
     const r = MIN_R + t * (MAX_R - MIN_R);
-    const maxChars = Math.max(2, Math.floor(((r - 6) * 2) / CHAR_PX));
-    const label = name.length > maxChars ? name.slice(0, maxChars - 1) + "…" : name;
-    return { r, label };
+    const fontSize = labelFontSize(r);
+    const avail = (r - 4) * 2; // 圆内直径留 4px 边距
+    if (estWidth(name, fontSize) <= avail) return { r, label: name };
+    // 逐字累加直到「已选文字 + 省略号」正好放得下,保证截断后仍不溢出。
+    let label = "";
+    for (const ch of name) {
+      if (estWidth(label + ch + "…", fontSize) > avail) break;
+      label += ch;
+    }
+    return { r, label: label + "…" };
   }
 
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
@@ -269,23 +291,29 @@
       .force("center", forceCenter(width / 2, height / 2))
       .force("gravityX", forceX<SimNode>(width / 2).strength(gravityStrength))
       .force("gravityY", forceY<SimNode>(height / 2).strength(gravityStrength))
-      .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6))
+      // heavy 图碰撞力加大迭代次数(默认 1→3):快衰减(见下)只给约 40 tick,
+      // 碰撞力每 tick 只推一次的话根本来不及把重叠分开、仿真就冷却停了(冒烟反馈
+      // "位置没好就停止了")。加迭代=每 tick 多推几轮,少 tick 也能分干净——用
+      // "推得更狠"换"跑得更快",而不是靠拖时间。
+      .force("collide", forceCollide<SimNode>((d) => (d.r ?? MIN_R) + 6).iterations(4))
       // heavy 图默认衰减(alphaDecay≈0.0228,~300 tick、5 秒+)配合弱化过的斥力,
       // 动画拖得很长、过程飘来飘去看着乱(冒烟反馈"动的时间太长了很混乱")。
-      // 调快衰减(~150 tick、3 秒内)+ 加大阻尼(velocityDecay,抑制过冲/来回摆动),
-      // 让"展开一层"的生长动画短平快、不慌乱。
-      .alphaDecay(heavy ? 0.3 : 0.0228)
+      // 调快衰减(~40 tick、1 秒内)+ 加大阻尼(velocityDecay,抑制过冲/来回摆动),
+      // 让"展开一层"的生长动画短平快、不慌乱;碰撞迭代兜住布局质量不因快而糊。
+      .alphaDecay(heavy ? 0.26 : 0.0228)
       .velocityDecay(heavy ? 0.45 : 0.4)
       .on("tick", refreshSnap);
     skipAnimation = dNodes.length > 450 || dLinks.length > 2500;
     if (reduce || skipAnimation) {
       sim.stop();
       if (skipAnimation) {
-        // 固定 tick 数是猜的,猜错了就是这样:弱化过斥力(-55)之后收敛变慢,固定
-        // 90 tick 根本不够把碰撞力(collide)真正撑开,新长出来的节点(没有旧位置
-        // 可继承,d3 从零初始化)挤成一坨、圆圈和文字互相重叠(冒烟反馈"是不是要
-        // 重新渲染,现在都挤到了一起")。改成跑到仿真真正收敛(alpha 降到 alphaMin
-        // 以下)为止,而不是赌一个数字够不够——400 tick 是防跑飞的安全上限。
+        // 巨图(900+ 节点)一次性冷启动定格,不逐帧动画(逐 tick 全量重渲染上千 DOM
+        // 会真卡死)。这条路用户看不到动画过程、只看最终结果,时间不敏感但布局必须
+        // 干净。**这里必须用慢衰减跑足够多的 tick**:上面为动画调的快衰减(0.26)会
+        // 让下面这个 alpha 门控循环几十 tick 就退出,几百上千节点根本没被碰撞力分开、
+        // 挤成一坨(冒烟反馈"位置没好就停止了")。临时把衰减调回慢档(0.02≈300 tick
+        // 预算)专门给冷启动用,配合 collide 迭代把重叠彻底清干净,400 tick 安全上限。
+        sim.alphaDecay(0.05).alpha(1);
         let iterations = 0;
         while (sim.alpha() > sim.alphaMin() && iterations < 400) {
           sim.tick();
@@ -583,7 +611,7 @@
                   vector-effect="non-scaling-stroke"
                 />
               {/if}
-              <text class="lbl" font-size={Math.min(14, Math.max(8, 6 + n.r * 0.22))}>{n.label}</text>
+              <text class="lbl" font-size={labelFontSize(n.r)}>{n.label}</text>
             </g>
           {/each}
         </g>
@@ -612,7 +640,7 @@
       <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>显示全部</button>
     </div>
   {/if}
-  {#if legend.length > 0}
+  {#if showLegend && legend.length > 0}
     <div class="legend">
       {#each legend as row (row.key)}
         <div class="legend-row">

@@ -16,7 +16,7 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
-  import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
+  import { graphEntities, noteGraphData, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
 
   let notes = $state<NoteSummary[]>([]);
@@ -86,17 +86,25 @@
     }
   });
 
-  // ── 图谱:实体列表作为主从结构的 master(搜索 + kind 过滤在侧栏,主区放详情面板)──
+  // ── 图谱:实体/文章两视角,列表作为主从结构的 master(搜索 + 过滤在侧栏,主区放画布)──
   let graphEnts = $state<EntitySummary[]>([]);
+  let graphNotes = $state<EntitySummary[]>([]); // 文章视角:节点=笔记(name=标题)
 
   async function refreshGraph() {
     try {
-      graphEnts = await graphEntities();
+      if (graphFilter.mode === "note") {
+        graphNotes = (await noteGraphData()).nodes;
+      } else {
+        graphEnts = await graphEntities();
+      }
     } catch {
-      graphEnts = [];
+      if (graphFilter.mode === "note") graphNotes = [];
+      else graphEnts = [];
     }
   }
   $effect(() => {
+    // 依赖 mode:切视角时重新拉对应数据。
+    void graphFilter.mode;
     if (tab === "graph") refreshGraph();
   });
 
@@ -111,6 +119,12 @@
       const q = graphFilter.query.trim().toLowerCase();
       if (!q) return true;
       return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
+    }),
+  );
+  const graphNotesShown = $derived(
+    graphNotes.filter((n) => {
+      const q = graphFilter.query.trim().toLowerCase();
+      return !q || n.name.toLowerCase().includes(q);
     }),
   );
   const graphSelected = $derived($page.url.searchParams.get("e"));
@@ -430,33 +444,72 @@
       </svg>
       全局图谱
     </button>
-    <input class="search" type="search" placeholder="搜索实体…" bind:value={graphFilter.query} />
-    <div class="gchips">
-      <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
-      {#each graphKinds as k (k)}
-        <!-- 圆点=该 kind 在力导图上的节点色(kindInk,与 ForceGraph.svelte 同一份取色
-             逻辑),让过滤药丸跟图上的圆圈对得上号,不再是一片同色灰药丸 -->
-        <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
-          <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
-        </button>
-      {/each}
+    <!-- 视角切换:实体视角(节点=实体、边=共现)/ 文章视角(节点=笔记、边=共享实体)。
+         两视角是同一份图谱的对偶,segmented 分段控件切换,主区画布与侧栏列表同步。 -->
+    <div class="gmode">
+      <button
+        class="gmode-seg"
+        class:on={graphFilter.mode === "entity"}
+        onclick={() => { graphFilter.mode = "entity"; if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
+      >实体</button>
+      <button
+        class="gmode-seg"
+        class:on={graphFilter.mode === "note"}
+        onclick={() => { graphFilter.mode = "note"; if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
+      >文章</button>
     </div>
-    {#if graphShown.length === 0}
-      <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+    <input
+      class="search"
+      type="search"
+      placeholder={graphFilter.mode === "note" ? "搜索笔记标题…" : "搜索实体…"}
+      bind:value={graphFilter.query}
+    />
+    {#if graphFilter.mode === "entity"}
+      <div class="gchips">
+        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
+        {#each graphKinds as k (k)}
+          <!-- 圆点=该 kind 在力导图上的节点色(kindInk,与 ForceGraph.svelte 同一份取色
+               逻辑),让过滤药丸跟图上的圆圈对得上号,不再是一片同色灰药丸 -->
+          <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
+            <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
+          </button>
+        {/each}
+      </div>
+      {#if graphShown.length === 0}
+        <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+      {/if}
+      <ul class="list">
+        {#each graphShown as e (e.id)}
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+          <li class="item entity" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
+            <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
+            <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
+            <div class="main-line">
+              <span class="title">{e.name}</span>
+              <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <!-- 文章视角:节点=笔记,列表=笔记(标题 + 含实体数),点击直接进笔记详情页
+           (笔记本身已有相关笔记/实体高亮,无需再在图上开面板)。 -->
+      {#if graphNotesShown.length === 0}
+        <p class="hint">{graphNotes.length === 0 ? "还没有进入图谱的笔记" : "没有匹配的笔记"}</p>
+      {/if}
+      <ul class="list">
+        {#each graphNotesShown as n (n.id)}
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+          <li class="item entity" onclick={() => goto("/notes/" + n.id)}>
+            <span class="dot" style="background: {kindInk('note')}"></span>
+            <div class="main-line">
+              <span class="title">{n.name}</span>
+              <span class="meta">{n.note_count} 个实体 · {n.mention_total} 提及</span>
+            </div>
+          </li>
+        {/each}
+      </ul>
     {/if}
-    <ul class="list">
-      {#each graphShown as e (e.id)}
-        <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
-        <li class="item entity" class:current={graphSelected === e.id} onclick={() => pickEntity(e)}>
-          <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
-          <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
-          <div class="main-line">
-            <span class="title">{e.name}</span>
-            <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
-          </div>
-        </li>
-      {/each}
-    </ul>
   {:else}
   <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
 
@@ -798,6 +851,33 @@
     box-shadow: 0 0 0 1px var(--accent);
   }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
+  /* 视角切换分段控件:实体 / 文章 二选一。整块 surface-press 底 + 选中项白/accent
+     实底,跟设置页的 segmented 同一套视觉语言(此处窄栏本地实现,不引全局类)。 */
+  .gmode {
+    display: flex;
+    gap: 2px;
+    margin: 0.6rem 0 0.5rem;
+    padding: 2px;
+    background: var(--surface-press);
+    border-radius: var(--radius-md);
+  }
+  .gmode-seg {
+    flex: 1;
+    padding: 4px 0;
+    border: 0;
+    border-radius: calc(var(--radius-md) - 2px);
+    background: transparent;
+    color: var(--ink-secondary);
+    font: inherit;
+    font-size: 0.8em;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .gmode-seg.on {
+    background: var(--surface);
+    color: var(--ink);
+    box-shadow: var(--shadow-btn);
+  }
   .gchips {
     display: flex;
     flex-wrap: wrap;
