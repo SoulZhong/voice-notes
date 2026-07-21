@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { RelationStatus } from "./knowledge";
 
 /** 图谱实体摘要(列表 / 力导图节点)。镜像 ipc::EntitySummary。 */
 export interface EntitySummary {
@@ -16,6 +17,19 @@ export interface EdgeRow {
   a: string;
   b: string;
   weight: number;
+}
+
+/** Unified force-graph edge. Semantic relations stay directed and co-occurrence stays weak. */
+export interface RenderEdge {
+  id: string;
+  a: string;
+  b: string;
+  weight: number;
+  layer: "semantic" | "cooccurrence";
+  label: string;
+  directed: boolean;
+  confidence: number | null;
+  status: RelationStatus | null;
 }
 
 /** 力导图数据(Plan C 用)。镜像 ipc::GraphData。 */
