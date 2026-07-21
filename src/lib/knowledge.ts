@@ -3,6 +3,9 @@ import type { EdgeRow, EntitySummary } from "./graph";
 
 export type RelationStatus = "current" | "historical";
 export type RelationOrigin = "model" | "confirmed" | "manual" | "user_assertion";
+export type KnowledgeRebuildState = "queued";
+export type BackfillProvider = "openai" | "agent";
+export type BackfillState = "running" | "completed" | "cancelled" | "failed";
 export type JsonValue =
   | null
   | boolean
@@ -178,17 +181,17 @@ export interface SplitEntityRequest {
 export interface KnowledgeMutationResult {
   operation_id: string;
   entity_id: string | null;
-  rebuild_state: string;
+  rebuild_state: KnowledgeRebuildState;
 }
 
 export interface BackfillRequest {
   note_ids: string[] | null;
-  provider: string;
+  provider: BackfillProvider;
 }
 
 export interface BackfillPreview {
   note_ids: string[];
-  provider: string;
+  provider: BackfillProvider;
   model: string;
   contract_version: number;
 }
@@ -199,7 +202,7 @@ export interface BackfillFailure {
 }
 
 export interface BackfillProgress {
-  state: string;
+  state: BackfillState;
   completed: number;
   total: number;
   current_note_id: string | null;

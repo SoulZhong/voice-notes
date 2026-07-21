@@ -206,6 +206,43 @@ describe("viewEdges", () => {
     expect(viewEdges(data, filter({ predicate_types: ["does_not_exist"] }))).toEqual([]);
   });
 
+  it("preserves empty-semantic fallback under history, date, and predicate filters", () => {
+    const emptySemantic = graph(
+      [node("kg_a", "project"), node("kg_b", "term")],
+      [],
+      [{ a: "kg_a", b: "kg_b", weight: 4 }],
+    );
+    const semanticFilters: Partial<KnowledgeFilter>[] = [
+      { include_history: true },
+      { predicate_types: ["uses"] },
+      { from: "2026-01-01T00:00:00Z", to: "2026-12-31T23:59:59Z" },
+      {
+        include_history: true,
+        predicate_types: ["uses"],
+        from: "2026-01-01T00:00:00Z",
+      },
+    ];
+
+    for (const overrides of semanticFilters) {
+      expect(viewEdges(emptySemantic, filter(overrides))).toEqual([
+        {
+          id: "co:kg_a:kg_b",
+          a: "kg_a",
+          b: "kg_b",
+          weight: 4,
+          layer: "cooccurrence",
+          label: "共同出现（4 篇）",
+          directed: false,
+          confidence: null,
+          status: null,
+        },
+      ]);
+    }
+    expect(
+      viewEdges(emptySemantic, filter({ include_history: true, entity_kinds: ["project"] })),
+    ).toEqual([]);
+  });
+
   it("is independent of input ordering and never shortens a label", () => {
     const reversed = graph(
       [...data.nodes].reverse(),
@@ -291,6 +328,52 @@ describe("defaultBackbone", () => {
     const expanded = nextExpandedIds(baseline, data.semantic_edges, 2);
     expect(expanded.size).toBeGreaterThanOrEqual(baseline.size);
     expect(defaultBackbone(data, 3, 2)).toEqual(baseline);
+  });
+
+  it("never fills past a capped bridge with a disconnected high-degree node", () => {
+    const nodes = [node("A", "project", 20), node("B", "project", 10), node("C"), node("D")];
+    const edges = [
+      edge("r_ab", "A", "B", { confidence: 1, note_count: 20 }),
+      edge("r_ac", "A", "C", { confidence: 0.1, note_count: 1 }),
+      edge("r_cd", "C", "D", { confidence: 0.1, note_count: 1 }),
+    ];
+    for (let index = 0; index < 8; index += 1) {
+      const leaf = `A_leaf_${index}`;
+      nodes.push(node(leaf));
+      edges.push(edge(`r_a_leaf_${index}`, "A", leaf, { confidence: 0.5, note_count: 2 }));
+    }
+    for (let index = 0; index < 6; index += 1) {
+      const leaf = `D_leaf_${index}`;
+      nodes.push(node(leaf));
+      edges.push(edge(`r_d_leaf_${index}`, "D", leaf, { confidence: 0.9, note_count: 9 }));
+    }
+
+    const backbone = defaultBackbone(graph(nodes, edges), 3, 1);
+    expect(backbone).toEqual(new Set(["A", "B"]));
+
+    const adjacency = new Map<string, Set<string>>();
+    for (const item of edges) {
+      if (!backbone.has(item.subject_id) || !backbone.has(item.object_id)) continue;
+      adjacency.set(
+        item.subject_id,
+        new Set([...(adjacency.get(item.subject_id) ?? []), item.object_id]),
+      );
+      adjacency.set(
+        item.object_id,
+        new Set([...(adjacency.get(item.object_id) ?? []), item.subject_id]),
+      );
+    }
+    const reachable = new Set(["A"]);
+    const pending = ["A"];
+    while (pending.length > 0) {
+      for (const neighbor of adjacency.get(pending.shift()!) ?? []) {
+        if (!reachable.has(neighbor)) {
+          reachable.add(neighbor);
+          pending.push(neighbor);
+        }
+      }
+    }
+    expect([...backbone].every((id) => reachable.has(id))).toBe(true);
   });
 });
 

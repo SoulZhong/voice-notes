@@ -14,7 +14,10 @@ import {
   splitEntity,
   startRelationBackfill,
   undoKnowledgeOperation,
+  type BackfillProgress,
+  type BackfillRequest,
   type KnowledgeFilter,
+  type KnowledgeMutationResult,
   type KnowledgeOperationInput,
 } from "./knowledge";
 
@@ -23,6 +26,29 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
+
+if (false) {
+  const invalidProvider: BackfillRequest = {
+    note_ids: null,
+    // @ts-expect-error Backfill providers are the two backend-supported executors.
+    provider: "http",
+  };
+  const invalidBackfillState: BackfillProgress = {
+    // @ts-expect-error Backfill progress exposes only terminal/running backend states.
+    state: "done",
+    completed: 0,
+    total: 0,
+    current_note_id: null,
+    failed: [],
+  };
+  const invalidRebuildState: KnowledgeMutationResult = {
+    operation_id: "op_1",
+    entity_id: null,
+    // @ts-expect-error Public mutation commands return only the post-scheduling queued state.
+    rebuild_state: "committed",
+  };
+  void [invalidProvider, invalidBackfillState, invalidRebuildState];
+}
 
 describe("kindLabel", () => {
   it("已知 kind 给中文标签", () => {
@@ -99,7 +125,7 @@ describe("semantic graph invoke wrappers", () => {
 
   it("uses noteIds only for preview and a nested request for start", async () => {
     invokeMock.mockReset().mockResolvedValue(undefined);
-    const request = { note_ids: ["note-1"], provider: "http" };
+    const request = { note_ids: ["note-1"], provider: "openai" } satisfies BackfillRequest;
     await previewRelationBackfill();
     await previewRelationBackfill(["note-1"]);
     await startRelationBackfill(request);
