@@ -53,18 +53,23 @@
     }
   });
 
-  const running = $derived(state.phase === "running" || state.phase === "cancel-requested");
+  const busy = $derived(
+    state.phase === "starting" ||
+      state.phase === "running" ||
+      state.phase === "cancel-requested" ||
+      state.phase === "waiting-for-index",
+  );
   const providerLabel = $derived(state.preview?.provider === "agent" ? "本机 Agent" : "在线接口");
 
   function closeDialog() {
-    if (running) return;
+    if (busy) return;
     controller.close();
     if (dialog.open) dialog.close();
     onClose();
   }
 
   function handleCancel(event: Event) {
-    if (running) {
+    if (busy) {
       event.preventDefault();
       if (state.phase === "running") void controller.cancel();
       return;
@@ -98,7 +103,7 @@
         class="close-button"
         type="button"
         aria-label="关闭关系补建"
-        disabled={running}
+        disabled={busy}
         onclick={closeDialog}
       >关闭</button>
     </header>
@@ -108,6 +113,9 @@
         <p class="lead">正在读取可补建的笔记与当前执行体。</p>
       {:else if state.phase === "preview-error"}
         <p class="message error">{state.error}</p>
+        {#if state.technicalError}
+          <details class="technical"><summary>技术详情</summary><pre>{state.technicalError}</pre></details>
+        {/if}
         <button class="secondary" type="button" onclick={() => controller.preview(noteIds)}>重新预览</button>
       {:else if state.preview && (state.phase === "preview-ready")}
         <p class="lead">开始前请核对这次补建会处理什么，以及内容将交给谁。</p>
@@ -135,13 +143,16 @@
             <span>我已确认：将把修订稿发送给当前配置的执行体。补建只更新关系图谱产物，不修改转写段落与笔记顺序。</span>
           </label>
         {/if}
-      {:else if running || state.phase === "completed" || state.phase === "failed" || state.phase === "cancelled"}
+      {:else if busy || state.phase === "completed" || state.phase === "partial" || state.phase === "failed" || state.phase === "cancelled"}
         <div class="progress-heading">
           <p class="lead">
             {#if state.phase === "completed"}补建已完成
+            {:else if state.phase === "partial"}部分笔记未完成
             {:else if state.phase === "failed"}补建未完成
             {:else if state.phase === "cancelled"}补建已取消
+            {:else if state.phase === "starting"}正在建立安全连接
             {:else if state.phase === "cancel-requested"}正在安全停止
+            {:else if state.phase === "waiting-for-index"}正在发布图谱索引
             {:else}正在补建关系{/if}
           </p>
           <strong>{state.completed} / {state.total}</strong>
@@ -151,12 +162,19 @@
           <div class="current"><span>当前笔记</span><strong>{state.currentNoteId}</strong></div>
         {/if}
         {#if state.error}<p class="message error">{state.error}</p>{/if}
+        {#if state.technicalError && state.failures.length === 0}
+          <details class="technical"><summary>技术详情</summary><pre>{state.technicalError}</pre></details>
+        {/if}
         {#if state.failures.length > 0}
           <section class="failures" aria-labelledby="relation-backfill-failures">
             <h3 id="relation-backfill-failures">失败详情</h3>
             <ul>
               {#each state.failures as failure (`${failure.note_id}:${failure.error}`)}
-                <li><strong>{failure.note_id}</strong><span>{failure.error}</span></li>
+                <li>
+                  <strong>{failure.note_id || "图谱索引"}</strong>
+                  <span>此项未完成，可以重新预览后重试。</span>
+                  <details class="technical"><summary>技术详情</summary><pre>{failure.error}</pre></details>
+                </li>
               {/each}
             </ul>
           </section>
@@ -176,7 +194,7 @@
         <button class="secondary danger" type="button" onclick={cancel}>取消补建</button>
       {:else if state.phase === "cancel-requested"}
         <button class="secondary" type="button" disabled>等待取消</button>
-      {:else if state.phase === "failed" || state.phase === "cancelled"}
+      {:else if state.phase === "failed" || state.phase === "partial" || state.phase === "cancelled"}
         <button class="primary" type="button" onclick={resume}>继续未完成笔记</button>
       {/if}
     </footer>
@@ -229,6 +247,9 @@
   .failures { margin-top: 1.25rem; }
   .failures li { display: grid; gap: 0.25rem; padding: 0.75rem 0; border-bottom: 1px solid var(--hairline); overflow-wrap: anywhere; }
   .failures li span { color: var(--ink-secondary); font-size: 0.82rem; line-height: 1.5; }
+  .technical { margin-top: 0.65rem; color: var(--ink-secondary); font-size: 0.78rem; }
+  .technical summary { min-height: 2.25rem; display: flex; align-items: center; cursor: pointer; }
+  .technical pre { max-height: 12rem; margin: 0.35rem 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font: 0.76rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
   button { min-height: 2.25rem; padding: 0.45rem 0.85rem; border-radius: var(--radius-md); font: inherit; cursor: pointer; }
   button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button:disabled { cursor: default; opacity: 0.48; }

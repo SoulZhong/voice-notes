@@ -6,15 +6,19 @@ import type {
   BackfillProgress,
   BackfillRequest,
 } from "./knowledge";
+import type { GraphIndexStatus } from "./knowledgeGovernance";
 
 export type RelationBackfillPhase =
   | "idle"
   | "preview-loading"
   | "preview-ready"
   | "preview-error"
+  | "starting"
   | "running"
   | "cancel-requested"
+  | "waiting-for-index"
   | "completed"
+  | "partial"
   | "failed"
   | "cancelled";
 
@@ -22,18 +26,23 @@ export interface RelationBackfillState {
   phase: RelationBackfillPhase;
   preview: BackfillPreview | null;
   acknowledged: boolean;
+  runId: string | null;
   completed: number;
   total: number;
   currentNoteId: string | null;
   failures: BackfillFailure[];
+  rebuildGeneration: number | null;
   error: string;
+  technicalError: string;
 }
 
 export interface RelationBackfillApi {
   preview(noteIds?: string[]): Promise<BackfillPreview>;
   start(request: BackfillRequest): Promise<void>;
-  cancel(): Promise<void>;
+  cancel(runId: string): Promise<void>;
   subscribe(handler: (progress: BackfillProgress) => void): Promise<UnlistenFn>;
+  subscribeIndex(handler: (status: GraphIndexStatus) => void): Promise<UnlistenFn>;
+  createRunId(): string;
 }
 
 export interface RelationBackfillController {
@@ -52,11 +61,14 @@ const initialState = (): RelationBackfillState => ({
   phase: "idle",
   preview: null,
   acknowledged: false,
+  runId: null,
   completed: 0,
   total: 0,
   currentNoteId: null,
   failures: [],
+  rebuildGeneration: null,
   error: "",
+  technicalError: "",
 });
 
 function errorMessage(error: unknown): string {
@@ -65,14 +77,20 @@ function errorMessage(error: unknown): string {
   return text || "未知错误";
 }
 
+function failureDetails(failures: BackfillFailure[]): string {
+  return failures
+    .map((failure) => `${failure.note_id || "索引重建"}：${failure.error}`)
+    .join("\n");
+}
+
 export const previewRelationBackfill = (noteIds?: string[]) =>
   invoke<BackfillPreview>("preview_relation_backfill", { noteIds: noteIds ?? null });
 
 export const startRelationBackfill = (request: BackfillRequest) =>
   invoke<void>("start_relation_backfill", { request });
 
-export const cancelRelationBackfill = () =>
-  invoke<void>("cancel_relation_backfill");
+export const cancelRelationBackfill = (runId: string) =>
+  invoke<void>("cancel_relation_backfill", { runId });
 
 export function subscribeRelationBackfill(
   handler: (progress: BackfillProgress) => void,
@@ -80,23 +98,41 @@ export function subscribeRelationBackfill(
   return listen<BackfillProgress>("relation_backfill_progress", (event) => handler(event.payload));
 }
 
+export function subscribeRelationBackfillIndexStatus(
+  handler: (status: GraphIndexStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<GraphIndexStatus>("graph_index_status", (event) => handler(event.payload));
+}
+
+function createRunId(): string {
+  return `run-${globalThis.crypto.randomUUID()}`;
+}
+
 export const relationBackfillApi: RelationBackfillApi = {
   preview: previewRelationBackfill,
   start: startRelationBackfill,
   cancel: cancelRelationBackfill,
   subscribe: subscribeRelationBackfill,
+  subscribeIndex: subscribeRelationBackfillIndexStatus,
+  createRunId,
 };
 
 /**
- * One controller owns one dialog lifetime. Its monotonically increasing session
- * token rejects both late previews and progress queued by a previous run.
+ * One controller owns one dialog lifetime. Session and backend run IDs are
+ * independent: the first rejects stale promises, the second rejects stale
+ * events even when they arrive through a newly installed listener.
  */
 export function createRelationBackfillController(
   api: RelationBackfillApi = relationBackfillApi,
 ): RelationBackfillController {
   let state = initialState();
   let session = 0;
-  let activeUnlisten: UnlistenFn | null = null;
+  let progressUnlisten: UnlistenFn | null = null;
+  let indexUnlisten: UnlistenFn | null = null;
+  let startInFlight: Promise<void> | null = null;
+  let runSettled = false;
+  let targetGeneration: number | null = null;
+  const bufferedIndexTerminals = new Map<number, GraphIndexStatus>();
   const subscribers = new Set<(value: RelationBackfillState) => void>();
 
   const publish = (next: RelationBackfillState) => {
@@ -105,9 +141,39 @@ export function createRelationBackfillController(
   };
   const patch = (next: Partial<RelationBackfillState>) => publish({ ...state, ...next });
   const cleanup = () => {
-    const unlisten = activeUnlisten;
-    activeUnlisten = null;
-    unlisten?.();
+    const progress = progressUnlisten;
+    const index = indexUnlisten;
+    progressUnlisten = null;
+    indexUnlisten = null;
+    progress?.();
+    index?.();
+  };
+  const resetRunTracking = () => {
+    runSettled = false;
+    targetGeneration = null;
+    bufferedIndexTerminals.clear();
+  };
+  const settle = (
+    phase: Extract<RelationBackfillPhase, "completed" | "partial" | "failed" | "cancelled">,
+    summary = "",
+    technicalError = "",
+  ) => {
+    if (runSettled) return;
+    runSettled = true;
+    patch({ phase, currentNoteId: null, error: summary, technicalError });
+    cleanup();
+  };
+  const handleIndexTerminal = (status: GraphIndexStatus) => {
+    if (runSettled || targetGeneration === null || status.generation !== targetGeneration) return;
+    if (status.state === "ready") {
+      settle("completed");
+    } else if (status.state === "error") {
+      settle(
+        "failed",
+        "关系已经处理，但图谱索引未能安全更新。可以重新预览未完成笔记。",
+        status.error || "后端未提供索引失败详情",
+      );
+    }
   };
 
   const controller: RelationBackfillController = {
@@ -122,6 +188,7 @@ export function createRelationBackfillController(
     async preview(noteIds) {
       const token = ++session;
       cleanup();
+      resetRunTracking();
       publish({ ...initialState(), phase: "preview-loading" });
       try {
         const value = await api.preview(noteIds);
@@ -137,7 +204,8 @@ export function createRelationBackfillController(
         publish({
           ...initialState(),
           phase: "preview-error",
-          error: `无法预览关系补建：${errorMessage(cause)}。请检查执行体配置后重新预览。`,
+          error: "无法预览关系补建。请检查执行体配置后重新预览。",
+          technicalError: errorMessage(cause),
         });
       }
     },
@@ -145,88 +213,170 @@ export function createRelationBackfillController(
       if (state.phase !== "preview-ready") return;
       patch({ acknowledged: value });
     },
-    async start() {
+    start() {
+      if (startInFlight) return startInFlight;
       const selected = state.preview;
       if (state.phase !== "preview-ready" || !selected) {
-        throw new Error("请先完成补建预览。");
+        return Promise.reject(new Error("请先完成补建预览。"));
       }
       if (!state.acknowledged) {
-        throw new Error("请先确认隐私提示与本次补建范围。");
+        return Promise.reject(new Error("请先确认隐私提示与本次补建范围。"));
       }
 
       const token = session;
+      const runId = api.createRunId();
+      const request: BackfillRequest = {
+        run_id: runId,
+        consent_token: selected.consent_token,
+        note_ids: [...selected.note_ids],
+        provider: selected.provider,
+        model: selected.model,
+        contract_version: selected.contract_version,
+      };
       cleanup();
-      try {
-        const unlisten = await api.subscribe((event) => {
-          if (token !== session) return;
-          const terminal = event.state === "completed" || event.state === "failed" || event.state === "cancelled";
-          publish({
-            ...state,
-            phase: event.state,
-            completed: event.completed,
-            total: event.total,
-            currentNoteId: event.current_note_id,
-            failures: [...event.failed],
-            error: event.state === "failed" && event.failed.length === 0
-              ? "关系补建未完成，执行体没有返回详细失败原因。可以重新预览未完成笔记。"
-              : state.error,
+      resetRunTracking();
+      patch({
+        phase: "starting",
+        runId,
+        completed: 0,
+        total: selected.note_ids.length,
+        currentNoteId: null,
+        failures: [],
+        rebuildGeneration: null,
+        error: "",
+        technicalError: "",
+      });
+
+      let task!: Promise<void>;
+      task = (async () => {
+        try {
+          const progressListener = await api.subscribe((event) => {
+            if (token !== session || event.run_id !== runId || runSettled) return;
+            const failures = [...event.failed];
+            const technicalError = failureDetails(failures);
+            if (event.state === "running") {
+              patch({
+                phase: "running",
+                completed: event.completed,
+                total: event.total,
+                currentNoteId: event.current_note_id,
+                failures,
+                error: failures.length > 0 ? "部分笔记尚未完成；可展开技术详情查看原因。" : "",
+                technicalError,
+              });
+              return;
+            }
+            patch({
+              completed: event.completed,
+              total: event.total,
+              currentNoteId: null,
+              failures,
+              rebuildGeneration: event.rebuild_generation,
+            });
+            if (event.state === "completed" && failures.length === 0) {
+              const generation = event.rebuild_generation;
+              if (!Number.isSafeInteger(generation) || (generation ?? 0) <= 0) {
+                settle(
+                  "failed",
+                  "关系已经处理，但后端没有返回可核对的索引版本。可以重新预览后重试。",
+                  "completed progress missing rebuild_generation",
+                );
+                return;
+              }
+              targetGeneration = generation as number;
+              patch({
+                phase: "waiting-for-index",
+                error: "关系处理完成，正在等待对应的图谱索引安全发布。",
+                technicalError: "",
+              });
+              const buffered = bufferedIndexTerminals.get(targetGeneration);
+              bufferedIndexTerminals.clear();
+              if (buffered) handleIndexTerminal(buffered);
+              return;
+            }
+            if (event.state === "cancelled") {
+              settle("cancelled", "关系补建已取消。未完成笔记可以重新预览后继续。", technicalError);
+              return;
+            }
+            const partial = event.state === "partial" || failures.length > 0;
+            settle(
+              partial ? "partial" : "failed",
+              partial
+                ? "部分笔记未完成。可以重新预览未完成笔记后继续。"
+                : "关系补建未完成。可以重新预览未完成笔记后重试。",
+              technicalError || "后端未提供关系补建失败详情",
+            );
           });
-          if (terminal) cleanup();
-        });
-        if (token !== session) {
-          unlisten();
-          return;
-        }
-        activeUnlisten = unlisten;
-        // Listener installation must finish before the command can emit its
-        // first running event.
-        await api.start({ note_ids: [...selected.note_ids], provider: selected.provider });
-        if (token !== session) return;
-        if (state.phase === "preview-ready") {
-          patch({
-            phase: "running",
-            completed: 0,
-            total: selected.note_ids.length,
-            currentNoteId: null,
-            failures: [],
-            error: "",
+          if (token !== session || runSettled) {
+            progressListener();
+            return;
+          }
+          progressUnlisten = progressListener;
+
+          const rebuildListener = await api.subscribeIndex((status) => {
+            if (token !== session || runSettled) return;
+            if (status.state !== "ready" && status.state !== "error") return;
+            if (targetGeneration === null) {
+              bufferedIndexTerminals.set(status.generation, status);
+              if (bufferedIndexTerminals.size > 32) {
+                const oldest = bufferedIndexTerminals.keys().next().value;
+                if (oldest !== undefined) bufferedIndexTerminals.delete(oldest);
+              }
+              return;
+            }
+            handleIndexTerminal(status);
           });
+          if (token !== session || runSettled) {
+            rebuildListener();
+            return;
+          }
+          indexUnlisten = rebuildListener;
+
+          await api.start(request);
+          if (token !== session || runSettled) return;
+          if (state.phase === "starting") patch({ phase: "running" });
+        } catch (cause) {
+          if (token !== session || runSettled) throw cause;
+          settle(
+            "failed",
+            "关系补建未能启动。请重新预览并检查执行体配置。",
+            errorMessage(cause),
+          );
+          throw cause;
+        } finally {
+          if (startInFlight === task) startInFlight = null;
         }
-      } catch (cause) {
-        if (token !== session) return;
-        cleanup();
-        patch({
-          phase: "failed",
-          error: `关系补建未能启动：${errorMessage(cause)}。可以重新预览未完成笔记后重试。`,
-        });
-        throw cause;
-      }
+      })();
+      startInFlight = task;
+      return task;
     },
     async cancel() {
-      if (state.phase !== "running") return;
+      const runId = state.runId;
+      if (state.phase !== "running" || !runId) return;
       const token = session;
-      patch({ phase: "cancel-requested", error: "" });
+      patch({ phase: "cancel-requested", error: "", technicalError: "" });
       try {
-        await api.cancel();
+        await api.cancel(runId);
       } catch (cause) {
-        if (token !== session) return;
+        if (token !== session || state.runId !== runId || runSettled) return;
         patch({
           phase: "running",
-          error: `取消请求未送达：${errorMessage(cause)}。补建可能仍在继续，请再次尝试。`,
+          error: "取消请求未送达。补建可能仍在继续，请再次尝试。",
+          technicalError: errorMessage(cause),
         });
         throw cause;
       }
     },
     async resume() {
-      if (state.phase !== "failed" && state.phase !== "cancelled") {
-        throw new Error("只有失败或已取消的补建可以继续。");
+      if (state.phase !== "failed" && state.phase !== "cancelled" && state.phase !== "partial") {
+        throw new Error("只有失败、部分完成或已取消的补建可以继续。");
       }
-      // Undefined intentionally asks the backend for its durable unfinished set.
       await controller.preview(undefined);
     },
     close() {
       ++session;
       cleanup();
+      resetRunTracking();
       publish(initialState());
     },
     dispose() {
