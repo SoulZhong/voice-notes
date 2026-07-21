@@ -106,18 +106,27 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
 
 /// 探测全部四家的解析结果,供设置页展示「已检测到/未检测到」。
 pub fn probe_all() -> Vec<(&'static str, Option<String>)> {
-    [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini, AgentKind::Cursor]
-        .into_iter()
-        .map(|k| (k.key(), resolve_bin(k, "").map(|p| p.display().to_string())))
-        .collect()
+    [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Gemini,
+        AgentKind::Cursor,
+    ]
+    .into_iter()
+    .map(|k| (k.key(), resolve_bin(k, "").map(|p| p.display().to_string())))
+    .collect()
 }
 
 /// 「测试运行」:用配好的 CLI 跑一句极短提示,验证能启动并产出。不依赖任何笔记,
 /// 不落 AI 日志。成功返回 stdout 摘要;失败返回归类原因。
 pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<String, String> {
     let kind = AgentKind::from_key(provider).ok_or_else(|| format!("未知 Agent: {provider}"))?;
-    let bin = resolve_bin(kind, bin_override)
-        .ok_or_else(|| format!("未找到 {} 命令行工具:请先安装并登录,或指定 CLI 路径", kind.bin_name()))?;
+    let bin = resolve_bin(kind, bin_override).ok_or_else(|| {
+        format!(
+            "未找到 {} 命令行工具:请先安装并登录,或指定 CLI 路径",
+            kind.bin_name()
+        )
+    })?;
     let scratch = make_scratch("probe").map_err(|e| format!("建工作区失败: {e}"))?;
     let prompt = "只回复两个字:正常。不要任何解释。";
     let run = (|| -> anyhow::Result<(bool, String, String)> {
@@ -140,7 +149,14 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
             } else if stdout.trim().is_empty() {
                 Err("无输出:CLI 可能未登录或未产出结果".to_string())
             } else {
-                let first: String = stdout.trim().lines().next().unwrap_or("").chars().take(30).collect();
+                let first: String = stdout
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(30)
+                    .collect();
                 Ok(format!("CLI 可用,返回:{first}"))
             }
         }
@@ -152,7 +168,7 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
 /// gemini/cursor 是裸名),提示词里只用裸名,由各家自行映射。
 fn refine_prompt(note_id: &str) -> String {
     format!(
-        "你是会议逐字稿精修助手。任务:精修 voice-notes 笔记 {note_id} 的精修稿文本。\n\
+        "你是会议逐字稿精修与语义图谱助手。任务:完成 voice-notes 笔记 {note_id} 的文本与图谱 Aing。\n\
          步骤:\n\
          1. 调用 MCP 工具 get_note,参数 {{\"note_id\":\"{note_id}\",\"format\":\"segments\"}},\
          取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。\n\
@@ -164,7 +180,16 @@ fn refine_prompt(note_id: &str) -> String {
          3. 调用 MCP 工具 apply_refined_texts 一次性写回,参数 \
          {{\"note_id\":\"{note_id}\",\"updates\":[{{\"index\":段落下标,\"text\":\"该段修订后的完整文本\"}},...],\
          \"model\":\"你的模型名\"}};只提交有改动的段落;若全文确无需要修订,updates 传空数组 []。\n\
-         只允许使用这两个 MCP 工具;不要读写任何文件,不要执行任何命令。完成后回复一行「完成」即可。"
+         4. 文本写回成功后才调用 get_aing_context({{\"note_id\":\"{note_id}\"}}重新读取最终 paragraphs、\
+         source_seqs、实体/mention、core_predicates、contract_version 与当前 source_hash。不得使用步骤 1 的旧文本做证据。\n\
+         5. 基于该 context 抽取实体和有原文证据的关系。predicate 只用 core_predicates 或带非空 label 的 custom;\
+         evidence 的 paragraph_index 与 Unicode scalar start/end 必须指向最终段落,quote 必须逐字符精确匹配,\
+         source_seqs/source_hash 必须照 context 当前值提交。\n\
+         6. 只调用一次 apply_aing_graph,提交 note_id、entities、relations、contract_version、model。\
+         每个 entity 给一个本次载荷内唯一的临时 id,关系 subject/object 引用这些临时 id;服务端会重算全部持久 ID 与 mentions。\
+         没有可靠关系时 relations 传空数组 []，仍须提交实体和图谱完成态。\n\
+         只允许使用 get_note、apply_refined_texts、get_aing_context、apply_aing_graph 四个 MCP 工具;\
+         不要读写任何文件,不要执行任何命令。完成后回复一行「完成」即可。"
     )
 }
 
@@ -184,7 +209,11 @@ fn self_exe() -> anyhow::Result<PathBuf> {
 fn mcp_servers_json(exe: &Path) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
-            "voice-notes": { "command": exe.to_string_lossy(), "args": ["mcp", "serve"] }
+            "voice-notes": {
+                "command": exe.to_string_lossy(),
+                "args": ["mcp", "serve"],
+                "env": { "VN_MCP_AGENT_MODE": "1" }
+            }
         }
     })
 }
@@ -201,19 +230,31 @@ fn refine_command(
 ) -> anyhow::Result<Command> {
     let mut cmd = Command::new(bin);
     cmd.current_dir(scratch);
+    // 即使某家 CLI 忽略 MCP server 条目里的 env，stdio 子进程仍从 CLI 继承此值；
+    // server 端据此只注册 Aing 所需四工具，控制录制等其它 MCP 工具不可见也不可调。
+    cmd.env("VN_MCP_AGENT_MODE", "1");
     match kind {
         AgentKind::Claude => {
             // --strict-mcp-config:只用内联这一份,不加载用户全局 MCP 配置(否则用户
-            // 注册过的其它 server 全部起进程,慢且面大)。白名单只放行两只只读/约束写工具。
-            cmd.args(["-p", prompt, "--output-format", "json", "--strict-mcp-config"])
-                .arg("--mcp-config")
-                .arg(mcp_servers_json(exe).to_string())
-                .args([
-                    "--allowedTools",
-                    "mcp__voice-notes__get_note,mcp__voice-notes__apply_refined_texts",
-                    "--max-turns",
-                    "30",
-                ]);
+            // 注册过的其它 server 全部起进程,慢且面大)。白名单只放行四只 Aing 读写工具。
+            cmd.args([
+                "-p",
+                prompt,
+                "--output-format",
+                "json",
+                "--strict-mcp-config",
+            ])
+            .arg("--mcp-config")
+            .arg(mcp_servers_json(exe).to_string())
+            .args([
+                "--allowedTools",
+                "mcp__voice-notes__get_note,mcp__voice-notes__apply_refined_texts,\
+mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
+                "--tools",
+                "",
+                "--max-turns",
+                "45",
+            ]);
             if !model.is_empty() {
                 cmd.args(["--model", model]);
             }
@@ -223,7 +264,10 @@ fn refine_command(
             // 不写用户 ~/.codex/config.toml。scratch 不是 git 仓库,须 --skip-git-repo-check。
             cmd.args(["exec", "--skip-git-repo-check", "--sandbox", "read-only"])
                 .arg("-c")
-                .arg(format!("mcp_servers.voice-notes.command={:?}", exe.to_string_lossy()))
+                .arg(format!(
+                    "mcp_servers.voice-notes.command={:?}",
+                    exe.to_string_lossy()
+                ))
                 .arg("-c")
                 .arg(r#"mcp_servers.voice-notes.args=["mcp","serve"]"#);
             if !model.is_empty() {
@@ -234,12 +278,21 @@ fn refine_command(
         AgentKind::Gemini => {
             // gemini 只认 settings.json 里的 mcpServers → 写进一次性工作区的项目级配置;
             // coreTools=[] 关掉全部内置工具(shell/文件读写),这样 yolo 自动批准的只剩
-            // 白名单 MCP server 的两只工具,面收得比默认(内置工具全开)更小。
+            // 白名单 MCP server 的四只工具,面收得比默认(内置工具全开)更小。
             let dir = scratch.join(".gemini");
             std::fs::create_dir_all(&dir)?;
             let mut settings = mcp_servers_json(exe);
             settings["coreTools"] = serde_json::json!([]);
-            std::fs::write(dir.join("settings.json"), serde_json::to_vec_pretty(&settings)?)?;
+            settings["mcpServers"]["voice-notes"]["includeTools"] = serde_json::json!([
+                "get_note",
+                "apply_refined_texts",
+                "get_aing_context",
+                "apply_aing_graph"
+            ]);
+            std::fs::write(
+                dir.join("settings.json"),
+                serde_json::to_vec_pretty(&settings)?,
+            )?;
             cmd.args([
                 prompt,
                 "-o",
@@ -258,10 +311,20 @@ fn refine_command(
             // --approve-mcps 自动批准 MCP server。不给 --force(那是放行 shell 命令的)。
             let dir = scratch.join(".cursor");
             std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join("mcp.json"), serde_json::to_vec_pretty(&mcp_servers_json(exe))?)?;
-            cmd.args(["-p", prompt, "--output-format", "text", "--trust", "--approve-mcps"])
-                .arg("--workspace")
-                .arg(scratch);
+            std::fs::write(
+                dir.join("mcp.json"),
+                serde_json::to_vec_pretty(&mcp_servers_json(exe))?,
+            )?;
+            cmd.args([
+                "-p",
+                prompt,
+                "--output-format",
+                "text",
+                "--trust",
+                "--approve-mcps",
+            ])
+            .arg("--workspace")
+            .arg(scratch);
             if !model.is_empty() {
                 cmd.args(["--model", model]);
             }
@@ -272,7 +335,13 @@ fn refine_command(
 
 /// 标题一发一收(无 MCP、无工具)。输出解析统一为「stdout 最后一个非空行」——各家
 /// 文本模式的最终答复都在末尾,前面混进的日志/横幅靠调用方的长度守卫兜底拒绝。
-fn title_command(kind: AgentKind, bin: &Path, model: &str, prompt: &str, scratch: &Path) -> Command {
+fn title_command(
+    kind: AgentKind,
+    bin: &Path,
+    model: &str,
+    prompt: &str,
+    scratch: &Path,
+) -> Command {
     let mut cmd = Command::new(bin);
     cmd.current_dir(scratch);
     match kind {
@@ -318,7 +387,9 @@ fn proxy_env_to_inject() -> Vec<(String, String)> {
     if KEYS.iter().any(|k| std::env::var_os(k).is_some()) {
         return Vec::new();
     }
-    let Ok(out) = Command::new("scutil").arg("--proxy").output() else { return Vec::new() };
+    let Ok(out) = Command::new("scutil").arg("--proxy").output() else {
+        return Vec::new();
+    };
     parse_scutil_proxy(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -328,7 +399,11 @@ fn proxy_env_to_inject() -> Vec<(String, String)> {
 fn parse_scutil_proxy(text: &str) -> Vec<(String, String)> {
     let get = |key: &str| -> Option<String> {
         text.lines().find_map(|l| {
-            l.trim().strip_prefix(key)?.trim().strip_prefix(':').map(|v| v.trim().to_string())
+            l.trim()
+                .strip_prefix(key)?
+                .trim()
+                .strip_prefix(':')
+                .map(|v| v.trim().to_string())
         })
     };
     let enabled = |key: &str| get(key).as_deref() == Some("1");
@@ -341,10 +416,20 @@ fn parse_scutil_proxy(text: &str) -> Vec<(String, String)> {
         }
     };
     if enabled("HTTPEnable") {
-        push_pair("http_proxy", "HTTP_PROXY", get("HTTPProxy"), get("HTTPPort"));
+        push_pair(
+            "http_proxy",
+            "HTTP_PROXY",
+            get("HTTPProxy"),
+            get("HTTPPort"),
+        );
     }
     if enabled("HTTPSEnable") {
-        push_pair("https_proxy", "HTTPS_PROXY", get("HTTPSProxy"), get("HTTPSPort"));
+        push_pair(
+            "https_proxy",
+            "HTTPS_PROXY",
+            get("HTTPSProxy"),
+            get("HTTPSPort"),
+        );
     }
     if !out.is_empty() {
         out.push(("no_proxy".into(), "localhost,127.0.0.1".into()));
@@ -356,7 +441,11 @@ fn parse_scutil_proxy(text: &str) -> Vec<(String, String)> {
 /// spawn + 限时等待。stdout/stderr 重定向到 scratch 下的文件——用管道的话,子进程
 /// 输出超过管道缓冲而这边只在轮询 try_wait 不读管道,会互相卡死。超时 kill 判失败。
 /// 返回 (exit_ok, stdout, stderr尾部)。
-fn run_with_timeout(mut cmd: Command, scratch: &Path, timeout_s: u64) -> anyhow::Result<(bool, String, String)> {
+fn run_with_timeout(
+    mut cmd: Command,
+    scratch: &Path,
+    timeout_s: u64,
+) -> anyhow::Result<(bool, String, String)> {
     for (k, v) in proxy_env_to_inject() {
         cmd.env(k, v);
     }
@@ -383,7 +472,15 @@ fn run_with_timeout(mut cmd: Command, scratch: &Path, timeout_s: u64) -> anyhow:
     };
     let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-    let err_tail: String = stderr.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    let err_tail: String = stderr
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok((status.success(), stdout, err_tail))
 }
 
@@ -413,14 +510,20 @@ pub fn run_refine(
 ) -> anyhow::Result<()> {
     let before = load_refined(note_dir)
         .ok_or_else(|| anyhow::anyhow!("盘上没有可 Aing 的 aing.json(应先跑本地两段)"))?;
-    anyhow::ensure!(before.stages.llm != "done", "aing.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败");
+    anyhow::ensure!(
+        before.stages.llm != "done",
+        "aing.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败"
+    );
     let scratch = make_scratch(note_id)?;
     let prompt = refine_prompt(note_id);
     let started = std::time::Instant::now();
     let result = (|| -> anyhow::Result<(Vec<String>, bool, String, String)> {
         let exe = self_exe()?;
         let cmd = refine_command(kind, bin, model, &prompt, &exe, &scratch)?;
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         let (exit_ok, stdout, err_tail) = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S)?;
         Ok((args, exit_ok, stdout, err_tail))
     })();
@@ -440,6 +543,30 @@ pub fn run_refine(
                 "Agent 未完成写回(exit_ok={exit_ok},盘上 llm={});stderr 尾部:\n{err_tail}",
                 after.stages.llm
             );
+            let current_hash = crate::store::source_hash(&after.paragraphs);
+            let graph_error = if after.stages.entities != "done" {
+                Some(format!("entities={}", after.stages.entities))
+            } else if after.stages.relations != "done" {
+                Some(format!("relations={}", after.stages.relations))
+            } else if after
+                .graph_extraction
+                .as_ref()
+                .map(|extraction| extraction.source_hash.as_str())
+                != Some(current_hash.as_str())
+            {
+                Some("graph_extraction.source_hash 与最终文本不一致".into())
+            } else {
+                None
+            };
+            if let Some(graph_error) = graph_error {
+                let mark_error = mark_graph_failed(note_dir).err();
+                let suffix = mark_error
+                    .map(|error| format!(";失败状态落盘失败:{error}"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "Agent 图谱写回失败(exit_ok={exit_ok},{graph_error});stderr 尾部:\n{err_tail}{suffix}"
+                );
+            }
             Ok(())
         })(),
     };
@@ -470,6 +597,19 @@ pub fn run_refine(
     }
     let _ = std::fs::remove_dir_all(&scratch);
     verdict
+}
+
+fn mark_graph_failed(note_dir: &Path) -> anyhow::Result<()> {
+    let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
+        .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
+    let mut latest = crate::store::refined::load_refined_locked(note_dir, &note_lock)
+        .ok_or_else(|| anyhow::anyhow!("aing.json 不存在或已损坏"))?;
+    if latest.stages.llm == "done" {
+        latest.stages.entities = "failed".into();
+        latest.stages.relations = "failed".into();
+        crate::store::refined::write_refined_atomic_locked(note_dir, &latest, &note_lock)?;
+    }
+    Ok(())
 }
 
 /// 为整场笔记生成主题标题(语义与 llm::gen_title 一致:锦上添花,失败即放弃)。
@@ -536,8 +676,16 @@ pub fn gen_title(
 /// stdout 最后一个非空行 → 去引号 → 长度守卫(与 llm::gen_title 同一守卫:空、
 /// 超长、含换行都视为不服从指令,放弃)。
 fn extract_title(stdout: &str) -> anyhow::Result<String> {
-    let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let title = last.trim().trim_matches(['"', '“', '”', '「', '」', '《', '》', '。']).trim().to_string();
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let title = last
+        .trim()
+        .trim_matches(['"', '“', '”', '「', '」', '《', '》', '。'])
+        .trim()
+        .to_string();
     if title.is_empty() || title.chars().count() > 20 {
         anyhow::bail!("标题不合规,放弃: {title:?}");
     }
@@ -554,7 +702,13 @@ mod tests {
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: llm.into(), entities: "off".into(), relations: "off".into() },
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: llm.into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
             discarded_seqs: vec![],
             entities: vec![],
             graph_extraction: None,
@@ -576,6 +730,22 @@ mod tests {
         }
     }
 
+    fn graph_done_doc(texts: &[&str]) -> RefinedDoc {
+        let mut doc = doc("done", texts);
+        doc.stages.entities = "done".into();
+        doc.stages.relations = "done".into();
+        doc.graph_extraction = Some(crate::store::GraphExtraction {
+            contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+            provider: "agent".into(),
+            model: "test-model".into(),
+            run_id: "run-test".into(),
+            generated_at: doc.generated_at.clone(),
+            source_hash: crate::store::source_hash(&doc.paragraphs),
+            mode: "agent".into(),
+        });
+        doc
+    }
+
     /// 写一个假 Agent 可执行脚本。body 里可用 $1..(prompt 等参数),测试把要写的
     /// 目标路径直接烤进脚本文本。
     fn fake_bin(dir: &Path, body: &str) -> PathBuf {
@@ -588,20 +758,35 @@ mod tests {
 
     #[test]
     fn kind_key_roundtrip_and_bin_names() {
-        for k in [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini, AgentKind::Cursor] {
+        for k in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::Cursor,
+        ] {
             assert_eq!(AgentKind::from_key(k.key()), Some(k));
         }
         assert_eq!(AgentKind::from_key("bogus"), None);
-        assert_eq!(AgentKind::Cursor.bin_name(), "cursor-agent", "Cursor 的 CLI 是 cursor-agent");
+        assert_eq!(
+            AgentKind::Cursor.bin_name(),
+            "cursor-agent",
+            "Cursor 的 CLI 是 cursor-agent"
+        );
     }
 
     #[test]
     fn resolve_bin_override_must_exist_and_never_falls_back() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-bin");
-        assert!(resolve_bin(AgentKind::Claude, missing.to_str().unwrap()).is_none(), "显式路径不存在不得回退探测");
+        assert!(
+            resolve_bin(AgentKind::Claude, missing.to_str().unwrap()).is_none(),
+            "显式路径不存在不得回退探测"
+        );
         let bin = fake_bin(tmp.path(), "exit 0");
-        assert_eq!(resolve_bin(AgentKind::Claude, bin.to_str().unwrap()), Some(bin));
+        assert_eq!(
+            resolve_bin(AgentKind::Claude, bin.to_str().unwrap()),
+            Some(bin)
+        );
     }
 
     #[test]
@@ -616,29 +801,157 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(args.contains(&"--strict-mcp-config".to_string()), "必须隔离用户全局 MCP 配置: {args:?}");
-        assert!(args.iter().any(|a| a.contains("mcp__voice-notes__get_note")), "白名单缺 get_note");
-        assert!(args.iter().any(|a| a.contains("apply_refined_texts")), "白名单缺写回工具");
-        assert!(args.iter().any(|a| a.contains("\"mcpServers\"")), "缺内联 mcp-config");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "必须隔离用户全局 MCP 配置: {args:?}"
+        );
+        let allowed = args
+            .windows(2)
+            .find(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .expect("缺 --allowedTools");
+        assert_eq!(
+            allowed,
+            "mcp__voice-notes__get_note,mcp__voice-notes__apply_refined_texts,\
+mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--tools" && pair[1].is_empty()),
+            "Claude 内置工具必须关闭: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("\"mcpServers\"")),
+            "缺内联 mcp-config"
+        );
         assert!(args.contains(&"haiku".to_string()));
+    }
+
+    #[test]
+    fn every_refine_command_selects_the_agent_only_mcp_surface() {
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::Cursor,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cmd = refine_command(
+                kind,
+                Path::new("/bin/echo"),
+                "",
+                "P",
+                Path::new("/app/vn"),
+                tmp.path(),
+            )
+            .unwrap();
+            let agent_mode = cmd
+                .get_envs()
+                .find(|(key, _)| *key == "VN_MCP_AGENT_MODE")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned());
+            assert_eq!(
+                agent_mode.as_deref(),
+                Some("1"),
+                "{} 未限制 MCP 工具面",
+                kind.key()
+            );
+
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            match kind {
+                AgentKind::Codex => assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--sandbox", "read-only"]),
+                    "Codex 内置文件写/shell 面必须保持只读: {args:?}"
+                ),
+                AgentKind::Gemini => {
+                    let settings: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(tmp.path().join(".gemini/settings.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(settings["coreTools"], serde_json::json!([]));
+                    assert_eq!(
+                        settings["mcpServers"]["voice-notes"]["includeTools"],
+                        serde_json::json!([
+                            "get_note",
+                            "apply_refined_texts",
+                            "get_aing_context",
+                            "apply_aing_graph"
+                        ])
+                    );
+                }
+                AgentKind::Cursor => {
+                    assert!(!args.iter().any(|arg| arg == "--force" || arg == "--yolo"))
+                }
+                AgentKind::Claude => {}
+            }
+        }
+    }
+
+    #[test]
+    fn refine_prompt_requires_text_commit_before_one_graph_commit() {
+        let prompt = refine_prompt("note-1");
+        let get_note = prompt.find("get_note").unwrap();
+        let apply_text = prompt.find("apply_refined_texts").unwrap();
+        let get_context = prompt.find("get_aing_context").unwrap();
+        let apply_graph = prompt.find("apply_aing_graph").unwrap();
+        assert!(get_note < apply_text && apply_text < get_context && get_context < apply_graph);
+        assert!(prompt.contains("relations 传空数组 []"));
+        assert!(prompt.contains("只调用一次 apply_aing_graph"));
     }
 
     #[test]
     fn refine_command_gemini_and_cursor_write_workspace_configs() {
         let tmp = tempfile::tempdir().unwrap();
-        let _ = refine_command(AgentKind::Gemini, Path::new("/bin/echo"), "", "P", Path::new("/app/vn"), tmp.path()).unwrap();
-        let gemini: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.path().join(".gemini/settings.json")).unwrap()).unwrap();
+        let _ = refine_command(
+            AgentKind::Gemini,
+            Path::new("/bin/echo"),
+            "",
+            "P",
+            Path::new("/app/vn"),
+            tmp.path(),
+        )
+        .unwrap();
+        let gemini: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(gemini["mcpServers"]["voice-notes"]["command"], "/app/vn");
-        assert_eq!(gemini["coreTools"], serde_json::json!([]), "内置工具必须全关,yolo 才收得住面");
+        assert_eq!(
+            gemini["coreTools"],
+            serde_json::json!([]),
+            "内置工具必须全关,yolo 才收得住面"
+        );
         let tmp2 = tempfile::tempdir().unwrap();
-        let cmd = refine_command(AgentKind::Cursor, Path::new("/bin/echo"), "", "P", Path::new("/app/vn"), tmp2.path()).unwrap();
-        let cursor: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp2.path().join(".cursor/mcp.json")).unwrap()).unwrap();
+        let cmd = refine_command(
+            AgentKind::Cursor,
+            Path::new("/bin/echo"),
+            "",
+            "P",
+            Path::new("/app/vn"),
+            tmp2.path(),
+        )
+        .unwrap();
+        let cursor: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp2.path().join(".cursor/mcp.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(cursor["mcpServers"]["voice-notes"]["args"][0], "mcp");
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(!args.contains(&"--force".to_string()), "不得放行 shell 命令");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.contains(&"--force".to_string()),
+            "不得放行 shell 命令"
+        );
     }
 
     #[test]
@@ -648,7 +961,9 @@ mod tests {
         write_refined_atomic(note.path(), &doc("off", &["原文"])).unwrap();
         let bins = tempfile::tempdir().unwrap();
         let lazy = fake_bin(bins.path(), "exit 0");
-        let err = run_refine(note.path(), "n1", AgentKind::Claude, &lazy, "", None).unwrap_err().to_string();
+        let err = run_refine(note.path(), "n1", AgentKind::Claude, &lazy, "", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("未完成写回"), "退出 0 不算成功: {err}");
 
         // 烤进真实路径的假 Agent:模拟经写回工具完成(llm→done)。带 AI 日志上下文,
@@ -657,33 +972,112 @@ mod tests {
         // run_refine 的「after」读到这份写回——旧 refined.json 已不是 load_refined
         // 的优先读取目标(见 store::refined::load_refined)。
         let refined_path = note.path().join(crate::store::AING_DOC_FILE);
-        let done_json = serde_json::to_string(&doc("done", &["修订"])).unwrap();
+        let done_json = serde_json::to_string(&graph_done_doc(&["修订"])).unwrap();
         let diligent = fake_bin(
             bins.path(),
-            &format!("cat > {} <<'EOF'\n{}\nEOF\nexit 0", refined_path.display(), done_json),
+            &format!(
+                "cat > {} <<'EOF'\n{}\nEOF\nexit 0",
+                refined_path.display(),
+                done_json
+            ),
         );
         let logs = tempfile::tempdir().unwrap();
-        let ctx = crate::ailog::Ctx { data_root: logs.path().to_path_buf(), note_id: "n1".into() };
-        run_refine(note.path(), "n1", AgentKind::Claude, &diligent, "", Some(&ctx)).unwrap();
+        let ctx = crate::ailog::Ctx {
+            data_root: logs.path().to_path_buf(),
+            note_id: "n1".into(),
+        };
+        run_refine(
+            note.path(),
+            "n1",
+            AgentKind::Claude,
+            &diligent,
+            "",
+            Some(&ctx),
+        )
+        .unwrap();
         let v = crate::ailog::query(logs.path(), &crate::ailog::Filter::default());
         assert_eq!(v["total"], 1);
         let e = &v["entries"][0];
         assert_eq!(e["kind"], "agent_refine");
         assert_eq!(e["provider"], "claude");
         assert_eq!(e["status"], "ok");
-        assert!(e["request"]["prompt"].as_str().unwrap().contains("apply_refined_texts"), "提示词全量");
-        assert!(e["request"]["args"].as_array().unwrap().iter().any(|a| a == "--strict-mcp-config"), "命令行全量");
+        assert!(
+            e["request"]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("apply_refined_texts"),
+            "提示词全量"
+        );
+        assert!(
+            e["request"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--strict-mcp-config"),
+            "命令行全量"
+        );
         assert_eq!(e["response"]["exit_ok"], true);
+    }
+
+    #[test]
+    fn run_refine_marks_graph_failed_without_destroying_the_prior_snapshot() {
+        let note = tempfile::tempdir().unwrap();
+        let mut before = graph_done_doc(&["张三使用 Rust"]);
+        before.stages.llm = "off".into();
+        write_refined_atomic(note.path(), &before).unwrap();
+
+        let mut text_only = before.clone();
+        text_only.stages.llm = "done".into();
+        text_only.stages.entities = "off".into();
+        text_only.stages.relations = "off".into();
+        let bins = tempfile::tempdir().unwrap();
+        let text_only_json = serde_json::to_string(&text_only).unwrap();
+        let bin = fake_bin(
+            bins.path(),
+            &format!(
+                "cat > {} <<'EOF'\n{}\nEOF\nexit 0",
+                note.path().join(crate::store::AING_DOC_FILE).display(),
+                text_only_json
+            ),
+        );
+
+        let error = run_refine(note.path(), "n1", AgentKind::Claude, &bin, "", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("图谱"), "应返回图谱专属诊断: {error}");
+        let after = load_refined(note.path()).unwrap();
+        assert_eq!(after.stages.llm, "done");
+        assert_eq!(after.stages.entities, "failed");
+        assert_eq!(after.stages.relations, "failed");
+        assert_eq!(after.entities, before.entities);
+        assert_eq!(after.relations, before.relations);
+        assert_eq!(after.graph_extraction, before.graph_extraction);
     }
 
     #[test]
     fn run_refine_rejects_paragraph_count_change_and_requires_baseline() {
         let note = tempfile::tempdir().unwrap();
         // 无基线 aing.json(旧 refined.json 同理,均无)→ 拒绝
-        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "", None).is_err());
+        assert!(run_refine(
+            note.path(),
+            "n1",
+            AgentKind::Claude,
+            Path::new("/bin/true"),
+            "",
+            None
+        )
+        .is_err());
         // llm 已是 done → 拒绝(无法判定本轮)
         write_refined_atomic(note.path(), &doc("done", &["a"])).unwrap();
-        assert!(run_refine(note.path(), "n1", AgentKind::Claude, Path::new("/bin/true"), "", None).is_err());
+        assert!(run_refine(
+            note.path(),
+            "n1",
+            AgentKind::Claude,
+            Path::new("/bin/true"),
+            "",
+            None
+        )
+        .is_err());
         // 段落数被改 → 判失败
         write_refined_atomic(note.path(), &doc("off", &["a", "b"])).unwrap();
         let bins = tempfile::tempdir().unwrap();
@@ -696,13 +1090,18 @@ mod tests {
                 mutant_json
             ),
         );
-        let err = run_refine(note.path(), "n1", AgentKind::Claude, &mutant, "", None).unwrap_err().to_string();
+        let err = run_refine(note.path(), "n1", AgentKind::Claude, &mutant, "", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("段落数"), "{err}");
     }
 
     #[test]
     fn extract_title_takes_last_line_and_guards_length() {
-        assert_eq!(extract_title("日志横幅\n\n「产品评审」\n").unwrap(), "产品评审");
+        assert_eq!(
+            extract_title("日志横幅\n\n「产品评审」\n").unwrap(),
+            "产品评审"
+        );
         assert!(extract_title("").is_err());
         assert!(extract_title(&"字".repeat(40)).is_err(), "超长拒绝");
     }
@@ -712,18 +1111,33 @@ mod tests {
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_bin(bins.path(), "echo 发布计划评审");
         let ps = doc("done", &["讨论了发布计划。"]).paragraphs;
-        assert_eq!(gen_title(AgentKind::Claude, &bin, "", &ps, None).unwrap(), "发布计划评审");
-        assert!(gen_title(AgentKind::Claude, &bin, "", &[], None).is_err(), "空稿不发起");
+        assert_eq!(
+            gen_title(AgentKind::Claude, &bin, "", &ps, None).unwrap(),
+            "发布计划评审"
+        );
+        assert!(
+            gen_title(AgentKind::Claude, &bin, "", &[], None).is_err(),
+            "空稿不发起"
+        );
     }
 
     #[test]
     fn parse_scutil_proxy_extracts_enabled_entries_only() {
         let real = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 127.0.0.1\n  }\n  HTTPEnable : 1\n  HTTPPort : 7890\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 7890\n  HTTPSProxy : 127.0.0.1\n  ProxyAutoConfigEnable : 0\n  SOCKSEnable : 1\n  SOCKSPort : 7890\n  SOCKSProxy : 127.0.0.1\n}";
         let pairs = parse_scutil_proxy(real);
-        let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
         assert_eq!(get("http_proxy"), Some("http://127.0.0.1:7890"));
         assert_eq!(get("HTTPS_PROXY"), Some("http://127.0.0.1:7890"));
-        assert_eq!(get("no_proxy"), Some("localhost,127.0.0.1"), "有注入必带本机豁免");
+        assert_eq!(
+            get("no_proxy"),
+            Some("localhost,127.0.0.1"),
+            "有注入必带本机豁免"
+        );
         assert_eq!(pairs.len(), 6, "http/https 大小写各一 + no_proxy 两份");
 
         // 系统代理关闭 → 不注入任何东西
@@ -766,13 +1180,17 @@ mod tests {
             eprintln!("跳过:未设 VN_SELF_EXE(需指向 voice-notes 二进制)");
             return;
         };
-        assert!(Path::new(&self_exe).is_file(), "VN_SELF_EXE 不存在: {self_exe}");
+        assert!(
+            Path::new(&self_exe).is_file(),
+            "VN_SELF_EXE 不存在: {self_exe}"
+        );
         let Some(bin) = resolve_bin(AgentKind::Claude, "") else {
             eprintln!("跳过:本机未检测到 claude CLI");
             return;
         };
-        let _guard =
-            crate::mcp::ENV_VAR_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::mcp::ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("VN_APP_DATA", tmp.path()); // serve 子进程经环境继承同一数据根
         let note_id = "20260712-090000";
@@ -797,23 +1215,45 @@ mod tests {
         .unwrap();
         std::fs::write(
             note_dir.join("speakers.json"),
-            serde_json::json!({ "S1": { "name": "张三", "sources": ["mic"], "count": 1 } }).to_string(),
+            serde_json::json!({ "S1": { "name": "张三", "sources": ["mic"], "count": 1 } })
+                .to_string(),
         )
         .unwrap();
         write_refined_atomic(
             &note_dir,
-            &doc("off", &["我们肯计要在下周发布新版本", "嗯嗯这个这个方案我觉得可以", "用claude code来做 Aing 没问题"]),
+            &doc(
+                "off",
+                &[
+                    "我们肯计要在下周发布新版本",
+                    "嗯嗯这个这个方案我觉得可以",
+                    "用claude code来做 Aing 没问题",
+                ],
+            ),
         )
         .unwrap();
 
-        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: note_id.into() };
-        run_refine(&note_dir, note_id, AgentKind::Claude, &bin, "haiku", Some(&ctx))
-            .expect("真 claude Aing 应成功(需已登录)");
+        let ctx = crate::ailog::Ctx {
+            data_root: tmp.path().to_path_buf(),
+            note_id: note_id.into(),
+        };
+        run_refine(
+            &note_dir,
+            note_id,
+            AgentKind::Claude,
+            &bin,
+            "haiku",
+            Some(&ctx),
+        )
+        .expect("真 claude Aing 应成功(需已登录)");
 
         let after = load_refined(&note_dir).unwrap();
         assert_eq!(after.stages.llm, "done");
         assert_eq!(after.paragraphs.len(), 3);
-        assert!(!after.paragraphs[0].text.contains("肯计"), "错字应被纠正: {}", after.paragraphs[0].text);
+        assert!(
+            !after.paragraphs[0].text.contains("肯计"),
+            "错字应被纠正: {}",
+            after.paragraphs[0].text
+        );
 
         // 日志两侧齐:本进程的 agent_refine + serve 子进程的 mcp_apply。
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
@@ -822,14 +1262,26 @@ mod tests {
             eprintln!("{}", serde_json::to_string_pretty(e).unwrap());
         }
         let entries = v["entries"].as_array().unwrap();
-        let agent = entries.iter().find(|e| e["kind"] == "agent_refine").expect("缺 agent_refine 条目");
+        let agent = entries
+            .iter()
+            .find(|e| e["kind"] == "agent_refine")
+            .expect("缺 agent_refine 条目");
         assert_eq!(agent["status"], "ok");
         assert_eq!(agent["provider"], "claude");
-        assert!(agent["request"]["prompt"].as_str().unwrap().contains(note_id));
+        assert!(agent["request"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(note_id));
         assert!(agent["response"]["exit_ok"].as_bool().unwrap());
-        let apply = entries.iter().find(|e| e["kind"] == "mcp_apply").expect("缺 mcp_apply 条目(serve 子进程写)");
+        let apply = entries
+            .iter()
+            .find(|e| e["kind"] == "mcp_apply")
+            .expect("缺 mcp_apply 条目(serve 子进程写)");
         assert_eq!(apply["status"], "ok");
-        assert!(!apply["request"]["updates"].as_array().unwrap().is_empty(), "写回应含逐段修订全文");
+        assert!(
+            !apply["request"]["updates"].as_array().unwrap().is_empty(),
+            "写回应含逐段修订全文"
+        );
         std::env::remove_var("VN_APP_DATA");
     }
 }

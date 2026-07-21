@@ -43,7 +43,13 @@ MCP 未注册时,**先征得用户同意**后可代为注册:`{{BINARY}} mcp reg
 1. **会议纪要**:`get_note(note_id, format="markdown")` → 按「主题 / 结论与决议 / 待办(负责人+时限)/ 遗留问题」归纳;引用原话时带说话人名与时间戳。
 2. **周报/日报汇总**:`list_notes(from=<周一日期>)` → 逐条 `get_note` 提取 1-3 个要点合并;标题与时长直接用 list 字段。
 3. **找决议/待办/承诺**:`search_notes` 用关键词族(决定/定了/负责/下周/deadline/跟进),命中自带前后一句上下文,必要时 get 全文核对。
-4. **代 Aing**(用户明确要求时):`get_note(format="segments")` 拿修订稿 paragraphs → 只做错字纠正/实体统一/去语气词/中英排版,禁止改写语义 → `apply_refined_texts` 按下标提交有改动的段落(整段全文),确认无需修订则提交空 updates。笔记须已有修订稿(refined=true),否则请用户先在 App 里 Aing 一次。
+4. **代 Aing**(用户明确要求时),严格按这一顺序完成同一轮文本与图谱:
+   1. `get_note(format="segments")` 拿修订稿 paragraphs,只做错字纠正/实体统一/去语气词/中英排版,禁止改写语义。
+   2. `apply_refined_texts` 按下标提交有改动的段落(整段全文);确认无需修订也要提交空 updates。笔记须已有修订稿(refined=true),否则请用户先在 App 里 Aing 一次。
+   3. 文本写回成功后调用 `get_aing_context`;只用它返回的最终 paragraphs、`source_seqs`、live mentions、`source_hash`、`contract_version` 和 core predicates 抽取图谱,不要沿用写回前的证据坐标。
+   4. 恰好调用一次 `apply_aing_graph`:每个实体使用本次载荷内唯一的临时 id,关系 subject/object 引用它;证据 quote 与 Unicode scalar 区间必须逐字符匹配最终文本。没有可靠关系时仍提交 `relations: []`。
+
+`apply_aing_graph` 只接受单篇模型事实。不要提交人工确认、registry、override 或 operation 字段;实体、mention、证据和关系的持久 ID 及 source hash 均由服务端在笔记锁内重算。
 
 ## 隐私
 
