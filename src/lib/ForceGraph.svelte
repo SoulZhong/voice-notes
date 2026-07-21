@@ -608,6 +608,10 @@
   const visibleSemanticCount = $derived(
     snap.links.filter((edge) => edge.layer === "semantic").length,
   );
+  const hasSemanticEdges = $derived(visibleSemanticCount > 0);
+  const hasCooccurrenceEdges = $derived(
+    snap.links.some((edge) => edge.layer === "cooccurrence"),
+  );
 
   function edgePathId(id: string, label = false): string {
     const encoded = Array.from(id)
@@ -663,7 +667,7 @@
     }
     if (hoveredEdge && hoveredEdge !== edge.id) return 0.16;
     if (dimLink(edge.a, edge.b)) return 0.12;
-    return edge.layer === "semantic" ? 0.72 : 0.2;
+    return edge.layer === "semantic" ? 0.92 : 0.58;
   }
 
   function nodeOpacity(id: string): number {
@@ -887,7 +891,7 @@
         orient="auto-start-reverse"
         markerUnits="userSpaceOnUse"
       >
-        <path d="M 0 1 L 9 5 L 0 9 z" fill="var(--accent)" />
+        <path d="M 0 1 L 9 5 L 0 9 z" fill="var(--ink-secondary)" />
       </marker>
     </defs>
     <!-- 空白背景:承接拖拽平移,铺在最外层原始坐标系(不随 view/fit 变换),保证任意
@@ -1038,6 +1042,22 @@
       </g>
     </g>
   </svg>
+  {#if hasSemanticEdges || hasCooccurrenceEdges}
+    <div class="edge-key" aria-label="关系线说明">
+      {#if hasSemanticEdges}
+        <div class="edge-key-row">
+          <span class="edge-sample semantic-sample" aria-hidden="true"></span>
+          <span><strong>明确关系</strong><small>箭头表示方向 · 点击线查看依据</small></span>
+        </div>
+      {/if}
+      {#if hasCooccurrenceEdges}
+        <div class="edge-key-row">
+          <span class="edge-sample cooccurrence-sample" aria-hidden="true"></span>
+          <span><strong>共同出现</strong><small>虚线只表示同篇笔记提到</small></span>
+        </div>
+      {/if}
+    </div>
+  {/if}
   {#if snap.nodes.length > ALL_LABELS_LIMIT && viewZoom < 2.2}
     <div class="semantic-hint">滚轮放大显示更多名称 · 悬停探索相邻关系</div>
   {/if}
@@ -1087,13 +1107,13 @@
   .fg.reduced .edge, .fg.reduced .nodes > g { transition: none; }
   .edge-line { fill: none; vector-effect: non-scaling-stroke; }
   .semantic-line {
-    stroke: var(--accent);
-    stroke-width: 1.35px;
+    stroke: var(--ink-secondary);
+    stroke-width: 2px;
   }
   .cooccurrence-line {
     stroke: var(--hairline-strong);
-    stroke-width: 0.8px;
-    stroke-dasharray: 3 5;
+    stroke-width: 1.25px;
+    stroke-dasharray: 4 5;
   }
   .edge-label-guide { fill: none; stroke: none; }
   .edge-hit, .edge-hover-target {
@@ -1110,13 +1130,13 @@
     outline: none;
   }
   .edge-label {
-    fill: var(--ink-secondary);
+    fill: var(--ink);
     stroke: var(--canvas);
     stroke-width: 3px;
     paint-order: stroke fill;
     font-family: inherit;
-    font-size: 10px;
-    font-weight: 560;
+    font-size: 11px;
+    font-weight: 500;
     text-anchor: middle;
     letter-spacing: 0.015em;
     pointer-events: none;
@@ -1160,6 +1180,39 @@
     white-space: nowrap;
     pointer-events: none;
   }
+  .edge-key {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    display: grid;
+    gap: 8px;
+    max-width: min(250px, calc(100% - 32px));
+    padding: 9px 11px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--canvas) 92%, transparent);
+    color: var(--ink-secondary);
+    font-size: 11px;
+    pointer-events: none;
+  }
+  .edge-key-row { display: grid; grid-template-columns: 34px 1fr; align-items: center; gap: 8px; }
+  .edge-key-row > span:last-child { display: grid; gap: 1px; }
+  .edge-key strong { color: var(--ink); font-weight: 500; }
+  .edge-key small { color: var(--ink-secondary); font-size: 10px; line-height: 1.35; }
+  .edge-sample { position: relative; display: block; width: 32px; height: 0; }
+  .semantic-sample { border-top: 2px solid var(--ink-secondary); }
+  .semantic-sample::after {
+    content: "";
+    position: absolute;
+    top: -4px;
+    right: -1px;
+    width: 0;
+    height: 0;
+    border-top: 3px solid transparent;
+    border-bottom: 3px solid transparent;
+    border-left: 6px solid var(--ink-secondary);
+  }
+  .cooccurrence-sample { border-top: 1.5px dashed var(--hairline-strong); }
   /* 规模控制条:说明文字(纯信息,不可点)+ 独立的药丸按钮群(可点),不再是一整块
      文字链接挤在一个胶囊里分不清哪段是说明哪段是按钮(冒烟反馈"很粗糙,不够精美")。
      每个按钮自成一个 hairline 描边药丸,跟侧栏「全局图谱」/「返回图谱」同一套

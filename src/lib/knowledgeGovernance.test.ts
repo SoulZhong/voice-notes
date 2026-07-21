@@ -454,7 +454,7 @@ describe("governance UI source contract", () => {
     expect(route).not.toMatch(/\{#if selected[^}]*\}[\s\S]{0,500}<ForceGraph/);
   });
 
-  it("exposes valid governance actions and a persistent pending entry", () => {
+  it("keeps valid governance actions available without a persistent pending entry", () => {
     const entity = source("./EntityGovernance.svelte");
     const relation = source("./RelationDrawer.svelte");
     const pendingPanel = source("./PendingReviewPanel.svelte");
@@ -468,7 +468,7 @@ describe("governance UI source contract", () => {
     for (const label of ["确认关系", "查看关系", "否决并抑制", "稍后处理"]) {
       expect(pendingPanel).toContain(label);
     }
-    expect(sidebar).toContain("待整理");
+    expect(sidebar).not.toContain("待整理");
   });
 
   it("dispatches pending actions by real kind without fabricating relation triples", () => {

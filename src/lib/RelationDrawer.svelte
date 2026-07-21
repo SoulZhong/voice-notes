@@ -18,6 +18,7 @@
     relationLoader = relationDetail,
     resolveEntityName,
     readOnly = false,
+    simple = false,
   }: {
     relationId: string;
     onClose: () => void;
@@ -25,6 +26,8 @@
     relationLoader?: (relationId: string) => Promise<RelationDetail | null>;
     resolveEntityName?: (entityId: string) => string | undefined;
     readOnly?: boolean;
+    /** Everyday graph detail shows meaning and evidence without governance controls. */
+    simple?: boolean;
   } = $props();
 
   let detail = $state<RelationDetail | null>(null);
@@ -212,9 +215,9 @@
   {:else}
     {@const relation = detail.relation}
     <section class="direction" aria-label="完整关系方向">
-      <span><b>{subjectName || "未解析实体名称"}</b><small>{relation.subject_id}</small></span>
+      <span><b>{subjectName || "未解析实体名称"}</b>{#if !simple}<small>{relation.subject_id}</small>{/if}</span>
       <strong>→ {relationLabel(relation)} →</strong>
-      <span><b>{objectName || "未解析实体名称"}</b><small>{relation.object_id}</small></span>
+      <span><b>{objectName || "未解析实体名称"}</b>{#if !simple}<small>{relation.object_id}</small>{/if}</span>
     </section>
 
     <section class="section" aria-labelledby="relation-overview">
@@ -222,20 +225,22 @@
       <dl>
         <div><dt>状态</dt><dd>{relation.status === "current" ? "当前" : "历史"}</dd></div>
         <div><dt>置信度</dt><dd>{Math.round(relation.confidence * 100)}%</dd></div>
-        <div><dt>来源</dt><dd>{relation.origin}</dd></div>
         <div><dt>证据</dt><dd>{relation.evidence_count} 条</dd></div>
-        <div><dt>提供方</dt><dd>{detail.provider || "人工治理"}</dd></div>
-        <div><dt>模型</dt><dd>{detail.model || "未记录模型"}</dd></div>
-        <div><dt>有效起点</dt><dd>{relation.valid_from || "未限定"}</dd></div>
-        <div><dt>有效终点</dt><dd>{relation.valid_to || "持续有效"}</dd></div>
+        {#if !simple}
+          <div><dt>来源</dt><dd>{relation.origin}</dd></div>
+          <div><dt>提供方</dt><dd>{detail.provider || "人工治理"}</dd></div>
+          <div><dt>模型</dt><dd>{detail.model || "未记录模型"}</dd></div>
+          <div><dt>有效起点</dt><dd>{relation.valid_from || "未限定"}</dd></div>
+          <div><dt>有效终点</dt><dd>{relation.valid_to || "持续有效"}</dd></div>
+        {/if}
       </dl>
     </section>
 
-    <section class="section versions" aria-labelledby="relation-index-state">
+    {#if !simple}<section class="section versions" aria-labelledby="relation-index-state">
       <h3 id="relation-index-state">当前索引状态</h3>
       <p>当前索引将所选关系标记为「{relation.status === "current" ? "当前" : "历史"}」状态。</p>
       <p class="muted">接口仅返回所选单条关系，不代表已查询到该 triple 的完整版本历史。</p>
-    </section>
+    </section>{/if}
 
     <section class="section evidence" aria-labelledby="relation-evidence">
       <h3 id="relation-evidence">全部证据</h3>
@@ -248,8 +253,8 @@
             {:else}
               <a href={'/notes/' + encodeURIComponent(item.note_id) + '#paragraph-' + item.paragraph_index}>打开笔记 {item.note_id}</a>
             {/if}
-            <span>第 {item.paragraph_index + 1} 段 · 字符 {item.start_offset}–{item.end_offset}</span>
-            {#if item.source_seqs.length > 0}<span>时间片段序号 {item.source_seqs.join("、")}</span>{/if}
+            <span>第 {item.paragraph_index + 1} 段{simple ? "" : ` · 字符 ${item.start_offset}–${item.end_offset}`}</span>
+            {#if !simple && item.source_seqs.length > 0}<span>时间片段序号 {item.source_seqs.join("、")}</span>{/if}
           </footer>
         </blockquote>
       {/each}
@@ -263,7 +268,7 @@
         <h3 id="relation-actions">隔离调试</h3>
         <p class="unavailable">这是只读隔离夹具；关系证据不会读取或修改真实资料库。</p>
       </section>
-    {:else}
+    {:else if !simple}
       <section class="section actions" aria-labelledby="relation-actions">
       <h3 id="relation-actions">治理操作</h3>
       <div class="primary-actions">
@@ -317,7 +322,7 @@
     {/if}
   {/if}
 
-  {#if !readOnly}
+  {#if !readOnly && !simple}
     <div class="feedback-row">
       <p id="relation-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
       <div>

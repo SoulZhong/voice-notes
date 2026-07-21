@@ -1,20 +1,7 @@
-// 图谱浏览的共享筛选态:侧栏的搜索框/kind 过滤药丸/视角切换、主区力导图多处同源——
-// 药丸点的是"术语",画布上就该只剩术语节点,不是列表筛列表、画布看画布两张皮。
-export type GraphMode = "entity" | "note";
+// 图谱只共享日常需要的搜索与实体类型筛选。高级关系查询留在索引层，不占用浏览界面。
 export class GraphFilterState {
-  /** 视角:实体(节点=实体,边=共现)/ 文章(节点=笔记,边=共享实体)。 */
-  mode = $state<GraphMode>("entity");
   kind = $state("all");
   query = $state("");
-  entityKinds = $state<string[]>([]);
-  predicateTypes = $state<string[]>([]);
-  from = $state<string | null>(null);
-  to = $state<string | null>(null);
-  includeHistory = $state(false);
-  includeCooccurrence = $state(false);
-  pendingPanelOpen = $state(false);
-  pathStart = $state<string | null>(null);
-  pathEnd = $state<string | null>(null);
 }
 
 export const graphFilter = new GraphFilterState();
