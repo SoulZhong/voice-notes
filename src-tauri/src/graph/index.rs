@@ -14,6 +14,7 @@ const PREVIOUS_FILE: &str = "graph.sqlite.previous";
 const INDEX_LOCK_FILE: &str = ".graph-index.lock";
 const CURRENT_POINTER_FILE: &str = ".graph-index-current";
 const CURRENT_POINTER_NEXT_FILE: &str = ".graph-index-current.next";
+const DIRTY_MARKER_FILE: &str = ".graph-index-dirty";
 const VERSION_PREFIX: &str = "graph.sqlite.version.";
 const POINTER_FORMAT_VERSION: u32 = 1;
 const MAX_POINTER_BYTES: u64 = 1024;
@@ -1392,13 +1393,18 @@ impl RebuildScheduler {
         }
     }
 
-    pub fn request(&self, data_root: PathBuf, emit: impl Fn(IndexStatus) + Send + Sync + 'static) {
+    pub fn request(
+        &self,
+        data_root: PathBuf,
+        emit: impl Fn(IndexStatus) + Send + Sync + 'static,
+    ) -> anyhow::Result<()> {
         let generation_to_spawn = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist_dirty_marker(&data_root)?;
             state.generation = state
                 .generation
                 .checked_add(1)
@@ -1417,9 +1423,34 @@ impl RebuildScheduler {
             }
         };
         if let Some(generation) = generation_to_spawn {
-            spawn_claimed_scheduler(self.inner.clone(), generation);
+            spawn_claimed_scheduler(self.inner.clone(), generation)?;
         }
+        Ok(())
     }
+}
+
+fn persist_dirty_marker(data_root: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let path = data_root.join(DIRTY_MARKER_FILE);
+    let mut marker = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)?;
+    marker.write_all(b"semantic-graph-dirty\n")?;
+    marker.sync_all()?;
+    sync_directory(data_root)?;
+    Ok(())
+}
+
+fn clear_dirty_marker(data_root: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(data_root.join(DIRTY_MARKER_FILE)) {
+        Ok(()) => sync_directory(data_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 struct RunningGuard {
@@ -1449,12 +1480,12 @@ impl Drop for RunningGuard {
             }
         };
         if let Some(generation) = generation_to_spawn {
-            spawn_claimed_scheduler(self.inner.clone(), generation);
+            let _ = spawn_claimed_scheduler(self.inner.clone(), generation);
         }
     }
 }
 
-fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
+fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) -> anyhow::Result<()> {
     let worker_inner = inner.clone();
     let job: SpawnJob = Box::new(move || run_scheduler(worker_inner, generation));
     if let Err(error) = inner.spawner.spawn(job) {
@@ -1473,13 +1504,12 @@ fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
                     state.running_generation = Some(newer_generation);
                     (Some(newer_generation), None)
                 } else {
-                    state.dirty = false;
                     (None, state.latest.clone())
                 }
             }
         };
         if let Some(newer_generation) = newer_generation {
-            spawn_claimed_scheduler(inner, newer_generation);
+            return spawn_claimed_scheduler(inner, newer_generation);
         } else if let Some(request) = request_for_error {
             emit_status(
                 &request.emit,
@@ -1490,7 +1520,9 @@ fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
                 },
             );
         }
+        anyhow::bail!("semantic graph rebuild is pending retry");
     }
+    Ok(())
 }
 
 fn emit_status(emit: &Arc<EmitFn>, status: IndexStatus) {
@@ -1533,14 +1565,34 @@ fn run_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("semantic graph rebuilder panicked")));
         match result {
-            Ok(stats) => emit_status(
-                &request.emit,
-                IndexStatus {
-                    state: "ready".into(),
-                    error: None,
-                    stats: Some(stats),
-                },
-            ),
+            Ok(stats) => {
+                let clear_result = {
+                    let state = inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let should_clear = !state.dirty
+                        || state.latest.as_ref().is_some_and(|latest| {
+                            latest.data_root.as_path() != request.data_root.as_path()
+                        });
+                    if should_clear {
+                        clear_dirty_marker(&request.data_root)
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(error) = clear_result {
+                    eprintln!("graph: unable to clear semantic index retry marker: {error:#}");
+                }
+                emit_status(
+                    &request.emit,
+                    IndexStatus {
+                        state: "ready".into(),
+                        error: None,
+                        stats: Some(stats),
+                    },
+                );
+            }
             Err(error) => {
                 eprintln!("graph: semantic index rebuild failed: {error:#}");
                 emit_status(
@@ -2625,12 +2677,14 @@ mod tests {
         });
         let root = tempfile::tempdir().unwrap();
         let (status_tx, status_rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), {
-            let status_tx = status_tx.clone();
-            move |status| {
-                status_tx.send(status).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), {
+                let status_tx = status_tx.clone();
+                move |status| {
+                    status_tx.send(status).unwrap();
+                }
+            })
+            .unwrap();
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
 
         std::thread::scope(|scope| {
@@ -2639,9 +2693,11 @@ mod tests {
                 let root = root.path().to_path_buf();
                 let status_tx = status_tx.clone();
                 scope.spawn(move || {
-                    scheduler.request(root, move |status| {
-                        status_tx.send(status).unwrap();
-                    })
+                    scheduler
+                        .request(root, move |status| {
+                            status_tx.send(status).unwrap();
+                        })
+                        .unwrap();
                 });
             }
         });
@@ -2663,11 +2719,13 @@ mod tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
 
         let (late_tx, late_rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "ready" {
-                late_tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    late_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         late_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         wait_for_calls(&calls, 3);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
@@ -2680,11 +2738,13 @@ mod tests {
         });
         let root = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "error" {
-                tx.send(status).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "error" {
+                    tx.send(status).unwrap();
+                }
+            })
+            .unwrap();
         let status = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             status.error.as_deref(),
@@ -2706,19 +2766,23 @@ mod tests {
         });
         let root = tempfile::tempdir().unwrap();
         let (first_tx, first_rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "error" {
-                first_tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "error" {
+                    first_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         first_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let (second_tx, second_rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "ready" {
-                second_tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    second_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -2732,15 +2796,19 @@ mod tests {
             Ok(BuildStats::default())
         });
         let root = tempfile::tempdir().unwrap();
-        scheduler.request(root.path().to_path_buf(), |_| panic!("emit panic"));
+        scheduler
+            .request(root.path().to_path_buf(), |_| panic!("emit panic"))
+            .unwrap();
         wait_for_calls(&calls, 1);
 
         let (tx, rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "ready" {
-                tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -2766,17 +2834,21 @@ mod tests {
         });
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
-        scheduler.request(root_a.path().to_path_buf(), |_| {});
+        scheduler
+            .request(root_a.path().to_path_buf(), |_| {})
+            .unwrap();
         assert_eq!(
             build_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             root_a.path()
         );
         let (b_tx, b_rx) = mpsc::channel();
-        scheduler.request(root_b.path().to_path_buf(), move |status| {
-            if status.state == "ready" {
-                b_tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root_b.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    b_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         {
             let (lock, ready) = &*gate;
             *lock.lock().unwrap() = true;
@@ -2806,11 +2878,13 @@ mod tests {
         });
         let root = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "error" {
-                tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "error" {
+                    tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(snapshots.load(Ordering::SeqCst), 32);
         std::thread::sleep(Duration::from_millis(100));
@@ -2854,13 +2928,15 @@ mod tests {
             .unwrap();
 
         let (b_tx, b_rx) = mpsc::channel();
-        scheduler.request(root_b.path().to_path_buf(), move |status| {
-            if status.state == "ready" {
-                b_tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root_b.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    b_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
         release_spawn_tx.send(()).unwrap();
-        request_a.join().unwrap();
+        request_a.join().unwrap().unwrap();
 
         b_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
@@ -2883,14 +2959,51 @@ mod tests {
         );
         let root = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
-        scheduler.request(root.path().to_path_buf(), move |status| {
-            if status.state == "error" {
-                tx.send(()).unwrap();
-            }
-        });
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "error" {
+                    tx.send(()).unwrap();
+                }
+            })
+            .unwrap_err();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scheduler_spawn_failure_returns_error_and_keeps_durable_retry_marker() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let spawn_calls_for_spawner = spawn_calls.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let scheduler = RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(BuildStats::default()),
+            move |job: SpawnJob| {
+                if spawn_calls_for_spawner.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(std::io::Error::other("injected spawn failure"));
+                }
+                std::thread::Builder::new()
+                    .name("test-graph-index-retry".into())
+                    .spawn(job)
+                    .map(|_| ())
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(scheduler
+            .request(root.path().to_path_buf(), |_| {})
+            .is_err());
+        assert!(root.path().join(DIRTY_MARKER_FILE).is_file());
+        scheduler
+            .request(root.path().to_path_buf(), move |status| {
+                if status.state == "ready" {
+                    ready_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!root.path().join(DIRTY_MARKER_FILE).exists());
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
