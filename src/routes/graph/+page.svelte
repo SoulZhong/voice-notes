@@ -27,11 +27,13 @@
     nextExpandedIds,
     pathEmphasis,
     relationLabel,
+    runGuardedPathRefresh,
     searchAdmissionIds,
     semanticRequestFailureMessage,
     shouldUseLegacyFallback,
     viewEdges,
     type GlobalSemanticPresence,
+    type PathRefreshSnapshot,
   } from "$lib/knowledgeView";
   import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
   import { graphFilter } from "$lib/graphFilter.svelte";
@@ -373,33 +375,53 @@
   }
 
   async function refreshAfterBackfill() {
-    const previousStart = pathStart;
-    const previousEnd = pathEnd;
-    ++pathGeneration;
+    const snapshot: PathRefreshSnapshot = {
+      generation: ++pathGeneration,
+      start: pathStart,
+      end: pathEnd,
+    };
     activePath = null;
-    if (previousStart && previousEnd) {
+    if (snapshot.start && snapshot.end) {
       pathStatus = "loading";
       pathError = "";
     }
-    await Promise.all([
-      loadSemantic(effectiveGraphFilter),
-      probeGlobalSemanticPresence(),
-      loadGraph(),
-      loadPending(),
-    ]);
-    if (selected) await loadDetail(selected);
-    if (!previousStart || !previousEnd) return;
-    if (semanticRequestFailed) {
-      pathStatus = "error";
-      pathError = "图谱刷新失败，原路径已清除。请稍后重新选择两点。";
-      return;
-    }
-    if (!hasPathEndpoints(semantic, previousStart, previousEnd)) {
-      pathStatus = "error";
-      pathError = "关系补建后路径端点已变化，原路径已清除。请重新选择两点。";
-      return;
-    }
-    await requestPath(previousStart, previousEnd, knowledgeFilter, includeWeakPath);
+    await runGuardedPathRefresh(
+      snapshot,
+      () => ({ generation: pathGeneration, start: pathStart, end: pathEnd }),
+      [
+        async () => {
+          await Promise.all([
+            loadSemantic(effectiveGraphFilter),
+            probeGlobalSemanticPresence(),
+            loadGraph(),
+            loadPending(),
+          ]);
+        },
+        async () => {
+          if (selected) await loadDetail(selected);
+        },
+      ],
+      async () => {
+        if (!snapshot.start || !snapshot.end) return;
+        if (semanticRequestFailed) {
+          pathStatus = "error";
+          pathError = "图谱刷新失败，原路径已清除。请稍后重新选择两点。";
+          return;
+        }
+        if (!hasPathEndpoints(semantic, snapshot.start, snapshot.end)) {
+          pathStatus = "error";
+          pathError = "关系补建后路径端点已变化，原路径已清除。请重新选择两点。";
+          return;
+        }
+        await requestPath(
+          snapshot.start,
+          snapshot.end,
+          knowledgeFilter,
+          includeWeakPath,
+          snapshot.generation,
+        );
+      },
+    );
   }
 
   function updateQuery(change: (params: URLSearchParams) => void) {
@@ -514,8 +536,15 @@
     }
   }
 
-  async function requestPath(start: string, end: string, filter: KnowledgeFilter, includeWeak: boolean) {
-    const generation = ++pathGeneration;
+  async function requestPath(
+    start: string,
+    end: string,
+    filter: KnowledgeFilter,
+    includeWeak: boolean,
+    expectedGeneration?: number,
+  ) {
+    const generation = expectedGeneration ?? ++pathGeneration;
+    if (generation !== pathGeneration) return;
     pathStatus = "loading";
     pathError = "";
     try {

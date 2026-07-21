@@ -15,6 +15,7 @@ import {
   legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
+  runGuardedPathRefresh,
   relationLabel,
   searchAdmissionIds,
   semanticRequestFailureMessage,
@@ -431,6 +432,35 @@ describe("pathEmphasis", () => {
     });
     expect(pathEmphasis(null)).toEqual({ nodeIds: new Set(), edgeIds: new Set() });
   });
+
+  it("keeps a newly selected path when a deferred backfill refresh finishes", async () => {
+    let resolveRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    let dialogOpen = true;
+    let current = { generation: 11, start: "kg_a", end: "kg_b" };
+    let active = "old-path";
+    const rerun = async () => {
+      active = "stale-rerun";
+    };
+    const rerunSpy = { call: rerun };
+    const task = runGuardedPathRefresh(
+      { ...current },
+      () => current,
+      [() => refresh],
+      rerunSpy.call,
+    );
+
+    dialogOpen = false;
+    current = { generation: 12, start: "kg_new_a", end: "kg_new_b" };
+    active = "new-path";
+    resolveRefresh();
+
+    expect(await task).toBe(false);
+    expect(dialogOpen).toBe(false);
+    expect(active).toBe("new-path");
+  });
 });
 
 describe("exploratory graph UI source contract", () => {
@@ -524,8 +554,10 @@ describe("exploratory graph UI source contract", () => {
     expect(hasPathEndpoints(refreshed, "kg_a", "kg_b")).toBe(true);
     expect(hasPathEndpoints(refreshed, "kg_a", "kg_removed")).toBe(false);
     expect(route).toMatch(/async function refreshAfterBackfill\(\)[\s\S]{0,260}activePath = null/);
-    expect(route).toContain("hasPathEndpoints(semantic, previousStart, previousEnd)");
-    expect(route).toContain("await requestPath(previousStart, previousEnd, knowledgeFilter, includeWeakPath)");
+    expect(route).toContain("runGuardedPathRefresh(");
+    expect(route).toContain("hasPathEndpoints(semantic, snapshot.start, snapshot.end)");
+    expect(route).toContain("snapshot.generation");
+    expect(route).toContain("expectedGeneration ?? ++pathGeneration");
     expect(route).toContain("关系补建后路径端点已变化，原路径已清除。请重新选择两点。");
   });
 

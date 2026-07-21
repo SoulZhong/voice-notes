@@ -532,3 +532,36 @@ export function hasPathEndpoints(
   const ids = new Set(data.nodes.map((node) => node.id));
   return ids.has(start) && ids.has(end);
 }
+
+export interface PathRefreshSnapshot {
+  generation: number;
+  start: string | null;
+  end: string | null;
+}
+
+function samePathRefresh(
+  expected: PathRefreshSnapshot,
+  current: PathRefreshSnapshot,
+): boolean {
+  return (
+    expected.generation === current.generation &&
+    expected.start === current.start &&
+    expected.end === current.end
+  );
+}
+
+/** Run each refresh stage only while the captured path still owns the UI. */
+export async function runGuardedPathRefresh(
+  expected: PathRefreshSnapshot,
+  current: () => PathRefreshSnapshot,
+  refreshStages: Array<() => Promise<void>>,
+  rerun: () => Promise<void>,
+): Promise<boolean> {
+  for (const refresh of refreshStages) {
+    if (!samePathRefresh(expected, current())) return false;
+    await refresh();
+    if (!samePathRefresh(expected, current())) return false;
+  }
+  await rerun();
+  return samePathRefresh(expected, current());
+}
