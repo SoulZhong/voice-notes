@@ -527,6 +527,13 @@ describe("governance UI source contract", () => {
       expect(content).not.toContain("text-overflow: ellipsis");
     }
   });
+
+  it("explains why relation filters and backfill actions have no candidates", () => {
+    const toolbar = source("./KnowledgeGraphToolbar.svelte");
+    const backfill = source("./RelationBackfillDialog.svelte");
+    expect(toolbar).toContain("尚无语义关系类型。完成关系补建后可在这里筛选。");
+    expect(backfill).toContain("关系已是最新，或笔记尚未形成可用的实体上下文");
+  });
 });
 
 describe("relation drawer tombstone state", () => {
