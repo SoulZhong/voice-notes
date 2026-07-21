@@ -86,6 +86,10 @@ pub struct RefinedDoc {
     pub graph_extraction: Option<super::aing_graph::GraphExtraction>,
     #[serde(default)]
     pub relations: Vec<super::aing_graph::RelationFact>,
+    /// 仅供旧关系保持端点归属/证据拆分的 mention ids。它们仍存在于段落 mentions
+    /// 以通过图谱结构校验，但不是当前正文的 live mentions，不得进入 UI/搜索索引。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_support_mentions: Vec<String>,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
@@ -304,6 +308,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(), name: None, person_id: None,
                 start_ms: 0, end_ms: 1000, text: "灯塔计划启动".into(), source_seqs: vec![7],
@@ -322,6 +327,7 @@ mod tests {
         assert_eq!(second["paragraphs"][0]["mentions"][0]["id"].as_str(), Some(first_id.as_str()));
         assert_eq!(first.get("graph_extraction"), Some(&serde_json::Value::Null));
         assert_eq!(first.get("relations"), Some(&serde_json::json!([])));
+        assert!(first.get("graph_support_mentions").is_none());
     }
 
     #[test]
@@ -346,6 +352,7 @@ mod tests {
         assert_eq!(doc.stages.relations, "off");
         assert!(doc.graph_extraction.is_none());
         assert!(doc.relations.is_empty());
+        assert!(doc.graph_support_mentions.is_empty());
         assert!(doc.paragraphs[0].mentions[0].id.starts_with("mn_"));
         assert_eq!(doc.paragraphs[0].mentions[0].id, first_id);
         assert_eq!(doc.paragraphs[0].mentions[0].id.len(), 27);
@@ -374,6 +381,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
@@ -468,6 +476,7 @@ mod tests {
             }],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
         let back = load_refined(dir.path()).unwrap();
@@ -493,6 +502,7 @@ mod tests {
         let doc = load_refined(dir.path()).expect("旧结构应能加载");
         assert!(doc.entities.is_empty());
         assert!(doc.paragraphs[0].mentions.is_empty());
+        assert!(doc.graph_support_mentions.is_empty());
         assert_eq!(doc.stages.entities, "off", "缺 stages.entities 键默认 off");
     }
 
@@ -535,6 +545,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -680,6 +691,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留

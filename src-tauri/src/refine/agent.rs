@@ -559,6 +559,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: texts
                 .iter()
                 .map(|t| RefinedParagraph {

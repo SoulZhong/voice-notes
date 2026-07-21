@@ -239,6 +239,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![
                 para("R1", Some("张三"), Some("P1"), "有名字用名字。"),
                 para("R2", None, Some("P4"), "无名有关联用全局编号。"),

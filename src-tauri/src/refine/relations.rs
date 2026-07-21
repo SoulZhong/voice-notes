@@ -233,6 +233,7 @@ pub fn apply_validated_graph(
 ) {
     doc.relations = graph.relations;
     doc.graph_extraction = Some(extraction);
+    doc.graph_support_mentions.clear();
     doc.stages.relations = "done".into();
 }
 
@@ -269,6 +270,7 @@ mod tests {
             entities,
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(),
                 name: None,
@@ -360,10 +362,12 @@ mod tests {
             source_hash: crate::store::source_hash(&doc.paragraphs),
             mode: "http".into(),
         };
+        doc.graph_support_mentions = vec!["mn_old_support".into()];
         apply_validated_graph(&mut doc, extraction.clone(), graph);
         assert_eq!(doc.stages.relations, "done");
         assert_eq!(doc.graph_extraction, Some(extraction));
         assert_eq!(doc.relations.len(), 1);
+        assert!(doc.graph_support_mentions.is_empty());
     }
 
     #[test]

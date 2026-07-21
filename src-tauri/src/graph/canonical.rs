@@ -253,6 +253,7 @@ pub fn build_canonical_graph(
         );
     }
     let mut mentions = Vec::new();
+    let mut relation_mentions = Vec::new();
     let mut mention_roots = BTreeMap::new();
     for document in &documents {
         let document = match document {
@@ -270,6 +271,12 @@ pub fn build_canonical_graph(
             .entities
             .iter()
             .map(|entity| (entity.id.as_str(), entity))
+            .collect();
+        let support_mentions: BTreeSet<_> = document
+            .doc
+            .graph_support_mentions
+            .iter()
+            .map(String::as_str)
             .collect();
         for (paragraph_index, paragraph) in document.doc.paragraphs.iter().enumerate() {
             for mention in &paragraph.mentions {
@@ -342,7 +349,7 @@ pub fn build_canonical_graph(
                     });
                     continue;
                 };
-                mentions.push(CanonicalMention {
+                let canonical_mention = CanonicalMention {
                     id: mention.id.clone(),
                     note_id: document.note_id.clone(),
                     entity_id,
@@ -350,7 +357,11 @@ pub fn build_canonical_graph(
                     start: mention.start,
                     end: mention.end,
                     quote,
-                });
+                };
+                relation_mentions.push(canonical_mention.clone());
+                if !support_mentions.contains(mention.id.as_str()) {
+                    mentions.push(canonical_mention);
+                }
                 mention_roots.insert(
                     (document.note_id.clone(), mention.id.clone()),
                     lineage_roots,
@@ -359,7 +370,8 @@ pub fn build_canonical_graph(
         }
     }
     mentions.sort_by(|left, right| left.id.cmp(&right.id));
-    let mention_index: BTreeMap<_, _> = mentions
+    relation_mentions.sort_by(|left, right| left.id.cmp(&right.id));
+    let mention_index: BTreeMap<_, _> = relation_mentions
         .iter()
         .map(|mention| {
             (
@@ -1585,6 +1597,8 @@ fn normalize_document_graph(
     note_id: &str,
     doc: &mut RefinedDoc,
 ) -> Result<(), Vec<store::aing_graph::ValidationIssue>> {
+    let incoming_support: BTreeSet<_> = doc.graph_support_mentions.iter().cloned().collect();
+    let mut normalized_support = BTreeSet::new();
     let mut mention_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for paragraph in &mut doc.paragraphs {
         let identity = paragraph.clone();
@@ -1601,9 +1615,13 @@ fn normalize_document_graph(
                 .entry((original, mention.entity.clone()))
                 .or_default()
                 .push(normalized.clone());
+            if incoming_support.contains(&mention.id) {
+                normalized_support.insert(normalized.clone());
+            }
             mention.id = normalized;
         }
     }
+    doc.graph_support_mentions = normalized_support.into_iter().collect();
 
     let mut validation_relations = doc.relations.clone();
     for relation in &mut validation_relations {
@@ -1908,6 +1926,7 @@ mod tests {
                 mode: "done".into(),
             }),
             relations: Vec::new(),
+            graph_support_mentions: Vec::new(),
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(),
                 name: None,
@@ -4151,6 +4170,53 @@ mod tests {
             PendingItem::StaleEvidence { relation_id, evidence_id, .. }
                 if relation_id == &expected_relation_id && evidence_id == &expected_evidence_id
         )));
+    }
+
+    #[test]
+    fn support_mention_ids_follow_canonical_mention_normalization() {
+        let mut document = relation_doc("n1", 0.9);
+        document.paragraphs[0].mentions[0].id = "legacy-support".into();
+        document.relations[0].subject_mentions = vec!["legacy-support".into()];
+        document.graph_support_mentions = vec!["legacy-support".into()];
+        let expected = store::mention_id("n1", &document.paragraphs[0], "P1", 0, 5);
+
+        normalize_document_graph("n1", &mut document).unwrap();
+
+        assert_eq!(document.graph_support_mentions, vec![expected.clone()]);
+        assert_eq!(document.relations[0].subject_mentions, vec![expected]);
+    }
+
+    #[test]
+    fn support_mentions_feed_relation_split_but_not_live_or_index_mentions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut document = relation_doc("n1", 0.9);
+        document.graph_support_mentions = document.relations[0]
+            .subject_mentions
+            .iter()
+            .chain(&document.relations[0].object_mentions)
+            .cloned()
+            .collect();
+        document.graph_support_mentions.sort();
+        write_note(root.path(), "n1", &document);
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &reconcile_registry(root.path()).unwrap(),
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+
+        assert!(graph.mentions.is_empty());
+        assert_eq!(
+            graph.relations.len(),
+            1,
+            "support mentions 仍应供关系端点拆分"
+        );
+        assert_eq!(graph.relations[0].evidence[0].subject_mentions.len(), 1);
+        assert_eq!(graph.relations[0].evidence[0].object_mentions.len(), 1);
+        let stats = super::super::index::rebuild_atomic(root.path(), &graph).unwrap();
+        assert_eq!(stats.mentions, 0);
+        assert_eq!(stats.relations, 1);
     }
 
     #[test]
