@@ -230,6 +230,23 @@ pub fn update<T>(
     Ok(result)
 }
 
+pub(crate) fn with_locked_ledger<T>(
+    data_root: &Path,
+    inspect: impl FnOnce(&KnowledgeLedger) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    fs::create_dir_all(data_root)?;
+    let path = data_root.join(KNOWLEDGE_FILE);
+    let bootstrap = match read_ledger(&path)? {
+        Some(_) => None,
+        None => Some(
+            ValidatedBootstrap::new(bootstrap_legacy(data_root)?).map_err(anyhow::Error::msg)?,
+        ),
+    };
+    let _lock = KnowledgeLock::acquire(data_root)?;
+    let loaded = load_locked(data_root, bootstrap)?;
+    inspect(&loaded.ledger)
+}
+
 fn initialize_missing(
     data_root: &Path,
     bootstrap: ValidatedBootstrap,
