@@ -22,10 +22,16 @@ import {
   canSubmitSplit,
   createGovernanceController,
   groupPending,
+  pendingReviewModel,
   pendingAfterLater,
+  prepareRebuildWait,
+  retainLastKnownRelation,
   splitPreview,
+  type GraphIndexStatus,
   type GovernanceApi,
   type GovernanceMention,
+  type PrepareRebuildWait,
+  type RebuildWaitHandle,
 } from "./knowledgeGovernance";
 
 const result = (operationId: string): KnowledgeMutationResult => ({
@@ -54,16 +60,30 @@ function api(overrides: Partial<GovernanceApi> = {}): GovernanceApi {
   };
 }
 
+const status = (state: GraphIndexStatus["state"], error: string | null = null): GraphIndexStatus => ({
+  state,
+  error,
+  stats: null,
+});
+
+function immediateRebuildWait(): PrepareRebuildWait {
+  return vi.fn(async () => ({
+    terminal: Promise.resolve(status("ready")),
+    cancel: vi.fn(),
+  }));
+}
+
 describe("createGovernanceController", () => {
   it("deduplicates concurrent mutations and calls the API once", async () => {
     const pending = deferred<KnowledgeMutationResult>();
     const submit = vi.fn(() => pending.promise);
-    const controller = createGovernanceController(api({ submit }), vi.fn());
+    const controller = createGovernanceController(api({ submit }), vi.fn(), immediateRebuildWait());
     const operation = buildRenameEntity("kg_a", "完整新名称");
 
     const first = controller.submit(operation);
     const duplicate = controller.submit(operation);
     expect(controller.busy).toBe(true);
+    await Promise.resolve();
     expect(submit).toHaveBeenCalledTimes(1);
 
     pending.resolve(result("op_1"));
@@ -78,7 +98,7 @@ describe("createGovernanceController", () => {
       .fn()
       .mockRejectedValueOnce(new Error("ledger is read-only"))
       .mockImplementationOnce(() => retry.promise);
-    const controller = createGovernanceController(api({ submit }), vi.fn());
+    const controller = createGovernanceController(api({ submit }), vi.fn(), immediateRebuildWait());
     const operation = buildAddAlias("kg_a", "完整别名");
 
     await expect(controller.submit(operation)).rejects.toThrow("ledger is read-only");
@@ -91,16 +111,82 @@ describe("createGovernanceController", () => {
     await second;
   });
 
-  it("stores the operation and refreshes exactly once after API resolution", async () => {
+  it("subscribes before mutation, ignores an old ready, then refreshes exactly once after building -> ready", async () => {
     const order: string[] = [];
+    let emit!: (value: GraphIndexStatus) => void;
+    const cancel = vi.fn();
+    const prepare = vi.fn(async () => prepareRebuildWait(async (listener) => {
+      order.push("subscribe");
+      emit = listener;
+      return cancel;
+    }));
     const controller = createGovernanceController(
       api({ submit: vi.fn(async () => { order.push("api"); return result("op_2"); }) }),
       vi.fn(async () => { order.push("refresh"); }),
+      prepare,
     );
 
-    await controller.submit(buildConfirmRelation("rel_a"));
-    expect(order).toEqual(["api", "refresh"]);
+    const operation = controller.submit(buildConfirmRelation("rel_a"));
+    await vi.waitFor(() => expect(order).toEqual(["subscribe", "api"]));
+    emit(status("ready"));
+    await Promise.resolve();
+    expect(order).toEqual(["subscribe", "api"]);
+    emit(status("building"));
+    emit(status("ready"));
+    await operation;
+    expect(order).toEqual(["subscribe", "api", "refresh"]);
+    expect(cancel).toHaveBeenCalledTimes(1);
     expect(controller.lastOperationId).toBe("op_2");
+  });
+
+  it("keeps the committed operation when the observed rebuild ends in error", async () => {
+    let emit!: (value: GraphIndexStatus) => void;
+    const prepare = vi.fn(async () => prepareRebuildWait(async (listener) => {
+      emit = listener;
+      const unlisten: () => void = vi.fn();
+      return unlisten;
+    }));
+    const refresh = vi.fn();
+    const controller = createGovernanceController(api(), refresh, prepare);
+
+    const operation = controller.submit(buildConfirmRelation("rel_a"));
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
+    emit(status("building"));
+    emit(status("error", "semantic index unavailable"));
+
+    await expect(operation).resolves.toEqual(result("op_submit"));
+    expect(controller.lastOperationId).toBe("op_submit");
+    expect(controller.error).toBe("");
+    expect(controller.refreshError).toContain("索引重建失败");
+    expect(controller.refreshError).toContain("稍后重试");
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("cancels the prepared listener when mutation fails", async () => {
+    const cancel = vi.fn();
+    const handle: RebuildWaitHandle = { terminal: new Promise(() => {}), cancel };
+    const submit = vi.fn().mockRejectedValue(new Error("ledger is read-only"));
+    const refresh = vi.fn();
+    const controller = createGovernanceController(api({ submit }), refresh, vi.fn(async () => handle));
+
+    await expect(controller.submit(buildConfirmRelation("rel_a"))).rejects.toThrow("ledger is read-only");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("cancels the prepared listener and refreshes once for a non-queued result", async () => {
+    const cancel = vi.fn();
+    const refresh = vi.fn();
+    const nonQueued = { ...result("op_immediate"), rebuild_state: "ready" } as unknown as KnowledgeMutationResult;
+    const controller = createGovernanceController(
+      api({ submit: vi.fn().mockResolvedValue(nonQueued) }),
+      refresh,
+      vi.fn(async () => ({ terminal: new Promise<GraphIndexStatus>(() => {}), cancel })),
+    );
+
+    await expect(controller.submit(buildConfirmRelation("rel_a"))).resolves.toEqual(nonQueued);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 
   it("distinguishes refresh failure, keeps the operation ID, and offers retry", async () => {
@@ -108,7 +194,7 @@ describe("createGovernanceController", () => {
       .fn()
       .mockRejectedValueOnce(new Error("index unavailable"))
       .mockResolvedValueOnce(undefined);
-    const controller = createGovernanceController(api(), refresh);
+    const controller = createGovernanceController(api(), refresh, immediateRebuildWait());
 
     await expect(controller.submit(buildConfirmRelation("rel_a"))).resolves.toEqual(
       result("op_submit"),
@@ -124,12 +210,33 @@ describe("createGovernanceController", () => {
 
   it("undo uses the returned operation ID and stores the compensating operation", async () => {
     const undo = vi.fn().mockResolvedValue(result("op_compensation"));
-    const controller = createGovernanceController(api({ undo }), vi.fn());
+    const controller = createGovernanceController(api({ undo }), vi.fn(), immediateRebuildWait());
 
     await controller.submit(buildRenameEntity("kg_a", "新名称"));
     await controller.undo(controller.lastOperationId!);
     expect(undo).toHaveBeenCalledWith("op_submit");
     expect(controller.lastOperationId).toBe("op_compensation");
+  });
+});
+
+describe("prepareRebuildWait", () => {
+  it("accepts only a terminal event observed after building and unsubscribes once", async () => {
+    let emit!: (value: GraphIndexStatus) => void;
+    const unlisten = vi.fn();
+    const handle = await prepareRebuildWait(async (listener) => {
+      emit = listener;
+      return unlisten;
+    });
+    let settled = false;
+    void handle.terminal.then(() => { settled = true; });
+
+    emit(status("ready"));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    emit(status("building"));
+    emit(status("ready"));
+    await expect(handle.terminal).resolves.toEqual(status("ready"));
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -197,50 +304,85 @@ describe("splitPreview", () => {
   });
 });
 
-const pending = (id: string, kind: string): PendingReviewItem => ({
+const pending = (
+  id: string,
+  kind: string,
+  payload: PendingReviewItem["payload"],
+  noteId: string | null = null,
+  relationId: string | null = null,
+): PendingReviewItem => ({
   id,
   kind,
-  note_id: null,
-  relation_id: null,
-  payload: { label: `完整待整理内容 ${id}` },
+  note_id: noteId,
+  relation_id: relationId,
+  payload,
 });
 
+const pendingFixtures = [
+  pending("invalid", "invalid_document", { kind: "invalid_document", note_id: "note_invalid", message: "frontmatter 无效" }, "note_invalid"),
+  pending("identity", "identity_conflict", { kind: "identity_conflict", note_id: "note_identity", local_entity_id: "local_alice", candidates: ["kg_alice", "kg_alicia"], reason: "名称存在多个匹配" }, "note_identity"),
+  pending("stale", "stale_evidence", { kind: "stale_evidence", note_id: "note_stale", relation_id: "rel_stale", evidence_id: "ev_stale" }, "note_stale", "rel_stale"),
+  pending("split", "split_conflict", { kind: "split_conflict", note_id: "note_split", relation_id: "rel_split", evidence_id: "ev_split" }, "note_split", "rel_split"),
+  pending("review", "relation_review", { kind: "relation_review", note_id: "note_review", relation_id: "rel_review" }, "note_review", "rel_review"),
+  pending("time", "time_conflict", { kind: "time_conflict", relation_ids: ["rel_early", "rel_late"] }),
+  pending("unknown", "future_kind", { kind: "future_kind", message: "未知完整内容" }),
+] satisfies PendingReviewItem[];
+
 describe("groupPending", () => {
-  it("uses stable governance order and sends unknown kinds to the final fallback", () => {
-    const items = [
-      pending("z", "future_kind"),
-      pending("time", "time_conflict"),
-      pending("custom", "custom_predicate"),
-      pending("confidence", "low_confidence"),
-      pending("person", "person_candidate"),
-      pending("duplicate", "duplicate_candidate"),
-      pending("identity", "identity_conflict"),
-    ];
+  it("groups the six real backend payloads and sends unknown kinds to the final fallback", () => {
+    const items = [...pendingFixtures].reverse();
     const grouped = groupPending(items);
     expect(grouped.map((group) => group.label)).toEqual([
-      "疑似重复或人物匹配",
-      "低置信关系",
-      "自定义关系类型",
-      "时间冲突",
       "身份冲突",
+      "待确认关系",
+      "时间冲突",
+      "证据已失效",
+      "拆分冲突",
+      "文档错误",
       "其他",
     ]);
     expect(grouped.flatMap((group) => group.items.map((item) => item.id))).toEqual([
-      "duplicate", "person", "confidence", "custom", "time", "identity", "z",
+      "identity", "review", "time", "stale", "split", "invalid", "unknown",
     ]);
     expect(groupPending([...items].reverse())).toEqual(grouped);
-    expect(items[0]?.id).toBe("z");
+    expect(items[0]?.id).toBe("unknown");
+  });
+
+  it("derives honest navigation and direct-action capability from real payload fields", () => {
+    expect(pendingReviewModel(pendingFixtures[1]!)).toMatchObject({
+      kind: "identity_conflict",
+      noteId: "note_identity",
+      localEntityId: "local_alice",
+      candidateEntityIds: ["kg_alice", "kg_alicia"],
+      relationIds: [],
+      canConfirm: false,
+    });
+    expect(pendingReviewModel(pendingFixtures[2]!)).toMatchObject({
+      kind: "stale_evidence",
+      noteId: "note_stale",
+      evidenceId: "ev_stale",
+      relationIds: ["rel_stale"],
+      canConfirm: false,
+    });
+    expect(pendingReviewModel(pendingFixtures[4]!)).toMatchObject({
+      relationIds: ["rel_review"],
+      canConfirm: true,
+    });
+    expect(pendingReviewModel(pendingFixtures[5]!)).toMatchObject({
+      relationIds: ["rel_early", "rel_late"],
+      canConfirm: false,
+    });
   });
 
   it("later is session-only and never invokes an API", () => {
     const mutation = vi.fn();
-    const items = [pending("a", "low_confidence"), pending("b", "future_kind")];
-    expect(pendingAfterLater(items, new Set(["a"]))).toEqual([items[1]]);
+    const items = pendingFixtures.slice(0, 2);
+    expect(pendingAfterLater(items, new Set(["invalid"]))).toEqual([items[1]]);
     expect(mutation).not.toHaveBeenCalled();
   });
 
   it("never produces shortened visible content", () => {
-    const grouped = groupPending([pending("long", "future_kind")]);
+    const grouped = groupPending([pending("long", "future_kind", { message: "完整待整理内容" })]);
     const serialized = JSON.stringify(grouped);
     expect(serialized).not.toContain("…");
     expect(serialized).not.toMatch(/\.\.\.(?:"|$)/);
@@ -267,7 +409,7 @@ describe("governance UI source contract", () => {
     expect(route).not.toMatch(/\{#if selected[^}]*\}[\s\S]{0,500}<ForceGraph/);
   });
 
-  it("exposes every planned visible action and a persistent pending entry", () => {
+  it("exposes valid governance actions and a persistent pending entry", () => {
     const entity = source("./EntityGovernance.svelte");
     const relation = source("./RelationDrawer.svelte");
     const pendingPanel = source("./PendingReviewPanel.svelte");
@@ -275,13 +417,34 @@ describe("governance UI source contract", () => {
     for (const label of ["重命名实体", "添加别名", "合并实体", "拆分证据", "新建关系", "关联会议搭子"]) {
       expect(entity).toContain(label);
     }
-    for (const label of ["确认关系", "保存关系修改", "结束关系", "否决并抑制", "恢复关系", "撤销上次操作"]) {
+    for (const label of ["确认关系", "保存关系修改", "结束关系", "否决并抑制", "撤销上次操作"]) {
       expect(relation).toContain(label);
     }
-    for (const label of ["确认关系", "编辑关系", "否决并抑制", "稍后处理"]) {
+    for (const label of ["确认关系", "查看关系", "否决并抑制", "稍后处理"]) {
       expect(pendingPanel).toContain(label);
     }
     expect(sidebar).toContain("待整理");
+  });
+
+  it("dispatches pending actions by real kind without fabricating relation triples", () => {
+    const pendingPanel = source("./PendingReviewPanel.svelte");
+    for (const kind of ["invalid_document", "identity_conflict", "stale_evidence", "split_conflict", "relation_review", "time_conflict"]) {
+      expect(pendingPanel).toContain(kind);
+    }
+    expect(pendingPanel).toContain("candidateEntityIds");
+    expect(pendingPanel).toContain("encodeURIComponent(candidateId)");
+    expect(pendingPanel).not.toContain("payload?.subject_id");
+    expect(pendingPanel).not.toContain("payload?.predicate_type");
+  });
+
+  it("keeps tombstone mutation feedback and undo available without claiming complete history", () => {
+    const relation = source("./RelationDrawer.svelte");
+    expect(relation).toContain("lastKnown");
+    expect(relation).toContain("semanticEntityDetail");
+    expect(relation).toContain("接口仅返回所选单条关系");
+    expect(relation).toContain("{#if controller.lastOperationId}");
+    expect(relation).not.toContain("restoreOperationId");
+    expect(relation).not.toContain("当前索引没有这条关系的历史版本");
   });
 
   it("includes explicit no-evidence copy and accessibility markers", () => {
@@ -299,5 +462,38 @@ describe("governance UI source contract", () => {
       expect(content).not.toContain("line-clamp");
       expect(content).not.toContain("text-overflow: ellipsis");
     }
+  });
+});
+
+describe("relation drawer tombstone state", () => {
+  const relation = {
+    relation: {
+      id: "rel_a",
+      subject_id: "kg_a",
+      object_id: "kg_b",
+      predicate_type: "uses",
+      predicate_label: null,
+      status: "current" as const,
+      confidence: 1,
+      origin: "confirmed" as const,
+      evidence_count: 0,
+      note_count: 0,
+      valid_from: null,
+      valid_to: null,
+    },
+    provider: null,
+    model: null,
+    note_ids: [],
+    evidence: [],
+  };
+
+  it("retains the last relation through suppress -> null and replaces it after undo reload", () => {
+    const beforeSuppress = retainLastKnownRelation(relation, null);
+    const tombstone = retainLastKnownRelation(null, beforeSuppress);
+    const restored = { ...relation, relation: { ...relation.relation, origin: "manual" as const } };
+    const afterUndo = retainLastKnownRelation(restored, tombstone);
+
+    expect(tombstone).toBe(relation);
+    expect(afterUndo).toBe(restored);
   });
 });

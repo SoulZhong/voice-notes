@@ -1,12 +1,14 @@
 <script lang="ts">
-  import { relationDetail, type JsonValue, type PendingReviewItem } from "./knowledge";
+  import { relationDetail, type PendingReviewItem, type RelationDetail } from "./knowledge";
   import {
     buildConfirmRelation,
     buildSuppressRelation,
     createGovernanceController,
     groupPending,
     pendingAfterLater,
+    pendingReviewModel,
     task10GovernanceApi,
+    type PendingReviewModel,
   } from "./knowledgeGovernance";
 
   let {
@@ -24,38 +26,44 @@
   let hiddenIds = $state(new Set<string>());
   let workingId = $state<string | null>(null);
   let status = $state("");
+  let relationDetails = $state<Record<string, RelationDetail | null>>({});
+  let relationLoadGeneration = 0;
   const controller = createGovernanceController(task10GovernanceApi, () => onChanged());
   const visibleItems = $derived(pendingAfterLater(items, hiddenIds));
   const groups = $derived(groupPending(visibleItems));
 
-  function record(value: JsonValue): Record<string, JsonValue> | null {
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-      ? value as Record<string, JsonValue>
-      : null;
+  async function loadRelationDetails(ids: string[]) {
+    const generation = ++relationLoadGeneration;
+    const entries = await Promise.all(ids.map(async (id) => {
+      try {
+        return [id, await relationDetail(id)] as const;
+      } catch {
+        return [id, null] as const;
+      }
+    }));
+    if (generation === relationLoadGeneration) relationDetails = Object.fromEntries(entries);
   }
 
-  function itemTitle(item: PendingReviewItem): string {
-    const payload = record(item.payload);
-    for (const key of ["label", "name", "reason", "message"] as const) {
-      const value = payload?.[key];
-      if (typeof value === "string" && value.trim()) return value;
-    }
-    return item.relation_id ? `关系 ${item.relation_id}` : `待整理项 ${item.id}`;
+  $effect(() => {
+    const relationIds = [...new Set(items.flatMap((item) => pendingReviewModel(item).relationIds))].sort();
+    void loadRelationDetails(relationIds);
+  });
+
+  function itemTitle(item: PendingReviewItem, model: PendingReviewModel): string {
+    if (model.message) return model.message;
+    if (model.reason) return model.reason;
+    if (model.evidenceId) return `证据 ${model.evidenceId}`;
+    if (model.relationIds.length === 1) return `关系 ${model.relationIds[0]}`;
+    return `待整理项 ${item.id}`;
   }
 
-  function payloadText(item: PendingReviewItem): string {
-    return JSON.stringify(item.payload, null, 2);
-  }
-
-  async function confirmItem(item: PendingReviewItem) {
-    if (!item.relation_id || workingId) {
-      if (!item.relation_id) status = "这条待整理项没有可确认的关系 ID，可先打开编辑查看完整内容。";
-      return;
-    }
+  async function confirmItem(item: PendingReviewItem, model: PendingReviewModel) {
+    const relationId = model.relationIds[0];
+    if (!model.canConfirm || !relationId || workingId) return;
     workingId = item.id;
     status = "正在确认关系";
     try {
-      await controller.submit(buildConfirmRelation(item.relation_id));
+      await controller.submit(buildConfirmRelation(relationId));
       status = controller.refreshError || "关系已确认并移出待整理";
     } catch {
       status = controller.error;
@@ -64,24 +72,19 @@
     }
   }
 
-  async function suppressItem(item: PendingReviewItem) {
+  async function suppressItem(item: PendingReviewItem, relation: RelationDetail) {
     if (workingId) return;
-    const approved = window.confirm(`否决「${itemTitle(item)}」并永久抑制这条关系？模型重新抽取也不会自动恢复。`);
+    const model = pendingReviewModel(item);
+    const approved = window.confirm(`否决「${itemTitle(item, model)}」并永久抑制这条关系？模型重新抽取也不会自动恢复。`);
     if (!approved) return;
     workingId = item.id;
     status = "正在写入持久抑制裁决";
     try {
-      const relation = item.relation_id ? await relationDetail(item.relation_id) : null;
-      const payload = record(item.payload);
-      const subjectId = relation?.relation.subject_id ?? (typeof payload?.subject_id === "string" ? payload.subject_id : null);
-      const objectId = relation?.relation.object_id ?? (typeof payload?.object_id === "string" ? payload.object_id : null);
-      const predicateType = relation?.relation.predicate_type ?? (typeof payload?.predicate_type === "string" ? payload.predicate_type : null);
-      const predicateLabel = relation?.relation.predicate_label ?? (typeof payload?.predicate_label === "string" ? payload.predicate_label : null);
-      if (!subjectId || !objectId || !predicateType) {
-        status = "无法读取这条候选关系的主体、类型和客体；请先打开编辑并补全关系。";
-        return;
-      }
-      await controller.submit(buildSuppressRelation(subjectId, { type: predicateType, label: predicateLabel }, objectId));
+      await controller.submit(buildSuppressRelation(
+        relation.relation.subject_id,
+        { type: relation.relation.predicate_type, label: relation.relation.predicate_label },
+        relation.relation.object_id,
+      ));
       status = controller.refreshError || "候选关系已否决并持久抑制";
     } catch {
       status = controller.error || "候选关系读取失败，请稍后重试。";
@@ -92,7 +95,7 @@
 
   function later(item: PendingReviewItem) {
     hiddenIds = new Set([...hiddenIds, item.id]);
-    status = `已在本次会话稍后处理「${itemTitle(item)}」；没有写入后端。`;
+    status = `已在本次会话稍后处理「${itemTitle(item, pendingReviewModel(item))}」；没有写入后端。`;
   }
 
   async function undoLast() {
@@ -128,17 +131,59 @@
       <h3 id={'pending-group-' + group.key}>{group.label} <span>{group.items.length}</span></h3>
       <ul>
         {#each group.items as item (item.id)}
+          {@const model = pendingReviewModel(item)}
           <li>
             <div class="item-heading">
-              <strong>{itemTitle(item)}</strong>
+              <strong>{itemTitle(item, model)}</strong>
               <span>{item.kind}</span>
             </div>
-            {#if item.note_id}<a class="note-link" href={'/notes/' + encodeURIComponent(item.note_id)}>打开笔记 {item.note_id}</a>{/if}
-            <pre>{payloadText(item)}</pre>
-            <div class="row-actions" aria-label={`处理 ${itemTitle(item)}`}>
-              <button type="button" disabled={workingId !== null || !item.relation_id} onclick={() => confirmItem(item)}>确认关系</button>
-              <button type="button" disabled={workingId !== null || !item.relation_id} onclick={() => item.relation_id && onOpenRelation(item.relation_id)}>编辑关系</button>
-              <button class="danger" type="button" disabled={workingId !== null} onclick={() => suppressItem(item)}>否决并抑制</button>
+            {#if model.noteId}<a class="note-link" href={'/notes/' + encodeURIComponent(model.noteId)}>打开原笔记 {model.noteId}</a>{/if}
+
+            {#if model.kind === "identity_conflict"}
+              <p class="detail">本地实体 {model.localEntityId || "未提供"}。{model.reason || "后端未提供冲突原因。"}</p>
+              <div class="entity-links" aria-label="候选实体">
+                {#each model.candidateEntityIds as candidateId (candidateId)}
+                  <a href={'/graph?e=' + encodeURIComponent(candidateId)}>查看候选实体 {candidateId}</a>
+                {/each}
+              </div>
+              <p class="unavailable">当前后端尚未提供按该候选集合绑定身份的命令；请从原笔记或候选实体继续核对。</p>
+            {:else if model.kind === "invalid_document"}
+              <p class="detail">{model.message || "后端未提供文档错误详情。"}</p>
+              <p class="unavailable">请先修复原笔记的结构或 frontmatter；当前没有可安全执行的关系治理命令。</p>
+            {:else if model.kind === "stale_evidence" || model.kind === "split_conflict"}
+              <p class="detail">需修复的证据 ID：{model.evidenceId || "未提供"}</p>
+              <p class="unavailable">请回到原笔记修复证据锚点或拆分归属；当前后端未提供直接修复命令。</p>
+            {:else if model.kind === "time_conflict"}
+              <p class="detail">以下关系的时间范围相互冲突：</p>
+            {:else if model.kind === "relation_review"}
+              <p class="detail">这是后端明确标记的待确认关系。</p>
+            {:else}
+              <pre>{JSON.stringify(item.payload, null, 2)}</pre>
+              <p class="unavailable">未识别的待整理类型；当前不提供会发送不完整 payload 的通用动作。</p>
+            {/if}
+
+            {#if model.kind === "time_conflict"}
+              <div class="relation-links" aria-label="时间冲突关系">
+                {#each model.relationIds as relationId (relationId)}
+                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>查看关系 {relationId}</button>
+                {/each}
+              </div>
+            {:else if model.relationIds[0]}
+              {@const relationId = model.relationIds[0]}
+              {@const loadedRelation = relationDetails[relationId]}
+              <div class="relation-links">
+                <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>查看关系</button>
+                {#if loadedRelation}
+                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>编辑关系</button>
+                  <button class="danger" type="button" disabled={workingId !== null} onclick={() => suppressItem(item, loadedRelation)}>否决并抑制</button>
+                {:else if loadedRelation === null}
+                  <span class="unavailable">当前无法读取完整关系 triple，已隐藏编辑与抑制动作。</span>
+                {/if}
+              </div>
+            {/if}
+
+            <div class="row-actions" aria-label={`处理 ${itemTitle(item, model)}`}>
+              {#if model.canConfirm}<button type="button" disabled={workingId !== null} onclick={() => confirmItem(item, model)}>确认关系</button>{/if}
               <button type="button" disabled={workingId !== null} onclick={() => later(item)}>稍后处理</button>
             </div>
           </li>
@@ -180,7 +225,11 @@
   .item-heading span { flex: none; color: var(--ink-faint); font-size: 0.68rem; overflow-wrap: anywhere; }
   .note-link { display: inline-block; margin-top: 5px; color: var(--accent); font-size: 0.74rem; text-decoration: none; overflow-wrap: anywhere; }
   pre { margin: 8px 0; padding: 8px 0; color: var(--ink-secondary); font: 0.72rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .detail, .unavailable { margin: 7px 0; color: var(--ink-secondary); font-size: 0.76rem; line-height: 1.55; overflow-wrap: anywhere; }
+  .unavailable { color: var(--ink-faint); }
+  .entity-links, .relation-links, .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .entity-links a { padding: 6px 8px; border: 1px solid var(--hairline); border-radius: var(--radius-md); color: var(--accent); font-size: 0.74rem; text-decoration: none; overflow-wrap: anywhere; }
+  .relation-links .unavailable { flex: 1 1 100%; margin: 0; }
   button { min-height: 32px; padding: 6px 9px; border: 1px solid var(--hairline-strong); border-radius: var(--radius-md); background: transparent; color: var(--ink-secondary); font: inherit; font-size: 0.76rem; cursor: pointer; }
   button:hover:not(:disabled) { background: var(--surface-soft); color: var(--ink); }
   button.danger { border-color: var(--danger-line); color: var(--danger-ink); }

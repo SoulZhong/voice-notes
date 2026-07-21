@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import {
   applyKnowledgeOperation,
   mergeEntities,
@@ -8,6 +9,7 @@ import {
   type KnowledgePredicate,
   type MentionEvidence,
   type PendingReviewItem,
+  type RelationDetail,
   type SplitEntityRequest,
 } from "./knowledge";
 
@@ -30,6 +32,23 @@ export interface GovernanceController {
   retryRefresh(): Promise<void>;
 }
 
+export interface GraphIndexStatus {
+  state: "building" | "ready" | "error";
+  error: string | null;
+  stats: Record<string, number> | null;
+}
+
+export interface RebuildWaitHandle {
+  readonly terminal: Promise<GraphIndexStatus>;
+  cancel(): void;
+}
+
+export type RebuildStatusListener = (status: GraphIndexStatus) => void;
+export type RebuildStatusSubscribe = (
+  listener: RebuildStatusListener,
+) => Promise<() => void>;
+export type PrepareRebuildWait = () => Promise<RebuildWaitHandle>;
+
 export interface GovernanceMention extends MentionEvidence {
   /** Filled by the UI from relation evidence before split preview. */
   relation_ids?: string[];
@@ -48,6 +67,26 @@ export interface PendingGroup {
   items: PendingReviewItem[];
 }
 
+export type KnownPendingKind =
+  | "invalid_document"
+  | "identity_conflict"
+  | "stale_evidence"
+  | "split_conflict"
+  | "relation_review"
+  | "time_conflict";
+
+export interface PendingReviewModel {
+  kind: KnownPendingKind | "other";
+  noteId: string | null;
+  relationIds: string[];
+  evidenceId: string | null;
+  localEntityId: string | null;
+  candidateEntityIds: string[];
+  message: string | null;
+  reason: string | null;
+  canConfirm: boolean;
+}
+
 export const KNOWLEDGE_CHANGED_EVENT = "knowledge-governance-changed";
 
 export const task10GovernanceApi: GovernanceApi = {
@@ -63,9 +102,59 @@ function errorMessage(error: unknown): string {
   return message || "未知错误";
 }
 
+const subscribeToGraphRebuild: RebuildStatusSubscribe = async (listener) =>
+  listen<GraphIndexStatus>("graph_index_status", (event) => listener(event.payload));
+
+/**
+ * Installs the rebuild listener before a mutation is sent. Without a backend
+ * generation ID, an observed building event is the only safe boundary for
+ * accepting the following ready/error as belonging to the queued request.
+ */
+export async function prepareRebuildWait(
+  subscribe: RebuildStatusSubscribe = subscribeToGraphRebuild,
+): Promise<RebuildWaitHandle> {
+  let sawBuilding = false;
+  let settled = false;
+  let unlisten: (() => void) | null = null;
+  let cleanupPending = false;
+  let resolveTerminal!: (status: GraphIndexStatus) => void;
+
+  const cleanup = () => {
+    if (cleanupPending) return;
+    cleanupPending = true;
+    unlisten?.();
+  };
+  const terminal = new Promise<GraphIndexStatus>((resolve) => {
+    resolveTerminal = resolve;
+  });
+  const listener = (status: GraphIndexStatus) => {
+    if (settled) return;
+    if (status.state === "building") {
+      sawBuilding = true;
+      return;
+    }
+    if (!sawBuilding || (status.state !== "ready" && status.state !== "error")) return;
+    settled = true;
+    resolveTerminal(status);
+    cleanup();
+  };
+
+  unlisten = await subscribe(listener);
+  if (cleanupPending) unlisten();
+  return {
+    terminal,
+    cancel() {
+      if (settled) return;
+      settled = true;
+      cleanup();
+    },
+  };
+}
+
 export function createGovernanceController(
   api: GovernanceApi,
   refresh: () => Promise<void>,
+  prepareWait: PrepareRebuildWait = () => prepareRebuildWait(),
 ): GovernanceController {
   let busy = false;
   let error = "";
@@ -81,16 +170,38 @@ export function createGovernanceController(
     refreshError = "";
     const current = (async () => {
       let mutationResult: KnowledgeMutationResult;
+      let rebuildWait: RebuildWaitHandle | null = null;
       try {
+        // Await listener installation before invoking the mutation. This closes
+        // the fast-rebuild race where ready could otherwise arrive first.
+        rebuildWait = await prepareWait();
         mutationResult = await mutation();
       } catch (cause) {
+        rebuildWait?.cancel();
         error = `治理操作未保存：${errorMessage(cause)}。请检查后重试。`;
         throw cause;
       }
 
-      // The mutation is already durable at this point. A failed read refresh must not
-      // reject the successful mutation or lose the operation ID needed for Undo.
       lastOperationId = mutationResult.operation_id;
+      if (mutationResult.rebuild_state === "queued") {
+        try {
+          const terminal = await rebuildWait.terminal;
+          if (terminal.state === "error") {
+            refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但图谱索引重建失败：${terminal.error || "后端未提供详细原因"}。请稍后重试刷新；撤销仍可使用。`;
+            return mutationResult;
+          }
+        } catch (cause) {
+          refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但等待图谱索引重建失败：${errorMessage(cause)}。请稍后重试刷新；撤销仍可使用。`;
+          return mutationResult;
+        } finally {
+          rebuildWait.cancel();
+        }
+      } else {
+        rebuildWait.cancel();
+      }
+
+      // The mutation is already durable. A failed read refresh must not reject
+      // the operation or lose the operation ID needed for Undo.
       try {
         await refresh();
       } catch (cause) {
@@ -327,11 +438,12 @@ export function canSubmitSplit(preview: SplitPreview): boolean {
 }
 
 const PENDING_GROUPS = [
-  { key: "identity_candidate", label: "疑似重复或人物匹配" },
-  { key: "low_confidence", label: "低置信关系" },
-  { key: "custom_predicate", label: "自定义关系类型" },
-  { key: "time_conflict", label: "时间冲突" },
   { key: "identity_conflict", label: "身份冲突" },
+  { key: "relation_review", label: "待确认关系" },
+  { key: "time_conflict", label: "时间冲突" },
+  { key: "stale_evidence", label: "证据已失效" },
+  { key: "split_conflict", label: "拆分冲突" },
+  { key: "invalid_document", label: "文档错误" },
   { key: "other", label: "其他" },
 ] as const;
 
@@ -341,34 +453,50 @@ function payloadRecord(item: PendingReviewItem): Record<string, unknown> {
     : {};
 }
 
-function pendingGroupKey(item: PendingReviewItem): (typeof PENDING_GROUPS)[number]["key"] {
-  const kind = item.kind.toLowerCase();
+function stringField(payload: Record<string, unknown>, key: string): string | null {
+  const value = payload[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function stringArrayField(payload: Record<string, unknown>, key: string): string[] {
+  const value = payload[key];
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())))]
+    .sort();
+}
+
+export function pendingReviewModel(item: PendingReviewItem): PendingReviewModel {
   const payload = payloadRecord(item);
-  if (
-    kind.includes("duplicate") ||
-    kind.includes("person_candidate") ||
-    kind.includes("person_match") ||
-    kind === "identity_candidate"
-  ) return "identity_candidate";
-  if (kind.includes("custom_predicate")) return "custom_predicate";
-  if (kind.includes("low_confidence")) return "low_confidence";
-  if (kind === "relation_review") {
-    return payload.predicate_type === "custom" || payload.predicate === "custom"
-      ? "custom_predicate"
-      : "low_confidence";
-  }
-  if (kind.includes("time_conflict")) return "time_conflict";
-  if (
-    kind === "identity_conflict" &&
-    ((Array.isArray(payload.candidates) && payload.candidates.length > 0) ||
-      (typeof payload.reason === "string" && /duplicate|candidate|person|人物|候选|重复/i.test(payload.reason)))
-  ) return "identity_candidate";
-  if (
-    kind.includes("identity_conflict") ||
-    kind === "split_conflict" ||
-    kind === "stale_evidence"
-  ) return "identity_conflict";
-  return "other";
+  const knownKinds: KnownPendingKind[] = [
+    "invalid_document",
+    "identity_conflict",
+    "stale_evidence",
+    "split_conflict",
+    "relation_review",
+    "time_conflict",
+  ];
+  const kind = knownKinds.includes(item.kind as KnownPendingKind)
+    ? item.kind as KnownPendingKind
+    : "other";
+  const singleRelationId = item.relation_id ?? stringField(payload, "relation_id");
+  const relationIds = kind === "time_conflict"
+    ? stringArrayField(payload, "relation_ids")
+    : singleRelationId ? [singleRelationId] : [];
+  return {
+    kind,
+    noteId: item.note_id ?? stringField(payload, "note_id"),
+    relationIds,
+    evidenceId: stringField(payload, "evidence_id"),
+    localEntityId: stringField(payload, "local_entity_id"),
+    candidateEntityIds: stringArrayField(payload, "candidates"),
+    message: stringField(payload, "message"),
+    reason: stringField(payload, "reason"),
+    canConfirm: kind === "relation_review" && relationIds.length === 1,
+  };
+}
+
+function pendingGroupKey(item: PendingReviewItem): (typeof PENDING_GROUPS)[number]["key"] {
+  return pendingReviewModel(item).kind;
 }
 
 function comparePending(left: PendingReviewItem, right: PendingReviewItem): number {
@@ -393,4 +521,11 @@ export function pendingAfterLater(
   hiddenIds: ReadonlySet<string>,
 ): PendingReviewItem[] {
   return items.filter((item) => !hiddenIds.has(item.id));
+}
+
+export function retainLastKnownRelation(
+  current: RelationDetail | null,
+  previous: RelationDetail | null,
+): RelationDetail | null {
+  return current ?? previous;
 }
