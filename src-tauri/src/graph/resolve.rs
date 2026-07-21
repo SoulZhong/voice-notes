@@ -11,7 +11,7 @@ pub struct ResolverSnapshot {
     pub redirects: BTreeMap<String, String>,
     pub mention_bindings: BTreeMap<String, String>,
     pub relation_decisions: RelationDecisions,
-    pub active_merges: Vec<(String, String)>,
+    pub active_events: Vec<ResolverEvent>,
     legacy_ids: BTreeMap<String, String>,
 }
 
@@ -23,7 +23,19 @@ pub struct RelationDecisions {
     pub ended: BTreeMap<String, String>,
     pub restored_operations: BTreeSet<String>,
     pub created: BTreeMap<String, UserRelation>,
-    pub events: Vec<RelationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolverEvent {
+    Merge {
+        operation_index: usize,
+        source_id: String,
+        target_id: String,
+    },
+    Relation {
+        operation_index: usize,
+        event: RelationEvent,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,19 +119,7 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         redirects: BTreeMap::new(),
         mention_bindings: BTreeMap::new(),
         relation_decisions: RelationDecisions::default(),
-        active_merges: ledger
-            .operations
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| active[*index])
-            .filter_map(|(_, operation)| match &operation.action {
-                KnowledgeAction::MergeEntity {
-                    source_id,
-                    target_id,
-                } => Some((source_id.clone(), target_id.clone())),
-                _ => None,
-            })
-            .collect(),
+        active_events: Vec::new(),
         legacy_ids: ledger.legacy_ids.clone(),
     };
     let restored: BTreeSet<String> = ledger
@@ -149,6 +149,11 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                 source_id,
                 target_id,
             } => {
+                snapshot.active_events.push(ResolverEvent::Merge {
+                    operation_index: index,
+                    source_id: source_id.clone(),
+                    target_id: target_id.clone(),
+                });
                 snapshot
                     .redirects
                     .insert(source_id.clone(), target_id.clone());
@@ -166,12 +171,12 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .relation_decisions
                     .confirmed
                     .insert(relation_id.clone());
-                snapshot
-                    .relation_decisions
-                    .events
-                    .push(RelationEvent::Confirm {
+                snapshot.active_events.push(ResolverEvent::Relation {
+                    operation_index: index,
+                    event: RelationEvent::Confirm {
                         relation_id: relation_id.clone(),
-                    });
+                    },
+                });
             }
             KnowledgeAction::EditRelation {
                 relation_id,
@@ -194,13 +199,13 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .relation_decisions
                     .edited
                     .insert(relation_id.clone(), edit.clone());
-                snapshot
-                    .relation_decisions
-                    .events
-                    .push(RelationEvent::Edit {
+                snapshot.active_events.push(ResolverEvent::Relation {
+                    operation_index: index,
+                    event: RelationEvent::Edit {
                         relation_id: relation_id.clone(),
                         edit,
-                    });
+                    },
+                });
             }
             KnowledgeAction::SuppressRelation {
                 subject_id,
@@ -225,9 +230,12 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
                     .relation_decisions
                     .ended
                     .insert(relation_id.clone(), valid_to.clone());
-                snapshot.relation_decisions.events.push(RelationEvent::End {
-                    relation_id: relation_id.clone(),
-                    valid_to: valid_to.clone(),
+                snapshot.active_events.push(ResolverEvent::Relation {
+                    operation_index: index,
+                    event: RelationEvent::End {
+                        relation_id: relation_id.clone(),
+                        valid_to: valid_to.clone(),
+                    },
                 });
             }
             KnowledgeAction::RestoreRelation { operation_id } => {
@@ -525,23 +533,22 @@ pub fn entity_lineage_roots(
     )])
 }
 
-pub fn relation_root_lineage(
+pub fn resolve_reference_at_prefix(
     snapshot: &ResolverSnapshot,
     people: &Voiceprints,
-    root: &str,
-) -> BTreeSet<String> {
-    let mut redirects = BTreeMap::new();
-    let mut lineage = BTreeSet::new();
-    if let Ok(entity_id) = follow_redirects(&redirects, people, root) {
-        lineage.insert(entity_id);
-    }
-    for (source_id, target_id) in &snapshot.active_merges {
-        redirects.insert(source_id.clone(), target_id.clone());
-        if let Ok(entity_id) = follow_redirects(&redirects, people, root) {
-            lineage.insert(entity_id);
+    redirects: &BTreeMap<String, String>,
+    entity_id: &str,
+) -> Resolution {
+    match follow_redirects(redirects, people, entity_id) {
+        Ok(entity_id)
+            if snapshot.registry.contains_key(&entity_id)
+                || people.people.contains_key(&entity_id) =>
+        {
+            Resolution::resolved(entity_id)
         }
+        Ok(entity_id) => Resolution::pending(vec![entity_id], "resolved target entity is missing"),
+        Err(failure) => Resolution::pending(failure.candidates, failure.reason),
     }
-    lineage
 }
 
 pub(crate) fn confirmed_registry_matches(

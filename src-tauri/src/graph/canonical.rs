@@ -843,13 +843,10 @@ fn project_model_groups(
     now: DateTime<FixedOffset>,
 ) {
     for mut group in groups.into_values() {
-        let mut aliases =
-            historical_relation_aliases(&group.relation, &group.roots, snapshot, people);
-        aliases.extend(group.raw_ids);
         if !apply_relation_events(
             &mut group.relation,
             &mut group.roots,
-            &mut aliases,
+            &group.raw_ids,
             snapshot,
             people,
             mentions,
@@ -874,24 +871,63 @@ fn project_model_groups(
 fn apply_relation_events(
     relation: &mut CanonicalRelation,
     roots: &mut RelationRoots,
-    aliases: &mut BTreeSet<String>,
+    permanent_aliases: &BTreeSet<String>,
     snapshot: &resolve::ResolverSnapshot,
     people: &store::Voiceprints,
     mentions: &BTreeMap<(String, String), CanonicalMention>,
     pending: &mut Vec<PendingItem>,
     now: DateTime<FixedOffset>,
 ) -> bool {
-    aliases.insert(relation.id.clone());
-    for event in &snapshot.relation_decisions.events {
+    let mut prefix_redirects = BTreeMap::new();
+    let mut previous_operation_index = None;
+    for active_event in &snapshot.active_events {
+        let (operation_index, event) = match active_event {
+            resolve::ResolverEvent::Merge {
+                operation_index,
+                source_id,
+                target_id,
+            } => {
+                debug_assert!(previous_operation_index.is_none_or(|prior| prior < *operation_index));
+                previous_operation_index = Some(*operation_index);
+                prefix_redirects.insert(source_id.clone(), target_id.clone());
+                continue;
+            }
+            resolve::ResolverEvent::Relation {
+                operation_index,
+                event,
+            } => (*operation_index, event),
+        };
+        debug_assert!(previous_operation_index.is_none_or(|prior| prior < operation_index));
+        previous_operation_index = Some(operation_index);
+        let target_id = match event {
+            resolve::RelationEvent::Confirm { relation_id }
+            | resolve::RelationEvent::Edit { relation_id, .. }
+            | resolve::RelationEvent::End { relation_id, .. } => relation_id,
+        };
+        let visible_aliases =
+            visible_relation_aliases(relation, roots, snapshot, people, &prefix_redirects);
+        if !permanent_aliases.contains(target_id) && !visible_aliases.contains(target_id) {
+            continue;
+        }
         match event {
-            resolve::RelationEvent::Confirm { relation_id } if aliases.contains(relation_id) => {
+            resolve::RelationEvent::Confirm { .. } => {
                 if relation.origin == RelationOrigin::Model {
                     relation.origin = RelationOrigin::Confirmed;
                 }
             }
-            resolve::RelationEvent::Edit { relation_id, edit } if aliases.contains(relation_id) => {
-                let subject = resolve::resolve_reference_id(snapshot, people, &edit.subject_id);
-                let object = resolve::resolve_reference_id(snapshot, people, &edit.object_id);
+            resolve::RelationEvent::Edit { relation_id, edit } => {
+                let subject = resolve::resolve_reference_at_prefix(
+                    snapshot,
+                    people,
+                    &prefix_redirects,
+                    &edit.subject_id,
+                );
+                let object = resolve::resolve_reference_at_prefix(
+                    snapshot,
+                    people,
+                    &prefix_redirects,
+                    &edit.object_id,
+                );
                 let (Some(subject_id), Some(object_id)) = (subject.entity_id, object.entity_id)
                 else {
                     pending.push(PendingItem::IdentityConflict {
@@ -923,7 +959,6 @@ fn apply_relation_events(
                 relation.origin = RelationOrigin::Manual;
                 roots.subject = BTreeSet::from([edit.subject_id.clone()]);
                 roots.object = BTreeSet::from([edit.object_id.clone()]);
-                redirect_evidence_mentions(relation, mentions);
                 relation.id = canonical_relation_id(
                     &relation.subject_id,
                     &relation.predicate,
@@ -931,30 +966,46 @@ fn apply_relation_events(
                     relation.valid_from.as_deref(),
                     relation.valid_to.as_deref(),
                 );
-                aliases.extend(historical_relation_aliases(
-                    relation, roots, snapshot, people,
-                ));
-                aliases.insert(relation.id.clone());
             }
-            resolve::RelationEvent::End {
-                relation_id,
-                valid_to,
-            } if aliases.contains(relation_id) => {
+            resolve::RelationEvent::End { valid_to, .. } => {
                 relation.valid_to = Some(valid_to.clone());
-                relation.id = canonical_relation_id(
-                    &relation.subject_id,
-                    &relation.predicate,
-                    &relation.object_id,
-                    relation.valid_from.as_deref(),
-                    relation.valid_to.as_deref(),
-                );
-                aliases.extend(historical_relation_aliases(
-                    relation, roots, snapshot, people,
-                ));
             }
-            _ => {}
         }
     }
+    let subject_id = match resolve_final_root(roots.subject.iter(), snapshot, people) {
+        Ok(subject_id) => subject_id,
+        Err(candidates) => {
+            pending.push(PendingItem::IdentityConflict {
+                note_id: relation.note_ids.first().cloned().unwrap_or_default(),
+                local_entity_id: relation.id.clone(),
+                candidates,
+                reason: "relation subject roots do not resolve to one terminal".into(),
+            });
+            return false;
+        }
+    };
+    let object_id = match resolve_final_root(roots.object.iter(), snapshot, people) {
+        Ok(object_id) => object_id,
+        Err(candidates) => {
+            pending.push(PendingItem::IdentityConflict {
+                note_id: relation.note_ids.first().cloned().unwrap_or_default(),
+                local_entity_id: relation.id.clone(),
+                candidates,
+                reason: "relation object roots do not resolve to one terminal".into(),
+            });
+            return false;
+        }
+    };
+    relation.subject_id = subject_id;
+    relation.object_id = object_id;
+    redirect_evidence_mentions(relation, mentions);
+    relation.id = canonical_relation_id(
+        &relation.subject_id,
+        &relation.predicate,
+        &relation.object_id,
+        relation.valid_from.as_deref(),
+        relation.valid_to.as_deref(),
+    );
     relation.status = relation_status(relation.valid_to.as_deref(), now);
     true
 }
@@ -989,14 +1040,15 @@ fn redirect_evidence_mentions(
     }
 }
 
-fn historical_relation_aliases(
+fn visible_relation_aliases(
     relation: &CanonicalRelation,
     roots: &RelationRoots,
     snapshot: &resolve::ResolverSnapshot,
     people: &store::Voiceprints,
+    prefix_redirects: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
-    let subjects = directed_endpoint_lineage(&roots.subject, snapshot, people);
-    let objects = directed_endpoint_lineage(&roots.object, snapshot, people);
+    let subjects = visible_endpoint_ids(&roots.subject, snapshot, people, prefix_redirects);
+    let objects = visible_endpoint_ids(&roots.object, snapshot, people, prefix_redirects);
     subjects
         .iter()
         .flat_map(|subject| {
@@ -1013,18 +1065,41 @@ fn historical_relation_aliases(
         .collect()
 }
 
-// A relation endpoint's lineage is rooted in the endpoint references that created that relation.
-// Each root is resolved after every active merge prefix, so retargeting A from B to C retains
-// A/B/C for an A-rooted relation while relations rooted directly at B or C remain independent.
-fn directed_endpoint_lineage(
+fn visible_endpoint_ids(
     roots: &BTreeSet<String>,
     snapshot: &resolve::ResolverSnapshot,
     people: &store::Voiceprints,
+    prefix_redirects: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
     roots
-        .into_iter()
-        .flat_map(|root| resolve::relation_root_lineage(snapshot, people, root))
+        .iter()
+        .filter_map(|root| {
+            resolve::resolve_reference_at_prefix(snapshot, people, prefix_redirects, root).entity_id
+        })
         .collect()
+}
+
+fn resolve_final_root<'a>(
+    roots: impl Iterator<Item = &'a String>,
+    snapshot: &resolve::ResolverSnapshot,
+    people: &store::Voiceprints,
+) -> Result<String, Vec<String>> {
+    let mut terminals = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    for root in roots {
+        let resolution = resolve::resolve_reference_id(snapshot, people, root);
+        if let Some(entity_id) = resolution.entity_id {
+            terminals.insert(entity_id);
+        } else {
+            candidates.extend(resolution.candidates);
+        }
+    }
+    if candidates.is_empty() && terminals.len() == 1 {
+        Ok(terminals.into_iter().next().unwrap())
+    } else {
+        candidates.extend(terminals);
+        Err(candidates.into_iter().collect())
+    }
 }
 
 fn project_created_relations(
@@ -1145,12 +1220,11 @@ fn project_created_relations(
             subject: BTreeSet::from([relation.subject_id.clone()]),
             object: BTreeSet::from([relation.object_id.clone()]),
         };
-        let mut aliases = historical_relation_aliases(&canonical, &roots, snapshot, people);
-        aliases.insert(original_id);
+        let aliases = BTreeSet::from([original_id]);
         if !apply_relation_events(
             &mut canonical,
             &mut roots,
-            &mut aliases,
+            &aliases,
             snapshot,
             people,
             mentions,
@@ -3958,6 +4032,87 @@ mod tests {
         assert_eq!(graph.relations.len(), 1);
         assert_eq!(graph.relations[0].object_id, "kg_c");
         assert_eq!(graph.relations[0].status, RelationStatus::Historical);
+    }
+
+    #[test]
+    fn end_after_retarget_binds_only_the_relation_visible_at_that_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = KnowledgeLedger::empty();
+        for id in ["kg_u", "kg_a", "kg_b", "kg_c"] {
+            ledger.registry.insert(
+                id.into(),
+                RegistryEntity {
+                    kind: "term".into(),
+                    name: id.into(),
+                    aliases: Vec::new(),
+                    status: "confirmed".into(),
+                },
+            );
+        }
+        let predicate = RelationPredicate {
+            kind: "uses".into(),
+            label: None,
+        };
+        for (operation_id, object_id) in [("create_r1", "kg_a"), ("create_r2", "kg_b")] {
+            push_user_relation(
+                &mut ledger,
+                operation_id,
+                super::super::overrides::UserRelation {
+                    subject_id: "kg_u".into(),
+                    predicate: predicate.clone(),
+                    object_id: object_id.into(),
+                    valid_from: None,
+                    valid_to: None,
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            );
+        }
+        ledger.operations.push(KnowledgeOperation {
+            id: "merge_a_b".into(),
+            at: "t1".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::String("kg_b".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_a".into(),
+                target_id: "kg_b".into(),
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "retarget_a_c".into(),
+            at: "t2".into(),
+            before: serde_json::Value::String("kg_b".into()),
+            after: serde_json::Value::String("kg_c".into()),
+            action: KnowledgeAction::MergeEntity {
+                source_id: "kg_a".into(),
+                target_id: "kg_c".into(),
+            },
+        });
+        ledger.operations.push(KnowledgeOperation {
+            id: "end_visible_b".into(),
+            at: "t3".into(),
+            before: serde_json::Value::Null,
+            after: serde_json::Value::Null,
+            action: KnowledgeAction::EndRelation {
+                relation_id: canonical_relation_id("kg_u", &predicate, "kg_b", None, None),
+                valid_to: "2026-07-20T00:00:00Z".into(),
+            },
+        });
+
+        let graph = build_canonical_graph(
+            root.path(),
+            &ledger,
+            DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        let by_object: BTreeMap<_, _> = graph
+            .relations
+            .iter()
+            .map(|relation| (relation.object_id.as_str(), relation.status))
+            .collect();
+        assert_eq!(by_object["kg_b"], RelationStatus::Historical);
+        assert_eq!(by_object["kg_c"], RelationStatus::Current);
     }
 
     #[test]
