@@ -29,17 +29,23 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 if (false) {
   const invalidProvider: BackfillRequest = {
-    note_ids: null,
+    run_id: "run-invalid",
+    consent_token: "consent-invalid",
+    note_ids: [],
     // @ts-expect-error Backfill providers are the two backend-supported executors.
     provider: "http",
+    model: "model-invalid",
+    contract_version: 1,
   };
   const invalidBackfillState: BackfillProgress = {
+    run_id: "run-invalid",
     // @ts-expect-error Backfill progress exposes only terminal/running backend states.
     state: "done",
     completed: 0,
     total: 0,
     current_note_id: null,
     failed: [],
+    rebuild_generation: null,
   };
   const invalidRebuildState: KnowledgeMutationResult = {
     operation_id: "op_1",
@@ -126,17 +132,24 @@ describe("semantic graph invoke wrappers", () => {
 
   it("uses noteIds only for preview and a nested request for start", async () => {
     invokeMock.mockReset().mockResolvedValue(undefined);
-    const request = { note_ids: ["note-1"], provider: "openai" } satisfies BackfillRequest;
+    const request = {
+      run_id: "run-1",
+      consent_token: "consent-1",
+      note_ids: ["note-1"],
+      provider: "openai",
+      model: "gpt-4.1-mini",
+      contract_version: 1,
+    } satisfies BackfillRequest;
     await previewRelationBackfill();
     await previewRelationBackfill(["note-1"]);
     await startRelationBackfill(request);
-    await cancelRelationBackfill();
+    await cancelRelationBackfill("run-1");
 
     expect(invokeMock.mock.calls).toEqual([
       ["preview_relation_backfill", { noteIds: null }],
       ["preview_relation_backfill", { noteIds: ["note-1"] }],
       ["start_relation_backfill", { request }],
-      ["cancel_relation_backfill"],
+      ["cancel_relation_backfill", { runId: "run-1" }],
     ]);
   });
 });

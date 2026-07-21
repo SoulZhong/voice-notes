@@ -5,7 +5,7 @@ export type RelationStatus = "current" | "historical";
 export type RelationOrigin = "model" | "confirmed" | "manual" | "user_assertion";
 export type KnowledgeRebuildState = "queued";
 export type BackfillProvider = "openai" | "agent";
-export type BackfillState = "running" | "completed" | "cancelled" | "failed";
+export type BackfillState = "running" | "completed" | "cancelled" | "failed" | "partial";
 export type JsonValue =
   | null
   | boolean
@@ -186,11 +186,16 @@ export interface KnowledgeMutationResult {
 }
 
 export interface BackfillRequest {
-  note_ids: string[] | null;
+  run_id: string;
+  consent_token: string;
+  note_ids: string[];
   provider: BackfillProvider;
+  model: string;
+  contract_version: number;
 }
 
 export interface BackfillPreview {
+  consent_token: string;
   note_ids: string[];
   provider: BackfillProvider;
   model: string;
@@ -203,11 +208,13 @@ export interface BackfillFailure {
 }
 
 export interface BackfillProgress {
+  run_id: string;
   state: BackfillState;
   completed: number;
   total: number;
   current_note_id: string | null;
   failed: BackfillFailure[];
+  rebuild_generation: number | null;
 }
 
 export const semanticGraph = (filter: KnowledgeFilter) =>
@@ -246,4 +253,5 @@ export const previewRelationBackfill = (noteIds?: string[]) =>
 export const startRelationBackfill = (request: BackfillRequest) =>
   invoke<void>("start_relation_backfill", { request });
 
-export const cancelRelationBackfill = () => invoke<void>("cancel_relation_backfill");
+export const cancelRelationBackfill = (runId: string) =>
+  invoke<void>("cancel_relation_backfill", { runId });
