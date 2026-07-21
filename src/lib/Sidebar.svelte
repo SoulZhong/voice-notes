@@ -148,11 +148,19 @@
     }),
   );
   const graphSelected = $derived($page.url.searchParams.get("e"));
-  // 人→会议搭子;非人→主区详情面板(经 query 深链,id 含冒号/中文需编码)。
+  // 图谱实体统一留在关系地图的附着式检查器，不因人物类型把探索上下文切走。
   function entityHref(e: EntitySummary): string {
-    return e.is_person
-      ? "/speakers/" + encodeURIComponent(e.id)
-      : "/graph?e=" + encodeURIComponent(e.id);
+    return "/graph?e=" + encodeURIComponent(e.id);
+  }
+  function startPathFromSidebar(event: MouseEvent, entityId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const url = new URL($page.url);
+    url.pathname = "/graph";
+    url.searchParams.set("pathStart", entityId);
+    url.searchParams.delete("review");
+    url.searchParams.delete("r");
+    goto(url.pathname + url.search);
   }
   function openPendingReview() {
     const url = new URL($page.url);
@@ -502,6 +510,9 @@
       placeholder={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
       bind:value={graphFilter.query}
     />
+    {#if graphFilter.mode === "entity" && graphFilter.query.trim()}
+      <p class="search-behavior">搜索只聚焦匹配实体，画布中的其他关系仍会保留。</p>
+    {/if}
     {#if graphFilter.mode === "entity"}
       <div class="gchips">
         <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
@@ -518,7 +529,7 @@
       {/if}
       <ul class="list">
         {#each graphShown as e (e.id)}
-          <li>
+          <li class="entity-row">
             <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
               <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
               <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
@@ -527,6 +538,13 @@
                 <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
               </div>
             </a>
+            <button
+              type="button"
+              class="path-start"
+              aria-label={`将 ${e.name} 设为路径起点`}
+              title="设为路径起点"
+              onclick={(event) => startPathFromSidebar(event, e.id)}
+            >起</button>
           </li>
         {/each}
       </ul>
@@ -763,6 +781,28 @@
     color: inherit;
     text-decoration: none;
   }
+  .entity-row { position: relative; list-style: none; }
+  .entity-row .item.entity { padding-right: 2.8rem; }
+  .path-start {
+    position: absolute;
+    top: 50%;
+    right: 0.45rem;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    transform: translateY(-50%);
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--ink-faint);
+    font: inherit;
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .path-start:hover { border-color: var(--hairline); background: var(--surface-soft); color: var(--accent); }
+  .path-start:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   /* 概览与整理固定行:与人物行同形态,图标代色点;徽标=待办数(warning 色药丸) */
   /* 新建钩子:本页的主操作入口——实心 accent 按钮,与上方录制药丸拉开间距、
      并以蓝色区分红点录制;虚线/幽灵态表达太弱,看不出这是入口。 */
@@ -936,6 +976,7 @@
     background: var(--canvas);
     border-color: var(--accent);
   }
+  .search-behavior { margin: -0.45rem 0 0.6rem; color: var(--ink-faint); font-size: 0.7rem; line-height: 1.45; }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
   /* 视角切换分段控件:实体 / 文章 二选一。整块 surface-press 底 + 选中项白/accent
      实底,跟设置页的 segmented 同一套视觉语言(此处窄栏本地实现,不引全局类)。 */
@@ -1114,5 +1155,9 @@
   .hint {
     color: var(--ink-faint);
     font-size: 0.85em;
+  }
+  @media (pointer: coarse) {
+    .path-start { width: 44px; height: 44px; right: 0.1rem; }
+    .entity-row .item.entity { padding-right: 3.2rem; }
   }
 </style>
