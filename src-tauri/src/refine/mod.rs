@@ -13,12 +13,214 @@ use crate::store::{
     Entity, GraphExtraction, Mention, RefineStages, RefinedDoc, RefinedParagraph, SegmentRecord,
     SpeakerMeta,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use unicode_casefold::UnicodeCaseFold;
 
 /// 同说话人合并段落的时长上限(对齐豆包排版粒度)。
 pub const MAX_PARA_MS: u64 = 60_000;
+
+/// 关系回退不是两个顶层字段的拷贝，而是一份可独立解释的最小图谱快照。
+/// 端点实体和关系显式引用的 mentions 与旧关系共存亡，避免把旧 `ent_N`
+/// 静默重定向到本轮新抽取出的同号实体。
+#[derive(Clone, Default)]
+struct GraphFallbackSnapshot {
+    graph_extraction: Option<GraphExtraction>,
+    relations: Vec<crate::store::RelationFact>,
+    entities: Vec<Entity>,
+    mentions: Vec<(usize, Mention)>,
+}
+
+impl GraphFallbackSnapshot {
+    fn capture(doc: &RefinedDoc) -> Self {
+        let mut endpoint_ids = BTreeSet::new();
+        let mut referenced_mentions: BTreeMap<&str, &str> = BTreeMap::new();
+        for relation in &doc.relations {
+            endpoint_ids.insert(relation.subject.as_str());
+            endpoint_ids.insert(relation.object.as_str());
+            for id in &relation.subject_mentions {
+                referenced_mentions.insert(id, relation.subject.as_str());
+            }
+            for id in &relation.object_mentions {
+                referenced_mentions.insert(id, relation.object.as_str());
+            }
+        }
+
+        let entities: Vec<_> = doc
+            .entities
+            .iter()
+            .filter(|entity| endpoint_ids.contains(entity.id.as_str()))
+            .cloned()
+            .collect();
+        let mentions: Vec<_> = doc
+            .paragraphs
+            .iter()
+            .enumerate()
+            .flat_map(|(paragraph_index, paragraph)| {
+                paragraph
+                    .mentions
+                    .iter()
+                    .filter(|mention| referenced_mentions.contains_key(mention.id.as_str()))
+                    .cloned()
+                    .map(move |mention| (paragraph_index, mention))
+            })
+            .collect();
+
+        let entity_ids: BTreeSet<_> = entities.iter().map(|entity| entity.id.as_str()).collect();
+        let all_mention_owners: BTreeMap<_, _> = doc
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| &paragraph.mentions)
+            .map(|mention| (mention.id.as_str(), mention.entity.as_str()))
+            .collect();
+        let captured_mention_owners: BTreeMap<_, _> = mentions
+            .iter()
+            .map(|(_, mention)| (mention.id.as_str(), mention.entity.as_str()))
+            .collect();
+        let coherent = endpoint_ids.iter().all(|id| entity_ids.contains(id))
+            && referenced_mentions
+                .iter()
+                .all(|(id, owner)| captured_mention_owners.get(*id).copied() == Some(*owner))
+            && doc.relations.iter().all(|relation| {
+                !relation.subject_mentions.is_empty()
+                    && !relation.object_mentions.is_empty()
+                    && relation.subject_mentions.iter().all(|id| {
+                        all_mention_owners.get(id.as_str()).copied()
+                            == Some(relation.subject.as_str())
+                    })
+                    && relation.object_mentions.iter().all(|id| {
+                        all_mention_owners.get(id.as_str()).copied()
+                            == Some(relation.object.as_str())
+                    })
+                    && !relation.evidence.is_empty()
+                    && relation.evidence.iter().all(|evidence| {
+                        !evidence.quote.is_empty()
+                            && !evidence.source_seqs.is_empty()
+                            && evidence.start < evidence.end
+                    })
+            });
+
+        if !coherent {
+            return Self::default();
+        }
+        Self {
+            graph_extraction: doc.graph_extraction.clone(),
+            relations: doc.relations.clone(),
+            entities,
+            mentions,
+        }
+    }
+
+    fn restore(self, note_id: &str, doc: &mut RefinedDoc) {
+        if !self.relations.is_empty() && doc.paragraphs.is_empty() {
+            // 没有段落就无处保存关系引用的 mention；清空比制造悬空引用安全。
+            doc.graph_extraction = None;
+            doc.relations.clear();
+            return;
+        }
+
+        let support_by_id: BTreeMap<_, _> = self
+            .entities
+            .iter()
+            .map(|entity| (entity.id.clone(), entity.clone()))
+            .collect();
+        let mut used_ids: BTreeSet<_> = support_by_id.keys().cloned().collect();
+        let mut remapped_ids = BTreeMap::new();
+        let mut next_local_id = 1usize;
+
+        for entity in &mut doc.entities {
+            let reuse = self.entities.iter().find(|support| {
+                entity_key(&support.name) == entity_key(&entity.name)
+                    && entity_key(&support.kind) == entity_key(&entity.kind)
+            });
+            let desired = if let Some(support) = reuse {
+                support.id.clone()
+            } else if !entity.id.is_empty() && !used_ids.contains(&entity.id) {
+                entity.id.clone()
+            } else {
+                loop {
+                    let candidate = format!("ent_{next_local_id}");
+                    next_local_id += 1;
+                    if !used_ids.contains(&candidate) {
+                        break candidate;
+                    }
+                }
+            };
+            if entity.id != desired {
+                remapped_ids.insert(entity.id.clone(), desired.clone());
+                entity.id = desired.clone();
+            }
+            used_ids.insert(desired);
+        }
+
+        for paragraph in &mut doc.paragraphs {
+            for mention in &mut paragraph.mentions {
+                if let Some(new_id) = remapped_ids.get(&mention.entity) {
+                    mention.entity = new_id.clone();
+                    mention.id.clear();
+                }
+            }
+        }
+
+        let mut merged_entities = support_by_id;
+        for entity in std::mem::take(&mut doc.entities) {
+            if let Some(existing) = merged_entities.get_mut(&entity.id) {
+                merge_entity_aliases(existing, &entity);
+            } else {
+                merged_entities.insert(entity.id.clone(), entity);
+            }
+        }
+        doc.entities = merged_entities.into_values().collect();
+
+        // 先让本轮 mentions 在重映射后的实体 id 上生成自己的稳定 id。
+        doc.graph_extraction = None;
+        doc.relations.clear();
+        crate::store::ensure_graph_ids(note_id, doc);
+
+        let fallback_mention_ids: BTreeSet<_> = self
+            .mentions
+            .iter()
+            .map(|(_, mention)| mention.id.as_str())
+            .collect();
+        for paragraph in &mut doc.paragraphs {
+            paragraph
+                .mentions
+                .retain(|mention| !fallback_mention_ids.contains(mention.id.as_str()));
+        }
+        for (old_index, mention) in self.mentions {
+            let safe_index = old_index.min(doc.paragraphs.len() - 1);
+            doc.paragraphs[safe_index].mentions.push(mention);
+        }
+        for paragraph in &mut doc.paragraphs {
+            paragraph.mentions.sort_by(|left, right| {
+                left.start
+                    .cmp(&right.start)
+                    .then(left.end.cmp(&right.end))
+                    .then(left.entity.cmp(&right.entity))
+                    .then(left.id.cmp(&right.id))
+            });
+        }
+
+        doc.graph_extraction = self.graph_extraction;
+        doc.relations = self.relations;
+        crate::store::ensure_graph_ids(note_id, doc);
+    }
+}
+
+fn merge_entity_aliases(existing: &mut Entity, current: &Entity) {
+    for alias in current.aliases.iter().chain(std::iter::once(&current.name)) {
+        let key = entity_key(alias);
+        if key != entity_key(&existing.name)
+            && !existing
+                .aliases
+                .iter()
+                .any(|candidate| entity_key(candidate) == key)
+        {
+            existing.aliases.push(alias.clone());
+        }
+    }
+    existing.aliases.sort_by_key(|alias| entity_key(alias));
+}
 
 pub fn run_local(
     note_dir: &Path,
@@ -76,14 +278,13 @@ pub fn run_local(
     };
     let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
         .ok_or_else(|| anyhow::anyhow!("笔记正被其它进程写入，无法提交本地 Aing"))?;
-    if let Some(previous) = crate::store::refined::load_refined_locked(note_dir, &note_lock) {
-        doc.graph_extraction = previous.graph_extraction;
-        doc.relations = previous.relations;
-    }
     let note_id = note_dir
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
+    if let Some(previous) = crate::store::refined::load_refined_locked(note_dir, &note_lock) {
+        GraphFallbackSnapshot::capture(&previous).restore(note_id, &mut doc);
+    }
     crate::store::ensure_graph_ids(note_id, &mut doc);
     crate::store::refined::write_refined_atomic_locked(note_dir, &doc, &note_lock)?;
     Ok(doc)
@@ -275,7 +476,7 @@ pub fn run_llm(
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
     crate::store::ensure_graph_ids(note_id, &mut latest);
     *doc = latest;
-    let fallback_graph = (doc.graph_extraction.clone(), doc.relations.clone());
+    let fallback_graph = GraphFallbackSnapshot::capture(doc);
 
     let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log);
     let relations_complete = text_outcome.relations_complete();
@@ -347,14 +548,12 @@ pub fn run_llm(
                 for issue in issues {
                     eprintln!("refine relations: {}: {}", issue.field, issue.message);
                 }
-                doc.graph_extraction = fallback_graph.0;
-                doc.relations = fallback_graph.1;
+                fallback_graph.clone().restore(note_id, doc);
                 doc.stages.relations = "failed".into();
             }
         }
     } else {
-        doc.graph_extraction = fallback_graph.0;
-        doc.relations = fallback_graph.1;
+        fallback_graph.restore(note_id, doc);
         doc.stages.relations = "failed".into();
     }
     if let Err(e) = crate::store::refined::write_refined_atomic_locked(note_dir, doc, &note_lock) {
@@ -529,41 +728,180 @@ mod tests {
         }
     }
 
-    fn old_graph() -> (Option<GraphExtraction>, Vec<RelationFact>) {
-        (
-            Some(GraphExtraction {
-                contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
-                provider: "old-provider".into(),
-                model: "old-model".into(),
-                run_id: "old-run".into(),
-                generated_at: "2026-07-20T09:00:00+08:00".into(),
-                source_hash: "old-source".into(),
-                mode: "http".into(),
-            }),
-            vec![RelationFact {
-                id: "old-relation".into(),
-                subject: "old-subject".into(),
-                predicate: RelationPredicate {
-                    kind: "uses".into(),
-                    label: None,
-                },
-                object: "old-object".into(),
-                subject_mentions: vec!["old-subject-mention".into()],
-                object_mentions: vec!["old-object-mention".into()],
-                confidence: 0.88,
-                valid_from: None,
-                valid_to: None,
-                evidence: vec![RelationEvidence {
-                    id: "old-evidence".into(),
-                    paragraph_index: 0,
-                    start: 0,
-                    end: 1,
-                    quote: "旧".into(),
-                    source_seqs: vec![0],
-                    source_hash: "old-source".into(),
-                }],
+    fn valid_prior_doc_with_texts(note_id: &str, texts: &[&str]) -> RefinedDoc {
+        assert!(texts
+            .first()
+            .is_some_and(|text| text.starts_with("张三负责灯塔计划")));
+        let mut doc = doc_with(texts);
+        doc.generated_at = "2026-07-20T09:00:00+08:00".into();
+        doc.entities = vec![
+            store::Entity {
+                id: "ent_1".into(),
+                kind: "person".into(),
+                name: "张三".into(),
+                aliases: vec![],
+            },
+            store::Entity {
+                id: "ent_2".into(),
+                kind: "project".into(),
+                name: "灯塔计划".into(),
+                aliases: vec![],
+            },
+        ];
+        doc.paragraphs[0].mentions = vec![
+            store::Mention {
+                id: String::new(),
+                entity: "ent_1".into(),
+                start: 0,
+                end: 2,
+            },
+            store::Mention {
+                id: String::new(),
+                entity: "ent_2".into(),
+                start: 4,
+                end: 8,
+            },
+        ];
+        store::ensure_graph_ids(note_id, &mut doc);
+        let relation = RelationFact {
+            id: String::new(),
+            subject: "ent_1".into(),
+            predicate: RelationPredicate {
+                kind: "responsible_for".into(),
+                label: None,
+            },
+            object: "ent_2".into(),
+            subject_mentions: vec![doc.paragraphs[0].mentions[0].id.clone()],
+            object_mentions: vec![doc.paragraphs[0].mentions[1].id.clone()],
+            confidence: 0.9,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![RelationEvidence {
+                id: String::new(),
+                paragraph_index: 0,
+                start: 0,
+                end: 8,
+                quote: "张三负责灯塔计划".into(),
+                source_seqs: vec![0],
+                source_hash: String::new(),
             }],
+        };
+        doc.relations = store::aing_graph::validate_graph(note_id, &doc, vec![relation])
+            .expect("prior fixture 必须先通过 Task 2 validator")
+            .relations;
+        doc.graph_extraction = Some(GraphExtraction {
+            contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+            provider: "old-provider".into(),
+            model: "old-model".into(),
+            run_id: "old-run".into(),
+            generated_at: doc.generated_at.clone(),
+            source_hash: store::source_hash(&doc.paragraphs),
+            mode: "http".into(),
+        });
+        doc.stages.entities = "done".into();
+        doc.stages.relations = "done".into();
+        doc
+    }
+
+    fn valid_prior_doc(note_id: &str) -> RefinedDoc {
+        valid_prior_doc_with_texts(note_id, &["张三负责灯塔计划"])
+    }
+
+    fn assert_fallback_dependencies(doc: &RefinedDoc) {
+        assert_eq!(doc.relations.len(), 1);
+        let relation = &doc.relations[0];
+        let entities: BTreeMap<_, _> = doc
+            .entities
+            .iter()
+            .map(|entity| (entity.id.as_str(), entity.name.as_str()))
+            .collect();
+        assert_eq!(entities.get(relation.subject.as_str()), Some(&"张三"));
+        assert_eq!(entities.get(relation.object.as_str()), Some(&"灯塔计划"));
+        let mention_owners: BTreeMap<_, _> = doc
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| &paragraph.mentions)
+            .map(|mention| (mention.id.as_str(), mention.entity.as_str()))
+            .collect();
+        for mention in &relation.subject_mentions {
+            assert_eq!(
+                mention_owners.get(mention.as_str()),
+                Some(&relation.subject.as_str())
+            );
+        }
+        for mention in &relation.object_mentions {
+            assert_eq!(
+                mention_owners.get(mention.as_str()),
+                Some(&relation.object.as_str())
+            );
+        }
+    }
+
+    fn entity_id<'a>(doc: &'a RefinedDoc, name: &str) -> &'a str {
+        doc.entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .map(|entity| entity.id.as_str())
+            .unwrap_or_else(|| panic!("missing entity {name}"))
+    }
+
+    fn assert_fallback_commit(
+        root: &std::path::Path,
+        note_id: &str,
+        doc: &RefinedDoc,
+        baseline_graph: &[u8],
+        new_entity_names: &[&str],
+    ) {
+        assert_eq!(graph_bytes(doc), baseline_graph);
+        assert_fallback_dependencies(doc);
+        assert_eq!(entity_id(doc, "张三"), "ent_1");
+        assert_eq!(entity_id(doc, "灯塔计划"), "ent_2");
+        for name in new_entity_names {
+            let id = entity_id(doc, name);
+            assert!(id != "ent_1" && id != "ent_2", "{name} 不能重定向旧端点 id");
+            assert!(doc
+                .paragraphs
+                .iter()
+                .flat_map(|paragraph| &paragraph.mentions)
+                .any(|mention| mention.entity == id));
+        }
+        let persisted = store::load_refined(&root.join("notes").join(note_id)).unwrap();
+        assert_eq!(
+            serde_json::to_value(doc).unwrap(),
+            serde_json::to_value(&persisted).unwrap(),
+            "HTTP 返回内存态必须与落盘完全一致"
+        );
+        assert_task4_stale_not_invalid(root, note_id);
+    }
+
+    fn note_dir(root: &std::path::Path, note_id: &str) -> std::path::PathBuf {
+        let dir = root.join("notes").join(note_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn assert_task4_stale_not_invalid(root: &std::path::Path, note_id: &str) {
+        let ledger = crate::graph::canonical::reconcile_registry(root).unwrap();
+        let graph = crate::graph::canonical::build_canonical_graph(
+            root,
+            &ledger,
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
         )
+        .unwrap();
+        assert!(
+            graph.relations.is_empty(),
+            "旧证据已 stale，不应发布或重定向到新实体"
+        );
+        assert!(graph.pending.iter().any(|item| matches!(
+            item,
+            crate::graph::canonical::PendingItem::StaleEvidence { note_id: stale, .. }
+                if stale == note_id
+        )));
+        assert!(!graph.pending.iter().any(|item| matches!(
+            item,
+            crate::graph::canonical::PendingItem::InvalidDocument { note_id: invalid, .. }
+                if invalid == note_id
+        )));
     }
 
     fn graph_bytes(doc: &RefinedDoc) -> Vec<u8> {
@@ -744,6 +1082,54 @@ mod tests {
                 }]
             }]
         })
+    }
+
+    fn changed_relation_content(quote: &str, include_object_entity: bool) -> serde_json::Value {
+        let mut entities = vec![serde_json::json!({
+            "name": "张三", "kind": "person", "aliases": ["老张"]
+        })];
+        if include_object_entity {
+            entities.push(serde_json::json!({
+                "name": "火星计划", "kind": "project", "aliases": []
+            }));
+        }
+        serde_json::json!({
+            "glossary": {},
+            "texts": ["张三负责火星计划"],
+            "entities": entities,
+            "relations": [{
+                "subject": "张三",
+                "predicate": {"type": "responsible_for", "label": null},
+                "object": "火星计划",
+                "confidence": 0.92,
+                "valid_from": null,
+                "valid_to": null,
+                "evidence": [{
+                    "paragraph_index": 0,
+                    "start": 0,
+                    "end": 8,
+                    "quote": quote
+                }]
+            }]
+        })
+    }
+
+    fn changed_entities_content(
+        text: &str,
+        relations: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut content = serde_json::json!({
+            "glossary": {},
+            "texts": [text],
+            "entities": [
+                {"name": "李四", "kind": "person", "aliases": []},
+                {"name": "火星计划", "kind": "project", "aliases": []}
+            ]
+        });
+        if let Some(relations) = relations {
+            content["relations"] = relations;
+        }
+        content
     }
 
     #[test]
@@ -1326,17 +1712,19 @@ mod tests {
 
     #[test]
     fn invalid_quote_or_absent_entity_preserves_prior_graph_but_keeps_text_and_entities() {
-        for (quote, include_object_entity) in
-            [("张三拥有灯塔计划", true), ("张三负责灯塔计划", false)]
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let mut doc = doc_with(&["🙂张三负则灯塔计划"]);
-            (doc.graph_extraction, doc.relations) = old_graph();
-            store::write_refined_atomic(dir.path(), &doc).unwrap();
-            let baseline = store::load_refined(dir.path()).unwrap();
+        for (case, quote, include_object_entity) in [
+            ("invalid-quote", "张三拥有火星计划", true),
+            ("absent-entity", "张三负责火星计划", false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let note_id = format!("fallback-{case}");
+            let dir = note_dir(root.path(), &note_id);
+            let mut doc = valid_prior_doc(&note_id);
+            store::write_refined_atomic(&dir, &doc).unwrap();
+            let baseline = store::load_refined(&dir).unwrap();
             let baseline_graph = graph_bytes(&baseline);
             doc = baseline;
-            let base = mock_server(chat_response(relation_content(
+            let base = mock_server(chat_response(changed_relation_content(
                 quote,
                 include_object_entity,
             )));
@@ -1346,71 +1734,123 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(dir.path(), &mut doc, &cfg, "model-v2", None).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
 
-            assert_eq!(doc.paragraphs[0].text, "🙂张三负责灯塔计划");
+            assert_eq!(doc.paragraphs[0].text, "张三负责火星计划");
             assert_eq!(doc.stages.llm, "done");
             assert_eq!(doc.stages.entities, "done");
             assert_eq!(doc.stages.relations, "failed");
             assert_eq!(
-                graph_bytes(&doc),
-                baseline_graph,
-                "旧 relations+extraction 必须逐字节不变"
+                entity_id(&doc, "张三"),
+                "ent_1",
+                "同名同 kind 必须复用旧 id"
             );
-            let persisted = store::load_refined(dir.path()).unwrap();
-            assert_eq!(persisted.paragraphs[0].text, "🙂张三负责灯塔计划");
-            assert_eq!(persisted.stages.relations, "failed");
-            assert_eq!(graph_bytes(&persisted), baseline_graph);
+            let new_entities: &[&str] = if include_object_entity {
+                &["火星计划"]
+            } else {
+                &[]
+            };
+            assert_fallback_commit(root.path(), &note_id, &doc, &baseline_graph, new_entities);
         }
     }
 
     #[test]
-    fn missing_relations_preserves_prior_graph_while_explicit_empty_replaces_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut doc = doc_with(&["原文"]);
-        (doc.graph_extraction, doc.relations) = old_graph();
-        store::write_refined_atomic(dir.path(), &doc).unwrap();
-        let baseline = store::load_refined(dir.path()).unwrap();
-        let baseline_graph = graph_bytes(&baseline);
-        doc = baseline;
-        let missing = serde_json::json!({
-            "glossary": {}, "texts": ["修订文本"], "entities": []
+    fn missing_or_malformed_relations_preserve_new_text_entities_and_coherent_prior_graph() {
+        for (case, relations) in [
+            ("missing", None),
+            ("malformed", Some(serde_json::json!({}))),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let note_id = format!("fallback-{case}");
+            let dir = note_dir(root.path(), &note_id);
+            let mut doc = valid_prior_doc(&note_id);
+            store::write_refined_atomic(&dir, &doc).unwrap();
+            let baseline = store::load_refined(&dir).unwrap();
+            let baseline_graph = graph_bytes(&baseline);
+            doc = baseline;
+            let response = changed_entities_content("李四负责火星计划", relations);
+            let cfg = llm::LlmConfig {
+                base_url: mock_server(chat_response(response)),
+                model: "model-v2".into(),
+                api_key: "k".into(),
+            };
+
+            run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+
+            assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
+            assert_eq!(doc.stages.llm, "done");
+            assert_eq!(doc.stages.entities, "done");
+            assert_eq!(doc.stages.relations, "failed");
+            assert_fallback_commit(
+                root.path(),
+                &note_id,
+                &doc,
+                &baseline_graph,
+                &["李四", "火星计划"],
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_relations_clear_fallback_graph_and_only_its_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let note_id = "fallback-explicit-clear";
+        let dir = note_dir(root.path(), note_id);
+        let mut doc = valid_prior_doc(note_id);
+        store::write_refined_atomic(&dir, &doc).unwrap();
+        let missing = changed_entities_content("李四负责火星计划", None);
+        let explicit_empty = serde_json::json!({
+            "glossary": {},
+            "texts": ["王五启动金星计划"],
+            "entities": [
+                {"name": "王五", "kind": "person", "aliases": []},
+                {"name": "金星计划", "kind": "project", "aliases": []}
+            ],
+            "relations": []
         });
+        let base_url = sequence_server(vec![
+            Some(chat_response(missing)),
+            Some(chat_response(explicit_empty)),
+        ]);
         let cfg = llm::LlmConfig {
-            base_url: mock_server(chat_response(missing)),
+            base_url,
             model: "model-v2".into(),
             api_key: "k".into(),
         };
+        run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+        assert_fallback_dependencies(&doc);
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-v2", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v3", None).unwrap();
 
-        assert_eq!(doc.paragraphs[0].text, "修订文本");
-        assert_eq!(doc.stages.llm, "done");
-        assert_eq!(doc.stages.entities, "done");
-        assert_eq!(doc.stages.relations, "failed");
-        assert_eq!(graph_bytes(&doc), baseline_graph);
-
-        let explicit_empty = serde_json::json!({
-            "glossary": {}, "texts": ["二次修订"], "entities": [], "relations": []
-        });
-        let cfg = llm::LlmConfig {
-            base_url: mock_server(chat_response(explicit_empty)),
-            model: "model-v3".into(),
-            api_key: "k".into(),
-        };
-        run_llm(dir.path(), &mut doc, &cfg, "model-v3", None).unwrap();
-
-        assert_eq!(doc.paragraphs[0].text, "二次修订");
+        assert_eq!(doc.paragraphs[0].text, "王五启动金星计划");
         assert_eq!(doc.stages.relations, "done");
         assert!(doc.relations.is_empty(), "显式 [] 是成功替换，不保留旧事实");
         assert_eq!(doc.graph_extraction.as_ref().unwrap().model, "model-v3");
+        assert_eq!(entity_id(&doc, "王五"), "ent_1");
+        assert_eq!(entity_id(&doc, "金星计划"), "ent_2");
+        assert!(!doc
+            .entities
+            .iter()
+            .any(|entity| entity.name == "张三" || entity.name == "灯塔计划"));
+        assert!(doc
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| &paragraph.mentions)
+            .all(|mention| doc
+                .entities
+                .iter()
+                .any(|entity| entity.id == mention.entity)));
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap()
+        );
     }
 
     #[test]
     fn non_string_text_item_marks_relations_incomplete_and_preserves_prior_graph() {
         let dir = tempfile::tempdir().unwrap();
-        let mut doc = doc_with(&["原文"]);
-        (doc.graph_extraction, doc.relations) = old_graph();
+        let note_id = dir.path().file_name().unwrap().to_str().unwrap();
+        let mut doc = valid_prior_doc(note_id);
         store::write_refined_atomic(dir.path(), &doc).unwrap();
         let baseline = store::load_refined(dir.path()).unwrap();
         let baseline_graph = graph_bytes(&baseline);
@@ -1426,13 +1866,14 @@ mod tests {
 
         run_llm(dir.path(), &mut doc, &cfg, "model-strict", None).unwrap();
 
-        assert_eq!(doc.paragraphs[0].text, "原文");
+        assert_eq!(doc.paragraphs[0].text, "张三负责灯塔计划");
         assert_eq!(doc.stages.llm, "partial");
         assert_eq!(doc.stages.relations, "failed");
         assert_eq!(graph_bytes(&doc), baseline_graph);
+        assert_fallback_dependencies(&doc);
         assert_eq!(
-            graph_bytes(&store::load_refined(dir.path()).unwrap()),
-            baseline_graph
+            serde_json::to_value(&doc).unwrap(),
+            serde_json::to_value(store::load_refined(dir.path()).unwrap()).unwrap()
         );
     }
 
@@ -1492,33 +1933,37 @@ mod tests {
             "missing-relations",
             "malformed-relations",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let first_text = format!("张三负责灯塔计划{}", "甲".repeat(llm::CHUNK_CHARS));
-            let second_text = format!("第二段{}", "乙".repeat(llm::CHUNK_CHARS));
-            let mut doc = doc_with(&[&first_text, &second_text]);
-            (doc.graph_extraction, doc.relations) = old_graph();
-            store::write_refined_atomic(dir.path(), &doc).unwrap();
-            let baseline = store::load_refined(dir.path()).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let note_id = format!("fallback-later-{failure}");
+            let dir = note_dir(root.path(), &note_id);
+            let first_prior = format!("张三负责灯塔计划{}", "甲".repeat(llm::CHUNK_CHARS));
+            let second_prior = format!("旧第二段{}", "乙".repeat(llm::CHUNK_CHARS));
+            let first_revised = format!("李四负责火星计划{}", "甲".repeat(llm::CHUNK_CHARS));
+            let second_revised = format!("新第二段{}", "乙".repeat(llm::CHUNK_CHARS));
+            let mut doc = valid_prior_doc_with_texts(&note_id, &[&first_prior, &second_prior]);
+            assert_eq!(llm::chunk_indices(&doc.paragraphs).len(), 2);
+            store::write_refined_atomic(&dir, &doc).unwrap();
+            let baseline = store::load_refined(&dir).unwrap();
             let baseline_graph = graph_bytes(&baseline);
             doc = baseline;
 
             let first = serde_json::json!({
                 "glossary": {},
-                "texts": [first_text],
+                "texts": [first_revised],
                 "entities": [
-                    {"name": "张三", "kind": "person", "aliases": []},
-                    {"name": "灯塔计划", "kind": "project", "aliases": []}
+                    {"name": "李四", "kind": "person", "aliases": []},
+                    {"name": "火星计划", "kind": "project", "aliases": []}
                 ],
                 "relations": [{
-                    "subject": "张三",
+                    "subject": "李四",
                     "predicate": {"type": "responsible_for", "label": null},
-                    "object": "灯塔计划",
+                    "object": "火星计划",
                     "confidence": 0.9,
                     "valid_from": null,
                     "valid_to": null,
                     "evidence": [{
                         "paragraph_index": 0, "start": 0, "end": 8,
-                        "quote": "张三负责灯塔计划"
+                        "quote": "李四负责火星计划"
                     }]
                 }]
             });
@@ -1528,10 +1973,10 @@ mod tests {
                     "glossary": {}, "texts": [null], "entities": [], "relations": []
                 }))),
                 "missing-relations" => Some(chat_response(serde_json::json!({
-                    "glossary": {}, "texts": [second_text], "entities": []
+                    "glossary": {}, "texts": [second_revised], "entities": []
                 }))),
                 "malformed-relations" => Some(chat_response(serde_json::json!({
-                    "glossary": {}, "texts": [second_text], "entities": [], "relations": {}
+                    "glossary": {}, "texts": [second_revised], "entities": [], "relations": {}
                 }))),
                 _ => unreachable!(),
             };
@@ -1541,44 +1986,86 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(dir.path(), &mut doc, &cfg, "model-multi-failure", None).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-multi-failure", None).unwrap();
 
             assert_eq!(doc.stages.relations, "failed", "failure={failure}");
-            assert_eq!(graph_bytes(&doc), baseline_graph, "failure={failure}");
-            assert_eq!(
-                graph_bytes(&store::load_refined(dir.path()).unwrap()),
-                baseline_graph,
-                "failure={failure}"
+            assert_eq!(doc.paragraphs[0].text, first_revised, "failure={failure}");
+            assert_fallback_commit(
+                root.path(),
+                &note_id,
+                &doc,
+                &baseline_graph,
+                &["李四", "火星计划"],
             );
         }
     }
 
     #[test]
     fn run_local_carries_prior_graph_snapshot_before_overwrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut previous = doc_with(&["旧稿"]);
-        (previous.graph_extraction, previous.relations) = old_graph();
-        store::write_refined_atomic(dir.path(), &previous).unwrap();
-        let baseline = store::load_refined(dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = note_dir(root.path(), "local-fallback");
+        let previous = valid_prior_doc("local-fallback");
+        store::write_refined_atomic(&dir, &previous).unwrap();
+        let baseline = store::load_refined(&dir).unwrap();
         let baseline_graph = graph_bytes(&baseline);
-        let segments = vec![seg(7, "mic", "本地新稿。", 0, 4000, "S1")];
+        let segments = vec![seg(7, "mic", "李四负责火星计划", 0, 4000, "S1")];
 
-        let doc = run_local(
-            dir.path(),
-            &segments,
-            &BTreeMap::new(),
-            None,
-            &[],
-            "new-time",
-        )
-        .unwrap();
+        let doc = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time").unwrap();
 
-        assert_eq!(doc.paragraphs[0].text, "本地新稿。");
+        assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
         assert_eq!(graph_bytes(&doc), baseline_graph);
+        assert_fallback_dependencies(&doc);
         assert_eq!(
-            graph_bytes(&store::load_refined(dir.path()).unwrap()),
+            serde_json::to_value(&doc).unwrap(),
+            serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap()
+        );
+        assert_eq!(
+            graph_bytes(&store::load_refined(&dir).unwrap()),
             baseline_graph
         );
+        assert_task4_stale_not_invalid(root.path(), "local-fallback");
+    }
+
+    #[test]
+    fn fallback_snapshot_keeps_paragraph_indexes_safe_or_drops_unhostable_graph() {
+        let prior = valid_prior_doc("paragraph-safety");
+        let mut snapshot = GraphFallbackSnapshot::capture(&prior);
+        for (paragraph_index, _) in &mut snapshot.mentions {
+            *paragraph_index = usize::MAX;
+        }
+        let mut shortened = doc_with(&["李四负责火星计划"]);
+        fill_entities(
+            &mut shortened,
+            vec![
+                llm::RawEntity {
+                    name: "李四".into(),
+                    kind: "person".into(),
+                    aliases: vec![],
+                },
+                llm::RawEntity {
+                    name: "火星计划".into(),
+                    kind: "project".into(),
+                    aliases: vec![],
+                },
+            ],
+            "done",
+        );
+        snapshot.restore("paragraph-safety", &mut shortened);
+        assert_fallback_dependencies(&shortened);
+        assert!(shortened.paragraphs[0]
+            .mentions
+            .iter()
+            .any(|mention| mention.entity == "ent_1"));
+        assert!(shortened.paragraphs[0]
+            .mentions
+            .iter()
+            .any(|mention| mention.entity == "ent_2"));
+
+        let mut empty = doc_with(&[]);
+        GraphFallbackSnapshot::capture(&prior).restore("paragraph-safety", &mut empty);
+        assert!(empty.graph_extraction.is_none());
+        assert!(empty.relations.is_empty());
+        assert!(empty.entities.is_empty());
     }
 
     #[test]
