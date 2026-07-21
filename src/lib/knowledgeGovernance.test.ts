@@ -475,6 +475,9 @@ describe("governance UI source contract", () => {
     const entity = source("./EntityGovernance.svelte");
     expect(entity).toContain('class="source-notes"');
     expect(entity).toContain('{simple ? "关联笔记" : "证据"}');
+    expect(entity).toContain("listNotes().catch(() => [])");
+    expect(entity).toContain("noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`");
+    expect(entity).toContain("{group.title}</a>");
     expect(entity).toContain("{#if simple}");
     expect(entity).toContain("{#each group.items as mention (mention.id)}");
     expect(entity).toContain("第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}");
