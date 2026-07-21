@@ -89,10 +89,11 @@ export function filterSemanticGraph(
     .map((edge) => ({ ...edge }))
     .sort(compareSemanticIds);
   if (
-    filter.include_history ||
-    predicates.size > 0 ||
-    filter.from !== null ||
-    filter.to !== null
+    data.semantic_edges.length > 0 &&
+    (filter.include_history ||
+      predicates.size > 0 ||
+      filter.from !== null ||
+      filter.to !== null)
   ) {
     const admittedEndpoints = new Set(
       semanticEdges.flatMap((edge) => [edge.subject_id, edge.object_id]),
@@ -294,6 +295,9 @@ export function defaultBackbone(
 
   const queues = admitted.map((component) => [component.root]);
   const neighborLimit = Math.max(0, Math.floor(perNode));
+  // `perNode` is a strict expansion-degree budget. A selected node may admit only its
+  // top N previously unseen neighbors; lower-ranked neighbors cannot be smuggled in by
+  // a later global fill, because that can jump a bridge and disconnect the induced view.
   let madeProgress = true;
   while (selected.size < limit && madeProgress && neighborLimit > 0) {
     madeProgress = false;
@@ -316,15 +320,6 @@ export function defaultBackbone(
     }
   }
 
-  if (selected.size < limit) {
-    const remaining = data.nodes
-      .filter((node) => !selected.has(node.id))
-      .sort((left, right) => compareNodesByMeaning(left, right, incident));
-    for (const node of remaining) {
-      if (selected.size >= limit) break;
-      selected.add(node.id);
-    }
-  }
   return selected;
 }
 
