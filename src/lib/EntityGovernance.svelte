@@ -2,7 +2,7 @@
   import { entityMentions, relationDetail, type SemanticEntityDetail } from "./knowledge";
   import { kindInk, kindLabel, kindSoft } from "./graph";
   import { relationLabel } from "./knowledgeView";
-  import { listNotes } from "./notes";
+  import { formatDate, listNotes } from "./notes";
   import {
     buildAddAlias,
     buildBindPerson,
@@ -41,6 +41,7 @@
   let personEntityId = $state("");
   let mentions = $state<GovernanceMention[]>([]);
   let noteTitles = $state<Map<string, string>>(new Map());
+  let noteStartedAt = $state<Map<string, string>>(new Map());
   let mentionsLoading = $state(false);
   let splitOpen = $state(false);
   let working = $state(false);
@@ -89,11 +90,13 @@
         relation_ids: [...(relationIdsByMention.get(mention.id) ?? [])].sort(),
       }));
       noteTitles = new Map(notes.map((note) => [note.id, note.title]));
+      noteStartedAt = new Map(notes.map((note) => [note.id, note.started_at]));
       mentionsLoading = false;
     }).catch(() => {
       if (generation !== evidenceGeneration) return;
       mentions = [];
       noteTitles = new Map();
+      noteStartedAt = new Map();
       mentionsLoading = false;
     });
   });
@@ -108,11 +111,17 @@
       a.start_offset - b.start_offset ||
       a.id.localeCompare(b.id)
     )) groups.set(mention.note_id, [...(groups.get(mention.note_id) ?? []), mention]);
-    return [...groups.entries()].map(([noteId, items]) => ({
-      noteId,
-      title: noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`,
-      items,
-    }));
+    return [...groups.entries()].map(([noteId, items]) => {
+      const startedAt = noteStartedAt.get(noteId) ?? "";
+      const formattedTime = formatDate(startedAt);
+      return {
+        noteId,
+        title: noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`,
+        startedAt,
+        time: formattedTime === "—" ? "" : formattedTime,
+        items,
+      };
+    });
   });
   const displayEntityName = (id: string) =>
     id === detail.id ? detail.name : resolveEntityName?.(id) ?? "相关实体";
@@ -347,14 +356,22 @@
       {#if simple}
         <ul class="source-notes">
           {#each mentionGroups as group (group.noteId)}
-            <li><a href={'/notes/' + encodeURIComponent(group.noteId)}>{group.title}</a></li>
+            <li>
+              <a class="note-link" href={'/notes/' + encodeURIComponent(group.noteId)}>
+                <span>{group.title}</span>
+                {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+              </a>
+            </li>
           {/each}
         </ul>
         {#if mentionGroups.length === 0}<p class="empty-line">没有关联笔记</p>{/if}
       {:else}
         {#each mentionGroups as group (group.noteId)}
           <div class="note-group">
-            <a href={'/notes/' + encodeURIComponent(group.noteId)}>{group.title}</a>
+            <a class="note-link" href={'/notes/' + encodeURIComponent(group.noteId)}>
+              <span>{group.title}</span>
+              {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+            </a>
             {#each group.items as mention (mention.id)}
               <blockquote>
                 <p>{mention.quote}</p>
@@ -423,10 +440,13 @@
   .relation-list button small { margin-top: 3px; color: var(--ink-faint); font-size: 0.7rem; }
   .empty-line { margin: 6px 0; color: var(--ink-faint); font-size: 0.78rem; }
   .note-group { padding: 12px 0; border-top: 1px solid var(--hairline); }
-  .note-group > a { color: var(--accent); font-size: 0.78rem; text-decoration: none; overflow-wrap: anywhere; }
+  .note-link { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+  .note-link span { font-size: 0.82rem; }
+  .note-link time { color: var(--ink-faint); font-size: 0.7rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .note-group > .note-link { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   .source-notes { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
   .source-notes li { border-top: 1px solid var(--hairline); }
-  .source-notes a { display: block; padding: 12px 0; color: var(--accent); font-size: 0.82rem; text-decoration: none; overflow-wrap: anywhere; }
+  .source-notes .note-link { display: grid; gap: 3px; padding: 12px 0; }
   .source-notes a:hover { color: var(--ink); }
   blockquote { margin: 10px 0 0; padding: 0 0 0 12px; border-left: 2px solid var(--hairline-strong); }
   blockquote p { margin: 0; color: var(--ink); font-size: 0.86rem; line-height: 1.65; overflow-wrap: anywhere; }
