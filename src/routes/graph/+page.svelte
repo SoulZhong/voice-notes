@@ -29,7 +29,7 @@
     legacyFallbackGraph,
     nextExpandedIds,
     pathEmphasis,
-    preserveGraphExplorationState,
+    resolveGraphRefreshState,
     relationLabel,
     runGuardedPathRefresh,
     sanitizeDebugGraphUrl,
@@ -231,16 +231,20 @@
       semanticError = value.degraded ? "语义关系服务暂时降级，当前显示可用结果。" : "";
       const filtered = filterSemanticGraph(value, filter);
       if (mode === "preserve-view") {
-        const preserved = preserveGraphExplorationState(
+        const refreshed = resolveGraphRefreshState(
           filtered,
           visibleIds,
           expansionDepth,
           activePath?.entity_ids ?? [],
+          showingAll
+            ? new Set(filtered.nodes.map((node) => node.id))
+            : initialIds(value),
         );
         visibleIds = showingAll
           ? new Set(filtered.nodes.map((node) => node.id))
-          : preserved.visibleIds;
-        expansionDepth = preserved.expansionDepth;
+          : refreshed.visibleIds;
+        expansionDepth = refreshed.expansionDepth;
+        if (refreshed.shouldResetView) graphViewResetKey += 1;
       } else {
         if (showingAll) visibleIds = new Set(filtered.nodes.map((node) => node.id));
         else visibleIds = initialIds(value);
@@ -253,7 +257,23 @@
       console.warn("semantic graph request failed", cause);
       semanticRequestFailed = true;
       const fallback = legacyFallbackGraph(semantic, graph);
-      if (mode === "reset-view") {
+      if (mode === "preserve-view") {
+        const filteredFallback = filterSemanticGraph(fallback, filter);
+        const refreshed = resolveGraphRefreshState(
+          filteredFallback,
+          visibleIds,
+          expansionDepth,
+          activePath?.entity_ids ?? [],
+          showingAll
+            ? new Set(filteredFallback.nodes.map((node) => node.id))
+            : initialIds(fallback),
+        );
+        visibleIds = showingAll
+          ? new Set(filteredFallback.nodes.map((node) => node.id))
+          : refreshed.visibleIds;
+        expansionDepth = refreshed.expansionDepth;
+        if (refreshed.shouldResetView) graphViewResetKey += 1;
+      } else {
         visibleIds = showingAll
           ? new Set(fallback.nodes.map((node) => node.id))
           : initialIds(fallback);
