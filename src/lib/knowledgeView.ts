@@ -1,5 +1,11 @@
 import type { EntitySummary, RenderEdge } from "./graph";
-import type { KnowledgeFilter, KnowledgePath, SemanticEdge, SemanticGraphData } from "./knowledge";
+import type {
+  KnowledgeFilter,
+  KnowledgePath,
+  KnowledgePathStep,
+  SemanticEdge,
+  SemanticGraphData,
+} from "./knowledge";
 
 export const DEFAULT_KNOWLEDGE_FILTER: KnowledgeFilter = {
   entity_kinds: [],
@@ -323,8 +329,112 @@ export function defaultBackbone(
   return selected;
 }
 
+export function ensureBackboneEdge(
+  initial: ReadonlySet<string>,
+  data: SemanticGraphData,
+  maxNodes: number,
+): Set<string> {
+  const limit = Math.max(0, Math.floor(maxNodes));
+  if (limit < 2) return new Set([...initial].slice(0, limit));
+  const nodeIds = new Set(data.nodes.map((node) => node.id));
+  const selected = new Set([...initial].filter((id) => nodeIds.has(id)).slice(0, limit));
+  if (
+    data.semantic_edges.some(
+      (edge) => selected.has(edge.subject_id) && selected.has(edge.object_id),
+    )
+  ) {
+    return selected;
+  }
+
+  const bestEdge = [...data.semantic_edges]
+    .filter(
+      (edge) =>
+        edge.subject_id !== edge.object_id &&
+        nodeIds.has(edge.subject_id) &&
+        nodeIds.has(edge.object_id),
+    )
+    .sort(
+      (left, right) =>
+        right.confidence - left.confidence ||
+        right.note_count - left.note_count ||
+        compareStrings(left.id, right.id),
+    )[0];
+  if (!bestEdge) return selected;
+
+  const required = new Set([bestEdge.subject_id, bestEdge.object_id]);
+  const missing = [...required].filter((id) => !selected.has(id));
+  for (const id of [...selected].reverse()) {
+    if (selected.size + missing.length <= limit) break;
+    if (!required.has(id)) selected.delete(id);
+  }
+  for (const id of missing) selected.add(id);
+  return selected;
+}
+
 function cooccurrenceId(a: string, b: string): string {
   return compareStrings(a, b) <= 0 ? `co:${a}:${b}` : `co:${b}:${a}`;
+}
+
+export function canonicalPathEdgeId(
+  step: Pick<KnowledgePathStep, "id" | "subject_id" | "object_id" | "origin">,
+): string {
+  if (step.origin !== "cooccurrence") return step.id;
+  const [a, b] =
+    compareStrings(step.subject_id, step.object_id) <= 0
+      ? [step.subject_id, step.object_id]
+      : [step.object_id, step.subject_id];
+  return `co:${a}:${b}`;
+}
+
+export function stableEdgeLanes(
+  edges: readonly Pick<RenderEdge, "id" | "a" | "b">[],
+): Map<string, number> {
+  const groups = new Map<string, Pick<RenderEdge, "id" | "a" | "b">[]>();
+  for (const edge of edges) {
+    const [a, b] = compareStrings(edge.a, edge.b) <= 0 ? [edge.a, edge.b] : [edge.b, edge.a];
+    const key = `${a.length}:${a}|${b.length}:${b}`;
+    groups.set(key, [...(groups.get(key) ?? []), edge]);
+  }
+  const lanes = new Map<string, number>();
+  for (const key of [...groups.keys()].sort(compareStrings)) {
+    const group = groups.get(key)!.sort((left, right) => left.id.localeCompare(right.id));
+    group.forEach((edge, index) => lanes.set(edge.id, index - (group.length - 1) / 2));
+  }
+  return lanes;
+}
+
+export function searchAdmissionIds(
+  nodes: EntitySummary[],
+  edges: SemanticEdge[],
+  query: string,
+): Set<string> {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return new Set();
+  const matched = nodes
+    .filter(
+      (node) =>
+        node.name.toLowerCase().includes(normalized) ||
+        node.aliases.some((alias) => alias.toLowerCase().includes(normalized)),
+    )
+    .map((node) => node.id)
+    .sort(compareStrings);
+  const admitted = new Set(matched);
+  const neighbors = new Set<string>();
+  for (const edge of edges) {
+    if (admitted.has(edge.subject_id)) neighbors.add(edge.object_id);
+    if (admitted.has(edge.object_id)) neighbors.add(edge.subject_id);
+  }
+  for (const id of [...neighbors].sort(compareStrings)) admitted.add(id);
+  return admitted;
+}
+
+export type GlobalSemanticPresence = "unknown" | "present" | "absent";
+
+export function shouldUseLegacyFallback(
+  presence: GlobalSemanticPresence,
+  filtered: SemanticGraphData,
+): boolean {
+  return presence === "absent" && filtered.semantic_edges.length === 0;
 }
 
 export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): RenderEdge[] {
@@ -363,6 +473,6 @@ export function pathEmphasis(
 ): { nodeIds: Set<string>; edgeIds: Set<string> } {
   return {
     nodeIds: new Set(path?.entity_ids ?? []),
-    edgeIds: new Set(path?.steps.map((step) => step.id) ?? []),
+    edgeIds: new Set(path?.steps.map(canonicalPathEdgeId) ?? []),
   };
 }

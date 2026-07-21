@@ -17,11 +17,15 @@
   import {
     DEFAULT_KNOWLEDGE_FILTER,
     defaultBackbone,
+    ensureBackboneEdge,
     filterSemanticGraph,
     nextExpandedIds,
     pathEmphasis,
     relationLabel,
+    searchAdmissionIds,
+    shouldUseLegacyFallback,
     viewEdges,
+    type GlobalSemanticPresence,
   } from "$lib/knowledgeView";
   import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
   import { graphFilter } from "$lib/graphFilter.svelte";
@@ -40,6 +44,7 @@
     degraded: false,
     message: null,
   });
+  const BACKBONE_NODE_LIMIT = 80;
 
   let graph = $state<GraphData>({ nodes: [], edges: [] });
   let semantic = $state<SemanticGraphData>(emptySemantic());
@@ -54,6 +59,7 @@
   let semanticLoading = $state(false);
   let semanticError = $state("");
   let predicateCatalog = $state<Map<string, string>>(new Map());
+  let globalSemanticPresence = $state<GlobalSemanticPresence>("unknown");
   let detail = $state<SemanticEntityDetail | null>(null);
   let detailLoading = $state(false);
   let detailError = $state("");
@@ -83,9 +89,7 @@
   });
 
   const usableSemantic = $derived.by((): SemanticGraphData => {
-    if (semantic.semantic_edges.length > 0 || semantic.cooccurrence_edges.length > 0) {
-      return semantic;
-    }
+    if (!shouldUseLegacyFallback(globalSemanticPresence, semantic)) return semantic;
     return {
       ...semantic,
       nodes: semantic.nodes.length > 0 ? semantic.nodes : graph.nodes,
@@ -101,7 +105,16 @@
   );
   const pathFocus = $derived(pathEmphasis(activePath));
   const semanticFallback = $derived(
-    loaded && filteredSemantic.semantic_edges.length === 0 && filteredSemantic.cooccurrence_edges.length > 0,
+    loaded &&
+      globalSemanticPresence === "absent" &&
+      filteredSemantic.semantic_edges.length === 0 &&
+      filteredSemantic.cooccurrence_edges.length > 0,
+  );
+  const filteredSemanticEmpty = $derived(
+    loaded &&
+      !semanticLoading &&
+      globalSemanticPresence === "present" &&
+      semantic.semantic_edges.length === 0,
   );
   const entityNames = $derived(
     new Map([...graph.nodes, ...semantic.nodes].map((node) => [node.id, node.name])),
@@ -125,12 +138,16 @@
 
   function initialIds(data: SemanticGraphData): Set<string> {
     const filtered = filterSemanticGraph(data, knowledgeFilter);
-    const semanticIds = defaultBackbone(filtered, 80, 3);
+    const semanticIds = ensureBackboneEdge(
+      defaultBackbone(filtered, BACKBONE_NODE_LIMIT, 3),
+      filtered,
+      BACKBONE_NODE_LIMIT,
+    );
     if (semanticIds.size > 0) return semanticIds;
     return new Set(
       [...filtered.nodes]
         .sort((left, right) => right.note_count - left.note_count || left.id.localeCompare(right.id))
-        .slice(0, 80)
+        .slice(0, BACKBONE_NODE_LIMIT)
         .map((node) => node.id),
     );
   }
@@ -154,6 +171,7 @@
       const value = await semanticGraph(filter);
       if (generation !== graphGeneration) return;
       semantic = value;
+      if (value.semantic_edges.length > 0) globalSemanticPresence = "present";
       const nextPredicates = new Map(predicateCatalog);
       for (const edge of value.semantic_edges) {
         nextPredicates.set(edge.predicate_type, relationLabel(edge));
@@ -174,6 +192,26 @@
         semanticLoading = false;
         loaded = true;
       }
+    }
+  }
+
+  async function probeGlobalSemanticPresence() {
+    try {
+      const value = await semanticGraph(DEFAULT_KNOWLEDGE_FILTER);
+      const observedPresence = value.semantic_edges.length > 0 ? "present" : "absent";
+      if (globalSemanticPresence !== "present" || observedPresence === "present") {
+        globalSemanticPresence = observedPresence;
+      }
+      const nextPredicates = new Map(predicateCatalog);
+      for (const edge of value.semantic_edges) {
+        nextPredicates.set(edge.predicate_type, relationLabel(edge));
+      }
+      predicateCatalog = nextPredicates;
+      if (globalSemanticPresence === "absent" && visibleIds.size === 0) {
+        visibleIds = initialIds(usableSemantic);
+      }
+    } catch {
+      if (globalSemanticPresence !== "present") globalSemanticPresence = "unknown";
     }
   }
 
@@ -204,7 +242,12 @@
   }
 
   onMount(() => {
-    void Promise.all([loadGraph(), loadSemantic(knowledgeFilter), loadPending()]);
+    void Promise.all([
+      loadGraph(),
+      loadSemantic(knowledgeFilter),
+      probeGlobalSemanticPresence(),
+      loadPending(),
+    ]);
   });
 
   $effect(() => {
@@ -231,13 +274,7 @@
   $effect(() => {
     const query = graphFilter.query.trim().toLowerCase();
     if (!query) return;
-    const matches = filteredSemantic.nodes
-      .filter(
-        (node) =>
-          node.name.toLowerCase().includes(query) ||
-          node.aliases.some((alias) => alias.toLowerCase().includes(query)),
-      )
-      .map((node) => node.id);
+    const matches = [...searchAdmissionIds(filteredSemantic.nodes, filteredSemantic.semantic_edges, query)];
     if (matches.some((id) => !visibleIds.has(id))) visibleIds = new Set([...visibleIds, ...matches]);
   });
 
@@ -493,6 +530,12 @@
             <div class="map-message fallback">
               <span>尚未补建语义关系，当前保留共现弱连接供继续探索。</span>
               <button type="button" onclick={() => goto("/ai?backfill=relations")}>补建语义关系</button>
+            </div>
+          {/if}
+          {#if filteredSemanticEmpty}
+            <div class="map-message" role="status">
+              <span>当前筛选下没有语义关系，图谱没有切换为旧版共现结果。</span>
+              <button type="button" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>重置图谱筛选</button>
             </div>
           {/if}
 

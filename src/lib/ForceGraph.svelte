@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, forceX, forceY, type Simulation } from "d3-force";
   import { kindInk, kindLabel, type EntitySummary, type EdgeRow, type RenderEdge } from "$lib/graph";
+  import { stableEdgeLanes } from "$lib/knowledgeView";
   import { speakerInk } from "$lib/notes";
 
   let {
@@ -60,6 +61,7 @@
     b: string;
     source: SimNode;
     target: SimNode;
+    lane: number;
   };
 
   function normalizeEdges(edges: RenderEdge[] | EdgeRow[]): RenderEdge[] {
@@ -87,6 +89,9 @@
   let height = $state(560);
   let hovered = $state<string | null>(null);
   let hoveredEdge = $state<string | null>(null);
+  let focusedEdge = $state<string | null>(null);
+  let systemReducedMotion = $state(false);
+  const effectiveReducedMotion = $derived(reducedMotion ?? systemReducedMotion);
   let truncated = $state(0);
   /** 用户点了「显示全部」:build() 里忽略 maxNodes/minEdgeWeight/backboneK 的封顶,
       画出这份数据里全部有共现边的实体。 */
@@ -112,7 +117,7 @@
       labelRank: number;
       showLabelByDefault: boolean;
     }[];
-    links: (RenderEdge & { x1: number; y1: number; x2: number; y2: number; r1: number; r2: number })[];
+    links: (RenderEdge & { lane: number; x1: number; y1: number; x2: number; y2: number; r1: number; r2: number })[];
   }>({ nodes: [], links: [] });
 
   // 镜头变换(用户手动缩放/平移,叠在 fit 自适应变换之外的第二层):滚轮缩放围绕光标、
@@ -132,6 +137,7 @@
   const LABEL_LINE = 14;
   const ALL_LABELS_LIMIT = 30;
   const DEFAULT_LARGE_LABELS = 32;
+  const EDGE_LANE_GAP = 26;
 
   // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色
   // (`kindInk` 来自 $lib/graph,是全应用唯一真值源——侧栏 kind 过滤药丸/实体列表
@@ -227,6 +233,11 @@
     return { r, labelLines, labelW, labelH, labelRank, showLabelByDefault, collisionR };
   }
 
+  function assignStableLanes(links: SimLink[]): SimLink[] {
+    const lanes = stableEdgeLanes(links);
+    return links.map((edge) => ({ ...edge, lane: lanes.get(edge.id) ?? 0 }));
+  }
+
   // 只画有共现边的实体,按 note_count 降序取前 N;边只留两端都在集里的。
   // expanded(显示全部)/expandHops(展开一层,可重复点)都会放宽这份封顶——
   // 前者一步到位画出全部,后者以当前骨架图为种子逐层并入邻居,一步步长大,不用
@@ -250,7 +261,21 @@
       deg.add(e.a);
       deg.add(e.b);
     }
-    const candidates = allNodes.filter((n) => deg.has(n.id)).sort((a, b) => b.note_count - a.note_count);
+    const normalizedQuery = (query ?? "").trim().toLowerCase();
+    const searchNodeIds = new Set(
+      normalizedQuery
+        ? allNodes
+            .filter(
+              (node) =>
+                node.name.toLowerCase().includes(normalizedQuery) ||
+                node.aliases.some((alias) => alias.toLowerCase().includes(normalizedQuery)),
+            )
+            .map((node) => node.id)
+        : [],
+    );
+    const candidates = allNodes
+      .filter((node) => deg.has(node.id) || searchNodeIds.has(node.id))
+      .sort((a, b) => b.note_count - a.note_count || a.id.localeCompare(b.id));
 
     let idset: Set<string>;
     if (expanded) {
@@ -308,6 +333,10 @@
       }
     }
 
+    // 搜索命中是用户明确请求的焦点，即便它没有达到默认骨架的边权阈值或完全孤立，
+    // 也必须进入画布。否则侧栏能搜到、镜头却没有可聚焦的节点。
+    for (const id of searchNodeIds) idset.add(id);
+
     // 重要节点最后绘制,它们的标记和标签自然位于较弱节点之上。
     const chosen = allNodes
       .filter((n) => idset.has(n.id))
@@ -336,7 +365,7 @@
     const edgePool = growing ? normalizedEdges : strong;
     let candLinks = edgePool
       .filter((e) => idset.has(e.a) && idset.has(e.b))
-      .map((edge) => ({ ...edge, source: byId.get(edge.a)!, target: byId.get(edge.b)! }));
+      .map((edge) => ({ ...edge, source: byId.get(edge.a)!, target: byId.get(edge.b)!, lane: 0 }));
     // 稀疏化 backbone:每个节点只保留最强的 backboneK 条边(union),把超密共现图收成可读骨架。
     const perNode = new Map<string, { l: SimLink; w: number }[]>();
     for (const l of candLinks) {
@@ -350,13 +379,15 @@
     for (const [, arr] of perNode) {
       arr.sort((a, b) => b.w - a.w).slice(0, effBackboneK).forEach((x) => keep.add(x.l));
     }
-    dLinks = candLinks
-      .filter((link) => keep.has(link))
-      .sort(
-        (left, right) =>
-          (left.layer === right.layer ? 0 : left.layer === "cooccurrence" ? -1 : 1) ||
-          left.id.localeCompare(right.id),
-      );
+    dLinks = assignStableLanes(
+      candLinks
+        .filter((link) => keep.has(link))
+        .sort(
+          (left, right) =>
+            (left.layer === right.layer ? 0 : left.layer === "cooccurrence" ? -1 : 1) ||
+            left.id.localeCompare(right.id),
+        ),
+    );
   }
 
   function refreshSnap() {
@@ -386,6 +417,7 @@
         confidence: l.confidence,
         status: l.status,
         weight: l.weight,
+        lane: l.lane,
         x1: l.source.x ?? 0,
         y1: l.source.y ?? 0,
         x2: l.target.x ?? 0,
@@ -407,6 +439,22 @@
   let heavy = false;
   let skipAnimation = false;
 
+  function settleSimulation(iterations = 120) {
+    if (!sim) return;
+    sim.stop();
+    sim.alpha(Math.max(sim.alpha(), 0.3));
+    sim.tick(iterations);
+    sim.stop();
+    refreshSnap();
+  }
+
+  function updateSimulationCenter() {
+    const gravityStrength = heavy ? 0.4 : 0.08;
+    sim?.force("center", forceCenter(width / 2, height / 2));
+    sim?.force("gravityX", forceX<SimNode>(width / 2).strength(gravityStrength));
+    sim?.force("gravityY", forceY<SimNode>(height / 2).strength(gravityStrength));
+  }
+
   /** (重)建仿真:首次挂载与之后每次 nodes/edges/规模参数变化(如详情页切换中心实体)都要
       重跑,否则组件被复用时 props 换了但内部仿真停留在旧数据,图不更新。 */
   function rebuild() {
@@ -418,7 +466,6 @@
     viewY = 0;
     build();
     heavy = dNodes.length > 150 || dLinks.length > 800;
-    const reduce = reducedMotion ?? window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
     // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
     // 跟主团完全没有边连接的孤岛,互斥力(charge)会把它们越推越远,越推越飘。
@@ -454,29 +501,33 @@
       .velocityDecay(heavy ? 0.45 : 0.4)
       .on("tick", refreshSnap);
     skipAnimation = dNodes.length > 450 || dLinks.length > 2500;
-    if (reduce || skipAnimation) {
+    if (skipAnimation) {
       sim.stop();
-      if (skipAnimation) {
-        // 巨图(900+ 节点)一次性冷启动定格,不逐帧动画(逐 tick 全量重渲染上千 DOM
-        // 会真卡死)。这条路用户看不到动画过程、只看最终结果,时间不敏感但布局必须
-        // 干净。**这里必须用慢衰减跑足够多的 tick**:上面为动画调的快衰减(0.26)会
-        // 让下面这个 alpha 门控循环几十 tick 就退出,几百上千节点根本没被碰撞力分开、
-        // 挤成一坨(冒烟反馈"位置没好就停止了")。临时把衰减调回慢档(0.02≈300 tick
-        // 预算)专门给冷启动用,配合 collide 迭代把重叠彻底清干净,400 tick 安全上限。
-        sim.alphaDecay(0.05).alpha(1);
-        let iterations = 0;
-        while (sim.alpha() > sim.alphaMin() && iterations < 400) {
-          sim.tick();
-          iterations++;
-        }
-      } else {
-        sim.tick(120);
+      // 巨图(900+ 节点)一次性冷启动定格,不逐帧动画(逐 tick 全量重渲染上千 DOM
+      // 会真卡死)。这条路用户看不到动画过程、只看最终结果,时间不敏感但布局必须
+      // 干净。**这里必须用慢衰减跑足够多的 tick**:上面为动画调的快衰减(0.26)会
+      // 让下面这个 alpha 门控循环几十 tick 就退出,几百上千节点根本没被碰撞力分开、
+      // 挤成一坨(冒烟反馈"位置没好就停止了")。临时把衰减调回慢档(0.02≈300 tick
+      // 预算)专门给冷启动用,配合 collide 迭代把重叠彻底清干净,400 tick 安全上限。
+      sim.alphaDecay(0.05).alpha(1);
+      let iterations = 0;
+      while (sim.alpha() > sim.alphaMin() && iterations < 400) {
+        sim.tick();
+        iterations++;
       }
       refreshSnap();
+    } else {
+      if (effectiveReducedMotion) settleSimulation();
     }
   }
 
   onMount(() => {
+    const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    systemReducedMotion = reducedMotionQuery.matches;
+    const updateReducedMotion = (event: MediaQueryListEvent) => {
+      systemReducedMotion = event.matches;
+    };
+    reducedMotionQuery.addEventListener("change", updateReducedMotion);
     if (container) {
       width = container.clientWidth || 800;
       height = container.clientHeight || 560;
@@ -485,29 +536,34 @@
       if (!container) return;
       width = container.clientWidth || width;
       height = container.clientHeight || height;
-      sim?.force("center", forceCenter(width / 2, height / 2));
+      updateSimulationCenter();
       // 巨图 resize 不走 alphaTarget 持续重热(会重新触发逐 tick 全量重渲染),
       // 冷启动重定格一次即可——容器大小变化不需要重新物理仿真,只是换个中心点。
-      if (skipAnimation) {
-        sim?.tick(20);
-        refreshSnap();
+      if (effectiveReducedMotion) {
+        settleSimulation(20);
+      } else if (skipAnimation) {
+        settleSimulation(20);
       } else {
         sim?.alpha(0.3).restart();
       }
     });
     if (container) ro.observe(container);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      reducedMotionQuery.removeEventListener("change", updateReducedMotion);
+    };
   });
 
   $effect(() => {
     // 读取这些依赖建立追踪:任一变化(换了中心实体/规模参数/显示全部开关)即重建。
-    // 故意不含 query——搜索只影响高亮/镜头聚焦,不该让仿真每敲一个字就重排一次。
+    // query 需要参与建图：搜索命中的孤立节点不在默认边骨架里，只有查询时才准入。
     void allNodes;
     void allEdges;
     void maxNodes;
     void minEdgeWeight;
     void backboneK;
-    void reducedMotion;
+    void query;
+    void effectiveReducedMotion;
     void expanded;
     void expandHops;
     if (container) rebuild();
@@ -546,14 +602,27 @@
     const length = Math.max(1, Math.hypot(dx, dy));
     const startInset = Math.min(edge.r1 + 2, length * 0.3);
     const endInset = Math.min(edge.r2 + (edge.directed ? 8 : 2), length * 0.34);
-    return `M ${edge.x1 + (dx / length) * startInset} ${edge.y1 + (dy / length) * startInset} L ${edge.x2 - (dx / length) * endInset} ${edge.y2 - (dy / length) * endInset}`;
+    const canonicalDirection = edge.a.localeCompare(edge.b) <= 0 ? 1 : -1;
+    const canonicalDx = dx * canonicalDirection;
+    const canonicalDy = dy * canonicalDirection;
+    const offset = edge.lane * EDGE_LANE_GAP;
+    const controlX = (edge.x1 + edge.x2) / 2 - (canonicalDy / length) * offset;
+    const controlY = (edge.y1 + edge.y2) / 2 + (canonicalDx / length) * offset;
+    return `M ${edge.x1 + (dx / length) * startInset} ${edge.y1 + (dy / length) * startInset} Q ${controlX} ${controlY} ${edge.x2 - (dx / length) * endInset} ${edge.y2 - (dy / length) * endInset}`;
   }
 
   function edgeLabelPath(edge: (typeof snap.links)[number]): string {
+    const dx = edge.x2 - edge.x1;
+    const dy = edge.y2 - edge.y1;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const canonicalDirection = edge.a.localeCompare(edge.b) <= 0 ? 1 : -1;
+    const offset = edge.lane * EDGE_LANE_GAP;
+    const controlX = (edge.x1 + edge.x2) / 2 - ((dy * canonicalDirection) / length) * offset;
+    const controlY = (edge.y1 + edge.y2) / 2 + ((dx * canonicalDirection) / length) * offset;
     const readsForward = edge.x1 < edge.x2 || (edge.x1 === edge.x2 && edge.y1 <= edge.y2);
     return readsForward
-      ? `M ${edge.x1} ${edge.y1} L ${edge.x2} ${edge.y2}`
-      : `M ${edge.x2} ${edge.y2} L ${edge.x1} ${edge.y1}`;
+      ? `M ${edge.x1} ${edge.y1} Q ${controlX} ${controlY} ${edge.x2} ${edge.y2}`
+      : `M ${edge.x2} ${edge.y2} Q ${controlX} ${controlY} ${edge.x1} ${edge.y1}`;
   }
 
   function edgeLabelVisible(edge: (typeof snap.links)[number]): boolean {
@@ -562,6 +631,7 @@
       visibleSemanticCount <= 30 ||
       viewZoom >= 1.35 ||
       hoveredEdge === edge.id ||
+      focusedEdge === edge.id ||
       focusedEdgeIds.has(edge.id)
     );
   }
@@ -742,7 +812,7 @@
     if (n) {
       // heavy 图不重热仿真(alphaTarget 持续重启=逐 tick 全量重渲染,卡死元凶之一),
       // 只把这一个节点钉在指针位置、手动单帧刷新——其余节点保持冷却定格不陪着抖。
-      if (!heavy) sim?.alphaTarget(0.3).restart();
+      if (!heavy && !effectiveReducedMotion) sim?.alphaTarget(0.3).restart();
       n.fx = n.x;
       n.fy = n.y;
     }
@@ -755,7 +825,7 @@
     if (n) {
       n.fx = ((e.clientX - rect.left - viewX) / viewZoom - fit.tx) / fit.scale;
       n.fy = ((e.clientY - rect.top - viewY) / viewZoom - fit.ty) / fit.scale;
-      if (heavy) refreshSnap();
+      if (heavy || effectiveReducedMotion) refreshSnap();
     }
   }
   function onUp(id: string, isPerson: boolean) {
@@ -764,7 +834,7 @@
       n.fx = null;
       n.fy = null;
     }
-    if (!heavy) sim?.alphaTarget(0);
+    if (!heavy && !effectiveReducedMotion) sim?.alphaTarget(0);
     // dragId 只在左键 onDown 时被置位(见上方注释);右键释放时 dragId 仍是上次左键交互
     // 遗留值(通常是 null),不等于当前 id,故不会误触发导航。
     if (dragId === id && !moved) onPick(id, isPerson);
@@ -772,7 +842,7 @@
   }
 </script>
 
-<div class="fg" bind:this={container}>
+<div class="fg" class:reduced={effectiveReducedMotion} bind:this={container}>
   <svg {width} {height} role="img" aria-label="知识图谱力导向图" onwheel={onWheel}>
     <defs>
       <marker
@@ -838,20 +908,26 @@
                 class="edge-label-guide"
                 d={edgeLabelPath(l)}
               />
-              <path
-                class="edge-hit"
-                d={edgePath(l)}
-                role="button"
-                tabindex={onEdgePick ? 0 : -1}
-                aria-label={`${l.label}，${l.layer === "semantic" ? "语义关系" : "共现弱连接"}`}
-                onclick={() => onEdgePick?.(l.id, l.layer)}
-                onkeydown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    onEdgePick?.(l.id, l.layer);
-                  }
-                }}
-              ><title>{l.label}</title></path>
+              {#if onEdgePick}
+                <path
+                  class="edge-hit"
+                  d={edgePath(l)}
+                  role="button"
+                  tabindex="0"
+                  aria-label={`${l.label}，${l.layer === "semantic" ? "语义关系" : "共现弱连接"}`}
+                  onclick={() => onEdgePick(l.id, l.layer)}
+                  onfocus={() => (focusedEdge = l.id)}
+                  onblur={() => (focusedEdge = null)}
+                  onkeydown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onEdgePick(l.id, l.layer);
+                    }
+                  }}
+                ><title>{l.label}</title></path>
+              {:else}
+                <path class="edge-hover-target" d={edgePath(l)}><title>{l.label}</title></path>
+              {/if}
               {#if edgeLabelVisible(l)}
                 <text class="edge-label">
                   <textPath href={`#${edgePathId(l.id, true)}`} startOffset="50%">{l.label}</textPath>
@@ -974,6 +1050,7 @@
   svg { display: block; touch-action: none; }
   .bg { cursor: grab; }
   .edge { transition: opacity 240ms cubic-bezier(0.25, 1, 0.5, 1); }
+  .fg.reduced .edge, .fg.reduced .nodes > g { transition: none; }
   .edge-line { fill: none; vector-effect: non-scaling-stroke; }
   .semantic-line {
     stroke: var(--accent);
@@ -985,11 +1062,13 @@
     stroke-dasharray: 3 5;
   }
   .edge-label-guide { fill: none; stroke: none; }
-  .edge-hit {
+  .edge-hit, .edge-hover-target {
     fill: none;
     stroke: transparent;
     stroke-width: 12px;
     vector-effect: non-scaling-stroke;
+  }
+  .edge-hit {
     cursor: pointer;
   }
   .edge-hit:focus-visible {
@@ -1132,7 +1211,7 @@
     background: var(--ink-faint);
   }
   @media (pointer: coarse) {
-    .edge-hit { stroke-width: 18px; }
+    .edge-hit, .edge-hover-target { stroke-width: 18px; }
     .trunc-action { min-height: 44px; padding-inline: 14px; }
   }
   @media (prefers-reduced-motion: reduce) {

@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { EntitySummary } from "./graph";
-import type { KnowledgePath, KnowledgeFilter, SemanticEdge, SemanticGraphData } from "./knowledge";
+import type { KnowledgePath, KnowledgeFilter, KnowledgePathStep, SemanticEdge, SemanticGraphData } from "./knowledge";
 import {
   DEFAULT_KNOWLEDGE_FILTER,
+  canonicalPathEdgeId,
   defaultBackbone,
+  ensureBackboneEdge,
   filterSemanticGraph,
   nextExpandedIds,
   pathEmphasis,
   relationLabel,
+  searchAdmissionIds,
+  shouldUseLegacyFallback,
+  stableEdgeLanes,
   viewEdges,
 } from "./knowledgeView";
 
@@ -423,7 +428,7 @@ describe("pathEmphasis", () => {
 
 describe("exploratory graph UI source contract", () => {
   const sources = import.meta.glob(
-    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
+    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
     { eager: true, query: "?raw", import: "default" },
   ) as Record<string, string>;
   const source = (name: string) => {
@@ -503,5 +508,119 @@ describe("exploratory graph UI source contract", () => {
     }
     expect(panel).not.toContain("…");
     expect(panel).not.toMatch(/\.\.\.(?=["'`<])/);
+  });
+
+  it("canonicalizes Rust-style cooccurrence path step IDs to rendered weak-edge IDs", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const policy = source("./knowledgeView.ts");
+    const rustStyleStep = {
+      id: "co_91d3e0e29ac24fb6",
+      subject_id: "kg_zeta",
+      object_id: "kg_alpha",
+      origin: "cooccurrence",
+    };
+    const [a, b] = [rustStyleStep.subject_id, rustStyleStep.object_id].sort();
+    expect(`co:${a}:${b}`).toBe("co:kg_alpha:kg_zeta");
+    expect(rustStyleStep.id).not.toBe(`co:${a}:${b}`);
+    expect(canonicalPathEdgeId(rustStyleStep as KnowledgePathStep)).toBe("co:kg_alpha:kg_zeta");
+    expect(
+      pathEmphasis({ entity_ids: [a, b], steps: [rustStyleStep as KnowledgePathStep], total_cost: 1 }),
+    ).toEqual({ nodeIds: new Set([a, b]), edgeIds: new Set(["co:kg_alpha:kg_zeta"]) });
+    expect(policy).toContain("function canonicalPathEdgeId(");
+    expect(policy).toContain('step.origin !== "cooccurrence"');
+    expect(policy).toContain('return `co:${a}:${b}`');
+    expect(route).toContain("pathEmphasis(activePath)");
+  });
+
+  it("admits and focuses an off-backbone search match even when it is isolated", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    const route = source("../routes/graph/+page.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(forceGraph).toContain("searchNodeIds");
+    expect(forceGraph).toContain("deg.has(node.id) || searchNodeIds.has(node.id)");
+    expect(forceGraph).toContain("void query");
+    expect(policy).toContain("function searchAdmissionIds(");
+    expect(route).toContain("visibleIds = new Set([...visibleIds, ...matches])");
+    expect(route).not.toMatch(/graphFilter\.query[\s\S]{0,300}renderedNodes\s*=/);
+    expect(
+      searchAdmissionIds(
+        [node("hidden"), node("neighbor"), node("isolated", "term"), node("unrelated")],
+        [edge("r_hidden", "hidden", "neighbor")],
+        "isolated",
+      ),
+    ).toEqual(new Set(["isolated"]));
+    expect(
+      searchAdmissionIds(
+        [node("hidden"), node("neighbor"), node("isolated"), node("unrelated")],
+        [edge("r_hidden", "hidden", "neighbor")],
+        "hidden",
+      ),
+    ).toEqual(new Set(["hidden", "neighbor"]));
+  });
+
+  it("uses legacy fallback only when the global semantic index is truly absent", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(route).toContain('globalSemanticPresence === "absent"');
+    expect(route).toContain("probeGlobalSemanticPresence(");
+    expect(route).toContain('globalSemanticPresence === "present"');
+    expect(route).toContain("当前筛选下没有语义关系");
+    expect(policy).toContain("function shouldUseLegacyFallback(");
+    expect(route).not.toMatch(/semantic\.semantic_edges\.length === 0[\s\S]{0,180}cooccurrence_edges: graph\.edges/);
+    const filteredEmpty = graph([node("a"), node("b")], []);
+    expect(shouldUseLegacyFallback("present", filteredEmpty)).toBe(false);
+    expect(shouldUseLegacyFallback("unknown", filteredEmpty)).toBe(false);
+    expect(shouldUseLegacyFallback("absent", filteredEmpty)).toBe(true);
+  });
+
+  it("gives parallel relations stable signed Bezier lanes and independent label paths", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(forceGraph).toContain("assignStableLanes(");
+    expect(policy).toContain("left.id.localeCompare(right.id)");
+    expect(policy).toContain("index - (group.length - 1) / 2");
+    expect(forceGraph).toContain(" Q ");
+    expect(forceGraph).toContain("edge.lane * EDGE_LANE_GAP");
+    expect(forceGraph).toContain("edgePathId(l.id, true)");
+    expect(policy).toContain("function stableEdgeLanes(");
+    const parallel = [
+      { id: "rel_c", a: "z", b: "a" },
+      { id: "rel_a", a: "a", b: "z" },
+      { id: "rel_b", a: "a", b: "z" },
+    ];
+    expect(stableEdgeLanes(parallel)).toEqual(new Map([["rel_a", -1], ["rel_b", 0], ["rel_c", 1]]));
+    expect(stableEdgeLanes([...parallel].reverse())).toEqual(stableEdgeLanes(parallel));
+  });
+
+  it("keeps reduced-motion settled through resize and drag, with honest SVG semantics", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain("effectiveReducedMotion");
+    expect(forceGraph).toContain("settleSimulation(");
+    expect(forceGraph).toContain("if (effectiveReducedMotion)");
+    expect(forceGraph).toContain('class:reduced={effectiveReducedMotion}');
+    expect(forceGraph).toContain("focusedEdge === edge.id");
+    expect(forceGraph).toContain("{#if onEdgePick}");
+    expect(forceGraph).toContain('class="edge-hover-target"');
+    expect(forceGraph).not.toContain("tabindex={onEdgePick ? 0 : -1}");
+  });
+
+  it("ensures a root-heavy default view still contains at least one useful edge", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(route).toContain("ensureBackboneEdge(");
+    expect(route).toContain("BACKBONE_NODE_LIMIT");
+    expect(policy).toContain("selected.has(edge.subject_id) && selected.has(edge.object_id)");
+    const roots = Array.from({ length: 81 }, (_, index) => node(`root_${index}`));
+    const rootEdges = Array.from({ length: 40 }, (_, index) =>
+      edge(`rel_${index}`, `root_${index * 2}`, `root_${index * 2 + 1}`, {
+        confidence: 1 - index / 100,
+      }),
+    );
+    const data = graph(roots, rootEdges);
+    const selected = defaultBackbone(data, 20, 1);
+    expect([...selected].some((id) => rootEdges.some((item) => item.subject_id === id && selected.has(item.object_id)))).toBe(false);
+    const ensured = ensureBackboneEdge(selected, data, 20);
+    expect(ensured.size).toBeLessThanOrEqual(20);
+    expect(rootEdges.some((item) => ensured.has(item.subject_id) && ensured.has(item.object_id))).toBe(true);
   });
 });
