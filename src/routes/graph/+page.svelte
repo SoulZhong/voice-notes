@@ -454,13 +454,16 @@
     if (debugFixtureRequested) return;
     const id = selected;
     const generation = ++detailGeneration;
-    const [nextGraph, nextPending, nextDetail] = await Promise.all([
-      graphData(),
+    // Install this refresh's co-occurrence graph before semantic loading. If the
+    // semantic request fails, its preserve-view fallback must rebase against the
+    // same generation rather than IDs from the previous graph.
+    const nextGraph = await graphData();
+    graph = nextGraph;
+    const [nextPending, nextDetail] = await Promise.all([
       pendingReview(DEFAULT_KNOWLEDGE_FILTER),
       id ? semanticEntityDetail(id, detailFilter) : Promise.resolve(null),
       loadSemantic(effectiveGraphFilter, "preserve-view"),
     ]);
-    graph = nextGraph;
     pendingItems = nextPending;
     loaded = true;
     if (generation === detailGeneration) {
@@ -483,6 +486,9 @@
       pathStatus = "loading";
       pathError = "";
     }
+    // The semantic failure path derives its fallback from `graph`, so make the
+    // current generation visible before starting any semantic request.
+    await loadGraph();
     await runGuardedPathRefresh(
       snapshot,
       () => ({ generation: pathGeneration, start: pathStart, end: pathEnd }),
@@ -491,7 +497,6 @@
           await Promise.all([
             loadSemantic(effectiveGraphFilter, "preserve-view"),
             probeGlobalSemanticPresence(),
-            loadGraph(),
             loadPending(),
           ]);
         },
