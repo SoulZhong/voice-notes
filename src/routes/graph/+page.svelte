@@ -523,6 +523,7 @@
         onPick={(id) => pickNoteNode(id)}
         query={graphFilter.query}
         showLegend={false}
+        cooccurrenceMeaning="shared-entities"
       />
     {:else if noteGraphState.data.nodes.length > 0}
       <div class="placeholder">

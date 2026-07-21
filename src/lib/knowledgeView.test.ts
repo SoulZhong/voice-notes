@@ -623,13 +623,18 @@ describe("exploratory graph UI source contract", () => {
     for (const copy of [
       "明确关系",
       "箭头表示方向 · 点击线查看依据",
-      "共同上下文",
-      "虚线表示同篇提及或共享实体",
+      "共用实体",
+      "细线表示两篇文章含有相同实体",
+      "同时提及",
+      "细线表示一篇笔记提到两个实体",
     ]) {
       expect(forceGraph).toContain(copy);
     }
     expect(forceGraph).toMatch(/\.semantic-line\s*\{[^}]*stroke:\s*var\(--accent\)[^}]*stroke-width:\s*2\.75px/s);
-    expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*1\.75px[^}]*stroke-dasharray:\s*5 5/s);
+    expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*1\.35px/s);
+    expect(forceGraph).not.toContain("stroke-dasharray");
+    expect(forceGraph).toContain('cooccurrenceMeaning = "shared-notes"');
+    expect(source("../routes/graph/+page.svelte")).toContain('cooccurrenceMeaning="shared-entities"');
     expect(forceGraph).toContain('class="edge-key"');
   });
 
