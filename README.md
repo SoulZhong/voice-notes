@@ -112,7 +112,7 @@ npm run tauri build    # 构建 .app + .dmg
 
 | 接入面 | 是什么 | 用在哪 |
 | --- | --- | --- |
-| **MCP 服务** | Agent 的标准工具协议,11 个工具(检索 / 读全文 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
+| **MCP 服务** | Agent 的标准工具协议,13 个工具(检索 / 读全文 / 精修与语义图谱写回 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
 | **命令行 CLI** | 同一套查询能力的命令行版,可 `--json` | 脚本、CI,或 Agent 没配 MCP 时的降级 |
 | **Claude Code 技能** | 教 Claude Code 何时怎么组合上面的工具(纪要 / 周报 / 检索工作流) | 锦上添花,让 Claude 开箱会用 |
 
@@ -150,7 +150,7 @@ npm run tauri build    # 构建 .app + .dmg
    args = ["mcp", "serve"]
    ```
 
-提供的 11 个工具:
+提供的 13 个工具:
 
 | 工具 | 用途 | 前提 |
 | --- | --- | --- |
@@ -159,11 +159,13 @@ npm run tauri build    # 构建 .app + .dmg
 | `get_note` | 读一场笔记全文(默认优先 AI 精修稿) | 无需 App 运行 |
 | `list_speakers` | 全局声纹库人物(跨会议一致的编号 / 名字) | 无需 App 运行 |
 | `apply_refined_texts` | Agent 代精修写回:按段落下标提交修订文本(只能改文本,结构不可动) | 无需 App 运行,笔记须已有精修稿 |
+| `get_aing_context` | 读取最终精修段落、实体、稳定 mention 与当前 source hash,供 Agent 按服务端图谱契约抽取事实 | 无需 App 运行,笔记须有当前 `aing.json`;应在文本写回后调用 |
+| `apply_aing_graph` | 提交实体与带精确证据的语义关系;服务端重算 ID/mention 并校验最新全文后写回 | 无需 App 运行;须先提交最终文本并使用最新 `get_aing_context` |
 | `recording_status` | 当前录制状态 | App 运行中 |
 | `get_live_transcript` | 正在录制会话的实时转写 | App 运行中 |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
 
-查询类四工具直读本机数据文件,App 没开也能用;其余经 App 内本地 socket,需 App 运行。
+笔记与图谱类七工具直接访问本机数据文件,App 没开也能用;录制状态、实时转写与四项录制控制经 App 内本地 socket,需 App 运行。
 
 ### 命令行直查(无需 MCP)
 
