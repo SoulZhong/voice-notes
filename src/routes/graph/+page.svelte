@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { goto, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, type GraphData, type RenderEdge } from "$lib/graph";
+  import { graphData, kindLabel, type GraphData, type RenderEdge } from "$lib/graph";
   import {
     semanticEntityDetail,
     semanticGraph,
@@ -23,6 +23,7 @@
     filterSemanticGraph,
     legacyFallbackGraph,
     nextExpandedIds,
+    relationLabel,
     resolveGraphRefreshState,
     sanitizeDebugGraphUrl,
     searchAdmissionIds,
@@ -33,7 +34,9 @@
   } from "$lib/knowledgeView";
   import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
   import { graphFilter } from "$lib/graphFilter.svelte";
+  import { noteGraphState } from "$lib/noteGraph.svelte";
   import ForceGraph from "$lib/ForceGraph.svelte";
+  import KnowledgeGraphToolbar from "$lib/KnowledgeGraphToolbar.svelte";
   import EntityGovernance from "$lib/EntityGovernance.svelte";
   import RelationDrawer from "$lib/RelationDrawer.svelte";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
@@ -59,6 +62,7 @@
   let semanticLoading = $state(false);
   let semanticError = $state("");
   let semanticRequestFailed = $state(false);
+  let predicateCatalog = $state<Map<string, string>>(new Map());
   let globalSemanticPresence = $state<GlobalSemanticPresence>("unknown");
   let detail = $state<SemanticEntityDetail | null>(null);
   let detailLoading = $state(false);
@@ -69,6 +73,7 @@
   let backfillOpen = $state(false);
   let debugFixtureSession = $state<string | null>(null);
   let debugRelationEnabled = $state(false);
+  let ctxMenu = $state<{ id: string; name: string; isPerson: boolean; x: number; y: number } | null>(null);
   let debugFixtureDisposed = false;
   const releaseDebugFixtureOnce = createDebugFixtureReleaseOnce(semanticGraphDebugRelease);
   let lastSidebarKind = graphFilter.kind;
@@ -86,6 +91,7 @@
   );
   const selected = $derived(routePolicy.selected);
   const relationId = $derived(routePolicy.relationId);
+  const manageOpen = $derived($page.url.searchParams.get("manage") === "1");
   const inspectorOpen = $derived(Boolean(selected || relationId));
   const detailFilter = { ...DEFAULT_KNOWLEDGE_FILTER, include_history: true };
   const effectiveGraphFilter = $derived<KnowledgeFilter>(knowledgeFilter);
@@ -128,6 +134,13 @@
   const entityNames = $derived(
     new Map([...graph.nodes, ...semantic.nodes].map((node) => [node.id, node.name])),
   );
+  const availableKinds = $derived.by(() => {
+    const values = new Set([...graph.nodes, ...semantic.nodes].map((node) => node.kind));
+    return [...values].sort().map((value) => ({ value, label: kindLabel(value) }));
+  });
+  const availablePredicates = $derived.by(() => {
+    return [...predicateCatalog].sort(([left], [right]) => left.localeCompare(right)).map(([value, label]) => ({ value, label }));
+  });
 
   function initialIds(data: SemanticGraphData): Set<string> {
     const filtered = filterSemanticGraph(data, knowledgeFilter);
@@ -174,6 +187,9 @@
       if (generation !== graphGeneration) return;
       semanticRequestFailed = false;
       semantic = value;
+      const nextPredicates = new Map(predicateCatalog);
+      for (const edge of value.semantic_edges) nextPredicates.set(edge.predicate_type, relationLabel(edge));
+      predicateCatalog = nextPredicates;
       if (value.semantic_edges.length > 0) globalSemanticPresence = "present";
       if (value.degraded && value.message) console.warn("semantic graph degraded", value.message);
       semanticError = value.degraded ? "语义关系服务暂时降级，当前显示可用结果。" : "";
@@ -330,6 +346,10 @@
   });
 
   $effect(() => {
+    if (graphFilter.mode === "note" && noteGraphState.status === "idle") void noteGraphState.load();
+  });
+
+  $effect(() => {
     const query = graphFilter.query.trim().toLowerCase();
     if (!query) return;
     const matches = [...searchAdmissionIds(filteredSemantic.nodes, filteredSemantic.semantic_edges, query)];
@@ -396,7 +416,11 @@
   function pickNode(id: string, _isPerson: boolean) {
     revealFrom(id);
     if (debugFixtureRequested) return;
-    updateQuery((params) => { params.set("e", id); params.delete("review"); params.delete("r"); });
+    updateQuery((params) => { params.set("e", id); params.delete("manage"); params.delete("review"); params.delete("r"); });
+  }
+
+  function pickNoteNode(id: string) {
+    goto("/notes/" + encodeURIComponent(id));
   }
 
   function openRelation(id: string) {
@@ -417,7 +441,42 @@
   }
 
   function closeEntity() {
-    updateQuery((params) => { params.delete("e"); });
+    updateQuery((params) => { params.delete("e"); params.delete("manage"); });
+  }
+
+  function collapseGraph() {
+    expansionDepth = new Map();
+    visibleIds = initialIds(usableSemantic);
+    graphViewResetKey += 1;
+  }
+
+  function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
+    if (debugFixtureRequested) return;
+    ctxMenu = {
+      id,
+      name,
+      isPerson,
+      x: Math.max(8, Math.min(clientX, window.innerWidth - 196)),
+      y: Math.max(8, Math.min(clientY, window.innerHeight - 126)),
+    };
+  }
+
+  function closeCtxMenu() {
+    ctxMenu = null;
+  }
+
+  function openContextDetail() {
+    if (!ctxMenu) return;
+    const id = ctxMenu.id;
+    closeCtxMenu();
+    updateQuery((params) => { params.set("e", id); params.delete("manage"); params.delete("r"); });
+  }
+
+  function openContextGovernance() {
+    if (!ctxMenu) return;
+    const id = ctxMenu.id;
+    closeCtxMenu();
+    updateQuery((params) => { params.set("e", id); params.set("manage", "1"); params.delete("r"); });
   }
 
   function applyKnowledgeFilter(next: KnowledgeFilter) {
@@ -443,6 +502,10 @@
 
   function handleEscape(event: KeyboardEvent) {
     if (event.key !== "Escape") return;
+    if (ctxMenu) {
+      closeCtxMenu();
+      return;
+    }
     if (document.querySelector("dialog[open]")) return;
     if (relationId) closeRelation();
     else if (selected) closeEntity();
@@ -452,9 +515,45 @@
 <svelte:window onkeydown={handleEscape} />
 
 <div class="graph-main">
-  <!-- 点击实体或关系只打开附着式详情，不会重挂载画布。 -->
-  <div class="entity-stage" class:with-inspector={inspectorOpen}>
+  {#if graphFilter.mode === "note" && !debugFixtureRequested}
+    {#if noteGraphState.data.edges.length > 0 && noteGraphState.data.nodes.length >= 2}
+      <ForceGraph
+        nodes={noteGraphState.data.nodes}
+        edges={noteGraphState.data.edges}
+        onPick={(id) => pickNoteNode(id)}
+        query={graphFilter.query}
+        showLegend={false}
+      />
+    {:else if noteGraphState.data.nodes.length > 0}
+      <div class="placeholder">
+        <p class="ph-title">笔记之间还没有连接</p>
+        <p class="ph-desc">当两篇笔记提到同一个实体时，它们会在这里连成一条边。</p>
+      </div>
+    {:else if noteGraphState.status === "loading" || noteGraphState.status === "idle"}
+      <div class="placeholder"><p class="ph-title">文章视角</p><p class="ph-desc">正在按共享实体加载笔记关系。</p></div>
+    {:else if noteGraphState.status === "error"}
+      <div class="placeholder">
+        <p class="ph-title">文章图谱加载失败</p>
+        <p class="ph-desc">图谱索引失败不会影响笔记内容。</p>
+        <button class="empty-cta" onclick={() => noteGraphState.load()}>重新加载文章图谱</button>
+      </div>
+    {:else}
+      <div class="placeholder"><p class="ph-title">还没有进入图谱的笔记</p><p class="ph-desc">对笔记重新 Aing 后会按共享实体建立连接。</p></div>
+    {/if}
+  {:else}
+    <!-- 点击实体或关系只打开附着式详情，不会重挂载画布。 -->
+    <div class="entity-stage" class:with-inspector={inspectorOpen}>
       <div class="map-column">
+        <KnowledgeGraphToolbar
+          filter={knowledgeFilter}
+          kinds={availableKinds}
+          predicates={availablePredicates}
+          visibleCount={renderedNodes.length}
+          totalCount={filteredSemantic.nodes.length}
+          loading={semanticLoading}
+          onChange={applyKnowledgeFilter}
+          onCollapse={collapseGraph}
+        />
         <div class="canvas-shell" aria-label="知识图谱画布">
           {#if debugFixtureRequested}
             <div class="map-message debug-fixture" role="status">
@@ -497,6 +596,7 @@
               edges={renderedEdges}
               onPick={pickNode}
               onEdgePick={pickEdge}
+              onContextMenu={openCtxMenu}
               query={graphFilter.query}
               showLegend={false}
               resetKey={graphViewResetKey}
@@ -548,7 +648,7 @@
                 onChanged={refreshKnowledge}
                 onOpenRelation={openRelation}
                 resolveEntityName={(id) => entityNames.get(id)}
-                simple={true}
+                simple={!manageOpen}
               />
             {:else}
               <div class="inspector-state" aria-live="polite">
@@ -560,6 +660,7 @@
         </aside>
       {/if}
     </div>
+  {/if}
 </div>
 
 {#if !debugFixtureRequested}
@@ -570,12 +671,48 @@
   />
 {/if}
 
+{#if ctxMenu}
+  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+  <div class="menu-overlay" onclick={closeCtxMenu} oncontextmenu={(event) => { event.preventDefault(); closeCtxMenu(); }}></div>
+  <div class="ctx-menu" style:left={`${ctxMenu.x}px`} style:top={`${ctxMenu.y}px`} role="menu" aria-label={`治理 ${ctxMenu.name}`}>
+    <p>{ctxMenu.name}</p>
+    <button class="ctx-item" role="menuitem" onclick={openContextDetail}>查看实体详情</button>
+    <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>管理实体</button>
+  </div>
+{/if}
+
 <style>
   .graph-main, .entity-stage { height: 100%; min-width: 0; min-height: 0; }
   .graph-main { overflow: hidden; }
   .entity-stage { display: flex; background: var(--canvas); }
   .map-column { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
   .canvas-shell { flex: 1 1 auto; position: relative; min-width: 0; min-height: 0; }
+  .menu-overlay { position: fixed; inset: 0; z-index: 48; }
+  .ctx-menu {
+    position: fixed;
+    z-index: 49;
+    display: grid;
+    min-width: 180px;
+    padding: 6px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-lg);
+    background: var(--surface-press);
+    box-shadow: var(--shadow-popover);
+  }
+  .ctx-menu p { margin: 3px 8px 7px; color: var(--ink-faint); font-size: 0.7rem; }
+  .ctx-item {
+    min-height: 36px;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.82rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ctx-item:hover { background: var(--surface-soft); }
   .map-message {
     position: absolute;
     z-index: 9;

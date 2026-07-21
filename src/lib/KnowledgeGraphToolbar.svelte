@@ -8,10 +8,8 @@
     visibleCount,
     totalCount,
     loading = false,
-    showingAll = false,
     onChange,
     onCollapse,
-    onShowAll,
   }: {
     filter: KnowledgeFilter;
     kinds: { value: string; label: string }[];
@@ -19,10 +17,8 @@
     visibleCount: number;
     totalCount: number;
     loading?: boolean;
-    showingAll?: boolean;
     onChange: (filter: KnowledgeFilter) => void;
     onCollapse: () => void;
-    onShowAll: () => void;
   } = $props();
 
   const activeCount = $derived(
@@ -102,8 +98,8 @@
     </details>
 
     <details class="filter-menu date-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
-      <summary>有效时间{filter.from || filter.to ? " · 已设定" : ""}</summary>
-      <div class="date-fields">
+      <summary>更多{filter.from || filter.to || filter.include_history || filter.include_cooccurrence ? " · 已启用" : ""}</summary>
+      <div class="date-fields advanced-fields">
         <label>
           <span>开始日期</span>
           <input
@@ -121,28 +117,24 @@
             onchange={(event) => onChange({ ...filter, to: event.currentTarget.value || null })}
           />
         </label>
+        <label class="advanced-toggle">
+          <input
+            type="checkbox"
+            checked={filter.include_history}
+            onchange={(event) => onChange({ ...filter, include_history: event.currentTarget.checked })}
+          />
+          <span>包含历史关系</span>
+        </label>
+        <label class="advanced-toggle">
+          <input
+            type="checkbox"
+            checked={filter.include_cooccurrence}
+            onchange={(event) => onChange({ ...filter, include_cooccurrence: event.currentTarget.checked })}
+          />
+          <span>显示共同出现的弱连接</span>
+        </label>
       </div>
     </details>
-
-    <label class="inline-toggle">
-      <input
-        type="checkbox"
-        checked={filter.include_history}
-        onchange={(event) =>
-          onChange({ ...filter, include_history: event.currentTarget.checked })}
-      />
-      <span>{filter.include_history ? "包含历史关系" : "仅当前关系"}</span>
-    </label>
-
-    <label class="inline-toggle weak">
-      <input
-        type="checkbox"
-        checked={filter.include_cooccurrence}
-        onchange={(event) =>
-          onChange({ ...filter, include_cooccurrence: event.currentTarget.checked })}
-      />
-      <span>显示共现弱连接</span>
-    </label>
   </div>
 
   <div class="view-run">
@@ -153,9 +145,6 @@
       <button type="button" class="text-action" onclick={reset}>重置 {activeCount} 项筛选</button>
     {/if}
     <button type="button" class="text-action" onclick={onCollapse}>收起到主干</button>
-    <button type="button" class:active={showingAll} class="show-all" onclick={onShowAll}>
-      {showingAll ? "已显示全部" : "显示全部"}
-    </button>
   </div>
 </div>
 
@@ -181,7 +170,7 @@
   .filter-run { flex: none; flex-wrap: nowrap; }
   .view-run { flex: none; justify-content: flex-end; white-space: nowrap; }
   details { position: relative; }
-  summary, button, .inline-toggle {
+  summary, button {
     min-height: 32px;
     box-sizing: border-box;
     border: 1px solid var(--hairline);
@@ -199,7 +188,7 @@
   }
   summary::-webkit-details-marker { display: none; }
   summary::after { content: "⌄"; margin-left: 6px; color: var(--ink-faint); }
-  details[open] summary, summary:hover, button:hover, .inline-toggle:hover {
+  details[open] summary, summary:hover, button:hover {
     border-color: var(--hairline-strong);
     background: var(--surface-soft);
     color: var(--ink);
@@ -236,6 +225,7 @@
   input[type="checkbox"] { accent-color: var(--accent); }
   .date-fields { min-width: 220px; gap: 10px; padding: 12px; }
   .date-fields label { display: grid; gap: 5px; color: var(--ink-secondary); }
+  .date-fields .advanced-toggle { display: flex; align-items: center; gap: 8px; min-height: 34px; }
   .date-fields input {
     min-height: 36px;
     box-sizing: border-box;
@@ -246,18 +236,14 @@
     color: var(--ink);
     font: inherit;
   }
-  .inline-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; cursor: pointer; }
-  .weak { border-style: dashed; }
   button { padding: 5px 10px; cursor: pointer; }
   .text-action { border-color: transparent; }
-  .show-all { color: var(--accent); border-color: var(--accent-tint); }
-  .show-all.active { background: var(--accent-tint); }
   .view-count { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
   summary:focus-visible, button:focus-visible, label:has(input:focus-visible), input:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
   @media (pointer: coarse) {
-    summary, button, .inline-toggle, fieldset label, .date-fields input { min-height: 44px; }
+    summary, button, fieldset label, .date-fields input { min-height: 44px; }
   }
 </style>

@@ -650,10 +650,12 @@
   }
 
   function edgeLabelVisible(edge: (typeof snap.links)[number]): boolean {
-    if (edge.layer !== "semantic") return false;
+    if (edge.layer === "cooccurrence") {
+      return snap.links.length <= 40 || viewZoom >= 1.35 || hoveredEdge === edge.id || focusedEdge === edge.id;
+    }
     return (
-      visibleSemanticCount <= 30 ||
-      viewZoom >= 1.35 ||
+      visibleSemanticCount <= 80 ||
+      viewZoom >= 1.15 ||
       hoveredEdge === edge.id ||
       focusedEdge === edge.id ||
       focusedEdgeIds.has(edge.id)
@@ -667,7 +669,7 @@
     }
     if (hoveredEdge && hoveredEdge !== edge.id) return 0.16;
     if (dimLink(edge.a, edge.b)) return 0.12;
-    return edge.layer === "semantic" ? 0.92 : 0.58;
+    return edge.layer === "semantic" ? 1 : 0.78;
   }
 
   function nodeOpacity(id: string): number {
@@ -891,7 +893,7 @@
         orient="auto-start-reverse"
         markerUnits="userSpaceOnUse"
       >
-        <path d="M 0 1 L 9 5 L 0 9 z" fill="var(--ink-secondary)" />
+        <path d="M 0 1 L 9 5 L 0 9 z" fill="var(--accent)" />
       </marker>
     </defs>
     <!-- 空白背景:承接拖拽平移,铺在最外层原始坐标系(不随 view/fit 变换),保证任意
@@ -1053,13 +1055,13 @@
       {#if hasCooccurrenceEdges}
         <div class="edge-key-row">
           <span class="edge-sample cooccurrence-sample" aria-hidden="true"></span>
-          <span><strong>共同出现</strong><small>虚线只表示同篇笔记提到</small></span>
+          <span><strong>共同上下文</strong><small>虚线表示同篇提及或共享实体</small></span>
         </div>
       {/if}
     </div>
   {/if}
   {#if snap.nodes.length > ALL_LABELS_LIMIT && viewZoom < 2.2}
-    <div class="semantic-hint">滚轮放大显示更多名称 · 悬停探索相邻关系</div>
+    <div class="semantic-hint">点击节点逐层展开 · 滚轮放大显示更多名称</div>
   {/if}
   {#if expanded}
     <div class="trunc-bar">
@@ -1107,13 +1109,13 @@
   .fg.reduced .edge, .fg.reduced .nodes > g { transition: none; }
   .edge-line { fill: none; vector-effect: non-scaling-stroke; }
   .semantic-line {
-    stroke: var(--ink-secondary);
-    stroke-width: 2px;
+    stroke: var(--accent);
+    stroke-width: 2.75px;
   }
   .cooccurrence-line {
-    stroke: var(--hairline-strong);
-    stroke-width: 1.25px;
-    stroke-dasharray: 4 5;
+    stroke: var(--ink-secondary);
+    stroke-width: 1.75px;
+    stroke-dasharray: 5 5;
   }
   .edge-label-guide { fill: none; stroke: none; }
   .edge-hit, .edge-hover-target {
@@ -1132,11 +1134,11 @@
   .edge-label {
     fill: var(--ink);
     stroke: var(--canvas);
-    stroke-width: 3px;
+    stroke-width: 4px;
     paint-order: stroke fill;
     font-family: inherit;
-    font-size: 11px;
-    font-weight: 500;
+    font-size: 12px;
+    font-weight: 650;
     text-anchor: middle;
     letter-spacing: 0.015em;
     pointer-events: none;
@@ -1200,7 +1202,7 @@
   .edge-key strong { color: var(--ink); font-weight: 500; }
   .edge-key small { color: var(--ink-secondary); font-size: 10px; line-height: 1.35; }
   .edge-sample { position: relative; display: block; width: 32px; height: 0; }
-  .semantic-sample { border-top: 2px solid var(--ink-secondary); }
+  .semantic-sample { border-top: 3px solid var(--accent); }
   .semantic-sample::after {
     content: "";
     position: absolute;
@@ -1210,9 +1212,9 @@
     height: 0;
     border-top: 3px solid transparent;
     border-bottom: 3px solid transparent;
-    border-left: 6px solid var(--ink-secondary);
+    border-left: 6px solid var(--accent);
   }
-  .cooccurrence-sample { border-top: 1.5px dashed var(--hairline-strong); }
+  .cooccurrence-sample { border-top: 2px dashed var(--ink-secondary); }
   /* 规模控制条:说明文字(纯信息,不可点)+ 独立的药丸按钮群(可点),不再是一整块
      文字链接挤在一个胶囊里分不清哪段是说明哪段是按钮(冒烟反馈"很粗糙,不够精美")。
      每个按钮自成一个 hairline 描边药丸,跟侧栏「全局图谱」/「返回图谱」同一套

@@ -1,5 +1,8 @@
-// 图谱只共享日常需要的搜索与实体类型筛选。高级关系查询留在索引层，不占用浏览界面。
+export type GraphMode = "entity" | "note";
+
+// 侧栏与画布共享视角、搜索和实体类型，切换视角时两边始终同步。
 export class GraphFilterState {
+  mode = $state<GraphMode>("entity");
   kind = $state("all");
   query = $state("");
 }
