@@ -3726,13 +3726,26 @@ fn semantic_graph_debug_fixture_root(session_id: &str) -> Option<PathBuf> {
 }
 
 #[cfg(debug_assertions)]
-fn remove_semantic_graph_debug_fixture(session_id: &str) {
+fn remove_semantic_graph_debug_fixture(session_id: &str) -> Result<(), String> {
     let root = semantic_graph_debug_sessions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(session_id);
-    if let Some(root) = root {
-        let _ = std::fs::remove_dir_all(root);
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let owned_temp_root = root.parent() == Some(std::env::temp_dir().as_path())
+        && root.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with("aing-semantic-fixture-")
+        });
+    if !owned_temp_root {
+        return Err("拒绝删除非调试夹具临时目录".to_string());
+    }
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除隔离调试夹具失败:{error}")),
     }
 }
 
@@ -3803,6 +3816,14 @@ fn semantic_graph_debug_relation_detail(
         .ok_or_else(|| "隔离调试夹具会话不存在或已过期".to_string())?;
     graph::query::relation_detail(&fixture_root, &relation_id)
         .map_err(|error| format!("读取隔离夹具关系证据失败:{error:#}"))
+}
+
+/// Debug-only cleanup. The client supplies only the opaque token; the server
+/// resolves and validates its own mapped temp root before deleting anything.
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn semantic_graph_debug_release(session_id: String) -> Result<(), String> {
+    remove_semantic_graph_debug_fixture(&session_id)
 }
 
 #[cfg(target_os = "macos")]
@@ -4022,6 +4043,8 @@ pub fn run() {
             semantic_graph_debug_fixture,
             #[cfg(debug_assertions)]
             semantic_graph_debug_relation_detail,
+            #[cfg(debug_assertions)]
+            semantic_graph_debug_release,
             apply_knowledge_operation,
             split_entity,
             merge_entities,
@@ -4316,16 +4339,34 @@ mod tests {
         assert!(source.contains(
             "#[cfg(debug_assertions)]\n            semantic_graph_debug_relation_detail,"
         ));
+        assert!(source.contains(
+            "#[cfg(debug_assertions)]\n            semantic_graph_debug_release,"
+        ));
         assert!(source.contains("fn semantic_graph_debug_fixture()"));
         assert!(source.contains("fn semantic_graph_debug_relation_detail("));
+        assert!(source.contains("fn semantic_graph_debug_release(session_id: String)"));
+
+        let real_sentinel = configured_root.path().join("real-library-sentinel");
+        std::fs::write(&real_sentinel, b"must survive debug release").unwrap();
+        super::semantic_graph_debug_release(configured_root.path().display().to_string()).unwrap();
+        assert!(
+            real_sentinel.exists(),
+            "opaque session IDs must never be treated as paths"
+        );
 
         let replacement = super::semantic_graph_debug_fixture().unwrap();
         assert!(super::semantic_graph_debug_fixture_root(&fixture.session_id).is_none());
         assert!(!root.exists(), "replaced server-owned fixture root must be deleted");
         let replacement_root =
             super::semantic_graph_debug_fixture_root(&replacement.session_id).unwrap();
-        super::remove_semantic_graph_debug_fixture(&replacement.session_id);
+        super::semantic_graph_debug_release(replacement.session_id.clone()).unwrap();
+        assert!(super::semantic_graph_debug_fixture_root(&replacement.session_id).is_none());
         assert!(!replacement_root.exists(), "released fixture root must be deleted");
+        super::semantic_graph_debug_release(replacement.session_id).unwrap();
+        assert!(
+            real_sentinel.exists(),
+            "repeated release must remain harmless to real data"
+        );
     }
 
     #[test]

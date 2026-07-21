@@ -6,6 +6,7 @@ import {
   GLOBAL_SEMANTIC_PRESENCE_FILTER,
   NORMAL_GRAPH_ALPHA_DECAY,
   canonicalPathEdgeId,
+  createDebugFixtureReleaseOnce,
   defaultBackbone,
   debugKnowledgeRoutePolicy,
   ensureBackboneEdge,
@@ -65,6 +66,20 @@ describe("debug fixture route isolation", () => {
     expect(debugKnowledgeRoutePolicy(fixtureClick, true, true, true).relationId).toBe(
       "fixture-relation",
     );
+  });
+
+  it("releases an opaque fixture session at most once", async () => {
+    const release = vi.fn(async (_sessionId: string) => {});
+    const releaseOnce = createDebugFixtureReleaseOnce(release);
+
+    await Promise.all([
+      releaseOnce("fixture-session"),
+      releaseOnce("fixture-session"),
+      releaseOnce(null),
+    ]);
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith("fixture-session");
   });
 });
 
@@ -615,6 +630,14 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("const fixture = await semanticGraphDebugFixture()");
     expect(route).toContain("debugFixtureSession = fixture.session_id");
     expect(route).toContain("semanticGraphDebugRelationDetail");
+    expect(route).toContain('import { onDestroy, onMount } from "svelte"');
+    expect(route).toContain("const releaseDebugFixtureOnce = createDebugFixtureReleaseOnce(");
+    expect(route).toContain("onDestroy(() => {");
+    expect(route).toContain("debugFixtureDisposed = true");
+    expect(route).toContain("debugFixtureSession = null");
+    expect(route).toContain("void releaseDebugFixtureOnce(session)");
+    expect(route).toContain("if (debugFixtureDisposed) {");
+    expect(route).toContain("await releaseDebugFixtureOnce(fixture.session_id)");
     expect(route).toContain("debugFixtureSession && relationId");
     expect(route).toContain("relationLoader={loadDebugRelationDetail}");
     expect(route).toContain("readOnly={true}");
@@ -624,7 +647,9 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("仅创建并读取临时夹具，不会读取或修改真实资料库");
     expect(knowledge).toContain('invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture")');
     expect(knowledge).toContain('invoke<RelationDetail | null>("semantic_graph_debug_relation_detail"');
+    expect(knowledge).toContain('invoke<void>("semantic_graph_debug_release", { sessionId })');
     expect(knowledge).not.toMatch(/semanticGraphDebugFixture\s*=\s*\([^)]*(root|path)/);
+    expect(knowledge).not.toMatch(/semanticGraphDebugRelease\s*=\s*\([^)]*(root|path)/);
     expect(knowledge).not.toContain("fixture_root");
     expect(drawer).toContain("relationLoader");
     expect(drawer).toContain("resolveEntityName");
