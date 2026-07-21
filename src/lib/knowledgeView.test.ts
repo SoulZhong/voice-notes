@@ -420,3 +420,88 @@ describe("pathEmphasis", () => {
     expect(pathEmphasis(null)).toEqual({ nodeIds: new Set(), edgeIds: new Set() });
   });
 });
+
+describe("exploratory graph UI source contract", () => {
+  const sources = import.meta.glob(
+    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
+    { eager: true, query: "?raw", import: "default" },
+  ) as Record<string, string>;
+  const source = (name: string) => {
+    const value = sources[name];
+    if (value === undefined) throw new Error(`Missing source fixture: ${name}`);
+    return value;
+  };
+
+  it("renders semantic foreground edges with stable directed paths and whole labels", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain('marker-end="url(#semantic-arrow)"');
+    expect(forceGraph).toContain("<textPath");
+    expect(forceGraph).toContain("edgePathId(");
+    expect(forceGraph).toContain("character.codePointAt(0)!.toString(16)");
+    expect(forceGraph).toContain("edge.x1 === edge.x2 && edge.y1 <= edge.y2");
+    expect(forceGraph).toContain("edgeLabelVisible(");
+    expect(forceGraph).toContain("visibleSemanticCount <= 30");
+    expect(forceGraph).toContain("viewZoom >= 1.35");
+    expect(forceGraph).toContain('class:cooccurrence={l.layer === "cooccurrence"}');
+    expect(forceGraph).not.toContain("text-overflow: ellipsis");
+    expect(forceGraph).not.toContain("line-clamp");
+  });
+
+  it("keeps complete centered wrapped node names on the vertex", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain('class="node-label"');
+    expect(forceGraph).toContain('text-anchor: middle');
+    expect(forceGraph).toContain("wrapLabel(name");
+    expect(forceGraph).toContain("n.labelLines as line");
+    expect(forceGraph).not.toMatch(/slice\([^\n]*name|substring\([^\n]*name/);
+    expect(forceGraph).not.toContain('class="node-label-box"');
+  });
+
+  it("preserves legacy callers and exposes focus/edge/reduced-motion props", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain("RenderEdge[] | EdgeRow[]");
+    expect(forceGraph).toContain("onEdgePick?:");
+    expect(forceGraph).toContain("focusedNodeIds?: Set<string>");
+    expect(forceGraph).toContain("focusedEdgeIds?: Set<string>");
+    expect(forceGraph).toContain("reducedMotion?: boolean");
+    expect(forceGraph).toContain("normalizeEdges(");
+  });
+
+  it("retains unrelated path context at fifteen percent instead of deleting it", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain("focusedEdgeIds.size > 0");
+    expect(forceGraph).toContain("focusedNodeIds.size > 0");
+    expect(forceGraph).toMatch(/return\s+0\.15/);
+  });
+
+  it("offers complete filters, deterministic reveal controls, and honest fallback", () => {
+    const toolbar = source("./KnowledgeGraphToolbar.svelte");
+    const route = source("../routes/graph/+page.svelte");
+    for (const label of ["实体类型", "关系类型", "开始日期", "结束日期", "包含历史关系", "显示共现弱连接", "收起到主干", "显示全部"]) {
+      expect(toolbar).toContain(label);
+    }
+    expect(route).toContain("semanticGraph(");
+    expect(route).toContain("defaultBackbone(");
+    expect(route).toContain("nextExpandedIds(");
+    expect(route).toContain("visibleIds = new Set([...visibleIds, ...matches])");
+    expect(route).toContain("尚未补建语义关系");
+    expect(route).toContain("补建语义关系");
+    expect(route).toContain('class="canvas-shell"');
+    expect(route).toContain("<EntityGovernance");
+  });
+
+  it("guards two-point paths against stale responses and exposes accessible evidence steps", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const panel = source("./KnowledgePathPanel.svelte");
+    expect(route).toContain("pathGeneration");
+    expect(route).toContain("generation !== pathGeneration");
+    expect(route).toContain("knowledgePath(");
+    expect(route).toContain("include_cooccurrence: includeWeak");
+    expect(route).toContain('class="accessible-network"');
+    for (const label of ["设为路径起点", "包含共现弱连接", "查看关系证据", "未找到可连接两点的路径"]) {
+      expect(route + panel).toContain(label);
+    }
+    expect(panel).not.toContain("…");
+    expect(panel).not.toMatch(/\.\.\.(?=["'`<])/);
+  });
+});

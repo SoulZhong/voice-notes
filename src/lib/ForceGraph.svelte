@@ -1,23 +1,28 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, forceX, forceY, type Simulation } from "d3-force";
-  import { kindInk, kindLabel, type EntitySummary, type EdgeRow } from "$lib/graph";
+  import { kindInk, kindLabel, type EntitySummary, type EdgeRow, type RenderEdge } from "$lib/graph";
   import { speakerInk } from "$lib/notes";
 
   let {
     nodes: allNodes,
     edges: allEdges,
     onPick,
+    onEdgePick,
     onContextMenu,
     maxNodes = 60,
     minEdgeWeight = 2,
     backboneK = 3,
     query,
     showLegend = true,
+    focusedNodeIds = new Set<string>(),
+    focusedEdgeIds = new Set<string>(),
+    reducedMotion,
   }: {
     nodes: EntitySummary[];
-    edges: EdgeRow[];
+    edges: RenderEdge[] | EdgeRow[];
     onPick: (id: string, isPerson: boolean) => void;
+    onEdgePick?: (id: string, layer: "semantic" | "cooccurrence") => void;
     /** 右键节点(改名等次要操作入口);不传则节点不响应右键,走浏览器默认菜单。 */
     onContextMenu?: (id: string, name: string, isPerson: boolean, clientX: number, clientY: number) => void;
     /** 规模封顶(默认给全局图用);实体详情页的小型关系图会传更小的值。用户点「显示全部」
@@ -32,6 +37,9 @@
     query?: string;
     /** kind 图例开关;文章视角(节点全是笔记、单一类型)传 false,图例无信息量。 */
     showLegend?: boolean;
+    focusedNodeIds?: Set<string>;
+    focusedEdgeIds?: Set<string>;
+    reducedMotion?: boolean;
   } = $props();
 
   interface SimNode extends EntitySummary {
@@ -47,12 +55,38 @@
     showLabelByDefault?: boolean;
     collisionR?: number;
   }
-  type SimLink = { source: SimNode; target: SimNode; weight: number };
+  type SimLink = Omit<RenderEdge, "a" | "b"> & {
+    a: string;
+    b: string;
+    source: SimNode;
+    target: SimNode;
+  };
+
+  function normalizeEdges(edges: RenderEdge[] | EdgeRow[]): RenderEdge[] {
+    return edges.map((edge) => {
+      if ("layer" in edge) return { ...edge };
+      const [a, b] = edge.a <= edge.b ? [edge.a, edge.b] : [edge.b, edge.a];
+      return {
+        id: `co:${a}:${b}`,
+        a,
+        b,
+        weight: edge.weight,
+        layer: "cooccurrence" as const,
+        label: `共同出现（${edge.weight} 篇）`,
+        directed: false,
+        confidence: null,
+        status: null,
+      };
+    });
+  }
+
+  const normalizedEdges = $derived(normalizeEdges(allEdges));
 
   let container = $state<HTMLDivElement>();
   let width = $state(800);
   let height = $state(560);
   let hovered = $state<string | null>(null);
+  let hoveredEdge = $state<string | null>(null);
   let truncated = $state(0);
   /** 用户点了「显示全部」:build() 里忽略 maxNodes/minEdgeWeight/backboneK 的封顶,
       画出这份数据里全部有共现边的实体。 */
@@ -78,7 +112,7 @@
       labelRank: number;
       showLabelByDefault: boolean;
     }[];
-    links: { aid: string; bid: string; x1: number; y1: number; x2: number; y2: number; w: number }[];
+    links: (RenderEdge & { x1: number; y1: number; x2: number; y2: number; r1: number; r2: number })[];
   }>({ nodes: [], links: [] });
 
   // 镜头变换(用户手动缩放/平移,叠在 fit 自适应变换之外的第二层):滚轮缩放围绕光标、
@@ -208,7 +242,9 @@
     const effBackboneK = growing ? Math.max(6, backboneK) : backboneK;
     // 只用「权重≥effMinWeight」的强边定种子:度数、选点都基于强边,骨架图不被
     // 大量弱共现噪声撑大。
-    const strong = allEdges.filter((e) => e.weight >= effMinWeight);
+    const strong = normalizedEdges.filter(
+      (edge) => edge.layer === "semantic" || edge.weight >= effMinWeight,
+    );
     const deg = new Set<string>();
     for (const e of strong) {
       deg.add(e.a);
@@ -236,7 +272,7 @@
         let frontier = idset;
         for (let h = 0; h < expandHops && idset.size < 2000; h++) {
           const byNode = new Map<string, { id: string; w: number }[]>();
-          for (const e of allEdges) {
+          for (const e of normalizedEdges) {
             if (frontier.has(e.a) && !idset.has(e.b)) {
               const arr = byNode.get(e.a) ?? [];
               arr.push({ id: e.b, w: e.weight });
@@ -263,7 +299,7 @@
         // 展开态的"还有多少"改按全量边(不局限强边)的度数论域算——种子阶段的
         // strong 论域跟这里不是一回事。
         const universeDeg = new Set<string>();
-        for (const e of allEdges) {
+        for (const e of normalizedEdges) {
           universeDeg.add(e.a);
           universeDeg.add(e.b);
         }
@@ -297,10 +333,10 @@
     const byId = new Map(dNodes.map((n) => [n.id, n]));
     // 已经放宽/展开了就不再局限于强边——节点都决定要画出来了,哪怕只共享 1 篇笔记
     // 也该连起来,不然图会显得比实际更散(也是本节点跟主团断联的一个常见成因)。
-    const edgePool = growing ? allEdges : strong;
+    const edgePool = growing ? normalizedEdges : strong;
     let candLinks = edgePool
       .filter((e) => idset.has(e.a) && idset.has(e.b))
-      .map((e) => ({ source: byId.get(e.a)!, target: byId.get(e.b)!, weight: e.weight }));
+      .map((edge) => ({ ...edge, source: byId.get(edge.a)!, target: byId.get(edge.b)! }));
     // 稀疏化 backbone:每个节点只保留最强的 backboneK 条边(union),把超密共现图收成可读骨架。
     const perNode = new Map<string, { l: SimLink; w: number }[]>();
     for (const l of candLinks) {
@@ -314,7 +350,13 @@
     for (const [, arr] of perNode) {
       arr.sort((a, b) => b.w - a.w).slice(0, effBackboneK).forEach((x) => keep.add(x.l));
     }
-    dLinks = candLinks.filter((l) => keep.has(l));
+    dLinks = candLinks
+      .filter((link) => keep.has(link))
+      .sort(
+        (left, right) =>
+          (left.layer === right.layer ? 0 : left.layer === "cooccurrence" ? -1 : 1) ||
+          left.id.localeCompare(right.id),
+      );
   }
 
   function refreshSnap() {
@@ -335,13 +377,21 @@
         showLabelByDefault: n.showLabelByDefault ?? true,
       })),
       links: dLinks.map((l) => ({
-        aid: l.source.id,
-        bid: l.target.id,
+        id: l.id,
+        a: l.a,
+        b: l.b,
+        layer: l.layer,
+        label: l.label,
+        directed: l.directed,
+        confidence: l.confidence,
+        status: l.status,
+        weight: l.weight,
         x1: l.source.x ?? 0,
         y1: l.source.y ?? 0,
         x2: l.target.x ?? 0,
         y2: l.target.y ?? 0,
-        w: l.weight,
+        r1: l.source.r ?? MIN_R,
+        r2: l.target.r ?? MIN_R,
       })),
     };
   }
@@ -368,7 +418,7 @@
     viewY = 0;
     build();
     heavy = dNodes.length > 150 || dLinks.length > 800;
-    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const reduce = reducedMotion ?? window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
     // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
     // 跟主团完全没有边连接的孤岛,互斥力(charge)会把它们越推越远,越推越飘。
@@ -457,6 +507,7 @@
     void maxNodes;
     void minEdgeWeight;
     void backboneK;
+    void reducedMotion;
     void expanded;
     void expandHops;
     if (container) rebuild();
@@ -469,14 +520,69 @@
     if (!hovered) return null;
     const s = new Set<string>([hovered]);
     for (const l of snap.links) {
-      if (l.aid === hovered) s.add(l.bid);
-      if (l.bid === hovered) s.add(l.aid);
+      if (l.a === hovered) s.add(l.b);
+      if (l.b === hovered) s.add(l.a);
     }
     return s;
   });
   const dimNode = (id: string) => neighbors !== null && !neighbors.has(id);
   const dimLink = (aid: string, bid: string) =>
     hovered !== null && aid !== hovered && bid !== hovered;
+
+  const visibleSemanticCount = $derived(
+    snap.links.filter((edge) => edge.layer === "semantic").length,
+  );
+
+  function edgePathId(id: string, label = false): string {
+    const encoded = Array.from(id)
+      .map((character) => character.codePointAt(0)!.toString(16))
+      .join("-");
+    return `${label ? "edge-label" : "edge-path"}-${encoded}`;
+  }
+
+  function edgePath(edge: (typeof snap.links)[number]): string {
+    const dx = edge.x2 - edge.x1;
+    const dy = edge.y2 - edge.y1;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const startInset = Math.min(edge.r1 + 2, length * 0.3);
+    const endInset = Math.min(edge.r2 + (edge.directed ? 8 : 2), length * 0.34);
+    return `M ${edge.x1 + (dx / length) * startInset} ${edge.y1 + (dy / length) * startInset} L ${edge.x2 - (dx / length) * endInset} ${edge.y2 - (dy / length) * endInset}`;
+  }
+
+  function edgeLabelPath(edge: (typeof snap.links)[number]): string {
+    const readsForward = edge.x1 < edge.x2 || (edge.x1 === edge.x2 && edge.y1 <= edge.y2);
+    return readsForward
+      ? `M ${edge.x1} ${edge.y1} L ${edge.x2} ${edge.y2}`
+      : `M ${edge.x2} ${edge.y2} L ${edge.x1} ${edge.y1}`;
+  }
+
+  function edgeLabelVisible(edge: (typeof snap.links)[number]): boolean {
+    if (edge.layer !== "semantic") return false;
+    return (
+      visibleSemanticCount <= 30 ||
+      viewZoom >= 1.35 ||
+      hoveredEdge === edge.id ||
+      focusedEdgeIds.has(edge.id)
+    );
+  }
+
+  function edgeOpacity(edge: (typeof snap.links)[number]): number {
+    if (focusedEdgeIds.size > 0) {
+      if (focusedEdgeIds.has(edge.id)) return 0.94;
+      return 0.15;
+    }
+    if (hoveredEdge && hoveredEdge !== edge.id) return 0.16;
+    if (dimLink(edge.a, edge.b)) return 0.12;
+    return edge.layer === "semantic" ? 0.72 : 0.2;
+  }
+
+  function nodeOpacity(id: string): number {
+    if (focusedNodeIds.size > 0) {
+      if (focusedNodeIds.has(id)) return 1;
+      return 0.15;
+    }
+    return dimNode(id) || dimForSearch(id) ? 0.22 : 1;
+  }
 
   // 搜索命中(名字/别名子串,大小写不敏感,与侧栏列表同一套匹配规则):命中节点画布上
   // 高亮描边+其余淡化,只在当前已渲染的节点里找——被封顶挤掉的实体点「显示全部」才够得着。
@@ -668,6 +774,20 @@
 
 <div class="fg" bind:this={container}>
   <svg {width} {height} role="img" aria-label="知识图谱力导向图" onwheel={onWheel}>
+    <defs>
+      <marker
+        id="semantic-arrow"
+        viewBox="0 0 10 10"
+        refX="8"
+        refY="5"
+        markerWidth="7"
+        markerHeight="7"
+        orient="auto-start-reverse"
+        markerUnits="userSpaceOnUse"
+      >
+        <path d="M 0 1 L 9 5 L 0 9 z" fill="var(--accent)" />
+      </marker>
+    </defs>
     <!-- 空白背景:承接拖拽平移,铺在最外层原始坐标系(不随 view/fit 变换),保证任意
          缩放级别下都能覆盖满整个视口。 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -686,19 +806,58 @@
     <g transform="translate({viewX},{viewY}) scale({viewZoom})">
       <g transform="translate({fit.tx},{fit.ty}) scale({fit.scale})">
         <g class="edges">
-          {#each snap.links as l (l.aid + "-" + l.bid)}
-            <!-- 边粗细=关系强弱(共享笔记数),连续映射而非固定档;title 给 hover 原生提示;
-                 non-scaling-stroke 防 fit 缩放把线宽也跟着放大失真 -->
-            <line
-              x1={l.x1}
-              y1={l.y1}
-              x2={l.x2}
-              y2={l.y2}
-              stroke="var(--hairline-strong)"
-              stroke-width={Math.min(5, 0.5 + l.w * 0.7)}
-              opacity={dimLink(l.aid, l.bid) ? 0.06 : 0.35}
-              vector-effect="non-scaling-stroke"
-            ><title>共享 {l.w} 篇笔记</title></line>
+          {#each snap.links as l (l.id)}
+            <g
+              class="edge"
+              role="group"
+              aria-label={l.label}
+              class:semantic={l.layer === "semantic"}
+              class:cooccurrence={l.layer === "cooccurrence"}
+              opacity={edgeOpacity(l)}
+              onmouseenter={() => (hoveredEdge = l.id)}
+              onmouseleave={() => (hoveredEdge = null)}
+            >
+              {#if l.layer === "semantic"}
+                <path
+                  id={edgePathId(l.id)}
+                  class="edge-line semantic-line"
+                  d={edgePath(l)}
+                  marker-end="url(#semantic-arrow)"
+                  vector-effect="non-scaling-stroke"
+                />
+              {:else}
+                <path
+                  id={edgePathId(l.id)}
+                  class="edge-line cooccurrence-line"
+                  d={edgePath(l)}
+                  vector-effect="non-scaling-stroke"
+                />
+              {/if}
+              <path
+                id={edgePathId(l.id, true)}
+                class="edge-label-guide"
+                d={edgeLabelPath(l)}
+              />
+              <path
+                class="edge-hit"
+                d={edgePath(l)}
+                role="button"
+                tabindex={onEdgePick ? 0 : -1}
+                aria-label={`${l.label}，${l.layer === "semantic" ? "语义关系" : "共现弱连接"}`}
+                onclick={() => onEdgePick?.(l.id, l.layer)}
+                onkeydown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onEdgePick?.(l.id, l.layer);
+                  }
+                }}
+              ><title>{l.label}</title></path>
+              {#if edgeLabelVisible(l)}
+                <text class="edge-label">
+                  <textPath href={`#${edgePathId(l.id, true)}`} startOffset="50%">{l.label}</textPath>
+                </text>
+              {/if}
+            </g>
           {/each}
         </g>
         <g class="nodes">
@@ -706,13 +865,22 @@
             <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
             <g
               transform="translate({n.x},{n.y})"
-              opacity={dimNode(n.id) || dimForSearch(n.id) ? 0.22 : 1}
+              opacity={nodeOpacity(n.id)}
               style="cursor:pointer"
+              role="button"
+              tabindex="0"
+              aria-label={`${n.name}，${kindLabel(n.kind)}`}
               onpointerdown={(e) => onDown(n.id, e)}
               onpointermove={onMove}
               onpointerup={() => onUp(n.id, n.is_person)}
               onmouseenter={() => (hovered = n.id)}
               onmouseleave={() => (hovered = null)}
+              onkeydown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onPick(n.id, n.is_person);
+                }
+              }}
               oncontextmenu={(e) => {
                 if (!onContextMenu) return;
                 e.preventDefault();
@@ -805,6 +973,41 @@
   .fg { position: relative; height: 100%; overflow: hidden; }
   svg { display: block; touch-action: none; }
   .bg { cursor: grab; }
+  .edge { transition: opacity 240ms cubic-bezier(0.25, 1, 0.5, 1); }
+  .edge-line { fill: none; vector-effect: non-scaling-stroke; }
+  .semantic-line {
+    stroke: var(--accent);
+    stroke-width: 1.35px;
+  }
+  .cooccurrence-line {
+    stroke: var(--hairline-strong);
+    stroke-width: 0.8px;
+    stroke-dasharray: 3 5;
+  }
+  .edge-label-guide { fill: none; stroke: none; }
+  .edge-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 12px;
+    vector-effect: non-scaling-stroke;
+    cursor: pointer;
+  }
+  .edge-hit:focus-visible {
+    stroke: var(--accent-tint);
+    outline: none;
+  }
+  .edge-label {
+    fill: var(--ink-secondary);
+    stroke: var(--canvas);
+    stroke-width: 3px;
+    paint-order: stroke fill;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 560;
+    text-anchor: middle;
+    letter-spacing: 0.015em;
+    pointer-events: none;
+  }
   .node-halo { opacity: 0.2; }
   .node-marker {
     stroke: var(--surface);
@@ -825,6 +1028,9 @@
     letter-spacing: 0.01em;
   }
   .nodes > g:hover .node-label text { font-weight: 750; }
+  .nodes > g { transition: opacity 240ms cubic-bezier(0.25, 1, 0.5, 1); }
+  .nodes > g:focus-visible { outline: none; }
+  .nodes > g:focus-visible .node-halo { opacity: 1; stroke-width: 2.5px; }
   .semantic-hint {
     position: absolute;
     top: 12px;
@@ -923,12 +1129,13 @@
     flex: none;
   }
   .legend-dot-person {
-    background: conic-gradient(
-      var(--tint-sky-ink),
-      var(--tint-mint-ink),
-      var(--tint-rose-ink),
-      var(--tint-lavender-ink),
-      var(--tint-sky-ink)
-    );
+    background: var(--ink-faint);
+  }
+  @media (pointer: coarse) {
+    .edge-hit { stroke-width: 18px; }
+    .trunc-action { min-height: 44px; padding-inline: 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .edge, .nodes > g { transition-duration: 0.01ms; }
   }
 </style>

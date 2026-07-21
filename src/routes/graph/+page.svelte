@@ -2,53 +2,178 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, type GraphData } from "$lib/graph";
+  import { graphData, kindLabel, type GraphData, type RenderEdge } from "$lib/graph";
   import {
+    knowledgePath,
     pendingReview,
     semanticEntityDetail,
+    semanticGraph,
+    type KnowledgeFilter,
+    type KnowledgePath,
     type PendingReviewItem,
     type SemanticEntityDetail,
+    type SemanticGraphData,
   } from "$lib/knowledge";
-  import { DEFAULT_KNOWLEDGE_FILTER } from "$lib/knowledgeView";
+  import {
+    DEFAULT_KNOWLEDGE_FILTER,
+    defaultBackbone,
+    filterSemanticGraph,
+    nextExpandedIds,
+    pathEmphasis,
+    relationLabel,
+    viewEdges,
+  } from "$lib/knowledgeView";
   import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
   import ForceGraph from "$lib/ForceGraph.svelte";
+  import KnowledgeGraphToolbar from "$lib/KnowledgeGraphToolbar.svelte";
+  import KnowledgePathPanel from "$lib/KnowledgePathPanel.svelte";
   import EntityGovernance from "$lib/EntityGovernance.svelte";
   import PendingReviewPanel from "$lib/PendingReviewPanel.svelte";
   import RelationDrawer from "$lib/RelationDrawer.svelte";
 
+  const emptySemantic = (): SemanticGraphData => ({
+    nodes: [],
+    semantic_edges: [],
+    cooccurrence_edges: [],
+    degraded: false,
+    message: null,
+  });
+
   let graph = $state<GraphData>({ nodes: [], edges: [] });
+  let semantic = $state<SemanticGraphData>(emptySemantic());
+  let knowledgeFilter = $state<KnowledgeFilter>({
+    ...DEFAULT_KNOWLEDGE_FILTER,
+    entity_kinds: graphFilter.kind === "all" ? [] : [graphFilter.kind],
+  });
+  let visibleIds = $state<Set<string>>(new Set());
+  let showingAll = $state(false);
+  let expansionDepth = $state<Map<string, number>>(new Map());
   let loaded = $state(false);
+  let semanticLoading = $state(false);
+  let semanticError = $state("");
+  let predicateCatalog = $state<Map<string, string>>(new Map());
   let detail = $state<SemanticEntityDetail | null>(null);
   let detailLoading = $state(false);
   let detailError = $state("");
   let pendingItems = $state<PendingReviewItem[]>([]);
   let ctxMenu = $state<{ id: string; name: string; isPerson: boolean; x: number; y: number } | null>(null);
   let detailGeneration = 0;
+  let graphGeneration = 0;
+  let pathGeneration = 0;
+  let pathStart = $state<string | null>(null);
+  let pathEnd = $state<string | null>(null);
+  let activePath = $state<KnowledgePath | null>(null);
+  let pathStatus = $state<"idle" | "choosing" | "loading" | "ready" | "empty" | "error">("idle");
+  let pathError = $state("");
+  let includeWeakPath = $state(false);
+  let lastSidebarKind = graphFilter.kind;
+  let lastRequestedPathStart: string | null = null;
 
   const selected = $derived($page.url.searchParams.get("e"));
   const reviewOpen = $derived($page.url.searchParams.get("review") === "1");
   const relationId = $derived($page.url.searchParams.get("r"));
+  const requestedPathStart = $derived($page.url.searchParams.get("pathStart"));
   const inspectorOpen = $derived(Boolean(selected || reviewOpen || relationId));
   const detailFilter = { ...DEFAULT_KNOWLEDGE_FILTER, include_history: true };
+  const effectiveGraphFilter = $derived<KnowledgeFilter>({
+    ...knowledgeFilter,
+    include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
+  });
 
-  const filteredGraph = $derived.by(() => {
-    if (graphFilter.kind === "all") return graph;
-    const keep = new Set(graph.nodes.filter((node) => node.kind === graphFilter.kind).map((node) => node.id));
+  const usableSemantic = $derived.by((): SemanticGraphData => {
+    if (semantic.semantic_edges.length > 0 || semantic.cooccurrence_edges.length > 0) {
+      return semantic;
+    }
     return {
-      nodes: graph.nodes.filter((node) => keep.has(node.id)),
-      edges: graph.edges.filter((edge) => keep.has(edge.a) && keep.has(edge.b)),
+      ...semantic,
+      nodes: semantic.nodes.length > 0 ? semantic.nodes : graph.nodes,
+      cooccurrence_edges: graph.edges,
     };
   });
+  const filteredSemantic = $derived(filterSemanticGraph(usableSemantic, effectiveGraphFilter));
+  const renderedNodes = $derived(filteredSemantic.nodes.filter((node) => visibleIds.has(node.id)));
+  const renderedEdges = $derived(
+    viewEdges(usableSemantic, effectiveGraphFilter).filter(
+      (edge) => visibleIds.has(edge.a) && visibleIds.has(edge.b),
+    ),
+  );
+  const pathFocus = $derived(pathEmphasis(activePath));
+  const semanticFallback = $derived(
+    loaded && filteredSemantic.semantic_edges.length === 0 && filteredSemantic.cooccurrence_edges.length > 0,
+  );
+  const entityNames = $derived(
+    new Map([...graph.nodes, ...semantic.nodes].map((node) => [node.id, node.name])),
+  );
+  const availableKinds = $derived.by(() => {
+    const values = new Set([...graph.nodes, ...semantic.nodes].map((node) => node.kind));
+    return [...values].sort().map((value) => ({ value, label: kindLabel(value) }));
+  });
+  const availablePredicates = $derived.by(() => {
+    return [...predicateCatalog]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([value, label]) => ({ value, label }));
+  });
+  const accessibleNodes = $derived.by(() => {
+    const query = graphFilter.query.trim().toLowerCase();
+    const nodes = renderedNodes.filter(
+      (node) => !query || node.name.toLowerCase().includes(query) || node.aliases.some((alias) => alias.toLowerCase().includes(query)),
+    );
+    return nodes.sort((left, right) => right.note_count - left.note_count || left.name.localeCompare(right.name));
+  });
+
+  function initialIds(data: SemanticGraphData): Set<string> {
+    const filtered = filterSemanticGraph(data, knowledgeFilter);
+    const semanticIds = defaultBackbone(filtered, 80, 3);
+    if (semanticIds.size > 0) return semanticIds;
+    return new Set(
+      [...filtered.nodes]
+        .sort((left, right) => right.note_count - left.note_count || left.id.localeCompare(right.id))
+        .slice(0, 80)
+        .map((node) => node.id),
+    );
+  }
 
   async function loadGraph() {
     try {
       graph = await graphData();
+      if (semantic.nodes.length === 0 && visibleIds.size === 0) visibleIds = initialIds(usableSemantic);
     } catch {
       graph = { nodes: [], edges: [] };
     } finally {
       loaded = true;
+    }
+  }
+
+  async function loadSemantic(filter: KnowledgeFilter) {
+    const generation = ++graphGeneration;
+    semanticLoading = true;
+    semanticError = "";
+    try {
+      const value = await semanticGraph(filter);
+      if (generation !== graphGeneration) return;
+      semantic = value;
+      const nextPredicates = new Map(predicateCatalog);
+      for (const edge of value.semantic_edges) {
+        nextPredicates.set(edge.predicate_type, relationLabel(edge));
+      }
+      predicateCatalog = nextPredicates;
+      semanticError = value.degraded ? value.message ?? "语义索引当前处于降级状态。" : "";
+      const filtered = filterSemanticGraph(value, filter);
+      if (showingAll) visibleIds = new Set(filtered.nodes.map((node) => node.id));
+      else visibleIds = initialIds(value);
+      if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
+      expansionDepth = new Map();
+    } catch (cause) {
+      if (generation !== graphGeneration) return;
+      semanticError = `语义关系读取失败：${cause instanceof Error ? cause.message : String(cause)}。已保留可用的共现图。`;
+      if (visibleIds.size === 0) visibleIds = initialIds(usableSemantic);
+    } finally {
+      if (generation === graphGeneration) {
+        semanticLoading = false;
+        loaded = true;
+      }
     }
   }
 
@@ -79,13 +204,41 @@
   }
 
   onMount(() => {
-    void Promise.all([loadGraph(), loadPending()]);
+    void Promise.all([loadGraph(), loadSemantic(knowledgeFilter), loadPending()]);
   });
 
   $effect(() => {
-    if (graphFilter.mode === "note" && noteGraphState.status === "idle") {
-      void noteGraphState.load();
-    }
+    if (graphFilter.mode === "note" && noteGraphState.status === "idle") void noteGraphState.load();
+  });
+
+  $effect(() => {
+    const sidebarKind = graphFilter.kind;
+    if (sidebarKind === lastSidebarKind) return;
+    lastSidebarKind = sidebarKind;
+    applyKnowledgeFilter({
+      ...knowledgeFilter,
+      entity_kinds: sidebarKind === "all" ? [] : [sidebarKind],
+    });
+  });
+
+  $effect(() => {
+    const requested = requestedPathStart;
+    if (!requested || requested === lastRequestedPathStart) return;
+    lastRequestedPathStart = requested;
+    setPathStart(requested);
+  });
+
+  $effect(() => {
+    const query = graphFilter.query.trim().toLowerCase();
+    if (!query) return;
+    const matches = filteredSemantic.nodes
+      .filter(
+        (node) =>
+          node.name.toLowerCase().includes(query) ||
+          node.aliases.some((alias) => alias.toLowerCase().includes(query)),
+      )
+      .map((node) => node.id);
+    if (matches.some((id) => !visibleIds.has(id))) visibleIds = new Set([...visibleIds, ...matches]);
   });
 
   $effect(() => {
@@ -107,6 +260,7 @@
       graphData(),
       pendingReview(DEFAULT_KNOWLEDGE_FILTER),
       id ? semanticEntityDetail(id, detailFilter) : Promise.resolve(null),
+      loadSemantic(effectiveGraphFilter),
     ]);
     graph = nextGraph;
     pendingItems = nextPending;
@@ -125,9 +279,21 @@
     goto(url.pathname + url.search);
   }
 
-  function pickNode(id: string, isPerson: boolean) {
-    if (isPerson) goto("/speakers/" + encodeURIComponent(id));
-    else updateQuery((params) => { params.set("e", id); params.delete("review"); params.delete("r"); });
+  function revealFrom(id: string) {
+    if (showingAll) return;
+    const depth = (expansionDepth.get(id) ?? 0) + 1;
+    expansionDepth = new Map(expansionDepth).set(id, depth);
+    const revealed = nextExpandedIds(new Set([id]), filteredSemantic.semantic_edges, depth, 8);
+    visibleIds = new Set([...visibleIds, ...revealed]);
+  }
+
+  function pickNode(id: string, _isPerson: boolean) {
+    revealFrom(id);
+    if (pathStart && id !== pathStart) {
+      pathEnd = id;
+      void requestPath(pathStart, id, knowledgeFilter, includeWeakPath);
+    }
+    updateQuery((params) => { params.set("e", id); params.delete("review"); params.delete("r"); });
   }
 
   function pickNoteNode(id: string) {
@@ -136,6 +302,10 @@
 
   function openRelation(id: string) {
     updateQuery((params) => { params.set("r", id); });
+  }
+
+  function pickEdge(id: string, layer: RenderEdge["layer"]) {
+    if (layer === "semantic") openRelation(id);
   }
 
   function closeRelation() {
@@ -150,13 +320,88 @@
     updateQuery((params) => { params.delete("e"); });
   }
 
-  function openCtxMenu(
-    id: string,
-    name: string,
-    isPerson: boolean,
-    clientX: number,
-    clientY: number,
-  ) {
+  function collapseGraph() {
+    showingAll = false;
+    expansionDepth = new Map();
+    visibleIds = initialIds(usableSemantic);
+  }
+
+  function showAll() {
+    showingAll = true;
+    visibleIds = new Set(filteredSemantic.nodes.map((node) => node.id));
+  }
+
+  function applyKnowledgeFilter(next: KnowledgeFilter) {
+    knowledgeFilter = {
+      ...next,
+      entity_kinds: [...next.entity_kinds],
+      predicate_types: [...next.predicate_types],
+    };
+    const sidebarKind = next.entity_kinds.length === 1 ? next.entity_kinds[0]! : "all";
+    lastSidebarKind = sidebarKind;
+    graphFilter.kind = sidebarKind;
+    ++pathGeneration;
+    void loadSemantic({
+      ...knowledgeFilter,
+      include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
+    });
+    if (pathStart && pathEnd) void requestPath(pathStart, pathEnd, knowledgeFilter, includeWeakPath);
+  }
+
+  function setPathStart(id: string) {
+    ++pathGeneration;
+    pathStart = id;
+    pathEnd = null;
+    activePath = null;
+    pathError = "";
+    pathStatus = "choosing";
+    closeCtxMenu();
+  }
+
+  function clearPath() {
+    ++pathGeneration;
+    const reloadWithoutPathWeakLayer = includeWeakPath && !knowledgeFilter.include_cooccurrence;
+    pathStart = null;
+    pathEnd = null;
+    activePath = null;
+    pathError = "";
+    pathStatus = "idle";
+    includeWeakPath = false;
+    if (reloadWithoutPathWeakLayer) void loadSemantic(knowledgeFilter);
+    if (requestedPathStart) {
+      lastRequestedPathStart = null;
+      updateQuery((params) => { params.delete("pathStart"); });
+    }
+  }
+
+  async function requestPath(start: string, end: string, filter: KnowledgeFilter, includeWeak: boolean) {
+    const generation = ++pathGeneration;
+    pathStatus = "loading";
+    pathError = "";
+    try {
+      const result = await knowledgePath(start, end, {
+        ...filter,
+        include_cooccurrence: includeWeak,
+      });
+      if (generation !== pathGeneration) return;
+      activePath = result;
+      if (result) visibleIds = new Set([...visibleIds, ...result.entity_ids]);
+      pathStatus = result ? "ready" : "empty";
+    } catch (cause) {
+      if (generation !== pathGeneration) return;
+      activePath = null;
+      pathStatus = "error";
+      pathError = `路径读取失败：${cause instanceof Error ? cause.message : String(cause)}`;
+    }
+  }
+
+  function toggleWeakPath(value: boolean) {
+    includeWeakPath = value;
+    void loadSemantic({ ...knowledgeFilter, include_cooccurrence: knowledgeFilter.include_cooccurrence || value });
+    if (pathStart && pathEnd) void requestPath(pathStart, pathEnd, knowledgeFilter, value);
+  }
+
+  function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
     ctxMenu = { id, name, isPerson, x: clientX, y: clientY };
   }
 
@@ -169,6 +414,10 @@
     const target = ctxMenu;
     closeCtxMenu();
     pickNode(target.id, target.isPerson);
+  }
+
+  function startPathFromContext() {
+    if (ctxMenu) setPathStart(ctxMenu.id);
   }
 
   function handleEscape(event: KeyboardEvent) {
@@ -222,33 +471,115 @@
     <!-- This stage never branches on `selected`: changing ?e= updates only the
          edge inspector, so the ForceGraph component and its camera stay mounted. -->
     <div class="entity-stage" class:with-inspector={inspectorOpen}>
-      <div class="canvas-shell" aria-label="知识图谱画布">
-        {#if loaded && graph.nodes.length === 0}
-          <div class="placeholder">
-            <p class="ph-title">还没有知识图谱</p>
-            <p class="ph-desc">配置大模型并对笔记「重新 Aing」后，人物、组织、项目等实体会汇入这里。</p>
-            <button class="empty-cta" onclick={() => goto("/ai")}>前往 AI 设置</button>
-          </div>
-        {:else if filteredGraph.nodes.length >= 2 && graph.edges.length > 0}
-          <ForceGraph
-            nodes={filteredGraph.nodes}
-            edges={filteredGraph.edges}
-            onPick={pickNode}
-            onContextMenu={openCtxMenu}
-            query={graphFilter.query}
+      <div class="map-column">
+        <KnowledgeGraphToolbar
+          filter={knowledgeFilter}
+          kinds={availableKinds}
+          predicates={availablePredicates}
+          visibleCount={renderedNodes.length}
+          totalCount={filteredSemantic.nodes.length}
+          loading={semanticLoading}
+          {showingAll}
+          onChange={applyKnowledgeFilter}
+          onCollapse={collapseGraph}
+          onShowAll={showAll}
+        />
+
+        <div class="canvas-shell" aria-label="知识图谱画布">
+          {#if semanticError}
+            <div class="map-message degraded" role="status">{semanticError}</div>
+          {/if}
+          {#if semanticFallback}
+            <div class="map-message fallback">
+              <span>尚未补建语义关系，当前保留共现弱连接供继续探索。</span>
+              <button type="button" onclick={() => goto("/ai?backfill=relations")}>补建语义关系</button>
+            </div>
+          {/if}
+
+          {#if loaded && usableSemantic.nodes.length === 0 && graph.nodes.length === 0}
+            <div class="placeholder">
+              <p class="ph-title">还没有知识图谱</p>
+              <p class="ph-desc">配置大模型并对笔记「重新 Aing」后，人物、组织、项目等实体会汇入这里。</p>
+              <button class="empty-cta" onclick={() => goto("/ai")}>前往 AI 设置</button>
+            </div>
+          {:else if renderedNodes.length >= 2 && renderedEdges.length > 0}
+            <ForceGraph
+              nodes={renderedNodes}
+              edges={renderedEdges}
+              onPick={pickNode}
+              onEdgePick={pickEdge}
+              onContextMenu={openCtxMenu}
+              query={graphFilter.query}
+              focusedNodeIds={pathFocus.nodeIds}
+              focusedEdgeIds={pathFocus.edgeIds}
+              maxNodes={2000}
+              minEdgeWeight={0}
+              backboneK={2000}
+            />
+          {:else if loaded && filteredSemantic.nodes.length >= 2}
+            <div class="placeholder">
+              <p class="ph-title">没有匹配的实体关系</p>
+              <p class="ph-desc">当前筛选下没有可连接的关系。可以重置筛选，或显示全部实体继续选择。</p>
+              <button class="empty-cta" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>重置图谱筛选</button>
+            </div>
+          {:else}
+            <div class="placeholder">
+              <p class="ph-title">知识图谱</p>
+              <p class="ph-desc">从实体名称开始，沿完整关系逐层探索会议上下文。</p>
+            </div>
+          {/if}
+
+          <KnowledgePathPanel
+            startId={pathStart}
+            endId={pathEnd}
+            names={entityNames}
+            path={activePath}
+            status={pathStatus}
+            error={pathError}
+            includeCooccurrence={includeWeakPath}
+            onToggleCooccurrence={toggleWeakPath}
+            onOpenEvidence={openRelation}
+            onClear={clearPath}
           />
-        {:else if loaded && graph.nodes.length >= 2}
-          <div class="placeholder">
-            <p class="ph-title">没有匹配的实体关系</p>
-            <p class="ph-desc">当前类型筛选下没有足够的关系可画，可以清除筛选后继续探索。</p>
-            <button class="empty-cta" onclick={() => (graphFilter.kind = "all")}>清除实体类型筛选</button>
-          </div>
-        {:else}
-          <div class="placeholder">
-            <p class="ph-title">知识图谱</p>
-            <p class="ph-desc">从左侧选择实体，或继续 Aing 笔记以建立更多连接。</p>
-          </div>
-        {/if}
+
+          {#if renderedNodes.length > 0}
+            <details class="accessible-network">
+              <summary>键盘浏览节点与关系</summary>
+              <div class="accessible-content">
+                <section aria-labelledby="accessible-nodes-title">
+                  <h2 id="accessible-nodes-title">实体</h2>
+                  <ul>
+                    {#each accessibleNodes as node (node.id)}
+                      <li>
+                        <span><strong>{node.name}</strong><small>{kindLabel(node.kind)} · {node.note_count} 篇笔记</small></span>
+                        <span class="row-actions">
+                          <button type="button" onclick={() => pickNode(node.id, node.is_person)}>查看并展开</button>
+                          <button type="button" onclick={() => setPathStart(node.id)}>设为路径起点</button>
+                        </span>
+                      </li>
+                    {/each}
+                  </ul>
+                </section>
+                <section aria-labelledby="accessible-edges-title">
+                  <h2 id="accessible-edges-title">关系</h2>
+                  <ul>
+                    {#each renderedEdges as edge (edge.id)}
+                      <li class:weak-edge={edge.layer === "cooccurrence"}>
+                        <span>
+                          <strong>{entityNames.get(edge.a) ?? edge.a} → {entityNames.get(edge.b) ?? edge.b}</strong>
+                          <small>{edge.label}</small>
+                        </span>
+                        {#if edge.layer === "semantic"}
+                          <button type="button" onclick={() => openRelation(edge.id)}>查看关系证据</button>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ul>
+                </section>
+              </div>
+            </details>
+          {/if}
+        </div>
       </div>
 
       {#if inspectorOpen}
@@ -287,16 +618,76 @@
   <div class="menu-overlay" onclick={closeCtxMenu} oncontextmenu={(event) => { event.preventDefault(); closeCtxMenu(); }}></div>
   <div class="ctx-menu" style:left={`${ctxMenu.x}px`} style:top={`${ctxMenu.y}px`} role="menu" aria-label={`治理 ${ctxMenu.name}`}>
     <p>{ctxMenu.name}</p>
+    <button class="ctx-item" role="menuitem" onclick={startPathFromContext}>设为路径起点</button>
     <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>改名</button>
     <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>打开治理面板</button>
   </div>
 {/if}
 
 <style>
-  .graph-main, .entity-stage, .canvas-shell { height: 100%; min-width: 0; min-height: 0; }
+  .graph-main, .entity-stage { height: 100%; min-width: 0; min-height: 0; }
   .graph-main { overflow: hidden; }
   .entity-stage { display: flex; background: var(--canvas); }
-  .canvas-shell { flex: 1 1 auto; position: relative; }
+  .map-column { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; }
+  .canvas-shell { flex: 1 1 auto; position: relative; min-width: 0; min-height: 0; }
+  .map-message {
+    position: absolute;
+    z-index: 9;
+    top: 10px;
+    left: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(620px, calc(100% - 24px));
+    box-sizing: border-box;
+    padding: 7px 10px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    background: var(--surface-press);
+    color: var(--ink-secondary);
+    font-size: 0.74rem;
+    line-height: 1.45;
+  }
+  .map-message.degraded + .map-message { top: 52px; }
+  .map-message button {
+    flex: none;
+    min-height: 32px;
+    padding: 4px 8px;
+    border: 0;
+    border-radius: var(--radius-md);
+    background: var(--accent-tint);
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+  }
+  .accessible-network {
+    position: absolute;
+    z-index: 7;
+    left: 12px;
+    bottom: 12px;
+    width: min(540px, calc(100% - 24px));
+    max-height: min(62%, 520px);
+    overflow: auto;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    background: var(--surface-press);
+    color: var(--ink-secondary);
+    font-size: 0.75rem;
+  }
+  .accessible-network:not([open]) { width: auto; overflow: visible; }
+  .accessible-network summary { min-height: 34px; box-sizing: border-box; padding: 8px 11px; cursor: pointer; }
+  .accessible-content { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; padding: 2px 12px 12px; border-top: 1px solid var(--hairline); }
+  .accessible-content h2 { margin: 10px 0 4px; color: var(--ink-faint); font-size: 0.68rem; font-weight: 600; letter-spacing: 0.04em; }
+  .accessible-content ul { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+  .accessible-content li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--hairline); }
+  .accessible-content li > span:first-child { display: grid; min-width: 0; gap: 2px; }
+  .accessible-content strong, .accessible-content small { overflow-wrap: anywhere; }
+  .accessible-content strong { color: var(--ink); font-size: 0.76rem; font-weight: 590; }
+  .accessible-content small { color: var(--ink-faint); line-height: 1.45; }
+  .accessible-content button { min-height: 32px; padding: 4px 7px; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--accent); font: inherit; font-size: 0.69rem; cursor: pointer; }
+  .accessible-content button:hover { background: var(--surface-soft); }
+  .row-actions { display: flex; flex: none; }
+  .weak-edge { border-left: 1px dashed var(--hairline-strong); padding-left: 7px !important; }
   .edge-inspector {
     flex: 0 0 clamp(340px, 34%, 440px);
     box-sizing: border-box;
@@ -367,9 +758,10 @@
       border-left: 1px solid var(--hairline-strong);
       border-radius: 0;
     }
+    .accessible-content { grid-template-columns: 1fr; }
   }
   @media (pointer: coarse) {
-    button, .ctx-item { min-height: 44px; }
+    button, .ctx-item, .accessible-network summary, .accessible-content button { min-height: 44px; }
     .inspector-close { width: 44px; }
   }
   @media (prefers-reduced-motion: reduce) {
