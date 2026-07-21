@@ -4,7 +4,7 @@ use crate::settings::Settings;
 use crate::store::aing_graph::{ValidatedGraph, GRAPH_CONTRACT_VERSION};
 use crate::store::{GraphExtraction, RefinedDoc};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,12 @@ pub struct BackfillOutcome {
     pub contract_version: u32,
     pub source_hash: String,
     pub committed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovedBackfill {
+    pub preview: BackfillPreview,
+    pub source_hashes: BTreeMap<String, String>,
 }
 
 pub(crate) struct BackfillGate {
@@ -181,17 +187,52 @@ fn consent_token(
     provider: &str,
     model: &str,
 ) -> anyhow::Result<String> {
+    let source_hashes = approved_source_hashes(notes_root, note_ids)?;
+    Ok(consent_token_from_hashes(
+        note_ids,
+        provider,
+        model,
+        &source_hashes,
+    ))
+}
+
+fn consent_token_from_hashes(
+    note_ids: &[String],
+    provider: &str,
+    model: &str,
+    source_hashes: &BTreeMap<String, String>,
+) -> String {
     let mut hasher = Sha256::new();
     hash_preview_field(&mut hasher, provider);
     hash_preview_field(&mut hasher, model);
     hasher.update(GRAPH_CONTRACT_VERSION.to_be_bytes());
     for note_id in note_ids {
         hash_preview_field(&mut hasher, note_id);
-        let doc = load_preview_doc(notes_root, note_id)?
-            .ok_or_else(|| anyhow::anyhow!("笔记 {note_id} 没有可补建的 aing.json"))?;
-        hash_preview_field(&mut hasher, &crate::store::source_hash(&doc.paragraphs));
+        hash_preview_field(
+            &mut hasher,
+            source_hashes
+                .get(note_id)
+                .expect("approved sources cover every selected note"),
+        );
     }
-    Ok(format!("backfill-preview-{:x}", hasher.finalize()))
+    format!("backfill-preview-{:x}", hasher.finalize())
+}
+
+pub(crate) fn approved_source_hashes(
+    notes_root: &Path,
+    note_ids: &[String],
+) -> anyhow::Result<BTreeMap<String, String>> {
+    note_ids
+        .iter()
+        .map(|note_id| {
+            let doc = load_preview_doc(notes_root, note_id)?
+                .ok_or_else(|| anyhow::anyhow!("笔记 {note_id} 没有可补建的 aing.json"))?;
+            Ok((
+                note_id.clone(),
+                crate::store::source_hash(&doc.paragraphs),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn validate_request(
@@ -209,6 +250,30 @@ pub(crate) fn validate_request(
         "关系补建预览已变化，请重新预览并确认"
     );
     Ok(())
+}
+
+pub(crate) fn preflight(
+    data_root: &Path,
+    settings: &Settings,
+    request: &BackfillRequest,
+) -> anyhow::Result<ApprovedBackfill> {
+    let preview = preview(data_root, settings, Some(&request.note_ids))?;
+    validate_request(&preview, request)?;
+    let source_hashes = approved_source_hashes(&data_root.join("notes"), &preview.note_ids)?;
+    anyhow::ensure!(
+        preview.consent_token
+            == consent_token_from_hashes(
+                &preview.note_ids,
+                &preview.provider,
+                &preview.model,
+                &source_hashes,
+            ),
+        "关系补建预览已变化，请重新预览并确认"
+    );
+    Ok(ApprovedBackfill {
+        preview,
+        source_hashes,
+    })
 }
 
 /// 纯只读选择：不迁移旧稿、不写 stage、不触发索引。
@@ -325,6 +390,7 @@ fn ensure_revision_unchanged(snapshot: &RefinedDoc, latest: &RefinedDoc) -> anyh
 fn run_one_controlled_with_writer(
     note_dir: &Path,
     note_id: &str,
+    approved_source_hash: Option<&str>,
     executor: &dyn RelationExecutor,
     cancel: &AtomicBool,
     write: impl FnOnce(
@@ -358,6 +424,13 @@ fn run_one_controlled_with_writer(
         .load_current()
         .map_err(RunOneError::Failed)?
         .ok_or_else(|| RunOneError::Failed(anyhow::anyhow!("aing.json 不存在或已损坏")))?;
+    if let Some(approved_source_hash) = approved_source_hash {
+        if crate::store::source_hash(&snapshot.paragraphs) != approved_source_hash {
+            return Err(RunOneError::Failed(anyhow::anyhow!(
+                "关系补建预览后正文已变化，请重新预览并确认"
+            )));
+        }
+    }
     if is_current(&snapshot) {
         return Ok(BackfillOutcome {
             note_id: note_id.into(),
@@ -455,12 +528,14 @@ fn run_one_controlled_with_writer(
 fn run_one_controlled(
     note_dir: &Path,
     note_id: &str,
+    approved_source_hash: Option<&str>,
     executor: &dyn RelationExecutor,
     cancel: &AtomicBool,
 ) -> Result<BackfillOutcome, RunOneError> {
     run_one_controlled_with_writer(
         note_dir,
         note_id,
+        approved_source_hash,
         executor,
         cancel,
         |anchored, candidate, note_lock| anchored.write_locked(candidate, note_lock),
@@ -474,7 +549,7 @@ pub(crate) fn run_one_with_cancel(
     executor: &dyn RelationExecutor,
     cancel: &AtomicBool,
 ) -> anyhow::Result<BackfillOutcome> {
-    run_one_controlled(note_dir, note_id, executor, cancel).map_err(RunOneError::into_anyhow)
+    run_one_controlled(note_dir, note_id, None, executor, cancel).map_err(RunOneError::into_anyhow)
 }
 
 #[allow(dead_code)] // Public Task 9 contract; batch execution uses the cancellable core directly.
@@ -483,7 +558,7 @@ pub fn run_one(
     note_id: &str,
     executor: &dyn RelationExecutor,
 ) -> anyhow::Result<BackfillOutcome> {
-    run_one_controlled(note_dir, note_id, executor, &AtomicBool::new(false))
+    run_one_controlled(note_dir, note_id, None, executor, &AtomicBool::new(false))
         .map_err(RunOneError::into_anyhow)
 }
 
@@ -491,6 +566,7 @@ pub(crate) fn run_batch(
     run_id: &str,
     notes_root: &Path,
     note_ids: &[String],
+    approved_source_hashes: &BTreeMap<String, String>,
     executor: &dyn RelationExecutor,
     cancel: &AtomicBool,
     mut emit: impl FnMut(BackfillProgress),
@@ -514,7 +590,16 @@ pub(crate) fn run_batch(
             rebuild_generation: None,
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_one_controlled(&notes_root.join(note_id), note_id, executor, cancel)
+            let approved_source_hash = approved_source_hashes.get(note_id).ok_or_else(|| {
+                RunOneError::Failed(anyhow::anyhow!("关系补建缺少已批准的正文快照"))
+            })?;
+            run_one_controlled(
+                &notes_root.join(note_id),
+                note_id,
+                Some(approved_source_hash),
+                executor,
+                cancel,
+            )
         }));
         match result {
             Ok(Ok(outcome)) => {
@@ -892,6 +977,110 @@ mod tests {
     }
 
     #[test]
+    fn batch_rechecks_each_approved_source_before_calling_the_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let note_ids = vec!["first".to_string(), "later".to_string()];
+        for note_id in &note_ids {
+            write_note(root.path(), note_id, &fixture_doc(note_id, 0, "failed"));
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.refine_provider = "openai".into();
+        settings.refine_model = "relation-model".into();
+        let shown = preview(root.path(), &settings, Some(&note_ids)).unwrap();
+        let request = BackfillRequest {
+            run_id: "run-source-drift".into(),
+            consent_token: shown.consent_token,
+            note_ids: shown.note_ids,
+            provider: shown.provider,
+            model: shown.model,
+            contract_version: shown.contract_version,
+        };
+        let approved = preflight(root.path(), &settings, &request).unwrap();
+
+        struct BlockingExecutor {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            first_entered: Arc<std::sync::Barrier>,
+            release_first: Arc<std::sync::Barrier>,
+        }
+        impl RelationExecutor for BlockingExecutor {
+            fn provider(&self) -> &str {
+                "openai"
+            }
+            fn model(&self) -> &str {
+                "relation-model"
+            }
+            fn extract(
+                &self,
+                note_id: &str,
+                doc: &RefinedDoc,
+            ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
+                self.calls.lock().unwrap().push(note_id.into());
+                if note_id == "first" {
+                    self.first_entered.wait();
+                    self.release_first.wait();
+                }
+                crate::refine::relations::materialize(note_id, doc, vec![raw_relation(0.93)])
+                    .map_err(|issues| anyhow::anyhow!("{issues:?}"))
+            }
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_first = Arc::new(std::sync::Barrier::new(2));
+        let executor = Arc::new(BlockingExecutor {
+            calls: Arc::clone(&calls),
+            first_entered: Arc::clone(&first_entered),
+            release_first: Arc::clone(&release_first),
+        });
+        let notes_root = root.path().join("notes");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn({
+            let note_ids = note_ids.clone();
+            let cancel = Arc::clone(&cancel);
+            move || {
+                run_batch(
+                    "run-source-drift",
+                    &notes_root,
+                    &note_ids,
+                    &approved.source_hashes,
+                    executor.as_ref(),
+                    &cancel,
+                    |_| {},
+                    || Ok(73),
+                )
+            }
+        });
+
+        first_entered.wait();
+        let later_dir = root.path().join("notes/later");
+        let mut changed = store::load_refined(&later_dir).unwrap();
+        changed.paragraphs[0].text.push_str("，用户刚刚修改");
+        changed.paragraphs[0].source_seqs.push(99);
+        store::write_refined_atomic(&later_dir, &changed).unwrap();
+        let changed_bytes = std::fs::read(later_dir.join(store::AING_DOC_FILE)).unwrap();
+        release_first.wait();
+
+        let terminal = worker.join().unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), ["first"]);
+        assert_eq!(terminal.state, "partial");
+        assert!(terminal.failed.iter().any(|failure| {
+            failure.note_id == "later" && failure.error.contains("预览后正文已变化")
+        }));
+        assert_eq!(
+            std::fs::read(later_dir.join(store::AING_DOC_FILE)).unwrap(),
+            changed_bytes
+        );
+        assert_eq!(
+            store::load_refined(&later_dir)
+                .unwrap()
+                .graph_extraction
+                .unwrap()
+                .run_id,
+            "old-run"
+        );
+    }
+
+    #[test]
     fn preview_rejects_corrupt_human_ledger_before_note_selection() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1031,6 +1220,7 @@ mod tests {
             "run-cancel",
             &root.path().join("notes"),
             &note_ids,
+            &approved_source_hashes(&root.path().join("notes"), &note_ids).unwrap(),
             &executor,
             &cancel,
             |event| progress.push(event),
@@ -1061,6 +1251,7 @@ mod tests {
             "run-resume",
             &root.path().join("notes"),
             &note_ids,
+            &approved_source_hashes(&root.path().join("notes"), &note_ids).unwrap(),
             &resume_executor,
             &cancel,
             |_| {},
@@ -1114,6 +1305,7 @@ mod tests {
         let result = run_one_controlled_with_writer(
             &failed_dir,
             write_failed_id,
+            None,
             &executor,
             &AtomicBool::new(false),
             |_, _, _| anyhow::bail!("disk full"),
@@ -1176,6 +1368,7 @@ mod tests {
             "run-dirty",
             &root.path().join("notes"),
             &[note_id.into()],
+            &approved_source_hashes(&root.path().join("notes"), &[note_id.into()]).unwrap(),
             &executor,
             &AtomicBool::new(false),
             |progress| events.borrow_mut().push(progress),
@@ -1207,6 +1400,7 @@ mod tests {
             "run-provider-failed",
             &root.path().join("notes"),
             &[failed_id.into()],
+            &approved_source_hashes(&root.path().join("notes"), &[failed_id.into()]).unwrap(),
             &executor,
             &AtomicBool::new(false),
             |_| {},
@@ -1261,6 +1455,11 @@ mod tests {
             "run-panic",
             &root.path().join("notes"),
             &[first.into(), second.into()],
+            &approved_source_hashes(
+                &root.path().join("notes"),
+                &[first.into(), second.into()],
+            )
+            .unwrap(),
             &PanicOnSecond {
                 calls: AtomicUsize::new(0),
             },

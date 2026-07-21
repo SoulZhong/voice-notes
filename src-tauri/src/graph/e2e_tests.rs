@@ -863,6 +863,7 @@ fn multi_note_multi_paragraph_backfill_preserves_transcript_order() {
         "run-multi-note-order",
         &root.path().join("notes"),
         &note_ids,
+        &backfill::approved_source_hashes(&root.path().join("notes"), &note_ids).unwrap(),
         &FixtureExecutor { calls },
         &std::sync::atomic::AtomicBool::new(false),
         |event| progress.push(event),
