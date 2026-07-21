@@ -2,6 +2,7 @@
   import { entityMentions, relationDetail, type SemanticEntityDetail } from "./knowledge";
   import { kindInk, kindLabel, kindSoft } from "./graph";
   import { relationLabel } from "./knowledgeView";
+  import { listNotes } from "./notes";
   import {
     buildAddAlias,
     buildBindPerson,
@@ -39,6 +40,7 @@
   let personMentionId = $state("");
   let personEntityId = $state("");
   let mentions = $state<GovernanceMention[]>([]);
+  let noteTitles = $state<Map<string, string>>(new Map());
   let mentionsLoading = $state(false);
   let splitOpen = $state(false);
   let working = $state(false);
@@ -68,7 +70,8 @@
     Promise.all([
       entityMentions(entityId),
       Promise.all(relations.map((id) => relationDetail(id).catch(() => null))),
-    ]).then(([items, relationDetails]) => {
+      listNotes().catch(() => []),
+    ]).then(([items, relationDetails, notes]) => {
       if (generation !== evidenceGeneration) return;
       const relationIdsByMention = new Map<string, Set<string>>();
       for (const item of relationDetails) {
@@ -85,10 +88,12 @@
         ...mention,
         relation_ids: [...(relationIdsByMention.get(mention.id) ?? [])].sort(),
       }));
+      noteTitles = new Map(notes.map((note) => [note.id, note.title]));
       mentionsLoading = false;
     }).catch(() => {
       if (generation !== evidenceGeneration) return;
       mentions = [];
+      noteTitles = new Map();
       mentionsLoading = false;
     });
   });
@@ -103,7 +108,11 @@
       a.start_offset - b.start_offset ||
       a.id.localeCompare(b.id)
     )) groups.set(mention.note_id, [...(groups.get(mention.note_id) ?? []), mention]);
-    return [...groups.entries()].map(([noteId, items]) => ({ noteId, items }));
+    return [...groups.entries()].map(([noteId, items]) => ({
+      noteId,
+      title: noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`,
+      items,
+    }));
   });
   const displayEntityName = (id: string) =>
     id === detail.id ? detail.name : resolveEntityName?.(id) ?? "相关实体";
@@ -338,14 +347,14 @@
       {#if simple}
         <ul class="source-notes">
           {#each mentionGroups as group (group.noteId)}
-            <li><a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a></li>
+            <li><a href={'/notes/' + encodeURIComponent(group.noteId)}>{group.title}</a></li>
           {/each}
         </ul>
         {#if mentionGroups.length === 0}<p class="empty-line">没有关联笔记</p>{/if}
       {:else}
         {#each mentionGroups as group (group.noteId)}
           <div class="note-group">
-            <a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a>
+            <a href={'/notes/' + encodeURIComponent(group.noteId)}>{group.title}</a>
             {#each group.items as mention (mention.id)}
               <blockquote>
                 <p>{mention.quote}</p>
