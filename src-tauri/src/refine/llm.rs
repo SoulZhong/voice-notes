@@ -1,6 +1,7 @@
 //! A2 LLM Aing:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
 
-use crate::store::RefinedParagraph;
+use crate::store::{RefinedParagraph, RelationPredicate};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const CHUNK_CHARS: usize = 3000;
@@ -8,7 +9,7 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。";
+const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence,valid_from/valid_to 可为 null。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
 
 pub struct LlmConfig {
     pub base_url: String,
@@ -18,8 +19,16 @@ pub struct LlmConfig {
 
 pub enum LlmOutcome {
     Done,
+    /// 文本和实体可用，但至少一块缺少/损坏 relations；只降级关系阶段。
+    DoneWithRelationErrors,
     Partial(usize),
     Failed,
+}
+
+impl LlmOutcome {
+    pub(crate) fn relations_complete(&self) -> bool {
+        matches!(self, Self::Done)
+    }
 }
 
 /// 大模型每块吐出的原始实体(未去重、未分配 id)。解析层(refine/mod.rs)再规范化。
@@ -28,6 +37,27 @@ pub struct RawEntity {
     pub name: String,
     pub kind: String,
     pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RawRelation {
+    pub subject: String,
+    pub predicate: RelationPredicate,
+    pub object: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    #[serde(default)]
+    pub valid_to: Option<String>,
+    pub evidence: Vec<RawEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RawEvidence {
+    pub paragraph_index: usize,
+    pub start: usize,
+    pub end: usize,
+    pub quote: String,
 }
 
 /// 按累计字符预算切块,返回每块的段落下标。单段超预算独占一块。
@@ -124,6 +154,13 @@ enum ChunkErr {
     Content(anyhow::Error),
 }
 
+fn format_chunk_paragraphs(paragraphs: &[(usize, &str)]) -> String {
+    paragraphs
+        .iter()
+        .map(|(absolute_index, text)| format!("paragraph_index={absolute_index}: {text}\n"))
+        .collect()
+}
+
 impl std::fmt::Display for ChunkErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -135,14 +172,10 @@ impl std::fmt::Display for ChunkErr {
 fn call_chunk(
     cfg: &LlmConfig,
     glossary: &Value,
-    texts: &[&str],
+    paragraphs: &[(usize, &str)],
     log: Option<&crate::ailog::Ctx>,
-) -> Result<(Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
-    let numbered: String = texts
-        .iter()
-        .enumerate()
-        .map(|(i, t)| format!("{}. {}\n", i + 1, t))
-        .collect();
+) -> Result<(Value, Vec<String>, Vec<RawEntity>, Vec<RawRelation>, bool), ChunkErr> {
+    let numbered = format_chunk_paragraphs(paragraphs);
     let user = format!("术语表(沿用并可扩充):{glossary}\n段落:\n{numbered}");
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut body_json = json!({
@@ -156,11 +189,11 @@ fn call_chunk(
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
     let started = std::time::Instant::now();
-    let result = do_call_chunk(cfg, &url, &body_json.to_string(), texts.len());
+    let result = do_call_chunk(cfg, &url, &body_json.to_string(), paragraphs.len());
     // AI 日志:请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
     if let Some(ctx) = log {
         let (response, status, error) = match &result {
-            Ok((raw, _, _, _)) => (Value::String(raw.clone()), "ok", None),
+            Ok((raw, _, _, _, _, _)) => (Value::String(raw.clone()), "ok", None),
             Err(e) => (Value::Null, "error", Some(e.to_string())),
         };
         crate::ailog::record(
@@ -178,13 +211,17 @@ fn call_chunk(
             },
         );
     }
-    result.map(|(_, glossary, texts, ents)| (glossary, texts, ents))
+    result.map(|(_, glossary, texts, ents, relations, relations_valid)| {
+        (glossary, texts, ents, relations, relations_valid)
+    })
 }
 
 /// 宽松解析实体数组:非数组 → 空;逐项跳过缺 name 的;kind 缺省 "term";aliases 缺省空。
 /// 绝不返回错误——实体是增值层,坏数据只当没有,不拖垮 texts。
 fn parse_raw_entities(v: &Value) -> Vec<RawEntity> {
-    let Some(arr) = v.as_array() else { return Vec::new() };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
     arr.iter()
         .filter_map(|e| {
             let name = e["name"].as_str()?.trim();
@@ -202,18 +239,33 @@ fn parse_raw_entities(v: &Value) -> Vec<RawEntity> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(RawEntity { name: name.to_string(), kind: kind.to_string(), aliases })
+            Some(RawEntity {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                aliases,
+            })
         })
         .collect()
 }
 
-/// 网络+解析的本体,返回 (响应原文, glossary, texts, entities) 供 call_chunk 记日志后拆用。
+/// 网络+解析的本体。relations 缺失/损坏时仍返回可信 texts/entities，并用最后一个
+/// bool 把失败交给独立关系阶段；显式 [] 则是成功的空关系集合。
 fn do_call_chunk(
     cfg: &LlmConfig,
     url: &str,
     body: &str,
     expect_len: usize,
-) -> Result<(String, Value, Vec<String>, Vec<RawEntity>), ChunkErr> {
+) -> Result<
+    (
+        String,
+        Value,
+        Vec<String>,
+        Vec<RawEntity>,
+        Vec<RawRelation>,
+        bool,
+    ),
+    ChunkErr,
+> {
     let resp_text = ureq::post(url)
         .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
@@ -241,7 +293,27 @@ fn do_call_chunk(
         )));
     }
     let entities = parse_raw_entities(&parsed["entities"]);
-    Ok((resp_text, parsed["glossary"].clone(), texts_out, entities))
+    let (relations, relations_valid) = match parsed.get("relations") {
+        Some(value) => match serde_json::from_value::<Vec<RawRelation>>(value.clone()) {
+            Ok(relations) => (relations, true),
+            Err(error) => {
+                eprintln!("refine llm: relations 解析失败: {error}");
+                (Vec::new(), false)
+            }
+        },
+        None => {
+            eprintln!("refine llm: 响应缺 relations 数组");
+            (Vec::new(), false)
+        }
+    };
+    Ok((
+        resp_text,
+        parsed["glossary"].clone(),
+        texts_out,
+        entities,
+        relations,
+        relations_valid,
+    ))
 }
 
 /// 为整场笔记生成主题标题(Aing 完成后调用,替换未被用户改过的默认标题)。
@@ -325,19 +397,24 @@ pub fn polish(
     cfg: &LlmConfig,
     paragraphs: &mut [RefinedParagraph],
     log: Option<&crate::ailog::Ctx>,
-) -> (LlmOutcome, Vec<RawEntity>) {
+) -> (LlmOutcome, Vec<RawEntity>, Vec<RawRelation>) {
     let chunks = chunk_indices(paragraphs);
     if chunks.is_empty() {
-        return (LlmOutcome::Done, Vec::new());
+        return (LlmOutcome::Done, Vec::new(), Vec::new());
     }
     let mut glossary = json!({});
     let mut failed = 0usize;
     let mut network_failed = 0usize;
     let mut all_entities: Vec<RawEntity> = Vec::new();
+    let mut all_relations: Vec<RawRelation> = Vec::new();
+    let mut relation_failed = false;
     for chunk in &chunks {
-        let texts: Vec<&str> = chunk.iter().map(|&i| paragraphs[i].text.as_str()).collect();
-        match call_chunk(cfg, &glossary, &texts, log) {
-            Ok((g, outs, ents)) => {
+        let inputs: Vec<(usize, &str)> = chunk
+            .iter()
+            .map(|&i| (i, paragraphs[i].text.as_str()))
+            .collect();
+        match call_chunk(cfg, &glossary, &inputs, log) {
+            Ok((g, outs, ents, relations, relations_valid)) => {
                 if let Value::Object(map) = g {
                     if let Value::Object(acc) = &mut glossary {
                         acc.extend(map);
@@ -349,6 +426,11 @@ pub fn polish(
                     }
                 }
                 all_entities.extend(ents);
+                if relations_valid {
+                    all_relations.extend(relations);
+                } else {
+                    relation_failed = true;
+                }
             }
             Err(e) => {
                 if matches!(e, ChunkErr::Network(_)) {
@@ -356,17 +438,20 @@ pub fn polish(
                 }
                 eprintln!("refine llm: 块失败保留原文: {e}");
                 failed += 1;
+                relation_failed = true;
             }
         }
     }
-    let outcome = if failed == 0 {
+    let outcome = if failed == 0 && relation_failed {
+        LlmOutcome::DoneWithRelationErrors
+    } else if failed == 0 {
         LlmOutcome::Done
     } else if network_failed == chunks.len() {
         LlmOutcome::Failed
     } else {
         LlmOutcome::Partial(failed)
     };
-    (outcome, all_entities)
+    (outcome, all_entities, all_relations)
 }
 
 #[cfg(test)]
@@ -433,8 +518,12 @@ mod tests {
     }
 
     fn chat_body(texts: &[&str], glossary: &str) -> String {
-        let content = serde_json::json!({ "glossary": serde_json::from_str::<serde_json::Value>(glossary).unwrap(), "texts": texts })
-            .to_string();
+        let content = serde_json::json!({
+            "glossary": serde_json::from_str::<serde_json::Value>(glossary).unwrap(),
+            "texts": texts,
+            "relations": [],
+        })
+        .to_string();
         serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
     }
 
@@ -462,38 +551,60 @@ mod tests {
         apply_thinking_off("HTTPS://ARK.CN-BEIJING.VOLCES.COM/api/v3", &mut b2);
         assert_eq!(b2["thinking"]["type"], "disabled");
         // 其它 OpenAI 兼容 provider:绝不注入(否则可能 400)
-        for u in ["https://api.openai.com/v1", "https://api.deepseek.com", "https://api.moonshot.cn/v1"] {
+        for u in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com",
+            "https://api.moonshot.cn/v1",
+        ] {
             let mut o = json!({ "model": "m" });
             apply_thinking_off(u, &mut o);
-            assert!(o.get("thinking").is_none(), "非方舟端点不应注入 thinking: {u}");
+            assert!(
+                o.get("thinking").is_none(),
+                "非方舟端点不应注入 thinking: {u}"
+            );
         }
     }
 
     #[test]
     fn polish_rewrites_texts_on_success() {
         let base = mock_server(vec![chat_body(&["我们肯定要做。"], r#"{"肯计":"肯定"}"#)]);
-        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps = vec![para("我们肯计要做。")];
-        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, None);
         assert!(matches!(outcome, LlmOutcome::Done));
         assert_eq!(ps[0].text, "我们肯定要做。");
     }
 
     #[test]
     fn length_mismatch_keeps_originals_as_partial() {
-        let base = mock_server(vec![chat_body(&["只有一段", "但输入两段之外多了一段"], "{}")]);
-        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let base = mock_server(vec![chat_body(
+            &["只有一段", "但输入两段之外多了一段"],
+            "{}",
+        )]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps = vec![para("原文一")];
-        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, None);
         assert!(matches!(outcome, LlmOutcome::Partial(1)));
         assert_eq!(ps[0].text, "原文一", "长度不符必须保留原文");
     }
 
     #[test]
     fn connection_refused_is_failed_and_keeps_originals() {
-        let cfg = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps = vec![para("原文")];
-        let (outcome, _ents) = polish(&cfg, &mut ps, None);
+        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, None);
         assert!(matches!(outcome, LlmOutcome::Failed));
         assert_eq!(ps[0].text, "原文");
     }
@@ -502,16 +613,27 @@ mod tests {
     #[test]
     fn polish_logs_request_and_response_per_chunk() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: "n1".into() };
+        let ctx = crate::ailog::Ctx {
+            data_root: tmp.path().to_path_buf(),
+            note_id: "n1".into(),
+        };
         let base = mock_server(vec![chat_body(&["修订。"], "{}")]);
-        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "SECRET-KEY".into() };
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "SECRET-KEY".into(),
+        };
         let mut ps = vec![para("原文。")];
-        let (outcome, _ents) = polish(&cfg, &mut ps, Some(&ctx));
+        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, Some(&ctx));
         assert!(matches!(outcome, LlmOutcome::Done));
         // 连不上的一轮:同样要留痕
-        let cfg_bad = LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let cfg_bad = LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps2 = vec![para("原文。")];
-        let (outcome2, _ents2) = polish(&cfg_bad, &mut ps2, Some(&ctx));
+        let (outcome2, _ents2, _relations2) = polish(&cfg_bad, &mut ps2, Some(&ctx));
         assert!(matches!(outcome2, LlmOutcome::Failed));
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
         assert_eq!(v["total"], 2);
@@ -521,19 +643,32 @@ mod tests {
         let ok = entries.iter().find(|e| e["status"] == "ok").unwrap();
         assert_eq!(ok["kind"], "refine_chunk");
         assert_eq!(ok["note_id"], "n1");
-        assert!(ok["request"]["messages"][1]["content"].as_str().unwrap().contains("原文。"), "请求体全量");
-        assert!(ok["response"].as_str().unwrap().contains("choices"), "响应原文全量");
+        assert!(
+            ok["request"]["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("原文。"),
+            "请求体全量"
+        );
+        assert!(
+            ok["response"].as_str().unwrap().contains("choices"),
+            "响应原文全量"
+        );
         let err = entries.iter().find(|e| e["status"] == "error").unwrap();
         assert!(err["error"].as_str().unwrap().len() > 0);
     }
 
     #[test]
     fn parses_entities_from_response() {
-        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"灯塔计划下周启动\"],\"entities\":[{\"name\":\"灯塔计划\",\"kind\":\"project\",\"aliases\":[\"Lighthouse\"]}]}"}}]}"#;
+        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"灯塔计划下周启动\"],\"entities\":[{\"name\":\"灯塔计划\",\"kind\":\"project\",\"aliases\":[\"Lighthouse\"]}],\"relations\":[]}"}}]}"#;
         let base = mock_server(vec![body.to_string()]);
-        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps = vec![para("灯塔计划下周启动")];
-        let (outcome, ents) = polish(&cfg, &mut ps, None);
+        let (outcome, ents, _relations) = polish(&cfg, &mut ps, None);
         assert!(matches!(outcome, LlmOutcome::Done));
         assert_eq!(ps[0].text, "灯塔计划下周启动");
         assert_eq!(ents.len(), 1);
@@ -544,13 +679,129 @@ mod tests {
 
     #[test]
     fn missing_entities_key_degrades_to_empty_without_failing_texts() {
-        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"你好\"]}"}}]}"#;
+        let body = r#"{"choices":[{"message":{"content":"{\"glossary\":{},\"texts\":[\"你好\"],\"relations\":[]}"}}]}"#;
         let base = mock_server(vec![body.to_string()]);
-        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let mut ps = vec![para("你好")];
-        let (outcome, ents) = polish(&cfg, &mut ps, None);
-        assert!(matches!(outcome, LlmOutcome::Done), "缺 entities 不影响 texts 成败");
+        let (outcome, ents, _relations) = polish(&cfg, &mut ps, None);
+        assert!(
+            matches!(outcome, LlmOutcome::Done),
+            "缺 entities 不影响 texts 成败"
+        );
         assert!(ents.is_empty());
+    }
+
+    #[test]
+    fn parses_relations_with_absolute_unicode_scalar_offsets() {
+        let content = serde_json::json!({
+            "glossary": {},
+            "texts": ["🙂张三负责灯塔计划"],
+            "entities": [
+                {"name": "张三", "kind": "person", "aliases": []},
+                {"name": "灯塔计划", "kind": "project", "aliases": []}
+            ],
+            "relations": [{
+                "subject": "张三",
+                "predicate": {"type": "responsible_for", "label": null},
+                "object": "灯塔计划",
+                "confidence": 0.92,
+                "valid_from": null,
+                "valid_to": null,
+                "evidence": [{
+                    "paragraph_index": 0,
+                    "start": 1,
+                    "end": 9,
+                    "quote": "张三负责灯塔计划"
+                }]
+            }]
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string();
+        let base = mock_server(vec![body]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![para("🙂张三负则灯塔计划")];
+
+        let (outcome, ents, relations) = polish(&cfg, &mut ps, None);
+
+        assert!(matches!(outcome, LlmOutcome::Done));
+        assert_eq!(ps[0].text, "🙂张三负责灯塔计划");
+        assert_eq!(ents.len(), 2);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].predicate.kind, "responsible_for");
+        assert_eq!(relations[0].evidence[0].paragraph_index, 0);
+        assert_eq!(
+            (relations[0].evidence[0].start, relations[0].evidence[0].end),
+            (1, 9)
+        );
+        assert_eq!(relations[0].evidence[0].quote, "张三负责灯塔计划");
+    }
+
+    #[test]
+    fn missing_relations_is_graph_only_failure() {
+        let content = serde_json::json!({
+            "glossary": {},
+            "texts": ["修订文本"],
+            "entities": [{"name": "修订", "kind": "term", "aliases": []}]
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string();
+        let base = mock_server(vec![body]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![para("原始文本")];
+
+        let (outcome, ents, relations) = polish(&cfg, &mut ps, None);
+
+        assert!(matches!(outcome, LlmOutcome::DoneWithRelationErrors));
+        assert_eq!(ps[0].text, "修订文本", "关系字段缺失不能回滚文本");
+        assert_eq!(ents.len(), 1, "关系字段缺失不能回滚实体解析");
+        assert!(relations.is_empty());
+    }
+
+    #[test]
+    fn malformed_relations_is_graph_only_failure_but_explicit_empty_is_success() {
+        let malformed = serde_json::json!({
+            "choices": [{"message": {"content": serde_json::json!({
+                "glossary": {}, "texts": ["修订一"], "entities": [], "relations": {}
+            }).to_string()}}]
+        })
+        .to_string();
+        let empty = chat_body(&["修订二"], "{}");
+        let base = mock_server(vec![malformed, empty]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut first = vec![para("原文一")];
+        let mut second = vec![para("原文二")];
+
+        let (bad, _, bad_relations) = polish(&cfg, &mut first, None);
+        let (good, _, empty_relations) = polish(&cfg, &mut second, None);
+
+        assert!(matches!(bad, LlmOutcome::DoneWithRelationErrors));
+        assert_eq!(first[0].text, "修订一");
+        assert!(bad_relations.is_empty());
+        assert!(matches!(good, LlmOutcome::Done));
+        assert_eq!(second[0].text, "修订二");
+        assert!(empty_relations.is_empty());
     }
 
     #[test]
@@ -563,6 +814,14 @@ mod tests {
             let total: usize = c.iter().map(|&i| ps[i].text.chars().count()).sum();
             assert!(total <= CHUNK_CHARS || c.len() == 1);
         }
+    }
+
+    #[test]
+    fn chunk_prompt_keeps_absolute_paragraph_indexes() {
+        assert_eq!(
+            format_chunk_paragraphs(&[(7, "第八段"), (12, "第十三段")]),
+            "paragraph_index=7: 第八段\nparagraph_index=12: 第十三段\n"
+        );
     }
 }
 

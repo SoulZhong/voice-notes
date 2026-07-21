@@ -241,6 +241,18 @@ fn refine_agent_ready(s: &settings::Settings) -> bool {
     s.refine_enabled && s.refine_provider == "agent"
 }
 
+/// HTTP Aing 的提交→索引交接边界：note 写失败时绝不请求 rebuild；note 已写成功而
+/// scheduler 请求失败时不回滚人读真值，并把返回语义明确标成「已保存、待重试」。
+fn handoff_http_refine_write(
+    write_result: anyhow::Result<()>,
+    request_rebuild: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    write_result?;
+    request_rebuild().map_err(|error| {
+        anyhow::anyhow!("Aing 已保存，但语义索引排队失败，索引待重试（将自动重试）: {error:#}")
+    })
+}
+
 // resume_blocked_by_refining 纯函数已删:Aing 集入 lifecycle 内核(machine::RefineState),
 // 守卫仍在 do_resume_note_recording 原位判定(顺序不变:下载→Aing→模型),判定值
 // 由 actor 执行 Delegate 时从内核 Aing 集读出传入(见该函数 refining 参数注释)。
@@ -347,6 +359,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 let log_ctx = data_root(&app)
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+                let mut http_refine_handled = false;
                 if refine_agent_ready(&s) {
                     telemetry::track(
                         &app,
@@ -389,6 +402,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         }
                     }
                 } else if refine_llm_ready(&s) {
+                    http_refine_handled = true;
                     telemetry::track(
                         &app,
                         telemetry::Event::NoteRefined {
@@ -401,14 +415,27 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         model: s.refine_model.clone(),
                         api_key: s.refine_api_key.clone(),
                     };
-                    if let Err(e) = refine::run_llm(&dir, &mut doc, &cfg, &s.refine_model, log_ctx.as_ref()) {
-                        eprintln!("refine: llm 落盘失败: {e}");
+                    let write_result = refine::run_llm(
+                        &dir,
+                        &mut doc,
+                        &cfg,
+                        &s.refine_model,
+                        log_ctx.as_ref(),
+                    );
+                    if let Err(error) = handoff_http_refine_write(write_result, || {
+                        let root = data_root(&app)?;
+                        let graph_events = app.clone();
+                        graph_scheduler.request(root, move |status| {
+                            let _ = graph_events.emit("graph_index_status", status);
+                        })
+                    }) {
+                        eprintln!("refine: HTTP Aing 提交/索引交接: {error:#}");
                     }
                 }
                 report("llm", &doc.stages.llm);
                 // 图谱是纯增值产物:成功 Aing 只把全量重建标脏。scheduler 合并并发请求，
                 // 从 ledger + 全部 aing.json 取快照后原子替换；失败保留旧库且不打断 Aing。
-                if doc.stages.llm == "done" {
+                if !http_refine_handled && doc.stages.llm == "done" {
                     match data_root(&app) {
                         Ok(root) => {
                             let graph_events = app.clone();
@@ -3900,6 +3927,48 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("操作已保存"));
         assert!(error.contains("自动重试"));
+    }
+
+    #[test]
+    fn http_refine_handoff_runs_only_after_write_and_keeps_dirty_retry_on_spawn_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let note = root.path().join("notes").join("note-1");
+        std::fs::create_dir_all(&note).unwrap();
+        let saved = note.join(crate::store::AING_DOC_FILE);
+        std::fs::write(&saved, b"saved-document").unwrap();
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(crate::graph::index::BuildStats::default()),
+            |_job| Err(std::io::Error::other("injected spawn failure")),
+        );
+
+        let error = super::handoff_http_refine_write(Ok(()), || {
+            assert_eq!(std::fs::read(&saved).unwrap(), b"saved-document");
+            scheduler.request(root.path().to_path_buf(), |_| {})
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Aing 已保存"));
+        assert!(error.to_string().contains("索引待重试"));
+        assert!(root.path().join(".graph-index-dirty").is_file());
+        assert_eq!(std::fs::read(&saved).unwrap(), b"saved-document");
+    }
+
+    #[test]
+    fn http_refine_handoff_does_not_schedule_after_write_failure() {
+        let requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requested_in_closure = requested.clone();
+
+        let error = super::handoff_http_refine_write(
+            Err(anyhow::anyhow!("injected note write failure")),
+            move || {
+                requested_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected note write failure"));
+        assert!(!requested.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

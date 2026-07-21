@@ -5,12 +5,13 @@ pub mod agent;
 pub mod filter;
 pub mod llm;
 pub mod recluster;
+pub mod relations;
 
 use crate::diar::registry::SeedCluster;
 use crate::diar::SpeakerEmbedder;
 use crate::store::{
-    write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
-    SegmentRecord, SpeakerMeta,
+    write_refined_atomic, Entity, GraphExtraction, Mention, RefineStages, RefinedDoc,
+    RefinedParagraph, SegmentRecord, SpeakerMeta,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,7 +28,10 @@ pub fn run_local(
     generated_at: &str,
 ) -> RefinedDoc {
     let discarded = filter::discarded_seqs(segs);
-    let kept: Vec<&SegmentRecord> = segs.iter().filter(|s| !discarded.contains(&s.seq)).collect();
+    let kept: Vec<&SegmentRecord> = segs
+        .iter()
+        .filter(|s| !discarded.contains(&s.seq))
+        .collect();
 
     let inputs: Vec<recluster::SegInput> = kept
         .iter()
@@ -52,7 +56,7 @@ pub fn run_local(
     };
 
     let paragraphs = build_paragraphs(segs, &discarded, &assign, speakers);
-    let doc = RefinedDoc {
+    let mut doc = RefinedDoc {
         schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
         generated_at: generated_at.to_string(),
         llm_model: None,
@@ -69,8 +73,18 @@ pub fn run_local(
         relations: vec![],
         paragraphs,
     };
-    if let Err(e) = write_refined_atomic(note_dir, &doc) {
-        eprintln!("refine: refined.json 写盘失败: {e}");
+    match crate::store::notelock::NoteLock::acquire(note_dir) {
+        Ok(Some(_note_lock)) => {
+            if let Some(previous) = crate::store::load_refined(note_dir) {
+                doc.graph_extraction = previous.graph_extraction;
+                doc.relations = previous.relations;
+            }
+            if let Err(e) = write_refined_atomic(note_dir, &doc) {
+                eprintln!("refine: refined.json 写盘失败: {e}");
+            }
+        }
+        Ok(None) => eprintln!("refine: 笔记正被其它进程写入,跳过本地 Aing 落盘"),
+        Err(e) => eprintln!("refine: 获取笔记写锁失败: {e}"),
     }
     doc
 }
@@ -83,7 +97,12 @@ pub fn run_local(
 /// offset_ms 换算回文件内 ms,而不能假设轨道 0 时刻就是笔记 0 点。
 /// 越界一律 clamp 到 pcm_len;换算后 end<=start(轨道 offset 之后、或段整体早于该轨
 /// 出现时刻)返回 None,调用方按"该段在这轨没有可用音频"处理。
-fn slice_range(start_ms: u64, end_ms: u64, offset_ms: u64, pcm_len: usize) -> Option<(usize, usize)> {
+fn slice_range(
+    start_ms: u64,
+    end_ms: u64,
+    offset_ms: u64,
+    pcm_len: usize,
+) -> Option<(usize, usize)> {
     let a = ((start_ms.saturating_sub(offset_ms)) as usize * 16).min(pcm_len);
     let b = ((end_ms.saturating_sub(offset_ms)) as usize * 16).min(pcm_len);
     if b <= a {
@@ -117,7 +136,11 @@ fn embed_all(
         }) {
             continue;
         }
-        let offset_ms = audio_meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+        let offset_ms = audio_meta
+            .tracks
+            .get(source)
+            .map(|t| t.offset_ms)
+            .unwrap_or(0);
         let pcm = crate::store::transcode::track_pcm(note_dir, source)?;
         for &i in &idxs {
             let s = kept[i];
@@ -159,14 +182,21 @@ pub(crate) fn build_paragraphs(
         if discarded.contains(&s.seq) {
             continue;
         }
-        let Some(a) = by_seq.get(&s.seq) else { continue };
+        let Some(a) = by_seq.get(&s.seq) else {
+            continue;
+        };
         let old_meta = s.speaker.as_ref().and_then(|old| speakers.get(old));
         let name = a.name.clone().or_else(|| {
-            old_meta.filter(|m| !m.name.is_empty()).map(|m| m.name.clone())
+            old_meta
+                .filter(|m| !m.name.is_empty())
+                .map(|m| m.name.clone())
         });
         // 人物关联:重聚类种子命中优先;降级路径(沿用旧 S 标签)继承该说话人在
         // speakers.json 里已有的关联——与 name 同一套兜底逻辑。
-        let person_id = a.person.clone().or_else(|| old_meta.and_then(|m| m.person_id.clone()));
+        let person_id = a
+            .person
+            .clone()
+            .or_else(|| old_meta.and_then(|m| m.person_id.clone()));
         let merge = out.last().map_or(false, |p: &RefinedParagraph| {
             p.speaker == a.speaker && s.end_ms.saturating_sub(p.start_ms) <= MAX_PARA_MS
         });
@@ -203,9 +233,10 @@ pub fn run_llm(
     llm_model: &str,
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
-    let (text_outcome, raw_entities) = llm::polish(cfg, &mut doc.paragraphs, log);
-    let state = match text_outcome {
-        llm::LlmOutcome::Done => "done",
+    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log);
+    let relations_complete = text_outcome.relations_complete();
+    let state = match &text_outcome {
+        llm::LlmOutcome::Done | llm::LlmOutcome::DoneWithRelationErrors => "done",
         llm::LlmOutcome::Partial(_) => "partial",
         llm::LlmOutcome::Failed => "failed",
     };
@@ -213,9 +244,72 @@ pub fn run_llm(
     doc.llm_model = Some(llm_model.to_string());
     // 实体维度:与文本同一批调用产出,stages.entities 跟随 state;实体环节绝不回退修订文本。
     fill_entities(doc, raw_entities, state);
+
+    let note_id = note_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
+    let _note_lock = match crate::store::notelock::NoteLock::acquire(note_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            doc.stages.llm = "failed".into();
+            doc.stages.entities = "failed".into();
+            doc.stages.relations = "failed".into();
+            anyhow::bail!("笔记正被其它进程写入,无法提交 HTTP Aing");
+        }
+        Err(error) => {
+            doc.stages.llm = "failed".into();
+            doc.stages.entities = "failed".into();
+            doc.stages.relations = "failed".into();
+            return Err(error.into());
+        }
+    };
+    // HTTP 调用期间不占 note lock；提交前在锁内重载最新关系快照。成功替换关系和
+    // extraction，任意 parse/materialize/validator 失败则逐字段恢复，正文/实体照常提交。
+    let fallback = crate::store::load_refined(note_dir)
+        .map(|previous| (previous.graph_extraction, previous.relations))
+        .unwrap_or_else(|| (doc.graph_extraction.clone(), doc.relations.clone()));
+    if relations_complete {
+        match relations::materialize(note_id, doc, raw_relations) {
+            Ok(graph) => {
+                let source_hash = crate::store::source_hash(&doc.paragraphs);
+                let extraction = GraphExtraction {
+                    contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+                    provider: "openai".into(),
+                    model: llm_model.to_string(),
+                    run_id: crate::store::stable_id(
+                        "run_",
+                        &[
+                            note_id.to_string(),
+                            llm_model.to_string(),
+                            doc.generated_at.clone(),
+                            source_hash.clone(),
+                        ],
+                    ),
+                    generated_at: doc.generated_at.clone(),
+                    source_hash,
+                    mode: "http".into(),
+                };
+                relations::apply_validated_graph(doc, extraction, graph);
+            }
+            Err(issues) => {
+                for issue in issues {
+                    eprintln!("refine relations: {}: {}", issue.field, issue.message);
+                }
+                doc.graph_extraction = fallback.0;
+                doc.relations = fallback.1;
+                doc.stages.relations = "failed".into();
+            }
+        }
+    } else {
+        doc.graph_extraction = fallback.0;
+        doc.relations = fallback.1;
+        doc.stages.relations = "failed".into();
+    }
     if let Err(e) = write_refined_atomic(note_dir, doc) {
         doc.stages.llm = "failed".into();
         doc.stages.entities = "failed".into();
+        doc.stages.relations = "failed".into();
         return Err(e);
     }
     Ok(())
@@ -250,7 +344,10 @@ pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
                 let a = a.trim().to_string();
                 if !a.is_empty()
                     && a.to_lowercase() != key
-                    && !e.aliases.iter().any(|x| x.to_lowercase() == a.to_lowercase())
+                    && !e
+                        .aliases
+                        .iter()
+                        .any(|x| x.to_lowercase() == a.to_lowercase())
                 {
                     e.aliases.push(a);
                 }
@@ -267,7 +364,12 @@ pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
                     aliases.push(a);
                 }
             }
-            out.push(Entity { id, kind: r.kind.trim().to_string(), name: name.to_string(), aliases });
+            out.push(Entity {
+                id,
+                kind: r.kind.trim().to_string(),
+                name: name.to_string(),
+                aliases,
+            });
         }
     }
     out
@@ -294,7 +396,10 @@ fn find_char_spans(hay: &str, needle: &str) -> Vec<(usize, usize)> {
 /// 对每段,在修订后 `text` 里按各实体 name+aliases 子串搜索,产出提及区间。
 /// 单段内所有实体的命中合一起按 (start 升序, 长度降序) 贪心去重叠,保证高亮不交叠、
 /// 长匹配优先(别名「灯塔」与全名「灯塔计划」重叠时留全名)。返回与 paragraphs 逐段对齐。
-pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Entity]) -> Vec<Vec<Mention>> {
+pub(crate) fn compute_mentions(
+    paragraphs: &[RefinedParagraph],
+    entities: &[Entity],
+) -> Vec<Vec<Mention>> {
     paragraphs
         .iter()
         .map(|p| {
@@ -314,7 +419,12 @@ pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Enti
             let mut first = true;
             for (s, en, id) in hits {
                 if first || s >= last_end {
-                    chosen.push(Mention { id: String::new(), entity: id.to_string(), start: s, end: en });
+                    chosen.push(Mention {
+                        id: String::new(),
+                        entity: id.to_string(),
+                        start: s,
+                        end: en,
+                    });
                     last_end = en;
                     first = false;
                 }
@@ -328,8 +438,12 @@ pub(crate) fn compute_mentions(paragraphs: &[RefinedParagraph], entities: &[Enti
 mod tests {
     use super::*;
     use crate::store;
-    use crate::store::{SegmentRecord, SpeakerMeta};
+    use crate::store::{
+        GraphExtraction, RelationEvidence, RelationFact, RelationPredicate, SegmentRecord,
+        SpeakerMeta,
+    };
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
 
     fn para(text: &str) -> crate::store::RefinedParagraph {
         crate::store::RefinedParagraph {
@@ -349,7 +463,13 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
             discarded_seqs: vec![],
             entities: vec![],
             graph_extraction: None,
@@ -358,13 +478,148 @@ mod tests {
         }
     }
 
+    fn old_graph() -> (Option<GraphExtraction>, Vec<RelationFact>) {
+        (
+            Some(GraphExtraction {
+                contract_version: crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+                provider: "old-provider".into(),
+                model: "old-model".into(),
+                run_id: "old-run".into(),
+                generated_at: "2026-07-20T09:00:00+08:00".into(),
+                source_hash: "old-source".into(),
+                mode: "http".into(),
+            }),
+            vec![RelationFact {
+                id: "old-relation".into(),
+                subject: "old-subject".into(),
+                predicate: RelationPredicate {
+                    kind: "uses".into(),
+                    label: None,
+                },
+                object: "old-object".into(),
+                subject_mentions: vec!["old-subject-mention".into()],
+                object_mentions: vec!["old-object-mention".into()],
+                confidence: 0.88,
+                valid_from: None,
+                valid_to: None,
+                evidence: vec![RelationEvidence {
+                    id: "old-evidence".into(),
+                    paragraph_index: 0,
+                    start: 0,
+                    end: 1,
+                    quote: "旧".into(),
+                    source_seqs: vec![0],
+                    source_hash: "old-source".into(),
+                }],
+            }],
+        )
+    }
+
+    fn graph_bytes(doc: &RefinedDoc) -> Vec<u8> {
+        serde_json::to_vec(&(doc.graph_extraction.clone(), doc.relations.clone())).unwrap()
+    }
+
+    fn mock_server(body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn chat_response(content: serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"content": content.to_string()}}]
+        })
+        .to_string()
+    }
+
+    fn relation_content(quote: &str, include_object_entity: bool) -> serde_json::Value {
+        let mut entities = vec![serde_json::json!({
+            "name": "张三", "kind": "person", "aliases": []
+        })];
+        if include_object_entity {
+            entities.push(serde_json::json!({
+                "name": "灯塔计划", "kind": "project", "aliases": []
+            }));
+        }
+        serde_json::json!({
+            "glossary": {},
+            "texts": ["🙂张三负责灯塔计划"],
+            "entities": entities,
+            "relations": [{
+                "subject": "张三",
+                "predicate": {"type": "responsible_for", "label": null},
+                "object": "灯塔计划",
+                "confidence": 0.92,
+                "valid_from": null,
+                "valid_to": null,
+                "evidence": [{
+                    "paragraph_index": 0,
+                    "start": 1,
+                    "end": 9,
+                    "quote": quote
+                }]
+            }]
+        })
+    }
+
     #[test]
     fn resolve_dedups_by_name_case_insensitive_and_merges_aliases() {
         let raw = vec![
-            llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec!["Lighthouse".into()] },
-            llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec!["灯塔".into()] },
-            llm::RawEntity { name: "Acme".into(), kind: "org".into(), aliases: vec![] },
-            llm::RawEntity { name: "acme".into(), kind: "org".into(), aliases: vec!["ACME 公司".into()] },
+            llm::RawEntity {
+                name: "灯塔计划".into(),
+                kind: "project".into(),
+                aliases: vec!["Lighthouse".into()],
+            },
+            llm::RawEntity {
+                name: "灯塔计划".into(),
+                kind: "project".into(),
+                aliases: vec!["灯塔".into()],
+            },
+            llm::RawEntity {
+                name: "Acme".into(),
+                kind: "org".into(),
+                aliases: vec![],
+            },
+            llm::RawEntity {
+                name: "acme".into(),
+                kind: "org".into(),
+                aliases: vec!["ACME 公司".into()],
+            },
         ];
         let ents = resolve_note_entities(raw);
         assert_eq!(ents.len(), 2, "灯塔计划 与 Acme 各归一为一个");
@@ -392,13 +647,34 @@ mod tests {
             para("我们叫它 Lighthouse 吧"), // "我们叫它 " 是 5 个 char(含空格),Lighthouse 从 char 5 起
         ];
         let ms = compute_mentions(&ps, &ents);
-        assert_eq!(ms[0], vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }]);
-        assert_eq!(ms[1], vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 5, end: 15 }]);
+        assert_eq!(
+            ms[0],
+            vec![store::Mention {
+                id: String::new(),
+                entity: "ent_1".into(),
+                start: 0,
+                end: 4
+            }]
+        );
+        assert_eq!(
+            ms[1],
+            vec![store::Mention {
+                id: String::new(),
+                entity: "ent_1".into(),
+                start: 5,
+                end: 15
+            }]
+        );
     }
 
     #[test]
     fn compute_mentions_non_overlapping_and_empty_when_absent() {
-        let ents = vec![store::Entity { id: "ent_1".into(), kind: "term".into(), name: "AB".into(), aliases: vec![] }];
+        let ents = vec![store::Entity {
+            id: "ent_1".into(),
+            kind: "term".into(),
+            name: "AB".into(),
+            aliases: vec![],
+        }];
         let ps = vec![para("无关文本")];
         assert!(compute_mentions(&ps, &ents)[0].is_empty());
     }
@@ -454,7 +730,10 @@ mod tests {
         ];
         let a = [1.0, 0.0, 0.0];
         let b = [0.0, 1.0, 0.0];
-        let mut e = SeqEmbedder { dirs: vec![a, a, b], i: 0 };
+        let mut e = SeqEmbedder {
+            dirs: vec![a, a, b],
+            i: 0,
+        };
         let doc = run_local(
             dir.path(),
             &segs,
@@ -470,7 +749,10 @@ mod tests {
         assert_eq!(doc.paragraphs.len(), 2, "seq0+seq2 并段,seq3 独立");
         assert_eq!(doc.paragraphs[0].source_seqs, vec![0, 2]);
         assert_ne!(doc.paragraphs[0].speaker, doc.paragraphs[1].speaker);
-        assert!(crate::store::load_refined(dir.path()).is_some(), "run_local 已落盘");
+        assert!(
+            crate::store::load_refined(dir.path()).is_some(),
+            "run_local 已落盘"
+        );
     }
 
     #[test]
@@ -491,8 +773,16 @@ mod tests {
         let doc = run_local(dir.path(), &segs, &speakers, None, &[], "t");
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
-        assert_eq!(doc.paragraphs[0].name.as_deref(), Some("老板"), "旧标签沿用用户改名");
-        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P2"), "降级路径继承既有人物关联");
+        assert_eq!(
+            doc.paragraphs[0].name.as_deref(),
+            Some("老板"),
+            "旧标签沿用用户改名"
+        );
+        assert_eq!(
+            doc.paragraphs[0].person_id.as_deref(),
+            Some("P2"),
+            "降级路径继承既有人物关联"
+        );
     }
 
     #[test]
@@ -501,24 +791,41 @@ mod tests {
             .map(|i| seg(i, "mic", "内容。", i * 20_000, (i + 1) * 20_000, "S1"))
             .collect();
         let assign: Vec<_> = (0..5)
-            .map(|i| recluster::Assignment { seq: i, speaker: "R1".into(), name: None, person: None })
+            .map(|i| recluster::Assignment {
+                seq: i,
+                speaker: "R1".into(),
+                name: None,
+                person: None,
+            })
             .collect();
         let ps = build_paragraphs(&segs, &[], &assign, &BTreeMap::new());
         assert!(ps.len() >= 2, "100s 同人内容必须按 MAX_PARA_MS 切段");
-        assert!(ps.iter().all(|p| p.end_ms - p.start_ms <= MAX_PARA_MS + 20_000));
+        assert!(ps
+            .iter()
+            .all(|p| p.end_ms - p.start_ms <= MAX_PARA_MS + 20_000));
     }
 
     #[test]
     fn slice_range_covers_offset_bounds_and_inversion() {
         // offset=0:直接按 ms*16 换算,不做任何偏移。
-        assert_eq!(slice_range(1000, 3000, 0, 1_000_000), Some((16_000, 48_000)));
+        assert_eq!(
+            slice_range(1000, 3000, 0, 1_000_000),
+            Some((16_000, 48_000))
+        );
         // offset=60_000(续录/中途授权轨道,从第 60s 才出现):时间轴 ms 须先减掉 offset
         // 才是文件内 ms,直接拿时间轴 ms 当文件内 ms 用是 F2 的 bug。
-        assert_eq!(slice_range(61_000, 63_000, 60_000, 1_000_000), Some((16_000, 48_000)));
+        assert_eq!(
+            slice_range(61_000, 63_000, 60_000, 1_000_000),
+            Some((16_000, 48_000))
+        );
         // 越界:换算后终点超过 pcm 实际长度,clamp 到 pcm_len;clamp 后 start==end(=pcm_len)
         // 时说明这段完全落在文件外,必须 None。
         assert_eq!(slice_range(0, 1_000_000, 0, 1_000), Some((0, 1_000)));
-        assert_eq!(slice_range(100_000, 200_000, 0, 1_000), None, "clamp 后 start==end→None");
+        assert_eq!(
+            slice_range(100_000, 200_000, 0, 1_000),
+            None,
+            "clamp 后 start==end→None"
+        );
         // 倒置:end<=start(含 offset 换算后倒置)一律 None,绝不倒切片。
         assert_eq!(slice_range(3000, 1000, 0, 1_000_000), None);
     }
@@ -563,7 +870,10 @@ mod tests {
         }
         let mut e = CaptureEmbedder(Vec::new());
         let out = embed_all(dir.path(), &kept, &mut e).unwrap();
-        assert!(out[0].is_some(), "offset 换算后应落在轨道有效范围内,必须产出嵌入");
+        assert!(
+            out[0].is_some(),
+            "offset 换算后应落在轨道有效范围内,必须产出嵌入"
+        );
         assert_eq!(
             e.0[0],
             5000.0 / 32768.0,
@@ -580,14 +890,24 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
             discarded_seqs: vec![],
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
             paragraphs: vec![],
         };
-        let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let cfg = llm::LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         run_llm(dir.path(), &mut doc, &cfg, "m", None).expect("空段落路径不应触网,写盘应成功");
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(doc.llm_model.as_deref(), Some("m"));
@@ -606,28 +926,53 @@ mod tests {
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
-            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
             discarded_seqs: vec![],
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
             paragraphs: vec![],
         };
-        let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let cfg = llm::LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None);
         assert!(err.is_err(), "目录不存在,写盘必须失败");
-        assert_eq!(doc.stages.llm, "failed", "写盘失败必须把内存态降级为 failed");
+        assert_eq!(
+            doc.stages.llm, "failed",
+            "写盘失败必须把内存态降级为 failed"
+        );
     }
 
     #[test]
     fn fill_entities_populates_entities_and_mentions() {
         let mut doc = doc_with(&["灯塔计划下周启动"]);
-        let raw = vec![llm::RawEntity { name: "灯塔计划".into(), kind: "project".into(), aliases: vec![] }];
+        let raw = vec![llm::RawEntity {
+            name: "灯塔计划".into(),
+            kind: "project".into(),
+            aliases: vec![],
+        }];
         fill_entities(&mut doc, raw, "done");
         assert_eq!(doc.stages.entities, "done");
         assert_eq!(doc.entities.len(), 1);
         assert_eq!(doc.entities[0].id, "ent_1");
-        assert_eq!(doc.paragraphs[0].mentions, vec![store::Mention { id: String::new(), entity: "ent_1".into(), start: 0, end: 4 }]);
+        assert_eq!(
+            doc.paragraphs[0].mentions,
+            vec![store::Mention {
+                id: String::new(),
+                entity: "ent_1".into(),
+                start: 0,
+                end: 4
+            }]
+        );
     }
 
     #[test]
@@ -653,12 +998,216 @@ mod tests {
         // 验证 run_llm 确实调了 fill_entities:stages.entities 被置位(done)、entities 空。
         let dir = tempfile::tempdir().unwrap();
         let mut doc = doc_with(&[]);
-        let cfg = llm::LlmConfig { base_url: "http://127.0.0.1:1".into(), model: "m".into(), api_key: "k".into() };
+        let cfg = llm::LlmConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        };
         run_llm(dir.path(), &mut doc, &cfg, "m", None).unwrap();
         assert_eq!(doc.stages.llm, "done");
-        assert_eq!(doc.stages.entities, "done", "run_llm 应经 fill_entities 置位 stages.entities");
+        assert_eq!(
+            doc.stages.entities, "done",
+            "run_llm 应经 fill_entities 置位 stages.entities"
+        );
         let reloaded = crate::store::load_refined(dir.path()).unwrap();
         assert_eq!(reloaded.stages.entities, "done", "落盘也带上 entities 阶段");
+    }
+
+    #[test]
+    fn run_llm_materializes_and_persists_http_relations_with_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = doc_with(&["🙂张三负则灯塔计划"]);
+        doc.paragraphs[0].source_seqs = vec![42, 41];
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
+        let base = mock_server(chat_response(relation_content("张三负责灯塔计划", true)));
+        let cfg = llm::LlmConfig {
+            base_url: base,
+            model: "model-v1".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(dir.path(), &mut doc, &cfg, "model-v1", None).unwrap();
+
+        assert_eq!(doc.paragraphs[0].text, "🙂张三负责灯塔计划");
+        assert_eq!(doc.stages.llm, "done");
+        assert_eq!(doc.stages.entities, "done");
+        assert_eq!(doc.stages.relations, "done");
+        assert_eq!(doc.relations.len(), 1);
+        let relation = &doc.relations[0];
+        assert!(relation.id.starts_with("rf_"));
+        assert_eq!(relation.subject, "ent_1");
+        assert_eq!(relation.object, "ent_2");
+        assert_eq!(relation.evidence[0].quote, "张三负责灯塔计划");
+        assert_eq!(relation.evidence[0].source_seqs, vec![41, 42]);
+        assert!(relation.subject_mentions[0].starts_with("mn_"));
+        assert!(relation.object_mentions[0].starts_with("mn_"));
+        let extraction = doc.graph_extraction.as_ref().unwrap();
+        assert_eq!(
+            extraction.contract_version,
+            crate::store::aing_graph::GRAPH_CONTRACT_VERSION
+        );
+        assert_eq!(extraction.provider, "openai");
+        assert_eq!(extraction.model, "model-v1");
+        assert_eq!(extraction.mode, "http");
+        assert_eq!(extraction.source_hash, store::source_hash(&doc.paragraphs));
+        assert!(extraction.run_id.starts_with("run_"));
+
+        let persisted = store::load_refined(dir.path()).unwrap();
+        assert_eq!(graph_bytes(&persisted), graph_bytes(&doc));
+        assert_eq!(persisted.stages.relations, "done");
+    }
+
+    #[test]
+    fn invalid_quote_or_absent_entity_preserves_prior_graph_but_keeps_text_and_entities() {
+        for (quote, include_object_entity) in
+            [("张三拥有灯塔计划", true), ("张三负责灯塔计划", false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut doc = doc_with(&["🙂张三负则灯塔计划"]);
+            (doc.graph_extraction, doc.relations) = old_graph();
+            store::write_refined_atomic(dir.path(), &doc).unwrap();
+            let baseline = store::load_refined(dir.path()).unwrap();
+            let baseline_graph = graph_bytes(&baseline);
+            doc = baseline;
+            let base = mock_server(chat_response(relation_content(
+                quote,
+                include_object_entity,
+            )));
+            let cfg = llm::LlmConfig {
+                base_url: base,
+                model: "model-v2".into(),
+                api_key: "k".into(),
+            };
+
+            run_llm(dir.path(), &mut doc, &cfg, "model-v2", None).unwrap();
+
+            assert_eq!(doc.paragraphs[0].text, "🙂张三负责灯塔计划");
+            assert_eq!(doc.stages.llm, "done");
+            assert_eq!(doc.stages.entities, "done");
+            assert_eq!(doc.stages.relations, "failed");
+            assert_eq!(
+                graph_bytes(&doc),
+                baseline_graph,
+                "旧 relations+extraction 必须逐字节不变"
+            );
+            let persisted = store::load_refined(dir.path()).unwrap();
+            assert_eq!(persisted.paragraphs[0].text, "🙂张三负责灯塔计划");
+            assert_eq!(persisted.stages.relations, "failed");
+            assert_eq!(graph_bytes(&persisted), baseline_graph);
+        }
+    }
+
+    #[test]
+    fn missing_relations_preserves_prior_graph_while_explicit_empty_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = doc_with(&["原文"]);
+        (doc.graph_extraction, doc.relations) = old_graph();
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
+        let baseline = store::load_refined(dir.path()).unwrap();
+        let baseline_graph = graph_bytes(&baseline);
+        doc = baseline;
+        let missing = serde_json::json!({
+            "glossary": {}, "texts": ["修订文本"], "entities": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(missing)),
+            model: "model-v2".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(dir.path(), &mut doc, &cfg, "model-v2", None).unwrap();
+
+        assert_eq!(doc.paragraphs[0].text, "修订文本");
+        assert_eq!(doc.stages.llm, "done");
+        assert_eq!(doc.stages.entities, "done");
+        assert_eq!(doc.stages.relations, "failed");
+        assert_eq!(graph_bytes(&doc), baseline_graph);
+
+        let explicit_empty = serde_json::json!({
+            "glossary": {}, "texts": ["二次修订"], "entities": [], "relations": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(explicit_empty)),
+            model: "model-v3".into(),
+            api_key: "k".into(),
+        };
+        run_llm(dir.path(), &mut doc, &cfg, "model-v3", None).unwrap();
+
+        assert_eq!(doc.paragraphs[0].text, "二次修订");
+        assert_eq!(doc.stages.relations, "done");
+        assert!(doc.relations.is_empty(), "显式 [] 是成功替换，不保留旧事实");
+        assert_eq!(doc.graph_extraction.as_ref().unwrap().model, "model-v3");
+    }
+
+    #[test]
+    fn run_local_carries_prior_graph_snapshot_before_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut previous = doc_with(&["旧稿"]);
+        (previous.graph_extraction, previous.relations) = old_graph();
+        store::write_refined_atomic(dir.path(), &previous).unwrap();
+        let baseline = store::load_refined(dir.path()).unwrap();
+        let baseline_graph = graph_bytes(&baseline);
+        let segments = vec![seg(7, "mic", "本地新稿。", 0, 4000, "S1")];
+
+        let doc = run_local(
+            dir.path(),
+            &segments,
+            &BTreeMap::new(),
+            None,
+            &[],
+            "new-time",
+        );
+
+        assert_eq!(doc.paragraphs[0].text, "本地新稿。");
+        assert_eq!(graph_bytes(&doc), baseline_graph);
+        assert_eq!(
+            graph_bytes(&store::load_refined(dir.path()).unwrap()),
+            baseline_graph
+        );
+    }
+
+    #[test]
+    fn note_lock_prevents_run_local_and_run_llm_from_overwriting_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = doc_with(&["锁内旧稿"]);
+        store::write_refined_atomic(dir.path(), &previous).unwrap();
+        let baseline = std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap();
+        let lock = crate::store::notelock::NoteLock::try_exclusive(dir.path())
+            .unwrap()
+            .unwrap();
+
+        let segments = vec![seg(7, "mic", "不应写入。", 0, 4000, "S1")];
+        let _ = run_local(
+            dir.path(),
+            &segments,
+            &BTreeMap::new(),
+            None,
+            &[],
+            "new-time",
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),
+            baseline,
+            "run_local 必须服从 note lock"
+        );
+
+        let mut doc = store::load_refined(dir.path()).unwrap();
+        let explicit_empty = serde_json::json!({
+            "glossary": {}, "texts": ["也不应写入"], "entities": [], "relations": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(explicit_empty)),
+            model: "model-v3".into(),
+            api_key: "k".into(),
+        };
+        let result = run_llm(dir.path(), &mut doc, &cfg, "model-v3", None);
+        assert!(result.is_err(), "拿不到 note lock 必须显式报告未提交");
+        assert_eq!(
+            std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),
+            baseline,
+            "run_llm 必须服从 note lock"
+        );
+        drop(lock);
     }
 
     fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -726,6 +1275,9 @@ mod tests {
         println!("discarded 数: {}", doc.discarded_seqs.len());
         println!("工作目录: {}", dst.display());
 
-        assert!(crate::store::load_refined(&dst).is_some(), "refined.json 应已生成");
+        assert!(
+            crate::store::load_refined(&dst).is_some(),
+            "refined.json 应已生成"
+        );
     }
 }
