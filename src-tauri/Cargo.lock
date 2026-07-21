@@ -6022,6 +6022,7 @@ dependencies = [
  "tract-onnx",
  "ureq",
  "webrtc-audio-processing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

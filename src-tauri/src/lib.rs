@@ -113,6 +113,8 @@ struct AppState {
     /// 任一把锁时调它的阻塞方法（cancel_and_wait 等 in-flight）。停录入队、启动回溯
     /// 扫描入队、续录前 cancel_and_wait 都从队列这一把锁出入，与上述锁序完全解耦。
     transcode: Arc<store::transcode::TranscodeQueue>,
+    /// 语义图全量重建调度器:dirty 合并请求,running 保证至多一个 builder。
+    graph_scheduler: graph::index::RebuildScheduler,
     // refining 集合已删(P3):Aing 态入 lifecycle 内核(machine::RefineState),
     // 防重入/续录拦截由内核裁决,Aing 中查询走 LifecycleHandle::is_refining。
 }
@@ -130,6 +132,7 @@ impl Default for AppState {
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
+            graph_scheduler: graph::index::RebuildScheduler::default(),
         }
     }
 }
@@ -263,6 +266,7 @@ static AING_GATE: Mutex<()> = Mutex::new(());
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
     let transcode = state.transcode.clone();
+    let graph_scheduler = state.graph_scheduler.clone();
     let session = state.session.clone();
     let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
     // Aing 态置 Running 的信号(原 refining.insert 的时机)同步先行——必须在 spawn
@@ -402,13 +406,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 report("llm", &doc.stages.llm);
-                // 图谱是纯增值产物:仅成功 Aing 的笔记入图,失败只记日志不打断本轮 Aing。
+                // 图谱是纯增值产物:成功 Aing 只把全量重建标脏。scheduler 合并并发请求，
+                // 从 ledger + 全部 aing.json 取快照后原子替换；失败保留旧库且不打断 Aing。
                 if doc.stages.llm == "done" {
                     match data_root(&app) {
                         Ok(root) => {
-                            if let Err(e) = graph::upsert_note(&root, &note_id, &doc) {
-                                eprintln!("graph: upsert {note_id} 失败(不影响 Aing): {e}");
-                            }
+                            let graph_events = app.clone();
+                            graph_scheduler.request(root, move |status| {
+                                let _ = graph_events.emit("graph_index_status", status);
+                            });
                         }
                         Err(e) => eprintln!("graph: data_root 不可用,跳过入图: {e}"),
                     }
@@ -3393,18 +3399,14 @@ pub fn run() {
                 // Skill 同步:受管且过期(应用升级后)静默重写为当前版本。
                 let _ = crate::mcp::skill::heal();
             });
-            // 图谱存量兜底:存量笔记(升级前已有 aing.json)入图——后台整库重建一次,
-            // 兜底 spawn_refine 的尾部 upsert 只覆盖本次会话新 Aing 的空白。纯增值,
-            // 失败只 eprintln,不挡启动。
-            let app_for_graph = handle.clone();
-            std::thread::spawn(move || {
-                if let Ok(root) = data_root(&app_for_graph) {
-                    match graph::rebuild_all(&root) {
-                        Ok(n) => eprintln!("graph: 启动重建完成,{n} 篇入图"),
-                        Err(e) => eprintln!("graph: 启动重建失败(不影响运行): {e}"),
-                    }
-                }
-            });
+            // 图谱存量兜底:启动只标脏一次。与 Aing 完成请求共用同一 scheduler，
+            // 因而不会重叠 builder，也不会在 worker 退出窗口丢掉最后一次请求。
+            if let Ok(root) = data_root(&handle) {
+                let graph_events = handle.clone();
+                st.graph_scheduler.request(root, move |status| {
+                    let _ = graph_events.emit("graph_index_status", status);
+                });
+            }
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
             telemetry::track(&handle, telemetry::Event::AppStarted);
