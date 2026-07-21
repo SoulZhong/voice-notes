@@ -29,7 +29,6 @@ struct GraphFallbackSnapshot {
     relations: Vec<crate::store::RelationFact>,
     entities: Vec<Entity>,
     mentions: Vec<(usize, Mention)>,
-    support_mention_ids: BTreeSet<String>,
 }
 
 impl GraphFallbackSnapshot {
@@ -109,12 +108,6 @@ impl GraphFallbackSnapshot {
             relations: doc.relations.clone(),
             entities,
             mentions,
-            support_mention_ids: doc
-                .graph_support_mentions
-                .iter()
-                .filter(|id| referenced_mentions.contains_key(id.as_str()))
-                .cloned()
-                .collect(),
         }
     }
 
@@ -188,22 +181,19 @@ impl GraphFallbackSnapshot {
         let mut support_mention_ids: BTreeSet<_> = doc.graph_support_mentions.drain(..).collect();
         for (old_index, mention) in self.mentions {
             let safe_index = old_index.min(doc.paragraphs.len() - 1);
-            if !self.support_mention_ids.contains(&mention.id) {
-                if let Some(current) =
-                    doc.paragraphs[safe_index]
-                        .mentions
-                        .iter_mut()
-                        .find(|current| {
-                            current.entity == mention.entity
-                                && current.start == mention.start
-                                && current.end == mention.end
-                        })
-                {
-                    // 同一实体、同一段落区间只有一个物理 mention：它是本轮 fresh live
-                    // occurrence。沿用旧引用 id 即可同时服务旧关系，不能再复制成 support。
-                    current.id = mention.id;
-                    continue;
-                }
+            let fresh_match = doc.paragraphs.get_mut(old_index).and_then(|paragraph| {
+                paragraph.mentions.iter_mut().find(|current| {
+                    current.entity == mention.entity
+                        && current.start == mention.start
+                        && current.end == mention.end
+                })
+            });
+            if let Some(current) = fresh_match {
+                // 必须同时匹配实体归属、原段落和区间；stable id 相同本身不足以证明
+                // occurrence 已回到当前正文。命中后沿用旧关系引用 id，并提升回 live。
+                current.id = mention.id.clone();
+                support_mention_ids.remove(&mention.id);
+                continue;
             }
             for paragraph in &mut doc.paragraphs {
                 paragraph
@@ -232,7 +222,6 @@ impl GraphFallbackSnapshot {
             .flat_map(|paragraph| &paragraph.mentions)
             .map(|mention| mention.id.as_str())
             .collect();
-        support_mention_ids.extend(self.support_mention_ids);
         doc.graph_support_mentions = support_mention_ids
             .into_iter()
             .filter(|id| actual_mentions.contains(id.as_str()))
@@ -1937,6 +1926,100 @@ mod tests {
             .collect();
         quotes.sort();
         assert_eq!(quotes, vec!["张三", "灯塔计划"]);
+    }
+
+    #[test]
+    fn fallback_support_mentions_promote_when_fresh_occurrences_return() {
+        let root = tempfile::tempdir().unwrap();
+        let note_id = "fallback-support-promotion";
+        let dir = note_dir(root.path(), note_id);
+        let mut doc = valid_prior_doc(note_id);
+        let relation_mentions: BTreeSet<_> = doc.relations[0]
+            .subject_mentions
+            .iter()
+            .chain(&doc.relations[0].object_mentions)
+            .cloned()
+            .collect();
+        store::write_refined_atomic(&dir, &doc).unwrap();
+        let changed = changed_entities_content("李四负责火星计划", None);
+        let restored = serde_json::json!({
+            "glossary": {},
+            "texts": ["张三负责灯塔计划"],
+            "entities": [
+                {"name": "张三", "kind": "person", "aliases": []},
+                {"name": "灯塔计划", "kind": "project", "aliases": []}
+            ]
+        });
+        let cfg = llm::LlmConfig {
+            base_url: sequence_server(vec![
+                Some(chat_response(changed)),
+                Some(chat_response(restored)),
+            ]),
+            model: "model-v2".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(&dir, &mut doc, &cfg, "model-changed", None).unwrap();
+        assert_eq!(
+            doc.graph_support_mentions
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            relation_mentions,
+            "正文不再包含旧 occurrences 时，关系端点必须降级为 support"
+        );
+
+        run_llm(&dir, &mut doc, &cfg, "model-restored", None).unwrap();
+
+        assert_fallback_dependencies(&doc);
+        assert!(
+            doc.graph_support_mentions.is_empty(),
+            "相同实体、段落和区间重新成为 fresh occurrence 后必须提升回 live"
+        );
+        let all_mentions: Vec<_> = doc
+            .paragraphs
+            .iter()
+            .enumerate()
+            .flat_map(|(paragraph_index, paragraph)| {
+                paragraph
+                    .mentions
+                    .iter()
+                    .map(move |mention| (paragraph_index, mention))
+            })
+            .collect();
+        assert_eq!(all_mentions.len(), 2);
+        assert!(all_mentions.iter().all(|(paragraph_index, mention)| {
+            *paragraph_index == 0
+                && relation_mentions.contains(&mention.id)
+                && ((mention.entity == "ent_1" && mention.start == 0 && mention.end == 2)
+                    || (mention.entity == "ent_2" && mention.start == 4 && mention.end == 8))
+        }));
+
+        let ledger = crate::graph::canonical::reconcile_registry(root.path()).unwrap();
+        let graph = crate::graph::canonical::build_canonical_graph(
+            root.path(),
+            &ledger,
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        let note_mentions: Vec<_> = graph
+            .mentions
+            .iter()
+            .filter(|mention| mention.note_id == note_id)
+            .collect();
+        assert_eq!(note_mentions.len(), 2);
+        assert_eq!(
+            note_mentions
+                .iter()
+                .map(|mention| mention.id.clone())
+                .collect::<BTreeSet<_>>(),
+            relation_mentions,
+            "两个旧端点应各提升为唯一 live canonical mention"
+        );
+        assert_eq!(graph.relations.len(), 1);
+        let stats = crate::graph::index::rebuild_atomic(root.path(), &graph).unwrap();
+        assert_eq!(stats.mentions, 2);
+        assert_eq!(stats.relations, 1);
     }
 
     #[test]
