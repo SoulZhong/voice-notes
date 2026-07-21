@@ -1304,7 +1304,7 @@ fn validate_read_schema(connection: &rusqlite::Connection) -> anyhow::Result<()>
 
 type RebuildFn = dyn Fn(&Path) -> anyhow::Result<BuildStats> + Send + Sync + 'static;
 type EmitFn = dyn Fn(IndexStatus) + Send + Sync + 'static;
-type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
 type SpawnFn = dyn Fn(SpawnJob) -> std::io::Result<()> + Send + Sync + 'static;
 
 enum Rebuilder {
@@ -1367,7 +1367,7 @@ impl Default for RebuildScheduler {
 }
 
 impl RebuildScheduler {
-    fn with_rebuilder(
+    pub(crate) fn with_rebuilder(
         rebuild: impl Fn(&Path) -> anyhow::Result<BuildStats> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -1380,7 +1380,7 @@ impl RebuildScheduler {
     }
 
     #[cfg(test)]
-    fn with_rebuilder_and_spawner(
+    pub(crate) fn with_rebuilder_and_spawner(
         rebuild: impl Fn(&Path) -> anyhow::Result<BuildStats> + Send + Sync + 'static,
         spawn: impl Fn(SpawnJob) -> std::io::Result<()> + Send + Sync + 'static,
     ) -> Self {

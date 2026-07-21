@@ -1,6 +1,6 @@
 use super::{index, overrides, resolve};
 use crate::ipc;
-use crate::store::{self, RelationPredicate, VoiceprintStore};
+use crate::store::{self, RelationPredicate, VoiceprintStore, Voiceprints};
 use rusqlite::types::Value;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -27,6 +27,7 @@ struct LedgerView {
 pub(crate) struct ReadContext {
     connection: rusqlite::Connection,
     ledger: LedgerView,
+    people: Voiceprints,
 }
 
 #[derive(Debug)]
@@ -34,7 +35,7 @@ struct NodeRecord {
     summary: ipc::EntitySummary,
 }
 
-fn ledger_view(data_root: &Path) -> LedgerView {
+fn ledger_view(data_root: &Path, people: &Voiceprints) -> LedgerView {
     let bytes = match std::fs::read(data_root.join(overrides::KNOWLEDGE_FILE)) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -46,7 +47,7 @@ fn ledger_view(data_root: &Path) -> LedgerView {
     };
     match serde_json::from_slice::<overrides::KnowledgeLedger>(&bytes) {
         Ok(ledger) => LedgerView {
-            degraded: !ledger_is_valid_for_read(data_root, &ledger),
+            degraded: !ledger_is_valid_for_read(&ledger, people),
             ledger: Some(ledger),
         },
         Err(_) => LedgerView {
@@ -57,9 +58,11 @@ fn ledger_view(data_root: &Path) -> LedgerView {
 }
 
 pub(crate) fn open_read_context(data_root: &Path) -> anyhow::Result<ReadContext> {
+    let people = VoiceprintStore::new(data_root.to_path_buf()).load();
     Ok(ReadContext {
-        ledger: ledger_view(data_root),
+        ledger: ledger_view(data_root, &people),
         connection: index::open_readonly(data_root)?,
+        people,
     })
 }
 
@@ -67,7 +70,7 @@ fn canonical_set(values: &[String]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn ledger_is_valid_for_read(data_root: &Path, ledger: &overrides::KnowledgeLedger) -> bool {
+fn ledger_is_valid_for_read(ledger: &overrides::KnowledgeLedger, people: &Voiceprints) -> bool {
     if ledger.schema_version != 1
         || ledger
             .registry
@@ -95,7 +98,6 @@ fn ledger_is_valid_for_read(data_root: &Path, ledger: &overrides::KnowledgeLedge
     let Ok(snapshot) = resolve::replay(ledger) else {
         return false;
     };
-    let people = VoiceprintStore::new(data_root.to_path_buf()).load();
     let mut references = BTreeSet::new();
     references.extend(ledger.registry.keys().cloned());
     references.extend(ledger.legacy_ids.values().cloned());
@@ -104,16 +106,16 @@ fn ledger_is_valid_for_read(data_root: &Path, ledger: &overrides::KnowledgeLedge
     references.extend(people.redirects.keys().cloned());
     references.extend(people.redirects.values().cloned());
     references.into_iter().all(|entity_id| {
-        resolve::resolve_reference_id(&snapshot, &people, &entity_id)
+        resolve::resolve_reference_id(&snapshot, people, &entity_id)
             .entity_id
             .is_some()
     })
 }
 
 pub(crate) fn resolve_public_entity_id(
-    data_root: &Path,
     entity_id: &str,
     ledger: Option<&overrides::KnowledgeLedger>,
+    people: &Voiceprints,
 ) -> Option<String> {
     let Some(ledger) = ledger else {
         return Some(entity_id.to_string());
@@ -124,16 +126,14 @@ pub(crate) fn resolve_public_entity_id(
         .map(String::as_str)
         .unwrap_or(entity_id);
     let snapshot = resolve::replay(ledger).ok()?;
-    let people = VoiceprintStore::new(data_root.to_path_buf()).load();
-    resolve::resolve_reference_id(&snapshot, &people, candidate).entity_id
+    resolve::resolve_reference_id(&snapshot, people, candidate).entity_id
 }
 
 pub(crate) fn resolve_entity_from_context(
-    data_root: &Path,
     context: &ReadContext,
     entity_id: &str,
 ) -> Option<String> {
-    resolve_public_entity_id(data_root, entity_id, context.ledger.ledger.as_ref())
+    resolve_public_entity_id(entity_id, context.ledger.ledger.as_ref(), &context.people)
 }
 
 fn normalized_values(values: &[String]) -> Vec<String> {
@@ -396,16 +396,15 @@ pub fn semantic_entity_detail(
     filter: &GraphFilter,
 ) -> anyhow::Result<Option<ipc::SemanticEntityDetail>> {
     let context = open_read_context(data_root)?;
-    semantic_entity_detail_from_context(data_root, &context, entity_id, filter)
+    semantic_entity_detail_from_context(&context, entity_id, filter)
 }
 
 fn semantic_entity_detail_from_context(
-    data_root: &Path,
     context: &ReadContext,
     entity_id: &str,
     filter: &GraphFilter,
 ) -> anyhow::Result<Option<ipc::SemanticEntityDetail>> {
-    let Some(entity_id) = resolve_entity_from_context(data_root, context, entity_id) else {
+    let Some(entity_id) = resolve_entity_from_context(context, entity_id) else {
         return Ok(None);
     };
     let graph = semantic_graph_from_context(context, filter)?;
@@ -684,7 +683,7 @@ pub fn entity_mentions(
     entity_id: &str,
 ) -> anyhow::Result<Vec<ipc::MentionEvidence>> {
     let context = open_read_context(data_root)?;
-    let Some(entity_id) = resolve_entity_from_context(data_root, &context, entity_id) else {
+    let Some(entity_id) = resolve_entity_from_context(&context, entity_id) else {
         return Ok(Vec::new());
     };
     let mut statement = context.connection.prepare(
@@ -1599,9 +1598,9 @@ pub(crate) fn undo_operation(
 mod tests {
     use super::{
         apply_operation, entity_mentions, merge_operation, open_read_context, pending_review,
-        pending_review_from_context, relation_detail, semantic_entity_detail,
-        semantic_entity_detail_from_context, semantic_graph, split_operation, undo_operation,
-        GraphFilter,
+        pending_review_from_context, relation_detail, resolve_entity_from_context,
+        semantic_entity_detail, semantic_entity_detail_from_context, semantic_graph,
+        split_operation, undo_operation, GraphFilter,
     };
     use crate::graph::canonical::{
         CanonicalEntity, CanonicalEvidence, CanonicalGraph, CanonicalMention, CanonicalRelation,
@@ -1972,14 +1971,10 @@ mod tests {
         )
         .unwrap();
 
-        let old_detail = semantic_entity_detail_from_context(
-            root.path(),
-            &context,
-            "kg_a",
-            &GraphFilter::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let old_detail =
+            semantic_entity_detail_from_context(&context, "kg_a", &GraphFilter::default())
+                .unwrap()
+                .unwrap();
         assert_eq!(old_detail.name, "Alice");
         assert_eq!(
             pending_review_from_context(&context, &GraphFilter::default())
@@ -1999,6 +1994,48 @@ mod tests {
                 .id,
             "kg_new"
         );
+    }
+
+    #[test]
+    fn held_read_context_owns_one_voiceprint_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"kg_a": {"name": "Alice"}, "kg_b": {"name": "Beacon"}},
+                "redirects": {"kg_a": "kg_b"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = open_read_context(root.path()).unwrap();
+        assert!(!context.ledger.degraded);
+        assert_eq!(
+            resolve_entity_from_context(&context, "e:alice").as_deref(),
+            Some("kg_b")
+        );
+
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"kg_a": {"name": "Alice"}, "kg_b": {"name": "Beacon"}},
+                "redirects": {"kg_a": "kg_b", "kg_b": "kg_a"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!context.ledger.degraded);
+        assert_eq!(
+            resolve_entity_from_context(&context, "e:alice").as_deref(),
+            Some("kg_b")
+        );
+        let replacement = open_read_context(root.path()).unwrap();
+        assert!(replacement.ledger.degraded);
+        assert_eq!(resolve_entity_from_context(&replacement, "e:alice"), None);
     }
 
     #[test]
@@ -2372,5 +2409,54 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn concurrent_mutations_receive_unique_operation_ids_and_timestamps() {
+        const MUTATION_COUNT: usize = 2;
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let root_path = std::sync::Arc::new(root.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(MUTATION_COUNT));
+        let handles = (0..MUTATION_COUNT)
+            .map(|index| {
+                let root_path = std::sync::Arc::clone(&root_path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_operation(
+                        root_path.as_path(),
+                        &crate::ipc::KnowledgeOperationInput::AddAlias {
+                            entity_id: "kg_a".into(),
+                            alias: format!("Alice-{index}"),
+                        },
+                    )
+                    .unwrap()
+                    .operation_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let returned_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let ledger = overrides::load(root.path()).unwrap();
+        assert_eq!(ledger.operations.len(), MUTATION_COUNT);
+        assert_eq!(returned_ids.len(), MUTATION_COUNT);
+        assert_eq!(
+            ledger
+                .operations
+                .iter()
+                .map(|operation| operation.id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            returned_ids
+        );
+        let timestamps = ledger
+            .operations
+            .iter()
+            .map(|operation| operation.at.as_str())
+            .collect::<Vec<_>>();
+        assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }
