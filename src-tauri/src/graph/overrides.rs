@@ -171,6 +171,12 @@ pub fn load(data_root: &Path) -> Result<KnowledgeLedger, KnowledgeLoadError> {
     load_with_bootstrap_reader(data_root, bootstrap_legacy)
 }
 
+/// Validate an existing human-decision ledger without creating or bootstrapping
+/// one. Missing is valid; corrupt or non-canonical bytes fail closed.
+pub(crate) fn validate_existing(data_root: &Path) -> Result<(), KnowledgeLoadError> {
+    read_ledger(&data_root.join(KNOWLEDGE_FILE)).map(|_| ())
+}
+
 fn load_with_bootstrap_reader(
     data_root: &Path,
     read_bootstrap: impl FnOnce(&Path) -> anyhow::Result<KnowledgeLedger>,

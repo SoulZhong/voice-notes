@@ -473,12 +473,17 @@ pub struct RefineEvent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackfillRequest {
-    pub note_ids: Option<Vec<String>>,
+    pub run_id: String,
+    pub consent_token: String,
+    pub note_ids: Vec<String>,
     pub provider: String,
+    pub model: String,
+    pub contract_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackfillPreview {
+    pub consent_token: String,
     pub note_ids: Vec<String>,
     pub provider: String,
     pub model: String,
@@ -493,9 +498,11 @@ pub struct BackfillFailure {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackfillProgress {
+    pub run_id: String,
     pub state: String,
     pub completed: usize,
     pub total: usize,
     pub current_note_id: Option<String>,
     pub failed: Vec<BackfillFailure>,
+    pub rebuild_generation: Option<u64>,
 }

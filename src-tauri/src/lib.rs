@@ -118,6 +118,7 @@ struct AppState {
     /// 用户显式关系补建的进程级单实例闸与协作取消位；与普通 Aing 生命周期分离。
     relation_backfill_running: Arc<AtomicBool>,
     relation_backfill_cancel: Arc<AtomicBool>,
+    relation_backfill_run_id: Arc<Mutex<Option<String>>>,
     // refining 集合已删(P3):Aing 态入 lifecycle 内核(machine::RefineState),
     // 防重入/续录拦截由内核裁决,Aing 中查询走 LifecycleHandle::is_refining。
 }
@@ -138,6 +139,7 @@ impl Default for AppState {
             graph_scheduler: graph::index::RebuildScheduler::default(),
             relation_backfill_running: Arc::new(AtomicBool::new(false)),
             relation_backfill_cancel: Arc::new(AtomicBool::new(false)),
+            relation_backfill_run_id: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1752,14 +1754,18 @@ fn start_relation_backfill(
     state: State<AppState>,
     request: ipc::BackfillRequest,
 ) -> Result<(), String> {
-    let gate = refine::backfill::BackfillGate::acquire(Arc::clone(
-        &state.relation_backfill_running,
-    ))
+    let gate = refine::backfill::BackfillGate::acquire(
+        Arc::clone(&state.relation_backfill_running),
+        Arc::clone(&state.relation_backfill_run_id),
+        &request.run_id,
+    )
     .map_err(|error| error.to_string())?;
     let settings = relation_backfill_settings(&app)?;
     ensure_requested_backfill_provider(&request, &settings)?;
     let root = data_root(&app).map_err(|error| error.to_string())?;
-    let preview = refine::backfill::preview(&root, &settings, request.note_ids.as_deref())
+    let preview = refine::backfill::preview(&root, &settings, Some(&request.note_ids))
+        .map_err(|error| format!("{error:#}"))?;
+    refine::backfill::validate_request(&preview, &request)
         .map_err(|error| format!("{error:#}"))?;
     let executor = relation_executor(&settings).map_err(|error| format!("{error:#}"))?;
     if executor.provider() != preview.provider || executor.model() != preview.model {
@@ -1770,13 +1776,16 @@ fn start_relation_backfill(
     let cancel = Arc::clone(&state.relation_backfill_cancel);
     let scheduler = state.graph_scheduler.clone();
     let note_ids = preview.note_ids.clone();
+    let run_id = request.run_id.clone();
     let events = app.clone();
     let initial = ipc::BackfillProgress {
+        run_id: run_id.clone(),
         state: "running".into(),
         completed: 0,
         total: note_ids.len(),
         current_note_id: None,
         failed: vec![],
+        rebuild_generation: None,
     };
     let last_progress = Arc::new(Mutex::new(initial.clone()));
     let spawn_failure_events = app.clone();
@@ -1797,6 +1806,7 @@ fn start_relation_backfill(
                 let rebuild_events = events.clone();
                 let rebuild_root = root.clone();
                 refine::backfill::run_batch(
+                    &run_id,
                     &root.join("notes"),
                     &note_ids,
                     executor.as_ref(),
@@ -1813,7 +1823,6 @@ fn start_relation_backfill(
                             .request(rebuild_root.clone(), move |status| {
                                 let _ = graph_events.emit("graph_index_status", status);
                             })
-                            .map(|_| ())
                     },
                 )
             }));
@@ -1836,9 +1845,13 @@ fn start_relation_backfill(
 }
 
 #[tauri::command]
-fn cancel_relation_backfill(state: State<AppState>) -> Result<(), String> {
-    state.relation_backfill_cancel.store(true, Ordering::SeqCst);
-    Ok(())
+fn cancel_relation_backfill(state: State<AppState>, run_id: String) -> Result<(), String> {
+    refine::backfill::request_cancel(
+        &state.relation_backfill_run_id,
+        &state.relation_backfill_cancel,
+        &run_id,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
@@ -4154,18 +4167,25 @@ mod tests {
     #[test]
     fn relation_backfill_spawn_failure_emits_terminal_and_releases_gate() {
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let gate = crate::refine::backfill::BackfillGate::acquire(std::sync::Arc::clone(&running))
-            .unwrap();
+        let active = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let gate = crate::refine::backfill::BackfillGate::acquire(
+            std::sync::Arc::clone(&running),
+            std::sync::Arc::clone(&active),
+            "run-spawn-failure",
+        )
+        .unwrap();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events_for_failure = std::sync::Arc::clone(&events);
         let worker_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_ran_in_job = std::sync::Arc::clone(&worker_ran);
         let initial = crate::ipc::BackfillProgress {
+            run_id: "run-spawn-failure".into(),
             state: "running".into(),
             completed: 0,
             total: 2,
             current_note_id: None,
             failed: vec![],
+            rebuild_generation: None,
         };
 
         let error = super::spawn_relation_backfill_worker(
@@ -4185,6 +4205,7 @@ mod tests {
             !running.load(std::sync::atomic::Ordering::SeqCst),
             "spawn Err must drop the gate"
         );
+        assert!(active.lock().unwrap().is_none());
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].state, "failed");
