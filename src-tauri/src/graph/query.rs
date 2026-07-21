@@ -24,6 +24,11 @@ struct LedgerView {
     degraded: bool,
 }
 
+pub(crate) struct ReadContext {
+    connection: rusqlite::Connection,
+    ledger: LedgerView,
+}
+
 #[derive(Debug)]
 struct NodeRecord {
     summary: ipc::EntitySummary,
@@ -39,20 +44,30 @@ fn ledger_view(data_root: &Path) -> LedgerView {
             }
         }
     };
-    let ledger = serde_json::from_slice::<overrides::KnowledgeLedger>(&bytes)
-        .ok()
-        .filter(|ledger| ledger_is_valid_for_read(data_root, ledger));
-    LedgerView {
-        degraded: ledger.is_none(),
-        ledger,
+    match serde_json::from_slice::<overrides::KnowledgeLedger>(&bytes) {
+        Ok(ledger) => LedgerView {
+            degraded: !ledger_is_valid_for_read(data_root, &ledger),
+            ledger: Some(ledger),
+        },
+        Err(_) => LedgerView {
+            ledger: None,
+            degraded: true,
+        },
     }
+}
+
+pub(crate) fn open_read_context(data_root: &Path) -> anyhow::Result<ReadContext> {
+    Ok(ReadContext {
+        ledger: ledger_view(data_root),
+        connection: index::open_readonly(data_root)?,
+    })
 }
 
 fn canonical_set(values: &[String]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn ledger_is_valid_for_read(_data_root: &Path, ledger: &overrides::KnowledgeLedger) -> bool {
+fn ledger_is_valid_for_read(data_root: &Path, ledger: &overrides::KnowledgeLedger) -> bool {
     if ledger.schema_version != 1
         || ledger
             .registry
@@ -77,66 +92,48 @@ fn ledger_is_valid_for_read(_data_root: &Path, ledger: &overrides::KnowledgeLedg
     {
         return false;
     }
-    if resolve::replay(ledger).is_err() {
-        return false;
-    }
-    let Ok(active) = overrides::active_operation_mask(&ledger.operations) else {
+    let Ok(snapshot) = resolve::replay(ledger) else {
         return false;
     };
-    let redirects = ledger
-        .operations
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| active[*index])
-        .filter_map(|(_, operation)| match &operation.action {
-            overrides::KnowledgeAction::MergeEntity {
-                source_id,
-                target_id,
-            } => Some((source_id.as_str(), target_id.as_str())),
-            _ => None,
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    'mapping: for target in ledger.legacy_ids.values() {
-        let mut current = target.as_str();
-        let mut visited = BTreeSet::new();
-        while let Some(next) = redirects.get(current) {
-            if !visited.insert(current) {
-                continue 'mapping;
-            }
-            current = next;
-        }
-        if !ledger.registry.contains_key(current) {
-            return false;
-        }
-    }
-    true
+    let people = VoiceprintStore::new(data_root.to_path_buf()).load();
+    let mut references = BTreeSet::new();
+    references.extend(ledger.registry.keys().cloned());
+    references.extend(ledger.legacy_ids.values().cloned());
+    references.extend(snapshot.redirects.keys().cloned());
+    references.extend(snapshot.redirects.values().cloned());
+    references.extend(people.redirects.keys().cloned());
+    references.extend(people.redirects.values().cloned());
+    references.into_iter().all(|entity_id| {
+        resolve::resolve_reference_id(&snapshot, &people, &entity_id)
+            .entity_id
+            .is_some()
+    })
 }
 
 pub(crate) fn resolve_public_entity_id(
     data_root: &Path,
     entity_id: &str,
     ledger: Option<&overrides::KnowledgeLedger>,
-) -> String {
+) -> Option<String> {
     let Some(ledger) = ledger else {
-        return entity_id.to_string();
+        return Some(entity_id.to_string());
     };
     let candidate = ledger
         .legacy_ids
         .get(entity_id)
         .map(String::as_str)
         .unwrap_or(entity_id);
-    let Ok(snapshot) = resolve::replay(ledger) else {
-        return candidate.to_string();
-    };
+    let snapshot = resolve::replay(ledger).ok()?;
     let people = VoiceprintStore::new(data_root.to_path_buf()).load();
-    resolve::resolve_reference_id(&snapshot, &people, candidate)
-        .entity_id
-        .unwrap_or_else(|| candidate.to_string())
+    resolve::resolve_reference_id(&snapshot, &people, candidate).entity_id
 }
 
-pub(crate) fn resolve_entity_for_read(data_root: &Path, entity_id: &str) -> String {
-    let ledger = ledger_view(data_root);
-    resolve_public_entity_id(data_root, entity_id, ledger.ledger.as_ref())
+pub(crate) fn resolve_entity_from_context(
+    data_root: &Path,
+    context: &ReadContext,
+    entity_id: &str,
+) -> Option<String> {
+    resolve_public_entity_id(data_root, entity_id, context.ledger.ledger.as_ref())
 }
 
 fn normalized_values(values: &[String]) -> Vec<String> {
@@ -351,19 +348,36 @@ pub fn semantic_graph(
     data_root: &Path,
     filter: &GraphFilter,
 ) -> anyhow::Result<ipc::SemanticGraphData> {
+    let context = open_read_context(data_root)?;
+    semantic_graph_from_context(&context, filter)
+}
+
+pub(crate) fn semantic_graph_from_context(
+    context: &ReadContext,
+    filter: &GraphFilter,
+) -> anyhow::Result<ipc::SemanticGraphData> {
     validate_filter(filter)?;
     let kinds = normalized_values(&filter.entity_kinds);
     let predicates = normalized_values(&filter.predicate_types);
-    let ledger = ledger_view(data_root);
-    let connection = index::open_readonly(data_root)?;
-    let nodes = query_nodes(&connection, &kinds)?;
+    let mut nodes = query_nodes(&context.connection, &kinds)?;
+    let semantic_edges = query_semantic_edges(&context.connection, filter, &kinds, &predicates)?;
+    if filter.include_history
+        || !predicates.is_empty()
+        || filter.from.is_some()
+        || filter.to.is_some()
+    {
+        let admitted_endpoints = semantic_edges
+            .iter()
+            .flat_map(|edge| [&edge.subject_id, &edge.object_id])
+            .collect::<BTreeSet<_>>();
+        nodes.retain(|node| admitted_endpoints.contains(&node.summary.id));
+    }
     let live_nodes = nodes
         .iter()
         .map(|node| node.summary.id.clone())
         .collect::<BTreeSet<_>>();
-    let semantic_edges = query_semantic_edges(&connection, filter, &kinds, &predicates)?;
     let cooccurrence_edges = if filter.include_cooccurrence {
-        query_cooccurrence_edges(&connection, &live_nodes)?
+        query_cooccurrence_edges(&context.connection, &live_nodes)?
     } else {
         Vec::new()
     };
@@ -371,8 +385,8 @@ pub fn semantic_graph(
         nodes: nodes.into_iter().map(|node| node.summary).collect(),
         semantic_edges,
         cooccurrence_edges,
-        degraded: ledger.degraded,
-        message: ledger.degraded.then(|| DEGRADED_MESSAGE.into()),
+        degraded: context.ledger.degraded,
+        message: context.ledger.degraded.then(|| DEGRADED_MESSAGE.into()),
     })
 }
 
@@ -381,14 +395,24 @@ pub fn semantic_entity_detail(
     entity_id: &str,
     filter: &GraphFilter,
 ) -> anyhow::Result<Option<ipc::SemanticEntityDetail>> {
-    let ledger = ledger_view(data_root);
-    let entity_id = resolve_public_entity_id(data_root, entity_id, ledger.ledger.as_ref());
-    let graph = semantic_graph(data_root, filter)?;
+    let context = open_read_context(data_root)?;
+    semantic_entity_detail_from_context(data_root, &context, entity_id, filter)
+}
+
+fn semantic_entity_detail_from_context(
+    data_root: &Path,
+    context: &ReadContext,
+    entity_id: &str,
+    filter: &GraphFilter,
+) -> anyhow::Result<Option<ipc::SemanticEntityDetail>> {
+    let Some(entity_id) = resolve_entity_from_context(data_root, context, entity_id) else {
+        return Ok(None);
+    };
+    let graph = semantic_graph_from_context(context, filter)?;
     let Some(summary) = graph.nodes.into_iter().find(|node| node.id == entity_id) else {
         return Ok(None);
     };
-    let connection = index::open_readonly(data_root)?;
-    let confirmed = connection.query_row(
+    let confirmed = context.connection.query_row(
         "SELECT confirmed FROM entities WHERE id = ?",
         [&entity_id],
         |row| row.get::<_, i64>(0),
@@ -531,17 +555,101 @@ pub fn relation_detail(
     }))
 }
 
+fn pending_payload_string<'a>(
+    payload: &'a serde_json::Value,
+    pointers: &[&str],
+) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(serde_json::Value::as_str))
+}
+
+fn pending_matches_filter(
+    payload: &serde_json::Value,
+    filter: &GraphFilter,
+    kinds: &[String],
+    predicates: &[String],
+) -> bool {
+    if !predicates.is_empty() {
+        if let Some(predicate) = pending_payload_string(
+            payload,
+            &[
+                "/predicate_type",
+                "/predicate/kind",
+                "/relation/predicate_type",
+                "/relation/predicate/kind",
+            ],
+        ) {
+            if !predicates.iter().any(|allowed| allowed == predicate) {
+                return false;
+            }
+        }
+    }
+    if !kinds.is_empty() {
+        for pointer in [
+            "/entity_kind",
+            "/subject_kind",
+            "/object_kind",
+            "/relation/subject_kind",
+            "/relation/object_kind",
+        ] {
+            if let Some(kind) = payload.pointer(pointer).and_then(serde_json::Value::as_str) {
+                if !kinds.iter().any(|allowed| allowed == kind) {
+                    return false;
+                }
+            }
+        }
+    }
+    if !filter.include_history {
+        if pending_payload_string(payload, &["/status", "/relation/status"])
+            .is_some_and(|status| status == "historical")
+        {
+            return false;
+        }
+    }
+    if let (Some(from), Some(valid_to)) = (
+        filter
+            .from
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()),
+        pending_payload_string(payload, &["/valid_to", "/relation/valid_to"])
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()),
+    ) {
+        if valid_to < from {
+            return false;
+        }
+    }
+    if let (Some(to), Some(valid_from)) = (
+        filter
+            .to
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()),
+        pending_payload_string(payload, &["/valid_from", "/relation/valid_from"])
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()),
+    ) {
+        if valid_from > to {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn pending_review(
     data_root: &Path,
     filter: &GraphFilter,
 ) -> anyhow::Result<Vec<ipc::PendingReviewItem>> {
-    let allowed_relations = semantic_graph(data_root, filter)?
-        .semantic_edges
-        .into_iter()
-        .map(|edge| edge.id)
-        .collect::<BTreeSet<_>>();
-    let connection = index::open_readonly(data_root)?;
-    let mut statement = connection.prepare(
+    let context = open_read_context(data_root)?;
+    pending_review_from_context(&context, filter)
+}
+
+fn pending_review_from_context(
+    context: &ReadContext,
+    filter: &GraphFilter,
+) -> anyhow::Result<Vec<ipc::PendingReviewItem>> {
+    validate_filter(filter)?;
+    let predicates = normalized_values(&filter.predicate_types);
+    let kinds = normalized_values(&filter.entity_kinds);
+    let mut statement = context.connection.prepare(
         "SELECT id, kind, note_id, relation_id, payload FROM pending_review ORDER BY kind, id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -566,11 +674,7 @@ pub fn pending_review(
     .collect::<anyhow::Result<Vec<_>>>()
     .map(|rows| {
         rows.into_iter()
-            .filter(|row| {
-                row.relation_id
-                    .as_ref()
-                    .map_or(true, |relation_id| allowed_relations.contains(relation_id))
-            })
+            .filter(|row| pending_matches_filter(&row.payload, filter, &kinds, &predicates))
             .collect()
     })
 }
@@ -579,10 +683,11 @@ pub fn entity_mentions(
     data_root: &Path,
     entity_id: &str,
 ) -> anyhow::Result<Vec<ipc::MentionEvidence>> {
-    let ledger = ledger_view(data_root);
-    let entity_id = resolve_public_entity_id(data_root, entity_id, ledger.ledger.as_ref());
-    let connection = index::open_readonly(data_root)?;
-    let mut statement = connection.prepare(
+    let context = open_read_context(data_root)?;
+    let Some(entity_id) = resolve_entity_from_context(data_root, &context, entity_id) else {
+        return Ok(Vec::new());
+    };
+    let mut statement = context.connection.prepare(
         "SELECT id, note_id, entity_id, paragraph_index, start_offset, end_offset, quote \
          FROM entity_mentions WHERE entity_id = ? \
          ORDER BY note_id, paragraph_index, start_offset, id",
@@ -620,19 +725,42 @@ fn operation_identity(
     kind: &str,
     payload: &serde_json::Value,
 ) -> String {
-    store::stable_id(
-        "op_",
-        &[
-            at.into(),
-            ledger.operations.len().to_string(),
-            kind.into(),
-            payload.to_string(),
-        ],
-    )
+    let mut nonce = 0_u64;
+    loop {
+        let id = store::stable_id(
+            "op_",
+            &[
+                at.into(),
+                ledger.operations.len().to_string(),
+                kind.into(),
+                payload.to_string(),
+                nonce.to_string(),
+            ],
+        );
+        if ledger.operations.iter().all(|operation| operation.id != id) {
+            return id;
+        }
+        nonce = nonce
+            .checked_add(1)
+            .expect("knowledge operation identity space exhausted");
+    }
 }
 
-fn mutation_time() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+fn next_operation_time(ledger: &overrides::KnowledgeLedger) -> anyhow::Result<String> {
+    let now = chrono::Utc::now();
+    let latest = ledger
+        .operations
+        .iter()
+        .filter_map(|operation| chrono::DateTime::parse_from_rfc3339(&operation.at).ok())
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .max();
+    let timestamp = match latest {
+        Some(latest) if latest >= now => latest
+            .checked_add_signed(chrono::Duration::nanoseconds(1))
+            .ok_or_else(|| anyhow::anyhow!("知识操作时间戳已耗尽"))?,
+        _ => now,
+    };
+    Ok(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
 }
 
 fn entity_state(
@@ -687,10 +815,14 @@ fn normalized_predicate(mut predicate: RelationPredicate) -> anyhow::Result<Rela
 }
 
 fn validate_interval(from: Option<&str>, to: Option<&str>) -> anyhow::Result<()> {
-    for value in [from, to].into_iter().flatten() {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .map_err(|_| anyhow::anyhow!("关系时间必须使用 RFC3339 格式"))?;
-    }
+    let from = from
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("关系时间必须使用 RFC3339 格式"))?;
+    let to = to
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("关系时间必须使用 RFC3339 格式"))?;
     if let (Some(from), Some(to)) = (from, to) {
         anyhow::ensure!(from <= to, "关系开始时间不能晚于结束时间");
     }
@@ -782,7 +914,7 @@ pub(crate) fn apply_operation(
         _ => {}
     }
     overrides::update(data_root, |ledger| {
-        let at = mutation_time();
+        let at = next_operation_time(ledger)?;
         let (kind, payload) = match input {
             ipc::KnowledgeOperationInput::RenameEntity { entity_id, name } => {
                 ("rename_entity", serde_json::json!([entity_id, name]))
@@ -1141,7 +1273,7 @@ pub(crate) fn split_operation(
                 .all(|mention_id| !snapshot.mention_bindings.contains_key(mention_id)),
             "所选提及已经被拆分"
         );
-        let at = mutation_time();
+        let at = next_operation_time(ledger)?;
         let root_operation_id = operation_identity(
             ledger,
             &at,
@@ -1169,14 +1301,19 @@ pub(crate) fn split_operation(
             overrides::KnowledgeAction::CreateEntity { entity },
         );
         for mention_id in &mention_ids {
-            let bind_id = store::stable_id(
-                "op_",
-                &[root_operation_id.clone(), "bind".into(), mention_id.clone()],
+            let bind_id = split_bind_operation_id(&root_operation_id, mention_id);
+            anyhow::ensure!(
+                ledger
+                    .operations
+                    .iter()
+                    .all(|operation| operation.id != bind_id),
+                "拆分子操作 ID 冲突"
             );
+            let bind_at = next_operation_time(ledger)?;
             push_operation(
                 ledger,
                 bind_id,
-                &at,
+                &bind_at,
                 serde_json::Value::Null,
                 serde_json::Value::String(entity_id.clone()),
                 overrides::KnowledgeAction::BindMention {
@@ -1201,7 +1338,7 @@ pub(crate) fn merge_operation(
         anyhow::ensure!(source_id != target_id, "不能合并同一个实体或形成重定向环");
         let snapshot = resolve::replay(ledger)?;
         let before = snapshot.redirects.get(&source_id).cloned();
-        let at = mutation_time();
+        let at = next_operation_time(ledger)?;
         let operation_id = operation_identity(
             ledger,
             &at,
@@ -1266,10 +1403,32 @@ fn project_registry_after_undo(
     Ok(registry)
 }
 
-fn split_batch_targets(
+fn split_bind_operation_id(root_operation_id: &str, mention_id: &str) -> String {
+    store::stable_id(
+        "op_",
+        &[
+            root_operation_id.into(),
+            "split_bind".into(),
+            mention_id.into(),
+        ],
+    )
+}
+
+fn undo_child_operation_id(root_operation_id: &str, target_id: &str) -> String {
+    store::stable_id(
+        "op_",
+        &[
+            root_operation_id.into(),
+            "group_undo".into(),
+            target_id.into(),
+        ],
+    )
+}
+
+fn split_batch_indices(
     ledger: &overrides::KnowledgeLedger,
     target_index: usize,
-) -> anyhow::Result<Option<Vec<String>>> {
+) -> anyhow::Result<Option<Vec<usize>>> {
     let target = &ledger.operations[target_index];
     let overrides::KnowledgeAction::CreateEntity { .. } = &target.action else {
         return Ok(None);
@@ -1278,46 +1437,92 @@ fn split_batch_targets(
     if state.entity_id != overrides::allocate_split_entity_id(&target.id) {
         return Ok(None);
     }
-    let mut targets = vec![target.id.clone()];
-    targets.extend(
-        ledger
-            .operations
-            .iter()
-            .skip(target_index + 1)
-            .take_while(|operation| operation.at == target.at)
-            .filter_map(|operation| match &operation.action {
-                overrides::KnowledgeAction::BindMention { entity_id, .. }
-                    if entity_id == &state.entity_id =>
-                {
-                    Some(operation.id.clone())
-                }
-                _ => None,
-            }),
-    );
-    Ok(Some(targets))
+    let mut targets = vec![target_index];
+    for (index, operation) in ledger.operations.iter().enumerate().skip(target_index + 1) {
+        let overrides::KnowledgeAction::BindMention {
+            mention_id,
+            entity_id,
+        } = &operation.action
+        else {
+            break;
+        };
+        if entity_id != &state.entity_id
+            || operation.id != split_bind_operation_id(&target.id, mention_id)
+        {
+            break;
+        }
+        targets.push(index);
+    }
+    Ok((targets.len() > 1).then_some(targets))
 }
 
-fn undo_batch_targets(
+fn operation_group_indices(
     ledger: &overrides::KnowledgeLedger,
     target_index: usize,
-) -> anyhow::Result<Vec<String>> {
-    if let Some(targets) = split_batch_targets(ledger, target_index)? {
+) -> anyhow::Result<Vec<usize>> {
+    operation_group_indices_at_depth(ledger, target_index, 0)
+}
+
+fn operation_group_indices_at_depth(
+    ledger: &overrides::KnowledgeLedger,
+    target_index: usize,
+    depth: usize,
+) -> anyhow::Result<Vec<usize>> {
+    anyhow::ensure!(depth <= ledger.operations.len(), "知识操作分组形成递归环");
+    if let Some(targets) = split_batch_indices(ledger, target_index)? {
         return Ok(targets);
     }
     let target = &ledger.operations[target_index];
-    if matches!(target.action, overrides::KnowledgeAction::Undo { .. }) {
-        let siblings = ledger
+    if let overrides::KnowledgeAction::Undo { operation_id } = &target.action {
+        let undone_index = ledger
             .operations
             .iter()
-            .filter(|operation| operation.at == target.at)
-            .filter(|operation| matches!(operation.action, overrides::KnowledgeAction::Undo { .. }))
-            .map(|operation| operation.id.clone())
-            .collect::<Vec<_>>();
-        if !siblings.is_empty() {
-            return Ok(siblings);
+            .position(|operation| operation.id == *operation_id)
+            .ok_or_else(|| anyhow::anyhow!("撤销分组引用未知操作"))?;
+        anyhow::ensure!(undone_index < target_index, "撤销分组必须引用更早的操作");
+        let undone_group = operation_group_indices_at_depth(ledger, undone_index, depth + 1)?;
+        if undone_group.len() > 1 {
+            let mut group = Vec::with_capacity(undone_group.len());
+            for (offset, undone_member) in undone_group.iter().enumerate() {
+                let index = target_index + offset;
+                let operation = ledger
+                    .operations
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("撤销分组不完整"))?;
+                let expected_target = &ledger.operations[*undone_member].id;
+                anyhow::ensure!(
+                    matches!(
+                        &operation.action,
+                        overrides::KnowledgeAction::Undo { operation_id }
+                            if operation_id == expected_target
+                    ),
+                    "撤销分组目标不连续"
+                );
+                if offset > 0 {
+                    anyhow::ensure!(
+                        operation.id == undo_child_operation_id(&target.id, expected_target),
+                        "撤销分组子操作 ID 无效"
+                    );
+                }
+                group.push(index);
+            }
+            return Ok(group);
         }
     }
-    Ok(vec![target.id.clone()])
+    Ok(vec![target_index])
+}
+
+fn enclosing_group_root(
+    ledger: &overrides::KnowledgeLedger,
+    target_index: usize,
+) -> anyhow::Result<Option<usize>> {
+    for root_index in 0..target_index {
+        let group = operation_group_indices(ledger, root_index)?;
+        if group.len() > 1 && group.contains(&target_index) {
+            return Ok(Some(root_index));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn undo_operation(
@@ -1335,20 +1540,42 @@ pub(crate) fn undo_operation(
             ledger.operations[target_index].at != "legacy_bootstrap",
             "系统迁移操作不能撤销"
         );
-        let targets = undo_batch_targets(ledger, target_index)?;
+        anyhow::ensure!(
+            enclosing_group_root(ledger, target_index)?.is_none(),
+            "分组子操作不能单独撤销"
+        );
+        let target_indices = operation_group_indices(ledger, target_index)?;
+        let targets = target_indices
+            .iter()
+            .map(|index| ledger.operations[*index].id.clone())
+            .collect::<Vec<_>>();
         let baseline = overrides::registry_baseline(ledger)?;
-        let at = mutation_time();
+        let root_at = next_operation_time(ledger)?;
+        let root_operation_id = operation_identity(
+            ledger,
+            &root_at,
+            "undo_group",
+            &serde_json::to_value(&targets)?,
+        );
         let mut first_operation_id = None;
-        for target in targets {
-            let operation_id = store::stable_id(
-                "op_",
-                &[
-                    at.clone(),
-                    ledger.operations.len().to_string(),
-                    "undo".into(),
-                    target.clone(),
-                ],
+        for (offset, target) in targets.into_iter().enumerate() {
+            let operation_id = if offset == 0 {
+                root_operation_id.clone()
+            } else {
+                undo_child_operation_id(&root_operation_id, &target)
+            };
+            anyhow::ensure!(
+                ledger
+                    .operations
+                    .iter()
+                    .all(|operation| operation.id != operation_id),
+                "撤销操作 ID 冲突"
             );
+            let at = if offset == 0 {
+                root_at.clone()
+            } else {
+                next_operation_time(ledger)?
+            };
             first_operation_id.get_or_insert_with(|| operation_id.clone());
             push_operation(
                 ledger,
@@ -1371,8 +1598,10 @@ pub(crate) fn undo_operation(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_operation, entity_mentions, merge_operation, pending_review, relation_detail,
-        semantic_entity_detail, semantic_graph, split_operation, undo_operation, GraphFilter,
+        apply_operation, entity_mentions, merge_operation, open_read_context, pending_review,
+        pending_review_from_context, relation_detail, semantic_entity_detail,
+        semantic_entity_detail_from_context, semantic_graph, split_operation, undo_operation,
+        GraphFilter,
     };
     use crate::graph::canonical::{
         CanonicalEntity, CanonicalEvidence, CanonicalGraph, CanonicalMention, CanonicalRelation,
@@ -1610,6 +1839,24 @@ mod tests {
             ["cr_history"]
         );
         assert!(dated.cooccurrence_edges.is_empty());
+
+        let predicate_only = semantic_graph(
+            root.path(),
+            &GraphFilter {
+                predicate_types: vec!["member_of".into()],
+                include_history: true,
+                ..GraphFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            predicate_only
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["kg_a", "kg_c"]
+        );
     }
 
     #[test]
@@ -1646,6 +1893,111 @@ mod tests {
                 .map(|row| row.kind.as_str())
                 .collect::<Vec<_>>(),
             ["identity_conflict", "relation_review"]
+        );
+    }
+
+    #[test]
+    fn pending_review_keeps_relation_pending_without_a_published_relation_row() {
+        let root = tempfile::tempdir().unwrap();
+        let pending = vec![
+            PendingItem::RelationReview {
+                note_id: "note-review".into(),
+                relation_id: "cr_missing_review".into(),
+            },
+            PendingItem::StaleEvidence {
+                note_id: "note-stale".into(),
+                relation_id: "cr_missing_stale".into(),
+                evidence_id: "ev_stale".into(),
+            },
+            PendingItem::SplitConflict {
+                note_id: "note-split".into(),
+                relation_id: "cr_missing_split".into(),
+                evidence_id: "ev_split".into(),
+            },
+        ];
+        index::rebuild_atomic(
+            root.path(),
+            &CanonicalGraph {
+                entities: BTreeMap::new(),
+                mentions: Vec::new(),
+                relations: Vec::new(),
+                pending,
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(overrides::KNOWLEDGE_FILE),
+            serde_json::to_vec(&overrides::KnowledgeLedger::empty()).unwrap(),
+        )
+        .unwrap();
+
+        let rows = pending_review(root.path(), &GraphFilter::default()).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+            ["relation_review", "split_conflict", "stale_evidence"]
+        );
+        let conservatively_filtered = pending_review(
+            root.path(),
+            &GraphFilter {
+                entity_kinds: vec!["person".into()],
+                predicate_types: vec!["uses".into()],
+                from: Some("2026-01-01T00:00:00Z".into()),
+                ..GraphFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(conservatively_filtered.len(), 3);
+    }
+
+    #[test]
+    fn held_read_context_never_mixes_replaced_index_versions() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let context = open_read_context(root.path()).unwrap();
+
+        index::rebuild_atomic(
+            root.path(),
+            &CanonicalGraph {
+                entities: BTreeMap::from([(
+                    "kg_new".into(),
+                    entity("kg_new", "project", "New snapshot"),
+                )]),
+                mentions: Vec::new(),
+                relations: Vec::new(),
+                pending: vec![PendingItem::InvalidDocument {
+                    note_id: "new-note".into(),
+                    message: "new snapshot".into(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let old_detail = semantic_entity_detail_from_context(
+            root.path(),
+            &context,
+            "kg_a",
+            &GraphFilter::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(old_detail.name, "Alice");
+        assert_eq!(
+            pending_review_from_context(&context, &GraphFilter::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            semantic_entity_detail(root.path(), "kg_a", &GraphFilter::default())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            semantic_graph(root.path(), &GraphFilter::default())
+                .unwrap()
+                .nodes[0]
+                .id,
+            "kg_new"
         );
     }
 
@@ -1697,6 +2049,67 @@ mod tests {
     }
 
     #[test]
+    fn redirect_cycle_without_a_legacy_mapping_degrades_and_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let ledger_path = root.path().join(overrides::KNOWLEDGE_FILE);
+        let mut ledger: overrides::KnowledgeLedger =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        ledger.legacy_ids.clear();
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        merge_operation(root.path(), "kg_a", "kg_b").unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"kg_a": {"name": "Alice"}, "kg_b": {"name": "Beacon"}},
+                "redirects": {"kg_b": "kg_a"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            semantic_graph(root.path(), &GraphFilter::default())
+                .unwrap()
+                .degraded
+        );
+        assert!(
+            semantic_entity_detail(root.path(), "kg_a", &GraphFilter::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_mapping_into_a_cross_redirect_cycle_degrades_and_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        merge_operation(root.path(), "kg_a", "kg_b").unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"kg_a": {"name": "Alice"}, "kg_b": {"name": "Beacon"}},
+                "redirects": {"kg_b": "kg_a"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            semantic_graph(root.path(), &GraphFilter::default())
+                .unwrap()
+                .degraded
+        );
+        assert!(
+            semantic_entity_detail(root.path(), "e:alice", &GraphFilter::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn entity_mutation_appends_one_typed_operation_with_valid_snapshots() {
         let root = tempfile::tempdir().unwrap();
         install_fixture(root.path());
@@ -1719,6 +2132,34 @@ mod tests {
         ));
         assert_eq!(ledger.registry["kg_a"].name, "Alicia");
         assert_ne!(ledger.operations[0].before, ledger.operations[0].after);
+    }
+
+    #[test]
+    fn relation_mutation_compares_rfc3339_instants_in_both_offset_directions() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let create = |valid_from: &str, valid_to: &str| {
+            apply_operation(
+                root.path(),
+                &crate::ipc::KnowledgeOperationInput::CreateRelation {
+                    subject_id: "kg_a".into(),
+                    predicate: RelationPredicate {
+                        kind: "uses".into(),
+                        label: None,
+                    },
+                    object_id: "kg_b".into(),
+                    valid_from: Some(valid_from.into()),
+                    valid_to: Some(valid_to.into()),
+                    note: None,
+                    evidence_ids: Vec::new(),
+                    user_assertion: true,
+                },
+            )
+        };
+
+        create("2026-01-01T01:00:00+08:00", "2025-12-31T18:00:00Z").unwrap();
+        assert!(create("2025-12-31T23:00:00-08:00", "2026-01-01T01:00:00Z",).is_err());
+        assert_eq!(overrides::load(root.path()).unwrap().operations.len(), 1);
     }
 
     #[test]
@@ -1752,6 +2193,100 @@ mod tests {
             &operation.action,
             overrides::KnowledgeAction::BindMention { mention_id, .. } if mention_id == "m_a_1"
         )));
+        assert_ne!(ledger.operations[0].at, ledger.operations[1].at);
+        assert_ne!(ledger.operations[0].id, ledger.operations[1].id);
+    }
+
+    #[test]
+    fn split_child_cannot_be_undone_directly() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        split_operation(
+            root.path(),
+            &crate::ipc::SplitEntityRequest {
+                entity_id: "kg_a".into(),
+                name: "Alice (other)".into(),
+                kind: None,
+                aliases: Vec::new(),
+                mention_ids: vec!["m_a_2".into()],
+            },
+        )
+        .unwrap();
+        let child_id = overrides::load(root.path()).unwrap().operations[1]
+            .id
+            .clone();
+        assert!(undo_operation(root.path(), &child_id).is_err());
+    }
+
+    #[test]
+    fn split_undo_ignores_an_unrelated_bind_with_the_same_wall_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let split = split_operation(
+            root.path(),
+            &crate::ipc::SplitEntityRequest {
+                entity_id: "kg_a".into(),
+                name: "Alice (other)".into(),
+                kind: None,
+                aliases: Vec::new(),
+                mention_ids: vec!["m_a_2".into()],
+            },
+        )
+        .unwrap();
+        apply_operation(
+            root.path(),
+            &crate::ipc::KnowledgeOperationInput::BindMention {
+                mention_id: "m_a_1".into(),
+                entity_id: split.entity_id.clone().unwrap(),
+            },
+        )
+        .unwrap();
+        let ledger_path = root.path().join(overrides::KNOWLEDGE_FILE);
+        let mut ledger: overrides::KnowledgeLedger =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        ledger.operations[2].at = ledger.operations[0].at.clone();
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        undo_operation(root.path(), &split.operation_id).unwrap();
+        let ledger = overrides::load(root.path()).unwrap();
+        let active = overrides::active_operation_mask(&ledger.operations).unwrap();
+        assert_eq!(&active[..3], &[false, false, true]);
+    }
+
+    #[test]
+    fn multiple_split_batches_remain_independent() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+        let first = split_operation(
+            root.path(),
+            &crate::ipc::SplitEntityRequest {
+                entity_id: "kg_a".into(),
+                name: "Alice one".into(),
+                kind: None,
+                aliases: Vec::new(),
+                mention_ids: vec!["m_a_2".into()],
+            },
+        )
+        .unwrap();
+        let second = split_operation(
+            root.path(),
+            &crate::ipc::SplitEntityRequest {
+                entity_id: "kg_a".into(),
+                name: "Alice two".into(),
+                kind: None,
+                aliases: Vec::new(),
+                mention_ids: vec!["m_a_1".into()],
+            },
+        )
+        .unwrap();
+
+        undo_operation(root.path(), &first.operation_id).unwrap();
+        let ledger = overrides::load(root.path()).unwrap();
+        let active = overrides::active_operation_mask(&ledger.operations).unwrap();
+        assert_eq!(&active[..4], &[false, false, true, true]);
+        assert!(ledger
+            .registry
+            .contains_key(second.entity_id.as_deref().unwrap()));
     }
 
     #[test]

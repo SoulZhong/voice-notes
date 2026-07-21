@@ -1,7 +1,7 @@
 use super::query::{self, GraphFilter};
 use crate::ipc;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,12 +128,32 @@ pub(crate) fn shortest_path_from_edges(
         entity_ids: vec![start.into()],
         traversals: Vec::new(),
     })]);
-    let mut best = BTreeMap::from([(start.to_string(), start_rank)]);
+    let mut adjacency = BTreeMap::<String, Vec<usize>>::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
+        adjacency
+            .entry(edge.subject_id.clone())
+            .or_default()
+            .push(edge_index);
+        adjacency
+            .entry(edge.object_id.clone())
+            .or_default()
+            .push(edge_index);
+    }
+    for edge_indexes in adjacency.values_mut() {
+        edge_indexes.sort_by(|left, right| edges[*left].id.cmp(&edges[*right].id));
+    }
+    let mut labels = BTreeMap::<(String, BTreeSet<String>), Vec<PathRank>>::new();
+    labels.insert(
+        (start.into(), BTreeSet::from([start.into()])),
+        vec![start_rank],
+    );
 
     while let Some(Reverse(state)) = queue.pop() {
-        if best
-            .get(&state.current)
-            .is_some_and(|known| known < &state.rank)
+        let visited = state.entity_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let label_key = (state.current.clone(), visited.clone());
+        if !labels
+            .get(&label_key)
+            .is_some_and(|known| known.contains(&state.rank))
         {
             continue;
         }
@@ -170,7 +190,8 @@ pub(crate) fn shortest_path_from_edges(
             });
         }
 
-        for (edge_index, edge) in edges.iter().enumerate() {
+        for edge_index in adjacency.get(&state.current).into_iter().flatten().copied() {
+            let edge = &edges[edge_index];
             let next = if edge.subject_id == state.current {
                 edge.object_id.as_str()
             } else if edge.object_id == state.current {
@@ -201,12 +222,20 @@ pub(crate) fn shortest_path_from_edges(
                 min_confidence: Reverse(min_confidence),
                 stable_path_ids,
             };
-            if best.get(next).is_some_and(|known| known <= &next_rank) {
-                continue;
-            }
-            best.insert(next.into(), next_rank.clone());
             let mut entity_ids = state.entity_ids.clone();
             entity_ids.push(next.into());
+            let mut next_visited = visited.clone();
+            next_visited.insert(next.into());
+            let next_key = (next.to_string(), next_visited);
+            let known = labels.entry(next_key).or_default();
+            if known
+                .iter()
+                .any(|candidate| path_rank_safely_dominates(candidate, &next_rank))
+            {
+                continue;
+            }
+            known.retain(|candidate| !path_rank_safely_dominates(&next_rank, candidate));
+            known.push(next_rank.clone());
             let mut traversals = state.traversals.clone();
             traversals.push(Traversal {
                 edge_index,
@@ -222,6 +251,16 @@ pub(crate) fn shortest_path_from_edges(
         }
     }
     None
+}
+
+fn path_rank_safely_dominates(left: &PathRank, right: &PathRank) -> bool {
+    if left.cost_micros != right.cost_micros {
+        return left.cost_micros < right.cost_micros;
+    }
+    if left.hops != right.hops {
+        return left.hops < right.hops;
+    }
+    left.min_confidence.0 >= right.min_confidence.0 && left.stable_path_ids <= right.stable_path_ids
 }
 
 fn semantic_origin(origin: &str) -> anyhow::Result<RelationOrigin> {
@@ -240,9 +279,14 @@ pub fn shortest_path(
     end: &str,
     filter: &GraphFilter,
 ) -> anyhow::Result<Option<ipc::KnowledgePath>> {
-    let start = query::resolve_entity_for_read(data_root, start);
-    let end = query::resolve_entity_for_read(data_root, end);
-    let graph = query::semantic_graph(data_root, filter)?;
+    let context = query::open_read_context(data_root)?;
+    let Some(start) = query::resolve_entity_from_context(data_root, &context, start) else {
+        return Ok(None);
+    };
+    let Some(end) = query::resolve_entity_from_context(data_root, &context, end) else {
+        return Ok(None);
+    };
+    let graph = query::semantic_graph_from_context(&context, filter)?;
     let live = graph
         .nodes
         .iter()
@@ -373,6 +417,26 @@ mod tests {
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
             ["co_direct"]
+        );
+    }
+
+    #[test]
+    fn shared_low_confidence_suffix_reopens_lexically_better_prefix() {
+        let edges = vec![
+            edge("z_prefix", "start", "via_z", RelationOrigin::Manual, 0.9),
+            edge("z_join", "via_z", "join", RelationOrigin::Manual, 0.9),
+            edge("a_prefix", "start", "via_a", RelationOrigin::Manual, 0.8),
+            edge("a_join", "via_a", "join", RelationOrigin::Manual, 0.8),
+            edge("shared_low", "join", "end", RelationOrigin::Manual, 0.7),
+        ];
+
+        let path = shortest_path_from_edges("start", "end", &edges).unwrap();
+        assert_eq!(
+            path.steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a_prefix", "a_join", "shared_low"]
         );
     }
 

@@ -412,9 +412,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     match data_root(&app) {
                         Ok(root) => {
                             let graph_events = app.clone();
-                            graph_scheduler.request(root, move |status| {
+                            if let Err(error) = graph_scheduler.request(root, move |status| {
                                 let _ = graph_events.emit("graph_index_status", status);
-                            });
+                            }) {
+                                eprintln!("graph: Aing 后索引排队失败，已保留重试标记: {error:#}");
+                            }
                         }
                         Err(e) => eprintln!("graph: data_root 不可用,跳过入图: {e}"),
                     }
@@ -1769,19 +1771,31 @@ fn graph_mutation_error(command: &str, error: anyhow::Error) -> String {
     "无法保存知识整理操作；请确认目标仍存在且整理记录完好".into()
 }
 
+fn mark_knowledge_rebuild_queued(
+    mut result: ipc::KnowledgeMutationResult,
+    scheduled: anyhow::Result<()>,
+) -> Result<ipc::KnowledgeMutationResult, String> {
+    if let Err(error) = scheduled {
+        eprintln!("knowledge mutation committed but graph rebuild scheduling failed: {error:#}");
+        return Err("知识整理操作已保存，但索引排队失败；应用将在下次启动或整理时自动重试".into());
+    }
+    result.rebuild_state = "queued".into();
+    Ok(result)
+}
+
 fn queue_knowledge_rebuild(
     app: &AppHandle,
     root: PathBuf,
-    mut result: ipc::KnowledgeMutationResult,
-) -> ipc::KnowledgeMutationResult {
+    result: ipc::KnowledgeMutationResult,
+) -> Result<ipc::KnowledgeMutationResult, String> {
     let graph_events = app.clone();
-    app.state::<AppState>()
+    let scheduled = app
+        .state::<AppState>()
         .graph_scheduler
         .request(root, move |status| {
             let _ = graph_events.emit("graph_index_status", status);
         });
-    result.rebuild_state = "queued".into();
-    result
+    mark_knowledge_rebuild_queued(result, scheduled)
 }
 
 #[tauri::command]
@@ -1856,7 +1870,7 @@ fn apply_knowledge_operation(
         .map_err(|error| graph_mutation_error("apply_knowledge_operation", error))?;
     // `overrides::update` has returned here, so its cross-process ledger lock is released before
     // the scheduler can sample or rebuild.
-    Ok(queue_knowledge_rebuild(&app, root, result))
+    queue_knowledge_rebuild(&app, root, result)
 }
 
 #[tauri::command]
@@ -1867,7 +1881,7 @@ fn split_entity(
     let root = data_root(&app).map_err(|error| graph_mutation_error("split_entity", error))?;
     let result = graph::query::split_operation(&root, &request)
         .map_err(|error| graph_mutation_error("split_entity", error))?;
-    Ok(queue_knowledge_rebuild(&app, root, result))
+    queue_knowledge_rebuild(&app, root, result)
 }
 
 #[tauri::command]
@@ -1879,7 +1893,7 @@ fn merge_entities(
     let root = data_root(&app).map_err(|error| graph_mutation_error("merge_entities", error))?;
     let result = graph::query::merge_operation(&root, &source_id, &target_id)
         .map_err(|error| graph_mutation_error("merge_entities", error))?;
-    Ok(queue_knowledge_rebuild(&app, root, result))
+    queue_knowledge_rebuild(&app, root, result)
 }
 
 #[tauri::command]
@@ -1891,7 +1905,7 @@ fn undo_knowledge_operation(
         .map_err(|error| graph_mutation_error("undo_knowledge_operation", error))?;
     let result = graph::query::undo_operation(&root, &operation_id)
         .map_err(|error| graph_mutation_error("undo_knowledge_operation", error))?;
-    Ok(queue_knowledge_rebuild(&app, root, result))
+    queue_knowledge_rebuild(&app, root, result)
 }
 
 #[tauri::command]
@@ -3538,9 +3552,11 @@ pub fn run() {
             // 因而不会重叠 builder，也不会在 worker 退出窗口丢掉最后一次请求。
             if let Ok(root) = data_root(&handle) {
                 let graph_events = handle.clone();
-                st.graph_scheduler.request(root, move |status| {
+                if let Err(error) = st.graph_scheduler.request(root, move |status| {
                     let _ = graph_events.emit("graph_index_status", status);
-                });
+                }) {
+                    eprintln!("graph: 启动索引排队失败，已保留重试标记: {error:#}");
+                }
             }
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
@@ -3801,6 +3817,22 @@ mod tests {
                 "missing registered command {command}"
             );
         }
+    }
+
+    #[test]
+    fn failed_rebuild_request_never_reports_a_queued_mutation() {
+        let result = crate::ipc::KnowledgeMutationResult {
+            operation_id: "op_saved".into(),
+            entity_id: None,
+            rebuild_state: "committed".into(),
+        };
+        let error = super::mark_knowledge_rebuild_queued(
+            result,
+            Err(anyhow::anyhow!("injected spawn failure")),
+        )
+        .unwrap_err();
+        assert!(error.contains("操作已保存"));
+        assert!(error.contains("自动重试"));
     }
 
     #[test]
