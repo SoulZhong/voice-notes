@@ -71,6 +71,17 @@ export function sanitizeDebugGraphUrl(url: URL): URL {
   return sanitized;
 }
 
+export function createDebugFixtureReleaseOnce(
+  release: (sessionId: string) => Promise<void>,
+): (sessionId: string | null) => Promise<void> {
+  const released = new Set<string>();
+  return (sessionId) => {
+    if (!sessionId || released.has(sessionId)) return Promise.resolve();
+    released.add(sessionId);
+    return release(sessionId);
+  };
+}
+
 export function graphSimulationTickBudget(
   alphaDecay = NORMAL_GRAPH_ALPHA_DECAY,
   alphaMin = 0.001,

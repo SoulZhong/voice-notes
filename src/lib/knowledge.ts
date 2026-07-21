@@ -270,3 +270,7 @@ export const semanticGraphDebugFixture = () =>
 /** Debug builds only: relation evidence stays bound to the server-owned fixture root. */
 export const semanticGraphDebugRelationDetail = (sessionId: string, relationId: string) =>
   invoke<RelationDetail | null>("semantic_graph_debug_relation_detail", { sessionId, relationId });
+
+/** Debug builds only: releases the server-owned temporary root for this opaque session. */
+export const semanticGraphDebugRelease = (sessionId: string) =>
+  invoke<void>("semantic_graph_debug_release", { sessionId });

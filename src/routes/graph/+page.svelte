@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { goto, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
   import { graphData, kindLabel, type GraphData, type RenderEdge } from "$lib/graph";
@@ -9,6 +9,7 @@
     semanticEntityDetail,
     semanticGraph,
     semanticGraphDebugFixture,
+    semanticGraphDebugRelease,
     semanticGraphDebugRelationDetail,
     type KnowledgeFilter,
     type KnowledgePath,
@@ -20,6 +21,7 @@
     DEFAULT_KNOWLEDGE_FILTER,
     GLOBAL_SEMANTIC_PRESENCE_FILTER,
     defaultBackbone,
+    createDebugFixtureReleaseOnce,
     debugKnowledgeRoutePolicy,
     ensureBackboneEdge,
     filterSemanticGraph,
@@ -89,6 +91,8 @@
   let backfillOpen = $state(false);
   let debugFixtureSession = $state<string | null>(null);
   let debugRelationEnabled = $state(false);
+  let debugFixtureDisposed = false;
+  const releaseDebugFixtureOnce = createDebugFixtureReleaseOnce(semanticGraphDebugRelease);
   let lastSidebarKind = graphFilter.kind;
   let lastRequestedPathStart: string | null = null;
 
@@ -294,6 +298,14 @@
     semanticError = "";
     try {
       const fixture = await semanticGraphDebugFixture();
+      if (debugFixtureDisposed) {
+        try {
+          await releaseDebugFixtureOnce(fixture.session_id);
+        } catch (cause) {
+          console.warn("isolated semantic graph fixture cleanup failed", cause);
+        }
+        return;
+      }
       debugFixtureSession = fixture.session_id;
       semantic = fixture.graph;
       graph = { nodes: [], edges: [] };
@@ -311,12 +323,13 @@
       visibleIds = new Set([...initialIds(fixture.graph), ...fixture.path.entity_ids]);
       loaded = true;
     } catch (cause) {
+      if (debugFixtureDisposed) return;
       console.warn("isolated semantic graph fixture failed", cause);
       semanticRequestFailed = true;
       semanticError = "隔离调试夹具加载失败。请重新打开调试地址。";
       loaded = true;
     } finally {
-      semanticLoading = false;
+      if (!debugFixtureDisposed) semanticLoading = false;
     }
   }
 
@@ -338,6 +351,17 @@
       probeGlobalSemanticPresence(),
       loadPending(),
     ]);
+  });
+
+  onDestroy(() => {
+    debugFixtureDisposed = true;
+    const session = debugFixtureSession;
+    debugFixtureSession = null;
+    if (session) {
+      void releaseDebugFixtureOnce(session).catch((cause) => {
+        console.warn("isolated semantic graph fixture cleanup failed", cause);
+      });
+    }
   });
 
   $effect(() => {
