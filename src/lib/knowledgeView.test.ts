@@ -566,6 +566,7 @@ describe("pathEmphasis", () => {
     let dialogOpen = true;
     let current = { generation: 11, start: "kg_a", end: "kg_b" };
     let active = "old-path";
+    let semanticRefreshes = 0;
     const rerun = async () => {
       active = "stale-rerun";
     };
@@ -573,7 +574,10 @@ describe("pathEmphasis", () => {
     const task = runGuardedPathRefresh(
       { ...current },
       () => current,
-      [() => refresh],
+      [async () => {
+        await refresh;
+        semanticRefreshes += 1;
+      }],
       rerunSpy.call,
     );
 
@@ -583,6 +587,7 @@ describe("pathEmphasis", () => {
     resolveRefresh();
 
     expect(await task).toBe(false);
+    expect(semanticRefreshes).toBe(1);
     expect(dialogOpen).toBe(false);
     expect(active).toBe("new-path");
   });

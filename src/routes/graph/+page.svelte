@@ -486,14 +486,15 @@
       pathStatus = "loading";
       pathError = "";
     }
-    // The semantic failure path derives its fallback from `graph`, so make the
-    // current generation visible before starting any semantic request.
-    await loadGraph();
     await runGuardedPathRefresh(
       snapshot,
       () => ({ generation: pathGeneration, start: pathStart, end: pathEnd }),
       [
         async () => {
+          // Once the guarded data stage starts, finish installing one coherent
+          // fallback/semantic generation even if path selection changes while
+          // graphData is pending. Later stages and the stale path rerun remain guarded.
+          await loadGraph();
           await Promise.all([
             loadSemantic(effectiveGraphFilter, "preserve-view"),
             probeGlobalSemanticPresence(),
