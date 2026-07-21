@@ -700,6 +700,27 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).not.toMatch(/function rebuild\([^)]*\)\s*\{[\s\S]{0,180}viewZoom = 1/);
   });
 
+  it("installs the same-generation fallback graph before preserve-view semantic loads", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const governanceRefresh = route.slice(
+      route.indexOf("async function refreshKnowledge()"),
+      route.indexOf("async function refreshAfterBackfill()"),
+    );
+    expect(governanceRefresh.indexOf("graph = nextGraph")).toBeGreaterThan(-1);
+    expect(governanceRefresh.indexOf('loadSemantic(effectiveGraphFilter, "preserve-view")')).toBeGreaterThan(
+      governanceRefresh.indexOf("graph = nextGraph"),
+    );
+
+    const backfillRefresh = route.slice(
+      route.indexOf("async function refreshAfterBackfill()"),
+      route.indexOf("function updateQuery("),
+    );
+    expect(backfillRefresh.indexOf("await loadGraph()")).toBeGreaterThan(-1);
+    expect(backfillRefresh.indexOf('loadSemantic(effectiveGraphFilter, "preserve-view")')).toBeGreaterThan(
+      backfillRefresh.indexOf("await loadGraph()"),
+    );
+  });
+
   it("documents the shipped semantic zoom layers without promising detail overlays", () => {
     const design = source("../../DESIGN.md");
     expect(design).toContain("缩放时逐级显示更多完整的顶点名称和关系标签");
