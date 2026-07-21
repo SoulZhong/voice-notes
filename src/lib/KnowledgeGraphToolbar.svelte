@@ -84,16 +84,20 @@
       <summary>关系类型{filter.predicate_types.length ? ` · ${filter.predicate_types.length}` : ""}</summary>
       <fieldset>
         <legend>关系类型</legend>
-        {#each predicates as predicate (predicate.value)}
-          <label>
-            <input
-              type="checkbox"
-              checked={filter.predicate_types.includes(predicate.value)}
-              onchange={() => toggleList("predicate_types", predicate.value)}
-            />
-            <span>{predicate.label}</span>
-          </label>
-        {/each}
+        {#if predicates.length === 0}
+          <p class="empty-options">尚无语义关系类型。完成关系补建后可在这里筛选。</p>
+        {:else}
+          {#each predicates as predicate (predicate.value)}
+            <label>
+              <input
+                type="checkbox"
+                checked={filter.predicate_types.includes(predicate.value)}
+                onchange={() => toggleList("predicate_types", predicate.value)}
+              />
+              <span>{predicate.label}</span>
+            </label>
+          {/each}
+        {/if}
       </fieldset>
     </details>
 
@@ -222,6 +226,7 @@
     white-space: nowrap;
   }
   fieldset label:hover { background: var(--surface-soft); }
+  .empty-options { max-width: 18rem; margin: 0; padding: 8px 7px; color: var(--ink-secondary); line-height: 1.55; white-space: normal; }
   input[type="checkbox"] { accent-color: var(--accent); }
   .date-fields { min-width: 220px; gap: 10px; padding: 12px; }
   .date-fields label { display: grid; gap: 5px; color: var(--ink-secondary); }

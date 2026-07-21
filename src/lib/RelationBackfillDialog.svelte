@@ -140,7 +140,7 @@
           </ul>
         </details>
         {#if state.preview.note_ids.length === 0}
-          <p class="message">没有需要补建的笔记。现有转写稿不会改变。</p>
+          <p class="message">没有可补建的笔记。关系已是最新，或笔记尚未形成可用的实体上下文。现有转写稿不会改变。</p>
         {:else}
           <label class="consent">
             <input

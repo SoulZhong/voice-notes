@@ -152,12 +152,9 @@ pub(crate) fn is_current(doc: &RefinedDoc) -> bool {
 }
 
 fn selected_by_default(doc: &RefinedDoc) -> bool {
-    doc.stages.relations == "failed"
-        || doc
-            .graph_extraction
-            .as_ref()
-            .map(|extraction| extraction.contract_version != GRAPH_CONTRACT_VERSION)
-            .unwrap_or(false)
+    let has_entity_context =
+        matches!(doc.stages.entities.as_str(), "done" | "partial") && !doc.entities.is_empty();
+    has_entity_context && !is_current(doc)
 }
 
 fn validate_backfill_note_id(note_id: &str) -> anyhow::Result<()> {
@@ -856,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_defaults_to_non_current_notes_and_explicit_selection_is_strict_and_sorted() {
+    fn preview_defaults_to_every_non_current_note_with_entity_context() {
         let root = tempfile::tempdir().unwrap();
         let current = fixture_doc(
             "current",
@@ -881,18 +878,27 @@ mod tests {
             "done",
         );
         stale.graph_extraction.as_mut().unwrap().source_hash = "stale".into();
+        let mut unavailable = fixture_doc(
+            "unavailable",
+            crate::store::aing_graph::GRAPH_CONTRACT_VERSION,
+            "off",
+        );
+        unavailable.graph_extraction = None;
+        unavailable.stages.entities = "failed".into();
+        unavailable.entities.clear();
         write_note(root.path(), "current", &current);
         write_note(root.path(), "old", &old);
         write_note(root.path(), "failed", &failed);
         write_note(root.path(), "off", &off);
         write_note(root.path(), "stale", &stale);
+        write_note(root.path(), "unavailable", &unavailable);
         std::fs::create_dir_all(root.path().join("notes/unrefined")).unwrap();
 
         let mut settings = crate::settings::Settings::default();
         settings.refine_provider = "openai".into();
         settings.refine_model = "relation-model".into();
         let found = preview(root.path(), &settings, None).unwrap();
-        assert_eq!(found.note_ids, vec!["failed", "old"]);
+        assert_eq!(found.note_ids, vec!["failed", "off", "old", "stale"]);
         assert_eq!(found.provider, "openai");
         assert_eq!(found.model, "relation-model");
         assert_eq!(
