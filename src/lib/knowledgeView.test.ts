@@ -11,6 +11,7 @@ import {
   filterSemanticGraph,
   graphDragPosition,
   graphSimulationTickBudget,
+  hasPathEndpoints,
   legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
@@ -514,6 +515,18 @@ describe("exploratory graph UI source contract", () => {
     }
     expect(panel).not.toContain("…");
     expect(panel).not.toMatch(/\.\.\.(?=["'`<])/);
+  });
+
+  it("clears stale path emphasis during backfill refresh and reruns only valid endpoints", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const refreshed = graph([node("kg_a"), node("kg_b")], [edge("rel_new", "kg_a", "kg_b")]);
+
+    expect(hasPathEndpoints(refreshed, "kg_a", "kg_b")).toBe(true);
+    expect(hasPathEndpoints(refreshed, "kg_a", "kg_removed")).toBe(false);
+    expect(route).toMatch(/async function refreshAfterBackfill\(\)[\s\S]{0,260}activePath = null/);
+    expect(route).toContain("hasPathEndpoints(semantic, previousStart, previousEnd)");
+    expect(route).toContain("await requestPath(previousStart, previousEnd, knowledgeFilter, includeWeakPath)");
+    expect(route).toContain("关系补建后路径端点已变化，原路径已清除。请重新选择两点。");
   });
 
   it("canonicalizes Rust-style cooccurrence path step IDs to rendered weak-edge IDs", () => {
