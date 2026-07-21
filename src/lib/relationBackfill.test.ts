@@ -567,4 +567,17 @@ describe("backfill dialog source contract", () => {
     expect(graph).toContain("probeGlobalSemanticPresence()");
     expect(graph).not.toMatch(/\{#if backfillOpen[^}]*\}[\s\S]{0,400}<ForceGraph/);
   });
+
+  it("uses the design-system primary CTA and coarse disclosure targets", () => {
+    const dialog = source("./RelationBackfillDialog.svelte");
+    expect(dialog).toMatch(/\.primary\s*\{[^}]*background:\s*var\(--primary\)/s);
+    expect(dialog).toMatch(/\.primary\s*\{[^}]*color:\s*var\(--on-primary\)/s);
+    expect(dialog).toMatch(/\.primary\s*\{[^}]*border-radius:\s*var\(--radius-full\)/s);
+    expect(dialog).toMatch(/\.primary\s*\{[^}]*box-shadow:\s*var\(--shadow-btn\)/s);
+    expect(dialog).toMatch(/\.primary:hover:not\(:disabled\)[^}]*background:\s*var\(--primary-pressed\)/s);
+    expect(dialog).toMatch(/\.primary:active:not\(:disabled\)[^}]*translateY\(0\.5px\)/s);
+    expect(dialog).not.toMatch(/\.primary\s*\{[^}]*var\(--accent\)/s);
+    expect(dialog).not.toMatch(/font-weight:\s*(?:620|650)/);
+    expect(dialog).toMatch(/@media \(pointer: coarse\)\s*\{[^}]*\.technical summary[^}]*min-height:\s*44px/s);
+  });
 });

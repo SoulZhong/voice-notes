@@ -29,6 +29,7 @@
     legacyFallbackGraph,
     nextExpandedIds,
     pathEmphasis,
+    preserveGraphExplorationState,
     relationLabel,
     runGuardedPathRefresh,
     sanitizeDebugGraphUrl,
@@ -81,6 +82,7 @@
   let ctxMenu = $state<{ id: string; name: string; isPerson: boolean; x: number; y: number } | null>(null);
   let detailGeneration = 0;
   let graphGeneration = 0;
+  let graphViewResetKey = $state(0);
   let pathGeneration = 0;
   let pathStart = $state<string | null>(null);
   let pathEnd = $state<string | null>(null);
@@ -204,7 +206,12 @@
     }
   }
 
-  async function loadSemantic(filter: KnowledgeFilter) {
+  type SemanticLoadMode = "reset-view" | "preserve-view";
+
+  async function loadSemantic(
+    filter: KnowledgeFilter,
+    mode: SemanticLoadMode = "reset-view",
+  ) {
     if (debugFixtureRequested) return;
     const generation = ++graphGeneration;
     semanticLoading = true;
@@ -223,19 +230,37 @@
       if (value.degraded && value.message) console.warn("semantic graph degraded", value.message);
       semanticError = value.degraded ? "语义关系服务暂时降级，当前显示可用结果。" : "";
       const filtered = filterSemanticGraph(value, filter);
-      if (showingAll) visibleIds = new Set(filtered.nodes.map((node) => node.id));
-      else visibleIds = initialIds(value);
-      if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
-      expansionDepth = new Map();
+      if (mode === "preserve-view") {
+        const preserved = preserveGraphExplorationState(
+          filtered,
+          visibleIds,
+          expansionDepth,
+          activePath?.entity_ids ?? [],
+        );
+        visibleIds = showingAll
+          ? new Set(filtered.nodes.map((node) => node.id))
+          : preserved.visibleIds;
+        expansionDepth = preserved.expansionDepth;
+      } else {
+        if (showingAll) visibleIds = new Set(filtered.nodes.map((node) => node.id));
+        else visibleIds = initialIds(value);
+        if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
+        expansionDepth = new Map();
+        graphViewResetKey += 1;
+      }
     } catch (cause) {
       if (generation !== graphGeneration) return;
       console.warn("semantic graph request failed", cause);
       semanticRequestFailed = true;
       const fallback = legacyFallbackGraph(semantic, graph);
-      visibleIds = showingAll
-        ? new Set(fallback.nodes.map((node) => node.id))
-        : initialIds(fallback);
-      if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
+      if (mode === "reset-view") {
+        visibleIds = showingAll
+          ? new Set(fallback.nodes.map((node) => node.id))
+          : initialIds(fallback);
+        if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
+        expansionDepth = new Map();
+        graphViewResetKey += 1;
+      }
     } finally {
       if (generation === graphGeneration) {
         semanticLoading = false;
@@ -413,7 +438,7 @@
       graphData(),
       pendingReview(DEFAULT_KNOWLEDGE_FILTER),
       id ? semanticEntityDetail(id, detailFilter) : Promise.resolve(null),
-      loadSemantic(effectiveGraphFilter),
+      loadSemantic(effectiveGraphFilter, "preserve-view"),
     ]);
     graph = nextGraph;
     pendingItems = nextPending;
@@ -444,7 +469,7 @@
       [
         async () => {
           await Promise.all([
-            loadSemantic(effectiveGraphFilter),
+            loadSemantic(effectiveGraphFilter, "preserve-view"),
             probeGlobalSemanticPresence(),
             loadGraph(),
             loadPending(),
@@ -766,6 +791,7 @@
               query={graphFilter.query}
               focusedNodeIds={pathFocus.nodeIds}
               focusedEdgeIds={pathFocus.edgeIds}
+              resetKey={graphViewResetKey}
               maxNodes={2000}
               minEdgeWeight={0}
               backboneK={2000}

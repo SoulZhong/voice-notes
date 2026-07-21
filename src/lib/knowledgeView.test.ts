@@ -17,6 +17,8 @@ import {
   legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
+  preserveGraphExplorationState,
+  preserveGraphNodePositions,
   runGuardedPathRefresh,
   relationLabel,
   searchAdmissionIds,
@@ -80,6 +82,38 @@ describe("debug fixture route isolation", () => {
 
     expect(release).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledWith("fixture-session");
+  });
+});
+
+describe("graph refresh continuity", () => {
+  it("keeps surviving visible and expanded entities while pruning removed IDs", () => {
+    const refreshed = graph([node("kg_keep"), node("kg_new")], []);
+    const result = preserveGraphExplorationState(
+      refreshed,
+      new Set(["kg_keep", "kg_removed"]),
+      new Map([["kg_keep", 2], ["kg_removed", 1]]),
+      ["kg_keep", "kg_removed"],
+    );
+
+    expect(result.visibleIds).toEqual(new Set(["kg_keep"]));
+    expect(result.expansionDepth).toEqual(new Map([["kg_keep", 2]]));
+  });
+
+  it("carries coordinates only for nodes that survive a data refresh", () => {
+    const previous = new Map([
+      ["kg_keep", { name: "Stale name", x: 120, y: 240, vx: 1, vy: -1 }],
+      ["kg_removed", { name: "Removed", x: 20, y: 40, vx: 0, vy: 0 }],
+    ]);
+    const result = preserveGraphNodePositions(
+      [{ id: "kg_keep", name: "Keep" }, { id: "kg_new", name: "New" }],
+      previous,
+    );
+
+    expect(result).toEqual([
+      { id: "kg_keep", name: "Keep", x: 120, y: 240, vx: 1, vy: -1 },
+      { id: "kg_new", name: "New" },
+    ]);
+    expect(result.some((item) => item.id === "kg_removed")).toBe(false);
   });
 });
 
@@ -524,7 +558,7 @@ describe("pathEmphasis", () => {
 
 describe("exploratory graph UI source contract", () => {
   const sources = import.meta.glob(
-    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./RelationDrawer.svelte", "./knowledge.ts", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
+    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./RelationDrawer.svelte", "./knowledge.ts", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte", "../../DESIGN.md"],
     { eager: true, query: "?raw", import: "default" },
   ) as Record<string, string>;
   const source = (name: string) => {
@@ -618,6 +652,28 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("snapshot.generation");
     expect(route).toContain("expectedGeneration ?? ++pathGeneration");
     expect(route).toContain("关系补建后路径端点已变化，原路径已清除。请重新选择两点。");
+  });
+
+  it("preserves graph exploration, positions, and camera only for data refreshes", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(route).toContain('type SemanticLoadMode = "reset-view" | "preserve-view"');
+    expect(route).toContain('loadSemantic(effectiveGraphFilter, "preserve-view")');
+    expect(route).toContain("preserveGraphExplorationState(");
+    expect(route).toContain("resetKey={graphViewResetKey}");
+    expect(forceGraph).toContain("resetKey?: string | number");
+    expect(forceGraph).toContain("preserveGraphNodePositions(");
+    expect(forceGraph).toContain("if (shouldReset) resetViewport()");
+    expect(forceGraph).toContain("const previousPositions = shouldReset");
+    expect(forceGraph).not.toMatch(/function rebuild\([^)]*\)\s*\{[\s\S]{0,180}viewZoom = 1/);
+  });
+
+  it("documents the shipped semantic zoom layers without promising detail overlays", () => {
+    const design = source("../../DESIGN.md");
+    expect(design).toContain("缩放时逐级显示更多完整的顶点名称和关系标签");
+    expect(design).toContain("别名继续用于搜索");
+    expect(design).toContain("证据与治理状态通过详情面板查看");
+    expect(design).not.toContain("逐步显露别名、关系、证据数量和治理状态");
   });
 
   it("keeps the large graph and relation evidence behind one opaque debug session", () => {

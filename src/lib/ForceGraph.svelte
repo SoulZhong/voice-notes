@@ -5,6 +5,7 @@
   import {
     NORMAL_GRAPH_ALPHA_DECAY,
     graphDragPosition,
+    preserveGraphNodePositions,
     stableEdgeLanes,
   } from "$lib/knowledgeView";
   import { speakerInk } from "$lib/notes";
@@ -23,6 +24,7 @@
     focusedNodeIds = new Set<string>(),
     focusedEdgeIds = new Set<string>(),
     reducedMotion,
+    resetKey = 0,
   }: {
     nodes: EntitySummary[];
     edges: RenderEdge[] | EdgeRow[];
@@ -45,6 +47,8 @@
     focusedNodeIds?: Set<string>;
     focusedEdgeIds?: Set<string>;
     reducedMotion?: boolean;
+    /** Change only when navigation/filter semantics require a fresh camera. */
+    resetKey?: string | number;
   } = $props();
 
   interface SimNode extends EntitySummary {
@@ -125,8 +129,8 @@
   }>({ nodes: [], links: [] });
 
   // 镜头变换(用户手动缩放/平移,叠在 fit 自适应变换之外的第二层):滚轮缩放围绕光标、
-  // 拖拽空白处平移。数据变化(rebuild)时归零回到自适应总览,不然新数据可能整个不在
-  // 用户上次停留的视口范围内。
+  // 拖拽空白处平移。普通数据刷新保留探索位置；只有 resetKey 表示导航/筛选语义改变
+  // 时才归零回到自适应总览。
   let viewZoom = $state(1);
   let viewX = $state(0);
   let viewY = $state(0);
@@ -134,6 +138,7 @@
   let sim: Simulation<SimNode, undefined> | null = null;
   let dNodes: SimNode[] = [];
   let dLinks: SimLink[] = [];
+  let lastResetKey: string | number | undefined;
 
   const MIN_R = 12;
   const MAX_R = 38;
@@ -251,7 +256,7 @@
   // 全量共现边有几万条,forceLink 每 tick 都要过一遍全部边,配合每 tick 全量重渲染
   // 上千个 DOM 节点,浏览器直接卡死。放宽到 6(默认 3)已经比骨架图丰富得多,边数量级
   // 仍被按节点数线性封顶,不会随原始边数暴涨。
-  function build() {
+  function build(previousPositions = new Map<string, SimNode>()) {
     const growing = expanded || expandHops > 0;
     const effMinWeight = expanded ? 1 : minEdgeWeight;
     const effMaxNodes = expanded ? 2000 : maxNodes;
@@ -353,7 +358,7 @@
         .map((n, rank) => [n.id, rank]),
     );
     const showAllLabels = chosen.length <= ALL_LABELS_LIMIT;
-    dNodes = chosen.map((n) => {
+    dNodes = preserveGraphNodePositions(chosen, previousPositions).map((n) => {
       const layout = layoutFor(
         n.name,
         n.kind,
@@ -393,6 +398,12 @@
             left.id.localeCompare(right.id),
         ),
     );
+  }
+
+  function resetViewport() {
+    viewZoom = 1;
+    viewX = 0;
+    viewY = 0;
   }
 
   function refreshSnap() {
@@ -464,12 +475,13 @@
       重跑,否则组件被复用时 props 换了但内部仿真停留在旧数据,图不更新。 */
   function rebuild() {
     sim?.stop();
-    // 数据集本身变了(换中心实体/kind 过滤/显示全部切换),旧的镜头位置对新数据未必
-    // 还有意义,归零回自适应总览。
-    viewZoom = 1;
-    viewX = 0;
-    viewY = 0;
-    build();
+    const shouldReset = lastResetKey === undefined || lastResetKey !== resetKey;
+    const previousPositions = shouldReset
+      ? new Map<string, SimNode>()
+      : new Map(dNodes.map((node) => [node.id, node]));
+    if (shouldReset) resetViewport();
+    lastResetKey = resetKey;
+    build(previousPositions);
     heavy = dNodes.length > 150 || dLinks.length > 800;
     // 独立于共现关系的小簇(比如几个只互相共现、跟主图毫无连接的「日期」实体)光靠
     // forceCenter 拉不住——那只是把全体节点的平均位置摆回中心,不会单独管束某个
@@ -573,6 +585,7 @@
     void effectiveReducedMotion;
     void expanded;
     void expandHops;
+    void resetKey;
     if (container) rebuild();
   });
 
