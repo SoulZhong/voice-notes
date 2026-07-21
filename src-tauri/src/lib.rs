@@ -336,7 +336,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     embedder.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
-                );
+                )?;
                 report("filter", &doc.stages.filter);
                 report("recluster", &doc.stages.recluster);
                 if enqueue_transcode_after_local {

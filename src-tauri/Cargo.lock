@@ -5867,6 +5867,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6020,6 +6026,7 @@ dependencies = [
  "tokio",
  "toml_edit 0.25.12+spec-1.1.0",
  "tract-onnx",
+ "unicode-casefold",
  "ureq",
  "webrtc-audio-processing",
  "windows-sys 0.59.0",

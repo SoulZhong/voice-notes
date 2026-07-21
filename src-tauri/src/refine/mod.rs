@@ -10,11 +10,12 @@ pub mod relations;
 use crate::diar::registry::SeedCluster;
 use crate::diar::SpeakerEmbedder;
 use crate::store::{
-    write_refined_atomic, Entity, GraphExtraction, Mention, RefineStages, RefinedDoc,
-    RefinedParagraph, SegmentRecord, SpeakerMeta,
+    Entity, GraphExtraction, Mention, RefineStages, RefinedDoc, RefinedParagraph, SegmentRecord,
+    SpeakerMeta,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
+use unicode_casefold::UnicodeCaseFold;
 
 /// 同说话人合并段落的时长上限(对齐豆包排版粒度)。
 pub const MAX_PARA_MS: u64 = 60_000;
@@ -26,7 +27,7 @@ pub fn run_local(
     embedder: Option<&mut dyn SpeakerEmbedder>,
     seeds: &[SeedCluster],
     generated_at: &str,
-) -> RefinedDoc {
+) -> anyhow::Result<RefinedDoc> {
     let discarded = filter::discarded_seqs(segs);
     let kept: Vec<&SegmentRecord> = segs
         .iter()
@@ -73,20 +74,19 @@ pub fn run_local(
         relations: vec![],
         paragraphs,
     };
-    match crate::store::notelock::NoteLock::acquire(note_dir) {
-        Ok(Some(_note_lock)) => {
-            if let Some(previous) = crate::store::load_refined(note_dir) {
-                doc.graph_extraction = previous.graph_extraction;
-                doc.relations = previous.relations;
-            }
-            if let Err(e) = write_refined_atomic(note_dir, &doc) {
-                eprintln!("refine: refined.json 写盘失败: {e}");
-            }
-        }
-        Ok(None) => eprintln!("refine: 笔记正被其它进程写入,跳过本地 Aing 落盘"),
-        Err(e) => eprintln!("refine: 获取笔记写锁失败: {e}"),
+    let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
+        .ok_or_else(|| anyhow::anyhow!("笔记正被其它进程写入，无法提交本地 Aing"))?;
+    if let Some(previous) = crate::store::refined::load_refined_locked(note_dir, &note_lock) {
+        doc.graph_extraction = previous.graph_extraction;
+        doc.relations = previous.relations;
     }
-    doc
+    let note_id = note_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
+    crate::store::ensure_graph_ids(note_id, &mut doc);
+    crate::store::refined::write_refined_atomic_locked(note_dir, &doc, &note_lock)?;
+    Ok(doc)
 }
 
 /// 时间轴 ms 区间 → 该轨文件内的 PCM 样本下标区间(16kHz 单声道,1ms=16 样本)。
@@ -233,6 +233,50 @@ pub fn run_llm(
     llm_model: &str,
     log: Option<&crate::ailog::Ctx>,
 ) -> anyhow::Result<()> {
+    let fail_in_memory = |doc: &mut RefinedDoc| {
+        doc.stages.llm = "failed".into();
+        doc.stages.entities = "failed".into();
+        doc.stages.relations = "failed".into();
+    };
+    let aing_path = note_dir.join(crate::store::AING_DOC_FILE);
+    // HTTP 必须以调用开始时盘上的整份人读真值为基线。原始 bytes 即 CAS revision：
+    // 原子 rename 保证读到完整版本，提交时逐字节比较可捕获任意字段的并发改动。
+    let original_revision = match std::fs::read(&aing_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // 兼容仅有 legacy refined.json 的旧笔记：先走受锁保护的一次性迁移。
+            if crate::store::load_refined(note_dir).is_none() {
+                fail_in_memory(doc);
+                anyhow::bail!("HTTP Aing 前无法加载最新整份修订稿");
+            }
+            match std::fs::read(&aing_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    fail_in_memory(doc);
+                    return Err(error.into());
+                }
+            }
+        }
+        Err(error) => {
+            fail_in_memory(doc);
+            return Err(error.into());
+        }
+    };
+    let mut latest: RefinedDoc = match serde_json::from_slice(&original_revision) {
+        Ok(doc) => doc,
+        Err(error) => {
+            fail_in_memory(doc);
+            return Err(error.into());
+        }
+    };
+    let note_id = note_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
+    crate::store::ensure_graph_ids(note_id, &mut latest);
+    *doc = latest;
+    let fallback_graph = (doc.graph_extraction.clone(), doc.relations.clone());
+
     let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log);
     let relations_complete = text_outcome.relations_complete();
     let state = match &text_outcome {
@@ -244,31 +288,38 @@ pub fn run_llm(
     doc.llm_model = Some(llm_model.to_string());
     // 实体维度:与文本同一批调用产出,stages.entities 跟随 state;实体环节绝不回退修订文本。
     fill_entities(doc, raw_entities, state);
+    // materialize 会引用 mention id；必须先写回当前内存 doc，而不是只依赖 writer
+    // 对 clone 的落盘修复，否则调用者内存态与 reload 后状态不一致。
+    crate::store::ensure_graph_ids(note_id, doc);
 
-    let note_id = note_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
-    let _note_lock = match crate::store::notelock::NoteLock::acquire(note_dir) {
+    let note_lock = match crate::store::notelock::NoteLock::acquire(note_dir) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            doc.stages.llm = "failed".into();
-            doc.stages.entities = "failed".into();
-            doc.stages.relations = "failed".into();
+            fail_in_memory(doc);
             anyhow::bail!("笔记正被其它进程写入,无法提交 HTTP Aing");
         }
         Err(error) => {
-            doc.stages.llm = "failed".into();
-            doc.stages.entities = "failed".into();
-            doc.stages.relations = "failed".into();
+            fail_in_memory(doc);
             return Err(error.into());
         }
     };
-    // HTTP 调用期间不占 note lock；提交前在锁内重载最新关系快照。成功替换关系和
-    // extraction，任意 parse/materialize/validator 失败则逐字段恢复，正文/实体照常提交。
-    let fallback = crate::store::load_refined(note_dir)
-        .map(|previous| (previous.graph_extraction, previous.relations))
-        .unwrap_or_else(|| (doc.graph_extraction.clone(), doc.relations.clone()));
+    let current_revision = match std::fs::read(&aing_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            fail_in_memory(doc);
+            return Err(error.into());
+        }
+    };
+    if current_revision != original_revision {
+        if let Ok(mut concurrent) = serde_json::from_slice::<RefinedDoc>(&current_revision) {
+            crate::store::ensure_graph_ids(note_id, &mut concurrent);
+            *doc = concurrent;
+        }
+        anyhow::bail!("HTTP Aing 期间 aing.json 已变化，请基于最新版本重试");
+    }
+
+    // CAS 成功后在锁内完成 materialize + 整份提交。成功替换关系和 extraction；任意
+    // parse/materialize/validator 失败只恢复同一原始整份基线里的旧图谱字段。
     if relations_complete {
         match relations::materialize(note_id, doc, raw_relations) {
             Ok(graph) => {
@@ -296,20 +347,18 @@ pub fn run_llm(
                 for issue in issues {
                     eprintln!("refine relations: {}: {}", issue.field, issue.message);
                 }
-                doc.graph_extraction = fallback.0;
-                doc.relations = fallback.1;
+                doc.graph_extraction = fallback_graph.0;
+                doc.relations = fallback_graph.1;
                 doc.stages.relations = "failed".into();
             }
         }
     } else {
-        doc.graph_extraction = fallback.0;
-        doc.relations = fallback.1;
+        doc.graph_extraction = fallback_graph.0;
+        doc.relations = fallback_graph.1;
         doc.stages.relations = "failed".into();
     }
-    if let Err(e) = write_refined_atomic(note_dir, doc) {
-        doc.stages.llm = "failed".into();
-        doc.stages.entities = "failed".into();
-        doc.stages.relations = "failed".into();
+    if let Err(e) = crate::store::refined::write_refined_atomic_locked(note_dir, doc, &note_lock) {
+        fail_in_memory(doc);
         return Err(e);
     }
     Ok(())
@@ -328,9 +377,14 @@ pub(crate) fn fill_entities(doc: &mut RefinedDoc, raw: Vec<llm::RawEntity>, text
     doc.entities = entities;
 }
 
-/// 大模型原始实体 → 本篇规范实体:按规范名(trim + 不分大小写)去重,合并别名,
+/// 大模型原始实体 → 本篇规范实体:按规范名(trim + Unicode full default case fold)
+/// 去重并合并别名,
 /// 按首次出现顺序分配局部 id `ent_N`。首现的原名即规范名。**不做全局 person 归并**
 /// (跨笔记/声纹匹配是 Plan 4 的解析层)。
+pub(crate) fn entity_key(value: &str) -> String {
+    value.trim().case_fold().collect()
+}
+
 pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
     let mut out: Vec<Entity> = Vec::new();
     for r in raw {
@@ -338,16 +392,13 @@ pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
         if name.is_empty() {
             continue;
         }
-        let key = name.to_lowercase();
-        if let Some(e) = out.iter_mut().find(|e| e.name.to_lowercase() == key) {
+        let key = entity_key(name);
+        if let Some(e) = out.iter_mut().find(|e| entity_key(&e.name) == key) {
             for a in r.aliases {
                 let a = a.trim().to_string();
                 if !a.is_empty()
-                    && a.to_lowercase() != key
-                    && !e
-                        .aliases
-                        .iter()
-                        .any(|x| x.to_lowercase() == a.to_lowercase())
+                    && entity_key(&a) != key
+                    && !e.aliases.iter().any(|x| entity_key(x) == entity_key(&a))
                 {
                     e.aliases.push(a);
                 }
@@ -358,8 +409,8 @@ pub(crate) fn resolve_note_entities(raw: Vec<llm::RawEntity>) -> Vec<Entity> {
             for a in r.aliases {
                 let a = a.trim().to_string();
                 if !a.is_empty()
-                    && a.to_lowercase() != key
-                    && !aliases.iter().any(|x| x.to_lowercase() == a.to_lowercase())
+                    && entity_key(&a) != key
+                    && !aliases.iter().any(|x| entity_key(x) == entity_key(&a))
                 {
                     aliases.push(a);
                 }
@@ -560,6 +611,104 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// `Some(body)` 返回一个 200；`None` 在读完请求后直接断开，用来稳定制造
+    /// 传输级失败。每项对应一个分块请求。
+    fn sequence_server(responses: Vec<Option<String>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let count = stream.read(&mut chunk).unwrap_or(0);
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                if let Some(body) = body {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn barrier_server(
+        body: String,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requested_tx, requested_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            requested_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}"), requested_rx, release_tx)
+    }
+
     fn chat_response(content: serde_json::Value) -> String {
         serde_json::json!({
             "choices": [{"message": {"content": content.to_string()}}]
@@ -631,6 +780,26 @@ mod tests {
         assert_eq!(ents[1].id, "ent_2");
         assert_eq!(ents[1].name, "Acme", "首现写法为规范名");
         assert!(ents[1].aliases.contains(&"ACME 公司".to_string()));
+    }
+
+    #[test]
+    fn resolve_uses_full_unicode_default_case_folding() {
+        let ents = resolve_note_entities(vec![
+            llm::RawEntity {
+                name: "Straße".into(),
+                kind: "place".into(),
+                aliases: vec!["Fußweg".into()],
+            },
+            llm::RawEntity {
+                name: "STRASSE".into(),
+                kind: "place".into(),
+                aliases: vec!["FUSSWEG".into()],
+            },
+        ]);
+
+        assert_eq!(ents.len(), 1, "ß/SS 必须按 Unicode full case folding 归一");
+        assert_eq!(ents[0].name, "Straße");
+        assert_eq!(ents[0].aliases, vec!["Fußweg"]);
     }
 
     #[test]
@@ -741,7 +910,8 @@ mod tests {
             Some(&mut e),
             &[],
             "2026-07-06T15:00:00+08:00",
-        );
+        )
+        .unwrap();
         assert_eq!(doc.discarded_seqs, vec![1]);
         assert_eq!(doc.stages.filter, "done");
         assert_eq!(doc.stages.recluster, "done");
@@ -770,7 +940,7 @@ mod tests {
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
-        let doc = run_local(dir.path(), &segs, &speakers, None, &[], "t");
+        let doc = run_local(dir.path(), &segs, &speakers, None, &[], "t").unwrap();
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert_eq!(
@@ -908,6 +1078,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
         };
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
         run_llm(dir.path(), &mut doc, &cfg, "m", None).expect("空段落路径不应触网,写盘应成功");
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(doc.llm_model.as_deref(), Some("m"));
@@ -1003,6 +1174,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
         };
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
         run_llm(dir.path(), &mut doc, &cfg, "m", None).unwrap();
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(
@@ -1041,6 +1213,14 @@ mod tests {
         assert_eq!(relation.evidence[0].source_seqs, vec![41, 42]);
         assert!(relation.subject_mentions[0].starts_with("mn_"));
         assert!(relation.object_mentions[0].starts_with("mn_"));
+        assert_eq!(
+            doc.paragraphs[0].mentions[0].id, relation.subject_mentions[0],
+            "materialize 前必须把 mention id 写回内存 doc"
+        );
+        assert_eq!(
+            doc.paragraphs[0].mentions[1].id,
+            relation.object_mentions[0]
+        );
         let extraction = doc.graph_extraction.as_ref().unwrap();
         assert_eq!(
             extraction.contract_version,
@@ -1055,6 +1235,93 @@ mod tests {
         let persisted = store::load_refined(dir.path()).unwrap();
         assert_eq!(graph_bytes(&persisted), graph_bytes(&doc));
         assert_eq!(persisted.stages.relations, "done");
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::to_value(&doc).unwrap(),
+            "成功返回的内存 doc 必须与 reload 后逐字段一致"
+        );
+    }
+
+    #[test]
+    fn run_llm_polishes_the_latest_full_disk_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = doc_with(&["盘上原稿"]);
+        disk.paragraphs[0].speaker = "disk-speaker".into();
+        disk.paragraphs[0].name = Some("盘上姓名".into());
+        disk.paragraphs[0].person_id = Some("P9".into());
+        disk.discarded_seqs = vec![7, 8];
+        store::write_refined_atomic(dir.path(), &disk).unwrap();
+
+        let mut stale_caller = doc_with(&["调用方旧稿"]);
+        stale_caller.paragraphs[0].speaker = "stale-speaker".into();
+        let content = serde_json::json!({
+            "glossary": {}, "texts": ["盘上润色稿"], "entities": [], "relations": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(content)),
+            model: "model-latest".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(dir.path(), &mut stale_caller, &cfg, "model-latest", None).unwrap();
+
+        assert_eq!(stale_caller.paragraphs[0].text, "盘上润色稿");
+        assert_eq!(stale_caller.paragraphs[0].speaker, "disk-speaker");
+        assert_eq!(stale_caller.paragraphs[0].name.as_deref(), Some("盘上姓名"));
+        assert_eq!(stale_caller.paragraphs[0].person_id.as_deref(), Some("P9"));
+        assert_eq!(stale_caller.discarded_seqs, vec![7, 8]);
+    }
+
+    #[test]
+    fn concurrent_writer_during_http_causes_whole_document_cas_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = doc_with(&["HTTP 前原稿"]);
+        store::write_refined_atomic(dir.path(), &base).unwrap();
+        let content = serde_json::json!({
+            "glossary": {}, "texts": ["HTTP 候选稿"], "entities": [], "relations": []
+        });
+        let (base_url, requested, release) = barrier_server(chat_response(content));
+        let cfg = llm::LlmConfig {
+            base_url,
+            model: "model-cas".into(),
+            api_key: "k".into(),
+        };
+        let note_dir = dir.path().to_path_buf();
+        let mut caller = doc_with(&["调用方旧稿"]);
+        let worker = std::thread::spawn(move || {
+            let result = run_llm(&note_dir, &mut caller, &cfg, "model-cas", None);
+            (result, caller)
+        });
+
+        requested
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("HTTP 请求应到达屏障");
+        let mut concurrent = base;
+        concurrent.generated_at = "并发版本".into();
+        concurrent.discarded_seqs = vec![99];
+        concurrent.paragraphs[0].speaker = "concurrent-speaker".into();
+        concurrent.paragraphs[0].text = "并发写者真值".into();
+        store::write_refined_atomic(dir.path(), &concurrent).unwrap();
+        let concurrent_bytes = std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap();
+        release.send(()).unwrap();
+
+        let (result, returned) = worker.join().unwrap();
+        let error = result.expect_err("revision 改变必须拒绝整个 HTTP 候选稿");
+        assert!(
+            error.to_string().contains("已变化"),
+            "错误应明确提示 CAS 冲突: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),
+            concurrent_bytes,
+            "不能只合并图谱字段或覆盖并发写者的任意整文字段"
+        );
+        let latest = store::load_refined(dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&returned).unwrap(),
+            serde_json::to_vec(&latest).unwrap(),
+            "冲突后内存态也应回到最新整份盘上真值"
+        );
     }
 
     #[test]
@@ -1140,6 +1407,153 @@ mod tests {
     }
 
     #[test]
+    fn non_string_text_item_marks_relations_incomplete_and_preserves_prior_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = doc_with(&["原文"]);
+        (doc.graph_extraction, doc.relations) = old_graph();
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
+        let baseline = store::load_refined(dir.path()).unwrap();
+        let baseline_graph = graph_bytes(&baseline);
+        doc = baseline;
+        let bad = serde_json::json!({
+            "glossary": {}, "texts": [null], "entities": [], "relations": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(bad)),
+            model: "model-strict".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(dir.path(), &mut doc, &cfg, "model-strict", None).unwrap();
+
+        assert_eq!(doc.paragraphs[0].text, "原文");
+        assert_eq!(doc.stages.llm, "partial");
+        assert_eq!(doc.stages.relations, "failed");
+        assert_eq!(graph_bytes(&doc), baseline_graph);
+        assert_eq!(
+            graph_bytes(&store::load_refined(dir.path()).unwrap()),
+            baseline_graph
+        );
+    }
+
+    #[test]
+    fn multi_chunk_valid_relation_then_explicit_empty_keeps_the_valid_fact() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_text = format!("张三负责灯塔计划{}", "甲".repeat(llm::CHUNK_CHARS));
+        let second_text = format!("第二段{}", "乙".repeat(llm::CHUNK_CHARS));
+        let mut doc = doc_with(&[&first_text, &second_text]);
+        assert_eq!(llm::chunk_indices(&doc.paragraphs).len(), 2);
+        store::write_refined_atomic(dir.path(), &doc).unwrap();
+        let first = serde_json::json!({
+            "glossary": {},
+            "texts": [first_text],
+            "entities": [
+                {"name": "张三", "kind": "person", "aliases": []},
+                {"name": "灯塔计划", "kind": "project", "aliases": []}
+            ],
+            "relations": [{
+                "subject": "张三",
+                "predicate": {"type": "responsible_for", "label": null},
+                "object": "灯塔计划",
+                "confidence": 0.9,
+                "valid_from": null,
+                "valid_to": null,
+                "evidence": [{
+                    "paragraph_index": 0, "start": 0, "end": 8,
+                    "quote": "张三负责灯塔计划"
+                }]
+            }]
+        });
+        let second = serde_json::json!({
+            "glossary": {}, "texts": [second_text], "entities": [], "relations": []
+        });
+        let cfg = llm::LlmConfig {
+            base_url: sequence_server(vec![
+                Some(chat_response(first)),
+                Some(chat_response(second)),
+            ]),
+            model: "model-multi".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(dir.path(), &mut doc, &cfg, "model-multi", None).unwrap();
+
+        assert_eq!(doc.stages.relations, "done");
+        assert_eq!(doc.relations.len(), 1);
+        assert_eq!(doc.relations[0].evidence[0].paragraph_index, 0);
+        assert_eq!(doc.relations[0].evidence[0].quote, "张三负责灯塔计划");
+    }
+
+    #[test]
+    fn any_later_chunk_failure_preserves_the_entire_prior_graph() {
+        for failure in [
+            "network",
+            "content",
+            "missing-relations",
+            "malformed-relations",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let first_text = format!("张三负责灯塔计划{}", "甲".repeat(llm::CHUNK_CHARS));
+            let second_text = format!("第二段{}", "乙".repeat(llm::CHUNK_CHARS));
+            let mut doc = doc_with(&[&first_text, &second_text]);
+            (doc.graph_extraction, doc.relations) = old_graph();
+            store::write_refined_atomic(dir.path(), &doc).unwrap();
+            let baseline = store::load_refined(dir.path()).unwrap();
+            let baseline_graph = graph_bytes(&baseline);
+            doc = baseline;
+
+            let first = serde_json::json!({
+                "glossary": {},
+                "texts": [first_text],
+                "entities": [
+                    {"name": "张三", "kind": "person", "aliases": []},
+                    {"name": "灯塔计划", "kind": "project", "aliases": []}
+                ],
+                "relations": [{
+                    "subject": "张三",
+                    "predicate": {"type": "responsible_for", "label": null},
+                    "object": "灯塔计划",
+                    "confidence": 0.9,
+                    "valid_from": null,
+                    "valid_to": null,
+                    "evidence": [{
+                        "paragraph_index": 0, "start": 0, "end": 8,
+                        "quote": "张三负责灯塔计划"
+                    }]
+                }]
+            });
+            let second = match failure {
+                "network" => None,
+                "content" => Some(chat_response(serde_json::json!({
+                    "glossary": {}, "texts": [null], "entities": [], "relations": []
+                }))),
+                "missing-relations" => Some(chat_response(serde_json::json!({
+                    "glossary": {}, "texts": [second_text], "entities": []
+                }))),
+                "malformed-relations" => Some(chat_response(serde_json::json!({
+                    "glossary": {}, "texts": [second_text], "entities": [], "relations": {}
+                }))),
+                _ => unreachable!(),
+            };
+            let cfg = llm::LlmConfig {
+                base_url: sequence_server(vec![Some(chat_response(first)), second]),
+                model: "model-multi-failure".into(),
+                api_key: "k".into(),
+            };
+
+            run_llm(dir.path(), &mut doc, &cfg, "model-multi-failure", None).unwrap();
+
+            assert_eq!(doc.stages.relations, "failed", "failure={failure}");
+            assert_eq!(graph_bytes(&doc), baseline_graph, "failure={failure}");
+            assert_eq!(
+                graph_bytes(&store::load_refined(dir.path()).unwrap()),
+                baseline_graph,
+                "failure={failure}"
+            );
+        }
+    }
+
+    #[test]
     fn run_local_carries_prior_graph_snapshot_before_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let mut previous = doc_with(&["旧稿"]);
@@ -1156,7 +1570,8 @@ mod tests {
             None,
             &[],
             "new-time",
-        );
+        )
+        .unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "本地新稿。");
         assert_eq!(graph_bytes(&doc), baseline_graph);
@@ -1177,13 +1592,17 @@ mod tests {
             .unwrap();
 
         let segments = vec![seg(7, "mic", "不应写入。", 0, 4000, "S1")];
-        let _ = run_local(
+        let local_result = run_local(
             dir.path(),
             &segments,
             &BTreeMap::new(),
             None,
             &[],
             "new-time",
+        );
+        assert!(
+            local_result.is_err(),
+            "run_local 拿不到锁时必须显式报告未提交，调用方不得继续 HTTP"
         );
         assert_eq!(
             std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),
@@ -1266,7 +1685,8 @@ mod tests {
             Some(&mut embedder as &mut dyn crate::diar::SpeakerEmbedder),
             &[],
             "golden",
-        );
+        )
+        .unwrap();
 
         let labels: std::collections::BTreeSet<&str> =
             doc.paragraphs.iter().map(|p| p.speaker.as_str()).collect();

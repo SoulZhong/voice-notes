@@ -36,6 +36,8 @@ memmap2 = "0.9"
 hound = "3.5"
 sherpa-rs = "0.6"
 chrono = "0.4"
+# 实体规范名/别名/关系端点统一使用 Unicode full default case folding（如 ß == SS）。
+unicode-casefold = "0.2"
 ureq = "2"
 sha2 = "0.10"
 hex = "0.4"

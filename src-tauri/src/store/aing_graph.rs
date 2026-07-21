@@ -325,6 +325,45 @@ pub fn validate_graph(
                 "confidence must be between 0.0 and 1.0",
             );
         }
+        let valid_from = relation.valid_from.as_deref().and_then(|value| {
+            match chrono::DateTime::parse_from_rfc3339(value) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    issue(
+                        &mut issues,
+                        relation_index,
+                        field(relation_index, "valid_from"),
+                        "valid_from must be a non-empty RFC3339 timestamp or null",
+                    );
+                    None
+                }
+            }
+        });
+        let valid_to =
+            relation.valid_to.as_deref().and_then(
+                |value| match chrono::DateTime::parse_from_rfc3339(value) {
+                    Ok(parsed) => Some(parsed),
+                    Err(_) => {
+                        issue(
+                            &mut issues,
+                            relation_index,
+                            field(relation_index, "valid_to"),
+                            "valid_to must be a non-empty RFC3339 timestamp or null",
+                        );
+                        None
+                    }
+                },
+            );
+        if let (Some(from), Some(to)) = (valid_from, valid_to) {
+            if from >= to {
+                issue(
+                    &mut issues,
+                    relation_index,
+                    field(relation_index, "valid_to"),
+                    "valid_to must be later than valid_from",
+                );
+            }
+        }
         if !entity_ids.contains(relation.subject.as_str()) {
             issue(
                 &mut issues,
@@ -811,6 +850,47 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(fields(&issues), vec!["relations[0].confidence"]);
+    }
+
+    #[test]
+    fn validator_rejects_empty_and_invalid_rfc3339_validity_bounds() {
+        let mut relation = valid_fact(0.8, "uses");
+        relation.valid_from = Some(String::new());
+        relation.valid_to = Some("2026-99-99".into());
+
+        let issues = validate_graph("note-1", &validator_doc(), vec![relation]).unwrap_err();
+
+        assert_eq!(
+            fields(&issues),
+            vec!["relations[0].valid_from", "relations[0].valid_to"]
+        );
+    }
+
+    #[test]
+    fn validator_requires_a_strictly_positive_validity_interval() {
+        for (from, to) in [
+            ("2026-07-21T10:00:01+08:00", "2026-07-21T10:00:00+08:00"),
+            ("2026-07-21T10:00:00+08:00", "2026-07-21T02:00:00Z"),
+        ] {
+            let mut relation = valid_fact(0.8, "uses");
+            relation.valid_from = Some(from.into());
+            relation.valid_to = Some(to.into());
+
+            let issues = validate_graph("note-1", &validator_doc(), vec![relation]).unwrap_err();
+
+            assert_eq!(fields(&issues), vec!["relations[0].valid_to"]);
+        }
+    }
+
+    #[test]
+    fn validator_compares_validity_bounds_as_instants_across_offsets() {
+        let mut relation = valid_fact(0.8, "uses");
+        relation.valid_from = Some("2026-07-21T10:00:00+08:00".into());
+        relation.valid_to = Some("2026-07-21T02:00:01Z".into());
+
+        let graph = validate_graph("note-1", &validator_doc(), vec![relation]).unwrap();
+
+        assert_eq!(graph.relations.len(), 1);
     }
 
     #[test]
