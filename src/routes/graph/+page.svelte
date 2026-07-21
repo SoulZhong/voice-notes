@@ -39,6 +39,7 @@
   import EntityGovernance from "$lib/EntityGovernance.svelte";
   import PendingReviewPanel from "$lib/PendingReviewPanel.svelte";
   import RelationDrawer from "$lib/RelationDrawer.svelte";
+  import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
 
   const emptySemantic = (): SemanticGraphData => ({
     nodes: [],
@@ -78,6 +79,7 @@
   let pathStatus = $state<"idle" | "choosing" | "loading" | "ready" | "empty" | "error">("idle");
   let pathError = $state("");
   let includeWeakPath = $state(false);
+  let backfillOpen = $state(false);
   let lastSidebarKind = graphFilter.kind;
   let lastRequestedPathStart: string | null = null;
 
@@ -331,6 +333,16 @@
     window.dispatchEvent(new CustomEvent(KNOWLEDGE_CHANGED_EVENT));
   }
 
+  async function refreshAfterBackfill() {
+    await Promise.all([
+      loadSemantic(effectiveGraphFilter),
+      probeGlobalSemanticPresence(),
+      loadGraph(),
+      loadPending(),
+    ]);
+    if (selected) await loadDetail(selected);
+  }
+
   function updateQuery(change: (params: URLSearchParams) => void) {
     const url = new URL($page.url);
     change(url.searchParams);
@@ -550,12 +562,13 @@
               {#if semanticRequestFailed}
                 <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>重新读取</button>
               {/if}
+              <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
             </div>
           {/if}
           {#if semanticFallback}
             <div class="map-message fallback">
               <span>尚未补建语义关系，当前保留共现弱连接供继续探索。</span>
-              <button type="button" onclick={() => goto("/ai?backfill=relations")}>补建语义关系</button>
+              <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
             </div>
           {/if}
           {#if filteredSemanticEmpty}
@@ -680,6 +693,12 @@
     </div>
   {/if}
 </div>
+
+<RelationBackfillDialog
+  open={backfillOpen}
+  onClose={() => (backfillOpen = false)}
+  onCompleted={refreshAfterBackfill}
+/>
 
 {#if ctxMenu}
   <!-- Pointer convenience layer. The same rename/governance entry stays visible in EntityGovernance. -->

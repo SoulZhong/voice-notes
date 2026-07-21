@@ -1,0 +1,234 @@
+use super::canonical::{
+    CanonicalEntity, CanonicalEvidence, CanonicalGraph, CanonicalMention, CanonicalRelation,
+    RelationOrigin, RelationStatus,
+};
+use super::index;
+#[cfg(test)]
+use super::{path, query};
+#[cfg(test)]
+use crate::graph::query::GraphFilter;
+use crate::store::RelationPredicate;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+const ENTITY_COUNT: usize = 1_000;
+const RELATION_COUNT: usize = 5_000;
+const COOCCURRENCE_COUNT: usize = 1_500;
+
+fn entity_id(index: usize) -> String {
+    format!("kg_{index:04}")
+}
+
+fn deterministic_large_graph() -> CanonicalGraph {
+    let entities = (0..ENTITY_COUNT)
+        .map(|index| {
+            let id = entity_id(index);
+            (
+                id.clone(),
+                CanonicalEntity {
+                    id,
+                    kind: match index % 5 {
+                        0 => "person",
+                        1 => "project",
+                        2 => "org",
+                        3 => "term",
+                        _ => "task",
+                    }
+                    .into(),
+                    name: format!("Fixture Entity {index:04}"),
+                    aliases: vec![format!("Fixture Alias {index:04}")],
+                    confirmed: index % 3 == 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    // Each unique two-entity note contributes exactly one undirected
+    // co-occurrence edge. 1,000 cycle neighbours + 500 second neighbours are
+    // disjoint, yielding exactly 1,500 distinct edges.
+    let pairs = (0..ENTITY_COUNT)
+        .map(|left| (left, (left + 1) % ENTITY_COUNT))
+        .chain((0..500).map(|left| (left, left + 2)))
+        .collect::<Vec<_>>();
+    assert_eq!(pairs.len(), COOCCURRENCE_COUNT);
+    let mentions = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(note_index, (left, right))| {
+            let note_id = format!("fixture-co-{note_index:04}");
+            [
+                CanonicalMention {
+                    id: format!("mn_co_{note_index:04}_a"),
+                    note_id: note_id.clone(),
+                    entity_id: entity_id(*left),
+                    paragraph_index: 0,
+                    start: 0,
+                    end: 8,
+                    quote: format!("Entity {left:04}"),
+                },
+                CanonicalMention {
+                    id: format!("mn_co_{note_index:04}_b"),
+                    note_id,
+                    entity_id: entity_id(*right),
+                    paragraph_index: 0,
+                    start: 12,
+                    end: 20,
+                    quote: format!("Entity {right:04}"),
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let predicates = [
+        "participates_in",
+        "responsible_for",
+        "belongs_to",
+        "uses",
+        "depends_on",
+        "produces",
+        "assigned_to",
+        "occurs_at",
+    ];
+    let relations = (0..RELATION_COUNT)
+        .map(|index| {
+            let subject = index % ENTITY_COUNT;
+            let object = (index * 37 + 17) % ENTITY_COUNT;
+            let note_id = format!("fixture-semantic-{index:04}");
+            let subject_mention = format!("mn_semantic_{index:04}_subject");
+            let object_mention = format!("mn_semantic_{index:04}_object");
+            let quote =
+                format!("Fixture Entity {subject:04} relates to Fixture Entity {object:04}");
+            CanonicalRelation {
+                id: format!("cr_fixture_{index:04}"),
+                subject_id: entity_id(subject),
+                predicate: RelationPredicate {
+                    kind: predicates[index % predicates.len()].into(),
+                    label: None,
+                },
+                object_id: entity_id(object),
+                confidence: 0.8 + ((index % 20) as f64 / 100.0),
+                valid_from: None,
+                valid_to: None,
+                status: RelationStatus::Current,
+                origin: RelationOrigin::Model,
+                provider: Some("fixture".into()),
+                model: Some("semantic-graph-large-v1".into()),
+                note_ids: vec![note_id.clone()],
+                evidence: vec![CanonicalEvidence {
+                    id: format!("ev_fixture_{index:04}"),
+                    note_id,
+                    paragraph_index: 0,
+                    start: 0,
+                    end: quote.chars().count(),
+                    quote,
+                    source_seqs: vec![index as u64 + 1],
+                    source_hash: format!("fixture-source-{index:04}"),
+                    subject_mentions: vec![subject_mention],
+                    object_mentions: vec![object_mention],
+                }],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    CanonicalGraph {
+        entities,
+        mentions,
+        relations,
+        pending: Vec::new(),
+    }
+}
+
+/// Debug/test importer for manual desktop inspection. It refuses every target
+/// except a brand-new, explicitly named child of the operating-system temp
+/// directory, so it cannot seed or overwrite the user's configured library.
+#[allow(dead_code)]
+pub(crate) fn import_semantic_graph_large_fixture(
+    data_root: &Path,
+) -> anyhow::Result<index::BuildStats> {
+    let temp = std::env::temp_dir().canonicalize()?;
+    let parent = data_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("fixture root has no parent"))?
+        .canonicalize()?;
+    anyhow::ensure!(
+        parent.starts_with(&temp),
+        "fixture root must be inside the OS temp directory"
+    );
+    let name = data_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("fixture root name is not valid UTF-8"))?;
+    anyhow::ensure!(
+        name.starts_with("aing-semantic-fixture-"),
+        "fixture root must use the aing-semantic-fixture- prefix"
+    );
+    anyhow::ensure!(!data_root.exists(), "fixture root must not already exist");
+    std::fs::create_dir(data_root)?;
+    index::rebuild_atomic(data_root, &deterministic_large_graph())
+}
+
+#[cfg(test)]
+fn all_filter() -> GraphFilter {
+    GraphFilter {
+        entity_kinds: Vec::new(),
+        predicate_types: Vec::new(),
+        from: None,
+        to: None,
+        include_history: true,
+        include_cooccurrence: true,
+    }
+}
+
+#[test]
+fn semantic_graph_large_import_requires_a_new_explicit_temp_root() {
+    let parent = tempfile::tempdir().unwrap();
+    assert!(import_semantic_graph_large_fixture(parent.path()).is_err());
+    let wrong_name = parent.path().join("not-a-fixture");
+    assert!(import_semantic_graph_large_fixture(&wrong_name).is_err());
+    let allowed = parent.path().join("aing-semantic-fixture-safe");
+    let stats = import_semantic_graph_large_fixture(&allowed).unwrap();
+    assert_eq!(
+        (stats.entities, stats.relations, stats.evidence),
+        (1_000, 5_000, 5_000)
+    );
+    assert!(import_semantic_graph_large_fixture(&allowed).is_err());
+}
+
+#[test]
+#[ignore = "release-only semantic graph performance budget"]
+fn semantic_graph_large_rebuild_query_and_path_stay_within_release_budgets() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("aing-semantic-fixture-release");
+
+    let rebuild_started = std::time::Instant::now();
+    let stats = import_semantic_graph_large_fixture(&root).unwrap();
+    let rebuild_elapsed = rebuild_started.elapsed();
+    assert_eq!(stats.entities, ENTITY_COUNT);
+    assert_eq!(stats.relations, RELATION_COUNT);
+    assert_eq!(stats.evidence, RELATION_COUNT);
+
+    let query_started = std::time::Instant::now();
+    let graph = query::semantic_graph(&root, &all_filter()).unwrap();
+    let query_elapsed = query_started.elapsed();
+    assert_eq!(graph.nodes.len(), ENTITY_COUNT);
+    assert_eq!(graph.semantic_edges.len(), RELATION_COUNT);
+    assert_eq!(graph.cooccurrence_edges.len(), COOCCURRENCE_COUNT);
+
+    let path_started = std::time::Instant::now();
+    let found = path::shortest_path(&root, "kg_0000", "kg_0017", &all_filter())
+        .unwrap()
+        .unwrap();
+    let path_elapsed = path_started.elapsed();
+    assert_eq!(
+        found.entity_ids.first().map(String::as_str),
+        Some("kg_0000")
+    );
+    assert_eq!(found.entity_ids.last().map(String::as_str), Some("kg_0017"));
+
+    eprintln!(
+        "semantic_graph_large timings: rebuild={rebuild_elapsed:?} query={query_elapsed:?} path={path_elapsed:?}"
+    );
+    assert!(rebuild_elapsed < std::time::Duration::from_secs(5));
+    assert!(query_elapsed < std::time::Duration::from_millis(500));
+    assert!(path_elapsed < std::time::Duration::from_millis(500));
+}
