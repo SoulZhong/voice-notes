@@ -11,6 +11,7 @@ pub struct ResolverSnapshot {
     pub redirects: BTreeMap<String, String>,
     pub mention_bindings: BTreeMap<String, String>,
     pub relation_decisions: RelationDecisions,
+    pub active_merges: Vec<(String, String)>,
     legacy_ids: BTreeMap<String, String>,
 }
 
@@ -106,6 +107,19 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         redirects: BTreeMap::new(),
         mention_bindings: BTreeMap::new(),
         relation_decisions: RelationDecisions::default(),
+        active_merges: ledger
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| active[*index])
+            .filter_map(|(_, operation)| match &operation.action {
+                KnowledgeAction::MergeEntity {
+                    source_id,
+                    target_id,
+                } => Some((source_id.clone(), target_id.clone())),
+                _ => None,
+            })
+            .collect(),
         legacy_ids: ledger.legacy_ids.clone(),
     };
     let restored: BTreeSet<String> = ledger
@@ -468,6 +482,68 @@ pub fn resolve_reference_id(
     }
 }
 
+pub fn entity_lineage_roots(
+    snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
+    note_id: &str,
+    local: &Entity,
+    mention_ids: &[String],
+) -> BTreeSet<String> {
+    let bound: BTreeSet<_> = mention_ids
+        .iter()
+        .filter_map(|mention_id| snapshot.mention_bindings.get(mention_id).cloned())
+        .collect();
+    if !bound.is_empty() {
+        return bound;
+    }
+    if snapshot.redirects.contains_key(&local.id)
+        || people.people.contains_key(&local.id)
+        || people.redirects.contains_key(&local.id)
+    {
+        return BTreeSet::from([local.id.clone()]);
+    }
+    if local.kind == "person" {
+        if let Some(person_id) = VoiceprintStore::resolve(people, &local.id) {
+            return BTreeSet::from([person_id.to_string()]);
+        }
+    }
+    let exact = confirmed_registry_matches(&snapshot.registry, local);
+    if !exact.is_empty() {
+        return exact.into_iter().collect();
+    }
+    if let Some(entity_id) = snapshot
+        .registry_id_for_legacy(&format!("{note_id}/{}", local.id))
+        .or_else(|| snapshot.registry_id_for_legacy(&local.id))
+    {
+        return BTreeSet::from([entity_id]);
+    }
+    BTreeSet::from([allocate_entity_id(
+        &local.kind,
+        &local.name,
+        note_id,
+        &local.id,
+    )])
+}
+
+pub fn relation_root_lineage(
+    snapshot: &ResolverSnapshot,
+    people: &Voiceprints,
+    root: &str,
+) -> BTreeSet<String> {
+    let mut redirects = BTreeMap::new();
+    let mut lineage = BTreeSet::new();
+    if let Ok(entity_id) = follow_redirects(&redirects, people, root) {
+        lineage.insert(entity_id);
+    }
+    for (source_id, target_id) in &snapshot.active_merges {
+        redirects.insert(source_id.clone(), target_id.clone());
+        if let Ok(entity_id) = follow_redirects(&redirects, people, root) {
+            lineage.insert(entity_id);
+        }
+    }
+    lineage
+}
+
 pub(crate) fn confirmed_registry_matches(
     registry: &BTreeMap<String, RegistryEntity>,
     local: &Entity,
@@ -534,6 +610,14 @@ fn follow_all_redirects(
     people: &Voiceprints,
     entity_id: &str,
 ) -> Result<String, RedirectFailure> {
+    follow_redirects(&snapshot.redirects, people, entity_id)
+}
+
+fn follow_redirects(
+    redirects: &BTreeMap<String, String>,
+    people: &Voiceprints,
+    entity_id: &str,
+) -> Result<String, RedirectFailure> {
     let mut current = entity_id.to_string();
     let mut visited = BTreeSet::new();
     loop {
@@ -545,7 +629,7 @@ fn follow_all_redirects(
                 reason: "redirect cycle detected".into(),
             });
         }
-        let registry_next = snapshot.redirects.get(&current);
+        let registry_next = redirects.get(&current);
         let voiceprint_next = people.redirects.get(&current);
         let next = match (registry_next, voiceprint_next) {
             (Some(registry), Some(voiceprint)) if registry != voiceprint => {
