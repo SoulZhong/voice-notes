@@ -2,7 +2,7 @@
   import { entityMentions, relationDetail, type SemanticEntityDetail } from "./knowledge";
   import { kindInk, kindLabel, kindSoft } from "./graph";
   import { relationLabel } from "./knowledgeView";
-  import { formatDate, listNotes } from "./notes";
+  import { formatDate, formatDuration, listNotes } from "./notes";
   import {
     buildAddAlias,
     buildBindPerson,
@@ -42,6 +42,7 @@
   let mentions = $state<GovernanceMention[]>([]);
   let noteTitles = $state<Map<string, string>>(new Map());
   let noteStartedAt = $state<Map<string, string>>(new Map());
+  let noteDurations = $state<Map<string, number | null>>(new Map());
   let mentionsLoading = $state(false);
   let splitOpen = $state(false);
   let working = $state(false);
@@ -91,12 +92,14 @@
       }));
       noteTitles = new Map(notes.map((note) => [note.id, note.title]));
       noteStartedAt = new Map(notes.map((note) => [note.id, note.started_at]));
+      noteDurations = new Map(notes.map((note) => [note.id, note.duration_secs]));
       mentionsLoading = false;
     }).catch(() => {
       if (generation !== evidenceGeneration) return;
       mentions = [];
       noteTitles = new Map();
       noteStartedAt = new Map();
+      noteDurations = new Map();
       mentionsLoading = false;
     });
   });
@@ -114,11 +117,13 @@
     return [...groups.entries()].map(([noteId, items]) => {
       const startedAt = noteStartedAt.get(noteId) ?? "";
       const formattedTime = formatDate(startedAt);
+      const formattedDuration = formatDuration(noteDurations.get(noteId) ?? null);
       return {
         noteId,
         title: noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`,
         startedAt,
         time: formattedTime === "—" ? "" : formattedTime,
+        duration: formattedDuration === "—" ? "" : formattedDuration,
         items,
       };
     });
@@ -359,7 +364,13 @@
             <li>
               <a class="note-link" href={'/notes/' + encodeURIComponent(group.noteId)}>
                 <span>{group.title}</span>
-                {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+                {#if group.time || group.duration}
+                  <small class="note-meta">
+                    {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+                    {#if group.time && group.duration}<span aria-hidden="true">·</span>{/if}
+                    {#if group.duration}<span>{group.duration}</span>{/if}
+                  </small>
+                {/if}
               </a>
             </li>
           {/each}
@@ -370,7 +381,13 @@
           <div class="note-group">
             <a class="note-link" href={'/notes/' + encodeURIComponent(group.noteId)}>
               <span>{group.title}</span>
-              {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+              {#if group.time || group.duration}
+                <small class="note-meta">
+                  {#if group.time}<time datetime={group.startedAt}>{group.time}</time>{/if}
+                  {#if group.time && group.duration}<span aria-hidden="true">·</span>{/if}
+                  {#if group.duration}<span>{group.duration}</span>{/if}
+                </small>
+              {/if}
             </a>
             {#each group.items as mention (mention.id)}
               <blockquote>
@@ -442,7 +459,8 @@
   .note-group { padding: 12px 0; border-top: 1px solid var(--hairline); }
   .note-link { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
   .note-link span { font-size: 0.82rem; }
-  .note-link time { color: var(--ink-faint); font-size: 0.7rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .note-meta { display: flex; gap: 5px; color: var(--ink-faint); font-size: 0.7rem; font-variant-numeric: tabular-nums; font-weight: 400; white-space: nowrap; }
+  .note-meta span { font-size: inherit; }
   .note-group > .note-link { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   .source-notes { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
   .source-notes li { border-top: 1px solid var(--hairline); }
