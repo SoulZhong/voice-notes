@@ -319,6 +319,186 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
     Ok(cmd)
 }
 
+fn relation_prompt(note_id: &str, model: &str) -> String {
+    format!(
+        "你是会议语义关系补建助手。只处理 voice-notes 笔记 {note_id} 的关系，禁止修改正文或使用任何文件/shell 工具。\n\
+         1. 只调用一次 get_aing_context({{\"note_id\":\"{note_id}\"}})，读取最终 paragraphs、source_seqs、entities、core_predicates、contract_version 与 source_hash。\n\
+         2. entities 必须逐项、原顺序、原 name/kind/aliases 完整照抄 context，不得新增、删除、重排或归一。\n\
+         3. 仅抽取有逐字证据的 relations；subject/object 引用上述 entities 的临时 id；predicate 只用 core_predicates 或带非空 label 的 custom；evidence 的 paragraph_index 与 Unicode scalar start/end 必须精确指向最终段落，quote 必须逐字符匹配，source_seqs/source_hash 必须照 context 当前值提交。\n\
+         4. 只调用一次 apply_aing_graph，提交 note_id、原样 entities、relations、context 的 contract_version，以及 model=\"{model}\"。没有可靠关系时 relations 传 []。\n\
+         全程只允许调用 get_aing_context 与 apply_aing_graph 两个 MCP 工具。完成后回复一行「完成」。"
+    )
+}
+
+fn relation_command(
+    kind: AgentKind,
+    bin: &Path,
+    model: &str,
+    prompt: &str,
+    exe: &Path,
+    scratch: &Path,
+    isolated_app_data: &Path,
+) -> anyhow::Result<Command> {
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(scratch)
+        .env("VN_MCP_AGENT_MODE", "1")
+        .env("VN_APP_DATA", isolated_app_data);
+    match kind {
+        AgentKind::Claude => {
+            let mut mcp = mcp_servers_json(exe);
+            mcp["mcpServers"]["voice-notes"]["env"]["VN_APP_DATA"] =
+                serde_json::Value::String(isolated_app_data.to_string_lossy().into_owned());
+            cmd.args([
+                "-p",
+                prompt,
+                "--output-format",
+                "json",
+                "--strict-mcp-config",
+            ])
+            .arg("--mcp-config")
+            .arg(mcp.to_string())
+            .args([
+                "--allowedTools",
+                "mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
+                "--tools",
+                "",
+                "--max-turns",
+                "30",
+                "--model",
+                model,
+            ]);
+        }
+        AgentKind::Codex => {
+            anyhow::bail!(
+                "Codex Agent 当前只能看到 Task 8 的四工具 MCP surface，无法结构性限制为两个关系工具，本次补建已安全拒绝"
+            );
+        }
+        AgentKind::Gemini => {
+            let dir = scratch.join(".gemini");
+            std::fs::create_dir_all(&dir)?;
+            let mut settings = mcp_servers_json(exe);
+            settings["coreTools"] = serde_json::json!([]);
+            settings["mcpServers"]["voice-notes"]["includeTools"] =
+                serde_json::json!(["get_aing_context", "apply_aing_graph"]);
+            settings["mcpServers"]["voice-notes"]["env"]["VN_APP_DATA"] =
+                serde_json::Value::String(isolated_app_data.to_string_lossy().into_owned());
+            std::fs::write(
+                dir.join("settings.json"),
+                serde_json::to_vec_pretty(&settings)?,
+            )?;
+            cmd.args([
+                prompt,
+                "-o",
+                "json",
+                "--approval-mode",
+                "yolo",
+                "--allowed-mcp-server-names",
+                "voice-notes",
+                "-m",
+                model,
+            ]);
+        }
+        AgentKind::Cursor => anyhow::bail!(
+            "Cursor Agent 无法把工具结构性限制为两个关系 MCP 工具，本次补建已安全拒绝"
+        ),
+    }
+    Ok(cmd)
+}
+
+pub struct AgentRelationExecutor {
+    kind: AgentKind,
+    bin: PathBuf,
+    model: String,
+}
+
+impl AgentRelationExecutor {
+    pub fn new(kind: AgentKind, bin_override: &str, model: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(!model.trim().is_empty(), "Agent relation model 未配置");
+        anyhow::ensure!(
+            matches!(kind, AgentKind::Claude | AgentKind::Gemini),
+            "{} Agent 无法结构性限制为两个关系 MCP 工具，本次补建已安全拒绝",
+            kind.key()
+        );
+        let bin = resolve_bin(kind, bin_override).ok_or_else(|| {
+            anyhow::anyhow!(
+                "未找到 {} 命令行工具:请先安装并登录,或指定 CLI 路径",
+                kind.bin_name()
+            )
+        })?;
+        Ok(Self {
+            kind,
+            bin,
+            model: model.trim().into(),
+        })
+    }
+}
+
+impl super::backfill::RelationExecutor for AgentRelationExecutor {
+    fn provider(&self) -> &str {
+        "agent"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn extract(
+        &self,
+        note_id: &str,
+        doc: &RefinedDoc,
+    ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
+        anyhow::ensure!(doc.stages.llm == "done", "关系补建要求已完成的最终正文");
+        let scratch = make_scratch(&format!("relation-{note_id}"))?;
+        let isolated_app_data = scratch.join("app-data");
+        let isolated_note = isolated_app_data.join("notes").join(note_id);
+        let result = (|| -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
+            std::fs::create_dir_all(&isolated_note)?;
+            crate::store::write_refined_atomic(&isolated_note, doc)?;
+            let prompt = relation_prompt(note_id, &self.model);
+            let exe = self_exe()?;
+            let cmd = relation_command(
+                self.kind,
+                &self.bin,
+                &self.model,
+                &prompt,
+                &exe,
+                &scratch,
+                &isolated_app_data,
+            )?;
+            let process = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S);
+            let after = crate::store::load_refined(&isolated_note).ok_or_else(|| {
+                process
+                    .as_ref()
+                    .err()
+                    .map(|error| anyhow::anyhow!("Agent 关系补建失败:{error}"))
+                    .unwrap_or_else(|| anyhow::anyhow!("Agent 跑完后隔离 aing.json 不可读"))
+            })?;
+            let extraction = after
+                .graph_extraction
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Agent 未提交图谱完成态"))?;
+            anyhow::ensure!(
+                after.stages.relations == "done"
+                    && extraction.contract_version
+                        == crate::store::aing_graph::GRAPH_CONTRACT_VERSION
+                    && extraction.source_hash == crate::store::source_hash(&doc.paragraphs)
+                    && extraction.model == self.model,
+                "Agent 提交的图谱 provenance 与预览不一致"
+            );
+            crate::store::aing_graph::validate_graph(note_id, doc, after.relations).map_err(
+                |issues| {
+                    anyhow::anyhow!(
+                        "Agent 图谱校验失败:{}",
+                        serde_json::to_string(&issues).unwrap_or_else(|_| "invalid graph".into())
+                    )
+                },
+            )
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        result
+    }
+}
+
 /// 标题一发一收(无 MCP、无工具)。输出解析统一为「stdout 最后一个非空行」——各家
 /// 文本模式的最终答复都在末尾,前面混进的日志/横幅靠调用方的长度守卫兜底拒绝。
 fn title_command(
@@ -845,6 +1025,87 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
             "缺内联 mcp-config"
         );
         assert!(args.contains(&"haiku".to_string()));
+    }
+
+    #[test]
+    fn relation_command_claude_exposes_only_graph_tools_and_isolates_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data = tmp.path().join("isolated-app-data");
+        let cmd = relation_command(
+            AgentKind::Claude,
+            Path::new("/bin/echo"),
+            "haiku",
+            "P",
+            Path::new("/app/voice-notes"),
+            tmp.path(),
+            &app_data,
+        )
+        .unwrap();
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let allowed = args
+            .windows(2)
+            .find(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .unwrap();
+        assert_eq!(
+            allowed,
+            "mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
+        );
+        assert!(!allowed.contains("apply_refined_texts"));
+        let isolated = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "VN_APP_DATA")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(isolated.as_deref(), app_data.to_str());
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("VN_APP_DATA") && arg.contains("isolated-app-data")),
+            "MCP server config itself must carry the isolated data root"
+        );
+    }
+
+    #[test]
+    fn relation_executor_fails_closed_for_agents_without_a_two_tool_router() {
+        for kind in [AgentKind::Codex, AgentKind::Cursor] {
+            let error = AgentRelationExecutor::new(kind, "/bin/echo", "model")
+                .err()
+                .expect("unsafe relation surface must be rejected")
+                .to_string();
+            assert!(error.contains("两个关系 MCP 工具"), "{error}");
+        }
+    }
+
+    #[test]
+    fn relation_command_gemini_exposes_exactly_two_graph_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data = tmp.path().join("isolated-app-data");
+        relation_command(
+            AgentKind::Gemini,
+            Path::new("/bin/echo"),
+            "gemini-model",
+            "P",
+            Path::new("/app/voice-notes"),
+            tmp.path(),
+            &app_data,
+        )
+        .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tmp.path().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["coreTools"], serde_json::json!([]));
+        assert_eq!(
+            settings["mcpServers"]["voice-notes"]["includeTools"],
+            serde_json::json!(["get_aing_context", "apply_aing_graph"])
+        );
+        assert_eq!(
+            settings["mcpServers"]["voice-notes"]["env"]["VN_APP_DATA"],
+            app_data.to_string_lossy().as_ref()
+        );
     }
 
     #[test]

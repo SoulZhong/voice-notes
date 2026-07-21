@@ -115,6 +115,9 @@ struct AppState {
     transcode: Arc<store::transcode::TranscodeQueue>,
     /// 语义图全量重建调度器:dirty 合并请求,running 保证至多一个 builder。
     graph_scheduler: graph::index::RebuildScheduler,
+    /// 用户显式关系补建的进程级单实例闸与协作取消位；与普通 Aing 生命周期分离。
+    relation_backfill_running: Arc<AtomicBool>,
+    relation_backfill_cancel: Arc<AtomicBool>,
     // refining 集合已删(P3):Aing 态入 lifecycle 内核(machine::RefineState),
     // 防重入/续录拦截由内核裁决,Aing 中查询走 LifecycleHandle::is_refining。
 }
@@ -133,6 +136,8 @@ impl Default for AppState {
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
             graph_scheduler: graph::index::RebuildScheduler::default(),
+            relation_backfill_running: Arc::new(AtomicBool::new(false)),
+            relation_backfill_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1651,6 +1656,145 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
         }
         doc
     }))
+}
+
+fn relation_backfill_settings(app: &AppHandle) -> Result<settings::Settings, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("app_data_dir 不可用: {error}"))?;
+    Ok(settings::load(&app_data))
+}
+
+fn ensure_requested_backfill_provider(
+    request: &ipc::BackfillRequest,
+    settings: &settings::Settings,
+) -> Result<(), String> {
+    if request.provider != settings.refine_provider {
+        return Err(format!(
+            "补建 provider 与当前配置不一致:请求 {},当前 {}",
+            request.provider, settings.refine_provider
+        ));
+    }
+    Ok(())
+}
+
+fn relation_executor(
+    settings: &settings::Settings,
+) -> anyhow::Result<Box<dyn refine::backfill::RelationExecutor>> {
+    match settings.refine_provider.as_str() {
+        "openai" => Ok(Box::new(refine::llm::HttpRelationExecutor::new(
+            refine::llm::LlmConfig {
+                base_url: settings.refine_base_url.clone(),
+                model: settings.refine_model.clone(),
+                api_key: settings.refine_api_key.clone(),
+            },
+        )?)),
+        "agent" => {
+            let kind = refine::agent::AgentKind::from_key(&settings.refine_agent)
+                .ok_or_else(|| anyhow::anyhow!("未知 Agent: {}", settings.refine_agent))?;
+            Ok(Box::new(refine::agent::AgentRelationExecutor::new(
+                kind,
+                &settings.refine_agent_bin,
+                &settings.refine_agent_model,
+            )?))
+        }
+        provider => anyhow::bail!("未知关系补建 provider: {provider}"),
+    }
+}
+
+#[tauri::command]
+fn preview_relation_backfill(
+    app: AppHandle,
+    note_ids: Option<Vec<String>>,
+) -> Result<ipc::BackfillPreview, String> {
+    let settings = relation_backfill_settings(&app)?;
+    let root = data_root(&app).map_err(|error| error.to_string())?;
+    refine::backfill::preview(&root, &settings, note_ids.as_deref())
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+fn start_relation_backfill(
+    app: AppHandle,
+    state: State<AppState>,
+    request: ipc::BackfillRequest,
+) -> Result<(), String> {
+    let gate = refine::backfill::BackfillGate::acquire(Arc::clone(
+        &state.relation_backfill_running,
+    ))
+    .map_err(|error| error.to_string())?;
+    let settings = relation_backfill_settings(&app)?;
+    ensure_requested_backfill_provider(&request, &settings)?;
+    let root = data_root(&app).map_err(|error| error.to_string())?;
+    let preview = refine::backfill::preview(&root, &settings, request.note_ids.as_deref())
+        .map_err(|error| format!("{error:#}"))?;
+    let executor = relation_executor(&settings).map_err(|error| format!("{error:#}"))?;
+    if executor.provider() != preview.provider || executor.model() != preview.model {
+        return Err("preview 与执行 provider/model 不一致".into());
+    }
+
+    state.relation_backfill_cancel.store(false, Ordering::SeqCst);
+    let cancel = Arc::clone(&state.relation_backfill_cancel);
+    let scheduler = state.graph_scheduler.clone();
+    let note_ids = preview.note_ids.clone();
+    let events = app.clone();
+    let initial = ipc::BackfillProgress {
+        state: "running".into(),
+        completed: 0,
+        total: note_ids.len(),
+        current_note_id: None,
+        failed: vec![],
+    };
+    let last_progress = Arc::new(Mutex::new(initial.clone()));
+    let _ = app.emit("relation_backfill_progress", initial);
+    std::thread::Builder::new()
+        .name("relation-backfill".into())
+        .spawn(move || {
+            let _gate = gate;
+            let panic_events = events.clone();
+            let progress_state = Arc::clone(&last_progress);
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rebuild_events = events.clone();
+                let rebuild_root = root.clone();
+                refine::backfill::run_batch(
+                    &root.join("notes"),
+                    &note_ids,
+                    executor.as_ref(),
+                    &cancel,
+                    |progress| {
+                        *progress_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = progress.clone();
+                        let _ = events.emit("relation_backfill_progress", progress);
+                    },
+                    || {
+                        let graph_events = rebuild_events.clone();
+                        scheduler.request(rebuild_root.clone(), move |status| {
+                            let _ = graph_events.emit("graph_index_status", status);
+                        })
+                    },
+                )
+            }));
+            if run.is_err() {
+                let terminal = refine::backfill::panic_progress(
+                    last_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                    cancel.load(Ordering::SeqCst),
+                );
+                let _ = panic_events.emit("relation_backfill_progress", terminal);
+            }
+        })
+        .map_err(|error| format!("无法启动关系补建线程:{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_relation_backfill(state: State<AppState>) -> Result<(), String> {
+    state.relation_backfill_cancel.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
@@ -3668,6 +3812,9 @@ pub fn run() {
             get_note,
             refine_note,
             get_refined,
+            preview_relation_backfill,
+            start_relation_backfill,
+            cancel_relation_backfill,
             rename_refined_speaker,
             assign_refined_person,
             assign_note_speaker_person,
@@ -3911,6 +4058,52 @@ mod tests {
                 "missing registered command {command}"
             );
         }
+    }
+
+    #[test]
+    fn relation_backfill_commands_are_registered_and_never_auto_started() {
+        let source = include_str!("lib.rs");
+        let handlers = source
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .expect("generate_handler block")
+            .1
+            .split_once("])")
+            .expect("generate_handler terminator")
+            .0;
+        for command in [
+            "preview_relation_backfill,",
+            "start_relation_backfill,",
+            "cancel_relation_backfill,",
+        ] {
+            assert!(
+                handlers.contains(command),
+                "missing registered command {command}"
+            );
+        }
+        assert_eq!(
+            source.matches("\nfn start_relation_backfill(").count(),
+            1,
+            "backfill must only have its user-triggered command entrypoint"
+        );
+        let preview_signature = source
+            .split_once("\nfn preview_relation_backfill(")
+            .unwrap()
+            .1
+            .split_once(") ->")
+            .unwrap()
+            .0;
+        assert!(preview_signature.contains("note_ids: Option<Vec<String>>"));
+        assert!(!preview_signature.contains("BackfillRequest"));
+        let start_signature = source
+            .split_once("\nfn start_relation_backfill(")
+            .unwrap()
+            .1
+            .split_once('{')
+            .unwrap()
+            .0;
+        assert!(start_signature.contains("request: ipc::BackfillRequest"));
+        assert!(start_signature.contains(") -> Result<(), String>"));
+        assert!(source.contains("relation_backfill_progress"));
     }
 
     #[test]

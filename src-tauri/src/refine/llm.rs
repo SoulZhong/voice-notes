@@ -11,10 +11,96 @@ pub const PROBE_TIMEOUT_S: u64 = 15;
 
 const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
 
+const RELATION_ONLY_SYSTEM_PROMPT: &str = "你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {\"relations\":[...]}；没有可靠关系时输出 {\"relations\":[]}。";
+
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+}
+
+pub struct HttpRelationExecutor {
+    cfg: LlmConfig,
+}
+
+impl HttpRelationExecutor {
+    pub fn new(cfg: LlmConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(!cfg.base_url.trim().is_empty(), "HTTP base URL 未配置");
+        anyhow::ensure!(!cfg.model.trim().is_empty(), "HTTP model 未配置");
+        anyhow::ensure!(!cfg.api_key.trim().is_empty(), "HTTP API key 未配置");
+        Ok(Self { cfg })
+    }
+}
+
+impl super::backfill::RelationExecutor for HttpRelationExecutor {
+    fn provider(&self) -> &str {
+        "openai"
+    }
+
+    fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
+    fn extract(
+        &self,
+        note_id: &str,
+        doc: &crate::store::RefinedDoc,
+    ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
+        let raw = extract_relations(&self.cfg, doc)?;
+        super::relations::materialize(note_id, doc, raw).map_err(|issues| {
+            anyhow::anyhow!(
+                "图谱校验失败:{}",
+                serde_json::to_string(&issues).unwrap_or_else(|_| "invalid graph".into())
+            )
+        })
+    }
+}
+
+/// HTTP provider 的关系专用调用。载荷没有 `texts` 输出位，调用方也只传不可变文档。
+pub fn extract_relations(
+    cfg: &LlmConfig,
+    doc: &crate::store::RefinedDoc,
+) -> anyhow::Result<Vec<RawRelation>> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let paragraphs = doc
+        .paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| {
+            json!({
+                "paragraph_index": index,
+                "text": paragraph.text,
+                "source_seqs": paragraph.source_seqs,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": cfg.model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": RELATION_ONLY_SYSTEM_PROMPT},
+            {"role": "user", "content": serde_json::to_string(&json!({
+                "entities": doc.entities,
+                "paragraphs": paragraphs,
+            }))?},
+        ],
+    });
+    apply_thinking_off(&cfg.base_url, &mut body);
+    let response = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+        .set("authorization", &format!("Bearer {}", cfg.api_key))
+        .set("content-type", "application/json")
+        .send_string(&body.to_string())?
+        .into_string()?;
+    let envelope: Value = serde_json::from_str(&response)?;
+    let content = envelope["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
+    let payload: Value = serde_json::from_str(content)?;
+    let relations = payload
+        .get("relations")
+        .ok_or_else(|| anyhow::anyhow!("关系补建响应缺 relations 数组"))?;
+    Ok(serde_json::from_value(relations.clone())?)
 }
 
 pub enum LlmOutcome {
