@@ -1,11 +1,10 @@
 use super::canonical::{self, CanonicalGraph, PendingItem};
 use super::overrides;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const GRAPH_SCHEMA_VERSION: u32 = 2;
@@ -13,9 +12,12 @@ pub const GRAPH_SCHEMA_VERSION: u32 = 2;
 const NEXT_FILE: &str = "graph.sqlite.next";
 const PREVIOUS_FILE: &str = "graph.sqlite.previous";
 const INDEX_LOCK_FILE: &str = ".graph-index.lock";
-const CURRENT_MANIFEST_FILE: &str = ".graph-index-current.sqlite";
-const CURRENT_MANIFEST_NEXT_FILE: &str = ".graph-index-current.sqlite.next";
+const CURRENT_POINTER_FILE: &str = ".graph-index-current";
+const CURRENT_POINTER_NEXT_FILE: &str = ".graph-index-current.next";
 const VERSION_PREFIX: &str = "graph.sqlite.version.";
+const POINTER_FORMAT_VERSION: u32 = 1;
+const MAX_POINTER_BYTES: u64 = 1024;
+const SAFE_PREVIOUS_VERSIONS: usize = 2;
 const STATUS_ERROR: &str = "semantic graph rebuild failed";
 
 const SCHEMA: &str = r#"
@@ -120,6 +122,7 @@ enum BuildStage {
     BeforeBackup,
     AfterBackupSync,
     BeforeReplace,
+    AfterPointerStageSync,
     BeforePointerCommit,
     AfterPublish,
 }
@@ -128,6 +131,66 @@ enum BuildStage {
 enum StorageLayout {
     Direct,
     Versioned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentPointer {
+    format_version: u32,
+    file_name: String,
+    build_id: String,
+    checksum: String,
+}
+
+impl CurrentPointer {
+    fn new(file_name: String, build_id: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            parse_version_file_name(&file_name).is_some(),
+            "semantic graph pointer version file is invalid"
+        );
+        anyhow::ensure!(
+            valid_build_id(&build_id),
+            "semantic graph pointer build id is invalid"
+        );
+        let checksum = pointer_checksum(POINTER_FORMAT_VERSION, &file_name, &build_id);
+        Ok(Self {
+            format_version: POINTER_FORMAT_VERSION,
+            file_name,
+            build_id,
+            checksum,
+        })
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.format_version == POINTER_FORMAT_VERSION,
+            "unsupported semantic graph pointer version"
+        );
+        anyhow::ensure!(
+            parse_version_file_name(&self.file_name).is_some(),
+            "semantic graph pointer version file is invalid"
+        );
+        anyhow::ensure!(
+            valid_build_id(&self.build_id),
+            "semantic graph pointer build id is invalid"
+        );
+        anyhow::ensure!(
+            self.checksum == pointer_checksum(self.format_version, &self.file_name, &self.build_id),
+            "semantic graph pointer checksum is invalid"
+        );
+        Ok(())
+    }
+
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_POINTER_BYTES,
+            "semantic graph pointer is too large"
+        );
+        Ok(bytes)
+    }
 }
 
 #[cfg(windows)]
@@ -233,6 +296,32 @@ fn stable_digest(prefix: &str, bytes: &[u8]) -> String {
     format!("{prefix}{}", &hex::encode(hash.finalize())[..24])
 }
 
+fn pointer_checksum(format_version: u32, file_name: &str, build_id: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"semantic-graph-pointer\0");
+    hash.update(format_version.to_le_bytes());
+    hash.update(file_name.as_bytes());
+    hash.update(b"\0");
+    hash.update(build_id.as_bytes());
+    hex::encode(hash.finalize())
+}
+
+fn valid_build_id(value: &str) -> bool {
+    value.len() == "build_".len() + 24
+        && value.starts_with("build_")
+        && value["build_".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn parse_version_file_name(value: &str) -> Option<u64> {
+    let suffix = value.strip_prefix(VERSION_PREFIX)?;
+    if suffix.len() != 20 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
 fn graph_build_id(graph: &CanonicalGraph) -> anyhow::Result<String> {
     Ok(stable_digest("build_", &serde_json::to_vec(graph)?))
 }
@@ -272,6 +361,7 @@ fn insert_graph(
     transaction: &rusqlite::Transaction<'_>,
     graph: &CanonicalGraph,
     ledger_digest: &str,
+    build_id: &str,
 ) -> anyhow::Result<BuildStats> {
     for entity in graph.entities.values() {
         transaction.execute(
@@ -375,7 +465,7 @@ fn insert_graph(
 
     transaction.execute(
         "INSERT INTO graph_meta(id, schema_version, build_id, ledger_digest) VALUES(1, ?1, ?2, ?3)",
-        rusqlite::params![GRAPH_SCHEMA_VERSION, graph_build_id(graph)?, ledger_digest],
+        rusqlite::params![GRAPH_SCHEMA_VERSION, build_id, ledger_digest],
     )?;
 
     Ok(BuildStats {
@@ -411,6 +501,20 @@ fn validate_transaction(transaction: &rusqlite::Transaction<'_>) -> anyhow::Resu
     Ok(())
 }
 
+fn with_graph_index_lock<T>(
+    data_root: &Path,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    fs::create_dir_all(data_root)?;
+    // Lock order is process graph lock -> cross-process index lock -> knowledge lock.
+    // Knowledge writers never acquire either graph lock while holding KnowledgeLock.
+    let _graph_guard = super::GRAPH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _index_file_lock = GraphIndexFileLock::acquire(data_root)?;
+    action()
+}
+
 fn build_candidate_with_hook(
     data_root: &Path,
     canonical: &CanonicalGraph,
@@ -419,11 +523,26 @@ fn build_candidate_with_hook(
     hook: &mut impl FnMut(BuildStage) -> anyhow::Result<()>,
     publish_if_current: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<CandidateOutcome> {
-    fs::create_dir_all(data_root)?;
-    let _graph_guard = super::GRAPH_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _index_file_lock = GraphIndexFileLock::acquire(data_root)?;
+    with_graph_index_lock(data_root, || {
+        build_candidate_with_hook_locked(
+            data_root,
+            canonical,
+            digest,
+            layout,
+            hook,
+            publish_if_current,
+        )
+    })
+}
+
+fn build_candidate_with_hook_locked(
+    data_root: &Path,
+    canonical: &CanonicalGraph,
+    digest: &str,
+    layout: StorageLayout,
+    hook: &mut impl FnMut(BuildStage) -> anyhow::Result<()>,
+    publish_if_current: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<bool>,
+) -> anyhow::Result<CandidateOutcome> {
     let next_path = data_root.join(NEXT_FILE);
     match fs::remove_file(&next_path) {
         Ok(()) => {}
@@ -432,6 +551,7 @@ fn build_candidate_with_hook(
     }
     let mut next_file = NextFile::new(next_path.clone());
     let graph = normalized_graph(canonical);
+    let build_id = graph_build_id(&graph)?;
     let stats = {
         let mut connection = rusqlite::Connection::open(&next_path)?;
         connection.busy_timeout(std::time::Duration::from_secs(3))?;
@@ -440,7 +560,7 @@ fn build_candidate_with_hook(
         connection.execute_batch(SCHEMA)?;
         hook(BuildStage::AfterSchema)?;
         let transaction = connection.transaction()?;
-        let stats = insert_graph(&transaction, &graph, digest)?;
+        let stats = insert_graph(&transaction, &graph, digest, &build_id)?;
         hook(BuildStage::BeforeCommit)?;
         validate_transaction(&transaction)?;
         transaction.commit()?;
@@ -481,7 +601,7 @@ fn build_candidate_with_hook(
                     next_file.replaced = true;
                 }
                 StorageLayout::Versioned => {
-                    publish_versioned(data_root, &next_path, hook)?;
+                    publish_versioned(data_root, &next_path, &build_id, hook)?;
                 }
             }
             Ok(())
@@ -519,6 +639,9 @@ fn rebuild_atomic_with_layout(
 }
 
 pub fn rebuild_atomic(data_root: &Path, canonical: &CanonicalGraph) -> anyhow::Result<BuildStats> {
+    // Low-level contract: `canonical` is a caller-owned snapshot. Callers that derive
+    // snapshots from mutable sources must use `rebuild_from_sources`, which samples
+    // only after acquiring the cross-process index lock.
     rebuild_atomic_with_hook(data_root, canonical, |_| Ok(()))
 }
 
@@ -550,24 +673,26 @@ fn rebuild_from_snapshot_source_with_publish(
     mut accept: impl FnMut(&str, Option<&mut dyn FnMut() -> anyhow::Result<()>>) -> anyhow::Result<bool>,
     mut hook: impl FnMut(BuildStage) -> anyhow::Result<()>,
 ) -> anyhow::Result<BuildStats> {
-    for _ in 0..32 {
-        let (captured_digest, graph) = snapshot()?;
-        let outcome = build_candidate_with_hook(
-            data_root,
-            &graph,
-            &captured_digest,
-            platform_layout(),
-            &mut hook,
-            |publish| accept(&captured_digest, Some(publish)),
-        )?;
-        match outcome {
-            CandidateOutcome::Replaced(stats) if accept(&captured_digest, None)? => {
-                return Ok(stats)
+    with_graph_index_lock(data_root, || {
+        for _ in 0..32 {
+            let (captured_digest, graph) = snapshot()?;
+            let outcome = build_candidate_with_hook_locked(
+                data_root,
+                &graph,
+                &captured_digest,
+                platform_layout(),
+                &mut hook,
+                |publish| accept(&captured_digest, Some(publish)),
+            )?;
+            match outcome {
+                CandidateOutcome::Replaced(stats) if accept(&captured_digest, None)? => {
+                    return Ok(stats);
+                }
+                CandidateOutcome::Replaced(_) | CandidateOutcome::Retry => {}
             }
-            CandidateOutcome::Replaced(_) | CandidateOutcome::Retry => {}
         }
-    }
-    anyhow::bail!("knowledge ledger changed too frequently to produce a stable index")
+        anyhow::bail!("knowledge ledger changed too frequently to produce a stable index")
+    })
 }
 
 fn rebuild_from_sources_with_hook(
@@ -605,117 +730,275 @@ pub fn rebuild_from_sources(data_root: &Path) -> anyhow::Result<BuildStats> {
     rebuild_from_sources_with_hook(data_root, |_| Ok(()))
 }
 
-fn next_version_file(data_root: &Path) -> anyhow::Result<(String, PathBuf)> {
-    for sequence in 1_u64.. {
-        let file_name = format!("{VERSION_PREFIX}{sequence:020}");
-        let path = data_root.join(&file_name);
-        if !path.exists() {
-            return Ok((file_name, path));
-        }
+fn symlink_metadata_optional(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    unreachable!("u64 version sequence cannot be exhausted")
+}
+
+fn ensure_regular_file_without_links(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "semantic graph path is not a regular file: {}",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "semantic graph path is a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+fn open_validated_regular_file(path: &Path) -> anyhow::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure_regular_file_without_links(path, &metadata)?;
+    let file = open_read_no_follow(path)?;
+    ensure_regular_file_without_links(path, &file.metadata()?)?;
+    Ok(file)
+}
+
+fn read_current_pointer(data_root: &Path) -> anyhow::Result<Option<CurrentPointer>> {
+    use std::io::Read;
+
+    let path = data_root.join(CURRENT_POINTER_FILE);
+    let Some(metadata) = symlink_metadata_optional(&path)? else {
+        return Ok(None);
+    };
+    ensure_regular_file_without_links(&path, &metadata)?;
+    let file = open_read_no_follow(&path)?;
+    ensure_regular_file_without_links(&path, &file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_POINTER_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_POINTER_BYTES,
+        "semantic graph pointer is too large"
+    );
+    let pointer: CurrentPointer = serde_json::from_slice(&bytes)?;
+    pointer.validate()?;
+    Ok(Some(pointer))
+}
+
+fn next_version_file(data_root: &Path) -> anyhow::Result<(String, PathBuf)> {
+    let mut maximum = 0_u64;
+    for entry in fs::read_dir(data_root)? {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(sequence) = parse_version_file_name(&file_name) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure_regular_file_without_links(&entry.path(), &metadata)?;
+        maximum = maximum.max(sequence);
+    }
+    let sequence = maximum
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("semantic graph version sequence is exhausted"))?;
+    let file_name = format!("{VERSION_PREFIX}{sequence:020}");
+    Ok((file_name.clone(), data_root.join(file_name)))
+}
+
+fn cleanup_version_files(data_root: &Path, current_file: Option<&str>) -> anyhow::Result<()> {
+    cleanup_version_files_with(data_root, current_file, |path| fs::remove_file(path))
+}
+
+fn cleanup_version_files_with(
+    data_root: &Path,
+    current_file: Option<&str>,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let current_sequence = match current_file {
+        Some(file_name) => Some(
+            parse_version_file_name(file_name)
+                .ok_or_else(|| anyhow::anyhow!("semantic graph current version file is invalid"))?,
+        ),
+        None => None,
+    };
+    let mut versions = Vec::new();
+    for entry in fs::read_dir(data_root)? {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(sequence) = parse_version_file_name(&file_name) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if ensure_regular_file_without_links(&path, &metadata).is_err() {
+            continue;
+        }
+        versions.push((sequence, file_name, path));
+    }
+    versions.sort_by(|left, right| right.0.cmp(&left.0));
+
+    let mut retained_previous = 0_usize;
+    for (sequence, file_name, path) in versions {
+        if current_file == Some(file_name.as_str()) {
+            continue;
+        }
+        let retain_as_previous = current_sequence.is_some_and(|current| sequence < current)
+            && retained_previous < SAFE_PREVIOUS_VERSIONS;
+        if retain_as_previous {
+            retained_previous += 1;
+            continue;
+        }
+        // Best effort by design: Windows sharing violations mean a held reader keeps
+        // its immutable file. A later rebuild retries the same safe deletion.
+        let _ = remove(&path);
+    }
+    Ok(())
 }
 
 fn publish_versioned(
     data_root: &Path,
     next_path: &Path,
+    build_id: &str,
     hook: &mut impl FnMut(BuildStage) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    use std::io::Write;
+
     hook(BuildStage::BeforeBackup)?;
+    let previous_pointer = read_current_pointer(data_root)?;
+    cleanup_version_files(
+        data_root,
+        previous_pointer
+            .as_ref()
+            .map(|pointer| pointer.file_name.as_str()),
+    )?;
     let (file_name, version_path) = next_version_file(data_root)?;
-    fs::copy(next_path, &version_path)?;
-    OpenOptions::new()
-        .read(true)
+    let mut version_guard = NextFile::new(version_path.clone());
+    let mut source = open_validated_regular_file(next_path)?;
+    let mut version = OpenOptions::new()
+        .create_new(true)
         .write(true)
-        .open(&version_path)?
-        .sync_all()?;
+        .open(&version_path)?;
+    std::io::copy(&mut source, &mut version)?;
+    version.flush()?;
+    version.sync_all()?;
+    drop(version);
     hook(BuildStage::AfterBackupSync)?;
     hook(BuildStage::BeforeReplace)?;
-    update_current_manifest(data_root, &file_name, hook)?;
+    let pointer = CurrentPointer::new(file_name, build_id.to_owned())?;
+    update_current_pointer(data_root, &pointer, hook)?;
+    version_guard.replaced = true;
+    cleanup_version_files(data_root, Some(&pointer.file_name))?;
     Ok(())
 }
 
-fn update_current_manifest(
+fn update_current_pointer(
     data_root: &Path,
-    file_name: &str,
+    pointer: &CurrentPointer,
     hook: &mut impl FnMut(BuildStage) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let manifest_path = data_root.join(CURRENT_MANIFEST_FILE);
-    if !manifest_path.exists() {
-        let manifest_next_path = data_root.join(CURRENT_MANIFEST_NEXT_FILE);
-        match fs::remove_file(&manifest_next_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let mut manifest_next = NextFile::new(manifest_next_path.clone());
-        let mut connection = open_manifest_for_update(&manifest_next_path)?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO current_graph(id, file_name) VALUES(1, ?1)",
-            [file_name],
-        )?;
-        hook(BuildStage::BeforePointerCommit)?;
-        transaction.commit()?;
-        drop(connection);
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&manifest_next_path)?
-            .sync_all()?;
-        fs::rename(&manifest_next_path, &manifest_path)?;
-        manifest_next.replaced = true;
-        sync_directory(data_root)?;
-        return Ok(());
-    }
+    update_current_pointer_with(data_root, pointer, hook, atomic_install_pointer)
+}
 
-    let mut connection = open_manifest_for_update(&manifest_path)?;
-    let transaction = connection.transaction()?;
-    let rows: usize =
-        transaction.query_row("SELECT count(*) FROM current_graph", [], |row| row.get(0))?;
-    anyhow::ensure!(
-        rows <= 1,
-        "semantic graph current manifest is not a singleton"
-    );
-    if rows == 0 {
-        transaction.execute(
-            "INSERT INTO current_graph(id, file_name) VALUES(1, ?1)",
-            [file_name],
-        )?;
-    } else {
-        let changed = transaction.execute(
-            "UPDATE current_graph SET file_name = ?1 WHERE id = 1",
-            [file_name],
-        )?;
-        anyhow::ensure!(
-            changed == 1,
-            "semantic graph current manifest key is invalid"
-        );
+fn update_current_pointer_with(
+    data_root: &Path,
+    pointer: &CurrentPointer,
+    hook: &mut impl FnMut(BuildStage) -> anyhow::Result<()>,
+    install: impl FnOnce(&Path, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let pointer_path = data_root.join(CURRENT_POINTER_FILE);
+    if let Some(metadata) = symlink_metadata_optional(&pointer_path)? {
+        ensure_regular_file_without_links(&pointer_path, &metadata)?;
     }
-    hook(BuildStage::BeforePointerCommit)?;
-    transaction.commit()?;
-    drop(connection);
-    OpenOptions::new()
-        .read(true)
+    let staged_path = data_root.join(CURRENT_POINTER_NEXT_FILE);
+    if let Some(metadata) = symlink_metadata_optional(&staged_path)? {
+        ensure_regular_file_without_links(&staged_path, &metadata)?;
+        fs::remove_file(&staged_path)?;
+    }
+    let mut staged_guard = NextFile::new(staged_path.clone());
+    let mut staged = OpenOptions::new()
+        .create_new(true)
         .write(true)
-        .open(&manifest_path)?
-        .sync_all()?;
+        .open(&staged_path)?;
+    staged.write_all(&pointer.encode()?)?;
+    staged.flush()?;
+    staged.sync_all()?;
+    drop(staged);
+    hook(BuildStage::AfterPointerStageSync)?;
+    hook(BuildStage::BeforePointerCommit)?;
+    install(&staged_path, &pointer_path)?;
+    staged_guard.replaced = true;
     sync_directory(data_root)?;
     Ok(())
 }
 
-fn open_manifest_for_update(path: &Path) -> anyhow::Result<rusqlite::Connection> {
-    let connection = rusqlite::Connection::open(path)?;
-    connection.busy_timeout(std::time::Duration::from_secs(3))?;
-    connection.pragma_update(None, "journal_mode", "DELETE")?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS current_graph (\
-           id INTEGER PRIMARY KEY CHECK (id = 1),\
-           file_name TEXT NOT NULL\
-         );",
-    )?;
-    Ok(connection)
+#[cfg(unix)]
+fn atomic_install_pointer(staged: &Path, current: &Path) -> anyhow::Result<()> {
+    fs::rename(staged, current)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_install_pointer(staged: &Path, current: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let staged = staged
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let current = current
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let installed = unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            current.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    anyhow::ensure!(installed != 0, std::io::Error::last_os_error());
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_install_pointer(staged: &Path, current: &Path) -> anyhow::Result<()> {
+    fs::rename(staged, current)?;
+    Ok(())
 }
 
 pub fn open_readonly(data_root: &Path) -> anyhow::Result<rusqlite::Connection> {
@@ -726,10 +1009,13 @@ fn open_readonly_with_layout(
     data_root: &Path,
     layout: StorageLayout,
 ) -> anyhow::Result<rusqlite::Connection> {
-    let live_path = match layout {
-        StorageLayout::Direct => data_root.join(super::GRAPH_FILE),
-        StorageLayout::Versioned => current_version_path(data_root)?,
+    let (live_path, expected_build_id) = match layout {
+        StorageLayout::Direct => (data_root.join(super::GRAPH_FILE), None),
+        StorageLayout::Versioned => resolve_current_version(data_root)?,
     };
+    if expected_build_id.is_some() {
+        open_validated_regular_file(&live_path)?;
+    }
     let connection = rusqlite::Connection::open_with_flags(
         &live_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -737,66 +1023,28 @@ fn open_readonly_with_layout(
     connection.busy_timeout(std::time::Duration::from_secs(3))?;
     connection.pragma_update(None, "query_only", "ON")?;
     validate_read_schema(&connection)?;
+    if let Some(expected_build_id) = expected_build_id {
+        let actual_build_id: String =
+            connection.query_row("SELECT build_id FROM graph_meta", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            actual_build_id == expected_build_id,
+            "semantic graph pointer build id does not match its version"
+        );
+    }
     Ok(connection)
 }
 
 fn current_version_path(data_root: &Path) -> anyhow::Result<PathBuf> {
-    let manifest_path = data_root.join(CURRENT_MANIFEST_FILE);
-    if !manifest_path.exists() {
-        return Ok(data_root.join(super::GRAPH_FILE));
-    }
-    let connection = rusqlite::Connection::open_with_flags(
-        &manifest_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    connection.busy_timeout(std::time::Duration::from_secs(3))?;
-    let tables = connection
-        .prepare(
-            "SELECT name FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    anyhow::ensure!(
-        tables == ["current_graph"],
-        "semantic graph current manifest schema is invalid"
-    );
-    let columns = connection
-        .prepare("PRAGMA table_info(current_graph)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    anyhow::ensure!(
-        columns == ["id", "file_name"],
-        "semantic graph current manifest columns are invalid"
-    );
-    let (rows, id, file_name): (usize, Option<i64>, Option<String>) = connection.query_row(
-        "SELECT count(*), min(id), min(file_name) FROM current_graph",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    anyhow::ensure!(
-        rows == 1 && id == Some(1),
-        "semantic graph current manifest is not a singleton"
-    );
-    let file_name =
-        file_name.ok_or_else(|| anyhow::anyhow!("semantic graph current manifest has no file"))?;
-    anyhow::ensure!(
-        file_name.starts_with(VERSION_PREFIX)
-            && file_name[VERSION_PREFIX.len()..]
-                .chars()
-                .all(|character| character.is_ascii_digit())
-            && Path::new(&file_name)
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some(&file_name),
-        "semantic graph current manifest file is invalid"
-    );
-    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-    anyhow::ensure!(
-        quick_check == "ok",
-        "semantic graph current manifest is corrupt"
-    );
-    Ok(data_root.join(file_name))
+    resolve_current_version(data_root).map(|(path, _)| path)
+}
+
+fn resolve_current_version(data_root: &Path) -> anyhow::Result<(PathBuf, Option<String>)> {
+    let Some(pointer) = read_current_pointer(data_root)? else {
+        return Ok((data_root.join(super::GRAPH_FILE), None));
+    };
+    let version_path = data_root.join(&pointer.file_name);
+    open_validated_regular_file(&version_path)?;
+    Ok((version_path, Some(pointer.build_id)))
 }
 
 fn validate_read_schema(connection: &rusqlite::Connection) -> anyhow::Result<()> {
@@ -1055,17 +1303,43 @@ fn validate_read_schema(connection: &rusqlite::Connection) -> anyhow::Result<()>
 
 type RebuildFn = dyn Fn(&Path) -> anyhow::Result<BuildStats> + Send + Sync + 'static;
 type EmitFn = dyn Fn(IndexStatus) + Send + Sync + 'static;
+type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
+type SpawnFn = dyn Fn(SpawnJob) -> std::io::Result<()> + Send + Sync + 'static;
 
 enum Rebuilder {
     Sources,
     Custom(Arc<RebuildFn>),
 }
 
+enum SchedulerSpawner {
+    Thread,
+    Custom(Arc<SpawnFn>),
+}
+
+impl SchedulerSpawner {
+    fn spawn(&self, job: SpawnJob) -> std::io::Result<()> {
+        match self {
+            Self::Thread => std::thread::Builder::new()
+                .name("graph-index-rebuild".into())
+                .spawn(job)
+                .map(|_| ()),
+            Self::Custom(spawn) => spawn(job),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    generation: u64,
+    dirty: bool,
+    running_generation: Option<u64>,
+    latest: Option<RebuildRequest>,
+}
+
 struct SchedulerInner {
-    dirty: AtomicBool,
-    running: AtomicBool,
+    state: Mutex<SchedulerState>,
     rebuilder: Rebuilder,
-    latest: Mutex<Option<RebuildRequest>>,
+    spawner: SchedulerSpawner,
 }
 
 #[derive(Clone)]
@@ -1083,10 +1357,9 @@ impl Default for RebuildScheduler {
     fn default() -> Self {
         Self {
             inner: Arc::new(SchedulerInner {
-                dirty: AtomicBool::new(false),
-                running: AtomicBool::new(false),
+                state: Mutex::new(SchedulerState::default()),
                 rebuilder: Rebuilder::Sources,
-                latest: Mutex::new(None),
+                spawner: SchedulerSpawner::Thread,
             }),
         }
     }
@@ -1098,63 +1371,116 @@ impl RebuildScheduler {
     ) -> Self {
         Self {
             inner: Arc::new(SchedulerInner {
-                dirty: AtomicBool::new(false),
-                running: AtomicBool::new(false),
+                state: Mutex::new(SchedulerState::default()),
                 rebuilder: Rebuilder::Custom(Arc::new(rebuild)),
-                latest: Mutex::new(None),
+                spawner: SchedulerSpawner::Thread,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rebuilder_and_spawner(
+        rebuild: impl Fn(&Path) -> anyhow::Result<BuildStats> + Send + Sync + 'static,
+        spawn: impl Fn(SpawnJob) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(SchedulerInner {
+                state: Mutex::new(SchedulerState::default()),
+                rebuilder: Rebuilder::Custom(Arc::new(rebuild)),
+                spawner: SchedulerSpawner::Custom(Arc::new(spawn)),
             }),
         }
     }
 
     pub fn request(&self, data_root: PathBuf, emit: impl Fn(IndexStatus) + Send + Sync + 'static) {
-        *self
-            .inner
-            .latest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RebuildRequest {
-            data_root,
-            emit: Arc::new(emit),
-        });
-        self.inner.dirty.store(true, Ordering::Release);
-        start_scheduler(self.inner.clone());
+        let generation_to_spawn = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("semantic graph scheduler generation exhausted");
+            state.latest = Some(RebuildRequest {
+                data_root,
+                emit: Arc::new(emit),
+            });
+            state.dirty = true;
+            if state.running_generation.is_none() {
+                let generation = state.generation;
+                state.running_generation = Some(generation);
+                Some(generation)
+            } else {
+                None
+            }
+        };
+        if let Some(generation) = generation_to_spawn {
+            spawn_claimed_scheduler(self.inner.clone(), generation);
+        }
     }
 }
 
 struct RunningGuard {
     inner: Arc<SchedulerInner>,
+    generation: u64,
 }
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.inner.running.store(false, Ordering::Release);
-        if self.inner.dirty.load(Ordering::Acquire) {
-            start_scheduler(self.inner.clone());
+        let generation_to_spawn = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.running_generation != Some(self.generation) {
+                None
+            } else {
+                state.running_generation = None;
+                if state.dirty {
+                    let generation = state.generation;
+                    state.running_generation = Some(generation);
+                    Some(generation)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(generation) = generation_to_spawn {
+            spawn_claimed_scheduler(self.inner.clone(), generation);
         }
     }
 }
 
-fn start_scheduler(inner: Arc<SchedulerInner>) {
-    if inner
-        .running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
+fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
     let worker_inner = inner.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("graph-index-rebuild".into())
-        .spawn(move || run_scheduler(worker_inner))
-    {
-        inner.running.store(false, Ordering::Release);
-        inner.dirty.store(false, Ordering::Release);
+    let job: SpawnJob = Box::new(move || run_scheduler(worker_inner, generation));
+    if let Err(error) = inner.spawner.spawn(job) {
         eprintln!("graph: unable to start semantic index rebuild: {error}");
-        let request = inner
-            .latest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(request) = request {
+        let (newer_generation, request_for_error) = {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.running_generation != Some(generation) {
+                (None, None)
+            } else {
+                state.running_generation = None;
+                if state.dirty && state.generation > generation {
+                    let newer_generation = state.generation;
+                    state.running_generation = Some(newer_generation);
+                    (Some(newer_generation), None)
+                } else {
+                    state.dirty = false;
+                    (None, state.latest.clone())
+                }
+            }
+        };
+        if let Some(newer_generation) = newer_generation {
+            spawn_claimed_scheduler(inner, newer_generation);
+        } else if let Some(request) = request_for_error {
             emit_status(
                 &request.emit,
                 IndexStatus {
@@ -1171,17 +1497,25 @@ fn emit_status(emit: &Arc<EmitFn>, status: IndexStatus) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(status)));
 }
 
-fn run_scheduler(inner: Arc<SchedulerInner>) {
+fn run_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
     let _running_guard = RunningGuard {
         inner: inner.clone(),
+        generation,
     };
-    while inner.dirty.swap(false, Ordering::AcqRel) {
-        let Some(request) = inner
-            .latest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        else {
+    loop {
+        let request = {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.dirty {
+                None
+            } else {
+                state.dirty = false;
+                state.latest.clone()
+            }
+        };
+        let Some(request) = request else {
             break;
         };
         emit_status(
@@ -1611,6 +1945,362 @@ mod tests {
     }
 
     #[test]
+    fn repeated_versioned_rebuilds_keep_a_bounded_safe_version_set() {
+        let root = tempfile::tempdir().unwrap();
+        for generation in 0..8 {
+            let mut graph = fixture();
+            graph.entities.get_mut("kg_a").unwrap().name = format!("Alice {generation}");
+            rebuild_atomic_with_layout(root.path(), &graph, StorageLayout::Versioned, |_| Ok(()))
+                .unwrap();
+        }
+
+        let versions = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| parse_version_file_name(&entry.file_name().to_string_lossy()).is_some())
+            .count();
+        assert!(versions <= 3, "retained {versions} immutable versions");
+        assert_eq!(
+            open_readonly_with_layout(root.path(), StorageLayout::Versioned)
+                .unwrap()
+                .query_row("SELECT name FROM entities WHERE id = 'kg_a'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Alice 7"
+        );
+    }
+
+    #[test]
+    fn held_version_delete_failure_is_retained_then_retried_after_reader_closes() {
+        let root = tempfile::tempdir().unwrap();
+        for sequence in 1..=5 {
+            std::fs::write(
+                root.path().join(format!("{VERSION_PREFIX}{sequence:020}")),
+                format!("version {sequence}"),
+            )
+            .unwrap();
+        }
+        let held_path = root
+            .path()
+            .join("graph.sqlite.version.00000000000000000001");
+        let held_reader = std::fs::File::open(&held_path).unwrap();
+        let current = "graph.sqlite.version.00000000000000000005";
+
+        cleanup_version_files_with(root.path(), Some(current), |path| {
+            if path == held_path {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated Windows sharing violation",
+                ));
+            }
+            std::fs::remove_file(path)
+        })
+        .unwrap();
+        assert!(held_path.exists());
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    parse_version_file_name(&entry.file_name().to_string_lossy()).is_some()
+                })
+                .count(),
+            4
+        );
+
+        drop(held_reader);
+        cleanup_version_files(root.path(), Some(current)).unwrap();
+        assert!(!held_path.exists());
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    parse_version_file_name(&entry.file_name().to_string_lossy()).is_some()
+                })
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn current_pointer_is_a_small_immutable_document_not_a_sqlite_database() {
+        let root = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(root.path().join(CURRENT_POINTER_FILE)).unwrap();
+        assert!(bytes.len() < 1024);
+        assert_eq!(bytes.first(), Some(&b'{'));
+        let sqlite_probe = rusqlite::Connection::open_with_flags(
+            root.path().join(CURRENT_POINTER_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert!(sqlite_probe
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, u32>(0))
+            .is_err());
+    }
+
+    #[test]
+    fn version_file_names_require_exactly_twenty_ascii_digits() {
+        assert_eq!(
+            parse_version_file_name("graph.sqlite.version.00000000000000000001"),
+            Some(1)
+        );
+        for invalid in [
+            "graph.sqlite.version.",
+            "graph.sqlite.version.0000000000000000001",
+            "graph.sqlite.version.000000000000000000001",
+            "graph.sqlite.version.0000000000000000000x",
+            "graph.sqlite.version.０００００００００００００００００００１",
+            "graph.sqlite.version.00000000000000000001/escape",
+            "other.00000000000000000001",
+        ] {
+            assert_eq!(parse_version_file_name(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn staged_pointer_failure_keeps_old_pointer_and_cleans_the_stage() {
+        let root = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let pointer_path = root.path().join(CURRENT_POINTER_FILE);
+        let original_pointer = std::fs::read(&pointer_path).unwrap();
+        let original_build =
+            build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap());
+        let mut changed = fixture();
+        changed.entities.get_mut("kg_a").unwrap().name = "Never Current".into();
+
+        rebuild_atomic_with_layout(root.path(), &changed, StorageLayout::Versioned, |stage| {
+            anyhow::ensure!(
+                stage != BuildStage::AfterPointerStageSync,
+                "staged pointer failure"
+            );
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(std::fs::read(pointer_path).unwrap(), original_pointer);
+        assert!(!root.path().join(CURRENT_POINTER_NEXT_FILE).exists());
+        assert_eq!(
+            build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap()),
+            original_build
+        );
+    }
+
+    #[test]
+    fn stale_staged_pointer_artifact_is_ignored_and_replaced_on_the_next_build() {
+        let root = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let old_build =
+            build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap());
+        std::fs::write(
+            root.path().join(CURRENT_POINTER_NEXT_FILE),
+            b"process died after staging this garbage",
+        )
+        .unwrap();
+        assert_eq!(
+            build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap()),
+            old_build
+        );
+
+        let mut changed = fixture();
+        changed.entities.get_mut("kg_a").unwrap().name = "Recovered Alice".into();
+        rebuild_atomic_with_layout(root.path(), &changed, StorageLayout::Versioned, |_| Ok(()))
+            .unwrap();
+
+        assert!(!root.path().join(CURRENT_POINTER_NEXT_FILE).exists());
+        assert_ne!(
+            build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap()),
+            old_build
+        );
+    }
+
+    #[test]
+    fn pointer_installer_adapter_preserves_old_or_installs_new_as_one_document() {
+        let root = tempfile::tempdir().unwrap();
+        let old = CurrentPointer::new(
+            "graph.sqlite.version.00000000000000000001".into(),
+            "build_000000000000000000000001".into(),
+        )
+        .unwrap();
+        update_current_pointer_with(root.path(), &old, &mut |_| Ok(()), |staged, current| {
+            assert!(!current.exists());
+            std::fs::rename(staged, current)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            read_current_pointer(root.path()).unwrap(),
+            Some(old.clone())
+        );
+
+        let new = CurrentPointer::new(
+            "graph.sqlite.version.00000000000000000002".into(),
+            "build_000000000000000000000002".into(),
+        )
+        .unwrap();
+        update_current_pointer_with(root.path(), &new, &mut |_| Ok(()), |_staged, _current| {
+            anyhow::bail!("install failed before replacement")
+        })
+        .unwrap_err();
+        assert_eq!(read_current_pointer(root.path()).unwrap(), Some(old));
+        assert!(!root.path().join(CURRENT_POINTER_NEXT_FILE).exists());
+
+        update_current_pointer_with(root.path(), &new, &mut |_| Ok(()), |staged, current| {
+            std::fs::rename(staged, current)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(read_current_pointer(root.path()).unwrap(), Some(new));
+    }
+
+    #[test]
+    fn tampered_pointer_checksum_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let pointer_path = root.path().join(CURRENT_POINTER_FILE);
+        let mut pointer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pointer_path).unwrap()).unwrap();
+        pointer["build_id"] = serde_json::Value::String("build_ffffffffffffffffffffffff".into());
+        std::fs::write(pointer_path, serde_json::to_vec(&pointer).unwrap()).unwrap();
+
+        assert!(open_readonly_with_layout(root.path(), StorageLayout::Versioned).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pointer_and_version_symlinks_are_rejected_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let pointer_root = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            pointer_root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let pointer_path = pointer_root.path().join(CURRENT_POINTER_FILE);
+        let pointer_target = pointer_root.path().join("pointer.real");
+        std::fs::rename(&pointer_path, &pointer_target).unwrap();
+        symlink(&pointer_target, &pointer_path).unwrap();
+        assert!(read_current_pointer(pointer_root.path()).is_err());
+
+        let version_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        rebuild_atomic_with_layout(
+            version_root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let version_path = current_version_path(version_root.path()).unwrap();
+        let outside_version = outside.path().join("outside.sqlite");
+        std::fs::rename(&version_path, &outside_version).unwrap();
+        symlink(&outside_version, &version_path).unwrap();
+        assert!(open_readonly_with_layout(version_root.path(), StorageLayout::Versioned).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legal_version_symlink_is_rejected_not_treated_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let missing_target = outside.path().join("must-not-be-created.sqlite");
+        symlink(
+            &missing_target,
+            root.path()
+                .join("graph.sqlite.version.00000000000000000001"),
+        )
+        .unwrap();
+
+        assert!(rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(())
+        )
+        .is_err());
+        assert!(!missing_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_pointer_symlink_is_rejected_not_treated_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let missing_target = outside.path().join("must-not-be-created.pointer");
+        symlink(&missing_target, root.path().join(CURRENT_POINTER_FILE)).unwrap();
+
+        assert!(read_current_pointer(root.path()).is_err());
+        assert!(rebuild_atomic_with_layout(
+            root.path(),
+            &fixture(),
+            StorageLayout::Versioned,
+            |_| Ok(())
+        )
+        .is_err());
+        assert!(!missing_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_cleanup_never_deletes_unknown_names_or_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("outside.sqlite");
+        std::fs::write(&outside_target, b"outside").unwrap();
+        let legal_link = root
+            .path()
+            .join("graph.sqlite.version.00000000000000000001");
+        let unknown_file = root.path().join("graph.sqlite.version.not-a-version");
+        let unknown_link = root.path().join("unrelated-link");
+        symlink(&outside_target, &legal_link).unwrap();
+        std::fs::write(&unknown_file, b"unknown").unwrap();
+        symlink(&outside_target, &unknown_link).unwrap();
+
+        cleanup_version_files(root.path(), None).unwrap();
+
+        assert!(std::fs::symlink_metadata(&legal_link).is_ok());
+        assert!(unknown_file.exists());
+        assert!(std::fs::symlink_metadata(&unknown_link).is_ok());
+        assert_eq!(std::fs::read(&outside_target).unwrap(), b"outside");
+    }
+
+    #[test]
     fn versioned_pointer_failure_keeps_old_pointer_and_readers_intact() {
         let root = tempfile::tempdir().unwrap();
         rebuild_atomic_with_layout(
@@ -1661,7 +2351,7 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(!root.path().join(CURRENT_MANIFEST_FILE).exists());
+        assert!(!root.path().join(CURRENT_POINTER_FILE).exists());
         assert_eq!(
             build_id(&open_readonly_with_layout(root.path(), StorageLayout::Versioned).unwrap()),
             old_build
@@ -1695,7 +2385,7 @@ mod tests {
             2
         );
         assert!(legacy_path.exists());
-        assert!(root.path().join(CURRENT_MANIFEST_FILE).exists());
+        assert!(root.path().join(CURRENT_POINTER_FILE).exists());
     }
 
     #[test]
@@ -1730,6 +2420,88 @@ mod tests {
             })
             .unwrap(),
             "Fresh Alice"
+        );
+    }
+
+    #[test]
+    fn waiting_source_resamples_only_after_acquiring_the_index_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(AtomicUsize::new(0));
+        let (a_locked_tx, a_locked_rx) = mpsc::channel();
+        let (release_a_tx, release_a_rx) = mpsc::channel();
+        let root_a = root.path().to_path_buf();
+        let state_a = state.clone();
+        let a = std::thread::spawn(move || {
+            let mut paused = false;
+            rebuild_from_snapshot_source(
+                &root_a,
+                || {
+                    let sampled = state_a.load(Ordering::SeqCst);
+                    let mut graph = fixture();
+                    graph.entities.get_mut("kg_a").unwrap().name = if sampled == 0 {
+                        "Old Alice"
+                    } else {
+                        "New Alice"
+                    }
+                    .into();
+                    Ok(("same-ledger-digest".into(), graph))
+                },
+                || Ok("same-ledger-digest".into()),
+                |stage| {
+                    if stage == BuildStage::AfterSchema && !paused {
+                        paused = true;
+                        a_locked_tx.send(()).unwrap();
+                        release_a_rx.recv().unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        a_locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let root_b = root.path().to_path_buf();
+        let state_b = state.clone();
+        let b = std::thread::spawn(move || {
+            rebuild_from_snapshot_source(
+                &root_b,
+                || {
+                    let sampled = state_b.load(Ordering::SeqCst);
+                    sampled_tx.send(sampled).unwrap();
+                    let mut graph = fixture();
+                    graph.entities.get_mut("kg_a").unwrap().name = if sampled == 0 {
+                        "Old Alice"
+                    } else {
+                        "New Alice"
+                    }
+                    .into();
+                    Ok(("same-ledger-digest".into(), graph))
+                },
+                || Ok("same-ledger-digest".into()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        });
+
+        let early_sample = sampled_rx.recv_timeout(Duration::from_millis(50));
+        state.store(1, Ordering::SeqCst);
+        release_a_tx.send(()).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        let sampled_early = early_sample.is_ok();
+        let sampled = early_sample.unwrap_or_else(|_| sampled_rx.recv().unwrap());
+
+        assert!(!sampled_early, "waiting source sampled before the lock");
+        assert_eq!(sampled, 1);
+        assert_eq!(
+            open_readonly(root.path())
+                .unwrap()
+                .query_row("SELECT name FROM entities WHERE id = 'kg_a'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "New Alice"
         );
     }
 
@@ -2043,6 +2815,82 @@ mod tests {
         assert_eq!(snapshots.load(Ordering::SeqCst), 32);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(snapshots.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn scheduler_spawn_failure_with_a_newer_request_runs_the_new_generation() {
+        let (spawn_started_tx, spawn_started_rx) = mpsc::channel();
+        let (release_spawn_tx, release_spawn_rx) = mpsc::channel();
+        let release_spawn_rx = Arc::new(Mutex::new(release_spawn_rx));
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let spawn_calls_for_spawner = spawn_calls.clone();
+        let release_spawn_rx_for_spawner = release_spawn_rx.clone();
+        let (build_tx, build_rx) = mpsc::channel();
+        let scheduler = RebuildScheduler::with_rebuilder_and_spawner(
+            move |root| {
+                build_tx.send(root.to_path_buf()).unwrap();
+                Ok(BuildStats::default())
+            },
+            move |job: SpawnJob| {
+                let call = spawn_calls_for_spawner.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    spawn_started_tx.send(()).unwrap();
+                    release_spawn_rx_for_spawner.lock().unwrap().recv().unwrap();
+                    return Err(std::io::Error::other("injected spawn failure"));
+                }
+                std::thread::Builder::new()
+                    .name("test-graph-index-rebuild".into())
+                    .spawn(job)
+                    .map(|_| ())
+            },
+        );
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let scheduler_a = scheduler.clone();
+        let root_a_path = root_a.path().to_path_buf();
+        let request_a = std::thread::spawn(move || scheduler_a.request(root_a_path, |_| {}));
+        spawn_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let (b_tx, b_rx) = mpsc::channel();
+        scheduler.request(root_b.path().to_path_buf(), move |status| {
+            if status.state == "ready" {
+                b_tx.send(()).unwrap();
+            }
+        });
+        release_spawn_tx.send(()).unwrap();
+        request_a.join().unwrap();
+
+        b_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            build_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            root_b.path()
+        );
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scheduler_spawn_failure_without_a_new_request_reports_once_without_retry_loop() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let spawn_calls_for_spawner = spawn_calls.clone();
+        let scheduler = RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(BuildStats::default()),
+            move |_job: SpawnJob| {
+                spawn_calls_for_spawner.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other("injected spawn failure"))
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        scheduler.request(root.path().to_path_buf(), move |status| {
+            if status.state == "error" {
+                tx.send(()).unwrap();
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
