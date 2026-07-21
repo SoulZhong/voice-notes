@@ -1,7 +1,13 @@
 //! Aing 产物 refined.json:原始三文件之外的独立终稿,损坏/缺失时 UI 回落原始逐字稿。
 
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
+#[cfg(not(unix))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::notelock::NoteLock;
 
@@ -93,6 +99,517 @@ pub struct RefinedDoc {
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
+fn prepared_doc_bytes(note_id: &str, doc: &RefinedDoc) -> anyhow::Result<Vec<u8>> {
+    let mut doc = doc.clone();
+    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+    Ok(serde_json::to_vec_pretty(&doc)?)
+}
+
+fn parse_doc(note_id: &str, bytes: &[u8]) -> anyhow::Result<RefinedDoc> {
+    let mut doc: RefinedDoc = serde_json::from_slice(bytes)?;
+    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+    Ok(doc)
+}
+
+/// 一旦构造成功，后续 Aing 真值/旧稿/锁/临时文件操作都绑定到同一个已打开的
+/// 笔记目录。这样外部进程即使在检查后替换 `notes/<id>`，读写也不会重新解析父路径。
+pub(crate) struct AnchoredRefinedDir {
+    note_id: String,
+    #[cfg(unix)]
+    dir: File,
+    #[cfg(windows)]
+    _notes_root: File,
+    #[cfg(windows)]
+    dir: File,
+    #[cfg(windows)]
+    path: PathBuf,
+    #[cfg(not(any(unix, windows)))]
+    path: PathBuf,
+}
+
+impl AnchoredRefinedDir {
+    pub(crate) fn open(notes_root: &Path, note_id: &str) -> anyhow::Result<Self> {
+        crate::store::validate_note_id(note_id)?;
+
+        #[cfg(unix)]
+        {
+            let notes = open_unix_directory(notes_root)?;
+            let dir = open_unix_directory_at(&notes, note_id)?;
+            return Ok(Self {
+                note_id: note_id.into(),
+                dir,
+            });
+        }
+
+        #[cfg(windows)]
+        {
+            let notes = open_windows_directory(notes_root)?;
+            let path = notes_root.join(note_id);
+            let dir = open_windows_directory(&path)?;
+            return Ok(Self {
+                note_id: note_id.into(),
+                _notes_root: notes,
+                dir,
+                path,
+            });
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let root = std::fs::canonicalize(notes_root)?;
+            let path = notes_root.join(note_id);
+            let canonical = std::fs::canonicalize(&path)?;
+            anyhow::ensure!(
+                canonical.parent() == Some(root.as_path()),
+                "笔记目录越出 notes 根"
+            );
+            return Ok(Self {
+                note_id: note_id.into(),
+                path,
+            });
+        }
+    }
+
+    pub(crate) fn acquire_lock(&self) -> std::io::Result<Option<NoteLock>> {
+        NoteLock::acquire_opened(|| self.open_lock_file())
+    }
+
+    /// 只读当前 aing.json；缺失不回退旧稿，也不触发迁移。
+    pub(crate) fn load_current(&self) -> anyhow::Result<Option<RefinedDoc>> {
+        let Some(bytes) = self.read_optional(AING_DOC_FILE)? else {
+            return Ok(None);
+        };
+        Ok(Some(parse_doc(&self.note_id, &bytes)?))
+    }
+
+    /// 已持锁加载当前真值；只有 aing.json 确实不存在才读旧稿并尝试迁移。
+    pub(crate) fn load_locked(&self, lock: &NoteLock) -> anyhow::Result<Option<RefinedDoc>> {
+        if let Some(bytes) = self.read_optional(AING_DOC_FILE)? {
+            return Ok(Some(parse_doc(&self.note_id, &bytes)?));
+        }
+        let Some(bytes) = self.read_optional(LEGACY_REFINED_FILE)? else {
+            return Ok(None);
+        };
+        let doc = parse_doc(&self.note_id, &bytes)?;
+        // 与旧路径 loader 一致：迁移写失败不影响本次读取，旧文件永远保留。
+        let _ = self.write_locked(&doc, lock);
+        Ok(Some(doc))
+    }
+
+    pub(crate) fn write_locked(&self, doc: &RefinedDoc, _lock: &NoteLock) -> anyhow::Result<()> {
+        let bytes = prepared_doc_bytes(&self.note_id, doc)?;
+        self.write_bytes_atomic(&bytes)
+    }
+
+    #[cfg(unix)]
+    fn read_optional(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(mut file) = open_unix_child(&self.dir, name, libc::O_RDONLY, 0)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(file.metadata()?.is_file(), "{name} 不是普通文件");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(windows)]
+    fn read_optional(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let path = self.path.join(name);
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "{name} 不是无 reparse 的普通文件"
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn read_optional(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let path = self.path.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "{name} 不是普通文件"
+        );
+        Ok(Some(std::fs::read(path)?))
+    }
+
+    #[cfg(unix)]
+    fn open_lock_file(&self) -> std::io::Result<File> {
+        open_unix_child(
+            &self.dir,
+            super::notelock::LOCK_FILE,
+            libc::O_RDWR | libc::O_CREAT,
+            0o600,
+        )?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        .and_then(|file| {
+            if file.metadata()?.is_file() {
+                Ok(file)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    ".note.lock 不是普通文件",
+                ))
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    fn open_lock_file(&self) -> std::io::Result<File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(super::notelock::LOCK_FILE))?;
+        let metadata = file.metadata()?;
+        if metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            Ok(file)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                ".note.lock 不是无 reparse 的普通文件",
+            ))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open_lock_file(&self) -> std::io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.path.join(super::notelock::LOCK_FILE))
+    }
+
+    #[cfg(unix)]
+    fn write_bytes_atomic(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let temp_name = unique_temp_name()?;
+        let mut temp = open_unix_child(
+            &self.dir,
+            &temp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("无法创建唯一 Aing 临时文件"))?;
+        let result = (|| -> anyhow::Result<()> {
+            temp.write_all(bytes)?;
+            temp.sync_all()?;
+            ensure_unix_entry_is_open_file(&self.dir, &temp_name, &temp)?;
+            ensure_unix_optional_regular(&self.dir, AING_DOC_FILE)?;
+            rename_unix_child(&self.dir, &temp_name, AING_DOC_FILE)?;
+            self.dir.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = unlink_unix_child(&self.dir, &temp_name);
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn write_bytes_atomic(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        // Existing final symlinks/reparse points fail closed. A replacement racing after this
+        // check is replaced as a directory entry by the handle-relative rename and is not followed.
+        if let Some(metadata) = symlink_metadata_optional(&self.path.join(AING_DOC_FILE))? {
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "aing.json 不是无 reparse 的普通文件"
+            );
+        }
+
+        let (temp_name, mut temp) = loop {
+            let name = unique_temp_name()?;
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .access_mode(GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(self.path.join(&name))
+            {
+                Ok(file) => break (name, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let result = (|| -> anyhow::Result<()> {
+            temp.write_all(bytes)?;
+            temp.sync_all()?;
+            rename_windows_handle(&temp, &self.dir, AING_DOC_FILE)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(self.path.join(temp_name));
+        }
+        result
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn write_bytes_atomic(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let temp = self.path.join(unique_temp_name()?);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(temp, self.path.join(AING_DOC_FILE))?;
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+static AING_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_name() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        let mut random = [0u8; 16];
+        File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let nonce = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        return Ok(format!(".aing.json.tmp.{nonce}"));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let sequence = AING_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(format!(
+            ".aing.json.tmp.{}.{}.{sequence}",
+            std::process::id(),
+            nanos
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名包含 NUL"))
+}
+
+#[cfg(unix)]
+fn open_unix_directory(path: &Path) -> anyhow::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    anyhow::ensure!(file.metadata()?.is_dir(), "不是目录: {}", path.display());
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_unix_directory_at(parent: &File, name: &str) -> anyhow::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    anyhow::ensure!(file.metadata()?.is_dir(), "笔记节点不是目录");
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_unix_child(
+    dir: &File,
+    name: &str,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+#[cfg(unix)]
+fn ensure_unix_optional_regular(dir: &File, name: &str) -> anyhow::Result<()> {
+    if let Some(file) = open_unix_child(dir, name, libc::O_RDONLY, 0)? {
+        anyhow::ensure!(file.metadata()?.is_file(), "{name} 不是普通文件");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_unix_entry_is_open_file(dir: &File, name: &str, open: &File) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = open_unix_child(dir, name, libc::O_RDONLY, 0)?
+        .ok_or_else(|| anyhow::anyhow!("Aing 临时文件在提交前消失"))?;
+    let open_metadata = open.metadata()?;
+    let current_metadata = current.metadata()?;
+    anyhow::ensure!(
+        current_metadata.is_file()
+            && current_metadata.dev() == open_metadata.dev()
+            && current_metadata.ino() == open_metadata.ino(),
+        "Aing 临时文件在提交前被替换"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rename_unix_child(dir: &File, from: &str, to: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let from = c_name(from)?;
+    let to = c_name(to)?;
+    let result =
+        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlink_unix_child(dir: &File, name: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let name = c_name(name)?;
+    let result = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path) -> anyhow::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "不是无 reparse 的真实目录: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn rename_windows_handle(temp: &File, dir: &File, target: &str) -> anyhow::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    let target = std::ffi::OsStr::new(target)
+        .encode_wide()
+        .collect::<Vec<_>>();
+    let byte_len = target.len() * size_of::<u16>();
+    let info_len = offset_of!(FILE_RENAME_INFO, FileName) + byte_len;
+    let words = info_len.div_ceil(size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = 1;
+        (*info).RootDirectory = dir.as_raw_handle();
+        (*info).FileNameLength = byte_len as u32;
+        std::ptr::copy_nonoverlapping(target.as_ptr(), (*info).FileName.as_mut_ptr(), target.len());
+        if SetFileInformationByHandle(
+            temp.as_raw_handle(),
+            FileRenameInfo,
+            info.cast(),
+            info_len as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn symlink_metadata_optional(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// 已持有该笔记 `NoteLock` 时使用的底层原子写。把锁凭据作为参数，避免调用者
 /// 意外绕开跨进程互斥，也避免 Aing 管线在锁内重入公共 writer。
 pub(crate) fn write_refined_atomic_locked(
@@ -100,14 +617,12 @@ pub(crate) fn write_refined_atomic_locked(
     doc: &RefinedDoc,
     _lock: &NoteLock,
 ) -> anyhow::Result<()> {
-    let mut doc = doc.clone();
     let note_id = note_dir
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
-    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
     let tmp = note_dir.join("aing.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
+    std::fs::write(&tmp, prepared_doc_bytes(note_id, doc)?)?;
     std::fs::rename(&tmp, note_dir.join(AING_DOC_FILE))?;
     Ok(())
 }

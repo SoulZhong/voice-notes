@@ -28,10 +28,24 @@ impl NoteLock {
     /// 录制/转码,持锁数秒~数分钟)则全部失败返回 None。生产编辑/录制路径与并发单测
     /// 都应走这里,而非裸 try_exclusive(后者留给需断言"立即拒绝"语义的场景)。
     pub fn acquire(dir: &Path) -> std::io::Result<Option<NoteLock>> {
+        Self::acquire_opened(|| {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(dir.join(LOCK_FILE))
+        })
+    }
+
+    /// 与 [`acquire`] 相同的有界重试，但锁文件由调用者打开。句柄锚定目录的写入
+    /// 用它通过 `openat` / reparse-safe handle 打开 `.note.lock`，避免先安全检查、
+    /// 后按路径重新解析目录的竞态。
+    pub(crate) fn acquire_opened(
+        mut open: impl FnMut() -> std::io::Result<File>,
+    ) -> std::io::Result<Option<NoteLock>> {
         const RETRIES: u32 = 5;
         const BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
         for attempt in 0..RETRIES {
-            match Self::try_exclusive(dir)? {
+            match Self::try_exclusive_file(open()?)? {
                 Some(lock) => return Ok(Some(lock)),
                 None if attempt + 1 < RETRIES => std::thread::sleep(BACKOFF),
                 None => {}
@@ -42,7 +56,14 @@ impl NoteLock {
 
     /// 非阻塞尝试独占。Ok(None) = 已被其他持有者(进程或本进程另一句柄)占用。
     pub fn try_exclusive(dir: &Path) -> std::io::Result<Option<NoteLock>> {
-        let f = OpenOptions::new().create(true).write(true).open(dir.join(LOCK_FILE))?;
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir.join(LOCK_FILE))?;
+        Self::try_exclusive_file(f)
+    }
+
+    fn try_exclusive_file(f: File) -> std::io::Result<Option<NoteLock>> {
         match f.try_lock() {
             Ok(()) => Ok(Some(NoteLock { _file: f })),
             Err(TryLockError::WouldBlock) => Ok(None),
