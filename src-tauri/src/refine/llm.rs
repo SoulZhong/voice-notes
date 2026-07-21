@@ -9,7 +9,7 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence,valid_from/valid_to 可为 null。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
+const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
 
 pub struct LlmConfig {
     pub base_url: String,
@@ -279,12 +279,11 @@ fn do_call_chunk(
         .as_str()
         .ok_or_else(|| ChunkErr::Content(anyhow::anyhow!("响应缺 choices[0].message.content")))?;
     let parsed: Value = serde_json::from_str(content).map_err(|e| ChunkErr::Content(e.into()))?;
-    let texts_out: Vec<String> = parsed["texts"]
-        .as_array()
-        .ok_or_else(|| ChunkErr::Content(anyhow::anyhow!("响应缺 texts 数组")))?
-        .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
-        .collect();
+    let texts_value = parsed
+        .get("texts")
+        .ok_or_else(|| ChunkErr::Content(anyhow::anyhow!("响应缺 texts 数组")))?;
+    let texts_out: Vec<String> = serde_json::from_value(texts_value.clone())
+        .map_err(|error| ChunkErr::Content(anyhow::anyhow!("texts 必须是纯字符串数组: {error}")))?;
     if texts_out.len() != expect_len {
         return Err(ChunkErr::Content(anyhow::anyhow!(
             "texts 长度不符: 期望 {} 实得 {}",
@@ -594,6 +593,33 @@ mod tests {
         let (outcome, _ents, _relations) = polish(&cfg, &mut ps, None);
         assert!(matches!(outcome, LlmOutcome::Partial(1)));
         assert_eq!(ps[0].text, "原文一", "长度不符必须保留原文");
+    }
+
+    #[test]
+    fn non_string_text_items_make_the_whole_chunk_unusable() {
+        for bad in [json!(null), json!(7), json!({"text": "伪装对象"})] {
+            let content = json!({
+                "glossary": {},
+                "texts": [bad],
+                "entities": [{"name": "不应采纳", "kind": "term"}],
+                "relations": []
+            })
+            .to_string();
+            let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+            let cfg = LlmConfig {
+                base_url: mock_server(vec![body]),
+                model: "m".into(),
+                api_key: "k".into(),
+            };
+            let mut ps = vec![para("原文")];
+
+            let (outcome, entities, relations) = polish(&cfg, &mut ps, None);
+
+            assert!(matches!(outcome, LlmOutcome::Partial(1)));
+            assert_eq!(ps[0].text, "原文", "坏块必须完整保留原文");
+            assert!(entities.is_empty(), "坏块实体不得混入整篇结果");
+            assert!(relations.is_empty(), "坏块关系不得被视为完整结果");
+        }
     }
 
     #[test]

@@ -26,16 +26,16 @@ fn resolve_entity<'a>(
     endpoint: &str,
     issues: &mut Vec<ValidationIssue>,
 ) -> Option<&'a crate::store::Entity> {
-    let key = name.trim().to_lowercase();
+    let key = super::entity_key(name);
     let matches = doc
         .entities
         .iter()
         .filter(|entity| {
-            entity.name.trim().to_lowercase() == key
+            super::entity_key(&entity.name) == key
                 || entity
                     .aliases
                     .iter()
-                    .any(|alias| alias.trim().to_lowercase() == key)
+                    .any(|alias| super::entity_key(alias) == key)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -399,6 +399,83 @@ mod tests {
 
         assert_eq!(graph.relations[0].subject, "ent_1");
         assert_eq!(graph.relations[0].object, "ent_2");
+    }
+
+    #[test]
+    fn resolves_full_unicode_case_folded_endpoints() {
+        let doc = doc(
+            "Straße 负责 Projekt",
+            vec![
+                entity("ent_1", "Straße", &[]),
+                entity("ent_2", "Projekt", &[]),
+            ],
+            vec![
+                Mention {
+                    id: String::new(),
+                    entity: "ent_1".into(),
+                    start: 0,
+                    end: 6,
+                },
+                Mention {
+                    id: String::new(),
+                    entity: "ent_2".into(),
+                    start: 10,
+                    end: 17,
+                },
+            ],
+        );
+
+        let graph = materialize(
+            "note-1",
+            &doc,
+            vec![raw("STRASSE", "projekt", 0, 17, "Straße 负责 Projekt")],
+        )
+        .unwrap();
+
+        assert_eq!(graph.relations[0].subject, "ent_1");
+    }
+
+    #[test]
+    fn unicode_case_fold_collisions_are_ambiguous() {
+        let doc = doc(
+            "Straße 负责 Projekt",
+            vec![
+                entity("ent_1", "Straße", &[]),
+                entity("ent_2", "STRASSE", &[]),
+                entity("ent_3", "Projekt", &[]),
+            ],
+            vec![
+                Mention {
+                    id: String::new(),
+                    entity: "ent_1".into(),
+                    start: 0,
+                    end: 6,
+                },
+                Mention {
+                    id: String::new(),
+                    entity: "ent_2".into(),
+                    start: 0,
+                    end: 6,
+                },
+                Mention {
+                    id: String::new(),
+                    entity: "ent_3".into(),
+                    start: 10,
+                    end: 17,
+                },
+            ],
+        );
+
+        let issues = materialize(
+            "note-1",
+            &doc,
+            vec![raw("strasse", "Projekt", 0, 17, "Straße 负责 Projekt")],
+        )
+        .unwrap_err();
+
+        assert!(issues.iter().any(|issue| {
+            issue.field == "relations[0].subject" && issue.message.contains("ambiguous")
+        }));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use super::notelock::NoteLock;
+
 pub const REFINED_SCHEMA_VERSION: u32 = 2;
 
 /// 每笔记修订稿产物文件名(人读真值)。
@@ -87,7 +89,13 @@ pub struct RefinedDoc {
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
-pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
+/// 已持有该笔记 `NoteLock` 时使用的底层原子写。把锁凭据作为参数，避免调用者
+/// 意外绕开跨进程互斥，也避免 Aing 管线在锁内重入公共 writer。
+pub(crate) fn write_refined_atomic_locked(
+    note_dir: &Path,
+    doc: &RefinedDoc,
+    _lock: &NoteLock,
+) -> anyhow::Result<()> {
     let mut doc = doc.clone();
     let note_id = note_dir
         .file_name()
@@ -100,22 +108,67 @@ pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result
     Ok(())
 }
 
+/// 公共整份写入同样服从笔记级跨进程锁；所有 aing.json writer 因而共享一条
+/// 串行化边界，固定的 `.tmp` 文件也不会被并发写者竞写。
+pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
+    let lock = NoteLock::acquire(note_dir)?
+        .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
+    write_refined_atomic_locked(note_dir, doc, &lock)
+}
+
+fn ensure_ids(note_dir: &Path, mut doc: RefinedDoc) -> Option<RefinedDoc> {
+    let note_id = note_dir.file_name()?.to_str()?;
+    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+    Some(doc)
+}
+
+/// `Some(None)` 表示文件不存在；`None` 表示文件存在但读/解析失败。后者不能回退
+/// 旧文件，否则损坏的新真值会被旧快照静默覆盖。
+fn load_aing_file(note_dir: &Path) -> Option<Option<RefinedDoc>> {
+    match std::fs::read(note_dir.join(AING_DOC_FILE)) {
+        Ok(bytes) => {
+            let doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+            Some(Some(ensure_ids(note_dir, doc)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+fn load_legacy_file(note_dir: &Path) -> Option<RefinedDoc> {
+    let bytes = std::fs::read(note_dir.join(LEGACY_REFINED_FILE)).ok()?;
+    let doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
+    ensure_ids(note_dir, doc)
+}
+
+/// 已持有 NoteLock 的加载路径。旧稿迁移也复用同一锁内 writer，避免重入。
+pub(crate) fn load_refined_locked(note_dir: &Path, lock: &NoteLock) -> Option<RefinedDoc> {
+    match load_aing_file(note_dir)? {
+        Some(doc) => Some(doc),
+        None => {
+            let doc = load_legacy_file(note_dir)?;
+            // 迁移落盘失败不致命(下次加载再试),旧文件不删。
+            let _ = write_refined_atomic_locked(note_dir, &doc, lock);
+            Some(doc)
+        }
+    }
+}
+
 /// 读修订稿:优先 `aing.json`;缺失时从旧 `refined.json` 一次性迁移(读旧格式→写
 /// aing.json,旧文件保留供回滚)。两者皆无或损坏 → None(UI 回落原始逐字稿)。
 pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
-    if let Ok(bytes) = std::fs::read(note_dir.join(AING_DOC_FILE)) {
-        let mut doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
-        let note_id = note_dir.file_name()?.to_str()?;
-        crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
-        return Some(doc);
+    match load_aing_file(note_dir)? {
+        Some(doc) => Some(doc),
+        None => match NoteLock::acquire(note_dir) {
+            Ok(Some(lock)) => load_refined_locked(note_dir, &lock),
+            // 另一 writer 正持锁时仍可读已有的完整原子快照；若它尚未产生
+            // aing.json，则暂时返回旧稿但绝不在无锁状态迁移。
+            _ => match load_aing_file(note_dir)? {
+                Some(doc) => Some(doc),
+                None => load_legacy_file(note_dir),
+            },
+        },
     }
-    let bytes = std::fs::read(note_dir.join(LEGACY_REFINED_FILE)).ok()?;
-    let mut doc: RefinedDoc = serde_json::from_slice(&bytes).ok()?;
-    let note_id = note_dir.file_name()?.to_str()?;
-    crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
-    // 迁移落盘;失败不致命(下次加载再试),旧文件不删
-    let _ = write_refined_atomic(note_dir, &doc);
-    Some(doc)
 }
 
 /// aing.json 或旧 refined.json 是否存在(供「是否有修订稿」判断,迁移感知)。
@@ -123,9 +176,8 @@ pub fn aing_exists(note_dir: &Path) -> bool {
     note_dir.join(AING_DOC_FILE).exists() || note_dir.join(LEGACY_REFINED_FILE).exists()
 }
 
-/// refined.json 编辑锁:改名/关联是 read-modify-write,无互斥的并发调用会互相覆盖
-/// 丢更新(与 notes.rs EDIT_LOCK 同一哲学,独立锁——修订稿编辑与笔记编辑互不相干)。
-/// Aing 管线整写 refined.json 的竞争由命令层「Aing 中拒绝编辑」guard 挡住,不进此锁。
+/// 同进程 read-modify-write 串行锁。跨进程边界始终是 NoteLock；两把锁同时需要
+/// 时固定按 NoteLock → REFINED_EDIT_LOCK 获取，杜绝反序死锁。
 static REFINED_EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 锁内 read-modify-write 骨架:加载 → 就地修改 → 原子落盘。缺失/损坏 → Err
@@ -134,11 +186,15 @@ fn update_refined(
     note_dir: &Path,
     f: impl FnOnce(&mut RefinedDoc) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let _guard = REFINED_EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut doc =
-        load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("修订稿不存在或已损坏"))?;
+    let note_lock = NoteLock::acquire(note_dir)?
+        .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
+    let _process_guard = REFINED_EDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut doc = load_refined_locked(note_dir, &note_lock)
+        .ok_or_else(|| anyhow::anyhow!("修订稿不存在或已损坏"))?;
     f(&mut doc)?;
-    write_refined_atomic(note_dir, &doc)
+    write_refined_atomic_locked(note_dir, &doc, &note_lock)
 }
 
 /// 修订稿说话人改名:该 speaker 的全部段落 name 置为新名。
@@ -482,6 +538,47 @@ mod tests {
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
+    }
+
+    #[test]
+    fn every_writer_respects_note_lock_and_locked_writer_can_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        write_doc(dir.path(), vec![para("R1", None, None, 0)]);
+        let original = std::fs::read(dir.path().join(AING_DOC_FILE)).unwrap();
+        let guard = crate::store::notelock::NoteLock::try_exclusive(dir.path())
+            .unwrap()
+            .unwrap();
+
+        let mut replacement = load_refined(dir.path()).unwrap();
+        replacement.paragraphs[0].text = "整份替换。".into();
+        assert!(
+            write_refined_atomic(dir.path(), &replacement).is_err(),
+            "公共整写也必须服从 NoteLock"
+        );
+        assert!(
+            apply_refined_texts(dir.path(), &[(0, "局部替换。".into())], "m").is_err(),
+            "公共 read-modify-write 必须服从同一把 NoteLock"
+        );
+        assert!(
+            rename_refined_speaker(dir.path(), "R1", "新名字").is_err(),
+            "改名 writer 必须服从同一把 NoteLock"
+        );
+        assert!(
+            assign_refined_person(dir.path(), "R1", "P1", "人物").is_err(),
+            "人物关联 writer 必须服从同一把 NoteLock"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(AING_DOC_FILE)).unwrap(),
+            original,
+            "抢锁失败的写入不能触碰盘上真值"
+        );
+
+        write_refined_atomic_locked(dir.path(), &replacement, &guard).unwrap();
+        drop(guard);
+        assert_eq!(
+            load_refined(dir.path()).unwrap().paragraphs[0].text,
+            "整份替换。"
+        );
     }
 
     #[test]
