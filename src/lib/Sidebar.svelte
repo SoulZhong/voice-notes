@@ -1212,18 +1212,23 @@
       pointer-events: none;
       border-right: 1px solid var(--hairline-strong);
       box-shadow: var(--shadow-popover);
-      transition: transform 180ms ease, visibility 180ms;
+      transition:
+        transform 240ms cubic-bezier(0.16, 1, 0.3, 1),
+        visibility 0s linear 240ms;
     }
     .sidebar.graph-mode .panel.drawer-open {
       transform: translateX(0);
       visibility: visible;
       pointer-events: auto;
+      transition-delay: 0s;
     }
     .graph-drawer-toggle {
       display: grid;
       place-items: center;
-      min-height: 44px;
-      margin: 4px;
+      width: 44px;
+      height: 44px;
+      box-sizing: border-box;
+      margin: 4px 0;
       padding: 7px 3px;
       border: 1px solid var(--hairline-strong);
       border-radius: var(--radius-md);
@@ -1262,6 +1267,8 @@
     }
   }
   @media (pointer: coarse) {
+    .sidebar.graph-mode .panel button,
+    .sidebar.graph-mode .panel input { min-height: 44px; }
     .path-start { width: 44px; height: 44px; right: 0.1rem; }
     .entity-row .item.entity { padding-right: 3.2rem; }
   }
