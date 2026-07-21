@@ -2112,15 +2112,29 @@ fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>,
 /// 改实体显示名。很多录音提取的名字不对(ASR 同音异写),这是纠错入口——与查询类命令不同,
 /// 这是写操作,失败要如实报给用户(不能静默降级)。人实体委托声纹库改名(id 不变);非人
 /// 实体 id 随名字重算,撞已存在实体自动合并。
-#[tauri::command]
-fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
+fn rename_entity_with_rebuild(
+    root: PathBuf,
+    id: String,
+    new_name: String,
+    queue_person_rebuild: impl FnOnce(PathBuf) -> Result<(), String>,
+) -> Result<ipc::RenameEntityResult, String> {
     let is_person = !id.starts_with("e:");
     let outcome = graph::rename_entity(&root, &id, &new_name).map_err(|e| e.to_string())?;
     if is_person {
-        queue_person_graph_rebuild(&app, root, "人物改名")?;
+        queue_person_rebuild(root)?;
     }
-    Ok(ipc::RenameEntityResult { new_id: outcome.new_id, merged: outcome.merged })
+    Ok(ipc::RenameEntityResult {
+        new_id: outcome.new_id,
+        merged: outcome.merged,
+    })
+}
+
+#[tauri::command]
+fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    rename_entity_with_rebuild(root, id, new_name, |root| {
+        queue_person_graph_rebuild(&app, root, "人物改名")
+    })
 }
 
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
@@ -3908,6 +3922,52 @@ mod tests {
         assert!(error.contains("人物合并已保存"));
         assert!(error.contains("索引待重试"));
         assert!(error.contains("自动重试"));
+    }
+
+    #[test]
+    fn compat_graph_failure_after_person_rename_still_requests_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"P1": {"name": "张三"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join(crate::graph::GRAPH_FILE)).unwrap();
+        let spawn_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawn_called_for_scheduler = std::sync::Arc::clone(&spawn_called);
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(crate::graph::index::BuildStats::default()),
+            move |_job| {
+                spawn_called_for_scheduler.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other("injected spawn failure"))
+            },
+        );
+
+        let error = super::rename_entity_with_rebuild(
+            root.path().to_path_buf(),
+            "P1".into(),
+            "张三丰".into(),
+            |root| {
+                super::queue_person_graph_rebuild_with(
+                    &scheduler,
+                    root,
+                    "人物改名",
+                    |_| {},
+                )
+            },
+        )
+        .unwrap_err();
+
+        let people = crate::store::VoiceprintStore::new(root.path().to_path_buf()).load();
+        assert_eq!(people.people["P1"].name, "张三丰");
+        assert!(spawn_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(root.path().join(".graph-index-dirty").is_file());
+        assert!(error.contains("人物改名已保存"));
+        assert!(error.contains("索引待重试"));
     }
 
     #[test]

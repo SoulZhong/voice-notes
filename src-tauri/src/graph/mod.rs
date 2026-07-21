@@ -225,14 +225,27 @@ pub(crate) fn rename_entity(data_root: &Path, old_id: &str, new_name: &str) -> a
     if !old_id.starts_with("e:") {
         // 人实体:id 是 person_id,不随名字变;真值源是声纹库。
         store::VoiceprintStore::new(data_root.to_path_buf()).rename(old_id, new_name)?;
-        let _guard = GRAPH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let conn = open(data_root)?;
+        let _guard = GRAPH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 现地更新图谱展示名,失败不影响改名本身(声纹库已是真值源,图谱下次 upsert 会追上)。
-        let _ = conn.execute(
-            "UPDATE entities SET name = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![new_name, chrono::Local::now().to_rfc3339(), old_id],
-        );
-        return Ok(RenameOutcome { new_id: old_id.to_string(), merged: false });
+        match open(data_root) {
+            Ok(conn) => {
+                if let Err(error) = conn.execute(
+                    "UPDATE entities SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![new_name, chrono::Local::now().to_rfc3339(), old_id],
+                ) {
+                    eprintln!("人物改名已保存，但兼容图谱名称同步失败({old_id}): {error:#}");
+                }
+            }
+            Err(error) => {
+                eprintln!("人物改名已保存，但兼容图谱打开失败({old_id}): {error:#}");
+            }
+        }
+        return Ok(RenameOutcome {
+            new_id: old_id.to_string(),
+            merged: false,
+        });
     }
 
     let new_id = format!("e:{}", norm(new_name));
@@ -845,6 +858,26 @@ mod tests {
         assert!(!outcome.merged);
         let vp = store::VoiceprintStore::new(root.path().to_path_buf()).load();
         assert_eq!(vp.people["P1"].name, "张三丰", "声纹库才是人物改名的真值源");
+    }
+
+    #[test]
+    fn rename_entity_person_survives_compat_graph_open_failure() {
+        let root = tempfile::tempdir().unwrap();
+        write_vp(
+            root.path(),
+            r#"{"schema_version":1,"next_person":2,"people":{"P1":{"name":"张三"}}}"#,
+        );
+        std::fs::create_dir(root.path().join(GRAPH_FILE)).unwrap();
+
+        let outcome = rename_entity(root.path(), "P1", "张三丰").unwrap();
+
+        assert_eq!(outcome.new_id, "P1");
+        assert!(!outcome.merged);
+        let vp = store::VoiceprintStore::new(root.path().to_path_buf()).load();
+        assert_eq!(
+            vp.people["P1"].name, "张三丰",
+            "canonical rename remains committed"
+        );
     }
 
     #[test]
