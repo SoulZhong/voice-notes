@@ -1,7 +1,7 @@
-//! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini /
-//! Cursor),让它经自家 MCP server(`voice-notes mcp serve`)读修订稿并调
-//! `apply_refined_texts` 写回。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按
-//! settings.refine_provider 二选一。
+//! A2 Aing 的 Agent provider:spawn 本机 Agent CLI(Claude Code / Codex / Gemini),
+//! 让它经自家 MCP server(`voice-notes mcp serve`)完成文本与图谱写回。Cursor CLI
+//! 仍可探测/生成标题，但其 headless 模式无法结构性关闭 write/shell 与用户级 MCP，
+//! 因而完整 Aing fail closed。与 llm.rs 的 HTTP provider 并列,由 lib.rs 按设置选择。
 //!
 //! 核心原则:**成败判定不信 Agent 的任何输出**——各家 CLI 输出格式互不相同且随版本
 //! 漂移,唯一可信的是盘上 aing.json(原 refined.json,见 store::refined 迁移)的终态
@@ -11,11 +11,10 @@
 //!
 //! 每次调用在系统临时目录建一次性工作区(scratch dir)作为子进程 cwd:
 //! - 隔离:避免 Agent 把用户某个项目目录当工作区,加载到无关的项目级配置/记忆;
-//! - 注入:Gemini(.gemini/settings.json)与 Cursor(.cursor/mcp.json)只认工作区
-//!   配置文件,MCP server 条目写在这里;Claude 用内联 --mcp-config + --strict-mcp-config,
-//!   Codex 用 -c 覆盖,均不落盘、不碰用户全局配置。
+//! - 注入:Gemini 的 `.gemini/settings.json` 写进一次性工作区；Claude 用内联
+//!   --mcp-config + --strict-mcp-config，Codex 用 -c 覆盖，均不碰用户全局配置。
 
-use crate::store::{load_refined, RefinedParagraph};
+use crate::store::{load_refined, RefinedDoc, RefinedParagraph};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -25,6 +24,8 @@ pub const REFINE_TIMEOUT_S: u64 = 900;
 pub const TITLE_TIMEOUT_S: u64 = 120;
 /// 「测试运行」探测的超时:只验能启动+能产出,远短于 Aing 的 REFINE_TIMEOUT_S。
 pub const PROBE_TIMEOUT_S: u64 = 60;
+
+type RefineProcessResult = anyhow::Result<(Vec<String>, bool, String, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -165,7 +166,7 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
 
 /// Aing 指令。与 llm.rs SYSTEM_PROMPT 同一套四类修订规则,但流程改为「读稿→修订→
 /// 工具写回」;各家 CLI 对 MCP 工具的暴露名前缀不同(claude 是 mcp__server__tool,
-/// gemini/cursor 是裸名),提示词里只用裸名,由各家自行映射。
+/// gemini 是裸名),提示词里只用裸名,由各家自行映射。
 fn refine_prompt(note_id: &str) -> String {
     format!(
         "你是会议逐字稿精修与语义图谱助手。任务:完成 voice-notes 笔记 {note_id} 的文本与图谱 Aing。\n\
@@ -205,7 +206,7 @@ fn self_exe() -> anyhow::Result<PathBuf> {
     Ok(std::env::current_exe()?)
 }
 
-/// mcpServers JSON 条目(claude 内联 / gemini settings.json / cursor mcp.json 共用形状)。
+/// mcpServers JSON 条目(Claude 内联 / Gemini settings.json 共用形状)。
 fn mcp_servers_json(exe: &Path) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
@@ -307,27 +308,12 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
             }
         }
         AgentKind::Cursor => {
-            // cursor-agent 只认工作区 .cursor/mcp.json;--trust 免首次信任交互,
-            // --approve-mcps 自动批准 MCP server。不给 --force(那是放行 shell 命令的)。
-            let dir = scratch.join(".cursor");
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(
-                dir.join("mcp.json"),
-                serde_json::to_vec_pretty(&mcp_servers_json(exe))?,
-            )?;
-            cmd.args([
-                "-p",
-                prompt,
-                "--output-format",
-                "text",
-                "--trust",
-                "--approve-mcps",
-            ])
-            .arg("--workspace")
-            .arg(scratch);
-            if !model.is_empty() {
-                cmd.args(["--model", model]);
-            }
+            // cursor-agent 2026.04 的 --print 明确启用全部 write/shell 工具，且
+            // .cursor/mcp.json 会与 ~/.cursor/mcp.json 合并；CLI 没有 strict-config
+            // 或 tool allowlist。不能把 prompt 当安全边界，因此 Agent Aing 必须拒绝。
+            anyhow::bail!(
+                "Cursor Agent 当前无法把工具结构性限制为 voice-notes 四个 Aing 工具；为防止文件/shell 或用户级 MCP 绕过约束，本次 Aing 已安全拒绝"
+            );
         }
     }
     Ok(cmd)
@@ -494,8 +480,8 @@ fn make_scratch(tag: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Agent Aing 主入口。前置:管线刚整写过 aing.json(stages.llm=="off")。
-/// 成功判据(与 Agent 输出无关):跑完后盘上 aing.json 可读且 stages.llm=="done"、
-/// 段落数不变(写回工具本就不可能改段落数,这里是对「Agent 绕开工具直写文件」的兜底)。
+/// 成功判据(与 Agent 输出无关):段落数不变，盘上 llm/entities/relations 全 done，
+/// 且 extraction source hash 等于最终文本。spawn/wait/timeout Err 后同样重读终态。
 /// log=Some 时整轮调用(命令行+提示词+stdout/stderr+以盘上判定的结果)记入 AI 日志。
 ///
 /// 基线读取经 `load_refined`——它对旧笔记(只有 refined.json、尚未迁移)一样迁移感知,
@@ -517,7 +503,7 @@ pub fn run_refine(
     let scratch = make_scratch(note_id)?;
     let prompt = refine_prompt(note_id);
     let started = std::time::Instant::now();
-    let result = (|| -> anyhow::Result<(Vec<String>, bool, String, String)> {
+    let result: RefineProcessResult = (|| {
         let exe = self_exe()?;
         let cmd = refine_command(kind, bin, model, &prompt, &exe, &scratch)?;
         let args: Vec<String> = cmd
@@ -527,49 +513,9 @@ pub fn run_refine(
         let (exit_ok, stdout, err_tail) = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S)?;
         Ok((args, exit_ok, stdout, err_tail))
     })();
-    let verdict: anyhow::Result<()> = match &result {
-        Err(e) => Err(anyhow::anyhow!("{e}")),
-        Ok((_, exit_ok, _, err_tail)) => (|| {
-            let after =
-                load_refined(note_dir).ok_or_else(|| anyhow::anyhow!("跑完后 aing.json 不可读"))?;
-            anyhow::ensure!(
-                after.paragraphs.len() == before.paragraphs.len(),
-                "段落数改变({} → {}),疑似绕开写回工具,判失败",
-                before.paragraphs.len(),
-                after.paragraphs.len()
-            );
-            anyhow::ensure!(
-                after.stages.llm == "done",
-                "Agent 未完成写回(exit_ok={exit_ok},盘上 llm={});stderr 尾部:\n{err_tail}",
-                after.stages.llm
-            );
-            let current_hash = crate::store::source_hash(&after.paragraphs);
-            let graph_error = if after.stages.entities != "done" {
-                Some(format!("entities={}", after.stages.entities))
-            } else if after.stages.relations != "done" {
-                Some(format!("relations={}", after.stages.relations))
-            } else if after
-                .graph_extraction
-                .as_ref()
-                .map(|extraction| extraction.source_hash.as_str())
-                != Some(current_hash.as_str())
-            {
-                Some("graph_extraction.source_hash 与最终文本不一致".into())
-            } else {
-                None
-            };
-            if let Some(graph_error) = graph_error {
-                let mark_error = mark_graph_failed(note_dir).err();
-                let suffix = mark_error
-                    .map(|error| format!(";失败状态落盘失败:{error}"))
-                    .unwrap_or_default();
-                anyhow::bail!(
-                    "Agent 图谱写回失败(exit_ok={exit_ok},{graph_error});stderr 尾部:\n{err_tail}{suffix}"
-                );
-            }
-            Ok(())
-        })(),
-    };
+    // 即使 spawn/wait/timeout 返回 Err，也必须以最新盘上状态判定：Agent 可能已先经
+    // apply_refined_texts 提交文本，随后才挂住。此时不能绕过统一的图谱失败收口。
+    let verdict = evaluate_refine_result(note_dir, &before, &result);
     if let Some(ctx) = log {
         let response = match &result {
             Ok((_, exit_ok, stdout, err_tail)) => serde_json::json!({
@@ -597,6 +543,76 @@ pub fn run_refine(
     }
     let _ = std::fs::remove_dir_all(&scratch);
     verdict
+}
+
+fn evaluate_refine_result(
+    note_dir: &Path,
+    before: &RefinedDoc,
+    result: &RefineProcessResult,
+) -> anyhow::Result<()> {
+    let after = match load_refined(note_dir) {
+        Some(after) => after,
+        None => {
+            if let Err(error) = result {
+                return Err(anyhow::anyhow!("{error}"));
+            }
+            anyhow::bail!("跑完后 aing.json 不可读");
+        }
+    };
+    let paragraph_error = (after.paragraphs.len() != before.paragraphs.len()).then(|| {
+        format!(
+            "段落数改变({} → {}),疑似绕开写回工具",
+            before.paragraphs.len(),
+            after.paragraphs.len()
+        )
+    });
+    if after.stages.llm == "done" {
+        let current_hash = crate::store::source_hash(&after.paragraphs);
+        let graph_error = paragraph_error
+            .or_else(|| {
+                (after.stages.entities != "done")
+                    .then(|| format!("entities={}", after.stages.entities))
+            })
+            .or_else(|| {
+                (after.stages.relations != "done")
+                    .then(|| format!("relations={}", after.stages.relations))
+            })
+            .or_else(|| {
+                (after
+                    .graph_extraction
+                    .as_ref()
+                    .map(|extraction| extraction.source_hash.as_str())
+                    != Some(current_hash.as_str()))
+                .then(|| "graph_extraction.source_hash 与最终文本不一致".into())
+            });
+        if let Some(graph_error) = graph_error {
+            let runtime = match result {
+                Ok((_, exit_ok, _, err_tail)) => {
+                    format!("exit_ok={exit_ok};stderr 尾部:\n{err_tail}")
+                }
+                Err(error) => format!("执行错误:{error}"),
+            };
+            let mark_error = mark_graph_failed(note_dir).err();
+            let suffix = mark_error
+                .map(|error| format!(";失败状态落盘失败:{error}"))
+                .unwrap_or_default();
+            anyhow::bail!("Agent 图谱写回失败({graph_error};{runtime}){suffix}");
+        }
+        // 与既有语义一致：盘上完整终态是真值；CLI 非零退出或终态落盘后的
+        // wait 错误不应把已经原子提交的完整结果误判失败。
+        return Ok(());
+    }
+
+    if let Some(paragraph_error) = paragraph_error {
+        anyhow::bail!("{paragraph_error},判失败");
+    }
+    match result {
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+        Ok((_, exit_ok, _, err_tail)) => anyhow::bail!(
+            "Agent 未完成写回(exit_ok={exit_ok},盘上 llm={});stderr 尾部:\n{err_tail}",
+            after.stages.llm
+        ),
+    }
 }
 
 fn mark_graph_failed(note_dir: &Path) -> anyhow::Result<()> {
@@ -832,13 +848,31 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
     }
 
     #[test]
-    fn every_refine_command_selects_the_agent_only_mcp_surface() {
-        for kind in [
-            AgentKind::Claude,
-            AgentKind::Codex,
-            AgentKind::Gemini,
+    fn cursor_refine_fails_closed_without_a_structural_tool_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = refine_command(
             AgentKind::Cursor,
-        ] {
+            Path::new("/bin/echo"),
+            "",
+            "P",
+            Path::new("/app/vn"),
+            tmp.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Cursor") && error.contains("工具"),
+            "必须明确说明为何安全拒绝 Cursor Agent Aing: {error}"
+        );
+        assert!(
+            !tmp.path().join(".cursor/mcp.json").exists(),
+            "拒绝路径不得写出一个会与用户级 MCP 合并的不安全配置"
+        );
+    }
+
+    #[test]
+    fn every_supported_refine_command_selects_the_agent_only_mcp_surface() {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini] {
             let tmp = tempfile::tempdir().unwrap();
             let cmd = refine_command(
                 kind,
@@ -887,10 +921,8 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
                         ])
                     );
                 }
-                AgentKind::Cursor => {
-                    assert!(!args.iter().any(|arg| arg == "--force" || arg == "--yolo"))
-                }
                 AgentKind::Claude => {}
+                AgentKind::Cursor => unreachable!("Cursor 在单独的 fail-closed 测试覆盖"),
             }
         }
     }
@@ -908,7 +940,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
     }
 
     #[test]
-    fn refine_command_gemini_and_cursor_write_workspace_configs() {
+    fn refine_command_gemini_writes_a_strict_workspace_config() {
         let tmp = tempfile::tempdir().unwrap();
         let _ = refine_command(
             AgentKind::Gemini,
@@ -928,29 +960,6 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
             gemini["coreTools"],
             serde_json::json!([]),
             "内置工具必须全关,yolo 才收得住面"
-        );
-        let tmp2 = tempfile::tempdir().unwrap();
-        let cmd = refine_command(
-            AgentKind::Cursor,
-            Path::new("/bin/echo"),
-            "",
-            "P",
-            Path::new("/app/vn"),
-            tmp2.path(),
-        )
-        .unwrap();
-        let cursor: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp2.path().join(".cursor/mcp.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(cursor["mcpServers"]["voice-notes"]["args"][0], "mcp");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !args.contains(&"--force".to_string()),
-            "不得放行 shell 命令"
         );
     }
 
@@ -1051,6 +1060,48 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         assert_eq!(after.stages.relations, "failed");
         assert_eq!(after.entities, before.entities);
         assert_eq!(after.relations, before.relations);
+        assert_eq!(after.graph_extraction, before.graph_extraction);
+    }
+
+    #[test]
+    fn run_refine_marks_graph_failed_when_agent_times_out_after_text_commit() {
+        let note = tempfile::tempdir().unwrap();
+        let mut before = graph_done_doc(&["张三使用 Rust"]);
+        before.stages.llm = "off".into();
+        before.entities = vec![crate::store::Entity {
+            id: "ent_old".into(),
+            kind: "person".into(),
+            name: "张三".into(),
+            aliases: vec![],
+        }];
+        before.paragraphs[0].mentions = vec![crate::store::Mention {
+            id: "mn_old".into(),
+            entity: "ent_old".into(),
+            start: 0,
+            end: 2,
+        }];
+        write_refined_atomic(note.path(), &before).unwrap();
+
+        let mut text_only = before.clone();
+        text_only.stages.llm = "done".into();
+        text_only.paragraphs[0].text = "张三改用 Go".into();
+        write_refined_atomic(note.path(), &text_only).unwrap();
+
+        let timeout: RefineProcessResult = Err(anyhow::anyhow!("Agent 进程超时(3s),已杀"));
+        let error = evaluate_refine_result(note.path(), &before, &timeout)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("图谱") && error.contains("超时"),
+            "文本提交后的执行错误必须归类为图谱失败: {error}"
+        );
+        let after = load_refined(note.path()).unwrap();
+        assert_eq!(after.paragraphs[0].text, "张三改用 Go");
+        assert_eq!(after.stages.llm, "done");
+        assert_eq!(after.stages.entities, "failed");
+        assert_eq!(after.stages.relations, "failed");
+        assert_eq!(after.entities, before.entities);
+        assert_eq!(after.paragraphs[0].mentions, before.paragraphs[0].mentions);
         assert_eq!(after.graph_extraction, before.graph_extraction);
     }
 
