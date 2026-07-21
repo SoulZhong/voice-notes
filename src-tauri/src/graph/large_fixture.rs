@@ -19,7 +19,7 @@ fn entity_id(index: usize) -> String {
     format!("kg_{index:04}")
 }
 
-fn deterministic_large_graph() -> CanonicalGraph {
+pub(crate) fn deterministic_large_graph() -> CanonicalGraph {
     let entities = (0..ENTITY_COUNT)
         .map(|index| {
             let id = entity_id(index);

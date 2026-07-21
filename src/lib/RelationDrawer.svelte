@@ -15,10 +15,16 @@
     relationId,
     onClose,
     onChanged,
+    relationLoader = relationDetail,
+    resolveEntityName,
+    readOnly = false,
   }: {
     relationId: string;
     onClose: () => void;
     onChanged: () => Promise<void>;
+    relationLoader?: (relationId: string) => Promise<RelationDetail | null>;
+    resolveEntityName?: (entityId: string) => string | undefined;
+    readOnly?: boolean;
   } = $props();
 
   let detail = $state<RelationDetail | null>(null);
@@ -60,7 +66,7 @@
     loading = true;
     loadError = "";
     try {
-      const value = await relationDetail(id);
+      const value = await relationLoader(id);
       if (current !== generation) return;
       detail = value;
       lastKnown = retainLastKnownRelation(value, lastKnown);
@@ -71,13 +77,18 @@
         predicateLabel = value.relation.predicate_label ?? "";
         validFrom = value.relation.valid_from ?? "";
         validTo = value.relation.valid_to ?? "";
-        const [subject, object] = await Promise.all([
-          semanticEntityDetail(value.relation.subject_id, entityFilter).catch(() => null),
-          semanticEntityDetail(value.relation.object_id, entityFilter).catch(() => null),
-        ]);
-        if (current !== generation) return;
-        subjectName = subject?.name ?? "";
-        objectName = object?.name ?? "";
+        if (resolveEntityName) {
+          subjectName = resolveEntityName(value.relation.subject_id) ?? "";
+          objectName = resolveEntityName(value.relation.object_id) ?? "";
+        } else {
+          const [subject, object] = await Promise.all([
+            semanticEntityDetail(value.relation.subject_id, entityFilter).catch(() => null),
+            semanticEntityDetail(value.relation.object_id, entityFilter).catch(() => null),
+          ]);
+          if (current !== generation) return;
+          subjectName = subject?.name ?? "";
+          objectName = object?.name ?? "";
+        }
       }
     } catch (cause) {
       if (current !== generation) return;
@@ -232,7 +243,11 @@
         <blockquote>
           <p>{item.quote}</p>
           <footer>
-            <a href={'/notes/' + encodeURIComponent(item.note_id) + '#paragraph-' + item.paragraph_index}>打开笔记 {item.note_id}</a>
+            {#if readOnly}
+              <span>隔离夹具笔记 {item.note_id}</span>
+            {:else}
+              <a href={'/notes/' + encodeURIComponent(item.note_id) + '#paragraph-' + item.paragraph_index}>打开笔记 {item.note_id}</a>
+            {/if}
             <span>第 {item.paragraph_index + 1} 段 · 字符 {item.start_offset}–{item.end_offset}</span>
             {#if item.source_seqs.length > 0}<span>时间片段序号 {item.source_seqs.join("、")}</span>{/if}
           </footer>
@@ -243,7 +258,13 @@
       {/if}
     </section>
 
-    <section class="section actions" aria-labelledby="relation-actions">
+    {#if readOnly}
+      <section class="section actions" aria-labelledby="relation-actions">
+        <h3 id="relation-actions">隔离调试</h3>
+        <p class="unavailable">这是只读隔离夹具；关系证据不会读取或修改真实资料库。</p>
+      </section>
+    {:else}
+      <section class="section actions" aria-labelledby="relation-actions">
       <h3 id="relation-actions">治理操作</h3>
       <div class="primary-actions">
         <button type="button" disabled={working} onclick={() => runOperation("正在确认关系", "关系已确认", buildConfirmRelation(relation.id))}>确认关系</button>
@@ -292,26 +313,31 @@
         </form>
         <p class="unavailable">当前关系详情 API 未返回旧版本对应的操作 ID，因此不提供会猜测 provenance 的恢复动作。本面板只能撤销当前会话内已知的上次操作。</p>
       </details>
-    </section>
+      </section>
+    {/if}
   {/if}
 
-  <div class="feedback-row">
-    <p id="relation-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
-    <div>
-      {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
-      {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLast}>撤销上次操作</button>{/if}
+  {#if !readOnly}
+    <div class="feedback-row">
+      <p id="relation-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
+      <div>
+        {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
+        {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLast}>撤销上次操作</button>{/if}
+      </div>
     </div>
-  </div>
+  {/if}
 </article>
 
-<dialog bind:this={suppressDialog} class="confirm-dialog" aria-labelledby="suppress-title" aria-describedby="suppress-description">
-  <h2 id="suppress-title">否决并永久抑制这条关系？</h2>
-  <p id="suppress-description">该主体、关系类型与客体组合会写入持久裁决；模型更换证据或重新抽取也不会自动恢复。</p>
-  <div>
-    <button type="button" onclick={() => suppressDialog?.close()}>保留这条关系</button>
-    <button class="danger" type="button" onclick={suppressRelation}>否决并抑制</button>
-  </div>
-</dialog>
+{#if !readOnly}
+  <dialog bind:this={suppressDialog} class="confirm-dialog" aria-labelledby="suppress-title" aria-describedby="suppress-description">
+    <h2 id="suppress-title">否决并永久抑制这条关系？</h2>
+    <p id="suppress-description">该主体、关系类型与客体组合会写入持久裁决；模型更换证据或重新抽取也不会自动恢复。</p>
+    <div>
+      <button type="button" onclick={() => suppressDialog?.close()}>保留这条关系</button>
+      <button class="danger" type="button" onclick={suppressRelation}>否决并抑制</button>
+    </div>
+  </dialog>
+{/if}
 
 <style>
   .drawer { color: var(--ink); }
