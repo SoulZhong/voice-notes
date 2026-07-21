@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { ask } from "@tauri-apps/plugin-dialog";
@@ -19,6 +20,9 @@
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
+  import { pendingReview } from "$lib/knowledge";
+  import { DEFAULT_KNOWLEDGE_FILTER } from "$lib/knowledgeView";
+  import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -89,6 +93,7 @@
 
   // ── 图谱:实体/文章两视角,列表作为主从结构的 master(搜索 + 过滤在侧栏,主区放画布)──
   let graphEnts = $state<EntitySummary[]>([]);
+  let pendingCount = $state(0);
   const graphNotes = $derived(noteGraphState.data.nodes); // 文章视角:节点=笔记(name=标题)
 
   async function refreshGraphEntities() {
@@ -98,8 +103,16 @@
       graphEnts = [];
     }
   }
+  async function refreshPendingCount() {
+    try {
+      pendingCount = (await pendingReview(DEFAULT_KNOWLEDGE_FILTER)).length;
+    } catch {
+      pendingCount = 0;
+    }
+  }
   $effect(() => {
     if (tab !== "graph") return;
+    void refreshPendingCount();
     if (graphFilter.mode === "note") {
       // error 不自动重试:否则 load() 写 status 会反向触发这个 effect，持续失败时形成
       // invoke 循环。主画布错误态的“重新加载”是唯一重试入口。
@@ -107,6 +120,12 @@
     } else {
       void refreshGraphEntities();
     }
+  });
+
+  onMount(() => {
+    const refreshPending = () => { if (tab === "graph") void refreshPendingCount(); };
+    window.addEventListener(KNOWLEDGE_CHANGED_EVENT, refreshPending);
+    return () => window.removeEventListener(KNOWLEDGE_CHANGED_EVENT, refreshPending);
   });
 
   const graphKinds = $derived.by(() => {
@@ -134,6 +153,12 @@
     return e.is_person
       ? "/speakers/" + encodeURIComponent(e.id)
       : "/graph?e=" + encodeURIComponent(e.id);
+  }
+  function openPendingReview() {
+    const url = new URL($page.url);
+    url.searchParams.set("review", "1");
+    url.searchParams.delete("r");
+    goto(url.pathname + url.search);
   }
 
   // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
@@ -446,6 +471,15 @@
       </svg>
       全局图谱
     </button>
+    <button
+      class="pending-entry"
+      class:current={$page.url.searchParams.get("review") === "1"}
+      aria-label={`打开待整理面板，共 ${pendingCount} 项`}
+      onclick={openPendingReview}
+    >
+      <span>待整理</span>
+      <span class="pending-count">{pendingCount}</span>
+    </button>
     <!-- 视角切换:实体视角(节点=实体、边=共现)/ 文章视角(节点=笔记、边=共享实体)。
          两视角是同一份图谱的对偶,segmented 分段控件切换,主区画布与侧栏列表同步。 -->
     <div class="gmode">
@@ -465,7 +499,7 @@
       type="search"
       name="graph-search"
       aria-label={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
-      placeholder={graphFilter.mode === "note" ? "搜索笔记标题…" : "搜索实体…"}
+      placeholder={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
       bind:value={graphFilter.query}
     />
     {#if graphFilter.mode === "entity"}
@@ -523,7 +557,7 @@
       </ul>
     {/if}
   {:else}
-  <input class="search" type="search" placeholder="按标题过滤…" bind:value={query} />
+  <input class="search" type="search" placeholder="按标题过滤" bind:value={query} />
 
   {#if error}
     <div class="banner">{error}</div>
@@ -806,6 +840,42 @@
   .graph-global:hover .graph-global-icon {
     color: var(--ink-secondary);
   }
+  .pending-entry {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0.25rem 0 0.15rem;
+    padding: 0.45rem 0.6rem;
+    border: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--ink-secondary);
+    font: inherit;
+    font-size: 0.84em;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pending-entry:hover,
+  .pending-entry.current { background: var(--surface-soft); color: var(--ink); }
+  .pending-entry:focus-visible,
+  .graph-global:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .pending-count {
+    min-width: 1.35em;
+    padding: 0.05em 0.42em;
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-full);
+    background: var(--warning-tint);
+    color: var(--warning-ink);
+    font-size: 0.72rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
   .tidy-badge {
     margin-left: auto;
     flex: none;
@@ -860,11 +930,11 @@
   .search::placeholder {
     color: var(--ink-faint);
   }
-  .search:focus {
-    outline: none;
+  .search:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
     background: var(--canvas);
     border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
   }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
   /* 视角切换分段控件:实体 / 文章 二选一。整块 surface-press 底 + 选中项白/accent
@@ -956,9 +1026,11 @@
     text-decoration: none;
     font-weight: 500;
     font-size: 0.92em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+  }
+  /* 图谱与治理内容始终保留完整名称；窄侧栏通过换行承担长度，而不是截断。 */
+  .item.entity .title {
+    white-space: normal;
   }
   .title:hover {
     color: var(--accent);
