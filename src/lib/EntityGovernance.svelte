@@ -331,22 +331,31 @@
   </section>
 
   <section class="section evidence" aria-labelledby="entity-evidence">
-    <h3 id="entity-evidence">证据</h3>
+    <h3 id="entity-evidence">{simple ? "关联笔记" : "证据"}</h3>
     {#if mentionsLoading}
-      <p class="empty-line">正在读取完整提及证据</p>
+      <p class="empty-line">{simple ? "正在读取关联笔记" : "正在读取完整提及证据"}</p>
     {:else}
-      {#each mentionGroups as group (group.noteId)}
-        <div class="note-group">
-          <a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a>
-          {#each group.items as mention (mention.id)}
-            <blockquote>
-              <p>{mention.quote}</p>
-              <footer>第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}</footer>
-            </blockquote>
+      {#if simple}
+        <ul class="source-notes">
+          {#each mentionGroups as group (group.noteId)}
+            <li><a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a></li>
           {/each}
-        </div>
-      {/each}
-      {#if mentions.length === 0}<p class="empty-line">没有可显示的提及证据</p>{/if}
+        </ul>
+        {#if mentionGroups.length === 0}<p class="empty-line">没有关联笔记</p>{/if}
+      {:else}
+        {#each mentionGroups as group (group.noteId)}
+          <div class="note-group">
+            <a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a>
+            {#each group.items as mention (mention.id)}
+              <blockquote>
+                <p>{mention.quote}</p>
+                <footer>第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}</footer>
+              </blockquote>
+            {/each}
+          </div>
+        {/each}
+        {#if mentions.length === 0}<p class="empty-line">没有可显示的提及证据</p>{/if}
+      {/if}
     {/if}
   </section>
 
@@ -406,6 +415,10 @@
   .empty-line { margin: 6px 0; color: var(--ink-faint); font-size: 0.78rem; }
   .note-group { padding: 12px 0; border-top: 1px solid var(--hairline); }
   .note-group > a { color: var(--accent); font-size: 0.78rem; text-decoration: none; overflow-wrap: anywhere; }
+  .source-notes { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+  .source-notes li { border-top: 1px solid var(--hairline); }
+  .source-notes a { display: block; padding: 12px 0; color: var(--accent); font-size: 0.82rem; text-decoration: none; overflow-wrap: anywhere; }
+  .source-notes a:hover { color: var(--ink); }
   blockquote { margin: 10px 0 0; padding: 0 0 0 12px; border-left: 2px solid var(--hairline-strong); }
   blockquote p { margin: 0; color: var(--ink); font-size: 0.86rem; line-height: 1.65; overflow-wrap: anywhere; }
   blockquote footer { margin-top: 4px; color: var(--ink-faint); font-size: 0.7rem; }

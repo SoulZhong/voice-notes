@@ -471,6 +471,16 @@ describe("governance UI source contract", () => {
     expect(sidebar).not.toContain("待整理");
   });
 
+  it("shows note-level evidence in ordinary details and reserves mention offsets for governance", () => {
+    const entity = source("./EntityGovernance.svelte");
+    expect(entity).toContain('class="source-notes"');
+    expect(entity).toContain('{simple ? "关联笔记" : "证据"}');
+    expect(entity).toContain("{#if simple}");
+    expect(entity).toContain("{#each group.items as mention (mention.id)}");
+    expect(entity).toContain("第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}");
+    expect(entity.indexOf('class="source-notes"')).toBeLessThan(entity.indexOf("{#each group.items as mention (mention.id)}"));
+  });
+
   it("dispatches pending actions by real kind without fabricating relation triples", () => {
     const pendingPanel = source("./PendingReviewPanel.svelte");
     for (const kind of ["invalid_document", "identity_conflict", "stale_evidence", "split_conflict", "relation_review", "time_conflict"]) {
