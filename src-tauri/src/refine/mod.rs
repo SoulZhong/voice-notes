@@ -29,6 +29,7 @@ struct GraphFallbackSnapshot {
     relations: Vec<crate::store::RelationFact>,
     entities: Vec<Entity>,
     mentions: Vec<(usize, Mention)>,
+    support_mention_ids: BTreeSet<String>,
 }
 
 impl GraphFallbackSnapshot {
@@ -108,6 +109,12 @@ impl GraphFallbackSnapshot {
             relations: doc.relations.clone(),
             entities,
             mentions,
+            support_mention_ids: doc
+                .graph_support_mentions
+                .iter()
+                .filter(|id| referenced_mentions.contains_key(id.as_str()))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -116,6 +123,7 @@ impl GraphFallbackSnapshot {
             // 没有段落就无处保存关系引用的 mention；清空比制造悬空引用安全。
             doc.graph_extraction = None;
             doc.relations.clear();
+            doc.graph_support_mentions.clear();
             return;
         }
 
@@ -177,18 +185,32 @@ impl GraphFallbackSnapshot {
         doc.relations.clear();
         crate::store::ensure_graph_ids(note_id, doc);
 
-        let fallback_mention_ids: BTreeSet<_> = self
-            .mentions
-            .iter()
-            .map(|(_, mention)| mention.id.as_str())
-            .collect();
-        for paragraph in &mut doc.paragraphs {
-            paragraph
-                .mentions
-                .retain(|mention| !fallback_mention_ids.contains(mention.id.as_str()));
-        }
+        let mut support_mention_ids: BTreeSet<_> = doc.graph_support_mentions.drain(..).collect();
         for (old_index, mention) in self.mentions {
             let safe_index = old_index.min(doc.paragraphs.len() - 1);
+            if !self.support_mention_ids.contains(&mention.id) {
+                if let Some(current) =
+                    doc.paragraphs[safe_index]
+                        .mentions
+                        .iter_mut()
+                        .find(|current| {
+                            current.entity == mention.entity
+                                && current.start == mention.start
+                                && current.end == mention.end
+                        })
+                {
+                    // 同一实体、同一段落区间只有一个物理 mention：它是本轮 fresh live
+                    // occurrence。沿用旧引用 id 即可同时服务旧关系，不能再复制成 support。
+                    current.id = mention.id;
+                    continue;
+                }
+            }
+            for paragraph in &mut doc.paragraphs {
+                paragraph
+                    .mentions
+                    .retain(|current| current.id != mention.id);
+            }
+            support_mention_ids.insert(mention.id.clone());
             doc.paragraphs[safe_index].mentions.push(mention);
         }
         for paragraph in &mut doc.paragraphs {
@@ -204,6 +226,17 @@ impl GraphFallbackSnapshot {
         doc.graph_extraction = self.graph_extraction;
         doc.relations = self.relations;
         crate::store::ensure_graph_ids(note_id, doc);
+        let actual_mentions: BTreeSet<_> = doc
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| &paragraph.mentions)
+            .map(|mention| mention.id.as_str())
+            .collect();
+        support_mention_ids.extend(self.support_mention_ids);
+        doc.graph_support_mentions = support_mention_ids
+            .into_iter()
+            .filter(|id| actual_mentions.contains(id.as_str()))
+            .collect();
     }
 }
 
@@ -274,6 +307,7 @@ pub fn run_local(
         entities: vec![],
         graph_extraction: None,
         relations: vec![],
+        graph_support_mentions: vec![],
         paragraphs,
     };
     let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
@@ -568,6 +602,7 @@ pub fn run_llm(
 /// 无论实体多寡,都不触碰 doc.paragraphs[].text(修订文本已由 polish 定稿)。
 pub(crate) fn fill_entities(doc: &mut RefinedDoc, raw: Vec<llm::RawEntity>, text_state: &str) {
     doc.stages.entities = text_state.into();
+    doc.graph_support_mentions.clear();
     let entities = resolve_note_entities(raw);
     let mentions = compute_mentions(&doc.paragraphs, &entities);
     for (p, m) in doc.paragraphs.iter_mut().zip(mentions) {
@@ -724,6 +759,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
@@ -856,6 +892,11 @@ mod tests {
         assert_fallback_dependencies(doc);
         assert_eq!(entity_id(doc, "张三"), "ent_1");
         assert_eq!(entity_id(doc, "灯塔计划"), "ent_2");
+        let support: BTreeSet<_> = doc
+            .graph_support_mentions
+            .iter()
+            .map(String::as_str)
+            .collect();
         for name in new_entity_names {
             let id = entity_id(doc, name);
             assert!(id != "ent_1" && id != "ent_2", "{name} 不能重定向旧端点 id");
@@ -863,7 +904,7 @@ mod tests {
                 .paragraphs
                 .iter()
                 .flat_map(|paragraph| &paragraph.mentions)
-                .any(|mention| mention.entity == id));
+                .any(|mention| mention.entity == id && !support.contains(mention.id.as_str())));
         }
         let persisted = store::load_refined(&root.join("notes").join(note_id)).unwrap();
         assert_eq!(
@@ -871,7 +912,7 @@ mod tests {
             serde_json::to_value(&persisted).unwrap(),
             "HTTP 返回内存态必须与落盘完全一致"
         );
-        assert_task4_stale_not_invalid(root, note_id);
+        assert_task4_stale_not_invalid(root, note_id, doc);
     }
 
     fn note_dir(root: &std::path::Path, note_id: &str) -> std::path::PathBuf {
@@ -880,7 +921,7 @@ mod tests {
         dir
     }
 
-    fn assert_task4_stale_not_invalid(root: &std::path::Path, note_id: &str) {
+    fn assert_task4_stale_not_invalid(root: &std::path::Path, note_id: &str, source: &RefinedDoc) {
         let ledger = crate::graph::canonical::reconcile_registry(root).unwrap();
         let graph = crate::graph::canonical::build_canonical_graph(
             root,
@@ -902,6 +943,54 @@ mod tests {
             crate::graph::canonical::PendingItem::InvalidDocument { note_id: invalid, .. }
                 if invalid == note_id
         )));
+        let support: BTreeSet<_> = source
+            .graph_support_mentions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let local_names: BTreeMap<_, _> = source
+            .entities
+            .iter()
+            .map(|entity| (entity.id.as_str(), entity.name.as_str()))
+            .collect();
+        let mut expected_live = Vec::new();
+        for (paragraph_index, paragraph) in source.paragraphs.iter().enumerate() {
+            for mention in &paragraph.mentions {
+                if !support.contains(mention.id.as_str()) {
+                    expected_live.push((
+                        paragraph_index,
+                        mention.start,
+                        mention.end,
+                        local_names[mention.entity.as_str()].to_string(),
+                    ));
+                }
+            }
+        }
+        expected_live.sort();
+        let mut actual_live: Vec<_> = graph
+            .mentions
+            .iter()
+            .filter(|mention| mention.note_id == note_id)
+            .map(|mention| {
+                (
+                    mention.paragraph_index,
+                    mention.start,
+                    mention.end,
+                    graph.entities[&mention.entity_id].name.clone(),
+                )
+            })
+            .collect();
+        actual_live.sort();
+        assert_eq!(
+            actual_live, expected_live,
+            "support mention 不能泄漏为 live mention"
+        );
+        let stats = crate::graph::index::rebuild_atomic(root, &graph).unwrap();
+        assert_eq!(
+            stats.mentions,
+            expected_live.len(),
+            "support mention 不能进入 entity_mentions 索引表"
+        );
     }
 
     fn graph_bytes(doc: &RefinedDoc) -> Vec<u8> {
@@ -1457,6 +1546,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
@@ -1494,6 +1584,7 @@ mod tests {
             entities: vec![],
             graph_extraction: None,
             relations: vec![],
+            graph_support_mentions: vec![],
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
@@ -1788,7 +1879,64 @@ mod tests {
                 &baseline_graph,
                 &["李四", "火星计划"],
             );
+            let support: BTreeSet<_> = doc
+                .graph_support_mentions
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert!(doc.relations[0]
+                .subject_mentions
+                .iter()
+                .chain(&doc.relations[0].object_mentions)
+                .all(|mention| support.contains(mention.as_str())));
         }
+    }
+
+    #[test]
+    fn unchanged_text_fallback_reuses_fresh_live_mentions_without_invalid_document() {
+        let root = tempfile::tempdir().unwrap();
+        let note_id = "fallback-unchanged";
+        let dir = note_dir(root.path(), note_id);
+        let mut doc = valid_prior_doc(note_id);
+        store::write_refined_atomic(&dir, &doc).unwrap();
+        let missing = serde_json::json!({
+            "glossary": {},
+            "texts": ["张三负责灯塔计划"],
+            "entities": [
+                {"name": "张三", "kind": "person", "aliases": []},
+                {"name": "灯塔计划", "kind": "project", "aliases": []}
+            ]
+        });
+        let cfg = llm::LlmConfig {
+            base_url: mock_server(chat_response(missing)),
+            model: "model-v2".into(),
+            api_key: "k".into(),
+        };
+
+        run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+
+        assert_fallback_dependencies(&doc);
+        assert!(doc.graph_support_mentions.is_empty());
+        let ledger = crate::graph::canonical::reconcile_registry(root.path()).unwrap();
+        let graph = crate::graph::canonical::build_canonical_graph(
+            root.path(),
+            &ledger,
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T12:00:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(!graph.pending.iter().any(|item| matches!(
+            item,
+            crate::graph::canonical::PendingItem::InvalidDocument { note_id: invalid, .. }
+                if invalid == note_id
+        )));
+        let mut quotes: Vec<_> = graph
+            .mentions
+            .iter()
+            .filter(|mention| mention.note_id == note_id)
+            .map(|mention| mention.quote.as_str())
+            .collect();
+        quotes.sort();
+        assert_eq!(quotes, vec!["张三", "灯塔计划"]);
     }
 
     #[test]
@@ -1799,6 +1947,7 @@ mod tests {
         let mut doc = valid_prior_doc(note_id);
         store::write_refined_atomic(&dir, &doc).unwrap();
         let missing = changed_entities_content("李四负责火星计划", None);
+        let missing_again = changed_entities_content("李四负责火星计划二次", None);
         let explicit_empty = serde_json::json!({
             "glossary": {},
             "texts": ["王五启动金星计划"],
@@ -1810,6 +1959,7 @@ mod tests {
         });
         let base_url = sequence_server(vec![
             Some(chat_response(missing)),
+            Some(chat_response(missing_again)),
             Some(chat_response(explicit_empty)),
         ]);
         let cfg = llm::LlmConfig {
@@ -1819,6 +1969,16 @@ mod tests {
         };
         run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
         assert_fallback_dependencies(&doc);
+        let support_once = doc.graph_support_mentions.clone();
+        assert!(!support_once.is_empty());
+
+        run_llm(&dir, &mut doc, &cfg, "model-v2-retry", None).unwrap();
+        assert_fallback_dependencies(&doc);
+        assert_eq!(doc.graph_support_mentions, support_once);
+        assert!(doc
+            .graph_support_mentions
+            .windows(2)
+            .all(|ids| ids[0] < ids[1]));
 
         run_llm(&dir, &mut doc, &cfg, "model-v3", None).unwrap();
 
@@ -1832,6 +1992,7 @@ mod tests {
             .entities
             .iter()
             .any(|entity| entity.name == "张三" || entity.name == "灯塔计划"));
+        assert!(doc.graph_support_mentions.is_empty());
         assert!(doc
             .paragraphs
             .iter()
@@ -2023,7 +2184,7 @@ mod tests {
             graph_bytes(&store::load_refined(&dir).unwrap()),
             baseline_graph
         );
-        assert_task4_stale_not_invalid(root.path(), "local-fallback");
+        assert_task4_stale_not_invalid(root.path(), "local-fallback", &doc);
     }
 
     #[test]

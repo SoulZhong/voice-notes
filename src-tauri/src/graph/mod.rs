@@ -557,7 +557,7 @@ mod tests {
         RefinedDoc {
             schema_version: 1, generated_at: "t".into(), llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
-            discarded_seqs: vec![], entities, graph_extraction: None, relations: vec![], paragraphs: paras,
+            discarded_seqs: vec![], entities, graph_extraction: None, relations: vec![], graph_support_mentions: vec![], paragraphs: paras,
         }
     }
     fn para(text: &str, mentions: Vec<Mention>) -> RefinedParagraph {
