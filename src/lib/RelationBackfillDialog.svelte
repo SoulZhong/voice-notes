@@ -27,7 +27,7 @@
   onMount(() => {
     unsubscribeState = controller.subscribe((next) => {
       state = next;
-      if (next.phase === "completed" && !completionReported) {
+      if (next.published && !completionReported) {
         completionReported = true;
         void onCompleted();
       }
@@ -57,6 +57,7 @@
     state.phase === "starting" ||
       state.phase === "running" ||
       state.phase === "cancel-requested" ||
+      state.phase === "index-retrying" ||
       state.phase === "waiting-for-index",
   );
   const providerLabel = $derived(state.preview?.provider === "agent" ? "本机 Agent" : "在线接口");
@@ -88,6 +89,10 @@
 
   function resume() {
     void controller.resume().catch(() => {});
+  }
+
+  function retryIndex() {
+    void controller.retryIndex().catch(() => {});
   }
 </script>
 
@@ -143,15 +148,17 @@
             <span>我已确认：将把修订稿发送给当前配置的执行体。补建只更新关系图谱产物，不修改转写段落与笔记顺序。</span>
           </label>
         {/if}
-      {:else if busy || state.phase === "completed" || state.phase === "partial" || state.phase === "failed" || state.phase === "cancelled"}
+      {:else if busy || state.phase === "index-failed" || state.phase === "completed" || state.phase === "partial" || state.phase === "failed" || state.phase === "cancelled"}
         <div class="progress-heading">
           <p class="lead">
             {#if state.phase === "completed"}补建已完成
             {:else if state.phase === "partial"}部分笔记未完成
             {:else if state.phase === "failed"}补建未完成
+            {:else if state.phase === "index-failed"}索引发布未完成
             {:else if state.phase === "cancelled"}补建已取消
             {:else if state.phase === "starting"}正在建立安全连接
             {:else if state.phase === "cancel-requested"}正在安全停止
+            {:else if state.phase === "index-retrying"}正在重试图谱索引
             {:else if state.phase === "waiting-for-index"}正在发布图谱索引
             {:else}正在补建关系{/if}
           </p>
@@ -164,6 +171,9 @@
         {#if state.error}<p class="message error">{state.error}</p>{/if}
         {#if state.technicalError && state.failures.length === 0}
           <details class="technical"><summary>技术详情</summary><pre>{state.technicalError}</pre></details>
+        {/if}
+        {#if state.indexError}
+          <details class="technical"><summary>索引技术详情</summary><pre>{state.indexError}</pre></details>
         {/if}
         {#if state.failures.length > 0}
           <section class="failures" aria-labelledby="relation-backfill-failures">
@@ -194,6 +204,8 @@
         <button class="secondary danger" type="button" onclick={cancel}>取消补建</button>
       {:else if state.phase === "cancel-requested"}
         <button class="secondary" type="button" disabled>等待取消</button>
+      {:else if state.phase === "index-failed"}
+        <button class="primary" type="button" onclick={retryIndex}>重试索引</button>
       {:else if state.phase === "failed" || state.phase === "partial" || state.phase === "cancelled"}
         <button class="primary" type="button" onclick={resume}>继续未完成笔记</button>
       {/if}

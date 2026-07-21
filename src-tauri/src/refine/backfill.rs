@@ -588,6 +588,7 @@ pub(crate) fn run_batch(
             current_note_id: Some(note_id.clone()),
             failed: failed.clone(),
             rebuild_generation: None,
+            index_error: None,
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let approved_source_hash = approved_source_hashes.get(note_id).ok_or_else(|| {
@@ -631,25 +632,22 @@ pub(crate) fn run_batch(
             current_note_id: Some(note_id.clone()),
             failed: failed.clone(),
             rebuild_generation: None,
+            index_error: None,
         });
         if cancelled || panicked {
             break;
         }
     }
     let mut rebuild_generation = None;
+    let mut index_error = None;
     if committed > 0 || (!cancelled && !panicked && failed.is_empty()) {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut request_rebuild)) {
             Ok(Ok(generation)) => rebuild_generation = Some(generation),
-            Ok(Err(error)) => failed.push(BackfillFailure {
-                note_id: String::new(),
-                error: format!("索引排队失败，已保留 dirty 标记供重试:{error:#}"),
-            }),
+            Ok(Err(error)) => {
+                index_error = Some(format!("索引排队失败，已保留 dirty 标记供重试:{error:#}"))
+            }
             Err(_) => {
-                panicked = true;
-                failed.push(BackfillFailure {
-                    note_id: String::new(),
-                    error: "索引排队异常退出，dirty 标记状态未知".into(),
-                });
+                index_error = Some("索引排队异常退出，dirty 标记状态未知".into());
             }
         }
     }
@@ -659,7 +657,7 @@ pub(crate) fn run_batch(
             "cancelled"
         } else if panicked {
             "failed"
-        } else if failed.is_empty() && rebuild_generation.is_some() {
+        } else if failed.is_empty() {
             "completed"
         } else if succeeded > 0 {
             "partial"
@@ -672,6 +670,7 @@ pub(crate) fn run_batch(
         current_note_id: None,
         failed,
         rebuild_generation,
+        index_error,
     };
     emit(terminal.clone());
     terminal
@@ -687,6 +686,7 @@ pub(crate) fn panic_progress(
         note_id: active_note_id,
         error: "关系补建线程异常退出".into(),
     });
+    last_progress.index_error = None;
     last_progress
 }
 
@@ -1063,6 +1063,7 @@ mod tests {
         let terminal = worker.join().unwrap();
         assert_eq!(calls.lock().unwrap().as_slice(), ["first"]);
         assert_eq!(terminal.state, "partial");
+        assert_eq!(terminal.rebuild_generation, Some(73));
         assert!(terminal.failed.iter().any(|failure| {
             failure.note_id == "later" && failure.error.contains("预览后正文已变化")
         }));
@@ -1381,12 +1382,26 @@ mod tests {
         );
         assert_eq!(scheduler_calls.load(Ordering::SeqCst), 1);
         assert!(root.path().join(".graph-index-dirty").is_file());
-        assert_eq!(terminal.state, "partial");
+        assert_eq!(terminal.state, "completed");
         assert_eq!((terminal.completed, terminal.total), (1, 1));
-        assert_eq!(terminal.failed.len(), 1);
-        assert!(terminal.failed[0].error.contains("dirty"));
-        assert_eq!(events.borrow().last().unwrap().state, "partial");
+        assert!(terminal.failed.is_empty());
+        assert!(terminal.index_error.as_deref().unwrap().contains("dirty"));
+        assert_eq!(events.borrow().last().unwrap().state, "completed");
         assert_eq!(terminal.rebuild_generation, None);
+
+        let terminal = run_batch(
+            "run-rebuild-panic",
+            &root.path().join("notes"),
+            &[note_id.into()],
+            &approved_source_hashes(&root.path().join("notes"), &[note_id.into()]).unwrap(),
+            &executor,
+            &AtomicBool::new(false),
+            |_| {},
+            || panic!("injected scheduler panic"),
+        );
+        assert_eq!(terminal.state, "completed");
+        assert!(terminal.failed.is_empty());
+        assert!(terminal.index_error.as_deref().unwrap().contains("异常退出"));
 
         let failed_id = "provider-failed";
         write_note(root.path(), failed_id, &fixture_doc(failed_id, 0, "failed"));
@@ -1510,6 +1525,7 @@ mod tests {
             current_note_id: Some("two".into()),
             failed: vec![],
             rebuild_generation: None,
+            index_error: None,
         };
         let failed = panic_progress(last.clone(), false);
         assert_eq!(failed.state, "failed");
