@@ -21,6 +21,7 @@
     backboneK = 3,
     query,
     showLegend = true,
+    cooccurrenceMeaning = "shared-notes",
     focusedNodeIds = new Set<string>(),
     focusedEdgeIds = new Set<string>(),
     reducedMotion,
@@ -44,6 +45,8 @@
     query?: string;
     /** kind 图例开关;文章视角(节点全是笔记、单一类型)传 false,图例无信息量。 */
     showLegend?: boolean;
+    /** 原始 EdgeRow 的权重语义：实体图是共同出现的笔记数，文章图是共用实体数。 */
+    cooccurrenceMeaning?: "shared-notes" | "shared-entities";
     focusedNodeIds?: Set<string>;
     focusedEdgeIds?: Set<string>;
     reducedMotion?: boolean;
@@ -82,7 +85,9 @@
         b,
         weight: edge.weight,
         layer: "cooccurrence" as const,
-        label: `共同出现（${edge.weight} 篇）`,
+        label: cooccurrenceMeaning === "shared-entities"
+          ? `${edge.weight} 个共用实体`
+          : `${edge.weight} 篇笔记同时提到`,
         directed: false,
         confidence: null,
         status: null,
@@ -1055,7 +1060,11 @@
       {#if hasCooccurrenceEdges}
         <div class="edge-key-row">
           <span class="edge-sample cooccurrence-sample" aria-hidden="true"></span>
-          <span><strong>共同上下文</strong><small>虚线表示同篇提及或共享实体</small></span>
+          {#if cooccurrenceMeaning === "shared-entities"}
+            <span><strong>共用实体</strong><small>细线表示两篇文章含有相同实体</small></span>
+          {:else}
+            <span><strong>同时提及</strong><small>细线表示一篇笔记提到两个实体</small></span>
+          {/if}
         </div>
       {/if}
     </div>
@@ -1114,8 +1123,7 @@
   }
   .cooccurrence-line {
     stroke: var(--ink-secondary);
-    stroke-width: 1.75px;
-    stroke-dasharray: 5 5;
+    stroke-width: 1.35px;
   }
   .edge-label-guide { fill: none; stroke: none; }
   .edge-hit, .edge-hover-target {
@@ -1214,7 +1222,7 @@
     border-bottom: 3px solid transparent;
     border-left: 6px solid var(--accent);
   }
-  .cooccurrence-sample { border-top: 2px dashed var(--ink-secondary); }
+  .cooccurrence-sample { border-top: 1.5px solid var(--ink-secondary); }
   /* 规模控制条:说明文字(纯信息,不可点)+ 独立的药丸按钮群(可点),不再是一整块
      文字链接挤在一个胶囊里分不清哪段是说明哪段是按钮(冒烟反馈"很粗糙,不够精美")。
      每个按钮自成一个 hairline 描边药丸,跟侧栏「全局图谱」/「返回图谱」同一套
