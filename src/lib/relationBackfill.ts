@@ -336,7 +336,7 @@ export function createRelationBackfillController(
           if (token !== session || runSettled) return;
           if (state.phase === "starting") patch({ phase: "running" });
         } catch (cause) {
-          if (token !== session || runSettled) throw cause;
+          if (token !== session || runSettled) return;
           settle(
             "failed",
             "关系补建未能启动。请重新预览并检查执行体配置。",

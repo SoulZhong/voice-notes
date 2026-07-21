@@ -435,7 +435,7 @@ describe("pathEmphasis", () => {
 
 describe("exploratory graph UI source contract", () => {
   const sources = import.meta.glob(
-    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
+    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./knowledge.ts", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte"],
     { eager: true, query: "?raw", import: "default" },
   ) as Record<string, string>;
   const source = (name: string) => {
@@ -527,6 +527,17 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("hasPathEndpoints(semantic, previousStart, previousEnd)");
     expect(route).toContain("await requestPath(previousStart, previousEnd, knowledgeFilter, includeWeakPath)");
     expect(route).toContain("关系补建后路径端点已变化，原路径已清除。请重新选择两点。");
+  });
+
+  it("activates the large graph harness only in dev and lets the backend choose an isolated root", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const knowledge = source("./knowledge.ts");
+    expect(route).toContain('import.meta.env.DEV && $page.url.searchParams.get("debugFixture") === "semantic-large"');
+    expect(route).toContain("const fixture = await semanticGraphDebugFixture()");
+    expect(route).toContain("debugFixtureRoot = fixture.fixture_root");
+    expect(route).toContain("不读取或修改真实资料库");
+    expect(knowledge).toContain('invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture")');
+    expect(knowledge).not.toMatch(/semanticGraphDebugFixture\s*=\s*\([^)]*(root|path)/);
   });
 
   it("canonicalizes Rust-style cooccurrence path step IDs to rendered weak-edge IDs", () => {

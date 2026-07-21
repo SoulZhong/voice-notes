@@ -321,6 +321,36 @@ describe("createRelationBackfillController", () => {
     expect(unlistenProgress).toHaveBeenCalledTimes(1);
     expect(unlistenIndex).toHaveBeenCalledTimes(1);
   });
+
+  it("ignores a late start rejection after the exact run has already settled", async () => {
+    let emitProgress!: (event: BackfillProgress) => void;
+    let emitIndex!: (event: GraphIndexStatus) => void;
+    const delayedStart = deferred<void>();
+    const controller = createRelationBackfillController(api({
+      start: vi.fn(() => delayedStart.promise),
+      subscribe: vi.fn(async (handler) => {
+        emitProgress = handler;
+        return vi.fn();
+      }),
+      subscribeIndex: vi.fn(async (handler) => {
+        emitIndex = handler;
+        return vi.fn();
+      }),
+    }));
+    await controller.preview();
+    controller.acknowledge(true);
+    const task = controller.start();
+    await vi.waitFor(() => expect(emitIndex).toBeTypeOf("function"));
+
+    emitProgress(progress("run-test", "completed", 2, { rebuild_generation: 15 }));
+    emitIndex(indexStatus(15, "ready"));
+    expect(controller.state.phase).toBe("completed");
+
+    const outcome = expect(task).resolves.toBeUndefined();
+    delayedStart.reject(new Error("late transport rejection"));
+    await outcome;
+    expect(controller.state.phase).toBe("completed");
+  });
 });
 
 describe("backfill dialog source contract", () => {

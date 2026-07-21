@@ -113,19 +113,19 @@ h1 若不定字级则回退浏览器默认 2em、页面标题失控巨大——a
 ### 数据真值与稳定标识
 
 - 系统分为三层真值：笔记目录中的原始稿与 `aing.json` 是可审计事实；数据根目录的 `knowledge-overrides.json` 是操作只追加、整体原子替换的人为治理账本；图谱目录中的版本化 SQLite 文件是可删除、可重建的派生语义索引。任何索引错误都不得反写或阻断笔记核心生命周期。
-- `aing.json` schema v2 为 mention、evidence、relation 提供稳定 ID。旧 schema v1 的 `e:<name>` 只作为迁移输入，经解析器映射为稳定 `kg:` 实体 ID；它不是当前实体身份，也不能成为跨次 Aing 的 canonical ID。
+- `aing.json` schema v2 为 mention、evidence、relation 提供稳定 ID。旧 schema v1 的 `e:<name>` 只作为迁移输入，经解析器映射为稳定 `kg_` 实体 ID；它不是当前实体身份，也不能成为跨次 Aing 的 canonical ID。
 - Resolver 先归一化显式稳定 ID，再应用人工 rename/alias/create/merge/split/suppress/restore/end/create relation 操作，最后才使用模型抽取结果。merge/split 必须同时处理 mention、relation 与 evidence 的归属；治理账本损坏时保留上一版可读图谱并拒绝新的治理或补建写入。
 
 ### 派生索引与执行体一致性
 
-- 重建写入版本化 `.next` 索引，完整校验后原子发布；失败删除候选并继续服务上一版。调度器按 generation 合并重复请求，进度、完成与失败事件都携带对应 generation，消费者不得把旧事件当成当前结果。
-- HTTP 与本机 Agent 共用同一归一化与物化管线：相同模型响应生成相同实体、关系与 evidence；执行体、provider、model、原始请求/响应摘要等 provenance 原样入库，不能因入口不同而丢失证据链。
+- 重建写入版本化 `.next` 索引，完整校验后原子发布；失败删除候选并继续服务上一版。调度器按 generation 合并重复请求，构建状态事件携带对应 generation；关系补建另以精确 `run_id` 关联进度和取消，前端只在收到该 run 的完成态及其精确 generation 的索引 ready 后刷新一次，旧 run/旧 generation 事件都不能提交当前结果。
+- HTTP 与本机 Agent 共用同一归一化、证据校验与物化规则：相同关系载荷生成同等的实体引用、关系和 evidence。`aing.json` 的 `graph_extraction` 保存 provider、精确 model、run、contract、source hash、mode 和生成时间，SQLite 关系/证据保存可查询的 provider、model、原文区间、source sequences/hash 与 mention 绑定；完整 AI 请求/响应只进入独立 AI 日志，不伪装成关系自身的 provenance 字段。
 - 图查询以语义关系为前景，共现只是一种可关闭的弱信号。最短解释路径按关系类型、置信度与治理状态计算确定性成本，使用稳定 ID 作为并列裁决，且每条路径边都可回到证据与原笔记。
 
 ### 补建、隐私与失败边界
 
-- 历史补建必须先展示待处理范围、段落数、当前执行体/provider/model 与发送内容说明，用户明确确认后才启动；文案明确告知「将把修订稿发送给当前配置的执行体」。界面不猜测价格，也不隐藏完整 ID、错误或发送范围。
-- 进度监听必须先建立再启动任务；取消是请求态而非伪造成功，终态与关闭时只清理一次监听。未完成任务可恢复进度、重新预览或取消，迟到事件用会话标识丢弃。补建只能新增/更新关系派生物，不改变段落文本、顺序或原始稿。
+- 历史补建必须先展示待处理笔记数量、完整笔记 ID、当前执行体/provider、精确 model、契约版本与发送内容说明，用户明确确认后才启动；文案明确告知「将把修订稿发送给当前配置的执行体」。预览生成的 consent token 绑定有序笔记选择、每篇 source hash、provider、model 和 contract，启动前重新计算，任一漂移都拒绝。界面不猜测价格，也不伪造当前接口并未计算的段落总数。
+- 关系进度与图索引状态两条监听都必须先建立再启动任务；取消携带精确 `run_id`，是请求态而非伪造成功，终态与关闭时只清理一次监听。失败、部分完成或取消后重新预览当前未完成范围再继续；迟到事件以会话标识、`run_id` 和 generation 丢弃。主界面只显示可行动的脱敏错误摘要，原始后端错误仅在用户主动展开“技术详情”时出现。补建只能新增/更新关系派生物，不改变段落文本、顺序或原始稿。
 - 模型不可用、账本损坏、候选索引发布失败或前端刷新失败时，录音、保存、精修、阅读与既有图谱读取仍可继续；图谱明确展示降级原因和可恢复动作。
 
 ### 探索与治理体验

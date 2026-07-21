@@ -9,9 +9,10 @@ use crate::refine::backfill::{self, RelationExecutor};
 use crate::refine::llm::{RawEvidence, RawRelation};
 use crate::store::{
     self, Entity, GraphExtraction, Mention, RefineStages, RefinedDoc, RefinedParagraph,
-    RelationPredicate,
+    RelationEvidence, RelationFact, RelationPredicate,
 };
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -39,13 +40,13 @@ fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
         discarded_seqs: Vec::new(),
         entities: vec![
             Entity {
-                id: "ent_alice".into(),
+                id: "ent_1".into(),
                 kind: "person".into(),
                 name: "Alice".into(),
                 aliases: Vec::new(),
             },
             Entity {
-                id: "ent_beacon".into(),
+                id: "ent_2".into(),
                 kind: "project".into(),
                 name: "Beacon".into(),
                 aliases: Vec::new(),
@@ -65,13 +66,13 @@ fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
             mentions: vec![
                 Mention {
                     id: String::new(),
-                    entity: "ent_alice".into(),
+                    entity: "ent_1".into(),
                     start: 0,
                     end: 5,
                 },
                 Mention {
                     id: String::new(),
-                    entity: "ent_beacon".into(),
+                    entity: "ent_2".into(),
                     start: 11,
                     end: 17,
                 },
@@ -230,6 +231,52 @@ fn filter() -> GraphFilter {
     }
 }
 
+fn relation_http_server(payload: serde_json::Value) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        let content = payload.to_string();
+        let envelope = serde_json::json!({
+            "choices": [{ "message": { "content": content } }]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            envelope.len(),
+            envelope
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    format!("http://{address}")
+}
+
 #[test]
 fn schema_v1_and_legacy_ids_bootstrap_without_rewriting_transcript() {
     let root = tempfile::tempdir().unwrap();
@@ -283,7 +330,61 @@ fn schema_v1_and_legacy_ids_bootstrap_without_rewriting_transcript() {
 #[test]
 fn governance_operations_survive_reaing_and_two_rebuilds() {
     let root = tempfile::tempdir().unwrap();
-    install_fixture(root.path());
+    let note_id = "note-reaing";
+    let mut initial_ledger = fixture_ledger();
+    initial_ledger
+        .legacy_ids
+        .insert(format!("{note_id}/ent_1"), "kg_alice".into());
+    initial_ledger
+        .legacy_ids
+        .insert(format!("{note_id}/ent_2"), "kg_beacon".into());
+    std::fs::write(
+        root.path().join(overrides::KNOWLEDGE_FILE),
+        serde_json::to_vec(&initial_ledger).unwrap(),
+    )
+    .unwrap();
+    let mut original_source = relation_doc(note_id, "failed");
+    let original_graph =
+        crate::refine::relations::materialize(note_id, &original_source, vec![raw_relation()])
+            .unwrap();
+    let original_source_hash = store::source_hash(&original_source.paragraphs);
+    crate::refine::relations::apply_validated_graph(
+        &mut original_source,
+        GraphExtraction {
+            contract_version: store::aing_graph::GRAPH_CONTRACT_VERSION,
+            provider: "openai".into(),
+            model: "fixture-http-v1".into(),
+            run_id: "run-before-reaing".into(),
+            generated_at: "2026-07-21T12:00:00+08:00".into(),
+            source_hash: original_source_hash,
+            mode: "http".into(),
+        },
+        original_graph,
+    );
+    write_note(root.path(), note_id, &original_source);
+    index::rebuild_from_sources(root.path()).unwrap();
+    let indexed_before = query::semantic_graph(root.path(), &filter()).unwrap();
+    let model_relation_id = indexed_before
+        .semantic_edges
+        .iter()
+        .find(|relation| relation.predicate_type == "uses")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        query::relation_detail(root.path(), &model_relation_id)
+            .unwrap()
+            .unwrap()
+            .provider
+            .as_deref(),
+        Some("openai")
+    );
+    let alice_mention_id = query::entity_mentions(root.path(), "kg_alice")
+        .unwrap()
+        .first()
+        .unwrap()
+        .id
+        .clone();
     let rename = query::apply_operation(
         root.path(),
         &KnowledgeOperationInput::RenameEntity {
@@ -318,7 +419,7 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
             name: "Alice Evidence Split".into(),
             kind: None,
             aliases: Vec::new(),
-            mention_ids: vec!["mn_alice".into()],
+            mention_ids: vec![alice_mention_id.clone()],
         },
     )
     .unwrap();
@@ -338,10 +439,20 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
         },
     )
     .unwrap();
+    // Split/merge decisions can change the projected canonical relation ID.
+    // End the relation by the ID that a rebuilt index actually exposes.
+    index::rebuild_from_sources(root.path()).unwrap();
+    let projected_relation_id = query::semantic_graph(root.path(), &filter())
+        .unwrap()
+        .semantic_edges
+        .into_iter()
+        .find(|relation| relation.predicate_type == "uses")
+        .unwrap()
+        .id;
     let ended = query::apply_operation(
         root.path(),
         &KnowledgeOperationInput::EndRelation {
-            relation_id: "cr_initial".into(),
+            relation_id: projected_relation_id.clone(),
             valid_to: "2026-07-21T12:30:00+08:00".into(),
         },
     )
@@ -365,11 +476,12 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
     .unwrap();
     let undo = query::undo_operation(root.path(), &alias.operation_id).unwrap();
 
-    // Simulated re-Aing replaces only model provenance/facts; the ledger remains
-    // byte-for-byte human truth across both complete source rebuilds.
-    let mut doc = relation_doc("note-reaing", "done");
+    // A real same-note Aing replacement changes provider/model/run provenance
+    // while keeping the source identity. Human governance must be projected
+    // into both complete source rebuilds rather than merely surviving in JSON.
+    let mut doc = relation_doc(note_id, "done");
     let validated =
-        crate::refine::relations::materialize("note-reaing", &doc, vec![raw_relation()]).unwrap();
+        crate::refine::relations::materialize(note_id, &doc, vec![raw_relation()]).unwrap();
     let reaing_source_hash = store::source_hash(&doc.paragraphs);
     crate::refine::relations::apply_validated_graph(
         &mut doc,
@@ -384,7 +496,7 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
         },
         validated,
     );
-    write_note(root.path(), "note-reaing", &doc);
+    write_note(root.path(), note_id, &doc);
     let decisions_before = overrides::load(root.path()).unwrap().operations;
     index::rebuild_from_sources(root.path()).unwrap();
     index::rebuild_from_sources(root.path()).unwrap();
@@ -397,15 +509,16 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
         .aliases
         .contains(&"A. Chen".into()));
     assert_eq!(snapshot.redirects[&created_id], "kg_beacon");
-    assert_eq!(
-        snapshot.mention_bindings["mn_alice"],
-        split.entity_id.unwrap()
-    );
+    let split_id = split.entity_id.unwrap();
+    assert_eq!(snapshot.mention_bindings[&alice_mention_id], split_id);
     assert!(snapshot
         .relation_decisions
         .restored_operations
         .contains(&suppress.operation_id));
-    assert!(snapshot.relation_decisions.ended.contains_key("cr_initial"));
+    assert!(snapshot
+        .relation_decisions
+        .ended
+        .contains_key(&projected_relation_id));
     assert!(!snapshot.relation_decisions.created.is_empty());
     for operation_id in [
         rename.operation_id,
@@ -420,6 +533,61 @@ fn governance_operations_survive_reaing_and_two_rebuilds() {
             .iter()
             .any(|operation| operation.id == operation_id));
     }
+
+    let renamed = query::semantic_entity_detail(root.path(), "kg_alice", &filter())
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed.name, "Alice Chen");
+    assert!(!renamed.aliases.contains(&"A. Chen".into()));
+
+    let redirected = query::semantic_entity_detail(root.path(), &created_id, &filter())
+        .unwrap()
+        .unwrap();
+    assert_eq!(redirected.id, "kg_beacon");
+    let split_mentions = query::entity_mentions(root.path(), &split_id).unwrap();
+    assert_eq!(
+        split_mentions
+            .iter()
+            .map(|mention| mention.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![alice_mention_id.as_str()]
+    );
+
+    let rebuilt = query::semantic_graph(root.path(), &filter()).unwrap();
+    let ended_relation = rebuilt
+        .semantic_edges
+        .iter()
+        .find(|relation| relation.predicate_type == "uses")
+        .unwrap();
+    assert_eq!(ended_relation.status, "historical");
+    assert_eq!(
+        ended_relation.valid_to.as_deref(),
+        Some("2026-07-21T12:30:00+08:00")
+    );
+    let restored_detail = query::relation_detail(root.path(), &ended_relation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_detail.provider.as_deref(), Some("agent"));
+    assert_eq!(
+        restored_detail.model.as_deref(),
+        Some("fixture-agent-model")
+    );
+    assert_eq!(restored_detail.evidence.len(), 1);
+    assert_eq!(restored_detail.evidence[0].note_id, note_id);
+
+    let manual_relation = rebuilt
+        .semantic_edges
+        .iter()
+        .find(|relation| relation.predicate_type == "responsible_for")
+        .unwrap();
+    assert_eq!(manual_relation.origin, "user_assertion");
+    assert_eq!(
+        query::relation_detail(root.path(), &manual_relation.id)
+            .unwrap()
+            .unwrap()
+            .provider,
+        None
+    );
 }
 
 struct FixtureExecutor {
@@ -513,92 +681,241 @@ fn failed_next_build_keeps_prior_index_readable() {
     assert!(!root.path().join("graph.sqlite.next").exists());
 }
 
+#[cfg(unix)]
 #[test]
-fn http_and_agent_normalization_have_evidence_and_provenance_parity() {
-    let doc = relation_doc("parity-note", "failed");
-    let http =
-        crate::refine::relations::materialize("parity-note", &doc, vec![raw_relation()]).unwrap();
-    let agent =
-        crate::refine::relations::materialize("parity-note", &doc, vec![raw_relation()]).unwrap();
-    assert_eq!(http, agent);
-    assert_eq!(http.relations[0].evidence[0].quote, "Alice uses Beacon");
-    assert_eq!(http.relations[0].evidence[0].source_seqs, vec![1, 2]);
+fn http_and_agent_executors_parse_real_boundaries_with_evidence_and_provenance_parity() {
+    use crate::refine::agent::{AgentKind, AgentRelationExecutor};
+    use crate::refine::llm::{HttpRelationExecutor, LlmConfig};
+    use std::os::unix::fs::PermissionsExt;
 
-    let mut http_doc = doc.clone();
-    let mut agent_doc = doc.clone();
-    for (target, provider, model, graph) in [
-        (&mut http_doc, "openai", "http-exact-model", http),
-        (&mut agent_doc, "agent", "agent-exact-model", agent),
-    ] {
-        crate::refine::relations::apply_validated_graph(
-            target,
-            GraphExtraction {
-                contract_version: store::aing_graph::GRAPH_CONTRACT_VERSION,
-                provider: provider.into(),
-                model: model.into(),
-                run_id: format!("run-{provider}"),
-                generated_at: "2026-07-21T12:00:00+08:00".into(),
-                source_hash: store::source_hash(&target.paragraphs),
-                mode: "fixture".into(),
-            },
-            graph,
-        );
-    }
-    assert_eq!(http_doc.relations, agent_doc.relations);
+    let note_id = "parity-note";
+    let doc = relation_doc("parity-note", "failed");
+    let raw_payload = serde_json::json!({
+        "relations": [{
+            "subject": "Alice",
+            "predicate": { "type": "uses" },
+            "object": "Beacon",
+            "confidence": 0.95,
+            "valid_from": null,
+            "valid_to": null,
+            "evidence": [{
+                "paragraph_index": 0,
+                "start": 0,
+                "end": 17,
+                "quote": "Alice uses Beacon"
+            }]
+        }]
+    });
+    let http_model = "http-exact-model";
+    let http_executor = HttpRelationExecutor::new(LlmConfig {
+        base_url: relation_http_server(raw_payload),
+        model: http_model.into(),
+        api_key: "fixture-key".into(),
+    })
+    .unwrap();
+    let http = RelationExecutor::extract(&http_executor, note_id, &doc).unwrap();
+
+    // Prepare the exact disk state the production MCP writer creates. The fake
+    // CLI only copies this payload into the executor's random isolated root;
+    // AgentRelationExecutor still owns process spawning, disk reload, provenance
+    // checks and final graph validation.
+    let agent_model = "agent-exact-model";
+    let source_hash = store::source_hash(&doc.paragraphs);
+    let submitted_entities = vec![
+        Entity {
+            id: "submitted-alice".into(),
+            kind: "person".into(),
+            name: "Alice".into(),
+            aliases: Vec::new(),
+        },
+        Entity {
+            id: "submitted-beacon".into(),
+            kind: "project".into(),
+            name: "Beacon".into(),
+            aliases: Vec::new(),
+        },
+    ];
+    let submitted_relations = vec![RelationFact {
+        id: "untrusted-relation-id".into(),
+        subject: "submitted-alice".into(),
+        predicate: predicate(),
+        object: "submitted-beacon".into(),
+        subject_mentions: Vec::new(),
+        object_mentions: Vec::new(),
+        confidence: 0.95,
+        valid_from: None,
+        valid_to: None,
+        evidence: vec![RelationEvidence {
+            id: "untrusted-evidence-id".into(),
+            paragraph_index: 0,
+            start: 0,
+            end: 17,
+            quote: "Alice uses Beacon".into(),
+            source_seqs: vec![1, 2],
+            source_hash,
+        }],
+    }];
+    let mut agent_written = doc.clone();
+    crate::mcp::tools::normalize_agent_graph(
+        note_id,
+        &mut agent_written,
+        &crate::mcp::server::ApplyAingGraphParams {
+            note_id: note_id.into(),
+            entities: submitted_entities,
+            relations: submitted_relations,
+            contract_version: store::aing_graph::GRAPH_CONTRACT_VERSION,
+            model: agent_model.into(),
+        },
+    )
+    .unwrap();
+
+    let fake = tempfile::tempdir().unwrap();
+    let output = fake.path().join("agent-output.json");
+    std::fs::write(&output, serde_json::to_vec(&agent_written).unwrap()).unwrap();
+    let bin = fake.path().join("fake-agent");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\ncp '{}' \"$VN_APP_DATA/notes/{note_id}/aing.json\"\n",
+            output.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agent_executor =
+        AgentRelationExecutor::new(AgentKind::Claude, bin.to_str().unwrap(), agent_model).unwrap();
+    let agent = RelationExecutor::extract(&agent_executor, note_id, &doc).unwrap();
+
+    let relation_signature = |graph: &store::aing_graph::ValidatedGraph| {
+        let relation = &graph.relations[0];
+        (
+            relation.predicate.clone(),
+            relation.confidence,
+            relation.evidence[0].paragraph_index,
+            relation.evidence[0].start,
+            relation.evidence[0].end,
+            relation.evidence[0].quote.clone(),
+            relation.evidence[0].source_seqs.clone(),
+            relation.evidence[0].source_hash.clone(),
+        )
+    };
+    assert_eq!(relation_signature(&http), relation_signature(&agent));
+    assert_eq!(http.relations[0].evidence[0].source_seqs, vec![1, 2]);
     assert_eq!(
-        http_doc.graph_extraction.as_ref().unwrap().provider,
-        "openai"
-    );
-    assert_eq!(
-        agent_doc.graph_extraction.as_ref().unwrap().provider,
+        agent_written.graph_extraction.as_ref().unwrap().provider,
         "agent"
     );
     assert_eq!(
-        http_doc.graph_extraction.as_ref().unwrap().model,
-        "http-exact-model"
+        agent_written.graph_extraction.as_ref().unwrap().model,
+        agent_model
     );
-    assert_eq!(
-        agent_doc.graph_extraction.as_ref().unwrap().model,
-        "agent-exact-model"
-    );
+    assert_eq!(RelationExecutor::provider(&http_executor), "openai");
+    assert_eq!(RelationExecutor::model(&http_executor), http_model);
+    assert_eq!(RelationExecutor::provider(&agent_executor), "agent");
+    assert_eq!(RelationExecutor::model(&agent_executor), agent_model);
 }
 
 #[test]
-fn backfill_changes_only_relation_artifacts() {
+fn multi_note_multi_paragraph_backfill_preserves_transcript_order() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join(overrides::KNOWLEDGE_FILE),
         serde_json::to_vec(&overrides::KnowledgeLedger::empty()).unwrap(),
     )
     .unwrap();
-    let note_id = "backfill-preserves-text";
-    let doc = relation_doc(note_id, "failed");
-    write_note(root.path(), note_id, &doc);
-    let before = store::load_refined(&root.path().join("notes").join(note_id)).unwrap();
+    let note_ids = vec![
+        "backfill-order-a".to_string(),
+        "backfill-order-b".to_string(),
+    ];
+    for (note_index, note_id) in note_ids.iter().enumerate() {
+        let mut doc = relation_doc(note_id, "failed");
+        doc.paragraphs.extend([
+            RefinedParagraph {
+                speaker: "R2".into(),
+                name: Some(format!("Speaker {note_index}")),
+                person_id: None,
+                start_ms: 1_001,
+                end_ms: 2_000,
+                text: format!("Context paragraph for {note_id}"),
+                source_seqs: vec![10 + note_index as u64, 20 + note_index as u64],
+                mentions: Vec::new(),
+            },
+            RefinedParagraph {
+                speaker: "R1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 2_001,
+                end_ms: 3_000,
+                text: format!("Closing paragraph for {note_id}"),
+                source_seqs: vec![30 + note_index as u64],
+                mentions: Vec::new(),
+            },
+        ]);
+        write_note(root.path(), note_id, &doc);
+    }
+    let before = note_ids
+        .iter()
+        .map(|note_id| store::load_refined(&root.path().join("notes").join(note_id)).unwrap())
+        .collect::<Vec<_>>();
     let calls = Arc::new(AtomicUsize::new(0));
-    let outcome = backfill::run_one(
-        &root.path().join("notes").join(note_id),
-        note_id,
+    let mut progress = Vec::new();
+    let terminal = backfill::run_batch(
+        "run-multi-note-order",
+        &root.path().join("notes"),
+        &note_ids,
         &FixtureExecutor { calls },
-    )
-    .unwrap();
-    let after = store::load_refined(&root.path().join("notes").join(note_id)).unwrap();
-    assert!(outcome.committed);
-    assert_eq!(
-        before
-            .paragraphs
-            .iter()
-            .map(|paragraph| (&paragraph.text, &paragraph.source_seqs))
-            .collect::<Vec<_>>(),
-        after
-            .paragraphs
-            .iter()
-            .map(|paragraph| (&paragraph.text, &paragraph.source_seqs))
-            .collect::<Vec<_>>()
+        &std::sync::atomic::AtomicBool::new(false),
+        |event| progress.push(event),
+        || {
+            index::rebuild_from_sources(root.path())?;
+            Ok(41)
+        },
     );
-    assert_eq!(before.paragraphs.len(), after.paragraphs.len());
-    assert_eq!(after.relations.len(), 1);
-    assert_eq!(after.graph_extraction.as_ref().unwrap().provider, "agent");
+    let after = note_ids
+        .iter()
+        .map(|note_id| store::load_refined(&root.path().join("notes").join(note_id)).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.state, "completed");
+    assert_eq!(terminal.rebuild_generation, Some(41));
+    assert_eq!(
+        progress
+            .iter()
+            .filter_map(|event| event.current_note_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            "backfill-order-a",
+            "backfill-order-a",
+            "backfill-order-b",
+            "backfill-order-b"
+        ]
+    );
+    for (before, after) in before.iter().zip(&after) {
+        assert_eq!(
+            serde_json::to_value(&before.paragraphs).unwrap(),
+            serde_json::to_value(&after.paragraphs).unwrap()
+        );
+        assert_eq!(after.paragraphs.len(), 3);
+        assert_eq!(after.relations.len(), 1);
+        assert_eq!(after.graph_extraction.as_ref().unwrap().provider, "agent");
+    }
+    let rebuilt = query::semantic_graph(root.path(), &filter()).unwrap();
+    let relations = rebuilt
+        .semantic_edges
+        .iter()
+        .filter(|edge| edge.predicate_type == "uses")
+        .collect::<Vec<_>>();
+    assert_eq!(relations.len(), 2);
+    let mut indexed_note_ids = relations
+        .iter()
+        .flat_map(|edge| {
+            query::relation_detail(root.path(), &edge.id)
+                .unwrap()
+                .unwrap()
+                .note_ids
+        })
+        .collect::<Vec<_>>();
+    indexed_note_ids.sort();
+    assert_eq!(indexed_note_ids, note_ids);
 }
 
 #[test]

@@ -8,6 +8,7 @@
     pendingReview,
     semanticEntityDetail,
     semanticGraph,
+    semanticGraphDebugFixture,
     type KnowledgeFilter,
     type KnowledgePath,
     type PendingReviewItem,
@@ -81,6 +82,7 @@
   let pathError = $state("");
   let includeWeakPath = $state(false);
   let backfillOpen = $state(false);
+  let debugFixtureRoot = $state<string | null>(null);
   let lastSidebarKind = graphFilter.kind;
   let lastRequestedPathStart: string | null = null;
 
@@ -265,7 +267,42 @@
     }
   }
 
+  async function loadDebugFixture() {
+    semanticLoading = true;
+    semanticError = "";
+    try {
+      const fixture = await semanticGraphDebugFixture();
+      debugFixtureRoot = fixture.fixture_root;
+      semantic = fixture.graph;
+      graph = { nodes: [], edges: [] };
+      globalSemanticPresence = "present";
+      semanticRequestFailed = false;
+      const nextPredicates = new Map<string, string>();
+      for (const edge of fixture.graph.semantic_edges) {
+        nextPredicates.set(edge.predicate_type, relationLabel(edge));
+      }
+      predicateCatalog = nextPredicates;
+      pathStart = fixture.path.entity_ids.at(0) ?? null;
+      pathEnd = fixture.path.entity_ids.at(-1) ?? null;
+      activePath = fixture.path;
+      pathStatus = "ready";
+      visibleIds = new Set([...initialIds(fixture.graph), ...fixture.path.entity_ids]);
+      loaded = true;
+    } catch (cause) {
+      console.warn("isolated semantic graph fixture failed", cause);
+      semanticRequestFailed = true;
+      semanticError = "隔离调试夹具加载失败。请重新打开调试地址。";
+      loaded = true;
+    } finally {
+      semanticLoading = false;
+    }
+  }
+
   onMount(() => {
+    if (import.meta.env.DEV && $page.url.searchParams.get("debugFixture") === "semantic-large") {
+      void loadDebugFixture();
+      return;
+    }
     void Promise.all([
       loadGraph(),
       loadSemantic(knowledgeFilter),
@@ -380,6 +417,7 @@
 
   function pickNode(id: string, _isPerson: boolean) {
     revealFrom(id);
+    if (debugFixtureRoot) return;
     if (pathStart && id !== pathStart) {
       pathEnd = id;
       void requestPath(pathStart, id, knowledgeFilter, includeWeakPath);
@@ -432,6 +470,16 @@
     lastSidebarKind = sidebarKind;
     graphFilter.kind = sidebarKind;
     ++pathGeneration;
+    if (debugFixtureRoot) {
+      const filtered = filterSemanticGraph(semantic, {
+        ...knowledgeFilter,
+        include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
+      });
+      visibleIds = showingAll
+        ? new Set(filtered.nodes.map((node) => node.id))
+        : new Set([...initialIds(semantic), ...(activePath?.entity_ids ?? [])]);
+      return;
+    }
     void loadSemantic({
       ...knowledgeFilter,
       include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
@@ -488,11 +536,13 @@
 
   function toggleWeakPath(value: boolean) {
     includeWeakPath = value;
+    if (debugFixtureRoot) return;
     void loadSemantic({ ...knowledgeFilter, include_cooccurrence: knowledgeFilter.include_cooccurrence || value });
     if (pathStart && pathEnd) void requestPath(pathStart, pathEnd, knowledgeFilter, value);
   }
 
   function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
+    if (debugFixtureRoot) return;
     ctxMenu = { id, name, isPerson, x: clientX, y: clientY };
   }
 
@@ -577,6 +627,11 @@
         />
 
         <div class="canvas-shell" aria-label="知识图谱画布">
+          {#if debugFixtureRoot}
+            <div class="map-message debug-fixture" role="status">
+              <span>隔离调试夹具 · 1,000 个实体 / 5,000 条语义关系 · 不读取或修改真实资料库</span>
+            </div>
+          {/if}
           {#if semanticStatusMessage}
             <div class="map-message degraded" role="status">
               <span>{semanticStatusMessage}</span>

@@ -217,6 +217,12 @@ export interface BackfillProgress {
   rebuild_generation: number | null;
 }
 
+export interface SemanticGraphDebugFixture {
+  fixture_root: string;
+  graph: SemanticGraphData;
+  path: KnowledgePath;
+}
+
 export const semanticGraph = (filter: KnowledgeFilter) =>
   invoke<SemanticGraphData>("semantic_graph", { filter });
 
@@ -255,3 +261,7 @@ export const startRelationBackfill = (request: BackfillRequest) =>
 
 export const cancelRelationBackfill = (runId: string) =>
   invoke<void>("cancel_relation_backfill", { runId });
+
+/** Debug builds only: the backend creates and selects its own isolated OS-temp root. */
+export const semanticGraphDebugFixture = () =>
+  invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture");

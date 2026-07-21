@@ -13,7 +13,10 @@ use std::path::Path;
 
 const ENTITY_COUNT: usize = 1_000;
 const RELATION_COUNT: usize = 5_000;
-const COOCCURRENCE_COUNT: usize = 1_500;
+const BASE_COOCCURRENCE_COUNT: usize = 1_500;
+// The 1,500 dedicated weak-edge notes plus semantic evidence notes yield this
+// deterministic union after four overlapping entity pairs are coalesced.
+const COOCCURRENCE_COUNT: usize = 2_496;
 
 fn entity_id(index: usize) -> String {
     format!("kg_{index:04}")
@@ -50,8 +53,8 @@ fn deterministic_large_graph() -> CanonicalGraph {
         .map(|left| (left, (left + 1) % ENTITY_COUNT))
         .chain((0..500).map(|left| (left, left + 2)))
         .collect::<Vec<_>>();
-    assert_eq!(pairs.len(), COOCCURRENCE_COUNT);
-    let mentions = pairs
+    assert_eq!(pairs.len(), BASE_COOCCURRENCE_COUNT);
+    let mut mentions = pairs
         .iter()
         .enumerate()
         .flat_map(|(note_index, (left, right))| {
@@ -78,6 +81,37 @@ fn deterministic_large_graph() -> CanonicalGraph {
             ]
         })
         .collect::<Vec<_>>();
+
+    // Semantic evidence must reference real canonical mentions as production
+    // data does; otherwise the large fixture can hide broken evidence joins.
+    mentions.extend((0..RELATION_COUNT).flat_map(|index| {
+        let subject = index % ENTITY_COUNT;
+        let object = (index * 37 + 17) % ENTITY_COUNT;
+        let note_id = format!("fixture-semantic-{index:04}");
+        let subject_quote = format!("Fixture Entity {subject:04}");
+        let object_quote = format!("Fixture Entity {object:04}");
+        let object_start = subject_quote.chars().count() + " relates to ".chars().count();
+        [
+            CanonicalMention {
+                id: format!("mn_semantic_{index:04}_subject"),
+                note_id: note_id.clone(),
+                entity_id: entity_id(subject),
+                paragraph_index: 0,
+                start: 0,
+                end: subject_quote.chars().count(),
+                quote: subject_quote,
+            },
+            CanonicalMention {
+                id: format!("mn_semantic_{index:04}_object"),
+                note_id,
+                entity_id: entity_id(object),
+                paragraph_index: 0,
+                start: object_start,
+                end: object_start + object_quote.chars().count(),
+                quote: object_quote,
+            },
+        ]
+    }));
 
     let predicates = [
         "participates_in",
@@ -191,6 +225,49 @@ fn semantic_graph_large_import_requires_a_new_explicit_temp_root() {
         (stats.entities, stats.relations, stats.evidence),
         (1_000, 5_000, 5_000)
     );
+    let graph = query::semantic_graph(&allowed, &all_filter()).unwrap();
+    assert_eq!(graph.nodes.len(), ENTITY_COUNT);
+    assert_eq!(graph.semantic_edges.len(), RELATION_COUNT);
+    assert_eq!(graph.cooccurrence_edges.len(), COOCCURRENCE_COUNT);
+
+    let detail = query::relation_detail(&allowed, "cr_fixture_0000")
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.evidence.len(), 1);
+    assert_eq!(
+        detail.evidence[0].subject_mentions,
+        vec!["mn_semantic_0000_subject"]
+    );
+    assert_eq!(
+        detail.evidence[0].object_mentions,
+        vec!["mn_semantic_0000_object"]
+    );
+    let subject_mentions = query::entity_mentions(&allowed, "kg_0000").unwrap();
+    let object_mentions = query::entity_mentions(&allowed, "kg_0017").unwrap();
+    assert!(subject_mentions
+        .iter()
+        .any(|mention| mention.id == "mn_semantic_0000_subject"));
+    assert!(object_mentions
+        .iter()
+        .any(|mention| mention.id == "mn_semantic_0000_object"));
+
+    let first = path::shortest_path(&allowed, "kg_0000", "kg_0017", &all_filter())
+        .unwrap()
+        .unwrap();
+    let second = path::shortest_path(&allowed, "kg_0000", "kg_0017", &all_filter())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&second).unwrap(),
+        "equal-cost path ties must resolve identically"
+    );
+    assert_eq!(first.entity_ids, vec!["kg_0000", "kg_0017"]);
+    assert_eq!(first.steps.len(), 1);
+    assert_eq!(first.steps[0].id, "cr_fixture_0000");
+    assert_eq!(first.steps[0].evidence_count, 1);
+    assert_eq!(first.steps[0].note_count, 1);
+    assert!((first.total_cost - 1.4).abs() < f64::EPSILON);
     assert!(import_semantic_graph_large_fixture(&allowed).is_err());
 }
 
