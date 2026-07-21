@@ -769,11 +769,15 @@ describe("exploratory graph UI source contract", () => {
 
   it("uses full coarse targets and restrained drawer motion without changing fine-pointer density", () => {
     const sidebar = source("./Sidebar.svelte");
+    const finePointerStyles = sidebar.split("@media (pointer: coarse)")[0];
     expect(sidebar).toMatch(/\.graph-drawer-toggle\s*\{[^}]*width:\s*44px[^}]*height:\s*44px/s);
     expect(sidebar).toContain("transform 240ms cubic-bezier(0.16, 1, 0.3, 1)");
     expect(sidebar).not.toContain("transform 180ms ease");
     expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel button[\s\S]*min-height:\s*44px/);
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel button[\s\S]*min-inline-size:\s*44px/);
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.gchip[\s\S]*min-inline-size:\s*44px/);
     expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel input[\s\S]*min-height:\s*44px/);
-    expect(sidebar).not.toMatch(/\.graph-global\s*\{[^}]*min-height:\s*44px/s);
+    expect(finePointerStyles).not.toMatch(/\.graph-global\s*\{[^}]*min-height:\s*44px/s);
+    expect(finePointerStyles).not.toMatch(/\.gchip\s*\{[^}]*min-inline-size:\s*44px/s);
   });
 });
