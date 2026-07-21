@@ -182,6 +182,7 @@ export interface KnowledgeMutationResult {
   operation_id: string;
   entity_id: string | null;
   rebuild_state: KnowledgeRebuildState;
+  rebuild_generation: number | null;
 }
 
 export interface BackfillRequest {

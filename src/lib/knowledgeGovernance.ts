@@ -33,13 +33,14 @@ export interface GovernanceController {
 }
 
 export interface GraphIndexStatus {
+  generation: number;
   state: "building" | "ready" | "error";
   error: string | null;
   stats: Record<string, number> | null;
 }
 
 export interface RebuildWaitHandle {
-  readonly terminal: Promise<GraphIndexStatus>;
+  waitFor(generation: number): Promise<GraphIndexStatus>;
   cancel(): void;
 }
 
@@ -106,17 +107,18 @@ const subscribeToGraphRebuild: RebuildStatusSubscribe = async (listener) =>
   listen<GraphIndexStatus>("graph_index_status", (event) => listener(event.payload));
 
 /**
- * Installs the rebuild listener before a mutation is sent. Without a backend
- * generation ID, an observed building event is the only safe boundary for
- * accepting the following ready/error as belonging to the queued request.
+ * Installs the rebuild listener before a mutation is sent. Events may arrive
+ * before the mutation response supplies its generation, so
+ * terminal events are buffered until waitFor selects the exact queued token.
  */
 export async function prepareRebuildWait(
   subscribe: RebuildStatusSubscribe = subscribeToGraphRebuild,
 ): Promise<RebuildWaitHandle> {
-  let sawBuilding = false;
   let settled = false;
+  let targetGeneration: number | null = null;
   let unlisten: (() => void) | null = null;
   let cleanupPending = false;
+  const bufferedTerminals = new Map<number, GraphIndexStatus>();
   let resolveTerminal!: (status: GraphIndexStatus) => void;
 
   const cleanup = () => {
@@ -129,11 +131,12 @@ export async function prepareRebuildWait(
   });
   const listener = (status: GraphIndexStatus) => {
     if (settled) return;
-    if (status.state === "building") {
-      sawBuilding = true;
+    if (status.state !== "ready" && status.state !== "error") return;
+    if (targetGeneration === null) {
+      bufferedTerminals.set(status.generation, status);
       return;
     }
-    if (!sawBuilding || (status.state !== "ready" && status.state !== "error")) return;
+    if (status.generation !== targetGeneration) return;
     settled = true;
     resolveTerminal(status);
     cleanup();
@@ -142,7 +145,20 @@ export async function prepareRebuildWait(
   unlisten = await subscribe(listener);
   if (cleanupPending) unlisten();
   return {
-    terminal,
+    waitFor(generation) {
+      if (targetGeneration !== null && targetGeneration !== generation) {
+        return Promise.reject(new Error("重建监听已绑定到另一个 generation。"));
+      }
+      targetGeneration = generation;
+      const buffered = bufferedTerminals.get(generation);
+      bufferedTerminals.clear();
+      if (buffered && !settled) {
+        settled = true;
+        resolveTerminal(buffered);
+        cleanup();
+      }
+      return terminal;
+    },
     cancel() {
       if (settled) return;
       settled = true;
@@ -184,8 +200,14 @@ export function createGovernanceController(
 
       lastOperationId = mutationResult.operation_id;
       if (mutationResult.rebuild_state === "queued") {
+        const generation = mutationResult.rebuild_generation;
+        if (generation === null || !Number.isSafeInteger(generation) || generation <= 0) {
+          rebuildWait.cancel();
+          refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但后端未返回有效的索引 generation。无法安全判定本次重建完成；撤销仍可使用。`;
+          return mutationResult;
+        }
         try {
-          const terminal = await rebuildWait.terminal;
+          const terminal = await rebuildWait.waitFor(generation);
           if (terminal.state === "error") {
             refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但图谱索引重建失败：${terminal.error || "后端未提供详细原因"}。请稍后重试刷新；撤销仍可使用。`;
             return mutationResult;

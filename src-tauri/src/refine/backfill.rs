@@ -968,7 +968,9 @@ mod tests {
             |progress| events.borrow_mut().push(progress),
             || {
                 scheduler_calls.fetch_add(1, Ordering::SeqCst);
-                scheduler.request(root.path().to_path_buf(), |_| {})
+                scheduler
+                    .request(root.path().to_path_buf(), |_| {})
+                    .map(|_| ())
             },
         );
         assert_eq!(scheduler_calls.load(Ordering::SeqCst), 1);
@@ -1049,7 +1051,9 @@ mod tests {
             |progress| events.borrow_mut().push(progress),
             || {
                 rebuilds.fetch_add(1, Ordering::SeqCst);
-                scheduler.request(root.path().to_path_buf(), |_| {})
+                scheduler
+                    .request(root.path().to_path_buf(), |_| {})
+                    .map(|_| ())
             },
         );
 

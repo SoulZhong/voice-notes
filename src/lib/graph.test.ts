@@ -44,6 +44,7 @@ if (false) {
   const invalidRebuildState: KnowledgeMutationResult = {
     operation_id: "op_1",
     entity_id: null,
+    rebuild_generation: null,
     // @ts-expect-error Public mutation commands return only the post-scheduling queued state.
     rebuild_state: "committed",
   };

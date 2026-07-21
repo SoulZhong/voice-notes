@@ -430,9 +430,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     if let Err(error) = handoff_http_refine_write(write_result, || {
                         let root = data_root(&app)?;
                         let graph_events = app.clone();
-                        graph_scheduler.request(root, move |status| {
-                            let _ = graph_events.emit("graph_index_status", status);
-                        })
+                        graph_scheduler
+                            .request(root, move |status| {
+                                let _ = graph_events.emit("graph_index_status", status);
+                            })
+                            .map(|_| ())
                     }) {
                         eprintln!("refine: HTTP Aing 提交/索引交接: {error:#}");
                     }
@@ -1807,9 +1809,11 @@ fn start_relation_backfill(
                     },
                     || {
                         let graph_events = rebuild_events.clone();
-                        scheduler.request(rebuild_root.clone(), move |status| {
-                            let _ = graph_events.emit("graph_index_status", status);
-                        })
+                        scheduler
+                            .request(rebuild_root.clone(), move |status| {
+                                let _ = graph_events.emit("graph_index_status", status);
+                            })
+                            .map(|_| ())
                     },
                 )
             }));
@@ -1986,13 +1990,14 @@ fn graph_mutation_error(command: &str, error: anyhow::Error) -> String {
 
 fn mark_knowledge_rebuild_queued(
     mut result: ipc::KnowledgeMutationResult,
-    scheduled: anyhow::Result<()>,
+    scheduled: anyhow::Result<u64>,
 ) -> Result<ipc::KnowledgeMutationResult, String> {
-    if let Err(error) = scheduled {
+    let generation = scheduled.map_err(|error| {
         eprintln!("knowledge mutation committed but graph rebuild scheduling failed: {error:#}");
-        return Err("知识整理操作已保存，但索引排队失败；应用将在下次启动或整理时自动重试".into());
-    }
+        "知识整理操作已保存，但索引排队失败；应用将在下次启动或整理时自动重试".to_string()
+    })?;
     result.rebuild_state = "queued".into();
+    result.rebuild_generation = Some(generation);
     Ok(result)
 }
 
@@ -2013,7 +2018,7 @@ fn queue_knowledge_rebuild(
 
 fn mark_person_graph_rebuild_queued(
     action: &str,
-    scheduled: anyhow::Result<()>,
+    scheduled: anyhow::Result<u64>,
 ) -> Result<(), String> {
     if let Err(error) = scheduled {
         eprintln!("{action} committed but graph rebuild scheduling failed: {error:#}");
@@ -4193,6 +4198,7 @@ mod tests {
             operation_id: "op_saved".into(),
             entity_id: None,
             rebuild_state: "committed".into(),
+            rebuild_generation: None,
         };
         let error = super::mark_knowledge_rebuild_queued(
             result,
@@ -4201,6 +4207,20 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("操作已保存"));
         assert!(error.contains("自动重试"));
+    }
+
+    #[test]
+    fn queued_knowledge_mutation_records_the_nonzero_scheduler_generation() {
+        let result = crate::ipc::KnowledgeMutationResult {
+            operation_id: "op_saved".into(),
+            entity_id: None,
+            rebuild_state: "committed".into(),
+            rebuild_generation: None,
+        };
+
+        let queued = super::mark_knowledge_rebuild_queued(result, Ok(37)).unwrap();
+        assert_eq!(queued.rebuild_state, "queued");
+        assert_eq!(queued.rebuild_generation, Some(37));
     }
 
     #[test]
@@ -4217,7 +4237,9 @@ mod tests {
 
         let error = super::handoff_http_refine_write(Ok(()), || {
             assert_eq!(std::fs::read(&saved).unwrap(), b"saved-document");
-            scheduler.request(root.path().to_path_buf(), |_| {})
+            scheduler
+                .request(root.path().to_path_buf(), |_| {})
+                .map(|_| ())
         })
         .unwrap_err();
 

@@ -34,10 +34,11 @@ import {
   type RebuildWaitHandle,
 } from "./knowledgeGovernance";
 
-const result = (operationId: string): KnowledgeMutationResult => ({
+const result = (operationId: string, rebuildGeneration = 1): KnowledgeMutationResult => ({
   operation_id: operationId,
   entity_id: null,
   rebuild_state: "queued",
+  rebuild_generation: rebuildGeneration,
 });
 
 function deferred<T>() {
@@ -60,7 +61,12 @@ function api(overrides: Partial<GovernanceApi> = {}): GovernanceApi {
   };
 }
 
-const status = (state: GraphIndexStatus["state"], error: string | null = null): GraphIndexStatus => ({
+const status = (
+  state: GraphIndexStatus["state"],
+  generation: number,
+  error: string | null = null,
+): GraphIndexStatus => ({
+  generation,
   state,
   error,
   stats: null,
@@ -68,7 +74,7 @@ const status = (state: GraphIndexStatus["state"], error: string | null = null): 
 
 function immediateRebuildWait(): PrepareRebuildWait {
   return vi.fn(async () => ({
-    terminal: Promise.resolve(status("ready")),
+    waitFor: vi.fn(async (generation: number) => status("ready", generation)),
     cancel: vi.fn(),
   }));
 }
@@ -111,28 +117,32 @@ describe("createGovernanceController", () => {
     await second;
   });
 
-  it("subscribes before mutation, ignores an old ready, then refreshes exactly once after building -> ready", async () => {
+  it("subscribes before mutation and ignores the coalesced old generation until the queued generation is ready", async () => {
     const order: string[] = [];
     let emit!: (value: GraphIndexStatus) => void;
     const cancel = vi.fn();
+    const mutation = deferred<KnowledgeMutationResult>();
     const prepare = vi.fn(async () => prepareRebuildWait(async (listener) => {
       order.push("subscribe");
       emit = listener;
       return cancel;
     }));
     const controller = createGovernanceController(
-      api({ submit: vi.fn(async () => { order.push("api"); return result("op_2"); }) }),
+      api({ submit: vi.fn(() => { order.push("api"); return mutation.promise; }) }),
       vi.fn(async () => { order.push("refresh"); }),
       prepare,
     );
 
     const operation = controller.submit(buildConfirmRelation("rel_a"));
     await vi.waitFor(() => expect(order).toEqual(["subscribe", "api"]));
-    emit(status("ready"));
+    emit(status("building", 41));
+    mutation.resolve(result("op_2", 42));
+    await Promise.resolve();
+    emit(status("ready", 41));
     await Promise.resolve();
     expect(order).toEqual(["subscribe", "api"]);
-    emit(status("building"));
-    emit(status("ready"));
+    emit(status("building", 42));
+    emit(status("ready", 42));
     await operation;
     expect(order).toEqual(["subscribe", "api", "refresh"]);
     expect(cancel).toHaveBeenCalledTimes(1);
@@ -147,14 +157,18 @@ describe("createGovernanceController", () => {
       return unlisten;
     }));
     const refresh = vi.fn();
-    const controller = createGovernanceController(api(), refresh, prepare);
+    const controller = createGovernanceController(
+      api({ submit: vi.fn().mockResolvedValue(result("op_submit", 7)) }),
+      refresh,
+      prepare,
+    );
 
     const operation = controller.submit(buildConfirmRelation("rel_a"));
     await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
-    emit(status("building"));
-    emit(status("error", "semantic index unavailable"));
+    emit(status("building", 7));
+    emit(status("error", 7, "semantic index unavailable"));
 
-    await expect(operation).resolves.toEqual(result("op_submit"));
+    await expect(operation).resolves.toEqual(result("op_submit", 7));
     expect(controller.lastOperationId).toBe("op_submit");
     expect(controller.error).toBe("");
     expect(controller.refreshError).toContain("索引重建失败");
@@ -164,7 +178,10 @@ describe("createGovernanceController", () => {
 
   it("cancels the prepared listener when mutation fails", async () => {
     const cancel = vi.fn();
-    const handle: RebuildWaitHandle = { terminal: new Promise(() => {}), cancel };
+    const handle: RebuildWaitHandle = {
+      waitFor: vi.fn(() => new Promise<GraphIndexStatus>(() => {})),
+      cancel,
+    };
     const submit = vi.fn().mockRejectedValue(new Error("ledger is read-only"));
     const refresh = vi.fn();
     const controller = createGovernanceController(api({ submit }), refresh, vi.fn(async () => handle));
@@ -177,16 +194,42 @@ describe("createGovernanceController", () => {
   it("cancels the prepared listener and refreshes once for a non-queued result", async () => {
     const cancel = vi.fn();
     const refresh = vi.fn();
-    const nonQueued = { ...result("op_immediate"), rebuild_state: "ready" } as unknown as KnowledgeMutationResult;
+    const nonQueued = {
+      ...result("op_immediate"),
+      rebuild_state: "ready",
+      rebuild_generation: null,
+    } as unknown as KnowledgeMutationResult;
     const controller = createGovernanceController(
       api({ submit: vi.fn().mockResolvedValue(nonQueued) }),
       refresh,
-      vi.fn(async () => ({ terminal: new Promise<GraphIndexStatus>(() => {}), cancel })),
+      vi.fn(async () => ({
+        waitFor: vi.fn(() => new Promise<GraphIndexStatus>(() => {})),
+        cancel,
+      })),
     );
 
     await expect(controller.submit(buildConfirmRelation("rel_a"))).resolves.toEqual(nonQueued);
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails safely when a queued mutation response omits its generation", async () => {
+    const cancel = vi.fn();
+    const waitFor = vi.fn(() => new Promise<GraphIndexStatus>(() => {}));
+    const refresh = vi.fn();
+    const malformed = { ...result("op_missing_generation"), rebuild_generation: null };
+    const controller = createGovernanceController(
+      api({ submit: vi.fn().mockResolvedValue(malformed) }),
+      refresh,
+      vi.fn(async () => ({ waitFor, cancel })),
+    );
+
+    await expect(controller.submit(buildConfirmRelation("rel_a"))).resolves.toEqual(malformed);
+    expect(controller.lastOperationId).toBe("op_missing_generation");
+    expect(controller.refreshError).toContain("generation");
+    expect(waitFor).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(refresh).not.toHaveBeenCalled();
   });
 
   it("distinguishes refresh failure, keeps the operation ID, and offers retry", async () => {
@@ -220,7 +263,7 @@ describe("createGovernanceController", () => {
 });
 
 describe("prepareRebuildWait", () => {
-  it("accepts only a terminal event observed after building and unsubscribes once", async () => {
+  it("accepts only the requested generation terminal and unsubscribes once", async () => {
     let emit!: (value: GraphIndexStatus) => void;
     const unlisten = vi.fn();
     const handle = await prepareRebuildWait(async (listener) => {
@@ -228,14 +271,16 @@ describe("prepareRebuildWait", () => {
       return unlisten;
     });
     let settled = false;
-    void handle.terminal.then(() => { settled = true; });
+    const terminal = handle.waitFor(12);
+    void terminal.then(() => { settled = true; });
 
-    emit(status("ready"));
+    emit(status("building", 11));
+    emit(status("ready", 11));
     await Promise.resolve();
     expect(settled).toBe(false);
-    emit(status("building"));
-    emit(status("ready"));
-    await expect(handle.terminal).resolves.toEqual(status("ready"));
+    emit(status("building", 12));
+    emit(status("ready", 12));
+    await expect(terminal).resolves.toEqual(status("ready", 12));
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 });

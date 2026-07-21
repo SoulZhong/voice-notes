@@ -715,6 +715,7 @@ fn operation_result(
         operation_id,
         entity_id,
         rebuild_state: "committed".into(),
+        rebuild_generation: None,
     }
 }
 

@@ -109,6 +109,7 @@ pub struct BuildStats {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexStatus {
+    pub generation: u64,
     pub state: String,
     pub error: Option<String>,
     pub stats: Option<BuildStats>,
@@ -1346,6 +1347,12 @@ struct SchedulerInner {
 #[derive(Clone)]
 struct RebuildRequest {
     data_root: PathBuf,
+    status_targets: Vec<RebuildStatusTarget>,
+}
+
+#[derive(Clone)]
+struct RebuildStatusTarget {
+    generation: u64,
     emit: Arc<EmitFn>,
 }
 
@@ -1397,8 +1404,8 @@ impl RebuildScheduler {
         &self,
         data_root: PathBuf,
         emit: impl Fn(IndexStatus) + Send + Sync + 'static,
-    ) -> anyhow::Result<()> {
-        let generation_to_spawn = {
+    ) -> anyhow::Result<u64> {
+        let (queued_generation, generation_to_spawn) = {
             let mut state = self
                 .inner
                 .state
@@ -1409,23 +1416,37 @@ impl RebuildScheduler {
                 .generation
                 .checked_add(1)
                 .expect("semantic graph scheduler generation exhausted");
-            state.latest = Some(RebuildRequest {
-                data_root,
+            let queued_generation = state.generation;
+            let mut status_targets = if state.dirty {
+                state
+                    .latest
+                    .take()
+                    .map(|request| request.status_targets)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            status_targets.push(RebuildStatusTarget {
+                generation: queued_generation,
                 emit: Arc::new(emit),
             });
+            state.latest = Some(RebuildRequest {
+                data_root,
+                status_targets,
+            });
             state.dirty = true;
-            if state.running_generation.is_none() {
-                let generation = state.generation;
-                state.running_generation = Some(generation);
-                Some(generation)
+            let generation_to_spawn = if state.running_generation.is_none() {
+                state.running_generation = Some(queued_generation);
+                Some(queued_generation)
             } else {
                 None
-            }
+            };
+            (queued_generation, generation_to_spawn)
         };
         if let Some(generation) = generation_to_spawn {
             spawn_claimed_scheduler(self.inner.clone(), generation)?;
         }
-        Ok(())
+        Ok(queued_generation)
     }
 }
 
@@ -1511,14 +1532,7 @@ fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) -> anyho
         if let Some(newer_generation) = newer_generation {
             return spawn_claimed_scheduler(inner, newer_generation);
         } else if let Some(request) = request_for_error {
-            emit_status(
-                &request.emit,
-                IndexStatus {
-                    state: "error".into(),
-                    error: Some(STATUS_ERROR.into()),
-                    stats: None,
-                },
-            );
+            emit_request_status(&request, "error", Some(STATUS_ERROR), None);
         }
         anyhow::bail!("semantic graph rebuild is pending retry");
     }
@@ -1527,6 +1541,25 @@ fn spawn_claimed_scheduler(inner: Arc<SchedulerInner>, generation: u64) -> anyho
 
 fn emit_status(emit: &Arc<EmitFn>, status: IndexStatus) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit(status)));
+}
+
+fn emit_request_status(
+    request: &RebuildRequest,
+    state: &str,
+    error: Option<&str>,
+    stats: Option<&BuildStats>,
+) {
+    for target in &request.status_targets {
+        emit_status(
+            &target.emit,
+            IndexStatus {
+                generation: target.generation,
+                state: state.into(),
+                error: error.map(str::to_owned),
+                stats: stats.cloned(),
+            },
+        );
+    }
 }
 
 fn run_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
@@ -1550,14 +1583,7 @@ fn run_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
         let Some(request) = request else {
             break;
         };
-        emit_status(
-            &request.emit,
-            IndexStatus {
-                state: "building".into(),
-                error: None,
-                stats: None,
-            },
-        );
+        emit_request_status(&request, "building", None, None);
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &inner.rebuilder {
                 Rebuilder::Sources => rebuild_from_sources(&request.data_root),
@@ -1584,25 +1610,11 @@ fn run_scheduler(inner: Arc<SchedulerInner>, generation: u64) {
                 if let Err(error) = clear_result {
                     eprintln!("graph: unable to clear semantic index retry marker: {error:#}");
                 }
-                emit_status(
-                    &request.emit,
-                    IndexStatus {
-                        state: "ready".into(),
-                        error: None,
-                        stats: Some(stats),
-                    },
-                );
+                emit_request_status(&request, "ready", None, Some(&stats));
             }
             Err(error) => {
                 eprintln!("graph: semantic index rebuild failed: {error:#}");
-                emit_status(
-                    &request.emit,
-                    IndexStatus {
-                        state: "error".into(),
-                        error: Some(STATUS_ERROR.into()),
-                        stats: None,
-                    },
-                );
+                emit_request_status(&request, "error", Some(STATUS_ERROR), None);
             }
         }
     }
@@ -2647,6 +2659,124 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn scheduler_statuses_identify_the_generation_queued_for_a_dirty_rerun() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_for_build = gate.clone();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_rebuilder = builds.clone();
+        let scheduler = RebuildScheduler::with_rebuilder(move |_| {
+            let call = builds_for_rebuilder.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let (lock, ready) = &*gate_for_build;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+            }
+            Ok(BuildStats::default())
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (status_tx, status_rx) = mpsc::channel();
+
+        let old_generation = scheduler
+            .request(root.path().to_path_buf(), {
+                let status_tx = status_tx.clone();
+                move |status| status_tx.send(status).unwrap()
+            })
+            .unwrap();
+        assert_ne!(old_generation, 0);
+        let old_building = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(old_building.state, "building");
+        assert_eq!(old_building.generation, old_generation);
+
+        let queued_generation = scheduler
+            .request(root.path().to_path_buf(), {
+                let status_tx = status_tx.clone();
+                move |status| status_tx.send(status).unwrap()
+            })
+            .unwrap();
+        assert!(queued_generation > old_generation);
+        {
+            let (lock, ready) = &*gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        let old_ready = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued_building = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued_ready = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (old_ready.state.as_str(), old_ready.generation),
+            ("ready", old_generation)
+        );
+        assert_eq!(
+            (queued_building.state.as_str(), queued_building.generation),
+            ("building", queued_generation),
+        );
+        assert_eq!(
+            (queued_ready.state.as_str(), queued_ready.generation),
+            ("ready", queued_generation),
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scheduler_coalescing_does_not_lose_any_returned_generation_terminal() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_for_build = gate.clone();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_rebuilder = builds.clone();
+        let scheduler = RebuildScheduler::with_rebuilder(move |_| {
+            if builds_for_rebuilder.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (lock, ready) = &*gate_for_build;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+            }
+            Ok(BuildStats::default())
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (status_tx, status_rx) = mpsc::channel();
+        let request = |scheduler: &RebuildScheduler| {
+            scheduler
+                .request(root.path().to_path_buf(), {
+                    let status_tx = status_tx.clone();
+                    move |status| status_tx.send(status).unwrap()
+                })
+                .unwrap()
+        };
+
+        let first = request(&scheduler);
+        let first_building = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (first_building.state.as_str(), first_building.generation),
+            ("building", first)
+        );
+        let second = request(&scheduler);
+        let third = request(&scheduler);
+        assert!(first < second && second < third);
+        {
+            let (lock, ready) = &*gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        let mut ready_generations = std::collections::BTreeSet::new();
+        while ready_generations.len() < 3 {
+            let status = status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if status.state == "ready" {
+                ready_generations.insert(status.generation);
+            }
+        }
+        assert_eq!(
+            ready_generations,
+            std::collections::BTreeSet::from([first, second, third])
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]

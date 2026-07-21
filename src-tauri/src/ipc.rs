@@ -346,6 +346,33 @@ pub struct KnowledgeMutationResult {
     pub operation_id: String,
     pub entity_id: Option<String>,
     pub rebuild_state: String,
+    pub rebuild_generation: Option<u64>,
+}
+
+#[cfg(test)]
+mod knowledge_mutation_result_tests {
+    use super::KnowledgeMutationResult;
+
+    #[test]
+    fn serialization_exposes_queued_generation_and_committed_null() {
+        let queued = serde_json::to_value(KnowledgeMutationResult {
+            operation_id: "op_queued".into(),
+            entity_id: None,
+            rebuild_state: "queued".into(),
+            rebuild_generation: Some(37),
+        })
+        .unwrap();
+        assert_eq!(queued["rebuild_generation"], 37);
+
+        let committed = serde_json::to_value(KnowledgeMutationResult {
+            operation_id: "op_committed".into(),
+            entity_id: None,
+            rebuild_state: "committed".into(),
+            rebuild_generation: None,
+        })
+        .unwrap();
+        assert!(committed["rebuild_generation"].is_null());
+    }
 }
 
 /// 实体详情面板里「出现的笔记」一项(联查了标题)。
