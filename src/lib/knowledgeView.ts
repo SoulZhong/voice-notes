@@ -1,4 +1,4 @@
-import type { EntitySummary, RenderEdge } from "./graph";
+import type { EntitySummary, GraphData, RenderEdge } from "./graph";
 import type {
   KnowledgeFilter,
   KnowledgePath,
@@ -23,6 +23,17 @@ export const GLOBAL_SEMANTIC_PRESENCE_FILTER: KnowledgeFilter = {
   predicate_types: [],
   include_history: true,
 };
+
+/** D3 默认约 300 帧；0.23 在 alphaMin=0.001 时约 27 帧，约 450ms 后自动冻结。 */
+export const NORMAL_GRAPH_ALPHA_DECAY = 0.23;
+
+export function graphSimulationTickBudget(
+  alphaDecay = NORMAL_GRAPH_ALPHA_DECAY,
+  alphaMin = 0.001,
+): number {
+  if (!(alphaDecay > 0 && alphaDecay < 1) || !(alphaMin > 0 && alphaMin < 1)) return 0;
+  return Math.ceil(Math.log(alphaMin) / Math.log(1 - alphaDecay));
+}
 
 const CORE_PREDICATE_LABELS: Readonly<Record<string, string>> = {
   participates_in: "参与",
@@ -441,8 +452,21 @@ export type GlobalSemanticPresence = "unknown" | "present" | "absent";
 export function shouldUseLegacyFallback(
   presence: GlobalSemanticPresence,
   filtered: SemanticGraphData,
+  requestFailed = false,
 ): boolean {
-  return presence === "absent" && filtered.semantic_edges.length === 0;
+  return requestFailed || (presence === "absent" && filtered.semantic_edges.length === 0);
+}
+
+export function legacyFallbackGraph(
+  semantic: SemanticGraphData,
+  legacy: Pick<GraphData, "nodes" | "edges">,
+): SemanticGraphData {
+  return {
+    ...semantic,
+    nodes: legacy.nodes,
+    semantic_edges: [],
+    cooccurrence_edges: legacy.edges,
+  };
 }
 
 export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): RenderEdge[] {

@@ -54,11 +54,20 @@
       include_cooccurrence: false,
     });
   }
+
+  function positionMenu(details: HTMLDetailsElement) {
+    if (!details.open) return;
+    const rect = details.getBoundingClientRect();
+    const menuWidth = details.classList.contains("date-menu") ? 244 : 196;
+    const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - menuWidth - 8));
+    details.style.setProperty("--menu-left", `${left}px`);
+    details.style.setProperty("--menu-top", `${rect.bottom + 6}px`);
+  }
 </script>
 
 <div class="map-toolbar" aria-label="知识图谱筛选与视图控制">
   <div class="filter-run">
-    <details class="filter-menu">
+    <details class="filter-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
       <summary>实体类型{filter.entity_kinds.length ? ` · ${filter.entity_kinds.length}` : ""}</summary>
       <fieldset>
         <legend>实体类型</legend>
@@ -75,7 +84,7 @@
       </fieldset>
     </details>
 
-    <details class="filter-menu">
+    <details class="filter-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
       <summary>关系类型{filter.predicate_types.length ? ` · ${filter.predicate_types.length}` : ""}</summary>
       <fieldset>
         <legend>关系类型</legend>
@@ -92,7 +101,7 @@
       </fieldset>
     </details>
 
-    <details class="filter-menu date-menu">
+    <details class="filter-menu date-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
       <summary>有效时间{filter.from || filter.to ? " · 已设定" : ""}</summary>
       <div class="date-fields">
         <label>
@@ -155,17 +164,22 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: nowrap;
     gap: 8px 16px;
     min-height: 44px;
     padding: 6px 10px;
+    overflow-x: auto;
+    overflow-y: hidden;
     border-bottom: 1px solid var(--hairline);
     background: var(--canvas);
     color: var(--ink-secondary);
     font-size: 0.76rem;
+    white-space: nowrap;
+    scrollbar-width: thin;
   }
   .filter-run, .view-run { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .filter-run { flex-wrap: wrap; }
-  .view-run { justify-content: flex-end; white-space: nowrap; }
+  .filter-run { flex: none; flex-wrap: nowrap; }
+  .view-run { flex: none; justify-content: flex-end; white-space: nowrap; }
   details { position: relative; }
   summary, button, .inline-toggle {
     min-height: 32px;
@@ -191,10 +205,10 @@
     color: var(--ink);
   }
   fieldset, .date-fields {
-    position: absolute;
+    position: fixed;
     z-index: 20;
-    top: calc(100% + 6px);
-    left: 0;
+    top: var(--menu-top, 52px);
+    left: var(--menu-left, 8px);
     display: grid;
     gap: 3px;
     min-width: 180px;
@@ -242,10 +256,6 @@
   summary:focus-visible, button:focus-visible, label:has(input:focus-visible), input:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-  }
-  @media (max-width: 980px) {
-    .map-toolbar { align-items: flex-start; flex-direction: column; }
-    .view-run { width: 100%; justify-content: flex-start; overflow-x: auto; }
   }
   @media (pointer: coarse) {
     summary, button, .inline-toggle, fieldset label, .date-fields input { min-height: 44px; }
