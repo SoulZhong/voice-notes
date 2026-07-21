@@ -18,6 +18,7 @@
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
+  import { noteGraphState } from "$lib/noteGraph.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -86,9 +87,10 @@
     }
   });
 
-  // ── 图谱:只保留实体搜索与类型筛选；复杂治理和路径工具不占用日常界面。──
+  // ── 图谱:实体与文章两种视角共享搜索；治理和关系筛选留在画布渐进展开。──
   let graphEnts = $state<EntitySummary[]>([]);
   let graphDrawerOpen = $state(false);
+  const graphNotes = $derived(noteGraphState.data.nodes);
 
   $effect(() => {
     if (tab !== "graph") graphDrawerOpen = false;
@@ -103,7 +105,11 @@
   }
   $effect(() => {
     if (tab !== "graph") return;
-    void refreshGraphEntities();
+    if (graphFilter.mode === "note") {
+      if (noteGraphState.status === "idle") void noteGraphState.load();
+    } else {
+      void refreshGraphEntities();
+    }
   });
 
   const graphKinds = $derived.by(() => {
@@ -117,6 +123,12 @@
       const q = graphFilter.query.trim().toLowerCase();
       if (!q) return true;
       return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
+    }),
+  );
+  const graphNotesShown = $derived(
+    graphNotes.filter((note) => {
+      const q = graphFilter.query.trim().toLowerCase();
+      return !q || note.name.toLowerCase().includes(q);
     }),
   );
   const graphSelected = $derived($page.url.searchParams.get("e"));
@@ -438,41 +450,72 @@
       {/if}
     </ul>
   {:else if tab === "graph"}
+    <div class="gmode" aria-label="图谱视角">
+      <button
+        class="gmode-seg"
+        class:on={graphFilter.mode === "entity"}
+        onclick={() => { graphFilter.mode = "entity"; if ($page.url.search) goto("/graph"); }}
+      >实体</button>
+      <button
+        class="gmode-seg"
+        class:on={graphFilter.mode === "note"}
+        onclick={() => { graphFilter.mode = "note"; if ($page.url.search) goto("/graph"); }}
+      >文章</button>
+    </div>
     <input
       class="search"
       type="search"
       name="graph-search"
-      aria-label="搜索人物、项目或术语"
-      placeholder="搜索人物、项目或术语"
+      aria-label={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索人物、项目或术语"}
+      placeholder={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索人物、项目或术语"}
       bind:value={graphFilter.query}
     />
-    {#if graphFilter.query.trim()}
+    {#if graphFilter.mode === "entity" && graphFilter.query.trim()}
       <p class="search-behavior">搜索只聚焦匹配实体，画布中的其他关系仍会保留。</p>
     {/if}
-    <div class="gchips">
-      <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
-      {#each graphKinds as k (k)}
-        <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
-          <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
-        </button>
-      {/each}
-    </div>
-    {#if graphShown.length === 0}
-      <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+    {#if graphFilter.mode === "entity"}
+      <div class="gchips">
+        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
+        {#each graphKinds as k (k)}
+          <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
+            <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
+          </button>
+        {/each}
+      </div>
+      {#if graphShown.length === 0}
+        <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+      {/if}
+      <ul class="list">
+        {#each graphShown as e (e.id)}
+          <li class="entity-row">
+            <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
+              <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
+              <div class="main-line">
+                <span class="title">{e.name}</span>
+                <span class="meta">{kindLabel(e.kind)} · {e.note_count} 篇笔记</span>
+              </div>
+            </a>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      {#if graphNotesShown.length === 0}
+        <p class="hint">{noteGraphState.status === "error" ? "文章图谱加载失败" : graphNotes.length === 0 ? "还没有进入图谱的笔记" : "没有匹配的笔记"}</p>
+      {/if}
+      <ul class="list">
+        {#each graphNotesShown as note (note.id)}
+          <li>
+            <a class="item entity" href={"/notes/" + encodeURIComponent(note.id)}>
+              <span class="dot" style="background: {kindInk('note')}"></span>
+              <div class="main-line">
+                <span class="title">{note.name}</span>
+                <span class="meta">{note.note_count} 个实体 · {note.mention_total} 次提及</span>
+              </div>
+            </a>
+          </li>
+        {/each}
+      </ul>
     {/if}
-    <ul class="list">
-      {#each graphShown as e (e.id)}
-        <li class="entity-row">
-          <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
-            <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
-            <div class="main-line">
-              <span class="title">{e.name}</span>
-              <span class="meta">{kindLabel(e.kind)} · {e.note_count} 篇笔记</span>
-            </div>
-          </a>
-        </li>
-      {/each}
-    </ul>
   {:else}
   <input class="search" type="search" placeholder="按标题过滤" bind:value={query} />
 
@@ -802,6 +845,27 @@
     border-color: var(--accent);
   }
   .search-behavior { margin: -0.45rem 0 0.6rem; color: var(--ink-faint); font-size: 0.7rem; line-height: 1.45; }
+  .gmode {
+    display: flex;
+    gap: 2px;
+    margin: 0.6rem 0 0.5rem;
+    padding: 2px;
+    border-radius: var(--radius-md);
+    background: var(--surface-press);
+  }
+  .gmode-seg {
+    flex: 1;
+    min-height: 30px;
+    border: 0;
+    border-radius: calc(var(--radius-md) - 2px);
+    background: transparent;
+    color: var(--ink-secondary);
+    font: inherit;
+    font-size: 0.8em;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .gmode-seg.on { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-btn); }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
   .gchips {
     display: flex;

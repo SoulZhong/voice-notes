@@ -611,8 +611,8 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).toContain("character.codePointAt(0)!.toString(16)");
     expect(forceGraph).toContain("edge.x1 === edge.x2 && edge.y1 <= edge.y2");
     expect(forceGraph).toContain("edgeLabelVisible(");
-    expect(forceGraph).toContain("visibleSemanticCount <= 30");
-    expect(forceGraph).toContain("viewZoom >= 1.35");
+    expect(forceGraph).toContain("visibleSemanticCount <= 80");
+    expect(forceGraph).toContain("viewZoom >= 1.15");
     expect(forceGraph).toContain('class:cooccurrence={l.layer === "cooccurrence"}');
     expect(forceGraph).not.toContain("text-overflow: ellipsis");
     expect(forceGraph).not.toContain("line-clamp");
@@ -623,13 +623,13 @@ describe("exploratory graph UI source contract", () => {
     for (const copy of [
       "明确关系",
       "箭头表示方向 · 点击线查看依据",
-      "共同出现",
-      "虚线只表示同篇笔记提到",
+      "共同上下文",
+      "虚线表示同篇提及或共享实体",
     ]) {
       expect(forceGraph).toContain(copy);
     }
-    expect(forceGraph).toMatch(/\.semantic-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*2px/s);
-    expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke-width:\s*1\.25px[^}]*stroke-dasharray:\s*4 5/s);
+    expect(forceGraph).toMatch(/\.semantic-line\s*\{[^}]*stroke:\s*var\(--accent\)[^}]*stroke-width:\s*2\.75px/s);
+    expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*1\.75px[^}]*stroke-dasharray:\s*5 5/s);
     expect(forceGraph).toContain('class="edge-key"');
   });
 
@@ -660,7 +660,7 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).toMatch(/return\s+0\.15/);
   });
 
-  it("keeps the everyday graph focused on search, entity types, and direct exploration", () => {
+  it("keeps core exploration visible while expert path and queues stay omitted", () => {
     const route = source("../routes/graph/+page.svelte");
     const sidebar = source("./Sidebar.svelte");
     expect(route).toContain("semanticGraph(");
@@ -672,25 +672,27 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain('class="canvas-shell"');
     expect(route).toContain("<EntityGovernance");
     expect(route).toContain("<RelationDrawer");
-    expect(route).toMatch(/<EntityGovernance[\s\S]{0,260}simple=\{true\}/);
+    expect(route).toContain("simple={!manageOpen}");
     expect(route).toMatch(/<RelationDrawer[\s\S]{0,180}simple=\{true\}/);
     expect(sidebar).toContain("搜索人物、项目或术语");
     expect(sidebar).toContain('class="gchips"');
-    for (const removed of ["待整理", "设为路径起点", 'class="gmode"']) {
+    expect(sidebar).toContain('class="gmode"');
+    expect(sidebar).toContain("文章");
+    for (const removed of ["待整理", "设为路径起点"]) {
       expect(sidebar).not.toContain(removed);
     }
   });
 
-  it("removes specialist graph controls from the everyday canvas", () => {
+  it("retains filtering, article view, and right-click governance without specialist workflows", () => {
     const route = source("../routes/graph/+page.svelte");
+    for (const retained of ["KnowledgeGraphToolbar", "noteGraphState", "onContextMenu={openCtxMenu}", "查看实体详情", "管理实体"]) {
+      expect(route).toContain(retained);
+    }
     for (const removed of [
-      "KnowledgeGraphToolbar",
       "KnowledgePathPanel",
       "PendingReviewPanel",
-      "noteGraphState",
       "pathGeneration",
       'class="accessible-network"',
-      "onContextMenu={openCtxMenu}",
     ]) {
       expect(route).not.toContain(removed);
     }
