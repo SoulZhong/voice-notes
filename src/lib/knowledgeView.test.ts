@@ -19,6 +19,7 @@ import {
   pathEmphasis,
   preserveGraphExplorationState,
   preserveGraphNodePositions,
+  resolveGraphRefreshState,
   runGuardedPathRefresh,
   relationLabel,
   searchAdmissionIds,
@@ -114,6 +115,37 @@ describe("graph refresh continuity", () => {
       { id: "kg_new", name: "New" },
     ]);
     expect(result.some((item) => item.id === "kg_removed")).toBe(false);
+  });
+
+  it("rebases a successful refresh when no visible entity survives", () => {
+    const result = resolveGraphRefreshState(
+      graph([node("kg_new")], []),
+      new Set(["kg_removed"]),
+      new Map([["kg_removed", 2]]),
+      [],
+      new Set(["kg_new"]),
+    );
+
+    expect(result).toEqual({
+      visibleIds: new Set(["kg_new"]),
+      expansionDepth: new Map(),
+      shouldResetView: true,
+    });
+  });
+
+  it("rebases a failed refresh onto a non-overlapping legacy fallback", () => {
+    const fallback = graph([node("legacy_new")], []);
+    const result = resolveGraphRefreshState(
+      fallback,
+      new Set(["semantic_removed"]),
+      new Map([["semantic_removed", 1]]),
+      [],
+      new Set(["legacy_new"]),
+    );
+
+    expect(result.visibleIds).toEqual(new Set(["legacy_new"]));
+    expect(result.expansionDepth.size).toBe(0);
+    expect(result.shouldResetView).toBe(true);
   });
 });
 
@@ -659,7 +691,7 @@ describe("exploratory graph UI source contract", () => {
     const forceGraph = source("./ForceGraph.svelte");
     expect(route).toContain('type SemanticLoadMode = "reset-view" | "preserve-view"');
     expect(route).toContain('loadSemantic(effectiveGraphFilter, "preserve-view")');
-    expect(route).toContain("preserveGraphExplorationState(");
+    expect(route).toContain("resolveGraphRefreshState(");
     expect(route).toContain("resetKey={graphViewResetKey}");
     expect(forceGraph).toContain("resetKey?: string | number");
     expect(forceGraph).toContain("preserveGraphNodePositions(");

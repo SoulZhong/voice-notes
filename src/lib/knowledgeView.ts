@@ -53,6 +53,34 @@ export function preserveGraphExplorationState(
   return { visibleIds: nextVisible, expansionDepth: nextDepth };
 }
 
+/** Preserve a refresh only while at least one visible entity can anchor the old camera. */
+export function resolveGraphRefreshState(
+  graph: Pick<SemanticGraphData, "nodes">,
+  visibleIds: ReadonlySet<string>,
+  expansionDepth: ReadonlyMap<string, number>,
+  additionallyVisibleIds: readonly string[],
+  resetVisibleIds: ReadonlySet<string>,
+): {
+  visibleIds: Set<string>;
+  expansionDepth: Map<string, number>;
+  shouldResetView: boolean;
+} {
+  const preserved = preserveGraphExplorationState(
+    graph,
+    visibleIds,
+    expansionDepth,
+    additionallyVisibleIds,
+  );
+  if (preserved.visibleIds.size > 0 || graph.nodes.length === 0) {
+    return { ...preserved, shouldResetView: false };
+  }
+  return {
+    visibleIds: new Set(resetVisibleIds),
+    expansionDepth: new Map(),
+    shouldResetView: true,
+  };
+}
+
 /** Re-attach the last simulation coordinates to nodes that survived a data refresh. */
 export function preserveGraphNodePositions<T extends { id: string }>(
   nodes: readonly T[],
