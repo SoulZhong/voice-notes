@@ -36,6 +36,7 @@ export interface RelationBackfillState {
   rebuildGeneration: number | null;
   terminalPhase: RelationBackfillTerminalPhase | null;
   published: boolean;
+  publishedGeneration: number | null;
   error: string;
   technicalError: string;
   indexError: string;
@@ -81,6 +82,7 @@ const initialState = (): RelationBackfillState => ({
   rebuildGeneration: null,
   terminalPhase: null,
   published: false,
+  publishedGeneration: null,
   error: "",
   technicalError: "",
   indexError: "",
@@ -185,6 +187,7 @@ export function createRelationBackfillController(
       phase,
       terminalPhase: phase,
       published,
+      publishedGeneration: published ? state.rebuildGeneration : null,
       currentNoteId: null,
       error: summary,
       technicalError,
@@ -205,6 +208,7 @@ export function createRelationBackfillController(
       phase: "index-failed",
       terminalPhase: phase,
       published: false,
+      publishedGeneration: null,
       currentNoteId: null,
       error: "关系已经处理，但图谱索引未能安全发布。请单独重试索引。",
       indexError: detail || "后端未提供索引失败详情",
@@ -217,6 +221,7 @@ export function createRelationBackfillController(
       phase: "waiting-for-index",
       terminalPhase: phase,
       published: false,
+      publishedGeneration: null,
       rebuildGeneration: generation,
       error: "已处理的关系正在等待对应的图谱索引安全发布。",
       indexError: "",
@@ -305,6 +310,7 @@ export function createRelationBackfillController(
         rebuildGeneration: null,
         terminalPhase: null,
         published: false,
+        publishedGeneration: null,
         error: "",
         technicalError: "",
         indexError: "",
@@ -346,6 +352,7 @@ export function createRelationBackfillController(
               rebuildGeneration: event.rebuild_generation,
               terminalPhase,
               published: false,
+              publishedGeneration: null,
               technicalError,
               indexError: event.index_error || "",
             });
@@ -438,6 +445,7 @@ export function createRelationBackfillController(
         phase: "index-retrying",
         terminalPhase,
         published: false,
+        publishedGeneration: null,
         rebuildGeneration: null,
         error: "正在重新发布图谱索引。",
         indexError: "",

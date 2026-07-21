@@ -3727,10 +3727,13 @@ fn semantic_graph_debug_fixture_root(session_id: &str) -> Option<PathBuf> {
 
 #[cfg(debug_assertions)]
 fn remove_semantic_graph_debug_fixture(session_id: &str) {
-    semantic_graph_debug_sessions()
+    let root = semantic_graph_debug_sessions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(session_id);
+    if let Some(root) = root {
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Debug-only desktop harness. It always creates a new OS-temp child itself;
@@ -3769,10 +3772,17 @@ fn semantic_graph_debug_fixture() -> Result<SemanticGraphDebugFixture, String> {
     let path = graph::path::shortest_path(&fixture_root, "kg_0000", "kg_0017", &filter)
         .map_err(|error| format!("读取隔离夹具路径失败:{error:#}"))?
         .ok_or_else(|| "隔离夹具没有预期路径".to_string())?;
-    semantic_graph_debug_sessions()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_id.clone(), fixture_root);
+    let stale_roots = {
+        let mut sessions = semantic_graph_debug_sessions()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale_roots = sessions.drain().map(|(_, root)| root).collect::<Vec<_>>();
+        sessions.insert(session_id.clone(), fixture_root);
+        stale_roots
+    };
+    for stale_root in stale_roots {
+        let _ = std::fs::remove_dir_all(stale_root);
+    }
     Ok(SemanticGraphDebugFixture {
         session_id,
         graph,
@@ -4308,8 +4318,14 @@ mod tests {
         ));
         assert!(source.contains("fn semantic_graph_debug_fixture()"));
         assert!(source.contains("fn semantic_graph_debug_relation_detail("));
-        super::remove_semantic_graph_debug_fixture(&fixture.session_id);
-        std::fs::remove_dir_all(root).unwrap();
+
+        let replacement = super::semantic_graph_debug_fixture().unwrap();
+        assert!(super::semantic_graph_debug_fixture_root(&fixture.session_id).is_none());
+        assert!(!root.exists(), "replaced server-owned fixture root must be deleted");
+        let replacement_root =
+            super::semantic_graph_debug_fixture_root(&replacement.session_id).unwrap();
+        super::remove_semantic_graph_debug_fixture(&replacement.session_id);
+        assert!(!replacement_root.exists(), "released fixture root must be deleted");
     }
 
     #[test]

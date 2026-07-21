@@ -22,13 +22,17 @@
   let dialog: HTMLDialogElement;
   let closeButton: HTMLButtonElement;
   let unsubscribeState: (() => void) | null = null;
-  let completionReported = false;
+  let lastReportedGeneration: number | null = null;
 
   onMount(() => {
     unsubscribeState = controller.subscribe((next) => {
       state = next;
-      if (next.published && !completionReported) {
-        completionReported = true;
+      if (
+        next.published &&
+        next.publishedGeneration !== null &&
+        next.publishedGeneration !== lastReportedGeneration
+      ) {
+        lastReportedGeneration = next.publishedGeneration;
         void onCompleted();
       }
     });
@@ -43,7 +47,6 @@
   $effect(() => {
     if (!dialog) return;
     if (open && !dialog.open) {
-      completionReported = false;
       dialog.showModal();
       closeButton?.focus();
       void controller.preview(noteIds);
