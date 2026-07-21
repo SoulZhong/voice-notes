@@ -1759,6 +1759,141 @@ fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, Str
 }
 
 /// 图谱全部实体(列表视图),按出现笔记数降序。图谱失败/空 → 空列表,不 Err。
+fn graph_read_error(command: &str, error: anyhow::Error) -> String {
+    eprintln!("{command}: semantic graph read failed: {error:#}");
+    "知识图谱暂时不可用，请稍后重试".into()
+}
+
+fn graph_mutation_error(command: &str, error: anyhow::Error) -> String {
+    eprintln!("{command}: knowledge mutation failed: {error:#}");
+    "无法保存知识整理操作；请确认目标仍存在且整理记录完好".into()
+}
+
+fn queue_knowledge_rebuild(
+    app: &AppHandle,
+    root: PathBuf,
+    mut result: ipc::KnowledgeMutationResult,
+) -> ipc::KnowledgeMutationResult {
+    let graph_events = app.clone();
+    app.state::<AppState>()
+        .graph_scheduler
+        .request(root, move |status| {
+            let _ = graph_events.emit("graph_index_status", status);
+        });
+    result.rebuild_state = "queued".into();
+    result
+}
+
+#[tauri::command]
+fn semantic_graph(
+    app: AppHandle,
+    filter: graph::query::GraphFilter,
+) -> Result<ipc::SemanticGraphData, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("semantic_graph", error))?;
+    graph::query::semantic_graph(&root, &filter)
+        .map_err(|error| graph_read_error("semantic_graph", error))
+}
+
+#[tauri::command]
+fn semantic_entity_detail(
+    app: AppHandle,
+    entity_id: String,
+    filter: graph::query::GraphFilter,
+) -> Result<Option<ipc::SemanticEntityDetail>, String> {
+    let root =
+        data_root(&app).map_err(|error| graph_read_error("semantic_entity_detail", error))?;
+    graph::query::semantic_entity_detail(&root, &entity_id, &filter)
+        .map_err(|error| graph_read_error("semantic_entity_detail", error))
+}
+
+#[tauri::command]
+fn relation_detail(
+    app: AppHandle,
+    relation_id: String,
+) -> Result<Option<ipc::RelationDetail>, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("relation_detail", error))?;
+    graph::query::relation_detail(&root, &relation_id)
+        .map_err(|error| graph_read_error("relation_detail", error))
+}
+
+#[tauri::command]
+fn pending_review(
+    app: AppHandle,
+    filter: graph::query::GraphFilter,
+) -> Result<Vec<ipc::PendingReviewItem>, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("pending_review", error))?;
+    graph::query::pending_review(&root, &filter)
+        .map_err(|error| graph_read_error("pending_review", error))
+}
+
+#[tauri::command]
+fn entity_mentions(app: AppHandle, entity_id: String) -> Result<Vec<ipc::MentionEvidence>, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("entity_mentions", error))?;
+    graph::query::entity_mentions(&root, &entity_id)
+        .map_err(|error| graph_read_error("entity_mentions", error))
+}
+
+#[tauri::command]
+fn shortest_path(
+    app: AppHandle,
+    start: String,
+    end: String,
+    filter: graph::query::GraphFilter,
+) -> Result<Option<ipc::KnowledgePath>, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("shortest_path", error))?;
+    graph::path::shortest_path(&root, &start, &end, &filter)
+        .map_err(|error| graph_read_error("shortest_path", error))
+}
+
+#[tauri::command]
+fn apply_knowledge_operation(
+    app: AppHandle,
+    operation: ipc::KnowledgeOperationInput,
+) -> Result<ipc::KnowledgeMutationResult, String> {
+    let root = data_root(&app)
+        .map_err(|error| graph_mutation_error("apply_knowledge_operation", error))?;
+    let result = graph::query::apply_operation(&root, &operation)
+        .map_err(|error| graph_mutation_error("apply_knowledge_operation", error))?;
+    // `overrides::update` has returned here, so its cross-process ledger lock is released before
+    // the scheduler can sample or rebuild.
+    Ok(queue_knowledge_rebuild(&app, root, result))
+}
+
+#[tauri::command]
+fn split_entity(
+    app: AppHandle,
+    request: ipc::SplitEntityRequest,
+) -> Result<ipc::KnowledgeMutationResult, String> {
+    let root = data_root(&app).map_err(|error| graph_mutation_error("split_entity", error))?;
+    let result = graph::query::split_operation(&root, &request)
+        .map_err(|error| graph_mutation_error("split_entity", error))?;
+    Ok(queue_knowledge_rebuild(&app, root, result))
+}
+
+#[tauri::command]
+fn merge_entities(
+    app: AppHandle,
+    source_id: String,
+    target_id: String,
+) -> Result<ipc::KnowledgeMutationResult, String> {
+    let root = data_root(&app).map_err(|error| graph_mutation_error("merge_entities", error))?;
+    let result = graph::query::merge_operation(&root, &source_id, &target_id)
+        .map_err(|error| graph_mutation_error("merge_entities", error))?;
+    Ok(queue_knowledge_rebuild(&app, root, result))
+}
+
+#[tauri::command]
+fn undo_knowledge_operation(
+    app: AppHandle,
+    operation_id: String,
+) -> Result<ipc::KnowledgeMutationResult, String> {
+    let root = data_root(&app)
+        .map_err(|error| graph_mutation_error("undo_knowledge_operation", error))?;
+    let result = graph::query::undo_operation(&root, &operation_id)
+        .map_err(|error| graph_mutation_error("undo_knowledge_operation", error))?;
+    Ok(queue_knowledge_rebuild(&app, root, result))
+}
+
 #[tauri::command]
 fn graph_entities(app: AppHandle) -> Result<Vec<ipc::EntitySummary>, String> {
     let Ok(root) = data_root(&app) else { return Ok(vec![]) };
@@ -3430,6 +3565,16 @@ pub fn run() {
             note_related,
             graph_entities,
             graph_data,
+            semantic_graph,
+            semantic_entity_detail,
+            relation_detail,
+            pending_review,
+            entity_mentions,
+            shortest_path,
+            apply_knowledge_operation,
+            split_entity,
+            merge_entities,
+            undo_knowledge_operation,
             note_graph_data,
             entity_detail,
             note_entity_links,
@@ -3627,6 +3772,35 @@ mod tests {
         let dl = Arc::new(AtomicBool::new(false));
         assert!(migrate_guard(&running, &dl).is_ok(), "空闲放行");
         assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
+    }
+
+    #[test]
+    fn semantic_graph_commands_are_registered() {
+        let source = include_str!("lib.rs");
+        let handlers = source
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .expect("generate_handler block")
+            .1
+            .split_once("])")
+            .expect("generate_handler terminator")
+            .0;
+        for command in [
+            "semantic_graph,",
+            "semantic_entity_detail,",
+            "relation_detail,",
+            "pending_review,",
+            "entity_mentions,",
+            "shortest_path,",
+            "apply_knowledge_operation,",
+            "split_entity,",
+            "merge_entities,",
+            "undo_knowledge_operation,",
+        ] {
+            assert!(
+                handlers.contains(command),
+                "missing registered command {command}"
+            );
+        }
     }
 
     #[test]

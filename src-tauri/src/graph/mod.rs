@@ -11,6 +11,8 @@ pub(crate) mod canonical;
 pub(crate) mod index;
 #[allow(dead_code)] // Pure snapshot contract; canonical projection consumes it next.
 pub(crate) mod resolve;
+pub(crate) mod query;
+pub(crate) mod path;
 
 pub(crate) const GRAPH_FILE: &str = "graph.sqlite";
 

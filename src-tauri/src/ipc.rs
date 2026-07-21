@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 快流临时文本，事件名 "partial"。
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +159,193 @@ pub struct EdgeRow {
 pub struct GraphData {
     pub nodes: Vec<EntitySummary>,
     pub edges: Vec<EdgeRow>,
+}
+
+/// A published evidence-backed semantic relation. Co-occurrence edges deliberately use
+/// `EdgeRow` instead so callers cannot accidentally present a weak link as a fact.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticEdge {
+    pub id: String,
+    pub subject_id: String,
+    pub object_id: String,
+    pub predicate_type: String,
+    pub predicate_label: Option<String>,
+    pub status: String,
+    pub confidence: f64,
+    pub origin: String,
+    pub evidence_count: i64,
+    pub note_count: i64,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticGraphData {
+    pub nodes: Vec<EntitySummary>,
+    pub semantic_edges: Vec<SemanticEdge>,
+    pub cooccurrence_edges: Vec<EdgeRow>,
+    pub degraded: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticEntityDetail {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub confirmed: bool,
+    pub is_person: bool,
+    pub note_count: i64,
+    pub mention_total: i64,
+    pub relations: Vec<SemanticEdge>,
+    pub degraded: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationEvidence {
+    pub id: String,
+    pub note_id: String,
+    pub paragraph_index: i64,
+    pub start_offset: i64,
+    pub end_offset: i64,
+    pub quote: String,
+    pub source_seqs: Vec<u64>,
+    pub source_hash: String,
+    pub subject_mentions: Vec<String>,
+    pub object_mentions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationDetail {
+    pub relation: SemanticEdge,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub note_ids: Vec<String>,
+    pub evidence: Vec<RelationEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingReviewItem {
+    pub id: String,
+    pub kind: String,
+    pub note_id: Option<String>,
+    pub relation_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MentionEvidence {
+    pub id: String,
+    pub note_id: String,
+    pub entity_id: String,
+    pub paragraph_index: i64,
+    pub start_offset: i64,
+    pub end_offset: i64,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgePathStep {
+    pub id: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub subject_id: String,
+    pub object_id: String,
+    pub predicate_type: String,
+    pub predicate_label: Option<String>,
+    pub direction: String,
+    pub origin: String,
+    pub confidence: f64,
+    pub evidence_count: i64,
+    pub note_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgePath {
+    pub entity_ids: Vec<String>,
+    pub steps: Vec<KnowledgePathStep>,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum KnowledgeOperationInput {
+    RenameEntity {
+        entity_id: String,
+        name: String,
+    },
+    AddAlias {
+        entity_id: String,
+        alias: String,
+    },
+    RemoveAlias {
+        entity_id: String,
+        alias: String,
+    },
+    BindMention {
+        mention_id: String,
+        entity_id: String,
+    },
+    ConfirmRelation {
+        relation_id: String,
+    },
+    EditRelation {
+        relation_id: String,
+        subject_id: String,
+        predicate: crate::store::RelationPredicate,
+        object_id: String,
+        valid_from: Option<String>,
+        valid_to: Option<String>,
+        note: Option<String>,
+    },
+    SuppressRelation {
+        subject_id: String,
+        predicate: crate::store::RelationPredicate,
+        object_id: String,
+    },
+    EndRelation {
+        relation_id: String,
+        valid_to: String,
+    },
+    RestoreRelation {
+        operation_id: String,
+    },
+    CreateEntity {
+        kind: String,
+        name: String,
+        #[serde(default)]
+        aliases: Vec<String>,
+    },
+    CreateRelation {
+        subject_id: String,
+        predicate: crate::store::RelationPredicate,
+        object_id: String,
+        valid_from: Option<String>,
+        valid_to: Option<String>,
+        note: Option<String>,
+        #[serde(default)]
+        evidence_ids: Vec<String>,
+        user_assertion: bool,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitEntityRequest {
+    pub entity_id: String,
+    pub name: String,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgeMutationResult {
+    pub operation_id: String,
+    pub entity_id: Option<String>,
+    pub rebuild_state: String,
 }
 
 /// 实体详情面板里「出现的笔记」一项(联查了标题)。
