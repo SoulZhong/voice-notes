@@ -522,3 +522,13 @@ export function pathEmphasis(
     edgeIds: new Set(path?.steps.map(canonicalPathEdgeId) ?? []),
   };
 }
+
+/** A saved path may only be queried again after both endpoints exist in the newly published graph. */
+export function hasPathEndpoints(
+  data: Pick<SemanticGraphData, "nodes">,
+  start: string,
+  end: string,
+): boolean {
+  const ids = new Set(data.nodes.map((node) => node.id));
+  return ids.has(start) && ids.has(end);
+}

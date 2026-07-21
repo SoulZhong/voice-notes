@@ -20,6 +20,7 @@
     defaultBackbone,
     ensureBackboneEdge,
     filterSemanticGraph,
+    hasPathEndpoints,
     legacyFallbackGraph,
     nextExpandedIds,
     pathEmphasis,
@@ -334,6 +335,14 @@
   }
 
   async function refreshAfterBackfill() {
+    const previousStart = pathStart;
+    const previousEnd = pathEnd;
+    ++pathGeneration;
+    activePath = null;
+    if (previousStart && previousEnd) {
+      pathStatus = "loading";
+      pathError = "";
+    }
     await Promise.all([
       loadSemantic(effectiveGraphFilter),
       probeGlobalSemanticPresence(),
@@ -341,6 +350,18 @@
       loadPending(),
     ]);
     if (selected) await loadDetail(selected);
+    if (!previousStart || !previousEnd) return;
+    if (semanticRequestFailed) {
+      pathStatus = "error";
+      pathError = "图谱刷新失败，原路径已清除。请稍后重新选择两点。";
+      return;
+    }
+    if (!hasPathEndpoints(semantic, previousStart, previousEnd)) {
+      pathStatus = "error";
+      pathError = "关系补建后路径端点已变化，原路径已清除。请重新选择两点。";
+      return;
+    }
+    await requestPath(previousStart, previousEnd, knowledgeFilter, includeWeakPath);
   }
 
   function updateQuery(change: (params: URLSearchParams) => void) {
