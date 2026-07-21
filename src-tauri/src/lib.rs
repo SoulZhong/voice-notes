@@ -1763,10 +1763,9 @@ fn start_relation_backfill(
     let settings = relation_backfill_settings(&app)?;
     ensure_requested_backfill_provider(&request, &settings)?;
     let root = data_root(&app).map_err(|error| error.to_string())?;
-    let preview = refine::backfill::preview(&root, &settings, Some(&request.note_ids))
+    let approved = refine::backfill::preflight(&root, &settings, &request)
         .map_err(|error| format!("{error:#}"))?;
-    refine::backfill::validate_request(&preview, &request)
-        .map_err(|error| format!("{error:#}"))?;
+    let preview = &approved.preview;
     let executor = relation_executor(&settings).map_err(|error| format!("{error:#}"))?;
     if executor.provider() != preview.provider || executor.model() != preview.model {
         return Err("preview 与执行 provider/model 不一致".into());
@@ -1776,6 +1775,7 @@ fn start_relation_backfill(
     let cancel = Arc::clone(&state.relation_backfill_cancel);
     let scheduler = state.graph_scheduler.clone();
     let note_ids = preview.note_ids.clone();
+    let approved_source_hashes = approved.source_hashes;
     let run_id = request.run_id.clone();
     let events = app.clone();
     let initial = ipc::BackfillProgress {
@@ -1809,6 +1809,7 @@ fn start_relation_backfill(
                     &run_id,
                     &root.join("notes"),
                     &note_ids,
+                    &approved_source_hashes,
                     executor.as_ref(),
                     &cancel,
                     |progress| {
