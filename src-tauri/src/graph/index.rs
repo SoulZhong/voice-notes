@@ -647,6 +647,20 @@ pub fn rebuild_atomic(data_root: &Path, canonical: &CanonicalGraph) -> anyhow::R
     rebuild_atomic_with_hook(data_root, canonical, |_| Ok(()))
 }
 
+#[cfg(test)]
+pub(super) fn rebuild_atomic_fail_before_publish(
+    data_root: &Path,
+    canonical: &CanonicalGraph,
+) -> anyhow::Result<BuildStats> {
+    rebuild_atomic_with_hook(data_root, canonical, |stage| {
+        anyhow::ensure!(
+            stage != BuildStage::BeforeReplace,
+            "injected .next publication failure"
+        );
+        Ok(())
+    })
+}
+
 fn rebuild_from_snapshot_source(
     data_root: &Path,
     mut snapshot: impl FnMut() -> anyhow::Result<(String, CanonicalGraph)>,

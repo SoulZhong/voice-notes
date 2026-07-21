@@ -242,6 +242,15 @@ fn run_one_controlled_with_writer(
         .ok_or_else(|| RunOneError::Failed(anyhow::anyhow!("笔记目录缺少 notes 根")))?;
     let anchored = crate::store::refined::AnchoredRefinedDir::open(notes_root, note_id)
         .map_err(RunOneError::Failed)?;
+    // The override ledger is human-decision truth. A corrupt ledger makes every
+    // graph write read-only, including model backfill, while the last index stays
+    // available to readers.
+    crate::graph::overrides::load(
+        notes_root
+            .parent()
+            .ok_or_else(|| RunOneError::Failed(anyhow::anyhow!("笔记目录缺少数据根")))?,
+    )
+    .map_err(|error| RunOneError::Failed(error.into()))?;
     let snapshot = anchored
         .load_current()
         .map_err(RunOneError::Failed)?

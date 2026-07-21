@@ -14,6 +14,11 @@ pub(crate) mod resolve;
 pub(crate) mod query;
 pub(crate) mod path;
 
+#[cfg(test)]
+mod e2e_tests;
+#[cfg(any(test, debug_assertions))]
+mod large_fixture;
+
 pub(crate) const GRAPH_FILE: &str = "graph.sqlite";
 
 /// 写路径进程内串行(rusqlite::Connection 非 Sync;沿用全仓"每次操作现开连接 + Mutex 门禁"惯例)。

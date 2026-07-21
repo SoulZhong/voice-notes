@@ -21,6 +21,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
   import { aiLogsQuery } from "$lib/ailog";
+  import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
@@ -127,6 +128,7 @@
   // —— AI 调用日志:本页只留入口行(浏览/导出/打开目录在 /ai/logs 独立页),
   //    条数仅作说明位展示,拉取失败静默(入口不因统计失败而残缺)。 ——
   let aiLogsTotal = $state(0);
+  let backfillOpen = $state(false);
 
   async function loadAiLogsTotal() {
     try {
@@ -137,6 +139,7 @@
   }
 
   onMount(() => {
+    backfillOpen = new URLSearchParams(window.location.search).get("backfill") === "relations";
     loadAiLogsTotal();
     (async () => {
       try {
@@ -657,6 +660,19 @@
 
   <!-- —— AI 调用日志:入口行,浏览/导出/打开目录在独立页 /ai/logs —— -->
   <section>
+    <h2 class="section-title">历史语义关系</h2>
+    <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">补建关系</span>
+          <span class="row-desc">先预览范围、执行体与精确模型，再由你明确确认是否发送修订稿。</span>
+        </div>
+        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>预览关系补建</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2 class="section-title">AI 调用日志</h2>
     <div class="rows">
       <div class="row">
@@ -671,6 +687,8 @@
     </div>
   </section>
 </div>
+
+<RelationBackfillDialog open={backfillOpen} onClose={() => (backfillOpen = false)} />
 
 <style>
   .page { padding: 0 1.5rem 2rem; }
