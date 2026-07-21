@@ -458,13 +458,13 @@
   .empty-line { margin: 6px 0; color: var(--ink-faint); font-size: 0.78rem; }
   .note-group { padding: 12px 0; border-top: 1px solid var(--hairline); }
   .note-link { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
-  .note-link span { font-size: 0.82rem; }
-  .note-meta { display: flex; gap: 5px; color: var(--ink-faint); font-size: 0.7rem; font-variant-numeric: tabular-nums; font-weight: 400; white-space: nowrap; }
+  .note-link > span:first-child { min-width: 0; font-size: 0.82rem; }
+  .note-meta { display: flex; flex: none; gap: 5px; color: var(--ink-faint); font-size: 0.7rem; font-variant-numeric: tabular-nums; font-weight: 400; white-space: nowrap; }
   .note-meta span { font-size: inherit; }
   .note-group > .note-link { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   .source-notes { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
   .source-notes li { border-top: 1px solid var(--hairline); }
-  .source-notes .note-link { display: grid; gap: 3px; padding: 12px 0; }
+  .source-notes .note-link { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 0; }
   .source-notes a:hover { color: var(--ink); }
   blockquote { margin: 10px 0 0; padding: 0 0 0 12px; border-left: 2px solid var(--hairline-strong); }
   blockquote p { margin: 0; color: var(--ink); font-size: 0.86rem; line-height: 1.65; overflow-wrap: anywhere; }
