@@ -7,6 +7,8 @@ use std::path::Path;
 pub(crate) mod overrides;
 #[allow(dead_code)] // Canonical graph consumers land in the following indexing/API tasks.
 pub(crate) mod canonical;
+#[allow(dead_code)] // Semantic index query consumers land in the following API task.
+pub(crate) mod index;
 #[allow(dead_code)] // Pure snapshot contract; canonical projection consumes it next.
 pub(crate) mod resolve;
 
@@ -62,6 +64,16 @@ fn resolve_redirect(conn: &rusqlite::Connection, id: &str) -> String {
 pub(crate) fn open(data_root: &Path) -> anyhow::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(data_root.join(GRAPH_FILE))?;
     conn.busy_timeout(std::time::Duration::from_millis(3000))?;
+    // v2 是由 index::rebuild_atomic 整库替换的派生快照。兼容查询暂时复用本函数，
+    // 但不能在读到 v2 后补建 v1 治理表；治理真值已经迁到 knowledge-overrides.json。
+    let schema_version = conn
+        .query_row("SELECT schema_version FROM graph_meta LIMIT 1", [], |row| {
+            row.get::<_, u32>(0)
+        })
+        .ok();
+    if schema_version == Some(index::GRAPH_SCHEMA_VERSION) {
+        return Ok(conn);
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
@@ -117,6 +129,7 @@ pub(crate) fn resolve_local_ids(data_root: &Path, note_id: &str) -> anyhow::Resu
 
 /// 把一篇笔记的实体/提及写入图谱:整篇替换该笔记的边(先删后插,幂等)。
 /// 调用方负责"失败只 eprintln,不打断 Aing"。
+#[allow(dead_code)] // v1 compatibility helper; production indexing now uses index::RebuildScheduler.
 pub(crate) fn upsert_note(data_root: &Path, note_id: &str, doc: &store::RefinedDoc) -> anyhow::Result<()> {
     store::validate_note_id(note_id)?;
     let vp = store::VoiceprintStore::new(data_root.to_path_buf()).load();
@@ -305,6 +318,7 @@ pub(crate) fn rename_entity(data_root: &Path, old_id: &str, new_name: &str) -> a
 
 /// 清表后遍历 notes 根下所有笔记目录,逐篇 load_refined 重灌。返回入图笔记数。
 /// 损坏/无 aing.json/无实体的笔记静默跳过(全仓损坏容忍)。
+#[allow(dead_code)] // v1 compatibility helper; startup now requests an atomic v2 rebuild.
 pub(crate) fn rebuild_all(data_root: &Path) -> anyhow::Result<usize> {
     {
         let _guard = GRAPH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

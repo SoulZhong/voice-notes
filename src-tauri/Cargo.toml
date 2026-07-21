@@ -69,6 +69,10 @@ tempfile = "3"
 [target.'cfg(not(windows))'.dependencies]
 webrtc-audio-processing = { version = "2.1.0", features = ["bundled"] }
 
+# graph.sqlite 的整库替换在 Windows 必须直接调用 ReplaceFileW，不能先移走 live。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "8", features = ["macos_13_0"] }
 # P4 VPIO spike: Apple 内建 AEC(VoiceProcessingIO)采集麦克风。crate 名 `coreaudio`。
