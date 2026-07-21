@@ -4,7 +4,8 @@
 use crate::settings;
 use crate::store::{self, NoteStore, SpeakerMeta};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use super::server::ApplyAingGraphParams;
@@ -33,6 +34,108 @@ pub fn resolve_roots() -> DataRoots {
 
 fn notes_dir(roots: &DataRoots) -> PathBuf {
     roots.data_root.join("notes")
+}
+
+struct SafeAingPaths {
+    note_dir: PathBuf,
+    aing_file: PathBuf,
+}
+
+fn checked_real_directory(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "{label} 必须是真实目录，不能是 symlink: {}",
+        path.display()
+    );
+    Ok(std::fs::canonicalize(path)?)
+}
+
+fn check_optional_real_file(
+    path: &Path,
+    canonical_note_dir: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "{label} 必须是真实文件，不能是 symlink: {}",
+        path.display()
+    );
+    let canonical = std::fs::canonicalize(path)?;
+    anyhow::ensure!(
+        canonical.parent() == Some(canonical_note_dir),
+        "{label} 解析后越出笔记目录: {}",
+        canonical.display()
+    );
+    Ok(())
+}
+
+/// 图谱 MCP 的共同路径边界。允许 aing.json 尚不存在（锁内 legacy 迁移会创建），
+/// 但任何已存在的目录/真值/临时文件都必须是 canonical notes 根内的真实节点。
+fn safe_aing_paths(roots: &DataRoots, note_id: &str) -> anyhow::Result<SafeAingPaths> {
+    store::validate_note_id(note_id)?;
+    let notes_root = notes_dir(roots);
+    let canonical_notes_root = checked_real_directory(&notes_root, "notes 根")?;
+    let note_dir = notes_root.join(note_id);
+    let canonical_note_dir = checked_real_directory(&note_dir, "笔记目录")?;
+    anyhow::ensure!(
+        canonical_note_dir.parent() == Some(canonical_notes_root.as_path()),
+        "笔记目录解析后越出 notes 根: {}",
+        canonical_note_dir.display()
+    );
+
+    let aing_file = note_dir.join(store::AING_DOC_FILE);
+    check_optional_real_file(&aing_file, &canonical_note_dir, "aing.json")?;
+    check_optional_real_file(
+        &note_dir.join(store::LEGACY_REFINED_FILE),
+        &canonical_note_dir,
+        "refined.json",
+    )?;
+    check_optional_real_file(
+        &note_dir.join("aing.json.tmp"),
+        &canonical_note_dir,
+        "aing.json.tmp",
+    )?;
+    Ok(SafeAingPaths {
+        note_dir,
+        aing_file,
+    })
+}
+
+#[cfg(unix)]
+fn read_regular_file_no_follow(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "不是普通文件: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_regular_file_no_follow(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "不是普通文件: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// 笔记列表。from/to 为 RFC3339 前缀(如 "2026-02-01"),与 started_at 字典序比较
@@ -231,9 +334,9 @@ pub fn apply_refined_texts(
 /// Agent 图谱读取上下文。这里故意直读当前 `aing.json`，不走会迁移旧稿的
 /// `load_refined`：context 是只读操作，不能因为一次读取初始化或改写任何真值文件。
 pub fn get_aing_context(roots: &DataRoots, note_id: &str) -> anyhow::Result<serde_json::Value> {
+    let paths = safe_aing_paths(roots, note_id)?;
     NoteStore::new(notes_dir(roots)).load(note_id)?;
-    let note_dir = notes_dir(roots).join(note_id);
-    let bytes = std::fs::read(note_dir.join(store::AING_DOC_FILE))?;
+    let bytes = read_regular_file_no_follow(&paths.aing_file)?;
     let mut doc: store::RefinedDoc = serde_json::from_slice(&bytes)?;
     store::ensure_graph_ids(note_id, &mut doc);
     let support: HashSet<&str> = doc
@@ -428,11 +531,12 @@ pub fn apply_aing_graph(
     roots: &DataRoots,
     params: ApplyAingGraphParams,
 ) -> anyhow::Result<serde_json::Value> {
+    let paths = safe_aing_paths(roots, &params.note_id)?;
     NoteStore::new(notes_dir(roots)).load(&params.note_id)?;
-    let note_dir = notes_dir(roots).join(&params.note_id);
-    let note_lock = store::notelock::NoteLock::acquire(&note_dir)?
+    let note_lock = store::notelock::NoteLock::acquire(&paths.note_dir)?
         .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
-    let mut latest = store::refined::load_refined_locked(&note_dir, &note_lock)
+    let paths = safe_aing_paths(roots, &params.note_id)?;
+    let mut latest = store::refined::load_refined_locked(&paths.note_dir, &note_lock)
         .ok_or_else(|| anyhow::anyhow!("aing.json 不存在或已损坏"))?;
     let mut candidate = latest.clone();
 
@@ -440,14 +544,15 @@ pub fn apply_aing_graph(
         if latest.stages.llm == "done" {
             latest.stages.entities = "failed".into();
             latest.stages.relations = "failed".into();
-            store::refined::write_refined_atomic_locked(&note_dir, &latest, &note_lock).map_err(
-                |write_error| anyhow::anyhow!("{error};失败状态落盘也失败:{write_error}"),
-            )?;
+            store::refined::write_refined_atomic_locked(&paths.note_dir, &latest, &note_lock)
+                .map_err(|write_error| {
+                    anyhow::anyhow!("{error};失败状态落盘也失败:{write_error}")
+                })?;
         }
         return Err(error);
     }
 
-    store::refined::write_refined_atomic_locked(&note_dir, &candidate, &note_lock)?;
+    store::refined::write_refined_atomic_locked(&paths.note_dir, &candidate, &note_lock)?;
     let entity_count = candidate.entities.len();
     let relation_count = candidate.relations.len();
     drop(note_lock);
@@ -965,6 +1070,145 @@ mod tests {
             "读 context 不得初始化 ledger"
         );
         assert!(get_aing_context(&roots(tmp.path()), "../evil").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_tools_reject_symlinked_notes_root_and_note_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root_link = tempfile::tempdir().unwrap();
+        let root_target = tempfile::tempdir().unwrap();
+        let root_note_id = "20260101-110000";
+        fixture_note(
+            root_target.path(),
+            root_note_id,
+            "根链接",
+            "2026-01-01T11:00:00+08:00",
+            &[("S1", "原始句", 0)],
+        );
+        let root_doc = graph_doc("张三使用Rust");
+        store::write_refined_atomic(
+            &root_target.path().join("notes").join(root_note_id),
+            &root_doc,
+        )
+        .unwrap();
+        symlink(
+            root_target.path().join("notes"),
+            root_link.path().join("notes"),
+        )
+        .unwrap();
+        let root_hash = store::source_hash(&root_doc.paragraphs);
+        let root_read_rejected = get_aing_context(&roots(root_link.path()), root_note_id).is_err();
+        let root_write_rejected = apply_aing_graph(
+            &roots(root_link.path()),
+            graph_params(root_note_id, &root_hash),
+        )
+        .is_err();
+        assert!(
+            root_read_rejected && root_write_rejected,
+            "notes 根是 symlink 时读写都必须 fail closed"
+        );
+
+        let note_link = tempfile::tempdir().unwrap();
+        let note_target = tempfile::tempdir().unwrap();
+        let note_id = "20260101-120000";
+        fixture_note(
+            note_target.path(),
+            note_id,
+            "目录链接",
+            "2026-01-01T12:00:00+08:00",
+            &[("S1", "原始句", 0)],
+        );
+        let note_doc = graph_doc("张三使用Rust");
+        store::write_refined_atomic(&note_target.path().join("notes").join(note_id), &note_doc)
+            .unwrap();
+        std::fs::create_dir_all(note_link.path().join("notes")).unwrap();
+        symlink(
+            note_target.path().join("notes").join(note_id),
+            note_link.path().join("notes").join(note_id),
+        )
+        .unwrap();
+        let note_hash = store::source_hash(&note_doc.paragraphs);
+        let note_read_rejected = get_aing_context(&roots(note_link.path()), note_id).is_err();
+        let note_write_rejected =
+            apply_aing_graph(&roots(note_link.path()), graph_params(note_id, &note_hash)).is_err();
+        assert!(
+            note_read_rejected && note_write_rejected,
+            "单篇笔记目录是 symlink 时读写都必须 fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_tools_reject_symlinked_aing_file_without_replacing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let note_id = "20260101-130000";
+        fixture_note(
+            tmp.path(),
+            note_id,
+            "文件链接",
+            "2026-01-01T13:00:00+08:00",
+            &[("S1", "原始句", 0)],
+        );
+        let doc = graph_doc("张三使用Rust");
+        let outside_aing = outside.path().join("outside-aing.json");
+        let outside_bytes = serde_json::to_vec_pretty(&doc).unwrap();
+        std::fs::write(&outside_aing, &outside_bytes).unwrap();
+        let linked_aing = tmp
+            .path()
+            .join("notes")
+            .join(note_id)
+            .join(store::AING_DOC_FILE);
+        symlink(&outside_aing, &linked_aing).unwrap();
+
+        let hash = store::source_hash(&doc.paragraphs);
+        let read_rejected = get_aing_context(&roots(tmp.path()), note_id).is_err();
+        let write_rejected =
+            apply_aing_graph(&roots(tmp.path()), graph_params(note_id, &hash)).is_err();
+        assert!(
+            read_rejected && write_rejected,
+            "aing.json 是 symlink 时读写都必须 fail closed"
+        );
+        assert_eq!(std::fs::read(&outside_aing).unwrap(), outside_bytes);
+        assert!(
+            std::fs::symlink_metadata(linked_aing)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "拒绝路径不得用 rename 替换原 symlink"
+        );
+    }
+
+    #[test]
+    fn apply_aing_graph_keeps_safe_legacy_only_creation_compatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note_id = "20260101-140000";
+        fixture_note(
+            tmp.path(),
+            note_id,
+            "旧稿迁移",
+            "2026-01-01T14:00:00+08:00",
+            &[("S1", "原始句", 0)],
+        );
+        let note_dir = tmp.path().join("notes").join(note_id);
+        let doc = graph_doc("张三使用Rust");
+        std::fs::write(
+            note_dir.join(store::LEGACY_REFINED_FILE),
+            serde_json::to_vec_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        assert!(!note_dir.join(store::AING_DOC_FILE).exists());
+
+        let hash = store::source_hash(&doc.paragraphs);
+        let result = apply_aing_graph(&roots(tmp.path()), graph_params(note_id, &hash)).unwrap();
+        assert_eq!(result["saved"], true);
+        let metadata = std::fs::symlink_metadata(note_dir.join(store::AING_DOC_FILE)).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert!(note_dir.join(store::LEGACY_REFINED_FILE).is_file());
     }
 
     #[test]
