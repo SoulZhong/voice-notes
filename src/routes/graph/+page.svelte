@@ -9,6 +9,7 @@
     semanticEntityDetail,
     semanticGraph,
     semanticGraphDebugFixture,
+    semanticGraphDebugRelationDetail,
     type KnowledgeFilter,
     type KnowledgePath,
     type PendingReviewItem,
@@ -82,7 +83,7 @@
   let pathError = $state("");
   let includeWeakPath = $state(false);
   let backfillOpen = $state(false);
-  let debugFixtureRoot = $state<string | null>(null);
+  let debugFixtureSession = $state<string | null>(null);
   let lastSidebarKind = graphFilter.kind;
   let lastRequestedPathStart: string | null = null;
 
@@ -272,7 +273,7 @@
     semanticError = "";
     try {
       const fixture = await semanticGraphDebugFixture();
-      debugFixtureRoot = fixture.fixture_root;
+      debugFixtureSession = fixture.session_id;
       semantic = fixture.graph;
       graph = { nodes: [], edges: [] };
       globalSemanticPresence = "present";
@@ -417,7 +418,7 @@
 
   function pickNode(id: string, _isPerson: boolean) {
     revealFrom(id);
-    if (debugFixtureRoot) return;
+    if (debugFixtureSession) return;
     if (pathStart && id !== pathStart) {
       pathEnd = id;
       void requestPath(pathStart, id, knowledgeFilter, includeWeakPath);
@@ -470,7 +471,7 @@
     lastSidebarKind = sidebarKind;
     graphFilter.kind = sidebarKind;
     ++pathGeneration;
-    if (debugFixtureRoot) {
+    if (debugFixtureSession) {
       const filtered = filterSemanticGraph(semantic, {
         ...knowledgeFilter,
         include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
@@ -536,18 +537,23 @@
 
   function toggleWeakPath(value: boolean) {
     includeWeakPath = value;
-    if (debugFixtureRoot) return;
+    if (debugFixtureSession) return;
     void loadSemantic({ ...knowledgeFilter, include_cooccurrence: knowledgeFilter.include_cooccurrence || value });
     if (pathStart && pathEnd) void requestPath(pathStart, pathEnd, knowledgeFilter, value);
   }
 
   function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
-    if (debugFixtureRoot) return;
+    if (debugFixtureSession) return;
     ctxMenu = { id, name, isPerson, x: clientX, y: clientY };
   }
 
   function closeCtxMenu() {
     ctxMenu = null;
+  }
+
+  async function loadDebugRelationDetail(id: string) {
+    if (!debugFixtureSession) return null;
+    return semanticGraphDebugRelationDetail(debugFixtureSession, id);
   }
 
   function openContextGovernance() {
@@ -627,7 +633,7 @@
         />
 
         <div class="canvas-shell" aria-label="知识图谱画布">
-          {#if debugFixtureRoot}
+          {#if debugFixtureSession}
             <div class="map-message debug-fixture" role="status">
               <span>隔离调试夹具 · 1,000 个实体 / 5,000 条语义关系 · 不读取或修改真实资料库</span>
             </div>
@@ -743,7 +749,14 @@
       {#if inspectorOpen}
         <aside class="edge-inspector" aria-label="知识治理检查器">
           {#if relationId}
-            <RelationDrawer {relationId} onClose={closeRelation} onChanged={refreshKnowledge} />
+            <RelationDrawer
+              {relationId}
+              onClose={closeRelation}
+              onChanged={refreshKnowledge}
+              relationLoader={debugFixtureSession ? loadDebugRelationDetail : undefined}
+              resolveEntityName={debugFixtureSession ? (id) => entityNames.get(id) : undefined}
+              readOnly={Boolean(debugFixtureSession)}
+            />
           {:else if reviewOpen}
             <PendingReviewPanel
               items={pendingItems}

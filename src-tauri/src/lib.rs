@@ -3678,9 +3678,35 @@ fn set_input_volume(v: u8) -> bool {
 #[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 struct SemanticGraphDebugFixture {
-    fixture_root: String,
+    session_id: String,
     graph: ipc::SemanticGraphData,
     path: ipc::KnowledgePath,
+}
+
+#[cfg(debug_assertions)]
+fn semantic_graph_debug_sessions(
+) -> &'static Mutex<std::collections::HashMap<String, PathBuf>> {
+    static SESSIONS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(debug_assertions)]
+fn semantic_graph_debug_fixture_root(session_id: &str) -> Option<PathBuf> {
+    semantic_graph_debug_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned()
+}
+
+#[cfg(debug_assertions)]
+fn remove_semantic_graph_debug_fixture(session_id: &str) {
+    semantic_graph_debug_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
 }
 
 /// Debug-only desktop harness. It always creates a new OS-temp child itself;
@@ -3695,10 +3721,15 @@ fn semantic_graph_debug_fixture() -> Result<SemanticGraphDebugFixture, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let fixture_root = std::env::temp_dir().join(format!(
-        "aing-semantic-fixture-{}-{nanos}-{sequence}",
-        std::process::id()
-    ));
+    let session_id = store::stable_id(
+        "fixture_session_",
+        &[
+            std::process::id().to_string(),
+            nanos.to_string(),
+            sequence.to_string(),
+        ],
+    );
+    let fixture_root = std::env::temp_dir().join(format!("aing-semantic-fixture-{session_id}"));
     graph::large_fixture::import_semantic_graph_large_fixture(&fixture_root)
         .map_err(|error| format!("创建隔离语义图夹具失败:{error:#}"))?;
     let filter = graph::query::GraphFilter {
@@ -3714,11 +3745,30 @@ fn semantic_graph_debug_fixture() -> Result<SemanticGraphDebugFixture, String> {
     let path = graph::path::shortest_path(&fixture_root, "kg_0000", "kg_0017", &filter)
         .map_err(|error| format!("读取隔离夹具路径失败:{error:#}"))?
         .ok_or_else(|| "隔离夹具没有预期路径".to_string())?;
+    semantic_graph_debug_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id.clone(), fixture_root);
     Ok(SemanticGraphDebugFixture {
-        fixture_root: fixture_root.to_string_lossy().into_owned(),
+        session_id,
         graph,
         path,
     })
+}
+
+/// Debug-only evidence loader. The client can only present an opaque session
+/// token minted above; it can never select a filesystem path or the configured
+/// user library.
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn semantic_graph_debug_relation_detail(
+    session_id: String,
+    relation_id: String,
+) -> Result<Option<ipc::RelationDetail>, String> {
+    let fixture_root = semantic_graph_debug_fixture_root(&session_id)
+        .ok_or_else(|| "隔离调试夹具会话不存在或已过期".to_string())?;
+    graph::query::relation_detail(&fixture_root, &relation_id)
+        .map_err(|error| format!("读取隔离夹具关系证据失败:{error:#}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -3935,6 +3985,8 @@ pub fn run() {
             shortest_path,
             #[cfg(debug_assertions)]
             semantic_graph_debug_fixture,
+            #[cfg(debug_assertions)]
+            semantic_graph_debug_relation_detail,
             apply_knowledge_operation,
             split_entity,
             merge_entities,
@@ -4171,7 +4223,8 @@ mod tests {
     #[test]
     fn semantic_graph_debug_fixture_owns_a_new_isolated_temp_root() {
         let fixture = super::semantic_graph_debug_fixture().unwrap();
-        let root = std::path::PathBuf::from(&fixture.fixture_root);
+        assert!(!fixture.session_id.contains(std::path::MAIN_SEPARATOR));
+        let root = super::semantic_graph_debug_fixture_root(&fixture.session_id).unwrap();
         let temp = std::env::temp_dir().canonicalize().unwrap();
         let parent = root.parent().unwrap().canonicalize().unwrap();
         assert!(parent.starts_with(temp));
@@ -4184,9 +4237,53 @@ mod tests {
         assert_eq!(fixture.graph.semantic_edges.len(), 5_000);
         assert_eq!(fixture.path.steps[0].id, "cr_fixture_0000");
 
+        let configured_root = tempfile::tempdir().unwrap();
+        let mut configured_graph = crate::graph::large_fixture::deterministic_large_graph();
+        configured_graph.relations[0].provider = Some("configured-real-library".into());
+        configured_graph.relations[1].id = "configured-only-relation".into();
+        crate::graph::index::rebuild_atomic(configured_root.path(), &configured_graph).unwrap();
+        assert_eq!(
+            crate::graph::query::relation_detail(configured_root.path(), "cr_fixture_0000")
+                .unwrap()
+                .unwrap()
+                .provider
+                .as_deref(),
+            Some("configured-real-library")
+        );
+        assert!(crate::graph::query::relation_detail(
+            configured_root.path(),
+            "configured-only-relation"
+        )
+        .unwrap()
+        .is_some());
+
+        let isolated = super::semantic_graph_debug_relation_detail(
+            fixture.session_id.clone(),
+            "cr_fixture_0000".into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(isolated.provider.as_deref(), Some("fixture"));
+        assert!(super::semantic_graph_debug_relation_detail(
+            fixture.session_id.clone(),
+            "configured-only-relation".into(),
+        )
+        .unwrap()
+        .is_none());
+        assert!(super::semantic_graph_debug_relation_detail(
+            "unknown-session".into(),
+            "cr_fixture_0000".into(),
+        )
+        .is_err());
+
         let source = include_str!("lib.rs");
         assert!(source.contains("#[cfg(debug_assertions)]\n            semantic_graph_debug_fixture,"));
+        assert!(source.contains(
+            "#[cfg(debug_assertions)]\n            semantic_graph_debug_relation_detail,"
+        ));
         assert!(source.contains("fn semantic_graph_debug_fixture()"));
+        assert!(source.contains("fn semantic_graph_debug_relation_detail("));
+        super::remove_semantic_graph_debug_fixture(&fixture.session_id);
         std::fs::remove_dir_all(root).unwrap();
     }
 

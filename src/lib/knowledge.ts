@@ -218,7 +218,7 @@ export interface BackfillProgress {
 }
 
 export interface SemanticGraphDebugFixture {
-  fixture_root: string;
+  session_id: string;
   graph: SemanticGraphData;
   path: KnowledgePath;
 }
@@ -265,3 +265,7 @@ export const cancelRelationBackfill = (runId: string) =>
 /** Debug builds only: the backend creates and selects its own isolated OS-temp root. */
 export const semanticGraphDebugFixture = () =>
   invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture");
+
+/** Debug builds only: relation evidence stays bound to the server-owned fixture root. */
+export const semanticGraphDebugRelationDetail = (sessionId: string, relationId: string) =>
+  invoke<RelationDetail | null>("semantic_graph_debug_relation_detail", { sessionId, relationId });
