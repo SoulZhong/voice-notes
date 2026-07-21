@@ -440,3 +440,35 @@ pub struct RefineEvent {
     pub stage: String,
     pub state: String,
 }
+
+/// 用户显式发起的关系补建请求。`note_ids=None` 使用只读 preview 的默认选择；
+/// 显式列表始终逐个校验，不会在坏 id 时退回全库扫描。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackfillRequest {
+    pub note_ids: Option<Vec<String>>,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillPreview {
+    pub note_ids: Vec<String>,
+    pub provider: String,
+    pub model: String,
+    pub contract_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BackfillFailure {
+    pub note_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillProgress {
+    pub state: String,
+    pub completed: usize,
+    pub total: usize,
+    pub current_note_id: Option<String>,
+    pub failed: Vec<BackfillFailure>,
+}

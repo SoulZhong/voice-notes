@@ -2,6 +2,7 @@
 //! 原始三文件只读;一切产物写 refined.json。
 
 pub mod agent;
+pub mod backfill;
 pub mod filter;
 pub mod llm;
 pub mod recluster;
