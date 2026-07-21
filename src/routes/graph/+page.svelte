@@ -16,6 +16,7 @@
   } from "$lib/knowledge";
   import {
     DEFAULT_KNOWLEDGE_FILTER,
+    GLOBAL_SEMANTIC_PRESENCE_FILTER,
     defaultBackbone,
     ensureBackboneEdge,
     filterSemanticGraph,
@@ -197,7 +198,7 @@
 
   async function probeGlobalSemanticPresence() {
     try {
-      const value = await semanticGraph(DEFAULT_KNOWLEDGE_FILTER);
+      const value = await semanticGraph(GLOBAL_SEMANTIC_PRESENCE_FILTER);
       const observedPresence = value.semantic_edges.length > 0 ? "present" : "absent";
       if (globalSemanticPresence !== "present" || observedPresence === "present") {
         globalSemanticPresence = observedPresence;

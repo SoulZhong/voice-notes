@@ -16,6 +16,14 @@ export const DEFAULT_KNOWLEDGE_FILTER: KnowledgeFilter = {
   include_cooccurrence: false,
 };
 
+/** 全局语义存在性探测必须覆盖历史关系；用户画布仍使用自己的实际筛选。 */
+export const GLOBAL_SEMANTIC_PRESENCE_FILTER: KnowledgeFilter = {
+  ...DEFAULT_KNOWLEDGE_FILTER,
+  entity_kinds: [],
+  predicate_types: [],
+  include_history: true,
+};
+
 const CORE_PREDICATE_LABELS: Readonly<Record<string, string>> = {
   participates_in: "参与",
   responsible_for: "负责",
