@@ -505,4 +505,5 @@ pub struct BackfillProgress {
     pub current_note_id: Option<String>,
     pub failed: Vec<BackfillFailure>,
     pub rebuild_generation: Option<u64>,
+    pub index_error: Option<String>,
 }

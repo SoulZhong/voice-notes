@@ -215,6 +215,7 @@ export interface BackfillProgress {
   current_note_id: string | null;
   failed: BackfillFailure[];
   rebuild_generation: number | null;
+  index_error: string | null;
 }
 
 export interface SemanticGraphDebugFixture {

@@ -1462,6 +1462,18 @@ impl RebuildScheduler {
         }
         Ok(queued_generation)
     }
+
+    pub fn retry_dirty(
+        &self,
+        data_root: PathBuf,
+        emit: impl Fn(IndexStatus) + Send + Sync + 'static,
+    ) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            data_root.join(DIRTY_MARKER_FILE).is_file(),
+            "semantic graph index is not marked dirty"
+        );
+        self.request(data_root, emit)
+    }
 }
 
 fn persist_dirty_marker(data_root: &Path) -> anyhow::Result<()> {

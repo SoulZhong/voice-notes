@@ -5,6 +5,7 @@ import {
   cancelRelationBackfill,
   createRelationBackfillController,
   previewRelationBackfill,
+  retryRelationBackfillIndex,
   startRelationBackfill,
   subscribeRelationBackfill,
   subscribeRelationBackfillIndexStatus,
@@ -40,6 +41,7 @@ const progress = (
   current_note_id: null,
   failed: [],
   rebuild_generation: null,
+  index_error: null,
   ...overrides,
 });
 
@@ -64,6 +66,7 @@ function api(overrides: Partial<RelationBackfillApi> = {}): RelationBackfillApi 
     preview: vi.fn().mockResolvedValue(preview()),
     start: vi.fn().mockResolvedValue(undefined),
     cancel: vi.fn().mockResolvedValue(undefined),
+    retryIndex: vi.fn().mockResolvedValue(1),
     subscribe: vi.fn().mockResolvedValue(vi.fn()),
     subscribeIndex: vi.fn().mockResolvedValue(vi.fn()),
     createRunId: vi.fn().mockReturnValue("run-test"),
@@ -91,6 +94,7 @@ describe("relation backfill invoke contract", () => {
     await previewRelationBackfill(["note-a"]);
     await startRelationBackfill(request);
     await cancelRelationBackfill("run-wrapper");
+    await retryRelationBackfillIndex();
     await subscribeRelationBackfill(progressHandler);
     await subscribeRelationBackfillIndexStatus(indexHandler);
 
@@ -99,6 +103,7 @@ describe("relation backfill invoke contract", () => {
       ["preview_relation_backfill", { noteIds: ["note-a"] }],
       ["start_relation_backfill", { request }],
       ["cancel_relation_backfill", { runId: "run-wrapper" }],
+      ["retry_relation_backfill_index"],
     ]);
     expect(listenMock.mock.calls.map(([event]) => event)).toEqual([
       "relation_backfill_progress",
@@ -256,7 +261,7 @@ describe("createRelationBackfillController", () => {
     expect(unlistenIndex).toHaveBeenCalledTimes(1);
   });
 
-  it("turns the matching rebuild error into a resumable failure", async () => {
+  it("keeps a matching rebuild error isolated from resumable note failures", async () => {
     let emitProgress!: (event: BackfillProgress) => void;
     let emitIndex!: (event: GraphIndexStatus) => void;
     const controller = createRelationBackfillController(api({
@@ -274,18 +279,24 @@ describe("createRelationBackfillController", () => {
     await controller.start();
     emitProgress(progress("run-test", "completed", 2, { rebuild_generation: 12 }));
     emitIndex(indexStatus(12, "error", "/private/index.sqlite: disk error"));
-    expect(controller.state.phase).toBe("failed");
+    expect(controller.state.phase).toBe("index-failed");
     expect(controller.state.error).not.toContain("/private/index.sqlite");
-    expect(controller.state.technicalError).toContain("/private/index.sqlite");
-    await controller.resume();
-    expect(controller.state.phase).toBe("preview-ready");
+    expect(controller.state.technicalError).toBe("");
+    expect(controller.state.indexError).toContain("/private/index.sqlite");
+    await expect(controller.resume()).rejects.toThrow("只有失败");
+    expect(controller.state.phase).toBe("index-failed");
   });
 
   it("never accepts completed-with-failures and keeps partial runs resumable", async () => {
     let emitProgress!: (event: BackfillProgress) => void;
+    let emitIndex!: (event: GraphIndexStatus) => void;
     const controller = createRelationBackfillController(api({
       subscribe: vi.fn(async (handler) => {
         emitProgress = handler;
+        return vi.fn();
+      }),
+      subscribeIndex: vi.fn(async (handler) => {
+        emitIndex = handler;
         return vi.fn();
       }),
     }));
@@ -296,8 +307,11 @@ describe("createRelationBackfillController", () => {
       failed: [{ note_id: "note-b", error: "provider output contained /private/path" }],
       rebuild_generation: 4,
     }));
-    expect(controller.state.phase).toBe("partial");
+    expect(controller.state.phase).toBe("waiting-for-index");
     expect(controller.state.error).not.toContain("/private/path");
+    emitIndex(indexStatus(4, "ready"));
+    expect(controller.state.phase).toBe("partial");
+    expect(controller.state.published).toBe(true);
     await controller.resume();
     expect(controller.state.phase).toBe("preview-ready");
   });
@@ -351,6 +365,93 @@ describe("createRelationBackfillController", () => {
     await outcome;
     expect(controller.state.phase).toBe("completed");
   });
+
+  it("retries only the dirty index through exact error and ready generations", async () => {
+    let emitProgress!: (event: BackfillProgress) => void;
+    const indexHandlers: Array<(event: GraphIndexStatus) => void> = [];
+    const order: string[] = [];
+    const start = vi.fn().mockResolvedValue(undefined);
+    const retryIndex = vi.fn()
+      .mockImplementationOnce(async () => {
+        order.push("retry-20");
+        return 20;
+      })
+      .mockImplementationOnce(async () => {
+        order.push("retry-21");
+        return 21;
+      });
+    const controller = createRelationBackfillController(api({
+      start,
+      retryIndex,
+      subscribe: vi.fn(async (handler) => {
+        emitProgress = handler;
+        return vi.fn();
+      }),
+      subscribeIndex: vi.fn(async (handler) => {
+        order.push(`listen-${indexHandlers.length}`);
+        indexHandlers.push(handler);
+        return vi.fn();
+      }),
+    }));
+    await controller.preview();
+    controller.acknowledge(true);
+    await controller.start();
+    emitProgress(progress("run-test", "completed", 2, {
+      index_error: "/private/index.sqlite: initial queue failure",
+    }));
+    expect(controller.state.phase).toBe("index-failed");
+    expect(controller.state.failures).toEqual([]);
+    expect(controller.state.error).not.toContain("/private/index.sqlite");
+    expect(controller.state.indexError).toContain("/private/index.sqlite");
+
+    await controller.retryIndex();
+    expect(order.slice(-2)).toEqual(["listen-1", "retry-20"]);
+    indexHandlers[1]!(indexStatus(19, "ready"));
+    expect(controller.state.phase).toBe("waiting-for-index");
+    indexHandlers[1]!(indexStatus(20, "error", "/private/index.sqlite: publish failed"));
+    expect(controller.state.phase).toBe("index-failed");
+
+    await controller.retryIndex();
+    expect(order.slice(-2)).toEqual(["listen-2", "retry-21"]);
+    indexHandlers[2]!(indexStatus(20, "ready"));
+    expect(controller.state.phase).toBe("waiting-for-index");
+    indexHandlers[2]!(indexStatus(21, "ready"));
+    expect(controller.state.phase).toBe("completed");
+    expect(controller.state.published).toBe(true);
+    expect(controller.state.rebuildGeneration).toBe(21);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(retryIndex).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["partial", "cancelled"] as const)(
+    "waits for committed %s work to publish before exposing the terminal state",
+    async (terminalPhase) => {
+      let emitProgress!: (event: BackfillProgress) => void;
+      let emitIndex!: (event: GraphIndexStatus) => void;
+      const controller = createRelationBackfillController(api({
+        subscribe: vi.fn(async (handler) => {
+          emitProgress = handler;
+          return vi.fn();
+        }),
+        subscribeIndex: vi.fn(async (handler) => {
+          emitIndex = handler;
+          return vi.fn();
+        }),
+      }));
+      await controller.preview();
+      controller.acknowledge(true);
+      await controller.start();
+      emitProgress(progress("run-test", terminalPhase, 1, {
+        failed: terminalPhase === "partial" ? [{ note_id: "note-b", error: "provider failed" }] : [],
+        rebuild_generation: 31,
+      }));
+      expect(controller.state.phase).toBe("waiting-for-index");
+      expect(controller.state.rebuildGeneration).toBe(31);
+      emitIndex(indexStatus(31, "ready"));
+      expect(controller.state.phase).toBe(terminalPhase);
+      expect(controller.state.published).toBe(true);
+    },
+  );
 });
 
 describe("backfill dialog source contract", () => {
@@ -402,7 +503,9 @@ describe("backfill dialog source contract", () => {
   it("refreshes only after generation-ready completion without remounting ForceGraph", () => {
     const dialog = source("./RelationBackfillDialog.svelte");
     const graph = source("../routes/graph/+page.svelte");
-    expect(dialog).toContain('next.phase === "completed"');
+    expect(dialog).toContain("next.published");
+    expect(dialog).toContain("重试索引");
+    expect(dialog).toContain("controller.retryIndex()");
     expect(graph).toContain("onCompleted={refreshAfterBackfill}");
     expect(graph).toContain("loadSemantic(effectiveGraphFilter)");
     expect(graph).toContain("probeGlobalSemanticPresence()");

@@ -16,7 +16,9 @@ export type RelationBackfillPhase =
   | "starting"
   | "running"
   | "cancel-requested"
+  | "index-retrying"
   | "waiting-for-index"
+  | "index-failed"
   | "completed"
   | "partial"
   | "failed"
@@ -32,14 +34,23 @@ export interface RelationBackfillState {
   currentNoteId: string | null;
   failures: BackfillFailure[];
   rebuildGeneration: number | null;
+  terminalPhase: RelationBackfillTerminalPhase | null;
+  published: boolean;
   error: string;
   technicalError: string;
+  indexError: string;
 }
+
+export type RelationBackfillTerminalPhase = Extract<
+  RelationBackfillPhase,
+  "completed" | "partial" | "failed" | "cancelled"
+>;
 
 export interface RelationBackfillApi {
   preview(noteIds?: string[]): Promise<BackfillPreview>;
   start(request: BackfillRequest): Promise<void>;
   cancel(runId: string): Promise<void>;
+  retryIndex(): Promise<number>;
   subscribe(handler: (progress: BackfillProgress) => void): Promise<UnlistenFn>;
   subscribeIndex(handler: (status: GraphIndexStatus) => void): Promise<UnlistenFn>;
   createRunId(): string;
@@ -52,6 +63,7 @@ export interface RelationBackfillController {
   acknowledge(value: boolean): void;
   start(): Promise<void>;
   cancel(): Promise<void>;
+  retryIndex(): Promise<void>;
   resume(): Promise<void>;
   close(): void;
   dispose(): void;
@@ -67,8 +79,11 @@ const initialState = (): RelationBackfillState => ({
   currentNoteId: null,
   failures: [],
   rebuildGeneration: null,
+  terminalPhase: null,
+  published: false,
   error: "",
   technicalError: "",
+  indexError: "",
 });
 
 function errorMessage(error: unknown): string {
@@ -92,6 +107,9 @@ export const startRelationBackfill = (request: BackfillRequest) =>
 export const cancelRelationBackfill = (runId: string) =>
   invoke<void>("cancel_relation_backfill", { runId });
 
+export const retryRelationBackfillIndex = () =>
+  invoke<number>("retry_relation_backfill_index");
+
 export function subscribeRelationBackfill(
   handler: (progress: BackfillProgress) => void,
 ): Promise<UnlistenFn> {
@@ -112,6 +130,7 @@ export const relationBackfillApi: RelationBackfillApi = {
   preview: previewRelationBackfill,
   start: startRelationBackfill,
   cancel: cancelRelationBackfill,
+  retryIndex: retryRelationBackfillIndex,
   subscribe: subscribeRelationBackfill,
   subscribeIndex: subscribeRelationBackfillIndexStatus,
   createRunId,
@@ -130,6 +149,7 @@ export function createRelationBackfillController(
   let progressUnlisten: UnlistenFn | null = null;
   let indexUnlisten: UnlistenFn | null = null;
   let startInFlight: Promise<void> | null = null;
+  let indexRetryInFlight: Promise<void> | null = null;
   let runSettled = false;
   let targetGeneration: number | null = null;
   const bufferedIndexTerminals = new Map<number, GraphIndexStatus>();
@@ -154,27 +174,67 @@ export function createRelationBackfillController(
     bufferedIndexTerminals.clear();
   };
   const settle = (
-    phase: Extract<RelationBackfillPhase, "completed" | "partial" | "failed" | "cancelled">,
+    phase: RelationBackfillTerminalPhase,
     summary = "",
     technicalError = "",
+    published = false,
   ) => {
     if (runSettled) return;
     runSettled = true;
-    patch({ phase, currentNoteId: null, error: summary, technicalError });
+    patch({
+      phase,
+      terminalPhase: phase,
+      published,
+      currentNoteId: null,
+      error: summary,
+      technicalError,
+      indexError: "",
+    });
     cleanup();
   };
-  const handleIndexTerminal = (status: GraphIndexStatus) => {
-    if (runSettled || targetGeneration === null || status.generation !== targetGeneration) return;
-    if (status.state === "ready") {
-      settle("completed");
-    } else if (status.state === "error") {
-      settle(
-        "failed",
-        "关系已经处理，但图谱索引未能安全更新。可以重新预览未完成笔记。",
-        status.error || "后端未提供索引失败详情",
-      );
-    }
+  const terminalSummary = (phase: RelationBackfillTerminalPhase) => {
+    if (phase === "partial") return "部分笔记未完成。可以重新预览未完成笔记后继续。";
+    if (phase === "cancelled") return "关系补建已取消。未完成笔记可以重新预览后继续。";
+    if (phase === "failed") return "关系补建未完成。可以重新预览未完成笔记后重试。";
+    return "";
   };
+  const failIndex = (phase: RelationBackfillTerminalPhase, detail: string) => {
+    if (runSettled) return;
+    runSettled = true;
+    patch({
+      phase: "index-failed",
+      terminalPhase: phase,
+      published: false,
+      currentNoteId: null,
+      error: "关系已经处理，但图谱索引未能安全发布。请单独重试索引。",
+      indexError: detail || "后端未提供索引失败详情",
+    });
+    cleanup();
+  };
+  const waitForIndex = (phase: RelationBackfillTerminalPhase, generation: number) => {
+    targetGeneration = generation;
+    patch({
+      phase: "waiting-for-index",
+      terminalPhase: phase,
+      published: false,
+      rebuildGeneration: generation,
+      error: "已处理的关系正在等待对应的图谱索引安全发布。",
+      indexError: "",
+    });
+    const buffered = bufferedIndexTerminals.get(generation);
+    bufferedIndexTerminals.clear();
+    if (buffered) handleIndexTerminal(buffered);
+  };
+  function handleIndexTerminal(status: GraphIndexStatus) {
+    if (runSettled || targetGeneration === null || status.generation !== targetGeneration) return;
+    const terminalPhase = state.terminalPhase;
+    if (!terminalPhase) return;
+    if (status.state === "ready") {
+      settle(terminalPhase, terminalSummary(terminalPhase), state.technicalError, true);
+    } else if (status.state === "error") {
+      failIndex(terminalPhase, status.error || "后端未提供索引失败详情");
+    }
+  }
 
   const controller: RelationBackfillController = {
     get state() {
@@ -243,8 +303,11 @@ export function createRelationBackfillController(
         currentNoteId: null,
         failures: [],
         rebuildGeneration: null,
+        terminalPhase: null,
+        published: false,
         error: "",
         technicalError: "",
+        indexError: "",
       });
 
       let task!: Promise<void>;
@@ -263,49 +326,43 @@ export function createRelationBackfillController(
                 failures,
                 error: failures.length > 0 ? "部分笔记尚未完成；可展开技术详情查看原因。" : "",
                 technicalError,
+                indexError: "",
               });
               return;
             }
+            const terminalPhase: RelationBackfillTerminalPhase =
+              event.state === "cancelled"
+                ? "cancelled"
+                : event.state === "partial" || (event.state === "completed" && failures.length > 0)
+                  ? "partial"
+                  : event.state === "failed"
+                    ? "failed"
+                    : "completed";
             patch({
               completed: event.completed,
               total: event.total,
               currentNoteId: null,
               failures,
               rebuildGeneration: event.rebuild_generation,
+              terminalPhase,
+              published: false,
+              technicalError,
+              indexError: event.index_error || "",
             });
-            if (event.state === "completed" && failures.length === 0) {
-              const generation = event.rebuild_generation;
-              if (!Number.isSafeInteger(generation) || (generation ?? 0) <= 0) {
-                settle(
-                  "failed",
-                  "关系已经处理，但后端没有返回可核对的索引版本。可以重新预览后重试。",
-                  "completed progress missing rebuild_generation",
-                );
-                return;
-              }
-              targetGeneration = generation as number;
-              patch({
-                phase: "waiting-for-index",
-                error: "关系处理完成，正在等待对应的图谱索引安全发布。",
-                technicalError: "",
-              });
-              const buffered = bufferedIndexTerminals.get(targetGeneration);
-              bufferedIndexTerminals.clear();
-              if (buffered) handleIndexTerminal(buffered);
+            if (event.index_error) {
+              failIndex(terminalPhase, event.index_error);
               return;
             }
-            if (event.state === "cancelled") {
-              settle("cancelled", "关系补建已取消。未完成笔记可以重新预览后继续。", technicalError);
+            const generation = event.rebuild_generation;
+            if (Number.isSafeInteger(generation) && (generation ?? 0) > 0) {
+              waitForIndex(terminalPhase, generation as number);
               return;
             }
-            const partial = event.state === "partial" || failures.length > 0;
-            settle(
-              partial ? "partial" : "failed",
-              partial
-                ? "部分笔记未完成。可以重新预览未完成笔记后继续。"
-                : "关系补建未完成。可以重新预览未完成笔记后重试。",
-              technicalError || "后端未提供关系补建失败详情",
-            );
+            if (terminalPhase === "completed") {
+              failIndex(terminalPhase, "completed progress missing rebuild_generation");
+              return;
+            }
+            settle(terminalPhase, terminalSummary(terminalPhase), technicalError);
           });
           if (token !== session || runSettled) {
             progressListener();
@@ -366,6 +423,64 @@ export function createRelationBackfillController(
         });
         throw cause;
       }
+    },
+    retryIndex() {
+      if (indexRetryInFlight) return indexRetryInFlight;
+      const terminalPhase = state.terminalPhase;
+      if (state.phase !== "index-failed" || !terminalPhase) {
+        return Promise.reject(new Error("只有索引发布失败时可以单独重试索引。"));
+      }
+
+      const token = session;
+      cleanup();
+      resetRunTracking();
+      patch({
+        phase: "index-retrying",
+        terminalPhase,
+        published: false,
+        rebuildGeneration: null,
+        error: "正在重新发布图谱索引。",
+        indexError: "",
+      });
+
+      let task!: Promise<void>;
+      task = (async () => {
+        try {
+          const rebuildListener = await api.subscribeIndex((status) => {
+            if (token !== session || runSettled) return;
+            if (status.state !== "ready" && status.state !== "error") return;
+            if (targetGeneration === null) {
+              bufferedIndexTerminals.set(status.generation, status);
+              if (bufferedIndexTerminals.size > 32) {
+                const oldest = bufferedIndexTerminals.keys().next().value;
+                if (oldest !== undefined) bufferedIndexTerminals.delete(oldest);
+              }
+              return;
+            }
+            handleIndexTerminal(status);
+          });
+          if (token !== session || runSettled) {
+            rebuildListener();
+            return;
+          }
+          indexUnlisten = rebuildListener;
+
+          const generation = await api.retryIndex();
+          if (token !== session || runSettled) return;
+          if (!Number.isSafeInteger(generation) || generation <= 0) {
+            throw new Error("index retry missing rebuild_generation");
+          }
+          waitForIndex(terminalPhase, generation);
+        } catch (cause) {
+          if (token !== session || runSettled) return;
+          failIndex(terminalPhase, errorMessage(cause));
+          throw cause;
+        } finally {
+          if (indexRetryInFlight === task) indexRetryInFlight = null;
+        }
+      })();
+      indexRetryInFlight = task;
+      return task;
     },
     async resume() {
       if (state.phase !== "failed" && state.phase !== "cancelled" && state.phase !== "partial") {

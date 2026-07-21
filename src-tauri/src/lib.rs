@@ -1731,6 +1731,7 @@ where
             note_id: String::new(),
             error: format!("无法启动关系补建线程:{error}"),
         });
+        terminal.index_error = None;
         emit_failure(terminal);
         return Err(format!("无法启动关系补建线程:{error}"));
     }
@@ -1786,6 +1787,7 @@ fn start_relation_backfill(
         current_note_id: None,
         failed: vec![],
         rebuild_generation: None,
+        index_error: None,
     };
     let last_progress = Arc::new(Mutex::new(initial.clone()));
     let spawn_failure_events = app.clone();
@@ -1853,6 +1855,28 @@ fn cancel_relation_backfill(state: State<AppState>, run_id: String) -> Result<()
         &run_id,
     )
     .map_err(|error| error.to_string())
+}
+
+fn retry_relation_backfill_index_with(
+    scheduler: &graph::index::RebuildScheduler,
+    root: PathBuf,
+    emit: impl Fn(graph::index::IndexStatus) + Send + Sync + 'static,
+) -> Result<u64, String> {
+    scheduler
+        .retry_dirty(root, emit)
+        .map_err(|error| format!("图谱索引重试排队失败:{error:#}"))
+}
+
+#[tauri::command]
+fn retry_relation_backfill_index(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<u64, String> {
+    let root = data_root(&app).map_err(|error| error.to_string())?;
+    let graph_events = app.clone();
+    retry_relation_backfill_index_with(&state.graph_scheduler, root, move |status| {
+        let _ = graph_events.emit("graph_index_status", status);
+    })
 }
 
 /// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
@@ -3970,6 +3994,7 @@ pub fn run() {
             preview_relation_backfill,
             start_relation_backfill,
             cancel_relation_backfill,
+            retry_relation_backfill_index,
             rename_refined_speaker,
             assign_refined_person,
             assign_note_speaker_person,
@@ -4301,6 +4326,7 @@ mod tests {
             "preview_relation_backfill,",
             "start_relation_backfill,",
             "cancel_relation_backfill,",
+            "retry_relation_backfill_index,",
         ] {
             assert!(
                 handlers.contains(command),
@@ -4355,6 +4381,7 @@ mod tests {
             current_note_id: None,
             failed: vec![],
             rebuild_generation: None,
+            index_error: None,
         };
 
         let error = super::spawn_relation_backfill_worker(
@@ -4380,6 +4407,63 @@ mod tests {
         assert_eq!(events[0].state, "failed");
         assert_eq!((events[0].completed, events[0].total), (0, 2));
         assert!(events[0].failed[0].error.contains("injected spawn failure"));
+    }
+
+    #[test]
+    fn dirty_index_retry_returns_the_exact_generation_without_running_backfill() {
+        let root = tempfile::tempdir().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuilds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuilds_in_worker = std::sync::Arc::clone(&rebuilds);
+        let attempts_in_spawn = std::sync::Arc::clone(&attempts);
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
+            move |_| {
+                rebuilds_in_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::graph::index::BuildStats::default())
+            },
+            move |job| {
+                if attempts_in_spawn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(std::io::Error::other("injected initial queue failure"))
+                } else {
+                    job();
+                    Ok(())
+                }
+            },
+        );
+        assert!(scheduler.request(root.path().to_path_buf(), |_| {}).is_err());
+        let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let statuses_in_emit = std::sync::Arc::clone(&statuses);
+
+        let generation = super::retry_relation_backfill_index_with(
+            &scheduler,
+            root.path().to_path_buf(),
+            move |status| statuses_in_emit.lock().unwrap().push(status),
+        )
+        .unwrap();
+
+        assert_eq!(generation, 2);
+        assert_eq!(
+            rebuilds.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let statuses = statuses.lock().unwrap();
+        assert!(statuses
+            .iter()
+            .any(|status| status.generation == generation && status.state == "building"));
+        assert!(statuses
+            .iter()
+            .any(|status| status.generation == generation && status.state == "ready"));
+        let source = include_str!("lib.rs");
+        assert!(source.contains("retry_relation_backfill_index,"));
+        let body = source
+            .split_once("fn retry_relation_backfill_index(")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(!body.contains("relation_executor"));
+        assert!(!body.contains("run_batch"));
     }
 
     #[test]
