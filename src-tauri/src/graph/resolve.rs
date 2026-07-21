@@ -11,7 +11,6 @@ pub struct ResolverSnapshot {
     pub redirects: BTreeMap<String, String>,
     pub mention_bindings: BTreeMap<String, String>,
     pub relation_decisions: RelationDecisions,
-    pub redirect_history: Vec<(String, String)>,
     legacy_ids: BTreeMap<String, String>,
 }
 
@@ -107,19 +106,6 @@ pub fn replay(ledger: &KnowledgeLedger) -> anyhow::Result<ResolverSnapshot> {
         redirects: BTreeMap::new(),
         mention_bindings: BTreeMap::new(),
         relation_decisions: RelationDecisions::default(),
-        redirect_history: ledger
-            .operations
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| active[*index])
-            .filter_map(|(_, operation)| match &operation.action {
-                KnowledgeAction::MergeEntity {
-                    source_id,
-                    target_id,
-                } => Some((source_id.clone(), target_id.clone())),
-                _ => None,
-            })
-            .collect(),
         legacy_ids: ledger.legacy_ids.clone(),
     };
     let restored: BTreeSet<String> = ledger
