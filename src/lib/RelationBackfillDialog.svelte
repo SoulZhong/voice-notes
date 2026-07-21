@@ -233,8 +233,8 @@
   header { border-bottom: 1px solid var(--hairline); }
   footer { justify-content: flex-end; border-top: 1px solid var(--hairline); }
   h2, h3, p { margin: 0; }
-  h2 { margin-top: 0.15rem; font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; }
-  h3 { font-size: 0.83rem; font-weight: 650; }
+  h2 { margin-top: 0.15rem; font-size: 1.15rem; font-weight: 500; letter-spacing: -0.01em; }
+  h3 { font-size: 0.83rem; font-weight: 500; }
   .eyebrow { color: var(--ink-faint); font-size: 0.72rem; letter-spacing: 0.08em; }
   .status { overflow: auto; padding: clamp(1rem, 3vw, 1.5rem); }
   .lead { color: var(--ink-secondary); font-size: 0.9rem; line-height: 1.6; }
@@ -244,7 +244,7 @@
   .facts div:nth-child(even) { padding-left: 1rem; border-left: 1px solid var(--hairline); }
   .facts div:nth-child(n + 3) { border-top: 1px solid var(--hairline); }
   dt { margin-bottom: 0.2rem; color: var(--ink-faint); font-size: 0.75rem; }
-  dd { margin: 0; color: var(--ink); font-size: 0.9rem; font-weight: 620; overflow-wrap: anywhere; }
+  dd { margin: 0; color: var(--ink); font-size: 0.9rem; font-weight: 500; overflow-wrap: anywhere; }
   .selection { margin: 0 0 1rem; color: var(--ink-secondary); font-size: 0.82rem; }
   .selection summary { cursor: pointer; min-height: 2.75rem; display: flex; align-items: center; }
   .selection ul, .failures ul { margin: 0; padding: 0; list-style: none; }
@@ -268,7 +268,9 @@
   button { min-height: 2.25rem; padding: 0.45rem 0.85rem; border-radius: var(--radius-md); font: inherit; cursor: pointer; }
   button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button:disabled { cursor: default; opacity: 0.48; }
-  .primary { border: 1px solid var(--accent); background: var(--accent); color: var(--canvas); }
+  .primary { border: 1px solid var(--primary); border-radius: var(--radius-full); background: var(--primary); color: var(--on-primary); box-shadow: var(--shadow-btn); }
+  .primary:hover:not(:disabled) { background: var(--primary-pressed); }
+  .primary:active:not(:disabled) { transform: translateY(0.5px); }
   .secondary, .close-button { border: 1px solid var(--hairline); background: var(--surface); color: var(--ink); }
   .danger { color: var(--danger); }
   @media (max-width: 34rem) {
@@ -278,6 +280,6 @@
     .facts div:nth-child(n) { padding: 0.7rem 0; border-left: 0; }
     .facts div:nth-child(n + 2) { border-top: 1px solid var(--hairline); }
   }
-  @media (pointer: coarse) { button, .selection summary, .consent { min-height: 44px; } }
+  @media (pointer: coarse) { button, .selection summary, .consent, .technical summary { min-height: 44px; } }
   @media (prefers-reduced-motion: reduce) { dialog { scroll-behavior: auto; } }
 </style>

@@ -27,6 +27,51 @@ export const GLOBAL_SEMANTIC_PRESENCE_FILTER: KnowledgeFilter = {
 /** D3 默认约 300 帧；0.23 在 alphaMin=0.001 时约 27 帧，约 450ms 后自动冻结。 */
 export const NORMAL_GRAPH_ALPHA_DECAY = 0.23;
 
+export interface GraphNodePosition {
+  x?: number;
+  y?: number;
+  vx?: number;
+  vy?: number;
+  fx?: number | null;
+  fy?: number | null;
+}
+
+/** Keep only exploration state that still points at entities in the refreshed graph. */
+export function preserveGraphExplorationState(
+  graph: Pick<SemanticGraphData, "nodes">,
+  visibleIds: ReadonlySet<string>,
+  expansionDepth: ReadonlyMap<string, number>,
+  additionallyVisibleIds: readonly string[] = [],
+): { visibleIds: Set<string>; expansionDepth: Map<string, number> } {
+  const available = new Set(graph.nodes.map((node) => node.id));
+  const nextVisible = new Set(
+    [...visibleIds, ...additionallyVisibleIds].filter((id) => available.has(id)),
+  );
+  const nextDepth = new Map(
+    [...expansionDepth].filter(([id]) => available.has(id)),
+  );
+  return { visibleIds: nextVisible, expansionDepth: nextDepth };
+}
+
+/** Re-attach the last simulation coordinates to nodes that survived a data refresh. */
+export function preserveGraphNodePositions<T extends { id: string }>(
+  nodes: readonly T[],
+  previous: ReadonlyMap<string, GraphNodePosition>,
+): Array<T & GraphNodePosition> {
+  return nodes.map((node) => {
+    const position = previous.get(node.id);
+    if (!position) return { ...node };
+    const preserved: GraphNodePosition = {};
+    if (position.x !== undefined) preserved.x = position.x;
+    if (position.y !== undefined) preserved.y = position.y;
+    if (position.vx !== undefined) preserved.vx = position.vx;
+    if (position.vy !== undefined) preserved.vy = position.vy;
+    if (position.fx !== undefined) preserved.fx = position.fx;
+    if (position.fy !== undefined) preserved.fy = position.fy;
+    return { ...node, ...preserved };
+  });
+}
+
 export interface DebugKnowledgeRoutePolicy {
   debugFixtureRequested: boolean;
   productionEffectsAllowed: boolean;
