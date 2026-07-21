@@ -13,10 +13,7 @@ use std::path::Path;
 
 const ENTITY_COUNT: usize = 1_000;
 const RELATION_COUNT: usize = 5_000;
-const BASE_COOCCURRENCE_COUNT: usize = 1_500;
-// The 1,500 dedicated weak-edge notes plus semantic evidence notes yield this
-// deterministic union after four overlapping entity pairs are coalesced.
-const COOCCURRENCE_COUNT: usize = 2_496;
+const COOCCURRENCE_COUNT: usize = 1_500;
 
 fn entity_id(index: usize) -> String {
     format!("kg_{index:04}")
@@ -49,11 +46,14 @@ fn deterministic_large_graph() -> CanonicalGraph {
     // Each unique two-entity note contributes exactly one undirected
     // co-occurrence edge. 1,000 cycle neighbours + 500 second neighbours are
     // disjoint, yielding exactly 1,500 distinct edges.
-    let pairs = (0..ENTITY_COUNT)
+    let mut pairs = (0..ENTITY_COUNT)
         .map(|left| (left, (left + 1) % ENTITY_COUNT))
         .chain((0..500).map(|left| (left, left + 2)))
         .collect::<Vec<_>>();
-    assert_eq!(pairs.len(), BASE_COOCCURRENCE_COUNT);
+    // Preserve the direct 0000 -> 0017 path used by the deterministic path
+    // assertion without adding a sixteenth-hundredth weak pair.
+    pairs[0] = (0, 17);
+    assert_eq!(pairs.len(), COOCCURRENCE_COUNT);
     let mut mentions = pairs
         .iter()
         .enumerate()
@@ -85,8 +85,7 @@ fn deterministic_large_graph() -> CanonicalGraph {
     // Semantic evidence must reference real canonical mentions as production
     // data does; otherwise the large fixture can hide broken evidence joins.
     mentions.extend((0..RELATION_COUNT).flat_map(|index| {
-        let subject = index % ENTITY_COUNT;
-        let object = (index * 37 + 17) % ENTITY_COUNT;
+        let (subject, object) = pairs[index % pairs.len()];
         let note_id = format!("fixture-semantic-{index:04}");
         let subject_quote = format!("Fixture Entity {subject:04}");
         let object_quote = format!("Fixture Entity {object:04}");
@@ -125,8 +124,7 @@ fn deterministic_large_graph() -> CanonicalGraph {
     ];
     let relations = (0..RELATION_COUNT)
         .map(|index| {
-            let subject = index % ENTITY_COUNT;
-            let object = (index * 37 + 17) % ENTITY_COUNT;
+            let (subject, object) = pairs[index % pairs.len()];
             let note_id = format!("fixture-semantic-{index:04}");
             let subject_mention = format!("mn_semantic_{index:04}_subject");
             let object_mention = format!("mn_semantic_{index:04}_object");
@@ -250,6 +248,21 @@ fn semantic_graph_large_import_requires_a_new_explicit_temp_root() {
     assert!(object_mentions
         .iter()
         .any(|mention| mention.id == "mn_semantic_0000_object"));
+    let connection = index::open_readonly(&allowed).unwrap();
+    let resolvable_evidence_mentions: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM (\
+               SELECT mention.id FROM relation_evidence evidence, json_each(evidence.subject_mentions) refs \
+                 JOIN entity_mentions mention ON mention.id = refs.value \
+               UNION ALL \
+               SELECT mention.id FROM relation_evidence evidence, json_each(evidence.object_mentions) refs \
+                 JOIN entity_mentions mention ON mention.id = refs.value\
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(resolvable_evidence_mentions, RELATION_COUNT * 2);
 
     let first = path::shortest_path(&allowed, "kg_0000", "kg_0017", &all_filter())
         .unwrap()
