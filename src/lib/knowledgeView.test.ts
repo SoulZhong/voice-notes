@@ -3,6 +3,7 @@ import type { EntitySummary } from "./graph";
 import type { KnowledgePath, KnowledgeFilter, KnowledgePathStep, SemanticEdge, SemanticGraphData } from "./knowledge";
 import {
   DEFAULT_KNOWLEDGE_FILTER,
+  GLOBAL_SEMANTIC_PRESENCE_FILTER,
   canonicalPathEdgeId,
   defaultBackbone,
   ensureBackboneEdge,
@@ -571,6 +572,34 @@ describe("exploratory graph UI source contract", () => {
     expect(shouldUseLegacyFallback("present", filteredEmpty)).toBe(false);
     expect(shouldUseLegacyFallback("unknown", filteredEmpty)).toBe(false);
     expect(shouldUseLegacyFallback("absent", filteredEmpty)).toBe(true);
+  });
+
+  it("detects a historical-only backend graph without changing the current-only view", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const historicalOnly = graph(
+      [node("kg_person", "person"), node("kg_project")],
+      [
+        edge("r_historical", "kg_person", "kg_project", {
+          status: "historical",
+          valid_from: "2025-01-01T00:00:00Z",
+          valid_to: "2025-12-31T23:59:59Z",
+        }),
+      ],
+    );
+
+    const currentOnly = filterSemanticGraph(historicalOnly, DEFAULT_KNOWLEDGE_FILTER);
+    const globalProbe = filterSemanticGraph(historicalOnly, GLOBAL_SEMANTIC_PRESENCE_FILTER);
+
+    expect(DEFAULT_KNOWLEDGE_FILTER.include_history).toBe(false);
+    expect(currentOnly.semantic_edges).toEqual([]);
+    expect(GLOBAL_SEMANTIC_PRESENCE_FILTER).toEqual({
+      ...DEFAULT_KNOWLEDGE_FILTER,
+      include_history: true,
+    });
+    expect(globalProbe.semantic_edges.map((item) => item.id)).toEqual(["r_historical"]);
+    expect(shouldUseLegacyFallback("present", currentOnly)).toBe(false);
+    expect(route).toContain("semanticGraph(GLOBAL_SEMANTIC_PRESENCE_FILTER)");
+    expect(route).toContain("loadSemantic(knowledgeFilter)");
   });
 
   it("gives parallel relations stable signed Bezier lanes and independent label paths", () => {
