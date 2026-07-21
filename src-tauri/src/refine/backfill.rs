@@ -3,10 +3,11 @@ pub use crate::ipc::{BackfillFailure, BackfillPreview, BackfillProgress, Backfil
 use crate::settings::Settings;
 use crate::store::aing_graph::{ValidatedGraph, GRAPH_CONTRACT_VERSION};
 use crate::store::{GraphExtraction, RefinedDoc};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub trait RelationExecutor: Send + Sync {
     fn provider(&self) -> &str;
@@ -27,21 +28,77 @@ pub struct BackfillOutcome {
 
 pub(crate) struct BackfillGate {
     running: Arc<AtomicBool>,
+    active_run_id: Arc<Mutex<Option<String>>>,
+    run_id: String,
 }
 
 impl BackfillGate {
-    pub(crate) fn acquire(running: Arc<AtomicBool>) -> anyhow::Result<Self> {
+    pub(crate) fn acquire(
+        running: Arc<AtomicBool>,
+        active_run_id: Arc<Mutex<Option<String>>>,
+        run_id: &str,
+    ) -> anyhow::Result<Self> {
+        validate_run_id(run_id)?;
         running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| anyhow::anyhow!("关系补建已在运行"))?;
-        Ok(Self { running })
+        let mut active = active_run_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.is_some() {
+            running.store(false, Ordering::SeqCst);
+            anyhow::bail!("关系补建运行标识尚未释放");
+        }
+        *active = Some(run_id.into());
+        drop(active);
+        Ok(Self {
+            running,
+            active_run_id,
+            run_id: run_id.into(),
+        })
     }
 }
 
 impl Drop for BackfillGate {
     fn drop(&mut self) {
+        let mut active = self
+            .active_run_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_deref() == Some(self.run_id.as_str()) {
+            *active = None;
+        }
         self.running.store(false, Ordering::SeqCst);
     }
+}
+
+fn validate_run_id(run_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 128
+            && run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "非法关系补建 run_id"
+    );
+    Ok(())
+}
+
+pub(crate) fn request_cancel(
+    active_run_id: &Mutex<Option<String>>,
+    cancel: &AtomicBool,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    validate_run_id(run_id)?;
+    let active = active_run_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    anyhow::ensure!(
+        active.as_deref() == Some(run_id),
+        "关系补建 run_id 已过期或不在运行"
+    );
+    cancel.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 fn configured_provider(settings: &Settings) -> anyhow::Result<(&str, &str)> {
@@ -113,12 +170,56 @@ fn load_preview_doc(notes_root: &Path, note_id: &str) -> anyhow::Result<Option<R
     anchored.load_current()
 }
 
+fn hash_preview_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn consent_token(
+    notes_root: &Path,
+    note_ids: &[String],
+    provider: &str,
+    model: &str,
+) -> anyhow::Result<String> {
+    let mut hasher = Sha256::new();
+    hash_preview_field(&mut hasher, provider);
+    hash_preview_field(&mut hasher, model);
+    hasher.update(GRAPH_CONTRACT_VERSION.to_be_bytes());
+    for note_id in note_ids {
+        hash_preview_field(&mut hasher, note_id);
+        let doc = load_preview_doc(notes_root, note_id)?
+            .ok_or_else(|| anyhow::anyhow!("笔记 {note_id} 没有可补建的 aing.json"))?;
+        hash_preview_field(&mut hasher, &crate::store::source_hash(&doc.paragraphs));
+    }
+    Ok(format!("backfill-preview-{:x}", hasher.finalize()))
+}
+
+pub(crate) fn validate_request(
+    fresh: &BackfillPreview,
+    request: &BackfillRequest,
+) -> anyhow::Result<()> {
+    validate_run_id(&request.run_id)?;
+    anyhow::ensure!(!request.note_ids.is_empty(), "关系补建选择不能为空");
+    anyhow::ensure!(
+        request.consent_token == fresh.consent_token
+            && request.note_ids == fresh.note_ids
+            && request.provider == fresh.provider
+            && request.model == fresh.model
+            && request.contract_version == fresh.contract_version,
+        "关系补建预览已变化，请重新预览并确认"
+    );
+    Ok(())
+}
+
 /// 纯只读选择：不迁移旧稿、不写 stage、不触发索引。
 pub fn preview(
     data_root: &Path,
     settings: &Settings,
     requested: Option<&[String]>,
 ) -> anyhow::Result<BackfillPreview> {
+    // Human decisions are truth. Validate existing bytes before provider setup
+    // or any note-directory scan; missing remains a valid read-only state.
+    crate::graph::overrides::validate_existing(data_root)?;
     let (provider, model) = configured_provider(settings)?;
     let notes_root = data_root.join("notes");
     let note_ids = match requested {
@@ -140,11 +241,12 @@ pub fn preview(
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(BackfillPreview {
+                        consent_token: consent_token(&notes_root, &selected, provider, model)?,
                         note_ids: selected,
                         provider: provider.into(),
                         model: model.into(),
                         contract_version: GRAPH_CONTRACT_VERSION,
-                    });
+                    })
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -170,6 +272,7 @@ pub fn preview(
         }
     };
     Ok(BackfillPreview {
+        consent_token: consent_token(&notes_root, &note_ids, provider, model)?,
         note_ids,
         provider: provider.into(),
         model: model.into(),
@@ -385,26 +488,30 @@ pub fn run_one(
 }
 
 pub(crate) fn run_batch(
+    run_id: &str,
     notes_root: &Path,
     note_ids: &[String],
     executor: &dyn RelationExecutor,
     cancel: &AtomicBool,
     mut emit: impl FnMut(BackfillProgress),
-    mut request_rebuild: impl FnMut() -> anyhow::Result<()>,
+    mut request_rebuild: impl FnMut() -> anyhow::Result<u64>,
 ) -> BackfillProgress {
     let total = note_ids.len();
     let mut completed = 0usize;
     let mut committed = 0usize;
+    let mut succeeded = 0usize;
     let mut failed = Vec::new();
     let mut cancelled = false;
     let mut panicked = false;
     for note_id in note_ids {
         emit(BackfillProgress {
+            run_id: run_id.into(),
             state: "running".into(),
             completed,
             total,
             current_note_id: Some(note_id.clone()),
             failed: failed.clone(),
+            rebuild_generation: None,
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one_controlled(&notes_root.join(note_id), note_id, executor, cancel)
@@ -413,6 +520,7 @@ pub(crate) fn run_batch(
             Ok(Ok(outcome)) => {
                 completed += 1;
                 committed += usize::from(outcome.committed);
+                succeeded += 1;
             }
             Ok(Err(RunOneError::Cancelled)) => cancelled = true,
             Ok(Err(RunOneError::Failed(error))) => {
@@ -431,19 +539,22 @@ pub(crate) fn run_batch(
             }
         }
         emit(BackfillProgress {
+            run_id: run_id.into(),
             state: "running".into(),
             completed,
             total,
             current_note_id: Some(note_id.clone()),
             failed: failed.clone(),
+            rebuild_generation: None,
         });
         if cancelled || panicked {
             break;
         }
     }
-    if committed > 0 {
+    let mut rebuild_generation = None;
+    if committed > 0 || (!cancelled && !panicked && failed.is_empty()) {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut request_rebuild)) {
-            Ok(Ok(())) => {}
+            Ok(Ok(generation)) => rebuild_generation = Some(generation),
             Ok(Err(error)) => failed.push(BackfillFailure {
                 note_id: String::new(),
                 error: format!("索引排队失败，已保留 dirty 标记供重试:{error:#}"),
@@ -458,18 +569,24 @@ pub(crate) fn run_batch(
         }
     }
     let terminal = BackfillProgress {
+        run_id: run_id.into(),
         state: if cancelled {
             "cancelled"
         } else if panicked {
             "failed"
-        } else {
+        } else if failed.is_empty() && rebuild_generation.is_some() {
             "completed"
+        } else if succeeded > 0 {
+            "partial"
+        } else {
+            "failed"
         }
         .into(),
         completed,
         total,
         current_note_id: None,
         failed,
+        rebuild_generation,
     };
     emit(terminal.clone());
     terminal
@@ -739,6 +856,80 @@ mod tests {
     }
 
     #[test]
+    fn preview_consent_token_binds_selection_source_provider_model_and_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let note_id = "consent-bound";
+        write_note(root.path(), note_id, &fixture_doc(note_id, 0, "failed"));
+        let mut settings = crate::settings::Settings::default();
+        settings.refine_provider = "openai".into();
+        settings.refine_model = "relation-model-a".into();
+
+        let first = preview(root.path(), &settings, Some(&[note_id.into()])).unwrap();
+        assert!(first.consent_token.starts_with("backfill-preview-"));
+        let exact = BackfillRequest {
+            run_id: "run-consent-a".into(),
+            consent_token: first.consent_token.clone(),
+            note_ids: first.note_ids.clone(),
+            provider: first.provider.clone(),
+            model: first.model.clone(),
+            contract_version: first.contract_version,
+        };
+        validate_request(&first, &exact).unwrap();
+
+        let note_dir = root.path().join("notes").join(note_id);
+        let mut changed = store::load_refined(&note_dir).unwrap();
+        changed.paragraphs[0].text.push_str("，正文已变");
+        changed.paragraphs[0].source_seqs.push(99);
+        store::write_refined_atomic(&note_dir, &changed).unwrap();
+        let source_changed = preview(root.path(), &settings, Some(&[note_id.into()])).unwrap();
+        assert_ne!(source_changed.consent_token, first.consent_token);
+        assert!(validate_request(&source_changed, &exact).is_err());
+
+        settings.refine_model = "relation-model-b".into();
+        let model_changed = preview(root.path(), &settings, Some(&[note_id.into()])).unwrap();
+        assert_ne!(model_changed.consent_token, source_changed.consent_token);
+        assert!(validate_request(&model_changed, &exact).is_err());
+    }
+
+    #[test]
+    fn preview_rejects_corrupt_human_ledger_before_note_selection() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(crate::graph::overrides::KNOWLEDGE_FILE),
+            b"{broken",
+        )
+        .unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.refine_provider = "openai".into();
+        settings.refine_model = "relation-model".into();
+
+        let error = preview(root.path(), &settings, Some(&["../must-not-scan".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("knowledge-overrides.json"), "{error}");
+        assert!(
+            !error.contains("非法笔记"),
+            "ledger validation must run first: {error}"
+        );
+    }
+
+    #[test]
+    fn cancel_is_scoped_to_the_exact_active_run() {
+        let active = Arc::new(std::sync::Mutex::new(None));
+        let running = Arc::new(AtomicBool::new(false));
+        let cancel = AtomicBool::new(false);
+        let gate = BackfillGate::acquire(Arc::clone(&running), Arc::clone(&active), "run-current")
+            .unwrap();
+
+        assert!(request_cancel(&active, &cancel, "run-old").is_err());
+        assert!(!cancel.load(Ordering::SeqCst));
+        request_cancel(&active, &cancel, "run-current").unwrap();
+        assert!(cancel.load(Ordering::SeqCst));
+        drop(gate);
+        assert!(active.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn cancellation_before_provider_and_between_extraction_and_commit_preserves_every_byte() {
         let root = tempfile::tempdir().unwrap();
         let note_id = "cancelled";
@@ -837,6 +1028,7 @@ mod tests {
         let mut progress = Vec::new();
         let rebuilds = AtomicUsize::new(0);
         let final_progress = run_batch(
+            "run-cancel",
             &root.path().join("notes"),
             &note_ids,
             &executor,
@@ -844,10 +1036,12 @@ mod tests {
             |event| progress.push(event),
             || {
                 rebuilds.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(41)
             },
         );
         assert_eq!(final_progress.state, "cancelled");
+        assert_eq!(final_progress.run_id, "run-cancel");
+        assert_eq!(final_progress.rebuild_generation, Some(41));
         assert_eq!(final_progress.completed, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
@@ -864,14 +1058,16 @@ mod tests {
         let resume_calls = Arc::new(AtomicUsize::new(0));
         let resume_executor = MaterializingExecutor::success(Arc::clone(&resume_calls));
         let resumed = run_batch(
+            "run-resume",
             &root.path().join("notes"),
             &note_ids,
             &resume_executor,
             &cancel,
             |_| {},
-            || Ok(()),
+            || Ok(42),
         );
         assert_eq!(resumed.state, "completed");
+        assert_eq!(resumed.rebuild_generation, Some(42));
         assert_eq!(resumed.completed, 2);
         assert_eq!(resume_calls.load(Ordering::SeqCst), 1);
         assert!(is_current(
@@ -882,18 +1078,25 @@ mod tests {
     #[test]
     fn global_gate_rejects_overlap_and_resets_on_drop() {
         let running = Arc::new(AtomicBool::new(false));
-        let first = BackfillGate::acquire(Arc::clone(&running)).unwrap();
-        assert!(BackfillGate::acquire(Arc::clone(&running)).is_err());
+        let active = Arc::new(std::sync::Mutex::new(None));
+        let first =
+            BackfillGate::acquire(Arc::clone(&running), Arc::clone(&active), "run-first").unwrap();
+        assert!(
+            BackfillGate::acquire(Arc::clone(&running), Arc::clone(&active), "run-second").is_err()
+        );
         drop(first);
-        assert!(BackfillGate::acquire(running).is_ok());
+        assert!(BackfillGate::acquire(running, active, "run-second").is_ok());
 
         let running = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(std::sync::Mutex::new(None));
         let unwind_running = Arc::clone(&running);
+        let unwind_active = Arc::clone(&active);
         let _ = std::panic::catch_unwind(move || {
-            let _guard = BackfillGate::acquire(unwind_running).unwrap();
+            let _guard = BackfillGate::acquire(unwind_running, unwind_active, "run-panic").unwrap();
             panic!("simulated worker panic");
         });
         assert!(!running.load(Ordering::SeqCst));
+        assert!(active.lock().unwrap().is_none());
     }
 
     #[test]
@@ -970,6 +1173,7 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
         let executor = MaterializingExecutor::success(Arc::new(AtomicUsize::new(0)));
         let terminal = run_batch(
+            "run-dirty",
             &root.path().join("notes"),
             &[note_id.into()],
             &executor,
@@ -979,16 +1183,17 @@ mod tests {
                 scheduler_calls.fetch_add(1, Ordering::SeqCst);
                 scheduler
                     .request(root.path().to_path_buf(), |_| {})
-                    .map(|_| ())
+                    .map(|generation| generation)
             },
         );
         assert_eq!(scheduler_calls.load(Ordering::SeqCst), 1);
         assert!(root.path().join(".graph-index-dirty").is_file());
-        assert_eq!(terminal.state, "completed");
+        assert_eq!(terminal.state, "partial");
         assert_eq!((terminal.completed, terminal.total), (1, 1));
         assert_eq!(terminal.failed.len(), 1);
         assert!(terminal.failed[0].error.contains("dirty"));
-        assert_eq!(events.borrow().last().unwrap().state, "completed");
+        assert_eq!(events.borrow().last().unwrap().state, "partial");
+        assert_eq!(terminal.rebuild_generation, None);
 
         let failed_id = "provider-failed";
         write_note(root.path(), failed_id, &fixture_doc(failed_id, 0, "failed"));
@@ -999,6 +1204,7 @@ mod tests {
             invalid: false,
         };
         let terminal = run_batch(
+            "run-provider-failed",
             &root.path().join("notes"),
             &[failed_id.into()],
             &executor,
@@ -1006,7 +1212,8 @@ mod tests {
             |_| {},
             || anyhow::bail!("must not rebuild without a commit"),
         );
-        assert_eq!(terminal.state, "completed");
+        assert_eq!(terminal.state, "failed");
+        assert_eq!(terminal.rebuild_generation, None);
         assert_eq!(terminal.failed[0].note_id, failed_id);
         assert!(terminal.failed[0].error.contains("provider failed"));
     }
@@ -1051,6 +1258,7 @@ mod tests {
         let rebuilds = AtomicUsize::new(0);
         let events = std::cell::RefCell::new(Vec::new());
         let terminal = run_batch(
+            "run-panic",
             &root.path().join("notes"),
             &[first.into(), second.into()],
             &PanicOnSecond {
@@ -1062,7 +1270,7 @@ mod tests {
                 rebuilds.fetch_add(1, Ordering::SeqCst);
                 scheduler
                     .request(root.path().to_path_buf(), |_| {})
-                    .map(|_| ())
+                    .map(|generation| generation)
             },
         );
 
@@ -1096,11 +1304,13 @@ mod tests {
     #[test]
     fn panic_progress_is_failed_unless_cancellation_was_requested() {
         let last = BackfillProgress {
+            run_id: "run-panic-progress".into(),
             state: "running".into(),
             completed: 1,
             total: 3,
             current_note_id: Some("two".into()),
             failed: vec![],
+            rebuild_generation: None,
         };
         let failed = panic_progress(last.clone(), false);
         assert_eq!(failed.state, "failed");
