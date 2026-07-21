@@ -17,7 +17,7 @@ pub(crate) mod path;
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(any(test, debug_assertions))]
-mod large_fixture;
+pub(crate) mod large_fixture;
 
 pub(crate) const GRAPH_FILE: &str = "graph.sqlite";
 

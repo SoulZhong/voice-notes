@@ -3674,6 +3674,52 @@ fn set_input_volume(v: u8) -> bool {
     }
 }
 
+#[cfg(debug_assertions)]
+#[derive(serde::Serialize)]
+struct SemanticGraphDebugFixture {
+    fixture_root: String,
+    graph: ipc::SemanticGraphData,
+    path: ipc::KnowledgePath,
+}
+
+/// Debug-only desktop harness. It always creates a new OS-temp child itself;
+/// callers cannot provide a path, so the configured library can never be
+/// selected or overwritten by the fixture importer.
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn semantic_graph_debug_fixture() -> Result<SemanticGraphDebugFixture, String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let fixture_root = std::env::temp_dir().join(format!(
+        "aing-semantic-fixture-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
+    graph::large_fixture::import_semantic_graph_large_fixture(&fixture_root)
+        .map_err(|error| format!("创建隔离语义图夹具失败:{error:#}"))?;
+    let filter = graph::query::GraphFilter {
+        entity_kinds: Vec::new(),
+        predicate_types: Vec::new(),
+        from: None,
+        to: None,
+        include_history: true,
+        include_cooccurrence: true,
+    };
+    let graph = graph::query::semantic_graph(&fixture_root, &filter)
+        .map_err(|error| format!("读取隔离语义图夹具失败:{error:#}"))?;
+    let path = graph::path::shortest_path(&fixture_root, "kg_0000", "kg_0017", &filter)
+        .map_err(|error| format!("读取隔离夹具路径失败:{error:#}"))?
+        .ok_or_else(|| "隔离夹具没有预期路径".to_string())?;
+    Ok(SemanticGraphDebugFixture {
+        fixture_root: fixture_root.to_string_lossy().into_owned(),
+        graph,
+        path,
+    })
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -3886,6 +3932,8 @@ pub fn run() {
             pending_review,
             entity_mentions,
             shortest_path,
+            #[cfg(debug_assertions)]
+            semantic_graph_debug_fixture,
             apply_knowledge_operation,
             split_entity,
             merge_entities,
@@ -4116,6 +4164,29 @@ mod tests {
                 "missing registered command {command}"
             );
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn semantic_graph_debug_fixture_owns_a_new_isolated_temp_root() {
+        let fixture = super::semantic_graph_debug_fixture().unwrap();
+        let root = std::path::PathBuf::from(&fixture.fixture_root);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let parent = root.parent().unwrap().canonicalize().unwrap();
+        assert!(parent.starts_with(temp));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("aing-semantic-fixture-"));
+        assert_eq!(fixture.graph.nodes.len(), 1_000);
+        assert_eq!(fixture.graph.semantic_edges.len(), 5_000);
+        assert_eq!(fixture.path.steps[0].id, "cr_fixture_0000");
+
+        let source = include_str!("lib.rs");
+        assert!(source.contains("#[cfg(debug_assertions)]\n            semantic_graph_debug_fixture,"));
+        assert!(source.contains("fn semantic_graph_debug_fixture()"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

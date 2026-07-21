@@ -287,7 +287,7 @@ fn get_aing_context_with_hook(
     }))
 }
 
-fn normalize_agent_graph(
+pub(crate) fn normalize_agent_graph(
     note_id: &str,
     doc: &mut store::RefinedDoc,
     params: &ApplyAingGraphParams,
