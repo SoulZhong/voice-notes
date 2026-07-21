@@ -226,6 +226,47 @@ fn query_nodes(
     .collect()
 }
 
+fn query_node(
+    connection: &rusqlite::Connection,
+    entity_id: &str,
+) -> anyhow::Result<Option<ipc::EntitySummary>> {
+    let row = connection.query_row(
+        "SELECT entity.id, entity.kind, entity.name, entity.aliases, entity.is_person, \
+         count(DISTINCT note_entity.note_id), \
+         coalesce(sum(note_entity.mention_count), 0) \
+         FROM entities entity \
+         LEFT JOIN note_entities note_entity ON note_entity.entity_id = entity.id \
+         WHERE entity.id = ? \
+         GROUP BY entity.id, entity.kind, entity.name, entity.aliases, entity.is_person",
+        [entity_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    );
+    let (id, kind, name, aliases, is_person, note_count, mention_total) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(ipc::EntitySummary {
+        id,
+        kind,
+        name,
+        aliases: serde_json::from_str(&aliases)?,
+        is_person: is_person != 0,
+        note_count,
+        mention_total,
+    }))
+}
+
 fn query_semantic_edges(
     connection: &rusqlite::Connection,
     filter: &GraphFilter,
@@ -407,20 +448,21 @@ fn semantic_entity_detail_from_context(
     let Some(entity_id) = resolve_entity_from_context(context, entity_id) else {
         return Ok(None);
     };
-    let graph = semantic_graph_from_context(context, filter)?;
-    let Some(summary) = graph.nodes.into_iter().find(|node| node.id == entity_id) else {
+    validate_filter(filter)?;
+    let Some(summary) = query_node(&context.connection, &entity_id)? else {
         return Ok(None);
     };
+    let kinds = normalized_values(&filter.entity_kinds);
+    let predicates = normalized_values(&filter.predicate_types);
+    let relations = query_semantic_edges(&context.connection, filter, &kinds, &predicates)?
+        .into_iter()
+        .filter(|edge| edge.subject_id == entity_id || edge.object_id == entity_id)
+        .collect();
     let confirmed = context.connection.query_row(
         "SELECT confirmed FROM entities WHERE id = ?",
         [&entity_id],
         |row| row.get::<_, i64>(0),
     )? != 0;
-    let relations = graph
-        .semantic_edges
-        .into_iter()
-        .filter(|edge| edge.subject_id == entity_id || edge.object_id == entity_id)
-        .collect();
     Ok(Some(ipc::SemanticEntityDetail {
         id: summary.id,
         kind: summary.kind,
@@ -431,8 +473,8 @@ fn semantic_entity_detail_from_context(
         note_count: summary.note_count,
         mention_total: summary.mention_total,
         relations,
-        degraded: graph.degraded,
-        message: graph.message,
+        degraded: context.ledger.degraded,
+        message: context.ledger.degraded.then(|| DEGRADED_MESSAGE.into()),
     }))
 }
 
@@ -1674,6 +1716,7 @@ mod tests {
             ("kg_a".into(), entity("kg_a", "person", "Alice")),
             ("kg_b".into(), entity("kg_b", "project", "Beacon")),
             ("kg_c".into(), entity("kg_c", "org", "Council")),
+            ("kg_d".into(), entity("kg_d", "term", "Detached")),
         ]);
         let mentions = vec![
             CanonicalMention {
@@ -1702,6 +1745,15 @@ mod tests {
                 start: 10,
                 end: 16,
                 quote: "Beacon".into(),
+            },
+            CanonicalMention {
+                id: "m_d_1".into(),
+                note_id: "note-3".into(),
+                entity_id: "kg_d".into(),
+                paragraph_index: 0,
+                start: 0,
+                end: 8,
+                quote: "Detached".into(),
             },
         ];
         let relations = vec![
@@ -1775,6 +1827,15 @@ mod tests {
                     overrides::RegistryEntity {
                         kind: "org".into(),
                         name: "Council".into(),
+                        aliases: Vec::new(),
+                        status: "confirmed".into(),
+                    },
+                ),
+                (
+                    "kg_d".into(),
+                    overrides::RegistryEntity {
+                        kind: "term".into(),
+                        name: "Detached".into(),
                         aliases: Vec::new(),
                         status: "confirmed".into(),
                     },
@@ -1894,6 +1955,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["identity_conflict", "relation_review"]
         );
+    }
+
+    #[test]
+    fn semantic_entity_detail_keeps_an_indexed_entity_without_relations() {
+        let root = tempfile::tempdir().unwrap();
+        install_fixture(root.path());
+
+        let detail = semantic_entity_detail(root.path(), "kg_d", &all_filter())
+            .unwrap()
+            .expect("indexed entities do not require a semantic relation");
+
+        assert_eq!(detail.id, "kg_d");
+        assert_eq!(detail.name, "Detached");
+        assert_eq!(detail.note_count, 1);
+        assert_eq!(detail.mention_total, 1);
+        assert!(detail.relations.is_empty());
     }
 
     #[test]
