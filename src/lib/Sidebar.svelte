@@ -94,7 +94,12 @@
   // ── 图谱:实体/文章两视角,列表作为主从结构的 master(搜索 + 过滤在侧栏,主区放画布)──
   let graphEnts = $state<EntitySummary[]>([]);
   let pendingCount = $state(0);
+  let graphDrawerOpen = $state(false);
   const graphNotes = $derived(noteGraphState.data.nodes); // 文章视角:节点=笔记(name=标题)
+
+  $effect(() => {
+    if (tab !== "graph") graphDrawerOpen = false;
+  });
 
   async function refreshGraphEntities() {
     try {
@@ -329,7 +334,7 @@
   </li>
 {/snippet}
 
-<aside class="sidebar">
+<aside class="sidebar" class:graph-mode={tab === "graph"}>
   <!-- 立体竖排页签(冒烟反馈):贴侧栏左缘,文件夹式——选中页签与内容面板同底、
        交界边线断开融为一体(凸起),未选中退后;点击即导航,选中由路由派生。 -->
   <nav class="tab-rail">
@@ -350,6 +355,15 @@
       class:active={tab === "graph"}
       onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>图谱</button
     >
+    {#if tab === "graph"}
+      <button
+        type="button"
+        class="graph-drawer-toggle"
+        aria-expanded={graphDrawerOpen}
+        aria-controls="graph-sidebar-panel"
+        onclick={() => (graphDrawerOpen = !graphDrawerOpen)}
+      >筛选</button>
+    {/if}
     <button
       class="vtab"
       class:active={tab === "hooks"}
@@ -367,7 +381,15 @@
     >
   </nav>
 
-  <div class="panel">
+  <div id="graph-sidebar-panel" class="panel" class:drawer-open={graphDrawerOpen}>
+  {#if tab === "graph"}
+    <button
+      type="button"
+      class="graph-drawer-close"
+      aria-label="关闭图谱侧栏"
+      onclick={() => (graphDrawerOpen = false)}
+    >×</button>
+  {/if}
   <button
     class="record-btn"
     class:recording={recording.isLive}
@@ -632,6 +654,15 @@
   </div>
 </aside>
 
+{#if tab === "graph" && graphDrawerOpen}
+  <button
+    type="button"
+    class="graph-drawer-scrim"
+    aria-label="关闭图谱侧栏"
+    onclick={() => (graphDrawerOpen = false)}
+  ></button>
+{/if}
+
 {#if menuForId}
   {@const menuNote = notes.find((n) => n.id === menuForId)}
   <!-- 点击任意处关闭;键盘路径由 svelte:window 的 Esc 承担,遮罩是纯指针便利层 -->
@@ -657,7 +688,11 @@
   </div>
 {/if}
 
-<svelte:window onkeydown={(e) => { if (e.key === "Escape" && menuForId) closeMenu(); }} />
+<svelte:window onkeydown={(e) => {
+  if (e.key !== "Escape") return;
+  if (menuForId) closeMenu();
+  else if (graphDrawerOpen) graphDrawerOpen = false;
+}} />
 
 <style>
   /* sidebar 组件规范：surface 底 + 右侧发丝线，条目 rounded-md、hover surface-soft、
@@ -674,6 +709,9 @@
     box-sizing: border-box;
     overflow-y: hidden;
   }
+  .graph-drawer-toggle,
+  .graph-drawer-close,
+  .graph-drawer-scrim { display: none; }
   .tab-rail {
     width: 34px;
     flex-shrink: 0;
@@ -1156,8 +1194,78 @@
     color: var(--ink-faint);
     font-size: 0.85em;
   }
+  @media (max-width: 700px) {
+    .sidebar.graph-mode {
+      width: 44px;
+      overflow: visible;
+    }
+    .sidebar.graph-mode .tab-rail { width: 44px; position: relative; z-index: 37; }
+    .sidebar.graph-mode .panel {
+      position: fixed;
+      z-index: 36;
+      top: 0;
+      bottom: 0;
+      left: 44px;
+      width: min(280px, calc(100vw - 60px));
+      transform: translateX(calc(-100% - 44px));
+      visibility: hidden;
+      pointer-events: none;
+      border-right: 1px solid var(--hairline-strong);
+      box-shadow: var(--shadow-popover);
+      transition: transform 180ms ease, visibility 180ms;
+    }
+    .sidebar.graph-mode .panel.drawer-open {
+      transform: translateX(0);
+      visibility: visible;
+      pointer-events: auto;
+    }
+    .graph-drawer-toggle {
+      display: grid;
+      place-items: center;
+      min-height: 44px;
+      margin: 4px;
+      padding: 7px 3px;
+      border: 1px solid var(--hairline-strong);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      color: var(--accent);
+      font: inherit;
+      font-size: 0.72rem;
+      writing-mode: vertical-rl;
+      cursor: pointer;
+    }
+    .graph-drawer-close {
+      display: grid;
+      place-items: center;
+      align-self: flex-end;
+      width: 44px;
+      min-height: 44px;
+      margin: -4px -4px 2px 0;
+      padding: 0;
+      border: 0;
+      border-radius: var(--radius-full);
+      background: transparent;
+      color: var(--ink-secondary);
+      font: inherit;
+      font-size: 1.25rem;
+      cursor: pointer;
+    }
+    .graph-drawer-scrim {
+      position: fixed;
+      z-index: 35;
+      inset: 0 0 0 44px;
+      display: block;
+      padding: 0;
+      border: 0;
+      background: color-mix(in srgb, var(--canvas) 34%, transparent);
+      cursor: default;
+    }
+  }
   @media (pointer: coarse) {
     .path-start { width: 44px; height: 44px; right: 0.1rem; }
     .entity-row .item.entity { padding-right: 3.2rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar.graph-mode .panel { transition: none; }
   }
 </style>

@@ -20,6 +20,7 @@
     defaultBackbone,
     ensureBackboneEdge,
     filterSemanticGraph,
+    legacyFallbackGraph,
     nextExpandedIds,
     pathEmphasis,
     relationLabel,
@@ -59,6 +60,7 @@
   let loaded = $state(false);
   let semanticLoading = $state(false);
   let semanticError = $state("");
+  let semanticRequestFailed = $state(false);
   let predicateCatalog = $state<Map<string, string>>(new Map());
   let globalSemanticPresence = $state<GlobalSemanticPresence>("unknown");
   let detail = $state<SemanticEntityDetail | null>(null);
@@ -90,12 +92,10 @@
   });
 
   const usableSemantic = $derived.by((): SemanticGraphData => {
-    if (!shouldUseLegacyFallback(globalSemanticPresence, semantic)) return semantic;
-    return {
-      ...semantic,
-      nodes: semantic.nodes.length > 0 ? semantic.nodes : graph.nodes,
-      cooccurrence_edges: graph.edges,
-    };
+    if (!shouldUseLegacyFallback(globalSemanticPresence, semantic, semanticRequestFailed)) {
+      return semantic;
+    }
+    return legacyFallbackGraph(semantic, graph);
   });
   const filteredSemantic = $derived(filterSemanticGraph(usableSemantic, effectiveGraphFilter));
   const renderedNodes = $derived(filteredSemantic.nodes.filter((node) => visibleIds.has(node.id)));
@@ -107,6 +107,7 @@
   const pathFocus = $derived(pathEmphasis(activePath));
   const semanticFallback = $derived(
     loaded &&
+      !semanticRequestFailed &&
       globalSemanticPresence === "absent" &&
       filteredSemantic.semantic_edges.length === 0 &&
       filteredSemantic.cooccurrence_edges.length > 0,
@@ -114,6 +115,7 @@
   const filteredSemanticEmpty = $derived(
     loaded &&
       !semanticLoading &&
+      !semanticRequestFailed &&
       globalSemanticPresence === "present" &&
       semantic.semantic_edges.length === 0,
   );
@@ -156,7 +158,9 @@
   async function loadGraph() {
     try {
       graph = await graphData();
-      if (semantic.nodes.length === 0 && visibleIds.size === 0) visibleIds = initialIds(usableSemantic);
+      if ((semantic.nodes.length === 0 || semanticRequestFailed) && visibleIds.size === 0) {
+        visibleIds = initialIds(usableSemantic);
+      }
     } catch {
       graph = { nodes: [], edges: [] };
     } finally {
@@ -171,6 +175,7 @@
     try {
       const value = await semanticGraph(filter);
       if (generation !== graphGeneration) return;
+      semanticRequestFailed = false;
       semantic = value;
       if (value.semantic_edges.length > 0) globalSemanticPresence = "present";
       const nextPredicates = new Map(predicateCatalog);
@@ -178,7 +183,8 @@
         nextPredicates.set(edge.predicate_type, relationLabel(edge));
       }
       predicateCatalog = nextPredicates;
-      semanticError = value.degraded ? value.message ?? "语义索引当前处于降级状态。" : "";
+      if (value.degraded && value.message) console.warn("semantic graph degraded", value.message);
+      semanticError = value.degraded ? "语义关系服务暂时降级，当前显示可用结果。" : "";
       const filtered = filterSemanticGraph(value, filter);
       if (showingAll) visibleIds = new Set(filtered.nodes.map((node) => node.id));
       else visibleIds = initialIds(value);
@@ -186,8 +192,14 @@
       expansionDepth = new Map();
     } catch (cause) {
       if (generation !== graphGeneration) return;
-      semanticError = `语义关系读取失败：${cause instanceof Error ? cause.message : String(cause)}。已保留可用的共现图。`;
-      if (visibleIds.size === 0) visibleIds = initialIds(usableSemantic);
+      console.warn("semantic graph request failed", cause);
+      semanticRequestFailed = true;
+      semanticError = "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。";
+      const fallback = legacyFallbackGraph(semantic, graph);
+      visibleIds = showingAll
+        ? new Set(fallback.nodes.map((node) => node.id))
+        : initialIds(fallback);
+      if (activePath) visibleIds = new Set([...visibleIds, ...activePath.entity_ids]);
     } finally {
       if (generation === graphGeneration) {
         semanticLoading = false;
@@ -525,7 +537,12 @@
 
         <div class="canvas-shell" aria-label="知识图谱画布">
           {#if semanticError}
-            <div class="map-message degraded" role="status">{semanticError}</div>
+            <div class="map-message degraded" role="status">
+              <span>{semanticError}</span>
+              {#if semanticRequestFailed}
+                <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>重新读取</button>
+              {/if}
+            </div>
           {/if}
           {#if semanticFallback}
             <div class="map-message fallback">

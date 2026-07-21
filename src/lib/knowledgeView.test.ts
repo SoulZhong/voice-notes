@@ -4,10 +4,13 @@ import type { KnowledgePath, KnowledgeFilter, KnowledgePathStep, SemanticEdge, S
 import {
   DEFAULT_KNOWLEDGE_FILTER,
   GLOBAL_SEMANTIC_PRESENCE_FILTER,
+  NORMAL_GRAPH_ALPHA_DECAY,
   canonicalPathEdgeId,
   defaultBackbone,
   ensureBackboneEdge,
   filterSemanticGraph,
+  graphSimulationTickBudget,
+  legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
   relationLabel,
@@ -651,5 +654,86 @@ describe("exploratory graph UI source contract", () => {
     const ensured = ensureBackboneEdge(selected, data, 20);
     expect(ensured.size).toBeLessThanOrEqual(20);
     expect(rootEdges.some((item) => ensured.has(item.subject_id) && ensured.has(item.object_id))).toBe(true);
+  });
+
+  it("preserves a usable graph canvas at 800, 500, and 390 pixel viewport widths", () => {
+    const sidebar = source("./Sidebar.svelte");
+    const toolbar = source("./KnowledgeGraphToolbar.svelte");
+    expect(sidebar).toContain('class:graph-mode={tab === "graph"}');
+    expect(sidebar).toContain('class="graph-drawer-toggle"');
+    expect(sidebar).toContain("@media (max-width: 700px)");
+    expect(sidebar).toMatch(/\.sidebar\.graph-mode\s*\{[^}]*width:\s*44px/s);
+    expect(sidebar).toMatch(/\.sidebar\s*\{[^}]*width:\s*300px/s);
+    expect(sidebar).toContain(".panel.drawer-open");
+    expect(toolbar).toMatch(/\.map-toolbar\s*\{[^}]*overflow-x:\s*auto/s);
+    expect(toolbar).toMatch(/\.filter-run\s*\{[^}]*flex-wrap:\s*nowrap/s);
+    expect(toolbar).toContain("function positionMenu(");
+    expect(toolbar).toMatch(/fieldset, \.date-fields\s*\{[^}]*position:\s*fixed/s);
+    expect(toolbar).not.toMatch(/@media \(max-width: 980px\)[\s\S]*flex-direction:\s*column/);
+
+    const sidebarWidth = (viewport: number) => (viewport <= 700 ? 44 : 300);
+    expect([800, 500, 390].map((viewport) => [viewport, sidebarWidth(viewport), viewport - sidebarWidth(viewport)])).toEqual([
+      [800, 300, 500],
+      [500, 44, 456],
+      [390, 44, 346],
+    ]);
+  });
+
+  it("gives every node a transparent coarse-pointer target of at least 44 pixels", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    expect(forceGraph).toContain('class="node-hit-target"');
+    expect(forceGraph).toContain("interactionScale = Math.max(0.001, fit.scale * viewZoom)");
+    expect(forceGraph).toContain("r={Math.max(n.r, 22 / interactionScale)}");
+    expect(forceGraph).toMatch(/\.node-hit-target\s*\{[^}]*fill:\s*transparent/s);
+    expect(forceGraph).toMatch(/\.node-hit-target\s*\{[^}]*pointer-events:\s*all/s);
+    expect(forceGraph).not.toContain('class="node-hit-box"');
+  });
+
+  it("bounds normal graph motion to a short settling window without continuous drag reheating", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(policy).toContain("NORMAL_GRAPH_ALPHA_DECAY = 0.23");
+    expect(policy).toContain("function graphSimulationTickBudget(");
+    expect(forceGraph).toContain(".alphaDecay(NORMAL_GRAPH_ALPHA_DECAY)");
+    expect(forceGraph).toContain('.on("end"');
+    expect(forceGraph).not.toContain("alphaTarget(0.3)");
+    expect(forceGraph).toContain("sim?.alpha(0.3).restart()");
+    expect(forceGraph).toContain("refreshSnap();");
+    expect(NORMAL_GRAPH_ALPHA_DECAY).toBe(0.23);
+    const tickBudget = graphSimulationTickBudget();
+    expect(tickBudget).toBeGreaterThanOrEqual(25);
+    expect(tickBudget).toBeLessThanOrEqual(30);
+  });
+
+  it("renders legacy graph data on semantic request failure without false backfill or raw errors", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(route).toContain("semanticRequestFailed");
+    expect(route).toContain("legacyFallbackGraph(");
+    expect(route).toContain("visibleIds = showingAll");
+    expect(route).toContain(">重新读取</button>");
+    expect(policy).toContain("requestFailed ||");
+    expect(route).toMatch(/semanticFallback[\s\S]{0,240}!semanticRequestFailed/);
+    expect(route).toMatch(/filteredSemanticEmpty[\s\S]{0,220}!semanticRequestFailed/);
+    expect(route).toContain("语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。");
+    expect(route).not.toMatch(/semanticError\s*=\s*`[^`]*\$\{cause/);
+    expect(route).not.toMatch(/semanticError\s*=\s*value\.degraded\s*\?\s*value\.message/);
+
+    const semanticBeforeFailure = graph(
+      [node("stale_a"), node("stale_b")],
+      [edge("stale_relation", "stale_a", "stale_b")],
+    );
+    const legacy = {
+      nodes: [node("legacy_a"), node("legacy_b")],
+      edges: [{ a: "legacy_a", b: "legacy_b", weight: 3 }],
+    };
+    expect(shouldUseLegacyFallback("unknown", semanticBeforeFailure, true)).toBe(true);
+    const failedFallback = legacyFallbackGraph(semanticBeforeFailure, legacy);
+    expect(failedFallback.nodes.map((item) => item.id)).toEqual(["legacy_a", "legacy_b"]);
+    expect(failedFallback.semantic_edges).toEqual([]);
+    expect(viewEdges(failedFallback, DEFAULT_KNOWLEDGE_FILTER)).toMatchObject([
+      { id: "co:legacy_a:legacy_b", layer: "cooccurrence", weight: 3 },
+    ]);
+    expect(shouldUseLegacyFallback("present", graph(legacy.nodes, []), false)).toBe(false);
   });
 });

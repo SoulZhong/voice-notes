@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, forceX, forceY, type Simulation } from "d3-force";
   import { kindInk, kindLabel, type EntitySummary, type EdgeRow, type RenderEdge } from "$lib/graph";
-  import { stableEdgeLanes } from "$lib/knowledgeView";
+  import { NORMAL_GRAPH_ALPHA_DECAY, stableEdgeLanes } from "$lib/knowledgeView";
   import { speakerInk } from "$lib/notes";
 
   let {
@@ -493,13 +493,15 @@
       // "位置没好就停止了")。加迭代=每 tick 多推几轮,少 tick 也能分干净——用
       // "推得更狠"换"跑得更快",而不是靠拖时间。
       .force("collide", forceCollide<SimNode>((d) => d.collisionR ?? (d.r ?? MIN_R) + 6).iterations(4))
-      // heavy 图默认衰减(alphaDecay≈0.0228,~300 tick、5 秒+)配合弱化过的斥力,
-      // 动画拖得很长、过程飘来飘去看着乱(冒烟反馈"动的时间太长了很混乱")。
-      // 调快衰减(~40 tick、1 秒内)+ 加大阻尼(velocityDecay,抑制过冲/来回摆动),
-      // 让"展开一层"的生长动画短平快、不慌乱;碰撞迭代兜住布局质量不因快而糊。
-      .alphaDecay(heavy ? 0.26 : 0.0228)
+      // 普通与中型图都使用统一的短衰减预算：约 27 tick / 450ms 后 D3 自动 end，
+      // 避免默认 300 tick 持续约 5 秒。碰撞多迭代兜住短预算下的布局质量。
+      .alphaDecay(NORMAL_GRAPH_ALPHA_DECAY)
       .velocityDecay(heavy ? 0.45 : 0.4)
-      .on("tick", refreshSnap);
+      .on("tick", refreshSnap)
+      .on("end", () => {
+        sim?.stop();
+        refreshSnap();
+      });
     skipAnimation = dNodes.length > 450 || dLinks.length > 2500;
     if (skipAnimation) {
       sim.stop();
@@ -810,9 +812,9 @@
     moved = false;
     const n = dNodes.find((d) => d.id === id);
     if (n) {
-      // heavy 图不重热仿真(alphaTarget 持续重启=逐 tick 全量重渲染,卡死元凶之一),
-      // 只把这一个节点钉在指针位置、手动单帧刷新——其余节点保持冷却定格不陪着抖。
-      if (!heavy && !effectiveReducedMotion) sim?.alphaTarget(0.3).restart();
+      // 拖拽只触发一次有界重排，不设置非零 alphaTarget；即便长按也会在短预算后冻结。
+      // 真正巨图保持同步定格，不让上千 DOM 节点在拖拽时持续重排。
+      if (!skipAnimation && !effectiveReducedMotion) sim?.alpha(0.3).restart();
       n.fx = n.x;
       n.fy = n.y;
     }
@@ -825,7 +827,8 @@
     if (n) {
       n.fx = ((e.clientX - rect.left - viewX) / viewZoom - fit.tx) / fit.scale;
       n.fy = ((e.clientY - rect.top - viewY) / viewZoom - fit.ty) / fit.scale;
-      if (heavy || effectiveReducedMotion) refreshSnap();
+      // 仿真可能已在 450ms 后冻结；指针移动仍直接刷新被拖节点，交互不会失去跟手性。
+      refreshSnap();
     }
   }
   function onUp(id: string, isPerson: boolean) {
@@ -834,7 +837,6 @@
       n.fx = null;
       n.fy = null;
     }
-    if (!heavy && !effectiveReducedMotion) sim?.alphaTarget(0);
     // dragId 只在左键 onDown 时被置位(见上方注释);右键释放时 dragId 仍是上次左键交互
     // 遗留值(通常是 null),不等于当前 id,故不会误触发导航。
     if (dragId === id && !moved) onPick(id, isPerson);
@@ -938,6 +940,7 @@
         </g>
         <g class="nodes">
           {#each snap.nodes as n (n.id)}
+            {@const interactionScale = Math.max(0.001, fit.scale * viewZoom)}
             <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
             <g
               transform="translate({n.x},{n.y})"
@@ -963,6 +966,7 @@
                 onContextMenu(n.id, n.name, n.is_person, e.clientX, e.clientY);
               }}
             >
+              <circle class="node-hit-target" r={Math.max(n.r, 22 / interactionScale)} />
               <circle
                 class="node-halo"
                 r={n.r + 3}
@@ -1087,6 +1091,7 @@
     letter-spacing: 0.015em;
     pointer-events: none;
   }
+  .node-hit-target { fill: transparent; pointer-events: all; }
   .node-halo { opacity: 0.2; }
   .node-marker {
     stroke: var(--surface);
