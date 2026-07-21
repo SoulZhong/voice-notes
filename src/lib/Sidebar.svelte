@@ -1269,6 +1269,8 @@
   @media (pointer: coarse) {
     .sidebar.graph-mode .panel button,
     .sidebar.graph-mode .panel input { min-height: 44px; }
+    .sidebar.graph-mode .panel button,
+    .sidebar.graph-mode .panel .gchip { min-inline-size: 44px; }
     .path-start { width: 44px; height: 44px; right: 0.1rem; }
     .entity-row .item.entity { padding-right: 3.2rem; }
   }
