@@ -13,7 +13,6 @@ import {
   filterSemanticGraph,
   graphDragPosition,
   graphSimulationTickBudget,
-  hasPathEndpoints,
   legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
@@ -619,6 +618,21 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).not.toContain("line-clamp");
   });
 
+  it("explains relation lines with persistent high-contrast map symbols", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    for (const copy of [
+      "明确关系",
+      "箭头表示方向 · 点击线查看依据",
+      "共同出现",
+      "虚线只表示同篇笔记提到",
+    ]) {
+      expect(forceGraph).toContain(copy);
+    }
+    expect(forceGraph).toMatch(/\.semantic-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*2px/s);
+    expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke-width:\s*1\.25px[^}]*stroke-dasharray:\s*4 5/s);
+    expect(forceGraph).toContain('class="edge-key"');
+  });
+
   it("keeps complete centered wrapped node names on the vertex", () => {
     const forceGraph = source("./ForceGraph.svelte");
     expect(forceGraph).toContain('class="node-label"');
@@ -646,12 +660,9 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).toMatch(/return\s+0\.15/);
   });
 
-  it("offers complete filters, deterministic reveal controls, and honest fallback", () => {
-    const toolbar = source("./KnowledgeGraphToolbar.svelte");
+  it("keeps the everyday graph focused on search, entity types, and direct exploration", () => {
     const route = source("../routes/graph/+page.svelte");
-    for (const label of ["实体类型", "关系类型", "开始日期", "结束日期", "包含历史关系", "显示共现弱连接", "收起到主干", "显示全部"]) {
-      expect(toolbar).toContain(label);
-    }
+    const sidebar = source("./Sidebar.svelte");
     expect(route).toContain("semanticGraph(");
     expect(route).toContain("defaultBackbone(");
     expect(route).toContain("nextExpandedIds(");
@@ -660,35 +671,40 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("补建语义关系");
     expect(route).toContain('class="canvas-shell"');
     expect(route).toContain("<EntityGovernance");
-  });
-
-  it("guards two-point paths against stale responses and exposes accessible evidence steps", () => {
-    const route = source("../routes/graph/+page.svelte");
-    const panel = source("./KnowledgePathPanel.svelte");
-    expect(route).toContain("pathGeneration");
-    expect(route).toContain("generation !== pathGeneration");
-    expect(route).toContain("knowledgePath(");
-    expect(route).toContain("include_cooccurrence: includeWeak");
-    expect(route).toContain('class="accessible-network"');
-    for (const label of ["设为路径起点", "包含共现弱连接", "查看关系证据", "未找到可连接两点的路径"]) {
-      expect(route + panel).toContain(label);
+    expect(route).toContain("<RelationDrawer");
+    expect(route).toMatch(/<EntityGovernance[\s\S]{0,260}simple=\{true\}/);
+    expect(route).toMatch(/<RelationDrawer[\s\S]{0,180}simple=\{true\}/);
+    expect(sidebar).toContain("搜索人物、项目或术语");
+    expect(sidebar).toContain('class="gchips"');
+    for (const removed of ["待整理", "设为路径起点", 'class="gmode"']) {
+      expect(sidebar).not.toContain(removed);
     }
-    expect(panel).not.toContain("…");
-    expect(panel).not.toMatch(/\.\.\.(?=["'`<])/);
   });
 
-  it("clears stale path emphasis during backfill refresh and reruns only valid endpoints", () => {
+  it("removes specialist graph controls from the everyday canvas", () => {
     const route = source("../routes/graph/+page.svelte");
-    const refreshed = graph([node("kg_a"), node("kg_b")], [edge("rel_new", "kg_a", "kg_b")]);
+    for (const removed of [
+      "KnowledgeGraphToolbar",
+      "KnowledgePathPanel",
+      "PendingReviewPanel",
+      "noteGraphState",
+      "pathGeneration",
+      'class="accessible-network"',
+      "onContextMenu={openCtxMenu}",
+    ]) {
+      expect(route).not.toContain(removed);
+    }
+  });
 
-    expect(hasPathEndpoints(refreshed, "kg_a", "kg_b")).toBe(true);
-    expect(hasPathEndpoints(refreshed, "kg_a", "kg_removed")).toBe(false);
-    expect(route).toMatch(/async function refreshAfterBackfill\(\)[\s\S]{0,260}activePath = null/);
-    expect(route).toContain("runGuardedPathRefresh(");
-    expect(route).toContain("hasPathEndpoints(semantic, snapshot.start, snapshot.end)");
-    expect(route).toContain("snapshot.generation");
-    expect(route).toContain("expectedGeneration ?? ++pathGeneration");
-    expect(route).toContain("关系补建后路径端点已变化，原路径已清除。请重新选择两点。");
+  it("refreshes graph data after backfill without reviving removed path workflows", () => {
+    const route = source("../routes/graph/+page.svelte");
+    const refresh = route.slice(
+      route.indexOf("async function refreshAfterBackfill()"),
+      route.indexOf("function updateQuery("),
+    );
+    expect(refresh).toContain("await loadGraph()");
+    expect(refresh).toContain('loadSemantic(effectiveGraphFilter, "preserve-view")');
+    expect(refresh).not.toContain("path");
   });
 
   it("preserves graph exploration, positions, and camera only for data refreshes", () => {
@@ -755,7 +771,6 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("debugFixtureSession && relationId");
     expect(route).toContain("relationLoader={loadDebugRelationDetail}");
     expect(route).toContain("readOnly={true}");
-    expect(route).toContain("!debugFixtureRequested && reviewOpen");
     expect(route).toContain("!debugFixtureRequested && selected");
     expect(route).toContain("{#if !debugFixtureRequested}\n  <RelationBackfillDialog");
     expect(route).toContain("仅创建并读取临时夹具，不会读取或修改真实资料库");
@@ -771,8 +786,7 @@ describe("exploratory graph UI source contract", () => {
     expect(drawer).toContain("await relationLoader(id)");
   });
 
-  it("canonicalizes Rust-style cooccurrence path step IDs to rendered weak-edge IDs", () => {
-    const route = source("../routes/graph/+page.svelte");
+  it("canonicalizes Rust-style cooccurrence path step IDs for legacy API callers", () => {
     const policy = source("./knowledgeView.ts");
     const rustStyleStep = {
       id: "co_91d3e0e29ac24fb6",
@@ -790,7 +804,6 @@ describe("exploratory graph UI source contract", () => {
     expect(policy).toContain("function canonicalPathEdgeId(");
     expect(policy).toContain('step.origin !== "cooccurrence"');
     expect(policy).toContain('return `co:${a}:${b}`');
-    expect(route).toContain("pathEmphasis(activePath)");
   });
 
   it("admits and focuses an off-backbone search match even when it is isolated", () => {
@@ -915,18 +928,12 @@ describe("exploratory graph UI source contract", () => {
 
   it("preserves a usable graph canvas at 800, 500, and 390 pixel viewport widths", () => {
     const sidebar = source("./Sidebar.svelte");
-    const toolbar = source("./KnowledgeGraphToolbar.svelte");
     expect(sidebar).toContain('class:graph-mode={tab === "graph"}');
     expect(sidebar).toContain('class="graph-drawer-toggle"');
     expect(sidebar).toContain("@media (max-width: 700px)");
     expect(sidebar).toMatch(/\.sidebar\.graph-mode\s*\{[^}]*width:\s*44px/s);
     expect(sidebar).toMatch(/\.sidebar\s*\{[^}]*width:\s*300px/s);
     expect(sidebar).toContain(".panel.drawer-open");
-    expect(toolbar).toMatch(/\.map-toolbar\s*\{[^}]*overflow-x:\s*auto/s);
-    expect(toolbar).toMatch(/\.filter-run\s*\{[^}]*flex-wrap:\s*nowrap/s);
-    expect(toolbar).toContain("function positionMenu(");
-    expect(toolbar).toMatch(/fieldset, \.date-fields\s*\{[^}]*position:\s*fixed/s);
-    expect(toolbar).not.toMatch(/@media \(max-width: 980px\)[\s\S]*flex-direction:\s*column/);
 
     const sidebarWidth = (viewport: number) => (viewport <= 700 ? 44 : 300);
     expect([800, 500, 390].map((viewport) => [viewport, sidebarWidth(viewport), viewport - sidebarWidth(viewport)])).toEqual([
@@ -986,7 +993,7 @@ describe("exploratory graph UI source contract", () => {
     const policy = source("./knowledgeView.ts");
     expect(route).toContain("semanticRequestFailed");
     expect(route).toContain("legacyFallbackGraph(");
-    expect(route).toContain("visibleIds = showingAll");
+    expect(route).toContain("visibleIds = initialIds(fallback)");
     expect(route).toContain(">重新读取</button>");
     expect(policy).toContain("requestFailed ||");
     expect(route).toMatch(/semanticFallback[\s\S]{0,240}!semanticRequestFailed/);

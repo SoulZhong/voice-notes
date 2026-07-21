@@ -18,10 +18,15 @@
     detail,
     onChanged,
     onOpenRelation,
+    simple = false,
+    resolveEntityName,
   }: {
     detail: SemanticEntityDetail;
     onChanged: () => Promise<void>;
     onOpenRelation: (id: string) => void;
+    /** Everyday graph detail hides database-governance operations. */
+    simple?: boolean;
+    resolveEntityName?: (id: string) => string | undefined;
   } = $props();
 
   let renameValue = $state("");
@@ -100,6 +105,8 @@
     )) groups.set(mention.note_id, [...(groups.get(mention.note_id) ?? []), mention]);
     return [...groups.entries()].map(([noteId, items]) => ({ noteId, items }));
   });
+  const displayEntityName = (id: string) =>
+    id === detail.id ? detail.name : resolveEntityName?.(id) ?? "相关实体";
 
   async function runOperation(
     pendingText: string,
@@ -154,7 +161,7 @@
 <article class="governance" aria-labelledby="entity-governance-title">
   <header class="entity-heading">
     <div>
-      <p class="eyebrow">实体治理</p>
+      <p class="eyebrow">{simple ? "实体详情" : "实体治理"}</p>
       <h2 id="entity-governance-title">{detail.name}</h2>
     </div>
     <span class="kind" style:background={kindSoft(detail.kind)} style:color={kindInk(detail.kind)}>{kindLabel(detail.kind)}</span>
@@ -173,6 +180,7 @@
       <div><dt>关系</dt><dd>{detail.relations.length} 条</dd></div>
     </dl>
 
+    {#if !simple}
     <form class="inline-form" onsubmit={(event) => {
       event.preventDefault();
       const nextName = renameValue.trim();
@@ -218,8 +226,10 @@
         <button type="submit" disabled={working || detail.degraded || !aliasValue.trim()}>添加别名</button>
       </form>
     </div>
+    {/if}
   </section>
 
+  {#if !simple}
   <section class="section actions" aria-labelledby="entity-actions">
     <h3 id="entity-actions">身份与关系操作</h3>
     <details>
@@ -288,6 +298,7 @@
       </form>
     </details>
   </section>
+  {/if}
 
   <section class="section" aria-labelledby="entity-relations">
     <h3 id="entity-relations">关系</h3>
@@ -296,25 +307,27 @@
       {#each currentRelations as relation (relation.id)}
         <li>
           <button type="button" onclick={() => onOpenRelation(relation.id)}>
-            <span>{relation.subject_id === detail.id ? `${detail.name} → ${relationLabel(relation)} → ${relation.object_id}` : `${relation.subject_id} → ${relationLabel(relation)} → ${detail.name}`}</span>
+            <span>{`${displayEntityName(relation.subject_id)} → ${relationLabel(relation)} → ${displayEntityName(relation.object_id)}`}</span>
             <small>{Math.round(relation.confidence * 100)}% 置信度 · {relation.evidence_count} 条证据</small>
           </button>
         </li>
       {/each}
       {#if currentRelations.length === 0}<li class="empty-line">没有当前关系</li>{/if}
     </ul>
-    <h4>历史关系 <span>{historicalRelations.length}</span></h4>
-    <ul class="relation-list">
-      {#each historicalRelations as relation (relation.id)}
-        <li>
-          <button type="button" onclick={() => onOpenRelation(relation.id)}>
-            <span>{relation.subject_id === detail.id ? `${detail.name} → ${relationLabel(relation)} → ${relation.object_id}` : `${relation.subject_id} → ${relationLabel(relation)} → ${detail.name}`}</span>
-            <small>{relation.valid_to ? `有效至 ${relation.valid_to}` : "历史版本"}</small>
-          </button>
-        </li>
-      {/each}
-      {#if historicalRelations.length === 0}<li class="empty-line">没有历史关系</li>{/if}
-    </ul>
+    {#if !simple}
+      <h4>历史关系 <span>{historicalRelations.length}</span></h4>
+      <ul class="relation-list">
+        {#each historicalRelations as relation (relation.id)}
+          <li>
+            <button type="button" onclick={() => onOpenRelation(relation.id)}>
+              <span>{relation.subject_id === detail.id ? `${detail.name} → ${relationLabel(relation)} → ${relation.object_id}` : `${relation.subject_id} → ${relationLabel(relation)} → ${detail.name}`}</span>
+              <small>{relation.valid_to ? `有效至 ${relation.valid_to}` : "历史版本"}</small>
+            </button>
+          </li>
+        {/each}
+        {#if historicalRelations.length === 0}<li class="empty-line">没有历史关系</li>{/if}
+      </ul>
+    {/if}
   </section>
 
   <section class="section evidence" aria-labelledby="entity-evidence">
@@ -337,14 +350,14 @@
     {/if}
   </section>
 
-  <div class="feedback-actions">
+  {#if !simple}<div class="feedback-actions">
     <p id="entity-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
     {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
     {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLastOperation}>撤销上次实体操作</button>{/if}
-  </div>
+  </div>{/if}
 </article>
 
-{#if splitOpen}
+{#if splitOpen && !simple}
   <EntitySplitDialog entity={detail} {mentions} onClose={() => (splitOpen = false)} onCommitted={onChanged} />
 {/if}
 

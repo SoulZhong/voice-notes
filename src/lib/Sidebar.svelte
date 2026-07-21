@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { ask } from "@tauri-apps/plugin-dialog";
@@ -19,10 +18,6 @@
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
-  import { noteGraphState } from "$lib/noteGraph.svelte";
-  import { pendingReview } from "$lib/knowledge";
-  import { DEFAULT_KNOWLEDGE_FILTER } from "$lib/knowledgeView";
-  import { KNOWLEDGE_CHANGED_EVENT } from "$lib/knowledgeGovernance";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -91,11 +86,9 @@
     }
   });
 
-  // ── 图谱:实体/文章两视角,列表作为主从结构的 master(搜索 + 过滤在侧栏,主区放画布)──
+  // ── 图谱:只保留实体搜索与类型筛选；复杂治理和路径工具不占用日常界面。──
   let graphEnts = $state<EntitySummary[]>([]);
-  let pendingCount = $state(0);
   let graphDrawerOpen = $state(false);
-  const graphNotes = $derived(noteGraphState.data.nodes); // 文章视角:节点=笔记(name=标题)
 
   $effect(() => {
     if (tab !== "graph") graphDrawerOpen = false;
@@ -108,29 +101,9 @@
       graphEnts = [];
     }
   }
-  async function refreshPendingCount() {
-    try {
-      pendingCount = (await pendingReview(DEFAULT_KNOWLEDGE_FILTER)).length;
-    } catch {
-      pendingCount = 0;
-    }
-  }
   $effect(() => {
     if (tab !== "graph") return;
-    void refreshPendingCount();
-    if (graphFilter.mode === "note") {
-      // error 不自动重试:否则 load() 写 status 会反向触发这个 effect，持续失败时形成
-      // invoke 循环。主画布错误态的“重新加载”是唯一重试入口。
-      if (noteGraphState.status === "idle") void noteGraphState.load();
-    } else {
-      void refreshGraphEntities();
-    }
-  });
-
-  onMount(() => {
-    const refreshPending = () => { if (tab === "graph") void refreshPendingCount(); };
-    window.addEventListener(KNOWLEDGE_CHANGED_EVENT, refreshPending);
-    return () => window.removeEventListener(KNOWLEDGE_CHANGED_EVENT, refreshPending);
+    void refreshGraphEntities();
   });
 
   const graphKinds = $derived.by(() => {
@@ -146,32 +119,10 @@
       return e.name.toLowerCase().includes(q) || e.aliases.some((a) => a.toLowerCase().includes(q));
     }),
   );
-  const graphNotesShown = $derived(
-    graphNotes.filter((n) => {
-      const q = graphFilter.query.trim().toLowerCase();
-      return !q || n.name.toLowerCase().includes(q);
-    }),
-  );
   const graphSelected = $derived($page.url.searchParams.get("e"));
   // 图谱实体统一留在关系地图的附着式检查器，不因人物类型把探索上下文切走。
   function entityHref(e: EntitySummary): string {
     return "/graph?e=" + encodeURIComponent(e.id);
-  }
-  function startPathFromSidebar(event: MouseEvent, entityId: string) {
-    event.preventDefault();
-    event.stopPropagation();
-    const url = new URL($page.url);
-    url.pathname = "/graph";
-    url.searchParams.set("pathStart", entityId);
-    url.searchParams.delete("review");
-    url.searchParams.delete("r");
-    goto(url.pathname + url.search);
-  }
-  function openPendingReview() {
-    const url = new URL($page.url);
-    url.searchParams.set("review", "1");
-    url.searchParams.delete("r");
-    goto(url.pathname + url.search);
   }
 
   // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
@@ -487,115 +438,41 @@
       {/if}
     </ul>
   {:else if tab === "graph"}
-    <!-- 固定行:全局图谱(清空选中,回到力导图总览;紧跟录制按钮,不随实体列表滚动
-         消失——详情态下从任何深度都能一键退回)。轻量文字链接而非常驻实底卡片——
-         `!graphSelected` 是常态(大多数时候没选中任何实体),用 .item.current 那种
-         实底高亮会让这行几乎永远是侧栏里最重的一块,比白色录制药丸还抢眼(冒烟反馈
-         "不够美观"),故只保留 hover 反馈,不常驻着色。 -->
-    <button class="graph-global" onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>
-      <svg class="graph-global-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <circle cx="8" cy="3.6" r="1.6" />
-        <circle cx="3.4" cy="12" r="1.6" />
-        <circle cx="12.6" cy="12" r="1.6" />
-        <path d="M8 5.2L4.4 10.6M8 5.2l3.6 5.4M5 12h6" />
-      </svg>
-      全局图谱
-    </button>
-    <button
-      class="pending-entry"
-      class:current={$page.url.searchParams.get("review") === "1"}
-      aria-label={`打开待整理面板，共 ${pendingCount} 项`}
-      onclick={openPendingReview}
-    >
-      <span>待整理</span>
-      <span class="pending-count">{pendingCount}</span>
-    </button>
-    <!-- 视角切换:实体视角(节点=实体、边=共现)/ 文章视角(节点=笔记、边=共享实体)。
-         两视角是同一份图谱的对偶,segmented 分段控件切换,主区画布与侧栏列表同步。 -->
-    <div class="gmode">
-      <button
-        class="gmode-seg"
-        class:on={graphFilter.mode === "entity"}
-        onclick={() => { graphFilter.mode = "entity"; if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
-      >实体</button>
-      <button
-        class="gmode-seg"
-        class:on={graphFilter.mode === "note"}
-        onclick={() => { graphFilter.mode = "note"; if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}
-      >文章</button>
-    </div>
     <input
       class="search"
       type="search"
       name="graph-search"
-      aria-label={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
-      placeholder={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索实体"}
+      aria-label="搜索人物、项目或术语"
+      placeholder="搜索人物、项目或术语"
       bind:value={graphFilter.query}
     />
-    {#if graphFilter.mode === "entity" && graphFilter.query.trim()}
+    {#if graphFilter.query.trim()}
       <p class="search-behavior">搜索只聚焦匹配实体，画布中的其他关系仍会保留。</p>
     {/if}
-    {#if graphFilter.mode === "entity"}
-      <div class="gchips">
-        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
-        {#each graphKinds as k (k)}
-          <!-- 圆点=该 kind 在力导图上的节点色(kindInk,与 ForceGraph.svelte 同一份取色
-               逻辑),让过滤药丸跟图上的圆圈对得上号,不再是一片同色灰药丸 -->
-          <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
-            <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
-          </button>
-        {/each}
-      </div>
-      {#if graphShown.length === 0}
-        <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
-      {/if}
-      <ul class="list">
-        {#each graphShown as e (e.id)}
-          <li class="entity-row">
-            <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
-              <!-- 非人实体色点现在跟图上同 kind 的圆圈同色(此前是一律扁平灰,看不出类别) -->
-              <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
-              <div class="main-line">
-                <span class="title">{e.name}</span>
-                <span class="meta">{kindLabel(e.kind)} · {e.note_count} 笔 · {e.mention_total} 提及</span>
-              </div>
-            </a>
-            <button
-              type="button"
-              class="path-start"
-              aria-label={`将 ${e.name} 设为路径起点`}
-              title="设为路径起点"
-              onclick={(event) => startPathFromSidebar(event, e.id)}
-            >起</button>
-          </li>
-        {/each}
-      </ul>
-    {:else}
-      <!-- 文章视角:节点=笔记,列表=笔记(标题 + 含实体数),点击直接进笔记详情页
-           (笔记本身已有相关笔记/实体高亮,无需再在图上开面板)。 -->
-      {#if graphNotesShown.length === 0}
-        <p class="hint">
-          {noteGraphState.status === "error"
-            ? "文章图谱加载失败"
-            : graphNotes.length === 0
-              ? "还没有进入图谱的笔记"
-              : "没有匹配的笔记"}
-        </p>
-      {/if}
-      <ul class="list">
-        {#each graphNotesShown as n (n.id)}
-          <li>
-            <a class="item entity" href={"/notes/" + encodeURIComponent(n.id)}>
-              <span class="dot" style="background: {kindInk('note')}"></span>
-              <div class="main-line">
-                <span class="title">{n.name}</span>
-                <span class="meta">{n.note_count} 个实体 · {n.mention_total} 提及</span>
-              </div>
-            </a>
-          </li>
-        {/each}
-      </ul>
+    <div class="gchips">
+      <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
+      {#each graphKinds as k (k)}
+        <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
+          <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
+        </button>
+      {/each}
+    </div>
+    {#if graphShown.length === 0}
+      <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
     {/if}
+    <ul class="list">
+      {#each graphShown as e (e.id)}
+        <li class="entity-row">
+          <a class="item entity" class:current={graphSelected === e.id} href={entityHref(e)}>
+            <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
+            <div class="main-line">
+              <span class="title">{e.name}</span>
+              <span class="meta">{kindLabel(e.kind)} · {e.note_count} 篇笔记</span>
+            </div>
+          </a>
+        </li>
+      {/each}
+    </ul>
   {:else}
   <input class="search" type="search" placeholder="按标题过滤" bind:value={query} />
 
@@ -820,27 +697,6 @@
     text-decoration: none;
   }
   .entity-row { position: relative; list-style: none; }
-  .entity-row .item.entity { padding-right: 2.8rem; }
-  .path-start {
-    position: absolute;
-    top: 50%;
-    right: 0.45rem;
-    display: grid;
-    place-items: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    transform: translateY(-50%);
-    border: 1px solid transparent;
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--ink-faint);
-    font: inherit;
-    font-size: 0.7rem;
-    cursor: pointer;
-  }
-  .path-start:hover { border-color: var(--hairline); background: var(--surface-soft); color: var(--accent); }
-  .path-start:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   /* 概览与整理固定行:与人物行同形态,图标代色点;徽标=待办数(warning 色药丸) */
   /* 新建钩子:本页的主操作入口——实心 accent 按钮,与上方录制药丸拉开间距、
      并以蓝色区分红点录制;虚线/幽灵态表达太弱,看不出这是入口。 */
@@ -884,75 +740,6 @@
   .item.overview.current .overview-icon,
   .item.overview:hover .overview-icon {
     color: var(--ink-secondary);
-  }
-  /* 全局图谱固定行:描边"幽灵按钮"(hairline 边框 + 透明底),既不像 .item.current
-     那样常驻实底抢戏,又靠边框把"这是可点的东西"的信号亮出来——纯文字链接(上一版)
-     太朴素,用户反馈看不出能点。 */
-  .graph-global {
-    display: flex;
-    align-items: center;
-    gap: 0.5em;
-    width: 100%;
-    box-sizing: border-box;
-    margin: 0.7rem 0 0.15rem;
-    padding: 0.45rem 0.6rem;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-md);
-    background: transparent;
-    font: inherit;
-    font-size: 0.86em;
-    font-weight: 500;
-    text-align: left;
-    cursor: pointer;
-    color: var(--ink-secondary);
-  }
-  .graph-global:hover {
-    background: var(--surface-soft);
-    color: var(--ink);
-    border-color: var(--hairline-strong);
-  }
-  .graph-global-icon {
-    flex: none;
-    color: var(--ink-faint);
-  }
-  .graph-global:hover .graph-global-icon {
-    color: var(--ink-secondary);
-  }
-  .pending-entry {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.5rem;
-    width: 100%;
-    box-sizing: border-box;
-    margin: 0.25rem 0 0.15rem;
-    padding: 0.45rem 0.6rem;
-    border: 0;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 0.84em;
-    text-align: left;
-    cursor: pointer;
-  }
-  .pending-entry:hover,
-  .pending-entry.current { background: var(--surface-soft); color: var(--ink); }
-  .pending-entry:focus-visible,
-  .graph-global:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .pending-count {
-    min-width: 1.35em;
-    padding: 0.05em 0.42em;
-    border: 1px solid var(--warning-line);
-    border-radius: var(--radius-full);
-    background: var(--warning-tint);
-    color: var(--warning-ink);
-    font-size: 0.72rem;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
   }
   .tidy-badge {
     margin-left: auto;
@@ -1016,33 +803,6 @@
   }
   .search-behavior { margin: -0.45rem 0 0.6rem; color: var(--ink-faint); font-size: 0.7rem; line-height: 1.45; }
   /* 图谱 kind 过滤药丸(侧栏窄,紧凑换行) */
-  /* 视角切换分段控件:实体 / 文章 二选一。整块 surface-press 底 + 选中项白/accent
-     实底,跟设置页的 segmented 同一套视觉语言(此处窄栏本地实现,不引全局类)。 */
-  .gmode {
-    display: flex;
-    gap: 2px;
-    margin: 0.6rem 0 0.5rem;
-    padding: 2px;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-  }
-  .gmode-seg {
-    flex: 1;
-    padding: 4px 0;
-    border: 0;
-    border-radius: calc(var(--radius-md) - 2px);
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 0.8em;
-    font-weight: 500;
-    cursor: pointer;
-  }
-  .gmode-seg.on {
-    background: var(--surface);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
   .gchips {
     display: flex;
     flex-wrap: wrap;
@@ -1271,8 +1031,6 @@
     .sidebar.graph-mode .panel input { min-height: 44px; }
     .sidebar.graph-mode .panel button,
     .sidebar.graph-mode .panel .gchip { min-inline-size: 44px; }
-    .path-start { width: 44px; height: 44px; right: 0.1rem; }
-    .entity-row .item.entity { padding-right: 3.2rem; }
   }
   @media (prefers-reduced-motion: reduce) {
     .sidebar.graph-mode .panel { transition: none; }
