@@ -35,6 +35,14 @@ export function graphSimulationTickBudget(
   return Math.ceil(Math.log(alphaMin) / Math.log(1 - alphaDecay));
 }
 
+export function graphDragPosition(
+  x: number,
+  y: number,
+  direct: boolean,
+): { x?: number; y?: number; fx: number; fy: number } {
+  return direct ? { x, y, fx: x, fy: y } : { fx: x, fy: y };
+}
+
 const CORE_PREDICATE_LABELS: Readonly<Record<string, string>> = {
   participates_in: "参与",
   responsible_for: "负责",
@@ -467,6 +475,12 @@ export function legacyFallbackGraph(
     semantic_edges: [],
     cooccurrence_edges: legacy.edges,
   };
+}
+
+export function semanticRequestFailureMessage(hasLegacyFallback: boolean): string {
+  return hasLegacyFallback
+    ? "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。"
+    : "语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。";
 }
 
 export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): RenderEdge[] {

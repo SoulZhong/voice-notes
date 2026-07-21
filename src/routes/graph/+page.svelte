@@ -25,6 +25,7 @@
     pathEmphasis,
     relationLabel,
     searchAdmissionIds,
+    semanticRequestFailureMessage,
     shouldUseLegacyFallback,
     viewEdges,
     type GlobalSemanticPresence,
@@ -119,6 +120,14 @@
       globalSemanticPresence === "present" &&
       semantic.semantic_edges.length === 0,
   );
+  const semanticFailureHasLegacy = $derived(
+    viewEdges(legacyFallbackGraph(semantic, graph), effectiveGraphFilter).length > 0,
+  );
+  const semanticStatusMessage = $derived(
+    semanticRequestFailed
+      ? semanticRequestFailureMessage(semanticFailureHasLegacy)
+      : semanticError,
+  );
   const entityNames = $derived(
     new Map([...graph.nodes, ...semantic.nodes].map((node) => [node.id, node.name])),
   );
@@ -194,7 +203,6 @@
       if (generation !== graphGeneration) return;
       console.warn("semantic graph request failed", cause);
       semanticRequestFailed = true;
-      semanticError = "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。";
       const fallback = legacyFallbackGraph(semantic, graph);
       visibleIds = showingAll
         ? new Set(fallback.nodes.map((node) => node.id))
@@ -536,9 +544,9 @@
         />
 
         <div class="canvas-shell" aria-label="知识图谱画布">
-          {#if semanticError}
+          {#if semanticStatusMessage}
             <div class="map-message degraded" role="status">
-              <span>{semanticError}</span>
+              <span>{semanticStatusMessage}</span>
               {#if semanticRequestFailed}
                 <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>重新读取</button>
               {/if}

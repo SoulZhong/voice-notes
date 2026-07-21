@@ -9,12 +9,14 @@ import {
   defaultBackbone,
   ensureBackboneEdge,
   filterSemanticGraph,
+  graphDragPosition,
   graphSimulationTickBudget,
   legacyFallbackGraph,
   nextExpandedIds,
   pathEmphasis,
   relationLabel,
   searchAdmissionIds,
+  semanticRequestFailureMessage,
   shouldUseLegacyFallback,
   stableEdgeLanes,
   viewEdges,
@@ -689,6 +691,25 @@ describe("exploratory graph UI source contract", () => {
     expect(forceGraph).not.toContain('class="node-hit-box"');
   });
 
+  it("moves reduced-motion and giant-graph drags directly while suppressing clicks only after travel", () => {
+    const forceGraph = source("./ForceGraph.svelte");
+    const policy = source("./knowledgeView.ts");
+    expect(policy).toContain("function graphDragPosition(");
+    expect(forceGraph).toContain("effectiveReducedMotion || skipAnimation");
+    expect(forceGraph).toContain("graphDragPosition(");
+    expect(forceGraph).toContain("Object.assign(n, position)");
+    expect(forceGraph).toContain("DRAG_MOVE_THRESHOLD");
+    expect(forceGraph).toMatch(/Math\.hypot\([\s\S]{0,180}< DRAG_MOVE_THRESHOLD\s*\)\s*return/);
+    expect(forceGraph).toMatch(/< DRAG_MOVE_THRESHOLD\s*\)\s*return;[\s\S]{0,100}moved = true/);
+    expect(graphDragPosition(120, 240, true)).toEqual({
+      x: 120,
+      y: 240,
+      fx: 120,
+      fy: 240,
+    });
+    expect(graphDragPosition(120, 240, false)).toEqual({ fx: 120, fy: 240 });
+  });
+
   it("bounds normal graph motion to a short settling window without continuous drag reheating", () => {
     const forceGraph = source("./ForceGraph.svelte");
     const policy = source("./knowledgeView.ts");
@@ -715,7 +736,16 @@ describe("exploratory graph UI source contract", () => {
     expect(policy).toContain("requestFailed ||");
     expect(route).toMatch(/semanticFallback[\s\S]{0,240}!semanticRequestFailed/);
     expect(route).toMatch(/filteredSemanticEmpty[\s\S]{0,220}!semanticRequestFailed/);
-    expect(route).toContain("语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。");
+    expect(policy).toContain("function semanticRequestFailureMessage(");
+    expect(route).toContain("semanticRequestFailureMessage(");
+    expect(policy).toContain("语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。");
+    expect(policy).toContain("语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。");
+    expect(semanticRequestFailureMessage(true)).toBe(
+      "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。",
+    );
+    expect(semanticRequestFailureMessage(false)).toBe(
+      "语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。",
+    );
     expect(route).not.toMatch(/semanticError\s*=\s*`[^`]*\$\{cause/);
     expect(route).not.toMatch(/semanticError\s*=\s*value\.degraded\s*\?\s*value\.message/);
 
@@ -735,5 +765,15 @@ describe("exploratory graph UI source contract", () => {
       { id: "co:legacy_a:legacy_b", layer: "cooccurrence", weight: 3 },
     ]);
     expect(shouldUseLegacyFallback("present", graph(legacy.nodes, []), false)).toBe(false);
+  });
+
+  it("uses full coarse targets and restrained drawer motion without changing fine-pointer density", () => {
+    const sidebar = source("./Sidebar.svelte");
+    expect(sidebar).toMatch(/\.graph-drawer-toggle\s*\{[^}]*width:\s*44px[^}]*height:\s*44px/s);
+    expect(sidebar).toContain("transform 240ms cubic-bezier(0.16, 1, 0.3, 1)");
+    expect(sidebar).not.toContain("transform 180ms ease");
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel button[\s\S]*min-height:\s*44px/);
+    expect(sidebar).toMatch(/@media \(pointer: coarse\)[\s\S]*\.sidebar\.graph-mode \.panel input[\s\S]*min-height:\s*44px/);
+    expect(sidebar).not.toMatch(/\.graph-global\s*\{[^}]*min-height:\s*44px/s);
   });
 });

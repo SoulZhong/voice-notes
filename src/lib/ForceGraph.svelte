@@ -2,7 +2,11 @@
   import { onMount, onDestroy } from "svelte";
   import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, forceX, forceY, type Simulation } from "d3-force";
   import { kindInk, kindLabel, type EntitySummary, type EdgeRow, type RenderEdge } from "$lib/graph";
-  import { NORMAL_GRAPH_ALPHA_DECAY, stableEdgeLanes } from "$lib/knowledgeView";
+  import {
+    NORMAL_GRAPH_ALPHA_DECAY,
+    graphDragPosition,
+    stableEdgeLanes,
+  } from "$lib/knowledgeView";
   import { speakerInk } from "$lib/notes";
 
   let {
@@ -138,6 +142,7 @@
   const ALL_LABELS_LIMIT = 30;
   const DEFAULT_LARGE_LABELS = 32;
   const EDGE_LANE_GAP = 26;
+  const DRAG_MOVE_THRESHOLD = 3;
 
   // 人实体=个人身份色(与会议搭子同一套,跨页一致认人);非人=kind 分类色
   // (`kindInk` 来自 $lib/graph,是全应用唯一真值源——侧栏 kind 过滤药丸/实体列表
@@ -802,6 +807,7 @@
   // 两层都撤完才是仿真坐标系,否则镜头缩放/平移过后鼠标跟节点视觉位置对不上。
   let dragId: string | null = null;
   let moved = false;
+  let dragStart = { x: 0, y: 0 };
   function onDown(id: string, e: PointerEvent) {
     // 只有主键(左键)才算拖拽/点击起点——右键的 pointerdown+pointerup 也会触发这对回调,
     // 不拦下的话右键点节点会在打开右键菜单的同时把页面导航走(onUp 误判为点击)。
@@ -810,6 +816,7 @@
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     dragId = id;
     moved = false;
+    dragStart = { x: e.clientX, y: e.clientY };
     const n = dNodes.find((d) => d.id === id);
     if (n) {
       // 拖拽只触发一次有界重排，不设置非零 alphaTarget；即便长按也会在短预算后冻结。
@@ -821,12 +828,22 @@
   }
   function onMove(e: PointerEvent) {
     if (!dragId || !container) return;
+    if (
+      !moved &&
+      Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) < DRAG_MOVE_THRESHOLD
+    ) return;
     moved = true;
     const rect = container.getBoundingClientRect();
     const n = dNodes.find((d) => d.id === dragId);
     if (n) {
-      n.fx = ((e.clientX - rect.left - viewX) / viewZoom - fit.tx) / fit.scale;
-      n.fy = ((e.clientY - rect.top - viewY) / viewZoom - fit.ty) / fit.scale;
+      const pointerX = ((e.clientX - rect.left - viewX) / viewZoom - fit.tx) / fit.scale;
+      const pointerY = ((e.clientY - rect.top - viewY) / viewZoom - fit.ty) / fit.scale;
+      const position = graphDragPosition(
+        pointerX,
+        pointerY,
+        effectiveReducedMotion || skipAnimation,
+      );
+      Object.assign(n, position);
       // 仿真可能已在 450ms 后冻结；指针移动仍直接刷新被拖节点，交互不会失去跟手性。
       refreshSnap();
     }
