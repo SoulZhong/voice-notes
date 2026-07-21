@@ -1659,11 +1659,13 @@ fn rename_refined_speaker(
     }
     // 同步会议搭子:人已被删除/合并成悬空引用时静默跳过——本地改名已生效,不回滚。
     if let Some(pid) = person_id {
-        let vp_store = open_voiceprint_store(&app)?;
+        let graph_root = data_root(&app).map_err(|e| e.to_string())?;
+        let vp_store = store::VoiceprintStore::new(graph_root.clone());
         let vp = vp_store.load();
         if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
-            if let Err(e) = vp_store.rename(&resolved, name) {
-                eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}");
+            match vp_store.rename(&resolved, name) {
+                Ok(()) => queue_person_graph_rebuild(&app, graph_root, "人物改名")?,
+                Err(e) => eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}"),
             }
         }
     }
@@ -1796,6 +1798,44 @@ fn queue_knowledge_rebuild(
             let _ = graph_events.emit("graph_index_status", status);
         });
     mark_knowledge_rebuild_queued(result, scheduled)
+}
+
+fn mark_person_graph_rebuild_queued(
+    action: &str,
+    scheduled: anyhow::Result<()>,
+) -> Result<(), String> {
+    if let Err(error) = scheduled {
+        eprintln!("{action} committed but graph rebuild scheduling failed: {error:#}");
+        return Err(format!(
+            "{action}已保存，但索引待重试；应用将在下次启动或整理时自动重试"
+        ));
+    }
+    Ok(())
+}
+
+fn queue_person_graph_rebuild_with(
+    scheduler: &graph::index::RebuildScheduler,
+    root: PathBuf,
+    action: &str,
+    emit: impl Fn(graph::index::IndexStatus) + Send + Sync + 'static,
+) -> Result<(), String> {
+    mark_person_graph_rebuild_queued(action, scheduler.request(root, emit))
+}
+
+fn queue_person_graph_rebuild(
+    app: &AppHandle,
+    root: PathBuf,
+    action: &str,
+) -> Result<(), String> {
+    let graph_events = app.clone();
+    queue_person_graph_rebuild_with(
+        &app.state::<AppState>().graph_scheduler,
+        root,
+        action,
+        move |status| {
+            let _ = graph_events.emit("graph_index_status", status);
+        },
+    )
 }
 
 #[tauri::command]
@@ -2075,7 +2115,11 @@ fn note_entity_links(app: AppHandle, id: String) -> Result<Vec<ipc::EntityLink>,
 #[tauri::command]
 fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
+    let is_person = !id.starts_with("e:");
     let outcome = graph::rename_entity(&root, &id, &new_name).map_err(|e| e.to_string())?;
+    if is_person {
+        queue_person_graph_rebuild(&app, root, "人物改名")?;
+    }
     Ok(ipc::RenameEntityResult { new_id: outcome.new_id, merged: outcome.merged })
 }
 
@@ -2408,7 +2452,11 @@ fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String>
         // 被"改成"的普通名字;改回未命名无意义——清名走删除/合并，不走 rename。
         return Err("名字不能为空".into());
     }
-    open_voiceprint_store(&app)?.rename(&id, name).map_err(|e| e.to_string())
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::VoiceprintStore::new(root.clone())
+        .rename(&id, name)
+        .map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "人物改名")
 }
 
 /// 从 person 出现过的最近一条笔记的音频里截取其发言(≤ 试听样本上限)。
@@ -2488,7 +2536,8 @@ fn merge_person(
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能合并说话人".into());
     }
-    let store = open_voiceprint_store(&app)?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let store = store::VoiceprintStore::new(root.clone());
     // 合并前记住 loser 是否有样本:有则 merge 内部迁移;没有则合并后从笔记音频
     // 现场截一份补给 winner(被并入的声音必须能在试听列表里听到)。
     let loser_had_samples = !store.sample_paths_existing(&loser).is_empty();
@@ -2524,7 +2573,7 @@ fn merge_person(
             Err(e) => eprintln!("合并兜底样本跳过(notes_dir 不可用): {e}"),
         }
     }
-    Ok(())
+    queue_person_graph_rebuild(&app, root, "人物合并")
 }
 
 /// 录制中拒绝：理由同 merge_person。
@@ -2533,7 +2582,11 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能删除说话人".into());
     }
-    open_voiceprint_store(&app)?.delete(&id).map_err(|e| e.to_string())
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::VoiceprintStore::new(root.clone())
+        .delete(&id)
+        .map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "人物删除")
 }
 
 // —— MCP 注册(设置页/欢迎页消费;registry 真值源是各 Agent 配置文件) ——
@@ -3833,6 +3886,202 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("操作已保存"));
         assert!(error.contains("自动重试"));
+    }
+
+    #[test]
+    fn failed_person_rebuild_request_keeps_retry_marker_and_reports_saved_merge() {
+        let root = tempfile::tempdir().unwrap();
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(crate::graph::index::BuildStats::default()),
+            |_job| Err(std::io::Error::other("injected spawn failure")),
+        );
+
+        let error = super::queue_person_graph_rebuild_with(
+            &scheduler,
+            root.path().to_path_buf(),
+            "人物合并",
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(root.path().join(".graph-index-dirty").exists());
+        assert!(error.contains("人物合并已保存"));
+        assert!(error.contains("索引待重试"));
+        assert!(error.contains("自动重试"));
+    }
+
+    #[test]
+    fn merged_person_rebuild_runs_after_voiceprint_lock_and_updates_all_read_surfaces() {
+        use crate::graph::canonical::{
+            CanonicalEntity, CanonicalGraph, CanonicalRelation, RelationOrigin, RelationStatus,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let ledger = crate::graph::overrides::KnowledgeLedger {
+            schema_version: 1,
+            registry: BTreeMap::from([
+                (
+                    "P1".into(),
+                    crate::graph::overrides::RegistryEntity {
+                        kind: "person".into(),
+                        name: "Loser".into(),
+                        aliases: Vec::new(),
+                        status: "confirmed".into(),
+                    },
+                ),
+                (
+                    "P2".into(),
+                    crate::graph::overrides::RegistryEntity {
+                        kind: "person".into(),
+                        name: "Winner".into(),
+                        aliases: Vec::new(),
+                        status: "confirmed".into(),
+                    },
+                ),
+                (
+                    "kg_project".into(),
+                    crate::graph::overrides::RegistryEntity {
+                        kind: "project".into(),
+                        name: "Project".into(),
+                        aliases: Vec::new(),
+                        status: "confirmed".into(),
+                    },
+                ),
+            ]),
+            legacy_ids: BTreeMap::new(),
+            operations: Vec::new(),
+        };
+        std::fs::write(
+            root.path()
+                .join(crate::graph::overrides::KNOWLEDGE_FILE),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("voiceprints.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "people": {"P1": {"name": "Loser"}, "P2": {"name": "Winner"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let voiceprints = crate::store::VoiceprintStore::new(root.path().to_path_buf());
+        voiceprints.merge("P1", "P2").unwrap();
+
+        let rebuild_count = Arc::new(AtomicUsize::new(0));
+        let rebuild_count_for_worker = Arc::clone(&rebuild_count);
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder(move |root| {
+            rebuild_count_for_worker.fetch_add(1, Ordering::SeqCst);
+            let voiceprints = crate::store::VoiceprintStore::new(root.to_path_buf());
+            voiceprints.rename("P2", "Winner after merge")?;
+            let people = voiceprints.load();
+            anyhow::ensure!(
+                crate::store::VoiceprintStore::resolve(&people, "P1") == Some("P2"),
+                "merge redirect was not durable"
+            );
+            crate::graph::index::rebuild_atomic(
+                root,
+                &CanonicalGraph {
+                    entities: BTreeMap::from([
+                        (
+                            "P2".into(),
+                            CanonicalEntity {
+                                id: "P2".into(),
+                                kind: "person".into(),
+                                name: people.people["P2"].name.clone(),
+                                aliases: Vec::new(),
+                                confirmed: true,
+                            },
+                        ),
+                        (
+                            "kg_project".into(),
+                            CanonicalEntity {
+                                id: "kg_project".into(),
+                                kind: "project".into(),
+                                name: "Project".into(),
+                                aliases: Vec::new(),
+                                confirmed: true,
+                            },
+                        ),
+                    ]),
+                    mentions: Vec::new(),
+                    relations: vec![CanonicalRelation {
+                        id: "cr_person_project".into(),
+                        subject_id: "P2".into(),
+                        predicate: crate::store::RelationPredicate {
+                            kind: "responsible_for".into(),
+                            label: None,
+                        },
+                        object_id: "kg_project".into(),
+                        confidence: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                        status: RelationStatus::Current,
+                        origin: RelationOrigin::UserAssertion,
+                        provider: None,
+                        model: None,
+                        note_ids: Vec::new(),
+                        evidence: Vec::new(),
+                    }],
+                    pending: Vec::new(),
+                },
+            )
+        });
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        super::queue_person_graph_rebuild_with(
+            &scheduler,
+            root.path().to_path_buf(),
+            "人物合并",
+            move |status| {
+                let _ = status_tx.send(status);
+            },
+        )
+        .unwrap();
+        loop {
+            let status = status_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("person rebuild should finish without waiting on the voiceprint lock");
+            assert_ne!(status.state, "error", "person rebuild failed");
+            if status.state == "ready" {
+                break;
+            }
+        }
+
+        assert_eq!(rebuild_count.load(Ordering::SeqCst), 1);
+        assert_eq!(voiceprints.load().people["P2"].name, "Winner after merge");
+        let graph = crate::graph::query::semantic_graph(
+            root.path(),
+            &crate::graph::query::GraphFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            graph.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(),
+            ["P2", "kg_project"]
+        );
+        let detail = crate::graph::query::semantic_entity_detail(
+            root.path(),
+            "P1",
+            &crate::graph::query::GraphFilter::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(detail.id, "P2");
+        assert_eq!(detail.name, "Winner after merge");
+        assert_eq!(detail.relations.len(), 1);
+        let path = crate::graph::path::shortest_path(
+            root.path(),
+            "P1",
+            "kg_project",
+            &crate::graph::query::GraphFilter::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(path.entity_ids, ["P2", "kg_project"]);
     }
 
     #[test]

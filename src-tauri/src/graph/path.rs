@@ -280,10 +280,10 @@ pub fn shortest_path(
     filter: &GraphFilter,
 ) -> anyhow::Result<Option<ipc::KnowledgePath>> {
     let context = query::open_read_context(data_root)?;
-    let Some(start) = query::resolve_entity_from_context(data_root, &context, start) else {
+    let Some(start) = query::resolve_entity_from_context(&context, start) else {
         return Ok(None);
     };
-    let Some(end) = query::resolve_entity_from_context(data_root, &context, end) else {
+    let Some(end) = query::resolve_entity_from_context(&context, end) else {
         return Ok(None);
     };
     let graph = query::semantic_graph_from_context(&context, filter)?;
