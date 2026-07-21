@@ -1468,10 +1468,6 @@ impl RebuildScheduler {
         data_root: PathBuf,
         emit: impl Fn(IndexStatus) + Send + Sync + 'static,
     ) -> anyhow::Result<u64> {
-        anyhow::ensure!(
-            data_root.join(DIRTY_MARKER_FILE).is_file(),
-            "semantic graph index is not marked dirty"
-        );
         self.request(data_root, emit)
     }
 }
@@ -3160,6 +3156,37 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!root.path().join(DIRTY_MARKER_FILE).exists());
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scheduler_dirty_retry_creates_a_missing_marker_and_recovers_after_persist_failure() {
+        let scheduler = RebuildScheduler::with_rebuilder_and_spawner(
+            |_| Ok(BuildStats::default()),
+            |job| {
+                job();
+                Ok(())
+            },
+        );
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("missing-then-repaired");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let statuses_for_emit = statuses.clone();
+
+        assert!(scheduler.retry_dirty(root.clone(), |_| {}).is_err());
+        std::fs::create_dir(&root).unwrap();
+        assert!(!root.join(DIRTY_MARKER_FILE).exists());
+
+        let generation = scheduler
+            .retry_dirty(root.clone(), move |status| {
+                statuses_for_emit.lock().unwrap().push(status)
+            })
+            .unwrap();
+
+        assert_eq!(generation, 1);
+        assert!(statuses.lock().unwrap().iter().any(|status| {
+            status.generation == generation && status.state == "ready"
+        }));
+        assert!(!root.join(DIRTY_MARKER_FILE).exists());
     }
 
     #[test]

@@ -27,6 +27,50 @@ export const GLOBAL_SEMANTIC_PRESENCE_FILTER: KnowledgeFilter = {
 /** D3 默认约 300 帧；0.23 在 alphaMin=0.001 时约 27 帧，约 450ms 后自动冻结。 */
 export const NORMAL_GRAPH_ALPHA_DECAY = 0.23;
 
+export interface DebugKnowledgeRoutePolicy {
+  debugFixtureRequested: boolean;
+  productionEffectsAllowed: boolean;
+  selected: string | null;
+  relationId: string | null;
+  reviewOpen: boolean;
+}
+
+/** Debug isolation is decided synchronously from the URL, never from an async fixture result. */
+export function debugKnowledgeRoutePolicy(
+  url: URL,
+  dev: boolean,
+  fixtureSessionReady: boolean,
+  debugRelationEnabled: boolean,
+): DebugKnowledgeRoutePolicy {
+  const debugFixtureRequested =
+    dev && url.searchParams.get("debugFixture") === "semantic-large";
+  if (debugFixtureRequested) {
+    return {
+      debugFixtureRequested,
+      productionEffectsAllowed: false,
+      selected: null,
+      relationId:
+        fixtureSessionReady && debugRelationEnabled ? url.searchParams.get("r") : null,
+      reviewOpen: false,
+    };
+  }
+  return {
+    debugFixtureRequested,
+    productionEffectsAllowed: true,
+    selected: url.searchParams.get("e"),
+    relationId: url.searchParams.get("r"),
+    reviewOpen: url.searchParams.get("review") === "1",
+  };
+}
+
+export function sanitizeDebugGraphUrl(url: URL): URL {
+  const sanitized = new URL(url);
+  sanitized.searchParams.delete("e");
+  sanitized.searchParams.delete("r");
+  sanitized.searchParams.delete("review");
+  return sanitized;
+}
+
 export function graphSimulationTickBudget(
   alphaDecay = NORMAL_GRAPH_ALPHA_DECAY,
   alphaMin = 0.001,

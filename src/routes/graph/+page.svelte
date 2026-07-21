@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { goto } from "$app/navigation";
+  import { goto, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
   import { graphData, kindLabel, type GraphData, type RenderEdge } from "$lib/graph";
   import {
@@ -20,6 +20,7 @@
     DEFAULT_KNOWLEDGE_FILTER,
     GLOBAL_SEMANTIC_PRESENCE_FILTER,
     defaultBackbone,
+    debugKnowledgeRoutePolicy,
     ensureBackboneEdge,
     filterSemanticGraph,
     hasPathEndpoints,
@@ -28,6 +29,7 @@
     pathEmphasis,
     relationLabel,
     runGuardedPathRefresh,
+    sanitizeDebugGraphUrl,
     searchAdmissionIds,
     semanticRequestFailureMessage,
     shouldUseLegacyFallback,
@@ -86,12 +88,24 @@
   let includeWeakPath = $state(false);
   let backfillOpen = $state(false);
   let debugFixtureSession = $state<string | null>(null);
+  let debugRelationEnabled = $state(false);
   let lastSidebarKind = graphFilter.kind;
   let lastRequestedPathStart: string | null = null;
 
-  const selected = $derived($page.url.searchParams.get("e"));
-  const reviewOpen = $derived($page.url.searchParams.get("review") === "1");
-  const relationId = $derived($page.url.searchParams.get("r"));
+  const debugFixtureRequested = $derived(
+    import.meta.env.DEV && $page.url.searchParams.get("debugFixture") === "semantic-large",
+  );
+  const routePolicy = $derived(
+    debugKnowledgeRoutePolicy(
+      $page.url,
+      import.meta.env.DEV,
+      Boolean(debugFixtureSession),
+      debugRelationEnabled,
+    ),
+  );
+  const selected = $derived(routePolicy.selected);
+  const reviewOpen = $derived(routePolicy.reviewOpen);
+  const relationId = $derived(routePolicy.relationId);
   const requestedPathStart = $derived($page.url.searchParams.get("pathStart"));
   const inspectorOpen = $derived(Boolean(selected || reviewOpen || relationId));
   const detailFilter = { ...DEFAULT_KNOWLEDGE_FILTER, include_history: true };
@@ -173,6 +187,7 @@
   }
 
   async function loadGraph() {
+    if (debugFixtureRequested) return;
     try {
       graph = await graphData();
       if ((semantic.nodes.length === 0 || semanticRequestFailed) && visibleIds.size === 0) {
@@ -186,6 +201,7 @@
   }
 
   async function loadSemantic(filter: KnowledgeFilter) {
+    if (debugFixtureRequested) return;
     const generation = ++graphGeneration;
     semanticLoading = true;
     semanticError = "";
@@ -225,6 +241,7 @@
   }
 
   async function probeGlobalSemanticPresence() {
+    if (debugFixtureRequested) return;
     try {
       const value = await semanticGraph(GLOBAL_SEMANTIC_PRESENCE_FILTER);
       const observedPresence = value.semantic_edges.length > 0 ? "present" : "absent";
@@ -245,6 +262,7 @@
   }
 
   async function loadPending() {
+    if (debugFixtureRequested) return;
     try {
       pendingItems = await pendingReview(DEFAULT_KNOWLEDGE_FILTER);
     } catch {
@@ -253,6 +271,7 @@
   }
 
   async function loadDetail(id: string) {
+    if (debugFixtureRequested) return;
     const generation = ++detailGeneration;
     detailLoading = true;
     detailError = "";
@@ -302,7 +321,14 @@
   }
 
   onMount(() => {
-    if (import.meta.env.DEV && $page.url.searchParams.get("debugFixture") === "semantic-large") {
+    if (debugFixtureRequested) {
+      const sanitized = sanitizeDebugGraphUrl($page.url);
+      debugRelationEnabled = false;
+      backfillOpen = false;
+      ctxMenu = null;
+      if (sanitized.search !== $page.url.search) {
+        replaceState(sanitized.pathname + sanitized.search, {});
+      }
       void loadDebugFixture();
       return;
     }
@@ -315,6 +341,7 @@
   });
 
   $effect(() => {
+    if (debugFixtureRequested) return;
     if (graphFilter.mode === "note" && noteGraphState.status === "idle") void noteGraphState.load();
   });
 
@@ -355,6 +382,7 @@
   });
 
   async function refreshKnowledge() {
+    if (debugFixtureRequested) return;
     const id = selected;
     const generation = ++detailGeneration;
     const [nextGraph, nextPending, nextDetail] = await Promise.all([
@@ -375,6 +403,7 @@
   }
 
   async function refreshAfterBackfill() {
+    if (debugFixtureRequested) return;
     const snapshot: PathRefreshSnapshot = {
       generation: ++pathGeneration,
       start: pathStart,
@@ -440,7 +469,7 @@
 
   function pickNode(id: string, _isPerson: boolean) {
     revealFrom(id);
-    if (debugFixtureSession) return;
+    if (debugFixtureRequested) return;
     if (pathStart && id !== pathStart) {
       pathEnd = id;
       void requestPath(pathStart, id, knowledgeFilter, includeWeakPath);
@@ -453,6 +482,10 @@
   }
 
   function openRelation(id: string) {
+    if (debugFixtureRequested) {
+      if (!debugFixtureSession) return;
+      debugRelationEnabled = true;
+    }
     updateQuery((params) => { params.set("r", id); });
   }
 
@@ -461,6 +494,7 @@
   }
 
   function closeRelation() {
+    debugRelationEnabled = false;
     updateQuery((params) => { params.delete("r"); });
   }
 
@@ -493,7 +527,7 @@
     lastSidebarKind = sidebarKind;
     graphFilter.kind = sidebarKind;
     ++pathGeneration;
-    if (debugFixtureSession) {
+    if (debugFixtureRequested) {
       const filtered = filterSemanticGraph(semantic, {
         ...knowledgeFilter,
         include_cooccurrence: knowledgeFilter.include_cooccurrence || includeWeakPath,
@@ -543,6 +577,7 @@
     includeWeak: boolean,
     expectedGeneration?: number,
   ) {
+    if (debugFixtureRequested) return;
     const generation = expectedGeneration ?? ++pathGeneration;
     if (generation !== pathGeneration) return;
     pathStatus = "loading";
@@ -566,13 +601,13 @@
 
   function toggleWeakPath(value: boolean) {
     includeWeakPath = value;
-    if (debugFixtureSession) return;
+    if (debugFixtureRequested) return;
     void loadSemantic({ ...knowledgeFilter, include_cooccurrence: knowledgeFilter.include_cooccurrence || value });
     if (pathStart && pathEnd) void requestPath(pathStart, pathEnd, knowledgeFilter, value);
   }
 
   function openCtxMenu(id: string, name: string, isPerson: boolean, clientX: number, clientY: number) {
-    if (debugFixtureSession) return;
+    if (debugFixtureRequested) return;
     ctxMenu = { id, name, isPerson, x: clientX, y: clientY };
   }
 
@@ -581,7 +616,7 @@
   }
 
   async function loadDebugRelationDetail(id: string) {
-    if (!debugFixtureSession) return null;
+    if (!debugFixtureRequested || !debugFixtureSession) return null;
     return semanticGraphDebugRelationDetail(debugFixtureSession, id);
   }
 
@@ -612,7 +647,7 @@
 <svelte:window onkeydown={handleEscape} />
 
 <div class="graph-main">
-  {#if graphFilter.mode === "note"}
+  {#if graphFilter.mode === "note" && !debugFixtureRequested}
     {#if noteGraphState.data.edges.length > 0 && noteGraphState.data.nodes.length >= 2}
       <ForceGraph
         nodes={noteGraphState.data.nodes}
@@ -662,12 +697,14 @@
         />
 
         <div class="canvas-shell" aria-label="知识图谱画布">
-          {#if debugFixtureSession}
+          {#if debugFixtureRequested}
             <div class="map-message debug-fixture" role="status">
-              <span>隔离调试夹具 · 1,000 个实体 / 5,000 条语义关系 · 不读取或修改真实资料库</span>
+              <span>隔离调试模式 · 仅创建并读取临时夹具，不会读取或修改真实资料库</span>
+              {#if debugFixtureSession}<small>1,000 个实体 / 5,000 条语义关系</small>{/if}
+              {#if semanticError}<small>{semanticError}</small>{/if}
             </div>
           {/if}
-          {#if semanticStatusMessage}
+          {#if !debugFixtureRequested && semanticStatusMessage}
             <div class="map-message degraded" role="status">
               <span>{semanticStatusMessage}</span>
               {#if semanticRequestFailed}
@@ -676,13 +713,13 @@
               <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
             </div>
           {/if}
-          {#if semanticFallback}
+          {#if !debugFixtureRequested && semanticFallback}
             <div class="map-message fallback">
               <span>尚未补建语义关系，当前保留共现弱连接供继续探索。</span>
               <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
             </div>
           {/if}
-          {#if filteredSemanticEmpty}
+          {#if !debugFixtureRequested && filteredSemanticEmpty}
             <div class="map-message" role="status">
               <span>当前筛选下没有语义关系，图谱没有切换为旧版共现结果。</span>
               <button type="button" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>重置图谱筛选</button>
@@ -777,23 +814,29 @@
 
       {#if inspectorOpen}
         <aside class="edge-inspector" aria-label="知识治理检查器">
-          {#if relationId}
+          {#if debugFixtureRequested && debugFixtureSession && relationId}
+            <RelationDrawer
+              {relationId}
+              onClose={closeRelation}
+              onChanged={async () => {}}
+              relationLoader={loadDebugRelationDetail}
+              resolveEntityName={(id) => entityNames.get(id)}
+              readOnly={true}
+            />
+          {:else if !debugFixtureRequested && relationId}
             <RelationDrawer
               {relationId}
               onClose={closeRelation}
               onChanged={refreshKnowledge}
-              relationLoader={debugFixtureSession ? loadDebugRelationDetail : undefined}
-              resolveEntityName={debugFixtureSession ? (id) => entityNames.get(id) : undefined}
-              readOnly={Boolean(debugFixtureSession)}
             />
-          {:else if reviewOpen}
+          {:else if !debugFixtureRequested && reviewOpen}
             <PendingReviewPanel
               items={pendingItems}
               onClose={closeReview}
               onChanged={refreshKnowledge}
               onOpenRelation={openRelation}
             />
-          {:else if selected}
+          {:else if !debugFixtureRequested && selected}
             <button class="inspector-close" type="button" aria-label="关闭实体治理检查器" onclick={closeEntity}>×</button>
             {#if detailLoading && !detail}
               <p class="inspector-state" aria-live="polite">正在读取实体治理信息</p>
@@ -812,11 +855,13 @@
   {/if}
 </div>
 
-<RelationBackfillDialog
-  open={backfillOpen}
-  onClose={() => (backfillOpen = false)}
-  onCompleted={refreshAfterBackfill}
-/>
+{#if !debugFixtureRequested}
+  <RelationBackfillDialog
+    open={backfillOpen}
+    onClose={() => (backfillOpen = false)}
+    onCompleted={refreshAfterBackfill}
+  />
+{/if}
 
 {#if ctxMenu}
   <!-- Pointer convenience layer. The same rename/governance entry stays visible in EntityGovernance. -->

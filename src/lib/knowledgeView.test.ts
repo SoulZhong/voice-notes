@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { EntitySummary } from "./graph";
 import type { KnowledgePath, KnowledgeFilter, KnowledgePathStep, SemanticEdge, SemanticGraphData } from "./knowledge";
 import {
@@ -7,6 +7,7 @@ import {
   NORMAL_GRAPH_ALPHA_DECAY,
   canonicalPathEdgeId,
   defaultBackbone,
+  debugKnowledgeRoutePolicy,
   ensureBackboneEdge,
   filterSemanticGraph,
   graphDragPosition,
@@ -21,8 +22,51 @@ import {
   semanticRequestFailureMessage,
   shouldUseLegacyFallback,
   stableEdgeLanes,
+  sanitizeDebugGraphUrl,
   viewEdges,
 } from "./knowledgeView";
+
+describe("debug fixture route isolation", () => {
+  it("blocks production effects before the fixture session exists and clears unsafe inspectors", () => {
+    const unsafe = new URL(
+      "http://localhost/graph?debugFixture=semantic-large&e=real-entity&r=real-relation&review=1",
+    );
+    const initial = debugKnowledgeRoutePolicy(unsafe, true, false, false);
+    expect(initial).toEqual({
+      debugFixtureRequested: true,
+      productionEffectsAllowed: false,
+      selected: null,
+      relationId: null,
+      reviewOpen: false,
+    });
+
+    const production = {
+      semanticGraph: vi.fn(),
+      entityDetail: vi.fn(),
+      relationDetail: vi.fn(),
+      pendingReview: vi.fn(),
+      governance: vi.fn(),
+      backfill: vi.fn(),
+    };
+    if (initial.productionEffectsAllowed) {
+      for (const effect of Object.values(production)) effect();
+    }
+    for (const effect of Object.values(production)) expect(effect).not.toHaveBeenCalled();
+
+    const delayed = debugKnowledgeRoutePolicy(unsafe, true, true, false);
+    expect(delayed.relationId).toBeNull();
+    const cleaned = sanitizeDebugGraphUrl(unsafe);
+    expect(cleaned.searchParams.get("debugFixture")).toBe("semantic-large");
+    expect(cleaned.searchParams.has("e")).toBe(false);
+    expect(cleaned.searchParams.has("r")).toBe(false);
+    expect(cleaned.searchParams.has("review")).toBe(false);
+
+    const fixtureClick = new URL("http://localhost/graph?debugFixture=semantic-large&r=fixture-relation");
+    expect(debugKnowledgeRoutePolicy(fixtureClick, true, true, true).relationId).toBe(
+      "fixture-relation",
+    );
+  });
+});
 
 const node = (id: string, kind = "project", noteCount = 1): EntitySummary => ({
   id,
@@ -565,13 +609,19 @@ describe("exploratory graph UI source contract", () => {
     const route = source("../routes/graph/+page.svelte");
     const knowledge = source("./knowledge.ts");
     const drawer = source("./RelationDrawer.svelte");
+    expect(route).toContain("const debugFixtureRequested = $derived(");
     expect(route).toContain('import.meta.env.DEV && $page.url.searchParams.get("debugFixture") === "semantic-large"');
+    expect(route).toContain("sanitizeDebugGraphUrl");
     expect(route).toContain("const fixture = await semanticGraphDebugFixture()");
     expect(route).toContain("debugFixtureSession = fixture.session_id");
     expect(route).toContain("semanticGraphDebugRelationDetail");
-    expect(route).toContain("relationLoader={debugFixtureSession ? loadDebugRelationDetail : undefined}");
-    expect(route).toContain("readOnly={Boolean(debugFixtureSession)}");
-    expect(route).toContain("不读取或修改真实资料库");
+    expect(route).toContain("debugFixtureSession && relationId");
+    expect(route).toContain("relationLoader={loadDebugRelationDetail}");
+    expect(route).toContain("readOnly={true}");
+    expect(route).toContain("!debugFixtureRequested && reviewOpen");
+    expect(route).toContain("!debugFixtureRequested && selected");
+    expect(route).toContain("{#if !debugFixtureRequested}\n  <RelationBackfillDialog");
+    expect(route).toContain("仅创建并读取临时夹具，不会读取或修改真实资料库");
     expect(knowledge).toContain('invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture")');
     expect(knowledge).toContain('invoke<RelationDetail | null>("semantic_graph_debug_relation_detail"');
     expect(knowledge).not.toMatch(/semanticGraphDebugFixture\s*=\s*\([^)]*(root|path)/);

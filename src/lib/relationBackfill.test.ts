@@ -450,8 +450,61 @@ describe("createRelationBackfillController", () => {
       emitIndex(indexStatus(31, "ready"));
       expect(controller.state.phase).toBe(terminalPhase);
       expect(controller.state.published).toBe(true);
+      expect(controller.state.publishedGeneration).toBe(31);
     },
   );
+
+  it("reports each distinct published generation once across resumed runs in one dialog", async () => {
+    const progressHandlers: Array<(event: BackfillProgress) => void> = [];
+    const indexHandlers: Array<(event: GraphIndexStatus) => void> = [];
+    const runIds = ["run-partial", "run-cancelled"];
+    const controller = createRelationBackfillController(api({
+      createRunId: vi.fn(() => runIds.shift()!),
+      subscribe: vi.fn(async (handler) => {
+        progressHandlers.push(handler);
+        return vi.fn();
+      }),
+      subscribeIndex: vi.fn(async (handler) => {
+        indexHandlers.push(handler);
+        return vi.fn();
+      }),
+    }));
+    const onCompleted = vi.fn();
+    let lastReportedGeneration: number | null = null;
+    controller.subscribe((next) => {
+      if (
+        next.publishedGeneration !== null &&
+        next.publishedGeneration !== lastReportedGeneration
+      ) {
+        lastReportedGeneration = next.publishedGeneration;
+        onCompleted(next.publishedGeneration);
+      }
+    });
+
+    await controller.preview();
+    controller.acknowledge(true);
+    await controller.start();
+    progressHandlers[0]!(progress("run-partial", "partial", 1, {
+      failed: [{ note_id: "note-b", error: "provider failed" }],
+      rebuild_generation: 41,
+    }));
+    indexHandlers[0]!(indexStatus(41, "ready"));
+    indexHandlers[0]!(indexStatus(41, "ready"));
+    expect(onCompleted).toHaveBeenCalledTimes(1);
+    expect(onCompleted).toHaveBeenLastCalledWith(41);
+
+    await controller.resume();
+    controller.acknowledge(true);
+    await controller.start();
+    progressHandlers[1]!(progress("run-cancelled", "cancelled", 1, {
+      rebuild_generation: 42,
+    }));
+    indexHandlers[1]!(indexStatus(41, "ready"));
+    indexHandlers[1]!(indexStatus(42, "ready"));
+    indexHandlers[1]!(indexStatus(42, "ready"));
+    expect(onCompleted).toHaveBeenCalledTimes(2);
+    expect(onCompleted).toHaveBeenLastCalledWith(42);
+  });
 });
 
 describe("backfill dialog source contract", () => {
@@ -504,6 +557,9 @@ describe("backfill dialog source contract", () => {
     const dialog = source("./RelationBackfillDialog.svelte");
     const graph = source("../routes/graph/+page.svelte");
     expect(dialog).toContain("next.published");
+    expect(dialog).toContain("lastReportedGeneration");
+    expect(dialog).toContain("next.publishedGeneration");
+    expect(dialog).not.toMatch(/lastReportedGeneration = null;[\s\S]{0,80}dialog\.showModal/);
     expect(dialog).toContain("重试索引");
     expect(dialog).toContain("controller.retryIndex()");
     expect(graph).toContain("onCompleted={refreshAfterBackfill}");
