@@ -483,6 +483,7 @@ describe("governance UI source contract", () => {
     expect(entity).toContain("formatDuration(noteDurations.get(noteId) ?? null)");
     expect(entity).toContain("<span>{group.title}</span>");
     expect(entity).toContain('{#if group.time && group.duration}<span aria-hidden="true">·</span>{/if}');
+    expect(entity).toContain(".source-notes .note-link { display: flex; align-items: baseline; justify-content: space-between;");
     expect(entity).toContain("{#if simple}");
     expect(entity).toContain("{#each group.items as mention (mention.id)}");
     expect(entity).toContain("第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}");
