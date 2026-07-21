@@ -433,6 +433,164 @@ impl AgentRelationExecutor {
     }
 }
 
+struct RelationScratch {
+    path: PathBuf,
+}
+
+impl RelationScratch {
+    fn create(tag: &str) -> anyhow::Result<Self> {
+        let safe_tag = tag
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .take(64)
+            .collect::<String>();
+        for _ in 0..32 {
+            let nonce = relation_scratch_nonce()?;
+            let candidate = std::env::temp_dir().join(format!(
+                "vn-agent-relation-{nonce}-{}",
+                safe_tag.trim_matches('-')
+            ));
+            match Self::create_at(candidate) {
+                Ok(scratch) => return Ok(scratch),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        anyhow::bail!("无法独占创建关系补建隔离目录")
+    }
+
+    fn create_at(path: PathBuf) -> anyhow::Result<Self> {
+        create_private_directory(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::Error::new(error).context(format!(
+                    "关系补建隔离目录已存在，拒绝复用 {}",
+                    path.display()
+                ))
+            } else {
+                anyhow::Error::new(error)
+            }
+        })?;
+        ensure_plain_directory(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RelationScratch {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "relation backfill: 清理隔离目录 {} 失败: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+fn relation_scratch_nonce() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        return Ok(hex::encode(bytes));
+    }
+
+    #[cfg(not(unix))]
+    {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        return Ok(format!("{:x}-{:x}-{:x}", std::process::id(), now, sequence));
+    }
+}
+
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        return std::fs::DirBuilder::new().mode(0o700).create(path);
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+fn ensure_plain_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "隔离路径不是普通目录: {}",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                == 0,
+            "隔离路径是 Windows reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn create_private_child(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let child = parent.join(name);
+    create_private_directory(&child)
+        .map_err(|error| anyhow::anyhow!("无法独占创建隔离目录 {}: {error}", child.display()))?;
+    ensure_plain_directory(&child)?;
+    Ok(child)
+}
+
+struct IsolatedRelationNote {
+    app_data: PathBuf,
+    anchored: crate::store::refined::AnchoredRefinedDir,
+}
+
+fn prepare_isolated_relation_note(
+    scratch: &RelationScratch,
+    note_id: &str,
+    doc: &RefinedDoc,
+) -> anyhow::Result<IsolatedRelationNote> {
+    crate::store::validate_note_id(note_id)?;
+    let app_data = create_private_child(scratch.path(), "app-data")?;
+    let notes = create_private_child(&app_data, "notes")?;
+    create_private_child(&notes, note_id)?;
+    let anchored = crate::store::refined::AnchoredRefinedDir::open(&notes, note_id)?;
+    let lock = anchored
+        .acquire_lock()?
+        .ok_or_else(|| anyhow::anyhow!("无法锁定关系补建隔离笔记"))?;
+    anchored.write_locked(doc, &lock)?;
+    drop(lock);
+    Ok(IsolatedRelationNote { app_data, anchored })
+}
+
 impl super::backfill::RelationExecutor for AgentRelationExecutor {
     fn provider(&self) -> &str {
         "agent"
@@ -448,12 +606,9 @@ impl super::backfill::RelationExecutor for AgentRelationExecutor {
         doc: &RefinedDoc,
     ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
         anyhow::ensure!(doc.stages.llm == "done", "关系补建要求已完成的最终正文");
-        let scratch = make_scratch(&format!("relation-{note_id}"))?;
-        let isolated_app_data = scratch.join("app-data");
-        let isolated_note = isolated_app_data.join("notes").join(note_id);
-        let result = (|| -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
-            std::fs::create_dir_all(&isolated_note)?;
-            crate::store::write_refined_atomic(&isolated_note, doc)?;
+        let scratch = RelationScratch::create(&format!("relation-{note_id}"))?;
+        let isolated = prepare_isolated_relation_note(&scratch, note_id, doc)?;
+        (|| -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
             let prompt = relation_prompt(note_id, &self.model);
             let exe = self_exe()?;
             let cmd = relation_command(
@@ -462,11 +617,11 @@ impl super::backfill::RelationExecutor for AgentRelationExecutor {
                 &self.model,
                 &prompt,
                 &exe,
-                &scratch,
-                &isolated_app_data,
+                scratch.path(),
+                &isolated.app_data,
             )?;
-            let process = run_with_timeout(cmd, &scratch, REFINE_TIMEOUT_S);
-            let after = crate::store::load_refined(&isolated_note).ok_or_else(|| {
+            let process = run_with_timeout(cmd, scratch.path(), REFINE_TIMEOUT_S);
+            let after = isolated.anchored.load_current()?.ok_or_else(|| {
                 process
                     .as_ref()
                     .err()
@@ -493,9 +648,7 @@ impl super::backfill::RelationExecutor for AgentRelationExecutor {
                     )
                 },
             )
-        })();
-        let _ = std::fs::remove_dir_all(&scratch);
-        result
+        })()
     }
 }
 
@@ -1077,6 +1230,66 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
                 .to_string();
             assert!(error.contains("两个关系 MCP 工具"), "{error}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relation_scratch_is_private_and_removed_by_raii() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = RelationScratch::create("private-test").unwrap();
+        let candidate = scratch.path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(scratch.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(scratch);
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relation_scratch_rejects_preexisting_symlink_and_never_touches_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("keep");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let candidate = parent.path().join("relation-scratch");
+        symlink(outside.path(), &candidate).unwrap();
+
+        let error = RelationScratch::create_at(candidate).err().unwrap();
+        assert!(error.to_string().contains("已存在"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert!(outside.path().is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn isolated_relation_truth_rejects_symlinked_app_data() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("keep");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let scratch = RelationScratch::create_at(parent.path().join("scratch")).unwrap();
+        symlink(outside.path(), scratch.path().join("app-data")).unwrap();
+
+        let error = prepare_isolated_relation_note(
+            &scratch,
+            "safe-note",
+            &doc("done", &["张三负责灯塔计划"]),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("app-data"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
     }
 
     #[test]

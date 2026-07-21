@@ -388,19 +388,36 @@ pub(crate) fn run_batch(
     let mut committed = 0usize;
     let mut failed = Vec::new();
     let mut cancelled = false;
+    let mut panicked = false;
     for note_id in note_ids {
-        let result = run_one_controlled(&notes_root.join(note_id), note_id, executor, cancel);
+        emit(BackfillProgress {
+            state: "running".into(),
+            completed,
+            total,
+            current_note_id: Some(note_id.clone()),
+            failed: failed.clone(),
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_one_controlled(&notes_root.join(note_id), note_id, executor, cancel)
+        }));
         match result {
-            Ok(outcome) => {
+            Ok(Ok(outcome)) => {
                 completed += 1;
                 committed += usize::from(outcome.committed);
             }
-            Err(RunOneError::Cancelled) => cancelled = true,
-            Err(RunOneError::Failed(error)) => {
+            Ok(Err(RunOneError::Cancelled)) => cancelled = true,
+            Ok(Err(RunOneError::Failed(error))) => {
                 completed += 1;
                 failed.push(BackfillFailure {
                     note_id: note_id.clone(),
                     error: format!("{error:#}"),
+                });
+            }
+            Err(_) => {
+                panicked = true;
+                failed.push(BackfillFailure {
+                    note_id: note_id.clone(),
+                    error: "关系补建执行器异常退出".into(),
                 });
             }
         }
@@ -411,20 +428,35 @@ pub(crate) fn run_batch(
             current_note_id: Some(note_id.clone()),
             failed: failed.clone(),
         });
-        if cancelled {
+        if cancelled || panicked {
             break;
         }
     }
     if committed > 0 {
-        if let Err(error) = request_rebuild() {
-            failed.push(BackfillFailure {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut request_rebuild)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failed.push(BackfillFailure {
                 note_id: String::new(),
                 error: format!("索引排队失败，已保留 dirty 标记供重试:{error:#}"),
-            });
+            }),
+            Err(_) => {
+                panicked = true;
+                failed.push(BackfillFailure {
+                    note_id: String::new(),
+                    error: "索引排队异常退出，dirty 标记状态未知".into(),
+                });
+            }
         }
     }
     let terminal = BackfillProgress {
-        state: if cancelled { "cancelled" } else { "completed" }.into(),
+        state: if cancelled {
+            "cancelled"
+        } else if panicked {
+            "failed"
+        } else {
+            "completed"
+        }
+        .into(),
         completed,
         total,
         current_note_id: None,
@@ -438,10 +470,10 @@ pub(crate) fn panic_progress(
     mut last_progress: BackfillProgress,
     cancelled: bool,
 ) -> BackfillProgress {
+    let active_note_id = last_progress.current_note_id.take().unwrap_or_default();
     last_progress.state = if cancelled { "cancelled" } else { "failed" }.into();
-    last_progress.current_note_id = None;
     last_progress.failed.push(BackfillFailure {
-        note_id: String::new(),
+        note_id: active_note_id,
         error: "关系补建线程异常退出".into(),
     });
     last_progress
@@ -969,6 +1001,86 @@ mod tests {
     }
 
     #[test]
+    fn committed_work_rebuilds_once_and_reports_active_note_when_next_executor_panics() {
+        struct PanicOnSecond {
+            calls: AtomicUsize,
+        }
+
+        impl RelationExecutor for PanicOnSecond {
+            fn provider(&self) -> &str {
+                "test-provider"
+            }
+
+            fn model(&self) -> &str {
+                "test-model"
+            }
+
+            fn extract(
+                &self,
+                note_id: &str,
+                doc: &RefinedDoc,
+            ) -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    panic!("second provider panicked");
+                }
+                crate::refine::relations::materialize(note_id, doc, vec![raw_relation(0.93)])
+                    .map_err(|issues| anyhow::anyhow!("{issues:?}"))
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let first = "panic-first";
+        let second = "panic-second";
+        write_note(root.path(), first, &fixture_doc(first, 0, "failed"));
+        write_note(root.path(), second, &fixture_doc(second, 0, "failed"));
+        let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
+            |_| anyhow::bail!("must not run"),
+            |_| Err(std::io::Error::other("spawn denied")),
+        );
+        let rebuilds = AtomicUsize::new(0);
+        let events = std::cell::RefCell::new(Vec::new());
+        let terminal = run_batch(
+            &root.path().join("notes"),
+            &[first.into(), second.into()],
+            &PanicOnSecond {
+                calls: AtomicUsize::new(0),
+            },
+            &AtomicBool::new(false),
+            |progress| events.borrow_mut().push(progress),
+            || {
+                rebuilds.fetch_add(1, Ordering::SeqCst);
+                scheduler.request(root.path().to_path_buf(), |_| {})
+            },
+        );
+
+        assert!(is_current(
+            &store::load_refined(&root.path().join("notes").join(first)).unwrap()
+        ));
+        assert!(!is_current(
+            &store::load_refined(&root.path().join("notes").join(second)).unwrap()
+        ));
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+        assert!(root.path().join(".graph-index-dirty").is_file());
+        assert_eq!(terminal.state, "failed");
+        assert_eq!((terminal.completed, terminal.total), (1, 2));
+        assert!(terminal
+            .failed
+            .iter()
+            .any(|failure| failure.note_id == second && failure.error.contains("异常退出")));
+        let events = events.into_inner();
+        assert_eq!(events[0].current_note_id.as_deref(), Some(first));
+        assert_eq!(events[0].completed, 0);
+        assert!(events.iter().any(|progress| {
+            progress.current_note_id.as_deref() == Some(second) && progress.completed == 1
+        }));
+        let last = events.last().unwrap();
+        assert_eq!(last.state, terminal.state);
+        assert_eq!(last.completed, terminal.completed);
+        assert_eq!(last.total, terminal.total);
+        assert_eq!(last.failed.len(), terminal.failed.len());
+    }
+
+    #[test]
     fn panic_progress_is_failed_unless_cancellation_was_requested() {
         let last = BackfillProgress {
             state: "running".into(),
@@ -981,6 +1093,7 @@ mod tests {
         assert_eq!(failed.state, "failed");
         assert_eq!((failed.completed, failed.total), (1, 3));
         assert_eq!(failed.failed.len(), 1);
+        assert_eq!(failed.failed[0].note_id, "two");
         assert!(failed.current_note_id.is_none());
 
         let cancelled = panic_progress(last, true);

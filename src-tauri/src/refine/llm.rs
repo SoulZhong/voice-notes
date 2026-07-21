@@ -96,11 +96,17 @@ pub fn extract_relations(
     let content = envelope["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
-    let payload: Value = serde_json::from_str(content)?;
-    let relations = payload
-        .get("relations")
-        .ok_or_else(|| anyhow::anyhow!("关系补建响应缺 relations 数组"))?;
-    Ok(serde_json::from_value(relations.clone())?)
+    parse_relation_only_payload(content)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelationOnlyPayload {
+    relations: Vec<RawRelation>,
+}
+
+fn parse_relation_only_payload(content: &str) -> anyhow::Result<Vec<RawRelation>> {
+    Ok(serde_json::from_str::<RelationOnlyPayload>(content)?.relations)
 }
 
 pub enum LlmOutcome {
@@ -610,6 +616,18 @@ mod tests {
         })
         .to_string();
         serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
+    }
+
+    #[test]
+    fn relation_only_payload_rejects_unknown_output_fields() {
+        assert!(parse_relation_only_payload(r#"{"relations":[]}"#).is_ok());
+        let error = parse_relation_only_payload(r#"{"relations":[],"texts":["mutated"]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown field") && error.contains("texts"),
+            "{error}"
+        );
     }
 
     fn para(text: &str) -> crate::store::RefinedParagraph {

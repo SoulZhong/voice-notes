@@ -1703,6 +1703,36 @@ fn relation_executor(
     }
 }
 
+fn spawn_relation_backfill_worker<Spawn, Worker, EmitFailure>(
+    gate: refine::backfill::BackfillGate,
+    initial: ipc::BackfillProgress,
+    spawn: Spawn,
+    worker: Worker,
+    emit_failure: EmitFailure,
+) -> Result<(), String>
+where
+    Spawn: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    Worker: FnOnce(ipc::BackfillProgress) + Send + 'static,
+    EmitFailure: FnOnce(ipc::BackfillProgress),
+{
+    let failure_template = initial.clone();
+    let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _gate = gate;
+        worker(initial);
+    });
+    if let Err(error) = spawn(job) {
+        let mut terminal = failure_template;
+        terminal.state = "failed".into();
+        terminal.failed.push(ipc::BackfillFailure {
+            note_id: String::new(),
+            error: format!("无法启动关系补建线程:{error}"),
+        });
+        emit_failure(terminal);
+        return Err(format!("无法启动关系补建线程:{error}"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn preview_relation_backfill(
     app: AppHandle,
@@ -1747,11 +1777,18 @@ fn start_relation_backfill(
         failed: vec![],
     };
     let last_progress = Arc::new(Mutex::new(initial.clone()));
-    let _ = app.emit("relation_backfill_progress", initial);
-    std::thread::Builder::new()
-        .name("relation-backfill".into())
-        .spawn(move || {
-            let _gate = gate;
+    let spawn_failure_events = app.clone();
+    spawn_relation_backfill_worker(
+        gate,
+        initial,
+        |job| {
+            std::thread::Builder::new()
+                .name("relation-backfill".into())
+                .spawn(move || job())
+                .map(|_| ())
+        },
+        move |initial| {
+            let _ = events.emit("relation_backfill_progress", initial);
             let panic_events = events.clone();
             let progress_state = Arc::clone(&last_progress);
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1786,8 +1823,11 @@ fn start_relation_backfill(
                 );
                 let _ = panic_events.emit("relation_backfill_progress", terminal);
             }
-        })
-        .map_err(|error| format!("无法启动关系补建线程:{error}"))?;
+        },
+        move |terminal| {
+            let _ = spawn_failure_events.emit("relation_backfill_progress", terminal);
+        },
+    )?;
     Ok(())
 }
 
@@ -4104,6 +4144,47 @@ mod tests {
         assert!(start_signature.contains("request: ipc::BackfillRequest"));
         assert!(start_signature.contains(") -> Result<(), String>"));
         assert!(source.contains("relation_backfill_progress"));
+    }
+
+    #[test]
+    fn relation_backfill_spawn_failure_emits_terminal_and_releases_gate() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = crate::refine::backfill::BackfillGate::acquire(std::sync::Arc::clone(&running))
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_for_failure = std::sync::Arc::clone(&events);
+        let worker_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_ran_in_job = std::sync::Arc::clone(&worker_ran);
+        let initial = crate::ipc::BackfillProgress {
+            state: "running".into(),
+            completed: 0,
+            total: 2,
+            current_note_id: None,
+            failed: vec![],
+        };
+
+        let error = super::spawn_relation_backfill_worker(
+            gate,
+            initial,
+            |_job| Err(std::io::Error::other("injected spawn failure")),
+            move |_initial| {
+                worker_ran_in_job.store(true, std::sync::atomic::Ordering::SeqCst)
+            },
+            move |progress| events_for_failure.lock().unwrap().push(progress),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected spawn failure"));
+        assert!(!worker_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !running.load(std::sync::atomic::Ordering::SeqCst),
+            "spawn Err must drop the gate"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, "failed");
+        assert_eq!((events[0].completed, events[0].total), (0, 2));
+        assert!(events[0].failed[0].error.contains("injected spawn failure"));
     }
 
     #[test]
