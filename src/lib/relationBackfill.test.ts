@@ -530,14 +530,14 @@ describe("backfill dialog source contract", () => {
     expect(dialog).toContain("执行体");
     expect(dialog).toContain("精确模型");
     expect(dialog).toContain("契约版本");
-    expect(dialog).toContain("将把修订稿发送给当前配置的执行体");
+    expect(dialog).toContain("将把修订稿发送给当前配置的处理方式");
     expect(dialog).not.toMatch(/价格|费用|token|令牌估算/i);
   });
 
   it("keeps full IDs and technical errors inspectable only through disclosure", () => {
     const dialog = source("./RelationBackfillDialog.svelte");
     for (const text of [
-      "取消补建",
+      "停止分析",
       "继续未完成笔记",
       "重新预览",
       "aria-live",

@@ -664,10 +664,10 @@
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">补建关系</span>
+          <span class="row-label">笔记关系分析</span>
           <span class="row-desc">先预览范围、执行体与精确模型，再由你明确确认是否发送修订稿。</span>
         </div>
-        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>预览关系补建</button>
+        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
       </div>
     </div>
   </section>

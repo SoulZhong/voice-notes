@@ -2,7 +2,14 @@
   import { onDestroy, onMount } from "svelte";
   import { goto, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
-  import { graphData, kindLabel, type GraphData, type RenderEdge } from "$lib/graph";
+  import {
+    graphData,
+    graphEdgeDetail,
+    kindLabel,
+    type GraphData,
+    type GraphEdgeDetailItem,
+    type RenderEdge,
+  } from "$lib/graph";
   import {
     semanticEntityDetail,
     semanticGraph,
@@ -40,6 +47,7 @@
   import EntityGovernance from "$lib/EntityGovernance.svelte";
   import RelationDrawer from "$lib/RelationDrawer.svelte";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
+  import GraphEdgeInspector from "$lib/GraphEdgeInspector.svelte";
 
   const emptySemantic = (): SemanticGraphData => ({
     nodes: [],
@@ -74,6 +82,16 @@
   let debugFixtureSession = $state<string | null>(null);
   let debugRelationEnabled = $state(false);
   let ctxMenu = $state<{ id: string; name: string; isPerson: boolean; x: number; y: number } | null>(null);
+  let edgeInspector = $state<{
+    perspective: "note" | "entity";
+    edge: RenderEdge;
+    leftName: string;
+    rightName: string;
+    items: GraphEdgeDetailItem[];
+    loading: boolean;
+    error: string;
+  } | null>(null);
+  let edgeDetailGeneration = 0;
   let debugFixtureDisposed = false;
   const releaseDebugFixtureOnce = createDebugFixtureReleaseOnce(semanticGraphDebugRelease);
   let lastSidebarKind = graphFilter.kind;
@@ -92,7 +110,7 @@
   const selected = $derived(routePolicy.selected);
   const relationId = $derived(routePolicy.relationId);
   const manageOpen = $derived($page.url.searchParams.get("manage") === "1");
-  const inspectorOpen = $derived(Boolean(selected || relationId));
+  const inspectorOpen = $derived(Boolean(selected || relationId || edgeInspector));
   const detailFilter = { ...DEFAULT_KNOWLEDGE_FILTER, include_history: true };
   const effectiveGraphFilter = $derived<KnowledgeFilter>(knowledgeFilter);
 
@@ -350,6 +368,11 @@
   });
 
   $effect(() => {
+    const mode = graphFilter.mode;
+    if (edgeInspector && edgeInspector.perspective !== mode) closeEdgeInspector();
+  });
+
+  $effect(() => {
     const query = graphFilter.query.trim().toLowerCase();
     if (!query) return;
     const matches = [...searchAdmissionIds(filteredSemantic.nodes, filteredSemantic.semantic_edges, query)];
@@ -416,6 +439,7 @@
   function pickNode(id: string, _isPerson: boolean) {
     revealFrom(id);
     if (debugFixtureRequested) return;
+    closeEdgeInspector();
     updateQuery((params) => { params.set("e", id); params.delete("manage"); params.delete("review"); params.delete("r"); });
   }
 
@@ -428,11 +452,72 @@
       if (!debugFixtureSession) return;
       debugRelationEnabled = true;
     }
+    closeEdgeInspector();
     updateQuery((params) => { params.set("r", id); });
   }
 
-  function pickEdge(id: string, layer: RenderEdge["layer"]) {
-    if (layer === "semantic") openRelation(id);
+  function edgeEndpointName(edge: RenderEdge, perspective: "note" | "entity", endpoint: "a" | "b") {
+    const id = edge[endpoint];
+    const nodes = perspective === "note" ? noteGraphState.data.nodes : renderedNodes;
+    return nodes.find((node) => node.id === id)?.name ?? entityNames.get(id) ?? id;
+  }
+
+  async function loadEdgeInspector(edge: RenderEdge, perspective: "note" | "entity") {
+    const generation = ++edgeDetailGeneration;
+    edgeInspector = {
+      perspective,
+      edge,
+      leftName: edgeEndpointName(edge, perspective, "a"),
+      rightName: edgeEndpointName(edge, perspective, "b"),
+      items: [],
+      loading: true,
+      error: "",
+    };
+    try {
+      const result = await graphEdgeDetail(edge.a, edge.b, perspective);
+      if (generation !== edgeDetailGeneration || !edgeInspector) return;
+      edgeInspector = { ...edgeInspector, items: result.items, loading: false };
+    } catch (cause) {
+      if (generation !== edgeDetailGeneration || !edgeInspector) return;
+      edgeInspector = {
+        ...edgeInspector,
+        loading: false,
+        error: `连接内容读取失败：${cause instanceof Error ? cause.message : String(cause)}`,
+      };
+    }
+  }
+
+  function pickEdge(edge: RenderEdge) {
+    if (edge.layer === "semantic") openRelation(edge.id);
+    else void loadEdgeInspector(edge, "entity");
+  }
+
+  function pickNoteEdge(edge: RenderEdge) {
+    void loadEdgeInspector(edge, "note");
+  }
+
+  function closeEdgeInspector() {
+    ++edgeDetailGeneration;
+    edgeInspector = null;
+  }
+
+  function retryEdgeInspector() {
+    if (edgeInspector) void loadEdgeInspector(edgeInspector.edge, edgeInspector.perspective);
+  }
+
+  function pickEdgeItem(item: GraphEdgeDetailItem) {
+    if (!edgeInspector) return;
+    if (edgeInspector.perspective === "entity") {
+      goto("/notes/" + encodeURIComponent(item.id));
+      return;
+    }
+    closeEdgeInspector();
+    graphFilter.mode = "entity";
+    updateQuery((params) => {
+      params.set("e", item.id);
+      params.delete("r");
+      params.delete("manage");
+    });
   }
 
   function closeRelation() {
@@ -509,6 +594,7 @@
     if (document.querySelector("dialog[open]")) return;
     if (relationId) closeRelation();
     else if (selected) closeEntity();
+    else if (edgeInspector) closeEdgeInspector();
   }
 </script>
 
@@ -517,14 +603,34 @@
 <div class="graph-main">
   {#if graphFilter.mode === "note" && !debugFixtureRequested}
     {#if noteGraphState.data.edges.length > 0 && noteGraphState.data.nodes.length >= 2}
-      <ForceGraph
-        nodes={noteGraphState.data.nodes}
-        edges={noteGraphState.data.edges}
-        onPick={(id) => pickNoteNode(id)}
-        query={graphFilter.query}
-        showLegend={false}
-        cooccurrenceMeaning="shared-entities"
-      />
+      <div class="entity-stage" class:with-inspector={edgeInspector?.perspective === "note"}>
+        <div class="map-column">
+          <ForceGraph
+            nodes={noteGraphState.data.nodes}
+            edges={noteGraphState.data.edges}
+            onPick={(id) => pickNoteNode(id)}
+            onEdgePick={pickNoteEdge}
+            query={graphFilter.query}
+            showLegend={false}
+            cooccurrenceMeaning="shared-entities"
+          />
+        </div>
+        {#if edgeInspector?.perspective === "note"}
+          <aside class="edge-inspector" aria-label="文章连接详情">
+            <GraphEdgeInspector
+              perspective="note"
+              leftName={edgeInspector.leftName}
+              rightName={edgeInspector.rightName}
+              items={edgeInspector.items}
+              loading={edgeInspector.loading}
+              error={edgeInspector.error}
+              onClose={closeEdgeInspector}
+              onRetry={retryEdgeInspector}
+              onPick={pickEdgeItem}
+            />
+          </aside>
+        {/if}
+      </div>
     {:else if noteGraphState.data.nodes.length > 0}
       <div class="placeholder">
         <p class="ph-title">笔记之间还没有连接</p>
@@ -569,13 +675,13 @@
               {#if semanticRequestFailed}
                 <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>重新读取</button>
               {/if}
-              <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
+              <button type="button" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
             </div>
           {/if}
           {#if !debugFixtureRequested && semanticFallback}
             <div class="map-message fallback">
-              <span>尚未补建语义关系，当前保留共现弱连接供继续探索。</span>
-              <button type="button" onclick={() => (backfillOpen = true)}>补建语义关系</button>
+              <span>还没有分析笔记之间的具体关系，目前先按共同提到的内容连接。</span>
+              <button type="button" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
             </div>
           {/if}
           {#if !debugFixtureRequested && filteredSemanticEmpty}
@@ -623,7 +729,19 @@
 
       {#if inspectorOpen}
         <aside class="edge-inspector" aria-label="知识治理检查器">
-          {#if debugFixtureRequested && debugFixtureSession && relationId}
+          {#if edgeInspector?.perspective === "entity"}
+            <GraphEdgeInspector
+              perspective="entity"
+              leftName={edgeInspector.leftName}
+              rightName={edgeInspector.rightName}
+              items={edgeInspector.items}
+              loading={edgeInspector.loading}
+              error={edgeInspector.error}
+              onClose={closeEdgeInspector}
+              onRetry={retryEdgeInspector}
+              onPick={pickEdgeItem}
+            />
+          {:else if debugFixtureRequested && debugFixtureSession && relationId}
             <RelationDrawer
               {relationId}
               onClose={closeRelation}

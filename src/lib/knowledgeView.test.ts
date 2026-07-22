@@ -368,7 +368,7 @@ describe("viewEdges", () => {
           b: "kg_b",
           weight: 4,
           layer: "cooccurrence",
-          label: "共同出现（4 篇）",
+          label: "4 篇笔记同时提到",
           directed: false,
           confidence: null,
           status: null,
@@ -672,8 +672,12 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("defaultBackbone(");
     expect(route).toContain("nextExpandedIds(");
     expect(route).toContain("visibleIds = new Set([...visibleIds, ...matches])");
-    expect(route).toContain("尚未补建语义关系");
-    expect(route).toContain("补建语义关系");
+    expect(route).toContain("还没有分析笔记之间的具体关系");
+    expect(route).toContain("分析笔记关系");
+    expect(route).toContain("onEdgePick={pickNoteEdge}");
+    expect(route).toContain('<GraphEdgeInspector');
+    expect(route).toContain('perspective="note"');
+    expect(route).toContain('perspective="entity"');
     expect(route).toContain('class="canvas-shell"');
     expect(route).toContain("<EntityGovernance");
     expect(route).toContain("<RelationDrawer");

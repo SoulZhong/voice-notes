@@ -38,6 +38,16 @@ export interface GraphData {
   edges: EdgeRow[];
 }
 
+export interface GraphEdgeDetailItem {
+  id: string;
+  name: string;
+  kind: string | null;
+}
+
+export interface GraphEdgeDetail {
+  items: GraphEdgeDetailItem[];
+}
+
 /** 详情面板「出现的笔记」一项(已联查标题)。镜像 ipc::EntityNoteRef。 */
 export interface EntityNoteRef {
   id: string;
@@ -139,6 +149,9 @@ export const graphData = () => invoke<GraphData>("graph_data");
 /** 力导图数据(文章视角:节点=笔记[name=标题、note_count=该笔记实体数],边=两篇笔记
     共享的实体数)。实体视角的对偶,复用同一 GraphData/ForceGraph。 */
 export const noteGraphData = () => invoke<GraphData>("note_graph_data");
+/** 点击共现边后，按当前视角读取共用实体或共同出现的笔记。 */
+export const graphEdgeDetail = (a: string, b: string, perspective: "note" | "entity") =>
+  invoke<GraphEdgeDetail>("graph_edge_detail", { a, b, perspective });
 /** 单实体详情;不存在/失败 → null。 */
 export const entityDetail = (id: string) => invoke<EntityDetail | null>("entity_detail", { id });
 /** 笔记局部实体→全局 id(Plan C 笔记页)。 */

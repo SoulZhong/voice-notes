@@ -385,6 +385,27 @@ fn query_cooccurrence_edges(
     Ok(edges)
 }
 
+/// 两个当前语义实体共同出现的笔记 ID。边详情与图谱边读取同一份版本化索引，
+/// 避免治理后的稳定 ID 与兼容图谱 ID 不一致时丢失连接证据。
+pub fn shared_notes_for_entities(
+    data_root: &Path,
+    entity_a: &str,
+    entity_b: &str,
+) -> anyhow::Result<Vec<String>> {
+    let connection = index::open_readonly(data_root)?;
+    let mut statement = connection.prepare(
+        "SELECT left_entity.note_id
+         FROM note_entities left_entity
+         JOIN note_entities right_entity ON right_entity.note_id = left_entity.note_id
+         WHERE left_entity.entity_id = ?1 AND right_entity.entity_id = ?2
+         ORDER BY left_entity.note_id ASC",
+    )?;
+    let note_ids = statement
+        .query_map([entity_a, entity_b], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(note_ids)
+}
+
 pub fn semantic_graph(
     data_root: &Path,
     filter: &GraphFilter,

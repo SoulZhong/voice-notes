@@ -407,6 +407,19 @@ pub struct EntityDetail {
     pub related: Vec<RelatedEntity>,
 }
 
+/// 图谱边详情中的一项。文章视角返回实体(kind 有值)，实体视角返回笔记(kind 为空)。
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdgeDetailItem {
+    pub id: String,
+    pub name: String,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdgeDetail {
+    pub items: Vec<GraphEdgeDetailItem>,
+}
+
 /// 笔记页高亮点击导航:局部实体 id → 全局 id(+是否人实体)。
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityLink {

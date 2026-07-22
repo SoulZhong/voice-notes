@@ -30,7 +30,7 @@
     nodes: EntitySummary[];
     edges: RenderEdge[] | EdgeRow[];
     onPick: (id: string, isPerson: boolean) => void;
-    onEdgePick?: (id: string, layer: "semantic" | "cooccurrence") => void;
+    onEdgePick?: (edge: RenderEdge) => void;
     /** 右键节点(改名等次要操作入口);不传则节点不响应右键,走浏览器默认菜单。 */
     onContextMenu?: (id: string, name: string, isPerson: boolean, clientX: number, clientY: number) => void;
     /** 规模封顶(默认给全局图用);实体详情页的小型关系图会传更小的值。用户点「显示全部」
@@ -957,14 +957,14 @@
                   d={edgePath(l)}
                   role="button"
                   tabindex="0"
-                  aria-label={`${l.label}，${l.layer === "semantic" ? "语义关系" : "共现弱连接"}`}
-                  onclick={() => onEdgePick(l.id, l.layer)}
+                  aria-label={`${l.label}，${l.layer === "semantic" ? "点击查看关系证据" : cooccurrenceMeaning === "shared-entities" ? "点击查看共用实体" : "点击查看共同出现的笔记"}`}
+                  onclick={() => onEdgePick(l)}
                   onfocus={() => (focusedEdge = l.id)}
                   onblur={() => (focusedEdge = null)}
                   onkeydown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      onEdgePick(l.id, l.layer);
+                      onEdgePick(l);
                     }
                   }}
                 ><title>{l.label}</title></path>

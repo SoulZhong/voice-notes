@@ -497,6 +497,49 @@ pub(crate) fn note_shared_edges(data_root: &Path) -> anyhow::Result<Vec<(String,
     Ok(rows)
 }
 
+/// 两个实体同时出现的笔记。用于点击实体图的共现边后按需展示证据。
+pub(crate) fn shared_notes_for_entities(
+    data_root: &Path,
+    entity_a: &str,
+    entity_b: &str,
+) -> anyhow::Result<Vec<String>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT ne1.note_id
+         FROM note_entities ne1
+         JOIN note_entities ne2 ON ne1.note_id = ne2.note_id
+         WHERE ne1.entity_id = ?1 AND ne2.entity_id = ?2
+         ORDER BY ne1.note_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([entity_a, entity_b], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 两篇笔记共同提到的实体。用于点击文章图的边后按需展示连接原因。
+pub(crate) fn shared_entities_for_notes(
+    data_root: &Path,
+    note_a: &str,
+    note_b: &str,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let conn = open(data_root)?;
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.kind, e.name
+         FROM note_entities ne1
+         JOIN note_entities ne2 ON ne1.entity_id = ne2.entity_id
+         JOIN entities e ON e.id = ne1.entity_id
+         WHERE ne1.note_id = ?1 AND ne2.note_id = ?2
+         ORDER BY e.name ASC, e.id ASC",
+    )?;
+    let rows = stmt
+        .query_map([note_a, note_b], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// 查单个实体详情。实体不存在 → Ok(None)。只读,不加锁。
 pub(crate) fn entity_detail(data_root: &Path, gid: &str) -> anyhow::Result<Option<EntityDetail>> {
     let conn = open(data_root)?;
@@ -761,6 +804,14 @@ mod tests {
         assert!(edges.iter().any(|(a, b, w)| a == "n1" && b == "n3" && *w == 1), "n1,n3 共享 1");
         assert!(edges.iter().any(|(a, b, w)| a == "n2" && b == "n3" && *w == 1), "n2,n3 共享 1");
         assert!(edges.iter().all(|(a, b, _)| a < b), "a<b 去重");
+
+        let shared_entities = shared_entities_for_notes(root.path(), "n1", "n2").unwrap();
+        assert_eq!(
+            shared_entities.iter().map(|(_, _, name)| name.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B"],
+        );
+        let shared_notes = shared_notes_for_entities(root.path(), "e:a", "e:b").unwrap();
+        assert_eq!(shared_notes, vec!["n1", "n2"]);
     }
 
     #[test]

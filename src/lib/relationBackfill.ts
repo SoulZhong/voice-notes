@@ -197,8 +197,8 @@ export function createRelationBackfillController(
   };
   const terminalSummary = (phase: RelationBackfillTerminalPhase) => {
     if (phase === "partial") return "部分笔记未完成。可以重新预览未完成笔记后继续。";
-    if (phase === "cancelled") return "关系补建已取消。未完成笔记可以重新预览后继续。";
-    if (phase === "failed") return "关系补建未完成。可以重新预览未完成笔记后重试。";
+    if (phase === "cancelled") return "关系分析已取消。未完成笔记可以重新预览后继续。";
+    if (phase === "failed") return "关系分析未完成。可以重新预览未完成笔记后重试。";
     return "";
   };
   const failIndex = (phase: RelationBackfillTerminalPhase, detail: string) => {
@@ -269,7 +269,7 @@ export function createRelationBackfillController(
         publish({
           ...initialState(),
           phase: "preview-error",
-          error: "无法预览关系补建。请检查执行体配置后重新预览。",
+          error: "无法预览笔记关系分析。请检查处理方式配置后重新预览。",
           technicalError: errorMessage(cause),
         });
       }
@@ -282,10 +282,10 @@ export function createRelationBackfillController(
       if (startInFlight) return startInFlight;
       const selected = state.preview;
       if (state.phase !== "preview-ready" || !selected) {
-        return Promise.reject(new Error("请先完成补建预览。"));
+        return Promise.reject(new Error("请先完成关系分析预览。"));
       }
       if (!state.acknowledged) {
-        return Promise.reject(new Error("请先确认隐私提示与本次补建范围。"));
+        return Promise.reject(new Error("请先确认隐私提示与本次分析范围。"));
       }
 
       const token = session;
@@ -403,7 +403,7 @@ export function createRelationBackfillController(
           if (token !== session || runSettled) return;
           settle(
             "failed",
-            "关系补建未能启动。请重新预览并检查执行体配置。",
+            "关系分析未能启动。请重新预览并检查处理方式配置。",
             errorMessage(cause),
           );
           throw cause;
@@ -425,7 +425,7 @@ export function createRelationBackfillController(
         if (token !== session || state.runId !== runId || runSettled) return;
         patch({
           phase: "running",
-          error: "取消请求未送达。补建可能仍在继续，请再次尝试。",
+          error: "停止请求未送达。关系分析可能仍在继续，请再次尝试。",
           technicalError: errorMessage(cause),
         });
         throw cause;
@@ -492,7 +492,7 @@ export function createRelationBackfillController(
     },
     async resume() {
       if (state.phase !== "failed" && state.phase !== "cancelled" && state.phase !== "partial") {
-        throw new Error("只有失败、部分完成或已取消的补建可以继续。");
+        throw new Error("只有失败、部分完成或已取消的关系分析可以继续。");
       }
       await controller.preview(undefined);
     },
