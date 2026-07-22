@@ -42,6 +42,8 @@ export interface GraphEdgeDetailItem {
   id: string;
   name: string;
   kind: string | null;
+  started_at: string | null;
+  duration_secs: number | null;
 }
 
 export interface GraphEdgeDetail {

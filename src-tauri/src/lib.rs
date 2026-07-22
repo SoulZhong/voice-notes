@@ -2313,7 +2313,13 @@ fn graph_edge_detail(
         "note" => graph::shared_entities_for_notes(&root, &a, &b)
             .map_err(|error| graph_read_error("graph_edge_detail", error))?
             .into_iter()
-            .map(|(id, kind, name)| ipc::GraphEdgeDetailItem { id, name, kind: Some(kind) })
+            .map(|(id, kind, name)| ipc::GraphEdgeDetailItem {
+                id,
+                name,
+                kind: Some(kind),
+                started_at: None,
+                duration_secs: None,
+            })
             .collect(),
         "entity" => {
             let semantic_note_ids = graph::query::shared_notes_for_entities(&root, &a, &b)
@@ -2340,6 +2346,8 @@ fn graph_edge_detail(
                         id: note.id.clone(),
                         name: note.title.clone(),
                         kind: None,
+                        started_at: Some(note.started_at.clone()),
+                        duration_secs: note.duration_secs,
                     })
                 })
                 .collect()
