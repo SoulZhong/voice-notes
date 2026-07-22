@@ -521,7 +521,21 @@ sherpa-onnx 当前官方列表包含中文流式 Zipformer、FireRedASR、SenseV
 - 不因官方仓库“可下载”就自动认为允许产品再分发；
 - 模型与应用版本解耦，评测报告必须钉死模型 checksum。
 
-## 9. 完成定义
+## 9. 自动化评测入口
+
+仓库内已提供 `tools/asr_eval.py` 作为统一离线评分入口。数据集采用 JSONL，每行至少
+包含 `reference`、`hypothesis`，可选 `entities`、`suppressed`、`should_suppress`。
+
+```bash
+python3 tools/asr_eval.py eval.jsonl \
+  --max-cer 0.12 \
+  --min-entity-recall 0.90 \
+  --max-filter-fdr 0.01
+```
+
+任一指标越界时命令返回非零，可直接接入 CI 和模型 bake-off。
+
+## 10. 完成定义
 
 ASR 系统提升完成，不等于“新模型能出字”。至少需要满足：
 
@@ -535,7 +549,7 @@ ASR 系统提升完成，不等于“新模型能出字”。至少需要满足�
 - [ ] 每次发布都有固定基线与回归门禁；
 - [ ] 用户能够查看疑似低质量段并从保存音频重试。
 
-## 10. 参考资料
+## 11. 参考资料
 
 ### ASR 与两遍识别
 
