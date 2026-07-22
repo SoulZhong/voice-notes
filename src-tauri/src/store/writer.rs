@@ -1,4 +1,7 @@
-use super::{write_meta_atomic, write_speakers_atomic, NoteMeta, SegmentRecord, SpeakerMeta, SCHEMA_VERSION};
+use super::{
+    write_meta_atomic, write_speakers_atomic, NoteMeta, SegmentRecord, SegmentSuppression,
+    SpeakerMeta, SCHEMA_VERSION, SEGMENT_SUPPRESSIONS_FILE,
+};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -35,8 +38,8 @@ pub struct NoteWriter {
 /// 默认标题:「周X时段的会议」。列表副标题已有精确「日期时间 · 时长」,标题再放
 /// 数字时间戳就是逐字重复(冒烟反馈)——标题承载人话语义,精确时间交给副标题。
 pub fn default_title(now: &DateTime<Local>) -> String {
-    let wd = ["一", "二", "三", "四", "五", "六", "日"]
-        [now.weekday().num_days_from_monday() as usize];
+    let wd =
+        ["一", "二", "三", "四", "五", "六", "日"][now.weekday().num_days_from_monday() as usize];
     let slot = match now.hour() {
         0..=4 => "凌晨",
         5..=8 => "早上",
@@ -126,7 +129,9 @@ impl NoteWriter {
         // 全部重试仍拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::acquire(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始")
+            })?;
         let meta = NoteMeta {
             schema_version: SCHEMA_VERSION,
             id: id.clone(),
@@ -169,7 +174,9 @@ impl NoteWriter {
         // 全部重试仍拿不到说明另一实例正占着本笔记。
         let lock = super::notelock::NoteLock::acquire(&dir)
             .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),无法开始")
+            })?;
 
         let meta_str = std::fs::read_to_string(dir.join("meta.json"))
             .map_err(|e| anyhow::anyhow!("读 meta.json 失败: {e}"))?;
@@ -189,10 +196,11 @@ impl NoteWriter {
             }
         }
 
-        let speakers: BTreeMap<String, SpeakerMeta> = std::fs::read_to_string(dir.join("speakers.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let speakers: BTreeMap<String, SpeakerMeta> =
+            std::fs::read_to_string(dir.join("speakers.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -254,7 +262,13 @@ impl NoteWriter {
     pub fn set_speaker_name(&mut self, id: &str, name: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
+            .or_insert_with(|| SpeakerMeta {
+                name: String::new(),
+                sources: Vec::new(),
+                centroid: None,
+                count: 0,
+                person_id: None,
+            })
             .name = name.to_string();
     }
 
@@ -265,7 +279,13 @@ impl NoteWriter {
     pub fn set_speaker_person(&mut self, id: &str, person: &str) {
         self.speakers
             .entry(id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
+            .or_insert_with(|| SpeakerMeta {
+                name: String::new(),
+                sources: Vec::new(),
+                centroid: None,
+                count: 0,
+                person_id: None,
+            })
             .person_id = Some(person.to_string());
     }
 
@@ -406,7 +426,13 @@ impl NoteWriter {
         for (id, sources) in infos {
             let entry = self.speakers.entry(id.clone()).or_insert_with(|| {
                 changed = true;
-                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None }
+                SpeakerMeta {
+                    name: String::new(),
+                    sources: Vec::new(),
+                    centroid: None,
+                    count: 0,
+                    person_id: None,
+                }
             });
             for s in sources {
                 if !entry.sources.contains(s) {
@@ -456,10 +482,16 @@ impl NoteWriter {
         self.file = None;
 
         if let Some(loser_meta) = self.speakers.remove(loser) {
-            let winner_entry = self
-                .speakers
-                .entry(winner.to_string())
-                .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None });
+            let winner_entry =
+                self.speakers
+                    .entry(winner.to_string())
+                    .or_insert_with(|| SpeakerMeta {
+                        name: String::new(),
+                        sources: Vec::new(),
+                        centroid: None,
+                        count: 0,
+                        person_id: None,
+                    });
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
             }
@@ -543,10 +575,9 @@ impl NoteWriter {
         Ok(())
     }
 
-    /// 追溯撤回一条已落盘段(回声段事后被 system 定稿确认):按 (source, start_ms,
-    /// end_ms, text) 精确匹配,只删首个命中行。与 merge_speaker 同一套安全姿势:
-    /// 先 flush 保证 jsonl 完整;读失败中止(绝不能把整场转写覆写成空);不可解析行
-    /// 原样保留;临时文件原子替换后丢弃旧句柄。无命中(已被编辑/删除)静默成功。
+    /// 追溯抑制一条已落盘回声段。按 (source,start,end,text) 找首个尚未抑制的段，
+    /// 只向 sidecar 追加 seq+reason；`segments.jsonl` 永不删除，默认读取视图应用
+    /// sidecar 隐藏，诊断/恢复仍能取得原始段。无命中或已抑制时静默成功。
     pub fn retract_segment(
         &mut self,
         source: &str,
@@ -558,32 +589,40 @@ impl NoteWriter {
         let path = self.dir.join("segments.jsonl");
         let content = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（撤回中止，避免清空）: {e}"))?;
-        let mut out = String::new();
-        let mut removed = false;
+        let suppression_path = self.dir.join(SEGMENT_SUPPRESSIONS_FILE);
+        let existing: std::collections::BTreeSet<u64> = std::fs::read_to_string(&suppression_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SegmentSuppression>(line).ok())
+            .map(|record| record.seq)
+            .collect();
+        let mut matched_seq = None;
         for line in content.lines() {
-            if !removed {
-                if let Ok(rec) = serde_json::from_str::<SegmentRecord>(line) {
-                    if rec.source == source
-                        && rec.start_ms == start_ms
-                        && rec.end_ms == end_ms
-                        && rec.text == text
-                    {
-                        removed = true;
-                        continue; // 命中:跳过该行 = 删除
-                    }
+            if let Ok(rec) = serde_json::from_str::<SegmentRecord>(line) {
+                if !existing.contains(&rec.seq)
+                    && rec.source == source
+                    && rec.start_ms == start_ms
+                    && rec.end_ms == end_ms
+                    && rec.text == text
+                {
+                    matched_seq = Some(rec.seq);
+                    break;
                 }
             }
-            out.push_str(line);
-            out.push('\n');
         }
-        if !removed {
+        let Some(seq) = matched_seq else {
             return Ok(()); // 已被用户编辑/删除:无事可做,不动文件
-        }
-        let tmp = self.dir.join("segments.jsonl.tmp");
-        std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, &path)?;
-        // 同 merge_speaker:重写替换了磁盘文件,旧句柄指向被替换前的 inode,丢弃待重开。
-        self.file = None;
+        };
+        let record = SegmentSuppression {
+            seq,
+            reason: "echo_retract".into(),
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(suppression_path)?;
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        file.flush()?;
         Ok(())
     }
 
@@ -645,16 +684,20 @@ mod tests {
         let base = default_title(&n);
         assert_eq!(load_meta(tmp.path(), w1.note_id()).title, base);
         let w2 = NoteWriter::create(tmp.path(), n).unwrap();
-        assert_eq!(load_meta(tmp.path(), w2.note_id()).title, format!("{base} 2"));
+        assert_eq!(
+            load_meta(tmp.path(), w2.note_id()).title,
+            format!("{base} 2")
+        );
         let w3 = NoteWriter::create(tmp.path(), n).unwrap();
-        assert_eq!(load_meta(tmp.path(), w3.note_id()).title, format!("{base} 3"));
+        assert_eq!(
+            load_meta(tmp.path(), w3.note_id()).title,
+            format!("{base} 3")
+        );
     }
 
     fn load_meta(root: &std::path::Path, id: &str) -> NoteMeta {
-        serde_json::from_str(
-            &std::fs::read_to_string(root.join(id).join("meta.json")).unwrap(),
-        )
-        .unwrap()
+        serde_json::from_str(&std::fs::read_to_string(root.join(id).join("meta.json")).unwrap())
+            .unwrap()
     }
 
     fn read_meta(dir: &std::path::Path) -> NoteMeta {
@@ -690,8 +733,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         assert!(!w.has_content());
-        w.append_final("mic", "第一句", 0, 1500, None, None).unwrap();
-        w.append_final("system", "second", 1500, 3000, None, None).unwrap();
+        w.append_final("mic", "第一句", 0, 1500, None, None)
+            .unwrap();
+        w.append_final("system", "second", 1500, 3000, None, None)
+            .unwrap();
         assert!(w.has_content());
 
         let lines = read_lines(w.dir());
@@ -720,11 +765,14 @@ mod tests {
         // 模拟句柄失效 + 目录消失：追加必须失败但段保留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "丢不得", 0, 1000, None, None).is_err());
+        assert!(w
+            .append_final("mic", "丢不得", 0, 1000, None, None)
+            .is_err());
 
         // 目录恢复后，下一次追加把队列里的段一并补写
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000, None, None).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None, None)
+            .unwrap();
         let lines = read_lines(&dir);
         assert_eq!(lines.len(), 2, "失败段重试补写，一段不丢");
         let r0: crate::store::SegmentRecord = serde_json::from_str(&lines[0]).unwrap();
@@ -745,7 +793,9 @@ mod tests {
         // 模拟句柄失效 + 目录消失：append 必须失败，段留在待写队列
         w.file = None;
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(w.append_final("mic", "会丢失吗", 0, 1000, None, None).is_err());
+        assert!(w
+            .append_final("mic", "会丢失吗", 0, 1000, None, None)
+            .is_err());
 
         // 目录仍不存在：finalize 应失败，且不得把 state 标记为 complete
         // （此时磁盘上连 meta.json 都不存在，正是"不诚实的 complete"要避免的场景）。
@@ -754,7 +804,8 @@ mod tests {
         // 目录恢复后：finalize 应能补写队列并把 meta 正常置 complete，
         // 验证"失败不置 complete、恢复后可补救"的语义。
         std::fs::create_dir_all(&dir).unwrap();
-        w.append_final("mic", "第二句", 1000, 2000, None, None).unwrap();
+        w.append_final("mic", "第二句", 1000, 2000, None, None)
+            .unwrap();
         w.finalize(now()).unwrap();
 
         let meta = read_meta(&dir);
@@ -793,7 +844,10 @@ mod tests {
         struct CountingRecognizer;
         impl crate::asr::Recognizer for CountingRecognizer {
             fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
-                Ok(crate::asr::Transcript { text: format!("len={}", s.len()), ..Default::default() })
+                Ok(crate::asr::Transcript {
+                    text: format!("len={}", s.len()),
+                    ..Default::default()
+                })
             }
         }
 
@@ -807,8 +861,11 @@ mod tests {
             "/tests/fixtures/sample_16k.wav"
         ))
         .expect("fixture");
-        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> =
-            vec![(Source::Mic, Box::new(cap), Box::new(MockSegmenter::new(2000)))];
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
+            Source::Mic,
+            Box::new(cap),
+            Box::new(MockSegmenter::new(2000)),
+        )];
 
         let (w2, e2) = (writer.clone(), emitted.clone());
         let start = crate::session::start_session(
@@ -817,7 +874,7 @@ mod tests {
             None,
             crate::diar::registry::SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
-            true, // language_filter: 既有测试语义不变(过滤开)
+            true,                                 // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -840,9 +897,21 @@ mod tests {
         let n = *emitted.lock().unwrap();
         assert!(n > 0, "fixture 应产出至少一个 final");
         let note = NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
-        assert_eq!(note.segments.len(), n, "jsonl 行数 = final 事件数，一段不丢");
-        assert!(note.segments.windows(2).all(|w| w[1].seq == w[0].seq + 1), "seq 单调");
-        assert!(note.segments.windows(2).all(|w| w[1].start_ms >= w[0].start_ms), "时间戳单调");
+        assert_eq!(
+            note.segments.len(),
+            n,
+            "jsonl 行数 = final 事件数，一段不丢"
+        );
+        assert!(
+            note.segments.windows(2).all(|w| w[1].seq == w[0].seq + 1),
+            "seq 单调"
+        );
+        assert!(
+            note.segments
+                .windows(2)
+                .all(|w| w[1].start_ms >= w[0].start_ms),
+            "时间戳单调"
+        );
         assert_eq!(note.meta.state, "complete");
         assert_eq!(note.skipped_lines, 0);
     }
@@ -852,19 +921,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
-        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None)
+            .unwrap();
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["system".into()]),
+        ])
+        .unwrap();
         // 合并 S2 → S1：jsonl 重写 + speakers 表收缩
         w.merge_speaker("S2", "S1").unwrap();
         w.finalize(now()).unwrap();
 
         let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
         let note = store.load(&id).unwrap();
-        assert!(note.segments.iter().all(|s| s.speaker.as_deref() == Some("S1")), "S2 段已重写为 S1");
+        assert!(
+            note.segments
+                .iter()
+                .all(|s| s.speaker.as_deref() == Some("S1")),
+            "S2 段已重写为 S1"
+        );
         assert!(note.speakers.contains_key("S1"));
         assert!(!note.speakers.contains_key("S2"));
-        assert!(note.speakers["S1"].sources.contains(&"system".to_string()), "sources 并入");
+        assert!(
+            note.speakers["S1"].sources.contains(&"system".to_string()),
+            "sources 并入"
+        );
     }
 
     #[test]
@@ -872,22 +955,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
-        w.append_final("mic", "乙说", 2000, 4000, Some("S2"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.append_final("mic", "乙说", 2000, 4000, Some("S2"), None)
+            .unwrap();
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["mic".into()]),
+        ])
+        .unwrap();
         // 传递合并:S2→S3、S3→S1。随后一条带 S2 旧标签的在途段在重写之后才落盘,
         // 复现合并重写与在途段(如回声 hold 队列)的竞态孤儿。
-        w.sync_speakers(&[("S3".into(), vec!["mic".into()])]).unwrap();
+        w.sync_speakers(&[("S3".into(), vec!["mic".into()])])
+            .unwrap();
         w.merge_speaker("S2", "S3").unwrap();
         w.merge_speaker("S3", "S1").unwrap();
-        w.append_final("mic", "迟到的在途段", 4000, 6000, Some("S2"), None).unwrap();
+        w.append_final("mic", "迟到的在途段", 4000, 6000, Some("S2"), None)
+            .unwrap();
         w.finalize(now()).unwrap();
 
-        let note = crate::store::NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
+        let note = crate::store::NoteStore::new(tmp.path().to_path_buf())
+            .load(&id)
+            .unwrap();
         assert!(
-            note.segments.iter().all(|s| s.speaker.as_deref() == Some("S1")),
+            note.segments
+                .iter()
+                .all(|s| s.speaker.as_deref() == Some("S1")),
             "孤儿 S2 段应沿合并史(S2→S3→S1)追认为 S1: {:?}",
-            note.segments.iter().map(|s| s.speaker.clone()).collect::<Vec<_>>()
+            note.segments
+                .iter()
+                .map(|s| s.speaker.clone())
+                .collect::<Vec<_>>()
         );
         assert!(!note.speakers.contains_key("S2"), "不应为可追溯孤儿补表项");
         assert!(!note.speakers.contains_key("S3"));
@@ -898,55 +996,98 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
         // S9 无合并史可追(如续录前旧场次残留):补空表项保证表段一致,段不改写。
-        w.append_final("mic", "来历不明", 2000, 4000, Some("S9"), None).unwrap();
+        w.append_final("mic", "来历不明", 2000, 4000, Some("S9"), None)
+            .unwrap();
         w.finalize(now()).unwrap();
 
-        let note = crate::store::NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
-        assert_eq!(note.segments[1].speaker.as_deref(), Some("S9"), "无从追溯的段保持原标签");
+        let note = crate::store::NoteStore::new(tmp.path().to_path_buf())
+            .load(&id)
+            .unwrap();
+        assert_eq!(
+            note.segments[1].speaker.as_deref(),
+            Some("S9"),
+            "无从追溯的段保持原标签"
+        );
         let s9 = note.speakers.get("S9").expect("应为 S9 补空表项");
         assert!(s9.name.is_empty());
         assert_eq!(s9.sources, vec!["mic".to_string()]);
     }
 
     #[test]
-    fn retract_segment_removes_exact_match_only_and_tolerates_missing() {
+    fn retract_segment_hides_exact_match_but_preserves_raw_record() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "回声段", 100, 900, None, Some(0.1)).unwrap();
-        w.append_final("system", "回声段", 100, 900, None, None).unwrap();
-        w.append_final("mic", "真实发言", 1000, 1900, None, None).unwrap();
+        w.append_final("mic", "回声段", 100, 900, None, Some(0.1))
+            .unwrap();
+        w.append_final("system", "回声段", 100, 900, None, None)
+            .unwrap();
+        w.append_final("mic", "真实发言", 1000, 1900, None, None)
+            .unwrap();
 
-        // 精确命中(source+start+end+text):只删那一行,同文本的 system 行不受影响。
+        // 精确命中(source+start+end+text):默认视图隐藏，原始 jsonl 一行不删。
         w.retract_segment("mic", 100, 900, "回声段").unwrap();
+        let raw = std::fs::read_to_string(w.dir().join("segments.jsonl")).unwrap();
+        assert_eq!(raw.lines().count(), 3, "自动回声判断不得物理删除原始段");
         let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
         let note = store.load(&id).unwrap();
         assert_eq!(note.segments.len(), 2);
-        assert!(note.segments.iter().all(|s| !(s.source == "mic" && s.text == "回声段")));
-        assert!(note.segments.iter().any(|s| s.source == "system" && s.text == "回声段"), "同文本 system 行保留");
+        assert_eq!(note.suppressed_segments.len(), 1);
+        assert_eq!(note.suppressed_segments[0].text, "回声段");
+        assert_eq!(note.suppressed_segments[0].source, "mic");
+        assert!(note
+            .segments
+            .iter()
+            .all(|s| !(s.source == "mic" && s.text == "回声段")));
+        assert!(
+            note.segments
+                .iter()
+                .any(|s| s.source == "system" && s.text == "回声段"),
+            "同文本 system 行保留"
+        );
         assert!(note.segments.iter().any(|s| s.text == "真实发言"));
 
         // 无命中(已被编辑/删除):静默成功,文件不动。
         w.retract_segment("mic", 100, 900, "回声段").unwrap();
         assert_eq!(store.load(&id).unwrap().segments.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(w.dir().join(SEGMENT_SUPPRESSIONS_FILE))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "重复撤回不得追加重复抑制记录"
+        );
 
         // 撤回后继续追加:句柄重开,seq 续接不冲突。
-        w.append_final("mic", "后续", 2000, 2900, None, None).unwrap();
+        w.append_final("mic", "后续", 2000, 2900, None, None)
+            .unwrap();
         let note = store.load(&id).unwrap();
         assert_eq!(note.segments.len(), 3);
-        assert!(note.segments.windows(2).all(|p| p[1].seq > p[0].seq), "seq 仍单调");
+        assert!(
+            note.segments.windows(2).all(|p| p[1].seq > p[0].seq),
+            "seq 仍单调"
+        );
     }
 
     #[test]
     fn merge_speaker_read_failure_leaves_data_intact() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
-        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()]), ("S2".into(), vec!["system".into()])]).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.append_final("system", "乙说", 2000, 4000, Some("S2"), None)
+            .unwrap();
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["system".into()]),
+        ])
+        .unwrap();
 
         // 构造读失败：丢弃句柄、删掉 segments.jsonl 并在同名处建目录，
         // read_to_string 必失败（"Is a directory"）。
@@ -956,8 +1097,14 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         // 合并必须返回 Err 且不 panic；内存 speakers 表不得已被修改（S2 仍在）。
-        assert!(w.merge_speaker("S2", "S1").is_err(), "读失败应中止合并而非清空");
-        assert!(w.speakers().contains_key("S2"), "Err 路径下 speakers 表未被改动");
+        assert!(
+            w.merge_speaker("S2", "S1").is_err(),
+            "读失败应中止合并而非清空"
+        );
+        assert!(
+            w.speakers().contains_key("S2"),
+            "Err 路径下 speakers 表未被改动"
+        );
         assert!(w.speakers().contains_key("S1"));
 
         // 恢复（删目录）后不再触发路径存在的清空——重点是上面的 Err 与不 panic。
@@ -969,8 +1116,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "甲说", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
 
         // set_speaker_name + persist_speakers 后重开 NoteStore.load，名字应在磁盘上。
         w.set_speaker_name("S1", "张三");
@@ -982,7 +1131,10 @@ mod tests {
         w.set_speaker_name("S1", "李四");
         w.finalize(now()).unwrap();
         let note = store.load(&id).unwrap();
-        assert_eq!(note.speakers["S1"].name, "李四", "finalize 兜底落盘 speakers");
+        assert_eq!(
+            note.speakers["S1"].name, "李四",
+            "finalize 兜底落盘 speakers"
+        );
         assert_eq!(note.speakers, *w.speakers(), "speakers.json 与内存一致");
     }
 
@@ -991,7 +1143,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
 
         // store_centroids 只 merge 质心/count,不落盘;显式 persist_speakers 后重读应在。
         w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
@@ -1038,7 +1191,10 @@ mod tests {
             person: Some("P1".into()),
             total_ms: 0,
         }]);
-        assert!(!w.speakers().contains_key("S9"), "未命中种子(sources 为空)不建表项");
+        assert!(
+            !w.speakers().contains_key("S9"),
+            "未命中种子(sources 为空)不建表项"
+        );
     }
 
     #[test]
@@ -1056,7 +1212,11 @@ mod tests {
         }]);
         let s7 = &w.speakers()["S7"];
         assert_eq!(s7.name, "", "新建项 name 空串");
-        assert_eq!(s7.sources, vec!["system".to_string()], "新建项 sources 取快照");
+        assert_eq!(
+            s7.sources,
+            vec!["system".to_string()],
+            "新建项 sources 取快照"
+        );
         assert_eq!(s7.centroid, Some(vec![1.0, 0.0]));
         assert_eq!(s7.count, 2);
     }
@@ -1065,7 +1225,8 @@ mod tests {
     fn store_centroids_existing_entry_only_merges_centroid_and_count() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
         w.set_speaker_name("S1", "张三");
 
         w.store_centroids(&[crate::diar::registry::ClusterSnapshot {
@@ -1078,7 +1239,11 @@ mod tests {
         }]);
         let s1 = &w.speakers()["S1"];
         assert_eq!(s1.name, "张三", "已有表项 name 不受影响");
-        assert_eq!(s1.sources, vec!["mic".to_string()], "已有表项 sources 不受快照影响");
+        assert_eq!(
+            s1.sources,
+            vec!["mic".to_string()],
+            "已有表项 sources 不受快照影响"
+        );
         assert_eq!(s1.centroid, Some(vec![0.5, 0.5]));
         assert_eq!(s1.count, 9);
     }
@@ -1127,15 +1292,26 @@ mod tests {
             person: Some("P1".into()),
             total_ms: 0,
         }]);
-        assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P1"), "store_centroids 应回填 person_id");
+        assert_eq!(
+            w.speakers()["S1"].person_id.as_deref(),
+            Some("P1"),
+            "store_centroids 应回填 person_id"
+        );
         w.finalize(now()).unwrap();
         drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         let resumed = NoteWriter::resume(tmp.path(), &id).unwrap();
         let snaps = resumed.registry_snapshot();
         let s1 = snaps.iter().find(|s| s.id == "S1").unwrap();
-        assert_eq!(s1.person, Some("P1".to_string()), "续录快照应恢复 person 关联");
-        assert_eq!(s1.total_ms, 0, "registry_snapshot 的 total_ms 恒 0（本场续录快照，非库计时）");
+        assert_eq!(
+            s1.person,
+            Some("P1".to_string()),
+            "续录快照应恢复 person 关联"
+        );
+        assert_eq!(
+            s1.total_ms, 0,
+            "registry_snapshot 的 total_ms 恒 0（本场续录快照，非库计时）"
+        );
 
         // 再喂一次不带 person 的快照（种子未命中/悬空）：既有 person_id 不应被清空。
         let mut resumed = resumed;
@@ -1147,7 +1323,11 @@ mod tests {
             person: None,
             total_ms: 0,
         }]);
-        assert_eq!(resumed.speakers()["S1"].person_id.as_deref(), Some("P1"), "snap.person=None 不清空既有关联");
+        assert_eq!(
+            resumed.speakers()["S1"].person_id.as_deref(),
+            Some("P1"),
+            "snap.person=None 不清空既有关联"
+        );
     }
 
     /// set_speaker_person：既有项设值、缺项自动建（同 set_speaker_name 模式）。
@@ -1155,7 +1335,8 @@ mod tests {
     fn set_speaker_person_updates_existing_and_creates_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
 
         w.set_speaker_person("S1", "P1");
         assert_eq!(w.speakers()["S1"].person_id.as_deref(), Some("P1"));
@@ -1194,7 +1375,11 @@ mod tests {
             v
         };
         let id = registry.assign(&long, "mic", 48000 /* 3s，够长建簇 */);
-        assert_eq!(id, Some("S3".into()), "新说话人编号应续接旧笔记的最大 id，不撞旧 id");
+        assert_eq!(
+            id,
+            Some("S3".into()),
+            "新说话人编号应续接旧笔记的最大 id，不撞旧 id"
+        );
     }
 
     #[test]
@@ -1209,11 +1394,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        assert!(w.created_this_session(), "create() 应设 created_this_session=true");
+        assert!(
+            w.created_this_session(),
+            "create() 应设 created_this_session=true"
+        );
         drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
         let r = NoteWriter::resume(tmp.path(), &id).unwrap();
-        assert!(!r.created_this_session(), "resume() 应设 created_this_session=false");
+        assert!(
+            !r.created_this_session(),
+            "resume() 应设 created_this_session=false"
+        );
     }
 
     #[test]
@@ -1221,9 +1412,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "第一句", 0, 1500, None, None).unwrap();
-        w.append_final("system", "第二句", 1500, 3000, None, None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "第一句", 0, 1500, None, None)
+            .unwrap();
+        w.append_final("system", "第二句", 1500, 3000, None, None)
+            .unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
         w.finalize(now()).unwrap();
         assert_eq!(read_meta(&tmp.path().join(&id)).state, "complete");
         drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
@@ -1234,10 +1428,14 @@ mod tests {
         let meta = read_meta(r.dir());
         assert_eq!(meta.state, "recording", "resume 后 meta 翻回 recording");
         assert!(meta.ended_at.is_none(), "resume 后 ended_at 清空");
-        assert!(r.speakers().contains_key("S1"), "speakers.json 应加载进内存表");
+        assert!(
+            r.speakers().contains_key("S1"),
+            "speakers.json 应加载进内存表"
+        );
 
         // resume 后追加：seq 应从 2 续接（此前两段 seq=0,1）。
-        r.append_final("mic", "第三句", 0, 1000, None, None).unwrap();
+        r.append_final("mic", "第三句", 0, 1000, None, None)
+            .unwrap();
         let lines = read_lines(r.dir());
         assert_eq!(lines.len(), 3);
         let rec2: SegmentRecord = serde_json::from_str(&lines[2]).unwrap();
@@ -1265,7 +1463,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "完整句", 0, 1000, None, None).unwrap();
+        w.append_final("mic", "完整句", 0, 1000, None, None)
+            .unwrap();
         w.finalize(now()).unwrap();
         drop(w); // writer 持锁到 Drop:释放目录锁后 resume 才能取锁
 
@@ -1279,12 +1478,19 @@ mod tests {
         drop(f);
 
         let mut r = NoteWriter::resume(tmp.path(), &id).unwrap();
-        assert_eq!(r.base_ms(), 1000, "损坏尾行应被跳过，base_ms 取最大可解析 end_ms");
+        assert_eq!(
+            r.base_ms(),
+            1000,
+            "损坏尾行应被跳过，base_ms 取最大可解析 end_ms"
+        );
         r.append_final("mic", "续录句", 0, 500, None, None).unwrap();
         // 续录追加的段 seq 应为 1（唯一可解析的前段 seq=0）——证明 next_seq 未被半行干扰到 2。
         let lines = read_lines(r.dir());
         let appended: SegmentRecord = serde_json::from_str(lines.last().unwrap()).unwrap();
-        assert_eq!(appended.seq, 1, "next_seq 应据可解析行计算，不被截断尾行带偏");
+        assert_eq!(
+            appended.seq, 1,
+            "next_seq 应据可解析行计算，不被截断尾行带偏"
+        );
     }
 
     #[test]
@@ -1303,15 +1509,24 @@ mod tests {
         // 但测的就不再是「meta 损坏 → Err」这条本意路径了。
         drop(w);
         std::fs::write(tmp.path().join(&id).join("meta.json"), "not json").unwrap();
-        let err = NoteWriter::resume(tmp.path(), &id).err().expect("meta 损坏应 Err").to_string();
-        assert!(err.contains("meta.json 解析失败"), "应因 meta 损坏而拒,实际: {err}");
+        let err = NoteWriter::resume(tmp.path(), &id)
+            .err()
+            .expect("meta 损坏应 Err")
+            .to_string();
+        assert!(
+            err.contains("meta.json 解析失败"),
+            "应因 meta 损坏而拒,实际: {err}"
+        );
     }
 
     #[test]
     fn resume_rejects_path_traversal_ids() {
         let tmp = tempfile::tempdir().unwrap();
         for bad in ["../x", "a/b", "a\\b", "..", ""] {
-            assert!(NoteWriter::resume(tmp.path(), bad).is_err(), "应拒绝非法 id: {bad}");
+            assert!(
+                NoteWriter::resume(tmp.path(), bad).is_err(),
+                "应拒绝非法 id: {bad}"
+            );
         }
     }
 
@@ -1320,8 +1535,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "有能量", 0, 900, None, Some(0.123)).unwrap();
-        w.append_final("mic", "无能量数据", 1000, 1900, None, None).unwrap();
+        w.append_final("mic", "有能量", 0, 900, None, Some(0.123))
+            .unwrap();
+        w.append_final("mic", "无能量数据", 1000, 1900, None, None)
+            .unwrap();
         w.finalize(chrono::Local::now()).unwrap();
         let store = crate::store::NoteStore::new(tmp.path().to_path_buf());
         let n = store.load(&id).unwrap();
@@ -1348,7 +1565,10 @@ mod tests {
         struct CountingRecognizer;
         impl crate::asr::Recognizer for CountingRecognizer {
             fn recognize(&mut self, s: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
-                Ok(crate::asr::Transcript { text: format!("len={}", s.len()), ..Default::default() })
+                Ok(crate::asr::Transcript {
+                    text: format!("len={}", s.len()),
+                    ..Default::default()
+                })
             }
         }
 
@@ -1358,7 +1578,11 @@ mod tests {
                 "/tests/fixtures/sample_16k.wav"
             ))
             .expect("fixture");
-            vec![(Source::Mic, Box::new(cap), Box::new(MockSegmenter::new(2000)))]
+            vec![(
+                Source::Mic,
+                Box::new(cap),
+                Box::new(MockSegmenter::new(2000)),
+            )]
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1373,7 +1597,7 @@ mod tests {
             None,
             SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
-            true, // language_filter: 既有测试语义不变(过滤开)
+            true,                                 // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -1411,7 +1635,7 @@ mod tests {
             None,
             SpeakerRegistry::from_snapshot(&writer2.lock().unwrap().registry_snapshot()),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
-            true, // language_filter: 既有测试语义不变(过滤开)
+            true,                                 // language_filter: 既有测试语义不变(过滤开)
             16000,
             4000,
             vec![],
@@ -1419,7 +1643,14 @@ mod tests {
             move |src, text, start_ms, end_ms, spk, rms| {
                 w3.lock()
                     .unwrap()
-                    .append_final(src.as_str(), &text, start_ms + base_ms, end_ms + base_ms, spk.as_deref(), rms)
+                    .append_final(
+                        src.as_str(),
+                        &text,
+                        start_ms + base_ms,
+                        end_ms + base_ms,
+                        spk.as_deref(),
+                        rms,
+                    )
                     .unwrap();
             },
             |_, _| {},
@@ -1431,7 +1662,11 @@ mod tests {
         writer2.lock().unwrap().finalize(now()).unwrap();
 
         let note = store.load(&id).unwrap();
-        assert_eq!(note.segments.len(), n * 2, "N+M 段一段不丢（同一 fixture，M=N）");
+        assert_eq!(
+            note.segments.len(),
+            n * 2,
+            "N+M 段一段不丢（同一 fixture，M=N）"
+        );
         assert!(
             note.segments.windows(2).all(|w| w[1].seq == w[0].seq + 1),
             "seq 跨会话仍单调续接"
@@ -1440,7 +1675,10 @@ mod tests {
             note.segments[n..].iter().all(|s| s.start_ms >= base_ms),
             "续录段 start_ms 均 ≥ base_ms（时间轴连续）"
         );
-        assert_eq!(note.meta.state, "complete", "续录后 stop 仍正常收尾为 complete");
+        assert_eq!(
+            note.meta.state, "complete",
+            "续录后 stop 仍正常收尾为 complete"
+        );
     }
 
     #[test]
@@ -1449,9 +1687,13 @@ mod tests {
         let w = NoteWriter::create(dir.path(), chrono::Local::now()).unwrap();
         let note_dir = w.dir().to_path_buf();
         // 会话期间:任何人拿不到锁
-        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir).unwrap().is_none());
+        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir)
+            .unwrap()
+            .is_none());
         drop(w);
         // writer 落幕:锁释放
-        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir).unwrap().is_some());
+        assert!(crate::store::notelock::NoteLock::try_exclusive(&note_dir)
+            .unwrap()
+            .is_some());
     }
 }

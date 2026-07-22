@@ -33,6 +33,8 @@ export type SegmentRecord = {
 export type Note = {
   meta: NoteMeta;
   segments: SegmentRecord[];
+  /** 自动规则隐藏但仍保留在原始转写中的段，用于诊断与恢复。 */
+  suppressed_segments: SegmentRecord[];
   skipped_lines: number;
   // centroid/count 是后端质心快照（P4.5 续录铺底），person_id 是关联的全局声纹库
   // 人物 id（P5.5 铺底），随 get_note 下发；前端目前不消费这三者，仅补齐类型以

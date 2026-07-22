@@ -1,6 +1,6 @@
 use super::{
     write_meta_atomic, write_speakers_atomic, Note, NoteMeta, NoteSummary, SegmentRecord,
-    SpeakerMeta, SCHEMA_VERSION,
+    SegmentSuppression, SpeakerMeta, SCHEMA_VERSION, SEGMENT_SUPPRESSIONS_FILE,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn edit_guard() -> std::sync::MutexGuard<'static, ()> {
-    EDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    EDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// 编辑前的跨进程写锁:录制会话(本进程或另一实例)持锁期间,一切整表
@@ -29,7 +31,9 @@ fn write_lock(dir: &Path) -> anyhow::Result<super::notelock::NoteLock> {
     // 有界重试获取(见 NoteLock::acquire):吸收非阻塞 flock 在瞬时竞争下的假性占用。
     super::notelock::NoteLock::acquire(dir)
         .map_err(|e| anyhow::anyhow!("笔记目录锁不可用: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),请稍后再试"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("该笔记正被占用(录制或转码中,可能来自另一个应用实例),请稍后再试")
+        })
 }
 
 /// load 结果记忆化。详情页切换会议会反复对同一 id 调 load(切走再切回、编辑后
@@ -61,14 +65,20 @@ const MAX_END_CACHE_CAP: usize = 8192;
 /// 单文件签名:(mtime 纳秒, 字节数)。文件缺失 → None(缺失本身也是签名的一部分:
 /// speakers.json 从无到有、声纹库被删都能触发失配)。
 type FileSig = Option<(u128, u64)>;
-/// (meta.json, segments.jsonl, speakers.json, voiceprints.json) 四源签名——
+/// (meta.json, segments.jsonl, segment-suppressions.jsonl, speakers.json,
+/// voiceprints.json) 五源签名——
 /// 覆盖 load 读到的全部文件,任一被写(改名写 meta.json、编辑写 segments/speakers、
 /// 声纹库合并)签名即失配,不会还出陈旧标题/内容。
-type LoadSig = (FileSig, FileSig, FileSig, FileSig);
+type LoadSig = (FileSig, FileSig, FileSig, FileSig, FileSig);
 
 fn file_sig(path: &Path) -> FileSig {
     let md = fs::metadata(path).ok()?;
-    let mtime = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     Some((mtime, md.len()))
 }
 
@@ -109,11 +119,12 @@ impl NoteStore {
 
     pub fn load(&self, id: &str) -> anyhow::Result<Note> {
         let dir = self.note_dir(id)?;
-        // 签名基于 load 真正读的三个文件;命中且签名未变直接还缓存副本,省掉全量解析。
+        // 签名覆盖 load 真正读取的文件；命中且签名未变直接还缓存副本，省掉全量解析。
         let vp_path = self.notes_dir.parent().map(|p| p.join("voiceprints.json"));
         let sig: LoadSig = (
             file_sig(&dir.join("meta.json")),
             file_sig(&dir.join("segments.jsonl")),
+            file_sig(&dir.join(SEGMENT_SUPPRESSIONS_FILE)),
             file_sig(&dir.join("speakers.json")),
             vp_path.as_deref().map(file_sig).unwrap_or(None),
         );
@@ -141,15 +152,32 @@ impl NoteStore {
                 }
             }
         }
-        // 读侧单一真值源:过滤空白段 + 按 start_ms 稳定排序(同值按 seq),消除
+        let suppressed_seqs = read_suppressions(&dir);
+        let mut suppressed_segments = Vec::new();
+        segments.retain(|segment| {
+            if suppressed_seqs.contains(&segment.seq) {
+                suppressed_segments.push(segment.clone());
+                false
+            } else {
+                true
+            }
+        });
+        // 读侧单一真值源:应用可逆隐藏 + 过滤空白段 + 按 start_ms 稳定排序(同值按 seq),消除
         // ECHO hold 造成的落盘交错——详情页与导出共同继承此语义,防两处漂移。
         // 磁盘文件序不动:编辑重写走 read_jsonl_lines 原始行,续录 next_seq 由
         // writer 自扫 jsonl,均不经此处。空白段非损坏,不计 skipped_lines。
         segments.retain(|s| !s.text.trim().is_empty());
         segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
+        suppressed_segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
         let mut speakers = read_speakers(&dir);
         join_person_names(&self.notes_dir, &mut speakers);
-        let note = Note { meta, segments, skipped_lines, speakers };
+        let note = Note {
+            meta,
+            segments,
+            suppressed_segments,
+            skipped_lines,
+            speakers,
+        };
         {
             let mut cache = LOAD_CACHE.lock().unwrap();
             if cache.len() >= CACHE_CAP && !cache.contains_key(&cache_key) {
@@ -192,7 +220,13 @@ impl NoteStore {
         let mut speakers = read_speakers(&dir);
         speakers
             .entry(speaker_id.to_string())
-            .or_insert_with(|| SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None })
+            .or_insert_with(|| SpeakerMeta {
+                name: String::new(),
+                sources: Vec::new(),
+                centroid: None,
+                count: 0,
+                person_id: None,
+            })
             .name = name.to_string();
         write_speakers_atomic(&dir, &speakers)
     }
@@ -266,7 +300,11 @@ impl NoteStore {
         find_seg(&mut lines, seq, expected_text)?;
         let mut speakers = read_speakers(&dir);
         let target = if speaker_id == "new" {
-            let num = |s: &str| s.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            let num = |s: &str| {
+                s.strip_prefix('S')
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
             let max_known = speakers
                 .keys()
                 .map(|k| num(k))
@@ -279,7 +317,13 @@ impl NoteStore {
             let new_id = format!("S{}", max_known + 1);
             speakers.insert(
                 new_id.clone(),
-                SpeakerMeta { name: String::new(), sources: Vec::new(), centroid: None, count: 0, person_id: None },
+                SpeakerMeta {
+                    name: String::new(),
+                    sources: Vec::new(),
+                    centroid: None,
+                    count: 0,
+                    person_id: None,
+                },
             );
             write_speakers_atomic(&dir, &speakers)?;
             new_id
@@ -295,6 +339,18 @@ impl NoteStore {
     }
 }
 
+fn read_suppressions(dir: &Path) -> std::collections::BTreeSet<u64> {
+    let Ok(file) = fs::File::open(dir.join(SEGMENT_SUPPRESSIONS_FILE)) else {
+        return std::collections::BTreeSet::new();
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .filter_map(Result::ok)
+        .filter_map(|line| serde_json::from_str::<SegmentSuppression>(&line).ok())
+        .map(|record| record.seq)
+        .collect()
+}
+
 /// segments.jsonl 的一行：可解析段或损坏原文。编辑重写时损坏行原样保留（不丢数据）。
 enum JsonlLine {
     Seg(SegmentRecord),
@@ -302,7 +358,9 @@ enum JsonlLine {
 }
 
 fn read_jsonl_lines(path: &Path) -> Vec<JsonlLine> {
-    let Ok(f) = fs::File::open(path) else { return Vec::new() };
+    let Ok(f) = fs::File::open(path) else {
+        return Vec::new();
+    };
     std::io::BufReader::new(f)
         .lines()
         .filter_map(|l| l.ok())
@@ -369,12 +427,15 @@ fn join_person_names(notes_dir: &Path, speakers: &mut BTreeMap<String, SpeakerMe
     if !speakers.values().any(|m| m.person_id.is_some()) {
         return; // 没有待 join 的候选，不必碰声纹库文件
     }
-    let Some(root) = notes_dir.parent() else { return };
+    let Some(root) = notes_dir.parent() else {
+        return;
+    };
     let vp = super::VoiceprintStore::new(root.to_path_buf()).load();
     for meta in speakers.values_mut() {
-        let Some(person_id) = &meta.person_id else { continue };
-        let Some(resolved) =
-            super::VoiceprintStore::resolve(&vp, person_id).map(str::to_string)
+        let Some(person_id) = &meta.person_id else {
+            continue;
+        };
+        let Some(resolved) = super::VoiceprintStore::resolve(&vp, person_id).map(str::to_string)
         else {
             continue;
         };
@@ -421,7 +482,13 @@ fn summarize(dir: &Path) -> NoteSummary {
     // 不含暂停与尾部静默）；无可解析段落的完成会议回退墙钟时长。
     let duration_secs = max_end_ms(&dir.join("segments.jsonl"))
         .map(|ms| ms / 1000)
-        .or_else(|| if meta.state == "complete" { duration_from_meta(&meta) } else { None });
+        .or_else(|| {
+            if meta.state == "complete" {
+                duration_from_meta(&meta)
+            } else {
+                None
+            }
+        });
     NoteSummary {
         id: meta.id,
         title: meta.title,
@@ -484,7 +551,15 @@ mod tests {
         let mut w = NoteWriter::create(notes_dir, now()).unwrap();
         for (i, t) in texts.iter().enumerate() {
             let s = i as u64 * 1000;
-            w.append_final(if i % 2 == 0 { "mic" } else { "system" }, t, s, s + 900, None, None).unwrap();
+            w.append_final(
+                if i % 2 == 0 { "mic" } else { "system" },
+                t,
+                s,
+                s + 900,
+                None,
+                None,
+            )
+            .unwrap();
         }
         if finalize {
             w.finalize(now()).unwrap();
@@ -534,12 +609,20 @@ mod tests {
         let id = make_note(tmp.path(), &["一", "二"], false); // 末段 end_ms=1900 → 1s
         let store = NoteStore::new(tmp.path().to_path_buf());
         assert_eq!(store.list()[0].duration_secs, Some(1), "首次扫描");
-        assert_eq!(store.list()[0].duration_secs, Some(1), "再取命中缓存,值一致");
+        assert_eq!(
+            store.list()[0].duration_secs,
+            Some(1),
+            "再取命中缓存,值一致"
+        );
         // 续录追加更靠后的段:segments.jsonl 增长,签名变 → 重扫。
         let mut w = NoteWriter::resume(tmp.path(), &id).unwrap();
         w.append_final("mic", "三", 5000, 6000, None, None).unwrap();
         drop(w); // 保持中断态(不 finalize)
-        assert_eq!(store.list()[0].duration_secs, Some(6), "增长后按新末段(6000ms)刷新,缓存不粘旧值");
+        assert_eq!(
+            store.list()[0].duration_secs,
+            Some(6),
+            "增长后按新末段(6000ms)刷新,缓存不粘旧值"
+        );
     }
 
     #[test]
@@ -619,15 +702,21 @@ mod tests {
 
     /// 造带说话人的笔记：segs = (text, speaker)；known = 写入 speakers.json 的说话人表
     /// （与段内 speaker 解耦——测试需要「段里有、表里没有」的孤儿 id）。
-    fn make_spk_note(dir: &std::path::Path, segs: &[(&str, Option<&str>)], known: &[&str]) -> String {
+    fn make_spk_note(
+        dir: &std::path::Path,
+        segs: &[(&str, Option<&str>)],
+        known: &[&str],
+    ) -> String {
         let mut w = NoteWriter::create(dir, now()).unwrap();
         for (i, (t, spk)) in segs.iter().enumerate() {
             let s = i as u64 * 1000;
             w.append_final("mic", t, s, s + 900, *spk, None).unwrap();
         }
         if !known.is_empty() {
-            let pairs: Vec<(String, Vec<String>)> =
-                known.iter().map(|s| (s.to_string(), vec!["mic".to_string()])).collect();
+            let pairs: Vec<(String, Vec<String>)> = known
+                .iter()
+                .map(|s| (s.to_string(), vec!["mic".to_string()]))
+                .collect();
             w.sync_speakers(&pairs).unwrap();
         }
         w.finalize(now()).unwrap();
@@ -652,11 +741,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = make_spk_note(tmp.path(), &[("原文", None)], &[]);
         let store = NoteStore::new(tmp.path().to_path_buf());
-        let e = store.edit_segment_text(&id, 0, "别人已改过", "x").unwrap_err();
+        let e = store
+            .edit_segment_text(&id, 0, "别人已改过", "x")
+            .unwrap_err();
         assert!(e.to_string().contains("请刷新后重试"), "乐观冲突提示: {e}");
-        assert!(store.edit_segment_text(&id, 0, "原文", "   ").is_err(), "空文本拒绝");
-        assert!(store.edit_segment_text(&id, 99, "原文", "x").is_err(), "seq 不存在");
-        assert_eq!(store.load(&id).unwrap().segments[0].text, "原文", "拒绝路径不落盘");
+        assert!(
+            store.edit_segment_text(&id, 0, "原文", "   ").is_err(),
+            "空文本拒绝"
+        );
+        assert!(
+            store.edit_segment_text(&id, 99, "原文", "x").is_err(),
+            "seq 不存在"
+        );
+        assert_eq!(
+            store.load(&id).unwrap().segments[0].text,
+            "原文",
+            "拒绝路径不落盘"
+        );
     }
 
     #[test]
@@ -683,11 +784,18 @@ mod tests {
     fn set_segment_speaker_existing_new_and_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         // speakers.json 有 S1、S3；另有孤儿段 speaker=S5（表里没有）。
-        let id = make_spk_note(tmp.path(), &[("甲", Some("S1")), ("乙", Some("S3")), ("丙", Some("S5"))], &["S1", "S3"]);
+        let id = make_spk_note(
+            tmp.path(),
+            &[("甲", Some("S1")), ("乙", Some("S3")), ("丙", Some("S5"))],
+            &["S1", "S3"],
+        );
         let store = NoteStore::new(tmp.path().to_path_buf());
         // 改为既有说话人
         assert_eq!(store.set_segment_speaker(&id, 0, "甲", "S3").unwrap(), "S3");
-        assert_eq!(store.load(&id).unwrap().segments[0].speaker.as_deref(), Some("S3"));
+        assert_eq!(
+            store.load(&id).unwrap().segments[0].speaker.as_deref(),
+            Some("S3")
+        );
         // 未知说话人拒绝
         assert!(store.set_segment_speaker(&id, 0, "甲", "S99").is_err());
         // 新建：max 取 speakers 表(S1,S3,S5) 与段内(S5) 的并集 → S6
@@ -705,8 +813,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "x", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
         w.finalize(now()).unwrap();
         drop(w); // writer 持锁到 Drop:释放目录锁后编辑路径才能取锁
         let store = NoteStore::new(tmp.path().to_path_buf());
@@ -723,8 +833,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "x", 0, 2000, Some("S1"), None).unwrap();
-        w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+        w.append_final("mic", "x", 0, 2000, Some("S1"), None)
+            .unwrap();
+        w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+            .unwrap();
         w.finalize(now()).unwrap();
         drop(w); // writer 持锁到 Drop:释放目录锁后编辑路径才能取锁
         let store = NoteStore::new(tmp.path().to_path_buf());
@@ -732,8 +844,14 @@ mod tests {
         store.assign_speaker_person(&id, "S1", "P7").unwrap();
         // 直读盘上原始表(load 会做库 join,person 悬空时不动 name):person 已写、本地名已清。
         let raw = std::fs::read_to_string(tmp.path().join(&id).join("speakers.json")).unwrap();
-        assert!(raw.contains(r#""person_id": "P7""#) || raw.contains(r#""person_id":"P7""#), "{raw}");
-        assert!(!raw.contains("本地名"), "关联须清空本地改名,否则永远压过库名: {raw}");
+        assert!(
+            raw.contains(r#""person_id": "P7""#) || raw.contains(r#""person_id":"P7""#),
+            "{raw}"
+        );
+        assert!(
+            !raw.contains("本地名"),
+            "关联须清空本地改名,否则永远压过库名: {raw}"
+        );
         // 未知说话人拒绝,不凭空造表项。
         assert!(store.assign_speaker_person(&id, "S9", "P7").is_err());
     }
@@ -749,9 +867,12 @@ mod tests {
         // 先创建笔记，确保目录存在
         let id = {
             let mut w = NoteWriter::create(&dir, now()).unwrap();
-            w.append_final("mic", "甲", 0, 900, Some("S1"), None).unwrap();
-            w.append_final("mic", "乙", 1000, 1900, Some("S1"), None).unwrap();
-            w.sync_speakers(&[("S1".into(), vec!["mic".into()])]).unwrap();
+            w.append_final("mic", "甲", 0, 900, Some("S1"), None)
+                .unwrap();
+            w.append_final("mic", "乙", 1000, 1900, Some("S1"), None)
+                .unwrap();
+            w.sync_speakers(&[("S1".into(), vec!["mic".into()])])
+                .unwrap();
             w.finalize(now()).unwrap();
             w.note_id().to_string()
         };
@@ -760,7 +881,9 @@ mod tests {
             let (dir, id) = (Arc::clone(&dir), id.clone());
             move || {
                 for i in 0..20 {
-                    NoteStore::new((*dir).clone()).rename_speaker(&id, "S1", &format!("名{i}")).unwrap();
+                    NoteStore::new((*dir).clone())
+                        .rename_speaker(&id, "S1", &format!("名{i}"))
+                        .unwrap();
                 }
             }
         });
@@ -768,7 +891,9 @@ mod tests {
             let (dir, id) = (Arc::clone(&dir), id.clone());
             move || {
                 for _ in 0..20 {
-                    NoteStore::new((*dir).clone()).set_segment_speaker(&id, 1, "乙", "new").unwrap();
+                    NoteStore::new((*dir).clone())
+                        .set_segment_speaker(&id, 1, "乙", "new")
+                        .unwrap();
                 }
             }
         });
@@ -801,8 +926,10 @@ mod tests {
         // 走不到 resolve 那步，因为本地名优先短路）。
         let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
-        w.append_final("mic", "乙说", 1000, 1900, Some("S2"), None).unwrap();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None)
+            .unwrap();
+        w.append_final("mic", "乙说", 1000, 1900, Some("S2"), None)
+            .unwrap();
         w.finalize(now()).unwrap();
         std::fs::write(
             w.dir().join("speakers.json"),
@@ -812,7 +939,10 @@ mod tests {
 
         let store = NoteStore::new(notes_dir.clone());
         let note = store.load(&id).unwrap();
-        assert_eq!(note.speakers["S1"].name, "张三", "本地无名 + 库有名 → 用库名填充");
+        assert_eq!(
+            note.speakers["S1"].name, "张三",
+            "本地无名 + 库有名 → 用库名填充"
+        );
         assert_eq!(note.speakers["S2"].name, "李四", "本地已有名字不被库名覆盖");
 
         // 磁盘上的 speakers.json 不应被 join 改写（只读视图）。
@@ -839,7 +969,8 @@ mod tests {
 
         let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None)
+            .unwrap();
         w.finalize(now()).unwrap();
         std::fs::write(
             w.dir().join("speakers.json"),
@@ -848,10 +979,17 @@ mod tests {
         .unwrap();
 
         let note = NoteStore::new(notes_dir).load(&id).unwrap();
-        assert_eq!(note.speakers["S1"].person_id.as_deref(), Some("P1"), "loser 引用归一到 winner");
+        assert_eq!(
+            note.speakers["S1"].person_id.as_deref(),
+            Some("P1"),
+            "loser 引用归一到 winner"
+        );
         assert_eq!(note.speakers["S1"].name, "张三", "名字随 winner join");
         let raw = std::fs::read_to_string(w.dir().join("speakers.json")).unwrap();
-        assert!(raw.contains(r#""person_id":"P2""#), "归一只影响返回值，不落盘");
+        assert!(
+            raw.contains(r#""person_id":"P2""#),
+            "归一只影响返回值，不落盘"
+        );
     }
 
     /// 库文件缺失（notes_dir 的上一级没有 voiceprints.json）时 load 不 panic，
@@ -864,7 +1002,8 @@ mod tests {
 
         let mut w = NoteWriter::create(&notes_dir, now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "甲说", 0, 900, Some("S1"), None).unwrap();
+        w.append_final("mic", "甲说", 0, 900, Some("S1"), None)
+            .unwrap();
         w.finalize(now()).unwrap();
         std::fs::write(
             w.dir().join("speakers.json"),
@@ -874,7 +1013,10 @@ mod tests {
 
         let store = NoteStore::new(notes_dir);
         let note = store.load(&id).unwrap(); // 无库文件不 panic
-        assert_eq!(note.speakers["S1"].name, "", "库缺失，name 保持本地原值（空）");
+        assert_eq!(
+            note.speakers["S1"].name, "",
+            "库缺失，name 保持本地原值（空）"
+        );
     }
 
     /// 读侧单一真值源:load 过滤空白段、按 (start_ms, seq) 稳定排序——
@@ -884,14 +1026,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
         let id = w.note_id().to_string();
-        w.append_final("mic", "后", 5000, 6000, None, None).unwrap();       // seq 0
-        w.append_final("system", "   ", 500, 900, None, None).unwrap();     // seq 1 空白段
-        w.append_final("mic", "前", 1000, 1500, None, None).unwrap();       // seq 2
-        w.append_final("system", "同前", 1000, 1400, None, None).unwrap();  // seq 3 同 start,按 seq 稳定
+        w.append_final("mic", "后", 5000, 6000, None, None).unwrap(); // seq 0
+        w.append_final("system", "   ", 500, 900, None, None)
+            .unwrap(); // seq 1 空白段
+        w.append_final("mic", "前", 1000, 1500, None, None).unwrap(); // seq 2
+        w.append_final("system", "同前", 1000, 1400, None, None)
+            .unwrap(); // seq 3 同 start,按 seq 稳定
         w.finalize(now()).unwrap();
         let n = NoteStore::new(tmp.path().to_path_buf()).load(&id).unwrap();
         let texts: Vec<&str> = n.segments.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["前", "同前", "后"], "空白段滤除,start_ms 升序,同值按 seq");
+        assert_eq!(
+            texts,
+            ["前", "同前", "后"],
+            "空白段滤除,start_ms 升序,同值按 seq"
+        );
         assert_eq!(n.skipped_lines, 0, "空白段不是损坏行,不计 skipped");
     }
 
@@ -903,10 +1051,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = make_spk_note(tmp.path(), &[("原文", None)], &[]);
         let dir = tmp.path().join(&id);
-        let _lock = crate::store::notelock::NoteLock::try_exclusive(&dir).unwrap().unwrap();
+        let _lock = crate::store::notelock::NoteLock::try_exclusive(&dir)
+            .unwrap()
+            .unwrap();
         let store = NoteStore::new(tmp.path().to_path_buf());
-        let err = store.edit_segment_text(&id, 0, "原文", "改").unwrap_err().to_string();
-        assert!(err.contains("正被占用"), "锁占用时编辑应被明确拒绝,实际: {err}");
+        let err = store
+            .edit_segment_text(&id, 0, "原文", "改")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("正被占用"),
+            "锁占用时编辑应被明确拒绝,实际: {err}"
+        );
     }
 
     #[test]
