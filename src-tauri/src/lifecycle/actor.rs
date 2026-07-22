@@ -298,6 +298,24 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                     crate::ipc::RetractEvent { source: "mic".into(), start_ms, end_ms, text },
                 );
             }
+            crate::session::DiarEvent::SuppressedFinal {
+                source,
+                text,
+                start_ms,
+                end_ms,
+                rms,
+                reason,
+            } => {
+                let w = &mut owned.writer;
+                let source = source.as_str();
+                if let Err(e) = w
+                    .append_final(source, &text, start_ms, end_ms, None, rms)
+                    .and_then(|_| w.suppress_segment(source, start_ms, end_ms, &text, &reason))
+                {
+                    eprintln!("抑制段落盘失败({reason}, {start_ms}-{end_ms}): {e}");
+                    let _ = app.emit("storage", crate::ipc::StorageEvent { state: "degraded".into() });
+                }
+            }
             crate::session::DiarEvent::Snapshot { snaps, samples: _ } => {
                 // 声纹库回写/样本落盘不触 writer,已拆分留在回调线程原地执行
                 // (见 lib.rs on_diar 闭包注释);新建的簇→人物关联已在回调侧注进

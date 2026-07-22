@@ -585,6 +585,18 @@ impl NoteWriter {
         end_ms: u64,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.suppress_segment(source, start_ms, end_ms, text, "echo_retract")
+    }
+
+    /// 记录一条自动抑制决策，但保留原始识别段。`reason` 是稳定的机器可读原因码。
+    pub fn suppress_segment(
+        &mut self,
+        source: &str,
+        start_ms: u64,
+        end_ms: u64,
+        text: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         self.flush_pending()?;
         let path = self.dir.join("segments.jsonl");
         let content = std::fs::read_to_string(&path)
@@ -615,7 +627,7 @@ impl NoteWriter {
         };
         let record = SegmentSuppression {
             seq,
-            reason: "echo_retract".into(),
+            reason: reason.into(),
         };
         let mut file = OpenOptions::new()
             .create(true)
