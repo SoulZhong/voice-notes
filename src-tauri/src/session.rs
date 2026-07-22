@@ -497,6 +497,16 @@ pub enum DiarEvent {
     /// 时间戳为会话相对值,消费方自行加续录 base_ms)。挂在 DiarEvent 总线上是复用
     /// 既有事件通道(避免为单一事件再扩 run_asr_worker 签名),并非声纹语义。
     EchoRetract { start_ms: u64, end_ms: u64, text: String },
+    /// 自动规则判为不可见的识别结果。消费方必须先写原始段，再以 reason 写入抑制
+    /// sidecar；不得直接丢弃，以便离线评测、误杀诊断和恢复。
+    SuppressedFinal {
+        source: Source,
+        text: String,
+        start_ms: u64,
+        end_ms: u64,
+        rms: Option<f32>,
+        reason: String,
+    },
 }
 
 /// 声纹样本上限:15s。超长截头 15s——试听确认身份用不着更长,也把 worker 内存
@@ -622,6 +632,14 @@ pub fn run_asr_worker(
                     // 被丢段无 final 接替，前端只在收到 final 时清 partial 预览，
                     // 幻觉文本会残留成 UI 残影；主动推空 partial 顶掉它。
                     on_partial(job.source, String::new());
+                    on_diar(DiarEvent::SuppressedFinal {
+                        source: job.source,
+                        text: t.text,
+                        start_ms: job.start_ms,
+                        end_ms: job.end_ms,
+                        rms: Some(rms_of(&job.samples)),
+                        reason: "foreign_language".into(),
+                    });
                     continue;
                 }
 
@@ -661,7 +679,7 @@ pub fn run_asr_worker(
                             // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 是
                             // 外层 FnMut，闭包已捕获 sub/sys_norm）；改用局部 flag，retain
                             // 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
-                            let mut dropped_mic = false;
+                            let mut dropped_mic: Vec<(String, u64, u64, f32, &'static str)> = Vec::new();
                             pending_mic.retain(|p| {
                                 if p.text == "[识别失败]" {
                                     return true;
@@ -676,7 +694,13 @@ pub fn run_asr_worker(
                                         p.rms,
                                         text_prefix20(&p.text)
                                     );
-                                    dropped_mic = true;
+                                    dropped_mic.push((
+                                        p.text.clone(),
+                                        p.start_ms,
+                                        p.end_ms,
+                                        p.rms,
+                                        "aec_residue",
+                                    ));
                                     return false;
                                 }
                                 let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
@@ -687,12 +711,28 @@ pub fn run_asr_worker(
                                         text_prefix20(&p.text),
                                         text_prefix20(&sub.text)
                                     );
-                                    dropped_mic = true;
+                                    dropped_mic.push((
+                                        p.text.clone(),
+                                        p.start_ms,
+                                        p.end_ms,
+                                        p.rms,
+                                        "echo_match",
+                                    ));
                                 }
                                 !echoed
                             });
-                            if dropped_mic {
+                            if !dropped_mic.is_empty() {
                                 on_partial(Source::Mic, String::new());
+                            }
+                            for (text, start_ms, end_ms, rms, reason) in dropped_mic {
+                                on_diar(DiarEvent::SuppressedFinal {
+                                    source: Source::Mic,
+                                    text,
+                                    start_ms,
+                                    end_ms,
+                                    rms: Some(rms),
+                                    reason: reason.into(),
+                                });
                             }
                             // system 段零延迟处理。
                             process_final(
@@ -790,6 +830,14 @@ pub fn run_asr_worker(
                                     text_prefix20(&sub.text)
                                 );
                                 on_partial(job.source, String::new());
+                                on_diar(DiarEvent::SuppressedFinal {
+                                    source: job.source,
+                                    text: sub.text,
+                                    start_ms: sub.start_ms,
+                                    end_ms: sub.end_ms,
+                                    rms: Some(seg_rms),
+                                    reason: "aec_residue".into(),
+                                });
                             } else {
                                 let mic_norm = normalize_text(&sub.text);
                                 let echo = recent_system.iter().find(|r| {
@@ -806,6 +854,14 @@ pub fn run_asr_worker(
                                         // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
                                         // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
                                         on_partial(job.source, String::new());
+                                        on_diar(DiarEvent::SuppressedFinal {
+                                            source: job.source,
+                                            text: sub.text,
+                                            start_ms: sub.start_ms,
+                                            end_ms: sub.end_ms,
+                                            rms: Some(seg_rms),
+                                            reason: "echo_match".into(),
+                                        });
                                     }
                                     None => {
                                         pending_mic.push_back(PendingMic {
@@ -1926,6 +1982,7 @@ mod asr_worker_tests {
         tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 200, end_ms: 300 }).unwrap();
         drop(tx);
         let mut finals: Vec<(String, Option<f32>)> = Vec::new();
+        let mut suppressed = Vec::new();
         run_asr_worker(
             Box::new(ScriptRecognizer(script.into())),
             None,
@@ -1936,12 +1993,17 @@ mod asr_worker_tests {
             Vec::new(),
             |_src, text, _s, _e, _spk, rms| finals.push((text, rms)),
             |_, _| {},
-            |_| {},
+            |event| {
+                if let DiarEvent::SuppressedFinal { text, reason, .. } = event {
+                    suppressed.push((text, reason));
+                }
+            },
         );
         assert_eq!(finals.len(), 1, "日语幻觉段被丢弃");
         assert_eq!(finals[0].0, "正常句子");
         let rms = finals[0].1.expect("正常段必须带 rms");
         assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
+        assert_eq!(suppressed, vec![("でかし".into(), "foreign_language".into())]);
     }
 
     /// language_filter=false:多语会议场景显式关闭本过滤后,即便命中中日韩白名单

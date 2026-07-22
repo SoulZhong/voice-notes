@@ -1199,6 +1199,21 @@ fn spawn_session(
                             text,
                         }
                     }
+                    session::DiarEvent::SuppressedFinal {
+                        source,
+                        text,
+                        start_ms,
+                        end_ms,
+                        rms,
+                        reason,
+                    } => session::DiarEvent::SuppressedFinal {
+                        source,
+                        text,
+                        start_ms: start_ms + base_ms,
+                        end_ms: end_ms + base_ms,
+                        rms,
+                        reason,
+                    },
                     session::DiarEvent::Snapshot { mut snaps, samples } => {
                         // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
                         // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
