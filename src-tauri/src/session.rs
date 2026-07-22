@@ -332,11 +332,11 @@ fn split_final(
     job_start_ms: u64,
     job_end_ms: u64,
     transcript: &Transcript,
-    recognizer: &mut Box<dyn Recognizer>,
+    _recognizer: &mut Box<dyn Recognizer>,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     // 开关透传：子段重识别复核（见下方 is_foreign_final 调用）需与整段判定用
     // 同一个开关状态，否则关闭过滤后仍会在回退路径误丢子段。
-    language_filter: bool,
+    _language_filter: bool,
 ) -> Vec<SubFinal> {
     let whole_segment = |job_samples: Vec<f32>| {
         vec![SubFinal {
@@ -388,11 +388,13 @@ fn split_final(
         return whole_segment(job_samples);
     }
 
-    // 文本按 token 时间戳分组；模型未提供时间戳（或与 tokens 不等长）时逐子段
-    // 重识别兜底（较慢但正确），保持"识别只跑一次"的常态优化不影响正确性。
+    // 文本只能按模型给出的 token 时间戳切。若时间戳缺失或不可信，保留母段：
+    // 说话人边界属于弱证据，不能触发第二次 ASR 覆盖已有文本，否则同一音频会因
+    // 上下文缩短产生不同字词，造成内容层准确率倒退。
     let groups = group_tokens_by_boundaries(&transcript.tokens, &transcript.timestamps, &boundaries);
     if groups.is_none() {
-        eprintln!("段内切分: 时间戳缺失,子段重识别回退");
+        eprintln!("段内切分: 时间戳缺失,保留母段文本");
+        return whole_segment(job_samples);
     }
 
     let mut subs: Vec<SubFinal> = Vec::new();
@@ -410,32 +412,7 @@ fn split_final(
         };
         let sub_samples = job_samples[start_idx..end_idx].to_vec();
 
-        let text = match &groups {
-            Some(g) => g[i].clone(),
-            None => {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    recognizer.recognize(&sub_samples)
-                })) {
-                    Ok(Ok(t)) => {
-                        // 重识别产出的是全新转写，可能与母段整体判断不一致（如
-                        // AEC 残渣独立成段后更像纯外语幻觉）；沿用母段语言标签
-                        // （lang 未变，仅 text 是新的）复核一次，命中则该子段
-                        // 文本置空——下面的空文本判断会自然丢弃它，不单独处理。
-                        if language_filter && is_foreign_final(&transcript.lang, &t.text) {
-                            eprintln!("段内切分: 回退子段命中语言过滤,丢弃");
-                            String::new()
-                        } else {
-                            t.text
-                        }
-                    }
-                    Ok(Err(_)) => "[识别失败]".to_string(),
-                    Err(_) => {
-                        eprintln!("段内切分: 子段重识别 panic,以占位继续");
-                        "[识别失败]".to_string()
-                    }
-                }
-            }
-        };
+        let text = groups.as_ref().expect("groups checked above")[i].clone();
 
         // 子段文本 trim 后为空 → 丢弃该子段（与空白段过滤同哲学：无文本内容
         // 不产 final）。是否全部被丢在循环结束后统一检查、回退整段。
@@ -2270,13 +2247,9 @@ mod asr_worker_tests {
         assert_eq!((finals[0].1, finals[0].2), (0, 8000));
     }
 
-    /// 回归终审 Finding：时间戳缺失走"子段重识别"回退时，重识别产出的新文本
-    /// 未经语言过滤——某子段（如 AEC 残渣独立成段后）重识别出纯外语幻觉文本本应
-    /// 被丢弃，却绕过了整段判定时用过的过滤器直接进入处理链。修复后：回退路径
-    /// 对每个重识别子段沿用母段的 lang 标签复核一次，命中即丢弃该子段（空文本
-    /// 走既有丢弃逻辑），不丢内容不变式仍成立（另一子段正常保留）。
+    /// 时间戳缺失时，说话人切分不得触发子段重识别覆盖母段文本。
     #[test]
-    fn worker_split_fallback_reidentified_subseg_hits_language_filter() {
+    fn worker_split_without_timestamps_preserves_original_transcript() {
         struct ContentEmbedder;
         impl SpeakerEmbedder for ContentEmbedder {
             fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
@@ -2325,12 +2298,9 @@ mod asr_worker_tests {
             |_, _| {},
             |_| {},
         );
-        assert_eq!(
-            finals.len(),
-            1,
-            "重识别出的纯假名子段应被语言过滤丢弃,只留正常那一段: {finals:?}"
-        );
-        assert_eq!(finals[0].0, "第一部分内容");
+        assert_eq!(finals.len(), 1, "无词级时间戳时应保留母段: {finals:?}");
+        assert_eq!(finals[0].0, "占位母段文本");
+        assert_eq!((finals[0].1, finals[0].2), (0, 8000));
     }
 
     /// 回归终审 Finding：末子段边界按 ms_to_sample_idx(total_ms) 换算会因 ms 记账
