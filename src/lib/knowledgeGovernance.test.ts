@@ -534,6 +534,14 @@ describe("governance UI source contract", () => {
     expect(toolbar).toContain("尚无语义关系类型。完成关系补建后可在这里筛选。");
     expect(backfill).toContain("关系已是最新，或笔记尚未形成可用的实体上下文");
   });
+
+  it("lets users leave the modal after a backfill cancel request is accepted", () => {
+    const backfill = source("./RelationBackfillDialog.svelte");
+    expect(backfill).toContain('busy && state.phase !== "cancel-requested"');
+    expect(backfill).toContain("当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。");
+    expect(backfill).toContain('<button class="secondary" type="button" onclick={closeDialog}>关闭窗口</button>');
+    expect(backfill).not.toContain('<button class="secondary" type="button" disabled>等待取消</button>');
+  });
 });
 
 describe("relation drawer tombstone state", () => {

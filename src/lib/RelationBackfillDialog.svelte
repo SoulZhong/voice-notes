@@ -63,17 +63,18 @@
       state.phase === "index-retrying" ||
       state.phase === "waiting-for-index",
   );
+  const closeBlocked = $derived(busy && state.phase !== "cancel-requested");
   const providerLabel = $derived(state.preview?.provider === "agent" ? "本机 Agent" : "在线接口");
 
   function closeDialog() {
-    if (busy) return;
+    if (closeBlocked) return;
     controller.close();
     if (dialog.open) dialog.close();
     onClose();
   }
 
   function handleCancel(event: Event) {
-    if (busy) {
+    if (closeBlocked) {
       event.preventDefault();
       if (state.phase === "running") void controller.cancel();
       return;
@@ -111,7 +112,7 @@
         class="close-button"
         type="button"
         aria-label="关闭关系补建"
-        disabled={busy}
+        disabled={closeBlocked}
         onclick={closeDialog}
       >关闭</button>
     </header>
@@ -160,7 +161,7 @@
             {:else if state.phase === "index-failed"}索引发布未完成
             {:else if state.phase === "cancelled"}补建已取消
             {:else if state.phase === "starting"}正在建立安全连接
-            {:else if state.phase === "cancel-requested"}正在安全停止
+            {:else if state.phase === "cancel-requested"}停止请求已送达
             {:else if state.phase === "index-retrying"}正在重试图谱索引
             {:else if state.phase === "waiting-for-index"}正在发布图谱索引
             {:else}正在补建关系{/if}
@@ -170,6 +171,9 @@
         <progress max={Math.max(state.total, 1)} value={state.completed}>{state.completed} / {state.total}</progress>
         {#if state.currentNoteId}
           <div class="current"><span>当前笔记</span><strong>{state.currentNoteId}</strong></div>
+        {/if}
+        {#if state.phase === "cancel-requested"}
+          <p class="message">当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。</p>
         {/if}
         {#if state.error}<p class="message error">{state.error}</p>{/if}
         {#if state.technicalError && state.failures.length === 0}
@@ -206,7 +210,7 @@
       {:else if state.phase === "running"}
         <button class="secondary danger" type="button" onclick={cancel}>取消补建</button>
       {:else if state.phase === "cancel-requested"}
-        <button class="secondary" type="button" disabled>等待取消</button>
+        <button class="secondary" type="button" onclick={closeDialog}>关闭窗口</button>
       {:else if state.phase === "index-failed"}
         <button class="primary" type="button" onclick={retryIndex}>重试索引</button>
       {:else if state.phase === "failed" || state.phase === "partial" || state.phase === "cancelled"}
