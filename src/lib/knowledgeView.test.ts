@@ -594,7 +594,7 @@ describe("pathEmphasis", () => {
 
 describe("exploratory graph UI source contract", () => {
   const sources = import.meta.glob(
-    ["./ForceGraph.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./RelationDrawer.svelte", "./knowledge.ts", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte", "../../DESIGN.md"],
+    ["./ForceGraph.svelte", "./GraphEdgeInspector.svelte", "./KnowledgeGraphToolbar.svelte", "./KnowledgePathPanel.svelte", "./RelationDrawer.svelte", "./knowledge.ts", "./knowledgeView.ts", "../routes/graph/+page.svelte", "./Sidebar.svelte", "../../DESIGN.md"],
     { eager: true, query: "?raw", import: "default" },
   ) as Record<string, string>;
   const source = (name: string) => {
@@ -678,6 +678,9 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain('<GraphEdgeInspector');
     expect(route).toContain('perspective="note"');
     expect(route).toContain('perspective="entity"');
+    const edgeInspector = source("./GraphEdgeInspector.svelte");
+    expect(edgeInspector).toContain("formatDate(item.started_at");
+    expect(edgeInspector).toContain("formatDuration(item.duration_secs)");
     expect(route).toContain('class="canvas-shell"');
     expect(route).toContain("<EntityGovernance");
     expect(route).toContain("<RelationDrawer");

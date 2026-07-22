@@ -413,6 +413,8 @@ pub struct GraphEdgeDetailItem {
     pub id: String,
     pub name: String,
     pub kind: Option<String>,
+    pub started_at: Option<String>,
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { kindLabel, type GraphEdgeDetailItem } from "$lib/graph";
+  import { formatDate, formatDuration } from "$lib/notes";
 
   let {
     perspective,
@@ -60,8 +61,12 @@
       {#each items as item (item.id)}
         <li>
           <button type="button" onclick={() => onPick(item)}>
-            <span>{item.name}</span>
-            {#if item.kind}<small>{kindLabel(item.kind)}</small>{/if}
+            <span class="item-name">{item.name}</span>
+            {#if item.kind}
+              <small>{kindLabel(item.kind)}</small>
+            {:else}
+              <small>{formatDate(item.started_at ?? "")} · {formatDuration(item.duration_secs)}</small>
+            {/if}
           </button>
         </li>
       {/each}
@@ -124,8 +129,8 @@
     cursor: pointer;
   }
   li button:hover { color: var(--accent); }
-  li button span { overflow-wrap: anywhere; }
-  li small { flex: none; color: var(--ink-faint); font-size: 0.7rem; }
+  .item-name { min-width: 0; overflow-wrap: anywhere; }
+  li small { flex: none; color: var(--ink-faint); font-size: 0.7rem; white-space: nowrap; }
   .state { margin: 40px 0 0; color: var(--ink-secondary); font-size: 0.84rem; line-height: 1.6; }
   .state p { margin: 0 0 14px; }
   .state button { min-height: 36px; padding: 7px 12px; border: 1px solid var(--hairline-strong); border-radius: var(--radius-md); background: transparent; color: var(--ink-secondary); font: inherit; cursor: pointer; }
