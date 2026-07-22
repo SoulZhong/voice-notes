@@ -1,36 +1,42 @@
-pub mod audio;
 pub mod aing_graph;
+pub mod audio;
 pub mod disk;
+mod export;
 pub mod migrate;
 pub mod notelock;
+mod notes;
 pub mod refined;
 pub mod transcode;
-pub mod writer;
-mod export;
-mod notes;
 mod voiceprints;
+pub mod writer;
+pub use aing_graph::{
+    ensure_graph_ids, evidence_id, mention_id, relation_fact_id, source_hash, stable_id,
+    GraphExtraction, RelationEvidence, RelationFact, RelationPredicate,
+};
 pub use export::render_refined; // GUI 导出与 MCP get_note 共用的 Aing 渲染(format_ts 已无 store:: 路径消费者,不再 re-export)。
 pub use notes::NoteStore;
-pub use refined::{load_refined, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph};
-pub use aing_graph::{ensure_graph_ids, evidence_id, mention_id, relation_fact_id, source_hash, stable_id, GraphExtraction, RelationEvidence, RelationFact, RelationPredicate};
-pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
+pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
+pub use refined::{
+    load_refined, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
+};
+pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
+pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
 pub use voiceprints::Voiceprints; // graph::resolve_global_id 命名此类型(人实体→person_id 匹配)。
-pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
-pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
 pub use voiceprints::AUTO_ENROLL_MS; // lib.rs 实时入库回调(registry enroller)用同一门槛。
 pub use voiceprints::MAX_SAMPLES; // merge_person 判断样本是否超额(超额才付声纹模型加载成本)。
-// Person/PersonCentroid/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型生成/测试引用),
-// 但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。Voiceprints 例外:
-// graph::resolve_global_id 需要具名此类型,已于上方重新导出。
+                                  // Person/PersonCentroid/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型生成/测试引用),
+                                  // 但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。Voiceprints 例外:
+                                  // graph::resolve_global_id 需要具名此类型,已于上方重新导出。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const SEGMENT_SUPPRESSIONS_FILE: &str = "segment-suppressions.jsonl";
 
 /// 一场会议的元数据，存 meta.json（原子写）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +66,14 @@ pub struct SegmentRecord {
     pub rms: Option<f32>,
 }
 
+/// 对原始段的可逆隐藏决定。原始 `segments.jsonl` 永不因自动规则删除；默认视图
+/// 应用本记录隐藏命中段，诊断/恢复路径仍可读取 `Note::suppressed_segments`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SegmentSuppression {
+    pub seq: u64,
+    pub reason: String,
+}
+
 /// 一位说话人的可持久化信息，存 speakers.json（键为说话人 id，如 "S1"）。
 /// name 空串 = 未改名，显示端兜底「说话人 N」。
 /// centroid/count 为 P4.5 续录铺底新增字段：serde default + skip_serializing_if 保证
@@ -84,6 +98,8 @@ pub struct SpeakerMeta {
 pub struct Note {
     pub meta: NoteMeta,
     pub segments: Vec<SegmentRecord>,
+    /// 被自动规则隐藏的原始段。与 `segments` 互斥，按原始时间顺序返回。
+    pub suppressed_segments: Vec<SegmentRecord>,
     /// load 时因损坏被跳过的行数（>0 时前端可提示）。
     pub skipped_lines: u32,
     pub speakers: BTreeMap<String, SpeakerMeta>,
