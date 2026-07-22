@@ -85,7 +85,7 @@
       <fieldset>
         <legend>关系类型</legend>
         {#if predicates.length === 0}
-          <p class="empty-options">尚无语义关系类型。完成关系补建后可在这里筛选。</p>
+          <p class="empty-options">还没有可筛选的具体关系。完成笔记关系分析后会显示在这里。</p>
         {:else}
           {#each predicates as predicate (predicate.value)}
             <label>

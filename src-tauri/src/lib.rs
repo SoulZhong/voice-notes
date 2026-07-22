@@ -2299,6 +2299,56 @@ fn note_graph_data(app: AppHandle) -> Result<ipc::GraphData, String> {
     Ok(ipc::GraphData { nodes, edges })
 }
 
+/// 点击图谱共现边时按需读取连接原因。perspective=note 返回共用实体；
+/// perspective=entity 返回同时提到两个实体的笔记标题。
+#[tauri::command]
+fn graph_edge_detail(
+    app: AppHandle,
+    a: String,
+    b: String,
+    perspective: String,
+) -> Result<ipc::GraphEdgeDetail, String> {
+    let root = data_root(&app).map_err(|error| graph_read_error("graph_edge_detail", error))?;
+    let items = match perspective.as_str() {
+        "note" => graph::shared_entities_for_notes(&root, &a, &b)
+            .map_err(|error| graph_read_error("graph_edge_detail", error))?
+            .into_iter()
+            .map(|(id, kind, name)| ipc::GraphEdgeDetailItem { id, name, kind: Some(kind) })
+            .collect(),
+        "entity" => {
+            let semantic_note_ids = graph::query::shared_notes_for_entities(&root, &a, &b)
+                .unwrap_or_default();
+            let note_ids = if semantic_note_ids.is_empty() {
+                graph::shared_notes_for_entities(&root, &a, &b)
+                    .map_err(|error| graph_read_error("graph_edge_detail", error))?
+            } else {
+                semantic_note_ids
+            };
+            let by_id: std::collections::HashMap<String, store::NoteSummary> = notes_dir(&app)
+                .map(|notes_root| {
+                    store::NoteStore::new(notes_root)
+                        .list()
+                        .into_iter()
+                        .map(|note| (note.id.clone(), note))
+                        .collect()
+                })
+                .unwrap_or_default();
+            note_ids
+                .into_iter()
+                .filter_map(|id| {
+                    by_id.get(&id).map(|note| ipc::GraphEdgeDetailItem {
+                        id: note.id.clone(),
+                        name: note.title.clone(),
+                        kind: None,
+                    })
+                })
+                .collect()
+        }
+        _ => return Err("未知的图谱视角".into()),
+    };
+    Ok(ipc::GraphEdgeDetail { items })
+}
+
 /// 单个实体详情(右侧面板)。实体不存在/图谱失败 → None,不 Err。
 #[tauri::command]
 fn entity_detail(app: AppHandle, id: String) -> Result<Option<ipc::EntityDetail>, String> {
@@ -4050,6 +4100,7 @@ pub fn run() {
             merge_entities,
             undo_knowledge_operation,
             note_graph_data,
+            graph_edge_detail,
             entity_detail,
             note_entity_links,
             rename_entity,
@@ -4269,6 +4320,7 @@ mod tests {
             "split_entity,",
             "merge_entities,",
             "undo_knowledge_operation,",
+            "graph_edge_detail,",
         ] {
             assert!(
                 handlers.contains(command),

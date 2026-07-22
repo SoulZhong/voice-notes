@@ -104,14 +104,14 @@
   <div class="dialog-shell">
     <header>
       <div>
-        <p class="eyebrow">语义关系维护</p>
-        <h2 id="relation-backfill-title">补建历史关系</h2>
+        <p class="eyebrow">知识图谱</p>
+        <h2 id="relation-backfill-title">分析笔记关系</h2>
       </div>
       <button
         bind:this={closeButton}
         class="close-button"
         type="button"
-        aria-label="关闭关系补建"
+        aria-label="关闭笔记关系分析"
         disabled={closeBlocked}
         onclick={closeDialog}
       >关闭</button>
@@ -119,7 +119,7 @@
 
     <div class="status" aria-live="polite" aria-atomic="false">
       {#if state.phase === "preview-loading"}
-        <p class="lead">正在读取可补建的笔记与当前执行体。</p>
+        <p class="lead">正在读取需要分析的笔记与当前处理方式。</p>
       {:else if state.phase === "preview-error"}
         <p class="message error">{state.error}</p>
         {#if state.technicalError}
@@ -127,7 +127,7 @@
         {/if}
         <button class="secondary" type="button" onclick={() => controller.preview(noteIds)}>重新预览</button>
       {:else if state.preview && (state.phase === "preview-ready")}
-        <p class="lead">开始前请核对这次补建会处理什么，以及内容将交给谁。</p>
+        <p class="lead">系统会从已有笔记中识别实体之间的具体关系。开始前请核对处理范围，以及内容将交给谁。</p>
         <dl class="facts">
           <div><dt>笔记数量</dt><dd>{state.preview.note_ids.length}</dd></div>
           <div><dt>执行体</dt><dd>{providerLabel}</dd></div>
@@ -141,7 +141,7 @@
           </ul>
         </details>
         {#if state.preview.note_ids.length === 0}
-          <p class="message">没有可补建的笔记。关系已是最新，或笔记尚未形成可用的实体上下文。现有转写稿不会改变。</p>
+          <p class="message">没有需要分析的笔记。关系已是最新，或笔记中还没有可识别的实体。现有转写稿不会改变。</p>
         {:else}
           <label class="consent">
             <input
@@ -149,22 +149,22 @@
               checked={state.acknowledged}
               onchange={(event) => controller.acknowledge(event.currentTarget.checked)}
             />
-            <span>我已确认：将把修订稿发送给当前配置的执行体。补建只更新关系图谱产物，不修改转写段落与笔记顺序。</span>
+            <span>我已确认：将把修订稿发送给当前配置的处理方式。分析只更新图谱中的关系，不修改转写段落与笔记顺序。</span>
           </label>
         {/if}
       {:else if busy || state.phase === "index-failed" || state.phase === "completed" || state.phase === "partial" || state.phase === "failed" || state.phase === "cancelled"}
         <div class="progress-heading">
           <p class="lead">
-            {#if state.phase === "completed"}补建已完成
+            {#if state.phase === "completed"}关系分析已完成
             {:else if state.phase === "partial"}部分笔记未完成
-            {:else if state.phase === "failed"}补建未完成
+            {:else if state.phase === "failed"}关系分析未完成
             {:else if state.phase === "index-failed"}索引发布未完成
-            {:else if state.phase === "cancelled"}补建已取消
+            {:else if state.phase === "cancelled"}关系分析已取消
             {:else if state.phase === "starting"}正在建立安全连接
             {:else if state.phase === "cancel-requested"}停止请求已送达
             {:else if state.phase === "index-retrying"}正在重试图谱索引
             {:else if state.phase === "waiting-for-index"}正在发布图谱索引
-            {:else}正在补建关系{/if}
+            {:else}正在分析笔记关系{/if}
           </p>
           <strong>{state.completed} / {state.total}</strong>
         </div>
@@ -206,9 +206,9 @@
           type="button"
           disabled={!state.acknowledged || !state.preview || state.preview.note_ids.length === 0}
           onclick={start}
-        >开始补建</button>
+        >开始分析</button>
       {:else if state.phase === "running"}
-        <button class="secondary danger" type="button" onclick={cancel}>取消补建</button>
+        <button class="secondary danger" type="button" onclick={cancel}>停止分析</button>
       {:else if state.phase === "cancel-requested"}
         <button class="secondary" type="button" onclick={closeDialog}>关闭窗口</button>
       {:else if state.phase === "index-failed"}

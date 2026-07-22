@@ -531,8 +531,8 @@ describe("governance UI source contract", () => {
   it("explains why relation filters and backfill actions have no candidates", () => {
     const toolbar = source("./KnowledgeGraphToolbar.svelte");
     const backfill = source("./RelationBackfillDialog.svelte");
-    expect(toolbar).toContain("尚无语义关系类型。完成关系补建后可在这里筛选。");
-    expect(backfill).toContain("关系已是最新，或笔记尚未形成可用的实体上下文");
+    expect(toolbar).toContain("还没有可筛选的具体关系。完成笔记关系分析后会显示在这里。");
+    expect(backfill).toContain("关系已是最新，或笔记中还没有可识别的实体");
   });
 
   it("lets users leave the modal after a backfill cancel request is accepted", () => {

@@ -630,7 +630,7 @@ export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): Ren
     b: compareStrings(edge.a, edge.b) <= 0 ? edge.b : edge.a,
     weight: edge.weight,
     layer: "cooccurrence",
-    label: `共同出现（${edge.weight} 篇）`,
+    label: `${edge.weight} 篇笔记同时提到`,
     directed: false,
     confidence: null,
     status: null,
