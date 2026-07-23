@@ -15,10 +15,9 @@ use std::path::PathBuf;
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// 够料自动入库的门槛(累计发声毫秒)。2026-07-11 按真实库复盘上调 10s→30s:
-/// 10s 时代攒出 37 个 0-8 分钟的未命名碎片(低电平/杂音段凑够即领 P 号),质心近
-/// 随机、谁都认不出还污染种子池;30s 才够格算"真实参会者"。
-pub const AUTO_ENROLL_MS: u64 = 30_000;
+/// 够料自动识别/入库的门槛(累计发声毫秒)。累计 10s 即建立身份，
+/// 让短发言者也能在本场会议内及时获得稳定人物编号。
+pub const AUTO_ENROLL_MS: u64 = 10_000;
 
 /// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
 /// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
@@ -1087,6 +1086,11 @@ mod tests {
         assert_eq!(vp.people[pid].name, "", "新建人物未命名");
         assert_eq!(vp.people[pid].total_ms, AUTO_ENROLL_MS);
         assert_eq!(vp.next_person, 2);
+    }
+
+    #[test]
+    fn auto_enroll_threshold_is_ten_seconds() {
+        assert_eq!(AUTO_ENROLL_MS, 10_000);
     }
 
     #[test]

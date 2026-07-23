@@ -224,7 +224,10 @@ mod tests {
         assert!(!r.contains("{{VERSION}}"), "占位必须被替换");
         assert!(r.contains(env!("CARGO_PKG_VERSION")));
         assert!(r.contains(MANAGED_MARK));
-        assert!(r.starts_with("---\nname: voice-notes"), "frontmatter 形状");
+        assert!(
+            r.replace("\r\n", "\n").starts_with("---\nname: voice-notes"),
+            "frontmatter 形状"
+        );
     }
 
     #[test]

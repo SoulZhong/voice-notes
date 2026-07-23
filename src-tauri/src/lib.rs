@@ -1507,13 +1507,17 @@ pub(crate) fn do_stop_tail(app: &AppHandle, note_id: String) {
 }
 
 #[tauri::command]
-fn stop_recording(app: AppHandle) {
-    // 薄壳:经 actor 串行执行停录(P2:teardown+自投 Finalize,reply 在收尾完成后
-    // 才回,同步语义与旧直调一致)。Err 仅在 actor 已退出(进程收尾)时出现;
-    // 原直调无返回值,保持壳签名不变,记日志即可。
-    if let Err(e) = app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Stop) {
-        eprintln!("stop_recording: {e}");
-    }
+async fn stop_recording(app: AppHandle) -> Result<(), String> {
+    // 停录会排干分段/ASR worker、收尾 WAV 并 finalize 笔记，这些都是有意保留的
+    // 阻塞操作。同步命令会占住 Tauri IPC 执行路径，在 Windows 上表现为整个 WebView
+    // 无法重绘。把完整的 durable shutdown 移到阻塞线程池：数据完整性和 reply=已落盘
+    // 的语义不变，但 UI 事件循环始终可响应。
+    let lifecycle = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        lifecycle.command(lifecycle::Cmd::Stop)
+    })
+    .await
+    .map_err(|e| format!("停止录制后台任务异常: {e}"))?
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -3024,7 +3028,13 @@ fn ai_logs_open_dir(app: AppHandle) -> Result<String, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
     let dir = ailog::log_dir(&root);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::process::Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(&dir).spawn().map_err(|e| e.to_string())?;
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -4309,7 +4319,7 @@ mod tests {
 
     #[test]
     fn semantic_graph_commands_are_registered() {
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         let handlers = source
             .split_once(".invoke_handler(tauri::generate_handler![")
             .expect("generate_handler block")
@@ -4394,7 +4404,7 @@ mod tests {
         )
         .is_err());
 
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(source.contains("#[cfg(debug_assertions)]\n            semantic_graph_debug_fixture,"));
         assert!(source.contains(
             "#[cfg(debug_assertions)]\n            semantic_graph_debug_relation_detail,"

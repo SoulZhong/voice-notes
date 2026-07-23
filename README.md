@@ -6,7 +6,7 @@
 
 中文 | [English](./README.en.md)
 
-[![platform](https://img.shields.io/badge/platform-macOS%2013%2B-black)](#系统要求)
+[![platform](https://img.shields.io/badge/platform-macOS%2013%2B%20%7C%20Windows%2010%2B-black)](#系统要求)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](#license)
 [![tauri](https://img.shields.io/badge/Tauri-2-24C8DB)](https://tauri.app)
 [![rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
@@ -46,7 +46,9 @@
 
 ### 系统要求
 
-- **macOS 13 或更高**、Apple Silicon（M 系列）Mac —— 系统声音采集依赖 ScreenCaptureKit，目前只提供 arm64 安装包
+- **macOS 13 或更高**（Apple Silicon），或 **Windows 10/11 64 位**
+- macOS 系统声音使用 ScreenCaptureKit；Windows 系统声音使用 WASAPI loopback
+- Releases 目前只提供 macOS arm64 安装包；Windows 请按下方步骤从源码构建
 - 磁盘空间：应用本体约 60MB，识别模型约 1GB（首次启动下载）
 
 ### 安装步骤
@@ -87,7 +89,7 @@
 ### 从源码运行（开发者）
 
 - [Rust](https://rustup.rs)（stable）与 Node.js 18+
-- meson 与 ninja（编译内嵌的 WebRTC 回声消除模块）：`pip3 install --user meson ninja`
+- macOS/Linux 还需 meson 与 ninja（编译 WebRTC 回声消除模块）：`pip3 install --user meson ninja`；Windows 不需要
 
 ```bash
 git clone https://github.com/SoulZhong/voice-notes.git
@@ -96,6 +98,8 @@ npm install
 npm run tauri dev      # 开发运行
 npm run tauri build    # 构建 .app + .dmg
 ```
+
+Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`npm run tauri build` 会生成 Windows 安装包。若 PowerShell 执行策略拦截 `npm.ps1`，使用 `npm.cmd run tauri dev` / `npm.cmd run tauri build`。
 
 模型除了应用内下载，也可用脚本预取：`./scripts/fetch_models.sh`
 
@@ -250,7 +254,7 @@ macOS 采集系统声音（别的 App 放出来的声音）只能走 ScreenCaptu
 默认在应用数据目录，可在设置里迁移到任意位置（如 iCloud/外置盘）。每场会议一个文件夹：`meta.json` + `segments.jsonl`（逐句转写）+ 音频轨 + `speakers.json`，纯文本格式，随时可被其他工具读取。
 
 **支持 Windows / Linux 吗？**
-目前仅 macOS（系统声音采集、回声消除、菜单栏都依赖平台能力）。转写管线本身是跨平台的 Rust，欢迎贡献其他平台的音频采集层。
+支持 Windows 10/11：麦克风与 WASAPI 系统声音可双路录制，静音时会自动维持时间轴，设备断开后自动尝试恢复。Windows 暂不使用 WebRTC 实时 AEC，仍有文本级回声去重兜底。目前未提供官方 Windows 安装包，需从源码构建。Linux 尚未支持系统声音采集。
 
 ## 工作原理
 

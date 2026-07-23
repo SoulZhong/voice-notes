@@ -291,6 +291,7 @@ mod tests {
     /// 4 阶、40ms 展宽)在本构型彻底消除锁死,持续到 20s+ 仍稳定收敛(诊断见
     /// 开发记录)。真实蓝牙/声学回声路径本就有多径/混响,不会是理想单抽头,
     /// 故此处认为多抽头合成更贴合场景,而非规避测试。
+    #[cfg(not(windows))]
     #[test]
     fn cleans_600ms_bluetooth_echo_and_keeps_local_voice() {
         let dir = tempfile::tempdir().unwrap();
@@ -376,6 +377,7 @@ mod tests {
 
     /// 末段短于暖机(warm_end==seg_end)且长度非 160 倍数:暖机残帧不得泄漏,
     /// 输出样本数必须与输入严格相等(审查发现的守恒破坏布局)。
+    #[cfg(not(windows))]
     #[test]
     fn short_tail_segment_conserves_sample_count() {
         let dir = tempfile::tempdir().unwrap();

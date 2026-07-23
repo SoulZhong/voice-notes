@@ -6,7 +6,7 @@
 
 [中文](./README.md) | English
 
-[![platform](https://img.shields.io/badge/platform-macOS%2013%2B-black)](#requirements)
+[![platform](https://img.shields.io/badge/platform-macOS%2013%2B%20%7C%20Windows%2010%2B-black)](#requirements)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](#license)
 [![tauri](https://img.shields.io/badge/Tauri-2-24C8DB)](https://tauri.app)
 [![rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
@@ -48,7 +48,9 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 ### Requirements
 
-- **macOS 13 or later**, Apple Silicon (M-series) Mac — system-audio capture relies on ScreenCaptureKit, and only arm64 packages are provided for now
+- **macOS 13 or later** (Apple Silicon), or **64-bit Windows 10/11**
+- System audio uses ScreenCaptureKit on macOS and WASAPI loopback on Windows
+- Releases currently provide macOS arm64 packages only; build from source on Windows
 - Disk space: ~60 MB for the app, ~1 GB for recognition models (downloaded on first launch)
 
 ### Steps
@@ -89,7 +91,7 @@ Works out of the box — every setting has a sensible default. Adjust as needed 
 ### Run from source (developers)
 
 - [Rust](https://rustup.rs) (stable) and Node.js 18+
-- meson and ninja (to build the vendored WebRTC echo-cancellation module): `pip3 install --user meson ninja`
+- macOS/Linux additionally need meson and ninja for WebRTC echo cancellation: `pip3 install --user meson ninja`; Windows does not
 
 ```bash
 git clone https://github.com/SoulZhong/voice-notes.git
@@ -98,6 +100,8 @@ npm install
 npm run tauri dev      # development
 npm run tauri build    # build the .app + .dmg
 ```
+
+On Windows, run the same commands in “Developer PowerShell for VS 2022”; `npm run tauri build` produces the Windows installer. If PowerShell blocks `npm.ps1`, use `npm.cmd run tauri dev` / `npm.cmd run tauri build`.
 
 Models can also be prefetched outside the app: `./scripts/fetch_models.sh`
 
@@ -255,7 +259,7 @@ That's macOS voice-processing (VPIO echo cancellation) ducking, a system behavio
 In the app data directory by default, relocatable in Settings (e.g. iCloud or an external drive). One folder per meeting: `meta.json` + `segments.jsonl` (sentence-by-sentence transcript) + audio tracks + `speakers.json` — plain text formats any tool can read.
 
 **Windows / Linux?**
-macOS only for now (system-audio capture, echo cancellation, and the menu bar all depend on platform APIs). The transcription pipeline itself is cross-platform Rust — contributions of audio-capture layers for other platforms are welcome.
+Windows 10/11 is supported: microphone and WASAPI system audio are captured independently, silence keeps both timelines aligned, and disconnected devices are retried automatically. Windows currently uses text-level echo deduplication instead of real-time WebRTC AEC. No official Windows installer is published yet, so build from source. Linux system-audio capture is not supported yet.
 
 ## How it works
 

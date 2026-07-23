@@ -340,8 +340,8 @@ impl AnchoredRefinedDir {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use windows_sys::Win32::Foundation::GENERIC_WRITE;
         use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
+            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         // Existing final symlinks/reparse points fail closed. A replacement racing after this
@@ -360,7 +360,7 @@ impl AnchoredRefinedDir {
                 .write(true)
                 .create_new(true)
                 .access_mode(GENERIC_WRITE | DELETE)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(self.path.join(&name))
             {
@@ -372,7 +372,11 @@ impl AnchoredRefinedDir {
         let result = (|| -> anyhow::Result<()> {
             temp.write_all(bytes)?;
             temp.sync_all()?;
-            rename_windows_handle(&temp, &self.dir, AING_DOC_FILE)?;
+            drop(temp);
+            rename_windows_file(
+                &self.path.join(&temp_name),
+                &self.path.join(AING_DOC_FILE),
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -567,36 +571,31 @@ fn open_windows_directory(path: &Path) -> anyhow::Result<File> {
 }
 
 #[cfg(windows)]
-fn rename_windows_handle(temp: &File, dir: &File, target: &str) -> anyhow::Result<()> {
-    use std::mem::{offset_of, size_of};
+fn rename_windows_file(temp: &Path, target: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
-    let target = std::ffi::OsStr::new(target)
+    let temp = temp
+        .as_os_str()
         .encode_wide()
+        .chain(Some(0))
         .collect::<Vec<_>>();
-    let byte_len = target.len() * size_of::<u16>();
-    let info_len = offset_of!(FILE_RENAME_INFO, FileName) + byte_len;
-    let words = info_len.div_ceil(size_of::<usize>());
-    let mut storage = vec![0usize; words];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    unsafe {
-        (*info).Anonymous.ReplaceIfExists = 1;
-        (*info).RootDirectory = dir.as_raw_handle();
-        (*info).FileNameLength = byte_len as u32;
-        std::ptr::copy_nonoverlapping(target.as_ptr(), (*info).FileName.as_mut_ptr(), target.len());
-        if SetFileInformationByHandle(
-            temp.as_raw_handle(),
-            FileRenameInfo,
-            info.cast(),
-            info_len as u32,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            temp.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
 }

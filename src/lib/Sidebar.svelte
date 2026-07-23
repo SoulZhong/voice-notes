@@ -327,15 +327,16 @@
         onclick={() => (graphDrawerOpen = !graphDrawerOpen)}
       >筛选</button>
     {/if}
-    <button
+    <a
       class="vtab"
       class:active={tab === "hooks"}
-      onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
+      href="/hooks"
+      data-sveltekit-preload-code="eager">钩子</a
     >
-    <button
+    <a
       class="vtab vtab-upright"
       class:active={tab === "ai"}
-      onclick={() => { if (!$page.url.pathname.startsWith("/ai")) goto("/ai"); }}>AI</button
+      href="/ai">AI</a
     >
     <button
       class="vtab"
@@ -360,7 +361,7 @@
     disabled={recording.pending}
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
-    {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
+    {recording.stopping ? "正在停止…" : recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
   {#if tab === "hooks"}
@@ -654,6 +655,7 @@
     border-right: none;
     border-radius: var(--radius-md) 0 0 var(--radius-md);
     cursor: pointer;
+    text-decoration: none;
   }
   /* 拉丁标签(AI):竖排会把字母放倒或上下堆叠,改横排让「AI」两字母同行并排 */
   .vtab-upright {
