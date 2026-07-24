@@ -33,3 +33,23 @@ describe("Windows release documentation", () => {
     expect(english).not.toContain("No official Windows installer is published yet");
   });
 });
+
+describe("Windows CI resource staging", () => {
+  it("stages every Tauri runtime resource before cargo check", () => {
+    const workflow = read(".github\\workflows\\windows-check.yml");
+    const staging = workflow.indexOf("Stage Tauri runtime resource placeholders");
+    const cargoCheck = workflow.indexOf("- name: cargo check (lib, Windows msvc)");
+
+    expect(staging).toBeGreaterThanOrEqual(0);
+    expect(staging).toBeLessThan(cargoCheck);
+    for (const dll of [
+      "cargs.dll",
+      "onnxruntime.dll",
+      "onnxruntime_providers_shared.dll",
+      "sherpa-onnx-c-api.dll",
+      "sherpa-onnx-cxx-api.dll",
+    ]) {
+      expect(workflow).toContain(dll);
+    }
+  });
+});
