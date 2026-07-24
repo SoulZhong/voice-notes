@@ -644,6 +644,11 @@
   /* 竖排文件夹页签:选中态与面板同底且右边线断开(margin-right 盖住面板左边线),
      页签与面板融为一体=凸起;未选中透明退后,hover 半显影。 */
   .vtab {
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
     writing-mode: vertical-rl;
     letter-spacing: 0.12em;
     padding: 0.8em 0.3em;

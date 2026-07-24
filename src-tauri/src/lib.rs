@@ -2933,8 +2933,12 @@ struct RegisterOutcome {
 static MCP_HEALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[tauri::command]
-fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> {
-    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
+async fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
+    })
+    .await
+    .map_err(|e| format!("Agent 状态后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2955,8 +2959,12 @@ fn mcp_unregister(agent: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn mcp_manual_snippet() -> Result<String, String> {
-    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
+async fn mcp_manual_snippet() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
+    })
+    .await
+    .map_err(|e| format!("MCP 配置读取后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2975,8 +2983,12 @@ fn skill_state_str(state: mcp::skill::SkillState) -> &'static str {
 }
 
 #[tauri::command]
-fn mcp_skill_status() -> Result<String, String> {
-    Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
+async fn mcp_skill_status() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
+    })
+    .await
+    .map_err(|e| format!("Skill 状态后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2998,19 +3010,27 @@ fn mcp_capabilities() -> serde_json::Value {
 /// 四家 Agent CLI 的本机探测结果(key → 解析到的可执行路径或 null),供 /ai 页
 /// Agent Aing 模式展示「已检测到/未检测到」。探测只做文件存在性检查,毫秒级。
 #[tauri::command]
-fn refine_agents_probe() -> serde_json::Value {
-    refine::agent::probe_all()
-        .into_iter()
-        .map(|(k, p)| (k.to_string(), serde_json::json!(p)))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+async fn refine_agents_probe() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        refine::agent::probe_all()
+            .into_iter()
+            .map(|(k, p)| (k.to_string(), serde_json::json!(p)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    })
+    .await
+    .map_err(|e| format!("Agent 探测后台任务异常: {e}"))
 }
 
 /// AI 调用日志查询(倒序分页,过滤条件见 ailog::Filter)。
 #[tauri::command]
-fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    Ok(ailog::query(&root, &filter))
+async fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        Ok(ailog::query(&root, &filter))
+    })
+    .await
+    .map_err(|e| format!("AI 日志查询后台任务异常: {e}"))?
 }
 
 /// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
