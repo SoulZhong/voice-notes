@@ -7,7 +7,8 @@ name: windows-check
 
 on:
   push:
-    branches: [feature/meetily-borrow-windows]
+    branches: [master, main, feature/meetily-borrow-windows]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -20,6 +21,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # `cargo check` does not package or run these DLLs, but Tauri validates every
+      # configured Windows resource path before the sherpa build script finishes.
+      - name: Stage Tauri runtime resource placeholders
+        shell: pwsh
+        run: |
+          $runtimeDir = "src-tauri/target/bundle-libs/windows"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          @(
+            "cargs.dll",
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+            "sherpa-onnx-c-api.dll",
+            "sherpa-onnx-cxx-api.dll"
+          ) | ForEach-Object {
+            New-Item -ItemType File -Force -Path (Join-Path $runtimeDir $_) | Out-Null
+          }
       - name: cargo check (lib, Windows msvc)
         working-directory: src-tauri
         run: cargo check --lib

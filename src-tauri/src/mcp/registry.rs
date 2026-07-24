@@ -438,6 +438,7 @@ mod tests {
 
     /// 权限位保留回归:用户可能已把含 token 的配置文件 chmod 600,注册/自愈不得
     /// 把权限重置成 umask 默认(0644)。
+    #[cfg(unix)]
     #[test]
     fn register_preserves_existing_file_permissions() {
         use std::os::unix::fs::PermissionsExt;

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "target/bundle-libs/windows/cargs.dll": "",
+      "target/bundle-libs/windows/onnxruntime.dll": "",
+      "target/bundle-libs/windows/onnxruntime_providers_shared.dll": "",
+      "target/bundle-libs/windows/sherpa-onnx-c-api.dll": "",
+      "target/bundle-libs/windows/sherpa-onnx-cxx-api.dll": ""
+    }
+  }
+}

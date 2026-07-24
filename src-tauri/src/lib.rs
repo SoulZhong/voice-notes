@@ -1507,13 +1507,17 @@ pub(crate) fn do_stop_tail(app: &AppHandle, note_id: String) {
 }
 
 #[tauri::command]
-fn stop_recording(app: AppHandle) {
-    // 薄壳:经 actor 串行执行停录(P2:teardown+自投 Finalize,reply 在收尾完成后
-    // 才回,同步语义与旧直调一致)。Err 仅在 actor 已退出(进程收尾)时出现;
-    // 原直调无返回值,保持壳签名不变,记日志即可。
-    if let Err(e) = app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Stop) {
-        eprintln!("stop_recording: {e}");
-    }
+async fn stop_recording(app: AppHandle) -> Result<(), String> {
+    // 停录会排干分段/ASR worker、收尾 WAV 并 finalize 笔记，这些都是有意保留的
+    // 阻塞操作。同步命令会占住 Tauri IPC 执行路径，在 Windows 上表现为整个 WebView
+    // 无法重绘。把完整的 durable shutdown 移到阻塞线程池：数据完整性和 reply=已落盘
+    // 的语义不变，但 UI 事件循环始终可响应。
+    let lifecycle = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        lifecycle.command(lifecycle::Cmd::Stop)
+    })
+    .await
+    .map_err(|e| format!("停止录制后台任务异常: {e}"))?
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -2929,8 +2933,12 @@ struct RegisterOutcome {
 static MCP_HEALED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[tauri::command]
-fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> {
-    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
+async fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
+    })
+    .await
+    .map_err(|e| format!("Agent 状态后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2951,8 +2959,12 @@ fn mcp_unregister(agent: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn mcp_manual_snippet() -> Result<String, String> {
-    Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
+async fn mcp_manual_snippet() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
+    })
+    .await
+    .map_err(|e| format!("MCP 配置读取后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2971,8 +2983,12 @@ fn skill_state_str(state: mcp::skill::SkillState) -> &'static str {
 }
 
 #[tauri::command]
-fn mcp_skill_status() -> Result<String, String> {
-    Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
+async fn mcp_skill_status() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
+    })
+    .await
+    .map_err(|e| format!("Skill 状态后台任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -2994,19 +3010,27 @@ fn mcp_capabilities() -> serde_json::Value {
 /// 四家 Agent CLI 的本机探测结果(key → 解析到的可执行路径或 null),供 /ai 页
 /// Agent Aing 模式展示「已检测到/未检测到」。探测只做文件存在性检查,毫秒级。
 #[tauri::command]
-fn refine_agents_probe() -> serde_json::Value {
-    refine::agent::probe_all()
-        .into_iter()
-        .map(|(k, p)| (k.to_string(), serde_json::json!(p)))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+async fn refine_agents_probe() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        refine::agent::probe_all()
+            .into_iter()
+            .map(|(k, p)| (k.to_string(), serde_json::json!(p)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    })
+    .await
+    .map_err(|e| format!("Agent 探测后台任务异常: {e}"))
 }
 
 /// AI 调用日志查询(倒序分页,过滤条件见 ailog::Filter)。
 #[tauri::command]
-fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    Ok(ailog::query(&root, &filter))
+async fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        Ok(ailog::query(&root, &filter))
+    })
+    .await
+    .map_err(|e| format!("AI 日志查询后台任务异常: {e}"))?
 }
 
 /// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
@@ -3024,7 +3048,13 @@ fn ai_logs_open_dir(app: AppHandle) -> Result<String, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
     let dir = ailog::log_dir(&root);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::process::Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(&dir).spawn().map_err(|e| e.to_string())?;
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -4309,7 +4339,7 @@ mod tests {
 
     #[test]
     fn semantic_graph_commands_are_registered() {
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         let handlers = source
             .split_once(".invoke_handler(tauri::generate_handler![")
             .expect("generate_handler block")
@@ -4394,7 +4424,7 @@ mod tests {
         )
         .is_err());
 
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(source.contains("#[cfg(debug_assertions)]\n            semantic_graph_debug_fixture,"));
         assert!(source.contains(
             "#[cfg(debug_assertions)]\n            semantic_graph_debug_relation_detail,"

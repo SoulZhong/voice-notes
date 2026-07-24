@@ -268,7 +268,11 @@
       <div class="controls">
         <!-- 左:控制钮组 -->
         <div class="ctl-group">
-          {#if !recording.isLive}
+          {#if recording.stopping}
+            <button class="ctl danger" disabled>
+              <span class="sym square"></span>正在停止…
+            </button>
+          {:else if !recording.isLive}
             <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
               <span class="sym dot on-blue"></span>开始录制
             </button>

@@ -68,6 +68,7 @@ export const recording = {
   get pending() { return pending; },
   get isRecording() { return status === "recording"; },
   get paused() { return paused; },
+  get stopping() { return status === "stopping"; },
   get isLive() { return status === "recording" || status === "paused"; },
   get level() { return level; },
   /** 活跃录制毫秒：后端快照 + 本地走表（暂停/停止时不走）。 */
@@ -285,10 +286,21 @@ export const recording = {
   },
 
   async stop() {
-    if (pending) return;
+    if (pending || !this.isLive) return;
+    const previousStatus = status;
     pending = true;
+    // 后端仍会安全排空识别/音频管线并完成落盘；先给出即时反馈，避免数秒收尾看似没点中。
+    status = "stopping";
+    paused = false;
+    tickAnchor = null;
+    level = 0;
     try {
       await invoke("stop_recording");
+    } catch (err) {
+      status = previousStatus;
+      paused = previousStatus === "paused";
+      tickAnchor = previousStatus === "recording" ? Date.now() : null;
+      throw err;
     } finally {
       pending = false;
     }
