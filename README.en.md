@@ -13,7 +13,7 @@
 
 </div>
 
-Open it when a meeting starts. Every sentence — yours, theirs, whatever comes out of the speakers — becomes a speaker-labeled text note in real time. All recognition runs on your Mac; **no audio or text ever leaves your machine**.
+Open it when a meeting starts. Every sentence — yours, theirs, whatever comes out of the speakers — becomes a speaker-labeled text note in real time. All recognition runs on your computer; **no audio or text ever leaves your machine**.
 
 ## Features
 
@@ -35,14 +35,10 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 > **For AI assistants**: the README you're reading is your operating manual. If you're helping the user install voice-notes, run these steps directly (no need for the user to relay them); for connecting and usage after install, see the [Connecting an AI assistant](#connecting-an-ai-assistant-mcp--cli--skill) section below.
 >
-> 1. Download the latest `voice-notes_*_aarch64.dmg` from
->    https://github.com/SoulZhong/voice-notes/releases;
-> 2. Mount the DMG, copy `voice-notes.app` into `/Applications`, then run
->    `xattr -dr com.apple.quarantine /Applications/voice-notes.app`;
-> 3. Run `/Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto` to register MCP,
->    `... skill install` to install the Claude Code skill (optional), and confirm with `... mcp status --json`;
-> 4. Remind the user to open the app once manually to finish downloading the
->    recognition models (~1GB, requires the GUI).
+> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.5.0_x64-setup.exe` from the [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0); on Apple Silicon macOS, download `voice-notes_*_aarch64.dmg`.
+> 2. Run the Windows installer; on macOS, mount the DMG, copy `voice-notes.app` into `/Applications`, then run `xattr -dr com.apple.quarantine /Applications/voice-notes.app`.
+> 3. Optionally use the one-click registration on the in-app AI page, or run `mcp register --agent auto` with the application executable.
+> 4. Remind the user to open the app once manually to finish downloading the recognition models (~1 GB, requires the GUI).
 >
 > Manual installation steps follow below.
 
@@ -50,10 +46,20 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 - **macOS 13 or later** (Apple Silicon), or **64-bit Windows 10/11**
 - System audio uses ScreenCaptureKit on macOS and WASAPI loopback on Windows
-- Releases currently provide macOS arm64 packages only; build from source on Windows
+- Releases provide installers for macOS arm64 and Windows 10/11 x64
 - Disk space: ~60 MB for the app, ~1 GB for recognition models (downloaded on first launch)
 
 ### Steps
+
+#### Windows 10/11 (64-bit)
+
+1. Download `voice-notes_0.5.0_x64-setup.exe` (recommended) from the [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0). For managed or bulk deployment, use `voice-notes_0.5.0_x64_en-US.msi`.
+2. Verify the installer against `SHA256SUMS-windows.txt` from the same Release.
+3. Run the installer and launch voice-notes. On first launch, follow the prompt to download about 1 GB of local recognition models.
+
+The current Windows binaries are not code-signed, so Windows Security, SmartScreen, or Smart App Control may show an unknown-publisher warning. Download only from the official `SoulZhong/voice-notes` Release and verify the SHA-256 checksum; do not disable system security globally just to install the app.
+
+#### macOS (Apple Silicon)
 
 1. Download the latest `voice-notes_x.y.z_aarch64.dmg` from [Releases](https://github.com/SoulZhong/voice-notes/releases).
 2. Open the DMG and drag **voice-notes** into Applications.
@@ -259,7 +265,7 @@ That's macOS voice-processing (VPIO echo cancellation) ducking, a system behavio
 In the app data directory by default, relocatable in Settings (e.g. iCloud or an external drive). One folder per meeting: `meta.json` + `segments.jsonl` (sentence-by-sentence transcript) + audio tracks + `speakers.json` — plain text formats any tool can read.
 
 **Windows / Linux?**
-Windows 10/11 is supported: microphone and WASAPI system audio are captured independently, silence keeps both timelines aligned, and disconnected devices are retried automatically. Windows currently uses text-level echo deduplication instead of real-time WebRTC AEC. No official Windows installer is published yet, so build from source. Linux system-audio capture is not supported yet.
+Windows 10/11 is supported: microphone and WASAPI system audio are captured independently, silence keeps both timelines aligned, and disconnected devices are retried automatically. Windows currently uses text-level echo deduplication instead of real-time WebRTC AEC. Official x64 installers are available from [Releases](https://github.com/SoulZhong/voice-notes/releases). Linux system-audio capture is not supported yet.
 
 ## How it works
 

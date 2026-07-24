@@ -13,7 +13,7 @@
 
 </div>
 
-开会时打开它，说的每一句话——你的、对方的、外放里的——实时变成带说话人标签的文字笔记。所有识别都在你的 Mac 上完成，**没有任何音频或文字离开本机**。
+开会时打开它，说的每一句话——你的、对方的、外放里的——实时变成带说话人标签的文字笔记。所有识别都在你的电脑上完成，**没有任何音频或文字离开本机**。
 
 ## 特性
 
@@ -35,12 +35,10 @@
 
 > **给 AI 助手**:你正在读的这份 README 就是给你的操作说明。如果你在帮用户安装 voice-notes,直接按以下步骤执行(无需用户转达);装完后的接入与用法见下方[接入 AI 助手](#接入-ai-助手mcp--cli--skill)章节。
 >
-> 1. 从 https://github.com/SoulZhong/voice-notes/releases 下载最新的 `voice-notes_*_aarch64.dmg`;
-> 2. 挂载 DMG,把 `voice-notes.app` 拷入 `/Applications`,再执行
->    `xattr -dr com.apple.quarantine /Applications/voice-notes.app`;
-> 3. 执行 `/Applications/voice-notes.app/Contents/MacOS/voice-notes mcp register --agent auto` 注册 MCP、
->    `... skill install` 安装 Claude Code 技能(可选),用 `... mcp status --json` 确认;
-> 4. 提醒用户手动打开一次 App 完成识别模型下载(约 1GB,需要 GUI)。
+> 1. 先确认用户平台。Windows 10/11 x64 从 [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0) 下载 `voice-notes_0.5.0_x64-setup.exe`；macOS Apple Silicon 下载 `voice-notes_*_aarch64.dmg`。
+> 2. Windows 运行安装包；macOS 挂载 DMG，把 `voice-notes.app` 拷入 `/Applications`，再执行 `xattr -dr com.apple.quarantine /Applications/voice-notes.app`。
+> 3. 可选：执行应用内「AI」页的一键注册，或用应用可执行文件运行 `mcp register --agent auto`。
+> 4. 提醒用户手动打开一次 App 完成识别模型下载（约 1GB，需要 GUI）。
 >
 > 以下是人工安装步骤。
 
@@ -48,10 +46,20 @@
 
 - **macOS 13 或更高**（Apple Silicon），或 **Windows 10/11 64 位**
 - macOS 系统声音使用 ScreenCaptureKit；Windows 系统声音使用 WASAPI loopback
-- Releases 目前只提供 macOS arm64 安装包；Windows 请按下方步骤从源码构建
+- Releases 提供 macOS arm64 与 Windows 10/11 x64 安装包
 - 磁盘空间：应用本体约 60MB，识别模型约 1GB（首次启动下载）
 
 ### 安装步骤
+
+#### Windows 10/11（64 位）
+
+1. 从 [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0) 下载 `voice-notes_0.5.0_x64-setup.exe`（推荐）；企业或批量部署可使用 `voice-notes_0.5.0_x64_en-US.msi`。
+2. 对照同一 Release 中的 `SHA256SUMS-windows.txt` 校验安装包。
+3. 运行安装包并启动 voice-notes；首次启动按提示下载约 1GB 的本地识别模型。
+
+当前 Windows 安装包尚未代码签名，Windows 安全中心、SmartScreen 或 Smart App Control 可能提示未知发布者。请只从官方 `SoulZhong/voice-notes` Release 下载并核对 SHA-256；不要为了安装而全局关闭系统安全功能。
+
+#### macOS（Apple Silicon）
 
 1. 到 [Releases](https://github.com/SoulZhong/voice-notes/releases) 下载最新的 `voice-notes_x.y.z_aarch64.dmg`。
 2. 打开 DMG，把 **voice-notes** 拖进「应用程序」文件夹。
@@ -254,7 +262,7 @@ macOS 采集系统声音（别的 App 放出来的声音）只能走 ScreenCaptu
 默认在应用数据目录，可在设置里迁移到任意位置（如 iCloud/外置盘）。每场会议一个文件夹：`meta.json` + `segments.jsonl`（逐句转写）+ 音频轨 + `speakers.json`，纯文本格式，随时可被其他工具读取。
 
 **支持 Windows / Linux 吗？**
-支持 Windows 10/11：麦克风与 WASAPI 系统声音可双路录制，静音时会自动维持时间轴，设备断开后自动尝试恢复。Windows 暂不使用 WebRTC 实时 AEC，仍有文本级回声去重兜底。目前未提供官方 Windows 安装包，需从源码构建。Linux 尚未支持系统声音采集。
+支持 Windows 10/11：麦克风与 WASAPI 系统声音可双路录制，静音时会自动维持时间轴，设备断开后自动尝试恢复。Windows 暂不使用 WebRTC 实时 AEC，仍有文本级回声去重兜底。官方 x64 安装包可从 [Releases](https://github.com/SoulZhong/voice-notes/releases) 下载。Linux 尚未支持系统声音采集。
 
 ## 工作原理
 
