@@ -7,7 +7,7 @@ name: windows-check
 
 on:
   push:
-    branches: [master, main, feature/meetily-borrow-windows]
+    branches: [master, main]
   pull_request:
   workflow_dispatch:
 
