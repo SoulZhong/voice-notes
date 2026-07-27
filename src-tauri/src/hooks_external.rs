@@ -422,18 +422,24 @@ fn wait_timeout(child: &mut std::process::Child, limit: Duration) -> Option<std:
 pub fn run_shell(command: &str, envs: &[(String, String)], limit: Duration) -> Result<i32, String> {
     #[cfg(windows)]
     let mut c = {
-        let mut c = std::process::Command::new("cmd.exe");
+        use std::os::windows::process::CommandExt;
+        // cmd.exe 按 %ComSpec% 绝对路径解析,避免 PATH 搜索;命令串必须 raw_arg 原样
+        // 下发——std 默认按 MSVC 约定把引号转义成 \",cmd.exe 不认,带引号路径的钩子
+        // 命令会被毁掉。外层再包一对引号,配合 /S 固定首尾引号剥离规则。
+        let shell = std::env::var_os("ComSpec")
+            .unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+        let mut c = std::process::Command::new(shell);
         c.args(["/S", "/C"]);
+        c.raw_arg(format!("\"{command}\""));
         c
     };
     #[cfg(not(windows))]
     let mut c = {
         let mut c = std::process::Command::new("/bin/sh");
-        c.arg("-c");
+        c.arg("-c").arg(command);
         c
     };
-    c.arg(command)
-        .stdin(std::process::Stdio::null())
+    c.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     for (k, v) in envs {

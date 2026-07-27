@@ -7,11 +7,11 @@ type Runtime = typeof globalThis & {
 
 const runtime = globalThis as Runtime;
 const fs = runtime.process.getBuiltinModule("fs");
-const read = (path: string) => fs.readFileSync(`${runtime.process.cwd()}\\${path}`, "utf8");
+const read = (path: string) => fs.readFileSync(`${runtime.process.cwd()}/${path}`, "utf8");
 
 describe("AI navigation responsiveness", () => {
   it("runs blocking AI startup commands outside Tauri's command thread", () => {
-    const rust = read("src-tauri\\src\\lib.rs");
+    const rust = read("src-tauri/src/lib.rs");
     const commands = [
       "mcp_agents_status",
       "mcp_manual_snippet",
@@ -32,7 +32,7 @@ describe("AI navigation responsiveness", () => {
   });
 
   it("centers every sidebar tab in the same full-width rail", () => {
-    const sidebar = read("src\\lib\\Sidebar.svelte");
+    const sidebar = read("src/lib/Sidebar.svelte");
     const tabStart = sidebar.indexOf(".vtab {");
     const tabEnd = sidebar.indexOf("}", tabStart);
     const tabRule = sidebar.slice(tabStart, tabEnd);

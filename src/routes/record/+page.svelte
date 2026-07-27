@@ -282,7 +282,7 @@
             {:else}
               <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
             {/if}
-            <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop()}>
+            <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}>
               <span class="sym square"></span>停止
             </button>
           {/if}

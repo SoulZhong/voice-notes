@@ -1528,9 +1528,14 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
     let lc = app.state::<lifecycle::LifecycleHandle>();
     if running {
         // P1 改道:经 actor 串行(委托 do_stop_recording,恒 Ok);Err 仅 actor 退出时出现。
-        if let Err(e) = lc.command(lifecycle::Cmd::Stop) {
-            eprintln!("快捷键触发停录失败(静默进日志): {e}");
-        }
+        // 停录是持续数秒的 durable shutdown,而托盘菜单/全局快捷键回调跑在事件循环线程,
+        // 同步等待会冻结 WebView(与 stop_recording 命令同因):丢阻塞线程池,错误照旧进日志。
+        let lc = lc.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = lc.command(lifecycle::Cmd::Stop) {
+                eprintln!("快捷键触发停录失败(静默进日志): {e}");
+            }
+        });
     } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
     }
@@ -3036,10 +3041,14 @@ async fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_js
 /// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
 /// 「写数据目录、把路径给用户」约定)。
 #[tauri::command]
-fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    let (path, count) = ailog::export_jsonl(&root, None).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
+async fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let (path, count) = ailog::export_jsonl(&root, None).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
+    })
+    .await
+    .map_err(|e| format!("AI 日志导出后台任务异常: {e}"))?
 }
 
 /// 在访达中打开 AI 日志目录(macOS `open`;目录不存在先建,空目录也可打开)。

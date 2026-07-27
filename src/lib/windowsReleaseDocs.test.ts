@@ -7,7 +7,7 @@ type Runtime = typeof globalThis & {
 
 const runtime = globalThis as Runtime;
 const fs = runtime.process.getBuiltinModule("fs");
-const read = (path: string) => fs.readFileSync(`${runtime.process.cwd()}\\${path}`, "utf8");
+const read = (path: string) => fs.readFileSync(`${runtime.process.cwd()}/${path}`, "utf8");
 
 describe("Windows release documentation", () => {
   it("documents the official v0.5.0 Windows artifacts in both READMEs", () => {
@@ -36,7 +36,7 @@ describe("Windows release documentation", () => {
 
 describe("Windows CI resource staging", () => {
   it("stages every Tauri runtime resource before cargo check", () => {
-    const workflow = read(".github\\workflows\\windows-check.yml");
+    const workflow = read(".github/workflows/windows-check.yml");
     const staging = workflow.indexOf("Stage Tauri runtime resource placeholders");
     const cargoCheck = workflow.indexOf("- name: cargo check (lib, Windows msvc)");
 

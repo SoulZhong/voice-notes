@@ -344,8 +344,11 @@ impl AnchoredRefinedDir {
             FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
-        // Existing final symlinks/reparse points fail closed. A replacement racing after this
-        // check is replaced as a directory entry by the handle-relative rename and is not followed.
+        // Existing final symlinks/reparse points fail closed. The commit below is a path-based
+        // MoveFileExW (the handle-relative rename was dropped for Windows share-mode reasons):
+        // it replaces the destination directory entry without following it, but unlike the Unix
+        // renameat path it re-resolves parent components, so a parent swapped for a junction
+        // after this check is a knowingly accepted residual race in this single-user data dir.
         if let Some(metadata) = symlink_metadata_optional(&self.path.join(AING_DOC_FILE))? {
             anyhow::ensure!(
                 metadata.is_file()
