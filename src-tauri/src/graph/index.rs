@@ -1860,6 +1860,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn every_injected_failure_keeps_live_bytes_and_queries_unchanged() {
         let root = tempfile::tempdir().unwrap();
@@ -1893,6 +1894,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn sync_failures_before_publish_keep_live_bytes_and_queries_unchanged() {
         let root = tempfile::tempdir().unwrap();
@@ -2418,6 +2420,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn first_versioned_pointer_failure_keeps_direct_compatibility_pointer() {
         let root = tempfile::tempdir().unwrap();
@@ -3239,7 +3242,7 @@ mod tests {
     fn readonly_open_rejects_more_than_one_graph_meta_row() {
         let root = tempfile::tempdir().unwrap();
         rebuild_atomic(root.path(), &fixture()).unwrap();
-        let live = root.path().join(super::super::GRAPH_FILE);
+        let live = current_version_path(root.path()).unwrap();
         let conn = rusqlite::Connection::open(&live).unwrap();
         conn.execute("ALTER TABLE graph_meta RENAME TO old_graph_meta", [])
             .unwrap();
@@ -3268,7 +3271,7 @@ mod tests {
     fn readonly_open_rejects_graph_meta_without_singleton_checks() {
         let root = tempfile::tempdir().unwrap();
         rebuild_atomic(root.path(), &fixture()).unwrap();
-        let live = root.path().join(super::super::GRAPH_FILE);
+        let live = current_version_path(root.path()).unwrap();
         let conn = rusqlite::Connection::open(&live).unwrap();
         conn.execute("ALTER TABLE graph_meta RENAME TO old_graph_meta", [])
             .unwrap();

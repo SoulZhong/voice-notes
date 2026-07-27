@@ -822,12 +822,15 @@ where
             .open(&tmp)?;
         std::io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
+        // Windows does not allow renaming a file while this non-shareable
+        // handle is still open. Unix permits it, which hid the bug there.
+        drop(file);
         if fs::metadata(&live).is_ok() {
             fs::copy(&live, &backup)?;
-            File::open(&backup)?.sync_all()?;
+            OpenOptions::new().read(true).write(true).open(&backup)?.sync_all()?;
         }
         before_rename()?;
-        fs::rename(&tmp, &live)?;
+        atomic_replace(&tmp, &live)?;
         committed = true;
         sync_directory(data_root)?;
         Ok(())
@@ -836,6 +839,33 @@ where
         let _ = fs::remove_file(tmp);
     }
     result
+}
+
+#[cfg(windows)]
+fn atomic_replace(staged: &Path, live: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let staged = staged.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let live = live.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            live.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(staged: &Path, live: &Path) -> std::io::Result<()> {
+    fs::rename(staged, live)
 }
 
 #[cfg(unix)]

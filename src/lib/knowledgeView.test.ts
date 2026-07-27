@@ -600,7 +600,9 @@ describe("exploratory graph UI source contract", () => {
   const source = (name: string) => {
     const value = sources[name];
     if (value === undefined) throw new Error(`Missing source fixture: ${name}`);
-    return value;
+    // Vite's raw loader preserves the checkout's line endings. Normalize them
+    // so source-contract assertions behave identically on Windows and Unix.
+    return value.replace(/\r\n/g, "\n");
   };
 
   it("renders semantic foreground edges with stable directed paths and whole labels", () => {
