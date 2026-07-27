@@ -226,7 +226,11 @@
 
   async function toggleRecording() {
     if (recording.isLive) {
-      await recording.stop(); // 跳详情由全局 status 监听驱动
+      try {
+        await recording.stop(); // 跳详情由全局 status 监听驱动
+      } catch (err) {
+        console.error("停止录制失败", err); // stop() 失败已回滚状态,这里只记日志防未处理拒绝
+      }
     } else {
       await recording.start();
       // 无论成败都进录制页:失败时错误状态与模型下载卡只在录制页渲染,
@@ -327,15 +331,16 @@
         onclick={() => (graphDrawerOpen = !graphDrawerOpen)}
       >筛选</button>
     {/if}
-    <button
+    <a
       class="vtab"
       class:active={tab === "hooks"}
-      onclick={() => { if ($page.url.pathname !== "/hooks") goto("/hooks"); }}>钩子</button
+      href="/hooks"
+      data-sveltekit-preload-code="eager">钩子</a
     >
-    <button
+    <a
       class="vtab vtab-upright"
       class:active={tab === "ai"}
-      onclick={() => { if (!$page.url.pathname.startsWith("/ai")) goto("/ai"); }}>AI</button
+      href="/ai">AI</a
     >
     <button
       class="vtab"
@@ -357,10 +362,10 @@
     class="record-btn"
     class:recording={recording.isLive}
     onclick={toggleRecording}
-    disabled={recording.pending}
+    disabled={recording.pending || recording.stopping}
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
-    {recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
+    {recording.stopping ? "正在停止…" : recording.isLive ? (recording.paused ? "已暂停 · 停止" : "停止录制") : "开始录制"}
   </button>
 
   {#if tab === "hooks"}
@@ -643,6 +648,11 @@
   /* 竖排文件夹页签:选中态与面板同底且右边线断开(margin-right 盖住面板左边线),
      页签与面板融为一体=凸起;未选中透明退后,hover 半显影。 */
   .vtab {
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
     writing-mode: vertical-rl;
     letter-spacing: 0.12em;
     padding: 0.8em 0.3em;
@@ -654,6 +664,7 @@
     border-right: none;
     border-radius: var(--radius-md) 0 0 var(--radius-md);
     cursor: pointer;
+    text-decoration: none;
   }
   /* 拉丁标签(AI):竖排会把字母放倒或上下堆叠,改横排让「AI」两字母同行并排 */
   .vtab-upright {

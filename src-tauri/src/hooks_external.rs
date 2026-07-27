@@ -417,12 +417,29 @@ fn wait_timeout(child: &mut std::process::Child, limit: Duration) -> Option<std:
     }
 }
 
-/// /bin/sh -c 执行;stdio 全接 null——钩子输出不是产品数据,要日志请命令自己重定向。
+/// 使用系统原生 shell 执行（Windows 为 cmd.exe，Unix 为 /bin/sh）；
+/// stdio 全接 null——钩子输出不是产品数据，要日志请命令自己重定向。
 pub fn run_shell(command: &str, envs: &[(String, String)], limit: Duration) -> Result<i32, String> {
-    let mut c = std::process::Command::new("/bin/sh");
-    c.arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::null())
+    #[cfg(windows)]
+    let mut c = {
+        use std::os::windows::process::CommandExt;
+        // cmd.exe 按 %ComSpec% 绝对路径解析,避免 PATH 搜索;命令串必须 raw_arg 原样
+        // 下发——std 默认按 MSVC 约定把引号转义成 \",cmd.exe 不认,带引号路径的钩子
+        // 命令会被毁掉。外层再包一对引号,配合 /S 固定首尾引号剥离规则。
+        let shell = std::env::var_os("ComSpec")
+            .unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+        let mut c = std::process::Command::new(shell);
+        c.args(["/S", "/C"]);
+        c.raw_arg(format!("\"{command}\""));
+        c
+    };
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = std::process::Command::new("/bin/sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    c.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     for (k, v) in envs {
@@ -584,13 +601,37 @@ mod tests {
     fn run_shell_exit_code_env_and_timeout() {
         let t = Duration::from_secs(5);
         assert_eq!(run_shell("exit 0", &[], t).unwrap(), 0);
+        #[cfg(not(windows))]
         assert_eq!(run_shell("exit 3", &[], t).unwrap(), 3);
+        #[cfg(windows)]
+        assert_eq!(run_shell("exit /b 3", &[], t).unwrap(), 3);
         // 环境变量注入:变量对得上才退 0
         let envs = shell_envs("recording_started", "n1", "t");
+        #[cfg(not(windows))]
         assert_eq!(run_shell(r#"[ "$VN_EVENT" = recording_started ]"#, &envs, t).unwrap(), 0);
+        #[cfg(windows)]
+        assert_eq!(
+            run_shell(
+                r#"if "%VN_EVENT%"=="recording_started" (exit /b 0) else (exit /b 1)"#,
+                &envs,
+                t,
+            )
+            .unwrap(),
+            0
+        );
         // 超时:1s 限制跑 sleep 10 → Err 且不悬挂
         let start = std::time::Instant::now();
+        #[cfg(not(windows))]
         assert!(run_shell("sleep 10", &[], Duration::from_secs(1)).is_err());
+        #[cfg(windows)]
+        assert!(
+            run_shell(
+                "ping 127.0.0.1 -n 10 >nul",
+                &[],
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
         assert!(start.elapsed() < Duration::from_secs(5), "超时后必须立刻返回");
     }
 

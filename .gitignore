@@ -18,3 +18,4 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .superpowers/
 .playwright-mcp/
+.worktrees/

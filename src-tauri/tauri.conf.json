@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
-    "beforeBundleCommand": "bash src-tauri/fix-bundle-dylibs.sh",
+    "beforeBundleCommand": "node scripts/fix-bundle-dylibs.mjs",
     "frontendDist": "../build"
   },
   "app": {

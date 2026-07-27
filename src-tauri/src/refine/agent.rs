@@ -76,19 +76,34 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
         let p = PathBuf::from(override_path.trim());
         return p.is_file().then_some(p);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let name = kind.bin_name();
     let mut candidates = vec![
-        PathBuf::from(&home).join(".local/bin").join(name),
+        home.join(".local/bin").join(name),
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
     ];
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let npm = PathBuf::from(appdata).join("npm");
+            candidates.push(npm.join(format!("{name}.cmd")));
+            candidates.push(npm.join(format!("{name}.exe")));
+        }
+        candidates.push(home.join(".local/bin").join(format!("{name}.exe")));
+        candidates.push(home.join(".local/bin").join(format!("{name}.cmd")));
+    }
     if kind == AgentKind::Claude {
         // claude 官方迁移安装器的自管位置。
-        candidates.push(PathBuf::from(&home).join(".claude/local/claude"));
+        candidates.push(home.join(".claude/local/claude"));
+        #[cfg(windows)]
+        candidates.push(home.join(".claude/local/claude.exe"));
     }
     // nvm 全局包(codex/gemini 常经 npm -g 安装):扫各 node 版本的 bin。
-    if let Ok(rd) = std::fs::read_dir(PathBuf::from(&home).join(".nvm/versions/node")) {
+    if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
         for e in rd.flatten() {
             candidates.push(e.path().join("bin").join(name));
         }
@@ -97,11 +112,15 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
         return Some(hit);
     }
     // PATH 兜底
+    #[cfg(windows)]
+    let out = Command::new("where.exe").arg(name).output().ok()?;
+    #[cfg(not(windows))]
     let out = Command::new("which").arg(name).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let first = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    let p = PathBuf::from(first);
     p.is_file().then_some(p)
 }
 
@@ -1097,6 +1116,7 @@ mod tests {
 
     /// 写一个假 Agent 可执行脚本。body 里可用 $1..(prompt 等参数),测试把要写的
     /// 目标路径直接烤进脚本文本。
+    #[cfg(unix)]
     fn fake_bin(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("fake-agent");
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1123,6 +1143,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_bin_override_must_exist_and_never_falls_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1437,6 +1458,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_refine_trusts_disk_not_agent_exit_code() {
         // Agent 退出 0 但没写回 → 失败;假 Agent 把 llm 置 done → 成功。
@@ -1502,6 +1524,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         assert_eq!(e["response"]["exit_ok"], true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_refine_marks_graph_failed_without_destroying_the_prior_snapshot() {
         let note = tempfile::tempdir().unwrap();
@@ -1579,6 +1602,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         assert_eq!(after.graph_extraction, before.graph_extraction);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_refine_rejects_paragraph_count_change_and_requires_baseline() {
         let note = tempfile::tempdir().unwrap();
@@ -1631,6 +1655,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         assert!(extract_title(&"字".repeat(40)).is_err(), "超长拒绝");
     }
 
+    #[cfg(unix)]
     #[test]
     fn gen_title_via_fake_agent_and_empty_doc_bails() {
         let bins = tempfile::tempdir().unwrap();
