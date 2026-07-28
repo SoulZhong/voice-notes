@@ -3158,7 +3158,12 @@ fn preload_models(
 
 #[tauri::command]
 fn models_status(app: AppHandle) -> models::ModelsStatus {
-    models::status(&current_asr(&app))
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    models::status_for(
+        &s.asr_model,
+        s.asr_mode == settings::ASR_MODE_CLOUD,
+        settings::cloud_creds_ok(&s),
+    )
 }
 
 /// 在系统文件管理器中打开模型存储目录(设置页「语音模型」区路径点击)。

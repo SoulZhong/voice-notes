@@ -342,6 +342,21 @@ pub fn status(asr_model: &str) -> ModelsStatus {
     }
 }
 
+/// 就绪判定的模式感知入口。cloud_mode=false 时与 status() 完全等价(本地现状);
+/// cloud_mode=true:识别在云端,本地 ASR 大模型全不必需,vad 保留必需(spec §5:
+/// 避免 required_now 分叉、回切本地时不缺件);录制就绪还要求凭证齐(creds_ok)。
+pub fn status_for(asr_model: &str, cloud_mode: bool, creds_ok: bool) -> ModelsStatus {
+    let mut s = status(asr_model);
+    if cloud_mode {
+        for a in &mut s.artifacts {
+            a.required_for_recording = a.id == "vad";
+        }
+        let vad_ok = s.artifacts.iter().find(|a| a.id == "vad").map(|a| a.present).unwrap_or(false);
+        s.recording_ready = vad_ok && creds_ok;
+    }
+    s
+}
+
 /// start/resume_recording 入口的防御检查用。按当前 ASR 选型判定必需工件是否齐。
 pub fn recording_ready(asr_model: &str) -> bool {
     let root = root();
@@ -469,6 +484,22 @@ mod tests {
             assert_eq!(s.url, a.url, "DTO url 应等于注册表 url");
             assert!(!s.url.is_empty(), "url 不应为空");
         }
+    }
+
+    #[test]
+    fn status_for_cloud_mode_needs_only_vad_plus_creds() {
+        // 本地模式 = 现状(回归锚)。
+        let local = status_for(crate::settings::ASR_SENSE_VOICE, false, false);
+        assert_eq!(local.recording_ready, status(crate::settings::ASR_SENSE_VOICE).recording_ready);
+        // 云端模式:ASR 工件全不必需,vad 仍必需。
+        let cloud = status_for(crate::settings::ASR_SENSE_VOICE, true, true);
+        for a in &cloud.artifacts {
+            let want = a.id == "vad";
+            assert_eq!(a.required_for_recording, want, "云端模式 {} 必需性", a.id);
+        }
+        // 凭证缺失 → 即使 vad 在也不就绪。
+        let no_creds = status_for(crate::settings::ASR_SENSE_VOICE, true, false);
+        assert!(!no_creds.recording_ready, "云端无凭证不可开录");
     }
 }
 
