@@ -3,6 +3,7 @@ pub mod whisper;
 pub mod sense_voice;
 pub mod paraformer;
 pub mod qwen3;
+pub mod cloud;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone, Default)]
