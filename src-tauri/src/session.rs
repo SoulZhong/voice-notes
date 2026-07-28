@@ -1025,6 +1025,13 @@ const CLOUD_BACKOFF_BASE_MS: u64 = 1000;
 const CLOUD_BACKOFF_BASE_MS: u64 = 1;
 /// 退避上限(ms):长时间断网不再无限拉长,保证网络恢复后 30s 内必然重试。
 const CLOUD_BACKOFF_CAP_MS: u64 = 30_000;
+/// 「这条流算活过」的门槛(ms):活够这么久才把退避清回基数。低于门槛的流是
+/// 「开起来就死」的抖动流(鉴权过期/服务端持续拒绝),此时清零退避会退化成
+/// 忙重连风暴——每次都 1s 后再来一次,既打厂商也烧电。测试注入 5ms 免空等。
+#[cfg(not(test))]
+const CLOUD_BACKOFF_STABLE_MS: u64 = 5000;
+#[cfg(test)]
+const CLOUD_BACKOFF_STABLE_MS: u64 = 5;
 /// 停录后排干厂商剩余定稿的窗口(ms):厂商常在 finish 之后才吐最后一句。
 /// 测试用短窗:mock 流在 finish 后即断开通道,排干靠断开结束,短窗只是兜底。
 #[cfg(not(test))]
@@ -1062,6 +1069,9 @@ pub(crate) struct SourceFeed {
     ring_start: u64,
     /// 断连起点(绝对样本号);None = 无未补缺口。
     gap_from: Option<u64>,
+    /// 最后一条厂商定稿的绝对结束样本号(开流时以 fed 为起点)。缺口起点靠它,
+    /// 而不是靠 fed —— 见 gap_start。
+    last_final_end: u64,
 }
 
 impl SourceFeed {
@@ -1072,7 +1082,32 @@ impl SourceFeed {
             ring: VecDeque::new(),
             ring_start: 0,
             gap_from: None,
+            last_final_end: 0,
         }
+    }
+
+    /// 缺口起点:已定稿的末尾与已推样本取小者。
+    /// 厂商定稿滞后于推流(推进去的最后一两秒往往还没吐出定稿就断了),若拿 fed
+    /// 当起点,这段"推了但没回话"的音频会被算作已识别而永久丢失;拿定稿末尾当
+    /// 起点最多让接缝处重复识别一小段。接缝宁重复不丢(spec §4)。
+    /// min(fed) 是护栏:定稿 end 常越过已喂样本(服务端补白),缺口起点不该跑到
+    /// 未来去,否则 gap_to <= gap_from 会把整个缺口判成零长。
+    fn gap_start(&self) -> u64 {
+        self.last_final_end.min(self.fed)
+    }
+
+    /// 起一个缺口(若尚无)。get_or_insert:重连成功后立刻再断的场景,缺口起点仍
+    /// 是最早那次,中间这段音频不能被后一次断连"吃掉"。
+    fn begin_gap(&mut self) {
+        let from = self.gap_start();
+        self.gap_from.get_or_insert(from);
+    }
+
+    /// 开流(首开或重连成功)时重基:新流的厂商时钟从 0 重计,此刻的 fed 既是
+    /// stream_base 也是"尚未定稿的起点"。
+    fn rebase(&mut self, at: u64) {
+        self.stream_base = at;
+        self.last_final_end = at;
     }
 
     /// 记一帧账:fed 前进、入环、超 CAP 掐头。断连与否都要记——缺口的音频全靠
@@ -1146,26 +1181,55 @@ struct CloudSource {
     stream: Option<crate::asr::cloud::CloudStream>,
     /// 音频通道是否仍开着(全关 = 停录)。
     audio_open: bool,
-    /// 下次重连时刻(退避);None = 无待重连。
+    /// 当前流的开流时刻;None = 无活流。用于判断这条流"活够久"没有(退避防抖)。
+    stream_opened_at: Option<Instant>,
+    /// 下次重连时刻(退避);None = 不安排自动重连(正常关闭 / 从未断连)。
     retry_at: Option<Instant>,
     backoff_ms: u64,
 }
 
+/// 下一次重连退避:活够 STABLE 才算这条流站住过,退避清回基数;否则继续翻倍到上限。
+/// 纯函数(不看时钟)以便直接单测。
+fn next_backoff(prev_ms: u64, lived_ms: u64) -> u64 {
+    if lived_ms >= CLOUD_BACKOFF_STABLE_MS {
+        CLOUD_BACKOFF_BASE_MS
+    } else {
+        (prev_ms * 2).min(CLOUD_BACKOFF_CAP_MS)
+    }
+}
+
 /// 标记一次断连:记缺口起点、丢弃死流、通知 UI、起退避。
-/// gap_from 用 get_or_insert:重连成功后立刻再断的场景,缺口起点仍是最早那次,
-/// 中间这段音频不能被后一次断连"吃掉"。
 fn mark_disconnected<S: FnMut(CloudAsrStatus)>(cs: &mut CloudSource, on_status: &mut S) {
-    cs.feed.gap_from.get_or_insert(cs.feed.fed);
+    cs.feed.begin_gap();
     cs.stream = None;
-    cs.backoff_ms = CLOUD_BACKOFF_BASE_MS;
+    // 退避按"这条流活了多久"推进:开起来就死的抖动流必须继续拉长间隔,
+    // 无条件清零会在鉴权过期/服务端持续拒绝时变成忙重连风暴。
+    let lived_ms = cs
+        .stream_opened_at
+        .take()
+        .map_or(0, |t| t.elapsed().as_millis() as u64);
+    cs.backoff_ms = next_backoff(cs.backoff_ms, lived_ms);
     cs.retry_at = Some(Instant::now() + Duration::from_millis(cs.backoff_ms));
     on_status(CloudAsrStatus::Reconnecting { source: cs.source });
+}
+
+/// 厂商定稿的绝对样本区间 `[start, end)`:流内 ms 叠加本流基准。
+/// 单独成函数,是因为这段换算同时决定两件事——取哪段音频做声纹、缺口从哪里起
+/// (last_final_end),两处必须用同一把尺子,否则接缝会悄悄错位。
+fn definite_abs_samples(
+    stream_base: u64,
+    u: &crate::asr::cloud::DefiniteUtterance,
+) -> (u64, u64) {
+    (
+        stream_base + ms_to_samples(u.start_ms),
+        stream_base + ms_to_samples(u.end_ms),
+    )
 }
 
 /// 一条厂商定稿落进 FinalSink:流内 ms → 绝对 ms,并按绝对区间从 ring 取声纹样本。
 fn push_definite<F, P, D>(
     source: Source,
-    feed: &SourceFeed,
+    feed: &mut SourceFeed,
     u: &crate::asr::cloud::DefiniteUtterance,
     sink: &mut FinalSink<'_, F, P, D>,
 ) where
@@ -1176,10 +1240,10 @@ fn push_definite<F, P, D>(
     let base_ms = samples_to_ms(feed.stream_base);
     let start_ms = base_ms + u.start_ms;
     let end_ms = base_ms + u.end_ms;
-    let samples = feed.slice(
-        feed.stream_base + ms_to_samples(u.start_ms),
-        feed.stream_base + ms_to_samples(u.end_ms),
-    );
+    let (from, to) = definite_abs_samples(feed.stream_base, u);
+    let samples = feed.slice(from, to);
+    // 定稿推进"已识别水位":后面若断连,缺口就从这里起(见 SourceFeed::gap_start)。
+    feed.last_final_end = to;
     // 到期检查先于本条定稿(与本机 worker 同款):持续来定稿时也能及时放行 hold 中的段。
     sink.tick();
     sink.push(source, utterance_to_transcript(u), start_ms, end_ms, &samples);
@@ -1231,7 +1295,10 @@ fn backfill_gap<F, P, D, S>(
 
     // ring 之外的区间音频已被覆盖,补无可补 → 先落一条占位,再处理覆盖部分,
     // 保证时间轴顺序(占位在前)。
-    let covered_from = gap_from.max(feed.ring_start);
+    // .min(gap_to):占位段绝不许越过缺口末尾。ring_start > gap_to 在当前调用路径下
+    // 走不到(缺口闭合时 gap_to = fed ≥ ring 覆盖范围),一行钳制换掉一类"占位段
+    // 盖到未来"的时间轴错乱。
+    let covered_from = gap_from.max(feed.ring_start).min(gap_to);
     if covered_from > gap_from {
         push_placeholder(source, samples_to_ms(gap_from), samples_to_ms(covered_from), sink);
     }
@@ -1300,17 +1367,26 @@ fn try_recover<F, P, D, S>(
     let Some(gap_from) = cs.feed.gap_from else {
         return;
     };
-    if !force && cs.retry_at.is_some_and(|t| Instant::now() < t) {
-        return;
+    // retry_at=None 且非 force:这个缺口不是断连留下的(厂商正常关闭,见
+    // handle_cloud_event),没有重连语义——正常关闭再自动开一条流只是凭空多一次
+    // 握手。缺口留到停录收尾时统一处理(force 一次:能补则补,补不回就占位)。
+    if !force {
+        match cs.retry_at {
+            None => return,
+            Some(t) if Instant::now() < t => return,
+            Some(_) => {}
+        }
     }
     match cloud.open_stream() {
         Ok(stream) => {
             cs.stream = Some(stream);
-            cs.backoff_ms = CLOUD_BACKOFF_BASE_MS;
+            cs.stream_opened_at = Some(Instant::now());
+            // 退避不在这里清零:一条流"开起来了"不代表它站得住,清零交给
+            // mark_disconnected 按存活时长判定(next_backoff)。
             cs.retry_at = None;
             // 新流的厂商时钟从 0 重计:此刻的 fed 就是它的基准。缺口在此闭合。
             let gap_to = cs.feed.fed;
-            cs.feed.stream_base = gap_to;
+            cs.feed.rebase(gap_to);
             cs.feed.gap_from = None;
             backfill_gap(
                 cs.source,
@@ -1334,9 +1410,12 @@ fn try_recover<F, P, D, S>(
 
 /// 云端识别 worker：每源一条厂商流，音频记账 + 推流，事件回灌同一条 FinalSink。
 ///
-/// 断连不丢内容是本函数的核心不变式：流一死就记下缺口起点，其间的音频照常记账进
+/// 断连不丢内容是本函数的核心不变式：流一死就记下缺口起点(取"最后一条定稿的末尾"
+/// 而非"已推样本",厂商定稿滞后于推流,接缝宁重复不丢)，其间的音频照常记账进
 /// ring；重连成功后把缺口音频切段批式补回来，补不回来(超出 ring / 批式失败 / 停录
 /// 前始终连不上)也要留一条 `[识别失败]` 占位段，绝不静默吞掉一段发声。
+/// 厂商正常关闭(Closed{error:None})同样起缺口——只要音频还在来，那之后喂进来的
+/// 每一帧都无人识别，差别只在不重连、不报"重连中"，缺口留到停录收尾统一了结。
 ///
 /// audio_rxs 全部关闭 = 停录：对活流 finish 并排干厂商最后几句，再 sink.finish()，
 /// 返还 embedder 供调用方复用。
@@ -1374,6 +1453,7 @@ pub fn run_cloud_asr_worker(
             feed: SourceFeed::new(),
             stream: None,
             audio_open: true,
+            stream_opened_at: None,
             retry_at: None,
             backoff_ms: CLOUD_BACKOFF_BASE_MS,
         })
@@ -1383,7 +1463,11 @@ pub fn run_cloud_asr_worker(
     // 网络在录制中恢复的场景下,这段音频还能靠补识捞回来。
     for cs in srcs.iter_mut() {
         match cloud.open_stream() {
-            Ok(s) => cs.stream = Some(s),
+            Ok(s) => {
+                cs.stream = Some(s);
+                cs.stream_opened_at = Some(Instant::now());
+                cs.feed.rebase(0); // 首流:基准与"已识别水位"都在 0
+            }
             Err(e) => {
                 eprintln!("云端开流失败({:?} 源): {e};进入重连", cs.source);
                 mark_disconnected(cs, &mut on_status);
@@ -1557,8 +1641,8 @@ pub fn run_cloud_asr_worker(
         match ev {
             // 排干阶段只捞定稿:预览已无处可去,断连也无需再重连(录制已结束)。
             Ok(crate::asr::cloud::CloudEvent::Definite(u)) => {
-                let i = drains[slot].0;
-                push_definite(srcs[i].source, &srcs[i].feed, &u, &mut sink);
+                let cs = &mut srcs[drains[slot].0];
+                push_definite(cs.source, &mut cs.feed, &u, &mut sink);
             }
             Ok(crate::asr::cloud::CloudEvent::Interim { .. }) => {}
             Ok(crate::asr::cloud::CloudEvent::Closed { .. }) | Err(_) => {
@@ -1586,11 +1670,19 @@ fn handle_cloud_event<F, P, D, S>(
 {
     match event {
         crate::asr::cloud::CloudEvent::Interim { text } => sink.push_partial(cs.source, text),
-        crate::asr::cloud::CloudEvent::Definite(u) => push_definite(cs.source, &cs.feed, &u, sink),
+        crate::asr::cloud::CloudEvent::Definite(u) => {
+            push_definite(cs.source, &mut cs.feed, &u, sink)
+        }
         crate::asr::cloud::CloudEvent::Closed { error: None } => {
-            // 正常关闭(厂商侧收尾):不算缺口,也不自动重开——重开是断连语义,
-            // 正常关闭再开一条流只会凭空多一次握手。
+            // 正常关闭(厂商侧收尾):不自动重开——重开是断连语义,正常关闭再开一条
+            // 流只会凭空多一次握手,也不该报"重连中"惊扰 UI。
             cs.stream = None;
+            // 但音频通道还开着就意味着还在录:此后喂进来的每一帧都无人识别,
+            // 必须记成缺口,否则这段发声被静默吞掉(与断连同罪,只是没有告警)。
+            // 缺口留给停录收尾的 force 恢复:能补则补,补不回落占位段留痕。
+            if cs.audio_open {
+                cs.feed.begin_gap();
+            }
         }
         crate::asr::cloud::CloudEvent::Closed { error: Some(e) } => {
             eprintln!("云端连接断开({:?} 源): {e}", cs.source);
@@ -3362,11 +3454,12 @@ mod cloud_worker_tests {
 
     #[test]
     fn definite_maps_stream_ms_to_source_timeline_and_reaches_final() {
+        // 脚本不带 Closed{None}:MockCloudAsr 在开流瞬间就投递全部事件,写在这里
+        // 等于"厂商刚开流就收尾、而录音还在继续",按 F1 会给尾部音频留占位段
+        // (那条语义由 normal_close_mid_session_leaves_placeholder_for_tail_audio 专测)。
+        // 本例只关心时间映射,让流一直活到停录排干为止。
         let mock = MockCloudAsr::new(
-            vec![vec![
-                CloudEvent::Definite(utter("你好", 0, 500)),
-                CloudEvent::Closed { error: None },
-            ]],
+            vec![vec![CloudEvent::Definite(utter("你好", 0, 500))]],
             vec![],
         );
         let (finals, _, _) = drive(mock, vec![vec![0.0; 16000]]);
@@ -3542,16 +3635,14 @@ mod cloud_worker_tests {
     fn each_source_opens_its_own_stream_on_its_own_timeline() {
         // 两源各开一条流(mock 按 open 顺序发脚本),各记各的账。system 侧预览还要
         // 经 push_partial 进 sink 的在途文本记账(mic 预览级回声抑制依赖它)。
+        // 脚本不带 Closed{None}:mock 会在开流瞬间就投递它,那等于"厂商刚开流就收尾
+        // 而录音继续",按 F1 两源都会多出一条尾部占位段,与本例要验的多源时间轴无关。
         let mock = MockCloudAsr::new(
             vec![
-                vec![
-                    CloudEvent::Definite(utter("我这边", 0, 500)),
-                    CloudEvent::Closed { error: None },
-                ],
+                vec![CloudEvent::Definite(utter("我这边", 0, 500))],
                 vec![
                     CloudEvent::Interim { text: "对方在讲".into() },
                     CloudEvent::Definite(utter("对方在讲话", 3000, 3600)),
-                    CloudEvent::Closed { error: None },
                 ],
             ],
             vec![],
@@ -3602,6 +3693,157 @@ mod cloud_worker_tests {
         let tail = feed.slice(feed.fed - 1600, feed.fed + 1600);
         assert_eq!(tail.len(), 1600);
         assert!(tail.iter().all(|&x| x == 0.25));
+    }
+
+    /// 按推流进度投递事件的桩:脚本 `(after_samples, events)` —— 本流累计推入
+    /// after_samples 个样本后事件才进通道(0 = 开流即发)。
+    /// MockCloudAsr 在开流瞬间就把脚本灌满通道,复现不出"先喂音频、定稿/关闭随后
+    /// 才到"的真实次序,而接缝类缺陷(F1 正常关闭吞尾音、F2 定稿滞后)恰恰只在这
+    /// 种次序下才暴露。
+    struct PushGatedCloud {
+        scripts: Mutex<std::collections::VecDeque<(usize, Vec<CloudEvent>)>>,
+        batches: Mutex<std::collections::VecDeque<anyhow::Result<Vec<DefiniteUtterance>>>>,
+    }
+
+    impl PushGatedCloud {
+        fn new(
+            scripts: Vec<(usize, Vec<CloudEvent>)>,
+            batches: Vec<anyhow::Result<Vec<DefiniteUtterance>>>,
+        ) -> Self {
+            Self { scripts: Mutex::new(scripts.into()), batches: Mutex::new(batches.into()) }
+        }
+    }
+
+    impl CloudAsr for PushGatedCloud {
+        fn open_stream(&self) -> anyhow::Result<CloudStream> {
+            let (after, mut pending) = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("PushGatedCloud 流脚本耗尽"))?;
+            let (tx, rx) = crossbeam_channel::unbounded();
+            if after == 0 {
+                for e in pending.drain(..) {
+                    let _ = tx.send(e);
+                }
+            }
+            let mut pushed = 0usize;
+            Ok(CloudStream {
+                // tx 随闭包存活:流活着期间事件通道不断开(与真实适配层一致)。
+                push: Box::new(move |s: &[f32]| {
+                    pushed += s.len();
+                    if pushed >= after {
+                        for e in pending.drain(..) {
+                            let _ = tx.send(e);
+                        }
+                    }
+                    Ok(())
+                }),
+                finish: Box::new(|| Ok(())),
+                events: rx,
+            })
+        }
+        fn transcribe_batch(&self, _s: &[f32]) -> anyhow::Result<Vec<DefiniteUtterance>> {
+            self.batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("PushGatedCloud 批式脚本耗尽")))
+        }
+    }
+
+    #[test]
+    fn normal_close_mid_session_leaves_placeholder_for_tail_audio() {
+        // 厂商在 0.5s 处正常收尾,而录音还在继续:此后 1.5s 音频无流可推 → 必须留痕。
+        let cloud: Arc<dyn CloudAsr> = Arc::new(PushGatedCloud::new(
+            vec![(
+                8_000,
+                vec![
+                    CloudEvent::Definite(utter("短句", 0, 500)),
+                    CloudEvent::Closed { error: None },
+                ],
+            )],
+            vec![],
+        ));
+        let (finals, _, statuses) = drive_with(
+            cloud,
+            vec![vec![0.1; 8_000]; 4], // 4 × 0.5s = 2s
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+        );
+        assert!(finals.contains(&(Source::Mic, "短句".into(), 0, 500)), "{finals:?}");
+        assert!(
+            finals.contains(&(Source::Mic, "[识别失败]".into(), 500, 2000)),
+            "正常关闭之后仍在喂的音频没人识别,必须占位留痕: {finals:?}"
+        );
+        assert!(
+            !statuses.contains(&"Reconnecting".to_string()),
+            "正常关闭不是断连:不重连也不该报重连中: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn gap_starts_at_last_definite_end_not_at_fed() {
+        // 定稿滞后推流:句子只到 500ms,断连时已推到 1000ms。缺口若从 fed 起,
+        // [500ms,1000ms) 这段"推了但没回话"的音频就永久消失。
+        let cloud: Arc<dyn CloudAsr> = Arc::new(PushGatedCloud::new(
+            vec![
+                (
+                    16_000,
+                    vec![
+                        CloudEvent::Definite(utter("甲", 0, 500)),
+                        CloudEvent::Closed { error: Some("net".into()) },
+                    ],
+                ),
+                (0, vec![CloudEvent::Closed { error: None }]),
+            ],
+            vec![Ok(vec![utter("补", 0, 1500)])],
+        ));
+        let gap_lens = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let seen = gap_lens.clone();
+        let (finals, _, statuses) = drive_with(
+            cloud,
+            vec![vec![0.1; 8_000]; 4], // 2s
+            Box::new(move |gap: &[f32]| {
+                seen.lock().unwrap().push(gap.len());
+                vec![(0u64, gap.to_vec())]
+            }),
+        );
+        assert_eq!(
+            *gap_lens.lock().unwrap(),
+            vec![24_000],
+            "缺口 = [最后定稿末尾 500ms, 停录 2000ms) = 1.5s;旧口径 gap_from=fed 只会补回 1s"
+        );
+        assert!(
+            finals.contains(&(Source::Mic, "补".into(), 500, 2000)),
+            "补识结果贴回缺口起点(定稿末尾): {finals:?}"
+        );
+        assert_eq!(statuses, vec!["Reconnecting", "Backfilling", "Recovered"]);
+    }
+
+    #[test]
+    fn next_backoff_doubles_until_cap_and_only_resets_after_stable_run() {
+        assert_eq!(next_backoff(CLOUD_BACKOFF_BASE_MS, 0), CLOUD_BACKOFF_BASE_MS * 2, "秒死流:翻倍");
+        assert_eq!(next_backoff(4, CLOUD_BACKOFF_STABLE_MS - 1), 8, "差一点站住也不算站住");
+        assert_eq!(next_backoff(20_000, 0), CLOUD_BACKOFF_CAP_MS, "翻倍不越上限");
+        assert_eq!(next_backoff(CLOUD_BACKOFF_CAP_MS, 0), CLOUD_BACKOFF_CAP_MS, "封顶后停在上限");
+        assert_eq!(
+            next_backoff(CLOUD_BACKOFF_CAP_MS, CLOUD_BACKOFF_STABLE_MS),
+            CLOUD_BACKOFF_BASE_MS,
+            "活够门槛 → 退避清回基数"
+        );
+        assert_eq!(
+            next_backoff(CLOUD_BACKOFF_CAP_MS, CLOUD_BACKOFF_STABLE_MS * 100),
+            CLOUD_BACKOFF_BASE_MS
+        );
+    }
+
+    #[test]
+    fn definite_abs_samples_anchors_stream_ms_onto_absolute_timeline() {
+        let u = utter("一句", 500, 1200);
+        assert_eq!(definite_abs_samples(0, &u), (8_000, 19_200), "首流:500ms/1200ms → 8000/19200 样本");
+        // 重连后 stream_base 重基到 2s 处,厂商 ms 仍从 0 重计。
+        assert_eq!(definite_abs_samples(32_000, &u), (40_000, 51_200));
     }
 
     #[test]
