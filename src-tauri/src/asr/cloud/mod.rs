@@ -1,7 +1,7 @@
 //! 云端流式 ASR 适配层边界(spec §2)。厂商差异封装在 volcano/aliyun 子模块,
 //! 会话层只见本文件的类型。协议编解码全部纯函数化,单测不碰网络。
 
-// pub mod volcano;  // Task 7 解开
+pub mod volcano;
 // pub mod aliyun;   // Task 9 解开
 
 #[derive(Debug, Clone, PartialEq)]
