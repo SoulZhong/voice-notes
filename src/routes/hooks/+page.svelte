@@ -2,14 +2,14 @@
   <header class="topbar"><h1>钩子</h1></header>
 
   <p class="intro">
-    笔记状态变化时自动执行你的命令或调用接口:停止录制后归档、Aing 完成后发通知——
+    笔记状态变化时自动执行你的命令或调用接口：停止录制后归档、Aing 结束后发通知——
     左侧新建一条钩子,选事件、填命令,配置完可以立即测试。
   </p>
 
   <section>
     <h2 class="section-title">可用事件</h2>
     <div class="flow-card">
-      <svg class="flow-svg diagram" viewBox="0 0 600 268" role="img" aria-label="笔记生命周期状态图:录制中、已暂停、Aing 中依次转移,停止后进入 Aing,Aing 完成即结束">
+      <svg class="flow-svg diagram" viewBox="0 0 820 286" role="img" aria-label="笔记生命周期状态图：录制中停止后进入录制完成，执行 Aing 后按结果进入 AI 已完成或 AI 失败状态">
         <defs>
           <marker id="hk-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" class="arrowhead" />
@@ -18,62 +18,75 @@
 
         <!-- 转移边(先画,压在节点下) -->
         <!-- 起点 → 录制中 -->
-        <line class="edge" x1="46" y1="90" x2="93" y2="90" marker-end="url(#hk-arrow)" />
-        <!-- 录制中 → Aing 中(停止即结束录制并自动开始 Aing) -->
-        <line class="edge" x1="206" y1="90" x2="353" y2="90" marker-end="url(#hk-arrow)" />
-        <!-- Aing 中 → 结束 -->
-        <line class="edge" x1="466" y1="90" x2="548" y2="90" marker-end="url(#hk-arrow)" />
+        <line class="edge" x1="36" y1="92" x2="77" y2="92" marker-end="url(#hk-arrow)" />
+        <!-- 录制中 → 录制完成 -->
+        <line class="edge" x1="203" y1="92" x2="282" y2="92" marker-end="url(#hk-arrow)" />
+        <!-- 录制完成 → Aing 动作 → 成功/失败结果 -->
+        <line class="edge" x1="408" y1="92" x2="547" y2="92" marker-end="url(#hk-arrow)" />
+        <path class="decision" d="M550 92 570 72 590 92 570 112Z" />
+        <line class="edge" x1="590" y1="86" x2="682" y2="65" marker-end="url(#hk-arrow)" />
+        <line class="edge" x1="590" y1="98" x2="682" y2="170" marker-end="url(#hk-arrow)" />
         <!-- 录制中 → 已暂停 -->
-        <line class="edge" x1="135" y1="119" x2="135" y2="184" marker-end="url(#hk-arrow)" />
+        <line class="edge" x1="125" y1="121" x2="125" y2="202" marker-end="url(#hk-arrow)" />
         <!-- 已暂停 → 录制中 -->
-        <line class="edge" x1="165" y1="184" x2="165" y2="121" marker-end="url(#hk-arrow)" />
+        <line class="edge" x1="155" y1="202" x2="155" y2="123" marker-end="url(#hk-arrow)" />
 
         <!-- 起止标记 -->
-        <circle class="start-dot" cx="40" cy="90" r="5" />
-        <circle class="final-ring" cx="560" cy="90" r="9" />
-        <circle class="final-dot" cx="560" cy="90" r="4.5" />
+        <circle class="start-dot" cx="30" cy="92" r="5" />
 
         <!-- 状态节点 -->
         <g class="node">
-          <rect class="node-box" x="96" y="63" width="108" height="54" rx="10" />
-          <text class="node-label" x="150" y="90" text-anchor="middle" dominant-baseline="central">录制中</text>
+          <rect class="node-box" x="80" y="63" width="120" height="58" rx="10" />
+          <text class="node-label" x="140" y="92" text-anchor="middle" dominant-baseline="central">录制中</text>
         </g>
         <g class="node">
-          <rect class="node-box" x="356" y="63" width="108" height="54" rx="10" />
-          <text class="node-label" x="410" y="90" text-anchor="middle" dominant-baseline="central">Aing 中</text>
+          <rect class="node-box" x="285" y="63" width="120" height="58" rx="10" />
+          <text class="node-label" x="345" y="92" text-anchor="middle" dominant-baseline="central">录制完成</text>
         </g>
         <g class="node">
-          <rect class="node-box" x="96" y="187" width="108" height="54" rx="10" />
-          <text class="node-label" x="150" y="214" text-anchor="middle" dominant-baseline="central">已暂停</text>
+          <rect class="node-box" x="685" y="36" width="120" height="58" rx="10" />
+          <text class="node-label" x="745" y="65" text-anchor="middle" dominant-baseline="central">
+            <tspan>AI</tspan><tspan class="state-check" dx="6">✓</tspan>
+          </text>
+        </g>
+        <g class="node">
+          <rect class="node-box" x="685" y="141" width="120" height="58" rx="10" />
+          <text class="node-label" x="745" y="170" text-anchor="middle" dominant-baseline="central">
+            <tspan>AI</tspan><tspan class="state-failed" dx="6">×</tspan>
+          </text>
+        </g>
+        <g class="node">
+          <rect class="node-box" x="80" y="205" width="120" height="58" rx="10" />
+          <text class="node-label" x="140" y="234" text-anchor="middle" dominant-baseline="central">已暂停</text>
         </g>
 
         <!-- 边标签(中文名 + 事件键) -->
-        <text class="edge-label" text-anchor="middle" x="69" y="42">
+        <text class="edge-label" text-anchor="middle" x="52" y="42">
           <tspan class="cn">录制开始</tspan>
-          <tspan class="key" x="69" dy="15">recording_started</tspan>
+          <tspan class="key" x="52" dy="15">recording_started</tspan>
         </text>
-        <text class="edge-label" text-anchor="middle" x="280" y="44">
+        <text class="edge-label" text-anchor="middle" x="242" y="42">
           <tspan class="cn">录制停止</tspan>
-          <tspan class="key" x="280" dy="15">recording_stopped</tspan>
+          <tspan class="key" x="242" dy="15">recording_stopped</tspan>
         </text>
-        <text class="edge-label" text-anchor="middle" x="280" y="133">
-          <tspan class="cn">Aing 开始</tspan>
-          <tspan class="key" x="280" dy="15">refine_started</tspan>
+        <text class="action-label" text-anchor="middle" x="477" y="78">
+          <tspan class="action-name">Aing</tspan>
         </text>
-        <text class="edge-label" text-anchor="middle" x="507" y="44">
-          <tspan class="cn">Aing 完成</tspan>
-          <tspan class="key" x="507" dy="15">refine_finished</tspan>
-        </text>
-        <text class="edge-label" text-anchor="end" x="125" y="140">
+        <text class="outcome-label" text-anchor="middle" x="636" y="61">成功</text>
+        <text class="outcome-label" text-anchor="middle" x="636" y="141">失败</text>
+        <text class="edge-label" text-anchor="end" x="116" y="151">
           <tspan class="cn">录制暂停</tspan>
-          <tspan class="key" x="125" dy="15">recording_paused</tspan>
+          <tspan class="key" x="116" dy="15">recording_paused</tspan>
         </text>
-        <text class="edge-label" text-anchor="start" x="175" y="167">
+        <text class="edge-label" text-anchor="start" x="165" y="184">
           <tspan class="cn">录制恢复</tspan>
-          <tspan class="key" x="175" dy="15">recording_resumed</tspan>
+          <tspan class="key" x="165" dy="15">recording_resumed</tspan>
         </text>
       </svg>
-      <p class="flow-caption">停止录制即结束录制并自动开始 Aing;Aing 完成即到达终态。暂停 / 恢复只在录制途中来回。</p>
+      <p class="flow-caption">
+        方框表示状态，连线表示动作。录制完成后执行 Aing；成功后标记为「AI ✓」，失败后标记为「AI ×」并可重新执行。
+        钩子可在 Aing 开始（refine_started）或结束（refine_finished）时触发。
+      </p>
     </div>
   </section>
 
@@ -146,7 +159,7 @@ content-type: application/json
     "speakers": ["张三"], "text": "…markdown…", "text_truncated": false
   }
 }`}</pre>
-    <p class="hint">note 字段仅在钩子勾选「附带笔记内容」时出现;停止录制时通常是原始稿,想要 Aing 全文请挂「Aing 完成」事件。</p>
+    <p class="hint">note 字段仅在钩子勾选「附带笔记内容」时出现；停止录制时通常是原始稿，想要 AI 整理后的全文请挂「Aing 结束」事件。</p>
   </section>
 </div>
 
@@ -199,7 +212,7 @@ content-type: application/json
     width: 100%;
     height: auto;
     display: block;
-    max-width: 560px;
+    max-width: 780px;
     margin: 0 auto;
   }
   .diagram text { font-family: inherit; }
@@ -213,15 +226,23 @@ content-type: application/json
     font-size: 14px;
     font-weight: 500;
   }
+  .diagram .state-check { fill: var(--success); font-weight: 700; }
+  .diagram .state-failed { fill: var(--danger); font-weight: 700; }
   .diagram .edge {
     stroke: var(--ink-faint);
     stroke-width: 1.5;
     fill: none;
   }
+  .diagram .action-label {
+    fill: var(--ink-secondary);
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+  .diagram .action-name { font-size: 12.5px; }
+  .diagram .decision { fill: var(--surface-press); stroke: var(--hairline); stroke-width: 1; }
+  .diagram .outcome-label { fill: var(--ink-faint); font-size: 11px; }
   .diagram .arrowhead { fill: var(--ink-faint); }
   .diagram .start-dot { fill: var(--ink-secondary); }
-  .diagram .final-ring { fill: none; stroke: var(--ink-secondary); stroke-width: 1.5; }
-  .diagram .final-dot { fill: var(--ink-secondary); }
   .diagram .cn { fill: var(--ink-secondary); font-size: 12.5px; }
   .diagram .key {
     fill: var(--ink-faint);

@@ -645,7 +645,7 @@
         <button class="empty-cta" onclick={() => noteGraphState.load()}>重新加载文章图谱</button>
       </div>
     {:else}
-      <div class="placeholder"><p class="ph-title">还没有进入图谱的笔记</p><p class="ph-desc">对笔记重新 Aing 后会按共享实体建立连接。</p></div>
+      <div class="placeholder"><p class="ph-title">还没有进入图谱的笔记</p><p class="ph-desc">对笔记重新执行 AI 后会按共享实体建立连接。</p></div>
     {/if}
   {:else}
     <!-- 点击实体或关系只打开附着式详情，不会重挂载画布。 -->
@@ -694,7 +694,7 @@
           {#if loaded && usableSemantic.nodes.length === 0 && graph.nodes.length === 0}
             <div class="placeholder">
               <p class="ph-title">还没有知识图谱</p>
-              <p class="ph-desc">配置大模型并对笔记「重新 Aing」后，人物、组织、项目等实体会汇入这里。</p>
+              <p class="ph-desc">配置大模型并对笔记重新执行 AI 后，人物、组织、项目等实体会汇入这里。</p>
               <button class="empty-cta" onclick={() => goto("/ai")}>前往 AI 设置</button>
             </div>
           {:else if renderedNodes.length >= 2 && renderedEdges.length > 0}

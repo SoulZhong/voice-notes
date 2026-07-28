@@ -14,6 +14,8 @@ export type ModelsStatus = {
   artifacts: ArtifactState[];
   recording_ready: boolean;
   diarization_ready: boolean;
+  /** 模型存储目录(设置页展示,点击经 open_models_dir 在文件管理器中打开)。 */
+  root: string;
 };
 export type Settings = {
   mirror_enabled: boolean;
@@ -21,6 +23,8 @@ export type Settings = {
   data_dir?: string | null;
   models_dir?: string | null;
   asr_model: string;
+  /** sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json;空 = CPU)。 */
+  asr_provider: string;
   /** 声纹嵌入模型:"campplus"(默认)/"eres2netv2"。切换触发声纹库后台重建。 */
   speaker_model: string;
   // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
@@ -57,6 +61,8 @@ export type Settings = {
   refine_api_key: string;
   // 首启引导已完成(欢迎层走完或模型已就绪时静默补 true)
   onboarded: boolean;
+  // 已完成的功能引导 ID；每项功能独立记录，新增功能不能复用 onboarded 判断
+  completed_guides: string[];
   // 隐私敏感:开录必须用户显式授权,默认关
   mcp_allow_control: boolean;
   // 防重复引导:欢迎页走完或提示条关闭后置 true,两处引导只出现一次
@@ -74,6 +80,7 @@ export type ModelDownloadEvent = {
 export type MigrateEvent = { kind: "data" | "models"; phase: "copying" | "done" | "error"; message: string };
 
 export const modelsStatus = () => invoke<ModelsStatus>("models_status");
+export const openModelsDir = () => invoke<void>("open_models_dir");
 export const downloadModels = (ids?: string[]) => invoke<void>("download_models", { ids: ids ?? null });
 export const deleteModel = (id: string) => invoke<void>("delete_model", { id });
 export const cancelModelsDownload = () => invoke<void>("cancel_models_download");

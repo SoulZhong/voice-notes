@@ -18,6 +18,7 @@
     purgeAudio,
     onMigrate,
     onModelDownload,
+    openModelsDir,
     testMirror,
     type ModelsStatus,
     type Settings,
@@ -75,9 +76,12 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
-  /** asr_model 后端值 → radio 本地 value 的三态映射(whisper/paraformer/sense_voice)。 */
+  /** asr_model 后端值 → radio 本地 value 的四态映射(whisper/paraformer/qwen3/sense_voice)。 */
   function asrModelToChoice(m: string | undefined): string {
-    return m === "whisper" ? "whisper" : m === "paraformer" ? "paraformer" : "sense_voice";
+    return m === "whisper" ? "whisper"
+      : m === "paraformer" ? "paraformer"
+      : m === "qwen3" ? "qwen3"
+      : "sense_voice";
   }
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
@@ -126,9 +130,12 @@
     ),
   );
 
-  // 当前 ASR 选型对应的工件 id:sense_voice→asr,whisper→whisper,paraformer→paraformer。
+  // 当前 ASR 选型对应的工件 id:sense_voice→asr,其余选型 id 与 asr_model 同名。
   const asrArtifactId = $derived(
-    settings?.asr_model === "whisper" ? "whisper" : settings?.asr_model === "paraformer" ? "paraformer" : "asr",
+    settings?.asr_model === "whisper" ? "whisper"
+      : settings?.asr_model === "paraformer" ? "paraformer"
+      : settings?.asr_model === "qwen3" ? "qwen3"
+      : "asr",
   );
   const asrModelMissing = $derived(
     !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
@@ -308,6 +315,16 @@
 
   // —— 外观 / 录制 / 系统:通用「取新鲜值→改→存」保存 ——
   // 成功后 settings 与本地镜像同步;失败时 danger 横幅 + 从后端真值回弹本地镜像。
+  /** 在系统文件管理器中打开模型存储目录(失败走 danger 横幅,如目录被迁移后不存在)。 */
+  async function doOpenModelsDir() {
+    error = "";
+    try {
+      await openModelsDir();
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
   async function saveSetting(mut: (s: Settings) => void) {
     error = "";
     try {
@@ -667,7 +684,9 @@
               ? "多语种支持广,说话人区分较粗"
               : asrChoice === "paraformer"
                 ? "中文更准、英文较弱"
-                : "推荐 · 中英日韩粤语,功能最全"}
+                : asrChoice === "qwen3"
+                  ? "中英混说最准,识别稍慢,说话人区分较粗"
+                  : "推荐 · 中英日韩粤语,功能最全"}
           </span>
         </div>
         <div class="seg" class:disabled={recording.isLive}>
@@ -700,6 +719,16 @@
               disabled={recording.isLive || !settings}
               onchange={() => changeAsr("paraformer")}
             />Paraformer
+          </label>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="asr"
+              value="qwen3"
+              bind:group={asrChoice}
+              disabled={recording.isLive || !settings}
+              onchange={() => changeAsr("qwen3")}
+            />Qwen3
           </label>
         </div>
       </div>
@@ -740,8 +769,8 @@
       </div>
       <label class="row">
         <div class="row-info">
-          <span class="row-label">会后 Aing</span>
-          <span class="row-desc">停止录制后自动用大模型 Aing 转写稿(错字修正、段落归并);在线接口或本机 Agent,在左侧 AI 页配置</span>
+          <span class="row-label">会后 AI</span>
+          <span class="row-desc">停止录制后自动用大模型整理转写稿（错字修正、段落归并）；在线接口或本机 Agent 在左侧 AI 页配置</span>
         </div>
         <input
           type="checkbox"
@@ -763,6 +792,12 @@
   <!-- —— 语音模型 —— -->
   <section>
     <h2 class="section-title">语音模型</h2>
+    {#if status}
+      <button class="models-path" title="在文件管理器中打开" onclick={doOpenModelsDir}>
+        <span class="row-desc">存储位置</span>
+        <span class="row-path models-path-value">{status.root}</span>
+      </button>
+    {/if}
     <div class="rows">
       {#if status}
         {#each status.artifacts as a (a.id)}
@@ -1000,6 +1035,23 @@
     font-size: 0.8rem;
     color: var(--ink-secondary);
     word-break: break-all;
+  }
+  /* 「语音模型」区的存储位置行:整行可点,在文件管理器中打开目录。 */
+  .models-path {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: -0.2rem 0 0.6rem;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+  .models-path:hover .models-path-value {
+    text-decoration: underline;
+    color: var(--ink);
   }
   .present {
     font-size: 0.8rem;
