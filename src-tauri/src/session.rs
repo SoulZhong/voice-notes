@@ -332,7 +332,6 @@ fn split_final(
     job_start_ms: u64,
     job_end_ms: u64,
     transcript: &Transcript,
-    _recognizer: &mut Box<dyn Recognizer>,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     // 开关透传：子段重识别复核（见下方 is_foreign_final 调用）需与整段判定用
     // 同一个开关状态，否则关闭过滤后仍会在回退路径误丢子段。
@@ -495,6 +494,432 @@ pub(crate) const SPEAKER_SAMPLE_CAP: usize =
 pub(crate) const SPEAKER_SAMPLE_ENOUGH: usize =
     10 * crate::store::audio::AUDIO_SAMPLE_RATE as usize;
 
+/// 定稿处理链的持有者：回声去重(hold/追溯撤回/AEC 残渣)、语言过滤、段内切分、
+/// 声纹归簇与 emit 全在这里。从 run_asr_worker 抽出是为了让本机 worker 与云端
+/// worker 喂同一条链——链一旦有两份实现，回声/声纹的判据迟早会分叉。
+/// 生命周期 'a 借用 worker 持有的 embedder 与 registry(worker 结束后要把 embedder
+/// 还给调用方复用)；三个回调按值持有，随 sink 一起活到 finish。
+pub(crate) struct FinalSink<'a, F, P, D>
+where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+{
+    embedder: &'a mut Option<Box<dyn SpeakerEmbedder>>,
+    registry: &'a mut SpeakerRegistry,
+    echo_hold: Duration,
+    /// 语言幻觉过滤总开关，见 run_asr_worker 同名参数注释。
+    language_filter: bool,
+    on_final: F,
+    on_partial: P,
+    on_diar: D,
+    /// 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
+    /// 已有簇 sources 增长等变化都能被捕获并同步。
+    last_sent: Vec<crate::diar::registry::SpeakerInfo>,
+    // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）
+    // + 已放行的 mic 段（供 system 定稿后的追溯撤回）。
+    pending_mic: VecDeque<PendingMic>,
+    recent_system: VecDeque<RecentSystem>,
+    recent_mic: VecDeque<EmittedMic>,
+    /// system 路当前在途预览文本(预览级回声抑制用):随 system partial 更新,该句
+    /// 定稿(进 recent_system)即清——staleness 被限制在"当前在途一句"内,不会拿几分钟前
+    /// 的旧预览误杀 mic 新语句。
+    last_system_partial: String,
+    /// 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
+    sample_store: std::collections::HashMap<String, Vec<f32>>,
+}
+
+impl<'a, F, P, D> FinalSink<'a, F, P, D>
+where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+{
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        embedder: &'a mut Option<Box<dyn SpeakerEmbedder>>,
+        registry: &'a mut SpeakerRegistry,
+        echo_hold: Duration,
+        language_filter: bool,
+        on_final: F,
+        on_partial: P,
+        on_diar: D,
+    ) -> Self {
+        Self {
+            embedder,
+            registry,
+            echo_hold,
+            language_filter,
+            on_final,
+            on_partial,
+            on_diar,
+            last_sent: Vec::new(),
+            pending_mic: VecDeque::new(),
+            recent_system: VecDeque::new(),
+            recent_mic: VecDeque::new(),
+            last_system_partial: String::new(),
+            sample_store: std::collections::HashMap::new(),
+        }
+    }
+
+    /// release 一个到期/排干的 pending mic 段：走完整处理链，与即时路径同源。
+    fn release_pending(&mut self, p: PendingMic) {
+        // 记录已放行 mic 段(占位段除外),供 system 定稿后的追溯回声撤回。
+        if p.text != "[识别失败]" {
+            self.recent_mic.push_back(EmittedMic {
+                text: p.text.clone(),
+                norm: p.norm.clone(),
+                start_ms: p.start_ms,
+                end_ms: p.end_ms,
+            });
+        }
+        process_final(
+            Source::Mic,
+            p.text,
+            p.start_ms,
+            p.end_ms,
+            p.samples_len,
+            &p.embedding_input,
+            p.rms,
+            self.embedder,
+            self.registry,
+            &mut self.sample_store,
+            &mut self.last_sent,
+            &mut self.on_final,
+            &mut self.on_diar,
+        );
+    }
+
+    /// 周期性的 pending mic 到期检查。调用方每收到一条 final 前调一次(让长时间
+    /// 空转但持续来 final 的场景也能及时 release)，空闲 tick 也调一次兜底。
+    pub(crate) fn tick(&mut self) {
+        // 自适应 hold:system 侧有在途语句(预览未定稿)时延长——mic 回声段常先于
+        // system 长句定稿,固定 2.5s 放行就错过比对(冒烟实锤主漏杀形态);system
+        // 句一定稿 last_system_partial 即清,下个检查点就按普通 hold 放行。
+        let hold_now = if self.last_system_partial.is_empty() {
+            self.echo_hold
+        } else {
+            self.echo_hold * ECHO_HOLD_EXTEND_FACTOR
+        };
+        while self
+            .pending_mic
+            .front()
+            .is_some_and(|p| p.held_at.elapsed() >= hold_now)
+        {
+            let p = self.pending_mic.pop_front().unwrap();
+            self.release_pending(p);
+        }
+    }
+
+    /// 一条已识别的定稿段进入完整处理链(语言过滤 → 段内切分 → 回声 hold/声纹/emit)。
+    /// `samples` 为该段原始音频，语言过滤丢弃时用于算 rms、正常路径进切分与声纹嵌入。
+    pub(crate) fn push(
+        &mut self,
+        source: Source,
+        t: Transcript,
+        start_ms: u64,
+        end_ms: u64,
+        samples: &[f32],
+    ) {
+        // 语言白名单:外语幻觉段与 ECHO 命中同待遇——不 embed/不 assign/
+        // 不 emit/不落盘,从源头杜绝垃圾段污染说话人表。占位段占比 0 天然放行。
+        if self.language_filter && is_foreign_final(&t.lang, &t.text) {
+            eprintln!(
+                "语言过滤: 丢弃 {:?} 段 lang=\"{}\" text=\"{}\"",
+                source,
+                t.lang,
+                text_prefix20(&t.text)
+            );
+            // 被丢段无 final 接替，前端只在收到 final 时清 partial 预览，
+            // 幻觉文本会残留成 UI 残影；主动推空 partial 顶掉它。
+            (self.on_partial)(source, String::new());
+            (self.on_diar)(DiarEvent::SuppressedFinal {
+                source,
+                text: t.text,
+                start_ms,
+                end_ms,
+                rms: Some(rms_of(samples)),
+                reason: "foreign_language".into(),
+            });
+            return;
+        }
+
+        // 占位段("[识别失败]")没有时间戳也没有切分意义,不进滑窗切分,
+        // 沿既有专用路径原样走一个"子段"。真实段交给 split_final:装不下/
+        // 跑不动/切不出/切了也没内容 → 内部各失败路径回退单元素原段，
+        // 下面循环体在"无变更点"的绝大多数段上退化为原逻辑，零行为变化。
+        let subs: Vec<SubFinal> = if t.text == "[识别失败]" {
+            vec![SubFinal {
+                text: t.text,
+                samples: samples.to_vec(),
+                start_ms,
+                end_ms,
+            }]
+        } else {
+            split_final(
+                samples.to_vec(),
+                start_ms,
+                end_ms,
+                &t,
+                self.embedder,
+                self.language_filter,
+            )
+        };
+
+        for sub in subs {
+            let seg_rms = rms_of(&sub.samples);
+            match source {
+                Source::System => self.push_system_sub(sub, seg_rms),
+                Source::Mic => self.push_mic_sub(sub, seg_rms),
+            }
+        }
+    }
+
+    /// system 侧子段：先用它击杀/撤回 mic 侧回声，再零延迟走处理链并记入 recent_system。
+    fn push_system_sub(&mut self, sub: SubFinal, seg_rms: f32) {
+        let sys_norm = normalize_text(&sub.text);
+        // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
+        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的
+        // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
+        // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
+        // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
+        // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 与
+        // pending_mic 同属 self，闭包已独占 pending_mic 的可变借用）；改用
+        // 局部 flag，retain 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
+        let mut dropped_mic: Vec<(String, u64, u64, f32, &'static str)> = Vec::new();
+        self.pending_mic.retain(|p| {
+            if p.text == "[识别失败]" {
+                return true;
+            }
+            // AEC 残渣抑制:与文本回声去重镜像的第二个检查点——新到 system
+            // 段与某 pending mic 段重叠且 mic 段 rms 低,视为残渣,先于文本
+            // 相似度判定丢弃(残渣文本本就与 system 段不相似,躲不过下面的
+            // echoed 判定,须单独拦)。
+            if is_residue_pair(p.rms, p.start_ms, p.end_ms, sub.start_ms, sub.end_ms) {
+                eprintln!(
+                    "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                    p.rms,
+                    text_prefix20(&p.text)
+                );
+                dropped_mic.push((p.text.clone(), p.start_ms, p.end_ms, p.rms, "aec_residue"));
+                return false;
+            }
+            let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
+                && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+            if echoed {
+                eprintln!(
+                    "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                    text_prefix20(&p.text),
+                    text_prefix20(&sub.text)
+                );
+                dropped_mic.push((p.text.clone(), p.start_ms, p.end_ms, p.rms, "echo_match"));
+            }
+            !echoed
+        });
+        if !dropped_mic.is_empty() {
+            (self.on_partial)(Source::Mic, String::new());
+        }
+        for (text, start_ms, end_ms, rms, reason) in dropped_mic {
+            (self.on_diar)(DiarEvent::SuppressedFinal {
+                source: Source::Mic,
+                text,
+                start_ms,
+                end_ms,
+                rms: Some(rms),
+                reason: reason.into(),
+            });
+        }
+        // system 段零延迟处理。
+        process_final(
+            Source::System,
+            sub.text.clone(),
+            sub.start_ms,
+            sub.end_ms,
+            sub.samples.len(),
+            &sub.samples,
+            seg_rms,
+            self.embedder,
+            self.registry,
+            &mut self.sample_store,
+            &mut self.last_sent,
+            &mut self.on_final,
+            &mut self.on_diar,
+        );
+        // 追溯回声撤回:该 system 句可能对应一条已放行的 mic 回声段
+        // (hold 到期先落盘了)。命中(时间邻近+文本高相似,与击杀
+        // pending 同一套判据)即发 EchoRetract,由调用方从落盘与 UI
+        // 移除。占位段不参与(双路同时识别失败文本雷同,会互相误杀)。
+        if sub.text != "[识别失败]" {
+            let mut i = 0;
+            while i < self.recent_mic.len() {
+                let hit = time_near(
+                    self.recent_mic[i].start_ms,
+                    self.recent_mic[i].end_ms,
+                    sub.start_ms,
+                    sub.end_ms,
+                ) && text_similarity(&self.recent_mic[i].norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+                if hit {
+                    let m = self.recent_mic.remove(i).unwrap();
+                    eprintln!(
+                        "追溯回声撤回: mic=\"{}\" system=\"{}\"",
+                        text_prefix20(&m.text),
+                        text_prefix20(&sub.text)
+                    );
+                    (self.on_diar)(DiarEvent::EchoRetract {
+                        start_ms: m.start_ms,
+                        end_ms: m.end_ms,
+                        text: m.text,
+                    });
+                } else {
+                    i += 1;
+                }
+            }
+            let newest_end = sub.end_ms;
+            self.recent_mic
+                .retain(|m| newest_end.saturating_sub(m.end_ms) <= RETRACT_WINDOW_MS);
+        }
+        // 该句已定稿:预览级抑制改由 recent_system(带 10s 窗)接力,
+        // 清掉在途预览文本,防其无限期滞留误杀后续 mic 预览。
+        self.last_system_partial.clear();
+        self.recent_system.push_back(RecentSystem {
+            text: sub.text,
+            norm: sys_norm,
+            start_ms: sub.start_ms,
+            end_ms: sub.end_ms,
+        });
+        let newest_end = sub.end_ms;
+        self.recent_system
+            .retain(|r| newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS);
+    }
+
+    /// mic 侧子段：占位段直通、残渣/回声命中即丢，其余进 hold 等 system 侧比对。
+    fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32) {
+        // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
+        // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
+        // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
+        // hold，直接走完整处理链即时处理。
+        if sub.text == "[识别失败]" {
+            process_final(
+                Source::Mic,
+                sub.text,
+                sub.start_ms,
+                sub.end_ms,
+                sub.samples.len(),
+                &sub.samples,
+                seg_rms,
+                self.embedder,
+                self.registry,
+                &mut self.sample_store,
+                &mut self.last_sent,
+                &mut self.on_final,
+                &mut self.on_diar,
+            );
+        } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &self.recent_system) {
+            // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
+            // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
+            // ECHO 命中同待遇。
+            eprintln!(
+                "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                seg_rms,
+                text_prefix20(&sub.text)
+            );
+            (self.on_partial)(Source::Mic, String::new());
+            (self.on_diar)(DiarEvent::SuppressedFinal {
+                source: Source::Mic,
+                text: sub.text,
+                start_ms: sub.start_ms,
+                end_ms: sub.end_ms,
+                rms: Some(seg_rms),
+                reason: "aec_residue".into(),
+            });
+        } else {
+            let mic_norm = normalize_text(&sub.text);
+            let echo = self.recent_system.iter().find(|r| {
+                time_near(sub.start_ms, sub.end_ms, r.start_ms, r.end_ms)
+                    && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+            });
+            match echo {
+                Some(r) => {
+                    eprintln!(
+                        "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
+                        text_prefix20(&sub.text),
+                        text_prefix20(&r.text)
+                    );
+                    // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
+                    // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
+                    (self.on_partial)(Source::Mic, String::new());
+                    (self.on_diar)(DiarEvent::SuppressedFinal {
+                        source: Source::Mic,
+                        text: sub.text,
+                        start_ms: sub.start_ms,
+                        end_ms: sub.end_ms,
+                        rms: Some(seg_rms),
+                        reason: "echo_match".into(),
+                    });
+                }
+                None => {
+                    self.pending_mic.push_back(PendingMic {
+                        text: sub.text,
+                        norm: mic_norm,
+                        start_ms: sub.start_ms,
+                        end_ms: sub.end_ms,
+                        samples_len: sub.samples.len(),
+                        embedding_input: sub.samples,
+                        held_at: Instant::now(),
+                        rms: seg_rms,
+                    });
+                }
+            }
+        }
+    }
+
+    /// system 侧在途预览文本更新(预览级回声抑制依赖)：只记状态，不 emit。
+    pub(crate) fn note_system_partial(&mut self, text: &str) {
+        self.last_system_partial.clear();
+        self.last_system_partial.push_str(text);
+    }
+
+    /// 一版预览文本进入预览链：system 侧记在途文本，mic 侧按回声抑制，再统一 emit。
+    pub(crate) fn push_partial(&mut self, source: Source, text: String) {
+        // 预览级回声抑制:外放场景 mic 路会实时"跟读"system 路
+        // 正在说的话——定稿级去重(hold/recent_system)不管预览,
+        // UI 上会出现「我」「对方」两行同字齐蹦的回音观感。mic
+        // 预览与 system 在途预览或最近 system 定稿(10s 窗)高相似
+        // 即按回声压掉(推空清残影)。只影响预览:若真是本人发言,
+        // 定稿仍走完整判定链(hold+时间邻近+rms),不丢内容。
+        let text = match source {
+            Source::System => {
+                self.note_system_partial(&text);
+                text
+            }
+            Source::Mic => {
+                let echoed = text_similarity(&text, &self.last_system_partial) >= ECHO_SIM_THRESHOLD
+                    || self
+                        .recent_system
+                        .iter()
+                        .any(|r| text_similarity(&text, &r.text) >= ECHO_SIM_THRESHOLD);
+                if echoed {
+                    eprintln!("预览回声抑制: 隐藏 mic 预览 \"{}\"", text_prefix20(&text));
+                    String::new()
+                } else {
+                    text
+                }
+            }
+        };
+        (self.on_partial)(source, text);
+    }
+
+    /// 收尾：排干全部 pending（无论是否到期），保持入队序，再发 Snapshot。
+    pub(crate) fn finish(mut self) {
+        while let Some(p) = self.pending_mic.pop_front() {
+            self.release_pending(p);
+        }
+        let snaps = self.registry.snapshot();
+        let samples = self.sample_store.drain().collect();
+        (self.on_diar)(DiarEvent::Snapshot { snaps, samples });
+    }
+}
+
 /// 单识别 worker：串行消费 finals（不丢、优先），空闲时取每源最新 partial（best-effort）。
 /// finals_rx 关闭且排干后返回。识别失败的完成句 emit "[识别失败]" 占位，worker 不退出。
 /// 每条 final 定稿时额外提声纹嵌入并归簇（嵌入失败/无 embedder/panic 均降级为 None，绝不影响文本）；
@@ -502,6 +927,9 @@ pub(crate) const SPEAKER_SAMPLE_ENOUGH: usize =
 /// 识别得到的语言标签命中外语白名单过滤（`is_foreign_final`）的整段直接丢弃，
 /// 与 ECHO 命中同待遇；未被丢弃的段额外算出段级 rms，随 `on_final` 尾参
 /// `Option<f32>` 透传给调用方落盘（partial 路径不参与语言过滤，也不算 rms）。
+///
+/// 本函数只负责「取 job → 识别 → 交给 FinalSink」：定稿的全部判定与副作用都在
+/// `FinalSink` 里，云端 worker 复用同一个 sink，两条来源的处理链永远一致。
 #[allow(clippy::too_many_arguments)]
 pub fn run_asr_worker(
     mut recognizer: Box<dyn Recognizer>,
@@ -510,79 +938,29 @@ pub fn run_asr_worker(
     finals_rx: Receiver<FinalJob>,
     echo_hold: Duration,
     // 语言幻觉过滤总开关：会议场景默认开(过滤中日韩误判幻觉段)，多语会议可关闭
-    // 以保留外语真实发言；关闭时下方两处 is_foreign_final 判定整体短路为不丢弃。
+    // 以保留外语真实发言；关闭时 FinalSink 内的 is_foreign_final 判定整体短路为不丢弃。
     language_filter: bool,
     partial_slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)>,
-    mut on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
-    mut on_partial: impl FnMut(Source, String),
-    mut on_diar: impl FnMut(DiarEvent),
+    on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    on_partial: impl FnMut(Source, String),
+    on_diar: impl FnMut(DiarEvent),
 ) -> (Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>) {
-    // 与上次发送的完整说话人表比较（非仅 len）：同段内「合并-1+新建+1」净零、
-    // 已有簇 sources 增长等变化都能被捕获并同步。
-    let mut last_sent: Vec<crate::diar::registry::SpeakerInfo> = Vec::new();
-    // 回声去重状态：hold 中的 mic 段（入队序）+ 最近处理过的 system 段（供 mic 端比对）
-    // + 已放行的 mic 段（供 system 定稿后的追溯撤回）。
-    let mut pending_mic: VecDeque<PendingMic> = VecDeque::new();
-    let mut recent_system: VecDeque<RecentSystem> = VecDeque::new();
-    let mut recent_mic: VecDeque<EmittedMic> = VecDeque::new();
-    // system 路当前在途预览文本(预览级回声抑制用):随 system partial 更新,该句
-    // 定稿(进 recent_system)即清——staleness 被限制在"当前在途一句"内,不会拿几分钟前
-    // 的旧预览误杀 mic 新语句。
-    let mut last_system_partial = String::new();
-    // 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
-    let mut sample_store: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
-
-    // release 一个到期/排干的 pending mic 段：走完整处理链，与即时路径同源。
-    macro_rules! release_pending {
-        ($p:expr) => {{
-            let p: PendingMic = $p;
-            // 记录已放行 mic 段(占位段除外),供 system 定稿后的追溯回声撤回。
-            if p.text != "[识别失败]" {
-                recent_mic.push_back(EmittedMic {
-                    text: p.text.clone(),
-                    norm: p.norm.clone(),
-                    start_ms: p.start_ms,
-                    end_ms: p.end_ms,
-                });
-            }
-            process_final(
-                Source::Mic,
-                p.text,
-                p.start_ms,
-                p.end_ms,
-                p.samples_len,
-                &p.embedding_input,
-                p.rms,
-                &mut embedder,
-                &mut registry,
-                &mut sample_store,
-                &mut last_sent,
-                &mut on_final,
-                &mut on_diar,
-            );
-        }};
-    }
+    let mut sink = FinalSink::new(
+        &mut embedder,
+        &mut registry,
+        echo_hold,
+        language_filter,
+        on_final,
+        on_partial,
+        on_diar,
+    );
 
     loop {
         match finals_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => {
                 // 到期检查(先于本条 final 的处理)：让长时间空转但持续来 final 的场景
                 // 也能及时 release，不必等到 timeout tick。
-                // 自适应 hold:system 侧有在途语句(预览未定稿)时延长——mic 回声段常先于
-                // system 长句定稿,固定 2.5s 放行就错过比对(冒烟实锤主漏杀形态);system
-                // 句一定稿 last_system_partial 即清,下个检查点就按普通 hold 放行。
-                let hold_now = if last_system_partial.is_empty() {
-                    echo_hold
-                } else {
-                    echo_hold * ECHO_HOLD_EXTEND_FACTOR
-                };
-                while pending_mic
-                    .front()
-                    .is_some_and(|p| p.held_at.elapsed() >= hold_now)
-                {
-                    let p = pending_mic.pop_front().unwrap();
-                    release_pending!(p);
-                }
+                sink.tick();
 
                 let t: Transcript = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     recognizer.recognize(&job.samples)
@@ -597,282 +975,11 @@ pub fn run_asr_worker(
                         Transcript { text: "[识别失败]".to_string(), ..Default::default() }
                     }
                 };
-                // 语言白名单:外语幻觉段与 ECHO 命中同待遇——不 embed/不 assign/
-                // 不 emit/不落盘,从源头杜绝垃圾段污染说话人表。占位段占比 0 天然放行。
-                if language_filter && is_foreign_final(&t.lang, &t.text) {
-                    eprintln!(
-                        "语言过滤: 丢弃 {:?} 段 lang=\"{}\" text=\"{}\"",
-                        job.source,
-                        t.lang,
-                        text_prefix20(&t.text)
-                    );
-                    // 被丢段无 final 接替，前端只在收到 final 时清 partial 预览，
-                    // 幻觉文本会残留成 UI 残影；主动推空 partial 顶掉它。
-                    on_partial(job.source, String::new());
-                    on_diar(DiarEvent::SuppressedFinal {
-                        source: job.source,
-                        text: t.text,
-                        start_ms: job.start_ms,
-                        end_ms: job.end_ms,
-                        rms: Some(rms_of(&job.samples)),
-                        reason: "foreign_language".into(),
-                    });
-                    continue;
-                }
-
-                // 占位段("[识别失败]")没有时间戳也没有切分意义,不进滑窗切分,
-                // 沿既有专用路径原样走一个"子段"。真实段交给 split_final:装不下/
-                // 跑不动/切不出/切了也没内容 → 内部各失败路径回退单元素原段，
-                // 下面循环体在"无变更点"的绝大多数段上退化为原逻辑，零行为变化。
-                let subs: Vec<SubFinal> = if t.text == "[识别失败]" {
-                    vec![SubFinal {
-                        text: t.text,
-                        samples: job.samples,
-                        start_ms: job.start_ms,
-                        end_ms: job.end_ms,
-                    }]
-                } else {
-                    split_final(
-                        job.samples,
-                        job.start_ms,
-                        job.end_ms,
-                        &t,
-                        &mut recognizer,
-                        &mut embedder,
-                        language_filter,
-                    )
-                };
-
-                for sub in subs {
-                    let seg_rms = rms_of(&sub.samples);
-                    match job.source {
-                        Source::System => {
-                            let sys_norm = normalize_text(&sub.text);
-                            // 先对照 pending_mic：命中即丢弃（零副作用），不进入处理链。
-                            // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的
-                            // 痕迹，不参与回声比对：双路同时识别失败时文本雷同（都是占位串）
-                            // 又时间邻近，若照常比对会把 mic 占位段误判为回声丢弃，静默吞掉
-                            // 一段真实发声。故遇到占位段的 pending 直接跳过匹配，原样保留。
-                            // retain 闭包内不能直接调用 on_partial（借用冲突：on_partial 是
-                            // 外层 FnMut，闭包已捕获 sub/sys_norm）；改用局部 flag，retain
-                            // 结束后统一补一次空 partial，清掉被丢 mic 段的 UI 残影。
-                            let mut dropped_mic: Vec<(String, u64, u64, f32, &'static str)> = Vec::new();
-                            pending_mic.retain(|p| {
-                                if p.text == "[识别失败]" {
-                                    return true;
-                                }
-                                // AEC 残渣抑制:与文本回声去重镜像的第二个检查点——新到 system
-                                // 段与某 pending mic 段重叠且 mic 段 rms 低,视为残渣,先于文本
-                                // 相似度判定丢弃(残渣文本本就与 system 段不相似,躲不过下面的
-                                // echoed 判定,须单独拦)。
-                                if is_residue_pair(p.rms, p.start_ms, p.end_ms, sub.start_ms, sub.end_ms) {
-                                    eprintln!(
-                                        "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
-                                        p.rms,
-                                        text_prefix20(&p.text)
-                                    );
-                                    dropped_mic.push((
-                                        p.text.clone(),
-                                        p.start_ms,
-                                        p.end_ms,
-                                        p.rms,
-                                        "aec_residue",
-                                    ));
-                                    return false;
-                                }
-                                let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
-                                    && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
-                                if echoed {
-                                    eprintln!(
-                                        "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
-                                        text_prefix20(&p.text),
-                                        text_prefix20(&sub.text)
-                                    );
-                                    dropped_mic.push((
-                                        p.text.clone(),
-                                        p.start_ms,
-                                        p.end_ms,
-                                        p.rms,
-                                        "echo_match",
-                                    ));
-                                }
-                                !echoed
-                            });
-                            if !dropped_mic.is_empty() {
-                                on_partial(Source::Mic, String::new());
-                            }
-                            for (text, start_ms, end_ms, rms, reason) in dropped_mic {
-                                on_diar(DiarEvent::SuppressedFinal {
-                                    source: Source::Mic,
-                                    text,
-                                    start_ms,
-                                    end_ms,
-                                    rms: Some(rms),
-                                    reason: reason.into(),
-                                });
-                            }
-                            // system 段零延迟处理。
-                            process_final(
-                                job.source,
-                                sub.text.clone(),
-                                sub.start_ms,
-                                sub.end_ms,
-                                sub.samples.len(),
-                                &sub.samples,
-                                seg_rms,
-                                &mut embedder,
-                                &mut registry,
-                                &mut sample_store,
-                                &mut last_sent,
-                                &mut on_final,
-                                &mut on_diar,
-                            );
-                            // 追溯回声撤回:该 system 句可能对应一条已放行的 mic 回声段
-                            // (hold 到期先落盘了)。命中(时间邻近+文本高相似,与击杀
-                            // pending 同一套判据)即发 EchoRetract,由调用方从落盘与 UI
-                            // 移除。占位段不参与(双路同时识别失败文本雷同,会互相误杀)。
-                            if sub.text != "[识别失败]" {
-                                let mut i = 0;
-                                while i < recent_mic.len() {
-                                    let hit = time_near(
-                                        recent_mic[i].start_ms,
-                                        recent_mic[i].end_ms,
-                                        sub.start_ms,
-                                        sub.end_ms,
-                                    ) && text_similarity(&recent_mic[i].norm, &sys_norm)
-                                        >= ECHO_SIM_THRESHOLD;
-                                    if hit {
-                                        let m = recent_mic.remove(i).unwrap();
-                                        eprintln!(
-                                            "追溯回声撤回: mic=\"{}\" system=\"{}\"",
-                                            text_prefix20(&m.text),
-                                            text_prefix20(&sub.text)
-                                        );
-                                        on_diar(DiarEvent::EchoRetract {
-                                            start_ms: m.start_ms,
-                                            end_ms: m.end_ms,
-                                            text: m.text,
-                                        });
-                                    } else {
-                                        i += 1;
-                                    }
-                                }
-                                let newest_end = sub.end_ms;
-                                recent_mic.retain(|m| {
-                                    newest_end.saturating_sub(m.end_ms) <= RETRACT_WINDOW_MS
-                                });
-                            }
-                            // 该句已定稿:预览级抑制改由 recent_system(带 10s 窗)接力,
-                            // 清掉在途预览文本,防其无限期滞留误杀后续 mic 预览。
-                            last_system_partial.clear();
-                            recent_system.push_back(RecentSystem {
-                                text: sub.text,
-                                norm: sys_norm,
-                                start_ms: sub.start_ms,
-                                end_ms: sub.end_ms,
-                            });
-                            let newest_end = sub.end_ms;
-                            recent_system.retain(|r| {
-                                newest_end.saturating_sub(r.end_ms) <= RECENT_SYSTEM_WINDOW_MS
-                            });
-                        }
-                        Source::Mic => {
-                            // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
-                            // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
-                            // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
-                            // hold，直接走完整处理链即时处理。
-                            if sub.text == "[识别失败]" {
-                                process_final(
-                                    job.source,
-                                    sub.text,
-                                    sub.start_ms,
-                                    sub.end_ms,
-                                    sub.samples.len(),
-                                    &sub.samples,
-                                    seg_rms,
-                                    &mut embedder,
-                                    &mut registry,
-                                    &mut sample_store,
-                                    &mut last_sent,
-                                    &mut on_final,
-                                    &mut on_diar,
-                                );
-                            } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &recent_system) {
-                                // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
-                                // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
-                                // ECHO 命中同待遇。
-                                eprintln!(
-                                    "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
-                                    seg_rms,
-                                    text_prefix20(&sub.text)
-                                );
-                                on_partial(job.source, String::new());
-                                on_diar(DiarEvent::SuppressedFinal {
-                                    source: job.source,
-                                    text: sub.text,
-                                    start_ms: sub.start_ms,
-                                    end_ms: sub.end_ms,
-                                    rms: Some(seg_rms),
-                                    reason: "aec_residue".into(),
-                                });
-                            } else {
-                                let mic_norm = normalize_text(&sub.text);
-                                let echo = recent_system.iter().find(|r| {
-                                    time_near(sub.start_ms, sub.end_ms, r.start_ms, r.end_ms)
-                                        && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
-                                });
-                                match echo {
-                                    Some(r) => {
-                                        eprintln!(
-                                            "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
-                                            text_prefix20(&sub.text),
-                                            text_prefix20(&r.text)
-                                        );
-                                        // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
-                                        // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
-                                        on_partial(job.source, String::new());
-                                        on_diar(DiarEvent::SuppressedFinal {
-                                            source: job.source,
-                                            text: sub.text,
-                                            start_ms: sub.start_ms,
-                                            end_ms: sub.end_ms,
-                                            rms: Some(seg_rms),
-                                            reason: "echo_match".into(),
-                                        });
-                                    }
-                                    None => {
-                                        pending_mic.push_back(PendingMic {
-                                            text: sub.text,
-                                            norm: mic_norm,
-                                            start_ms: sub.start_ms,
-                                            end_ms: sub.end_ms,
-                                            samples_len: sub.samples.len(),
-                                            embedding_input: sub.samples,
-                                            held_at: Instant::now(),
-                                            rms: seg_rms,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                sink.push(job.source, t, job.start_ms, job.end_ms, &job.samples);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // 到期检查：无 final 到来时靠这个 100ms tick 兜底 release。
-                // 自适应 hold 同上(system 在途语句期间延长)。
-                let hold_now = if last_system_partial.is_empty() {
-                    echo_hold
-                } else {
-                    echo_hold * ECHO_HOLD_EXTEND_FACTOR
-                };
-                while pending_mic
-                    .front()
-                    .is_some_and(|p| p.held_at.elapsed() >= hold_now)
-                {
-                    let p = pending_mic.pop_front().unwrap();
-                    release_pending!(p);
-                }
+                sink.tick();
                 // 空闲：服务每源最新 partial（取出即清空，只识别最新一版）。
                 for (src, slot) in &partial_slots {
                     let job = slot.lock().unwrap().take();
@@ -880,37 +987,7 @@ pub fn run_asr_worker(
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             recognizer.recognize(&job.samples)
                         })) {
-                            Ok(Ok(t)) => {
-                                // 预览级回声抑制:外放场景 mic 路会实时"跟读"system 路
-                                // 正在说的话——定稿级去重(hold/recent_system)不管预览,
-                                // UI 上会出现「我」「对方」两行同字齐蹦的回音观感。mic
-                                // 预览与 system 在途预览或最近 system 定稿(10s 窗)高相似
-                                // 即按回声压掉(推空清残影)。只影响预览:若真是本人发言,
-                                // 定稿仍走完整判定链(hold+时间邻近+rms),不丢内容。
-                                let text = match *src {
-                                    Source::System => {
-                                        last_system_partial = t.text.clone();
-                                        t.text
-                                    }
-                                    Source::Mic => {
-                                        let echoed = text_similarity(&t.text, &last_system_partial)
-                                            >= ECHO_SIM_THRESHOLD
-                                            || recent_system.iter().any(|r| {
-                                                text_similarity(&t.text, &r.text) >= ECHO_SIM_THRESHOLD
-                                            });
-                                        if echoed {
-                                            eprintln!(
-                                                "预览回声抑制: 隐藏 mic 预览 \"{}\"",
-                                                text_prefix20(&t.text)
-                                            );
-                                            String::new()
-                                        } else {
-                                            t.text
-                                        }
-                                    }
-                                };
-                                on_partial(*src, text);
-                            }
+                            Ok(Ok(t)) => sink.push_partial(*src, t.text),
                             Ok(Err(_)) => {}
                             Err(_) => {
                                 eprintln!(
@@ -923,14 +1000,7 @@ pub fn run_asr_worker(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                // 排干全部 pending（无论是否到期），保持入队序，再发 Snapshot。
-                while let Some(p) = pending_mic.pop_front() {
-                    release_pending!(p);
-                }
-                on_diar(DiarEvent::Snapshot {
-                    snaps: registry.snapshot(),
-                    samples: sample_store.drain().collect(),
-                });
+                sink.finish();
                 break;
             }
         }
@@ -2326,9 +2396,8 @@ mod asr_worker_tests {
             timestamps: (0..8).map(|i| i as f32).collect(),
             ..Default::default()
         };
-        let mut recognizer: Box<dyn Recognizer> = Box::new(CountingRecognizer);
         let mut embedder: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ContentEmbedder));
-        let subs = split_final(samples, 0, 8000, &transcript, &mut recognizer, &mut embedder, true);
+        let subs = split_final(samples, 0, 8000, &transcript, &mut embedder, true);
         assert_eq!(subs.len(), 2, "应切成两个子段");
         let total_sub_samples: usize = subs.iter().map(|s| s.samples.len()).sum();
         assert_eq!(total_sub_samples, total_len, "子段样本总长应等于母段样本总长,不丢尾部样本");
