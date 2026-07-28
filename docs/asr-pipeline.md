@@ -153,30 +153,37 @@ Silero 当前固定参数：
 
 ## 3. 识别器选择与输出差异
 
+所有选型统一经 `asr/engine.rs`(sherpa-onnx 官方 crate 的 sys 层,静态链接)推理,
+适配层只负责文件布局与参数;结果从 C 端 JSON 解析,保留 lang(2026-07-28 迁移)。
+
 ```mermaid
 flowchart LR
     SETTINGS["settings.json<br/>asr_model"] --> FACTORY{"new_recognizer"}
     FACTORY -- "sense_voice 或未知值" --> SV["SenseVoice full precision<br/>language=auto, ITN=true"]
     FACTORY -- "paraformer" --> PF["Paraformer large int8<br/>greedy/default decode"]
     FACTORY -- "whisper" --> WH["Whisper base int8<br/>language=auto/default decode"]
+    FACTORY -- "qwen3" --> QW["Qwen3-ASR 0.6B int8<br/>近贪心采样,热词可选"]
     SV --> SVOUT["text + lang<br/>tokens + timestamps"]
     PF --> PFOUT["text + tokens + timestamps<br/>lang 通常为空"]
-    WH --> WHOUT["只有 text<br/>其余字段为空"]
+    WH --> WHOUT["text(lang/时间戳未启用)"]
+    QW --> QWOUT["text + tokens<br/>无时间戳,lang 通常为空"]
     SVOUT --> COMMON["统一 Transcript"]
     PFOUT --> COMMON
     WHOUT --> COMMON
+    QWOUT --> COMMON
 ```
 
-| 能力 | SenseVoice | Paraformer | Whisper base |
-|---|---|---|---|
-| 默认选择 | 是 | 否 | 否 |
-| 模型精度 | 全精度优先，int8 兜底 | int8 | int8 优先 |
-| 中文 | 支持 | 中文专用 | 支持 |
-| 中英混合 | 自动语种 | 英文较弱 | 自动语种 |
-| 语言标签 | 有 | 通常无 | 当前适配层未透传 |
-| token 时间戳 | 有 | 有 | 当前适配层未透传 |
-| 段内换人后的文本处理 | 按 token 分组 | 按 token 分组 | 子段重新识别 |
-| 热词/领域词 | 未接入 | 未接入 | 未接入 |
+| 能力 | SenseVoice | Paraformer | Whisper base | Qwen3-ASR 0.6B |
+|---|---|---|---|---|
+| 默认选择 | 是 | 否 | 否 | 否 |
+| 模型精度 | 全精度优先，int8 兜底 | int8 | int8 优先 | int8 |
+| 中文 | 支持 | 中文专用 | 支持 | 支持(52 语种) |
+| 中英混合 | 自动语种 | 英文较弱 | 自动语种 | 最强(专项优化) |
+| 语言标签 | 有 | 通常无 | 未启用 | 通常无(文本兜底过滤) |
+| token 时间戳 | 有 | 有 | 未启用 | 无(LLM 解码) |
+| 段内换人后的文本处理 | 按 token 分组 | 按 token 分组 | 段级降级 | 段级降级 |
+| 热词/领域词 | 不支持 | 不支持 | 不支持 | **支持**(配置层已留口,待术语库接入) |
+| 单段延迟(M 系 Mac, 4s 段) | ~0.1s | 未测 | 未测 | ~0.7-1.4s(RTF 0.18-0.34) |
 
 ## 4. Final 段处理与所有丢弃路径
 
@@ -331,9 +338,11 @@ flowchart TB
 | 分段 worker | `run_segment_worker` | 暂停闸、电平、音频旁路、VAD、partial/final 生产 | `pipeline/segment_worker.rs` |
 | VAD | `SileroSegmenter` | 语音检测、断句、15 秒硬切 | `pipeline/silero.rs` |
 | 识别器 | `Recognizer`、`Transcript` | 三种模型的统一接口 | `asr/mod.rs` |
+| 推理引擎 | `OfflineEngine` | 四选型统一 sys 层推理，从 C 端 JSON 保留 lang | `asr/engine.rs` |
 | 模型适配 | `SenseVoiceRecognizer` | 默认中英混合识别，透传语言和 token 时间戳 | `asr/sense_voice.rs` |
 | 模型适配 | `ParaformerRecognizer` | 中文识别，透传 token 时间戳 | `asr/paraformer.rs` |
 | 模型适配 | `WhisperRecognizer` | Whisper base 识别，目前仅透传文本 | `asr/whisper.rs` |
+| 模型适配 | `Qwen3Recognizer` | 中英混说/热词，无 token 时间戳（段级降级） | `asr/qwen3.rs` |
 | ASR 调度 | `run_asr_worker` | final 优先、partial 预览、过滤、回声去重、说话人处理 | `session.rs` |
 | 段内切分 | `detect_change_points`、`group_tokens_by_boundaries` | 按声纹换人点拆分长段文字 | `diar/split.rs` |
 | 说话人 | `SpeakerRegistry`、`SpeakerEmbedder` | 实时聚类、已有身份匹配、簇合并 | `diar/registry.rs`、`diar/mod.rs` |
