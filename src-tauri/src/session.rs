@@ -1008,6 +1008,597 @@ pub fn run_asr_worker(
     (recognizer, embedder)
 }
 
+// ===== 云端流式识别 worker(spec §4)=====
+//
+// 与本机 worker 的分工:本机侧「切段 → 识别 → FinalSink」,云端侧把切段与识别都
+// 交给厂商,worker 只做三件本机才知道的事——(1) 把厂商的流内时钟映射回本源时间轴,
+// (2) 断连期间的音频记账 + 重连后批式补识,(3) 把结果喂进同一个 FinalSink。
+// 处理链复用 FinalSink 是硬要求:回声去重/声纹/语言过滤一旦有两份实现必然分叉。
+
+/// ring 容量:5 分钟(spec §4)。断网缺口能补回的上限,也是 worker 内存占用上限
+/// (5min × 16kHz × 4B ≈ 19MB/源)。
+pub(crate) const CLOUD_RING_CAP: usize = 5 * 60 * 16_000;
+/// 重连退避基数(ms):1s→2s→4s…上限 30s。测试注入 1ms,避免单测空等真实退避。
+#[cfg(not(test))]
+const CLOUD_BACKOFF_BASE_MS: u64 = 1000;
+#[cfg(test)]
+const CLOUD_BACKOFF_BASE_MS: u64 = 1;
+/// 退避上限(ms):长时间断网不再无限拉长,保证网络恢复后 30s 内必然重试。
+const CLOUD_BACKOFF_CAP_MS: u64 = 30_000;
+/// 停录后排干厂商剩余定稿的窗口(ms):厂商常在 finish 之后才吐最后一句。
+/// 测试用短窗:mock 流在 finish 后即断开通道,排干靠断开结束,短窗只是兜底。
+#[cfg(not(test))]
+const CLOUD_DRAIN_MS: u64 = 3000;
+#[cfg(test)]
+const CLOUD_DRAIN_MS: u64 = 200;
+/// 主循环空闲 tick(ms):驱动 FinalSink 的 hold 到期检查,与本机 worker 同节奏。
+const CLOUD_TICK_MS: u64 = 100;
+
+/// 缺口切段器:缺口音频 → (段偏移样本, 段) 列表。由调用方注入本机 VAD
+/// (厂商批式接口有单请求时长上限),worker 只把偏移叠回绝对时间轴。
+pub type BackfillSegmenter = dyn FnMut(&[f32]) -> Vec<(u64, Vec<f32>)> + Send;
+
+/// 云端识别的连接状态,供 UI 提示「重连中/补识中/已恢复」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudAsrStatus {
+    Reconnecting { source: Source },
+    Recovered { source: Source },
+    Backfilling { source: Source },
+    BackfillFailed { source: Source },
+}
+
+/// 每源音频账本:推流样本计数(=流内时钟)+ 环形缓冲 + 断连缺口。
+///
+/// 为什么要自己记账:厂商给的时间戳是「本条流内的相对 ms」,重连后从 0 重计,
+/// 而落盘/UI 要的是「本源会话时间轴」。fed 只在真正喂给识别的帧上前进(暂停期
+/// 的帧在 segment_worker 就被丢了,压根到不了这里),因此与本机路的时间轴同语义。
+pub(crate) struct SourceFeed {
+    /// 已推样本(16kHz),暂停不计 → 与本地时间轴同语义。
+    fed: u64,
+    /// 当前流打开时的 fed(重连后厂商 ms 从 0 重计,靠它加回绝对位置)。
+    stream_base: u64,
+    ring: VecDeque<f32>,
+    /// ring[0] 的绝对样本号(掐头后前进)。
+    ring_start: u64,
+    /// 断连起点(绝对样本号);None = 无未补缺口。
+    gap_from: Option<u64>,
+}
+
+impl SourceFeed {
+    fn new() -> Self {
+        Self {
+            fed: 0,
+            stream_base: 0,
+            ring: VecDeque::new(),
+            ring_start: 0,
+            gap_from: None,
+        }
+    }
+
+    /// 记一帧账:fed 前进、入环、超 CAP 掐头。断连与否都要记——缺口的音频全靠
+    /// 这份 ring 补回来。
+    fn account(&mut self, samples: &[f32]) {
+        self.fed += samples.len() as u64;
+        self.ring.extend(samples.iter().copied());
+        if self.ring.len() > CLOUD_RING_CAP {
+            let overflow = self.ring.len() - CLOUD_RING_CAP;
+            self.ring.drain(..overflow);
+            self.ring_start += overflow as u64;
+        }
+    }
+
+    /// `[from,to)` 的环内音频(声纹样本用)。
+    /// 段首已被环挤掉 → 整段给空:宁可没有声纹,也不能拿一段错位的音频去归簇。
+    /// 段尾越过环末 → 截到环末:厂商定稿的 end 常比我们已喂的样本多出几十毫秒
+    /// (服务端补白),为这点尾巴丢掉整段声纹得不偿失。
+    fn slice(&self, from: u64, to: u64) -> Vec<f32> {
+        let ring_end = self.ring_start + self.ring.len() as u64;
+        if to <= from || from < self.ring_start || from >= ring_end {
+            return Vec::new();
+        }
+        let lo = (from - self.ring_start) as usize;
+        let hi = (to.min(ring_end) - self.ring_start) as usize;
+        self.ring.iter().copied().skip(lo).take(hi - lo).collect()
+    }
+
+    /// `[from,to)` 与环的交集,零拷贝借出(补识切段用,可能是几分钟的大数组)。
+    fn contiguous(&mut self, from: u64, to: u64) -> &[f32] {
+        let lo = from.max(self.ring_start);
+        let hi = to.min(self.ring_start + self.ring.len() as u64);
+        if hi <= lo {
+            return &[];
+        }
+        let (lo, hi) = ((lo - self.ring_start) as usize, (hi - self.ring_start) as usize);
+        &self.ring.make_contiguous()[lo..hi]
+    }
+}
+
+/// 样本数 → ms(16kHz)。
+fn samples_to_ms(n: u64) -> u64 {
+    n * 1000 / crate::store::audio::AUDIO_SAMPLE_RATE as u64
+}
+
+/// ms → 样本数(16kHz)。
+fn ms_to_samples(ms: u64) -> u64 {
+    ms * crate::store::audio::AUDIO_SAMPLE_RATE as u64 / 1000
+}
+
+/// 厂商定稿 → Transcript。逐词表映射成 tokens + 相对段首的秒时间戳,喂 FinalSink
+/// 的段内切分(与本机 Qwen3 的 token 时间戳同形);无词表则两者皆空,自然降级为段级。
+fn utterance_to_transcript(u: &crate::asr::cloud::DefiniteUtterance) -> Transcript {
+    Transcript {
+        text: u.text.clone(),
+        lang: u.lang.clone(),
+        tokens: u.words.iter().map(|w| w.text.clone()).collect(),
+        timestamps: u
+            .words
+            .iter()
+            .map(|w| w.start_ms.saturating_sub(u.start_ms) as f32 / 1000.0)
+            .collect(),
+    }
+}
+
+/// 云端 worker 的每源运行态:账本 + 当前流 + 重连节奏。
+struct CloudSource {
+    source: Source,
+    feed: SourceFeed,
+    /// None = 当前无可用流(断连或已正常关闭)。
+    stream: Option<crate::asr::cloud::CloudStream>,
+    /// 音频通道是否仍开着(全关 = 停录)。
+    audio_open: bool,
+    /// 下次重连时刻(退避);None = 无待重连。
+    retry_at: Option<Instant>,
+    backoff_ms: u64,
+}
+
+/// 标记一次断连:记缺口起点、丢弃死流、通知 UI、起退避。
+/// gap_from 用 get_or_insert:重连成功后立刻再断的场景,缺口起点仍是最早那次,
+/// 中间这段音频不能被后一次断连"吃掉"。
+fn mark_disconnected<S: FnMut(CloudAsrStatus)>(cs: &mut CloudSource, on_status: &mut S) {
+    cs.feed.gap_from.get_or_insert(cs.feed.fed);
+    cs.stream = None;
+    cs.backoff_ms = CLOUD_BACKOFF_BASE_MS;
+    cs.retry_at = Some(Instant::now() + Duration::from_millis(cs.backoff_ms));
+    on_status(CloudAsrStatus::Reconnecting { source: cs.source });
+}
+
+/// 一条厂商定稿落进 FinalSink:流内 ms → 绝对 ms,并按绝对区间从 ring 取声纹样本。
+fn push_definite<F, P, D>(
+    source: Source,
+    feed: &SourceFeed,
+    u: &crate::asr::cloud::DefiniteUtterance,
+    sink: &mut FinalSink<'_, F, P, D>,
+) where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+{
+    let base_ms = samples_to_ms(feed.stream_base);
+    let start_ms = base_ms + u.start_ms;
+    let end_ms = base_ms + u.end_ms;
+    let samples = feed.slice(
+        feed.stream_base + ms_to_samples(u.start_ms),
+        feed.stream_base + ms_to_samples(u.end_ms),
+    );
+    // 到期检查先于本条定稿(与本机 worker 同款):持续来定稿时也能及时放行 hold 中的段。
+    sink.tick();
+    sink.push(source, utterance_to_transcript(u), start_ms, end_ms, &samples);
+}
+
+/// 一条占位段:确有发声但没能识别回来的区间,留痕不静默丢(与本机路占位同语义)。
+fn push_placeholder<F, P, D>(
+    source: Source,
+    start_ms: u64,
+    end_ms: u64,
+    sink: &mut FinalSink<'_, F, P, D>,
+) where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+{
+    sink.push(
+        source,
+        Transcript { text: "[识别失败]".to_string(), ..Default::default() },
+        start_ms,
+        end_ms,
+        &[],
+    );
+}
+
+/// 缺口补识:ring 未覆盖的头部直接占位,覆盖部分切段后逐段批式识别。
+/// 任一段失败 → 整缺口一条占位段(spec §4):成功段先攒着不发,避免同一区间既有
+/// 文本段又盖一条占位段,时间轴上自相矛盾。
+#[allow(clippy::too_many_arguments)]
+fn backfill_gap<F, P, D, S>(
+    source: Source,
+    feed: &mut SourceFeed,
+    gap_from: u64,
+    gap_to: u64,
+    cloud: &Arc<dyn crate::asr::cloud::CloudAsr>,
+    backfill_segmenter: &mut BackfillSegmenter,
+    sink: &mut FinalSink<'_, F, P, D>,
+    on_status: &mut S,
+) where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+    S: FnMut(CloudAsrStatus),
+{
+    if gap_to <= gap_from {
+        return; // 零长缺口(断连期间一帧没来):无音频可补,也不必惊动 UI
+    }
+    on_status(CloudAsrStatus::Backfilling { source });
+
+    // ring 之外的区间音频已被覆盖,补无可补 → 先落一条占位,再处理覆盖部分,
+    // 保证时间轴顺序(占位在前)。
+    let covered_from = gap_from.max(feed.ring_start);
+    if covered_from > gap_from {
+        push_placeholder(source, samples_to_ms(gap_from), samples_to_ms(covered_from), sink);
+    }
+    let chunks = {
+        let audio = feed.contiguous(covered_from, gap_to);
+        if audio.is_empty() {
+            return;
+        }
+        backfill_segmenter(audio)
+    };
+
+    let mut done: Vec<(Transcript, u64, u64, Vec<f32>)> = Vec::new();
+    let mut failed = false;
+    for (offset, chunk) in chunks {
+        match cloud.transcribe_batch(&chunk) {
+            Ok(utts) => {
+                for u in utts {
+                    // 绝对时间 = 缺口可补起点 + 段偏移 + 段内相对时间。
+                    let seg_base = covered_from + offset;
+                    let start_ms = samples_to_ms(seg_base) + u.start_ms;
+                    let end_ms = samples_to_ms(seg_base) + u.end_ms;
+                    let samples = feed.slice(
+                        seg_base + ms_to_samples(u.start_ms),
+                        seg_base + ms_to_samples(u.end_ms),
+                    );
+                    done.push((utterance_to_transcript(&u), start_ms, end_ms, samples));
+                }
+            }
+            Err(e) => {
+                eprintln!("云端补识失败({:?} 源): {e};整缺口按占位段处理", source);
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    if failed {
+        // 覆盖整个缺口的占位;若头部已单独占位过,就从可补起点开始,免得两条
+        // 占位段互相包含。
+        push_placeholder(source, samples_to_ms(covered_from), samples_to_ms(gap_to), sink);
+        on_status(CloudAsrStatus::BackfillFailed { source });
+        return;
+    }
+    for (t, start_ms, end_ms, samples) in done {
+        sink.push(source, t, start_ms, end_ms, &samples);
+    }
+}
+
+/// 尝试重连并补识缺口。`force` 忽略退避(停录收尾时只此一次)。
+/// 顺序:重开成功 → 重基 stream_base → 补识缺口 → Recovered 殿后,「已恢复」才
+/// 真的意味着这段时间没留窟窿。
+#[allow(clippy::too_many_arguments)]
+fn try_recover<F, P, D, S>(
+    cs: &mut CloudSource,
+    force: bool,
+    cloud: &Arc<dyn crate::asr::cloud::CloudAsr>,
+    backfill_segmenter: &mut BackfillSegmenter,
+    sink: &mut FinalSink<'_, F, P, D>,
+    on_status: &mut S,
+) where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+    S: FnMut(CloudAsrStatus),
+{
+    let Some(gap_from) = cs.feed.gap_from else {
+        return;
+    };
+    if !force && cs.retry_at.is_some_and(|t| Instant::now() < t) {
+        return;
+    }
+    match cloud.open_stream() {
+        Ok(stream) => {
+            cs.stream = Some(stream);
+            cs.backoff_ms = CLOUD_BACKOFF_BASE_MS;
+            cs.retry_at = None;
+            // 新流的厂商时钟从 0 重计:此刻的 fed 就是它的基准。缺口在此闭合。
+            let gap_to = cs.feed.fed;
+            cs.feed.stream_base = gap_to;
+            cs.feed.gap_from = None;
+            backfill_gap(
+                cs.source,
+                &mut cs.feed,
+                gap_from,
+                gap_to,
+                cloud,
+                backfill_segmenter,
+                sink,
+                on_status,
+            );
+            on_status(CloudAsrStatus::Recovered { source: cs.source });
+        }
+        Err(e) => {
+            eprintln!("云端重连失败({:?} 源): {e}", cs.source);
+            cs.backoff_ms = (cs.backoff_ms * 2).min(CLOUD_BACKOFF_CAP_MS);
+            cs.retry_at = Some(Instant::now() + Duration::from_millis(cs.backoff_ms));
+        }
+    }
+}
+
+/// 云端识别 worker：每源一条厂商流，音频记账 + 推流，事件回灌同一条 FinalSink。
+///
+/// 断连不丢内容是本函数的核心不变式：流一死就记下缺口起点，其间的音频照常记账进
+/// ring；重连成功后把缺口音频切段批式补回来，补不回来(超出 ring / 批式失败 / 停录
+/// 前始终连不上)也要留一条 `[识别失败]` 占位段，绝不静默吞掉一段发声。
+///
+/// audio_rxs 全部关闭 = 停录：对活流 finish 并排干厂商最后几句，再 sink.finish()，
+/// 返还 embedder 供调用方复用。
+#[allow(clippy::too_many_arguments)]
+pub fn run_cloud_asr_worker(
+    cloud: Arc<dyn crate::asr::cloud::CloudAsr>,
+    mut embedder: Option<Box<dyn SpeakerEmbedder>>,
+    mut registry: SpeakerRegistry,
+    audio_rxs: Vec<(Source, Receiver<Vec<f32>>)>,
+    echo_hold: Duration,
+    // 语言幻觉过滤总开关，见 run_asr_worker 同名参数注释。
+    language_filter: bool,
+    // 缺口音频 → (段偏移样本, 段) 列表。由调用方注入本机 VAD 切段(厂商批式接口
+    // 有单请求时长上限),worker 只负责把偏移叠回绝对时间轴。
+    mut backfill_segmenter: Box<BackfillSegmenter>,
+    on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    on_partial: impl FnMut(Source, String),
+    on_diar: impl FnMut(DiarEvent),
+    mut on_status: impl FnMut(CloudAsrStatus),
+) -> Option<Box<dyn SpeakerEmbedder>> {
+    let mut sink = FinalSink::new(
+        &mut embedder,
+        &mut registry,
+        echo_hold,
+        language_filter,
+        on_final,
+        on_partial,
+        on_diar,
+    );
+
+    let mut srcs: Vec<CloudSource> = audio_rxs
+        .iter()
+        .map(|(source, _)| CloudSource {
+            source: *source,
+            feed: SourceFeed::new(),
+            stream: None,
+            audio_open: true,
+            retry_at: None,
+            backoff_ms: CLOUD_BACKOFF_BASE_MS,
+        })
+        .collect();
+
+    // 开流。首次就开不起来的源直接进重连状态机(缺口从 0 起),不放弃该源:
+    // 网络在录制中恢复的场景下,这段音频还能靠补识捞回来。
+    for cs in srcs.iter_mut() {
+        match cloud.open_stream() {
+            Ok(s) => cs.stream = Some(s),
+            Err(e) => {
+                eprintln!("云端开流失败({:?} 源): {e};进入重连", cs.source);
+                mark_disconnected(cs, &mut on_status);
+            }
+        }
+    }
+
+    /// 主循环一次唤醒的来源(usize 为源下标)。
+    enum Woke {
+        Audio(usize, Result<Vec<f32>, crossbeam_channel::RecvError>),
+        Event(usize, Result<crate::asr::cloud::CloudEvent, crossbeam_channel::RecvError>),
+        Tick,
+    }
+
+    loop {
+        if srcs.iter().all(|cs| !cs.audio_open) {
+            break; // 全部音频通道关闭 = 停录
+        }
+
+        // 1) 事件优先:先把已到的识别事件处理干净再收音频。断连时刻决定缺口起点,
+        //    若让事件落后于音频,断连前已成功推送的音频会被错算进缺口(重复识别)。
+        for cs in srcs.iter_mut() {
+            while let Some(stream) = cs.stream.as_ref() {
+                match stream.events.try_recv() {
+                    Ok(e) => handle_cloud_event(cs, e, &mut sink, &mut on_status),
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // 事件通道无声无息断开(适配层线程异常退出):视同带错关闭,
+                        // 否则这条流会变成"活着但永不出字"的黑洞。
+                        eprintln!("云端事件通道断开({:?} 源);按断连处理", cs.source);
+                        mark_disconnected(cs, &mut on_status);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2) 重连 + 补识。只在所有源都无音频积压时做:开流与批式识别都要走网络,
+        //    可能阻塞数秒,占着主循环就会把各源的记账一起堵死。
+        let idle = audio_rxs
+            .iter()
+            .zip(srcs.iter())
+            .all(|((_, rx), cs)| !cs.audio_open || rx.is_empty());
+        if idle {
+            for cs in srcs.iter_mut() {
+                try_recover(
+                    cs,
+                    false,
+                    &cloud,
+                    backfill_segmenter.as_mut(),
+                    &mut sink,
+                    &mut on_status,
+                );
+            }
+        }
+
+        // 3) 等音频帧 / 事件 / tick。Select 借着 audio_rxs 与各流的 events,
+        //    借用必须在改状态之前结束,故收完值就出块。
+        let woke = {
+            let mut sel = crossbeam_channel::Select::new();
+            let mut ops: Vec<(usize, bool, usize)> = Vec::new(); // (op, 是音频, 源下标)
+            for (i, cs) in srcs.iter().enumerate() {
+                if cs.audio_open {
+                    ops.push((sel.recv(&audio_rxs[i].1), true, i));
+                }
+                if let Some(s) = cs.stream.as_ref() {
+                    ops.push((sel.recv(&s.events), false, i));
+                }
+            }
+            match sel.select_timeout(Duration::from_millis(CLOUD_TICK_MS)) {
+                Err(_) => Woke::Tick,
+                Ok(oper) => {
+                    let idx = oper.index();
+                    let (_, is_audio, i) = *ops
+                        .iter()
+                        .find(|(op, _, _)| *op == idx)
+                        .expect("select 只会返回上面注册过的操作");
+                    if is_audio {
+                        Woke::Audio(i, oper.recv(&audio_rxs[i].1))
+                    } else {
+                        let rx = &srcs[i].stream.as_ref().expect("事件操作只对活流注册").events;
+                        Woke::Event(i, oper.recv(rx))
+                    }
+                }
+            }
+        };
+
+        match woke {
+            Woke::Audio(i, Ok(frame)) => {
+                let cs = &mut srcs[i];
+                // 先推后记账:推失败时缺口起点正好落在本帧之前(本帧没送达厂商,
+                // 必须算进缺口)。断连期间流为 None → 只记账,不推(规约 7)。
+                let push_failed = match cs.stream.as_mut() {
+                    Some(s) => (s.push)(&frame).is_err(),
+                    None => false,
+                };
+                if push_failed {
+                    eprintln!("云端推流失败({:?} 源);按断连处理", cs.source);
+                    mark_disconnected(cs, &mut on_status);
+                }
+                cs.feed.account(&frame);
+            }
+            Woke::Audio(i, Err(_)) => srcs[i].audio_open = false,
+            Woke::Event(i, Ok(e)) => handle_cloud_event(&mut srcs[i], e, &mut sink, &mut on_status),
+            Woke::Event(i, Err(_)) => {
+                eprintln!("云端事件通道断开({:?} 源);按断连处理", srcs[i].source);
+                mark_disconnected(&mut srcs[i], &mut on_status);
+            }
+            Woke::Tick => sink.tick(),
+        }
+    }
+
+    // 停录收尾。仍挂着缺口的源走同一条恢复路径(忽略退避,只此一次):多开一条随
+    // 即 finish 的流,换取"补识只有一条实现"的确定性;连不上就落占位段留痕。
+    for cs in srcs.iter_mut() {
+        try_recover(
+            cs,
+            true,
+            &cloud,
+            backfill_segmenter.as_mut(),
+            &mut sink,
+            &mut on_status,
+        );
+        // 始终连不上:缺口里的发声补不回来了,落一条占位段留痕(零长缺口除外)。
+        if let Some(gap_from) = cs.feed.gap_from.take() {
+            if cs.feed.fed > gap_from {
+                push_placeholder(
+                    cs.source,
+                    samples_to_ms(gap_from),
+                    samples_to_ms(cs.feed.fed),
+                    &mut sink,
+                );
+                on_status(CloudAsrStatus::BackfillFailed { source: cs.source });
+            }
+        }
+    }
+
+    // 对活流 finish 并排干:厂商常在 finish 之后才吐最后一句。push 闭包在此丢弃,
+    // 适配层的发送端随之释放,排干靠通道断开自然结束,不必空等满窗。
+    let mut drains: Vec<(usize, Receiver<crate::asr::cloud::CloudEvent>)> = Vec::new();
+    for (i, cs) in srcs.iter_mut().enumerate() {
+        if let Some(stream) = cs.stream.take() {
+            let crate::asr::cloud::CloudStream { push, finish, events } = stream;
+            drop(push);
+            if let Err(e) = finish() {
+                eprintln!("云端流 finish 失败({:?} 源): {e}", cs.source);
+            }
+            drains.push((i, events));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(CLOUD_DRAIN_MS);
+    while !drains.is_empty() {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            eprintln!("云端排干超时,放弃剩余事件");
+            break;
+        };
+        let woke = {
+            let mut sel = crossbeam_channel::Select::new();
+            for (_, rx) in drains.iter() {
+                sel.recv(rx);
+            }
+            match sel.select_timeout(left) {
+                Err(_) => None,
+                Ok(oper) => {
+                    let slot = oper.index();
+                    Some((slot, oper.recv(&drains[slot].1)))
+                }
+            }
+        };
+        let Some((slot, ev)) = woke else { break };
+        match ev {
+            // 排干阶段只捞定稿:预览已无处可去,断连也无需再重连(录制已结束)。
+            Ok(crate::asr::cloud::CloudEvent::Definite(u)) => {
+                let i = drains[slot].0;
+                push_definite(srcs[i].source, &srcs[i].feed, &u, &mut sink);
+            }
+            Ok(crate::asr::cloud::CloudEvent::Interim { .. }) => {}
+            Ok(crate::asr::cloud::CloudEvent::Closed { .. }) | Err(_) => {
+                drains.remove(slot);
+            }
+        }
+    }
+
+    sink.finish();
+    embedder
+}
+
+/// 主循环里的一条厂商事件:预览走 push_partial(system 记账与 mic 预览回声抑制
+/// 都在 sink 内部),定稿走时间映射,带错关闭进重连状态机。
+fn handle_cloud_event<F, P, D, S>(
+    cs: &mut CloudSource,
+    event: crate::asr::cloud::CloudEvent,
+    sink: &mut FinalSink<'_, F, P, D>,
+    on_status: &mut S,
+) where
+    F: FnMut(Source, String, u64, u64, Option<String>, Option<f32>),
+    P: FnMut(Source, String),
+    D: FnMut(DiarEvent),
+    S: FnMut(CloudAsrStatus),
+{
+    match event {
+        crate::asr::cloud::CloudEvent::Interim { text } => sink.push_partial(cs.source, text),
+        crate::asr::cloud::CloudEvent::Definite(u) => push_definite(cs.source, &cs.feed, &u, sink),
+        crate::asr::cloud::CloudEvent::Closed { error: None } => {
+            // 正常关闭(厂商侧收尾):不算缺口,也不自动重开——重开是断连语义,
+            // 正常关闭再开一条流只会凭空多一次握手。
+            cs.stream = None;
+        }
+        crate::asr::cloud::CloudEvent::Closed { error: Some(e) } => {
+            eprintln!("云端连接断开({:?} 源): {e}", cs.source);
+            mark_disconnected(cs, on_status);
+        }
+    }
+}
+
 /// 一次录制会话的句柄：持两路 capture + 各 worker 的 join 句柄。
 pub struct RecordingHandle {
     captures: Vec<Box<dyn AudioCapture>>,
@@ -2696,5 +3287,284 @@ mod tests {
             1.0,
             "较长文本仍应正常触发 contains 满分"
         );
+    }
+}
+
+#[cfg(test)]
+mod cloud_worker_tests {
+    use super::*;
+    use crate::asr::cloud::{CloudAsr, CloudEvent, CloudStream, CloudWord, DefiniteUtterance, MockCloudAsr};
+    use crate::audio::Source;
+    use std::sync::{Arc, Mutex};
+
+    // 短 hold:云端 worker 的 mic 段同样进回声 hold,测试里只关心停录排干后的结果,
+    // hold 时长本身对断言无影响(单源、无 system 段)。
+    const TEST_ECHO_HOLD: Duration = Duration::from_millis(50);
+
+    fn utter(text: &str, s: u64, e: u64) -> DefiniteUtterance {
+        DefiniteUtterance { text: text.into(), start_ms: s, end_ms: e, words: vec![], lang: String::new() }
+    }
+
+    /// 状态事件 → 短名,便于按序断言。
+    fn status_name(s: &CloudAsrStatus) -> String {
+        match s {
+            CloudAsrStatus::Reconnecting { .. } => "Reconnecting",
+            CloudAsrStatus::Recovered { .. } => "Recovered",
+            CloudAsrStatus::Backfilling { .. } => "Backfilling",
+            CloudAsrStatus::BackfillFailed { .. } => "BackfillFailed",
+        }
+        .to_string()
+    }
+
+    type Collected = (Vec<(Source, String, u64, u64)>, Vec<String>, Vec<String>);
+
+    /// 驱动骨架:单源 mic。帧全部预先入队后关掉发送端(= 停录),worker 就地跑完返回,
+    /// 三路回调收进 Vec 供断言。补识切段桩默认「整缺口一段、偏移 0」。
+    fn drive(mock: MockCloudAsr, frames: Vec<Vec<f32>>) -> Collected {
+        drive_with(Arc::new(mock), frames, Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]))
+    }
+
+    fn drive_with(
+        cloud: Arc<dyn CloudAsr>,
+        frames: Vec<Vec<f32>>,
+        backfill_segmenter: Box<BackfillSegmenter>,
+    ) -> Collected {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        for f in frames {
+            tx.send(f).unwrap();
+        }
+        drop(tx); // 停录:音频通道关闭即触发 worker 收尾
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String, u64, u64)>::new()));
+        let partials = Arc::new(Mutex::new(Vec::<String>::new()));
+        let statuses = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (f2, p2, s2) = (finals.clone(), partials.clone(), statuses.clone());
+
+        let _ = run_cloud_asr_worker(
+            cloud,
+            None,
+            SpeakerRegistry::new(),
+            vec![(Source::Mic, rx)],
+            TEST_ECHO_HOLD,
+            false, // language_filter:测试文本与语言过滤无关,关掉隔离变量
+            backfill_segmenter,
+            move |s, t, start_ms, end_ms, _, _| f2.lock().unwrap().push((s, t, start_ms, end_ms)),
+            move |s, t| p2.lock().unwrap().push(format!("{}:{}", s.as_str(), t)),
+            |_| {},
+            move |st| s2.lock().unwrap().push(status_name(&st)),
+        );
+
+        let finals = finals.lock().unwrap().clone();
+        let partials = partials.lock().unwrap().clone();
+        let statuses = statuses.lock().unwrap().clone();
+        (finals, partials, statuses)
+    }
+
+    #[test]
+    fn definite_maps_stream_ms_to_source_timeline_and_reaches_final() {
+        let mock = MockCloudAsr::new(
+            vec![vec![
+                CloudEvent::Definite(utter("你好", 0, 500)),
+                CloudEvent::Closed { error: None },
+            ]],
+            vec![],
+        );
+        let (finals, _, _) = drive(mock, vec![vec![0.0; 16000]]);
+        assert_eq!(finals.len(), 1, "一条 Definite → 一条 final");
+        assert_eq!(finals[0].1, "你好");
+        assert_eq!((finals[0].2, finals[0].3), (0, 500), "首流 stream_base=0,厂商 ms 即绝对 ms");
+    }
+
+    #[test]
+    fn interim_feeds_partial_slot() {
+        let mock = MockCloudAsr::new(
+            vec![vec![
+                CloudEvent::Interim { text: "你".into() },
+                CloudEvent::Closed { error: None },
+            ]],
+            vec![],
+        );
+        let (_, partials, _) = drive(mock, vec![vec![0.0; 1600]]);
+        assert_eq!(partials, vec!["mic:你".to_string()], "Interim 经 push_partial 出预览");
+    }
+
+    #[test]
+    fn reconnect_records_gap_and_backfills_via_batch() {
+        // 流1 立刻带错关闭(缺口起点 fed=0);流2 重连成功并再吐一句(验证 stream_base 重基)。
+        let mock = MockCloudAsr::new(
+            vec![
+                vec![CloudEvent::Closed { error: Some("net".into()) }],
+                vec![
+                    CloudEvent::Definite(utter("续", 0, 200)),
+                    CloudEvent::Closed { error: None },
+                ],
+            ],
+            vec![Ok(vec![utter("补", 0, 1000)])],
+        );
+        // 1s 音频 → 缺口 [0, 16000) = [0ms, 1000ms)
+        let (finals, _, statuses) = drive(mock, vec![vec![0.1; 16000]]);
+        assert_eq!(
+            statuses,
+            vec!["Reconnecting", "Backfilling", "Recovered"],
+            "重连→补识→恢复:Recovered 殿后(缺口处理完才算恢复)"
+        );
+        assert!(
+            finals.contains(&(Source::Mic, "补".into(), 0, 1000)),
+            "补识结果落在缺口起点 + 段偏移 + 段内相对时间上: {finals:?}"
+        );
+        assert!(
+            finals.contains(&(Source::Mic, "续".into(), 1000, 1200)),
+            "重连后厂商 ms 从 0 重计,须叠加 stream_base(1000ms): {finals:?}"
+        );
+    }
+
+    #[test]
+    fn batch_failure_yields_placeholder_covering_gap() {
+        let mock = MockCloudAsr::new(
+            vec![
+                vec![CloudEvent::Closed { error: Some("net".into()) }],
+                vec![CloudEvent::Closed { error: None }],
+            ],
+            vec![Err(anyhow::anyhow!("batch boom"))],
+        );
+        let (finals, _, statuses) = drive(mock, vec![vec![0.1; 16000]]);
+        assert_eq!(
+            statuses,
+            vec!["Reconnecting", "Backfilling", "BackfillFailed", "Recovered"],
+            "补识失败也要走完恢复流程"
+        );
+        assert_eq!(
+            finals,
+            vec![(Source::Mic, "[识别失败]".to_string(), 0, 1000)],
+            "整缺口一条占位段,不静默吞掉这段发声"
+        );
+    }
+
+    #[test]
+    fn gap_beyond_ring_yields_placeholder_for_uncovered_head() {
+        // 缺口 400s,ring 只留最近 5 分钟(300s):前 100s 无音频可补 → 占位;
+        // 其余走批式补识。
+        let mock = MockCloudAsr::new(
+            vec![
+                vec![CloudEvent::Closed { error: Some("net".into()) }],
+                vec![CloudEvent::Closed { error: None }],
+            ],
+            vec![Ok(vec![utter("尾", 0, 500)])],
+        );
+        let cloud: Arc<dyn CloudAsr> = Arc::new(mock);
+        // 切段桩不搬运大数组:只回一个「偏移 0 的小段」,时间映射只看偏移。
+        let (finals, _, statuses) = drive_with(
+            cloud,
+            vec![vec![0.1; 3_200_000], vec![0.1; 3_200_000]], // 共 400s
+            Box::new(|_gap: &[f32]| vec![(0u64, vec![0.1; 16])]),
+        );
+        let ring_ms = (CLOUD_RING_CAP as u64) * 1000 / 16_000; // 300_000ms
+        let head_end = 400_000 - ring_ms; // 100_000ms:ring 覆盖不到的头部
+        assert_eq!(
+            finals,
+            vec![
+                (Source::Mic, "[识别失败]".to_string(), 0, head_end),
+                (Source::Mic, "尾".to_string(), head_end, head_end + 500),
+            ],
+            "先占位未覆盖头部,再落覆盖部分的补识结果"
+        );
+        assert_eq!(statuses, vec!["Reconnecting", "Backfilling", "Recovered"]);
+    }
+
+    /// finish 之后才吐最后一句的厂商流(排干路径专用)。
+    struct LateFinishCloud;
+    impl CloudAsr for LateFinishCloud {
+        fn open_stream(&self) -> anyhow::Result<CloudStream> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let tx_finish = tx.clone();
+            Ok(CloudStream {
+                // tx 挂在 push 上:流活着期间事件通道不断开(与真实适配层一致)。
+                push: Box::new(move |_s: &[f32]| {
+                    let _ = &tx;
+                    Ok(())
+                }),
+                finish: Box::new(move || {
+                    let _ = tx_finish.send(CloudEvent::Definite(DefiniteUtterance {
+                        text: "尾句".into(),
+                        start_ms: 0,
+                        end_ms: 300,
+                        words: vec![],
+                        lang: String::new(),
+                    }));
+                    Ok(())
+                }),
+                events: rx,
+            })
+        }
+        fn transcribe_batch(&self, _s: &[f32]) -> anyhow::Result<Vec<DefiniteUtterance>> {
+            anyhow::bail!("本例不走批式")
+        }
+    }
+
+    #[test]
+    fn definite_arriving_after_finish_still_lands_during_drain() {
+        let (finals, _, _) = drive_with(
+            Arc::new(LateFinishCloud),
+            vec![vec![0.1; 16000]],
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+        );
+        assert_eq!(
+            finals,
+            vec![(Source::Mic, "尾句".to_string(), 0, 300)],
+            "停录 finish 后才到的定稿必须排干落地"
+        );
+    }
+
+    #[test]
+    fn audio_during_disconnect_is_accounted_but_not_pushed() {
+        // 只给一条流脚本:断连后重连必然失败,整段音频都在断连期内。
+        let mock = MockCloudAsr::new(
+            vec![vec![CloudEvent::Closed { error: Some("net".into()) }]],
+            vec![],
+        );
+        let pushed = mock.pushed_samples.clone();
+        let cloud: Arc<dyn CloudAsr> = Arc::new(mock);
+        let (finals, _, statuses) = drive_with(
+            cloud,
+            vec![vec![0.1; 16000]],
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+        );
+        assert_eq!(*pushed.lock().unwrap(), 0, "流已死:断连期间的音频一个样本都不许推");
+        assert_eq!(
+            finals,
+            vec![(Source::Mic, "[识别失败]".to_string(), 0, 1000)],
+            "音频仍在记账,停录时补不回来 → 整缺口占位(不静默丢)"
+        );
+        assert_eq!(statuses, vec!["Reconnecting", "BackfillFailed"]);
+    }
+
+    #[test]
+    fn ring_trims_to_cap_and_slices_only_from_covered_start() {
+        let mut feed = SourceFeed::new();
+        feed.account(&vec![0.5; CLOUD_RING_CAP]);
+        feed.account(&vec![0.25; 16_000]);
+        assert_eq!(feed.fed, CLOUD_RING_CAP as u64 + 16_000);
+        assert_eq!(feed.ring.len(), CLOUD_RING_CAP, "环容量掐头到 CAP");
+        assert_eq!(feed.ring_start, 16_000, "掐掉多少,ring_start 就前进多少");
+        assert!(feed.slice(0, 1600).is_empty(), "段首已被挤掉 → 整段给空");
+        assert_eq!(feed.slice(16_000, 17_600).len(), 1600, "环内区间照常取样");
+        // 段尾越过已喂样本(厂商补白):截到环末而不是整段丢弃。
+        let tail = feed.slice(feed.fed - 1600, feed.fed + 1600);
+        assert_eq!(tail.len(), 1600);
+        assert!(tail.iter().all(|&x| x == 0.25));
+    }
+
+    #[test]
+    fn words_become_tokens_with_relative_second_timestamps() {
+        let mut u = utter("你好世界", 1000, 2000);
+        u.words = vec![
+            CloudWord { text: "你好".into(), start_ms: 1000, end_ms: 1500 },
+            CloudWord { text: "世界".into(), start_ms: 1500, end_ms: 2000 },
+        ];
+        let t = utterance_to_transcript(&u);
+        assert_eq!(t.tokens, vec!["你好".to_string(), "世界".to_string()]);
+        assert_eq!(t.timestamps, vec![0.0, 0.5], "时间戳相对段首、单位秒");
+        let empty = utterance_to_transcript(&utter("无词", 0, 100));
+        assert!(empty.tokens.is_empty() && empty.timestamps.is_empty(), "无词表 → 两者皆空");
     }
 }
