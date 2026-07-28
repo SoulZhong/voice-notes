@@ -3539,6 +3539,56 @@ mod cloud_worker_tests {
     }
 
     #[test]
+    fn each_source_opens_its_own_stream_on_its_own_timeline() {
+        // 两源各开一条流(mock 按 open 顺序发脚本),各记各的账。system 侧预览还要
+        // 经 push_partial 进 sink 的在途文本记账(mic 预览级回声抑制依赖它)。
+        let mock = MockCloudAsr::new(
+            vec![
+                vec![
+                    CloudEvent::Definite(utter("我这边", 0, 500)),
+                    CloudEvent::Closed { error: None },
+                ],
+                vec![
+                    CloudEvent::Interim { text: "对方在讲".into() },
+                    CloudEvent::Definite(utter("对方在讲话", 3000, 3600)),
+                    CloudEvent::Closed { error: None },
+                ],
+            ],
+            vec![],
+        );
+        let (mic_tx, mic_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let (sys_tx, sys_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        mic_tx.send(vec![0.1; 16000]).unwrap();
+        sys_tx.send(vec![0.1; 32000]).unwrap();
+        drop(mic_tx);
+        drop(sys_tx);
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String, u64, u64)>::new()));
+        let partials = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (f2, p2) = (finals.clone(), partials.clone());
+        let _ = run_cloud_asr_worker(
+            Arc::new(mock),
+            None,
+            SpeakerRegistry::new(),
+            vec![(Source::Mic, mic_rx), (Source::System, sys_rx)],
+            TEST_ECHO_HOLD,
+            false,
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+            move |s, t, a, b, _, _| f2.lock().unwrap().push((s, t, a, b)),
+            move |s, t| p2.lock().unwrap().push(format!("{}:{}", s.as_str(), t)),
+            |_| {},
+            |st| panic!("不该有状态事件: {st:?}"),
+        );
+        let finals = finals.lock().unwrap().clone();
+        assert!(finals.contains(&(Source::Mic, "我这边".into(), 0, 500)), "{finals:?}");
+        assert!(
+            finals.contains(&(Source::System, "对方在讲话".into(), 3000, 3600)),
+            "{finals:?}"
+        );
+        assert_eq!(*partials.lock().unwrap(), vec!["system:对方在讲".to_string()]);
+    }
+
+    #[test]
     fn ring_trims_to_cap_and_slices_only_from_covered_start() {
         let mut feed = SourceFeed::new();
         feed.account(&vec![0.5; CLOUD_RING_CAP]);
