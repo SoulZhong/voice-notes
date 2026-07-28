@@ -28,8 +28,21 @@
 | 火山 | 豆包大模型流式语音识别 sauc(WebSocket,二进制帧:4 字节头 + JSON/音频负载) | 录音文件识别极速版 flash(HTTP) | AppKey + AccessToken(header 鉴权) |
 | 阿里 | DashScope 实时语音识别(WebSocket task 协议:run-task/continue-task/result 事件;模型 paraformer-realtime-v2 或其 2026 后继) | DashScope 文件转写 flash | API Key(Bearer) |
 
-⚠️ 上表协议细节以**实现期第一步联网核实的官方文档**为准;设计只锁定适配层边界,
-不锁定线上协议字段。两家模型名做成常量集中定义,便于厂商升级模型时单点替换。
+### 2.1 协议核实结果(2026-07-29 已完成,替代原"实现期核实"步骤)
+
+**火山**(文档 docs.volcengine.com/docs/6561/1354869、1631584):
+
+- 流式:`wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`(官方推荐变体,结果变化才返回);v3 二进制帧(4 字节头:版本/头长、消息类型/flags、序列化/压缩;大端 u32 长度;gzip 可选);鉴权 header `X-Api-App-Key`/`X-Api-Access-Key`/`X-Api-Resource-Id: volc.bigasr.sauc.duration`(小时版;2.0 代为 volc.seedasr.sauc.*,请求体 model_name 恒为 "bigmodel")。
+- 首帧 full client request JSON:audio{format:pcm,rate:16000,bits:16,channel:1} + request{model_name,enable_itn,enable_punc,show_utterances:true};音频 200ms/包;末包 flags=0b0010。
+- 响应:result.utterances[]{text,start_time,end_time,definite,words[]{text,start_time,end_time}} → 正好映射 DefiniteUtterance。
+- 补识:`POST /api/v3/auc/bigmodel/recognize/flash`(Resource-Id volc.bigasr.auc_turbo,base64 音频,同构 utterances 响应,≤2h/100MB)。
+
+**阿里**(文档 help.aliyun.com/zh/model-studio/fun-asr-realtime-websocket-api 等):
+
+- 流式:`wss://dashscope.aliyuncs.com/api-ws/v1/inference/`,`Authorization: bearer <key>`;task 协议(文本帧 run-task/finish-task JSON + 二进制帧裸 PCM 100ms/3200B);模型选 **fun-asr-realtime**(2026 主线,中英混说,句级+字级时间戳,支持 heartbeat 保活防 60s 静默断连);事件 result-generated → payload.output.sentence{begin_time,end_time,text,sentence_end,words[]},sentence_end=true 为定稿。
+- ⚠️ **补识偏差(对原设计的修正)**:DashScope 录音文件转写仅收公网 URL,不适用本地文件;补识改走 `qwen3-asr-flash` 多模态 HTTP(base64,单次 ≤5 分钟/10MB,**无时间戳**)。因此补识统一为:**本地 Silero 先把缺口音频切段(≤15s),逐段调 transcribe_batch,时间戳取本地段边界**(火山同走此路径,代码统一;火山返回的段内 utterance 时间戳作为增强保留)。
+
+两家模型名/Resource-Id 集中定义为常量,升级单点替换。
 
 ### CloudAsr trait(适配层边界)
 
@@ -104,8 +117,11 @@ tokio + tokio-tungstenite(tokio 已在依赖树);协议帧的构造/解析写成
 - `Closed{error}` → 状态事件「云端识别中断,重连中」;指数退避重连
   (1s/2s/4s/…上限 30s,不封顶重试直到停录)。
 - 断连区间记为缺口 `[t_lost, t_recovered]`(按源)。恢复后启动补识任务:
-  - 音频来源优先级:已落盘 WAV(keep_audio 链路,精确切片)→ 内存环形缓冲
-    (keep_audio 关闭且缺口 ≤60s 时);两者都覆盖不了的区间如实标注。
+  - 音频来源:**内存环形缓冲(每源 5 分钟)**。录制中读取写入中的 WAV 不可靠
+    (头部长度未定稿),不采用;缺口超出 5 分钟的部分落 `[识别失败]` 占位,
+    原始音频仍在(keep_audio),可事后重识。
+  - 缺口音频先经本地 Silero 切段(≤15s),逐段调 `transcribe_batch`(§2.1),
+    时间戳取本地段边界。
   - 走 `transcribe_batch`(厂商 flash 接口),返回句子照常 append 落盘
     (segments.jsonl 是 append-only,seq 只增;句子携带真实 start_ms,
     展示层按时间排序——双源交错本就如此,补识段不需要特殊插入逻辑)。
