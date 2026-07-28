@@ -14,6 +14,8 @@ pub const ASR_SENSE_VOICE: &str = "sense_voice";
 pub const ASR_WHISPER: &str = "whisper";
 /// Paraformer-large 中文选型。
 pub const ASR_PARAFORMER: &str = "paraformer";
+/// Qwen3-ASR 0.6B int8 选型(52 语种/中英混说,LLM 解码,支持热词)。
+pub const ASR_QWEN3: &str = "qwen3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -30,6 +32,11 @@ pub struct Settings {
     /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
     #[serde(default = "default_asr")]
     pub asr_model: String,
+    /// sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json)。空 = sherpa
+    /// 默认(0.6.8 硬编码 CPU);macOS 可填 "coreml" 实验加速(见 2026-07-28 ASR 调研)。
+    /// 值原样透传 sherpa/onnxruntime,不做白名单;加载失败会走既有报错路径,不静默降级。
+    #[serde(default)]
+    pub asr_provider: String,
     /// 声纹嵌入模型选型:"campplus"(默认)/"eres2netv2"。不同模型嵌入空间不可混用,
     /// 切换会触发声纹库从录音样本后台重建(见 lib.rs set_settings)。
     #[serde(default = "default_speaker_model")]
@@ -91,6 +98,10 @@ pub struct Settings {
     /// 不会对老用户弹引导。
     #[serde(default)]
     pub onboarded: bool,
+    /// 已完成的功能引导 ID。每项功能/重大版本独立记账，不能让一个全局 bool
+    /// 永久吞掉后续新增功能的引导。
+    #[serde(default)]
+    pub completed_guides: Vec<String>,
     /// 允许 MCP(AI 助手)控制录制(start/stop/pause/resume)。默认关:开录是隐私
     /// 敏感操作,必须用户显式授权。
     #[serde(default)]
@@ -146,6 +157,7 @@ impl Default for Settings {
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
+            asr_provider: String::new(),
             speaker_model: default_speaker_model(),
             theme: default_theme(),
             record_system_only: false,
@@ -164,6 +176,7 @@ impl Default for Settings {
             refine_model: String::new(),
             refine_api_key: String::new(),
             onboarded: false,
+            completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
             telemetry_enabled: true,
@@ -378,6 +391,22 @@ mod tests {
     }
 
     #[test]
+    fn feature_guides_default_empty_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"onboarded":true}"#).unwrap();
+        let legacy = load(tmp.path());
+        assert!(legacy.onboarded);
+        assert!(legacy.completed_guides.is_empty(), "旧用户不能被视为已看过未来功能引导");
+
+        let s = Settings {
+            completed_guides: vec!["ai-tools-v1".into(), "future-feature-v1".into()],
+            ..Default::default()
+        };
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).completed_guides, s.completed_guides);
+    }
+
+    #[test]
     fn migrate_bumps_legacy_prefix_to_new_default() {
         let tmp = tempfile::tempdir().unwrap();
         // 存量:旧默认 ghproxy.net
@@ -412,6 +441,17 @@ mod tests {
         assert_eq!(got.mirror_prefix, DEFAULT_MIRROR_PREFIX);
         let again = migrate_mirror_prefix(tmp.path()).unwrap();
         assert_eq!(again.mirror_prefix, DEFAULT_MIRROR_PREFIX);
+    }
+
+    #[test]
+    fn asr_provider_defaults_empty_and_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 老配置缺字段 → 空串 = 不覆盖,沿用 sherpa 默认(CPU),行为与历史版本一致。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"asr_model":"whisper"}"#).unwrap();
+        assert_eq!(load(tmp.path()).asr_provider, "");
+        let s = Settings { asr_provider: "coreml".into(), ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).asr_provider, "coreml");
     }
 
     #[test]

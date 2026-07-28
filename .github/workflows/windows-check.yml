@@ -24,22 +24,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      # `cargo check` does not package or run these DLLs, but Tauri validates every
-      # configured Windows resource path before the sherpa build script finishes.
-      - name: Stage Tauri runtime resource placeholders
-        shell: pwsh
-        run: |
-          $runtimeDir = "src-tauri/target/bundle-libs/windows"
-          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
-          @(
-            "cargs.dll",
-            "onnxruntime.dll",
-            "onnxruntime_providers_shared.dll",
-            "sherpa-onnx-c-api.dll",
-            "sherpa-onnx-cxx-api.dll"
-          ) | ForEach-Object {
-            New-Item -ItemType File -Force -Path (Join-Path $runtimeDir $_) | Out-Null
-          }
+      # DLL 占位步骤已删除:sherpa-onnx 官方 crate 默认静态链接(含 onnxruntime),
+      # tauri.windows.conf.json 不再声明任何运行时 DLL 资源。
+      # 注意:cargo check 不做最终链接,静态库 MT 运行时与 MSVC 默认 MD 的潜在
+      # 冲突要到真正 cargo build 才暴露——首个 Windows 打包版本需人工验证。
       - name: cargo check (lib, Windows msvc)
         working-directory: src-tauri
         run: cargo check --lib

@@ -43,8 +43,6 @@
       "signingIdentity": "voice-notes Dev",
       "entitlements": "./Entitlements.plist",
       "frameworks": [
-        "target/release/libonnxruntime.1.17.1.dylib",
-        "target/release/libsherpa-onnx-c-api.dylib",
         "target/bundle-libs/libabsl_base.2407.0.0.dylib",
         "target/bundle-libs/libabsl_raw_logging_internal.2407.0.0.dylib",
         "target/bundle-libs/libabsl_log_severity.2407.0.0.dylib",

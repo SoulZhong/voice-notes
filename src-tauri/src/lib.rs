@@ -564,16 +564,33 @@ fn paraformer_dir() -> PathBuf {
     models::root().join(models::PF_DIR)
 }
 
+fn qwen3_dir() -> PathBuf {
+    models::root().join(models::QWEN3_DIR)
+}
+
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
 /// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
-fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+/// provider 经 settings.asr_provider 覆盖(实验字段,默认 None = CPU)。
+fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<Box<dyn asr::Recognizer>> {
     if asr_model == settings::ASR_WHISPER {
-        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir(), provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_PARAFORMER {
-        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir(), provider)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_QWEN3 {
+        // 热词暂传 None:等术语库(改进计划 Phase 5)落地后从设置注入。
+        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&qwen3_dir(), provider, None)?) as Box<dyn asr::Recognizer>)
     } else {
-        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir(), provider)?) as Box<dyn asr::Recognizer>)
     }
+}
+
+/// 当前 provider 覆盖:settings.asr_provider 经 asr::provider_override 规整。
+/// 读设置失败 → None(CPU),与 current_asr 的兜底纪律一致。
+fn current_asr_provider(app: &AppHandle) -> Option<String> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .and_then(|d| asr::provider_override(&settings::load(&d).asr_provider))
 }
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
@@ -709,7 +726,7 @@ fn spawn_session(
         let taken = recognizer_cache.lock().unwrap().take();
         let recognizer = match taken {
             Some(r) => r,
-            None => match new_recognizer(&current_asr(&app)) {
+            None => match new_recognizer(&current_asr(&app), current_asr_provider(&app)) {
                 Ok(r) => r,
                 Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
             },
@@ -3122,7 +3139,7 @@ fn preload_models(
         let asr_model = current_asr(&app);
         let mut slot = cache.lock().unwrap();
         if slot.is_none() {
-            match new_recognizer(&asr_model) {
+            match new_recognizer(&asr_model, current_asr_provider(&app)) {
                 Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
@@ -3142,6 +3159,20 @@ fn preload_models(
 #[tauri::command]
 fn models_status(app: AppHandle) -> models::ModelsStatus {
     models::status(&current_asr(&app))
+}
+
+/// 在系统文件管理器中打开模型存储目录(设置页「语音模型」区路径点击)。
+/// 走 Rust 侧 opener:能直接打开目录本身,且不依赖前端 opener 权限的路径白名单。
+#[tauri::command]
+fn open_models_dir(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = models::root();
+    if !dir.is_dir() {
+        return Err(format!("模型目录不存在: {}", dir.display()));
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| format!("打开目录失败: {e}"))
 }
 
 /// 下载单个工件:按 download_urls 的候选顺序尝试。代理候选各试 1 次(死代理快速跳过,
@@ -4182,6 +4213,7 @@ pub fn run() {
             set_input_volume,
             output_is_bluetooth,
             models_status,
+            open_models_dir,
             download_models,
             cancel_models_download,
             delete_model,
