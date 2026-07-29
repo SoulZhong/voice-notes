@@ -516,6 +516,11 @@
   async function doExport(format: "md") {
     exportMsg = "";
     if (!note) return;
+    // await 前快照:保存对话框可以开很久,期间精修完成会把 effectiveView 从
+    // 原始稿翻成修订稿(refine 事件监听常驻)、路由/标题也可能变——导出的必须
+    // 是点击导出那一刻用户看到的那份。
+    const noteId = id;
+    const preferRefined = effectiveView === "refined";
     try {
       // 保存对话框让用户挑落盘位置(冒烟反馈:旧流程写进数据目录再开 Finder,
       // 用户以为"只是打开了文件夹")。默认名 = 标题+录音时间;取消返回 null,
@@ -525,8 +530,10 @@
         filters: [{ name: "Markdown", extensions: ["md"] }],
       });
       if (!dest) return;
-      const path = await exportNote(id, format, effectiveView === "refined", dest);
+      const path = await exportNote(noteId, format, preferRefined, dest);
       exportMsg = `已导出：${path}`;
+      // 清掉早前失败留下的红色横幅,避免"上面报失败下面报成功"并存。
+      if (error.startsWith("导出失败")) error = "";
     } catch (e) {
       error = `导出失败: ${e}`;
     }

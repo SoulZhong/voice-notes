@@ -144,4 +144,24 @@ describe("exportFileName", () => {
   it("时间解析失败时省略时间段", () => {
     expect(exportFileName("t", "not-a-date")).toBe("t.md");
   });
+  it("全非法字符标题(清洗后只剩连字符)兜底「未命名」", () => {
+    expect(exportFileName("///", "2026-07-16T15:30:09+08:00")).toBe("未命名-20260716-1530.md");
+  });
+  it("剥控制字符与双向覆盖符,防换行入名与视觉欺骗", () => {
+    expect(exportFileName("a\nb\u202ec", "not-a-date")).toBe("abc.md");
+  });
+  it("剥首部点(隐藏文件)与尾部点/空白(Windows 不允许)", () => {
+    expect(exportFileName("..bashrc", "not-a-date")).toBe("bashrc.md");
+    expect(exportFileName("笔记. ", "not-a-date")).toBe("笔记.md");
+  });
+  it("超长 CJK 标题截到 160 字节 UTF-8 边界(文件名 255 字节上限留量)", () => {
+    const name = exportFileName("会".repeat(100), "2026-07-16T15:30:09+08:00");
+    expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+    // 160 字节 = 53 个 3 字节 CJK(159 字节),不落在半个字符中间。
+    expect(name).toBe(`${"会".repeat(53)}-20260716-1530.md`);
+  });
+  it("Windows 保留设备名加尾缀避让(仅裸名命中时)", () => {
+    expect(exportFileName("CON", "not-a-date")).toBe("CON_.md");
+    expect(exportFileName("CON", "2026-07-16T15:30:09+08:00")).toBe("CON-20260716-1530.md");
+  });
 });

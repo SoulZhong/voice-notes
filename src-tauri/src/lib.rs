@@ -2810,7 +2810,9 @@ fn set_segment_speaker(
 /// 导出笔记到用户选定路径(前端保存对话框拿到 dest)。prefer_refined=真且修订稿
 /// 在盘时导修订稿(所见即所得:用户看着哪个视图点导出就得到哪个),否则导原始
 /// 逐字稿;修订稿导出前与 get_refined 同款只读 join,库中现名(会议搭子改名)
-/// 一并带出。dest 由系统保存对话框产生,不做路径白名单(用户显式选择即授权)。
+/// 一并带出。dest 由系统保存对话框产生,不做路径白名单(用户显式选择即授权,
+/// 桌面 webview 为本地可信代码);export_to 内有兜底守卫:须绝对路径、不得落在
+/// 笔记数据目录内,写入为原子替换。
 #[tauri::command]
 fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool, dest: String) -> Result<String, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
