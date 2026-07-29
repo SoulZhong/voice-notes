@@ -576,7 +576,7 @@ fn run_asr(path: &str) {
         }
         let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17");
-        match SenseVoiceRecognizer::new(&model_dir) {
+        match SenseVoiceRecognizer::new(&model_dir, None) {
             Ok(mut rec) => match rec.recognize(&samples) {
                 Ok(t) => println!("ASR[{path}]: {}", t.text),
                 Err(e) => eprintln!("识别失败: {e}"),

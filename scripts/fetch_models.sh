@@ -28,6 +28,16 @@ if [ ! -d "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17" ]; then
   echo "SenseVoice 模型已就绪：$DIR/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 fi
 
+# Qwen3-ASR 0.6B int8(中英混说/热词;879MB,较大,失败不阻塞其余模型)
+if [ ! -d "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25" ]; then
+  QW_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2"
+  echo "下载 Qwen3-ASR $QW_URL ..."
+  curl -L -o qwen3.tar.bz2 "$QW_URL"
+  tar xjf qwen3.tar.bz2
+  rm -f qwen3.tar.bz2
+  echo "Qwen3-ASR 模型已就绪:$DIR/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
+fi
+
 # 3D-Speaker CAM++ 中文声纹模型(说话人区分用)
 SPK_MODEL="3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 if [ ! -f "$SPK_MODEL" ]; then

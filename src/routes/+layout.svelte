@@ -2,6 +2,7 @@
   import "../app.css";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
+  import { page } from "$app/stores";
   import Sidebar from "$lib/Sidebar.svelte";
   import WelcomeOverlay from "$lib/WelcomeOverlay.svelte";
   import { recording } from "$lib/recording.svelte";
@@ -9,6 +10,8 @@
   import { applyTheme } from "$lib/theme";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { checkUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
+  import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
+  import ContextGuide from "$lib/ContextGuide.svelte";
 
   let { children } = $props();
 
@@ -23,24 +26,30 @@
     update = null;
   }
 
-  // 首启引导:未 onboarded 且模型未就绪才弹欢迎层;模型已就绪(老用户升级出新字段)
-  // 静默补 onboarded,不打扰。任何 IPC 失败都按"不弹"处理——引导是增强,不能挡主界面。
+  // 基础初始化由 onboarded 记账；每个新功能由 completed_guides 中的独立 ID 记账。
+  // 因此旧用户可以看到新功能引导，同时不会重复经历模型下载。
   let welcomeStatus = $state<ModelsStatus | null>(null);
   async function checkOnboarding() {
     try {
-      const s = await getSettings();
-      if (s.onboarded) return;
+      let s = await getSettings();
       const m = await modelsStatus();
-      if (m.recording_ready) {
-        await setSettings({ ...s, onboarded: true });
-      } else {
+      if (!s.onboarded && m.recording_ready) {
+        s = { ...s, onboarded: true };
+        await setSettings(s);
+      }
+      const needsBaseSetup = !s.onboarded;
+      const needsAiGuide = !s.completed_guides.includes(AI_TOOLS_GUIDE_ID);
+      if (needsBaseSetup) {
         welcomeStatus = m;
+      } else if (needsAiGuide && $page.url.searchParams.get("guide") !== AI_TOOLS_GUIDE_ID) {
+        // 功能教学必须发生在真实操作页；只把用户导航到对应功能并启动上下文引导。
+        goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`);
       }
     } catch {
       /* 静默:见上 */
     }
   }
-  function onWelcomeDone(target: "/record" | "/settings") {
+  function onWelcomeDone(target: "/record" | "/settings" | "/ai" | "/ai?guide=ai-tools-v1") {
     welcomeStatus = null;
     goto(target);
   }
@@ -77,6 +86,7 @@
 {#if welcomeStatus}
   <WelcomeOverlay status={welcomeStatus} onDone={onWelcomeDone} />
 {/if}
+<ContextGuide />
 
 <style>
   :global(body) {

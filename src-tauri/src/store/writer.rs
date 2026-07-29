@@ -882,7 +882,7 @@ mod tests {
         let (w2, e2) = (writer.clone(), emitted.clone());
         let start = crate::session::start_session(
             sources,
-            Box::new(CountingRecognizer),
+            crate::session::AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             crate::diar::registry::SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
@@ -1605,7 +1605,7 @@ mod tests {
         let w2 = writer.clone();
         let start = crate::session::start_session(
             fixture_sources(),
-            Box::new(CountingRecognizer),
+            crate::session::AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             SpeakerRegistry::new(),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要
@@ -1643,7 +1643,7 @@ mod tests {
         let w3 = writer2.clone();
         let start2 = crate::session::start_session(
             fixture_sources(),
-            Box::new(CountingRecognizer),
+            crate::session::AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             SpeakerRegistry::from_snapshot(&writer2.lock().unwrap().registry_snapshot()),
             std::time::Duration::from_millis(50), // 短 hold,单 Mic 源无回声可比对,值本身无关紧要

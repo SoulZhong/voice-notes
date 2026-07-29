@@ -2,7 +2,7 @@
 
 # voice-notes
 
-**Local, real-time meeting transcription for macOS · speaker identification · fully offline**
+**Local, real-time meeting transcription for macOS · speaker identification · offline by default, optional cloud recognition**
 
 [中文](./README.md) | English
 
@@ -13,13 +13,13 @@
 
 </div>
 
-Open it when a meeting starts. Every sentence — yours, theirs, whatever comes out of the speakers — becomes a speaker-labeled text note in real time. All recognition runs on your computer; **no audio or text ever leaves your machine**.
+Open it when a meeting starts. Every sentence — yours, theirs, whatever comes out of the speakers — becomes a speaker-labeled text note in real time. In the default local mode, all recognition runs on your computer and **no audio or text ever leaves your machine**; if you manually turn on optional cloud recognition, recorded audio is streamed to the vendor you chose in real time.
 
 ## Features
 
 - **Dual-source live transcription**: captures the microphone and system audio (ScreenCaptureKit) simultaneously, so both what you say and what you hear in online meetings end up in the note. Cross-channel echo dedup keeps speaker bleed-through from being transcribed twice.
 - **No echo when meeting on speakers**: with "keep speaker volume" on, the other party's sound bleeding into your mic is handled by a multi-stage software echo canceller — real-time WebRTC AEC3 plus automatic Bluetooth-latency pre-alignment (a sliding window measures the actual speaker delay, so it keeps up even when the delay drifts), followed by an offline clean-up pass after you stop. An optional neural residual model (DTLN-aec, ~15 MB) can be downloaded to push the leftover echo below the audible floor (measured on a real meeting: residual cross-correlation 0.13→0, your own voice untouched). On playback, a cross-track gate keyed to who's speaking removes the doubling from mixing both tracks. All on-device; speaker volume is never lowered.
-- **Fully local & offline**: ASR / VAD / speaker models all run on-device via sherpa-onnx. Works without a network connection; nothing is uploaded, ever.
+- **Fully offline in local mode**: ASR / VAD / speaker models all run on-device via sherpa-onnx. Works without a network connection; nothing is uploaded, ever. You can also switch to optional cloud recognition (Volcano Engine / Alibaba Cloud, off by default) — once enabled, recorded audio is streamed to the chosen vendor in real time.
 - **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 30+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Mis-split entries can be merged, samples and all.
 - **Buddy tidy-up & attribution suggestions**: unnamed speakers are automatically re-identified against the library (S-Norm score normalization survives cross-meeting channel drift); audition both sides inline before merging. Duplicate names guide you to link/merge; sample-less fragment entries can be cleaned in one pass. Each person keeps multiple "session centroids" (headset / speakerphone / other conditions each get a representative voiceprint) — accuracy compounds with use.
 - **Editable speakers on the refined transcript**: click a speaker chip to rename (two-way sync with the library), mark "this is me", or link to a library person; export is WYSIWYG (refined view exports refined content).
@@ -128,7 +128,7 @@ Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CL
 | **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
 | **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
-> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **voice-notes itself still never uploads anything.** Recording-control tools are disabled by default; enable "Allow AI to control recording" on the "AI" tab in the sidebar.
+> **Privacy note**: once an agent retrieves note content, it enters that agent's LLM context — whether that leaves your machine depends on the agent and model you use. **In the default local recognition mode, voice-notes itself never uploads anything** (if you manually turn on optional cloud recognition, recorded audio is streamed to the chosen vendor in real time). Recording-control tools are disabled by default; enable "Allow AI to control recording" on the "AI" tab in the sidebar.
 
 **Fastest start**: open the "AI" tab in the sidebar to register MCP and install the skill in one click. (An AI assistant can just follow the [Installation](#installation) steps and do it itself.)
 

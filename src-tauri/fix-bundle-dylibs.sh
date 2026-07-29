@@ -6,7 +6,8 @@
 # 上 dyld 直接启动崩溃。这里把绝对路径改写成 @rpath/，配合 build.rs 注入的
 # @executable_path/../Frameworks rpath 与 bundle.macOS.frameworks 打进包里的
 # dylib 副本，让 .app 自带全部非系统依赖。
-# sherpa/onnxruntime 本身就是 @rpath 引用，无需改写，只需打包（frameworks 列表）。
+# sherpa/onnxruntime 已随官方 sherpa-onnx crate 迁移改为静态链接（2026-07-28），
+# 本脚本只剩 abseil 一项职责。
 #
 # install_name_tool 会使 arm64 的 linker 签名失效，改完必须 ad-hoc 重签，
 # 否则 macOS 拒绝加载（Killed: 9）。

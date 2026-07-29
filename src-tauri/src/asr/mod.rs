@@ -1,6 +1,9 @@
+pub mod engine;
 pub mod whisper;
 pub mod sense_voice;
 pub mod paraformer;
+pub mod qwen3;
+pub mod cloud;
 
 /// 一次识别的结果文本。
 #[derive(Debug, Clone, Default)]
@@ -21,6 +24,14 @@ pub trait Recognizer: Send {
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript>;
 }
 
+/// settings.asr_provider → sherpa provider 覆盖。空/空白 = 不覆盖(沿用 sherpa 默认)。
+/// sherpa-rs 0.6.8 的 get_default_provider() 硬编码 "cpu",想试 CoreML/CUDA 只能经
+/// config.provider 显式传入,这里是唯一入口。
+pub fn provider_override(setting: &str) -> Option<String> {
+    let trimmed = setting.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,5 +40,12 @@ mod tests {
     fn transcript_default_has_empty_token_fields() {
         let t = Transcript { text: "x".into(), ..Default::default() };
         assert!(t.tokens.is_empty() && t.timestamps.is_empty());
+    }
+
+    #[test]
+    fn provider_override_blank_is_none_and_value_is_trimmed() {
+        assert_eq!(provider_override(""), None);
+        assert_eq!(provider_override("  "), None);
+        assert_eq!(provider_override(" coreml "), Some("coreml".to_string()));
     }
 }

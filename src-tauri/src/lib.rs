@@ -564,22 +564,63 @@ fn paraformer_dir() -> PathBuf {
     models::root().join(models::PF_DIR)
 }
 
+fn qwen3_dir() -> PathBuf {
+    models::root().join(models::QWEN3_DIR)
+}
+
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
 /// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
-fn new_recognizer(asr_model: &str) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+/// provider 经 settings.asr_provider 覆盖(实验字段,默认 None = CPU)。
+fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<Box<dyn asr::Recognizer>> {
     if asr_model == settings::ASR_WHISPER {
-        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir(), provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_PARAFORMER {
-        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir(), provider)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_QWEN3 {
+        // 热词暂传 None:等术语库(改进计划 Phase 5)落地后从设置注入。
+        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&qwen3_dir(), provider, None)?) as Box<dyn asr::Recognizer>)
     } else {
-        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir())?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir(), provider)?) as Box<dyn asr::Recognizer>)
     }
+}
+
+/// 云端识别器唯一实例化点(对称 new_recognizer):按 provider 造火山/阿里适配器。
+/// 凭证不齐直接 bail——开录/测试连接都走这里,错误文案单一真源,避免"连上了才发现
+/// 没填 key"这种要等一次握手往返才暴露的失败。
+fn make_cloud_asr(s: &settings::Settings) -> anyhow::Result<std::sync::Arc<dyn asr::cloud::CloudAsr>> {
+    if !settings::cloud_creds_ok(s) {
+        anyhow::bail!("请先在设置中配置云端凭证");
+    }
+    if s.cloud_asr_provider == settings::CLOUD_ALIYUN {
+        Ok(std::sync::Arc::new(asr::cloud::aliyun::AliyunAsr::new(s.dashscope_api_key.trim().to_string()))
+            as std::sync::Arc<dyn asr::cloud::CloudAsr>)
+    } else {
+        Ok(std::sync::Arc::new(asr::cloud::volcano::VolcanoAsr::new(
+            s.volc_app_key.trim().to_string(),
+            s.volc_access_key.trim().to_string(),
+        )) as std::sync::Arc<dyn asr::cloud::CloudAsr>)
+    }
+}
+
+/// 云端厂商展示名(测试连接文案 / 日志)。
+fn cloud_provider_label(provider: &str) -> &'static str {
+    if provider == settings::CLOUD_ALIYUN { "阿里云" } else { "火山引擎" }
+}
+
+/// 当前 provider 覆盖:settings.asr_provider 经 asr::provider_override 规整。
+/// 读设置失败 → None(CPU),与 current_asr 的兜底纪律一致。
+fn current_asr_provider(app: &AppHandle) -> Option<String> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .and_then(|d| asr::provider_override(&settings::load(&d).asr_provider))
 }
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
 /// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
-/// pub(crate)：托盘 build_menu 也要按当前选型算 recording_ready 决定 toggle 项禁用。
-pub(crate) fn current_asr(app: &AppHandle) -> String {
+/// 仅本模块内取用（识别器装配 / preload）；托盘就绪判定已改经 current_models_status
+/// （模式感知，云端模式不看本地选型），不再直接依赖这个函数。
+fn current_asr(app: &AppHandle) -> String {
     match app.path().app_data_dir() {
         Ok(d) => settings::load(&d).asr_model,
         Err(_) => settings::ASR_SENSE_VOICE.into(),
@@ -705,35 +746,50 @@ fn spawn_session(
             app.state::<lifecycle::LifecycleHandle>().report(lifecycle::machine::Msg::SessionFailed);
         };
 
-        // 1) 取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
-        let taken = recognizer_cache.lock().unwrap().take();
-        let recognizer = match taken {
-            Some(r) => r,
-            None => match new_recognizer(&current_asr(&app)) {
-                Ok(r) => r,
+        // 0) 一次性读设置：record_system_only / keep_audio / language_filter /
+        // keep_output_volume / 识别方式与云端凭证 同源同快照（避免多次 load 读到并发
+        // 写入的不同代）。app_data_dir 不可用时整体回落 Settings::default（仅系统声=否、
+        // 保留音频=是、语言过滤=开、保持外放音量=否、识别方式=本地），绝不因读设置失败
+        // 改变现状行为。位置提到取模型之前：识别方式决定要不要取常驻识别器。
+        // language_filter 在下方 start_session 处消费。
+        let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+        let (record_system_only, keep_audio, language_filter, keep_output_volume) =
+            (cfg.record_system_only, cfg.keep_audio, cfg.language_filter, cfg.keep_output_volume);
+        let cloud_mode = cfg.asr_mode == settings::ASR_MODE_CLOUD;
+
+        // 1) 识别引擎。
+        //  - 云端：按凭证造厂商适配器，完全不碰 recognizer_cache——常驻识别器留着,
+        //    回切本地时零延迟可用；凭证缺失在这里就拦(不必等一次握手往返)。
+        //  - 本地：取常驻识别器（预载中会在锁上等待）；槽空则现场加载兜底。
+        let cloud_asr = if cloud_mode {
+            match make_cloud_asr(&cfg) {
+                Ok(c) => Some(c),
                 Err(e) => return fail(&app, &running, &generation, my_gen, format!("error: {e}")),
-            },
+            }
+        } else {
+            None
+        };
+        let recognizer: Option<Box<dyn asr::Recognizer>> = if cloud_mode {
+            None
+        } else {
+            let taken = recognizer_cache.lock().unwrap().take();
+            Some(match taken {
+                Some(r) => r,
+                None => match new_recognizer(&current_asr(&app), current_asr_provider(&app)) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return fail(&app, &running, &generation, my_gen, format!("error: {e}"))
+                    }
+                },
+            })
         };
         // 1.5) 取常驻声纹嵌入器；与 recognizer 完全对称的取用节奏（其后），但槽空
         // 时不现场加载——预载失败即降级为无声纹（说话人区分不可用），而不是在
-        // 开录路径上额外背一次模型加载的延迟/失败风险。
+        // 开录路径上额外背一次模型加载的延迟/失败风险。云端模式同样取用/返还:
+        // 声纹是本机能力,与识别在哪跑无关。
         let embedder = embedder_cache.lock().unwrap().take();
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
-
-        // 一次性读设置：record_system_only / keep_audio / language_filter /
-        // keep_output_volume 同源同快照（避免多次 load 读到并发写入的不同代）。
-        // app_data_dir 不可用时全部保守回落 Settings::default（仅系统声=否、保留音频=是、
-        // 语言过滤=开、保持外放音量=否），绝不因读设置失败改变现状行为。
-        // language_filter 在下方 start_session 处消费。
-        let (record_system_only, keep_audio, language_filter, keep_output_volume) = app
-            .path()
-            .app_data_dir()
-            .map(|d| {
-                let s = settings::load(&d);
-                (s.record_system_only, s.keep_audio, s.language_filter, s.keep_output_volume)
-            })
-            .unwrap_or((false, true, true, false));
 
         // 2) 构建源（各自 VAD）。默认建麦克风（必备）+ 系统声音（可降级）；
         // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
@@ -745,7 +801,7 @@ fn spawn_session(
             let mic_seg = match new_silero(&vad_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    stash_model(&recognizer_cache, Some(recognizer));
+                    stash_model(&recognizer_cache, recognizer);
                     stash_model(&embedder_cache, embedder);
                     return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
                 }
@@ -1014,7 +1070,7 @@ fn spawn_session(
         }) {
             Ok(w) => w,
             Err(e) => {
-                stash_model(&recognizer_cache, Some(recognizer));
+                stash_model(&recognizer_cache, recognizer);
                 stash_model(&embedder_cache, embedder);
                 let msg = match &target {
                     NoteTarget::New => format!("error: 创建笔记失败: {e}"),
@@ -1146,12 +1202,75 @@ fn spawn_session(
             }
         }
 
+        // 识别引擎装配。云端两件调用方专属的注入(见 session::AsrEngine):
+        //  - backfill_segmenter:断网缺口补识的本机 VAD 切段(厂商批式接口有单请求
+        //    时长上限)。每次现造一只 SileroSegmenter——sherpa 的段起点是「本实例流内
+        //    绝对样本号」,复用同一只会把上一个缺口的长度算进下一个缺口的偏移。补识是
+        //    低频路径(一次断连一次),多一次模型构造换偏移正确,值。构造失败退化为整段
+        //    一刀:厂商若因超长报错,worker 会落 [识别失败] 占位段留痕——绝不返回空段
+        //    列表,那等于把这段发声静默丢掉。
+        //  - on_status:重连/补识状态 → 前端状态条(session 层保持无 UI 依赖)。
+        let engine = match cloud_asr {
+            Some(asr) => {
+                let vad_bf = vad_path.clone();
+                let app_st = app.clone();
+                session::AsrEngine::Cloud {
+                    asr,
+                    backfill_segmenter: Box::new(move |samples: &[f32]| {
+                        match pipeline::silero::SileroSegmenter::new(&vad_bf) {
+                            Ok(mut seg) => {
+                                seg.accept(samples);
+                                seg.flush();
+                                seg.take_finished()
+                                    .into_iter()
+                                    .map(|s| (s.start as u64, s.samples))
+                                    .collect()
+                            }
+                            Err(e) => {
+                                eprintln!("补识切段器构造失败({e});整缺口按单段送批式");
+                                vec![(0u64, samples.to_vec())]
+                            }
+                        }
+                    }),
+                    on_status: Box::new(move |st| {
+                        let (state, source, message) = match st {
+                            session::CloudAsrStatus::Reconnecting { source, message } => {
+                                ("reconnecting", source, message)
+                            }
+                            session::CloudAsrStatus::Recovered { source } => {
+                                ("recovered", source, None)
+                            }
+                            session::CloudAsrStatus::Backfilling { source } => {
+                                ("backfilling", source, None)
+                            }
+                            session::CloudAsrStatus::BackfillFailed { source } => {
+                                ("backfill_failed", source, None)
+                            }
+                        };
+                        // 厂商/本机错误原文可能很长(带 requestId 的整串 JSON);状态条只
+                        // 展示一行,这里按字符(而非字节)钳制,不能把多字节字符切成半个。
+                        let message = message.map(|m| m.chars().take(200).collect::<String>());
+                        let _ = app_st.emit(
+                            "cloud-asr-status",
+                            ipc::CloudAsrStatusEvent {
+                                state: state.into(),
+                                source: source.as_str().into(),
+                                message,
+                            },
+                        );
+                    }),
+                }
+            }
+            None => session::AsrEngine::Local(
+                recognizer.expect("本地模式在上方恒已取到识别器(取不到即已 fail 返回)"),
+            ),
+        };
         // language_filter:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里关闭以
         // 保留外语真实发言。值在上方与 record_system_only/keep_audio 同一次 settings
         // load 读出(读取失败已保守回落默认过滤开,与 Settings::default 一致)。
         let start = session::start_session(
             sources,
-            recognizer,
+            engine,
             embedder,
             registry,
             std::time::Duration::from_millis(session::ECHO_HOLD_MS),
@@ -1366,7 +1485,7 @@ fn spawn_session(
                     .report(lifecycle::machine::Msg::SessionStarted { note_id: note_id_for_report });
             }
             Err(se) => {
-                stash_model(&recognizer_cache, Some(se.recognizer));
+                stash_model(&recognizer_cache, se.recognizer);
                 stash_model(&embedder_cache, se.embedder);
                 // 会话未能启动:经信箱 abort(此路径无 worker,不存在在途管线消息)。
                 // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
@@ -1389,8 +1508,9 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     if state.download_running.load(Ordering::SeqCst) {
         return Err("正在迁移或下载,稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(app)) {
-        return Err("模型缺失：请先在设置页下载所选识别模型".into());
+    // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
+    if !current_models_status(app).recording_ready {
+        return Err(recording_not_ready_msg(app));
     }
     let result = spawn_session(
         app.clone(),
@@ -1439,8 +1559,9 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     if refining {
         return Err("该笔记正在 Aing,请稍后再试".into());
     }
-    if !models::recording_ready(&current_asr(app)) {
-        return Err("模型缺失：请先在设置页下载所选识别模型".into());
+    // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
+    if !current_models_status(app).recording_ready {
+        return Err(recording_not_ready_msg(app));
     }
     let result = spawn_session(
         app.clone(),
@@ -3120,9 +3241,16 @@ fn preload_models(
         }
         // 按当前选型预载（session 锁已放，此处才读设置：叶子锁纪律不变）。
         let asr_model = current_asr(&app);
+        // 云端模式不预载本机识别器:识别在厂商侧,加载一份几 GB 的模型纯属白占内存
+        // (开录也不会取用它)。声纹嵌入器照常预载——声纹是本机能力,与识别在哪跑无关。
+        let cloud_mode = app
+            .path()
+            .app_data_dir()
+            .map(|d| settings::load(&d).asr_mode == settings::ASR_MODE_CLOUD)
+            .unwrap_or(false);
         let mut slot = cache.lock().unwrap();
-        if slot.is_none() {
-            match new_recognizer(&asr_model) {
+        if slot.is_none() && !cloud_mode {
+            match new_recognizer(&asr_model, current_asr_provider(&app)) {
                 Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
@@ -3139,9 +3267,48 @@ fn preload_models(
     });
 }
 
+/// 当前设置下的模型就绪快照(模式感知)。设置页、托盘菜单、开录/续录守卫共用同一份
+/// 判定——云端模式下"就绪"= vad 在 + 凭证齐(本地大模型全不必需),本地模式与旧行为
+/// 逐位等价。三处若各写一份必然分叉:例如托盘按本地缺件把「开始录制」灰掉,而云端
+/// 用户根本不需要那些件。app_data_dir 不可用 → Settings::default(本地模式),与
+/// current_asr 的兜底纪律一致。
+pub(crate) fn current_models_status(app: &AppHandle) -> models::ModelsStatus {
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    models::status_for(
+        &s.asr_model,
+        s.asr_mode == settings::ASR_MODE_CLOUD,
+        settings::cloud_creds_ok(&s),
+    )
+}
+
+/// 开录被就绪判定挡下时的文案。云端模式下"缺件"多半是凭证没填(vad 随包下过),
+/// 沿用本地文案会让人跑去下载页找一个根本不需要的模型。
+pub(crate) fn recording_not_ready_msg(app: &AppHandle) -> String {
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    if s.asr_mode == settings::ASR_MODE_CLOUD && !settings::cloud_creds_ok(&s) {
+        "请先在设置中配置云端凭证".into()
+    } else {
+        "模型缺失：请先在设置页下载所选识别模型".into()
+    }
+}
+
 #[tauri::command]
 fn models_status(app: AppHandle) -> models::ModelsStatus {
-    models::status(&current_asr(&app))
+    current_models_status(&app)
+}
+
+/// 在系统文件管理器中打开模型存储目录(设置页「语音模型」区路径点击)。
+/// 走 Rust 侧 opener:能直接打开目录本身,且不依赖前端 opener 权限的路径白名单。
+#[tauri::command]
+fn open_models_dir(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = models::root();
+    if !dir.is_dir() {
+        return Err(format!("模型目录不存在: {}", dir.display()));
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| format!("打开目录失败: {e}"))
 }
 
 /// 下载单个工件:按 download_urls 的候选顺序尝试。代理候选各试 1 次(死代理快速跳过,
@@ -3343,6 +3510,69 @@ fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(
     Ok(())
 }
 
+/// 测试连接等 Closed 的上限。握手本身是同步的(open_stream 返回即已鉴权),这里等的
+/// 只是「推完静音 → finish → 厂商回关闭」的一个往返;5s 足够,超时即判网络异常。
+const CLOUD_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 设置页/欢迎页「测试连接」:直接使用表单当前值造适配器 → 开流(同步握手,鉴权/
+/// 网络问题在此暴露) → 推 200ms 静音 → finish → 等 Closed。表单值作为命令参数
+/// 传入,不依赖输入框 blur 先异步写 settings.json,也不会为了测试而持久化无效凭证。
+/// error=None 即通,Some 原样透出厂商说法(「鉴权失败」这类文案由适配层给,这里不猜)。
+///
+/// 阻塞至多「握手 ≤7s(阿里云 CONNECT_TIMEOUT 6s + 1s 缓冲) + 等 Closed ≤ CLOUD_TEST_TIMEOUT
+/// 5s」,worst case 逼近 12s:走 spawn_blocking 别占 IPC 线程,同 test_refine_llm 惯例——
+/// 用户主动触发的一次点击,阻塞线程池里的一条工作线程可接受,前端一次 invoke 就拿到结论。
+#[tauri::command]
+async fn test_cloud_asr(
+    state: State<'_, AppState>,
+    provider: String,
+    volc_app_key: String,
+    volc_access_key: String,
+    dashscope_api_key: String,
+) -> Result<String, String> {
+    // 录制中再开一条厂商流会挤占并发额度(多数厂商按账号限并发路数),拒绝而非静默抢占。
+    if *state.running.lock().unwrap() {
+        return Err("录制中不能测试云端连接".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let s = settings::Settings {
+            cloud_asr_provider: provider,
+            volc_app_key,
+            volc_access_key,
+            dashscope_api_key,
+            ..Default::default()
+        };
+        let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        let mut stream = cloud.open_stream().map_err(|e| format!("连接失败: {e}"))?;
+        // 200ms 静音:有些厂商在收到首个音频包前不会走完会话建立,空推一段最接近真实录制。
+        (stream.push)(&vec![0.0f32; 16000 / 5]).map_err(|e| format!("推流失败: {e}"))?;
+        (stream.finish)().map_err(|e| format!("收尾失败: {e}"))?;
+        let deadline = std::time::Instant::now() + CLOUD_TEST_TIMEOUT;
+        loop {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| "连接超时:请检查网络或凭证".to_string())?;
+            match stream.events.recv_timeout(left) {
+                Ok(asr::cloud::CloudEvent::Closed { error: None }) => {
+                    return Ok(format!("连接成功({})", cloud_provider_label(&s.cloud_asr_provider)))
+                }
+                Ok(asr::cloud::CloudEvent::Closed { error: Some(e) }) => return Err(e),
+                // 中途的预览/定稿(静音也可能吐空定稿)不是结论,继续等关闭。
+                Ok(_) => continue,
+                // 通道断开却没给 Closed:适配层线程异常退出,当失败报。
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err("连接异常中断:请检查网络或凭证".into())
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    return Err("连接超时:请检查网络或凭证".into())
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("执行线程失败: {e}"))?
+}
+
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
     app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| e.to_string())
@@ -3366,6 +3596,17 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     if asr_changed && *state.running.lock().unwrap() {
         return Err("录制中不能切换识别模型".into());
     }
+    // 识别方式(本地/云端)与云端凭证变更:与 ASR 选型同理,录制中改会让正在跑的会话与
+    // 设置对不上(云端流已按旧凭证握手、本地 worker 已持旧识别器),拒绝。凭证也在内:
+    // 改 key 不会重开流,却会让下一次重连/补识用上另一套账号,静默分裂到两个厂商账号下。
+    let mode_changed = old.asr_mode != new_settings.asr_mode
+        || old.cloud_asr_provider != new_settings.cloud_asr_provider;
+    let creds_changed = old.volc_app_key != new_settings.volc_app_key
+        || old.volc_access_key != new_settings.volc_access_key
+        || old.dashscope_api_key != new_settings.dashscope_api_key;
+    if (mode_changed || creds_changed) && *state.running.lock().unwrap() {
+        return Err("录制中不能切换识别方式".into());
+    }
     // 声纹模型切换:录制中拒绝(与 ASR 同理);保存后清旧嵌入器缓存,并起后台线程
     // 用新模型从录音样本重建整库质心(不同模型空间不可混用)。重建期间录制可用,
     // 只是种子注入被门禁跳过(不自动认人),完成后自动恢复。
@@ -3386,6 +3627,14 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
         s.models_dir = models_dir;
     }).map_err(|e| e.to_string())?;
     if asr_changed {
+        *state.recognizer_cache.lock().unwrap() = None;
+        preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+    } else if mode_changed {
+        // 识别方式切换(本地↔云端 / 换厂商):无条件清掉常驻识别器——
+        //  - 切到云端:那份几 GB 的模型此后没人取用,留着白占内存,清掉即释放;
+        //  - 切回本地:预载按新设置重载(preload 内部已按模式判定是否真的加载),
+        //    与 asr_changed 后的节奏一致,无需重启即可开录。
+        // 换厂商不涉及本机识别器,清空是空操作(槽本就为空),沿用同一条路径不分叉。
         *state.recognizer_cache.lock().unwrap() = None;
         preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
     }
@@ -4182,11 +4431,13 @@ pub fn run() {
             set_input_volume,
             output_is_bluetooth,
             models_status,
+            open_models_dir,
             download_models,
             cancel_models_download,
             delete_model,
             get_settings,
             set_settings,
+            test_cloud_asr,
             list_hooks,
             save_hooks,
             test_hook,
@@ -4289,6 +4540,48 @@ mod cut_sample_tests {
         let expect = (((first_idx % 1000) as i16) - 500) as f32 / 32768.0;
         assert!((sample[0] - expect).abs() < 1e-3, "首样本应来自 1000ms 处");
         assert!(cut_person_sample_from_notes(tmp.path(), "P404").is_none(), "查无此人");
+    }
+}
+
+#[cfg(test)]
+mod cloud_asr_factory_tests {
+    use super::{cloud_provider_label, make_cloud_asr};
+    use crate::settings::{Settings, CLOUD_ALIYUN, CLOUD_VOLCANO};
+
+    #[test]
+    fn missing_creds_bail_with_settings_hint() {
+        let s = Settings { cloud_asr_provider: CLOUD_VOLCANO.into(), ..Default::default() };
+        let err = make_cloud_asr(&s).err().expect("火山缺凭证应报错");
+        assert!(err.to_string().contains("请先在设置中配置云端凭证"), "{err}");
+        // 半套凭证(只有 app_key)同样不算齐:握手必然 401,提前拦住。
+        let s = Settings {
+            cloud_asr_provider: CLOUD_VOLCANO.into(),
+            volc_app_key: "a".into(),
+            ..Default::default()
+        };
+        assert!(make_cloud_asr(&s).is_err(), "火山半套凭证应报错");
+        let s = Settings { cloud_asr_provider: CLOUD_ALIYUN.into(), ..Default::default() };
+        let err = make_cloud_asr(&s).err().expect("阿里缺凭证应报错");
+        assert!(err.to_string().contains("请先在设置中配置云端凭证"), "{err}");
+    }
+
+    #[test]
+    fn builds_adapter_per_provider_when_creds_ok() {
+        let volc = Settings {
+            cloud_asr_provider: CLOUD_VOLCANO.into(),
+            volc_app_key: "a".into(),
+            volc_access_key: "b".into(),
+            ..Default::default()
+        };
+        assert!(make_cloud_asr(&volc).is_ok(), "火山凭证齐 → 造得出适配器");
+        let ali = Settings {
+            cloud_asr_provider: CLOUD_ALIYUN.into(),
+            dashscope_api_key: "sk-x".into(),
+            ..Default::default()
+        };
+        assert!(make_cloud_asr(&ali).is_ok(), "阿里凭证齐 → 造得出适配器");
+        assert_eq!(cloud_provider_label(CLOUD_VOLCANO), "火山引擎");
+        assert_eq!(cloud_provider_label(CLOUD_ALIYUN), "阿里云");
     }
 }
 

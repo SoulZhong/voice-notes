@@ -81,6 +81,7 @@ pub struct Artifact {
 
 const SV_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 pub const PF_DIR: &str = "sherpa-onnx-paraformer-zh-2023-09-14";
+pub const QWEN3_DIR: &str = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
 
 pub const ARTIFACTS: &[Artifact] = &[
     Artifact {
@@ -194,6 +195,46 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    Artifact {
+        id: "qwen3",
+        label: "语音识别（Qwen3-ASR 0.6B）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+        kind: ArtifactKind::TarBz2 { dest_dir: QWEN3_DIR },
+        approx_mb: 879,
+        prune: &["sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs"],
+        files: &[
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/conv_frontend.onnx",
+                bytes: 44_148_281,
+                sha256: "d22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/encoder.int8.onnx",
+                bytes: 182_491_662,
+                sha256: "60748d3e6744a57c9c91e1b17424a6c2990567e8adceb0783940c03ed98fa9d9",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/decoder.int8.onnx",
+                bytes: 755_914_231,
+                sha256: "4f6885be5959ae26af3089d38ee7972c5fafbeeb1cf8d5e76eab6d8b61ca5771",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/tokenizer/vocab.json",
+                bytes: 2_776_833,
+                sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/tokenizer/merges.txt",
+                bytes: 1_671_853,
+                sha256: "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/tokenizer/tokenizer_config.json",
+                bytes: 12_487,
+                sha256: "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+            },
+        ],
+    },
     // DTLN-aec 256 档：增值层神经残余回声消除。两个裸 onnx 工件（非压缩包），
     // 各自独立 URL/哈希，形状照抄 vad/speaker 的单文件 Artifact（File kind 一 url 一 file，
     // TarBz2 不适用——非压缩包）。not required_for_recording：模型不在场时清洗管线
@@ -230,18 +271,20 @@ pub const ARTIFACTS: &[Artifact] = &[
 ];
 
 /// 某工件在当前 ASR 选型下是否为「录制必需」。取代了静态 required_for_recording 字段：
-/// 就绪与否随选型变（三选型互斥：选中哪个就只需要哪个的工件），静态标记表达不了。
-/// vad 恒需；asr（SenseVoice）仅 sense_voice 选型需要；whisper 仅 whisper 选型需要；
-/// paraformer 仅 paraformer 选型需要；speaker 等不影响录制。
+/// 就绪与否随选型变（四选型互斥：选中哪个就只需要哪个的工件），静态标记表达不了。
+/// vad 恒需；asr（SenseVoice）仅 sense_voice 选型需要；whisper/paraformer/qwen3
+/// 各仅对应选型需要；speaker 等不影响录制。
 pub fn required_now(id: &str, asr_model: &str) -> bool {
     match id {
         "vad" => true,
         "asr" => {
             asr_model != crate::settings::ASR_WHISPER
                 && asr_model != crate::settings::ASR_PARAFORMER
+                && asr_model != crate::settings::ASR_QWEN3
         }
         "whisper" => asr_model == crate::settings::ASR_WHISPER,
         "paraformer" => asr_model == crate::settings::ASR_PARAFORMER,
+        "qwen3" => asr_model == crate::settings::ASR_QWEN3,
         _ => false,
     }
 }
@@ -273,6 +316,8 @@ pub struct ModelsStatus {
     pub recording_ready: bool,
     /// 说话人区分可用 = 声纹工件在。
     pub diarization_ready: bool,
+    /// 模型存储目录(root() 的展示形式)。设置页展示并支持点击打开。
+    pub root: String,
 }
 
 pub fn status(asr_model: &str) -> ModelsStatus {
@@ -293,21 +338,38 @@ pub fn status(asr_model: &str) -> ModelsStatus {
         recording_ready: artifacts.iter().filter(|s| s.required_for_recording).all(|s| s.present),
         diarization_ready: artifacts.iter().find(|s| s.id == "speaker").map(|s| s.present).unwrap_or(false),
         artifacts,
+        root: root.display().to_string(),
     }
 }
 
-/// start/resume_recording 入口的防御检查用。按当前 ASR 选型判定必需工件是否齐。
-pub fn recording_ready(asr_model: &str) -> bool {
-    let root = root();
-    ARTIFACTS
-        .iter()
-        .filter(|a| required_now(a.id, asr_model))
-        .all(|a| artifact_present(&root, a))
+/// 就绪判定的模式感知入口。cloud_mode=false 时与 status() 完全等价(本地现状);
+/// cloud_mode=true:识别在云端,本地 ASR 大模型全不必需,vad 保留必需(spec §5:
+/// 避免 required_now 分叉、回切本地时不缺件);录制就绪还要求凭证齐(creds_ok)。
+pub fn status_for(asr_model: &str, cloud_mode: bool, creds_ok: bool) -> ModelsStatus {
+    let mut s = status(asr_model);
+    if cloud_mode {
+        for a in &mut s.artifacts {
+            a.required_for_recording = a.id == "vad";
+        }
+        let vad_ok = s.artifacts.iter().find(|a| a.id == "vad").map(|a| a.present).unwrap_or(false);
+        s.recording_ready = vad_ok && creds_ok;
+    }
+    s
 }
+
+// 曾有一个 recording_ready(asr_model) 供开录守卫/托盘单独判定,已删除:它只认本地
+// 选型,云端模式下会把"本机大模型没下全"当成不可开录,而云端根本不需要那些件。
+// 就绪判定现在只有 status_for 一条真源,调用方经 lib.rs::current_models_status 取用。
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// root() 读 MODELS_OVERRIDE/VN_MODELS 两个进程级全局态；cargo test 默认多线程并行，
+    /// 凡是读或写它们的测试都要共用这把锁串行化，否则 root_prefers_env_then_override
+    /// 的写会和别的测试的读交叉，读到过渡态（曾致 status_for_cloud_mode_needs_only_vad_plus_creds
+    /// 间歇失败）。同一线程内可重入判定不适用——std Mutex 非重入，故各测试仅在自身体内取一次。
+    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 测试专用工件（不碰真实 ARTIFACTS，避免依赖本机模型）。
     fn test_artifact() -> Artifact {
@@ -330,22 +392,43 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_eight_artifacts_with_whisper_paraformer_and_dtln_aec() {
+    fn status_exposes_models_root_path() {
+        let _guard = ROOT_LOCK.lock().unwrap();
+        // 前端「语音模型」区展示存储目录并支持点击打开,root 必须随 status 下发。
+        let s = status(crate::settings::ASR_SENSE_VOICE);
+        assert!(!s.root.is_empty());
+        assert_eq!(s.root, root().display().to_string());
+    }
+
+    #[test]
+    fn manifest_covers_nine_artifacts_with_qwen3_whisper_paraformer_and_dtln_aec() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
         assert_eq!(
             ids,
             vec![
                 "vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer",
-                "dtln_aec_256_1", "dtln_aec_256_2",
+                "qwen3", "dtln_aec_256_1", "dtln_aec_256_2",
             ]
         );
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
         assert!(matches!(w.kind, ArtifactKind::TarBz2 { dest_dir: "sherpa-onnx-whisper-base" }));
         assert_eq!(w.files.len(), 3);
         assert!(!w.prune.is_empty(), "fp32 与测试音频装好即删");
+        let q = ARTIFACTS.iter().find(|a| a.id == "qwen3").unwrap();
+        assert!(matches!(q.kind, ArtifactKind::TarBz2 { dest_dir: QWEN3_DIR }));
+        assert_eq!(q.files.len(), 6, "三个 onnx + tokenizer 三件");
+        assert!(!q.prune.is_empty(), "test_wavs 装好即删");
         for a in ARTIFACTS {
             for f in a.files { assert_eq!(f.sha256.len(), 64); }
         }
+    }
+
+    #[test]
+    fn qwen3_required_only_when_selected() {
+        assert!(required_now("qwen3", crate::settings::ASR_QWEN3));
+        assert!(!required_now("qwen3", crate::settings::ASR_SENSE_VOICE));
+        assert!(!required_now("asr", crate::settings::ASR_QWEN3), "选 qwen3 时不需要 SenseVoice 工件");
+        assert!(required_now("vad", crate::settings::ASR_QWEN3), "vad 恒需");
     }
 
     #[test]
@@ -383,6 +466,7 @@ mod tests {
 
     #[test]
     fn root_prefers_env_then_override() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         set_models_override(Some(tmp.path().to_path_buf()));
         std::env::set_var("VN_MODELS", "/env-wins");
@@ -396,6 +480,7 @@ mod tests {
 
     #[test]
     fn status_exposes_artifact_urls() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         let st = status("sense_voice");
         assert_eq!(st.artifacts.len(), ARTIFACTS.len());
         for s in &st.artifacts {
@@ -403,6 +488,23 @@ mod tests {
             assert_eq!(s.url, a.url, "DTO url 应等于注册表 url");
             assert!(!s.url.is_empty(), "url 不应为空");
         }
+    }
+
+    #[test]
+    fn status_for_cloud_mode_needs_only_vad_plus_creds() {
+        let _guard = ROOT_LOCK.lock().unwrap();
+        // 本地模式 = 现状(回归锚)。
+        let local = status_for(crate::settings::ASR_SENSE_VOICE, false, false);
+        assert_eq!(local.recording_ready, status(crate::settings::ASR_SENSE_VOICE).recording_ready);
+        // 云端模式:ASR 工件全不必需,vad 仍必需。
+        let cloud = status_for(crate::settings::ASR_SENSE_VOICE, true, true);
+        for a in &cloud.artifacts {
+            let want = a.id == "vad";
+            assert_eq!(a.required_for_recording, want, "云端模式 {} 必需性", a.id);
+        }
+        // 凭证缺失 → 即使 vad 在也不就绪。
+        let no_creds = status_for(crate::settings::ASR_SENSE_VOICE, true, false);
+        assert!(!no_creds.recording_ready, "云端无凭证不可开录");
     }
 }
 

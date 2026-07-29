@@ -25,7 +25,7 @@ fn whisper_transcribes_fixture() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/sample_16k.wav"
     ));
-    let mut rec = WhisperRecognizer::new(&model_dir).expect("加载模型");
+    let mut rec = WhisperRecognizer::new(&model_dir, None).expect("加载模型");
     let t = rec.recognize(&samples).expect("识别");
     println!("识别结果: {}", t.text);
     let lower = t.text.to_lowercase();

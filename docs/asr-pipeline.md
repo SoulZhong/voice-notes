@@ -153,30 +153,70 @@ Silero 当前固定参数：
 
 ## 3. 识别器选择与输出差异
 
+所有选型统一经 `asr/engine.rs`(sherpa-onnx 官方 crate 的 sys 层,静态链接)推理,
+适配层只负责文件布局与参数;结果从 C 端 JSON 解析,保留 lang(2026-07-28 迁移)。
+
 ```mermaid
 flowchart LR
     SETTINGS["settings.json<br/>asr_model"] --> FACTORY{"new_recognizer"}
     FACTORY -- "sense_voice 或未知值" --> SV["SenseVoice full precision<br/>language=auto, ITN=true"]
     FACTORY -- "paraformer" --> PF["Paraformer large int8<br/>greedy/default decode"]
     FACTORY -- "whisper" --> WH["Whisper base int8<br/>language=auto/default decode"]
+    FACTORY -- "qwen3" --> QW["Qwen3-ASR 0.6B int8<br/>近贪心采样,热词可选"]
     SV --> SVOUT["text + lang<br/>tokens + timestamps"]
     PF --> PFOUT["text + tokens + timestamps<br/>lang 通常为空"]
-    WH --> WHOUT["只有 text<br/>其余字段为空"]
+    WH --> WHOUT["text(lang/时间戳未启用)"]
+    QW --> QWOUT["text + tokens<br/>无时间戳,lang 通常为空"]
     SVOUT --> COMMON["统一 Transcript"]
     PFOUT --> COMMON
     WHOUT --> COMMON
+    QWOUT --> COMMON
 ```
 
-| 能力 | SenseVoice | Paraformer | Whisper base |
-|---|---|---|---|
-| 默认选择 | 是 | 否 | 否 |
-| 模型精度 | 全精度优先，int8 兜底 | int8 | int8 优先 |
-| 中文 | 支持 | 中文专用 | 支持 |
-| 中英混合 | 自动语种 | 英文较弱 | 自动语种 |
-| 语言标签 | 有 | 通常无 | 当前适配层未透传 |
-| token 时间戳 | 有 | 有 | 当前适配层未透传 |
-| 段内换人后的文本处理 | 按 token 分组 | 按 token 分组 | 子段重新识别 |
-| 热词/领域词 | 未接入 | 未接入 | 未接入 |
+| 能力 | SenseVoice | Paraformer | Whisper base | Qwen3-ASR 0.6B |
+|---|---|---|---|---|
+| 默认选择 | 是 | 否 | 否 | 否 |
+| 模型精度 | 全精度优先，int8 兜底 | int8 | int8 优先 | int8 |
+| 中文 | 支持 | 中文专用 | 支持 | 支持(52 语种) |
+| 中英混合 | 自动语种 | 英文较弱 | 自动语种 | 最强(专项优化) |
+| 语言标签 | 有 | 通常无 | 未启用 | 通常无(文本兜底过滤) |
+| token 时间戳 | 有 | 有 | 未启用 | 无(LLM 解码) |
+| 段内换人后的文本处理 | 按 token 分组 | 按 token 分组 | 段级降级 | 段级降级 |
+| 热词/领域词 | 不支持 | 不支持 | 不支持 | **支持**(配置层已留口,待术语库接入) |
+| 单段延迟(M 系 Mac, 4s 段) | ~0.1s | 未测 | 未测 | ~0.7-1.4s(RTF 0.18-0.34) |
+
+### 云端模式
+
+`asr_mode=cloud` 时识别搬到厂商侧(火山引擎 sauc `bigmodel_async` 流式 /
+阿里 DashScope `fun-asr-realtime`),本机不再跑本地 ASR 大模型推理，`silero_vad.onnx`
+仍下载但不参与断句——断句改由厂商服务端 VAD 完成。详细设计见
+`docs/superpowers/specs/2026-07-29-cloud-asr-design.md`。
+
+要点：
+
+- **前处理零改动**：`CloudForwarder`(`pipeline/cloud_forward.rs`)实现与 `SileroSegmenter`
+  相同的 `Segmenter` trait，只做"消毒 NaN/Inf + 转发"，不产段不产 partial；借这个
+  形状让 `run_segment_worker` 的暂停闸/电平/AEC/音频旁路全部原样复用，`segment_worker.rs`
+  本身不知道自己在喂云端还是本地。
+- **厂商断句 + 双流**：mic/system 各开一条独立 WebSocket 流(`asr/cloud/volcano.rs`、
+  `asr/cloud/aliyun.rs` 实现 `CloudAsr` trait），协议帧编解码写成纯函数，单测不碰网络。
+  `Interim{text}` 事件覆盖式更新现有 per-source partial 槽；`Definite(DefiniteUtterance)`
+  按厂商给出的 `start_ms/end_ms`（有词级时间戳则映射 tokens/timestamps，喂现有段内
+  声纹切分；无则段级降级，同本地 Qwen3 路径）合成一个 final 段。
+- **FinalSink 全复用**：`run_cloud_asr_worker`(`session.rs`)与本地 `run_asr_worker`
+  共用同一个 `FinalSink`——回声去重、AEC 残渣过滤、语言过滤、说话人 embedding/在线
+  聚类、落盘全部走既有逻辑，云端只负责把 `DefiniteUtterance` 换算成 `Transcript`
+  喂进去（`utterance_to_transcript`），下游不知道识别来自厂商还是本机。
+- **断连重连 + 环形缓冲补识**：每源用 `SourceFeed` 记账——已推样本数、5 分钟环形
+  缓冲(`CLOUD_RING_CAP = 5*60*16000`)、缺口起点。流断开(`Closed{error}`)或推流失败
+  即标记断连，指数退避重连(1s→2s→…封顶 30s，不封顶重试直到停录)；音频照常落盘不
+  中断。重连成功后，缺口音频先经本机 Silero 切段(≤15s)，再逐段调厂商批式接口
+  补识——火山走 `flash`(录音文件识别极速版)，阿里因 DashScope 批式接口只收公网 URL，
+  改走 `qwen3-asr-flash`(多模态 HTTP，base64，无时间戳，取本地段边界)；两家由同一个
+  `try_recover`/`backfill_segmenter` 路径处理，补不回的部分（超出 5 分钟环、批式失败、
+  停录前始终连不上）落 `[识别失败]` 占位段，原始录音不受影响。
+- **状态可见性**：`CloudAsrStatus`(`Reconnecting`/`Recovered`/`Backfilling`/
+  `BackfillFailed`)经 `cloud-asr-status` 事件（`ipc.rs`）下发前端，驱动录制页状态条。
 
 ## 4. Final 段处理与所有丢弃路径
 
@@ -331,9 +371,11 @@ flowchart TB
 | 分段 worker | `run_segment_worker` | 暂停闸、电平、音频旁路、VAD、partial/final 生产 | `pipeline/segment_worker.rs` |
 | VAD | `SileroSegmenter` | 语音检测、断句、15 秒硬切 | `pipeline/silero.rs` |
 | 识别器 | `Recognizer`、`Transcript` | 三种模型的统一接口 | `asr/mod.rs` |
+| 推理引擎 | `OfflineEngine` | 四选型统一 sys 层推理，从 C 端 JSON 保留 lang | `asr/engine.rs` |
 | 模型适配 | `SenseVoiceRecognizer` | 默认中英混合识别，透传语言和 token 时间戳 | `asr/sense_voice.rs` |
 | 模型适配 | `ParaformerRecognizer` | 中文识别，透传 token 时间戳 | `asr/paraformer.rs` |
 | 模型适配 | `WhisperRecognizer` | Whisper base 识别，目前仅透传文本 | `asr/whisper.rs` |
+| 模型适配 | `Qwen3Recognizer` | 中英混说/热词，无 token 时间戳（段级降级） | `asr/qwen3.rs` |
 | ASR 调度 | `run_asr_worker` | final 优先、partial 预览、过滤、回声去重、说话人处理 | `session.rs` |
 | 段内切分 | `detect_change_points`、`group_tokens_by_boundaries` | 按声纹换人点拆分长段文字 | `diar/split.rs` |
 | 说话人 | `SpeakerRegistry`、`SpeakerEmbedder` | 实时聚类、已有身份匹配、簇合并 | `diar/registry.rs`、`diar/mod.rs` |
@@ -342,6 +384,9 @@ flowchart TB
 | 会后过滤 | `is_hallucination` | 标记精修稿要跳过的短垃圾段 | `refine/filter.rs` |
 | 会后聚类 | `recluster` | 从保存音频执行全局说话人重聚类 | `refine/recluster.rs` |
 | 文本精修 | HTTP LLM / Agent executor | 同音字、实体、口头语与排版修正 | `refine/llm.rs`、`refine/agent.rs` |
+| 云端适配层 | `CloudAsr`、`volcano`、`aliyun` | 厂商流式协议编解码(纯函数)+ 批式补识 | `asr/cloud/*` |
+| 云端调度 | `run_cloud_asr_worker` | 双流记账、事件回灌 FinalSink、断连重连、缺口补识、状态上报 | `session.rs` |
+| 云端前处理转发 | `CloudForwarder` | 借 `Segmenter` 之形转发前处理后音频,断句让位厂商 | `pipeline/cloud_forward.rs` |
 
 ## 9. 质量诊断切面
 

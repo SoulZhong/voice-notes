@@ -37,8 +37,8 @@ export const aiLogsExport = () => invoke<{ path: string; count: number }>("ai_lo
 export const aiLogsOpenDir = () => invoke<string>("ai_logs_open_dir");
 
 export const AI_LOG_KIND_LABELS: Record<string, string> = {
-  refine_chunk: "Aing 分块",
+  refine_chunk: "AI 分块整理",
   title: "标题生成",
-  agent_refine: "Agent Aing",
-  mcp_apply: "Aing 写回",
+  agent_refine: "Agent AI 整理",
+  mcp_apply: "AI 写回",
 };

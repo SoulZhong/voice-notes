@@ -18,7 +18,9 @@
     purgeAudio,
     onMigrate,
     onModelDownload,
+    openModelsDir,
     testMirror,
+    testCloudAsr,
     type ModelsStatus,
     type Settings,
     type ModelDownloadEvent,
@@ -75,12 +77,28 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
-  /** asr_model 后端值 → radio 本地 value 的三态映射(whisper/paraformer/sense_voice)。 */
+  /** asr_model 后端值 → radio 本地 value 的四态映射(whisper/paraformer/qwen3/sense_voice)。 */
   function asrModelToChoice(m: string | undefined): string {
-    return m === "whisper" ? "whisper" : m === "paraformer" ? "paraformer" : "sense_voice";
+    return m === "whisper" ? "whisper"
+      : m === "paraformer" ? "paraformer"
+      : m === "qwen3" ? "qwen3"
+      : "sense_voice";
   }
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
   let error = $state("");
+
+  // —— 识别方式(本地/云端)本地绑定值:同 asrChoice 理由,不派生 checked ——
+  /** "local" | "cloud"。 */
+  let asrMode = $state("local");
+  /** 云端厂商:"volcano" | "aliyun"。 */
+  let cloudProvider = $state("volcano");
+  let volcAppKey = $state("");
+  let volcAccessKey = $state("");
+  let dashKey = $state("");
+  /** 「测试连接」按钮态与结果(逻辑照搬 runMirrorTest)。 */
+  let testingCloud = $state(false);
+  let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
+  let cloudTestGeneration = 0;
 
   // —— 新四区块的本地绑定值 ——
   // 一律用本地 $state + bind(group/checked),不直接从 settings 派生 checked：
@@ -126,9 +144,12 @@
     ),
   );
 
-  // 当前 ASR 选型对应的工件 id:sense_voice→asr,whisper→whisper,paraformer→paraformer。
+  // 当前 ASR 选型对应的工件 id:sense_voice→asr,其余选型 id 与 asr_model 同名。
   const asrArtifactId = $derived(
-    settings?.asr_model === "whisper" ? "whisper" : settings?.asr_model === "paraformer" ? "paraformer" : "asr",
+    settings?.asr_model === "whisper" ? "whisper"
+      : settings?.asr_model === "paraformer" ? "paraformer"
+      : settings?.asr_model === "qwen3" ? "qwen3"
+      : "asr",
   );
   const asrModelMissing = $derived(
     !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
@@ -170,6 +191,11 @@
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
     telemetryOn = s.telemetry_enabled;
+    asrMode = s.asr_mode === "cloud" ? "cloud" : "local";
+    cloudProvider = s.cloud_asr_provider === "aliyun" ? "aliyun" : "volcano";
+    volcAppKey = s.volc_app_key;
+    volcAccessKey = s.volc_access_key;
+    dashKey = s.dashscope_api_key;
   }
 
   async function refreshDiskUsage() {
@@ -308,6 +334,16 @@
 
   // —— 外观 / 录制 / 系统:通用「取新鲜值→改→存」保存 ——
   // 成功后 settings 与本地镜像同步;失败时 danger 横幅 + 从后端真值回弹本地镜像。
+  /** 在系统文件管理器中打开模型存储目录(失败走 danger 横幅,如目录被迁移后不存在)。 */
+  async function doOpenModelsDir() {
+    error = "";
+    try {
+      await openModelsDir();
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
   async function saveSetting(mut: (s: Settings) => void) {
     error = "";
     try {
@@ -452,6 +488,59 @@
     }
   }
 
+  // —— 识别方式(本地/云端)——(逻辑照搬 changeAsr:取新鲜值再改,失败回弹)
+  async function changeAsrMode(mode: string) {
+    if (settings?.asr_mode === mode) return;
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.asr_mode = mode;
+      await setSettings(fresh);
+      settings = fresh;
+      asrMode = mode;
+      invalidateCloudTest(); // 切换方式后旧测试结果不再有意义
+      await refreshStatus(); // recording_ready 随方式重算(云端模式看凭证而非本地工件)
+    } catch (e) {
+      error = `${e}`;
+      settings = await getSettings().catch(() => settings);
+      asrMode = settings?.asr_mode === "cloud" ? "cloud" : "local";
+    }
+  }
+
+  // —— 云端 ASR「测试连接」——(逻辑照搬 runMirrorTest)
+  function invalidateCloudTest() {
+    cloudTestGeneration += 1;
+    cloudTestResult = null;
+  }
+
+  async function doTestCloud() {
+    if (!settings) return;
+    const generation = ++cloudTestGeneration;
+    const input = {
+      provider: cloudProvider,
+      volcAppKey,
+      volcAccessKey,
+      dashKey,
+    };
+    testingCloud = true;
+    cloudTestResult = null;
+    try {
+      const msg = await testCloudAsr(
+        input.provider,
+        input.volcAppKey,
+        input.volcAccessKey,
+        input.dashKey,
+      );
+      if (generation !== cloudTestGeneration) return;
+      cloudTestResult = { ok: true, msg };
+    } catch (e) {
+      if (generation !== cloudTestGeneration) return;
+      cloudTestResult = { ok: false, msg: String(e) };
+    } finally {
+      testingCloud = false;
+    }
+  }
+
   // —— 镜像加速(逻辑照搬 ModelDownloadCard)——
   async function toggleMirror() {
     mirrorTest = null;
@@ -473,7 +562,11 @@
 
 <main class="container">
   <h1>设置</h1>
-  <p class="desc">所有录音与识别都在本机完成,不上传任何音频。</p>
+  <p class="desc">
+    {asrMode === "cloud"
+      ? "录音仍保存在本机；识别时音频会发送到当前选择的云服务商。"
+      : "所有录音与识别都在本机完成，不上传任何音频。"}
+  </p>
 
   {#if error}
     <div class="banner">{error}</div>
@@ -661,48 +754,192 @@
       </label>
       <div class="row">
         <div class="row-info">
-          <span class="row-label">识别引擎</span>
+          <span class="row-label">识别方式</span>
           <span class="row-desc">
-            {asrChoice === "whisper"
-              ? "多语种支持广,说话人区分较粗"
-              : asrChoice === "paraformer"
-                ? "中文更准、英文较弱"
-                : "推荐 · 中英日韩粤语,功能最全"}
+            {asrMode === "cloud" ? "录音音频将实时上传至所选厂商" : "识别在本机完成,数据不出设备"}
           </span>
         </div>
         <div class="seg" class:disabled={recording.isLive}>
           <label class="seg-item">
             <input
               type="radio"
-              name="asr"
-              value="sense_voice"
-              bind:group={asrChoice}
+              name="asrmode"
+              value="local"
+              bind:group={asrMode}
               disabled={recording.isLive || !settings}
-              onchange={() => changeAsr("sense_voice")}
-            />SenseVoice
+              onchange={() => changeAsrMode("local")}
+            />本地模型
           </label>
           <label class="seg-item">
             <input
               type="radio"
-              name="asr"
-              value="whisper"
-              bind:group={asrChoice}
+              name="asrmode"
+              value="cloud"
+              bind:group={asrMode}
               disabled={recording.isLive || !settings}
-              onchange={() => changeAsr("whisper")}
-            />Whisper
-          </label>
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="asr"
-              value="paraformer"
-              bind:group={asrChoice}
-              disabled={recording.isLive || !settings}
-              onchange={() => changeAsr("paraformer")}
-            />Paraformer
+              onchange={() => changeAsrMode("cloud")}
+            />云端 API
           </label>
         </div>
       </div>
+      {#if asrMode === "cloud"}
+        <div class="row">
+          <div class="row-info"><span class="row-label">厂商</span></div>
+          <div class="seg" class:disabled={recording.isLive}>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="cloudprovider"
+                value="volcano"
+                bind:group={cloudProvider}
+                disabled={recording.isLive || !settings}
+                onchange={() => {
+                  invalidateCloudTest();
+                  saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
+                }}
+              />火山引擎
+            </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="cloudprovider"
+                value="aliyun"
+                bind:group={cloudProvider}
+                disabled={recording.isLive || !settings}
+                onchange={() => {
+                  invalidateCloudTest();
+                  saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
+                }}
+              />阿里云
+            </label>
+          </div>
+        </div>
+        {#if cloudProvider === "volcano"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">APP ID</span>
+              <span class="row-desc">火山引擎语音技术控制台的 App ID</span>
+            </div>
+            <input
+              class="row-input"
+              placeholder="APP ID"
+              bind:value={volcAppKey}
+              disabled={recording.isLive}
+              oninput={invalidateCloudTest}
+              onblur={() => saveSetting((s) => (s.volc_app_key = volcAppKey))}
+            />
+          </div>
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">Access Token</span>
+              <span class="row-desc">只保存在本机,不随笔记上传</span>
+            </div>
+            <input
+              class="row-input"
+              type="password"
+              placeholder="Access Token"
+              bind:value={volcAccessKey}
+              disabled={recording.isLive}
+              oninput={invalidateCloudTest}
+              onblur={() => saveSetting((s) => (s.volc_access_key = volcAccessKey))}
+            />
+          </div>
+        {:else}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">API Key</span>
+              <span class="row-desc">只保存在本机,不随笔记上传</span>
+            </div>
+            <input
+              class="row-input"
+              type="password"
+              placeholder="DashScope API Key"
+              bind:value={dashKey}
+              disabled={recording.isLive}
+              oninput={invalidateCloudTest}
+              onblur={() => saveSetting((s) => (s.dashscope_api_key = dashKey))}
+            />
+          </div>
+        {/if}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">测试连接</span>
+            <span class="row-desc">
+              {#if cloudTestResult}
+                <span class={cloudTestResult.ok ? "mtest-ok" : "mtest-err"}>
+                  {cloudTestResult.ok ? `测试成功(${cloudTestResult.msg})` : `测试失败: ${cloudTestResult.msg}`}
+                </span>
+              {:else}
+                用当前凭证实际连接一次厂商,验证配置可用
+              {/if}
+            </span>
+          </div>
+          <button
+            class="btn-secondary"
+            onclick={doTestCloud}
+            disabled={testingCloud || recording.isLive}
+          >
+            {testingCloud ? "测试中…" : "测试连接"}
+          </button>
+        </div>
+      {:else}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">识别引擎</span>
+            <span class="row-desc">
+              {asrChoice === "whisper"
+                ? "多语种支持广,说话人区分较粗"
+                : asrChoice === "paraformer"
+                  ? "中文更准、英文较弱"
+                  : asrChoice === "qwen3"
+                    ? "中英混说最准,识别稍慢,说话人区分较粗"
+                    : "推荐 · 中英日韩粤语,功能最全"}
+            </span>
+          </div>
+          <div class="seg" class:disabled={recording.isLive}>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="sense_voice"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("sense_voice")}
+              />SenseVoice
+            </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="whisper"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("whisper")}
+              />Whisper
+            </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="paraformer"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("paraformer")}
+              />Paraformer
+            </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="qwen3"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("qwen3")}
+              />Qwen3
+            </label>
+          </div>
+        </div>
+      {/if}
       <div class="row">
         <div class="row-info">
           <span class="row-label">声纹模型</span>
@@ -740,8 +977,8 @@
       </div>
       <label class="row">
         <div class="row-info">
-          <span class="row-label">会后 Aing</span>
-          <span class="row-desc">停止录制后自动用大模型 Aing 转写稿(错字修正、段落归并);在线接口或本机 Agent,在左侧 AI 页配置</span>
+          <span class="row-label">会后 AI</span>
+          <span class="row-desc">停止录制后自动用大模型整理转写稿（错字修正、段落归并）；在线接口或本机 Agent 在左侧 AI 页配置</span>
         </div>
         <input
           type="checkbox"
@@ -752,17 +989,23 @@
         />
       </label>
     </div>
-    {#if asrModelMissing}
+    {#if asrMode === "local" && asrModelMissing}
       <div class="banner warn">所选识别引擎的模型未下载,请在下方「语音模型」中下载。</div>
     {/if}
     <p class="lock-hint">
-      {recording.isLive ? "录制进行中:识别引擎已锁定,其余更改下一场录制生效。" : "更改在下一场录制生效。"}
+      {recording.isLive ? "录制进行中:识别方式已锁定,其余更改下一场录制生效。" : "更改在下一场录制生效。"}
     </p>
   </section>
 
   <!-- —— 语音模型 —— -->
   <section>
     <h2 class="section-title">语音模型</h2>
+    {#if status}
+      <button class="models-path" title="在文件管理器中打开" onclick={doOpenModelsDir}>
+        <span class="row-desc">存储位置</span>
+        <span class="row-path models-path-value">{status.root}</span>
+      </button>
+    {/if}
     <div class="rows">
       {#if status}
         {#each status.artifacts as a (a.id)}
@@ -1001,6 +1244,23 @@
     color: var(--ink-secondary);
     word-break: break-all;
   }
+  /* 「语音模型」区的存储位置行:整行可点,在文件管理器中打开目录。 */
+  .models-path {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: -0.2rem 0 0.6rem;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+  .models-path:hover .models-path-value {
+    text-decoration: underline;
+    color: var(--ink);
+  }
   .present {
     font-size: 0.8rem;
     color: var(--ink-faint);
@@ -1061,6 +1321,30 @@
   }
   .mtest-ok { color: var(--success, var(--ink-secondary)); }
   .mtest-err { color: var(--danger-ink); }
+  /* 行内输入(与 AI 页 .row-input 同款):surface-press 底、无边,聚焦浮出 canvas + accent 环。
+     云端 ASR 凭证输入(APP ID / Access Token / API Key)复用此形态。 */
+  .row-input {
+    flex: none;
+    width: 14rem;
+    box-sizing: border-box;
+    padding: 0.32em 0.6em;
+    border: none;
+    border-radius: var(--radius-md);
+    background: var(--surface-press);
+    color: var(--ink);
+    font-size: 0.85rem;
+  }
+  .row-input:focus {
+    outline: none;
+    background: var(--canvas);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .row-input::placeholder {
+    color: var(--ink-faint);
+  }
+  .row-input:disabled {
+    opacity: 0.6;
+  }
   /* button-secondary */
   .btn-secondary {
     flex: none;

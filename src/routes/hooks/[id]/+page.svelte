@@ -10,6 +10,7 @@
     hooks as hooksStore,
     HOOK_EVENTS,
     type HookCfg,
+    type HookKind,
   } from "$lib/hooks.svelte";
 
   const routeId = $derived($page.params.id as string);
@@ -40,7 +41,20 @@
         // 的表单覆盖成 A 的数据(此后保存还会静默写回 A)。闭包 id ≠ 当前 routeId 即丢弃。
         if (id !== routeId) return;
         const found = list.find((h) => h.id === id);
-        if (found) cfg = { ...found };
+        if (found) {
+          const legacyType = found.webhook_type ?? "generic";
+          cfg = {
+            ...found,
+            kind:
+              found.kind === "webhook" && legacyType !== "generic"
+                ? (legacyType as HookKind)
+                : found.kind,
+            webhook_type: legacyType,
+            webhook_secret: found.webhook_secret ?? "",
+            webhook_message_style: found.webhook_message_style ?? "rich",
+            webhook_mention_all: found.webhook_mention_all ?? false,
+          };
+        }
         else {
           cfg = null;
           loadError = "钩子不存在,可能已被删除";
@@ -109,6 +123,29 @@
   const bodyMissing = $derived(
     !cfg || (cfg.kind === "shell" ? !cfg.command.trim() : !cfg.url.trim()),
   );
+
+  const webhookHelp = $derived.by(() => {
+    if (!cfg) return { desc: "", hint: "", placeholder: "" };
+    if (cfg.kind === "feishu") {
+      return {
+        desc: "发送成飞书群机器人可以直接显示的文字消息",
+        hint: "打开飞书群设置 → 群机器人 → 添加机器人 → 自定义机器人，复制 Webhook 地址粘贴到这里。",
+        placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/…",
+      };
+    }
+    if (cfg.kind === "wecom") {
+      return {
+        desc: "发送成企业微信群机器人可以直接显示的文字消息",
+        hint: "打开企业微信群设置 → 群机器人 → 添加机器人，复制 Webhook 地址粘贴到这里。",
+        placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…",
+      };
+    }
+    return {
+      desc: "向自建服务或自动化工具 POST 标准 JSON",
+      hint: "适合自建服务、n8n、Zapier 等工具；请求体字段可在钩子概览页查看。",
+      placeholder: "https://example.com/hook",
+    };
+  });
 </script>
 
 <div class="page">
@@ -151,11 +188,16 @@
         <div class="row-info">
           <span class="row-label">执行方式</span>
           <span class="row-desc">
-            {cfg.kind === "shell" ? "本机运行命令,事件信息在环境变量里" : "向你的接口 POST 一段 JSON"}
+            {cfg.kind === "shell" ? "本机运行命令，事件信息在环境变量里" : webhookHelp.desc}
           </span>
         </div>
         <div class="segmented" role="radiogroup" aria-label="执行方式">
-          {#each [["shell", "Shell 命令"], ["webhook", "Webhook"]] as [v, label] (v)}
+          {#each [
+            ["shell", "Shell"],
+            ["feishu", "飞书"],
+            ["wecom", "企业微信"],
+            ["webhook", "通用 Webhook"],
+          ] as [v, label] (v)}
             <label class="seg-item">
               <input
                 type="radio"
@@ -163,7 +205,9 @@
                 value={v}
                 checked={cfg.kind === v}
                 onchange={() => {
-                  cfg!.kind = v as "shell" | "webhook";
+                  cfg!.kind = v as HookKind;
+                  cfg!.webhook_type =
+                    v === "feishu" || v === "wecom" ? v : "generic";
                   testResult = null;
                 }}
               />
@@ -190,22 +234,90 @@
       {:else}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">URL</span>
-            <span class="row-desc">POST JSON,10 秒超时;载荷格式见钩子概览页</span>
+            <span class="row-label">Webhook 地址</span>
+            <span class="row-desc">{webhookHelp.hint}</span>
           </div>
           <input
             class="row-input wide"
-            placeholder="https://example.com/hook"
+            placeholder={webhookHelp.placeholder}
             bind:value={cfg.url}
             oninput={() => (testResult = null)}
           />
         </div>
+        {#if cfg.kind === "feishu" || cfg.kind === "wecom"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">消息样式</span>
+              <span class="row-desc">
+                {cfg.kind === "feishu" ? "富文本会以飞书消息标题与分段正文展示" : "Markdown 支持标题、加粗、引用和链接"}
+              </span>
+            </div>
+            <div class="segmented" role="radiogroup" aria-label="消息样式">
+              {#each [["rich", cfg.kind === "feishu" ? "富文本" : "Markdown"], ["text", "纯文本"]] as [v, label] (v)}
+                <label class="seg-item">
+                  <input
+                    type="radio"
+                    name="message-style"
+                    value={v}
+                    checked={cfg.webhook_message_style === v}
+                    onchange={() => {
+                      cfg!.webhook_message_style = v as "text" | "rich";
+                      testResult = null;
+                    }}
+                  />
+                  {label}
+                </label>
+              {/each}
+            </div>
+          </div>
+
+          {#if cfg.kind === "feishu"}
+            <div class="row">
+              <div class="row-info">
+                <span class="row-label">签名密钥（推荐）</span>
+                <span class="row-desc">若机器人安全设置启用了“签名校验”，粘贴页面显示的密钥；只保存在本机</span>
+              </div>
+              <input
+                class="row-input wide"
+                type="password"
+                autocomplete="off"
+                placeholder="未启用签名校验可留空"
+                bind:value={cfg.webhook_secret}
+                oninput={() => (testResult = null)}
+              />
+            </div>
+          {/if}
+
+          <label class="row">
+            <div class="row-info">
+              <span class="row-label">提醒所有人</span>
+              <span class="row-desc">每次触发都会 @ 全体成员，请谨慎开启</span>
+            </div>
+            <input type="checkbox" class="switch" bind:checked={cfg.webhook_mention_all} />
+          </label>
+
+          <div class="webhook-tip">
+            <span aria-hidden="true">✓</span>
+            {cfg.kind === "feishu"
+              ? "飞书还可在机器人后台设置关键词或 IP 白名单；关键词必须出现在消息中，建议填“voice-notes”。"
+              : "企业微信单个机器人最多发送 20 条/分钟；高频事件请避免同时开启 @ 所有人。"}
+          </div>
+        {:else}
+          <div class="webhook-tip">
+            <span aria-hidden="true">i</span>
+            通用 Webhook 会发送标准 JSON，适合自建服务、n8n、Zapier 等自动化工具。
+          </div>
+        {/if}
       {/if}
 
       <label class="row">
         <div class="row-info">
           <span class="row-label">附带笔记内容</span>
-          <span class="row-desc">把笔记详情与全文交给命令/接口,修订稿优先;想要 Aing 全文请挂「Aing 完成」,变量清单见概览页</span>
+          <span class="row-desc">
+            {(cfg.kind === "feishu" || cfg.kind === "wecom")
+              ? "开启后，群消息会带上笔记全文（修订稿优先）；想接收 AI 整理结果请选择「Aing 结束」"
+              : "把笔记详情与全文交给命令/接口，修订稿优先；想要 AI 整理后的全文请挂「Aing 结束」，变量清单见概览页"}
+          </span>
         </div>
         <!-- 与启用开关不同:附带与否改变测试注入的内容,旧测试结果不再作数 -->
         <input
@@ -329,6 +441,19 @@
     box-shadow: var(--shadow-btn);
   }
   .seg-item input { position: absolute; opacity: 0; pointer-events: none; }
+  .segmented { flex-wrap: wrap; justify-content: flex-end; }
+  .webhook-tip {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.55rem 1rem;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--ink-secondary);
+    background: var(--surface-soft);
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+  .webhook-tip span { color: var(--success, var(--ink)); font-weight: 600; }
   .actions { margin-top: 1rem; display: flex; gap: 0.6rem; align-items: center; }
   .btn-primary {
     border: none;
