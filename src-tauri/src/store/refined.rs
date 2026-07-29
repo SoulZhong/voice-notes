@@ -96,6 +96,10 @@ pub struct RefinedDoc {
     /// 以通过图谱结构校验，但不是当前正文的 live mentions，不得进入 UI/搜索索引。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_support_mentions: Vec<String>,
+    /// 用户编辑保存的乐观并发版本号:每次锁内编辑落盘 +1,管线整写永不回退
+    /// (见 write_refined_atomic)。历史文档缺省 0。
+    #[serde(default)]
+    pub revision: u64,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
@@ -634,7 +638,15 @@ pub(crate) fn write_refined_atomic_locked(
 pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
     let lock = NoteLock::acquire(note_dir)?
         .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
-    write_refined_atomic_locked(note_dir, doc, &lock)
+    // 管线拿内存旧 doc 整写时不得把用户已推进的 revision 拉回去:一律进位,
+    // 让所有基于旧盘面的编辑器会话冲突失效,而不是被静默覆盖。
+    let mut doc = doc.clone();
+    if let Some(Some(existing)) = load_aing_file(note_dir) {
+        if existing.revision >= doc.revision {
+            doc.revision = existing.revision.saturating_add(1);
+        }
+    }
+    write_refined_atomic_locked(note_dir, &doc, &lock)
 }
 
 fn ensure_ids(note_dir: &Path, mut doc: RefinedDoc) -> Option<RefinedDoc> {
@@ -715,6 +727,9 @@ fn update_refined(
     let mut doc = load_refined_locked(note_dir, &note_lock)
         .ok_or_else(|| anyhow::anyhow!("修订稿不存在或已损坏"))?;
     f(&mut doc)?;
+    // 任何锁内编辑落盘都推进 revision:所有基于旧 revision 的未保存编辑器会话随之
+    // 失效,防止笔记页保存悄悄盖掉改名/Agent 修订等其他 writer 的成果。
+    doc.revision = doc.revision.saturating_add(1);
     write_refined_atomic_locked(note_dir, &doc, &note_lock)
 }
 
@@ -790,6 +805,103 @@ pub fn apply_refined_texts(
     Ok(updates.len())
 }
 
+/// save_refined 载荷段落:orig_index 指向保存基线 doc.paragraphs 的下标(None=用户
+/// 新插入块);dirty=文本相对载入基线有变(mention 偏移随之失效)。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ParagraphPayload {
+    pub orig_index: Option<usize>,
+    pub text: String,
+    pub dirty: bool,
+}
+
+/// 笔记页 WYSIWYG 整篇保存。与 apply_refined_texts(Agent 只改文本)不同,这里允许
+/// 增删段与插入无说话人块,因此要自己维护图谱一致性:
+/// - 干净段:speaker/时间戳/source_seqs/mentions 原样保留,仅替换 text;
+/// - 脏段:保留段但 mention 偏移失效 → mention id 移入 graph_support_mentions
+///   (mention 本体留在段上,图谱关系端点不悬空;UI/搜索按 support 过滤);
+/// - 被删段:mentions 随段消失 → 引用这些 mention 的关系整条剪掉;
+/// - 证据:paragraph_index 按新布局重定位,落在被删/脏段上的证据丢弃(偏移无效);
+/// - 新块:空 speaker + 零时间戳 + 空 source_seqs(导出侧对空 speaker 不加前缀)。
+/// revision 乐观并发:不匹配即拒绝;成功后经 update_refined 统一 +1,返回新值。
+pub fn save_refined_paragraphs(
+    note_dir: &Path,
+    expected_revision: u64,
+    payload: &[ParagraphPayload],
+) -> anyhow::Result<u64> {
+    update_refined(note_dir, |doc| {
+        anyhow::ensure!(
+            doc.revision == expected_revision,
+            "修订稿已在别处更新(盘上 revision {} ≠ 期望 {})",
+            doc.revision,
+            expected_revision
+        );
+        let old = std::mem::take(&mut doc.paragraphs);
+        // old 下标 → (新下标, 是否脏);None = 该段被删
+        let mut index_map: Vec<Option<(usize, bool)>> = vec![None; old.len()];
+        let mut new_paras = Vec::with_capacity(payload.len());
+        for (new_i, p) in payload.iter().enumerate() {
+            anyhow::ensure!(!p.text.trim().is_empty(), "第 {new_i} 段文本为空");
+            match p.orig_index {
+                Some(i) => {
+                    anyhow::ensure!(i < old.len(), "orig_index 越界: {i}(共 {} 段)", old.len());
+                    anyhow::ensure!(index_map[i].is_none(), "orig_index 重复: {i}");
+                    index_map[i] = Some((new_i, p.dirty));
+                    let mut para = old[i].clone();
+                    para.text = p.text.clone();
+                    new_paras.push(para);
+                }
+                None => new_paras.push(RefinedParagraph {
+                    speaker: String::new(),
+                    name: None,
+                    person_id: None,
+                    start_ms: 0,
+                    end_ms: 0,
+                    text: p.text.clone(),
+                    source_seqs: Vec::new(),
+                    mentions: Vec::new(),
+                }),
+            }
+        }
+        doc.paragraphs = new_paras;
+
+        // 脏段 mention 降级为 support-only
+        for (old_i, slot) in index_map.iter().enumerate() {
+            let Some((new_i, true)) = slot else { continue };
+            for m in &doc.paragraphs[*new_i].mentions {
+                if !m.id.is_empty() && !doc.graph_support_mentions.contains(&m.id) {
+                    doc.graph_support_mentions.push(m.id.clone());
+                }
+            }
+            let _ = old_i;
+        }
+        // 被删段的 mention 彻底消失:剪掉引用它们的关系与 support 残留
+        let alive: std::collections::HashSet<&str> = doc
+            .paragraphs
+            .iter()
+            .flat_map(|p| p.mentions.iter().map(|m| m.id.as_str()))
+            .collect();
+        doc.relations.retain(|r| {
+            r.subject_mentions
+                .iter()
+                .chain(r.object_mentions.iter())
+                .all(|id| alive.contains(id.as_str()))
+        });
+        doc.graph_support_mentions.retain(|id| alive.contains(id.as_str()));
+        // 证据重定位:落在被删/脏段上的丢弃,其余 paragraph_index 重映射
+        for rel in doc.relations.iter_mut() {
+            rel.evidence.retain_mut(|ev| match index_map.get(ev.paragraph_index).copied().flatten() {
+                Some((new_i, false)) => {
+                    ev.paragraph_index = new_i;
+                    true
+                }
+                _ => false,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(expected_revision.saturating_add(1))
+}
+
 /// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史修订稿
 /// 跟着变),person_id 经 redirects 归一到 winner。只改返回值,不落盘——与
 /// notes.rs join_person_names 同一哲学。库中无名/人已删除时保留段落原 name。
@@ -826,6 +938,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(), name: None, person_id: None,
                 start_ms: 0, end_ms: 1000, text: "灯塔计划启动".into(), source_seqs: vec![7],
@@ -899,6 +1012,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
@@ -994,6 +1108,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
         let back = load_refined(dir.path()).unwrap();
@@ -1063,6 +1178,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -1209,6 +1325,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留
@@ -1220,5 +1337,155 @@ mod tests {
         assert_eq!(doc.paragraphs[0].name.as_deref(), Some("张三"));
         assert_eq!(doc.paragraphs[1].name.as_deref(), Some("现场名"));
         assert_eq!(doc.paragraphs[2].name.as_deref(), Some("留名"));
+    }
+
+    fn editable_doc() -> RefinedDoc {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-30T00:00:00Z",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done", "entities": "done", "relations": "done" },
+            "discarded_seqs": [],
+            "revision": 3,
+            "entities": [{ "id": "P1", "kind": "person", "name": "张三" }],
+            "relations": [{
+                "id": "rel1",
+                "subject": "P1",
+                "predicate": { "type": "mentions" },
+                "object": "P1",
+                "subject_mentions": ["m1"],
+                "object_mentions": ["m1"],
+                "confidence": 0.9,
+                "evidence": [{ "id": "ev1", "paragraph_index": 0, "start": 0, "end": 2, "quote": "张三",
+                               "source_seqs": [1], "source_hash": "h" }]
+            }],
+            "paragraphs": [
+                { "speaker": "R1", "start_ms": 0, "end_ms": 1000, "text": "张三在发言", "source_seqs": [1],
+                  "mentions": [{ "id": "m1", "entity": "P1", "start": 0, "end": 2 }] },
+                { "speaker": "R2", "start_ms": 1000, "end_ms": 2000, "text": "第二段", "source_seqs": [2] }
+            ]
+        }))
+        .expect("fixture 反序列化失败")
+    }
+
+    fn payload(items: &[(Option<usize>, &str, bool)]) -> Vec<ParagraphPayload> {
+        items
+            .iter()
+            .map(|(i, t, d)| ParagraphPayload { orig_index: *i, text: t.to_string(), dirty: *d })
+            .collect()
+    }
+
+    #[test]
+    fn save_refined_rejects_revision_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let err = save_refined_paragraphs(&note, 999, &payload(&[(Some(0), "x", true)])).unwrap_err();
+        assert!(err.to_string().contains("revision"), "错误应指明版本冲突: {err}");
+    }
+
+    #[test]
+    fn save_refined_replaces_texts_and_bumps_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let rev = load_refined(&note).unwrap().revision; // 整写进位后的实际值
+        let new_rev = save_refined_paragraphs(
+            &note,
+            rev,
+            &payload(&[(Some(0), "张三在发言", false), (Some(1), "改过的第二段", true)]),
+        )
+        .unwrap();
+        assert_eq!(new_rev, rev + 1);
+        let doc = load_refined(&note).unwrap();
+        assert_eq!(doc.revision, new_rev);
+        assert_eq!(doc.paragraphs[1].text, "改过的第二段");
+        // 干净段保留 speaker/时间戳/mentions
+        assert_eq!(doc.paragraphs[0].speaker, "R1");
+        assert_eq!(doc.paragraphs[0].mentions.len(), 1);
+        assert!(doc.graph_support_mentions.is_empty());
+    }
+
+    #[test]
+    fn save_refined_dirty_paragraph_moves_mentions_to_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let rev = load_refined(&note).unwrap().revision;
+        save_refined_paragraphs(&note, rev, &payload(&[(Some(0), "改写了第一段", true), (Some(1), "第二段", false)]))
+            .unwrap();
+        let doc = load_refined(&note).unwrap();
+        // mention 仍在段上(图谱结构完整),但 id 进了 support 列表(UI/搜索不再当 live)
+        assert_eq!(doc.paragraphs[0].mentions.len(), 1);
+        assert!(doc.graph_support_mentions.contains(&"m1".to_string()));
+        // 证据偏移随脏段失效,但关系端点仍有 mention 支撑,关系保留
+        assert!(doc.relations[0].evidence.is_empty());
+        assert_eq!(doc.relations.len(), 1);
+    }
+
+    #[test]
+    fn save_refined_removed_paragraph_prunes_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let rev = load_refined(&note).unwrap().revision;
+        // 只保留第二段:第一段(含 m1)被删 → 引用 m1 的关系整条剪掉
+        save_refined_paragraphs(&note, rev, &payload(&[(Some(1), "第二段", false)])).unwrap();
+        let doc = load_refined(&note).unwrap();
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert!(doc.relations.is_empty());
+        assert!(doc.graph_support_mentions.is_empty());
+    }
+
+    #[test]
+    fn save_refined_new_block_gets_empty_speaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let rev = load_refined(&note).unwrap().revision;
+        save_refined_paragraphs(
+            &note,
+            rev,
+            &payload(&[(None, "## 会议纪要", true), (Some(0), "张三在发言", false), (Some(1), "第二段", false)]),
+        )
+        .unwrap();
+        let doc = load_refined(&note).unwrap();
+        assert_eq!(doc.paragraphs.len(), 3);
+        assert_eq!(doc.paragraphs[0].speaker, "");
+        assert_eq!(doc.paragraphs[0].text, "## 会议纪要");
+        assert!(doc.paragraphs[0].source_seqs.is_empty());
+        // 证据 paragraph_index 随原第 0 段后移一位
+        assert_eq!(doc.relations[0].evidence[0].paragraph_index, 1);
+    }
+
+    #[test]
+    fn save_refined_rejects_empty_text_and_bad_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        write_refined_atomic(&note, &editable_doc()).unwrap();
+        let rev = load_refined(&note).unwrap().revision;
+        assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(0), "  ", true)])).is_err());
+        assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(9), "x", true)])).is_err());
+        assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(0), "a", true), (Some(0), "b", true)])).is_err());
+    }
+
+    #[test]
+    fn write_refined_atomic_never_regresses_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        let mut doc = editable_doc();
+        doc.revision = 5;
+        write_refined_atomic(&note, &doc).unwrap();
+        // 管线重跑拿着旧内存 doc(revision 0)整写 → 落盘必须进位到 6,而不是回到 0
+        let mut stale = editable_doc();
+        stale.revision = 0;
+        write_refined_atomic(&note, &stale).unwrap();
+        assert_eq!(load_refined(&note).unwrap().revision, 6);
     }
 }

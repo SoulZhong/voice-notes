@@ -55,6 +55,7 @@ fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
         graph_extraction: None,
         relations: Vec::new(),
         graph_support_mentions: Vec::new(),
+        revision: 0,
         paragraphs: vec![RefinedParagraph {
             speaker: "R1".into(),
             name: None,

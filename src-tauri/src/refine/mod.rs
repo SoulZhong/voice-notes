@@ -298,6 +298,7 @@ pub fn run_local(
         graph_extraction: None,
         relations: vec![],
         graph_support_mentions: vec![],
+        revision: 0,
         paragraphs,
     };
     let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
@@ -750,6 +751,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
@@ -1537,6 +1539,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
@@ -1575,6 +1578,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
