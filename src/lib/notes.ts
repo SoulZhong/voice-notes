@@ -150,6 +150,10 @@ export interface RefinedDoc {
   graph_extraction?: GraphExtraction;
   /** Omitted by schema-v1 documents. */
   relations?: RelationFact[];
+  /** 用户编辑保存的乐观并发版本号;历史文档缺省 0(后端 serde default)。 */
+  revision?: number;
+  /** 仅供旧图谱关系保持结构完整的 mention id;不是 live mention,UI 必须过滤。 */
+  graph_support_mentions?: string[];
 }
 
 /** Required graph fields for schema-v2 writes; `RefinedDoc` remains permissive for legacy reads. */
@@ -387,3 +391,14 @@ export function speakerIdCompare(a: string, b: string): number {
   };
   return num(a) - num(b) || a.localeCompare(b);
 }
+
+/** save_refined 载荷段落:orig_index 指向载入时 doc.paragraphs 下标,null=用户新插入块。 */
+export interface ParagraphPayload {
+  orig_index: number | null;
+  text: string;
+  dirty: boolean;
+}
+
+/** 整篇保存精修稿(WYSIWYG 编辑),revision 乐观并发,返回新 revision。 */
+export const saveRefined = (noteId: string, revision: number, paragraphs: ParagraphPayload[]) =>
+  invoke<number>("save_refined", { noteId, revision, paragraphs });
