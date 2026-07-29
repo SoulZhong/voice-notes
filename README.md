@@ -48,6 +48,8 @@
 - macOS 系统声音使用 ScreenCaptureKit；Windows 系统声音使用 WASAPI loopback
 - Releases 提供 macOS arm64 与 Windows 10/11 x64 安装包
 - 磁盘空间：应用本体约 60MB，识别模型约 1GB（首次启动下载）
+- **后续更新一键完成**:装好之后发现新版时,应用内点「一键更新」即可下载安装并自动重启
+  (更新包经签名校验;首次安装仍需从 Release 手动下载)
 
 ### 安装步骤
 

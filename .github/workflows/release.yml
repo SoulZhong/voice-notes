@@ -1,0 +1,49 @@
+# 发布流水线:打 v* tag 自动构建两平台安装包 + updater 资产(.tar.gz/.exe + .sig +
+# latest.json),挂到 GitHub Release。一键更新(tauri-plugin-updater)依赖这里的产物:
+# latest.json 是 endpoint,.sig 由下方私钥签名、客户端用 tauri.conf 里的公钥校验。
+#
+# 必需 secrets(一次性配置,由维护者本机 `npm run tauri signer generate -- -w ~/.tauri/voice-notes.key`
+# 生成后录入,私钥不进仓库):
+#   TAURI_SIGNING_PRIVATE_KEY          私钥文件内容
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD 生成时设置的密码(未设则留空字符串)
+# 同时把生成的公钥写进 src-tauri/tauri.conf.json 的 plugins.updater.pubkey。
+#
+# releaseDraft: true —— 产物齐了人工点发布,给真机抽验留窗口;发布后 latest.json
+# 才会出现在 releases/latest 下,客户端一键更新随之生效。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "voice-notes ${{ github.ref_name }}"
+          releaseDraft: true

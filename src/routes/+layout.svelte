@@ -9,7 +9,7 @@
   import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { checkUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
+  import { checkUpdate, applyUpdate, updateProgressLabel, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
 
@@ -18,8 +18,27 @@
   // 升级提示放全局布局:app 启动落地页可能是笔记详情/录制/空态任一(见根路由重定向),
   // 布局却必挂载且跨路由常驻——查一次、有新版且未忽略就在内容区顶部出可关闭横幅。
   let update = $state<UpdateInfo | null>(null);
-  function openUpdate() {
-    if (update) openUrl(update.url);
+  // 一键更新态:进行中禁点、按钮显进度;失败退回「打开发布页」手动路径(文案联动)。
+  let updating = $state(false);
+  let updatingLabel = $state("更新中…");
+  let updateFailed = $state(false);
+  async function openUpdate() {
+    if (!update) return;
+    if (updateFailed) {
+      // 一键失败后本按钮降级为手动路径,绝不堵死更新。
+      openUrl(update.url);
+      return;
+    }
+    updating = true;
+    updatingLabel = "更新中…";
+    try {
+      const r = await applyUpdate((d, t) => (updatingLabel = updateProgressLabel(d, t)));
+      if (r === "none") updateFailed = true; // latest.json 未就绪等,退手动
+    } catch {
+      updateFailed = true;
+    } finally {
+      updating = false;
+    }
   }
   function dismissUpdateBanner() {
     if (update) dismissUpdate(update.latest);
@@ -76,7 +95,9 @@
     {#if update}
       <div class="update-banner">
         <span class="upd-dot"></span>发现新版 v{update.latest}(当前 v{update.current})
-        <button class="link" onclick={openUpdate}>查看更新</button>
+        <button class="link" onclick={openUpdate} disabled={updating}>
+          {updating ? updatingLabel : updateFailed ? "打开发布页" : "一键更新"}
+        </button>
         <button class="link" onclick={dismissUpdateBanner}>知道了</button>
       </div>
     {/if}
