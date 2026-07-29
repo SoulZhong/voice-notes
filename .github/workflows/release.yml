@@ -27,6 +27,9 @@ jobs:
       matrix:
         platform: [macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
+    # 签名密钥存放在 GitHub Environment「TAURI」——不声明 environment 时
+    # secrets.TAURI_SIGNING_* 解析为空,产物无签名,一键更新校验必失败。
+    environment: TAURI
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
