@@ -1032,10 +1032,11 @@ const CLOUD_BACKOFF_CAP_MS: u64 = 30_000;
 const CLOUD_BACKOFF_STABLE_MS: u64 = 5000;
 #[cfg(test)]
 const CLOUD_BACKOFF_STABLE_MS: u64 = 5;
-/// 停录后排干厂商剩余定稿的窗口(ms):厂商常在 finish 之后才吐最后一句。
+/// 停录后排干厂商剩余定稿的窗口(ms)。生产值是边界层的单一真源
+/// (`asr::cloud::CLOUD_DRAIN_MS`),适配层的内部排干预算据它收窄,防止两边错位丢句。
 /// 测试用短窗:mock 流在 finish 后即断开通道,排干靠断开结束,短窗只是兜底。
 #[cfg(not(test))]
-const CLOUD_DRAIN_MS: u64 = 3000;
+use crate::asr::cloud::CLOUD_DRAIN_MS;
 #[cfg(test)]
 const CLOUD_DRAIN_MS: u64 = 200;
 /// 主循环空闲 tick(ms):驱动 FinalSink 的 hold 到期检查,与本机 worker 同节奏。

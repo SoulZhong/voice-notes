@@ -4,6 +4,13 @@
 pub mod volcano;
 // pub mod aliyun;   // Task 9 解开
 
+/// 停录后会话 worker 排干厂商剩余定稿的窗口(ms):厂商常在 finish 之后才吐最后一句。
+///
+/// 放在边界层是为了单一真源:适配层内部的"末包后等收尾"预算必须严格小于它,
+/// 否则 (worker窗口, 适配层窗口] 这段区间里到达的尾段定稿虽然被适配层收下,
+/// worker 早已放弃接收 —— 结果是静默丢句。改这个值时,两侧一起动。
+pub const CLOUD_DRAIN_MS: u64 = 3000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudWord { pub text: String, pub start_ms: u64, pub end_ms: u64 }
 

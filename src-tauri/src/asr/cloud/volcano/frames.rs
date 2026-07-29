@@ -15,6 +15,8 @@ use crate::asr::cloud::{CloudWord, DefiniteUtterance};
 use anyhow::{anyhow, bail, Context};
 use std::io::Read;
 
+/// 注意 `bigmodel_async` 不是笔误:它是官方推荐的流式优化变体(下行更早吐定稿,
+/// 2026-07 文档核实),别"顺手"改回 `bigmodel`。
 pub const WS_URL: &str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async";
 pub const RESOURCE_ID_STREAM: &str = "volc.bigasr.sauc.duration";
 pub const FLASH_URL: &str = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash";

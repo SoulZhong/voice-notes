@@ -15,7 +15,9 @@
 
 pub mod frames;
 
-use crate::asr::cloud::{f32_to_pcm_s16le, CloudAsr, CloudEvent, CloudStream, DefiniteUtterance};
+use crate::asr::cloud::{
+    f32_to_pcm_s16le, CloudAsr, CloudEvent, CloudStream, DefiniteUtterance, CLOUD_DRAIN_MS,
+};
 use anyhow::{anyhow, bail, Context};
 use frames::{
     audio_frame, full_request_frame, full_request_json, parse_server_frame,
@@ -31,13 +33,21 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// 握手(TCP+TLS+WS upgrade+首帧配置)总上限。超时按"没开起来"处理,返回 Err,
 /// 由 worker 的退避重连接手——绝不能挂死在这里,worker 的主循环在等我们返回。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 预算必须短:open_stream 是同步的、阻塞 worker 主循环(期间所有源都不推进),
+/// 断网时靠 worker 的退避机制继续重试,不靠这里死等。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 末包发出后等服务端吐完收尾定稿的上限。厂商通常吐完即关连接,这只是防挂死的闸。
-const FINAL_DRAIN: Duration = Duration::from_secs(5);
-/// 待发队列积压上限(条)。一条 ≈ 一帧音频(worker 帧率即节奏,约 100ms),
-/// 64 条 ≈ 6s:超过说明连接实际已卡死,此时 push 报错让 worker 按断连处理
+/// 必须小于 worker 排干窗口,否则 (worker, adapter] 区间的尾段定稿被丢:我们还在
+/// 收,worker 已经不听了。故直接由 CLOUD_DRAIN_MS 收窄 500ms 派生,不写死第二个值。
+const FINAL_DRAIN: Duration = Duration::from_millis(CLOUD_DRAIN_MS.saturating_sub(500));
+/// 待发积压上限(样本数,16k 单声道)。设备回调链上来的一次 push 只有 10–21ms,
+/// 按条数计根本量不出时间,所以按样本算:16000×5 = 5s 音频。超过说明连接事实上
+/// 已不可用(TCP 发不出去/服务端不收),此时 push 报错让 worker 按断连处理
 /// (记缺口 → 重连 → 批式补识),比无限涨内存或阻塞主循环都好。
-const QUEUE_CAP: usize = 64;
+const QUEUE_CAP_SAMPLES: usize = 16000 * 5;
+/// 上行分包粒度(字节):3200 = 100ms @ 16k/s16le。火山建议 100–200ms 一包;
+/// 逐次 push(10–21ms)直发会把帧数放大近 10 倍,徒增帧头开销与服务端调度压力。
+const UPLINK_CHUNK_BYTES: usize = 3200;
 /// flash 批式请求超时:调用方按 ≤15s 切段,单请求给足余量但不无限等。
 const FLASH_TIMEOUT_S: u64 = 30;
 
@@ -122,9 +132,10 @@ impl CloudAsr for VolcanoAsr {
             })
             .context("起火山 WS 线程失败")?;
 
-        // 线程内已有 CONNECT_TIMEOUT 闸,这里再多给一点余量兜住线程调度抖动;
-        // recv_timeout 本身也不会永久阻塞 worker。
-        match ready_rx.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(2)) {
+        // 线程内已有 CONNECT_TIMEOUT 闸,这里再多给 1s 余量兜住线程调度抖动;
+        // recv_timeout 本身也不会永久阻塞 worker。同样按"短预算"原则:这条 recv
+        // 就是 worker 主循环的停顿时长。
+        match ready_rx.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1)) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => bail!("火山流未能建立: {e}"),
             Err(e) => bail!("火山流握手无响应: {e}"),
@@ -137,16 +148,22 @@ impl CloudAsr for VolcanoAsr {
                 if samples.is_empty() {
                     return Ok(());
                 }
-                if pending.load(Ordering::Relaxed) >= QUEUE_CAP {
-                    bail!("火山发送队列积压 ≥{QUEUE_CAP} 帧,按断连处理");
+                if pending.load(Ordering::Relaxed) >= QUEUE_CAP_SAMPLES {
+                    bail!(
+                        "火山待发音频积压 ≥{}s,按断连处理",
+                        QUEUE_CAP_SAMPLES / 16000
+                    );
                 }
                 // f32→PCM 在调用方线程做:转换是纯算术(比 memcpy 贵不了多少),
                 // 换来跨线程只搬一份紧凑字节,也让 WS 线程只管协议。
                 let pcm = f32_to_pcm_s16le(samples);
-                pending.fetch_add(1, Ordering::Relaxed);
-                audio_tx
-                    .send(Ctl::Audio(pcm))
-                    .map_err(|_| anyhow!("火山流已关闭,推流失败"))
+                let n = samples.len();
+                pending.fetch_add(n, Ordering::Relaxed);
+                audio_tx.send(Ctl::Audio(pcm)).map_err(|_| {
+                    // 没进队列就不算积压:失败路径回滚计数,别让死流的残值污染语义。
+                    pending.fetch_sub(n, Ordering::Relaxed);
+                    anyhow!("火山流已关闭,推流失败")
+                })
             }),
             finish: Box::new(move || {
                 // 只入队,不等排干:worker 是逐源串行调 finish 的,在这里阻塞会把
@@ -181,7 +198,7 @@ impl CloudAsr for VolcanoAsr {
             },
         });
 
-        let resp = ureq::post(FLASH_URL)
+        let resp = match ureq::post(FLASH_URL)
             .timeout(Duration::from_secs(FLASH_TIMEOUT_S))
             .set("X-Api-App-Key", &self.app_key)
             .set("X-Api-Access-Key", &self.access_key)
@@ -190,37 +207,77 @@ impl CloudAsr for VolcanoAsr {
             .set("X-Api-Sequence", "-1")
             .set("content-type", "application/json")
             .send_string(&body.to_string())
-            .context("火山 flash 请求失败")?;
+        {
+            Ok(resp) => resp,
+            // 非 2xx:火山把业务错误说明(鉴权/配额/参数)放在响应体里,只报状态码
+            // 等于把唯一有用的信息扔掉。
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                bail!("火山 flash HTTP {code}: {}", head_of(&body));
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("火山 flash 请求失败")),
+        };
 
         // 业务码在头里,HTTP 恒 200:先验码再解 JSON,否则失败会被当成静音。
-        if let Some(code) = resp.header("X-Api-Status-Code") {
-            if code != FLASH_STATUS_OK {
-                let msg = resp.header("X-Api-Message").unwrap_or_default().to_string();
-                bail!("火山 flash 返回业务错误 {code}: {msg}");
-            }
-        }
+        let status = resp.header("X-Api-Status-Code").map(|s| s.to_string());
+        let api_msg = resp.header("X-Api-Message").unwrap_or_default().to_string();
         let text = resp.into_string().context("读火山 flash 响应体失败")?;
+        match status.as_deref() {
+            // 头都没有 = 响应根本不是我们认识的那个接口的形状(网关拦截页/重定向/
+            // 改版)。这种情况下解出来的"没文本"绝不能当静音上报,否则整段音频
+            // 被判定为无人说话而永久丢失。
+            None => bail!("火山 flash 响应缺 X-Api-Status-Code 头: {}", head_of(&text)),
+            Some(code) if code != FLASH_STATUS_OK => {
+                bail!("火山 flash 返回业务错误 {code}: {api_msg}")
+            }
+            Some(_) => {}
+        }
         let json: serde_json::Value =
             serde_json::from_str(&text).context("解析火山 flash 响应 JSON 失败")?;
 
         let (interim, defs) = utterances_from_response(&json);
-        if !defs.is_empty() {
-            return Ok(defs);
-        }
-        // 兜底:批式接口的 utterances 未必带 definite 标记(流式才需要"还会改写"这个
-        // 概念),这时整段文本本身就是定稿。退化成一条覆盖 [0, 段长] 的 utterance,
-        // 与阿里批式的偏差处理同形(spec §2.1),调用方叠加段偏移即可。
-        let text = interim.unwrap_or_default();
-        if text.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(vec![DefiniteUtterance {
-            text,
-            start_ms: 0,
-            end_ms: (samples.len() as u64) * 1000 / 16000,
-            words: Vec::new(),
-            lang: String::new(),
-        }])
+        flash_utterances(interim, defs, (samples.len() as u64) * 1000 / 16000)
+    }
+}
+
+/// flash 响应的"有话/没话/形状不对"三分决策(纯函数,便于单测)。
+///
+/// 关键区分:`interim: None` 表示 `result.text` 字段整个不存在——即响应形状不符,
+/// 必须报错走上层重试/记缺口;`Some("")` 才是厂商明确表示"这段没人说话"。
+/// 把前者折叠成后者,等于用一次静默的数据丢失换一次安静的日志。
+fn flash_utterances(
+    interim: Option<String>,
+    defs: Vec<DefiniteUtterance>,
+    samples_ms: u64,
+) -> anyhow::Result<Vec<DefiniteUtterance>> {
+    if !defs.is_empty() {
+        return Ok(defs);
+    }
+    let Some(text) = interim else {
+        bail!("火山 flash 响应无 result.text 字段且无分句,形状不符,不按静音处理");
+    };
+    // 兜底:批式接口的 utterances 未必带 definite 标记(流式才需要"还会改写"这个
+    // 概念),这时整段文本本身就是定稿。退化成一条覆盖 [0, 段长] 的 utterance,
+    // 与阿里批式的偏差处理同形(spec §2.1),调用方叠加段偏移即可。
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![DefiniteUtterance {
+        text,
+        start_ms: 0,
+        end_ms: samples_ms,
+        words: Vec::new(),
+        lang: String::new(),
+    }])
+}
+
+/// 报错时截取响应体开头,够定位问题又不至于把整页 HTML 灌进日志。按字符边界切,
+/// 免得中文错误说明被切成非法 UTF-8。
+fn head_of(body: &str) -> String {
+    const MAX: usize = 200;
+    match body.char_indices().nth(MAX) {
+        None => body.to_string(),
+        Some((i, _)) => format!("{}…", &body[..i]),
     }
 }
 
@@ -267,18 +324,26 @@ async fn run_session(
     pending: Arc<AtomicUsize>,
 ) {
     let (mut sink, mut stream) = ws.split();
+    // 上行聚合缓冲:push 的粒度由设备回调链决定(10–21ms),这里攒够
+    // UPLINK_CHUNK_BYTES 再发,避免一次 push 一帧的碎包。
+    let mut uplink = Vec::with_capacity(UPLINK_CHUNK_BYTES * 2);
     loop {
         tokio::select! {
             ctl = ctl_rx.recv() => match ctl {
                 Some(Ctl::Audio(pcm)) => {
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(e) = sink.send(Message::binary(audio_frame(&pcm, false))).await {
-                        let _ = ev_tx.send(CloudEvent::Closed { error: Some(format!("音频帧发送失败: {e}")) });
-                        return;
+                    pending.fetch_sub(pcm.len() / 2, Ordering::Relaxed);
+                    uplink.extend_from_slice(&pcm);
+                    if uplink.len() >= UPLINK_CHUNK_BYTES {
+                        let frame = audio_frame(&uplink, false);
+                        uplink.clear();
+                        if let Err(e) = sink.send(Message::binary(frame)).await {
+                            let _ = ev_tx.send(CloudEvent::Closed { error: Some(format!("音频帧发送失败: {e}")) });
+                            return;
+                        }
                     }
                 }
                 Some(Ctl::Finish) => {
-                    finish_and_drain(sink, stream, &ev_tx).await;
+                    finish_and_drain(sink, stream, &ev_tx, &uplink).await;
                     return;
                 }
                 // 两个发送端都没了 = CloudStream 整个被丢弃却没调 finish(worker 侧
@@ -294,7 +359,10 @@ async fn run_session(
                     match parse_server_frame(&bytes) {
                         Ok(ServerFrame::Response { json, .. }) => {
                             if !emit_response(&json, &ev_tx) {
-                                return; // 上游不再收事件:收摊,别把线程和连接漏着
+                                // 上游不再收事件:收摊,别把线程和连接漏着。
+                                // 与"上游丢流"路径同形,先给对端一个 Close 再走。
+                                let _ = sink.send(Message::Close(None)).await;
+                                return;
                             }
                         }
                         Ok(ServerFrame::Error { code, msg }) => {
@@ -331,7 +399,17 @@ async fn finish_and_drain(
     mut sink: futures_util::stream::SplitSink<WsStream, Message>,
     mut stream: futures_util::stream::SplitStream<WsStream>,
     ev_tx: &crossbeam_channel::Sender<CloudEvent>,
+    tail: &[u8],
 ) {
+    // 聚合缓冲里的余音必须先于末包发出:末包一到服务端就收尾,晚发等于截掉句尾。
+    if !tail.is_empty() {
+        if let Err(e) = sink.send(Message::binary(audio_frame(tail, false))).await {
+            let _ = ev_tx.send(CloudEvent::Closed {
+                error: Some(format!("尾部音频发送失败: {e}")),
+            });
+            return;
+        }
+    }
     if let Err(e) = sink.send(Message::binary(audio_frame(&[], true))).await {
         let _ = ev_tx.send(CloudEvent::Closed {
             error: Some(format!("末包发送失败: {e}")),
@@ -355,7 +433,12 @@ async fn finish_and_drain(
                 },
                 Ok(Message::Close(_)) => return None,
                 Ok(_) => {}
-                Err(_) => return None,
+                // 末包已发出,读错不改变关闭语义(仍是 None),但别把原因吞了:
+                // 收尾阶段的 IO 错是排查"最后一句没出来"的第一现场。
+                Err(e) => {
+                    eprintln!("火山收尾读错误: {e}");
+                    return None;
+                }
             }
         }
         None
@@ -434,6 +517,71 @@ mod tests {
         assert_eq!(wav.len(), 44 + 2 * 100, "s16 单声道 WAV = 44 字节头 + 2n");
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
+    }
+
+    #[test]
+    fn adapter_drain_budget_stays_inside_worker_drain_window() {
+        // 适配层排干必须严格短于 worker 的窗口,否则尾段定稿在"我们还在收、worker
+        // 已放弃"的区间里被静默丢弃(改任一常数时这条会先炸)。
+        assert!(
+            (FINAL_DRAIN.as_millis() as u64) < CLOUD_DRAIN_MS,
+            "FINAL_DRAIN({}ms) 必须 < CLOUD_DRAIN_MS({CLOUD_DRAIN_MS}ms)",
+            FINAL_DRAIN.as_millis()
+        );
+        assert!(FINAL_DRAIN.as_millis() > 0, "排干窗口不能被收窄成 0");
+    }
+
+    #[test]
+    fn uplink_chunk_is_100ms_of_16k_s16le() {
+        assert_eq!(UPLINK_CHUNK_BYTES, 16000 / 10 * 2);
+        assert_eq!(QUEUE_CAP_SAMPLES / 16000, 5, "积压闸 = 5s 音频");
+    }
+
+    #[test]
+    fn flash_prefers_definite_utterances_when_present() {
+        let d = DefiniteUtterance {
+            text: "你好".into(),
+            start_ms: 0,
+            end_ms: 700,
+            words: vec![],
+            lang: String::new(),
+        };
+        let out = flash_utterances(Some("你好世界".into()), vec![d.clone()], 5000).unwrap();
+        assert_eq!(out, vec![d], "有分句就用分句,不被整体文本覆盖");
+    }
+
+    #[test]
+    fn flash_falls_back_to_whole_text_when_no_definite_flag() {
+        let out = flash_utterances(Some("你好".into()), Vec::new(), 5000).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "你好");
+        assert_eq!(out[0].end_ms, 5000, "退化条覆盖整段");
+    }
+
+    #[test]
+    fn flash_empty_text_field_is_genuine_silence() {
+        // 字段在、内容空 = 厂商明确说"没人说话",这才允许静默返回空。
+        assert!(flash_utterances(Some(String::new()), Vec::new(), 5000)
+            .unwrap()
+            .is_empty());
+        assert!(flash_utterances(Some("  ".into()), Vec::new(), 5000)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn flash_missing_text_field_bails_instead_of_reporting_silence() {
+        // 字段整个缺失 = 响应形状不符,必须报错,不能折叠成静音把音频丢掉。
+        assert!(flash_utterances(None, Vec::new(), 5000).is_err());
+    }
+
+    #[test]
+    fn head_of_truncates_on_char_boundary() {
+        let long: String = "错".repeat(500);
+        let h = head_of(&long);
+        assert!(h.ends_with('…'));
+        assert_eq!(h.chars().count(), 201);
+        assert_eq!(head_of("短"), "短", "短体原样返回");
     }
 
     #[test]
