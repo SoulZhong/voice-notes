@@ -238,7 +238,11 @@
               name="welcome-cloudprovider"
               value="volcano"
               bind:group={cloudProvider}
-              onchange={() => (cloudTestResult = null)}
+              onchange={() => {
+                // 凭证一经改动,上次测试结果即作废,须重测才能完成
+                cloudTestResult = null;
+                cloudTestPassed = false;
+              }}
             />火山引擎
           </label>
           <label class="seg-item">
@@ -247,7 +251,10 @@
               name="welcome-cloudprovider"
               value="aliyun"
               bind:group={cloudProvider}
-              onchange={() => (cloudTestResult = null)}
+              onchange={() => {
+                cloudTestResult = null;
+                cloudTestPassed = false;
+              }}
             />阿里云
           </label>
         </div>
@@ -258,7 +265,10 @@
               class="row-input"
               placeholder="火山引擎语音技术控制台的 App ID"
               bind:value={volcAppKey}
-              oninput={() => (cloudTestResult = null)}
+              oninput={() => {
+                cloudTestResult = null;
+                cloudTestPassed = false;
+              }}
             />
           </label>
           <label class="field">
@@ -268,7 +278,10 @@
               type="password"
               placeholder="Access Token"
               bind:value={volcAccessKey}
-              oninput={() => (cloudTestResult = null)}
+              oninput={() => {
+                cloudTestResult = null;
+                cloudTestPassed = false;
+              }}
             />
           </label>
         {:else}
@@ -279,7 +292,10 @@
               type="password"
               placeholder="DashScope API Key"
               bind:value={dashKey}
-              oninput={() => (cloudTestResult = null)}
+              oninput={() => {
+                cloudTestResult = null;
+                cloudTestPassed = false;
+              }}
             />
           </label>
         {/if}
