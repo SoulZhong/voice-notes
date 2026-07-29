@@ -173,11 +173,11 @@ fn set_menu_on_main(app: &AppHandle, recording: bool) {
 
 // —— 图标动画：仅录制中逐帧循环抖动，停止即静止 —— //
 
-/// 「活跃」= 会话正在录制。**只看录制**：停止录制通常紧接自动 Aing，若把 Aing 也算
-/// 活跃，抖动会一路延续到 Aing 结束——用户按了停止却还在抖，读起来像「没停下」。
-/// 故停录（会话离开 Recording）即停回静止 Logo，Aing 在后台安静进行、不再驱动图标。
+/// 「活跃」= 会话正在录制**且未暂停**。停录/暂停都静止:停止后继续抖读起来像
+/// 「没停下」(Aing 不驱动图标),暂停后继续抖读起来像「没暂停成」——图标动画的
+/// 语义就是"正在记",不在记就不该动。恢复录制经状态边沿重新起动画。
 fn is_active(s: &LifecycleState) -> bool {
-    matches!(s.session, SessionState::Recording { .. })
+    matches!(s.session, SessionState::Recording { paused: false, .. })
 }
 
 /// 内核状态提交后由 actor 调用（见 actor.rs 提交点）：按活跃度**边沿**驱动图标动画。
@@ -261,6 +261,18 @@ pub fn apply_enabled(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 动画活跃判定:录制中才动,暂停/空闲/停止都静止。暂停时若继续抖动,
+    /// 读起来像「没暂停成」——与停录即静止同一条产品理由(2026-07-29 冒烟反馈)。
+    #[test]
+    fn animation_active_only_while_recording_unpaused() {
+        let mut s = LifecycleState::init();
+        assert!(!is_active(&s), "空闲不动");
+        s.session = SessionState::Recording { note_id: "n".into(), paused: false };
+        assert!(is_active(&s), "录制中要动");
+        s.session = SessionState::Recording { note_id: "n".into(), paused: true };
+        assert!(!is_active(&s), "暂停即静止");
+    }
 
     /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。
     /// 为什么存在:PR#57 的图标流水线曾把 7 张帧 PNG 覆盖成 App 图标的近似副本,
