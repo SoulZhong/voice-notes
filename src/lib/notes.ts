@@ -219,9 +219,44 @@ export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
 export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
-/** 返回导出文件绝对路径。preferRefined=真且修订稿在盘时导修订稿(所见即所得)。 */
-export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean) =>
-  invoke<string>("export_note", { id, format, preferRefined });
+/** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
+ * 在盘时导修订稿(所见即所得)。 */
+export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string) =>
+  invoke<string>("export_note", { id, format, preferRefined, dest });
+
+/** 保存对话框的默认文件名:{标题}-{YYYYMMDD-HHmm}.md。
+ * 时间直接取 started_at 字符串的墙钟分量(不经 Date):录音的"名义时间"就是写进
+ * ISO 串的本地时间,经 Date 换算会随导出机器时区漂移;解析失败则省略时间段。
+ * 标题清洗:路径非法字符(/\:*?"<>|)换 '-',控制字符与双向覆盖符(文件名视觉
+ * 欺骗)删除,首部点(隐藏文件)与尾部点/空白(Windows 不允许)剥掉;标题截到
+ * 160 字节 UTF-8 边界(文件系统文件名上限 255 字节,给时间段+扩展名留量,超长
+ * CJK 标题不截会让保存对话框直接拒收);Windows 保留设备名(CON/PRN/…)加尾缀
+ * 避让;清洗后无实义字符兜底「未命名」。 */
+export function exportFileName(title: string, startedAt: string): string {
+  let clean = title
+    .replace(/[/\\:*?"<>|]/g, "-")
+    .replace(/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+    .trim()
+    .replace(/^\.+|[.\s]+$/g, "");
+  const enc = new TextEncoder();
+  if (enc.encode(clean).length > 160) {
+    let bytes = 0;
+    let cut = 0;
+    for (const ch of clean) {
+      const b = enc.encode(ch).length;
+      if (bytes + b > 160) break;
+      bytes += b;
+      cut += ch.length;
+    }
+    clean = clean.slice(0, cut);
+  }
+  if (!/[^-\s]/.test(clean)) clean = "未命名";
+  const m = startedAt.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  const time = m ? `-${m[1]}${m[2]}${m[3]}-${m[4]}${m[5]}` : "";
+  let stem = `${clean}${time}`;
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) stem += "_";
+  return `${stem}.md`;
+}
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
 /** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
