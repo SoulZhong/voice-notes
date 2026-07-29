@@ -130,9 +130,6 @@ pub struct Settings {
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
     #[serde(default)]
     pub mcp_onboarded: bool,
-    /// 匿名使用统计:仅上报功能使用计数与版本信息,绝不含会议内容;默认开,设置页可关。
-    #[serde(default = "default_true")]
-    pub telemetry_enabled: bool,
 }
 
 fn default_prefix() -> String {
@@ -216,7 +213,6 @@ impl Default for Settings {
             completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
-            telemetry_enabled: true,
         }
     }
 }
@@ -526,21 +522,16 @@ mod tests {
         assert_eq!(load(tmp.path()).asr_provider, "coreml");
     }
 
+    /// 遥测改为无开关常开(2026-07-29 产品决策):历史 settings.json 可能残留
+    /// telemetry_enabled 键(含显式 false),反序列化必须静默忽略而非报错。
     #[test]
-    fn telemetry_default_on_and_roundtrip() {
-        // 新装默认开
-        assert!(Settings::default().telemetry_enabled);
-        // 显式关闭可往返
-        let mut s = Settings::default();
-        s.telemetry_enabled = false;
-        let json = serde_json::to_string(&s).unwrap();
-        let back: Settings = serde_json::from_str(&json).unwrap();
-        assert!(!back.telemetry_enabled);
-        // 旧配置文件(无此键)反序列化默认开
+    fn legacy_telemetry_key_is_ignored() {
+        let json = serde_json::to_string(&Settings::default()).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        v.as_object_mut().unwrap().remove("telemetry_enabled");
-        let old: Settings = serde_json::from_value(v).unwrap();
-        assert!(old.telemetry_enabled);
+        v.as_object_mut()
+            .unwrap()
+            .insert("telemetry_enabled".into(), serde_json::Value::Bool(false));
+        assert!(serde_json::from_value::<Settings>(v).is_ok());
     }
 
     #[test]

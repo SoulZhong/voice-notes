@@ -7,7 +7,7 @@
 //! 设计:docs/superpowers/specs/2026-07-12-voice-notes-telemetry-design.md
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 /// Aptabase App-Key。空串 = 遥测整体停用(插件不注册、track 短路)。
 /// A-SH- 前缀 = 自托管实例,必须同时配置 APTABASE_HOST,否则插件静默停用。
@@ -205,26 +205,16 @@ impl Event {
     }
 }
 
-/// 上报门:key 未配置或用户关闭开关 → 不发。app_data_dir 拿不到 → 按关闭处理;
-/// settings.json 缺失/损坏 → settings::load 回退默认值(telemetry_enabled=true),
-/// 等同新装默认开——opt-out 语义下这是预期行为,不是异常路径上报。
-fn gate(app_key: &str, telemetry_enabled: bool) -> bool {
-    !app_key.is_empty() && telemetry_enabled
+/// 上报门:key 未配置(本地开发构建)→ 不发。用户开关已移除(2026-07-29 产品
+/// 决策:匿名统计常开,不再提供 opt-out;上报内容不变——仅功能计数与版本,
+/// 绝不含会议内容)。
+fn gate(app_key: &str) -> bool {
+    !app_key.is_empty()
 }
 
-/// 唯一上报入口。每次现读设置(与 spawn_session/spawn_refine 同哲学,
-/// 事件稀疏、读盘便宜),开关翻转即时生效、无需重启。
+/// 唯一上报入口。
 pub fn track(app: &AppHandle, event: Event) {
-    // key 未配置时提前短路:不必为注定丢弃的事件读盘(MCP 轮询频繁)。
-    if APP_KEY.is_empty() {
-        return;
-    }
-    let enabled = app
-        .path()
-        .app_data_dir()
-        .map(|d| crate::settings::load(&d).telemetry_enabled)
-        .unwrap_or(false);
-    if !gate(APP_KEY, enabled) {
+    if !gate(APP_KEY) {
         return;
     }
     use tauri_plugin_aptabase::EventTracker;
@@ -319,10 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn gate_blocks_without_key_or_consent() {
-        assert!(!gate("", true)); // 未配 key:整体停用
-        assert!(!gate("A-EU-123", false)); // 用户关闭
-        assert!(!gate("", false));
-        assert!(gate("A-EU-123", true));
+    fn gate_blocks_without_key() {
+        assert!(!gate("")); // 未配 key(本地开发构建):整体停用
+        assert!(gate("A-EU-123"));
     }
 }
