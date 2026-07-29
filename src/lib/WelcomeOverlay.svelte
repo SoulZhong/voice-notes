@@ -7,6 +7,8 @@
     modelsStatus,
     getSettings,
     setSettings,
+    downloadModels,
+    testCloudAsr,
     type ModelsStatus,
   } from "$lib/models";
   import { mcpAgentsStatus, mcpRegister, type AgentStatus, type RegisterOutcome } from "$lib/mcp";
@@ -25,10 +27,22 @@
   // svelte-ignore state_referenced_locally
   let current = $state(status);
 
-  // 相位:download(模型下载) → learn(先理解 AI 能力) → connect(选择接入方式) → 结束。
+  // 相位:choose(本地/云端分支) → download(模型下载,本地分支)/cloud-setup(云端凭证,云端分支)
+  //   → learn(先理解 AI 能力) → connect(选择接入方式) → 结束。
   // 即使没检测到 Agent 也展示 connect:「没安装」本身需要可行动的下一步,不能静默跳过。
   // svelte-ignore state_referenced_locally
-  let phase = $state<"download" | "learn" | "connect">(status.recording_ready ? "learn" : "download");
+  let phase = $state<"choose" | "download" | "cloud-setup" | "learn" | "connect">(
+    status.recording_ready ? "learn" : "choose",
+  );
+  // —— 云端识别引导(cloud-setup 相位)本地绑定,逻辑照搬设置页「识别方式」区 ——
+  let cloudProvider = $state<"volcano" | "aliyun">("volcano");
+  let volcAppKey = $state("");
+  let volcAccessKey = $state("");
+  let dashKey = $state("");
+  let testingCloud = $state(false);
+  let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
+  // 「完成」按钮门闩:必须先测试成功一次,防止凭证打错却直接进入下载/录制。
+  let cloudTestPassed = $state(false);
   let agents = $state<AgentStatus[]>([]);
   let picked = $state<Record<string, boolean>>({});
   let outcomes = $state<RegisterOutcome[] | null>(null);
@@ -74,6 +88,60 @@
       /* 基础状态下次可幂等补写；不阻断进入真实操作页 */
     }
     onDone("/ai?guide=ai-tools-v1");
+  }
+
+  function backToChoose() {
+    phase = "choose";
+    cloudTestResult = null;
+    cloudTestPassed = false;
+  }
+
+  /** 落盘厂商+凭证:testCloudAsr 读的是持久化 settings,测试前必须先写入。 */
+  async function saveCloudCreds() {
+    const s = await getSettings();
+    s.cloud_asr_provider = cloudProvider;
+    s.volc_app_key = volcAppKey;
+    s.volc_access_key = volcAccessKey;
+    s.dashscope_api_key = dashKey;
+    await setSettings(s);
+  }
+
+  async function doTestCloud() {
+    testingCloud = true;
+    cloudTestResult = null;
+    cloudTestPassed = false;
+    try {
+      await saveCloudCreds();
+      cloudTestResult = { ok: true, msg: await testCloudAsr() };
+      cloudTestPassed = true;
+    } catch (e) {
+      cloudTestResult = { ok: false, msg: String(e) };
+    } finally {
+      testingCloud = false;
+    }
+  }
+
+  /** 测试通过后「完成」:切到云端模式落盘,只下载云端模式所需的 vad+speaker,再走既有下载态。 */
+  async function completeCloudSetup() {
+    if (!cloudTestPassed) return;
+    try {
+      const s = await getSettings();
+      s.asr_mode = "cloud";
+      s.cloud_asr_provider = cloudProvider;
+      s.volc_app_key = volcAppKey;
+      s.volc_access_key = volcAccessKey;
+      s.dashscope_api_key = dashKey;
+      await setSettings(s);
+    } catch {
+      /* 落盘失败仍进入下载态,用户可在设置页补救;凭证已在测试时保存过一次 */
+    }
+    phase = "download";
+    try {
+      await downloadModels(["vad", "speaker"]);
+    } catch {
+      /* "下载已在进行中" 等非致命错误:沿用 ModelDownloadCard 的进度事件即可 */
+    }
+    await refresh();
   }
 
   async function showConnect() {
@@ -130,17 +198,106 @@
     </div>
 
     <div class="steps" aria-label="新手引导进度">
-      <span class:active={phase === "download"} class:done={phase !== "download"}>准备</span>
+      <span
+        class:active={phase === "choose" || phase === "download" || phase === "cloud-setup"}
+        class:done={phase === "learn" || phase === "connect"}>准备</span
+      >
       <i></i>
       <span class:active={phase === "learn"} class:done={phase === "connect"}>认识 AI</span>
       <i></i>
       <span class:active={phase === "connect"}>接入工具</span>
     </div>
 
-    {#if phase === "download"}
+    {#if phase === "choose"}
+      <div class="choose">
+        <h2>选择识别方式</h2>
+        <div class="choice-cards">
+          <button type="button" class="choice-card" onclick={() => (phase = "download")}>
+            <strong>本地识别 · 隐私优先</strong>
+            <p>识别在本机完成，数据不出设备；需下载模型约 1GB。</p>
+          </button>
+          <button type="button" class="choice-card" onclick={() => (phase = "cloud-setup")}>
+            <strong>云端识别 · 更准更快</strong>
+            <p>火山引擎 / 阿里云实时识别；录音音频将实时上传至所选厂商；需 API Key。</p>
+          </button>
+        </div>
+        <p class="hints">以后可随时在设置中更改。</p>
+      </div>
+    {:else if phase === "download"}
       <ModelDownloadCard status={current} onComplete={refresh} primaryLabel="开 始 使 用" />
       <p class="hints">首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。</p>
       <p class="hints">已开启匿名使用统计（仅功能使用次数与版本，绝不含会议内容），可在设置中关闭。</p>
+    {:else if phase === "cloud-setup"}
+      <div class="cloud-setup">
+        <h2>配置云端识别</h2>
+        <p class="hints">录音音频将实时上传至所选厂商；凭证只保存在本机。</p>
+        <div class="seg">
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="welcome-cloudprovider"
+              value="volcano"
+              bind:group={cloudProvider}
+              onchange={() => (cloudTestResult = null)}
+            />火山引擎
+          </label>
+          <label class="seg-item">
+            <input
+              type="radio"
+              name="welcome-cloudprovider"
+              value="aliyun"
+              bind:group={cloudProvider}
+              onchange={() => (cloudTestResult = null)}
+            />阿里云
+          </label>
+        </div>
+        {#if cloudProvider === "volcano"}
+          <label class="field">
+            <span>APP ID</span>
+            <input
+              class="row-input"
+              placeholder="火山引擎语音技术控制台的 App ID"
+              bind:value={volcAppKey}
+              oninput={() => (cloudTestResult = null)}
+            />
+          </label>
+          <label class="field">
+            <span>Access Token</span>
+            <input
+              class="row-input"
+              type="password"
+              placeholder="Access Token"
+              bind:value={volcAccessKey}
+              oninput={() => (cloudTestResult = null)}
+            />
+          </label>
+        {:else}
+          <label class="field">
+            <span>API Key</span>
+            <input
+              class="row-input"
+              type="password"
+              placeholder="DashScope API Key"
+              bind:value={dashKey}
+              oninput={() => (cloudTestResult = null)}
+            />
+          </label>
+        {/if}
+        {#if cloudTestResult}
+          <p class="test-result" class:ok={cloudTestResult.ok} class:bad={!cloudTestResult.ok}>
+            {cloudTestResult.ok ? `测试成功（${cloudTestResult.msg}）` : `测试失败：${cloudTestResult.msg}`}
+          </p>
+        {/if}
+        <div class="connect-actions">
+          <button class="btn-primary" disabled={testingCloud} onclick={doTestCloud}>
+            {testingCloud ? "测试中…" : "测试连接"}
+          </button>
+          <button class="btn-primary" disabled={!cloudTestPassed} onclick={completeCloudSetup}>完成</button>
+        </div>
+        <div class="foot">
+          <button type="button" class="link" onclick={backToChoose}>← 返回</button>
+        </div>
+      </div>
     {:else if phase === "learn"}
       <div class="learn">
         <h2>一份录音，三种 AI 用法</h2>
@@ -200,7 +357,7 @@
     {/if}
 
     <div class="foot">
-      {#if phase === "download"}<button class="link" onclick={advanced}>高级设置 →</button>{/if}
+      {#if phase === "choose" || phase === "download"}<button class="link" onclick={advanced}>高级设置 →</button>{/if}
     </div>
   </div>
 </div>
@@ -290,7 +447,44 @@
     background: var(--surface-soft);
   }
   .connect { text-align: left; }
-  .connect h2, .learn h2 { margin: 0 0 0.4rem; font-size: 1.1rem; text-align: center; }
+  .connect h2, .learn h2, .choose h2, .cloud-setup h2 { margin: 0 0 0.4rem; font-size: 1.1rem; text-align: center; }
+  /* choose:两张等宽卡片,复用 prompt-example 的 surface 底色语言 */
+  .choice-cards { display: grid; gap: 0.7rem; margin: 1rem 0 0.6rem; }
+  .choice-card {
+    text-align: left;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    padding: 0.85rem 1rem;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+  }
+  .choice-card:hover { background: var(--surface-soft); border-color: var(--hairline-strong); }
+  .choice-card strong { display: block; font-size: 0.94rem; font-weight: 600; }
+  .choice-card p { margin: 0.3rem 0 0; color: var(--ink-secondary); font-size: 0.82rem; line-height: 1.5; }
+  /* cloud-setup:凭证输入,样式照搬设置页「识别方式」区(seg/row-input/mtest-*) */
+  .cloud-setup .seg { display: flex; gap: 2px; background: var(--surface-press); border-radius: var(--radius-md); padding: 2px; margin: 1rem 0 0; }
+  .cloud-setup .seg-item {
+    position: relative; flex: 1; text-align: center;
+    padding: 0.32em 0.7em; font-size: 0.85rem; font-weight: 500;
+    color: var(--ink-secondary); border-radius: calc(var(--radius-md) - 2px); cursor: pointer;
+  }
+  .cloud-setup .seg-item:hover { color: var(--ink); }
+  .cloud-setup .seg-item:has(input:checked) { background: var(--canvas); color: var(--ink); box-shadow: var(--shadow-btn); }
+  .cloud-setup .seg-item input { position: absolute; opacity: 0; pointer-events: none; }
+  .field { display: block; margin: 0.7rem 0 0; }
+  .field span { display: block; font-size: 0.8rem; color: var(--ink-secondary); margin-bottom: 0.3rem; }
+  .row-input {
+    width: 100%; box-sizing: border-box;
+    padding: 0.42em 0.65em; border: none; border-radius: var(--radius-md);
+    background: var(--surface-press); color: var(--ink); font-size: 0.9rem;
+  }
+  .row-input:focus { outline: none; background: var(--canvas); box-shadow: 0 0 0 1px var(--accent); }
+  .row-input::placeholder { color: var(--ink-faint); }
+  .test-result { font-size: 0.82rem; margin: 0.7rem 0 0; text-align: center; }
+  .test-result.ok { color: var(--success); }
+  .test-result.bad { color: var(--danger-ink); }
   .ability-list { margin: 1rem 0; border-top: 1px solid var(--hairline); }
   .ability {
     display: grid; grid-template-columns: 2rem 1fr; gap: 0.55rem;
