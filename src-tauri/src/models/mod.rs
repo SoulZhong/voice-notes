@@ -365,6 +365,12 @@ pub fn status_for(asr_model: &str, cloud_mode: bool, creds_ok: bool) -> ModelsSt
 mod tests {
     use super::*;
 
+    /// root() 读 MODELS_OVERRIDE/VN_MODELS 两个进程级全局态；cargo test 默认多线程并行，
+    /// 凡是读或写它们的测试都要共用这把锁串行化，否则 root_prefers_env_then_override
+    /// 的写会和别的测试的读交叉，读到过渡态（曾致 status_for_cloud_mode_needs_only_vad_plus_creds
+    /// 间歇失败）。同一线程内可重入判定不适用——std Mutex 非重入，故各测试仅在自身体内取一次。
+    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 测试专用工件（不碰真实 ARTIFACTS，避免依赖本机模型）。
     fn test_artifact() -> Artifact {
         Artifact {
@@ -387,6 +393,7 @@ mod tests {
 
     #[test]
     fn status_exposes_models_root_path() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         // 前端「语音模型」区展示存储目录并支持点击打开,root 必须随 status 下发。
         let s = status(crate::settings::ASR_SENSE_VOICE);
         assert!(!s.root.is_empty());
@@ -459,6 +466,7 @@ mod tests {
 
     #[test]
     fn root_prefers_env_then_override() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         set_models_override(Some(tmp.path().to_path_buf()));
         std::env::set_var("VN_MODELS", "/env-wins");
@@ -472,6 +480,7 @@ mod tests {
 
     #[test]
     fn status_exposes_artifact_urls() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         let st = status("sense_voice");
         assert_eq!(st.artifacts.len(), ARTIFACTS.len());
         for s in &st.artifacts {
@@ -483,6 +492,7 @@ mod tests {
 
     #[test]
     fn status_for_cloud_mode_needs_only_vad_plus_creds() {
+        let _guard = ROOT_LOCK.lock().unwrap();
         // 本地模式 = 现状(回归锚)。
         let local = status_for(crate::settings::ASR_SENSE_VOICE, false, false);
         assert_eq!(local.recording_ready, status(crate::settings::ASR_SENSE_VOICE).recording_ready);

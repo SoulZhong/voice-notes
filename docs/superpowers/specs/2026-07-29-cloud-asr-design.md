@@ -191,12 +191,12 @@ tokio + tokio-tungstenite(tokio 已在依赖树);协议帧的构造/解析写成
 
 ## 9. 实现顺序建议(供 writing-plans 细化)
 
-1. 联网核实两家协议(端点/鉴权/帧格式/模型名/计费资源 ID),回填本文档 §2。
-2. settings 字段 + required_now/recording_ready 感知(TDD)。
-3. CloudAsr trait + MockCloudStream + 会话 cloud worker(TDD,mock 驱动)。
-4. 火山 adapter(帧纯函数 → 真实连通 ignored 测试)。
-5. 阿里 adapter(同上)。
-6. 断网补识状态机(mock 时序 TDD)。
-7. 设置页 UI + test_cloud_asr 命令。
-8. 欢迎页分支 + README 措辞。
-9. 全量回归 + 真机冒烟(两家各录一段真会议)。
+1. ✅ 联网核实两家协议(端点/鉴权/帧格式/模型名/计费资源 ID),回填本文档 §2。
+2. ✅ settings 字段 + required_now/recording_ready 感知(TDD)。
+3. ✅ CloudAsr trait + MockCloudStream + 会话 cloud worker(TDD,mock 驱动)。
+4. ✅ 火山 adapter(帧纯函数 → 真实连通 ignored 测试)。
+5. ✅ 阿里 adapter(同上)。
+6. ✅ 断网补识状态机(mock 时序 TDD)。
+7. ✅ 设置页 UI + test_cloud_asr 命令。
+8. ✅ 欢迎页分支 + README 措辞。
+9. 全量回归 + 真机冒烟(两家各录一段真会议)——回归已跑绿(见 Task 13);真机冒烟待用户执行。

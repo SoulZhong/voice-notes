@@ -185,6 +185,39 @@ flowchart LR
 | 热词/领域词 | 不支持 | 不支持 | 不支持 | **支持**(配置层已留口,待术语库接入) |
 | 单段延迟(M 系 Mac, 4s 段) | ~0.1s | 未测 | 未测 | ~0.7-1.4s(RTF 0.18-0.34) |
 
+### 云端模式
+
+`asr_mode=cloud` 时识别搬到厂商侧(火山引擎 sauc `bigmodel_async` 流式 /
+阿里 DashScope `fun-asr-realtime`),本机不再跑本地 ASR 大模型推理，`silero_vad.onnx`
+仍下载但不参与断句——断句改由厂商服务端 VAD 完成。详细设计见
+`docs/superpowers/specs/2026-07-29-cloud-asr-design.md`。
+
+要点：
+
+- **前处理零改动**：`CloudForwarder`(`pipeline/cloud_forward.rs`)实现与 `SileroSegmenter`
+  相同的 `Segmenter` trait，只做"消毒 NaN/Inf + 转发"，不产段不产 partial；借这个
+  形状让 `run_segment_worker` 的暂停闸/电平/AEC/音频旁路全部原样复用，`segment_worker.rs`
+  本身不知道自己在喂云端还是本地。
+- **厂商断句 + 双流**：mic/system 各开一条独立 WebSocket 流(`asr/cloud/volcano.rs`、
+  `asr/cloud/aliyun.rs` 实现 `CloudAsr` trait），协议帧编解码写成纯函数，单测不碰网络。
+  `Interim{text}` 事件覆盖式更新现有 per-source partial 槽；`Definite(DefiniteUtterance)`
+  按厂商给出的 `start_ms/end_ms`（有词级时间戳则映射 tokens/timestamps，喂现有段内
+  声纹切分；无则段级降级，同本地 Qwen3 路径）合成一个 final 段。
+- **FinalSink 全复用**：`run_cloud_asr_worker`(`session.rs`)与本地 `run_asr_worker`
+  共用同一个 `FinalSink`——回声去重、AEC 残渣过滤、语言过滤、说话人 embedding/在线
+  聚类、落盘全部走既有逻辑，云端只负责把 `DefiniteUtterance` 换算成 `Transcript`
+  喂进去（`utterance_to_transcript`），下游不知道识别来自厂商还是本机。
+- **断连重连 + 环形缓冲补识**：每源用 `SourceFeed` 记账——已推样本数、5 分钟环形
+  缓冲(`CLOUD_RING_CAP = 5*60*16000`)、缺口起点。流断开(`Closed{error}`)或推流失败
+  即标记断连，指数退避重连(1s→2s→…封顶 30s，不封顶重试直到停录)；音频照常落盘不
+  中断。重连成功后，缺口音频先经本机 Silero 切段(≤15s)，再逐段调厂商批式接口
+  补识——火山走 `flash`(录音文件识别极速版)，阿里因 DashScope 批式接口只收公网 URL，
+  改走 `qwen3-asr-flash`(多模态 HTTP，base64，无时间戳，取本地段边界)；两家由同一个
+  `try_recover`/`backfill_segmenter` 路径处理，补不回的部分（超出 5 分钟环、批式失败、
+  停录前始终连不上）落 `[识别失败]` 占位段，原始录音不受影响。
+- **状态可见性**：`CloudAsrStatus`(`Reconnecting`/`Recovered`/`Backfilling`/
+  `BackfillFailed`)经 `cloud-asr-status` 事件（`ipc.rs`）下发前端，驱动录制页状态条。
+
 ## 4. Final 段处理与所有丢弃路径
 
 ```mermaid
@@ -351,6 +384,9 @@ flowchart TB
 | 会后过滤 | `is_hallucination` | 标记精修稿要跳过的短垃圾段 | `refine/filter.rs` |
 | 会后聚类 | `recluster` | 从保存音频执行全局说话人重聚类 | `refine/recluster.rs` |
 | 文本精修 | HTTP LLM / Agent executor | 同音字、实体、口头语与排版修正 | `refine/llm.rs`、`refine/agent.rs` |
+| 云端适配层 | `CloudAsr`、`volcano`、`aliyun` | 厂商流式协议编解码(纯函数)+ 批式补识 | `asr/cloud/*` |
+| 云端调度 | `run_cloud_asr_worker` | 双流记账、事件回灌 FinalSink、断连重连、缺口补识、状态上报 | `session.rs` |
+| 云端前处理转发 | `CloudForwarder` | 借 `Segmenter` 之形转发前处理后音频,断句让位厂商 | `pipeline/cloud_forward.rs` |
 
 ## 9. 质量诊断切面
 
