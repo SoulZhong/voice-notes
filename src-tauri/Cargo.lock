@@ -6015,6 +6015,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "flate2",
+ "futures-util",
  "hex",
  "hound",
  "libc",

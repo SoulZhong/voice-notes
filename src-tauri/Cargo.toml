@@ -54,7 +54,8 @@ tar = "0.4"
 libc = "0.2"
 toml_edit = "0.25.12"
 rmcp = { version = "~2.1", features = ["server", "transport-io", "macros", "schemars"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-std", "time"] }
+# sync:云端流适配层用 mpsc 把同步 push 闭包桥到 WS 的 async 循环。
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-std", "time", "sync"] }
 schemars = "1.2.1"
 serde_yaml_ng = "0.10.0"
 # 神经残余级(DTLN-aec):tract-onnx 纯 Rust 推理 + 纯 Rust FFT。
@@ -67,6 +68,9 @@ realfft = "3"
 # bundled 静态编译 libsqlite3,不依赖系统库(与本仓其余原生依赖 bundled 风格一致)。
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+# WebSocketStream 的 Sink/Stream 扩展(split/send/next):收发要在同一个 select
+# 里并行,必须先 split 成两半才不撞可变借用。
+futures-util = "0.3"
 flate2 = "1.1.9"
 uuid = { version = "1.24.0", features = ["v4"] }
 
