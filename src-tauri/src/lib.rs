@@ -618,8 +618,9 @@ fn current_asr_provider(app: &AppHandle) -> Option<String> {
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
 /// 默认 sense_voice（与 settings 默认一致），绝不因读设置失败挡住录制/预载。
-/// pub(crate)：托盘 build_menu 也要按当前选型算 recording_ready 决定 toggle 项禁用。
-pub(crate) fn current_asr(app: &AppHandle) -> String {
+/// 仅本模块内取用（识别器装配 / preload）；托盘就绪判定已改经 current_models_status
+/// （模式感知，云端模式不看本地选型），不再直接依赖这个函数。
+fn current_asr(app: &AppHandle) -> String {
     match app.path().app_data_dir() {
         Ok(d) => settings::load(&d).asr_model,
         Err(_) => settings::ASR_SENSE_VOICE.into(),
@@ -3511,38 +3512,47 @@ const CLOUD_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// → 推 200ms 静音 → finish → 等 Closed。error=None 即通,Some 原样透出厂商说法
 /// (「鉴权失败」这类文案由适配层给,这里不猜)。
 ///
-/// 阻塞至多 CLOUD_TEST_TIMEOUT:tauri 命令在线程池上跑,用户主动触发的一次点击,
-/// 阻塞自己那条池线程可接受,换来前端一次 invoke 就拿到结论。
+/// 阻塞至多「握手 ≤7s(阿里云 CONNECT_TIMEOUT 6s + 1s 缓冲) + 等 Closed ≤ CLOUD_TEST_TIMEOUT
+/// 5s」,worst case 逼近 12s:走 spawn_blocking 别占 IPC 线程,同 test_refine_llm 惯例——
+/// 用户主动触发的一次点击,阻塞线程池里的一条工作线程可接受,前端一次 invoke 就拿到结论。
 #[tauri::command]
-fn test_cloud_asr(app: AppHandle) -> Result<String, String> {
-    let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let s = settings::load(&d);
-    let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
-    let mut stream = cloud.open_stream().map_err(|e| format!("连接失败: {e}"))?;
-    // 200ms 静音:有些厂商在收到首个音频包前不会走完会话建立,空推一段最接近真实录制。
-    (stream.push)(&vec![0.0f32; 16000 / 5]).map_err(|e| format!("推流失败: {e}"))?;
-    (stream.finish)().map_err(|e| format!("收尾失败: {e}"))?;
-    let deadline = std::time::Instant::now() + CLOUD_TEST_TIMEOUT;
-    loop {
-        let left = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .ok_or_else(|| "连接超时:请检查网络或凭证".to_string())?;
-        match stream.events.recv_timeout(left) {
-            Ok(asr::cloud::CloudEvent::Closed { error: None }) => {
-                return Ok(format!("连接成功({})", cloud_provider_label(&s.cloud_asr_provider)))
-            }
-            Ok(asr::cloud::CloudEvent::Closed { error: Some(e) }) => return Err(e),
-            // 中途的预览/定稿(静音也可能吐空定稿)不是结论,继续等关闭。
-            Ok(_) => continue,
-            // 通道断开却没给 Closed:适配层线程异常退出,当失败报。
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                return Err("连接异常中断:请检查网络或凭证".into())
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                return Err("连接超时:请检查网络或凭证".into())
+async fn test_cloud_asr(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    // 录制中再开一条厂商流会挤占并发额度(多数厂商按账号限并发路数),拒绝而非静默抢占。
+    if *state.running.lock().unwrap() {
+        return Err("录制中不能测试云端连接".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let s = settings::load(&d);
+        let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        let mut stream = cloud.open_stream().map_err(|e| format!("连接失败: {e}"))?;
+        // 200ms 静音:有些厂商在收到首个音频包前不会走完会话建立,空推一段最接近真实录制。
+        (stream.push)(&vec![0.0f32; 16000 / 5]).map_err(|e| format!("推流失败: {e}"))?;
+        (stream.finish)().map_err(|e| format!("收尾失败: {e}"))?;
+        let deadline = std::time::Instant::now() + CLOUD_TEST_TIMEOUT;
+        loop {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| "连接超时:请检查网络或凭证".to_string())?;
+            match stream.events.recv_timeout(left) {
+                Ok(asr::cloud::CloudEvent::Closed { error: None }) => {
+                    return Ok(format!("连接成功({})", cloud_provider_label(&s.cloud_asr_provider)))
+                }
+                Ok(asr::cloud::CloudEvent::Closed { error: Some(e) }) => return Err(e),
+                // 中途的预览/定稿(静音也可能吐空定稿)不是结论,继续等关闭。
+                Ok(_) => continue,
+                // 通道断开却没给 Closed:适配层线程异常退出,当失败报。
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err("连接异常中断:请检查网络或凭证".into())
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    return Err("连接超时:请检查网络或凭证".into())
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|e| format!("执行线程失败: {e}"))?
 }
 
 #[tauri::command]
