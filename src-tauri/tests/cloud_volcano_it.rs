@@ -57,10 +57,11 @@ fn volcano_streams_chinese_fixture() {
     let mut stream = asr.open_stream().expect("开流");
     let samples = fixture();
 
-    // 200ms 一帧、按真实时钟节奏推:厂商按流速做端点检测,一次灌完会被限流。
+    // 200ms 一帧(3200 样本 @16k)、按真实时钟节奏推:厂商按流速做端点检测,
+    // 推快了会被限流,所以 sleep 必须等于帧长而不是它的一半。
     for chunk in samples.chunks(3200) {
         (stream.push)(chunk).expect("推流");
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
     }
     (stream.finish)().expect("末包");
 
@@ -103,5 +104,16 @@ fn volcano_flash_rejects_bad_credentials() {
     // 凭证错时必须报错,而不是把失败当成"这段没人说话"静默返回空。
     let asr = VolcanoAsr::new("not-a-real-app".into(), "not-a-real-key".into());
     let err = asr.transcribe_batch(&fixture()).expect_err("坏凭证应报错");
-    eprintln!("坏凭证错误: {err:#}");
+    let msg = format!("{err:#}");
+    eprintln!("坏凭证错误: {msg}");
+    // 光 expect_err 不够:断网/DNS 挂了也会报错,这条测试就会在"根本没打到厂商"
+    // 的情况下假绿。所以要求错误里带上 HTTP/业务级拒绝的证据(火山鉴权失败可能
+    // 走 HTTP 401/403,也可能 HTTP 200 + X-Api-Status-Code 45xxxxxx/55xxxxxx)。
+    // 匹配保持宽松:厂商随时可能调整具体码与文案,这里要守的是"请求确实到达并被拒"。
+    assert!(
+        ["401", "403", "45000", "45100", "55000", "Unauthorized"]
+            .iter()
+            .any(|k| msg.contains(k)),
+        "错误应含 HTTP/业务级拒绝证据(而非 DNS/离线失败): {msg}"
+    );
 }

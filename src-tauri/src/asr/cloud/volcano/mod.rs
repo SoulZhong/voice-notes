@@ -48,6 +48,17 @@ const QUEUE_CAP_SAMPLES: usize = 16000 * 5;
 /// 上行分包粒度(字节):3200 = 100ms @ 16k/s16le。火山建议 100–200ms 一包;
 /// 逐次 push(10–21ms)直发会把帧数放大近 10 倍,徒增帧头开销与服务端调度压力。
 const UPLINK_CHUNK_BYTES: usize = 3200;
+/// 空闲保活:距上一次**真正发上线**的音频帧超过这么久,就补一帧静音。
+///
+/// 为什么需要:重连之后会话 worker 会在自己的循环里**同步**跑缺口补识
+/// (最多约 20 次 transcribe_batch,40–80s),这段时间它根本回不到 select 循环、
+/// 一帧音频都不会 push,新开的流上是**零上行帧**。火山对此的约束是等包超时
+/// (错误 45000081,与阿里 23s 无音频即 task-failed 同类)。
+/// 配置帧里的静音/心跳相关参数只覆盖"有帧但内容是静音",覆盖不了"零帧"。
+const KEEPALIVE_IDLE_MS: u64 = 10_000;
+/// 保活检查节拍。粒度要远小于 KEEPALIVE_IDLE_MS,让实际静默上限 ≈ idle + 一个节拍,
+/// 与厂商的等包超时之间留足余量。
+const KEEPALIVE_TICK: Duration = Duration::from_secs(2);
 /// flash 批式请求超时:调用方按 ≤15s 切段,单请求给足余量但不无限等。
 const FLASH_TIMEOUT_S: u64 = 30;
 
@@ -317,6 +328,11 @@ async fn handshake(app_key: &str, access_key: &str) -> anyhow::Result<WsStream> 
 }
 
 /// 收发主循环。任何出口都恰好发一次 Closed:None 只属于"我方 finish"这一条路径。
+///
+/// 关于"必须持续有音频帧上行"的服务端约束:正常录制时采集回调 10–21ms 一次,
+/// 天然满足;但**重连之后**worker 会先同步跑完缺口补识(最多约 20 次
+/// transcribe_batch,40–80s)才回到自己的 select 循环,期间这条新流上零上行帧,
+/// 会撞上厂商的等包超时(45000081)。故此处有一条 KEEPALIVE_TICK 的定时分支补静音帧。
 async fn run_session(
     ws: WsStream,
     mut ctl_rx: tokio::sync::mpsc::UnboundedReceiver<Ctl>,
@@ -327,6 +343,11 @@ async fn run_session(
     // 上行聚合缓冲:push 的粒度由设备回调链决定(10–21ms),这里攒够
     // UPLINK_CHUNK_BYTES 再发,避免一次 push 一帧的碎包。
     let mut uplink = Vec::with_capacity(UPLINK_CHUNK_BYTES * 2);
+    // 保活以"上一次真正发出去的音频帧"为基准,而不是"上一次收到 push":攒在
+    // uplink 里没发出的字节对服务端不存在。保活帧自己也刷新这个时间戳,所以它
+    // 天然自限流(静默期每 KEEPALIVE_IDLE_MS 一帧),不会连发。
+    let mut last_audio_sent = tokio::time::Instant::now();
+    let mut keepalive = tokio::time::interval(KEEPALIVE_TICK);
     loop {
         tokio::select! {
             ctl = ctl_rx.recv() => match ctl {
@@ -340,6 +361,7 @@ async fn run_session(
                             let _ = ev_tx.send(CloudEvent::Closed { error: Some(format!("音频帧发送失败: {e}")) });
                             return;
                         }
+                        last_audio_sent = tokio::time::Instant::now();
                     }
                 }
                 Some(Ctl::Finish) => {
@@ -387,6 +409,26 @@ async fn run_session(
                 None => {
                     let _ = ev_tx.send(CloudEvent::Closed { error: Some("连接被对端关闭".into()) });
                     return;
+                }
+            },
+            // 空闲保活。重连后 worker 串行补识期间这条流上零上行帧,厂商的等包超时
+            // (45000081)会掐掉会话;配置里的静音相关参数只覆盖"有帧但静音",覆盖
+            // 不了"零帧",所以只能我们自己补一帧 100ms 静音。
+            // 这条分支随 Ctl::Finish 一起退出循环(finish_and_drain 后直接 return),
+            // 所以末包之后不会再有保活帧插到收尾流程里。
+            // 代价:静音也计入厂商的流内时钟,此后定稿的 ms 相对"已推真实样本"会前移
+            // 一个注入总量(补识窗口最坏 80s → 8 帧 → ≈0.8s),换的是这条流不被掐死
+            // (掐死则整段无人识别)。正常录制期采集帧不断,这条分支根本不触发。
+            _ = keepalive.tick() => {
+                if last_audio_sent.elapsed() >= Duration::from_millis(KEEPALIVE_IDLE_MS) {
+                    // 补识窗口内 uplink 必定是空的(worker 压根没 push),不存在
+                    // 静音插到半包真实音频前面的乱序问题。
+                    let frame = audio_frame(&[0u8; UPLINK_CHUNK_BYTES], false);
+                    if let Err(e) = sink.send(Message::binary(frame)).await {
+                        let _ = ev_tx.send(CloudEvent::Closed { error: Some(format!("保活静音帧发送失败: {e}")) });
+                        return;
+                    }
+                    last_audio_sent = tokio::time::Instant::now();
                 }
             },
         }
@@ -461,11 +503,20 @@ fn emit_response(json: &serde_json::Value, ev_tx: &crossbeam_channel::Sender<Clo
         }
     }
     for d in defs {
+        if !should_emit_definite(&d.text) {
+            continue;
+        }
         if ev_tx.send(CloudEvent::Definite(d)).is_err() {
             return false;
         }
     }
     true
+}
+
+/// 空文本定稿只会在 sink 里产生一个空段、还白白推进 last_final_end,过滤掉;
+/// 与阿里侧同名函数镜像(刻意各留一份:两家的定稿语义随时可能各自演进)。
+fn should_emit_definite(text: &str) -> bool {
+    !text.trim().is_empty()
 }
 
 /// f32 → 内存 WAV(16k 单声道 s16le)。批式接口只吃带头的容器格式,而流式吃裸 PCM;
@@ -535,6 +586,41 @@ mod tests {
     fn uplink_chunk_is_100ms_of_16k_s16le() {
         assert_eq!(UPLINK_CHUNK_BYTES, 16000 / 10 * 2);
         assert_eq!(QUEUE_CAP_SAMPLES / 16000, 5, "积压闸 = 5s 音频");
+    }
+
+    #[test]
+    fn keepalive_fires_well_before_vendor_idle_kill() {
+        // 火山 sauc:长时间收不到音频包会以 45000081(等包超时)掐掉会话,量级与
+        // 阿里的 23s 同类,这里按同一条保守线校核。
+        // 实际最坏静默 = KEEPALIVE_IDLE_MS + 一个节拍,必须仍然明显小于它。
+        const VENDOR_IDLE_KILL_MS: u64 = 23_000;
+        let worst_silence = KEEPALIVE_IDLE_MS + KEEPALIVE_TICK.as_millis() as u64;
+        assert!(
+            worst_silence < VENDOR_IDLE_KILL_MS,
+            "最坏静默 {worst_silence}ms 必须 < 厂商 {VENDOR_IDLE_KILL_MS}ms 掐流线"
+        );
+        assert!(
+            (KEEPALIVE_TICK.as_millis() as u64) < KEEPALIVE_IDLE_MS,
+            "节拍要比空闲阈值细,否则保活精度还不如阈值本身"
+        );
+    }
+
+    #[test]
+    fn empty_definite_is_filtered() {
+        assert!(!should_emit_definite(""), "空文本定稿只会产生空段");
+        assert!(!should_emit_definite("  \n"), "纯空白同理");
+        assert!(should_emit_definite("你好"));
+
+        // 走完整 emit 路径:definite=true 但文本为空的分句不产生任何事件。
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let json = serde_json::json!({
+            "result": {"utterances": [{"definite": true, "text": "", "start_time": 0, "end_time": 500}]}
+        });
+        assert!(emit_response(&json, &tx));
+        assert!(
+            rx.try_recv().is_err(),
+            "空定稿不入下游,免得推进 last_final_end"
+        );
     }
 
     #[test]
