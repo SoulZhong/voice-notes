@@ -36,6 +36,9 @@ jobs:
           npx tauri signer sign -k "$KEY" -p "$PW" dummy.bin
           test -s dummy.bin.sig || { echo "::error::未产出签名文件"; exit 1; }
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          # tauri 的 .sig 是 base64 包装的 minisign 签名(latest.json 嵌的就是它),
+          # minisign 需要先解回原始格式再验。
+          base64 -d dummy.bin.sig > dummy.bin.minisig
           PUB=$(python3 -c "import json,base64;print(base64.b64decode(json.load(open('src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey']).decode().strip().splitlines()[-1])")
-          minisign -Vm dummy.bin -x dummy.bin.sig -P "$PUB"
+          minisign -Vm dummy.bin -x dummy.bin.minisig -P "$PUB"
           echo "签名链路自检通过:secrets 接线 / 私钥密码 / 公私钥配对 全部正确"
