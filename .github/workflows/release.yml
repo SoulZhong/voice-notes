@@ -52,17 +52,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      # macOS 构建链:webrtc-audio-processing(bundled)经 meson/ninja 编译并
-      # 经 pkg-config 链接 brew abseil;abseil 版本随 runner 镜像滚动,
-      # fix-bundle-dylibs.sh 已做版本无关化,这里装什么版本都行。
+      # macOS 构建链:webrtc-audio-processing(bundled)经 meson/ninja 编译。
+      # 刻意不装 brew abseil——装了会被 pkg-config 捡走变成共享链接(用户机器
+      # 没有 brew abseil,启动必崩;且 brew 滚版本曾直接崩掉 v0.6.0 首次发版)。
+      # 无系统 abseil 时 sys crate 走 meson wrap 拉取 abseil-cpp-20240722.0
+      # 静态内嵌,二进制零动态依赖。显式卸载兜底未来 runner 镜像预装的情况,
+      # beforeBundleCommand 的守卫脚本再挡最后一道。
       - name: macOS 构建依赖
         if: matrix.platform == 'macos-latest'
-        run: brew install abseil meson ninja pkg-config
-      # tauri-build 在 cargo 编译期就校验 bundle.macOS.frameworks 文件存在,
-      # 必须在构建前把 abseil 免版本副本暂存好(--stage-only 不碰主二进制)。
-      - name: 预暂存 abseil 打包副本
-        if: matrix.platform == 'macos-latest'
-        run: bash src-tauri/fix-bundle-dylibs.sh --stage-only
+        run: |
+          brew list abseil >/dev/null 2>&1 && brew uninstall --ignore-dependencies abseil || true
+          brew install meson ninja pkg-config
       - run: npm ci
       # 钉 commit SHA 而非可变 tag(v0):此 step 持有 updater 签名私钥,
       # tag 被恶意重指即可窃 key、给全体客户端签恶意更新。升级时人工换 SHA。
