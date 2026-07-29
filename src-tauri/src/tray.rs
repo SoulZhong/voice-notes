@@ -257,3 +257,22 @@ pub fn apply_enabled(app: &AppHandle) {
         app.remove_tray_by_id(TRAY_ID);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。
+    /// 为什么存在:PR#57 的图标流水线曾把 7 张帧 PNG 覆盖成 App 图标的近似副本,
+    /// 动画线程照常循环但每帧长一样——用户看到"小姑娘不写字了"。字节级去重是
+    /// 最便宜的哨兵:真动画必然逐帧有别,流水线再次压平资产时这里先红。
+    #[test]
+    fn rec_frames_are_pairwise_distinct_and_differ_from_idle() {
+        for i in 0..REC_FRAMES.len() {
+            assert_ne!(REC_FRAMES[i], IDLE_ICON, "第 {i} 帧不得等于静止帧(动画会隐形)");
+            for j in (i + 1)..REC_FRAMES.len() {
+                assert_ne!(REC_FRAMES[i], REC_FRAMES[j], "第 {i} 与第 {j} 帧重复(动画退化)");
+            }
+        }
+    }
+}
