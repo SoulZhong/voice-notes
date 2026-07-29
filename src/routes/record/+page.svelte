@@ -7,6 +7,7 @@
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
+  import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
 
@@ -116,6 +117,63 @@
     if (goSettings) goto("/ai");
   }
 
+  // 云端识别连接状态(仅云端模式录制时产生):细提示条,不阻断录制。reconnecting/backfilling/
+  // backfill_failed 持续显示到下一个事件覆盖;recovered 闪一下「已恢复」后 3s 自动清空,
+  // 避免恢复提示常驻占位。
+  let cloudStatus = $state<{ kind: CloudAsrStatusEvent["state"]; text: string } | null>(null);
+  let cloudStatusClearTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 厂商错误原文可能很长(带 requestId 的整串 JSON),状态条只留一行的量。 */
+  const CLOUD_REASON_MAX = 80;
+  function cloudReason(message?: string) {
+    const m = message?.trim();
+    if (!m) return "";
+    // Array.from 按码点(而非 UTF-16 单元)切:message.slice 会把代理对(如 emoji/
+    // 部分 CJK 扩展区字符)从中间切开，渲染成乱码半字符。
+    const chars = Array.from(m);
+    return `(${chars.length > CLOUD_REASON_MAX ? chars.slice(0, CLOUD_REASON_MAX - 1).join("") + "…" : m})`;
+  }
+  function handleCloudAsrStatus(e: CloudAsrStatusEvent) {
+    // 「已恢复」不许盖掉「补识失败」:补识失败是这场录音真留了窟窿(占位段已落盘),
+    // 而 recovered 只说明连接回来了。盖过去用户会以为窟窿被补上了。警告留到下一次
+    // reconnecting(新一轮故障)、录制结束(提示条随 isLive 消失)或手动清除为止。
+    if (e.state === "recovered" && cloudStatus?.kind === "backfill_failed") return;
+    if (cloudStatusClearTimer) {
+      clearTimeout(cloudStatusClearTimer);
+      cloudStatusClearTimer = null;
+    }
+    if (e.state === "reconnecting") {
+      cloudStatus = { kind: e.state, text: `云端识别中断,重连中…${cloudReason(e.message)}` };
+    } else if (e.state === "backfilling") {
+      cloudStatus = { kind: e.state, text: "补识中…" };
+    } else if (e.state === "backfill_failed") {
+      cloudStatus = { kind: e.state, text: "部分片段补识失败,原始音频已保留" };
+    } else {
+      // recovered
+      cloudStatus = { kind: e.state, text: "已恢复" };
+      cloudStatusClearTimer = setTimeout(() => {
+        cloudStatus = null;
+        cloudStatusClearTimer = null;
+      }, 3000);
+    }
+  }
+
+  // 状态条按场次隔离:cloudStatus 是模块顶层 state,录制页不会因换场重新挂载,
+  // F4 的粘滞设计(backfill_failed 持续显示到下一事件覆盖)只在"当场"内成立——
+  // isLive false→true(开始下一场录制,哪怕是本地模式)必须先清掉上一场遗留的
+  // 横幅,否则用户会以为这场也补识失败了,而这场压根还没产生过一个云端事件。
+  let wasLive = false;
+  $effect(() => {
+    const live = recording.isLive;
+    if (live && !wasLive) {
+      cloudStatus = null;
+      if (cloudStatusClearTimer) {
+        clearTimeout(cloudStatusClearTimer);
+        cloudStatusClearTimer = null;
+      }
+    }
+    wasLive = live;
+  });
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
@@ -133,9 +191,12 @@
     window.addEventListener("focus", onFocus);
     // 录制中也检测(会议软件中途拉低输入音量):轮询与录制状态无关,一直跑。
     const volTimer = setInterval(refreshInputVol, POLL_MS);
+    const unCloud = onCloudAsrStatus(handleCloudAsrStatus);
     return () => {
       window.removeEventListener("focus", onFocus);
       clearInterval(volTimer);
+      if (cloudStatusClearTimer) clearTimeout(cloudStatusClearTimer);
+      unCloud.then((f) => f());
     };
   });
 
@@ -313,6 +374,13 @@
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
       {#if isError(recording.status)}
         <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      {/if}
+
+      <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->
+      {#if recording.isLive && cloudStatus}
+        <p class="status" class:error={cloudStatus.kind === "backfill_failed"}>
+          <span class="status-dot"></span>{cloudStatus.text}
+        </p>
       {/if}
 
       <!-- 说话人条随头部整体吸顶:滚到会中段落时仍要能对着条上的名字辨认发言人/改名,

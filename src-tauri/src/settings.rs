@@ -1,6 +1,7 @@
 //! 轻量应用设置（app_data_dir/settings.json，原子写）。目前仅镜像加速配置。
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghfast.top/";
@@ -14,6 +15,14 @@ pub const ASR_SENSE_VOICE: &str = "sense_voice";
 pub const ASR_WHISPER: &str = "whisper";
 /// Paraformer-large 中文选型。
 pub const ASR_PARAFORMER: &str = "paraformer";
+/// Qwen3-ASR 0.6B int8 选型(52 语种/中英混说,LLM 解码,支持热词)。
+pub const ASR_QWEN3: &str = "qwen3";
+/// 识别方式:本地模型 / 云端 API(spec 2026-07-29-cloud-asr-design)。
+pub const ASR_MODE_LOCAL: &str = "local";
+pub const ASR_MODE_CLOUD: &str = "cloud";
+/// 云端厂商标识。
+pub const CLOUD_VOLCANO: &str = "volcano";
+pub const CLOUD_ALIYUN: &str = "aliyun";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -30,6 +39,25 @@ pub struct Settings {
     /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
     #[serde(default = "default_asr")]
     pub asr_model: String,
+    /// sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json)。空 = sherpa
+    /// 默认(0.6.8 硬编码 CPU);macOS 可填 "coreml" 实验加速(见 2026-07-28 ASR 调研)。
+    /// 值原样透传 sherpa/onnxruntime,不做白名单;加载失败会走既有报错路径,不静默降级。
+    #[serde(default)]
+    pub asr_provider: String,
+    /// 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(set_settings 保护)。
+    #[serde(default = "default_asr_mode")]
+    pub asr_mode: String,
+    /// 云端厂商:"volcano" / "aliyun"。
+    #[serde(default = "default_cloud_provider")]
+    pub cloud_asr_provider: String,
+    /// 火山凭证(APP ID / Access Token)。明文存储,同 refine_api_key 先例。
+    #[serde(default)]
+    pub volc_app_key: String,
+    #[serde(default)]
+    pub volc_access_key: String,
+    /// 阿里 DashScope API Key。明文,同上。
+    #[serde(default)]
+    pub dashscope_api_key: String,
     /// 声纹嵌入模型选型:"campplus"(默认)/"eres2netv2"。不同模型嵌入空间不可混用,
     /// 切换会触发声纹库从录音样本后台重建(见 lib.rs set_settings)。
     #[serde(default = "default_speaker_model")]
@@ -91,6 +119,10 @@ pub struct Settings {
     /// 不会对老用户弹引导。
     #[serde(default)]
     pub onboarded: bool,
+    /// 已完成的功能引导 ID。每项功能/重大版本独立记账，不能让一个全局 bool
+    /// 永久吞掉后续新增功能的引导。
+    #[serde(default)]
+    pub completed_guides: Vec<String>,
     /// 允许 MCP(AI 助手)控制录制(start/stop/pause/resume)。默认关:开录是隐私
     /// 敏感操作,必须用户显式授权。
     #[serde(default)]
@@ -131,6 +163,17 @@ fn default_refine_agent() -> String {
     "claude".into()
 }
 
+fn default_asr_mode() -> String { ASR_MODE_LOCAL.into() }
+fn default_cloud_provider() -> String { CLOUD_VOLCANO.into() }
+
+/// 当前选中厂商的凭证是否齐全(云端模式录制就绪的必要条件)。
+pub fn cloud_creds_ok(s: &Settings) -> bool {
+    match s.cloud_asr_provider.as_str() {
+        CLOUD_ALIYUN => !s.dashscope_api_key.trim().is_empty(),
+        _ => !s.volc_app_key.trim().is_empty() && !s.volc_access_key.trim().is_empty(),
+    }
+}
+
 /// serde `#[derive(Deserialize)]` 的裸 `#[serde(default)]` 总是取字段类型的
 /// `Default::default()`(bool → false)。language_filter/keep_audio/tray_enabled
 /// 三个字段的产品默认值是 true,所以必须显式挂这个辅助函数,不能偷懒裸写 default。
@@ -146,6 +189,12 @@ impl Default for Settings {
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
+            asr_provider: String::new(),
+            asr_mode: default_asr_mode(),
+            cloud_asr_provider: default_cloud_provider(),
+            volc_app_key: String::new(),
+            volc_access_key: String::new(),
+            dashscope_api_key: String::new(),
             speaker_model: default_speaker_model(),
             theme: default_theme(),
             record_system_only: false,
@@ -164,6 +213,7 @@ impl Default for Settings {
             refine_model: String::new(),
             refine_api_key: String::new(),
             onboarded: false,
+            completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
             telemetry_enabled: true,
@@ -191,7 +241,22 @@ pub fn load(app_data: &Path) -> Settings {
 pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
     let tmp = app_data.join("settings.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(s)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // tmp 可能来自上次崩溃且权限较宽；mode() 只对新建文件生效，显式收紧。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(serde_json::to_string_pretty(s)?.as_bytes())?;
+    drop(file);
     std::fs::rename(&tmp, app_data.join("settings.json"))?;
     Ok(())
 }
@@ -246,6 +311,26 @@ mod tests {
         assert!(got.mirror_enabled);
         assert_eq!(got.mirror_prefix, "https://mirror.example/");
         assert!(!tmp.path().join("settings.json.tmp").exists(), "原子写不留 tmp");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_credentials_private_to_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Settings {
+            volc_access_key: "secret".into(),
+            dashscope_api_key: "secret".into(),
+            ..Default::default()
+        };
+        save(tmp.path(), &s).unwrap();
+        let mode = std::fs::metadata(tmp.path().join("settings.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "含 API key 的 settings.json 不得向同机其他用户开放");
     }
 
     #[test]
@@ -378,6 +463,22 @@ mod tests {
     }
 
     #[test]
+    fn feature_guides_default_empty_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"onboarded":true}"#).unwrap();
+        let legacy = load(tmp.path());
+        assert!(legacy.onboarded);
+        assert!(legacy.completed_guides.is_empty(), "旧用户不能被视为已看过未来功能引导");
+
+        let s = Settings {
+            completed_guides: vec!["ai-tools-v1".into(), "future-feature-v1".into()],
+            ..Default::default()
+        };
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).completed_guides, s.completed_guides);
+    }
+
+    #[test]
     fn migrate_bumps_legacy_prefix_to_new_default() {
         let tmp = tempfile::tempdir().unwrap();
         // 存量:旧默认 ghproxy.net
@@ -415,6 +516,17 @@ mod tests {
     }
 
     #[test]
+    fn asr_provider_defaults_empty_and_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 老配置缺字段 → 空串 = 不覆盖,沿用 sherpa 默认(CPU),行为与历史版本一致。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"asr_model":"whisper"}"#).unwrap();
+        assert_eq!(load(tmp.path()).asr_provider, "");
+        let s = Settings { asr_provider: "coreml".into(), ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).asr_provider, "coreml");
+    }
+
+    #[test]
     fn telemetry_default_on_and_roundtrip() {
         // 新装默认开
         assert!(Settings::default().telemetry_enabled);
@@ -429,5 +541,34 @@ mod tests {
         v.as_object_mut().unwrap().remove("telemetry_enabled");
         let old: Settings = serde_json::from_value(v).unwrap();
         assert!(old.telemetry_enabled);
+    }
+
+    #[test]
+    fn cloud_asr_fields_default_local_and_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 老配置缺字段 → local + volcano + 空凭证,老用户行为零变化。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"asr_model":"whisper"}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.asr_mode, ASR_MODE_LOCAL);
+        assert_eq!(s.cloud_asr_provider, CLOUD_VOLCANO);
+        assert!(s.volc_app_key.is_empty() && s.volc_access_key.is_empty() && s.dashscope_api_key.is_empty());
+        assert!(!cloud_creds_ok(&s), "空凭证不算就绪");
+        let s = Settings {
+            asr_mode: ASR_MODE_CLOUD.into(),
+            cloud_asr_provider: CLOUD_ALIYUN.into(),
+            dashscope_api_key: "sk-x".into(),
+            ..Default::default()
+        };
+        assert!(cloud_creds_ok(&s), "阿里只看 dashscope_api_key");
+        save(tmp.path(), &s).unwrap();
+        let got = load(tmp.path());
+        assert_eq!(got.asr_mode, "cloud");
+        assert_eq!(got.cloud_asr_provider, "aliyun");
+        assert_eq!(got.dashscope_api_key, "sk-x");
+        // 火山凭证要求两个都非空。
+        let v = Settings { cloud_asr_provider: CLOUD_VOLCANO.into(), volc_app_key: "a".into(), ..Default::default() };
+        assert!(!cloud_creds_ok(&v));
+        let v = Settings { volc_app_key: "a".into(), volc_access_key: "t".into(), ..Default::default() };
+        assert!(cloud_creds_ok(&v));
     }
 }

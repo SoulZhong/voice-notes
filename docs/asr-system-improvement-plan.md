@@ -83,6 +83,7 @@ Paraformer 生态存在专门的热词模型 SeACo-Paraformer；论文和 FunASR
 - 短期不能把“给现有 SenseVoice 加热词”当作简单配置任务；
 - 应先建立统一术语库，供确定性归一和 LLM 使用；
 - 若需要真正的解码级热词，应评测 sherpa-onnx 中文 Zipformer Transducer 或接入支持热词的 FunASR/SeACo 路径；
+- **2026-07-28 更新**：Qwen3-ASR（Apache 2.0 开源，sherpa-onnx 已集成 0.6B int8 并实现 hotwords）通过 system prompt 上下文偏置原生支持热词，是 Transducer/SeACo 之外的第三条路线，且不必离开 sherpa 技术栈，详见 [ASR 模型选型调研](./superpowers/research/2026-07-28-asr-model-comparison.md)；
 - 热词分数必须通过实体召回率和普通词误触发率共同校准，不能无限提高 boost。
 
 ### 3.3 VAD：按数据集校准，而不是固定默认值
@@ -259,6 +260,14 @@ flowchart TB
 | sherpa-onnx Zipformer Transducer | 第一遍候选 | 支持 streaming、modified beam search 和热词 | 需要新适配与模型体积/RTF评测 |
 | FireRedASR2 CTC/AED | 第二遍候选 | sherpa-onnx 已支持，中英和多种方言 | CTC 版本约 740 MB；热词与时间戳能力需实测 |
 | FunASR SeACo-Paraformer | 领域版候选 | 原生面向热词定制 | 新运行时与部署复杂度，不宜首阶段直接引入 |
+| Qwen3-ASR-0.6B int8 | 第一遍挑战者/第二遍候选。**2026-07-28 已接入为第四选型**（asr/qwen3.rs，实测 RTF 0.18-0.34 < 0.5 门槛） | 精度大幅领先（混说 WER 7.4% vs SenseVoice 18.7%）、原生热词、Apache 2.0、sherpa-onnx 已集成 | 无原生 token 时间戳（已实测确认，diarization 段级降级）；lang 空（语言过滤走文本兜底）；空输入幻觉待评测集验证 |
+| Fun-ASR-Nano-2512 | SenseVoice 官方接班人 | 同 encoder 迁移摩擦小、真流式、鲁棒性/专名强、Apache 2.0 | 0.8B LLM 解码 CPU 慢数倍；需 llama.cpp/FunASR 运行时，不在 sherpa-rs 栈内 |
+
+2026-07-28 调研补充（详见 [ASR 模型选型调研](./superpowers/research/2026-07-28-asr-model-comparison.md)）：
+
+- Microsoft VibeVoice-ASR 已评估并**排除**：批式 60 分钟范式与实时管线正交，GPU 16-24GB / BitNet CPU RTF 0.77 均不可行，中文 AISHELL-4 WER 21.4% 为候选中最弱；
+- CoreML provider 实验**无稳定收益**（两轮测量方向相反，与 CPU 同量级），`settings.asr_provider` 实验开关保留，未来 LLM-decoder 类模型可复测；
+- 同日已完成 sherpa-rs → 官方 sherpa-onnx 1.13.4 迁移（静态链接）并把 Qwen3-ASR-0.6B 接入为第四选型，热词配置口已留（等 Phase 5 术语库），详见调研文档 §5.1。
 
 sherpa-onnx 当前官方列表包含中文流式 Zipformer、FireRedASR、SenseVoice、Paraformer、Whisper 等多种离线与在线模型，可在不改变“本地优先”原则下做同音频评测。[sherpa-onnx Pre-trained Models](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html)、[FireRedASR2 model](https://k2-fsa.github.io/sherpa/onnx/FireRedAsr/pretrained.html)
 
@@ -529,11 +538,16 @@ sherpa-onnx 当前官方列表包含中文流式 Zipformer、FireRedASR、SenseV
 ```bash
 python3 tools/asr_eval.py eval.jsonl \
   --max-cer 0.12 \
+  --max-mer 0.15 \
   --min-entity-recall 0.90 \
   --max-filter-fdr 0.01
 ```
 
 任一指标越界时命令返回非零，可直接接入 CI 和模型 bake-off。
+
+指标说明：`cer` 为纯字符级错误率；`mer`（2026-07-28 新增）按混合分词计算——CJK
+按字、ASCII 词按词，即中文取 CER 语义、英文取 WER 语义，覆盖 §3.7 要求的
+“中文 CER + 英文 WER”而无需拆分数据集；code-switch 子集仍建议单独成集观察。
 
 ## 10. 完成定义
 

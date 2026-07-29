@@ -5,6 +5,7 @@
   import { goto } from "$app/navigation";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
+  import AiStateLabel from "$lib/AiStateLabel.svelte";
   import { onRefine, onNoteRenamed } from "$lib/events";
   import {
     getNote,
@@ -53,6 +54,7 @@
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
   let refining = $state(false);
+  let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
@@ -78,6 +80,12 @@
 
   /** 修订稿是否可展示：无 Aing 结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
   const refinedAvailable = $derived(!!refined && note?.meta.state === "complete");
+  const refinedHasFailure = $derived(
+    !!refined && [refined.stages.filter, refined.stages.recluster, refined.stages.llm].includes("failed"),
+  );
+  const aiState = $derived(
+    refining ? "running" : refineRunFailed || refinedHasFailure ? "failed" : refinedAvailable ? "complete" : "idle",
+  );
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
@@ -256,6 +264,7 @@
     confirmSeq = null;
     refined = null;
     refining = false;
+    refineRunFailed = false;
     refineErr = "";
     confirmRefine = false;
     viewMode = "refined";
@@ -269,9 +278,13 @@
     let disposed = false;
     onRefine((e) => {
       if (e.note_id !== forId) return;
-      if (e.state === "running") refining = true;
+      if (e.state === "running") {
+        refining = true;
+        refineRunFailed = false;
+      }
       if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
         refining = false;
+        refineRunFailed = e.state === "failed";
         getRefined(forId).then((r) => {
           if (forId === id) refined = r;
         });
@@ -524,12 +537,14 @@
     }
     confirmRefine = false;
     refineErr = "";
+    refineRunFailed = false;
     refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次 Aing
     try {
       await refineNote(id);
     } catch (e) {
       refining = false;
-      refineErr = `重新 Aing 失败: ${e}`;
+      refineRunFailed = true;
+      refineErr = `重新执行 AI 失败：${e}`;
     }
   }
 
@@ -675,7 +690,7 @@
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
           <span class="refine-warn">未关联搭子的说话人改名将丢失</span>
-          <button class="link danger" onclick={rerunRefine}>确认重新 Aing</button>
+          <button class="link danger" onclick={rerunRefine}>确认重新 AI</button>
           <button class="link" onclick={() => (confirmRefine = false)}>取消</button>
         {:else}
           <button
@@ -683,7 +698,7 @@
             class:casting={refining}
             disabled={refining || note.meta.state !== "complete"}
             onclick={rerunRefine}
-            title={refining ? "Aing 中…" : "重新 Aing"}
+            title={aiState === "running" ? "Aing，正在执行" : aiState === "complete" ? "AI 已完成，点击重新执行" : aiState === "failed" ? "AI 执行失败，点击重试" : "执行 AI"}
           >
             <svg class="wand" viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
               <path
@@ -708,7 +723,7 @@
                 d="M10 15.4 10.3 16.2 11.1 16.5 10.3 16.8 10 17.6 9.7 16.8 8.9 16.5 9.7 16.2Z"
               />
             </svg>
-            <span>{refining ? "Aing 中…" : "重新 Aing"}</span>
+            <AiStateLabel state={aiState} />
           </button>
         {/if}
       </div>
@@ -717,9 +732,9 @@
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
     {#if effectiveView === "refined" && refined}
       {#if refined.stages.llm === "partial"}
-        <div class="banner">部分段落 Aing 失败，已保留原文，可重新 Aing。</div>
+        <div class="banner">部分段落 AI 处理失败，已保留原文，可重新执行。</div>
       {:else if refined.stages.llm === "failed"}
-        <div class="banner banner-danger">LLM Aing 失败，当前展示本地 Aing 结果。</div>
+        <div class="banner banner-danger">在线 AI 处理失败，当前展示本地处理结果。</div>
       {/if}
     {/if}
 
@@ -759,7 +774,7 @@
             class="seg"
             class:playing={activeSeqs.has(seg.seq)}
             class:discarded={discardedSeqs.has(seg.seq)}
-            title={discardedSeqs.has(seg.seq) ? "已被 Aing 过滤" : undefined}
+            title={discardedSeqs.has(seg.seq) ? "已被 AI 过滤" : undefined}
             data-seq={seg.seq}
           >
             {#if canEdit && speakerMenuSeq === seg.seq}

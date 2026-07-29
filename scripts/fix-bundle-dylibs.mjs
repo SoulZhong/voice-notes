@@ -1,52 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
 
-if (process.platform === "win32") {
-  const runtimeDlls = [
-    "cargs.dll",
-    "onnxruntime.dll",
-    "onnxruntime_providers_shared.dll",
-    "sherpa-onnx-c-api.dll",
-    "sherpa-onnx-cxx-api.dll",
-  ];
-  const configuredTarget = process.env.CARGO_TARGET_DIR;
-  const targetRoots = configuredTarget
-    ? [
-        isAbsolute(configuredTarget)
-          ? configuredTarget
-          : resolve(process.cwd(), configuredTarget),
-        resolve(process.cwd(), "src-tauri", configuredTarget),
-      ]
-    : [resolve(process.cwd(), "src-tauri", "target")];
-  const releaseDir = targetRoots
-    .map((root) => resolve(root, "release"))
-    .find((candidate) => runtimeDlls.every((dll) => existsSync(resolve(candidate, dll))));
-
-  if (!releaseDir) {
-    console.error(
-      `prepare-windows-runtime: missing native DLLs in ${targetRoots.join(", ")}`,
-    );
-    process.exit(1);
-  }
-
-  const bundleDir = resolve(
-    process.cwd(),
-    "src-tauri",
-    "target",
-    "bundle-libs",
-    "windows",
-  );
-  mkdirSync(bundleDir, { recursive: true });
-  for (const dll of runtimeDlls) {
-    copyFileSync(resolve(releaseDir, dll), resolve(bundleDir, dll));
-  }
-  console.log(`prepare-windows-runtime: copied ${runtimeDlls.length} DLLs`);
-  process.exit(0);
-}
-
+// Windows 曾在此暂存 sherpa-onnx/onnxruntime 运行时 DLL(sherpa-rs 动态链接时代)。
+// 迁移到官方 sherpa-onnx crate 后默认静态链接(含 onnxruntime),Windows 不再有
+// 需要随包分发的原生 DLL,此步骤只剩 macOS 的 abseil 处理(webrtc-audio-processing
+// 链接 Homebrew abseil,与 sherpa 无关)。
 if (process.platform !== "darwin") {
-  console.log("fix-bundle-dylibs: skipped (unsupported platform)");
+  console.log("fix-bundle-dylibs: skipped (no runtime libs to stage on this platform)");
   process.exit(0);
 }
 

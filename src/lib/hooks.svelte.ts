@@ -2,7 +2,9 @@
 // notesVersion 同套路——编辑页保存后 bump,侧栏列表 $effect 依赖重拉,不搞事件总线。
 import { invoke } from "@tauri-apps/api/core";
 
-export type HookKind = "shell" | "webhook";
+export type HookKind = "shell" | "feishu" | "wecom" | "webhook";
+export type WebhookType = "generic" | "feishu" | "wecom";
+export type WebhookMessageStyle = "text" | "rich";
 
 export type HookCfg = {
   id: string;
@@ -11,6 +13,10 @@ export type HookCfg = {
   kind: HookKind;
   command: string;
   url: string;
+  webhook_type: WebhookType;
+  webhook_secret: string;
+  webhook_message_style: WebhookMessageStyle;
+  webhook_mention_all: boolean;
   enabled: boolean;
   include_note: boolean;
 };
@@ -22,7 +28,7 @@ export const HOOK_EVENTS: { value: string; label: string }[] = [
   { value: "recording_paused", label: "录制暂停" },
   { value: "recording_resumed", label: "录制恢复" },
   { value: "refine_started", label: "Aing 开始" },
-  { value: "refine_finished", label: "Aing 完成" },
+  { value: "refine_finished", label: "Aing 结束" },
 ];
 
 export const eventLabel = (v: string) => HOOK_EVENTS.find((e) => e.value === v)?.label ?? v;
@@ -57,6 +63,10 @@ export function newHook(): HookCfg {
     kind: "shell",
     command: "",
     url: "",
+    webhook_type: "generic",
+    webhook_secret: "",
+    webhook_message_style: "rich",
+    webhook_mention_all: false,
     enabled: true,
     include_note: false,
   };

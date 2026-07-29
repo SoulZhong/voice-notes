@@ -54,14 +54,16 @@ fn tray_enabled(app: &AppHandle) -> bool {
 /// 按录制态构建三项菜单：toggle 文案随 recording 切「停止录制」/「开始录制」，
 /// show / quit 恒定。id 稳定（toggle/show/quit），on_menu_event 据此分发。
 ///
-/// toggle 项按 recording_ready 禁用（spec：模型缺失时禁用开始录制）：录制中恒可停
+/// toggle 项按录制就绪判定禁用（spec：模型缺失时禁用开始录制）：录制中恒可停
 /// （enabled = recording || ready）；未录且当前选型模型不完整则灰掉，避免点了必然失败。
 /// 已知取舍:刷新时机只有 setup / set_recording(即 start/stop 前后),模型下载完成本身不触发
 /// 菜单重建——故"模型刚下完到下一次 start/stop 之间"这段,菜单项仍是灰的(点不亮的窗口),
 /// 要到下一次录制状态变化才刷新可用。可接受:下载完成是低频一次性事件。
 fn build_menu(app: &AppHandle, recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
     let toggle_label = if recording { "停止录制" } else { "开始录制" };
-    let ready = crate::models::recording_ready(&crate::current_asr(app));
+    // 模式感知就绪判定,与设置页(models_status)/开录守卫同一份:云端模式下本机大模型
+    // 不必需,只要 vad 在 + 凭证齐就该点得亮——否则云端用户面对一个永远灰着的菜单项。
+    let ready = crate::current_models_status(app).recording_ready;
     let toggle = MenuItemBuilder::with_id("toggle", toggle_label)
         .enabled(recording || ready)
         .build(app)?;
@@ -171,11 +173,11 @@ fn set_menu_on_main(app: &AppHandle, recording: bool) {
 
 // —— 图标动画：仅录制中逐帧循环抖动，停止即静止 —— //
 
-/// 「活跃」= 会话正在录制。**只看录制**：停止录制通常紧接自动 Aing，若把 Aing 也算
-/// 活跃，抖动会一路延续到 Aing 结束——用户按了停止却还在抖，读起来像「没停下」。
-/// 故停录（会话离开 Recording）即停回静止 Logo，Aing 在后台安静进行、不再驱动图标。
+/// 「活跃」= 会话正在录制**且未暂停**。停录/暂停都静止:停止后继续抖读起来像
+/// 「没停下」(Aing 不驱动图标),暂停后继续抖读起来像「没暂停成」——图标动画的
+/// 语义就是"正在记",不在记就不该动。恢复录制经状态边沿重新起动画。
 fn is_active(s: &LifecycleState) -> bool {
-    matches!(s.session, SessionState::Recording { .. })
+    matches!(s.session, SessionState::Recording { paused: false, .. })
 }
 
 /// 内核状态提交后由 actor 调用（见 actor.rs 提交点）：按活跃度**边沿**驱动图标动画。
@@ -253,5 +255,36 @@ pub fn apply_enabled(app: &AppHandle) {
         setup(app);
     } else if !enabled && exists {
         app.remove_tray_by_id(TRAY_ID);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 动画活跃判定:录制中才动,暂停/空闲/停止都静止。暂停时若继续抖动,
+    /// 读起来像「没暂停成」——与停录即静止同一条产品理由(2026-07-29 冒烟反馈)。
+    #[test]
+    fn animation_active_only_while_recording_unpaused() {
+        let mut s = LifecycleState::init();
+        assert!(!is_active(&s), "空闲不动");
+        s.session = SessionState::Recording { note_id: "n".into(), paused: false };
+        assert!(is_active(&s), "录制中要动");
+        s.session = SessionState::Recording { note_id: "n".into(), paused: true };
+        assert!(!is_active(&s), "暂停即静止");
+    }
+
+    /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。
+    /// 为什么存在:PR#57 的图标流水线曾把 7 张帧 PNG 覆盖成 App 图标的近似副本,
+    /// 动画线程照常循环但每帧长一样——用户看到"小姑娘不写字了"。字节级去重是
+    /// 最便宜的哨兵:真动画必然逐帧有别,流水线再次压平资产时这里先红。
+    #[test]
+    fn rec_frames_are_pairwise_distinct_and_differ_from_idle() {
+        for i in 0..REC_FRAMES.len() {
+            assert_ne!(REC_FRAMES[i], IDLE_ICON, "第 {i} 帧不得等于静止帧(动画会隐形)");
+            for j in (i + 1)..REC_FRAMES.len() {
+                assert_ne!(REC_FRAMES[i], REC_FRAMES[j], "第 {i} 与第 {j} 帧重复(动画退化)");
+            }
+        }
     }
 }

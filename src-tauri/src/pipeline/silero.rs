@@ -4,26 +4,28 @@ use std::path::Path;
 /// 基于 sherpa-onnx Silero VAD 的语句分段器。
 /// 内部维护"当前句"缓冲：只在说话时累积，VAD 切出完整段时清空，用于实时 partial。
 pub struct SileroSegmenter {
-    vad: sherpa_rs::silero_vad::SileroVad,
+    vad: sherpa_onnx::VoiceActivityDetector,
     current: Vec<f32>,
 }
 
 impl SileroSegmenter {
     pub fn new(model_path: &Path) -> anyhow::Result<Self> {
-        let config = sherpa_rs::silero_vad::SileroVadConfig {
-            model: model_path.to_string_lossy().into_owned(),
-            min_silence_duration: 0.6, // 静音 > 0.6s 视为一句结束
-            min_speech_duration: 0.25,
-            max_speech_duration: 15.0, // 上限：超 15s 强制切，界定每次识别量
-            threshold: 0.5,
+        let config = sherpa_onnx::VadModelConfig {
+            silero_vad: sherpa_onnx::SileroVadModelConfig {
+                model: Some(model_path.to_string_lossy().into_owned()),
+                min_silence_duration: 0.6, // 静音 > 0.6s 视为一句结束
+                min_speech_duration: 0.25,
+                max_speech_duration: 15.0, // 上限：超 15s 强制切，界定每次识别量
+                threshold: 0.5,
+                window_size: 512,
+            },
             sample_rate: 16000,
-            window_size: 512,
-            num_threads: Some(1),
+            num_threads: 1,
             ..Default::default()
         };
         // buffer_size_in_seconds：内部环形缓冲容量，给足
-        let vad = sherpa_rs::silero_vad::SileroVad::new(config, 30.0)
-            .map_err(|e| anyhow::anyhow!("加载 Silero VAD 失败: {e}"))?;
+        let vad = sherpa_onnx::VoiceActivityDetector::create(&config, 30.0)
+            .ok_or_else(|| anyhow::anyhow!("加载 Silero VAD 失败(检查 {:?})", model_path))?;
         Ok(Self { vad, current: Vec::new() })
     }
 }
@@ -95,8 +97,8 @@ impl Segmenter for SileroSegmenter {
             .map(|&x| if x.is_finite() { x } else { 0.0 })
             .collect();
         let samples = samples.as_slice();
-        self.vad.accept_waveform(samples.to_vec());
-        if self.vad.is_speech() {
+        self.vad.accept_waveform(samples);
+        if self.vad.detected() {
             self.current.extend_from_slice(samples);
         } else {
             // 静音期清空预览缓冲：避免噪声导致 is_speech 抖动却不成段时，
@@ -108,8 +110,9 @@ impl Segmenter for SileroSegmenter {
     fn take_finished(&mut self) -> Vec<Segment> {
         let mut out = Vec::new();
         while !self.vad.is_empty() {
-            let seg = self.vad.front();
-            out.extend(split_long(seg.samples, seg.start.max(0) as usize));
+            let Some(seg) = self.vad.front() else { break };
+            out.extend(split_long(seg.samples().to_vec(), seg.start().max(0) as usize));
+            drop(seg); // front 是借用视图,pop 前先归还
             self.vad.pop();
         }
         if !out.is_empty() {

@@ -11,27 +11,35 @@ pub trait SpeakerEmbedder: Send {
 
 /// sherpa-onnx CAM++ 声纹模型。
 pub struct SherpaEmbedder {
-    inner: sherpa_rs::speaker_id::EmbeddingExtractor,
+    inner: sherpa_onnx::SpeakerEmbeddingExtractor,
 }
 
 impl SherpaEmbedder {
     pub fn new(model_path: &Path) -> anyhow::Result<Self> {
-        let config = sherpa_rs::speaker_id::ExtractorConfig {
-            model: model_path.to_string_lossy().into_owned(),
-            num_threads: Some(1),
+        let config = sherpa_onnx::SpeakerEmbeddingExtractorConfig {
+            model: Some(model_path.to_string_lossy().into_owned()),
+            num_threads: 1,
             ..Default::default()
         };
-        let inner = sherpa_rs::speaker_id::EmbeddingExtractor::new(config)
-            .map_err(|e| anyhow::anyhow!("加载声纹模型失败: {e}"))?;
+        let inner = sherpa_onnx::SpeakerEmbeddingExtractor::create(&config)
+            .ok_or_else(|| anyhow::anyhow!("加载声纹模型失败(检查 {:?})", model_path))?;
         Ok(Self { inner })
     }
 }
 
 impl SpeakerEmbedder for SherpaEmbedder {
     fn embed(&mut self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
+        // 官方 API 是流式喂入:整段一次 accept + input_finished 后 compute,
+        // 语义等价于旧 sherpa-rs 的 compute_speaker_embedding(samples, 16000)。
+        let stream = self
+            .inner
+            .create_stream()
+            .ok_or_else(|| anyhow::anyhow!("创建声纹流失败"))?;
+        stream.accept_waveform(16000, samples);
+        stream.input_finished();
         self.inner
-            .compute_speaker_embedding(samples.to_vec(), 16000)
-            .map_err(|e| anyhow::anyhow!("提取声纹失败: {e}"))
+            .compute(&stream)
+            .ok_or_else(|| anyhow::anyhow!("提取声纹失败(段过短或推理错误)"))
     }
 }
 

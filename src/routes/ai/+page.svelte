@@ -20,8 +20,10 @@
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
+  import { page } from "$app/stores";
   import { aiLogsQuery } from "$lib/ailog";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
+  import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
@@ -129,6 +131,102 @@
   //    条数仅作说明位展示,拉取失败静默(入口不因统计失败而残缺)。 ——
   let aiLogsTotal = $state(0);
   let backfillOpen = $state(false);
+  let promptCopied = $state(false);
+  let guideStep = $state(0);
+  let guidePosition = $state("left: 1rem; top: 1rem;");
+  let guidePlacement = $state<"right" | "below">("right");
+  const guideActive = $derived($page.url.searchParams.get("guide") === AI_TOOLS_GUIDE_ID);
+  const GUIDE_STEPS = [
+    {
+      target: "aing-settings",
+      eyebrow: "1 / 3 · 整理单次录音",
+      title: "先选择 AI 的执行方式",
+      body: "这就是实际生效的设置。在线接口适合固定模型；本机 Agent 可复用已经登录的 Claude、Codex 等工具。你可以现在直接选择并测试。",
+    },
+    {
+      target: "assistant-connect",
+      eyebrow: "2 / 3 · 接入现有工具",
+      title: "在这里把笔记交给常用助手",
+      body: "点击“注册”会把 voice-notes 作为 MCP 服务写入对应助手。注册后，回到 Claude、Cursor、Codex 或 Gemini 就能检索会议笔记。",
+    },
+    {
+      target: "agent-capabilities",
+      eyebrow: "3 / 3 · 理解权限边界",
+      title: "确认 Agent 实际能调用什么",
+      body: "这里列出的是真实工具清单。读取默认可用；开始或停止录制仍需你在上方显式开启控制权限。",
+    },
+  ] as const;
+  const currentGuide = $derived(GUIDE_STEPS[guideStep]);
+  const starterPrompt = "找出上周所有提到发布风险的会议，并按负责人整理待办。";
+
+  function scrollToSection(id: string) {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function copyStarterPrompt() {
+    try {
+      await navigator.clipboard.writeText(starterPrompt);
+      promptCopied = true;
+      setTimeout(() => (promptCopied = false), 1600);
+    } catch {
+      error = "复制失败，请手动选择示例文字";
+    }
+  }
+
+  function positionGuideBubble() {
+    if (!guideActive || !currentGuide) return;
+    const el = document.getElementById(currentGuide.target);
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const bubbleWidth = Math.min(370, window.innerWidth - 24);
+    const roomRight = window.innerWidth - rect.right;
+    let left: number;
+    let top: number;
+    if (roomRight >= bubbleWidth + 24) {
+      guidePlacement = "right";
+      left = rect.right + 14;
+      top = Math.max(12, Math.min(rect.top + 18, window.innerHeight - 260));
+    } else {
+      guidePlacement = "below";
+      left = Math.max(12, Math.min(rect.left + 18, window.innerWidth - bubbleWidth - 12));
+      top = Math.max(12, Math.min(rect.top + 62, window.innerHeight - 260));
+    }
+    guidePosition = `left:${left}px;top:${top}px;width:${bubbleWidth}px;`;
+  }
+
+  $effect(() => {
+    if (!guideActive || !currentGuide) return;
+    const target = currentGuide.target;
+    const timer = setTimeout(() => {
+      document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      setTimeout(positionGuideBubble, 260);
+    }, 80);
+    const reposition = () => positionGuideBubble();
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  });
+
+  async function completeGuide(goHooks = false) {
+    try {
+      const s = await getSettings();
+      const completed = new Set(s.completed_guides);
+      completed.add(AI_TOOLS_GUIDE_ID);
+      await setSettings({ ...s, completed_guides: [...completed], mcp_onboarded: true });
+    } catch {
+      /* 保存失败时下次会再次提示，当前仍允许用户继续 */
+    }
+    goto(goHooks ? "/hooks/new?from=ai-guide" : "/ai", { replaceState: true });
+  }
+
+  function nextGuideStep() {
+    if (guideStep < GUIDE_STEPS.length - 1) guideStep += 1;
+    else void completeGuide(false);
+  }
 
   async function loadAiLogsTotal() {
     try {
@@ -357,17 +455,62 @@
     <div class="banner">{error}</div>
   {/if}
 
+  <section class="quickstart" aria-labelledby="quickstart-title">
+    <div class="quickstart-heading">
+      <div>
+        <h2 id="quickstart-title">第一次使用 AI？从这里开始</h2>
+        <p>voice-notes 的 AI 分两层：会后 AI 整理单次录音，AI 助手跨笔记检索并衔接你的工作。</p>
+      </div>
+      <div class="quickstart-heading-actions">
+        <span class="local-badge">笔记默认留在本机</span>
+        <button class="btn-secondary" onclick={() => { guideStep = 0; goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`); }}>重播引导</button>
+      </div>
+    </div>
+    <div class="quickstart-path">
+      <div class="quickstep">
+        <span class="quickstep-no">1</span>
+        <div>
+          <strong>选择 AI 方式</strong>
+          <p>用在线接口，或复用本机已登录的 Agent；录制结束后自动修订转写。</p>
+          <button class="text-action" onclick={() => scrollToSection("aing-settings")}>去配置 ↓</button>
+        </div>
+      </div>
+      <div class="quickstep">
+        <span class="quickstep-no">2</span>
+        <div>
+          <strong>把笔记接入常用助手</strong>
+          <p>为 Claude、Cursor、Codex 或 Gemini 注册 MCP；其他工具可使用通用配置。</p>
+          <button class="text-action" onclick={() => scrollToSection("assistant-connect")}>
+            {mcpAgents.some((a) => a.registered) ? "查看已接入工具 ↓" : "选择接入工具 ↓"}
+          </button>
+        </div>
+      </div>
+      <div class="quickstep">
+        <span class="quickstep-no">3</span>
+        <div>
+          <strong>在助手里直接提问</strong>
+          <p class="starter-prompt">“{starterPrompt}”</p>
+          <button class="text-action" onclick={copyStarterPrompt}>{promptCopied ? "已复制 ✓" : "复制示例"}</button>
+        </div>
+      </div>
+    </div>
+    <p class="quickstart-foot">
+      想自动同步到飞书、Notion 或内部系统？到 <button class="text-action" onclick={() => goto("/hooks")}>钩子</button>
+      配置 AI 完成后的 Shell 命令或 Webhook。
+    </p>
+  </section>
+
   <!-- —— Aing:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
-  <section>
-    <h2 class="section-title">Aing</h2>
+  <section id="aing-settings" class="anchor-section" class:guide-target={guideActive && guideStep === 0}>
+    <h2 class="section-title">AI 整理</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">Aing 方式</span>
+          <span class="row-label">AI 方式</span>
           <span class="row-desc">
             {refineProvider === "agent"
-              ? "用本机已登录的 AI 助手 Aing,不需要 API Key"
-              : "用 OpenAI 兼容的在线接口 Aing,需要 API Key"}
+              ? "用本机已登录的 AI 助手整理，不需要 API Key"
+              : "用 OpenAI 兼容的在线接口整理，需要 API Key"}
           </span>
         </div>
         <div class="seg">
@@ -444,7 +587,7 @@
             {agentTest.ok ? `测试成功(${agentTest.msg})` : `测试失败: ${agentTest.msg}`}
           </p>
         {/if}
-        <p class="config-hint">Aing 失败(如 Agent 未登录)时保留原文,不影响已保存的笔记。</p>
+        <p class="config-hint">AI 处理失败（如 Agent 未登录）时保留原文，不影响已保存的笔记。</p>
       {:else}
         <div class="row">
           <div class="row-info">
@@ -512,14 +655,14 @@
           </p>
         {/if}
         {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">三项配齐后 Aing 生效。</p>
+          <p class="config-hint">三项配齐后会后 AI 生效。</p>
         {/if}
       {/if}
     </div>
   </section>
 
   <!-- —— AI 助手接入(MCP) —— -->
-  <section>
+  <section id="assistant-connect" class="anchor-section" class:guide-target={guideActive && guideStep === 1}>
     <h2 class="section-title">AI 助手接入</h2>
     <div class="rows">
       {#if mcpError}
@@ -626,7 +769,7 @@
   </section>
 
   <!-- —— Agent 能调用什么(MCP 工具 + CLI 命令清单,与后端 catalog 同源,纯只读展示) —— -->
-  <section>
+  <section id="agent-capabilities" class="anchor-section" class:guide-target={guideActive && guideStep === 2}>
     <h2 class="section-title">Agent 能调用什么</h2>
     <div class="rows">
       {#if capError}
@@ -679,7 +822,7 @@
         <div class="row-info">
           <span class="row-label">调用记录</span>
           <span class="row-desc">
-            Aing 与标题生成的每次对外 AI 调用,请求与响应全量留痕{aiLogsTotal > 0 ? `;共 ${aiLogsTotal} 条` : ""}
+            AI 整理与标题生成的每次对外调用，请求与响应全量留痕{aiLogsTotal > 0 ? `；共 ${aiLogsTotal} 条` : ""}
           </span>
         </div>
         <button class="btn-secondary" onclick={() => goto("/ai/logs")}>查看</button>
@@ -690,6 +833,31 @@
 
 <RelationBackfillDialog open={backfillOpen} onClose={() => (backfillOpen = false)} />
 
+{#if guideActive && currentGuide}
+  <aside
+    class="guide-coach"
+    class:placed-right={guidePlacement === "right"}
+    class:placed-below={guidePlacement === "below"}
+    style={guidePosition}
+    aria-live="polite"
+  >
+    <div>
+      <span class="guide-eyebrow">{currentGuide.eyebrow}</span>
+      <strong>{currentGuide.title}</strong>
+      <p>{currentGuide.body}</p>
+    </div>
+    <div class="guide-actions">
+      <button class="text-action" onclick={() => completeGuide(false)}>跳过</button>
+      {#if guideStep === GUIDE_STEPS.length - 1}
+        <button class="btn-secondary" onclick={() => completeGuide(true)}>继续了解钩子</button>
+        <button class="guide-next" onclick={nextGuideStep}>完成</button>
+      {:else}
+        <button class="guide-next" onclick={nextGuideStep}>下一步</button>
+      {/if}
+    </div>
+  </aside>
+{/if}
+
 <style>
   .page { padding: 0 1.5rem 2rem; }
   .topbar { position: sticky; top: 0; background: var(--canvas); padding: 1.1rem 0 0.6rem; }
@@ -697,6 +865,169 @@
 
   section {
     margin-top: 1.3rem;
+  }
+  .anchor-section { scroll-margin-top: 1rem; }
+  .guide-target {
+    position: relative;
+    z-index: 21;
+    border-radius: var(--radius-xl);
+    outline: 2px solid var(--accent);
+    outline-offset: 7px;
+  }
+  .guide-target::after {
+    content: "";
+    position: absolute;
+    inset: -9px;
+    z-index: -1;
+    border-radius: var(--radius-xl);
+    background: var(--accent-tint);
+    pointer-events: none;
+  }
+  .guide-coach {
+    position: fixed;
+    z-index: 30;
+    padding: 0.9rem 1rem 0.8rem;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-xl);
+    background: var(--canvas);
+    box-shadow: var(--shadow-popover);
+  }
+  .guide-coach::before,
+  .guide-coach::after {
+    content: "";
+    position: absolute;
+    width: 0;
+    height: 0;
+    border-style: solid;
+  }
+  .guide-coach.placed-right::before {
+    left: -9px; top: 24px;
+    border-width: 8px 9px 8px 0;
+    border-color: transparent var(--hairline-strong) transparent transparent;
+  }
+  .guide-coach.placed-right::after {
+    left: -7px; top: 25px;
+    border-width: 7px 8px 7px 0;
+    border-color: transparent var(--canvas) transparent transparent;
+  }
+  .guide-coach.placed-below::before {
+    left: 24px; top: -9px;
+    border-width: 0 8px 9px;
+    border-color: transparent transparent var(--hairline-strong);
+  }
+  .guide-coach.placed-below::after {
+    left: 25px; top: -7px;
+    border-width: 0 7px 8px;
+    border-color: transparent transparent var(--canvas);
+  }
+  .guide-coach strong { display: block; margin-top: 0.12rem; font-size: 0.92rem; }
+  .guide-coach p { margin: 0.25rem 0 0; color: var(--ink-secondary); font-size: 0.8rem; line-height: 1.5; }
+  .guide-eyebrow { color: var(--accent); font-size: 0.72rem; }
+  .guide-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 0.75rem;
+  }
+  .guide-next {
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    color: var(--on-primary);
+    padding: 0.48em 1.15em;
+    font-size: 0.82rem;
+    cursor: pointer;
+    box-shadow: var(--shadow-btn);
+  }
+  .quickstart {
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    margin-top: 0.75rem;
+  }
+  .quickstart-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 1rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .quickstart-heading h2 { margin: 0; font-size: 1rem; font-weight: 600; }
+  .quickstart-heading p {
+    margin: 0.25rem 0 0;
+    max-width: 37rem;
+    color: var(--ink-secondary);
+    font-size: 0.82rem;
+    line-height: 1.5;
+  }
+  .local-badge {
+    color: var(--success);
+    font-size: 0.74rem;
+  }
+  .quickstart-heading-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+  .quickstart-path {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .quickstep {
+    display: grid;
+    grid-template-columns: 1.4rem 1fr;
+    gap: 0.55rem;
+    padding: 0.9rem 1rem;
+    border-right: 1px solid var(--hairline);
+  }
+  .quickstep:last-child { border-right: none; }
+  .quickstep-no {
+    display: grid;
+    place-items: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    color: var(--on-primary);
+    font-size: 0.68rem;
+  }
+  .quickstep strong { font-size: 0.86rem; font-weight: 600; }
+  .quickstep p {
+    margin: 0.25rem 0 0.4rem;
+    color: var(--ink-secondary);
+    font-size: 0.78rem;
+    line-height: 1.5;
+  }
+  .quickstep .starter-prompt { color: var(--ink); }
+  .text-action {
+    border: none;
+    background: none;
+    color: var(--accent);
+    padding: 0;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .text-action:hover { color: var(--accent-pressed); text-decoration: underline; }
+  .quickstart-foot {
+    margin: 0;
+    padding: 0.65rem 1rem;
+    border-top: 1px solid var(--hairline);
+    color: var(--ink-faint);
+    font-size: 0.78rem;
+  }
+  @media (max-width: 760px) {
+    .quickstart-heading { display: block; }
+    .quickstart-heading-actions { margin-top: 0.65rem; justify-content: space-between; }
+    .quickstart-path { grid-template-columns: 1fr; }
+    .quickstep { border-right: none; border-bottom: 1px solid var(--hairline); }
+    .quickstep:last-child { border-bottom: none; }
+    .guide-coach {
+      max-width: calc(100vw - 1.5rem);
+    }
   }
   /* 区块标题(settings 页 .section-title 同款):卡片上方的次级标题,只用于新增的
      「Agent 能调用什么」区块——既有区块靠位置隐含上下文,不追加改动。 */

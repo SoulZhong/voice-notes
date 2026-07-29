@@ -5,10 +5,13 @@
 //! 状态同步。执行契约与 lifecycle::hooks::HookBus 一致:任何失败只记日志,
 //! 绝不影响录制/Aing 主流程。
 
+use crate::lifecycle::machine::{LifecycleState, SessionState};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-use crate::lifecycle::machine::{LifecycleState, SessionState};
 use tauri::Manager;
 
 /// 一条钩子配置。event/kind 存字符串而非枚举:未知值只让该条失配,不让整个
@@ -29,6 +32,19 @@ pub struct HookCfg {
     pub command: String,
     #[serde(default)]
     pub url: String,
+    /// webhook 消息格式:"generic"(原始 JSON)|"feishu"(群机器人)|"wecom"(群机器人)。
+    /// 老配置缺字段时保持 generic，载荷逐字兼容。
+    #[serde(default = "default_webhook_type")]
+    pub webhook_type: String,
+    /// 飞书自定义机器人的可选签名密钥。仅保存在本机 hooks.json。
+    #[serde(default)]
+    pub webhook_secret: String,
+    /// "text" | "rich"。飞书 rich=富文本 post，企微 rich=markdown。
+    #[serde(default = "default_message_style")]
+    pub webhook_message_style: String,
+    /// 群消息是否提醒所有人。
+    #[serde(default)]
+    pub webhook_mention_all: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// 附带笔记内容:开启时执行注入笔记详情与全文(修订稿优先)。默认关,
@@ -49,6 +65,22 @@ fn default_kind() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_webhook_type() -> String {
+    "generic".into()
+}
+
+fn default_message_style() -> String {
+    "rich".into()
+}
+
+fn platform(cfg: &HookCfg) -> &str {
+    match cfg.kind.as_str() {
+        "feishu" | "wecom" => cfg.kind.as_str(),
+        "webhook" => cfg.webhook_type.as_str(), // 兼容旧版二级 Webhook 配置
+        _ => "generic",
+    }
 }
 
 /// 缺失/损坏 → 空表(容忍,不报错;与 settings::load 同策略)。
@@ -86,7 +118,22 @@ pub fn load_checked(app_data: &Path) -> Result<HooksFile, String> {
 pub fn save(app_data: &Path, f: &HooksFile) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
     let tmp = app_data.join("hooks.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(f)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // hooks.json 可含飞书签名密钥；崩溃残留 tmp 也必须重新收紧权限。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(serde_json::to_string_pretty(f)?.as_bytes())?;
+    drop(file);
     std::fs::rename(&tmp, app_data.join("hooks.json"))?;
     Ok(())
 }
@@ -127,27 +174,64 @@ pub struct HookFire {
 pub fn hook_events(before: &LifecycleState, after: &LifecycleState) -> Vec<HookFire> {
     let mut out = Vec::new();
     match (&before.session, &after.session) {
-        (SessionState::Recording { note_id, paused: false }, SessionState::Recording { note_id: id2, paused: true })
-            if note_id == id2 =>
+        (
+            SessionState::Recording {
+                note_id,
+                paused: false,
+            },
+            SessionState::Recording {
+                note_id: id2,
+                paused: true,
+            },
+        ) if note_id == id2 => {
+            out.push(HookFire {
+                event: HookEvent::RecordingPaused,
+                note_id: note_id.clone(),
+            });
+        }
+        (
+            SessionState::Recording {
+                note_id,
+                paused: true,
+            },
+            SessionState::Recording {
+                note_id: id2,
+                paused: false,
+            },
+        ) if note_id == id2 => {
+            out.push(HookFire {
+                event: HookEvent::RecordingResumed,
+                note_id: note_id.clone(),
+            });
+        }
+        (from, SessionState::Recording { note_id, .. })
+            if !matches!(from, SessionState::Recording { .. }) =>
         {
-            out.push(HookFire { event: HookEvent::RecordingPaused, note_id: note_id.clone() });
+            out.push(HookFire {
+                event: HookEvent::RecordingStarted,
+                note_id: note_id.clone(),
+            });
         }
-        (SessionState::Recording { note_id, paused: true }, SessionState::Recording { note_id: id2, paused: false })
-            if note_id == id2 =>
-        {
-            out.push(HookFire { event: HookEvent::RecordingResumed, note_id: note_id.clone() });
-        }
-        (from, SessionState::Recording { note_id, .. }) if !matches!(from, SessionState::Recording { .. }) => {
-            out.push(HookFire { event: HookEvent::RecordingStarted, note_id: note_id.clone() });
-        }
-        (SessionState::Recording { note_id, .. } | SessionState::Stopping { note_id }, SessionState::Idle) => {
-            out.push(HookFire { event: HookEvent::RecordingStopped, note_id: note_id.clone() });
+        (
+            SessionState::Recording { note_id, .. } | SessionState::Stopping { note_id },
+            SessionState::Idle,
+        ) => {
+            out.push(HookFire {
+                event: HookEvent::RecordingStopped,
+                note_id: note_id.clone(),
+            });
         }
         _ => {}
     }
     let (added, removed) = before.refine.diff(&after.refine);
-    out.extend(added.into_iter().map(|id| HookFire { event: HookEvent::RefineStarted, note_id: id }));
-    out.extend(removed.into_iter().map(|id| HookFire { event: HookEvent::RefineFinished, note_id: id }));
+    out.extend(added.into_iter().map(|id| HookFire {
+        event: HookEvent::RefineStarted,
+        note_id: id,
+    }));
+    out.extend(removed.into_iter().map(|id| HookFire {
+        event: HookEvent::RefineFinished,
+        note_id: id,
+    }));
     out
 }
 
@@ -280,8 +364,10 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
         std::collections::HashMap::new();
     for f in &fires {
         let event = f.event.as_str();
-        let matched: Vec<&HookCfg> =
-            cfgs.iter().filter(|c| c.enabled && c.event == event).collect();
+        let matched: Vec<&HookCfg> = cfgs
+            .iter()
+            .filter(|c| c.enabled && c.event == event)
+            .collect();
         if matched.is_empty() {
             continue;
         }
@@ -309,8 +395,12 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
         for cfg in matched {
             let note = if cfg.include_note { content } else { None };
             let r = match cfg.kind.as_str() {
-                "webhook" => run_webhook(&cfg.url, &payload(event, &f.note_id, &title, &occurred_at, note), WEBHOOK_LIMIT)
-                    .map(|s| format!("HTTP {s}")),
+                "webhook" | "feishu" | "wecom" => {
+                    let generic = payload(event, &f.note_id, &title, &occurred_at, note);
+                    let body = webhook_body(cfg, event, &title, note, generic);
+                    run_webhook(&cfg.url, platform(cfg), &body, WEBHOOK_LIMIT)
+                        .map(|s| format!("HTTP {s}"))
+                }
                 // 非 0 退出码算失败,与 test_run 语义一致——否则"完成"日志会把真实的
                 // 命令失败盖过去,排查通道形同虚设。
                 _ => {
@@ -327,7 +417,10 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
             };
             match r {
                 Ok(msg) => eprintln!("hooks: '{}' [{}] 完成({msg})", cfg.name, event),
-                Err(e) => eprintln!("hooks: '{}' [{}] 失败: {e}(已忽略,不影响主流程)", cfg.name, event),
+                Err(e) => eprintln!(
+                    "hooks: '{}' [{}] 失败: {e}(已忽略,不影响主流程)",
+                    cfg.name, event
+                ),
             }
         }
     }
@@ -336,7 +429,11 @@ fn run_fires(app: &tauri::AppHandle, fires: Vec<HookFire>) {
 /// 配置页「测试」按钮:以假载荷立即执行一次,结果如实回传 UI。
 /// 超时收紧到 10s——测试是交互动作,30s 转圈没人等得起。
 pub fn test_run(cfg: &HookCfg) -> Result<String, String> {
-    let event = if cfg.event.is_empty() { "recording_stopped" } else { cfg.event.as_str() };
+    let event = if cfg.event.is_empty() {
+        "recording_stopped"
+    } else {
+        cfg.event.as_str()
+    };
     let occurred_at = chrono::Local::now().to_rfc3339();
     // 假内容:测试不读库,注入固定占位——用户看得出变量有值即可。
     let fake = cfg.include_note.then(|| NoteContent {
@@ -348,8 +445,11 @@ pub fn test_run(cfg: &HookCfg) -> Result<String, String> {
         truncated: false,
     });
     match cfg.kind.as_str() {
-        "webhook" => run_webhook(&cfg.url, &payload(event, "note-test", "测试笔记", &occurred_at, fake.as_ref()), WEBHOOK_LIMIT)
-            .map(|s| format!("HTTP {s}")),
+        "webhook" | "feishu" | "wecom" => {
+            let generic = payload(event, "note-test", "测试笔记", &occurred_at, fake.as_ref());
+            let body = webhook_body(cfg, event, "测试笔记", fake.as_ref(), generic);
+            run_webhook(&cfg.url, platform(cfg), &body, WEBHOOK_LIMIT).map(|s| format!("HTTP {s}"))
+        }
         _ => {
             let mut envs = shell_envs(event, "note-test", "测试笔记");
             if let Some(c) = &fake {
@@ -400,9 +500,137 @@ pub fn payload(
     p
 }
 
+fn event_display(event: &str) -> &str {
+    match event {
+        "recording_started" => "录制开始",
+        "recording_stopped" => "录制完成",
+        "recording_paused" => "录制暂停",
+        "recording_resumed" => "录制恢复",
+        "refine_started" => "Aing 开始",
+        "refine_finished" => "Aing 结束",
+        _ => event,
+    }
+}
+
+/// 群机器人只接受自己的消息协议。正文限制在 3,500 字节内，给平台 JSON 包装和
+/// UTF-8 留余量；通用 webhook 保持原始结构与既有 200KB 上限不变。
+fn bot_text(event: &str, title: &str, note: Option<&NoteContent>) -> String {
+    let mut text = format!("voice-notes · {}\n{}", event_display(event), title);
+    if let Some(n) = note {
+        text.push_str(&format!(
+            "\n时长：{} 分钟\n参与者：{}",
+            n.duration_secs / 60,
+            if n.speakers.is_empty() {
+                "暂无".into()
+            } else {
+                n.speakers.join("、")
+            }
+        ));
+        if !n.text.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&n.text);
+        }
+    }
+    let (text, truncated) = truncate_utf8(text, 3_500);
+    if truncated {
+        format!("{text}\n\n（内容过长，已截断）")
+    } else {
+        text
+    }
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for i in 0..64 {
+        inner_pad[i] ^= block[i];
+        outer_pad[i] ^= block[i];
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_pad)
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(outer_pad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+fn feishu_sign(secret: &str, timestamp: i64) -> String {
+    let string_to_sign = format!("{timestamp}\n{secret}");
+    base64::engine::general_purpose::STANDARD.encode(hmac_sha256(string_to_sign.as_bytes(), &[]))
+}
+
+pub fn webhook_body(
+    cfg: &HookCfg,
+    event: &str,
+    title: &str,
+    note: Option<&NoteContent>,
+    generic: serde_json::Value,
+) -> serde_json::Value {
+    let mut text = bot_text(event, title, note);
+    match platform(cfg) {
+        "feishu" => {
+            if cfg.webhook_mention_all && cfg.webhook_message_style != "rich" {
+                text.push_str("\n<at user_id=\"all\">所有人</at>");
+            }
+            let mut body = if cfg.webhook_message_style == "rich" {
+                let mut paragraphs = text
+                    .lines()
+                    .map(|line| serde_json::json!([{ "tag": "text", "text": line }]))
+                    .collect::<Vec<_>>();
+                if cfg.webhook_mention_all {
+                    paragraphs.push(serde_json::json!([{
+                        "tag": "at", "user_id": "all", "user_name": "所有人"
+                    }]));
+                }
+                serde_json::json!({
+                    "msg_type": "post",
+                    "content": { "post": { "zh_cn": { "title": title, "content": paragraphs } } }
+                })
+            } else {
+                serde_json::json!({ "msg_type": "text", "content": { "text": text } })
+            };
+            if !cfg.webhook_secret.trim().is_empty() {
+                let timestamp = chrono::Utc::now().timestamp();
+                body["timestamp"] = serde_json::json!(timestamp.to_string());
+                body["sign"] = serde_json::json!(feishu_sign(&cfg.webhook_secret, timestamp));
+            }
+            body
+        }
+        "wecom" if cfg.webhook_message_style == "rich" => {
+            if cfg.webhook_mention_all {
+                text.push_str("\n<@all>");
+            }
+            serde_json::json!({
+                "msgtype": "markdown",
+                "markdown": { "content": truncate_utf8(text, 4_096).0 }
+            })
+        }
+        "wecom" => serde_json::json!({
+            "msgtype": "text",
+            "text": {
+                "content": truncate_utf8(text, 2_048).0,
+                "mentioned_list": if cfg.webhook_mention_all { vec!["@all"] } else { Vec::<&str>::new() }
+            }
+        }),
+        _ => generic,
+    }
+}
+
 /// 轮询 try_wait 实现超时:std 没有 wait_timeout,200ms 步进对 30s 上限的
 /// 精度足够;超时 kill+wait 收尸,不留僵尸。
-fn wait_timeout(child: &mut std::process::Child, limit: Duration) -> Option<std::process::ExitStatus> {
+fn wait_timeout(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
     let start = std::time::Instant::now();
     loop {
         if let Ok(Some(st)) = child.try_wait() {
@@ -453,16 +681,51 @@ pub fn run_shell(command: &str, envs: &[(String, String)], limit: Duration) -> R
 }
 
 /// 发送 webhook POST 请求,返回 HTTP 状态码;非 2xx 为错误。
-pub fn run_webhook(url: &str, payload: &serde_json::Value, limit: Duration) -> Result<u16, String> {
+pub fn run_webhook(
+    url: &str,
+    platform: &str,
+    payload: &serde_json::Value,
+    limit: Duration,
+) -> Result<u16, String> {
     match ureq::post(url)
         .timeout(limit)
         .set("content-type", "application/json")
         .send_string(&payload.to_string())
     {
-        Ok(resp) => Ok(resp.status()),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.into_string().unwrap_or_default();
+            if matches!(platform, "feishu" | "wecom") && !body.trim().is_empty() {
+                platform_response(platform, &body)?;
+            }
+            Ok(status)
+        }
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
         Err(e) => Err(format!("请求失败: {e}")),
     }
+}
+
+fn platform_response(platform: &str, body: &str) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "平台返回了无法识别的响应".to_string())?;
+    let code = if platform == "wecom" {
+        parsed.get("errcode").and_then(|v| v.as_i64())
+    } else {
+        parsed
+            .get("code")
+            .or_else(|| parsed.get("StatusCode"))
+            .and_then(|v| v.as_i64())
+    };
+    if code.unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let msg = parsed
+        .get("errmsg")
+        .or_else(|| parsed.get("msg"))
+        .or_else(|| parsed.get("StatusMessage"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("未知错误");
+    Err(format!("平台拒绝消息（{}）：{msg}", code.unwrap_or(-1)))
 }
 
 #[cfg(test)]
@@ -472,11 +735,17 @@ mod tests {
     use std::time::Duration;
 
     fn st(session: SessionState) -> LifecycleState {
-        LifecycleState { session, refine: Default::default() }
+        LifecycleState {
+            session,
+            refine: Default::default(),
+        }
     }
 
     fn fire(event: HookEvent, id: &str) -> HookFire {
-        HookFire { event, note_id: id.into() }
+        HookFire {
+            event,
+            note_id: id.into(),
+        }
     }
 
     #[test]
@@ -484,14 +753,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(load(tmp.path()).hooks.is_empty(), "缺文件 → 空表");
         std::fs::write(tmp.path().join("hooks.json"), "not json").unwrap();
-        assert!(load(tmp.path()).hooks.is_empty(), "损坏 → 空表(派发路径容错语义不变)");
+        assert!(
+            load(tmp.path()).hooks.is_empty(),
+            "损坏 → 空表(派发路径容错语义不变)"
+        );
     }
 
     #[test]
     fn load_checked_errs_on_corrupt_but_oks_on_missing() {
         let tmp = tempfile::tempdir().unwrap();
         // 缺失文件:未配置过的正常初始状态,不是错误
-        assert!(load_checked(tmp.path()).unwrap().hooks.is_empty(), "缺文件 → Ok(空表)");
+        assert!(
+            load_checked(tmp.path()).unwrap().hooks.is_empty(),
+            "缺文件 → Ok(空表)"
+        );
         // 存在且解析失败:必须如实报错,UI 才能点亮横幅、编辑页 save 流程才会中止而非覆盖
         std::fs::write(tmp.path().join("hooks.json"), "not json").unwrap();
         let err = load_checked(tmp.path()).expect_err("损坏文件必须 Err");
@@ -509,6 +784,10 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo done".into(),
                 url: String::new(),
+                webhook_type: "generic".into(),
+                webhook_secret: String::new(),
+                webhook_message_style: "rich".into(),
+                webhook_mention_all: false,
                 enabled: true,
                 include_note: false,
             }],
@@ -517,7 +796,20 @@ mod tests {
         let got = load(tmp.path());
         assert_eq!(got.hooks.len(), 1);
         assert_eq!(got.hooks[0].event, "recording_stopped");
-        assert!(!tmp.path().join("hooks.json.tmp").exists(), "原子写不留 tmp");
+        assert!(
+            !tmp.path().join("hooks.json.tmp").exists(),
+            "原子写不留 tmp"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("hooks.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "可能含签名密钥的 hooks.json 仅当前用户可读写");
+        }
     }
 
     #[test]
@@ -530,15 +822,75 @@ mod tests {
         .unwrap();
         let got = load(tmp.path());
         assert_eq!(got.hooks[0].kind, "shell", "kind 缺省 shell");
+        assert_eq!(
+            got.hooks[0].webhook_type, "generic",
+            "老配置缺省通用 webhook"
+        );
         assert!(got.hooks[0].enabled, "enabled 缺省 true");
     }
 
     #[test]
+    fn webhook_body_uses_platform_protocol_and_keeps_generic_unchanged() {
+        let generic = serde_json::json!({"event": "recording_stopped", "note_id": "n1"});
+        let mut cfg = HookCfg {
+            id: "h".into(),
+            name: "测试".into(),
+            event: "recording_stopped".into(),
+            kind: "feishu".into(),
+            command: String::new(),
+            url: String::new(),
+            webhook_type: "generic".into(),
+            webhook_secret: String::new(),
+            webhook_message_style: "text".into(),
+            webhook_mention_all: false,
+            enabled: true,
+            include_note: false,
+        };
+
+        let feishu = webhook_body(&cfg, "recording_stopped", "周会", None, generic.clone());
+        assert_eq!(feishu["msg_type"], "text");
+        assert_eq!(feishu["content"]["text"], "voice-notes · 录制完成\n周会");
+
+        cfg.kind = "wecom".into();
+        let wecom = webhook_body(&cfg, "refine_finished", "周会", None, generic.clone());
+        assert_eq!(wecom["msgtype"], "text");
+        assert_eq!(wecom["text"]["content"], "voice-notes · Aing 结束\n周会");
+
+        cfg.kind = "webhook".into();
+        assert_eq!(
+            webhook_body(&cfg, "recording_stopped", "周会", None, generic.clone()),
+            generic,
+            "通用 webhook 必须保持既有载荷"
+        );
+    }
+
+    #[test]
+    fn platform_response_checks_business_code_not_only_http_status() {
+        assert!(platform_response("feishu", r#"{"code":0,"msg":"success"}"#).is_ok());
+        assert!(platform_response("wecom", r#"{"errcode":0,"errmsg":"ok"}"#).is_ok());
+        assert_eq!(
+            platform_response("feishu", r#"{"code":19021,"msg":"sign match fail"}"#).unwrap_err(),
+            "平台拒绝消息（19021）：sign match fail"
+        );
+        assert_eq!(
+            platform_response("wecom", r#"{"errcode":93000,"errmsg":"invalid webhook"}"#)
+                .unwrap_err(),
+            "平台拒绝消息（93000）：invalid webhook"
+        );
+    }
+
+    #[test]
     fn session_transitions_map_to_events() {
-        let rec = |paused| SessionState::Recording { note_id: "n1".into(), paused };
+        let rec = |paused| SessionState::Recording {
+            note_id: "n1".into(),
+            paused,
+        };
         // 开始(经 Starting,含续录同路径)
         assert_eq!(
-            hook_events(&st(SessionState::Starting { resume_id: None }), &st(rec(false))),
+            hook_events(
+                &st(SessionState::Starting { resume_id: None }),
+                &st(rec(false))
+            ),
             vec![fire(HookEvent::RecordingStarted, "n1")]
         );
         // 停止(Recording→Idle 与 Stopping→Idle 同义)
@@ -547,7 +899,12 @@ mod tests {
             vec![fire(HookEvent::RecordingStopped, "n1")]
         );
         assert_eq!(
-            hook_events(&st(SessionState::Stopping { note_id: "n1".into() }), &st(SessionState::Idle)),
+            hook_events(
+                &st(SessionState::Stopping {
+                    note_id: "n1".into()
+                }),
+                &st(SessionState::Idle)
+            ),
             vec![fire(HookEvent::RecordingStopped, "n1")]
         );
         // 暂停/恢复(同 id 的 paused 翻转)
@@ -560,7 +917,11 @@ mod tests {
             vec![fire(HookEvent::RecordingResumed, "n1")]
         );
         // 非迁移:Idle→Starting、原地不动,都不产事件
-        assert!(hook_events(&st(SessionState::Idle), &st(SessionState::Starting { resume_id: None })).is_empty());
+        assert!(hook_events(
+            &st(SessionState::Idle),
+            &st(SessionState::Starting { resume_id: None })
+        )
+        .is_empty());
         assert!(hook_events(&st(SessionState::Idle), &st(SessionState::Idle)).is_empty());
     }
 
@@ -568,19 +929,34 @@ mod tests {
     fn refine_diff_maps_to_events_and_composes_with_session() {
         // 停录 + 同帧自动 Aing 启动:一次提交两个事件,顺序 = session 事件在前
         let before = LifecycleState {
-            session: SessionState::Recording { note_id: "n1".into(), paused: false },
+            session: SessionState::Recording {
+                note_id: "n1".into(),
+                paused: false,
+            },
             refine: Default::default(),
         };
-        let mut after = LifecycleState { session: SessionState::Idle, refine: Default::default() };
+        let mut after = LifecycleState {
+            session: SessionState::Idle,
+            refine: Default::default(),
+        };
         after.refine = before.refine.diff_test_insert("n1"); // 见 Step 3:测试辅助
         let got = hook_events(&before, &after);
         assert_eq!(
             got,
-            vec![fire(HookEvent::RecordingStopped, "n1"), fire(HookEvent::RefineStarted, "n1")]
+            vec![
+                fire(HookEvent::RecordingStopped, "n1"),
+                fire(HookEvent::RefineStarted, "n1")
+            ]
         );
         // Aing 完成
-        let done = LifecycleState { session: SessionState::Idle, refine: Default::default() };
-        assert_eq!(hook_events(&after, &done), vec![fire(HookEvent::RefineFinished, "n1")]);
+        let done = LifecycleState {
+            session: SessionState::Idle,
+            refine: Default::default(),
+        };
+        assert_eq!(
+            hook_events(&after, &done),
+            vec![fire(HookEvent::RefineFinished, "n1")]
+        );
     }
 
     #[test]
@@ -590,7 +966,13 @@ mod tests {
         assert!(envs.contains(&("VN_NOTE_ID".into(), "n1".into())));
         assert!(envs.contains(&("VN_NOTE_TITLE".into(), "周会".into())));
 
-        let p = payload("refine_finished", "n1", "周会", "2026-07-14T10:00:00+08:00", None);
+        let p = payload(
+            "refine_finished",
+            "n1",
+            "周会",
+            "2026-07-14T10:00:00+08:00",
+            None,
+        );
         assert_eq!(p["event"], "refine_finished");
         assert_eq!(p["note_id"], "n1");
         assert_eq!(p["note_title"], "周会");
@@ -643,7 +1025,10 @@ mod tests {
             r#"{"hooks":[{"id":"h_old","event":"recording_stopped","command":"true"}]}"#,
         )
         .unwrap();
-        assert!(!load(tmp.path()).hooks[0].include_note, "老配置缺字段 → false");
+        assert!(
+            !load(tmp.path()).hooks[0].include_note,
+            "老配置缺字段 → false"
+        );
     }
 
     #[test]
@@ -689,23 +1074,44 @@ mod tests {
         let c = content_fixture();
         let envs = note_envs(&c);
         assert!(envs.contains(&("VN_NOTE_TEXT".into(), "# 占位正文".into())));
-        assert!(envs.contains(&("VN_NOTE_STARTED_AT".into(), "2026-07-14T10:00:00+08:00".into())));
-        assert!(envs.contains(&("VN_NOTE_ENDED_AT".into(), "2026-07-14T11:00:00+08:00".into())));
+        assert!(envs.contains(&(
+            "VN_NOTE_STARTED_AT".into(),
+            "2026-07-14T10:00:00+08:00".into()
+        )));
+        assert!(envs.contains(&(
+            "VN_NOTE_ENDED_AT".into(),
+            "2026-07-14T11:00:00+08:00".into()
+        )));
         assert!(envs.contains(&("VN_NOTE_DURATION_SECS".into(), "3600".into())));
         assert!(envs.contains(&("VN_NOTE_SPEAKERS".into(), "张三、说话人 2".into())));
-        assert!(!envs.iter().any(|(k, _)| k == "VN_NOTE_TEXT_TRUNCATED"), "未截断不注入标记");
+        assert!(
+            !envs.iter().any(|(k, _)| k == "VN_NOTE_TEXT_TRUNCATED"),
+            "未截断不注入标记"
+        );
 
         let mut cut = content_fixture();
         cut.truncated = true;
         assert!(note_envs(&cut).contains(&("VN_NOTE_TEXT_TRUNCATED".into(), "1".into())));
 
-        let p = payload("refine_finished", "n1", "周会", "2026-07-14T11:00:01+08:00", Some(&c));
+        let p = payload(
+            "refine_finished",
+            "n1",
+            "周会",
+            "2026-07-14T11:00:01+08:00",
+            Some(&c),
+        );
         assert_eq!(p["note"]["duration_secs"], 3600);
         assert_eq!(p["note"]["speakers"][0], "张三");
         assert_eq!(p["note"]["text"], "# 占位正文");
         assert_eq!(p["note"]["text_truncated"], false);
         // 未附带时与现状逐字一致(回归防漂移):没有 note 键
-        let p0 = payload("refine_finished", "n1", "周会", "2026-07-14T11:00:01+08:00", None);
+        let p0 = payload(
+            "refine_finished",
+            "n1",
+            "周会",
+            "2026-07-14T11:00:01+08:00",
+            None,
+        );
         assert!(p0.get("note").is_none());
         assert_eq!(p0["event"], "refine_finished");
     }

@@ -1,3 +1,4 @@
+pub mod cloud_forward;
 pub mod frame_tap;
 pub mod segmenter;
 pub mod segment_worker;
