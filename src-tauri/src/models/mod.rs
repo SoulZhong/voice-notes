@@ -357,14 +357,9 @@ pub fn status_for(asr_model: &str, cloud_mode: bool, creds_ok: bool) -> ModelsSt
     s
 }
 
-/// start/resume_recording 入口的防御检查用。按当前 ASR 选型判定必需工件是否齐。
-pub fn recording_ready(asr_model: &str) -> bool {
-    let root = root();
-    ARTIFACTS
-        .iter()
-        .filter(|a| required_now(a.id, asr_model))
-        .all(|a| artifact_present(&root, a))
-}
+// 曾有一个 recording_ready(asr_model) 供开录守卫/托盘单独判定,已删除:它只认本地
+// 选型,云端模式下会把"本机大模型没下全"当成不可开录,而云端根本不需要那些件。
+// 就绪判定现在只有 status_for 一条真源,调用方经 lib.rs::current_models_status 取用。
 
 #[cfg(test)]
 mod tests {

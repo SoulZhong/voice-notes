@@ -1692,11 +1692,18 @@ fn handle_cloud_event<F, P, D, S>(
     }
 }
 
+/// 识别 worker 线程的返还物:(recognizer, embedder)。recognizer 为 Option——
+/// 云端模式没有本机识别器可还(识别在厂商侧),本地模式恒 Some,调用方的 stash
+/// 语义因此两边一致(stash_model 对 None 是空操作)。
+type AsrJoin =
+    std::thread::JoinHandle<(Option<Box<dyn Recognizer>>, Option<Box<dyn SpeakerEmbedder>>)>;
+
 /// 一次录制会话的句柄：持两路 capture + 各 worker 的 join 句柄。
 pub struct RecordingHandle {
     captures: Vec<Box<dyn AudioCapture>>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    asr: Option<std::thread::JoinHandle<(Box<dyn Recognizer>, Option<Box<dyn SpeakerEmbedder>>)>>,
+    /// 识别 worker 的 join 句柄(本地 / 云端同一个槽,见 AsrJoin)。
+    asr: Option<AsrJoin>,
     /// 各 segment_worker 共享的暂停闸（true = 丢帧，时间轴冻结）。
     paused: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1710,6 +1717,9 @@ impl RecordingHandle {
     /// 优雅停止：停各 capture（关帧通道）→ 分段 worker flush 尾段后退出并 join
     /// →（其 finals 发送端随之 drop）ASR worker 排干剩余 finals 后退出并 join，
     /// 返还 recognizer / embedder 供复用（asr 线程 panic 时均返 None，调用方现场重载兜底）。
+    /// 云端模式下 recognizer 恒为 None（识别在厂商侧,本机无模型可还）；
+    /// 其收尾链完全同构:CloudForwarder 随分段 worker drop → 音频通道关闭 →
+    /// 云端 worker finish 厂商流、排干末尾定稿后退出。
     pub fn stop(mut self) -> (Option<Box<dyn Recognizer>>, Option<Box<dyn SpeakerEmbedder>>) {
         for c in self.captures.iter_mut() {
             c.stop();
@@ -1719,7 +1729,7 @@ impl RecordingHandle {
         }
         match self.asr.take() {
             Some(a) => match a.join() {
-                Ok((r, e)) => (Some(r), e),
+                Ok((r, e)) => (r, e),
                 Err(_) => {
                     eprintln!("RecordingHandle::stop: asr 线程异常退出（panic），模型不回收");
                     (None, None)
@@ -1738,9 +1748,10 @@ pub struct SessionStart {
 }
 
 /// start_session 失败时携带 recognizer / embedder 返还，避免常驻模型在错误路径丢失。
+/// recognizer 为 Option:云端模式压根没有本机识别器,无可返还(None)。
 pub struct StartError {
     pub error: anyhow::Error,
-    pub recognizer: Box<dyn Recognizer>,
+    pub recognizer: Option<Box<dyn Recognizer>>,
     pub embedder: Option<Box<dyn SpeakerEmbedder>>,
 }
 
@@ -1750,16 +1761,36 @@ impl std::fmt::Debug for StartError {
     }
 }
 
+/// 本场录制的识别引擎:本机常驻识别器,或云端厂商流。
+///
+/// 云端所需的两件"只有调用方知道"的东西随变体一起传进来,而不是加到 start_session
+/// 的参数表里——本地路的调用点(既有测试/store 测试/lib.rs)因此一字不改,云端专属
+/// 的装配也不会漏进本地分支:
+///  - `backfill_segmenter`:缺口补识的本机 VAD 切段器(模型路径归 lib.rs 管,
+///    session 层不碰 models::root);
+///  - `on_status`:重连/补识状态回调(session 层保持无 UI 依赖,emit 留给 lib.rs)。
+pub enum AsrEngine {
+    Local(Box<dyn Recognizer>),
+    Cloud {
+        asr: Arc<dyn crate::asr::cloud::CloudAsr>,
+        backfill_segmenter: Box<BackfillSegmenter>,
+        on_status: Box<dyn FnMut(CloudAsrStatus) + Send>,
+    },
+}
+
 /// 起会话：每源一条分段 worker + 单 ASR worker，接好 finals 通道与每源 partial 槽。
 /// 某源 capture 启动失败 → 跳过该源并记入 failed（用于降级）；无任何源启动 → Err。
 /// audio_sinks:按源可选的音频旁路(录音保留),worker 在暂停闸后把重采样样本喂给它;
 /// 未提供的源不落音频。capture 启动失败的源其 sink 随 worker 一起丢弃(惰性建档不留空文件)。
 /// aec_roles:按源可选的软件回声消除角色(System=Render 参考,Mic=Capture 消回声,
 /// 见 audio::aec);capture 启动失败的源其角色随 worker 一起丢弃。
+/// engine:本机识别器 或 云端厂商流(见 AsrEngine)。云端分支下 sources 里带的本机
+/// 分段器整段让位给 CloudForwarder——断句由厂商服务端 VAD 负责,本机只做转发,
+/// run_segment_worker(AEC/暂停闸/电平/音频旁路)一行不改地复用。
 #[allow(clippy::too_many_arguments)]
 pub fn start_session(
     sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)>,
-    recognizer: Box<dyn Recognizer>,
+    engine: AsrEngine,
     embedder: Option<Box<dyn SpeakerEmbedder>>,
     registry: SpeakerRegistry,
     echo_hold: Duration,
@@ -1783,9 +1814,22 @@ pub fn start_session(
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut active: Vec<Source> = Vec::new();
     let mut failed: Vec<(Source, String)> = Vec::new();
+    // 云端:每源一条「分段 worker → 云端 worker」的音频通道。只收录 capture 启动成功
+    // 的源(与 slots 同节奏),否则会为一条根本没音频的源白开一次厂商流。
+    let cloud_mode = matches!(engine, AsrEngine::Cloud { .. });
+    let mut audio_rxs: Vec<(Source, Receiver<Vec<f32>>)> = Vec::new();
 
     for (source, mut capture, segmenter) in sources {
         let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(256);
+        // 云端:本机分段器让位给 CloudForwarder(只转发,不断句)。被替下的 silero
+        // 在此 drop——多花一次构造是本地/云端共用同一段源装配代码的代价,换来 lib.rs
+        // 侧的源构建(采集栈/AEC/健康统计)零分叉。
+        let (segmenter, cloud_rx): (Box<dyn Segmenter>, Option<Receiver<Vec<f32>>>) = if cloud_mode {
+            let (atx, arx) = crossbeam_channel::unbounded::<Vec<f32>>();
+            (Box::new(crate::pipeline::cloud_forward::CloudForwarder::new(atx)), Some(arx))
+        } else {
+            (segmenter, None)
+        };
         let slot = Arc::new(Mutex::new(None));
         let slot_for_worker = slot.clone();
         let final_tx = finals_tx.clone();
@@ -1820,6 +1864,9 @@ pub fn start_session(
             Ok(()) => {
                 active.push(source);
                 slots.push((source, slot));
+                if let Some(rx) = cloud_rx {
+                    audio_rxs.push((source, rx));
+                }
                 captures.push(capture);
                 workers.push(w);
             }
@@ -1835,25 +1882,53 @@ pub fn start_session(
     if active.is_empty() {
         return Err(StartError {
             error: anyhow::anyhow!("没有可用音频源可启动: {failed:?}"),
-            recognizer,
+            recognizer: match engine {
+                AsrEngine::Local(r) => Some(r),
+                AsrEngine::Cloud { .. } => None,
+            },
             embedder,
         });
     }
 
-    let asr = std::thread::spawn(move || {
-        run_asr_worker(
-            recognizer,
-            embedder,
-            registry,
-            finals_rx,
-            echo_hold,
-            language_filter,
-            slots,
-            on_final,
-            on_partial,
-            on_diar,
-        )
-    });
+    let asr = match engine {
+        AsrEngine::Local(recognizer) => std::thread::spawn(move || {
+            let (r, e) = run_asr_worker(
+                recognizer,
+                embedder,
+                registry,
+                finals_rx,
+                echo_hold,
+                language_filter,
+                slots,
+                on_final,
+                on_partial,
+                on_diar,
+            );
+            (Some(r), e)
+        }),
+        AsrEngine::Cloud { asr, backfill_segmenter, on_status } => {
+            // finals_rx / slots 在云端不参与:CloudForwarder 既不产段也不产 partial,
+            // 通道就此空转(发送端随分段 worker 一起 drop)。
+            drop(finals_rx);
+            drop(slots);
+            std::thread::spawn(move || {
+                let e = run_cloud_asr_worker(
+                    asr,
+                    embedder,
+                    registry,
+                    audio_rxs,
+                    echo_hold,
+                    language_filter,
+                    backfill_segmenter,
+                    on_final,
+                    on_partial,
+                    on_diar,
+                    on_status,
+                );
+                (None, e)
+            })
+        }
+    };
 
     Ok(SessionStart {
         handle: RecordingHandle { captures, workers, asr: Some(asr), paused },
@@ -3181,7 +3256,7 @@ mod session_tests {
 
         let start = start_session(
             sources,
-            Box::new(ContentDigestRecognizer),
+            AsrEngine::Local(Box::new(ContentDigestRecognizer)),
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
@@ -3237,7 +3312,7 @@ mod session_tests {
         )];
         let start = start_session(
             sources,
-            Box::new(CountingRecognizer),
+            AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
@@ -3283,7 +3358,7 @@ mod session_tests {
         )];
         let start = start_session(
             sources,
-            Box::new(CountingRecognizer),
+            AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
@@ -3315,7 +3390,7 @@ mod session_tests {
             vec![(Source::System, Box::new(FailingCapture), Box::new(MockSegmenter::new(8000)))];
         let r = start_session(
             sources,
-            Box::new(CountingRecognizer),
+            AsrEngine::Local(Box::new(CountingRecognizer)),
             None,
             SpeakerRegistry::new(),
             TEST_ECHO_HOLD,
@@ -3334,7 +3409,80 @@ mod session_tests {
             Err(e) => e,
         };
         assert!(err.error.to_string().contains("没有可用音频源"));
-        let _reusable: Box<dyn Recognizer> = err.recognizer; // Err 携带 recognizer 返还
+        // Err 携带 recognizer 返还(本地引擎恒 Some)
+        let _reusable: Box<dyn Recognizer> = err.recognizer.expect("本地模式应返还识别器");
+    }
+
+    /// 云端装配冒烟:AsrEngine::Cloud 下,源自带的本机分段器让位给 CloudForwarder,
+    /// 采集帧一路进厂商流(pushed_samples > 0),厂商定稿经同一条 FinalSink 出到
+    /// on_final;停录返还 recognizer=None(云端无本机识别器)、embedder 照常返还。
+    #[test]
+    fn cloud_engine_forwards_audio_and_emits_vendor_finals() {
+        use crate::asr::cloud::{CloudEvent, DefiniteUtterance, MockCloudAsr};
+        use crate::diar::MockEmbedder;
+
+        let mock = MockCloudAsr::new(
+            vec![vec![CloudEvent::Definite(DefiniteUtterance {
+                text: "云端定稿".into(),
+                start_ms: 0,
+                end_ms: 500,
+                words: vec![],
+                lang: String::new(),
+            })]],
+            vec![],
+        );
+        let pushed = mock.pushed_samples.clone();
+
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let f2 = finals.clone();
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![(
+            Source::Mic,
+            Box::new(IdlingCapture::from_fixture()),
+            // 这只分段器在云端分支被 CloudForwarder 顶替,断句归厂商。
+            Box::new(MockSegmenter::new(2000)),
+        )];
+        let start = start_session(
+            sources,
+            AsrEngine::Cloud {
+                asr: Arc::new(mock),
+                // 本用例不制造断连,补识桩不会被调用。
+                backfill_segmenter: Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+                on_status: Box::new(|_| {}),
+            },
+            Some(Box::new(MockEmbedder::new(vec![])) as Box<dyn SpeakerEmbedder>),
+            SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
+            false, // language_filter:与本用例无关,关掉隔离变量
+            16000,
+            4000,
+            vec![],
+            vec![],
+            move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+            |_, _| {},
+            |_| {},
+            None,
+        )
+        .expect("start_session");
+        assert_eq!(start.active, vec![Source::Mic]);
+
+        // 有界轮询：等采集帧真的经 CloudForwarder 推进厂商流。
+        let mut fed = false;
+        for _ in 0..300 {
+            if *pushed.lock().unwrap() > 0 {
+                fed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (r, e) = start.handle.stop();
+        assert!(fed, "采集帧应经 CloudForwarder 推进厂商流");
+        assert!(r.is_none(), "云端模式没有本机识别器可返还");
+        assert!(e.is_some(), "声纹嵌入器照常返还复用");
+        let g = finals.lock().unwrap();
+        assert!(
+            g.iter().any(|(s, t)| *s == Source::Mic && t == "云端定稿"),
+            "厂商定稿应经同一条 FinalSink 出到 on_final: {g:?}"
+        );
     }
 }
 

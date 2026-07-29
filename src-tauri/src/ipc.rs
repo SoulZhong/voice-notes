@@ -83,6 +83,17 @@ pub struct SourceHealthEvent {
     pub state: String,  // "recovered" | "lost"
 }
 
+/// 云端识别的连接状态,事件名 "cloud-asr-status"。仅云端模式录制时产生,供前端状态条
+/// 提示「重连中/补识中/已恢复/补识失败」。session 层只吐 session::CloudAsrStatus,
+/// 到 lib.rs 才映射成本结构 emit——UI 依赖不下沉进会话层。
+/// 未接监听不影响录制(状态是提示,不是控制)。
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudAsrStatusEvent {
+    /// "reconnecting" | "recovered" | "backfilling" | "backfill_failed"
+    pub state: String,
+    pub source: String, // "mic" | "system"
+}
+
 /// 说话人表(全量推送),事件名 "speakers"。name 空串 = 未改名(前端按 id 兜底)。
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeakerEntry {

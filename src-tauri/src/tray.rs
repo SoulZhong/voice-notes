@@ -54,14 +54,16 @@ fn tray_enabled(app: &AppHandle) -> bool {
 /// 按录制态构建三项菜单：toggle 文案随 recording 切「停止录制」/「开始录制」，
 /// show / quit 恒定。id 稳定（toggle/show/quit），on_menu_event 据此分发。
 ///
-/// toggle 项按 recording_ready 禁用（spec：模型缺失时禁用开始录制）：录制中恒可停
+/// toggle 项按录制就绪判定禁用（spec：模型缺失时禁用开始录制）：录制中恒可停
 /// （enabled = recording || ready）；未录且当前选型模型不完整则灰掉，避免点了必然失败。
 /// 已知取舍:刷新时机只有 setup / set_recording(即 start/stop 前后),模型下载完成本身不触发
 /// 菜单重建——故"模型刚下完到下一次 start/stop 之间"这段,菜单项仍是灰的(点不亮的窗口),
 /// 要到下一次录制状态变化才刷新可用。可接受:下载完成是低频一次性事件。
 fn build_menu(app: &AppHandle, recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
     let toggle_label = if recording { "停止录制" } else { "开始录制" };
-    let ready = crate::models::recording_ready(&crate::current_asr(app));
+    // 模式感知就绪判定,与设置页(models_status)/开录守卫同一份:云端模式下本机大模型
+    // 不必需,只要 vad 在 + 凭证齐就该点得亮——否则云端用户面对一个永远灰着的菜单项。
+    let ready = crate::current_models_status(app).recording_ready;
     let toggle = MenuItemBuilder::with_id("toggle", toggle_label)
         .enabled(recording || ready)
         .build(app)?;
