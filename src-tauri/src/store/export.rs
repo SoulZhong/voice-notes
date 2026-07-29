@@ -1,32 +1,61 @@
 use super::{Note, NoteStore, RefinedDoc, SegmentRecord, SpeakerMeta};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 impl NoteStore {
-    /// 导出到会议文件夹内的 transcript.md / transcript.txt，返回文件路径。
-    /// refined=Some 时导修订稿(所见即所得:用户看着修订稿点导出,不能给他原始逐字稿);
-    /// None 走原始 segments 渲染。两者写同一文件名,后导覆盖先导。
-    pub fn export(
+    /// 导出到用户选定路径(保存对话框流程),渲染与 render/render_refined 同源。
+    /// 守卫:dest 须为绝对路径且不落在笔记数据目录内(防误选/被误传毁库);
+    /// 父目录不代建——保存对话框保证父目录存在,ENOENT 直接报错。
+    /// 写入走同目录临时文件 + rename 原子替换:覆盖已有文件时,磁盘满/拔盘/中途
+    /// 被杀不会留下被截断的半成品,原文件要么完好要么已被完整新内容替换。
+    pub fn export_to(
         &self,
         id: &str,
         format: &str,
         refined: Option<&RefinedDoc>,
-    ) -> anyhow::Result<PathBuf> {
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if format != "md" && format != "txt" {
+            anyhow::bail!("未知导出格式: {format}");
+        }
+        if !dest.is_absolute() {
+            anyhow::bail!("导出路径必须是绝对路径");
+        }
+        let file_name = dest
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("导出路径缺少文件名"))?;
+        let note_dir = self.note_dir(id)?;
+        let data_root = note_dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| note_dir.clone());
+        let canon_root = data_root.canonicalize().unwrap_or(data_root);
+        let dest_parent = dest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("导出路径缺少父目录"))?;
+        let canon_parent = dest_parent
+            .canonicalize()
+            .unwrap_or_else(|_| dest_parent.to_path_buf());
+        if canon_parent.starts_with(&canon_root) {
+            anyhow::bail!("导出目标不能位于笔记数据目录内");
+        }
         let content = match refined {
             Some(doc) => render_refined(&self.load(id)?.meta.title, doc, format == "md"),
             None => self.render(id, format)?,
         };
-        if format != "md" && format != "txt" {
-            anyhow::bail!("未知导出格式: {format}");
+        let tmp = dest.with_file_name(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
         }
-        let dir = self.note_dir(id)?;
-        let name = match format {
-            "md" => "transcript.md",
-            _ => "transcript.txt",
-        };
-        let path = dir.join(name);
-        std::fs::write(&path, content)?;
-        Ok(path)
+        if let Err(e) = std::fs::rename(&tmp, dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     /// 渲染导出内容字符串(不落盘)。MCP get_note 与 export 共用同一渲染,防两处漂移。
@@ -197,6 +226,7 @@ mod tests {
     #[test]
     fn export_md_and_txt() {
         let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
         let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
         let id = w.note_id().to_string();
         w.append_final("mic", "今天开会讨论项目进度。", 83_000, 86_000, None, None)
@@ -213,8 +243,8 @@ mod tests {
         w.finalize(chrono::Local::now()).unwrap();
 
         let store = NoteStore::new(tmp.path().to_path_buf());
-        let md_path = store.export(&id, "md", None).unwrap();
-        assert_eq!(md_path.file_name().unwrap(), "transcript.md");
+        let md_path = out.path().join("out.md");
+        store.export_to(&id, "md", None, &md_path).unwrap();
         let md = std::fs::read_to_string(&md_path).unwrap();
         let title = store.load(&id).unwrap().meta.title;
         assert!(md.starts_with(&format!("# {title}\n")), "首行为标题: {md}");
@@ -227,7 +257,8 @@ mod tests {
             "{md}"
         );
 
-        let txt_path = store.export(&id, "txt", None).unwrap();
+        let txt_path = out.path().join("out.txt");
+        store.export_to(&id, "txt", None, &txt_path).unwrap();
         let txt = std::fs::read_to_string(&txt_path).unwrap();
         assert!(
             txt.contains("[我] 00:01:23 今天开会讨论项目进度。"),
@@ -235,7 +266,12 @@ mod tests {
         );
         assert!(!txt.contains("**"), "纯文本无 markdown 记号");
 
-        assert!(store.export(&id, "pdf", None).is_err(), "未知格式报错");
+        assert!(
+            store
+                .export_to(&id, "pdf", None, &out.path().join("out.pdf"))
+                .is_err(),
+            "未知格式报错"
+        );
     }
 
     #[test]
@@ -283,14 +319,18 @@ mod tests {
             ],
         };
         let store = NoteStore::new(tmp.path().to_path_buf());
-        let md = std::fs::read_to_string(store.export(&id, "md", Some(&doc)).unwrap()).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("refined.md");
+        store.export_to(&id, "md", Some(&doc), &dest).unwrap();
+        let md = std::fs::read_to_string(&dest).unwrap();
         assert!(md.contains("**张三** `[00:00:00]`"), "{md}");
         assert!(md.contains("**说话人 4**"), "关联人物按 P 号: {md}");
         assert!(md.contains("**说话人 3**"), "未关联按 R 号: {md}");
         assert!(md.contains("有名字用名字。"), "{md}");
         assert!(!md.contains("原始句。"), "Aing 导出不含原始段: {md}");
-        // 同名文件:再按原始稿导出,覆盖为原始内容(所见即所得,后导为准)。
-        let md2 = std::fs::read_to_string(store.export(&id, "md", None).unwrap()).unwrap();
+        // 同一目标再按原始稿导出:原子替换覆盖为原始内容(所见即所得,后导为准)。
+        store.export_to(&id, "md", None, &dest).unwrap();
+        let md2 = std::fs::read_to_string(&dest).unwrap();
         assert!(md2.contains("原始句。"), "{md2}");
     }
 
@@ -444,7 +484,10 @@ mod tests {
             .unwrap();
         w.finalize(chrono::Local::now()).unwrap();
         let store = NoteStore::new(tmp.path().to_path_buf());
-        let txt = std::fs::read_to_string(store.export(&id, "txt", None).unwrap()).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("order.txt");
+        store.export_to(&id, "txt", None, &dest).unwrap();
+        let txt = std::fs::read_to_string(&dest).unwrap();
         let (i_first, i_later) = (txt.find("先说的").unwrap(), txt.find("后说的").unwrap());
         assert!(i_first < i_later, "导出按 start_ms 序而非落盘序: {txt}");
         assert_eq!(
@@ -452,5 +495,87 @@ mod tests {
             2,
             "空白段被过滤,只剩两段: {txt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_to_tests {
+    use crate::store::writer::NoteWriter;
+    use crate::store::NoteStore;
+
+    /// 建一条单段笔记,返回 (notes 根目录, 导出目录, store, id)。
+    fn setup() -> (tempfile::TempDir, tempfile::TempDir, NoteStore, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "保存对话框导出。", 1_000, 2_000, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        (tmp, out, store, id)
+    }
+
+    /// 导出到用户选定路径(保存对话框流程):内容与 render 完全一致,写到任意 dest,
+    /// 不再往笔记数据目录塞 transcript.md(那是旧"导出后开文件夹"流程的产物)。
+    #[test]
+    fn export_to_writes_rendered_content_at_dest() {
+        let (_tmp, out, store, id) = setup();
+        let dest = out.path().join("我的会议-20260729-1630.md");
+        store.export_to(&id, "md", None, &dest).unwrap();
+        let written = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(written, store.render(&id, "md").unwrap(), "内容须与 render 同源");
+        assert!(!store.note_dir(&id).unwrap().join("transcript.md").exists(),
+            "export_to 不应在笔记目录残留 transcript.md");
+        let leftovers: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "原子写入不应残留临时文件");
+    }
+
+    /// 覆盖已有文件:成功后为完整新内容(临时文件 + rename,不经过截断态)。
+    #[test]
+    fn export_to_atomically_overwrites_existing_file() {
+        let (_tmp, out, store, id) = setup();
+        let dest = out.path().join("已有.md");
+        std::fs::write(&dest, "用户原有的重要内容").unwrap();
+        store.export_to(&id, "md", None, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), store.render(&id, "md").unwrap());
+    }
+
+    #[test]
+    fn export_to_rejects_unknown_format() {
+        let (_tmp, out, store, id) = setup();
+        assert!(store.export_to(&id, "pdf", None, &out.path().join("x.pdf")).is_err());
+    }
+
+    /// 相对路径解析随进程 CWD 漂移,UI 报告的路径会与实际落盘不符 → 直接拒绝。
+    #[test]
+    fn export_to_rejects_relative_dest() {
+        let (_tmp, _out, store, id) = setup();
+        let err = store
+            .export_to(&id, "md", None, std::path::Path::new("相对.md"))
+            .unwrap_err();
+        assert!(err.to_string().contains("绝对路径"), "{err}");
+    }
+
+    /// 兜底守卫:目标落在笔记数据目录内会毁掉笔记本体(segments.jsonl/meta.json),拒绝。
+    #[test]
+    fn export_to_rejects_dest_inside_notes_dir() {
+        let (tmp, _out, store, id) = setup();
+        let inside = store.note_dir(&id).unwrap().join("meta.json");
+        let err = store.export_to(&id, "md", None, &inside).unwrap_err();
+        assert!(err.to_string().contains("笔记数据目录"), "{err}");
+        let root_level = tmp.path().join("x.md");
+        assert!(store.export_to(&id, "md", None, &root_level).is_err());
+    }
+
+    /// 父目录不存在不再代建(保存对话框保证父目录存在),ENOENT 直接报错。
+    #[test]
+    fn export_to_errors_on_missing_parent() {
+        let (_tmp, out, store, id) = setup();
+        let dest = out.path().join("不存在的目录/x.md");
+        assert!(store.export_to(&id, "md", None, &dest).is_err());
     }
 }
