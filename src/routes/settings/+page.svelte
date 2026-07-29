@@ -28,7 +28,7 @@
   } from "$lib/models";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
-  import { checkUpdate, type UpdateInfo } from "$lib/update";
+  import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
 
   let settings = $state<Settings | null>(null);
 
@@ -68,6 +68,32 @@
       updateError = `检查失败: ${e}`;
     } finally {
       updateChecking = false;
+    }
+  }
+
+  // —— 一键更新:updater 插件下载安装 + 自动重启;失败亮出「打开发布页」兜底 ——
+  let updating = $state(false);
+  let updatingLabel = $state("更新中…");
+  let updateFallback = $state(false);
+  // 与 +layout 横幅同款守卫:安装成功即 relaunch,录音/收尾中更新会截断录音尾段。
+  const updateBlocked = $derived(recording.isLive || recording.stopping);
+  async function doOneClickUpdate() {
+    if (updateBlocked) return;
+    updating = true;
+    updateError = "";
+    updatingLabel = "更新中…";
+    try {
+      const r = await applyUpdate((label) => (updatingLabel = label));
+      if (r === "none") {
+        // GitHub API 已见新版但 latest.json 未就绪(发布产物上传有时差)。
+        updateError = "更新包尚未就绪,稍后再试或打开发布页手动下载";
+        updateFallback = true;
+      }
+    } catch (e) {
+      updateError = `一键更新失败: ${e}`;
+      updateFallback = true;
+    } finally {
+      updating = false;
     }
   }
   let status = $state<ModelsStatus | null>(null);
@@ -1131,7 +1157,18 @@
           </span>
         </div>
         {#if updateInfo?.has_update}
-          <button class="btn-secondary" onclick={() => updateInfo && openUrl(updateInfo.url)}>下载 v{updateInfo.latest}</button>
+          <button
+            class="btn-secondary"
+            onclick={doOneClickUpdate}
+            disabled={updating || updateBlocked}
+            title={updateBlocked ? "录音进行中,结束后再更新" : undefined}
+          >
+            {updating ? updatingLabel : `一键更新 v${updateInfo.latest}`}
+          </button>
+          {#if updateFallback}
+            <!-- 一键失败(签名/网络/latest.json 未就绪)兜底手动路径,绝不堵死更新。 -->
+            <button class="link" onclick={() => updateInfo && openUrl(updateInfo.url)}>打开发布页</button>
+          {/if}
         {:else}
           <button class="btn-secondary" disabled={updateChecking} onclick={doCheckUpdate}>
             {updateChecking ? "检查中…" : "检查更新"}

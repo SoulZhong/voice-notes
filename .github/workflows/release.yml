@@ -1,0 +1,66 @@
+# 发布流水线:打 v* tag 自动构建两平台安装包 + updater 资产(.tar.gz/.exe + .sig +
+# latest.json),挂到 GitHub Release。一键更新(tauri-plugin-updater)依赖这里的产物:
+# latest.json 是 endpoint,.sig 由下方私钥签名、客户端用 tauri.conf 里的公钥校验。
+#
+# 必需 secrets(一次性配置,由维护者本机 `npm run tauri signer generate -- -w ~/.tauri/voice-notes.key`
+# 生成后录入,私钥不进仓库):
+#   TAURI_SIGNING_PRIVATE_KEY          私钥文件内容
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD 生成时设置的密码(未设则留空字符串)
+# 同时把生成的公钥写进 src-tauri/tauri.conf.json 的 plugins.updater.pubkey。
+#
+# releaseDraft: true —— 产物齐了人工点发布,给真机抽验留窗口;发布后 latest.json
+# 才会出现在 releases/latest 下,客户端一键更新随之生效。
+name: release
+
+# 仅 tag 触发,不留 workflow_dispatch:手动从分支跑会把 tagName 解析成分支名,
+# tauri-action 会创建一个名叫「master」的垃圾 tag + draft release。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    # 签名密钥存放在 GitHub Environment「TAURI」——不声明 environment 时
+    # secrets.TAURI_SIGNING_* 解析为空,产物无签名,一键更新校验必失败。
+    environment: TAURI
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # tag 与应用版本一致性守卫:打了 v0.6.0 却忘 bump tauri.conf.json 时,
+      # latest.json 会停在旧版本号——已装用户的 GitHub API 横幅说有新版、
+      # updater 插件却说没有,一键更新全员永久降级成「打开发布页」。宁可构建失败。
+      - name: tag 与 tauri.conf.json 版本一致性
+        shell: bash
+        run: |
+          VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$VER" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} 与 tauri.conf.json 版本 v$VER 不一致,先 bump 版本再打 tag"
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      # 钉 commit SHA 而非可变 tag(v0):此 step 持有 updater 签名私钥,
+      # tag 被恶意重指即可窃 key、给全体客户端签恶意更新。升级时人工换 SHA。
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "voice-notes ${{ github.ref_name }}"
+          releaseDraft: true
