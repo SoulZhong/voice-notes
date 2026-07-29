@@ -3514,22 +3514,34 @@ fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(
 /// 只是「推完静音 → finish → 厂商回关闭」的一个往返;5s 足够,超时即判网络异常。
 const CLOUD_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 设置页「测试连接」:按当前设置造适配器 → 开流(同步握手,鉴权/网络问题在此暴露)
-/// → 推 200ms 静音 → finish → 等 Closed。error=None 即通,Some 原样透出厂商说法
-/// (「鉴权失败」这类文案由适配层给,这里不猜)。
+/// 设置页/欢迎页「测试连接」:直接使用表单当前值造适配器 → 开流(同步握手,鉴权/
+/// 网络问题在此暴露) → 推 200ms 静音 → finish → 等 Closed。表单值作为命令参数
+/// 传入,不依赖输入框 blur 先异步写 settings.json,也不会为了测试而持久化无效凭证。
+/// error=None 即通,Some 原样透出厂商说法(「鉴权失败」这类文案由适配层给,这里不猜)。
 ///
 /// 阻塞至多「握手 ≤7s(阿里云 CONNECT_TIMEOUT 6s + 1s 缓冲) + 等 Closed ≤ CLOUD_TEST_TIMEOUT
 /// 5s」,worst case 逼近 12s:走 spawn_blocking 别占 IPC 线程,同 test_refine_llm 惯例——
 /// 用户主动触发的一次点击,阻塞线程池里的一条工作线程可接受,前端一次 invoke 就拿到结论。
 #[tauri::command]
-async fn test_cloud_asr(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+async fn test_cloud_asr(
+    state: State<'_, AppState>,
+    provider: String,
+    volc_app_key: String,
+    volc_access_key: String,
+    dashscope_api_key: String,
+) -> Result<String, String> {
     // 录制中再开一条厂商流会挤占并发额度(多数厂商按账号限并发路数),拒绝而非静默抢占。
     if *state.running.lock().unwrap() {
         return Err("录制中不能测试云端连接".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let d = app.path().app_data_dir().map_err(|e| e.to_string())?;
-        let s = settings::load(&d);
+        let s = settings::Settings {
+            cloud_asr_provider: provider,
+            volc_app_key,
+            volc_access_key,
+            dashscope_api_key,
+            ..Default::default()
+        };
         let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
         let mut stream = cloud.open_stream().map_err(|e| format!("连接失败: {e}"))?;
         // 200ms 静音:有些厂商在收到首个音频包前不会走完会话建立,空推一段最接近真实录制。

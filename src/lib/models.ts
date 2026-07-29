@@ -116,6 +116,17 @@ export const testRefineLlm = (baseUrl: string, model: string, apiKey: string) =>
 export const testRefineAgent = (provider: string, bin: string, model: string) =>
   invoke<string>("test_refine_agent", { provider, bin, model });
 export const testMirror = (prefix: string) => invoke<string>("test_mirror", { prefix });
-// 云端 ASR 测试连接:按当前 settings 造适配器实际握手一次,成功返回文案、失败 reject 原因;
-// 录制中会被后端拒绝(挤占厂商并发路数)。
-export const testCloudAsr = () => invoke<string>("test_cloud_asr");
+// 云端 ASR 测试连接:直接测试表单当前值,不依赖 onblur 先把凭证落盘。
+// 这样用户粘贴 key 后立刻点测试也不会与异步保存竞态；录制中仍由后端拒绝。
+export const testCloudAsr = (
+  provider: string,
+  volcAppKey: string,
+  volcAccessKey: string,
+  dashscopeApiKey: string,
+) =>
+  invoke<string>("test_cloud_asr", {
+    provider,
+    volcAppKey,
+    volcAccessKey,
+    dashscopeApiKey,
+  });

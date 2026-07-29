@@ -1,6 +1,7 @@
 //! 轻量应用设置（app_data_dir/settings.json，原子写）。目前仅镜像加速配置。
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghfast.top/";
@@ -240,7 +241,22 @@ pub fn load(app_data: &Path) -> Settings {
 pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
     let tmp = app_data.join("settings.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(s)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // tmp 可能来自上次崩溃且权限较宽；mode() 只对新建文件生效，显式收紧。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(serde_json::to_string_pretty(s)?.as_bytes())?;
+    drop(file);
     std::fs::rename(&tmp, app_data.join("settings.json"))?;
     Ok(())
 }
@@ -295,6 +311,26 @@ mod tests {
         assert!(got.mirror_enabled);
         assert_eq!(got.mirror_prefix, "https://mirror.example/");
         assert!(!tmp.path().join("settings.json.tmp").exists(), "原子写不留 tmp");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_credentials_private_to_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Settings {
+            volc_access_key: "secret".into(),
+            dashscope_api_key: "secret".into(),
+            ..Default::default()
+        };
+        save(tmp.path(), &s).unwrap();
+        let mode = std::fs::metadata(tmp.path().join("settings.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "含 API key 的 settings.json 不得向同机其他用户开放");
     }
 
     #[test]

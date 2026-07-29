@@ -1709,12 +1709,16 @@ pub fn run_cloud_asr_worker(
     // 对活流 finish 并排干:厂商常在 finish 之后才吐最后一句。push 闭包在此丢弃,
     // 适配层的发送端随之释放,排干靠通道断开自然结束,不必空等满窗。
     let mut drains: Vec<(usize, Receiver<crate::asr::cloud::CloudEvent>)> = Vec::new();
+    // finish/排干失败的源不能只写日志后收摊:它们最后一条定稿之后的尾音没有成功
+    // 收尾,必须在排干结束后复用缺口补识链。索引会在多条失败信号汇合时去重。
+    let mut drain_failures: Vec<usize> = Vec::new();
     for (i, cs) in srcs.iter_mut().enumerate() {
         if let Some(stream) = cs.stream.take() {
             let crate::asr::cloud::CloudStream { push, finish, events } = stream;
             drop(push);
             if let Err(e) = finish() {
                 eprintln!("云端流 finish 失败({:?} 源): {e}", cs.source);
+                drain_failures.push(i);
             }
             drains.push((i, events));
         }
@@ -1723,6 +1727,7 @@ pub fn run_cloud_asr_worker(
     while !drains.is_empty() {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             eprintln!("云端排干超时,放弃剩余事件");
+            drain_failures.extend(drains.iter().map(|(i, _)| *i));
             break;
         };
         let woke = {
@@ -1746,9 +1751,41 @@ pub fn run_cloud_asr_worker(
                 push_definite(cs.source, &mut cs.feed, &u, &mut sink);
             }
             Ok(crate::asr::cloud::CloudEvent::Interim { .. }) => {}
-            Ok(crate::asr::cloud::CloudEvent::Closed { .. }) | Err(_) => {
+            Ok(crate::asr::cloud::CloudEvent::Closed { error }) => {
+                if let Some(e) = error {
+                    let source_idx = drains[slot].0;
+                    eprintln!("云端收尾失败({:?} 源): {e}", srcs[source_idx].source);
+                    drain_failures.push(source_idx);
+                }
                 drains.remove(slot);
             }
+            // 适配层允许用发送端自然释放表示正常排干结束；只有 finish 本身失败、
+            // 明确的 Closed(error) 或总排干超时才说明尾音未确认。
+            Err(_) => {
+                drains.remove(slot);
+            }
+        }
+    }
+
+    // 排干失败意味着 last_final_end..fed 这段尾音没有成功获得厂商的最终确认。
+    // 接缝口径沿用断线恢复:从最后一条定稿末尾补,最多重复、不允许静默丢失。
+    drain_failures.sort_unstable();
+    drain_failures.dedup();
+    for i in drain_failures {
+        let cs = &mut srcs[i];
+        cs.feed.begin_gap();
+        if let Some(gap_from) = cs.feed.gap_from.take() {
+            let gap_to = cs.feed.fed;
+            backfill_gap(
+                cs.source,
+                &mut cs.feed,
+                gap_from,
+                gap_to,
+                &cloud,
+                backfill_segmenter.as_mut(),
+                &mut sink,
+                &mut on_status,
+            );
         }
     }
 
@@ -3857,6 +3894,45 @@ mod cloud_worker_tests {
             vec![(Source::Mic, "尾句".to_string(), 0, 300)],
             "停录 finish 后才到的定稿必须排干落地"
         );
+    }
+
+    /// finish 指令没能交给适配层时,尾部必须转入批式补识而非只打日志后丢掉。
+    struct FinishFailureCloud;
+    impl CloudAsr for FinishFailureCloud {
+        fn open_stream(&self) -> anyhow::Result<CloudStream> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            Ok(CloudStream {
+                push: Box::new(move |_s: &[f32]| {
+                    let _ = &tx;
+                    Ok(())
+                }),
+                finish: Box::new(|| anyhow::bail!("finish channel closed")),
+                events: rx,
+            })
+        }
+
+        fn transcribe_batch(&self, samples: &[f32]) -> anyhow::Result<Vec<DefiniteUtterance>> {
+            Ok(vec![utter(
+                "补回尾句",
+                0,
+                samples.len() as u64 * 1000 / 16_000,
+            )])
+        }
+    }
+
+    #[test]
+    fn finish_failure_backfills_unconfirmed_tail() {
+        let (finals, _, statuses) = drive_with(
+            Arc::new(FinishFailureCloud),
+            vec![vec![0.1; 16_000]],
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+        );
+        assert_eq!(
+            finals,
+            vec![(Source::Mic, "补回尾句".to_string(), 0, 1000)],
+            "finish 失败后的未确认尾音必须走批式补识,不能静默丢失"
+        );
+        assert_eq!(statuses, vec!["Backfilling"]);
     }
 
     #[test]

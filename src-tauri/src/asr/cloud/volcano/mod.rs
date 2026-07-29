@@ -481,11 +481,8 @@ async fn finish_and_drain(
                 },
                 Ok(Message::Close(_)) => return None,
                 Ok(_) => {}
-                // 末包已发出,读错不改变关闭语义(仍是 None),但别把原因吞了:
-                // 收尾阶段的 IO 错是排查"最后一句没出来"的第一现场。
                 Err(e) => {
-                    eprintln!("火山收尾读错误: {e}");
-                    return None;
+                    return Some(format!("收尾读错误: {e}"));
                 }
             }
         }
@@ -494,9 +491,12 @@ async fn finish_and_drain(
     .await;
 
     let _ = sink.send(Message::Close(None)).await;
-    // 末包已发出:超时/对端关闭/读错都只是收尾过程的结束方式,没有重连语义 → None。
-    // 只有厂商明确回错误帧才带上原因(录制已停,worker 排干阶段不区分,留作日志)。
-    let error = drained.unwrap_or(None);
+    // 排干超时/读错时最后一句是否已定稿不可知,带错交给 worker 补识尾部。
+    // 对端在末包后的正常 Close/EOF 仍是火山协议的成功结束方式。
+    let error = match drained {
+        Ok(error) => error,
+        Err(_) => Some(format!("收尾超时(>{}ms)", FINAL_DRAIN.as_millis())),
+    };
     let _ = ev_tx.send(CloudEvent::Closed { error });
 }
 

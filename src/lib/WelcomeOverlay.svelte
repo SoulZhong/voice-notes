@@ -43,6 +43,7 @@
   let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
   // 「完成」按钮门闩:必须先测试成功一次,防止凭证打错却直接进入下载/录制。
   let cloudTestPassed = $state(false);
+  let cloudTestGeneration = 0;
   let agents = $state<AgentStatus[]>([]);
   let picked = $state<Record<string, boolean>>({});
   let outcomes = $state<RegisterOutcome[] | null>(null);
@@ -92,29 +93,38 @@
 
   function backToChoose() {
     phase = "choose";
+    invalidateCloudTest();
+  }
+
+  function invalidateCloudTest() {
+    cloudTestGeneration += 1;
     cloudTestResult = null;
     cloudTestPassed = false;
   }
 
-  /** 落盘厂商+凭证:testCloudAsr 读的是持久化 settings,测试前必须先写入。 */
-  async function saveCloudCreds() {
-    const s = await getSettings();
-    s.cloud_asr_provider = cloudProvider;
-    s.volc_app_key = volcAppKey;
-    s.volc_access_key = volcAccessKey;
-    s.dashscope_api_key = dashKey;
-    await setSettings(s);
-  }
-
   async function doTestCloud() {
+    const generation = ++cloudTestGeneration;
+    const input = {
+      provider: cloudProvider,
+      volcAppKey,
+      volcAccessKey,
+      dashKey,
+    };
     testingCloud = true;
     cloudTestResult = null;
     cloudTestPassed = false;
     try {
-      await saveCloudCreds();
-      cloudTestResult = { ok: true, msg: await testCloudAsr() };
+      const msg = await testCloudAsr(
+        input.provider,
+        input.volcAppKey,
+        input.volcAccessKey,
+        input.dashKey,
+      );
+      if (generation !== cloudTestGeneration) return;
+      cloudTestResult = { ok: true, msg };
       cloudTestPassed = true;
     } catch (e) {
+      if (generation !== cloudTestGeneration) return;
       cloudTestResult = { ok: false, msg: String(e) };
     } finally {
       testingCloud = false;
@@ -132,8 +142,10 @@
       s.volc_access_key = volcAccessKey;
       s.dashscope_api_key = dashKey;
       await setSettings(s);
-    } catch {
-      /* 落盘失败仍进入下载态,用户可在设置页补救;凭证已在测试时保存过一次 */
+    } catch (e) {
+      cloudTestPassed = false;
+      cloudTestResult = { ok: false, msg: `保存设置失败：${String(e)}` };
+      return;
     }
     phase = "download";
     try {
@@ -194,7 +206,7 @@
     <div class="hero">
       <div class="mark"><span class="dot"></span></div>
       <h1>voice-notes</h1>
-      <p class="tagline">会议实时转写与说话人分离，全程本地运行</p>
+      <p class="tagline">会议实时转写与说话人分离，数据流向由你选择</p>
     </div>
 
     <div class="steps" aria-label="新手引导进度">
@@ -240,8 +252,7 @@
               bind:group={cloudProvider}
               onchange={() => {
                 // 凭证一经改动,上次测试结果即作废,须重测才能完成
-                cloudTestResult = null;
-                cloudTestPassed = false;
+                invalidateCloudTest();
               }}
             />火山引擎
           </label>
@@ -252,8 +263,7 @@
               value="aliyun"
               bind:group={cloudProvider}
               onchange={() => {
-                cloudTestResult = null;
-                cloudTestPassed = false;
+                invalidateCloudTest();
               }}
             />阿里云
           </label>
@@ -266,8 +276,7 @@
               placeholder="火山引擎语音技术控制台的 App ID"
               bind:value={volcAppKey}
               oninput={() => {
-                cloudTestResult = null;
-                cloudTestPassed = false;
+                invalidateCloudTest();
               }}
             />
           </label>
@@ -279,8 +288,7 @@
               placeholder="Access Token"
               bind:value={volcAccessKey}
               oninput={() => {
-                cloudTestResult = null;
-                cloudTestPassed = false;
+                invalidateCloudTest();
               }}
             />
           </label>
@@ -293,8 +301,7 @@
               placeholder="DashScope API Key"
               bind:value={dashKey}
               oninput={() => {
-                cloudTestResult = null;
-                cloudTestPassed = false;
+                invalidateCloudTest();
               }}
             />
           </label>

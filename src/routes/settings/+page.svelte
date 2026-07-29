@@ -98,6 +98,7 @@
   /** 「测试连接」按钮态与结果(逻辑照搬 runMirrorTest)。 */
   let testingCloud = $state(false);
   let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
+  let cloudTestGeneration = 0;
 
   // —— 新四区块的本地绑定值 ——
   // 一律用本地 $state + bind(group/checked),不直接从 settings 派生 checked：
@@ -497,7 +498,7 @@
       await setSettings(fresh);
       settings = fresh;
       asrMode = mode;
-      cloudTestResult = null; // 切换方式后旧测试结果不再有意义
+      invalidateCloudTest(); // 切换方式后旧测试结果不再有意义
       await refreshStatus(); // recording_ready 随方式重算(云端模式看凭证而非本地工件)
     } catch (e) {
       error = `${e}`;
@@ -507,13 +508,33 @@
   }
 
   // —— 云端 ASR「测试连接」——(逻辑照搬 runMirrorTest)
+  function invalidateCloudTest() {
+    cloudTestGeneration += 1;
+    cloudTestResult = null;
+  }
+
   async function doTestCloud() {
     if (!settings) return;
+    const generation = ++cloudTestGeneration;
+    const input = {
+      provider: cloudProvider,
+      volcAppKey,
+      volcAccessKey,
+      dashKey,
+    };
     testingCloud = true;
     cloudTestResult = null;
     try {
-      cloudTestResult = { ok: true, msg: await testCloudAsr() };
+      const msg = await testCloudAsr(
+        input.provider,
+        input.volcAppKey,
+        input.volcAccessKey,
+        input.dashKey,
+      );
+      if (generation !== cloudTestGeneration) return;
+      cloudTestResult = { ok: true, msg };
     } catch (e) {
+      if (generation !== cloudTestGeneration) return;
       cloudTestResult = { ok: false, msg: String(e) };
     } finally {
       testingCloud = false;
@@ -541,7 +562,11 @@
 
 <main class="container">
   <h1>设置</h1>
-  <p class="desc">所有录音与识别都在本机完成,不上传任何音频。</p>
+  <p class="desc">
+    {asrMode === "cloud"
+      ? "录音仍保存在本机；识别时音频会发送到当前选择的云服务商。"
+      : "所有录音与识别都在本机完成，不上传任何音频。"}
+  </p>
 
   {#if error}
     <div class="banner">{error}</div>
@@ -769,7 +794,7 @@
                 bind:group={cloudProvider}
                 disabled={recording.isLive || !settings}
                 onchange={() => {
-                  cloudTestResult = null;
+                  invalidateCloudTest();
                   saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
                 }}
               />火山引擎
@@ -782,7 +807,7 @@
                 bind:group={cloudProvider}
                 disabled={recording.isLive || !settings}
                 onchange={() => {
-                  cloudTestResult = null;
+                  invalidateCloudTest();
                   saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
                 }}
               />阿里云
@@ -800,7 +825,7 @@
               placeholder="APP ID"
               bind:value={volcAppKey}
               disabled={recording.isLive}
-              oninput={() => (cloudTestResult = null)}
+              oninput={invalidateCloudTest}
               onblur={() => saveSetting((s) => (s.volc_app_key = volcAppKey))}
             />
           </div>
@@ -815,7 +840,7 @@
               placeholder="Access Token"
               bind:value={volcAccessKey}
               disabled={recording.isLive}
-              oninput={() => (cloudTestResult = null)}
+              oninput={invalidateCloudTest}
               onblur={() => saveSetting((s) => (s.volc_access_key = volcAccessKey))}
             />
           </div>
@@ -831,7 +856,7 @@
               placeholder="DashScope API Key"
               bind:value={dashKey}
               disabled={recording.isLive}
-              oninput={() => (cloudTestResult = null)}
+              oninput={invalidateCloudTest}
               onblur={() => saveSetting((s) => (s.dashscope_api_key = dashKey))}
             />
           </div>

@@ -9,6 +9,7 @@ use crate::lifecycle::machine::{LifecycleState, SessionState};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tauri::Manager;
@@ -117,7 +118,22 @@ pub fn load_checked(app_data: &Path) -> Result<HooksFile, String> {
 pub fn save(app_data: &Path, f: &HooksFile) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
     let tmp = app_data.join("hooks.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(f)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // hooks.json 可含飞书签名密钥；崩溃残留 tmp 也必须重新收紧权限。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(serde_json::to_string_pretty(f)?.as_bytes())?;
+    drop(file);
     std::fs::rename(&tmp, app_data.join("hooks.json"))?;
     Ok(())
 }
@@ -784,6 +800,16 @@ mod tests {
             !tmp.path().join("hooks.json.tmp").exists(),
             "原子写不留 tmp"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("hooks.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "可能含签名密钥的 hooks.json 仅当前用户可读写");
+        }
     }
 
     #[test]

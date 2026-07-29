@@ -35,13 +35,14 @@ describe("Windows release documentation", () => {
 });
 
 describe("Windows CI resource staging", () => {
-  it("stages every Tauri runtime resource before cargo check", () => {
+  it("builds the statically linked library without obsolete DLL staging", () => {
     const workflow = read(".github/workflows/windows-check.yml");
     const staging = workflow.indexOf("Stage Tauri runtime resource placeholders");
-    const cargoCheck = workflow.indexOf("- name: cargo check (lib, Windows msvc)");
+    const cargoBuild = workflow.indexOf("- name: cargo build (lib, Windows msvc)");
 
-    expect(staging).toBeGreaterThanOrEqual(0);
-    expect(staging).toBeLessThan(cargoCheck);
+    expect(staging).toBe(-1);
+    expect(cargoBuild).toBeGreaterThanOrEqual(0);
+    expect(workflow).toContain("run: cargo build --lib");
     for (const dll of [
       "cargs.dll",
       "onnxruntime.dll",
@@ -49,7 +50,7 @@ describe("Windows CI resource staging", () => {
       "sherpa-onnx-c-api.dll",
       "sherpa-onnx-cxx-api.dll",
     ]) {
-      expect(workflow).toContain(dll);
+      expect(workflow).not.toContain(dll);
     }
   });
 });

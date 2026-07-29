@@ -472,24 +472,26 @@ async fn finish_and_drain(
                     Ok(AliEvent::Started) => {}
                     Err(e) => eprintln!("阿里收尾帧解析失败: {e:#}"),
                 },
-                Ok(Message::Close(_)) => return None,
+                Ok(Message::Close(f)) => {
+                    return Some(format!("task-finished 前服务端关闭: {f:?}"));
+                }
                 Ok(_) => {}
-                // finish-task 已发出,读错不改变关闭语义(仍是 None),但别把原因吞了:
-                // 收尾阶段的 IO 错是排查"最后一句没出来"的第一现场。
                 Err(e) => {
-                    eprintln!("阿里收尾读错误: {e}");
-                    return None;
+                    return Some(format!("收尾读错误: {e}"));
                 }
             }
         }
-        None
+        Some("task-finished 前连接被对端关闭".into())
     })
     .await;
 
     let _ = sink.send(Message::Close(None)).await;
-    // 末包已发出:超时/对端关闭/读错都只是收尾过程的结束方式,没有重连语义 → None。
-    // 只有厂商明确回 task-failed 才带上原因(录制已停,worker 排干阶段不区分,留作日志)。
-    let error = drained.unwrap_or(None);
+    // 阿里协议以 task-finished 作为收尾成功回执。超时、提前关闭和读错都说明尾句
+    // 未被最终确认,必须带错交给 worker 走尾部补识,不能伪装成正常 Closed。
+    let error = match drained {
+        Ok(error) => error,
+        Err(_) => Some(format!("收尾超时(>{}ms)", FINAL_DRAIN.as_millis())),
+    };
     let _ = ev_tx.send(CloudEvent::Closed { error });
 }
 

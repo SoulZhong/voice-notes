@@ -1,7 +1,7 @@
-# Windows 编译真验证:开发机是 macOS,交叉 cargo check 被原生依赖 build script
+# Windows 编译真验证:开发机是 macOS,交叉 cargo build 被原生依赖 build script
 # 卡死(ring 的 cc、webrtc-ap 的 meson 均需目标平台工具链,2026-07-18 实测),
-# 唯一可行的类型检查/build script 验证是真 Windows runner。
-# 只做 cargo check --lib(类型检查 + 全部 build script),不打包不签名——
+# 唯一可行的 build script/最终链接验证是真 Windows runner。
+# 只做 cargo build --lib(编译 + 最终链接),不打包不签名——
 # 真机行为验收(环回采集/静默填充/断连自愈)仍需人工,见计划文档「验证边界」。
 name: windows-check
 
@@ -25,9 +25,8 @@ jobs:
         with:
           workspaces: src-tauri
       # DLL 占位步骤已删除:sherpa-onnx 官方 crate 默认静态链接(含 onnxruntime),
-      # tauri.windows.conf.json 不再声明任何运行时 DLL 资源。
-      # 注意:cargo check 不做最终链接,静态库 MT 运行时与 MSVC 默认 MD 的潜在
-      # 冲突要到真正 cargo build 才暴露——首个 Windows 打包版本需人工验证。
-      - name: cargo check (lib, Windows msvc)
+      # tauri.windows.conf.json 不再声明任何运行时 DLL 资源。这里必须真正 build：
+      # cargo check 不做最终链接，会让静态库缺失或 MT/MD 运行时冲突静默过绿。
+      - name: cargo build (lib, Windows msvc)
         working-directory: src-tauri
-        run: cargo check --lib
+        run: cargo build --lib
