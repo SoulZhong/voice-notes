@@ -219,9 +219,21 @@ export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
 export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
-/** 返回导出文件绝对路径。preferRefined=真且修订稿在盘时导修订稿(所见即所得)。 */
-export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean) =>
-  invoke<string>("export_note", { id, format, preferRefined });
+/** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿
+ * 在盘时导修订稿(所见即所得)。 */
+export const exportNote = (id: string, format: "md" | "txt", preferRefined: boolean, dest: string) =>
+  invoke<string>("export_note", { id, format, preferRefined, dest });
+
+/** 保存对话框的默认文件名:{标题}-{YYYYMMDD-HHmm}.md。
+ * 时间直接取 started_at 字符串的墙钟分量(不经 Date):录音的"名义时间"就是写进
+ * ISO 串的本地时间,经 Date 换算会随导出机器时区漂移;解析失败则省略时间段。
+ * 标题清洗路径非法字符(/\:*?"<>|),空白标题兜底「未命名」。 */
+export function exportFileName(title: string, startedAt: string): string {
+  const clean = title.replace(/[/\\:*?"<>|]/g, "-").trim() || "未命名";
+  const m = startedAt.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  const time = m ? `-${m[1]}${m[2]}${m[3]}-${m[4]}${m[5]}` : "";
+  return `${clean}${time}.md`;
+}
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
 /** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */

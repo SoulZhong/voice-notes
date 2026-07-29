@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { splitMentions } from "./notes";
+import { splitMentions, exportFileName } from "./notes";
 import type { GraphExtraction, RefinedDoc, RefinedDocV2, RelationFact } from "./notes";
 
 const legacyGraphFixture: RefinedDoc = {
@@ -126,5 +126,22 @@ describe("splitMentions", () => {
   });
   it("ignores out-of-range mentions", () => {
     expect(splitMentions("AB", [{ entity: "z", start: 0, end: 99 }])).toEqual([{ text: "AB", entityId: null }]);
+  });
+});
+
+describe("exportFileName", () => {
+  it("组合标题与录音时间为文件名安全的默认名", () => {
+    expect(exportFileName("周会纪要", "2026-07-16T15:30:09.894724+08:00")).toBe(
+      "周会纪要-20260716-1530.md",
+    );
+  });
+  it("清洗路径非法字符并兜底空标题", () => {
+    expect(exportFileName('a/b\\c:d*e?f"g<h>i|j', "2026-07-16T15:30:09+08:00")).toBe(
+      "a-b-c-d-e-f-g-h-i-j-20260716-1530.md",
+    );
+    expect(exportFileName("   ", "2026-07-16T15:30:09+08:00")).toBe("未命名-20260716-1530.md");
+  });
+  it("时间解析失败时省略时间段", () => {
+    expect(exportFileName("t", "not-a-date")).toBe("t.md");
   });
 });

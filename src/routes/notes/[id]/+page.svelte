@@ -3,7 +3,7 @@
   import { onTranscodeDone } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
-  import { revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
   import { onRefine, onNoteRenamed } from "$lib/events";
@@ -11,6 +11,7 @@
     getNote,
     renameNote,
     exportNote,
+    exportFileName,
     getRefined,
     refineNote,
     formatTs,
@@ -514,11 +515,18 @@
 
   async function doExport(format: "md") {
     exportMsg = "";
+    if (!note) return;
     try {
-      // 所见即所得:看着修订稿点导出就导修订稿,原始稿视图导原始逐字稿。
-      const path = await exportNote(id, format, effectiveView === "refined");
+      // 保存对话框让用户挑落盘位置(冒烟反馈:旧流程写进数据目录再开 Finder,
+      // 用户以为"只是打开了文件夹")。默认名 = 标题+录音时间;取消返回 null,
+      // 静默收手不算失败。所见即所得:看着修订稿点导出就导修订稿。
+      const dest = await save({
+        defaultPath: exportFileName(note.meta.title, note.meta.started_at),
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (!dest) return;
+      const path = await exportNote(id, format, effectiveView === "refined", dest);
       exportMsg = `已导出：${path}`;
-      await revealItemInDir(path);
     } catch (e) {
       error = `导出失败: ${e}`;
     }

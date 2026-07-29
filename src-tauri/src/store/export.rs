@@ -29,6 +29,30 @@ impl NoteStore {
         Ok(path)
     }
 
+    /// 导出到用户选定路径(保存对话框流程)。与 export 同一渲染源,但落盘位置由
+    /// 用户决定,不再往笔记数据目录塞 transcript.*;父目录不存在时代建(保存对话
+    /// 框一般已保证存在,这里兜底新目录名场景)。
+    pub fn export_to(
+        &self,
+        id: &str,
+        format: &str,
+        refined: Option<&RefinedDoc>,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if format != "md" && format != "txt" {
+            anyhow::bail!("未知导出格式: {format}");
+        }
+        let content = match refined {
+            Some(doc) => render_refined(&self.load(id)?.meta.title, doc, format == "md"),
+            None => self.render(id, format)?,
+        };
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dest, content)?;
+        Ok(())
+    }
+
     /// 渲染导出内容字符串(不落盘)。MCP get_note 与 export 共用同一渲染,防两处漂移。
     pub fn render(&self, id: &str, format: &str) -> anyhow::Result<String> {
         let note = self.load(id)?;
@@ -452,5 +476,40 @@ mod tests {
             2,
             "空白段被过滤,只剩两段: {txt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_to_tests {
+    use crate::store::writer::NoteWriter;
+    use crate::store::NoteStore;
+
+    /// 导出到用户选定路径(保存对话框流程):内容与 render 完全一致,写到任意 dest,
+    /// 不再往笔记数据目录塞 transcript.md(那是旧"导出后开文件夹"流程的产物)。
+    #[test]
+    fn export_to_writes_rendered_content_at_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "保存对话框导出。", 1_000, 2_000, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dest = tmp.path().join("导出目标/我的会议-20260729-1630.md");
+        store.export_to(&id, "md", None, &dest).unwrap();
+        let written = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(written, store.render(&id, "md").unwrap(), "内容须与 render 同源");
+        assert!(!store.note_dir(&id).unwrap().join("transcript.md").exists(),
+            "export_to 不应在笔记目录残留 transcript.md");
+    }
+
+    #[test]
+    fn export_to_rejects_unknown_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        assert!(store.export_to(&id, "pdf", None, &tmp.path().join("x.pdf")).is_err());
     }
 }

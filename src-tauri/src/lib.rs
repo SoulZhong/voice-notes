@@ -2807,11 +2807,12 @@ fn set_segment_speaker(
         .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
 }
 
-/// 导出笔记。prefer_refined=真且修订稿在盘时导修订稿(所见即所得:用户看着哪个视图
-/// 点导出就得到哪个),否则导原始逐字稿;修订稿导出前与 get_refined 同款只读 join,
-/// 库中现名(会议搭子改名)一并带出。
+/// 导出笔记到用户选定路径(前端保存对话框拿到 dest)。prefer_refined=真且修订稿
+/// 在盘时导修订稿(所见即所得:用户看着哪个视图点导出就得到哪个),否则导原始
+/// 逐字稿;修订稿导出前与 get_refined 同款只读 join,库中现名(会议搭子改名)
+/// 一并带出。dest 由系统保存对话框产生,不做路径白名单(用户显式选择即授权)。
 #[tauri::command]
-fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool) -> Result<String, String> {
+fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool, dest: String) -> Result<String, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let refined = if prefer_refined {
@@ -2827,9 +2828,10 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool)
     } else {
         None
     };
+    let dest_path = std::path::PathBuf::from(&dest);
     let result = store::NoteStore::new(dir)
-        .export(&id, &format, refined.as_ref())
-        .map(|p| p.to_string_lossy().into_owned())
+        .export_to(&id, &format, refined.as_ref(), &dest_path)
+        .map(|_| dest)
         .map_err(|e| e.to_string());
     if result.is_ok() {
         if let Some(fmt) = telemetry::ExportFormat::parse(&format) {
