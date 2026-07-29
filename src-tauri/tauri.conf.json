@@ -50,18 +50,7 @@
       "infoPlist": "Info.plist",
       "minimumSystemVersion": "13.0",
       "signingIdentity": "voice-notes Dev",
-      "entitlements": "./Entitlements.plist",
-      "frameworks": [
-        "target/bundle-libs/libabsl_base.dylib",
-        "target/bundle-libs/libabsl_raw_logging_internal.dylib",
-        "target/bundle-libs/libabsl_log_severity.dylib",
-        "target/bundle-libs/libabsl_spinlock_wait.dylib",
-        "target/bundle-libs/libabsl_strings.dylib",
-        "target/bundle-libs/libabsl_strings_internal.dylib",
-        "target/bundle-libs/libabsl_int128.dylib",
-        "target/bundle-libs/libabsl_string_view.dylib",
-        "target/bundle-libs/libabsl_throw_delegate.dylib"
-      ]
+      "entitlements": "./Entitlements.plist"
     }
   }
 }
