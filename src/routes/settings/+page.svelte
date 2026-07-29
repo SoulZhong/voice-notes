@@ -28,7 +28,7 @@
   } from "$lib/models";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
-  import { checkUpdate, applyUpdate, updateProgressLabel, type UpdateInfo } from "$lib/update";
+  import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
 
   let settings = $state<Settings | null>(null);
 
@@ -75,12 +75,15 @@
   let updating = $state(false);
   let updatingLabel = $state("更新中…");
   let updateFallback = $state(false);
+  // 与 +layout 横幅同款守卫:安装成功即 relaunch,录音/收尾中更新会截断录音尾段。
+  const updateBlocked = $derived(recording.isLive || recording.stopping);
   async function doOneClickUpdate() {
+    if (updateBlocked) return;
     updating = true;
     updateError = "";
     updatingLabel = "更新中…";
     try {
-      const r = await applyUpdate((d, t) => (updatingLabel = updateProgressLabel(d, t)));
+      const r = await applyUpdate((label) => (updatingLabel = label));
       if (r === "none") {
         // GitHub API 已见新版但 latest.json 未就绪(发布产物上传有时差)。
         updateError = "更新包尚未就绪,稍后再试或打开发布页手动下载";
@@ -1154,7 +1157,12 @@
           </span>
         </div>
         {#if updateInfo?.has_update}
-          <button class="btn-secondary" onclick={doOneClickUpdate} disabled={updating}>
+          <button
+            class="btn-secondary"
+            onclick={doOneClickUpdate}
+            disabled={updating || updateBlocked}
+            title={updateBlocked ? "录音进行中,结束后再更新" : undefined}
+          >
             {updating ? updatingLabel : `一键更新 v${updateInfo.latest}`}
           </button>
           {#if updateFallback}

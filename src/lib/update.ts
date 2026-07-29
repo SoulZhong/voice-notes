@@ -45,28 +45,50 @@ export function updateProgressLabel(downloaded: number, total: number | undefine
   return `更新中 ${Math.min(100, Math.round((downloaded / total) * 100))}%`;
 }
 
-/** 一键更新:updater 插件查 → 下载(回调进度)→ 安装 → 重启。
+/** 网络请求超时(查询与下载各自适用):连接悬死不能让按钮永远停在「更新中」。 */
+const UPDATE_TIMEOUT_MS = 30_000;
+
+// 单飞锁:横幅(+layout)与设置页两个入口同时可见,各自组件态互不知情,
+// 不加锁会并发两趟 downloadAndInstall(双下载、安装互踩)。进行中再调用
+// 直接复用同一 promise(后来者的进度回调不接线,其按钮停在初始「更新中…」,
+// 与真实进度共享同一次安装)。
+let inFlight: Promise<"none"> | null = null;
+
+/** 一键更新:updater 插件查 → 下载(回调进度文案)→ 安装 → 重启。
  * 返回 "none" = 端上认为没有更新(与 check_update 的 GitHub API 判断可能短暂不一致,
- * 如 Release 刚发但 latest.json 未就绪);安装成功后 relaunch 不返回。
+ * 如 Release 刚发但 latest.json 未就绪);安装成功后 relaunch 不返回
+ * (Windows 上安装器会先行结束应用,relaunch 根本执行不到——由安装器负责收尾)。
  * 任何失败向上抛:调用方兜底到「打开发布页」手动路径——一键更新是增强,
  * 不能因签名/网络问题把用户堵死在无法更新的状态。 */
-export async function applyUpdate(
-  onProgress: (downloaded: number, total: number | undefined) => void,
-): Promise<"none"> {
+export function applyUpdate(onProgress: (label: string) => void): Promise<"none"> {
+  if (!inFlight) {
+    inFlight = doApplyUpdate(onProgress).finally(() => (inFlight = null));
+  }
+  return inFlight;
+}
+
+async function doApplyUpdate(onProgress: (label: string) => void): Promise<"none"> {
   const { check } = await import("@tauri-apps/plugin-updater");
   const { relaunch } = await import("@tauri-apps/plugin-process");
-  const update = await check();
+  const update = await check({ timeout: UPDATE_TIMEOUT_MS });
   if (!update) return "none";
   let downloaded = 0;
   let total: number | undefined;
-  await update.downloadAndInstall((event) => {
-    if (event.event === "Started") {
-      total = event.data.contentLength ?? undefined;
-    } else if (event.event === "Progress") {
-      downloaded += event.data.chunkLength;
-      onProgress(downloaded, total);
-    }
-  });
+  await update.downloadAndInstall(
+    (event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? undefined;
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        onProgress(updateProgressLabel(downloaded, total));
+      } else if (event.event === "Finished") {
+        // 下载完成后还有签名校验+解包安装,可能要几十秒;不处理会停在
+        // 「更新中 100%」像卡死。
+        onProgress("安装中…");
+      }
+    },
+    { timeout: UPDATE_TIMEOUT_MS },
+  );
   await relaunch();
   return "none"; // relaunch 后通常到不了这里,类型完整性兜底
 }

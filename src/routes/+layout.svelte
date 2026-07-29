@@ -9,7 +9,7 @@
   import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { checkUpdate, applyUpdate, updateProgressLabel, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
+  import { checkUpdate, applyUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
 
@@ -22,6 +22,9 @@
   let updating = $state(false);
   let updatingLabel = $state("更新中…");
   let updateFailed = $state(false);
+  // 安装成功即 relaunch:录音/收尾进行中点更新会把识别尾包和终稿截在半路,
+  // 静默丢数据——录音期间禁点,结束后再更新。
+  const updateBlocked = $derived(recording.isLive || recording.stopping);
   async function openUpdate() {
     if (!update) return;
     if (updateFailed) {
@@ -29,10 +32,11 @@
       openUrl(update.url);
       return;
     }
+    if (updateBlocked) return;
     updating = true;
     updatingLabel = "更新中…";
     try {
-      const r = await applyUpdate((d, t) => (updatingLabel = updateProgressLabel(d, t)));
+      const r = await applyUpdate((label) => (updatingLabel = label));
       if (r === "none") updateFailed = true; // latest.json 未就绪等,退手动
     } catch {
       updateFailed = true;
@@ -95,10 +99,17 @@
     {#if update}
       <div class="update-banner">
         <span class="upd-dot"></span>发现新版 v{update.latest}(当前 v{update.current})
-        <button class="link" onclick={openUpdate} disabled={updating}>
+        <button
+          class="link"
+          onclick={openUpdate}
+          disabled={updating || (!updateFailed && updateBlocked)}
+          title={!updateFailed && updateBlocked ? "录音进行中,结束后再更新" : undefined}
+        >
           {updating ? updatingLabel : updateFailed ? "打开发布页" : "一键更新"}
         </button>
-        <button class="link" onclick={dismissUpdateBanner}>知道了</button>
+        <!-- 更新中禁「知道了」:横幅一收,下载安装仍在后台跑,几分钟后应用
+             无预警重启,用户会以为闪退。 -->
+        <button class="link" onclick={dismissUpdateBanner} disabled={updating}>知道了</button>
       </div>
     {/if}
     {@render children()}

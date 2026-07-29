@@ -23,17 +23,20 @@ jobs:
           node-version: 20
       - run: npm ci
       - name: 私钥签名 → 公钥验签
+        # 私钥走 tauri CLI 原生识别的环境变量,不下 CLI 参数:argv 对 runner 上
+        # 同宿主进程全程可见(/proc/*/cmdline),而 npm ci 刚执行过整棵依赖树的
+        # postinstall——环境变量只暴露给被调用的 tauri 进程本身。
         env:
-          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "$KEY" ]; then
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY 为空——检查 Environment「TAURI」的 secrets 与 workflow 的 environment 声明"
             exit 1
           fi
           echo "hello-updater-$(date +%s)" > dummy.bin
-          npx tauri signer sign -k "$KEY" -p "$PW" dummy.bin
+          npx tauri signer sign dummy.bin
           test -s dummy.bin.sig || { echo "::error::未产出签名文件"; exit 1; }
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           # tauri 的 .sig 是 base64 包装的 minisign 签名(latest.json 嵌的就是它),
