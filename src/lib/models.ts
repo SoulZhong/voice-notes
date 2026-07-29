@@ -25,6 +25,16 @@ export type Settings = {
   asr_model: string;
   /** sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json;空 = CPU)。 */
   asr_provider: string;
+  /** 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(后端 set_settings 拦截)。 */
+  asr_mode: string;
+  /** 云端厂商:"volcano" / "aliyun"。 */
+  cloud_asr_provider: string;
+  /** 火山凭证(APP ID)。明文存储,同 refine_api_key 先例。 */
+  volc_app_key: string;
+  /** 火山凭证(Access Token)。 */
+  volc_access_key: string;
+  /** 阿里 DashScope API Key。明文,同上。 */
+  dashscope_api_key: string;
   /** 声纹嵌入模型:"campplus"(默认)/"eres2netv2"。切换触发声纹库后台重建。 */
   speaker_model: string;
   // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
@@ -106,3 +116,6 @@ export const testRefineLlm = (baseUrl: string, model: string, apiKey: string) =>
 export const testRefineAgent = (provider: string, bin: string, model: string) =>
   invoke<string>("test_refine_agent", { provider, bin, model });
 export const testMirror = (prefix: string) => invoke<string>("test_mirror", { prefix });
+// 云端 ASR 测试连接:按当前 settings 造适配器实际握手一次,成功返回文案、失败 reject 原因;
+// 录制中会被后端拒绝(挤占厂商并发路数)。
+export const testCloudAsr = () => invoke<string>("test_cloud_asr");

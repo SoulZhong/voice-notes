@@ -7,6 +7,7 @@
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
+  import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
 
@@ -116,6 +117,32 @@
     if (goSettings) goto("/ai");
   }
 
+  // 云端识别连接状态(仅云端模式录制时产生):细提示条,不阻断录制。reconnecting/backfilling/
+  // backfill_failed 持续显示到下一个事件覆盖;recovered 闪一下「已恢复」后 3s 自动清空,
+  // 避免恢复提示常驻占位。
+  let cloudStatus = $state<{ kind: CloudAsrStatusEvent["state"]; text: string } | null>(null);
+  let cloudStatusClearTimer: ReturnType<typeof setTimeout> | null = null;
+  function handleCloudAsrStatus(e: CloudAsrStatusEvent) {
+    if (cloudStatusClearTimer) {
+      clearTimeout(cloudStatusClearTimer);
+      cloudStatusClearTimer = null;
+    }
+    if (e.state === "reconnecting") {
+      cloudStatus = { kind: e.state, text: "云端识别中断,重连中…" };
+    } else if (e.state === "backfilling") {
+      cloudStatus = { kind: e.state, text: "补识中…" };
+    } else if (e.state === "backfill_failed") {
+      cloudStatus = { kind: e.state, text: "部分片段补识失败,原始音频已保留" };
+    } else {
+      // recovered
+      cloudStatus = { kind: e.state, text: "已恢复" };
+      cloudStatusClearTimer = setTimeout(() => {
+        cloudStatus = null;
+        cloudStatusClearTimer = null;
+      }, 3000);
+    }
+  }
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
@@ -133,9 +160,12 @@
     window.addEventListener("focus", onFocus);
     // 录制中也检测(会议软件中途拉低输入音量):轮询与录制状态无关,一直跑。
     const volTimer = setInterval(refreshInputVol, POLL_MS);
+    const unCloud = onCloudAsrStatus(handleCloudAsrStatus);
     return () => {
       window.removeEventListener("focus", onFocus);
       clearInterval(volTimer);
+      if (cloudStatusClearTimer) clearTimeout(cloudStatusClearTimer);
+      unCloud.then((f) => f());
     };
   });
 
@@ -313,6 +343,13 @@
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
       {#if isError(recording.status)}
         <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      {/if}
+
+      <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->
+      {#if recording.isLive && cloudStatus}
+        <p class="status" class:error={cloudStatus.kind === "backfill_failed"}>
+          <span class="status-dot"></span>{cloudStatus.text}
+        </p>
       {/if}
 
       <!-- 说话人条随头部整体吸顶:滚到会中段落时仍要能对着条上的名字辨认发言人/改名,

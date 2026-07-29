@@ -85,6 +85,16 @@ export function onPlayerPos(cb: (e: PlayerPosEvent) => void) {
   return listen<PlayerPosEvent>("player_pos", (ev) => cb(ev.payload));
 }
 
+/** 云端识别连接状态(仅云端模式录制时产生),事件名 "cloud-asr-status"。录制页据此显示
+ * 「重连中/补识中/补识失败」的细提示条,未接监听不影响录制。 */
+export type CloudAsrStatusEvent = {
+  state: "reconnecting" | "recovered" | "backfilling" | "backfill_failed";
+  source: Source;
+};
+export function onCloudAsrStatus(cb: (e: CloudAsrStatusEvent) => void) {
+  return listen<CloudAsrStatusEvent>("cloud-asr-status", (ev) => cb(ev.payload));
+}
+
 /** 后端自动改名(LLM 主题标题)。侧栏与详情页据此刷新标题。 */
 export type NoteRenamedEvent = { note_id: string; title: string };
 
