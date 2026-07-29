@@ -100,6 +100,7 @@
 
 - [Rust](https://rustup.rs)（stable）与 Node.js 18+
 - macOS/Linux 还需 meson 与 ninja（编译 WebRTC 回声消除模块）：`pip3 install --user meson ninja`；Windows 不需要
+- macOS 打包机不要安装（或先 `brew unlink abseil`）Homebrew abseil：装了会被链成共享库，产出的包在用户机器上启动即崩；不装时构建会自动静态内嵌 abseil（首次构建需联网拉取源码）
 
 ```bash
 git clone https://github.com/SoulZhong/voice-notes.git
