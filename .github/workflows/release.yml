@@ -52,14 +52,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # macOS 构建链:webrtc-audio-processing(bundled)经 meson/ninja 编译并
+      # 经 pkg-config 链接 brew abseil;abseil 版本随 runner 镜像滚动,
+      # fix-bundle-dylibs.sh 已做版本无关化,这里装什么版本都行。
+      - name: macOS 构建依赖
+        if: matrix.platform == 'macos-latest'
+        run: brew install abseil meson ninja pkg-config
+      # tauri-build 在 cargo 编译期就校验 bundle.macOS.frameworks 文件存在,
+      # 必须在构建前把 abseil 免版本副本暂存好(--stage-only 不碰主二进制)。
+      - name: 预暂存 abseil 打包副本
+        if: matrix.platform == 'macos-latest'
+        run: bash src-tauri/fix-bundle-dylibs.sh --stage-only
       - run: npm ci
       # 钉 commit SHA 而非可变 tag(v0):此 step 持有 updater 签名私钥,
       # tag 被恶意重指即可窃 key、给全体客户端签恶意更新。升级时人工换 SHA。
+      #
+      # APPLE_SIGNING_IDENTITY=- :runner 上没有本机的「voice-notes Dev」自签
+      # 身份,官方语义为环境变量覆盖 tauri.conf 的 signingIdentity,ad-hoc 签名
+      # (与本机自签同为无公证分发,用户信任路径不变);Windows 构建忽略此变量。
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "voice-notes ${{ github.ref_name }}"
