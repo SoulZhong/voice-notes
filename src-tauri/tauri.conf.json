@@ -52,15 +52,15 @@
       "signingIdentity": "voice-notes Dev",
       "entitlements": "./Entitlements.plist",
       "frameworks": [
-        "target/bundle-libs/libabsl_base.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_raw_logging_internal.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_log_severity.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_spinlock_wait.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_strings.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_strings_internal.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_int128.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_string_view.2407.0.0.dylib",
-        "target/bundle-libs/libabsl_throw_delegate.2407.0.0.dylib"
+        "target/bundle-libs/libabsl_base.dylib",
+        "target/bundle-libs/libabsl_raw_logging_internal.dylib",
+        "target/bundle-libs/libabsl_log_severity.dylib",
+        "target/bundle-libs/libabsl_spinlock_wait.dylib",
+        "target/bundle-libs/libabsl_strings.dylib",
+        "target/bundle-libs/libabsl_strings_internal.dylib",
+        "target/bundle-libs/libabsl_int128.dylib",
+        "target/bundle-libs/libabsl_string_view.dylib",
+        "target/bundle-libs/libabsl_throw_delegate.dylib"
       ]
     }
   }
