@@ -90,6 +90,8 @@ export function onPlayerPos(cb: (e: PlayerPosEvent) => void) {
 export type CloudAsrStatusEvent = {
   state: "reconnecting" | "recovered" | "backfilling" | "backfill_failed";
   source: Source;
+  /** 断连原因原文(仅 reconnecting 可能带),状态条截断附在「重连中…」后面。 */
+  message?: string;
 };
 export function onCloudAsrStatus(cb: (e: CloudAsrStatusEvent) => void) {
   return listen<CloudAsrStatusEvent>("cloud-asr-status", (ev) => cb(ev.payload));

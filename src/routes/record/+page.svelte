@@ -122,13 +122,24 @@
   // 避免恢复提示常驻占位。
   let cloudStatus = $state<{ kind: CloudAsrStatusEvent["state"]; text: string } | null>(null);
   let cloudStatusClearTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 厂商错误原文可能很长(带 requestId 的整串 JSON),状态条只留一行的量。 */
+  const CLOUD_REASON_MAX = 80;
+  function cloudReason(message?: string) {
+    const m = message?.trim();
+    if (!m) return "";
+    return `(${m.length > CLOUD_REASON_MAX ? m.slice(0, CLOUD_REASON_MAX - 1) + "…" : m})`;
+  }
   function handleCloudAsrStatus(e: CloudAsrStatusEvent) {
+    // 「已恢复」不许盖掉「补识失败」:补识失败是这场录音真留了窟窿(占位段已落盘),
+    // 而 recovered 只说明连接回来了。盖过去用户会以为窟窿被补上了。警告留到下一次
+    // reconnecting(新一轮故障)、录制结束(提示条随 isLive 消失)或手动清除为止。
+    if (e.state === "recovered" && cloudStatus?.kind === "backfill_failed") return;
     if (cloudStatusClearTimer) {
       clearTimeout(cloudStatusClearTimer);
       cloudStatusClearTimer = null;
     }
     if (e.state === "reconnecting") {
-      cloudStatus = { kind: e.state, text: "云端识别中断,重连中…" };
+      cloudStatus = { kind: e.state, text: `云端识别中断,重连中…${cloudReason(e.message)}` };
     } else if (e.state === "backfilling") {
       cloudStatus = { kind: e.state, text: "补识中…" };
     } else if (e.state === "backfill_failed") {

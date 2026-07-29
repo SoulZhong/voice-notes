@@ -1233,16 +1233,18 @@ fn spawn_session(
                         }
                     }),
                     on_status: Box::new(move |st| {
-                        let (state, source) = match st {
-                            session::CloudAsrStatus::Reconnecting { source } => {
-                                ("reconnecting", source)
+                        let (state, source, message) = match st {
+                            session::CloudAsrStatus::Reconnecting { source, message } => {
+                                ("reconnecting", source, message)
                             }
-                            session::CloudAsrStatus::Recovered { source } => ("recovered", source),
+                            session::CloudAsrStatus::Recovered { source } => {
+                                ("recovered", source, None)
+                            }
                             session::CloudAsrStatus::Backfilling { source } => {
-                                ("backfilling", source)
+                                ("backfilling", source, None)
                             }
                             session::CloudAsrStatus::BackfillFailed { source } => {
-                                ("backfill_failed", source)
+                                ("backfill_failed", source, None)
                             }
                         };
                         let _ = app_st.emit(
@@ -1250,6 +1252,7 @@ fn spawn_session(
                             ipc::CloudAsrStatusEvent {
                                 state: state.into(),
                                 source: source.as_str().into(),
+                                message,
                             },
                         );
                     }),

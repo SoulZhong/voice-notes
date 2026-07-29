@@ -277,4 +277,36 @@ mod tests {
         assert_eq!(code, 55000031);
         assert_eq!(msg, "quota");
     }
+
+    #[test]
+    fn parse_server_frame_rejects_truncated_and_unknown_frames() {
+        // 与阿里侧 parse_event 的坏帧用例镜像:坏帧一律 Err,绝不 panic——收发循环
+        // 只把 Err 当"丢弃继续收",一次下标越界 panic 会整条会话线程猝死。
+        assert!(parse_server_frame(&[]).is_err(), "空帧");
+        assert!(parse_server_frame(&[0x11, 0x90, 0x11]).is_err(), "不足 4 字节头部");
+        // 完整响应帧:头部够了,但 seq+长度字段不全。
+        assert!(parse_server_frame(&[0x11, 0x90, 0x11, 0x00, 0x00]).is_err(), "响应帧头后截断");
+        // payload 长度声明越界(声明 999 字节,实际只有 2)。
+        let mut buf = vec![0x11, 0x90, 0x11, 0x00];
+        buf.extend_from_slice(&1i32.to_be_bytes());
+        buf.extend_from_slice(&999u32.to_be_bytes());
+        buf.extend_from_slice(&[0xAB, 0xCD]);
+        assert!(parse_server_frame(&buf).is_err(), "payload 长度声明超出帧体");
+        // 错误帧同款:消息长度声明越界。
+        let mut buf = vec![0x11, 0xF0, 0x00, 0x00];
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&999u32.to_be_bytes());
+        buf.extend_from_slice(b"ab");
+        assert!(parse_server_frame(&buf).is_err(), "错误消息长度声明超出帧体");
+        // 未知消息类型(byte1 高4位 = 0b0101,协议里没有)。
+        let mut buf = vec![0x11, 0x50, 0x00, 0x00];
+        buf.extend_from_slice(&[0u8; 8]);
+        assert!(parse_server_frame(&buf).is_err(), "未知消息类型");
+        // 声明 gzip 但 payload 不是 gzip 流:解压失败也走 Err,不 panic。
+        let mut buf = vec![0x11, 0x90, 0x11, 0x00];
+        buf.extend_from_slice(&1i32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(b"junk");
+        assert!(parse_server_frame(&buf).is_err(), "假 gzip payload");
+    }
 }

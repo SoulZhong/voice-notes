@@ -92,6 +92,10 @@ pub struct CloudAsrStatusEvent {
     /// "reconnecting" | "recovered" | "backfilling" | "backfill_failed"
     pub state: String,
     pub source: String, // "mic" | "system"
+    /// 断连原因原文(仅 reconnecting 可能有):厂商错误文本/本机失败描述,前端
+    /// 附在「重连中…」后面截断展示。拿不到原因时字段整个不出现。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// 说话人表(全量推送),事件名 "speakers"。name 空串 = 未改名(前端按 id 兜底)。

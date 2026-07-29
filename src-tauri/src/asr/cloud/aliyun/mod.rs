@@ -58,7 +58,13 @@ const UPLINK_CHUNK_BYTES: usize = 3200;
 /// 一帧音频都不会 push,新开的流上是**零上行帧**。阿里对此的约束是 run-task 后
 /// 23s 内没有音频帧就 task-failed(火山是同类的等包超时 45000081)。
 /// run-task 的 `heartbeat:true` 只覆盖"有帧但内容是静音"这种情况,覆盖不了"零帧"。
-const KEEPALIVE_IDLE_MS: u64 = 10_000;
+///
+/// 分工(与 session.rs CLOUD_IDLE_CLOSE_MS 注释对称):本保活只负责"worker 被同步
+/// 补识阻塞"这类**有界**窗口(≤80s → 注入 ≤0.8s 静音,时钟偏移已在下方分支算过账);
+/// **暂停**那种无界静默由 worker 侧的闲置关流兜底——它的门槛(8s)严格小于这里的
+/// 10s,所以暂停永远轮不到保活开火。改这两个值时保持这个大小关系(session.rs
+/// 有一条常数关系测试盯着)。
+pub(crate) const KEEPALIVE_IDLE_MS: u64 = 10_000;
 /// 保活检查节拍。粒度要远小于 KEEPALIVE_IDLE_MS,让实际静默上限 ≈ idle + 一个节拍,
 /// 与厂商的 23s 之间留足余量。
 const KEEPALIVE_TICK: Duration = Duration::from_secs(2);

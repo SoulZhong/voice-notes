@@ -333,8 +333,9 @@ fn split_final(
     job_end_ms: u64,
     transcript: &Transcript,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
-    // 开关透传：子段重识别复核（见下方 is_foreign_final 调用）需与整段判定用
-    // 同一个开关状态，否则关闭过滤后仍会在回退路径误丢子段。
+    // 已无用:子段重识别复核撤掉后,本函数内不再有任何语言判定(整段过滤在
+    // FinalSink::push 里一次做完)。参数保留仅为签名兼容——调用点与本机/云端两条
+    // 路一致,将来若要恢复子段级复核,开关必须仍与整段判定同源,不该由这里另取。
     _language_filter: bool,
 ) -> Vec<SubFinal> {
     let whole_segment = |job_samples: Vec<f32>| {
@@ -1041,6 +1042,25 @@ use crate::asr::cloud::CLOUD_DRAIN_MS;
 const CLOUD_DRAIN_MS: u64 = 200;
 /// 主循环空闲 tick(ms):驱动 FinalSink 的 hold 到期检查,与本机 worker 同节奏。
 const CLOUD_TICK_MS: u64 = 100;
+/// 闲置即关流的门槛(ms):某源这么久没有音频帧就主动关掉厂商流。
+///
+/// 治的是暂停:暂停期间 segment_worker 把帧全丢了,worker 这边一帧不来、fed 冻结,
+/// 而适配层的保活会每 KEEPALIVE_IDLE_MS 往厂商塞 100ms 静音——暂停多久就塞多久
+/// (30min 暂停 ≈ 18s 时钟偏移),此后所有定稿的流内 ms 相对真实音频整体前移,
+/// ring 取样与 diarization 全部错位。关掉流,厂商时钟自然停摆;恢复送音频时重开
+/// 一条流并重基,偏移归零。
+///
+/// **必须严格小于两家适配层的 KEEPALIVE_IDLE_MS(10_000)**:否则保活会先于关流触发,
+/// 暂停仍会注入静音。分工(与适配层注释对称):worker 侧闲置关流覆盖「暂停」这类
+/// 无界静默;适配层保活只覆盖「worker 被同步补识阻塞」这类有界窗口(≤80s → ≤0.8s
+/// 偏移,已在适配层注释里算过账)——那期间音频通道里帧还在排队,这里的 last_audio_at
+/// 不会老化,两条机制不打架。
+pub(crate) const CLOUD_IDLE_CLOSE_MS_PROD: u64 = 8_000;
+#[cfg(not(test))]
+const CLOUD_IDLE_CLOSE_MS: u64 = CLOUD_IDLE_CLOSE_MS_PROD;
+/// 测试值:短到单测里几个真实 sleep 就能触发,免得空等 8s。
+#[cfg(test)]
+const CLOUD_IDLE_CLOSE_MS: u64 = 50;
 
 /// 缺口切段器:缺口音频 → (段偏移样本, 段) 列表。由调用方注入本机 VAD
 /// (厂商批式接口有单请求时长上限),worker 只把偏移叠回绝对时间轴。
@@ -1049,7 +1069,9 @@ pub type BackfillSegmenter = dyn FnMut(&[f32]) -> Vec<(u64, Vec<f32>)> + Send;
 /// 云端识别的连接状态,供 UI 提示「重连中/补识中/已恢复」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudAsrStatus {
-    Reconnecting { source: Source },
+    /// `message`:断连原因的厂商/本机原文(spec §7 要求把它透到状态条上,
+    /// 「重连中」三个字说不清是网断了还是配额没了)。拿不到原文时为 None。
+    Reconnecting { source: Source, message: Option<String> },
     Recovered { source: Source },
     Backfilling { source: Source },
     BackfillFailed { source: Source },
@@ -1187,6 +1209,11 @@ struct CloudSource {
     /// 下次重连时刻(退避);None = 不安排自动重连(正常关闭 / 从未断连)。
     retry_at: Option<Instant>,
     backoff_ms: u64,
+    /// 本源最后一次收到音频帧的时刻(闲置关流判据,见 CLOUD_IDLE_CLOSE_MS)。
+    last_audio_at: Instant,
+    /// 流是被「闲置关流」关掉的(而非断连/厂商正常关闭)。音频一回来就立刻重开,
+    /// 不等退避——它压根不是故障。
+    idle_closed: bool,
 }
 
 /// 下一次重连退避:活够 STABLE 才算这条流站住过,退避清回基数;否则继续翻倍到上限。
@@ -1199,10 +1226,16 @@ fn next_backoff(prev_ms: u64, lived_ms: u64) -> u64 {
     }
 }
 
-/// 标记一次断连:记缺口起点、丢弃死流、通知 UI、起退避。
-fn mark_disconnected<S: FnMut(CloudAsrStatus)>(cs: &mut CloudSource, on_status: &mut S) {
+/// 标记一次断连:记缺口起点、丢弃死流、通知 UI(带上原因原文)、起退避。
+fn mark_disconnected<S: FnMut(CloudAsrStatus)>(
+    cs: &mut CloudSource,
+    // 断连原因原文(厂商错误文本/本机失败描述),透传到状态条,见 CloudAsrStatus。
+    message: Option<String>,
+    on_status: &mut S,
+) {
     cs.feed.begin_gap();
     cs.stream = None;
+    cs.idle_closed = false; // 这是故障关流,不是闲置关流:恢复走退避路径
     // 退避按"这条流活了多久"推进:开起来就死的抖动流必须继续拉长间隔,
     // 无条件清零会在鉴权过期/服务端持续拒绝时变成忙重连风暴。
     let lived_ms = cs
@@ -1211,7 +1244,7 @@ fn mark_disconnected<S: FnMut(CloudAsrStatus)>(cs: &mut CloudSource, on_status: 
         .map_or(0, |t| t.elapsed().as_millis() as u64);
     cs.backoff_ms = next_backoff(cs.backoff_ms, lived_ms);
     cs.retry_at = Some(Instant::now() + Duration::from_millis(cs.backoff_ms));
-    on_status(CloudAsrStatus::Reconnecting { source: cs.source });
+    on_status(CloudAsrStatus::Reconnecting { source: cs.source, message });
 }
 
 /// 厂商定稿的绝对样本区间 `[start, end)`:流内 ms 叠加本流基准。
@@ -1457,6 +1490,8 @@ pub fn run_cloud_asr_worker(
             stream_opened_at: None,
             retry_at: None,
             backoff_ms: CLOUD_BACKOFF_BASE_MS,
+            last_audio_at: Instant::now(),
+            idle_closed: false,
         })
         .collect();
 
@@ -1471,7 +1506,7 @@ pub fn run_cloud_asr_worker(
             }
             Err(e) => {
                 eprintln!("云端开流失败({:?} 源): {e};进入重连", cs.source);
-                mark_disconnected(cs, &mut on_status);
+                mark_disconnected(cs, Some(format!("开流失败: {e}")), &mut on_status);
             }
         }
     }
@@ -1499,7 +1534,7 @@ pub fn run_cloud_asr_worker(
                         // 事件通道无声无息断开(适配层线程异常退出):视同带错关闭,
                         // 否则这条流会变成"活着但永不出字"的黑洞。
                         eprintln!("云端事件通道断开({:?} 源);按断连处理", cs.source);
-                        mark_disconnected(cs, &mut on_status);
+                        mark_disconnected(cs, Some("识别通道意外断开".into()), &mut on_status);
                         break;
                     }
                 }
@@ -1559,6 +1594,21 @@ pub fn run_cloud_asr_worker(
         match woke {
             Woke::Audio(i, Ok(frame)) => {
                 let cs = &mut srcs[i];
+                cs.last_audio_at = Instant::now();
+                // 闲置关流后音频回来了(用户解除暂停):立刻重开,不等退避——它不是
+                // 故障。缺口是暂停那一刻起的零长/尾巴长,补识几乎是空操作。
+                if cs.stream.is_none() && cs.idle_closed {
+                    cs.idle_closed = false;
+                    // 闲置重开不报 Recovered:用户只是暂停过,状态条闪一下「已恢复」
+                    // 会让人以为刚出过故障。真有尾巴没补回来时 Backfilling/
+                    // BackfillFailed 照常透出,那才是需要知道的事。
+                    let mut st = |s: CloudAsrStatus| {
+                        if !matches!(s, CloudAsrStatus::Recovered { .. }) {
+                            on_status(s);
+                        }
+                    };
+                    try_recover(cs, true, &cloud, backfill_segmenter.as_mut(), &mut sink, &mut st);
+                }
                 // 先推后记账:推失败时缺口起点正好落在本帧之前(本帧没送达厂商,
                 // 必须算进缺口)。断连期间流为 None → 只记账,不推(规约 7)。
                 let push_failed = match cs.stream.as_mut() {
@@ -1567,17 +1617,41 @@ pub fn run_cloud_asr_worker(
                 };
                 if push_failed {
                     eprintln!("云端推流失败({:?} 源);按断连处理", cs.source);
-                    mark_disconnected(cs, &mut on_status);
+                    mark_disconnected(cs, Some("音频推流失败".into()), &mut on_status);
                 }
                 cs.feed.account(&frame);
+                // hold 到期检查必须搭音频分支的车:录制期间采集帧 10–21ms 一次(静音
+                // 也发),select 的超时分支实际到不了,只靠 Woke::Tick 驱动 tick 会让
+                // 一个 hold 中的 mic 段在长时间无定稿的间隙里远远超期不放行。
+                // tick 廉价且幂等,每次音频都调一次是最省事的正确做法。
+                sink.tick();
             }
             Woke::Audio(i, Err(_)) => srcs[i].audio_open = false,
             Woke::Event(i, Ok(e)) => handle_cloud_event(&mut srcs[i], e, &mut sink, &mut on_status),
             Woke::Event(i, Err(_)) => {
                 eprintln!("云端事件通道断开({:?} 源);按断连处理", srcs[i].source);
-                mark_disconnected(&mut srcs[i], &mut on_status);
+                mark_disconnected(&mut srcs[i], Some("识别通道意外断开".into()), &mut on_status);
             }
             Woke::Tick => sink.tick(),
+        }
+
+        // 闲置关流(暂停根治,见 CLOUD_IDLE_CLOSE_MS)。放在唤醒处理之后,音频分支与
+        // tick 分支都覆盖到——同上,超时分支在录制期几乎不触发,不能只挂在 tick 上。
+        for cs in srcs.iter_mut() {
+            if cs.stream.is_some()
+                && cs.last_audio_at.elapsed() > Duration::from_millis(CLOUD_IDLE_CLOSE_MS)
+            {
+                // 丢弃 push/finish/events 三个句柄:适配层的 ctl 通道随之关闭,那边
+                // 自行收摊(它发出的 Closed 我们已不再接收)。不 finish——暂停不是
+                // 收尾,尾巴靠下面这个缺口在重开时补回。
+                cs.stream = None;
+                cs.stream_opened_at = None;
+                // fed 已冻结,缺口起点 = min(最后定稿末尾, fed):厂商把话说完了就是
+                // 零长缺口(重开时闭合即无事发生),没说完就是那截尾巴,照常补识。
+                cs.feed.begin_gap();
+                cs.idle_closed = true;
+                // 不发状态事件:暂停不是故障,状态条上不该出现任何提示。
+            }
         }
     }
 
@@ -1687,7 +1761,9 @@ fn handle_cloud_event<F, P, D, S>(
         }
         crate::asr::cloud::CloudEvent::Closed { error: Some(e) } => {
             eprintln!("云端连接断开({:?} 源): {e}", cs.source);
-            mark_disconnected(cs, on_status);
+            // 厂商错误原文原样透传:状态条上「重连中(配额已用尽)」与「重连中」
+            // 对用户是两回事,前者他知道该去充值,后者只能干等。
+            mark_disconnected(cs, Some(e), on_status);
         }
     }
 }
@@ -3852,6 +3928,10 @@ mod cloud_worker_tests {
     struct PushGatedCloud {
         scripts: Mutex<std::collections::VecDeque<(usize, Vec<CloudEvent>)>>,
         batches: Mutex<std::collections::VecDeque<anyhow::Result<Vec<DefiniteUtterance>>>>,
+        /// 累计开流次数(闲置关流后是否真的重开了一条流,靠它断言)。
+        opens: Arc<Mutex<usize>>,
+        /// 跨流累计推入样本数(重开后音频有没有真的续上,靠它断言)。
+        pushed_total: Arc<Mutex<usize>>,
     }
 
     impl PushGatedCloud {
@@ -3859,7 +3939,12 @@ mod cloud_worker_tests {
             scripts: Vec<(usize, Vec<CloudEvent>)>,
             batches: Vec<anyhow::Result<Vec<DefiniteUtterance>>>,
         ) -> Self {
-            Self { scripts: Mutex::new(scripts.into()), batches: Mutex::new(batches.into()) }
+            Self {
+                scripts: Mutex::new(scripts.into()),
+                batches: Mutex::new(batches.into()),
+                opens: Default::default(),
+                pushed_total: Default::default(),
+            }
         }
     }
 
@@ -3871,6 +3956,7 @@ mod cloud_worker_tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("PushGatedCloud 流脚本耗尽"))?;
+            *self.opens.lock().unwrap() += 1;
             let (tx, rx) = crossbeam_channel::unbounded();
             if after == 0 {
                 for e in pending.drain(..) {
@@ -3878,10 +3964,12 @@ mod cloud_worker_tests {
                 }
             }
             let mut pushed = 0usize;
+            let total = self.pushed_total.clone();
             Ok(CloudStream {
                 // tx 随闭包存活:流活着期间事件通道不断开(与真实适配层一致)。
                 push: Box::new(move |s: &[f32]| {
                     pushed += s.len();
+                    *total.lock().unwrap() += s.len();
                     if pushed >= after {
                         for e in pending.drain(..) {
                             let _ = tx.send(e);
@@ -3968,6 +4056,178 @@ mod cloud_worker_tests {
             "补识结果贴回缺口起点(定稿末尾): {finals:?}"
         );
         assert_eq!(statuses, vec!["Reconnecting", "Backfilling", "Recovered"]);
+    }
+
+    /// 边跑边喂的驱动骨架:帧由后台线程按真实节奏送入,音频通道在 feeder 跑完前
+    /// 一直开着(对照 drive/drive_with:那边帧预先入队、立刻关通道 = 停录,复现不出
+    /// 「录制进行中」的时序,而 tick 饥饿、暂停闲置这类缺陷只在这种时序下才暴露)。
+    /// 每条 final 附带一个「此刻还在喂帧吗」标记,用来断言放行时机。
+    type LiveCollected = (Vec<(Source, String, u64, u64, bool)>, Vec<String>);
+
+    fn drive_live(
+        cloud: Arc<dyn CloudAsr>,
+        feeder: impl FnOnce(&crossbeam_channel::Sender<Vec<f32>>) + Send + 'static,
+    ) -> LiveCollected {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let feeding = Arc::new(AtomicBool::new(true));
+        let f2 = feeding.clone();
+        let feeder = std::thread::spawn(move || {
+            feeder(&tx);
+            f2.store(false, Ordering::SeqCst);
+            drop(tx); // 停录
+        });
+
+        let finals = Arc::new(Mutex::new(Vec::new()));
+        let statuses = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (f3, s3, flag) = (finals.clone(), statuses.clone(), feeding.clone());
+        let _ = run_cloud_asr_worker(
+            cloud,
+            None,
+            SpeakerRegistry::new(),
+            vec![(Source::Mic, rx)],
+            TEST_ECHO_HOLD,
+            false,
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+            move |s, t, a, b, _, _| {
+                f3.lock().unwrap().push((s, t, a, b, flag.load(Ordering::SeqCst)))
+            },
+            |_, _| {},
+            |_| {},
+            move |st| s3.lock().unwrap().push(status_name(&st)),
+        );
+        feeder.join().unwrap();
+        let finals = finals.lock().unwrap().clone();
+        let statuses = statuses.lock().unwrap().clone();
+        (finals, statuses)
+    }
+
+    #[test]
+    fn held_mic_final_releases_while_audio_keeps_flowing() {
+        // tick 饥饿:音频帧 10–21ms 一次(静音也发),select 的 100ms 超时分支实际
+        // 到不了;若 hold 到期检查只挂在超时分支上,这条 mic 段会一直压在 pending 里
+        // 直到停录排干才上屏——真实表现是"说完一句后好久不出字"。
+        let cloud: Arc<dyn CloudAsr> = Arc::new(PushGatedCloud::new(
+            vec![(1_600, vec![CloudEvent::Definite(utter("说了一句", 0, 100))])],
+            vec![],
+        ));
+        let (finals, _) = drive_live(cloud, |tx| {
+            for _ in 0..100 {
+                if tx.send(vec![0.1; 160]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert_eq!(finals.len(), 1, "{finals:?}");
+        assert_eq!(
+            (finals[0].1.as_str(), finals[0].2, finals[0].3),
+            ("说了一句", 0, 100)
+        );
+        assert!(
+            finals[0].4,
+            "hold(50ms)一到期就该放行,而不是拖到停录排干:此刻音频还在源源不断地来"
+        );
+    }
+
+    #[test]
+    fn idle_close_threshold_stays_below_adapter_keepalive() {
+        // 关流必须先于适配层保活开火,否则暂停期间照样每 10s 注入 100ms 静音,
+        // 厂商流内时钟随暂停时长无界偏移(30min 暂停 ≈ 18s)。
+        assert!(
+            CLOUD_IDLE_CLOSE_MS_PROD < crate::asr::cloud::volcano::KEEPALIVE_IDLE_MS,
+            "闲置关流门槛必须严格小于火山保活门槛"
+        );
+        assert!(
+            CLOUD_IDLE_CLOSE_MS_PROD < crate::asr::cloud::aliyun::KEEPALIVE_IDLE_MS,
+            "闲置关流门槛必须严格小于阿里保活门槛"
+        );
+        // 也不能太小:短于一次正常的说话停顿就会把流关来关去,每次重开都是一次握手。
+        assert!(CLOUD_IDLE_CLOSE_MS_PROD >= 5_000, "门槛过小会在正常停顿时反复关流");
+    }
+
+    #[test]
+    fn pause_closes_stream_and_next_audio_reopens_it_without_alarming_ui() {
+        // 暂停 = 音频帧不再到达(segment_worker 把帧丢了)。worker 必须主动关流;
+        // 音频一回来立刻重开,而且全程不该惊动状态条——用户只是按了暂停。
+        let gated = Arc::new(PushGatedCloud::new(
+            vec![
+                // 流1:推满 1600 样本(暂停前喂进去的全部)后吐一条覆盖到 fed 的定稿,
+                // 于是关流时缺口零长(真实厂商在 8s 闲置里早把话说完了)。
+                (1_600, vec![CloudEvent::Definite(utter("暂停前", 0, 100))]),
+                // 流2:重开后一直活着,不再吐事件。
+                (0, vec![]),
+            ],
+            vec![],
+        ));
+        let (opens, pushed) = (gated.opens.clone(), gated.pushed_total.clone());
+        let cloud: Arc<dyn CloudAsr> = gated;
+        let (finals, statuses) = drive_live(cloud, |tx| {
+            for _ in 0..10 {
+                tx.send(vec![0.1; 160]).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // 暂停:远超 CLOUD_IDLE_CLOSE_MS(测试值 50ms),通道保持开着(仍在录)。
+            std::thread::sleep(Duration::from_millis(250));
+            for _ in 0..10 {
+                tx.send(vec![0.1; 160]).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        assert_eq!(*opens.lock().unwrap(), 2, "闲置关流后音频回来,必须重开一条流");
+        assert_eq!(
+            *pushed.lock().unwrap(),
+            3_200,
+            "暂停前后的帧都推到了流上(暂停期间本就无帧)"
+        );
+        assert!(statuses.is_empty(), "暂停不是故障:不该有任何状态提示 {statuses:?}");
+        assert!(
+            !finals.iter().any(|f| f.1 == "[识别失败]"),
+            "零长缺口不该造出占位段: {finals:?}"
+        );
+        assert!(
+            finals.iter().any(|f| f.1 == "暂停前"),
+            "暂停前已定稿的内容照常上屏: {finals:?}"
+        );
+    }
+
+    #[test]
+    fn reconnecting_status_carries_vendor_error_text() {
+        // 「重连中」三个字说不清是网断了还是配额没了,厂商原文必须跟着状态走。
+        let mock = MockCloudAsr::new(
+            vec![
+                vec![CloudEvent::Closed { error: Some("55000031 配额已用尽".into()) }],
+                vec![CloudEvent::Closed { error: None }],
+            ],
+            vec![Ok(vec![utter("补", 0, 1000)])],
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        tx.send(vec![0.1; 16000]).unwrap();
+        drop(tx);
+        let statuses = Arc::new(Mutex::new(Vec::<CloudAsrStatus>::new()));
+        let s2 = statuses.clone();
+        let _ = run_cloud_asr_worker(
+            Arc::new(mock),
+            None,
+            SpeakerRegistry::new(),
+            vec![(Source::Mic, rx)],
+            TEST_ECHO_HOLD,
+            false,
+            Box::new(|gap: &[f32]| vec![(0u64, gap.to_vec())]),
+            |_, _, _, _, _, _| {},
+            |_, _| {},
+            |_| {},
+            move |st| s2.lock().unwrap().push(st),
+        );
+        let statuses = statuses.lock().unwrap().clone();
+        assert!(
+            matches!(
+                &statuses[0],
+                CloudAsrStatus::Reconnecting { source: Source::Mic, message: Some(m) }
+                    if m.contains("配额已用尽")
+            ),
+            "断连原因原文必须挂在 Reconnecting 上: {statuses:?}"
+        );
     }
 
     #[test]
