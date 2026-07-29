@@ -127,7 +127,10 @@
   function cloudReason(message?: string) {
     const m = message?.trim();
     if (!m) return "";
-    return `(${m.length > CLOUD_REASON_MAX ? m.slice(0, CLOUD_REASON_MAX - 1) + "…" : m})`;
+    // Array.from 按码点(而非 UTF-16 单元)切:message.slice 会把代理对(如 emoji/
+    // 部分 CJK 扩展区字符)从中间切开，渲染成乱码半字符。
+    const chars = Array.from(m);
+    return `(${chars.length > CLOUD_REASON_MAX ? chars.slice(0, CLOUD_REASON_MAX - 1).join("") + "…" : m})`;
   }
   function handleCloudAsrStatus(e: CloudAsrStatusEvent) {
     // 「已恢复」不许盖掉「补识失败」:补识失败是这场录音真留了窟窿(占位段已落盘),
@@ -153,6 +156,23 @@
       }, 3000);
     }
   }
+
+  // 状态条按场次隔离:cloudStatus 是模块顶层 state,录制页不会因换场重新挂载,
+  // F4 的粘滞设计(backfill_failed 持续显示到下一事件覆盖)只在"当场"内成立——
+  // isLive false→true(开始下一场录制,哪怕是本地模式)必须先清掉上一场遗留的
+  // 横幅,否则用户会以为这场也补识失败了,而这场压根还没产生过一个云端事件。
+  let wasLive = false;
+  $effect(() => {
+    const live = recording.isLive;
+    if (live && !wasLive) {
+      cloudStatus = null;
+      if (cloudStatusClearTimer) {
+        clearTimeout(cloudStatusClearTimer);
+        cloudStatusClearTimer = null;
+      }
+    }
+    wasLive = live;
+  });
 
   onMount(() => {
     refreshModels();

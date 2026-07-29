@@ -1247,6 +1247,9 @@ fn spawn_session(
                                 ("backfill_failed", source, None)
                             }
                         };
+                        // 厂商/本机错误原文可能很长(带 requestId 的整串 JSON);状态条只
+                        // 展示一行,这里按字符(而非字节)钳制,不能把多字节字符切成半个。
+                        let message = message.map(|m| m.chars().take(200).collect::<String>());
                         let _ = app_st.emit(
                             "cloud-asr-status",
                             ipc::CloudAsrStatusEvent {
