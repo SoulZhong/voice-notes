@@ -1,0 +1,41 @@
+# 更新签名链路自检(手动触发):用 Environment「TAURI」里的私钥真实签名一个
+# 测试文件,再用 tauri.conf.json 的公钥验签。三件事一次验证:
+# ① environment secrets 接线正确(未接上时私钥为空,第一步就报错);
+# ② 私钥内容与密码有效(签名步骤失败即密码/格式错);
+# ③ 私钥与仓库公钥是同一对(验签失败即密钥对不匹配,一键更新会全员报签名错误)。
+# 发版前改动密钥/公钥后都值得跑一次;比打真 tag 快一个数量级。
+name: updater-signing-check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    environment: TAURI
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: 私钥签名 → 公钥验签
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY 为空——检查 Environment「TAURI」的 secrets 与 workflow 的 environment 声明"
+            exit 1
+          fi
+          echo "hello-updater-$(date +%s)" > dummy.bin
+          npx tauri signer sign -k "$KEY" -p "$PW" dummy.bin
+          test -s dummy.bin.sig || { echo "::error::未产出签名文件"; exit 1; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          PUB=$(python3 -c "import json,base64;print(base64.b64decode(json.load(open('src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey']).decode().strip().splitlines()[-1])")
+          minisign -Vm dummy.bin -x dummy.bin.sig -P "$PUB"
+          echo "签名链路自检通过:secrets 接线 / 私钥密码 / 公私钥配对 全部正确"
