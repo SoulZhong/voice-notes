@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RefinedDoc } from "../notes";
 import {
+  isBlockTextEmpty,
   normalizeOrigIndices,
   refinedSavePayload,
   refinedToBlocks,
@@ -102,6 +103,43 @@ describe("refinedSavePayload", () => {
 describe("normalizeOrigIndices", () => {
   it("重复 origIndex 保首个,其余置 null;null 与唯一值原样保留", () => {
     expect(normalizeOrigIndices([0, 0, 1, null, 1])).toEqual([0, null, 1, null, null]);
+  });
+});
+
+describe("isBlockTextEmpty", () => {
+  it("空白 textContent(含纯空格/换行)判空", () => {
+    expect(isBlockTextEmpty("")).toBe(true);
+    expect(isBlockTextEmpty("   ")).toBe(true);
+    expect(isBlockTextEmpty("\n\t ")).toBe(true);
+  });
+
+  it("非空文本判非空", () => {
+    expect(isBlockTextEmpty("张三")).toBe(false);
+    expect(isBlockTextEmpty("  张三  ")).toBe(false);
+  });
+
+  // Round 2 Critical 1 回归:MarkdownEditor.svelte 的 collectBlocks(保存载荷)
+  // 与 markSaved(origIndex 重排)必须共用同一个"块是否为空"判定,否则会对
+  // 同一份文档数出不同的块集合,origIndex 错位(orig_index 越界/元数据错配)。
+  // 这里用 isBlockTextEmpty 模拟两处共用的 blockMarkdown 逻辑,证明:即使
+  // "序列化器输出"是 truthy 的 "<br />" 字面量(commonmark 对空 paragraph 的
+  // 真实行为,见 node_modules/@milkdown/preset-commonmark/src/node/paragraph.ts
+  // `state.addNode('html', undefined, '<br />')`),只要 PM 节点的 textContent
+  // 判空,判定就必须记为 "",refinedSavePayload 才会正确丢弃这个块——不能像
+  // Round 1 之前的 markSaved 那样直接信任 serializer 输出的真值性。
+  it("不变式:textContent 判空时不信任 serializer 的 truthy 输出(如 '<br />'),refinedSavePayload 必须丢弃该块", () => {
+    const fakeSerializerOutput = "<br />"; // commonmark 空段的真实序列化输出,truthy 但语义为空
+    const rawTextContent = "";
+    // 模拟 blockMarkdown(ctx, node, fallbackToText):先判 textContent 是否为空,
+    // 为空则直接记 "",完全不信任/不采用 serializer 的输出。
+    const blockMarkdown = isBlockTextEmpty(rawTextContent) ? "" : fakeSerializerOutput;
+    expect(blockMarkdown).toBe("");
+
+    const d = doc({
+      paragraphs: [{ speaker: "R1", start_ms: 0, end_ms: 1000, source_seqs: [1], text: "占位" }],
+    });
+    const payload = refinedSavePayload(d, [{ origIndex: 0, markdown: blockMarkdown }], new Map());
+    expect(payload.paragraphs).toEqual([]);
   });
 });
 

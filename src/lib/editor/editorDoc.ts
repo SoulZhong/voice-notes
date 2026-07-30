@@ -39,6 +39,15 @@ export function refinedToBlocks(doc: RefinedDoc): BlockSpec[] {
 
 export type EditedBlock = { origIndex: number | null; markdown: string };
 
+/** 单一判定源:一个块算不算"空"(不该占 origIndex 名额/不该进保存载荷)。只信
+    PM 节点的 textContent,不信任 serializer 的输出——commonmark 对空 paragraph
+    会序列化出 "<br />" 字面量,是 truthy 但语义上是空块。MarkdownEditor.svelte
+    的 collectBlocks(保存载荷)与 markSaved(origIndex 重排)必须共用这一个判定,
+    否则两处对同一份文档会数出不同的"块集合",origIndex 就会错位。 */
+export function isBlockTextEmpty(textContent: string): boolean {
+  return textContent.trim().length === 0;
+}
+
 /** 整篇保存载荷。dirty 判定基线:载入时同一块的序列化结果(baseline),没有基线
     (理论上不发生)退回存储原文;空白块直接丢弃(后端也会拒空,双保险)。 */
 export function refinedSavePayload(

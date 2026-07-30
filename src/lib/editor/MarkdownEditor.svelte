@@ -29,6 +29,7 @@
   import type { Node as PMNode, Fragment } from "@milkdown/kit/prose/model";
   import { formatTs, type RefinedDoc, type ParagraphPayload } from "../notes";
   import {
+    isBlockTextEmpty,
     refinedSavePayload,
     refinedToBlocks,
     type EditedBlock,
@@ -58,6 +59,14 @@
     speakerBadge: (attrs: BadgeAttrs) => { label: string; bg: string; ink: string };
   } = $props();
 
+  // 精修稿保存生命周期契约(宿主/Task 7 必须遵守):onSaveRefined(payload) 发出
+  // 后 saveInFlight=true;宿主保存成功 → 调 markSaved(newRevision) 确认落定
+  // (复位 saveInFlight,重建 baseline/origIndex);宿主保存失败(拒绝并不罕见:
+  // Aing 中/录制中/revision 冲突等)→ 必须调 markSaveFailed() 复位 saveInFlight
+  // 并重新排队,否则 saveInFlight 卡 true,自动保存永久停摆。冲突类失败宿主
+  // 通常还会紧接着 setRefined() 整份重载(它自己也会复位 saveInFlight);非冲突
+  // 失败(如 Aing/录制中被拒)只需调 markSaveFailed() 让编辑继续按 idle 定时器
+  // 重试,不必重载文档。
   let rootEl: HTMLDivElement;
   let editor: Editor | null = null;
   let ctxRef: Ctx | null = null;
@@ -98,6 +107,15 @@
       console.warn("serializeBlock 失败", err);
       return null;
     }
+  }
+
+  /** 单一判定源:collectBlocks(保存载荷)与 markSaved(origIndex 重排)都必须
+      走这个函数,不能各自直接调 serializeBlock——否则两处对"块是不是空的"会
+      产生分歧(commonmark 空 paragraph 序列化出 truthy 的 "<br />"),同一份
+      文档数出两种不同的块集合,origIndex 就会错位(Round 2 Critical 1)。 */
+  function blockMarkdown(ctx: Ctx, node: PMNode, fallbackToText: boolean): string | null {
+    if (isBlockTextEmpty(node.textContent)) return "";
+    return serializeBlock(ctx, node, fallbackToText);
   }
 
   /** 行内 markdown → Fragment。解析出多块(理论上段内不该有)时退回字面文本。 */
@@ -163,10 +181,11 @@
     lastSaved = JSON.stringify(refinedSavePayload(doc, collectBlocks() ?? [], baseline).paragraphs);
   }
 
-  /** 顶层块 → EditedBlock[],用于保存载荷。空块(textContent 全空白)markdown
-      记为 "",不信任序列化器(commonmark 空段会吐 "<br />" 字面量)——载荷构建器
-      按 trim 后为空丢弃这类块。任一非空块序列化失败(fallbackToText=false)返回
-      null,视为整批失败,调用方应中止本次保存,而不是带着残缺内容继续写盘。 */
+  /** 顶层块 → EditedBlock[],用于保存载荷。空块(blockMarkdown 判定)markdown
+      记为 "",载荷构建器按 trim 后为空丢弃这类块。任一非空块序列化失败
+      (fallbackToText=false)返回 null,视为整批失败,调用方应中止本次保存,
+      而不是带着残缺内容继续写盘。判空标准与 markSaved 共用 blockMarkdown,
+      两处必须数出同一个块集合,否则 origIndex 会错位。 */
   function collectBlocks(): EditedBlock[] | null {
     if (!ctxRef) return [];
     const ctx = ctxRef;
@@ -175,8 +194,7 @@
     let failed = false;
     view.state.doc.forEach((node) => {
       if (failed) return;
-      const hasText = node.textContent.trim().length > 0;
-      const md = hasText ? serializeBlock(ctx, node, false) : "";
+      const md = blockMarkdown(ctx, node, false);
       if (md === null) {
         failed = true;
         return;
@@ -211,7 +229,21 @@
     onSaveRefined(payload);
   }
 
-  /** 保存成功回执:当前内容成为新基线(origIndex 重排为保存后的段序)。 */
+  /** 保存被拒(参见组件顶部的保存生命周期契约)。宿主必须在 onSaveRefined 的
+      失败分支调用本方法复位 saveInFlight,否则一次拒绝就会让自动保存永久
+      停摆——下次编辑的 flushRefined 会一直因 saveInFlight 为 true 而重新排队,
+      永远发不出去。 */
+  export function markSaveFailed() {
+    saveInFlight = false;
+    scheduleIdleSave();
+  }
+
+  /** 保存成功回执:当前内容成为新基线(origIndex 重排为保存后的段序)。
+      baseline 重建 fail-closed:blockMarkdown 传 fallbackToText=false,任一块
+      序列化失败就整体放弃本次重建——旧 baseline/origIndex/revision 原样保留,
+      不用半可信数据(或 fallback 出的剥格式纯文本)当基线,否则下次保存会把
+      它误判成"没变"/"变了"静默写盘,而且共享 SerializerState 污染还可能级联
+      到后面的块。放弃时 console.warn,宿主应重新 setRefined() 整份重载。 */
   export function markSaved(newRevision: number) {
     saveInFlight = false;
     if (!ctxRef || !loadedDoc) return;
@@ -219,9 +251,15 @@
     const view = ctx.get(editorViewCtx);
     let tr = view.state.tr;
     let nextIndex = 0;
-    baseline = new Map();
+    const nextBaseline = new Map<number, string>();
+    let failed = false;
     view.state.doc.forEach((node, pos) => {
-      const md = serializeBlock(ctx, node, true);
+      if (failed) return;
+      const md = blockMarkdown(ctx, node, false);
+      if (md === null) {
+        failed = true;
+        return;
+      }
       if (!md) {
         // 空块没进保存载荷(refinedSavePayload 会丢弃),服务端已不存在该段;
         // 清掉它的 origIndex/说话人属性,否则它会顶着过期 origIndex 一直留在
@@ -242,10 +280,15 @@
         if (node.attrs.origIndex !== nextIndex) {
           tr = tr.setNodeMarkup(pos, undefined, { ...node.attrs, origIndex: nextIndex });
         }
-        baseline.set(nextIndex, md);
+        nextBaseline.set(nextIndex, md);
       }
       nextIndex += 1;
     });
+    if (failed) {
+      console.warn("markSaved 序列化失败,放弃本次基线重建;宿主应重新 setRefined() 重载精修稿");
+      return;
+    }
+    baseline = nextBaseline;
     tr = tr.setMeta("addToHistory", false).setMeta("external-load", true);
     if (tr.docChanged || tr.steps.length > 0) {
       suppressNextUpdate = true;
