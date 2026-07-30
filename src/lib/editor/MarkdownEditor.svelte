@@ -61,25 +61,42 @@
   let rootEl: HTMLDivElement;
   let editor: Editor | null = null;
   let ctxRef: Ctx | null = null;
+  let destroyed = false;
   // 精修稿保存状态:载入 doc + 各 origIndex 的序列化基线 + 上次已保存载荷指纹
   let loadedDoc: RefinedDoc | null = null;
   let baseline = new Map<number, string>();
   let lastSaved = "";
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   const IDLE_SAVE_MS = 2000;
+  // ctxRef 尚未就绪(onMount 的 Editor.make() 还没 resolve)时到达的 setRefined
+  // 文档;ctx 就绪后在 onMount 里重放,避免静默丢文档。
+  let pendingDoc: RefinedDoc | null = null;
+  // 保存请求已发出、等待宿主页面回调 markSaved 确认落定;避免同一份未确认的
+  // 保存被并发/重复的 flushRefined 再次发出。
+  let saveInFlight = false;
+  // setRefined/markSaved 程序化 dispatch(meta "external-load")后,PM 的
+  // view.update 回调拿不到触发它的 tr,只能用这个标志显式跳过下一次 update ->
+  // 避免程序化载入被误判成用户编辑而 schedule 幻影保存。
+  let suppressNextUpdate = false;
 
   /** 顶层块 → markdown。自定义块(refined_paragraph/transcript_segment)按段落
       输出行内内容;标准块直接序列化。往返兜底:结果必须 parse 回同构文本,
-      失败(理论不发生)退回 textContent,绝不静默改写。 */
-  function serializeBlock(ctx: Ctx, node: PMNode): string {
+      失败(理论不发生)退回 textContent,绝不静默改写——除非 fallbackToText 为
+      false(精修稿保存路径):此时失败返回 null,交给调用方中止整次保存,而不是
+      悄悄用可能污染共享 SerializerState 之后的残缺文本继续写盘。 */
+  function serializeBlock(ctx: Ctx, node: PMNode, fallbackToText: boolean): string | null {
     const schema = ctx.get(schemaCtx);
     const serializer = ctx.get(serializerCtx);
     try {
       const doc = schema.topNodeType.createChecked(null, [node]);
       return serializer(doc).trim();
     } catch (err) {
-      console.warn("serializeBlock 失败,退回纯文本", err);
-      return node.textContent.trim();
+      if (fallbackToText) {
+        console.warn("serializeBlock 失败,退回纯文本", err);
+        return node.textContent.trim();
+      }
+      console.warn("serializeBlock 失败", err);
+      return null;
     }
   }
 
@@ -99,10 +116,15 @@
   }
 
   export function setRefined(doc: RefinedDoc) {
-    if (!ctxRef) return;
+    if (!ctxRef) {
+      // Editor 还没 create() 完(onMount 是 async 的),先攒着,onMount 里重放。
+      pendingDoc = doc;
+      return;
+    }
     const ctx = ctxRef;
     loadedDoc = doc;
     baseline = new Map();
+    saveInFlight = false;
     const view = ctx.get(editorViewCtx);
     const schema = ctx.get(schemaCtx);
     const paras = refinedToBlocks(doc).map((b) => {
@@ -125,6 +147,7 @@
       null,
       paras.length ? paras : [schema.nodes.paragraph.createAndFill()!],
     );
+    suppressNextUpdate = true;
     view.dispatch(
       view.state.tr
         .replaceWith(0, view.state.doc.content.size, docNode.content)
@@ -132,37 +155,65 @@
         .setMeta("external-load", true),
     );
     paras.forEach((p) => {
-      if (p.attrs.origIndex !== null) baseline.set(p.attrs.origIndex as number, serializeBlock(ctx, p));
+      if (p.attrs.origIndex !== null) {
+        const md = serializeBlock(ctx, p, true);
+        if (md !== null) baseline.set(p.attrs.origIndex as number, md);
+      }
     });
-    lastSaved = JSON.stringify(refinedSavePayload(doc, collectBlocks(), baseline).paragraphs);
+    lastSaved = JSON.stringify(refinedSavePayload(doc, collectBlocks() ?? [], baseline).paragraphs);
   }
 
-  function collectBlocks(): EditedBlock[] {
+  /** 顶层块 → EditedBlock[],用于保存载荷。空块(textContent 全空白)markdown
+      记为 "",不信任序列化器(commonmark 空段会吐 "<br />" 字面量)——载荷构建器
+      按 trim 后为空丢弃这类块。任一非空块序列化失败(fallbackToText=false)返回
+      null,视为整批失败,调用方应中止本次保存,而不是带着残缺内容继续写盘。 */
+  function collectBlocks(): EditedBlock[] | null {
     if (!ctxRef) return [];
     const ctx = ctxRef;
     const view = ctx.get(editorViewCtx);
     const blocks: EditedBlock[] = [];
+    let failed = false;
     view.state.doc.forEach((node) => {
+      if (failed) return;
+      const hasText = node.textContent.trim().length > 0;
+      const md = hasText ? serializeBlock(ctx, node, false) : "";
+      if (md === null) {
+        failed = true;
+        return;
+      }
       blocks.push({
         origIndex: node.type.name === "refined_paragraph" ? (node.attrs.origIndex as number | null) : null,
-        markdown: serializeBlock(ctx, node),
+        markdown: md,
       });
     });
-    return blocks;
+    return failed ? null : blocks;
   }
 
   export function flushRefined() {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
     if (!loadedDoc || !onSaveRefined) return;
-    const payload = refinedSavePayload(loadedDoc, collectBlocks(), baseline);
+    if (saveInFlight) {
+      // 上一次保存还没等到 markSaved 回执,别再并发发一次;等它落定后再算。
+      scheduleIdleSave();
+      return;
+    }
+    const blocks = collectBlocks();
+    if (blocks === null) {
+      console.warn("精修稿序列化失败,本次不保存");
+      return;
+    }
+    const payload = refinedSavePayload(loadedDoc, blocks, baseline);
+    if (payload.paragraphs.length === 0) return; // 全选删除不该经定时器抹掉整份精修稿
     const fingerprint = JSON.stringify(payload.paragraphs);
     if (fingerprint === lastSaved) return;
+    saveInFlight = true;
     onSaveRefined(payload);
   }
 
   /** 保存成功回执:当前内容成为新基线(origIndex 重排为保存后的段序)。 */
   export function markSaved(newRevision: number) {
+    saveInFlight = false;
     if (!ctxRef || !loadedDoc) return;
     const ctx = ctxRef;
     const view = ctx.get(editorViewCtx);
@@ -170,8 +221,23 @@
     let nextIndex = 0;
     baseline = new Map();
     view.state.doc.forEach((node, pos) => {
-      const md = serializeBlock(ctx, node);
-      if (!md) return;
+      const md = serializeBlock(ctx, node, true);
+      if (!md) {
+        // 空块没进保存载荷(refinedSavePayload 会丢弃),服务端已不存在该段;
+        // 清掉它的 origIndex/说话人属性,否则它会顶着过期 origIndex 一直留在
+        // 文档里,后续 normalize/保存都会拿它当已知段处理。
+        if (node.type.name === "refined_paragraph" && node.attrs.origIndex !== null) {
+          tr = tr.setNodeMarkup(pos, undefined, {
+            ...node.attrs,
+            origIndex: null,
+            speaker: "",
+            name: null,
+            personId: null,
+            startMs: 0,
+          });
+        }
+        return;
+      }
       if (node.type.name === "refined_paragraph") {
         if (node.attrs.origIndex !== nextIndex) {
           tr = tr.setNodeMarkup(pos, undefined, { ...node.attrs, origIndex: nextIndex });
@@ -181,9 +247,12 @@
       nextIndex += 1;
     });
     tr = tr.setMeta("addToHistory", false).setMeta("external-load", true);
-    if (tr.docChanged || tr.steps.length > 0) view.dispatch(tr);
+    if (tr.docChanged || tr.steps.length > 0) {
+      suppressNextUpdate = true;
+      view.dispatch(tr);
+    }
     loadedDoc = { ...loadedDoc, revision: newRevision };
-    lastSaved = JSON.stringify(refinedSavePayload(loadedDoc, collectBlocks(), baseline).paragraphs);
+    lastSaved = JSON.stringify(refinedSavePayload(loadedDoc, collectBlocks() ?? [], baseline).paragraphs);
   }
 
   export function hasFocus(): boolean {
@@ -218,6 +287,13 @@
               if (span) rootEl.dispatchEvent(new CustomEvent("entityhover", { detail: { entityId: span.dataset.entityId, rect: span.getBoundingClientRect() } }));
               return false;
             },
+            // entityhover 的镜像:鼠标离开实体高亮 span 时通知页面隐藏浮层。
+            mouseout: (_view, event) => {
+              const t = event.target as HTMLElement;
+              const span = t.closest?.("span[data-entity-id]") as HTMLElement | null;
+              if (span) rootEl.dispatchEvent(new CustomEvent("entityleave", { detail: { entityId: span.dataset.entityId } }));
+              return false;
+            },
             focusout: () => {
               if (mode === "refined") flushRefined();
               return false;
@@ -226,6 +302,13 @@
         },
         view: () => ({
           update: (view, prev) => {
+            if (suppressNextUpdate) {
+              // setRefined/markSaved 的程序化 dispatch(external-load meta);
+              // update(view, prev) 拿不到触发它的 tr,靠这个标志显式跳过,
+              // 不把程序化载入误判成用户编辑去 schedule 幻影保存。
+              suppressNextUpdate = false;
+              return;
+            }
             if (mode === "refined" && !view.state.doc.eq(prev.doc)) scheduleIdleSave();
           },
         }),
@@ -233,7 +316,7 @@
   );
 
   onMount(async () => {
-    editor = await Editor.make()
+    const created = await Editor.make()
       .config((ctx) => {
         ctx.set(rootCtx, rootEl);
         ctx.set(defaultValueCtx, "");
@@ -245,18 +328,37 @@
       .use(refinedNormalizePlugin)
       .use(uiPlugins)
       .create();
+    if (destroyed) {
+      // onDestroy 已经跑过(组件在 Editor.make() resolve 前就被卸载):别再
+      // 挂 ctxRef/事件,立刻销毁刚创建出来的 editor,避免它悬空监听/泄漏。
+      created.destroy();
+      return;
+    }
+    editor = created;
     editor.action((ctx) => {
       ctxRef = ctx;
     });
-    rootEl.addEventListener("entityhover", ((e: CustomEvent) => {
-      // 页面若关心实体悬浮,经 onEntityOpen 之外的浮层处理;此处只转发打开回调的数据源
-      void e;
-    }) as EventListener);
+    if (pendingDoc) {
+      const doc = pendingDoc;
+      pendingDoc = null;
+      setRefined(doc);
+    }
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (idleTimer) clearTimeout(idleTimer);
     editor?.destroy();
+  });
+
+  // editable 变化即时生效:PM 的 editable prop 只在事务分发时被重新读取,
+  // 派发一个空事务强制它重读(依赖 editable 建立 $effect 追踪)。
+  $effect(() => {
+    void editable;
+    if (ctxRef) {
+      const view = ctxRef.get(editorViewCtx);
+      view.dispatch(view.state.tr);
+    }
   });
 </script>
 
@@ -266,6 +368,9 @@
   .md-editor :global(.ProseMirror) {
     outline: none;
     white-space: pre-wrap;
+  }
+  .md-editor :global(.ProseMirror > p) {
+    margin: 0 0 6px;
   }
   .md-editor :global(.md-para) {
     margin: 0 0 6px;

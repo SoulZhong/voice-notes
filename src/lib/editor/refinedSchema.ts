@@ -4,9 +4,23 @@
 // 保证 serializeBlock 与保存载荷可用。
 import { $markSchema, $nodeSchema, $prose } from "@milkdown/kit/utils";
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
-import type { Node as PMNode } from "@milkdown/kit/prose/model";
+import type { Node as PMNode, Fragment } from "@milkdown/kit/prose/model";
 import type { EditorView, ViewMutationRecord } from "@milkdown/kit/prose/view";
+import type { MarkSerializerSpec } from "@milkdown/kit/transformer";
 import { normalizeOrigIndices } from "./editorDoc";
+
+/** 剥掉 Fragment 尾部的 hardbreak 节点(如果有)。commonmark 段落序列化靠
+    preset-commonmark 的 __internal__/serializeText 做同样的事,但该辅助未从包
+    入口导出(见 node_modules/@milkdown/preset-commonmark/src/index.ts,只
+    re-export ./node ./mark ./plugin ./composed ./commands,不含 __internal__),
+    故本地按同样语义手写一份,避免尾随 hardbreak 被序列化成多余的换行/`<br />`。 */
+function dropTrailingHardbreak(content: Fragment): Fragment {
+  const last = content.lastChild;
+  if (last && last.type.name === "hardbreak") {
+    return content.cut(0, content.size - last.nodeSize);
+  }
+  return content;
+}
 
 export const refinedParagraphSchema = $nodeSchema("refined_paragraph", () => ({
   content: "inline*",
@@ -26,11 +40,28 @@ export const refinedParagraphSchema = $nodeSchema("refined_paragraph", () => ({
     match: (node) => node.type.name === "refined_paragraph",
     runner: (state, node) => {
       state.openNode("paragraph");
-      state.next(node.content);
+      state.next(dropTrailingHardbreak(node.content));
       state.closeNode();
     },
   },
 }));
+
+/** entity_mention 的 toMarkdown 规则,单独导出以便
+    refinedSchema.serialize.test.ts 用真实序列化管线(而非重新实现一份影子逻辑)
+    验证不重复文本。 */
+export const entityMentionToMarkdown: MarkSerializerSpec = {
+  // 序列化时实体标注不落盘(mentions 生命周期由后端管),文本原样透传。
+  match: (mark) => mark.type.name === "entity_mention",
+  runner: (state, _mark, node) => {
+    state.addNode("text", undefined, node.text ?? "");
+    // 返回 true 是 prevent-default:milkdown SerializerState#runNode 里,
+    // mark runner 返回真值会跳过该文本节点自身的默认 text runner
+    // (node_modules/@milkdown/transformer/src/serializer/state.ts #runNode:
+    // `unPreventNext = marks.every(mark => !runProseMark(...))`)。不返回 true
+    // 时默认 runner 还会再输出一次同样的文本,导致带 mark 的文本被序列化两次。
+    return true;
+  },
+};
 
 export const entityMentionSchema = $markSchema("entity_mention", () => ({
   attrs: { entityId: { default: "" } },
@@ -46,13 +77,7 @@ export const entityMentionSchema = $markSchema("entity_mention", () => ({
     { "data-entity-id": mark.attrs.entityId as string, class: "entity-mention" },
   ],
   parseMarkdown: { match: () => false, runner: () => {} },
-  toMarkdown: {
-    // 序列化时实体标注不落盘(mentions 生命周期由后端管),文本原样透传。
-    match: (mark) => mark.type.name === "entity_mention",
-    runner: (state, _mark, node) => {
-      state.addNode("text", undefined, node.text ?? "");
-    },
-  },
+  toMarkdown: entityMentionToMarkdown,
 }));
 
 /** Enter 分段/粘贴复制块属性 → origIndex 重复。规整:保首个,其余降级为用户新块
