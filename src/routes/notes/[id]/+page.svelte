@@ -138,13 +138,20 @@
   // 当前编辑器里加载的是哪个笔记的精修稿(而非 route 的 id):id 切换时 flush 必须
   // 落到*旧*笔记,不能用已经翻新的 id——否则会把上一篇的编辑存进新笔记。
   let loadedRefinedId: string | null = null;
-  // 身份闸门:标记"编辑器已同步到的那份 refined 对象"。保存成功后 refined 换新对象
-  // 身份(revision 更新)必然触发下面的同步 effect;若不闸,失焦保存场景 hasFocus()
-  // 为 false,effect 会用*旧*的段落快照把编辑器里刚打上的内容重建一遍,吹掉用户
-  // 紧接着的输入。凡是"页面主动把 doc 写成与编辑器一致"的地方(保存成功回写、冲突
-  // 重载显式 setRefined),都要顺手把该 doc 记进 syncedRefined,让 effect 识别出
-  // "已经同步过,不用再来一次"。
+  // 身份闸门:标记"编辑器已同步到的那份 refined 对象"+"是哪个编辑器实例同步的"。
+  // 保存成功后 refined 换新对象身份(revision 更新)必然触发下面的同步 effect;若
+  // 不闸,失焦保存场景 hasFocus() 为 false,effect 会用*旧*的段落快照把编辑器里
+  // 刚打上的内容重建一遍,吹掉用户紧接着的输入。凡是"页面主动把 doc 写成与编辑器
+  // 一致"的地方(保存成功回写、冲突重载显式 setRefined),都要顺手把该 doc 记进
+  // syncedRefined、当前编辑器实例记进 syncedEditor,让 effect 识别出"已经同步
+  // 过,不用再来一次"。两者必须配对判定(Fix Round 2):只闸 doc 不闸 editor 实例,
+  // 会在「修订稿→原始稿→修订稿」来回切时炸——MarkdownEditor 挂在
+  // {#if effectiveView === "refined"} 里,视图切走会销毁旧实例、切回来挂全新实例;
+  // 若 refined 对象没变(没有新保存/新精修),新实例挂载触发 effect 重跑时
+  // doc === syncedRefined 命中就直接 return,新实例永远收不到 setRefined,渲染空白
+  // 且其中打字因组件内部 loadedDoc 为 null 静默不落盘。
   let syncedRefined: RefinedDoc | null = null;
+  let syncedEditor: unknown = null;
 
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
@@ -163,13 +170,30 @@
       // *旧*笔记上,组件自己的 setRefined(切笔记时会重新整份载入)早就复位过
       // saveInFlight,不需要再补 markSaveFailed——直接丢弃回执即可。
       if (loadedRefinedId !== targetId) return;
+      // markSaved 用后端刚返回的 newRev,在下面的 getRefined 之前调用:避免编辑器
+      // revision 出现空窗期(空窗期内若触发下一次自动保存,会拿着旧 revision 去打
+      // 乐观并发冲突)。
       refinedEditor?.markSaved(newRev);
-      if (refined && targetId === id) {
-        refined = { ...refined, revision: newRev };
-        // 把自己刚写回的对象标记为"已同步":下面的同步 effect 会因为 refined 换了
-        // 对象身份而重跑,若不标记,失焦保存场景(hasFocus()===false)它会用这个
-        // 新对象重建一次编辑器文档——内容虽然一样,但会把用户紧接着敲的字吹掉。
-        syncedRefined = refined;
+      // 不再本地拼 { ...refined, revision: newRev }(Fix Round 2 之前的做法):那样
+      // refined.paragraphs 仍是保存前的旧内容,与编辑器里实际内容(用户刚打的字)
+      // 对不上——"空稿提示与输入并存"之类的问题正是源于此。保存成功后直接回读
+      // 盘上最新精修稿,让 refined 说真话;这份内容和编辑器一致,配合下面 syncedRefined/
+      // syncedEditor 闸门,视图来回切换重建新编辑器实例时会用这份正确内容渲染,
+      // 而不是被闸门跳过导致空白。
+      try {
+        const latest = await getRefined(targetId);
+        // await 后重验守卫:回读期间用户可能已经切走了笔记。
+        if (targetId === id && loadedRefinedId === targetId) {
+          if (latest) {
+            refined = latest;
+            syncedRefined = latest;
+            syncedEditor = refinedEditor;
+          }
+          // latest 为 null(极端情况,如笔记目录被清):保持 refined 原样不动,不因
+          // 一次回读失败就把已展示的内容整篇清空。
+        }
+      } catch {
+        /* 回读失败:refined 保持原状;本次保存本身已经成功(markSaved 已确认落定) */
       }
       if (refinedSaveErr) refinedSaveErr = "";
     } catch (err) {
@@ -191,11 +215,13 @@
           if (targetId === id && loadedRefinedId === targetId) {
             refined = latest;
             if (latest) {
-              // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest 记进
-              // syncedRefined,让下面的同步 effect 认出"已经同步过"直接跳过——
-              // 否则 effect 会因 refined 换了身份再 setRefined 一次,属于重复重建。
+              // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
+              // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
+              // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
+              // 属于重复重建。
               refinedEditor?.setRefined(latest);
               syncedRefined = latest;
+              syncedEditor = refinedEditor;
             }
           }
         } catch {
@@ -206,17 +232,20 @@
   }
 
   // refined 变化(载入/精修完成/冲突重载)→ 重建编辑器文档;输入中不打断。
-  // 身份闸门(syncedRefined,见上方声明的注释):doSaveRefined 成功回写/显式冲突
-  // 重载已经让编辑器和这个具体对象同步过,不必再来一次——否则失焦保存场景会用
-  // 刚落盘的旧引用重建文档,吹掉用户紧接着的输入。
+  // 身份闸门(syncedRefined + syncedEditor,见上方声明的注释):doSaveRefined 成功
+  // 回写/显式冲突重载已经让*这个*编辑器实例和这个具体 doc 对象同步过,不必再来
+  // 一次——否则失焦保存场景会用刚落盘的旧引用重建文档,吹掉用户紧接着的输入。
+  // 两者必须配对判定:只闸 doc 会在视图来回切换、MarkdownEditor 被销毁重挂出新
+  // 实例但 refined 对象没变时,把新实例挂载这次也跳过,渲染空白且输入静默不保存。
   $effect(() => {
     const doc = refined;
     const ed = refinedEditor;
     if (!ed || !doc || effectiveView !== "refined") return;
-    if (doc === syncedRefined) return;
+    if (doc === syncedRefined && ed === syncedEditor) return;
     if (ed.hasFocus()) return; // 常驻编辑态:正在打字时外部刷新不吹掉输入
     ed.setRefined(doc);
     syncedRefined = doc;
+    syncedEditor = ed;
     loadedRefinedId = id;
   });
 
@@ -419,6 +448,7 @@
     confirmSeq = null;
     refined = null;
     syncedRefined = null;
+    syncedEditor = null;
     refining = false;
     refineRunFailed = false;
     refineErr = "";
