@@ -7,6 +7,7 @@
     personNotes,
     renamePerson,
     mergePerson,
+    undoMerge,
     deletePerson,
     deletePersonSample,
     type PersonSummary,
@@ -117,7 +118,7 @@
     editingId = null;
     dupRename = null;
     try {
-      await mergePerson(p.id, d.other.id);
+      lastMergeId = await mergePerson(p.id, d.other.id);
       recording.bumpPeople();
       goto(`/speakers/${d.other.id}`);
     } catch (e) {
@@ -183,7 +184,7 @@
     const loser = person.id;
     closeAllOps();
     try {
-      await mergePerson(loser, winner);
+      lastMergeId = await mergePerson(loser, winner);
       recording.bumpPeople();
       // 本人已并入对方:跳到对方详情,让"这个人现在是谁"立即可见。
       goto(`/speakers/${winner}`);
@@ -218,11 +219,27 @@
       ? { id: s.winner, name: s.winner_name }
       : { id: s.loser, name: s.loser_name };
 
+  /** 手动合并后的撤销条(最近一次;后端日志兜底,失效时撤销报错原样透出)。 */
+  let lastMergeId = $state<string | null>(null);
+
+  async function undoLastMerge() {
+    if (!lastMergeId) return;
+    try {
+      await undoMerge(lastMergeId);
+      lastMergeId = null;
+      recording.bumpPeople();
+      await tidy.refresh();
+      await refresh();
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
   async function applyCtxSuggestion(s: PersonMergeSuggestion) {
     stopCtx();
     stopSample();
     try {
-      await mergePerson(s.loser, s.winner);
+      lastMergeId = await mergePerson(s.loser, s.winner);
       recording.bumpPeople();
       await tidy.refresh();
       if (s.loser === personId) {
@@ -303,6 +320,14 @@
 <main class="container">
   {#if error}
     <div class="banner">{error}</div>
+  {/if}
+
+  {#if lastMergeId}
+    <div class="undo-strip">
+      已合并。
+      <button class="mini" disabled={recording.isLive} onclick={undoLastMerge}>撤销</button>
+      <button class="mini" onclick={() => (lastMergeId = null)}>好</button>
+    </div>
   {/if}
 
   {#if !loaded}
@@ -1059,6 +1084,17 @@
     padding: 0.6rem 0.8rem;
     margin: 0 0 1rem;
     font-size: 0.95rem;
+  }
+  .undo-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    padding: 0.5rem 0.8rem;
+    margin: 0.5rem 0 1rem;
+    font-size: 0.85rem;
+    color: var(--ink-secondary);
   }
   .hint {
     color: var(--ink-faint);
