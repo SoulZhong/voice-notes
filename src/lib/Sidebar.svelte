@@ -15,6 +15,7 @@
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { tidy } from "$lib/tidy.svelte";
+  import { buildTidyQueue } from "$lib/tidyQueue";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
@@ -78,12 +79,11 @@
   );
 
   // 切到声纹库页签时拉取;详情页改名/合并/删除后经 peopleVersion 触发重拉,索引不滞留旧名。
-  // 整理建议同步重算:「概览与整理」徽标要跟库同步,不能挂着旧数。
+  // 整理收件箱由 layout 全局驱动(见 +layout.svelte),这里不再重复 refresh。
   $effect(() => {
     void recording.peopleVersion;
     if (tab === "people") {
       refreshPeople();
-      tidy.refresh();
     }
   });
 
@@ -144,19 +144,8 @@
   const peopleUnnamed = $derived(peopleSorted.filter((p) => !p.name));
   const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
 
-  /** 同名分组数(疑似重复):与概览页同一判定,计入徽标。 */
-  const dupGroupCount = $derived.by(() => {
-    const seen = new Set<string>();
-    const dup = new Set<string>();
-    for (const p of people) {
-      if (!p.name) continue;
-      if (seen.has(p.name)) dup.add(p.name);
-      seen.add(p.name);
-    }
-    return dup.size;
-  });
-  /** 「概览与整理」徽标:待办数=可归属建议 + 疑似重复组。0 不显示。 */
-  const tidyBadge = $derived(tidy.visible.length + dupGroupCount);
+  /** 「概览与整理」徽标:收件箱队列总数(回执+建议+同名组+无样本),像收件箱未读。 */
+  const tidyBadge = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed).length);
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
@@ -437,7 +426,7 @@
             <a class="title" href="/speakers">概览与整理</a>
           </div>
           {#if tidyBadge > 0}
-            <span class="tidy-badge" title="{tidy.visible.length} 条归属建议 · {dupGroupCount} 组同名">{tidyBadge}</span>
+            <span class="tidy-badge" title="{tidyBadge} 项待处理">{tidyBadge}</span>
           {/if}
         </li>
       {/if}
