@@ -52,9 +52,15 @@ describe("buildTidyQueue", () => {
   it("dismissed 集合滤掉同名组与无样本条目", () => {
     const people = [person("P2", "张三"), person("P3", "张三"), person("P4", "", [])];
     const all = buildTidyQueue(people, [], []);
-    expect(all).toHaveLength(3); // dup + P2/P3 无样本?——张三两条都无样本:dup 1 + nosample 3
+    expect(all).toHaveLength(4); // dup(张三) 1 + nosample(P2/P3/P4 均无样本) 3
     const q = buildTidyQueue(people, [], [], new Set(["d:张三", "n:P4"]));
     expect(q.every((i) => tidyItemKey(i) !== "d:张三" && tidyItemKey(i) !== "n:P4")).toBe(true);
+  });
+
+  it("同名组不设样本条件:全员无样本也成组,且与无样本卡共存", () => {
+    const people = [person("P2", "张三"), person("P3", "张三")];
+    const q = buildTidyQueue(people, [], []);
+    expect(q.map((i) => i.kind)).toEqual(["dup", "nosample", "nosample"]);
   });
 
   it("key 稳定且各类型互不冲突", () => {
@@ -93,5 +99,9 @@ describe("keyCommand", () => {
     expect(keyCommand("3", "suggestion")).toBeNull();
     expect(keyCommand("9", "dup")).toEqual({ play: 8 });
     expect(keyCommand("0", "dup")).toBeNull();
+  });
+  it("无样本卡数字键返回 null(没有可试听的)", () => {
+    expect(keyCommand("1", "nosample")).toBeNull();
+    expect(keyCommand("2", "nosample")).toBeNull();
   });
 });

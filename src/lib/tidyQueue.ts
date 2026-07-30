@@ -34,15 +34,13 @@ export function buildTidyQueue(
     if (!p.name) continue;
     byName.set(p.name, [...(byName.get(p.name) ?? []), p]);
   }
-  const inDupGroup = new Set<string>();
   for (const [name, g] of byName) {
-    if (g.length > 1 && g.some((p) => p.sample_paths.length > 0)) {
+    if (g.length > 1) {
       items.push({ kind: "dup", name, people: g });
-      for (const p of g) inDupGroup.add(p.id);
     }
   }
   for (const p of people) {
-    if (p.sample_paths.length === 0 && !inDupGroup.has(p.id)) {
+    if (p.sample_paths.length === 0) {
       items.push({ kind: "nosample", person: p });
     }
   }
@@ -66,6 +64,7 @@ export function keyCommand(key: string, kind: TidyItem["kind"]): TidyCommand | n
   if (key === "Enter") return "primary";
   if (key === "x" || key === "X") return kind === "receipt" ? null : "dismiss";
   if (key === "s" || key === "S") return "skip";
+  if (kind === "nosample") return null; // 无样本卡没有可试听的
   const digitMax = kind === "dup" ? 9 : 2;
   const n = Number(key);
   if (Number.isInteger(n) && n >= 1 && n <= digitMax) return { play: n - 1 };
