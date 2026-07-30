@@ -14,7 +14,6 @@
     exportFileName,
     getRefined,
     refineNote,
-    formatTs,
     formatDate,
     formatDuration,
     speakerLabel,
@@ -29,7 +28,6 @@
     assignRefinedPerson,
     assignNoteSpeakerPerson,
     type Note,
-    type SegmentRecord,
     type TrackInfo,
     type RefinedDoc,
     noteRelated,
@@ -49,10 +47,15 @@
   let editingTitle = $state("");
   let exportMsg = $state("");
 
-  // 段落编辑状态(常驻编辑态:focusedSeq 只用于刷新守卫,防外部刷新吹掉输入中的内容)
-  let focusedSeq = $state<number | null>(null);
-  let confirmSeq = $state<number | null>(null);
-  let speakerMenuSeq = $state<number | null>(null);
+  // ── 原始稿 WYSIWYG(MarkdownEditor mode="segments"):段结构锁定编辑器 + 浮层菜单/
+  //    删除确认。组件契约见 MarkdownEditor.svelte 顶部注释与 Task 8 移交文件——
+  //    onEditSegment 成功后必须调 markSegmentSaved(seq, newText),否则同一焦点
+  //    会话内的连续提交会拿旧 expectedText 撞后端 CAS。 ──
+  let segEditor = $state<ReturnType<typeof MarkdownEditor> | null>(null);
+  // 原始稿浮层:说话人菜单 / 删除确认(锚定 NodeView 内按钮的屏幕矩形,与精修稿的
+  // entityPop/refinedBadgePop 同一套 position:fixed 套路)。
+  let segMenuPop = $state<{ seq: number; rect: DOMRect } | null>(null);
+  let segDeletePop = $state<{ seq: number; rect: DOMRect } | null>(null);
 
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
@@ -443,9 +446,8 @@
     note = null;
     error = "";
     editing = false;
-    focusedSeq = null;
-    speakerMenuSeq = null;
-    confirmSeq = null;
+    segMenuPop = null;
+    segDeletePop = null;
     refined = null;
     syncedRefined = null;
     syncedEditor = null;
@@ -505,11 +507,13 @@
       un?.();
     };
   });
-  // 刷新：任何编辑进行中都跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
+  // 刷新：标题重命名进行中跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
+  // 原始稿/精修稿编辑器的常驻编辑态不在此处拦截——两者的数据同步 effect 各自
+  // 内部靠 hasFocus() 守卫,外部刷新不会吹掉正在输入的段/段落(与精修稿同哲学)。
   $effect(() => {
     void id;
     void recording.notesVersion;
-    if (editing || focusedSeq !== null || speakerMenuSeq !== null) return;
+    if (editing) return;
     exportMsg = "";
     refresh();
   });
@@ -636,37 +640,45 @@
     resumeFollow(); // 点时间戳跳播 = 想跟着听
   }
 
-  function segFocus(s: SegmentRecord) {
-    focusedSeq = s.seq;
-    speakerMenuSeq = null;
-    confirmSeq = null;
+  /** segments 模式徽章:按 seq 回查 note.segments 拿权威 speaker/source(与 note.speakers
+      命名/关联人物一致)——NodeView 透传的 attrs 只是点击当下的渲染快照,不作数
+      (MarkdownEditor 顶部注释同款告诫)。 */
+  function segBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
+    const seg = note?.segments.find((s) => s.seq === attrs.seq);
+    const speaker = seg?.speaker ?? null;
+    const source = seg?.source ?? "mic";
+    return {
+      label: speakerLabel(speaker, source, note?.speakers ?? {}),
+      bg: speakerColor(speaker, source, note?.speakers),
+      ink: speakerInk(speaker, source, note?.speakers),
+    };
   }
 
-  /** 失焦提交:空文本或未变则还原显示(去段须走显式删除按钮)。
-      失败时手动把 DOM 文本还原为提交前基线——canonical 未变时 Svelte 不会重设
-      被用户敲过的文本节点,不还原会出现界面与落盘不一致。 */
-  async function segBlur(e: FocusEvent, s: SegmentRecord) {
-    const el = e.currentTarget as HTMLElement;
-    focusedSeq = null;
-    const text = (el.textContent ?? "").trim();
-    if (!text || text === s.text) {
-      el.textContent = s.text;
-      return;
-    }
+  /** 段级提交(见组件顶部保存生命周期契约):成功后必须先调 markSegmentSaved
+      把 segBase 基线更新为刚落盘的值,再 await refresh()——否则 refresh 的
+      setSegments 被 hasFocus() 守卫挡住时(常驻编辑态继续打字),同一段后续
+      提交仍会带着旧的 expectedText,在后端撞 CAS 冲突。失败路径不调
+      markSegmentSaved:refresh() 成功后 setSegments 会整体重建 segBase。 */
+  async function doEditSegment(seq: number, expectedText: string, newText: string) {
     try {
-      await editSegment(id, s.seq, s.text, text);
+      await editSegment(id, seq, expectedText, newText);
+      segEditor?.markSegmentSaved(seq, newText);
       await refresh();
     } catch (err) {
-      el.textContent = s.text;
       error = `编辑失败: ${err}`;
-      await refresh(); // 乐观冲突：重载最新内容
+      await refresh(); // 乐观冲突:重载最新内容(setSegments 由下方 effect 触发)
     }
   }
 
-  async function doDeleteSeg(s: SegmentRecord) {
-    confirmSeq = null;
+  /** 浮层没有整段对象,按 seq 查;canEdit 复核见调用处(onBadgeClick/onDeleteClick
+      的页面回调)——NodeView 的 canEdit 是构造时快照,不能只信它。 */
+  async function doDeleteSeg(seq: number) {
+    segDeletePop = null;
+    if (!canEdit) return;
+    const seg = note?.segments.find((s) => s.seq === seq);
+    if (!seg) return;
     try {
-      await deleteSegment(id, s.seq, s.text);
+      await deleteSegment(id, seg.seq, seg.text);
       await refresh();
     } catch (e) {
       error = `删除失败: ${e}`;
@@ -674,16 +686,62 @@
     }
   }
 
-  async function doSetSpeaker(s: SegmentRecord, speakerId: string) {
-    speakerMenuSeq = null;
+  async function doSetSpeaker(seq: number, speakerId: string) {
+    segMenuPop = null;
+    if (!canEdit) return;
+    const seg = note?.segments.find((s) => s.seq === seq);
+    if (!seg) return;
     try {
-      await setSegmentSpeaker(id, s.seq, s.text, speakerId);
+      await setSegmentSpeaker(id, seg.seq, seg.text, speakerId);
       await refresh();
     } catch (e) {
       error = `修改说话人失败: ${e}`;
       await refresh();
     }
   }
+
+  // note.segments 变化(载入/提交回执/冲突重载)→ 重建编辑器文档;输入中不打断
+  // (与精修稿的同步 effect 同一套身份守卫哲学,这里只需 hasFocus,不需要
+  // syncedRefined 那层对象身份闸门——setSegments 本身就是幂等重建,没有"刚保存
+  // 成功回写又被自己吹掉"的问题,因为提交回执走 markSegmentSaved 而非整份换新
+  // note 对象触发的重复 setSegments)。
+  $effect(() => {
+    const segs = displaySegments;
+    const ed = segEditor;
+    const speakers = note?.speakers;
+    if (!ed || !note || effectiveView === "refined") return;
+    if (ed.hasFocus()) return;
+    ed.setSegments(segs, speakers ?? {});
+  });
+
+  // 播放高亮/AI 过滤灰显:NodeView DOM 不吃 Svelte class 指令,直接按 data-seq 贴类。
+  $effect(() => {
+    const el = transcriptEl;
+    const active = activeSeqs;
+    const discarded = discardedSeqs;
+    if (!el || effectiveView === "refined") return;
+    for (const node of el.querySelectorAll<HTMLElement>(".md-seg")) {
+      const seq = Number(node.dataset.seq);
+      node.classList.toggle("playing", active.has(seq));
+      node.classList.toggle("discarded", discarded.has(seq));
+      node.title = discarded.has(seq) ? "已被 AI 过滤" : "";
+    }
+  });
+
+  // Escape 还原桥接:segments 编辑器在段内 Escape 时派发 segescape(不冒泡,与
+  // entityhover/entityleave 同款 capture-only 事件,见上方那处桥接 effect 的
+  // 注释),页面收到后 refresh() 触发上面的数据同步 effect 重建文档,把被放弃的
+  // 编辑还原为盘上原文——此时编辑器已在派发前同步 blur,hasFocus() 为 false,
+  // 不会被同步 effect 的焦点守卫拦下(移交义务 2)。
+  $effect(() => {
+    const el = transcriptEl;
+    if (!el) return;
+    const onSegEscape = () => {
+      refresh();
+    };
+    el.addEventListener("segescape", onSegEscape, true);
+    return () => el.removeEventListener("segescape", onSegEscape, true);
+  });
 
   function beginRename() {
     if (!note) return;
@@ -967,82 +1025,59 @@
           <p class="hint">（修订稿为空，可直接输入补充内容）</p>
         {/if}
       {:else}
-        {#each displaySegments as seg (seg.seq)}
-          <div
-            class="seg"
-            class:playing={activeSeqs.has(seg.seq)}
-            class:discarded={discardedSeqs.has(seg.seq)}
-            title={discardedSeqs.has(seg.seq) ? "已被 AI 过滤" : undefined}
-            data-seq={seg.seq}
-          >
-            {#if canEdit && speakerMenuSeq === seg.seq}
-              <span class="badge-menu">
-                {#each speakerIds as sid (sid)}
-                  <button class="menu-item" onclick={() => doSetSpeaker(seg, sid)}>
-                    {speakerLabel(sid, seg.source, note.speakers)}
-                  </button>
-                {/each}
-                <button class="menu-item new" onclick={() => doSetSpeaker(seg, "new")}>＋ 新说话人</button>
-                <button class="menu-item" onclick={() => (speakerMenuSeq = null)}>取消</button>
-              </span>
-            {:else}
-              <button
-                class="badge as-btn"
-                style="background: {speakerColor(seg.speaker, seg.source, note.speakers)}; color: {speakerInk(seg.speaker, seg.source, note.speakers)}"
-                disabled={!canEdit}
-                title={canEdit ? "点击改说话人" : ""}
-                onclick={() => (speakerMenuSeq = seg.seq)}
-              >
-                {speakerLabel(seg.speaker, seg.source, note.speakers)}
-              </button>
-            {/if}
-            {#if tracks.length > 0}
-              <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom(seg)}>
-                {formatTs(seg.start_ms)}
-              </button>
-            {:else}
-              <span class="ts">{formatTs(seg.start_ms)}</span>
-            {/if}
-            {#if canEdit}
-              <!-- 常驻编辑态(冒烟反馈):contenteditable 保持行内排版,点击即打字,无换态换布局。
-                   失焦保存,Enter 提交,Esc 还原;删除仍走右侧按钮。 -->
-              <span
-                class="seg-text editable"
-                contenteditable="plaintext-only"
-                role="textbox"
-                tabindex="0"
-                spellcheck="false"
-                onfocus={() => segFocus(seg)}
-                onblur={(e) => segBlur(e, seg)}
-                onkeydown={(e) => {
-                  const el = e.currentTarget as HTMLElement;
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    el.blur();
-                  }
-                  if (e.key === "Escape") {
-                    el.textContent = seg.text;
-                    el.blur();
-                  }
-                }}>{seg.text}</span>
-              <span class="seg-actions">
-                {#if confirmSeq === seg.seq}
-                  <button class="link danger" onclick={() => doDeleteSeg(seg)}>确认删除</button>
-                  <button class="link" onclick={() => (confirmSeq = null)}>取消</button>
-                {:else}
-                  <button class="link" onclick={() => (confirmSeq = seg.seq)}>删除</button>
-                {/if}
-              </span>
-            {:else}
-              <span class="seg-text">{seg.text}</span>
-            {/if}
-          </div>
-        {/each}
+        <!-- 原始稿 WYSIWYG:MarkdownEditor(可编辑,mode="segments")段结构锁定 + 浮层
+             菜单/删除确认。canEdit 翻转是 NodeView 构造期快照(PM 不会为未变节点
+             重建 NodeView,详见组件顶部/segmentSchema.ts 注释),{#key canEdit}
+             强制整份重挂,拿到与当前权限一致的徽章禁用态/删除按钮(移交义务 4)。
+             空转写时 editable 强制 false:没有 transcript_segment 节点时组件退回
+             一个占位空 paragraph,可打字但永不落盘,不给这个误导性入口(移交义务 7)。 -->
+        {#key canEdit}
+          <MarkdownEditor
+            bind:this={segEditor}
+            mode="segments"
+            editable={canEdit && displaySegments.length > 0}
+            speakerBadge={segBadge}
+            onEditSegment={doEditSegment}
+            onBadgeClick={(attrs, rect) => {
+              if (canEdit) segMenuPop = { seq: attrs.seq!, rect };
+            }}
+            onDeleteClick={(seq, rect) => {
+              if (canEdit) segDeletePop = { seq, rect };
+            }}
+            onPlayFrom={(ms) => playFrom({ start_ms: ms })}
+          />
+        {/key}
         {#if displaySegments.length === 0}
           <p class="hint">（这场会议没有转写内容）</p>
         {/if}
       {/if}
     </div>
+
+    {#if segMenuPop && note}
+      <!-- 原始稿说话人浮层:锚定被点击徽章的屏幕矩形,与 entity-pop/refinedBadgePop
+           同一套 position:fixed 套路;菜单项复用旧版 badge-menu 的按钮结构与样式。 -->
+      <div
+        class="badge-menu floating"
+        style="position: fixed; left: {segMenuPop.rect.left}px; top: {segMenuPop.rect.bottom + 4}px;"
+      >
+        {#each speakerIds as sid (sid)}
+          <button class="menu-item" onclick={() => doSetSpeaker(segMenuPop!.seq, sid)}>
+            {speakerLabel(sid, "mic", note.speakers)}
+          </button>
+        {/each}
+        <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>＋ 新说话人</button>
+        <button class="menu-item" onclick={() => (segMenuPop = null)}>取消</button>
+      </div>
+    {/if}
+    {#if segDeletePop}
+      <div
+        class="badge-menu floating"
+        style="position: fixed; left: {segDeletePop.rect.left}px; top: {segDeletePop.rect.bottom + 4}px;"
+      >
+        <button class="menu-item" onclick={() => doDeleteSeg(segDeletePop!.seq)}>确认删除</button>
+        <button class="menu-item" onclick={() => (segDeletePop = null)}>取消</button>
+      </div>
+    {/if}
 
     {#if entityPop}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1277,10 +1312,12 @@
     padding-top: 40vh;
     padding-bottom: 50vh;
   }
-  .transcript.live .seg {
+  .transcript.live :global(.md-seg) {
     color: var(--ink-secondary);
   }
-  .seg {
+  /* 原始稿段落(MarkdownEditor 的 transcript_segment NodeView 产出,DOM 由 PM 命令式
+     创建,没有 Svelte 的 scope hash,必须 :global 才能命中,同 .md-para 同款注释)。 */
+  .transcript :global(.md-seg) {
     margin: 0 0 6px;
     line-height: 1.7;
     border-radius: var(--radius-sm);
@@ -1290,15 +1327,15 @@
       color 0.2s ease;
   }
   /* 播放跟随:当前段 accent-tint 底,与 editable hover 同色系,安静不抢内容 */
-  .seg.playing {
+  .transcript :global(.md-seg.playing) {
     background: var(--accent-tint);
   }
   /* 被 Aing 过滤掉的段(原始稿视角):灰显但保留可读,不做删除线/隐藏 */
-  .seg.discarded {
+  .transcript :global(.md-seg.discarded) {
     opacity: 0.38;
   }
   /* 修订稿段落(MarkdownEditor 的 refined_paragraph NodeView 产出,DOM 由 PM 命令式
-     创建,没有 Svelte 的 scope hash,必须 :global 才能命中):与 .seg 同排版语言,
+     创建,没有 Svelte 的 scope hash,必须 :global 才能命中):与 .md-seg 同排版语言,
      可编辑(WYSIWYG)。 */
   .transcript :global(.md-para) {
     margin: 0 0 6px;
@@ -1314,8 +1351,8 @@
     border-radius: var(--radius-sm);
   }
   /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字。
-     :global 原因同上——原始稿(.seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
-     class,原始稿元素是 Svelte 模板写的、天然带 hash,这里不额外区分。 */
+     :global 原因同上——原始稿(.md-seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
+     class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash。 */
   .transcript :global(.entity-mention) {
     border-radius: var(--radius-sm);
     cursor: default;
@@ -1336,7 +1373,7 @@
     text-decoration-color: var(--accent);
   }
   /* 当前播放段(仅播放中):放大 + 主墨色 + 轻投影,歌词感;负边距抵掉内缩,行左缘对齐不跳 */
-  .transcript.live .seg.playing {
+  .transcript.live :global(.md-seg.playing) {
     font-size: 1.5em;
     line-height: 1.55;
     color: var(--ink);
@@ -1371,8 +1408,8 @@
   .jump:hover {
     background: var(--primary-pressed);
   }
-  /* :global——原始稿(.seg)与修订稿 NodeView(.md-para)共用同一套 .badge/.ts 徽章
-     class,后者是 PM 命令式创建的 DOM,没有 Svelte scope hash,见上方 .entity-mention
+  /* :global——原始稿(.md-seg)与修订稿 NodeView(.md-para)共用同一套 .badge/.ts 徽章
+     class,两者都是 PM 命令式创建的 DOM,没有 Svelte scope hash,见上方 .entity-mention
      同款注释。 */
   .transcript :global(.badge.as-btn) {
     border: none;
@@ -1382,25 +1419,28 @@
   .transcript :global(.badge.as-btn:disabled) {
     cursor: default;
   }
-  /* editable-text（段落）：静态时无边，hover accent-tint 底 + rounded-sm，focus accent outline */
-  .seg-text.editable {
+  /* editable-text（段落正文）：静态时无边，hover accent-tint 底 + rounded-sm；
+     焦点态不在这里补(ProseMirror 编辑区是整份 contentEditable,不是逐段 focus/blur),
+     由上方 .transcript :global(.ProseMirror:focus-visible) 统一给编辑器整体 outline。 */
+  .transcript :global(.md-seg .seg-text) {
     cursor: text;
     border-radius: var(--radius-sm);
   }
-  .seg-text.editable:hover {
+  .transcript :global(.md-seg .seg-text:hover) {
     background: var(--accent-tint);
   }
-  .seg-text.editable:focus {
-    outline: 2px solid var(--accent);
-    background: var(--canvas);
-  }
   /* 行级操作默认隐身，悬停浮现，保持列表安静 */
-  .seg-actions {
+  .transcript :global(.md-seg .seg-actions) {
     visibility: hidden;
     margin-left: 0.4em;
   }
-  .seg:hover .seg-actions {
+  .transcript :global(.md-seg:hover .seg-actions) {
     visibility: visible;
+  }
+  /* 精修稿实体/徽章浮层与原始稿说话人菜单/删除确认共用的 fixed 定位浮层需要盖过
+     transcript 内容(z-index:10 的 topbar 之上),badge-menu 本身默认无 z-index。 */
+  .badge-menu.floating {
+    z-index: 30;
   }
   /* button-link：无底无边，accent 字，悬停加下划线 */
   .link {
