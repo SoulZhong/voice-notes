@@ -3130,18 +3130,39 @@ fn apply_confident_merges(
     let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
     let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
     let mut applied = Vec::new();
+    let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in autos {
         match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity)) {
-            Ok(jid) => match journal.entry(&jid) {
-                Ok(e) => applied.push(receipt_of(&e)),
-                Err(err) => eprintln!("自动归并回执读取失败({jid}): {err}"),
-            },
+            Ok(jid) => {
+                merged.insert(s.loser.clone());
+                match journal.entry(&jid) {
+                    Ok(e) => applied.push(receipt_of(&e)),
+                    Err(err) => {
+                        eprintln!("自动归并回执读取失败({jid}): {err}");
+                        // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
+                        // (time 空串;list_merge_receipts 仍是真值源)。
+                        applied.push(ipc::MergeReceipt {
+                            journal_id: jid.clone(),
+                            time: String::new(),
+                            origin: "auto".into(),
+                            loser: s.loser.clone(),
+                            loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+                            winner: s.winner.clone(),
+                            winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+                            similarity: Some(s.similarity),
+                            invalid_reason: None,
+                        });
+                    }
+                }
+            }
             Err(err) => {
                 eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
                 remaining.push(to_ipc(&s));
             }
         }
     }
+    // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
+    remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
     if !applied.is_empty() {
         queue_person_graph_rebuild(&app, root, "自动归并")?;
     }
