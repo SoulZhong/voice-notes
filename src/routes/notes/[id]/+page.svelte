@@ -110,8 +110,26 @@
   //    onSaveRefined 的每条失败路径必须调 markSaveFailed(),否则自动保存永久停摆。 ──
   let refinedEditor = $state<ReturnType<typeof MarkdownEditor> | null>(null);
   let refinedHostEl = $state<HTMLDivElement | null>(null);
-  // 实体悬浮浮层:{ entityId, rect };离开/点击别处即收起。
+  // 实体悬浮浮层:{ entityId, rect };离开/点击别处即收起——但不是立即清:鼠标从
+  // 实体 span 移向浮层里的按钮途中会先经过两者之间的空隙,entityleave/宿主
+  // mouseleave 若立即清空,浮层在按钮点到之前就没了(entity-pop 是 rect.bottom+4
+  // 的兄弟节点,不在实体 span 内部)。改成排 ~180ms 收起,浮层自身 hover 能取消。
   let entityPop = $state<{ entityId: string; rect: DOMRect } | null>(null);
+  let entityPopHideTimer: ReturnType<typeof setTimeout> | null = null;
+  const ENTITY_POP_HIDE_MS = 180;
+  function scheduleHideEntityPop() {
+    if (entityPopHideTimer) clearTimeout(entityPopHideTimer);
+    entityPopHideTimer = setTimeout(() => {
+      entityPopHideTimer = null;
+      entityPop = null;
+    }, ENTITY_POP_HIDE_MS);
+  }
+  function cancelHideEntityPop() {
+    if (entityPopHideTimer) {
+      clearTimeout(entityPopHideTimer);
+      entityPopHideTimer = null;
+    }
+  }
   // 精修稿说话人徽章点击浮层:沿用说话人条改名/选人入口,弹层只做身份提示。
   let refinedBadgePop = $state<{ attrs: BadgeAttrs; rect: DOMRect } | null>(null);
   // 保存错误粘性去重:markSaveFailed 无退避地按 2s 重试,持续性拒绝(Aing 中/录制中)
@@ -120,6 +138,13 @@
   // 当前编辑器里加载的是哪个笔记的精修稿(而非 route 的 id):id 切换时 flush 必须
   // 落到*旧*笔记,不能用已经翻新的 id——否则会把上一篇的编辑存进新笔记。
   let loadedRefinedId: string | null = null;
+  // 身份闸门:标记"编辑器已同步到的那份 refined 对象"。保存成功后 refined 换新对象
+  // 身份(revision 更新)必然触发下面的同步 effect;若不闸,失焦保存场景 hasFocus()
+  // 为 false,effect 会用*旧*的段落快照把编辑器里刚打上的内容重建一遍,吹掉用户
+  // 紧接着的输入。凡是"页面主动把 doc 写成与编辑器一致"的地方(保存成功回写、冲突
+  // 重载显式 setRefined),都要顺手把该 doc 记进 syncedRefined,让 effect 识别出
+  // "已经同步过,不用再来一次"。
+  let syncedRefined: RefinedDoc | null = null;
 
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
@@ -134,30 +159,44 @@
     const targetId = loadedRefinedId ?? id;
     try {
       const newRev = await saveRefined(targetId, payload.revision, payload.paragraphs);
+      // await 期间编辑器可能已经切到别的笔记(loadedRefinedId 变了):这份回执打在
+      // *旧*笔记上,组件自己的 setRefined(切笔记时会重新整份载入)早就复位过
+      // saveInFlight,不需要再补 markSaveFailed——直接丢弃回执即可。
+      if (loadedRefinedId !== targetId) return;
       refinedEditor?.markSaved(newRev);
-      if (refined && targetId === id) refined = { ...refined, revision: newRev };
-      if (refinedSaveErr) {
-        if (error === refinedSaveErr) error = "";
-        refinedSaveErr = "";
+      if (refined && targetId === id) {
+        refined = { ...refined, revision: newRev };
+        // 把自己刚写回的对象标记为"已同步":下面的同步 effect 会因为 refined 换了
+        // 对象身份而重跑,若不标记,失焦保存场景(hasFocus()===false)它会用这个
+        // 新对象重建一次编辑器文档——内容虽然一样,但会把用户紧接着敲的字吹掉。
+        syncedRefined = refined;
       }
+      if (refinedSaveErr) refinedSaveErr = "";
     } catch (err) {
+      // 同上:编辑器已经切走,回执作废,不需要 markSaveFailed。
+      if (loadedRefinedId !== targetId) return;
       // markSaveFailed 必须无条件调用(即使随后走冲突重载分支):否则一次拒绝就让
       // 组件 saveInFlight 卡 true,自动保存永久停摆。
       refinedEditor?.markSaveFailed();
+      // 精修稿保存错误走独立粘性 banner(refinedSaveErr),不写共享 error——refresh()
+      // 成功会清 error,若复用它,持续性失败(Aing 中反复被拒)会被后台刷新悄悄抹掉。
       const msg = `精修稿保存失败: ${err}`;
-      if (msg !== refinedSaveErr) {
-        refinedSaveErr = msg;
-        error = msg;
-      }
+      if (msg !== refinedSaveErr) refinedSaveErr = msg;
       // revision 冲突(乐观并发):当前编辑已经落空,重载盘上最新内容重建文档。
       // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
       // (markSaveFailed 已排好下一次)。
       if (String(err).includes("已在别处更新")) {
         try {
           const latest = await getRefined(targetId);
-          if (targetId === id) {
+          if (targetId === id && loadedRefinedId === targetId) {
             refined = latest;
-            if (latest) refinedEditor?.setRefined(latest);
+            if (latest) {
+              // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest 记进
+              // syncedRefined,让下面的同步 effect 认出"已经同步过"直接跳过——
+              // 否则 effect 会因 refined 换了身份再 setRefined 一次,属于重复重建。
+              refinedEditor?.setRefined(latest);
+              syncedRefined = latest;
+            }
           }
         } catch {
           /* 重载失败保持错误横幅 */
@@ -167,12 +206,17 @@
   }
 
   // refined 变化(载入/精修完成/冲突重载)→ 重建编辑器文档;输入中不打断。
+  // 身份闸门(syncedRefined,见上方声明的注释):doSaveRefined 成功回写/显式冲突
+  // 重载已经让编辑器和这个具体对象同步过,不必再来一次——否则失焦保存场景会用
+  // 刚落盘的旧引用重建文档,吹掉用户紧接着的输入。
   $effect(() => {
     const doc = refined;
     const ed = refinedEditor;
     if (!ed || !doc || effectiveView !== "refined") return;
+    if (doc === syncedRefined) return;
     if (ed.hasFocus()) return; // 常驻编辑态:正在打字时外部刷新不吹掉输入
     ed.setRefined(doc);
+    syncedRefined = doc;
     loadedRefinedId = id;
   });
 
@@ -186,23 +230,28 @@
     if (!el) return;
     const onHover = (e: Event) => {
       const detail = (e as CustomEvent<{ entityId: string; rect: DOMRect }>).detail;
+      cancelHideEntityPop(); // 新实体到达:取消 pending 收起,直接替换内容
       entityPop = detail;
     };
     const onLeave = (e: Event) => {
       const detail = (e as CustomEvent<{ entityId: string }>).detail;
-      if (entityPop && entityPop.entityId === detail.entityId) entityPop = null;
+      if (entityPop && entityPop.entityId === detail.entityId) scheduleHideEntityPop();
     };
     el.addEventListener("entityhover", onHover, true);
     el.addEventListener("entityleave", onLeave, true);
     return () => {
       el.removeEventListener("entityhover", onHover, true);
       el.removeEventListener("entityleave", onLeave, true);
+      cancelHideEntityPop(); // host 元素换掉/组件销毁:pending 的收起 timer 不留着
     };
   });
 
   // 离开页面/组件销毁前把未保存的精修稿编辑冲出去(与段编辑失焦保存同哲学:
   // 不因为切走了就悄悄丢用户刚打的字)。
-  onDestroy(() => refinedEditor?.flushRefined());
+  onDestroy(() => {
+    refinedEditor?.flushRefined();
+    cancelHideEntityPop();
+  });
 
   // ── 说话人试听:chips 面板「试听他的声音」——不听声音没法确认「说话人 N」是谁。
   //    播该说话人时长最长的一段(代表性最好),重复点击按时长降序换下一段(取前 5,
@@ -369,11 +418,13 @@
     speakerMenuSeq = null;
     confirmSeq = null;
     refined = null;
+    syncedRefined = null;
     refining = false;
     refineRunFailed = false;
     refineErr = "";
     confirmRefine = false;
     viewMode = "refined";
+    cancelHideEntityPop();
     entityPop = null;
     refinedBadgePop = null;
     refinedSaveErr = "";
@@ -854,6 +905,9 @@
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
     {#if effectiveView === "refined" && refined}
+      <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
+           成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
+      {#if refinedSaveErr}<div class="banner banner-danger">{refinedSaveErr}</div>{/if}
       {#if refined.stages.llm === "partial"}
         <div class="banner">部分段落 AI 处理失败，已保留原文，可重新执行。</div>
       {:else if refined.stages.llm === "failed"}
@@ -867,7 +921,7 @@
              host div 只用来接收组件在编辑器根上派发的 entityhover/entityleave(不冒泡,
              靠 capture 阶段的祖先监听,见上方 script 区的桥接 effect)。 -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="refined-editor-host" bind:this={refinedHostEl} onmouseleave={() => (entityPop = null)}>
+        <div class="refined-editor-host" bind:this={refinedHostEl} onmouseleave={scheduleHideEntityPop}>
           <MarkdownEditor
             bind:this={refinedEditor}
             mode="refined"
@@ -962,16 +1016,21 @@
 
     {#if entityPop}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <!-- 浮层是 rect.bottom+4 的兄弟节点,不在触发它的实体 span 内部:鼠标离开 span
+           去点这里的按钮途中会先经过两者间的空隙。onmouseenter 取消宿主/entityleave
+           排的 pending 收起,onmouseleave 再排一次——不这样按钮永远点不到。 -->
       <div
         class="entity-pop"
         style="position: fixed; left: {entityPop.rect.left}px; top: {entityPop.rect.bottom + 4}px;"
-        onmouseleave={() => (entityPop = null)}
+        onmouseenter={cancelHideEntityPop}
+        onmouseleave={scheduleHideEntityPop}
       >
         <span>{entityName(entityPop.entityId)}</span>
         {#if entityLinks[entityPop.entityId]}
           <button
             class="link"
             onclick={() => {
+              cancelHideEntityPop();
               gotoEntity(entityPop!.entityId);
               entityPop = null;
             }}

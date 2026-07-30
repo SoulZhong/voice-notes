@@ -839,6 +839,8 @@ pub fn save_refined_paragraphs(
     payload: &[ParagraphPayload],
 ) -> anyhow::Result<u64> {
     update_refined(note_dir, |doc| {
+        // 前端 +page.svelte 的 doSaveRefined 冲突判别靠字符串匹配"已在别处更新"这个
+        // 子串来触发重载分支,改这句文案要同步改那边的 String(err).includes(...)。
         anyhow::ensure!(
             doc.revision == expected_revision,
             "修订稿已在别处更新(盘上 revision {} ≠ 期望 {})",
