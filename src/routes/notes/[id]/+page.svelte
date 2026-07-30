@@ -1089,10 +1089,20 @@
             speakerBadge={segBadge}
             onEditSegment={doEditSegment}
             onBadgeClick={(attrs, rect) => {
-              if (canEdit) segMenuPop = { seq: attrs.seq!, rect };
+              if (!canEdit) return;
+              // WKWebView 焦点语义保险:点悬浮菜单按钮不像 Chromium 那样把焦点从编辑
+              // 宿主夺走,focusout 不触发,段内未提交的文字进不了 commitSegment,随后
+              // 命令路径的 syncSegments(true) 整份重建会把它静默吹掉。这里显式 blur
+              // 当前 activeElement,同步触发 focusout 先把待提交段存掉,再开浮层
+              // ——Chromium 下 activeElement 已经是这个按钮本身,blur 无害。
+              (document.activeElement as HTMLElement | null)?.blur();
+              segMenuPop = { seq: attrs.seq!, rect };
             }}
             onDeleteClick={(seq, rect) => {
-              if (canEdit) segDeletePop = { seq, rect };
+              if (!canEdit) return;
+              // 同上(onBadgeClick 注释):先失焦提交,再开删除确认浮层。
+              (document.activeElement as HTMLElement | null)?.blur();
+              segDeletePop = { seq, rect };
             }}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
           />
