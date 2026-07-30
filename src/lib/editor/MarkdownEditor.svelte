@@ -366,6 +366,11 @@
       // string,这里的 ?? "" 只是安抚类型系统。
       segBase.set(s.seq, { storedText: s.text, baselineMd: serializeBlock(ctx, nodes[i], true) ?? "" });
     });
+    // 文档替换已同步生效(ProseMirror dispatch 是同步的,.md-seg NodeView DOM 此刻
+    // 已挂好):通知宿主页面可以安全查询 .md-seg 了。不带 bubbles,与 segescape
+    // 同款 capture-only 桥接;onMount 的 pendingSegments 补放路径也走本函数本体,
+    // 天然覆盖。
+    rootEl.dispatchEvent(new CustomEvent("segmentsrendered"));
   }
 
   /** 焦点段变化/失焦时评估提交。往返校验:serialize→parse→serialize 必须稳定。 */

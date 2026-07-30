@@ -56,6 +56,12 @@
   // entityPop/refinedBadgePop 同一套 position:fixed 套路)。
   let segMenuPop = $state<{ seq: number; rect: DOMRect } | null>(null);
   let segDeletePop = $state<{ seq: number; rect: DOMRect } | null>(null);
+  /** setSegments 实际完成文档替换(含 onMount 补放路径)的信号:.md-seg DOM 由
+      MarkdownEditor 异步产出,高亮/灰显 effect 若只依赖 activeSeqs/discardedSeqs,
+      在渲染尚未落地时查询会拿空集(切视图/首次挂载的竞态)。递增即代表"至少已
+      渲染一次新文档",配合下方 segmentsrendered 桥接(与 segescape 同一处
+      addEventListener,capture 阶段)。 */
+  let segRenderTick = $state(0);
 
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
@@ -666,7 +672,11 @@
       await refresh();
     } catch (err) {
       error = `编辑失败: ${err}`;
-      await refresh(); // 乐观冲突:重载最新内容(setSegments 由下方 effect 触发)
+      await refresh();
+      // 冲突回滚:被拒的编辑必须立即还原,不能指望 hasFocus 守卫下的 effect
+      // (WKWebView 下点击/失焦时序不保证 hasFocus() 已变 false)。成功分支不强制
+      // ——markSegmentSaved 已确立基线,重建交给守卫下的 effect,避免打断连续编辑。
+      syncSegments(true);
     }
   }
 
@@ -680,9 +690,13 @@
     try {
       await deleteSegment(id, seg.seq, seg.text);
       await refresh();
+      // 离散命令(点删除确认按钮):WKWebView 下按钮点击不转移焦点,hasFocus()
+      // 恒 true,守卫下的 effect 吞掉重建会留幽灵段在屏——强制入口。
+      syncSegments(true);
     } catch (e) {
       error = `删除失败: ${e}`;
       await refresh();
+      syncSegments(true);
     }
   }
 
@@ -694,37 +708,60 @@
     try {
       await setSegmentSpeaker(id, seg.seq, seg.text, speakerId);
       await refresh();
+      // 离散命令(点说话人菜单项):同 doDeleteSeg,强制入口绕开 WKWebView 下恒真的
+      // hasFocus() 守卫,否则徽章不刷新。
+      syncSegments(true);
     } catch (e) {
       error = `修改说话人失败: ${e}`;
       await refresh();
+      syncSegments(true);
     }
+  }
+
+  /** note.segments → 编辑器文档重建。默认受 hasFocus() 守卫(常驻编辑态不打断
+      正在输入)。force=true:调用方是用户刚下的离散命令(删段/改说话人/Esc 放弃/
+      冲突回滚)——WKWebView(macOS 实际运行时)下点悬浮菜单按钮不转移焦点,
+      hasFocus() 会恒为 true,若不强制,这些命令的重建会被守卫永久吞掉(幽灵段
+      留屏、徽章不刷、被拒文本不还原)。丢光标是这类离散命令的预期代价。 */
+  function syncSegments(force = false) {
+    const ed = segEditor;
+    if (!ed || !note || effectiveView === "refined") return;
+    if (!force && ed.hasFocus()) return;
+    ed.setSegments(displaySegments, note.speakers ?? {});
   }
 
   // note.segments 变化(载入/提交回执/冲突重载)→ 重建编辑器文档;输入中不打断
   // (与精修稿的同步 effect 同一套身份守卫哲学,这里只需 hasFocus,不需要
   // syncedRefined 那层对象身份闸门——setSegments 本身就是幂等重建,没有"刚保存
   // 成功回写又被自己吹掉"的问题,因为提交回执走 markSegmentSaved 而非整份换新
-  // note 对象触发的重复 setSegments)。
+  // note 对象触发的重复 setSegments)。显式引用 displaySegments/note/note.speakers/
+  // effectiveView/segEditor 以保持依赖追踪(syncSegments 内部重读同一批,读法
+  // 重复但保证 $effect 依赖不漏)。
   $effect(() => {
-    const segs = displaySegments;
-    const ed = segEditor;
-    const speakers = note?.speakers;
-    if (!ed || !note || effectiveView === "refined") return;
-    if (ed.hasFocus()) return;
-    ed.setSegments(segs, speakers ?? {});
+    void displaySegments;
+    void note?.speakers;
+    void effectiveView;
+    void segEditor;
+    syncSegments();
   });
 
   // 播放高亮/AI 过滤灰显:NodeView DOM 不吃 Svelte class 指令,直接按 data-seq 贴类。
+  // segRenderTick 依赖:.md-seg 由 setSegments 异步产出(含 onMount 补放路径),
+  // 若只依赖 activeSeqs/discardedSeqs,精修稿切原始稿等场景下渲染未落地时
+  // querySelectorAll 会拿空集,AI 灰显/tooltip 丢失直到下一次播放/切换才自愈
+  // ——segmentsrendered 到达时 tick 一变,本 effect 重跑即可补上。
   $effect(() => {
     const el = transcriptEl;
     const active = activeSeqs;
     const discarded = discardedSeqs;
+    void segRenderTick;
     if (!el || effectiveView === "refined") return;
     for (const node of el.querySelectorAll<HTMLElement>(".md-seg")) {
       const seq = Number(node.dataset.seq);
       node.classList.toggle("playing", active.has(seq));
       node.classList.toggle("discarded", discarded.has(seq));
-      node.title = discarded.has(seq) ? "已被 AI 过滤" : "";
+      if (discarded.has(seq)) node.title = "已被 AI 过滤";
+      else node.removeAttribute("title");
     }
   });
 
@@ -732,15 +769,28 @@
   // entityhover/entityleave 同款 capture-only 事件,见上方那处桥接 effect 的
   // 注释),页面收到后 refresh() 触发上面的数据同步 effect 重建文档,把被放弃的
   // 编辑还原为盘上原文——此时编辑器已在派发前同步 blur,hasFocus() 为 false,
-  // 不会被同步 effect 的焦点守卫拦下(移交义务 2)。
+  // 不会被同步 effect 的焦点守卫拦下(移交义务 2)。syncSegments(true) 是保险:
+  // Esc 放弃本就该立即还原,blur 后 hasFocus() 通常已 false 不需要强制,但
+  // WKWebView 语义下焦点转移时序不完全可信,强制入口兜底。
+  //
+  // segmentsrendered 桥接(同一处 addEventListener,capture 阶段):MarkdownEditor
+  // 的 setSegments 实际完成文档替换后派发,页面收到即 segRenderTick++,驱动上方
+  // 高亮 effect 重跑——见该 effect 注释。
   $effect(() => {
     const el = transcriptEl;
     if (!el) return;
     const onSegEscape = () => {
-      refresh();
+      refresh().then(() => syncSegments(true));
+    };
+    const onSegRendered = () => {
+      segRenderTick++;
     };
     el.addEventListener("segescape", onSegEscape, true);
-    return () => el.removeEventListener("segescape", onSegEscape, true);
+    el.addEventListener("segmentsrendered", onSegRendered, true);
+    return () => {
+      el.removeEventListener("segescape", onSegEscape, true);
+      el.removeEventListener("segmentsrendered", onSegRendered, true);
+    };
   });
 
   function beginRename() {
