@@ -2998,31 +2998,24 @@ fn cut_person_sample_from_notes(notes_root: &std::path::Path, person: &str) -> O
     None
 }
 
-/// 录制中拒绝合并/删除：开录时种子已经按当前库结构注入本场 registry，若此刻改
-/// 动库的引用关系（合并/删除 person），本场 registry 里的种子锚点和库状态就脱节，
-/// "是谁"会变得混乱——比改名危险得多，故禁止，等停止录制后再操作。
-#[tauri::command]
-fn merge_person(
-    app: AppHandle,
-    state: State<AppState>,
-    loser: String,
-    winner: String,
-) -> Result<(), String> {
-    if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能合并说话人".into());
-    }
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    let store = store::VoiceprintStore::new(root.clone());
-    // 合并前记住 loser 是否有样本:有则 merge 内部迁移;没有则合并后从笔记音频
-    // 现场截一份补给 winner(被并入的声音必须能在试听列表里听到)。
-    let loser_had_samples = !store.sample_paths_existing(&loser).is_empty();
-    // 双方样本合计超上限才需要按声纹多样性挑保留集,此时才付模型加载成本;
-    // 模型不可用只影响挑法(退回按序保留),不挡合并。
-    let overflow = store.sample_paths_existing(&loser).len()
-        + store.sample_paths_existing(&winner).len()
+/// merge_person 与 apply_confident_merges 共享的合并主体:落日志→合并→loser 无
+/// 样本时从笔记音频兜底截样(walk 同旧 merge_person),返回 journal id。不含录制
+/// 中检查与图谱重建(调用方各自处理/批量做)。
+fn do_merge_person(
+    app: &AppHandle,
+    loser: &str,
+    winner: &str,
+    origin: &str,
+    similarity: Option<f32>,
+) -> Result<String, String> {
+    let root = data_root(app).map_err(|e| e.to_string())?;
+    let store = store::VoiceprintStore::new(root);
+    let loser_had_samples = !store.sample_paths_existing(loser).is_empty();
+    let overflow = store.sample_paths_existing(loser).len()
+        + store.sample_paths_existing(winner).len()
         > store::MAX_SAMPLES;
     let mut emb = if overflow {
-        match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
+        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
             Ok(e) => Some(e),
             Err(e) => {
                 eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}");
@@ -3032,14 +3025,23 @@ fn merge_person(
     } else {
         None
     };
-    store
-        .merge_with_embedder(&loser, &winner, emb.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder))
+    let now = chrono::Local::now().to_rfc3339();
+    let journal_id = store
+        .merge_journaled(
+            loser,
+            winner,
+            emb.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
+            origin,
+            similarity,
+            &now,
+        )
         .map_err(|e| e.to_string())?;
     if !loser_had_samples {
-        match notes_dir(&app) {
-            Ok(root) => match cut_person_sample_from_notes(&root, &loser) {
+        match notes_dir(app) {
+            Ok(nroot) => match cut_person_sample_from_notes(&nroot, loser) {
                 Some(sample) => {
-                    if let Err(e) = store.append_sample(&winner, &sample) {
+                    // 兜底样本走 for_merge 变体:不触发日志失效(是合并动作的一部分)。
+                    if let Err(e) = store.append_sample_for_merge(winner, &sample) {
                         eprintln!("合并兜底样本写入失败({loser}->{winner},不影响合并): {e}");
                     }
                 }
@@ -3048,7 +3050,25 @@ fn merge_person(
             Err(e) => eprintln!("合并兜底样本跳过(notes_dir 不可用): {e}"),
         }
     }
-    queue_person_graph_rebuild(&app, root, "人物合并")
+    Ok(journal_id)
+}
+
+/// 录制中拒绝合并/删除:开录时种子已按当前库结构注入本场 registry,此刻改动库的
+/// 引用关系会让"是谁"混乱——比改名危险得多,故禁止。返回合并日志 id(前端撤销条用)。
+#[tauri::command]
+fn merge_person(
+    app: AppHandle,
+    state: State<AppState>,
+    loser: String,
+    winner: String,
+) -> Result<String, String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能合并说话人".into());
+    }
+    let journal_id = do_merge_person(&app, &loser, &winner, "manual", None)?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "人物合并")?;
+    Ok(journal_id)
 }
 
 /// 录制中拒绝：理由同 merge_person。
@@ -3062,6 +3082,103 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
         .delete(&id)
         .map_err(|e| e.to_string())?;
     queue_person_graph_rebuild(&app, root, "人物删除")
+}
+
+fn receipt_of(e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
+    ipc::MergeReceipt {
+        journal_id: e.id.clone(),
+        time: e.time.clone(),
+        origin: e.origin.clone(),
+        loser: e.loser.clone(),
+        loser_name: e.loser_name.clone(),
+        winner: e.winner.clone(),
+        winner_name: e.winner_name.clone(),
+        similarity: e.similarity,
+        invalid_reason: e.invalid_reason.clone(),
+    }
+}
+
+/// 整理·自动归并:strong 档且 loser 未命名且不在拒绝名单的建议逐条落日志后合并,
+/// 其余留给人工。录制中不动库(建议仍只读算出返回,审阅流此时只读浏览)。单条
+/// 失败不挡整批:该条降级人工,eprintln 留痕。
+#[tauri::command]
+fn apply_confident_merges(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<ipc::ConfidentMergeOutcome, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let store = store::VoiceprintStore::new(root.clone());
+    let vp = store.load();
+    let sugs = store::suggest_merges(&vp);
+    let to_ipc = |s: &store::MergeSuggestion| ipc::PersonMergeSuggestion {
+        loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+        winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+        loser: s.loser.clone(),
+        winner: s.winner.clone(),
+        similarity: s.similarity,
+        source: s.source.clone(),
+        salience: s.salience,
+    };
+    if state.session.lock().unwrap().is_some() {
+        return Ok(ipc::ConfidentMergeOutcome {
+            applied: vec![],
+            remaining: sugs.iter().map(to_ipc).collect(),
+        });
+    }
+    let journal = store::MergeJournal::new(root.clone());
+    let deny = journal.auto_denylist();
+    let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
+    let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
+    let mut applied = Vec::new();
+    for s in autos {
+        match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity)) {
+            Ok(jid) => match journal.entry(&jid) {
+                Ok(e) => applied.push(receipt_of(&e)),
+                Err(err) => eprintln!("自动归并回执读取失败({jid}): {err}"),
+            },
+            Err(err) => {
+                eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
+                remaining.push(to_ipc(&s));
+            }
+        }
+    }
+    if !applied.is_empty() {
+        queue_person_graph_rebuild(&app, root, "自动归并")?;
+    }
+    Ok(ipc::ConfidentMergeOutcome { applied, remaining })
+}
+
+/// 撤销一次合并(按日志条目)。录制中拒绝:理由同 merge_person。
+#[tauri::command]
+fn undo_merge(app: AppHandle, state: State<AppState>, journal_id: String) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能撤销合并".into());
+    }
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::VoiceprintStore::new(root.clone())
+        .undo_merge(&journal_id)
+        .map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "撤销合并")
+}
+
+/// 回执卡「好」:确认自动归并,条目(连同样本副本)删除。
+#[tauri::command]
+fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::MergeJournal::new(root).acknowledge(&journal_id).map_err(|e| e.to_string())
+}
+
+/// 未确认的合并回执(审阅流回执卡数据;含已失效的——卡上撤销钮变灰注明原因)。
+/// manual 条目生来已确认,天然不在其中。
+#[tauri::command]
+fn list_merge_receipts(app: AppHandle) -> Result<Vec<ipc::MergeReceipt>, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(store::MergeJournal::new(root)
+        .entries()
+        .iter()
+        .filter(|e| !e.acknowledged)
+        .map(receipt_of)
+        .collect())
 }
 
 // —— MCP 注册(设置页/欢迎页消费;registry 真值源是各 Agent 配置文件) ——
@@ -4463,6 +4580,10 @@ pub fn run() {
             delete_person,
             delete_person_sample,
             suggest_person_merges,
+            apply_confident_merges,
+            undo_merge,
+            acknowledge_merge,
+            list_merge_receipts,
             mcp_agents_status,
             mcp_register,
             mcp_unregister,
