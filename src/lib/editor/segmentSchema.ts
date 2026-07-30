@@ -5,6 +5,7 @@ import { $nodeSchema, $prose } from "@milkdown/kit/utils";
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
 import type { Node as PMNode } from "@milkdown/kit/prose/model";
 import type { EditorView, ViewMutationRecord } from "@milkdown/kit/prose/view";
+import type { Source } from "../events";
 import { sameSegmentSkeleton, type SegSkeleton } from "./editorDoc";
 
 export const transcriptSegmentSchema = $nodeSchema("transcript_segment", () => ({
@@ -57,7 +58,7 @@ export type SegmentViewCallbacks = {
   speakerBadge: (attrs: Record<string, unknown>) => { label: string; bg: string; ink: string };
   formatTs: (ms: number) => string;
   canEdit: () => boolean;
-  onBadgeClick: (seq: number, rect: DOMRect) => void;
+  onBadgeClick: (seq: number, speaker: string | null, source: Source, rect: DOMRect) => void;
   onPlayFrom: (startMs: number) => void;
   onDeleteClick: (seq: number, rect: DOMRect) => void;
 };
@@ -81,7 +82,13 @@ export function makeSegmentView(cb: SegmentViewCallbacks) {
     badge.title = cb.canEdit() ? "点击改说话人" : "";
     badge.onclick = (e) => {
       e.preventDefault();
-      if (cb.canEdit()) cb.onBadgeClick(node.attrs.seq as number, badge.getBoundingClientRect());
+      if (cb.canEdit())
+        cb.onBadgeClick(
+          node.attrs.seq as number,
+          node.attrs.speaker as string | null,
+          node.attrs.source as Source,
+          badge.getBoundingClientRect(),
+        );
     };
     const ts = document.createElement("button");
     ts.type = "button";

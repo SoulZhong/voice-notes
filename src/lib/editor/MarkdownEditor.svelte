@@ -1,8 +1,15 @@
 <script lang="ts" module>
+  import type { Source } from "../events";
+
   export type BadgeAttrs = {
     seq?: number;
     origIndex?: number | null;
-    speaker: string;
+    // segments 模式的段可能没有说话人(系统音轨/未分簇)——放宽为可空,与
+    // notes.ts 的 speakerLabel/speakerColor/speakerInk(speaker: string | null)
+    // 用法一致。refined 路径的 speaker 恒为 string,是本类型的子集,不受影响。
+    speaker: string | null;
+    // 仅 segments 模式的徽章回调会带上(该段来源:mic/system),refined 路径不填。
+    source?: Source;
     name: string | null;
     personId: string | null;
     startMs: number;
@@ -456,8 +463,12 @@
               speakerBadge: (attrs) => speakerBadge(attrs as BadgeAttrs),
               formatTs,
               canEdit: () => editable,
-              onBadgeClick: (seq, rect) =>
-                onBadgeClick?.({ seq, speaker: "", name: null, personId: null, startMs: 0 }, rect),
+              // segments 模式徽章回调里只有 seq 必然可信(段身份的唯一锚点);
+              // speaker/source 是点击当下的渲染快照,宿主应按 seq 回查
+              // note.segments 拿权威 speaker/source/startMs,不要直接拿这里
+              // 透传的值当权威数据用。
+              onBadgeClick: (seq, speaker, source, rect) =>
+                onBadgeClick?.({ seq, speaker, source, name: null, personId: null, startMs: 0 }, rect),
               onPlayFrom: (ms) => onPlayFrom?.(ms),
               onDeleteClick: (seq, rect) => onDeleteClick?.(seq, rect),
             }),
