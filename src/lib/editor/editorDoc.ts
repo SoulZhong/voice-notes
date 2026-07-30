@@ -69,6 +69,26 @@ export function refinedSavePayload(
   return { revision: doc.revision ?? 0, paragraphs };
 }
 
+/** 保存成功后的 origIndex 重排映射,推导自**已发送的载荷**而不是当前文档:载荷第
+    i 段就是保存后盘上的第 i 段,所以映射是 old origIndex → i。载荷里没出现的
+    origIndex 说明该段已从盘上消失(空块被载荷构建器丢弃),调用方应把它置 null。
+    invoke 往返期间用户可能又编辑了文档,当前文档顺序此刻已经不代表盘上段序——按
+    当前顺序顺次编号会把窗口内新增的块编进服务端不存在的下标(orig_index 越界)。 */
+export function savedIndexRemap(sent: ParagraphPayload[]): Map<number, number> {
+  const remap = new Map<number, number>();
+  sent.forEach((p, i) => {
+    if (p.orig_index !== null) remap.set(p.orig_index, i);
+  });
+  return remap;
+}
+
+/** 保存成功后的 dirty 基线,同样取自已发送载荷:盘上第 i 段的正文就是载荷第 i 段的
+    text。用载荷而非当前文档重建基线,是 in-flight 编辑不丢字的关键——往返窗口内改过
+    的段与载荷文本不同,下一轮 flush 就会把它正确判成 dirty(宁多 dirty 不丢字)。 */
+export function savedBaseline(sent: ParagraphPayload[]): Map<number, string> {
+  return new Map(sent.map((p, i) => [i, p.text] as const));
+}
+
 /** Enter 分段/复制粘贴会复制块属性 → 同一 origIndex 出现多次。保首个,其余视为
     用户新插入块(origIndex=null,调用方同时清 speaker 属性)。 */
 export function normalizeOrigIndices(indices: (number | null)[]): (number | null)[] {

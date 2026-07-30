@@ -6,6 +6,8 @@ import {
   refinedSavePayload,
   refinedToBlocks,
   sameSegmentSkeleton,
+  savedBaseline,
+  savedIndexRemap,
   segmentCommitDecision,
 } from "./editorDoc";
 
@@ -97,6 +99,62 @@ describe("refinedSavePayload", () => {
     const d = doc({ paragraphs: [] });
     delete (d as any).revision;
     expect(refinedSavePayload(d, [], new Map()).revision).toBe(0);
+  });
+});
+
+// markSaved 的 in-flight 分支(Round 3 Important 2):invoke 往返期间用户继续输入时,
+// 保存后的段序只能从**已发送的载荷**推导,不能按当前文档顺序顺次编号——窗口内 Enter
+// 新增的块会被编进服务端不存在的下标,下次保存被"orig_index 越界"拒绝,而该错误串
+// 不含"已在别处更新",宿主不走重载分支,markSaveFailed 每 2s 重试同一份毒载荷。
+describe("savedIndexRemap / savedBaseline", () => {
+  const sent = [
+    { orig_index: null, text: "## 新标题", dirty: true },
+    { orig_index: 0, text: "第一段", dirty: false },
+    { orig_index: 2, text: "改过的第三段", dirty: true },
+  ];
+
+  it("载荷第 i 段即盘上第 i 段:old origIndex → i;新块不进映射", () => {
+    expect([...savedIndexRemap(sent)]).toEqual([
+      [0, 1],
+      [2, 2],
+    ]);
+  });
+
+  it("载荷里没出现的 origIndex 查不到(调用方据此把该块置 null)", () => {
+    // 原第 1 段在 T0 是空块 → 被载荷构建器丢弃 → 盘上已不存在。
+    expect(savedIndexRemap(sent).get(1)).toBeUndefined();
+  });
+
+  it("基线取载荷文本(= 盘上现值),窗口内改过的段下一轮才会被判成 dirty", () => {
+    const baseline = savedBaseline(sent);
+    expect([...baseline]).toEqual([
+      [0, "## 新标题"],
+      [1, "第一段"],
+      [2, "改过的第三段"],
+    ]);
+    // 重排后的文档 + 该基线 → 只有 in-flight 改过的段是 dirty(宁多 dirty 不丢字)
+    const after = doc({
+      revision: 4,
+      paragraphs: [
+        { speaker: "", start_ms: 0, end_ms: 0, source_seqs: [], text: "## 新标题" },
+        { speaker: "R1", start_ms: 0, end_ms: 1, source_seqs: [1], text: "第一段" },
+        { speaker: "R3", start_ms: 2, end_ms: 3, source_seqs: [3], text: "改过的第三段" },
+      ],
+    });
+    const payload = refinedSavePayload(
+      after,
+      [
+        { origIndex: null, markdown: "## 新标题" },
+        { origIndex: 1, markdown: "第一段窗口内又改了" },
+        { origIndex: 2, markdown: "改过的第三段" },
+      ],
+      baseline,
+    );
+    expect(payload.paragraphs).toEqual([
+      { orig_index: null, text: "## 新标题", dirty: true },
+      { orig_index: 1, text: "第一段窗口内又改了", dirty: true },
+      { orig_index: 2, text: "改过的第三段", dirty: false },
+    ]);
   });
 });
 

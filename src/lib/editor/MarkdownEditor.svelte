@@ -39,6 +39,8 @@
     isBlockTextEmpty,
     refinedSavePayload,
     refinedToBlocks,
+    savedBaseline,
+    savedIndexRemap,
     segmentCommitDecision,
     type EditedBlock,
   } from "./editorDoc";
@@ -58,7 +60,6 @@
     onEditSegment,
     onBadgeClick,
     onPlayFrom,
-    onEntityOpen,
     onDeleteClick,
     speakerBadge,
   }: {
@@ -68,7 +69,8 @@
     onEditSegment?: (seq: number, expectedText: string, newText: string) => void;
     onBadgeClick?: (attrs: BadgeAttrs, rect: DOMRect) => void;
     onPlayFrom?: (startMs: number) => void;
-    onEntityOpen?: (entityId: string) => void;
+    // 实体跳转不在这里出口:组件只在实体高亮上派发 entityhover/entityleave,跳转由
+    // 页面浮层的按钮发起(见 +page.svelte 的 entityPop)。
     onDeleteClick?: (seq: number, rect: DOMRect) => void;
     speakerBadge: (attrs: BadgeAttrs) => { label: string; bg: string; ink: string };
   } = $props();
@@ -95,7 +97,14 @@
   // 精修稿保存状态:载入 doc + 各 origIndex 的序列化基线 + 上次已保存载荷指纹
   let loadedDoc: RefinedDoc | null = null;
   let baseline = new Map<number, string>();
+  // lastSaved 的不变式:它只能反映「已确认落在盘上的内容」。一旦被置成尚未确认的
+  // 当前内容,排队中的下一次 flush 会因指纹相等直接 return,那部分输入永不落盘。
   let lastSaved = "";
+  // flushRefined 在 T0 发出的那份载荷及其指纹。markSaved 到达时据此判断 invoke 往返
+  // 期间有没有新编辑(指纹分歧),并用它——而不是当前文档——推导保存后的段序/基线。
+  // 发送未落定即作废:markSaveFailed / setRefined 都会清空。
+  let sentParagraphs: ParagraphPayload[] | null = null;
+  let sentFingerprint = "";
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   const IDLE_SAVE_MS = 2000;
   // ctxRef 尚未就绪(onMount 的 Editor.make() 还没 resolve)时到达的 setRefined
@@ -170,6 +179,9 @@
     loadedDoc = doc;
     baseline = new Map();
     saveInFlight = false;
+    // 整份重载后旧的在途载荷不再有任何意义(它的 origIndex 指向旧布局)。
+    sentParagraphs = null;
+    sentFingerprint = "";
     const view = ctx.get(editorViewCtx);
     const schema = ctx.get(schemaCtx);
     const paras = refinedToBlocks(doc).map((b) => {
@@ -253,6 +265,9 @@
     const fingerprint = JSON.stringify(payload.paragraphs);
     if (fingerprint === lastSaved) return;
     saveInFlight = true;
+    // 先记快照再发:markSaved 靠它区分「往返期间无编辑」与「有 in-flight 编辑」。
+    sentParagraphs = payload.paragraphs;
+    sentFingerprint = fingerprint;
     onSaveRefined(payload);
   }
 
@@ -262,6 +277,59 @@
       永远发不出去。 */
   export function markSaveFailed() {
     saveInFlight = false;
+    // 这份载荷没落盘:作废快照,免得后续某次 markSaved 拿它当「盘上现状」重排。
+    sentParagraphs = null;
+    sentFingerprint = "";
+    scheduleIdleSave();
+  }
+
+  /** markSaved 的 in-flight 分支:invoke 往返期间用户又编辑了,当前文档已经不是刚
+      落盘的那份内容。此时**不能**把 lastSaved 置成当前指纹(排队的下一次 flush 会
+      因指纹相等直接 return,窗口内的输入永不落盘),也**不能**按当前文档顺序顺次
+      重排 origIndex(窗口内 Enter 新增的块会被编进服务端不存在的下标 → 下次保存
+      被"orig_index 越界"拒绝,错误串不含"已在别处更新"不走宿主的重载分支,
+      markSaveFailed 每 2s 拿同一份毒载荷重试,会话级保存瘫痪)。
+      改用**已发送的载荷**推导保存后的段序(savedIndexRemap/savedBaseline):
+      - 载荷第 i 段就是盘上第 i 段 → old origIndex 映射到 i;映射里没有的 origIndex
+        说明该段已从盘上消失(空块被丢弃),置 null 并清掉身份属性;
+      - origIndex 为 null 的块一律保持 null:它可能是窗口内新敲的块,也可能是 T0
+        载荷里的新块,两者在这里无法区分,取安全侧。后者的代价只是下次保存重建一个
+        同构的无说话人段(内容不丢、speaker/时间戳/mentions 本就是空,结构等价),
+        而猜错方向会把别人的段落身份套到新块上;
+      - 基线取载荷文本(= 盘上现值):窗口内改过的段下一轮被判成 dirty(宁多 dirty
+        不丢字),没动过的段仍是 clean;
+      - lastSaved 清空 → 下一轮 flush 一定发得出去,待保存内容随新 revision 落盘。 */
+  function rebaseAfterInFlightEdits(newRevision: number, sent: ParagraphPayload[] | null) {
+    if (ctxRef && sent) {
+      const view = ctxRef.get(editorViewCtx);
+      const remap = savedIndexRemap(sent);
+      let tr = view.state.tr;
+      view.state.doc.forEach((node, pos) => {
+        if (node.type.name !== "refined_paragraph") return;
+        const cur = node.attrs.origIndex as number | null;
+        if (cur === null) return;
+        const next = remap.get(cur);
+        if (next === cur) return;
+        tr =
+          next === undefined
+            ? tr.setNodeMarkup(pos, undefined, {
+                ...node.attrs,
+                origIndex: null,
+                speaker: "",
+                name: null,
+                personId: null,
+                startMs: 0,
+              })
+            : tr.setNodeMarkup(pos, undefined, { ...node.attrs, origIndex: next });
+      });
+      baseline = savedBaseline(sent);
+      if (tr.steps.length > 0) {
+        suppressNextUpdate = true;
+        view.dispatch(tr.setMeta("addToHistory", false).setMeta("external-load", true));
+      }
+    }
+    if (loadedDoc) loadedDoc = { ...loadedDoc, revision: newRevision };
+    lastSaved = "";
     scheduleIdleSave();
   }
 
@@ -270,12 +338,29 @@
       序列化失败就整体放弃本次重建——旧 baseline/origIndex/revision 原样保留,
       不用半可信数据(或 fallback 出的剥格式纯文本)当基线,否则下次保存会把
       它误判成"没变"/"变了"静默写盘,而且共享 SerializerState 污染还可能级联
-      到后面的块。放弃时 console.warn,宿主应重新 setRefined() 整份重载。 */
+      到后面的块。放弃时 console.warn,宿主应重新 setRefined() 整份重载。
+      往返期间用户可能继续输入:当前内容与 T0 发出的载荷指纹不符时不走本函数的重排
+      路径,转 rebaseAfterInFlightEdits(见其注释),否则会静默丢字/发出毒载荷。 */
   export function markSaved(newRevision: number) {
     saveInFlight = false;
+    const sent = sentParagraphs;
+    const sentFp = sentFingerprint;
+    sentParagraphs = null;
+    sentFingerprint = "";
     if (!ctxRef || !loadedDoc) return;
     const ctx = ctxRef;
     const view = ctx.get(editorViewCtx);
+    // in-flight 编辑检测:loadedDoc/baseline 在往返期间不变,两次指纹计算输入同源,
+    // 直接比字符串即可。序列化失败(null)也按分歧处理——同样是"当前内容未确认落盘"。
+    const nowBlocks = collectBlocks();
+    const nowFingerprint =
+      nowBlocks === null
+        ? null
+        : JSON.stringify(refinedSavePayload(loadedDoc, nowBlocks, baseline).paragraphs);
+    if (sent === null || nowFingerprint === null || nowFingerprint !== sentFp) {
+      rebaseAfterInFlightEdits(newRevision, sent);
+      return;
+    }
     let tr = view.state.tr;
     let nextIndex = 0;
     const nextBaseline = new Map<number, string>();

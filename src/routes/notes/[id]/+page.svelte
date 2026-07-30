@@ -1068,7 +1068,6 @@
             onSaveRefined={doSaveRefined}
             onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
-            onEntityOpen={(eid) => gotoEntity(eid)}
           />
         </div>
         {#if refined.paragraphs.length === 0}
@@ -1134,7 +1133,7 @@
         class="badge-menu floating"
         style="position: fixed; left: {segDeletePop.rect.left}px; top: {segDeletePop.rect.bottom + 4}px;"
       >
-        <button class="menu-item" onclick={() => doDeleteSeg(segDeletePop!.seq)}>确认删除</button>
+        <button class="menu-item danger" onclick={() => doDeleteSeg(segDeletePop!.seq)}>确认删除</button>
         <button class="menu-item" onclick={() => (segDeletePop = null)}>取消</button>
       </div>
     {/if}
@@ -1741,6 +1740,10 @@
   }
   .menu-item.new {
     font-weight: 500;
+  }
+  /* 破坏性菜单项(段删除确认)与 .link.danger 同一色钩:红字提示不可撤销。 */
+  .menu-item.danger {
+    color: var(--danger);
   }
   /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
      （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。
