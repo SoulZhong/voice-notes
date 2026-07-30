@@ -777,7 +777,7 @@
     max-width: 24rem;
     line-height: 1.45;
   }
-  /* 上下文整理提示:warning 横幅家族(与概览疑似重复卡同语义=待办),行内直达动作 */
+  /* 上下文整理提示:warning 横幅家族(待办语义),行内直达动作 */
   .ctx-card {
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);

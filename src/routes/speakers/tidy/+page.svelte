@@ -31,8 +31,9 @@
   let busy = $state(false);
   let skipped = $state<string[]>([]);
   let done = $state(0);
-  /** 手动合并后的页内撤销条(最近一次;同名组连并多条时只能撤最后一条,撤后其前
-      一条经日志复活仍可继续撤)。 */
+  /** 手动合并后的页内撤销条(最近一次;同名组连并多条时只能撤最后一条——撤销后
+      其前一条虽在合并日志里复活,但 manual 条目不进回执队列,UI 上无法继续撤;
+      同名组卡会重新出现,留给用户对复活的那一对重新拍板)。 */
   let lastManual = $state<{ journalId: string; label: string } | null>(null);
   let confirmClean = $state(false);
 
@@ -295,11 +296,17 @@
   {/if}
 
   {#if !current}
-    <div class="empty">
-      <p>都整理完了</p>
-      <p class="hint">新的建议会随录制自动出现;高置信的会自动归并并在这里留回执。</p>
-      <a class="mini as-link" href="/speakers">返回概览</a>
-    </div>
+    {#if tidy.loading}
+      <div class="empty">
+        <p class="hint">正在比对声纹…</p>
+      </div>
+    {:else}
+      <div class="empty">
+        <p>都整理完了</p>
+        <p class="hint">新的建议会随录制自动出现;高置信的会自动归并并在这里留回执。</p>
+        <a class="mini as-link" href="/speakers">返回概览</a>
+      </div>
+    {/if}
   {:else if current.kind === "receipt"}
     {@const r = current.receipt}
     <section class="card">

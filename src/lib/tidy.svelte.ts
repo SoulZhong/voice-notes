@@ -25,6 +25,7 @@ class TidyState {
   /** 会话级忽略/保留集(同名组「忽略」、无样本「保留」),键=tidyItemKey。 */
   dismissed = $state<Set<string>>(new Set());
   loading = $state(false);
+  private inflight: Promise<void> | null = null;
 
   /** 未被忽略的建议(展示/计数用)。 */
   get visible(): PersonMergeSuggestion[] {
@@ -48,6 +49,14 @@ class TidyState {
       增值层,比对失败不该打扰主流程。有自动合并发生时 bumpPeople 驱动全局刷新
       (再触发的下一轮 refresh 不会再有 applied,自然收敛)。 */
   async refresh() {
+    if (this.inflight) return this.inflight;
+    this.inflight = this.doRefresh().finally(() => (this.inflight = null));
+    return this.inflight;
+  }
+
+  /** 并发调用合并到同一趟(动作后 bumpPeople 与 layout effect 会双触发,
+      双发第二趟拿旧库快照算 remaining 会短暂显示已消失的人)。 */
+  private async doRefresh() {
     this.loading = true;
     try {
       const outcome = await applyConfidentMerges();

@@ -352,7 +352,9 @@ impl VoiceprintStore {
         journal.append(&entry, &self.sample_paths_existing(loser), &self.sample_paths_existing(winner))?;
         if let Err(e) = self.merge_locked(loser, winner, embedder) {
             // 合并没做成,日志不留——否则可"撤销"一次没发生的合并。
-            let _ = journal.remove(&entry.id);
+            if let Err(e2) = journal.remove(&entry.id) {
+                eprintln!("合并失败后的日志清理也失败({}),该条目撤销等价于空操作: {e2}", entry.id);
+            }
             return Err(e);
         }
         // 本次合并使触及双方的既有可撤销条目失效(不含自己):它们的快照已过时。
@@ -392,6 +394,7 @@ impl VoiceprintStore {
             eprintln!("撤销合并:样本副本还原失败(不影响库): {e}");
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
+        // remove 失败则 revive 不执行:重试撤销幂等,链上条目只是暂失撤销入口。
         journal.remove(journal_id)?;
         journal.revive_invalidated_by(journal_id);
         Ok(())
@@ -940,6 +943,11 @@ pub fn suggest_merges(vp: &Voiceprints) -> Vec<MergeSuggestion> {
 /// SUGGEST_STRONG_Z)+ loser 未命名(已命名条目不自动动)+ 不在拒绝名单 + 双方
 /// 未被本轮更早的自动合并触及(同一 winner 一轮只吃一条:第二条会使第一条的回
 /// 执立即失效,顺延到下一轮重算后再合)。返回 (可自动合并, 留给人工)。
+///
+/// 拒绝名单匹配方向不敏感:两个未命名人之间谁是 loser/winner 由 total_ms 决定,
+/// 会随后续入库时长变化而翻转(见 suggest_merges 的 loser/winner 择定),用户撤销
+/// 时记下的 "P1>P2" 不能挡不住后来反向浮现的 "P2>P1" 建议——同一对人一旦被撤销
+/// 过一次,两个方向都不应再被自动合并。
 pub fn confident_picks(
     vp: &Voiceprints,
     sugs: Vec<MergeSuggestion>,
@@ -952,7 +960,9 @@ pub fn confident_picks(
         let strong = s.similarity >= SUGGEST_STRONG_RAW
             || s.salience.map_or(false, |z| z >= SUGGEST_STRONG_Z);
         let unnamed = vp.people.get(&s.loser).map_or(false, |p| p.name.is_empty());
-        let denied = deny.iter().any(|d| d == &format!("{}>{}", s.loser, s.winner));
+        let denied = deny.iter().any(|d| {
+            d == &format!("{}>{}", s.loser, s.winner) || d == &format!("{}>{}", s.winner, s.loser)
+        });
         if strong && unnamed && !denied && !touched.contains(&s.loser) && !touched.contains(&s.winner)
         {
             touched.insert(s.loser.clone());
@@ -2021,6 +2031,26 @@ mod tests {
         }];
         let (autos, manual) = confident_picks(&vp, sugs, &[]);
         assert!(autos.is_empty(), "已命名条目不自动动");
+        assert_eq!(manual.len(), 1);
+    }
+
+    #[test]
+    fn confident_picks_denylist_blocks_reversed_direction() {
+        // 撤销记的是 "P4>P5"(P4 曾是 loser);total_ms 变化后 suggest_merges 反向
+        // 推出 P5→P4(P5 是 loser),同一对人不该因方向翻转而绕过拒绝名单。
+        let mut vp = Voiceprints::default();
+        vp.people.insert("P4".into(), Person { name: "".into(), ..Default::default() });
+        vp.people.insert("P5".into(), Person { name: "".into(), ..Default::default() });
+        let sugs = vec![MergeSuggestion {
+            loser: "P5".into(),
+            winner: "P4".into(),
+            similarity: 0.80,
+            source: "mic".into(),
+            salience: None,
+        }];
+        let deny = vec!["P4>P5".to_string()];
+        let (autos, manual) = confident_picks(&vp, sugs, &deny);
+        assert!(autos.is_empty(), "反向建议仍应被拒绝名单挡住,落入人工");
         assert_eq!(manual.len(), 1);
     }
 

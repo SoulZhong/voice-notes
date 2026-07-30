@@ -26,7 +26,6 @@ pub use voiceprints::confident_picks; // 自动归并筛选(apply_confident_merg
 pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
 pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
 pub use voiceprints::MergeSuggestion; // confident_picks 出入参类型(lib.rs 消费)。
-pub use voiceprints::{SUGGEST_STRONG_RAW, SUGGEST_STRONG_Z}; // strong 档(前端 isStrong 对齐)。
 pub use voiceprints::VoiceprintStore; // lib.rs 四命令 + 种子/入库回写直接消费,无需 allow。
 pub use voiceprints::Voiceprints; // graph::resolve_global_id 命名此类型(人实体→person_id 匹配)。
 pub use voiceprints::AUTO_ENROLL_MS; // lib.rs 实时入库回调(registry enroller)用同一门槛。
