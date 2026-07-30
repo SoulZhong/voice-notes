@@ -618,35 +618,45 @@ fn symlink_metadata_optional(path: &Path) -> std::io::Result<Option<std::fs::Met
 
 /// 已持有该笔记 `NoteLock` 时使用的底层原子写。把锁凭据作为参数，避免调用者
 /// 意外绕开跨进程互斥，也避免 Aing 管线在锁内重入公共 writer。
+///
+/// 这是所有 aing.json writer 的收敛点，但只兜「拿旧内存态整写会让 revision 倒退」
+/// 这一条底——内容整替换的 writer(乐观并发校验、精修管线)自己负责算出正确的
+/// 目标 revision 并进位；这里只做单调性后备，严格大于才纠正:`existing.revision >
+/// doc.revision` 时把待写副本的 revision 拉高到 `existing.revision + 1`。相等时
+/// 原样透传，不额外进位——这是留给「载入-改-写回」型 writer(如迁移写、
+/// mark_graph_failed 这类同锁内先读后写、revision 本就与盘面一致的调用点)的
+/// 契约：它们的内存态与盘面在写入前后应保持一致，不能被这里的后备规则悄悄推高。
+/// 若 aing.json 存在但已损坏(`load_aing_file` 返回 `None`),此处不进位——损坏时
+/// 旧值本就不可读，无法判断该不该让步，保持当前 doc 的 revision 原样落盘是有意
+/// 取舍。
 pub(crate) fn write_refined_atomic_locked(
     note_dir: &Path,
     doc: &RefinedDoc,
     _lock: &NoteLock,
 ) -> anyhow::Result<()> {
+    let mut doc = doc.clone();
+    if let Some(Some(existing)) = load_aing_file(note_dir) {
+        if existing.revision > doc.revision {
+            doc.revision = existing.revision.saturating_add(1);
+        }
+    }
     let note_id = note_dir
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
     let tmp = note_dir.join("aing.json.tmp");
-    std::fs::write(&tmp, prepared_doc_bytes(note_id, doc)?)?;
+    std::fs::write(&tmp, prepared_doc_bytes(note_id, &doc)?)?;
     std::fs::rename(&tmp, note_dir.join(AING_DOC_FILE))?;
     Ok(())
 }
 
 /// 公共整份写入同样服从笔记级跨进程锁；所有 aing.json writer 因而共享一条
-/// 串行化边界，固定的 `.tmp` 文件也不会被并发写者竞写。
+/// 串行化边界，固定的 `.tmp` 文件也不会被并发写者竞写。revision never-regress
+/// 规则已下沉到 `write_refined_atomic_locked`，此处自动获得该保证。
 pub fn write_refined_atomic(note_dir: &Path, doc: &RefinedDoc) -> anyhow::Result<()> {
     let lock = NoteLock::acquire(note_dir)?
         .ok_or_else(|| anyhow::anyhow!("笔记正在被另一进程修改，请稍后重试"))?;
-    // 管线拿内存旧 doc 整写时不得把用户已推进的 revision 拉回去:一律进位,
-    // 让所有基于旧盘面的编辑器会话冲突失效,而不是被静默覆盖。
-    let mut doc = doc.clone();
-    if let Some(Some(existing)) = load_aing_file(note_dir) {
-        if existing.revision >= doc.revision {
-            doc.revision = existing.revision.saturating_add(1);
-        }
-    }
-    write_refined_atomic_locked(note_dir, &doc, &lock)
+    write_refined_atomic_locked(note_dir, doc, &lock)
 }
 
 fn ensure_ids(note_dir: &Path, mut doc: RefinedDoc) -> Option<RefinedDoc> {
@@ -865,14 +875,13 @@ pub fn save_refined_paragraphs(
         doc.paragraphs = new_paras;
 
         // 脏段 mention 降级为 support-only
-        for (old_i, slot) in index_map.iter().enumerate() {
+        for slot in index_map.iter() {
             let Some((new_i, true)) = slot else { continue };
             for m in &doc.paragraphs[*new_i].mentions {
                 if !m.id.is_empty() && !doc.graph_support_mentions.contains(&m.id) {
                     doc.graph_support_mentions.push(m.id.clone());
                 }
             }
-            let _ = old_i;
         }
         // 被删段的 mention 彻底消失:剪掉引用它们的关系与 support 残留
         let alive: std::collections::HashSet<&str> = doc
@@ -1472,6 +1481,10 @@ mod tests {
         assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(0), "  ", true)])).is_err());
         assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(9), "x", true)])).is_err());
         assert!(save_refined_paragraphs(&note, rev, &payload(&[(Some(0), "a", true), (Some(0), "b", true)])).is_err());
+        // 三次失败都不应落盘:revision 与段落数保持不变
+        let doc = load_refined(&note).unwrap();
+        assert_eq!(doc.revision, rev);
+        assert_eq!(doc.paragraphs.len(), 2);
     }
 
     #[test]
@@ -1487,5 +1500,49 @@ mod tests {
         stale.revision = 0;
         write_refined_atomic(&note, &stale).unwrap();
         assert_eq!(load_refined(&note).unwrap().revision, 6);
+    }
+
+    #[test]
+    fn write_refined_atomic_locked_never_regresses_revision() {
+        // 模拟精修管线主路径:mod.rs 直接持锁调 write_refined_atomic_locked,
+        // 新 doc 硬编码 revision: 0。never-regress 规则必须在这条路径上同样生效,
+        // 而不仅仅在公共 write_refined_atomic 入口生效。
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        let mut doc = editable_doc();
+        doc.revision = 5;
+        write_refined_atomic(&note, &doc).unwrap();
+        assert_eq!(load_refined(&note).unwrap().revision, 5);
+
+        let lock = NoteLock::acquire(&note).unwrap().expect("应能取得笔记锁");
+        let mut pipeline_doc = editable_doc();
+        pipeline_doc.revision = 0;
+        write_refined_atomic_locked(&note, &pipeline_doc, &lock).unwrap();
+        drop(lock);
+
+        assert_eq!(load_refined(&note).unwrap().revision, 6);
+    }
+
+    #[test]
+    fn write_refined_atomic_locked_passes_through_equal_revision() {
+        // 「载入-改-写回」型 writer(迁移写、mark_graph_failed 这类同锁内先读后写)
+        // 传入的 doc.revision 本就等于盘上现值——收敛点的单调性后备只在严格大于时
+        // 才纠正，相等必须原样透传，否则这类合法 writer 的内存态会与盘面永久漂移。
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        let mut doc = editable_doc();
+        doc.revision = 3;
+        write_refined_atomic(&note, &doc).unwrap();
+        let on_disk_revision = load_refined(&note).unwrap().revision;
+
+        let lock = NoteLock::acquire(&note).unwrap().expect("应能取得笔记锁");
+        let mut same_revision_doc = editable_doc();
+        same_revision_doc.revision = on_disk_revision;
+        write_refined_atomic_locked(&note, &same_revision_doc, &lock).unwrap();
+        drop(lock);
+
+        assert_eq!(load_refined(&note).unwrap().revision, on_disk_revision);
     }
 }

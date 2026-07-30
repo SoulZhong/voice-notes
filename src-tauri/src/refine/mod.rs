@@ -307,8 +307,18 @@ pub fn run_local(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
-    if let Some(previous) = crate::store::refined::load_refined_locked(note_dir, &note_lock) {
-        GraphFallbackSnapshot::capture(&previous).restore(note_id, &mut doc);
+    let previous = crate::store::refined::load_refined_locked(note_dir, &note_lock);
+    // 显式进位,而不是依赖 write_refined_atomic_locked 的单调性后备:有旧稿则
+    // old+1,没有旧稿(首次生成)才是 0。这样无论用户是否编辑过,精修重跑都会
+    // 推进 revision,过期编辑器会话的保存必然因 revision 不匹配而冲突——而不是
+    // 留一个 rev-0 窗口寄望收敛点的后备规则兜底(那条规则相等时会原样透传,
+    // 专留给「载入-改-写回」型 writer,不会替这里进位)。
+    doc.revision = previous
+        .as_ref()
+        .map(|p| p.revision.saturating_add(1))
+        .unwrap_or(0);
+    if let Some(previous) = &previous {
+        GraphFallbackSnapshot::capture(previous).restore(note_id, &mut doc);
     }
     crate::store::ensure_graph_ids(note_id, &mut doc);
     crate::store::refined::write_refined_atomic_locked(note_dir, &doc, &note_lock)?;
