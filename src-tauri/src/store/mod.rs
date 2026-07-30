@@ -2,6 +2,7 @@ pub mod aing_graph;
 pub mod audio;
 pub mod disk;
 mod export;
+pub mod merge_journal;
 pub mod migrate;
 pub mod notelock;
 mod notes;
@@ -30,6 +31,7 @@ pub use voiceprints::MAX_SAMPLES; // merge_person 判断样本是否超额(超�
                                   // Person/PersonCentroid/AUTO_ENROLL_MS 曾在此 re-export(供未来前端类型生成/测试引用),
                                   // 但全仓 grep 确认无一处经 store:: 路径消费——终审删掉,要用时再导出。Voiceprints 例外:
                                   // graph::resolve_global_id 需要具名此类型,已于上方重新导出。
+pub use merge_journal::{MergeJournal, MergeJournalEntry}; // 合并日志(lib.rs 命令层消费)。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
