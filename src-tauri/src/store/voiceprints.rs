@@ -164,13 +164,20 @@ impl VoiceprintStore {
         None // 超过步数上限,视为异常环,容忍返回 None 而非死循环
     }
 
+    /// 变更入口统一失效钩子:触及这些人物的合并日志条目不可再撤销(快照已过时)。
+    fn journal_invalidate(&self, touched: &[&str], reason: &str) {
+        super::merge_journal::MergeJournal::new(self.root.clone()).invalidate(touched, reason, None);
+    }
+
     /// 改人物显示名。
     pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let mut vp = self.load();
         let person = vp.people.get_mut(id).ok_or_else(|| anyhow::anyhow!("未知人物: {id}"))?;
         person.name = name.to_string();
-        self.save(&vp)
+        self.save(&vp)?;
+        self.journal_invalidate(&[id], "此人随后被改名");
+        Ok(())
     }
 
     /// 把 loser 合并进 winner(无嵌入器变体:样本超额时退回"winner 全留、loser 按序
@@ -399,6 +406,7 @@ impl VoiceprintStore {
         vp.redirects.retain(|_, target| target != id);
         vp.redirects.remove(id);
         self.save(&vp)?;
+        self.journal_invalidate(&[id], "此人随后被删除");
         for sample in self.sample_paths_existing(id) {
             if let Err(e) = std::fs::remove_file(&sample) {
                 eprintln!("声纹样本删除失败({id},不影响库): {e}");
@@ -439,21 +447,21 @@ impl VoiceprintStore {
     /// - id 先经 redirects 解析(会话快照里的 person 引用可能已被合并);
     /// - 已有样本不覆盖(每场会议至多追加一份,试听可区分"哪场的声音");
     /// - 满员(MAX_SAMPLES)/解析失败(人物已删)/空样本静默跳过。
-    /// 返回是否实际写入。
+    /// 返回实际写入时解析后的人物 id(未写入则 None)。
     ///
     /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,否则「停止入库写样本」
     /// 与管理页并发合并/删除会写出无主孤儿样本或把错人的音频挂到 winner 上。
-    pub fn append_sample(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
+    fn append_sample_inner(&self, id: &str, samples: &[f32]) -> anyhow::Result<Option<String>> {
         let _guard = vp_guard();
         let vp = self.load();
         let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
-            return Ok(false);
+            return Ok(None);
         };
         if samples.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(path) = self.next_free_sample_slot(&resolved) else {
-            return Ok(false); // 满员:样本够用了,不再累积
+            return Ok(None); // 满员:样本够用了,不再累积
         };
         std::fs::create_dir_all(path.parent().expect("sample_path 恒有父目录"))?;
         let spec = hound::WavSpec {
@@ -470,7 +478,23 @@ impl VoiceprintStore {
         }
         w.finalize()?;
         std::fs::rename(&tmp, &path)?;
-        Ok(true)
+        Ok(Some(resolved))
+    }
+
+    /// 为人物追加一份录音样本(语义见 append_sample_inner)。会使触及此人的合并
+    /// 日志条目失效(样本状态与快照脱节)。
+    pub fn append_sample(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
+        let resolved = self.append_sample_inner(id, samples)?;
+        if let Some(rid) = &resolved {
+            self.journal_invalidate(&[rid], "此人样本随后有变动");
+        }
+        Ok(resolved.is_some())
+    }
+
+    /// 合并兜底截样专用:不触发日志失效——兜底样本是合并动作自身的一部分,
+    /// 不能反手把刚落的这条日志灭了(撤销时快照还原自然会清掉它)。
+    pub fn append_sample_for_merge(&self, id: &str, samples: &[f32]) -> anyhow::Result<bool> {
+        Ok(self.append_sample_inner(id, samples)?.is_some())
     }
 
     /// 切换嵌入模型后的库重建:每人用其录音样本按新模型重算质心(样本=人工核验过
@@ -529,6 +553,8 @@ impl VoiceprintStore {
         }
         vp.embedding_model = model_tag.to_string();
         self.save(&vp)?;
+        super::merge_journal::MergeJournal::new(self.root.clone())
+            .invalidate_all("声纹库已按新模型重建");
         Ok(rebuilt)
     }
 
@@ -547,6 +573,7 @@ impl VoiceprintStore {
             anyhow::bail!("不是该人物的样本文件");
         }
         std::fs::remove_file(path)?;
+        self.journal_invalidate(&[&resolved], "此人样本随后有变动");
         Ok(())
     }
 
@@ -564,6 +591,7 @@ impl VoiceprintStore {
         let _guard = vp_guard();
         let mut vp = self.load();
         let mut new_links = BTreeMap::new();
+        let mut touched: Vec<String> = Vec::new();
         for snap in snaps {
             // sources 恒空 ⇔ 未命中的库种子簇,勿回写勿入库(终审 triage①):assign 命中
             // 必 sources.insert,空集是种子铺底后本场从未被认领的信号,不是"真实说话人"。
@@ -582,6 +610,7 @@ impl VoiceprintStore {
                 person.total_ms += snap.total_ms;
                 person.last_seen = now.to_string();
                 push_session_centroid(person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
+                touched.push(resolved.clone());
             } else if snap.total_ms >= AUTO_ENROLL_MS && !snap.centroid.is_empty() {
                 let id = format!("P{}", vp.next_person);
                 vp.next_person += 1;
@@ -603,6 +632,10 @@ impl VoiceprintStore {
             }
         }
         self.save(&vp)?;
+        if !touched.is_empty() {
+            let refs: Vec<&str> = touched.iter().map(String::as_str).collect();
+            self.journal_invalidate(&refs, "此人随后又录了新会议");
+        }
         Ok(new_links)
     }
 }
@@ -1824,6 +1857,76 @@ mod tests {
         write_fake_sample(tmp.path(), "P1.wav");
         write_fake_sample(tmp.path(), "P2.wav");
         store
+    }
+
+    /// 造好合并日志条目后执行某操作,断言条目失效与否。
+    fn journaled_entry(store: &VoiceprintStore, tmp: &tempfile::TempDir) -> String {
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        assert!(j.entry(&jid).unwrap().invalid_reason.is_none());
+        jid
+    }
+
+    fn assert_invalidated(tmp: &tempfile::TempDir, jid: &str, reason_part: &str) {
+        let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let e = j.entry(jid).unwrap();
+        let r = e.invalid_reason.expect("应已失效");
+        assert!(r.contains(reason_part), "原因不符: {r}");
+        assert!(e.invalidated_by.is_none(), "非合并失效不可复活");
+    }
+
+    #[test]
+    fn rename_invalidates_touching_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = journaled_entry(&store, &tmp);
+        store.rename("P2", "李四").unwrap();
+        assert_invalidated(&tmp, &jid, "改名");
+    }
+
+    #[test]
+    fn delete_invalidates_touching_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = journaled_entry(&store, &tmp);
+        store.delete("P2").unwrap();
+        assert_invalidated(&tmp, &jid, "删除");
+    }
+
+    #[test]
+    fn upsert_invalidates_entries_of_people_who_spoke_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = journaled_entry(&store, &tmp);
+        // P2(经 redirect 解析)又录了一场
+        let snaps = vec![snap("S9", vec![0.0, 1.0], 3, &["mic"], Some("P2"), 20_000)];
+        store.upsert_from_session(&snaps, "t2").unwrap();
+        assert_invalidated(&tmp, &jid, "新会议");
+    }
+
+    #[test]
+    fn append_and_delete_sample_invalidate_but_merge_variant_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = journaled_entry(&store, &tmp);
+        let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+
+        // 合并专用变体:不失效(兜底样本是合并动作的一部分)
+        store.append_sample_for_merge("P2", &[0.1f32; 1600]).unwrap();
+        assert!(j.entry(&jid).unwrap().invalid_reason.is_none());
+        // 普通 append:失效
+        store.append_sample("P2", &[0.1f32; 1600]).unwrap();
+        assert_invalidated(&tmp, &jid, "样本");
+    }
+
+    #[test]
+    fn delete_sample_invalidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = journaled_entry(&store, &tmp);
+        let path = store.sample_paths_existing("P2")[0].clone();
+        store.delete_sample("P2", &path).unwrap();
+        assert_invalidated(&tmp, &jid, "样本");
     }
 
     #[test]
