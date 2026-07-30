@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
+  import { untrack } from "svelte";
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
@@ -59,6 +60,13 @@
   // 路由参数变化(侧栏点选另一人)时重载;同页操作后手动 refresh。
   $effect(() => {
     void personId;
+    // 撤销条只在"合并落点"(lastMergeWinner)的人物页存活;导航到别的无关人物页要清掉。
+    // untrack 读取 lastMergeWinner:避免该 effect 因合并动作里对它的赋值而重跑
+    // (那一刻 personId 还是旧页,会把刚设好的状态立即冲掉)。
+    if (personId !== untrack(() => lastMergeWinner)) {
+      lastMergeId = null;
+      lastMergeWinner = null;
+    }
     stopSample();
     stopCtx();
     closeAllOps();
@@ -119,6 +127,7 @@
     dupRename = null;
     try {
       lastMergeId = await mergePerson(p.id, d.other.id);
+      lastMergeWinner = d.other.id;
       recording.bumpPeople();
       goto(`/speakers/${d.other.id}`);
     } catch (e) {
@@ -185,6 +194,7 @@
     closeAllOps();
     try {
       lastMergeId = await mergePerson(loser, winner);
+      lastMergeWinner = winner;
       recording.bumpPeople();
       // 本人已并入对方:跳到对方详情,让"这个人现在是谁"立即可见。
       goto(`/speakers/${winner}`);
@@ -221,12 +231,15 @@
 
   /** 手动合并后的撤销条(最近一次;后端日志兜底,失效时撤销报错原样透出)。 */
   let lastMergeId = $state<string | null>(null);
+  /** 本次合并的落点(winner)。导航到别人页时撤销条清除;跳到 winner 页(本人被并走的 goto)则保留。 */
+  let lastMergeWinner = $state<string | null>(null);
 
   async function undoLastMerge() {
     if (!lastMergeId) return;
     try {
       await undoMerge(lastMergeId);
       lastMergeId = null;
+      lastMergeWinner = null;
       recording.bumpPeople();
       await tidy.refresh();
       await refresh();
@@ -240,6 +253,7 @@
     stopSample();
     try {
       lastMergeId = await mergePerson(s.loser, s.winner);
+      lastMergeWinner = s.winner;
       recording.bumpPeople();
       await tidy.refresh();
       if (s.loser === personId) {
@@ -326,7 +340,13 @@
     <div class="undo-strip">
       已合并。
       <button class="mini" disabled={recording.isLive} onclick={undoLastMerge}>撤销</button>
-      <button class="mini" onclick={() => (lastMergeId = null)}>好</button>
+      <button
+        class="mini"
+        onclick={() => {
+          lastMergeId = null;
+          lastMergeWinner = null;
+        }}>好</button
+      >
     </div>
   {/if}
 
