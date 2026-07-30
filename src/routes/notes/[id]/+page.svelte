@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { onTranscodeDone } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
@@ -32,14 +32,16 @@
     type SegmentRecord,
     type TrackInfo,
     type RefinedDoc,
-    splitMentions,
     noteRelated,
     type RelatedNote,
+    saveRefined,
+    type ParagraphPayload,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { listPeople, type PersonSummary } from "$lib/people";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
+  import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -102,6 +104,106 @@
     }
     return m;
   });
+
+  // ── 精修稿 WYSIWYG 接线(MarkdownEditor):可编辑 + 失焦/停顿自动保存 + revision
+  //    冲突重载 + 实体浮层。组件契约见 MarkdownEditor.svelte 顶部注释与移交文件——
+  //    onSaveRefined 的每条失败路径必须调 markSaveFailed(),否则自动保存永久停摆。 ──
+  let refinedEditor = $state<ReturnType<typeof MarkdownEditor> | null>(null);
+  let refinedHostEl = $state<HTMLDivElement | null>(null);
+  // 实体悬浮浮层:{ entityId, rect };离开/点击别处即收起。
+  let entityPop = $state<{ entityId: string; rect: DOMRect } | null>(null);
+  // 精修稿说话人徽章点击浮层:沿用说话人条改名/选人入口,弹层只做身份提示。
+  let refinedBadgePop = $state<{ attrs: BadgeAttrs; rect: DOMRect } | null>(null);
+  // 保存错误粘性去重:markSaveFailed 无退避地按 2s 重试,持续性拒绝(Aing 中/录制中)
+  // 不该每次都刷新一条 banner——同一条错误只设置一次,markSaved 成功后清空。
+  let refinedSaveErr = $state("");
+  // 当前编辑器里加载的是哪个笔记的精修稿(而非 route 的 id):id 切换时 flush 必须
+  // 落到*旧*笔记,不能用已经翻新的 id——否则会把上一篇的编辑存进新笔记。
+  let loadedRefinedId: string | null = null;
+
+  function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
+    const sid = attrs.speaker;
+    return {
+      label: speakerLabel(sid, "mic", refinedSpeakers),
+      bg: speakerColor(sid, "mic", refinedSpeakers),
+      ink: speakerInk(sid, "mic", refinedSpeakers),
+    };
+  }
+
+  async function doSaveRefined(payload: { revision: number; paragraphs: ParagraphPayload[] }) {
+    const targetId = loadedRefinedId ?? id;
+    try {
+      const newRev = await saveRefined(targetId, payload.revision, payload.paragraphs);
+      refinedEditor?.markSaved(newRev);
+      if (refined && targetId === id) refined = { ...refined, revision: newRev };
+      if (refinedSaveErr) {
+        if (error === refinedSaveErr) error = "";
+        refinedSaveErr = "";
+      }
+    } catch (err) {
+      // markSaveFailed 必须无条件调用(即使随后走冲突重载分支):否则一次拒绝就让
+      // 组件 saveInFlight 卡 true,自动保存永久停摆。
+      refinedEditor?.markSaveFailed();
+      const msg = `精修稿保存失败: ${err}`;
+      if (msg !== refinedSaveErr) {
+        refinedSaveErr = msg;
+        error = msg;
+      }
+      // revision 冲突(乐观并发):当前编辑已经落空,重载盘上最新内容重建文档。
+      // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
+      // (markSaveFailed 已排好下一次)。
+      if (String(err).includes("已在别处更新")) {
+        try {
+          const latest = await getRefined(targetId);
+          if (targetId === id) {
+            refined = latest;
+            if (latest) refinedEditor?.setRefined(latest);
+          }
+        } catch {
+          /* 重载失败保持错误横幅 */
+        }
+      }
+    }
+  }
+
+  // refined 变化(载入/精修完成/冲突重载)→ 重建编辑器文档;输入中不打断。
+  $effect(() => {
+    const doc = refined;
+    const ed = refinedEditor;
+    if (!ed || !doc || effectiveView !== "refined") return;
+    if (ed.hasFocus()) return; // 常驻编辑态:正在打字时外部刷新不吹掉输入
+    ed.setRefined(doc);
+    loadedRefinedId = id;
+  });
+
+  // 实体悬浮浮层桥接:组件在编辑器根上派发 entityhover/entityleave,两者都不带
+  // bubbles:true——只有 capture 阶段的祖先监听才能收到(非冒泡事件的标准套路,
+  // 与旧式 focus/blur 在有 focusin/focusout 之前的处理方式同理)。span→span 快速
+  // 移动会先 leave(A) 再 hover(B):leave 的 entityId 与当前展示不符就忽略,否则
+  // 新浮层会被刚到达的旧 leave 事件立刻收起。
+  $effect(() => {
+    const el = refinedHostEl;
+    if (!el) return;
+    const onHover = (e: Event) => {
+      const detail = (e as CustomEvent<{ entityId: string; rect: DOMRect }>).detail;
+      entityPop = detail;
+    };
+    const onLeave = (e: Event) => {
+      const detail = (e as CustomEvent<{ entityId: string }>).detail;
+      if (entityPop && entityPop.entityId === detail.entityId) entityPop = null;
+    };
+    el.addEventListener("entityhover", onHover, true);
+    el.addEventListener("entityleave", onLeave, true);
+    return () => {
+      el.removeEventListener("entityhover", onHover, true);
+      el.removeEventListener("entityleave", onLeave, true);
+    };
+  });
+
+  // 离开页面/组件销毁前把未保存的精修稿编辑冲出去(与段编辑失焦保存同哲学:
+  // 不因为切走了就悄悄丢用户刚打的字)。
+  onDestroy(() => refinedEditor?.flushRefined());
+
   // ── 说话人试听:chips 面板「试听他的声音」——不听声音没法确认「说话人 N」是谁。
   //    播该说话人时长最长的一段(代表性最好),重复点击按时长降序换下一段(取前 5,
   //    循环);单段最多听 15s,段尾自动停;用户手动暂停/拖走即退出试听态。 ──
@@ -257,6 +359,9 @@
   // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
   $effect(() => {
     void id;
+    // 落盘先于复位:flushRefined 内部用 loadedRefinedId(不是下面即将复位的
+    // refined/id)找旧笔记,必须在清空编辑态之前调用。
+    refinedEditor?.flushRefined();
     note = null;
     error = "";
     editing = false;
@@ -269,6 +374,9 @@
     refineErr = "";
     confirmRefine = false;
     viewMode = "refined";
+    entityPop = null;
+    refinedBadgePop = null;
+    refinedSaveErr = "";
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -755,33 +863,24 @@
 
     <div class="transcript" class:live={playerPlaying} bind:this={transcriptEl}>
       {#if effectiveView === "refined" && refined}
-        {#each refined.paragraphs as p, i (i)}
-          <div class="para">
-            <span
-              class="badge"
-              style="background: {speakerColor(p.speaker, 'mic', refinedSpeakers)}; color: {speakerInk(p.speaker, 'mic', refinedSpeakers)}"
-            >
-              {speakerLabel(p.speaker, "mic", refinedSpeakers)}
-            </span>
-            {#if tracks.length > 0}
-              <button class="ts ts-btn" title="从此处播放" onclick={() => playFrom({ start_ms: p.start_ms })}>
-                {formatTs(p.start_ms)}
-              </button>
-            {:else}
-              <span class="ts">{formatTs(p.start_ms)}</span>
-            {/if}
-            <span class="para-text">{#each splitMentions(p.text, p.mentions) as seg}{#if seg.entityId}{@const eid = seg.entityId}{#if entityLinks[eid]}<span
-                    class="entity-mention linkable"
-                    title={entityName(eid)}
-                    role="link"
-                    tabindex="0"
-                    onclick={() => gotoEntity(eid)}
-                    onkeydown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), gotoEntity(eid))}
-                  >{seg.text}</span>{:else}<span class="entity-mention" title={entityName(eid)}>{seg.text}</span>{/if}{:else}{seg.text}{/if}{/each}</span>
-          </div>
-        {/each}
+        <!-- 精修稿 WYSIWYG:MarkdownEditor(可编辑,mode="refined")+ 实体/徽章浮层。
+             host div 只用来接收组件在编辑器根上派发的 entityhover/entityleave(不冒泡,
+             靠 capture 阶段的祖先监听,见上方 script 区的桥接 effect)。 -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="refined-editor-host" bind:this={refinedHostEl} onmouseleave={() => (entityPop = null)}>
+          <MarkdownEditor
+            bind:this={refinedEditor}
+            mode="refined"
+            editable={canEdit}
+            speakerBadge={refinedBadge}
+            onSaveRefined={doSaveRefined}
+            onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
+            onPlayFrom={(ms) => playFrom({ start_ms: ms })}
+            onEntityOpen={(eid) => gotoEntity(eid)}
+          />
+        </div>
         {#if refined.paragraphs.length === 0}
-          <p class="hint">（修订稿为空）</p>
+          <p class="hint">（修订稿为空，可直接输入补充内容）</p>
         {/if}
       {:else}
         {#each displaySegments as seg (seg.seq)}
@@ -860,6 +959,38 @@
         {/if}
       {/if}
     </div>
+
+    {#if entityPop}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="entity-pop"
+        style="position: fixed; left: {entityPop.rect.left}px; top: {entityPop.rect.bottom + 4}px;"
+        onmouseleave={() => (entityPop = null)}
+      >
+        <span>{entityName(entityPop.entityId)}</span>
+        {#if entityLinks[entityPop.entityId]}
+          <button
+            class="link"
+            onclick={() => {
+              gotoEntity(entityPop!.entityId);
+              entityPop = null;
+            }}
+          >
+            打开知识图谱
+          </button>
+        {/if}
+      </div>
+    {/if}
+    {#if refinedBadgePop}
+      <!-- 说话人徽章浮层:只做身份提示,改名/选人仍走页面顶部的 SpeakerChips 说话人条。 -->
+      <div
+        class="entity-pop"
+        style="position: fixed; left: {refinedBadgePop.rect.left}px; top: {refinedBadgePop.rect.bottom + 4}px;"
+      >
+        <span>{refinedBadge(refinedBadgePop.attrs).label}</span>
+        <button class="link" onclick={() => (refinedBadgePop = null)}>关闭</button>
+      </div>
+    {/if}
 
     {#if related.length > 0}
       <section class="card col related">
@@ -1077,31 +1208,41 @@
   .seg.discarded {
     opacity: 0.38;
   }
-  /* 修订稿段落:与 .seg 同排版语言,文本只读(无 editable/hover 态) */
-  .para {
+  /* 修订稿段落(MarkdownEditor 的 refined_paragraph NodeView 产出,DOM 由 PM 命令式
+     创建,没有 Svelte 的 scope hash,必须 :global 才能命中):与 .seg 同排版语言,
+     可编辑(WYSIWYG)。 */
+  .transcript :global(.md-para) {
     margin: 0 0 6px;
     line-height: 1.7;
   }
-  .para-text {
+  .transcript :global(.md-para .para-text) {
     white-space: pre-wrap;
   }
-  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字 */
-  .entity-mention {
+  /* editable-text(精修稿正文):组件把默认 outline 摘了,焦点态自己补——accent
+     2px outline,与标题/段落输入同一套规范。 */
+  .transcript :global(.ProseMirror:focus-visible) {
+    outline: 2px solid var(--accent);
+    border-radius: var(--radius-sm);
+  }
+  /* 实体提及高亮:正文单色,静态无底(不染正文),hover 才浮 accent-tint 底 + accent 字。
+     :global 原因同上——原始稿(.seg 内)与修订稿(NodeView 的 .md-para 内)共用同一套
+     class,原始稿元素是 Svelte 模板写的、天然带 hash,这里不额外区分。 */
+  .transcript :global(.entity-mention) {
     border-radius: var(--radius-sm);
     cursor: default;
     transition:
       background 120ms ease,
       color 120ms ease;
   }
-  .entity-mention:hover {
+  .transcript :global(.entity-mention:hover) {
     background: var(--accent-tint);
     color: var(--accent);
   }
   /* 可导航的实体提及(能解析到全局 id):区别于纯 tooltip 态,给出可点信号 */
-  .entity-mention.linkable {
+  .transcript :global(.entity-mention.linkable) {
     cursor: pointer;
   }
-  .entity-mention.linkable:hover {
+  .transcript :global(.entity-mention.linkable:hover) {
     text-decoration: underline;
     text-decoration-color: var(--accent);
   }
@@ -1141,12 +1282,15 @@
   .jump:hover {
     background: var(--primary-pressed);
   }
-  .badge.as-btn {
+  /* :global——原始稿(.seg)与修订稿 NodeView(.md-para)共用同一套 .badge/.ts 徽章
+     class,后者是 PM 命令式创建的 DOM,没有 Svelte scope hash,见上方 .entity-mention
+     同款注释。 */
+  .transcript :global(.badge.as-btn) {
     border: none;
     cursor: pointer;
     font-family: inherit;
   }
-  .badge.as-btn:disabled {
+  .transcript :global(.badge.as-btn:disabled) {
     cursor: default;
   }
   /* editable-text（段落）：静态时无边，hover accent-tint 底 + rounded-sm，focus accent outline */
@@ -1371,6 +1515,20 @@
       transform: none;
     }
   }
+  /* 精修稿实体/徽章浮层：position:fixed 定位在触发元素下方（entityPop/refinedBadgePop
+     的 rect 来自 getBoundingClientRect），与 .badge-menu 同一套 popover 视觉语言。 */
+  .entity-pop {
+    z-index: 30;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 10px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    font-size: 0.85rem;
+  }
   /* menu/popover（改说话人菜单）：surface-press 底、hairline 边、rounded-lg、shadow-popover
      （暗色下 canvas 比承载面更黑，浮层用 canvas 会成"洞"，故底走 surface-press）。 */
   .badge-menu {
@@ -1396,8 +1554,9 @@
     font-weight: 500;
   }
   /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
-     （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。 */
-  .badge {
+     （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。
+     :global 见上方 .entity-mention 同款注释:原始稿/修订稿共用同一套 class。 */
+  .transcript :global(.badge) {
     display: inline-block;
     min-width: 2.2em;
     text-align: center;
@@ -1407,14 +1566,14 @@
     padding: 0.05em 0.4em;
     margin-right: 0.4em;
   }
-  .ts {
+  .transcript :global(.ts) {
     color: var(--ink-faint);
     font-size: 0.8em;
     margin-right: 0.4em;
     font-variant-numeric: tabular-nums;
   }
   /* 时间戳按钮化(有音频时):无底无边,hover 变 accent 提示可点播 */
-  .ts-btn {
+  .transcript :global(.ts-btn) {
     background: none;
     border: none;
     cursor: pointer;
@@ -1422,7 +1581,7 @@
     font-family: inherit;
     border-radius: var(--radius-sm);
   }
-  .ts-btn:hover {
+  .transcript :global(.ts-btn:hover) {
     color: var(--accent);
     text-decoration: underline;
   }
