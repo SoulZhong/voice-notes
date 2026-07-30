@@ -96,8 +96,9 @@ pub struct RefinedDoc {
     /// 以通过图谱结构校验，但不是当前正文的 live mentions，不得进入 UI/搜索索引。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_support_mentions: Vec<String>,
-    /// 用户编辑保存的乐观并发版本号:每次锁内编辑落盘 +1,管线整写永不回退
-    /// (见 write_refined_atomic)。历史文档缺省 0。
+    /// 用户编辑保存的乐观并发版本号:每次锁内编辑落盘 +1(见 update_refined),
+    /// 管线整写永不回退(never-regress 后备在 write_refined_atomic_locked,所有
+    /// writer 的收敛点)。历史文档缺省 0。
     #[serde(default)]
     pub revision: u64,
     pub paragraphs: Vec<RefinedParagraph>,
@@ -826,9 +827,12 @@ pub struct ParagraphPayload {
 
 /// 笔记页 WYSIWYG 整篇保存。与 apply_refined_texts(Agent 只改文本)不同,这里允许
 /// 增删段与插入无说话人块,因此要自己维护图谱一致性:
-/// - 干净段:speaker/时间戳/source_seqs/mentions 原样保留,仅替换 text;
-/// - 脏段:保留段但 mention 偏移失效 → mention id 移入 graph_support_mentions
-///   (mention 本体留在段上,图谱关系端点不悬空;UI/搜索按 support 过滤);
+/// - 干净段(dirty=false):整段原样保留,连 text 也不替换——载荷文本被忽略。
+///   dirty=false 的语义是「相对载入基线没变」,而编辑器的 markdown 序列化会给正文
+///   加转义符(`1. ` → `1\. `),据此替换会污染用户没编辑过的段并让 mention 偏移错位;
+/// - 脏段:替换 text(speaker/时间戳/source_seqs 仍原样保留),但 mention 偏移失效
+///   → mention id 移入 graph_support_mentions(mention 本体留在段上,图谱关系端点
+///   不悬空;UI/搜索按 support 过滤);
 /// - 被删段:mentions 随段消失 → 引用这些 mention 的关系整条剪掉;
 /// - 证据:paragraph_index 按新布局重定位,落在被删/脏段上的证据丢弃(偏移无效);
 /// - 新块:空 speaker + 零时间戳 + 空 source_seqs(导出侧对空 speaker 不加前缀)。
@@ -859,7 +863,16 @@ pub fn save_refined_paragraphs(
                     anyhow::ensure!(index_map[i].is_none(), "orig_index 重复: {i}");
                     index_map[i] = Some((new_i, p.dirty));
                     let mut para = old[i].clone();
-                    para.text = p.text.clone();
+                    // dirty=false 语义即「相对载入基线没变」→ 一律保留盘上原文,忽略载荷
+                    // 文本。编辑器把带 live mention 的干净段按字面载入、再经 commonmark
+                    // 序列化回载荷,markdown 转义会静默改写正文(`1. 议题`→`1\. 议题`、
+                    // `预算[初稿]`→`预算\[初稿]`);基线同样是转义结果所以判不出 dirty,
+                    // 若在这里替换,用户从未碰过的段会被写进转义符,mentions 的
+                    // start/end 字符偏移随之错位。脏段行为不变(偏移本就失效,见下方
+                    // support 降级)。
+                    if p.dirty {
+                        para.text = p.text.clone();
+                    }
                     new_paras.push(para);
                 }
                 None => new_paras.push(RefinedParagraph {
@@ -910,6 +923,10 @@ pub fn save_refined_paragraphs(
         }
         Ok(())
     })?;
+    // expected_revision + 1 与 update_refined 锁内那次 +1 是同一个值:能走到这里说明
+    // 上面的 ensure 已确认盘上 doc.revision == expected_revision,而 update_refined 在
+    // 同一把锁内对同一个 doc 做 revision += 1 后才落盘,中途没有别的 writer 能插入。
+    // (saturating 同样一致:u64::MAX 在两边都饱和到同一值。)
     Ok(expected_revision.saturating_add(1))
 }
 
@@ -1416,6 +1433,46 @@ mod tests {
         assert_eq!(doc.paragraphs[0].speaker, "R1");
         assert_eq!(doc.paragraphs[0].mentions.len(), 1);
         assert!(doc.graph_support_mentions.is_empty());
+    }
+
+    /// Critical 1 回归:干净段(dirty=false)的正文一律保留盘上原文,载荷文本被忽略。
+    /// 编辑器把带 live mention 的段按字面载入,再经 commonmark 序列化成载荷时会加
+    /// markdown 转义(`1. 议题` → `1\. 议题`、`预算[初稿]` → `预算\[初稿]`、
+    /// `2*3` → `2\*3`);载入基线同样是转义结果,所以 dirty 判不出来。若后端照载荷
+    /// 替换,用户只编辑了第二段,第一段也会被写进转义符,mentions 的字符偏移错位。
+    #[test]
+    fn save_refined_keeps_clean_paragraph_text_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("n1");
+        std::fs::create_dir_all(&note).unwrap();
+        let mut doc = editable_doc();
+        let prefix = "1. 议题:预算[初稿] ";
+        let clean_text = format!("{prefix}张三 主讲,2*3 个方案");
+        let start = prefix.chars().count();
+        doc.paragraphs[0].text = clean_text.clone();
+        doc.paragraphs[0].mentions =
+            vec![Mention { id: "m1".into(), entity: "P1".into(), start, end: start + 2 }];
+        write_refined_atomic(&note, &doc).unwrap();
+        let rev = load_refined(&note).unwrap().revision;
+
+        // 编辑器载荷:第一段是序列化后的转义文本 + dirty=false;第二段是真实编辑。
+        let escaped = "1\\. 议题:预算\\[初稿] 张三 主讲,2\\*3 个方案";
+        let new_rev = save_refined_paragraphs(
+            &note,
+            rev,
+            &payload(&[(Some(0), escaped, false), (Some(1), "用户改过的第二段", true)]),
+        )
+        .unwrap();
+
+        let back = load_refined(&note).unwrap();
+        assert_eq!(back.revision, new_rev);
+        assert_eq!(back.paragraphs[0].text, clean_text, "干净段正文必须逐字节不变");
+        assert_eq!(back.paragraphs[0].mentions, doc.paragraphs[0].mentions, "mention 偏移不得漂移");
+        let chars: Vec<char> = back.paragraphs[0].text.chars().collect();
+        let m = &back.paragraphs[0].mentions[0];
+        assert_eq!(chars[m.start..m.end].iter().collect::<String>(), "张三", "偏移仍落在实体原文上");
+        assert!(back.graph_support_mentions.is_empty(), "干净段 mention 仍是 live");
+        assert_eq!(back.paragraphs[1].text, "用户改过的第二段", "脏段照常替换");
     }
 
     #[test]
