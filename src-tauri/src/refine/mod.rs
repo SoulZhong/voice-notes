@@ -591,6 +591,11 @@ pub fn run_llm(
         fallback_graph.restore(note_id, doc);
         doc.stages.relations = "failed".into();
     }
+    // 润色整替换段落文本,写盘前进位(与 run_local 同构):run_local 落盘与本次落盘
+    // 之间载入精修稿的编辑器会话,其 expected_revision 在本次落盘后仍会通过 store
+    // 层 CAS 校验,保存会被静默接受并回退本次润色结果——进位使该会话必然冲突。
+    // 加在内存 doc 上、写盘前完成,内存态与落盘 JSON 仍保持一致。
+    doc.revision = doc.revision.saturating_add(1);
     if let Err(e) = crate::store::refined::write_refined_atomic_locked(note_dir, doc, &note_lock) {
         fail_in_memory(doc);
         return Err(e);
