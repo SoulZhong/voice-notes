@@ -315,7 +315,7 @@
       </div>
       <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
       <div class="acts">
-        <button class="mini accent" disabled={busy} onclick={() => doAck(r)}>好 <kbd class="kbd">⏎</kbd></button>
+        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好 <kbd class="kbd">⏎</kbd></button>
         {#if r.invalid_reason}
           <button class="mini" disabled title={r.invalid_reason}>撤销(不可用)</button>
           <span class="hint">{r.invalid_reason}</span>
@@ -345,7 +345,7 @@
       <p class="hint">两边各听一段原声(数字键 1/2 播最新样本),确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
       <div class="acts">
         <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s)}>合并 <kbd class="kbd">⏎</kbd></button>
-        <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>忽略 <kbd class="kbd">X</kbd></button>
+        <button class="mini" disabled={busy || live} onclick={() => doIgnoreSuggestion(s)}>忽略 <kbd class="kbd">X</kbd></button>
         <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
       </div>
     </section>
@@ -376,7 +376,7 @@
         <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(current.name, g)}>
           全部并入主条目 <kbd class="kbd">⏎</kbd>
         </button>
-        <button class="mini" disabled={busy} onclick={() => doDismiss(current)}>忽略 <kbd class="kbd">X</kbd></button>
+        <button class="mini" disabled={busy || live} onclick={() => doDismiss(current)}>忽略 <kbd class="kbd">X</kbd></button>
         <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
       </div>
     </section>
@@ -393,7 +393,7 @@
       </p>
       <div class="acts">
         <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>删除 <kbd class="kbd">⏎</kbd></button>
-        <button class="mini" disabled={busy} onclick={() => doDismiss(current)}>保留 <kbd class="kbd">X</kbd></button>
+        <button class="mini" disabled={busy || live} onclick={() => doDismiss(current)}>保留 <kbd class="kbd">X</kbd></button>
         <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
         {#if queue.filter((i) => i.kind === "nosample").length > 1}
           <span class="spacer"></span>
