@@ -74,6 +74,13 @@
   // 通常还会紧接着 setRefined() 整份重载(它自己也会复位 saveInFlight);非冲突
   // 失败(如 Aing/录制中被拒)只需调 markSaveFailed() 让编辑继续按 idle 定时器
   // 重试,不必重载文档。
+  //
+  // segments 模式提交回执契约:宿主在 editSegment 成功后必须调
+  // markSegmentSaved(seq, newText)(newText 即刚提交的值),把该段的 segBase
+  // 基线更新为新落盘值——否则用户在段间连续编辑但不失焦离开编辑器时,同一段
+  // 后续再次提交仍会带着旧的 expectedText,在后端撞 CAS 冲突(旧值早被上一次
+  // 提交改写)。失败路径不必调用:页面会 refresh() 后重新 setSegments() 整体
+  // 重建 segBase,不需要这里单独补偿。
   let rootEl: HTMLDivElement;
   let editor: Editor | null = null;
   let ctxRef: Ctx | null = null;
@@ -388,6 +395,28 @@
       if (!decision.roundTripOk) console.warn(`段 ${seq} markdown 序列化往返不稳定,按纯文本提交`);
       onEditSegment(seq, base.storedText, decision.newText);
     }
+  }
+
+  /** 段级提交回执(与 refined 的 markSaved 对称):宿主在 editSegment 成功后调用,
+      把 segBase 基线更新为刚落盘的 newText,使同一段在同一次焦点会话内的后续
+      提交(未失焦离开编辑器、页面 refresh 还没重建 segBase 之前)用上正确的
+      expectedText,不会撞后端 CAS。baselineMd 重建方式与 setSegments 里同段的
+      做法一致:建同型 transcript_segment 节点再 serializeBlock(fallbackToText:
+      true);理论上不会失败(该模式下恒返回 string),仅在 createChecked 本身
+      抛错(内容不合法)时退回 newText 本身并 console.warn。 */
+  export function markSegmentSaved(seq: number, newText: string) {
+    if (!ctxRef) return;
+    const ctx = ctxRef;
+    let baselineMd = newText;
+    try {
+      const schema = ctx.get(schemaCtx);
+      const node = schema.nodes.transcript_segment.createChecked({ seq }, parseInline(ctx, newText));
+      baselineMd = serializeBlock(ctx, node, true) ?? newText;
+    } catch (err) {
+      console.warn(`段 ${seq} markSegmentSaved 基线重建失败,退回纯文本`, err);
+      baselineMd = newText;
+    }
+    segBase.set(seq, { storedText: newText, baselineMd });
   }
 
   function currentSeq(): number | null {
