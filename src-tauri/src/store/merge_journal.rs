@@ -193,9 +193,12 @@ impl MergeJournal {
     }
 
     /// 触及 touched 中任一人物的**有效**条目全部失效。by=使其失效的合并 id(该
-    /// 合并被撤销时本条复活,样本副本保留);by=None 为永久性失效(改名/删除/新
-    /// 录制等),样本副本删掉省空间。失效标记写失败时 fail-closed 隔离整条日志:
-    /// 宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物数据。
+    /// 合并被撤销时本条复活);by=None 为永久性失效(改名/删除/新录制等),不可
+    /// 复活。两种失效都**保留**样本副本:失效条目一旦不能撤销,回执卡上「合并
+    /// 时的原声」就是唯一还能核对的东西,最不该在这时候删掉——空间由 JOURNAL_CAP
+    /// 上限与确认/淘汰时随目录一并清理兜底。失效标记写失败时 fail-closed 隔离
+    /// 整条日志:宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物
+    /// 数据。
     pub fn invalidate(&self, touched: &[&str], reason: &str, by: Option<&str>) {
         for mut e in self.entries() {
             if e.invalid_reason.is_some() {
@@ -220,15 +223,11 @@ impl MergeJournal {
                 }
                 continue;
             }
-            if by.is_none() {
-                if let Some(d) = self.entry_dir(&e.id) {
-                    let _ = std::fs::remove_dir_all(d.join("samples"));
-                }
-            }
         }
     }
 
-    /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本删除。
+    /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本保留(同
+    /// invalidate 文档)。
     pub fn invalidate_all(&self, reason: &str) {
         let ids: Vec<String> = self
             .entries()
@@ -276,8 +275,9 @@ impl MergeJournal {
         }
     }
 
-    /// 某侧(loser/winner)合并前的样本快照副本路径,按槽位序。条目不存在/已被
-    /// 永久失效清理/该侧无样本 → 空(回执卡隐藏该试听行)。
+    /// 某侧(loser/winner)合并前的样本快照副本路径,按槽位序。条目不存在/该侧
+    /// 无样本 → 空(回执卡隐藏该试听行)。失效条目(无论 by=Some/None)的副本
+    /// 保留,直至条目被确认/撤销/淘汰随目录一并清理。
     pub fn sample_copies(&self, id: &str, side: &str) -> Vec<PathBuf> {
         let Some(dir) = self.samples_dir(id, side) else { return vec![] };
         let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_by_merge_keeps_samples_permanent_op_deletes_them() {
+    fn invalidate_keeps_sample_copies_regardless_of_cause() {
         let tmp = tempfile::tempdir().unwrap();
         let j = MergeJournal::new(tmp.path().to_path_buf());
         let vpdir = tmp.path().join("voiceprints");
@@ -486,12 +486,13 @@ mod tests {
         j.append(&entry("m-P1", "t1", "P1", "P9"), &[s1], &[]).unwrap();
         j.append(&entry("m-P2", "t2", "P2", "P9"), &[s2], &[]).unwrap();
 
-        // 由另一次合并失效:可复活,样本副本必须保留
+        // 由另一次合并失效(可复活):样本副本保留
         j.invalidate(&["P1"], "相关人物随后又被合并", Some("m-X"));
         assert!(tmp.path().join("merge_journal/m-P1/samples/loser/P1.wav").exists());
-        // 永久性操作失效(by=None):不可复活,样本副本删掉省空间
+        // 永久性失效(by=None,不可复活):样本副本同样保留——回执卡此时唯一能
+        // 核对的就是这份快照,不该删。
         j.invalidate(&["P2"], "此人随后被改名", None);
-        assert!(!tmp.path().join("merge_journal/m-P2/samples").exists());
+        assert!(tmp.path().join("merge_journal/m-P2/samples/loser/P2.wav").exists());
     }
 
     #[test]
@@ -517,9 +518,9 @@ mod tests {
         j.append(&entry("m-P1", "t1", "P1", "P2"), &[ls], &[]).unwrap();
         assert_eq!(j.loser_sample_copies("m-P1").len(), 1);
         assert!(j.loser_sample_copies("../evil").is_empty());
-        // 永久性失效清理样本副本后为空
+        // 永久性失效后样本副本仍保留(唯一可核对的快照)
         j.invalidate(&["P1"], "此人随后被改名", None);
-        assert!(j.loser_sample_copies("m-P1").is_empty());
+        assert_eq!(j.loser_sample_copies("m-P1").len(), 1);
     }
 
     #[test]

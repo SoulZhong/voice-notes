@@ -328,6 +328,9 @@
                 <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id)}>撤销</button>
               {/if}
             </div>
+            {#if r.invalid_reason}
+              <p class="hint">不能撤销时:先听「合并时的原声」核对;确认并错也不必慌——后续录制会把不同的声音重新分开建档,不会将错就错。</p>
+            {/if}
           </section>
         {:else if item.kind === "suggestion"}
           {@const s = item.suggestion}
