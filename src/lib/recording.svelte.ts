@@ -159,6 +159,8 @@ export const recording = {
         partialSystem = "";
         storageDegraded = false;
         statusVersion++;
+        // 停止入库可能新建/更新人物与样本:人物简表与整理收件箱都要重算。
+        peopleVersion++;
         if (e.state === "stopped" && e.note_id) {
           goto(`/notes/${e.note_id}`);
         }
