@@ -719,6 +719,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(),
                 name: None,

@@ -2617,6 +2617,26 @@ fn assign_refined_person(
     store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())
 }
 
+/// 笔记页 WYSIWYG 整篇保存精修稿。守卫与 rename_refined_speaker 同套:Aing 中拒绝
+/// (管线随后整写会吞掉编辑),录制中拒绝;revision 乐观并发在 store 层校验。
+#[tauri::command]
+fn save_refined(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    revision: u64,
+    paragraphs: Vec<store::ParagraphPayload>,
+) -> Result<u64, String> {
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err("该笔记正在 Aing 中，稍后再存".into());
+    }
+    reject_if_active(&state, &note_id)?;
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::save_refined_paragraphs(&root.join(&note_id), revision, &paragraphs)
+        .map_err(|e| e.to_string())
+}
+
 /// 笔记音频轨道信息(详情页播放器用)。**纯读**:陈旧 WAV 头(硬崩残留)的修复
 /// 统一放在应用启动扫描(setup)与续录 open——此前放在这里做过"非活动才修",但
 /// stop 排干窗口 / 开录入槽窗口里 session 槽都是空的,check-then-act 挡不住与
@@ -4391,6 +4411,7 @@ pub fn run() {
             get_note,
             refine_note,
             get_refined,
+            save_refined,
             preview_relation_backfill,
             start_relation_backfill,
             cancel_relation_backfill,
