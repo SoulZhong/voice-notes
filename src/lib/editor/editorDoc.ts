@@ -89,6 +89,30 @@ export function savedBaseline(sent: ParagraphPayload[]): Map<number, string> {
   return new Map(sent.map((p, i) => [i, p.text] as const));
 }
 
+/** 把首个保存请求期间捕获的后续载荷,重基到首个请求已经写成的新 revision/段序。
+    用于页面切换或组件销毁时的 detached drain:此时不能等组件的 idle timer,
+    也不能拿旧 revision 并发写。 */
+export function rebaseQueuedRefinedSave(
+  revision: number,
+  sent: ParagraphPayload[],
+  queued: ParagraphPayload[],
+): { revision: number; paragraphs: ParagraphPayload[] } {
+  const remap = savedIndexRemap(sent);
+  return {
+    revision,
+    paragraphs: queued.map((p) => {
+      if (p.orig_index === null) return { ...p, dirty: true };
+      const next = remap.get(p.orig_index);
+      if (next === undefined) return { orig_index: null, text: p.text, dirty: true };
+      return {
+        orig_index: next,
+        text: p.text,
+        dirty: p.text.trim() !== sent[next]?.text.trim(),
+      };
+    }),
+  };
+}
+
 /** Enter 分段/复制粘贴会复制块属性 → 同一 origIndex 出现多次。保首个,其余视为
     用户新插入块(origIndex=null,调用方同时清 speaker 属性)。 */
 export function normalizeOrigIndices(indices: (number | null)[]): (number | null)[] {

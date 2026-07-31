@@ -40,6 +40,7 @@
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
+  import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -147,6 +148,13 @@
   // 当前编辑器里加载的是哪个笔记的精修稿(而非 route 的 id):id 切换时 flush 必须
   // 落到*旧*笔记,不能用已经翻新的 id——否则会把上一篇的编辑存进新笔记。
   let loadedRefinedId: string | null = null;
+  type RefinedSaveSnapshot = { revision: number; paragraphs: ParagraphPayload[] };
+  type ActiveRefinedSave = { payload: RefinedSaveSnapshot; done: Promise<number> };
+  // lifecycle drain 活在页面层,不依赖即将销毁的 MarkdownEditor 实例。每篇笔记至多
+  // 保留一份最新快照;active 完成后按其新 revision/段序重基并串行落盘。
+  const activeRefinedSaves = new Map<string, ActiveRefinedSave>();
+  const pendingRefinedDrains = new Map<string, RefinedSaveSnapshot>();
+  const runningRefinedDrains = new Set<string>();
   // 身份闸门:标记"编辑器已同步到的那份 refined 对象"+"是哪个编辑器实例同步的"。
   // 保存成功后 refined 换新对象身份(revision 更新)必然触发下面的同步 effect;若
   // 不闸,失焦保存场景 hasFocus() 为 false,effect 会用*旧*的段落快照把编辑器里
@@ -162,6 +170,55 @@
   let syncedRefined: RefinedDoc | null = null;
   let syncedEditor: unknown = null;
 
+  function queueRefinedDrain(payload: RefinedSaveSnapshot) {
+    const targetId = loadedRefinedId ?? id;
+    pendingRefinedDrains.set(targetId, payload);
+    if (runningRefinedDrains.has(targetId)) return;
+    const active = activeRefinedSaves.get(targetId) ?? null;
+    void drainRefinedAfterActive(targetId, active);
+  }
+
+  async function drainRefinedAfterActive(targetId: string, initial: ActiveRefinedSave | null) {
+    runningRefinedDrains.add(targetId);
+    let revision: number | null = null;
+    let previous: ParagraphPayload[] | null = null;
+    try {
+      if (initial) {
+        revision = await initial.done;
+        previous = initial.payload.paragraphs;
+      }
+      while (pendingRefinedDrains.has(targetId)) {
+        const queued = pendingRefinedDrains.get(targetId)!;
+        pendingRefinedDrains.delete(targetId);
+        const next =
+          revision !== null && previous
+            ? rebaseQueuedRefinedSave(revision, previous, queued.paragraphs)
+            : queued;
+        revision = await saveRefined(targetId, next.revision, next.paragraphs);
+        previous = next.paragraphs;
+      }
+      // 仍停留在本篇且没有继续输入时,把 detached 保存的最终盘上状态同步回来。
+      if (targetId === id && !refinedEditor?.hasFocus()) {
+        const latest = await getRefined(targetId);
+        if (latest && targetId === id && !refinedEditor?.hasFocus()) {
+          refined = latest;
+          syncedRefined = latest;
+          syncedEditor = refinedEditor;
+          refinedEditor?.setRefined(latest);
+        }
+      }
+    } catch (err) {
+      const msg = `精修稿离开页面前排空失败: ${err}`;
+      if (targetId === id && msg !== refinedSaveErr) refinedSaveErr = msg;
+    } finally {
+      runningRefinedDrains.delete(targetId);
+      // 排空结束的极窄窗口里可能又收到一份更新快照,继续下一轮而不丢它。
+      if (pendingRefinedDrains.has(targetId)) {
+        void drainRefinedAfterActive(targetId, activeRefinedSaves.get(targetId) ?? null);
+      }
+    }
+  }
+
   function refinedBadge(attrs: BadgeAttrs): { label: string; bg: string; ink: string } {
     const sid = attrs.speaker;
     return {
@@ -173,8 +230,11 @@
 
   async function doSaveRefined(payload: { revision: number; paragraphs: ParagraphPayload[] }) {
     const targetId = loadedRefinedId ?? id;
+    const done = saveRefined(targetId, payload.revision, payload.paragraphs);
+    const active = { payload, done };
+    activeRefinedSaves.set(targetId, active);
     try {
-      const newRev = await saveRefined(targetId, payload.revision, payload.paragraphs);
+      const newRev = await done;
       // await 期间编辑器可能已经切到别的笔记(loadedRefinedId 变了):这份回执打在
       // *旧*笔记上,组件自己的 setRefined(切笔记时会重新整份载入)早就复位过
       // saveInFlight,不需要再补 markSaveFailed——直接丢弃回执即可。
@@ -237,6 +297,8 @@
           /* 重载失败保持错误横幅 */
         }
       }
+    } finally {
+      if (activeRefinedSaves.get(targetId) === active) activeRefinedSaves.delete(targetId);
     }
   }
 
@@ -287,7 +349,7 @@
   // 离开页面/组件销毁前把未保存的精修稿编辑冲出去(与段编辑失焦保存同哲学:
   // 不因为切走了就悄悄丢用户刚打的字)。
   onDestroy(() => {
-    refinedEditor?.flushRefined();
+    refinedEditor?.flushRefined(true);
     cancelHideEntityPop();
   });
 
@@ -448,7 +510,7 @@
     void id;
     // 落盘先于复位:flushRefined 内部用 loadedRefinedId(不是下面即将复位的
     // refined/id)找旧笔记,必须在清空编辑态之前调用。
-    refinedEditor?.flushRefined();
+    refinedEditor?.flushRefined(true);
     note = null;
     error = "";
     editing = false;
@@ -1066,6 +1128,7 @@
             editable={canEdit}
             speakerBadge={refinedBadge}
             onSaveRefined={doSaveRefined}
+            onDrainRefined={queueRefinedDrain}
             onBadgeClick={(attrs, rect) => (refinedBadgePop = { attrs, rect })}
             onPlayFrom={(ms) => playFrom({ start_ms: ms })}
           />

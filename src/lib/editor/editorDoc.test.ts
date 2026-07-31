@@ -3,6 +3,7 @@ import type { RefinedDoc } from "../notes";
 import {
   isBlockTextEmpty,
   normalizeOrigIndices,
+  rebaseQueuedRefinedSave,
   refinedSavePayload,
   refinedToBlocks,
   sameSegmentSkeleton,
@@ -155,6 +156,40 @@ describe("savedIndexRemap / savedBaseline", () => {
       { orig_index: 1, text: "第一段窗口内又改了", dirty: true },
       { orig_index: 2, text: "改过的第三段", dirty: false },
     ]);
+  });
+});
+
+describe("rebaseQueuedRefinedSave", () => {
+  const sent = [
+    { orig_index: null, text: "首轮新增标题", dirty: true },
+    { orig_index: 0, text: "第一段首轮内容", dirty: true },
+    { orig_index: 2, text: "第三段", dirty: false },
+  ];
+
+  it("把保存期间的后续编辑重基到首轮保存返回的新 revision 和段序", () => {
+    expect(
+      rebaseQueuedRefinedSave(8, sent, [
+        { orig_index: null, text: "首轮新增标题", dirty: true },
+        { orig_index: 0, text: "第一段离开前又改了", dirty: true },
+        { orig_index: 2, text: "第三段", dirty: false },
+      ]),
+    ).toEqual({
+      revision: 8,
+      paragraphs: [
+        { orig_index: null, text: "首轮新增标题", dirty: true },
+        { orig_index: 1, text: "第一段离开前又改了", dirty: true },
+        { orig_index: 2, text: "第三段", dirty: false },
+      ],
+    });
+  });
+
+  it("首轮删除后又重新输入的旧段按新段保存", () => {
+    expect(
+      rebaseQueuedRefinedSave(3, sent, [{ orig_index: 1, text: "第二段重新输入", dirty: true }]),
+    ).toEqual({
+      revision: 3,
+      paragraphs: [{ orig_index: null, text: "第二段重新输入", dirty: true }],
+    });
   });
 });
 

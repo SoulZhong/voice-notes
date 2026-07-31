@@ -57,6 +57,7 @@
     mode,
     editable = true,
     onSaveRefined,
+    onDrainRefined,
     onEditSegment,
     onBadgeClick,
     onPlayFrom,
@@ -66,6 +67,9 @@
     mode: "refined" | "segments";
     editable?: boolean;
     onSaveRefined?: (payload: { revision: number; paragraphs: ParagraphPayload[] }) => void;
+    /** 页面切换/组件销毁时若已有保存请求在途,把离开前的最新快照交给宿主串行
+        排到该请求之后。普通 idle 保存仍走 onSaveRefined。 */
+    onDrainRefined?: (payload: { revision: number; paragraphs: ParagraphPayload[] }) => void;
     onEditSegment?: (seq: number, expectedText: string, newText: string) => void;
     onBadgeClick?: (attrs: BadgeAttrs, rect: DOMRect) => void;
     onPlayFrom?: (startMs: number) => void;
@@ -105,6 +109,8 @@
   // 发送未落定即作废:markSaveFailed / setRefined 都会清空。
   let sentParagraphs: ParagraphPayload[] | null = null;
   let sentFingerprint = "";
+  // route effect 与 onDestroy 可能连续要求 detached drain;同一快照只交给宿主一次。
+  let drainedFingerprint = "";
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   const IDLE_SAVE_MS = 2000;
   // ctxRef 尚未就绪(onMount 的 Editor.make() 还没 resolve)时到达的 setRefined
@@ -182,6 +188,7 @@
     // 整份重载后旧的在途载荷不再有任何意义(它的 origIndex 指向旧布局)。
     sentParagraphs = null;
     sentFingerprint = "";
+    drainedFingerprint = "";
     const view = ctx.get(editorViewCtx);
     const schema = ctx.get(schemaCtx);
     const paras = refinedToBlocks(doc).map((b) => {
@@ -246,12 +253,28 @@
     return failed ? null : blocks;
   }
 
-  export function flushRefined() {
+  export function flushRefined(detachIfBusy = false) {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
     if (!loadedDoc || !onSaveRefined) return;
     if (saveInFlight) {
-      // 上一次保存还没等到 markSaved 回执,别再并发发一次;等它落定后再算。
+      // 普通自动保存仍等待上一趟落定。页面切换/销毁不能依赖稍后会被清掉的
+      // timer:此时把离开前的完整快照交给宿主,由宿主按新 revision 串行排空。
+      if (detachIfBusy && onDrainRefined) {
+        const blocks = collectBlocks();
+        if (blocks === null) {
+          console.warn("精修稿序列化失败,离开页面前的排空已中止");
+          return;
+        }
+        const payload = refinedSavePayload(loadedDoc, blocks, baseline);
+        if (payload.paragraphs.length === 0) return;
+        const fingerprint = JSON.stringify(payload.paragraphs);
+        if (fingerprint !== sentFingerprint && fingerprint !== drainedFingerprint) {
+          drainedFingerprint = fingerprint;
+          onDrainRefined(payload);
+        }
+        return;
+      }
       scheduleIdleSave();
       return;
     }
@@ -280,6 +303,7 @@
     // 这份载荷没落盘:作废快照,免得后续某次 markSaved 拿它当「盘上现状」重排。
     sentParagraphs = null;
     sentFingerprint = "";
+    drainedFingerprint = "";
     scheduleIdleSave();
   }
 
@@ -532,6 +556,7 @@
   }
 
   function scheduleIdleSave() {
+    if (destroyed) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => flushRefined(), IDLE_SAVE_MS);
   }
@@ -675,6 +700,9 @@
   });
 
   onDestroy(() => {
+    // 父页面的 onDestroy / id-effect 顺序不应决定数据安全。组件自身也在 editor
+    // 尚可序列化时做一次 lifecycle flush;drainedFingerprint 会与父调用去重。
+    if (mode === "refined") flushRefined(true);
     destroyed = true;
     if (idleTimer) clearTimeout(idleTimer);
     editor?.destroy();
