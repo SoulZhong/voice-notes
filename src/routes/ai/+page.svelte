@@ -783,8 +783,12 @@
               <span class="row-label mono">{t.name}</span>
               <span class="row-desc">{t.desc}</span>
             </div>
+            <!-- catalog 的 gate 是静态前置条件声明;control 一档按上方开关的实时值
+                 显示当前状态,否则开关打开后徽章不变,会被读成「开了也没生效」。 -->
             {#if t.gate === "app"}<span class="pill">需应用运行</span>
-            {:else if t.gate === "control"}<span class="pill warn">需允许控制</span>
+            {:else if t.gate === "control"}
+              {#if mcpAllowControl}<span class="pill">已允许控制</span>
+              {:else}<span class="pill warn">需允许控制</span>{/if}
             {/if}
           </div>
         {/each}
