@@ -3000,13 +3000,15 @@ fn cut_person_sample_from_notes(notes_root: &std::path::Path, person: &str) -> O
 
 /// merge_person 与 apply_confident_merges 共享的合并主体:落日志→合并→loser 无
 /// 样本时从笔记音频兜底截样(walk 同旧 merge_person),返回 journal id。不含录制
-/// 中检查与图谱重建(调用方各自处理/批量做)。
+/// 中检查与图谱重建(调用方各自处理/批量做)。`emb` 是调用方持有的惰性单例:样本超限
+/// 首次才加载声纹模型,同批后续条目复用同一实例(批量合并不再逐条秒级加载模型)。
 fn do_merge_person(
     app: &AppHandle,
     loser: &str,
     winner: &str,
     origin: &str,
     similarity: Option<f32>,
+    emb: &mut Option<diar::SherpaEmbedder>,
 ) -> Result<String, String> {
     let root = data_root(app).map_err(|e| e.to_string())?;
     let store = store::VoiceprintStore::new(root);
@@ -3014,17 +3016,12 @@ fn do_merge_person(
     let overflow = store.sample_paths_existing(loser).len()
         + store.sample_paths_existing(winner).len()
         > store::MAX_SAMPLES;
-    let mut emb = if overflow {
+    if overflow && emb.is_none() {
         match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}");
-                None
-            }
+            Ok(e) => *emb = Some(e),
+            Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
         }
-    } else {
-        None
-    };
+    }
     let now = chrono::Local::now().to_rfc3339();
     let journal_id = store
         .merge_journaled(
@@ -3065,7 +3062,8 @@ fn merge_person(
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能合并说话人".into());
     }
-    let journal_id = do_merge_person(&app, &loser, &winner, "manual", None)?;
+    let mut emb = None;
+    let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
     let root = data_root(&app).map_err(|e| e.to_string())?;
     queue_person_graph_rebuild(&app, root, "人物合并")?;
     Ok(journal_id)
@@ -3136,8 +3134,9 @@ fn apply_confident_merges(
     let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
     let mut applied = Vec::new();
     let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut emb = None;
     for s in autos {
-        match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity)) {
+        match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity), &mut emb) {
             Ok(jid) => {
                 merged.insert(s.loser.clone());
                 match journal.entry(&jid) {
