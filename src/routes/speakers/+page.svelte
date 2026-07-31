@@ -38,7 +38,7 @@
   <h1>会议搭子</h1>
   <p class="desc">
     录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,之后的录制会自动认出他并直接显示名字;
-    声纹足够相似的会自动归并,拿不准的进「整理收件箱」等你拍板。从左侧选择一个人查看详情、试听原声或管理。
+    声纹足够相似的会自动归并,拿不准的进「分析说话人」等你拍板。从左侧选择一个人查看详情、试听原声或管理。
   </p>
 
   {#if error}
@@ -71,7 +71,7 @@
     <section class="tidy">
       <div class="tidy-head">
         <div>
-          <div class="tidy-title">整理收件箱</div>
+          <div class="tidy-title">分析说话人</div>
           <div class="tidy-desc">
             {#if pending + receiptsN === 0}
               没有要整理的。
@@ -81,7 +81,7 @@
           </div>
         </div>
         {#if pending + receiptsN > 0}
-          <a class="tidy-go" href="/speakers/tidy">开始整理</a>
+          <a class="tidy-go" href="/speakers/tidy">开始分析</a>
         {/if}
       </div>
     </section>

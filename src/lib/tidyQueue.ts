@@ -1,4 +1,4 @@
-// 整理收件箱的队列纯逻辑:构建、跳过排序、键盘命令映射。
+// 整理收件箱的队列纯逻辑:构建队列本身。
 // UI 无关、可单测;/speakers/tidy 页面与侧栏徽标共同消费。
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "$lib/people";
 
@@ -48,16 +48,6 @@ export function buildTidyQueue(
   return items.filter((i) => !dismissed.has(tidyItemKey(i)));
 }
 
-/** 跳过=挪队尾:未跳过的保持原序,跳过的按跳过先后排最后。 */
-export function orderWithSkips(items: TidyItem[], skippedKeys: string[]): TidyItem[] {
-  const rank = new Map(skippedKeys.map((k, i) => [k, i]));
-  const kept = items.filter((i) => !rank.has(tidyItemKey(i)));
-  const skipped = items
-    .filter((i) => rank.has(tidyItemKey(i)))
-    .sort((a, b) => rank.get(tidyItemKey(a))! - rank.get(tidyItemKey(b))!);
-  return [...kept, ...skipped];
-}
-
 /** 同名组按列表顺序并入 winner。每次成功后立刻发布对应 journal id,而不是等整组
     完成:后续某一条失败时,调用方仍能展示最近一次已落盘合并的撤销入口。 */
 export async function mergeDuplicatePeople(
@@ -71,19 +61,4 @@ export async function mergeDuplicatePeople(
     const journalId = await merge(person.id, winner);
     onMerged(journalId);
   }
-}
-
-/** 键盘命令:Enter=主动作,X=忽略/保留(回执卡除外——撤销只走点击防误触),
-    S=跳过,数字=试听(双栏卡 1/2=左右方——回执卡 1=被并入方快照副本,2=winner 最新;
-    同名组卡 1-9=第 n 条;nosample 卡无试听)。null=此卡无该命令。 */
-export type TidyCommand = "primary" | "dismiss" | "skip" | { play: number };
-export function keyCommand(key: string, kind: TidyItem["kind"]): TidyCommand | null {
-  if (key === "Enter") return "primary";
-  if (key === "x" || key === "X") return kind === "receipt" ? null : "dismiss";
-  if (key === "s" || key === "S") return "skip";
-  if (kind === "nosample") return null; // 无样本卡没有可试听的
-  const digitMax = kind === "dup" ? 9 : 2;
-  const n = Number(key);
-  if (Number.isInteger(n) && n >= 1 && n <= digitMax) return { play: n - 1 };
-  return null;
 }

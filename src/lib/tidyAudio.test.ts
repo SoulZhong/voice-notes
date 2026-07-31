@@ -49,4 +49,23 @@ describe("createAudition", () => {
     last!.onended?.();
     expect(a.key).toBeNull();
   });
+
+  it("play() 拒绝时触发 onError,不静默吞掉", async () => {
+    const errors: string[] = [];
+    const p: PlayerLike = {
+      play: () => Promise.reject(new Error("NotAllowedError")),
+      pause: vi.fn(),
+      onended: null,
+    };
+    const a = createAudition(
+      () => p,
+      () => {},
+      (msg) => errors.push(msg),
+    );
+    a.toggle("k1", "/a.wav");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errors).toEqual(["Error: NotAllowedError"]);
+    expect(a.key).toBeNull();
+  });
 });

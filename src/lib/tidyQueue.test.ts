@@ -1,12 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildTidyQueue,
-  keyCommand,
-  mergeDuplicatePeople,
-  orderWithSkips,
-  tidyItemKey,
-  type TidyItem,
-} from "./tidyQueue";
+import { buildTidyQueue, mergeDuplicatePeople, tidyItemKey, type TidyItem } from "./tidyQueue";
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
@@ -79,18 +72,6 @@ describe("buildTidyQueue", () => {
   });
 });
 
-describe("orderWithSkips", () => {
-  it("跳过的挪到队尾并保持跳过先后序", () => {
-    const items = buildTidyQueue(
-      [person("P4", "", []), person("P5", "", []), person("P6", "", [])],
-      [],
-      [],
-    );
-    const ordered = orderWithSkips(items, ["n:P4", "n:P5"]);
-    expect(ordered.map(tidyItemKey)).toEqual(["n:P6", "n:P4", "n:P5"]);
-  });
-});
-
 describe("mergeDuplicatePeople", () => {
   it("后续合并失败时仍发布最近一次成功合并的撤销 id", async () => {
     const published: string[] = [];
@@ -108,28 +89,5 @@ describe("mergeDuplicatePeople", () => {
       ),
     ).rejects.toThrow("第二条失败");
     expect(published).toEqual(["m-P2"]);
-  });
-});
-
-describe("keyCommand", () => {
-  it("Enter=主动作,S=跳过,数字=试听", () => {
-    expect(keyCommand("Enter", "suggestion")).toBe("primary");
-    expect(keyCommand("s", "receipt")).toBe("skip");
-    expect(keyCommand("1", "suggestion")).toEqual({ play: 0 });
-    expect(keyCommand("2", "receipt")).toEqual({ play: 1 });
-  });
-  it("X 忽略/保留,但回执卡无 X(撤销只走点击,防误触)", () => {
-    expect(keyCommand("x", "suggestion")).toBe("dismiss");
-    expect(keyCommand("X", "nosample")).toBe("dismiss");
-    expect(keyCommand("x", "receipt")).toBeNull();
-  });
-  it("数字键上限:双栏卡 1-2,同名组卡 1-9", () => {
-    expect(keyCommand("3", "suggestion")).toBeNull();
-    expect(keyCommand("9", "dup")).toEqual({ play: 8 });
-    expect(keyCommand("0", "dup")).toBeNull();
-  });
-  it("无样本卡数字键返回 null(没有可试听的)", () => {
-    expect(keyCommand("1", "nosample")).toBeNull();
-    expect(keyCommand("2", "nosample")).toBeNull();
   });
 });

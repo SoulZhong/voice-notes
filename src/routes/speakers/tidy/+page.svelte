@@ -15,35 +15,26 @@
   } from "$lib/people";
   import { formatDate, formatDuration, speakerInk, type NoteSummary } from "$lib/notes";
   import { isStrong, tidy } from "$lib/tidy.svelte";
-  import {
-    buildTidyQueue,
-    keyCommand,
-    mergeDuplicatePeople,
-    orderWithSkips,
-    tidyItemKey,
-    type TidyItem,
-  } from "$lib/tidyQueue";
-  import { createAudition } from "$lib/tidyAudio";
+  import { buildTidyQueue, mergeDuplicatePeople, tidyItemKey, type TidyItem } from "$lib/tidyQueue";
+  import { createAudition, type PlayerLike } from "$lib/tidyAudio";
   import { recording } from "$lib/recording.svelte";
 
-  // ── 数据:队列由共享 store + 人物表现算;处理完的项随重算自然消失,始终看队首 ──
+  // ── 数据:队列由共享 store + 人物表现算,全量渲染;处理完的项随重算自然从
+  // 列表消失。 ──
   let people = $state<PersonSummary[]>([]);
   let error = $state("");
   let busy = $state(false);
-  let skipped = $state<string[]>([]);
-  let done = $state(0);
   /** 手动合并后的页内撤销条(最近一次;同名组连并多条时只能撤最后一条——撤销后
       其前一条虽在合并日志里复活,但 manual 条目不进回执队列,UI 上无法继续撤;
       同名组卡会重新出现,留给用户对复活的那一对重新拍板)。 */
   let lastManual = $state<{ journalId: string; label: string } | null>(null);
+  /** 一键清理无样本条目的二段确认:单一状态,多张 nosample 卡共享(简单为先)。 */
   let confirmClean = $state(false);
 
   const personById = $derived(new Map(people.map((p) => [p.id, p])));
-  const queue = $derived(
-    orderWithSkips(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed), skipped),
-  );
-  const current = $derived(queue[0] ?? null);
-  const total = $derived(done + queue.length);
+  const queue = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed));
+  const pendingN = $derived(queue.filter((i) => i.kind !== "receipt").length);
+  const receiptsN = $derived(queue.filter((i) => i.kind === "receipt").length);
   const live = $derived(recording.isLive);
 
   const plabel = (id: string, name: string) => name || `说话人 ${id.replace(/^P/, "")}`;
@@ -58,48 +49,29 @@
       notesCache[pid] = [];
     }
   }
-  /** 当前卡涉及的人物(回执卡的 loser 已并入 winner,看 winner 即可)。 */
-  const currentIds = $derived.by(() => {
-    if (!current) return [] as string[];
-    if (current.kind === "suggestion") return [current.suggestion.loser, current.suggestion.winner];
-    if (current.kind === "receipt") return [current.receipt.winner];
-    if (current.kind === "dup") return current.people.map((p) => p.id);
-    return [current.person.id];
-  });
+  /** 某条目涉及的人物(回执卡的 loser 已并入 winner,看 winner 即可)。 */
+  function itemIds(item: TidyItem): string[] {
+    if (item.kind === "suggestion") return [item.suggestion.loser, item.suggestion.winner];
+    if (item.kind === "receipt") return [item.receipt.winner];
+    if (item.kind === "dup") return item.people.map((p) => p.id);
+    return [item.person.id];
+  }
+  // 首屏可见范围懒加载:queue 前 12 张卡涉及的人物才主动拉会议上下文,滚动到
+  // 深处的卡按需可再点进详情页看。
   $effect(() => {
-    for (const id of currentIds) void loadNotes(id);
+    for (const item of queue.slice(0, 12)) {
+      for (const id of itemIds(item)) void loadNotes(id);
+    }
   });
 
-  // ── 试听:单实例互斥,切卡/离开即停 ──
+  // ── 试听:单实例互斥,离开页面即停(列表页同屏多卡,切卡不再意味着换焦点)──
   let playingKey = $state<string | null>(null);
   const audition = createAudition(
-    (src) => {
-      const audio = new Audio(convertFileSrc(src));
-      return {
-        play: () => audio.play(),
-        pause: () => audio.pause(),
-        set onended(cb: (() => void) | null) {
-          audio.onended = cb ? () => cb() : null;
-        },
-        get onended() {
-          return null;
-        },
-      } as any;
-    },
+    (src) => new Audio(convertFileSrc(src)) as unknown as PlayerLike,
     (k) => (playingKey = k),
+    (msg) => (error = `试听失败:${msg}`),
   );
-  $effect(() => {
-    void current;
-    audition.stop();
-  });
   $effect(() => () => audition.stop());
-
-  /** 播某人最新一份样本(键盘数字键)。无样本静默不动。 */
-  function playLatest(pid: string) {
-    const p = personById.get(pid);
-    const path = p?.sample_paths[p.sample_paths.length - 1];
-    if (path) audition.toggle(path, path);
-  }
 
   // ── 同名组主条目(可切换,默认最近活跃=组首) ──
   let dupPrimary = $state<Record<string, string>>({});
@@ -131,7 +103,6 @@
     confirmClean = false;
     try {
       await fn();
-      done++;
       recording.bumpPeople();
       await tidy.refresh();
       await refreshPeople();
@@ -152,7 +123,6 @@
   }
   function doIgnoreSuggestion(s: PersonMergeSuggestion) {
     tidy.ignore(s);
-    done++;
   }
   async function doMergeDup(name: string, g: PersonSummary[]) {
     await act(async () => {
@@ -178,10 +148,6 @@
   }
   function doDismiss(item: TidyItem) {
     tidy.dismiss(tidyItemKey(item));
-    done++;
-  }
-  function doSkip() {
-    if (current) skipped = [...skipped, tidyItemKey(current)];
   }
   async function doAck(r: MergeReceipt) {
     await act(async () => {
@@ -195,58 +161,23 @@
     });
   }
 
-  // ── 键盘:Enter 主动作 / X 忽略保留 / S 跳过 / 1-9 试听 / Esc 返回 ──
+  // ── 键盘:仅 Esc 返回概览(全量列表页无「当前项」概念,主动作/忽略均走点击)──
   function onKeydown(e: KeyboardEvent) {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === "Escape") {
       e.preventDefault();
       goto("/speakers");
-      return;
-    }
-    if (!current || busy) return;
-    const cmd = keyCommand(e.key, current.kind);
-    if (!cmd) return;
-    e.preventDefault();
-    const it = current;
-    if (typeof cmd === "object") {
-      if (it.kind === "receipt") {
-        const path = it.receipt.loser_sample_paths[it.receipt.loser_sample_paths.length - 1];
-        if (cmd.play === 0) {
-          if (path) audition.toggle(path, path);
-        } else {
-          playLatest(it.receipt.winner);
-        }
-      } else {
-        playLatest(currentIds[cmd.play] ?? "");
-      }
-      return;
-    }
-    if (cmd === "skip") {
-      doSkip();
-      return;
-    }
-    if (live) return; // 录制中只许试听/跳过
-    if (cmd === "primary") {
-      if (it.kind === "suggestion") void doMergeSuggestion(it.suggestion);
-      else if (it.kind === "dup") void doMergeDup(it.name, it.people);
-      else if (it.kind === "nosample") void doDeleteNoSample(it.person);
-      else void doAck(it.receipt);
-    } else if (cmd === "dismiss") {
-      if (it.kind === "suggestion") doIgnoreSuggestion(it.suggestion);
-      else if (it.kind !== "receipt") doDismiss(it);
     }
   }
 </script>
 
 <svelte:window onkeydown={onKeydown} />
 
-{#snippet personPane(pid: string, name: string, digit: number | null)}
+{#snippet personPane(pid: string, name: string)}
   {@const p = personById.get(pid)}
   <div class="pane">
     <div class="pane-head">
       <span class="dot" style="background: {speakerInk(pid, 'mic')}"></span>
       <a class="pname" href="/speakers/{pid}">{plabel(pid, name)}</a>
-      {#if digit !== null}<kbd class="kbd">{digit}</kbd>{/if}
     </div>
     {#if p}
       <div class="pane-meta">
@@ -283,9 +214,9 @@
 <main class="container">
   <header class="head">
     <a class="back" href="/speakers">← 概览</a>
-    <h1>整理收件箱</h1>
-    {#if total > 0 && queue.length > 0}
-      <span class="progress">第 {done + 1} / {total} 件</span>
+    <h1>分析说话人</h1>
+    {#if queue.length > 0}
+      <span class="summary">{pendingN} 件待处理{#if receiptsN > 0} · {receiptsN} 条已自动归并{/if}</span>
     {/if}
   </header>
 
@@ -303,7 +234,7 @@
     </div>
   {/if}
 
-  {#if !current}
+  {#if queue.length === 0}
     {#if tidy.loading}
       <div class="empty">
         <p class="hint">正在比对声纹…</p>
@@ -315,140 +246,142 @@
         <a class="mini as-link" href="/speakers">返回概览</a>
       </div>
     {/if}
-  {:else if current.kind === "receipt"}
-    {@const r = current.receipt}
-    <section class="card">
-      <div class="card-tag">已自动归并</div>
-      <div class="card-title">
-        {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
-        {#if r.similarity !== null}
-          <span class="sim strong">相似度 {Math.round(r.similarity * 100)}%</span>
-        {/if}
-      </div>
-      <div class="panes">
-        {@render personPane(r.winner, r.winner_name, 2)}
-      </div>
-      {#if r.loser_sample_paths.length > 0}
-        <div class="loser-listen">
-          <span class="loser-label">被并入的声音({plabel(r.loser, r.loser_name)})</span>
-          {#each r.loser_sample_paths as path, i (path)}
-            <button
-              class="chip"
-              class:playing={playingKey === path}
-              title={playingKey === path ? "停止" : "试听合并前的原声"}
-              onclick={() => audition.toggle(path, path)}
-            >
-              {playingKey === path ? "◼" : "▶"} 样本 {i + 1}
-            </button>
-          {/each}
-          <kbd class="kbd">1</kbd>
-        </div>
-      {/if}
-      <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
-      <div class="acts">
-        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好 <kbd class="kbd">⏎</kbd></button>
-        {#if r.invalid_reason}
-          <button class="mini" disabled title={r.invalid_reason}>撤销(不可用)</button>
-          <span class="hint">{r.invalid_reason}</span>
-        {:else}
-          <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id)}>撤销</button>
-        {/if}
-        <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
-      </div>
-    </section>
-  {:else if current.kind === "suggestion"}
-    {@const s = current.suggestion}
-    <section class="card">
-      <div class="card-tag">归属建议</div>
-      <div class="card-title">
-        这两条像同一个人吗?
-        <span class="sim" class:strong={isStrong(s)}>
-          相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
-        </span>
-      </div>
-      <div class="panes">
-        {@render personPane(s.loser, s.loser_name, 1)}
-        <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
-        </svg>
-        {@render personPane(s.winner, s.winner_name, 2)}
-      </div>
-      <p class="hint">两边各听一段原声(数字键 1/2 播最新样本),确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
-      <div class="acts">
-        <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s)}>合并 <kbd class="kbd">⏎</kbd></button>
-        <button class="mini" disabled={busy || live} onclick={() => doIgnoreSuggestion(s)}>忽略 <kbd class="kbd">X</kbd></button>
-        <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
-      </div>
-    </section>
-  {:else if current.kind === "dup"}
-    {@const g = current.people}
-    {@const primary = dupPrimaryId(current.name, g)}
-    <section class="card">
-      <div class="card-tag">同名重复</div>
-      <div class="card-title">「{current.name}」有 {g.length} 条,多半是同一个人被拆开了</div>
-      <div class="panes wrap">
-        {#each g as p, i (p.id)}
-          <div class="dup-item" class:primary={p.id === primary}>
-            {@render personPane(p.id, p.name, i < 9 ? i + 1 : null)}
-            <label class="pick">
-              <input
-                type="radio"
-                name="dup-primary"
-                checked={p.id === primary}
-                onchange={() => (dupPrimary = { ...dupPrimary, [current.name]: p.id })}
-              />
-              作为主条目
-            </label>
-          </div>
-        {/each}
-      </div>
-      <p class="hint">其余条目将并入主条目(默认最近活跃的);数字键逐条试听核对。</p>
-      <div class="acts">
-        <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(current.name, g)}>
-          全部并入主条目 <kbd class="kbd">⏎</kbd>
-        </button>
-        <button class="mini" disabled={busy || live} onclick={() => doDismiss(current)}>忽略 <kbd class="kbd">X</kbd></button>
-        <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
-      </div>
-    </section>
   {:else}
-    {@const p = current.person}
-    <section class="card">
-      <div class="card-tag">无样本条目</div>
-      <div class="card-title">{plabel(p.id, p.name)}——没有原声可核对</div>
-      <div class="panes">
-        {@render personPane(p.id, p.name, null)}
-      </div>
-      <p class="hint warn-text">
-        删除后历史笔记中这个说话人恢复显示为编号,不可恢复。认不出是谁就删,拿不准就保留。
-      </p>
-      <div class="acts">
-        <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>删除 <kbd class="kbd">⏎</kbd></button>
-        <button class="mini" disabled={busy || live} onclick={() => doDismiss(current)}>保留 <kbd class="kbd">X</kbd></button>
-        <button class="mini plain" onclick={doSkip}>跳过 <kbd class="kbd">S</kbd></button>
-        {#if queue.filter((i) => i.kind === "nosample").length > 1}
-          <span class="spacer"></span>
-          {#if confirmClean}
-            <span class="warn-text">共 {queue.filter((i) => i.kind === "nosample").length} 条,删除不可恢复。</span>
-            <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>确认清理</button>
-            <button class="mini plain" onclick={() => (confirmClean = false)}>取消</button>
-          {:else}
-            <button class="mini plain" disabled={busy || live} onclick={() => (confirmClean = true)}>
-              剩余 {queue.filter((i) => i.kind === "nosample").length} 条无样本条目一键清理
-            </button>
-          {/if}
+    <div class="stack">
+      {#each queue as item (tidyItemKey(item))}
+        {#if item.kind === "receipt"}
+          {@const r = item.receipt}
+          <section class="card">
+            <div class="card-tag">已自动归并</div>
+            <div class="card-title">
+              {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
+              {#if r.similarity !== null}
+                <span class="sim strong">相似度 {Math.round(r.similarity * 100)}%</span>
+              {/if}
+            </div>
+            <div class="panes">
+              <div class="pane">
+                <div class="pane-head">
+                  <span class="dot" style="background: {speakerInk(r.loser, 'mic')}"></span>
+                  <span class="pname">{plabel(r.loser, r.loser_name)}</span>
+                  <span class="pane-tag">已并入</span>
+                </div>
+                <div class="samples">
+                  {#each r.loser_sample_paths as path, i (path)}
+                    <button
+                      class="chip"
+                      class:playing={playingKey === path}
+                      title={playingKey === path ? "停止" : "试听合并前的原声"}
+                      onclick={() => audition.toggle(path, path)}
+                    >
+                      {playingKey === path ? "◼" : "▶"} 样本 {i + 1}
+                    </button>
+                  {:else}
+                    <span class="hint">无可试听的快照</span>
+                  {/each}
+                </div>
+              </div>
+              <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
+              </svg>
+              {@render personPane(r.winner, r.winner_name)}
+            </div>
+            <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
+            <div class="acts">
+              <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
+              {#if r.invalid_reason}
+                <button class="mini" disabled title={r.invalid_reason}>撤销(不可用)</button>
+                <span class="hint">{r.invalid_reason}</span>
+              {:else}
+                <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id)}>撤销</button>
+              {/if}
+            </div>
+          </section>
+        {:else if item.kind === "suggestion"}
+          {@const s = item.suggestion}
+          <section class="card">
+            <div class="card-tag">归属建议</div>
+            <div class="card-title">
+              这两条像同一个人吗?
+              <span class="sim" class:strong={isStrong(s)}>
+                相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
+              </span>
+            </div>
+            <div class="panes">
+              {@render personPane(s.loser, s.loser_name)}
+              <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
+              </svg>
+              {@render personPane(s.winner, s.winner_name)}
+            </div>
+            <p class="hint">两边各听一段原声,确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
+            <div class="acts">
+              <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s)}>合并</button>
+              <button class="mini" disabled={busy || live} onclick={() => doIgnoreSuggestion(s)}>忽略</button>
+            </div>
+          </section>
+        {:else if item.kind === "dup"}
+          {@const g = item.people}
+          {@const primary = dupPrimaryId(item.name, g)}
+          <section class="card">
+            <div class="card-tag">同名重复</div>
+            <div class="card-title">「{item.name}」有 {g.length} 条,多半是同一个人被拆开了</div>
+            <div class="panes wrap">
+              {#each g as p (p.id)}
+                <div class="dup-item" class:primary={p.id === primary}>
+                  {@render personPane(p.id, p.name)}
+                  <label class="pick">
+                    <input
+                      type="radio"
+                      name={"dup-" + item.name}
+                      checked={p.id === primary}
+                      onchange={() => (dupPrimary = { ...dupPrimary, [item.name]: p.id })}
+                    />
+                    作为主条目
+                  </label>
+                </div>
+              {/each}
+            </div>
+            <p class="hint">其余条目将并入主条目(默认最近活跃的);逐条试听核对。</p>
+            <div class="acts">
+              <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(item.name, g)}>
+                全部并入主条目
+              </button>
+              <button class="mini" disabled={busy || live} onclick={() => doDismiss(item)}>忽略</button>
+            </div>
+          </section>
+        {:else}
+          {@const p = item.person}
+          <section class="card">
+            <div class="card-tag">无样本条目</div>
+            <div class="card-title">{plabel(p.id, p.name)}——没有原声可核对</div>
+            <div class="panes">
+              {@render personPane(p.id, p.name)}
+            </div>
+            <p class="hint warn-text">
+              删除后历史笔记中这个说话人恢复显示为编号,不可恢复。认不出是谁就删,拿不准就保留。
+            </p>
+            <div class="acts">
+              <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>删除</button>
+              <button class="mini" disabled={busy || live} onclick={() => doDismiss(item)}>保留</button>
+              {#if queue.filter((i) => i.kind === "nosample").length > 1}
+                <span class="spacer"></span>
+                {#if confirmClean}
+                  <span class="warn-text">共 {queue.filter((i) => i.kind === "nosample").length} 条,删除不可恢复。</span>
+                  <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>确认清理</button>
+                  <button class="mini plain" onclick={() => (confirmClean = false)}>取消</button>
+                {:else}
+                  <button class="mini plain" disabled={busy || live} onclick={() => (confirmClean = true)}>
+                    剩余 {queue.filter((i) => i.kind === "nosample").length} 条无样本条目一键清理
+                  </button>
+                {/if}
+              {/if}
+            </div>
+          </section>
         {/if}
-      </div>
-    </section>
+      {/each}
+    </div>
   {/if}
-
-  <footer class="keys">
-    <span><kbd class="kbd">⏎</kbd> 主动作</span>
-    <span><kbd class="kbd">X</kbd> 忽略/保留</span>
-    <span><kbd class="kbd">S</kbd> 跳过</span>
-    <span><kbd class="kbd">1-9</kbd> 试听</span>
-    <span><kbd class="kbd">Esc</kbd> 返回</span>
-  </footer>
 </main>
 
 <style>
@@ -475,9 +408,14 @@
   .back:hover {
     color: var(--accent);
   }
-  .progress {
+  .summary {
     color: var(--ink-faint);
     font-size: 0.82rem;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
   }
   .banner {
     background: var(--danger-tint);
@@ -540,17 +478,6 @@
   .panes.wrap {
     flex-wrap: wrap;
   }
-  .loser-listen {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    flex-wrap: wrap;
-    margin-top: 0.6rem;
-  }
-  .loser-label {
-    color: var(--ink-secondary);
-    font-size: 0.78rem;
-  }
   .arrow {
     color: var(--ink-faint);
     flex: none;
@@ -599,10 +526,17 @@
     font-size: 0.76rem;
     margin: 0.25rem 0 0.4rem;
   }
+  .pane-tag {
+    color: var(--ink-faint);
+    font-size: 0.72rem;
+  }
   .samples {
     display: flex;
     flex-wrap: wrap;
     gap: 0.35rem;
+  }
+  .pane-head + .samples {
+    margin-top: 0.4rem;
   }
   .chip {
     border: 1px solid var(--hairline-strong);
@@ -703,15 +637,6 @@
     text-decoration: none;
     margin-top: 0.6rem;
   }
-  .kbd {
-    font-family: inherit;
-    font-size: 0.68rem;
-    color: var(--ink-faint);
-    border: 1px solid var(--hairline);
-    border-radius: 3px;
-    padding: 0 0.25em;
-    margin-left: 0.15em;
-  }
   .hint {
     color: var(--ink-faint);
     font-size: 0.8rem;
@@ -731,12 +656,5 @@
   .empty p {
     margin: 0 0 0.4rem;
     font-weight: 500;
-  }
-  .keys {
-    display: flex;
-    gap: 1rem;
-    margin-top: 0.9rem;
-    color: var(--ink-faint);
-    font-size: 0.75rem;
   }
 </style>
