@@ -17,6 +17,7 @@
   import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
+  import PersonPickList from "$lib/PersonPickList.svelte";
 
   // 主从结构的"从":本页只呈现/操作一个人;人物索引在侧栏声纹库页签。
   const personId = $derived($page.params.id as string);
@@ -149,6 +150,8 @@
   let mergeOpen = $state(false);
   let pendingMergeWinner = $state<string | null>(null);
   let confirmDelete = $state(false);
+  /** 「合并到…」菜单的检索词;与录音页选人面板共用 PersonPickList 过滤逻辑。 */
+  let mergeQuery = $state("");
 
   /** 合并结果预览:名字继承规则(winner 名优先,winner 无名继承 loser 名)对用户是
       黑盒,确认前把结果摆出来;loser 数据比 winner 厚时提示通常反向合并更好。 */
@@ -165,6 +168,7 @@
   function closeAllOps() {
     mergeOpen = false;
     pendingMergeWinner = null;
+    mergeQuery = "";
     confirmDelete = false;
     confirmSampleIdx = null;
   }
@@ -589,12 +593,9 @@
           {#if mergeOpen && !pendingMergeWinner}
             <div class="menu">
               <div class="menu-title">把「{displayName(person)}」并入…</div>
-              {#each others as o (o.id)}
-                <button class="menu-item" onclick={() => (pendingMergeWinner = o.id)}>
-                  <span class="menu-dot" style="background: {speakerColor(o.id, 'mic')}"></span>
-                  {displayName(o)}
-                </button>
-              {/each}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input class="pick-input" autofocus placeholder="输入名字检索" bind:value={mergeQuery} />
+              <PersonPickList people={others} query={mergeQuery} onpick={(p) => (pendingMergeWinner = p.id)} />
             </div>
           {:else if pendingMergeWinner}
             {@const target = people.find((o) => o.id === pendingMergeWinner)}
@@ -1026,28 +1027,22 @@
     line-height: 1.45;
     padding: 0.25rem 0.5rem 0.35rem;
   }
-  .menu-item {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
+  /* 检索输入:与 SpeakerChips .panel-input 同形态(无框,面板本身即聚焦语境) */
+  .pick-input {
     width: 100%;
-    text-align: left;
-    background: none;
-    border: none;
-    color: var(--ink);
-    font-size: 0.85rem;
+    box-sizing: border-box;
     padding: 0.35rem 0.5rem;
-    border-radius: var(--radius-md);
-    cursor: pointer;
+    margin-bottom: 0.25rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--hairline);
+    outline: none;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--ink);
   }
-  .menu-item:hover {
-    background: var(--surface-soft);
-  }
-  .menu-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    flex: none;
+  .pick-input::placeholder {
+    color: var(--ink-faint);
   }
   .menu.confirm .menu-title {
     color: var(--warning-ink);
