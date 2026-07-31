@@ -3011,7 +3011,7 @@ fn do_merge_person(
     emb: &mut Option<diar::SherpaEmbedder>,
 ) -> Result<String, String> {
     let root = data_root(app).map_err(|e| e.to_string())?;
-    let store = store::VoiceprintStore::new(root);
+    let store = store::VoiceprintStore::new(root.clone());
     let loser_had_samples = !store.sample_paths_existing(loser).is_empty();
     let overflow = store.sample_paths_existing(loser).len()
         + store.sample_paths_existing(winner).len()
@@ -3042,6 +3042,9 @@ fn do_merge_person(
                     if let Err(e) = store.append_sample_for_merge(winner, &sample) {
                         eprintln!("合并兜底样本写入失败({loser}->{winner},不影响合并): {e}");
                     }
+                    // 回执卡左栏"合并时的原声":同一段兜底截声也落进本次合并日志的
+                    // loser 快照副本,不然左栏永远"无可试听的快照"。
+                    store::MergeJournal::new(root.clone()).write_loser_cut_sample(&journal_id, loser, &sample);
                 }
                 None => eprintln!("合并兜底:未能从笔记音频截到 {loser} 的样本(可能无笔记/无音频)"),
             },
@@ -3094,7 +3097,12 @@ fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ip
         winner_name: e.winner_name.clone(),
         similarity: e.similarity,
         loser_sample_paths: journal
-            .loser_sample_copies(&e.id)
+            .sample_copies(&e.id, "loser")
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        winner_sample_paths: journal
+            .sample_copies(&e.id, "winner")
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
@@ -3157,7 +3165,12 @@ fn apply_confident_merges(
                             winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
                             similarity: Some(s.similarity),
                             loser_sample_paths: journal
-                                .loser_sample_copies(&jid)
+                                .sample_copies(&jid, "loser")
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect(),
+                            winner_sample_paths: journal
+                                .sample_copies(&jid, "winner")
                                 .iter()
                                 .map(|p| p.to_string_lossy().into_owned())
                                 .collect(),

@@ -289,7 +289,7 @@
                       title={playingKey === path ? "停止" : "试听合并前的原声"}
                       onclick={() => audition.toggle(path, path)}
                     >
-                      {playingKey === path ? "◼" : "▶"} 样本 {i + 1}
+                      {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
                     </button>
                   {:else}
                     <span class="hint">无可试听的快照</span>
@@ -299,7 +299,24 @@
               <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
               </svg>
-              {@render personPane(r.winner, r.winner_name)}
+              <div class="pane-col">
+                {@render personPane(r.winner, r.winner_name)}
+                {#if r.winner_sample_paths.length > 0}
+                  <div class="snap-listen">
+                    <span class="snap-label">合并时的原声</span>
+                    {#each r.winner_sample_paths as path, i (path)}
+                      <button
+                        class="chip"
+                        class:playing={playingKey === path}
+                        title={playingKey === path ? "停止" : "试听合并时刻的样本"}
+                        onclick={() => audition.toggle(path, path)}
+                      >
+                        {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
             </div>
             <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
             <div class="acts">
@@ -508,6 +525,23 @@
     background: var(--surface-soft);
     border-radius: var(--radius-md);
     padding: 0.6rem 0.7rem;
+  }
+  .pane-col {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+  }
+  .snap-listen {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.45rem;
+    align-items: center;
+  }
+  .snap-label {
+    color: var(--ink-faint);
+    font-size: 0.76rem;
   }
   .dup-item {
     flex: 1 1 16rem;

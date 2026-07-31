@@ -32,6 +32,7 @@ const receipt = (id: string): MergeReceipt => ({
   winner_name: "张三",
   similarity: 0.9,
   loser_sample_paths: [],
+  winner_sample_paths: [],
   invalid_reason: null,
 });
 

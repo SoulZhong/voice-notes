@@ -482,6 +482,9 @@ pub struct MergeReceipt {
     pub similarity: Option<f32>,
     /// 被并入方合并前的样本快照副本(绝对路径;空=无样本或已被永久失效清理)。
     pub loser_sample_paths: Vec<String>,
+    /// winner 合并时刻的样本快照副本(绝对路径;回执卡"合并时的原声"——右栏实时
+    /// 状态会随后续操作漂移,核对历史合并要看快照)。
+    pub winner_sample_paths: Vec<String>,
     pub invalid_reason: Option<String>,
 }
 
