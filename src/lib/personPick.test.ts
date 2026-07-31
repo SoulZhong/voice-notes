@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dupNameSet, filterPeople, personLabel, recentLabel } from "./personPick";
+import { dupNameSet, filterPeople, personLabel, recentLabel, sortPeopleAlpha } from "./personPick";
 import type { PersonSummary } from "./people";
 
 const person = (id: string, name = "", lastSeen = "2026-07-31T10:00:00+08:00"): PersonSummary => ({
@@ -56,5 +56,25 @@ describe("filterPeople", () => {
 
   it("未命中返回空数组", () => {
     expect(filterPeople(people, "不存在的名字")).toEqual([]);
+  });
+});
+
+describe("sortPeopleAlpha", () => {
+  it("中文名按拼音序", () => {
+    const people = [person("P1", "张三"), person("P2", "陈博"), person("P3", "郎佳奇")];
+    expect(sortPeopleAlpha(people).map((p) => p.name)).toEqual(["陈博", "郎佳奇", "张三"]);
+  });
+
+  it("未命名按编号数值序,「说话人 2」<「说话人 10」", () => {
+    const people = [person("P10", ""), person("P2", "")];
+    expect(sortPeopleAlpha(people).map(personLabel)).toEqual(["说话人 2", "说话人 10"]);
+  });
+
+  it("混合已命名与未命名不抛错,原数组不被修改", () => {
+    const people = [person("P10", ""), person("P1", "张三"), person("P2", "")];
+    expect(() => sortPeopleAlpha(people)).not.toThrow();
+    const sorted = sortPeopleAlpha(people);
+    expect(sorted).toHaveLength(3);
+    expect(people.map((p) => p.id)).toEqual(["P10", "P1", "P2"]);
   });
 });

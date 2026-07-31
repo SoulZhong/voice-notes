@@ -29,3 +29,10 @@ export function filterPeople(people: PersonSummary[], query: string): PersonSumm
   const q = query.trim();
   return q ? people.filter((p) => personLabel(p).includes(q)) : people;
 }
+
+/** 人物字母序:中文按拼音、数字段按数值("说话人 2"<"说话人 10")。已命名按名字,
+    未命名按编号标签——分组展示时两组各自内部有序。 */
+export function sortPeopleAlpha(people: PersonSummary[]): PersonSummary[] {
+  const collator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", { numeric: true });
+  return [...people].sort((a, b) => collator.compare(personLabel(a), personLabel(b)));
+}
