@@ -226,13 +226,22 @@ impl MergeJournal {
         }
     }
 
-    /// 被并入方(loser)合并前的样本快照副本路径,按文件名序。条目不存在/已被永久
+    /// 被并入方(loser)合并前的样本快照副本路径,按槽位序。条目不存在/已被永久
     /// 失效清理/该侧无样本 → 空(回执卡隐藏该试听行)。
     pub fn loser_sample_copies(&self, id: &str) -> Vec<PathBuf> {
         let Some(dir) = self.samples_dir(id, "loser") else { return vec![] };
         let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
         let mut out: Vec<PathBuf> = rd.flatten().map(|f| f.path()).collect();
-        out.sort();
+        // 槽位序而非字典序:<id>.wav=槽1,<id>-N.wav=槽N。字典序会把 '-' 排在 '.'
+        // 前,槽1(最老)反而落到最后,前端"最后一份=最新"的取法就拿错。
+        let slot = |p: &PathBuf| -> u32 {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit_once('-'))
+                .and_then(|(_, n)| n.parse().ok())
+                .unwrap_or(1)
+        };
+        out.sort_by_key(slot);
         out
     }
 
@@ -411,6 +420,25 @@ mod tests {
         // 永久性失效清理样本副本后为空
         j.invalidate(&["P1"], "此人随后被改名", None);
         assert!(j.loser_sample_copies("m-P1").is_empty());
+    }
+
+    #[test]
+    fn loser_sample_copies_orders_by_slot_not_lexicographic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        let vpdir = tmp.path().join("voiceprints");
+        // 创建槽 1、2、10 的样本,字典序会错成 10, 2, 1
+        let s1 = fake_sample(&vpdir, "P9.wav");
+        let s2 = fake_sample(&vpdir, "P9-2.wav");
+        let s10 = fake_sample(&vpdir, "P9-10.wav");
+        j.append(&entry("m-P9", "t1", "P9", "P8"), &[s1, s2, s10], &[]).unwrap();
+
+        let copies = j.loser_sample_copies("m-P9");
+        assert_eq!(copies.len(), 3);
+        // 按槽位序验证(1, 2, 10),而非字典序(1, 10, 2 或 10, 2, 1)
+        assert_eq!(copies[0].file_name().unwrap(), "P9.wav", "槽 1 应在最前");
+        assert_eq!(copies[1].file_name().unwrap(), "P9-2.wav", "槽 2 应在中间");
+        assert_eq!(copies[2].file_name().unwrap(), "P9-10.wav", "槽 10 应在最后");
     }
 
     #[test]
