@@ -298,6 +298,7 @@ pub fn run_local(
         graph_extraction: None,
         relations: vec![],
         graph_support_mentions: vec![],
+        revision: 0,
         paragraphs,
     };
     let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
@@ -306,8 +307,18 @@ pub fn run_local(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("修订稿目录缺少有效笔记 id"))?;
-    if let Some(previous) = crate::store::refined::load_refined_locked(note_dir, &note_lock) {
-        GraphFallbackSnapshot::capture(&previous).restore(note_id, &mut doc);
+    let previous = crate::store::refined::load_refined_locked(note_dir, &note_lock);
+    // 显式进位,而不是依赖 write_refined_atomic_locked 的单调性后备:有旧稿则
+    // old+1,没有旧稿(首次生成)才是 0。这样无论用户是否编辑过,精修重跑都会
+    // 推进 revision,过期编辑器会话的保存必然因 revision 不匹配而冲突——而不是
+    // 留一个 rev-0 窗口寄望收敛点的后备规则兜底(那条规则相等时会原样透传,
+    // 专留给「载入-改-写回」型 writer,不会替这里进位)。
+    doc.revision = previous
+        .as_ref()
+        .map(|p| p.revision.saturating_add(1))
+        .unwrap_or(0);
+    if let Some(previous) = &previous {
+        GraphFallbackSnapshot::capture(previous).restore(note_id, &mut doc);
     }
     crate::store::ensure_graph_ids(note_id, &mut doc);
     crate::store::refined::write_refined_atomic_locked(note_dir, &doc, &note_lock)?;
@@ -580,6 +591,11 @@ pub fn run_llm(
         fallback_graph.restore(note_id, doc);
         doc.stages.relations = "failed".into();
     }
+    // 润色整替换段落文本,写盘前进位(与 run_local 同构):run_local 落盘与本次落盘
+    // 之间载入精修稿的编辑器会话,其 expected_revision 在本次落盘后仍会通过 store
+    // 层 CAS 校验,保存会被静默接受并回退本次润色结果——进位使该会话必然冲突。
+    // 加在内存 doc 上、写盘前完成,内存态与落盘 JSON 仍保持一致。
+    doc.revision = doc.revision.saturating_add(1);
     if let Err(e) = crate::store::refined::write_refined_atomic_locked(note_dir, doc, &note_lock) {
         fail_in_memory(doc);
         return Err(e);
@@ -750,6 +766,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
@@ -1537,6 +1554,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
@@ -1575,6 +1593,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {

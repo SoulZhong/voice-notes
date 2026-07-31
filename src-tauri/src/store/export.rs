@@ -93,6 +93,13 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
         out.push_str(&format!("{title}\n\n"));
     }
     for p in &doc.paragraphs {
+        // 用户在笔记页插入的自由 markdown 块(空 speaker、无关联人物):只出正文。
+        let speakerless =
+            p.speaker.is_empty() && p.name.as_deref().unwrap_or("").is_empty() && p.person_id.is_none();
+        if speakerless {
+            out.push_str(&format!("{}\n\n", p.text));
+            continue;
+        }
         let label = p
             .name
             .clone()
@@ -208,6 +215,7 @@ mod tests {
     use super::*;
     use crate::store::writer::NoteWriter;
     use crate::store::NoteStore;
+    use serde_json;
 
     #[test]
     fn format_ts_is_hhmmss() {
@@ -312,6 +320,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![
                 para("R1", Some("张三"), Some("P1"), "有名字用名字。"),
                 para("R2", None, Some("P4"), "无名有关联用全局编号。"),
@@ -495,6 +504,27 @@ mod tests {
             2,
             "空白段被过滤,只剩两段: {txt}"
         );
+    }
+
+    #[test]
+    fn render_refined_skips_prefix_for_speakerless_blocks() {
+        let doc: RefinedDoc = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "generated_at": "2026-07-30T00:00:00Z",
+            "stages": { "filter": "done", "recluster": "done", "llm": "done" },
+            "discarded_seqs": [],
+            "paragraphs": [
+                { "speaker": "", "start_ms": 0, "end_ms": 0, "text": "## 会议纪要", "source_seqs": [] },
+                { "speaker": "R1", "start_ms": 0, "end_ms": 1000, "text": "正文", "source_seqs": [1] }
+            ]
+        }))
+        .unwrap();
+        let md = render_refined("标题", &doc, true);
+        assert!(md.contains("## 会议纪要\n\n"), "无说话人块只出正文: {md}");
+        assert!(!md.contains("****"), "不得出现空名加粗前缀: {md}");
+        assert!(md.contains("**说话人 1** `[00:00:00]`"), "有说话人的段保持原格式: {md}");
+        let txt = render_refined("标题", &doc, false);
+        assert!(txt.contains("\n## 会议纪要\n"), "txt 同样跳过前缀: {txt}");
     }
 }
 

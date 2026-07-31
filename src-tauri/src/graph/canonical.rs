@@ -1927,6 +1927,7 @@ mod tests {
             }),
             relations: Vec::new(),
             graph_support_mentions: Vec::new(),
+            revision: 0,
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(),
                 name: None,
