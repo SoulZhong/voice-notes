@@ -940,8 +940,9 @@ pub fn suggest_merges(vp: &Voiceprints) -> Vec<MergeSuggestion> {
 }
 
 /// 自动归并筛选(纯函数):strong 档(裸余弦 ≥ SUGGEST_STRONG_RAW 或 z ≥
-/// SUGGEST_STRONG_Z)+ loser 未命名(已命名条目不自动动)+ 不在拒绝名单 + 双方
-/// 未被本轮更早的自动合并触及(同一 winner 一轮只吃一条:第二条会使第一条的回
+/// SUGGEST_STRONG_Z)+ loser 未命名(已命名条目不自动动)+ winner 已命名(往"说话人 N"上
+/// 自动并毫无意义——归并的价值是把碎片归到确定身份上;未命名互并留给人工)+ 不在拒绝名单
+/// + 双方未被本轮更早的自动合并触及(同一 winner 一轮只吃一条:第二条会使第一条的回
 /// 执立即失效,顺延到下一轮重算后再合)。返回 (可自动合并, 留给人工)。
 ///
 /// 拒绝名单匹配方向不敏感:两个未命名人之间谁是 loser/winner 由 total_ms 决定,
@@ -960,10 +961,11 @@ pub fn confident_picks(
         let strong = s.similarity >= SUGGEST_STRONG_RAW
             || s.salience.map_or(false, |z| z >= SUGGEST_STRONG_Z);
         let unnamed = vp.people.get(&s.loser).map_or(false, |p| p.name.is_empty());
+        let winner_named = vp.people.get(&s.winner).map_or(false, |p| !p.name.is_empty());
         let denied = deny.iter().any(|d| {
             d == &format!("{}>{}", s.loser, s.winner) || d == &format!("{}>{}", s.winner, s.loser)
         });
-        if strong && unnamed && !denied && !touched.contains(&s.loser) && !touched.contains(&s.winner)
+        if strong && unnamed && winner_named && !denied && !touched.contains(&s.loser) && !touched.contains(&s.winner)
         {
             touched.insert(s.loser.clone());
             touched.insert(s.winner.clone());
@@ -2051,6 +2053,23 @@ mod tests {
         let deny = vec!["P4>P5".to_string()];
         let (autos, manual) = confident_picks(&vp, sugs, &deny);
         assert!(autos.is_empty(), "反向建议仍应被拒绝名单挡住,落入人工");
+        assert_eq!(manual.len(), 1);
+    }
+
+    #[test]
+    fn confident_picks_requires_named_winner() {
+        let mut vp = Voiceprints::default();
+        vp.people.insert("P1".into(), Person::default()); // 未命名
+        vp.people.insert("P2".into(), Person::default()); // 未命名
+        let sugs = vec![MergeSuggestion {
+            loser: "P1".into(),
+            winner: "P2".into(),
+            similarity: 0.95,
+            source: "mic".into(),
+            salience: Some(9.0),
+        }];
+        let (autos, manual) = confident_picks(&vp, sugs, &[]);
+        assert!(autos.is_empty(), "未命名互并再像也不自动,留给人工");
         assert_eq!(manual.len(), 1);
     }
 
