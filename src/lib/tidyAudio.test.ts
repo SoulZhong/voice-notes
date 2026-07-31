@@ -68,4 +68,31 @@ describe("createAudition", () => {
     expect(errors).toEqual(["Error: NotAllowedError"]);
     expect(a.key).toBeNull();
   });
+
+  it("快速切换后过期的拒绝不触发 onError", async () => {
+    const errors: string[] = [];
+    const p1: PlayerLike = {
+      play: () => Promise.reject(new Error("k1-error")),
+      pause: vi.fn(),
+      onended: null,
+    };
+    const p2: PlayerLike = {
+      play: () => Promise.resolve(),
+      pause: vi.fn(),
+      onended: null,
+    };
+    let useP1 = true;
+    const a = createAudition(
+      () => (useP1 ? p1 : p2),
+      () => {},
+      (msg) => errors.push(msg),
+    );
+    a.toggle("k1", "/a.wav");
+    useP1 = false;
+    a.toggle("k2", "/b.wav");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errors).toEqual([]);
+    expect(a.key).toBe("k2");
+  });
 });

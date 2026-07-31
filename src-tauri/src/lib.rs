@@ -3019,6 +3019,7 @@ fn do_merge_person(
     if overflow && emb.is_none() {
         match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
             Ok(e) => *emb = Some(e),
+            // 加载失败不缓存"已尝试":同批后续超限条目会重试加载——模型损坏是罕见态,重试成本可接受,不为它引入毒化标记。
             Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
         }
     }

@@ -34,12 +34,16 @@ export function createAudition(
     try {
       const r = p.play();
       if (r instanceof Promise) r.catch((err) => {
-        if (key === k) stop();
-        onError?.(String(err));
+        if (key === k) {
+          stop();
+          onError?.(String(err));
+        }
       });
     } catch (err) {
-      stop();
-      onError?.(String(err));
+      if (key === k) {
+        stop();
+        onError?.(String(err));
+      }
     }
   };
   return {

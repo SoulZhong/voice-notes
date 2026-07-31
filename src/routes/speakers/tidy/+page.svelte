@@ -215,8 +215,8 @@
   <header class="head">
     <a class="back" href="/speakers">← 概览</a>
     <h1>分析说话人</h1>
-    {#if queue.length > 0}
-      <span class="summary">{pendingN} 件待处理{#if receiptsN > 0} · {receiptsN} 条已自动归并{/if}</span>
+    {#if pendingN > 0 || receiptsN > 0}
+      <span class="summary">{#if pendingN > 0}{pendingN} 件待处理{/if}{#if pendingN > 0 && receiptsN > 0} · {/if}{#if receiptsN > 0}{receiptsN} 条已自动归并{/if}</span>
     {/if}
   </header>
 
