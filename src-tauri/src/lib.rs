@@ -3084,7 +3084,7 @@ fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(
     queue_person_graph_rebuild(&app, root, "人物删除")
 }
 
-fn receipt_of(e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
+fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
     ipc::MergeReceipt {
         journal_id: e.id.clone(),
         time: e.time.clone(),
@@ -3094,6 +3094,11 @@ fn receipt_of(e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
         winner: e.winner.clone(),
         winner_name: e.winner_name.clone(),
         similarity: e.similarity,
+        loser_sample_paths: journal
+            .loser_sample_copies(&e.id)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         invalid_reason: e.invalid_reason.clone(),
     }
 }
@@ -3136,11 +3141,12 @@ fn apply_confident_merges(
             Ok(jid) => {
                 merged.insert(s.loser.clone());
                 match journal.entry(&jid) {
-                    Ok(e) => applied.push(receipt_of(&e)),
+                    Ok(e) => applied.push(receipt_of(&journal, &e)),
                     Err(err) => {
                         eprintln!("自动归并回执读取失败({jid}): {err}");
                         // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
-                        // (time 空串;list_merge_receipts 仍是真值源)。
+                        // (time 空串;list_merge_receipts 仍是真值源)。方法只要 id,
+                        // 条目读不回也能列副本。
                         applied.push(ipc::MergeReceipt {
                             journal_id: jid.clone(),
                             time: String::new(),
@@ -3150,6 +3156,11 @@ fn apply_confident_merges(
                             winner: s.winner.clone(),
                             winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
                             similarity: Some(s.similarity),
+                            loser_sample_paths: journal
+                                .loser_sample_copies(&jid)
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect(),
                             invalid_reason: None,
                         });
                     }
@@ -3194,11 +3205,12 @@ fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
 #[tauri::command]
 fn list_merge_receipts(app: AppHandle) -> Result<Vec<ipc::MergeReceipt>, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
-    Ok(store::MergeJournal::new(root)
+    let journal = store::MergeJournal::new(root);
+    Ok(journal
         .entries()
         .iter()
         .filter(|e| !e.acknowledged)
-        .map(receipt_of)
+        .map(|e| receipt_of(&journal, e))
         .collect())
 }
 

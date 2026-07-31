@@ -480,6 +480,8 @@ pub struct MergeReceipt {
     pub winner: String,
     pub winner_name: String,
     pub similarity: Option<f32>,
+    /// 被并入方合并前的样本快照副本(绝对路径;空=无样本或已被永久失效清理)。
+    pub loser_sample_paths: Vec<String>,
     pub invalid_reason: Option<String>,
 }
 

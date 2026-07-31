@@ -226,6 +226,16 @@ impl MergeJournal {
         }
     }
 
+    /// 被并入方(loser)合并前的样本快照副本路径,按文件名序。条目不存在/已被永久
+    /// 失效清理/该侧无样本 → 空(回执卡隐藏该试听行)。
+    pub fn loser_sample_copies(&self, id: &str) -> Vec<PathBuf> {
+        let Some(dir) = self.samples_dir(id, "loser") else { return vec![] };
+        let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+        let mut out: Vec<PathBuf> = rd.flatten().map(|f| f.path()).collect();
+        out.sort();
+        out
+    }
+
     /// 把条目的样本副本拷回声纹样本目录(撤销用),返回还原文件数。
     pub fn restore_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
@@ -387,6 +397,20 @@ mod tests {
         j.revive_invalidated_by("m-X");
         assert!(j.entry("m-P1").unwrap().invalid_reason.is_none(), "由 m-X 失效的复活");
         assert!(j.entry("m-P2").unwrap().invalid_reason.is_some(), "永久失效的不复活");
+    }
+
+    #[test]
+    fn loser_sample_copies_lists_snapshot_or_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        let vpdir = tmp.path().join("voiceprints");
+        let ls = fake_sample(&vpdir, "P1.wav");
+        j.append(&entry("m-P1", "t1", "P1", "P2"), &[ls], &[]).unwrap();
+        assert_eq!(j.loser_sample_copies("m-P1").len(), 1);
+        assert!(j.loser_sample_copies("../evil").is_empty());
+        // 永久性失效清理样本副本后为空
+        j.invalidate(&["P1"], "此人随后被改名", None);
+        assert!(j.loser_sample_copies("m-P1").is_empty());
     }
 
     #[test]

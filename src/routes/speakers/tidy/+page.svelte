@@ -208,8 +208,18 @@
     const cmd = keyCommand(e.key, current.kind);
     if (!cmd) return;
     e.preventDefault();
+    const it = current;
     if (typeof cmd === "object") {
-      playLatest(currentIds[cmd.play] ?? "");
+      if (it.kind === "receipt") {
+        const path = it.receipt.loser_sample_paths[it.receipt.loser_sample_paths.length - 1];
+        if (cmd.play === 0) {
+          if (path) audition.toggle(path, path);
+        } else {
+          playLatest(it.receipt.winner);
+        }
+      } else {
+        playLatest(currentIds[cmd.play] ?? "");
+      }
       return;
     }
     if (cmd === "skip") {
@@ -217,7 +227,6 @@
       return;
     }
     if (live) return; // 录制中只许试听/跳过
-    const it = current;
     if (cmd === "primary") {
       if (it.kind === "suggestion") void doMergeSuggestion(it.suggestion);
       else if (it.kind === "dup") void doMergeDup(it.name, it.people);
@@ -318,8 +327,24 @@
         {/if}
       </div>
       <div class="panes">
-        {@render personPane(r.winner, r.winner_name, 1)}
+        {@render personPane(r.winner, r.winner_name, 2)}
       </div>
+      {#if r.loser_sample_paths.length > 0}
+        <div class="loser-listen">
+          <span class="loser-label">被并入的声音({plabel(r.loser, r.loser_name)})</span>
+          {#each r.loser_sample_paths as path, i (path)}
+            <button
+              class="chip"
+              class:playing={playingKey === path}
+              title={playingKey === path ? "停止" : "试听合并前的原声"}
+              onclick={() => audition.toggle(path, path)}
+            >
+              {playingKey === path ? "◼" : "▶"} 样本 {i + 1}
+            </button>
+          {/each}
+          <kbd class="kbd">1</kbd>
+        </div>
+      {/if}
       <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
       <div class="acts">
         <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好 <kbd class="kbd">⏎</kbd></button>
@@ -515,6 +540,17 @@
   }
   .panes.wrap {
     flex-wrap: wrap;
+  }
+  .loser-listen {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-top: 0.6rem;
+  }
+  .loser-label {
+    color: var(--ink-secondary);
+    font-size: 0.78rem;
   }
   .arrow {
     color: var(--ink-faint);

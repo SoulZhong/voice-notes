@@ -56,6 +56,8 @@ export type MergeReceipt = {
   winner: string;
   winner_name: string;
   similarity: number | null;
+  /** 被并入方合并前的样本快照副本(绝对路径;空=无样本或已被永久失效清理)。 */
+  loser_sample_paths: string[];
   invalid_reason: string | null;
 };
 /** 整理·自动归并返回:本次合并的回执 + 留给人工的建议。 */
