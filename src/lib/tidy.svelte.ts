@@ -45,6 +45,11 @@ class TidyState {
     this.dismissed = new Set([...this.dismissed, key]);
   }
 
+  /** 乐观移除一条回执(「好」/撤销点击后立即收起卡片,不等后台整轮重算对账)。 */
+  removeReceipt(journalId: string) {
+    this.receipts = this.receipts.filter((r) => r.journal_id !== journalId);
+  }
+
   /** 自动归并 + 重拉(启动、录制停止、库变化后调用)。失败静默清空——整理是
       增值层,比对失败不该打扰主流程。有自动合并发生时 bumpPeople 驱动全局刷新
       (再触发的下一轮 refresh 不会再有 applied,自然收敛)。 */

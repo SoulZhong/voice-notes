@@ -85,17 +85,19 @@
       error = `加载失败: ${e}`;
     }
   }
-  onMount(async () => {
-    await tidy.refresh();
-    await refreshPeople();
+  onMount(() => {
+    void tidy.refresh();
+    void refreshPeople();
   });
   $effect(() => {
     void recording.peopleVersion;
     refreshPeople();
   });
 
-  // ── 动作:每个动作后重算队列;失败卡片留在原地,错误横幅透出后端文案 ──
-  async function act(fn: () => Promise<void>) {
+  // ── 动作:busy 只覆盖后端操作本身;重算(tidy.refresh/refreshPeople)放后台,
+  // layout 对 peopleVersion 的 effect + tidy 单飞 refresh 会兜底同步。失败卡片
+  // 留在原地,错误横幅透出后端文案 ──
+  async function act(fn: () => Promise<void>, optimistic?: () => void) {
     if (busy) return;
     busy = true;
     error = "";
@@ -103,9 +105,9 @@
     confirmClean = false;
     try {
       await fn();
-      recording.bumpPeople();
-      await tidy.refresh();
-      await refreshPeople();
+      optimistic?.(); // 后端成功即本地收起,不等整轮重算
+      recording.bumpPeople(); // 驱动 layout 后台 tidy.refresh(单飞)与各处同步
+      void refreshPeople();
     } catch (e) {
       error = `${e}`;
     }
@@ -113,6 +115,7 @@
   }
 
   async function doMergeSuggestion(s: PersonMergeSuggestion) {
+    // 无 optimistic:这张建议卡随后台 refreshPeople/tidy.refresh 自然消失。
     await act(async () => {
       const jid = await mergePerson(s.loser, s.winner);
       lastManual = {
@@ -125,6 +128,7 @@
     tidy.ignore(s);
   }
   async function doMergeDup(name: string, g: PersonSummary[]) {
+    // 无 optimistic:同名组卡随后台 refreshPeople 自然消失。
     await act(async () => {
       const winner = dupPrimaryId(name, g);
       await mergeDuplicatePeople(g, winner, mergePerson, (journalId) => {
@@ -133,6 +137,7 @@
     });
   }
   async function doDeleteNoSample(p: PersonSummary) {
+    // 无 optimistic:无样本卡随后台 refreshPeople 自然消失。
     await act(async () => {
       await deletePerson(p.id);
     });
@@ -140,6 +145,7 @@
   /** 一键清理剩余全部无样本条目(二段确认后)。 */
   async function doCleanAll() {
     const rest = queue.filter((i) => i.kind === "nosample");
+    // 无 optimistic:这批卡随后台 refreshPeople 自然消失。
     await act(async () => {
       for (const i of rest) {
         if (i.kind === "nosample") await deletePerson(i.person.id);
@@ -150,15 +156,23 @@
     tidy.dismiss(tidyItemKey(item));
   }
   async function doAck(r: MergeReceipt) {
-    await act(async () => {
-      await acknowledgeMerge(r.journal_id);
-    });
+    await act(
+      async () => {
+        await acknowledgeMerge(r.journal_id);
+      },
+      () => tidy.removeReceipt(r.journal_id),
+    );
   }
   async function doUndo(journalId: string) {
-    await act(async () => {
-      await undoMerge(journalId);
-      lastManual = null;
-    });
+    // removeReceipt 对不存在的 id 是 no-op:doUndo 既用于回执撤销卡也用于手动
+    // 合并后的页内撤销条,两处共用同一 optimistic 安全。
+    await act(
+      async () => {
+        await undoMerge(journalId);
+        lastManual = null;
+      },
+      () => tidy.removeReceipt(journalId),
+    );
   }
 
   // ── 键盘:仅 Esc 返回概览(全量列表页无「当前项」概念,主动作/忽略均走点击)──
@@ -218,6 +232,7 @@
     {#if pendingN > 0 || receiptsN > 0}
       <span class="summary">{#if pendingN > 0}{pendingN} 件待处理{/if}{#if pendingN > 0 && receiptsN > 0} · {/if}{#if receiptsN > 0}{receiptsN} 条已自动归并{/if}</span>
     {/if}
+    {#if tidy.loading}<span class="refreshing">正在比对声纹…</span>{/if}
   </header>
 
   {#if live}
@@ -411,6 +426,10 @@
   .summary {
     color: var(--ink-faint);
     font-size: 0.82rem;
+  }
+  .refreshing {
+    color: var(--ink-faint);
+    font-size: 0.78rem;
   }
   .stack {
     display: flex;
