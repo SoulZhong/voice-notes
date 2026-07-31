@@ -1,12 +1,14 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
+  import { untrack } from "svelte";
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
     personNotes,
     renamePerson,
     mergePerson,
+    undoMerge,
     deletePerson,
     deletePersonSample,
     type PersonSummary,
@@ -15,6 +17,7 @@
   import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
+  import PersonPickList from "$lib/PersonPickList.svelte";
 
   // 主从结构的"从":本页只呈现/操作一个人;人物索引在侧栏声纹库页签。
   const personId = $derived($page.params.id as string);
@@ -58,6 +61,13 @@
   // 路由参数变化(侧栏点选另一人)时重载;同页操作后手动 refresh。
   $effect(() => {
     void personId;
+    // 撤销条只在"合并落点"(lastMergeWinner)的人物页存活;导航到别的无关人物页要清掉。
+    // untrack 读取 lastMergeWinner:避免该 effect 因合并动作里对它的赋值而重跑
+    // (那一刻 personId 还是旧页,会把刚设好的状态立即冲掉)。
+    if (personId !== untrack(() => lastMergeWinner)) {
+      lastMergeId = null;
+      lastMergeWinner = null;
+    }
     stopSample();
     stopCtx();
     closeAllOps();
@@ -117,7 +127,8 @@
     editingId = null;
     dupRename = null;
     try {
-      await mergePerson(p.id, d.other.id);
+      lastMergeId = await mergePerson(p.id, d.other.id);
+      lastMergeWinner = d.other.id;
       recording.bumpPeople();
       goto(`/speakers/${d.other.id}`);
     } catch (e) {
@@ -139,6 +150,8 @@
   let mergeOpen = $state(false);
   let pendingMergeWinner = $state<string | null>(null);
   let confirmDelete = $state(false);
+  /** 「合并到…」菜单的检索词;与录音页选人面板共用 PersonPickList 过滤逻辑。 */
+  let mergeQuery = $state("");
 
   /** 合并结果预览:名字继承规则(winner 名优先,winner 无名继承 loser 名)对用户是
       黑盒,确认前把结果摆出来;loser 数据比 winner 厚时提示通常反向合并更好。 */
@@ -155,6 +168,7 @@
   function closeAllOps() {
     mergeOpen = false;
     pendingMergeWinner = null;
+    mergeQuery = "";
     confirmDelete = false;
     confirmSampleIdx = null;
   }
@@ -183,7 +197,8 @@
     const loser = person.id;
     closeAllOps();
     try {
-      await mergePerson(loser, winner);
+      lastMergeId = await mergePerson(loser, winner);
+      lastMergeWinner = winner;
       recording.bumpPeople();
       // 本人已并入对方:跳到对方详情,让"这个人现在是谁"立即可见。
       goto(`/speakers/${winner}`);
@@ -218,11 +233,31 @@
       ? { id: s.winner, name: s.winner_name }
       : { id: s.loser, name: s.loser_name };
 
+  /** 手动合并后的撤销条(最近一次;后端日志兜底,失效时撤销报错原样透出)。 */
+  let lastMergeId = $state<string | null>(null);
+  /** 本次合并的落点(winner)。导航到别人页时撤销条清除;跳到 winner 页(本人被并走的 goto)则保留。 */
+  let lastMergeWinner = $state<string | null>(null);
+
+  async function undoLastMerge() {
+    if (!lastMergeId) return;
+    try {
+      await undoMerge(lastMergeId);
+      lastMergeId = null;
+      lastMergeWinner = null;
+      recording.bumpPeople();
+      await tidy.refresh();
+      await refresh();
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+
   async function applyCtxSuggestion(s: PersonMergeSuggestion) {
     stopCtx();
     stopSample();
     try {
-      await mergePerson(s.loser, s.winner);
+      lastMergeId = await mergePerson(s.loser, s.winner);
+      lastMergeWinner = s.winner;
       recording.bumpPeople();
       await tidy.refresh();
       if (s.loser === personId) {
@@ -303,6 +338,20 @@
 <main class="container">
   {#if error}
     <div class="banner">{error}</div>
+  {/if}
+
+  {#if lastMergeId}
+    <div class="undo-strip">
+      已合并。
+      <button class="mini" disabled={recording.isLive} onclick={undoLastMerge}>撤销</button>
+      <button
+        class="mini"
+        onclick={() => {
+          lastMergeId = null;
+          lastMergeWinner = null;
+        }}>好</button
+      >
+    </div>
   {/if}
 
   {#if !loaded}
@@ -544,12 +593,9 @@
           {#if mergeOpen && !pendingMergeWinner}
             <div class="menu">
               <div class="menu-title">把「{displayName(person)}」并入…</div>
-              {#each others as o (o.id)}
-                <button class="menu-item" onclick={() => (pendingMergeWinner = o.id)}>
-                  <span class="menu-dot" style="background: {speakerColor(o.id, 'mic')}"></span>
-                  {displayName(o)}
-                </button>
-              {/each}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input class="pick-input" autofocus placeholder="输入名字检索" bind:value={mergeQuery} />
+              <PersonPickList people={others} query={mergeQuery} onpick={(p) => (pendingMergeWinner = p.id)} />
             </div>
           {:else if pendingMergeWinner}
             {@const target = people.find((o) => o.id === pendingMergeWinner)}
@@ -732,7 +778,7 @@
     max-width: 24rem;
     line-height: 1.45;
   }
-  /* 上下文整理提示:warning 横幅家族(与概览疑似重复卡同语义=待办),行内直达动作 */
+  /* 上下文整理提示:warning 横幅家族(待办语义),行内直达动作 */
   .ctx-card {
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);
@@ -981,28 +1027,22 @@
     line-height: 1.45;
     padding: 0.25rem 0.5rem 0.35rem;
   }
-  .menu-item {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
+  /* 检索输入:与 SpeakerChips .panel-input 同形态(无框,面板本身即聚焦语境) */
+  .pick-input {
     width: 100%;
-    text-align: left;
-    background: none;
-    border: none;
-    color: var(--ink);
-    font-size: 0.85rem;
+    box-sizing: border-box;
     padding: 0.35rem 0.5rem;
-    border-radius: var(--radius-md);
-    cursor: pointer;
+    margin-bottom: 0.25rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--hairline);
+    outline: none;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--ink);
   }
-  .menu-item:hover {
-    background: var(--surface-soft);
-  }
-  .menu-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    flex: none;
+  .pick-input::placeholder {
+    color: var(--ink-faint);
   }
   .menu.confirm .menu-title {
     color: var(--warning-ink);
@@ -1059,6 +1099,17 @@
     padding: 0.6rem 0.8rem;
     margin: 0 0 1rem;
     font-size: 0.95rem;
+  }
+  .undo-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    padding: 0.5rem 0.8rem;
+    margin: 0.5rem 0 1rem;
+    font-size: 0.85rem;
+    color: var(--ink-secondary);
   }
   .hint {
     color: var(--ink-faint);

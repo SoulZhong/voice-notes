@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { speakerColor, speakerInk, speakerLabel, renameSpeaker, speakerIdCompare, formatDate } from "$lib/notes";
+  import { speakerColor, speakerInk, speakerLabel, renameSpeaker, speakerIdCompare } from "$lib/notes";
   import type { PersonSummary } from "$lib/people";
+  import { recentLabel } from "$lib/personPick";
+  import PersonPickList from "$lib/PersonPickList.svelte";
 
   let {
     speakers,
@@ -44,34 +46,6 @@
   /** 改名撞库中现有人名时的待确认态:面板转为确认条,防悄悄造出重名。
       linkedOther=该说话人已关联别人 → 撞名大概率是库里有重复条目,给详情页合并入口。 */
   let dupPending = $state<{ id: string; name: string; person: PersonSummary; linkedOther: boolean } | null>(null);
-
-  /** 人物面板显示名:库中未命名的人按全局编号「说话人 N」兜底(与徽章一致)。 */
-  const personLabel = (p: PersonSummary) => p.name || `说话人 ${p.id.replace(/^P/, "")}`;
-
-  /** "最近 MM-DD":未命名/重名条目的区分后缀。 */
-  const recentLabel = (p: PersonSummary) => {
-    const d = formatDate(p.last_seen);
-    return d === "—" ? "" : `最近 ${d.slice(5, 10)}`;
-  };
-
-  /** 出现超过一次的名字集合:同名条目必须带区分后缀,否则列表里两行一模一样。 */
-  const dupNames = $derived.by(() => {
-    const seen = new Set<string>();
-    const dup = new Set<string>();
-    for (const p of people ?? []) {
-      if (!p.name) continue;
-      if (seen.has(p.name)) dup.add(p.name);
-      seen.add(p.name);
-    }
-    return dup;
-  });
-
-  /** 人物面板候选:没敲过字给全量,敲过按包含匹配过滤。 */
-  const pickCandidates = $derived.by(() => {
-    if (!people) return [];
-    const q = editingDirty ? editingName.trim() : "";
-    return q ? people.filter((p) => personLabel(p).includes(q)) : people;
-  });
 
   const ids = $derived.by(() => {
     const all = Object.keys(speakers).sort(speakerIdCompare);
@@ -282,28 +256,13 @@
               {/if}
               {#if people && onPick}
                 <div class="caption">会议搭子</div>
-                {#if pickCandidates.length > 0}
-                  <div class="list">
-                    {#each pickCandidates as p (p.id)}
-                      <button class="row" onclick={() => commitPick(id, p.id)}>
-                        <!-- 色点用 ink 变体:soft 底(15% alpha)做 9px 点几乎不可见 -->
-                        <span class="dot" style="background: {speakerInk(p.id, 'mic')}"></span>
-                        <span class="row-label">{personLabel(p)}</span>
-                        {#if !p.name || dupNames.has(p.name)}
-                          <!-- 未命名/重名条目:补最近出现日期,两行不至于一模一样 -->
-                          <span class="row-sub">{recentLabel(p)}</span>
-                        {/if}
-                        {#if p.id === speakers[id]?.person_id}
-                          <svg class="tick" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            <path d="M3 8.5l3.2 3.2L13 5" />
-                          </svg>
-                        {/if}
-                      </button>
-                    {/each}
-                  </div>
-                {:else}
-                  <div class="empty">{people.length === 0 ? "还没有认识的人" : "没有匹配的人"}</div>
-                {/if}
+                <PersonPickList
+                  people={people ?? []}
+                  query={editingDirty ? editingName : ""}
+                  onpick={(p) => commitPick(id, p.id)}
+                  selectedId={speakers[id]?.person_id ?? null}
+                  emptyText={people.length === 0 ? "还没有认识的人" : "没有匹配的人"}
+                />
               {/if}
             {/if}
           </div>
@@ -425,10 +384,6 @@
     color: var(--ink-faint);
     letter-spacing: 0.02em;
   }
-  .list {
-    max-height: 13rem;
-    overflow-y: auto;
-  }
   /* 菜单行(「这是我」与人物行同形态):全宽、radius-md、hover surface-soft */
   .row {
     display: flex;
@@ -479,27 +434,5 @@
     color: var(--ink-faint);
     font-size: 0.72rem;
     flex: none;
-  }
-  /* 人物色点:与徽章同一调色板按 P 号取色(跨会议恒定) */
-  .dot {
-    width: 9px;
-    height: 9px;
-    border-radius: var(--radius-full);
-    flex: none;
-  }
-  .row-label {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .tick {
-    color: var(--accent);
-    flex: none;
-  }
-  .empty {
-    padding: 0.38rem 0.55rem 0.45rem;
-    color: var(--ink-faint);
   }
 </style>

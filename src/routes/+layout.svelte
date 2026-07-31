@@ -6,6 +6,7 @@
   import Sidebar from "$lib/Sidebar.svelte";
   import WelcomeOverlay from "$lib/WelcomeOverlay.svelte";
   import { recording } from "$lib/recording.svelte";
+  import { tidy } from "$lib/tidy.svelte";
   import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
   import { openUrl } from "@tauri-apps/plugin-opener";
@@ -76,6 +77,13 @@
     welcomeStatus = null;
     goto(target);
   }
+
+  // 整理收件箱全局驱动:挂载即跑一次(应用启动),之后随 peopleVersion(录制停止
+  // /人物增删改)重算——不锁在人物页签,自动归并不等用户逛到那儿才发生。
+  $effect(() => {
+    void recording.peopleVersion;
+    void tidy.refresh();
+  });
 
   onMount(() => {
     recording.init();

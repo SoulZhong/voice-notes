@@ -467,6 +467,31 @@ pub struct PersonMergeSuggestion {
     pub salience: Option<f32>,
 }
 
+/// 合并回执(合并日志条目的前端视图)。invalid_reason 非空 = 不能再撤销(原因
+/// 文案直接展示,如"此人随后又录了新会议");origin="auto" 且未确认的条目出现
+/// 在审阅流回执卡队列。
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeReceipt {
+    pub journal_id: String,
+    pub time: String,
+    pub origin: String,
+    pub loser: String,
+    pub loser_name: String,
+    pub winner: String,
+    pub winner_name: String,
+    pub similarity: Option<f32>,
+    /// 被并入方合并前的样本快照副本(绝对路径;空=无样本或已被永久失效清理)。
+    pub loser_sample_paths: Vec<String>,
+    pub invalid_reason: Option<String>,
+}
+
+/// apply_confident_merges 返回:本次自动合并的回执 + 留给人工的建议。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfidentMergeOutcome {
+    pub applied: Vec<MergeReceipt>,
+    pub remaining: Vec<PersonMergeSuggestion>,
+}
+
 /// 目录迁移进度，事件名 "migrate"。kind∈{"data","models"} 标明迁的是哪条目录;
 /// phase∈{"copying","done","error"};error 时 message 带原因,其余为空串。
 #[derive(Debug, Clone, Serialize)]

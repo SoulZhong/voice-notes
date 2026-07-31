@@ -23,7 +23,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/notes/**", "$APPDATA/voiceprints/**"]
+        "scope": ["$APPDATA/notes/**", "$APPDATA/voiceprints/**", "$APPDATA/merge_journal/**"]
       }
     }
   },
