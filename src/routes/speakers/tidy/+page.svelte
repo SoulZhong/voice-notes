@@ -18,6 +18,7 @@
   import {
     buildTidyQueue,
     keyCommand,
+    mergeDuplicatePeople,
     orderWithSkips,
     tidyItemKey,
     type TidyItem,
@@ -156,11 +157,9 @@
   async function doMergeDup(name: string, g: PersonSummary[]) {
     await act(async () => {
       const winner = dupPrimaryId(name, g);
-      let jid = "";
-      for (const p of g) {
-        if (p.id !== winner) jid = await mergePerson(p.id, winner);
-      }
-      lastManual = { journalId: jid, label: `「${name}」并成一条` };
+      await mergeDuplicatePeople(g, winner, mergePerson, (journalId) => {
+        lastManual = { journalId, label: `「${name}」并成一条` };
+      });
     });
   }
   async function doDeleteNoSample(p: PersonSummary) {

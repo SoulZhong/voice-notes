@@ -58,6 +58,21 @@ export function orderWithSkips(items: TidyItem[], skippedKeys: string[]): TidyIt
   return [...kept, ...skipped];
 }
 
+/** 同名组按列表顺序并入 winner。每次成功后立刻发布对应 journal id,而不是等整组
+    完成:后续某一条失败时,调用方仍能展示最近一次已落盘合并的撤销入口。 */
+export async function mergeDuplicatePeople(
+  people: PersonSummary[],
+  winner: string,
+  merge: (loser: string, winner: string) => Promise<string>,
+  onMerged: (journalId: string) => void,
+): Promise<void> {
+  for (const person of people) {
+    if (person.id === winner) continue;
+    const journalId = await merge(person.id, winner);
+    onMerged(journalId);
+  }
+}
+
 /** 键盘命令:Enter=主动作,X=忽略/保留(回执卡除外——撤销只走点击防误触),
     S=跳过,数字=试听(双栏卡 1/2=左右方——回执卡 1=被并入方快照副本,2=winner 最新;
     同名组卡 1-9=第 n 条;nosample 卡无试听)。null=此卡无该命令。 */

@@ -52,11 +52,17 @@ pub struct MergeJournalEntry {
 /// 上下文中操作,模块自身不再加锁。
 pub struct MergeJournal {
     root: PathBuf,
+    #[cfg(test)]
+    fail_next_save_for: std::sync::Mutex<Option<String>>,
 }
 
 impl MergeJournal {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            #[cfg(test)]
+            fail_next_save_for: std::sync::Mutex::new(None),
+        }
     }
 
     fn dir(&self) -> PathBuf {
@@ -93,9 +99,19 @@ impl MergeJournal {
             .flatten()
             .filter(|e| e.path().is_dir())
             .filter_map(|e| {
+                // fail-closed 失效路径会先把目录原子改名为隐藏 quarantine。只读取
+                // 路径名与 entry.id 严格一致的合法目录,避免隔离条目重新进入 UI。
+                let dir_id = e.file_name().to_str()?.to_string();
+                if self.entry_dir(&dir_id).as_deref() != Some(e.path().as_path()) {
+                    return None;
+                }
                 let s = std::fs::read_to_string(e.path().join("entry.json")).ok()?;
-                match serde_json::from_str(&s) {
-                    Ok(v) => Some(v),
+                match serde_json::from_str::<MergeJournalEntry>(&s) {
+                    Ok(v) if v.id == dir_id => Some(v),
+                    Ok(_) => {
+                        eprintln!("合并日志目录名与条目 id 不一致,跳过({:?})", e.path());
+                        None
+                    }
                     Err(err) => {
                         eprintln!("合并日志条目损坏,跳过({:?}): {err}", e.path());
                         None
@@ -109,12 +125,39 @@ impl MergeJournal {
 
     /// 原子写条目 JSON(tmp+rename,与库文件同哲学)。
     fn save_entry(&self, e: &MergeJournalEntry) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            let mut fail = self.fail_next_save_for.lock().expect("测试 failpoint 锁");
+            if fail.as_deref() == Some(e.id.as_str()) {
+                fail.take();
+                anyhow::bail!("测试注入:save_entry 失败");
+            }
+        }
         let path = self.entry_path(&e.id).ok_or_else(|| anyhow::anyhow!("非法日志 id: {}", e.id))?;
         std::fs::create_dir_all(path.parent().expect("entry_path 恒有父目录"))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(e)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
+    }
+
+    /// 失效标记写不下去时,旧 entry.json 仍表示“可撤销”。先把整个目录原子移出
+    /// 合法命名空间,再 best-effort 删除;这样即使删除失败,entry()/entries() 也看
+    /// 不到过期快照。rename 不可用时退回直接删除。
+    fn discard_stale_entry(&self, id: &str) -> anyhow::Result<()> {
+        let dir = self.entry_dir(id).ok_or_else(|| anyhow::anyhow!("非法日志 id: {id}"))?;
+        let quarantine = self.dir().join(format!(".invalid-{id}"));
+        if quarantine.exists() {
+            let _ = std::fs::remove_dir_all(&quarantine);
+        }
+        match std::fs::rename(&dir, &quarantine) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(quarantine);
+                Ok(())
+            }
+            Err(rename_err) => std::fs::remove_dir_all(&dir)
+                .map_err(|remove_err| anyhow::anyhow!("隔离失败:{rename_err};删除失败:{remove_err}")),
+        }
     }
 
     /// 落一条新日志:entry.json + 双方样本文件副本。任一步失败→清掉半成品目录并
@@ -151,8 +194,8 @@ impl MergeJournal {
 
     /// 触及 touched 中任一人物的**有效**条目全部失效。by=使其失效的合并 id(该
     /// 合并被撤销时本条复活,样本副本保留);by=None 为永久性失效(改名/删除/新
-    /// 录制等),样本副本删掉省空间。best-effort:失效是保护层,写失败只 eprintln
-    /// 不打断主流程(宁可少一个可撤销项,不挡合并/录制)。
+    /// 录制等),样本副本删掉省空间。失效标记写失败时 fail-closed 隔离整条日志:
+    /// 宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物数据。
     pub fn invalidate(&self, touched: &[&str], reason: &str, by: Option<&str>) {
         for mut e in self.entries() {
             if e.invalid_reason.is_some() {
@@ -167,7 +210,14 @@ impl MergeJournal {
             e.invalid_reason = Some(reason.to_string());
             e.invalidated_by = by.map(str::to_string);
             if let Err(err) = self.save_entry(&e) {
-                eprintln!("合并日志失效标记写入失败({}): {err}", e.id);
+                if let Err(discard_err) = self.discard_stale_entry(&e.id) {
+                    eprintln!(
+                        "合并日志失效标记写入失败且隔离失败({}): {err};{discard_err}",
+                        e.id
+                    );
+                } else {
+                    eprintln!("合并日志失效标记写入失败,已隔离过期撤销项({}): {err}", e.id);
+                }
                 continue;
             }
             if by.is_none() {
@@ -323,6 +373,19 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, b"RIFFfake-wav").unwrap();
         p
+    }
+
+    #[test]
+    fn invalidate_failure_removes_stale_undo_entry_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        j.append(&entry("m-P1", "t1", "P1", "P9"), &[], &[]).unwrap();
+        *j.fail_next_save_for.lock().unwrap() = Some("m-P1".into());
+
+        j.invalidate(&["P1"], "此人随后被改名", None);
+
+        assert!(j.entry("m-P1").is_err(), "写不下失效标记时旧快照必须不可撤销");
+        assert!(j.entries().is_empty(), "隔离目录不能重新进入回执/撤销列表");
     }
 
     #[test]

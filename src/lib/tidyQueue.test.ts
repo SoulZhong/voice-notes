@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildTidyQueue, keyCommand, orderWithSkips, tidyItemKey, type TidyItem } from "./tidyQueue";
+import {
+  buildTidyQueue,
+  keyCommand,
+  mergeDuplicatePeople,
+  orderWithSkips,
+  tidyItemKey,
+  type TidyItem,
+} from "./tidyQueue";
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
@@ -81,6 +88,26 @@ describe("orderWithSkips", () => {
     );
     const ordered = orderWithSkips(items, ["n:P4", "n:P5"]);
     expect(ordered.map(tidyItemKey)).toEqual(["n:P6", "n:P4", "n:P5"]);
+  });
+});
+
+describe("mergeDuplicatePeople", () => {
+  it("后续合并失败时仍发布最近一次成功合并的撤销 id", async () => {
+    const published: string[] = [];
+    const merge = async (loser: string) => {
+      if (loser === "P3") throw new Error("第二条失败");
+      return `m-${loser}`;
+    };
+
+    await expect(
+      mergeDuplicatePeople(
+        [person("P1", "张三"), person("P2", "张三"), person("P3", "张三")],
+        "P1",
+        merge,
+        (journalId) => published.push(journalId),
+      ),
+    ).rejects.toThrow("第二条失败");
+    expect(published).toEqual(["m-P2"]);
   });
 });
 
