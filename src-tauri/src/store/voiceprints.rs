@@ -400,6 +400,36 @@ impl VoiceprintStore {
         Ok(())
     }
 
+    /// 从失效日志条目拆回被并入方:按快照把 loser 重建为原编号独立说话人,还原
+    /// 指向他的 redirects(历史笔记段落重新归他),pair 进自动归并拒绝名单,条目
+    /// 删除。与 undo_merge 的区别:不动 winner(那次合并未被撤销,质心里已混入的
+    /// 贡献不抽回,后续录制自然纠正),也不 revive 链上条目(它们的前置状态未还原,
+    /// 复活会造成"可撤销"假象)。仅失效条目可拆;有效条目走 undo_merge。
+    pub fn restore_merged_person(&self, journal_id: &str) -> anyhow::Result<String> {
+        let _guard = vp_guard();
+        let journal = super::merge_journal::MergeJournal::new(self.root.clone());
+        let entry = journal.entry(journal_id)?;
+        if entry.invalid_reason.is_none() {
+            anyhow::bail!("该条仍可直接撤销,不需要拆回");
+        }
+        let mut vp = self.load();
+        if vp.people.contains_key(&entry.loser) {
+            anyhow::bail!("原编号 {} 已存在,无法拆回", entry.loser);
+        }
+        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+        vp.redirects.remove(&entry.loser);
+        for k in &entry.redirects_to_loser {
+            vp.redirects.insert(k.clone(), entry.loser.clone());
+        }
+        self.save(&vp)?;
+        if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+            eprintln!("拆回说话人:样本副本还原失败(不影响库): {e}");
+        }
+        journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
+        journal.remove(journal_id)?;
+        Ok(entry.loser.clone())
+    }
+
     /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)
     /// + 连带删除全部录音样本(best-effort)。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -2148,5 +2178,80 @@ mod tests {
         assert!(j.entry(&j1).unwrap().invalid_reason.is_none(), "j2 撤销后 j1 复活");
         store.undo_merge(&j1).unwrap(); // 再撤 j1,库回到最初
         assert_eq!(store.load().people, before.people);
+    }
+
+    // ── restore_merged_person(拆回原身份)── 只对失效条目生效,不动 winner,不 revive 链 ──
+
+    /// P1(未命名)并入 P2(张三)落条目,再让条目失效(模拟"P2 随后又被合并"),
+    /// 造出可拆回的场景。返回 (store, journal_id, tmp)——tmp 需随用例存活。
+    fn setup_invalidated_merge() -> (VoiceprintStore, String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        j.invalidate(&["P2"], "相关人物随后又被合并", None);
+        (store, jid, tmp)
+    }
+
+    /// 同上但条目未失效,仍可直接撤销。
+    fn setup_valid_merge() -> (VoiceprintStore, String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        (store, jid, tmp)
+    }
+
+    /// 链式合并:P1→P2 落条目 A,再 P2→P3 落条目 B——B 一落地就把触及 P2 的 A
+    /// 连带失效(invalidated_by=B)。额外让 B 自身也失效(模拟 P3 随后又变动),
+    /// 使 B 具备"可拆回"的前提(仅失效条目可拆)。
+    fn setup_chained_merges() -> (VoiceprintStore, String, String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+        let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        j.invalidate(&["P3"], "相关人物随后又发生变化", None);
+        (store, entry_a, entry_b, tmp)
+    }
+
+    #[test]
+    fn restore_merged_person_rebuilds_loser_without_touching_winner() {
+        let (store, journal_id, tmp) = setup_invalidated_merge();
+        let winner_before = store.load().people.get("P2").cloned();
+
+        let pid = store.restore_merged_person(&journal_id).unwrap();
+
+        assert_eq!(pid, "P1");
+        let vp = store.load();
+        assert!(vp.people.contains_key("P1"), "loser 按快照重建");
+        assert_eq!(vp.people.get("P2").cloned(), winner_before, "winner 不动");
+        assert!(!vp.redirects.contains_key("P1"), "loser 不再被重定向");
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        assert!(journal.entry(&journal_id).is_err(), "条目删除");
+        assert!(journal.auto_denylist().iter().any(|p| p == "P1>P2"), "pair 进拒绝名单");
+    }
+
+    #[test]
+    fn restore_merged_person_rejects_valid_entry() {
+        let (store, journal_id, _tmp) = setup_valid_merge();
+        let err = store.restore_merged_person(&journal_id).unwrap_err().to_string();
+        assert!(err.contains("撤销"), "有效条目应引导走撤销而非拆回: {err}");
+    }
+
+    #[test]
+    fn restore_merged_person_does_not_revive_chain() {
+        let (store, entry_a_id, entry_b_id, tmp) = setup_chained_merges();
+
+        store.restore_merged_person(&entry_b_id).unwrap();
+
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let a = journal.entry(&entry_a_id).unwrap();
+        assert!(a.invalid_reason.is_some(), "链上条目不复活——B 那次合并并未被撤销");
     }
 }

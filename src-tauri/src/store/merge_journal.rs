@@ -782,4 +782,18 @@ mod tests {
         assert!(out.join("P2.wav").exists(), "仅有兜底截声时拷成槽 1,拆回的人才有样本可听");
         assert!(!out.join("P2-cut.wav").exists());
     }
+
+    #[test]
+    fn restore_loser_samples_ignores_cut_when_regular_slot_present() {
+        // 常规槽位与兜底截声并存(常规槽是合并时真实迁移前的样本,截声只是兜底):
+        // 只拷常规槽,截声不进正式库,避免同一人多出一份"降级"样本。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "loser", "P1-cut.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1, "常规槽位存在时只拷常规槽");
+        assert!(out.join("P1.wav").exists());
+        assert!(!out.join("P1-cut.wav").exists(), "截声不该被拷回");
+    }
 }
