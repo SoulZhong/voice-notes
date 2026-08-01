@@ -414,16 +414,25 @@ impl VoiceprintStore {
         }
         let mut vp = self.load();
         if vp.people.contains_key(&entry.loser) {
-            anyhow::bail!("原编号 {} 已存在,无法拆回", entry.loser);
-        }
-        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
-        vp.redirects.remove(&entry.loser);
-        for k in &entry.redirects_to_loser {
-            vp.redirects.insert(k.clone(), entry.loser.clone());
-        }
-        self.save(&vp)?;
-        if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
-            eprintln!("拆回说话人:样本副本还原失败(不影响库): {e}");
+            // id 单调分配、不复用,现实中不会真撞库——走到这里只有一种解释:
+            // 上一次拆回已经把 loser 写回库(含 redirect/样本回填),但在
+            // journal.remove 前被打断(I/O 偶发失败),条目还留着导致这是次
+            // 重试。此时若仍 bail("已存在"),拆回就永久卡死、无法重试;
+            // 而重建/redirect/样本回填都已经做过,不能再做一遍(会用快照
+            // 覆盖掉重建后可能已发生的新变化)。所以这一分支只补做收尾
+            // (deny_auto + remove),不碰 vp / 样本——与 undo_merge 「remove
+            // 失败则重试幂等」的承诺保持一致。
+            eprintln!("拆回说话人:{} 已在库中,视为上次拆回的重试(仅补做收尾)", entry.loser);
+        } else {
+            vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+            vp.redirects.remove(&entry.loser);
+            for k in &entry.redirects_to_loser {
+                vp.redirects.insert(k.clone(), entry.loser.clone());
+            }
+            self.save(&vp)?;
+            if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+                eprintln!("拆回说话人:样本副本还原失败(不影响库): {e}");
+            }
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
         journal.remove(journal_id)?;
@@ -2253,5 +2262,29 @@ mod tests {
         let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         let a = journal.entry(&entry_a_id).unwrap();
         assert!(a.invalid_reason.is_some(), "链上条目不复活——B 那次合并并未被撤销");
+    }
+
+    #[test]
+    fn restore_merged_person_retry_after_partial_failure_is_idempotent() {
+        // 模拟"上次拆回已把 loser 写回库,但在 journal.remove 前中断"的场景:
+        // 手动把 loser 快照插回库(不经 restore_merged_person),条目仍留着。
+        let (store, journal_id, tmp) = setup_invalidated_merge();
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let entry = journal.entry(&journal_id).unwrap();
+        let mut vp = store.load();
+        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+        store.save(&vp).unwrap();
+
+        let pid = store.restore_merged_person(&journal_id).unwrap();
+
+        assert_eq!(pid, "P1", "重试仍应返回 loser 编号");
+        let vp = store.load();
+        assert_eq!(
+            vp.people.get("P1"),
+            Some(&entry.loser_person),
+            "loser 仍在库,重试不应二次覆盖破坏记录"
+        );
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        assert!(journal.entry(&journal_id).is_err(), "重试应成功清掉条目,不报'已存在'");
     }
 }
