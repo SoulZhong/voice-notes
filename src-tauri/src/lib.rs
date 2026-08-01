@@ -3206,6 +3206,24 @@ fn undo_merge(app: AppHandle, state: State<AppState>, journal_id: String) -> Res
     queue_person_graph_rebuild(&app, root, "撤销合并")
 }
 
+/// 失效回执「拆回独立说话人」:按快照重建被并入方。录制中拒绝:理由同 merge_person。
+#[tauri::command]
+fn restore_merged_person(
+    app: AppHandle,
+    state: State<AppState>,
+    journal_id: String,
+) -> Result<String, String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能拆回说话人".into());
+    }
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let pid = store::VoiceprintStore::new(root.clone())
+        .restore_merged_person(&journal_id)
+        .map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "拆回说话人")?;
+    Ok(pid)
+}
+
 /// 回执卡「好」:确认自动归并,条目(连同样本副本)删除。
 #[tauri::command]
 fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
@@ -4642,6 +4660,7 @@ pub fn run() {
             suggest_person_merges,
             apply_confident_merges,
             undo_merge,
+            restore_merged_person,
             acknowledge_merge,
             list_merge_receipts,
             dismiss_tidy_item,

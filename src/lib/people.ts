@@ -80,5 +80,9 @@ export const acknowledgeMerge = (journalId: string) =>
   invoke<void>("acknowledge_merge", { journalId });
 /** 整理条目人工处置(忽略/保留)落盘:重启后不再出现。key 为 tidyItemKey 格式。 */
 export const dismissTidyItem = (key: string) => invoke<void>("dismiss_tidy_item", { key });
+/** 失效回执「拆回独立说话人」:按合并时快照把被并入方重建为原编号独立说话人,
+    返回其 id;录制中后端拒绝。 */
+export const restoreMergedPerson = (journalId: string) =>
+  invoke<string>("restore_merged_person", { journalId });
 /** 已落盘的处置键全量(重启后合并进本地已忽略集合)。 */
 export const listDismissedTidyItems = () => invoke<string[]>("list_dismissed_tidy_items");
