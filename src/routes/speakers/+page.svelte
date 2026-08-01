@@ -565,7 +565,6 @@
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;
-    max-width: 44rem;
   }
   h1 {
     margin: 0 0 0.75rem;
@@ -637,10 +636,13 @@
     color: var(--ink-faint);
     font-size: 0.85rem;
   }
+  /* 自适应多列:宽窗 2-3 列一屏多卡,窄窗自动退单列;卡片顶对齐各保己高,
+     DOM 序即队列序(逐行阅读)。存档组/横幅/撤销条在 .stack 外,天然整行。 */
   .stack {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(26rem, 1fr));
     gap: 0.8rem;
+    align-items: start;
   }
   .archive {
     margin-top: 1rem;
