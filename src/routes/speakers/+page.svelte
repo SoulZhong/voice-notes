@@ -219,16 +219,16 @@
   }
   /** 不可撤销的回执只剩回看价值,批量确认清掉,不必逐张点。 */
   async function ackAllInvalid() {
-    const invalid = archived.filter((i) => i.kind === "receipt");
+    const invalid = archived;
     await act(
       async () => {
         for (const i of invalid) {
-          if (i.kind === "receipt") await acknowledgeMerge(i.receipt.journal_id);
+          await acknowledgeMerge(i.receipt.journal_id);
         }
       },
       () => {
         for (const i of invalid) {
-          if (i.kind === "receipt") tidy.removeReceipt(i.receipt.journal_id);
+          tidy.removeReceipt(i.receipt.journal_id);
         }
       },
     );
@@ -545,7 +545,7 @@
             {#if archiveOpen}
               <div class="stack">
                 {#each archived as item (tidyItemKey(item))}
-                  {#if item.kind === "receipt"}{@render receiptCard(item.receipt)}{/if}
+                  {@render receiptCard(item.receipt)}
                 {/each}
               </div>
             {/if}

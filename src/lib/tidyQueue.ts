@@ -53,11 +53,18 @@ export function buildTidyQueue(
   return items.filter((i) => !dismissed.has(tidyItemKey(i)));
 }
 
+/** 回执类条目(splitArchive 的 archived 侧只可能是它,类型上钉死,消费方无需再判 kind)。 */
+export type ReceiptItem = Extract<TidyItem, { kind: "receipt" }>;
+
 /** 待办/存档分组:失效回执(不能再撤销)只剩回看价值,折叠进存档区,不算待办
     ——徽标与「N 件待处理」按 pending 计。 */
-export function splitArchive(items: TidyItem[]): { pending: TidyItem[]; archived: TidyItem[] } {
-  const archived = items.filter((i) => i.kind === "receipt" && i.receipt.invalid_reason !== null);
-  const pending = items.filter((i) => !archived.includes(i));
+export function splitArchive(items: TidyItem[]): { pending: TidyItem[]; archived: ReceiptItem[] } {
+  const pending: TidyItem[] = [];
+  const archived: ReceiptItem[] = [];
+  for (const i of items) {
+    if (i.kind === "receipt" && i.receipt.invalid_reason !== null) archived.push(i);
+    else pending.push(i);
+  }
   return { pending, archived };
 }
 
