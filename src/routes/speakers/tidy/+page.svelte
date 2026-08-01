@@ -35,6 +35,9 @@
   const queue = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed));
   const pendingN = $derived(queue.filter((i) => i.kind !== "receipt").length);
   const receiptsN = $derived(queue.filter((i) => i.kind === "receipt").length);
+  const invalidReceiptsN = $derived(
+    queue.filter((i) => i.kind === "receipt" && i.receipt.invalid_reason !== null).length,
+  );
   const live = $derived(recording.isLive);
 
   const plabel = (id: string, name: string) => name || `说话人 ${id.replace(/^P/, "")}`;
@@ -163,6 +166,24 @@
       () => tidy.removeReceipt(r.journal_id),
     );
   }
+  /** 不可撤销的回执只剩回看价值,批量确认清掉,不必逐张点。 */
+  async function ackAllInvalid() {
+    const invalid = queue.filter(
+      (i) => i.kind === "receipt" && i.receipt.invalid_reason !== null,
+    );
+    await act(
+      async () => {
+        for (const i of invalid) {
+          if (i.kind === "receipt") await acknowledgeMerge(i.receipt.journal_id);
+        }
+      },
+      () => {
+        for (const i of invalid) {
+          if (i.kind === "receipt") tidy.removeReceipt(i.receipt.journal_id);
+        }
+      },
+    );
+  }
   async function doUndo(journalId: string) {
     // removeReceipt 对不存在的 id 是 no-op:doUndo 既用于回执撤销卡也用于手动
     // 合并后的页内撤销条,两处共用同一 optimistic 安全。
@@ -235,6 +256,14 @@
     {#if tidy.loading}<span class="refreshing">正在比对声纹…</span>{/if}
   </header>
 
+  {#if invalidReceiptsN > 1}
+    <div class="tools">
+      <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>
+        一键确认全部 {invalidReceiptsN} 条不可撤销回执
+      </button>
+    </div>
+  {/if}
+
   {#if live}
     <div class="banner warn">录制中不能整理——可以浏览和试听,合并/删除/撤销等停止录制后再做。</div>
   {/if}
@@ -266,8 +295,14 @@
       {#each queue as item (tidyItemKey(item))}
         {#if item.kind === "receipt"}
           {@const r = item.receipt}
-          <section class="card">
-            <div class="card-tag">已自动归并</div>
+          <section class="card" class:archived={r.invalid_reason}>
+            <div class="card-tag">
+              {#if r.invalid_reason}
+                已自动归并 · 仅存档 · {r.invalid_reason}
+              {:else}
+                已自动归并
+              {/if}
+            </div>
             <div class="card-title">
               {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
               {#if r.similarity !== null}
@@ -320,11 +355,10 @@
             </div>
             <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
             <div class="acts">
-              <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
               {#if r.invalid_reason}
-                <button class="mini" disabled title={r.invalid_reason}>撤销(不可用)</button>
-                <span class="hint">{r.invalid_reason}</span>
+                <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>知道了</button>
               {:else}
+                <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
                 <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id)}>撤销</button>
               {/if}
             </div>
@@ -470,6 +504,11 @@
     border-color: var(--warning-line);
     color: var(--warning-ink);
   }
+  .tools {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.8rem;
+  }
   .undo-strip {
     display: flex;
     align-items: center;
@@ -485,6 +524,9 @@
     background: var(--surface);
     border-radius: var(--radius-lg);
     padding: 1rem 1.1rem;
+  }
+  .card.archived {
+    opacity: 0.75;
   }
   .card-tag {
     font-size: 0.75rem;
