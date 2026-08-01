@@ -29,7 +29,12 @@ export function buildTidyQueue(
   dismissed: Set<string> = new Set(),
 ): TidyItem[] {
   const items: TidyItem[] = receipts.map((r) => ({ kind: "receipt", receipt: r }));
-  for (const s of suggestions) items.push({ kind: "suggestion", suggestion: s });
+  const ids = new Set(people.map((p) => p.id));
+  // 失效目标保险:后端建议按当前库现算,但拉取与消费之间有时序窗口——已合并/
+  // 已删除的人不能再作合并目标(或来源),否则点「合并」必报「人物不存在」。
+  for (const s of suggestions) {
+    if (ids.has(s.loser) && ids.has(s.winner)) items.push({ kind: "suggestion", suggestion: s });
+  }
   const byName = new Map<string, PersonSummary[]>();
   for (const p of people) {
     if (!p.name) continue;
@@ -46,6 +51,14 @@ export function buildTidyQueue(
     }
   }
   return items.filter((i) => !dismissed.has(tidyItemKey(i)));
+}
+
+/** 待办/存档分组:失效回执(不能再撤销)只剩回看价值,折叠进存档区,不算待办
+    ——徽标与「N 件待处理」按 pending 计。 */
+export function splitArchive(items: TidyItem[]): { pending: TidyItem[]; archived: TidyItem[] } {
+  const archived = items.filter((i) => i.kind === "receipt" && i.receipt.invalid_reason !== null);
+  const pending = items.filter((i) => !archived.includes(i));
+  return { pending, archived };
 }
 
 /** 同名组按列表顺序并入 winner。每次成功后立刻发布对应 journal id,而不是等整组

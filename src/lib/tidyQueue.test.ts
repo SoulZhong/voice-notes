@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTidyQueue, mergeDuplicatePeople, tidyItemKey, type TidyItem } from "./tidyQueue";
+import { buildTidyQueue, mergeDuplicatePeople, splitArchive, tidyItemKey, type TidyItem } from "./tidyQueue";
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
@@ -22,7 +22,7 @@ const sug = (loser: string, winner: string): PersonMergeSuggestion => ({
   salience: null,
 });
 
-const receipt = (id: string): MergeReceipt => ({
+const receipt = (id: string, invalidReason: string | null = null): MergeReceipt => ({
   journal_id: id,
   time: "t",
   origin: "auto",
@@ -33,7 +33,7 @@ const receipt = (id: string): MergeReceipt => ({
   similarity: 0.9,
   loser_sample_paths: [],
   winner_sample_paths: [],
-  invalid_reason: null,
+  invalid_reason: invalidReason,
 });
 
 describe("buildTidyQueue", () => {
@@ -70,6 +70,44 @@ describe("buildTidyQueue", () => {
     expect(tidyItemKey({ kind: "receipt", receipt: receipt("m-P1") })).toBe("r:m-P1");
     expect(tidyItemKey({ kind: "nosample", person: person("P4") })).toBe("n:P4");
     expect(tidyItemKey({ kind: "dup", name: "张三", people: [] })).toBe("d:张三");
+  });
+});
+
+describe("buildTidyQueue 失效目标过滤", () => {
+  it("winner 不在库的建议被滤掉(已合并/已删除的人不能再作合并目标)", () => {
+    const people = [person("P1")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toEqual([]);
+  });
+
+  it("loser 不在库的建议同样滤掉", () => {
+    const people = [person("P9")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toEqual([]);
+  });
+
+  it("双方都在库的建议保留", () => {
+    const people = [person("P1"), person("P9")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toHaveLength(1);
+  });
+});
+
+describe("splitArchive", () => {
+  it("失效回执进 archived,其余进 pending,各自保持队列序", () => {
+    const items = buildTidyQueue(
+      [person("P1")],
+      [],
+      [receipt("J1"), receipt("J2", "相关人物随后又被合并"), receipt("J3")],
+      new Set(),
+    );
+    const { pending, archived } = splitArchive(items);
+    expect(archived.map((i) => i.kind === "receipt" && i.receipt.journal_id)).toEqual(["J2"]);
+    expect(pending.filter((i) => i.kind === "receipt")).toHaveLength(2);
+  });
+
+  it("空输入两侧都空", () => {
+    expect(splitArchive([])).toEqual({ pending: [], archived: [] });
   });
 });
 
