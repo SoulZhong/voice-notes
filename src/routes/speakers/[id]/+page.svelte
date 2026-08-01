@@ -25,6 +25,8 @@
   let people = $state<PersonSummary[]>([]);
   let loaded = $state(false);
   let error = $state("");
+  /** 撤销条重入门:双击/连点时后端还没落盘,同一条日志不能被并发撤销两次。 */
+  let undoing = $state(false);
 
   // 详情数据从全量列表 find:合并菜单本就需要其他人物做目标,一次拉取两用。
   const person = $derived(people.find((p) => p.id === personId) ?? null);
@@ -238,19 +240,25 @@
 
   /** 撤销条数据在 tidy.lastManual(会话级全局;后端日志兜底,失效时撤销报错原样透出)。 */
   async function undoLastMerge() {
-    const last = tidy.lastManual;
-    if (!last) return;
+    if (undoing) return;
+    undoing = true;
     try {
-      await undoMerge(last.journalId);
-      tidy.lastManual = null;
-      recording.bumpPeople();
-      await tidy.refresh();
-      await refresh();
-    } catch (e) {
-      error = `${e}`;
-      // 失败也对账:日志可能已失效,重拉让回执/建议回到与库一致的形态
-      recording.bumpPeople();
-      await refresh();
+      const last = tidy.lastManual;
+      if (!last) return;
+      try {
+        await undoMerge(last.journalId);
+        tidy.lastManual = null;
+        recording.bumpPeople();
+        await tidy.refresh();
+        await refresh();
+      } catch (e) {
+        error = `${e}`;
+        // 失败也对账:日志可能已失效,重拉让回执/建议回到与库一致的形态
+        recording.bumpPeople();
+        await refresh();
+      }
+    } finally {
+      undoing = false;
     }
   }
 
@@ -358,7 +366,7 @@
   {#if tidy.lastManual}
     <div class="undo-strip">
       已合并:{tidy.lastManual.label}
-      <button class="mini" disabled={recording.isLive} onclick={undoLastMerge}>撤销</button>
+      <button class="mini" disabled={recording.isLive || undoing} onclick={undoLastMerge}>撤销</button>
       <button class="mini" onclick={() => (tidy.lastManual = null)}>好</button>
     </div>
   {/if}

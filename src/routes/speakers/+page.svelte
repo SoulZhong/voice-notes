@@ -351,7 +351,9 @@
         {/if}
       </div>
     </div>
-    <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
+    {#if !r.invalid_reason}
+      <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
+    {/if}
     <div class="acts">
       {#if r.invalid_reason}
         <button class="mini accent" disabled={busy || live} onclick={() => doRestore(r)}>拆回独立说话人</button>
@@ -365,6 +367,7 @@
       <p class="hint">
         不能撤销时:先听「合并时的原声」核对;确认并错可「拆回独立说话人」——按合并时快照
         恢复原编号,历史笔记段落重新归他,之后录制也能重新认出;当时的合并对象不受影响。
+        拆回后这两条仍可能作为普通建议出现,不想合可忽略。
       </p>
     {/if}
     {@render cardError(`r:${r.journal_id}`)}

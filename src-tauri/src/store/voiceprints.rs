@@ -379,6 +379,9 @@ impl VoiceprintStore {
         vp.people.insert(entry.winner.clone(), entry.winner_person.clone());
         vp.redirects.remove(&entry.loser);
         for k in &entry.redirects_to_loser {
+            // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
+            // 会让 resolve 把他解析走,笔记归属与新样本落盘全部错人。
+            if vp.people.contains_key(k) { continue; }
             vp.redirects.insert(k.clone(), entry.loser.clone());
         }
         self.save(&vp)?;
@@ -427,6 +430,9 @@ impl VoiceprintStore {
             vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
             vp.redirects.remove(&entry.loser);
             for k in &entry.redirects_to_loser {
+                // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
+                // 会让 resolve 把他解析走,笔记归属与新样本落盘全部错人。
+                if vp.people.contains_key(k) { continue; }
                 vp.redirects.insert(k.clone(), entry.loser.clone());
             }
             self.save(&vp)?;
@@ -435,6 +441,13 @@ impl VoiceprintStore {
             }
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
+        // winner 多半已被再次合并(这正是条目失效的主因):把它的当前化身也进名单,
+        // 否则下一轮自动归并会把刚拆回的人立刻并进化身,拆回等于没拆。
+        if let Some(current) = Self::resolve(&vp, &entry.winner) {
+            if current != entry.winner {
+                journal.deny_auto(&format!("{}>{}", entry.loser, current));
+            }
+        }
         journal.remove(journal_id)?;
         Ok(entry.loser.clone())
     }
@@ -2286,5 +2299,58 @@ mod tests {
         );
         let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         assert!(journal.entry(&journal_id).is_err(), "重试应成功清掉条目,不报'已存在'");
+    }
+
+    /// 链式合并 A=P1→P2(被 B 连带失效)、B=P2→P3(仍有效)。先拆回 A 重建 P1,
+    /// 再撤销 B——B 的快照里 redirects_to_loser 含 "P1"(B 落地时 P1 还重定向到
+    /// P2),回放不能无脑插回,否则 resolve("P1") 会被解析成 P2,刚拆回的人被
+    /// 静默架空。
+    #[test]
+    fn restore_then_undo_chained_merge_does_not_reredirect_restored_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+        // entry_a 已被 entry_b 的创建连带失效(触及 P2);entry_b 本身仍有效。
+
+        store.restore_merged_person(&entry_a).unwrap();
+        assert!(store.load().people.contains_key("P1"), "拆回后 P1 重建为独立说话人");
+
+        store.undo_merge(&entry_b).unwrap();
+
+        let vp = store.load();
+        assert!(!vp.redirects.contains_key("P1"), "拆回的人不能被快照回放重新遮蔽");
+        assert!(vp.people.contains_key("P1"));
+        assert!(vp.people.contains_key("P2"));
+    }
+
+    /// 同样的链式场景:拆回 A 后,winner P2 已经(通过 B)并入 P3——拒绝名单必须
+    /// 同时记住原始 pair 与解析到当前化身的 pair,否则下一轮自动归并会立刻把
+    /// 刚拆回的人并回 P3,拆回等于没拆。
+    #[test]
+    fn restore_merged_person_denylists_current_avatar_when_winner_already_merged_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let _entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+
+        store.restore_merged_person(&entry_a).unwrap();
+
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let deny = journal.auto_denylist();
+        assert!(deny.iter().any(|p| p == "P1>P2"), "原始 pair 进名单: {deny:?}");
+        assert!(deny.iter().any(|p| p == "P1>P3"), "解析后的当前化身 pair 也要进名单: {deny:?}");
     }
 }
