@@ -24,6 +24,10 @@ export const isStrong = (s: PersonMergeSuggestion) =>
 class TidyState {
   suggestions = $state<PersonMergeSuggestion[]>([]);
   receipts = $state<MergeReceipt[]>([]);
+  /** 手动合并后的撤销条(最近一次,会话级全局)。手动合并不进回执收件箱,这里是
+      UI 上唯一的撤销入口——挂在页面局部状态时一次导航就永久丢失(后端日志明明
+      还在),故提到 store:概览页与人物详情页同读同写,谁合并的都能在两处撤。 */
+  lastManual = $state<{ journalId: string; label: string } | null>(null);
   /** 人工处置集(忽略的建议对/保留的无样本条目/忽略的同名组),键=tidyItemKey。
       落盘为真值源,本地 Set 是即时展示的乐观镜像。 */
   dismissed = $state<Set<string>>(new Set());

@@ -57,6 +57,27 @@ describe("filterPeople", () => {
   it("未命中返回空数组", () => {
     expect(filterPeople(people, "不存在的名字")).toEqual([]);
   });
+
+  it("全拼命中中文名(排序按拼音,检索也得认拼音)", () => {
+    expect(filterPeople(people, "lisi")).toEqual([people[1]]);
+    expect(filterPeople(people, "zhangsan")).toEqual([people[0]]);
+  });
+
+  it("拼音首字母命中中文名", () => {
+    expect(filterPeople(people, "ls")).toEqual([people[1]]);
+  });
+
+  it("拼音大小写不敏感", () => {
+    expect(filterPeople(people, "ZhangSan")).toEqual([people[0]]);
+  });
+
+  it("拼音前缀命中(边输边筛)", () => {
+    expect(filterPeople(people, "zhang")).toEqual([people[0]]);
+  });
+
+  it("纯数字查询不被拼音误伤,仍按编号匹配", () => {
+    expect(filterPeople(people, "3")).toEqual([people[2]]);
+  });
 });
 
 describe("sortPeopleAlpha", () => {

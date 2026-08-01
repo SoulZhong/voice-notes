@@ -5,6 +5,17 @@
 // 不变),让调用方能把"点了没声"的真实原因显性化(如错误横幅),而不是吞掉。
 export type PlayerLike = { play(): unknown; pause(): void; onended: (() => void) | null };
 
+/** play() 失败转用户可读文案:已知媒体错误给中文(终端用户读不懂 WebKit 英文原文),
+    未知错误保留原文——别把真实原因编码没了。 */
+export function describePlayError(err: unknown): string {
+  const name = (err as { name?: string } | null | undefined)?.name ?? "";
+  const text = String(err);
+  if (name === "NotSupportedError" || text.includes("no supported source")) {
+    return "这份样本无法播放(文件可能已损坏或被移动)";
+  }
+  return text;
+}
+
 export function createAudition(
   factory: (src: string) => PlayerLike,
   onChange: (key: string | null) => void,
@@ -36,13 +47,13 @@ export function createAudition(
       if (r instanceof Promise) r.catch((err) => {
         if (key === k) {
           stop();
-          onError?.(String(err));
+          onError?.(describePlayError(err));
         }
       });
     } catch (err) {
       if (key === k) {
         stop();
-        onError?.(String(err));
+        onError?.(describePlayError(err));
       }
     }
   };
