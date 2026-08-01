@@ -15,10 +15,18 @@
   } from "$lib/people";
   import { formatDate, formatDuration, speakerInk, type NoteSummary } from "$lib/notes";
   import { isStrong, tidy } from "$lib/tidy.svelte";
-  import { buildTidyQueue, mergeDuplicatePeople, splitArchive, tidyItemKey, type TidyItem } from "$lib/tidyQueue";
+  import {
+    buildTidyQueue,
+    mergeDuplicatePeople,
+    resolveSugTarget,
+    splitArchive,
+    tidyItemKey,
+    type TidyItem,
+  } from "$lib/tidyQueue";
   import { createAudition, type PlayerLike } from "$lib/tidyAudio";
   import { keyedOnce } from "$lib/keyedOnce";
   import { recording } from "$lib/recording.svelte";
+  import PersonPickList from "$lib/PersonPickList.svelte";
 
   // 主从结构的落地页:人物索引在侧栏,本页概览引导之下常驻「分析说话人」区——
   // 队列由共享 store + 人物表现算,全量渲染;处理完的项随重算自然从列表消失。
@@ -32,6 +40,11 @@
   let confirmClean = $state(false);
   /** 存档折叠组的展开态(默认收起,失效回执只剩回看价值,不必占屏)。 */
   let archiveOpen = $state(false);
+  /** 建议卡合并目标的会话级改选(键=sugKey);还原=删键。 */
+  let sugOverride = $state<Record<string, string>>({});
+  /** 打开选人 popover 的建议卡(sugKey);同屏至多一个。 */
+  let sugPickFor = $state<string | null>(null);
+  let sugPickQuery = $state("");
 
   const named = $derived(people.filter((p) => p.name).length);
   const unnamed = $derived(people.length - named);
@@ -124,6 +137,7 @@
     actionError = null;
     audition.stop();
     confirmClean = false;
+    sugPickFor = null;
     try {
       await fn();
       optimistic?.(); // 后端成功即本地收起,不等整轮重算
@@ -139,14 +153,14 @@
     busy = false;
   }
 
-  async function doMergeSuggestion(s: PersonMergeSuggestion) {
+  async function doMergeSuggestion(s: PersonMergeSuggestion, targetId: string, targetName: string) {
     // 无 optimistic:这张建议卡随后台 refreshPeople/tidy.refresh 自然消失。
     await act(
       async () => {
-        const jid = await mergePerson(s.loser, s.winner);
+        const jid = await mergePerson(s.loser, targetId);
         tidy.lastManual = {
           journalId: jid,
-          label: `${plabel(s.loser, s.loser_name)} → ${plabel(s.winner, s.winner_name)}`,
+          label: `${plabel(s.loser, s.loser_name)} → ${plabel(targetId, targetName)}`,
         };
       },
       undefined,
@@ -447,24 +461,65 @@
               {@render receiptCard(item.receipt)}
             {:else if item.kind === "suggestion"}
               {@const s = item.suggestion}
+              {@const skey = `${s.loser}>${s.winner}`}
+              {@const target = resolveSugTarget(s, sugOverride, personById)}
               <section class="card">
                 <div class="card-tag">归属建议</div>
                 <div class="card-title">
                   这两条像同一个人吗?
-                  <span class="sim" class:strong={isStrong(s)}>
-                    相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
-                  </span>
+                  {#if target.overridden}
+                    <!-- 相似度只对系统建议对成立,换了人再挂着就是误导 -->
+                    <span class="sim">手动改选</span>
+                    <button
+                      class="mini plain"
+                      onclick={() => {
+                        const { [skey]: _, ...rest } = sugOverride;
+                        sugOverride = rest;
+                      }}>还原建议</button>
+                  {:else}
+                    <span class="sim" class:strong={isStrong(s)}>
+                      相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
+                    </span>
+                  {/if}
                 </div>
                 <div class="panes">
                   {@render personPane(s.loser, s.loser_name)}
                   <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
                   </svg>
-                  {@render personPane(s.winner, s.winner_name)}
+                  <div class="switch-anchor">
+                    {@render personPane(target.id, target.name)}
+                    <!-- 猜错人时就地换目标,不必忽略后绕去详情页「合并到…」 -->
+                    <button
+                      class="switch-btn"
+                      title="不是他?换成另一个已有的人"
+                      onclick={() => {
+                        confirmClean = false;
+                        sugPickQuery = "";
+                        sugPickFor = sugPickFor === skey ? null : skey;
+                      }}>换个人</button>
+                    {#if sugPickFor === skey}
+                      <button class="menu-scrim" aria-label="关闭菜单" onclick={() => (sugPickFor = null)}></button>
+                      <div class="menu">
+                        <div class="menu-title">把「{plabel(s.loser, s.loser_name)}」并入…</div>
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <input class="pick-input" autofocus placeholder="输入名字检索" bind:value={sugPickQuery} />
+                        <PersonPickList
+                          people={people.filter((p) => p.id !== s.loser && p.id !== target.id)}
+                          query={sugPickQuery}
+                          onpick={(p) => {
+                            sugOverride = { ...sugOverride, [skey]: p.id };
+                            loadNotes(p.id);
+                            sugPickFor = null;
+                          }}
+                        />
+                      </div>
+                    {/if}
+                  </div>
                 </div>
                 <p class="hint">两边各听一段原声,确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
                 <div class="acts">
-                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s)}>合并</button>
+                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s, target.id, target.name)}>合并</button>
                   <!-- 忽略是本地处置(dismissed 元数据),后端录制中也放行,不必陪绑置灰 -->
                   <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>忽略</button>
                 </div>
@@ -943,4 +998,81 @@
     margin: 0 0 0.4rem;
     font-weight: 500;
   }
+  /* 换目标:锚定 winner 面板,按钮悬浮右上角(faint 小字,hover 显色) */
+  .switch-anchor {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .switch-btn {
+    position: absolute;
+    top: 0.45rem;
+    right: 0.55rem;
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    font-size: 0.75rem;
+    padding: 0.1em 0.3em;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .switch-btn:hover {
+    color: var(--accent);
+    background: var(--accent-tint);
+  }
+  .menu-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    cursor: default;
+  }
+  .menu {
+    position: absolute;
+    top: 2rem;
+    right: 0.4rem;
+    z-index: 10;
+    min-width: 16rem;
+    max-height: 16rem;
+    overflow-y: auto;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    padding: 0.35rem;
+  }
+  .menu-title {
+    color: var(--ink-secondary);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    padding: 0.25rem 0.5rem 0.35rem;
+  }
+  .pick-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.35rem 0.5rem;
+    margin-bottom: 0.25rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--hairline);
+    outline: none;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--ink);
+  }
+  .pick-input::placeholder {
+    color: var(--ink-faint);
+  }
 </style>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== "Escape") return;
+    if (sugPickFor) sugPickFor = null;
+    else if (confirmClean) confirmClean = false;
+  }}
+/>
