@@ -16,7 +16,7 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { filterPeople, sortPeopleAlpha } from "$lib/personPick";
   import { tidy } from "$lib/tidy.svelte";
-  import { buildTidyQueue } from "$lib/tidyQueue";
+  import { buildTidyQueue, splitArchive } from "$lib/tidyQueue";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
@@ -149,8 +149,10 @@
   const peopleUnnamed = $derived(peopleFiltered.filter((p) => !p.name));
   const peopleNamed = $derived(peopleFiltered.filter((p) => p.name));
 
-  /** 「概览与整理」徽标:收件箱队列总数(回执+建议+同名组+无样本),像收件箱未读。 */
-  const tidyBadge = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed).length);
+  /** 「概览与整理」徽标:待拍板的活(有效回执+建议+同名组+无样本);失效存档不计。 */
+  const tidyBadge = $derived(
+    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed)).pending.length,
+  );
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)

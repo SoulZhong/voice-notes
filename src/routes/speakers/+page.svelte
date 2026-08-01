@@ -7,6 +7,7 @@
     listPeople,
     mergePerson,
     personNotes,
+    restoreMergedPerson,
     undoMerge,
     type MergeReceipt,
     type PersonMergeSuggestion,
@@ -14,8 +15,9 @@
   } from "$lib/people";
   import { formatDate, formatDuration, speakerInk, type NoteSummary } from "$lib/notes";
   import { isStrong, tidy } from "$lib/tidy.svelte";
-  import { buildTidyQueue, mergeDuplicatePeople, tidyItemKey, type TidyItem } from "$lib/tidyQueue";
+  import { buildTidyQueue, mergeDuplicatePeople, splitArchive, tidyItemKey, type TidyItem } from "$lib/tidyQueue";
   import { createAudition, type PlayerLike } from "$lib/tidyAudio";
+  import { keyedOnce } from "$lib/keyedOnce";
   import { recording } from "$lib/recording.svelte";
 
   // 主从结构的落地页:人物索引在侧栏,本页概览引导之下常驻「分析说话人」区——
@@ -23,22 +25,33 @@
   let people = $state<PersonSummary[]>([]);
   let error = $state("");
   let busy = $state(false);
-  /** 手动合并后的页内撤销条(最近一次;同名组连并多条时只能撤最后一条——撤销后
-      其前一条虽在合并日志里复活,但 manual 条目不进回执队列,UI 上无法继续撤;
-      同名组卡会重新出现,留给用户对复活的那一对重新拍板)。 */
-  let lastManual = $state<{ journalId: string; label: string } | null>(null);
-  /** 一键清理无样本条目的二段确认:单一状态,多张 nosample 卡共享(简单为先)。 */
+  /** 卡片级动作失败:挂在出错的那张卡下面,用户在哪儿点的就在哪儿看到原因
+      (顶部横幅在长队列底部操作时完全在视野外,表现为"点了没反应")。 */
+  let actionError = $state<{ key: string; msg: string } | null>(null);
+  /** 一键清理无样本条目的二段确认(控件只渲染在第一张无样本卡上,单处出现)。 */
   let confirmClean = $state(false);
+  /** 存档折叠组的展开态(默认收起,失效回执只剩回看价值,不必占屏)。 */
+  let archiveOpen = $state(false);
 
   const named = $derived(people.filter((p) => p.name).length);
   const unnamed = $derived(people.length - named);
 
   const personById = $derived(new Map(people.map((p) => [p.id, p])));
-  const queue = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed));
+  const queueParts = $derived(
+    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed)),
+  );
+  const queue = $derived(queueParts.pending);
+  const archived = $derived(queueParts.archived);
   const pendingN = $derived(queue.filter((i) => i.kind !== "receipt").length);
   const receiptsN = $derived(queue.filter((i) => i.kind === "receipt").length);
-  const invalidReceiptsN = $derived(
-    queue.filter((i) => i.kind === "receipt" && i.receipt.invalid_reason !== null).length,
+  const nosampleN = $derived(queue.filter((i) => i.kind === "nosample").length);
+  /** 一键清理控件只挂在第一张无样本卡:共享确认态若逐卡渲染,会同屏出现多组
+      重复的破坏性确认按钮。 */
+  const firstNosampleKey = $derived(
+    (() => {
+      const first = queue.find((i) => i.kind === "nosample");
+      return first ? tidyItemKey(first) : null;
+    })(),
   );
   const live = $derived(recording.isLive);
 
@@ -46,14 +59,15 @@
 
   // ── 会议上下文(拍板信息):每人最近 3 场,懒加载缓存 ──
   let notesCache = $state<Record<string, NoteSummary[]>>({});
-  async function loadNotes(pid: string) {
-    if (notesCache[pid]) return;
+  // keyedOnce 去重:effect 因 notesCache 写入而重跑时,同一人不再重复发
+  // person_notes(此前 8 人放大成 87 次调用的 IPC 风暴)。
+  const loadNotes = keyedOnce(async (pid: string) => {
     try {
       notesCache[pid] = (await personNotes(pid)).slice(0, 3);
     } catch {
       notesCache[pid] = [];
     }
-  }
+  });
   /** 某条目涉及的人物(回执卡的 loser 已并入 winner,看 winner 即可)。 */
   function itemIds(item: TidyItem): string[] {
     if (item.kind === "suggestion") return [item.suggestion.loser, item.suggestion.winner];
@@ -65,7 +79,7 @@
   // 深处的卡按需可再点进详情页看。
   $effect(() => {
     for (const item of queue.slice(0, 12)) {
-      for (const id of itemIds(item)) void loadNotes(id);
+      for (const id of itemIds(item)) loadNotes(id);
     }
   });
 
@@ -102,61 +116,84 @@
 
   // ── 动作:busy 只覆盖后端操作本身;重算(tidy.refresh/refreshPeople)放后台,
   // layout 对 peopleVersion 的 effect + tidy 单飞 refresh 会兜底同步。失败卡片
-  // 留在原地,错误横幅透出后端文案 ──
-  async function act(fn: () => Promise<void>, optimistic?: () => void) {
+  // 留在原地,错误就地(errKey 对应卡)或顶部横幅透出后端文案 ──
+  async function act(fn: () => Promise<void>, optimistic?: () => void, errKey?: string) {
     if (busy) return;
     busy = true;
     error = "";
+    actionError = null;
     audition.stop();
     confirmClean = false;
     try {
       await fn();
       optimistic?.(); // 后端成功即本地收起,不等整轮重算
-      recording.bumpPeople(); // 驱动 layout 后台 tidy.refresh(单飞)与各处同步
-      void refreshPeople();
     } catch (e) {
-      error = `${e}`;
+      if (errKey) actionError = { key: errKey, msg: `${e}` };
+      else error = `${e}`;
     }
+    // 成败都对账:同名组连并是逐条落库的,部分成功后本地视图若不回到与库一致,
+    // 重试会拿已并走的旧 id 报「人物不存在」;回执撤销被拒同理(条目已失效要
+    // 重拉才会转「仅存档」形态)。
+    recording.bumpPeople(); // 驱动 layout 后台 tidy.refresh(单飞)与各处同步
+    void refreshPeople();
     busy = false;
   }
 
   async function doMergeSuggestion(s: PersonMergeSuggestion) {
     // 无 optimistic:这张建议卡随后台 refreshPeople/tidy.refresh 自然消失。
-    await act(async () => {
-      const jid = await mergePerson(s.loser, s.winner);
-      lastManual = {
-        journalId: jid,
-        label: `${plabel(s.loser, s.loser_name)} → ${plabel(s.winner, s.winner_name)}`,
-      };
-    });
+    await act(
+      async () => {
+        const jid = await mergePerson(s.loser, s.winner);
+        tidy.lastManual = {
+          journalId: jid,
+          label: `${plabel(s.loser, s.loser_name)} → ${plabel(s.winner, s.winner_name)}`,
+        };
+      },
+      undefined,
+      `s:${s.loser}>${s.winner}`,
+    );
   }
   function doIgnoreSuggestion(s: PersonMergeSuggestion) {
     tidy.ignore(s);
   }
   async function doMergeDup(name: string, g: PersonSummary[]) {
     // 无 optimistic:同名组卡随后台 refreshPeople 自然消失。
-    await act(async () => {
-      const winner = dupPrimaryId(name, g);
-      await mergeDuplicatePeople(g, winner, mergePerson, (journalId) => {
-        lastManual = { journalId, label: `「${name}」并成一条` };
-      });
-    });
+    await act(
+      async () => {
+        const winner = dupPrimaryId(name, g);
+        await mergeDuplicatePeople(g, winner, mergePerson, (journalId) => {
+          tidy.lastManual = { journalId, label: `「${name}」并成一条` };
+        });
+      },
+      undefined,
+      `d:${name}`,
+    );
   }
   async function doDeleteNoSample(p: PersonSummary) {
     // 无 optimistic:无样本卡随后台 refreshPeople 自然消失。
-    await act(async () => {
-      await deletePerson(p.id);
-    });
+    await act(
+      async () => {
+        await deletePerson(p.id);
+      },
+      undefined,
+      `n:${p.id}`,
+    );
   }
   /** 一键清理剩余全部无样本条目(二段确认后)。 */
   async function doCleanAll() {
     const rest = queue.filter((i) => i.kind === "nosample");
-    // 无 optimistic:这批卡随后台 refreshPeople 自然消失。
-    await act(async () => {
-      for (const i of rest) {
-        if (i.kind === "nosample") await deletePerson(i.person.id);
-      }
-    });
+    // 无 optimistic:这批卡随后台 refreshPeople 自然消失。错误挂在承载清理控件
+    // 的第一张无样本卡上。
+    const errKey = firstNosampleKey ?? undefined;
+    await act(
+      async () => {
+        for (const i of rest) {
+          if (i.kind === "nosample") await deletePerson(i.person.id);
+        }
+      },
+      undefined,
+      errKey,
+    );
   }
   function doDismiss(item: TidyItem) {
     tidy.dismiss(tidyItemKey(item));
@@ -167,13 +204,22 @@
         await acknowledgeMerge(r.journal_id);
       },
       () => tidy.removeReceipt(r.journal_id),
+      `r:${r.journal_id}`,
+    );
+  }
+  /** 失效回执「拆回独立说话人」:按合并时快照恢复原编号,历史笔记段落重新归他。 */
+  async function doRestore(r: MergeReceipt) {
+    await act(
+      async () => {
+        await restoreMergedPerson(r.journal_id);
+      },
+      () => tidy.removeReceipt(r.journal_id),
+      `r:${r.journal_id}`,
     );
   }
   /** 不可撤销的回执只剩回看价值,批量确认清掉,不必逐张点。 */
   async function ackAllInvalid() {
-    const invalid = queue.filter(
-      (i) => i.kind === "receipt" && i.receipt.invalid_reason !== null,
-    );
+    const invalid = archived.filter((i) => i.kind === "receipt");
     await act(
       async () => {
         for (const i of invalid) {
@@ -187,18 +233,25 @@
       },
     );
   }
-  async function doUndo(journalId: string) {
+  async function doUndo(journalId: string, errKey?: string) {
     // removeReceipt 对不存在的 id 是 no-op:doUndo 既用于回执撤销卡也用于手动
-    // 合并后的页内撤销条,两处共用同一 optimistic 安全。
+    // 合并后的撤销条,两处共用同一 optimistic 安全。
     await act(
       async () => {
         await undoMerge(journalId);
-        lastManual = null;
+        tidy.lastManual = null;
       },
       () => tidy.removeReceipt(journalId),
+      errKey,
     );
   }
 </script>
+
+{#snippet cardError(key: string)}
+  {#if actionError?.key === key}
+    <p class="card-error">{actionError.msg}</p>
+  {/if}
+{/snippet}
 
 {#snippet personPane(pid: string, name: string)}
   {@const p = personById.get(pid)}
@@ -237,6 +290,85 @@
       <div class="pane-meta">已并入,记录随合并转移</div>
     {/if}
   </div>
+{/snippet}
+
+{#snippet receiptCard(r: MergeReceipt)}
+  <section class="card" class:archived={r.invalid_reason}>
+    <div class="card-tag">
+      {#if r.invalid_reason}
+        已自动归并 · 仅存档 · {r.invalid_reason}
+      {:else}
+        已自动归并
+      {/if}
+    </div>
+    <div class="card-title">
+      {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
+      {#if r.similarity !== null}
+        <span class="sim strong">相似度 {Math.round(r.similarity * 100)}%</span>
+      {/if}
+    </div>
+    <div class="panes">
+      <div class="pane">
+        <div class="pane-head">
+          <span class="dot" style="background: {speakerInk(r.loser, 'mic')}"></span>
+          <span class="pname">{plabel(r.loser, r.loser_name)}</span>
+          <span class="pane-tag">已并入</span>
+        </div>
+        <div class="samples">
+          {#each r.loser_sample_paths as path, i (path)}
+            <button
+              class="chip"
+              class:playing={playingKey === path}
+              title={playingKey === path ? "停止" : "试听合并前的原声"}
+              onclick={() => audition.toggle(path, path)}
+            >
+              {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
+            </button>
+          {:else}
+            <span class="hint">无可试听的快照</span>
+          {/each}
+        </div>
+      </div>
+      <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
+      </svg>
+      <div class="pane-col">
+        {@render personPane(r.winner, r.winner_name)}
+        {#if r.winner_sample_paths.length > 0}
+          <div class="snap-listen">
+            <span class="snap-label">合并时的原声</span>
+            {#each r.winner_sample_paths as path, i (path)}
+              <button
+                class="chip"
+                class:playing={playingKey === path}
+                title={playingKey === path ? "停止" : "试听合并时刻的样本"}
+                onclick={() => audition.toggle(path, path)}
+              >
+                {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+    <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
+    <div class="acts">
+      {#if r.invalid_reason}
+        <button class="mini accent" disabled={busy || live} onclick={() => doRestore(r)}>拆回独立说话人</button>
+        <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>知道了</button>
+      {:else}
+        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
+        <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id, `r:${r.journal_id}`)}>撤销</button>
+      {/if}
+    </div>
+    {#if r.invalid_reason}
+      <p class="hint">
+        不能撤销时:先听「合并时的原声」核对;确认并错可「拆回独立说话人」——按合并时快照
+        恢复原编号,历史笔记段落重新归他,之后录制也能重新认出;当时的合并对象不受影响。
+      </p>
+    {/if}
+    {@render cardError(`r:${r.journal_id}`)}
+  </section>
 {/snippet}
 
 <main class="container">
@@ -280,15 +412,9 @@
           {/if}
         </span>
         {#if tidy.loading}<span class="refreshing">正在比对声纹…</span>{/if}
+        <span class="head-spacer"></span>
+        <button class="mini plain" disabled={tidy.loading} onclick={() => void tidy.refresh()}>重新整理</button>
       </div>
-
-      {#if invalidReceiptsN > 1}
-        <div class="tools">
-          <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>
-            一键确认全部 {invalidReceiptsN} 条不可撤销回执
-          </button>
-        </div>
-      {/if}
 
       {#if live}
         <div class="banner warn">录制中不能整理——可以浏览和试听,合并/删除/撤销等停止录制后再做。</div>
@@ -296,96 +422,26 @@
       {#if error}
         <div class="banner">{error}</div>
       {/if}
-      {#if lastManual}
+      {#if tidy.lastManual}
         <div class="undo-strip">
-          已合并:{lastManual.label}
-          <button class="mini" disabled={busy || live} onclick={() => doUndo(lastManual!.journalId)}>撤销</button>
-          <button class="mini plain" onclick={() => (lastManual = null)}>好</button>
+          已合并:{tidy.lastManual.label}
+          <button class="mini" disabled={busy || live} onclick={() => doUndo(tidy.lastManual!.journalId)}>撤销</button>
+          <button class="mini plain" onclick={() => (tidy.lastManual = null)}>好</button>
         </div>
       {/if}
 
-      {#if queue.length === 0}
+      {#if queue.length === 0 && archived.length === 0}
         {#if tidy.loading}
           <p class="hint">正在比对声纹…</p>
         {:else}
           <p class="hint">都整理完了——新的建议会随录制自动出现;高置信的会自动归并并在这里留回执。</p>
         {/if}
       {:else}
+        {#if queue.length > 0}
         <div class="stack">
           {#each queue as item (tidyItemKey(item))}
             {#if item.kind === "receipt"}
-              {@const r = item.receipt}
-              <section class="card" class:archived={r.invalid_reason}>
-                <div class="card-tag">
-                  {#if r.invalid_reason}
-                    已自动归并 · 仅存档 · {r.invalid_reason}
-                  {:else}
-                    已自动归并
-                  {/if}
-                </div>
-                <div class="card-title">
-                  {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
-                  {#if r.similarity !== null}
-                    <span class="sim strong">相似度 {Math.round(r.similarity * 100)}%</span>
-                  {/if}
-                </div>
-                <div class="panes">
-                  <div class="pane">
-                    <div class="pane-head">
-                      <span class="dot" style="background: {speakerInk(r.loser, 'mic')}"></span>
-                      <span class="pname">{plabel(r.loser, r.loser_name)}</span>
-                      <span class="pane-tag">已并入</span>
-                    </div>
-                    <div class="samples">
-                      {#each r.loser_sample_paths as path, i (path)}
-                        <button
-                          class="chip"
-                          class:playing={playingKey === path}
-                          title={playingKey === path ? "停止" : "试听合并前的原声"}
-                          onclick={() => audition.toggle(path, path)}
-                        >
-                          {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
-                        </button>
-                      {:else}
-                        <span class="hint">无可试听的快照</span>
-                      {/each}
-                    </div>
-                  </div>
-                  <svg class="arrow" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 8h10M9 4.5L13.5 8 9 11.5" />
-                  </svg>
-                  <div class="pane-col">
-                    {@render personPane(r.winner, r.winner_name)}
-                    {#if r.winner_sample_paths.length > 0}
-                      <div class="snap-listen">
-                        <span class="snap-label">合并时的原声</span>
-                        {#each r.winner_sample_paths as path, i (path)}
-                          <button
-                            class="chip"
-                            class:playing={playingKey === path}
-                            title={playingKey === path ? "停止" : "试听合并时刻的样本"}
-                            onclick={() => audition.toggle(path, path)}
-                          >
-                            {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
-                          </button>
-                        {/each}
-                      </div>
-                    {/if}
-                  </div>
-                </div>
-                <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
-                <div class="acts">
-                  {#if r.invalid_reason}
-                    <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>知道了</button>
-                  {:else}
-                    <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
-                    <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id)}>撤销</button>
-                  {/if}
-                </div>
-                {#if r.invalid_reason}
-                  <p class="hint">不能撤销时:先听「合并时的原声」核对;确认并错也不必慌——后续录制会把不同的声音重新分开建档,不会将错就错。</p>
-                {/if}
-              </section>
+              {@render receiptCard(item.receipt)}
             {:else if item.kind === "suggestion"}
               {@const s = item.suggestion}
               <section class="card">
@@ -406,8 +462,10 @@
                 <p class="hint">两边各听一段原声,确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
                 <div class="acts">
                   <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s)}>合并</button>
-                  <button class="mini" disabled={busy || live} onclick={() => doIgnoreSuggestion(s)}>忽略</button>
+                  <!-- 忽略是本地处置(dismissed 元数据),后端录制中也放行,不必陪绑置灰 -->
+                  <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>忽略</button>
                 </div>
+                {@render cardError(tidyItemKey(item))}
               </section>
             {:else if item.kind === "dup"}
               {@const g = item.people}
@@ -436,8 +494,9 @@
                   <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(item.name, g)}>
                     全部并入主条目
                   </button>
-                  <button class="mini" disabled={busy || live} onclick={() => doDismiss(item)}>忽略</button>
+                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>忽略</button>
                 </div>
+                {@render cardError(tidyItemKey(item))}
               </section>
             {:else}
               {@const p = item.person}
@@ -452,24 +511,46 @@
                 </p>
                 <div class="acts">
                   <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>删除</button>
-                  <button class="mini" disabled={busy || live} onclick={() => doDismiss(item)}>保留</button>
-                  {#if queue.filter((i) => i.kind === "nosample").length > 1}
+                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>保留</button>
+                  {#if nosampleN > 1 && tidyItemKey(item) === firstNosampleKey}
                     <span class="spacer"></span>
                     {#if confirmClean}
-                      <span class="warn-text">共 {queue.filter((i) => i.kind === "nosample").length} 条,删除不可恢复。</span>
+                      <span class="warn-text">共 {nosampleN} 条,删除不可恢复。</span>
                       <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>确认清理</button>
                       <button class="mini plain" onclick={() => (confirmClean = false)}>取消</button>
                     {:else}
                       <button class="mini plain" disabled={busy || live} onclick={() => (confirmClean = true)}>
-                        剩余 {queue.filter((i) => i.kind === "nosample").length} 条无样本条目一键清理
+                        剩余 {nosampleN} 条无样本条目一键清理
                       </button>
                     {/if}
                   {/if}
                 </div>
+                {@render cardError(tidyItemKey(item))}
               </section>
             {/if}
           {/each}
         </div>
+        {/if}
+
+        {#if archived.length > 0}
+          <div class="archive">
+            <div class="archive-head">
+              <button class="archive-toggle" onclick={() => (archiveOpen = !archiveOpen)}>
+                {archiveOpen ? "收起" : "展开"} {archived.length} 条已存档
+              </button>
+              <span class="hint">相关人物已再次合并等原因,不能再撤销;可逐条核对或拆回。</span>
+              <span class="spacer"></span>
+              <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>一键确认全部</button>
+            </div>
+            {#if archiveOpen}
+              <div class="stack">
+                {#each archived as item (tidyItemKey(item))}
+                  {#if item.kind === "receipt"}{@render receiptCard(item.receipt)}{/if}
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
       {/if}
     </section>
 
@@ -549,6 +630,9 @@
     color: var(--ink-faint);
     font-size: 0.78rem;
   }
+  .head-spacer {
+    flex: 1;
+  }
   .pick-hint {
     color: var(--ink-faint);
     font-size: 0.85rem;
@@ -558,8 +642,37 @@
     flex-direction: column;
     gap: 0.8rem;
   }
+  .archive {
+    margin-top: 1rem;
+  }
+  .archive-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.8rem;
+  }
+  .archive-toggle {
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    border-radius: var(--radius-md);
+    font-size: 0.82rem;
+    padding: 0.25em 0.75em;
+    cursor: pointer;
+  }
+  .archive-toggle:hover {
+    background: var(--surface-soft);
+  }
+  /* 粘性:长队列滚到深处时顶部通知(试听失败/批量操作错误/录制中提示)仍在
+     视野内——否则底部操作失败表现为"点了没反应"。tint 在暗色下半透明,叠一层
+     canvas 垫底,悬浮时不透出下方卡片。 */
   .banner {
-    background: var(--danger-tint);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background:
+      linear-gradient(var(--danger-tint), var(--danger-tint)),
+      var(--canvas);
     border: 1px solid var(--danger-line);
     color: var(--danger-ink);
     border-radius: var(--radius-lg);
@@ -568,14 +681,21 @@
     font-size: 0.9rem;
   }
   .banner.warn {
-    background: var(--warning-tint);
+    background:
+      linear-gradient(var(--warning-tint), var(--warning-tint)),
+      var(--canvas);
     border-color: var(--warning-line);
     color: var(--warning-ink);
   }
-  .tools {
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 0.8rem;
+  /* 卡片级错误:失败原因贴在出错的那张卡下,与顶部横幅同色系 */
+  .card-error {
+    background: var(--danger-tint);
+    border: 1px solid var(--danger-line);
+    color: var(--danger-ink);
+    border-radius: var(--radius-md);
+    padding: 0.45rem 0.6rem;
+    font-size: 0.82rem;
+    margin: 0.6rem 0 0;
   }
   .undo-strip {
     display: flex;

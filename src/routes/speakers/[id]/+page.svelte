@@ -1,7 +1,6 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
-  import { untrack } from "svelte";
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     listPeople,
@@ -15,6 +14,7 @@
     type PersonMergeSuggestion,
   } from "$lib/people";
   import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
+  import { describePlayError } from "$lib/tidyAudio";
   import { formatDate, formatDuration, speakerColor, speakerInk, type NoteSummary } from "$lib/notes";
   import { recording } from "$lib/recording.svelte";
   import PersonPickList from "$lib/PersonPickList.svelte";
@@ -58,16 +58,11 @@
     loaded = true;
   }
 
-  // 路由参数变化(侧栏点选另一人)时重载;同页操作后手动 refresh。
+  // 路由参数变化(侧栏点选另一人)时重载;同页操作后手动 refresh。撤销条是
+  // 会话级全局(tidy.lastManual,带"谁并入谁"标签),导航不清——它是手动合并
+  // 在 UI 上唯一的撤销入口,一次无意识导航不该把它永久关掉。
   $effect(() => {
     void personId;
-    // 撤销条只在"合并落点"(lastMergeWinner)的人物页存活;导航到别的无关人物页要清掉。
-    // untrack 读取 lastMergeWinner:避免该 effect 因合并动作里对它的赋值而重跑
-    // (那一刻 personId 还是旧页,会把刚设好的状态立即冲掉)。
-    if (personId !== untrack(() => lastMergeWinner)) {
-      lastMergeId = null;
-      lastMergeWinner = null;
-    }
     stopSample();
     stopCtx();
     closeAllOps();
@@ -80,8 +75,9 @@
   // ── 改名(沿旧管理页语义:未命名给显眼「命名」,已命名点名字改) ──
   let editingId = $state<string | null>(null);
   let editingName = $state("");
-  /** 改名撞库中另一人现名:大概率是同一个人被声纹拆重,先确认合并还是真重名。 */
-  let dupRename = $state<{ name: string; other: PersonSummary } | null>(null);
+  /** 改名撞库中他人现名:大概率是同一个人被声纹拆重,先确认合并还是真重名。
+      同名者可能不止一位,全部列出让用户挑并入哪条,而不是静默选第一个。 */
+  let dupRename = $state<{ name: string; others: PersonSummary[] } | null>(null);
 
   function beginRename() {
     if (!person) return;
@@ -99,9 +95,9 @@
       editingId = null;
       return; // 空/未变:静默还原,不当真改名
     }
-    const other = others.find((o) => o.name === text);
-    if (other) {
-      dupRename = { name: text, other };
+    const sameNamed = others.filter((o) => o.name === text);
+    if (sameNamed.length > 0) {
+      dupRename = { name: text, others: sameNamed };
       return; // 输入框保留,下方出确认条
     }
     editingId = null;
@@ -119,20 +115,20 @@
     }
   }
 
-  /** 重名确认:就是同一个人 → 当前人并入已有同名者,跳转对方详情。 */
-  async function dupMerge() {
+  /** 重名确认:就是同一个人 → 当前人并入选中的同名者,跳转对方详情。 */
+  async function dupMerge(other: PersonSummary) {
     const p = person;
-    const d = dupRename;
-    if (!p || !d) return;
+    if (!p || !dupRename) return;
     editingId = null;
     dupRename = null;
     try {
-      lastMergeId = await mergePerson(p.id, d.other.id);
-      lastMergeWinner = d.other.id;
+      const jid = await mergePerson(p.id, other.id);
+      tidy.lastManual = { journalId: jid, label: `${displayName(p)} → ${displayName(other)}` };
       recording.bumpPeople();
-      goto(`/speakers/${d.other.id}`);
+      goto(`/speakers/${other.id}`);
     } catch (e) {
       error = `${e}`;
+      await refresh(); // 失败也对账:别让本地视图停在与库不一致的状态
     }
   }
 
@@ -193,18 +189,20 @@
 
   async function doMerge() {
     const winner = pendingMergeWinner;
-    if (!person || !winner) return;
-    const loser = person.id;
+    const target = people.find((o) => o.id === winner);
+    if (!person || !winner || !target) return;
+    const loser = person;
     closeAllOps();
     try {
-      lastMergeId = await mergePerson(loser, winner);
-      lastMergeWinner = winner;
+      const jid = await mergePerson(loser.id, winner);
+      tidy.lastManual = { journalId: jid, label: `${displayName(loser)} → ${displayName(target)}` };
       recording.bumpPeople();
       // 本人已并入对方:跳到对方详情,让"这个人现在是谁"立即可见。
       goto(`/speakers/${winner}`);
     } catch (e) {
       // 录制中后端拒绝等错误文案原样展示。
       error = `${e}`;
+      await refresh(); // 失败也对账
     }
   }
 
@@ -223,7 +221,12 @@
 
   // ── 上下文整理提示(建议跟人走):当前这个人涉及归属建议/同名重复时,详情页
   //    头部直接给出,不必回概览找「整理」。数据走共享 tidy store(侧栏徽标同源)。 ──
-  const related = $derived(tidy.involving(personId));
+  /** 上下文建议:对方必须仍在库(失效目标保险,与概览队列同口径)。 */
+  const related = $derived(
+    tidy
+      .involving(personId)
+      .filter((s) => people.some((p) => p.id === (s.loser === personId ? s.winner : s.loser))),
+  );
   /** 同名的另一人(重名十有八九=同一人被拆重,给直达入口)。 */
   const sameName = $derived(person?.name ? (others.find((o) => o.name === person!.name) ?? null) : null);
 
@@ -233,22 +236,21 @@
       ? { id: s.winner, name: s.winner_name }
       : { id: s.loser, name: s.loser_name };
 
-  /** 手动合并后的撤销条(最近一次;后端日志兜底,失效时撤销报错原样透出)。 */
-  let lastMergeId = $state<string | null>(null);
-  /** 本次合并的落点(winner)。导航到别人页时撤销条清除;跳到 winner 页(本人被并走的 goto)则保留。 */
-  let lastMergeWinner = $state<string | null>(null);
-
+  /** 撤销条数据在 tidy.lastManual(会话级全局;后端日志兜底,失效时撤销报错原样透出)。 */
   async function undoLastMerge() {
-    if (!lastMergeId) return;
+    const last = tidy.lastManual;
+    if (!last) return;
     try {
-      await undoMerge(lastMergeId);
-      lastMergeId = null;
-      lastMergeWinner = null;
+      await undoMerge(last.journalId);
+      tidy.lastManual = null;
       recording.bumpPeople();
       await tidy.refresh();
       await refresh();
     } catch (e) {
       error = `${e}`;
+      // 失败也对账:日志可能已失效,重拉让回执/建议回到与库一致的形态
+      recording.bumpPeople();
+      await refresh();
     }
   }
 
@@ -256,8 +258,11 @@
     stopCtx();
     stopSample();
     try {
-      lastMergeId = await mergePerson(s.loser, s.winner);
-      lastMergeWinner = s.winner;
+      const jid = await mergePerson(s.loser, s.winner);
+      tidy.lastManual = {
+        journalId: jid,
+        label: `${s.loser_name || `说话人 ${s.loser.replace(/^P/, "")}`} → ${s.winner_name || `说话人 ${s.winner.replace(/^P/, "")}`}`,
+      };
       recording.bumpPeople();
       await tidy.refresh();
       if (s.loser === personId) {
@@ -267,6 +272,7 @@
       }
     } catch (e) {
       error = `${e}`;
+      await refresh(); // 失败也对账
     }
   }
 
@@ -295,7 +301,13 @@
     };
     ctxAudio = a;
     ctxPlayingId = pid;
-    void a.play().catch(() => stopCtx());
+    // 播放失败显性化:静默吞掉=「点了没声」还不知道为什么(概览页同一语义)
+    void a.play().catch((err) => {
+      if (ctxPlayingId === pid) {
+        stopCtx();
+        error = `试听失败:${describePlayError(err)}`;
+      }
+    });
   }
 
   $effect(() => stopCtx);
@@ -327,8 +339,11 @@
     };
     sampleAudio = a;
     playingIdx = idx;
-    void a.play().catch(() => {
-      if (personId === id) stopSample();
+    void a.play().catch((err) => {
+      if (personId === id) {
+        stopSample();
+        error = `试听失败:${describePlayError(err)}`;
+      }
     });
   }
 
@@ -340,17 +355,11 @@
     <div class="banner">{error}</div>
   {/if}
 
-  {#if lastMergeId}
+  {#if tidy.lastManual}
     <div class="undo-strip">
-      已合并。
+      已合并:{tidy.lastManual.label}
       <button class="mini" disabled={recording.isLive} onclick={undoLastMerge}>撤销</button>
-      <button
-        class="mini"
-        onclick={() => {
-          lastMergeId = null;
-          lastMergeWinner = null;
-        }}>好</button
-      >
+      <button class="mini" onclick={() => (tidy.lastManual = null)}>好</button>
     </div>
   {/if}
 
@@ -395,24 +404,50 @@
               onblur={commitRename}
             />
             {#if dupRename}
-              <!-- 重名确认(menu 语言):撞名十有八九=同一个人被拆重,先问合并 -->
+              <!-- 重名确认(menu 语言):撞名十有八九=同一个人被拆重,先问合并。
+                   同名者不止一位时逐条列出,让用户挑并入哪条,不静默选第一个 -->
               <div class="menu dup-menu">
                 <div class="menu-title">
-                  已有一位「{dupRename.other.name}」(最近出现 {formatDate(dupRename.other.last_seen)} ·
-                  累计 {formatDuration(Math.floor(dupRename.other.total_ms / 1000))})。是同一个人吗?
+                  {#if dupRename.others.length === 1}
+                    已有一位「{dupRename.name}」(最近出现 {formatDate(dupRename.others[0].last_seen)} ·
+                    累计 {formatDuration(Math.floor(dupRename.others[0].total_ms / 1000))})。是同一个人吗?
+                  {:else}
+                    已有 {dupRename.others.length} 位「{dupRename.name}」。若是同一个人,选择并入哪一条:
+                  {/if}
                 </div>
-                <div class="confirm-row">
-                  <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={dupMerge}>是,合并成一个</button>
-                  <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>不是,保留同名</button>
-                  <button
-                    class="mini quiet"
-                    onmousedown={(e) => e.preventDefault()}
-                    onclick={() => {
-                      editingId = null;
-                      dupRename = null;
-                    }}>取消</button
-                  >
-                </div>
+                {#if dupRename.others.length === 1}
+                  <div class="confirm-row">
+                    <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(dupRename!.others[0])}>是,合并成一个</button>
+                    <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>不是,保留同名</button>
+                    <button
+                      class="mini quiet"
+                      onmousedown={(e) => e.preventDefault()}
+                      onclick={() => {
+                        editingId = null;
+                        dupRename = null;
+                      }}>取消</button
+                    >
+                  </div>
+                {:else}
+                  {#each dupRename.others as o (o.id)}
+                    <div class="confirm-row">
+                      <button class="mini accent" onmousedown={(e) => e.preventDefault()} onclick={() => dupMerge(o)}>
+                        并入这条(最近 {formatDate(o.last_seen)} · 累计 {formatDuration(Math.floor(o.total_ms / 1000))})
+                      </button>
+                    </div>
+                  {/each}
+                  <div class="confirm-row">
+                    <button class="mini" onmousedown={(e) => e.preventDefault()} onclick={dupKeep}>都不是,保留同名</button>
+                    <button
+                      class="mini quiet"
+                      onmousedown={(e) => e.preventDefault()}
+                      onclick={() => {
+                        editingId = null;
+                        dupRename = null;
+                      }}>取消</button
+                    >
+                  </div>
+                {/if}
               </div>
             {/if}
           {:else if person.name}
@@ -590,6 +625,10 @@
           >
             合并到…
           </button>
+          {#if mergeOpen || pendingMergeWinner}
+            <!-- 透明遮罩:点击菜单外任意处关闭(popover 惯例;此前只能再点一次按钮) -->
+            <button class="menu-scrim" aria-label="关闭菜单" onclick={closeAllOps}></button>
+          {/if}
           {#if mergeOpen && !pendingMergeWinner}
             <div class="menu">
               <div class="menu-title">把「{displayName(person)}」并入…</div>
@@ -604,7 +643,7 @@
                 并入「{target ? displayName(target) : "?"}」?合并后是一个人:
                 {#if mergePreview}名字为「{mergePreview.name || "未命名"}」,累计发声
                   {formatDuration(Math.floor(mergePreview.total / 1000))};{/if}
-                历史笔记都显示合并后的名字,不可撤销。
+                历史笔记都显示合并后的名字。合并后可立即撤销,应用重启后不可再撤。
               </div>
               {#if mergePreview?.thickerLoser}
                 <div class="menu-note">
@@ -644,6 +683,14 @@
     </section>
   {/if}
 </main>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== "Escape") return;
+    // Esc 关闭操作浮层(合并菜单/删除确认/样本删除确认);改名输入框自带 Esc 语义
+    if (mergeOpen || pendingMergeWinner || confirmDelete || confirmSampleIdx !== null) closeAllOps();
+  }}
+/>
 
 <style>
   .container {
@@ -1006,6 +1053,16 @@
   /* menu/popover:surface-press 底(暗色下 canvas 会成"洞") */
   .merge-anchor {
     position: relative;
+  }
+  /* 全屏透明遮罩:承接"点击外部关闭",在菜单(z-index 10)之下 */
+  .menu-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    cursor: default;
   }
   .menu {
     position: absolute;
