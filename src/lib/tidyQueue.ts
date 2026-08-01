@@ -82,3 +82,16 @@ export async function mergeDuplicatePeople(
     onMerged(journalId);
   }
 }
+
+/** 建议卡合并目标解析:会话级改选覆盖优先;覆盖的人已不在库(其间被合并/删除)
+    则回落系统建议目标。winner 本身不在库的建议在 buildTidyQueue 就被滤掉,无需兜底。 */
+export function resolveSugTarget(
+  s: PersonMergeSuggestion,
+  overrides: Record<string, string>,
+  byId: Map<string, PersonSummary>,
+): { id: string; name: string; overridden: boolean } {
+  const o = overrides[`${s.loser}>${s.winner}`];
+  const p = o ? byId.get(o) : undefined;
+  if (p) return { id: p.id, name: p.name, overridden: true };
+  return { id: s.winner, name: s.winner_name, overridden: false };
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTidyQueue, mergeDuplicatePeople, splitArchive, tidyItemKey, type TidyItem } from "./tidyQueue";
+import { buildTidyQueue, mergeDuplicatePeople, resolveSugTarget, splitArchive, tidyItemKey, type TidyItem } from "./tidyQueue";
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
@@ -128,5 +128,23 @@ describe("mergeDuplicatePeople", () => {
       ),
     ).rejects.toThrow("第二条失败");
     expect(published).toEqual(["m-P2"]);
+  });
+});
+
+describe("resolveSugTarget", () => {
+  const byId = new Map([["P1", person("P1", "张三")], ["P9", person("P9", "王五")]]);
+  const s = sug("P2", "P1"); // loser P2 → 系统建议 winner P1(builder 若带名字参数,winner_name 取"张三")
+
+  it("无覆盖时返回系统建议目标", () => {
+    expect(resolveSugTarget(s, {}, byId)).toEqual({ id: "P1", name: s.winner_name, overridden: false });
+  });
+
+  it("覆盖存在于库时生效并标记 overridden", () => {
+    const r = resolveSugTarget(s, { "P2>P1": "P9" }, byId);
+    expect(r).toEqual({ id: "P9", name: "王五", overridden: true });
+  });
+
+  it("覆盖的人已不在库(其间被合并/删除)时回落系统建议", () => {
+    expect(resolveSugTarget(s, { "P2>P1": "P404" }, byId)).toEqual({ id: "P1", name: s.winner_name, overridden: false });
   });
 });
