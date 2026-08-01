@@ -40,8 +40,6 @@
   let confirmClean = $state(false);
   /** 存档折叠组的展开态(默认收起,失效回执只剩回看价值,不必占屏)。 */
   let archiveOpen = $state(false);
-  /** 建议卡合并目标的会话级改选(键=sugKey);还原=删键。 */
-  let sugOverride = $state<Record<string, string>>({});
   /** 打开选人 popover 的建议卡(sugKey);同屏至多一个。 */
   let sugPickFor = $state<string | null>(null);
   let sugPickQuery = $state("");
@@ -462,7 +460,7 @@
             {:else if item.kind === "suggestion"}
               {@const s = item.suggestion}
               {@const skey = `${s.loser}>${s.winner}`}
-              {@const target = resolveSugTarget(s, sugOverride, personById)}
+              {@const target = resolveSugTarget(s, tidy.sugOverride, personById)}
               <section class="card">
                 <div class="card-tag">归属建议</div>
                 <div class="card-title">
@@ -473,8 +471,8 @@
                     <button
                       class="mini plain"
                       onclick={() => {
-                        const { [skey]: _, ...rest } = sugOverride;
-                        sugOverride = rest;
+                        const { [skey]: _, ...rest } = tidy.sugOverride;
+                        tidy.sugOverride = rest;
                       }}>还原建议</button>
                   {:else}
                     <span class="sim" class:strong={isStrong(s)}>
@@ -508,7 +506,7 @@
                           people={people.filter((p) => p.id !== s.loser && p.id !== target.id)}
                           query={sugPickQuery}
                           onpick={(p) => {
-                            sugOverride = { ...sugOverride, [skey]: p.id };
+                            tidy.sugOverride = { ...tidy.sugOverride, [skey]: p.id };
                             loadNotes(p.id);
                             sugPickFor = null;
                           }}

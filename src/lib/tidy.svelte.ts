@@ -28,6 +28,11 @@ class TidyState {
       UI 上唯一的撤销入口——挂在页面局部状态时一次导航就永久丢失(后端日志明明
       还在),故提到 store:概览页与人物详情页同读同写,谁合并的都能在两处撤。 */
   lastManual = $state<{ journalId: string; label: string } | null>(null);
+  /** 建议卡合并目标的改选覆盖(键=sugKey"loser>winner",值=person id)。会话级:
+      建议卡满是导航入口(人名/会议链接),挂页面局部态会点出去一趟就丢,回来
+      静默回落系统建议——用户不细看就并进自己刚否掉的人(lastManual 同款教训)。
+      失效回落由 resolveSugTarget 兜底,残键无害,不清理。 */
+  sugOverride = $state<Record<string, string>>({});
   /** 人工处置集(忽略的建议对/保留的无样本条目/忽略的同名组),键=tidyItemKey。
       落盘为真值源,本地 Set 是即时展示的乐观镜像。 */
   dismissed = $state<Set<string>>(new Set());
