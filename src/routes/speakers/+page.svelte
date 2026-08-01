@@ -7,6 +7,7 @@
     listPeople,
     mergePerson,
     personNotes,
+    renamePerson,
     restoreMergedPerson,
     undoMerge,
     type MergeReceipt,
@@ -14,7 +15,7 @@
     type PersonSummary,
   } from "$lib/people";
   import { formatDate, formatDuration, speakerInk, type NoteSummary } from "$lib/notes";
-  import { isStrong, tidy } from "$lib/tidy.svelte";
+  import { isStrong, sugKey, tidy } from "$lib/tidy.svelte";
   import {
     buildTidyQueue,
     mergeDuplicatePeople,
@@ -162,6 +163,20 @@
         };
       },
       undefined,
+      `s:${s.loser}>${s.winner}`,
+    );
+  }
+  /** 换人弹层「新建」:库里没这个人=左侧说话人就是他,就地命名(声纹/样本/笔记
+      原地不动,无合并日志);已命名的人不再进归属建议,这张卡随重算消失——乐观
+      先移除,不写 dismissed(命名后建议本就不再生成,不该占一条落盘忽略)。 */
+  async function doNameAsNew(s: PersonMergeSuggestion, name: string) {
+    await act(
+      async () => {
+        await renamePerson(s.loser, name);
+      },
+      () => {
+        tidy.suggestions = tidy.suggestions.filter((x) => sugKey(x) !== sugKey(s));
+      },
       `s:${s.loser}>${s.winner}`,
     );
   }
@@ -497,6 +512,7 @@
                         sugPickFor = sugPickFor === skey ? null : skey;
                       }}>换个人</button>
                     {#if sugPickFor === skey}
+                      {@const q = sugPickQuery.trim()}
                       <button class="menu-scrim" aria-label="关闭菜单" onclick={() => (sugPickFor = null)}></button>
                       <div class="menu">
                         <div class="menu-title">把「{plabel(s.loser, s.loser_name)}」并入…</div>
@@ -511,6 +527,12 @@
                             sugPickFor = null;
                           }}
                         />
+                        {#if q && !people.some((p) => p.name === q)}
+                          <!-- 库里没这个人:就地命名,不必出弹层绕去详情页 -->
+                          <button class="create-row" disabled={busy} onclick={() => doNameAsNew(s, q)}>
+                            新建「{q}」并命名这个说话人
+                          </button>
+                        {/if}
                       </div>
                     {/if}
                   </div>
@@ -1064,6 +1086,28 @@
   }
   .pick-input::placeholder {
     color: var(--ink-faint);
+  }
+  /* 新建行:menu 行形态,accent 色标识"这是创建动作"而非候选 */
+  .create-row {
+    display: block;
+    width: 100%;
+    padding: 0.38rem 0.55rem;
+    background: none;
+    border: none;
+    border-top: 1px solid var(--hairline);
+    border-radius: 0 0 var(--radius-md) var(--radius-md);
+    color: var(--accent);
+    font: inherit;
+    font-size: 0.85rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .create-row:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .create-row:disabled {
+    color: var(--ink-faint);
+    cursor: default;
   }
 </style>
 
