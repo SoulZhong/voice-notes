@@ -351,6 +351,31 @@ impl MergeJournal {
         Ok(n)
     }
 
+    /// 只把 loser 侧快照副本拷回声纹样本目录(拆回用;undo 用 restore_samples 双侧)。
+    /// 无常规槽位而有 `<loser>-cut.wav` 兜底截声时,改名拷成 `<loser>.wav`(槽 1)——
+    /// sample_slot_path 不识别 -cut 后缀,原名拷回等于拆回的人"无样本"。
+    pub fn restore_loser_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
+        std::fs::create_dir_all(vp_samples_dir)?;
+        let copies = self.sample_copies(id, "loser");
+        let is_cut = |p: &PathBuf| {
+            p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-cut"))
+        };
+        let mut n = 0usize;
+        for p in copies.iter().filter(|p| !is_cut(p)) {
+            std::fs::copy(p, vp_samples_dir.join(p.file_name().unwrap()))?;
+            n += 1;
+        }
+        if n == 0 {
+            if let Some(cut) = copies.iter().find(|p| is_cut(p)) {
+                let stem = cut.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                let loser = stem.trim_end_matches("-cut");
+                std::fs::copy(cut, vp_samples_dir.join(format!("{loser}.wav")))?;
+                n = 1;
+            }
+        }
+        Ok(n)
+    }
+
     // ── 自动合并拒绝名单(撤销过的 pair,落盘;仅屏蔽自动合并,不屏蔽人工建议) ──
 
     fn denylist_path(&self) -> PathBuf {
@@ -453,6 +478,21 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, b"RIFFfake-wav").unwrap();
         p
+    }
+
+    /// 建一个空日志(临时根目录 + 实例)。TempDir 需随返回值存活,否则目录被清。
+    fn test_journal() -> (tempfile::TempDir, MergeJournal) {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        (tmp, j)
+    }
+
+    /// 直接在某条目某侧的样本目录里摆一份快照副本文件,跳过 append() 的完整校验
+    /// 流程——只测只读拷贝类方法(如 restore_loser_samples)时够用。
+    fn put_side_file(j: &MergeJournal, id: &str, side: &str, name: &str) {
+        let dir = j.samples_dir(id, side).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"RIFFfake-wav").unwrap();
     }
 
     #[test]
@@ -718,5 +758,28 @@ mod tests {
         let n = j.restore_samples("m-P1", &vpdir).unwrap();
         assert_eq!(n, 2);
         assert!(ls.exists() && ws.exists());
+    }
+
+    #[test]
+    fn restore_loser_samples_copies_only_loser_side() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "winner", "P9.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1);
+        assert!(out.join("P1.wav").exists());
+        assert!(!out.join("P9.wav").exists(), "winner 侧不许被拷回");
+    }
+
+    #[test]
+    fn restore_loser_samples_promotes_cut_to_slot1_when_no_regular() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P2", "loser", "P2-cut.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P2", &out).unwrap();
+        assert_eq!(n, 1);
+        assert!(out.join("P2.wav").exists(), "仅有兜底截声时拷成槽 1,拆回的人才有样本可听");
+        assert!(!out.join("P2-cut.wav").exists());
     }
 }
