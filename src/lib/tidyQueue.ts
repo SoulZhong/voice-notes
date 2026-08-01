@@ -1,5 +1,5 @@
 // 整理收件箱的队列纯逻辑:构建队列本身。
-// UI 无关、可单测;/speakers/tidy 页面与侧栏徽标共同消费。
+// UI 无关、可单测;/speakers 概览页常驻分析区与侧栏徽标共同消费。
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "$lib/people";
 
 export type TidyItem =
