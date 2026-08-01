@@ -13,6 +13,10 @@ use super::voiceprints::Person;
 /// 上限只是防无界膨胀。
 pub const JOURNAL_CAP: usize = 50;
 
+/// 人工处置键名单上限:超出按追加序淘汰最旧。500 远超一轮整理量,只为防无界
+/// 膨胀——丢了顶多让用户重启后再处置一次。
+pub const DISMISSED_CAP: usize = 500;
+
 /// 一条合并日志。id 格式 `m-<loser>`:loser 合并后即从库中消失,同一 loser 不会
 /// 有两条并存(撤销会删条目,重新合并再落新条),天然唯一。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +383,45 @@ impl MergeJournal {
             eprintln!("自动合并拒绝名单写入失败: {e}");
         }
     }
+
+    // ── 整理条目人工处置(忽略/保留),落盘 ──
+
+    fn dismissed_path(&self) -> PathBuf {
+        self.dir().join("dismissed.json")
+    }
+
+    /// 人工处置过的整理条目键(忽略的建议对/保留的无样本条目/忽略的同名组)。
+    /// 缺失/损坏 → 空。键格式与前端 tidyItemKey 一致,后端只存不解释。
+    pub fn dismissed_items(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dismissed_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// 追加处置键,去重,超过 DISMISSED_CAP 淘汰最旧。best-effort:丢了顶多重启
+    /// 后再展示一次,不影响正确性。
+    pub fn dismiss_item(&self, key: &str) {
+        let mut list = self.dismissed_items();
+        if list.iter().any(|k| k == key) {
+            return;
+        }
+        list.push(key.to_string());
+        if list.len() > DISMISSED_CAP {
+            let drop = list.len() - DISMISSED_CAP;
+            list.drain(0..drop);
+        }
+        let res = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(self.dir())?;
+            let tmp = self.dismissed_path().with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_string_pretty(&list)?)?;
+            std::fs::rename(&tmp, self.dismissed_path())?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            eprintln!("整理条目处置名单写入失败: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +669,39 @@ mod tests {
         j.deny_auto("P1>P2");
         j.deny_auto("P3>P4");
         assert_eq!(j.auto_denylist(), vec!["P1>P2".to_string(), "P3>P4".to_string()]);
+    }
+
+    #[test]
+    fn dismissed_items_roundtrip_and_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        assert!(j.dismissed_items().is_empty());
+        j.dismiss_item("s:P1>P2");
+        j.dismiss_item("s:P1>P2");
+        j.dismiss_item("d:张三");
+        assert_eq!(j.dismissed_items(), vec!["s:P1>P2".to_string(), "d:张三".to_string()]);
+    }
+
+    #[test]
+    fn dismissed_items_evicts_oldest_past_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        for i in 0..(DISMISSED_CAP + 1) {
+            j.dismiss_item(&format!("n:P{i}"));
+        }
+        let list = j.dismissed_items();
+        assert_eq!(list.len(), DISMISSED_CAP);
+        assert!(!list.contains(&"n:P0".to_string()), "最旧的被淘汰");
+        assert!(list.contains(&format!("n:P{DISMISSED_CAP}")), "最新的保留");
+    }
+
+    #[test]
+    fn dismissed_items_corrupted_file_reads_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        std::fs::create_dir_all(j.dir()).unwrap();
+        std::fs::write(j.dismissed_path(), b"not json").unwrap();
+        assert!(j.dismissed_items().is_empty());
     }
 
     #[test]

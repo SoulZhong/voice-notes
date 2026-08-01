@@ -3227,6 +3227,20 @@ fn list_merge_receipts(app: AppHandle) -> Result<Vec<ipc::MergeReceipt>, String>
         .collect())
 }
 
+/// 整理条目人工处置(忽略/保留)落盘:重启后不再出现。键格式由前端定义。
+#[tauri::command]
+fn dismiss_tidy_item(app: AppHandle, key: String) -> Result<(), String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::MergeJournal::new(root).dismiss_item(&key);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_dismissed_tidy_items(app: AppHandle) -> Result<Vec<String>, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(store::MergeJournal::new(root).dismissed_items())
+}
+
 // —— MCP 注册(设置页/欢迎页消费;registry 真值源是各 Agent 配置文件) ——
 
 #[derive(serde::Serialize)]
@@ -4630,6 +4644,8 @@ pub fn run() {
             undo_merge,
             acknowledge_merge,
             list_merge_receipts,
+            dismiss_tidy_item,
+            list_dismissed_tidy_items,
             mcp_agents_status,
             mcp_register,
             mcp_unregister,
