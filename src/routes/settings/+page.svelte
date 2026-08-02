@@ -26,6 +26,7 @@
     type ModelDownloadEvent,
     type MigrateEvent,
   } from "$lib/models";
+  import { countPeopleWithoutSamples } from "$lib/people";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
@@ -474,8 +475,27 @@
   const eres2Missing = $derived(
     !!status && !status.artifacts.find((a) => a.id === "speaker-eres2netv2")?.present,
   );
+  // 切换前先弹一步轻量行内确认(同存储区「清理…」的 purge-bar 形态):无样本人物
+  // 换模型后质心被清空、重建前认不出,得让用户知情再动手。
+  let pendingSpeakerModel = $state<string | null>(null);
+  let speakerNoSampleCount = $state(0);
+  function revertSpeakerChoice() {
+    speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
+  }
   async function changeSpeakerModel(model: string) {
     if (settings?.speaker_model === model) return;
+    error = "";
+    try {
+      speakerNoSampleCount = await countPeopleWithoutSamples();
+    } catch {
+      speakerNoSampleCount = 0; // 查询失败不挡切换,确认文案少一句而已
+    }
+    pendingSpeakerModel = model;
+  }
+  async function confirmSpeakerModelChange() {
+    const model = pendingSpeakerModel;
+    pendingSpeakerModel = null;
+    if (!model) return;
     error = "";
     try {
       const fresh = await getSettings();
@@ -485,8 +505,12 @@
       speakerChoice = model;
     } catch (e) {
       error = `${e}`;
-      speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
+      revertSpeakerChoice();
     }
+  }
+  function cancelSpeakerModelChange() {
+    pendingSpeakerModel = null;
+    revertSpeakerChoice();
   }
 
   // —— ASR 选型 ——
@@ -956,7 +980,7 @@
           <span class="row-label">声纹模型</span>
           <span class="row-desc">
             {speakerChoice === "eres2netv2"
-              ? "备选模型;切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"
+              ? "备选模型;ERes2NetV2:中文基准更准(CN-Celeb EER 6.14% vs 6.78%),模型更大速度稍慢;切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"
               : "推荐 · 切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"}
           </span>
         </div>
@@ -986,6 +1010,19 @@
           </label>
         </div>
       </div>
+      {#if pendingSpeakerModel}
+        <div class="purge-bar">
+          <span class="confirm-text">
+            切换后将用录音样本为每人重算声纹{speakerNoSampleCount > 0
+              ? `;库内 ${speakerNoSampleCount} 人无样本,重建前无法自动认出(名字与历史笔记不受影响)`
+              : ""}。
+          </span>
+          <div class="purge-actions">
+            <button class="link danger" onclick={confirmSpeakerModelChange}>确认切换</button>
+            <button class="link" onclick={cancelSpeakerModelChange}>取消</button>
+          </div>
+        </div>
+      {/if}
       <label class="row">
         <div class="row-info">
           <span class="row-label">会后 AI</span>

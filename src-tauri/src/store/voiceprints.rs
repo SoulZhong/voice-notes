@@ -630,6 +630,15 @@ impl VoiceprintStore {
         Ok(rebuilt)
     }
 
+    /// 库内「无录音样本」的人数——切换嵌入模型前供前端预告:这些人 rebuild_for_model
+    /// 会清空质心(新模型空间无从重建),重建完成前无法自动认出(名字/历史笔记不受
+    /// 影响,等下次录到重新积累样本)。判据与 rebuild_for_model 一致(样本槽是否存在
+    /// 于磁盘),只读不加锁。
+    pub fn count_people_without_samples(&self) -> usize {
+        let vp = self.load();
+        vp.people.keys().filter(|id| self.sample_paths_existing(id).is_empty()).count()
+    }
+
     /// 删除某人的一份录音样本(按绝对路径指认,试听纠错用;样本不参与识别,删除
     /// 不影响认人)。路径必须是该人现存样本之一——IPC 传入的任意路径不可信,
     /// 绝不能直接 remove_file。id 先经 redirects 解析(详情页可能拿着旧引用)。
@@ -1710,6 +1719,42 @@ mod tests {
         let b = &vp.people[&pb];
         assert!(b.centroids.is_empty(), "无样本者清空质心(身份保留,等重新积累)");
         assert!(b.session_centroids.is_empty());
+    }
+
+    /// T3:切换声纹模型前的边界显性化——2 人有样本、1 人无样本,
+    /// count_people_without_samples 要能把无样本者单独数出来,且 rebuild_for_model
+    /// 跑完后该人 people 记录(名字)仍完整保留,只是质心被清空(新空间无从匹配)。
+    #[test]
+    fn count_people_without_samples_distinguishes_and_preserves_people_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(
+                &[
+                    snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                    snap("S3", vec![1.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+                ],
+                "t1",
+            )
+            .unwrap();
+        let (pa, pb, pc) = (links["S1"].clone(), links["S2"].clone(), links["S3"].clone());
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        // pa、pb 各有一份样本;pc 无样本。
+        store.append_sample(&pa, &square).unwrap();
+        store.append_sample(&pb, &square).unwrap();
+        store.rename(&pc, "无样本的人").unwrap();
+        assert_eq!(store.count_people_without_samples(), 1, "仅 pc 无样本");
+
+        let mut e = FlipEmbedder;
+        let n = store.rebuild_for_model("eres2netv2", &mut e).unwrap();
+        assert_eq!(n, 2, "pa、pb 有样本可重建");
+        assert_eq!(store.count_people_without_samples(), 1, "重建后无样本人数不变");
+
+        let vp = store.load();
+        let c = &vp.people[&pc];
+        assert_eq!(c.name, "无样本的人", "无样本者 people 记录(名字)完整保留");
+        assert!(c.centroids.is_empty(), "无样本者质心已清空(新空间无从匹配)");
     }
 
     #[test]

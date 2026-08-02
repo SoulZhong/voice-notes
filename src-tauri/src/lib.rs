@@ -2889,6 +2889,14 @@ fn list_people(app: AppHandle) -> Result<Vec<ipc::PersonSummary>, String> {
     Ok(people)
 }
 
+/// 库内「无录音样本」的人数——设置页切换声纹模型前的确认提示用:这些人切换后
+/// 质心会被 rebuild_for_model 清空（新模型向量空间不可比），重建完成前无法自动
+/// 认出（名字与历史笔记不受影响）。只读查询，录制中也可用。
+#[tauri::command]
+fn count_people_without_samples(app: AppHandle) -> Result<usize, String> {
+    Ok(open_voiceprint_store(&app)?.count_people_without_samples())
+}
+
 /// 整理·再辨认：未命名人物与库中其他人比对声纹质心，可归属者给出合并建议。
 /// 纯推荐不落任何修改——确认合并由前端走既有 merge_person（含录制中拒绝等守卫）。
 #[tauri::command]
@@ -4732,6 +4740,7 @@ pub fn run() {
             audio_disk_usage,
             purge_audio,
             list_people,
+            count_people_without_samples,
             rename_person,
             merge_person,
             delete_person,

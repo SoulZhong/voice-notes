@@ -17,6 +17,10 @@ export type PersonSummary = {
 
 /** 后端已按 last_seen 降序返回。 */
 export const listPeople = () => invoke<PersonSummary[]>("list_people");
+/** 库内「无录音样本」的人数——切换声纹模型前用于确认提示:这些人切换后质心会
+    被清空(新模型向量空间不可比),重建完成前无法自动认出(名字/历史笔记不受
+    影响)。只读,录制中也可调用。 */
+export const countPeopleWithoutSamples = () => invoke<number>("count_people_without_samples");
 /** 该人出现过的会议(扫笔记 person_id 引用,经合并重定向归一),按开始时间倒序。 */
 export const personNotes = (personId: string) =>
   invoke<NoteSummary[]>("person_notes", { personId });
