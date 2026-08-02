@@ -483,13 +483,21 @@
     speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
   }
   async function changeSpeakerModel(model: string) {
-    if (settings?.speaker_model === model) return;
+    if (settings?.speaker_model === model) {
+      // 用户在确认前切回当前模型:取消尚未确认的旧目标。bind:group 已先更新
+      // speakerChoice,若只 return 会留下旧 pending,随后点「确认」反而切到未选中的模型。
+      pendingSpeakerModel = null;
+      speakerNoSampleCount = 0;
+      return;
+    }
     error = "";
     try {
       speakerNoSampleCount = await countPeopleWithoutSamples();
     } catch {
       speakerNoSampleCount = 0; // 查询失败不挡切换,确认文案少一句而已
     }
+    // 查询在途时用户可能已选回原模型或改选别项;旧响应不得复活过时确认条。
+    if (speakerChoice !== model || settings?.speaker_model === model) return;
     pendingSpeakerModel = model;
   }
   async function confirmSpeakerModelChange() {
