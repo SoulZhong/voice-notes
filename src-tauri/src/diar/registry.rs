@@ -19,7 +19,12 @@ pub const MIN_NEW_CLUSTER_SAMPLES: usize = 40_000; // 2.5s
 /// 低于此样本数(16kHz)的段不参与质心更新(短段声纹噪声大,防拖歪质心)。
 /// 首轮校准是 0.6s(质心更新的容错比建簇高,running mean 稀释单段噪声)。
 /// 二〇二六-〇八根因分析:短段系统性偏移非白噪声,running-mean 稀释不足以
-/// 抵御,提到 1.5s;0.6~1.5s 段仍正常归簇打标签,只是无权改质心。
+/// 抵御,提到 1.5s;0.6~1.5s 段仍正常归簇打标签,但不止"无权改质心"——
+/// 不更新质心、不计入 count/total_ms、也不进"近期贡献环"(见 assign_inner)。
+/// 终审 F2:这连带让 enroll 累计口径收紧——AUTO_ENROLL_MS 的门槛依赖
+/// total_ms 累计,0.6~1.5s 的碎句不再计入,同等语速下攒够登记门槛变慢,
+/// 即碎句说话人的登记门槛隐性抬高。方向与"压制批量造新人"一致,是随本次
+/// 校准接受的显式决定,不是遗漏。
 pub const MIN_CENTROID_UPDATE_SAMPLES: usize = 24_000; // 1.5s
 /// 软归属下限(余弦):相似度落在 [SOFT_ASSIGN_THRESHOLD, ASSIGN_THRESHOLD) 灰区的段,
 /// 归入最近的普通簇(打标签但不更新质心/计数,防弱证据污染),而非开新簇——近场 mic
@@ -464,19 +469,55 @@ impl SpeakerRegistry {
             'outer: for i in 0..self.clusters.len() {
                 for j in (i + 1)..self.clusters.len() {
                     let (a, b) = (&self.clusters[i], &self.clusters[j]);
+                    // 终审 F1:双方都是"跨会话种子"(seed_source 非 None)的配对直接跳过,
+                    // 不参与合并——with_seeds 给同一 person 的主质心+每条会话变体各建
+                    // 一个种子簇,匹配语义本就取 max(assign_inner 逐簇比对,不要求
+                    // "唯一命中"),同人变体互相 cos ≥0.68 是常态,互并对识别零收益;
+                    // 反而会毁掉信道结构与 cohort 统计——互并后下面的降级规则会把
+                    // winner 的 seed_source/seed_cohort 清空,该人退化为"恢复簇"语义
+                    // (裸 0.68 跨信道复活、丢失短段闸①),person_max 计数还可能因种子
+                    // 减少而跌破 SNORM_MIN_COHORT,连累其他人物的 z 通道被关掉——三闸
+                    // 对多数真实人物形同未做(冒烟实锤:同人两 mic 种子链式合并数条
+                    // final 内吃光多数种子)。不同 person 的种子簇本就被下面 person
+                    // 不等分支挡住;无主会话簇 ↔ 种子簇的合并(死区修复,F3a 见下)
+                    // 不受影响,只有 j 循环里非种子一侧 seed_source 为 None 时才会走到
+                    // 下面的判定。放在点积计算之前是 O(1) 早退,顺带砍掉种子↔种子的
+                    // 每次 final O(S²·D) 扫描(种子多时这条本身就是显著开销)。
+                    if a.seed_source.is_some() && b.seed_source.is_some() {
+                        continue;
+                    }
                     // 合并门槛按配对身份分档:
                     // - 不同 person 禁止自动互并("库里两人实为一人"只能用户在管理页显式合并);
-                    // - 无主簇 ↔ 有主簇(或同 person 双簇)用归簇同款 SEED_ASSIGN_THRESHOLD:
-                    //   开场短段声纹噪声大、够不着种子门槛时会另立无主簇,若其质心本可归簇
-                    //   命中种子(≥0.68),就该并回去——否则卡在 [0.68, 0.74) 死区裂人
-                    //   (冒烟实锤:同人双簇余弦 0.711 永远等不到 0.74);
+                    // - 无主簇(person=None)↔ 有 person 一侧:
+                    //   · 若有 person 一侧不是种子(本场实时入库的普通簇)→ 维持 MERGE_THRESHOLD,
+                    //     与"尚未入库"时行为一致;
+                    //   · 若是种子且该种子无信道记录(seed_source=None,即续录恢复簇,信道
+                    //     未知)→ 维持旧语义,裸 SEED_ASSIGN_THRESHOLD(0.68)不分信道,
+                    //     待快照带信道后收紧;
+                    //   · 若是种子且带信道记录:同信道维持 SEED_ASSIGN_THRESHOLD(0.68,
+                    //     开场短段声纹噪声大够不着种子门槛时会另立无主簇,若其质心本可
+                    //     归簇命中种子就该并回去,否则卡在 [0.68,0.74) 死区裂人——冒烟
+                    //     实锤:同人双簇余弦 0.711 永远等不到 0.74);跨信道抬到
+                    //     MERGE_THRESHOLD(终审 F3a——assign 路刚关掉的 mic 撞 system 裸
+                    //     0.68 不能从合并路走回来;0.74 与场内簇间合并同档,待评测集校准);
+                    // - 同 person 双簇(必是"无主簇后来追认成同一 person"与种子/入库簇配对,
+                    //   seed↔seed 已被上面挡掉)沿用 SEED_ASSIGN_THRESHOLD,信道判定留给
+                    //   assign_inner 的三闸,这里不重复;
                     // - 无主 ↔ 无主维持 MERGE_THRESHOLD(0.74 为首轮真实会议校准,防过度合并)。
                     let pair_threshold = match (&a.person, &b.person) {
                         (Some(x), Some(y)) if x != y => continue,
-                        // 放宽到归簇同款阈值只适用于"跨会话种子"参与的配对(死区修复的
-                        // 本意)：本场实时入库的簇不是种子,与无主簇合并仍走普通门槛,
-                        // 行为与"尚未入库"时完全一致。
-                        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                        (Some(_), None) | (None, Some(_)) => {
+                            let (masterless, other) = if a.person.is_none() { (a, b) } else { (b, a) };
+                            if other.is_seed() {
+                                match &other.seed_source {
+                                    Some(src) if !masterless.sources.contains(src) => MERGE_THRESHOLD,
+                                    _ => SEED_ASSIGN_THRESHOLD,
+                                }
+                            } else {
+                                MERGE_THRESHOLD
+                            }
+                        }
+                        (Some(_), Some(_)) => {
                             if a.is_seed() || b.is_seed() { SEED_ASSIGN_THRESHOLD } else { MERGE_THRESHOLD }
                         }
                         (None, None) => MERGE_THRESHOLD,
@@ -505,10 +546,13 @@ impl SpeakerRegistry {
             winner.total_ms += loser.total_ms;
             winner.reported_ms += loser.reported_ms;
             winner.sources.extend(loser.sources.iter().cloned());
-            // T1 交接项:任一侧曾是"跨会话种子"(seed_source 非 None),混合后的
-            // 质心已不再单纯属于该信道,winner 的信道身份与 AS-Norm 统计随之
-            // 作废——退化为"恢复簇"语义(seed_source=None,不分信道走裸分;
-            // seed_cohort 同步清空,注释见 assign_inner 的三闸判定)。
+            // T1 交接项(终审 F1 后收窄):seed↔seed 的配对已被上面的 continue 挡在
+            // detect_merges 之外,能走到这里、且任一侧 seed_source 非 None 的合并
+            // 只剩"非种子簇(无主簇,或本场追认成同一 person 的入库簇)↔ 种子簇"这
+            // 一种——混合后的质心已不再单纯属于种子那侧的信道,winner 的信道身份与
+            // AS-Norm 统计随之作废,退化为"恢复簇"语义(seed_source=None,不分信道
+            // 走裸分;seed_cohort 同步清空,注释见 assign_inner 的三闸判定)。这份
+            // 降级本身仍然成立,予以保留。
             if winner.seed_source.is_some() || loser.seed_source.is_some() {
                 winner.seed_source = None;
                 winner.seed_cohort = None;
@@ -1039,11 +1083,14 @@ mod tests {
     fn unowned_cluster_in_dead_zone_merges_into_seed_at_assign_threshold() {
         // 冒烟实锤场景:开场短段够不着种子 0.68 另立无主簇,漂到与种子余弦 0.711——
         // 落在 [SEED_ASSIGN, MERGE) 死区,旧逻辑永不合并,同一人被裂成两个。
+        // 无主簇来源与种子同为 "mic"(同信道):终审 F3a 给这类配对加了信道判定,
+        // 跨信道抬到 MERGE_THRESHOLD(见 masterless_to_seed_merge_cross_channel_threshold_raised
+        // 专项锁测);同信道维持本测试锁死的 SEED_ASSIGN_THRESHOLD(0.68)不变。
         let snap = ClusterSnapshot {
             id: "S9".into(),
             centroid: v(0.71, 0.70413, 0.0), // 与 e1 余弦 ≈ 0.710
             count: 2,
-            sources: BTreeSet::from(["system".to_string()]),
+            sources: BTreeSet::from(["mic".to_string()]),
             person: None,
             total_ms: 3000,
         };
@@ -1055,7 +1102,7 @@ mod tests {
             source: "mic".into(),
         }];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
-        assert_eq!(r.take_merges().len(), 1, "无主↔有主在 0.71 应按归簇同款阈值合并");
+        assert_eq!(r.take_merges().len(), 1, "同信道下,无主↔有主在 0.71 应按归簇同款阈值合并");
         let s = r.speakers();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].person.as_deref(), Some("P1"), "种子 count 大为 winner,person 保留");
@@ -1580,19 +1627,21 @@ mod tests {
     /// AS-Norm 统计随之作废,退化为"恢复簇"语义(seed_source/seed_cohort 清空)。
     #[test]
     fn seed_merge_degrades_seed_source_and_cohort_to_recovered_semantics() {
-        // 复用死区修复场景:无主簇(system,余弦 0.71)漂到够得着种子(mic,P1)的
-        // 归簇死区阈值,自动并入种子(种子 count 更大,winner)。
+        // 复用死区修复场景:无主簇(mic,余弦 0.71)漂到够得着种子(mic,P1)的
+        // 归簇死区阈值,自动并入种子(种子 count 更大,winner)。同信道(终审
+        // F3a 之后仍走 SEED_ASSIGN_THRESHOLD 0.68,与既有测试一致);跨信道
+        // 场景已改抬到 MERGE_THRESHOLD,见专项锁测,这里只关心降级规则本身。
         let snap = ClusterSnapshot {
             id: "S9".into(),
             centroid: v(0.71, 0.70413, 0.0),
             count: 2,
-            sources: BTreeSet::from(["system".to_string()]),
+            sources: BTreeSet::from(["mic".to_string()]),
             person: None,
             total_ms: 3000,
         };
         let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into() }];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
-        assert_eq!(r.take_merges().len(), 1, "无主↔有主在 0.71 应按归簇同款阈值合并(前置条件与既有测试一致)");
+        assert_eq!(r.take_merges().len(), 1, "同信道下,无主↔有主在 0.71 应按归簇同款阈值合并(前置条件与既有测试一致)");
         let winner = r.clusters.iter().find(|c| c.person.as_deref() == Some("P1")).unwrap();
         assert!(winner.seed_source.is_none(), "混合信道质心不再属于单一信道,seed_source 应被清空");
         assert!(winner.seed_cohort.is_none(), "统计随信道身份一并作废,seed_cohort 应被清空");
@@ -1704,5 +1753,110 @@ mod tests {
             Some("P4"),
             "同信道裸分 0.64 ∈ [0.50,0.68) 死区但 z=3.1≥3,z 通道对同信道同样开放(召回增益)应命中"
         );
+    }
+
+    /// 终审 F1 锁测:with_seeds 给同一 person 的主质心+每条会话变体各建一个
+    /// 种子簇(匹配语义取 max),两个 P1 种子(主质心/变体)余弦 0.9 ≥
+    /// SEED_ASSIGN_THRESHOLD(0.68)——修前会在第一次 detect_merges 里互并,
+    /// 混合质心后 seed_source/seed_cohort 被下面的降级规则清空,该人退化为
+    /// "恢复簇"语义(裸 0.68 跨信道复活、丢短段闸)。P2/P3/P4 只是凑够
+    /// SNORM_MIN_COHORT(3 个其他人物)让 P1 的 seed_cohort 非 None,便于校验
+    /// 互并未清空它。多轮 take_merges 与穿插的无关 assign(触发周期性
+    /// detect_merges)之后,P1 应始终是两个独立、身份字段完好的种子簇。
+    #[test]
+    fn same_person_seed_variants_never_automerge_and_keep_seed_identity() {
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 40, source: "mic".into() },
+            // 与主质心余弦 = 0.9(0.9² + 0.435_889_9² ≈ 1)。
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![0.9, 0.435_889_9, 0.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        assert_eq!(r.clusters.len(), 5, "P1 的两条种子(主质心+变体)都应各自建簇");
+        let p1_before = r.clusters.iter().filter(|c| c.person.as_deref() == Some("P1")).count();
+        assert_eq!(p1_before, 2, "互并前 P1 应有两个独立种子簇");
+        for c in r.clusters.iter().filter(|c| c.person.as_deref() == Some("P1")) {
+            assert!(c.seed_cohort.is_some(), "3 个其他人物已达 SNORM_MIN_COHORT,seed_cohort 应为 Some");
+        }
+
+        for _ in 0..5 {
+            assert!(r.take_merges().is_empty(), "同人种子簇互并零收益,终审 F1 应恒不触发合并");
+        }
+        // 穿插几条与所有种子正交的无关 assign(第 5 维),验证 MERGE_CHECK_INTERVAL
+        // 周期触发的 detect_merges 同样不会误伤 P1 的两个种子簇。
+        for _ in 0..8 {
+            r.assign(&[0.0, 0.0, 0.0, 0.0, 1.0], "mic", LONG);
+        }
+        assert!(r.take_merges().is_empty());
+
+        let p1_after: Vec<&Cluster> = r.clusters.iter().filter(|c| c.person.as_deref() == Some("P1")).collect();
+        assert_eq!(p1_after.len(), 2, "P1 的两个种子簇应始终独立存在,未被互并");
+        for c in &p1_after {
+            assert!(c.seed_source.is_some(), "F1 修复后 P1 种子簇的 seed_source 不应被互并清空");
+            assert!(c.seed_cohort.is_some(), "F1 修复后 P1 种子簇的 seed_cohort 不应被互并清空");
+        }
+    }
+
+    /// 终审 F1 死区回归锁测:无主会话簇 ↔ 种子簇的合并(既有死区修复)不因
+    /// F1 的"seed↔seed 早退"而受影响——早退条件要求双方 seed_source 均非
+    /// None,无主簇(person=None)天然不是种子,不会被早退挡住。构造与
+    /// `different_persons_never_automerge_and_winner_inherits_person` 相同
+    /// (相向漂移把跨信道质心拉到 ≥ MERGE_THRESHOLD,F3a 的信道判定同样放行)。
+    #[test]
+    fn masterless_to_seed_merge_still_works_after_f1() {
+        let mut r2 = SpeakerRegistry::with_seeds(
+            &[],
+            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into() }],
+        );
+        // 建无主簇(system 信道),与种子(mic)正交起步。
+        r2.assign(&v(0.30, (1.0f32 - 0.09f32).sqrt(), 0.0), "system", LONG).unwrap();
+        for k in 1..=10 {
+            let t = 0.30 + 0.05 * k as f32; // 0.35..0.80
+            let y = (1.0 - t * t).max(0.0).sqrt();
+            r2.assign(&v(t, y, 0.0), "system", LONG).unwrap();
+        }
+        // 再用同信道(mic)样本把种子质心拖向无主簇方向,两者相向漂移到
+        // 跨信道也够得着的 MERGE_THRESHOLD。
+        for _ in 0..9 {
+            r2.assign(&v(0.90, 0.436, 0.0), "mic", LONG).unwrap();
+        }
+        let merges = r2.take_merges();
+        assert_eq!(merges.len(), 1, "无主会话簇(跨信道)最终质心贴近种子达 MERGE_THRESHOLD 时仍应合并,死区语义不回归");
+    }
+
+    /// 终审 F3a 锁测:无主会话簇 ↔ 种子簇的合并,信道一致时维持
+    /// SEED_ASSIGN_THRESHOLD(0.68,死区修复原语义);跨信道时抬到
+    /// MERGE_THRESHOLD(0.74)——assign 路已经不允许 mic 段裸 0.68 撞 system
+    /// 种子直接命中,不能让它从"合并"这条路绕回去。种子固定来源 "system";
+    /// 无主簇用与种子正交的向量建出(sim=0,不触发任何归簇/命中判定),再直接
+    /// 改写其质心到目标余弦,只验证 detect_merges 的门槛逻辑本身。
+    #[test]
+    fn masterless_to_seed_merge_cross_channel_threshold_raised() {
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "system".into() }];
+
+        // 跨信道(无主簇来源 "mic"):0.70 < 0.74,不应合并。
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let mid = r.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap();
+        let idx = r.clusters.iter().position(|c| c.id == mid).unwrap();
+        r.clusters[idx].centroid = v(0.70, (1.0f32 - 0.70 * 0.70).sqrt(), 0.0);
+        assert!(r.take_merges().is_empty(), "跨信道 0.70 < MERGE_THRESHOLD(0.74) 不应合并");
+        assert_eq!(r.speakers().len(), 2);
+
+        // 跨信道:0.75 ≥ 0.74,应合并。
+        let mut r2 = SpeakerRegistry::with_seeds(&[], &seeds);
+        let mid2 = r2.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap();
+        let idx2 = r2.clusters.iter().position(|c| c.id == mid2).unwrap();
+        r2.clusters[idx2].centroid = v(0.75, (1.0f32 - 0.75 * 0.75).sqrt(), 0.0);
+        assert_eq!(r2.take_merges().len(), 1, "跨信道 0.75 ≥ MERGE_THRESHOLD(0.74) 应合并");
+
+        // 同信道(无主簇来源同为 "system"):0.70 ≥ SEED_ASSIGN_THRESHOLD(0.68),
+        // 维持死区修复的原行为,应合并。
+        let mut r3 = SpeakerRegistry::with_seeds(&[], &seeds);
+        let mid3 = r3.assign(&v(0.0, 1.0, 0.0), "system", LONG).unwrap();
+        let idx3 = r3.clusters.iter().position(|c| c.id == mid3).unwrap();
+        r3.clusters[idx3].centroid = v(0.70, (1.0f32 - 0.70 * 0.70).sqrt(), 0.0);
+        assert_eq!(r3.take_merges().len(), 1, "同信道 0.70 ≥ SEED_ASSIGN_THRESHOLD(0.68) 照并,死区语义不变");
     }
 }

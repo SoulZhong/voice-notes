@@ -26,6 +26,7 @@
 
 - `MIN_CENTROID_UPDATE_SAMPLES: 9600(0.6s) → 24_000(1.5s)`。注释保留 0.6s 首轮校准史,新增依据:<2s 嵌入可靠性跳崖(EER 可翻 3 倍),running-mean 的稀释不足以抵御短段系统性偏移。
 - 新增 `SEED_MIN_SAMPLES: usize = 32_000(2s)`:短于 2s 的段**不参与种子命中**(快路与 z 通道都不开;仍可归场内簇 0.62/软归属 0.45)。短段无权拍板"这是谁"。
+- 终审 F2 补记:`MIN_CENTROID_UPDATE_SAMPLES` 提到 1.5s 后,0.6~1.5s 的段不再计入 count/total_ms,连带让 `AUTO_ENROLL_MS` 的累计口径变严——碎句说话人攒够登记门槛变慢,方向与本次改造"压制批量造新人"一致,是随本次校准接受的显式决定。
 
 ## 四、ERes2NetV2 收尾(models/settings/前端)
 

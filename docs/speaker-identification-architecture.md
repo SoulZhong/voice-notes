@@ -94,11 +94,11 @@ sequenceDiagram
 
 要点:一个人的多条质心(主+变体)各成一个种子簇,匹配等价于取 max——不同状态的声音都可能命中;种子簇阈值(0.68)比普通簇(0.62)**更严**,且**不参与软归属**——认错老熟人的代价高于漏认。识别发生在**实时**,不等停止。
 
-种子命中还设了"三闸":①段长 <2s(`SEED_MIN_SAMPLES`)一律无权拍板,再高的裸分也只能进普通簇/软归属;②同信道走裸余弦快路(≥0.68 即中,与普通簇同款判定,只是阈值更高);③跨信道裸分不可比,只走 AS-Norm 对称 z 通道(`SEED_ASSIGN_Z=3.0` 且裸分 ≥`SEED_ASSIGN_RAW_FLOOR=0.50`)才认领——z 通道对同信道同样开放,作为召回增益。
+种子命中还设了"三闸":①段长 <2s(`SEED_MIN_SAMPLES`)一律无权拍板,再高的裸分也只能进普通簇/软归属;②同信道走裸余弦快路(≥0.68 即中,与普通簇同款判定,只是阈值更高);③跨信道裸分不可比,只走 AS-Norm 对称 z 通道(`SEED_ASSIGN_Z=3.0` 且裸分 ≥`SEED_ASSIGN_RAW_FLOOR=0.50`)才认领——z 通道对同信道同样开放,作为召回增益。续录恢复簇与(无主↔种子)合并降级簇维持旧语义(裸 0.68 不分信道),待快照带信道后收紧。
 
 ## ⑤ 自动登记与库更新
 
-- **登记门槛**:无主簇本场**累计发声 ≥10s**(`AUTO_ENROLL_MS=10_000`,`voiceprints.rs:20`;软归属/短段不计入累计)。两条路径:实时(每条定稿后 `enroll_pending`)+ 停止兜底(`upsert_from_session`),同一门槛。
+- **登记门槛**:无主簇本场**累计发声 ≥10s**(`AUTO_ENROLL_MS=10_000`,`voiceprints.rs:20`;软归属/短段不计入累计;短段=1.5s 以下的段不更新质心也不计入这份累计,`MIN_CENTROID_UPDATE_SAMPLES`)。两条路径:实时(每条定稿后 `enroll_pending`)+ 停止兜底(`upsert_from_session`),同一门槛。
 - **质心更新**:停止时按**本场净增量**(减去种子基数,防重复累加)加权并入同信道主质心并重归一;净增量 ≥10s 另追加一条会话变体(环形上限 5)。
 - **试听样本**:只为"本场**新入库**的陌生声音"写一份(截 15s,够 10s 即定格);老熟人跳过(除非一份都没有)。上限 10 份,合并超额时按 farthest-point 贪心保留彼此最不相似的 10 份——样本的价值是"这个人听起来的不同样子"。**样本不参与识别**,用途:人工试听核对、合并挑选、换嵌入模型时重算质心(`rebuild_for_model`)。
 
@@ -145,7 +145,7 @@ flowchart LR
 | `MIN_NEW_CLUSTER_SAMPLES` | 2.5s | 短于此不建新簇 | registry.rs |
 | `MIN_CENTROID_UPDATE_SAMPLES` | 1.5s | 短于此不更新质心 | registry.rs |
 | `SEED_MIN_SAMPLES` | 2s | 段长下限,不足则无权拍板种子(待评测集校准的初值) | registry.rs |
-| `SEED_ASSIGN_Z` | 3.0 | 种子跨信道 AS-Norm 对称 z 命中门槛(待评测集校准的初值) | registry.rs |
+| `SEED_ASSIGN_Z` | 3.0 | 种子 AS-Norm 对称 z 命中门槛(跨信道唯一通道;同信道亦开放为召回增益)(待评测集校准的初值) | registry.rs |
 | `SEED_ASSIGN_RAW_FLOOR` | 0.50 | 种子 z 通道命中仍要求的裸分地板(待评测集校准的初值) | registry.rs |
 | `AUTO_ENROLL_MS` | 10s | 自动登记新 Person 门槛 | voiceprints.rs:20 |
 | `SESSION_CENTROIDS_MAX` | 5 | 会话变体环形上限 | voiceprints.rs:45 |
