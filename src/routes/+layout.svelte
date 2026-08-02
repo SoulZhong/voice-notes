@@ -9,6 +9,7 @@
   import { tidy } from "$lib/tidy.svelte";
   import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
+  import { i18n } from "$lib/i18n/index.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { checkUpdate, applyUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
@@ -87,10 +88,13 @@
 
   onMount(() => {
     recording.init();
-    // 启动即按已保存设置切主题;取不到设置(如首启动/IPC 失败)时静默放弃——
-    // 根元素 color-scheme 保持默认,等价于跟随系统,不需要额外兜底分支
+    // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——
+    // 主题保持默认(等价跟随系统),语言保持 i18n 默认(zh,与历史行为一致)
     getSettings()
-      .then((s) => applyTheme(s.theme))
+      .then((s) => {
+        applyTheme(s.theme);
+        i18n.setChoice(s.ui_lang);
+      })
       .catch(() => {});
     checkOnboarding();
     checkUpdate()

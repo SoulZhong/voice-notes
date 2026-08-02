@@ -4,6 +4,7 @@
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
   import { applyTheme } from "$lib/theme";
+  import { i18n, t } from "$lib/i18n/index.svelte";
   import { acceleratorFromEvent, displayShortcut } from "$lib/shortcut";
   import {
     modelsStatus,
@@ -133,6 +134,8 @@
   // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
   /** 外观主题 radio:"light" | "dark" | "system"。 */
   let themeChoice = $state("system");
+  /** UI 语言 radio:"system" | "zh" | "en"。 */
+  let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
   let sysOnly = $state(false);
   let keepVol = $state(false);
@@ -209,6 +212,7 @@
   /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
+    langChoice = s.ui_lang;
     sysOnly = s.record_system_only;
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
@@ -397,6 +401,23 @@
       error = `切换主题失败: ${e}`;
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings); // 回弹 themeChoice
+    }
+  }
+
+  // UI 语言:存 settings 后 i18n.setChoice 即时生效(界面响应式重渲;托盘由后端
+  // set_settings 检测 ui_lang 变化自行重建)。套路同 changeTheme。
+  async function changeLang() {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.ui_lang = langChoice;
+      await setSettings(fresh);
+      settings = fresh;
+      i18n.setChoice(langChoice);
+    } catch (e) {
+      error = t("common.language.switchFailed", { e });
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings); // 回弹 langChoice
     }
   }
 
@@ -635,6 +656,20 @@
           </label>
           <label class="seg-item">
             <input type="radio" name="theme" value="system" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />跟随系统
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info"><span class="row-label">{t("common.language.label")}</span></div>
+        <div class="seg">
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="zh" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.zh")}
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="en" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.en")}
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="system" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.system")}
           </label>
         </div>
       </div>
