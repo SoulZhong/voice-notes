@@ -506,12 +506,17 @@
   // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的修订稿/进度）。
   // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
   // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
-  // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
+  // 只在 id 变化时清；编辑后的 refresh() 不经此处，不会闪屏。
   $effect(() => {
     void id;
     // 落盘先于复位:flushRefined 内部用 loadedRefinedId(不是下面即将复位的
     // refined/id)找旧笔记,必须在清空编辑态之前调用。
-    refinedEditor?.flushRefined(true);
+    //
+    // 必须 untrack:refinedEditor 是 bind:this 的 $state,裸读会让本 effect 除 id 外
+    // 还依赖它,于是有修订稿的笔记进入自毁循环——编辑器挂载使 refinedEditor 由 null
+    // 变为实例 → effect 重跑 → note/refined 被清空 → 编辑器卸载 → refinedEditor 回到
+    // null → effect 再跑……页面永远停在「加载中…」,且全程不报错(2026-08-02 定位)。
+    untrack(() => refinedEditor?.flushRefined(true));
     note = null;
     error = "";
     editing = false;
