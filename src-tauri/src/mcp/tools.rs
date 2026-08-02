@@ -621,6 +621,7 @@ mod tests {
             graph_extraction: None,
             relations: vec![],
             graph_support_mentions: vec![],
+            revision: 0,
             paragraphs: vec![store::RefinedParagraph {
                 speaker: "S1".into(),
                 name: Some("张三".into()),
@@ -723,6 +724,7 @@ mod tests {
                 graph_extraction: None,
                 relations: vec![],
                 graph_support_mentions: vec![],
+                revision: 0,
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -819,6 +821,7 @@ mod tests {
                 graph_extraction: None,
                 relations: vec![],
                 graph_support_mentions: vec![],
+                revision: 0,
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),
@@ -907,6 +910,7 @@ mod tests {
                 graph_extraction: None,
                 relations: vec![],
                 graph_support_mentions: vec![],
+                revision: 0,
                 paragraphs: vec![store::RefinedParagraph {
                     speaker: "S1".into(),
                     name: Some("张三".into()),

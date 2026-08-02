@@ -2617,6 +2617,26 @@ fn assign_refined_person(
     store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())
 }
 
+/// 笔记页 WYSIWYG 整篇保存精修稿。守卫与 rename_refined_speaker 同套:Aing 中拒绝
+/// (管线随后整写会吞掉编辑),录制中拒绝;revision 乐观并发在 store 层校验。
+#[tauri::command]
+fn save_refined(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    revision: u64,
+    paragraphs: Vec<store::ParagraphPayload>,
+) -> Result<u64, String> {
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err("该笔记正在 Aing 中，稍后再存".into());
+    }
+    reject_if_active(&state, &note_id)?;
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::save_refined_paragraphs(&root.join(&note_id), revision, &paragraphs)
+        .map_err(|e| e.to_string())
+}
+
 /// 笔记音频轨道信息(详情页播放器用)。**纯读**:陈旧 WAV 头(硬崩残留)的修复
 /// 统一放在应用启动扫描(setup)与续录 open——此前放在这里做过"非活动才修",但
 /// stop 排干窗口 / 开录入槽窗口里 session 槽都是空的,check-then-act 挡不住与
@@ -3344,6 +3364,136 @@ fn dismiss_tidy_item(app: AppHandle, key: String) -> Result<(), String> {
 fn list_dismissed_tidy_items(app: AppHandle) -> Result<Vec<String>, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
     Ok(store::MergeJournal::new(root).dismissed_items())
+}
+
+fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
+    ipc::MergeReceipt {
+        journal_id: e.id.clone(),
+        time: e.time.clone(),
+        origin: e.origin.clone(),
+        loser: e.loser.clone(),
+        loser_name: e.loser_name.clone(),
+        winner: e.winner.clone(),
+        winner_name: e.winner_name.clone(),
+        similarity: e.similarity,
+        loser_sample_paths: journal
+            .loser_sample_copies(&e.id)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        invalid_reason: e.invalid_reason.clone(),
+    }
+}
+
+/// 整理·自动归并:strong 档且 loser 未命名且不在拒绝名单的建议逐条落日志后合并,
+/// 其余留给人工。录制中不动库(建议仍只读算出返回,审阅流此时只读浏览)。单条
+/// 失败不挡整批:该条降级人工,eprintln 留痕。
+#[tauri::command]
+fn apply_confident_merges(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<ipc::ConfidentMergeOutcome, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let store = store::VoiceprintStore::new(root.clone());
+    let vp = store.load();
+    let sugs = store::suggest_merges(&vp);
+    let to_ipc = |s: &store::MergeSuggestion| ipc::PersonMergeSuggestion {
+        loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+        winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+        loser: s.loser.clone(),
+        winner: s.winner.clone(),
+        similarity: s.similarity,
+        source: s.source.clone(),
+        salience: s.salience,
+    };
+    if state.session.lock().unwrap().is_some() {
+        return Ok(ipc::ConfidentMergeOutcome {
+            applied: vec![],
+            remaining: sugs.iter().map(to_ipc).collect(),
+        });
+    }
+    let journal = store::MergeJournal::new(root.clone());
+    let deny = journal.auto_denylist();
+    let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
+    let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
+    let mut applied = Vec::new();
+    let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in autos {
+        match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity)) {
+            Ok(jid) => {
+                merged.insert(s.loser.clone());
+                match journal.entry(&jid) {
+                    Ok(e) => applied.push(receipt_of(&journal, &e)),
+                    Err(err) => {
+                        eprintln!("自动归并回执读取失败({jid}): {err}");
+                        // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
+                        // (time 空串;list_merge_receipts 仍是真值源)。方法只要 id,
+                        // 条目读不回也能列副本。
+                        applied.push(ipc::MergeReceipt {
+                            journal_id: jid.clone(),
+                            time: String::new(),
+                            origin: "auto".into(),
+                            loser: s.loser.clone(),
+                            loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+                            winner: s.winner.clone(),
+                            winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+                            similarity: Some(s.similarity),
+                            loser_sample_paths: journal
+                                .loser_sample_copies(&jid)
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect(),
+                            invalid_reason: None,
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
+                remaining.push(to_ipc(&s));
+            }
+        }
+    }
+    // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
+    remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
+    if !applied.is_empty() {
+        queue_person_graph_rebuild(&app, root, "自动归并")?;
+    }
+    Ok(ipc::ConfidentMergeOutcome { applied, remaining })
+}
+
+/// 撤销一次合并(按日志条目)。录制中拒绝:理由同 merge_person。
+#[tauri::command]
+fn undo_merge(app: AppHandle, state: State<AppState>, journal_id: String) -> Result<(), String> {
+    if state.session.lock().unwrap().is_some() {
+        return Err("录制中不能撤销合并".into());
+    }
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::VoiceprintStore::new(root.clone())
+        .undo_merge(&journal_id)
+        .map_err(|e| e.to_string())?;
+    queue_person_graph_rebuild(&app, root, "撤销合并")
+}
+
+/// 回执卡「好」:确认自动归并,条目(连同样本副本)删除。
+#[tauri::command]
+fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    store::MergeJournal::new(root).acknowledge(&journal_id).map_err(|e| e.to_string())
+}
+
+/// 未确认的合并回执(审阅流回执卡数据;含已失效的——卡上撤销钮变灰注明原因)。
+/// manual 条目生来已确认,天然不在其中。
+#[tauri::command]
+fn list_merge_receipts(app: AppHandle) -> Result<Vec<ipc::MergeReceipt>, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let journal = store::MergeJournal::new(root);
+    Ok(journal
+        .entries()
+        .iter()
+        .filter(|e| !e.acknowledged)
+        .map(|e| receipt_of(&journal, e))
+        .collect())
 }
 
 // —— MCP 注册(设置页/欢迎页消费;registry 真值源是各 Agent 配置文件) ——
@@ -4673,6 +4823,7 @@ pub fn run() {
             get_note,
             refine_note,
             get_refined,
+            save_refined,
             preview_relation_backfill,
             start_relation_backfill,
             cancel_relation_backfill,
