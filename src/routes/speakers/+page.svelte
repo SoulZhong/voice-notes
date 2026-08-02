@@ -168,7 +168,9 @@
   }
   /** 换人弹层「新建」:库里没这个人=左侧说话人就是他,就地命名(声纹/样本/笔记
       原地不动,无合并日志);已命名的人不再进归属建议,这张卡随重算消失——乐观
-      先移除,不写 dismissed(命名后建议本就不再生成,不该占一条落盘忽略)。 */
+      先移除,不写 dismissed(命名后建议本就不再生成,不该占一条落盘忽略)。
+      在途 refresh 覆写 suggestions 可能让卡短暂闪回,下一轮自愈——tidy.doRefresh
+      注释里已明文接受的单飞刷新权衡,此处不另设防。 */
   async function doNameAsNew(s: PersonMergeSuggestion, name: string) {
     await act(
       async () => {
