@@ -267,9 +267,12 @@ fn process_final<F1, F2>(
     F2: FnMut(DiarEvent),
 {
     // 声纹:嵌入失败/无 embedder → None,绝不影响文本
+    // seg_key 供事后追溯回声撤回(EchoRetract → registry.retract_contribution)按图索骥:
+    // 仅 mic 段可能被追溯撤回,但 system 段同样传入不影响正确性(不会被查询到)。
+    let seg_key = format!("{}:{start_ms}", source.as_str());
     let speaker = embedder.as_mut().and_then(|e| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.embed(embedding_input))) {
-            Ok(Ok(v)) => registry.assign(&v, source.as_str(), samples_len),
+            Ok(Ok(v)) => registry.assign_tracked(&v, source.as_str(), samples_len, &seg_key),
             Ok(Err(err)) => {
                 eprintln!("声纹提取失败({:?} 段): {err}", source);
                 None
@@ -761,6 +764,11 @@ where
                 ) && text_similarity(&self.recent_mic[i].norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
                 if hit {
                     let m = self.recent_mic.remove(i).unwrap();
+                    // 该 mic 段的嵌入早已进过 registry 的簇质心/count/total_ms(process_final
+                    // 里 assign_tracked 记的贡献,seg_key 与此处同一构造规则)——回声被追溯
+                    // 确认后必须把这份污染从簇里冲抵掉,否则对方的声音会一直留在我方质心里,
+                    // 停止时的库快照也会把污染带进声纹库(找不到/已淘汰是 no-op,不影响撤回落盘)。
+                    self.registry.retract_contribution(&format!("{}:{}", Source::Mic.as_str(), m.start_ms));
                     eprintln!(
                         "追溯回声撤回: mic=\"{}\" system=\"{}\"",
                         text_prefix20(&m.text),

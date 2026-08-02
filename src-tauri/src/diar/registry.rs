@@ -3,7 +3,7 @@
 //! 唯一的外部副作用点是可选的 enroller 回调(会话中实时入库拿全局 person id),
 //! 由 lib.rs 注入、enroll_pending 触发;不注入时保持纯逻辑。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 /// 归簇阈值(余弦)。首轮真实会议校准(10+人短句场景)调整:原 0.55 下不同人被吸入同簇。
 pub const ASSIGN_THRESHOLD: f32 = 0.62;
@@ -29,6 +29,11 @@ pub const MERGE_CHECK_INTERVAL: u64 = 8;
 /// 种子簇(已关联库人物)的归簇阈值,高于普通阈值。跨会议信道差异比同会议内大,
 /// 命错人比不命名更糟,故要求更高相似度才认领。待真实会议数据校准。
 pub const SEED_ASSIGN_THRESHOLD: f32 = 0.68;
+/// "近期贡献环"容量:回声追溯撤回窗口(session.rs RETRACT_WINDOW_MS=30s)内可能
+/// 被撤销的 assign 调用数上限,防止长会话无界增长。超出容量的旧条目被静默淘汰
+/// ——淘汰后对应的撤回请求视为 no-op(近似值,回声窗口内的高频 assign 场景下
+/// 64 条已覆盖远超 30s 的真实语速)。
+const CONTRIBUTION_RING_CAP: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerInfo {
@@ -51,6 +56,19 @@ pub struct ClusterSnapshot {
     pub person: Option<String>,
     /// 本簇累计的长段时长(毫秒),供停止时的入库门槛判定与库累计使用。
     pub total_ms: u64,
+}
+
+/// "近期贡献环"里的一条记录:某次 assign 调用真正更新了某簇质心/计数/时长,
+/// 记下逆更新所需的最小信息。回声追溯撤回(session.rs EchoRetract)命中时,
+/// 凭 seg_key 找到这条记录并调用 retract_contribution 冲抵。
+struct Contribution {
+    /// 调用方给的稳定段标识(session.rs 用 "{source}:{start_ms}")。
+    seg_key: String,
+    cluster_id: String,
+    /// 该次 assign 用于更新质心的单位向量(assign 内部算出的 `unit`)。
+    embedding: Vec<f32>,
+    /// 该次贡献计入 total_ms 的增量。
+    ms: u64,
 }
 
 /// 库里的一个种子人物:注入 registry 供本场优先命中,免得同一人在新会话里
@@ -110,6 +128,8 @@ pub struct SpeakerRegistry {
     pending_merges: Vec<(String, String)>,
     /// (够料门槛 ms, 入库回调)。None = 不做实时入库(测试/库路径不可用)。
     enroller: Option<(u64, EnrollFn)>,
+    /// 近期贡献环,见 Contribution 注释。容量 CONTRIBUTION_RING_CAP,超出淘汰最旧。
+    contributions: VecDeque<Contribution>,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -132,7 +152,14 @@ impl Default for SpeakerRegistry {
 
 impl SpeakerRegistry {
     pub fn new() -> Self {
-        Self { clusters: Vec::new(), next_id: 1, assigns: 0, pending_merges: Vec::new(), enroller: None }
+        Self {
+            clusters: Vec::new(),
+            next_id: 1,
+            assigns: 0,
+            pending_merges: Vec::new(),
+            enroller: None,
+            contributions: VecDeque::new(),
+        }
     }
 
     /// 装配会话中实时入库回调(lib.rs 在 with_seeds 之后调用)。
@@ -156,7 +183,19 @@ impl SpeakerRegistry {
     /// 归簇:与各质心比余弦,≥ 阈值归入最相似簇;
     /// 长段(≥ MIN_NEW_CLUSTER_SAMPLES)更新质心、增计数; 短段仅记录来源、不拖质心(防噪声污染)。
     /// 不相似且段够长才新建簇。返回说话人 id;不可用嵌入/短段无归属返回 None。
+    /// 不记录"近期贡献"(不可撤回)——调用方需要事后追溯撤回时改用 assign_tracked。
     pub fn assign(&mut self, embedding: &[f32], source: &str, num_samples: usize) -> Option<String> {
+        self.assign_inner(embedding, source, num_samples, None)
+    }
+
+    /// 同 assign,额外记一条"近期贡献"(seg_key 标识该次调用,见 Contribution 注释),
+    /// 供事后 retract_contribution 撤回。session.rs 的 mic 段回声追溯撤回场景使用;
+    /// 其余调用方(测试等)用普通 assign 即可,不需要为不会被撤回的段占用环容量。
+    pub fn assign_tracked(&mut self, embedding: &[f32], source: &str, num_samples: usize, seg_key: &str) -> Option<String> {
+        self.assign_inner(embedding, source, num_samples, Some(seg_key))
+    }
+
+    fn assign_inner(&mut self, embedding: &[f32], source: &str, num_samples: usize, seg_key: Option<&str>) -> Option<String> {
         let unit = normalize(embedding)?;
         if let Some(c) = self.clusters.first() {
             if c.centroid.len() != unit.len() {
@@ -186,6 +225,7 @@ impl SpeakerRegistry {
         if let Some((_sim, cluster)) = best {
             cluster.sources.insert(source.to_string());
             // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
+            let mut contribution: Option<(String, u64)> = None;
             if num_samples >= MIN_CENTROID_UPDATE_SAMPLES {
                 // 质心 running mean(在单位向量上),再归一化
                 let n = cluster.count as f32;
@@ -196,14 +236,21 @@ impl SpeakerRegistry {
                     cluster.centroid = renorm;
                 }
                 cluster.count += 1;
-                cluster.total_ms += (num_samples / 16) as u64;
+                let ms = (num_samples / 16) as u64;
+                cluster.total_ms += ms;
+                contribution = Some((cluster.id.clone(), ms));
             }
-            return Some(cluster.id.clone());
+            let id = cluster.id.clone();
+            if let (Some(key), Some((cluster_id, ms))) = (seg_key, contribution) {
+                self.record_contribution(key, cluster_id, unit, ms);
+            }
+            return Some(id);
         }
 
         // 软归属:严格阈值未命中,但与某个**普通簇**(非种子)的相似度落在灰区
         // [SOFT, ASSIGN) → 归入该簇打标签,不更新质心/计数/时长(弱证据不留痕:
         // 不拖质心、不计入自动入库时长)。种子簇除外——弱证据错认领人名比碎片化更糟。
+        // 未真正更新质心,不记贡献:retract_contribution 对这类 seg_key 天然是 no-op。
         let soft = self
             .clusters
             .iter_mut()
@@ -225,6 +272,8 @@ impl SpeakerRegistry {
         }
         let id = format!("S{}", self.next_id);
         self.next_id += 1;
+        let ms = (num_samples / 16) as u64;
+        let ring_embedding = seg_key.map(|_| unit.clone());
         self.clusters.push(Cluster {
             id: id.clone(),
             centroid: unit,
@@ -234,13 +283,67 @@ impl SpeakerRegistry {
             person_name: None,
             // 建簇本身要求 num_samples >= MIN_NEW_CLUSTER_SAMPLES(足够长的段),
             // 首个成员的时长直接计入,与既有簇长段累加同一口径。
-            total_ms: (num_samples / 16) as u64,
+            total_ms: ms,
             // 会话内新建的普通簇没有"历史基数"，count 从 0 开始就是纯增量。
             seed_base_count: 0,
             reported_ms: 0,
             session_enrolled: false,
         });
+        // 新建簇同样是"真正更新了质心"(从无到有):记为贡献,撤回时若这是簇内
+        // 唯一成员,count 落到 0 且无 person → 整簇连带撤销(见 retract_contribution)。
+        if let (Some(key), Some(emb)) = (seg_key, ring_embedding) {
+            self.record_contribution(key, id.clone(), emb, ms);
+        }
         Some(id)
+    }
+
+    /// 把一条"近期贡献"记入环,超容量淘汰最旧(见 CONTRIBUTION_RING_CAP)。
+    fn record_contribution(&mut self, seg_key: &str, cluster_id: String, embedding: Vec<f32>, ms: u64) {
+        self.contributions.push_back(Contribution { seg_key: seg_key.to_string(), cluster_id, embedding, ms });
+        while self.contributions.len() > CONTRIBUTION_RING_CAP {
+            self.contributions.pop_front();
+        }
+    }
+
+    /// 撤回一次此前经 assign_tracked 记录的贡献:近似逆更新质心
+    /// `c' = normalize(c*count - e)`——running mean 每步都重新归一化,`c*count`
+    /// 并非精确的和向量(丢了历史范数),但簇内向量高度相似时 `‖sum‖ ≈ count`
+    /// (对齐的单位向量之和,模长趋近个数),误差可忽略(校准记录:两段同簇场景
+    /// 下与"仅保留另一段"的真实质心余弦 > 0.99)。
+    /// count/total_ms 相应回退(下限 0);簇回退到 0 且无 person → 整簇移除
+    /// (含从未真正认领的会话内簇撤销),有 person 则保留(库层净增量自然缩小)。
+    /// 找不到该 seg_key(未记录 / 已被环淘汰)或对应簇已不存在(已被合并/移除
+    /// 后环内条目未及清理)时是 no-op,返回 false——回声撤回是尽力而为，不panic。
+    pub fn retract_contribution(&mut self, seg_key: &str) -> bool {
+        let Some(pos) = self.contributions.iter().position(|c| c.seg_key == seg_key) else {
+            return false;
+        };
+        let contrib = self.contributions.remove(pos).expect("pos 刚定位到");
+        let Some(idx) = self.clusters.iter().position(|c| c.id == contrib.cluster_id) else {
+            return false;
+        };
+        let old_count = self.clusters[idx].count;
+        let new_count = old_count.saturating_sub(1);
+        self.clusters[idx].total_ms = self.clusters[idx].total_ms.saturating_sub(contrib.ms);
+
+        if new_count == 0 && self.clusters[idx].person.is_none() {
+            let removed = self.clusters.remove(idx);
+            // 该簇已死,环里其余指向它的条目(若有)也失去回退目标,一并丢弃。
+            self.contributions.retain(|c| c.cluster_id != removed.id);
+            return true;
+        }
+
+        let n = old_count as f32;
+        let cluster = &mut self.clusters[idx];
+        let mut sum: Vec<f32> = cluster.centroid.iter().map(|x| x * n).collect();
+        for (s, e) in sum.iter_mut().zip(contrib.embedding.iter()) {
+            *s -= e;
+        }
+        if let Some(renorm) = normalize(&sum) {
+            cluster.centroid = renorm;
+        }
+        cluster.count = new_count;
+        true
     }
 
     /// 取走自上次调用以来检测到的合并对 (被并 id, 并入 id)。
@@ -302,6 +405,16 @@ impl SpeakerRegistry {
                 winner.person = loser.person.clone();
                 winner.person_name = loser.person_name.clone();
                 winner.session_enrolled = loser.session_enrolled;
+            }
+            // 环里指向 loser 的贡献重映射到 winner:loser 簇本身已被摘掉,这些
+            // 条目若不跟着改指向,日后撤回会因"找不到簇"而静默失效(见
+            // retract_contribution 的簇缺失分支)——貌似安全但会让本可撤销的
+            // 贡献提前失效,故这里主动重映射而非留给缺失分支兜底。
+            let winner_id = winner.id.clone();
+            for c in self.contributions.iter_mut() {
+                if c.cluster_id == loser.id {
+                    c.cluster_id = winner_id.clone();
+                }
             }
             self.pending_merges.push((loser.id.clone(), winner.id.clone()));
         }
@@ -413,7 +526,14 @@ impl SpeakerRegistry {
                 });
             }
         }
-        Self { clusters, next_id, assigns: 0, pending_merges: Vec::new(), enroller: None }
+        Self {
+            clusters,
+            next_id,
+            assigns: 0,
+            pending_merges: Vec::new(),
+            enroller: None,
+            contributions: VecDeque::new(),
+        }
     }
 
     /// 库种子注入:先铺会话快照(续录),再为快照中未出现的 person 建种子簇。
@@ -1007,5 +1127,128 @@ mod tests {
         let id = r.assign(&probe, "mic", LONG).unwrap();
         assert_eq!(id, b_id, "应命中够得着的普通簇 B,而非被够不着的种子簇 A 挡住去新建簇");
         assert_eq!(r.speakers().len(), 2, "总簇数不变(命中已有簇,未新建)");
+    }
+
+    /// 回声追溯撤回①:两段进同簇,撤最后一段 → count/total_ms 回滚到仅剩第一段的
+    /// 状态,质心近似逆更新后与剩余那段的嵌入余弦 > 0.99(近似逆更新的校准口径)。
+    #[test]
+    fn retract_contribution_rolls_back_count_ms_and_centroid() {
+        let mut r = SpeakerRegistry::new();
+        // segA:建簇,3000ms;segB:同簇内第二段(与 segA 余弦 0.8,够得着 ASSIGN_THRESHOLD),1000ms。
+        assert_eq!(r.assign_tracked(&v(1.0, 0.0, 0.0), "mic", LONG, "segA"), Some("S1".into()));
+        assert_eq!(r.assign_tracked(&v(0.8, 0.6, 0.0), "mic", 16000, "segB"), Some("S1".into()));
+        let before = r.snapshot();
+        assert_eq!(before[0].count, 2);
+        assert_eq!(before[0].total_ms, 3000 + 1000);
+
+        assert!(r.retract_contribution("segB"), "已记录的贡献应能成功撤回");
+
+        let after = r.snapshot();
+        assert_eq!(after.len(), 1, "簇仍在(还有 segA 撑着)");
+        assert_eq!(after[0].count, 1, "count 应回退到只剩 segA");
+        assert_eq!(after[0].total_ms, 3000, "total_ms 应回退到只剩 segA 的时长");
+        assert!(
+            dot(&after[0].centroid, &[1.0, 0.0, 0.0]) > 0.99,
+            "近似逆更新后质心应与剩余的 segA 嵌入高度重合(cos > 0.99),实际 dot={}",
+            dot(&after[0].centroid, &[1.0, 0.0, 0.0])
+        );
+
+        // 同一 seg_key 只能撤一次:重复调用是 no-op。
+        assert!(!r.retract_contribution("segB"), "重复撤回同一 seg_key 应是 no-op");
+    }
+
+    /// 回声追溯撤回②:软归属段(灰区,不更新质心/计数)从未被记入贡献环,
+    /// 撤回请求天然找不到条目,是 no-op,簇状态原封不动。
+    #[test]
+    fn retract_contribution_on_soft_assigned_segment_is_noop() {
+        let mut r = SpeakerRegistry::new();
+        assert_eq!(r.assign_tracked(&v(1.0, 0.0, 0.0), "mic", LONG, "segA"), Some("S1".into()));
+        // 余弦 0.5 ∈ [SOFT, ASSIGN) 灰区 → 软归属,不拖质心/计数,不记贡献。
+        let y = (1.0f32 - 0.25).sqrt();
+        assert_eq!(r.assign_tracked(&v(0.5, y, 0.0), "system", LONG, "segSoft"), Some("S1".into()));
+
+        assert!(!r.retract_contribution("segSoft"), "软归属段没有对应贡献记录,应为 no-op");
+
+        let snap = r.snapshot();
+        assert_eq!(snap[0].count, 1, "软归属撤回不应影响簇状态");
+        assert_eq!(snap[0].total_ms, 3000);
+    }
+
+    /// 回声追溯撤回③:两簇合并后,撤销一条"合并前属于 loser 簇"的历史贡献,
+    /// 应从合并后的 winner 簇上正确回滚(环内条目随合并重映射到 winner)。
+    #[test]
+    fn retract_contribution_after_merge_rolls_back_from_winner() {
+        let mut r = SpeakerRegistry::new();
+        // 直接摆两个"高度相似但仍是两个簇"的状态,绕开 assign() 阈值互斥的物理约束
+        // (同一测试文件内 mod tests 对私有字段可见,构造纯逻辑场景更直接)。
+        r.clusters.push(Cluster {
+            id: "S1".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 2,
+            sources: BTreeSet::from(["mic".to_string()]),
+            person: None,
+            person_name: None,
+            total_ms: 5000,
+            seed_base_count: 0,
+            reported_ms: 0,
+            session_enrolled: false,
+        });
+        r.clusters.push(Cluster {
+            id: "S2".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 1,
+            sources: BTreeSet::from(["mic".to_string()]),
+            person: None,
+            person_name: None,
+            total_ms: 1000,
+            seed_base_count: 0,
+            reported_ms: 0,
+            session_enrolled: false,
+        });
+        r.record_contribution("segX", "S2".into(), v(1.0, 0.0, 0.0), 1000);
+
+        let merges = r.take_merges();
+        assert_eq!(merges, vec![("S2".to_string(), "S1".to_string())], "计数大者(S1)胜出");
+        assert_eq!(r.speakers().len(), 1, "两簇应已合并为一");
+
+        assert!(
+            r.retract_contribution("segX"),
+            "合并前记在 loser(S2)身上的贡献,合并后应仍可通过重映射撤回"
+        );
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, "S1", "撤回应作用在合并后的 winner 簇上");
+        assert_eq!(snap[0].count, 2, "count 应从合并后的 3 回退到 2(冲抵 segX 的贡献)");
+        assert_eq!(snap[0].total_ms, 5000, "total_ms 应从合并后的 6000 回退到 5000");
+    }
+
+    /// 回声追溯撤回④:贡献环容量有限(CONTRIBUTION_RING_CAP),超容量后最旧条目
+    /// 被淘汰;针对已淘汰 seg_key 的撤回请求是 no-op,不 panic,簇状态不受影响。
+    #[test]
+    fn retract_contribution_after_ring_eviction_is_noop_not_panic() {
+        let mut r = SpeakerRegistry::new();
+        r.clusters.push(Cluster {
+            id: "S1".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 1,
+            sources: BTreeSet::from(["mic".to_string()]),
+            person: None,
+            person_name: None,
+            total_ms: 1000,
+            seed_base_count: 0,
+            reported_ms: 0,
+            session_enrolled: false,
+        });
+        r.record_contribution("seg0", "S1".into(), v(1.0, 0.0, 0.0), 1000);
+        // 填满环把 seg0 挤出去。
+        for i in 0..CONTRIBUTION_RING_CAP {
+            r.record_contribution(&format!("filler{i}"), "S1".into(), v(1.0, 0.0, 0.0), 1);
+        }
+
+        assert!(!r.retract_contribution("seg0"), "已被环淘汰的 seg_key 撤回应是 no-op");
+        assert_eq!(r.clusters[0].count, 1, "被淘汰贡献的撤回请求不应影响簇状态(count 未受 filler 记录影响)");
+
+        // 未知 seg_key(从未记录过)同样是 no-op,不 panic。
+        assert!(!r.retract_contribution("never-existed"));
     }
 }
