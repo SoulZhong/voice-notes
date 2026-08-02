@@ -52,8 +52,11 @@ pub struct MergeJournalEntry {
 }
 
 /// root 为 app_data_dir(与 VoiceprintStore 同根),日志落 root/merge_journal/。
-/// 并发:所有调用方(voiceprints.rs 各方法/命令层)都在 vp_guard 内或单线程命令
-/// 上下文中操作,模块自身不再加锁。
+/// 并发:凡触碰条目目录(entries/样本副本/denylist)的调用方都必须在 vp_guard
+/// 内操作,模块自身不再加锁。命令层异步化(spawn_blocking)后不再有"单线程命令
+/// 上下文"这条豁免——直连写条目的旧路径(如 acknowledge)已收编进 VoiceprintStore
+/// 持锁包装,新调用方一律走那里。例外:dismissed 处置名单是独立单写文件,与条目
+/// 目录不相交,dismiss_item 免锁直连仍安全。
 pub struct MergeJournal {
     root: PathBuf,
     #[cfg(test)]
