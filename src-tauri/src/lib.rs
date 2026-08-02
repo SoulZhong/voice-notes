@@ -3071,6 +3071,11 @@ async fn merge_person(
     // 活会冻结整个 WebView。
     tauri::async_runtime::spawn_blocking(move || {
         let mut emb = None;
+        // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
+        // 「合并中开录」的种子错配窗口缩到微秒级。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err("录制中不能合并说话人".into());
+        }
         let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
         let root = data_root(&app).map_err(|e| e.to_string())?;
         queue_person_graph_rebuild(&app, root, "人物合并")?;
@@ -3088,6 +3093,11 @@ async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -
     }
     // 重活(store 删除+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
+        // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
+        // 「合并中开录」的种子错配窗口缩到微秒级。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err("录制中不能删除说话人".into());
+        }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         store::VoiceprintStore::new(root.clone())
             .delete(&id)
@@ -3155,6 +3165,15 @@ async fn apply_confident_merges(
                 remaining: sugs.iter().map(to_ipc).collect(),
             });
         }
+        // 异步化后 live 快照与此处之间有秒级窗口(建议计算等重活),进"落库分支"前
+        // 再查一次;命中则和 live 分支同样只读返回 remaining,不报错——自动归并是
+        // 后台增值行为,不该在用户开录时弹出错误。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Ok(ipc::ConfidentMergeOutcome {
+                applied: vec![],
+                remaining: sugs.iter().map(to_ipc).collect(),
+            });
+        }
         let journal = store::MergeJournal::new(root.clone());
         let deny = journal.auto_denylist();
         let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
@@ -3163,6 +3182,15 @@ async fn apply_confident_merges(
         let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut emb = None;
         for s in autos {
+            // 撤销/拆回的 deny_auto 可能落在本轮快照之后:每条落库前重读名单,
+            // 用户刚撤销的 pair 不许被同一轮自动归并打回(重读是小文件,廉价)。
+            let deny_now = journal.auto_denylist();
+            let pair = format!("{}>{}", s.loser, s.winner);
+            let rev = format!("{}>{}", s.winner, s.loser);
+            if deny_now.iter().any(|d| d == &pair || d == &rev) {
+                remaining.push(to_ipc(&s));
+                continue;
+            }
             match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity), &mut emb) {
                 Ok(jid) => {
                     merged.insert(s.loser.clone());
@@ -3222,6 +3250,11 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
     }
     // 重活(store 改写+样本副本清理+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
+        // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
+        // 「合并中开录」的种子错配窗口缩到微秒级。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err("录制中不能撤销合并".into());
+        }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         store::VoiceprintStore::new(root.clone())
             .undo_merge(&journal_id)
@@ -3244,6 +3277,11 @@ async fn restore_merged_person(
     }
     // 重活(按快照重建+文件拷贝+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
+        // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
+        // 「合并中开录」的种子错配窗口缩到微秒级。
+        if app.state::<AppState>().session.lock().unwrap().is_some() {
+            return Err("录制中不能拆回说话人".into());
+        }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         let pid = store::VoiceprintStore::new(root.clone())
             .restore_merged_person(&journal_id)
@@ -3261,7 +3299,7 @@ async fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), Str
     // 重活(样本副本文件删除)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        store::MergeJournal::new(root).acknowledge(&journal_id).map_err(|e| e.to_string())
+        store::VoiceprintStore::new(root).acknowledge_merge(&journal_id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

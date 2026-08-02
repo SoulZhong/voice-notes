@@ -452,6 +452,14 @@ impl VoiceprintStore {
         Ok(entry.loser.clone())
     }
 
+    /// 确认合并回执(删条目及样本副本)。异步化后命令不再天然串行,journal 目录
+    /// 写删必须与 invalidate/save_entry 等在同一把 vp_guard 下互斥,否则并发的
+    /// invalidate 会把刚删的条目以"无快照失效条"复活。
+    pub fn acknowledge_merge(&self, journal_id: &str) -> anyhow::Result<()> {
+        let _guard = vp_guard();
+        super::merge_journal::MergeJournal::new(self.root.clone()).acknowledge(journal_id)
+    }
+
     /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)
     /// + 连带删除全部录音样本(best-effort)。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -2178,6 +2186,21 @@ mod tests {
         let err = store.undo_merge(&jid).unwrap_err().to_string();
         assert!(err.contains("不能撤销"), "拒绝并带原因: {err}");
         assert!(err.contains("此人随后被改名"));
+    }
+
+    /// acknowledge_merge 是 vp_guard 内的薄包装,行为上应与直接调用
+    /// MergeJournal::acknowledge 等价(条目连样本副本一并消失)。
+    #[test]
+    fn acknowledge_merge_removes_entry_same_as_direct_journal_acknowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1").unwrap();
+
+        store.acknowledge_merge(&jid).unwrap();
+
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        assert!(journal.entries().is_empty(), "确认后条目消失");
+        assert!(journal.entry(&jid).is_err(), "条目目录已删除,与直接调 journal.acknowledge 等价");
     }
 
     #[test]
