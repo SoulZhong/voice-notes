@@ -560,9 +560,15 @@ mod tests {
 
     #[test]
     fn probe_mirror_empty_prefix_errs() {
-        // 文案随全局语言(可能被并发的 i18n 用例短暂翻转)二选一,两种都算对。
+        // 文案随全局语言:拿 test_lang_guard 与其它改语言的用例互斥后,两种语言各断言一次。
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
         let e = probe_mirror("   ").unwrap_err();
-        assert!(e.contains("为空") || e.contains("empty"), "空前缀应报错: {e}");
+        assert!(e.contains("为空"), "空前缀应报错(中文): {e}");
+        crate::i18n::set_lang("en");
+        let e = probe_mirror("   ").unwrap_err();
+        assert!(e.contains("empty"), "空前缀应报错(英文): {e}");
+        crate::i18n::set_lang("zh");
     }
 
     /// 真机验证(网络依赖,与既有 7 个模型依赖测试同惯例 #[ignore]):走生产同款

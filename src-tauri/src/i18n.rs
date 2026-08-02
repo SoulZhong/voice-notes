@@ -37,14 +37,23 @@ macro_rules! tr {
     };
 }
 
+/// 语言是进程级全局,而 cargo test 并行跑用例:任何**改动**当前语言的测试都必须先拿到
+/// 这把锁,否则会把正在断言中文的另一个用例掀翻(典型的偶发红)。中毒锁降级取值继续——
+/// 一个 panic 的用例不该让后续全部卡死。
+#[cfg(test)]
+pub(crate) fn test_lang_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // 注意:EN 是进程级全局,cargo test 并发跑用例会互相干扰——本模块用例全部串行
-    // 收敛在一个 #[test] 里,测完恢复默认中文。
+    // 本模块用例串行收敛在一个 #[test] 里,测完恢复默认中文;跨模块的并发由 test_lang_guard 挡。
     #[test]
     fn set_lang_and_tr_roundtrip() {
+        let _guard = test_lang_guard();
         set_lang("en");
         assert!(is_en());
         assert_eq!(tr!("未知模型: {id}", "Unknown model: {id}", id = "x"), "Unknown model: x");
