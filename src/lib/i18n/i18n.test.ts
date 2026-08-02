@@ -56,6 +56,44 @@ describe("i18n 核心", () => {
     }
   });
 
+  it("字典分片:en 函数值读取的参数名必须与 zh 占位符一致", () => {
+    // 英文用函数值处理复数,参数靠名字取(p.hops)。若与 zh 的 {hops} 对不上,
+    // 中文只是占位符原样留着(看得出),英文却会渲染成 "undefined"(看不出是 bug)。
+    for (const [name, shard] of Object.entries(shards)) {
+      const zh = shard.zh as Record<string, unknown>;
+      const en = shard.en as Record<string, unknown>;
+      for (const [key, enValue] of Object.entries(en)) {
+        if (typeof enValue !== "function") continue;
+        const zhValue = zh[key];
+        if (typeof zhValue !== "string") continue;
+        const zhNames = new Set([...zhValue.matchAll(/\{(\w+)\}/g)].map((m) => m[1]));
+        const enNames = new Set(
+          [...enValue.toString().matchAll(/\bp\.(\w+)/g)].map((m) => m[1]),
+        );
+        for (const n of enNames) {
+          expect(zhNames.has(n), `分片 ${name} 的 ${key}:en 读了 p.${n},zh 没有对应的 {${n}}`).toBe(true);
+        }
+        for (const n of zhNames) {
+          expect(enNames.has(n), `分片 ${name} 的 ${key}:zh 有 {${n}},en 函数没用到`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("字典分片:en 值不得整段照抄 zh(漏翻的兜底体检)", () => {
+    // 语言名按惯例两语言同形(在英文界面也要让中文用户认得出「中文」),白名单放行。
+    const sameByDesign = new Set(["common.language.zh", "common.language.en"]);
+    for (const [name, shard] of Object.entries(shards)) {
+      const zh = shard.zh as Record<string, unknown>;
+      const en = shard.en as Record<string, unknown>;
+      for (const [key, zhValue] of Object.entries(zh)) {
+        if (typeof zhValue !== "string" || !/[一-鿿]/.test(zhValue)) continue;
+        if (sameByDesign.has(key)) continue;
+        expect(en[key], `分片 ${name} 的 ${key} 未翻译(en 与 zh 同值)`).not.toBe(zhValue);
+      }
+    }
+  });
+
   it("字典分片:键必须以所在分片名为前缀(防未来撞键)", () => {
     for (const [name, shard] of Object.entries(shards)) {
       for (const key of Object.keys(shard.zh)) {
