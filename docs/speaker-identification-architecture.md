@@ -73,7 +73,7 @@ flowchart LR
 
 - **嵌入模型**:sherpa-onnx `SpeakerEmbeddingExtractor`,默认 **CAM++**(`3dspeaker_speech_campplus_sv_zh-cn_16k`),可选 ERes2NetV2(`models/mod.rs:104,119`;设置项 `settings.rs:61`)。库记录 `embedding_model`,选型不符则整场跳过种子注入(不同模型的向量空间不可比,`lib.rs:212-217`)。
 - **段内换人切分**(`session.rs:330-441`):`SPLIT_MIN_SEGMENT_MS=3000 / SPLIT_WIN_MS=1500 / SPLIT_HOP_MS=500 / CHANGE_SIM_THRESHOLD=0.55 / MIN_SUBSEG_MS=1200`;时间戳缺失或切不出时回退整段——**不丢内容**是硬不变式。
-- **在线聚类**(`diar/registry.rs:159-244`):判定顺序=严格阈值最优命中 → 灰区软归属 → 够长新建 → 留空。质心是单位向量 running-mean 再归一化;短于 0.6s 的段命中也**不更新质心**(`MIN_CENTROID_UPDATE_SAMPLES=9600`),防碎片稀释。
+- **在线聚类**(`diar/registry.rs:159-244`):判定顺序=严格阈值最优命中 → 灰区软归属 → 够长新建 → 留空。质心是单位向量 running-mean 再归一化;短于 1.5s 的段命中也**不更新质心**(`MIN_CENTROID_UPDATE_SAMPLES=24_000`),防碎片稀释。
 - **mic/system 统一编号**:两路进同一个 registry,信道只记在簇的 `sources` 集合里——同一人开着外放说话,两路会归成同一个 S 号。
 - **场内自我纠错**:每 8 次归簇跑一次簇间比对(`MERGE_CHECK_INTERVAL=8`),两簇 ≥**0.74** 自动合并(涉及种子簇用 0.68;不同 person 的簇**禁止**自动合并),小簇并大簇,历史段经 `merged` 事件在前端就地改写徽章(`lifecycle/actor.rs:261-286` → `recording.svelte.ts:180-188`)。
 - **嵌入失败/panic 一律降级为 speaker=None,绝不影响转写文本**(`session.rs:270-282`)。
@@ -93,6 +93,8 @@ sequenceDiagram
 ```
 
 要点:一个人的多条质心(主+变体)各成一个种子簇,匹配等价于取 max——不同状态的声音都可能命中;种子簇阈值(0.68)比普通簇(0.62)**更严**,且**不参与软归属**——认错老熟人的代价高于漏认。识别发生在**实时**,不等停止。
+
+种子命中还设了"三闸":①段长 <2s(`SEED_MIN_SAMPLES`)一律无权拍板,再高的裸分也只能进普通簇/软归属;②同信道走裸余弦快路(≥0.68 即中,与普通簇同款判定,只是阈值更高);③跨信道裸分不可比,只走 AS-Norm 对称 z 通道(`SEED_ASSIGN_Z=3.0` 且裸分 ≥`SEED_ASSIGN_RAW_FLOOR=0.50`)才认领——z 通道对同信道同样开放,作为召回增益。
 
 ## ⑤ 自动登记与库更新
 
@@ -137,11 +139,14 @@ flowchart LR
 | 常量 | 值 | 语义 | 位置 |
 |---|---|---|---|
 | `ASSIGN_THRESHOLD` | 0.62 | 归入普通簇 | registry.rs |
-| `SEED_ASSIGN_THRESHOLD` | 0.68 | 归入种子簇(认老熟人,更严) | registry.rs |
+| `SEED_ASSIGN_THRESHOLD` | 0.68 | 归入种子簇(认老熟人,更严;同信道;跨信道走 z 通道) | registry.rs |
 | `SOFT_ASSIGN_THRESHOLD` | 0.45 | 灰区软归属(不动质心) | registry.rs |
 | `MERGE_THRESHOLD` | 0.74 | 场内簇间自动合并 | registry.rs |
 | `MIN_NEW_CLUSTER_SAMPLES` | 2.5s | 短于此不建新簇 | registry.rs |
-| `MIN_CENTROID_UPDATE_SAMPLES` | 0.6s | 短于此不更新质心 | registry.rs |
+| `MIN_CENTROID_UPDATE_SAMPLES` | 1.5s | 短于此不更新质心 | registry.rs |
+| `SEED_MIN_SAMPLES` | 2s | 段长下限,不足则无权拍板种子(待评测集校准的初值) | registry.rs |
+| `SEED_ASSIGN_Z` | 3.0 | 种子跨信道 AS-Norm 对称 z 命中门槛(待评测集校准的初值) | registry.rs |
+| `SEED_ASSIGN_RAW_FLOOR` | 0.50 | 种子 z 通道命中仍要求的裸分地板(待评测集校准的初值) | registry.rs |
 | `AUTO_ENROLL_MS` | 10s | 自动登记新 Person 门槛 | voiceprints.rs:20 |
 | `SESSION_CENTROIDS_MAX` | 5 | 会话变体环形上限 | voiceprints.rs:45 |
 | `MAX_SAMPLES` | 10 | 试听样本上限 | voiceprints.rs:26 |
