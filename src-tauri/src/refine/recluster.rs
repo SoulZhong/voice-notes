@@ -251,7 +251,7 @@ mod tests {
         let inputs = vec![seg(0, 0, 10_000), seg(1, 10_000, 20_000)];
         let embs = vec![v(a, 0.0), v(a, 0.01)];
         let seeds = vec![crate::diar::registry::SeedCluster {
-            person: "P1".into(), name: "张三".into(), centroid: vec![1.0, 0.0, 0.0], count: 5,
+            person: "P1".into(), name: "张三".into(), centroid: vec![1.0, 0.0, 0.0], count: 5, source: "mic".into(),
         }];
         let out = recluster(&inputs, &embs, &seeds);
         assert_eq!(out[0].name.as_deref(), Some("张三"));
@@ -265,7 +265,7 @@ mod tests {
         let inputs = vec![seg(0, 0, 10_000), seg(1, 10_000, 20_000)];
         let embs = vec![v(a, 0.0), v(a, 0.01)];
         let seeds = vec![crate::diar::registry::SeedCluster {
-            person: "P4".into(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 5,
+            person: "P4".into(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 5, source: "mic".into(),
         }];
         let out = recluster(&inputs, &embs, &seeds);
         assert!(out[0].name.is_none(), "未命名人物不产生名字");

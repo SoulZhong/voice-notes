@@ -34,6 +34,11 @@ pub const SEED_ASSIGN_THRESHOLD: f32 = 0.68;
 /// ——淘汰后对应的撤回请求视为 no-op(近似值,回声窗口内的高频 assign 场景下
 /// 64 条已覆盖远超 30s 的真实语速)。
 const CONTRIBUTION_RING_CAP: usize = 64;
+/// 种子侧 AS-Norm cohort 统计的最少对比人数:库太小(其他人物 <3)算不出稳定
+/// 分布。与 store 层 suggest_merges 的同名门槛(voiceprints.rs:877)同值同理——
+/// 两处场景不同(这里是种子注入时预计算,那边是整理建议时计算)各自独立定义，
+/// 不共享同一常量,避免跨模块耦合。
+const SNORM_MIN_COHORT: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerInfo {
@@ -78,6 +83,9 @@ pub struct SeedCluster {
     pub name: String,
     pub centroid: Vec<f32>,
     pub count: u64,
+    /// 该质心来自的信道(如 "mic"/"system")。跨信道种子只走归一化通道
+    /// (Task 2)的前提:注入后要知道自己质心的信道身份。
+    pub source: String,
 }
 
 struct Cluster {
@@ -108,6 +116,16 @@ struct Cluster {
     /// 前者质心来自别的信道/场次，归簇与合并都要用更严的种子阈值防误认；后者质心
     /// 就是本场刚聚出来的，拿到全局 id 不该反而让归簇变严(否则同一人会话内碎片化)。
     session_enrolled: bool,
+    /// 种子质心来自的信道(如 "mic"/"system")。只在库种子注入路径(with_seeds
+    /// 的 seeds 参数)设置；快照恢复的簇(续录/跨场)恢复无信道保证，保守起见留
+    /// None，语义由 Task 2 处理。供后续任务判断"跨信道种子只走归一化通道"。
+    seed_source: Option<String>,
+    /// 该种子的 AS-Norm 种子侧 cohort 统计 (均值 μb, 样本标准差 σb)：库中其他每个
+    /// 人物的种子对本种子质心的最高余弦，取这些"每人一分"的均值/标准差(σ 夹到
+    /// 1e-3 下限，防止除零)。其他人物数 < SNORM_MIN_COHORT 时统计不稳定，记 None。
+    /// 只在库种子注入路径预计算一次(O(种子²·维度)，with_seeds 内一次性代价)；
+    /// 快照恢复的簇同样保守留 None，语义由 Task 2 处理。
+    seed_cohort: Option<(f32, f32)>,
 }
 
 impl Cluster {
@@ -288,6 +306,9 @@ impl SpeakerRegistry {
             seed_base_count: 0,
             reported_ms: 0,
             session_enrolled: false,
+            // 本场刚聚出来的普通簇,不是库种子,无信道/cohort 语义。
+            seed_source: None,
+            seed_cohort: None,
         });
         // 新建簇同样是"真正更新了质心"(从无到有):记为贡献,撤回时若这是簇内
         // 唯一成员,count 落到 0 且无 person → 整簇连带撤销(见 retract_contribution)。
@@ -523,6 +544,10 @@ impl SpeakerRegistry {
                     reported_ms: 0,
                     // 快照恢复的关联是"上一场"建立的：本场视作跨会话种子(严格阈值)。
                     session_enrolled: false,
+                    // 跨场恢复无信道保证,语义由 Task 2 处理:保守起见留 None,
+                    // 不参与"跨信道种子走归一化通道"与 cohort 判定。
+                    seed_source: None,
+                    seed_cohort: None,
                 });
             }
         }
@@ -565,9 +590,53 @@ impl SpeakerRegistry {
                 seed_base_count: base_count,
                 reported_ms: 0,
                 session_enrolled: false,
+                // 跨信道种子只走归一化通道(Task 2)的前提:记下该质心的信道身份。
+                seed_source: Some(s.source.clone()),
+                // 下面统一预计算(precompute_seed_cohorts),此处先占位。
+                seed_cohort: None,
             });
         }
+        r.precompute_seed_cohorts(seeds);
         r
+    }
+
+    /// 为本次库种子注入预计算 AS-Norm 种子侧 cohort 统计:对每个刚注入的种子簇 i
+    /// (seed_source 非 None),按 person 归组算「其他每个人物的种子对 i.centroid
+    /// 的最高余弦」，得每人一个分；样本数(即其他人物数)< SNORM_MIN_COHORT → None，
+    /// 否则 (均值, 样本标准差.max(1e-3))。快照恢复的簇(seed_source=None)不计算，
+    /// 保持 None(跨场恢复无信道保证,语义由 Task 2 处理)。
+    ///
+    /// 一次性 O(种子²·维度)代价,发生在 with_seeds(会话开录/建种子时),不在
+    /// assign 热路径上——之后每次 assign 只读取预计算好的 seed_cohort。
+    fn precompute_seed_cohorts(&mut self, seeds: &[SeedCluster]) {
+        // 按 person 归组的归一化质心(跳过零向量/非法种子),供下面逐簇取"每人最高分"复用。
+        let mut by_person: std::collections::BTreeMap<&str, Vec<Vec<f32>>> = std::collections::BTreeMap::new();
+        for s in seeds {
+            if let Some(u) = normalize(&s.centroid) {
+                by_person.entry(s.person.as_str()).or_default().push(u);
+            }
+        }
+        for c in self.clusters.iter_mut() {
+            if c.seed_source.is_none() {
+                continue; // 只为本次真正注入的种子簇计算
+            }
+            let Some(person) = c.person.as_deref() else { continue };
+            let scores: Vec<f32> = by_person
+                .iter()
+                .filter(|(p, _)| **p != person)
+                .map(|(_, centroids)| {
+                    centroids.iter().map(|v| dot(v, &c.centroid)).fold(f32::NEG_INFINITY, f32::max)
+                })
+                .collect();
+            c.seed_cohort = if scores.len() < SNORM_MIN_COHORT {
+                None
+            } else {
+                let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+                let var =
+                    scores.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / (scores.len() - 1) as f32;
+                Some((mean, var.sqrt().max(1e-3)))
+            };
+        }
     }
 }
 
@@ -632,6 +701,7 @@ mod tests {
             name: "甲".into(),
             centroid: v(1.0, 0.0, 0.0),
             count: 5,
+            source: "mic".into(),
         }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         // 与种子余弦 0.5(灰区):不得软归属领走人名 → 长段落地为新普通簇
@@ -639,6 +709,37 @@ mod tests {
         let id = r.assign(&v(0.5, y, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person, None, "灰区弱证据不得认领种子人物");
+    }
+
+    /// Task 1:with_seeds 注入后按"对其他每个人物的种子取 i.centroid 的最高 cos"
+    /// 预计算 AS-Norm 种子侧 cohort 统计;人物数(不含自己)< SNORM_MIN_COHORT(3)
+    /// 时关断为 None。判定逻辑本身不变——本测试只锁死管道贯通,不锁死后续任务的
+    /// 消费方式。
+    #[test]
+    fn with_seeds_precomputes_cohort_stats_per_seed() {
+        // 4 个人物(其他人数=3,达门槛)→ 每个种子簇的 seed_cohort 都应是 Some。
+        let seeds4 = vec![
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P3".into(), name: "丙".into(), centroid: vec![0.0, 0.0, 1.0, 0.0], count: 5, source: "system".into() },
+            SeedCluster { person: "P4".into(), name: "丁".into(), centroid: vec![0.0, 0.0, 0.0, 1.0], count: 5, source: "system".into() },
+        ];
+        let r = SpeakerRegistry::with_seeds(&[], &seeds4);
+        assert_eq!(r.clusters.len(), 4);
+        for c in &r.clusters {
+            let (_, sigma) = c.seed_cohort.expect("4 人物(3 个其他人)应达 cohort 门槛");
+            assert!(sigma >= 1e-3, "样本标准差应夹到下限 1e-3,实际 {sigma}");
+        }
+
+        // 只有 2 个人物(1 个其他人)→ 未达门槛,全部 None。
+        let seeds2 = vec![
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: vec![1.0, 0.0, 0.0, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0, 0.0], count: 5, source: "mic".into() },
+        ];
+        let r2 = SpeakerRegistry::with_seeds(&[], &seeds2);
+        for c in &r2.clusters {
+            assert!(c.seed_cohort.is_none(), "只有 1 个其他人物,未达门槛应为 None");
+        }
     }
 
     #[test]
@@ -812,8 +913,8 @@ mod tests {
             total_ms: 0,
         };
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "张三".into(), centroid: v(1.0, 0.0, 0.0), count: 40 },
-            SeedCluster { person: "P9".into(), name: "旧人".into(), centroid: v(0.0, 1.0, 0.0), count: 7 },
+            SeedCluster { person: "P1".into(), name: "张三".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into() },
+            SeedCluster { person: "P9".into(), name: "旧人".into(), centroid: v(0.0, 1.0, 0.0), count: 7, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         // P9 已在快照,种子去重:簇数 = 快照1 + P1 种子1
@@ -828,7 +929,7 @@ mod tests {
     #[test]
     fn seed_threshold_is_stricter_than_session_threshold() {
         // 相似度 ~0.65:普通簇能命中(≥0.62),种子簇不能(<0.68)
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into() }];
         let mut seeded = SpeakerRegistry::with_seeds(&[], &seeds);
         let probe = v(0.65, (1.0f32 - 0.65 * 0.65).sqrt(), 0.0);
         let id = seeded.assign(&probe, "mic", LONG).unwrap();
@@ -858,6 +959,7 @@ mod tests {
             name: "甲".into(),
             centroid: v(1.0, 0.0, 0.0),
             count: 10,
+            source: "mic".into(),
         }];
         let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
         assert_eq!(r.take_merges().len(), 1, "无主↔有主在 0.71 应按归簇同款阈值合并");
@@ -892,8 +994,8 @@ mod tests {
     #[test]
     fn different_persons_never_automerge_and_winner_inherits_person() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.9805, 0.19612, 0.0), count: 10 },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.9805, 0.19612, 0.0), count: 10, source: "mic".into() },
         ];
         // 两种子余弦 ~0.98 ≥ MERGE_THRESHOLD,但 person 不同 → 永不自动合并
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
@@ -905,7 +1007,7 @@ mod tests {
         // 余弦 ≥ MERGE_THRESHOLD,且 count 更大 → S2 胜出,继承 S1 的 person。
         let mut r2 = SpeakerRegistry::with_seeds(
             &[],
-            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1 }],
+            &[SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 1, source: "mic".into() }],
         );
         // 建 S2(与 e1 余弦 0.30,低于种子阈值 0.68 → 新建普通簇)
         r2.assign(&v(0.30, (1.0f32 - 0.09f32).sqrt(), 0.0), "system", LONG).unwrap();
@@ -948,8 +1050,8 @@ mod tests {
     #[test]
     fn unhit_seed_cluster_has_empty_sources_hit_one_has_nonempty() {
         let seeds = vec![
-            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 },
-            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 1.0, 0.0), count: 10 },
+            SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "乙".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         // 只命中甲(与 e1 余弦 ≈0.99 ≥ 种子阈值 0.68);乙从未被 assign 到。
@@ -970,7 +1072,7 @@ mod tests {
     /// 再报一遍,库 count 几何级数膨胀,质心学习率随之衰减到接近失效。
     #[test]
     fn snapshot_exports_incremental_count_not_seed_base_for_seed_cluster() {
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 40 }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 40, source: "mic".into() }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
@@ -996,7 +1098,7 @@ mod tests {
         assert!(r.enroll_candidates(2000).is_empty(), "已入库簇不重复候选");
 
         // 未命中的种子簇(sources 空)不是候选。
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(0.0, 1.0, 0.0), count: 10 }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(0.0, 1.0, 0.0), count: 10, source: "mic".into() }];
         let r2 = SpeakerRegistry::with_seeds(&[], &seeds);
         assert!(r2.enroll_candidates(0).is_empty(), "种子簇有主且 sources 空,不候选");
     }
@@ -1117,7 +1219,7 @@ mod tests {
         // 与 B 余弦 0.63 ∈(0.62,0.68)(够得着普通阈值),且 0.63 < 0.65(全局最相似是 A,不是 B)。
         // 修前:全局 argmax 先选中 A(0.65 全局最大),再验 A 的阈值 0.68 → 失败 → 错误新建第三个簇。
         // 修后:先按各簇自己的阈值过滤合格候选(A 不合格被滤掉,只剩 B),合格者中取最相似 → 命中 B。
-        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10 }];
+        let seeds = vec![SeedCluster { person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into() }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds); // S1 = 种子簇 A
         let b_id = r.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap(); // S2 = 会话普通簇 B(与 A 正交)
         assert_eq!(r.speakers().len(), 2);
@@ -1192,6 +1294,8 @@ mod tests {
             seed_base_count: 0,
             reported_ms: 0,
             session_enrolled: false,
+            seed_source: None,
+            seed_cohort: None,
         });
         r.clusters.push(Cluster {
             id: "S2".into(),
@@ -1204,6 +1308,8 @@ mod tests {
             seed_base_count: 0,
             reported_ms: 0,
             session_enrolled: false,
+            seed_source: None,
+            seed_cohort: None,
         });
         r.record_contribution("segX", "S2".into(), v(1.0, 0.0, 0.0), 1000);
 
@@ -1238,6 +1344,8 @@ mod tests {
             seed_base_count: 0,
             reported_ms: 0,
             session_enrolled: false,
+            seed_source: None,
+            seed_cohort: None,
         });
         r.record_contribution("seg0", "S1".into(), v(1.0, 0.0, 0.0), 1000);
         // 填满环把 seg0 挤出去。

@@ -741,21 +741,25 @@ pub fn seed_clusters(vp: &Voiceprints) -> Vec<crate::diar::registry::SeedCluster
         if VoiceprintStore::resolve(vp, id) != Some(id.as_str()) {
             continue;
         }
-        for c in person.centroids.values() {
+        for (src, c) in &person.centroids {
             seeds.push(crate::diar::registry::SeedCluster {
                 person: id.clone(),
                 name: person.name.clone(),
                 centroid: c.vec.clone(),
                 count: c.count,
+                source: src.clone(),
             });
         }
-        for c in person.session_centroids.values().flatten() {
-            seeds.push(crate::diar::registry::SeedCluster {
-                person: id.clone(),
-                name: person.name.clone(),
-                centroid: c.vec.clone(),
-                count: c.count,
-            });
+        for (src, list) in &person.session_centroids {
+            for c in list {
+                seeds.push(crate::diar::registry::SeedCluster {
+                    person: id.clone(),
+                    name: person.name.clone(),
+                    centroid: c.vec.clone(),
+                    count: c.count,
+                    source: src.clone(),
+                });
+            }
         }
     }
     seeds
@@ -1622,6 +1626,27 @@ mod tests {
         assert!(seeds.iter().all(|s| s.person == "P1" && s.name == "张三"));
     }
 
+    /// 跨信道种子只走归一化通道(Task 2)的前提:种子簇要知道自己质心来自哪个
+    /// 信道。P1 有 mic 主质心 + system 会话变体 → 两个种子各带各的信道来源。
+    #[test]
+    fn seed_clusters_carry_channel_source() {
+        let mut vp = Voiceprints::default();
+        let pc = |x: f32, y: f32| PersonCentroid { vec: vec![x, y], count: 5, seen: "t".into() };
+        vp.people.insert(
+            "P1".into(),
+            Person {
+                name: "张三".into(),
+                centroids: BTreeMap::from([("mic".to_string(), pc(1.0, 0.0))]),
+                session_centroids: BTreeMap::from([("system".to_string(), vec![pc(0.0, 1.0)])]),
+                total_ms: 60_000,
+                last_seen: "t".into(),
+            },
+        );
+        let seeds = seed_clusters(&vp);
+        assert!(seeds.iter().any(|s| s.person == "P1" && s.source == "mic"));
+        assert!(seeds.iter().any(|s| s.person == "P1" && s.source == "system"));
+    }
+
     #[test]
     fn suggest_merges_matches_via_session_variant_when_main_drifted() {
         // P1 张三主质心已被平均"搅偏"([0,1]),但留有一份 [1,0] 状态变体;
@@ -1902,7 +1927,7 @@ mod tests {
 
         // 本场:该人作为种子注入(count=40),命中两段长音频。
         let seeds =
-            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40 }];
+            vec![SeedCluster { person: pid.clone(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 40, source: "mic".into() }];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
         r.assign(&[1.0, 0.0, 0.0], "mic", 32000).unwrap();
