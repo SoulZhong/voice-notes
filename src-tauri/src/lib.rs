@@ -3023,6 +3023,11 @@ fn do_merge_person(
             Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
         }
     }
+    // 模型加载耗秒级:落库前最后一查,「合并中开录」的种子错配窗口收到毫秒级。
+    // apply 逐条调用本函数,等价获得逐条重查。
+    if app.state::<AppState>().session.lock().unwrap().is_some() {
+        return Err("录制中不能合并说话人".into());
+    }
     let now = chrono::Local::now().to_rfc3339();
     let journal_id = store
         .merge_journaled(
@@ -3044,7 +3049,7 @@ fn do_merge_person(
                     }
                     // 回执卡左栏"合并时的原声":同一段兜底截声也落进本次合并日志的
                     // loser 快照副本,不然左栏永远"无可试听的快照"。
-                    store::MergeJournal::new(root.clone()).write_loser_cut_sample(&journal_id, loser, &sample);
+                    store.write_journal_cut_sample(&journal_id, loser, &sample);
                 }
                 None => eprintln!("合并兜底:未能从笔记音频截到 {loser} 的样本(可能无笔记/无音频)"),
             },

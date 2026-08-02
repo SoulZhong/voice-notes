@@ -460,6 +460,15 @@ impl VoiceprintStore {
         super::merge_journal::MergeJournal::new(self.root.clone()).acknowledge(journal_id)
     }
 
+    /// 合并兜底截声写入日志条目目录。写条目目录必须持 vp_guard(异步化后命令
+    /// 并发,裸写与 acknowledge/invalidate 的目录删写会交错);上游音频截取是
+    /// 秒级重活,留在锁外,只锁这笔写。
+    pub fn write_journal_cut_sample(&self, journal_id: &str, loser: &str, samples: &[f32]) {
+        let _guard = vp_guard();
+        super::merge_journal::MergeJournal::new(self.root.clone())
+            .write_loser_cut_sample(journal_id, loser, samples);
+    }
+
     /// 删除人物:移除 people 项 + 清掉所有指向它的 redirects(悬空引用交给 resolve 容忍)
     /// + 连带删除全部录音样本(best-effort)。
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
