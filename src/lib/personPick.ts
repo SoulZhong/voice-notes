@@ -1,5 +1,6 @@
 // 选人列表的共享纯逻辑:录音页说话人面板与详情页「合并到…」菜单同源,
 // 展示名/区分后缀/同名集合/包含过滤四件套一处维护。
+import { pinyin } from "pinyin-pro";
 import type { PersonSummary } from "./people";
 import { formatDate } from "./notes";
 
@@ -24,8 +25,38 @@ export function dupNameSet(people: PersonSummary[]): Set<string> {
   return dup;
 }
 
-/** 候选过滤:空查询给全量,非空按显示名包含匹配。 */
+/** 拼音检索键(全拼+首字母),按显示名缓存:列表边输边筛不重算转换。 */
+const pinyinKeyCache = new Map<string, { full: string; initials: string }>();
+function pinyinKeys(label: string): { full: string; initials: string } {
+  let k = pinyinKeyCache.get(label);
+  if (!k) {
+    k = {
+      full: pinyin(label, { toneType: "none", type: "array" }).join("").toLowerCase(),
+      initials: pinyin(label, { pattern: "first", toneType: "none", type: "array" }).join("").toLowerCase(),
+    };
+    pinyinKeyCache.set(label, k);
+  }
+  return k;
+}
+
+/** 候选过滤:空查询给全量;非空按显示名包含匹配,纯字母查询另按拼音全拼/首字母
+    匹配(排序是拼音序,检索若不认拼音会与用户心智脱节)。 */
 export function filterPeople(people: PersonSummary[], query: string): PersonSummary[] {
   const q = query.trim();
-  return q ? people.filter((p) => personLabel(p).includes(q)) : people;
+  if (!q) return people;
+  const alpha = /^[a-zA-Z]+$/.test(q) ? q.toLowerCase() : null;
+  return people.filter((p) => {
+    const label = personLabel(p);
+    if (label.includes(q)) return true;
+    if (!alpha) return false;
+    const k = pinyinKeys(label);
+    return k.full.includes(alpha) || k.initials.includes(alpha);
+  });
+}
+
+/** 人物字母序:中文按拼音、数字段按数值("说话人 2"<"说话人 10")。已命名按名字,
+    未命名按编号标签——分组展示时两组各自内部有序。 */
+export function sortPeopleAlpha(people: PersonSummary[]): PersonSummary[] {
+  const collator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", { numeric: true });
+  return [...people].sort((a, b) => collator.compare(personLabel(a), personLabel(b)));
 }

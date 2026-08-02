@@ -17,6 +17,10 @@ export type PersonSummary = {
 
 /** 后端已按 last_seen 降序返回。 */
 export const listPeople = () => invoke<PersonSummary[]>("list_people");
+/** 库内「无录音样本」的人数——切换声纹模型前用于确认提示:这些人切换后质心会
+    被清空(新模型向量空间不可比),重建完成前无法自动认出(名字/历史笔记不受
+    影响)。只读,录制中也可调用。 */
+export const countPeopleWithoutSamples = () => invoke<number>("count_people_without_samples");
 /** 该人出现过的会议(扫笔记 person_id 引用,经合并重定向归一),按开始时间倒序。 */
 export const personNotes = (personId: string) =>
   invoke<NoteSummary[]>("person_notes", { personId });
@@ -58,6 +62,9 @@ export type MergeReceipt = {
   similarity: number | null;
   /** 被并入方合并前的样本快照副本(绝对路径;空=无样本或已被永久失效清理)。 */
   loser_sample_paths: string[];
+  /** winner 合并时刻的样本快照副本(绝对路径;核对历史合并要看快照,而非会随
+      后续操作漂移的实时状态)。 */
+  winner_sample_paths: string[];
   invalid_reason: string | null;
 };
 /** 整理·自动归并返回:本次合并的回执 + 留给人工的建议。 */
@@ -75,3 +82,11 @@ export const undoMerge = (journalId: string) => invoke<void>("undo_merge", { jou
 /** 回执卡「好」:确认自动归并,条目删除。 */
 export const acknowledgeMerge = (journalId: string) =>
   invoke<void>("acknowledge_merge", { journalId });
+/** 整理条目人工处置(忽略/保留)落盘:重启后不再出现。key 为 tidyItemKey 格式。 */
+export const dismissTidyItem = (key: string) => invoke<void>("dismiss_tidy_item", { key });
+/** 失效回执「拆回独立说话人」:按合并时快照把被并入方重建为原编号独立说话人,
+    返回其 id;录制中后端拒绝。 */
+export const restoreMergedPerson = (journalId: string) =>
+  invoke<string>("restore_merged_person", { journalId });
+/** 已落盘的处置键全量(重启后合并进本地已忽略集合)。 */
+export const listDismissedTidyItems = () => invoke<string[]>("list_dismissed_tidy_items");

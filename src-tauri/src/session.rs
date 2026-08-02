@@ -258,7 +258,7 @@ fn process_final<F1, F2>(
     rms: f32,
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     registry: &mut SpeakerRegistry,
-    sample_store: &mut std::collections::HashMap<String, Vec<f32>>,
+    sample_store: &mut std::collections::HashMap<String, (String, Vec<f32>)>,
     last_sent: &mut Vec<crate::diar::registry::SpeakerInfo>,
     on_final: &mut F1,
     on_diar: &mut F2,
@@ -267,9 +267,12 @@ fn process_final<F1, F2>(
     F2: FnMut(DiarEvent),
 {
     // 声纹:嵌入失败/无 embedder → None,绝不影响文本
+    // seg_key 供事后追溯回声撤回(EchoRetract → registry.retract_contribution)按图索骥:
+    // 仅 mic 段可能被追溯撤回,但 system 段同样传入不影响正确性(不会被查询到)。
+    let seg_key = format!("{}:{start_ms}", source.as_str());
     let speaker = embedder.as_mut().and_then(|e| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.embed(embedding_input))) {
-            Ok(Ok(v)) => registry.assign(&v, source.as_str(), samples_len),
+            Ok(Ok(v)) => registry.assign_tracked(&v, source.as_str(), samples_len, &seg_key),
             Ok(Err(err)) => {
                 eprintln!("声纹提取失败({:?} 段): {err}", source);
                 None
@@ -284,15 +287,15 @@ fn process_final<F1, F2>(
     // 已存样本 ≥ ENOUGH 即定格:更长不再有试听增益,不值一次整块克隆。
     if let Some(id) = &speaker {
         let keep = embedding_input.len().min(SPEAKER_SAMPLE_CAP);
-        let cur = sample_store.get(id).map(|v| v.len()).unwrap_or(0);
+        let cur = sample_store.get(id).map(|(_, v)| v.len()).unwrap_or(0);
         if keep > cur && cur < SPEAKER_SAMPLE_ENOUGH {
-            sample_store.insert(id.clone(), embedding_input[..keep].to_vec());
+            sample_store.insert(id.clone(), (seg_key.clone(), embedding_input[..keep].to_vec()));
         }
     }
     for (loser, winner) in registry.take_merges() {
         if let Some(ls) = sample_store.remove(&loser) {
-            let wl = sample_store.get(&winner).map(|v| v.len()).unwrap_or(0);
-            if ls.len() > wl {
+            let wl = sample_store.get(&winner).map(|(_, v)| v.len()).unwrap_or(0);
+            if ls.1.len() > wl {
                 sample_store.insert(winner.clone(), ls);
             }
         }
@@ -527,7 +530,8 @@ where
     /// 的旧预览误杀 mic 新语句。
     last_system_partial: String,
     /// 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
-    sample_store: std::collections::HashMap<String, Vec<f32>>,
+    /// 同时保留来源段 key,追溯回声撤回时若它正是代表样本也一并移除。
+    sample_store: std::collections::HashMap<String, (String, Vec<f32>)>,
 }
 
 impl<'a, F, P, D> FinalSink<'a, F, P, D>
@@ -761,6 +765,15 @@ where
                 ) && text_similarity(&self.recent_mic[i].norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
                 if hit {
                     let m = self.recent_mic.remove(i).unwrap();
+                    // 该 mic 段的嵌入早已进过 registry 的簇质心/count/total_ms(process_final
+                    // 里 assign_tracked 记的贡献,seg_key 与此处同一构造规则)——回声被追溯
+                    // 确认后必须把这份污染从簇里冲抵掉,否则对方的声音会一直留在我方质心里,
+                    // 停止时的库快照也会把污染带进声纹库(找不到/已淘汰是 no-op,不影响撤回落盘)。
+                    let seg_key = format!("{}:{}", Source::Mic.as_str(), m.start_ms);
+                    self.registry.retract_contribution(&seg_key);
+                    // 质心回滚之外,代表性试听样本也不能留下这段回声:若它恰是
+                    // 该簇当前最长样本,停录时会被写进新人物/无样本老人物的声纹样本。
+                    self.sample_store.retain(|_, (sample_key, _)| sample_key != &seg_key);
                     eprintln!(
                         "追溯回声撤回: mic=\"{}\" system=\"{}\"",
                         text_prefix20(&m.text),
@@ -916,7 +929,7 @@ where
             self.release_pending(p);
         }
         let snaps = self.registry.snapshot();
-        let samples = self.sample_store.drain().collect();
+        let samples = self.sample_store.drain().map(|(id, (_, samples))| (id, samples)).collect();
         (self.on_diar)(DiarEvent::Snapshot { snaps, samples });
     }
 }
@@ -2361,6 +2374,68 @@ mod asr_worker_tests {
 
         drop(tx);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn late_echo_retract_does_not_export_retracted_mic_as_voice_sample() {
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let finals = Arc::new(Mutex::new(Vec::<(Source, String)>::new()));
+        let events = Arc::new(Mutex::new(Vec::<DiarEvent>::new()));
+        let (f2, e2) = (finals.clone(), events.clone());
+
+        let worker = std::thread::spawn(move || {
+            let _ = run_asr_worker(
+                Box::new(CountingRecognizer),
+                Some(Box::new(MockEmbedder::new(vec![
+                    Ok(vec![1.0, 0.0, 0.0]),
+                    Ok(vec![1.0, 0.0, 0.0]),
+                ]))),
+                SpeakerRegistry::new(),
+                rx,
+                TEST_ECHO_HOLD,
+                true,
+                vec![],
+                move |s, t, _, _, _, _| f2.lock().unwrap().push((s, t)),
+                |_, _| {},
+                move |ev| e2.lock().unwrap().push(ev),
+            );
+        });
+
+        // 这段足够长,会同时更新质心并成为 S1 的代表性试听样本。
+        tx.send(FinalJob {
+            source: Source::Mic,
+            samples: vec![0.1; 44_800],
+            start_ms: 0,
+            end_ms: 2_800,
+        })
+        .unwrap();
+        assert!(poll_until(|| {
+            finals.lock().unwrap().contains(&(Source::Mic, "len=44800".into()))
+        }));
+        // 同句 system 晚到触发追溯撤回；若只回滚 registry 而不清 sample_store,
+        // finish 仍会把上面的 mic 回声作为新人物样本导出。
+        tx.send(FinalJob {
+            source: Source::System,
+            samples: vec![0.2; 44_800],
+            start_ms: 0,
+            end_ms: 2_800,
+        })
+        .unwrap();
+        assert!(poll_until(|| {
+            events.lock().unwrap().iter().any(|e| matches!(e, DiarEvent::EchoRetract { .. }))
+        }));
+        drop(tx);
+        worker.join().unwrap();
+
+        let events = events.lock().unwrap();
+        let samples = events
+            .iter()
+            .find_map(|e| match e {
+                DiarEvent::Snapshot { samples, .. } => Some(samples),
+                _ => None,
+            })
+            .expect("结束时应导出 Snapshot");
+        assert!(samples.is_empty(), "被追溯撤回的 mic 回声不得残留为声纹试听样本");
     }
 
     /// 自适应 hold:system 侧有在途预览时,mic 段 hold 延长(×ECHO_HOLD_EXTEND_FACTOR),
