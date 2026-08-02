@@ -500,10 +500,33 @@ fn apply_aing_graph_with_hook(
     }))
 }
 
-/// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id)。
+/// 纯函数:给定每篇笔记内出现过的 person_id 列表(未归一,可能残留已合并的
+/// loser id)+ resolve 闭包,按归一后 id 计数会议数(同篇内去重)。
+/// resolve 返回 None 的悬空 id 保留原样计数,口径与 join(lib.rs::person_notes)
+/// 的容忍一致——不因库损坏/悬空引用而漏计。
+fn count_notes_by_canonical_person(
+    notes_person_ids: &[Vec<String>],
+    mut resolve: impl FnMut(&str) -> Option<String>,
+) -> HashMap<String, u64> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for ids in notes_person_ids {
+        let mut seen = HashSet::new();
+        for pid in ids {
+            let canonical = resolve(pid).unwrap_or_else(|| pid.clone());
+            if seen.insert(canonical.clone()) {
+                *counts.entry(canonical).or_default() += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// 全局声纹库人物 + 各自出现过的笔记数(扫 speakers.json 的 person_id,经
+/// redirects 归一——笔记里可能还留着已被合并的 loser 引用,不归一会少计
+/// winner 的会议数)。
 pub fn list_speakers(roots: &DataRoots) -> serde_json::Value {
     let vp = store::VoiceprintStore::new(roots.data_root.clone()).load();
-    let mut note_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut notes_person_ids: Vec<Vec<String>> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(notes_dir(roots)) {
         for e in rd.flatten().filter(|e| e.path().is_dir()) {
             let Ok(text) = std::fs::read_to_string(e.path().join("speakers.json")) else {
@@ -512,16 +535,12 @@ pub fn list_speakers(roots: &DataRoots) -> serde_json::Value {
             let Ok(map) = serde_json::from_str::<BTreeMap<String, SpeakerMeta>>(&text) else {
                 continue;
             };
-            let mut seen = std::collections::HashSet::new();
-            for m in map.values() {
-                if let Some(pid) = &m.person_id {
-                    if seen.insert(pid.clone()) {
-                        *note_counts.entry(pid.clone()).or_default() += 1;
-                    }
-                }
-            }
+            notes_person_ids.push(map.values().filter_map(|m| m.person_id.clone()).collect());
         }
     }
+    let note_counts = count_notes_by_canonical_person(&notes_person_ids, |pid| {
+        store::VoiceprintStore::resolve(&vp, pid).map(str::to_string)
+    });
     let speakers: Vec<_> = vp
         .people
         .iter()
@@ -1639,6 +1658,38 @@ mod tests {
             })
         };
         assert_eq!(normalized(&agent_doc), normalized(&http_doc));
+    }
+
+    #[test]
+    fn count_notes_by_canonical_person_redirects_loser_to_winner() {
+        // P1 已被合并入 P2:某篇笔记只留着旧的 P1 引用,归一后应计入 P2,P1 不计。
+        let notes = vec![vec!["P1".to_string()]];
+        let counts = count_notes_by_canonical_person(&notes, |pid| match pid {
+            "P1" => Some("P2".to_string()),
+            _ => None,
+        });
+        assert_eq!(counts.get("P2"), Some(&1));
+        assert_eq!(counts.get("P1"), None);
+    }
+
+    #[test]
+    fn count_notes_by_canonical_person_dedups_within_note_after_resolve() {
+        // 同一篇笔记里 P1(旧引用)与 P2(新引用)并存,归一后是同一个人,只应计 1 次。
+        let notes = vec![vec!["P1".to_string(), "P2".to_string()]];
+        let counts = count_notes_by_canonical_person(&notes, |pid| match pid {
+            "P1" => Some("P2".to_string()),
+            "P2" => Some("P2".to_string()),
+            _ => None,
+        });
+        assert_eq!(counts.get("P2"), Some(&1));
+    }
+
+    #[test]
+    fn count_notes_by_canonical_person_keeps_dangling_id_as_is() {
+        // resolve 返回 None(悬空 id)时保留原样计数,口径与 join 的容忍一致。
+        let notes = vec![vec!["ghost".to_string()]];
+        let counts = count_notes_by_canonical_person(&notes, |_| None);
+        assert_eq!(counts.get("ghost"), Some(&1));
     }
 
     #[test]
