@@ -8,6 +8,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod store;
+mod i18n;
 mod player;
 mod player_gate;
 mod tray;
@@ -151,7 +152,7 @@ pub(crate) fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{}", tr!("app_data_dir 不可用: {e}", "app_data_dir unavailable: {e}")))?;
     let s = settings::load(&app_data);
     Ok(settings::resolve_data_root(&app_data, &s))
 }
@@ -589,7 +590,7 @@ fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<B
 /// 没填 key"这种要等一次握手往返才暴露的失败。
 fn make_cloud_asr(s: &settings::Settings) -> anyhow::Result<std::sync::Arc<dyn asr::cloud::CloudAsr>> {
     if !settings::cloud_creds_ok(s) {
-        anyhow::bail!("请先在设置中配置云端凭证");
+        anyhow::bail!("{}", tr!("请先在设置中配置云端凭证", "Please configure cloud credentials in Settings first"));
     }
     if s.cloud_asr_provider == settings::CLOUD_ALIYUN {
         Ok(std::sync::Arc::new(asr::cloud::aliyun::AliyunAsr::new(s.dashscope_api_key.trim().to_string()))
@@ -603,8 +604,12 @@ fn make_cloud_asr(s: &settings::Settings) -> anyhow::Result<std::sync::Arc<dyn a
 }
 
 /// 云端厂商展示名(测试连接文案 / 日志)。
-fn cloud_provider_label(provider: &str) -> &'static str {
-    if provider == settings::CLOUD_ALIYUN { "阿里云" } else { "火山引擎" }
+fn cloud_provider_label(provider: &str) -> String {
+    if provider == settings::CLOUD_ALIYUN {
+        tr!("阿里云", "Alibaba Cloud")
+    } else {
+        tr!("火山引擎", "Volcano Engine")
+    }
 }
 
 /// 当前 provider 覆盖:settings.asr_provider 经 asr::provider_override 规整。
@@ -1506,7 +1511,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
     // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
     if state.download_running.load(Ordering::SeqCst) {
-        return Err("正在迁移或下载,稍后再试".into());
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress, try again later"));
     }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
@@ -1551,13 +1556,13 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
-        return Err("正在迁移或下载,稍后再试".into());
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress, try again later"));
     }
     // F1 修复:该笔记正在 Aing 中就拒绝续录——Aing 完成后才 transcode.enqueue,而续录
     // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,Aing 收尾时才入队的转码会把
     // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
     if refining {
-        return Err("该笔记正在 Aing,请稍后再试".into());
+        return Err(tr!("该笔记正在 Aing,请稍后再试", "Aing is running on this note, try again later"));
     }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
@@ -1653,7 +1658,7 @@ async fn stop_recording(app: AppHandle) -> Result<(), String> {
         lifecycle.command(lifecycle::Cmd::Stop)
     })
     .await
-    .map_err(|e| format!("停止录制后台任务异常: {e}"))?
+    .map_err(|e| tr!("停止录制后台任务异常: {e}", "Stop-recording background task failed: {e}"))?
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -1704,7 +1709,7 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
-        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(s) = slot.as_mut() else { return Err(tr!("没有正在进行的录制", "No recording in progress")) };
         if s.paused_at.is_some() {
             return Ok(()); // 已暂停：幂等
         }
@@ -1734,7 +1739,7 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
-        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(s) = slot.as_mut() else { return Err(tr!("没有正在进行的录制", "No recording in progress")) };
         let Some(p) = s.paused_at.take() else { return Ok(()) }; // 未暂停：幂等
         s.paused_accum += p.elapsed();
         s.handle.set_paused(false);
@@ -1811,7 +1816,7 @@ fn relation_backfill_settings(app: &AppHandle) -> Result<settings::Settings, Str
     let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("app_data_dir 不可用: {error}"))?;
+        .map_err(|error| tr!("app_data_dir 不可用: {error}", "app_data_dir unavailable: {error}"))?;
     Ok(settings::load(&app_data))
 }
 
@@ -1820,8 +1825,9 @@ fn ensure_requested_backfill_provider(
     settings: &settings::Settings,
 ) -> Result<(), String> {
     if request.provider != settings.refine_provider {
-        return Err(format!(
+        return Err(tr!(
             "补建 provider 与当前配置不一致:请求 {},当前 {}",
+            "Backfill provider mismatches current settings: requested {}, current {}",
             request.provider, settings.refine_provider
         ));
     }
@@ -1841,14 +1847,14 @@ fn relation_executor(
         )?)),
         "agent" => {
             let kind = refine::agent::AgentKind::from_key(&settings.refine_agent)
-                .ok_or_else(|| anyhow::anyhow!("未知 Agent: {}", settings.refine_agent))?;
+                .ok_or_else(|| anyhow::anyhow!("{}", tr!("未知 Agent: {agent}", "Unknown agent: {agent}", agent = settings.refine_agent)))?;
             Ok(Box::new(refine::agent::AgentRelationExecutor::new(
                 kind,
                 &settings.refine_agent_bin,
                 &settings.refine_agent_model,
             )?))
         }
-        provider => anyhow::bail!("未知关系补建 provider: {provider}"),
+        provider => anyhow::bail!("{}", tr!("未知关系补建 provider: {provider}", "Unknown relation backfill provider: {provider}")),
     }
 }
 
@@ -3923,6 +3929,9 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }
     // 托盘开关是否变更(落盘后据此建/拆托盘,即时生效无需重启)。
     let tray_changed = old.tray_enabled != new_settings.tray_enabled;
+    // UI 语言变更:落盘后切全局语言并重建托盘菜单文案(new_settings 即将 move 进闭包,先取值)。
+    let lang_changed = old.ui_lang != new_settings.ui_lang;
+    let new_ui_lang = new_settings.ui_lang.clone();
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
@@ -3977,6 +3986,12 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     }
     if tray_changed {
         tray::apply_enabled(&app);
+    }
+    if lang_changed {
+        i18n::set_lang(&new_ui_lang);
+        // 菜单标签按新语言重建(set_recording 即整体重建路径);running statement-scoped。
+        let running = *state.running.lock().unwrap();
+        tray::set_recording(&app, running);
     }
     Ok(())
 }
@@ -4576,6 +4591,8 @@ pub fn run() {
                 let _ = settings::migrate_mirror_prefix(dir);
             }
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
+            // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
+            i18n::set_lang(&s.ui_lang);
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
             // 必须先于 models::root() 的任何使用。
             models::set_models_override(s.models_dir.clone().map(PathBuf::from));

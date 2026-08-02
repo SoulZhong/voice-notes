@@ -3,6 +3,7 @@
 // 命中(文档只由 setRefined 程序化构建);toMarkdown 按普通段落/纯文本输出,
 // 保证 serializeBlock 与保存载荷可用。
 import { $markSchema, $nodeSchema, $prose } from "@milkdown/kit/utils";
+import { t } from "$lib/i18n/index.svelte";
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
 import type { Node as PMNode, Fragment } from "@milkdown/kit/prose/model";
 import type { EditorView, ViewMutationRecord } from "@milkdown/kit/prose/view";
@@ -146,7 +147,7 @@ export function makeRefinedParagraphView(cb: BadgeCallbacks) {
       ts.className = "ts ts-btn";
       ts.contentEditable = "false";
       ts.textContent = cb.formatTs(node.attrs.startMs as number);
-      ts.title = "从此处播放";
+      ts.title = t("notes.editor.playFromHere");
       ts.onclick = () => cb.onPlayFrom(node.attrs.startMs as number);
       dom.append(badge, ts);
     }

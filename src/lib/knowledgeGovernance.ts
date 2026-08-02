@@ -12,6 +12,7 @@ import {
   type RelationDetail,
   type SplitEntityRequest,
 } from "./knowledge";
+import { t } from "$lib/i18n/index.svelte";
 
 export interface GovernanceApi {
   submit(operation: KnowledgeOperationInput): Promise<KnowledgeMutationResult>;
@@ -100,7 +101,7 @@ export const task10GovernanceApi: GovernanceApi = {
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   const message = String(error).trim();
-  return message || "未知错误";
+  return message || t("governance.unknownError");
 }
 
 const subscribeToGraphRebuild: RebuildStatusSubscribe = async (listener) =>
@@ -147,7 +148,7 @@ export async function prepareRebuildWait(
   return {
     waitFor(generation) {
       if (targetGeneration !== null && targetGeneration !== generation) {
-        return Promise.reject(new Error("重建监听已绑定到另一个 generation。"));
+        return Promise.reject(new Error(t("governance.controller.generationMismatch")));
       }
       targetGeneration = generation;
       const buffered = bufferedTerminals.get(generation);
@@ -180,7 +181,7 @@ export function createGovernanceController(
 
   function run(mutation: () => Promise<KnowledgeMutationResult>): Promise<KnowledgeMutationResult> {
     if (inFlight) return inFlight;
-    if (busy) return Promise.reject(new Error("另一项治理操作正在完成，请稍后重试。"));
+    if (busy) return Promise.reject(new Error(t("governance.controller.busy")));
     busy = true;
     error = "";
     refreshError = "";
@@ -194,7 +195,7 @@ export function createGovernanceController(
         mutationResult = await mutation();
       } catch (cause) {
         rebuildWait?.cancel();
-        error = `治理操作未保存：${errorMessage(cause)}。请检查后重试。`;
+        error = t("governance.controller.notSaved", { e: errorMessage(cause) });
         throw cause;
       }
 
@@ -203,17 +204,23 @@ export function createGovernanceController(
         const generation = mutationResult.rebuild_generation;
         if (generation === null || !Number.isSafeInteger(generation) || generation <= 0) {
           rebuildWait.cancel();
-          refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但后端未返回有效的索引 generation。无法安全判定本次重建完成；撤销仍可使用。`;
+          refreshError = t("governance.controller.noGeneration", { id: mutationResult.operation_id });
           return mutationResult;
         }
         try {
           const terminal = await rebuildWait.waitFor(generation);
           if (terminal.state === "error") {
-            refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但图谱索引重建失败：${terminal.error || "后端未提供详细原因"}。请稍后重试刷新；撤销仍可使用。`;
+            refreshError = t("governance.controller.rebuildFailed", {
+              id: mutationResult.operation_id,
+              e: terminal.error || t("governance.controller.noRebuildDetail"),
+            });
             return mutationResult;
           }
         } catch (cause) {
-          refreshError = `操作已保存（操作 ID：${mutationResult.operation_id}），但等待图谱索引重建失败：${errorMessage(cause)}。请稍后重试刷新；撤销仍可使用。`;
+          refreshError = t("governance.controller.waitFailed", {
+            id: mutationResult.operation_id,
+            e: errorMessage(cause),
+          });
           return mutationResult;
         } finally {
           rebuildWait.cancel();
@@ -227,7 +234,7 @@ export function createGovernanceController(
       try {
         await refresh();
       } catch (cause) {
-        refreshError = `操作已保存，但图谱刷新失败：${errorMessage(cause)}。可单独重试刷新。`;
+        refreshError = t("governance.controller.refreshFailed", { e: errorMessage(cause) });
       }
       return mutationResult;
     })().finally(() => {
@@ -259,7 +266,7 @@ export function createGovernanceController(
     },
     merge(sourceId, targetId) {
       return run(() => {
-        if (!api.merge) return Promise.reject(new Error("当前治理 API 不支持实体合并。"));
+        if (!api.merge) return Promise.reject(new Error(t("governance.controller.mergeUnsupported")));
         return api.merge(sourceId, targetId);
       });
     },
@@ -273,7 +280,7 @@ export function createGovernanceController(
       try {
         await refresh();
       } catch (cause) {
-        refreshError = `图谱仍未刷新：${errorMessage(cause)}。请稍后再试。`;
+        refreshError = t("governance.controller.stillNotRefreshed", { e: errorMessage(cause) });
         throw cause;
       } finally {
         busy = false;
@@ -459,14 +466,16 @@ export function canSubmitSplit(preview: SplitPreview): boolean {
   return preview.mentionCount > 0;
 }
 
+// 分组标签存字典键而非成品文案:模块常量在加载时求值,存文案会把首次加载时的语言
+// 固化下来;label 改由 groupPending 调用时 t() 现取,语言切换后重算即生效。
 const PENDING_GROUPS = [
-  { key: "identity_conflict", label: "身份冲突" },
-  { key: "relation_review", label: "待确认关系" },
-  { key: "time_conflict", label: "时间冲突" },
-  { key: "stale_evidence", label: "证据已失效" },
-  { key: "split_conflict", label: "拆分冲突" },
-  { key: "invalid_document", label: "文档错误" },
-  { key: "other", label: "其他" },
+  { key: "identity_conflict", labelKey: "governance.pending.group.identityConflict" },
+  { key: "relation_review", labelKey: "governance.pending.group.relationReview" },
+  { key: "time_conflict", labelKey: "governance.pending.group.timeConflict" },
+  { key: "stale_evidence", labelKey: "governance.pending.group.staleEvidence" },
+  { key: "split_conflict", labelKey: "governance.pending.group.splitConflict" },
+  { key: "invalid_document", labelKey: "governance.pending.group.invalidDocument" },
+  { key: "other", labelKey: "governance.pending.group.other" },
 ] as const;
 
 function payloadRecord(item: PendingReviewItem): Record<string, unknown> {
@@ -534,7 +543,9 @@ export function groupPending(items: PendingReviewItem[]): PendingGroup[] {
   for (const item of items) buckets.get(pendingGroupKey(item))!.push(item);
   return PENDING_GROUPS.flatMap((group) => {
     const groupedItems = buckets.get(group.key)!.map((item) => ({ ...item })).sort(comparePending);
-    return groupedItems.length > 0 ? [{ ...group, items: groupedItems }] : [];
+    return groupedItems.length > 0
+      ? [{ key: group.key, label: t(group.labelKey), items: groupedItems }]
+      : [];
   });
 }
 

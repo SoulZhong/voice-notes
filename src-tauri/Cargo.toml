@@ -44,6 +44,8 @@ chrono = "0.4"
 unicode-casefold = "0.2"
 ureq = "2"
 sha2 = "0.10"
+# UI 语言"跟随系统"的系统 locale 解析(零依赖小 crate,见 src/i18n.rs)。
+sys-locale = "0.3"
 base64 = "0.22"
 hex = "0.4"
 bzip2 = "0.5"

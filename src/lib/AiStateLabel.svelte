@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { t } from "$lib/i18n/index.svelte";
+
   let { state }: { state: "idle" | "running" | "complete" | "failed" } = $props();
 </script>
 
-<span class="ai-state" class:running={state === "running"} aria-label={state === "idle" ? "AI" : state === "running" ? "Aing，正在执行" : state === "complete" ? "AI，已完成" : "AI，执行失败"}>
+<span class="ai-state" class:running={state === "running"} aria-label={state === "idle" ? t("record.ai.idle") : state === "running" ? t("record.ai.running") : state === "complete" ? t("record.ai.complete") : t("record.ai.failed")}>
   {#if state === "running"}
     {#each ["A", "i", "n", "g"] as letter, i}
       <span class="letter" style={`--i:${i}`}>{letter}</span>

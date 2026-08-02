@@ -10,6 +10,7 @@
     task10GovernanceApi,
     type PendingReviewModel,
   } from "./knowledgeGovernance";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     items,
@@ -52,19 +53,19 @@
   function itemTitle(item: PendingReviewItem, model: PendingReviewModel): string {
     if (model.message) return model.message;
     if (model.reason) return model.reason;
-    if (model.evidenceId) return `证据 ${model.evidenceId}`;
-    if (model.relationIds.length === 1) return `关系 ${model.relationIds[0]}`;
-    return `待整理项 ${item.id}`;
+    if (model.evidenceId) return t("governance.pending.evidenceTitle", { id: model.evidenceId });
+    if (model.relationIds.length === 1) return t("governance.pending.relationTitle", { id: model.relationIds[0] });
+    return t("governance.pending.itemTitle", { id: item.id });
   }
 
   async function confirmItem(item: PendingReviewItem, model: PendingReviewModel) {
     const relationId = model.relationIds[0];
     if (!model.canConfirm || !relationId || workingId) return;
     workingId = item.id;
-    status = "正在确认关系";
+    status = t("governance.relation.confirming");
     try {
       await controller.submit(buildConfirmRelation(relationId));
-      status = controller.refreshError || "关系已确认并移出待整理";
+      status = controller.refreshError || t("governance.pending.confirmed");
     } catch {
       status = controller.error;
     } finally {
@@ -75,19 +76,19 @@
   async function suppressItem(item: PendingReviewItem, relation: RelationDetail) {
     if (workingId) return;
     const model = pendingReviewModel(item);
-    const approved = window.confirm(`否决「${itemTitle(item, model)}」并永久抑制这条关系？模型重新抽取也不会自动恢复。`);
+    const approved = window.confirm(t("governance.pending.suppressConfirm", { title: itemTitle(item, model) }));
     if (!approved) return;
     workingId = item.id;
-    status = "正在写入持久抑制裁决";
+    status = t("governance.pending.suppressing");
     try {
       await controller.submit(buildSuppressRelation(
         relation.relation.subject_id,
         { type: relation.relation.predicate_type, label: relation.relation.predicate_label },
         relation.relation.object_id,
       ));
-      status = controller.refreshError || "候选关系已否决并持久抑制";
+      status = controller.refreshError || t("governance.pending.suppressed");
     } catch {
-      status = controller.error || "候选关系读取失败，请稍后重试。";
+      status = controller.error || t("governance.pending.suppressFailed");
     } finally {
       workingId = null;
     }
@@ -95,16 +96,16 @@
 
   function later(item: PendingReviewItem) {
     hiddenIds = new Set([...hiddenIds, item.id]);
-    status = `已在本次会话稍后处理「${itemTitle(item, pendingReviewModel(item))}」；没有写入后端。`;
+    status = t("governance.pending.laterDone", { title: itemTitle(item, pendingReviewModel(item)) });
   }
 
   async function undoLast() {
     if (!controller.lastOperationId || workingId) return;
     workingId = "undo";
-    status = "正在撤销上次待整理操作";
+    status = t("governance.pending.undoing");
     try {
       await controller.undo(controller.lastOperationId);
-      status = controller.refreshError || "已撤销上次待整理操作";
+      status = controller.refreshError || t("governance.pending.undone");
     } catch {
       status = controller.error;
     } finally {
@@ -118,13 +119,13 @@
 <article class="pending" aria-labelledby="pending-title">
   <header>
     <div>
-      <p class="eyebrow">知识治理队列</p>
-      <h2 id="pending-title">待整理 {visibleItems.length}</h2>
+      <p class="eyebrow">{t("governance.pending.eyebrow")}</p>
+      <h2 id="pending-title">{t("governance.pending.title", { n: visibleItems.length })}</h2>
     </div>
-    <button class="close" type="button" aria-label="关闭待整理面板" onclick={onClose}>×</button>
+    <button class="close" type="button" aria-label={t("governance.pending.closeAria")} onclick={onClose}>×</button>
   </header>
 
-  <p class="intro">按证据风险排序处理。稍后处理只隐藏本次会话，否决会写入持久抑制。</p>
+  <p class="intro">{t("governance.pending.intro")}</p>
 
   {#each groups as group (group.key)}
     <section class="group" aria-labelledby={'pending-group-' + group.key}>
@@ -137,54 +138,54 @@
               <strong>{itemTitle(item, model)}</strong>
               <span>{item.kind}</span>
             </div>
-            {#if model.noteId}<a class="note-link" href={'/notes/' + encodeURIComponent(model.noteId)}>打开原笔记 {model.noteId}</a>{/if}
+            {#if model.noteId}<a class="note-link" href={'/notes/' + encodeURIComponent(model.noteId)}>{t("governance.pending.openNote", { id: model.noteId })}</a>{/if}
 
             {#if model.kind === "identity_conflict"}
-              <p class="detail">本地实体 {model.localEntityId || "未提供"}。{model.reason || "后端未提供冲突原因。"}</p>
-              <div class="entity-links" aria-label="候选实体">
+              <p class="detail">{t("governance.pending.identityDetail", { id: model.localEntityId || t("governance.pending.notProvided"), reason: model.reason || t("governance.pending.noConflictReason") })}</p>
+              <div class="entity-links" aria-label={t("governance.pending.candidatesAria")}>
                 {#each model.candidateEntityIds as candidateId (candidateId)}
-                  <a href={'/graph?e=' + encodeURIComponent(candidateId)}>查看候选实体 {candidateId}</a>
+                  <a href={'/graph?e=' + encodeURIComponent(candidateId)}>{t("governance.pending.viewCandidate", { id: candidateId })}</a>
                 {/each}
               </div>
-              <p class="unavailable">当前后端尚未提供按该候选集合绑定身份的命令；请从原笔记或候选实体继续核对。</p>
+              <p class="unavailable">{t("governance.pending.identityUnavailable")}</p>
             {:else if model.kind === "invalid_document"}
-              <p class="detail">{model.message || "后端未提供文档错误详情。"}</p>
-              <p class="unavailable">请先修复原笔记的结构或 frontmatter；当前没有可安全执行的关系治理命令。</p>
+              <p class="detail">{model.message || t("governance.pending.noDocDetail")}</p>
+              <p class="unavailable">{t("governance.pending.docUnavailable")}</p>
             {:else if model.kind === "stale_evidence" || model.kind === "split_conflict"}
-              <p class="detail">需修复的证据 ID：{model.evidenceId || "未提供"}</p>
-              <p class="unavailable">请回到原笔记修复证据锚点或拆分归属；当前后端未提供直接修复命令。</p>
+              <p class="detail">{t("governance.pending.evidenceToFix", { id: model.evidenceId || t("governance.pending.notProvided") })}</p>
+              <p class="unavailable">{t("governance.pending.staleUnavailable")}</p>
             {:else if model.kind === "time_conflict"}
-              <p class="detail">以下关系的时间范围相互冲突：</p>
+              <p class="detail">{t("governance.pending.timeConflictDetail")}</p>
             {:else if model.kind === "relation_review"}
-              <p class="detail">这是后端明确标记的待确认关系。</p>
+              <p class="detail">{t("governance.pending.reviewDetail")}</p>
             {:else}
               <pre>{JSON.stringify(item.payload, null, 2)}</pre>
-              <p class="unavailable">未识别的待整理类型；当前不提供会发送不完整 payload 的通用动作。</p>
+              <p class="unavailable">{t("governance.pending.unknownKind")}</p>
             {/if}
 
             {#if model.kind === "time_conflict"}
-              <div class="relation-links" aria-label="时间冲突关系">
+              <div class="relation-links" aria-label={t("governance.pending.timeConflictAria")}>
                 {#each model.relationIds as relationId (relationId)}
-                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>查看关系 {relationId}</button>
+                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>{t("governance.pending.viewRelationId", { id: relationId })}</button>
                 {/each}
               </div>
             {:else if model.relationIds[0]}
               {@const relationId = model.relationIds[0]}
               {@const loadedRelation = relationDetails[relationId]}
               <div class="relation-links">
-                <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>查看关系</button>
+                <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>{t("governance.pending.viewRelation")}</button>
                 {#if loadedRelation}
-                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>编辑关系</button>
-                  <button class="danger" type="button" disabled={workingId !== null} onclick={() => suppressItem(item, loadedRelation)}>否决并抑制</button>
+                  <button type="button" disabled={workingId !== null} onclick={() => onOpenRelation(relationId)}>{t("governance.pending.editRelation")}</button>
+                  <button class="danger" type="button" disabled={workingId !== null} onclick={() => suppressItem(item, loadedRelation)}>{t("governance.suppressReject")}</button>
                 {:else if loadedRelation === null}
-                  <span class="unavailable">当前无法读取完整关系 triple，已隐藏编辑与抑制动作。</span>
+                  <span class="unavailable">{t("governance.pending.tripleUnavailable")}</span>
                 {/if}
               </div>
             {/if}
 
-            <div class="row-actions" aria-label={`处理 ${itemTitle(item, model)}`}>
-              {#if model.canConfirm}<button type="button" disabled={workingId !== null} onclick={() => confirmItem(item, model)}>确认关系</button>{/if}
-              <button type="button" disabled={workingId !== null} onclick={() => later(item)}>稍后处理</button>
+            <div class="row-actions" aria-label={t("governance.pending.rowAria", { title: itemTitle(item, model) })}>
+              {#if model.canConfirm}<button type="button" disabled={workingId !== null} onclick={() => confirmItem(item, model)}>{t("governance.relation.confirm")}</button>{/if}
+              <button type="button" disabled={workingId !== null} onclick={() => later(item)}>{t("governance.pending.later")}</button>
             </div>
           </li>
         {/each}
@@ -194,15 +195,15 @@
 
   {#if groups.length === 0}
     <section class="empty">
-      <h3>当前没有待整理项</h3>
-      <p>新的低置信关系、身份或时间冲突出现后会汇入这里。</p>
+      <h3>{t("governance.pending.emptyTitle")}</h3>
+      <p>{t("governance.pending.emptyBody")}</p>
     </section>
   {/if}
 
   <div class="feedback">
     <p class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
-    {#if controller.refreshError}<button type="button" disabled={workingId !== null} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
-    {#if controller.lastOperationId}<button type="button" disabled={workingId !== null} onclick={undoLast}>撤销上次待整理操作</button>{/if}
+    {#if controller.refreshError}<button type="button" disabled={workingId !== null} onclick={() => controller.retryRefresh().then(() => { status = t("governance.refreshed"); }).catch(() => { status = controller.refreshError; })}>{t("governance.retryRefresh")}</button>{/if}
+    {#if controller.lastOperationId}<button type="button" disabled={workingId !== null} onclick={undoLast}>{t("governance.pending.undoLast")}</button>{/if}
   </div>
 </article>
 

@@ -3,6 +3,8 @@
 // 测试传假播放器。三处试听场景(概览已删,审阅流/详情页)语义与旧实现一致。
 // onError 可选:play() 的同步异常与 Promise 拒绝都会转交(不传就静默,原语义
 // 不变),让调用方能把"点了没声"的真实原因显性化(如错误横幅),而不是吞掉。
+import { t } from "$lib/i18n/index.svelte";
+
 export type PlayerLike = { play(): unknown; pause(): void; onended: (() => void) | null };
 
 /** play() 失败转用户可读文案:已知媒体错误给中文(终端用户读不懂 WebKit 英文原文),
@@ -11,7 +13,7 @@ export function describePlayError(err: unknown): string {
   const name = (err as { name?: string } | null | undefined)?.name ?? "";
   const text = String(err);
   if (name === "NotSupportedError" || text.includes("no supported source")) {
-    return "这份样本无法播放(文件可能已损坏或被移动)";
+    return t("speakers.playUnsupported");
   }
   return text;
 }

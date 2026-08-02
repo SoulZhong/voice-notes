@@ -6204,6 +6204,7 @@ dependencies = [
  "sha2",
  "sherpa-onnx",
  "sherpa-onnx-sys",
+ "sys-locale",
  "tar",
  "tauri",
  "tauri-build",

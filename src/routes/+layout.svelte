@@ -9,7 +9,7 @@
   import { tidy } from "$lib/tidy.svelte";
   import { getSettings, setSettings, modelsStatus, type ModelsStatus } from "$lib/models";
   import { applyTheme } from "$lib/theme";
-  import { i18n } from "$lib/i18n/index.svelte";
+  import { i18n, t } from "$lib/i18n/index.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { checkUpdate, applyUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
@@ -22,7 +22,7 @@
   let update = $state<UpdateInfo | null>(null);
   // 一键更新态:进行中禁点、按钮显进度;失败退回「打开发布页」手动路径(文案联动)。
   let updating = $state(false);
-  let updatingLabel = $state("更新中…");
+  let updatingLabel = $state(t("shell.update.updating"));
   let updateFailed = $state(false);
   // 安装成功即 relaunch:录音/收尾进行中点更新会把识别尾包和终稿截在半路,
   // 静默丢数据——录音期间禁点,结束后再更新。
@@ -36,7 +36,7 @@
     }
     if (updateBlocked) return;
     updating = true;
-    updatingLabel = "更新中…";
+    updatingLabel = t("shell.update.updating");
     try {
       const r = await applyUpdate((label) => (updatingLabel = label));
       if (r === "none") updateFailed = true; // latest.json 未就绪等,退手动
@@ -110,18 +110,18 @@
   <main class="main">
     {#if update}
       <div class="update-banner">
-        <span class="upd-dot"></span>发现新版 v{update.latest}(当前 v{update.current})
+        <span class="upd-dot"></span>{t("shell.update.found", { latest: update.latest, current: update.current })}
         <button
           class="link"
           onclick={openUpdate}
           disabled={updating || (!updateFailed && updateBlocked)}
-          title={!updateFailed && updateBlocked ? "录音进行中,结束后再更新" : undefined}
+          title={!updateFailed && updateBlocked ? t("shell.update.blockedTitle") : undefined}
         >
-          {updating ? updatingLabel : updateFailed ? "打开发布页" : "一键更新"}
+          {updating ? updatingLabel : updateFailed ? t("shell.update.openRelease") : t("shell.update.oneClick")}
         </button>
         <!-- 更新中禁「知道了」:横幅一收,下载安装仍在后台跑,几分钟后应用
              无预警重启,用户会以为闪退。 -->
-        <button class="link" onclick={dismissUpdateBanner} disabled={updating}>知道了</button>
+        <button class="link" onclick={dismissUpdateBanner} disabled={updating}>{t("shell.update.dismiss")}</button>
       </div>
     {/if}
     {@render children()}

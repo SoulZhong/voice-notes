@@ -13,6 +13,7 @@
   } from "$lib/models";
   import { mcpAgentsStatus, mcpRegister, type AgentStatus, type RegisterOutcome } from "$lib/mcp";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     status,
@@ -144,7 +145,7 @@
       await setSettings(s);
     } catch (e) {
       cloudTestPassed = false;
-      cloudTestResult = { ok: false, msg: `保存设置失败：${String(e)}` };
+      cloudTestResult = { ok: false, msg: t("shell.welcome.saveSettingsFailed", { e: String(e) }) };
       return;
     }
     phase = "download";
@@ -176,7 +177,7 @@
     try {
       outcomes = keys.length ? await mcpRegister(keys) : [];
     } catch {
-      outcomes = keys.map((key) => ({ key, ok: false, error: "调用失败" }));
+      outcomes = keys.map((key) => ({ key, ok: false, error: t("shell.welcome.callFailed") }));
     }
     registering = false;
     if ((outcomes ?? []).every((o) => o.ok)) {
@@ -206,43 +207,43 @@
     <div class="hero">
       <div class="mark"><span class="dot"></span></div>
       <h1>voice-notes</h1>
-      <p class="tagline">会议实时转写与说话人分离，数据流向由你选择</p>
+      <p class="tagline">{t("shell.welcome.tagline")}</p>
     </div>
 
-    <div class="steps" aria-label="新手引导进度">
+    <div class="steps" aria-label={t("shell.welcome.stepsAria")}>
       <span
         class:active={phase === "choose" || phase === "download" || phase === "cloud-setup"}
-        class:done={phase === "learn" || phase === "connect"}>准备</span
+        class:done={phase === "learn" || phase === "connect"}>{t("shell.welcome.stepPrepare")}</span
       >
       <i></i>
-      <span class:active={phase === "learn"} class:done={phase === "connect"}>认识 AI</span>
+      <span class:active={phase === "learn"} class:done={phase === "connect"}>{t("shell.welcome.stepLearn")}</span>
       <i></i>
-      <span class:active={phase === "connect"}>接入工具</span>
+      <span class:active={phase === "connect"}>{t("shell.welcome.stepConnect")}</span>
     </div>
 
     {#if phase === "choose"}
       <div class="choose">
-        <h2>选择识别方式</h2>
+        <h2>{t("shell.welcome.chooseTitle")}</h2>
         <div class="choice-cards">
           <button type="button" class="choice-card" onclick={() => (phase = "download")}>
-            <strong>本地识别 · 隐私优先</strong>
-            <p>识别在本机完成，数据不出设备；需下载模型约 1GB。</p>
+            <strong>{t("shell.welcome.localTitle")}</strong>
+            <p>{t("shell.welcome.localDesc")}</p>
           </button>
           <button type="button" class="choice-card" onclick={() => (phase = "cloud-setup")}>
-            <strong>云端识别 · 更准更快</strong>
-            <p>火山引擎 / 阿里云实时识别；录音音频将实时上传至所选厂商；需 API Key。</p>
+            <strong>{t("shell.welcome.cloudTitle")}</strong>
+            <p>{t("shell.welcome.cloudDesc")}</p>
           </button>
         </div>
-        <p class="hints">以后可随时在设置中更改。</p>
+        <p class="hints">{t("shell.welcome.changeLater")}</p>
       </div>
     {:else if phase === "download"}
-      <ModelDownloadCard status={current} onComplete={refresh} primaryLabel="开 始 使 用" />
-      <p class="hints">首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。</p>
-      <p class="hints">已开启匿名使用统计（仅功能使用次数与版本，绝不含会议内容），可在设置中关闭。</p>
+      <ModelDownloadCard status={current} onComplete={refresh} primaryLabel={t("shell.welcome.startUsing")} />
+      <p class="hints">{t("shell.welcome.permissionsHint")}</p>
+      <p class="hints">{t("shell.welcome.telemetryHint")}</p>
     {:else if phase === "cloud-setup"}
       <div class="cloud-setup">
-        <h2>配置云端识别</h2>
-        <p class="hints">录音音频将实时上传至所选厂商；凭证只保存在本机。</p>
+        <h2>{t("shell.welcome.cloudSetupTitle")}</h2>
+        <p class="hints">{t("shell.welcome.cloudSetupHint")}</p>
         <div class="seg">
           <label class="seg-item">
             <input
@@ -254,7 +255,7 @@
                 // 凭证一经改动,上次测试结果即作废,须重测才能完成
                 invalidateCloudTest();
               }}
-            />火山引擎
+            />{t("shell.welcome.providerVolcano")}
           </label>
           <label class="seg-item">
             <input
@@ -265,7 +266,7 @@
               onchange={() => {
                 invalidateCloudTest();
               }}
-            />阿里云
+            />{t("shell.welcome.providerAliyun")}
           </label>
         </div>
         {#if cloudProvider === "volcano"}
@@ -273,7 +274,7 @@
             <span>APP ID</span>
             <input
               class="row-input"
-              placeholder="火山引擎语音技术控制台的 App ID"
+              placeholder={t("shell.welcome.volcAppIdPlaceholder")}
               bind:value={volcAppKey}
               oninput={() => {
                 invalidateCloudTest();
@@ -308,47 +309,47 @@
         {/if}
         {#if cloudTestResult}
           <p class="test-result" class:ok={cloudTestResult.ok} class:bad={!cloudTestResult.ok}>
-            {cloudTestResult.ok ? `测试成功（${cloudTestResult.msg}）` : `测试失败：${cloudTestResult.msg}`}
+            {cloudTestResult.ok ? t("shell.welcome.testOk", { msg: cloudTestResult.msg }) : t("shell.welcome.testFail", { msg: cloudTestResult.msg })}
           </p>
         {/if}
         <div class="connect-actions">
           <button class="btn-primary" disabled={testingCloud} onclick={doTestCloud}>
-            {testingCloud ? "测试中…" : "测试连接"}
+            {testingCloud ? t("shell.welcome.testing") : t("shell.welcome.testConnection")}
           </button>
-          <button class="btn-primary" disabled={!cloudTestPassed} onclick={completeCloudSetup}>完成</button>
+          <button class="btn-primary" disabled={!cloudTestPassed} onclick={completeCloudSetup}>{t("shell.welcome.done")}</button>
         </div>
         <div class="foot">
-          <button type="button" class="link" onclick={backToChoose}>← 返回</button>
+          <button type="button" class="link" onclick={backToChoose}>{t("shell.welcome.back")}</button>
         </div>
       </div>
     {:else if phase === "learn"}
       <div class="learn">
-        <h2>一份录音，三种 AI 用法</h2>
+        <h2>{t("shell.welcome.learnTitle")}</h2>
         <div class="ability-list">
           <div class="ability">
             <span class="ability-index">01</span>
-            <div><strong>自动整理</strong><p>会后 AI 在录制结束后修订转写、提炼标题，原始稿始终保留。</p></div>
+            <div><strong>{t("shell.welcome.ability1Title")}</strong><p>{t("shell.welcome.ability1Body")}</p></div>
           </div>
           <div class="ability">
             <span class="ability-index">02</span>
-            <div><strong>带进对话</strong><p>接入 Claude、Cursor 等助手后，直接让它检索会议、追踪决定或生成周报。</p></div>
+            <div><strong>{t("shell.welcome.ability2Title")}</strong><p>{t("shell.welcome.ability2Body")}</p></div>
           </div>
           <div class="ability">
             <span class="ability-index">03</span>
-            <div><strong>串起工作流</strong><p>用钩子在 AI 完成后调用 Shell 或 Webhook，把结果送到现有工具。</p></div>
+            <div><strong>{t("shell.welcome.ability3Title")}</strong><p>{t("shell.welcome.ability3Body")}</p></div>
           </div>
         </div>
         <div class="prompt-example">
-          <span>接入后可以直接问</span>
-          <p>“找出上周所有提到发布风险的会议，并按负责人整理待办。”</p>
+          <span>{t("shell.welcome.promptLabel")}</span>
+          <p>{t("shell.welcome.promptExample")}</p>
         </div>
-        <button class="btn-primary next" onclick={showConnect}>选择如何接入</button>
+        <button class="btn-primary next" onclick={showConnect}>{t("shell.welcome.chooseConnect")}</button>
       </div>
     {:else}
       <div class="connect">
-        <h2>连接 AI 助手</h2>
+        <h2>{t("shell.welcome.connectTitle")}</h2>
         <p class="hints">
-          MCP 是 voice-notes 与 AI 助手之间的本地桥梁。注册后，助手可按需检索笔记；命中的内容会进入该助手的模型上下文。
+          {t("shell.welcome.mcpHint")}
         </p>
         {#if agents.length}
           {#each agents as a (a.key)}
@@ -357,30 +358,30 @@
               <span>{a.name}</span>
               {#if outcomes}
                 {@const o = outcomes.find((x) => x.key === a.key)}
-                {#if o}<span class="mark-txt" class:bad={!o.ok}>{o.ok ? "✓ 已注册" : `✕ ${o.error ?? "失败"}`}</span>{/if}
+                {#if o}<span class="mark-txt" class:bad={!o.ok}>{o.ok ? t("shell.welcome.registered") : `✕ ${o.error ?? t("shell.welcome.failed")}`}</span>{/if}
               {/if}
             </label>
           {/each}
           <div class="connect-actions">
-            <button class="btn-primary" disabled={registerLocked} onclick={registerPicked}>注册所选</button>
-            <button class="link" disabled={registering} onclick={() => finish("/record")}>暂不接入</button>
+            <button class="btn-primary" disabled={registerLocked} onclick={registerPicked}>{t("shell.welcome.registerSelected")}</button>
+            <button class="link" disabled={registering} onclick={() => finish("/record")}>{t("shell.welcome.skipConnect")}</button>
           </div>
         {:else}
           <div class="no-agent">
-            <strong>暂未发现支持的 AI 助手</strong>
-            <p>你仍可先开始录音；安装 Claude Code、Cursor、Codex 或 Gemini CLI 后，到 AI 页一键注册。其他工具可复制通用 MCP 配置。</p>
+            <strong>{t("shell.welcome.noAgentTitle")}</strong>
+            <p>{t("shell.welcome.noAgentBody")}</p>
           </div>
           <div class="connect-actions">
-            <button class="btn-primary" onclick={() => finish("/ai")}>查看接入方式</button>
-            <button class="link" onclick={() => finish("/record")}>先开始录音</button>
+            <button class="btn-primary" onclick={() => finish("/ai")}>{t("shell.welcome.viewConnect")}</button>
+            <button class="link" onclick={() => finish("/record")}>{t("shell.welcome.startRecordingFirst")}</button>
           </div>
         {/if}
-        <p class="privacy">默认只开放读取能力；允许 AI 控制录制需在 AI 页单独开启。</p>
+        <p class="privacy">{t("shell.welcome.privacy")}</p>
       </div>
     {/if}
 
     <div class="foot">
-      {#if phase === "choose" || phase === "download"}<button class="link" onclick={advanced}>高级设置 →</button>{/if}
+      {#if phase === "choose" || phase === "download"}<button class="link" onclick={advanced}>{t("shell.welcome.advanced")}</button>{/if}
     </div>
   </div>
 </div>

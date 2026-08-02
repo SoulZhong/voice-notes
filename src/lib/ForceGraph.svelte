@@ -9,6 +9,7 @@
     stableEdgeLanes,
   } from "$lib/knowledgeView";
   import { speakerInk } from "$lib/notes";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     nodes: allNodes,
@@ -86,8 +87,8 @@
         weight: edge.weight,
         layer: "cooccurrence" as const,
         label: cooccurrenceMeaning === "shared-entities"
-          ? `${edge.weight} 个共用实体`
-          : `${edge.weight} 篇笔记同时提到`,
+          ? t("graph.edge.sharedEntities", { n: edge.weight })
+          : t("graph.edge.sharedNotes", { n: edge.weight }),
         directed: false,
         confidence: null,
         status: null,
@@ -166,7 +167,7 @@
       挤在一个窄区间里看不出差别;线性 + 拉宽 MIN_R..MAX_R 让差距在视觉上真正显著。 */
   // 逐字估宽:CJK/全角 ≈ 1em、ASCII ≈ 0.55em。用于 SVG 标签换行与碰撞范围,
   // 避免依赖 foreignObject(桌面 WebView 兼容性和测量时序都更不稳定)。
-  const isWide = (ch: string) => /[⺀-鿿＀-￯　-〿]/.test(ch);
+  const isWide = (ch: string) => /[⺀-鿿＀-￯　-〿]/.test(ch); // i18n-exempt: 全角字符区间,非文案
   function estWidth(str: string, fontSize: number): number {
     let w = 0;
     for (const ch of str) w += isWide(ch) ? fontSize : fontSize * 0.55;
@@ -175,7 +176,7 @@
 
   /** 按词/CJK 字符贪心换行。每个字符都进入某一行,只换行不截断。 */
   function wrapLabel(name: string, maxWidth: number): string[] {
-    const normalized = name.trim() || "未命名";
+    const normalized = name.trim() || t("graph.unnamed");
     const tokens: string[] = [];
     let word = "";
     const flushWord = () => {
@@ -221,7 +222,7 @@
       }
     }
     pushLine();
-    return lines.length > 0 ? lines : ["未命名"];
+    return lines.length > 0 ? lines : [t("graph.unnamed")];
   }
 
   function layoutFor(
@@ -722,7 +723,7 @@
     const rows: { key: string; label: string; ink: string | null }[] = [...kinds]
       .sort()
       .map((k) => ({ key: k, label: kindLabel(k), ink: kindInk(k) }));
-    if (hasPerson) rows.unshift({ key: "__is_person__", label: "人 · 按个人上色", ink: null });
+    if (hasPerson) rows.unshift({ key: "__is_person__", label: t("graph.legend.person"), ink: null });
     return rows;
   });
 
@@ -886,7 +887,7 @@
 </script>
 
 <div class="fg" class:reduced={effectiveReducedMotion} bind:this={container}>
-  <svg {width} {height} role="img" aria-label="知识图谱力导向图" onwheel={onWheel}>
+  <svg {width} {height} role="img" aria-label={t("graph.svgAria")} onwheel={onWheel}>
     <defs>
       <marker
         id="semantic-arrow"
@@ -957,7 +958,11 @@
                   d={edgePath(l)}
                   role="button"
                   tabindex="0"
-                  aria-label={`${l.label}，${l.layer === "semantic" ? "点击查看关系证据" : cooccurrenceMeaning === "shared-entities" ? "点击查看共用实体" : "点击查看共同出现的笔记"}`}
+                  aria-label={l.layer === "semantic"
+                    ? t("graph.edgeAria.semantic", { label: l.label })
+                    : cooccurrenceMeaning === "shared-entities"
+                      ? t("graph.edgeAria.sharedEntities", { label: l.label })
+                      : t("graph.edgeAria.sharedNotes", { label: l.label })}
                   onclick={() => onEdgePick(l)}
                   onfocus={() => (focusedEdge = l.id)}
                   onblur={() => (focusedEdge = null)}
@@ -989,7 +994,7 @@
               style="cursor:pointer"
               role="button"
               tabindex="0"
-              aria-label={`${n.name}，${kindLabel(n.kind)}`}
+              aria-label={t("graph.nodeAria", { name: n.name, kind: kindLabel(n.kind) })}
               onpointerdown={(e) => onDown(n.id, e)}
               onpointermove={onMove}
               onpointerup={() => onUp(n.id, n.is_person)}
@@ -1050,48 +1055,48 @@
     </g>
   </svg>
   {#if hasSemanticEdges || hasCooccurrenceEdges}
-    <div class="edge-key" aria-label="关系线说明">
+    <div class="edge-key" aria-label={t("graph.edgeKey.aria")}>
       {#if hasSemanticEdges}
         <div class="edge-key-row">
           <span class="edge-sample semantic-sample" aria-hidden="true"></span>
-          <span><strong>明确关系</strong><small>箭头表示方向 · 点击线查看依据</small></span>
+          <span><strong>{t("graph.edgeKey.semantic")}</strong><small>{t("graph.edgeKey.semanticDesc")}</small></span>
         </div>
       {/if}
       {#if hasCooccurrenceEdges}
         <div class="edge-key-row">
           <span class="edge-sample cooccurrence-sample" aria-hidden="true"></span>
           {#if cooccurrenceMeaning === "shared-entities"}
-            <span><strong>共用实体</strong><small>细线表示两篇文章含有相同实体</small></span>
+            <span><strong>{t("graph.edgeKey.sharedEntities")}</strong><small>{t("graph.edgeKey.sharedEntitiesDesc")}</small></span>
           {:else}
-            <span><strong>同时提及</strong><small>细线表示一篇笔记提到两个实体</small></span>
+            <span><strong>{t("graph.edgeKey.cooccur")}</strong><small>{t("graph.edgeKey.cooccurDesc")}</small></span>
           {/if}
         </div>
       {/if}
     </div>
   {/if}
   {#if snap.nodes.length > ALL_LABELS_LIMIT && viewZoom < 2.2}
-    <div class="semantic-hint">点击节点逐层展开 · 滚轮放大显示更多名称</div>
+    <div class="semantic-hint">{t("graph.zoomHint")}</div>
   {/if}
   {#if expanded}
     <div class="trunc-bar">
-      <span class="trunc-label">已显示全部 {snap.nodes.length} 个实体</span>
-      <button class="trunc-action" onclick={() => { expanded = false; expandHops = 0; }}>收起</button>
+      <span class="trunc-label">{t("graph.trunc.all", { n: snap.nodes.length })}</span>
+      <button class="trunc-action" onclick={() => { expanded = false; expandHops = 0; }}>{t("graph.trunc.collapse")}</button>
     </div>
   {:else if expandHops > 0}
     <!-- 展开一层可重复点,一圈圈往外长,不像「显示全部」一步到位——避免一下爆炸 -->
     <div class="trunc-bar">
-      <span class="trunc-label">已展开 {expandHops} 层 · 共 {snap.nodes.length} 个实体</span>
+      <span class="trunc-label">{t("graph.expanded", { hops: expandHops, n: snap.nodes.length })}</span>
       {#if truncated > 0}
-        <button class="trunc-action" onclick={() => (expandHops += 1)}>继续展开</button>
-        <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>显示全部</button>
+        <button class="trunc-action" onclick={() => (expandHops += 1)}>{t("graph.trunc.expandMore")}</button>
+        <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>{t("graph.trunc.showAll")}</button>
       {/if}
-      <button class="trunc-action" onclick={() => (expandHops = 0)}>收起</button>
+      <button class="trunc-action" onclick={() => (expandHops = 0)}>{t("graph.trunc.collapse")}</button>
     </div>
   {:else if truncated > 0}
     <div class="trunc-bar">
-      <span class="trunc-label">显示连接最紧的 {snap.nodes.length} 个实体</span>
-      <button class="trunc-action" onclick={() => (expandHops = 1)}>展开一层</button>
-      <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>显示全部</button>
+      <span class="trunc-label">{t("graph.trunc.top", { n: snap.nodes.length })}</span>
+      <button class="trunc-action" onclick={() => (expandHops = 1)}>{t("graph.trunc.expandOne")}</button>
+      <button class="trunc-action trunc-action-strong" onclick={() => (expanded = true)}>{t("graph.trunc.showAll")}</button>
     </div>
   {/if}
   {#if showLegend && legend.length > 0}

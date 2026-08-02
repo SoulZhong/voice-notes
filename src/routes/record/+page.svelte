@@ -4,6 +4,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
+  import { t } from "$lib/i18n/index.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
@@ -120,7 +121,12 @@
   // 云端识别连接状态(仅云端模式录制时产生):细提示条,不阻断录制。reconnecting/backfilling/
   // backfill_failed 持续显示到下一个事件覆盖;recovered 闪一下「已恢复」后 3s 自动清空,
   // 避免恢复提示常驻占位。
-  let cloudStatus = $state<{ kind: CloudAsrStatusEvent["state"]; text: string } | null>(null);
+  // 存键+参数而非成品文案:模板里再过 t(),语言切换时状态条即时跟随重渲。
+  let cloudStatus = $state<{
+    kind: CloudAsrStatusEvent["state"];
+    key: string;
+    params?: Record<string, unknown>;
+  } | null>(null);
   let cloudStatusClearTimer: ReturnType<typeof setTimeout> | null = null;
   /** 厂商错误原文可能很长(带 requestId 的整串 JSON),状态条只留一行的量。 */
   const CLOUD_REASON_MAX = 80;
@@ -142,14 +148,14 @@
       cloudStatusClearTimer = null;
     }
     if (e.state === "reconnecting") {
-      cloudStatus = { kind: e.state, text: `云端识别中断,重连中…${cloudReason(e.message)}` };
+      cloudStatus = { kind: e.state, key: "record.cloud.reconnecting", params: { reason: cloudReason(e.message) } };
     } else if (e.state === "backfilling") {
-      cloudStatus = { kind: e.state, text: "补识中…" };
+      cloudStatus = { kind: e.state, key: "record.cloud.backfilling" };
     } else if (e.state === "backfill_failed") {
-      cloudStatus = { kind: e.state, text: "部分片段补识失败,原始音频已保留" };
+      cloudStatus = { kind: e.state, key: "record.cloud.backfillFailed" };
     } else {
       // recovered
-      cloudStatus = { kind: e.state, text: "已恢复" };
+      cloudStatus = { kind: e.state, key: "record.cloud.recovered" };
       cloudStatusClearTimer = setTimeout(() => {
         cloudStatus = null;
         cloudStatusClearTimer = null;
@@ -207,14 +213,14 @@
       错误详情(可能很长)不塞这里,另在下方红色行完整展开。 */
   const statusLabel = $derived(
     isError(recording.status)
-      ? "出错"
+      ? t("record.status.error")
       : recording.status === "recording"
-        ? "录制中"
+        ? t("record.status.recording")
         : recording.status === "paused"
-          ? "已暂停"
+          ? t("record.status.paused")
           : recording.status === "stopped"
-            ? "已停止"
-            : "就绪",
+            ? t("record.status.stopped")
+            : t("record.status.ready"),
   );
   async function openScreenRecordingSettings() {
     await openUrl(
@@ -315,7 +321,7 @@
   <!-- 头部整体吸顶(标题/下载卡/控制条/状态行/说话人条):录制中转写自动滚到最新,
        操作与说话人对照都不能跟着滚出视口 -->
   <div class="topbar">
-    <h1>实时转写</h1>
+    <h1>{t("record.title")}</h1>
 
     <!-- 单实例:compact 由 recording_ready 驱动。若拆成两个 if 分支,识别模型下完
          切小提示条时组件会销毁重建,进行中的下载进度/订阅状态全部清零。 -->
@@ -331,27 +337,27 @@
         <div class="ctl-group">
           {#if recording.stopping}
             <button class="ctl danger" disabled>
-              <span class="sym square"></span>正在停止…
+              <span class="sym square"></span>{t("record.btn.stopping")}
             </button>
           {:else if !recording.isLive}
             <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
-              <span class="sym dot on-blue"></span>开始录制
+              <span class="sym dot on-blue"></span>{t("record.btn.start")}
             </button>
           {:else}
             {#if recording.paused}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>恢复</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>{t("record.btn.resume")}</button>
             {:else}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>暂停</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>{t("record.btn.pause")}</button>
             {/if}
             <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}>
-              <span class="sym square"></span>停止
+              <span class="sym square"></span>{t("record.btn.stop")}
             </button>
           {/if}
         </div>
 
         <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
         {#if recording.isLive}
-          <div class="wave-live" class:frozen={recording.paused} title="麦克风电平" aria-hidden="true">
+          <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")} aria-hidden="true">
             {#each liveBarsView as h, i (i)}
               <span class="bar" style="height: {Math.max(6, h)}%"></span>
             {/each}
@@ -379,7 +385,7 @@
       <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->
       {#if recording.isLive && cloudStatus}
         <p class="status" class:error={cloudStatus.kind === "backfill_failed"}>
-          <span class="status-dot"></span>{cloudStatus.text}
+          <span class="status-dot"></span>{t(cloudStatus.key, cloudStatus.params)}
         </p>
       {/if}
 
@@ -393,35 +399,35 @@
 
     {#if showMcpHint}
       <div class="banner">
-        新功能：把会议笔记接入 Claude / Cursor 等 AI 助手（MCP）。
-        <button class="link" onclick={() => dismissMcpHint(true)}>去 AI 页</button>
-        <button class="link" onclick={() => dismissMcpHint(false)}>知道了</button>
+        {t("record.banner.mcpHint")}
+        <button class="link" onclick={() => dismissMcpHint(true)}>{t("record.banner.mcpGo")}</button>
+        <button class="link" onclick={() => dismissMcpHint(false)}>{t("record.banner.mcpDismiss")}</button>
       </div>
     {/if}
 
     {#if btEchoRisk && !recording.isLive}
       <div class="banner">
-        检测到蓝牙外放 + 「保持外放音量」：蓝牙延迟会让回声消除失效，录音会混入对方声音（回放像回音）。建议改用有线外放/耳机，或到设置关闭「保持外放音量」。
+        {t("record.banner.btEcho")}
       </div>
     {/if}
 
     {#if lowInputVol}
       <div class="banner">
-        麦克风输入音量偏低（{lowInputVol.vol}%），可能录得很轻。
-        <button class="link" onclick={fixInputVol}>调到 {INPUT_TARGET}%</button>
+        {t("record.banner.lowInput", { vol: lowInputVol.vol })}
+        <button class="link" onclick={fixInputVol}>{t("record.banner.setVolume", { target: INPUT_TARGET })}</button>
       </div>
     {/if}
 
     {#if !screenPerm && !recording.isLive}
       <div class="banner">
-        系统声音未授权：只能录到麦克风，对方/外放的声音不会进笔记。
-        <button class="link" onclick={requestScreenPerm}>立即授权</button>
-        <span class="hint">系统设置里勾选 voice-notes 后切回本页即可。</span>
+        {t("record.banner.screenPerm")}
+        <button class="link" onclick={requestScreenPerm}>{t("record.banner.authorizeNow")}</button>
+        <span class="hint">{t("record.banner.screenPermHint")}</span>
         {#if showPermFix}
           <div class="fixline">
-            系统设置里已勾选却仍提示未授权？多半是旧版本的授权记录残留，开关是失效的。
-            <button class="link" onclick={fixScreenPerm}>修复授权</button>
-            <span class="hint">清除残留后重新弹出系统授权；若未弹出，退出并重新打开应用后再点「立即授权」。</span>
+            {t("record.banner.permFix")}
+            <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+            <span class="hint">{t("record.banner.permFixHint")}</span>
           </div>
         {/if}
       </div>
@@ -429,18 +435,18 @@
 
     {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
       <div class="banner">
-        系统声音不可用（未授权屏幕录制）。仅麦克风在录。
-        <button class="link" onclick={openScreenRecordingSettings}>打开系统设置</button>
-        <span class="hint">授权后重新开录生效。</span>
+        {t("record.banner.sysAudioOff")}
+        <button class="link" onclick={openScreenRecordingSettings}>{t("record.banner.openSettings")}</button>
+        <span class="hint">{t("record.banner.sysAudioOffHint")}</span>
       </div>
     {/if}
 
     {#if recording.isLive && recording.diarization === "unavailable"}
-      <div class="banner">说话人区分不可用（相关模型未下载）。转写与录音不受影响。</div>
+      <div class="banner">{t("record.banner.diarUnavailable")}</div>
     {/if}
 
     {#if recording.storageDegraded}
-      <div class="banner">落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。</div>
+      <div class="banner">{t("record.banner.storageDegraded")}</div>
     {/if}
 
     <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
@@ -453,20 +459,20 @@
         </p>
       {/each}
       {#if recording.partialMic}
-        <p class="partial" class:current={recording.isLive}><span class="badge mic">我</span>{recording.partialMic}</p>
+        <p class="partial" class:current={recording.isLive}><span class="badge mic">{t("record.badge.me")}</span>{recording.partialMic}</p>
       {/if}
       {#if recording.partialSystem}
-        <p class="partial" class:current={recording.isLive}><span class="badge system">对方</span>{recording.partialSystem}</p>
+        <p class="partial" class:current={recording.isLive}><span class="badge system">{t("record.badge.them")}</span>{recording.partialSystem}</p>
       {/if}
       {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
-        <p class="hint">（开始说话…）</p>
+        <p class="hint">{t("record.emptyHint")}</p>
       {/if}
     </div>
 
     <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失 -->
     <div class="jump-anchor" aria-hidden={follow || !recording.isLive}>
       {#if !follow && recording.isLive}
-        <button class="jump" onclick={jumpToLatest}>↓ 回到最新</button>
+        <button class="jump" onclick={jumpToLatest}>{t("record.jumpLatest")}</button>
       {/if}
     </div>
   {/if}

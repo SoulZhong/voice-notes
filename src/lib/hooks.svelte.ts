@@ -1,6 +1,7 @@
 // 钩子配置的共享数据层:类型 + IPC 封装 + 版本信号。版本信号与 recording 的
 // notesVersion 同套路——编辑页保存后 bump,侧栏列表 $effect 依赖重拉,不搞事件总线。
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "$lib/i18n/index.svelte";
 
 export type HookKind = "shell" | "feishu" | "wecom" | "webhook";
 export type WebhookType = "generic" | "feishu" | "wecom";
@@ -21,14 +22,15 @@ export type HookCfg = {
   include_note: boolean;
 };
 
-/** 事件白名单(与后端 HookEvent::as_str 逐字对齐,顺序即下拉顺序)。 */
+/** 事件白名单(与后端 HookEvent::as_str 逐字对齐,顺序即下拉顺序)。
+ * label 用 getter 走 i18n 字典:读取时才求值,模板/$derived 里访问会追踪 locale,切语言即更新。 */
 export const HOOK_EVENTS: { value: string; label: string }[] = [
-  { value: "recording_started", label: "录制开始" },
-  { value: "recording_stopped", label: "录制停止" },
-  { value: "recording_paused", label: "录制暂停" },
-  { value: "recording_resumed", label: "录制恢复" },
-  { value: "refine_started", label: "Aing 开始" },
-  { value: "refine_finished", label: "Aing 结束" },
+  { value: "recording_started", get label() { return t("hooks.event.recordingStarted"); } },
+  { value: "recording_stopped", get label() { return t("hooks.event.recordingStopped"); } },
+  { value: "recording_paused", get label() { return t("hooks.event.recordingPaused"); } },
+  { value: "recording_resumed", get label() { return t("hooks.event.recordingResumed"); } },
+  { value: "refine_started", get label() { return t("hooks.event.refineStarted"); } },
+  { value: "refine_finished", get label() { return t("hooks.event.refineFinished"); } },
 ];
 
 export const eventLabel = (v: string) => HOOK_EVENTS.find((e) => e.value === v)?.label ?? v;

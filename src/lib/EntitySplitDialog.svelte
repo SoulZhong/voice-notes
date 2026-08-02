@@ -8,6 +8,7 @@
     splitPreview,
     task10GovernanceApi,
   } from "./knowledgeGovernance";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     entity,
@@ -25,7 +26,7 @@
   let returnFocus: HTMLElement | null = null;
   let closed = false;
   let selectedIds = $state(new Set<string>());
-  let name = $state(untrack(() => `${entity.name}（拆分）`));
+  let name = $state(untrack(() => t("governance.split.defaultName", { name: entity.name })));
   let kind = $state(untrack(() => entity.kind));
   let aliases = $state("");
   let working = $state(false);
@@ -84,7 +85,7 @@
   async function commitSplit() {
     if (working || !canSubmitSplit(preview) || !name.trim()) return;
     working = true;
-    status = "正在拆分所选证据";
+    status = t("governance.split.working");
     try {
       const result = await controller.split(buildSplitEntity(
         entity.id,
@@ -94,7 +95,7 @@
         preview.selectedMentionIds,
       ));
       splitOperationId = result.operation_id;
-      status = controller.refreshError || `已将 ${preview.mentionCount} 条证据拆分到新实体`;
+      status = controller.refreshError || t("governance.split.done", { n: preview.mentionCount });
     } catch {
       status = controller.error;
     } finally {
@@ -105,11 +106,11 @@
   async function undoSplit() {
     if (!splitOperationId || working || undone) return;
     working = true;
-    status = "正在撤销本次拆分";
+    status = t("governance.split.undoing");
     try {
       await controller.undo(splitOperationId);
       undone = true;
-      status = controller.refreshError || "已撤销本次拆分";
+      status = controller.refreshError || t("governance.split.undone");
     } catch {
       status = controller.error;
     } finally {
@@ -129,34 +130,34 @@
   <div class="dialog-frame">
     <header>
       <div>
-        <p class="eyebrow">证据级身份调整</p>
-        <h2 id="split-title">拆分「{entity.name}」的证据</h2>
+        <p class="eyebrow">{t("governance.split.eyebrow")}</p>
+        <h2 id="split-title">{t("governance.split.title", { name: entity.name })}</h2>
       </div>
-      <button class="icon-button" type="button" aria-label="关闭拆分证据对话框" onclick={dismiss}>×</button>
+      <button class="icon-button" type="button" aria-label={t("governance.split.closeAria")} onclick={dismiss}>×</button>
     </header>
 
     <p id="split-description" class="description">
-      所选原文将归入一个新的稳定实体；历史笔记不会被改写，提交后可撤销。
+      {t("governance.split.description")}
     </p>
 
     <div class="identity-fields">
       <label>
-        <span>新实体名称</span>
+        <span>{t("governance.split.name")}</span>
         <input bind:value={name} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
       <label>
-        <span>新实体类型</span>
+        <span>{t("governance.split.kind")}</span>
         <input bind:value={kind} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
       <label class="wide-field">
-        <span>新实体别名（用顿号分隔）</span>
+        <span>{t("governance.split.aliases")}</span>
         <input bind:value={aliases} disabled={working || splitOperationId !== null} aria-describedby="split-feedback" />
       </label>
     </div>
 
     <div class="selection-heading">
-      <h3>选择要移动的完整原文</h3>
-      <p>{preview.noteCount} 篇笔记 · {preview.mentionCount} 条提及 · {preview.affectedRelationCount} 条受影响关系</p>
+      <h3>{t("governance.split.selectTitle")}</h3>
+      <p>{t("governance.split.preview", { notes: preview.noteCount, mentions: preview.mentionCount, relations: preview.affectedRelationCount })}</p>
     </div>
 
     <div class="evidence-list">
@@ -164,7 +165,7 @@
         {@const allSelected = group.items.every((item) => selectedIds.has(item.id))}
         <section class="note-group">
           <div class="note-heading">
-            <a href={'/notes/' + encodeURIComponent(group.noteId)}>笔记 {group.noteId}</a>
+            <a href={'/notes/' + encodeURIComponent(group.noteId)}>{t("governance.noteFallback", { id: group.noteId })}</a>
             <label class="select-note">
               <input
                 type="checkbox"
@@ -172,7 +173,7 @@
                 disabled={working || splitOperationId !== null}
                 onchange={(event) => toggleNote(group.items, event.currentTarget.checked)}
               />
-              选择这篇笔记的全部证据
+              {t("governance.split.selectNote")}
             </label>
           </div>
           <ul>
@@ -187,7 +188,7 @@
                   />
                   <span>
                     <q>{mention.quote}</q>
-                    <small>第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}</small>
+                    <small>{t("governance.mention.position", { p: mention.paragraph_index + 1, start: mention.start_offset, end: mention.end_offset })}</small>
                   </span>
                 </label>
               </li>
@@ -196,7 +197,7 @@
         </section>
       {/each}
       {#if mentions.length === 0}
-        <p class="empty">这个实体目前没有可拆分的稳定提及证据。</p>
+        <p class="empty">{t("governance.split.empty")}</p>
       {/if}
     </div>
 
@@ -205,16 +206,16 @@
     </p>
 
     <footer>
-      <button class="secondary" type="button" onclick={dismiss}>保留当前实体</button>
+      <button class="secondary" type="button" onclick={dismiss}>{t("governance.split.keep")}</button>
       {#if splitOperationId && !undone}
-        <button class="secondary" type="button" disabled={working} onclick={undoSplit}>撤销本次拆分</button>
+        <button class="secondary" type="button" disabled={working} onclick={undoSplit}>{t("governance.split.undo")}</button>
       {:else if !splitOperationId}
         <button
           class="primary"
           type="button"
           disabled={working || !canSubmitSplit(preview) || !name.trim()}
           onclick={commitSplit}
-        >拆分所选证据</button>
+        >{t("governance.split.commit")}</button>
       {/if}
     </footer>
   </div>

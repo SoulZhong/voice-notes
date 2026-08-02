@@ -28,6 +28,7 @@
   import { keyedOnce } from "$lib/keyedOnce";
   import { recording } from "$lib/recording.svelte";
   import PersonPickList from "$lib/PersonPickList.svelte";
+  import { t } from "$lib/i18n/index.svelte";
 
   // 主从结构的落地页:人物索引在侧栏,本页概览引导之下常驻「分析说话人」区——
   // 队列由共享 store + 人物表现算,全量渲染;处理完的项随重算自然从列表消失。
@@ -67,7 +68,8 @@
   );
   const live = $derived(recording.isLive);
 
-  const plabel = (id: string, name: string) => name || `说话人 ${id.replace(/^P/, "")}`;
+  const plabel = (id: string, name: string) =>
+    name || t("speakers.personFallback", { n: id.replace(/^P/, "") });
 
   // ── 会议上下文(拍板信息):每人最近 3 场,懒加载缓存 ──
   let notesCache = $state<Record<string, NoteSummary[]>>({});
@@ -100,7 +102,7 @@
   const audition = createAudition(
     (src) => new Audio(convertFileSrc(src)) as unknown as PlayerLike,
     (k) => (playingKey = k),
-    (msg) => (error = `试听失败:${msg}`),
+    (msg) => (error = t("speakers.auditionFailed", { msg })),
   );
   $effect(() => () => audition.stop());
 
@@ -113,7 +115,7 @@
       people = await listPeople();
       error = "";
     } catch (e) {
-      error = `加载失败: ${e}`;
+      error = t("common.loadFailed", { e });
     }
   }
   onMount(() => {
@@ -191,7 +193,7 @@
       async () => {
         const winner = dupPrimaryId(name, g);
         await mergeDuplicatePeople(g, winner, mergePerson, (journalId) => {
-          tidy.lastManual = { journalId, label: `「${name}」并成一条` };
+          tidy.lastManual = { journalId, label: t("speakers.dupMergedLabel", { name }) };
         });
       },
       undefined,
@@ -291,21 +293,26 @@
     </div>
     {#if p}
       <div class="pane-meta">
-        最近 {formatDate(p.last_seen)} · 累计 {formatDuration(Math.floor(p.total_ms / 1000))}
+        {t("speakers.paneMeta", {
+          date: formatDate(p.last_seen),
+          dur: formatDuration(Math.floor(p.total_ms / 1000)),
+        })}
       </div>
       <div class="samples">
         {#each p.sample_paths as path, i (path)}
           <button
             class="chip"
             class:playing={playingKey === path}
-            title={playingKey === path ? "停止" : "试听这份原声"}
+            title={playingKey === path ? t("speakers.stop") : t("speakers.auditionSample")}
             onclick={() => audition.toggle(path, path)}
           >
             {playingKey === path ? "◼" : "▶"}
-            {p.sample_dates[i] ? formatDate(p.sample_dates[i]).slice(5, 10) : `样本 ${i + 1}`}
+            {p.sample_dates[i]
+              ? formatDate(p.sample_dates[i]).slice(5, 10)
+              : t("speakers.sampleN", { n: i + 1 })}
           </button>
         {:else}
-          <span class="hint">无录音样本</span>
+          <span class="hint">{t("speakers.noSamples")}</span>
         {/each}
       </div>
       {#if (notesCache[pid] ?? []).length > 0}
@@ -316,7 +323,7 @@
         </div>
       {/if}
     {:else}
-      <div class="pane-meta">已并入,记录随合并转移</div>
+      <div class="pane-meta">{t("speakers.mergedAway")}</div>
     {/if}
   </div>
 {/snippet}
@@ -325,15 +332,15 @@
   <section class="card" class:archived={r.invalid_reason}>
     <div class="card-tag">
       {#if r.invalid_reason}
-        已自动归并 · 仅存档 · {r.invalid_reason}
+        {t("speakers.autoMergedArchived", { reason: r.invalid_reason })}
       {:else}
-        已自动归并
+        {t("speakers.autoMerged")}
       {/if}
     </div>
     <div class="card-title">
       {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
       {#if r.similarity !== null}
-        <span class="sim strong">相似度 {Math.round(r.similarity * 100)}%</span>
+        <span class="sim strong">{t("speakers.similarity", { pct: Math.round(r.similarity * 100) })}</span>
       {/if}
     </div>
     <div class="panes">
@@ -341,20 +348,20 @@
         <div class="pane-head">
           <span class="dot" style="background: {speakerInk(r.loser, 'mic')}"></span>
           <span class="pname">{plabel(r.loser, r.loser_name)}</span>
-          <span class="pane-tag">已并入</span>
+          <span class="pane-tag">{t("speakers.mergedTag")}</span>
         </div>
         <div class="samples">
           {#each r.loser_sample_paths as path, i (path)}
             <button
               class="chip"
               class:playing={playingKey === path}
-              title={playingKey === path ? "停止" : "试听合并前的原声"}
+              title={playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")}
               onclick={() => audition.toggle(path, path)}
             >
-              {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
+              {playingKey === path ? "◼" : "▶"} {t("speakers.snapshotN", { n: i + 1 })}
             </button>
           {:else}
-            <span class="hint">无可试听的快照</span>
+            <span class="hint">{t("speakers.noSnapshots")}</span>
           {/each}
         </div>
       </div>
@@ -365,15 +372,15 @@
         {@render personPane(r.winner, r.winner_name)}
         {#if r.winner_sample_paths.length > 0}
           <div class="snap-listen">
-            <span class="snap-label">合并时的原声</span>
+            <span class="snap-label">{t("speakers.snapshotAtMerge")}</span>
             {#each r.winner_sample_paths as path, i (path)}
               <button
                 class="chip"
                 class:playing={playingKey === path}
-                title={playingKey === path ? "停止" : "试听合并时刻的样本"}
+                title={playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")}
                 onclick={() => audition.toggle(path, path)}
               >
-                {playingKey === path ? "◼" : "▶"} 快照 {i + 1}
+                {playingKey === path ? "◼" : "▶"} {t("speakers.snapshotN", { n: i + 1 })}
               </button>
             {/each}
           </div>
@@ -381,92 +388,87 @@
       </div>
     </div>
     {#if !r.invalid_reason}
-      <p class="hint">声纹足够相似已自动并入。听一下不对劲就撤销;没问题点「好」。</p>
+      <p class="hint">{t("speakers.autoMergedHint")}</p>
     {/if}
     <div class="acts">
       {#if r.invalid_reason}
-        <button class="mini accent" disabled={busy || live} onclick={() => doRestore(r)}>拆回独立说话人</button>
-        <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>知道了</button>
+        <button class="mini accent" disabled={busy || live} onclick={() => doRestore(r)}>{t("speakers.restoreSplit")}</button>
+        <button class="mini" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.gotIt")}</button>
       {:else}
-        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>好</button>
-        <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id, `r:${r.journal_id}`)}>撤销</button>
+        <button class="mini accent" disabled={busy || live} onclick={() => doAck(r)}>{t("speakers.ok")}</button>
+        <button class="mini" disabled={busy || live} onclick={() => doUndo(r.journal_id, `r:${r.journal_id}`)}>{t("speakers.undo")}</button>
       {/if}
     </div>
     {#if r.invalid_reason}
-      <p class="hint">
-        不能撤销时:先听「合并时的原声」核对;确认并错可「拆回独立说话人」——按合并时快照
-        恢复原编号,历史笔记段落重新归他,之后录制也能重新认出;当时的合并对象不受影响。
-        拆回后这两条仍可能作为普通建议出现,不想合可忽略。
-      </p>
+      <p class="hint">{t("speakers.restoreHint")}</p>
     {/if}
     {@render cardError(`r:${r.journal_id}`)}
   </section>
 {/snippet}
 
 <main class="container">
-  <h1>会议搭子</h1>
+  <h1>{t("speakers.title")}</h1>
   <p class="desc">
-    录到的说话人会自动登记。给"未命名"的人<strong>命名</strong>后,之后的录制会自动认出他并直接显示名字;
-    声纹足够相似的会自动归并,拿不准的进「分析说话人」等你拍板。从左侧选择一个人查看详情、试听原声或管理。
+    {t("speakers.desc1")}<strong>{t("speakers.descName")}</strong>{t("speakers.desc2")}
   </p>
 
   {#if people.length === 0}
     <div class="empty">
-      <p>还没有说话人。</p>
-      <p class="hint">录一场会议(单人说话累计满 30 秒),停止后会自动出现在左侧。</p>
+      <p>{t("speakers.emptyTitle")}</p>
+      <p class="hint">{t("speakers.emptyHint")}</p>
     </div>
   {:else}
     <div class="stats">
       <div class="stat">
         <span class="num">{people.length}</span>
-        <span class="label">位说话人</span>
+        <span class="label">{t("speakers.statTotal")}</span>
       </div>
       <div class="stat">
         <span class="num">{named}</span>
-        <span class="label">已命名</span>
+        <span class="label">{t("speakers.statNamed")}</span>
       </div>
       {#if unnamed > 0}
         <div class="stat todo">
           <span class="num">{unnamed}</span>
-          <span class="label">待命名</span>
+          <span class="label">{t("speakers.statUnnamed")}</span>
         </div>
       {/if}
     </div>
 
     <section class="tidy">
       <div class="tidy-head">
-        <span class="tidy-title">分析说话人</span>
+        <span class="tidy-title">{t("speakers.tidyTitle")}</span>
         <span class="summary">
           {#if pendingN === 0 && receiptsN === 0}
-            没有要整理的
+            {t("speakers.tidyNone")}
           {:else}
-            {#if pendingN > 0}{pendingN} 件待处理{/if}{#if pendingN > 0 && receiptsN > 0} · {/if}{#if receiptsN > 0}{receiptsN} 条已自动归并{/if}
+            {#if pendingN > 0}{t("speakers.pendingCount", { n: pendingN })}{/if}{#if pendingN > 0 && receiptsN > 0} · {/if}{#if receiptsN > 0}{t("speakers.receiptsCount", { n: receiptsN })}{/if}
           {/if}
         </span>
-        {#if tidy.loading}<span class="refreshing">正在比对声纹…</span>{/if}
+        {#if tidy.loading}<span class="refreshing">{t("speakers.comparing")}</span>{/if}
         <span class="head-spacer"></span>
-        <button class="mini plain" disabled={tidy.loading} onclick={() => void tidy.refresh()}>重新整理</button>
+        <button class="mini plain" disabled={tidy.loading} onclick={() => void tidy.refresh()}>{t("speakers.reTidy")}</button>
       </div>
 
       {#if live}
-        <div class="banner warn">录制中不能整理——可以浏览和试听,合并/删除/撤销等停止录制后再做。</div>
+        <div class="banner warn">{t("speakers.liveBanner")}</div>
       {/if}
       {#if error}
         <div class="banner">{error}</div>
       {/if}
       {#if tidy.lastManual}
         <div class="undo-strip">
-          已合并:{tidy.lastManual.label}
-          <button class="mini" disabled={busy || live} onclick={() => doUndo(tidy.lastManual!.journalId)}>撤销</button>
-          <button class="mini plain" onclick={() => (tidy.lastManual = null)}>好</button>
+          {t("speakers.mergedLabel", { label: tidy.lastManual.label })}
+          <button class="mini" disabled={busy || live} onclick={() => doUndo(tidy.lastManual!.journalId)}>{t("speakers.undo")}</button>
+          <button class="mini plain" onclick={() => (tidy.lastManual = null)}>{t("speakers.ok")}</button>
         </div>
       {/if}
 
       {#if queue.length === 0 && archived.length === 0}
         {#if tidy.loading}
-          <p class="hint">正在比对声纹…</p>
+          <p class="hint">{t("speakers.comparing")}</p>
         {:else}
-          <p class="hint">都整理完了——新的建议会随录制自动出现;高置信的会自动归并并在这里留回执。</p>
+          <p class="hint">{t("speakers.allDone")}</p>
         {/if}
       {:else}
         {#if queue.length > 0}
@@ -479,21 +481,21 @@
               {@const skey = `${s.loser}>${s.winner}`}
               {@const target = resolveSugTarget(s, tidy.sugOverride, personById)}
               <section class="card">
-                <div class="card-tag">归属建议</div>
+                <div class="card-tag">{t("speakers.tagSuggestion")}</div>
                 <div class="card-title">
-                  这两条像同一个人吗?
+                  {t("speakers.sugTitle")}
                   {#if target.overridden}
                     <!-- 相似度只对系统建议对成立,换了人再挂着就是误导 -->
-                    <span class="sim">手动改选</span>
+                    <span class="sim">{t("speakers.manualOverride")}</span>
                     <button
                       class="mini plain"
                       onclick={() => {
                         const { [skey]: _, ...rest } = tidy.sugOverride;
                         tidy.sugOverride = rest;
-                      }}>还原建议</button>
+                      }}>{t("speakers.restoreSuggestion")}</button>
                   {:else}
                     <span class="sim" class:strong={isStrong(s)}>
-                      相似度 {Math.round(s.similarity * 100)}%{isStrong(s) ? " · 很可能" : ""}
+                      {t("speakers.similarity", { pct: Math.round(s.similarity * 100) })}{isStrong(s) ? t("speakers.likelySuffix") : ""}
                     </span>
                   {/if}
                 </div>
@@ -507,19 +509,19 @@
                     <!-- 猜错人时就地换目标,不必忽略后绕去详情页「合并到…」 -->
                     <button
                       class="switch-btn"
-                      title="不是他?换成另一个已有的人"
+                      title={t("speakers.switchTitle")}
                       onclick={() => {
                         confirmClean = false;
                         sugPickQuery = "";
                         sugPickFor = sugPickFor === skey ? null : skey;
-                      }}>换个人</button>
+                      }}>{t("speakers.switchPerson")}</button>
                     {#if sugPickFor === skey}
                       {@const q = sugPickQuery.trim()}
-                      <button class="menu-scrim" aria-label="关闭菜单" onclick={() => (sugPickFor = null)}></button>
+                      <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={() => (sugPickFor = null)}></button>
                       <div class="menu">
-                        <div class="menu-title">把「{plabel(s.loser, s.loser_name)}」并入…</div>
+                        <div class="menu-title">{t("speakers.mergeInto", { name: plabel(s.loser, s.loser_name) })}</div>
                         <!-- svelte-ignore a11y_autofocus -->
-                        <input class="pick-input" autofocus placeholder="输入名字检索" bind:value={sugPickQuery} />
+                        <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={sugPickQuery} />
                         <PersonPickList
                           people={people.filter((p) => p.id !== s.loser && p.id !== target.id)}
                           query={sugPickQuery}
@@ -532,18 +534,18 @@
                         {#if q && !people.some((p) => p.name === q)}
                           <!-- 库里没这个人:就地命名,不必出弹层绕去详情页 -->
                           <button class="create-row" disabled={busy} onclick={() => doNameAsNew(s, q)}>
-                            新建「{q}」并命名这个说话人
+                            {t("speakers.createAndName", { name: q })}
                           </button>
                         {/if}
                       </div>
                     {/if}
                   </div>
                 </div>
-                <p class="hint">两边各听一段原声,确认是同一个人再合并;合并保留双方声纹,认得更准。</p>
+                <p class="hint">{t("speakers.sugHint")}</p>
                 <div class="acts">
-                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s, target.id, target.name)}>合并</button>
+                  <button class="mini accent" disabled={busy || live} onclick={() => doMergeSuggestion(s, target.id, target.name)}>{t("speakers.merge")}</button>
                   <!-- 忽略是本地处置(dismissed 元数据),后端录制中也放行,不必陪绑置灰 -->
-                  <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>忽略</button>
+                  <button class="mini" disabled={busy} onclick={() => doIgnoreSuggestion(s)}>{t("speakers.ignore")}</button>
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
@@ -551,8 +553,8 @@
               {@const g = item.people}
               {@const primary = dupPrimaryId(item.name, g)}
               <section class="card">
-                <div class="card-tag">同名重复</div>
-                <div class="card-title">「{item.name}」有 {g.length} 条,多半是同一个人被拆开了</div>
+                <div class="card-tag">{t("speakers.tagDup")}</div>
+                <div class="card-title">{t("speakers.dupTitle", { name: item.name, n: g.length })}</div>
                 <div class="panes wrap">
                   {#each g as p (p.id)}
                     <div class="dup-item" class:primary={p.id === primary}>
@@ -564,43 +566,43 @@
                           checked={p.id === primary}
                           onchange={() => (dupPrimary = { ...dupPrimary, [item.name]: p.id })}
                         />
-                        作为主条目
+                        {t("speakers.asPrimary")}
                       </label>
                     </div>
                   {/each}
                 </div>
-                <p class="hint">其余条目将并入主条目(默认最近活跃的);逐条试听核对。</p>
+                <p class="hint">{t("speakers.dupHint")}</p>
                 <div class="acts">
                   <button class="mini accent" disabled={busy || live} onclick={() => doMergeDup(item.name, g)}>
-                    全部并入主条目
+                    {t("speakers.mergeAllPrimary")}
                   </button>
-                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>忽略</button>
+                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.ignore")}</button>
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
             {:else}
               {@const p = item.person}
               <section class="card">
-                <div class="card-tag">无样本条目</div>
-                <div class="card-title">{plabel(p.id, p.name)}——没有原声可核对</div>
+                <div class="card-tag">{t("speakers.tagNosample")}</div>
+                <div class="card-title">{t("speakers.nosampleTitle", { name: plabel(p.id, p.name) })}</div>
                 <div class="panes">
                   {@render personPane(p.id, p.name)}
                 </div>
                 <p class="hint warn-text">
-                  删除后历史笔记中这个说话人恢复显示为编号,不可恢复。认不出是谁就删,拿不准就保留。
+                  {t("speakers.nosampleHint")}
                 </p>
                 <div class="acts">
-                  <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>删除</button>
-                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>保留</button>
+                  <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>{t("speakers.delete")}</button>
+                  <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.keep")}</button>
                   {#if nosampleN > 1 && tidyItemKey(item) === firstNosampleKey}
                     <span class="spacer"></span>
                     {#if confirmClean}
-                      <span class="warn-text">共 {nosampleN} 条,删除不可恢复。</span>
-                      <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>确认清理</button>
-                      <button class="mini plain" onclick={() => (confirmClean = false)}>取消</button>
+                      <span class="warn-text">{t("speakers.cleanConfirmWarn", { n: nosampleN })}</span>
+                      <button class="mini danger" disabled={busy || live} onclick={doCleanAll}>{t("speakers.confirmClean")}</button>
+                      <button class="mini plain" onclick={() => (confirmClean = false)}>{t("speakers.cancel")}</button>
                     {:else}
                       <button class="mini plain" disabled={busy || live} onclick={() => (confirmClean = true)}>
-                        剩余 {nosampleN} 条无样本条目一键清理
+                        {t("speakers.cleanAll", { n: nosampleN })}
                       </button>
                     {/if}
                   {/if}
@@ -616,11 +618,11 @@
           <div class="archive">
             <div class="archive-head">
               <button class="archive-toggle" onclick={() => (archiveOpen = !archiveOpen)}>
-                {archiveOpen ? "收起" : "展开"} {archived.length} 条已存档
+                {archiveOpen ? t("speakers.collapse") : t("speakers.expand")} {t("speakers.archivedCount", { n: archived.length })}
               </button>
-              <span class="hint">相关人物已再次合并等原因,不能再撤销;可逐条核对或拆回。</span>
+              <span class="hint">{t("speakers.archiveHint")}</span>
               <span class="spacer"></span>
-              <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>一键确认全部</button>
+              <button class="mini plain" disabled={busy || live} onclick={ackAllInvalid}>{t("speakers.ackAll")}</button>
             </div>
             {#if archiveOpen}
               <div class="stack">
@@ -635,8 +637,8 @@
     </section>
 
     <p class="pick-hint">
-      从左侧列表选择一个人查看详情。
-      {#if unnamed > 0}「待命名」的人命名后,之后的录制会自动显示名字。{/if}
+      {t("speakers.pickHint")}
+      {#if unnamed > 0}{t("speakers.pickHintUnnamed")}{/if}
     </p>
   {/if}
 </main>

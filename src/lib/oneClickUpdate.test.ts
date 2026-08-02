@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { updateProgressLabel, applyUpdate } from "./update";
+import { zh } from "./i18n/dict/settings";
 import conf from "../../src-tauri/tauri.conf.json";
+
+// 进度文案已 i18n 化(settings 分片);测试默认 locale=zh,断言从 zh 字典取值,
+// 文案改动只需改字典,测试不再钉死字面量。
+const updating = zh["settings.update.updating"];
+const installing = zh["settings.update.installing"];
+const updatingPct = (pct: number) => zh["settings.update.updatingPct"].replace("{pct}", String(pct));
 
 // applyUpdate 内部动态 import 这两个插件;vi.mock 拦截模块解析,测试无需真实 Tauri 环境。
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
@@ -37,12 +44,12 @@ describe("tauri.conf.json updater 配置", () => {
 
 describe("updateProgressLabel", () => {
   it("有总长时显示百分比", () => {
-    expect(updateProgressLabel(4200, 10000)).toBe("更新中 42%");
-    expect(updateProgressLabel(10000, 10000)).toBe("更新中 100%");
+    expect(updateProgressLabel(4200, 10000)).toBe(updatingPct(42));
+    expect(updateProgressLabel(10000, 10000)).toBe(updatingPct(100));
   });
   it("无总长/零总长显示省略号", () => {
-    expect(updateProgressLabel(4200, undefined)).toBe("更新中…");
-    expect(updateProgressLabel(0, 0)).toBe("更新中…");
+    expect(updateProgressLabel(4200, undefined)).toBe(updating);
+    expect(updateProgressLabel(0, 0)).toBe(updating);
   });
 });
 
@@ -69,7 +76,7 @@ describe("applyUpdate", () => {
       },
     } as never);
     await applyUpdate((label) => labels.push(label));
-    expect(labels).toEqual(["更新中 50%", "更新中 100%", "安装中…"]);
+    expect(labels).toEqual([updatingPct(50), updatingPct(100), installing]);
     expect(relaunch).toHaveBeenCalledOnce();
   });
 
