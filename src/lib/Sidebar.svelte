@@ -14,8 +14,9 @@
     type NoteSummary,
   } from "$lib/notes";
   import { listPeople, type PersonSummary } from "$lib/people";
+  import { filterPeople, sortPeopleAlpha } from "$lib/personPick";
   import { tidy } from "$lib/tidy.svelte";
-  import { buildTidyQueue } from "$lib/tidyQueue";
+  import { buildTidyQueue, splitArchive } from "$lib/tidyQueue";
   import { listHooks, hooks as hooksStore, type HookCfg, HOOK_EVENTS } from "$lib/hooks.svelte";
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
@@ -137,15 +138,21 @@
     return "/graph?e=" + encodeURIComponent(e.id);
   }
 
-  // 与详情页同一套排序/分组语义:最近出现在前;待命名是待处理项排上面。
-  const peopleSorted = $derived(
-    [...people].sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")),
-  );
-  const peopleUnnamed = $derived(peopleSorted.filter((p) => !p.name));
-  const peopleNamed = $derived(peopleSorted.filter((p) => p.name));
+  // 人物字母序(拼音/编号数值序);待命名是待处理项排上面,组内各自有序。
+  const peopleSorted = $derived(sortPeopleAlpha(people));
+  let peopleQuery = $state("");
+  // 切出人物页签时清空搜索词,回来不留上次的过滤态。
+  $effect(() => {
+    if (tab !== "people") peopleQuery = "";
+  });
+  const peopleFiltered = $derived(filterPeople(peopleSorted, peopleQuery));
+  const peopleUnnamed = $derived(peopleFiltered.filter((p) => !p.name));
+  const peopleNamed = $derived(peopleFiltered.filter((p) => p.name));
 
-  /** 「概览与整理」徽标:收件箱队列总数(回执+建议+同名组+无样本),像收件箱未读。 */
-  const tidyBadge = $derived(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed).length);
+  /** 「概览与整理」徽标:待拍板的活(有效回执+建议+同名组+无样本);失效存档不计。 */
+  const tidyBadge = $derived(
+    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed)).pending.length,
+  );
   let editingId = $state<string | null>(null);
   let editingTitle = $state("");
   // 右键菜单(冒烟反馈:改名/删除从行内挪进 context menu,列表不再有常驻操作行)
@@ -429,6 +436,9 @@
             <span class="tidy-badge" title="{tidyBadge} 项待处理">{tidyBadge}</span>
           {/if}
         </li>
+        <li class="people-search-row">
+          <input class="people-search" placeholder="搜索搭子" bind:value={peopleQuery} />
+        </li>
       {/if}
       {#if peopleUnnamed.length > 0}
         <li class="group-label">待命名</li>
@@ -441,6 +451,9 @@
         {#each peopleNamed as p (p.id)}
           {@render personRow(p)}
         {/each}
+      {/if}
+      {#if peopleQuery.trim() && peopleUnnamed.length === 0 && peopleNamed.length === 0}
+        <li class="hint people-empty">没有匹配的搭子</li>
       {/if}
     </ul>
   {:else if tab === "graph"}
@@ -796,6 +809,34 @@
     font-weight: 500;
     border-radius: var(--radius-full);
     padding: 0.05em 0.45em;
+  }
+  /* 搭子搜索行:非交互 li 壳,输入框本体照 SpeakerChips .panel-input 起个带边框态──
+     发丝边 + surface 底 + radius-md,列表滚动区顶部,概览行之下。 */
+  .people-search-row {
+    list-style: none;
+    padding: 0 0.1rem 0.4rem;
+  }
+  .people-search {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.4em 0.6em;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.82rem;
+  }
+  .people-search::placeholder {
+    color: var(--ink-faint);
+  }
+  .people-search:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .people-empty {
+    list-style: none;
+    padding: 0.5rem 0.5rem;
   }
   /* 分组标签:待命名/已命名,与详情域分区语义一致;非交互,安静小字 */
   .group-label {

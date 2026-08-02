@@ -1,12 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildTidyQueue,
-  keyCommand,
-  mergeDuplicatePeople,
-  orderWithSkips,
-  tidyItemKey,
-  type TidyItem,
-} from "./tidyQueue";
+import { buildTidyQueue, mergeDuplicatePeople, resolveSugTarget, splitArchive, tidyItemKey, type TidyItem } from "./tidyQueue";
 import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
@@ -29,7 +22,7 @@ const sug = (loser: string, winner: string): PersonMergeSuggestion => ({
   salience: null,
 });
 
-const receipt = (id: string): MergeReceipt => ({
+const receipt = (id: string, invalidReason: string | null = null): MergeReceipt => ({
   journal_id: id,
   time: "t",
   origin: "auto",
@@ -39,7 +32,8 @@ const receipt = (id: string): MergeReceipt => ({
   winner_name: "张三",
   similarity: 0.9,
   loser_sample_paths: [],
-  invalid_reason: null,
+  winner_sample_paths: [],
+  invalid_reason: invalidReason,
 });
 
 describe("buildTidyQueue", () => {
@@ -79,15 +73,41 @@ describe("buildTidyQueue", () => {
   });
 });
 
-describe("orderWithSkips", () => {
-  it("跳过的挪到队尾并保持跳过先后序", () => {
+describe("buildTidyQueue 失效目标过滤", () => {
+  it("winner 不在库的建议被滤掉(已合并/已删除的人不能再作合并目标)", () => {
+    const people = [person("P1")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toEqual([]);
+  });
+
+  it("loser 不在库的建议同样滤掉", () => {
+    const people = [person("P9")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toEqual([]);
+  });
+
+  it("双方都在库的建议保留", () => {
+    const people = [person("P1"), person("P9")];
+    const q = buildTidyQueue(people, [sug("P1", "P9")], [], new Set());
+    expect(q.filter((i) => i.kind === "suggestion")).toHaveLength(1);
+  });
+});
+
+describe("splitArchive", () => {
+  it("失效回执进 archived,其余进 pending,各自保持队列序", () => {
     const items = buildTidyQueue(
-      [person("P4", "", []), person("P5", "", []), person("P6", "", [])],
+      [person("P1")],
       [],
-      [],
+      [receipt("J1"), receipt("J2", "相关人物随后又被合并"), receipt("J3")],
+      new Set(),
     );
-    const ordered = orderWithSkips(items, ["n:P4", "n:P5"]);
-    expect(ordered.map(tidyItemKey)).toEqual(["n:P6", "n:P4", "n:P5"]);
+    const { pending, archived } = splitArchive(items);
+    expect(archived.map((i) => i.kind === "receipt" && i.receipt.journal_id)).toEqual(["J2"]);
+    expect(pending.filter((i) => i.kind === "receipt")).toHaveLength(2);
+  });
+
+  it("空输入两侧都空", () => {
+    expect(splitArchive([])).toEqual({ pending: [], archived: [] });
   });
 });
 
@@ -111,25 +131,20 @@ describe("mergeDuplicatePeople", () => {
   });
 });
 
-describe("keyCommand", () => {
-  it("Enter=主动作,S=跳过,数字=试听", () => {
-    expect(keyCommand("Enter", "suggestion")).toBe("primary");
-    expect(keyCommand("s", "receipt")).toBe("skip");
-    expect(keyCommand("1", "suggestion")).toEqual({ play: 0 });
-    expect(keyCommand("2", "receipt")).toEqual({ play: 1 });
+describe("resolveSugTarget", () => {
+  const byId = new Map([["P1", person("P1", "张三")], ["P9", person("P9", "王五")]]);
+  const s = sug("P2", "P1"); // loser P2 → 系统建议 winner P1(builder 若带名字参数,winner_name 取"张三")
+
+  it("无覆盖时返回系统建议目标", () => {
+    expect(resolveSugTarget(s, {}, byId)).toEqual({ id: "P1", name: s.winner_name, overridden: false });
   });
-  it("X 忽略/保留,但回执卡无 X(撤销只走点击,防误触)", () => {
-    expect(keyCommand("x", "suggestion")).toBe("dismiss");
-    expect(keyCommand("X", "nosample")).toBe("dismiss");
-    expect(keyCommand("x", "receipt")).toBeNull();
+
+  it("覆盖存在于库时生效并标记 overridden", () => {
+    const r = resolveSugTarget(s, { "P2>P1": "P9" }, byId);
+    expect(r).toEqual({ id: "P9", name: "王五", overridden: true });
   });
-  it("数字键上限:双栏卡 1-2,同名组卡 1-9", () => {
-    expect(keyCommand("3", "suggestion")).toBeNull();
-    expect(keyCommand("9", "dup")).toEqual({ play: 8 });
-    expect(keyCommand("0", "dup")).toBeNull();
-  });
-  it("无样本卡数字键返回 null(没有可试听的)", () => {
-    expect(keyCommand("1", "nosample")).toBeNull();
-    expect(keyCommand("2", "nosample")).toBeNull();
+
+  it("覆盖的人已不在库(其间被合并/删除)时回落系统建议", () => {
+    expect(resolveSugTarget(s, { "P2>P1": "P404" }, byId)).toEqual({ id: "P1", name: s.winner_name, overridden: false });
   });
 });

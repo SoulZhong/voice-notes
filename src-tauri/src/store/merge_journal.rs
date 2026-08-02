@@ -13,6 +13,10 @@ use super::voiceprints::Person;
 /// 上限只是防无界膨胀。
 pub const JOURNAL_CAP: usize = 50;
 
+/// 人工处置键名单上限:超出按追加序淘汰最旧。500 远超一轮整理量,只为防无界
+/// 膨胀——丢了顶多让用户重启后再处置一次。
+pub const DISMISSED_CAP: usize = 500;
+
 /// 一条合并日志。id 格式 `m-<loser>`:loser 合并后即从库中消失,同一 loser 不会
 /// 有两条并存(撤销会删条目,重新合并再落新条),天然唯一。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,8 +52,11 @@ pub struct MergeJournalEntry {
 }
 
 /// root 为 app_data_dir(与 VoiceprintStore 同根),日志落 root/merge_journal/。
-/// 并发:所有调用方(voiceprints.rs 各方法/命令层)都在 vp_guard 内或单线程命令
-/// 上下文中操作,模块自身不再加锁。
+/// 并发:凡触碰条目目录(entries/样本副本/denylist)的调用方都必须在 vp_guard
+/// 内操作,模块自身不再加锁。命令层异步化(spawn_blocking)后不再有"单线程命令
+/// 上下文"这条豁免——直连写条目的旧路径(如 acknowledge)已收编进 VoiceprintStore
+/// 持锁包装,新调用方一律走那里。例外:dismissed 处置名单是独立单写文件,与条目
+/// 目录不相交,dismiss_item 免锁直连仍安全。
 pub struct MergeJournal {
     root: PathBuf,
     #[cfg(test)]
@@ -193,9 +200,12 @@ impl MergeJournal {
     }
 
     /// 触及 touched 中任一人物的**有效**条目全部失效。by=使其失效的合并 id(该
-    /// 合并被撤销时本条复活,样本副本保留);by=None 为永久性失效(改名/删除/新
-    /// 录制等),样本副本删掉省空间。失效标记写失败时 fail-closed 隔离整条日志:
-    /// 宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物数据。
+    /// 合并被撤销时本条复活);by=None 为永久性失效(改名/删除/新录制等),不可
+    /// 复活。两种失效都**保留**样本副本:失效条目一旦不能撤销,回执卡上「合并
+    /// 时的原声」就是唯一还能核对的东西,最不该在这时候删掉——空间由 JOURNAL_CAP
+    /// 上限与确认/淘汰时随目录一并清理兜底。失效标记写失败时 fail-closed 隔离
+    /// 整条日志:宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物
+    /// 数据。
     pub fn invalidate(&self, touched: &[&str], reason: &str, by: Option<&str>) {
         for mut e in self.entries() {
             if e.invalid_reason.is_some() {
@@ -220,15 +230,11 @@ impl MergeJournal {
                 }
                 continue;
             }
-            if by.is_none() {
-                if let Some(d) = self.entry_dir(&e.id) {
-                    let _ = std::fs::remove_dir_all(d.join("samples"));
-                }
-            }
         }
     }
 
-    /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本删除。
+    /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本保留(同
+    /// invalidate 文档)。
     pub fn invalidate_all(&self, reason: &str) {
         let ids: Vec<String> = self
             .entries()
@@ -276,23 +282,61 @@ impl MergeJournal {
         }
     }
 
-    /// 被并入方(loser)合并前的样本快照副本路径,按槽位序。条目不存在/已被永久
-    /// 失效清理/该侧无样本 → 空(回执卡隐藏该试听行)。
-    pub fn loser_sample_copies(&self, id: &str) -> Vec<PathBuf> {
-        let Some(dir) = self.samples_dir(id, "loser") else { return vec![] };
+    /// 某侧(loser/winner)合并前的样本快照副本路径,按槽位序。条目不存在/该侧
+    /// 无样本 → 空(回执卡隐藏该试听行)。失效条目(无论 by=Some/None)的副本
+    /// 保留,直至条目被确认/撤销/淘汰随目录一并清理。
+    pub fn sample_copies(&self, id: &str, side: &str) -> Vec<PathBuf> {
+        let Some(dir) = self.samples_dir(id, side) else { return vec![] };
         let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
         let mut out: Vec<PathBuf> = rd.flatten().map(|f| f.path()).collect();
         // 槽位序而非字典序:<id>.wav=槽1,<id>-N.wav=槽N。字典序会把 '-' 排在 '.'
-        // 前,槽1(最老)反而落到最后,前端"最后一份=最新"的取法就拿错。
+        // 前,槽1(最老)反而落到最后,前端"最后一份=最新"的取法就拿错。兜底截声
+        // 文件 "<loser>-cut.wav" 的后缀非数字,排在所有数字槽之后(u32::MAX - 1,
+        // 留 u32::MAX 给理论上更极端的未知后缀,避免边界互相踩)。
         let slot = |p: &PathBuf| -> u32 {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.rsplit_once('-'))
-                .and_then(|(_, n)| n.parse().ok())
-                .unwrap_or(1)
+            match p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('-')) {
+                None => 1,
+                Some((_, n)) => n.parse().unwrap_or(u32::MAX - 1),
+            }
         };
         out.sort_by_key(slot);
         out
+    }
+
+    /// 被并入方(loser)合并前的样本快照副本路径,按槽位序。薄委托,保留旧名不破
+    /// 既有调用。
+    pub fn loser_sample_copies(&self, id: &str) -> Vec<PathBuf> {
+        self.sample_copies(id, "loser")
+    }
+
+    /// 无样本 loser 的兜底截声写入快照副本(合并时现场从笔记音频截的 loser 原声):
+    /// 回执卡左栏据此有得听,不再"无可试听的快照"。best-effort:失败只 eprintln,
+    /// 不影响合并(与样本层一贯哲学)。
+    pub fn write_loser_cut_sample(&self, id: &str, loser: &str, samples: &[f32]) {
+        let res = (|| -> anyhow::Result<()> {
+            let Some(dir) = self.samples_dir(id, "loser") else {
+                anyhow::bail!("非法日志 id: {id}");
+            };
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("{loser}-cut.wav"));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: crate::store::audio::AUDIO_SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let tmp = path.with_extension("wav.tmp");
+            let mut w = hound::WavWriter::create(&tmp, spec)?;
+            for s in samples {
+                w.write_sample(crate::store::audio::f32_to_s16(*s))?;
+            }
+            w.finalize()?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            eprintln!("合并日志兜底截声写入失败({id},不影响合并): {e}");
+        }
     }
 
     /// 把条目的样本副本拷回声纹样本目录(撤销用),返回还原文件数。
@@ -305,6 +349,31 @@ impl MergeJournal {
             for f in rd.flatten() {
                 std::fs::copy(f.path(), vp_samples_dir.join(f.file_name()))?;
                 n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// 只把 loser 侧快照副本拷回声纹样本目录(拆回用;undo 用 restore_samples 双侧)。
+    /// 无常规槽位而有 `<loser>-cut.wav` 兜底截声时,改名拷成 `<loser>.wav`(槽 1)——
+    /// sample_slot_path 不识别 -cut 后缀,原名拷回等于拆回的人"无样本"。
+    pub fn restore_loser_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
+        std::fs::create_dir_all(vp_samples_dir)?;
+        let copies = self.sample_copies(id, "loser");
+        let is_cut = |p: &PathBuf| {
+            p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-cut"))
+        };
+        let mut n = 0usize;
+        for p in copies.iter().filter(|p| !is_cut(p)) {
+            std::fs::copy(p, vp_samples_dir.join(p.file_name().unwrap()))?;
+            n += 1;
+        }
+        if n == 0 {
+            if let Some(cut) = copies.iter().find(|p| is_cut(p)) {
+                let stem = cut.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                let loser = stem.trim_end_matches("-cut");
+                std::fs::copy(cut, vp_samples_dir.join(format!("{loser}.wav")))?;
+                n = 1;
             }
         }
         Ok(n)
@@ -342,6 +411,45 @@ impl MergeJournal {
             eprintln!("自动合并拒绝名单写入失败: {e}");
         }
     }
+
+    // ── 整理条目人工处置(忽略/保留),落盘 ──
+
+    fn dismissed_path(&self) -> PathBuf {
+        self.dir().join("dismissed.json")
+    }
+
+    /// 人工处置过的整理条目键(忽略的建议对/保留的无样本条目/忽略的同名组)。
+    /// 缺失/损坏 → 空。键格式与前端 tidyItemKey 一致,后端只存不解释。
+    pub fn dismissed_items(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dismissed_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// 追加处置键,去重,超过 DISMISSED_CAP 淘汰最旧。best-effort:丢了顶多重启
+    /// 后再展示一次,不影响正确性。
+    pub fn dismiss_item(&self, key: &str) {
+        let mut list = self.dismissed_items();
+        if list.iter().any(|k| k == key) {
+            return;
+        }
+        list.push(key.to_string());
+        if list.len() > DISMISSED_CAP {
+            let drop = list.len() - DISMISSED_CAP;
+            list.drain(0..drop);
+        }
+        let res = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(self.dir())?;
+            let tmp = self.dismissed_path().with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_string_pretty(&list)?)?;
+            std::fs::rename(&tmp, self.dismissed_path())?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            eprintln!("整理条目处置名单写入失败: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +481,21 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, b"RIFFfake-wav").unwrap();
         p
+    }
+
+    /// 建一个空日志(临时根目录 + 实例)。TempDir 需随返回值存活,否则目录被清。
+    fn test_journal() -> (tempfile::TempDir, MergeJournal) {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        (tmp, j)
+    }
+
+    /// 直接在某条目某侧的样本目录里摆一份快照副本文件,跳过 append() 的完整校验
+    /// 流程——只测只读拷贝类方法(如 restore_loser_samples)时够用。
+    fn put_side_file(j: &MergeJournal, id: &str, side: &str, name: &str) {
+        let dir = j.samples_dir(id, side).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"RIFFfake-wav").unwrap();
     }
 
     #[test]
@@ -440,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_by_merge_keeps_samples_permanent_op_deletes_them() {
+    fn invalidate_keeps_sample_copies_regardless_of_cause() {
         let tmp = tempfile::tempdir().unwrap();
         let j = MergeJournal::new(tmp.path().to_path_buf());
         let vpdir = tmp.path().join("voiceprints");
@@ -449,12 +572,13 @@ mod tests {
         j.append(&entry("m-P1", "t1", "P1", "P9"), &[s1], &[]).unwrap();
         j.append(&entry("m-P2", "t2", "P2", "P9"), &[s2], &[]).unwrap();
 
-        // 由另一次合并失效:可复活,样本副本必须保留
+        // 由另一次合并失效(可复活):样本副本保留
         j.invalidate(&["P1"], "相关人物随后又被合并", Some("m-X"));
         assert!(tmp.path().join("merge_journal/m-P1/samples/loser/P1.wav").exists());
-        // 永久性操作失效(by=None):不可复活,样本副本删掉省空间
+        // 永久性失效(by=None,不可复活):样本副本同样保留——回执卡此时唯一能
+        // 核对的就是这份快照,不该删。
         j.invalidate(&["P2"], "此人随后被改名", None);
-        assert!(!tmp.path().join("merge_journal/m-P2/samples").exists());
+        assert!(tmp.path().join("merge_journal/m-P2/samples/loser/P2.wav").exists());
     }
 
     #[test]
@@ -480,9 +604,9 @@ mod tests {
         j.append(&entry("m-P1", "t1", "P1", "P2"), &[ls], &[]).unwrap();
         assert_eq!(j.loser_sample_copies("m-P1").len(), 1);
         assert!(j.loser_sample_copies("../evil").is_empty());
-        // 永久性失效清理样本副本后为空
+        // 永久性失效后样本副本仍保留(唯一可核对的快照)
         j.invalidate(&["P1"], "此人随后被改名", None);
-        assert!(j.loser_sample_copies("m-P1").is_empty());
+        assert_eq!(j.loser_sample_copies("m-P1").len(), 1);
     }
 
     #[test]
@@ -502,6 +626,49 @@ mod tests {
         assert_eq!(copies[0].file_name().unwrap(), "P9.wav", "槽 1 应在最前");
         assert_eq!(copies[1].file_name().unwrap(), "P9-2.wav", "槽 2 应在中间");
         assert_eq!(copies[2].file_name().unwrap(), "P9-10.wav", "槽 10 应在最后");
+    }
+
+    #[test]
+    fn sample_copies_lists_winner_side_in_slot_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        let vpdir = tmp.path().join("voiceprints");
+        let ws1 = fake_sample(&vpdir, "P2.wav");
+        let ws2 = fake_sample(&vpdir, "P2-2.wav");
+        j.append(&entry("m-P1", "t1", "P1", "P2"), &[], &[ws1, ws2]).unwrap();
+
+        let copies = j.sample_copies("m-P1", "winner");
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].file_name().unwrap(), "P2.wav", "槽 1 应在最前");
+        assert_eq!(copies[1].file_name().unwrap(), "P2-2.wav", "槽 2 应在后");
+    }
+
+    #[test]
+    fn write_loser_cut_sample_appears_after_numeric_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        let vpdir = tmp.path().join("voiceprints");
+        let s1 = fake_sample(&vpdir, "P1.wav");
+        let s2 = fake_sample(&vpdir, "P1-2.wav");
+        j.append(&entry("m-P1", "t1", "P1", "P9"), &[s1, s2], &[]).unwrap();
+
+        j.write_loser_cut_sample("m-P1", "P1", &[0.1f32; 100]);
+
+        let copies = j.sample_copies("m-P1", "loser");
+        assert_eq!(copies.len(), 3);
+        assert_eq!(copies[0].file_name().unwrap(), "P1.wav");
+        assert_eq!(copies[1].file_name().unwrap(), "P1-2.wav");
+        assert_eq!(copies[2].file_name().unwrap(), "P1-cut.wav", "截声兜底文件排最后");
+        assert!(copies[2].exists());
+    }
+
+    #[test]
+    fn write_loser_cut_sample_illegal_id_does_not_panic_or_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        j.write_loser_cut_sample("../evil", "P1", &[0.1f32; 10]);
+        assert!(j.sample_copies("../evil", "loser").is_empty());
+        assert!(!tmp.path().join("merge_journal/../evil").exists(), "非法 id 不应落任何文件");
     }
 
     #[test]
@@ -548,6 +715,39 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_items_roundtrip_and_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        assert!(j.dismissed_items().is_empty());
+        j.dismiss_item("s:P1>P2");
+        j.dismiss_item("s:P1>P2");
+        j.dismiss_item("d:张三");
+        assert_eq!(j.dismissed_items(), vec!["s:P1>P2".to_string(), "d:张三".to_string()]);
+    }
+
+    #[test]
+    fn dismissed_items_evicts_oldest_past_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        for i in 0..(DISMISSED_CAP + 1) {
+            j.dismiss_item(&format!("n:P{i}"));
+        }
+        let list = j.dismissed_items();
+        assert_eq!(list.len(), DISMISSED_CAP);
+        assert!(!list.contains(&"n:P0".to_string()), "最旧的被淘汰");
+        assert!(list.contains(&format!("n:P{DISMISSED_CAP}")), "最新的保留");
+    }
+
+    #[test]
+    fn dismissed_items_corrupted_file_reads_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = MergeJournal::new(tmp.path().to_path_buf());
+        std::fs::create_dir_all(j.dir()).unwrap();
+        std::fs::write(j.dismissed_path(), b"not json").unwrap();
+        assert!(j.dismissed_items().is_empty());
+    }
+
+    #[test]
     fn restore_samples_copies_back_both_sides() {
         let tmp = tempfile::tempdir().unwrap();
         let j = MergeJournal::new(tmp.path().to_path_buf());
@@ -561,5 +761,42 @@ mod tests {
         let n = j.restore_samples("m-P1", &vpdir).unwrap();
         assert_eq!(n, 2);
         assert!(ls.exists() && ws.exists());
+    }
+
+    #[test]
+    fn restore_loser_samples_copies_only_loser_side() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "winner", "P9.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1);
+        assert!(out.join("P1.wav").exists());
+        assert!(!out.join("P9.wav").exists(), "winner 侧不许被拷回");
+    }
+
+    #[test]
+    fn restore_loser_samples_promotes_cut_to_slot1_when_no_regular() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P2", "loser", "P2-cut.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P2", &out).unwrap();
+        assert_eq!(n, 1);
+        assert!(out.join("P2.wav").exists(), "仅有兜底截声时拷成槽 1,拆回的人才有样本可听");
+        assert!(!out.join("P2-cut.wav").exists());
+    }
+
+    #[test]
+    fn restore_loser_samples_ignores_cut_when_regular_slot_present() {
+        // 常规槽位与兜底截声并存(常规槽是合并时真实迁移前的样本,截声只是兜底):
+        // 只拷常规槽,截声不进正式库,避免同一人多出一份"降级"样本。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "loser", "P1-cut.wav");
+        let out = dir.path().join("vp");
+        let n = j.restore_loser_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1, "常规槽位存在时只拷常规槽");
+        assert!(out.join("P1.wav").exists());
+        assert!(!out.join("P1-cut.wav").exists(), "截声不该被拷回");
     }
 }
