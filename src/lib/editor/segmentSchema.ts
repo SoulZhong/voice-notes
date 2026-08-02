@@ -2,7 +2,9 @@
 // 结构锁定:任何改变段骨架(段数/顺序/seq/speaker)的事务一律拒绝——增删段与
 // 改说话人只走命令按钮(delete_segment/set_segment_speaker),键盘只能改段内文本。
 import { $nodeSchema, $prose } from "@milkdown/kit/utils";
-import { t } from "$lib/i18n/index.svelte";
+// NodeView 在创建它的 effect 销毁后仍被编辑器调用,必须用不建依赖的 tStatic
+// (普通 t() 会触发 svelte derived_inert 并中断渲染,页面停在加载态)。
+import { tStatic } from "$lib/i18n/index.svelte";
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
 import type { Node as PMNode } from "@milkdown/kit/prose/model";
 import type { EditorView, ViewMutationRecord } from "@milkdown/kit/prose/view";
@@ -80,7 +82,7 @@ export function makeSegmentView(cb: SegmentViewCallbacks) {
     badge.style.background = bg;
     badge.style.color = ink;
     badge.disabled = !cb.canEdit();
-    badge.title = cb.canEdit() ? t("notes.editor.changeSpeaker") : "";
+    badge.title = cb.canEdit() ? tStatic("notes.editor.changeSpeaker") : "";
     badge.onclick = (e) => {
       e.preventDefault();
       if (cb.canEdit())
@@ -95,7 +97,7 @@ export function makeSegmentView(cb: SegmentViewCallbacks) {
     ts.type = "button";
     ts.className = "ts ts-btn";
     ts.contentEditable = "false";
-    ts.title = t("notes.editor.playFromHere");
+    ts.title = tStatic("notes.editor.playFromHere");
     ts.textContent = cb.formatTs(node.attrs.startMs as number);
     ts.onclick = () => cb.onPlayFrom(node.attrs.startMs as number);
     const content = document.createElement("span");
@@ -107,7 +109,7 @@ export function makeSegmentView(cb: SegmentViewCallbacks) {
       const del = document.createElement("button");
       del.type = "button";
       del.className = "link";
-      del.textContent = t("notes.editor.delete");
+      del.textContent = tStatic("notes.editor.delete");
       del.onclick = () => cb.onDeleteClick(node.attrs.seq as number, del.getBoundingClientRect());
       actions.append(del);
     }

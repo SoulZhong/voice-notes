@@ -2,6 +2,7 @@
 // layout 启动初始化都只走这里,不允许出现第二份"切语言"逻辑。
 // 字典按领域分片(dict/*),各分片键带域前缀互不重叠;t() 内读 $state locale,
 // 模板表达式随语言切换自动重渲,无需刷新页面。
+import { untrack } from "svelte";
 import type { Dict, Msg } from "./types";
 import * as common from "./dict/common";
 import * as shell from "./dict/shell";
@@ -65,6 +66,20 @@ class I18n {
 export const i18n = new I18n();
 /** 模板/模块通用简写:t("settings.theme.label")、t("notes.count", { n })。 */
 export const t = (key: string, params?: Record<string, unknown>) => i18n.t(key, params);
+
+/**
+ * 取文案**快照**,不建立响应式依赖。
+ *
+ * 给脱离 Svelte 生命周期的 DOM 回调用——典型是 ProseMirror/Milkdown 的 NodeView:
+ * 它由某个 effect 创建,却在该 effect 销毁后继续存活并被编辑器反复调用。此时普通 t()
+ * 会去读 $state,Svelte 判定"读一个属于已销毁 effect 的 derived",发 derived_inert 警告
+ * **并中断这次渲染**——症状是页面停在加载态、既不报错也不出内容(2026-08-02 实测)。
+ *
+ * 代价:这样取到的文案不会随语言切换自动更新,要等编辑器下次重建。对 NodeView 里的
+ * title/按钮文字可接受;能走模板的地方一律用 t(),别图省事用这个。
+ */
+export const tStatic = (key: string, params?: Record<string, unknown>) =>
+  untrack(() => i18n.t(key, params));
 
 /**
  * 某个键在**全部语言**下的取值(去重,只含静态字符串值)。
