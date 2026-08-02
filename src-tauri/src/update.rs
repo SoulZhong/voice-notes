@@ -35,11 +35,11 @@ pub fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
         .set("User-Agent", "voice-notes")
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| format!("检查更新失败: {e}"))?
+        .map_err(|e| crate::tr!("检查更新失败: {e}", "Failed to check for updates: {e}"))?
         .into_string()
-        .map_err(|e| format!("读取响应失败: {e}"))?;
+        .map_err(|e| crate::tr!("读取响应失败: {e}", "Failed to read the response: {e}"))?;
     let (tag, html_url, notes) =
-        parse_latest(&body).ok_or_else(|| "解析 GitHub 响应失败".to_string())?;
+        parse_latest(&body).ok_or_else(|| crate::tr!("解析 GitHub 响应失败", "Failed to parse the GitHub response"))?;
     let latest = tag.trim_start_matches('v').to_string();
     let has_update = is_newer(&latest, &current);
     Ok(UpdateInfo { current, latest, has_update, url: html_url, notes })

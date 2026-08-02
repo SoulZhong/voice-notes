@@ -65,3 +65,17 @@ class I18n {
 export const i18n = new I18n();
 /** 模板/模块通用简写:t("settings.theme.label")、t("notes.count", { n })。 */
 export const t = (key: string, params?: Record<string, unknown>) => i18n.t(key, params);
+
+/**
+ * 某个键在**全部语言**下的取值(去重,只含静态字符串值)。
+ *
+ * 用途:少数文案会被**写进用户数据**(如「这是我」把人名存成「我」/"Me")。写入用的是
+ * 当时的界面语言,所以之后的判等必须跨语言——否则用户切到英文,就认不出自己在中文
+ * 界面下标记的那条数据,重名/去重一类的拦截会静默失效(同一个人被拆成两条)。
+ */
+export function localeVariants(key: string): string[] {
+  const values = (Object.keys(dicts) as Locale[])
+    .map((l) => dicts[l][key])
+    .filter((v): v is string => typeof v === "string");
+  return [...new Set(values)];
+}

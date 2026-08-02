@@ -291,7 +291,8 @@ export const en = {
   "speakers.deleteSample": "Delete this sample",
   "speakers.playSample": "Play sample",
   "speakers.auditionHint": "Listen to a sample to confirm you've got the right person.",
-  "speakers.auditionHintMulti": "Multiple samples come from merged entries — verify each one.",
+  // 紧跟 auditionHint 之后拼接:英文句间需要空格,中文不需要(故只 en 侧留前导空格)。
+  "speakers.auditionHintMulti": " Multiple samples come from merged entries — verify each one.",
   "speakers.noSamplesYet":
     "No samples yet — one will be added after the next recording that includes this person.",
   "speakers.appearTitle": "Meetings they appeared in",

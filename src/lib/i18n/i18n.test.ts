@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { i18n, resolveLocale, shards, t } from "./index.svelte";
+import { i18n, localeVariants, resolveLocale, shards, t } from "./index.svelte";
 
 describe("i18n 核心", () => {
   it("resolveLocale:显式 zh/en 原样,system 按系统语言,node 无 navigator 回落 en", () => {
@@ -26,6 +26,15 @@ describe("i18n 核心", () => {
 
   it("t:缺键返回 key 本身(界面永远有字可显)", () => {
     expect(t("no.such.key")).toBe("no.such.key");
+  });
+
+  it("localeVariants:给出该键的全部语言写法(写入用户数据的文案要跨语言判等)", () => {
+    const me = localeVariants("notes.speaker.me");
+    expect(me).toContain("我");
+    expect(me).toContain("Me");
+    // 两语言同值时去重;缺键给空数组(调用方 includes 判定自然为 false)。
+    expect(localeVariants("common.none")).toEqual(["—"]);
+    expect(localeVariants("no.such.key")).toEqual([]);
   });
 
   it("字典分片:zh/en 键集一致(漏翻在 CI 现形,不等运行时)", () => {
