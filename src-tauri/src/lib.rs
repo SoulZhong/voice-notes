@@ -3057,33 +3057,45 @@ fn do_merge_person(
 /// 录制中拒绝合并/删除:开录时种子已按当前库结构注入本场 registry,此刻改动库的
 /// 引用关系会让"是谁"混乱——比改名危险得多,故禁止。返回合并日志 id(前端撤销条用)。
 #[tauri::command]
-fn merge_person(
+async fn merge_person(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     loser: String,
     winner: String,
 ) -> Result<String, String> {
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能合并说话人".into());
     }
-    let mut emb = None;
-    let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    queue_person_graph_rebuild(&app, root, "人物合并")?;
-    Ok(journal_id)
+    // 重活(样本超限时现场加载声纹模型+逐份嵌入挑选、loser 无样本时扫笔记截声)
+    // 走 spawn_blocking,别冻主线程——同步命令在 Tauri v2 里跑在主线程,这些秒级
+    // 活会冻结整个 WebView。
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut emb = None;
+        let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        queue_person_graph_rebuild(&app, root, "人物合并")?;
+        Ok(journal_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 录制中拒绝：理由同 merge_person。
 #[tauri::command]
-fn delete_person(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能删除说话人".into());
     }
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    store::VoiceprintStore::new(root.clone())
-        .delete(&id)
-        .map_err(|e| e.to_string())?;
-    queue_person_graph_rebuild(&app, root, "人物删除")
+    // 重活(store 删除+索引重建排队)走 spawn_blocking,别冻主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        store::VoiceprintStore::new(root.clone())
+            .delete(&id)
+            .map_err(|e| e.to_string())?;
+        queue_person_graph_rebuild(&app, root, "人物删除")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ipc::MergeReceipt {
@@ -3114,121 +3126,145 @@ fn receipt_of(journal: &store::MergeJournal, e: &store::MergeJournalEntry) -> ip
 /// 其余留给人工。录制中不动库(建议仍只读算出返回,审阅流此时只读浏览)。单条
 /// 失败不挡整批:该条降级人工,eprintln 留痕。
 #[tauri::command]
-fn apply_confident_merges(
+async fn apply_confident_merges(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<ipc::ConfidentMergeOutcome, String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    let store = store::VoiceprintStore::new(root.clone());
-    let vp = store.load();
-    let sugs = store::suggest_merges(&vp);
-    let to_ipc = |s: &store::MergeSuggestion| ipc::PersonMergeSuggestion {
-        loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
-        winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
-        loser: s.loser.clone(),
-        winner: s.winner.clone(),
-        similarity: s.similarity,
-        source: s.source.clone(),
-        salience: s.salience,
-    };
-    if state.session.lock().unwrap().is_some() {
-        return Ok(ipc::ConfidentMergeOutcome {
-            applied: vec![],
-            remaining: sugs.iter().map(to_ipc).collect(),
-        });
-    }
-    let journal = store::MergeJournal::new(root.clone());
-    let deny = journal.auto_denylist();
-    let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
-    let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
-    let mut applied = Vec::new();
-    let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut emb = None;
-    for s in autos {
-        match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity), &mut emb) {
-            Ok(jid) => {
-                merged.insert(s.loser.clone());
-                match journal.entry(&jid) {
-                    Ok(e) => applied.push(receipt_of(&journal, &e)),
-                    Err(err) => {
-                        eprintln!("自动归并回执读取失败({jid}): {err}");
-                        // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
-                        // (time 空串;list_merge_receipts 仍是真值源)。方法只要 id,
-                        // 条目读不回也能列副本。
-                        applied.push(ipc::MergeReceipt {
-                            journal_id: jid.clone(),
-                            time: String::new(),
-                            origin: "auto".into(),
-                            loser: s.loser.clone(),
-                            loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
-                            winner: s.winner.clone(),
-                            winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
-                            similarity: Some(s.similarity),
-                            loser_sample_paths: journal
-                                .sample_copies(&jid, "loser")
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect(),
-                            winner_sample_paths: journal
-                                .sample_copies(&jid, "winner")
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect(),
-                            invalid_reason: None,
-                        });
+    // 录制中检查须在进 spawn_blocking 前同步做完(State 不能进闭包);结果以 bool
+    // 搬进闭包,闭包内按 live 分支——录制中仍要"只读算建议"，不落库。
+    let live = state.session.lock().unwrap().is_some();
+    // 重活(建议计算+样本超限时现场加载声纹模型逐条嵌入挑选、loser 无样本时扫笔记
+    // 截声)走 spawn_blocking,别冻主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let store = store::VoiceprintStore::new(root.clone());
+        let vp = store.load();
+        let sugs = store::suggest_merges(&vp);
+        let to_ipc = |s: &store::MergeSuggestion| ipc::PersonMergeSuggestion {
+            loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+            winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+            loser: s.loser.clone(),
+            winner: s.winner.clone(),
+            similarity: s.similarity,
+            source: s.source.clone(),
+            salience: s.salience,
+        };
+        if live {
+            return Ok(ipc::ConfidentMergeOutcome {
+                applied: vec![],
+                remaining: sugs.iter().map(to_ipc).collect(),
+            });
+        }
+        let journal = store::MergeJournal::new(root.clone());
+        let deny = journal.auto_denylist();
+        let (autos, manual) = store::confident_picks(&vp, sugs, &deny);
+        let mut remaining: Vec<ipc::PersonMergeSuggestion> = manual.iter().map(to_ipc).collect();
+        let mut applied = Vec::new();
+        let mut merged: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut emb = None;
+        for s in autos {
+            match do_merge_person(&app, &s.loser, &s.winner, "auto", Some(s.similarity), &mut emb) {
+                Ok(jid) => {
+                    merged.insert(s.loser.clone());
+                    match journal.entry(&jid) {
+                        Ok(e) => applied.push(receipt_of(&journal, &e)),
+                        Err(err) => {
+                            eprintln!("自动归并回执读取失败({jid}): {err}");
+                            // 合并已发生,不能从响应里消失:按建议数据合成兜底回执
+                            // (time 空串;list_merge_receipts 仍是真值源)。方法只要 id,
+                            // 条目读不回也能列副本。
+                            applied.push(ipc::MergeReceipt {
+                                journal_id: jid.clone(),
+                                time: String::new(),
+                                origin: "auto".into(),
+                                loser: s.loser.clone(),
+                                loser_name: vp.people.get(&s.loser).map(|p| p.name.clone()).unwrap_or_default(),
+                                winner: s.winner.clone(),
+                                winner_name: vp.people.get(&s.winner).map(|p| p.name.clone()).unwrap_or_default(),
+                                similarity: Some(s.similarity),
+                                loser_sample_paths: journal
+                                    .sample_copies(&jid, "loser")
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .collect(),
+                                winner_sample_paths: journal
+                                    .sample_copies(&jid, "winner")
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .collect(),
+                                invalid_reason: None,
+                            });
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
-                remaining.push(to_ipc(&s));
+                Err(err) => {
+                    eprintln!("自动归并失败({}->{}),留给人工: {err}", s.loser, s.winner);
+                    remaining.push(to_ipc(&s));
+                }
             }
         }
-    }
-    // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
-    remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
-    if !applied.is_empty() {
-        queue_person_graph_rebuild(&app, root, "自动归并")?;
-    }
-    Ok(ipc::ConfidentMergeOutcome { applied, remaining })
+        // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
+        remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
+        if !applied.is_empty() {
+            queue_person_graph_rebuild(&app, root, "自动归并")?;
+        }
+        Ok(ipc::ConfidentMergeOutcome { applied, remaining })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 撤销一次合并(按日志条目)。录制中拒绝:理由同 merge_person。
 #[tauri::command]
-fn undo_merge(app: AppHandle, state: State<AppState>, journal_id: String) -> Result<(), String> {
+async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能撤销合并".into());
     }
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    store::VoiceprintStore::new(root.clone())
-        .undo_merge(&journal_id)
-        .map_err(|e| e.to_string())?;
-    queue_person_graph_rebuild(&app, root, "撤销合并")
+    // 重活(store 改写+样本副本清理+索引重建排队)走 spawn_blocking,别冻主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        store::VoiceprintStore::new(root.clone())
+            .undo_merge(&journal_id)
+            .map_err(|e| e.to_string())?;
+        queue_person_graph_rebuild(&app, root, "撤销合并")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 失效回执「拆回独立说话人」:按快照重建被并入方。录制中拒绝:理由同 merge_person。
 #[tauri::command]
-fn restore_merged_person(
+async fn restore_merged_person(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     journal_id: String,
 ) -> Result<String, String> {
     if state.session.lock().unwrap().is_some() {
         return Err("录制中不能拆回说话人".into());
     }
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    let pid = store::VoiceprintStore::new(root.clone())
-        .restore_merged_person(&journal_id)
-        .map_err(|e| e.to_string())?;
-    queue_person_graph_rebuild(&app, root, "拆回说话人")?;
-    Ok(pid)
+    // 重活(按快照重建+文件拷贝+索引重建排队)走 spawn_blocking,别冻主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let pid = store::VoiceprintStore::new(root.clone())
+            .restore_merged_person(&journal_id)
+            .map_err(|e| e.to_string())?;
+        queue_person_graph_rebuild(&app, root, "拆回说话人")?;
+        Ok(pid)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 回执卡「好」:确认自动归并,条目(连同样本副本)删除。
 #[tauri::command]
-fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
-    let root = data_root(&app).map_err(|e| e.to_string())?;
-    store::MergeJournal::new(root).acknowledge(&journal_id).map_err(|e| e.to_string())
+async fn acknowledge_merge(app: AppHandle, journal_id: String) -> Result<(), String> {
+    // 重活(样本副本文件删除)走 spawn_blocking,别冻主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        store::MergeJournal::new(root).acknowledge(&journal_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 未确认的合并回执(审阅流回执卡数据;含已失效的——卡上撤销钮变灰注明原因)。
