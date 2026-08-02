@@ -296,12 +296,19 @@ impl SpeakerRegistry {
                         let same_channel = seed_src == source;
                         let seed_eligible = num_samples >= SEED_MIN_SAMPLES;
                         let fast_hit = same_channel && sim >= SEED_ASSIGN_THRESHOLD;
-                        let z_hit = c.person.as_deref().is_some_and(|p| {
-                            matches!(
-                                seed_z(sim, &person_max, p, c.seed_cohort),
-                                Some(z) if z >= SEED_ASSIGN_Z
-                            ) && sim >= SEED_ASSIGN_RAW_FLOOR
-                        });
+                        // 惰性化:cohort_stats/seed_z 各带一次 Vec 分配,只在真正可能
+                        // 走到 z 通道时才算——快路已命中(fast_hit)或压根不够资格
+                        // (!seed_eligible)或裸分够不着地板时,z 值本就无关判定结果,
+                        // 白算一次不改变行为(z_hit 原本就 AND 着这三个条件)。
+                        let z_hit = seed_eligible
+                            && !fast_hit
+                            && sim >= SEED_ASSIGN_RAW_FLOOR
+                            && c.person.as_deref().is_some_and(|p| {
+                                matches!(
+                                    seed_z(sim, &person_max, p, c.seed_cohort),
+                                    Some(z) if z >= SEED_ASSIGN_Z
+                                )
+                            });
                         seed_eligible && (fast_hit || z_hit)
                     }
                     // 续录恢复簇信道未知,维持原语义,待快照带信道后收紧:裸
@@ -1614,6 +1621,88 @@ mod tests {
             info.person.as_deref(),
             Some("P1"),
             "恢复簇应维持旧行为:裸分达标即命中,不受短段/信道新门槛约束"
+        );
+    }
+
+    /// T2 审查必修项:锁死对称 z 公式的**形态**,而非只锁"能不能走通 z 通道"。
+    /// 既有的 `cross_channel_high_z_accepted` 用正交基构造 cohort,方差为 0 被
+    /// σ 下限(1e-3)夹住,z 算出几百量级——za-only/zb-only/漏 ÷2 三种错误实现
+    /// 换上去照样命中,毫无判别力。
+    ///
+    /// 本测试构造双侧**真实方差**(σa=0.1/0.15、σb=0.1,远离 1e-3 下限),让
+    /// za、zb 刻意不对称(相差 2.6),对称 z 精确落在 3.0 边界两侧:
+    /// - 命中用例:za=1.8、zb=4.4 → 对称 z=3.1(≥3,命中)。
+    ///   若变异成 za-only,z 就是 1.8(<3)→ 误判不命中。
+    /// - 镜像用例(zb 不变,只调低 za):za=1.4、zb=4.4 → 对称 z=2.9(<3,不命中)。
+    ///   若变异成 zb-only,z 就是 4.4(≥3)→ 误判命中;
+    ///   若漏掉 ÷2,z 就是 za+zb=5.8(≥3)→ 同样误判命中。
+    ///
+    /// 几何构造(python 预演,见 PR 描述/task-2-report.md):5 维正交基,
+    /// C(候选 P4,system)=e1;P1/P2/P3(mic,陪衬)分别是 e1 与 e2/e3/e4 的混合,
+    /// 对 C 的种子侧余弦固定在 0.10/0.20/0.30(→ μb=0.2,σb=0.1,与信道无关,
+    /// 两个探针共用);探针在 e1 分量固定 0.64(= sim),e2/e3/e4 分量各自反解
+    /// 使 dot(Pi,探针) 落在预设的扫描侧分数上,e5 分量归一化兜底。
+    ///
+    /// 自证(变异测试):临时把 `seed_z` 改成 `Some(za)`(za-only),重跑本测试,
+    /// 命中用例的 `assert_eq!` 从绿转红(实测输出与证据见 task-2-report.md),
+    /// 证明本测试确能捕获该类回归;验证后已改回对称式。
+    #[test]
+    fn symmetric_z_formula_rejects_single_sided_or_undivided_variants() {
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into() },
+            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into() },
+            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "system".into() },
+        ];
+
+        // 命中用例:za=1.8、zb=4.4,对称 z=3.1≥3。
+        let mut r_hit = SpeakerRegistry::with_seeds(&[], &seeds);
+        let probe_hit = vec![0.64, 0.297_491_2, 0.338_846_1, 0.385_768_8, 0.488_123_7];
+        let id = r_hit.assign(&probe_hit, "mic", LONG).unwrap();
+        let info = r_hit.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            info.person.as_deref(),
+            Some("P4"),
+            "za=1.8、zb=4.4,对称 z=3.1≥3 应命中(za-only 变异会把 z 算成 1.8,误判不命中)"
+        );
+
+        // 镜像用例:zb 不变(4.4),只把 za 调到 1.4 → 对称 z=2.9<3,不应命中。
+        let mut r_miss = SpeakerRegistry::with_seeds(&[], &seeds);
+        let probe_miss = vec![0.64, 0.217_088_2, 0.308_227_5, 0.406_734_5, 0.531_822_9];
+        let id2 = r_miss.assign(&probe_miss, "mic", LONG).unwrap();
+        let info2 = r_miss.speakers().into_iter().find(|s| s.id == id2).unwrap();
+        assert_eq!(
+            info2.person, None,
+            "za=1.4、zb=4.4,对称 z=2.9<3 不应命中(zb-only 会把 z 算成 4.4,漏÷2 会把 z 算成 5.8,均误判命中)"
+        );
+    }
+
+    /// T2 审查顺手项①:z 通道未按信道区分,同信道裸分卡在
+    /// [SEED_ASSIGN_RAW_FLOOR, SEED_ASSIGN_THRESHOLD) 死区(够不着快路 0.68)时,
+    /// z 通道依旧可依统计显著性放行——这是有意的**召回增益**设计(本应命中的
+    /// 同信道段不因裸分差一点点而落空),不是收紧。锁死增益方向:若未来有人
+    /// 误给 z 通道加上"仅跨信道生效"的限制,本测试会变红,提示这是行为变更
+    /// 而非无害重构。复用上一测试(命中用例)的同一套向量,仅把候选人物 P4 的
+    /// 种子信道与探针信道都改成 "mic"(同信道)。
+    #[test]
+    fn same_channel_z_channel_widens_recall_not_tightens() {
+        let seeds = vec![
+            SeedCluster { person: "P1".into(), name: "一".into(), centroid: vec![0.10, 0.994_987_5, 0.0, 0.0, 0.0], count: 10, source: "mic".into() },
+            SeedCluster { person: "P2".into(), name: "二".into(), centroid: vec![0.20, 0.0, 0.979_795_9, 0.0, 0.0], count: 10, source: "mic".into() },
+            SeedCluster { person: "P3".into(), name: "三".into(), centroid: vec![0.30, 0.0, 0.0, 0.953_939_2, 0.0], count: 10, source: "mic".into() },
+            // 候选人物、陪衬人物、探针全部同信道("mic")——若 z 通道只对跨信道
+            // 开放,这里应因裸分 0.64<0.68(快路够不着)而落空;实测未按信道
+            // 区分,z=3.1≥3 依旧命中。
+            SeedCluster { person: "P4".into(), name: "四".into(), centroid: vec![1.0, 0.0, 0.0, 0.0, 0.0], count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let probe = vec![0.64, 0.297_491_2, 0.338_846_1, 0.385_768_8, 0.488_123_7]; // sim=0.64 ∈ [0.50,0.68)
+        let id = r.assign(&probe, "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            info.person.as_deref(),
+            Some("P4"),
+            "同信道裸分 0.64 ∈ [0.50,0.68) 死区但 z=3.1≥3,z 通道对同信道同样开放(召回增益)应命中"
         );
     }
 }
