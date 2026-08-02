@@ -10,12 +10,15 @@ const fs = runtime.process.getBuiltinModule("fs");
 const read = (path: string) => fs.readFileSync(`${runtime.process.cwd()}/${path}`, "utf8");
 
 describe("Windows release documentation", () => {
-  it("documents the official v0.5.0 Windows artifacts in both READMEs", () => {
+  it("documents the current official Windows installer in both READMEs", () => {
+    const { version } = JSON.parse(read("package.json")) as { version: string };
+
     for (const path of ["README.md", "README.en.md"]) {
       const readme = read(path);
-      expect(readme, path).toContain("voice-notes_0.5.0_x64-setup.exe");
-      expect(readme, path).toContain("voice-notes_0.5.0_x64_en-US.msi");
-      expect(readme, path).toContain("SHA256SUMS-windows.txt");
+      expect(readme, path).toContain(`voice-notes_${version}_x64-setup.exe`);
+      expect(readme, path).toContain(`/releases/tag/v${version}`);
+      expect(readme, path).not.toContain("_x64_en-US.msi");
+      expect(readme, path).not.toContain("SHA256SUMS-windows.txt");
     }
   });
 

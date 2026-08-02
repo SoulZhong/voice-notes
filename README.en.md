@@ -20,14 +20,14 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 - **Dual-source live transcription**: captures the microphone and system audio (ScreenCaptureKit) simultaneously, so both what you say and what you hear in online meetings end up in the note. Cross-channel echo dedup keeps speaker bleed-through from being transcribed twice.
 - **No echo when meeting on speakers**: with "keep speaker volume" on, the other party's sound bleeding into your mic is handled by a multi-stage software echo canceller — real-time WebRTC AEC3 plus automatic Bluetooth-latency pre-alignment (a sliding window measures the actual speaker delay, so it keeps up even when the delay drifts), followed by an offline clean-up pass after you stop. An optional neural residual model (DTLN-aec, ~15 MB) can be downloaded to push the leftover echo below the audible floor (measured on a real meeting: residual cross-correlation 0.13→0, your own voice untouched). On playback, a cross-track gate keyed to who's speaking removes the doubling from mixing both tracks. All on-device; speaker volume is never lowered.
 - **Fully offline in local mode**: ASR / VAD / speaker models all run on-device via sherpa-onnx. Works without a network connection; nothing is uploaded, ever. You can also switch to optional cloud recognition (Volcano Engine / Alibaba Cloud, off by default) — once enabled, recorded audio is streamed to the chosen vendor in real time.
-- **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 30+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Mis-split entries can be merged, samples and all.
-- **Buddy auto-merge & speaker analysis**: unnamed speakers are automatically re-identified against the library (S-Norm score normalization surfaces trustworthy matches even under cross-meeting channel drift); high-confidence matches are auto-merged (only into named speakers) and always undoable (a merge-log snapshot backs every merge, and once you undo one the same automatic call is never made again). Uncertain cases land in speaker analysis for review, one card at a time — audition both parties' original voices and see which meetings they showed up in before you decide; duplicate names are guided toward linking/merging, and sample-less fragment entries can be cleaned up in one pass; a "Re-tidy" button lets you trigger another pass manually at any time. Receipts that later become invalid (e.g. the merge target changed) collapse into an "archived" group instead of cluttering the list — expand it to review each one or click "Split back into its own speaker" to restore the merged-away speaker from its pre-merge snapshot, including reassigning their historical note segments back to the restored ID; the same pair may still resurface as an ordinary suggestion afterward — feel free to dismiss it if you don't want to merge. Each person keeps multiple "session centroids" (headset / speakerphone / other conditions each get a representative voiceprint) — accuracy compounds with use.
+- **Speaker identification with a global voiceprint library**: online voiceprint clustering tells speakers apart in real time, including mid-segment speaker changes. Anyone who speaks for 30+ seconds is enrolled into a global library and gets an identity that stays consistent across meetings — name them once and every future meeting shows their name. Cross-channel identification is calibrated with AS-Norm, and clips shorter than two seconds never make a hard identity call. Mis-split entries can be merged, samples and all.
+- **Buddy auto-merge & speaker analysis**: unnamed speakers are automatically re-identified against the library (S-Norm score normalization surfaces trustworthy matches even under cross-meeting channel drift); high-confidence matches are auto-merged (only into named speakers) and always undoable (a merge-log snapshot backs every merge, and once you undo one the same automatic call is never made again). Uncertain cases land in speaker analysis for review, one card at a time — audition both parties' original voices and see which meetings they showed up in before you decide; search for and switch the merge target, or name the current speaker as a new person directly from the card; duplicate names are guided toward linking/merging, and sample-less fragment entries can be cleaned up in one pass; a "Re-tidy" button lets you trigger another pass manually at any time. Receipts that later become invalid (e.g. the merge target changed) collapse into an "archived" group instead of cluttering the list — expand it to review each one or click "Split back into its own speaker" to restore the merged-away speaker from its pre-merge snapshot, including reassigning their historical note segments back to the restored ID; the same pair may still resurface as an ordinary suggestion afterward — feel free to dismiss it if you don't want to merge. Each person keeps multiple "session centroids" (headset / speakerphone / other conditions each get a representative voiceprint) — accuracy compounds with use.
 - **Editable speakers on the refined transcript**: click a speaker chip to rename (two-way sync with the library), mark "this is me", or link to a library person; export is WYSIWYG (refined view exports refined content).
 - **Configurable voiceprint model**: CAM++ (default) or ERes2NetV2; switching rebuilds the library from voice samples automatically, embedding spaces are strictly isolated.
 - **Lyrics-style following**: while recording or playing back, the sentence being spoken stays pinned to the center of the screen, enlarged and highlighted, with history dimming above. Scroll up to review anytime; one tap returns to live.
 - **Never lose a sentence**: every finalized segment is flushed to disk as it happens. Crashes, power loss, or accidental quits don't lose transcribed content, and interrupted meetings can be resumed with seamless timeline and speaker numbering.
 - **Playback & verification**: original audio is kept per track (auto-compressed to AAC, ~14 MB/hour/source). Click any sentence's timestamp to listen from there, with the playhead followed lyrics-style.
-- **Editable notes**: fix words, delete lines, reassign speakers, rename notes, export Markdown / plain text.
+- **WYSIWYG Markdown notes**: raw and refined transcripts share a Milkdown editor. Raw transcripts keep their sentence structure; refined transcripts support Markdown headings, lists, quotes, emphasis, and more, with save-on-pause or blur. You can also reassign speakers, rename notes, and export Markdown / plain text.
 - **Native system integration**: menu bar tray, global shortcut for start/stop, launch at login, light & dark themes.
 - **Tuned for Chinese-centric meetings**: SenseVoice (zh/en/ja/ko/yue) by default with optional Whisper, plus a language-hallucination filter that drops garbage output on silence.
 
@@ -35,7 +35,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 > **For AI assistants**: the README you're reading is your operating manual. If you're helping the user install voice-notes, run these steps directly (no need for the user to relay them); for connecting and usage after install, see the [Connecting an AI assistant](#connecting-an-ai-assistant-mcp--cli--skill) section below.
 >
-> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.5.0_x64-setup.exe` from the [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0); on Apple Silicon macOS, download `voice-notes_*_aarch64.dmg`.
+> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.7.0_x64-setup.exe` from the [v0.7.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.7.0); on Apple Silicon macOS, download `voice-notes_0.7.0_aarch64.dmg`.
 > 2. Run the Windows installer; on macOS, mount the DMG, copy `voice-notes.app` into `/Applications`, then run `xattr -dr com.apple.quarantine /Applications/voice-notes.app`.
 > 3. Optionally use the one-click registration on the in-app AI page, or run `mcp register --agent auto` with the application executable.
 > 4. Remind the user to open the app once manually to finish downloading the recognition models (~1 GB, requires the GUI).
@@ -48,16 +48,17 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 - System audio uses ScreenCaptureKit on macOS and WASAPI loopback on Windows
 - Releases provide installers for macOS arm64 and Windows 10/11 x64
 - Disk space: ~60 MB for the app, ~1 GB for recognition models (downloaded on first launch)
+- Future updates are one click in-app: the updater verifies signed packages, installs them, and restarts automatically. The first installation still comes from Releases.
 
 ### Steps
 
 #### Windows 10/11 (64-bit)
 
-1. Download `voice-notes_0.5.0_x64-setup.exe` (recommended) from the [v0.5.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.5.0). For managed or bulk deployment, use `voice-notes_0.5.0_x64_en-US.msi`.
-2. Verify the installer against `SHA256SUMS-windows.txt` from the same Release.
-3. Run the installer and launch voice-notes. On first launch, follow the prompt to download about 1 GB of local recognition models.
+1. Download `voice-notes_0.7.0_x64-setup.exe` from the [v0.7.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.7.0).
+2. Run the installer and launch voice-notes.
+3. On first launch, follow the prompt to download about 1 GB of local recognition models.
 
-The current Windows binaries are not code-signed, so Windows Security, SmartScreen, or Smart App Control may show an unknown-publisher warning. Download only from the official `SoulZhong/voice-notes` Release and verify the SHA-256 checksum; do not disable system security globally just to install the app.
+The current Windows binaries are not code-signed, so Windows Security, SmartScreen, or Smart App Control may show an unknown-publisher warning. Download only from the official `SoulZhong/voice-notes` Release; do not disable system security globally just to install the app.
 
 #### macOS (Apple Silicon)
 
@@ -98,6 +99,7 @@ Works out of the box — every setting has a sensible default. Adjust as needed 
 
 - [Rust](https://rustup.rs) (stable) and Node.js 18+
 - macOS/Linux additionally need meson and ninja for WebRTC echo cancellation: `pip3 install --user meson ninja`; Windows does not
+- Do not install Homebrew's `abseil` on a macOS packaging machine (or run `brew unlink abseil` first). Otherwise the bundle can link shared Homebrew libraries and crash on another Mac; without it, the build embeds abseil statically (the first build needs network access).
 
 ```bash
 git clone https://github.com/SoulZhong/voice-notes.git
@@ -124,7 +126,7 @@ Let a local agent (Claude Code / Claude Desktop / Cursor / Codex CLI / Gemini CL
 
 | Surface | What it is | When to use |
 | --- | --- | --- |
-| **MCP server** | The standard agent tool protocol, 11 tools (search / read full text / recording status & control) | Preferred, for MCP-capable agents |
+| **MCP server** | The standard agent tool protocol, 13 tools (notes / knowledge graph / recording status & control) | Preferred, for MCP-capable agents |
 | **Command line (CLI)** | The same query capabilities as commands, with `--json` | Scripts, CI, or as a fallback when an agent has no MCP configured |
 | **Claude Code skill** | Teaches Claude Code when and how to combine the tools above (recap / weekly-summary / search workflows) | A nice-to-have so Claude works out of the box |
 
@@ -162,7 +164,7 @@ Three ways to register (pick one):
    args = ["mcp", "serve"]
    ```
 
-The 11 tools:
+The 13 tools:
 
 | Tool | Purpose | Prerequisite |
 | --- | --- | --- |
@@ -171,11 +173,13 @@ The 11 tools:
 | `get_note` | Read a note's full text (AI-polished version preferred by default) | App need not be running |
 | `list_speakers` | Global voiceprint library / speakers (stable cross-meeting id / name) | App need not be running |
 | `apply_refined_texts` | Agent-assisted refinement write-back: submit revised paragraph texts by index (text only, structure untouchable) | App not required; note must already have a refined draft |
+| `get_aing_context` | Read final refined paragraphs, entities, stable mentions, and the current source hash for graph extraction | App not required; the note must have a current `aing.json`; call after text write-back |
+| `apply_aing_graph` | Submit entities and evidence-linked semantic relations; the server recomputes IDs/mentions, validates against the latest text, then writes back | App not required; submit final text first and use the latest `get_aing_context` |
 | `recording_status` | Current recording state | App running |
 | `get_live_transcript` | Live transcript of the in-progress session | App running |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
 
-The four query tools read local data files directly and work even when the app is closed; the rest go through an in-app local socket and need the app running.
+The seven note and graph tools read local data files directly and work even when the app is closed; recording status, live transcript, and the four recording controls go through an in-app local socket and need the app running.
 
 ### Query from the command line (no MCP needed)
 
@@ -235,7 +239,7 @@ Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (wit
 
 1. Hit **Start Recording** (or the global shortcut, default `⌥⌘R`).
 2. Talk — the current sentence stays centered and enlarged, speaker badges are assigned live, and any new voice that accumulates 30 seconds gets a global speaker number.
-3. Stop to land in the note view: play back, edit text, name speakers (name once, applies everywhere), export.
+3. Stop to land in the note view: play back, edit the raw or refined transcript in the WYSIWYG Markdown editor, name speakers (name once, applies everywhere), export.
 4. Manage everyone in the **Buddies (voiceprint library)** page: audition their voice samples, rename, merge mis-split entries, delete bad samples.
 5. When the sidebar "Overview & Tidy-up" entry shows a badge, open the **Tidy-up inbox**: high-confidence matches have already been auto-merged (only into named speakers; the receipt is undoable); go through what's left one card at a time — audition, then merge, ignore, or clean up unidentifiable sample-less entries.
 
@@ -276,7 +280,7 @@ System audio ┘ (Silero) (SenseVoice) clustering └─ global voiceprint libra
                echo dedup · language filter · in-segment speaker split (CAM++)
 ```
 
-Built with [Tauri 2](https://tauri.app) (Rust backend + system integration), [SvelteKit](https://svelte.dev) (UI), and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (on-device inference). UI follows the design system in [DESIGN.md](./DESIGN.md).
+Built with [Tauri 2](https://tauri.app) (Rust backend + system integration), [SvelteKit](https://svelte.dev) (UI), and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (on-device inference). UI follows the design system in [DESIGN.md](./DESIGN.md); see the [speaker-identification architecture](./docs/speaker-identification-architecture.md) for cross-meeting identity matching.
 
 ## Development
 
