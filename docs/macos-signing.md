@@ -59,14 +59,21 @@ xcrun notarytool store-credentials voice-notes-notary \
 ### 每次发布
 
 ```bash
-npm run tauri build                       # 产出已签名的 .app / .dmg
+npm run tauri build            # 产出已签名的 .app / .dmg
+./scripts/notarize_macos.sh    # 提交公证 → staple → 验证,一条龙
+```
+
+脚本做的三件事:`notarytool submit --wait` 提交并等结果、`stapler staple` 把票据钉进包
+(分发前必做,否则用户断网时仍会被拦)、`spctl` 验证。期望最后看到
+`accepted / source=Notarized Developer ID`。
+
+手工执行等价于:
+
+```bash
 DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)
-
 xcrun notarytool submit "$DMG" --keychain-profile voice-notes-notary --wait
-xcrun stapler staple "$DMG"               # 把公证票据钉进包里(离线也能通过校验)
-
+xcrun stapler staple "$DMG"
 spctl -a -vv -t open --context context:primary-signature "$DMG"
-# 期望:accepted / source=Notarized Developer ID
 ```
 
 公证通常几分钟内完成。若被拒,用返回的 submission id 查原因:
@@ -77,6 +84,8 @@ xcrun notarytool log <submission-id> --keychain-profile voice-notes-notary
 
 常见拒因是 Hardened Runtime 未开或嵌套二进制未签名——本项目的
 `Entitlements.plist` 与 Tauri 的签名流程已覆盖这两点。
+
+已实测:v0.7.0 的 DMG 于 2026-08-03 公证通过(status: Accepted),staple 与 spctl 均放行。
 
 ## CI 发布(尚未接入)
 
