@@ -220,7 +220,7 @@ fn validate_under_notes(app: &AppHandle, path: &Path) -> Result<PathBuf, String>
     let notes_canon = std::fs::canonicalize(&notes).map_err(|e| e.to_string())?;
     let canon = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     if !canon.starts_with(&notes_canon) {
-        return Err("路径越界".into());
+        return Err(crate::tr!("路径越界", "Path is outside the allowed directory"));
     }
     Ok(canon)
 }
@@ -261,8 +261,8 @@ pub async fn player_load(
                     crate::store::transcode::decode_m4a_to_standard_wav(&src2, &cache2)
                 })
                 .await
-                .map_err(|e| format!("解码任务失败: {e}"))?
-                .map_err(|e| format!("解码 m4a 失败: {e}"))?;
+                .map_err(|e| crate::tr!("解码任务失败: {e}", "Decode task failed: {e}"))?
+                .map_err(|e| crate::tr!("解码 m4a 失败: {e}", "Failed to decode m4a: {e}"))?;
             }
             cache
         } else {
@@ -295,7 +295,7 @@ pub async fn player_load(
     // mmap 装载 + Core 组装。
     let mut loaded = Vec::new();
     for (wav, offset_ms, source) in plan {
-        let f = std::fs::File::open(&wav).map_err(|e| format!("打开音轨失败: {e}"))?;
+        let f = std::fs::File::open(&wav).map_err(|e| crate::tr!("打开音轨失败: {e}", "Failed to open the audio track: {e}"))?;
         let len = f.metadata().map_err(|e| e.to_string())?.len();
         if len <= HEADER_LEN {
             continue; // 空轨容忍:枚举端一般已滤,这里兜底
@@ -307,7 +307,7 @@ pub async fn player_load(
         // len_samples 在映射时按实际文件长度封顶,读取永不越过映射长度。
         // 警示:若以后 repair_wav_header 截掉超过亚页的长度,或引入任何"原地截断"写入器,
         // 这里会变成真 SIGBUS——届时必须改为 copy-read 或文件锁。
-        let mmap = unsafe { Mmap::map(&f) }.map_err(|e| format!("mmap 失败: {e}"))?;
+        let mmap = unsafe { Mmap::map(&f) }.map_err(|e| crate::tr!("mmap 失败: {e}", "mmap failed: {e}"))?;
         loaded.push(Track {
             data: TrackBytes::Mmap(mmap),
             offset_samples: offset_ms * SRC_RATE as u64 / 1000,
@@ -318,7 +318,7 @@ pub async fn player_load(
         });
     }
     if loaded.is_empty() {
-        return Err("没有可播放的音轨".into());
+        return Err(crate::tr!("没有可播放的音轨", "No playable audio track"));
     }
     let total_samples = loaded.iter().map(|t| t.offset_samples + t.len_samples).max().unwrap_or(0);
     let core = Arc::new(Core {
@@ -346,10 +346,14 @@ fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core
         let opened = (|| -> Result<(cpal::Stream, f64), String> {
             let device = cpal::default_host()
                 .default_output_device()
-                .ok_or_else(|| "找不到输出设备".to_string())?;
+                .ok_or_else(|| crate::tr!("找不到输出设备", "No audio output device found"))?;
             let supported = device.default_output_config().map_err(|e| e.to_string())?;
             if supported.sample_format() != cpal::SampleFormat::F32 {
-                return Err(format!("输出格式不支持: {}(仅支持 f32)", supported.sample_format()));
+                return Err(crate::tr!(
+                    "输出格式不支持: {}(仅支持 f32)",
+                    "Unsupported output format: {} (only f32 is supported)",
+                    supported.sample_format()
+                ));
             }
             let config: cpal::StreamConfig = supported.into();
             let channels = config.channels as usize;
@@ -388,7 +392,7 @@ fn start_stream(app: &AppHandle, state: &State<'_, PlayerHandle>, core: Arc<Core
     });
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
-        .map_err(|_| "输出流启动超时".to_string())??;
+        .map_err(|_| crate::tr!("输出流启动超时", "Timed out starting the output stream"))??;
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
     Ok(())
 }
@@ -401,7 +405,7 @@ fn stop_stream(state: &State<'_, PlayerHandle>) {
 #[tauri::command]
 pub fn player_play(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<(), String> {
     let g = state.core.lock().unwrap();
-    let core = g.as_ref().ok_or("尚未装载音轨")?;
+    let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
     // 播完再按:从头来(与旧前端播放器语义一致)。
     if core.cursor() >= core.total_samples as f64 {
         core.set_cursor(0.0);
@@ -414,7 +418,7 @@ pub fn player_play(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<(),
 #[tauri::command]
 pub fn player_pause(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<(), String> {
     let g = state.core.lock().unwrap();
-    let core = g.as_ref().ok_or("尚未装载音轨")?;
+    let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
     core.playing.store(false, Ordering::Relaxed);
     emit_pos(&app, core);
     Ok(())
@@ -423,7 +427,7 @@ pub fn player_pause(app: AppHandle, state: State<'_, PlayerHandle>) -> Result<()
 #[tauri::command]
 pub fn player_seek(app: AppHandle, state: State<'_, PlayerHandle>, ms: u64) -> Result<(), String> {
     let g = state.core.lock().unwrap();
-    let core = g.as_ref().ok_or("尚未装载音轨")?;
+    let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
     let target = (ms as f64 / 1000.0 * SRC_RATE).min(core.total_samples as f64);
     core.set_cursor(target);
     emit_pos(&app, core);
@@ -433,7 +437,7 @@ pub fn player_seek(app: AppHandle, state: State<'_, PlayerHandle>, ms: u64) -> R
 #[tauri::command]
 pub fn player_set_muted(state: State<'_, PlayerHandle>, source: String, muted: bool) -> Result<(), String> {
     let g = state.core.lock().unwrap();
-    let core = g.as_ref().ok_or("尚未装载音轨")?;
+    let core = g.as_ref().ok_or_else(|| crate::tr!("尚未装载音轨", "No audio track loaded"))?;
     for t in &core.tracks {
         if t.source == source {
             t.muted.store(muted, Ordering::Relaxed);

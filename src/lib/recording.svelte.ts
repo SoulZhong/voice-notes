@@ -214,7 +214,7 @@ export const recording = {
       return true;
     } catch (err) {
       // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
-      if (String(err).includes("已在录制")) {
+      if (String(err).includes("已在录制")) { // i18n-exempt: 与后端错误原文判等,翻译会破坏竞态对账
         const s = await invoke<StatusEvent>("recording_status");
         if (s.state === "recording" || s.state === "paused") {
           status = s.state;
@@ -258,7 +258,7 @@ export const recording = {
         speakers = {};
         noteId = ""; // 回滚预灌注（下方"已在录制"对账分支会用真实 noteId 覆盖）
         // "已在录制" = 竞态重复点击，不是错误：以后端真实状态为准，不污染 status。
-        if (String(err).includes("已在录制")) {
+        if (String(err).includes("已在录制")) { // i18n-exempt: 与后端错误原文判等,翻译会破坏竞态对账
           const s = await invoke<StatusEvent>("recording_status");
           if (s.state === "recording" || s.state === "paused") {
             status = s.state;

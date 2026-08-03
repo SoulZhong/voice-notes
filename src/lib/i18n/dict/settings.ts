@@ -1,0 +1,328 @@
+import type { Dict, Msg } from "../types";
+
+// settings 领域文案分片。键一律以 "settings." 前缀命名,分片之间不得重键(有测试哨兵)。
+// 覆盖:设置页(src/routes/settings/+page.svelte)与一键更新(src/lib/update.ts)的用户可见文案。
+export const zh = {
+  // —— 页面头 ——
+  "settings.title": "设置",
+  "settings.desc.local": "所有录音与识别都在本机完成，不上传任何音频。",
+  "settings.desc.cloud": "录音仍保存在本机；识别时音频会发送到当前选择的云服务商。",
+  "settings.loadSettingsFailed": "读取设置失败: {e}",
+  "settings.cancel": "取消",
+
+  // —— 通用 ——
+  "settings.section.general": "通用",
+  "settings.theme.label": "外观",
+  "settings.theme.light": "亮色",
+  "settings.theme.dark": "暗色",
+  "settings.theme.system": "跟随系统",
+  "settings.theme.switchFailed": "切换主题失败: {e}",
+  "settings.shortcut.label": "全局快捷键",
+  "settings.shortcut.desc": "在任意应用中按组合键开始 / 停止录制",
+  "settings.shortcut.placeholder": "按下组合键…",
+  "settings.shortcut.enableAria": "启用全局快捷键",
+  "settings.shortcut.saveFailed": "快捷键设置失败: {e}",
+  "settings.autostart.label": "开机自动启动",
+  "settings.autostart.saveFailed": "开机自启设置失败: {e}",
+  "settings.tray.label": "菜单栏常驻",
+  "settings.tray.desc": "关闭窗口只隐藏到菜单栏,录制不中断",
+
+  // —— 存储 ——
+  "settings.section.store": "存储",
+  "settings.store.dataDir": "数据存储目录",
+  "settings.store.modelsDir": "模型存储目录",
+  "settings.store.defaultDir": "默认(应用数据目录)",
+  "settings.store.audioUsage": "录音音频占用",
+  "settings.store.calculating": "统计中…",
+  "settings.store.freed": "已释放 {size}",
+  "settings.store.purge": "清理…",
+  "settings.store.purgeTitle": "清理历史录音音频",
+  "settings.store.purgeBlockedRecording": "录制中不能清理音频",
+  "settings.store.purge30": "清理 30 天前",
+  "settings.store.purge90": "清理 90 天前",
+  "settings.store.purgeAll": "清理全部",
+  "settings.store.purgeNote": "只删除音频文件,笔记文字与说话人保留。",
+  "settings.store.purgeConfirm": "确认清理",
+  "settings.store.purgeFailed": "清理失败: {e}",
+  "settings.store.change": "更改…",
+  "settings.store.changeTitle": "选择新目录并迁移现有内容",
+
+  // —— 存储迁移 ——
+  "settings.migrate.blockedRecording": "录制中不能迁移数据",
+  "settings.migrate.blockedDownloading": "模型下载进行中不能迁移",
+  "settings.migrate.blockedMigrating": "正在迁移…",
+  "settings.migrate.inProgress": "迁移中…",
+  "settings.migrate.confirmPrefix": "将把现有数据完整迁移到 ",
+  "settings.migrate.confirmSuffix": ",期间不能录制。",
+  "settings.migrate.start": "开始迁移",
+
+  // —— 录制 ——
+  "settings.section.record": "录制",
+  "settings.record.sysOnly.label": "仅录制系统声音",
+  "settings.record.sysOnly.desc": "不开麦克风,只录电脑播放的声音。适合直播、网课等旁听场景",
+  "settings.record.keepVol.label": "保持外放音量",
+  "settings.record.keepVol.desc": "外放开会时音量不再被系统压低,回声自动消除",
+  "settings.record.keepVol.sysOnlySuffix": "(仅录系统声音时无效)",
+  "settings.record.langFilter.label": "乱码过滤",
+  "settings.record.langFilter.desc": "丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭",
+  "settings.record.keepAudio.label": "保留录音音频",
+  "settings.record.keepAudio.desc": "录完可回放核对;关闭可节省磁盘",
+  "settings.lockHint.recording": "录制进行中:识别方式已锁定,其余更改下一场录制生效。",
+  "settings.lockHint.idle": "更改在下一场录制生效。",
+
+  // —— 识别方式(本地/云端)——
+  "settings.asrMode.label": "识别方式",
+  "settings.asrMode.cloudDesc": "录音音频将实时上传至所选厂商",
+  "settings.asrMode.localDesc": "识别在本机完成,数据不出设备",
+  "settings.asrMode.local": "本地模型",
+  "settings.asrMode.cloud": "云端 API",
+
+  // —— 云端 ASR ——
+  "settings.cloud.provider": "厂商",
+  "settings.cloud.volcano": "火山引擎",
+  "settings.cloud.aliyun": "阿里云",
+  "settings.cloud.volcAppIdDesc": "火山引擎语音技术控制台的 App ID",
+  "settings.cloud.secretDesc": "只保存在本机,不随笔记上传",
+  "settings.cloud.test": "测试连接",
+  "settings.cloud.testDesc": "用当前凭证实际连接一次厂商,验证配置可用",
+
+  // —— 连接/镜像测试(云端与镜像共用结果文案)——
+  "settings.test.ok": "测试成功({msg})",
+  "settings.test.failed": "测试失败: {msg}",
+  "settings.testing": "测试中…",
+
+  // —— 识别引擎 ——
+  "settings.asr.label": "识别引擎",
+  "settings.asr.senseVoiceDesc": "推荐 · 中英日韩粤语,功能最全",
+  "settings.asr.whisperDesc": "多语种支持广,说话人区分较粗",
+  "settings.asr.paraformerDesc": "中文更准、英文较弱",
+  "settings.asr.qwen3Desc": "中英混说最准,识别稍慢,说话人区分较粗",
+  "settings.asr.modelMissing": "所选识别引擎的模型未下载,请在下方「语音模型」中下载。",
+
+  // —— 声纹模型 ——
+  "settings.speaker.label": "声纹模型",
+  "settings.speaker.campplusDesc":
+    "推荐 · 切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人",
+  "settings.speaker.eres2Desc":
+    "备选模型;ERes2NetV2:中文基准更准(CN-Celeb EER 6.14% vs 6.78%),模型更大速度稍慢;切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人",
+  "settings.speaker.eres2Missing": "模型未下载:请先在下方「语音模型」中下载 ERes2NetV2",
+  "settings.speaker.confirmText": (p) =>
+    Number(p.n) > 0
+      ? `切换后将用录音样本为每人重算声纹;库内 ${p.n} 人无样本,重建前无法自动认出(名字与历史笔记不受影响)。`
+      : "切换后将用录音样本为每人重算声纹。",
+  "settings.speaker.confirmSwitch": "确认切换",
+
+  // —— 会后 AI ——
+  "settings.refine.label": "会后 AI",
+  "settings.refine.desc":
+    "停止录制后自动用大模型整理转写稿（错字修正、段落归并）；在线接口或本机 Agent 在左侧 AI 页配置",
+
+  // —— 语音模型 ——
+  "settings.section.models": "语音模型",
+  "settings.models.openDir": "在文件管理器中打开",
+  "settings.models.location": "存储位置",
+  "settings.models.expandUrl": "展开下载地址",
+  "settings.models.collapseUrl": "收起下载地址",
+  "settings.models.approxMb": "约 {mb}MB",
+  "settings.models.present": "已下载",
+  "settings.models.phase.downloading": "下载中",
+  "settings.models.phase.verifying": "校验中",
+  "settings.models.phase.extracting": "解压中",
+  "settings.models.phase.done": "完成",
+  "settings.models.confirmDelete": "确认删除",
+  "settings.models.delete": "删除",
+  "settings.models.deleteTitle": "删除本模型(可随时重新下载)",
+  "settings.models.deleteBlockedRecording": "录制中不能删除模型",
+  "settings.models.deleteBlockedDownloading": "下载进行中不能删除模型",
+  "settings.models.download": "下载",
+  "settings.models.downloadFailed": "下载失败: {e}",
+  "settings.models.statusFailed": "读取模型状态失败: {e}",
+  "settings.models.originUrl": "原始地址",
+  "settings.models.mirrorUrl": "镜像地址",
+  "settings.models.copy": "复制",
+  "settings.models.mirrorOff": "未启用镜像加速",
+
+  // —— 镜像加速 ——
+  "settings.mirror.label": "镜像加速",
+  "settings.mirror.desc": "国内网络下载模型更快",
+  "settings.mirror.test": "测试",
+  "settings.mirror.aria": "使用镜像加速",
+
+  // —— 关于 / 更新 ——
+  "settings.section.about": "关于",
+  "settings.about.version": "当前版本 v{v}",
+  "settings.update.hint": "从 GitHub Releases 检查是否有新版",
+  "settings.update.checking": "正在检查…",
+  "settings.update.found": "发现新版 v{v}，前往下载页更新",
+  "settings.update.latest": "已是最新版本",
+  "settings.update.check": "检查更新",
+  "settings.update.checkingBtn": "检查中…",
+  "settings.update.checkFailed": "检查失败: {e}",
+  "settings.update.oneClick": "一键更新 v{v}",
+  "settings.update.blockedRecording": "录音进行中,结束后再更新",
+  "settings.update.notReady": "更新包尚未就绪,稍后再试或打开发布页手动下载",
+  "settings.update.oneClickFailed": "一键更新失败: {e}",
+  "settings.update.openRelease": "打开发布页",
+  "settings.update.updating": "更新中…",
+  "settings.update.updatingPct": "更新中 {pct}%",
+  "settings.update.installing": "安装中…",
+} as const satisfies Dict;
+
+export const en = {
+  "settings.title": "Settings",
+  "settings.desc.local": "All recording and transcription happen on this device; no audio is ever uploaded.",
+  "settings.desc.cloud":
+    "Recordings stay on this device; audio is sent to the selected cloud provider for transcription.",
+  "settings.loadSettingsFailed": "Failed to read settings: {e}",
+  "settings.cancel": "Cancel",
+
+  "settings.section.general": "General",
+  "settings.theme.label": "Appearance",
+  "settings.theme.light": "Light",
+  "settings.theme.dark": "Dark",
+  "settings.theme.system": "Follow system",
+  "settings.theme.switchFailed": "Failed to switch theme: {e}",
+  "settings.shortcut.label": "Global shortcut",
+  "settings.shortcut.desc": "Press the shortcut in any app to start or stop recording",
+  "settings.shortcut.placeholder": "Press keys…",
+  "settings.shortcut.enableAria": "Enable global shortcut",
+  "settings.shortcut.saveFailed": "Failed to set shortcut: {e}",
+  "settings.autostart.label": "Launch at login",
+  "settings.autostart.saveFailed": "Failed to set launch at login: {e}",
+  "settings.tray.label": "Keep in menu bar",
+  "settings.tray.desc": "Closing the window hides it to the menu bar; recording continues",
+
+  "settings.section.store": "Storage",
+  "settings.store.dataDir": "Data directory",
+  "settings.store.modelsDir": "Models directory",
+  "settings.store.defaultDir": "Default (app data directory)",
+  "settings.store.audioUsage": "Recording audio usage",
+  "settings.store.calculating": "Calculating…",
+  "settings.store.freed": "Freed {size}",
+  "settings.store.purge": "Clean up…",
+  "settings.store.purgeTitle": "Delete old recording audio",
+  "settings.store.purgeBlockedRecording": "Cannot clean up audio while recording",
+  "settings.store.purge30": "Older than 30 days",
+  "settings.store.purge90": "Older than 90 days",
+  "settings.store.purgeAll": "All recordings",
+  "settings.store.purgeNote": "Only audio files are deleted; note text and speakers are kept.",
+  "settings.store.purgeConfirm": "Confirm cleanup",
+  "settings.store.purgeFailed": "Failed to clean up: {e}",
+  "settings.store.change": "Change…",
+  "settings.store.changeTitle": "Choose a new directory and migrate existing content",
+
+  "settings.migrate.blockedRecording": "Cannot migrate while recording",
+  "settings.migrate.blockedDownloading": "Cannot migrate while models are downloading",
+  "settings.migrate.blockedMigrating": "Migration in progress…",
+  "settings.migrate.inProgress": "Migrating…",
+  "settings.migrate.confirmPrefix": "All existing data will be migrated to ",
+  "settings.migrate.confirmSuffix": "; recording is unavailable during migration.",
+  "settings.migrate.start": "Start migration",
+
+  "settings.section.record": "Recording",
+  "settings.record.sysOnly.label": "Record system audio only",
+  "settings.record.sysOnly.desc":
+    "Keeps the microphone off and records only what this computer plays. Good for listen-only scenarios like livestreams and online classes",
+  "settings.record.keepVol.label": "Keep speaker volume",
+  "settings.record.keepVol.desc":
+    "Speaker volume is no longer lowered by the system during calls; echo is cancelled automatically",
+  "settings.record.keepVol.sysOnlySuffix": " (no effect when recording system audio only)",
+  "settings.record.langFilter.label": "Garbled text filter",
+  "settings.record.langFilter.desc":
+    "Drops text falsely transcribed from silence or noise. Turn off if multilingual meetings are affected",
+  "settings.record.keepAudio.label": "Keep recording audio",
+  "settings.record.keepAudio.desc": "Play back recordings to verify; turn off to save disk space",
+  "settings.lockHint.recording":
+    "Recording in progress: transcription mode is locked; other changes take effect on the next recording.",
+  "settings.lockHint.idle": "Changes take effect on the next recording.",
+
+  "settings.asrMode.label": "Transcription mode",
+  "settings.asrMode.cloudDesc": "Audio is streamed to the selected provider in real time",
+  "settings.asrMode.localDesc": "Transcription runs on this device; data never leaves it",
+  "settings.asrMode.local": "Local model",
+  "settings.asrMode.cloud": "Cloud API",
+
+  "settings.cloud.provider": "Provider",
+  "settings.cloud.volcano": "Volcano Engine",
+  "settings.cloud.aliyun": "Alibaba Cloud",
+  "settings.cloud.volcAppIdDesc": "App ID from the Volcano Engine speech console",
+  "settings.cloud.secretDesc": "Stored only on this device; never uploaded with notes",
+  "settings.cloud.test": "Test connection",
+  "settings.cloud.testDesc": "Makes one real connection with the current credentials to verify the setup",
+
+  "settings.test.ok": "Test passed ({msg})",
+  "settings.test.failed": "Test failed: {msg}",
+  "settings.testing": "Testing…",
+
+  "settings.asr.label": "Transcription engine",
+  "settings.asr.senseVoiceDesc": "Recommended · Chinese, English, Japanese, Korean, Cantonese; most complete features",
+  "settings.asr.whisperDesc": "Broad multilingual support; coarser speaker separation",
+  "settings.asr.paraformerDesc": "More accurate Chinese; weaker English",
+  "settings.asr.qwen3Desc": "Best for mixed Chinese-English; slightly slower; coarser speaker separation",
+  "settings.asr.modelMissing":
+    "The model for the selected engine is not downloaded; download it under Speech models below.",
+
+  "settings.speaker.label": "Voiceprint model",
+  "settings.speaker.campplusDesc":
+    "Recommended · After switching, the voiceprint library is rebuilt from recording samples in the background (about half a minute); speakers are not auto-recognized meanwhile",
+  "settings.speaker.eres2Desc":
+    "Alternative model. ERes2NetV2: more accurate on Chinese benchmarks (CN-Celeb EER 6.14% vs 6.78%), larger and slightly slower; after switching, the voiceprint library is rebuilt from recording samples in the background (about half a minute); speakers are not auto-recognized meanwhile",
+  "settings.speaker.eres2Missing": "Model not downloaded: download ERes2NetV2 under Speech models below first",
+  "settings.speaker.confirmText": (p) =>
+    Number(p.n) > 0
+      ? `Switching recalculates every person's voiceprint from recording samples; ${p.n} people in the library have no samples and cannot be auto-recognized until rebuilt (names and past notes are unaffected).`
+      : "Switching recalculates every person's voiceprint from recording samples.",
+  "settings.speaker.confirmSwitch": "Confirm switch",
+
+  "settings.refine.label": "Post-meeting AI",
+  "settings.refine.desc":
+    "After recording stops, a large model tidies the transcript automatically (typo fixes, paragraph merging); configure the online API or local agent on the AI page",
+
+  "settings.section.models": "Speech models",
+  "settings.models.openDir": "Open in file manager",
+  "settings.models.location": "Location",
+  "settings.models.expandUrl": "Show download URL",
+  "settings.models.collapseUrl": "Hide download URL",
+  "settings.models.approxMb": "~{mb} MB",
+  "settings.models.present": "Downloaded",
+  "settings.models.phase.downloading": "Downloading",
+  "settings.models.phase.verifying": "Verifying",
+  "settings.models.phase.extracting": "Extracting",
+  "settings.models.phase.done": "Done",
+  "settings.models.confirmDelete": "Confirm delete",
+  "settings.models.delete": "Delete",
+  "settings.models.deleteTitle": "Delete this model (you can re-download it anytime)",
+  "settings.models.deleteBlockedRecording": "Cannot delete models while recording",
+  "settings.models.deleteBlockedDownloading": "Cannot delete models while downloading",
+  "settings.models.download": "Download",
+  "settings.models.downloadFailed": "Download failed: {e}",
+  "settings.models.statusFailed": "Failed to read model status: {e}",
+  "settings.models.originUrl": "Original URL",
+  "settings.models.mirrorUrl": "Mirror URL",
+  "settings.models.copy": "Copy",
+  "settings.models.mirrorOff": "Mirror acceleration is off",
+
+  "settings.mirror.label": "Mirror acceleration",
+  "settings.mirror.desc": "Faster model downloads on networks in China",
+  "settings.mirror.test": "Test",
+  "settings.mirror.aria": "Use mirror acceleration",
+
+  "settings.section.about": "About",
+  "settings.about.version": "Current version v{v}",
+  "settings.update.hint": "Check GitHub Releases for a new version",
+  "settings.update.checking": "Checking…",
+  "settings.update.found": "New version v{v} available; update from the download page",
+  "settings.update.latest": "You're on the latest version",
+  "settings.update.check": "Check for updates",
+  "settings.update.checkingBtn": "Checking…",
+  "settings.update.checkFailed": "Check failed: {e}",
+  "settings.update.oneClick": "Update to v{v}",
+  "settings.update.blockedRecording": "Recording in progress; update after it ends",
+  "settings.update.notReady":
+    "Update package not ready yet; try again later or open the release page to download manually",
+  "settings.update.oneClickFailed": "One-click update failed: {e}",
+  "settings.update.openRelease": "Open release page",
+  "settings.update.updating": "Updating…",
+  "settings.update.updatingPct": "Updating {pct}%",
+  "settings.update.installing": "Installing…",
+} satisfies Record<keyof typeof zh, Msg>;

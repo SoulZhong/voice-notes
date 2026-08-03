@@ -21,6 +21,7 @@
   import { graphEntities, kindLabel, kindInk, type EntitySummary } from "$lib/graph";
   import { graphFilter } from "$lib/graphFilter.svelte";
   import { noteGraphState } from "$lib/noteGraph.svelte";
+  import { t } from "$lib/i18n/index.svelte";
 
   let notes = $state<NoteSummary[]>([]);
   let query = $state("");
@@ -50,7 +51,7 @@
       people = await listPeople();
       peopleError = "";
     } catch (e) {
-      peopleError = `加载失败: ${e}`;
+      peopleError = t("common.loadFailed", { e });
     }
   }
 
@@ -62,7 +63,7 @@
       hookList = await listHooks();
       hooksError = "";
     } catch (e) {
-      hooksError = `加载失败: ${e}`;
+      hooksError = t("common.loadFailed", { e });
     }
   }
 
@@ -195,7 +196,7 @@
       notes = await listNotes();
       error = "";
     } catch (e) {
-      error = `加载失败: ${e}`;
+      error = t("common.loadFailed", { e });
     }
   }
 
@@ -248,18 +249,18 @@
       await renameNote(id, editingTitle);
       recording.bumpNotes();
     } catch (e) {
-      error = `改名失败: ${e}`;
+      error = t("shell.renameFailed", { e });
     }
   }
 
   /// 删除走系统原生确认对话框(plugin-dialog):平台惯例体验,替代旧的
   /// 「菜单原地变形成确认项」自造交互(冒烟反馈:不符合正常预期)。
   async function confirmDelete(id: string, title: string) {
-    const yes = await ask(`「${title}」的转写与录音将一并删除，此操作不可恢复。`, {
-      title: "删除笔记",
+    const yes = await ask(t("shell.deleteConfirm.message", { title }), {
+      title: t("shell.deleteConfirm.title"),
       kind: "warning",
-      okLabel: "删除",
-      cancelLabel: "取消",
+      okLabel: t("shell.deleteConfirm.ok"),
+      cancelLabel: t("shell.deleteConfirm.cancel"),
     });
     if (!yes) return;
     try {
@@ -270,12 +271,12 @@
         goto("/");
       }
     } catch (e) {
-      error = `删除失败: ${e}`;
+      error = t("common.deleteFailed", { e });
     }
   }
 
   const stateBadge = (s: NoteSummary["state"]) =>
-    s === "active" ? "录制中" : s === "recording" ? "已中断" : "";
+    s === "active" ? t("shell.note.stateActive") : s === "recording" ? t("shell.note.stateInterrupted") : "";
 </script>
 
 {#snippet personRow(p: PersonSummary)}
@@ -291,8 +292,8 @@
   >
     <span class="dot" style="background: {speakerColor(p.id, 'mic')}"></span>
     <div class="main-line">
-      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || `说话人 ${p.id.replace(/^P/, "")}`}</a>
-      <span class="meta">最近出现 {formatDate(p.last_seen)}</span>
+      <a class="title" class:unnamed={!p.name} href="/speakers/{p.id}">{p.name || t("shell.person.unnamed", { id: p.id.replace(/^P/, "") })}</a>
+      <span class="meta">{t("shell.person.lastSeen", { date: formatDate(p.last_seen) })}</span>
     </div>
   </li>
 {/snippet}
@@ -306,17 +307,17 @@
     <button
       class="vtab"
       class:active={tab === "notes"}
-      onclick={() => { if ($page.url.pathname !== "/") goto("/"); }}>录音</button
+      onclick={() => { if ($page.url.pathname !== "/") goto("/"); }}>{t("shell.tab.notes")}</button
     >
     <button
       class="vtab"
       class:active={tab === "people"}
-      onclick={() => { if ($page.url.pathname !== "/speakers") goto("/speakers"); }}>会议搭子</button
+      onclick={() => { if ($page.url.pathname !== "/speakers") goto("/speakers"); }}>{t("shell.tab.people")}</button
     >
     <button
       class="vtab"
       class:active={tab === "graph"}
-      onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>图谱</button
+      onclick={() => { if ($page.url.pathname !== "/graph" || $page.url.search !== "") goto("/graph"); }}>{t("shell.tab.graph")}</button
     >
     {#if tab === "graph"}
       <button
@@ -325,13 +326,13 @@
         aria-expanded={graphDrawerOpen}
         aria-controls="graph-sidebar-panel"
         onclick={() => (graphDrawerOpen = !graphDrawerOpen)}
-      >筛选</button>
+      >{t("shell.graph.filterToggle")}</button>
     {/if}
     <a
       class="vtab"
       class:active={tab === "hooks"}
       href="/hooks"
-      data-sveltekit-preload-code="eager">钩子</a
+      data-sveltekit-preload-code="eager">{t("shell.tab.hooks")}</a
     >
     <a
       class="vtab vtab-upright"
@@ -341,7 +342,7 @@
     <button
       class="vtab"
       class:active={tab === "settings"}
-      onclick={() => { if ($page.url.pathname !== "/settings") goto("/settings"); }}>设置</button
+      onclick={() => { if ($page.url.pathname !== "/settings") goto("/settings"); }}>{t("shell.tab.settings")}</button
     >
   </nav>
 
@@ -350,7 +351,7 @@
     <button
       type="button"
       class="graph-drawer-close"
-      aria-label="关闭图谱侧栏"
+      aria-label={t("shell.graph.closeSidebar")}
       onclick={() => (graphDrawerOpen = false)}
     >×</button>
   {/if}
@@ -361,7 +362,7 @@
     disabled={recording.pending || recording.stopping}
   >
     <span class="rec-dot" class:square={recording.isLive}></span>
-    {recording.stopping ? "正在停止…" : recording.isLive ? (recording.paused ? "已暂停" : "停止录制") : "开始录制"}
+    {recording.stopping ? t("shell.record.stopping") : recording.isLive ? (recording.paused ? t("shell.record.paused") : t("shell.record.stop")) : t("shell.record.start")}
   </button>
 
   {#if tab === "hooks"}
@@ -375,11 +376,11 @@
           <svg class="new-hook-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
             <path d="M8 3.5v9M3.5 8h9" />
           </svg>
-          新建钩子
+          {t("shell.hooks.new")}
         </a>
       </li>
       {#if hookList.length === 0 && !hooksError}
-        <p class="empty-hint">事件发生时自动执行命令或调用接口<br />先新建一条试试</p>
+        <p class="empty-hint">{t("shell.hooks.emptyHint1")}<br />{t("shell.hooks.emptyHint2")}</p>
       {/if}
       {#each hookGroups as g (g.value)}
         <li class="group-label">{g.label}</li>
@@ -395,8 +396,8 @@
             }}
           >
             <div class="main-line">
-              <a class="title" href="/hooks/{h.id}">{h.name || "未命名钩子"}</a>
-              <span class="meta">{h.kind === "webhook" ? "Webhook" : "Shell 命令"}{h.enabled ? "" : " · 已停用"}</span>
+              <a class="title" href="/hooks/{h.id}">{h.name || t("shell.hooks.unnamed")}</a>
+              <span class="meta">{h.kind === "webhook" ? "Webhook" : t("shell.hooks.kindShell")}{h.enabled ? "" : t("shell.hooks.disabledSuffix")}</span>
             </div>
           </li>
         {/each}
@@ -407,7 +408,7 @@
       <div class="banner">{peopleError}</div>
     {/if}
     {#if people.length === 0 && !peopleError}
-      <p class="hint">录一场会议,停止后本场说话人会自动出现在这里</p>
+      <p class="hint">{t("shell.people.hint")}</p>
     {/if}
     <!-- 人物索引(主从结构的"主"):点击进主区详情页;待命名是待处理项排上面,
          与旧管理页分区语义一致。行内无操作,管理动作全在详情页。 -->
@@ -430,59 +431,59 @@
             <path d="M11.5 11.5h2.5M12.75 10.25v2.5" />
           </svg>
           <div class="main-line">
-            <a class="title" href="/speakers">概览与整理</a>
+            <a class="title" href="/speakers">{t("shell.people.overview")}</a>
           </div>
           {#if tidyBadge > 0}
-            <span class="tidy-badge" title="{tidyBadge} 项待处理">{tidyBadge}</span>
+            <span class="tidy-badge" title={t("shell.people.pendingCount", { n: tidyBadge })}>{tidyBadge}</span>
           {/if}
         </li>
         <li class="people-search-row">
-          <input class="people-search" placeholder="搜索搭子" bind:value={peopleQuery} />
+          <input class="people-search" placeholder={t("shell.people.searchPlaceholder")} bind:value={peopleQuery} />
         </li>
       {/if}
       {#if peopleUnnamed.length > 0}
-        <li class="group-label">待命名</li>
+        <li class="group-label">{t("shell.people.groupUnnamed")}</li>
         {#each peopleUnnamed as p (p.id)}
           {@render personRow(p)}
         {/each}
       {/if}
       {#if peopleNamed.length > 0}
-        <li class="group-label">已命名</li>
+        <li class="group-label">{t("shell.people.groupNamed")}</li>
         {#each peopleNamed as p (p.id)}
           {@render personRow(p)}
         {/each}
       {/if}
       {#if peopleQuery.trim() && peopleUnnamed.length === 0 && peopleNamed.length === 0}
-        <li class="hint people-empty">没有匹配的搭子</li>
+        <li class="hint people-empty">{t("shell.people.noMatch")}</li>
       {/if}
     </ul>
   {:else if tab === "graph"}
-    <div class="gmode" aria-label="图谱视角">
+    <div class="gmode" aria-label={t("shell.graph.viewAria")}>
       <button
         class="gmode-seg"
         class:on={graphFilter.mode === "entity"}
         onclick={() => { graphFilter.mode = "entity"; if ($page.url.search) goto("/graph"); }}
-      >实体</button>
+      >{t("shell.graph.modeEntity")}</button>
       <button
         class="gmode-seg"
         class:on={graphFilter.mode === "note"}
         onclick={() => { graphFilter.mode = "note"; if ($page.url.search) goto("/graph"); }}
-      >文章</button>
+      >{t("shell.graph.modeNote")}</button>
     </div>
     <input
       class="search"
       type="search"
       name="graph-search"
-      aria-label={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索人物、项目或术语"}
-      placeholder={graphFilter.mode === "note" ? "搜索笔记标题" : "搜索人物、项目或术语"}
+      aria-label={graphFilter.mode === "note" ? t("shell.graph.searchNotes") : t("shell.graph.searchEntities")}
+      placeholder={graphFilter.mode === "note" ? t("shell.graph.searchNotes") : t("shell.graph.searchEntities")}
       bind:value={graphFilter.query}
     />
     {#if graphFilter.mode === "entity" && graphFilter.query.trim()}
-      <p class="search-behavior">搜索只聚焦匹配实体，画布中的其他关系仍会保留。</p>
+      <p class="search-behavior">{t("shell.graph.searchBehavior")}</p>
     {/if}
     {#if graphFilter.mode === "entity"}
       <div class="gchips">
-        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>全部</button>
+        <button class="gchip" class:on={graphFilter.kind === "all"} onclick={() => (graphFilter.kind = "all")}>{t("shell.graph.kindAll")}</button>
         {#each graphKinds as k (k)}
           <button class="gchip" class:on={graphFilter.kind === k} onclick={() => (graphFilter.kind = k)}>
             <span class="gchip-dot" style="background: {kindInk(k)}"></span>{kindLabel(k)}
@@ -490,7 +491,7 @@
         {/each}
       </div>
       {#if graphShown.length === 0}
-        <p class="hint">{graphEnts.length === 0 ? "还没有图谱实体" : "没有匹配的实体"}</p>
+        <p class="hint">{graphEnts.length === 0 ? t("shell.graph.emptyEntities") : t("shell.graph.noMatchEntities")}</p>
       {/if}
       <ul class="list">
         {#each graphShown as e (e.id)}
@@ -499,7 +500,7 @@
               <span class="dot" style="background: {e.is_person ? speakerColor(e.id, 'mic') : kindInk(e.kind)}"></span>
               <div class="main-line">
                 <span class="title">{e.name}</span>
-                <span class="meta">{kindLabel(e.kind)} · {e.note_count} 篇笔记</span>
+                <span class="meta">{kindLabel(e.kind)} · {t("shell.graph.noteCount", { n: e.note_count })}</span>
               </div>
             </a>
           </li>
@@ -507,7 +508,7 @@
       </ul>
     {:else}
       {#if graphNotesShown.length === 0}
-        <p class="hint">{noteGraphState.status === "error" ? "文章图谱加载失败" : graphNotes.length === 0 ? "还没有进入图谱的笔记" : "没有匹配的笔记"}</p>
+        <p class="hint">{noteGraphState.status === "error" ? t("shell.graph.notesLoadFailed") : graphNotes.length === 0 ? t("shell.graph.emptyNotes") : t("shell.notes.noMatch")}</p>
       {/if}
       <ul class="list">
         {#each graphNotesShown as note (note.id)}
@@ -516,7 +517,7 @@
               <span class="dot" style="background: {kindInk('note')}"></span>
               <div class="main-line">
                 <span class="title">{note.name}</span>
-                <span class="meta">{note.note_count} 个实体 · {note.mention_total} 次提及</span>
+                <span class="meta">{t("shell.graph.entityMentions", { n: note.note_count, m: note.mention_total })}</span>
               </div>
             </a>
           </li>
@@ -524,14 +525,14 @@
       </ul>
     {/if}
   {:else}
-  <input class="search" type="search" placeholder="按标题过滤" bind:value={query} />
+  <input class="search" type="search" placeholder={t("shell.notes.filterPlaceholder")} bind:value={query} />
 
   {#if error}
     <div class="banner">{error}</div>
   {/if}
 
   {#if filtered.length === 0}
-    <p class="hint">{notes.length === 0 ? "还没有笔记" : "没有匹配的笔记"}</p>
+    <p class="hint">{notes.length === 0 ? t("shell.notes.empty") : t("shell.notes.noMatch")}</p>
   {/if}
 
   <ul class="list">
@@ -585,7 +586,7 @@
   <button
     type="button"
     class="graph-drawer-scrim"
-    aria-label="关闭图谱侧栏"
+    aria-label={t("shell.graph.closeSidebar")}
     onclick={() => (graphDrawerOpen = false)}
   ></button>
 {/if}
@@ -601,7 +602,7 @@
       onclick={() => {
         if (menuNote) beginRename(menuNote);
         closeMenu();
-      }}>改名</button
+      }}>{t("shell.menu.rename")}</button
     >
     <button
       class="ctx-item danger"
@@ -610,7 +611,7 @@
         const title = menuNote?.title ?? "";
         closeMenu();
         confirmDelete(id, title);
-      }}>删除</button
+      }}>{t("shell.menu.delete")}</button
     >
   </div>
 {/if}

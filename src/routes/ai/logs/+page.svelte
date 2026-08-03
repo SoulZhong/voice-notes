@@ -3,10 +3,12 @@
   // 可在访达中打开日志目录。数据真值源是 data_root/ai_logs/,现查现示。
   import { onMount } from "svelte";
   import { aiLogsQuery, aiLogsExport, aiLogsOpenDir, AI_LOG_KIND_LABELS, type AiLogEntry } from "$lib/ailog";
+  import { t } from "$lib/i18n/index.svelte";
 
   const PAGE_SIZE = 50;
+  // label 存 i18n 键,渲染处 t() 取值。
   const KIND_TABS = [
-    { key: "", label: "全部" },
+    { key: "", label: "ai.logs.kind.all" },
     ...Object.entries(AI_LOG_KIND_LABELS).map(([key, label]) => ({ key, label })),
   ];
 
@@ -48,7 +50,7 @@
     error = "";
     try {
       const r = await aiLogsExport();
-      notice = `已导出 ${r.count} 条 → ${r.path}`;
+      notice = t("ai.logs.exported", { count: r.count, path: r.path });
     } catch (e) {
       error = String(e);
     } finally {
@@ -75,10 +77,10 @@
 
 <div class="page">
   <header class="topbar">
-    <h1>AI 调用日志</h1>
+    <h1>{t("ai.logs.sectionTitle")}</h1>
     <div class="topbar-actions">
-      <button class="btn-secondary" onclick={openDir}>打开日志目录</button>
-      <button class="btn-secondary" disabled={busy || total === 0} onclick={doExport}>导出 JSONL</button>
+      <button class="btn-secondary" onclick={openDir}>{t("ai.logs.openDir")}</button>
+      <button class="btn-secondary" disabled={busy || total === 0} onclick={doExport}>{t("ai.logs.export")}</button>
     </div>
   </header>
 
@@ -88,29 +90,29 @@
 
   <div class="toolbar">
     <div class="seg">
-      {#each KIND_TABS as t (t.key)}
+      {#each KIND_TABS as tab (tab.key)}
         <label class="seg-item">
-          <input type="radio" name="log-kind" value={t.key} checked={kind === t.key} onchange={() => setKind(t.key)} />
-          {t.label}
+          <input type="radio" name="log-kind" value={tab.key} checked={kind === tab.key} onchange={() => setKind(tab.key)} />
+          {t(tab.label)}
         </label>
       {/each}
     </div>
     <span class="toolbar-hint">
-      {#if notice}{notice}{:else}共 {total} 条,已加载 {entries.length} 条{/if}
+      {#if notice}{notice}{:else}{t("ai.logs.count", { total, loaded: entries.length })}{/if}
     </span>
   </div>
 
   <div class="rows">
     {#if entries.length === 0}
-      <p class="empty">暂无记录。AI 整理与标题生成的每次对外调用（请求与响应全量）都会在这里留痕。</p>
+      <p class="empty">{t("ai.logs.empty")}</p>
     {:else}
       {#each entries as e (e.id)}
         <div class="row">
           <div class="row-info">
             <span class="row-label-line">
-              <span class="row-label">{AI_LOG_KIND_LABELS[e.kind] ?? e.kind}</span>
-              {#if e.status !== "ok"}<span class="pill warn">失败</span>{/if}
-              {#if e.truncated}<span class="pill">超长已截断</span>{/if}
+              <span class="row-label">{AI_LOG_KIND_LABELS[e.kind] ? t(AI_LOG_KIND_LABELS[e.kind]) : e.kind}</span>
+              {#if e.status !== "ok"}<span class="pill warn">{t("ai.logs.failed")}</span>{/if}
+              {#if e.truncated}<span class="pill">{t("ai.logs.truncated")}</span>{/if}
             </span>
             <span class="row-desc">
               {fmtTs(e.ts)} · {e.provider}{e.model ? ` · ${e.model}` : ""} · {e.duration_ms}ms{e.note_id
@@ -119,7 +121,7 @@
             </span>
           </div>
           <button class="link" onclick={() => (expandedId = expandedId === e.id ? null : e.id)}>
-            {expandedId === e.id ? "收起" : "详情"}
+            {expandedId === e.id ? t("ai.action.collapse") : t("ai.logs.detail")}
           </button>
         </div>
         {#if expandedId === e.id}
@@ -130,7 +132,7 @@
     {#if entries.length < total}
       <div class="row load-more">
         <button class="btn-secondary" disabled={busy} onclick={() => load(false)}>
-          加载更多(剩 {total - entries.length} 条)
+          {t("ai.logs.loadMore", { n: total - entries.length })}
         </button>
       </div>
     {/if}

@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { listNotes } from "$lib/notes";
+  import { t } from "$lib/i18n/index.svelte";
 
   let empty = $state(false);
 
@@ -25,8 +26,8 @@
 
 {#if empty}
   <div class="empty">
-    <p>还没有会议笔记。</p>
-    <p class="hint">点击左上角「● 开始录制」来第一场。</p>
+    <p>{t("shell.home.empty")}</p>
+    <p class="hint">{t("shell.home.emptyHint")}</p>
   </div>
 {/if}
 

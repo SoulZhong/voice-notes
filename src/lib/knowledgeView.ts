@@ -1,3 +1,4 @@
+import { t } from "$lib/i18n/index.svelte";
 import type { EntitySummary, GraphData, RenderEdge } from "./graph";
 import type {
   KnowledgeFilter,
@@ -171,22 +172,22 @@ export function graphDragPosition(
   return direct ? { x, y, fx: x, fy: y } : { fx: x, fy: y };
 }
 
-const CORE_PREDICATE_LABELS: Readonly<Record<string, string>> = {
-  participates_in: "参与",
-  responsible_for: "负责",
-  belongs_to: "属于",
-  uses: "使用",
-  depends_on: "依赖",
-  produces: "产生",
-  assigned_to: "指派给",
-  occurs_at: "发生于",
+const CORE_PREDICATE_LABEL_KEYS: Readonly<Record<string, string>> = {
+  participates_in: "graph.predicate.participates_in",
+  responsible_for: "graph.predicate.responsible_for",
+  belongs_to: "graph.predicate.belongs_to",
+  uses: "graph.predicate.uses",
+  depends_on: "graph.predicate.depends_on",
+  produces: "graph.predicate.produces",
+  assigned_to: "graph.predicate.assigned_to",
+  occurs_at: "graph.predicate.occurs_at",
 };
 
 export function relationLabel(
   edge: Pick<SemanticEdge, "predicate_type" | "predicate_label">,
 ): string {
-  const coreLabel = CORE_PREDICATE_LABELS[edge.predicate_type];
-  if (coreLabel !== undefined) return coreLabel;
+  const coreLabelKey = CORE_PREDICATE_LABEL_KEYS[edge.predicate_type];
+  if (coreLabelKey !== undefined) return t(coreLabelKey);
   if (edge.predicate_type === "custom" && edge.predicate_label?.trim()) {
     return edge.predicate_label;
   }
@@ -606,9 +607,9 @@ export function legacyFallbackGraph(
 }
 
 export function semanticRequestFailureMessage(hasLegacyFallback: boolean): string {
-  return hasLegacyFallback
-    ? "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。"
-    : "语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。";
+  return t(
+    hasLegacyFallback ? "graph.semantic.failedWithLegacy" : "graph.semantic.failedNoLegacy",
+  );
 }
 
 export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): RenderEdge[] {
@@ -630,7 +631,7 @@ export function viewEdges(data: SemanticGraphData, filter: KnowledgeFilter): Ren
     b: compareStrings(edge.a, edge.b) <= 0 ? edge.b : edge.a,
     weight: edge.weight,
     layer: "cooccurrence",
-    label: `${edge.weight} 篇笔记同时提到`,
+    label: t("graph.edge.sharedNotes", { n: edge.weight }),
     directed: false,
     confidence: null,
     status: null,

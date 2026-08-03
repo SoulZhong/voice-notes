@@ -10,6 +10,7 @@
     retainLastKnownRelation,
     task10GovernanceApi,
   } from "./knowledgeGovernance";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     relationId,
@@ -96,7 +97,7 @@
     } catch (cause) {
       if (current !== generation) return;
       detail = null;
-      loadError = `关系详情读取失败：${cause instanceof Error ? cause.message : String(cause)}`;
+      loadError = t("governance.relation.loadFailed", { e: cause instanceof Error ? cause.message : String(cause) });
     } finally {
       if (current === generation) loading = false;
     }
@@ -135,12 +136,12 @@
       label: predicateType.trim() === "custom" ? predicateLabel.trim() || null : null,
     };
     if (predicate.type === "custom" && !predicate.label) {
-      status = "自定义关系需要填写完整关系名称。";
+      status = t("governance.relation.customLabelRequired");
       return;
     }
     await runOperation(
-      "正在保存关系修改",
-      "关系方向、类型、时间与说明已更新",
+      t("governance.relation.saving"),
+      t("governance.relation.saved"),
       buildEditRelation(
         detail.relation.id,
         subjectId.trim(),
@@ -157,8 +158,8 @@
     if (!detail) return;
     suppressDialog?.close();
     await runOperation(
-      "正在永久抑制这条模型关系",
-      "关系已否决并持久抑制，模型重跑不会自动恢复",
+      t("governance.relation.suppressing"),
+      t("governance.relation.suppressed"),
       buildSuppressRelation(
         detail.relation.subject_id,
         { type: detail.relation.predicate_type, label: detail.relation.predicate_label },
@@ -170,10 +171,10 @@
   async function undoLast() {
     if (!controller.lastOperationId || working) return;
     working = true;
-    status = "正在撤销上次操作";
+    status = t("governance.relation.undoing");
     try {
       await controller.undo(controller.lastOperationId);
-      status = controller.refreshError || "已写入补偿操作并刷新关系";
+      status = controller.refreshError || t("governance.relation.undone");
     } catch {
       status = controller.error;
     } finally {
@@ -191,132 +192,134 @@
 <article class="drawer" aria-labelledby="relation-drawer-title">
   <header>
     <div>
-      <p class="eyebrow">关系证据</p>
-      <h2 id="relation-drawer-title">关系详情</h2>
+      <p class="eyebrow">{t("governance.relation.eyebrow")}</p>
+      <h2 id="relation-drawer-title">{t("governance.relation.title")}</h2>
     </div>
-    <button class="close" type="button" aria-label="关闭关系详情" onclick={onClose}>×</button>
+    <button class="close" type="button" aria-label={t("governance.relation.closeAria")} onclick={onClose}>×</button>
   </header>
 
   {#if loading}
-    <p class="state" role="status">正在读取完整关系与证据</p>
+    <p class="state" role="status">{t("governance.relation.loading")}</p>
   {:else if loadError}
     <p class="state error" role="alert">{loadError}</p>
   {:else if !detail}
-    <p class="state">这条关系已不在当前索引中。若刚完成抑制，仍可在下方撤销该次操作。</p>
+    <p class="state">{t("governance.relation.gone")}</p>
     {#if lastKnown}
       {@const relation = lastKnown.relation}
-      <section class="direction tombstone" aria-label="最后一次读取的完整关系方向">
-        <span><b>{subjectName || "未解析实体名称"}</b><small>{relation.subject_id}</small></span>
+      <section class="direction tombstone" aria-label={t("governance.relation.tombstoneAria")}>
+        <span><b>{subjectName || t("governance.relation.unresolvedEntity")}</b><small>{relation.subject_id}</small></span>
         <strong>→ {relationLabel(relation)} →</strong>
-        <span><b>{objectName || "未解析实体名称"}</b><small>{relation.object_id}</small></span>
+        <span><b>{objectName || t("governance.relation.unresolvedEntity")}</b><small>{relation.object_id}</small></span>
       </section>
-      <p class="muted">上方为本面板最后一次成功读取的关系摘要，不代表当前索引仍包含该关系。</p>
+      <p class="muted">{t("governance.relation.tombstoneNote")}</p>
     {/if}
   {:else}
     {@const relation = detail.relation}
-    <section class="direction" aria-label="完整关系方向">
-      <span><b>{subjectName || "未解析实体名称"}</b>{#if !simple}<small>{relation.subject_id}</small>{/if}</span>
+    <section class="direction" aria-label={t("governance.relation.directionAria")}>
+      <span><b>{subjectName || t("governance.relation.unresolvedEntity")}</b>{#if !simple}<small>{relation.subject_id}</small>{/if}</span>
       <strong>→ {relationLabel(relation)} →</strong>
-      <span><b>{objectName || "未解析实体名称"}</b>{#if !simple}<small>{relation.object_id}</small>{/if}</span>
+      <span><b>{objectName || t("governance.relation.unresolvedEntity")}</b>{#if !simple}<small>{relation.object_id}</small>{/if}</span>
     </section>
 
     <section class="section" aria-labelledby="relation-overview">
-      <h3 id="relation-overview">概览</h3>
+      <h3 id="relation-overview">{t("governance.overview")}</h3>
       <dl>
-        <div><dt>状态</dt><dd>{relation.status === "current" ? "当前" : "历史"}</dd></div>
-        <div><dt>置信度</dt><dd>{Math.round(relation.confidence * 100)}%</dd></div>
-        <div><dt>证据</dt><dd>{relation.evidence_count} 条</dd></div>
+        <div><dt>{t("governance.statusLabel")}</dt><dd>{relation.status === "current" ? t("governance.relation.statusCurrent") : t("governance.relation.statusHistorical")}</dd></div>
+        <div><dt>{t("governance.relation.confidence")}</dt><dd>{Math.round(relation.confidence * 100)}%</dd></div>
+        <div><dt>{t("governance.evidence")}</dt><dd>{t("governance.countItems", { n: relation.evidence_count })}</dd></div>
         {#if !simple}
-          <div><dt>来源</dt><dd>{relation.origin}</dd></div>
-          <div><dt>提供方</dt><dd>{detail.provider || "人工治理"}</dd></div>
-          <div><dt>模型</dt><dd>{detail.model || "未记录模型"}</dd></div>
-          <div><dt>有效起点</dt><dd>{relation.valid_from || "未限定"}</dd></div>
-          <div><dt>有效终点</dt><dd>{relation.valid_to || "持续有效"}</dd></div>
+          <div><dt>{t("governance.relation.origin")}</dt><dd>{relation.origin}</dd></div>
+          <div><dt>{t("governance.relation.provider")}</dt><dd>{detail.provider || t("governance.relation.manualGovernance")}</dd></div>
+          <div><dt>{t("governance.relation.model")}</dt><dd>{detail.model || t("governance.relation.noModel")}</dd></div>
+          <div><dt>{t("governance.relation.validFrom")}</dt><dd>{relation.valid_from || t("governance.relation.unbounded")}</dd></div>
+          <div><dt>{t("governance.relation.validToLabel")}</dt><dd>{relation.valid_to || t("governance.relation.ongoing")}</dd></div>
         {/if}
       </dl>
     </section>
 
     {#if !simple}<section class="section versions" aria-labelledby="relation-index-state">
-      <h3 id="relation-index-state">当前索引状态</h3>
-      <p>当前索引将所选关系标记为「{relation.status === "current" ? "当前" : "历史"}」状态。</p>
-      <p class="muted">接口仅返回所选单条关系，不代表已查询到该 triple 的完整版本历史。</p>
+      <h3 id="relation-index-state">{t("governance.relation.indexStateTitle")}</h3>
+      <p>{t("governance.relation.indexStateBody", { status: relation.status === "current" ? t("governance.relation.statusCurrent") : t("governance.relation.statusHistorical") })}</p>
+      <p class="muted">{t("governance.relation.singleRelationNote")}</p>
     </section>{/if}
 
     <section class="section evidence" aria-labelledby="relation-evidence">
-      <h3 id="relation-evidence">全部证据</h3>
+      <h3 id="relation-evidence">{t("governance.relation.allEvidence")}</h3>
       {#each detail.evidence as item (item.id)}
         <blockquote>
           <p>{item.quote}</p>
           <footer>
             {#if readOnly}
-              <span>隔离夹具笔记 {item.note_id}</span>
+              <span>{t("governance.relation.fixtureNote", { id: item.note_id })}</span>
             {:else}
-              <a href={'/notes/' + encodeURIComponent(item.note_id) + '#paragraph-' + item.paragraph_index}>打开笔记 {item.note_id}</a>
+              <a href={'/notes/' + encodeURIComponent(item.note_id) + '#paragraph-' + item.paragraph_index}>{t("governance.relation.openNote", { id: item.note_id })}</a>
             {/if}
-            <span>第 {item.paragraph_index + 1} 段{simple ? "" : ` · 字符 ${item.start_offset}–${item.end_offset}`}</span>
-            {#if !simple && item.source_seqs.length > 0}<span>时间片段序号 {item.source_seqs.join("、")}</span>{/if}
+            <span>{simple
+              ? t("governance.mention.paragraph", { p: item.paragraph_index + 1 })
+              : t("governance.mention.position", { p: item.paragraph_index + 1, start: item.start_offset, end: item.end_offset })}</span>
+            {#if !simple && item.source_seqs.length > 0}<span>{t("governance.relation.sourceSeqs", { seqs: item.source_seqs.join("、") })}</span>{/if}
           </footer>
         </blockquote>
       {/each}
       {#if detail.evidence.length === 0}
-        <p class="assertion">用户直接声明</p>
+        <p class="assertion">{t("governance.relation.userAssertion")}</p>
       {/if}
     </section>
 
     {#if readOnly}
       <section class="section actions" aria-labelledby="relation-actions">
-        <h3 id="relation-actions">隔离调试</h3>
-        <p class="unavailable">这是只读隔离夹具；关系证据不会读取或修改真实资料库。</p>
+        <h3 id="relation-actions">{t("governance.relation.isolationTitle")}</h3>
+        <p class="unavailable">{t("governance.relation.isolationBody")}</p>
       </section>
     {:else if !simple}
       <section class="section actions" aria-labelledby="relation-actions">
-      <h3 id="relation-actions">治理操作</h3>
+      <h3 id="relation-actions">{t("governance.relation.actionsTitle")}</h3>
       <div class="primary-actions">
-        <button type="button" disabled={working} onclick={() => runOperation("正在确认关系", "关系已确认", buildConfirmRelation(relation.id))}>确认关系</button>
-        <button class="danger" type="button" disabled={working} onclick={() => suppressDialog?.showModal()}>否决并抑制</button>
+        <button type="button" disabled={working} onclick={() => runOperation(t("governance.relation.confirming"), t("governance.relation.confirmed"), buildConfirmRelation(relation.id))}>{t("governance.relation.confirm")}</button>
+        <button class="danger" type="button" disabled={working} onclick={() => suppressDialog?.showModal()}>{t("governance.suppressReject")}</button>
       </div>
 
       <details>
-        <summary>编辑方向、类型、时间与说明</summary>
+        <summary>{t("governance.relation.editSummary")}</summary>
         <form onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
-          <label for="relation-subject">主体实体 ID</label>
+          <label for="relation-subject">{t("governance.relation.subjectId")}</label>
           <input id="relation-subject" bind:value={subjectId} disabled={working} aria-describedby="relation-feedback" />
-          <button class="swap" type="button" disabled={working} onclick={swapDirection}>交换关系方向</button>
-          <label for="relation-object">客体实体 ID</label>
+          <button class="swap" type="button" disabled={working} onclick={swapDirection}>{t("governance.relation.swap")}</button>
+          <label for="relation-object">{t("governance.relation.objectId")}</label>
           <input id="relation-object" bind:value={objectId} disabled={working} aria-describedby="relation-feedback" />
-          <label for="relation-predicate">关系类型</label>
+          <label for="relation-predicate">{t("governance.relation.type")}</label>
           <select id="relation-predicate" bind:value={predicateType} disabled={working}>
-            <option value="participates_in">参与</option><option value="responsible_for">负责</option>
-            <option value="belongs_to">属于</option><option value="uses">使用</option>
-            <option value="depends_on">依赖</option><option value="produces">产生</option>
-            <option value="assigned_to">指派给</option><option value="occurs_at">发生于</option>
-            <option value="custom">自定义关系</option>
+            <option value="participates_in">{t("governance.predicate.participatesIn")}</option><option value="responsible_for">{t("governance.predicate.responsibleFor")}</option>
+            <option value="belongs_to">{t("governance.predicate.belongsTo")}</option><option value="uses">{t("governance.predicate.uses")}</option>
+            <option value="depends_on">{t("governance.predicate.dependsOn")}</option><option value="produces">{t("governance.predicate.produces")}</option>
+            <option value="assigned_to">{t("governance.predicate.assignedTo")}</option><option value="occurs_at">{t("governance.predicate.occursAt")}</option>
+            <option value="custom">{t("governance.predicate.custom")}</option>
           </select>
           {#if predicateType === "custom"}
-            <label for="relation-custom-label">完整关系名称</label>
+            <label for="relation-custom-label">{t("governance.relation.customLabel")}</label>
             <input id="relation-custom-label" bind:value={predicateLabel} disabled={working} aria-describedby="relation-feedback" />
           {/if}
-          <label for="relation-valid-from">有效起点（RFC 3339，可留空）</label>
+          <label for="relation-valid-from">{t("governance.relation.validFromInput")}</label>
           <input id="relation-valid-from" bind:value={validFrom} disabled={working} aria-describedby="relation-feedback" />
-          <label for="relation-valid-to">有效终点（RFC 3339，可留空）</label>
+          <label for="relation-valid-to">{t("governance.relation.validToInput")}</label>
           <input id="relation-valid-to" bind:value={validTo} disabled={working} aria-describedby="relation-feedback" />
-          <label for="relation-note">关系说明</label>
+          <label for="relation-note">{t("governance.relation.note")}</label>
           <textarea id="relation-note" bind:value={relationNote} disabled={working}></textarea>
-          <button type="submit" disabled={working || !subjectId.trim() || !objectId.trim() || !predicateType.trim() || (predicateType === "custom" && !predicateLabel.trim())}>保存关系修改</button>
+          <button type="submit" disabled={working || !subjectId.trim() || !objectId.trim() || !predicateType.trim() || (predicateType === "custom" && !predicateLabel.trim())}>{t("governance.relation.save")}</button>
         </form>
       </details>
 
       <details>
-        <summary>结束关系</summary>
+        <summary>{t("governance.relation.end")}</summary>
         <form onsubmit={(event) => {
           event.preventDefault();
-          if (endAt.trim()) void runOperation("正在结束关系", "关系已转入历史", buildEndRelation(relation.id, endAt.trim()));
+          if (endAt.trim()) void runOperation(t("governance.relation.ending"), t("governance.relation.ended"), buildEndRelation(relation.id, endAt.trim()));
         }}>
-          <label for="relation-end">关系结束时间（RFC 3339）</label>
+          <label for="relation-end">{t("governance.relation.endAt")}</label>
           <input id="relation-end" bind:value={endAt} disabled={working} aria-describedby="relation-feedback" />
-          <button type="submit" disabled={working || !endAt.trim()}>结束关系</button>
+          <button type="submit" disabled={working || !endAt.trim()}>{t("governance.relation.end")}</button>
         </form>
-        <p class="unavailable">当前关系详情 API 未返回旧版本对应的操作 ID，因此不提供会猜测 provenance 的恢复动作。本面板只能撤销当前会话内已知的上次操作。</p>
+        <p class="unavailable">{t("governance.relation.noRestoreNote")}</p>
       </details>
       </section>
     {/if}
@@ -326,8 +329,8 @@
     <div class="feedback-row">
       <p id="relation-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
       <div>
-        {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
-        {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLast}>撤销上次操作</button>{/if}
+        {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = t("governance.refreshed"); }).catch(() => { status = controller.refreshError; })}>{t("governance.retryRefresh")}</button>{/if}
+        {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLast}>{t("governance.relation.undoLast")}</button>{/if}
       </div>
     </div>
   {/if}
@@ -335,11 +338,11 @@
 
 {#if !readOnly}
   <dialog bind:this={suppressDialog} class="confirm-dialog" aria-labelledby="suppress-title" aria-describedby="suppress-description">
-    <h2 id="suppress-title">否决并永久抑制这条关系？</h2>
-    <p id="suppress-description">该主体、关系类型与客体组合会写入持久裁决；模型更换证据或重新抽取也不会自动恢复。</p>
+    <h2 id="suppress-title">{t("governance.relation.suppressTitle")}</h2>
+    <p id="suppress-description">{t("governance.relation.suppressBody")}</p>
     <div>
-      <button type="button" onclick={() => suppressDialog?.close()}>保留这条关系</button>
-      <button class="danger" type="button" onclick={suppressRelation}>否决并抑制</button>
+      <button type="button" onclick={() => suppressDialog?.close()}>{t("governance.relation.suppressKeep")}</button>
+      <button class="danger" type="button" onclick={suppressRelation}>{t("governance.suppressReject")}</button>
     </div>
   </dialog>
 {/if}

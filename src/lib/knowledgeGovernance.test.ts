@@ -33,6 +33,17 @@ import {
   type PrepareRebuildWait,
   type RebuildWaitHandle,
 } from "./knowledgeGovernance";
+// 文案已入字典:源码契约断言改为「钉住 t(键)」+「字典里这个键仍是那句中文」两问,
+// 意图不变(该 UI 在,且显示那句话),但不再随 i18n 改造误红。
+import { zh as governanceZh } from "./i18n/dict/governance";
+import { zh as graphZh } from "./i18n/dict/graph";
+import { zh as shellZh } from "./i18n/dict/shell";
+
+/** 断言源码以 t("键") 引用了该文案,且字典里这个键的中文仍是 expected。 */
+function expectCopy(source: string, dict: Record<string, unknown>, key: string, expected: string) {
+  expect(source).toContain(`t("${key}")`);
+  expect(dict[key]).toBe(expected);
+}
 
 const result = (operationId: string, rebuildGeneration = 1): KnowledgeMutationResult => ({
   operation_id: operationId,
@@ -459,24 +470,47 @@ describe("governance UI source contract", () => {
     const relation = source("./RelationDrawer.svelte");
     const pendingPanel = source("./PendingReviewPanel.svelte");
     const sidebar = source("./Sidebar.svelte");
-    for (const label of ["重命名实体", "添加别名", "合并实体", "拆分证据", "新建关系", "关联会议搭子"]) {
-      expect(entity).toContain(label);
+    for (const [key, label] of Object.entries({
+      "governance.entity.rename": "重命名实体",
+      "governance.entity.addAlias": "添加别名",
+      "governance.entity.merge": "合并实体",
+      "governance.entity.split": "拆分证据",
+      "governance.entity.createRelation": "新建关系",
+      "governance.entity.bindPerson": "关联会议搭子",
+    })) {
+      expectCopy(entity, governanceZh, key, label);
     }
-    for (const label of ["确认关系", "保存关系修改", "结束关系", "否决并抑制", "撤销上次操作"]) {
-      expect(relation).toContain(label);
+    for (const [key, label] of Object.entries({
+      "governance.relation.confirm": "确认关系",
+      "governance.relation.save": "保存关系修改",
+      "governance.relation.end": "结束关系",
+      "governance.suppressReject": "否决并抑制",
+      "governance.relation.undoLast": "撤销上次操作",
+    })) {
+      expectCopy(relation, governanceZh, key, label);
     }
-    for (const label of ["确认关系", "查看关系", "否决并抑制", "稍后处理"]) {
-      expect(pendingPanel).toContain(label);
+    for (const [key, label] of Object.entries({
+      "governance.relation.confirm": "确认关系",
+      "governance.pending.viewRelation": "查看关系",
+      "governance.suppressReject": "否决并抑制",
+      "governance.pending.later": "稍后处理",
+    })) {
+      expectCopy(pendingPanel, governanceZh, key, label);
     }
+    // 已移除的侧栏入口:源码不得残留,字典里也不该再有对应文案。
     expect(sidebar).not.toContain("待整理");
+    expect(Object.values(shellZh)).not.toContain("待整理");
   });
 
   it("shows note-level evidence in ordinary details and reserves mention offsets for governance", () => {
     const entity = source("./EntityGovernance.svelte");
     expect(entity).toContain('class="source-notes"');
-    expect(entity).toContain('{simple ? "关联笔记" : "证据"}');
+    expect(entity).toContain('{simple ? t("governance.entity.linkedNotes") : t("governance.evidence")}');
+    expect(governanceZh["governance.entity.linkedNotes"]).toBe("关联笔记");
+    expect(governanceZh["governance.evidence"]).toBe("证据");
     expect(entity).toContain("listNotes().catch(() => [])");
-    expect(entity).toContain("noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`");
+    expect(entity).toContain('noteTitles.get(noteId)?.trim() || t("governance.noteFallback", { id: noteId })');
+    expect(governanceZh["governance.noteFallback"]).toBe("笔记 {id}");
     expect(entity).toContain("noteStartedAt = new Map(notes.map((note) => [note.id, note.started_at]))");
     expect(entity).toContain("noteDurations = new Map(notes.map((note) => [note.id, note.duration_secs]))");
     expect(entity).toContain("formatDate(startedAt)");
@@ -486,7 +520,10 @@ describe("governance UI source contract", () => {
     expect(entity).toContain(".source-notes .note-link { display: flex; align-items: baseline; justify-content: space-between;");
     expect(entity).toContain("{#if simple}");
     expect(entity).toContain("{#each group.items as mention (mention.id)}");
-    expect(entity).toContain("第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}");
+    expect(entity).toContain(
+      't("governance.mention.position", { p: mention.paragraph_index + 1, start: mention.start_offset, end: mention.end_offset })',
+    );
+    expect(governanceZh["governance.mention.position"]).toBe("第 {p} 段 · 字符 {start}–{end}");
     expect(entity.indexOf('class="source-notes"')).toBeLessThan(entity.indexOf("{#each group.items as mention (mention.id)}"));
   });
 
@@ -505,10 +542,15 @@ describe("governance UI source contract", () => {
     const relation = source("./RelationDrawer.svelte");
     expect(relation).toContain("lastKnown");
     expect(relation).toContain("semanticEntityDetail");
-    expect(relation).toContain("接口仅返回所选单条关系");
+    expect(relation).toContain('t("governance.relation.singleRelationNote")');
+    expect(governanceZh["governance.relation.singleRelationNote"]).toContain("接口仅返回所选单条关系");
     expect(relation).toContain("{#if controller.lastOperationId}");
     expect(relation).not.toContain("restoreOperationId");
+    // 这句已废弃的说法既不该在源码,也不该被搬进字典。
     expect(relation).not.toContain("当前索引没有这条关系的历史版本");
+    for (const v of Object.values(governanceZh)) {
+      if (typeof v === "string") expect(v).not.toContain("当前索引没有这条关系的历史版本");
+    }
   });
 
   it("includes explicit no-evidence copy and accessibility markers", () => {
@@ -518,8 +560,8 @@ describe("governance UI source contract", () => {
     expect(split).toContain("<dialog");
     expect(split).toContain("showModal()");
     expect(split).toContain("aria-live");
-    expect(split).toContain("撤销本次拆分");
-    expect(relation).toContain("用户直接声明");
+    expectCopy(split, governanceZh, "governance.split.undo", "撤销本次拆分");
+    expectCopy(relation, governanceZh, "governance.relation.userAssertion", "用户直接声明");
     expect(relation).toContain("aria-live");
     expect(route).toMatch(/\.key\s*!==?\s*"Escape"|\.key\s*===?\s*"Escape"/);
     for (const content of [split, relation, route]) {
@@ -531,16 +573,22 @@ describe("governance UI source contract", () => {
   it("explains why relation filters and backfill actions have no candidates", () => {
     const toolbar = source("./KnowledgeGraphToolbar.svelte");
     const backfill = source("./RelationBackfillDialog.svelte");
-    expect(toolbar).toContain("还没有可筛选的具体关系。完成笔记关系分析后会显示在这里。");
-    expect(backfill).toContain("关系已是最新，或笔记中还没有可识别的实体");
+    expectCopy(toolbar, graphZh, "graph.toolbar.noPredicates", "还没有可筛选的具体关系。完成笔记关系分析后会显示在这里。");
+    expect(backfill).toContain('t("governance.backfill.nothingToAnalyze")');
+    expect(governanceZh["governance.backfill.nothingToAnalyze"]).toContain("关系已是最新，或笔记中还没有可识别的实体");
   });
 
   it("lets users leave the modal after a backfill cancel request is accepted", () => {
     const backfill = source("./RelationBackfillDialog.svelte");
     expect(backfill).toContain('busy && state.phase !== "cancel-requested"');
-    expect(backfill).toContain("当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。");
-    expect(backfill).toContain('<button class="secondary" type="button" onclick={closeDialog}>关闭窗口</button>');
-    expect(backfill).not.toContain('<button class="secondary" type="button" disabled>等待取消</button>');
+    expectCopy(backfill, governanceZh, "governance.backfill.cancelNote", "当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。");
+    expect(backfill).toContain('<button class="secondary" type="button" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</button>');
+    expect(governanceZh["governance.backfill.closeWindow"]).toBe("关闭窗口");
+    // 取消进行中不得退化成一个只能干等的禁用按钮(文案与禁用态都不该出现)。
+    expect(backfill).not.toContain('<button class="secondary" type="button" disabled>');
+    for (const v of Object.values(governanceZh)) {
+      if (typeof v === "string") expect(v).not.toBe("等待取消");
+    }
   });
 });
 

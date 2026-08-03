@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { splitMentions, exportFileName } from "./notes";
 import type { GraphExtraction, RefinedDoc, RefinedDocV2, RelationFact } from "./notes";
+import { zh as notesZh } from "./i18n/dict/notes";
+
+// 兜底文件名走 i18n 字典(测试默认 locale=zh),断言从分片取值,不再硬编码中文。
+const UNTITLED = notesZh["notes.untitled"];
 
 const legacyGraphFixture: RefinedDoc = {
   schema_version: 1,
@@ -139,13 +143,13 @@ describe("exportFileName", () => {
     expect(exportFileName('a/b\\c:d*e?f"g<h>i|j', "2026-07-16T15:30:09+08:00")).toBe(
       "a-b-c-d-e-f-g-h-i-j-20260716-1530.md",
     );
-    expect(exportFileName("   ", "2026-07-16T15:30:09+08:00")).toBe("未命名-20260716-1530.md");
+    expect(exportFileName("   ", "2026-07-16T15:30:09+08:00")).toBe(`${UNTITLED}-20260716-1530.md`);
   });
   it("时间解析失败时省略时间段", () => {
     expect(exportFileName("t", "not-a-date")).toBe("t.md");
   });
   it("全非法字符标题(清洗后只剩连字符)兜底「未命名」", () => {
-    expect(exportFileName("///", "2026-07-16T15:30:09+08:00")).toBe("未命名-20260716-1530.md");
+    expect(exportFileName("///", "2026-07-16T15:30:09+08:00")).toBe(`${UNTITLED}-20260716-1530.md`);
   });
   it("剥控制字符与双向覆盖符,防换行入名与视觉欺骗", () => {
     expect(exportFileName("a\nb\u202ec", "not-a-date")).toBe("abc.md");

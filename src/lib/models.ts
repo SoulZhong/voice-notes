@@ -39,6 +39,8 @@ export type Settings = {
   speaker_model: string;
   // "system" | "light" | "dark";具体枚举/校验留给后续任务,这里先补字段让 applyTheme 能读到值
   theme: string;
+  // UI 语言:"system" | "zh" | "en"。注意与 language_filter(转写乱码过滤)无关。
+  ui_lang: string;
   // 仅录系统声(不录麦克风)
   record_system_only: boolean;
   // 录制时保持外放音量:麦克风用普通输入代替 VPIO(无 ducking,失去系统回声消除)

@@ -11,6 +11,8 @@ import {
   subscribeRelationBackfillIndexStatus,
   type RelationBackfillApi,
 } from "./relationBackfill";
+// 文案已入字典:源码契约断言改为「钉住 t(键)」+「字典里这个键仍是那句中文」两问。
+import { zh as governanceZh } from "./i18n/dict/governance";
 
 const { invokeMock, listenMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -526,27 +528,34 @@ describe("backfill dialog source contract", () => {
     expect(graph).toContain("<RelationBackfillDialog");
     expect(dialog).toContain("<dialog");
     expect(dialog).toContain("showModal()");
-    expect(dialog).toContain("笔记数量");
-    expect(dialog).toContain("执行体");
-    expect(dialog).toContain("精确模型");
-    expect(dialog).toContain("契约版本");
-    expect(dialog).toContain("将把修订稿发送给当前配置的处理方式");
+    for (const [key, copy] of Object.entries({
+      "governance.backfill.noteCount": "笔记数量",
+      "governance.backfill.executor": "执行体",
+      "governance.backfill.model": "精确模型",
+      "governance.backfill.contractVersion": "契约版本",
+    })) {
+      expect(dialog).toContain(`t("${key}")`);
+      expect(governanceZh[key as keyof typeof governanceZh]).toBe(copy);
+    }
+    expect(dialog).toContain('t("governance.backfill.consent")');
+    expect(governanceZh["governance.backfill.consent"]).toContain("将把修订稿发送给当前配置的处理方式");
     expect(dialog).not.toMatch(/价格|费用|token|令牌估算/i);
   });
 
   it("keeps full IDs and technical errors inspectable only through disclosure", () => {
     const dialog = source("./RelationBackfillDialog.svelte");
-    for (const text of [
-      "停止分析",
-      "继续未完成笔记",
-      "重新预览",
-      "aria-live",
-      "当前笔记",
-      "失败详情",
-      "技术详情",
-    ]) {
-      expect(dialog).toContain(text);
+    for (const [key, copy] of Object.entries({
+      "governance.backfill.stop": "停止分析",
+      "governance.backfill.resume": "继续未完成笔记",
+      "governance.backfill.repreview": "重新预览",
+      "governance.backfill.currentNote": "当前笔记",
+      "governance.backfill.failuresTitle": "失败详情",
+      "governance.backfill.technicalDetails": "技术详情",
+    })) {
+      expect(dialog).toContain(`t("${key}")`);
+      expect(governanceZh[key as keyof typeof governanceZh]).toBe(copy);
     }
+    expect(dialog).toContain("aria-live");
     expect(dialog).toContain("<details");
     expect(dialog).not.toContain("text-overflow: ellipsis");
     expect(dialog).not.toContain("line-clamp");
@@ -560,7 +569,8 @@ describe("backfill dialog source contract", () => {
     expect(dialog).toContain("lastReportedGeneration");
     expect(dialog).toContain("next.publishedGeneration");
     expect(dialog).not.toMatch(/lastReportedGeneration = null;[\s\S]{0,80}dialog\.showModal/);
-    expect(dialog).toContain("重试索引");
+    expect(dialog).toContain('t("governance.backfill.retryIndex")');
+    expect(governanceZh["governance.backfill.retryIndex"]).toBe("重试索引");
     expect(dialog).toContain("controller.retryIndex()");
     expect(graph).toContain("onCompleted={refreshAfterBackfill}");
     expect(graph).toContain("loadSemantic(effectiveGraphFilter)");
