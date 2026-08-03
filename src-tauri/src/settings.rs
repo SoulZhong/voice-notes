@@ -65,6 +65,10 @@ pub struct Settings {
     /// 外观主题,消费任务:主题切换。"system"/"light"/"dark"。
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI 语言:"system"(跟随系统)/"zh"/"en"。前端界面与托盘/后端用户可见文案共用。
+    /// 注意与 language_filter(转写乱码过滤)语义无关。
+    #[serde(default = "default_ui_lang")]
+    pub ui_lang: String,
     /// 仅录系统声(不录麦克风),消费任务:录制开关。
     #[serde(default)]
     pub record_system_only: bool,
@@ -148,6 +152,10 @@ fn default_theme() -> String {
     "system".into()
 }
 
+fn default_ui_lang() -> String {
+    "system".into()
+}
+
 fn default_shortcut() -> String {
     "Alt+CmdOrCtrl+R".into()
 }
@@ -194,6 +202,7 @@ impl Default for Settings {
             dashscope_api_key: String::new(),
             speaker_model: default_speaker_model(),
             theme: default_theme(),
+            ui_lang: default_ui_lang(),
             record_system_only: false,
             keep_output_volume: false,
             language_filter: true,
@@ -380,17 +389,19 @@ mod tests {
         std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":false,"mirror_prefix":"x"}"#).unwrap();
         let s = load(tmp.path());
         assert_eq!(s.theme, "system");
+        assert_eq!(s.ui_lang, "system", "老配置缺 ui_lang 应回落跟随系统");
         assert!(!s.record_system_only && s.language_filter && s.keep_audio);
         assert!(!s.keep_output_volume, "保持外放音量默认关(保留 AEC)");
         assert!(!s.shortcut_enabled);
         assert_eq!(s.shortcut, "Alt+CmdOrCtrl+R");
         assert!(s.tray_enabled);
-        let s = Settings { theme: "dark".into(), record_system_only: true, language_filter: false,
-            keep_audio: false, keep_output_volume: true, shortcut_enabled: true,
+        let s = Settings { theme: "dark".into(), ui_lang: "en".into(), record_system_only: true,
+            language_filter: false, keep_audio: false, keep_output_volume: true, shortcut_enabled: true,
             shortcut: "Alt+CmdOrCtrl+K".into(), tray_enabled: false, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert_eq!(got.theme, "dark");
+        assert_eq!(got.ui_lang, "en");
         assert!(got.record_system_only && !got.language_filter && !got.keep_audio);
         assert!(got.keep_output_volume);
         assert!(got.shortcut_enabled && !got.tray_enabled);

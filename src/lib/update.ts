@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "$lib/i18n/index.svelte";
 
 export type UpdateInfo = {
   /** 当前应用版本。 */
@@ -41,8 +42,8 @@ export function dismissUpdate(latest: string): void {
 
 /** 下载进度 → 按钮文案。总长未知(部分 CDN 不给 Content-Length)退化省略号。 */
 export function updateProgressLabel(downloaded: number, total: number | undefined): string {
-  if (!total) return "更新中…";
-  return `更新中 ${Math.min(100, Math.round((downloaded / total) * 100))}%`;
+  if (!total) return t("settings.update.updating");
+  return t("settings.update.updatingPct", { pct: Math.min(100, Math.round((downloaded / total) * 100)) });
 }
 
 /** 网络请求超时(查询与下载各自适用):连接悬死不能让按钮永远停在「更新中」。 */
@@ -84,7 +85,7 @@ async function doApplyUpdate(onProgress: (label: string) => void): Promise<"none
       } else if (event.event === "Finished") {
         // 下载完成后还有签名校验+解包安装,可能要几十秒;不处理会停在
         // 「更新中 100%」像卡死。
-        onProgress("安装中…");
+        onProgress(t("settings.update.installing"));
       }
     },
     { timeout: UPDATE_TIMEOUT_MS },

@@ -98,6 +98,21 @@
   let editor: Editor | null = null;
   let ctxRef: Ctx | null = null;
   let destroyed = false;
+  /**
+   * editable 的**非响应式**镜像,专供 ProseMirror 回调读取(下方 uiPlugins 的
+   * props.editable 与 segment NodeView 的 canEdit)。
+   *
+   * 为什么不能让那些回调直接读 editable prop:编辑器实例的生命周期不归 Svelte 管,
+   * PM 会在创建它的 effect 销毁之后继续调这些回调;此时读 prop 就是读一个已失效的
+   * derived,Svelte 发 derived_inert 警告**并中断本次渲染**——症状是详情页停在
+   * 「加载中…」,既不报错也不出内容(有 AI 修订稿时必现)。
+   *
+   * 由下方追踪 editable 的 $effect 负责同步(赋值必须先于 dispatch,否则 PM 重读到旧值);
+   * onMount 建编辑器前还会再同步一次,保证首帧就是宿主传进来的值。
+   * 这里刻意不写 `= editable`:那样只捕获初始值,正是本变量要的语义,但 svelte-check
+   * 会当成误用而告警(state_referenced_locally),故用与 prop 相同的默认值起手。
+   */
+  let editableNow = true;
   // 精修稿保存状态:载入 doc + 各 origIndex 的序列化基线 + 上次已保存载荷指纹
   let loadedDoc: RefinedDoc | null = null;
   let baseline = new Map<number, string>();
@@ -566,7 +581,7 @@
       new Plugin({
         key: new PluginKey("md-editor-ui"),
         props: {
-          editable: () => editable,
+          editable: () => editableNow,
           nodeViews: {
             refined_paragraph: makeRefinedParagraphView({
               speakerBadge: (attrs) => speakerBadge(attrs as BadgeAttrs),
@@ -577,7 +592,7 @@
             transcript_segment: makeSegmentView({
               speakerBadge: (attrs) => speakerBadge(attrs as BadgeAttrs),
               formatTs,
-              canEdit: () => editable,
+              canEdit: () => editableNow,
               // segments 模式徽章回调里只有 seq 必然可信(段身份的唯一锚点);
               // speaker/source 是点击当下的渲染快照,宿主应按 seq 回查
               // note.segments 拿权威 speaker/source/startMs,不要直接拿这里
@@ -662,6 +677,8 @@
   );
 
   onMount(async () => {
+    // 首帧对齐:PM 回调只读镜像,建编辑器前必须让它等于宿主此刻传进来的值。
+    editableNow = editable;
     let builder = Editor.make()
       .config((ctx) => {
         ctx.set(rootCtx, rootEl);
@@ -710,8 +727,10 @@
 
   // editable 变化即时生效:PM 的 editable prop 只在事务分发时被重新读取,
   // 派发一个空事务强制它重读(依赖 editable 建立 $effect 追踪)。
+  // 先把新值写进非响应式镜像再 dispatch——PM 重读的是镜像(见 editableNow 注释)。
   $effect(() => {
     void editable;
+    editableNow = editable;
     if (ctxRef) {
       const view = ctxRef.get(editorViewCtx);
       view.dispatch(view.state.tr);

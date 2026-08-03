@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { t } from "$lib/i18n/index.svelte";
   import {
     createRelationBackfillController,
     type RelationBackfillState,
@@ -64,7 +65,11 @@
       state.phase === "waiting-for-index",
   );
   const closeBlocked = $derived(busy && state.phase !== "cancel-requested");
-  const providerLabel = $derived(state.preview?.provider === "agent" ? "本机 Agent" : "在线接口");
+  const providerLabel = $derived(
+    state.preview?.provider === "agent"
+      ? t("governance.backfill.providerAgent")
+      : t("governance.backfill.providerOnline"),
+  );
 
   function closeDialog() {
     if (closeBlocked) return;
@@ -104,44 +109,44 @@
   <div class="dialog-shell">
     <header>
       <div>
-        <p class="eyebrow">知识图谱</p>
-        <h2 id="relation-backfill-title">分析笔记关系</h2>
+        <p class="eyebrow">{t("governance.backfill.eyebrow")}</p>
+        <h2 id="relation-backfill-title">{t("governance.backfill.title")}</h2>
       </div>
       <button
         bind:this={closeButton}
         class="close-button"
         type="button"
-        aria-label="关闭笔记关系分析"
+        aria-label={t("governance.backfill.closeAria")}
         disabled={closeBlocked}
         onclick={closeDialog}
-      >关闭</button>
+      >{t("governance.backfill.close")}</button>
     </header>
 
     <div class="status" aria-live="polite" aria-atomic="false">
       {#if state.phase === "preview-loading"}
-        <p class="lead">正在读取需要分析的笔记与当前处理方式。</p>
+        <p class="lead">{t("governance.backfill.previewLoading")}</p>
       {:else if state.phase === "preview-error"}
         <p class="message error">{state.error}</p>
         {#if state.technicalError}
-          <details class="technical"><summary>技术详情</summary><pre>{state.technicalError}</pre></details>
+          <details class="technical"><summary>{t("governance.backfill.technicalDetails")}</summary><pre>{state.technicalError}</pre></details>
         {/if}
-        <button class="secondary" type="button" onclick={() => controller.preview(noteIds)}>重新预览</button>
+        <button class="secondary" type="button" onclick={() => controller.preview(noteIds)}>{t("governance.backfill.repreview")}</button>
       {:else if state.preview && (state.phase === "preview-ready")}
-        <p class="lead">系统会从已有笔记中识别实体之间的具体关系。开始前请核对处理范围，以及内容将交给谁。</p>
+        <p class="lead">{t("governance.backfill.lead")}</p>
         <dl class="facts">
-          <div><dt>笔记数量</dt><dd>{state.preview.note_ids.length}</dd></div>
-          <div><dt>执行体</dt><dd>{providerLabel}</dd></div>
-          <div><dt>精确模型</dt><dd>{state.preview.model}</dd></div>
-          <div><dt>契约版本</dt><dd>{state.preview.contract_version}</dd></div>
+          <div><dt>{t("governance.backfill.noteCount")}</dt><dd>{state.preview.note_ids.length}</dd></div>
+          <div><dt>{t("governance.backfill.executor")}</dt><dd>{providerLabel}</dd></div>
+          <div><dt>{t("governance.backfill.model")}</dt><dd>{state.preview.model}</dd></div>
+          <div><dt>{t("governance.backfill.contractVersion")}</dt><dd>{state.preview.contract_version}</dd></div>
         </dl>
         <details class="selection">
-          <summary>查看本次笔记 ID</summary>
+          <summary>{t("governance.backfill.viewNoteIds")}</summary>
           <ul>
             {#each state.preview.note_ids as noteId (noteId)}<li>{noteId}</li>{/each}
           </ul>
         </details>
         {#if state.preview.note_ids.length === 0}
-          <p class="message">没有需要分析的笔记。关系已是最新，或笔记中还没有可识别的实体。现有转写稿不会改变。</p>
+          <p class="message">{t("governance.backfill.nothingToAnalyze")}</p>
         {:else}
           <label class="consent">
             <input
@@ -149,48 +154,48 @@
               checked={state.acknowledged}
               onchange={(event) => controller.acknowledge(event.currentTarget.checked)}
             />
-            <span>我已确认：将把修订稿发送给当前配置的处理方式。分析只更新图谱中的关系，不修改转写段落与笔记顺序。</span>
+            <span>{t("governance.backfill.consent")}</span>
           </label>
         {/if}
       {:else if busy || state.phase === "index-failed" || state.phase === "completed" || state.phase === "partial" || state.phase === "failed" || state.phase === "cancelled"}
         <div class="progress-heading">
           <p class="lead">
-            {#if state.phase === "completed"}关系分析已完成
-            {:else if state.phase === "partial"}部分笔记未完成
-            {:else if state.phase === "failed"}关系分析未完成
-            {:else if state.phase === "index-failed"}索引发布未完成
-            {:else if state.phase === "cancelled"}关系分析已取消
-            {:else if state.phase === "starting"}正在建立安全连接
-            {:else if state.phase === "cancel-requested"}停止请求已送达
-            {:else if state.phase === "index-retrying"}正在重试图谱索引
-            {:else if state.phase === "waiting-for-index"}正在发布图谱索引
-            {:else}正在分析笔记关系{/if}
+            {#if state.phase === "completed"}{t("governance.backfill.phaseCompleted")}
+            {:else if state.phase === "partial"}{t("governance.backfill.phasePartial")}
+            {:else if state.phase === "failed"}{t("governance.backfill.phaseFailed")}
+            {:else if state.phase === "index-failed"}{t("governance.backfill.phaseIndexFailed")}
+            {:else if state.phase === "cancelled"}{t("governance.backfill.phaseCancelled")}
+            {:else if state.phase === "starting"}{t("governance.backfill.phaseStarting")}
+            {:else if state.phase === "cancel-requested"}{t("governance.backfill.phaseCancelRequested")}
+            {:else if state.phase === "index-retrying"}{t("governance.backfill.phaseIndexRetrying")}
+            {:else if state.phase === "waiting-for-index"}{t("governance.backfill.phasePublishing")}
+            {:else}{t("governance.backfill.phaseRunning")}{/if}
           </p>
           <strong>{state.completed} / {state.total}</strong>
         </div>
         <progress max={Math.max(state.total, 1)} value={state.completed}>{state.completed} / {state.total}</progress>
         {#if state.currentNoteId}
-          <div class="current"><span>当前笔记</span><strong>{state.currentNoteId}</strong></div>
+          <div class="current"><span>{t("governance.backfill.currentNote")}</span><strong>{state.currentNoteId}</strong></div>
         {/if}
         {#if state.phase === "cancel-requested"}
-          <p class="message">当前模型请求结束或超时后会停止，结果不会写入。你可以关闭窗口继续使用应用。</p>
+          <p class="message">{t("governance.backfill.cancelNote")}</p>
         {/if}
         {#if state.error}<p class="message error">{state.error}</p>{/if}
         {#if state.technicalError && state.failures.length === 0}
-          <details class="technical"><summary>技术详情</summary><pre>{state.technicalError}</pre></details>
+          <details class="technical"><summary>{t("governance.backfill.technicalDetails")}</summary><pre>{state.technicalError}</pre></details>
         {/if}
         {#if state.indexError}
-          <details class="technical"><summary>索引技术详情</summary><pre>{state.indexError}</pre></details>
+          <details class="technical"><summary>{t("governance.backfill.indexTechnicalDetails")}</summary><pre>{state.indexError}</pre></details>
         {/if}
         {#if state.failures.length > 0}
           <section class="failures" aria-labelledby="relation-backfill-failures">
-            <h3 id="relation-backfill-failures">失败详情</h3>
+            <h3 id="relation-backfill-failures">{t("governance.backfill.failuresTitle")}</h3>
             <ul>
               {#each state.failures as failure (`${failure.note_id}:${failure.error}`)}
                 <li>
-                  <strong>{failure.note_id || "图谱索引"}</strong>
-                  <span>此项未完成，可以重新预览后重试。</span>
-                  <details class="technical"><summary>技术详情</summary><pre>{failure.error}</pre></details>
+                  <strong>{failure.note_id || t("governance.backfill.graphIndex")}</strong>
+                  <span>{t("governance.backfill.failureHint")}</span>
+                  <details class="technical"><summary>{t("governance.backfill.technicalDetails")}</summary><pre>{failure.error}</pre></details>
                 </li>
               {/each}
             </ul>
@@ -206,15 +211,15 @@
           type="button"
           disabled={!state.acknowledged || !state.preview || state.preview.note_ids.length === 0}
           onclick={start}
-        >开始分析</button>
+        >{t("governance.backfill.start")}</button>
       {:else if state.phase === "running"}
-        <button class="secondary danger" type="button" onclick={cancel}>停止分析</button>
+        <button class="secondary danger" type="button" onclick={cancel}>{t("governance.backfill.stop")}</button>
       {:else if state.phase === "cancel-requested"}
-        <button class="secondary" type="button" onclick={closeDialog}>关闭窗口</button>
+        <button class="secondary" type="button" onclick={closeDialog}>{t("governance.backfill.closeWindow")}</button>
       {:else if state.phase === "index-failed"}
-        <button class="primary" type="button" onclick={retryIndex}>重试索引</button>
+        <button class="primary" type="button" onclick={retryIndex}>{t("governance.backfill.retryIndex")}</button>
       {:else if state.phase === "failed" || state.phase === "partial" || state.phase === "cancelled"}
-        <button class="primary" type="button" onclick={resume}>继续未完成笔记</button>
+        <button class="primary" type="button" onclick={resume}>{t("governance.backfill.resume")}</button>
       {/if}
     </footer>
   </div>

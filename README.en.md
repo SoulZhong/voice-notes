@@ -29,6 +29,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 - **Playback & verification**: original audio is kept per track (auto-compressed to AAC, ~14 MB/hour/source). Click any sentence's timestamp to listen from there, with the playhead followed lyrics-style.
 - **WYSIWYG Markdown notes**: raw and refined transcripts share a Milkdown editor. Raw transcripts keep their sentence structure; refined transcripts support Markdown headings, lists, quotes, emphasis, and more, with save-on-pause or blur. You can also reassign speakers, rename notes, and export Markdown / plain text.
 - **Native system integration**: menu bar tray, global shortcut for start/stop, launch at login, light & dark themes.
+- **Bilingual interface**: switch between 中文 / English / follow-system in Settings; the UI and the menu bar update immediately, no restart needed.
 - **Tuned for Chinese-centric meetings**: SenseVoice (zh/en/ja/ko/yue) by default with optional Whisper, plus a language-hallucination filter that drops garbage output on silence.
 
 ## Installation
@@ -88,7 +89,7 @@ Works out of the box — every setting has a sensible default. Adjust as needed 
 
 | Group | Item | Notes |
 | --- | --- | --- |
-| General | Appearance / launch at login / menu bar icon / global shortcut | Shortcut defaults to `⌥⌘R`, opt-in |
+| General | Appearance / language / launch at login / menu bar icon / global shortcut | Shortcut defaults to `⌥⌘R`, opt-in |
 | Storage | **Data directory / models directory** | Relocatable anywhere (iCloud / external drive); existing content is migrated automatically |
 | Storage | Audio disk usage & cleanup | Deletes audio only; transcripts and speakers are kept |
 | Recording | System audio only / keep output volume / garbage filter / keep audio | Scenario guide below under "Recording options" |

@@ -7,12 +7,13 @@
     type ModelsStatus,
     type ModelDownloadEvent,
   } from "$lib/models";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     status,
     compact = false,
     onComplete,
-    primaryLabel = "下载模型",
+    primaryLabel,
   }: { status: ModelsStatus; compact?: boolean; onComplete: () => void; primaryLabel?: string } = $props();
 
   const missing = $derived(
@@ -62,7 +63,7 @@
       await downloadModels();
     } catch (e) {
       // "下载已在进行中" 不算错：保持 downloading 态继续收进度事件。
-      if (!String(e).includes("已在进行中")) {
+      if (!String(e).includes("已在进行中")) { // i18n-exempt: 与后端错误原文判等
         downloading = false;
         error = String(e);
       }
@@ -72,28 +73,29 @@
   const pct = (p: { received: number; total: number }) =>
     p.total > 0 ? Math.min(100, Math.floor((p.received / p.total) * 100)) : 0;
   const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
-  const phaseText: Record<string, string> = {
-    downloading: "下载中",
-    verifying: "校验中",
-    extracting: "解压中",
-    done: "完成",
+  // phase → i18n 键;渲染处 t() 取当前语言文案。
+  const phaseKey: Record<string, string> = {
+    downloading: "ai.modelCard.phase.downloading",
+    verifying: "ai.modelCard.phase.verifying",
+    extracting: "ai.modelCard.phase.extracting",
+    done: "ai.modelCard.phase.done",
   };
 </script>
 
 <div class="card" class:compact>
   {#if compact}
-    <span>区分「谁在说话」还需补一个小模型（约 {totalMb}MB）。</span>
+    <span>{t("ai.modelCard.compactNotice", { mb: totalMb })}</span>
   {:else}
-    <h2>下载语音模型</h2>
-    <p class="desc">首次使用需下载识别模型（共约 {totalMb}MB），全程本地运行、不上传任何音频。</p>
+    <h2>{t("ai.modelCard.title")}</h2>
+    <p class="desc">{t("ai.modelCard.desc", { mb: totalMb })}</p>
   {/if}
 
   {#each missing as a (a.id)}
     <div class="row">
-      <span class="label">{a.label} · 约 {a.approx_mb}MB</span>
+      <span class="label">{a.label} · {t("ai.modelCard.approxMb", { mb: a.approx_mb })}</span>
       {#if prog[a.id]}
         <span class="phase">
-          {phaseText[prog[a.id].phase] ?? prog[a.id].phase}
+          {phaseKey[prog[a.id].phase] ? t(phaseKey[prog[a.id].phase]) : prog[a.id].phase}
           {#if prog[a.id].phase === "downloading" && prog[a.id].total > 0}
             {mb(prog[a.id].received)}/{mb(prog[a.id].total)}MB
           {/if}
@@ -104,20 +106,20 @@
   {/each}
 
   {#if error}
-    <div class="error">下载失败：{error}（已下载部分已保留，重试将续传）</div>
+    <div class="error">{t("ai.modelCard.failed", { e: error })}</div>
   {/if}
   {#if cancelled}
-    <div class="hint">已暂停下载，已下载部分保留，可随时继续。</div>
+    <div class="hint">{t("ai.modelCard.paused")}</div>
   {/if}
 
   <div class="actions">
     {#if downloading}
-      <button onclick={() => cancelModelsDownload()}>暂停下载</button>
+      <button onclick={() => cancelModelsDownload()}>{t("ai.modelCard.pause")}</button>
     {:else}
-      <button class="primary" onclick={start}>{error || cancelled ? "继续下载" : primaryLabel}</button>
+      <button class="primary" onclick={start}>{error || cancelled ? t("ai.modelCard.resume") : (primaryLabel ?? t("ai.modelCard.download"))}</button>
     {/if}
     {#if !compact}
-      <span class="note">下载镜像可在设置页配置。</span>
+      <span class="note">{t("ai.modelCard.mirrorNote")}</span>
     {/if}
   </div>
 </div>

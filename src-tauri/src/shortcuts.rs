@@ -23,7 +23,7 @@ pub fn apply_from_settings(app: &tauri::AppHandle) -> Result<(), String> {
     // 先清旧:保证本函数可反复调用而不残留、不重复注册(幂等前提)。
     app.global_shortcut()
         .unregister_all()
-        .map_err(|e| format!("清除旧快捷键失败: {e}"))?;
+        .map_err(|e| crate::tr!("清除旧快捷键失败: {e}", "Failed to clear the old shortcuts: {e}"))?;
     // settings.json 是自举指针,永在 app_data_dir;读不到目录则退回默认设置
     //(shortcut_enabled=false),即本次不注册任何快捷键。
     let s = match app.path().app_data_dir() {
@@ -34,10 +34,13 @@ pub fn apply_from_settings(app: &tauri::AppHandle) -> Result<(), String> {
         let sc = s
             .shortcut
             .parse::<Shortcut>()
-            .map_err(|e| format!("快捷键格式无效: {e}"))?;
+            .map_err(|e| crate::tr!("快捷键格式无效: {e}", "Invalid shortcut format: {e}"))?;
         app.global_shortcut()
             .register(sc)
-            .map_err(|e| format!("快捷键注册失败(可能与系统或其它应用冲突): {e}"))?;
+            .map_err(|e| crate::tr!(
+                "快捷键注册失败(可能与系统或其它应用冲突): {e}",
+                "Failed to register the shortcut (it may conflict with the system or another app): {e}"
+            ))?;
     }
     Ok(())
 }

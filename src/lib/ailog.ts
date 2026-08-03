@@ -36,9 +36,10 @@ export const aiLogsExport = () => invoke<{ path: string; count: number }>("ai_lo
 /** 在访达中打开日志目录(不存在则先创建),返回目录路径。 */
 export const aiLogsOpenDir = () => invoke<string>("ai_logs_open_dir");
 
+/** 日志类别 → i18n 键(ai 分片);渲染处用 t() 取当前语言文案。 */
 export const AI_LOG_KIND_LABELS: Record<string, string> = {
-  refine_chunk: "AI 分块整理",
-  title: "标题生成",
-  agent_refine: "Agent AI 整理",
-  mcp_apply: "AI 写回",
+  refine_chunk: "ai.logs.kind.refine_chunk",
+  title: "ai.logs.kind.title",
+  agent_refine: "ai.logs.kind.agent_refine",
+  mcp_apply: "ai.logs.kind.mcp_apply",
 };

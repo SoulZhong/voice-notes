@@ -3,14 +3,16 @@
 import { pinyin } from "pinyin-pro";
 import type { PersonSummary } from "./people";
 import { formatDate } from "./notes";
+import { i18n, t } from "$lib/i18n/index.svelte";
 
 /** 人物显示名:未命名按全局编号「说话人 N」兜底(与徽章一致)。 */
-export const personLabel = (p: PersonSummary) => p.name || `说话人 ${p.id.replace(/^P/, "")}`;
+export const personLabel = (p: PersonSummary) =>
+  p.name || t("speakers.personFallback", { n: p.id.replace(/^P/, "") });
 
 /** "最近 MM-DD":未命名/重名条目的区分后缀;无日期给空串。 */
 export const recentLabel = (p: PersonSummary) => {
   const d = formatDate(p.last_seen);
-  return d === "—" ? "" : `最近 ${d.slice(5, 10)}`;
+  return d === "—" ? "" : t("speakers.recentShort", { d: d.slice(5, 10) });
 };
 
 /** 出现超过一次的名字集合:同名条目必须带区分后缀,否则列表里两行一模一样。 */
@@ -55,8 +57,13 @@ export function filterPeople(people: PersonSummary[], query: string): PersonSumm
 }
 
 /** 人物字母序:中文按拼音、数字段按数值("说话人 2"<"说话人 10")。已命名按名字,
-    未命名按编号标签——分组展示时两组各自内部有序。 */
+    未命名按编号标签——分组展示时两组各自内部有序。
+    排序规则跟随界面语言:中文界面按拼音(否则中文名会退化成码点序),英文界面按 en
+    默认序;numeric 两边都要,编号标签的数值序与语言无关。 */
 export function sortPeopleAlpha(people: PersonSummary[]): PersonSummary[] {
-  const collator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", { numeric: true });
+  const collator = new Intl.Collator(
+    i18n.locale === "zh" ? "zh-Hans-CN-u-co-pinyin" : "en",
+    { numeric: true },
+  );
   return [...people].sort((a, b) => collator.compare(personLabel(a), personLabel(b)));
 }

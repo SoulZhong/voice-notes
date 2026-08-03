@@ -28,6 +28,10 @@ import {
   sanitizeDebugGraphUrl,
   viewEdges,
 } from "./knowledgeView";
+// 文案已入字典:源码契约断言改为「钉住 t(键)」+「字典里这个键仍是那句中文」两问,
+// 意图不变(该 UI 在,且显示那句话),但不再随 i18n 改造误红。
+import { zh as graphZh } from "./i18n/dict/graph";
+import { zh as shellZh } from "./i18n/dict/shell";
 
 describe("debug fixture route isolation", () => {
   it("blocks production effects before the fixture session exists and clears unsafe inspectors", () => {
@@ -622,15 +626,18 @@ describe("exploratory graph UI source contract", () => {
 
   it("explains relation lines with persistent high-contrast map symbols", () => {
     const forceGraph = source("./ForceGraph.svelte");
-    for (const copy of [
-      "明确关系",
-      "箭头表示方向 · 点击线查看依据",
-      "共用实体",
-      "细线表示两篇文章含有相同实体",
-      "同时提及",
-      "细线表示一篇笔记提到两个实体",
-    ]) {
-      expect(forceGraph).toContain(copy);
+    // 图例六条文案:源码钉 t(键),中文真值查 graph 分片字典。
+    const legend: Record<string, string> = {
+      "graph.edgeKey.semantic": "明确关系",
+      "graph.edgeKey.semanticDesc": "箭头表示方向 · 点击线查看依据",
+      "graph.edgeKey.sharedEntities": "共用实体",
+      "graph.edgeKey.sharedEntitiesDesc": "细线表示两篇文章含有相同实体",
+      "graph.edgeKey.cooccur": "同时提及",
+      "graph.edgeKey.cooccurDesc": "细线表示一篇笔记提到两个实体",
+    };
+    for (const [key, copy] of Object.entries(legend)) {
+      expect(forceGraph).toContain(`t("${key}")`);
+      expect(graphZh[key as keyof typeof graphZh]).toBe(copy);
     }
     expect(forceGraph).toMatch(/\.semantic-line\s*\{[^}]*stroke:\s*var\(--accent\)[^}]*stroke-width:\s*2\.75px/s);
     expect(forceGraph).toMatch(/\.cooccurrence-line\s*\{[^}]*stroke:\s*var\(--ink-secondary\)[^}]*stroke-width:\s*1\.35px/s);
@@ -674,8 +681,10 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("defaultBackbone(");
     expect(route).toContain("nextExpandedIds(");
     expect(route).toContain("visibleIds = new Set([...visibleIds, ...matches])");
-    expect(route).toContain("还没有分析笔记之间的具体关系");
-    expect(route).toContain("分析笔记关系");
+    expect(route).toContain('t("graph.fallback.notice")');
+    expect(graphZh["graph.fallback.notice"]).toContain("还没有分析笔记之间的具体关系");
+    expect(route).toContain('t("graph.backfill.analyze")');
+    expect(graphZh["graph.backfill.analyze"]).toBe("分析笔记关系");
     expect(route).toContain("onEdgePick={pickNoteEdge}");
     expect(route).toContain('<GraphEdgeInspector');
     expect(route).toContain('perspective="note"');
@@ -688,19 +697,28 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("<RelationDrawer");
     expect(route).toContain("simple={!manageOpen}");
     expect(route).toMatch(/<RelationDrawer[\s\S]{0,180}simple=\{true\}/);
-    expect(sidebar).toContain("搜索人物、项目或术语");
+    expect(sidebar).toContain('t("shell.graph.searchEntities")');
+    expect(shellZh["shell.graph.searchEntities"]).toBe("搜索人物、项目或术语");
     expect(sidebar).toContain('class="gchips"');
     expect(sidebar).toContain('class="gmode"');
-    expect(sidebar).toContain("文章");
+    expect(sidebar).toContain('t("shell.graph.modeNote")');
+    expect(shellZh["shell.graph.modeNote"]).toBe("文章");
+    // 已移除的入口:源码不得残留,字典里也不该再有对应文案(否则只是被搬进了字典)。
     for (const removed of ["待整理", "设为路径起点"]) {
       expect(sidebar).not.toContain(removed);
+      expect(Object.values(shellZh)).not.toContain(removed);
     }
   });
 
   it("retains filtering, article view, and right-click governance without specialist workflows", () => {
     const route = source("../routes/graph/+page.svelte");
-    for (const retained of ["KnowledgeGraphToolbar", "noteGraphState", "onContextMenu={openCtxMenu}", "查看实体详情", "管理实体"]) {
+    for (const retained of ["KnowledgeGraphToolbar", "noteGraphState", "onContextMenu={openCtxMenu}"]) {
       expect(route).toContain(retained);
+    }
+    // 右键菜单两项:源码钉 t(键),中文真值查字典。
+    for (const [key, copy] of Object.entries({ "graph.ctx.viewDetail": "查看实体详情", "graph.ctx.manage": "管理实体" })) {
+      expect(route).toContain(`t("${key}")`);
+      expect(graphZh[key as keyof typeof graphZh]).toBe(copy);
     }
     for (const removed of [
       "KnowledgePathPanel",
@@ -789,7 +807,8 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("readOnly={true}");
     expect(route).toContain("!debugFixtureRequested && selected");
     expect(route).toContain("{#if !debugFixtureRequested}\n  <RelationBackfillDialog");
-    expect(route).toContain("仅创建并读取临时夹具，不会读取或修改真实资料库");
+    expect(route).toContain('t("graph.debug.banner")');
+    expect(graphZh["graph.debug.banner"]).toContain("仅创建并读取临时夹具，不会读取或修改真实资料库");
     expect(knowledge).toContain('invoke<SemanticGraphDebugFixture>("semantic_graph_debug_fixture")');
     expect(knowledge).toContain('invoke<RelationDetail | null>("semantic_graph_debug_relation_detail"');
     expect(knowledge).toContain('invoke<void>("semantic_graph_debug_release", { sessionId })');
@@ -854,7 +873,8 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain('globalSemanticPresence === "absent"');
     expect(route).toContain("probeGlobalSemanticPresence(");
     expect(route).toContain('globalSemanticPresence === "present"');
-    expect(route).toContain("当前筛选下没有语义关系");
+    expect(route).toContain('t("graph.filteredEmpty.notice")');
+    expect(graphZh["graph.filteredEmpty.notice"]).toContain("当前筛选下没有语义关系");
     expect(policy).toContain("function shouldUseLegacyFallback(");
     expect(route).not.toMatch(/semantic\.semantic_edges\.length === 0[\s\S]{0,180}cooccurrence_edges: graph\.edges/);
     const filteredEmpty = graph([node("a"), node("b")], []);
@@ -1010,14 +1030,18 @@ describe("exploratory graph UI source contract", () => {
     expect(route).toContain("semanticRequestFailed");
     expect(route).toContain("legacyFallbackGraph(");
     expect(route).toContain("visibleIds = initialIds(fallback)");
-    expect(route).toContain(">重新读取</button>");
+    expect(route).toContain('{t("graph.retryRead")}</button>');
+    expect(graphZh["graph.retryRead"]).toBe("重新读取");
     expect(policy).toContain("requestFailed ||");
     expect(route).toMatch(/semanticFallback[\s\S]{0,240}!semanticRequestFailed/);
     expect(route).toMatch(/filteredSemanticEmpty[\s\S]{0,220}!semanticRequestFailed/);
     expect(policy).toContain("function semanticRequestFailureMessage(");
     expect(route).toContain("semanticRequestFailureMessage(");
-    expect(policy).toContain("语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。");
-    expect(policy).toContain("语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。");
+    // 两句文案已移入 graph 分片字典;policy 只持有键,真值由 semanticRequestFailureMessage 下方断言。
+    expect(policy).toContain('"graph.semantic.failedWithLegacy"');
+    expect(policy).toContain('"graph.semantic.failedNoLegacy"');
+    expect(graphZh["graph.semantic.failedWithLegacy"]).toBe("语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。");
+    expect(graphZh["graph.semantic.failedNoLegacy"]).toBe("语义关系暂时无法读取，当前没有可用的备用关系图。请稍后重试。");
     expect(semanticRequestFailureMessage(true)).toBe(
       "语义关系暂时无法读取，已显示可用的共现关系。请稍后重试。",
     );

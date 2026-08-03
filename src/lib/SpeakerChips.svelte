@@ -3,6 +3,7 @@
   import type { PersonSummary } from "$lib/people";
   import { recentLabel } from "$lib/personPick";
   import PersonPickList from "$lib/PersonPickList.svelte";
+  import { localeVariants, t } from "$lib/i18n/index.svelte";
 
   let {
     speakers,
@@ -148,13 +149,17 @@
 
   async function markAsMe(id: string) {
     // 「这是我」也走重名拦截:库里已有「我」而这个说话人不是他 → 大概率同一人被拆重。
-    const hit = people?.find((p) => p.name === "我" && p.id !== speakers[id]?.person_id);
+    // 新记录按当前界面语言写(所见即所存),但比对必须认全部语言的写法——用户可能是
+    // 在中文界面标的「我」,切到英文后只认 "Me" 就会把同一个人再标一遍。
+    const me = t("notes.speaker.me");
+    const meNames = localeVariants("notes.speaker.me");
+    const hit = people?.find((p) => meNames.includes(p.name) && p.id !== speakers[id]?.person_id);
     if (hit && onPick) {
-      dupPending = { id, name: "我", person: hit, linkedOther: !!speakers[id]?.person_id };
+      dupPending = { id, name: me, person: hit, linkedOther: !!speakers[id]?.person_id };
       return;
     }
     cancelEdit();
-    await doRename(id, "我");
+    await doRename(id, me);
     onRenamed?.();
   }
 </script>
@@ -173,7 +178,7 @@
         {#if editable}
           <button
             class="name"
-            title="改名或选择人物"
+            title={t("speakers.chipTitle")}
             onmousedown={(e) => {
               // 面板开着时按下不抢焦点:输入框 blur(=提交并关闭)先行,click 再开会闪一下
               if (editingId === id) e.preventDefault();
@@ -203,7 +208,7 @@
             <input
               class="panel-input"
               autofocus
-              placeholder="输入名字,回车改名"
+              placeholder={t("speakers.chipRenamePlaceholder")}
               bind:value={editingName}
               onfocus={(e) => e.currentTarget.select()}
               oninput={() => {
@@ -222,18 +227,23 @@
               <div class="dup">
                 {#if !dupPending.linkedOther}
                   <div class="dup-msg">
-                    会议搭子里已有「{dupPending.person.name}」{recentLabel(dupPending.person) ? `(${recentLabel(dupPending.person)})` : ""},是同一个人吗?
+                    {t("speakers.chipDupMsg", {
+                      name: dupPending.person.name,
+                      recent: recentLabel(dupPending.person),
+                    })}
                   </div>
-                  <button class="row strong" onclick={dupAssign}>是,关联他</button>
-                  <button class="row" onclick={dupRename}>不是,保留同名</button>
+                  <button class="row strong" onclick={dupAssign}>{t("speakers.chipDupAssign")}</button>
+                  <button class="row" onclick={dupRename}>{t("speakers.dupKeepNo")}</button>
                 {:else}
                   <div class="dup-msg">
-                    另一位搭子也叫「{dupPending.person.name}」,可能是重复条目——可到他的详情页做合并。
+                    {t("speakers.chipDupLinked", { name: dupPending.person.name })}
                   </div>
-                  <a class="row" href="/speakers/{dupPending.person.id}" onclick={cancelEdit}>查看那位「{dupPending.person.name}」</a>
-                  <button class="row" onclick={dupRename}>仍要改名</button>
+                  <a class="row" href="/speakers/{dupPending.person.id}" onclick={cancelEdit}
+                    >{t("speakers.chipViewThat", { name: dupPending.person.name })}</a
+                  >
+                  <button class="row" onclick={dupRename}>{t("speakers.chipRenameAnyway")}</button>
                 {/if}
-                <button class="row quiet" onclick={cancelEdit}>取消</button>
+                <button class="row quiet" onclick={cancelEdit}>{t("speakers.cancel")}</button>
               </div>
             {:else}
               {#if !editingDirty}
@@ -242,8 +252,8 @@
                     <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M5 3.5v9l7.5-4.5z" />
                     </svg>
-                    试听他的声音
-                    {#if previewingId === id}<span class="row-sub">播放中,点击换一段</span>{/if}
+                    {t("speakers.chipPreview")}
+                    {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
                   </button>
                 {/if}
                 <button class="row" onclick={() => markAsMe(id)}>
@@ -251,17 +261,19 @@
                     <circle cx="8" cy="5.2" r="2.6" />
                     <path d="M2.8 13.4c.9-2.4 2.9-3.6 5.2-3.6s4.3 1.2 5.2 3.6" />
                   </svg>
-                  这是我
+                  {t("speakers.chipMe")}
                 </button>
               {/if}
               {#if people && onPick}
-                <div class="caption">会议搭子</div>
+                <div class="caption">{t("speakers.title")}</div>
                 <PersonPickList
                   people={people ?? []}
                   query={editingDirty ? editingName : ""}
                   onpick={(p) => commitPick(id, p.id)}
                   selectedId={speakers[id]?.person_id ?? null}
-                  emptyText={people.length === 0 ? "还没有认识的人" : "没有匹配的人"}
+                  emptyText={people.length === 0
+                    ? t("speakers.noPeopleYet")
+                    : t("speakers.noMatch")}
                 />
               {/if}
             {/if}
@@ -272,7 +284,9 @@
     {#if collapsible}
       <!-- 碎片折叠钮:声纹没归成簇的一次性说话人收进来,别摊满一整条 -->
       <button class="chip more" onclick={() => (showFragments = !showFragments)}>
-        {showFragments ? "收起" : `+${fragmentIds.length} 位偶现说话人`}
+        {showFragments
+          ? t("speakers.collapse")
+          : t("speakers.fragmentsN", { n: fragmentIds.length })}
       </button>
     {/if}
   </div>

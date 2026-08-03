@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { t } from "$lib/i18n/index.svelte";
 import type {
   BackfillFailure,
   BackfillPreview,
@@ -91,12 +92,12 @@ const initialState = (): RelationBackfillState => ({
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   const text = String(error).trim();
-  return text || "未知错误";
+  return text || t("governance.unknownError");
 }
 
 function failureDetails(failures: BackfillFailure[]): string {
   return failures
-    .map((failure) => `${failure.note_id || "索引重建"}：${failure.error}`)
+    .map((failure) => t("governance.backfill.failureLine", { name: failure.note_id || t("governance.backfill.indexRebuild"), error: failure.error }))
     .join("\n");
 }
 
@@ -196,9 +197,9 @@ export function createRelationBackfillController(
     cleanup();
   };
   const terminalSummary = (phase: RelationBackfillTerminalPhase) => {
-    if (phase === "partial") return "部分笔记未完成。可以重新预览未完成笔记后继续。";
-    if (phase === "cancelled") return "关系分析已取消。未完成笔记可以重新预览后继续。";
-    if (phase === "failed") return "关系分析未完成。可以重新预览未完成笔记后重试。";
+    if (phase === "partial") return t("governance.backfill.summaryPartial");
+    if (phase === "cancelled") return t("governance.backfill.summaryCancelled");
+    if (phase === "failed") return t("governance.backfill.summaryFailed");
     return "";
   };
   const failIndex = (phase: RelationBackfillTerminalPhase, detail: string) => {
@@ -210,8 +211,8 @@ export function createRelationBackfillController(
       published: false,
       publishedGeneration: null,
       currentNoteId: null,
-      error: "关系已经处理，但图谱索引未能安全发布。请单独重试索引。",
-      indexError: detail || "后端未提供索引失败详情",
+      error: t("governance.backfill.indexPublishFailed"),
+      indexError: detail || t("governance.backfill.noIndexDetail"),
     });
     cleanup();
   };
@@ -223,7 +224,7 @@ export function createRelationBackfillController(
       published: false,
       publishedGeneration: null,
       rebuildGeneration: generation,
-      error: "已处理的关系正在等待对应的图谱索引安全发布。",
+      error: t("governance.backfill.waitingPublish"),
       indexError: "",
     });
     const buffered = bufferedIndexTerminals.get(generation);
@@ -237,7 +238,7 @@ export function createRelationBackfillController(
     if (status.state === "ready") {
       settle(terminalPhase, terminalSummary(terminalPhase), state.technicalError, true);
     } else if (status.state === "error") {
-      failIndex(terminalPhase, status.error || "后端未提供索引失败详情");
+      failIndex(terminalPhase, status.error || t("governance.backfill.noIndexDetail"));
     }
   }
 
@@ -269,7 +270,7 @@ export function createRelationBackfillController(
         publish({
           ...initialState(),
           phase: "preview-error",
-          error: "无法预览笔记关系分析。请检查处理方式配置后重新预览。",
+          error: t("governance.backfill.previewFailed"),
           technicalError: errorMessage(cause),
         });
       }
@@ -282,10 +283,10 @@ export function createRelationBackfillController(
       if (startInFlight) return startInFlight;
       const selected = state.preview;
       if (state.phase !== "preview-ready" || !selected) {
-        return Promise.reject(new Error("请先完成关系分析预览。"));
+        return Promise.reject(new Error(t("governance.backfill.needPreview")));
       }
       if (!state.acknowledged) {
-        return Promise.reject(new Error("请先确认隐私提示与本次分析范围。"));
+        return Promise.reject(new Error(t("governance.backfill.needConsent")));
       }
 
       const token = session;
@@ -330,7 +331,7 @@ export function createRelationBackfillController(
                 total: event.total,
                 currentNoteId: event.current_note_id,
                 failures,
-                error: failures.length > 0 ? "部分笔记尚未完成；可展开技术详情查看原因。" : "",
+                error: failures.length > 0 ? t("governance.backfill.partialProgress") : "",
                 technicalError,
                 indexError: "",
               });
@@ -403,7 +404,7 @@ export function createRelationBackfillController(
           if (token !== session || runSettled) return;
           settle(
             "failed",
-            "关系分析未能启动。请重新预览并检查处理方式配置。",
+            t("governance.backfill.startFailed"),
             errorMessage(cause),
           );
           throw cause;
@@ -425,7 +426,7 @@ export function createRelationBackfillController(
         if (token !== session || state.runId !== runId || runSettled) return;
         patch({
           phase: "running",
-          error: "停止请求未送达。关系分析可能仍在继续，请再次尝试。",
+          error: t("governance.backfill.cancelFailed"),
           technicalError: errorMessage(cause),
         });
         throw cause;
@@ -435,7 +436,7 @@ export function createRelationBackfillController(
       if (indexRetryInFlight) return indexRetryInFlight;
       const terminalPhase = state.terminalPhase;
       if (state.phase !== "index-failed" || !terminalPhase) {
-        return Promise.reject(new Error("只有索引发布失败时可以单独重试索引。"));
+        return Promise.reject(new Error(t("governance.backfill.retryIndexOnlyWhenFailed")));
       }
 
       const token = session;
@@ -447,7 +448,7 @@ export function createRelationBackfillController(
         published: false,
         publishedGeneration: null,
         rebuildGeneration: null,
-        error: "正在重新发布图谱索引。",
+        error: t("governance.backfill.republishing"),
         indexError: "",
       });
 
@@ -492,7 +493,7 @@ export function createRelationBackfillController(
     },
     async resume() {
       if (state.phase !== "failed" && state.phase !== "cancelled" && state.phase !== "partial") {
-        throw new Error("只有失败、部分完成或已取消的关系分析可以继续。");
+        throw new Error(t("governance.backfill.resumeOnlyWhenIncomplete"));
       }
       await controller.preview(undefined);
     },

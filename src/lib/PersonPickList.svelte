@@ -4,13 +4,14 @@
   import { speakerInk } from "$lib/notes";
   import type { PersonSummary } from "$lib/people";
   import { dupNameSet, filterPeople, personLabel, recentLabel } from "$lib/personPick";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     people,
     query = "",
     excludeIds = [],
     onpick,
-    emptyText = "没有匹配的人",
+    emptyText = t("speakers.noMatch"),
     selectedId = null,
   }: {
     people: PersonSummary[];

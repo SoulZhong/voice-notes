@@ -14,6 +14,7 @@
     type GovernanceMention,
   } from "./knowledgeGovernance";
   import EntitySplitDialog from "./EntitySplitDialog.svelte";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     detail,
@@ -120,7 +121,7 @@
       const formattedDuration = formatDuration(noteDurations.get(noteId) ?? null);
       return {
         noteId,
-        title: noteTitles.get(noteId)?.trim() || `笔记 ${noteId}`,
+        title: noteTitles.get(noteId)?.trim() || t("governance.noteFallback", { id: noteId }),
         startedAt,
         time: formattedTime === "—" ? "" : formattedTime,
         duration: formattedDuration === "—" ? "" : formattedDuration,
@@ -129,7 +130,7 @@
     });
   });
   const displayEntityName = (id: string) =>
-    id === detail.id ? detail.name : resolveEntityName?.(id) ?? "相关实体";
+    id === detail.id ? detail.name : resolveEntityName?.(id) ?? t("governance.entity.relatedEntity");
 
   async function runOperation(
     pendingText: string,
@@ -155,10 +156,10 @@
     const target = mergeTarget.trim();
     if (!target || target === detail.id || working) return;
     working = true;
-    status = "正在合并实体";
+    status = t("governance.entity.merging");
     try {
       await controller.merge(detail.id, target);
-      status = controller.refreshError || "实体已合并，旧身份会稳定重定向到目标实体";
+      status = controller.refreshError || t("governance.entity.merged");
     } catch {
       status = controller.error;
     } finally {
@@ -169,10 +170,10 @@
   async function undoLastOperation() {
     if (!controller.lastOperationId || working) return;
     working = true;
-    status = "正在撤销上次实体操作";
+    status = t("governance.entity.undoing");
     try {
       await controller.undo(controller.lastOperationId);
-      status = controller.refreshError || "已写入补偿操作并刷新图谱";
+      status = controller.refreshError || t("governance.entity.undone");
     } catch {
       status = controller.error;
     } finally {
@@ -184,23 +185,23 @@
 <article class="governance" aria-labelledby="entity-governance-title">
   <header class="entity-heading">
     <div>
-      <p class="eyebrow">{simple ? "实体详情" : "实体治理"}</p>
+      <p class="eyebrow">{simple ? t("governance.entity.eyebrowSimple") : t("governance.entity.eyebrow")}</p>
       <h2 id="entity-governance-title">{detail.name}</h2>
     </div>
     <span class="kind" style:background={kindSoft(detail.kind)} style:color={kindInk(detail.kind)}>{kindLabel(detail.kind)}</span>
   </header>
 
   {#if detail.degraded}
-    <p class="degraded" role="status">{detail.message || "图谱处于只读降级状态，当前信息仍可查看。"}</p>
+    <p class="degraded" role="status">{detail.message || t("governance.entity.degraded")}</p>
   {/if}
 
   <section class="section overview" aria-labelledby="entity-overview">
-    <h3 id="entity-overview">概览</h3>
+    <h3 id="entity-overview">{t("governance.overview")}</h3>
     <dl class="facts">
-      <div><dt>状态</dt><dd>{detail.confirmed ? "已确认" : "模型识别"}</dd></div>
-      <div><dt>笔记</dt><dd>{detail.note_count} 篇</dd></div>
-      <div><dt>提及</dt><dd>{detail.mention_total} 次</dd></div>
-      <div><dt>关系</dt><dd>{detail.relations.length} 条</dd></div>
+      <div><dt>{t("governance.statusLabel")}</dt><dd>{detail.confirmed ? t("governance.entity.confirmed") : t("governance.entity.modelDetected")}</dd></div>
+      <div><dt>{t("governance.entity.notesLabel")}</dt><dd>{t("governance.entity.noteCount", { n: detail.note_count })}</dd></div>
+      <div><dt>{t("governance.entity.mentionsLabel")}</dt><dd>{t("governance.entity.mentionCount", { n: detail.mention_total })}</dd></div>
+      <div><dt>{t("governance.entity.relationsLabel")}</dt><dd>{t("governance.countItems", { n: detail.relations.length })}</dd></div>
     </dl>
 
     {#if !simple}
@@ -208,20 +209,20 @@
       event.preventDefault();
       const nextName = renameValue.trim();
       if (nextName && nextName !== detail.name) void runOperation(
-        "正在重命名实体",
-        `实体已重命名为「${nextName}」`,
+        t("governance.entity.renaming"),
+        t("governance.entity.renamed", { name: nextName }),
         buildRenameEntity(detail.id, nextName),
       );
     }}>
-      <label for="entity-rename">规范名称</label>
+      <label for="entity-rename">{t("governance.entity.canonicalName")}</label>
       <div class="field-action">
         <input id="entity-rename" bind:value={renameValue} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
-        <button type="submit" disabled={working || detail.degraded || !renameValue.trim() || renameValue.trim() === detail.name}>重命名实体</button>
+        <button type="submit" disabled={working || detail.degraded || !renameValue.trim() || renameValue.trim() === detail.name}>{t("governance.entity.rename")}</button>
       </div>
     </form>
 
     <div class="aliases">
-      <p class="field-label">别名</p>
+      <p class="field-label">{t("governance.entity.aliasesLabel")}</p>
       {#if detail.aliases.length > 0}
         <div class="alias-list">
           {#each detail.aliases as alias (alias)}
@@ -229,24 +230,24 @@
               <span>{alias}</span>
               <button
                 type="button"
-                aria-label={`移除别名 ${alias}`}
+                aria-label={t("governance.entity.removeAliasAria", { alias })}
                 disabled={working || detail.degraded}
-                onclick={() => runOperation("正在移除别名", `已移除别名「${alias}」`, buildRemoveAlias(detail.id, alias))}
+                onclick={() => runOperation(t("governance.entity.removingAlias"), t("governance.entity.aliasRemoved", { alias }), buildRemoveAlias(detail.id, alias))}
               >×</button>
             </span>
           {/each}
         </div>
       {:else}
-        <p class="empty-line">尚未添加别名</p>
+        <p class="empty-line">{t("governance.entity.noAliases")}</p>
       {/if}
-      <label for="entity-alias">添加别名</label>
+      <label for="entity-alias">{t("governance.entity.addAlias")}</label>
       <form class="field-action" onsubmit={(event) => {
         event.preventDefault();
         const alias = aliasValue.trim();
-        if (alias) void runOperation("正在添加别名", `已添加别名「${alias}」`, buildAddAlias(detail.id, alias), () => { aliasValue = ""; });
+        if (alias) void runOperation(t("governance.entity.addingAlias"), t("governance.entity.aliasAdded", { alias }), buildAddAlias(detail.id, alias), () => { aliasValue = ""; });
       }}>
         <input id="entity-alias" bind:value={aliasValue} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
-        <button type="submit" disabled={working || detail.degraded || !aliasValue.trim()}>添加别名</button>
+        <button type="submit" disabled={working || detail.degraded || !aliasValue.trim()}>{t("governance.entity.addAlias")}</button>
       </form>
     </div>
     {/if}
@@ -254,22 +255,22 @@
 
   {#if !simple}
   <section class="section actions" aria-labelledby="entity-actions">
-    <h3 id="entity-actions">身份与关系操作</h3>
+    <h3 id="entity-actions">{t("governance.entity.actionsTitle")}</h3>
     <details>
-      <summary>合并实体</summary>
+      <summary>{t("governance.entity.merge")}</summary>
       <form class="disclosure-form" onsubmit={(event) => { event.preventDefault(); void mergeEntity(); }}>
-        <label for="merge-target">目标实体 ID</label>
+        <label for="merge-target">{t("governance.entity.mergeTarget")}</label>
         <input id="merge-target" bind:value={mergeTarget} disabled={working || detail.degraded} aria-describedby="merge-help entity-feedback" />
-        <small id="merge-help">当前实体会稳定重定向到目标实体，提及与关系在解析时汇入目标。</small>
-        <button type="submit" disabled={working || detail.degraded || !mergeTarget.trim() || mergeTarget.trim() === detail.id}>合并实体</button>
+        <small id="merge-help">{t("governance.entity.mergeHelp")}</small>
+        <button type="submit" disabled={working || detail.degraded || !mergeTarget.trim() || mergeTarget.trim() === detail.id}>{t("governance.entity.merge")}</button>
       </form>
     </details>
     <div class="direct-action">
-      <div><strong>拆分证据</strong><small>按完整原文提及建立新的稳定身份。</small></div>
-      <button type="button" disabled={working || detail.degraded || mentionsLoading || mentions.length === 0} onclick={() => (splitOpen = true)}>拆分证据</button>
+      <div><strong>{t("governance.entity.split")}</strong><small>{t("governance.entity.splitHelp")}</small></div>
+      <button type="button" disabled={working || detail.degraded || mentionsLoading || mentions.length === 0} onclick={() => (splitOpen = true)}>{t("governance.entity.split")}</button>
     </div>
     <details>
-      <summary>新建关系</summary>
+      <summary>{t("governance.entity.createRelation")}</summary>
       <form class="disclosure-form" onsubmit={(event) => {
         event.preventDefault();
         const target = relationTarget.trim();
@@ -277,86 +278,86 @@
           ? { type: "custom", label: relationCustomLabel.trim() || null }
           : { type: relationType.trim(), label: null };
         if (target && predicate.type && (predicate.type !== "custom" || predicate.label)) void runOperation(
-          "正在新建关系",
-          "已新建用户直接声明的关系",
+          t("governance.entity.creatingRelation"),
+          t("governance.entity.relationCreated"),
           buildCreateRelation(detail.id, predicate, target, null, null, relationNote.trim() || null, [], true),
           () => { relationTarget = ""; relationNote = ""; },
         );
       }}>
-        <label for="relation-target">客体实体 ID</label>
+        <label for="relation-target">{t("governance.relation.objectId")}</label>
         <input id="relation-target" bind:value={relationTarget} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
-        <label for="relation-type">关系类型</label>
+        <label for="relation-type">{t("governance.relation.type")}</label>
         <select id="relation-type" bind:value={relationType} disabled={working || detail.degraded}>
-          <option value="participates_in">参与</option><option value="responsible_for">负责</option>
-          <option value="belongs_to">属于</option><option value="uses">使用</option>
-          <option value="depends_on">依赖</option><option value="produces">产生</option>
-          <option value="assigned_to">指派给</option><option value="occurs_at">发生于</option>
-          <option value="custom">自定义关系</option>
+          <option value="participates_in">{t("governance.predicate.participatesIn")}</option><option value="responsible_for">{t("governance.predicate.responsibleFor")}</option>
+          <option value="belongs_to">{t("governance.predicate.belongsTo")}</option><option value="uses">{t("governance.predicate.uses")}</option>
+          <option value="depends_on">{t("governance.predicate.dependsOn")}</option><option value="produces">{t("governance.predicate.produces")}</option>
+          <option value="assigned_to">{t("governance.predicate.assignedTo")}</option><option value="occurs_at">{t("governance.predicate.occursAt")}</option>
+          <option value="custom">{t("governance.predicate.custom")}</option>
         </select>
         {#if relationType === "custom"}
-          <label for="relation-label">完整关系名称</label>
+          <label for="relation-label">{t("governance.relation.customLabel")}</label>
           <input id="relation-label" bind:value={relationCustomLabel} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
         {/if}
-        <label for="relation-note">关系说明</label>
+        <label for="relation-note">{t("governance.relation.note")}</label>
         <textarea id="relation-note" bind:value={relationNote} disabled={working || detail.degraded}></textarea>
-        <button type="submit" disabled={working || detail.degraded || !relationTarget.trim() || (relationType === "custom" && !relationCustomLabel.trim())}>新建关系</button>
+        <button type="submit" disabled={working || detail.degraded || !relationTarget.trim() || (relationType === "custom" && !relationCustomLabel.trim())}>{t("governance.entity.createRelation")}</button>
       </form>
     </details>
     <details>
-      <summary>关联会议搭子</summary>
+      <summary>{t("governance.entity.bindPerson")}</summary>
       <form class="disclosure-form" onsubmit={(event) => {
         event.preventDefault();
         if (personMentionId.trim() && personEntityId.trim()) void runOperation(
-          "正在关联会议搭子",
-          "提及证据已关联到会议搭子",
+          t("governance.entity.bindingPerson"),
+          t("governance.entity.personBound"),
           buildBindPerson(personMentionId.trim(), personEntityId.trim()),
           () => { personMentionId = ""; },
         );
       }}>
-        <label for="person-mention">提及证据 ID</label>
+        <label for="person-mention">{t("governance.entity.mentionId")}</label>
         <input id="person-mention" bind:value={personMentionId} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
-        <label for="person-id">会议搭子实体 ID</label>
+        <label for="person-id">{t("governance.entity.personEntityId")}</label>
         <input id="person-id" bind:value={personEntityId} disabled={working || detail.degraded} aria-describedby="entity-feedback" />
-        <button type="submit" disabled={working || detail.degraded || !personMentionId.trim() || !personEntityId.trim()}>关联会议搭子</button>
+        <button type="submit" disabled={working || detail.degraded || !personMentionId.trim() || !personEntityId.trim()}>{t("governance.entity.bindPerson")}</button>
       </form>
     </details>
   </section>
   {/if}
 
   <section class="section" aria-labelledby="entity-relations">
-    <h3 id="entity-relations">关系</h3>
-    <h4>当前关系 <span>{currentRelations.length}</span></h4>
+    <h3 id="entity-relations">{t("governance.entity.relationsLabel")}</h3>
+    <h4>{t("governance.entity.currentRelations")} <span>{currentRelations.length}</span></h4>
     <ul class="relation-list">
       {#each currentRelations as relation (relation.id)}
         <li>
           <button type="button" onclick={() => onOpenRelation(relation.id)}>
             <span>{`${displayEntityName(relation.subject_id)} → ${relationLabel(relation)} → ${displayEntityName(relation.object_id)}`}</span>
-            <small>{Math.round(relation.confidence * 100)}% 置信度 · {relation.evidence_count} 条证据</small>
+            <small>{t("governance.entity.relationMeta", { confidence: Math.round(relation.confidence * 100), count: relation.evidence_count })}</small>
           </button>
         </li>
       {/each}
-      {#if currentRelations.length === 0}<li class="empty-line">没有当前关系</li>{/if}
+      {#if currentRelations.length === 0}<li class="empty-line">{t("governance.entity.noCurrentRelations")}</li>{/if}
     </ul>
     {#if !simple}
-      <h4>历史关系 <span>{historicalRelations.length}</span></h4>
+      <h4>{t("governance.entity.historicalRelations")} <span>{historicalRelations.length}</span></h4>
       <ul class="relation-list">
         {#each historicalRelations as relation (relation.id)}
           <li>
             <button type="button" onclick={() => onOpenRelation(relation.id)}>
               <span>{relation.subject_id === detail.id ? `${detail.name} → ${relationLabel(relation)} → ${relation.object_id}` : `${relation.subject_id} → ${relationLabel(relation)} → ${detail.name}`}</span>
-              <small>{relation.valid_to ? `有效至 ${relation.valid_to}` : "历史版本"}</small>
+              <small>{relation.valid_to ? t("governance.entity.validTo", { date: relation.valid_to }) : t("governance.entity.historicalVersion")}</small>
             </button>
           </li>
         {/each}
-        {#if historicalRelations.length === 0}<li class="empty-line">没有历史关系</li>{/if}
+        {#if historicalRelations.length === 0}<li class="empty-line">{t("governance.entity.noHistoricalRelations")}</li>{/if}
       </ul>
     {/if}
   </section>
 
   <section class="section evidence" aria-labelledby="entity-evidence">
-    <h3 id="entity-evidence">{simple ? "关联笔记" : "证据"}</h3>
+    <h3 id="entity-evidence">{simple ? t("governance.entity.linkedNotes") : t("governance.evidence")}</h3>
     {#if mentionsLoading}
-      <p class="empty-line">{simple ? "正在读取关联笔记" : "正在读取完整提及证据"}</p>
+      <p class="empty-line">{simple ? t("governance.entity.loadingLinkedNotes") : t("governance.entity.loadingMentions")}</p>
     {:else}
       {#if simple}
         <ul class="source-notes">
@@ -375,7 +376,7 @@
             </li>
           {/each}
         </ul>
-        {#if mentionGroups.length === 0}<p class="empty-line">没有关联笔记</p>{/if}
+        {#if mentionGroups.length === 0}<p class="empty-line">{t("governance.entity.noLinkedNotes")}</p>{/if}
       {:else}
         {#each mentionGroups as group (group.noteId)}
           <div class="note-group">
@@ -392,20 +393,20 @@
             {#each group.items as mention (mention.id)}
               <blockquote>
                 <p>{mention.quote}</p>
-                <footer>第 {mention.paragraph_index + 1} 段 · 字符 {mention.start_offset}–{mention.end_offset}</footer>
+                <footer>{t("governance.mention.position", { p: mention.paragraph_index + 1, start: mention.start_offset, end: mention.end_offset })}</footer>
               </blockquote>
             {/each}
           </div>
         {/each}
-        {#if mentions.length === 0}<p class="empty-line">没有可显示的提及证据</p>{/if}
+        {#if mentions.length === 0}<p class="empty-line">{t("governance.entity.noMentions")}</p>{/if}
       {/if}
     {/if}
   </section>
 
   {#if !simple}<div class="feedback-actions">
     <p id="entity-feedback" class:error={Boolean(controller.error)} aria-live="polite">{status}</p>
-    {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = "图谱已刷新"; }).catch(() => { status = controller.refreshError; })}>重试刷新图谱</button>{/if}
-    {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLastOperation}>撤销上次实体操作</button>{/if}
+    {#if controller.refreshError}<button type="button" disabled={working} onclick={() => controller.retryRefresh().then(() => { status = t("governance.refreshed"); }).catch(() => { status = controller.refreshError; })}>{t("governance.retryRefresh")}</button>{/if}
+    {#if controller.lastOperationId}<button type="button" disabled={working} onclick={undoLastOperation}>{t("governance.entity.undoLast")}</button>{/if}
   </div>{/if}
 </article>
 

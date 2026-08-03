@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { KnowledgePath, KnowledgePathStep } from "$lib/knowledge";
   import { relationLabel } from "$lib/knowledgeView";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     startId,
@@ -26,33 +27,33 @@
     onClear: () => void;
   } = $props();
 
-  const nameFor = (id: string | null) => (id ? names.get(id) ?? id : "尚未选择");
+  const nameFor = (id: string | null) => (id ? names.get(id) ?? id : t("graph.path.notChosen"));
   const isWeak = (step: KnowledgePathStep) => step.origin === "cooccurrence";
   const labelFor = (step: KnowledgePathStep) =>
     isWeak(step)
-      ? `共同出现（${step.note_count} 篇）`
+      ? t("graph.path.cooccurStep", { n: step.note_count })
       : relationLabel(step);
-  const originLabel = (origin: KnowledgePathStep["origin"]) =>
-    ({
-      model: "模型提取",
-      confirmed: "人工确认",
-      manual: "人工建立",
-      user_assertion: "用户声明",
-      cooccurrence: "共现弱连接",
-    })[origin];
+  const ORIGIN_LABEL_KEYS: Record<KnowledgePathStep["origin"], string> = {
+    model: "graph.path.origin.model",
+    confirmed: "graph.path.origin.confirmed",
+    manual: "graph.path.origin.manual",
+    user_assertion: "graph.path.origin.user_assertion",
+    cooccurrence: "graph.path.origin.cooccurrence",
+  };
+  const originLabel = (origin: KnowledgePathStep["origin"]) => t(ORIGIN_LABEL_KEYS[origin]);
 </script>
 
 {#if startId}
-  <section class="path-panel" aria-label="两点关系路径">
+  <section class="path-panel" aria-label={t("graph.path.aria")}>
     <header>
       <div class="path-points">
-        <span class="point-mark">起</span>
+        <span class="point-mark">{t("graph.path.startMark")}</span>
         <strong>{nameFor(startId)}</strong>
         <span class="path-arrow" aria-hidden="true">→</span>
-        <span class="point-mark endpoint">终</span>
+        <span class="point-mark endpoint">{t("graph.path.endMark")}</span>
         <strong>{nameFor(endId)}</strong>
       </div>
-      <button type="button" class="clear" onclick={onClear}>清除路径</button>
+      <button type="button" class="clear" onclick={onClear}>{t("graph.path.clear")}</button>
     </header>
 
     <label class="weak-toggle">
@@ -61,17 +62,17 @@
         checked={includeCooccurrence}
         onchange={(event) => onToggleCooccurrence(event.currentTarget.checked)}
       />
-      <span>包含共现弱连接</span>
+      <span>{t("graph.path.includeCooccur")}</span>
     </label>
 
     {#if status === "choosing"}
-      <p class="state">再选择一个实体作为终点，画布不会隐藏其他关系。</p>
+      <p class="state">{t("graph.path.choosing")}</p>
     {:else if status === "loading"}
-      <p class="state" aria-live="polite">正在沿当前筛选寻找可解释路径</p>
+      <p class="state" aria-live="polite">{t("graph.path.loading")}</p>
     {:else if status === "error"}
-      <p class="state error" role="alert">{error || "路径读取失败。请检查筛选条件后重试。"}</p>
+      <p class="state error" role="alert">{error || t("graph.path.errorFallback")}</p>
     {:else if status === "empty"}
-      <p class="state">未找到可连接两点的路径。可以放宽关系类型或启用共现弱连接。</p>
+      <p class="state">{t("graph.path.empty")}</p>
     {:else if status === "ready" && path}
       <ol class="steps">
         {#each path.steps as step, index (step.id + ":" + index)}
@@ -80,16 +81,20 @@
             <div class="step-copy">
               <p class="step-route">
                 <span>{nameFor(step.from_id)}</span>
-                <span class="direction">{step.direction === "forward" ? "正向" : "逆向"}</span>
+                <span class="direction">{step.direction === "forward" ? t("graph.path.forward") : t("graph.path.reverse")}</span>
                 <span>{nameFor(step.to_id)}</span>
               </p>
               <p class="relation-name">{labelFor(step)}</p>
               <p class="provenance">
-                {originLabel(step.origin)} · 置信度 {Math.round(step.confidence * 100)}% · {step.evidence_count} 条证据
+                {t("graph.path.provenance", {
+                  origin: originLabel(step.origin),
+                  pct: Math.round(step.confidence * 100),
+                  n: step.evidence_count,
+                })}
               </p>
               {#if !isWeak(step)}
                 <button type="button" class="evidence" onclick={() => onOpenEvidence(step.id)}>
-                  查看关系证据
+                  {t("graph.path.viewEvidence")}
                 </button>
               {/if}
             </div>

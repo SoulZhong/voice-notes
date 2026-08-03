@@ -19,6 +19,7 @@
     type Capabilities,
   } from "$lib/mcp";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { t } from "$lib/i18n/index.svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { aiLogsQuery } from "$lib/ailog";
@@ -33,24 +34,27 @@
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
-  /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案。
+  /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案(存 i18n 键,渲染处 t() 取值)。
       豆包(火山方舟)的调用凭据是控制台创建的「推理接入点」ID(ep- 开头),不是
       裸模型名——预填模型名对要求接入点的账号是坏值,故 model 留空、整行换文案。 */
   const REFINE_PRESETS = [
     { label: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
-    { label: "通义千问", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+    { label: "Qwen", labelKey: "ai.aing.preset.qwen", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
     {
-      label: "豆包",
+      label: "Doubao",
+      labelKey: "ai.aing.preset.doubao",
       base: "https://ark.cn-beijing.volces.com/api/v3",
       model: "",
-      modelLabel: "接入点",
-      modelDesc: "火山方舟的推理接入点 ID,在方舟控制台「在线推理」创建;部分模型也可直接填模型名",
+      modelLabel: "ai.aing.doubao.modelLabel",
+      modelDesc: "ai.aing.doubao.modelDesc",
       modelPlaceholder: "ep-20250712…",
     },
     { label: "Kimi", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-auto" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   ] as {
     label: string;
+    /** 品牌名的字典键;仅中英名不同的服务商需要(如通义千问/Qwen),缺省直接显示 label。 */
+    labelKey?: string;
     base: string;
     model: string;
     modelLabel?: string;
@@ -96,11 +100,12 @@
   /** 四家 CLI 探测结果(key → 路径或 null);onMount 拉一次,切到 agent 模式时展示。 */
   let agentProbe = $state<Record<string, string | null>>({});
   const agentMissing = $derived(!refineAgentBin.trim() && !agentProbe[refineAgent]);
+  // modelHint 存 i18n 键,渲染处 t() 取值。
   const AGENT_OPTIONS = [
-    { key: "claude", label: "Claude Code", modelHint: "如 haiku、sonnet" },
-    { key: "codex", label: "Codex", modelHint: "如 gpt-5-codex" },
-    { key: "gemini", label: "Gemini", modelHint: "如 gemini-2.5-flash" },
-    { key: "cursor", label: "Cursor", modelHint: "如 sonnet-4.5" },
+    { key: "claude", label: "Claude Code", modelHint: "ai.aing.agentModelHint.claude" },
+    { key: "codex", label: "Codex", modelHint: "ai.aing.agentModelHint.codex" },
+    { key: "gemini", label: "Gemini", modelHint: "ai.aing.agentModelHint.gemini" },
+    { key: "cursor", label: "Cursor", modelHint: "ai.aing.agentModelHint.cursor" },
   ];
   const selectedAgentOption = $derived(AGENT_OPTIONS.find((a) => a.key === refineAgent) ?? AGENT_OPTIONS[0]);
   /** 家目录缩写为 ~,长路径在 row-desc 里不至于喧宾夺主。 */
@@ -136,28 +141,28 @@
   let guidePosition = $state("left: 1rem; top: 1rem;");
   let guidePlacement = $state<"right" | "below">("right");
   const guideActive = $derived($page.url.searchParams.get("guide") === AI_TOOLS_GUIDE_ID);
+  // eyebrow/title/body 存 i18n 键,渲染处 t() 取值。
   const GUIDE_STEPS = [
     {
       target: "aing-settings",
-      eyebrow: "1 / 3 · 整理单次录音",
-      title: "先选择 AI 的执行方式",
-      body: "这就是实际生效的设置。在线接口适合固定模型；本机 Agent 可复用已经登录的 Claude、Codex 等工具。你可以现在直接选择并测试。",
+      eyebrow: "ai.guide.step1.eyebrow",
+      title: "ai.guide.step1.title",
+      body: "ai.guide.step1.body",
     },
     {
       target: "assistant-connect",
-      eyebrow: "2 / 3 · 接入现有工具",
-      title: "在这里把笔记交给常用助手",
-      body: "点击“注册”会把 voice-notes 作为 MCP 服务写入对应助手。注册后，回到 Claude、Cursor、Codex 或 Gemini 就能检索会议笔记。",
+      eyebrow: "ai.guide.step2.eyebrow",
+      title: "ai.guide.step2.title",
+      body: "ai.guide.step2.body",
     },
     {
       target: "agent-capabilities",
-      eyebrow: "3 / 3 · 理解权限边界",
-      title: "确认 Agent 实际能调用什么",
-      body: "这里列出的是真实工具清单。读取默认可用；开始或停止录制仍需你在上方显式开启控制权限。",
+      eyebrow: "ai.guide.step3.eyebrow",
+      title: "ai.guide.step3.title",
+      body: "ai.guide.step3.body",
     },
   ] as const;
   const currentGuide = $derived(GUIDE_STEPS[guideStep]);
-  const starterPrompt = "找出上周所有提到发布风险的会议，并按负责人整理待办。";
 
   function scrollToSection(id: string) {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -165,11 +170,11 @@
 
   async function copyStarterPrompt() {
     try {
-      await navigator.clipboard.writeText(starterPrompt);
+      await navigator.clipboard.writeText(t("ai.quickstart.starterPrompt"));
       promptCopied = true;
       setTimeout(() => (promptCopied = false), 1600);
     } catch {
-      error = "复制失败，请手动选择示例文字";
+      error = t("ai.quickstart.copyFailed");
     }
   }
 
@@ -278,7 +283,7 @@
       refineAgentModel = fresh.refine_agent_model;
       mcpAllowControl = fresh.mcp_allow_control;
     } catch (e) {
-      error = `保存失败: ${e}`;
+      error = t("common.saveFailed", { e });
       settings = await getSettings().catch(() => settings);
       if (settings) {
         refineBaseUrl = settings.refine_base_url;
@@ -386,7 +391,7 @@
 
   /** 恢复默认:危险操作(覆盖用户编辑),confirm 二次确认后重装受管渲染稿并重拉内容。 */
   async function restoreSkillDefault() {
-    if (!confirm("将覆盖当前内容，恢复为应用内置版本？")) return;
+    if (!confirm(t("ai.mcp.skill.restoreConfirm"))) return;
     mcpError = "";
     skillEditBusy = true;
     try {
@@ -409,7 +414,7 @@
         await mcpUnregister(a.key);
       } else {
         const [r] = await mcpRegister([a.key]);
-        if (r && !r.ok) mcpError = `${a.name}: ${r.error ?? "注册失败"}`;
+        if (r && !r.ok) mcpError = `${a.name}: ${r.error ?? t("ai.mcp.registerFailed")}`;
       }
       // refreshMcp 也在 try 内:按钮解禁必须等列表真正刷新完成,否则刷新期间
       // 有一个窄窗口按钮已可点,连点可能撞上刷新中的旧数据。
@@ -428,7 +433,7 @@
     try {
       await navigator.clipboard.writeText(mcpSnippet);
     } catch {
-      mcpError = "复制失败,请展开后手动选择文本复制";
+      mcpError = t("ai.mcp.copyFailed");
     }
   }
 
@@ -458,67 +463,67 @@
   <section class="quickstart" aria-labelledby="quickstart-title">
     <div class="quickstart-heading">
       <div>
-        <h2 id="quickstart-title">第一次使用 AI？从这里开始</h2>
-        <p>voice-notes 的 AI 分两层：会后 AI 整理单次录音，AI 助手跨笔记检索并衔接你的工作。</p>
+        <h2 id="quickstart-title">{t("ai.quickstart.title")}</h2>
+        <p>{t("ai.quickstart.intro")}</p>
       </div>
       <div class="quickstart-heading-actions">
-        <span class="local-badge">笔记默认留在本机</span>
-        <button class="btn-secondary" onclick={() => { guideStep = 0; goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`); }}>重播引导</button>
+        <span class="local-badge">{t("ai.quickstart.localBadge")}</span>
+        <button class="btn-secondary" onclick={() => { guideStep = 0; goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`); }}>{t("ai.quickstart.replay")}</button>
       </div>
     </div>
     <div class="quickstart-path">
       <div class="quickstep">
         <span class="quickstep-no">1</span>
         <div>
-          <strong>选择 AI 方式</strong>
-          <p>用在线接口，或复用本机已登录的 Agent；录制结束后自动修订转写。</p>
-          <button class="text-action" onclick={() => scrollToSection("aing-settings")}>去配置 ↓</button>
+          <strong>{t("ai.quickstart.step1.title")}</strong>
+          <p>{t("ai.quickstart.step1.desc")}</p>
+          <button class="text-action" onclick={() => scrollToSection("aing-settings")}>{t("ai.quickstart.step1.action")}</button>
         </div>
       </div>
       <div class="quickstep">
         <span class="quickstep-no">2</span>
         <div>
-          <strong>把笔记接入常用助手</strong>
-          <p>为 Claude、Cursor、Codex 或 Gemini 注册 MCP；其他工具可使用通用配置。</p>
+          <strong>{t("ai.quickstart.step2.title")}</strong>
+          <p>{t("ai.quickstart.step2.desc")}</p>
           <button class="text-action" onclick={() => scrollToSection("assistant-connect")}>
-            {mcpAgents.some((a) => a.registered) ? "查看已接入工具 ↓" : "选择接入工具 ↓"}
+            {mcpAgents.some((a) => a.registered) ? t("ai.quickstart.step2.viewConnected") : t("ai.quickstart.step2.choose")}
           </button>
         </div>
       </div>
       <div class="quickstep">
         <span class="quickstep-no">3</span>
         <div>
-          <strong>在助手里直接提问</strong>
-          <p class="starter-prompt">“{starterPrompt}”</p>
-          <button class="text-action" onclick={copyStarterPrompt}>{promptCopied ? "已复制 ✓" : "复制示例"}</button>
+          <strong>{t("ai.quickstart.step3.title")}</strong>
+          <p class="starter-prompt">{t("ai.quickstart.step3.quote", { prompt: t("ai.quickstart.starterPrompt") })}</p>
+          <button class="text-action" onclick={copyStarterPrompt}>{promptCopied ? t("ai.quickstart.copied") : t("ai.quickstart.copyExample")}</button>
         </div>
       </div>
     </div>
     <p class="quickstart-foot">
-      想自动同步到飞书、Notion 或内部系统？到 <button class="text-action" onclick={() => goto("/hooks")}>钩子</button>
-      配置 AI 完成后的 Shell 命令或 Webhook。
+      {t("ai.quickstart.foot.before")} <button class="text-action" onclick={() => goto("/hooks")}>{t("ai.quickstart.foot.hooks")}</button>
+      {t("ai.quickstart.foot.after")}
     </p>
   </section>
 
   <!-- —— Aing:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
   <section id="aing-settings" class="anchor-section" class:guide-target={guideActive && guideStep === 0}>
-    <h2 class="section-title">AI 整理</h2>
+    <h2 class="section-title">{t("ai.aing.sectionTitle")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">AI 方式</span>
+          <span class="row-label">{t("ai.aing.provider.label")}</span>
           <span class="row-desc">
             {refineProvider === "agent"
-              ? "用本机已登录的 AI 助手整理，不需要 API Key"
-              : "用 OpenAI 兼容的在线接口整理，需要 API Key"}
+              ? t("ai.aing.provider.agentDesc")
+              : t("ai.aing.provider.openaiDesc")}
           </span>
         </div>
         <div class="seg">
           <label class="seg-item">
-            <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />在线接口
+            <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.openai")}
           </label>
           <label class="seg-item">
-            <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />本机 Agent
+            <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.agent")}
           </label>
         </div>
       </div>
@@ -528,13 +533,13 @@
             <span class="row-label">Agent</span>
             <span class="row-desc">
               {#if refineAgentBin.trim()}
-                使用指定路径 {shortPath(refineAgentBin)}
+                {t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
               {:else if agentProbe[refineAgent]}
-                已找到 {shortPath(agentProbe[refineAgent] ?? "")}
+                {t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
               {:else if refineAgent in agentProbe}
-                <span class="desc-warn">未找到命令行工具:请先安装并登录,或在下方指定路径</span>
+                <span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
               {:else}
-                检测中…
+                {t("ai.aing.agent.detecting")}
               {/if}
             </span>
           </div>
@@ -549,12 +554,12 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">模型</span>
-            <span class="row-desc">留空使用 {selectedAgentOption.label} 的默认模型</span>
+            <span class="row-label">{t("ai.aing.model.label")}</span>
+            <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
           </div>
           <input
             class="row-input"
-            placeholder={selectedAgentOption.modelHint}
+            placeholder={t(selectedAgentOption.modelHint)}
             bind:value={refineAgentModel}
             onblur={saveRefineAgent}
             oninput={() => (agentTest = null)}
@@ -562,12 +567,12 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">CLI 路径</span>
-            <span class="row-desc">自动探测不到时,手动指定可执行文件</span>
+            <span class="row-label">{t("ai.aing.cliPath.label")}</span>
+            <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
           </div>
           <input
             class="row-input wide"
-            placeholder="自动探测"
+            placeholder={t("ai.aing.cliPath.placeholder")}
             bind:value={refineAgentBin}
             onblur={saveRefineAgent}
             oninput={() => (agentTest = null)}
@@ -575,35 +580,35 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">测试运行</span>
-            <span class="row-desc">用该 CLI 跑一句极短提示,验证能启动并产出(约 1 分钟内)</span>
+            <span class="row-label">{t("ai.aing.testRun.label")}</span>
+            <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
           </div>
           <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
-            {agentTesting ? "测试中…" : "测试"}
+            {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
           </button>
         </div>
         {#if agentTest}
           <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
-            {agentTest.ok ? `测试成功(${agentTest.msg})` : `测试失败: ${agentTest.msg}`}
+            {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
           </p>
         {/if}
-        <p class="config-hint">AI 处理失败（如 Agent 未登录）时保留原文，不影响已保存的笔记。</p>
+        <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
       {:else}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">一键填充</span>
-            <span class="row-desc">选择常用服务商,自动填入接口地址与模型</span>
+            <span class="row-label">{t("ai.aing.preset.label")}</span>
+            <span class="row-desc">{t("ai.aing.preset.desc")}</span>
           </div>
           <div class="preset-btns">
             {#each REFINE_PRESETS as p (p.label)}
-              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.label}</button>
+              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.labelKey ? t(p.labelKey) : p.label}</button>
             {/each}
           </div>
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">接口地址</span>
-            <span class="row-desc">OpenAI 兼容服务的 Base URL</span>
+            <span class="row-label">{t("ai.aing.baseUrl.label")}</span>
+            <span class="row-desc">{t("ai.aing.baseUrl.desc")}</span>
           </div>
           <input
             class="row-input wide"
@@ -615,8 +620,8 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">{activePreset?.modelLabel ?? "模型"}</span>
-            <span class="row-desc">{activePreset?.modelDesc ?? "该服务商的模型名"}</span>
+            <span class="row-label">{activePreset?.modelLabel ? t(activePreset.modelLabel) : t("ai.aing.model.label")}</span>
+            <span class="row-desc">{activePreset?.modelDesc ? t(activePreset.modelDesc) : t("ai.aing.model.desc")}</span>
           </div>
           <input
             class="row-input"
@@ -629,7 +634,7 @@
         <div class="row">
           <div class="row-info">
             <span class="row-label">API Key</span>
-            <span class="row-desc">只保存在本机,不随笔记上传</span>
+            <span class="row-desc">{t("ai.aing.apiKey.desc")}</span>
           </div>
           <input
             class="row-input wide"
@@ -642,20 +647,20 @@
         </div>
         <div class="row">
           <div class="row-info">
-            <span class="row-label">测试连接</span>
-            <span class="row-desc">发一条最小请求,验证接口地址 / 密钥 / 模型可用</span>
+            <span class="row-label">{t("ai.aing.testConn.label")}</span>
+            <span class="row-desc">{t("ai.aing.testConn.desc")}</span>
           </div>
           <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
-            {llmTesting ? "测试中…" : "测试"}
+            {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
           </button>
         </div>
         {#if llmTest}
           <p class="test-result" class:ok={llmTest.ok} class:err={!llmTest.ok}>
-            {llmTest.ok ? `测试成功(${llmTest.msg})` : `测试失败: ${llmTest.msg}`}
+            {llmTest.ok ? t("ai.aing.testOk", { msg: llmTest.msg }) : t("ai.aing.testFail", { msg: llmTest.msg })}
           </p>
         {/if}
         {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">三项配齐后会后 AI 生效。</p>
+          <p class="config-hint">{t("ai.aing.configHint")}</p>
         {/if}
       {/if}
     </div>
@@ -663,7 +668,7 @@
 
   <!-- —— AI 助手接入(MCP) —— -->
   <section id="assistant-connect" class="anchor-section" class:guide-target={guideActive && guideStep === 1}>
-    <h2 class="section-title">AI 助手接入</h2>
+    <h2 class="section-title">{t("ai.mcp.sectionTitle")}</h2>
     <div class="rows">
       {#if mcpError}
         <div class="banner warn">{mcpError}</div>
@@ -673,15 +678,15 @@
           <div class="row-info">
             <span class="row-label">{a.name}</span>
             <span class="row-desc">
-              {#if !a.installed && !a.registered}未检测到安装
-              {:else if a.stale}已注册(路径已由自愈修复或待修复)
-              {:else if a.registered}已注册
-              {:else}未注册{/if}
+              {#if !a.installed && !a.registered}{t("ai.mcp.status.notInstalled")}
+              {:else if a.stale}{t("ai.mcp.status.stale")}
+              {:else if a.registered}{t("ai.mcp.status.registered")}
+              {:else}{t("ai.mcp.status.unregistered")}{/if}
             </span>
           </div>
           {#if a.installed || a.registered}
             <button class="btn-secondary" disabled={mcpBusy === a.key} onclick={() => mcpToggleRegister(a)}>
-              {a.registered ? "移除" : "注册"}
+              {a.registered ? t("ai.action.remove") : t("ai.mcp.register")}
             </button>
           {/if}
         </div>
@@ -689,29 +694,29 @@
       <div class="row">
         <div class="row-info">
           <span class="row-label-line">
-            <span class="row-label">Claude Code 技能</span>
-            {#if skillState === "current"}<span class="pill">当前版本</span>
-            {:else if skillState === "stale"}<span class="pill warn">待更新</span>
-            {:else if skillState === "unmanaged"}<span class="pill">已自定义</span>
+            <span class="row-label">{t("ai.mcp.skill.label")}</span>
+            {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
+            {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
+            {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
             {/if}
           </span>
           <span class="row-desc">
-            {#if skillState === "current"}已安装:Claude 掌握会议纪要/周报/检索工作流
-            {:else if skillState === "stale"}已安装(旧版,应用启动时自动更新)
-            {:else if skillState === "unmanaged"}检测到自定义同名技能,不自动管理
-            {:else}让 Claude Code 掌握会议纪要/周报/检索工作流(写入 ~/.claude/skills)
+            {#if skillState === "current"}{t("ai.mcp.skill.currentDesc")}
+            {:else if skillState === "stale"}{t("ai.mcp.skill.staleDesc")}
+            {:else if skillState === "unmanaged"}{t("ai.mcp.skill.unmanagedDesc")}
+            {:else}{t("ai.mcp.skill.installDesc")}
             {/if}
           </span>
         </div>
         {#if skillState !== null}
           <div class="row-actions">
             <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
-              查看 / 编辑
+              {t("ai.mcp.skill.viewEdit")}
             </button>
             {#if skillState !== "unmanaged"}
               <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
               <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
-                {skillState === "not_installed" ? "安装" : "移除"}
+                {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
               </button>
             {/if}
           </div>
@@ -728,71 +733,71 @@
           <div class="skill-edit-actions">
             <div class="skill-edit-buttons">
               <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>保存</button>
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>恢复默认</button>
-              <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>收起</button>
+              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
+              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
+              <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
             </div>
-            <p class="config-hint">保存后应用升级不再自动更新此文件</p>
+            <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
           </div>
         </div>
       {/if}
       <label class="row">
         <div class="row-info">
-          <span class="row-label">允许 AI 控制录制</span>
-          <span class="row-desc">开启后,已接入的 AI 助手可远程开始/停止/暂停录制。默认关闭</span>
+          <span class="row-label">{t("ai.mcp.allowControl.label")}</span>
+          <span class="row-desc">{t("ai.mcp.allowControl.desc")}</span>
         </div>
         <input type="checkbox" class="ctl switch" bind:checked={mcpAllowControl} disabled={!settings} onchange={saveMcpAllowControl} />
       </label>
       <div class="row">
         <div class="row-info">
-          <span class="row-label">手动配置</span>
-          <span class="row-desc">未内置的 Agent(Windsurf/Cline 等)把左侧片段加进其 MCP 配置即可</span>
+          <span class="row-label">{t("ai.mcp.manual.label")}</span>
+          <span class="row-desc">{t("ai.mcp.manual.desc")}</span>
         </div>
         <button class="btn-secondary" onclick={() => (mcpSnippetOpen = !mcpSnippetOpen)}>
-          {mcpSnippetOpen ? "收起" : "查看"}
+          {mcpSnippetOpen ? t("ai.action.collapse") : t("ai.action.view")}
         </button>
       </div>
       {#if mcpSnippetOpen}
         <div class="config">
           <pre class="snippet">{mcpSnippet}</pre>
-          <button class="btn-secondary" onclick={copyMcpSnippet}>复制</button>
+          <button class="btn-secondary" onclick={copyMcpSnippet}>{t("ai.action.copy")}</button>
         </div>
       {/if}
       {#if mcpHealed > 0}
-        <p class="config-hint">应用位置变更:已自动更新 {mcpHealed} 个 AI 助手的注册路径。</p>
+        <p class="config-hint">{t("ai.mcp.healed", { n: mcpHealed })}</p>
       {/if}
       <p class="config-hint">
-        笔记内容经 AI 助手检索后会进入其模型上下文;本应用自身不联网上传任何内容。
-        <button class="link" onclick={openMcpReadme}>详见 README</button>
+        {t("ai.mcp.privacyNote")}
+        <button class="link" onclick={openMcpReadme}>{t("ai.mcp.readme")}</button>
       </p>
     </div>
   </section>
 
   <!-- —— Agent 能调用什么(MCP 工具 + CLI 命令清单,与后端 catalog 同源,纯只读展示) —— -->
   <section id="agent-capabilities" class="anchor-section" class:guide-target={guideActive && guideStep === 2}>
-    <h2 class="section-title">Agent 能调用什么</h2>
+    <h2 class="section-title">{t("ai.cap.sectionTitle")}</h2>
     <div class="rows">
       {#if capError}
         <div class="banner warn">{capError}</div>
       {/if}
       {#if capabilities}
-        <div class="group-title">MCP 工具</div>
-        {#each capabilities.tools as t (t.name)}
+        <div class="group-title">{t("ai.cap.tools")}</div>
+        {#each capabilities.tools as tool (tool.name)}
           <div class="row">
             <div class="row-info">
-              <span class="row-label mono">{t.name}</span>
-              <span class="row-desc">{t.desc}</span>
+              <span class="row-label mono">{tool.name}</span>
+              <span class="row-desc">{tool.desc}</span>
             </div>
             <!-- catalog 的 gate 是静态前置条件声明;control 一档按上方开关的实时值
                  显示当前状态,否则开关打开后徽章不变,会被读成「开了也没生效」。 -->
-            {#if t.gate === "app"}<span class="pill">需应用运行</span>
-            {:else if t.gate === "control"}
-              {#if mcpAllowControl}<span class="pill">已允许控制</span>
-              {:else}<span class="pill warn">需允许控制</span>{/if}
+            {#if tool.gate === "app"}<span class="pill">{t("ai.cap.gateApp")}</span>
+            {:else if tool.gate === "control"}
+              {#if mcpAllowControl}<span class="pill">{t("ai.cap.gateControlOn")}</span>
+              {:else}<span class="pill warn">{t("ai.cap.gateControlOff")}</span>{/if}
             {/if}
           </div>
         {/each}
-        <div class="group-title">CLI 命令</div>
+        <div class="group-title">{t("ai.cap.cli")}</div>
         {#each capabilities.cli as c (c.cmd)}
           <div class="row">
             <div class="row-info">
@@ -807,29 +812,29 @@
 
   <!-- —— AI 调用日志:入口行,浏览/导出/打开目录在独立页 /ai/logs —— -->
   <section>
-    <h2 class="section-title">历史语义关系</h2>
+    <h2 class="section-title">{t("ai.relations.sectionTitle")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">笔记关系分析</span>
-          <span class="row-desc">先预览范围、执行体与精确模型，再由你明确确认是否发送修订稿。</span>
+          <span class="row-label">{t("ai.relations.label")}</span>
+          <span class="row-desc">{t("ai.relations.desc")}</span>
         </div>
-        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
+        <button class="btn-secondary" onclick={() => (backfillOpen = true)}>{t("ai.relations.analyze")}</button>
       </div>
     </div>
   </section>
 
   <section>
-    <h2 class="section-title">AI 调用日志</h2>
+    <h2 class="section-title">{t("ai.logs.sectionTitle")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">调用记录</span>
+          <span class="row-label">{t("ai.logs.entry.label")}</span>
           <span class="row-desc">
-            AI 整理与标题生成的每次对外调用，请求与响应全量留痕{aiLogsTotal > 0 ? `；共 ${aiLogsTotal} 条` : ""}
+            {t("ai.logs.entry.desc")}{aiLogsTotal > 0 ? t("ai.logs.entry.count", { n: aiLogsTotal }) : ""}
           </span>
         </div>
-        <button class="btn-secondary" onclick={() => goto("/ai/logs")}>查看</button>
+        <button class="btn-secondary" onclick={() => goto("/ai/logs")}>{t("ai.action.view")}</button>
       </div>
     </div>
   </section>
@@ -846,17 +851,17 @@
     aria-live="polite"
   >
     <div>
-      <span class="guide-eyebrow">{currentGuide.eyebrow}</span>
-      <strong>{currentGuide.title}</strong>
-      <p>{currentGuide.body}</p>
+      <span class="guide-eyebrow">{t(currentGuide.eyebrow)}</span>
+      <strong>{t(currentGuide.title)}</strong>
+      <p>{t(currentGuide.body)}</p>
     </div>
     <div class="guide-actions">
-      <button class="text-action" onclick={() => completeGuide(false)}>跳过</button>
+      <button class="text-action" onclick={() => completeGuide(false)}>{t("ai.guide.skip")}</button>
       {#if guideStep === GUIDE_STEPS.length - 1}
-        <button class="btn-secondary" onclick={() => completeGuide(true)}>继续了解钩子</button>
-        <button class="guide-next" onclick={nextGuideStep}>完成</button>
+        <button class="btn-secondary" onclick={() => completeGuide(true)}>{t("ai.guide.hooksNext")}</button>
+        <button class="guide-next" onclick={nextGuideStep}>{t("ai.guide.done")}</button>
       {:else}
-        <button class="guide-next" onclick={nextGuideStep}>下一步</button>
+        <button class="guide-next" onclick={nextGuideStep}>{t("ai.guide.next")}</button>
       {/if}
     </div>
   </aside>

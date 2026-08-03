@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onPlayerPos } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
+  import { t } from "$lib/i18n/index.svelte";
 
   /* 多轨播放器(原生引擎):音频在 Rust 里单条 cpal 输出流按 offset 混音——WebView
      只画 UI。此前 <audio> 方案在打包版(tauri:// 文档源)被 WKWebView 按自动播放策略
@@ -43,7 +44,7 @@
         : invoke<number>("player_load", {
             tracks: tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source })),
           }).catch((e) => {
-            reportError("音轨装载", `${e}`);
+            reportError(t("notes.player.errLoad"), `${e}`);
             throw e;
           });
     return () => {
@@ -99,7 +100,7 @@
       .then(() => invoke("player_play"))
       .catch((e) => {
         playing = false;
-        reportError("播放", `${e}`);
+        reportError(t("notes.player.errPlay"), `${e}`);
       });
   }
 
@@ -178,7 +179,7 @@
 
 <div class="player">
   <!-- 图标遵循 DESIGN.md:16px 线性/实心 SVG(currentColor),禁用 Unicode 符号字符 -->
-  <button class="play-btn" onclick={toggle} title={playing ? "暂停" : "播放"}>
+  <button class="play-btn" onclick={toggle} title={playing ? t("notes.player.pause") : t("notes.player.play")}>
     {#if playing}
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
         <rect x="3" y="2.5" width="3.4" height="11" rx="1" fill="currentColor" />
@@ -198,7 +199,7 @@
     bind:clientWidth={waveWidth}
     role="slider"
     tabindex="0"
-    aria-label="播放进度"
+    aria-label={t("notes.player.progress")}
     aria-valuemin={0}
     aria-valuemax={totalMs}
     aria-valuenow={Math.min(currentMs, totalMs)}
@@ -224,7 +225,7 @@
         class:has-touched={anyMuted}
         onclick={() => (menuOpen = !menuOpen)}
         aria-expanded={menuOpen}
-        title={anyMuted ? "音轨(有音轨已静音)" : "音轨(回放有回音时可静掉一轨)"}
+        title={anyMuted ? t("notes.player.tracksMutedTitle") : t("notes.player.tracksTitle")}
       >
         {#if anyMuted}
           <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -238,19 +239,19 @@
             <path d="M12.9 4.6a5.3 5.3 0 0 1 0 6.8" />
           </svg>
         {/if}
-        音轨
+        {t("notes.player.tracks")}
         <svg class="chev" class:open={menuOpen} width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />
         </svg>
       </button>
       {#if menuOpen}
         <div class="track-pop" role="menu">
-          <p class="track-pop-hint">回放有回音?静掉一轨</p>
-          {#each tracks as t (t.source)}
+          <p class="track-pop-hint">{t("notes.player.echoHint")}</p>
+          {#each tracks as track (track.source)}
             <label class="track-row">
-              <input type="checkbox" checked={!muted[t.source]} onchange={() => toggleMute(t.source)} />
-              <span class="track-row-name">{t.source === "mic" ? "麦克风" : "系统声"}</span>
-              {#if muted[t.source]}<span class="track-row-tag">已静音</span>{/if}
+              <input type="checkbox" checked={!muted[track.source]} onchange={() => toggleMute(track.source)} />
+              <span class="track-row-name">{track.source === "mic" ? t("notes.player.mic") : t("notes.player.system")}</span>
+              {#if muted[track.source]}<span class="track-row-tag">{t("notes.player.muted")}</span>{/if}
             </label>
           {/each}
         </div>

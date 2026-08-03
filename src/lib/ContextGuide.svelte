@@ -2,6 +2,7 @@
   import { page } from "$app/stores";
   import { getSettings, setSettings } from "$lib/models";
   import { PRODUCT_GUIDES, type ProductGuide, type ProductGuideStep } from "$lib/onboarding";
+  import { t } from "$lib/i18n/index.svelte";
 
   let guide = $state<ProductGuide | null>(null);
   let steps = $state<ProductGuideStep[]>([]);
@@ -108,12 +109,13 @@
 
 {#if active && current}
   <aside class="bubble" class:right={placement === "right"} class:below={placement === "below"} style={position}>
-    <span>{current.eyebrow}</span>
-    <strong>{current.title}</strong>
-    <p>{current.body}</p>
+    <!-- 步骤文案字段存 i18n 键(见 onboarding.ts),渲染时 t() 取当前语言 -->
+    <span>{t(current.eyebrow)}</span>
+    <strong>{t(current.title)}</strong>
+    <p>{t(current.body)}</p>
     <div class="actions">
-      <button class="skip" onclick={complete}>跳过</button>
-      <button class="next" onclick={next}>{step === steps.length - 1 ? "完成" : "下一步"}</button>
+      <button class="skip" onclick={complete}>{t("shell.guide.skip")}</button>
+      <button class="next" onclick={next}>{step === steps.length - 1 ? t("shell.guide.done") : t("shell.guide.next")}</button>
     </div>
   </aside>
 {/if}

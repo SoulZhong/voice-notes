@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "$lib/i18n/index.svelte";
 import type { Source } from "./events";
 
 export type NoteState = "active" | "recording" | "complete";
@@ -254,7 +255,7 @@ export function exportFileName(title: string, startedAt: string): string {
     }
     clean = clean.slice(0, cut);
   }
-  if (!/[^-\s]/.test(clean)) clean = "未命名";
+  if (!/[^-\s]/.test(clean)) clean = t("notes.untitled");
   const m = startedAt.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
   const time = m ? `-${m[1]}${m[2]}${m[3]}-${m[4]}${m[5]}` : "";
   let stem = `${clean}${time}`;
@@ -284,13 +285,13 @@ export function speakerLabel(
   source: Source,
   speakers: Record<string, SpeakerMetaLite>,
 ): string {
-  if (!speaker) return source === "mic" ? "我" : "对方";
+  if (!speaker) return source === "mic" ? t("notes.speaker.me") : t("notes.speaker.other");
   const meta = speakers[speaker];
   if (meta?.name) return meta.name;
-  if (meta?.person_id) return `说话人 ${meta.person_id.replace(/^P/, "")}`;
+  if (meta?.person_id) return t("notes.speaker.n", { n: meta.person_id.replace(/^P/, "") });
   // 修订稿重聚类标签(R1..Rk):终稿命名空间,不叫"新说话人"(它是全场收敛结果而非新面孔)
-  if (/^R\d+$/.test(speaker)) return `说话人 ${speaker.slice(1)}`;
-  return `新说话人 ${speaker.replace(/^S/, "")}`;
+  if (/^R\d+$/.test(speaker)) return t("notes.speaker.n", { n: speaker.slice(1) });
+  return t("notes.speaker.newN", { n: speaker.replace(/^S/, "") });
 }
 /** 稳定调色板:S1..Sn 循环取色;非 S<n> 形态 id 用字符串散列兜底(哈希逻辑不变)。
     调色板换成 DESIGN.md 粉彩 7 色，返回 CSS 变量引用——随 :root 的亮/暗色定义
@@ -361,9 +362,9 @@ export function formatDuration(secs: number | null): string {
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;
-  if (h > 0) return `${h} 小时 ${m} 分`;
-  if (m > 0) return `${m} 分 ${s} 秒`;
-  return `${s} 秒`;
+  if (h > 0) return t("notes.duration.hm", { h, m });
+  if (m > 0) return t("notes.duration.ms", { m, s });
+  return t("notes.duration.s", { s });
 }
 
 /** RFC3339 → "2026-07-03 15:04"；空串（元数据损坏）→ "—" */
