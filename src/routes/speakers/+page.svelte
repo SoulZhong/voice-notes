@@ -340,7 +340,9 @@
     <div class="card-title">
       {plabel(r.loser, r.loser_name)} → {plabel(r.winner, r.winner_name)}
       {#if r.similarity !== null}
-        <span class="sim strong">{t("speakers.similarity", { pct: Math.round(r.similarity * 100) })}</span>
+        <span class="sim strong">
+          {t("speakers.similarity", { pct: Math.round(r.similarity * 100) })}
+        </span>
       {/if}
     </div>
     <div class="panes">
@@ -358,7 +360,8 @@
               title={playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")}
               onclick={() => audition.toggle(path, path)}
             >
-              {playingKey === path ? "◼" : "▶"} {t("speakers.snapshotN", { n: i + 1 })}
+              {playingKey === path ? "◼" : "▶"}
+              {t("speakers.snapshotN", { n: i + 1 })}
             </button>
           {:else}
             <span class="hint">{t("speakers.noSnapshots")}</span>
@@ -380,7 +383,8 @@
                 title={playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")}
                 onclick={() => audition.toggle(path, path)}
               >
-                {playingKey === path ? "◼" : "▶"} {t("speakers.snapshotN", { n: i + 1 })}
+                {playingKey === path ? "◼" : "▶"}
+                {t("speakers.snapshotN", { n: i + 1 })}
               </button>
             {/each}
           </div>
@@ -495,7 +499,9 @@
                       }}>{t("speakers.restoreSuggestion")}</button>
                   {:else}
                     <span class="sim" class:strong={isStrong(s)}>
-                      {t("speakers.similarity", { pct: Math.round(s.similarity * 100) })}{isStrong(s) ? t("speakers.likelySuffix") : ""}
+                      {t("speakers.similarity", {
+                        pct: Math.round(s.similarity * 100),
+                      })}{isStrong(s) ? t("speakers.likelySuffix") : ""}
                     </span>
                   {/if}
                 </div>
@@ -519,7 +525,9 @@
                       {@const q = sugPickQuery.trim()}
                       <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={() => (sugPickFor = null)}></button>
                       <div class="menu">
-                        <div class="menu-title">{t("speakers.mergeInto", { name: plabel(s.loser, s.loser_name) })}</div>
+                        <div class="menu-title">
+                          {t("speakers.mergeInto", { name: plabel(s.loser, s.loser_name) })}
+                        </div>
                         <!-- svelte-ignore a11y_autofocus -->
                         <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={sugPickQuery} />
                         <PersonPickList
@@ -588,9 +596,7 @@
                 <div class="panes">
                   {@render personPane(p.id, p.name)}
                 </div>
-                <p class="hint warn-text">
-                  {t("speakers.nosampleHint")}
-                </p>
+                <p class="hint warn-text">{t("speakers.nosampleHint")}</p>
                 <div class="acts">
                   <button class="mini danger" disabled={busy || live} onclick={() => doDeleteNoSample(p)}>{t("speakers.delete")}</button>
                   <button class="mini" disabled={busy} onclick={() => doDismiss(item)}>{t("speakers.keep")}</button>
@@ -618,7 +624,8 @@
           <div class="archive">
             <div class="archive-head">
               <button class="archive-toggle" onclick={() => (archiveOpen = !archiveOpen)}>
-                {archiveOpen ? t("speakers.collapse") : t("speakers.expand")} {t("speakers.archivedCount", { n: archived.length })}
+                {archiveOpen ? t("speakers.collapse") : t("speakers.expand")}
+                {t("speakers.archivedCount", { n: archived.length })}
               </button>
               <span class="hint">{t("speakers.archiveHint")}</span>
               <span class="spacer"></span>

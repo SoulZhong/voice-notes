@@ -162,12 +162,12 @@
   /** 合并结果预览:名字继承规则(winner 名优先,winner 无名继承 loser 名)对用户是
       黑盒,确认前把结果摆出来;loser 数据比 winner 厚时提示通常反向合并更好。 */
   const mergePreview = $derived.by(() => {
-    const win = people.find((o) => o.id === pendingMergeWinner);
-    if (!win || !person) return null;
+    const winner = people.find((o) => o.id === pendingMergeWinner);
+    if (!winner || !person) return null;
     return {
-      name: win.name || person.name,
-      total: win.total_ms + person.total_ms,
-      thickerLoser: person.total_ms > win.total_ms,
+      name: winner.name || person.name,
+      total: winner.total_ms + person.total_ms,
+      thickerLoser: person.total_ms > winner.total_ms,
     };
   });
 
@@ -275,11 +275,9 @@
     stopSample();
     try {
       const jid = await mergePerson(s.loser, s.winner);
-      const sideLabel = (name: string, id: string) =>
-        name || t("speakers.personFallback", { n: id.replace(/^P/, "") });
       tidy.lastManual = {
         journalId: jid,
-        label: `${sideLabel(s.loser_name, s.loser)} → ${sideLabel(s.winner_name, s.winner)}`,
+        label: `${s.loser_name || t("speakers.personFallback", { n: s.loser.replace(/^P/, "") })} → ${s.winner_name || t("speakers.personFallback", { n: s.winner.replace(/^P/, "") })}`,
       };
       recording.bumpPeople();
       await tidy.refresh();
@@ -433,10 +431,7 @@
                       dur: formatDuration(Math.floor(dupRename.others[0].total_ms / 1000)),
                     })}
                   {:else}
-                    {t("speakers.dupManyTitle", {
-                      n: dupRename.others.length,
-                      name: dupRename.name,
-                    })}
+                    {t("speakers.dupManyTitle", { n: dupRename.others.length, name: dupRename.name })}
                   {/if}
                 </div>
                 {#if dupRename.others.length === 1}
@@ -514,15 +509,10 @@
               {t("speakers.ctxSamePre")}
               <a href="/speakers/{other.id}"
                 >{t("speakers.quotedName", {
-                  name:
-                    other.name ||
-                    t("speakers.personFallback", { n: other.id.replace(/^P/, "") }),
+                  name: other.name || t("speakers.personFallback", { n: other.id.replace(/^P/, "") }),
                 })}</a
               >
-              {t("speakers.ctxSamePost", {
-                pct: Math.round(s.similarity * 100),
-                strong: isStrong(s),
-              })}
+              {t("speakers.ctxSamePost", { pct: Math.round(s.similarity * 100), strong: isStrong(s) })}
             </span>
             {#if (people.find((o) => o.id === other.id)?.sample_paths.length ?? 0) > 0}
               <!-- 对方原声试听:不听没法拍板该不该合 -->
@@ -562,9 +552,7 @@
                 class="listen-mini"
                 class:playing={ctxPlayingId === sameName.id}
                 title={ctxPlayingId === sameName.id ? t("speakers.stop") : t("speakers.auditionOther")}
-                aria-label={ctxPlayingId === sameName.id
-                  ? t("speakers.stop")
-                  : t("speakers.auditionOther")}
+                aria-label={ctxPlayingId === sameName.id ? t("speakers.stop") : t("speakers.auditionOther")}
                 onclick={() => toggleCtxSample(sameName.id)}
               >
                 {#if ctxPlayingId === sameName.id}
@@ -630,9 +618,7 @@
           {/each}
         </div>
         <span class="card-hint">
-          {t("speakers.auditionHint")}{#if person.sample_paths.length > 1}{t(
-              "speakers.auditionHintMulti",
-            )}{/if}
+          {t("speakers.auditionHint")}{#if person.sample_paths.length > 1}{t("speakers.auditionHintMulti")}{/if}
         </span>
       {:else}
         <span class="card-hint">{t("speakers.noSamplesYet")}</span>
@@ -685,12 +671,7 @@
             <div class="menu">
               <div class="menu-title">{t("speakers.mergeInto", { name: displayName(person) })}</div>
               <!-- svelte-ignore a11y_autofocus -->
-              <input
-                class="pick-input"
-                autofocus
-                placeholder={t("speakers.searchPlaceholder")}
-                bind:value={mergeQuery}
-              />
+              <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={mergeQuery} />
               <PersonPickList people={others} query={mergeQuery} onpick={(p) => (pendingMergeWinner = p.id)} />
             </div>
           {:else if pendingMergeWinner}
@@ -726,9 +707,7 @@
           <button
             class="op-btn danger-hover"
             disabled={recording.isLive}
-            title={recording.isLive
-              ? t("speakers.noDeleteWhileRecording")
-              : t("speakers.deleteTitle")}
+            title={recording.isLive ? t("speakers.noDeleteWhileRecording") : t("speakers.deleteTitle")}
             onclick={() => {
               closeAllOps();
               confirmDelete = true;
