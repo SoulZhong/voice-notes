@@ -1,0 +1,79 @@
+# macOS 签名/公证链路自检(手动触发):不打 tag、不出包,只验证 Environment「TAURI」
+# 里的 Apple secrets 真的可用。存在的意义是——tauri-action 在 secrets 缺失或错误时
+# **不会让构建失败**,只会静默退回 ad-hoc 签名并跳过公证,产物照常上传 Release,
+# 直到用户下载后被 Gatekeeper 拦才发现。发版前跑一次,比打真 tag 快一个数量级。
+#
+# 三件事一次验证:
+# ① 六项 secret 均非空(写入时用错 shell 语法或非交互 read 会静默写入空值);
+# ② 证书能导入钥匙串并被 codesign 识别,且身份名与 APPLE_SIGNING_IDENTITY 一致;
+# ③ 公证凭据能通过 Apple 校验(notarytool 真实握手,不提交任何文件)。
+name: apple-signing-check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: macos-latest
+    environment: TAURI
+    timeout-minutes: 15
+    steps:
+      - name: 六项 secret 非空
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              echo "::error::$name 为空——检查 Environment「TAURI」的 secrets"
+              fail=1
+            else
+              # 只打印长度,不打印内容
+              echo "$name: 非空(${#val} 字符)"
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: 证书可导入且身份名匹配
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+          KC=/tmp/check.keychain
+          security create-keychain -p ci "$KC"
+          security unlock-keychain -p ci "$KC"
+          security import /tmp/cert.p12 -k "$KC" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          FOUND=$(security find-identity -v -p codesigning "$KC" | grep -c "$APPLE_SIGNING_IDENTITY" || true)
+          security find-identity -v -p codesigning "$KC" | sed 's/[0-9A-F]\{40\}/<hash>/'
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::钥匙串里找不到与 APPLE_SIGNING_IDENTITY 同名的身份,签名会退回 ad-hoc"
+            exit 1
+          fi
+          rm -f /tmp/cert.p12
+          security delete-keychain "$KC"
+
+      - name: 公证凭据可用
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # history 只做一次鉴权握手,不提交任何文件;凭据错会以非零码退出。
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" 2>&1 | head -5
+          echo "公证凭据校验通过"

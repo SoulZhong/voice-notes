@@ -23,7 +23,11 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/notes/**", "$APPDATA/voiceprints/**", "$APPDATA/merge_journal/**"]
+        "scope": [
+          "$APPDATA/notes/**",
+          "$APPDATA/voiceprints/**",
+          "$APPDATA/merge_journal/**"
+        ]
       }
     }
   },
@@ -37,7 +41,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -49,7 +57,7 @@
     "macOS": {
       "infoPlist": "Info.plist",
       "minimumSystemVersion": "13.0",
-      "signingIdentity": "voice-notes Dev",
+      "signingIdentity": "Developer ID Application: weijian zhong (892P9TWV6L)",
       "entitlements": "./Entitlements.plist"
     }
   }
