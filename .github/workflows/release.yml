@@ -67,19 +67,22 @@ jobs:
       # 钉 commit SHA 而非可变 tag(v0):此 step 持有 updater 签名私钥,
       # tag 被恶意重指即可窃 key、给全体客户端签恶意更新。升级时人工换 SHA。
       #
-      # APPLE_SIGNING_IDENTITY=- :runner 上没有 tauri.conf 里配置的 Developer ID
-      # 私钥,官方语义为环境变量覆盖 tauri.conf 的 signingIdentity,退回 ad-hoc 签名。
-      # 故发布产物目前仍是未签名的,用户首次打开需 xattr 去隔离属性(见 README)。
-      # 要让发布包也带 Developer ID + 公证,需把证书导出为 .p12 存入仓库 Secrets
-      # 并在此注入 APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_ID /
-      # APPLE_PASSWORD / APPLE_TEAM_ID(tauri-action 支持,见 docs/macos-signing.md)。
-      # Windows 构建忽略此变量。
+      # macOS 代码签名与公证(Environment「TAURI」的 Secrets,见 docs/macos-signing.md):
+      # tauri-action 会用 APPLE_CERTIFICATE 建临时钥匙串并导入,按 APPLE_SIGNING_IDENTITY
+      # 选身份签名,再用 APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID 提交公证并 staple。
+      # 缺任一项即退回 ad-hoc(不会让构建失败,但产物是未签名的——发版前请确认
+      # 日志里出现 "signing" 与 "notarizing" 两段)。Windows 构建忽略这些变量。
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "voice-notes ${{ github.ref_name }}"
