@@ -87,3 +87,28 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "voice-notes ${{ github.ref_name }}"
           releaseDraft: true
+      # tauri-action 只公证 .app,再把它打进 dmg——dmg 本身既没公证也没 staple。
+      # 后果:app 拖出来能跑,但用户双击 dmg 挂载那一刻 Gatekeeper 仍报「无法验证开发者」。
+      # v0.8.0 首次接入签名时实测到:dmg 判定 rejected/Unnotarized,内部 app 却是
+      # accepted/Notarized。故在此单独公证 dmg 并 staple,再覆盖 Release 里的同名资产。
+      - name: 公证 DMG 并替换 Release 资产
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          echo "公证 $DMG"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          # 期望 accepted / source=Notarized Developer ID;不符即让发布失败,
+          # 免得草稿里留一个会被 Gatekeeper 拦的包。
+          spctl -a -vv -t open --context context:primary-signature "$DMG" 2>&1 | tee /tmp/spctl.txt
+          grep -q "source=Notarized Developer ID" /tmp/spctl.txt \
+            || { echo "::error::DMG 公证后仍未被 Gatekeeper 接受"; exit 1; }
+          gh release upload "${{ github.ref_name }}" "$DMG" --clobber --repo "${{ github.repository }}"
