@@ -8,6 +8,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod store;
+mod i18n;
 mod player;
 mod player_gate;
 mod tray;
@@ -151,7 +152,7 @@ pub(crate) fn data_root(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("app_data_dir 不可用: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(tr!("app_data_dir 不可用: {e}", "app_data_dir unavailable: {e}")))?;
     let s = settings::load(&app_data);
     Ok(settings::resolve_data_root(&app_data, &s))
 }
@@ -589,7 +590,10 @@ fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<B
 /// 没填 key"这种要等一次握手往返才暴露的失败。
 fn make_cloud_asr(s: &settings::Settings) -> anyhow::Result<std::sync::Arc<dyn asr::cloud::CloudAsr>> {
     if !settings::cloud_creds_ok(s) {
-        anyhow::bail!("请先在设置中配置云端凭证");
+        anyhow::bail!(tr!(
+            "请先在设置中配置云端凭证",
+            "Please configure the cloud credentials in Settings first"
+        ));
     }
     if s.cloud_asr_provider == settings::CLOUD_ALIYUN {
         Ok(std::sync::Arc::new(asr::cloud::aliyun::AliyunAsr::new(s.dashscope_api_key.trim().to_string()))
@@ -603,8 +607,12 @@ fn make_cloud_asr(s: &settings::Settings) -> anyhow::Result<std::sync::Arc<dyn a
 }
 
 /// 云端厂商展示名(测试连接文案 / 日志)。
-fn cloud_provider_label(provider: &str) -> &'static str {
-    if provider == settings::CLOUD_ALIYUN { "阿里云" } else { "火山引擎" }
+fn cloud_provider_label(provider: &str) -> String {
+    if provider == settings::CLOUD_ALIYUN {
+        tr!("阿里云", "Alibaba Cloud")
+    } else {
+        tr!("火山引擎", "Volcano Engine")
+    }
 }
 
 /// 当前 provider 覆盖:settings.asr_provider 经 asr::provider_override 规整。
@@ -680,10 +688,10 @@ fn required_sources(system_only: bool) -> Vec<Source> {
 }
 
 /// 源的中文显示名，仅用于「XX未能启动」失败文案（沿用既有文案风格）。
-fn source_display(s: Source) -> &'static str {
+fn source_display(s: Source) -> String {
     match s {
-        Source::Mic => "麦克风",
-        Source::System => "系统声音",
+        Source::Mic => tr!("麦克风", "Microphone"),
+        Source::System => tr!("系统声音", "System audio"),
     }
 }
 
@@ -710,7 +718,7 @@ fn spawn_session(
     let my_gen = {
         let mut r = running.lock().unwrap();
         if *r {
-            return Err("已在录制".into());
+            return Err("已在录制".into()); // i18n-exempt: 前端按原文判等
         }
         *r = true;
         // 锁序 running → generation：running 锁仍持有时嵌套锁 generation 并
@@ -1073,8 +1081,13 @@ fn spawn_session(
                 stash_model(&recognizer_cache, recognizer);
                 stash_model(&embedder_cache, embedder);
                 let msg = match &target {
-                    NoteTarget::New => format!("error: 创建笔记失败: {e}"),
-                    NoteTarget::Resume(_) => format!("error: 续录笔记失败: {e}"),
+                    NoteTarget::New => {
+                        format!("error: {}", tr!("创建笔记失败: {e}", "Failed to create note: {e}"))
+                    }
+                    NoteTarget::Resume(_) => format!(
+                        "error: {}",
+                        tr!("续录笔记失败: {e}", "Failed to resume note recording: {e}")
+                    ),
                 };
                 return fail(&app, &running, &generation, my_gen, msg);
             }
@@ -1420,8 +1433,15 @@ fn spawn_session(
                     let name = source_display(missing);
                     let err = start.failed.iter()
                         .find(|(s, _)| *s == missing)
-                        .map(|(_, msg)| format!("error: {name}未能启动: {msg}"))
-                        .unwrap_or_else(|| format!("error: {name}未能启动"));
+                        .map(|(_, msg)| {
+                            format!(
+                                "error: {}",
+                                tr!("{name}未能启动: {msg}", "{name} failed to start: {msg}")
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            format!("error: {}", tr!("{name}未能启动", "{name} failed to start"))
+                        });
                     return fail(&app, &running, &generation, my_gen, err);
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
@@ -1506,7 +1526,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     // download_running 兼作迁移/下载互斥位:任一在跑都不能开录(下载中模型不完整、迁移中
     // 目录在搬)。原先仅靠模型 present 判定挡不住"下载已把文件补到位但还在收尾"的窗口。
     if state.download_running.load(Ordering::SeqCst) {
-        return Err("正在迁移或下载,稍后再试".into());
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later").into());
     }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
@@ -1551,13 +1571,16 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     let state = app.state::<AppState>();
     // 同 start_recording:迁移/下载进行中不能开录(见该处注释)。
     if state.download_running.load(Ordering::SeqCst) {
-        return Err("正在迁移或下载,稍后再试".into());
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later").into());
     }
     // F1 修复:该笔记正在 Aing 中就拒绝续录——Aing 完成后才 transcode.enqueue,而续录
     // 先 cancel_and_wait 再向 mic.wav 追加写;若放行,Aing 收尾时才入队的转码会把
     // 「活跃在追加」的 WAV 编码后删除,续录段音频永久丢失。
     if refining {
-        return Err("该笔记正在 Aing,请稍后再试".into());
+        return Err(tr!(
+            "该笔记正在 Aing,请稍后再试",
+            "This note is being refined by AI; try again later"
+        ));
     }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
@@ -1653,7 +1676,7 @@ async fn stop_recording(app: AppHandle) -> Result<(), String> {
         lifecycle.command(lifecycle::Cmd::Stop)
     })
     .await
-    .map_err(|e| format!("停止录制后台任务异常: {e}"))?
+    .map_err(|e| tr!("停止录制后台任务异常: {e}", "Stop-recording background task failed: {e}"))?
 }
 
 /// 快捷键共用的录制切换:running 为真则停,否则开。开录失败只 eprintln——快捷键触发
@@ -1704,7 +1727,9 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
-        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(s) = slot.as_mut() else {
+            return Err(tr!("没有正在进行的录制", "No recording in progress"));
+        };
         if s.paused_at.is_some() {
             return Ok(()); // 已暂停：幂等
         }
@@ -1734,7 +1759,9 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let ev = {
         let mut slot = state.session.lock().unwrap();
-        let Some(s) = slot.as_mut() else { return Err("没有正在进行的录制".into()) };
+        let Some(s) = slot.as_mut() else {
+            return Err(tr!("没有正在进行的录制", "No recording in progress"));
+        };
         let Some(p) = s.paused_at.take() else { return Ok(()) }; // 未暂停：幂等
         s.paused_accum += p.elapsed();
         s.handle.set_paused(false);
@@ -1811,7 +1838,7 @@ fn relation_backfill_settings(app: &AppHandle) -> Result<settings::Settings, Str
     let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("app_data_dir 不可用: {error}"))?;
+        .map_err(|error| tr!("app_data_dir 不可用: {error}", "app_data_dir unavailable: {error}"))?;
     Ok(settings::load(&app_data))
 }
 
@@ -1820,9 +1847,11 @@ fn ensure_requested_backfill_provider(
     settings: &settings::Settings,
 ) -> Result<(), String> {
     if request.provider != settings.refine_provider {
-        return Err(format!(
-            "补建 provider 与当前配置不一致:请求 {},当前 {}",
-            request.provider, settings.refine_provider
+        return Err(tr!(
+            "补建 provider 与当前配置不一致:请求 {requested},当前 {current}",
+            "Backfill provider does not match the current configuration: requested {requested}, current {current}",
+            requested = request.provider,
+            current = settings.refine_provider
         ));
     }
     Ok(())
@@ -1841,14 +1870,23 @@ fn relation_executor(
         )?)),
         "agent" => {
             let kind = refine::agent::AgentKind::from_key(&settings.refine_agent)
-                .ok_or_else(|| anyhow::anyhow!("未知 Agent: {}", settings.refine_agent))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(tr!(
+                        "未知 Agent: {agent}",
+                        "Unknown agent: {agent}",
+                        agent = settings.refine_agent
+                    ))
+                })?;
             Ok(Box::new(refine::agent::AgentRelationExecutor::new(
                 kind,
                 &settings.refine_agent_bin,
                 &settings.refine_agent_model,
             )?))
         }
-        provider => anyhow::bail!("未知关系补建 provider: {provider}"),
+        provider => anyhow::bail!(tr!(
+            "未知关系补建 provider: {provider}",
+            "Unknown relation backfill provider: {provider}"
+        )),
     }
 }
 
@@ -1874,11 +1912,17 @@ where
         terminal.state = "failed".into();
         terminal.failed.push(ipc::BackfillFailure {
             note_id: String::new(),
-            error: format!("无法启动关系补建线程:{error}"),
+            error: tr!(
+                "无法启动关系补建线程:{error}",
+                "Failed to start the relation backfill thread: {error}"
+            ),
         });
         terminal.index_error = None;
         emit_failure(terminal);
-        return Err(format!("无法启动关系补建线程:{error}"));
+        return Err(tr!(
+            "无法启动关系补建线程:{error}",
+            "Failed to start the relation backfill thread: {error}"
+        ));
     }
     Ok(())
 }
@@ -1914,7 +1958,10 @@ fn start_relation_backfill(
     let preview = &approved.preview;
     let executor = relation_executor(&settings).map_err(|error| format!("{error:#}"))?;
     if executor.provider() != preview.provider || executor.model() != preview.model {
-        return Err("preview 与执行 provider/model 不一致".into());
+        return Err(tr!(
+            "preview 与执行 provider/model 不一致",
+            "Preview and execution provider/model do not match"
+        ));
     }
 
     state.relation_backfill_cancel.store(false, Ordering::SeqCst);
@@ -2009,7 +2056,12 @@ fn retry_relation_backfill_index_with(
 ) -> Result<u64, String> {
     scheduler
         .retry_dirty(root, emit)
-        .map_err(|error| format!("图谱索引重试排队失败:{error:#}"))
+        .map_err(|error| {
+            tr!(
+                "图谱索引重试排队失败:{error:#}",
+                "Failed to queue the graph index retry: {error:#}"
+            )
+        })
 }
 
 #[tauri::command]
@@ -2037,11 +2089,14 @@ fn rename_refined_speaker(
 ) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("名字不能为空".into());
+        return Err(tr!("名字不能为空", "Name cannot be empty"));
     }
     // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err("该笔记正在 Aing 中，稍后再改".into());
+        return Err(tr!(
+            "该笔记正在 Aing 中，稍后再改",
+            "This note is being refined by AI; try again later"
+        ));
     }
     reject_if_active(&state, &note_id)?;
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -2062,7 +2117,9 @@ fn rename_refined_speaker(
         let vp = vp_store.load();
         if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
             match vp_store.rename(&resolved, name) {
-                Ok(()) => queue_person_graph_rebuild(&app, graph_root, "人物改名")?,
+                Ok(()) => {
+                    queue_person_graph_rebuild(&app, graph_root, &tr!("人物改名", "Person rename"))?
+                }
                 Err(e) => eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}"),
             }
         }
@@ -2084,7 +2141,10 @@ fn assign_note_speaker_person(
     reject_if_active(&state, &note_id)?;
     let vp = open_voiceprint_store(&app)?.load();
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
-        return Err(format!("声纹库中没有该人物: {person_id}"));
+        return Err(tr!(
+            "声纹库中没有该人物: {person_id}",
+            "No such person in the voiceprint library: {person_id}"
+        ));
     };
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::AssignPerson {
@@ -2103,7 +2163,12 @@ fn person_notes(app: AppHandle, person_id: String) -> Result<Vec<store::NoteSumm
     let vp = open_voiceprint_store(&app)?.load();
     let target = store::VoiceprintStore::resolve(&vp, &person_id)
         .map(str::to_string)
-        .ok_or_else(|| format!("声纹库中没有该人物: {person_id}"))?;
+        .ok_or_else(|| {
+            tr!(
+                "声纹库中没有该人物: {person_id}",
+                "No such person in the voiceprint library: {person_id}"
+            )
+        })?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let notes = store::NoteStore::new(dir.clone()).list(); // list 已按开始时间倒序
     Ok(notes
@@ -2163,12 +2228,18 @@ fn note_related(app: AppHandle, id: String) -> Result<Vec<ipc::RelatedNote>, Str
 /// 图谱全部实体(列表视图),按出现笔记数降序。图谱失败/空 → 空列表,不 Err。
 fn graph_read_error(command: &str, error: anyhow::Error) -> String {
     eprintln!("{command}: semantic graph read failed: {error:#}");
-    "知识图谱暂时不可用，请稍后重试".into()
+    tr!(
+        "知识图谱暂时不可用，请稍后重试",
+        "The knowledge graph is temporarily unavailable; please try again later"
+    )
 }
 
 fn graph_mutation_error(command: &str, error: anyhow::Error) -> String {
     eprintln!("{command}: knowledge mutation failed: {error:#}");
-    "无法保存知识整理操作；请确认目标仍存在且整理记录完好".into()
+    tr!(
+        "无法保存知识整理操作；请确认目标仍存在且整理记录完好",
+        "Could not save the knowledge edit; make sure the target still exists and the edit history is intact"
+    )
 }
 
 fn mark_knowledge_rebuild_queued(
@@ -2177,7 +2248,10 @@ fn mark_knowledge_rebuild_queued(
 ) -> Result<ipc::KnowledgeMutationResult, String> {
     let generation = scheduled.map_err(|error| {
         eprintln!("knowledge mutation committed but graph rebuild scheduling failed: {error:#}");
-        "知识整理操作已保存，但索引排队失败；应用将在下次启动或整理时自动重试".to_string()
+        tr!(
+            "知识整理操作已保存，但索引排队失败；应用将在下次启动或整理时自动重试",
+            "The knowledge edit was saved, but indexing could not be queued; the app will retry automatically on next launch or edit"
+        )
     })?;
     result.rebuild_state = "queued".into();
     result.rebuild_generation = Some(generation);
@@ -2205,8 +2279,9 @@ fn mark_person_graph_rebuild_queued(
 ) -> Result<(), String> {
     if let Err(error) = scheduled {
         eprintln!("{action} committed but graph rebuild scheduling failed: {error:#}");
-        return Err(format!(
-            "{action}已保存，但索引待重试；应用将在下次启动或整理时自动重试"
+        return Err(tr!(
+            "{action}已保存，但索引待重试；应用将在下次启动或整理时自动重试",
+            "{action} was saved, but indexing is pending retry; the app will retry automatically on next launch or edit"
         ));
     }
     Ok(())
@@ -2497,7 +2572,7 @@ fn graph_edge_detail(
                 })
                 .collect()
         }
-        _ => return Err("未知的图谱视角".into()),
+        _ => return Err(tr!("未知的图谱视角", "Unknown graph view")),
     };
     Ok(ipc::GraphEdgeDetail { items })
 }
@@ -2590,7 +2665,7 @@ fn rename_entity_with_rebuild(
 fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
     rename_entity_with_rebuild(root, id, new_name, |root| {
-        queue_person_graph_rebuild(&app, root, "人物改名")
+        queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
     })
 }
 
@@ -2605,12 +2680,18 @@ fn assign_refined_person(
 ) -> Result<(), String> {
     // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err("该笔记正在 Aing 中，稍后再改".into());
+        return Err(tr!(
+            "该笔记正在 Aing 中，稍后再改",
+            "This note is being refined by AI; try again later"
+        ));
     }
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
     let vp = open_voiceprint_store(&app)?.load();
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
-        return Err(format!("声纹库中没有该人物: {person_id}"));
+        return Err(tr!(
+            "声纹库中没有该人物: {person_id}",
+            "No such person in the voiceprint library: {person_id}"
+        ));
     };
     let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
@@ -2628,7 +2709,10 @@ fn save_refined(
     paragraphs: Vec<store::ParagraphPayload>,
 ) -> Result<u64, String> {
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err("该笔记正在 Aing 中，稍后再存".into());
+        return Err(tr!(
+            "该笔记正在 Aing 中，稍后再存",
+            "This note is being refined by AI; save again later"
+        ));
     }
     reject_if_active(&state, &note_id)?;
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -2647,7 +2731,7 @@ fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::Track
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let note_dir = dir.join(&id);
     if !note_dir.is_dir() {
-        return Err(format!("笔记不存在: {id}"));
+        return Err(tr!("笔记不存在: {id}", "Note not found: {id}"));
     }
     let tracks = store::audio::list_tracks(&note_dir);
     // 波形懒回填(读路径本身仍纯读,重活在后台线程):无预计算波形的轨道算一次写回
@@ -2696,11 +2780,11 @@ fn note_audio_info(app: AppHandle, id: String) -> Result<Vec<store::audio::Track
 #[tauri::command]
 fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
-        return Err("录制中的笔记不能改名".into());
+        return Err(tr!("录制中的笔记不能改名", "A note being recorded cannot be renamed"));
     }
     let title = title.trim();
     if title.is_empty() {
-        return Err("标题不能为空".into());
+        return Err(tr!("标题不能为空", "Title cannot be empty"));
     }
     // 非活动编辑经 actor 串行执行(取代 NoteStore 直写,见 lifecycle/actor.rs run_edit)。
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
@@ -2711,7 +2795,7 @@ fn rename_note(app: AppHandle, state: State<AppState>, id: String, title: String
 #[tauri::command]
 fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == id).unwrap_or(false) {
-        return Err("录制中的笔记不能删除".into());
+        return Err(tr!("录制中的笔记不能删除", "A note being recorded cannot be deleted"));
     }
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::Delete { id },
@@ -2732,7 +2816,7 @@ fn rename_speaker(
 ) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("名字不能为空".into());
+        return Err(tr!("名字不能为空", "Name cannot be empty"));
     }
     // 活动判定读 session 槽(与旧实现一致;槽与 actor 的 writer 槽同源于同一会话)。
     // statement-scoped 取值:request() 阻塞等 actor,而 actor 的执行体可能要取
@@ -2763,7 +2847,7 @@ fn rename_speaker(
 /// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
 fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false) {
-        return Err("录制中的笔记不能编辑".into());
+        return Err(tr!("录制中的笔记不能编辑", "A note being recorded cannot be edited"));
     }
     Ok(())
 }
@@ -2824,7 +2908,12 @@ fn set_segment_speaker(
         .iter()
         .find(|s| s.seq == seq)
         .and_then(|s| s.speaker.clone())
-        .ok_or_else(|| "说话人写入后重查未命中该段".to_string())
+        .ok_or_else(|| {
+            tr!(
+                "说话人写入后重查未命中该段",
+                "The segment was not found when re-reading after the speaker was written"
+            )
+        })
 }
 
 /// 导出笔记到用户选定路径(前端保存对话框拿到 dest)。prefer_refined=真且修订稿
@@ -2953,13 +3042,13 @@ fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String>
     if name.is_empty() {
         // 未命名是系统态(空 name 触发展示端"未命名 · 最近出现…"兜底),不是一个可以
         // 被"改成"的普通名字;改回未命名无意义——清名走删除/合并，不走 rename。
-        return Err("名字不能为空".into());
+        return Err(tr!("名字不能为空", "Name cannot be empty"));
     }
     let root = data_root(&app).map_err(|e| e.to_string())?;
     store::VoiceprintStore::new(root.clone())
         .rename(&id, name)
         .map_err(|e| e.to_string())?;
-    queue_person_graph_rebuild(&app, root, "人物改名")
+    queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
 }
 
 /// 从 person 出现过的最近一条笔记的音频里截取其发言(≤ 试听样本上限)。
@@ -3054,7 +3143,7 @@ fn do_merge_person(
     // 模型加载耗秒级:落库前最后一查,「合并中开录」的种子错配窗口收到毫秒级。
     // apply 逐条调用本函数,等价获得逐条重查。
     if app.state::<AppState>().session.lock().unwrap().is_some() {
-        return Err("录制中不能合并说话人".into());
+        return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
     let now = chrono::Local::now().to_rfc3339();
     let journal_id = store
@@ -3097,7 +3186,7 @@ async fn merge_person(
     winner: String,
 ) -> Result<String, String> {
     if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能合并说话人".into());
+        return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
     // 重活(样本超限时现场加载声纹模型+逐份嵌入挑选、loser 无样本时扫笔记截声)
     // 走 spawn_blocking,别冻主线程——同步命令在 Tauri v2 里跑在主线程,这些秒级
@@ -3107,11 +3196,11 @@ async fn merge_person(
         // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
         // 「合并中开录」的种子错配窗口缩到微秒级。
         if app.state::<AppState>().session.lock().unwrap().is_some() {
-            return Err("录制中不能合并说话人".into());
+            return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
         }
         let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        queue_person_graph_rebuild(&app, root, "人物合并")?;
+        queue_person_graph_rebuild(&app, root, &tr!("人物合并", "Person merge"))?;
         Ok(journal_id)
     })
     .await
@@ -3122,20 +3211,20 @@ async fn merge_person(
 #[tauri::command]
 async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能删除说话人".into());
+        return Err(tr!("录制中不能删除说话人", "Cannot delete a speaker while recording"));
     }
     // 重活(store 删除+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
         // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
         // 「合并中开录」的种子错配窗口缩到微秒级。
         if app.state::<AppState>().session.lock().unwrap().is_some() {
-            return Err("录制中不能删除说话人".into());
+            return Err(tr!("录制中不能删除说话人", "Cannot delete a speaker while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         store::VoiceprintStore::new(root.clone())
             .delete(&id)
             .map_err(|e| e.to_string())?;
-        queue_person_graph_rebuild(&app, root, "人物删除")
+        queue_person_graph_rebuild(&app, root, &tr!("人物删除", "Person deletion"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3267,7 +3356,7 @@ async fn apply_confident_merges(
         // 本轮已被自动合并吃掉的 id 不能再出现在人工建议里(loser 已消失,点了必错)。
         remaining.retain(|s| !merged.contains(&s.loser) && !merged.contains(&s.winner));
         if !applied.is_empty() {
-            queue_person_graph_rebuild(&app, root, "自动归并")?;
+            queue_person_graph_rebuild(&app, root, &tr!("自动归并", "Automatic merge"))?;
         }
         Ok(ipc::ConfidentMergeOutcome { applied, remaining })
     })
@@ -3279,20 +3368,20 @@ async fn apply_confident_merges(
 #[tauri::command]
 async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能撤销合并".into());
+        return Err(tr!("录制中不能撤销合并", "Cannot undo a merge while recording"));
     }
     // 重活(store 改写+样本副本清理+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
         // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
         // 「合并中开录」的种子错配窗口缩到微秒级。
         if app.state::<AppState>().session.lock().unwrap().is_some() {
-            return Err("录制中不能撤销合并".into());
+            return Err(tr!("录制中不能撤销合并", "Cannot undo a merge while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         store::VoiceprintStore::new(root.clone())
             .undo_merge(&journal_id)
             .map_err(|e| e.to_string())?;
-        queue_person_graph_rebuild(&app, root, "撤销合并")
+        queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3306,20 +3395,20 @@ async fn restore_merged_person(
     journal_id: String,
 ) -> Result<String, String> {
     if state.session.lock().unwrap().is_some() {
-        return Err("录制中不能拆回说话人".into());
+        return Err(tr!("录制中不能拆回说话人", "Cannot split a speaker back out while recording"));
     }
     // 重活(按快照重建+文件拷贝+索引重建排队)走 spawn_blocking,别冻主线程。
     tauri::async_runtime::spawn_blocking(move || {
         // 异步化后检查与重活之间有秒级窗口(模型加载),落库前再查一次,把
         // 「合并中开录」的种子错配窗口缩到微秒级。
         if app.state::<AppState>().session.lock().unwrap().is_some() {
-            return Err("录制中不能拆回说话人".into());
+            return Err(tr!("录制中不能拆回说话人", "Cannot split a speaker back out while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
         let pid = store::VoiceprintStore::new(root.clone())
             .restore_merged_person(&journal_id)
             .map_err(|e| e.to_string())?;
-        queue_person_graph_rebuild(&app, root, "拆回说话人")?;
+        queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)
     })
     .await
@@ -3385,7 +3474,7 @@ async fn mcp_agents_status() -> Result<Vec<mcp::registry::AgentStatus>, String> 
         Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.status())
     })
     .await
-    .map_err(|e| format!("Agent 状态后台任务异常: {e}"))?
+    .map_err(|e| tr!("Agent 状态后台任务异常: {e}", "Agent status background task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3411,7 +3500,7 @@ async fn mcp_manual_snippet() -> Result<String, String> {
         Ok(mcp::registry::Registry::new().map_err(|e| e.to_string())?.entry_snippet_json())
     })
     .await
-    .map_err(|e| format!("MCP 配置读取后台任务异常: {e}"))?
+    .map_err(|e| tr!("MCP 配置读取后台任务异常: {e}", "MCP config read background task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3435,7 +3524,7 @@ async fn mcp_skill_status() -> Result<String, String> {
         Ok(skill_state_str(mcp::skill::status().map_err(|e| e.to_string())?).into())
     })
     .await
-    .map_err(|e| format!("Skill 状态后台任务异常: {e}"))?
+    .map_err(|e| tr!("Skill 状态后台任务异常: {e}", "Skill status background task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3466,7 +3555,7 @@ async fn refine_agents_probe() -> Result<serde_json::Value, String> {
             .into()
     })
     .await
-    .map_err(|e| format!("Agent 探测后台任务异常: {e}"))
+    .map_err(|e| tr!("Agent 探测后台任务异常: {e}", "Agent probe background task failed: {e}"))
 }
 
 /// AI 调用日志查询(倒序分页,过滤条件见 ailog::Filter)。
@@ -3477,7 +3566,7 @@ async fn ai_logs_query(app: AppHandle, filter: ailog::Filter) -> Result<serde_js
         Ok(ailog::query(&root, &filter))
     })
     .await
-    .map_err(|e| format!("AI 日志查询后台任务异常: {e}"))?
+    .map_err(|e| tr!("AI 日志查询后台任务异常: {e}", "AI log query background task failed: {e}"))?
 }
 
 /// AI 调用日志全量导出为 JSONL,返回文件路径(写 ai_logs/ 目录,与笔记导出同一
@@ -3490,7 +3579,7 @@ async fn ai_logs_export(app: AppHandle) -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
     })
     .await
-    .map_err(|e| format!("AI 日志导出后台任务异常: {e}"))?
+    .map_err(|e| tr!("AI 日志导出后台任务异常: {e}", "AI log export background task failed: {e}"))?
 }
 
 /// 在访达中打开 AI 日志目录(macOS `open`;目录不存在先建,空目录也可打开)。
@@ -3592,9 +3681,15 @@ pub(crate) fn current_models_status(app: &AppHandle) -> models::ModelsStatus {
 pub(crate) fn recording_not_ready_msg(app: &AppHandle) -> String {
     let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
     if s.asr_mode == settings::ASR_MODE_CLOUD && !settings::cloud_creds_ok(&s) {
-        "请先在设置中配置云端凭证".into()
+        tr!(
+            "请先在设置中配置云端凭证",
+            "Please configure the cloud credentials in Settings first"
+        )
     } else {
-        "模型缺失：请先在设置页下载所选识别模型".into()
+        tr!(
+            "模型缺失：请先在设置页下载所选识别模型",
+            "Model missing: please download the selected recognition model in Settings"
+        )
     }
 }
 
@@ -3610,11 +3705,15 @@ fn open_models_dir(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     let dir = models::root();
     if !dir.is_dir() {
-        return Err(format!("模型目录不存在: {}", dir.display()));
+        return Err(tr!(
+            "模型目录不存在: {path}",
+            "Model directory does not exist: {path}",
+            path = dir.display()
+        ));
     }
     app.opener()
         .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
-        .map_err(|e| format!("打开目录失败: {e}"))
+        .map_err(|e| tr!("打开目录失败: {e}", "Failed to open the directory: {e}"))
 }
 
 /// 下载单个工件:按 download_urls 的候选顺序尝试。代理候选各试 1 次(死代理快速跳过,
@@ -3653,13 +3752,13 @@ fn download_one(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| "下载失败".into()))
+    Err(last_err.unwrap_or_else(|| tr!("下载失败", "Download failed")))
 }
 
 #[tauri::command]
 fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<String>>) -> Result<(), String> {
     if state.download_running.swap(true, Ordering::SeqCst) {
-        return Err("下载已在进行中".into());
+        return Err("下载已在进行中".into()); // i18n-exempt: 前端按原文判等
     }
     state.download_cancel.store(false, Ordering::SeqCst);
     let running = state.download_running.clone();
@@ -3783,27 +3882,27 @@ fn delete_model(_app: AppHandle, state: State<AppState>, id: String) -> Result<(
     // Some;查槽会在这段加载窗口误判"空闲",删掉正在被常驻实例/写盘用的模型。running
     // statement-scoped,查完即放。
     if *state.running.lock().unwrap() {
-        return Err("录制中不能删除模型".into());
+        return Err(tr!("录制中不能删除模型", "Cannot delete a model while recording"));
     }
     if state.download_running.load(Ordering::SeqCst) {
-        return Err("下载进行中，稍后再试".into());
+        return Err(tr!("下载进行中，稍后再试", "A download is in progress; try again later"));
     }
     let a = models::ARTIFACTS
         .iter()
         .find(|a| a.id == id)
-        .ok_or_else(|| format!("未知模型: {id}"))?;
+        .ok_or_else(|| tr!("未知模型: {id}", "Unknown model: {id}"))?;
     let root = models::root();
     match &a.kind {
         models::ArtifactKind::File => {
             let p = root.join(a.files[0].rel_path);
             if p.exists() {
-                std::fs::remove_file(&p).map_err(|e| format!("删除失败: {e}"))?;
+                std::fs::remove_file(&p).map_err(|e| tr!("删除失败: {e}", "Delete failed: {e}"))?;
             }
         }
         models::ArtifactKind::TarBz2 { dest_dir } => {
             let p = root.join(dest_dir);
             if p.exists() {
-                std::fs::remove_dir_all(&p).map_err(|e| format!("删除失败: {e}"))?;
+                std::fs::remove_dir_all(&p).map_err(|e| tr!("删除失败: {e}", "Delete failed: {e}"))?;
             }
         }
     }
@@ -3838,7 +3937,10 @@ async fn test_cloud_asr(
 ) -> Result<String, String> {
     // 录制中再开一条厂商流会挤占并发额度(多数厂商按账号限并发路数),拒绝而非静默抢占。
     if *state.running.lock().unwrap() {
-        return Err("录制中不能测试云端连接".into());
+        return Err(tr!(
+            "录制中不能测试云端连接",
+            "Cannot test the cloud connection while recording"
+        ));
     }
     tauri::async_runtime::spawn_blocking(move || {
         let s = settings::Settings {
@@ -3849,34 +3951,52 @@ async fn test_cloud_asr(
             ..Default::default()
         };
         let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
-        let mut stream = cloud.open_stream().map_err(|e| format!("连接失败: {e}"))?;
+        let mut stream = cloud
+            .open_stream()
+            .map_err(|e| tr!("连接失败: {e}", "Connection failed: {e}"))?;
         // 200ms 静音:有些厂商在收到首个音频包前不会走完会话建立,空推一段最接近真实录制。
-        (stream.push)(&vec![0.0f32; 16000 / 5]).map_err(|e| format!("推流失败: {e}"))?;
-        (stream.finish)().map_err(|e| format!("收尾失败: {e}"))?;
+        (stream.push)(&vec![0.0f32; 16000 / 5])
+            .map_err(|e| tr!("推流失败: {e}", "Failed to push audio: {e}"))?;
+        (stream.finish)().map_err(|e| tr!("收尾失败: {e}", "Failed to finish the stream: {e}"))?;
         let deadline = std::time::Instant::now() + CLOUD_TEST_TIMEOUT;
         loop {
             let left = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| "连接超时:请检查网络或凭证".to_string())?;
+                .ok_or_else(|| {
+                    tr!(
+                        "连接超时:请检查网络或凭证",
+                        "Connection timed out: check your network or credentials"
+                    )
+                })?;
             match stream.events.recv_timeout(left) {
                 Ok(asr::cloud::CloudEvent::Closed { error: None }) => {
-                    return Ok(format!("连接成功({})", cloud_provider_label(&s.cloud_asr_provider)))
+                    return Ok(tr!(
+                        "连接成功({label})",
+                        "Connected successfully ({label})",
+                        label = cloud_provider_label(&s.cloud_asr_provider)
+                    ))
                 }
                 Ok(asr::cloud::CloudEvent::Closed { error: Some(e) }) => return Err(e),
                 // 中途的预览/定稿(静音也可能吐空定稿)不是结论,继续等关闭。
                 Ok(_) => continue,
                 // 通道断开却没给 Closed:适配层线程异常退出,当失败报。
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return Err("连接异常中断:请检查网络或凭证".into())
+                    return Err(tr!(
+                        "连接异常中断:请检查网络或凭证",
+                        "Connection dropped unexpectedly: check your network or credentials"
+                    ))
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    return Err("连接超时:请检查网络或凭证".into())
+                    return Err(tr!(
+                        "连接超时:请检查网络或凭证",
+                        "Connection timed out: check your network or credentials"
+                    ))
                 }
             }
         }
     })
     .await
-    .map_err(|e| format!("执行线程失败: {e}"))?
+    .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3892,7 +4012,10 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     // 必须经专门的迁移功能（负责移动文件 + 重设 override），这里直接拒绝防止指针漂移
     // 而数据不动导致"找不到笔记/模型"。
     if old.data_dir != new_settings.data_dir || old.models_dir != new_settings.models_dir {
-        return Err("存储目录变更请使用迁移功能".into());
+        return Err(tr!(
+            "存储目录变更请使用迁移功能",
+            "Use the migration feature to change the storage directory"
+        ));
     }
     // ASR 选型变更:录制中切换会让常驻识别器与正在转写的会话对不上,拒绝;无会话则
     // save 后清掉旧选型的常驻识别器、按新选型重载,无需重启即可用新模型开录。
@@ -3900,7 +4023,10 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     // 窗口里切型会与即将取用的常驻识别器对不上。statement-scoped。
     let asr_changed = old.asr_model != new_settings.asr_model;
     if asr_changed && *state.running.lock().unwrap() {
-        return Err("录制中不能切换识别模型".into());
+        return Err(tr!(
+            "录制中不能切换识别模型",
+            "Cannot switch the recognition model while recording"
+        ));
     }
     // 识别方式(本地/云端)与云端凭证变更:与 ASR 选型同理,录制中改会让正在跑的会话与
     // 设置对不上(云端流已按旧凭证握手、本地 worker 已持旧识别器),拒绝。凭证也在内:
@@ -3911,17 +4037,26 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
         || old.volc_access_key != new_settings.volc_access_key
         || old.dashscope_api_key != new_settings.dashscope_api_key;
     if (mode_changed || creds_changed) && *state.running.lock().unwrap() {
-        return Err("录制中不能切换识别方式".into());
+        return Err(tr!(
+            "录制中不能切换识别方式",
+            "Cannot switch the recognition mode while recording"
+        ));
     }
     // 声纹模型切换:录制中拒绝(与 ASR 同理);保存后清旧嵌入器缓存,并起后台线程
     // 用新模型从录音样本重建整库质心(不同模型空间不可混用)。重建期间录制可用,
     // 只是种子注入被门禁跳过(不自动认人),完成后自动恢复。
     let speaker_changed = old.speaker_model != new_settings.speaker_model;
     if speaker_changed && *state.running.lock().unwrap() {
-        return Err("录制中不能切换声纹模型".into());
+        return Err(tr!(
+            "录制中不能切换声纹模型",
+            "Cannot switch the voiceprint model while recording"
+        ));
     }
     // 托盘开关是否变更(落盘后据此建/拆托盘,即时生效无需重启)。
     let tray_changed = old.tray_enabled != new_settings.tray_enabled;
+    // UI 语言变更:落盘后切全局语言并重建托盘菜单文案(new_settings 即将 move 进闭包,先取值)。
+    let lang_changed = old.ui_lang != new_settings.ui_lang;
+    let new_ui_lang = new_settings.ui_lang.clone();
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
@@ -3977,6 +4112,12 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     if tray_changed {
         tray::apply_enabled(&app);
     }
+    if lang_changed {
+        i18n::set_lang(&new_ui_lang);
+        // 菜单标签按新语言重建(set_recording 即整体重建路径);running statement-scoped。
+        let running = *state.running.lock().unwrap();
+        tray::set_recording(&app, running);
+    }
     Ok(())
 }
 
@@ -4003,7 +4144,7 @@ fn save_hooks(app: AppHandle, hooks: Vec<hooks_external::HookCfg>) -> Result<(),
 async fn test_hook(cfg: hooks_external::HookCfg) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || hooks_external::test_run(&cfg))
         .await
-        .map_err(|e| format!("执行线程失败: {e}"))?
+        .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
 
 /// 配置页「测试连接」:发一条最小 chat/completions 验证大模型 Aing 配置。
@@ -4013,7 +4154,7 @@ async fn test_refine_llm(base_url: String, model: String, api_key: String) -> Re
         refine::llm::probe(&refine::llm::LlmConfig { base_url, model, api_key })
     })
     .await
-    .map_err(|e| format!("执行线程失败: {e}"))?
+    .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
 
 /// 配置页「测试运行」:用配好的 Agent CLI 跑一句极短提示验证可用。
@@ -4021,7 +4162,7 @@ async fn test_refine_llm(base_url: String, model: String, api_key: String) -> Re
 async fn test_refine_agent(provider: String, bin: String, model: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || refine::agent::probe_run(&provider, &bin, &model))
         .await
-        .map_err(|e| format!("执行线程失败: {e}"))?
+        .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
 
 /// 设置页「测试」镜像:经镜像前缀探一个已知资源验证可达。
@@ -4029,7 +4170,7 @@ async fn test_refine_agent(provider: String, bin: String, model: String) -> Resu
 async fn test_mirror(prefix: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || models::download::probe_mirror(&prefix))
         .await
-        .map_err(|e| format!("执行线程失败: {e}"))?
+        .map_err(|e| tr!("执行线程失败: {e}", "Worker thread failed: {e}"))?
 }
 
 /// RAII 解暂停守卫:迁移后台线程无论正常返回、提前 return 还是 panic 展开,转码队列
@@ -4058,12 +4199,12 @@ impl Drop for UnpauseOnDrop {
 fn migrate_guard(running: &Arc<Mutex<bool>>, download_running: &Arc<AtomicBool>) -> Result<(), String> {
     // 先抢互斥位(与 start 的 download 检查对称)。
     if download_running.swap(true, Ordering::SeqCst) {
-        return Err("迁移或下载进行中".into());
+        return Err(tr!("迁移或下载进行中", "A migration or download is in progress"));
     }
     // 再查录制中;拒绝时必须复位刚抢下的互斥位,否则迁移互斥位永久卡死。
     if *running.lock().unwrap() {
         download_running.store(false, Ordering::SeqCst);
-        return Err("录制中不能迁移".into());
+        return Err(tr!("录制中不能迁移", "Cannot migrate while recording"));
     }
     Ok(())
 }
@@ -4112,7 +4253,13 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
         });
         if let Err(e) = saved {
             store::migrate::cleanup_copied_entries(&new_path, entries);
-            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+            return emit_err(
+                &app,
+                tr!(
+                    "保存设置失败,迁移已回滚: {e}",
+                    "Failed to save settings; the migration was rolled back: {e}"
+                ),
+            );
         }
         // 自定义目录落在 asset:// 默认作用域外,放行整棵子树供详情页音频播放。
         // 失败只降级打日志(音频可能无法播放,但迁移已提交)。
@@ -4135,7 +4282,10 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     // settings.models_dir 也不生效,迁了等于白迁,直接拒绝并提示先移除环境变量。
     if let Ok(v) = std::env::var("VN_MODELS") {
         if !v.is_empty() {
-            return Err("VN_MODELS 环境变量生效中,请先移除再迁移".into());
+            return Err(tr!(
+                "VN_MODELS 环境变量生效中,请先移除再迁移",
+                "The VN_MODELS environment variable is in effect; remove it before migrating"
+            ));
         }
     }
     let new_path = PathBuf::from(&new_dir);
@@ -4173,7 +4323,13 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
         });
         if let Err(e) = saved {
             store::migrate::cleanup_copied_entries(&new_path, &entry_refs);
-            return emit_err(&app, format!("保存设置失败,迁移已回滚: {e}"));
+            return emit_err(
+                &app,
+                tr!(
+                    "保存设置失败,迁移已回滚: {e}",
+                    "Failed to save settings; the migration was rolled back: {e}"
+                ),
+            );
         }
         // 提交生效:立即重设 override,后续 models::root() 即指向新处,无需重启。
         models::set_models_override(Some(new_path.clone()));
@@ -4575,6 +4731,8 @@ pub fn run() {
                 let _ = settings::migrate_mirror_prefix(dir);
             }
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
+            // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
+            i18n::set_lang(&s.ui_lang);
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
             // 必须先于 models::root() 的任何使用。
             models::set_models_override(s.models_dir.clone().map(PathBuf::from));
@@ -4869,6 +5027,8 @@ mod cloud_asr_factory_tests {
 
     #[test]
     fn missing_creds_bail_with_settings_hint() {
+        // 断言的是中文原文(进程默认语言):拿语言锁,免得并发的语言切换用例把它掀翻。
+        let _lang = crate::i18n::test_lang_guard();
         let s = Settings { cloud_asr_provider: CLOUD_VOLCANO.into(), ..Default::default() };
         let err = make_cloud_asr(&s).err().expect("火山缺凭证应报错");
         assert!(err.to_string().contains("请先在设置中配置云端凭证"), "{err}");
@@ -4886,6 +5046,8 @@ mod cloud_asr_factory_tests {
 
     #[test]
     fn builds_adapter_per_provider_when_creds_ok() {
+        // 同上:cloud_provider_label 断言中文原文,须与语言切换用例互斥。
+        let _lang = crate::i18n::test_lang_guard();
         let volc = Settings {
             cloud_asr_provider: CLOUD_VOLCANO.into(),
             volc_app_key: "a".into(),
@@ -5251,6 +5413,8 @@ mod tests {
 
     #[test]
     fn failed_rebuild_request_never_reports_a_queued_mutation() {
+        // 断言中文原文(进程默认语言):与语言切换用例互斥。
+        let _lang = crate::i18n::test_lang_guard();
         let result = crate::ipc::KnowledgeMutationResult {
             operation_id: "op_saved".into(),
             entity_id: None,
@@ -5326,6 +5490,8 @@ mod tests {
 
     #[test]
     fn failed_person_rebuild_request_keeps_retry_marker_and_reports_saved_merge() {
+        // 断言中文原文(进程默认语言):与语言切换用例互斥。
+        let _lang = crate::i18n::test_lang_guard();
         let root = tempfile::tempdir().unwrap();
         let scheduler = crate::graph::index::RebuildScheduler::with_rebuilder_and_spawner(
             |_| Ok(crate::graph::index::BuildStats::default()),
@@ -5348,6 +5514,8 @@ mod tests {
 
     #[test]
     fn compat_graph_failure_after_person_rename_still_requests_rebuild() {
+        // 断言中文原文(进程默认语言):与语言切换用例互斥。
+        let _lang = crate::i18n::test_lang_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("voiceprints.json"),

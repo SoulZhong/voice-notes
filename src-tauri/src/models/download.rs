@@ -51,7 +51,7 @@ pub fn download_urls(url: &str, mirror_enabled: bool, mirror_prefix: &str) -> Ve
 pub fn probe_mirror(prefix: &str) -> Result<String, String> {
     let p = prefix.trim();
     if p.is_empty() {
-        return Err("镜像前缀为空".to_string());
+        return Err(crate::tr!("镜像前缀为空", "Mirror prefix is empty"));
     }
     // 取注册表里一个稳定的小资源(vad,~1MB)做探测;Range 只要头 1 字节。
     let origin = crate::models::ARTIFACTS
@@ -65,31 +65,41 @@ pub fn probe_mirror(prefix: &str) -> Result<String, String> {
         .set("Range", "bytes=0-0")
         .call()
     {
-        Ok(r) => Ok(format!("镜像可达(HTTP {})", r.status())),
+        Ok(r) => Ok(crate::tr!("镜像可达(HTTP {code})", "Mirror reachable (HTTP {code})", code = r.status())),
         Err(ureq::Error::Status(code, _)) if (200..400).contains(&code) => {
-            Ok(format!("镜像可达(HTTP {code})"))
+            Ok(crate::tr!("镜像可达(HTTP {code})", "Mirror reachable (HTTP {code})", code = code))
         }
-        Err(ureq::Error::Status(code, _)) => Err(format!("镜像返回 HTTP {code}")),
+        Err(ureq::Error::Status(code, _)) => {
+            Err(crate::tr!("镜像返回 HTTP {code}", "Mirror returned HTTP {code}", code = code))
+        }
         Err(ureq::Error::Transport(t)) => {
             let s = t.to_string();
             if s.contains("timed out") || s.contains("timeout") {
-                Err("镜像连接超时".to_string())
+                Err(crate::tr!("镜像连接超时", "Mirror connection timed out"))
             } else {
-                Err(format!("镜像不可达:{s}"))
+                Err(crate::tr!("镜像不可达:{s}", "Mirror unreachable: {s}", s = s))
             }
         }
     }
 }
 
+/// 稳定错误码:以 "[E_*]" 前缀嵌入错误串,重试判定只认码不认人类可读文案——
+/// 文案可随 UI 语言(tr!)翻译,控制流不受影响。"cancelled" 字面量是取消协议,不在此列。
+pub const CODE_SIZE_MISMATCH: &str = "[E_SIZE_MISMATCH]";
+pub const CODE_SHA256_MISMATCH: &str = "[E_SHA256_MISMATCH]";
+pub const CODE_ARCHIVE_MISSING_DIR: &str = "[E_ARCHIVE_MISSING_DIR]";
+pub const CODE_RESUME_OFFSET: &str = "[E_RESUME_OFFSET]";
+
 pub fn retryable_download_error(message: &str) -> bool {
     message != "cancelled"
-        && !message.contains("大小不符")
-        && !message.contains("SHA256 校验失败")
-        && !message.contains("压缩包内缺少目录")
-        && !message.contains("续传偏移越界")
+        && !message.contains(CODE_SIZE_MISMATCH)
+        && !message.contains(CODE_SHA256_MISMATCH)
+        && !message.contains(CODE_ARCHIVE_MISSING_DIR)
+        && !message.contains(CODE_RESUME_OFFSET)
         // 4xx 是永久失败,重试同一 URL 纯浪费(直接换下一个 URL)。ureq 对非 2xx 走
         // Err(Status),经 download_artifact 包装后的真实文案是
-        // 「请求失败: <url>: status code 404」(ureq error.rs 的 Display 格式);
+        // 「请求失败: <url>: status code 404」(前缀随 UI 语言翻译,但 ": status code"
+        // 来自 ureq error.rs 的 Display 格式,恒为英文,判据不受翻译影响);
         // 本仓自己的 "HTTP {n}" 分支只有 204 等非 200/206 的 2xx 才可达,一并保留。
         && !message.contains(": status code 4")
         && !message.starts_with("HTTP 4")
@@ -114,11 +124,23 @@ pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
 pub fn verify_file(path: &Path, expected: &FinalFile) -> anyhow::Result<()> {
     let len = fs::metadata(path)?.len();
     if len != expected.bytes {
-        anyhow::bail!("{} 大小不符: {len} != {}", expected.rel_path, expected.bytes);
+        anyhow::bail!(
+            "{CODE_SIZE_MISMATCH} {}",
+            crate::tr!(
+                "{rel} 大小不符: {len} != {want}",
+                "{rel}: size mismatch: {len} != {want}",
+                rel = expected.rel_path,
+                len = len,
+                want = expected.bytes
+            )
+        );
     }
     let got = sha256_file(path)?;
     if got != expected.sha256 {
-        anyhow::bail!("{} SHA256 校验失败", expected.rel_path);
+        anyhow::bail!(
+            "{CODE_SHA256_MISMATCH} {}",
+            crate::tr!("{rel} SHA256 校验失败", "{rel}: SHA256 checksum failed", rel = expected.rel_path)
+        );
     }
     Ok(())
 }
@@ -178,7 +200,10 @@ pub fn extract_and_install(
     }
     let src = tmp.join(dest_dir);
     if !src.is_dir() {
-        anyhow::bail!("压缩包内缺少目录 {dest_dir}");
+        anyhow::bail!(
+            "{CODE_ARCHIVE_MISSING_DIR} {}",
+            crate::tr!("压缩包内缺少目录 {dest_dir}", "Archive is missing directory {dest_dir}", dest_dir = dest_dir)
+        );
     }
     // FinalFile.rel_path 相对 models root，而 tmp 镜像 root 布局，直接拼即可。
     for ff in files {
@@ -276,11 +301,18 @@ pub fn download_artifact(
                 if e.to_string() == "cancelled" {
                     e
                 } else {
-                    anyhow::anyhow!("续传偏移越界,残留分片无法直接安装,请重试({e})")
+                    anyhow::anyhow!(
+                        "{CODE_RESUME_OFFSET} {}",
+                        crate::tr!(
+                            "续传偏移越界,残留分片无法直接安装,请重试({e})",
+                            "Resume offset out of range; leftover partial file cannot be installed directly, please retry ({e})",
+                            e = e
+                        )
+                    )
                 }
             });
         }
-        Err(e) => anyhow::bail!("请求失败: {e}"),
+        Err(e) => anyhow::bail!("{}", crate::tr!("请求失败: {e}", "Request failed: {e}", e = e)),
     };
     let status = resp.status();
     let out: fs::File;
@@ -312,7 +344,7 @@ pub fn download_artifact(
             Err(e) => {
                 let _ = out.flush();
                 drop(out);
-                anyhow::bail!("下载中断: {e}");
+                anyhow::bail!("{}", crate::tr!("下载中断: {e}", "Download interrupted: {e}", e = e));
             }
         };
         if n == 0 {
@@ -416,7 +448,14 @@ mod tests {
         assert!(retryable_download_error("下载中断: response body closed before all bytes were read"));
         assert!(retryable_download_error("请求失败: Network Error: Operation timed out"));
         assert!(!retryable_download_error("cancelled"));
-        assert!(!retryable_download_error("m.bin SHA256 校验失败"));
+        // 永久失败判定只认稳定错误码,文案(中/英)可自由翻译。
+        assert!(!retryable_download_error("[E_SHA256_MISMATCH] m.bin SHA256 校验失败"));
+        assert!(!retryable_download_error("[E_SHA256_MISMATCH] m.bin: SHA256 checksum failed"));
+        assert!(!retryable_download_error("[E_SIZE_MISMATCH] m.bin 大小不符: 4 != 5"));
+        assert!(!retryable_download_error("[E_ARCHIVE_MISSING_DIR] Archive is missing directory d"));
+        assert!(!retryable_download_error("[E_RESUME_OFFSET] 续传偏移越界,残留分片无法直接安装,请重试(x)"));
+        // 无码的纯文案不再触发永久失败判定(判据已结构化)。
+        assert!(retryable_download_error("m.bin SHA256 校验失败"));
         // 4xx 的**真实**文案(ureq Status Display 经 "请求失败: {e}" 包装),
         // 不是虚构的 "HTTP 404"——PR #16 评审实证,勿改回纯 starts_with 匹配。
         assert!(!retryable_download_error(
@@ -433,10 +472,14 @@ mod tests {
         let p = tmp.path().join("m.bin");
         std::fs::write(&p, b"hello").unwrap();
         assert!(verify_file(&p, &ff("m.bin", b"hello")).is_ok());
-        assert!(verify_file(&p, &ff("m.bin", b"hell")).is_err(), "大小不符");
+        let size_err = verify_file(&p, &ff("m.bin", b"hell")).unwrap_err().to_string();
+        assert!(size_err.contains(CODE_SIZE_MISMATCH), "大小不符应带稳定码: {size_err}");
+        assert!(!retryable_download_error(&size_err), "大小不符不可重试");
         let mut wrong = ff("m.bin", b"hello");
         wrong.sha256 = Box::leak("0".repeat(64).into_boxed_str());
-        assert!(verify_file(&p, &wrong).is_err(), "哈希不符");
+        let hash_err = verify_file(&p, &wrong).unwrap_err().to_string();
+        assert!(hash_err.contains(CODE_SHA256_MISMATCH), "哈希不符应带稳定码: {hash_err}");
+        assert!(!retryable_download_error(&hash_err), "哈希不符不可重试");
     }
 
     #[test]
@@ -517,7 +560,15 @@ mod tests {
 
     #[test]
     fn probe_mirror_empty_prefix_errs() {
-        assert!(probe_mirror("   ").unwrap_err().contains("为空"));
+        // 文案随全局语言:拿 test_lang_guard 与其它改语言的用例互斥后,两种语言各断言一次。
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
+        let e = probe_mirror("   ").unwrap_err();
+        assert!(e.contains("为空"), "空前缀应报错(中文): {e}");
+        crate::i18n::set_lang("en");
+        let e = probe_mirror("   ").unwrap_err();
+        assert!(e.contains("empty"), "空前缀应报错(英文): {e}");
+        crate::i18n::set_lang("zh");
     }
 
     /// 真机验证(网络依赖,与既有 7 个模型依赖测试同惯例 #[ignore]):走生产同款

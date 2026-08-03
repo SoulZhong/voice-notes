@@ -2,6 +2,7 @@
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { ask } from "@tauri-apps/plugin-dialog";
+  import { t } from "$lib/i18n/index.svelte";
   import {
     listHooks,
     saveHooks,
@@ -57,13 +58,13 @@
         }
         else {
           cfg = null;
-          loadError = "钩子不存在,可能已被删除";
+          loadError = t("hooks.edit.notFound");
         }
       })
       .catch((e) => {
         if (id !== routeId) return; // 同上:过期请求的失败也不该污染当前页
         cfg = null;
-        loadError = `加载失败: ${e}`;
+        loadError = t("common.loadFailed", { e });
       });
   });
 
@@ -80,7 +81,7 @@
       hooksStore.bump();
       if (isNew) goto(`/hooks/${cfg.id}`);
     } catch (e) {
-      saveError = `保存失败: ${e}`;
+      saveError = t("common.saveFailed", { e });
     } finally {
       saving = false;
     }
@@ -88,11 +89,11 @@
 
   async function remove() {
     if (!cfg || isNew) return;
-    const yes = await ask(`「${cfg.name || "未命名钩子"}」将被删除,此操作不可恢复。`, {
-      title: "删除钩子",
+    const yes = await ask(t("hooks.delete.confirm", { name: cfg.name || t("hooks.unnamed") }), {
+      title: t("hooks.delete.title"),
       kind: "warning",
-      okLabel: "删除",
-      cancelLabel: "取消",
+      okLabel: t("hooks.action.delete"),
+      cancelLabel: t("hooks.action.cancel"),
     });
     if (!yes) return;
     try {
@@ -101,7 +102,7 @@
       hooksStore.bump();
       goto("/hooks");
     } catch (e) {
-      saveError = `删除失败: ${e}`;
+      saveError = t("common.deleteFailed", { e });
     }
   }
 
@@ -128,28 +129,28 @@
     if (!cfg) return { desc: "", hint: "", placeholder: "" };
     if (cfg.kind === "feishu") {
       return {
-        desc: "发送成飞书群机器人可以直接显示的文字消息",
-        hint: "打开飞书群设置 → 群机器人 → 添加机器人 → 自定义机器人，复制 Webhook 地址粘贴到这里。",
+        desc: t("hooks.kind.feishuDesc"),
+        hint: t("hooks.kind.feishuHint"),
         placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/…",
       };
     }
     if (cfg.kind === "wecom") {
       return {
-        desc: "发送成企业微信群机器人可以直接显示的文字消息",
-        hint: "打开企业微信群设置 → 群机器人 → 添加机器人，复制 Webhook 地址粘贴到这里。",
+        desc: t("hooks.kind.wecomDesc"),
+        hint: t("hooks.kind.wecomHint"),
         placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…",
       };
     }
     return {
-      desc: "向自建服务或自动化工具 POST 标准 JSON",
-      hint: "适合自建服务、n8n、Zapier 等工具；请求体字段可在钩子概览页查看。",
+      desc: t("hooks.kind.genericDesc"),
+      hint: t("hooks.kind.genericHint"),
       placeholder: "https://example.com/hook",
     };
   });
 </script>
 
 <div class="page">
-  <header class="topbar"><h1>{isNew ? "新建钩子" : cfg?.name || "编辑钩子"}</h1></header>
+  <header class="topbar"><h1>{isNew ? t("hooks.edit.newTitle") : cfg?.name || t("hooks.edit.editTitle")}</h1></header>
 
   {#if loadError}
     <div class="banner">{loadError}</div>
@@ -161,12 +162,12 @@
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">名称</span>
-          <span class="row-desc">给这条钩子起个好认的名字</span>
+          <span class="row-label">{t("hooks.field.name.label")}</span>
+          <span class="row-desc">{t("hooks.field.name.desc")}</span>
         </div>
         <input
           class="row-input"
-          placeholder="如:停录后归档"
+          placeholder={t("hooks.field.name.placeholder")}
           bind:value={cfg.name}
           oninput={() => (testResult = null)}
         />
@@ -174,8 +175,8 @@
 
       <div class="row">
         <div class="row-info">
-          <span class="row-label">触发事件</span>
-          <span class="row-desc">事件发生的那一刻执行</span>
+          <span class="row-label">{t("hooks.field.event.label")}</span>
+          <span class="row-desc">{t("hooks.field.event.desc")}</span>
         </div>
         <select class="row-input" bind:value={cfg.event} onchange={() => (testResult = null)}>
           {#each HOOK_EVENTS as e (e.value)}
@@ -186,17 +187,17 @@
 
       <div class="row">
         <div class="row-info">
-          <span class="row-label">执行方式</span>
+          <span class="row-label">{t("hooks.field.kind.label")}</span>
           <span class="row-desc">
-            {cfg.kind === "shell" ? "本机运行命令，事件信息在环境变量里" : webhookHelp.desc}
+            {cfg.kind === "shell" ? t("hooks.kind.shellDesc") : webhookHelp.desc}
           </span>
         </div>
-        <div class="segmented" role="radiogroup" aria-label="执行方式">
+        <div class="segmented" role="radiogroup" aria-label={t("hooks.field.kind.label")}>
           {#each [
             ["shell", "Shell"],
-            ["feishu", "飞书"],
-            ["wecom", "企业微信"],
-            ["webhook", "通用 Webhook"],
+            ["feishu", t("hooks.kind.feishu")],
+            ["wecom", t("hooks.kind.wecom")],
+            ["webhook", t("hooks.kind.generic")],
           ] as [v, label] (v)}
             <label class="seg-item">
               <input
@@ -220,13 +221,13 @@
       {#if cfg.kind === "shell"}
         <div class="row column">
           <div class="row-info">
-            <span class="row-label">命令</span>
-            <span class="row-desc">经 /bin/sh -c 执行;可用 $VN_EVENT、$VN_NOTE_ID、$VN_NOTE_TITLE,30 秒超时</span>
+            <span class="row-label">{t("hooks.field.command.label")}</span>
+            <span class="row-desc">{t("hooks.field.command.desc")}</span>
           </div>
           <textarea
             class="cmd"
             rows="3"
-            placeholder={'say "会议结束"'}
+            placeholder={t("hooks.field.command.placeholder")}
             bind:value={cfg.command}
             oninput={() => (testResult = null)}
           ></textarea>
@@ -234,7 +235,7 @@
       {:else}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">Webhook 地址</span>
+            <span class="row-label">{t("hooks.field.url.label")}</span>
             <span class="row-desc">{webhookHelp.hint}</span>
           </div>
           <input
@@ -247,13 +248,13 @@
         {#if cfg.kind === "feishu" || cfg.kind === "wecom"}
           <div class="row">
             <div class="row-info">
-              <span class="row-label">消息样式</span>
+              <span class="row-label">{t("hooks.field.style.label")}</span>
               <span class="row-desc">
-                {cfg.kind === "feishu" ? "富文本会以飞书消息标题与分段正文展示" : "Markdown 支持标题、加粗、引用和链接"}
+                {cfg.kind === "feishu" ? t("hooks.style.feishuDesc") : t("hooks.style.wecomDesc")}
               </span>
             </div>
-            <div class="segmented" role="radiogroup" aria-label="消息样式">
-              {#each [["rich", cfg.kind === "feishu" ? "富文本" : "Markdown"], ["text", "纯文本"]] as [v, label] (v)}
+            <div class="segmented" role="radiogroup" aria-label={t("hooks.field.style.label")}>
+              {#each [["rich", cfg.kind === "feishu" ? t("hooks.style.rich") : "Markdown"], ["text", t("hooks.style.plain")]] as [v, label] (v)}
                 <label class="seg-item">
                   <input
                     type="radio"
@@ -274,14 +275,14 @@
           {#if cfg.kind === "feishu"}
             <div class="row">
               <div class="row-info">
-                <span class="row-label">签名密钥（推荐）</span>
-                <span class="row-desc">若机器人安全设置启用了“签名校验”，粘贴页面显示的密钥；只保存在本机</span>
+                <span class="row-label">{t("hooks.field.secret.label")}</span>
+                <span class="row-desc">{t("hooks.field.secret.desc")}</span>
               </div>
               <input
                 class="row-input wide"
                 type="password"
                 autocomplete="off"
-                placeholder="未启用签名校验可留空"
+                placeholder={t("hooks.field.secret.placeholder")}
                 bind:value={cfg.webhook_secret}
                 oninput={() => (testResult = null)}
               />
@@ -290,33 +291,31 @@
 
           <label class="row">
             <div class="row-info">
-              <span class="row-label">提醒所有人</span>
-              <span class="row-desc">每次触发都会 @ 全体成员，请谨慎开启</span>
+              <span class="row-label">{t("hooks.field.mentionAll.label")}</span>
+              <span class="row-desc">{t("hooks.field.mentionAll.desc")}</span>
             </div>
             <input type="checkbox" class="switch" bind:checked={cfg.webhook_mention_all} />
           </label>
 
           <div class="webhook-tip">
             <span aria-hidden="true">✓</span>
-            {cfg.kind === "feishu"
-              ? "飞书还可在机器人后台设置关键词或 IP 白名单；关键词必须出现在消息中，建议填“voice-notes”。"
-              : "企业微信单个机器人最多发送 20 条/分钟；高频事件请避免同时开启 @ 所有人。"}
+            {cfg.kind === "feishu" ? t("hooks.tip.feishu") : t("hooks.tip.wecom")}
           </div>
         {:else}
           <div class="webhook-tip">
             <span aria-hidden="true">i</span>
-            通用 Webhook 会发送标准 JSON，适合自建服务、n8n、Zapier 等自动化工具。
+            {t("hooks.tip.generic")}
           </div>
         {/if}
       {/if}
 
       <label class="row">
         <div class="row-info">
-          <span class="row-label">附带笔记内容</span>
+          <span class="row-label">{t("hooks.field.includeNote.label")}</span>
           <span class="row-desc">
             {(cfg.kind === "feishu" || cfg.kind === "wecom")
-              ? "开启后，群消息会带上笔记全文（修订稿优先）；想接收 AI 整理结果请选择「Aing 结束」"
-              : "把笔记详情与全文交给命令/接口，修订稿优先；想要 AI 整理后的全文请挂「Aing 结束」，变量清单见概览页"}
+              ? t("hooks.includeNote.imDesc")
+              : t("hooks.includeNote.otherDesc")}
           </span>
         </div>
         <!-- 与启用开关不同:附带与否改变测试注入的内容,旧测试结果不再作数 -->
@@ -330,8 +329,8 @@
 
       <label class="row">
         <div class="row-info">
-          <span class="row-label">启用</span>
-          <span class="row-desc">停用后保留配置,事件不再触发</span>
+          <span class="row-label">{t("hooks.field.enabled.label")}</span>
+          <span class="row-desc">{t("hooks.field.enabled.desc")}</span>
         </div>
         <input type="checkbox" class="switch" bind:checked={cfg.enabled} />
       </label>
@@ -339,19 +338,19 @@
 
     <div class="actions">
       <button class="btn-primary" onclick={save} disabled={saving || bodyMissing}>
-        {saving ? "保存中…" : "保存"}
+        {saving ? t("hooks.action.saving") : t("hooks.action.save")}
       </button>
       <button class="btn-secondary" onclick={runTest} disabled={testing || bodyMissing}>
-        {testing ? "测试中…" : "测试一次"}
+        {testing ? t("hooks.action.testing") : t("hooks.action.test")}
       </button>
       {#if !isNew}
-        <button class="btn-danger" onclick={remove}>删除</button>
+        <button class="btn-danger" onclick={remove}>{t("hooks.action.delete")}</button>
       {/if}
     </div>
 
     {#if testResult}
       <p class="test-result" class:ok={testResult.ok} class:err={!testResult.ok}>
-        {testResult.ok ? `测试成功(${testResult.msg})` : `测试失败: ${testResult.msg}`}
+        {testResult.ok ? t("hooks.test.ok", { msg: testResult.msg }) : t("hooks.test.err", { msg: testResult.msg })}
       </p>
     {/if}
   {/if}

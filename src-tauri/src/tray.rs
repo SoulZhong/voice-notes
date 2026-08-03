@@ -59,16 +59,30 @@ fn tray_enabled(app: &AppHandle) -> bool {
 /// 已知取舍:刷新时机只有 setup / set_recording(即 start/stop 前后),模型下载完成本身不触发
 /// 菜单重建——故"模型刚下完到下一次 start/stop 之间"这段,菜单项仍是灰的(点不亮的窗口),
 /// 要到下一次录制状态变化才刷新可用。可接受:下载完成是低频一次性事件。
+/// 三个菜单项的标签(toggle / show / quit),按当前界面语言取。抽成纯函数是为了可测:
+/// build_menu 要 AppHandle,单测里造不出来,而"语言切了托盘却还是旧文案"正是这里会漏的。
+fn menu_labels(recording: bool) -> [String; 3] {
+    [
+        if recording {
+            crate::tr!("停止录制", "Stop recording")
+        } else {
+            crate::tr!("开始录制", "Start recording")
+        },
+        crate::tr!("打开主窗口", "Open main window"),
+        crate::tr!("退出", "Quit"),
+    ]
+}
+
 fn build_menu(app: &AppHandle, recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
-    let toggle_label = if recording { "停止录制" } else { "开始录制" };
+    let [toggle_label, show_label, quit_label] = menu_labels(recording);
     // 模式感知就绪判定,与设置页(models_status)/开录守卫同一份:云端模式下本机大模型
     // 不必需,只要 vad 在 + 凭证齐就该点得亮——否则云端用户面对一个永远灰着的菜单项。
     let ready = crate::current_models_status(app).recording_ready;
     let toggle = MenuItemBuilder::with_id("toggle", toggle_label)
         .enabled(recording || ready)
         .build(app)?;
-    let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
     Menu::with_items(app, &[&toggle, &show, &quit])
 }
 
@@ -272,6 +286,27 @@ mod tests {
         assert!(is_active(&s), "录制中要动");
         s.session = SessionState::Recording { note_id: "n".into(), paused: true };
         assert!(!is_active(&s), "暂停即静止");
+    }
+
+    /// 托盘菜单标签随界面语言切换。语言是进程级全局,故先拿 test_lang_guard 与其它
+    /// 改语言的用例互斥,末尾复位中文。
+    #[test]
+    fn menu_labels_follow_ui_language() {
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
+        assert_eq!(menu_labels(false)[0], "开始录制");
+        assert_eq!(menu_labels(true)[0], "停止录制");
+        assert_eq!(menu_labels(false)[1..], ["打开主窗口".to_string(), "退出".to_string()]);
+
+        crate::i18n::set_lang("en");
+        assert_eq!(menu_labels(false)[0], "Start recording");
+        assert_eq!(menu_labels(true)[0], "Stop recording");
+        assert_eq!(
+            menu_labels(false)[1..],
+            ["Open main window".to_string(), "Quit".to_string()]
+        );
+
+        crate::i18n::set_lang("zh");
     }
 
     /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。

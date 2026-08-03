@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { KnowledgeFilter } from "$lib/knowledge";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     filter,
@@ -61,12 +62,12 @@
   }
 </script>
 
-<div class="map-toolbar" aria-label="知识图谱筛选与视图控制">
+<div class="map-toolbar" aria-label={t("graph.toolbar.aria")}>
   <div class="filter-run">
     <details class="filter-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
-      <summary>实体类型{filter.entity_kinds.length ? ` · ${filter.entity_kinds.length}` : ""}</summary>
+      <summary>{t("graph.toolbar.entityKinds")}{filter.entity_kinds.length ? ` · ${filter.entity_kinds.length}` : ""}</summary>
       <fieldset>
-        <legend>实体类型</legend>
+        <legend>{t("graph.toolbar.entityKinds")}</legend>
         {#each kinds as kind (kind.value)}
           <label>
             <input
@@ -81,11 +82,11 @@
     </details>
 
     <details class="filter-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
-      <summary>关系类型{filter.predicate_types.length ? ` · ${filter.predicate_types.length}` : ""}</summary>
+      <summary>{t("graph.toolbar.predicates")}{filter.predicate_types.length ? ` · ${filter.predicate_types.length}` : ""}</summary>
       <fieldset>
-        <legend>关系类型</legend>
+        <legend>{t("graph.toolbar.predicates")}</legend>
         {#if predicates.length === 0}
-          <p class="empty-options">还没有可筛选的具体关系。完成笔记关系分析后会显示在这里。</p>
+          <p class="empty-options">{t("graph.toolbar.noPredicates")}</p>
         {:else}
           {#each predicates as predicate (predicate.value)}
             <label>
@@ -102,10 +103,10 @@
     </details>
 
     <details class="filter-menu date-menu" ontoggle={(event) => positionMenu(event.currentTarget)}>
-      <summary>更多{filter.from || filter.to || filter.include_history || filter.include_cooccurrence ? " · 已启用" : ""}</summary>
+      <summary>{t("graph.toolbar.more")}{filter.from || filter.to || filter.include_history || filter.include_cooccurrence ? ` · ${t("graph.toolbar.enabled")}` : ""}</summary>
       <div class="date-fields advanced-fields">
         <label>
-          <span>开始日期</span>
+          <span>{t("graph.toolbar.from")}</span>
           <input
             type="date"
             value={filter.from ?? ""}
@@ -114,7 +115,7 @@
           />
         </label>
         <label>
-          <span>结束日期</span>
+          <span>{t("graph.toolbar.to")}</span>
           <input
             type="date"
             value={filter.to ?? ""}
@@ -127,7 +128,7 @@
             checked={filter.include_history}
             onchange={(event) => onChange({ ...filter, include_history: event.currentTarget.checked })}
           />
-          <span>包含历史关系</span>
+          <span>{t("graph.toolbar.includeHistory")}</span>
         </label>
         <label class="advanced-toggle">
           <input
@@ -135,7 +136,7 @@
             checked={filter.include_cooccurrence}
             onchange={(event) => onChange({ ...filter, include_cooccurrence: event.currentTarget.checked })}
           />
-          <span>显示共同出现的弱连接</span>
+          <span>{t("graph.toolbar.includeCooccur")}</span>
         </label>
       </div>
     </details>
@@ -143,12 +144,12 @@
 
   <div class="view-run">
     <span class="view-count" aria-live="polite">
-      {loading ? "正在更新关系" : `${visibleCount} / ${totalCount} 个实体`}
+      {loading ? t("graph.toolbar.updating") : t("graph.toolbar.count", { visible: visibleCount, total: totalCount })}
     </span>
     {#if activeCount > 0}
-      <button type="button" class="text-action" onclick={reset}>重置 {activeCount} 项筛选</button>
+      <button type="button" class="text-action" onclick={reset}>{t("graph.toolbar.reset", { n: activeCount })}</button>
     {/if}
-    <button type="button" class="text-action" onclick={onCollapse}>收起到主干</button>
+    <button type="button" class="text-action" onclick={onCollapse}>{t("graph.toolbar.collapse")}</button>
   </div>
 </div>
 

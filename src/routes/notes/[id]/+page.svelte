@@ -36,6 +36,7 @@
     type ParagraphPayload,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
+  import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -208,7 +209,7 @@
         }
       }
     } catch (err) {
-      const msg = `精修稿离开页面前排空失败: ${err}`;
+      const msg = t("notes.detail.drainFailed", { e: err });
       if (targetId === id && msg !== refinedSaveErr) refinedSaveErr = msg;
     } finally {
       runningRefinedDrains.delete(targetId);
@@ -273,12 +274,12 @@
       refinedEditor?.markSaveFailed();
       // 精修稿保存错误走独立粘性 banner(refinedSaveErr),不写共享 error——refresh()
       // 成功会清 error,若复用它,持续性失败(Aing 中反复被拒)会被后台刷新悄悄抹掉。
-      const msg = `精修稿保存失败: ${err}`;
+      const msg = t("notes.detail.saveRefinedFailed", { e: err });
       if (msg !== refinedSaveErr) refinedSaveErr = msg;
       // revision 冲突(乐观并发):当前编辑已经落空,重载盘上最新内容重建文档。
       // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
       // (markSaveFailed 已排好下一次)。
-      if (String(err).includes("已在别处更新")) {
+      if (String(err).includes("已在别处更新")) { // i18n-exempt: 与后端错误原文判等
         try {
           const latest = await getRefined(targetId);
           if (targetId === id && loadedRefinedId === targetId) {
@@ -421,7 +422,7 @@
       note = await notePromise;
       error = "";
     } catch (e) {
-      error = `加载失败: ${e}`;
+      error = t("common.loadFailed", { e });
     }
     refined = await refinedPromise;
     people = await peoplePromise;
@@ -505,12 +506,17 @@
   // id 切换：无条件复位一切编辑态 + Aing 视图态（否则会短暂展示上一篇笔记的修订稿/进度）。
   // 同时清空 note/error：切换到长会议时后端 load 可能耗时数百毫秒，不清空会一直挂着
   // 上一篇的正文直到新数据整页跳变（观感=点了没反应、卡一下），清空后立即出加载态。
-  // 只在 id 变化时清（本 effect 唯一依赖 id）；编辑后的 refresh() 不经此处，不会闪屏。
+  // 只在 id 变化时清；编辑后的 refresh() 不经此处，不会闪屏。
   $effect(() => {
     void id;
     // 落盘先于复位:flushRefined 内部用 loadedRefinedId(不是下面即将复位的
     // refined/id)找旧笔记,必须在清空编辑态之前调用。
-    refinedEditor?.flushRefined(true);
+    //
+    // 必须 untrack:refinedEditor 是 bind:this 的 $state,裸读会让本 effect 除 id 外
+    // 还依赖它,于是有修订稿的笔记进入自毁循环——编辑器挂载使 refinedEditor 由 null
+    // 变为实例 → effect 重跑 → note/refined 被清空 → 编辑器卸载 → refinedEditor 回到
+    // null → effect 再跑……页面永远停在「加载中…」,且全程不报错(2026-08-02 定位)。
+    untrack(() => refinedEditor?.flushRefined(true));
     note = null;
     error = "";
     editing = false;
@@ -733,7 +739,7 @@
       segEditor?.markSegmentSaved(seq, newText);
       await refresh();
     } catch (err) {
-      error = `编辑失败: ${err}`;
+      error = t("notes.detail.editFailed", { e: err });
       await refresh();
       // 冲突回滚:被拒的编辑必须立即还原,不能指望 hasFocus 守卫下的 effect
       // (WKWebView 下点击/失焦时序不保证 hasFocus() 已变 false)。成功分支不强制
@@ -756,7 +762,7 @@
       // 恒 true,守卫下的 effect 吞掉重建会留幽灵段在屏——强制入口。
       syncSegments(true);
     } catch (e) {
-      error = `删除失败: ${e}`;
+      error = t("common.deleteFailed", { e });
       await refresh();
       syncSegments(true);
     }
@@ -774,7 +780,7 @@
       // hasFocus() 守卫,否则徽章不刷新。
       syncSegments(true);
     } catch (e) {
-      error = `修改说话人失败: ${e}`;
+      error = t("notes.detail.setSpeakerFailed", { e });
       await refresh();
       syncSegments(true);
     }
@@ -822,7 +828,7 @@
       const seq = Number(node.dataset.seq);
       node.classList.toggle("playing", active.has(seq));
       node.classList.toggle("discarded", discarded.has(seq));
-      if (discarded.has(seq)) node.title = "已被 AI 过滤";
+      if (discarded.has(seq)) node.title = t("notes.seg.filtered");
       else node.removeAttribute("title");
     }
   });
@@ -868,7 +874,7 @@
       await renameNote(id, editingTitle);
       recording.bumpNotes();
     } catch (e) {
-      error = `改名失败: ${e}`;
+      error = t("notes.detail.renameFailed", { e });
     }
   }
 
@@ -890,11 +896,12 @@
       });
       if (!dest) return;
       const path = await exportNote(noteId, format, preferRefined, dest);
-      exportMsg = `已导出：${path}`;
+      exportMsg = t("notes.export.done", { path });
       // 清掉早前失败留下的红色横幅,避免"上面报失败下面报成功"并存。
-      if (error.startsWith("导出失败")) error = "";
+      // 前缀判定:导出失败文案去掉 {e} 占位后的固定头部。
+      if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
     } catch (e) {
-      error = `导出失败: ${e}`;
+      error = t("notes.export.failed", { e });
     }
   }
 
@@ -918,7 +925,7 @@
     } catch (e) {
       refining = false;
       refineRunFailed = true;
-      refineErr = `重新执行 AI 失败：${e}`;
+      refineErr = t("notes.refine.rerunFailed", { e });
     }
   }
 
@@ -928,7 +935,7 @@
     else
       error = recording.status.startsWith("error:")
         ? recording.status
-        : "无法继续录制:请确认没有正在进行的录制";
+        : t("notes.resume.blocked");
   }
 </script>
 
@@ -956,14 +963,14 @@
             />
           {:else}
             <h1 class="title">
-              <button class="title-btn" title="点击改名" onclick={beginRename}>{note.meta.title}</button>
+              <button class="title-btn" title={t("notes.title.renameHint")} onclick={beginRename}>{note.meta.title}</button>
             </h1>
           {/if}
 
           <p class="meta">
             {formatDate(note.meta.started_at)} · {formatDuration(durationSecs(note))}
             {#if note.meta.state === "recording"}
-              <span class="state interrupted">已中断</span>
+              <span class="state interrupted">{t("notes.state.interrupted")}</span>
             {/if}
           </p>
         </div>
@@ -978,16 +985,16 @@
               <path d="M9.5 1.8V5h3.2" />
               <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
             </svg>
-            导出 MD
+            {t("notes.export.md")}
           </button>
         </div>
       </div>
 
       {#if note.meta.state === "recording"}
-        <div class="banner">这场录音曾意外中断，中断前的内容已保存。点击下方播放器右侧的红色录音键可接着录。</div>
+        <div class="banner">{t("notes.banner.interrupted")}</div>
       {/if}
       {#if note.skipped_lines > 0}
-        <div class="banner">有 {note.skipped_lines} 行记录损坏被跳过。</div>
+        <div class="banner">{t("notes.banner.skipped", { n: note.skipped_lines })}</div>
       {/if}
       {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
 
@@ -1002,8 +1009,8 @@
         <button
           class="rec-btn"
           disabled={recording.isLive}
-          title={recording.isLive ? "已有录制进行中" : "继续录制"}
-          aria-label="继续录制"
+          title={recording.isLive ? t("notes.record.busy") : t("notes.record.resume")}
+          aria-label={t("notes.record.resume")}
           onclick={doResume}
         >
           <span class="rec-dot"></span>
@@ -1052,27 +1059,27 @@
           class="link"
           class:active={effectiveView === "refined"}
           disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : "尚无修订稿"}
+          title={refinedAvailable ? "" : t("notes.view.noRefined")}
           onclick={() => (viewMode = "refined")}
         >
-          修订稿
+          {t("notes.view.refined")}
         </button>
         <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
-          原始逐字稿
+          {t("notes.view.raw")}
         </button>
         <span class="spacer"></span>
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
-          <span class="refine-warn">未关联搭子的说话人改名将丢失</span>
-          <button class="link danger" onclick={rerunRefine}>确认重新 AI</button>
-          <button class="link" onclick={() => (confirmRefine = false)}>取消</button>
+          <span class="refine-warn">{t("notes.refine.loseNames")}</span>
+          <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
+          <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
         {:else}
           <button
             class="reaing"
             class:casting={refining}
             disabled={refining || note.meta.state !== "complete"}
             onclick={rerunRefine}
-            title={aiState === "running" ? "Aing，正在执行" : aiState === "complete" ? "AI 已完成，点击重新执行" : aiState === "failed" ? "AI 执行失败，点击重试" : "执行 AI"}
+            title={aiState === "running" ? t("notes.refine.running") : aiState === "complete" ? t("notes.refine.completeHint") : aiState === "failed" ? t("notes.refine.failedHint") : t("notes.refine.run")}
           >
             <svg class="wand" viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
               <path
@@ -1109,9 +1116,9 @@
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
       {#if refinedSaveErr}<div class="banner banner-danger">{refinedSaveErr}</div>{/if}
       {#if refined.stages.llm === "partial"}
-        <div class="banner">部分段落 AI 处理失败，已保留原文，可重新执行。</div>
+        <div class="banner">{t("notes.banner.llmPartial")}</div>
       {:else if refined.stages.llm === "failed"}
-        <div class="banner banner-danger">在线 AI 处理失败，当前展示本地处理结果。</div>
+        <div class="banner banner-danger">{t("notes.banner.llmFailed")}</div>
       {/if}
     {/if}
 
@@ -1134,7 +1141,7 @@
           />
         </div>
         {#if refined.paragraphs.length === 0}
-          <p class="hint">（修订稿为空，可直接输入补充内容）</p>
+          <p class="hint">{t("notes.hint.emptyRefined")}</p>
         {/if}
       {:else}
         <!-- 原始稿 WYSIWYG:MarkdownEditor(可编辑,mode="segments")段结构锁定 + 浮层
@@ -1170,7 +1177,7 @@
           />
         {/key}
         {#if displaySegments.length === 0}
-          <p class="hint">（这场会议没有转写内容）</p>
+          <p class="hint">{t("notes.hint.emptyTranscript")}</p>
         {/if}
       {/if}
     </div>
@@ -1187,8 +1194,8 @@
             {speakerLabel(sid, "mic", note.speakers)}
           </button>
         {/each}
-        <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>＋ 新说话人</button>
-        <button class="menu-item" onclick={() => (segMenuPop = null)}>取消</button>
+        <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>{t("notes.menu.newSpeaker")}</button>
+        <button class="menu-item" onclick={() => (segMenuPop = null)}>{t("notes.cancel")}</button>
       </div>
     {/if}
     {#if segDeletePop}
@@ -1196,8 +1203,8 @@
         class="badge-menu floating"
         style="position: fixed; left: {segDeletePop.rect.left}px; top: {segDeletePop.rect.bottom + 4}px;"
       >
-        <button class="menu-item danger" onclick={() => doDeleteSeg(segDeletePop!.seq)}>确认删除</button>
-        <button class="menu-item" onclick={() => (segDeletePop = null)}>取消</button>
+        <button class="menu-item danger" onclick={() => doDeleteSeg(segDeletePop!.seq)}>{t("notes.menu.confirmDelete")}</button>
+        <button class="menu-item" onclick={() => (segDeletePop = null)}>{t("notes.cancel")}</button>
       </div>
     {/if}
 
@@ -1222,7 +1229,7 @@
               entityPop = null;
             }}
           >
-            打开知识图谱
+            {t("notes.entity.openGraph")}
           </button>
         {/if}
       </div>
@@ -1234,18 +1241,18 @@
         style="position: fixed; left: {refinedBadgePop.rect.left}px; top: {refinedBadgePop.rect.bottom + 4}px;"
       >
         <span>{refinedBadge(refinedBadgePop.attrs).label}</span>
-        <button class="link" onclick={() => (refinedBadgePop = null)}>关闭</button>
+        <button class="link" onclick={() => (refinedBadgePop = null)}>{t("notes.close")}</button>
       </div>
     {/if}
 
     {#if related.length > 0}
       <section class="card col related">
-        <div class="card-title">相关笔记</div>
+        <div class="card-title">{t("notes.related.title")}</div>
         <ul class="appear-list">
           {#each related as n (n.id)}
             <li class="appear-row">
               <a href="/notes/{n.id}">{n.title}</a>
-              <span class="appear-meta">共享 {n.shared_entities} 个实体</span>
+              <span class="appear-meta">{t("notes.related.shared", { n: n.shared_entities })}</span>
             </li>
           {/each}
         </ul>
@@ -1255,13 +1262,13 @@
     <!-- 跟随被用户上滑打断时的返回入口(与录制页同款):sticky 钉滚动视口底部 -->
     <div class="jump-anchor">
       {#if !follow && playerPlaying}
-        <button class="jump" onclick={resumeFollow}>↓ 回到播放位置</button>
+        <button class="jump" onclick={resumeFollow}>{t("notes.jumpBack")}</button>
       {/if}
     </div>
   {:else if !error}
     <!-- 加载态:切换会议到 note 就绪之间的空窗(长会议 load 可能数百毫秒),
          给一个安静的占位,避免"点了没反应"的错觉。error 分支已在上方单独渲染。 -->
-    <p class="loading">加载中…</p>
+    <p class="loading">{t("notes.loading")}</p>
   {/if}
 </main>
 

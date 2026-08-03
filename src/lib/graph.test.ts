@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { kindLabel } from "./graph";
+import { zh as graphZh } from "./i18n/dict/graph";
 import {
   applyKnowledgeOperation,
   cancelRelationBackfill,
@@ -58,16 +59,16 @@ if (false) {
 }
 
 describe("kindLabel", () => {
-  it("已知 kind 给中文标签", () => {
-    expect(kindLabel("person")).toBe("人");
-    expect(kindLabel("org")).toBe("组织");
-    expect(kindLabel("project")).toBe("项目");
-    expect(kindLabel("product")).toBe("产品");
-    expect(kindLabel("term")).toBe("术语");
-    expect(kindLabel("decision")).toBe("决议");
-    expect(kindLabel("task")).toBe("任务");
-    expect(kindLabel("place")).toBe("地点");
-    expect(kindLabel("date")).toBe("日期");
+  it("已知 kind 给本地化标签(默认 locale=zh,从 graph 分片字典取值)", () => {
+    expect(kindLabel("person")).toBe(graphZh["graph.kind.person"]);
+    expect(kindLabel("org")).toBe(graphZh["graph.kind.org"]);
+    expect(kindLabel("project")).toBe(graphZh["graph.kind.project"]);
+    expect(kindLabel("product")).toBe(graphZh["graph.kind.product"]);
+    expect(kindLabel("term")).toBe(graphZh["graph.kind.term"]);
+    expect(kindLabel("decision")).toBe(graphZh["graph.kind.decision"]);
+    expect(kindLabel("task")).toBe(graphZh["graph.kind.task"]);
+    expect(kindLabel("place")).toBe(graphZh["graph.kind.place"]);
+    expect(kindLabel("date")).toBe(graphZh["graph.kind.date"]);
   });
   it("未知 kind 原样返回(前向兼容,不吞新类型)", () => {
     expect(kindLabel("tool")).toBe("tool");

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "$lib/i18n/index.svelte";
 import type { RelationStatus } from "./knowledge";
 
 /** 图谱实体摘要(列表 / 力导图节点)。镜像 ipc::EntitySummary。 */
@@ -86,21 +87,22 @@ export interface EntityLink {
   is_person: boolean;
 }
 
-const KIND_LABELS: Record<string, string> = {
-  person: "人",
-  org: "组织",
-  project: "项目",
-  product: "产品",
-  term: "术语",
-  decision: "决议",
-  task: "任务",
-  place: "地点",
-  date: "日期",
+const KIND_LABEL_KEYS: Record<string, string> = {
+  person: "graph.kind.person",
+  org: "graph.kind.org",
+  project: "graph.kind.project",
+  product: "graph.kind.product",
+  term: "graph.kind.term",
+  decision: "graph.kind.decision",
+  task: "graph.kind.task",
+  place: "graph.kind.place",
+  date: "graph.kind.date",
 };
 
-/** kind→中文标签;未知 kind 原样返回(不吞大模型新造的类型)。 */
+/** kind→本地化标签(字典分片 graph.kind.*);未知 kind 原样返回(不吞大模型新造的类型)。 */
 export function kindLabel(kind: string): string {
-  return KIND_LABELS[kind] ?? kind;
+  const key = KIND_LABEL_KEYS[kind];
+  return key === undefined ? kind : t(key);
 }
 
 // kind 分类色(与 ForceGraph.svelte 节点色同一份定义,原先只在那一处内联,侧栏 kind

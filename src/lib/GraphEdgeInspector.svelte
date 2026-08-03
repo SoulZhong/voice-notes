@@ -1,6 +1,7 @@
 <script lang="ts">
   import { kindLabel, type GraphEdgeDetailItem } from "$lib/graph";
   import { formatDate, formatDuration } from "$lib/notes";
+  import { t } from "$lib/i18n/index.svelte";
 
   let {
     perspective,
@@ -24,36 +25,40 @@
     onPick: (item: GraphEdgeDetailItem) => void;
   } = $props();
 
-  const title = $derived(perspective === "note" ? "共用实体" : "共同出现的笔记");
+  const title = $derived(
+    perspective === "note" ? t("graph.edgeDetail.sharedEntities") : t("graph.edgeDetail.sharedNotes"),
+  );
   const countLabel = $derived(
-    perspective === "note" ? `${items.length} 个实体` : `${items.length} 篇笔记`,
+    perspective === "note"
+      ? t("graph.edgeDetail.countEntities", { n: items.length })
+      : t("graph.edgeDetail.countNotes", { n: items.length }),
   );
 </script>
 
 <header class="header">
   <div>
-    <p class="eyebrow">连接详情</p>
+    <p class="eyebrow">{t("graph.edgeDetail.eyebrow")}</p>
     <h2>{title}</h2>
   </div>
-  <button class="close" type="button" aria-label="关闭连接详情" onclick={onClose}>×</button>
+  <button class="close" type="button" aria-label={t("graph.edgeDetail.closeAria")} onclick={onClose}>×</button>
 </header>
 
-<div class="endpoints" aria-label="连接两端">
+<div class="endpoints" aria-label={t("graph.edgeDetail.endpointsAria")}>
   <span>{leftName}</span>
   <i aria-hidden="true"></i>
   <span>{rightName}</span>
 </div>
 
 {#if loading}
-  <p class="state" aria-live="polite">正在读取连接内容</p>
+  <p class="state" aria-live="polite">{t("graph.edgeDetail.loading")}</p>
 {:else if error}
   <div class="state" aria-live="polite">
     <p>{error}</p>
-    <button type="button" onclick={onRetry}>重新读取</button>
+    <button type="button" onclick={onRetry}>{t("graph.retryRead")}</button>
   </div>
 {:else}
   <div class="list-heading">
-    <p>{perspective === "note" ? "两篇笔记都提到了" : "两个实体都出现在"}</p>
+    <p>{perspective === "note" ? t("graph.edgeDetail.headingNote") : t("graph.edgeDetail.headingEntity")}</p>
     <span>{countLabel}</span>
   </div>
   {#if items.length > 0}
@@ -72,7 +77,7 @@
       {/each}
     </ul>
   {:else}
-    <p class="state">这条连接已变化，请刷新图谱后再试。</p>
+    <p class="state">{t("graph.edgeDetail.changed")}</p>
   {/if}
 {/if}
 

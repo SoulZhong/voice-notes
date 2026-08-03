@@ -4,6 +4,7 @@
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
   import { applyTheme } from "$lib/theme";
+  import { i18n, t } from "$lib/i18n/index.svelte";
   import { acceleratorFromEvent, displayShortcut } from "$lib/shortcut";
   import {
     modelsStatus,
@@ -66,7 +67,7 @@
     try {
       updateInfo = await checkUpdate();
     } catch (e) {
-      updateError = `检查失败: ${e}`;
+      updateError = t("settings.update.checkFailed", { e });
     } finally {
       updateChecking = false;
     }
@@ -74,7 +75,7 @@
 
   // —— 一键更新:updater 插件下载安装 + 自动重启;失败亮出「打开发布页」兜底 ——
   let updating = $state(false);
-  let updatingLabel = $state("更新中…");
+  let updatingLabel = $state(t("settings.update.updating"));
   let updateFallback = $state(false);
   // 与 +layout 横幅同款守卫:安装成功即 relaunch,录音/收尾中更新会截断录音尾段。
   const updateBlocked = $derived(recording.isLive || recording.stopping);
@@ -82,16 +83,16 @@
     if (updateBlocked) return;
     updating = true;
     updateError = "";
-    updatingLabel = "更新中…";
+    updatingLabel = t("settings.update.updating");
     try {
       const r = await applyUpdate((label) => (updatingLabel = label));
       if (r === "none") {
         // GitHub API 已见新版但 latest.json 未就绪(发布产物上传有时差)。
-        updateError = "更新包尚未就绪,稍后再试或打开发布页手动下载";
+        updateError = t("settings.update.notReady");
         updateFallback = true;
       }
     } catch (e) {
-      updateError = `一键更新失败: ${e}`;
+      updateError = t("settings.update.oneClickFailed", { e });
       updateFallback = true;
     } finally {
       updating = false;
@@ -133,6 +134,8 @@
   // 勾选/选中改到新态),本地 state 显式改回旧值必触发 DOM 对齐——与 asrChoice 同理。
   /** 外观主题 radio:"light" | "dark" | "system"。 */
   let themeChoice = $state("system");
+  /** UI 语言 radio:"system" | "zh" | "en"。 */
+  let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
   let sysOnly = $state(false);
   let keepVol = $state(false);
@@ -184,16 +187,16 @@
   // 迁移/更改目录被阻断的原因(禁用 title 用);录制中/下载中/迁移中皆阻断。
   const migrateBlockReason = $derived(
     recording.isLive
-      ? "录制中不能迁移数据"
+      ? t("settings.migrate.blockedRecording")
       : downloadingActive
-        ? "模型下载进行中不能迁移"
+        ? t("settings.migrate.blockedDownloading")
         : migrating
-          ? "正在迁移…"
+          ? t("settings.migrate.blockedMigrating")
           : "",
   );
 
-  const dataDirLabel = $derived(settings?.data_dir || "默认(应用数据目录)");
-  const modelsDirLabel = $derived(settings?.models_dir || "默认(应用数据目录)");
+  const dataDirLabel = $derived(settings?.data_dir || t("settings.store.defaultDir"));
+  const modelsDirLabel = $derived(settings?.models_dir || t("settings.store.defaultDir"));
 
   async function refreshSettings() {
     try {
@@ -202,13 +205,14 @@
       speakerChoice = settings.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
       syncLocalFromSettings(settings);
     } catch (e) {
-      error = `读取设置失败: ${e}`;
+      error = t("settings.loadSettingsFailed", { e });
     }
   }
 
   /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
+    langChoice = s.ui_lang;
     sysOnly = s.record_system_only;
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
@@ -242,7 +246,7 @@
     try {
       status = await modelsStatus();
     } catch (e) {
-      error = `读取模型状态失败: ${e}`;
+      error = t("settings.models.statusFailed", { e });
     }
   }
 
@@ -266,7 +270,7 @@
       return;
     }
     if (e.phase === "error") {
-      error = `下载失败: ${e.message}`;
+      error = t("settings.models.downloadFailed", { e: e.message });
       dropProg(e.artifact);
       return;
     }
@@ -338,9 +342,9 @@
       await downloadModels([id]);
     } catch (e) {
       // "下载已在进行中" 不算错:保留进度态继续收事件。
-      if (!String(e).includes("已在进行中")) {
+      if (!String(e).includes("已在进行中")) { // i18n-exempt: 与后端错误原文判等
         dropProg(id);
-        error = `下载失败: ${e}`;
+        error = t("settings.models.downloadFailed", { e });
       }
     }
   }
@@ -353,7 +357,7 @@
       await refreshStatus();
       // 删的是当前选型模型 → asrModelMissing 会自动亮警示横幅。
     } catch (e) {
-      error = `删除失败: ${e}`;
+      error = t("common.deleteFailed", { e });
     }
   }
 
@@ -378,7 +382,7 @@
       settings = fresh;
       syncLocalFromSettings(fresh);
     } catch (e) {
-      error = `保存失败: ${e}`;
+      error = t("common.saveFailed", { e });
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings);
     }
@@ -394,9 +398,26 @@
       settings = fresh;
       applyTheme(themeChoice);
     } catch (e) {
-      error = `切换主题失败: ${e}`;
+      error = t("settings.theme.switchFailed", { e });
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings); // 回弹 themeChoice
+    }
+  }
+
+  // UI 语言:存 settings 后 i18n.setChoice 即时生效(界面响应式重渲;托盘由后端
+  // set_settings 检测 ui_lang 变化自行重建)。套路同 changeTheme。
+  async function changeLang() {
+    error = "";
+    try {
+      const fresh = await getSettings();
+      fresh.ui_lang = langChoice;
+      await setSettings(fresh);
+      settings = fresh;
+      i18n.setChoice(langChoice);
+    } catch (e) {
+      error = t("common.language.switchFailed", { e });
+      settings = await getSettings().catch(() => settings);
+      if (settings) syncLocalFromSettings(settings); // 回弹 langChoice
     }
   }
 
@@ -412,7 +433,7 @@
       settings = fresh;
       await applyShortcut();
     } catch (e) {
-      error = `快捷键设置失败: ${e}`;
+      error = t("settings.shortcut.saveFailed", { e });
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings);
     }
@@ -438,7 +459,7 @@
       await applyShortcut();
       input.blur();
     } catch (err) {
-      error = `快捷键设置失败: ${err}`;
+      error = t("settings.shortcut.saveFailed", { e: err });
       settings = await getSettings().catch(() => settings);
       if (settings) syncLocalFromSettings(settings);
     }
@@ -451,7 +472,7 @@
       if (autostartEnabled) await enable();
       else await disable();
     } catch (e) {
-      error = `开机自启设置失败: ${e}`;
+      error = t("settings.autostart.saveFailed", { e });
       autostartEnabled = await isEnabled().catch(() => autostartEnabled); // 回读真值回弹
     }
   }
@@ -462,11 +483,11 @@
     const days = purgeChoice === "all" ? null : purgeChoice === "30" ? 30 : 90;
     try {
       const freed = await purgeAudio(days);
-      freedText = `已释放 ${fmtBytes(freed)}`;
+      freedText = t("settings.store.freed", { size: fmtBytes(freed) });
       showPurge = false;
       await refreshDiskUsage();
     } catch (e) {
-      error = `清理失败: ${e}`;
+      error = t("settings.store.purgeFailed", { e });
     }
   }
 
@@ -483,21 +504,13 @@
     speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
   }
   async function changeSpeakerModel(model: string) {
-    if (settings?.speaker_model === model) {
-      // 用户在确认前切回当前模型:取消尚未确认的旧目标。bind:group 已先更新
-      // speakerChoice,若只 return 会留下旧 pending,随后点「确认」反而切到未选中的模型。
-      pendingSpeakerModel = null;
-      speakerNoSampleCount = 0;
-      return;
-    }
+    if (settings?.speaker_model === model) return;
     error = "";
     try {
       speakerNoSampleCount = await countPeopleWithoutSamples();
     } catch {
       speakerNoSampleCount = 0; // 查询失败不挡切换,确认文案少一句而已
     }
-    // 查询在途时用户可能已选回原模型或改选别项;旧响应不得复活过时确认条。
-    if (speakerChoice !== model || settings?.speaker_model === model) return;
     pendingSpeakerModel = model;
   }
   async function confirmSpeakerModelChange() {
@@ -608,20 +621,19 @@
   const pct = (p: { received: number; total: number }) =>
     p.total > 0 ? Math.min(100, Math.floor((p.received / p.total) * 100)) : 0;
   const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
-  const phaseText: Record<string, string> = {
-    downloading: "下载中",
-    verifying: "校验中",
-    extracting: "解压中",
-    done: "完成",
+  const phaseKeys: Record<string, string> = {
+    downloading: "settings.models.phase.downloading",
+    verifying: "settings.models.phase.verifying",
+    extracting: "settings.models.phase.extracting",
+    done: "settings.models.phase.done",
   };
+  const phaseText = (phase: string) => (phaseKeys[phase] ? t(phaseKeys[phase]) : phase);
 </script>
 
 <main class="container">
-  <h1>设置</h1>
+  <h1>{t("settings.title")}</h1>
   <p class="desc">
-    {asrMode === "cloud"
-      ? "录音仍保存在本机；识别时音频会发送到当前选择的云服务商。"
-      : "所有录音与识别都在本机完成，不上传任何音频。"}
+    {asrMode === "cloud" ? t("settings.desc.cloud") : t("settings.desc.local")}
   </p>
 
   {#if error}
@@ -630,33 +642,47 @@
 
   <!-- —— 通用 —— -->
   <section>
-    <h2 class="section-title">通用</h2>
+    <h2 class="section-title">{t("settings.section.general")}</h2>
     <div class="rows">
       <div class="row">
-        <div class="row-info"><span class="row-label">外观</span></div>
+        <div class="row-info"><span class="row-label">{t("settings.theme.label")}</span></div>
         <div class="seg">
           <label class="seg-item">
-            <input type="radio" name="theme" value="light" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />亮色
+            <input type="radio" name="theme" value="light" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.light")}
           </label>
           <label class="seg-item">
-            <input type="radio" name="theme" value="dark" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />暗色
+            <input type="radio" name="theme" value="dark" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.dark")}
           </label>
           <label class="seg-item">
-            <input type="radio" name="theme" value="system" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />跟随系统
+            <input type="radio" name="theme" value="system" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.system")}
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info"><span class="row-label">{t("common.language.label")}</span></div>
+        <div class="seg">
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="zh" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.zh")}
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="en" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.en")}
+          </label>
+          <label class="seg-item">
+            <input type="radio" name="ui-lang" value="system" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.system")}
           </label>
         </div>
       </div>
       <div class="row">
         <div class="row-info">
-          <span class="row-label">全局快捷键</span>
-          <span class="row-desc">在任意应用中按组合键开始 / 停止录制</span>
+          <span class="row-label">{t("settings.shortcut.label")}</span>
+          <span class="row-desc">{t("settings.shortcut.desc")}</span>
         </div>
         {#if shortcutEnabled}
           <input
             class="shortcut-input"
             readonly
             value={capturingShortcut ? "" : displayShortcut(settings?.shortcut ?? "")}
-            placeholder="按下组合键…"
+            placeholder={t("settings.shortcut.placeholder")}
             onfocus={() => (capturingShortcut = true)}
             onblur={() => (capturingShortcut = false)}
             onkeydown={onShortcutKeydown}
@@ -665,20 +691,20 @@
         <input
           type="checkbox"
           class="ctl switch"
-          aria-label="启用全局快捷键"
+          aria-label={t("settings.shortcut.enableAria")}
           bind:checked={shortcutEnabled}
           disabled={!settings}
           onchange={toggleShortcutEnabled}
         />
       </div>
       <label class="row">
-        <div class="row-info"><span class="row-label">开机自动启动</span></div>
+        <div class="row-info"><span class="row-label">{t("settings.autostart.label")}</span></div>
         <input type="checkbox" class="ctl switch" bind:checked={autostartEnabled} onchange={toggleAutostart} />
       </label>
       <label class="row">
         <div class="row-info">
-          <span class="row-label">菜单栏常驻</span>
-          <span class="row-desc">关闭窗口只隐藏到菜单栏,录制不中断</span>
+          <span class="row-label">{t("settings.tray.label")}</span>
+          <span class="row-desc">{t("settings.tray.desc")}</span>
         </div>
         <input
           type="checkbox"
@@ -693,26 +719,26 @@
 
   <!-- —— 存储 ——(紧随通用:目录选择要在下载模型前被看到,新装用户价值最高) -->
   <section>
-    <h2 class="section-title">存储</h2>
+    <h2 class="section-title">{t("settings.section.store")}</h2>
     <div class="rows">
-      {@render storeRow("data", "数据存储目录", dataDirLabel)}
-      {@render storeRow("models", "模型存储目录", modelsDirLabel)}
+      {@render storeRow("data", t("settings.store.dataDir"), dataDirLabel)}
+      {@render storeRow("models", t("settings.store.modelsDir"), modelsDirLabel)}
       <div class="row">
         <div class="row-info">
-          <span class="row-label">录音音频占用</span>
+          <span class="row-label">{t("settings.store.audioUsage")}</span>
           <span class="row-path">
-            {audioBytes === null ? "统计中…" : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
+            {audioBytes === null ? t("settings.store.calculating") : fmtBytes(audioBytes)}{freedText ? ` · ${freedText}` : ""}
           </span>
         </div>
         {#if !showPurge}
           <button
             class="btn-secondary row-action"
             disabled={recording.isLive}
-            title={recording.isLive ? "录制中不能清理音频" : "清理历史录音音频"}
+            title={recording.isLive ? t("settings.store.purgeBlockedRecording") : t("settings.store.purgeTitle")}
             onclick={() => {
               freedText = "";
               showPurge = true;
-            }}>清理…</button
+            }}>{t("settings.store.purge")}</button
           >
         {/if}
       </div>
@@ -721,19 +747,19 @@
       <div class="purge-bar">
         <div class="purge-choices">
           <label class="mini-radio">
-            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />清理 30 天前
+            <input type="radio" name="purge" value="30" bind:group={purgeChoice} />{t("settings.store.purge30")}
           </label>
           <label class="mini-radio">
-            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />清理 90 天前
+            <input type="radio" name="purge" value="90" bind:group={purgeChoice} />{t("settings.store.purge90")}
           </label>
           <label class="mini-radio">
-            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />清理全部
+            <input type="radio" name="purge" value="all" bind:group={purgeChoice} />{t("settings.store.purgeAll")}
           </label>
         </div>
-        <span class="confirm-text">只删除音频文件,笔记文字与说话人保留。</span>
+        <span class="confirm-text">{t("settings.store.purgeNote")}</span>
         <div class="purge-actions">
-          <button class="link danger" onclick={doPurge}>确认清理</button>
-          <button class="link" onclick={() => (showPurge = false)}>取消</button>
+          <button class="link danger" onclick={doPurge}>{t("settings.store.purgeConfirm")}</button>
+          <button class="link" onclick={() => (showPurge = false)}>{t("settings.cancel")}</button>
         </div>
       </div>
     {/if}
@@ -741,12 +767,12 @@
 
   <!-- —— 录制 —— -->
   <section>
-    <h2 class="section-title">录制</h2>
+    <h2 class="section-title">{t("settings.section.record")}</h2>
     <div class="rows">
       <label class="row">
         <div class="row-info">
-          <span class="row-label">仅录制系统声音</span>
-          <span class="row-desc">不开麦克风,只录电脑播放的声音。适合直播、网课等旁听场景</span>
+          <span class="row-label">{t("settings.record.sysOnly.label")}</span>
+          <span class="row-desc">{t("settings.record.sysOnly.desc")}</span>
         </div>
         <input
           type="checkbox"
@@ -758,8 +784,8 @@
       </label>
       <label class="row" class:dim={sysOnly}>
         <div class="row-info">
-          <span class="row-label">保持外放音量</span>
-          <span class="row-desc">外放开会时音量不再被系统压低,回声自动消除{sysOnly ? "(仅录系统声音时无效)" : ""}</span>
+          <span class="row-label">{t("settings.record.keepVol.label")}</span>
+          <span class="row-desc">{t("settings.record.keepVol.desc")}{sysOnly ? t("settings.record.keepVol.sysOnlySuffix") : ""}</span>
         </div>
         <input
           type="checkbox"
@@ -771,8 +797,8 @@
       </label>
       <label class="row">
         <div class="row-info">
-          <span class="row-label">乱码过滤</span>
-          <span class="row-desc">丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭</span>
+          <span class="row-label">{t("settings.record.langFilter.label")}</span>
+          <span class="row-desc">{t("settings.record.langFilter.desc")}</span>
         </div>
         <input
           type="checkbox"
@@ -784,8 +810,8 @@
       </label>
       <label class="row">
         <div class="row-info">
-          <span class="row-label">保留录音音频</span>
-          <span class="row-desc">录完可回放核对;关闭可节省磁盘</span>
+          <span class="row-label">{t("settings.record.keepAudio.label")}</span>
+          <span class="row-desc">{t("settings.record.keepAudio.desc")}</span>
         </div>
         <input
           type="checkbox"
@@ -797,9 +823,9 @@
       </label>
       <div class="row">
         <div class="row-info">
-          <span class="row-label">识别方式</span>
+          <span class="row-label">{t("settings.asrMode.label")}</span>
           <span class="row-desc">
-            {asrMode === "cloud" ? "录音音频将实时上传至所选厂商" : "识别在本机完成,数据不出设备"}
+            {asrMode === "cloud" ? t("settings.asrMode.cloudDesc") : t("settings.asrMode.localDesc")}
           </span>
         </div>
         <div class="seg" class:disabled={recording.isLive}>
@@ -811,7 +837,7 @@
               bind:group={asrMode}
               disabled={recording.isLive || !settings}
               onchange={() => changeAsrMode("local")}
-            />本地模型
+            />{t("settings.asrMode.local")}
           </label>
           <label class="seg-item">
             <input
@@ -821,13 +847,13 @@
               bind:group={asrMode}
               disabled={recording.isLive || !settings}
               onchange={() => changeAsrMode("cloud")}
-            />云端 API
+            />{t("settings.asrMode.cloud")}
           </label>
         </div>
       </div>
       {#if asrMode === "cloud"}
         <div class="row">
-          <div class="row-info"><span class="row-label">厂商</span></div>
+          <div class="row-info"><span class="row-label">{t("settings.cloud.provider")}</span></div>
           <div class="seg" class:disabled={recording.isLive}>
             <label class="seg-item">
               <input
@@ -840,7 +866,7 @@
                   invalidateCloudTest();
                   saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
                 }}
-              />火山引擎
+              />{t("settings.cloud.volcano")}
             </label>
             <label class="seg-item">
               <input
@@ -853,7 +879,7 @@
                   invalidateCloudTest();
                   saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
                 }}
-              />阿里云
+              />{t("settings.cloud.aliyun")}
             </label>
           </div>
         </div>
@@ -861,7 +887,7 @@
           <div class="row">
             <div class="row-info">
               <span class="row-label">APP ID</span>
-              <span class="row-desc">火山引擎语音技术控制台的 App ID</span>
+              <span class="row-desc">{t("settings.cloud.volcAppIdDesc")}</span>
             </div>
             <input
               class="row-input"
@@ -875,7 +901,7 @@
           <div class="row">
             <div class="row-info">
               <span class="row-label">Access Token</span>
-              <span class="row-desc">只保存在本机,不随笔记上传</span>
+              <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
             <input
               class="row-input"
@@ -891,7 +917,7 @@
           <div class="row">
             <div class="row-info">
               <span class="row-label">API Key</span>
-              <span class="row-desc">只保存在本机,不随笔记上传</span>
+              <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
             <input
               class="row-input"
@@ -906,14 +932,16 @@
         {/if}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">测试连接</span>
+            <span class="row-label">{t("settings.cloud.test")}</span>
             <span class="row-desc">
               {#if cloudTestResult}
                 <span class={cloudTestResult.ok ? "mtest-ok" : "mtest-err"}>
-                  {cloudTestResult.ok ? `测试成功(${cloudTestResult.msg})` : `测试失败: ${cloudTestResult.msg}`}
+                  {cloudTestResult.ok
+                    ? t("settings.test.ok", { msg: cloudTestResult.msg })
+                    : t("settings.test.failed", { msg: cloudTestResult.msg })}
                 </span>
               {:else}
-                用当前凭证实际连接一次厂商,验证配置可用
+                {t("settings.cloud.testDesc")}
               {/if}
             </span>
           </div>
@@ -922,21 +950,21 @@
             onclick={doTestCloud}
             disabled={testingCloud || recording.isLive}
           >
-            {testingCloud ? "测试中…" : "测试连接"}
+            {testingCloud ? t("settings.testing") : t("settings.cloud.test")}
           </button>
         </div>
       {:else}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">识别引擎</span>
+            <span class="row-label">{t("settings.asr.label")}</span>
             <span class="row-desc">
               {asrChoice === "whisper"
-                ? "多语种支持广,说话人区分较粗"
+                ? t("settings.asr.whisperDesc")
                 : asrChoice === "paraformer"
-                  ? "中文更准、英文较弱"
+                  ? t("settings.asr.paraformerDesc")
                   : asrChoice === "qwen3"
-                    ? "中英混说最准,识别稍慢,说话人区分较粗"
-                    : "推荐 · 中英日韩粤语,功能最全"}
+                    ? t("settings.asr.qwen3Desc")
+                    : t("settings.asr.senseVoiceDesc")}
             </span>
           </div>
           <div class="seg" class:disabled={recording.isLive}>
@@ -985,11 +1013,11 @@
       {/if}
       <div class="row">
         <div class="row-info">
-          <span class="row-label">声纹模型</span>
+          <span class="row-label">{t("settings.speaker.label")}</span>
           <span class="row-desc">
             {speakerChoice === "eres2netv2"
-              ? "备选模型;ERes2NetV2:中文基准更准(CN-Celeb EER 6.14% vs 6.78%),模型更大速度稍慢;切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"
-              : "推荐 · 切换后后台用录音样本重建声纹库(约半分钟),期间录制暂不自动认人"}
+              ? t("settings.speaker.eres2Desc")
+              : t("settings.speaker.campplusDesc")}
           </span>
         </div>
         <div class="seg" class:disabled={recording.isLive}>
@@ -1005,7 +1033,7 @@
           </label>
           <label
             class="seg-item"
-            title={eres2Missing ? "模型未下载:请先在下方「语音模型」中下载 ERes2NetV2" : ""}
+            title={eres2Missing ? t("settings.speaker.eres2Missing") : ""}
           >
             <input
               type="radio"
@@ -1021,20 +1049,18 @@
       {#if pendingSpeakerModel}
         <div class="purge-bar">
           <span class="confirm-text">
-            切换后将用录音样本为每人重算声纹{speakerNoSampleCount > 0
-              ? `;库内 ${speakerNoSampleCount} 人无样本,重建前无法自动认出(名字与历史笔记不受影响)`
-              : ""}。
+            {t("settings.speaker.confirmText", { n: speakerNoSampleCount })}
           </span>
           <div class="purge-actions">
-            <button class="link danger" onclick={confirmSpeakerModelChange}>确认切换</button>
-            <button class="link" onclick={cancelSpeakerModelChange}>取消</button>
+            <button class="link danger" onclick={confirmSpeakerModelChange}>{t("settings.speaker.confirmSwitch")}</button>
+            <button class="link" onclick={cancelSpeakerModelChange}>{t("settings.cancel")}</button>
           </div>
         </div>
       {/if}
       <label class="row">
         <div class="row-info">
-          <span class="row-label">会后 AI</span>
-          <span class="row-desc">停止录制后自动用大模型整理转写稿（错字修正、段落归并）；在线接口或本机 Agent 在左侧 AI 页配置</span>
+          <span class="row-label">{t("settings.refine.label")}</span>
+          <span class="row-desc">{t("settings.refine.desc")}</span>
         </div>
         <input
           type="checkbox"
@@ -1046,19 +1072,19 @@
       </label>
     </div>
     {#if asrMode === "local" && asrModelMissing}
-      <div class="banner warn">所选识别引擎的模型未下载,请在下方「语音模型」中下载。</div>
+      <div class="banner warn">{t("settings.asr.modelMissing")}</div>
     {/if}
     <p class="lock-hint">
-      {recording.isLive ? "录制进行中:识别方式已锁定,其余更改下一场录制生效。" : "更改在下一场录制生效。"}
+      {recording.isLive ? t("settings.lockHint.recording") : t("settings.lockHint.idle")}
     </p>
   </section>
 
   <!-- —— 语音模型 —— -->
   <section>
-    <h2 class="section-title">语音模型</h2>
+    <h2 class="section-title">{t("settings.section.models")}</h2>
     {#if status}
-      <button class="models-path" title="在文件管理器中打开" onclick={doOpenModelsDir}>
-        <span class="row-desc">存储位置</span>
+      <button class="models-path" title={t("settings.models.openDir")} onclick={doOpenModelsDir}>
+        <span class="row-desc">{t("settings.models.location")}</span>
         <span class="row-path models-path-value">{status.root}</span>
       </button>
     {/if}
@@ -1070,21 +1096,21 @@
               <button
                 class="url-toggle"
                 aria-expanded={expandedId === a.id}
-                aria-label={expandedId === a.id ? "收起下载地址" : "展开下载地址"}
+                aria-label={expandedId === a.id ? t("settings.models.collapseUrl") : t("settings.models.expandUrl")}
                 onclick={() => (expandedId = expandedId === a.id ? null : a.id)}
               >
                 <span class="caret" class:open={expandedId === a.id}>▸</span>
-                <span class="row-label">{a.label} · 约 {a.approx_mb}MB</span>
+                <span class="row-label">{a.label} · {t("settings.models.approxMb", { mb: a.approx_mb })}</span>
               </button>
               {#if a.present}
-                <span class="present">已下载</span>
+                <span class="present">{t("settings.models.present")}</span>
               {/if}
             </div>
 
             {#if prog[a.id]}
               <div class="dl">
                 <span class="phase">
-                  {phaseText[prog[a.id].phase] ?? prog[a.id].phase}
+                  {phaseText(prog[a.id].phase)}
                   {#if prog[a.id].phase === "downloading" && prog[a.id].total > 0}
                     {mb(prog[a.id].received)}/{mb(prog[a.id].total)}MB
                   {/if}
@@ -1094,41 +1120,41 @@
             {:else if a.present}
               {#if confirmDeleteId === a.id}
                 <div class="confirm-inline">
-                  <button class="link danger" onclick={() => doDelete(a.id)}>确认删除</button>
-                  <button class="link" onclick={() => (confirmDeleteId = null)}>取消</button>
+                  <button class="link danger" onclick={() => doDelete(a.id)}>{t("settings.models.confirmDelete")}</button>
+                  <button class="link" onclick={() => (confirmDeleteId = null)}>{t("settings.cancel")}</button>
                 </div>
               {:else}
                 <button
                   class="link danger row-action"
                   disabled={recording.isLive || downloadingActive}
                   title={recording.isLive
-                    ? "录制中不能删除模型"
+                    ? t("settings.models.deleteBlockedRecording")
                     : downloadingActive
-                      ? "下载进行中不能删除模型"
-                      : "删除本模型(可随时重新下载)"}
+                      ? t("settings.models.deleteBlockedDownloading")
+                      : t("settings.models.deleteTitle")}
                   onclick={() => {
                     confirmDeleteId = a.id;
-                  }}>删除</button
+                  }}>{t("settings.models.delete")}</button
                 >
               {/if}
             {:else}
-              <button class="btn-secondary" onclick={() => download(a.id)}>下载</button>
+              <button class="btn-secondary" onclick={() => download(a.id)}>{t("settings.models.download")}</button>
             {/if}
           </div>
           {#if expandedId === a.id}
             <div class="url-detail">
               <div class="url-line">
-                <span class="url-tag">原始地址</span>
+                <span class="url-tag">{t("settings.models.originUrl")}</span>
                 <code class="url-text">{a.url}</code>
-                <button class="link" onclick={() => navigator.clipboard.writeText(a.url)}>复制</button>
+                <button class="link" onclick={() => navigator.clipboard.writeText(a.url)}>{t("settings.models.copy")}</button>
               </div>
               <div class="url-line">
-                <span class="url-tag">镜像地址</span>
+                <span class="url-tag">{t("settings.models.mirrorUrl")}</span>
                 {#if settings?.mirror_enabled && (settings?.mirror_prefix ?? "").trim()}
                   <code class="url-text">{effectiveUrl(a.url)}</code>
-                  <button class="link" onclick={() => navigator.clipboard.writeText(effectiveUrl(a.url))}>复制</button>
+                  <button class="link" onclick={() => navigator.clipboard.writeText(effectiveUrl(a.url))}>{t("settings.models.copy")}</button>
                 {:else}
-                  <span class="url-muted">未启用镜像加速</span>
+                  <span class="url-muted">{t("settings.models.mirrorOff")}</span>
                 {/if}
               </div>
             </div>
@@ -1137,26 +1163,28 @@
       {/if}
       <div class="row">
         <div class="row-info">
-          <span class="row-label">镜像加速</span>
+          <span class="row-label">{t("settings.mirror.label")}</span>
           <span class="row-desc">
             {#if mirrorTest}
               <span class={mirrorTest.ok ? "mtest-ok" : "mtest-err"}>
-                {mirrorTest.ok ? `测试成功(${mirrorTest.msg})` : `测试失败: ${mirrorTest.msg}`}
+                {mirrorTest.ok
+                  ? t("settings.test.ok", { msg: mirrorTest.msg })
+                  : t("settings.test.failed", { msg: mirrorTest.msg })}
               </span>
             {:else}
-              国内网络下载模型更快
+              {t("settings.mirror.desc")}
             {/if}
           </span>
         </div>
         {#if settings?.mirror_enabled}
           <button class="btn-secondary" onclick={runMirrorTest} disabled={mirrorTesting}>
-            {mirrorTesting ? "测试中…" : "测试"}
+            {mirrorTesting ? t("settings.testing") : t("settings.mirror.test")}
           </button>
         {/if}
         <input
           type="checkbox"
           class="ctl switch"
-          aria-label="使用镜像加速"
+          aria-label={t("settings.mirror.aria")}
           checked={settings?.mirror_enabled ?? false}
           disabled={!settings}
           onchange={toggleMirror}
@@ -1167,22 +1195,22 @@
 
   <!-- —— 关于 / 更新 —— -->
   <section>
-    <h2 class="section-title">关于</h2>
+    <h2 class="section-title">{t("settings.section.about")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">当前版本 v{appVersion || updateInfo?.current || "…"}</span>
+          <span class="row-label">{t("settings.about.version", { v: appVersion || updateInfo?.current || "…" })}</span>
           <span class="row-desc">
             {#if updateChecking}
-              正在检查…
+              {t("settings.update.checking")}
             {:else if updateError}
               {updateError}
             {:else if updateInfo?.has_update}
-              发现新版 v{updateInfo.latest}，前往下载页更新
+              {t("settings.update.found", { v: updateInfo.latest })}
             {:else if updateInfo}
-              已是最新版本
+              {t("settings.update.latest")}
             {:else}
-              从 GitHub Releases 检查是否有新版
+              {t("settings.update.hint")}
             {/if}
           </span>
         </div>
@@ -1191,17 +1219,17 @@
             class="btn-secondary"
             onclick={doOneClickUpdate}
             disabled={updating || updateBlocked}
-            title={updateBlocked ? "录音进行中,结束后再更新" : undefined}
+            title={updateBlocked ? t("settings.update.blockedRecording") : undefined}
           >
-            {updating ? updatingLabel : `一键更新 v${updateInfo.latest}`}
+            {updating ? updatingLabel : t("settings.update.oneClick", { v: updateInfo.latest })}
           </button>
           {#if updateFallback}
             <!-- 一键失败(签名/网络/latest.json 未就绪)兜底手动路径,绝不堵死更新。 -->
-            <button class="link" onclick={() => updateInfo && openUrl(updateInfo.url)}>打开发布页</button>
+            <button class="link" onclick={() => updateInfo && openUrl(updateInfo.url)}>{t("settings.update.openRelease")}</button>
           {/if}
         {:else}
           <button class="btn-secondary" disabled={updateChecking} onclick={doCheckUpdate}>
-            {updateChecking ? "检查中…" : "检查更新"}
+            {updateChecking ? t("settings.update.checkingBtn") : t("settings.update.check")}
           </button>
         {/if}
       </div>
@@ -1220,23 +1248,23 @@
       <button
         class="btn-secondary row-action"
         disabled={!!migrateBlockReason || !!pendingMigrate}
-        title={migrateBlockReason || "选择新目录并迁移现有内容"}
-        onclick={() => chooseDir(kind)}>更改…</button
+        title={migrateBlockReason || t("settings.store.changeTitle")}
+        onclick={() => chooseDir(kind)}>{t("settings.store.change")}</button
       >
     {/if}
   </div>
   {#if pendingMigrate && pendingMigrate.kind === kind}
     <div class="confirm-bar">
       {#if migrating}
-        <span class="migrating">迁移中…</span>
+        <span class="migrating">{t("settings.migrate.inProgress")}</span>
       {:else}
         <span class="confirm-text"
-          >将把现有数据完整迁移到 <span class="confirm-path">{pendingMigrate.path}</span
-          >,期间不能录制。</span
+          >{t("settings.migrate.confirmPrefix")}<span class="confirm-path">{pendingMigrate.path}</span
+          >{t("settings.migrate.confirmSuffix")}</span
         >
         <div class="confirm-actions">
-          <button class="btn-primary" onclick={startMigrate}>开始迁移</button>
-          <button class="btn-secondary" onclick={() => (pendingMigrate = null)}>取消</button>
+          <button class="btn-primary" onclick={startMigrate}>{t("settings.migrate.start")}</button>
+          <button class="btn-secondary" onclick={() => (pendingMigrate = null)}>{t("settings.cancel")}</button>
         </div>
       {/if}
     </div>

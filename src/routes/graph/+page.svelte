@@ -48,6 +48,7 @@
   import RelationDrawer from "$lib/RelationDrawer.svelte";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
   import GraphEdgeInspector from "$lib/GraphEdgeInspector.svelte";
+  import { t } from "$lib/i18n/index.svelte";
 
   const emptySemantic = (): SemanticGraphData => ({
     nodes: [],
@@ -210,7 +211,7 @@
       predicateCatalog = nextPredicates;
       if (value.semantic_edges.length > 0) globalSemanticPresence = "present";
       if (value.degraded && value.message) console.warn("semantic graph degraded", value.message);
-      semanticError = value.degraded ? "语义关系服务暂时降级，当前显示可用结果。" : "";
+      semanticError = value.degraded ? t("graph.semantic.degraded") : "";
       const filtered = filterSemanticGraph(value, filter);
       if (mode === "preserve-view") {
         const refreshed = resolveGraphRefreshState(
@@ -283,11 +284,13 @@
       const value = await semanticEntityDetail(id, detailFilter);
       if (generation !== detailGeneration) return;
       detail = value;
-      if (!value) detailError = "该实体还未进入当前语义索引，请稍后刷新。";
+      if (!value) detailError = t("graph.detail.notIndexed");
     } catch (cause) {
       if (generation !== detailGeneration) return;
       detail = null;
-      detailError = `实体治理信息读取失败：${cause instanceof Error ? cause.message : String(cause)}`;
+      detailError = t("graph.detail.loadFailed", {
+        e: cause instanceof Error ? cause.message : String(cause),
+      });
     } finally {
       if (generation === detailGeneration) detailLoading = false;
     }
@@ -317,7 +320,7 @@
       if (debugFixtureDisposed) return;
       console.warn("isolated semantic graph fixture failed", cause);
       semanticRequestFailed = true;
-      semanticError = "隔离调试夹具加载失败。请重新打开调试地址。";
+      semanticError = t("graph.debug.loadFailed");
       loaded = true;
     } finally {
       if (!debugFixtureDisposed) semanticLoading = false;
@@ -408,7 +411,7 @@
     if (generation === detailGeneration) {
       detail = nextDetail;
       detailLoading = false;
-      detailError = id && !nextDetail ? "该实体还未进入当前语义索引，请稍后刷新。" : "";
+      detailError = id && !nextDetail ? t("graph.detail.notIndexed") : "";
     }
     window.dispatchEvent(new CustomEvent(KNOWLEDGE_CHANGED_EVENT));
   }
@@ -482,7 +485,9 @@
       edgeInspector = {
         ...edgeInspector,
         loading: false,
-        error: `连接内容读取失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        error: t("graph.edgeDetail.loadFailed", {
+          e: cause instanceof Error ? cause.message : String(cause),
+        }),
       };
     }
   }
@@ -616,7 +621,7 @@
           />
         </div>
         {#if edgeInspector?.perspective === "note"}
-          <aside class="edge-inspector" aria-label="文章连接详情">
+          <aside class="edge-inspector" aria-label={t("graph.noteInspectorAria")}>
             <GraphEdgeInspector
               perspective="note"
               leftName={edgeInspector.leftName}
@@ -633,19 +638,19 @@
       </div>
     {:else if noteGraphState.data.nodes.length > 0}
       <div class="placeholder">
-        <p class="ph-title">笔记之间还没有连接</p>
-        <p class="ph-desc">当两篇笔记提到同一个实体时，它们会在这里连成一条边。</p>
+        <p class="ph-title">{t("graph.notePh.noEdgesTitle")}</p>
+        <p class="ph-desc">{t("graph.notePh.noEdgesDesc")}</p>
       </div>
     {:else if noteGraphState.status === "loading" || noteGraphState.status === "idle"}
-      <div class="placeholder"><p class="ph-title">文章视角</p><p class="ph-desc">正在按共享实体加载笔记关系。</p></div>
+      <div class="placeholder"><p class="ph-title">{t("graph.notePh.loadingTitle")}</p><p class="ph-desc">{t("graph.notePh.loadingDesc")}</p></div>
     {:else if noteGraphState.status === "error"}
       <div class="placeholder">
-        <p class="ph-title">文章图谱加载失败</p>
-        <p class="ph-desc">图谱索引失败不会影响笔记内容。</p>
-        <button class="empty-cta" onclick={() => noteGraphState.load()}>重新加载文章图谱</button>
+        <p class="ph-title">{t("graph.notePh.errorTitle")}</p>
+        <p class="ph-desc">{t("graph.notePh.errorDesc")}</p>
+        <button class="empty-cta" onclick={() => noteGraphState.load()}>{t("graph.notePh.reload")}</button>
       </div>
     {:else}
-      <div class="placeholder"><p class="ph-title">还没有进入图谱的笔记</p><p class="ph-desc">对笔记重新执行 AI 后会按共享实体建立连接。</p></div>
+      <div class="placeholder"><p class="ph-title">{t("graph.notePh.emptyTitle")}</p><p class="ph-desc">{t("graph.notePh.emptyDesc")}</p></div>
     {/if}
   {:else}
     <!-- 点击实体或关系只打开附着式详情，不会重挂载画布。 -->
@@ -661,11 +666,11 @@
           onChange={applyKnowledgeFilter}
           onCollapse={collapseGraph}
         />
-        <div class="canvas-shell" aria-label="知识图谱画布">
+        <div class="canvas-shell" aria-label={t("graph.canvasAria")}>
           {#if debugFixtureRequested}
             <div class="map-message debug-fixture" role="status">
-              <span>隔离调试模式 · 仅创建并读取临时夹具，不会读取或修改真实资料库</span>
-              {#if debugFixtureSession}<small>1,000 个实体 / 5,000 条语义关系</small>{/if}
+              <span>{t("graph.debug.banner")}</span>
+              {#if debugFixtureSession}<small>{t("graph.debug.fixtureSize")}</small>{/if}
               {#if semanticError}<small>{semanticError}</small>{/if}
             </div>
           {/if}
@@ -673,29 +678,29 @@
             <div class="map-message degraded" role="status">
               <span>{semanticStatusMessage}</span>
               {#if semanticRequestFailed}
-                <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>重新读取</button>
+                <button type="button" onclick={() => loadSemantic(effectiveGraphFilter)}>{t("graph.retryRead")}</button>
               {/if}
-              <button type="button" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
+              <button type="button" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</button>
             </div>
           {/if}
           {#if !debugFixtureRequested && semanticFallback}
             <div class="map-message fallback">
-              <span>还没有分析笔记之间的具体关系，目前先按共同提到的内容连接。</span>
-              <button type="button" onclick={() => (backfillOpen = true)}>分析笔记关系</button>
+              <span>{t("graph.fallback.notice")}</span>
+              <button type="button" onclick={() => (backfillOpen = true)}>{t("graph.backfill.analyze")}</button>
             </div>
           {/if}
           {#if !debugFixtureRequested && filteredSemanticEmpty}
             <div class="map-message" role="status">
-              <span>当前筛选下没有语义关系，图谱没有切换为旧版共现结果。</span>
-              <button type="button" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>重置图谱筛选</button>
+              <span>{t("graph.filteredEmpty.notice")}</span>
+              <button type="button" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.filteredEmpty.reset")}</button>
             </div>
           {/if}
 
           {#if loaded && usableSemantic.nodes.length === 0 && graph.nodes.length === 0}
             <div class="placeholder">
-              <p class="ph-title">还没有知识图谱</p>
-              <p class="ph-desc">配置大模型并对笔记重新执行 AI 后，人物、组织、项目等实体会汇入这里。</p>
-              <button class="empty-cta" onclick={() => goto("/ai")}>前往 AI 设置</button>
+              <p class="ph-title">{t("graph.emptyPh.title")}</p>
+              <p class="ph-desc">{t("graph.emptyPh.desc")}</p>
+              <button class="empty-cta" onclick={() => goto("/ai")}>{t("graph.emptyPh.goAi")}</button>
             </div>
           {:else if renderedNodes.length >= 2 && renderedEdges.length > 0}
             <ForceGraph
@@ -713,14 +718,14 @@
             />
           {:else if loaded && filteredSemantic.nodes.length >= 2}
             <div class="placeholder">
-              <p class="ph-title">没有匹配的实体关系</p>
-              <p class="ph-desc">当前类型下没有可连接的关系。选择全部类型，或从侧栏搜索其他实体。</p>
-              <button class="empty-cta" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>显示全部类型</button>
+              <p class="ph-title">{t("graph.noMatchPh.title")}</p>
+              <p class="ph-desc">{t("graph.noMatchPh.desc")}</p>
+              <button class="empty-cta" onclick={() => applyKnowledgeFilter(DEFAULT_KNOWLEDGE_FILTER)}>{t("graph.noMatchPh.showAll")}</button>
             </div>
           {:else}
             <div class="placeholder">
-              <p class="ph-title">知识图谱</p>
-              <p class="ph-desc">从实体名称开始，沿完整关系逐层探索会议上下文。</p>
+              <p class="ph-title">{t("graph.introPh.title")}</p>
+              <p class="ph-desc">{t("graph.introPh.desc")}</p>
             </div>
           {/if}
 
@@ -728,7 +733,7 @@
       </div>
 
       {#if inspectorOpen}
-        <aside class="edge-inspector" aria-label="知识治理检查器">
+        <aside class="edge-inspector" aria-label={t("graph.governanceInspectorAria")}>
           {#if edgeInspector?.perspective === "entity"}
             <GraphEdgeInspector
               perspective="entity"
@@ -758,9 +763,9 @@
               simple={true}
             />
           {:else if !debugFixtureRequested && selected}
-            <button class="inspector-close" type="button" aria-label="关闭实体治理检查器" onclick={closeEntity}>×</button>
+            <button class="inspector-close" type="button" aria-label={t("graph.closeEntityAria")} onclick={closeEntity}>×</button>
             {#if detailLoading && !detail}
-              <p class="inspector-state" aria-live="polite">正在读取实体治理信息</p>
+              <p class="inspector-state" aria-live="polite">{t("graph.detail.loading")}</p>
             {:else if detail}
               <EntityGovernance
                 {detail}
@@ -771,8 +776,8 @@
               />
             {:else}
               <div class="inspector-state" aria-live="polite">
-                <p>{detailError || "实体治理信息暂不可用。"}</p>
-                <button type="button" onclick={() => selected && loadDetail(selected)}>重试读取实体信息</button>
+                <p>{detailError || t("graph.detail.unavailable")}</p>
+                <button type="button" onclick={() => selected && loadDetail(selected)}>{t("graph.detail.retry")}</button>
               </div>
             {/if}
           {/if}
@@ -793,10 +798,10 @@
 {#if ctxMenu}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div class="menu-overlay" onclick={closeCtxMenu} oncontextmenu={(event) => { event.preventDefault(); closeCtxMenu(); }}></div>
-  <div class="ctx-menu" style:left={`${ctxMenu.x}px`} style:top={`${ctxMenu.y}px`} role="menu" aria-label={`治理 ${ctxMenu.name}`}>
+  <div class="ctx-menu" style:left={`${ctxMenu.x}px`} style:top={`${ctxMenu.y}px`} role="menu" aria-label={t("graph.ctx.aria", { name: ctxMenu.name })}>
     <p>{ctxMenu.name}</p>
-    <button class="ctx-item" role="menuitem" onclick={openContextDetail}>查看实体详情</button>
-    <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>管理实体</button>
+    <button class="ctx-item" role="menuitem" onclick={openContextDetail}>{t("graph.ctx.viewDetail")}</button>
+    <button class="ctx-item" role="menuitem" onclick={openContextGovernance}>{t("graph.ctx.manage")}</button>
   </div>
 {/if}
 
