@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 工作目录:`/Users/teemo/workspace-soul/voice-notes/.claude/worktrees/speaker-tidy`(worktree,勿 cd 到主仓)。
+- 工作目录:仓库的 `.claude/worktrees/speaker-tidy`(worktree,勿 cd 到主仓)。
 - 全部 UI 文案中文;禁 emoji 图标(DESIGN.md);样式用既有 token(`--surface`/`--hairline`/`.mini` 等)。
 - 代码注释风格:中文、讲约束不讲流水账(与仓库一致)。
 - 既有测试不许破坏:cargo test(933+)、vitest(168)、`npm run check` 0 错误;既有测试禁止 Sidebar 出现「待整理」字样(徽标 title 用「N 项待处理」)。

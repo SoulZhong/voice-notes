@@ -140,7 +140,7 @@ Expected: 打印若干 `AUDIO#..` 行；测试 PASS。记录：采样率、声�
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tests/sckit_probe.rs .superpowers/sdd/p2-sckit-spike.md
 git commit -m "spike(p2): screencapturekit 依赖 + 系统声音探针与 findings
 
@@ -276,7 +276,7 @@ Expected: 既有单测 + 新增全部 PASS。
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/audio/mod.rs src-tauri/src/audio/system.rs
 git commit -m "feat(audio): Source 枚举 + planar_to_mono 降混助手
 
@@ -429,7 +429,7 @@ Expected: PASS。
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/audio/system.rs .superpowers/sdd/p2-sckit-spike.md
 git commit -m "feat(audio): SystemAudioCapture（ScreenCaptureKit 系统声音，降级用可分类错误）
 
@@ -592,7 +592,7 @@ Expected: 全绿（旧 `run_pipeline` 及其测试仍在、仍过）。
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/session.rs src-tauri/src/pipeline/segment_worker.rs src-tauri/src/pipeline/mod.rs
 git commit -m "feat(pipeline): FinalJob/PartialJob + 单源 run_segment_worker（识别外置）
 
@@ -789,7 +789,7 @@ Expected: 全绿。
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/session.rs
 git commit -m "feat(session): run_asr_worker（finals 不丢优先 + partial 覆盖合并 + 失败占位）
 
@@ -1053,7 +1053,7 @@ Expected: 全绿（旧 `run_pipeline` 及其测试仍在）。
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/session.rs
 git commit -m "feat(session): start_session + RecordingHandle（双源汇入、真停止、降级报告）
 
@@ -1284,7 +1284,7 @@ Expected: 全绿；无对 `run_pipeline` 的悬空引用。
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src-tauri/src/ipc.rs src-tauri/src/lib.rs src-tauri/src/session.rs
 git commit -m "feat(app): 双源接线 + 真停止 + 就绪后发 recording + 系统声音降级；删除旧 run_pipeline
 
@@ -1504,7 +1504,7 @@ Run: `npm run tauri dev`
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git add src/lib/events.ts src/routes/+page.svelte
 git commit -m "feat(ui): 源徽章(我/对方) + 两条 partial + 系统声音降级横幅
 

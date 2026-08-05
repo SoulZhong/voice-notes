@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-14-hooks-note-content-design.md`
 
-**工作目录（重要）**：本计划在 worktree `/Users/teemo/workspace-soul/voice-notes-hooks` 执行（主检出被并行会话占用）。所有路径、git 操作、测试命令都在该目录下。node_modules 与 src-tauri/target 已软链主仓。
+**工作目录（重要）**：本计划在独立 worktree 根目录执行（主检出被并行会话占用）。所有路径、git 操作、测试命令都在该目录下。node_modules 与 src-tauri/target 已软链主仓。
 
 ## Global Constraints
 

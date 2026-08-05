@@ -72,7 +72,7 @@ voice-notes/
 
 - [ ] **Step 1: 用官方模板初始化项目**
 
-在项目根 `/Users/teemo/workspace-soul/voice-notes` 执行（目录已有 `docs/` 和 `.git/`，模板需写入当前目录）：
+在项目根目录执行（目录已有 `docs/` 和 `.git/`，模板需写入当前目录）：
 
 ```bash
 npm create tauri-app@latest . -- --template svelte-ts --manager npm --yes

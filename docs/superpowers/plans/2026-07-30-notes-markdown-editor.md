@@ -37,7 +37,7 @@
 - [ ] **Step 1: 安装依赖**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 npm install @milkdown/kit@^7
 ```
 
