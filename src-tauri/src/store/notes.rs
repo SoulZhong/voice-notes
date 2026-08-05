@@ -69,7 +69,7 @@ type FileSig = Option<(u128, u64)>;
 /// voiceprints.json) 五源签名——
 /// 覆盖 load 读到的全部文件,任一被写(改名写 meta.json、编辑写 segments/speakers、
 /// 声纹库合并)签名即失配,不会还出陈旧标题/内容。
-type LoadSig = (FileSig, FileSig, FileSig, FileSig, FileSig);
+type LoadSig = (FileSig, FileSig, FileSig, FileSig, FileSig, FileSig);
 
 fn file_sig(path: &Path) -> FileSig {
     let md = fs::metadata(path).ok()?;
@@ -127,6 +127,8 @@ impl NoteStore {
             file_sig(&dir.join(SEGMENT_SUPPRESSIONS_FILE)),
             file_sig(&dir.join("speakers.json")),
             vp_path.as_deref().map(file_sig).unwrap_or(None),
+            // 时基映射也参与签名:回放侧算出 align.json 后,缓存里那份旧时基的段必须失效。
+            file_sig(&dir.join(crate::store::align::ALIGN_FILE)),
         );
         let cache_key = dir.to_string_lossy().into_owned();
         if let Some((cached_sig, note)) = LOAD_CACHE.lock().unwrap().get(&cache_key) {
@@ -167,6 +169,20 @@ impl NoteStore {
         // 磁盘文件序不动:编辑重写走 read_jsonl_lines 原始行,续录 next_seq 由
         // writer 自扫 jsonl,均不经此处。空白段非损坏,不计 skipped_lines。
         segments.retain(|s| !s.text.trim().is_empty());
+        // 跨轨时基纠正:该笔记若存在 align.json(mic 轨时钟漂移过,回放侧已实测出映射),
+        // mic 段的时间戳整条停在旧时基上,必须在排序**之前**映射过去——否则不只是高亮
+        // 跟不上,mic 行与 system 行的先后次序本身就是错的(实测最多早插 148s)。
+        // 磁盘上的 segments.jsonl 不动:估计是启发式的,删掉 align.json 即回到未纠正。
+        if let Some(map) = crate::store::align::read(&dir) {
+            let fix = |s: &mut SegmentRecord| {
+                if s.source == "mic" {
+                    s.start_ms = crate::player_align::map_ms(&map, s.start_ms);
+                    s.end_ms = crate::player_align::map_ms(&map, s.end_ms);
+                }
+            };
+            segments.iter_mut().for_each(fix);
+            suppressed_segments.iter_mut().for_each(fix);
+        }
         segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
         suppressed_segments.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.seq.cmp(&b.seq)));
         let mut speakers = read_speakers(&dir);
@@ -586,6 +602,46 @@ mod tests {
         assert_eq!(note.segments[0].text, "你好");
         assert_eq!(note.segments[1].source, "system");
         assert_eq!(note.skipped_lines, 0);
+    }
+
+    /// 存在 align.json 时,mic 段的时间戳按映射换到 system 时基,**并据此重排**。
+    /// 重排是重点:时基漂移的笔记里 mic 行会整体早插到 system 行前面(实测最多早 148s),
+    /// 只改时间戳不重排,转写读起来仍是错乱的问答顺序。
+    #[test]
+    fn align_map_shifts_mic_segments_and_reorders_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        // mic 在 0ms、system 在 1000ms;mic 轨慢 2 倍速 → mic 的 0ms 其实对应 system 的 2000ms。
+        let id = make_note(tmp.path(), &["麦克风这句", "系统这句"], true);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let before = store.load(&id).unwrap();
+        assert_eq!(before.segments[0].source, "mic", "未纠正时 mic 排在前");
+
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 2.0), (100.0, 102.0)]).unwrap();
+        crate::store::align::write(&tmp.path().join(&id), &map).unwrap();
+
+        let after = store.load(&id).unwrap();
+        assert_eq!(after.segments[0].source, "system", "纠正后次序翻转");
+        let mic = after.segments.iter().find(|s| s.source == "mic").unwrap();
+        assert_eq!((mic.start_ms, mic.end_ms), (2000, 2900), "mic 段整体后移 2s");
+        let sys = after.segments.iter().find(|s| s.source == "system").unwrap();
+        assert_eq!((sys.start_ms, sys.end_ms), (1000, 1900), "system 段不动");
+    }
+
+    /// align.json 是纠正的唯一开关:删掉即完全回到未纠正状态(缓存签名须跟着失效)。
+    #[test]
+    fn removing_align_map_restores_original_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_note(tmp.path(), &["麦克风这句", "系统这句"], true);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join(&id);
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 2.0), (100.0, 102.0)]).unwrap();
+        crate::store::align::write(&dir, &map).unwrap();
+        assert_eq!(store.load(&id).unwrap().segments[0].source, "system");
+
+        std::fs::remove_file(dir.join(crate::store::align::ALIGN_FILE)).unwrap();
+        let back = store.load(&id).unwrap();
+        assert_eq!(back.segments[0].source, "mic", "删掉映射即回到未纠正");
+        assert_eq!(back.segments[0].start_ms, 0);
     }
 
     #[test]

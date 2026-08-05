@@ -10,6 +10,7 @@ mod shortcuts;
 mod store;
 mod i18n;
 mod player;
+mod player_align;
 mod player_gate;
 mod tray;
 mod update;
@@ -1823,7 +1824,7 @@ fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
 fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
-    Ok(store::load_refined(&dir).map(|mut doc| {
+    Ok(store::load_refined_for_display(&dir).map(|mut doc| {
         if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
             if let Ok(root) = data_root(&app) {
                 let vp = store::VoiceprintStore::new(root).load();
@@ -2927,7 +2928,7 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool,
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let refined = if prefer_refined {
-        store::load_refined(&dir.join(&id)).map(|mut doc| {
+        store::load_refined_for_display(&dir.join(&id)).map(|mut doc| {
             if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
                 if let Ok(root) = data_root(&app) {
                     let vp = store::VoiceprintStore::new(root).load();

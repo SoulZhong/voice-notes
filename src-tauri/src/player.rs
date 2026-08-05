@@ -225,6 +225,183 @@ fn validate_under_notes(app: &AppHandle, path: &Path) -> Result<PathBuf, String>
     Ok(canon)
 }
 
+/// 触发对齐的轨长差门限:相对差与绝对差都要过。
+/// 相对 1% 对应"每分钟错开 0.6s",一小时的会能拉开 36s;绝对 2s 挡掉短录音里
+/// 那点收尾差(两轨停止时刻本就差几百毫秒,不是时基问题)。
+const ALIGN_MIN_REL: f64 = 0.01;
+const ALIGN_MIN_ABS_MS: i64 = 2_000;
+
+/// canonical WAV 的时长(毫秒):16k 单声道 s16 → 每毫秒 32 字节。读不到算 0。
+fn wav_duration_ms(p: &Path) -> i64 {
+    std::fs::metadata(p).map(|m| ((m.len().saturating_sub(44)) / 32) as i64).unwrap_or(0)
+}
+
+/// 两轨长度差是否显著到值得跑一次(要几秒的)时基估计。
+/// 相对 1% 对应"每分钟错开 0.6s";绝对 2s 挡掉短录音里的收尾差(两轨停止时刻本就
+/// 差几百毫秒,不是时基问题)。任一轨读不出长度即不做。
+fn alignment_worth_attempting(mic_ms: i64, sys_ms: i64) -> bool {
+    if mic_ms <= 0 || sys_ms <= 0 {
+        return false;
+    }
+    let diff = (sys_ms - mic_ms).abs();
+    diff >= ALIGN_MIN_ABS_MS && (diff as f64) >= ALIGN_MIN_REL * sys_ms as f64
+}
+
+/// 对齐缓存是否可直接用。**缓存单元 = 对齐音轨 + align.json**,两者都必须比两条
+/// 源轨新;缺一即整体重算。
+///
+/// 只比"音轨 vs mic"是不够的:①align.json 写失败或被用户删掉后,下次会因为音轨
+/// 缓存还在而直接跳过,映射永远补不上、删 align.json 也回不到未纠正状态;
+/// ②system 轨变化(续录)不会让缓存失效,会拿旧映射继续播。
+fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&Path]) -> bool {
+    let newest_src = sources
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    let newer_than_src = |p: &Path| match (std::fs::metadata(p).and_then(|m| m.modified()), newest_src) {
+        (Ok(t), Some(src)) => t >= src,
+        _ => false,
+    };
+    newer_than_src(cache) && align_json.map(newer_than_src).unwrap_or(false)
+}
+
+/// 提交对齐结果:音轨先写临时文件 → 校验长度 → 原子 rename → **最后**发布映射。
+/// 返回是否整体提交成功;任一步失败都会清理临时文件并返回 false(下次装载重算)。
+///
+/// 顺序不能反。先发布映射有个真实的坏窗口:映射一落盘,转写时间戳立刻按新时基显示,
+/// 而音轨若在随后的写入中被磁盘写满/中断截断,回放还是原始音频——两边当场对不上;
+/// 更糟的是截断文件的 mtime 仍比源轨新,下次装载会把"新映射 + 半截音轨"判成 fresh
+/// 直接拿来用。映射是最后一步,它存在即代表音轨已就位。
+fn commit_aligned(
+    cache: &Path,
+    render: impl FnOnce(&mut std::fs::File) -> std::io::Result<u64>,
+    note_dir: &Path,
+    map: &crate::player_align::TimeMap,
+) -> bool {
+    // 唯一名 + create_new:同 store::align::write 的理由(不跟随预置符号链接)。
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = cache.with_extension(format!(
+        "{}-{}.wav.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // 直接流式写进临时文件:生产路径不再返回/持有整轨 Vec(见 render_aligned_to)。
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| render(&mut f).and_then(|n| f.sync_all().map(|_| n)));
+    let complete = match written {
+        Ok(n) => std::fs::metadata(&tmp).map(|m| m.len()).ok() == Some(n),
+        Err(_) => false,
+    };
+    if !complete {
+        eprintln!("回放对齐: 对齐音轨写入不完整,本次不对齐(下次装载重试)");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // std::fs::rename 在 Windows 走 MoveFileEx + MOVEFILE_REPLACE_EXISTING,
+    // 覆盖已有目标是既定语义,无需另写平台分支。
+    if let Err(e) = std::fs::rename(&tmp, cache) {
+        eprintln!("回放对齐: 对齐音轨发布失败({e}),本次不对齐(下次装载重试)");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if let Err(e) = crate::store::align::write(note_dir, map) {
+        eprintln!("回放对齐: 映射落盘失败({e}),本次不对齐(下次装载重试)");
+        return false;
+    }
+    true
+}
+
+/// 纠正后的 mic 轨在笔记时间轴上的 offset。
+///
+/// 它铺在 system 的本地时基上,但起点未必是 sys_local 0:mic 先开录时
+/// (mic_off < sys_off)起点是负的,`render_aligned` 已把那段渲进去,这里把 offset
+/// 相应前移,轨在**全局**时间轴上的起点仍是 mic 原来的起点。
+fn aligned_track_offset_ms(sys_off_ms: u64, map: &crate::player_align::TimeMap) -> u64 {
+    (sys_off_ms as i64 + crate::player_align::map_ms_signed(map, 0)).max(0) as u64
+}
+
+/// 把 mic 轨按实测时基映射重采样回 system 的时基(就地改写 plan)。
+///
+/// 保守到底:轨长差不显著、估不出可信映射、渲染或写盘失败——任一情形都原样返回,
+/// 回放行为与不对齐时完全一致。结果按两条源轨的路径+mtime 落缓存,同一笔记只算一次。
+async fn align_mic_track(
+    app: &AppHandle,
+    plan: &mut [(PathBuf, u64, String)],
+    note_dir: Option<&Path>,
+) {
+    let idx = |src: &str| plan.iter().position(|(_, _, s)| s == src);
+    let (Some(mi), Some(si)) = (idx("mic"), idx("system")) else {
+        return; // 单轨笔记没有跨轨时基可言
+    };
+    let (mic_path, mic_off) = (plan[mi].0.clone(), plan[mi].1);
+    let (sys_path, sys_off) = (plan[si].0.clone(), plan[si].1);
+    let (dm, ds) = (wav_duration_ms(&mic_path), wav_duration_ms(&sys_path));
+    if !alignment_worth_attempting(dm, ds) {
+        return;
+    }
+    let Ok(cache) = cache_path_for(app, &mic_path.with_extension("aligned.m4a")) else {
+        return;
+    };
+    let Some(note_dir) = note_dir else { return };
+    let align_json = note_dir.join(crate::store::align::ALIGN_FILE);
+
+    if !aligned_cache_is_fresh(&cache, Some(&align_json), &[&mic_path, &sys_path]) {
+        eprintln!(
+            "回放对齐: 两轨长度差 {:.1}s(mic {:.0}s / system {:.0}s),估计时基映射…",
+            (ds - dm).abs() as f64 / 1000.0,
+            dm as f64 / 1000.0,
+            ds as f64 / 1000.0
+        );
+        let (m2, s2, c2, nd) =
+            (mic_path.clone(), sys_path.clone(), cache.clone(), note_dir.to_path_buf());
+        let built = tauri::async_runtime::spawn_blocking(move || -> Option<u64> {
+            // mmap 而不是 read:估计要同时看两条完整音轨,一小时双轨读进堆里就是
+            // ~230MB 常驻,而 player_align 已改成按字节视图逐样本取值,页由系统按需
+            // 调入/回收即可(与回放热路径同一套 mmap 策略)。
+            let map_file = |p: &Path| -> Option<Mmap> {
+                let f = std::fs::File::open(p).ok()?;
+                unsafe { Mmap::map(&f).ok() }
+            };
+            let mic = map_file(&m2)?;
+            let sys = map_file(&s2)?;
+            let a = crate::player_align::estimate(&mic, mic_off, &sys, sys_off)?;
+            if !crate::player_align::worth_correcting(&a) {
+                eprintln!("回放对齐: 实测漂移仅 {:.2}s,不值得纠正", a.drift_secs);
+                return None;
+            }
+            eprintln!(
+                "回放对齐: 探针 {}/{} 命中,最大漂移 {:.1}s,按映射重采样 mic 轨",
+                a.accepted, a.probes, a.drift_secs
+            );
+            let render = |f: &mut std::fs::File| {
+                crate::player_align::render_aligned_to(&mic, &a.map, f).map(|(n, _)| n)
+            };
+            commit_aligned(&c2, render, &nd, &a.map).then(|| (a.drift_secs * 1000.0) as u64)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("回放对齐: 任务失败({e}),本次回放不对齐");
+            None
+        });
+        let Some(drift_ms) = built else { return };
+        // 详情页手里那份段是旧时基的,通知它整页重拉。
+        if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
+            let _ = app.emit(
+                "note_realigned",
+                crate::ipc::NoteRealignedEvent { note_id: note_id.to_string(), drift_ms },
+            );
+        }
+    }
+    // 起点从映射自身取(map.apply(0)),命中缓存时也算得出,不必额外存一份。
+    let Some(map) = crate::store::align::read(note_dir) else {
+        return; // 映射读不回来就不换轨:宁可不对齐,也不能按错的 offset 铺
+    };
+    plan[mi] = (cache, aligned_track_offset_ms(sys_off, &map), "mic".to_string());
+}
+
 /// 装载音轨并(重)起输出流。m4a 先解码到缓存(秒级,spawn_blocking 不占主线程,
 /// 前端 await 本命令即拿到就绪信号);返回时间轴总长 ms。
 #[tauri::command]
@@ -271,25 +448,46 @@ pub async fn player_load(
         plan.push((wav, t.offset_ms, t.source.clone()));
     }
 
-    // 回放门控:按转写段活跃度构建 mic 轨压低区间(任何失败空表降级=现状)。
-    let gate_spans = match &note_dir {
-        Some(dir) => {
-            let seg_path = dir.join("segments.jsonl");
-            let segs = crate::player_gate::parse_segments_jsonl(&seg_path);
-            if segs.is_empty() {
-                eprintln!("回放门控: segments 缺失或为空,本次回放不做门控");
+    // 跨轨时基对齐:历史录音里 mic 轨可能整条被压缩(采集侧把设备实际出样速率记错,
+    // 见 player_align 模块头),两轨按 offset 一铺,同一句话就被拉开成两处。这里在
+    // 门控之前把 mic 轨按实测映射重采样回 system 的时基——门控的电平判据要求两轨对齐
+    // 在 400ms 内,不先把时基掰正,门控只会压错地方。
+    //
+    // 只对"轨长明显对不上"的笔记做:估计要跑几秒,健康的笔记不该为它买单。
+    align_mic_track(&app, &mut plan, note_dir.as_deref()).await;
+
+    // 回放门控:按两轨逐帧电平构建 mic 压低区间(任何失败空表降级=不门控)。
+    // 判据不再取自转写段——回声残影本身会被识别成 mic 段,旧的"mic 有段即保护"
+    // 恰好把回声最响处挖成保护区,详见 player_gate 模块头。
+    // 读两轨包络是一次顺序读:这里已在 spawn_blocking 之后的解码路径上,
+    // 与既有 m4a 解码同量级,不额外阻塞 UI。
+    let find = |src: &str| {
+        plan.iter()
+            .find(|(_, _, s)| s == src)
+            .map(|(p, off, _)| (p.clone(), *off))
+    };
+    let gate_spans = match (find("mic"), find("system")) {
+        (Some((mic, mic_off)), Some((sys, sys_off))) => {
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::player_gate::build_gate_from_audio(&mic, mic_off, &sys, sys_off)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("回放门控: 构建任务失败({e}),本次回放不做门控");
                 Vec::new()
-            } else {
-                crate::player_gate::build_gate(&segs)
-            }
+            })
         }
-        None => {
-            eprintln!("回放门控: 无法定位笔记目录,本次回放不做门控");
+        _ => {
+            // 单轨笔记没有跨轨重影可言,不门控即正解。
             Vec::new()
         }
     };
     if !gate_spans.is_empty() {
-        eprintln!("回放门控: {} 个压低区间(mic 轨,-15dB,双讲保护)", gate_spans.len());
+        eprintln!(
+            "回放门控: {} 个压低区间(mic 轨,{:.0}dB,电平判据)",
+            gate_spans.len(),
+            20.0 * crate::player_gate::DUCK_GAIN.log10()
+        );
     }
 
     // mmap 装载 + Core 组装。
@@ -456,6 +654,146 @@ pub fn player_stop(state: State<'_, PlayerHandle>) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // ── 对齐缓存的四个决策(从 align_mic_track 抽出的纯逻辑;原先只有真机路径覆盖) ──
+
+    fn tmap() -> crate::player_align::TimeMap {
+        crate::player_align::TimeMap::new(vec![(0.0, 0.0), (100.0, 109.0)]).unwrap()
+    }
+
+    /// 写一个 canonical WAV 骨架(只关心长度,内容无所谓)。
+    fn wav_of_ms(path: &Path, ms: u64) {
+        let mut b = vec![0u8; HEADER_LEN as usize];
+        b.extend(std::iter::repeat(0u8).take(ms as usize * 32));
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// 把 mtime 推到"比现在晚",用来模拟源轨被更新(续录)。
+    fn touch_newer(path: &Path) {
+        // 重写一遍即可刷新 mtime;分辨率不足时补一次极短等待。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = std::fs::read(path).unwrap();
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn alignment_trigger_needs_both_relative_and_absolute_gap() {
+        assert!(!alignment_worth_attempting(0, 100_000), "读不出长度不做");
+        assert!(!alignment_worth_attempting(100_000, 0));
+        // 30 分钟录音差 1.5s:过不了绝对门限(收尾差,不是时基问题)
+        assert!(!alignment_worth_attempting(1_798_500, 1_800_000));
+        // 短录音差 3s 但只占 1.5%……绝对与相对都要过,这里两者都过
+        assert!(alignment_worth_attempting(197_000, 200_000));
+        // 长录音差 3s:绝对过了,相对(0.17%)没过 → 不做
+        assert!(!alignment_worth_attempting(1_797_000, 1_800_000));
+        // 真实那场:1665s vs 1813s
+        assert!(alignment_worth_attempting(1_665_188, 1_812_928));
+        // 反方向(mic 比 system 长)同样要触发
+        assert!(alignment_worth_attempting(1_812_928, 1_665_188));
+    }
+
+    /// 缓存单元 = 对齐音轨 + align.json,两者都必须比**两条**源轨新。
+    /// 这条锁住三个曾经踩过的坑:删 align.json 要能回到未纠正、映射写失败要能重试、
+    /// system 轨续录后不得继续用旧映射。
+    #[test]
+    fn aligned_cache_requires_both_artifacts_newer_than_both_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mic, sys) = (tmp.path().join("mic.wav"), tmp.path().join("system.wav"));
+        let (cache, aj) = (tmp.path().join("aligned.wav"), tmp.path().join("align.json"));
+        wav_of_ms(&mic, 10);
+        wav_of_ms(&sys, 10);
+        let srcs: [&Path; 2] = [&mic, &sys];
+
+        assert!(!aligned_cache_is_fresh(&cache, Some(&aj), &srcs), "音轨缺失即不新鲜");
+        touch_newer(&mic);
+        std::fs::write(&cache, b"x").unwrap();
+        assert!(!aligned_cache_is_fresh(&cache, Some(&aj), &srcs), "缺 align.json 即不新鲜");
+        std::fs::write(&aj, b"{}").unwrap();
+        assert!(aligned_cache_is_fresh(&cache, Some(&aj), &srcs), "两者俱全且比源轨新");
+
+        // 删掉映射 → 回到未纠正(不能因为音轨缓存还在就继续用)
+        std::fs::remove_file(&aj).unwrap();
+        assert!(!aligned_cache_is_fresh(&cache, Some(&aj), &srcs));
+        std::fs::write(&aj, b"{}").unwrap();
+        assert!(aligned_cache_is_fresh(&cache, Some(&aj), &srcs));
+
+        // system 轨续录变新 → 缓存整体失效
+        touch_newer(&sys);
+        assert!(!aligned_cache_is_fresh(&cache, Some(&aj), &srcs), "system 轨更新须让缓存失效");
+
+        // 无笔记目录(拿不到 align.json 路径)一律不新鲜
+        assert!(!aligned_cache_is_fresh(&cache, None, &srcs));
+    }
+
+    #[test]
+    fn commit_aligned_publishes_audio_then_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note");
+        std::fs::create_dir(&note).unwrap();
+        let cache = tmp.path().join("aligned.wav");
+        assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert_eq!(std::fs::read(&cache).unwrap(), b"PCMDATA");
+        assert_eq!(crate::store::align::read(&note), Some(tmap()));
+        // 不留临时文件
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件应已清理: {leftovers:?}");
+    }
+
+    /// 音轨没能发布时,**映射绝不能已经发布**——否则转写时间戳按新时基显示、
+    /// 回放却还是原始音频,两边当场对不上,而且下次装载可能把半截状态判成 fresh。
+    #[test]
+    fn commit_aligned_never_publishes_map_when_audio_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note");
+        std::fs::create_dir(&note).unwrap();
+        // 让最终 rename 失败:目标是个非空目录
+        let cache = tmp.path().join("aligned.wav");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("occupied"), b"x").unwrap();
+
+        assert!(!commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert!(
+            crate::store::align::read(&note).is_none(),
+            "音轨发布失败时映射不得落盘(否则时间戳与音频对不上)"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "失败路径也要清理临时文件: {leftovers:?}");
+    }
+
+    /// 连续提交不得因临时名冲突而失败(唯一名要真的唯一)。
+    #[test]
+    fn commit_aligned_is_repeatable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note");
+        std::fs::create_dir(&note).unwrap();
+        let cache = tmp.path().join("aligned.wav");
+        for i in 0..3u8 {
+            assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, &[i; 16]).map(|_| 16), &note, &tmap()), "第 {i} 次提交");
+        }
+        assert_eq!(std::fs::read(&cache).unwrap(), vec![2u8; 16], "最后一次胜出");
+    }
+
+    #[test]
+    fn aligned_offset_follows_the_maps_own_start() {
+        // 起点为 0:沿用 system 的 offset
+        assert_eq!(aligned_track_offset_ms(5_000, &tmap()), 5_000);
+        // mic 先开录 8s(起点 -8s):offset 相应前移,开头内容不被顶掉
+        let early = crate::player_align::TimeMap::new(vec![(0.0, -8.0), (100.0, 101.0)]).unwrap();
+        assert_eq!(aligned_track_offset_ms(20_000, &early), 12_000);
+        // 前移到负数则夹到 0(全局起点不可能为负)
+        assert_eq!(aligned_track_offset_ms(3_000, &early), 0);
+        // mic 后开录 8s
+        let late = crate::player_align::TimeMap::new(vec![(0.0, 8.0), (100.0, 109.0)]).unwrap();
+        assert_eq!(aligned_track_offset_ms(0, &late), 8_000);
+    }
+
     /// 造内存轨:samples 为 s16 值序列。
     fn mem_track(samples: &[i16], offset_ms: u64, source: &str) -> Track {
         let mut bytes = vec![0u8; HEADER_LEN as usize];
@@ -527,16 +865,26 @@ mod tests {
             std::fs::read(&dest).unwrap()
         };
 
-        // 真门控:segments.jsonl → build_gate(只压 mic)。
-        let segs = crate::player_gate::parse_segments_jsonl(&note.join("segments.jsonl"));
-        let gate = crate::player_gate::build_gate(&segs);
-        eprintln!("门控压低区间: {} 个", gate.len());
-
         // 真轨道偏移:audio.json。
         let meta = crate::store::audio::load_audio_meta(&note);
         let off = |s: &str| meta.tracks.get(s).map(|t| t.offset_ms).unwrap_or(0);
-        let mic = track_from_canonical_wav(decode("mic"), off("mic"), "mic", gate);
-        let sys = track_from_canonical_wav(decode("system"), off("system"), "system", Vec::new());
+        let (mic_bytes, sys_bytes) = (decode("mic"), decode("system"));
+
+        // 真门控:两轨电平判据(VN_MIX_NO_GATE=1 渲染无门控对照)。
+        let gate = if std::env::var("VN_MIX_NO_GATE").is_ok() {
+            Vec::new()
+        } else {
+            crate::player_gate::build_gate_from_wav_bytes(
+                &mic_bytes,
+                off("mic"),
+                &sys_bytes,
+                off("system"),
+            )
+        };
+        eprintln!("门控压低区间: {} 个", gate.len());
+
+        let mic = track_from_canonical_wav(mic_bytes, off("mic"), "mic", gate);
+        let sys = track_from_canonical_wav(sys_bytes, off("system"), "system", Vec::new());
         eprintln!(
             "mic {} 采样 offset {}ms | system {} 采样 offset {}ms",
             mic.len_samples, off("mic"), sys.len_samples, off("system")

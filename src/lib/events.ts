@@ -103,3 +103,12 @@ export type NoteRenamedEvent = { note_id: string; title: string };
 export function onNoteRenamed(cb: (e: NoteRenamedEvent) => void) {
   return listen<NoteRenamedEvent>("note_renamed", (ev) => cb(ev.payload));
 }
+
+/** 跨轨时基已纠正(mic 轨时钟漂移过,回放侧实测出映射并落盘)。详情页手里那份转写段
+    的时间戳还停在旧时基上——高亮跟不上、点段落跳错位置、mic 行与 system 行的次序也
+    是错的,须整页重拉。 */
+export type NoteRealignedEvent = { note_id: string; drift_ms: number };
+
+export function onNoteRealigned(cb: (e: NoteRealignedEvent) => void) {
+  return listen<NoteRealignedEvent>("note_realigned", (ev) => cb(ev.payload));
+}

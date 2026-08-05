@@ -317,7 +317,8 @@ fn note_content_from_dirs(
 ) -> Option<NoteContent> {
     let store = crate::store::NoteStore::new(notes_dir.to_path_buf());
     let note = store.load(note_id).ok()?;
-    let text = match crate::store::load_refined(&notes_dir.join(note_id)) {
+    // 纯读出口(钩子载荷):render_refined 会带 [时间戳],与 App 用同一条时基。
+    let text = match crate::store::load_refined_for_display(&notes_dir.join(note_id)) {
         Some(mut doc) => {
             if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
                 if let Some(root) = data_root {

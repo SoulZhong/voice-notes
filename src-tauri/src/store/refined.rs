@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
@@ -715,6 +715,51 @@ pub fn load_refined(note_dir: &Path) -> Option<RefinedDoc> {
     }
 }
 
+/// 读修订稿并套上跨轨时基投影(见 `realign_paragraphs`)。**只给纯展示面用**:
+/// 笔记页、导出这类"读出来给人看"的地方。
+///
+/// 为什么单开一个函数而不是把投影塞进 `load_refined`:投影后的时间戳一旦被写回磁盘,
+/// 下次读取会再投影一次,每写一轮漂一次。而写路径遍布仓库(Agent Aing 失败时就有一处
+/// `load_refined` → 改 stages → `write_refined_atomic`),靠"记得别写回"是守不住的。
+/// 把默认值定成**未投影**,写路径拿到的天然是磁盘真值,只有明确要展示的两处才升级
+/// 到本函数——错误方向从"默认危险"翻成"默认安全"。
+pub fn load_refined_for_display(note_dir: &Path) -> Option<RefinedDoc> {
+    load_refined(note_dir).map(|d| realign_paragraphs(note_dir, d))
+}
+
+/// 跨轨时基纠正:与 `NoteStore::load` 同一套(见 `store::align` 模块头)。修订段落
+/// 的时间戳继承自它的源段,mic 轨漂移过就同样是错的,高亮/点击跳转都会偏。
+///
+/// 只映射「源段全是 mic」的段落:段落跨两轨时(同一说话人被两条链路各录一份的边界
+/// 情形)映射哪一条都不对,宁可不动——它的时间戳本来就是两条时基混出来的,已不可修。
+/// align.json 不存在时整条路径零开销(一次 read 失败),不拖慢图谱重建那种全库遍历。
+///
+/// **只改时间戳,绝不重排**。段落数组的下标就是保存契约:笔记页整篇保存按
+/// `ParagraphPayload::orig_index` 指回基线数组,而基线取自 `load_refined_locked`
+/// (不经本函数,是磁盘原序)。这里一重排,前端按新序发下来的下标就会落到磁盘上的
+/// 另一段——编辑会写错段落。段那边可以排序是因为段编辑按 `seq` 定位,不是下标。
+/// 修订稿的段落顺序本就是 Aing 按(当时错误的)时序分好的,要真正理顺得重跑 Aing。
+fn realign_paragraphs(note_dir: &Path, mut doc: RefinedDoc) -> RefinedDoc {
+    let Some(map) = crate::store::align::read(note_dir) else { return doc };
+    let mic_seqs: std::collections::HashSet<u64> = match std::fs::File::open(note_dir.join("segments.jsonl")) {
+        Ok(f) => std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str::<crate::store::SegmentRecord>(&l).ok())
+            .filter(|s| s.source == "mic")
+            .map(|s| s.seq)
+            .collect(),
+        Err(_) => return doc,
+    };
+    for p in doc.paragraphs.iter_mut() {
+        if !p.source_seqs.is_empty() && p.source_seqs.iter().all(|q| mic_seqs.contains(q)) {
+            p.start_ms = crate::player_align::map_ms(&map, p.start_ms);
+            p.end_ms = crate::player_align::map_ms(&map, p.end_ms);
+        }
+    }
+    doc
+}
+
 /// aing.json 或旧 refined.json 是否存在(供「是否有修订稿」判断,迁移感知)。
 pub fn aing_exists(note_dir: &Path) -> bool {
     note_dir.join(AING_DOC_FILE).exists() || note_dir.join(LEGACY_REFINED_FILE).exists()
@@ -1193,6 +1238,128 @@ mod tests {
             source_seqs: vec![start / 1000],
             mentions: vec![],
         }
+    }
+
+    /// 修订段落的时间戳继承自源段,mic 轨漂移过就同样是错的。存在 align.json 时
+    /// 「源段全是 mic」的段落须换到新时基并重排;跨两轨的段落不动(它的时间戳本来
+    /// 就是两条时基混出来的,映射哪一条都不对)。
+    #[test]
+    fn align_map_shifts_mic_only_paragraphs_and_leaves_mixed_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // seq 0=mic, 1=system。段落 A 只含 mic(seq 0),B 只含 system(seq 1),C 跨两轨。
+        let segs = concat!(
+            r#"{"seq":0,"source":"mic","text":"甲","start_ms":0,"end_ms":900}"#,
+            "\n",
+            r#"{"seq":1,"source":"system","text":"乙","start_ms":1000,"end_ms":1900}"#,
+            "\n"
+        );
+        std::fs::write(dir.join("segments.jsonl"), segs).unwrap();
+        let mut a = para("S1", None, None, 0);
+        a.source_seqs = vec![0];
+        let mut b = para("S2", None, None, 1000);
+        b.source_seqs = vec![1];
+        let mut c = para("S3", None, None, 1500);
+        c.source_seqs = vec![0, 1];
+        write_doc(dir, vec![a, b, c]);
+
+        let before = load_refined_for_display(dir).unwrap();
+        assert_eq!(before.paragraphs[0].start_ms, 0, "未纠正时 mic 段落在最前");
+
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 2.0), (100.0, 102.0)]).unwrap();
+        crate::store::align::write(dir, &map).unwrap();
+
+        let after = load_refined_for_display(dir).unwrap();
+        let by_speaker = |s: &str| {
+            after.paragraphs.iter().find(|p| p.speaker == s).unwrap().start_ms
+        };
+        assert_eq!(by_speaker("S1"), 2000, "纯 mic 段落后移 2s");
+        assert_eq!(by_speaker("S2"), 1000, "纯 system 段落不动");
+        assert_eq!(by_speaker("S3"), 1500, "跨两轨的段落不动");
+        // 顺序必须原样保持:数组下标就是保存契约(见 realign_paragraphs 文档注释)。
+        assert_eq!(
+            after.paragraphs.iter().map(|p| p.speaker.as_str()).collect::<Vec<_>>(),
+            ["S1", "S2", "S3"],
+            "投影只改时间戳,绝不重排——重排会让整篇保存的 orig_index 落到别的段上"
+        );
+    }
+
+    /// 默认加载器**不得**带投影。这条是 P1 回归锁:仓库里遍布
+    /// `load_refined → 改几个字段 → write_refined_atomic` 的写路径(Agent Aing 失败
+    /// 落 stages 就是一处),一旦默认加载器带上投影,投影后的时间戳会被写回磁盘,
+    /// 下次读取再投影一次,每失败一轮多漂一次,而且不可逆。
+    #[test]
+    fn default_loader_returns_raw_timestamps_so_write_paths_cannot_persist_the_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            concat!(r#"{"seq":0,"source":"mic","text":"甲","start_ms":0,"end_ms":900}"#, "\n"),
+        )
+        .unwrap();
+        let mut a = para("S1", None, None, 0);
+        a.source_seqs = vec![0];
+        write_doc(dir, vec![a]);
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 9.0), (100.0, 109.0)]).unwrap();
+        crate::store::align::write(dir, &map).unwrap();
+
+        assert_eq!(load_refined(dir).unwrap().paragraphs[0].start_ms, 0, "默认加载器必须是磁盘真值");
+        assert_eq!(
+            load_refined_for_display(dir).unwrap().paragraphs[0].start_ms,
+            9000,
+            "投影只在明确要展示时发生"
+        );
+
+        // 模拟一次"读→改→写"的写路径:回写后再读,时间戳不得被推着走。
+        let mut doc = load_refined(dir).unwrap();
+        doc.stages.llm = "failed".into();
+        write_refined_atomic(dir, &doc).unwrap();
+        assert_eq!(
+            load_refined(dir).unwrap().paragraphs[0].start_ms,
+            0,
+            "写路径回写后磁盘仍是原始时基"
+        );
+        assert_eq!(
+            load_refined_for_display(dir).unwrap().paragraphs[0].start_ms,
+            9000,
+            "展示投影仍只映射一次(没有叠加)"
+        );
+    }
+
+    /// 保存契约的回归锁:`load_refined_for_display`(展示投影)与 `load_refined_locked`
+    /// (保存基线,磁盘原序)必须逐段一一对应。任何在读侧重排/增删段落的改动都会在此失败。
+    #[test]
+    fn display_projection_keeps_save_baseline_index_alignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            concat!(
+                r#"{"seq":0,"source":"mic","text":"甲","start_ms":0,"end_ms":900}"#,
+                "\n",
+                r#"{"seq":1,"source":"system","text":"乙","start_ms":1000,"end_ms":1900}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut a = para("S1", None, None, 0);
+        a.source_seqs = vec![0];
+        let mut b = para("S2", None, None, 1000);
+        b.source_seqs = vec![1];
+        write_doc(dir, vec![a, b]);
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 9.0), (100.0, 109.0)]).unwrap();
+        crate::store::align::write(dir, &map).unwrap();
+
+        let shown = load_refined_for_display(dir).unwrap();
+        let lock = NoteLock::acquire(dir).unwrap().unwrap();
+        let baseline = load_refined_locked(dir, &lock).unwrap();
+        assert_eq!(shown.paragraphs.len(), baseline.paragraphs.len());
+        for (i, (s, b)) in shown.paragraphs.iter().zip(baseline.paragraphs.iter()).enumerate() {
+            assert_eq!(s.speaker, b.speaker, "第 {i} 段在展示投影与保存基线上必须是同一段");
+            assert_eq!(s.source_seqs, b.source_seqs);
+        }
+        assert_eq!(shown.paragraphs[0].start_ms, 9000, "投影确实改了时间戳(否则本测试退化)");
+        assert_eq!(baseline.paragraphs[0].start_ms, 0, "保存基线保持磁盘原值");
     }
 
     fn write_doc(dir: &Path, paragraphs: Vec<RefinedParagraph>) {

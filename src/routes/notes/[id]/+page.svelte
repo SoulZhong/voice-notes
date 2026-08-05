@@ -6,7 +6,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
-  import { onRefine, onNoteRenamed } from "$lib/events";
+  import { onRefine, onNoteRenamed, onNoteRealigned } from "$lib/events";
   import {
     getNote,
     renameNote,
@@ -581,6 +581,24 @@
       un?.();
     };
   });
+  // 跨轨时基纠正完成:段的时间戳(以及 mic/system 的行序)在后端已换成新时基,整页重拉。
+  // 装载音轨后才算得出,故前端不会主动重拉;编辑中跳过,等编辑结束的刷新 effect 带上。
+  $effect(() => {
+    const forId = id;
+    let un: (() => void) | null = null;
+    let disposed = false;
+    onNoteRealigned((e) => {
+      if (e.note_id === forId && !editing) refresh();
+    }).then((u) => {
+      if (disposed) u();
+      else un = u;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  });
+
   // 刷新：标题重命名进行中跳过（编辑态是 effect 依赖，编辑结束会自动重跑并刷新）。
   // 原始稿/精修稿编辑器的常驻编辑态不在此处拦截——两者的数据同步 effect 各自
   // 内部靠 hasFocus() 守卫,外部刷新不会吹掉正在输入的段/段落(与精修稿同哲学)。
