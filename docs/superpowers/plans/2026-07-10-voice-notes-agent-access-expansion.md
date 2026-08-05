@@ -677,7 +677,7 @@ git commit -m "feat(cli): record 录制控制子命令(复用 UDS 桥)"
 
 Run:
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes && grep -rn "五家\|5 家\|Gemini\|claude-desktop\|接入" src/ | grep -iv "node_modules"
+cd "$(git rev-parse --show-toplevel)" && grep -rn "五家\|5 家\|Gemini\|claude-desktop\|接入" src/ | grep -iv "node_modules"
 ```
 若命中**硬编码的代理数量或写死的五家名单**(而非从后端 `status()` 渲染),把相关文案/列表改为不写死数量或补齐八家;若前端纯粹遍历后端返回的列表(无硬编码),则无需改,记录「已核对,前端由 AGENTS 驱动」。
 

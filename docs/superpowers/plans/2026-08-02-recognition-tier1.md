@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 工作目录 worktree:/Users/teemo/workspace-soul/voice-notes/.claude/worktrees/speaker-tidy。
+- 工作目录 worktree:仓库的 `.claude/worktrees/speaker-tidy`。
 - 新常量注释一律标「待评测集校准的初值」;改 `MIN_CENTROID_UPDATE_SAMPLES` 时**保留 0.6s 首轮校准的历史注释**并追加新依据。
 - 既有测试不许破坏(cargo --lib 950、vitest 176、check 0);registry 是 ASR worker 单线程热路径,不加锁不加堆分配大件。
 - 快路语义不变:同信道 raw≥0.68 命中行为与现状逐位一致。

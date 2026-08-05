@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 工作目录:`/Users/teemo/workspace-soul/voice-notes/.claude/worktrees/speaker-tidy`(worktree)。
+- 工作目录:仓库的 `.claude/worktrees/speaker-tidy`(worktree)。
 - 文案中文全角;样式用既有 token;注释中文讲约束。
 - 既有测试不破坏(vitest 173、check 0);录制中口径:换人/还原不置灰,合并置灰(busy||live)。
 - 提交 `feat(tidy):` 前缀,落款 `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`。
