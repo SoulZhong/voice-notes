@@ -15,7 +15,7 @@
 - **隐私红线**：事件属性只允许固定枚举与数值桶。禁止上报：会议内容、笔记标题、说话人名、文件路径、API key、模型接入点 ID、任何自由文本。
 - **上报绝不影响主流程**：不阻塞、不弹错、不写用户可见日志；任何失败静默。
 - git 提交信息**不加任何 Claude 署名尾注**（不加 `Co-Authored-By`、不加 "Generated with Claude Code"）。
-- Rust 测试在 `/Users/teemo/workspace-soul/voice-notes/src-tauri` 下跑 `cargo test`；前端检查在仓库根跑 `npm run check`。
+- Rust 测试在仓库的 `src-tauri/` 目录下跑 `cargo test`；前端检查在仓库根跑 `npm run check`。
 - 注释风格跟随仓库现状：中文、说明「为什么」。行号基于 commit 66c775f，动手前先用锚点文本确认位置。
 - MCP 查询类工具（list_notes/search 等）跑在独立 stdio 子进程、无 GUI 上下文，**首批不统计**；`mcp_tool_used` 只覆盖经 UDS 分发的 6 个控制面 op（status/live/start/stop/pause/resume）。
 

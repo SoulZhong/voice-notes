@@ -25,7 +25,7 @@
 - [ ] **Step 1: 从 master 切特性分支**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git checkout master && git pull --ff-only
 git checkout -b p5-backlog-hardening
 ```

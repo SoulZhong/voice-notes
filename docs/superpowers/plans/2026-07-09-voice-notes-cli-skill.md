@@ -19,7 +19,7 @@
 - 悬空 flag(有 flag 无值)必须报用法错,不得静默兜底(mod.rs parse_agent 的既有裁决)。
 - 单测涉及 VN_APP_DATA 的,持 `crate::mcp::ENV_VAR_LOCK`(bridge.rs tests 已有同款用法,照抄其获取方式)。
 - Skill 自愈:仅"已安装+受管标记+内容 stale"时重写;无标记(用户自建)绝不覆盖。显式 `skill install` 则总是覆盖(用户主动操作)。
-- 工作目录仓库根 /Users/teemo/workspace-soul/voice-notes;cargo 在 `src-tauri/`。
+- 工作目录为仓库根目录;cargo 在 `src-tauri/`。
 - 分支:继续在 `mcp-service` 上提交。
 
 ## File Structure

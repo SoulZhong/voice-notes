@@ -53,7 +53,7 @@
 - [ ] **Step 1: 建分支并带入设计文档**
 
 ```bash
-cd /Users/teemo/workspace-soul/voice-notes
+cd "$(git rev-parse --show-toplevel)"
 git checkout -b feature/speaker-tidy-redesign master
 git merge --no-edit docs/speaker-tidy-redesign
 ```

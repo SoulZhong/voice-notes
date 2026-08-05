@@ -19,7 +19,7 @@
 - 所有 Rust 测试命令在 `src-tauri/` 目录下执行:`cargo test <name>`(首次构建含 sherpa 链接,较慢,属正常)。
 - settings.json 新字段必须 `#[serde(default)]` 且旧文件可解析(仓库既有约定)。
 - 应用 identifier 固定 `com.teemo.voice-notes`(tauri.conf.json 真值);MCP 注册条目 args 固定 `["mcp","serve"]`。
-- 文件路径均相对仓库根 `/Users/teemo/workspace-soul/voice-notes`。
+- 文件路径均相对仓库根目录。
 
 ## File Structure(全景)
 
