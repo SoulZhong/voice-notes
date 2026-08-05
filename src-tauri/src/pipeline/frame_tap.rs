@@ -21,6 +21,89 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 时钟核对的默认评估窗。见 `TapPolicy::rate_eval_window`。
+const RATE_EVAL_WINDOW: Duration = Duration::from_secs(30);
+/// 快窗:粗偏差(>RATE_FAST_TOLERANCE)不必等满窗,5 秒就下手。
+///
+/// 为什么要有它:检测期间的内容**已经按错的率发下去了**,补齐只能把之后的内容摆正,
+/// 补不回窗内那段的相位。窗内残余 = 窗长 × 偏差,44.1k 被当 48k 时满窗要留 2.44s
+/// 残余(整段听得见重影),快窗把它压到 0.44s。彻底消掉需要缓冲整个窗再放行,那会给
+/// 实时转写加同样长的启动延迟,不划算——粗偏差正是伤害最大、又最容易在 5 秒内认定的
+/// 那一类,细偏差(1~3%)每秒只错开几十毫秒,等满窗拿更稳的估计更值。
+const RATE_FAST_WINDOW: Duration = Duration::from_secs(5);
+/// 快窗判定用的容差。远高于 RATE_TOLERANCE:5 秒窗的测量噪声更大,只用来抓
+/// "采样率整个记错了"这种量级(实测那场是 8.8%),不抓晶振失配那种细活。
+const RATE_FAST_TOLERANCE: f64 = 0.03;
+/// 相位还款窗:检测期间累计的错位在这么长的后续时间里**线性**还清。
+const PHASE_TRIM_SECS: f64 = 60.0;
+/// 还款时单帧最多把采样率拧动多少(2%,约 35 音分,连续语音上听不出来)。
+/// 它只是上限;实际速率由「剩余债务 / 剩余时间」定,通常远低于此。
+const PHASE_TRIM_MAX: f64 = 0.02;
+/// 债务小于此值即视为还清(半毫秒,远低于任何听感与门控阈值)。
+const PHASE_TRIM_EPS: f64 = 0.000_5;
+
+/// 还款期内**恒定**的目标采样率:债务确定时一次算定,直到还清都不再变。
+///
+/// 恒定是硬要求,不只是简洁:下游 `segment_worker` 一见 `sample_rate` 变化就重建
+/// `StreamResampler`,而那个重采样器的全部意义就是跨块保持相位与全局样本计数
+/// (见其文档:逐块重建会注入 ~0.2% 的时钟漂移)。逐帧按当前债务重算速率会在 60s
+/// 内产生上百次不同的整数率、即上百次重建,等于把它设计要解决的问题又造回来。
+/// 一次算定则整个还款期只有两三次变率。
+///
+/// 恒定率同时天然是线性还款:每秒还固定的量,窗内正好还清。逐帧重算才会退化成
+/// 指数衰减(d(debt)/dt = -debt/T,一个窗过完仍剩 1/e)。
+///
+/// 残留代价:每次变率仍会让下游重建一次重采样器,丢掉不足一个样本的相位与计数余数
+/// (~20µs)。整段还款只变两三次,合计几十微秒,远在听感与门控阈值之下,故不再为此
+/// 去改 StreamResampler 的相位表示——那需要把它从"全局计数"改成"显式相位",
+/// 收益与风险不成比例。
+fn phase_trim_rate(debt: f64, window: f64, base_rate: u32, max: f64) -> u32 {
+    let base = base_rate as f64;
+    let k = (debt / window.max(1e-3)).clamp(-max, max);
+    let target = base * (1.0 + k);
+    // 取整避开 round:债务小到 k·base<0.5Hz 时 round 会把率原样还回来,还款额恒 0。
+    (if k > 0.0 { target.ceil() } else { target.floor() }).max(1.0) as u32
+}
+
+/// 本帧还款:返回 (本帧该盖的采样率, 实际还掉的秒数)。
+///
+/// 常规帧直接用恒定的 `held`;只有**最后一帧**——按 held 还款会超过剩余债务时——
+/// 才反解一个不过冲的整数率。不能只把账面 `repaid` 截断到 debt 而仍盖 held:
+/// 下游与 `forwarded` 都按盖上去的率算时长,截断账面等于债务清零了、真实时间轴却
+/// 已经过冲。10ms 帧上这点差是几十微秒,但断流恢复后的突发帧(可达上百毫秒)会把它
+/// 放大成可闻错位。
+fn phase_trim_step(debt: f64, held: u32, base_rate: u32, per_channel: usize) -> (u32, f64) {
+    let (base, per) = (base_rate as f64, per_channel as f64);
+    let full = per / base - per / held as f64;
+    if full.abs() <= debt.abs() {
+        return (held, full);
+    }
+    // 反解 per/base - per/r = debt,并朝"还不足"的一侧取整,保证不过冲。
+    let denom = per / base - debt;
+    if denom <= 0.0 {
+        return (base_rate, 0.0); // 数值退化:本帧不还,留给下一帧
+    }
+    let exact = per / denom;
+    let r = (if debt > 0.0 { exact.floor() } else { exact.ceil() }).max(1.0);
+    let repaid = per / base - per / r;
+    if repaid.abs() > debt.abs() {
+        return (base_rate, 0.0); // 仍会过冲则不还,宁可留着
+    }
+    (r as u32, repaid)
+}
+
+/// 实测速率与当前生效采样率相差多少才改写(1%)。
+///
+/// 下界由测量噪声定:30s 窗内帧到达抖动 ±20ms 只带来 ~0.07% 误差,1% 有充足余量,
+/// 不会追着噪声抖。上界由危害定:1% 即每分钟错位 0.6s,一小时的会能拉开 36s,
+/// 必须拦下。真正的设备晶振失配在 100ppm 量级(0.01%),落在容差内不动它——那种
+/// 量级 AEC 自己能跟上,而按噪声去改写反而有害。
+const RATE_TOLERANCE: f64 = 0.01;
+/// 实测速率相对声明值的合理性夹板。落在此范围外的偏差不可能是"声明的率写错了"
+/// (设备不会差一倍以上),而是丢帧/缓冲回吐之类的别的故障,改写采样率只会把时间轴
+/// 推得更歪——这时保留声明值并留日志。
+const RATE_SANITY: (f64, f64) = (0.5, 2.0);
+
 /// 每源健康计数(原子字段,tap 线程写、查询命令读,无锁)。
 #[derive(Default)]
 pub struct SourceHealth {
@@ -32,6 +115,8 @@ pub struct SourceHealth {
     pub silence_ms: AtomicU64,
     /// 采集重启次数(由 ResilientCapture 递增,tap 不写)。
     pub restarts: AtomicU32,
+    /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
+    pub rate_fixes: AtomicU32,
 }
 
 /// 健康快照(pipeline_health 命令的序列化单元)。
@@ -43,6 +128,7 @@ pub struct HealthSnapshot {
     pub gaps: u32,
     pub silence_ms: u64,
     pub restarts: u32,
+    pub rate_fixes: u32,
 }
 
 impl SourceHealth {
@@ -54,6 +140,7 @@ impl SourceHealth {
             gaps: self.gaps.load(Ordering::Relaxed),
             silence_ms: self.silence_ms.load(Ordering::Relaxed),
             restarts: self.restarts.load(Ordering::Relaxed),
+            rate_fixes: self.rate_fixes.load(Ordering::Relaxed),
         }
     }
 }
@@ -73,6 +160,16 @@ pub struct TapPolicy {
     pub stall_after: Option<Duration>,
     /// recv 超时步长,亦即每轮补零的粒度上限。
     pub tick: Duration,
+    /// 时钟核对的评估窗:累计到这么久的「连续出帧时间」才做一次实测速率判定。
+    /// 越长越稳(抖动被平均掉)、越迟钝;30s 下调度抖动带来的误差约 0.1%,远低于
+    /// RATE_TOLERANCE,又能在半分钟内追上设备换率。
+    pub rate_eval_window: Duration,
+    /// 快窗:粗偏差不等满窗,累计到这么久就判一次(阈值 RATE_FAST_TOLERANCE)。
+    pub rate_fast_window: Duration,
+    /// 相位还款:把检测期累计的错位摊到多长时间里还清,以及单帧最多拧动多少采样率。
+    /// 生产取 60s/2%(听不出);测试可缩短以在秒级内跑完同一段收敛逻辑。
+    pub phase_trim_window: Duration,
+    pub phase_trim_max: f64,
 }
 
 impl TapPolicy {
@@ -81,6 +178,10 @@ impl TapPolicy {
             fill_after: Duration::from_millis(500),
             stall_after: Some(Duration::from_secs(3)),
             tick: Duration::from_millis(100),
+            rate_eval_window: RATE_EVAL_WINDOW,
+            rate_fast_window: RATE_FAST_WINDOW,
+            phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
+            phase_trim_max: PHASE_TRIM_MAX,
         }
     }
     #[cfg(target_os = "macos")]
@@ -91,6 +192,10 @@ impl TapPolicy {
             // 阈值比 mic 宽:SCK 偶发调度毛刺比 cpal 常见,宁慢勿误杀。
             stall_after: Some(Duration::from_secs(5)),
             tick: Duration::from_millis(100),
+            rate_eval_window: RATE_EVAL_WINDOW,
+            rate_fast_window: RATE_FAST_WINDOW,
+            phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
+            phase_trim_max: PHASE_TRIM_MAX,
         }
     }
     #[cfg(windows)]
@@ -99,6 +204,10 @@ impl TapPolicy {
             fill_after: Duration::from_millis(250),
             stall_after: None,
             tick: Duration::from_millis(100),
+            rate_eval_window: RATE_EVAL_WINDOW,
+            rate_fast_window: RATE_FAST_WINDOW,
+            phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
+            phase_trim_max: PHASE_TRIM_MAX,
         }
     }
 }
@@ -181,16 +290,53 @@ pub fn run_frame_tap(
     // 填零会凭空造出一条空白轨)。
     let mut last_format: Option<(u32, u16)> = None;
     let mut last_frame_at = Instant::now();
-    // 已填充到的时间点(≥ last_frame_at):每轮只补 [filled_until, now] 的差量,
-    // 断流恢复后设备从"现在"重新出帧,重叠误差上限为一个 tick,可接受。
-    let mut filled_until = Instant::now();
+    // 时钟核对:源声明的采样率只是它「自称」的,必须拿实际出样速率复核。
+    //
+    // 断流填充只对付「不出帧」,对付不了「一直出帧但每秒样本数不够」——后者永远不会
+    // 让 recv_timeout 超时,填充分支根本不执行,该轨时间轴就对墙钟线性漂移下去。
+    // 2026-08-04 实锤:一场 30 分钟的笔记,mic 在进程中止重启后声明 48kHz、实测约
+    // 44kHz,轨长比墙钟短 148s;两轨都按 offset 0 铺进混音,同一句话在两轨相隔从 0
+    // 一路拉到两分半各响一次,听感就是"每句话说两遍、间隔越来越大"。软件 AEC 也在
+    // 同一时刻脱锁(AEC3 的延迟估计只容忍 <100ppm,这里是 ~90000ppm)。
+    //
+    // 改写下游帧的 sample_rate 而不是补零:少的样本不是"没出声",是被按错误的率折算
+    // 掉了。把率改对,重采样器(segment_worker 见率变即重建)自然把时长与音高一并复位;
+    // 补零只会在正常语音里插静音,把内容也弄坏。
+    let mut applied_rate: Option<u32> = None;
+    let mut clock_span = Duration::ZERO;
+    let mut clock_samples: u64 = 0;
+    // 相位债务(秒,带符号):检测期间按错的率发出去的时长与墙钟的差。
+    // 正 = 发多了(实际率高于声明),负 = 发少了。改率只止住继续发散,这笔账要单独还。
+    //
+    // 为什么用"微调采样率慢慢还"而不是补零/丢样本:补零只能还负债(反方向根本补不了,
+    // 会留下一个横贯全场的固定错位——快窗下 0.44s,恰好在门控 400ms 回看窗之外、又够
+    // 不上回放对齐 2s 的门限,于是整场重影);丢样本要扔掉真实语音。把债摊到
+    // PHASE_TRIM_SECS 上只需拧动零点几个百分点的采样率,两个方向都能还,内容一个不丢,
+    // 音高变化远在可闻阈值之下。
+    let mut phase_debt: f64 = 0.0;
+    // 还款期内恒定的目标率(见 phase_trim_rate:下游按率变化重建重采样器,必须少变)。
+    let mut phase_rate: Option<u32> = None;
+    let mut settle_debt = false;
+    // 时间轴锚点(首个真实帧到达时刻)与"已向下游转发的音频总时长"(真实帧 + 补零)。
+    //
+    // 为什么记总量而不是「补到某个时刻」:断流期补零、设备恢复后又把断流期缓冲的
+    // 音频整批吐出来(蓝牙 mic 常态),同一段墙钟时间就被计了两遍,该轨时间轴凭空
+    // 变长。2026-08-04 实锤:一场墙钟 1998s 的笔记,mic 轨长 2712s(system 1964s),
+    // 多出的 ~683s 全是零串;后果是显示时长/播放进度/双轨时间戳全偏,回放里 mic
+    // 与 system 的同一句话被拉开成两处。
+    //
+    // 改成对齐总量后,补零量恒为 max(0, 墙钟 - 已转发),转发总时长的上界就是
+    // 「墙钟 + 一次突发的量」:突发把总量顶到墙钟之前不再补零,自动把超发吃回去,
+    // 误差不再累积。
+    let mut anchor: Option<Instant> = None;
+    let mut forwarded = Duration::ZERO;
     // 本次断流是否已计 gap / 已报 stall(去抖:恢复前不重复)。
     let mut gap_counted = false;
     let mut stalled = false;
 
     loop {
         match from_capture.recv_timeout(policy.tick) {
-            Ok(frame) => {
+            Ok(mut frame) => {
                 if stalled {
                     if let Some(cb) = &notify.on_recover {
                         cb();
@@ -198,9 +344,117 @@ pub fn run_frame_tap(
                 }
                 stalled = false;
                 gap_counted = false;
+                let now = Instant::now();
+                let gap = now.duration_since(last_frame_at);
+                let first = anchor.is_none();
+                // 设备中途换率(拔插耳机/切设备)是正当的断点:声明变了就丢弃旧的实测
+                // 结论,按新声明值从头核对,不把上一只设备的速率套到下一只头上。
+                if !first && last_format != Some((frame.sample_rate, frame.channels)) {
+                    applied_rate = None;
+                    clock_span = Duration::ZERO;
+                    clock_samples = 0;
+                }
                 last_format = Some((frame.sample_rate, frame.channels));
-                last_frame_at = Instant::now();
-                filled_until = last_frame_at;
+                last_frame_at = now;
+                anchor.get_or_insert(now);
+                // 交错多声道:每声道样本数才是时长。rate 为 0 的畸形帧按不计时长处理
+                // (下游重采样器同样处理不了,这里只保证不 panic/不污染时间轴)。
+                let per_channel = frame.samples.len() / frame.channels.max(1) as usize;
+                if frame.sample_rate > 0 {
+                    // 只统计「连续出帧」的时间:断流本身以及紧随其后的一次缓冲回吐
+                    // (蓝牙 mic 常态)会让瞬时速率忽低忽高,计进去就是把噪声当信号。
+                    if !first && gap < policy.fill_after {
+                        clock_span += gap;
+                        clock_samples += per_channel as u64;
+                    } else {
+                        clock_span = Duration::ZERO;
+                        clock_samples = 0;
+                    }
+                    // 两级判定:快窗只抓粗偏差(伤害最大、5 秒就能认定),满窗抓细偏差。
+                    // 快窗未超粗容差时**不清零**,让统计继续攒到满窗再用更稳的估计判一次。
+                    let due_full = clock_span >= policy.rate_eval_window;
+                    let due_fast = clock_span >= policy.rate_fast_window;
+                    if (due_full || due_fast) && clock_samples > 0 {
+                        let observed = clock_samples as f64 / clock_span.as_secs_f64();
+                        let declared = frame.sample_rate as f64;
+                        let effective = applied_rate.unwrap_or(frame.sample_rate) as f64;
+                        let tol = if due_full { RATE_TOLERANCE } else { RATE_FAST_TOLERANCE };
+                        let over = (observed / effective - 1.0).abs() > tol;
+                        if !over && !due_full {
+                            // 快窗内没看出粗问题:攒着,等满窗。
+                        } else if observed >= declared * RATE_SANITY.0
+                            && observed <= declared * RATE_SANITY.1
+                        {
+                            if over {
+                                eprintln!(
+                                    "采集时钟核对: 声明 {declared:.0}Hz 实测 {observed:.0}Hz\
+                                     (差 {:+.1}%),按实测改写下游采样率",
+                                    (observed / declared - 1.0) * 100.0
+                                );
+                                applied_rate = Some(observed.round() as u32);
+                                health.rate_fixes.fetch_add(1, Ordering::Relaxed);
+                                settle_debt = true;
+                            }
+                        } else {
+                            eprintln!(
+                                "采集时钟核对: 实测 {observed:.0}Hz 与声明 {declared:.0}Hz \
+                                 相差过大(非采样率问题),不改写"
+                            );
+                        }
+                        // 只有真判过一轮才重开统计;快窗放过的那次要接着攒到满窗,
+                        // 否则统计永远停在快窗长度,细偏差再也攒不到满窗、判不出来。
+                        if over || due_full {
+                            clock_span = Duration::ZERO;
+                            clock_samples = 0;
+                        }
+                    }
+                }
+                // 改写后再记时长:forwarded 要反映下游将如何解释这批样本。
+                if let Some(rate) = applied_rate {
+                    frame.sample_rate = rate;
+                }
+                // 刚判出新速率:把检测期间攒下的相位差记成债务(带符号,两个方向都记)。
+                if settle_debt {
+                    settle_debt = false;
+                    if let Some(anchor) = anchor {
+                        phase_debt =
+                            forwarded.as_secs_f64() - anchor.elapsed().as_secs_f64();
+                        if phase_debt.abs() > PHASE_TRIM_EPS {
+                            eprintln!(
+                                "采集时钟核对: 检测期间累计相位差 {:+.2}s,按 {:.0}% 上限\
+                                 微调采样率摊还",
+                                phase_debt,
+                                policy.phase_trim_max * 100.0
+                            );
+                        }
+                    }
+                }
+                // 还款:把采样率往债务的反方向拧一点点,下游据此多算/少算一点时长,
+                // forwarded 就平滑地追上墙钟。债清了立刻停手,恢复实测速率。
+                if frame.sample_rate > 0 && phase_debt.abs() > PHASE_TRIM_EPS {
+                    let base = frame.sample_rate;
+                    let held = *phase_rate.get_or_insert_with(|| {
+                        phase_trim_rate(
+                            phase_debt,
+                            policy.phase_trim_window.as_secs_f64(),
+                            base,
+                            policy.phase_trim_max,
+                        )
+                    });
+                    let (rate, repaid) = phase_trim_step(phase_debt, held, base, per_channel);
+                    phase_debt -= repaid;
+                    frame.sample_rate = rate;
+                    if phase_debt.abs() <= PHASE_TRIM_EPS {
+                        phase_rate = None; // 还清,下一帧恢复实测率
+                    }
+                } else {
+                    phase_rate = None;
+                }
+                if frame.sample_rate > 0 {
+                    forwarded += Duration::from_secs_f64(
+                        per_channel as f64 / frame.sample_rate as f64,
+                    );
+                }
                 health.frames.fetch_add(1, Ordering::Relaxed);
                 health.samples.fetch_add(frame.samples.len() as u64, Ordering::Relaxed);
                 if to_worker.send(frame).is_err() {
@@ -208,9 +462,11 @@ pub fn run_frame_tap(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                let Some((rate, channels)) = last_format else {
+                let Some((declared, channels)) = last_format else {
                     continue;
                 };
+                // 补零也走改写后的率:下游按同一个率解释真实帧与零帧,时间轴才自洽。
+                let rate = applied_rate.unwrap_or(declared);
                 let drought = last_frame_at.elapsed();
                 if drought < policy.fill_after {
                     continue;
@@ -229,13 +485,19 @@ pub fn run_frame_tap(
                         }
                     }
                 }
-                // 差量补零:样本数按墙钟差与采样率精确折算,交错声道等比放大。
-                let deficit = filled_until.elapsed();
+                // 差量补零:补到「已转发总时长 == 墙钟」为止,交错声道等比放大。
+                // 已转发量领先墙钟(设备刚吐过突发缓冲)时 deficit 为 0——本轮不补,
+                // 让超发自然被墙钟追平,不再累积。
+                let Some(anchor) = anchor else { continue };
+                let deficit = anchor.elapsed().saturating_sub(forwarded);
                 let frames_n = (deficit.as_secs_f64() * rate as f64) as usize;
                 if frames_n == 0 {
                     continue;
                 }
-                filled_until += Duration::from_secs_f64(frames_n as f64 / rate as f64);
+                forwarded += Duration::from_secs_f64(frames_n as f64 / rate as f64);
+                // 断流补零同样在改 forwarded,若不把债务重算成"当前真实残差",还款
+                // 会把已经被补零抹平的那部分再还一遍,反向拧过头。
+                phase_debt = forwarded.as_secs_f64() - anchor.elapsed().as_secs_f64();
                 health
                     .silence_ms
                     .fetch_add((frames_n as u64 * 1000) / rate as u64, Ordering::Relaxed);
@@ -267,7 +529,435 @@ mod tests {
             fill_after: Duration::from_millis(50),
             stall_after: Some(Duration::from_millis(120)),
             tick: Duration::from_millis(10),
+            // 默认给足够大的评估窗:除时钟核对本身的用例外,其它用例都不该被它波及。
+            rate_eval_window: Duration::from_secs(3600),
+            rate_fast_window: Duration::from_secs(3600),
+            // 还款窗按比例缩短:秒级用例里跑完与生产同一段收敛逻辑。
+            phase_trim_window: Duration::from_millis(200),
+            phase_trim_max: 0.5,
         }
+    }
+
+    /// 墙钟喂帧类用例的策略:fill_after 放宽到 500ms。
+    ///
+    /// 这类用例靠 10ms sleep 驱动,而 fast_policy 的 fill_after 只有 50ms——机器一忙
+    /// (全量并行、旁边在跑构建)一次超时的 sleep 就会被判成断流,把时钟统计清零,
+    /// 速率判定随之推迟或不发生。表现是"单独跑全过、全量跑偶发红",查起来很费劲。
+    /// 它们测的都不是断流,放宽即可。
+    fn wallclock_policy() -> TapPolicy {
+        TapPolicy { fill_after: Duration::from_millis(500), ..fast_policy() }
+    }
+
+    /// 以真实墙钟折算样本数喂帧:实际投喂速率恒为 `true_rate`,不受调度抖动影响
+    /// (若按固定样本数定时发,睡眠抖动会直接变成速率误差,断言就没法收紧)。
+    fn feed_at_rate(
+        ctx: &Sender<AudioFrame>,
+        declared: u32,
+        true_rate: f64,
+        dur: Duration,
+    ) -> Duration {
+        let t0 = Instant::now();
+        let mut sent = 0u64;
+        let mut worst_gap = Duration::ZERO;
+        let mut last = Instant::now();
+        while t0.elapsed() < dur {
+            std::thread::sleep(Duration::from_millis(10));
+            worst_gap = worst_gap.max(last.elapsed());
+            last = Instant::now();
+            let want = (t0.elapsed().as_secs_f64() * true_rate) as u64;
+            let n = want.saturating_sub(sent) as usize;
+            if n == 0 {
+                continue;
+            }
+            if ctx
+                .send(AudioFrame { samples: vec![0.2; n], sample_rate: declared, channels: 1 })
+                .is_err()
+            {
+                break;
+            }
+            sent = want;
+        }
+        worst_gap
+    }
+
+    /// 机器被压满时 10ms 的 sleep 能超时几百毫秒,墙钟驱动的用例就失去计时基准
+    /// (超过 fill_after 会被判成断流、清零时钟统计)。这时如实跳过计时断言并说明,
+    /// 而不是把阈值放宽到测不出问题——控制器本身的数学另有确定性仿真覆盖。
+    fn timing_sound(worst_gap: Duration, policy: &TapPolicy) -> bool {
+        if worst_gap >= policy.fill_after {
+            eprintln!(
+                "跳过计时断言:调度超时 {:?} ≥ fill_after {:?},本次计时基准不可信",
+                worst_gap, policy.fill_after
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 源一直出帧、但每秒样本数与它声明的采样率不符时,tap 必须按实测速率改写下游帧
+    /// 的 sample_rate。这是「回放里同一句话说两遍、间隔越拉越大」的根:断流填充只
+    /// 管"不出帧",管不了"出得不够快",后者永远不触发超时分支,时间轴就一路漂。
+    /// 2026-08-04 实锤见 run_frame_tap 内注释。
+    #[test]
+    fn corrects_source_that_lies_about_its_sample_rate() {
+        const DECLARED: u32 = 48_000;
+        const TRUE_RATE: f64 = 32_000.0; // 2/3 的谎报:远超容差,又在合理性夹板内
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        // 本用例只验"速率判定",把还款关掉(phase_trim_max=0):还款期间盖的率是
+        // 刻意偏离实测率的,混进来会让"末帧==实测率"这条断言测的东西不再单一。
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            phase_trim_max: 0.0,
+            ..wallclock_policy()
+        };
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        let gap = feed_at_rate(&ctx, DECLARED, TRUE_RATE, Duration::from_millis(600));
+        drop(ctx);
+        t.join().unwrap();
+
+        let got: Vec<AudioFrame> = wrx.try_iter().collect();
+        assert!(got.len() > 10, "应转发多帧: {}", got.len());
+        assert_eq!(got[0].sample_rate, DECLARED, "评估窗满之前不得改写");
+        if !timing_sound(gap, &policy) {
+            return;
+        }
+        let last = got.last().unwrap().sample_rate as f64;
+        assert!(
+            (last - TRUE_RATE).abs() / TRUE_RATE < 0.05,
+            "末帧应被改写为实测速率 ≈{TRUE_RATE},实得 {last}"
+        );
+        assert!(health.rate_fixes.load(Ordering::Relaxed) >= 1, "应记一次改写");
+    }
+
+    /// 按**生产参数**(60s 窗 / 2% 上限)确定性仿真还款:无线程、无 sleep,逐帧调
+    /// 纯函数,断言债务在窗内线性归零、不过冲、且**下游看到的采样率种类极少**。
+    ///
+    /// 这条锁死四个曾经真实发生的缺陷:①按"债务/总窗长"逐帧重算是指数衰减而非按期
+    /// 还清(60s 窗过完 +442ms 仍剩 163ms=1/e);②采样率取整用 round 时,债务小到
+    /// k·base<0.5Hz 就再也还不动,永远卡在 ~0.65ms;③逐帧变率会让 segment_worker
+    /// 反复重建 StreamResampler(实测约 138 次/60s),把那个重采样器要解决的跨块相位
+    /// 问题又造回来;④末帧只截断账面 repaid 却仍盖原率,债务清零而真实时间轴已过冲。
+    /// 缩小参数的仿真测不出这些,必须按生产参数跑。
+    #[test]
+    fn repays_phase_debt_linearly_at_production_parameters() {
+        const BASE: u32 = 48_000;
+        const FRAME_MS: f64 = 10.0;
+        let per = (BASE as f64 * FRAME_MS / 1000.0) as usize;
+        // +442ms 是"实际 48k/声明 44.1k"在 5s 快窗下的多发量;-406ms 是反向欠发量。
+        for start in [0.442f64, -0.406] {
+            let mut debt = start;
+            let mut t = 0.0f64;
+            let mut at_window = None;
+            let mut halfway = None;
+            let mut cleared_at = None;
+            let mut rates = std::collections::BTreeSet::new();
+            let held = phase_trim_rate(debt, PHASE_TRIM_SECS, BASE, PHASE_TRIM_MAX);
+            // 恒定率的拧动幅度必须在听感上限内
+            let k = (held as f64 - BASE as f64) / BASE as f64;
+            assert!(k.abs() <= PHASE_TRIM_MAX + 1e-9, "start={start}: 拧动 {k:.4} 超上限");
+            // debt>0 = 已多发时长 → 要少算,采样率要**调高**(per/rate 变小),故同号。
+            assert_eq!(k.signum(), start.signum(), "start={start}: 拧动方向错");
+
+            while t < PHASE_TRIM_SECS * 1.5 {
+                if debt.abs() <= PHASE_TRIM_EPS {
+                    cleared_at.get_or_insert(t);
+                    break;
+                }
+                let (rate, repaid) = phase_trim_step(debt, held, BASE, per);
+                rates.insert(rate);
+                assert!(
+                    repaid.abs() <= debt.abs() + 1e-12,
+                    "start={start} t={t:.1}: 还款过冲(debt={debt:.9} repaid={repaid:.9})"
+                );
+                assert!(
+                    repaid == 0.0 || repaid.signum() == debt.signum(),
+                    "start={start} t={t:.1}: 还款方向错了"
+                );
+                debt -= repaid;
+                t += FRAME_MS / 1000.0;
+                if halfway.is_none() && t >= PHASE_TRIM_SECS / 2.0 {
+                    halfway = Some(debt);
+                }
+                if at_window.is_none() && t >= PHASE_TRIM_SECS {
+                    at_window = Some(debt);
+                }
+            }
+
+            // 下游每见一个新率就重建一次 StreamResampler;整段还款只该有恒定率
+            // (+ 末帧可能一个不过冲的收尾率)。逐帧重算的旧实现在这里是上百种。
+            assert!(
+                rates.len() <= 2,
+                "start={start}: 还款期内下游只应看到 1~2 种采样率,实得 {} 种",
+                rates.len()
+            );
+            // 半程应剩约一半(线性);指数衰减在此处会剩 1/√e ≈ 61%
+            let mid = halfway.unwrap_or(0.0).abs() / start.abs();
+            assert!(
+                (0.35..=0.60).contains(&mid),
+                "start={start}: 半程应剩约一半(线性),实剩 {:.0}%",
+                mid * 100.0
+            );
+            // 窗末残余:与旧实现最直接的对照(指数衰减在此处剩 37%)
+            let left = at_window.map(|d| d.abs()).unwrap_or(0.0) / start.abs();
+            assert!(
+                left < 0.05,
+                "start={start}: 窗末残余应 <5%(旧指数衰减是 37%),实剩 {:.1}%",
+                left * 100.0
+            );
+            let cleared = cleared_at.unwrap_or(f64::INFINITY);
+            assert!(
+                cleared <= PHASE_TRIM_SECS * 1.05,
+                "start={start}: 应在窗长的 105% 内清零,实际 {cleared:.1}s(残余 {debt:.9}s)"
+            );
+        }
+    }
+
+    /// 突发帧(断流恢复后设备整批回吐)不得因"只截断账面"而让真实时间轴过冲:
+    /// 盖上去的率必须自身就还不过头。
+    #[test]
+    fn phase_trim_never_overshoots_even_on_a_burst_frame() {
+        const BASE: u32 = 48_000;
+        let held = phase_trim_rate(0.4, PHASE_TRIM_SECS, BASE, PHASE_TRIM_MAX);
+        // 剩 1ms 债务,却来了一帧 1 秒的突发音频
+        let debt = 0.001;
+        let per = BASE as usize; // 1s
+        let (rate, repaid) = phase_trim_step(debt, held, BASE, per);
+        assert!(repaid <= debt + 1e-12, "账面不得过冲: {repaid}");
+        // 关键:按**返回的率**算出的真实时长差同样不得过冲
+        let actual = per as f64 / BASE as f64 - per as f64 / rate as f64;
+        assert!(
+            actual <= debt + 1e-9,
+            "真实时长差 {actual:.9}s 不得超过剩余债务 {debt:.9}s(率 {rate})"
+        );
+    }
+
+    /// 内容锚点:在墙钟已知时刻埋一个满幅脉冲    /// 内容锚点:在墙钟已知时刻埋一个满幅脉冲,检查它在**下游时间轴上的位置**。
+    ///
+    /// 只对总样本量做断言是不够的——总长对上了不代表内容摆对了位置(补齐能把总长凑齐,
+    /// 却可能把内容整体推偏)。这里直接量相位:脉冲在逻辑时间轴上的位置必须等于它被
+    /// 喂进来时的墙钟时刻。两个速率方向都测。
+    #[test]
+    fn marker_lands_at_its_wall_clock_position_in_both_rate_directions() {
+        const DECLARED: u32 = 48_000;
+        for true_rate in [32_000.0f64, 64_000.0] {
+            let (ctx, crx) = crossbeam_channel::unbounded();
+            let (wtx, wrx) = crossbeam_channel::unbounded();
+            let health = Arc::new(SourceHealth::default());
+            // 快窗 150ms:脉冲埋在它之后,量的是"纠正生效后的内容位置"。
+            // 还款窗 150ms、上限 50%:相位差在几百毫秒内还清,断言才能收紧到 15ms
+            // ——旧版把容差放到 60ms、而残差恰好 50ms,那样的"通过"证明不了任何事。
+            let policy = TapPolicy {
+                rate_fast_window: Duration::from_millis(150),
+                rate_eval_window: Duration::from_secs(3600),
+                phase_trim_window: Duration::from_millis(150),
+                phase_trim_max: 0.5,
+                // fill_after 放宽到 500ms:本用例不测断流,而 fast_policy 的 50ms 会让
+                // 负载下一次超时的 sleep 被当成断流、把时钟统计清零,检测被推到脉冲
+                // 之后 —— 表现为间歇性失败。放宽后调度抖动不再影响判定时刻。
+                fill_after: Duration::from_millis(500),
+                ..fast_policy()
+            };
+            let t = std::thread::spawn(move || {
+                run_frame_tap(Source::Mic, crx, wtx, health, policy, TapNotify::none())
+            });
+
+            // 时间原点必须与下游一致:下游的 logical 从**首帧**起算,若 mark 的墙钟
+            // 从 t0 起算,首帧之前那次 sleep 与调度延迟(~10ms 且随负载浮动)会直接
+            // 计入误差——这正是此前偶发失败的成因(实测捕到 0.696s 对 0.712s)。
+            // 故记下首帧真正发出的时刻,并以它为原点度量 mark。
+            let mark_at = Duration::from_millis(700);
+            let t0 = Instant::now();
+            let mut worst_gap = Duration::ZERO;
+            let mut last = Instant::now();
+            let mut sent = 0u64;
+            let mut first_sent: Option<Instant> = None;
+            let mut marked = false;
+            let mut mark_wall = 0.0f64;
+            while t0.elapsed() < Duration::from_millis(1100) {
+                std::thread::sleep(Duration::from_millis(10));
+                worst_gap = worst_gap.max(last.elapsed());
+                last = Instant::now();
+                let el = t0.elapsed();
+                let want = (el.as_secs_f64() * true_rate) as u64;
+                let n = want.saturating_sub(sent) as usize;
+                if n == 0 {
+                    continue;
+                }
+                let mut samples = vec![0.2f32; n];
+                let now = Instant::now();
+                if !marked && el >= mark_at {
+                    samples[0] = 1.0; // 满幅脉冲,与 0.2 的底噪拉开
+                    marked = true;
+                    // 以首帧为原点;脉冲是本帧第 0 个样本,即本帧起点。
+                    mark_wall = now.duration_since(first_sent.unwrap_or(now)).as_secs_f64();
+                }
+                ctx.send(AudioFrame { samples, sample_rate: DECLARED, channels: 1 }).unwrap();
+                first_sent.get_or_insert(now);
+                sent = want;
+            }
+            drop(ctx);
+            t.join().unwrap();
+            assert!(marked, "脉冲应已喂出");
+            if !timing_sound(worst_gap, &policy) {
+                continue;
+            }
+
+            // 沿下游时间轴累加,找脉冲落在第几秒。
+            let mut logical = 0.0f64;
+            let mut mark_logical = None;
+            for f in wrx.try_iter() {
+                let per = f.samples.len() / f.channels.max(1) as usize;
+                if mark_logical.is_none() {
+                    if let Some(i) = f.samples.iter().position(|s| *s > 0.9) {
+                        mark_logical = Some(logical + i as f64 / f.sample_rate as f64);
+                    }
+                }
+                logical += per as f64 / f.sample_rate as f64;
+            }
+            let got = mark_logical.expect("下游应能找到脉冲");
+            assert!(
+                (got - mark_wall).abs() < 0.015,
+                "true_rate={true_rate}: 脉冲逻辑位置 {got:.3}s 应贴合墙钟 {mark_wall:.3}s"
+            );
+        }
+    }
+
+    /// 端到端:谎报采样率的源,**最终写出的音频总时长必须等于墙钟**。
+    ///
+    /// 只断言"末帧采样率改对了"是不够的——改率只止住继续漂,检测窗内已经按错的率送
+    /// 下去的那一段追不回来:44.1k 被当 48k 时 30s 墙钟只写进 27.56s,留下 2.44s 固定
+    /// 错位跟着整场走,而且它在长录音里占比不到 1%,回放侧的兜底阈值也不会触发。
+    /// 本测试按下游的解释(样本数 ÷ 该帧标称率)累加逻辑时长,与墙钟对表。
+    #[test]
+    fn total_logical_duration_matches_wall_clock_despite_lying_rate() {
+        const DECLARED: u32 = 48_000;
+        const TRUE_RATE: f64 = 32_000.0;
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let policy =
+            TapPolicy { rate_eval_window: Duration::from_millis(200), ..wallclock_policy() };
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, health, policy, TapNotify::none())
+        });
+        let t0 = Instant::now();
+        let gap = feed_at_rate(&ctx, DECLARED, TRUE_RATE, Duration::from_millis(800));
+        let wall = t0.elapsed().as_secs_f64();
+        drop(ctx);
+        t.join().unwrap();
+
+        if !timing_sound(gap, &policy) {
+            return;
+        }
+        let logical: f64 = wrx
+            .try_iter()
+            .map(|f| f.samples.len() as f64 / f.channels.max(1) as f64 / f.sample_rate as f64)
+            .sum();
+        // 容差 8%:首帧到达前的空窗 + 评估窗末尾那一帧的粒度,都是墙钟的零头。
+        // 未补齐时这里会短掉整整 1/3 的评估窗(0.2s×(1-32/48)≈0.067s,占 800ms 的 8.3%)。
+        assert!(
+            (logical - wall).abs() / wall < 0.08,
+            "逻辑时长 {logical:.3}s 应贴合墙钟 {wall:.3}s(差 {:.1}%)",
+            (logical - wall).abs() / wall * 100.0
+        );
+    }
+
+    /// 声明与实测一致时绝不改写——误改会把本来正常的轨道弄出漂移和变调。
+    #[test]
+    fn leaves_honest_sample_rate_untouched() {
+        const RATE: u32 = 16_000;
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let policy =
+            TapPolicy { rate_eval_window: Duration::from_millis(200), ..wallclock_policy() };
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        let gap = feed_at_rate(&ctx, RATE, RATE as f64, Duration::from_millis(600));
+        drop(ctx);
+        t.join().unwrap();
+
+        let got: Vec<AudioFrame> = wrx.try_iter().collect();
+        assert!(got.len() > 10);
+        if !timing_sound(gap, &policy) {
+            return;
+        }
+        assert!(
+            got.iter().all(|f| f.sample_rate == RATE),
+            "诚实的源不得被改写: {:?}",
+            got.iter().map(|f| f.sample_rate).collect::<Vec<_>>()
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
+    }
+
+    /// 断流 + 恢复后整批回吐(蓝牙 mic 常态)不得被误判成速率异常:那段时间瞬时
+    /// 速率先 0 后暴涨,若计进统计就会把一条正常轨改写坏。
+    #[test]
+    fn drought_and_burst_do_not_trigger_rate_correction() {
+        const RATE: u32 = 16_000;
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let policy =
+            TapPolicy { rate_eval_window: Duration::from_millis(150), ..fast_policy() };
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        for _ in 0..3 {
+            let _ = feed_at_rate(&ctx, RATE, RATE as f64, Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(200)); // 断流,tap 在此补零
+            // 回吐:断流期积压的样本一次性到达
+            ctx.send(AudioFrame {
+                samples: vec![0.2; (RATE as f64 * 0.2) as usize],
+                sample_rate: RATE,
+                channels: 1,
+            })
+            .unwrap();
+        }
+        drop(ctx);
+        t.join().unwrap();
+
+        let got: Vec<AudioFrame> = wrx.try_iter().collect();
+        assert!(
+            got.iter().all(|f| f.sample_rate == RATE),
+            "断流/回吐不得触发改写"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
+        assert!(health.gaps.load(Ordering::Relaxed) >= 1, "断流本身仍应被计为 gap");
+    }
+
+    /// 实测速率离声明值超过一倍:病因不是"率写错了",改写只会把时间轴推得更歪。
+    /// 保留声明值(留日志),把处置交给上层。
+    #[test]
+    fn absurd_measured_rate_is_not_applied() {
+        const DECLARED: u32 = 48_000;
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let policy =
+            TapPolicy { rate_eval_window: Duration::from_millis(200), ..wallclock_policy() };
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        let _ = feed_at_rate(&ctx, DECLARED, 4_000.0, Duration::from_millis(600));
+        drop(ctx);
+        t.join().unwrap();
+
+        let got: Vec<AudioFrame> = wrx.try_iter().collect();
+        assert!(
+            got.iter().all(|f| f.sample_rate == DECLARED),
+            "越过合理性夹板不得改写"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
     }
 
     /// 帧原样转发、计数正确;上游关闭 → 下游关闭(worker 收到通道关闭得以 flush)。
@@ -322,6 +1012,48 @@ mod tests {
         );
         assert_eq!(health.gaps.load(Ordering::Relaxed), 1, "一次断流计一次 gap");
         assert!(health.silence_ms.load(Ordering::Relaxed) >= 100);
+    }
+
+    /// 断流补零 + 设备恢复后吐出断流期缓冲(蓝牙 mic 常态)反复发生时,该轨时间轴
+    /// 不得随轮数累积变长:转发总时长的上界是「墙钟 + 一次突发」,而不是墙钟的两倍。
+    /// 这是 mic 轨曾比墙钟长 714s(2712s vs 1998s)的回归锁。
+    #[test]
+    fn burst_after_drought_does_not_inflate_timeline() {
+        const ROUNDS: u32 = 4;
+        const STALL: Duration = Duration::from_millis(200);
+        const BURST_SAMPLES: usize = 3200; // 200ms @16k:断流期设备缓冲的回吐量
+
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, health, fast_policy(), TapNotify::none())
+        });
+
+        let t0 = Instant::now();
+        ctx.send(frame(160)).unwrap(); // 首帧:建立格式与时间轴锚点
+        for _ in 0..ROUNDS {
+            std::thread::sleep(STALL); // tap 在此期间补零
+            ctx.send(frame(BURST_SAMPLES)).unwrap(); // 设备把断流期缓冲整批吐出
+        }
+        let wall = t0.elapsed();
+        drop(ctx);
+        t.join().unwrap();
+
+        let forwarded: usize = wrx.try_iter().map(|f| f.samples.len()).sum();
+        let wall_samples = (wall.as_secs_f64() * 16_000.0) as usize;
+        // 上界:墙钟 + 一次突发 + 一个 tick 的调度余量。旧实现(按墙钟差补,不看
+        // 已转发量)在同样脚本下会逼近 2×墙钟。
+        let cap = wall_samples + BURST_SAMPLES + 16 * 10 * 2;
+        assert!(
+            forwarded <= cap,
+            "转发总量不得随轮数累积:{forwarded} 样本 > 上界 {cap}(墙钟 {wall_samples})"
+        );
+        // 下界:确实补了零(否则本测试退化成"什么都没发生"也能过)。
+        assert!(
+            forwarded > wall_samples / 2,
+            "断流期应补零维持时间轴:{forwarded} 样本 vs 墙钟 {wall_samples}"
+        );
     }
 
     /// 从未收到帧(源没起来)绝不填充——不凭空造空白轨。

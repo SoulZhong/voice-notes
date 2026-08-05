@@ -67,6 +67,17 @@ pub struct NoteRenamedEvent {
     pub title: String,
 }
 
+/// 跨轨时基已纠正,事件名 "note_realigned"。回放侧实测出 mic 轨的时基映射并落盘后
+/// 发出:此时详情页手里那份转写段的时间戳还停在旧时基上(高亮跟不上、点段落跳错位置、
+/// mic 行与 system 行的次序也是错的),须整页重拉。映射估计要跑几秒,发生在装载音轨
+/// 之后,前端不会主动重拉。
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteRealignedEvent {
+    pub note_id: String,
+    /// 最大漂移(毫秒),供日志/提示用。
+    pub drift_ms: u64,
+}
+
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {

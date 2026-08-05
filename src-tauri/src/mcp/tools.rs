@@ -120,7 +120,9 @@ pub fn get_note(
     let store = NoteStore::new(notes_dir(roots));
     let note = store.load(id)?; // 内含 validate_note_id 防穿越 + 存在性检查
     let refined = if prefer_refined {
-        store::load_refined(&notes_dir(roots).join(id))
+        // 纯读出口:渲染出去的 markdown 带 [时间戳],必须与 App 同一条时基
+        // (段那边 NoteStore::load 已投影,这里不投影会在同一份输出里混两套时基)。
+        store::load_refined_for_display(&notes_dir(roots).join(id))
     } else {
         None
     };
@@ -844,6 +846,25 @@ mod tests {
         assert!(
             get_note(&roots(tmp.path()), "../evil", "segments", true).is_err(),
             "id 穿越防护"
+        );
+
+        // 跨轨时基纠正:段那边 NoteStore::load 已投影,修订段落必须走同一条时基,
+        // 否则同一份返回值里混着两套时间(Agent 按它跳转就会跳错)。
+        crate::store::align::write(
+            &dir,
+            &crate::player_align::TimeMap::new(vec![(0.0, 9.0), (100.0, 109.0)]).unwrap(),
+        )
+        .unwrap();
+        let v = get_note(&roots(tmp.path()), "20260101-100000", "segments", true).unwrap();
+        assert_eq!(
+            v["paragraphs"][0]["start_ms"], 9000,
+            "MCP 的修订段落时间戳须与 App 同一条时基"
+        );
+        let md = get_note(&roots(tmp.path()), "20260101-100000", "markdown", true).unwrap();
+        assert!(
+            md["content"].as_str().unwrap().contains("00:09"),
+            "渲染出的 markdown 时间戳也须是纠正后的: {}",
+            md["content"]
         );
     }
 
