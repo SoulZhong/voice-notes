@@ -78,9 +78,16 @@ impl OfflineEngine {
                 config.model_config.qwen3_asr.encoder = c(encoder, &mut keep);
                 config.model_config.qwen3_asr.decoder = c(decoder, &mut keep);
                 config.model_config.qwen3_asr.tokenizer = c(tokenizer_dir, &mut keep);
-                // 采样参数取官方安全封装同款默认(零值在 C 端此结构无 OR 兜底,须显式给):
-                config.model_config.qwen3_asr.max_total_len = 512;
-                config.model_config.qwen3_asr.max_new_tokens = 128;
+                // 采样参数取官方安全封装同款默认(零值在 C 端此结构无 OR 兜底,须显式给)。
+                // 长度上限从官方默认(512/128)上调:VAD 段上限 15s,中文密集语速下
+                // 一段可达 ~90 字 ≈ 90+ token,官方 128 会在真实会议里截断——2026-08-04
+                // 排查一场 33min 笔记的日志里 sherpa 报了 5 次
+                // "Result is truncated. max_new_tokens 128 is too small"。留 2 倍余量;
+                // max_total_len 同步上调,给音频提示 token 留出空间(否则新上限吃不到)。
+                // 上界不敢再放大的原因:近贪心解码偶发复读时,这里就是唯一的止损闸,
+                // 每段最坏解码时长与本值成正比。
+                config.model_config.qwen3_asr.max_total_len = 1024;
+                config.model_config.qwen3_asr.max_new_tokens = 256;
                 config.model_config.qwen3_asr.temperature = 1e-6; // 近贪心,转写要确定性
                 config.model_config.qwen3_asr.top_p = 0.8;
                 config.model_config.qwen3_asr.seed = 42;
