@@ -13,7 +13,18 @@ impl SileroSegmenter {
         let config = sherpa_onnx::VadModelConfig {
             silero_vad: sherpa_onnx::SileroVadModelConfig {
                 model: Some(model_path.to_string_lossy().into_owned()),
-                min_silence_duration: 0.6, // 静音 > 0.6s 视为一句结束
+                // 静音 > 此值视为一句结束。0.6s→1.2s(2026-08-04 实测):中文自然停顿
+                // 频繁落在 0.6~1.2s,旧值把一句话切成 1~3s 碎片,每片单独送识别——
+                // LLM 解码的 Qwen3 缺上下文就编造("类似于。""五万。""Be man, we need.")。
+                // 真实笔记复现:问题区段 28 个碎段的相邻间隙最小值恰为 606ms(全部贴着
+                // 旧门限切),按 1.2s 重新成段后 28→18 段、平均 3.6s→6.1s,多条句子从
+                // 碎片乱码恢复成完整语义(如「我从。」+「我从这个项目上来讲。」+
+                // 「我就必须把。」→「就我从我负责这个项目上来讲,我就必须把」)。
+                // 代价:定稿延迟 +0.6s(预览不受影响),且段跨说话人的概率上升——
+                // 实测同源相邻段在 0.6~1.2s 间隙内 mic 74% / system 90% 是同一人,
+                // 跨界部分由 split_final 的滑窗声纹变更点检测兜底(模型给出 token
+                // 时间戳时才能落到文本切分,Qwen3 无时间戳时保留母段)。
+                min_silence_duration: 1.2,
                 min_speech_duration: 0.25,
                 max_speech_duration: 15.0, // 上限：超 15s 强制切，界定每次识别量
                 threshold: 0.5,
