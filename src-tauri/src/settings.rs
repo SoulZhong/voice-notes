@@ -136,6 +136,7 @@ pub struct Settings {
     pub mcp_onboarded: bool,
     /// 方案 B:录制期把两轨混成 mixed.wav。默认关——实验特性,开启后每分钟多约
     /// 1.9MB 磁盘(转码 m4a 后大幅缩小)。仅影响新录制,已有笔记不受影响。
+    /// 实验字段,无 UI,手改 settings.json。
     #[serde(default)]
     pub mix_track: bool,
 }
@@ -584,5 +585,10 @@ mod tests {
         // 旧配置文件无该字段,必须仍可解析(仓库既有约定:新字段 serde(default))
         let s: Settings = serde_json::from_str("{}").expect("旧文件应可解析");
         assert!(!s.mix_track, "默认关闭:方案 B 是实验特性,不改变现有用户行为");
+        // 上面走的是 serde 字段级 #[serde(default)](bool → false),不覆盖手写的
+        // impl Default for Settings。lib.rs 的 app_data_dir() 不可用时读设置走
+        // unwrap_or_default(),真正生效的是这里的手写默认值——必须单独断言,
+        // 否则日后有人把 impl Default 里的 mix_track 改成 true,本测试仍然全绿。
+        assert!(!Settings::default().mix_track, "读设置失败时走 unwrap_or_default,默认必须是关的");
     }
 }
