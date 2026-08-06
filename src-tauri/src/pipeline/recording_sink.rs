@@ -118,6 +118,14 @@ impl RecordingSink for MixedSink {
         }
         let mut w = Box::new(self.inner).into_wiring();
 
+        // 续录判据:装配时(spawn 混音线程之前)note_dir 下是否已经躺着一条 mixed.wav。
+        // 为真即说明本场是续录——AudioTrackWriter::open() 会走"已存在"分支,对齐
+        // set_len 后把本场新样本接在上一场内容后面;这条轨此刻已经装着上一场完好的
+        // 内容,不是本场从零建的。为假即本场是从零开始的新轨,守卫放弃时删掉它是
+        // 零损失(可离线用两条源轨重算)。必须在 spawn 之前取快照并 move 进闭包——
+        // 线程里再判断就会把"本场自己刚建出来的文件"误当成"续录的旧文件"。
+        let preexisting = note_dir.join(format!("{MIXED_TRACK}.wav")).exists();
+
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, Vec<f32>)>();
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
@@ -160,18 +168,33 @@ impl RecordingSink for MixedSink {
                 // 顺序:先 drop 掉 writer 让它的 Drop 补完头、刷盘、关闭文件句柄,
                 // 再删除文件——不能反过来(文件还开着时删除在部分平台行为不可控)。
                 drop(writer.take());
-                let mixed_path = note_dir.join(format!("{MIXED_TRACK}.wav"));
-                if let Err(e) = std::fs::remove_file(&mixed_path) {
-                    // 纯单源饥饿(从未定稿过任何样本)时 writer 全程停在 Pending,
-                    // Drop 里 flush_header 对非 Open 状态直接 return,文件本就不存在,
-                    // NotFound 是这种场景下的正常路径,不必当错误声张。其它错误(如
-                    // 权限)才值得留痕排查——但无论如何不能 panic,旁路不许拖累主流程。
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!(
-                            "放弃 mixed.wav 后删除残留文件失败,可能留下时长错误的截断轨\
-                             ({}): {e}",
-                            mixed_path.display()
-                        );
+                // 但只有 !preexisting(本场从零建的轨)才能删:续录场景里这条 WAV
+                // 一开始就装着上一场已经写完、完好无损的内容,AudioTrackWriter::open()
+                // 是在它尾部 set_len 对齐后追加,不是重新建档。此时 remove_file 会把
+                // 上一场那些完好的内容一并冲掉——数据丢失面比"留一条尾部截断的合法
+                // 轨"大得多(后者只是本场这一小段脏,前者连之前几十分钟都没了)。
+                // 退化策略:续录场景就留着这条被截断的轨,eprintln 留痕即可,不比
+                // 修复前更糟(修复前也是"看似合法但截断",只是现在连上一场也保住了)。
+                if preexisting {
+                    eprintln!(
+                        "混音旁路放弃,但 mixed.wav 是续录追加在上一场内容之后的轨,\
+                         为避免连带删掉上一场已完好落盘的内容,保留这条被截断的轨\
+                         (下游可能读到错误的 duration,需要人工核实)"
+                    );
+                } else {
+                    let mixed_path = note_dir.join(format!("{MIXED_TRACK}.wav"));
+                    if let Err(e) = std::fs::remove_file(&mixed_path) {
+                        // 纯单源饥饿(从未定稿过任何样本)时 writer 全程停在 Pending,
+                        // Drop 里 flush_header 对非 Open 状态直接 return,文件本就不存在,
+                        // NotFound 是这种场景下的正常路径,不必当错误声张。其它错误(如
+                        // 权限)才值得留痕排查——但无论如何不能 panic,旁路不许拖累主流程。
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "放弃 mixed.wav 后删除残留文件失败,可能留下时长错误的截断轨\
+                                 ({}): {e}",
+                                mixed_path.display()
+                            );
+                        }
                     }
                 }
                 // 已知未覆盖、不在本次修复范围:如果混音线程本身 panic(而不是走到
@@ -271,6 +294,20 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         path.exists()
+    }
+
+    /// 同 wait_until_exists 的轮询手法,但断言文件字节数超过某个下限——用于确认
+    /// "续录追加"真的发生了(而不只是旧文件原样还在),即 AudioTrackWriter::open()
+    /// 走过了续录对齐分支并且后续 append 真把新样本写进了同一个文件句柄。
+    fn wait_until_size_at_least(path: &Path, min_len: u64, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > min_len {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > min_len
     }
 
     /// mix=false:只落两条源轨,不产生 mixed.wav。
@@ -451,6 +488,88 @@ mod tests {
         );
         let mic = read_pcm_i16(&dir.path().join("mic.wav"));
         assert_eq!(mic.len(), 160 * 100 + 8000 * rounds, "源轨不受混音旁路自杀影响");
+    }
+
+    /// Bug 修复回归,与上面 starvation_after_partial_success 相反方向:同样是"守卫
+    /// 触发时 mixed.wav 已经装着写出的内容",但这次内容不是本场自己混出来的,而是
+    /// **上一场续录前就已经完好落盘**的。remove_file 不加区分地删,会把续录场景下
+    /// 上一场那部分完全正常的内容一并冲掉——数据丢失面比"留一条尾部截断的合法轨"
+    /// 大得多。守卫必须只删"本场从零建的轨"(可离线用源轨重算,零损失),续录追加
+    /// 的轨即便本场这段截断了也必须保留。
+    ///
+    /// 搭建:先跑一场完整会话(base_ms=0)产出一条 1 秒、内容正确的 mixed.wav 并
+    /// 正常 finish,模拟"上一场"。base_ms=1000 严丝合缝对应它的时长(offset_ms=0,
+    /// 1 秒=1000ms),这样第二场 AudioTrackWriter::open() 的续录对齐分支
+    /// (`set_len` 到 base_ms 对应字节数)刚好不截断也不补零上一场的内容——如果这里
+    /// 算错 base_ms,对齐会把断言意图冲掉,所以特意选一个和预存时长严丝合缝的值。
+    /// 第二场先正常混一小段(确认 open() 真的走过续录分支、新内容接到旧内容后面,
+    /// 而不是像 one_sided_starvation 用例那样全程停在 Pending 从未开过文件),再让
+    /// system 彻底停摆触发守卫。
+    #[test]
+    fn starvation_during_continuation_preserves_preexisting_mixed_track() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 上一场:正常混 1 秒并正常 finish,mixed.wav 落地一条完好的成品轨。
+        {
+            let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+            for _ in 0..100 {
+                for (_, s) in w.sinks.iter_mut() {
+                    s(&[0.25; 160]);
+                }
+            }
+            drain(w);
+        }
+        let mixed_path = dir.path().join("mixed.wav");
+        assert!(mixed_path.exists(), "前置条件:上一场应正常产出 mixed.wav");
+        let old_mixed = read_pcm_i16(&mixed_path);
+        assert_eq!(old_mixed.len(), 16000, "前置条件:上一场应是 1 秒(16000 样本)");
+        let old_len_bytes = std::fs::metadata(&mixed_path).unwrap().len();
+
+        // 本场续录:base_ms=1000 对应上一场的 1 秒时长。
+        let mut w = build_sinks(dir.path(), 1000, &[Source::Mic, Source::System], true);
+        // 先正常混一小段,确认 open() 真的把新内容接在旧内容后面(文件变长),
+        // 而不是全程停在 Pending 从未打开过文件。
+        for _ in 0..50 {
+            for (_, s) in w.sinks.iter_mut() {
+                s(&[0.25; 160]);
+            }
+        }
+        assert!(
+            wait_until_size_at_least(&mixed_path, old_len_bytes, std::time::Duration::from_secs(5)),
+            "前置条件:续录期正常混音阶段应已把新内容追加到上一场内容之后"
+        );
+        // 随后 system 彻底停摆,只有 mic 继续推进,直到越过累加窗上限触发自杀。
+        let chunk = vec![0.3f32; 8000];
+        let rounds = MAX_MIXER_WINDOW_SAMPLES / 8000 + 5;
+        {
+            let mic = sink_for(&mut w, Source::Mic);
+            for _ in 0..rounds {
+                mic(&chunk);
+            }
+        }
+        drain(w);
+
+        // 核心断言:preexisting 场景下守卫不能删文件——留一条尾部截断的合法轨,
+        // 也不能把上一场完好的内容一并冲掉。
+        assert!(
+            mixed_path.exists(),
+            "续录场景守卫误删了 mixed.wav,上一场已完好落盘的内容随之丢失\
+             (本次修复要防的正是这个)"
+        );
+        let mixed = read_pcm_i16(&mixed_path);
+        assert!(
+            mixed.len() >= old_mixed.len(),
+            "续录追加后的内容不该比上一场还短: got {} want >= {}",
+            mixed.len(),
+            old_mixed.len()
+        );
+        // 上一场内容必须原样保留在文件开头(±2 LSB 容差同其它用例)。
+        for (i, (&got, &want)) in mixed[..old_mixed.len()].iter().zip(old_mixed.iter()).enumerate() {
+            assert!(
+                (got as i32 - want as i32).abs() <= 2,
+                "位置 {i}: 上一场内容被改动,got {got} want {want}"
+            );
+        }
     }
 
     /// 单源会话:无从混音,不产出 mixed.wav(降级为只有方案 A 可选)。
