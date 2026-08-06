@@ -84,6 +84,9 @@ pub struct TrackMeta {
     /// 离线清洗结果(排障用):估计延迟/置信度/分段数。None=未清洗过。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clean: Option<CleanInfo>,
+    /// 墙钟-样本对账(见 SyncInfo)。None = 该轨录制期未记录(旧笔记/中断)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncInfo>,
 }
 
 /// 波形桶数,与前端 WAVE_BARS 对齐(260 桶约 1KB JSON,audio.json 体积可忽略)。
@@ -99,6 +102,28 @@ pub struct CleanInfo {
     /// Some(false)=AEC3-only(模型未在场或推理失败);Some(true)=神经级已叠加。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neural: Option<bool>,
+}
+
+/// 墙钟-样本对账:该轨在本场录制里实际接受的样本数 vs 墙钟应有的样本数。
+///
+/// 为什么要落盘:回放侧的三种离线错位量法在 0.2~0.9s 区间互不吻合(见
+/// player_align.rs 头注),分歧本身已达阈值量级,导致"连残余有多大都测不准"。
+/// 录制期我们掌握真值——采集线程的样本计数与墙钟可直接对账,不需要估。有了这条
+/// 基准才谈得上判定方案 A/B 孰优,以及反向标定那三种离线量法。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncInfo {
+    /// 本场录制墙钟时长(ms)。
+    pub wall_ms: u64,
+    /// 该轨实际接受的样本数(16k 口径)。
+    pub samples: u64,
+    /// 漂移 = samples/16 − wall_ms。负值 = 该轨时钟跑慢(样本数不足墙钟)。
+    pub drift_ms: i64,
+    /// frame_tap 累计补的静音时长(ms)。
+    pub silence_ms: u64,
+    /// 帧荒次数。
+    pub gaps: u32,
+    /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
+    pub rate_fixes: u32,
 }
 
 /// 从 16k/mono/s16 WAV 流式计算波形桶:每桶取峰值 |i16| 折算 0..255。
@@ -233,6 +258,15 @@ pub fn set_track_clean_info(note_dir: &Path, source: &str, info: CleanInfo) -> a
     let _guard = meta_guard();
     let mut meta = load_audio_meta(note_dir);
     meta.tracks.entry(source.to_string()).or_default().clean = Some(info);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 写入某轨的墙钟-样本对账。全程持 audio.json 写锁;只改 sync 字段,保留其它。
+pub fn set_track_sync(note_dir: &Path, source: &str, info: SyncInfo) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.schema_version = 1;
+    meta.tracks.entry(source.to_string()).or_default().sync = Some(info);
     save_audio_meta(note_dir, &meta)
 }
 
@@ -820,6 +854,30 @@ mod tests {
         let c = meta.tracks["mic"].clean.as_ref().unwrap();
         assert_eq!((c.delay_ms, c.segments), (600, 1));
         assert_eq!(c.neural, Some(true), "neural 应随 CleanInfo 往返");
+    }
+
+    #[test]
+    fn sync_info_roundtrips_and_old_json_stays_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_sync(
+            dir.path(),
+            "mic",
+            SyncInfo { wall_ms: 60_000, samples: 959_000, drift_ms: -62, silence_ms: 0, gaps: 0, rate_fixes: 1 },
+        )
+        .unwrap();
+        let meta = load_audio_meta(dir.path());
+        let s = meta.tracks.get("mic").unwrap().sync.as_ref().expect("应已写入");
+        assert_eq!(s.wall_ms, 60_000);
+        assert_eq!(s.drift_ms, -62, "负值 = 该轨样本数不足墙钟,时钟跑慢");
+        assert_eq!(s.rate_fixes, 1);
+    }
+
+    #[test]
+    fn sync_absent_serializes_to_old_shape() {
+        // 未写 sync 的轨道,JSON 不该出现该键(新旧版本双向兼容,与 codec/waveform 同策略)
+        let t = TrackMeta { offset_ms: 5, ..Default::default() };
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(!j.contains("sync"), "无 sync 时不应序列化该键: {j}");
     }
 
     /// 冒烟实锤回归:soft_aec 标记先于轨道建档写入,建档(open)不得整条替换抹掉它。

@@ -86,6 +86,9 @@ struct ActiveSession {
     /// 每源管线健康计数(FrameTap 写入):pipeline_health 命令随时快照,
     /// 会话拆除即随本结构丢弃——健康数据只描述"这一场",无跨场语义。
     health: Vec<(Source, Arc<SourceHealth>)>,
+    /// 笔记目录快照:停录时写墙钟-样本对账要用(该路径在 writer 移交前已确定,
+    /// 见 start 处 `writer.dir()`)。
+    note_dir: std::path::PathBuf,
 }
 
 impl ActiveSession {
@@ -1492,6 +1495,7 @@ fn spawn_session(
                     paused_accum: std::time::Duration::ZERO,
                     audio_joins,
                     health: session_health,
+                    note_dir: note_dir.clone(),
                 });
                 drop(running_guard);
                 let _ = app.emit(
@@ -1646,6 +1650,29 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
     for j in s.audio_joins {
         let _ = j.join();
+    }
+    // 墙钟-样本对账:趁 health 计数仍在(会话拆除即丢弃),把真值落进 audio.json。
+    // wall_ms 取本场会话净时长(扣暂停),base_ms 传 0——对账描述"这一场",不含历史累计。
+    let wall_ms = active_elapsed_ms(
+        s.started.elapsed(),
+        s.paused_accum,
+        s.paused_at.map(|p| p.elapsed()),
+        0,
+    );
+    for (source, health) in &s.health {
+        let h = health.snapshot(*source);
+        let info = store::audio::SyncInfo {
+            wall_ms,
+            samples: h.samples,
+            drift_ms: (h.samples / 16) as i64 - wall_ms as i64,
+            silence_ms: h.silence_ms,
+            gaps: h.gaps,
+            rate_fixes: h.rate_fixes,
+        };
+        // 失败只记日志:排障数据缺失不是正确性问题,不该挡停录。
+        if let Err(e) = store::audio::set_track_sync(&s.note_dir, source.as_str(), info) {
+            eprintln!("对账写入失败({}): {e}", source.as_str());
+        }
     }
     Some(s.note_id)
 }
