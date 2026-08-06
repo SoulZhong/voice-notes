@@ -134,6 +134,10 @@ pub struct Settings {
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
     #[serde(default)]
     pub mcp_onboarded: bool,
+    /// 方案 B:录制期把两轨混成 mixed.wav。默认关——实验特性,开启后每分钟多约
+    /// 1.9MB 磁盘(转码 m4a 后大幅缩小)。仅影响新录制,已有笔记不受影响。
+    #[serde(default)]
+    pub mix_track: bool,
 }
 
 fn default_prefix() -> String {
@@ -222,6 +226,7 @@ impl Default for Settings {
             completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
+            mix_track: false,
         }
     }
 }
@@ -572,5 +577,12 @@ mod tests {
         assert!(!cloud_creds_ok(&v));
         let v = Settings { volc_app_key: "a".into(), volc_access_key: "t".into(), ..Default::default() };
         assert!(cloud_creds_ok(&v));
+    }
+
+    #[test]
+    fn mix_track_defaults_false_and_old_files_parse() {
+        // 旧配置文件无该字段,必须仍可解析(仓库既有约定:新字段 serde(default))
+        let s: Settings = serde_json::from_str("{}").expect("旧文件应可解析");
+        assert!(!s.mix_track, "默认关闭:方案 B 是实验特性,不改变现有用户行为");
     }
 }

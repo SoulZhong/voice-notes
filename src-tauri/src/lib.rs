@@ -756,14 +756,19 @@ fn spawn_session(
         };
 
         // 0) 一次性读设置：record_system_only / keep_audio / language_filter /
-        // keep_output_volume / 识别方式与云端凭证 同源同快照（避免多次 load 读到并发
-        // 写入的不同代）。app_data_dir 不可用时整体回落 Settings::default（仅系统声=否、
-        // 保留音频=是、语言过滤=开、保持外放音量=否、识别方式=本地），绝不因读设置失败
-        // 改变现状行为。位置提到取模型之前：识别方式决定要不要取常驻识别器。
-        // language_filter 在下方 start_session 处消费。
+        // keep_output_volume / mix_track / 识别方式与云端凭证 同源同快照（避免多次
+        // load 读到并发写入的不同代）。app_data_dir 不可用时整体回落 Settings::default
+        // （仅系统声=否、保留音频=是、语言过滤=开、保持外放音量=否、混音成品轨=否、
+        // 识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型之前：识别
+        // 方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
-        let (record_system_only, keep_audio, language_filter, keep_output_volume) =
-            (cfg.record_system_only, cfg.keep_audio, cfg.language_filter, cfg.keep_output_volume);
+        let (record_system_only, keep_audio, language_filter, keep_output_volume, mix_track) = (
+            cfg.record_system_only,
+            cfg.keep_audio,
+            cfg.language_filter,
+            cfg.keep_output_volume,
+            cfg.mix_track,
+        );
         let cloud_mode = cfg.asr_mode == settings::ASR_MODE_CLOUD;
 
         // 1) 识别引擎。
@@ -1194,27 +1199,24 @@ fn spawn_session(
         // 转写/声纹零影响——音频落盘是纯增值旁路,sink 仅把采集帧复制一份写 WAV,不在
         // 转写热路径上;audio_joins 空 Vec 在 stop 时 join 无害(空循环),start_session
         // 签名不变(空 sinks 即不落任何音频轨)。
-        let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
-        let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        if keep_audio {
-            // note_dir 在 writer 移交前已快照(见上),此处只用路径,不触 writer。
-            for (source, _, _) in &sources {
-                let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-                let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
-                audio_joins.push(std::thread::spawn(move || {
-                    for chunk in rx.iter() {
-                        w.append(&chunk);
-                    }
-                    // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
-                }));
-                audio_sinks.push((
-                    *source,
-                    Box::new(move |s: &[f32]| {
-                        let _ = tx.send(s.to_vec());
-                    }) as Box<dyn FnMut(&[f32]) + Send>,
-                ));
-            }
-        }
+        //
+        // 录制期产物装配移交 pipeline::recording_sink:mix_track 开启时多落一条
+        // mixed.wav(方案 B)。keep_audio=false 时不调 build_sinks、直接给空 Vec,
+        // 关闭音频保留不该产生任何轨(含成品轨),行为与此前完全一致。build_sinks
+        // 没有 keep_audio 参数,短路必须留在这层调用方。
+        //
+        // sources 在此处只是"配置期建了 capture 对象"的源(可能活跃),真正的
+        // capture.start() 在 spawn_session 里才跑,启动失败的源其 sink 随 worker 一起
+        // 丢弃(session.rs)——mix_track 装配时无法区分"确实活跃"与"仅配置存在",
+        // 这个缺口由 MixedSink 混音线程内的 30 秒窗口守卫兜住(一源彻底不喂料就放弃
+        // 成品轨,不影响两条源轨),此处不为此调整启动顺序。
+        let (audio_sinks, audio_joins) = if keep_audio {
+            let srcs: Vec<Source> = sources.iter().map(|(s, _, _)| *s).collect();
+            let w = pipeline::recording_sink::build_sinks(&note_dir, base_ms, &srcs, mix_track);
+            (w.sinks, w.joins)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // 识别引擎装配。云端两件调用方专属的注入(见 session::AsrEngine):
         //  - backfill_segmenter:断网缺口补识的本机 VAD 切段(厂商批式接口有单请求
