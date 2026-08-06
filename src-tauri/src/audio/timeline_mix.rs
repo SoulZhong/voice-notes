@@ -97,6 +97,13 @@ impl TimelineMixer {
         out
     }
 
+    /// 当前窗口长度。供上游(recording_sink.rs 的混音线程)做上限守卫用:稳态下
+    /// 恒为 margin,只有某源彻底停摆时才会无界增长(见模块头注),上游据此判断
+    /// 是否该放弃这条旁路轨,而不是让内存无限涨到分配失败拖垮整个进程。
+    pub fn win_len(&self) -> usize {
+        self.win.len()
+    }
+
     fn drain_below_watermark(&mut self) -> Vec<f32> {
         let low = self.pos.iter().copied().min().expect("pos 长度固定为 NSRC,min 不可能为 None");
         let watermark = low.saturating_sub(self.margin);
@@ -111,15 +118,6 @@ impl TimelineMixer {
         let out: Vec<f32> = self.win.drain(..n).collect();
         self.win_start += out.len() as u64;
         out
-    }
-}
-
-#[cfg(test)]
-impl TimelineMixer {
-    /// 仅测试可见:当前窗口长度。用于锁定"稳态下窗口大小恒为 margin,不会偷偷
-    /// 变大"这条性质,不为此放开生产 API。
-    fn win_len(&self) -> usize {
-        self.win.len()
     }
 }
 
