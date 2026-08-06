@@ -63,13 +63,21 @@
 mod tests {
     use super::*;
 
+    /// f32 逐元素容差比较。不用 assert_eq! 精确比:和式(如 1.0+0.1)是否恰好等于
+    /// 字面量 1.1f32 取决于舍入,断言不该赌这个。
+    fn assert_close(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "长度不符: got {got:?} want {want:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "got {got:?} want {want:?}");
+        }
+    }
+
     /// 两源等速到达:定稿部分应是逐样本和。
     #[test]
     fn equal_rate_sources_sum_pointwise() {
         let mut m = TimelineMixer::new(0); // margin=0 便于逐样本断言
         assert!(m.accept(MIC, &[1.0, 1.0, 1.0]).is_empty(), "只有一源时水位线为 0,不该定稿");
-        let out = m.accept(SYSTEM, &[0.5, 0.5, 0.5]);
-        assert_eq!(out, vec![1.5, 1.5, 1.5]);
+        assert_close(&m.accept(SYSTEM, &[0.5, 0.5, 0.5]), &[1.5, 1.5, 1.5]);
     }
 
     /// 一源滞后:滞后期间不定稿;补上后按位置对齐,不与更晚的对面窗错配。
@@ -79,9 +87,9 @@ mod tests {
         // mic 先跑 4 个样本,system 一个都没来
         assert!(m.accept(MIC, &[1.0, 2.0, 3.0, 4.0]).is_empty());
         // system 追上前 2 个 → 只定稿前 2 个位置
-        assert_eq!(m.accept(SYSTEM, &[0.1, 0.2]), vec![1.1, 2.2]);
+        assert_close(&m.accept(SYSTEM, &[0.1, 0.2]), &[1.1, 2.2]);
         // system 再追 2 个 → 定稿第 3、4 个位置(而非和 mic 后来的样本错配)
-        assert_eq!(m.accept(SYSTEM, &[0.3, 0.4]), vec![3.3, 4.4]);
+        assert_close(&m.accept(SYSTEM, &[0.3, 0.4]), &[3.3, 4.4]);
     }
 
     /// 缺口:某源在时间轴上有空洞(frame_tap 已补零帧,此处等价于喂 0.0),
@@ -90,21 +98,23 @@ mod tests {
     fn silent_fill_does_not_shift_positions() {
         let mut m = TimelineMixer::new(0);
         m.accept(MIC, &[0.0, 0.0, 9.0]);
-        assert_eq!(m.accept(SYSTEM, &[1.0, 1.0, 1.0]), vec![1.0, 1.0, 10.0]);
+        assert_close(&m.accept(SYSTEM, &[1.0, 1.0, 1.0]), &[1.0, 1.0, 10.0]);
     }
 
     /// 不等长块 + 交替到达:定稿序列与位置严格对应。
     #[test]
     fn uneven_chunks_keep_positional_correspondence() {
         let mut m = TimelineMixer::new(0);
-        m.accept(MIC, &[1.0]);
-        m.accept(SYSTEM, &[10.0, 20.0, 30.0]);
-        m.accept(MIC, &[2.0, 3.0]);
         let mut all = Vec::new();
-        all.extend(m.accept(MIC, &[]));
+        all.extend(m.accept(MIC, &[0.1])); // 水位线仍为 0,空
+        all.extend(m.accept(SYSTEM, &[0.01, 0.02, 0.03])); // 水位线到 1 → 定稿位置 0
+        all.extend(m.accept(MIC, &[0.2, 0.3])); // 水位线到 3 → 定稿位置 1、2
         all.extend(m.finish());
-        // 前 1 个在第 2 次 accept 时已定稿,这里只剩位置 1、2
-        assert_eq!(all, vec![22.0, 33.0]);
+        // 位置 0 = 0.1+0.01,位置 1 = 0.2+0.02,位置 2 = 0.3+0.03
+        assert_eq!(all.len(), 3);
+        for (got, want) in all.iter().zip([0.11_f32, 0.22, 0.33]) {
+            assert!((got - want).abs() < 1e-6, "got {all:?}");
+        }
     }
 
     /// 水位线余量:margin 之内的位置不定稿,留给尚未到达的样本。
@@ -113,17 +123,22 @@ mod tests {
         let mut m = TimelineMixer::new(2);
         m.accept(MIC, &[1.0, 1.0, 1.0, 1.0]);
         // 两源 min 位置 = 4,减 margin 2 → 只定稿位置 0、1
-        assert_eq!(m.accept(SYSTEM, &[1.0, 1.0, 1.0, 1.0]), vec![2.0, 2.0]);
+        assert_close(&m.accept(SYSTEM, &[1.0, 1.0, 1.0, 1.0]), &[2.0, 2.0]);
         // finish 把剩下的全部吐出
-        assert_eq!(m.finish(), vec![2.0, 2.0]);
+        assert_close(&m.finish(), &[2.0, 2.0]);
     }
 
-    /// 混音值钳制到 [-1,1](与 store::audio::f32_to_s16 同口径,防落盘溢出)。
+    /// 核心**不**钳制:溢出交给落盘侧的 f32_to_s16(既有,已 clamp)。
+    /// 混音器是纯加法,钳制是存储层关注点;两处都钳会让核心的单测无法用直观数值断言,
+    /// 也掩盖"两路相加真的触顶了"这一诊断信号。
     #[test]
-    fn sum_is_clamped_to_unit_range() {
+    fn sum_is_not_clamped_here() {
         let mut m = TimelineMixer::new(0);
         m.accept(MIC, &[0.9, -0.9]);
-        assert_eq!(m.accept(SYSTEM, &[0.9, -0.9]), vec![1.0, -1.0]);
+        let out = m.accept(SYSTEM, &[0.9, -0.9]);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 1.8).abs() < 1e-6, "got {out:?}");
+        assert!((out[1] + 1.8).abs() < 1e-6, "got {out:?}");
     }
 }
 ```
@@ -191,7 +206,7 @@ impl TimelineMixer {
 
     /// 收尾:两源都不再来数据,窗内剩余全部定稿。
     pub fn finish(&mut self) -> Vec<f32> {
-        let out: Vec<f32> = self.win.drain(..).map(clamp_unit).collect();
+        let out: Vec<f32> = self.win.drain(..).collect();
         self.win_start += out.len() as u64;
         out
     }
@@ -204,16 +219,10 @@ impl TimelineMixer {
         }
         let n = (watermark - self.win_start) as usize;
         let n = n.min(self.win.len());
-        let out: Vec<f32> = self.win.drain(..n).map(clamp_unit).collect();
+        let out: Vec<f32> = self.win.drain(..n).collect();
         self.win_start += out.len() as u64;
         out
     }
-}
-
-/// 与 store::audio::f32_to_s16 同口径的钳制:mic 已经过 AEC 消掉 system 内容,
-/// 两路相加不存在重复计数,正常电平下极少触顶;钳制只作溢出兜底。
-fn clamp_unit(v: f32) -> f32 {
-    v.clamp(-1.0, 1.0)
 }
 ```
 
