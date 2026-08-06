@@ -33,6 +33,12 @@ pub const MIXED_TRACK: &str = "mixed";
 /// 可能触达这个上限——正常的到达抖动不会。超限即证明这条旁路已经不可能再产出有意义
 /// 的 mixed.wav,必须自杀退出,不能任由窗口无界增长(实测约 230MB/小时;Rust 内存
 /// 分配失败是 abort,不是可恢复错误,拖累的是整个进程和两条本该完好的源轨)。
+///
+/// 真实存在的灰区(不是缺陷,如实记录):这条判据分不清"彻底停摆"和"首帧迟到"——
+/// 某源 capture.start() 返回 Ok,但首帧因为设备初始化慢等原因超过 30 秒才到,同样
+/// 会被判定为已停摆而放弃。frame_tap 只在收到过至少一帧之后才会用零帧补断流,首帧
+/// 到达前对面源是真饥饿,没有数据可补。且这个放弃不可逆——哪怕第 31 秒该源真的
+/// 恢复喂料,混音线程已经 break 退出,追不回来。
 const MAX_MIXER_WINDOW_SAMPLES: usize = 480_000;
 
 /// 装配产物:每源一个 sink 闭包 + 全部写盘线程句柄。形状与 lib.rs 既有构造一致。
@@ -102,8 +108,10 @@ impl RecordingSink for MixedSink {
         let note_dir = self.inner.note_dir.clone();
         let base_ms = self.inner.base_ms;
         // 混音只对 Mic+System 两源都在场时有意义:用 contains 而非 len() < 2,一是语义
-        // 更准确(顺带表达"混音只服务于这两源"),二是挡住重复源([Mic, Mic] 这种畸形
-        // 配置会通过 len() 判据、随后两个 writer 抢同一个 mic.wav)。
+        // 更准确(顺带表达"混音只服务于这两源"),二是挡住混音线程被装配到畸形配置
+        // 上([Mic, Mic] 会通过 len() < 2 判据继续往下走)。但这只挡住了混音线程本身,
+        // 不是重复源的通用防线:[Mic, Mic] 传进 DualTrackSink::into_wiring 仍会为每个
+        // 元素各开一个 writer,两者抢同一个 mic.wav——如实说,这里没有堵住那个问题。
         // 单源会话(record_system_only)无从混音:直接退化为方案 A,该笔记只有 A 可选。
         if !(self.inner.sources.contains(&Source::Mic) && self.inner.sources.contains(&Source::System)) {
             return Box::new(self.inner).into_wiring();
@@ -113,14 +121,19 @@ impl RecordingSink for MixedSink {
         let (tx, rx) = crossbeam_channel::unbounded::<(usize, Vec<f32>)>();
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
-            let mut writer = AudioTrackWriter::new(&note_dir, MIXED_TRACK, base_ms);
+            // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
+            // 让它的 Drop::flush_header 跑完(否则文件可能还开着、尺寸头是旧的,
+            // 删除时机早了在 Windows 等平台还可能因为文件被占用而失败)。
+            let mut writer = Some(AudioTrackWriter::new(&note_dir, MIXED_TRACK, base_ms));
             // 旁路自杀开关:一旦累加窗超限就 break,不再等 rx 关闭。break 之后不调
             // finish()——已经放弃这条轨,把窗内剩余也吐出去只会让半成品更长,没有意义。
             let mut abandoned = false;
             for (src, chunk) in rx.iter() {
                 let out = mixer.accept(src, &chunk);
                 if !out.is_empty() {
-                    writer.append(&out);
+                    if let Some(w) = writer.as_mut() {
+                        w.append(&out);
+                    }
                 }
                 if mixer.win_len() > MAX_MIXER_WINDOW_SAMPLES {
                     eprintln!(
@@ -134,11 +147,44 @@ impl RecordingSink for MixedSink {
             // break 出循环时 rx 直接被丢弃:两源 sink 的 `let _ = tx.send(...)` 早已把
             // 发送失败静默吞掉,源轨的写盘线程与本线程之间没有别的耦合,提前退出不会
             // 让源轨"落地"受影响。
-            if !abandoned {
+            if abandoned {
+                // "不调 finish()" 不等于"没有半截内容落盘"——AudioTrackWriter 每攒够
+                // 约 1 秒就会 flush_header 回写尺寸,真实的会议场景常常是两源先正常
+                // 混了很久(mixed.wav 早已建档、写出大段内容、回写过合法头),某源才
+                // 中途掉线触发这条守卫。如果这里什么都不做,盘上会留下一条**完全合法
+                // 但被静默截断**的成品轨:list_tracks 按字节数报出错误的 duration,
+                // 转码流程会把它当正常轨转成 m4a 并删掉 WAV,播放器把它当第三条轨
+                // 叠加播放——用户唯一能看到的线索是一行 eprintln。这比"轨道不存在"
+                // 危险得多,所以必须真正删除已写出的内容,而不只是停止再写。
+                //
+                // 顺序:先 drop 掉 writer 让它的 Drop 补完头、刷盘、关闭文件句柄,
+                // 再删除文件——不能反过来(文件还开着时删除在部分平台行为不可控)。
+                drop(writer.take());
+                let mixed_path = note_dir.join(format!("{MIXED_TRACK}.wav"));
+                if let Err(e) = std::fs::remove_file(&mixed_path) {
+                    // 纯单源饥饿(从未定稿过任何样本)时 writer 全程停在 Pending,
+                    // Drop 里 flush_header 对非 Open 状态直接 return,文件本就不存在,
+                    // NotFound 是这种场景下的正常路径,不必当错误声张。其它错误(如
+                    // 权限)才值得留痕排查——但无论如何不能 panic,旁路不许拖累主流程。
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "放弃 mixed.wav 后删除残留文件失败,可能留下时长错误的截断轨\
+                             ({}): {e}",
+                            mixed_path.display()
+                        );
+                    }
+                }
+                // 已知未覆盖、不在本次修复范围:如果混音线程本身 panic(而不是走到
+                // 这条 abandoned 分支),writer 的 Drop 同样会补一个合法头,但这里的
+                // 删除逻辑不会执行——那条路径目前没有清理,需要上层(线程 join 处)
+                // 处理 panic 的场景才能补上。
+            } else {
                 // 两源 sink 都被 drop → 通道关闭 → 定稿窗内剩余,writer Drop 补头刷盘。
                 let tail = mixer.finish();
                 if !tail.is_empty() {
-                    writer.append(&tail);
+                    if let Some(w) = writer.as_mut() {
+                        w.append(&tail);
+                    }
                 }
             }
         }));
@@ -177,10 +223,12 @@ mod tests {
     use crate::audio::Source;
     use crate::store::audio::f32_to_s16;
 
-    /// 喂完样本后拆掉 sink 让通道关闭,再 join 全部写盘线程。带超时:若混音线程
-    /// 该退出却没退出(例如未来 `drop(tx)` 那一行被误删,通道永不关闭、`rx.iter()`
-    /// 永不结束),用例应该在数秒内失败报出原因,而不是挂到 CI job 超时才被杀——
-    /// 那时候排查成本远高于一条断言失败。10 秒足够慢机器跑完这几个用例。
+    /// 喂完样本后拆掉 sink 让通道关闭,再 join 全部写盘线程。带超时:若某条线程
+    /// 该退出却没退出(例如未来 `drop(tx)` 那一行被误删,混音线程的通道永不关闭、
+    /// `rx.iter()` 永不结束),用例应该在数秒内失败报出原因,而不是挂到 CI job
+    /// 超时才被杀——那时候排查成本远高于一条断言失败。10 秒足够慢机器跑完这几个
+    /// 用例。注意 joins 里不止混音线程一条:DualTrackSink 的两条源轨写盘线程也在
+    /// 这个循环里等,它们卡住时下面这条 panic 消息不该被误读成"一定是混音线程"。
     fn drain(w: Wiring) {
         drop(w.sinks);
         for j in w.joins {
@@ -190,7 +238,10 @@ mod tests {
             });
             match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(res) => res.unwrap(),
-                Err(_) => panic!("混音线程未退出:检查 drop(tx) 是否还在——通道不关闭会让 rx.iter() 永不结束"),
+                Err(_) => panic!(
+                    "有写盘/混音线程 10 秒内未退出(源轨线程随 sink drop 而结束;混音线程\
+                     还依赖 drop(tx) 让通道关闭)——检查对应通道是否还在正常关闭"
+                ),
             }
         }
     }
@@ -204,6 +255,22 @@ mod tests {
     /// 按 Source 找到对应 sink 闭包,避免依赖 sinks 在 Vec 里的下标顺序。
     fn sink_for<'a>(w: &'a mut Wiring, want: Source) -> &'a mut Box<dyn FnMut(&[f32]) + Send> {
         w.sinks.iter_mut().find(|(s, _)| *s == want).map(|(_, f)| f).expect("source 未装配")
+    }
+
+    /// sink 闭包只是把样本 send 进 crossbeam 通道,真正落盘由独立线程异步完成。
+    /// 测试里如果要在"喂完一段、还不 drain"的中途断言盘上状态(见下面的
+    /// starvation_after_partial_success 用例),不能假设 send 一返回文件就已写出——
+    /// 这里轮询等文件出现,而不是在 send 之后立刻断言,避免测试本身的时序假设
+    /// 比生产代码的真实时序更脆弱、把纯竞态误判成断言失败。
+    fn wait_until_exists(path: &Path, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        path.exists()
     }
 
     /// mix=false:只落两条源轨,不产生 mixed.wav。
@@ -250,42 +317,54 @@ mod tests {
     /// 位置正确性:本模块存在的理由。一源(mic)先跑两个不同取值的整块,另一源
     /// (system)在此期间完全没喂过,随后一次性追上。追上的样本必须落在它真实对应
     /// 的时间轴位置上(与 mic 对应块相加),而不是被顶到窗尾或按到达顺序错配。
+    ///
+    /// 取值特意避开 f32_to_s16 的饱和区([-1,1] 外 clamp 到 ±32767)。之前这里用的
+    /// 是 1.0/2.0 + system 的 0.1 → 1.1/2.1,两者都会被 clamp 成同一个 32767,两段
+    /// 期望值塌缩成同一句"处处 32767"——这样"只透传了 mic、system 内容根本没混
+    /// 进去"或"system 落到了错误的半区"都测不出来,断言其实什么都没锁住。换成
+    /// 0.1/0.2 + 0.05 后两段期望值(约 4915 / 8191)截然不同,任何一种错误实现都会
+    /// 立刻在某一段红。
     #[test]
     fn lagging_source_content_lands_at_correct_timeline_position() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
         {
             let mic = sink_for(&mut w, Source::Mic);
-            mic(&vec![1.0; 8000]); // 位置 0..8000
-            mic(&vec![2.0; 8000]); // 位置 8000..16000,system 此刻仍一帧未喂
+            mic(&vec![0.1; 8000]); // 位置 0..8000
+            mic(&vec![0.2; 8000]); // 位置 8000..16000,system 此刻仍一帧未喂
         }
         {
             let system = sink_for(&mut w, Source::System);
-            system(&vec![0.1; 16000]); // 一次性追上两个位置区间
+            system(&vec![0.05; 16000]); // 一次性追上两个位置区间
         }
         drain(w);
 
         let mixed = read_pcm_i16(&dir.path().join("mixed.wav"));
         assert_eq!(mixed.len(), 16000);
-        let want_first = f32_to_s16(1.1);
-        let want_second = f32_to_s16(2.1);
+        let want_first = f32_to_s16(0.15);
+        let want_second = f32_to_s16(0.25);
         for (i, &v) in mixed[..8000].iter().enumerate() {
-            assert!((v as i32 - want_first as i32).abs() <= 2, "位置 {i}: got {v} want {want_first}(1.0 段)");
+            assert!((v as i32 - want_first as i32).abs() <= 2, "位置 {i}: got {v} want {want_first}(0.1 段)");
         }
         for (i, &v) in mixed[8000..].iter().enumerate() {
             let pos = i + 8000;
-            assert!((v as i32 - want_second as i32).abs() <= 2, "位置 {pos}: got {v} want {want_second}(2.0 段)");
+            assert!((v as i32 - want_second as i32).abs() <= 2, "位置 {pos}: got {v} want {want_second}(0.2 段)");
         }
     }
 
     /// 硬约束回归:mixed 建档失败只能拖累 mixed 轨,两条源轨必须完整落盘、内容正确。
-    /// 用预先占位同名文件模拟建档失败——AudioTrackWriter::open 对新文件用
-    /// create_new(true),文件已存在就直接 Err,不会覆盖或截断已有内容,是 macOS/
-    /// Linux 上都稳定可行的失败注入方式,不需要摆弄只读权限。
+    ///
+    /// 用预先占位同名**文件**模拟建档失败是无效的:AudioTrackWriter::open 对已存在
+    /// 路径走的是"续录对齐"分支而不是 create_new(true)——`path.exists()` 为真时,
+    /// `metadata().len()` 照样能读出旧占位文件的尺寸,`set_len(44)` 直接把垃圾字节
+    /// 截掉,`write_all(wav_header(0))` 写进一个合法空头,建档反而**成功**,混音全程
+    /// 正常跑完,断言永远绿。真正能让 open() 落到 Err 分支的是把路径占成一个**目录**:
+    /// `path.exists()`/`metadata()` 依然成功,但 `OpenOptions::write(true).open(&path)`
+    /// 在 macOS/Linux 上会因为对目录发起写打开而返回 EISDIR。
     #[test]
     fn mixed_track_creation_failure_does_not_affect_source_tracks() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mixed.wav"), b"occupies the name, not a real wav").unwrap();
+        std::fs::create_dir(dir.path().join("mixed.wav")).unwrap();
         let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
         for _ in 0..100 {
             for (_, s) in w.sinks.iter_mut() {
@@ -300,11 +379,22 @@ mod tests {
         let want = f32_to_s16(0.25);
         assert!(mic.iter().all(|&v| (v as i32 - want as i32).abs() <= 2), "mic 内容应不受影响");
         assert!(system.iter().all(|&v| (v as i32 - want as i32).abs() <= 2), "system 内容应不受影响");
+        // 负向断言:占位目录原样保留、没被写穿成文件——证明建档确实走进了 Err 分支,
+        // 而不是像旧手法那样悄悄把占位物覆盖成一份"看似失败其实成功"的空 WAV。
+        assert!(dir.path().join("mixed.wav").is_dir(), "建档失败不该动到占位目录");
     }
 
     /// Critical 回归:一源彻底停摆(capture 启动失败/设备被拔,一帧都不再喂)时,
     /// 混音旁路的累加窗不会无界增长把内存拖到分配失败——超过 MAX_MIXER_WINDOW_SAMPLES
     /// 混音线程即自杀退出,但两条源轨必须完全不受影响、正常完整落盘。
+    ///
+    /// 同时锁住"放弃"本身:光断言 mic 长度锁不住这条用例名字里说的"aborts mixer"——
+    /// 把守卫整段删掉后,mixer 会攒满全部样本、rx 关闭后 finish() 把窗内内容照样吐出
+    /// 建档写出 mixed.wav,mic 长度丝毫不受影响,断言依然全绿。必须显式断言
+    /// mixed.wav 不存在,才是这条用例存在的理由(推演见下:纯单源饥饿场景里 watermark
+    /// 恒为 0,writer.append 从未被调用,writer 全程停在 Pending,Drop 里
+    /// flush_header 对非 Open 状态直接 return,文件从未被创建过——删掉守卫则会建档
+    /// 写出内容,红绿分明)。
     #[test]
     fn one_sided_starvation_aborts_mixer_without_affecting_source_tracks() {
         let dir = tempfile::tempdir().unwrap();
@@ -321,6 +411,46 @@ mod tests {
         drain(w);
         let mic = read_pcm_i16(&dir.path().join("mic.wav"));
         assert_eq!(mic.len(), 8000 * rounds, "混音旁路放弃不该影响 mic 源轨完整写出");
+        assert!(!dir.path().join("mixed.wav").exists(), "旁路自杀应彻底放弃该轨");
+    }
+
+    /// Critical 回归:C1 守卫真正危险的场景不是上面这种"纯"单源饥饿(writer 从未
+    /// 建档,天然没有残留文件),而是"先正常混了一段、mixed.wav 已经建档写出内容、
+    /// 回写过合法头,某源才中途掉线"。AudioTrackWriter 每攒够约 1 秒就 flush_header
+    /// 回写尺寸,不调 finish() 并不能避免半截内容落盘——真实的会议场景大概率是这样:
+    /// 两源混了很久之后 system 设备被拔,守卫触发时盘上已经是一条完全合法但会被
+    /// 悄悄截断在掉线时刻的成品轨,duration 与内容对不上,下游 list_tracks/转码/
+    /// 播放器都会把它当完整轨处理。守卫必须连带删除已写出的内容,不能只是停止再写。
+    #[test]
+    fn starvation_after_partial_success_removes_already_written_mixed_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+        // 先让两源正常混一段,确保 mixed.wav 真的建档、写出内容、回写过合法头。
+        for _ in 0..100 {
+            for (_, s) in w.sinks.iter_mut() {
+                s(&[0.25; 160]);
+            }
+        }
+        assert!(
+            wait_until_exists(&dir.path().join("mixed.wav"), std::time::Duration::from_secs(5)),
+            "前置条件:掉线前 mixed.wav 应已建档写出"
+        );
+        // 随后 system 彻底停摆,只有 mic 继续推进,直到越过累加窗上限触发自杀。
+        let chunk = vec![0.3f32; 8000];
+        let rounds = MAX_MIXER_WINDOW_SAMPLES / 8000 + 5;
+        {
+            let mic = sink_for(&mut w, Source::Mic);
+            for _ in 0..rounds {
+                mic(&chunk);
+            }
+        }
+        drain(w);
+        assert!(
+            !dir.path().join("mixed.wav").exists(),
+            "旁路自杀必须删除已写出的残留内容,不能留下时长错误但语法合法的成品轨"
+        );
+        let mic = read_pcm_i16(&dir.path().join("mic.wav"));
+        assert_eq!(mic.len(), 160 * 100 + 8000 * rounds, "源轨不受混音旁路自杀影响");
     }
 
     /// 单源会话:无从混音,不产出 mixed.wav(降级为只有方案 A 可选)。
