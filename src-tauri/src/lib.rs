@@ -1651,7 +1651,7 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     for j in s.audio_joins {
         let _ = j.join();
     }
-    // 墙钟-样本对账:趁 health 计数仍在(会话拆除即丢弃),把真值落进 audio.json。
+    // 墙钟-轨时间轴对账:趁 health 计数仍在(会话拆除即丢弃),把真值落进 audio.json。
     // wall_ms 取本场会话净时长(扣暂停),base_ms 传 0——对账描述"这一场",不含历史累计。
     let wall_ms = active_elapsed_ms(
         s.started.elapsed(),
@@ -1661,10 +1661,19 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     );
     for (source, health) in &s.health {
         let h = health.snapshot(*source);
+        // 轨时长必须量 WAV,不能拿 h.samples 换算:后者是设备原生率、交错多声道的原始
+        // 计数,且在暂停闸之前累加(两处口径错误,详见 SyncInfo 文档注释)。此处上面的
+        // audio_joins 已 join 完,WAV 头已收尾,文件长度是终值。
+        let Some(track_ms) = store::audio::session_track_ms(&s.note_dir, source.as_str(), s.base_ms)
+        else {
+            // 该源没有 WAV(采集启动失败/未保留音频):无轨可对账,不写半条记录。
+            continue;
+        };
         let info = store::audio::SyncInfo {
             wall_ms,
             samples: h.samples,
-            drift_ms: (h.samples / 16) as i64 - wall_ms as i64,
+            track_ms,
+            drift_ms: store::audio::drift_ms(track_ms, wall_ms),
             silence_ms: h.silence_ms,
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,

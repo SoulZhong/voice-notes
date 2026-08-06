@@ -104,19 +104,51 @@ pub struct CleanInfo {
     pub neural: Option<bool>,
 }
 
-/// 墙钟-样本对账:该轨在本场录制里实际接受的样本数 vs 墙钟应有的样本数。
+/// 墙钟-轨时间轴对账:该轨在本场录制里实际落盘的时长 vs 同一场的墙钟时长。
 ///
 /// 为什么要落盘:回放侧的三种离线错位量法在 0.2~0.9s 区间互不吻合(见
 /// player_align.rs 头注),分歧本身已达阈值量级,导致"连残余有多大都测不准"。
-/// 录制期我们掌握真值——采集线程的样本计数与墙钟可直接对账,不需要估。有了这条
-/// 基准才谈得上判定方案 A/B 孰优,以及反向标定那三种离线量法。
+/// 录制期我们掌握真值——轨落盘长度与墙钟可直接对账,不需要估。有了这条基准才谈得上
+/// 判定方案 A/B 孰优,以及反向标定那三种离线量法。
+///
+/// # 口径怎么定的(踩过坑,别再改回去)
+///
+/// track_ms 取自 **WAV 实际字节数**,不是采集侧的样本计数器。两条理由缺一不可:
+/// - WAV 是重采样之后写入的,天然 16k 单声道口径;而 frame_tap 的 samples 计的是
+///   设备原生率、交错多声道的原始样本(见 samples 字段注释),换算不出毫秒。
+/// - WAV 是暂停闸之后写入的(sink 调用点在 segment_worker 的暂停 `continue` 之后),
+///   天然是净时长;而 samples 在闸之前累加,暂停期照涨,与 wall_ms(净)口径不一致。
+///
+/// # drift_ms 怎么用(重要)
+///
+/// drift_ms **含一段系统性正偏置**:各路 capture 在 start_session 内部就已起流产帧,
+/// 而墙钟起点 `started` 取于 start_session 返回之后,这段启动窗被算进了 track_ms 却
+/// 没算进 wall_ms。消除它要动录制主链路的启动时序,风险大于收益,故不修。
+/// 另有两处更小的同向偏置:mic 路软件 AEC 按 10ms 整帧输出,尾部不足一帧的余量滞留在
+/// AEC 内部不落盘(负向,< 10ms);轨长换算按字节整除,也有亚毫秒截断。
+///
+/// 因此:**drift_ms 的绝对值不宜直接用作达标判据**。真正稳健的量是**两轨 drift 之差**
+/// (`drift_ms(mic) − drift_ms(system)`):启动窗与暂停对两轨的影响大体同向,相减可
+/// 抵消大部分。回放对齐关心的本来就是两轨的**相对**关系,不是各自对墙钟的绝对偏差。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncInfo {
-    /// 本场录制墙钟时长(ms)。
+    /// 本场录制墙钟时长(ms,已扣暂停)。
     pub wall_ms: u64,
-    /// 该轨实际接受的样本数(16k 口径)。
+    /// 该轨累计原始样本数,**设备原生采样率、交错多声道**口径(frame_tap 直接累加
+    /// `frame.samples.len()`,到 16k 单声道的转换在它下游)。实测四条采集路径没有一条
+    /// 是 16k:macOS SCK 48k×1、macOS VPIO 48k×1、cpal mic 44.1/48k×2ch、
+    /// Windows loopback 48k×2ch。**不是 16k 口径,不可直接换算毫秒**(除以 16 会偏
+    /// 3~6 倍);且它在暂停闸之前累加,暂停期照涨。保留纯粹是为排障(看帧量级/是否为零)。
+    /// 要时长请用 track_ms。
     pub samples: u64,
-    /// 漂移 = samples/16 − wall_ms。负值 = 该轨时钟跑慢(样本数不足墙钟)。
+    /// 本场该轨的 16k 口径净时长(ms):由 WAV 实际字节数量出,减去本场开始前该轨已有
+    /// 的长度。轨文件不存在(采集启动失败/未保留音频)时本条 SyncInfo 整个不写。
+    /// 新增字段,serde default:老记录缺这个键时按 0 读入,而不是让整个 audio.json
+    /// 反序列化失败——那会连 offset_ms 一起丢掉,把回放对齐搞坏。
+    #[serde(default)]
+    pub track_ms: u64,
+    /// 漂移 = track_ms − wall_ms。正 = 轨比墙钟长,负 = 该轨时钟跑慢。
+    /// 含启动窗偏置,用法见结构体文档注释("怎么用"一节)。
     pub drift_ms: i64,
     /// frame_tap 累计补的静音时长(ms)。
     pub silence_ms: u64,
@@ -124,6 +156,34 @@ pub struct SyncInfo {
     pub gaps: u32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: u32,
+}
+
+/// 轨时间轴 − 墙钟。抽成纯函数是为了能被表驱动测试直接打:这条数是后续所有漂移标定
+/// 的基准,算错的基准比没有基准更坏,不能只靠 serde 往返测试"顺带"覆盖。
+/// i64:两侧都可能更长,符号本身是结论(正=轨长,负=轨短)。
+pub fn drift_ms(track_ms: u64, wall_ms: u64) -> i64 {
+    track_ms as i64 - wall_ms as i64
+}
+
+/// 从 WAV 文件长度算本场该轨的净时长(ms)。纯函数,便于表驱动测试。
+///
+/// carried = base_ms − offset_ms 是**本场开始前**该轨已有的时长:offset_ms 是该轨 0
+/// 时刻在笔记时间轴上的位置(轨可中途出现,见 AudioMeta 注释),AudioTrackWriter::open
+/// 的续录分支正是把文件 set_len 到这个长度之后才追加本场内容的。直接减 base_ms 只在
+/// offset_ms == 0 时才对——对"第二场才出现的轨",那样会减多,甚至减成负数。
+fn track_ms_from_wav_len(wav_len: u64, base_ms: u64, offset_ms: u64) -> u64 {
+    let file_ms = bytes_to_ms(wav_len.saturating_sub(HEADER_LEN));
+    let carried = base_ms.saturating_sub(offset_ms);
+    file_ms.saturating_sub(carried)
+}
+
+/// 量 note_dir 下 `<source>.wav` 得到本场该轨净时长(ms)。
+/// 必须在写盘线程 join 之后调用(WAV 头已收尾、文件长度已定终)。
+/// None = 该轨没有 WAV(采集启动失败、未保留音频、或文件被移走):无从对账,调用方跳过。
+pub fn session_track_ms(note_dir: &Path, source: &str, base_ms: u64) -> Option<u64> {
+    let wav_len = std::fs::metadata(note_dir.join(format!("{source}.wav"))).ok()?.len();
+    let offset_ms = load_audio_meta(note_dir).tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+    Some(track_ms_from_wav_len(wav_len, base_ms, offset_ms))
 }
 
 /// 从 16k/mono/s16 WAV 流式计算波形桶:每桶取峰值 |i16| 折算 0..255。
@@ -261,7 +321,9 @@ pub fn set_track_clean_info(note_dir: &Path, source: &str, info: CleanInfo) -> a
     save_audio_meta(note_dir, &meta)
 }
 
-/// 写入某轨的墙钟-样本对账。全程持 audio.json 写锁;只改 sync 字段,保留其它。
+/// 写入某轨的墙钟-轨时间轴对账。全程持 audio.json 写锁;只改 sync 字段,保留其它。
+/// 与 set_track_clean_info 同模板,另补写 schema_version = 1——与本模块其它写入点
+/// (open 的两条建档分支)一致,不是笔误。
 pub fn set_track_sync(note_dir: &Path, source: &str, info: SyncInfo) -> anyhow::Result<()> {
     let _guard = meta_guard();
     let mut meta = load_audio_meta(note_dir);
@@ -862,14 +924,111 @@ mod tests {
         set_track_sync(
             dir.path(),
             "mic",
-            SyncInfo { wall_ms: 60_000, samples: 959_000, drift_ms: -62, silence_ms: 0, gaps: 0, rate_fixes: 1 },
+            SyncInfo {
+                wall_ms: 60_000,
+                // 原生 48k 单声道跑 60 秒的量级:不是 16k 口径,不参与任何毫秒换算。
+                samples: 2_880_000,
+                track_ms: 59_937,
+                drift_ms: drift_ms(59_937, 60_000),
+                silence_ms: 0,
+                gaps: 0,
+                rate_fixes: 1,
+            },
         )
         .unwrap();
         let meta = load_audio_meta(dir.path());
         let s = meta.tracks.get("mic").unwrap().sync.as_ref().expect("应已写入");
         assert_eq!(s.wall_ms, 60_000);
-        assert_eq!(s.drift_ms, -62, "负值 = 该轨样本数不足墙钟,时钟跑慢");
+        assert_eq!(s.track_ms, 59_937);
+        assert_eq!(s.samples, 2_880_000);
+        assert_eq!(s.drift_ms, -63, "负值 = 该轨落盘时长不足墙钟,时钟跑慢");
         assert_eq!(s.rate_fixes, 1);
+
+        // 名副其实的"旧 JSON":不含 sync 键的轨道必须照常反序列化,sync 落 None。
+        let old: TrackMeta = serde_json::from_str(r#"{"offset_ms":7}"#).unwrap();
+        assert_eq!(old.offset_ms, 7);
+        assert!(old.sync.is_none(), "旧 JSON 无 sync 键 → None");
+
+        // 更旧的一档:sync 已写入但没有 track_ms 键(本次口径修正之前落盘的记录)。
+        // 必须能读进来 —— 若整条反序列化失败,load_audio_meta 会静默退回空表,
+        // 连 offset_ms 都丢掉,回放对齐会被搞坏。
+        let older: TrackMeta = serde_json::from_str(
+            r#"{"offset_ms":0,"sync":{"wall_ms":60000,"samples":959000,"drift_ms":-63,
+                "silence_ms":0,"gaps":0,"rate_fixes":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(older.sync.as_ref().unwrap().track_ms, 0, "缺 track_ms 键 → default 0");
+    }
+
+    /// 表驱动:drift_ms 的符号与量级。整个对账任务的数值核心,不允许零覆盖。
+    #[test]
+    fn drift_ms_signs_and_magnitudes() {
+        // (track_ms, wall_ms, 期望 drift, 场景)
+        let cases: &[(u64, u64, i64, &str)] = &[
+            (60_500, 60_000, 500, "轨长于墙钟 → 正"),
+            (59_500, 60_000, -500, "轨短于墙钟 → 负"),
+            (60_000, 60_000, 0, "相等 → 零"),
+            // 真实量级:48k 谎报为 44.1k 的 mic 跑半小时,轨比墙钟长约 2 分钟。
+            (1_920_000, 1_800_000, 120_000, "真实量级:半小时录制漂 2 分钟"),
+            (59_937, 60_000, -63, "亚百毫秒残余仍要如实带符号"),
+            (0, 60_000, -60_000, "轨全空(采集死了)→ 全负"),
+        ];
+        for (track, wall, want, what) in cases {
+            assert_eq!(drift_ms(*track, *wall), *want, "{what}");
+        }
+        // 符号可区分:同样偏 500ms,一正一负不能被绝对值抹平。
+        assert_ne!(drift_ms(60_500, 60_000), drift_ms(59_500, 60_000));
+    }
+
+    /// 表驱动:轨净时长的换算,重点是续录场景要减对 carried(base − offset)。
+    #[test]
+    fn track_ms_from_wav_len_accounts_for_carried_length() {
+        const HDR: u64 = HEADER_LEN;
+        let ms_bytes = |ms: u64| ms * 16_000 / 1000 * 2; // 16k s16le mono
+        // (文件总长, base_ms, offset_ms, 期望 track_ms, 场景)
+        let cases: &[(u64, u64, u64, u64, &str)] = &[
+            (HDR + ms_bytes(60_000), 0, 0, 60_000, "首场新轨:整条文件都是本场的"),
+            (HDR, 0, 0, 0, "只有头没有数据 → 0"),
+            (
+                HDR + ms_bytes(90_000),
+                60_000,
+                0,
+                30_000,
+                "续录:首场就在的轨(offset=0),减掉 base 得本场增量",
+            ),
+            (
+                HDR + ms_bytes(90_000),
+                120_000,
+                60_000,
+                30_000,
+                "续录:第二场才出现的轨(offset=60s),必须减 base−offset 而非 base",
+            ),
+            (
+                HDR + ms_bytes(50_000),
+                60_000,
+                0,
+                0,
+                "文件比 carried 还短(本场没写/被截断)→ 饱和为 0,不出负数",
+            ),
+        ];
+        for (len, base, offset, want, what) in cases {
+            assert_eq!(track_ms_from_wav_len(*len, *base, *offset), *want, "{what}");
+        }
+    }
+
+    /// session_track_ms:轨文件缺失时返回 None(调用方据此跳过,不写 SyncInfo)。
+    #[test]
+    fn session_track_ms_reads_file_and_skips_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(session_track_ms(dir.path(), "mic", 0), None, "无 WAV → None");
+
+        let mut w = AudioTrackWriter::new(dir.path(), "mic", 0);
+        w.append(&vec![0.1f32; 16_000]); // 1 秒 @16k
+        drop(w); // Drop 收尾回写头
+        assert_eq!(session_track_ms(dir.path(), "mic", 0), Some(1_000));
+
+        // 续录:第二场 base=1000,轨已有 1 秒 → 本场增量为 0。
+        assert_eq!(session_track_ms(dir.path(), "mic", 1_000), Some(0));
     }
 
     #[test]
