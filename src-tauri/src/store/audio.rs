@@ -458,6 +458,8 @@ pub struct TrackInfo {
 
 /// 已知源集合 = audio.json 记录过的 ∪ 内建两源:写入端(lib.rs 按配置源建档)与
 /// 读取端由 audio.json 桥接对齐,未来新增源不会在这里被漏掉。
+/// 注意:这里**包含**成品轨(MIXED_TRACK)——转码、陈旧头修复都要靠它找到那条轨。
+/// 「不进播放器轨列表」是 list_tracks 一处的过滤,不是从源头就藏起来。
 fn known_sources(meta: &AudioMeta) -> Vec<String> {
     let mut sources: Vec<String> = vec!["mic".into(), "system".into()];
     for s in meta.tracks.keys() {
@@ -468,49 +470,64 @@ fn known_sources(meta: &AudioMeta) -> Vec<String> {
     sources
 }
 
-/// 枚举笔记的音频轨道(详情页播放器用)。每源优先上报已转码的 m4a、否则回落 WAV。
-/// 时长口径按格式区分:WAV 由字节数换算(bytes_to_ms);m4a 例外——容器不能按字节换算,
-/// 时长取转码器实测后写进 audio.json 的记录(记录缺失即视为损坏,跳过该轨,不回落 WAV)。
-pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
-    let meta = load_audio_meta(note_dir);
-    let mut out = Vec::new();
-    for source in known_sources(&meta) {
-        let m4a_path = note_dir.join(format!("{source}.m4a"));
-        if m4a_path.exists() {
-            // 转码已完成:优先上报 m4a。m4a 容器不能按字节数换算时长,只能取转码器
-            // 实测写入 audio.json 的记录;记录缺失说明转码/写档中途失败,视为损坏跳过
-            // 该轨(而非回落 WAV——WAV 大概率已被转码流水线删除)。
-            let Some(duration_ms) = meta.tracks.get(&source).and_then(|t| t.duration_ms) else {
-                continue;
-            };
-            out.push(TrackInfo {
-                path: m4a_path.to_string_lossy().into_owned(),
-                offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
-                waveform: meta.tracks.get(&source).and_then(|t| t.waveform.clone()),
-                source,
-                duration_ms,
-            });
-            continue;
-        }
-        let path = note_dir.join(format!("{source}.wav"));
-        let Ok(md) = std::fs::metadata(&path) else { continue };
-        if md.len() <= HEADER_LEN {
-            continue; // 空轨道(刚建头没内容/损坏残留)不给前端,免得渲染空播放器
-        }
-        out.push(TrackInfo {
-            path: path.to_string_lossy().into_owned(),
-            offset_ms: meta.tracks.get(&source).map(|t| t.offset_ms).unwrap_or(0),
-            // 未转码 WAV(中断笔记/转码失败降级):波形与 m4a 同策略——读 audio.json 里
-            // 预算好的桶,没有(首次打开)就报 None。曾在这里同步 waveform_from_wav 现算,
-            // 但长会议(数小时 WAV 达数百 MB)全扫是切换卡顿主因,已移交 note_audio_info
-            // 的后台懒回填(backfill_wav_waveform 算完写回 meta 并发 transcode_done 重拉),
-            // 不再阻塞枚举;缺波形期间前端自动退段落包络。
-            waveform: meta.tracks.get(&source).and_then(|t| t.waveform.clone()),
-            source,
-            duration_ms: bytes_to_ms(md.len() - HEADER_LEN),
+/// 单个源的轨道信息:每源优先上报已转码的 m4a、否则回落 WAV。时长口径按格式区分:
+/// WAV 由字节数换算(bytes_to_ms);m4a 例外——容器不能按字节换算,时长取转码器实测后
+/// 写进 audio.json 的记录(记录缺失即视为损坏,跳过该轨,不回落 WAV)。
+/// list_tracks 与 mixed_track 共用这一份,枚举口径不会因为调用方不同而分叉。
+fn track_info_for(note_dir: &Path, meta: &AudioMeta, source: &str) -> Option<TrackInfo> {
+    let m4a_path = note_dir.join(format!("{source}.m4a"));
+    if m4a_path.exists() {
+        // 转码已完成:优先上报 m4a。m4a 容器不能按字节数换算时长,只能取转码器
+        // 实测写入 audio.json 的记录;记录缺失说明转码/写档中途失败,视为损坏跳过
+        // 该轨(而非回落 WAV——WAV 大概率已被转码流水线删除)。
+        let duration_ms = meta.tracks.get(source).and_then(|t| t.duration_ms)?;
+        return Some(TrackInfo {
+            path: m4a_path.to_string_lossy().into_owned(),
+            offset_ms: meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0),
+            waveform: meta.tracks.get(source).and_then(|t| t.waveform.clone()),
+            source: source.to_string(),
+            duration_ms,
         });
     }
-    out
+    let path = note_dir.join(format!("{source}.wav"));
+    let md = std::fs::metadata(&path).ok()?;
+    if md.len() <= HEADER_LEN {
+        return None; // 空轨道(刚建头没内容/损坏残留)不给前端,免得渲染空播放器
+    }
+    Some(TrackInfo {
+        path: path.to_string_lossy().into_owned(),
+        offset_ms: meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0),
+        // 未转码 WAV(中断笔记/转码失败降级):波形与 m4a 同策略——读 audio.json 里
+        // 预算好的桶,没有(首次打开)就报 None。曾在这里同步 waveform_from_wav 现算,
+        // 但长会议(数小时 WAV 达数百 MB)全扫是切换卡顿主因,已移交 note_audio_info
+        // 的后台懒回填(backfill_wav_waveform 算完写回 meta 并发 transcode_done 重拉),
+        // 不再阻塞枚举;缺波形期间前端自动退段落包络。
+        waveform: meta.tracks.get(source).and_then(|t| t.waveform.clone()),
+        source: source.to_string(),
+        duration_ms: bytes_to_ms(md.len() - HEADER_LEN),
+    })
+}
+
+/// 枚举笔记的**源轨**(详情页播放器用)。刻意排除成品轨(MIXED_TRACK,方案 B 录制期
+/// 混好的轨):播放器把这里返回的每条轨叠加播放,mic+system+mixed 三条一起播会变成
+/// 三重叠加(成品轨本就是 mic+system 混出来的),音量翻倍、听感像回声——而成品轨的
+/// 本意恰恰是消除回放重影。第二期的回放方案切换走 mixed_track 单独取那条轨,
+/// 不经这里。
+pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
+    let meta = load_audio_meta(note_dir);
+    known_sources(&meta)
+        .into_iter()
+        .filter(|s| s != crate::pipeline::recording_sink::MIXED_TRACK)
+        .filter_map(|source| track_info_for(note_dir, &meta, &source))
+        .collect()
+}
+
+/// 单独取成品轨(第二期回放方案切换消费,不进播放器的源轨列表)。
+/// 枚举口径与 list_tracks 对源轨完全一致(m4a 优先、时长/波形取法相同),
+/// 只是只看 MIXED_TRACK 这一个源,复用 track_info_for 避免口径分叉。
+pub fn mixed_track(note_dir: &Path) -> Option<TrackInfo> {
+    let meta = load_audio_meta(note_dir);
+    track_info_for(note_dir, &meta, crate::pipeline::recording_sink::MIXED_TRACK)
 }
 
 /// 陈旧头校验:实际长度与头部 data 尺寸不一致才重写(非活动笔记打开详情时调用;
@@ -848,5 +865,81 @@ mod tests {
         let c = meta.tracks["mic"].clean.as_ref().unwrap();
         assert_eq!((c.delay_ms, c.segments), (600, 1));
         assert_eq!(c.neural, None, "旧记录缺 neural 键应落到 None");
+    }
+
+    /// 核心回归:mic/system/mixed 三条 WAV 同时在场(方案 B 录制),list_tracks 只应
+    /// 报两条源轨——mixed 混进播放器轨列表会导致 mic+system+mixed 三重叠加播放。
+    #[test]
+    fn list_tracks_excludes_mixed_track_when_source_tracks_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        for source in ["mic", "system", crate::pipeline::recording_sink::MIXED_TRACK] {
+            let mut w = AudioTrackWriter::new(tmp.path(), source, 0);
+            w.append(&vec![0.1f32; 160]);
+            drop(w);
+        }
+
+        let tracks = list_tracks(tmp.path());
+        let sources: Vec<&str> = tracks.iter().map(|t| t.source.as_str()).collect();
+        assert_eq!(tracks.len(), 2, "mixed 不应出现在播放器轨列表里: {sources:?}");
+        assert!(sources.contains(&"mic"));
+        assert!(sources.contains(&"system"));
+        assert!(
+            !sources.contains(&crate::pipeline::recording_sink::MIXED_TRACK),
+            "成品轨不得混进源轨列表"
+        );
+    }
+
+    /// mixed_track 单独取成品轨,口径(offset_ms/时长)与 list_tracks 对源轨的口径一致。
+    #[test]
+    fn mixed_track_returns_the_mixed_source_with_consistent_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
+        w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
+        drop(w);
+        let mut w = AudioTrackWriter::new(
+            tmp.path(),
+            crate::pipeline::recording_sink::MIXED_TRACK,
+            0,
+        );
+        w.append(&vec![0.2f32; (AUDIO_SAMPLE_RATE / 2) as usize]); // 0.5s
+        drop(w);
+
+        let mixed = mixed_track(tmp.path()).expect("mixed.wav 存在时应能取到成品轨");
+        assert_eq!(mixed.source, crate::pipeline::recording_sink::MIXED_TRACK);
+        assert_eq!(mixed.offset_ms, 0);
+        assert_eq!(mixed.duration_ms, 500, "时长口径与 list_tracks 对 WAV 源轨一致(字节数换算)");
+
+        // list_tracks 里 mic 走同一套 track_info_for,offset/时长口径应互相印证。
+        let tracks = list_tracks(tmp.path());
+        let mic = tracks.iter().find(|t| t.source == "mic").unwrap();
+        assert_eq!(mic.duration_ms, 1000);
+        assert_eq!(mic.offset_ms, mixed.offset_ms, "两轨同场起录,offset 口径一致");
+    }
+
+    /// 没有 mixed.wav(未开方案 B / 旧笔记)时,mixed_track 返回 None 而不是报错或伪造。
+    #[test]
+    fn mixed_track_returns_none_when_no_mixed_wav() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
+        w.append(&vec![0.1f32; 160]);
+        drop(w);
+        assert!(mixed_track(tmp.path()).is_none());
+    }
+
+    /// 只有 mixed.wav、没有源轨(极端/测试态)时,list_tracks 必须返回空,
+    /// 不能因为 known_sources 里含 mixed 就把它漏给播放器。
+    #[test]
+    fn list_tracks_empty_when_only_mixed_track_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = AudioTrackWriter::new(
+            tmp.path(),
+            crate::pipeline::recording_sink::MIXED_TRACK,
+            0,
+        );
+        w.append(&vec![0.1f32; 160]);
+        drop(w);
+
+        assert!(list_tracks(tmp.path()).is_empty(), "只有成品轨时源轨列表应为空");
+        assert!(mixed_track(tmp.path()).is_some(), "但 mixed_track 仍应能取到它");
     }
 }
