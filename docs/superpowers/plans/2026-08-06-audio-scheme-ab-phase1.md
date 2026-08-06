@@ -825,7 +825,11 @@ EOF
 - [ ] 设置页 `mix_track` 开:三条轨齐全,`mixed.wav` 字节数与源轨一致
 - [ ] 单源会话(`record_system_only`)开 `mix_track`:不产出 `mixed.wav`,不报错
 - [ ] **真机冒烟**:录一场 ≥5 分钟的真实会议,停录后 `audio.json` 里两轨均有 `sync` 记录
-- [ ] **判据检查**:新录笔记两轨 `drift_ms` 绝对值 **< 20ms**(spec §度量 的验收线)
+- [ ] ~~**判据检查**:新录笔记两轨 `drift_ms` 绝对值 **< 20ms**(spec §度量 的验收线)~~
+      **该判据已被 spec 修订取代,勾这一条时以两轨之差为准**:`|drift_ms(mic) −
+      drift_ms(system)| < 20ms`。`drift_ms` 各自的绝对值含一段已知且不修的系统性偏置
+      (启动窗等),不能直接当达标线;两轨相减可抵消大部分,且回放对齐关心的本就是两轨的
+      相对关系。现行口径见 spec §度量「验收判据」与 `store/audio.rs` 的 `SyncInfo` 文档。
 
 > 若 `drift_ms` 超过 20ms,先不要调混音器——那说明问题在 `frame_tap` 的率纠正或 AEC 的
 > 10ms 整帧对齐,应回到 spec §已知限制 第 4 条重新评估该判据是否过严。

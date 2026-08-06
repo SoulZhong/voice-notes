@@ -1643,6 +1643,19 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
     // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
     telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
+    // 对账用的墙钟必须在这里取,不能等到下面 join 完再取:handle.stop() 要 join ASR 线程
+    // (等尾段识别跑完,云端还可能叠上重连/补识往返),audio_joins 要排干无界写盘队列
+    // (它存在的理由正是"磁盘可能卡顿数秒")——这段拆解耗时既无上界也未被测量,算进
+    // wall_ms 就是给 drift_ms 加一段大到能翻转符号的负偏置,让 SyncInfo 文档里那份
+    // 偏置清单(启动窗等,量级 ≤ 数百 ms)失效,首次冒烟的读数会被解释反。
+    // 与之相对,track_ms 必须留在 join 之后取——那时 WAV 头才收尾,文件长度才是终值。
+    // base_ms 传 0:对账描述"这一场",不含历史累计。
+    let wall_ms = active_elapsed_ms(
+        s.started.elapsed(),
+        s.paused_accum,
+        s.paused_at.map(|p| p.elapsed()),
+        0,
+    );
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
     stash_model(&state.embedder_cache, embedder);
@@ -1652,13 +1665,7 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
         let _ = j.join();
     }
     // 墙钟-轨时间轴对账:趁 health 计数仍在(会话拆除即丢弃),把真值落进 audio.json。
-    // wall_ms 取本场会话净时长(扣暂停),base_ms 传 0——对账描述"这一场",不含历史累计。
-    let wall_ms = active_elapsed_ms(
-        s.started.elapsed(),
-        s.paused_accum,
-        s.paused_at.map(|p| p.elapsed()),
-        0,
-    );
+    // wall_ms 已在 stop 之前取好(见上),这里只补 track_ms。
     for (source, health) in &s.health {
         let h = health.snapshot(*source);
         // 轨时长必须量 WAV,不能拿 h.samples 换算:后者是设备原生率、交错多声道的原始
