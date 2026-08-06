@@ -130,6 +130,26 @@ pub struct CleanInfo {
 /// 因此:**drift_ms 的绝对值不宜直接用作达标判据**。真正稳健的量是**两轨 drift 之差**
 /// (`drift_ms(mic) − drift_ms(system)`):启动窗与暂停对两轨的影响大体同向,相减可
 /// 抵消大部分。回放对齐关心的本来就是两轨的**相对**关系,不是各自对墙钟的绝对偏差。
+///
+/// # 判读陷阱:drift_ms≈0 不等于"对齐良好"
+///
+/// `frame_tap` 断流时补的静音帧走的是和真实帧完全相同的下游路径,经重采样后照样落进
+/// WAV,计入 track_ms。于是一路采集在录制中途彻底死掉时,tap 会一直补零把时间轴撑满,
+/// 最终 track_ms ≈ wall_ms、drift_ms ≈ 0——读数是"完美对齐",而那条轨其实半场是静音。
+/// 这不是缺陷(补零维持时间轴正是 frame_tap 的设计意图),但是最容易看错的情形。
+/// 判读 drift_ms **必须同时看 silence_ms 与 gaps**,silence_ms 占 wall_ms 比例畸高
+/// (或 gaps 不为零)时,drift_ms 再小也不能当作"这条轨录得好"的证据。
+///
+/// 另一处易混淆:读到 `track_ms == 0` 时,先确认是不是**口径修正前的老记录**——本次
+/// 口径修正之前,SourceHealth.samples 曾被当 16k 口径直接换算,那批已落盘的旧 sync
+/// 记录没有 track_ms 键,serde default 读入即为 0,其 drift_ms 也是旧公式算出的错值,
+/// 不代表"本场零内容"。这条和真·零内容的边角会撞车,判读时用 samples 是否为 0 辅助
+/// 区分(旧记录 samples 通常非零,真零内容时 samples 也是 0)。
+///
+/// 零内容边角下还有一个已知的极窄情形,不必为它改代码,归到这条一并说明即可:
+/// `AudioTrackWriter::open()` 是懒调用,首次 append 才跑;若本场一个样本都没写,
+/// 对齐用的 set_len 从未执行,文件仍停在上一场结束时的长度——这个长度若与 base_ms
+/// 不齐,会被换算出一个非零的假漂移。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncInfo {
     /// 本场录制墙钟时长(ms,已扣暂停)。
@@ -1029,6 +1049,21 @@ mod tests {
 
         // 续录:第二场 base=1000,轨已有 1 秒 → 本场增量为 0。
         assert_eq!(session_track_ms(dir.path(), "mic", 1_000), Some(0));
+    }
+
+    /// session_track_ms 必须真从 audio.json 读 offset_ms,不能形同虚设:上面那例全程
+    /// offset_ms 恒为 0,即便读 offset 那行被改成写死的常量 0 也测不出来。这里让轨道
+    /// 中途才出现(offset_ms=60_000,与建档时的 base_ms 一致,同 open() 新建分支的写入
+    /// 语义),同一场内追加 30 秒 —— 本场 carried = base_ms(60_000) − offset_ms(60_000)
+    /// = 0,track_ms 应等于全部本场内容 30_000。若 offset 被读成 0,carried 会错算成
+    /// 60_000,30_000 饱和减出 0,与期望值 30_000 不同,才有鉴别力。
+    #[test]
+    fn session_track_ms_reads_offset_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = AudioTrackWriter::new(dir.path(), "mic", 60_000); // 建档即写 offset_ms=60_000
+        w.append(&vec![0.1f32; 16_000 * 30]); // 30 秒 @16k
+        drop(w);
+        assert_eq!(session_track_ms(dir.path(), "mic", 60_000), Some(30_000));
     }
 
     #[test]
