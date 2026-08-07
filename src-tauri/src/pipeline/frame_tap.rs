@@ -18,7 +18,7 @@ use crate::audio::{AudioCapture, AudioFrame, Source};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 时钟核对的默认评估窗。见 `TapPolicy::rate_eval_window`。
@@ -41,6 +41,8 @@ const PHASE_TRIM_SECS: f64 = 60.0;
 const PHASE_TRIM_MAX: f64 = 0.02;
 /// 债务小于此值即视为还清(半毫秒,远低于任何听感与门控阈值)。
 const PHASE_TRIM_EPS: f64 = 0.000_5;
+/// mixed 轨固定为 16kHz;首帧墙钟偏移按这个口径交给时间轴混音器。
+const MIX_TIMELINE_RATE: u64 = 16_000;
 
 /// 还款期内**恒定**的目标采样率:债务确定时一次算定,直到还清都不再变。
 ///
@@ -117,6 +119,9 @@ pub struct SourceHealth {
     pub restarts: AtomicU32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: AtomicU32,
+    /// 首个真实帧相对本场最早首帧的 16k 样本偏移,+1 编码(0 表示尚未见首帧)。
+    /// mixed sink 在首个重采样块到达时读取,把两源放进同一墙钟原点。
+    first_frame_offset_16k_plus_one: AtomicU64,
 }
 
 /// 健康快照(pipeline_health 命令的序列化单元)。
@@ -142,6 +147,31 @@ impl SourceHealth {
             restarts: self.restarts.load(Ordering::Relaxed),
             rate_fixes: self.rate_fixes.load(Ordering::Relaxed),
         }
+    }
+
+    fn record_first_frame(&self, now: Instant, origin: &OnceLock<Instant>) {
+        let zero = *origin.get_or_init(|| now);
+        let elapsed = now.checked_duration_since(zero).unwrap_or_default();
+        let offset = (elapsed.as_nanos() * MIX_TIMELINE_RATE as u128 / 1_000_000_000) as u64;
+        let _ = self.first_frame_offset_16k_plus_one.compare_exchange(
+            0,
+            offset.saturating_add(1),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 尚未见首帧时保守返回 0;正常生产路径中 audio sink 只会在首帧经过 tap 后调用。
+    pub fn first_frame_offset_16k(&self) -> u64 {
+        self.first_frame_offset_16k_plus_one
+            .load(Ordering::Acquire)
+            .saturating_sub(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_first_frame_offset_16k_for_test(&self, offset: u64) {
+        self.first_frame_offset_16k_plus_one
+            .store(offset.saturating_add(1), Ordering::Release);
     }
 }
 
@@ -240,6 +270,7 @@ pub struct TappedCapture {
     /// start 时取走(TapNotify 非 Clone);重复 start 本仓不存在,取空则退化为无通知。
     notify: Option<TapNotify>,
     tap: Option<std::thread::JoinHandle<()>>,
+    timeline_origin: Arc<OnceLock<Instant>>,
 }
 
 impl TappedCapture {
@@ -250,7 +281,34 @@ impl TappedCapture {
         health: Arc<SourceHealth>,
         notify: TapNotify,
     ) -> Self {
-        Self { inner, source, policy, health, notify: Some(notify), tap: None }
+        Self::new_with_timeline_origin(
+            inner,
+            source,
+            policy,
+            health,
+            notify,
+            Arc::new(OnceLock::new()),
+        )
+    }
+
+    /// 同一会话的所有源共享 timeline_origin;第一个真实帧把它钉为 mixed 时间轴 0 点。
+    pub fn new_with_timeline_origin(
+        inner: Box<dyn AudioCapture>,
+        source: Source,
+        policy: TapPolicy,
+        health: Arc<SourceHealth>,
+        notify: TapNotify,
+        timeline_origin: Arc<OnceLock<Instant>>,
+    ) -> Self {
+        Self {
+            inner,
+            source,
+            policy,
+            health,
+            notify: Some(notify),
+            tap: None,
+            timeline_origin,
+        }
     }
 }
 
@@ -261,8 +319,17 @@ impl AudioCapture for TappedCapture {
         let policy = self.policy;
         let source = self.source;
         let notify = self.notify.take().unwrap_or_else(TapNotify::none);
+        let timeline_origin = self.timeline_origin.clone();
         self.tap = Some(std::thread::spawn(move || {
-            run_frame_tap(source, cap_rx, sink, health, policy, notify)
+            run_frame_tap_with_origin(
+                source,
+                cap_rx,
+                sink,
+                health,
+                policy,
+                notify,
+                timeline_origin,
+            )
         }));
         self.inner.start(cap_tx)
     }
@@ -285,6 +352,26 @@ pub fn run_frame_tap(
     health: Arc<SourceHealth>,
     policy: TapPolicy,
     notify: TapNotify,
+) {
+    run_frame_tap_with_origin(
+        _source,
+        from_capture,
+        to_worker,
+        health,
+        policy,
+        notify,
+        Arc::new(OnceLock::new()),
+    )
+}
+
+fn run_frame_tap_with_origin(
+    _source: Source,
+    from_capture: Receiver<AudioFrame>,
+    to_worker: Sender<AudioFrame>,
+    health: Arc<SourceHealth>,
+    policy: TapPolicy,
+    notify: TapNotify,
+    timeline_origin: Arc<OnceLock<Instant>>,
 ) {
     // 最近一次真实帧的格式:没收到过帧就不填充(源可能根本没起来,
     // 填零会凭空造出一条空白轨)。
@@ -347,6 +434,9 @@ pub fn run_frame_tap(
                 let now = Instant::now();
                 let gap = now.duration_since(last_frame_at);
                 let first = anchor.is_none();
+                if first {
+                    health.record_first_frame(now, &timeline_origin);
+                }
                 // 设备中途换率(拔插耳机/切设备)是正当的断点:声明变了就丢弃旧的实测
                 // 结论,按新声明值从头核对,不把上一只设备的速率套到下一只头上。
                 if !first && last_format != Some((frame.sample_rate, frame.channels)) {
@@ -519,6 +609,20 @@ pub fn run_frame_tap(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32 as StdAtomicU32;
+
+    #[test]
+    fn shared_origin_records_relative_first_frame_offsets() {
+        let origin = OnceLock::new();
+        let mic = SourceHealth::default();
+        let system = SourceHealth::default();
+        let first = Instant::now();
+
+        mic.record_first_frame(first, &origin);
+        system.record_first_frame(first + Duration::from_millis(10), &origin);
+
+        assert_eq!(mic.first_frame_offset_16k(), 0);
+        assert_eq!(system.first_frame_offset_16k(), 160);
+    }
 
     fn frame(n: usize) -> AudioFrame {
         AudioFrame { samples: vec![0.5; n], sample_rate: 16000, channels: 1 }

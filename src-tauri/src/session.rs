@@ -3515,7 +3515,14 @@ mod session_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut track = AudioTrackWriter::new(tmp.path(), "mic", 0);
         let sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> =
-            vec![(Source::Mic, Box::new(move |s: &[f32]| track.append(s)))];
+            vec![(
+                Source::Mic,
+                // 这条用例只关心样本是否落进 WAV,写失败与否由后面的长度断言暴露,
+                // 故显式丢弃 append 的成败(生产侧的源轨 worker 用 activity 标记表达)。
+                Box::new(move |s: &[f32]| {
+                    let _ = track.append(s);
+                }),
+            )];
 
         let finals = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
         let f2 = finals.clone();

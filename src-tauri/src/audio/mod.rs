@@ -6,6 +6,7 @@ pub mod aec;
 #[path = "aec_stub.rs"]
 pub mod aec;
 pub mod resample;
+pub mod timeline_mix;
 pub mod mock;
 pub mod microphone;
 pub mod resilient;

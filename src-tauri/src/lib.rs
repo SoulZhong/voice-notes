@@ -23,9 +23,9 @@ mod telemetry;
 mod lifecycle;
 mod hooks_external;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use audio::{AudioCapture, Source};
@@ -83,9 +83,15 @@ struct ActiveSession {
     /// 通道关闭)之后 join,保证 finalize 前 WAV 头已收尾。其余提前放弃路径不 join,
     /// 线程随通道关闭自行退出(Drop 收尾)。
     audio_joins: Vec<std::thread::JoinHandle<()>>,
+    /// 本场每源 writer 是否至少成功追加过一个块。与 health 的“配置过/收到原始帧”
+    /// 不同,这是停录时允许覆盖 sync 的最终真值。
+    audio_activity: Vec<(Source, Arc<AtomicBool>)>,
     /// 每源管线健康计数(FrameTap 写入):pipeline_health 命令随时快照,
     /// 会话拆除即随本结构丢弃——健康数据只描述"这一场",无跨场语义。
     health: Vec<(Source, Arc<SourceHealth>)>,
+    /// 笔记目录快照:停录时写墙钟-样本对账要用(该路径在 writer 移交前已确定,
+    /// 见 start 处 `writer.dir()`)。
+    note_dir: std::path::PathBuf,
 }
 
 impl ActiveSession {
@@ -756,14 +762,19 @@ fn spawn_session(
         };
 
         // 0) 一次性读设置：record_system_only / keep_audio / language_filter /
-        // keep_output_volume / 识别方式与云端凭证 同源同快照（避免多次 load 读到并发
-        // 写入的不同代）。app_data_dir 不可用时整体回落 Settings::default（仅系统声=否、
-        // 保留音频=是、语言过滤=开、保持外放音量=否、识别方式=本地），绝不因读设置失败
-        // 改变现状行为。位置提到取模型之前：识别方式决定要不要取常驻识别器。
-        // language_filter 在下方 start_session 处消费。
+        // keep_output_volume / mix_track / 识别方式与云端凭证 同源同快照（避免多次
+        // load 读到并发写入的不同代）。app_data_dir 不可用时整体回落 Settings::default
+        // （仅系统声=否、保留音频=是、语言过滤=开、保持外放音量=否、混音成品轨=否、
+        // 识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型之前：识别
+        // 方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
-        let (record_system_only, keep_audio, language_filter, keep_output_volume) =
-            (cfg.record_system_only, cfg.keep_audio, cfg.language_filter, cfg.keep_output_volume);
+        let (record_system_only, keep_audio, language_filter, keep_output_volume, mix_track) = (
+            cfg.record_system_only,
+            cfg.keep_audio,
+            cfg.language_filter,
+            cfg.keep_output_volume,
+            cfg.mix_track,
+        );
         let cloud_mode = cfg.asr_mode == settings::ASR_MODE_CLOUD;
 
         // 1) 识别引擎。
@@ -806,6 +817,9 @@ fn spawn_session(
         let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
         // 每源健康计数(FrameTap 写、pipeline_health 读),随 ActiveSession 存活一场。
         let mut session_health: Vec<(Source, Arc<SourceHealth>)> = Vec::new();
+        // 两源首个真实帧共享一个单调时钟原点。谁先到谁把 0 点钉住,后到源把偏移
+        // 写进 SourceHealth,供 mixed sink 在 16k 时间轴上插入准确的前导静音。
+        let timeline_origin = Arc::new(OnceLock::new());
         if !record_system_only {
             let mic_seg = match new_silero(&vad_path) {
                 Ok(s) => s,
@@ -885,12 +899,13 @@ fn spawn_session(
                 })),
                 on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
             };
-            let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
+            let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new_with_timeline_origin(
                 Box::new(mic_resilient),
                 Source::Mic,
                 TapPolicy::mic(),
                 mic_health.clone(),
                 mic_notify,
+                timeline_origin.clone(),
             ));
             session_health.push((Source::Mic, mic_health));
             sources.push((Source::Mic, mic, mic_seg));
@@ -948,13 +963,15 @@ fn spawn_session(
                         })),
                         on_recover: Some(Box::new(|| eprintln!("系统声音采集恢复"))),
                     };
-                    let sys: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
-                        Box::new(sys_resilient),
-                        Source::System,
-                        TapPolicy::system_sck(),
-                        sys_health.clone(),
-                        sys_notify,
-                    ));
+                    let sys: Box<dyn AudioCapture> =
+                        Box::new(TappedCapture::new_with_timeline_origin(
+                            Box::new(sys_resilient),
+                            Source::System,
+                            TapPolicy::system_sck(),
+                            sys_health.clone(),
+                            sys_notify,
+                            timeline_origin.clone(),
+                        ));
                     session_health.push((Source::System, sys_health));
                     sources.push((Source::System, sys, sys_seg));
                 }
@@ -1013,13 +1030,15 @@ fn spawn_session(
                         });
                     // 环回静默是常态(policy stall_after=None,tap 不判失联),
                     // 自愈只由 cpal 错误事件驱动,kicker 不接。
-                    let sys: Box<dyn AudioCapture> = Box::new(TappedCapture::new(
-                        Box::new(sys_resilient),
-                        Source::System,
-                        TapPolicy::system_loopback(),
-                        sys_health.clone(),
-                        TapNotify::none(),
-                    ));
+                    let sys: Box<dyn AudioCapture> =
+                        Box::new(TappedCapture::new_with_timeline_origin(
+                            Box::new(sys_resilient),
+                            Source::System,
+                            TapPolicy::system_loopback(),
+                            sys_health.clone(),
+                            TapNotify::none(),
+                            timeline_origin.clone(),
+                        ));
                     session_health.push((Source::System, sys_health));
                     sources.push((Source::System, sys, sys_seg));
                 }
@@ -1194,27 +1213,30 @@ fn spawn_session(
         // 转写/声纹零影响——音频落盘是纯增值旁路,sink 仅把采集帧复制一份写 WAV,不在
         // 转写热路径上;audio_joins 空 Vec 在 stop 时 join 无害(空循环),start_session
         // 签名不变(空 sinks 即不落任何音频轨)。
-        let mut audio_sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
-        let mut audio_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        if keep_audio {
-            // note_dir 在 writer 移交前已快照(见上),此处只用路径,不触 writer。
-            for (source, _, _) in &sources {
-                let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-                let mut w = store::audio::AudioTrackWriter::new(&note_dir, source.as_str(), base_ms);
-                audio_joins.push(std::thread::spawn(move || {
-                    for chunk in rx.iter() {
-                        w.append(&chunk);
-                    }
-                    // sink 随分段 worker 退出被 drop → 通道关闭 → 此处 w Drop 补头刷盘收尾。
-                }));
-                audio_sinks.push((
-                    *source,
-                    Box::new(move |s: &[f32]| {
-                        let _ = tx.send(s.to_vec());
-                    }) as Box<dyn FnMut(&[f32]) + Send>,
-                ));
-            }
-        }
+        //
+        // 录制期产物装配移交 pipeline::recording_sink:mix_track 开启时多落一条
+        // mixed.wav(方案 B)。keep_audio=false 时不调 build_sinks、直接给空 Vec,
+        // 关闭音频保留不该产生任何轨(含成品轨),行为与此前完全一致。build_sinks
+        // 没有 keep_audio 参数,短路必须留在这层调用方。
+        //
+        // sources 在此处只是"配置期建了 capture 对象"的源(可能活跃),真正的
+        // capture.start() 在 spawn_session 里才跑,启动失败的源其 sink 随 worker 一起
+        // 丢弃(session.rs)——mix_track 装配时无法区分"确实活跃"与"仅配置存在",
+        // 这个缺口由 MixedSink 的队列/窗口守卫与收尾 seen 检查兜住(一源不喂料就
+        // 放弃成品轨,不影响两条源轨),此处不为此调整启动顺序。
+        let (audio_sinks, audio_joins, audio_activity) = if keep_audio {
+            let srcs: Vec<Source> = sources.iter().map(|(s, _, _)| *s).collect();
+            let w = pipeline::recording_sink::build_sinks_with_first_offsets(
+                &note_dir,
+                base_ms,
+                &srcs,
+                &session_health,
+                mix_track,
+            );
+            (w.sinks, w.joins, w.activity)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         // 识别引擎装配。云端两件调用方专属的注入(见 session::AsrEngine):
         //  - backfill_segmenter:断网缺口补识的本机 VAD 切段(厂商批式接口有单请求
@@ -1489,7 +1511,9 @@ fn spawn_session(
                     paused_at: None,
                     paused_accum: std::time::Duration::ZERO,
                     audio_joins,
+                    audio_activity,
                     health: session_health,
+                    note_dir: note_dir.clone(),
                 });
                 drop(running_guard);
                 let _ = app.emit(
@@ -1614,6 +1638,45 @@ fn resume_recording(app: AppHandle, note_id: String) -> Result<(), String> {
         .command(lifecycle::Cmd::Start { resume_id: Some(note_id) })
 }
 
+fn persist_track_sync(
+    note_dir: &std::path::Path,
+    base_ms: u64,
+    wall_ms: u64,
+    health: &[(Source, Arc<SourceHealth>)],
+    activity: &[(Source, Arc<AtomicBool>)],
+) {
+    for (source, health) in health {
+        let wrote_current_audio = activity
+            .iter()
+            .find(|(candidate, _)| candidate == source)
+            .map(|(_, wrote)| wrote.load(Ordering::Acquire))
+            .unwrap_or(false);
+        if !wrote_current_audio {
+            continue;
+        }
+
+        let h = health.snapshot(*source);
+        // 轨时长必须量 WAV,不能拿 h.samples 换算:后者是设备原生率、交错多声道的原始
+        // 计数,且在暂停闸之前累加。调用方已 join writer,文件长度是终值。
+        let Some(track_ms) = store::audio::session_track_ms(note_dir, source.as_str(), base_ms)
+        else {
+            continue;
+        };
+        let info = store::audio::SyncInfo {
+            wall_ms,
+            samples: h.samples,
+            track_ms,
+            drift_ms: store::audio::drift_ms(track_ms, wall_ms),
+            silence_ms: h.silence_ms,
+            gaps: h.gaps,
+            rate_fixes: h.rate_fixes,
+        };
+        if let Err(e) = store::audio::set_track_sync(note_dir, source.as_str(), info) {
+            eprintln!("对账写入失败({}): {e}", source.as_str());
+        }
+    }
+}
+
 /// 停录 teardown(P2 上半,原 do_stop_recording 的拆除段逐语句搬移):running 复位、
 /// generation 递增、取会话、时长埋点、handle.stop 排干、模型归还、音频写盘线程 join。
 /// finalize 不在这里——writer 归 lifecycle actor,由调用方(actor 的 Cmd::Stop 特化
@@ -1637,6 +1700,19 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     // elapsed_ms(&self)(partial move 借用检查会拒绝),故须在任何字段搬走之前算好。
     // 续录笔记 elapsed_ms 含 base_ms(历史累计)——上报的是笔记累计时长而非本次会话时长,看板解读以此为准。
     telemetry::track(app, telemetry::Event::RecordingStopped { duration_ms: s.elapsed_ms() });
+    // 对账用的墙钟必须在这里取,不能等到下面 join 完再取:handle.stop() 要 join ASR 线程
+    // (等尾段识别跑完,云端还可能叠上重连/补识往返),audio_joins 要排干无界写盘队列
+    // (它存在的理由正是"磁盘可能卡顿数秒")——这段拆解耗时既无上界也未被测量,算进
+    // wall_ms 就是给 drift_ms 加一段大到能翻转符号的负偏置,让 SyncInfo 文档里那份
+    // 偏置清单(启动窗等,量级 ≤ 数百 ms)失效,首次冒烟的读数会被解释反。
+    // 与之相对,track_ms 必须留在 join 之后取——那时 WAV 头才收尾,文件长度才是终值。
+    // base_ms 传 0:对账描述"这一场",不含历史累计。
+    let wall_ms = active_elapsed_ms(
+        s.started.elapsed(),
+        s.paused_accum,
+        s.paused_at.map(|p| p.elapsed()),
+        0,
+    );
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
     stash_model(&state.embedder_cache, embedder);
@@ -1645,6 +1721,9 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     for j in s.audio_joins {
         let _ = j.join();
     }
+    // 只覆盖本场 writer 真正成功追加过的源。配置过但启动失败、活跃却无帧、以及
+    // keep_audio=false 的续录都保留旧 sync,不会拿旧 WAV 配本场零计数造假。
+    persist_track_sync(&s.note_dir, s.base_ms, wall_ms, &s.health, &s.audio_activity);
     Some(s.note_id)
 }
 
@@ -5080,6 +5159,83 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(10), s(3), Some(s(2)), 0), 5_000, "再扣当前暂停");
         assert_eq!(active_elapsed_ms(s(10), s(0), None, 60_000), 70_000, "续录加 base_ms");
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
+    }
+
+    /// 续录时只有本场 writer 真正追加过样本的源才能更新 sync。否则启动失败或
+    /// keep_audio=false 会拿旧 WAV 配上本场零计数,覆盖上一场可信记录。
+    #[test]
+    fn sync_persistence_preserves_prior_record_when_current_writer_wrote_nothing() {
+        use crate::audio::Source;
+        use crate::pipeline::frame_tap::SourceHealth;
+        use crate::store::audio::{load_audio_meta, set_track_sync, AudioTrackWriter, SyncInfo};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = AudioTrackWriter::new(dir.path(), "mic", 0);
+        let _ = writer.append(&[0.1; 1600]);
+        drop(writer);
+        set_track_sync(
+            dir.path(),
+            "mic",
+            SyncInfo {
+                wall_ms: 111,
+                samples: 222,
+                track_ms: 100,
+                drift_ms: -11,
+                silence_ms: 3,
+                gaps: 4,
+                rate_fixes: 5,
+            },
+        )
+        .unwrap();
+
+        let health = Arc::new(SourceHealth::default());
+        let wrote = Arc::new(AtomicBool::new(false));
+        super::persist_track_sync(
+            dir.path(),
+            100,
+            999,
+            &[(Source::Mic, health)],
+            &[(Source::Mic, wrote)],
+        );
+
+        let sync = load_audio_meta(dir.path()).tracks["mic"].sync.clone().unwrap();
+        assert_eq!(sync.wall_ms, 111);
+        assert_eq!(sync.samples, 222);
+        assert_eq!(sync.track_ms, 100);
+        assert_eq!(sync.drift_ms, -11);
+    }
+
+    #[test]
+    fn sync_persistence_updates_record_after_successful_current_write() {
+        use crate::audio::Source;
+        use crate::pipeline::frame_tap::SourceHealth;
+        use crate::store::audio::{load_audio_meta, AudioTrackWriter};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = AudioTrackWriter::new(dir.path(), "mic", 0);
+        assert!(writer.append(&[0.1; 1600]));
+        drop(writer);
+
+        let health = Arc::new(SourceHealth::default());
+        health.samples.store(1600, Ordering::Relaxed);
+        let wrote = Arc::new(AtomicBool::new(true));
+        super::persist_track_sync(
+            dir.path(),
+            0,
+            100,
+            &[(Source::Mic, health)],
+            &[(Source::Mic, wrote)],
+        );
+
+        let sync = load_audio_meta(dir.path()).tracks["mic"].sync.clone().unwrap();
+        assert_eq!(sync.wall_ms, 100);
+        assert_eq!(sync.samples, 1600);
+        assert_eq!(sync.track_ms, 100);
+        assert_eq!(sync.drift_ms, 0);
     }
 
     #[test]

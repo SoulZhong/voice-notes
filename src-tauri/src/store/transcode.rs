@@ -698,7 +698,7 @@ mod tests {
     fn make_note_with_wav(ms: u64) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; (16 * ms) as usize]); // 16 样本/ms
+        let _ = w.append(&vec![0.1f32; (16 * ms) as usize]); // 16 样本/ms
         drop(w);
         tmp
     }
@@ -725,7 +725,7 @@ mod tests {
         assert!(!tmp.path().join("mic.m4a.tmp").exists(), "tmp 残留清掉");
         // 模拟"删 wav 前崩溃":重造 wav,与 m4a 并存
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 160]);
+        let _ = w.append(&vec![0.1f32; 160]);
         drop(w);
         transcode_note_dir(tmp.path());
         assert!(!tmp.path().join("mic.wav").exists(), "并存收敛为只剩 m4a");
@@ -747,7 +747,7 @@ mod tests {
         assert!((ms as i64 - 2000).unsigned_abs() <= DURATION_TOLERANCE_MS);
         // 解码后可直接续录:既有对齐逻辑接手
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 2000);
-        w.append(&vec![0.5f32; 160]);
+        let _ = w.append(&vec![0.5f32; 160]);
         drop(w);
     }
 
