@@ -79,6 +79,8 @@ export type Settings = {
   mcp_allow_control: boolean;
   // 防重复引导:欢迎页走完或提示条关闭后置 true,两处引导只出现一次
   mcp_onboarded: boolean;
+  // 方案 B(实验特性):录制期额外落一条 mixed.wav 混音成品轨。默认关。
+  mix_track: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
