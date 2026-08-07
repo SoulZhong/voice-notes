@@ -82,6 +82,12 @@
   let retransConfirm = $state(false);
   let retransErr = $state("");
   let mixedReason = $state<string | null>(null); // null = 成品轨可用
+  // Fix 4:回填 effect 的 retranscribeStatus() 在途时，若终态事件（onRetranscribe 的
+  // ok/error）先到，迟到的回填快照会把已结束的任务重新标成"重转写中"且无人再纠正
+  // （事件只在状态变化时触发一次，不会再来一条把它拨回去）。这个旗标记录"本次 id
+  // 下是否已经见过至少一条 onRetranscribe 事件"——见过就说明事件通道已经接管了
+  // retranscribing 的真相，回填快照必须让路。
+  let retransEventSeen = $state(false);
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
   // 相关笔记(经知识图谱共享实体):增值层,取失败静默按空。
@@ -544,6 +550,7 @@
     retransStage = "";
     retransConfirm = false;
     retransErr = "";
+    retransEventSeen = false;
     mixedReason = null;
     viewMode = "refined";
     cancelHideEntityPop();
@@ -588,6 +595,10 @@
     retranscribeStatus()
       .then((s) => {
         if (forId !== id) return;
+        // Fix 4:此刻已经收到过 onRetranscribe 事件，说明事件通道已经接管了
+        // retranscribing 的真相（可能已经是终态 ok/error）——这条迟到的快照不再
+        // 可信，让路，避免把已结束的任务重新标成"重转写中"。
+        if (retransEventSeen) return;
         if (s && s.note_id === forId) {
           retranscribing = true;
           retransStage = s.stage;
@@ -611,6 +622,7 @@
     let disposed = false;
     onRetranscribe((e) => {
       if (e.note_id !== forId) return;
+      retransEventSeen = true;
       if (e.state === "running") {
         retranscribing = true;
         retransStage = e.stage;
