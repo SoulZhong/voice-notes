@@ -1646,6 +1646,13 @@ fn persist_track_sync(
     activity: &[(Source, Arc<AtomicBool>)],
 ) {
     for (source, health) in health {
+        // [诊断插桩 2026-08-07] 首帧偏移落日志:分解 drift_ms 里的起流差成分,
+        // 供实时 AEC 失效调查区分"起流差"与"持续时钟漂移"。
+        eprintln!(
+            "[对账诊断] {} 首帧偏移(相对最早源) {}ms",
+            source.as_str(),
+            health.first_frame_offset_16k() / 16
+        );
         let wrote_current_audio = activity
             .iter()
             .find(|(candidate, _)| candidate == source)

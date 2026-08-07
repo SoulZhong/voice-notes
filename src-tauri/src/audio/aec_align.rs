@@ -134,6 +134,23 @@ fn maybe_adjust(g: &mut Inner) {
     }
     let ref_win: Vec<f32> = g.ref_env.iter().rev().take(n).rev().copied().collect();
     let obs_win: Vec<f32> = g.obs_env.iter().rev().take(n).rev().copied().collect();
+    // [诊断插桩 2026-08-07] 双向签名测量:正向 = obs 落后 ref(正常因果),反向 =
+    // ref 落后 obs(参考迟到,AEC3 无法消除的病态)。单测已证参考迟到时消除为
+    // -9.5dB(被 AGC2 反放大);此日志用于在真机上量出 SCK 交付滞后的实际值。
+    // 每 5s 一行,仅诊断期保留。
+    {
+        let fwd = estimate_delay(&ref_win, &obs_win, MAX_DELAY_MS);
+        let rev = estimate_delay(&obs_win, &ref_win, MAX_DELAY_MS);
+        let f = fwd
+            .as_ref()
+            .map(|d| format!("+{}ms conf {:.1} peak {:.3}", d.delay_ms, d.confidence, d.peak))
+            .unwrap_or_else(|| "无".into());
+        let r = rev
+            .as_ref()
+            .map(|d| format!("-{}ms conf {:.1} peak {:.3}", d.delay_ms, d.confidence, d.peak))
+            .unwrap_or_else(|| "无".into());
+        eprintln!("[对齐诊断] 正向(回声滞后参考) {f} | 反向(参考迟到) {r} | 当前预延迟 {}ms", g.predelay / 16);
+    }
     let Some(DelayEstimate { delay_ms, confidence, peak }) =
         estimate_delay(&ref_win, &obs_win, MAX_DELAY_MS)
     else {

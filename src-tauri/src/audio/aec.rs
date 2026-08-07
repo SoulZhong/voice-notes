@@ -181,9 +181,13 @@ impl AecCapture {
                 self.frames_since_stats += 1;
                 if self.frames_since_stats >= STATS_EVERY_FRAMES {
                     self.frames_since_stats = 0;
-                    if let Some(d) = self.ap.get_stats().delay_ms {
-                        eprintln!("AEC3 内部延迟估计: {d}ms (预对齐已扣压部分不计入)");
-                    }
+                    // [诊断插桩 2026-08-07] 加 ERL/ERLE:ERLE 是消除量的直接读数,
+                    // 区分"对齐了但没消掉"与"根本没对齐"。
+                    let s = self.ap.get_stats();
+                    eprintln!(
+                        "AEC3 stats: delay {:?}ms erl {:?} erle {:?} (预对齐扣压不计入)",
+                        s.delay_ms, s.echo_return_loss, s.echo_return_loss_enhancement
+                    );
                 }
             }
         }
@@ -413,6 +417,122 @@ mod diag_tests {
         let out_p = power(&out_tail);
         eprintln!("AGC: 输入功率 {in_p:.8} 输出功率 {out_p:.8} 比值 {:.2}", out_p / in_p);
         assert!(out_p > in_p * 1.5, "低电平近端应被 AGC 抬升: in={in_p:.8} out={out_p:.8}");
+    }
+
+    /// 诊断 H1(2026-08-07 转写重复调查):参考**迟到**——回声延迟 30ms(内置扬声器
+    /// 量级),但 render 按 500ms 批次在对应 capture 处理完之后才喂入,模拟"SCK 批量
+    /// 交付晚于回声到达"。若消除崩塌 → 因果性破坏假说成立。
+    /// 生产一贯失效背景:约 40 场离线清洗 conf 数万~87万,实时 AEC 从未真正工作过。
+    #[test]
+    fn diag_reference_arriving_after_capture() {
+        let (mut r, mut c) = new_pair(16_000).unwrap();
+        let mut seed = 42u64;
+        let far = noise(16_000 * 8, &mut seed);
+        let delay = 480; // 30ms
+        let echo_gain = 0.5f32;
+        let mut near = vec![0.0f32; far.len()];
+        for i in delay..far.len() {
+            near[i] = far[i - delay] * echo_gain;
+        }
+        let burst = 16_000 / 2; // 500ms 批
+        let tail_from = far.len() - 16_000; // 评估最后 1s
+        let mut out_tail = Vec::new();
+        let mut pos = 0usize;
+        while pos < far.len() {
+            let end = (pos + burst).min(far.len());
+            // capture 先处理(回声已在 mic 流里)……
+            for (j, n) in near[pos..end].chunks(FRAME).enumerate() {
+                let cleaned = c.process(n);
+                if pos + j * FRAME >= tail_from {
+                    out_tail.extend_from_slice(&cleaned);
+                }
+            }
+            // ……参考随后才批量到达
+            for f in far[pos..end].chunks(FRAME) {
+                r.push(f);
+            }
+            pos = end;
+        }
+        let echo_p = power(&near[tail_from..]);
+        let out_p = power(&out_tail);
+        let att_db = 10.0 * (echo_p / out_p.max(1e-12)).log10();
+        eprintln!("[诊断A] 参考迟到500ms批: 回声功率 {echo_p:.6} 输出 {out_p:.6} 衰减 {att_db:.1}dB");
+    }
+
+    /// 诊断 H1 对照:同样 500ms 批量,但参考**先到**(每批先喂 render 再喂 capture)。
+    /// 若这组衰减正常而上一组崩塌 → 破坏因素是"迟到",不是"批量"本身。
+    #[test]
+    fn diag_reference_arriving_before_capture_in_bursts() {
+        let (mut r, mut c) = new_pair(16_000).unwrap();
+        let mut seed = 42u64;
+        let far = noise(16_000 * 8, &mut seed);
+        let delay = 480;
+        let echo_gain = 0.5f32;
+        let mut near = vec![0.0f32; far.len()];
+        for i in delay..far.len() {
+            near[i] = far[i - delay] * echo_gain;
+        }
+        let burst = 16_000 / 2;
+        let tail_from = far.len() - 16_000;
+        let mut out_tail = Vec::new();
+        let mut pos = 0usize;
+        while pos < far.len() {
+            let end = (pos + burst).min(far.len());
+            for f in far[pos..end].chunks(FRAME) {
+                r.push(f);
+            }
+            for (j, n) in near[pos..end].chunks(FRAME).enumerate() {
+                let cleaned = c.process(n);
+                if pos + j * FRAME >= tail_from {
+                    out_tail.extend_from_slice(&cleaned);
+                }
+            }
+            pos = end;
+        }
+        let echo_p = power(&near[tail_from..]);
+        let out_p = power(&out_tail);
+        let att_db = 10.0 * (echo_p / out_p.max(1e-12)).log10();
+        eprintln!("[诊断A对照] 参考先到500ms批: 回声功率 {echo_p:.6} 输出 {out_p:.6} 衰减 {att_db:.1}dB");
+    }
+
+    /// 诊断 H2:AGC2 是否把残余回声重新抬回语音电平。纯远端回声(无本地人声),
+    /// 严格 10ms 交替喂入(AEC 最佳条件),对比 aligned(带 AGC2)与 clean(无 AGC)
+    /// 的输出绝对电平。new_pair 头注声称"AGC2 作用在回声消除之后(不放大回声)"
+    /// ——本测试验证这句话。
+    #[test]
+    fn diag_agc2_on_residual_echo_level() {
+        let mut run = |with_agc: bool| -> (f32, f32) {
+            let (mut r, mut c) = if with_agc {
+                let (r, c, _a) = new_aligned_pair(16_000, 0).unwrap();
+                (r, c)
+            } else {
+                new_clean_pair(16_000).unwrap()
+            };
+            let mut seed = 42u64;
+            let far = noise(16_000 * 10, &mut seed);
+            let delay = 480;
+            let mut near = vec![0.0f32; far.len()];
+            for i in delay..far.len() {
+                near[i] = far[i - delay] * 0.5;
+            }
+            let tail_from = far.len() - 16_000;
+            let mut out_tail = Vec::new();
+            for (i, (f, n)) in far.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+                r.push(f);
+                let cleaned = c.process(n);
+                if i * FRAME >= tail_from {
+                    out_tail.extend_from_slice(&cleaned);
+                }
+            }
+            (power(&near[tail_from..]), power(&out_tail))
+        };
+        let (echo_p, out_agc) = run(true);
+        let (_, out_clean) = run(false);
+        let att_agc = 10.0 * (echo_p / out_agc.max(1e-12)).log10();
+        let att_clean = 10.0 * (echo_p / out_clean.max(1e-12)).log10();
+        eprintln!(
+            "[诊断B] 纯回声输入 | 带AGC2: 残余功率 {out_agc:.8} 衰减 {att_agc:.1}dB | 无AGC: 残余功率 {out_clean:.8} 衰减 {att_clean:.1}dB"
+        );
     }
 
     /// 诊断:完全不喂 render(系统源无帧)时近端表现。
