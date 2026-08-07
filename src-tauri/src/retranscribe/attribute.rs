@@ -113,7 +113,7 @@ pub fn finalize_speakers(
             }
         }
         // 继承候选:同 source 优先(mixed 与任意 source 比),取重叠占比最大者。
-        // overlap_fraction 分母取第一实参(seg)自身时长——continue 语义是「新段
+        // overlap_fraction 分母取第一实参(seg)自身时长——分母语义是「新段
         // 被旧段盖住的比例」,故新段参数必须放第一位,不能反过来按旧段时长算。
         let candidate = |same_source: bool| {
             old_segs.iter()

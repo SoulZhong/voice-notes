@@ -242,6 +242,20 @@ mod tests {
         dir
     }
 
+    /// NoteLock 互斥断言:同目录持锁期间再次 acquire 必须拿到 Ok(None)(而非 Err 或
+    /// 阻塞)。重转写 worker 全程持这把锁(见 spawn_retranscribe),正是靠这条互斥语义
+    /// 挡住"录制/编辑中还能重转写"或"重转写中还能录制/编辑"——spec §测试「持锁时
+    /// 发起 → 拒绝」在单元级锁死这个前提,不必每次都跑一遍完整的 worker 集成场景。
+    #[test]
+    fn notelock_acquire_rejects_while_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = NoteLock::acquire(dir.path()).unwrap().expect("首次持锁应成功");
+        let second = NoteLock::acquire(dir.path()).unwrap();
+        assert!(second.is_none(), "持锁期间二次 acquire 必须返回 Ok(None),不得拿到锁");
+        drop(held);
+        assert!(NoteLock::acquire(dir.path()).unwrap().is_some(), "释放后应可重新持锁");
+    }
+
     /// 端到端:两段进 → 识别 → 无 embedder 降级 → 提交,segments.jsonl 换新、seq 重编、备份在。
     #[test]
     fn run_replaces_segments_end_to_end() {
