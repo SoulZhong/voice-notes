@@ -144,10 +144,19 @@ pub fn mixed_untrusted(meta: &AudioMeta) -> Option<String> {
     let mut expected: Option<u64> = None;
     for source in ["mic", "system"] {
         let Some(t) = meta.tracks.get(source) else { continue };
-        let Some(sync) = &t.sync else {
-            return Some(format!("源轨 {source} 无 sync 对账记录(旧笔记),无法校验成品轨"));
+        // Fix 3(codex 第二轮):源轨终点优先用 duration_ms(整文件实测时长,转码后必有)
+        // + offset_ms——sync.track_ms 是"本场净时长",set_track_sync 每场覆盖,续录
+        // 笔记只留最后一场;拿它当源轨终点会把前面所有场次都漏掉,续录笔记必被误判
+        // untrusted。没有 duration_ms(未转码)才回退 offset_ms+sync.track_ms;该回退
+        // 对续录笔记会低估终点、可能误拒——宁可误拒不可误信,故仍保留而不是放行。
+        let end = if let Some(d) = t.duration_ms {
+            t.offset_ms + d
+        } else {
+            let Some(sync) = &t.sync else {
+                return Some(format!("源轨 {source} 无 sync 对账记录(旧笔记),无法校验成品轨"));
+            };
+            t.offset_ms + sync.track_ms
         };
-        let end = t.offset_ms + sync.track_ms;
         expected = Some(expected.map_or(end, |e: u64| e.max(end)));
     }
     let Some(expected) = expected else {
@@ -209,6 +218,25 @@ mod tests {
     fn mixed_trusted_when_duration_matches_source_syncs() {
         let m = meta_with(Some(60_400), 60_000, 59_000, 1_200); // max(60000, 60200)=60200,差 200ms
         assert_eq!(mixed_untrusted(&m), None);
+    }
+
+    /// 续录笔记(Fix 3,codex 第二轮):源轨 duration_ms 是整文件实测时长(跨全部场次),
+    /// sync.track_ms 只是最后一场的净时长(set_track_sync 每场覆盖)。mixed 时长对齐
+    /// 全长 duration_ms 时应判可信——若仍按 offset+sync.track_ms(只有末场)算终点,
+    /// 会把前面场次全部漏掉,偏差远超容限,续录笔记必被误判 untrusted。
+    #[test]
+    fn mixed_trusted_for_continued_recording_using_source_duration_ms() {
+        let sync = |track_ms: u64| SyncInfo {
+            wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+        };
+        let mut m = AudioMeta::default();
+        // 两场录制,mic 全长 10_000ms,但 sync.track_ms 只留了最后一场的 3_000ms
+        // ——若按旧回退口径算终点是 3_000ms,离真实全长差 7_000ms,远超容限。
+        m.tracks.insert("mic".into(), TrackMeta {
+            duration_ms: Some(10_000), sync: Some(sync(3_000)), ..Default::default()
+        });
+        m.tracks.insert("mixed".into(), TrackMeta { duration_ms: Some(10_100), ..Default::default() });
+        assert_eq!(mixed_untrusted(&m), None, "duration_ms 全长口径下续录笔记应判可信");
     }
 
     /// 不可信:偏差超 500ms 容限 → 给出原因。

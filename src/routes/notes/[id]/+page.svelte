@@ -1029,14 +1029,24 @@
   }
 
   /** 发起文件重转写:input 二选一(双轨/成品轨),破坏性(覆盖原始逐字稿),二段确认
-      已在按钮态处理(retransConfirm),这里只管发起。 */
+      已在按钮态处理(retransConfirm),这里只管发起。
+      Fix 4(codex 第二轮)快失败竞态:后端 worker 的终态事件(锁占用/模型缺失等
+      快失败)可能在 `await retranscribeNote` 决议之前就已经到达并把 retranscribing
+      清成 false——这里若无条件在 invoke 成功后把 retranscribing 置回 true,会覆盖
+      掉已经正确落地的终态,永久卡在"重转写中"没人再纠正(事件只在状态变化时触发
+      一次)。复用既有的 retransEventSeen 旗:invoke 前先清旗,invoke 成功后只有
+      "还没见过任何事件"才自己置 running 态——running 事件与终态事件都已到过,
+      说明事件通道已经接管了 retranscribing 的真相,以事件状态为准。 */
   async function startRetranscribe(input: "dual" | "mixed") {
     retransConfirm = false;
     retransErr = "";
+    retransEventSeen = false;
     try {
       await retranscribeNote(id, input);
-      retranscribing = true;
-      retransStage = "decode";
+      if (!retransEventSeen) {
+        retranscribing = true;
+        retransStage = "decode";
+      }
     } catch (e) {
       retransErr = t("notes.retrans.failed", { e });
     }
