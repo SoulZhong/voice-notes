@@ -266,6 +266,17 @@ impl UdsBackend for AppBackend<'_> {
         // 只放行 complete、非活动会话;spawn 后即返回,重活受 AING_GATE 串行闸约束(逐篇跑不爆核)。
         let fire = |id: &str| -> Result<(), String> {
             crate::store::validate_note_id(id).map_err(|e| e.to_string())?;
+            // 与 lib.rs::refine_note 命令逐字同款的重转写守卫——两处必须同步改。
+            // 原因:reaing 是 MCP 侧直投 RefineRequest 的入口,不经过 refine_note 命令,
+            // 若不在此复刻检查,MCP 客户端可在重转写运行期间绕过守卫触发 refine,
+            // refine 用重转写覆盖前的旧 segments 跑完后再提交,把重转写刚写入的新
+            // 结果盖掉(NoteLock 会让 refine 的提交失败,但那是跑完一整轮才失败,
+            // 这里提前到「点下去就说清」)。
+            if let Some((rid, _)) = app.state::<crate::AppState>().retranscribing.lock().unwrap().clone() {
+                if rid == id {
+                    return Err(crate::tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+                }
+            }
             app.state::<crate::lifecycle::LifecycleHandle>()
                 .request(crate::lifecycle::machine::Msg::RefineRequest { note_id: id.to_string() })
         };
@@ -305,7 +316,8 @@ impl UdsBackend for AppBackend<'_> {
 
     fn retranscribe_status(&self) -> serde_json::Value {
         let state = self.0.state::<crate::AppState>();
-        let slot = state.retranscribing.lock().unwrap();
+        // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续读最后写入值好过永久卡死。
+        let slot = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner());
         match slot.as_ref() {
             Some((note_id, stage)) => serde_json::json!({ "running": true, "note_id": note_id, "stage": stage }),
             None => serde_json::json!({ "running": false }),

@@ -1560,6 +1560,14 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     if state.download_running.load(Ordering::SeqCst) {
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later").into());
     }
+    // 全局互斥于重转写(不限本篇,双向对称——do_retranscribe 侧对称判断 session 是否
+    // 存在来拒绝重转写):重转写与实时 ASR 各起一套 ORT 管线,叠跑抢核。
+    if state.retranscribing.lock().unwrap().is_some() {
+        return Err(tr!(
+            "重转写进行中,完成后再录制",
+            "A re-transcription is in progress; please record after it finishes"
+        ));
+    }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
         return Err(recording_not_ready_msg(app));
@@ -1614,16 +1622,17 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
             "This note is being refined by AI; try again later"
         ));
     }
-    // 重转写中该笔记拒绝续录:重转写持 NoteLock 全程,续录也要写 mic.wav——放行会在
-    // NoteWriter::resume 拿锁失败才报错。此处从 AppState 读槽提前拒绝,把错误提前到
-    // 「点续录就说清」;即便这里漏检,NoteLock 兜底仍在(resume 会因锁失败拒绝)。
-    if let Some((rid, _)) = state.retranscribing.lock().unwrap().clone() {
-        if rid == note_id {
-            return Err(tr!(
-                "该笔记正在重转写中,完成后可继续录制",
-                "This note is being re-transcribed; you can resume recording once it finishes"
-            ));
-        }
+    // 全局互斥于重转写(不限本篇——升级自"仅同笔记"的旧检查):重转写与实时 ASR 各起
+    // 一套 ORT 管线,叠跑抢核,这条互斥与 do_start_recording 一样是双向对称的
+    // (do_retranscribe 侧对称判断 session 是否存在来拒绝重转写)。同笔记场景下还叠加
+    // 一层理由:重转写持 NoteLock 全程,续录也要写 mic.wav,放行会在 NoteWriter::resume
+    // 拿锁失败才报错——此处提前拒绝把错误提到「点续录就说清」;即便这里漏检,NoteLock
+    // 兜底仍在(resume 会因锁失败拒绝)。
+    if state.retranscribing.lock().unwrap().is_some() {
+        return Err(tr!(
+            "重转写进行中,完成后再录制",
+            "A re-transcription is in progress; please record after it finishes"
+        ));
     }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
@@ -1947,8 +1956,9 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
 }
 
 /// 重转写守卫与启动(tauri command 与 UDS op 共用;spec §提交与安全网)。
-/// 守卫顺序(不可颠倒):录制中拒 → Aing 中拒 → 完成态校验 → mixed 输入校验 → 槽占用拒。
-/// 前三条是"这场重转写值不值得跑"的资格判定,mixed 校验是"这个输入源可不可信",
+/// 守卫顺序(不可颠倒):录制中拒 → Aing 中拒 → 完成态校验 → 转码中拒 → mixed 输入校验 →
+/// 槽占用拒。前三条是"这场重转写值不值得跑"的资格判定,转码中拒是"盘上这个源此刻
+/// 会不会被转码 worker 改写"的资源校验,mixed 校验是"这个输入源可不可信",
 /// 槽占用最后判是因为它改变了共享状态(占槽)——只有前面全过才允许触碰它。
 pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<(), String> {
     store::validate_note_id(id).map_err(|e| e.to_string())?;
@@ -1969,6 +1979,12 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
         .load(id).map_err(|e| e.to_string())?;
     if note.meta.state != "complete" {
         return Err(tr!("笔记未完成,不能重转写", "Only completed notes can be re-transcribed"));
+    }
+    // 转码互斥:转码 worker 会把该目录的 wav 编码后删除,若此刻正 pending/in-flight,
+    // 与重转写离线读盘并发有踩踏窗口。不能用 cancel_and_wait 顶替这条检查:那会把
+    // pending 转码项摘掉,wav 就此永不转码——只读查询 + 直接拒绝才是正确的互斥手段。
+    if state.transcode.is_busy(&dir) {
+        return Err(tr!("该笔记正在转码,稍后再试", "This note is being transcoded; try again later"));
     }
     if input == "mixed" {
         let meta = store::audio::load_audio_meta(&dir);
@@ -2006,9 +2022,14 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<retranscribe::Summary, String> {
             let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
             // NoteLock 在 worker 内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
+            // 文案不写"或转码中":转码走队列不持 NoteLock,与此锁失败的实际成因无关
+            // (会撞这把锁的只有录制/编辑写手柄);写成"转码中"是与事实不符的误导。
             let lock = store::notelock::NoteLock::acquire(&dir)
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| tr!("笔记正被占用(录制或转码中),稍后再试", "The note is busy; try again later"))?;
+                .ok_or_else(|| tr!(
+                    "笔记正被占用(录制/编辑中),稍后再试",
+                    "The note is busy (recording or being edited); try again later"
+                ))?;
             // 独立识别器实例:不碰常驻 recognizer_cache 槽(那是录制会话的);
             // 恒用本地识别器,云端协议是录制期流式,不适配离线整轨(spec 已知限制 5)。
             let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app))
@@ -2034,7 +2055,9 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
             let note_id2 = note_id.clone();
             let app2 = app.clone();
             let mut progress = move |stage: &str| {
-                if let Some(s) = slot2.lock().unwrap().as_mut() {
+                // poison 只可能因锁内 panic 产生,槽是纯数据(note_id+stage 字符串),
+                // 中毒后继续用最后一次写入的值远好过让整条重转写进度上报永久卡死。
+                if let Some(s) = slot2.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     s.1 = stage.to_string();
                 }
                 let _ = app2.emit("retranscribe", ipc::RetranscribeEvent {
@@ -2046,7 +2069,8 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 &mut embedder, seeds, mixed, &mut progress)
                 .map_err(|e| e.to_string())
         }));
-        *slot.lock().unwrap() = None;
+        // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续清槽好过永久卡死。
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         match body {
             Ok(Ok(summary)) => {
                 eprintln!("重转写完成({note_id}): {summary:?}");
@@ -2077,7 +2101,8 @@ struct RetranscribeStatus {
 
 #[tauri::command]
 fn retranscribe_status(state: State<AppState>) -> Option<RetranscribeStatus> {
-    state.retranscribing.lock().unwrap().as_ref()
+    // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续读最后写入值好过永久卡死。
+    state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
         .map(|(note_id, stage)| RetranscribeStatus { note_id: note_id.clone(), stage: stage.clone() })
 }
 
