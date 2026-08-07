@@ -452,7 +452,7 @@ impl VnMcp {
         Ok(bridge_call("retranscribe", serde_json::json!({ "note_id": p.note_id, "input": p.input })).await)
     }
 
-    #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。需要应用运行。")]
+    #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。需要应用运行。")]
     async fn retranscribe_status(&self) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("retranscribe_status", serde_json::json!({})).await)
     }
@@ -507,7 +507,7 @@ pub fn catalog() -> serde_json::Value {
             "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份,说话人尽量保留)。异步启动即返回。",
             "control",
         ),
-        ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。", "app"),
+        ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。", "app"),
     ];
     let cli: &[(&str, &str)] = &[
         ("voice-notes notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]", "列出会议笔记"),

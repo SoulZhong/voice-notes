@@ -180,7 +180,7 @@ The 15 tools:
 | `get_live_transcript` | Live transcript of the in-progress session | App running |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | Control recording | App running, **and** "Allow AI to control recording" enabled |
 | `retranscribe_note` | Re-transcribe a completed note from its on-disk audio (overwrites the raw transcript, auto-backup; async start) | App running, **and** "Allow AI to control recording" enabled |
-| `retranscribe_status` | Current re-transcription task (note_id and stage; running=false when idle) | App running |
+| `retranscribe_status` | Current re-transcription task (note_id and stage; running=false when idle); includes the last task's terminal outcome (last) | App running |
 
 The seven note and graph tools read local data files directly and work even when the app is closed; recording status, live transcript, the four recording controls, and re-transcription go through an in-app local socket and need the app running.
 

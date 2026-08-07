@@ -318,10 +318,18 @@ impl UdsBackend for AppBackend<'_> {
         let state = self.0.state::<crate::AppState>();
         // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续读最后写入值好过永久卡死。
         let slot = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner());
-        match slot.as_ref() {
+        let mut v = match slot.as_ref() {
             Some((note_id, stage)) => serde_json::json!({ "running": true, "note_id": note_id, "stage": stage }),
             None => serde_json::json!({ "running": false }),
-        }
+        };
+        // additive:running/note_id/stage 字段不动(前端 command 契约不变),
+        // 新增 last 只给 UDS/MCP 轮询方——批量驱动靠它区分"完成"与"放弃/失败"。
+        let last = state.retranscribe_last.lock().unwrap_or_else(|e| e.into_inner());
+        v["last"] = match last.as_ref() {
+            Some(ev) => serde_json::to_value(ev).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
+        };
+        v
     }
 }
 
@@ -384,7 +392,7 @@ mod tests {
         }
         fn retranscribe_status(&self) -> serde_json::Value {
             self.log("retranscribe_status");
-            serde_json::json!({ "running": false })
+            serde_json::json!({ "running": false, "last": null })
         }
     }
 

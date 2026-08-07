@@ -135,6 +135,9 @@ struct AppState {
     /// 排队会让用户以为卡死)。守卫链:录制中拒/Aing 中拒/槽占用拒,再由 NoteLock
     /// 兜跨进程底。
     retranscribing: Arc<Mutex<Option<(String, String)>>>,
+    /// 最近一次重转写的终态(跨任务保留,新任务开始不清、结束时覆盖):UDS/MCP 轮询方
+    /// 靠它区分「完成」与「放弃/失败」——桌面事件是易失的,轮询面必须有可查终态。
+    retranscribe_last: Arc<Mutex<Option<ipc::RetranscribeEvent>>>,
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -155,6 +158,7 @@ impl Default for AppState {
             relation_backfill_cancel: Arc::new(AtomicBool::new(false)),
             relation_backfill_run_id: Arc::new(Mutex::new(None)),
             retranscribing: Arc::new(Mutex::new(None)),
+            retranscribe_last: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2012,11 +2016,19 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
 /// 全局互斥,不存在与管线事件的排序耦合,直发省一层转发不丢语义。
 fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
     let slot = app.state::<AppState>().retranscribing.clone();
+    let last = app.state::<AppState>().retranscribe_last.clone();
     std::thread::spawn(move || {
         let emit = |stage: &str, state: &str, message: Option<String>, summary: Option<retranscribe::Summary>| {
-            let _ = app.emit("retranscribe", ipc::RetranscribeEvent {
+            let ev = ipc::RetranscribeEvent {
                 note_id: note_id.clone(), stage: stage.into(), state: state.into(), message, summary,
-            });
+            };
+            // 只有终态(ok/error)落 last;中途的 "running" 不覆盖上一次任务的终态——
+            // 轮询方靠 last 区分"完成"与"放弃/失败",不该被进行中的噪声冲掉。
+            if state != "running" {
+                // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续写最后一次值好过永久卡死。
+                *last.lock().unwrap_or_else(|e| e.into_inner()) = Some(ev.clone());
+            }
+            let _ = app.emit("retranscribe", ev);
         };
         emit("all", "running", None, None);
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<retranscribe::Summary, String> {
@@ -6155,6 +6167,17 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"new_segments\":8"));
         assert!(!json.contains("message"));
+
+        // error 形态:message Some/summary None——轮询方(uds::retranscribe_status
+        // 的 last 字段)读的正是这两种终态形状,这里锁死不许漂移。
+        let err_e = crate::ipc::RetranscribeEvent {
+            note_id: "n1".into(), stage: "all".into(), state: "error".into(),
+            message: Some("笔记正被占用".into()),
+            summary: None,
+        };
+        let err_json = serde_json::to_string(&err_e).unwrap();
+        assert!(err_json.contains("\"message\":\"笔记正被占用\""));
+        assert!(!err_json.contains("summary"));
     }
 
     #[test]
