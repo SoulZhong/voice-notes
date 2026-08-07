@@ -1562,7 +1562,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     }
     // 全局互斥于重转写(不限本篇,双向对称——do_retranscribe 侧对称判断 session 是否
     // 存在来拒绝重转写):重转写与实时 ASR 各起一套 ORT 管线,叠跑抢核。
-    if state.retranscribing.lock().unwrap().is_some() {
+    if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
             "重转写进行中,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
@@ -1628,7 +1628,7 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     // 一层理由:重转写持 NoteLock 全程,续录也要写 mic.wav,放行会在 NoteWriter::resume
     // 拿锁失败才报错——此处提前拒绝把错误提到「点续录就说清」;即便这里漏检,NoteLock
     // 兜底仍在(resume 会因锁失败拒绝)。
-    if state.retranscribing.lock().unwrap().is_some() {
+    if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
             "重转写进行中,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
@@ -1927,7 +1927,7 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
     // 重转写中该笔记拒绝 Aing:重转写持 NoteLock,refine 的 run_local 提交时也会
     // 因锁失败——这里提前拒绝只是把错误从「跑完才失败」提到「点下去就说清」。
-    if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap().clone() {
+    if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if rid == id {
             return Err(tr!("该笔记正在重转写中", "This note is being re-transcribed"));
         }
@@ -1993,7 +1993,7 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
         }
     }
     {
-        let mut slot = state.retranscribing.lock().unwrap();
+        let mut slot = state.retranscribing.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((running, _)) = slot.as_ref() {
             return Err(tr!(
                 "已有重转写任务在进行({running}),请等它完成",

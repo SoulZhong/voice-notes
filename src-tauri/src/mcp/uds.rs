@@ -272,7 +272,7 @@ impl UdsBackend for AppBackend<'_> {
             // refine 用重转写覆盖前的旧 segments 跑完后再提交,把重转写刚写入的新
             // 结果盖掉(NoteLock 会让 refine 的提交失败,但那是跑完一整轮才失败,
             // 这里提前到「点下去就说清」)。
-            if let Some((rid, _)) = app.state::<crate::AppState>().retranscribing.lock().unwrap().clone() {
+            if let Some((rid, _)) = app.state::<crate::AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 if rid == id {
                     return Err(crate::tr!("该笔记正在重转写中", "This note is being re-transcribed"));
                 }
