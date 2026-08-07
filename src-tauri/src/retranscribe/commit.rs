@@ -1,6 +1,8 @@
-//! 重转写的提交侧。破坏性覆盖三重保险(spec §提交与安全网):一次性备份、
-//! 调用方提交门(本文件不管)、tmp+rename 原子切换。全部操作要求调用方持有
-//! NoteLock——签名收 &NoteLock 是类型层面的持锁证明(照 write_refined_atomic_locked)。
+//! 重转写的提交侧。破坏性覆盖三重保险(spec §提交与安全网):一次性备份(Fix 5,
+//! codex 第二轮:备份本身也走 tmp+rename,不直写目标路径——半截备份 + write-once
+//! 跳过 = 原稿保护永久失效)、调用方提交门(本文件不管)、tmp+rename 原子切换。
+//! 全部操作要求调用方持有 NoteLock——签名收 &NoteLock 是类型层面的持锁证明
+//! (照 write_refined_atomic_locked)。
 
 use crate::store::notelock::NoteLock;
 use crate::store::{SegmentRecord, SpeakerMeta};
@@ -9,6 +11,8 @@ use std::path::Path;
 
 /// 首次重转写前的原稿备份。write-once:保「最初的原始转写」,不随后续轮次滚动。
 pub const SEGMENTS_BACKUP_FILE: &str = "segments.orig.jsonl";
+/// 备份的 tmp 中转名(Fix 5,codex 第二轮:copy 到 tmp 再 rename 到位,见 commit 步骤 1)。
+const SEGMENTS_BACKUP_TMP_FILE: &str = "segments.orig.jsonl.tmp";
 
 /// 提交 segments/speakers 的原子替换,并使 aing 结果失效。
 ///
@@ -33,9 +37,24 @@ pub fn commit(
     let live = note_dir.join("segments.jsonl");
     let backup = note_dir.join(SEGMENTS_BACKUP_FILE);
 
-    // 1) 备份(write-once)。失败 → Err,盘上什么都还没动。
+    // 1) 备份(write-once)。Fix 5(codex 第二轮):copy 到 tmp 再 rename 到位,不直写
+    // backup 路径——直写在中断/磁盘满时会在 backup 路径留下半截文件,而 write-once
+    // 判据(`!backup.exists()`)只看文件在不在、不看内容完不完整:下次重试会因为
+    // "备份已存在"直接跳过步骤 1,永久锁死这份半截备份——write-once 这项本该保护
+    // 原稿的机制反倒成了让半截备份永久卡住的毒药,原稿从此再也备份不了。tmp+rename
+    // 消灭这个窗口:rename 是同一文件系统上的原子操作,backup 路径要么不存在、要么
+    // 是一份完整备份,不存在半截态;任一步失败都清掉 tmp 残留,保证下次重试仍会
+    // 重新走一遍完整的 copy+rename。失败 → Err,盘上 live/backup 均未变。
     if live.exists() && !backup.exists() {
-        std::fs::copy(&live, &backup)?;
+        let tmp = note_dir.join(SEGMENTS_BACKUP_TMP_FILE);
+        if let Err(e) = std::fs::copy(&live, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &backup) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
 
     // 2) aing 标 stale + revision 进位,原样逻辑但移到最前(与 run_local 同一套
@@ -48,12 +67,33 @@ pub fn commit(
         crate::store::refined::write_refined_atomic_locked(note_dir, &doc, lock)?;
     }
 
-    // 3) speakers 预写:旧表 ∪ 新表,冲突键取新值。旧表读法照 read_old_speakers 的
-    // 容忍式(缺失/损坏按空表处理,不因说话人表读取失败挡住提交)。并集保留旧 id
-    // 项 → 本步成功而 rename(步骤 4)失败时,live 仍是旧 segments,它们引用的旧
-    // 说话人 id 全部还在,照样可渲染;冲突取新值 → rename 成功而收尾精确写(步骤 5)
-    // 失败时,新 segments 引用的说话人 id 也全部正确,只多出孤儿旧条目——无害。
-    let mut union_speakers = super::read_old_speakers(note_dir);
+    // 3) speakers 预写:旧表 ∪ 新表。旧表读法照 read_old_speakers 的容忍式(缺失/
+    // 损坏按空表处理,不因说话人表读取失败挡住提交)。并集保留旧 id 项 → 本步成功
+    // 而 rename(步骤 4)失败时,live 仍是旧 segments,它们引用的旧说话人 id 全部
+    // 还在,照样可渲染;新表键与旧表键不相交(见下方断言)→ rename 成功而收尾精确写
+    // (步骤 5)失败时,新 segments 引用的说话人 id 也全部正确,只多出孤儿旧条目——无害。
+    //
+    // 断言式注释(Fix 2,codex 第二轮,根治撞号预写污染):`attribute::finalize_speakers`
+    // 保证新表(`speakers` 形参)落盘的全部 id 都严格避开旧表键域(见该函数注释与其
+    // `all_landed_ids_strictly_exceed_old_table_max_without_collision` 测试)——
+    // 新旧两表键域不相交,`insert` 因此不会覆盖任何旧条目,"冲突键取新值"这条选边
+    // 逻辑已经不存在(旧代码在此处写死 for 循环覆盖,现在纯属并集,不存在冲突键)。
+    // **若未来改动破坏了这条不变式(比如 finalize_speakers 又开始复用旧表 id 空间),
+    // 这里的 `insert` 会静默把旧表条目的人工归属换成新表的同名条目(选边),旧稿
+    // 张冠李戴——两处必须同步改。** 下面的 debug_assert 是这条不变式的运行时哨兵
+    // (release 构建不生效,不影响性能;测试/debug 构建下一旦违反立即 panic 暴露)。
+    let old_speakers_snapshot = super::read_old_speakers(note_dir);
+    #[cfg(debug_assertions)]
+    {
+        let old_keys: std::collections::BTreeSet<&String> = old_speakers_snapshot.keys().collect();
+        let new_keys: std::collections::BTreeSet<&String> = speakers.keys().collect();
+        debug_assert!(
+            old_keys.is_disjoint(&new_keys),
+            "新表 id 与旧表撞号——finalize_speakers 的不相交不变式被破坏,commit 的并集预写\
+             会静默选边(见本函数注释)"
+        );
+    }
+    let mut union_speakers = old_speakers_snapshot;
     for (id, meta) in speakers {
         union_speakers.insert(id.clone(), meta.clone());
     }
@@ -126,6 +166,70 @@ mod tests {
         assert!(std::fs::read_to_string(dir.path().join("speakers.json")).unwrap().contains("张三"));
         assert!(!dir.path().join("segment-suppressions.jsonl").exists(), "seq 全变,抑制表必须清");
         assert!(!dir.path().join("align.json").exists(), "旧时基映射不再适用");
+    }
+
+    /// Fix 2(codex 第二轮)并集验证:旧表 S1(张三)与新表 S2(李四,新表 id 已按
+    /// finalize_speakers 的不相交不变式避开旧表键域,不再撞号)——步骤 3 的并集
+    /// 预写落盘后,旧 S1 的 meta 必须与提交前逐字段相等(纯并集新增一行,不存在
+    /// "冲突键取新值"的选边覆盖;旧代码撞号时会把这里的 S1 覆盖成新表同名条目)。
+    /// 借用与 `segments_rename_failure_propagates_err` 同款手法把 rename(步骤 4)
+    /// 逼失败,冻结在"步骤 3 已落盘、步骤 5 精确收尾写因提前 return 未执行"这一刻
+    /// ——否则成功路径下步骤 5 会把并集收窄成精确新表,旧 S1 这一行按设计被移除
+    /// (孤儿旧条目只在部分提交的中间态里保留,不是最终成功态的承诺)。
+    #[test]
+    fn union_preserves_old_entry_when_new_table_has_no_colliding_id() {
+        let dir = setup();
+        let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
+        let old_s1 = SpeakerMeta {
+            name: "张三".into(), sources: vec!["mic".into()], centroid: Some(vec![0.5]),
+            count: 7, person_id: Some("P1".into()),
+        };
+        let old_table = BTreeMap::from([("S1".to_string(), old_s1.clone())]);
+        crate::store::write_speakers_atomic(dir.path(), &old_table).unwrap();
+
+        // 预建备份,跳过步骤 1 的 copy(同 segments_rename_failure_propagates_err)。
+        std::fs::copy(dir.path().join("segments.jsonl"), dir.path().join(SEGMENTS_BACKUP_FILE)).unwrap();
+        // 逼步骤 4 的 rename 失败:把 segments.jsonl 换成目录占位。
+        std::fs::remove_file(dir.path().join("segments.jsonl")).unwrap();
+        std::fs::create_dir(dir.path().join("segments.jsonl")).unwrap();
+
+        let new_s2 = SpeakerMeta {
+            name: "李四".into(), sources: vec!["mic".into()], centroid: None, count: 3, person_id: None,
+        };
+        let new_table = BTreeMap::from([("S2".to_string(), new_s2.clone())]);
+        let result = commit(dir.path(), &lock, &[seg(1, "新文本")], &new_table);
+        assert!(result.is_err(), "rename 目标被目录占位时必须 Err(借这条已知失败路径冻结在步骤 3 之后)");
+
+        let on_disk: BTreeMap<String, SpeakerMeta> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("speakers.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(on_disk.len(), 2, "步骤 3 的并集应保留旧 S1 + 新 S2 两行");
+        assert_eq!(on_disk["S1"], old_s1, "旧 S1 必须逐字段原样保留(并集无冲突键,不会被选边覆盖)");
+        assert_eq!(on_disk["S2"].name, "李四");
+    }
+
+    /// Fix 5(codex 第二轮)故障注入:备份 tmp 路径被目录占位 → copy 必失败 → commit
+    /// 整体 Err,且**不产生** `segments.orig.jsonl`(下次重试仍会重新走一遍完整备份,
+    /// 不会被"备份已存在"的 write-once 判据卡死在半截状态)。RED 证据见本文件所在
+    /// commit 的报告小节:旧代码(`fs::copy` 直写 `backup` 路径,无 tmp 中转)在同款
+    /// "拷贝目标被目录占位"故障下会直接在 `backup` 路径本身失败并可能留下同名目录
+    /// 冲突残留,不满足"无残留、可重试"的断言。
+    #[test]
+    fn backup_tmp_collision_fails_commit_without_leaving_partial_backup() {
+        let dir = setup();
+        let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
+        // 提前用目录占住 tmp 路径,逼 std::fs::copy(&live, &tmp) 必然失败(Is a directory)。
+        std::fs::create_dir(dir.path().join("segments.orig.jsonl.tmp")).unwrap();
+
+        let result = commit(dir.path(), &lock, &[seg(1, "新文本")], &BTreeMap::new());
+        assert!(result.is_err(), "tmp 路径被目录占位时备份 copy 必须失败,commit 必须整体 Err");
+        assert!(
+            !dir.path().join(SEGMENTS_BACKUP_FILE).exists(),
+            "copy 失败不得产生 segments.orig.jsonl,下次重试才能重新完整备份"
+        );
+        // live segments.jsonl 完全未动(旧内容原样在盘)。
+        let live = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
+        assert!(live.contains("旧文本"), "备份失败时 live segments 不受影响");
     }
 
     /// 二次提交:备份不被覆盖——保的是「最初的原始转写」,不是上一轮重转写结果。

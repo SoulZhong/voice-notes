@@ -138,16 +138,37 @@ pub fn finalize_speakers(
         }
     }).collect();
 
-    // 第二遍:定 id 映射并建表。簇 id 原样;继承 id 先尝试按 person 并入已用簇,
-    // 否则重编号避让(跨新簇与已分配号取 max)。
-    let used_clusters: std::collections::BTreeSet<&str> = picks.iter()
+    // 第二遍:定 id 映射并建表。
+    //
+    // Fix 2(codex 第二轮,根治撞号预写污染):以前只给"继承的旧 id"重编号避让新簇,
+    // 落盘的簇 id 本身原样沿用聚类器吐出的 "S{n}"——它与旧表的编号空间是同一套
+    // "S{n}"记法,天然可能撞号(旧表 S1、新簇也叫 S1,但是不同人)。commit.rs §3
+    // 的并集预写在"冲突键取新值"时会用新簇的空 name 覆盖旧 S1 的人工归属,
+    // 一旦 rename(commit 步骤 4)失败,旧稿说话人被张冠李戴,击穿"Err ⇒ 原稿未动"
+    // 承诺。根治办法不是选边,而是让新表与旧表键域天生不相交:全部落盘 id(簇 id
+    // 与继承重编号 id)都从 `base = max(旧表全部 id 的数字部分)` 之后起跳,commit.rs
+    // 的并集因此永远无冲突键(见该文件 §3 断言注释)。
+    let numeric = |s: &str| s.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let base = old_speakers.keys().map(|k| numeric(k)).max().unwrap_or(0);
+    // 簇 id 按数字升序稳定映射到 S{base+1}, S{base+2}, ...——BTreeSet<&str> 按字典序
+    // 排列会把 "S10" 排在 "S2" 前面,必须显式按数字排序才是确定性可测的映射。
+    let mut used_clusters: Vec<&str> = picks.iter()
         .filter_map(|p| match p { Pick::Cluster(id) => Some(id.as_str()), _ => None })
         .collect();
+    used_clusters.sort_by_key(|id| numeric(id));
+    used_clusters.dedup();
+    let mut cluster_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut next = base;
+    for old_id in &used_clusters {
+        next += 1;
+        cluster_map.insert(old_id.to_string(), format!("S{next}"));
+    }
     let mut table: BTreeMap<String, SpeakerMeta> = BTreeMap::new();
-    for id in &used_clusters {
-        let info = info_by_id.get(id);
-        let snap = snap_by_id.get(id);
-        table.insert(id.to_string(), SpeakerMeta {
+    for old_id in &used_clusters {
+        let new_id = &cluster_map[*old_id];
+        let info = info_by_id.get(old_id);
+        let snap = snap_by_id.get(old_id);
+        table.insert(new_id.clone(), SpeakerMeta {
             name: info.and_then(|i| i.name.clone()).unwrap_or_default(),
             sources: info.map(|i| i.sources.iter().cloned().collect()).unwrap_or_default(),
             centroid: snap.map(|s| s.centroid.clone()),
@@ -155,8 +176,8 @@ pub fn finalize_speakers(
             person_id: info.and_then(|i| i.person.clone()),
         });
     }
-    let numeric = |s: &str| s.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    let mut next = table.keys().map(|k| numeric(k)).max().unwrap_or(0) + 1;
+    // 继承 id 的重编号起点从同一个计数器(`next`)继续,不重新从 base 起跳——保证
+    // 继承 id 与刚分配的簇 id 也不相撞(两者都已经在 base 之上的同一段连续区间里)。
     let mut inherit_map: BTreeMap<String, String> = BTreeMap::new();
     for p in &picks {
         let Pick::Inherit(old_id) = p else { continue };
@@ -164,15 +185,16 @@ pub fn finalize_speakers(
             continue;
         }
         let old_meta = &old_speakers[old_id];
-        // 同人合流:旧归属关联的库人物已被某个簇命中 → 直接用那个簇 id。
+        // 同人合流:旧归属关联的库人物已被某个簇命中 → 直接用那个簇的**新** id
+        // (table 此刻的键已经是重映射后的簇 id,天然拿到正确值,无需额外换算)。
         let unified = old_meta.person_id.as_ref().and_then(|pid| {
             table.iter().find(|(_, m)| m.person_id.as_deref() == Some(pid)).map(|(k, _)| k.clone())
         });
         let new_id = match unified {
             Some(id) => id,
             None => {
-                let id = format!("S{next}");
                 next += 1;
+                let id = format!("S{next}");
                 table.insert(id.clone(), old_meta.clone());
                 id
             }
@@ -180,7 +202,7 @@ pub fn finalize_speakers(
         inherit_map.insert(old_id.clone(), new_id);
     }
     let speakers = picks.iter().map(|p| match p {
-        Pick::Cluster(id) => Some(id.clone()),
+        Pick::Cluster(id) => Some(cluster_map[id].clone()),
         Pick::Inherit(old_id) => Some(inherit_map[old_id].clone()),
         Pick::Nothing => None,
     }).collect();
@@ -285,10 +307,12 @@ mod tests {
         }
     }
 
-    /// 撞号:新簇 S1(无主)与旧 S1(张三)是不同人——继承段的旧 S1 必须重编号,
-    /// 不得吞并新簇 S1,speakers 表两行并存且 meta 各归各。
+    /// Fix 2(codex 第二轮,原名 inherited_old_id_renumbered_on_collision——语义已变,
+    /// 改名如实反映):旧表有 S1(张三),落盘的新簇 id 必须整体避让旧表键域,不再是
+    /// "簇 id 原样、只有继承 id 重编号"。旧表 max 数字部分是 1 → 新簇 S1 落盘为 S2 起,
+    /// 继承的旧 S1 接着编到 S3,两者与旧表键域两两不相交。
     #[test]
-    fn inherited_old_id_renumbered_on_collision() {
+    fn cluster_and_inherited_ids_avoid_old_table_domain_on_collision() {
         let segs = vec![rec("mic", 0, 2000), rec("mic", 10_000, 2000)];
         // 段0 归新簇 S1(无 person);段1 无簇
         let clusters = vec![Some("S1".to_string()), None];
@@ -298,15 +322,17 @@ mod tests {
         let old_speakers = BTreeMap::from([("S1".to_string(), named_meta("张三", None))]);
         let (speakers, table, stats) =
             finalize_speakers(&segs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
-        assert_eq!(speakers[0].as_deref(), Some("S1"), "新簇段保留簇 id");
+        assert_eq!(speakers[0].as_deref(), Some("S2"), "新簇 S1 避让旧表 S1,落盘为 S2");
         let inherited = speakers[1].clone().expect("重叠继承应命中");
-        assert_ne!(inherited, "S1", "旧 S1 与新簇 S1 撞号必须重编号");
+        assert_eq!(inherited, "S3", "继承的旧 S1 接着簇 id 的计数器继续编号");
         assert_eq!(table[&inherited].name, "张三");
-        assert_eq!(table["S1"].name, "");
+        assert_eq!(table["S2"].name, "", "新簇自己的 meta 落在它的新 id 下");
+        assert!(!table.contains_key("S1"), "新表不应再出现与旧表撞号的 S1 键");
         assert_eq!((stats.seed_matched, stats.inherited), (0, 1));
     }
 
-    /// 同人合流:旧说话人关联的 person 与种子命中簇相同 → 复用簇 id,不开第二行。
+    /// 同人合流:旧说话人关联的 person 与种子命中簇相同 → 复用簇的**新** id(避让旧表
+    /// 键域后的编号),不开第二行。
     #[test]
     fn inherited_speaker_unified_with_seed_cluster_by_person() {
         let segs = vec![rec("mic", 0, 3000), rec("mic", 10_000, 1000)];
@@ -318,10 +344,38 @@ mod tests {
         let old_speakers = BTreeMap::from([("S9".to_string(), named_meta("张三", Some("P7")))]);
         let (speakers, table, stats) =
             finalize_speakers(&segs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
-        assert_eq!(speakers[1].as_deref(), Some("S1"), "同 person 并入种子簇");
+        // 旧表 max 数字部分是 9 → 新簇 S1 落盘为 S10。
+        assert_eq!(speakers[1].as_deref(), Some("S10"), "同 person 并入种子簇(避让后的新 id)");
         assert_eq!(table.len(), 1);
-        assert_eq!(table["S1"].person_id.as_deref(), Some("P7"));
+        assert_eq!(table["S10"].person_id.as_deref(), Some("P7"));
         assert_eq!((stats.seed_matched, stats.inherited), (1, 1));
+    }
+
+    /// Fix 2 新增:旧表 {S1,S3},新簇 {S1,S2}(均未撞种子/继承候选) → 全部落盘 id
+    /// 都必须严格大于旧表最大数字部分(3),且新表键与旧表键 {S1,S3} 完全不相交
+    /// ——commit.rs §3 的并集预写因此天然无冲突键(见 commit.rs 对应测试)。
+    #[test]
+    fn all_landed_ids_strictly_exceed_old_table_max_without_collision() {
+        let segs = vec![rec("mic", 0, 2000), rec("mic", 5_000, 2000)];
+        let clusters = vec![Some("S1".to_string()), Some("S2".to_string())];
+        let infos = vec![info("S1", None, None), info("S2", None, None)];
+        let snaps = vec![snap("S1"), snap("S2")];
+        let old_segs: Vec<SegmentRecord> = vec![]; // 无重叠候选,两段都走簇 id 兜底
+        let old_speakers = BTreeMap::from([
+            ("S1".to_string(), named_meta("甲", None)),
+            ("S3".to_string(), named_meta("乙", None)),
+        ]);
+        let (speakers, table, _stats) =
+            finalize_speakers(&segs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
+        assert_eq!(speakers[0].as_deref(), Some("S4"));
+        assert_eq!(speakers[1].as_deref(), Some("S5"));
+        for id in table.keys() {
+            let n = id.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap();
+            assert!(n > 3, "落盘 id {id} 必须严格大于旧表最大数字部分 3");
+        }
+        let new_keys: std::collections::BTreeSet<&String> = table.keys().collect();
+        let old_keys: std::collections::BTreeSet<&String> = old_speakers.keys().collect();
+        assert!(new_keys.is_disjoint(&old_keys), "新表键与旧表键 {{S1,S3}} 必须不相交");
     }
 
     /// 无人工价值的旧归属(name 空且无 person)不继承——继承是保人工劳动,不是保编号。
