@@ -585,19 +585,21 @@
   // 需要靠这个补一次状态)+ 成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
   $effect(() => {
     const forId = id;
-    retranscribeStatus().then((s) => {
-      if (forId !== id) return;
-      if (s && s.note_id === forId) {
-        retranscribing = true;
-        retransStage = s.stage;
-      }
-    });
+    retranscribeStatus()
+      .then((s) => {
+        if (forId !== id) return;
+        if (s && s.note_id === forId) {
+          retranscribing = true;
+          retransStage = s.stage;
+        }
+      })
+      .catch(() => {});
     mixedInputStatus(forId)
       .then((r) => {
         if (forId === id) mixedReason = r;
       })
       .catch(() => {
-        if (forId === id) mixedReason = "?";
+        if (forId === id) mixedReason = t("notes.retrans.mixedCheckFailed");
       });
   });
 

@@ -56,6 +56,7 @@ export const zh = {
   "notes.retrans.running": "重转写中（{stage}）",
   "notes.retrans.failed": "重转写失败：{e}",
   "notes.retrans.staleBanner": "段落已重转写，本修订稿基于旧文本，请重新执行 AI。",
+  "notes.retrans.mixedCheckFailed": "无法检测成品轨可用性",
 
   // 详情页:错误文案(加载/删除失败复用 common.loadFailed/common.deleteFailed)
   "notes.detail.editFailed": "编辑失败: {e}",
@@ -142,6 +143,7 @@ export const en = {
   "notes.retrans.running": "Re-transcribing ({stage})",
   "notes.retrans.failed": "Re-transcription failed: {e}",
   "notes.retrans.staleBanner": "Segments were re-transcribed. This refined doc is based on the old text — please re-run AI.",
+  "notes.retrans.mixedCheckFailed": "Could not check mixed-track availability",
 
   "notes.detail.editFailed": "Failed to edit: {e}",
   "notes.detail.setSpeakerFailed": "Failed to change speaker: {e}",
