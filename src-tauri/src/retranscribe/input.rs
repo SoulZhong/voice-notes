@@ -69,9 +69,20 @@ impl TranscribeInput for DualTrackInput {
         let mut out = Vec::new();
         let mut found = false;
         for source in ["mic", "system"] {
-            let Ok(pcm) = crate::store::transcode::track_pcm(&self.note_dir, source) else {
-                continue; // 轨不存在/解码失败:单轨笔记合法,另一轨兜底
-            };
+            // 「轨不存在」与「轨存在但解码失败」不是同一件事,不能同等 continue:
+            // m4a 损坏、或转码 worker 恰在删 wav 的窗口撞上,都会让 track_pcm 返回 Err，
+            // 若在此静默跳过,单轨结果会在没有任何警示的情况下覆盖全文——用户以为
+            // 拿到了双轨完整重转写,实际上丢了一整路内容。文件确实都不存在才是
+            // 「单轨笔记合法」的场景,此时才允许 continue;文件存在但解不出来，
+            // 必须整体 bail,把盘上一字不动地留住,逼用户看到错误再决定重试。
+            if !track_exists(&self.note_dir, source) {
+                continue;
+            }
+            let pcm = crate::store::transcode::track_pcm(&self.note_dir, source).map_err(|e| {
+                anyhow::anyhow!(
+                    "音轨 {source} 存在但解码失败,拒绝用另一轨静默覆盖全文(排查后重试): {e}"
+                )
+            })?;
             found = true;
             let offset_ms = meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
             let mut seg = (self.make_segmenter)()?;
@@ -82,6 +93,13 @@ impl TranscribeInput for DualTrackInput {
         }
         Ok(out)
     }
+}
+
+/// 纯逻辑判定:`<source>.wav`/`<source>.m4a` 是否至少一个存在于笔记目录。抽成独立
+/// 函数是为了让"轨不存在 vs 轨存在但解码失败"这条分支判定本身可脱离 afconvert
+/// 子进程单测(见下方 tests::track_exists_*)。
+fn track_exists(note_dir: &std::path::Path, source: &str) -> bool {
+    note_dir.join(format!("{source}.wav")).exists() || note_dir.join(format!("{source}.m4a")).exists()
 }
 
 /// 成品轨入口:单轨,source 恒 "mixed"。调用方须先过 mixed_untrusted 校验。
@@ -209,5 +227,36 @@ mod tests {
         let mut m2 = meta_with(Some(60_000), 60_000, 60_000, 0);
         m2.tracks.get_mut("mic").unwrap().sync = None;
         assert!(mixed_untrusted(&m2).is_some(), "源轨无 sync 记录");
+    }
+
+    /// track_exists 纯逻辑:wav/m4a 任一存在即真,两者皆无为假。不依赖 afconvert,
+    /// 全平台可跑——这是 Fix1「轨不存在 vs 解码失败」分支判定的可测部分。
+    #[test]
+    fn track_exists_checks_wav_or_m4a_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!track_exists(dir.path(), "mic"), "两者皆无");
+        std::fs::write(dir.path().join("mic.wav"), b"x").unwrap();
+        assert!(track_exists(dir.path(), "mic"), "wav 存在");
+        std::fs::remove_file(dir.path().join("mic.wav")).unwrap();
+        std::fs::write(dir.path().join("mic.m4a"), b"x").unwrap();
+        assert!(track_exists(dir.path(), "mic"), "m4a 存在");
+    }
+
+    /// DualTrackInput 端到端(macOS 子进程可行,直接测真实分支而非只测纯函数):
+    /// system 轨完全不存在(单轨笔记合法,应 continue);mic 轨的 m4a 存在但是垃圾
+    /// 字节,afconvert 解码必失败——此时不许静默跳过,必须整体 bail 且错误带轨名。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dual_track_bails_when_file_exists_but_decode_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mic.m4a"), b"not a real m4a").unwrap();
+        let make_seg: SegmenterFactory =
+            Box::new(|| Ok(Box::new(MockSegmenter::new(1600)) as Box<dyn Segmenter>));
+        let mut input = DualTrackInput::new(dir.path().to_path_buf(), make_seg);
+        let err = match input.segments() {
+            Err(e) => e,
+            Ok(_) => panic!("解码失败必须整体 bail,不得静默产出结果"),
+        };
+        assert!(err.to_string().contains("mic"), "错误须带轨名,实际: {err}");
     }
 }
