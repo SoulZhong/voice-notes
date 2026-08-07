@@ -202,6 +202,16 @@ fn clean_mic_before_encode(note_dir: &Path, models_dir: &Path) {
     // 刻意不预修 WAV 头:清洗引擎按字节读(44 头后全量,不看头内长度字段),陈旧头
     // 不影响;encode 前的修头由 transcode_one 统一做。跳过清洗的路径必须严格
     // 字节不动(审查约束)。
+    // [诊断插桩 2026-08-07] VN_KEEP_PRECLEAN=1 时保留清洗前的原始 mic 轨副本。
+    // 后缀取 .wav.orig:sources_with_suffix 按 ".wav" 结尾扫盘,不会把副本当轨道
+    // 转码/删除;known_sources 也不认识它,对播放器不可见。用于实时 AEC 失效的
+    // 信号级验尸——此前每场的原始回声轨都被清洗原地替换,证据无从复得。
+    if std::env::var("VN_KEEP_PRECLEAN").is_ok() {
+        let keep = note_dir.join("mic.wav.orig");
+        if let Err(e) = std::fs::copy(&mic, &keep) {
+            eprintln!("保留清洗前副本失败(不影响清洗): {e}");
+        }
+    }
     let out_tmp = note_dir.join("mic.wav.clean.tmp");
     match crate::audio::echo_clean::clean_wav(&mic, &system, mic_off, sys_off, &out_tmp, models_dir) {
         Ok(Some(report)) => {

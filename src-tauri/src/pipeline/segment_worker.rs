@@ -126,7 +126,18 @@ pub fn run_segment_worker(
         }
     }
 
-    // 采集结束：尾段定稿
+    // 采集结束:先排空 AEC 签名预对齐在 capture 侧扣压的尾部(参考迟到场景下
+    // 最多 CAPTURE_MAX_MS 的真实 mic 音频,不排空即丢),与循环内同序喂给
+    // sink 与 segmenter,再定稿尾段。Render/无 AEC 角色 flush 恒空,零影响。
+    if let Some(crate::audio::aec::AecRole::Capture(c)) = aec.as_mut() {
+        let tail = c.flush();
+        if !tail.is_empty() {
+            if let Some(sink) = &mut audio_sink {
+                sink(&tail);
+            }
+            segmenter.accept(&tail);
+        }
+    }
     segmenter.flush();
     emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate);
 }
