@@ -6,7 +6,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
-  import { onRefine, onNoteRenamed, onNoteRealigned } from "$lib/events";
+  import { onRefine, onRetranscribe, onNoteRenamed, onNoteRealigned } from "$lib/events";
   import {
     getNote,
     renameNote,
@@ -14,6 +14,9 @@
     exportFileName,
     getRefined,
     refineNote,
+    retranscribeNote,
+    retranscribeStatus,
+    mixedInputStatus,
     formatDate,
     formatDuration,
     speakerLabel,
@@ -71,6 +74,14 @@
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
+
+  // 文件重转写(三期):离线用盘上音频重转全文,覆盖原始逐字稿(自动备份)。
+  // retransErr 复用 refineErr 同款粘性 banner 展示套路(本页无 toast 机制)。
+  let retranscribing = $state(false);
+  let retransStage = $state("");
+  let retransConfirm = $state(false);
+  let retransErr = $state("");
+  let mixedReason = $state<string | null>(null); // null = 成品轨可用
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
   // 相关笔记(经知识图谱共享实体):增值层,取失败静默按空。
@@ -529,6 +540,11 @@
     refineRunFailed = false;
     refineErr = "";
     confirmRefine = false;
+    retranscribing = false;
+    retransStage = "";
+    retransConfirm = false;
+    retransErr = "";
+    mixedReason = null;
     viewMode = "refined";
     cancelHideEntityPop();
     entityPop = null;
@@ -554,6 +570,57 @@
         getRefined(forId).then((r) => {
           if (forId === id) refined = r;
         });
+      }
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
+
+  // 文件重转写(三期):挂载/切笔记时回填在途任务(事件只覆盖在页期间,若切走再切回
+  // 需要靠这个补一次状态)+ 成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
+  $effect(() => {
+    const forId = id;
+    retranscribeStatus().then((s) => {
+      if (forId !== id) return;
+      if (s && s.note_id === forId) {
+        retranscribing = true;
+        retransStage = s.stage;
+      }
+    });
+    mixedInputStatus(forId)
+      .then((r) => {
+        if (forId === id) mixedReason = r;
+      })
+      .catch(() => {
+        if (forId === id) mixedReason = "?";
+      });
+  });
+
+  // 重转写进度事件：按 id 注册/解绑（同款 onRefine 套路）。running 置 retranscribing=true；
+  // 非 running（ok/error）都是任务终态，复位并按结果刷新（ok 才重拉，error 提示不改数据）。
+  $effect(() => {
+    const forId = id;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    onRetranscribe((e) => {
+      if (e.note_id !== forId) return;
+      if (e.state === "running") {
+        retranscribing = true;
+        retransStage = e.stage;
+        return;
+      }
+      retranscribing = false;
+      retransConfirm = false;
+      if (e.state === "ok") {
+        refresh();
+        recording.bumpNotes();
+      } else if (e.message) {
+        retransErr = t("notes.retrans.failed", { e: e.message });
       }
     }).then((u) => {
       if (disposed) u();
@@ -947,6 +1014,20 @@
     }
   }
 
+  /** 发起文件重转写:input 二选一(双轨/成品轨),破坏性(覆盖原始逐字稿),二段确认
+      已在按钮态处理(retransConfirm),这里只管发起。 */
+  async function startRetranscribe(input: "dual" | "mixed") {
+    retransConfirm = false;
+    retransErr = "";
+    try {
+      await retranscribeNote(id, input);
+      retranscribing = true;
+      retransStage = "decode";
+    } catch (e) {
+      retransErr = t("notes.retrans.failed", { e });
+    }
+  }
+
   async function doResume() {
     const ok = await recording.resume(id);
     if (ok) goto("/record");
@@ -1039,6 +1120,10 @@
         <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
              可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
              Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
+        {#if refined?.stale}
+          <!-- 文件重转写(三期)已跑过但本修订稿还是旧文本(段落已变):提示重新执行 AI -->
+          <div class="banner">{t("notes.retrans.staleBanner")}</div>
+        {/if}
         <SpeakerChips
           speakers={refinedSpeakers}
           noteId={id}
@@ -1125,10 +1210,40 @@
             <AiStateLabel state={aiState} />
           </button>
         {/if}
+
+        <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
+             自动备份为 segments.orig.jsonl),二段确认同款 confirmRefine 样板。
+             来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
+             判定可用性并置灰+tooltip 给原因)。 -->
+        {#if retransConfirm}
+          <span class="refine-warn">{t("notes.retrans.warn")}</span>
+          <button class="link danger" onclick={() => startRetranscribe("dual")}>
+            {t("notes.retrans.confirmDual")}
+          </button>
+          <button
+            class="link danger"
+            disabled={mixedReason !== null}
+            title={mixedReason ?? ""}
+            onclick={() => startRetranscribe("mixed")}
+          >
+            {t("notes.retrans.confirmMixed")}
+          </button>
+          <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+        {:else}
+          <button
+            class="link"
+            disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
+            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+            onclick={() => (retransConfirm = true)}
+          >
+            {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
+          </button>
+        {/if}
       </div>
     </div>
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
+    {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
     {#if effectiveView === "refined" && refined}
       <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
