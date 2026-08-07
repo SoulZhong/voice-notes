@@ -29,7 +29,11 @@ pub fn new_pair(sample_rate: u32) -> anyhow::Result<(AecRender, AecCapture)> {
         // 自动增益(AGC2 自适应数字):普通麦克风模式没有 VPIO 的增益管理,系统输入
         // 音量被会议软件拉低/说话偏轻时波形过小——VAD 概率过不了阈,句子根本不切段
         // (观感"声音小就不转写"),录音回放也听不见。自适应数字增益作用在回声消除
-        // 之后(不放大回声),把人声抬到正常电平。input_volume_controller 关死:
+        // 之后。**警示(2026-08-07 实测)**:它的语音检测分不清"残余回声"与"本人轻声
+        // 说话",纯远端回声场景会把残余抬回语音电平——理想对齐下消除量从 48.6dB 掉到
+        // 20.2dB(diag_agc2_on_residual_echo_level)。因果性修复(签名预对齐)后此
+        // 残余是否仍可被 VAD/ASR 捕获,待真机数据评估;若是,AGC2 需要远端活动门控。
+        // input_volume_controller 关死:
         // 绝不碰系统输入音量旋钮——那个旋钮会被会议软件抢,抢完不还(2026-07-06
         // 排障实锤),我们只做进程内数字增益,不参与系统层拉锯。
         gain_controller: Some(config::GainController::GainController2(config::GainController2 {
@@ -164,12 +168,17 @@ const STATS_EVERY_FRAMES: usize = 1000;
 impl AecCapture {
     /// 处理 mic 路 16k 单声道样本,返回消回声后的样本(10ms 整帧倍数;不足一帧的
     /// 余量滞留到下次调用)。单帧处理失败原样透传——宁可留回声也不丢波形。
-    /// align 为 Some 时先累积 obs 包络(消回声之前,供滑窗重估用),再走既有
-    /// 消回声流程。
+    /// align 为 Some 时样本先过签名预对齐:参考迟到场景下 capture 被扣压若干
+    /// 十毫秒(交付推迟、样本域不变),让参考先于回声就位;流结束须调 flush()
+    /// 排空扣压尾部,否则丢真实尾音。
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        if let Some(a) = &self.align {
-            a.on_capture(samples);
-        }
+        let delayed: Vec<f32>;
+        let samples: &[f32] = if let Some(a) = &self.align {
+            delayed = a.on_capture(samples);
+            &delayed
+        } else {
+            samples
+        };
         self.buf.extend_from_slice(samples);
         let full = (self.buf.len() / FRAME) * FRAME;
         let mut out: Vec<f32> = self.buf.drain(..full).collect();
@@ -189,6 +198,27 @@ impl AecCapture {
                         s.delay_ms, s.echo_return_loss, s.echo_return_loss_enhancement
                     );
                 }
+            }
+        }
+        out
+    }
+
+    /// 流结束:排空签名预对齐在 capture 侧扣压的尾部样本(最多 CAPTURE_MAX_MS),
+    /// 过 AEC3 后返回;不足 10ms 整帧的残余以原样附带(≤10ms,与既有"至多丢一帧
+    /// 余量"的口径一致但不再丢)。align 为 None 时无扣压,仅返回既有余量语义下
+    /// 的空结果(行为不变)。调用方(segment_worker)须把返回样本继续喂给
+    /// sink/segmenter——这些是真实 mic 音频,不是可弃的处理残渣。
+    pub fn flush(&mut self) -> Vec<f32> {
+        let Some(a) = &self.align else {
+            return Vec::new();
+        };
+        let tail = a.flush_capture();
+        self.buf.extend_from_slice(&tail);
+        let full = (self.buf.len() / FRAME) * FRAME;
+        let mut out: Vec<f32> = self.buf.drain(..).collect();
+        for chunk in out[..full].chunks_mut(FRAME) {
+            if let Err(e) = self.ap.process_capture_frame([&mut chunk[..]]) {
+                eprintln!("AEC capture 收尾处理失败(该帧原样透传): {e}");
             }
         }
         out
@@ -365,6 +395,48 @@ mod tests {
 mod diag_tests {
     use super::*;
     use tests::{noise, power};
+
+    /// 修复验证(2026-08-07 根因):参考恒定迟到 200ms(SCK 交付滞后的稳态近似),
+    /// 回声声学延迟 30ms——即 mic 回声比参考早 170ms 到达。修复前因果破坏,消除
+    /// ≈0(见 diag_reference_arriving_after_capture 的 -9.5dB);修复后 capture 侧
+    /// 扣压应恢复因果,收敛尾段至少 6dB。
+    #[test]
+    fn aligned_pair_cancels_echo_with_late_reference() {
+        use crate::audio::delay_estimate::tests::block_modulated_noise;
+        let (mut r, mut c, align) = new_aligned_pair(16_000, 0).unwrap();
+        let mut seed = 77u64;
+        let content = block_modulated_noise(16_000 * 45, &mut seed);
+        let echo_delay = 480; // 30ms 声学
+        let late = 3200; // 参考交付滞后 200ms
+        let echo_gain = 0.5f32;
+        // near[i] = content[i-480]*0.5;喂给 render 的流在位置 i 是 content[i-3200]
+        let mut near = vec![0.0f32; content.len()];
+        for i in echo_delay..content.len() {
+            near[i] = content[i - echo_delay] * echo_gain;
+        }
+        let mut ref_fed = vec![0.0f32; content.len()];
+        for i in late..content.len() {
+            ref_fed[i] = content[i - late];
+        }
+        let tail_from = content.len() - 16_000 * 5;
+        let mut out_tail = Vec::new();
+        for (i, (f, n)) in ref_fed.chunks(FRAME).zip(near.chunks(FRAME)).enumerate() {
+            r.push(f);
+            let cleaned = c.process(n);
+            if i * FRAME >= tail_from {
+                out_tail.extend_from_slice(&cleaned);
+            }
+        }
+        // capture 侧应已扣压 ~100+170=270ms
+        let p = align.capture_predelay_ms() as i64;
+        assert!((p - 270).unsigned_abs() <= 80, "capture 扣压应≈270ms,实际 {p}ms");
+        let echo_power = power(&near[tail_from..]);
+        let out_power = power(&out_tail);
+        assert!(
+            out_power < echo_power / 4.0,
+            "参考迟到场景修复后应至少衰减 6dB: {echo_power:.6} -> {out_power:.6}"
+        );
+    }
 
     /// 诊断:render 全程静音(远端没人说话)时,近端人声应该原样通过,不得被压制。
     #[test]
