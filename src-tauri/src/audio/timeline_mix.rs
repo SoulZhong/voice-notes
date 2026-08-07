@@ -3,8 +3,9 @@
 //! 为什么不按到达顺序:两路采集线程独立,块大小与到达时刻都不可控。按到达顺序配对
 //! (meetily 的 `can_mix()` 用 `||` + 零填充)会在某路滞后时拿静音顶替一窗,等真数据
 //! 到达已与更晚的对面窗错配,且错位不可恢复。这里每块样本的位置是**算出来的**——
-//! `pos = 该源已接受样本数`(调用方保证喂进来的是 post-frame_tap 流,断流已补零帧,
-//! 故样本数即时间轴位置),因此位置从不靠推断。
+//! 常规块的位置由该源已接受样本数推进;首块可由调用方通过 `accept_at` 带入相对
+//! 会话共同原点的偏移。调用方保证喂进来的是 post-frame_tap 流(断流已补零帧),
+//! 因此首块之后的样本数可继续作为时间轴位置,不靠到达顺序推断。
 //!
 //! 定稿判据:水位线 = `min(各源位置) − margin`。低于水位的位置两源都不可能再来数据,
 //! 可安全定稿;margin 吸收两路到达时刻的抖动。
@@ -48,19 +49,25 @@ impl TimelineMixer {
     }
 
     /// 接受某源一块样本,返回本次新定稿的连续样本(从旧 win_start 起)。
+    #[cfg(test)]
     pub fn accept(&mut self, src: usize, samples: &[f32]) -> Vec<f32> {
+        self.accept_at(src, self.pos[src], samples)
+    }
+
+    /// 在共同时间轴的显式位置接受一块样本。主要用于首块:两路 capture 顺序启动,
+    /// 后启动源首帧前的真实墙钟差要表现为前导静音,不能让每源都从各自的 0 起算。
+    /// 后续块应连续推进;允许 `start > pos[src]` 表示已知静音缺口,但不允许回写
+    /// 已经定稿或与本源既有内容重叠的位置。
+    pub fn accept_at(&mut self, src: usize, start: u64, samples: &[f32]) -> Vec<f32> {
         debug_assert!(src < NSRC, "src 越界: {src} >= NSRC({NSRC})");
-        // 下面两处 u64 减法(`end - win_start`、`start - win_start`)安全的前提是
-        // win_start <= pos[src]。drain_below_watermark 严格维持这个不变式;finish
-        // 也维持(见 finish 文档)。这里断言把契约钉死,一旦有代码改动破坏它,debug
-        // 构建立刻炸,而不是留到 release 下减法回绕成 Vec::resize 的天文 capacity。
+        // 下面两处 u64 减法安全的前提是 win_start <= start。显式位置还必须不早于
+        // 本源已接受位置,否则会重复混入或写回已定稿区。
         debug_assert!(
-            self.pos[src] >= self.win_start,
-            "pos[{src}]={} < win_start={}: 不变式已被打破",
+            start >= self.pos[src] && start >= self.win_start,
+            "start={start} 早于 pos[{src}]={} 或 win_start={}: 不变式已被打破",
             self.pos[src],
             self.win_start
         );
-        let start = self.pos[src];
         // 按位置累加进窗(窗不足则补 0.0 扩容——那些位置只是还没有任何源写过)。
         let end = start + samples.len() as u64;
         let need = (end - self.win_start) as usize;
@@ -156,6 +163,18 @@ mod tests {
         assert_close(&m.accept(SYSTEM, &[0.1, 0.2]), &[1.1, 2.2]);
         // system 再追 2 个 → 定稿第 3、4 个位置(而非和 mic 后来的样本错配)
         assert_close(&m.accept(SYSTEM, &[0.3, 0.4]), &[3.3, 4.4]);
+    }
+
+    /// 两源首帧并非同时出现时,调用方给出的共同时间轴起点必须保留下来。system
+    /// 晚 2 个样本才开始,前两个位置只能有 mic,不能把 system 整体前移到 0。
+    #[test]
+    fn explicit_first_frame_offset_preserves_leading_silence() {
+        let mut m = TimelineMixer::new(0);
+        assert!(m.accept_at(MIC, 0, &[1.0, 1.0, 1.0, 1.0]).is_empty());
+        assert_close(
+            &m.accept_at(SYSTEM, 2, &[0.5, 0.5]),
+            &[1.0, 1.0, 1.5, 1.5],
+        );
     }
 
     /// 缺口:某源在时间轴上有空洞(frame_tap 已补零帧,此处等价于喂 0.0),

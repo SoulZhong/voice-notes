@@ -203,6 +203,45 @@ fn track_ms_from_wav_len(wav_len: u64, base_ms: u64, offset_ms: u64) -> u64 {
     file_ms.saturating_sub(carried)
 }
 
+/// audio.json 缺该轨条目时反推 offset_ms:按「上场停止时文件尾 ≈ base_ms」的对齐
+/// 不变式倒算。`open()` 走这条路时会把结果回写补全,`pre_session_track_len` 只读地
+/// 复用同一公式——两处一旦分叉,回滚基线就会与 `open()` 实际对齐到的长度错开。
+fn estimated_offset_ms(base_ms: u64, existing_data: u64) -> u64 {
+    base_ms.saturating_sub(bytes_to_ms(existing_data))
+}
+
+/// 本场开始前该轨在盘上**应有**的字节数(含 44 字节头)。等于
+/// `AudioTrackWriter::open()` 续录对齐后的长度,再与装配时实际长度取小。
+///
+/// 谁需要它:混音旁路放弃 `mixed.wav` 时要把文件回滚成「不含本场任何字节」的样子。
+/// 回滚到**装配时的文件长度**是错的:`base_ms` 来自 `StoreWriter::base_ms()`,是续录前
+/// 最大 `end_ms`(最后一句话结束的位置),而文件尾还压着用户按停止键前那段没进任何
+/// segment 的静音(VAD 尾巴 + 反应时间),于是 `base_ms < 上一场轨时长` 是**常态**,
+/// `open()` 恒走截短分支。截掉的那截不可逆,回滚到旧长度只会把本场刚混出来的字节填进
+/// 空出的位置,拼出一条「上一场 + 本场开头」的混合体——而且 `duration_ms` 与放弃前
+/// 一模一样,下游任何交叉核对都发现不了。
+///
+/// 取 min 还挡住反向情形:对齐若是零填充(target 大于现有内容),那段零同样不是上一场
+/// 的内容,不该冒充它留在盘上。文件因此恒为装配前内容的**真前缀**。
+///
+/// `existing_len` 由调用方传入(它判定「这是一个普通文件」时已经 stat 过),让基线取的
+/// 与判定用的是同一份快照;也避免调用方为了对齐公式去复刻 `ms_to_bytes` / `HEADER_LEN`
+/// ——两处各算一遍正是上述 bug 的成因。
+pub fn pre_session_track_len(
+    note_dir: &Path,
+    source: &str,
+    base_ms: u64,
+    existing_len: u64,
+) -> u64 {
+    let existing_data = existing_len.saturating_sub(HEADER_LEN);
+    let offset_ms = match load_audio_meta(note_dir).tracks.get(source) {
+        Some(t) => t.offset_ms,
+        None => estimated_offset_ms(base_ms, existing_data),
+    };
+    let target = ms_to_bytes(base_ms.saturating_sub(offset_ms));
+    HEADER_LEN + existing_data.min(target)
+}
+
 /// 量 note_dir 下 `<source>.wav` 得到本场该轨净时长(ms)。
 /// 必须在写盘线程 join 之后调用(WAV 头已收尾、文件长度已定终)。
 /// None = 该轨没有 WAV(采集启动失败、未保留音频、或文件被移走):无从对账,调用方跳过。
@@ -450,7 +489,7 @@ impl AudioTrackWriter {
                     // 破坏性 set_len 固化。按「上场停止时文件尾 ≈ base_ms」的对齐
                     // 不变式反推 offset = base_ms - 时长(负值饱和为 0,等价旧行为),
                     // 并立即回写补全,让重建只发生一次。
-                    let est = self.base_ms.saturating_sub(bytes_to_ms(existing_data));
+                    let est = estimated_offset_ms(self.base_ms, existing_data);
                     meta.schema_version = 1;
                     // 只改 offset、保留其它字段(soft_aec 等先于建档写入):
                     // 整条替换会把建档之前已写入的标记一并抹掉。
@@ -493,10 +532,17 @@ impl AudioTrackWriter {
         }
     }
 
-    /// 追加一批 f32 样本(clamp 到 [-1,1] 转 s16le)。失败 eprintln 一次后永久停写。
-    pub fn append(&mut self, samples: &[f32]) {
+    /// 追加一批 f32 样本(clamp 到 [-1,1] 转 s16le)。成功返回 true;失败 eprintln
+    /// 一次后永久停写并返回 false,让需要产物完整性的上层能立即放弃该轨。
+    ///
+    /// `#[must_use]`:这个返回值是 mixed 旁路唯一能察觉「盘上产物已不完整」的信号,
+    /// 静默丢弃它就会留下一条语法合法、内容截断、下游分辨不出的成品轨。确实不关心
+    /// 失败的调用点(源轨侧靠 `activity` 标记表达,测试里只是造数据)请写 `let _ =`,
+    /// 把「故意忽略」显式化。
+    #[must_use]
+    pub fn append(&mut self, samples: &[f32]) -> bool {
         if samples.is_empty() {
-            return;
+            return !matches!(self.state, TrackState::Failed);
         }
         if matches!(self.state, TrackState::Pending) {
             match self.open() {
@@ -506,7 +552,7 @@ impl AudioTrackWriter {
                 Err(e) => {
                     eprintln!("音频轨道建档失败,本场 {} 不保留音频: {e}", self.source);
                     self.state = TrackState::Failed;
-                    return;
+                    return false;
                 }
             }
         }
@@ -515,11 +561,11 @@ impl AudioTrackWriter {
                 eprintln!("音频轨道达到 WAV 4GiB 尺寸上限,停写({})", path.display());
                 self.flush_header(); // 已写内容仍是合法 WAV
                 self.state = TrackState::Failed;
-                return;
+                return false;
             }
         }
         let TrackState::Open { file, path, data_len, since_flush, buf } = &mut self.state else {
-            return;
+            return false;
         };
         buf.clear();
         buf.reserve(samples.len() * 2);
@@ -529,13 +575,14 @@ impl AudioTrackWriter {
         if let Err(e) = file.write_all(buf) {
             eprintln!("音频落盘失败,本轨道停写({}): {e}", path.display());
             self.state = TrackState::Failed;
-            return;
+            return false;
         }
         *data_len += buf.len() as u64;
         *since_flush += samples.len() as u64;
         if *since_flush >= FLUSH_INTERVAL_SAMPLES {
             self.flush_header();
         }
+        !matches!(self.state, TrackState::Failed)
     }
 
     /// 回写头部尺寸并刷盘,失败即停写。
@@ -650,20 +697,18 @@ pub fn list_tracks(note_dir: &Path) -> Vec<TrackInfo> {
 ///
 /// # 返回 Some 不等于这条轨内容完整(消费前必读)
 ///
-/// 混音是录制主链路的旁路,放弃时优先保源轨,于是盘上**可能留下一条语法完全合法、
-/// 内容却被静默截断**的 `mixed.wav`。截断轨的 WAV 头是 `AudioTrackWriter` 定期回写的
-/// 合法头,本函数(以及转码、波形)都无从分辨它与完好轨的区别:`duration_ms` 按字节
-/// 如实算出,但它描述的只是"写到一半的长度",与笔记时间轴对不上。三条已知路径:
+/// 混音是录制主链路的旁路。已知失败会删除本场新轨,或把续录轨截回本场开始前的对齐
+/// 基线(`pre_session_track_len`,恒为上一场内容的真前缀),但回滚
+/// 本身仍可能因权限、磁盘或线程 panic 失败,盘上因而可能留下一条语法合法、内容却被
+/// 截断的 `mixed.wav`。本函数(以及转码、波形)无法仅凭 WAV 头识别这种残留:
+/// `duration_ms` 按字节如实算出,但它描述的只是"写到一半的长度",与笔记时间轴对不上。
+/// 两条残余路径:
 ///
-/// 1. **续录场景守卫触发**:混音旁路窗超限自杀时,若 `mixed.wav` 是续录追加在上一场
-///    内容之后的轨,`recording_sink.rs` 的 `preexisting` 分支**刻意保留**这条截断轨
-///    ——删掉会把上一场几十分钟完好的内容一并冲掉,取舍之下留脏。这是设计选择,不是 bug。
-/// 2. **非续录场景删除失败**:同一守卫本该 `remove_file` 掉本场从零建的残轨,但权限/
-///    文件被占用等原因可能让删除失败,只留一行 eprintln。
-/// 3. **混音线程 panic**:`AudioTrackWriter::Drop` 照样把合法头补完刷盘,而守卫里的
+/// 1. **回滚失败**:删除新轨或截断续录轨时遇到权限/文件占用等错误,只留一行日志。
+/// 2. **混音线程 panic**:`AudioTrackWriter::Drop` 照样把合法头补完刷盘,而正常的
 ///    删除逻辑根本没机会执行。
 ///
-/// 三条路径**都没有盘上标记**,唯一线索是一行 eprintln——进程重启后连这行都没有。
+/// 两条路径**都没有盘上标记**,唯一线索是一行 eprintln——进程重启后连这行都没有。
 /// 直接把返回的轨拿去回放,现象是"放到一半突然没声 / 时间轴对不上",极难归因。
 ///
 /// 因此:**第二期消费前须自行校验**(例如拿 `TrackMeta.sync` 里两条源轨的 track_ms
@@ -741,7 +786,7 @@ mod tests {
     fn append_finalize_roundtrip_readable_by_hound() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&[0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0]); // 越界值应被 clamp
+        let _ = w.append(&[0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0]); // 越界值应被 clamp
         drop(w); // Drop 兜底收尾
 
         let (spec, samples) = read_wav(&tmp.path().join("mic.wav"));
@@ -766,12 +811,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // 第一场:写 2000 个样本(=125ms)。
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.25f32; 2000]);
+        let _ = w.append(&vec![0.25f32; 2000]);
         drop(w);
 
         // 续录 base_ms=100(<125ms):首次 append 前先截断到 1600 样本再落新音频。
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 100);
-        w.append(&vec![0.5f32; 160]);
+        let _ = w.append(&vec![0.5f32; 160]);
         drop(w);
         let (_, samples) = read_wav(&tmp.path().join("mic.wav"));
         assert_eq!(samples.len(), 1600 + 160, "超长截断到 base_ms 后追加");
@@ -780,12 +825,43 @@ mod tests {
 
         // 再续录 base_ms=200(>110ms):零填充到 3200 样本再追加。
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 200);
-        w.append(&vec![0.75f32; 16]);
+        let _ = w.append(&vec![0.75f32; 16]);
         drop(w);
         let (_, samples) = read_wav(&tmp.path().join("mic.wav"));
         assert_eq!(samples.len(), 3200 + 16, "不足零填充到 base_ms 后追加");
         assert_eq!(samples[1760], 0, "填充部分为静音");
         assert_eq!(samples[3200], (0.75f32 * 32767.0) as i16);
+    }
+
+    /// 回滚基线必须与 open() 的对齐结果一致(截短方向),且在补零方向取现有内容长度
+    /// ——补出来的零不是上一场的内容,不该冒充它留在盘上。两个方向都锁,否则混音旁路
+    /// 放弃时会把本场字节或凭空的静音当成上一场内容留下来。
+    #[test]
+    fn pre_session_len_follows_alignment_and_never_exceeds_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 预存一条 125ms(2000 样本)的轨,offset_ms = 0。
+        let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
+        let _ = w.append(&vec![0.25f32; 2000]);
+        drop(w);
+        let existing = std::fs::metadata(tmp.path().join("mic.wav")).unwrap().len();
+        assert_eq!(existing, HEADER_LEN + 4000);
+
+        // 截短方向(常态:base_ms 落在最后一句话的结束位置,文件尾还有静音)。
+        assert_eq!(
+            pre_session_track_len(tmp.path(), "mic", 100, existing),
+            HEADER_LEN + 3200,
+            "100ms @16k s16 = 3200 字节"
+        );
+        // 补零方向:基线取现有内容,不含 open() 将要补出的静音。
+        assert_eq!(
+            pre_session_track_len(tmp.path(), "mic", 200, existing),
+            existing,
+            "补零段不是上一场内容,基线不得越过现有长度"
+        );
+        // audio.json 缺项时走与 open() 同一条反推公式(offset ≈ base − 现有时长),
+        // 结果等价于"保留全部现有内容"。
+        std::fs::remove_file(tmp.path().join("audio.json")).unwrap();
+        assert_eq!(pre_session_track_len(tmp.path(), "mic", 5000, existing), existing);
     }
 
     #[test]
@@ -797,12 +873,24 @@ mod tests {
         assert!(!tmp.path().join("audio.json").exists());
     }
 
+    /// mixed worker 必须能观察 writer 失败并放弃成品轨,不能让 append 静默吞错。
+    #[test]
+    fn append_reports_track_creation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("mixed.wav")).unwrap();
+        let mut w = AudioTrackWriter::new(tmp.path(), "mixed", 0);
+        assert!(
+            !w.append(&[0.1; 160]),
+            "建档失败必须通过返回值传播给旁路状态机"
+        );
+    }
+
     #[test]
     fn track_created_mid_note_records_offset() {
         let tmp = tempfile::tempdir().unwrap();
         // 模拟旧笔记续录/第二场才授权的 system:base_ms=60000 时轨道才出现。
         let mut w = AudioTrackWriter::new(tmp.path(), "system", 60_000);
-        w.append(&vec![0.1f32; 160]);
+        let _ = w.append(&vec![0.1f32; 160]);
         drop(w);
         let meta = load_audio_meta(tmp.path());
         assert_eq!(meta.tracks["system"].offset_ms, 60_000);
@@ -815,7 +903,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mic.wav");
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 100]); // 不足 1s,头仍是 0
+        let _ = w.append(&vec![0.1f32; 100]); // 不足 1s,头仍是 0
         // 模拟硬崩:绕过 Drop。
         std::mem::forget(w);
 
@@ -833,7 +921,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mic.wav");
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 10]);
+        let _ = w.append(&vec![0.1f32; 10]);
         std::mem::forget(w);
         // 追加半个样本的尾巴。
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
@@ -848,7 +936,7 @@ mod tests {
     fn list_tracks_reports_offset_and_duration_skips_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
+        let _ = w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
         drop(w);
         // 空轨道(只有 44 字节头,如旧版本残留/崩溃残留)不上报。
         std::fs::write(tmp.path().join("system.wav"), wav_header(0)).unwrap();
@@ -864,7 +952,7 @@ mod tests {
     fn resume_clears_stale_waveform_for_recompute() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
+        let _ = w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
         drop(w);
         // 模拟详情页懒回填把波形写进 audio.json。
         set_track_waveform(tmp.path(), "mic", vec![7u8; WAVEFORM_BUCKETS]).unwrap();
@@ -872,7 +960,7 @@ mod tests {
         // 续录:新 writer 从 base_ms=1000 接着写,open() 改写 WAV 前应清掉过期波形,
         // 否则本场再中断时旧短波形会被拉伸到新时长错位显示。
         let mut w2 = AudioTrackWriter::new(tmp.path(), "mic", 1000);
-        w2.append(&vec![0.2f32; AUDIO_SAMPLE_RATE as usize]); // +1s
+        let _ = w2.append(&vec![0.2f32; AUDIO_SAMPLE_RATE as usize]); // +1s
         drop(w2);
         assert!(
             load_audio_meta(tmp.path()).tracks["mic"].waveform.is_none(),
@@ -884,7 +972,7 @@ mod tests {
     fn list_tracks_tolerates_missing_or_corrupt_audio_json() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 160]);
+        let _ = w.append(&vec![0.1f32; 160]);
         drop(w);
         std::fs::write(tmp.path().join("audio.json"), "not json {{").unwrap();
         let tracks = list_tracks(tmp.path());
@@ -897,7 +985,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
         // 1.5s:跨过一次刷盘节点,此刻(不 drop)文件头至少覆盖前 1s。
-        w.append(&vec![0.1f32; (AUDIO_SAMPLE_RATE + AUDIO_SAMPLE_RATE / 2) as usize]);
+        let _ = w.append(&vec![0.1f32; (AUDIO_SAMPLE_RATE + AUDIO_SAMPLE_RATE / 2) as usize]);
         let (_, samples) = read_wav(&tmp.path().join("mic.wav"));
         assert!(samples.len() >= AUDIO_SAMPLE_RATE as usize, "录制中途文件即合法可读");
         drop(w);
@@ -907,7 +995,7 @@ mod tests {
     fn list_tracks_prefers_m4a_with_recorded_duration() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 1600]); // 100ms WAV
+        let _ = w.append(&vec![0.1f32; 1600]); // 100ms WAV
         drop(w);
         // 模拟转码完成:m4a 文件(内容不重要,枚举只看存在性)+ meta 标记
         std::fs::write(tmp.path().join("mic.m4a"), b"fake m4a").unwrap();
@@ -926,7 +1014,7 @@ mod tests {
         std::fs::remove_file(tmp.path().join("mic.m4a")).unwrap();
         clear_track_compressed(tmp.path(), "mic").unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 1600]);
+        let _ = w.append(&vec![0.1f32; 1600]);
         drop(w);
         let tracks = list_tracks(tmp.path());
         assert!(tracks[0].path.ends_with("mic.wav"));
@@ -1072,7 +1160,7 @@ mod tests {
         assert_eq!(session_track_ms(dir.path(), "mic", 0), None, "无 WAV → None");
 
         let mut w = AudioTrackWriter::new(dir.path(), "mic", 0);
-        w.append(&vec![0.1f32; 16_000]); // 1 秒 @16k
+        let _ = w.append(&vec![0.1f32; 16_000]); // 1 秒 @16k
         drop(w); // Drop 收尾回写头
         assert_eq!(session_track_ms(dir.path(), "mic", 0), Some(1_000));
 
@@ -1090,7 +1178,7 @@ mod tests {
     fn session_track_ms_reads_offset_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(dir.path(), "mic", 60_000); // 建档即写 offset_ms=60_000
-        w.append(&vec![0.1f32; 16_000 * 30]); // 30 秒 @16k
+        let _ = w.append(&vec![0.1f32; 16_000 * 30]); // 30 秒 @16k
         drop(w);
         assert_eq!(session_track_ms(dir.path(), "mic", 60_000), Some(30_000));
     }
@@ -1110,7 +1198,7 @@ mod tests {
         set_track_soft_aec(dir.path(), "mic").unwrap();
 
         let mut w = AudioTrackWriter::new(dir.path(), "mic", 0);
-        w.append(&vec![0.1f32; 160]); // 触发首次 open 建档
+        let _ = w.append(&vec![0.1f32; 160]); // 触发首次 open 建档
         drop(w);
 
         let meta = load_audio_meta(dir.path());
@@ -1155,7 +1243,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for source in ["mic", "system", crate::pipeline::recording_sink::MIXED_TRACK] {
             let mut w = AudioTrackWriter::new(tmp.path(), source, 0);
-            w.append(&vec![0.1f32; 160]);
+            let _ = w.append(&vec![0.1f32; 160]);
             drop(w);
         }
 
@@ -1175,14 +1263,14 @@ mod tests {
     fn mixed_track_returns_the_mixed_source_with_consistent_semantics() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
+        let _ = w.append(&vec![0.1f32; AUDIO_SAMPLE_RATE as usize]); // 1s
         drop(w);
         let mut w = AudioTrackWriter::new(
             tmp.path(),
             crate::pipeline::recording_sink::MIXED_TRACK,
             0,
         );
-        w.append(&vec![0.2f32; (AUDIO_SAMPLE_RATE / 2) as usize]); // 0.5s
+        let _ = w.append(&vec![0.2f32; (AUDIO_SAMPLE_RATE / 2) as usize]); // 0.5s
         drop(w);
 
         let mixed = mixed_track(tmp.path()).expect("mixed.wav 存在时应能取到成品轨");
@@ -1202,7 +1290,7 @@ mod tests {
     fn mixed_track_returns_none_when_no_mixed_wav() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = AudioTrackWriter::new(tmp.path(), "mic", 0);
-        w.append(&vec![0.1f32; 160]);
+        let _ = w.append(&vec![0.1f32; 160]);
         drop(w);
         assert!(mixed_track(tmp.path()).is_none());
     }
@@ -1217,7 +1305,7 @@ mod tests {
             crate::pipeline::recording_sink::MIXED_TRACK,
             0,
         );
-        w.append(&vec![0.1f32; 160]);
+        let _ = w.append(&vec![0.1f32; 160]);
         drop(w);
 
         assert!(list_tracks(tmp.path()).is_empty(), "只有成品轨时源轨列表应为空");

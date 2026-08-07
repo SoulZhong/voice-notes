@@ -4,22 +4,23 @@
 //! 之上多挂一条混音通道:两源的 sink 各自把样本**再复制一份**发给混音线程,由
 //! TimelineMixer 按位置合成后写第三条轨 `mixed.wav`。
 //!
-//! 硬约束:混音是旁路。线程死/写盘失败/内存无界增长都只影响 mixed.wav,两条源轨
-//! 与转写热路径不受任何影响(与 keep_audio 的既有哲学一致——音频落盘是增值旁路)。
-//! (不是"通道满"——两源到混音线程用的是 crossbeam unbounded 通道,永远不会满;
-//! 真正的风险是某一源彻底停止喂料时 TimelineMixer 的累加窗无界增长,见下方
-//! MAX_MIXER_WINDOW_SAMPLES 处的处理。)
+//! 硬约束:混音是旁路。线程死、写盘失败、队列拥塞或累加窗超限都只影响 mixed.wav,
+//! 两条源轨与转写热路径不受任何影响。mixed 使用有界 `try_send`:满即整轨放弃并
+//! 回滚,绝不反压 segment worker;另由 MAX_MIXER_WINDOW_SAMPLES 防一源停摆时窗增长。
 //!
 //! 单源会话(record_system_only)无从混音,直接不建混音线程:该笔记只有方案 A 可选。
 //!
-//! 装配契约:喂进 TimelineMixer 的必须是 **post-frame_tap** 流(断流已补零帧,样本数
-//! 即时间轴位置,见 timeline_mix.rs 模块头注)。本文件正是决定"谁的样本进 mixer"的
-//! 装配层——接到 pre-tap 的流会让位置语义直接失效且不报错,排查会非常痛苦。
+//! 装配契约:喂进 TimelineMixer 的必须是 **post-frame_tap** 流。FrameTap 记录首帧
+//! 相对共同单调时钟的偏移,断流则补零;本层用首帧偏移 + 后续样本数组成真实时间轴。
 
 use crate::audio::timeline_mix::{TimelineMixer, DEFAULT_MARGIN_SAMPLES, MIC, SYSTEM};
 use crate::audio::Source;
-use crate::store::audio::AudioTrackWriter;
+use crate::pipeline::frame_tap::SourceHealth;
+use crate::store::audio::{pre_session_track_len, repair_wav_header, AudioTrackWriter};
+use crossbeam_channel::TrySendError;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 混音成品轨文件名(不含扩展名对应的 source 标识)。下游读取端(转码/枚举/播放)
 /// 需要与写入端用同一个名字,故提成常量而非各处散落字面量。
@@ -46,11 +47,102 @@ pub const MIXED_TRACK: &str = "mixed";
 /// 到达前对面源是真饥饿,没有数据可补。且这个放弃不可逆——哪怕第 31 秒该源真的
 /// 恢复喂料,混音线程已经 break 退出,追不回来。
 const MAX_MIXER_WINDOW_SAMPLES: usize = 480_000;
+/// mixed 旁路的有界队列容量,口径是**两源合计的块数**(mic 与 system 共用这一条通道)。
+/// 按常见 10ms 块算:两源都在正常喂料时约 5.1 秒,只有一源在喂时约 10.2 秒。满时立即
+/// 放弃整条 mixed,不阻塞 segment worker,也不影响各源自己的无界保真写盘队列。
+///
+/// 为什么不是更省内存的 256:那是**单源**口径(注释写"约 2.5 秒"),两源共用一条通道后
+/// 实际只剩 1.3~2.6 秒,
+/// 而误放弃的代价是整场实验数据没了且不可逆(源轨在,但录制期混音的时基优势重算不回来)。
+/// 1024 块 16k f32 满载也才约 0.6MB,同一文件里 MAX_MIXER_WINDOW_SAMPLES 已经允许约
+/// 1.9MB 的累加窗。取舍很清楚:宁可多占约 0.6MB,也不因为一次写盘卡顿就误弃整轨。
+const MIXED_QUEUE_CAPACITY: usize = 1024;
+
+struct MixedChunk {
+    src: usize,
+    start: u64,
+    samples: Vec<f32>,
+}
+
+fn try_enqueue_mixed(
+    tx: &crossbeam_channel::Sender<MixedChunk>,
+    abandoned: &AtomicBool,
+    src: usize,
+    start: u64,
+    samples: &[f32],
+) -> bool {
+    if abandoned.load(Ordering::Acquire) {
+        return false;
+    }
+    match tx.try_send(MixedChunk { src, start, samples: samples.to_vec() }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            if !abandoned.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "mixed 写盘队列已满({MIXED_QUEUE_CAPACITY} 块),放弃 mixed.wav,\
+                     源轨与转写继续"
+                );
+            }
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            abandoned.store(true, Ordering::Release);
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MixedRollback {
+    RemoveNew,
+    /// 截回本场开始前的对齐基线(`pre_session_track_len`)。**不是**装配时的文件长度:
+    /// `AudioTrackWriter::open()` 几乎总会把续录轨截短到 `base_ms` 对应的位置(base_ms
+    /// 是续录前最大 end_ms,文件尾那段没进 segment 的静音会被切掉),截掉的字节不可逆,
+    /// 回滚到旧长度只会把本场刚混出的内容填进空位,拼出一条时长不变、下游无从分辨的
+    /// 混合体。基线口径的推导见 `store::audio::pre_session_track_len`。
+    Restore(u64),
+    PreserveUnknown,
+}
+
+/// 放弃 mixed 时回滚。新轨直接删;续录轨截回对齐基线并修正头,于是文件恒为上一场
+/// 内容的**真前缀**——既不丢上一场,也不把本场任何字节伪装成上一场的内容。
+///
+/// 只在本场真的成功 append 过之后才该调用:没 append 过 `open()` 就从未执行,文件还是
+/// 装配前的样子,此时任何 set_len / 重写头都是纯粹的破坏面(路径上若是个非 WAV 文件,
+/// `repair_wav_header` 会直接写坏它的前 44 字节)。
+fn rollback_mixed(path: &Path, rollback: MixedRollback) {
+    match rollback {
+        MixedRollback::Restore(len) => {
+            let result = (|| -> anyhow::Result<()> {
+                let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                file.set_len(len)?;
+                drop(file);
+                repair_wav_header(path)?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("mixed 放弃后回滚续录轨失败({}): {e}", path.display());
+            }
+        }
+        MixedRollback::RemoveNew => {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("mixed 放弃后删除残留失败({}): {e}", path.display());
+                }
+            }
+        }
+        // 装配时无法确认路径是否已有用户数据,宁可留下可诊断残留也不冒险删除。
+        MixedRollback::PreserveUnknown => {}
+    }
+}
 
 /// 装配产物:每源一个 sink 闭包 + 全部写盘线程句柄。形状与 lib.rs 既有构造一致。
 pub struct Wiring {
     pub sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
     pub joins: Vec<std::thread::JoinHandle<()>>,
+    /// 每源 writer 本场至少成功追加过一个非空块。停录对账只消费这些源,避免旧 WAV
+    /// 在启动失败或 keep_audio=false 续录中被误当成本场产物。
+    pub activity: Vec<(Source, Arc<AtomicBool>)>,
 }
 
 /// 录制方案。做成**装配工厂**而非逐块转发的 accept:后者要两源共享一个 sink 对象
@@ -77,12 +169,17 @@ impl RecordingSink for DualTrackSink {
     fn into_wiring(self: Box<Self>) -> Wiring {
         let mut sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)> = Vec::new();
         let mut joins = Vec::new();
+        let mut activity = Vec::new();
         for source in &self.sources {
             let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
             let mut w = AudioTrackWriter::new(&self.note_dir, source.as_str(), self.base_ms);
+            let wrote = Arc::new(AtomicBool::new(false));
+            let wrote_worker = wrote.clone();
             joins.push(std::thread::spawn(move || {
                 for chunk in rx.iter() {
-                    w.append(&chunk);
+                    if !chunk.is_empty() && w.append(&chunk) {
+                        wrote_worker.store(true, Ordering::Release);
+                    }
                 }
                 // sink 被 drop → 通道关闭 → w Drop 补头刷盘收尾。
             }));
@@ -92,8 +189,9 @@ impl RecordingSink for DualTrackSink {
                     let _ = tx.send(s.to_vec());
                 }) as Box<dyn FnMut(&[f32]) + Send>,
             ));
+            activity.push((*source, wrote));
         }
-        Wiring { sinks, joins }
+        Wiring { sinks, joins, activity }
     }
 }
 
@@ -101,11 +199,15 @@ impl RecordingSink for DualTrackSink {
 /// 线程,TimelineMixer 按位置合成后写 `mixed.wav`。
 pub struct MixedSink {
     inner: DualTrackSink,
+    first_offsets: Vec<(Source, Arc<SourceHealth>)>,
 }
 
 impl MixedSink {
-    pub fn new(inner: DualTrackSink) -> Self {
-        Self { inner }
+    pub fn with_first_offsets(
+        inner: DualTrackSink,
+        first_offsets: &[(Source, Arc<SourceHealth>)],
+    ) -> Self {
+        Self { inner, first_offsets: first_offsets.to_vec() }
     }
 }
 
@@ -130,9 +232,27 @@ impl RecordingSink for MixedSink {
         // 内容,不是本场从零建的。为假即本场是从零开始的新轨,守卫放弃时删掉它是
         // 零损失(可离线用两条源轨重算)。必须在 spawn 之前取快照并 move 进闭包——
         // 线程里再判断就会把"本场自己刚建出来的文件"误当成"续录的旧文件"。
-        let preexisting = note_dir.join(format!("{MIXED_TRACK}.wav")).exists();
+        let mixed_path = note_dir.join(format!("{MIXED_TRACK}.wav"));
+        let rollback = match std::fs::metadata(&mixed_path) {
+            // 基线由 store::audio 算(那里握着 open() 的对齐公式与 offset_ms),本层不复刻:
+            // 两处各算一遍正是「回滚恢复的是长度不是内容」那个 bug 的成因。
+            Ok(meta) if meta.is_file() => {
+                MixedRollback::Restore(pre_session_track_len(&note_dir, MIXED_TRACK, base_ms, meta.len()))
+            }
+            Ok(_) => MixedRollback::PreserveUnknown,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MixedRollback::RemoveNew,
+            Err(e) => {
+                eprintln!(
+                    "装配 mixed 时无法读取既有路径元数据,放弃时将保守保留({}): {e}",
+                    mixed_path.display()
+                );
+                MixedRollback::PreserveUnknown
+            }
+        };
 
-        let (tx, rx) = crossbeam_channel::unbounded::<(usize, Vec<f32>)>();
+        let (tx, rx) = crossbeam_channel::bounded::<MixedChunk>(MIXED_QUEUE_CAPACITY);
+        let enqueue_abandoned = Arc::new(AtomicBool::new(false));
+        let worker_abandoned = enqueue_abandoned.clone();
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
             // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
@@ -142,11 +262,29 @@ impl RecordingSink for MixedSink {
             // 旁路自杀开关:一旦累加窗超限就 break,不再等 rx 关闭。break 之后不调
             // finish()——已经放弃这条轨,把窗内剩余也吐出去只会让半成品更长,没有意义。
             let mut abandoned = false;
-            for (src, chunk) in rx.iter() {
-                let out = mixer.accept(src, &chunk);
+            let mut seen = [false; 2];
+            // 本场是否真的往盘上追加过内容。为假即 AudioTrackWriter 全程停在 Pending、
+            // open() 从未执行(它是惰性建档),文件仍是装配前的样子——此时回滚是纯破坏
+            // 面:新轨路径上根本没有文件可删,续录轨则会被白截一刀、头被重写一遍(路径
+            // 上若是个非 WAV 文件更会被直接写坏)。故放弃时以它为闸。
+            let mut appended = false;
+            for chunk in rx.iter() {
+                if worker_abandoned.load(Ordering::Acquire) {
+                    abandoned = true;
+                    break;
+                }
+                seen[chunk.src] = true;
+                let out = mixer.accept_at(chunk.src, chunk.start, &chunk.samples);
                 if !out.is_empty() {
                     if let Some(w) = writer.as_mut() {
-                        w.append(&out);
+                        if w.append(&out) {
+                            appended = true;
+                        } else {
+                            eprintln!("mixed 写盘失败,放弃该成品轨,源轨不受影响");
+                            worker_abandoned.store(true, Ordering::Release);
+                            abandoned = true;
+                            break;
+                        }
                     }
                 }
                 if mixer.win_len() > MAX_MIXER_WINDOW_SAMPLES {
@@ -158,63 +296,37 @@ impl RecordingSink for MixedSink {
                     break;
                 }
             }
-            // break 出循环时 rx 直接被丢弃:两源 sink 的 `let _ = tx.send(...)` 早已把
-            // 发送失败静默吞掉,源轨的写盘线程与本线程之间没有别的耦合,提前退出不会
-            // 让源轨"落地"受影响。
-            if abandoned {
-                // "不调 finish()" 不等于"没有半截内容落盘"——AudioTrackWriter 每攒够
-                // 约 1 秒就会 flush_header 回写尺寸,真实的会议场景常常是两源先正常
-                // 混了很久(mixed.wav 早已建档、写出大段内容、回写过合法头),某源才
-                // 中途掉线触发这条守卫。如果这里什么都不做,盘上会留下一条**完全合法
-                // 但被静默截断**的成品轨:list_tracks 按字节数报出错误的 duration,
-                // 转码流程会把它当正常轨转成 m4a 并删掉 WAV,播放器把它当第三条轨
-                // 叠加播放——用户唯一能看到的线索是一行 eprintln。这比"轨道不存在"
-                // 危险得多,所以必须真正删除已写出的内容,而不只是停止再写。
-                //
-                // 顺序:先 drop 掉 writer 让它的 Drop 补完头、刷盘、关闭文件句柄,
-                // 再删除文件——不能反过来(文件还开着时删除在部分平台行为不可控)。
-                drop(writer.take());
-                // 但只有 !preexisting(本场从零建的轨)才能删:续录场景里这条 WAV
-                // 一开始就装着上一场已经写完、完好无损的内容,AudioTrackWriter::open()
-                // 是在它尾部 set_len 对齐后追加,不是重新建档。此时 remove_file 会把
-                // 上一场那些完好的内容一并冲掉——数据丢失面比"留一条尾部截断的合法
-                // 轨"大得多(后者只是本场这一小段脏,前者连之前几十分钟都没了)。
-                // 退化策略:续录场景就留着这条被截断的轨,eprintln 留痕即可,不比
-                // 修复前更糟(修复前也是"看似合法但截断",只是现在连上一场也保住了)。
-                if preexisting {
-                    eprintln!(
-                        "混音旁路放弃,但 mixed.wav 是续录追加在上一场内容之后的轨,\
-                         为避免连带删掉上一场已完好落盘的内容,保留这条被截断的轨\
-                         (下游可能读到错误的 duration,需要人工核实)"
-                    );
-                } else {
-                    let mixed_path = note_dir.join(format!("{MIXED_TRACK}.wav"));
-                    if let Err(e) = std::fs::remove_file(&mixed_path) {
-                        // 纯单源饥饿(从未定稿过任何样本)时 writer 全程停在 Pending,
-                        // Drop 里 flush_header 对非 Open 状态直接 return,文件本就不存在,
-                        // NotFound 是这种场景下的正常路径,不必当错误声张。其它错误(如
-                        // 权限)才值得留痕排查——但无论如何不能 panic,旁路不许拖累主流程。
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            eprintln!(
-                                "放弃 mixed.wav 后删除残留文件失败,可能留下时长错误的截断轨\
-                                 ({}): {e}",
-                                mixed_path.display()
-                            );
-                        }
-                    }
-                }
-                // 已知未覆盖、不在本次修复范围:如果混音线程本身 panic(而不是走到
-                // 这条 abandoned 分支),writer 的 Drop 同样会补一个合法头,但这里的
-                // 删除逻辑不会执行——那条路径目前没有清理,需要上层(线程 join 处)
-                // 处理 panic 的场景才能补上。
-            } else {
+            if worker_abandoned.load(Ordering::Acquire) {
+                abandoned = true;
+            }
+            if !seen.iter().all(|seen| *seen) {
+                eprintln!("混音旁路收尾时有源从未产帧,放弃 mixed.wav,源轨不受影响");
+                abandoned = true;
+            }
+            if !abandoned {
                 // 两源 sink 都被 drop → 通道关闭 → 定稿窗内剩余,writer Drop 补头刷盘。
                 let tail = mixer.finish();
                 if !tail.is_empty() {
                     if let Some(w) = writer.as_mut() {
-                        w.append(&tail);
+                        if w.append(&tail) {
+                            appended = true;
+                        } else {
+                            eprintln!("mixed 收尾写盘失败,放弃该成品轨,源轨不受影响");
+                            abandoned = true;
+                        }
                     }
                 }
+            }
+            if abandoned && appended {
+                // 必须先关 writer 再回滚:Drop 会收尾头部并释放句柄;随后新轨删除,
+                // 续录轨截回本场开始前的对齐基线,不会留下可被下游误认的截断成品。
+                //
+                // 已知残余(不修,如实记录):open() 成功、首次 append 却写盘失败时
+                // appended 仍为 false,文件停在对齐后的长度上——它不含本场任何内容,
+                // 但若对齐是零填充方向,那段零会留在盘上。丢的只是"顺手把零也清掉",
+                // 而 open() 的截短本就不可逆,再回滚一次也换不回内容。
+                drop(writer.take());
+                rollback_mixed(&mixed_path, rollback);
             }
         }));
 
@@ -223,12 +335,25 @@ impl RecordingSink for MixedSink {
                 Source::Mic => MIC,
                 Source::System => SYSTEM,
             };
+            let first_offset = self
+                .first_offsets
+                .iter()
+                .find(|(candidate, _)| candidate == source)
+                .map(|(_, health)| health.clone());
             let tx = tx.clone();
+            let enqueue_abandoned = enqueue_abandoned.clone();
             let mut inner_sink = std::mem::replace(sink, Box::new(|_: &[f32]| {}));
+            let mut next_pos = None;
             *sink = Box::new(move |s: &[f32]| {
                 inner_sink(s);
-                // 发送失败(混音线程已死)静默忽略:旁路绝不许影响源轨。
-                let _ = tx.send((idx, s.to_vec()));
+                let start = next_pos.unwrap_or_else(|| {
+                    first_offset
+                        .as_ref()
+                        .map(|health| health.first_frame_offset_16k())
+                        .unwrap_or(0)
+                });
+                next_pos = Some(start.saturating_add(s.len() as u64));
+                let _ = try_enqueue_mixed(&tx, &enqueue_abandoned, idx, start, s);
             });
         }
         drop(tx); // 原始 tx 必须丢弃,否则通道永不关闭、混音线程 join 永久阻塞
@@ -238,9 +363,19 @@ impl RecordingSink for MixedSink {
 
 /// 按方案装配。mix=false 即退化为现状。
 pub fn build_sinks(note_dir: &Path, base_ms: u64, sources: &[Source], mix: bool) -> Wiring {
+    build_sinks_with_first_offsets(note_dir, base_ms, sources, &[], mix)
+}
+
+pub fn build_sinks_with_first_offsets(
+    note_dir: &Path,
+    base_ms: u64,
+    sources: &[Source],
+    first_offsets: &[(Source, Arc<SourceHealth>)],
+    mix: bool,
+) -> Wiring {
     let dual = DualTrackSink::new(note_dir, base_ms, sources);
     if mix {
-        Box::new(MixedSink::new(dual)).into_wiring()
+        Box::new(MixedSink::with_first_offsets(dual, first_offsets)).into_wiring()
     } else {
         Box::new(dual).into_wiring()
     }
@@ -330,6 +465,34 @@ mod tests {
         assert!(!dir.path().join("mixed.wav").exists(), "mix=false 不该产出成品轨");
     }
 
+    #[test]
+    fn source_activity_marks_only_after_successful_writer_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = build_sinks(dir.path(), 0, &[Source::Mic], false);
+        let wrote = w.activity[0].1.clone();
+        assert!(!wrote.load(Ordering::Acquire));
+        sink_for(&mut w, Source::Mic)(&[0.2; 160]);
+        drain(w);
+        assert!(
+            wrote.load(Ordering::Acquire),
+            "writer 成功追加后应留下本场活动标记"
+        );
+    }
+
+    #[test]
+    fn source_activity_stays_false_when_writer_creation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("mic.wav")).unwrap();
+        let mut w = build_sinks(dir.path(), 0, &[Source::Mic], false);
+        let wrote = w.activity[0].1.clone();
+        sink_for(&mut w, Source::Mic)(&[0.2; 160]);
+        drain(w);
+        assert!(
+            !wrote.load(Ordering::Acquire),
+            "建档失败不能被误记为本场已写音频"
+        );
+    }
+
     /// mix=true:三条轨都在,且 mixed 字节数与源轨一致(水位线不丢内容,finish 收尾)。
     #[test]
     fn with_mix_produces_mixed_track_of_equal_length() {
@@ -395,6 +558,75 @@ mod tests {
         }
     }
 
+    /// 生产接线回归:FrameTap 记录的首帧墙钟偏移必须真正传进 mixer,而不是只存在
+    /// health 里。system 晚 160 样本开始,前 160 个 mixed 样本只能有 mic。
+    #[test]
+    fn first_frame_health_offsets_are_applied_to_mixed_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mic_health = Arc::new(SourceHealth::default());
+        let system_health = Arc::new(SourceHealth::default());
+        mic_health.set_first_frame_offset_16k_for_test(0);
+        system_health.set_first_frame_offset_16k_for_test(160);
+        let health = [
+            (Source::Mic, mic_health),
+            (Source::System, system_health),
+        ];
+        let mut w = build_sinks_with_first_offsets(
+            dir.path(),
+            0,
+            &[Source::Mic, Source::System],
+            &health,
+            true,
+        );
+        sink_for(&mut w, Source::Mic)(&[0.1; 320]);
+        sink_for(&mut w, Source::System)(&[0.2; 320]);
+        drain(w);
+
+        let mixed = read_pcm_i16(&dir.path().join("mixed.wav"));
+        assert_eq!(mixed.len(), 480, "晚到源的偏移应扩展共同时间轴");
+        let mic_only = f32_to_s16(0.1);
+        let both = f32_to_s16(0.3);
+        let system_only = f32_to_s16(0.2);
+        assert!(
+            mixed[..160]
+                .iter()
+                .all(|&v| (v as i32 - mic_only as i32).abs() <= 2)
+        );
+        assert!(
+            mixed[160..320]
+                .iter()
+                .all(|&v| (v as i32 - both as i32).abs() <= 2)
+        );
+        assert!(
+            mixed[320..]
+                .iter()
+                .all(|&v| (v as i32 - system_only as i32).abs() <= 2)
+        );
+    }
+
+    /// mixed 队列必须有界且生产者永不阻塞。满队列时立即翻转 abandon 标记,后续块
+    /// 不再复制到旁路;源轨自己的发送路径与该标记无关。
+    #[test]
+    fn full_mixed_queue_marks_sidecar_abandoned() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(try_enqueue_mixed(
+            &tx,
+            &abandoned,
+            MIC,
+            0,
+            &[0.1; 16],
+        ));
+        assert!(!try_enqueue_mixed(
+            &tx,
+            &abandoned,
+            MIC,
+            16,
+            &[0.1; 16],
+        ));
+        assert!(abandoned.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     /// 硬约束回归:mixed 建档失败只能拖累 mixed 轨,两条源轨必须完整落盘、内容正确。
     ///
     /// 用预先占位同名**文件**模拟建档失败是无效的:AudioTrackWriter::open 对已存在
@@ -457,6 +689,22 @@ mod tests {
         assert!(!dir.path().join("mixed.wav").exists(), "旁路自杀应彻底放弃该轨");
     }
 
+    /// 回归:一源从未产帧且会话在 30 秒饥饿守卫触发前结束时,收尾不能把唯一来源
+    /// `finish()` 成一条看似完整的 mixed.wav。源轨仍须正常保留。
+    #[test]
+    fn short_one_sided_session_does_not_finalize_mixed_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+        sink_for(&mut w, Source::Mic)(&[0.3; 1600]);
+        drain(w);
+
+        assert!(dir.path().join("mic.wav").exists(), "真实来源的源轨必须保留");
+        assert!(
+            !dir.path().join("mixed.wav").exists(),
+            "两源未都出现时不得把单边缓冲定稿成 mixed.wav"
+        );
+    }
+
     /// Critical 回归:C1 守卫真正危险的场景不是上面这种"纯"单源饥饿(writer 从未
     /// 建档,天然没有残留文件),而是"先正常混了一段、mixed.wav 已经建档写出内容、
     /// 回写过合法头,某源才中途掉线"。AudioTrackWriter 每攒够约 1 秒就 flush_header
@@ -501,7 +749,7 @@ mod tests {
     /// **上一场续录前就已经完好落盘**的。remove_file 不加区分地删,会把续录场景下
     /// 上一场那部分完全正常的内容一并冲掉——数据丢失面比"留一条尾部截断的合法轨"
     /// 大得多。守卫必须只删"本场从零建的轨"(可离线用源轨重算,零损失),续录追加
-    /// 的轨即便本场这段截断了也必须保留。
+    /// 的轨必须回滚到装配前长度,既保留上一场,也不能留下本场截断尾巴。
     ///
     /// 搭建:先跑一场完整会话(base_ms=0)产出一条 1 秒、内容正确的 mixed.wav 并
     /// 正常 finish,模拟"上一场"。base_ms=1000 严丝合缝对应它的时长(offset_ms=0,
@@ -511,6 +759,11 @@ mod tests {
     /// 第二场先正常混一小段(确认 open() 真的走过续录分支、新内容接到旧内容后面,
     /// 而不是像 one_sided_starvation 用例那样全程停在 Pending 从未开过文件),再让
     /// system 彻底停摆触发守卫。
+    ///
+    /// 注意这个"严丝合缝"的参数**不是常态**,它只测"不删续录轨"这条性质。真实录制里
+    /// base_ms 恒小于上一场轨时长、对齐恒截短——那条路径由
+    /// `starvation_in_resumed_session_rolls_back_to_alignment_baseline` 覆盖,别把两条
+    /// 当成重复用例删掉其一。
     #[test]
     fn starvation_during_continuation_preserves_preexisting_mixed_track() {
         let dir = tempfile::tempdir().unwrap();
@@ -555,19 +808,18 @@ mod tests {
         }
         drain(w);
 
-        // 核心断言:preexisting 场景下守卫不能删文件——留一条尾部截断的合法轨,
-        // 也不能把上一场完好的内容一并冲掉。
+        // 核心断言:preexisting 场景下守卫不能删文件,也不能保留本场截断尾巴;
+        // 应精确回滚到装配前的完整轨。
         assert!(
             mixed_path.exists(),
             "续录场景守卫误删了 mixed.wav,上一场已完好落盘的内容随之丢失\
              (本次修复要防的正是这个)"
         );
         let mixed = read_pcm_i16(&mixed_path);
-        assert!(
-            mixed.len() >= old_mixed.len(),
-            "续录追加后的内容不该比上一场还短: got {} want >= {}",
+        assert_eq!(
             mixed.len(),
-            old_mixed.len()
+            old_mixed.len(),
+            "放弃续录 mixed 后应精确回滚到上一场长度"
         );
         // 上一场内容必须原样保留在文件开头(±2 LSB 容差同其它用例)。
         for (i, (&got, &want)) in mixed[..old_mixed.len()].iter().zip(old_mixed.iter()).enumerate() {
@@ -576,6 +828,108 @@ mod tests {
                 "位置 {i}: 上一场内容被改动,got {got} want {want}"
             );
         }
+    }
+
+    /// Bug 修复回归,与上一条同场景但**参数落在常态区间**:上一条特意选了 base_ms 与
+    /// 预存轨时长严丝合缝的点(对齐既不截断也不补零),那是唯一让"回滚到装配时文件
+    /// 长度"也能歪打正着的取值;真实录制里 `base_ms` 来自 `StoreWriter::base_ms()`,
+    /// 是续录前最大 `end_ms`(最后一句话结束的位置),而文件尾还压着用户按停止键前那段
+    /// 没进任何 segment 的静音,所以 `base_ms < 上一场轨时长` 才是**常态**,
+    /// `AudioTrackWriter::open()` 恒走截短分支。
+    ///
+    /// 回滚基线若取装配时的文件长度,`set_len` 会把文件拉回**比对齐后更长**,空出来的
+    /// 那截正好装着本场刚混出来的内容,拼成一条"上一场前段 + 本场开头"的混合体;更坏的是
+    /// 它的 `duration_ms` 与放弃前一模一样,下游任何交叉核对都发现不了。
+    ///
+    /// 构造:预存轨 1000ms,本场 base_ms=600(模拟 400ms 尾部静音没进 segment),
+    /// 于是对齐基线 = 44 + 600ms 对应的 19200 字节。本场混音内容取 0.9+0.9 → 饱和到
+    /// 32767,与预存内容(0.25+0.25 → 约 16383)截然不同,越界一个样本即可检出。
+    #[test]
+    fn starvation_in_resumed_session_rolls_back_to_alignment_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed_path = dir.path().join("mixed.wav");
+
+        // 上一场:正常混 1 秒(16000 样本)并 finish。
+        {
+            let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+            for _ in 0..100 {
+                for (_, s) in w.sinks.iter_mut() {
+                    s(&[0.25; 160]);
+                }
+            }
+            drain(w);
+        }
+        let old_mixed = read_pcm_i16(&mixed_path);
+        assert_eq!(old_mixed.len(), 16000, "前置条件:上一场应是 1 秒");
+        let old_len_bytes = std::fs::metadata(&mixed_path).unwrap().len();
+
+        // 本场续录:base_ms=600 < 上一场的 1000ms,open() 会把文件截到 600ms。
+        const BASE_MS: u64 = 600;
+        let baseline_bytes = 44 + BASE_MS * 16 * 2; // 44 + 19200
+        let mut w = build_sinks(dir.path(), BASE_MS, &[Source::Mic, Source::System], true);
+        for _ in 0..100 {
+            for (_, s) in w.sinks.iter_mut() {
+                s(&[0.9; 160]); // 与上一场取值截然不同:混出来饱和到 32767
+            }
+        }
+        // 门限取**上一场的文件长度**而非对齐基线:对齐已把文件截到 44+19200,只有本场
+        // 真的追加了内容才可能重新超过 44+32000。用基线当门限则一开始就成立,证明不了
+        // 追加发生过。
+        assert!(
+            wait_until_size_at_least(&mixed_path, old_len_bytes, std::time::Duration::from_secs(5)),
+            "前置条件:本场应已把新内容追加到对齐点之后(否则测不到回滚)"
+        );
+        // system 彻底停摆,mic 继续推进直到累加窗超限触发放弃。
+        {
+            let mic = sink_for(&mut w, Source::Mic);
+            for _ in 0..(MAX_MIXER_WINDOW_SAMPLES / 8000 + 5) {
+                mic(&vec![0.3f32; 8000]);
+            }
+        }
+        drain(w);
+
+        assert_eq!(
+            std::fs::metadata(&mixed_path).unwrap().len(),
+            baseline_bytes,
+            "回滚基线必须是对齐后的长度(44+19200),不是装配时的文件长度(44+32000)"
+        );
+        let rolled = read_pcm_i16(&mixed_path);
+        assert_eq!(rolled.len(), 9600, "600ms @16k = 9600 样本");
+        // 内容必须是上一场的**真前缀**:逐样本与预存内容一致,且不含本场任何样本。
+        let this_session = f32_to_s16(1.0); // 0.9+0.9 饱和后的取值
+        for (i, (&got, &want)) in rolled.iter().zip(old_mixed.iter()).enumerate() {
+            assert!(
+                (got as i32 - want as i32).abs() <= 2,
+                "位置 {i}: 回滚后不是上一场内容的真前缀,got {got} want {want}"
+            );
+            assert_ne!(got, this_session, "位置 {i}: 本场混音内容被回滚保留了下来");
+        }
+    }
+
+    /// M2 回归:本场一个样本都没写出去时,放弃路径必须**完全不碰**盘上的文件。
+    ///
+    /// AudioTrackWriter 是惰性建档,没 append 过就没 open() 过,文件仍是装配前的样子;
+    /// 此时照样跑 set_len + repair_wav_header 是纯破坏面——`PreserveUnknown` 只挡了
+    /// 非普通文件,挡不住"普通文件但根本不是 WAV"(用户误放、别的工具留下的同名文件),
+    /// 那前 44 字节会被直接写成 WAV 头。
+    #[test]
+    fn abandoning_without_any_append_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed_path = dir.path().join("mixed.wav");
+        let intact = b"this is not a wav file at all".to_vec();
+        std::fs::write(&mixed_path, &intact).unwrap();
+
+        // 只有 mic 产帧:水位线恒为 0,writer 全程停在 Pending,收尾时因"有源从未产帧"
+        // 判定放弃。
+        let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+        sink_for(&mut w, Source::Mic)(&[0.3; 1600]);
+        drain(w);
+
+        assert_eq!(
+            std::fs::read(&mixed_path).unwrap(),
+            intact,
+            "本场没写过一个字节,放弃时不该 set_len,更不该重写它的头"
+        );
     }
 
     /// 单源会话:无从混音,不产出 mixed.wav(降级为只有方案 A 可选)。
