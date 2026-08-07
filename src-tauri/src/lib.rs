@@ -17,6 +17,7 @@ mod update;
 pub mod diar;
 mod ailog;
 mod refine;
+mod retranscribe;
 mod graph;
 pub mod mcp;
 mod telemetry;
