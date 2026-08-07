@@ -2021,9 +2021,10 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     // Fix 1(codex 第二轮):download_running 兼作迁移/下载互斥位,与 do_start_recording
     // 同款判据同文案。迁移会搬 data_root 并删旧目录,若此刻放行重转写,worker 全程持有
     // 的路径可能被搬走/删掉,提交时 rename 失败甚至"成功"但已写进被丢弃的旧目录。
-    // 反向对称检查见 migrate_guard(它读 state.retranscribing 槽拒绝迁移)——两侧互查,
-    // 与下方录制互斥同一套 Dekker 思路:这里只是快速失败的 UX,真正的互锁靠 worker
-    // 占槽全程持有、migrate_guard 在槽非空时必拒来兜底(worker 存续期内迁移必被拒)。
+    // 反向对称检查见 migrate_guard(它读 state.retranscribing 槽拒绝迁移)。这里只是
+    // 快速失败的 UX:本检查到下方占槽之间隔着多次盘 IO(load/audio meta),迁移完全可能
+    // 在这个毫秒级窗口内 swap download_running 并在槽还空着时穿过 guard——权威判定
+    // (写后读)在占槽成功之后再做一次(见下方 Fix 1B)。
     if state.download_running.load(Ordering::SeqCst) {
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
     }
@@ -2082,6 +2083,14 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     if recording_blocks_retranscribe(&state.running, session_active) {
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
+    }
+    // Fix 1B(迁移侧同款写后读):占槽之后复查 download_running。迁移是
+    // write(download_running)→read(槽),本侧是 write(槽)→read(download_running),
+    // 两侧不可能同时穿关(最坏双拒,无害)。缺这一读时,迁移在上方快速失败检查
+    // 与占槽之间的盘 IO 窗口里穿过 guard 即双跑——正是本检查封死的交错。
+    if state.download_running.load(Ordering::SeqCst) {
+        *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
     }
     spawn_retranscribe(app.clone(), id.to_string(), input == "mixed");
     Ok(())
