@@ -21,14 +21,32 @@ pub struct DedupSeg<'a> {
 }
 
 /// 返回应弃用的段下标(恒为 mic 段)。O(mic × system),会议级段数(千段内)无压力。
+///
+/// 占位段("[识别失败]",`super::ASR_FAILED_PLACEHOLDER`)不参与回声比对,双向,
+/// 语义对齐实时链路 session.rs push_system_sub 的同款判据(约 687-690 行、
+/// 753-757 行注释:「占位段不参与——双路同时识别失败文本雷同,会互相误
+/// 杀」):
+/// 1) mic 侧占位段本身就不可能是"回声"(它是识别失败的痕迹,不是复述内容),
+///    直接跳过,不可能被弃;
+/// 2) system 侧占位段不能作为"这是回声"的证据——构建参考列表时先排除,
+///    避免 mic 侧一段恰好与占位串"相似"的正常文本被误判为回声丢弃。
 pub fn echo_discards(segs: &[DedupSeg]) -> Vec<usize> {
-    let systems: Vec<&DedupSeg> = segs.iter().filter(|s| s.source == "system").collect();
+    let systems: Vec<&DedupSeg> = segs
+        .iter()
+        .filter(|s| s.source == "system" && s.text != super::ASR_FAILED_PLACEHOLDER)
+        .collect();
     if systems.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     for (i, seg) in segs.iter().enumerate() {
         if seg.source != "mic" {
+            continue;
+        }
+        // mic 侧占位段不可能被判定为回声:双路同时识别失败时文本雷同(都是
+        // 占位串)又时间邻近,照常比对会把它误判为回声弃用,静默吞掉一段
+        // 真实发声。
+        if seg.text == super::ASR_FAILED_PLACEHOLDER {
             continue;
         }
         let hit = systems.iter().any(|sys| {
@@ -89,5 +107,32 @@ mod tests {
             seg("mixed", 1000, 3000, "同一句话"),
         ];
         assert!(echo_discards(&segs).is_empty());
+    }
+
+    /// 占位段("[识别失败]")不参与回声比对,双向:
+    /// 1) mic 侧为占位段、system 侧也是占位段(双路同时识别失败,文本雷同
+    ///    但都是"确有发声但识别失败"的痕迹,不是回声)→ 不弃,两段都保留;
+    /// 2) system 侧为占位段、mic 侧是与占位串"相似"的正常文本 → 占位段
+    ///    不能作为回声证据,同样不弃。
+    /// 语义对齐实时链路 session.rs push_system_sub 的同款判据(694-701 行 /
+    /// 753-757 行注释:「占位段不参与——双路同时识别失败文本雷同,会互相
+    /// 误杀」)。
+    #[test]
+    fn placeholder_segments_excluded_from_echo_match() {
+        // 双路同时识别失败:时间重叠 + 文本同为占位符,不得互杀。
+        let both_failed = [
+            seg("system", 1000, 5000, super::super::ASR_FAILED_PLACEHOLDER),
+            seg("mic", 1200, 5200, super::super::ASR_FAILED_PLACEHOLDER),
+        ];
+        assert!(echo_discards(&both_failed).is_empty());
+
+        // system 侧占位、mic 侧是正常文本(非占位符本身)但与占位串"[识别
+        // 失败]"高度相似(此处去掉方括号后即被 contains 捷径判为 1.0)——
+        // 占位段不作参考证据,不弃。
+        let sys_placeholder = [
+            seg("system", 1000, 5000, super::super::ASR_FAILED_PLACEHOLDER),
+            seg("mic", 1200, 5200, "识别失败"),
+        ];
+        assert!(echo_discards(&sys_placeholder).is_empty());
     }
 }
