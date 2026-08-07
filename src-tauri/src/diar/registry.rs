@@ -163,6 +163,9 @@ pub struct SpeakerRegistry {
     enroller: Option<(u64, EnrollFn)>,
     /// 近期贡献环,见 Contribution 注释。容量 CONTRIBUTION_RING_CAP,超出淘汰最旧。
     contributions: VecDeque<Contribution>,
+    /// 三期 mixed 降级口径:关闭种子 z 通道(assign_inner 的 z_hit 整体短路)。
+    /// mixed 单轨无信道可分,AS-Norm 的"跨信道归一化"前提不成立(spec §降级口径)。
+    seed_z_disabled: bool,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -223,12 +226,18 @@ impl SpeakerRegistry {
             pending_merges: Vec::new(),
             enroller: None,
             contributions: VecDeque::new(),
+            seed_z_disabled: false,
         }
     }
 
     /// 装配会话中实时入库回调(lib.rs 在 with_seeds 之后调用)。
     pub fn set_enroller(&mut self, min_ms: u64, f: EnrollFn) {
         self.enroller = Some((min_ms, f));
+    }
+
+    /// 关闭种子 AS-Norm z 通道(mixed 重转写用;默认开启,实时链路不受影响)。
+    pub fn disable_seed_z(&mut self) {
+        self.seed_z_disabled = true;
     }
 
     /// 跑一轮实时入库：把够料(≥ min_ms)的无主簇经回调入库并 mark_enrolled。
@@ -305,7 +314,8 @@ impl SpeakerRegistry {
                         // 走到 z 通道时才算——快路已命中(fast_hit)或压根不够资格
                         // (!seed_eligible)或裸分够不着地板时,z 值本就无关判定结果,
                         // 白算一次不改变行为(z_hit 原本就 AND 着这三个条件)。
-                        let z_hit = seed_eligible
+                        let z_hit = !self.seed_z_disabled
+                            && seed_eligible
                             && !fast_hit
                             && sim >= SEED_ASSIGN_RAW_FLOOR
                             && c.person.as_deref().is_some_and(|p| {
@@ -695,6 +705,7 @@ impl SpeakerRegistry {
             pending_merges: Vec::new(),
             enroller: None,
             contributions: VecDeque::new(),
+            seed_z_disabled: false,
         }
     }
 
@@ -877,6 +888,42 @@ mod tests {
         for c in &r2.clusters {
             assert!(c.seed_cohort.is_none(), "只有 1 个其他人物,未达门槛应为 None");
         }
+    }
+
+    /// mixed 降级口径(三期 spec):disable_seed_z 后,z 通道对种子簇整体关闭——
+    /// 裸分落在 [RAW_FLOOR, SEED_ASSIGN) 灰区的段不再可能经 z 命中种子;
+    /// 0.68 同信道快路不受影响。
+    #[test]
+    fn disable_seed_z_closes_z_channel_but_keeps_fast_path() {
+        // 4 个种子人物凑足 SNORM_MIN_COHORT,cohort 统计可用,z 通道原本开着。
+        // 主种子方向 e0;干扰种子方向远离(e1/e2/e3),对探针余弦≈0 → z 值巨大,
+        // 未关开关时灰区裸分必经 z 命中。
+        let dim = 8;
+        let unit = |i: usize| { let mut v = vec![0.0f32; dim]; v[i] = 1.0; v };
+        let seeds: Vec<SeedCluster> = (0..4).map(|i| SeedCluster {
+            person: format!("P{i}"), name: format!("人{i}"),
+            centroid: unit(i), count: 10, source: "mic".into(),
+        }).collect();
+        // 探针:与 P0 余弦 0.6(灰区:≥0.50 地板、<0.68 快路)
+        let mut probe = vec![0.0f32; dim];
+        probe[0] = 0.6; probe[4] = 0.8; // 0.6²+0.8²=1,单位向量
+        let long = SEED_MIN_SAMPLES; // 过三闸①的段长
+
+        let mut open = SpeakerRegistry::with_seeds(&[], &seeds);
+        let hit_open = open.assign_tracked(&probe, "mic", long, "mic:0");
+        let mut closed = SpeakerRegistry::with_seeds(&[], &seeds);
+        closed.disable_seed_z();
+        let hit_closed = closed.assign_tracked(&probe, "mic", long, "mic:0");
+
+        assert!(hit_open.is_some(), "z 通道开着时灰区高 z 段应命中种子");
+        assert!(hit_closed.is_none(), "disable_seed_z 后灰区段不得再经 z 命中");
+
+        // 快路不受影响:裸分 ≥0.68 照常命中
+        let mut strong = vec![0.0f32; dim];
+        strong[0] = 0.9; strong[4] = (1.0f32 - 0.81).sqrt();
+        let mut closed2 = SpeakerRegistry::with_seeds(&[], &seeds);
+        closed2.disable_seed_z();
+        assert!(closed2.assign_tracked(&strong, "mic", long, "mic:1").is_some());
     }
 
     #[test]
