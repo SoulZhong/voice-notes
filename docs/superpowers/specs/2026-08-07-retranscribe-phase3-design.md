@@ -126,8 +126,9 @@ A/B 的口径。重转写的主用例是修复历史笔记,其旧音频已经污
   `confirmRefine` 样板)。按钮可用性同互斥表。
 - **进度**:照 `RefineProgress` 模式,`Msg::RetranscribeProgress{note_id, stage,
   state}` → lifecycle actor 统一 emit `retranscribe` 事件(`src/lib/events.ts` 注册)。
-  阶段:`decode` → `transcribe:<track>` → `attribute` → `commit`;state 沿用
-  running/ok/error。
+  阶段:`decode` → `transcribe` → `attribute` → `commit`;state 沿用
+  running/ok/error。(实现勘误:原文写 `transcribe:<track>`,实现为单一
+  `transcribe` 阶段——识别循环按时间序混轨处理,无逐轨边界可报;粒度损失可接受。)
 - **MCP 工具**两个,经 UDS 桥打到运行中的 App(照 `reaing` op 的既有模式):
   `retranscribe_note(note_id, input?)`(默认 dual)**异步启动即返回**——重转写一跑
   数分钟,阻塞 UDS/MCP 连接会撞客户端超时;`retranscribe_status()` 轮询当前任务
