@@ -51,7 +51,7 @@ pub(crate) const RESIDUE_OVERLAP_MIN: f32 = 0.8;
 pub(crate) const RESIDUE_RMS_MAX: f32 = 0.012;
 
 /// 归一化：去除空白与常见中英标点、ASCII 转小写，供回声去重的文本比对使用。
-fn normalize_text(s: &str) -> String {
+pub(crate) fn normalize_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_whitespace() {
@@ -101,7 +101,7 @@ const ECHO_CONTAINS_MIN_LEN: usize = 4;
 
 /// 文本相似度 = max(1 − 编辑距离/较长串字符数, 归一化后短串被长串完全包含 ? 1.0 : 0.0)。
 /// 任一侧归一化后为空串 → 0（避免空文本互相「完全包含」误判）。
-fn text_similarity(a: &str, b: &str) -> f32 {
+pub(crate) fn text_similarity(a: &str, b: &str) -> f32 {
     let na = normalize_text(a);
     let nb = normalize_text(b);
     if na.is_empty() || nb.is_empty() {
@@ -137,7 +137,7 @@ fn time_near(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 
 /// `[a_start,a_end)` 与 `[b_start,b_end)` 的重叠时长占 a 段时长的比例(0~1)。
 /// a 段时长为 0 时返回 0(理论不出现零时长段,防御性避免除零)。
-fn overlap_fraction(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> f32 {
+pub(crate) fn overlap_fraction(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> f32 {
     let a_dur = a_end.saturating_sub(a_start);
     if a_dur == 0 {
         return 0.0;
