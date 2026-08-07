@@ -720,6 +720,20 @@ enum NoteTarget {
     Resume(String),
 }
 
+/// 录制↔重转写互斥的 S 侧（spawn_session）权威判定：running 已置 true 之后读重转写槽
+/// （Dekker 写后读）。true=须回滚 running 并拒绝启动录制。纯函数，供生产路径与并发
+/// 回归测试共用——测试直接驱动这两个判定函数，验证的正是生产两侧调用的同一份协议。
+pub(crate) fn retranscribe_blocks_recording(slot: &Mutex<Option<(String, String)>>) -> bool {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// 录制↔重转写互斥的 R 侧（do_retranscribe）权威判定：重转写槽已占之后读录音旗
+/// （Dekker 写后读）。true=须清槽并拒绝启动重转写。session_active 由调用方传入
+/// （session 槽覆盖 stop 早期窗口：running 已假但会话槽还没清空的那一小段时间）。
+pub(crate) fn recording_blocks_retranscribe(running: &Mutex<bool>, session_active: bool) -> bool {
+    *running.lock().unwrap_or_else(|e| e.into_inner()) || session_active
+}
+
 /// start_recording / resume_recording 共用的会话启动实现：running/generation
 /// 守卫（拒绝重复录制、递增 generation）+ 加载线程 spawn。二者的运行守卫与
 /// 竞态处理完全一致（同一份代码），仅 target 决定 writer 走 create 还是 resume。
@@ -731,6 +745,7 @@ fn spawn_session(
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
     transcode: Arc<store::transcode::TranscodeQueue>,
+    retranscribing: Arc<Mutex<Option<(String, String)>>>,
     target: NoteTarget,
 ) -> Result<(), String> {
     let my_gen = {
@@ -745,6 +760,30 @@ fn spawn_session(
         *g += 1;
         *g
     };
+
+    // Fix 1B(Dekker 写后读，S 侧权威判定):running 置 true 之后再读重转写槽。
+    // do_start_recording/do_resume_note_recording 里的早期槽检查只是快速失败的
+    // UX——若那次检查穿过加载窗口（槽在检查后、running 置位前才被占），这里补上
+    // 权威判定。与 R 侧 do_retranscribe 的占槽后复查（recording_blocks_retranscribe）
+    // 互为镜像：两侧各自"先写自己、再读对方"，顺序矛盾使得二者不可能同时判定通过。
+    // 短锁读槽，不与 running/session 嵌套，避免和 R 侧的锁序相反而成环。
+    if retranscribe_blocks_recording(&retranscribing) {
+        // 回滚照 fail() 的纪律:锁 running → 嵌套锁 generation → 仅当 *g==my_gen
+        // 才置回 false。置 true 到这里之间不可能有新的 start 穿进来(running=true
+        // 挡着)，但 stop 可能已经把 running 置 false 并递增了 generation——过期
+        // 就不回滚，以免覆盖更新的状态。
+        let mut r = running.lock().unwrap();
+        let g = generation.lock().unwrap();
+        if *g == my_gen {
+            *r = false;
+        }
+        drop(g);
+        drop(r);
+        return Err(tr!(
+            "重转写进行中,完成后再录制",
+            "A re-transcription is in progress; please record after it finishes"
+        ));
+    }
 
     std::thread::spawn(move || {
         // fail()：加载过程中任何一步失败都会调用。必须先确认 my_gen 仍是当前代
@@ -1564,8 +1603,10 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
     if state.download_running.load(Ordering::SeqCst) {
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later").into());
     }
-    // 全局互斥于重转写(不限本篇,双向对称——do_retranscribe 侧对称判断 session 是否
-    // 存在来拒绝重转写):重转写与实时 ASR 各起一套 ORT 管线,叠跑抢核。
+    // 全局互斥于重转写(不限本篇,双向对称——do_retranscribe 侧对称判断 running/session
+    // 是否存在来拒绝重转写)。这里只是快速失败的 UX——权威判定(Dekker 写后读)在
+    // spawn_session 内、running 置 true 之后再读一次同一把槽,堵掉本次检查与 running
+    // 置位之间的加载窗口。
     if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
             "重转写进行中,完成后再录制",
@@ -1584,6 +1625,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
         state.transcode.clone(),
+        state.retranscribing.clone(),
         NoteTarget::New,
     );
     if result.is_ok() {
@@ -1628,10 +1670,11 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
     }
     // 全局互斥于重转写(不限本篇——升级自"仅同笔记"的旧检查):重转写与实时 ASR 各起
     // 一套 ORT 管线,叠跑抢核,这条互斥与 do_start_recording 一样是双向对称的
-    // (do_retranscribe 侧对称判断 session 是否存在来拒绝重转写)。同笔记场景下还叠加
-    // 一层理由:重转写持 NoteLock 全程,续录也要写 mic.wav,放行会在 NoteWriter::resume
-    // 拿锁失败才报错——此处提前拒绝把错误提到「点续录就说清」;即便这里漏检,NoteLock
-    // 兜底仍在(resume 会因锁失败拒绝)。
+    // (do_retranscribe 侧对称判断 running/session 是否存在来拒绝重转写)。同笔记场景下
+    // 还叠加一层理由:重转写持 NoteLock 全程,续录也要写 mic.wav,放行会在
+    // NoteWriter::resume 拿锁失败才报错——此处提前拒绝把错误提到「点续录就说清」;
+    // 即便这里漏检,NoteLock 兜底仍在(resume 会因锁失败拒绝)。这里只是快速失败的
+    // UX——权威判定(Dekker 写后读)在 spawn_session 内、running 置 true 之后。
     if state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Err(tr!(
             "重转写进行中,完成后再录制",
@@ -1650,6 +1693,7 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
         state.recognizer_cache.clone(),
         state.embedder_cache.clone(),
         state.transcode.clone(),
+        state.retranscribing.clone(),
         NoteTarget::Resume(note_id),
     );
     if result.is_ok() {
@@ -1961,9 +2005,11 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
 
 /// 重转写守卫与启动(tauri command 与 UDS op 共用;spec §提交与安全网)。
 /// 守卫顺序(不可颠倒):录制中拒 → Aing 中拒 → 完成态校验 → 转码中拒 → mixed 输入校验 →
-/// 槽占用拒。前三条是"这场重转写值不值得跑"的资格判定,转码中拒是"盘上这个源此刻
-/// 会不会被转码 worker 改写"的资源校验,mixed 校验是"这个输入源可不可信",
-/// 槽占用最后判是因为它改变了共享状态(占槽)——只有前面全过才允许触碰它。
+/// 槽占用拒 → 占槽后录制中复拒。前三条是"这场重转写值不值得跑"的资格判定,转码中拒
+/// 是"盘上这个源此刻会不会被转码 worker 改写"的资源校验,mixed 校验是"这个输入源
+/// 可不可信",槽占用判是因为它改变了共享状态(占槽)——只有前面全过才允许触碰它。
+/// 最后一步(占槽后复拒)是 Fix 1A 补的 Dekker 写后读权威判定:开头那次"录制中拒"只是
+/// 快速失败的 UX,真正堵死与 spawn_session 竞态的是这一步。
 pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<(), String> {
     store::validate_note_id(id).map_err(|e| e.to_string())?;
     if input != "dual" && input != "mixed" {
@@ -1971,8 +2017,11 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     }
     let state: tauri::State<AppState> = app.state();
     // 全局互斥于录制(不限本篇):重转写与实时 ASR 各起一套 ORT 管线,叠跑抢核;
-    // 且省去"另一篇在录、本篇重转写"的时序矩阵——修复动作等一等没有代价。
-    if state.session.lock().unwrap().is_some() {
+    // 且省去"另一篇在录、本篇重转写"的时序矩阵——修复动作等一等没有代价。running 是
+    // 录制侧最早置位的旗子,session 覆盖 stop 早期窗口(running 已假但会话槽还没清空
+    // 的那一小段时间)——两者任一为真都算"录制中"。这里只是快速失败的 UX;权威判定
+    // (Dekker 写后读)在下方占槽成功之后再做一次同款检查。
+    if recording_blocks_retranscribe(&state.running, state.session.lock().unwrap().is_some()) {
         return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
     }
     if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
@@ -2005,6 +2054,16 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
             ));
         }
         *slot = Some((id.to_string(), "decode".into()));
+    }
+    // Fix 1A(Dekker 写后读，R 侧权威判定):槽已占之后再读一次 running/session
+    // ——不与槽锁嵌套持有(上面的槽锁已在此前的花括号作用域结束时释放),避免和
+    // S 侧(spawn_session)的锁序相反而成环。若此刻仍判定"录制中",说明 do_start_recording
+    // /do_resume_note_recording 的早期检查穿过了本次占槽与它们置位 running 之间的窗口
+    // ——必须清槽退让。与 S 侧互为镜像:两侧各自"先写自己、再读对方"，顺序矛盾使得
+    // 二者不可能同时判定通过（同时穿关）。
+    if recording_blocks_retranscribe(&state.running, state.session.lock().unwrap().is_some()) {
+        *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
     }
     spawn_retranscribe(app.clone(), id.to_string(), input == "mixed");
     Ok(())
@@ -2081,8 +2140,6 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 &mut embedder, seeds, mixed, &mut progress)
                 .map_err(|e| e.to_string())
         }));
-        // poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续清槽好过永久卡死。
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         match body {
             Ok(Ok(summary)) => {
                 eprintln!("重转写完成({note_id}): {summary:?}");
@@ -2097,6 +2154,13 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 emit("all", "error", Some(tr!("内部错误(见日志)", "Internal error (see logs)")), None);
             }
         }
+        // Fix 3:清槽移到终态 emit 之后（而非 match 之前）。轮询契约是"看到
+        // running=false（即槽空）时,last 必须已经是本次任务的终态"——三个 match 分支
+        // 各自只做锁写 last + emit,没有 panic 面（catch_unwind 已经兜过内部 body 的
+        // panic，这里三条分支本身不会再 panic），所以槽必达清空,不会因为提前 return
+        // 或异常路径漏清。poison 只可能因锁内 panic 产生,槽是纯数据,中毒后继续清槽
+        // 好过永久卡死。
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     });
 }
 
@@ -6192,6 +6256,100 @@ mod tests {
         });
         assert!(h.join().is_err());
         assert!(!flag.load(Ordering::SeqCst), "panic 展开也必须复位标志");
+    }
+
+    /// Fix 1C:录制↔重转写互斥的并发回归测试。直接驱动生产两侧调用的同两个判定函数
+    /// （retranscribe_blocks_recording / recording_blocks_retranscribe），用真实的两条
+    /// 操作系统线程重演 Dekker 写后读协议 1000 轮，断言两侧不可能在同一轮都判定"通过"。
+    ///
+    /// 每轮由主线程用 rendezvous channel 给两条racer线程发"go"，racer各自跑一遍生产
+    /// 侧的完整协议（S 侧:置 running=true → 读槽 → 命中则回滚；R 侧:占槽 → 读
+    /// running/session → 命中则清槽），把"最终是否通过"回传主线程；主线程收完双方结果
+    /// 后断言不同时为真，再复位 running/slot 供下一轮使用。channel 往返本身不消除
+    /// 并发——两条线程在收到 go 之后到把结果送回之前是真正并行执行的，判定函数内部
+    /// 的锁竞争窗口原样保留，这正是要验证的东西。
+    #[test]
+    fn recording_retranscribe_mutex_never_double_passes() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        let running: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let slot: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        const ROUNDS: usize = 1000;
+
+        // S 侧 racer:模拟 spawn_session 的 running 置位 + Dekker 权威判定。
+        let (tx_go_s, rx_go_s) = mpsc::channel::<()>();
+        let (tx_res_s, rx_res_s) = mpsc::channel::<bool>();
+        let running_s = running.clone();
+        let slot_s = slot.clone();
+        let h_s = std::thread::spawn(move || {
+            while rx_go_s.recv().is_ok() {
+                let mut passed = {
+                    let mut r = running_s.lock().unwrap();
+                    if *r {
+                        false
+                    } else {
+                        *r = true;
+                        true
+                    }
+                };
+                if passed && super::retranscribe_blocks_recording(&slot_s) {
+                    // 回滚:与生产 spawn_session 同款纪律（测试里没有 generation 过期
+                    // 的问题，直接复位）。
+                    *running_s.lock().unwrap() = false;
+                    passed = false;
+                }
+                let _ = tx_res_s.send(passed);
+            }
+        });
+
+        // R 侧 racer:模拟 do_retranscribe 的占槽 + Dekker 权威判定。
+        let (tx_go_r, rx_go_r) = mpsc::channel::<()>();
+        let (tx_res_r, rx_res_r) = mpsc::channel::<bool>();
+        let running_r = running.clone();
+        let slot_r = slot.clone();
+        let h_r = std::thread::spawn(move || {
+            while rx_go_r.recv().is_ok() {
+                let mut occupied = {
+                    let mut s = slot_r.lock().unwrap();
+                    if s.is_some() {
+                        false
+                    } else {
+                        *s = Some(("n1".into(), "decode".into()));
+                        true
+                    }
+                };
+                if occupied && super::recording_blocks_retranscribe(&running_r, false) {
+                    *slot_r.lock().unwrap() = None;
+                    occupied = false;
+                }
+                let _ = tx_res_r.send(occupied);
+            }
+        });
+
+        let mut both_passed_count = 0usize;
+        for round in 0..ROUNDS {
+            tx_go_s.send(()).unwrap();
+            tx_go_r.send(()).unwrap();
+            let passed_s = rx_res_s.recv().unwrap();
+            let passed_r = rx_res_r.recv().unwrap();
+            if passed_s && passed_r {
+                both_passed_count += 1;
+            }
+            assert!(
+                !(passed_s && passed_r),
+                "round {round}: 录制与重转写同一轮都判定通过——互斥协议破了"
+            );
+            // 轮末复位，供下一轮使用。
+            *running.lock().unwrap() = false;
+            *slot.lock().unwrap() = None;
+        }
+        assert_eq!(both_passed_count, 0);
+
+        drop(tx_go_s);
+        drop(tx_go_r);
+        h_s.join().unwrap();
+        h_r.join().unwrap();
     }
 }
 
