@@ -171,7 +171,7 @@ const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
 /// 占比兜底对模型标为 zh 的段同样生效(未提前用标签放行),系有意为之:混杂幻觉
 /// (如假名混中文)模型常仍标 zh,标签本身不可靠;误杀面(中文夹整句日语引用)
 /// 待 rms/误杀数据复盘时与阈值一并校准。
-fn is_foreign_final(lang: &str, text: &str) -> bool {
+pub(crate) fn is_foreign_final(lang: &str, text: &str) -> bool {
     let tag: String = lang
         .trim_matches(|c: char| c == '<' || c == '|' || c == '>')
         .to_ascii_lowercase();
@@ -318,11 +318,11 @@ fn ms_to_sample_idx(ms: u64) -> usize {
 }
 
 /// 一个母段切出的子段:等价一个独立 final。
-struct SubFinal {
-    text: String,
-    samples: Vec<f32>,
-    start_ms: u64,
-    end_ms: u64,
+pub(crate) struct SubFinal {
+    pub(crate) text: String,
+    pub(crate) samples: Vec<f32>,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
 }
 
 /// 母段 → 子段列表(len ≥ 1)。任何"装不下/跑不动/切不出/切了也没内容"的情形都
@@ -330,7 +330,7 @@ struct SubFinal {
 ///
 /// 失败/跳过路径：无 embedder；段时长 < SPLIT_MIN_SEGMENT_MS；变更点检测无点；
 /// 全部子段文本 trim 后为空。
-fn split_final(
+pub(crate) fn split_final(
     job_samples: Vec<f32>,
     job_start_ms: u64,
     job_end_ms: u64,
