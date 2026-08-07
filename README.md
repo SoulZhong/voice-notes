@@ -128,7 +128,7 @@ Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`n
 
 | 接入面 | 是什么 | 用在哪 |
 | --- | --- | --- |
-| **MCP 服务** | Agent 的标准工具协议,13 个工具(检索 / 读全文 / 精修与语义图谱写回 / 录制状态与控制) | 首选,给支持 MCP 的 Agent |
+| **MCP 服务** | Agent 的标准工具协议,15 个工具(检索 / 读全文 / 精修与语义图谱写回 / 录制状态与控制 / 重转写) | 首选,给支持 MCP 的 Agent |
 | **命令行 CLI** | 同一套查询能力的命令行版,可 `--json` | 脚本、CI,或 Agent 没配 MCP 时的降级 |
 | **Claude Code 技能** | 教 Claude Code 何时怎么组合上面的工具(纪要 / 周报 / 检索工作流) | 锦上添花,让 Claude 开箱会用 |
 
@@ -166,7 +166,7 @@ Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`n
    args = ["mcp", "serve"]
    ```
 
-提供的 13 个工具:
+提供的 15 个工具:
 
 | 工具 | 用途 | 前提 |
 | --- | --- | --- |
@@ -180,8 +180,10 @@ Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`n
 | `recording_status` | 当前录制状态 | App 运行中 |
 | `get_live_transcript` | 正在录制会话的实时转写 | App 运行中 |
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
+| `retranscribe_note` | 对已完成笔记发起文件重转写(离线重跑 ASR,覆盖原始逐字稿,自动备份;异步启动) | App 运行中,**且**已开启「允许 AI 控制录制」 |
+| `retranscribe_status` | 当前重转写任务(note_id 与阶段;空闲 running=false) | App 运行中 |
 
-笔记与图谱类七工具直接访问本机数据文件,App 没开也能用;录制状态、实时转写与四项录制控制经 App 内本地 socket,需 App 运行。
+笔记与图谱类七工具直接访问本机数据文件,App 没开也能用;录制状态、实时转写、四项录制控制与重转写经 App 内本地 socket,需 App 运行。
 
 ### 命令行直查(无需 MCP)
 
