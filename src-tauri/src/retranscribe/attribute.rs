@@ -4,6 +4,8 @@
 
 use crate::diar::registry::{ClusterSnapshot, SeedCluster, SpeakerInfo, SpeakerRegistry};
 use crate::diar::SpeakerEmbedder;
+use crate::store::{SegmentRecord, SpeakerMeta};
+use std::collections::BTreeMap;
 
 pub struct RecSeg {
     pub source: String,
@@ -78,6 +80,113 @@ pub fn assign_clusters(
     (clusters, registry.speakers(), registry.snapshot())
 }
 
+/// 继承兜底的时间重叠下限(相对判定口径同 overlap_fraction)。
+pub const INHERIT_OVERLAP_MIN: f32 = 0.3;
+
+#[derive(Debug, Default)]
+pub struct FinalizeStats {
+    pub seed_matched: usize,
+    pub inherited: usize,
+}
+
+/// 归属定稿:种子命中保簇,未命中按时间重叠继承旧人工归属,并重建 speakers 表。
+/// 规则见本文件头与三期 spec §说话人归属;撞号/同人合流的取舍在测试里逐条锁死。
+pub fn finalize_speakers(
+    segs: &[RecSeg],
+    clusters: &[Option<String>],
+    infos: &[SpeakerInfo],
+    snaps: &[ClusterSnapshot],
+    old_segs: &[SegmentRecord],
+    old_speakers: &BTreeMap<String, SpeakerMeta>,
+) -> (Vec<Option<String>>, BTreeMap<String, SpeakerMeta>, FinalizeStats) {
+    let info_by_id: BTreeMap<&str, &SpeakerInfo> = infos.iter().map(|i| (i.id.as_str(), i)).collect();
+    let snap_by_id: BTreeMap<&str, &ClusterSnapshot> = snaps.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut stats = FinalizeStats::default();
+
+    // 第一遍:每段定成三种之一——Cluster(簇 id)/ Inherit(旧 speaker id)/ None。
+    enum Pick { Cluster(String), Inherit(String), Nothing }
+    let picks: Vec<Pick> = segs.iter().zip(clusters).map(|(seg, cluster)| {
+        if let Some(id) = cluster {
+            if info_by_id.get(id.as_str()).is_some_and(|i| i.person.is_some()) {
+                stats.seed_matched += 1;
+                return Pick::Cluster(id.clone());
+            }
+        }
+        // 继承候选:同 source 优先(mixed 与任意 source 比),取重叠占比最大者。
+        // overlap_fraction 分母取第一实参(seg)自身时长——continue 语义是「新段
+        // 被旧段盖住的比例」,故新段参数必须放第一位,不能反过来按旧段时长算。
+        let candidate = |same_source: bool| {
+            old_segs.iter()
+                .filter(|o| o.speaker.is_some())
+                .filter(|o| !same_source || o.source == seg.source || seg.source == "mixed")
+                .map(|o| (crate::session::overlap_fraction(seg.start_ms, seg.end_ms, o.start_ms, o.end_ms), o))
+                .filter(|(f, _)| *f >= INHERIT_OVERLAP_MIN)
+                .max_by(|(a, _), (b, _)| a.total_cmp(b))
+                .map(|(_, o)| o)
+        };
+        let hit = candidate(true).or_else(|| candidate(false));
+        if let Some(old) = hit {
+            let sid = old.speaker.as_ref().unwrap();
+            if old_speakers.get(sid).is_some_and(|m| !m.name.is_empty() || m.person_id.is_some()) {
+                stats.inherited += 1;
+                return Pick::Inherit(sid.clone());
+            }
+        }
+        match cluster {
+            Some(id) => Pick::Cluster(id.clone()),
+            None => Pick::Nothing,
+        }
+    }).collect();
+
+    // 第二遍:定 id 映射并建表。簇 id 原样;继承 id 先尝试按 person 并入已用簇,
+    // 否则重编号避让(跨新簇与已分配号取 max)。
+    let used_clusters: std::collections::BTreeSet<&str> = picks.iter()
+        .filter_map(|p| match p { Pick::Cluster(id) => Some(id.as_str()), _ => None })
+        .collect();
+    let mut table: BTreeMap<String, SpeakerMeta> = BTreeMap::new();
+    for id in &used_clusters {
+        let info = info_by_id.get(id);
+        let snap = snap_by_id.get(id);
+        table.insert(id.to_string(), SpeakerMeta {
+            name: info.and_then(|i| i.name.clone()).unwrap_or_default(),
+            sources: info.map(|i| i.sources.iter().cloned().collect()).unwrap_or_default(),
+            centroid: snap.map(|s| s.centroid.clone()),
+            count: snap.map(|s| s.count).unwrap_or(0),
+            person_id: info.and_then(|i| i.person.clone()),
+        });
+    }
+    let numeric = |s: &str| s.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let mut next = table.keys().map(|k| numeric(k)).max().unwrap_or(0) + 1;
+    let mut inherit_map: BTreeMap<String, String> = BTreeMap::new();
+    for p in &picks {
+        let Pick::Inherit(old_id) = p else { continue };
+        if inherit_map.contains_key(old_id) {
+            continue;
+        }
+        let old_meta = &old_speakers[old_id];
+        // 同人合流:旧归属关联的库人物已被某个簇命中 → 直接用那个簇 id。
+        let unified = old_meta.person_id.as_ref().and_then(|pid| {
+            table.iter().find(|(_, m)| m.person_id.as_deref() == Some(pid)).map(|(k, _)| k.clone())
+        });
+        let new_id = match unified {
+            Some(id) => id,
+            None => {
+                let id = format!("S{next}");
+                next += 1;
+                table.insert(id.clone(), old_meta.clone());
+                id
+            }
+        };
+        inherit_map.insert(old_id.clone(), new_id);
+    }
+    let speakers = picks.iter().map(|p| match p {
+        Pick::Cluster(id) => Some(id.clone()),
+        Pick::Inherit(old_id) => Some(inherit_map[old_id].clone()),
+        Pick::Nothing => None,
+    }).collect();
+    (speakers, table, stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +251,111 @@ mod tests {
         let (clusters, infos, _snaps) = assign_clusters(&segs, &mut emb, seeds, true);
         let id = clusters[0].clone().expect("source 改写后 mixed 段应走同信道快路命中");
         assert_eq!(infos.iter().find(|i| i.id == id).unwrap().person.as_deref(), Some("P1"));
+    }
+
+    use crate::store::{SegmentRecord, SpeakerMeta};
+    use std::collections::BTreeMap;
+
+    fn old_seg(seq: u64, source: &str, start: u64, end: u64, speaker: Option<&str>) -> SegmentRecord {
+        SegmentRecord {
+            seq, source: source.into(), text: "旧".into(), start_ms: start, end_ms: end,
+            speaker: speaker.map(String::from), rms: None,
+        }
+    }
+
+    fn named_meta(name: &str, person: Option<&str>) -> SpeakerMeta {
+        SpeakerMeta {
+            name: name.into(), sources: vec!["mic".into()], centroid: Some(vec![1.0]),
+            count: 5, person_id: person.map(String::from),
+        }
+    }
+
+    fn info(id: &str, person: Option<&str>, name: Option<&str>) -> SpeakerInfo {
+        SpeakerInfo {
+            id: id.into(), sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: person.map(String::from), name: name.map(String::from),
+        }
+    }
+
+    fn snap(id: &str) -> ClusterSnapshot {
+        ClusterSnapshot {
+            id: id.into(), centroid: vec![1.0], count: 3,
+            sources: std::collections::BTreeSet::from(["mic".to_string()]),
+            person: None, total_ms: 5000,
+        }
+    }
+
+    /// 撞号:新簇 S1(无主)与旧 S1(张三)是不同人——继承段的旧 S1 必须重编号,
+    /// 不得吞并新簇 S1,speakers 表两行并存且 meta 各归各。
+    #[test]
+    fn inherited_old_id_renumbered_on_collision() {
+        let segs = vec![rec("mic", 0, 2000), rec("mic", 10_000, 2000)];
+        // 段0 归新簇 S1(无 person);段1 无簇
+        let clusters = vec![Some("S1".to_string()), None];
+        let infos = vec![info("S1", None, None)];
+        let snaps = vec![snap("S1")];
+        let old_segs = vec![old_seg(1, "mic", 10_000, 12_000, Some("S1"))];
+        let old_speakers = BTreeMap::from([("S1".to_string(), named_meta("张三", None))]);
+        let (speakers, table, stats) =
+            finalize_speakers(&segs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
+        assert_eq!(speakers[0].as_deref(), Some("S1"), "新簇段保留簇 id");
+        let inherited = speakers[1].clone().expect("重叠继承应命中");
+        assert_ne!(inherited, "S1", "旧 S1 与新簇 S1 撞号必须重编号");
+        assert_eq!(table[&inherited].name, "张三");
+        assert_eq!(table["S1"].name, "");
+        assert_eq!((stats.seed_matched, stats.inherited), (0, 1));
+    }
+
+    /// 同人合流:旧说话人关联的 person 与种子命中簇相同 → 复用簇 id,不开第二行。
+    #[test]
+    fn inherited_speaker_unified_with_seed_cluster_by_person() {
+        let segs = vec![rec("mic", 0, 3000), rec("mic", 10_000, 1000)];
+        // 段0 种子命中簇 S1(person P7);段1 无簇(短段)
+        let clusters = vec![Some("S1".to_string()), None];
+        let infos = vec![info("S1", Some("P7"), Some("张三"))];
+        let snaps = vec![snap("S1")];
+        let old_segs = vec![old_seg(1, "mic", 10_000, 11_000, Some("S9"))];
+        let old_speakers = BTreeMap::from([("S9".to_string(), named_meta("张三", Some("P7")))]);
+        let (speakers, table, stats) =
+            finalize_speakers(&segs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
+        assert_eq!(speakers[1].as_deref(), Some("S1"), "同 person 并入种子簇");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table["S1"].person_id.as_deref(), Some("P7"));
+        assert_eq!((stats.seed_matched, stats.inherited), (1, 1));
+    }
+
+    /// 无人工价值的旧归属(name 空且无 person)不继承——继承是保人工劳动,不是保编号。
+    #[test]
+    fn valueless_old_speaker_not_inherited() {
+        let segs = vec![rec("mic", 0, 2000)];
+        let clusters = vec![None];
+        let old_segs = vec![old_seg(1, "mic", 0, 2000, Some("S3"))];
+        let old_speakers = BTreeMap::from([("S3".to_string(), named_meta("", None))]);
+        let (speakers, table, stats) =
+            finalize_speakers(&segs, &clusters, &[], &[], &old_segs, &old_speakers);
+        assert_eq!(speakers[0], None);
+        assert!(table.is_empty());
+        assert_eq!(stats.inherited, 0);
+    }
+
+    /// 重叠不足 30% 不继承;同 source 候选优先于跨 source。
+    #[test]
+    fn overlap_threshold_and_same_source_priority() {
+        let segs = vec![rec("mic", 0, 4000)];
+        let clusters = vec![None];
+        let old_segs = vec![
+            old_seg(1, "mic", 3800, 8000, Some("S1")),    // 与新段仅重叠 200ms/4000ms=5%
+            old_seg(2, "system", 0, 4000, Some("S2")),    // 100% 重叠但跨 source
+            old_seg(3, "mic", 500, 4000, Some("S3")),     // 同 source 87.5% 重叠
+        ];
+        let old_speakers = BTreeMap::from([
+            ("S1".to_string(), named_meta("甲", None)),
+            ("S2".to_string(), named_meta("乙", None)),
+            ("S3".to_string(), named_meta("丙", None)),
+        ]);
+        let (speakers, table, _) =
+            finalize_speakers(&segs, &clusters, &[], &[], &old_segs, &old_speakers);
+        let id = speakers[0].clone().expect("87.5% 重叠应继承");
+        assert_eq!(table[&id].name, "丙", "同 source 最大重叠者胜出");
     }
 }
