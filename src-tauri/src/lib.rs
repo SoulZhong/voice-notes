@@ -2021,7 +2021,12 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     // 录制侧最早置位的旗子,session 覆盖 stop 早期窗口(running 已假但会话槽还没清空
     // 的那一小段时间)——两者任一为真都算"录制中"。这里只是快速失败的 UX;权威判定
     // (Dekker 写后读)在下方占槽成功之后再做一次同款检查。
-    if recording_blocks_retranscribe(&state.running, state.session.lock().unwrap().is_some()) {
+    // session 读必须是独立语句:若写进 recording_blocks_retranscribe 的实参里,
+    // MutexGuard 临时值会存活到整个调用表达式结束——函数内部锁 running 时 session
+    // 锁仍被持有,形成 session→running 锁序,与 spawn_session 加载线程的
+    // running→session_slot(全库锁序纪律,见 do_stop_teardown 注释)成 ABBA 环。
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active) {
         return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
     }
     if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
@@ -2061,7 +2066,9 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     // /do_resume_note_recording 的早期检查穿过了本次占槽与它们置位 running 之间的窗口
     // ——必须清槽退让。与 S 侧互为镜像:两侧各自"先写自己、再读对方"，顺序矛盾使得
     // 二者不可能同时判定通过（同时穿关）。
-    if recording_blocks_retranscribe(&state.running, state.session.lock().unwrap().is_some()) {
+    // session 读同样独立成句(锁序理由同上方快速失败检查处的注释)。
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active) {
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
     }
