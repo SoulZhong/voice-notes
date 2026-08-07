@@ -130,6 +130,11 @@ struct AppState {
     relation_backfill_run_id: Arc<Mutex<Option<String>>>,
     // refining 集合已删(P3):Aing 态入 lifecycle 内核(machine::RefineState),
     // 防重入/续录拦截由内核裁决,Aing 中查询走 LifecycleHandle::is_refining。
+    /// 重转写在跑任务:(note_id, 当前阶段)。单槽 = 全局同时只跑一个(每任务一整套
+    /// ORT 管线,与 AING_GATE 同理但直接拒绝不排队——重转写是显式修复动作,静默
+    /// 排队会让用户以为卡死)。守卫链:录制中拒/Aing 中拒/槽占用拒,再由 NoteLock
+    /// 兜跨进程底。
+    retranscribing: Arc<Mutex<Option<(String, String)>>>,
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -149,6 +154,7 @@ impl Default for AppState {
             relation_backfill_running: Arc::new(AtomicBool::new(false)),
             relation_backfill_cancel: Arc::new(AtomicBool::new(false)),
             relation_backfill_run_id: Arc::new(Mutex::new(None)),
+            retranscribing: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1608,6 +1614,17 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
             "This note is being refined by AI; try again later"
         ));
     }
+    // 重转写中该笔记拒绝续录:重转写持 NoteLock 全程,续录也要写 mic.wav——放行会在
+    // NoteWriter::resume 拿锁失败才报错。此处从 AppState 读槽提前拒绝,把错误提前到
+    // 「点续录就说清」;即便这里漏检,NoteLock 兜底仍在(resume 会因锁失败拒绝)。
+    if let Some((rid, _)) = state.retranscribing.lock().unwrap().clone() {
+        if rid == note_id {
+            return Err(tr!(
+                "该笔记正在重转写中,完成后可继续录制",
+                "This note is being re-transcribed; you can resume recording once it finishes"
+            ));
+        }
+    }
     // 模式感知就绪判定(与设置页/托盘同一份):本地看所选模型齐不齐,云端看 vad + 凭证。
     if !current_models_status(app).recording_ready {
         return Err(recording_not_ready_msg(app));
@@ -1899,6 +1916,13 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 /// enqueue_transcode 恒 false，不再重复入队。
 #[tauri::command]
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
+    // 重转写中该笔记拒绝 Aing:重转写持 NoteLock,refine 的 run_local 提交时也会
+    // 因锁失败——这里提前拒绝只是把错误从「跑完才失败」提到「点下去就说清」。
+    if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap().clone() {
+        if rid == id {
+            return Err(tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+        }
+    }
     app.state::<lifecycle::LifecycleHandle>()
         .request(lifecycle::machine::Msg::RefineRequest { note_id: id })
 }
@@ -1920,6 +1944,149 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
         }
         doc
     }))
+}
+
+/// 重转写守卫与启动(tauri command 与 UDS op 共用;spec §提交与安全网)。
+/// 守卫顺序(不可颠倒):录制中拒 → Aing 中拒 → 完成态校验 → mixed 输入校验 → 槽占用拒。
+/// 前三条是"这场重转写值不值得跑"的资格判定,mixed 校验是"这个输入源可不可信",
+/// 槽占用最后判是因为它改变了共享状态(占槽)——只有前面全过才允许触碰它。
+pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<(), String> {
+    store::validate_note_id(id).map_err(|e| e.to_string())?;
+    if input != "dual" && input != "mixed" {
+        return Err(tr!("未知重转写来源: {input}", "Unknown retranscribe input: {input}", input = input));
+    }
+    let state: tauri::State<AppState> = app.state();
+    // 全局互斥于录制(不限本篇):重转写与实时 ASR 各起一套 ORT 管线,叠跑抢核;
+    // 且省去"另一篇在录、本篇重转写"的时序矩阵——修复动作等一等没有代价。
+    if state.session.lock().unwrap().is_some() {
+        return Err(tr!("录制中不能重转写,请先停止录制", "Cannot re-transcribe while recording"));
+    }
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
+        return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
+    }
+    let dir = notes_dir(app).map_err(|e| e.to_string())?.join(id);
+    let note = store::NoteStore::new(notes_dir(app).map_err(|e| e.to_string())?)
+        .load(id).map_err(|e| e.to_string())?;
+    if note.meta.state != "complete" {
+        return Err(tr!("笔记未完成,不能重转写", "Only completed notes can be re-transcribed"));
+    }
+    if input == "mixed" {
+        let meta = store::audio::load_audio_meta(&dir);
+        if let Some(reason) = retranscribe::input::mixed_untrusted(&meta) {
+            return Err(reason);
+        }
+    }
+    {
+        let mut slot = state.retranscribing.lock().unwrap();
+        if let Some((running, _)) = slot.as_ref() {
+            return Err(tr!(
+                "已有重转写任务在进行({running}),请等它完成",
+                "A re-transcription task is already running ({running})", running = running
+            ));
+        }
+        *slot = Some((id.to_string(), "decode".into()));
+    }
+    spawn_retranscribe(app.clone(), id.to_string(), input == "mixed");
+    Ok(())
+}
+
+/// 重转写后台线程:catch_unwind 兜 panic,独立识别器/嵌入器实例(不碰常驻缓存槽——
+/// 那两槽是录制会话的常驻资源,重转写是离线一次性任务,混用会让二者互相饿死对方)。
+/// 事件不经 lifecycle actor 直发(见 ipc::RetranscribeEvent 注释):重转写与录制会话
+/// 全局互斥,不存在与管线事件的排序耦合,直发省一层转发不丢语义。
+fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
+    let slot = app.state::<AppState>().retranscribing.clone();
+    std::thread::spawn(move || {
+        let emit = |stage: &str, state: &str, message: Option<String>, summary: Option<retranscribe::Summary>| {
+            let _ = app.emit("retranscribe", ipc::RetranscribeEvent {
+                note_id: note_id.clone(), stage: stage.into(), state: state.into(), message, summary,
+            });
+        };
+        emit("all", "running", None, None);
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<retranscribe::Summary, String> {
+            let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+            // NoteLock 在 worker 内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
+            let lock = store::notelock::NoteLock::acquire(&dir)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| tr!("笔记正被占用(录制或转码中),稍后再试", "The note is busy; try again later"))?;
+            // 独立识别器实例:不碰常驻 recognizer_cache 槽(那是录制会话的);
+            // 恒用本地识别器,云端协议是录制期流式,不适配离线整轨(spec 已知限制 5)。
+            let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app))
+                .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?;
+            let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
+                match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
+                    Ok(e) => Some(Box::new(e)),
+                    Err(e) => {
+                        eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
+                        None
+                    }
+                };
+            let seeds = load_voiceprint_seeds(&app);
+            let vad_path = models::root().join("silero_vad.onnx");
+            let factory: retranscribe::input::SegmenterFactory =
+                Box::new(move || new_silero(&vad_path));
+            let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
+                Box::new(retranscribe::input::MixedInput::new(dir.clone(), factory))
+            } else {
+                Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
+            };
+            let slot2 = slot.clone();
+            let note_id2 = note_id.clone();
+            let app2 = app.clone();
+            let mut progress = move |stage: &str| {
+                if let Some(s) = slot2.lock().unwrap().as_mut() {
+                    s.1 = stage.to_string();
+                }
+                let _ = app2.emit("retranscribe", ipc::RetranscribeEvent {
+                    note_id: note_id2.clone(), stage: stage.into(), state: "running".into(),
+                    message: None, summary: None,
+                });
+            };
+            retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
+                &mut embedder, seeds, mixed, &mut progress)
+                .map_err(|e| e.to_string())
+        }));
+        *slot.lock().unwrap() = None;
+        match body {
+            Ok(Ok(summary)) => {
+                eprintln!("重转写完成({note_id}): {summary:?}");
+                emit("all", "ok", None, Some(summary));
+            }
+            Ok(Err(e)) => {
+                eprintln!("重转写失败({note_id}): {e}");
+                emit("all", "error", Some(e), None);
+            }
+            Err(_) => {
+                eprintln!("重转写 panic({note_id})");
+                emit("all", "error", Some(tr!("内部错误(见日志)", "Internal error (see logs)")), None);
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn retranscribe_note(app: AppHandle, id: String, input: String) -> Result<(), String> {
+    do_retranscribe(&app, &id, &input)
+}
+
+#[derive(serde::Serialize)]
+struct RetranscribeStatus {
+    note_id: String,
+    stage: String,
+}
+
+#[tauri::command]
+fn retranscribe_status(state: State<AppState>) -> Option<RetranscribeStatus> {
+    state.retranscribing.lock().unwrap().as_ref()
+        .map(|(note_id, stage)| RetranscribeStatus { note_id: note_id.clone(), stage: stage.clone() })
+}
+
+/// 成品轨入口可用性:None = 可用;Some(原因) = 置灰并提示。
+#[tauri::command]
+fn mixed_input_status(app: AppHandle, id: String) -> Result<Option<String>, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    Ok(retranscribe::input::mixed_untrusted(&store::audio::load_audio_meta(&dir)))
 }
 
 fn relation_backfill_settings(app: &AppHandle) -> Result<settings::Settings, String> {
@@ -4939,6 +5106,9 @@ pub fn run() {
             get_note,
             refine_note,
             get_refined,
+            retranscribe_note,
+            retranscribe_status,
+            mixed_input_status,
             save_refined,
             preview_relation_backfill,
             start_relation_backfill,
@@ -5945,6 +6115,22 @@ mod tests {
     // resume_blocked_by_refining_matches_refining_set 已随 Aing 集入内核而删除:
     // 同一语义(按 id 查集合/不误伤其它笔记)由 lifecycle::machine 的
     // concurrent_refines_tracked_independently_by_id 与 RefineRequest 裁决表接管。
+
+    /// 重转写摘要事件可序列化,None 字段不出现(前端契约)。
+    #[test]
+    fn retranscribe_event_serialization_shape() {
+        let e = crate::ipc::RetranscribeEvent {
+            note_id: "n1".into(), stage: "all".into(), state: "ok".into(),
+            message: None,
+            summary: Some(crate::retranscribe::Summary {
+                old_segments: 10, new_segments: 8, seed_matched: 5,
+                inherited: 2, echo_dropped: 1, failed_segments: 0,
+            }),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"new_segments\":8"));
+        assert!(!json.contains("message"));
+    }
 
     #[test]
     fn download_running_resets_even_on_panic() {
