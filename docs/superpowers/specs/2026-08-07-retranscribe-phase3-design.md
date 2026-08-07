@@ -88,7 +88,11 @@ panic 后 `Drop` 补合法头,两条残轨路径都没有盘上标记)。消费�
 
 1. 每段 `embed` + `assign_tracked`。种子经 `load_voiceprint_seeds`(含嵌入模型标签
    一致性门禁)。双轨模式三闸完整(0.68 同信道 + AS-Norm z 通道 + 裸阈下限);
-   Mixed 模式按母 spec §降级口径:z 通道关、`Source::Mixed` 不分信道。
+   Mixed 模式按母 spec §降级口径:z 通道关(registry 新增显式开关)、不分信道——
+   注入的种子把 source 改写为 "mixed",让 0.68 同信道快路对全部种子生效。
+   段落 source 以字符串 `"mixed"` 落盘,**不动实时 `Source` 枚举**(勘察结论:分段/
+   声纹/存储全链路均以 `&str` 传 source,母 spec 的枚举变体没有必要,加了反而要陪改
+   实时链路的穷举 match)。
 2. 声纹未命中到已建档人物的段(拿到的是场内 S 编号),按与**旧 segments** 的时间轴
    重叠继承旧 speaker 标注:同 source 优先,取重叠占比最大者;Mixed 模式与任意
    source 的旧段比。人工改名/关联过人物的归属由此保住。
@@ -124,9 +128,12 @@ A/B 的口径。重转写的主用例是修复历史笔记,其旧音频已经污
   state}` → lifecycle actor 统一 emit `retranscribe` 事件(`src/lib/events.ts` 注册)。
   阶段:`decode` → `transcribe:<track>` → `attribute` → `commit`;state 沿用
   running/ok/error。
-- **MCP 工具** `retranscribe_note(note_id, input?)`(默认 dual):同步跑完返回摘要
-  {旧段数、新段数、声纹命中数、继承数、弃用数}。40 场批量修复由外部按篇串行驱动,
-  不做内建批量队列。
+- **MCP 工具**两个,经 UDS 桥打到运行中的 App(照 `reaing` op 的既有模式):
+  `retranscribe_note(note_id, input?)`(默认 dual)**异步启动即返回**——重转写一跑
+  数分钟,阻塞 UDS/MCP 连接会撞客户端超时;`retranscribe_status()` 轮询当前任务
+  (note_id + 阶段,空闲返回 null)。摘要{旧段数、新段数、声纹命中数、继承数、
+  弃用数}随完成事件发出并落日志。40 场批量修复由外部「启动 → 轮询 → 下一篇」
+  串行驱动,不做内建批量队列。全局同时只跑一个任务,重复启动直接拒绝。
 
 ## 测试
 
@@ -147,3 +154,6 @@ A/B 的口径。重转写的主用例是修复历史笔记,其旧音频已经污
 3. 历史笔记若 m4a 转码时有损(AAC),重转写基于有损音频,与当年基于 WAV 的实时
    转写不完全可比。
 4. `[识别失败]` 占位段 ≤50% 时照常提交,残留占位段与实时链路同待遇(可编辑/删除)。
+5. 重转写恒用**本地**识别器(`new_recognizer` 独立实例):云端 ASR 是录制期流式
+   websocket 协议,不适配离线整轨重跑。云端模式用户重转写前需本地模型在盘,
+   缺模型时报错提示下载。
