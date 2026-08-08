@@ -82,11 +82,12 @@
   let retransConfirm = $state(false);
   let retransErr = $state("");
   let mixedReason = $state<string | null>(null); // null = 成品轨可用
-  // Fix 4:回填 effect 的 retranscribeStatus() 在途时，若终态事件（onRetranscribe 的
+  // Fix 4:回填查询 retranscribeStatus() 在途时，若终态事件（onRetranscribe 的
   // ok/error）先到，迟到的回填快照会把已结束的任务重新标成"重转写中"且无人再纠正
   // （事件只在状态变化时触发一次，不会再来一条把它拨回去）。这个旗标记录"本次 id
   // 下是否已经见过至少一条 onRetranscribe 事件"——见过就说明事件通道已经接管了
-  // retranscribing 的真相，回填快照必须让路。
+  // retranscribing 的真相，回填快照必须让路。回填查询的发起时机见 Fix 3（codex 第
+  // 三轮，已挪进订阅 effect，必须等 listen() resolve 之后再发）。
   let retransEventSeen = $state(false);
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
@@ -588,23 +589,13 @@
     };
   });
 
-  // 文件重转写(三期):挂载/切笔记时回填在途任务(事件只覆盖在页期间,若切走再切回
-  // 需要靠这个补一次状态)+ 成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
+  // 文件重转写(三期):成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
+  // 回填在途任务的查询(retranscribeStatus)已挪进下方订阅 effect——见 Fix 3
+  // (codex 第三轮)注释:必须等 listen() 的 promise resolve 之后再发起,不能像
+  // 这里一样与订阅 effect 各自独立跑,否则两个 effect 谁先谁后不确定,查询可能
+  // 在监听器挂到位之前就已发出/返回。
   $effect(() => {
     const forId = id;
-    retranscribeStatus()
-      .then((s) => {
-        if (forId !== id) return;
-        // Fix 4:此刻已经收到过 onRetranscribe 事件，说明事件通道已经接管了
-        // retranscribing 的真相（可能已经是终态 ok/error）——这条迟到的快照不再
-        // 可信，让路，避免把已结束的任务重新标成"重转写中"。
-        if (retransEventSeen) return;
-        if (s && s.note_id === forId) {
-          retranscribing = true;
-          retransStage = s.stage;
-        }
-      })
-      .catch(() => {});
     mixedInputStatus(forId)
       .then((r) => {
         if (forId === id) mixedReason = r;
@@ -616,6 +607,17 @@
 
   // 重转写进度事件：按 id 注册/解绑（同款 onRefine 套路）。running 置 retranscribing=true；
   // 非 running（ok/error）都是任务终态，复位并按结果刷新（ok 才重拉，error 提示不改数据）。
+  //
+  // Fix 3(codex 第三轮):回填查询(退回 retranscribeStatus 判在途任务，事件只覆盖
+  // 在页期间，若切走再切回需要靠这个补一次状态)从独立 effect 挪到这里，且必须在
+  // `onRetranscribe(...).then((u) => ...)` 里 listen() 的 promise 真正 resolve
+  // 之后才发起——旧版两个 effect 互相独立，挂载/切页瞬间任务恰好结束时可能撞上：
+  // 快照查到 running=true，而终态事件在 listen() 异步注册完成前就已发出，
+  // 监听器还没挂上，事件被漏收，没人再清 retranscribing，永久卡住（retransEventSeen
+  // 旗当时只盖住了 startRetranscribe 的 invoke 路径，管不到这条独立回填）。
+  // 现在把查询挪到 listen() resolve 之后：此后任何终态事件都必被 handler 收到并
+  // 置 retransEventSeen=true，下面 `if (retransEventSeen) return` 守卫自动让路，
+  // 不会再被这条迟到快照覆盖成"重转写中"后无人纠正。
   $effect(() => {
     const forId = id;
     let unlisten: (() => void) | null = null;
@@ -637,8 +639,25 @@
         retransErr = t("notes.retrans.failed", { e: e.message });
       }
     }).then((u) => {
-      if (disposed) u();
-      else unlisten = u;
+      if (disposed) {
+        u();
+        return;
+      }
+      unlisten = u;
+      // 监听器已挂载完成，此后任何终态事件都保证被上面的 handler 收到——现在才
+      // 发起回填查询，杜绝"快照说 running，终态事件却在监听器就位前漏发"的窗口。
+      retranscribeStatus()
+        .then((s) => {
+          if (disposed || forId !== id) return;
+          // 此刻已经收到过 onRetranscribe 事件（可能已经是终态 ok/error）——事件
+          // 通道已经接管了 retranscribing 的真相，这条迟到的快照不再可信，让路。
+          if (retransEventSeen) return;
+          if (s && s.note_id === forId) {
+            retranscribing = true;
+            retransStage = s.stage;
+          }
+        })
+        .catch(() => {});
     });
     return () => {
       disposed = true;
