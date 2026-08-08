@@ -719,6 +719,75 @@ impl VoiceprintStore {
         }
         Ok(new_links)
     }
+
+    /// 纠错回灌(spec P1-2):把人工指认段的重嵌入统计并入指定人物。与
+    /// upsert_from_session 的区别:输入是历史段重嵌入(非会话净增量)、悬空
+    /// 人物显式报错(回灌"成功"却没入库是最糟的静默)、返回前后快照供纠错
+    /// 还原。质心/会话质心/时长/last_seen 的并入口径与会话路径一致;合并建议
+    /// 回执按「此人有纠错回灌」失效——质心动了,旧建议的相似度不再可信,与
+    /// "又录了新会议"同理。
+    pub fn reinforce_feedback(
+        &self,
+        person_id: &str,
+        stats: &[(String, Vec<f32>, u64, u64)], // (source, centroid, count, total_ms)
+        now: &str,
+    ) -> anyhow::Result<FeedbackApplied> {
+        let _guard = vp_guard();
+        let mut vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, person_id).map(str::to_string) else {
+            anyhow::bail!("未知人物: {person_id}");
+        };
+        let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
+        let person_before = serde_json::to_string(person)?;
+        for (source, centroid, count, total_ms) in stats {
+            if centroid.is_empty() {
+                continue;
+            }
+            merge_centroid(
+                person,
+                source,
+                PersonCentroid { vec: centroid.clone(), count: (*count).max(1), seen: String::new() },
+            );
+            person.total_ms += total_ms;
+            push_session_centroid(person, source, centroid, (*count).max(1), *total_ms, now);
+        }
+        person.last_seen = now.to_string();
+        let person_after = serde_json::to_string(person)?;
+        self.save(&vp)?;
+        self.journal_invalidate(&[resolved.as_str()], "此人有纠错回灌");
+        Ok(FeedbackApplied { person_before, person_after })
+    }
+
+    /// 纠错还原:当前状态仍逐字节等于 expected_after 时恢复 before,返回 true;
+    /// 已被其它写(新会议/合并/再回灌)动过则不动返回 false——宁可留污染,
+    /// 也不覆盖新信息。
+    pub fn restore_feedback(
+        &self,
+        person_id: &str,
+        before: &str,
+        expected_after: &str,
+    ) -> anyhow::Result<bool> {
+        let _guard = vp_guard();
+        let mut vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, person_id).map(str::to_string) else {
+            return Ok(false); // 人都没了,无从还原也无需还原
+        };
+        let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
+        if serde_json::to_string(person)? != expected_after {
+            return Ok(false);
+        }
+        *person = serde_json::from_str(before)?;
+        self.save(&vp)?;
+        self.journal_invalidate(&[resolved.as_str()], "纠错回灌已撤销");
+        Ok(true)
+    }
+}
+
+/// reinforce_feedback 的前后快照:磁盘壳把它写进笔记级账本,纠错时
+/// 「比对 after 未被动过才还原 before」。
+pub struct FeedbackApplied {
+    pub person_before: String,
+    pub person_after: String,
 }
 
 /// 会话质心入环:本场净增量够料(≥SESSION_CENTROID_MIN_MS)才记为一个"状态代表";
@@ -2454,5 +2523,62 @@ mod tests {
         let deny = journal.auto_denylist();
         assert!(deny.iter().any(|p| p == "P1>P2"), "原始 pair 进名单: {deny:?}");
         assert!(deny.iter().any(|p| p == "P1>P3"), "解析后的当前化身 pair 也要进名单: {deny:?}");
+    }
+    #[test]
+    fn reinforce_feedback_merges_and_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .unwrap();
+        let pid = links.get("S1").unwrap().clone();
+
+        let applied = store
+            .reinforce_feedback(
+                &pid,
+                &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)],
+                "2026-08-08T01:00:00+08:00",
+            )
+            .unwrap();
+        let vp = store.load();
+        let p = vp.people.get(&pid).unwrap();
+        assert_eq!(p.total_ms, AUTO_ENROLL_MS + 4_000);
+        assert_eq!(p.last_seen, "2026-08-08T01:00:00+08:00");
+        assert!(p.centroids["mic"].vec[1] > 0.0, "新方向必须并入质心");
+        assert_ne!(applied.person_before, applied.person_after);
+    }
+
+    #[test]
+    fn reinforce_feedback_rejects_unknown_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let err = store.reinforce_feedback("P999", &[("mic".into(), vec![1.0], 1, 2_000)], "t");
+        assert!(err.is_err(), "悬空人物必须显式报错,不得静默成功");
+    }
+
+    #[test]
+    fn restore_feedback_only_when_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let links = store
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .unwrap();
+        let pid = links.get("S1").unwrap().clone();
+        let applied = store
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t1")
+            .unwrap();
+
+        // 场景一:未被动过 → 还原成功,total_ms 回到初值。
+        assert!(store.restore_feedback(&pid, &applied.person_before, &applied.person_after).unwrap());
+        assert_eq!(store.load().people.get(&pid).unwrap().total_ms, AUTO_ENROLL_MS);
+
+        // 场景二:重放回灌后又被别的写动过 → 拒绝还原。
+        let applied2 = store
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t2")
+            .unwrap();
+        store
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 0.0, 1.0, 0.0], 1, 2_000)], "t3")
+            .unwrap();
+        assert!(!store.restore_feedback(&pid, &applied2.person_before, &applied2.person_after).unwrap());
     }
 }

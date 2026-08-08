@@ -9,7 +9,7 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
+const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n每段前的 speaker= 标注是该段说话人(人名或簇号),仅供理解上下文:用于人名/称呼错字判断与实体归一(如称呼「小王」后由 speaker=王某 的段应答,可确认「王」字写法)。禁止据此改写句式、把代词替换成人名、或把 speaker 标注/说话人名写进 texts;texts 只输出修订后的正文。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
 
 const RELATION_ONLY_SYSTEM_PROMPT: &str = "你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {\"relations\":[...]}；没有可靠关系时输出 {\"relations\":[]}。";
 
@@ -246,10 +246,40 @@ enum ChunkErr {
     Content(anyhow::Error),
 }
 
-fn format_chunk_paragraphs(paragraphs: &[(usize, &str)]) -> String {
+/// 一段进块的最小信息:绝对下标 + 已 sanitize 的说话人标签 + 正文引用。
+pub(crate) struct ChunkPara<'a> {
+    pub index: usize,
+    pub label: String,
+    pub text: &'a str,
+}
+
+/// 说话人标签:人名优先(已命名/已关联),否则 R 号。名字是用户可编辑字符串,
+/// 换行会拆行、冒号会截断「标签: 正文」格式,统一替换为空格;这不是安全边界
+/// (笔记正文本就是用户数据),只是保住行格式不被破坏。
+pub(crate) fn speaker_label(p: &RefinedParagraph) -> String {
+    let cleaned = p
+        .name
+        .as_deref()
+        .unwrap_or("")
+        .replace(['\n', '\r', ':', ':'], " ")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        p.speaker.clone()
+    } else {
+        cleaned
+    }
+}
+
+fn format_chunk_paragraphs(paragraphs: &[ChunkPara]) -> String {
     paragraphs
         .iter()
-        .map(|(absolute_index, text)| format!("paragraph_index={absolute_index}: {text}\n"))
+        .map(|p| {
+            format!(
+                "paragraph_index={} speaker={}: {}\n",
+                p.index, p.label, p.text
+            )
+        })
         .collect()
 }
 
@@ -264,7 +294,7 @@ impl std::fmt::Display for ChunkErr {
 fn call_chunk(
     cfg: &LlmConfig,
     glossary: &Value,
-    paragraphs: &[(usize, &str)],
+    paragraphs: &[ChunkPara],
     log: Option<&crate::ailog::Ctx>,
 ) -> Result<(Value, Vec<String>, Vec<RawEntity>, Vec<RawRelation>, bool), ChunkErr> {
     let numbered = format_chunk_paragraphs(paragraphs);
@@ -500,9 +530,13 @@ pub fn polish(
     let mut all_relations: Vec<RawRelation> = Vec::new();
     let mut relation_failed = false;
     for chunk in &chunks {
-        let inputs: Vec<(usize, &str)> = chunk
+        let inputs: Vec<ChunkPara> = chunk
             .iter()
-            .map(|&i| (i, paragraphs[i].text.as_str()))
+            .map(|&i| ChunkPara {
+                index: i,
+                label: speaker_label(&paragraphs[i]),
+                text: paragraphs[i].text.as_str(),
+            })
             .collect();
         match call_chunk(cfg, &glossary, &inputs, log) {
             Ok((g, outs, ents, relations, relations_valid)) => {
@@ -571,8 +605,32 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// 读到请求头结束(\r\n\r\n)且(若有 Content-Length)body 也读完为止;丢弃内容。
-    fn read_request(s: &mut std::net::TcpStream) {
+    /// mock_server 的捕获版:read_request 本就读完了整个请求,这里把 body 存进
+    /// 共享 Vec 供测试断言请求内容(如说话人标签确实进了 prompt)。
+    fn mock_server_capturing(
+        responses: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut s, _) = listener.accept().unwrap();
+                cap.lock().unwrap().push(read_request(&mut s));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    /// 读到请求头结束(\r\n\r\n)且(若有 Content-Length)body 也读完为止;返回 body 文本。
+    fn read_request(s: &mut std::net::TcpStream) -> String {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -601,6 +659,10 @@ mod tests {
                 }
                 Err(_) => break,
             }
+        }
+        match find_header_end(&buf) {
+            Some(header_end) => String::from_utf8_lossy(&buf[header_end + 4..]).into_owned(),
+            None => String::new(),
         }
     }
 
@@ -631,9 +693,13 @@ mod tests {
     }
 
     fn para(text: &str) -> crate::store::RefinedParagraph {
+        para_with("R1", None, text)
+    }
+
+    fn para_with(speaker: &str, name: Option<&str>, text: &str) -> crate::store::RefinedParagraph {
         crate::store::RefinedParagraph {
-            speaker: "R1".into(),
-            name: None,
+            speaker: speaker.into(),
+            name: name.map(Into::into),
             person_id: None,
             start_ms: 0,
             end_ms: 1000,
@@ -946,12 +1012,55 @@ mod tests {
         }
     }
 
+    fn cp<'a>(index: usize, label: &str, text: &'a str) -> ChunkPara<'a> {
+        ChunkPara {
+            index,
+            label: label.into(),
+            text,
+        }
+    }
+
     #[test]
     fn chunk_prompt_keeps_absolute_paragraph_indexes() {
         assert_eq!(
-            format_chunk_paragraphs(&[(7, "第八段"), (12, "第十三段")]),
-            "paragraph_index=7: 第八段\nparagraph_index=12: 第十三段\n"
+            format_chunk_paragraphs(&[cp(7, "张伟", "第八段"), cp(12, "R2", "第十三段")]),
+            "paragraph_index=7 speaker=张伟: 第八段\nparagraph_index=12 speaker=R2: 第十三段\n"
         );
+    }
+
+    #[test]
+    fn speaker_label_prefers_name_sanitizes_and_falls_back() {
+        let p = |name: Option<&str>| para_with("R3", name, "x");
+        assert_eq!(speaker_label(&p(Some("张伟"))), "张伟");
+        // 名字是用户可编辑文本:换行/冒号会破坏"标签: 正文"行格式,替换成空格。
+        assert_eq!(speaker_label(&p(Some("张:伟\n总"))), "张 伟 总");
+        assert_eq!(speaker_label(&p(Some("   "))), "R3", "纯空白名退回簇号");
+        assert_eq!(speaker_label(&p(None)), "R3");
+    }
+
+    #[test]
+    fn polish_prompt_carries_speaker_labels() {
+        let (base, captured) = mock_server_capturing(vec![chat_body(&["甲", "乙"], "{}")]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![
+            para_with("R1", Some("张伟"), "甲"),
+            para_with("R2", None, "乙"),
+        ];
+        let (outcome, _ents, _relations) = polish(&cfg, &mut ps, None);
+        assert!(matches!(
+            outcome,
+            LlmOutcome::Done | LlmOutcome::DoneWithRelationErrors
+        ));
+        let req = captured.lock().unwrap().join("");
+        assert!(
+            req.contains("speaker=张伟"),
+            "有名字的段必须带人名标签: {req}"
+        );
+        assert!(req.contains("speaker=R2"), "无名字的段用 R 号兜底");
     }
 }
 
