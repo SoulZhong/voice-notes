@@ -51,4 +51,10 @@ impl AecCapture {
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
         samples.to_vec()
     }
+
+    /// 流结束排空(与 aec.rs 同形,PR#76 新增):桩无预对齐、无扣压缓冲,
+    /// 恒无尾样本可排。缺了它 Windows 编译在 segment_worker 的调用点直接挂。
+    pub fn flush(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
 }
