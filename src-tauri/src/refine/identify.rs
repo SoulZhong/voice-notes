@@ -547,6 +547,174 @@ pub fn adjudicate(
     Verdict { tier, acoustic, reject_reason: None, target_key, evidence }
 }
 
+// ---------- identify.json 落盘与生成 ----------
+
+use std::path::Path;
+
+pub const IDENTIFY_FILE: &str = "identify.json";
+pub const IDENTIFY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdentifyDoc {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub provider: String,
+    pub model: String,
+    /// 生成时 RefinedDoc.revision 与段落 source_hash:新鲜度判定的唯一依据。
+    pub revision: u64,
+    pub source_hash: String,
+    pub assignments: Vec<IdentifyAssignment>,
+    /// 拒绝记录跨代保留:key = "指纹|目标键"(目标键=resolve 后 person_id 或
+    /// "name:<新名>")。拒绝「是张伟」不封杀该簇的其它候选。value = decided_at。
+    #[serde(default)]
+    pub rejected: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyAssignment {
+    /// 簇指纹(成员 seq 集合 hash):身份绑定的锚,不绑会变的 R 号。
+    pub fingerprint: String,
+    /// 生成时的 R 号(展示用)。
+    pub cluster: String,
+    pub person_id: Option<String>,
+    pub new_name: Option<String>,
+    /// 生成时裁决档位:不可变——人工动作只改 status,评测读原始 tier。
+    pub tier: Tier,
+    pub llm_confidence: String,
+    pub acoustic: Option<(String, f32)>,
+    pub evidence: Vec<RawIdentifyEvidence>,
+    /// suggested | applied | rejected。
+    pub status: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+}
+
+pub fn rejected_key(fingerprint: &str, target_key: &str) -> String {
+    format!("{fingerprint}|{target_key}")
+}
+
+pub fn load_identify(note_dir: &Path) -> Option<IdentifyDoc> {
+    let text = std::fs::read_to_string(note_dir.join(IDENTIFY_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_identify(note_dir: &Path, doc: &IdentifyDoc) -> anyhow::Result<()> {
+    let tmp = note_dir.join(format!("{IDENTIFY_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(doc)?)?;
+    std::fs::rename(&tmp, note_dir.join(IDENTIFY_FILE))?;
+    Ok(())
+}
+
+/// 生成一轮 identify 结果并与旧稿合并:
+/// - 旧 rejected 全表继承;命中「指纹|目标」的新建议不再生成;
+/// - 旧 assignments 中 status==applied 的按指纹原样保留(用户拍板不重复打扰);
+/// - 每簇至多一条新建议(LLM 被要求如此,程序侧兜底);
+/// - 裁决 reject/Low 丢弃(留 stderr 痕);已 linked 的簇若建议目标与关联相同则
+///   不生成(与关联矛盾的建议保留——那正是纠错价值)。
+#[allow(clippy::too_many_arguments)]
+pub fn run_identify(
+    note_dir: &Path,
+    note_id: &str,
+    doc: &RefinedDoc,
+    stats: &[ClusterStat],
+    vp: &Voiceprints,
+    acoustic_enabled: bool,
+    executor: &dyn IdentifyExecutor,
+    log: Option<&crate::ailog::Ctx>,
+    now: &str,
+) -> anyhow::Result<IdentifyDoc> {
+    let members = cluster_members_from_doc(doc);
+    let ctx = build_context(note_id, doc, stats, vp, acoustic_enabled);
+    let (raws, parse_skipped) = executor.infer(&ctx, log)?;
+    if parse_skipped > 0 {
+        eprintln!("identify({note_id}): {parse_skipped} 条输出条目类型非法,已跳过");
+    }
+
+    let old = load_identify(note_dir);
+    let rejected = old.as_ref().map(|o| o.rejected.clone()).unwrap_or_default();
+    let mut assignments: Vec<IdentifyAssignment> = Vec::new();
+    let mut taken: BTreeMap<String, String> = BTreeMap::new();
+
+    // 已确认(applied)的旧条按指纹保留;指纹仍对应现稿某簇时占坑防重复建议。
+    let fp_to_speaker: BTreeMap<String, String> = members
+        .iter()
+        .map(|(speaker, seqs)| (cluster_fingerprint(seqs), speaker.clone()))
+        .collect();
+    if let Some(o) = &old {
+        for a in &o.assignments {
+            if a.status == "applied" {
+                if let Some(speaker) = fp_to_speaker.get(&a.fingerprint) {
+                    let key = a
+                        .person_id
+                        .clone()
+                        .unwrap_or_else(|| format!("name:{}", a.new_name.clone().unwrap_or_default()));
+                    taken.insert(speaker.clone(), key);
+                }
+                assignments.push(a.clone());
+            }
+        }
+    }
+
+    let linked_by_cluster: BTreeMap<&str, &(String, String)> = ctx
+        .clusters
+        .iter()
+        .filter_map(|c| c.linked.as_ref().map(|l| (c.speaker.as_str(), l)))
+        .collect();
+
+    for raw in &raws {
+        if taken.contains_key(&raw.cluster) {
+            continue; // 每簇一条,已确认/已收下的不再堆卡
+        }
+        let v = adjudicate(raw, doc, &members, stats, vp, acoustic_enabled, &taken);
+        if let Some(reason) = v.reject_reason {
+            eprintln!("identify({note_id}): {} 条目被裁决丢弃({reason})", raw.cluster);
+            continue;
+        }
+        if v.tier == Tier::Low {
+            continue; // 弱证据不进收件箱(只在 ailog 的原始响应里留痕)
+        }
+        let Some(seqs) = members.get(&raw.cluster) else { continue };
+        let fingerprint = cluster_fingerprint(seqs);
+        if rejected.contains_key(&rejected_key(&fingerprint, &v.target_key)) {
+            continue; // 用户拒过「这个簇是这个人」,同目标不再打扰
+        }
+        if let Some((linked_pid, _)) = linked_by_cluster.get(raw.cluster.as_str()) {
+            if *linked_pid == v.target_key {
+                continue; // 与既有关联相同的建议是废话;相异的保留(纠错价值)
+            }
+        }
+        let (person_id, new_name) = if let Some(rest) = v.target_key.strip_prefix("name:") {
+            (None, Some(rest.to_string()))
+        } else {
+            (Some(v.target_key.clone()), None)
+        };
+        taken.insert(raw.cluster.clone(), v.target_key.clone());
+        assignments.push(IdentifyAssignment {
+            fingerprint,
+            cluster: raw.cluster.clone(),
+            person_id,
+            new_name,
+            tier: v.tier,
+            llm_confidence: raw.confidence.clone(),
+            acoustic: v.acoustic,
+            evidence: v.evidence,
+            status: "suggested".into(),
+            decided_at: None,
+        });
+    }
+
+    Ok(IdentifyDoc {
+        schema_version: IDENTIFY_SCHEMA_VERSION,
+        generated_at: now.to_string(),
+        provider: executor.provider().to_string(),
+        model: executor.model().to_string(),
+        revision: doc.revision,
+        source_hash: crate::store::source_hash(&doc.paragraphs),
+        assignments,
+        rejected,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1004,77 @@ mod tests {
         // 未知 evidence type 丢弃后无有效证据 → reject。
         let noev = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "made_up")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
         assert_eq!(noev.reject_reason, Some("no-valid-evidence"));
+    }
+    // ---------- run_identify 合并规则测试 ----------
+
+    struct MockExec(Vec<RawAssignment>);
+    impl IdentifyExecutor for MockExec {
+        fn provider(&self) -> &str { "mock" }
+        fn model(&self) -> &str { "mock-m" }
+        fn infer(&self, _ctx: &IdentifyContext, _log: Option<&crate::ailog::Ctx>) -> anyhow::Result<(Vec<RawAssignment>, usize)> {
+            Ok((self.0.clone(), 0))
+        }
+    }
+
+    #[test]
+    fn run_identify_merges_rejected_and_applied_across_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        let fp_r1 = cluster_fingerprint(&members["R1"]);
+
+        // 第一轮:R1 建议张伟(P1)。
+        let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
+        let d1 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t1").unwrap();
+        assert_eq!(d1.assignments.len(), 1);
+        assert_eq!(d1.assignments[0].status, "suggested");
+        assert_eq!(d1.assignments[0].tier, Tier::High);
+        assert_eq!(d1.assignments[0].fingerprint, fp_r1);
+
+        // 用户拒绝「R1 是 P1」后重跑:同目标不再生成;换目标(new_name)可以。
+        let mut d1_rejected = d1;
+        d1_rejected.rejected.insert(rejected_key(&fp_r1, "P1"), "t1x".into());
+        d1_rejected.assignments.clear();
+        save_identify(dir.path(), &d1_rejected).unwrap();
+        let d2 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t2").unwrap();
+        assert!(d2.assignments.is_empty(), "拒过的同目标建议不再生成");
+        assert!(d2.rejected.contains_key(&rejected_key(&fp_r1, "P1")), "拒绝表跨代继承");
+        let exec_new = MockExec(vec![raw("R1", None, Some("张老板"), vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
+        let d3 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec_new, None, "t3").unwrap();
+        // 「我是张伟」不含「张老板」→ self_intro 降级 → Low → 不落建议;
+        // 换个含名证据检查放行路径:
+        assert!(d3.assignments.is_empty());
+
+        // applied 的旧条按指纹保留,且占坑挡新建议。
+        let mut d4 = IdentifyDoc {
+            schema_version: IDENTIFY_SCHEMA_VERSION,
+            generated_at: "t4".into(), provider: "mock".into(), model: "m".into(),
+            revision: 3, source_hash: "h".into(),
+            assignments: vec![IdentifyAssignment {
+                fingerprint: fp_r1.clone(), cluster: "R1".into(),
+                person_id: Some("P1".into()), new_name: None,
+                tier: Tier::High, llm_confidence: "high".into(), acoustic: None,
+                evidence: vec![], status: "applied".into(), decided_at: Some("t4".into()),
+            }],
+            rejected: BTreeMap::new(),
+        };
+        d4.rejected.clear();
+        save_identify(dir.path(), &d4).unwrap();
+        let d5 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t5").unwrap();
+        assert_eq!(d5.assignments.len(), 1, "applied 保留且不重复建议");
+        assert_eq!(d5.assignments[0].status, "applied");
+    }
+
+    #[test]
+    fn run_identify_skips_suggestion_equal_to_existing_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, _, stats, vp) = adjudicate_fixture();
+        // R1 已关联 P1:同目标建议是废话,不生成。
+        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == "R1") {
+            p.person_id = Some("P1".into());
+            p.name = Some("张伟".into());
+        }
+        let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
+        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t").unwrap();
+        assert!(d.assignments.is_empty());
     }
 }

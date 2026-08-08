@@ -390,8 +390,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 };
                 let seeds = load_voiceprint_seeds(&app);
-                // cluster_stats 在 P2a Task 5 接入 identify;下划线前缀待接线时移除。
-                let (mut doc, _cluster_stats) = refine::run_local(
+                let (mut doc, cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
                     &note.speakers,
@@ -497,6 +496,34 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 report("llm", &doc.stages.llm);
+                // identify(P2a 只读期):精修定稿后推断说话人身份,产物只落
+                // identify.json + 收件箱建议卡,零自动写入。执行体分派内含
+                // refine_llm_ready 门禁(用户关精修/agent provider → 静默跳过);
+                // 失败仅留日志,绝不影响 Aing 结果。
+                if let Ok(identify_exec) = identify_executor(&s) {
+                    let identify_result = (|| -> anyhow::Result<()> {
+                        let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
+                        let acoustic_enabled = vp.embedding_model == s.speaker_model;
+                        let now = chrono::Local::now().to_rfc3339();
+                        let idoc = refine::identify::run_identify(
+                            &dir,
+                            &note_id,
+                            &doc,
+                            &cluster_stats,
+                            &vp,
+                            acoustic_enabled,
+                            identify_exec.as_ref(),
+                            log_ctx.as_ref(),
+                            &now,
+                        )?;
+                        refine::identify::save_identify(&dir, &idoc)?;
+                        let _ = app.emit("identify_done", note_id.clone());
+                        Ok(())
+                    })();
+                    if let Err(e) = identify_result {
+                        eprintln!("identify({note_id}): 推断失败(不影响精修): {e}");
+                    }
+                }
                 // 图谱是纯增值产物:成功 Aing 只把全量重建标脏。scheduler 合并并发请求，
                 // 从 ledger + 全部 aing.json 取快照后原子替换；失败保留旧库且不打断 Aing。
                 if !http_refine_handled && doc.stages.llm == "done" {
@@ -3293,6 +3320,108 @@ fn assign_refined_person(
     Ok(())
 }
 
+/// 手动触发/重试 identify(P2a):从现稿重建簇成员与簇质心(逐段重嵌入,复用
+/// P1 feedback 纯逻辑核),走管线同一 run_identify。门禁同管线(refine_llm_ready
+/// 内含于 identify_executor);持 FEEDBACK_GATE 全程——嵌入并发与 track_pcm
+/// 临时文件竞争都收敛于此门。
+#[tauri::command]
+async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&id) {
+        return Err(tr!(
+            "该笔记正在 Aing 中,稍后再试",
+            "This note is being refined; try again later"
+        ));
+    }
+    reject_if_active(&state, &id)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let run = || -> anyhow::Result<()> {
+            let s = app2
+                .path()
+                .app_data_dir()
+                .map(|d| settings::load(&d))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let executor = identify_executor(&s)?;
+            let root = notes_dir(&app2)?;
+            let dir = root.join(&id);
+            let doc = store::load_refined(&dir)
+                .ok_or_else(|| anyhow::anyhow!(tr!("该笔记尚无精修稿,先运行 Aing", "No refined doc yet; run Aing first")))?;
+            let note = store::NoteStore::new(root).load(&id)?;
+            let vp = open_voiceprint_store(&app2).map_err(anyhow::Error::msg)?.load();
+            let acoustic_enabled = vp.embedding_model == s.speaker_model;
+            let _gate = FEEDBACK_GATE.lock().unwrap();
+
+            // 簇质心重建:每簇成员段逐段重嵌入(与管线路径的 recluster 统计等价口径)。
+            let members = refine::identify::cluster_members_from_doc(&doc);
+            let mut stats: Vec<refine::recluster::ClusterStat> = Vec::new();
+            if acoustic_enabled {
+                let meta = store::audio::load_audio_meta(&dir);
+                let mut pcm_by_source: std::collections::BTreeMap<String, (u64, Vec<f32>)> =
+                    Default::default();
+                for source in note
+                    .segments
+                    .iter()
+                    .map(|sg| sg.source.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    match store::transcode::track_pcm(&dir, source) {
+                        Ok(pcm) => {
+                            let off = meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+                            pcm_by_source.insert(source.to_string(), (off, pcm));
+                        }
+                        Err(e) => eprintln!("identify({id}): 音轨 {source} 解码失败,该轨无声学: {e}"),
+                    }
+                }
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app2))?;
+                for (speaker, seqs) in &members {
+                    let segs: Vec<&store::SegmentRecord> =
+                        note.segments.iter().filter(|sg| seqs.contains(&sg.seq)).collect();
+                    let sstats = feedback::build_source_stats(&segs, &pcm_by_source, &mut embedder);
+                    let mut centroids = std::collections::BTreeMap::new();
+                    let mut source_ms = std::collections::BTreeMap::new();
+                    let mut total = 0u64;
+                    for (src, st) in sstats {
+                        total += st.total_ms;
+                        source_ms.insert(src.clone(), st.total_ms);
+                        centroids.insert(src, st.centroid);
+                    }
+                    stats.push(refine::recluster::ClusterStat {
+                        speaker: speaker.clone(),
+                        centroids,
+                        total_ms: total,
+                        source_ms,
+                        core_seqs: seqs.iter().copied().collect(),
+                        seed: None,
+                    });
+                }
+            }
+
+            let log_ctx = data_root(&app2)
+                .ok()
+                .map(|r| ailog::Ctx { data_root: r, note_id: id.clone() });
+            let now = chrono::Local::now().to_rfc3339();
+            let idoc = refine::identify::run_identify(
+                &dir,
+                &id,
+                &doc,
+                &stats,
+                &vp,
+                acoustic_enabled,
+                executor.as_ref(),
+                log_ctx.as_ref(),
+                &now,
+            )?;
+            refine::identify::save_identify(&dir, &idoc)?;
+            let _ = app2.emit("identify_done", id.clone());
+            Ok(())
+        };
+        run().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 笔记页 WYSIWYG 整篇保存精修稿。守卫与 rename_refined_speaker 同套:Aing 中拒绝
 /// (管线随后整写会吞掉编辑),录制中拒绝;revision 乐观并发在 store 层校验。
 #[tauri::command]
@@ -5465,6 +5594,7 @@ pub fn run() {
             list_notes,
             get_note,
             refine_note,
+            identify_note,
             get_refined,
             retranscribe_note,
             retranscribe_status,
