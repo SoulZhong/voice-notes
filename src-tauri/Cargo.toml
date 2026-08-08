@@ -4,6 +4,9 @@ version = "0.8.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+# speaker_eval(PR#79 评测工具链)入列后包里有两个 bin,`cargo run`(tauri dev 的
+# DevCommand)无法自选,必须钉死默认 bin,否则 `npm run tauri dev` 直接报错。
+default-run = "voice-notes"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
