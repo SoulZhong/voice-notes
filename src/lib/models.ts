@@ -81,6 +81,7 @@ export type Settings = {
   mcp_onboarded: boolean;
   // 方案 B(实验特性):录制期额外落一条 mixed.wav 混音成品轨。默认关。
   mix_track: boolean;
+  calendar_match_enabled: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;
@@ -132,3 +133,8 @@ export const testCloudAsr = (
     volcAccessKey,
     dashscopeApiKey,
   });
+
+/** P3 日历授权态:full | write_only | denied | not_determined | unavailable。 */
+export const calendarPermission = () => invoke<string>("calendar_permission");
+/** 发起系统日历授权(只能由设置页说明卡触发):granted | denied | insufficient | error | timeout。 */
+export const requestCalendarPermission = () => invoke<string>("request_calendar_permission");
