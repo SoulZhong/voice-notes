@@ -261,6 +261,9 @@ export const renameNote = (id: string, title: string) =>
   invoke<void>("rename_note", { id, title });
 export const deleteNote = (id: string) => invoke<void>("delete_note", { id });
 export const resumeRecording = (noteId: string) => invoke<void>("resume_recording", { noteId });
+/** 删除笔记内说话人:表项移除,名下段落回到未标注。只动本笔记,不碰人物库。 */
+export const deleteNoteSpeaker = (noteId: string, speakerId: string) =>
+  invoke<void>("delete_note_speaker", { noteId, speakerId });
 export const renameSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_speaker", { noteId, speakerId, name });
 /** 导出到用户选定路径(保存对话框),返回落盘绝对路径。preferRefined=真且修订稿

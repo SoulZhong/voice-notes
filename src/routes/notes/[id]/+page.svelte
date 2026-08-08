@@ -17,6 +17,7 @@
     retranscribeNote,
     retranscribeStatus,
     mixedInputStatus,
+    deleteNoteSpeaker,
     mixedPlaybackInfo,
     regenerateMixed,
     mixedRegenStatus,
@@ -1429,6 +1430,7 @@
           counts={segCounts}
           people={canEdit ? people : undefined}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {

@@ -16,6 +16,7 @@
     onPick,
     onPreview,
     previewingId,
+    onDelete,
   }: {
     speakers: Record<string, { name: string; sources: string[]; person_id?: string | null }>;
     noteId: string;
@@ -37,6 +38,9 @@
     onPreview?: (id: string) => void;
     /** 正在试听的说话人 id(供行内提示「播放中,点击换一段」)。 */
     previewingId?: string | null;
+    /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
+        只动本笔记,不碰人物库。面板内二段确认。 */
+    onDelete?: (id: string) => Promise<void>;
   } = $props();
 
   let editingId = $state<string | null>(null);
@@ -85,16 +89,28 @@
   // 非 null 分支与徽章共用同一兜底逻辑;source 参数在此分支无关,固定传 "mic"。
   const label = (id: string) => speakerLabel(id, "mic", speakers);
 
+  /** 删除二段确认态:首点变确认行,再点才真删。切说话人/收面板即复位。 */
+  let deletePending = $state(false);
+
   function beginEdit(id: string) {
     editingId = id;
     editingName = speakers[id]?.name ?? "";
     editingDirty = false;
     dupPending = null;
+    deletePending = false;
   }
 
   function cancelEdit() {
     editingId = null;
     dupPending = null;
+    deletePending = false;
+  }
+
+  async function commitDelete(id: string) {
+    if (!onDelete) return;
+    cancelEdit();
+    await onDelete(id);
+    onRenamed?.();
   }
 
   /** 实际改名落点:外部没接管(onRename)就走笔记内 renameSpeaker。 */
@@ -263,6 +279,19 @@
                   </svg>
                   {t("speakers.chipMe")}
                 </button>
+                {#if onDelete}
+                  {#if deletePending}
+                    <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>
+                    <button class="row quiet" onclick={() => (deletePending = false)}>{t("speakers.cancel")}</button>
+                  {:else}
+                    <button class="row" onclick={() => (deletePending = true)}>
+                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                        <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.7 8.5h4.6l.7-8.5" />
+                      </svg>
+                      {t("speakers.chipDelete")}
+                    </button>
+                  {/if}
+                {/if}
               {/if}
               {#if people && onPick}
                 <div class="caption">{t("speakers.title")}</div>

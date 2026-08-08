@@ -4749,6 +4749,26 @@ fn rename_speaker(
     })
 }
 
+/// 删除笔记内说话人(原始逐字稿 chips):表项移除,名下段落回到未标注。
+/// 只动本笔记,不碰人物库。录制中拒绝(与段落编辑同模式,不做活动会话变体:
+/// 删除是低频清理动作,录完再删没有代价);Aing 中拒绝(管线随后整写会引用
+/// speakers 的产物)。
+#[tauri::command]
+fn delete_note_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+) -> Result<(), String> {
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err(tr!("该笔记正在 Aing 中，稍后再删", "This note is being refined by AI; try again later"));
+    }
+    reject_if_active(&state, &note_id)?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::DeleteSpeaker { id: note_id, speaker_id },
+    })
+}
+
 /// 段落编辑共用 guard：活动会话笔记一律拒绝（与 rename_note 同模式）。
 fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String> {
     if state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false) {
@@ -6831,6 +6851,7 @@ pub fn run() {
             delete_note,
             export_note,
             rename_speaker,
+            delete_note_speaker,
             edit_segment,
             delete_segment,
             set_segment_speaker,

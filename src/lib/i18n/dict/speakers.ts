@@ -174,6 +174,8 @@ export const zh = {
   "speakers.chipPreview": "试听他的声音",
   "speakers.chipPreviewPlaying": "播放中,点击换一段",
   "speakers.chipMe": "这是我",
+  "speakers.chipDelete": "删除这个说话人",
+  "speakers.chipDeleteConfirm": "确认删除(其段落变为未标注)",
   "speakers.fragmentsN": "+{n} 位偶现说话人",
 } as const satisfies Dict;
 
@@ -361,5 +363,7 @@ export const en = {
   "speakers.chipPreview": "Hear their voice",
   "speakers.chipPreviewPlaying": "Playing — click for another clip",
   "speakers.chipMe": "This is me",
+  "speakers.chipDelete": "Delete this speaker",
+  "speakers.chipDeleteConfirm": "Confirm delete (its segments become unlabeled)",
   "speakers.fragmentsN": "+{n} occasional speakers",
 } satisfies Record<keyof typeof zh, Msg>;

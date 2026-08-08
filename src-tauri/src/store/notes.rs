@@ -373,6 +373,33 @@ impl NoteStore {
         write_jsonl_atomic(&dir, &lines)?;
         Ok(target)
     }
+
+    /// 删除说话人:speakers.json 去条目,名下段落全部回到未标注(speaker=None)。
+    /// 只动本笔记——person_id 只是指向人物库的引用,库(会议搭子/声纹)不受影响。
+    /// 顺序刻意「先改段、再删表」:两写之间崩溃最坏留一个无段落引用的孤儿表项,
+    /// 与 delete_segment 的既有语义一致(无害,可再次删除清掉);反过来先删表,
+    /// 崩溃会留下指向已删说话人的段落,与 set_segment_speaker 的"未知说话人拒绝"
+    /// 判据自相矛盾。
+    pub fn delete_speaker(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        if !speakers.contains_key(speaker_id) {
+            anyhow::bail!("未知说话人: {speaker_id}");
+        }
+        let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        for l in lines.iter_mut() {
+            if let JsonlLine::Seg(r) = l {
+                if r.speaker.as_deref() == Some(speaker_id) {
+                    r.speaker = None;
+                }
+            }
+        }
+        write_jsonl_atomic(&dir, &lines)?;
+        speakers.remove(speaker_id);
+        write_speakers_atomic(&dir, &speakers)
+    }
 }
 
 fn read_suppressions(dir: &Path) -> std::collections::BTreeSet<u64> {
@@ -884,6 +911,26 @@ mod tests {
         assert!(n.speakers.contains_key("S6"), "新说话人已入表(空名,无质心)");
         assert_eq!(n.speakers["S6"].name, "");
         assert!(n.speakers["S6"].centroid.is_none());
+    }
+
+    /// 删除说话人:表项移除,名下段落回到未标注;其他说话人与段落原样;未知 id 拒绝。
+    #[test]
+    fn delete_speaker_unassigns_segments_and_removes_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(
+            tmp.path(),
+            &[("甲", Some("S1")), ("乙", Some("S3")), ("丙", Some("S1"))],
+            &["S1", "S3"],
+        );
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.delete_speaker(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert!(!n.speakers.contains_key("S1"), "表项必须移除");
+        assert!(n.speakers.contains_key("S3"), "无关说话人不动");
+        assert_eq!(n.segments[0].speaker, None, "名下段落回到未标注");
+        assert_eq!(n.segments[2].speaker, None);
+        assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人段落不动");
+        assert!(store.delete_speaker(&id, "S99").is_err(), "未知说话人拒绝");
     }
 
     #[test]
