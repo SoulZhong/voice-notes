@@ -16,6 +16,9 @@ export const zh = {
 
   // 详情页:标题/元信息/导出/继续录制
   "notes.title.renameHint": "点击改名",
+  "notes.identify.rerun": "重新推断身份",
+  "notes.identify.running": "推断中…",
+  "notes.identify.rerunHint": "用会议内容(自我介绍/称呼/日历参会人)重新推断各说话人是谁,结果进整理收件箱",
   "notes.calendar.attendeeN": "{n} 位参会人",
   "notes.calendar.me": "{name}(我)",
   "notes.calendar.reselect": "改选",
@@ -113,6 +116,9 @@ export const en = {
   "notes.duration.s": "{s} sec",
 
   "notes.title.renameHint": "Click to rename",
+  "notes.identify.rerun": "Re-identify speakers",
+  "notes.identify.running": "Identifying\u2026",
+  "notes.identify.rerunHint": "Re-infer who each speaker is from meeting content (self-intros, addressing, calendar attendees); results go to the tidy inbox",
   "notes.calendar.attendeeN": "{n} attendees",
   "notes.calendar.me": "{name} (me)",
   "notes.calendar.reselect": "Change",

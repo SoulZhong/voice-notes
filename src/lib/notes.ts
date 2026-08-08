@@ -248,6 +248,8 @@ export const listCalendarCandidates = (id: string) =>
 export const setNoteCalendarEvent = (id: string, eventId: string | null) =>
   invoke<void>("set_note_calendar_event", { id, eventId });
 export const noteCalendarPermission = () => invoke<string>("calendar_permission");
+/** 手动触发/重试说话人身份推断(P2a):完成后 identify_done 事件驱动收件箱刷新。 */
+export const identifyNote = (id: string) => invoke<void>("identify_note", { id });
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */

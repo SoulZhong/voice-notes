@@ -40,6 +40,7 @@
     listCalendarCandidates,
     setNoteCalendarEvent,
     noteCalendarPermission,
+    identifyNote,
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
@@ -466,6 +467,19 @@
     calMenuOpen = false;
     calBusy = false;
   }
+  // P2a 手动重推身份:后台跑,identify_done 事件会刷新收件箱;错误就地横幅。
+  let identifying = $state(false);
+  async function rerunIdentify() {
+    if (identifying) return;
+    identifying = true;
+    try {
+      await identifyNote(id);
+    } catch (e) {
+      error = `${e}`;
+    }
+    identifying = false;
+  }
+
   function fmtCalTime(ms: number): string {
     const d = new Date(ms);
     const pad = (n: number) => String(n).padStart(2, "0");
@@ -1194,6 +1208,9 @@
              只留 MD(冒烟反馈:TXT 用不上,按钮撤了);txt 渲染能力在导出层与
              CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
+          <button class="act-btn" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+            {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
+          </button>
           <button class="act-btn" onclick={() => doExport("md")}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
