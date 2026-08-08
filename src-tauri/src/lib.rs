@@ -1,4 +1,9 @@
 mod audio;
+#[cfg(target_os = "macos")]
+mod calendar;
+#[cfg(not(target_os = "macos"))]
+#[path = "calendar_stub.rs"]
+mod calendar;
 mod feedback;
 mod logging;
 pub mod pipeline;
@@ -420,6 +425,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 let log_ctx = data_root(&app)
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+                // P3 日历匹配:先于 identify 执行(参会人闭集先验要进 ctx);
+                // 失败/未授权/开关关都只收窄,不影响精修。
+                if let Err(e) = match_and_store_calendar(&app, &note_id) {
+                    eprintln!("calendar({note_id}): 匹配失败(不影响笔记): {e}");
+                }
                 let mut http_refine_handled = false;
                 if refine_agent_ready(&s) {
                     telemetry::track(
@@ -500,23 +510,64 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // identify.json + 收件箱建议卡,零自动写入。执行体分派内含
                 // refine_llm_ready 门禁(用户关精修/agent provider → 静默跳过);
                 // 失败仅留日志,绝不影响 Aing 结果。
-                if let Ok(identify_exec) = identify_executor(&s) {
+                let identify_exec = match identify_executor(&s) {
+                    Ok(e) => Some(e),
+                    Err(reason) => {
+                        eprintln!("identify({note_id}): 跳过——{reason}");
+                        None
+                    }
+                };
+                if let Some(identify_exec) = identify_exec {
                     let identify_result = (|| -> anyhow::Result<()> {
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
+                        // 日历快照在本线程开头已匹配落盘,此处重读最新 meta。
+                        let cal = store::NoteStore::new(notes_dir(&app)?)
+                            .load(&note_id)
+                            .ok()
+                            .and_then(|n| n.meta.calendar);
                         let now = chrono::Local::now().to_rfc3339();
-                        let idoc = refine::identify::run_identify(
-                            &dir,
-                            &note_id,
-                            &doc,
-                            &cluster_stats,
-                            &vp,
-                            acoustic_enabled,
-                            identify_exec.as_ref(),
-                            log_ctx.as_ref(),
-                            &now,
-                        )?;
-                        refine::identify::save_identify(&dir, &idoc)?;
+                        // 未完成 op 无条件先恢复(不依赖开关/推断成败):崩溃在
+                        // assign 后时,不先前滚,新一轮推断会因簇已关联吞掉条目。
+                        recover_identify_ops(&app, &note_id);
+                        // identify.json 读改写全程收进 IDENTIFY_ACT_GATE(与
+                        // apply/reject/自动应用同门,消并发覆盖)。
+                        let idoc = {
+                            let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+                            let idoc = refine::identify::run_identify(
+                                &dir,
+                                &note_id,
+                                &doc,
+                                &cluster_stats,
+                                &vp,
+                                acoustic_enabled,
+                                cal.as_ref(),
+                                identify_exec.as_ref(),
+                                log_ctx.as_ref(),
+                                &now,
+                            )?;
+                            refine::identify::save_identify(&dir, &idoc)?;
+                            idoc
+                        };
+                        // P2b 自动应用(默认关):恢复已在 run_identify 前无条件
+                        // 执行;此后 idoc 已是旧副本,绝不再保存它。
+                        if s.identify_auto_apply {
+                            let fps: Vec<String> = store::load_refined(&dir)
+                                .map(|d| {
+                                    refine::identify::auto_apply_targets(&idoc, &d)
+                                        .iter()
+                                        .map(|a| a.fingerprint.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for fp in fps {
+                                if let Err(e) = auto_apply_one(&app, &note_id, &fp) {
+                                    eprintln!(
+                                        "identify({note_id}): 自动应用 {fp} 未执行(留建议卡): {e}"
+                                    );
+                                }
+                            }
+                        }
                         let _ = app.emit("identify_done", note_id.clone());
                         Ok(())
                     })();
@@ -2379,14 +2430,30 @@ fn relation_executor(
     }
 }
 
-/// identify(P2a)执行体分派:门禁复用 refine_llm_ready 全套——用户关闭精修或
-/// 配置不齐时返回 Err,调用方一律按「静默跳过」处理,绝不绕过外发授权。
-/// agent provider 的 identify 执行体另立计划,在那之前同样跳过。
+/// identify(P2a)执行体分派:与精修同一外发授权语义——用户关闭精修即整体
+/// 不跑;agent provider 走零工具面的 AgentIdentifyExecutor(Cursor 拒绝),
+/// 其余沿 refine_llm_ready 的宽 provider 语义走 HTTP。返回 Err 时调用方跳过
+/// 并留一行原因日志(静默吞错会让"identify 没发生"无法诊断)。
 fn identify_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
+    anyhow::ensure!(settings.refine_enabled, "identify 需要已启用精修");
+    if settings.refine_provider == "agent" {
+        let kind = refine::agent::AgentKind::from_key(&settings.refine_agent).ok_or_else(|| {
+            anyhow::anyhow!(tr!(
+                "未知 Agent: {agent}",
+                "Unknown agent: {agent}",
+                agent = settings.refine_agent
+            ))
+        })?;
+        return Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(
+            kind,
+            &settings.refine_agent_bin,
+            &settings.refine_agent_model,
+        )?));
+    }
     if !refine_llm_ready(settings) {
-        anyhow::bail!("identify 需要已启用且配置齐全的 HTTP 精修");
+        anyhow::bail!("identify 需要配置齐全的 HTTP 精修");
     }
     Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
         refine::llm::LlmConfig {
@@ -2735,6 +2802,7 @@ fn spawn_feedback(
                         &expected,
                         &mut embedder,
                         &now,
+                        None,
                     )?;
                     eprintln!("feedback: note={note_id} target={target} result={r:?}");
                     Ok(())
@@ -3333,6 +3401,240 @@ fn do_assign_refined_person(
     Ok(())
 }
 
+/// P3 自动日历匹配(停止后/backfill 共用):开关开、已授权、无快照且未被清除
+/// 才写。持锁复查——查询期间用户手动改选/清除则放弃。返回是否写入。
+fn match_and_store_calendar(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
+    let s = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !s.calendar_match_enabled {
+        return Ok(false);
+    }
+    if calendar::permission_status() != calendar::Permission::Full {
+        return Ok(false);
+    }
+    let root = notes_dir(app)?;
+    let note = store::NoteStore::new(root.clone()).load(note_id)?;
+    if note.meta.calendar.is_some() || note.meta.calendar_cleared {
+        return Ok(false);
+    }
+    let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments) else {
+        return Ok(false);
+    };
+    let events = calendar::events_between(start_ms - 60_000, end_ms + 60_000)?;
+    let Some(ev) = calendar::best_match(&events, start_ms, end_ms) else {
+        return Ok(false);
+    };
+    let now = chrono::Local::now().to_rfc3339();
+    let snap = calendar::snapshot_of(ev, "auto", &now);
+    store::NoteStore::new(root).update_calendar(note_id, |meta| {
+        if meta.calendar.is_some() || meta.calendar_cleared {
+            return false; // 持锁复查:自动匹配绝不覆盖用户决定
+        }
+        meta.calendar = Some(snap.clone());
+        true
+    })
+}
+
+/// backfill 并发门:授权成功后的自动回填与用户手动回填不并跑。
+static CALENDAR_BACKFILL_GATE: Mutex<()> = Mutex::new(());
+
+/// 全库回填:一次拉取覆盖全部候选笔记的时间窗,内存逐笔记匹配(不逐笔记查
+/// EventKit)。返回写入数。
+fn backfill_calendar_impl(app: &AppHandle) -> anyhow::Result<u32> {
+    let _gate = CALENDAR_BACKFILL_GATE.lock().unwrap();
+    let s = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !s.calendar_match_enabled || calendar::permission_status() != calendar::Permission::Full {
+        return Ok(0);
+    }
+    let root = notes_dir(app)?;
+    let store_ = store::NoteStore::new(root.clone());
+    // 候选:完成态、无快照、未清除;窗口按全体候选的最早开始/最晚结束一次拉取。
+    let mut windows: Vec<(String, i64, i64)> = Vec::new();
+    for n in store_.list() {
+        if n.state != "complete" {
+            continue;
+        }
+        let Ok(note) = store_.load(&n.id) else { continue };
+        if note.meta.calendar.is_some() || note.meta.calendar_cleared {
+            continue;
+        }
+        if let Some((a, b)) = calendar::note_window_ms(&note.meta, &note.segments) {
+            windows.push((n.id, a, b));
+        }
+    }
+    if windows.is_empty() {
+        return Ok(0);
+    }
+    let lo = windows.iter().map(|(_, a, _)| *a).min().unwrap() - 60_000;
+    let hi = windows.iter().map(|(_, _, b)| *b).max().unwrap() + 60_000;
+    let events = calendar::events_between(lo, hi)?;
+    let mut written = 0u32;
+    let now = chrono::Local::now().to_rfc3339();
+    for (id, a, b) in windows {
+        let Some(ev) = calendar::best_match(&events, a, b) else { continue };
+        let snap = calendar::snapshot_of(ev, "auto", &now);
+        let ok = store::NoteStore::new(root.clone()).update_calendar(&id, |meta| {
+            if meta.calendar.is_some() || meta.calendar_cleared {
+                return false;
+            }
+            meta.calendar = Some(snap.clone());
+            true
+        })?;
+        if ok {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// 日历授权态(前端设置页/详情页查询;非 macOS 恒 unavailable → 整块隐藏)。
+#[tauri::command]
+fn calendar_permission() -> String {
+    match calendar::permission_status() {
+        calendar::Permission::Full => "full",
+        calendar::Permission::WriteOnly => "write_only",
+        calendar::Permission::Denied => "denied",
+        calendar::Permission::NotDetermined => "not_determined",
+        calendar::Permission::Unavailable => "unavailable",
+    }
+    .into()
+}
+
+/// 发起系统日历授权(只能由设置页说明卡「继续」触发)。授权成功后对历史笔记
+/// 做一次 best-effort 回填。
+#[tauri::command]
+async fn request_calendar_permission(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let outcome = calendar::request_permission();
+        if outcome == calendar::AuthOutcome::Granted {
+            if let Err(e) = backfill_calendar_impl(&app) {
+                eprintln!("calendar: 授权后回填失败(忽略): {e}");
+            }
+        }
+        Ok(match outcome {
+            calendar::AuthOutcome::Granted => "granted",
+            calendar::AuthOutcome::Denied => "denied",
+            calendar::AuthOutcome::Insufficient => "insufficient",
+            calendar::AuthOutcome::Error => "error",
+            calendar::AuthOutcome::Timeout => "timeout",
+        }
+        .into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 详情页改选候选:笔记当天(前后各扩 2h)的非全天事件,按重叠降序;
+/// 零重叠也列出(延迟开录/错记场景)。
+#[tauri::command]
+async fn list_calendar_candidates(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<ipc::CalendarCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<ipc::CalendarCandidate>, String> {
+        store::validate_note_id(&id).map_err(|e| e.to_string())?;
+        let root = notes_dir(&app).map_err(|e| e.to_string())?;
+        let note = store::NoteStore::new(root).load(&id).map_err(|e| e.to_string())?;
+        let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments) else {
+            return Ok(vec![]);
+        };
+        // 当天窗:起点回拨到当日 00:00 再扩 2h,终点同理,覆盖跨午夜。
+        let day_ms = 86_400_000i64;
+        let lo = (start_ms / day_ms) * day_ms - 2 * 3_600_000;
+        let hi = ((end_ms / day_ms) + 1) * day_ms + 2 * 3_600_000;
+        let events = calendar::events_between(lo, hi).map_err(|e| e.to_string())?;
+        let mut out: Vec<ipc::CalendarCandidate> = events
+            .iter()
+            .filter(|e| !e.all_day)
+            .map(|e| ipc::CalendarCandidate {
+                event_id: e.event_id.clone(),
+                title: e.title.clone(),
+                start_ms: e.start_ms,
+                end_ms: e.end_ms,
+                attendee_n: e.attendees.len(),
+                overlap_ms: calendar::overlap_ms(start_ms, end_ms, e.start_ms, e.end_ms),
+            })
+            .collect();
+        out.sort_by(|a, b| b.overlap_ms.cmp(&a.overlap_ms).then(a.start_ms.cmp(&b.start_ms)));
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 手动改选/清除:Some(event_id) 从候选窗重取该事件快照(match_kind=manual,
+/// 复位 tombstone);None 清除并立 tombstone(自动匹配/回填永不再绑)。
+#[tauri::command]
+async fn set_note_calendar_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    event_id: Option<String>,
+) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    reject_if_active(&state, &id)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let root = notes_dir(&app).map_err(|e| e.to_string())?;
+        let store_ = store::NoteStore::new(root);
+        match event_id {
+            None => {
+                store_
+                    .update_calendar(&id, |meta| {
+                        meta.calendar = None;
+                        meta.calendar_cleared = true;
+                        true
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Some(eid) => {
+                let note = store_.load(&id).map_err(|e| e.to_string())?;
+                let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments)
+                else {
+                    return Err(tr!("笔记时间信息不完整", "Note time info incomplete"));
+                };
+                let day_ms = 86_400_000i64;
+                let lo = (start_ms / day_ms) * day_ms - 2 * 3_600_000;
+                let hi = ((end_ms / day_ms) + 1) * day_ms + 2 * 3_600_000;
+                let events = calendar::events_between(lo, hi).map_err(|e| e.to_string())?;
+                let Some(ev) = events.iter().find(|e| e.event_id == eid) else {
+                    return Err(tr!(
+                        "该日程已不在候选窗口内(可能被移动或删除)",
+                        "Event no longer in the candidate window (moved or deleted)"
+                    ));
+                };
+                let now = chrono::Local::now().to_rfc3339();
+                let snap = calendar::snapshot_of(ev, "manual", &now);
+                store_
+                    .update_calendar(&id, |meta| {
+                        meta.calendar = Some(snap.clone());
+                        meta.calendar_cleared = false;
+                        true
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 手动全库回填(设置页入口可后续加;当前供授权成功后自动调用与 devtools)。
+#[tauri::command]
+async fn backfill_calendar_matches(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || backfill_calendar_impl(&app).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 手动触发/重试 identify(P2a):从现稿重建簇成员与簇质心(逐段重嵌入,复用
 /// P1 feedback 纯逻辑核),走管线同一 run_identify。门禁同管线(refine_llm_ready
 /// 内含于 identify_executor);持 FEEDBACK_GATE 全程——嵌入并发与 track_pcm
@@ -3363,7 +3665,9 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
             let note = store::NoteStore::new(root).load(&id)?;
             let vp = open_voiceprint_store(&app2).map_err(anyhow::Error::msg)?.load();
             let acoustic_enabled = vp.embedding_model == s.speaker_model;
-            let _gate = FEEDBACK_GATE.lock().unwrap();
+            // FEEDBACK_GATE 只护住嵌入重建段——auto_apply_one 的同步回灌也要取它,
+            // 锁不收窄会自锁(锁序恒 IDENTIFY_ACT_GATE → FEEDBACK_GATE)。
+            let gate = FEEDBACK_GATE.lock().unwrap();
 
             // 簇质心重建:每簇成员段逐段重嵌入(与管线路径的 recluster 统计等价口径)。
             let members = refine::identify::cluster_members_from_doc(&doc);
@@ -3410,22 +3714,45 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                 }
             }
 
+            drop(gate); // 嵌入完毕即释放:后续自动应用要按 ACT→FEEDBACK 锁序再取
+
             let log_ctx = data_root(&app2)
                 .ok()
                 .map(|r| ailog::Ctx { data_root: r, note_id: id.clone() });
             let now = chrono::Local::now().to_rfc3339();
-            let idoc = refine::identify::run_identify(
-                &dir,
-                &id,
-                &doc,
-                &stats,
-                &vp,
-                acoustic_enabled,
-                executor.as_ref(),
-                log_ctx.as_ref(),
-                &now,
-            )?;
-            refine::identify::save_identify(&dir, &idoc)?;
+            recover_identify_ops(&app2, &id); // 无条件前置(理由同管线路径)
+            let idoc = {
+                let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+                let idoc = refine::identify::run_identify(
+                    &dir,
+                    &id,
+                    &doc,
+                    &stats,
+                    &vp,
+                    acoustic_enabled,
+                    note.meta.calendar.as_ref(),
+                    executor.as_ref(),
+                    log_ctx.as_ref(),
+                    &now,
+                )?;
+                refine::identify::save_identify(&dir, &idoc)?;
+                idoc
+            };
+            if s.identify_auto_apply {
+                let fps: Vec<String> = store::load_refined(&dir)
+                    .map(|d| {
+                        refine::identify::auto_apply_targets(&idoc, &d)
+                            .iter()
+                            .map(|a| a.fingerprint.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for fp in fps {
+                    if let Err(e) = auto_apply_one(&app2, &id, &fp) {
+                        eprintln!("identify({id}): 自动应用 {fp} 未执行(留建议卡): {e}");
+                    }
+                }
+            }
             let _ = app2.emit("identify_done", id.clone());
             Ok(())
         };
@@ -3438,6 +3765,265 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
 /// identify 建议动作的命令级串行门:apply/reject 都是对同一 identify.json 的
 /// 读改写,UI 双击/并发确认全收敛于此(list 只读不受影响)。
 static IDENTIFY_ACT_GATE: Mutex<()> = Mutex::new(());
+
+/// P2b 操作 id:进程号 + 计数 + 时间戳,不求密码学强度,只求全局不重。
+fn identify_op_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "iop-{}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        chrono::Utc::now().timestamp_millis()
+    )
+}
+
+/// P2b 自动应用单条(意向日志护航,调用方须已确认 identify_auto_apply 开):
+/// 写序 pending→assign→assigned→同步回灌→reinforced→status→done,每步落盘,
+/// 崩溃由 recover_identify_ops 前滚。不做 is_refining 守卫——只在 Aing 线程/
+/// identify_note 线程内调用,彼时无并发编辑。锁序:IDENTIFY_ACT_GATE →
+/// FEEDBACK_GATE,绝不反向。
+fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::Result<()> {
+    let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+    let root = notes_dir(app)?;
+    let dir = root.join(note_id);
+    let mut idoc = refine::identify::load_identify(&dir)
+        .ok_or_else(|| anyhow::anyhow!("identify.json 缺失"))?;
+    let doc = store::load_refined(&dir).ok_or_else(|| anyhow::anyhow!("精修稿缺失"))?;
+    // 资格在锁内复核(auto_apply_targets 含"簇当前无关联无手填名"的全部前置)。
+    let eligible = refine::identify::auto_apply_targets(&idoc, &doc)
+        .iter()
+        .any(|a| a.fingerprint == fingerprint);
+    anyhow::ensure!(eligible, "条目已不满足自动应用前置");
+    let a = idoc
+        .assignments
+        .iter()
+        .find(|a| a.fingerprint == fingerprint)
+        .expect("eligible 已含存在性")
+        .clone();
+    let target = a.person_id.clone().expect("eligible 已含库内人前置");
+    let vp_store = open_voiceprint_store(app).map_err(anyhow::Error::msg)?;
+    let vp = vp_store.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, &target).map(str::to_string) else {
+        anyhow::bail!("目标人物已不在库");
+    };
+    let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
+    let members = refine::identify::cluster_members_from_doc(&doc);
+    let (speaker, seqs) = members
+        .iter()
+        .find(|(_, sq)| refine::identify::cluster_fingerprint(sq) == fingerprint)
+        .map(|(sp, sq)| (sp.clone(), sq.clone()))
+        .ok_or_else(|| anyhow::anyhow!("指纹已不对应任何簇"))?;
+
+    // ① 意向记录先落盘(pending)。
+    let now = chrono::Local::now().to_rfc3339();
+    let op_id = identify_op_id();
+    let mut ops = refine::identify::load_ops(&dir);
+    ops.ops.push(refine::identify::IdentifyOp {
+        op_id: op_id.clone(),
+        fingerprint: fingerprint.to_string(),
+        cluster: speaker.clone(),
+        seqs: seqs.iter().copied().collect(),
+        target_person: resolved.clone(),
+        target_name: name.clone(),
+        quote: a.evidence.first().map(|e| e.quote.clone()).unwrap_or_default(),
+        quote_type: a.evidence.first().map(|e| e.r#type.clone()).unwrap_or_default(),
+        created_at: now.clone(),
+        stage: "pending".into(),
+        acknowledged: false,
+        reinforce_skipped: None,
+        undo_stage: None,
+        non_revertible: None,
+    });
+    refine::identify::save_ops(&dir, &ops)?;
+    let set_stage = |dir: &std::path::Path, op_id: &str, stage: &str, skipped: Option<String>| {
+        let mut ops = refine::identify::load_ops(dir);
+        if let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) {
+            op.stage = stage.into();
+            if skipped.is_some() {
+                op.reinforce_skipped = skipped;
+            }
+        }
+        let _ = refine::identify::save_ops(dir, &ops);
+    };
+
+    // ② 关联(store 层自取 NoteLock;绕命令壳的 is_refining 守卫)。
+    store::assign_refined_person(&dir, &speaker, &resolved, &name)?;
+    set_stage(&dir, &op_id, "assigned", None);
+
+    // ③ 同步回灌(自动路径绝不异步——否则撤销后后台污染)。
+    let skipped = {
+        let _fb = FEEDBACK_GATE.lock().unwrap();
+        let note = store::NoteStore::new(root.clone()).load(note_id)?;
+        let expected = app
+            .path()
+            .app_data_dir()
+            .map(|d| settings::load(&d).speaker_model)
+            .unwrap_or_default();
+        let library_model = vp.embedding_model.clone();
+        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+            Ok(mut embedder) => {
+                match feedback::reinforce_person(
+                    &dir,
+                    &note.segments,
+                    &feedback::SegFilter::Seqs(seqs.clone()),
+                    &resolved,
+                    &vp_store,
+                    &library_model,
+                    &expected,
+                    &mut embedder,
+                    &now,
+                    Some(&op_id),
+                ) {
+                    Ok(feedback::ReinforceResult::Applied { .. }) => None,
+                    Ok(other) => Some(format!("{other:?}")),
+                    Err(e) => Some(format!("回灌失败: {e}")),
+                }
+            }
+            Err(e) => Some(format!("嵌入器不可用: {e}")),
+        }
+    };
+    set_stage(&dir, &op_id, "reinforced", skipped);
+
+    // ④ 状态落盘 + done。
+    refine::identify::mark_transition(&mut idoc, fingerprint, &["suggested"], "auto_applied", &now)?;
+    refine::identify::save_identify(&dir, &idoc)?;
+    set_stage(&dir, &op_id, "done", None);
+    eprintln!("identify({note_id}): 已自动认出 {speaker} = {name}(op {op_id})");
+    Ok(())
+}
+
+/// P2b 崩溃恢复:未完成 op 前滚(pending 且未见关联=放弃;assigned 起=补回灌/补状态)。
+/// 在自动应用循环前、IDENTIFY_ACT_GATE 内由调用方间接串行(本函数自取锁)。
+fn recover_identify_ops(app: &AppHandle, note_id: &str) {
+    let run = || -> anyhow::Result<()> {
+        let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+        let root = notes_dir(app)?;
+        let dir = root.join(note_id);
+        let mut ops = refine::identify::load_ops(&dir);
+        let pending: Vec<String> = ops
+            .ops
+            .iter()
+            .filter(|o| {
+                (o.stage != "done" && o.undo_stage.is_none())
+                    || matches!(o.undo_stage.as_deref(), Some("undo_pending") | Some("link_cleared"))
+            })
+            .map(|o| o.op_id.clone())
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let doc = store::load_refined(&dir).ok_or_else(|| anyhow::anyhow!("精修稿缺失"))?;
+        let mut idoc = refine::identify::load_identify(&dir)
+            .ok_or_else(|| anyhow::anyhow!("identify.json 缺失"))?;
+        for op_id in pending {
+            let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) else { continue };
+            // 撤销中途崩溃的恢复:undo_pending=实质动作未发生,回退到可撤状态;
+            // link_cleared=关联已清,前滚完成质心还原与拒绝键(与撤销命令 ②③ 同)。
+            match op.undo_stage.as_deref() {
+                Some("undo_pending") => {
+                    op.undo_stage = None;
+                    continue;
+                }
+                Some("link_cleared") => {
+                    let seqs: std::collections::BTreeSet<u64> =
+                        op.seqs.iter().copied().collect();
+                    if op.reinforce_skipped.is_none() {
+                        if let Ok(vp_store) = open_voiceprint_store(app) {
+                            match feedback::undo_reinforce_op(
+                                &dir,
+                                &seqs,
+                                &op.target_person,
+                                &op.op_id,
+                                &vp_store,
+                            ) {
+                                Ok(feedback::UndoOutcome::Restored) => {}
+                                Ok(feedback::UndoOutcome::NoEntry) => {
+                                    op.non_revertible
+                                        .get_or_insert("ledger-lost(账本缺失,污染未回滚)".into());
+                                }
+                                Ok(feedback::UndoOutcome::NotRevertible(r)) => {
+                                    op.non_revertible.get_or_insert(r.into());
+                                }
+                                Err(e) => {
+                                    op.non_revertible.get_or_insert(format!("restore-error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    if refine::identify::mark_rejected(&mut idoc, &op.fingerprint, &op.created_at)
+                        .is_err()
+                    {
+                        // 条目已被新一轮吞掉:拒绝键直接落(同目标不再建议)。
+                        idoc.rejected.insert(
+                            refine::identify::rejected_key(&op.fingerprint, &op.target_person),
+                            op.created_at.clone(),
+                        );
+                    }
+                    op.undo_stage = Some("undone".into());
+                    continue;
+                }
+                _ => {}
+            }
+            let seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
+            let linked_to_target = refine::identify::cluster_members_from_doc(&doc)
+                .iter()
+                .find(|(_, sq)| **sq == seqs)
+                .map(|(sp, _)| {
+                    doc.paragraphs
+                        .iter()
+                        .filter(|p| &p.speaker == sp)
+                        .all(|p| p.person_id.as_deref() == Some(op.target_person.as_str()))
+                })
+                .unwrap_or(false);
+            if op.stage == "pending" && !linked_to_target {
+                // assign 未发生:放弃,建议卡还在,无痕。
+                op.stage = "aborted".into();
+                op.undo_stage = Some("undone".into());
+                continue;
+            }
+            // assigned/reinforced(或 pending 但已见关联):前滚补状态;回灌交给
+            // 幂等账本(同 scope 已有条目则 reinforce 已发生;缺则标 skipped——
+            // 崩溃点在回灌中途时宁可少灌,绝不重复加权)。
+            if op.stage == "pending" || op.stage == "assigned" {
+                op.reinforce_skipped
+                    .get_or_insert("crash-before-reinforce(未回灌,宁缺勿重)".into());
+                op.stage = "reinforced".into();
+            }
+            if refine::identify::mark_transition(
+                &mut idoc,
+                &op.fingerprint,
+                &["suggested"],
+                "auto_applied",
+                &op.created_at,
+            )
+            .is_err()
+                && !idoc.assignments.iter().any(|a| a.fingerprint == op.fingerprint)
+            {
+                // 条目已被新一轮吞掉:按 op 记录合成回执条目,撤销入口不丢。
+                idoc.assignments.push(refine::identify::IdentifyAssignment {
+                    fingerprint: op.fingerprint.clone(),
+                    cluster: op.cluster.clone(),
+                    person_id: Some(op.target_person.clone()),
+                    new_name: None,
+                    tier: refine::identify::Tier::High,
+                    llm_confidence: "high".into(),
+                    acoustic: None,
+                    acoustic_z: None,
+                    evidence: vec![],
+                    status: "auto_applied".into(),
+                    decided_at: Some(op.created_at.clone()),
+                });
+            }
+            op.stage = "done".into();
+        }
+        refine::identify::save_identify(&dir, &idoc)?;
+        refine::identify::save_ops(&dir, &ops)?;
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("identify({note_id}): op 恢复失败(忽略): {e}");
+    }
+}
 
 /// 收件箱身份建议列表:扫各笔记 identify.json,只收 status=suggested 且「新鲜」
 /// (source_hash 与现稿一致、指纹仍对应某簇、该簇当前无关联、目标人仍在库)。
@@ -3503,12 +4089,206 @@ fn list_identify_suggestions(app: AppHandle) -> Result<Vec<ipc::IdentifySuggesti
                 quote: ev.map(|e| e.quote.clone()).unwrap_or_default(),
                 evidence_type: ev.map(|e| e.r#type.clone()).unwrap_or_default(),
                 generated_at: idoc.generated_at.clone(),
+                status: "suggested".into(),
+                op_id: None,
+                revertible: true,
             });
         }
     }
     out.sort_by(|a, b| b.generated_at.cmp(&a.generated_at));
     out.truncate(50);
-    Ok(out)
+
+    // P2b 自动回执:渲染自意向日志(永续可见,不受新鲜度与 50 条上限约束——
+    // 撤销入口不能因稿变化/淘汰而消失);revertible=簇仍可按指纹定位且关联仍是
+    // 自动目标(否则冲突态只留「好」)。
+    let mut receipts: Vec<ipc::IdentifySuggestion> = Vec::new();
+    for n in store::NoteStore::new(root.clone()).list() {
+        let dir = root.join(&n.id);
+        let ops = refine::identify::load_ops(&dir);
+        let pending: Vec<_> = ops
+            .ops
+            .iter()
+            .filter(|o| o.stage == "done" && !o.acknowledged && o.undo_stage.is_none())
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        let doc = store::load_refined(&dir);
+        for op in pending {
+            let revertible = doc
+                .as_ref()
+                .map(|d| {
+                    let seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
+                    refine::identify::cluster_members_from_doc(d)
+                        .iter()
+                        .find(|(_, sq)| **sq == seqs)
+                        .map(|(sp, _)| {
+                            d.paragraphs
+                                .iter()
+                                .filter(|p| &p.speaker == sp)
+                                .all(|p| p.person_id.as_deref() == Some(op.target_person.as_str()))
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let name = store::VoiceprintStore::resolve(&vp, &op.target_person)
+                .and_then(|rid| vp.people.get(rid))
+                .map(|p| p.name.clone())
+                .filter(|nm| !nm.trim().is_empty())
+                .unwrap_or_else(|| op.target_name.clone());
+            receipts.push(ipc::IdentifySuggestion {
+                note_id: n.id.clone(),
+                note_title: n.title.clone(),
+                cluster: op.cluster.clone(),
+                fingerprint: op.fingerprint.clone(),
+                person_id: Some(op.target_person.clone()),
+                person_name: name,
+                is_new: false,
+                tier: "high".into(),
+                quote: op.quote.clone(),
+                evidence_type: if op.quote_type.is_empty() { "self_intro".into() } else { op.quote_type.clone() },
+                generated_at: op.created_at.clone(),
+                status: "auto_applied".into(),
+                op_id: Some(op.op_id.clone()),
+                revertible,
+            });
+        }
+    }
+    receipts.sort_by(|a, b| b.generated_at.cmp(&a.generated_at));
+    receipts.extend(out);
+    Ok(receipts)
+}
+
+/// P2b 回执「好」:确认自动认人(回执消失);identify.json 状态 auto_applied→applied
+/// best-effort(稿重生成后条目可能不在,确认动作以 op 记录为准)。
+#[tauri::command]
+fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Result<(), String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+    let mut ops = refine::identify::load_ops(&dir);
+    let op = ops
+        .ops
+        .iter_mut()
+        .find(|o| o.op_id == op_id && o.stage == "done" && o.undo_stage.is_none())
+        .ok_or_else(|| tr!("回执不存在或已处理", "Receipt missing or already handled"))?;
+    op.acknowledged = true;
+    let fp = op.fingerprint.clone();
+    refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
+    if let Some(mut idoc) = refine::identify::load_identify(&dir) {
+        let now = chrono::Local::now().to_rfc3339();
+        if refine::identify::mark_transition(&mut idoc, &fp, &["auto_applied"], "applied", &now).is_ok() {
+            let _ = refine::identify::save_identify(&dir, &idoc);
+        }
+    }
+    Ok(())
+}
+
+/// P2b 回执「撤销」:CAS 解除关联 + 按 op 对账还原质心 + 拒绝键。返回质心是否
+/// 还原(false=已被后续写动过,关联已解除但声纹保留,前端如实提示)。
+#[tauri::command]
+async fn undo_identify_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    note_id: String,
+    op_id: String,
+) -> Result<bool, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
+    }
+    reject_if_active(&state, &note_id)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+        let root = notes_dir(&app2).map_err(|e| e.to_string())?;
+        let dir = root.join(&note_id);
+        let mut ops = refine::identify::load_ops(&dir);
+        let idx = ops
+            .ops
+            .iter()
+            .position(|o| o.op_id == op_id && o.stage == "done" && !o.acknowledged)
+            .ok_or_else(|| tr!("回执不存在或已处理", "Receipt missing or already handled"))?;
+        let (seqs, target, fp, reinforced) = {
+            let op = &mut ops.ops[idx];
+            if op.undo_stage.as_deref() == Some("undone") {
+                return Ok(op.non_revertible.is_none()); // 幂等重入
+            }
+            op.undo_stage = Some("undo_pending".into());
+            (
+                op.seqs.iter().copied().collect::<std::collections::BTreeSet<u64>>(),
+                op.target_person.clone(),
+                op.fingerprint.clone(),
+                op.reinforce_skipped.is_none(),
+            )
+        };
+        refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
+
+        // ① 定位当前簇并 CAS 解除关联(用户已手改则拒绝并回退 undo 状态)。
+        let doc = store::load_refined(&dir)
+            .ok_or_else(|| tr!("精修稿缺失", "Refined doc missing"))?;
+        let speaker = refine::identify::cluster_members_from_doc(&doc)
+            .iter()
+            .find(|(_, sq)| **sq == seqs)
+            .map(|(sp, _)| sp.clone());
+        let Some(speaker) = speaker else {
+            ops.ops[idx].undo_stage = None;
+            ops.ops[idx].non_revertible = Some("clusters-changed".into());
+            let _ = refine::identify::save_ops(&dir, &ops);
+            return Err(tr!(
+                "说话人分组已变化,无法自动撤销(可手动改指认)",
+                "Speaker clusters changed; cannot auto-undo (reassign manually)"
+            ));
+        };
+        if let Err(e) = store::unassign_refined_person_if(&dir, &speaker, &target) {
+            ops.ops[idx].undo_stage = None;
+            let _ = refine::identify::save_ops(&dir, &ops);
+            return Err(e.to_string());
+        }
+        ops.ops[idx].undo_stage = Some("link_cleared".into());
+        refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
+
+        // ② 质心还原(按 op 对账;不可还原如实记录,绝不错撤后续人工作业)。
+        // FEEDBACK_GATE:与人工回灌对同一账本/人物快照的读改写互斥
+        // (锁序恒 IDENTIFY_ACT_GATE → FEEDBACK_GATE)。
+        let vp_store = open_voiceprint_store(&app2)?;
+        let restored = {
+            let _fb = FEEDBACK_GATE.lock().unwrap();
+            match feedback::undo_reinforce_op(&dir, &seqs, &target, &op_id, &vp_store) {
+                Ok(feedback::UndoOutcome::Restored) => true,
+                Ok(feedback::UndoOutcome::NoEntry) if !reinforced => true, // 未曾回灌=无污染
+                Ok(feedback::UndoOutcome::NoEntry) => {
+                    // op 声称回灌过而账本无条:账丢了,污染无法回滚,如实报。
+                    ops.ops[idx].non_revertible = Some("ledger-lost".into());
+                    false
+                }
+                Ok(feedback::UndoOutcome::NotRevertible(reason)) => {
+                    ops.ops[idx].non_revertible = Some(reason.into());
+                    false
+                }
+                Err(e) => {
+                    ops.ops[idx].non_revertible = Some(format!("restore-error: {e}"));
+                    false
+                }
+            }
+        };
+
+        // ③ 状态与拒绝键(同目标不再建议)+ undone。
+        if let Some(mut idoc) = refine::identify::load_identify(&dir) {
+            let now = chrono::Local::now().to_rfc3339();
+            if refine::identify::mark_rejected(&mut idoc, &fp, &now).is_err() {
+                // 条目已被新一轮吞掉:拒绝键直接落,同目标不再建议。
+                idoc.rejected
+                    .insert(refine::identify::rejected_key(&fp, &target), now.clone());
+            }
+            let _ = refine::identify::save_identify(&dir, &idoc);
+        }
+        ops.ops[idx].undo_stage = Some("undone".into());
+        refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
+        Ok(restored)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 确认身份建议:锁外走 do_assign_refined_person(内部自取 NoteLock,不嵌套);
@@ -3560,6 +4340,29 @@ async fn apply_identify_suggestion(
                 let _ = vp_store.delete_person_if_empty(&target);
             }
             return Err(e);
+        }
+        // P3:参会人邮箱记录——三重唯一性防线(目标人名与某参会人名精确相等、
+        // 该名在参会人中唯一、该名在库中唯一)防同名污染;残余风险=确认本身指错。
+        if let Ok(note) = store::NoteStore::new(notes_dir(&app2).map_err(|e| e.to_string())?).load(&note_id) {
+            if let Some(cal) = &note.meta.calendar {
+                let vp_now = vp_store.load();
+                if let Some(target_name) =
+                    store::VoiceprintStore::resolve(&vp_now, &target).and_then(|rid| vp_now.people.get(rid)).map(|p| p.name.clone())
+                {
+                    let hits: Vec<_> = cal
+                        .attendees
+                        .iter()
+                        .filter(|a| !a.email.is_empty() && a.name == target_name)
+                        .collect();
+                    let library_unique =
+                        vp_now.people.values().filter(|p| p.name == target_name).count() == 1;
+                    if hits.len() == 1 && library_unique && !target_name.trim().is_empty() {
+                        if let Err(e) = vp_store.add_person_email(&target, &hits[0].email) {
+                            eprintln!("calendar: 记录参会人邮箱失败(忽略): {e}");
+                        }
+                    }
+                }
+            }
         }
         refine::identify::mark_applied(&mut idoc, &fingerprint, &now).map_err(|e| e.to_string())?;
         refine::identify::save_identify(&dir, &idoc).map_err(|e| e.to_string())?;
@@ -5761,9 +6564,16 @@ pub fn run() {
             get_note,
             refine_note,
             identify_note,
+            calendar_permission,
+            request_calendar_permission,
+            list_calendar_candidates,
+            set_note_calendar_event,
+            backfill_calendar_matches,
             list_identify_suggestions,
             apply_identify_suggestion,
             reject_identify_suggestion,
+            acknowledge_identify,
+            undo_identify_apply,
             get_refined,
             retranscribe_note,
             retranscribe_status,

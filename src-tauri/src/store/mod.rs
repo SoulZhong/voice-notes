@@ -20,7 +20,7 @@ pub use notes::NoteStore;
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::load_refined_for_display; // 纯展示面(笔记页/导出)专用:额外套跨轨时基投影,绝不可用于任何会写回的路径。
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
-pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
+pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker, unassign_refined_person_if}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
 pub use refined::{save_refined_paragraphs, ParagraphPayload}; // 笔记页 WYSIWYG 整篇保存(lib.rs 命令层消费)。
 pub use refined::{
     load_refined, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
@@ -57,6 +57,39 @@ pub struct NoteMeta {
     pub ended_at: Option<String>,
     /// "recording" | "complete"
     pub state: String,
+    /// 匹配到的日历事件快照(P3):serde default 兼容旧 meta;未匹配省略键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarSnapshot>,
+    /// 用户明确清除过日历关联的 tombstone:自动匹配/backfill 永不再绑,
+    /// 手动改选会复位。没有它,「清除」在下一次 backfill 就被推翻。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub calendar_cleared: bool,
+}
+
+/// 日历事件快照(P3):落盘即快照——title/attendees 是匹配时刻的副本,不依赖
+/// event_id 活性(事件被改/删后快照仍自洽);event_id 仅供改选时重新定位。
+/// 字段固定序列化(不 skip):前端 TS 类型全必填,空参会人也写空数组。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarSnapshot {
+    pub event_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub attendees: Vec<CalendarAttendee>,
+    pub matched_at: String,
+    /// "auto"(停止后/backfill 自动匹配)| "manual"(用户改选)。
+    #[serde(default)]
+    pub match_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarAttendee {
+    #[serde(default)]
+    pub name: String,
+    /// 已规范化(trim+小写,mailto 剥离+percent-decode);无邮箱为空串。
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub is_me: bool,
 }
 
 /// 一条定稿段，存 segments.jsonl（每段一行）。speaker 为 P4 说话人区分预留。

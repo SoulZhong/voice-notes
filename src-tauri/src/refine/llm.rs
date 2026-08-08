@@ -1142,6 +1142,7 @@ mod tests {
                 name: "张伟".into(),
             }],
             sampled: vec![],
+            calendar: None,
         };
         let (assignments, skipped) = exec.infer(&ctx, None).unwrap();
         assert_eq!(assignments.len(), 1);

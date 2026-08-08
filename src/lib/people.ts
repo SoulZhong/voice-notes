@@ -105,6 +105,12 @@ export type IdentifySuggestion = {
   quote: string;
   evidence_type: string;
   generated_at: string;
+  /** "suggested"(建议卡)| "auto_applied"(P2b 自动回执卡)。 */
+  status: string;
+  /** 自动回执的操作 id(确认/撤销按它对账);建议卡为 null。 */
+  op_id: string | null;
+  /** 自动回执是否可撤销;false=冲突态(簇已变/被手改)只留「好」。 */
+  revertible: boolean;
 };
 export const listIdentifySuggestions = () =>
   invoke<IdentifySuggestion[]>("list_identify_suggestions");
@@ -112,3 +118,10 @@ export const applyIdentifySuggestion = (noteId: string, fingerprint: string) =>
   invoke<void>("apply_identify_suggestion", { noteId, fingerprint });
 export const rejectIdentifySuggestion = (noteId: string, fingerprint: string) =>
   invoke<void>("reject_identify_suggestion", { noteId, fingerprint });
+/** P2b 回执「好」:确认自动认人。 */
+export const acknowledgeIdentify = (noteId: string, opId: string) =>
+  invoke<void>("acknowledge_identify", { noteId, opId });
+/** P2b 回执「撤销」:CAS 解除关联+还原质心;返回质心是否还原(false=已被后续
+    数据覆盖,关联已解除但声纹保留)。 */
+export const undoIdentifyApply = (noteId: string, opId: string) =>
+  invoke<boolean>("undo_identify_apply", { noteId, opId });

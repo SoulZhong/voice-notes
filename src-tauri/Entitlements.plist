@@ -7,5 +7,8 @@
   <!-- 硬化运行时下访问麦克风必须带此权利,否则采集拿到全零静音(录音无声、无转录)。 -->
   <key>com.apple.security.device.audio-input</key>
   <true/>
+  <!-- P3 日历匹配:读取日程做会议关联与说话人先验。 -->
+  <key>com.apple.security.personal-information.calendars</key>
+  <true/>
 </dict>
 </plist>

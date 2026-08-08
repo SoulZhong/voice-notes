@@ -846,6 +846,32 @@ pub fn assign_refined_person(
     })
 }
 
+/// 撤销自动身份关联(P2b):CAS——仅当该 speaker 的现有关联仍等于 expect_person
+/// 才清空 person_id/name;已被用户改成别人则拒绝(绝不覆盖最新人工结果)。
+/// 自动应用前置已验证簇原本无关联、无手填名,清空即恢复原状。
+pub fn unassign_refined_person_if(
+    note_dir: &Path,
+    speaker_id: &str,
+    expect_person: &str,
+) -> anyhow::Result<()> {
+    update_refined(note_dir, |doc| {
+        let mut hit = false;
+        for p in doc.paragraphs.iter().filter(|p| p.speaker == speaker_id) {
+            hit = true;
+            anyhow::ensure!(
+                p.person_id.as_deref() == Some(expect_person),
+                "当前关联已被修改,拒绝撤销覆盖"
+            );
+        }
+        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
+        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == speaker_id) {
+            p.person_id = None;
+            p.name = None;
+        }
+        Ok(())
+    })
+}
+
 /// Agent Aing 写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
 /// 约束式写入——只能改文本,说话人/时间戳/段落数一概不可动,这是把「外部 Agent 可写」
 /// 的面收到最小的关键:哪怕 Agent 行为失常,最坏也只是文本变差,结构不会被破坏。
@@ -1790,4 +1816,47 @@ mod tests {
 
         assert_eq!(load_refined(&note).unwrap().revision, on_disk_revision);
     }
+    #[test]
+    fn unassign_refined_person_if_is_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = RefinedDoc {
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "done".into(),
+                recluster: "done".into(),
+                llm: "off".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![RefinedParagraph {
+                speaker: "R1".into(),
+                name: None,
+                person_id: None,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "你好".into(),
+                source_seqs: vec![0],
+                mentions: vec![],
+            }],
+        };
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        assign_refined_person(dir.path(), "R1", "P1", "张伟").unwrap();
+        // 期望不符(已被"改成"别人)→ 拒绝。
+        assert!(unassign_refined_person_if(dir.path(), "R1", "P9").is_err());
+        // 期望相符 → 清空。
+        unassign_refined_person_if(dir.path(), "R1", "P1").unwrap();
+        let after = load_refined(dir.path()).unwrap();
+        let p = after.paragraphs.iter().find(|p| p.speaker == "R1").unwrap();
+        assert!(p.person_id.is_none() && p.name.is_none());
+    }
+
 }

@@ -12,6 +12,21 @@ export type NoteSummary = {
   state: NoteState;
 };
 
+export type CalendarAttendee = {
+  name: string;
+  email: string;
+  is_me: boolean;
+};
+
+/** 日历事件快照(P3):落盘即快照,不依赖 event_id 活性。 */
+export type CalendarSnapshot = {
+  event_id: string;
+  title: string;
+  attendees: CalendarAttendee[];
+  matched_at: string;
+  match_kind: string; // "auto" | "manual"
+};
+
 export type NoteMeta = {
   schema_version: number;
   id: string;
@@ -19,6 +34,8 @@ export type NoteMeta = {
   started_at: string;
   ended_at: string | null;
   state: string;
+  calendar?: CalendarSnapshot | null;
+  calendar_cleared?: boolean;
 };
 
 export type SegmentRecord = {
@@ -215,6 +232,24 @@ export interface RelatedNote {
   shared_entities: number;
 }
 export const noteRelated = (id: string) => invoke<RelatedNote[]>("note_related", { id });
+
+/** P3 日历改选候选(按重叠降序;零重叠也列出,覆盖延迟开录)。 */
+export type CalendarCandidate = {
+  event_id: string;
+  title: string;
+  start_ms: number;
+  end_ms: number;
+  attendee_n: number;
+  overlap_ms: number;
+};
+export const listCalendarCandidates = (id: string) =>
+  invoke<CalendarCandidate[]>("list_calendar_candidates", { id });
+/** 改选(eventId)或清除(null,立 tombstone:自动匹配不再复活)。 */
+export const setNoteCalendarEvent = (id: string, eventId: string | null) =>
+  invoke<void>("set_note_calendar_event", { id, eventId });
+export const noteCalendarPermission = () => invoke<string>("calendar_permission");
+/** 手动触发/重试说话人身份推断(P2a):完成后 identify_done 事件驱动收件箱刷新。 */
+export const identifyNote = (id: string) => invoke<void>("identify_note", { id });
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */

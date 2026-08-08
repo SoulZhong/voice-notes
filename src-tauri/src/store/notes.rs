@@ -220,6 +220,26 @@ impl NoteStore {
         write_meta_atomic(&dir, &meta)
     }
 
+    /// 日历字段的唯一写入口(P3):与 rename 同一锁纪律(EDIT_LOCK + 笔记 flock)
+    /// 内读-改-写。f 在持锁状态下拿到最新 meta——自动匹配路径必须在这里复查
+    /// 「仍无快照且未被清除」,查询期间用户手动改选/清除则放弃;f 返回 false
+    /// 表示不写盘。返回是否落盘(backfill 计数用)。
+    pub fn update_calendar(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut NoteMeta) -> bool,
+    ) -> anyhow::Result<bool> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut meta = read_meta(&dir).unwrap_or_else(|| fallback_meta(&dir));
+        if !f(&mut meta) {
+            return Ok(false);
+        }
+        write_meta_atomic(&dir, &meta)?;
+        Ok(true)
+    }
+
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
@@ -489,6 +509,8 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
         started_at: String::new(),
         ended_at: None,
         state: "complete".into(),
+        calendar: None,
+        calendar_cleared: false,
     }
 }
 
@@ -1135,4 +1157,85 @@ mod tests {
         assert_eq!(store.title("n1").as_deref(), Some("周会"));
         assert_eq!(store.title("nope"), None, "不存在的笔记 → None");
     }
+    #[test]
+    fn calendar_snapshot_roundtrip_and_legacy_compat() {
+        // 旧 meta(无 calendar 键)→ None/false;带快照往返保真。
+        let legacy = r#"{"schema_version":1,"id":"n","title":"t","started_at":"","ended_at":null,"state":"complete"}"#;
+        let m: NoteMeta = serde_json::from_str(legacy).unwrap();
+        assert!(m.calendar.is_none());
+        assert!(!m.calendar_cleared);
+
+        let mut m2 = m.clone();
+        m2.calendar = Some(crate::store::CalendarSnapshot {
+            event_id: "ev1".into(),
+            title: "周会".into(),
+            attendees: vec![crate::store::CalendarAttendee {
+                name: "张伟".into(),
+                email: "zw@x.com".into(),
+                is_me: false,
+            }],
+            matched_at: "2026-08-08T10:00:00+08:00".into(),
+            match_kind: "auto".into(),
+        });
+        let json = serde_json::to_string(&m2).unwrap();
+        assert!(json.contains("\"attendees\""), "attendees 固定序列化");
+        let back: NoteMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m2);
+    }
+
+    #[test]
+    fn update_calendar_conditional_write_under_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("n1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = NoteMeta {
+            schema_version: SCHEMA_VERSION,
+            id: "n1".into(),
+            title: "t".into(),
+            started_at: "2026-08-08T09:00:00+08:00".into(),
+            ended_at: Some("2026-08-08T10:00:00+08:00".into()),
+            state: "complete".into(),
+            calendar: None,
+            calendar_cleared: false,
+        };
+        write_meta_atomic(&dir, &meta).unwrap();
+
+        // f 返回 false → 不写。
+        assert!(!store.update_calendar("n1", |_| false).unwrap());
+        // 条件写:仍为空才绑(自动匹配语义)。
+        assert!(store
+            .update_calendar("n1", |m| {
+                if m.calendar.is_some() || m.calendar_cleared {
+                    return false;
+                }
+                m.calendar = Some(crate::store::CalendarSnapshot {
+                    event_id: "ev".into(),
+                    title: "会".into(),
+                    attendees: vec![],
+                    matched_at: "t".into(),
+                    match_kind: "auto".into(),
+                });
+                true
+            })
+            .unwrap());
+        // 清除 tombstone 后,同一自动写回调返回 false。
+        assert!(store
+            .update_calendar("n1", |m| {
+                m.calendar = None;
+                m.calendar_cleared = true;
+                true
+            })
+            .unwrap());
+        assert!(!store
+            .update_calendar("n1", |m| {
+                if m.calendar.is_some() || m.calendar_cleared {
+                    return false;
+                }
+                true
+            })
+            .unwrap());
+        assert!(!dir.join("meta.json.tmp").exists(), "无 tmp 残留");
+    }
+
 }

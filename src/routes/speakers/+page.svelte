@@ -3,12 +3,14 @@
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     acknowledgeMerge,
+    acknowledgeIdentify,
     applyIdentifySuggestion,
     deletePerson,
     listPeople,
     mergePerson,
     personNotes,
     rejectIdentifySuggestion,
+    undoIdentifyApply,
     renamePerson,
     restoreMergedPerson,
     undoMerge,
@@ -58,8 +60,16 @@
   );
   const queue = $derived(queueParts.pending);
   const archived = $derived(queueParts.archived);
-  const pendingN = $derived(queue.filter((i) => i.kind !== "receipt").length);
-  const receiptsN = $derived(queue.filter((i) => i.kind === "receipt").length);
+  const pendingN = $derived(
+    queue.filter(
+      (i) => i.kind !== "receipt" && !(i.kind === "identify" && i.suggestion.status === "auto_applied"),
+    ).length,
+  );
+  const receiptsN = $derived(
+    queue.filter(
+      (i) => i.kind === "receipt" || (i.kind === "identify" && i.suggestion.status === "auto_applied"),
+    ).length,
+  );
   const nosampleN = $derived(queue.filter((i) => i.kind === "nosample").length);
   /** 一键清理控件只挂在第一张无样本卡:共享确认态若逐卡渲染,会同屏出现多组
       重复的破坏性确认按钮。 */
@@ -237,6 +247,32 @@
     if (ty === "third_person_exclusion") return t("speakers.identifyEvExclusion");
     return t("speakers.identifyEvTopic");
   }
+  /** P2b 自动回执「好」:确认自动认人。 */
+  async function doAckIdentify(s: IdentifySuggestion) {
+    if (!s.op_id) return;
+    const opId = s.op_id;
+    await act(
+      async () => {
+        await acknowledgeIdentify(s.note_id, opId);
+      },
+      () => tidy.removeIdentify(s.note_id, s.fingerprint),
+      `i:${s.note_id}:${opId}`,
+    );
+  }
+  /** P2b 自动回执「撤销」:解除关联+还原质心;质心未还原时横幅如实提示。 */
+  async function doUndoIdentify(s: IdentifySuggestion) {
+    if (!s.op_id) return;
+    const opId = s.op_id;
+    await act(
+      async () => {
+        const restored = await undoIdentifyApply(s.note_id, opId);
+        if (!restored) error = t("speakers.identifyUndoPartial");
+      },
+      () => tidy.removeIdentify(s.note_id, s.fingerprint),
+      `i:${s.note_id}:${opId}`,
+    );
+  }
+
   /** 身份建议「就是 TA」:后端确认(关联+回灌+建档),成功即乐观收起。 */
   async function doApplyIdentify(s: IdentifySuggestion) {
     await act(
@@ -514,6 +550,26 @@
               {@render receiptCard(item.receipt)}
             {:else if item.kind === "identify"}
               {@const s = item.suggestion}
+              {#if s.status === "auto_applied"}
+                <section class="card">
+                  <div class="card-tag">{t("speakers.tagIdentifyAuto")}</div>
+                  <div class="card-title">{t("speakers.identifyAutoTitle", { cluster: s.cluster, name: s.person_name })}</div>
+                  <p class="hint">{t("speakers.identifyMeta", { title: s.note_title, cluster: s.cluster })}</p>
+                  {#if s.quote}
+                    <p class="hint">{t("speakers.identifyQuote", { quote: s.quote, kind: evidenceLabel(s.evidence_type) })}</p>
+                  {/if}
+                  {#if !s.revertible}
+                    <p class="hint">{t("speakers.identifyAutoConflict")}</p>
+                  {/if}
+                  <div class="acts">
+                    <button class="mini accent" disabled={busy} onclick={() => doAckIdentify(s)}>{t("speakers.ok")}</button>
+                    {#if s.revertible}
+                      <button class="mini" disabled={busy || live} onclick={() => doUndoIdentify(s)}>{t("speakers.undo")}</button>
+                    {/if}
+                  </div>
+                  {@render cardError(tidyItemKey(item))}
+                </section>
+              {:else}
               <section class="card">
                 <div class="card-tag">{t("speakers.tagIdentify")}</div>
                 <div class="card-title">
@@ -540,6 +596,7 @@
                 </div>
                 {@render cardError(tidyItemKey(item))}
               </section>
+              {/if}
             {:else if item.kind === "suggestion"}
               {@const s = item.suggestion}
               {@const skey = `${s.loser}>${s.winner}`}

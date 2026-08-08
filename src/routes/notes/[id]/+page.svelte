@@ -37,6 +37,11 @@
     type RelatedNote,
     saveRefined,
     type ParagraphPayload,
+    listCalendarCandidates,
+    setNoteCalendarEvent,
+    noteCalendarPermission,
+    identifyNote,
+    type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { t } from "$lib/i18n/index.svelte";
@@ -429,6 +434,56 @@
       return isNaN(d) ? null : Math.max(0, Math.floor(d));
     }
     return null;
+  }
+
+  // ── P3 日历行:权限态 + 改选候选下拉。动作成功后重拉 note(meta.calendar 已变)。
+  // 权限查询在组件初始化时发一次(本页无 onMount,顶层调用等价)。
+  let calPerm = $state("unavailable");
+  let calMenuOpen = $state(false);
+  let calCandidates = $state<CalendarCandidate[]>([]);
+  let calBusy = $state(false);
+  void noteCalendarPermission()
+    .then((p) => (calPerm = p))
+    .catch(() => {});
+  async function openCalMenu() {
+    if (calBusy) return;
+    calMenuOpen = !calMenuOpen;
+    if (!calMenuOpen) return;
+    try {
+      calCandidates = await listCalendarCandidates(id);
+    } catch {
+      calCandidates = [];
+    }
+  }
+  async function pickCalEvent(eventId: string | null) {
+    if (calBusy) return;
+    calBusy = true;
+    try {
+      await setNoteCalendarEvent(id, eventId);
+      await refresh();
+    } catch (e) {
+      error = `${e}`;
+    }
+    calMenuOpen = false;
+    calBusy = false;
+  }
+  // P2a 手动重推身份:后台跑,identify_done 事件会刷新收件箱;错误就地横幅。
+  let identifying = $state(false);
+  async function rerunIdentify() {
+    if (identifying) return;
+    identifying = true;
+    try {
+      await identifyNote(id);
+    } catch (e) {
+      error = `${e}`;
+    }
+    identifying = false;
+  }
+
+  function fmtCalTime(ms: number): string {
+    const d = new Date(ms);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   async function refresh() {
@@ -1115,12 +1170,47 @@
               <span class="state interrupted">{t("notes.state.interrupted")}</span>
             {/if}
           </p>
+          {#if calPerm !== "unavailable"}
+            <p class="meta cal-row">
+              {#if note.meta.calendar}
+                <span title={note.meta.calendar.attendees.map((a) => (a.is_me ? t("notes.calendar.me", { name: a.name }) : a.name)).join("、")}>
+                  📅 {note.meta.calendar.title}
+                  {#if note.meta.calendar.attendees.length > 0}
+                    · {t("notes.calendar.attendeeN", { n: note.meta.calendar.attendees.length })}
+                  {/if}
+                </span>
+                <button class="mini plain" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.reselect")}</button>
+                <button class="mini plain" disabled={calBusy} onclick={() => void pickCalEvent(null)}>{t("notes.calendar.clear")}</button>
+              {:else if calPerm === "full"}
+                <button class="mini plain" disabled={calBusy} onclick={() => void openCalMenu()}>{t("notes.calendar.link")}</button>
+              {:else}
+                <span class="cal-hint">{t("notes.calendar.needAuth")}</span>
+              {/if}
+            </p>
+            {#if calMenuOpen}
+              <div class="cal-menu">
+                {#if calCandidates.length === 0}
+                  <p class="hint">{t("notes.calendar.noCandidates")}</p>
+                {:else}
+                  {#each calCandidates as c (c.event_id)}
+                    <button class="cal-item" disabled={calBusy} onclick={() => void pickCalEvent(c.event_id)}>
+                      <span class="cal-title">{c.title}</span>
+                      <span class="cal-time">{fmtCalTime(c.start_ms)}–{fmtCalTime(c.end_ms)}{#if c.overlap_ms > 0} · {t("notes.calendar.overlapMin", { n: Math.round(c.overlap_ms / 60000) })}{/if}</span>
+                    </button>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
+          {/if}
         </div>
 
         <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态。
              只留 MD(冒烟反馈:TXT 用不上,按钮撤了);txt 渲染能力在导出层与
              CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
+          <button class="act-btn" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+            {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
+          </button>
           <button class="act-btn" onclick={() => doExport("md")}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
@@ -2099,5 +2189,60 @@
     color: var(--ink-faint);
     font-size: 0.78rem;
     flex: none;
+  }
+
+  /* ── P3 日历行 ── */
+  .cal-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .cal-row .mini {
+    border: none;
+    background: none;
+    color: var(--accent, #4a7dff);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0 2px;
+  }
+  .cal-row .mini:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .cal-hint {
+    opacity: 0.6;
+    font-size: 12px;
+  }
+  .cal-menu {
+    margin: 4px 0 0;
+    padding: 6px;
+    border: 1px solid var(--border, #3333);
+    border-radius: 8px;
+    max-width: 420px;
+    max-height: 220px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .cal-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 5px 8px;
+    border: none;
+    background: none;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+  }
+  .cal-item:hover {
+    background: var(--hover, #8881);
+  }
+  .cal-item .cal-time {
+    opacity: 0.6;
+    white-space: nowrap;
   }
 </style>

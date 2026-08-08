@@ -22,6 +22,8 @@
     openModelsDir,
     testMirror,
     testCloudAsr,
+    calendarPermission,
+    requestCalendarPermission,
     type ModelsStatus,
     type Settings,
     type ModelDownloadEvent,
@@ -141,7 +143,12 @@
   let keepVol = $state(false);
   let langFilter = $state(false);
   let keepAudio = $state(false);
+  let calendarMatch = $state(true);
+  /** 日历授权态(unavailable = 非 macOS,整块隐藏)。 */
+  let calPerm = $state("unavailable");
+  let calRequesting = $state(false);
   let refineOn = $state(false);
+  let identifyAuto = $state(false);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
@@ -209,6 +216,22 @@
     }
   }
 
+  /** 说明卡「继续」:唯一拉起系统日历授权的入口(开关切换绝不直接弹窗)。
+      授权成功后后端顺带回填历史笔记;insufficient/denied 由文案引导去系统设置。 */
+  async function requestCalendarAuth() {
+    if (calRequesting) return;
+    calRequesting = true;
+    try {
+      await requestCalendarPermission();
+    } catch {
+      // 结果以重新查询的权限态为准,请求错误无需单独提示。
+    }
+    try {
+      calPerm = await calendarPermission();
+    } catch {}
+    calRequesting = false;
+  }
+
   /** 把后端真值同步到各本地镜像(初始化 / 保存失败回弹后重新对齐 DOM)。 */
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
@@ -217,7 +240,9 @@
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
     keepAudio = s.keep_audio;
+    calendarMatch = s.calendar_match_enabled;
     refineOn = s.refine_enabled;
+    identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
     asrMode = s.asr_mode === "cloud" ? "cloud" : "local";
@@ -293,6 +318,7 @@
 
   onMount(() => {
     refreshSettings();
+    calendarPermission().then((p) => (calPerm = p)).catch(() => {});
     refreshStatus();
     refreshDiskUsage();
     getVersion().then((v) => (appVersion = v)).catch(() => {});
@@ -821,6 +847,36 @@
           onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
         />
       </label>
+      {#if calPerm !== "unavailable"}
+        <label class="row">
+          <div class="row-info">
+            <span class="row-label">{t("settings.calendar.label")}</span>
+            <span class="row-desc">{t("settings.calendar.desc")}</span>
+          </div>
+          <input
+            type="checkbox"
+            class="ctl switch"
+            bind:checked={calendarMatch}
+            disabled={!settings}
+            onchange={() => saveSetting((s) => (s.calendar_match_enabled = calendarMatch))}
+          />
+        </label>
+        {#if calendarMatch && calPerm === "not_determined"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.calendar.cardTitle")}</span>
+              <span class="row-desc">{t("settings.calendar.cardBody")}</span>
+            </div>
+            <button class="ctl" disabled={calRequesting} onclick={() => void requestCalendarAuth()}>
+              {calRequesting ? t("settings.calendar.requesting") : t("settings.calendar.cardContinue")}
+            </button>
+          </div>
+        {:else if calendarMatch && calPerm === "denied"}
+          <div class="row"><div class="row-info"><span class="row-desc">{t("settings.calendar.denied")}</span></div></div>
+        {:else if calendarMatch && calPerm === "write_only"}
+          <div class="row"><div class="row-info"><span class="row-desc">{t("settings.calendar.insufficient")}</span></div></div>
+        {/if}
+      {/if}
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.asrMode.label")}</span>
@@ -1068,6 +1124,19 @@
           bind:checked={refineOn}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
+        />
+      </label>
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.identifyAuto.label")}</span>
+          <span class="row-desc">{t("settings.identifyAuto.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={identifyAuto}
+          disabled={!settings || !refineOn}
+          onchange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
         />
       </label>
     </div>
