@@ -117,6 +117,9 @@
   // 切笔记复位——对比场景本来就是当场切,不做持久化。
   let playbackScheme = $state<"dual" | "mixed">("dual");
   let mixedInfo = $state<MixedPlaybackInfo | null>(null);
+  /** A/B 切换的续播现场(codex P2):换方案会整体重装原生播放器(核心恒从 0/
+      paused 起),对比要的恰是同一时刻——切换前记下位置,onLoaded 回调里恢复。 */
+  let pendingResume = $state<{ ms: number; playing: boolean } | null>(null);
   let regenStage = $state<string | null>(null); // 非 null = 补生成进行中(值为阶段名)
   let regenErr = $state("");
 
@@ -568,9 +571,27 @@
   // 装载数组的二选一表达式因此永远拿不到失效的 mixed。
   $effect(() => {
     if (playbackScheme === "mixed" && (!mixedInfo?.track || mixedInfo.untrusted)) {
-      playbackScheme = "dual";
+      switchScheme("dual");
     }
   });
+
+  function switchScheme(s: "dual" | "mixed") {
+    if (s === playbackScheme) return;
+    pendingResume = { ms: playerMs, playing: playerPlaying };
+    playbackScheme = s;
+  }
+
+  /** AudioPlayer 每次装载完成回调:有待恢复现场就 seek 回同一时刻(越界即放弃,
+      如切到时长更短的轨);进页首次装载 pendingResume 为 null,自然 no-op。 */
+  function onPlayerLoaded() {
+    const r = pendingResume;
+    pendingResume = null;
+    if (!r || !player) return;
+    if (r.ms > 0 && r.ms < player.durationMs()) {
+      player.seek(r.ms);
+      if (r.playing) player.play();
+    }
+  }
 
   // 相关笔记:增值层,取失败静默按空。id 切换即重取。
   $effect(() => {
@@ -647,6 +668,7 @@
     retransEventSeen = false;
     mixedReason = null;
     playbackScheme = "dual";
+    pendingResume = null;
     mixedInfo = null;
     regenStage = null;
     regenErr = "";
@@ -1356,7 +1378,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -1364,7 +1386,7 @@
             <button
               class="link"
               class:active={playbackScheme === "dual"}
-              onclick={() => (playbackScheme = "dual")}>{t("notes.mix.dual")}</button
+              onclick={() => switchScheme("dual")}>{t("notes.mix.dual")}</button
             >
             {#if mixedInfo?.track}
               <button
@@ -1372,7 +1394,7 @@
                 class:active={playbackScheme === "mixed"}
                 disabled={mixedInfo.untrusted !== null}
                 title={mixedInfo.untrusted ?? t("notes.mix.title")}
-                onclick={() => (playbackScheme = "mixed")}>{t("notes.mix.mixed")}</button
+                onclick={() => switchScheme("mixed")}>{t("notes.mix.mixed")}</button
               >
             {:else}
               <button

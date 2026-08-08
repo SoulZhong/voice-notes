@@ -115,7 +115,8 @@ pub fn regen_mixed_to<W: Write + Seek>(
 ///   代价:此后任一步失败,旧 m4a 因 duration 读数被清而整轨隐身(track_info_for
 ///   对无读数的 m4a 判损坏跳过)——可重新生成恢复,不丢源轨数据。
 /// ② rename tmp→mixed.wav(原子;若有旧 wav 即原子替换)—— 失败:轨隐身,可再生。
-/// ③ 删旧 mixed.m4a —— 失败只警告:m4a 已无 duration 读数,不会被采信,只是死文件。
+/// ③ 删旧 mixed.m4a —— 失败按提交失败上报(codex 第二轮 P2:m4a 优先级会藏住新
+///   wav,macOS 后续转码还可能因"m4a 已存在"直接删新 wav);状态同样是轨隐身可再生。
 /// ④ 写新 MixInfo —— 失败:新 wav 无标记 → mixed_untrusted 保守拒,重新生成可修。
 /// ⑤ 波形 —— 失败只降级(前端退段落包络)。
 pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
@@ -202,9 +203,12 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
         })?;
     let stale_m4a = dir.join(format!("{MIXED_TRACK}.m4a"));
     if stale_m4a.is_file() {
-        if let Err(e) = std::fs::remove_file(&stale_m4a) {
-            eprintln!("补生成:旧 mixed.m4a 删除失败(读数已清,不会被采信,仅残留死文件): {e}");
-        }
+        // 删除失败必须按提交失败上报(codex 第二轮 P2):m4a 残留会让 track_info_for
+        // 因 m4a 优先而把新 wav 藏住,macOS 后续转码还可能看到"m4a 已存在"而直接
+        // 删掉新 wav;此刻状态 = 轨隐身、无标记,重新生成即可恢复,与其它失败模式一致。
+        std::fs::remove_file(&stale_m4a).map_err(|e| {
+            anyhow::anyhow!("旧 mixed.m4a 删除失败,提交中止(轨暂时隐身,可重新生成): {e}")
+        })?;
     }
     crate::store::audio::set_track_mix(
         dir,

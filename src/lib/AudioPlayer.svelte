@@ -15,12 +15,17 @@
     waveform = [],
     currentMs = $bindable(0),
     playing = $bindable(false),
+    onLoaded,
   }: {
     tracks: TrackInfo[];
     /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
     waveform?: number[];
     currentMs?: number;
     playing?: boolean;
+    /** 装载成功回调(可选):tracks 变化触发的每次 player_load resolve 后调用。
+        宿主用它在重装后恢复播放位置(A/B 切换保位置,codex P2)——原生核心
+        每次装载都从 0/paused 起,不回调宿主无从得知何时可以 seek。 */
+    onLoaded?: () => void;
   } = $props();
 
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -43,10 +48,15 @@
         ? null
         : invoke<number>("player_load", {
             tracks: tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source })),
-          }).catch((e) => {
-            reportError(t("notes.player.errLoad"), `${e}`);
-            throw e;
-          });
+          })
+            .then((total) => {
+              onLoaded?.();
+              return total;
+            })
+            .catch((e) => {
+              reportError(t("notes.player.errLoad"), `${e}`);
+              throw e;
+            });
     return () => {
       loadPromise = null;
       void invoke("player_stop").catch(() => {});

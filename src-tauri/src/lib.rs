@@ -2501,8 +2501,18 @@ fn spawn_mixed_regen(app: tauri::AppHandle, note_id: String) {
                     "The note is busy (recording or being edited); try again later"
                 ))?;
             store::mix_regen::regen_note_dir(&dir).map_err(|e| e.to_string())?;
-            // macOS 转码出 m4a + 实测 duration;非 macOS 队列 worker 空跑,无副作用。
-            transcode.enqueue(dir);
+            // 转码守卫(codex 第二轮 P1):transcode_note_dir 是目录粒度,会把目录里
+            // 所有 WAV——包括中断笔记仍在盘的源轨——清洗、有损转码并删除,违反补生成
+            // 「源轨只读」契约,还会转码启动扫描刻意排除的未完成笔记。只有源轨已是
+            // 转码形态(wav 不在盘)时才入队:此时目录里唯一的 WAV 就是新 mixed。
+            // 否则成品轨保持 WAV(多占些磁盘;时长读数走 mix.track_ms,波形已算)。
+            let sources_transcoded =
+                !dir.join("mic.wav").is_file() && !dir.join("system.wav").is_file();
+            if sources_transcoded {
+                transcode.enqueue(dir);
+            } else {
+                eprintln!("补生成:源轨仍是 WAV,跳过目录转码(避免整目录清洗/删源),mixed 保持 WAV");
+            }
             Ok(())
         }));
         match body {
@@ -6152,6 +6162,7 @@ fn migrate_guard(
     running: &Arc<Mutex<bool>>,
     download_running: &Arc<AtomicBool>,
     retranscribing: &Arc<Mutex<Option<(String, String)>>>,
+    mixed_regen: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
     // 先抢互斥位(与 start 的 download 检查对称)。
     if download_running.swap(true, Ordering::SeqCst) {
@@ -6169,6 +6180,16 @@ fn migrate_guard(
         return Err(tr!(
             "重转写进行中,完成后再迁移",
             "A re-transcription is in progress; please migrate after it finishes"
+        ));
+    }
+    // 补生成侧(codex 第二轮 P1):regen worker 从占槽到清槽全程 mmap 读源轨并写
+    // 笔记目录,迁移此刻搬根会把映射中的文件移走/删掉。与 do_regenerate_mixed 的
+    // download_running 复查互为镜像,写后读闭环同上方重转写侧。
+    if mixed_regen_busy(mixed_regen) {
+        download_running.store(false, Ordering::SeqCst);
+        return Err(tr!(
+            "正在补生成成品轨,完成后再迁移",
+            "Mixed-track regeneration is in progress; please migrate after it finishes"
         ));
     }
     Ok(())
@@ -6189,7 +6210,7 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
     let old_root = data_root(&app).map_err(|e| e.to_string())?;
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
     // 守卫二:抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing)?;
+    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
     let running = state.download_running.clone();
     let transcode = state.transcode.clone();
     std::thread::spawn(move || {
@@ -6259,7 +6280,7 @@ fn migrate_models_dir(app: AppHandle, state: State<AppState>, new_dir: String) -
     // 嵌套守卫同 data:目标与当前模型根互不包含。以上皆只读检查,失败无需复位。
     store::migrate::ensure_disjoint(&old_root, &new_path).map_err(|e| e.to_string())?;
     // 抢迁移/下载互斥位 + 录制守卫(先 swap download 再查 running,见 migrate_guard)。
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing)?;
+    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
     // 顶层条目文件名(read_dir 收集 String):不存在的旧根视作空(首次即自定义,无可搬)。
     let entries: Vec<String> = std::fs::read_dir(&old_root)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -6336,7 +6357,7 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 /// 可比对,这边是批量清理、无单一 note_id,故退化为「跳过 == session 槽笔记」的防御性比对。
 #[tauri::command]
 fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u32>) -> Result<u64, String> {
-    migrate_guard(&state.running, &state.download_running, &state.retranscribing)?;
+    migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
     let _reset = ResetOnDrop(state.download_running.clone());
     state.transcode.pause_and_wait();
     let _unpause = UnpauseOnDrop(state.transcode.clone());
@@ -7187,18 +7208,21 @@ mod tests {
         let running = Arc::new(Mutex::new(true));
         let dl = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt).is_err(), "录制中拒绝");
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "录制中拒绝");
         assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
         // download_running 已 true(下载/另一迁移在跑）→ 拒。
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(true));
         let rt = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt).is_err(), "下载/迁移进行中拒绝");
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "下载/迁移进行中拒绝");
         // 都空闲 → 过,并已抢下互斥位(swap 置 true)。
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(None));
-        assert!(migrate_guard(&running, &dl, &rt).is_ok(), "空闲放行");
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "空闲放行");
         assert!(dl.load(Ordering::SeqCst), "放行后互斥位已抢占");
     }
 
@@ -7213,11 +7237,29 @@ mod tests {
         let running = Arc::new(Mutex::new(false));
         let dl = Arc::new(AtomicBool::new(false));
         let rt = Arc::new(Mutex::new(Some(("n1".to_string(), "decode".to_string()))));
-        assert!(migrate_guard(&running, &dl, &rt).is_err(), "重转写占槽时迁移必拒");
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "重转写占槽时迁移必拒");
         assert!(!dl.load(Ordering::SeqCst), "拒绝后必须复位互斥位");
         // 槽清空后(worker 跑完)同一互斥位可以再次放行。
         *rt.lock().unwrap() = None;
-        assert!(migrate_guard(&running, &dl, &rt).is_ok(), "槽清空后迁移应放行");
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "槽清空后迁移应放行");
+    }
+
+    /// codex 第二轮 P1:补生成槽占用时迁移必拒(worker 正 mmap 读源轨/写笔记目录,
+    /// 搬根会移走映射中的文件),拒绝后互斥位必须复位。
+    #[test]
+    fn migrate_guard_rejects_while_mixed_regen() {
+        use super::migrate_guard;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let running = Arc::new(Mutex::new(false));
+        let dl = Arc::new(AtomicBool::new(false));
+        let rt: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let mr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("n1".into())));
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_err(), "补生成占槽时迁移必拒");
+        assert!(!dl.load(Ordering::SeqCst), "拒绝后复位互斥位");
+        *mr.lock().unwrap() = None;
+        assert!(migrate_guard(&running, &dl, &rt, &mr).is_ok(), "槽清空后迁移应放行");
     }
 
     /// Fix 2(codex 第三轮,A↔R 占槽后互查闭环)的说明性单测:验证 A 侧判据本身——

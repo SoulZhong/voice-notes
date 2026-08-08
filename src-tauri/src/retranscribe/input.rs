@@ -159,6 +159,9 @@ impl TranscribeInput for MixedInput {
 
 /// mixed 轨完整性校验容限。起流错峰残余同量级的初值,待实测校准(spec §MixedInput)。
 pub const MIXED_TOLERANCE_MS: u64 = 500;
+/// regen 轨的放宽容限(codex 第二轮 P1):补生成经 player_align 重采样,mic 长度
+/// 相对源轨读数改变 0.5~0.9s 是 spec 已知限制 1 记录的量级,按严格档必被误拒。
+pub const MIXED_REGEN_TOLERANCE_MS: u64 = 2_000;
 
 /// mixed 轨内容是否**不可信**(None = 可信)。一期明示 mixed 存在 ≠ 完整(回滚失败/
 /// 混音线程 panic 后 Drop 补合法头,均无盘上标记),消费前拿源轨 sync.track_ms 交叉
@@ -200,10 +203,20 @@ pub fn mixed_untrusted(meta: &AudioMeta) -> Option<String> {
     let Some(expected) = expected else {
         return Some("没有可对账的源轨,无法校验成品轨".into());
     };
-    let diff = dur.abs_diff(expected);
-    if diff > MIXED_TOLERANCE_MS {
+    // 口径对齐(codex 第二轮 P1):dur 是文件本地时长,expected 是全局时间轴终点,
+    // 比较前把 mixed 自己的 offset_ms 加回去——否则 origin>0 的合法轨被整个
+    // offset 量级误拒。容限按来源分档:regen 经对齐重采样,长度相对源轨读数改变
+    // 0.5~0.9s 是已知残余(spec 已知限制 1),放宽到 2s;live/无标记维持严格档。
+    let mixed_end = mixed.offset_ms + dur;
+    let tolerance = if mixed.mix.as_ref().is_some_and(|m| m.origin == "regen") {
+        MIXED_REGEN_TOLERANCE_MS
+    } else {
+        MIXED_TOLERANCE_MS
+    };
+    let diff = mixed_end.abs_diff(expected);
+    if diff > tolerance {
         return Some(format!(
-            "成品轨时长({dur}ms)与源轨对账值({expected}ms)偏差 {diff}ms,超 {MIXED_TOLERANCE_MS}ms 容限,内容不可信"
+            "成品轨终点({mixed_end}ms)与源轨对账值({expected}ms)偏差 {diff}ms,超 {tolerance}ms 容限,内容不可信"
         ));
     }
     None
@@ -257,6 +270,40 @@ mod tests {
     fn mixed_trusted_when_duration_matches_source_syncs() {
         let m = meta_with(Some(60_400), 60_000, 59_000, 1_200); // max(60000, 60200)=60200,差 200ms
         assert_eq!(mixed_untrusted(&m), None);
+    }
+
+    /// codex 第二轮 P1:mixed 的时长读数是**文件本地**口径,源轨终点是**全局时间轴**
+    /// 口径——比较必须把 mixed 自己的 offset_ms 加回去,否则 origin>0 的合法成品轨
+    /// (续录/系统先开等 min(源 offset)>0 的场景)会被整个 offset 的量级误拒。
+    #[test]
+    fn mixed_with_nonzero_offset_compares_on_global_timeline() {
+        let mut m = meta_with(Some(59_000), 60_000, 58_000, 1_200);
+        // 两源 offset 分别 1200/…,mixed origin=1000:文件时长 59_000,全局终点 60_000。
+        m.tracks.get_mut("mic").unwrap().offset_ms = 1_000;
+        m.tracks.get_mut("mixed").unwrap().offset_ms = 1_000;
+        // expected = max(1000+60000, 1200+58000) = 61_000;mixed 全局终点 = 1000+59_000 = 60_000
+        // 偏差 1000ms>500 会拒——把 mixed 时长调到 60_200,全局终点 61_200,偏差 200 应放行。
+        m.tracks.get_mut("mixed").unwrap().duration_ms = Some(60_200);
+        assert_eq!(mixed_untrusted(&m), None, "全局口径下 offset>0 的合法轨应放行");
+        // 反证:若实现忘加 mixed.offset_ms,60_200 vs 61_000 偏差 800 会被误拒。
+    }
+
+    /// codex 第二轮 P1(第二半):regen 轨经 player_align 重采样,mic 长度改变
+    /// 0.5~0.9s 是 spec 已知限制 1 的量级,而源轨读数仍是对齐前的——对 regen 轨
+    /// 按已知残余放宽容限,live 轨维持 500ms 严格档。
+    #[test]
+    fn regen_origin_gets_alignment_tolerance() {
+        let mk = |origin: &str| {
+            let mut m = meta_with(None, 60_000, 59_000, 1_200); // expected=60_200
+            m.tracks.get_mut("mixed").unwrap().mix = Some(crate::store::audio::MixInfo {
+                origin: origin.into(),
+                seek_offset_ms: Default::default(),
+                track_ms: 61_000, // 偏差 800ms:超 500 严格档,在 2000 放宽档内
+            });
+            m
+        };
+        assert_eq!(mixed_untrusted(&mk("regen")), None, "regen 轨按对齐残余放宽");
+        assert!(mixed_untrusted(&mk("live")).is_some(), "live 轨维持严格容限");
     }
 
     /// 未转码的 mixed.wav(Windows 恒如此;macOS 转码失败降级)没有 duration_ms,
