@@ -143,6 +143,7 @@
   let keepVol = $state(false);
   let langFilter = $state(false);
   let keepAudio = $state(false);
+  let mixTrack = $state(false);
   let calendarMatch = $state(true);
   /** 日历授权态(unavailable = 非 macOS,整块隐藏)。 */
   let calPerm = $state("unavailable");
@@ -240,6 +241,7 @@
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
     keepAudio = s.keep_audio;
+    mixTrack = s.mix_track;
     calendarMatch = s.calendar_match_enabled;
     refineOn = s.refine_enabled;
     identifyAuto = s.identify_auto_apply;
@@ -845,6 +847,19 @@
           bind:checked={keepAudio}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
+        />
+      </label>
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.record.mixTrack.label")}</span>
+          <span class="row-desc">{t("settings.record.mixTrack.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={mixTrack}
+          disabled={!settings}
+          onchange={() => saveSetting((s) => (s.mix_track = mixTrack))}
         />
       </label>
       {#if calPerm !== "unavailable"}

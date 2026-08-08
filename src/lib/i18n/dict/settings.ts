@@ -77,6 +77,8 @@ export const zh = {
   "settings.calendar.insufficient": "当前仅有\u201c添加日程\u201d权限,读取日程需要完全访问:去 系统设置 → 隐私与安全性 → 日历 调整",
   "settings.record.keepAudio.label": "保留录音音频",
   "settings.record.keepAudio.desc": "录完可回放核对;关闭可节省磁盘",
+  "settings.record.mixTrack.label": "录制期混出成品轨(方案 B)",
+  "settings.record.mixTrack.desc": "录制时把两路声音混成第三条轨,详情页可切换直放对比。仅影响新录制;每分钟约多占 1.9MB(转码后大幅缩小)",
   "settings.lockHint.recording": "录制进行中:识别方式已锁定,其余更改下一场录制生效。",
   "settings.lockHint.idle": "更改在下一场录制生效。",
 
@@ -252,6 +254,8 @@ export const en = {
   "settings.calendar.insufficient": "Only add-events permission granted; reading events needs Full Access: adjust in System Settings \u2192 Privacy & Security \u2192 Calendars",
   "settings.record.keepAudio.label": "Keep recording audio",
   "settings.record.keepAudio.desc": "Play back recordings to verify; turn off to save disk space",
+  "settings.record.mixTrack.label": "Mix a combined track while recording (scheme B)",
+  "settings.record.mixTrack.desc": "Blend both audio sources into a third track during recording; switch playback on the note page to compare. New recordings only; ~1.9MB/min extra (much smaller after transcoding)",
   "settings.lockHint.recording":
     "Recording in progress: transcription mode is locked; other changes take effect on the next recording.",
   "settings.lockHint.idle": "Changes take effect on the next recording.",
