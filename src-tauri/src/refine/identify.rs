@@ -97,7 +97,7 @@ fn recall_candidates(
 ) -> Vec<Candidate> {
     let mut picked: Vec<Candidate> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut push = |id: &str, name: &str, picked: &mut Vec<Candidate>, seen: &mut BTreeSet<String>| {
+    let push = |id: &str, name: &str, picked: &mut Vec<Candidate>, seen: &mut BTreeSet<String>| {
         if name.trim().is_empty() {
             return;
         }
@@ -165,7 +165,7 @@ fn sample_paragraphs(
     let ps = &doc.paragraphs;
     let mut ordered: Vec<usize> = Vec::new();
     let mut chosen: BTreeSet<usize> = BTreeSet::new();
-    let mut add = |i: usize, ordered: &mut Vec<usize>, chosen: &mut BTreeSet<usize>| {
+    let add = |i: usize, ordered: &mut Vec<usize>, chosen: &mut BTreeSet<usize>| {
         if i < ps.len() && chosen.insert(i) {
             ordered.push(i);
         }
