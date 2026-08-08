@@ -514,6 +514,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     let identify_result = (|| -> anyhow::Result<()> {
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
+                        // 日历快照在本线程开头已匹配落盘,此处重读最新 meta。
+                        let cal = store::NoteStore::new(notes_dir(&app)?)
+                            .load(&note_id)
+                            .ok()
+                            .and_then(|n| n.meta.calendar);
                         let now = chrono::Local::now().to_rfc3339();
                         let idoc = refine::identify::run_identify(
                             &dir,
@@ -522,6 +527,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             &cluster_stats,
                             &vp,
                             acoustic_enabled,
+                            cal.as_ref(),
                             identify_exec.as_ref(),
                             log_ctx.as_ref(),
                             &now,
@@ -3665,6 +3671,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                 &stats,
                 &vp,
                 acoustic_enabled,
+                note.meta.calendar.as_ref(),
                 executor.as_ref(),
                 log_ctx.as_ref(),
                 &now,
@@ -3804,6 +3811,29 @@ async fn apply_identify_suggestion(
                 let _ = vp_store.delete_person_if_empty(&target);
             }
             return Err(e);
+        }
+        // P3:参会人邮箱记录——三重唯一性防线(目标人名与某参会人名精确相等、
+        // 该名在参会人中唯一、该名在库中唯一)防同名污染;残余风险=确认本身指错。
+        if let Ok(note) = store::NoteStore::new(notes_dir(&app2).map_err(|e| e.to_string())?).load(&note_id) {
+            if let Some(cal) = &note.meta.calendar {
+                let vp_now = vp_store.load();
+                if let Some(target_name) =
+                    store::VoiceprintStore::resolve(&vp_now, &target).and_then(|rid| vp_now.people.get(rid)).map(|p| p.name.clone())
+                {
+                    let hits: Vec<_> = cal
+                        .attendees
+                        .iter()
+                        .filter(|a| !a.email.is_empty() && a.name == target_name)
+                        .collect();
+                    let library_unique =
+                        vp_now.people.values().filter(|p| p.name == target_name).count() == 1;
+                    if hits.len() == 1 && library_unique && !target_name.trim().is_empty() {
+                        if let Err(e) = vp_store.add_person_email(&target, &hits[0].email) {
+                            eprintln!("calendar: 记录参会人邮箱失败(忽略): {e}");
+                        }
+                    }
+                }
+            }
         }
         refine::identify::mark_applied(&mut idoc, &fingerprint, &now).map_err(|e| e.to_string())?;
         refine::identify::save_identify(&dir, &idoc).map_err(|e| e.to_string())?;

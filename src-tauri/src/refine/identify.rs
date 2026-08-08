@@ -49,6 +49,17 @@ pub struct SampledParagraph {
     pub text: String,
 }
 
+/// 当场会议的日历上下文(P3):闭集先验,不是硬约束(临时加入/代参会存在)。
+#[derive(Debug, Serialize)]
+pub struct CalendarContext {
+    pub title: String,
+    /// 参会人名(is_me 的标成「名字(我)」);上限 CALENDAR_ATTENDEES_IN_PROMPT,
+    /// 超出末尾追加「(其余 N 人略)」占位——大型活动不许把几百人塞进 prompt。
+    pub attendees: Vec<String>,
+}
+
+pub const CALENDAR_ATTENDEES_IN_PROMPT: usize = 30;
+
 #[derive(Debug, Serialize)]
 pub struct IdentifyContext {
     pub note_id: String,
@@ -57,6 +68,8 @@ pub struct IdentifyContext {
     pub clusters: Vec<ClusterBrief>,
     pub candidates: Vec<Candidate>,
     pub sampled: Vec<SampledParagraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarContext>,
 }
 
 /// 簇指纹:与 P1 回灌账本同口径(feedback::seq_fingerprint)。
@@ -82,6 +95,44 @@ fn dot(a: &[f32], b: &[f32]) -> Option<f32> {
     }
     let v: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     v.is_finite().then_some(v)
+}
+
+/// 候选第④路(P3):日历参会人。email 精确命中 Person.emails 的人最优先,
+/// 其次参会人名精确等于库中人名的人。闭集先验,排在其余各路之前。
+fn calendar_candidates(cal: &crate::store::CalendarSnapshot, vp: &Voiceprints) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // email 精确命中。
+    for att in &cal.attendees {
+        if att.email.is_empty() {
+            continue;
+        }
+        for (pid, person) in &vp.people {
+            if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !person.name.trim().is_empty()
+                && person.emails.iter().any(|e| e == &att.email)
+                && seen.insert(pid.clone())
+            {
+                out.push(Candidate { person_id: pid.clone(), name: person.name.clone() });
+            }
+        }
+    }
+    // 名字精确命中。
+    for att in &cal.attendees {
+        let name = att.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        for (pid, person) in &vp.people {
+            if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && person.name == name
+                && seen.insert(pid.clone())
+            {
+                out.push(Candidate { person_id: pid.clone(), name: person.name.clone() });
+            }
+        }
+    }
+    out
 }
 
 /// 候选三路召回(内部带参 K,常量是默认值;测试可收紧)。只收有名人物——
@@ -233,16 +284,24 @@ pub fn build_context(
     stats: &[ClusterStat],
     vp: &Voiceprints,
     acoustic_enabled: bool,
+    calendar: Option<&crate::store::CalendarSnapshot>,
 ) -> IdentifyContext {
     let members = cluster_members_from_doc(doc);
-    let candidates = recall_candidates(
+    // 第④路(日历)排最前,其余三路去重后补齐;总量仍受 MAX_CANDIDATES。
+    let mut candidates = calendar.map(|c| calendar_candidates(c, vp)).unwrap_or_default();
+    for c in recall_candidates(
         stats,
         vp,
         acoustic_enabled,
         ACOUSTIC_TOP_K_PER_CLUSTER,
         RECENT_TOP_K,
         MAX_CANDIDATES,
-    );
+    ) {
+        if !candidates.iter().any(|x| x.person_id == c.person_id) {
+            candidates.push(c);
+        }
+    }
+    candidates.truncate(MAX_CANDIDATES);
 
     // 段落既有关联(种子命中会写进 paragraphs 的 person_id/name)。
     let mut linked_by_speaker: BTreeMap<&str, (String, String)> = BTreeMap::new();
@@ -296,6 +355,19 @@ pub fn build_context(
         .collect();
 
     let sampled = sample_paragraphs(doc, &candidates, SAMPLE_CHAR_BUDGET);
+    let calendar_ctx = calendar.map(|c| {
+        let mut names: Vec<String> = c
+            .attendees
+            .iter()
+            .take(CALENDAR_ATTENDEES_IN_PROMPT)
+            .map(|a| if a.is_me { format!("{}(我)", a.name) } else { a.name.clone() })
+            .collect();
+        let rest = c.attendees.len().saturating_sub(CALENDAR_ATTENDEES_IN_PROMPT);
+        if rest > 0 {
+            names.push(format!("(其余 {rest} 人略)"));
+        }
+        CalendarContext { title: c.title.clone(), attendees: names }
+    });
     IdentifyContext {
         note_id: note_id.to_string(),
         revision: doc.revision,
@@ -303,6 +375,7 @@ pub fn build_context(
         clusters,
         candidates,
         sampled,
+        calendar: calendar_ctx,
     }
 }
 
@@ -319,7 +392,7 @@ pub trait IdentifyExecutor: Send + Sync {
 }
 
 /// identify 的 system prompt。与精修 SYSTEM_PROMPT 同风格:单行、契约逐条钉死。
-pub const IDENTIFY_SYSTEM_PROMPT: &str = "你是会议说话人身份推断器。输入 JSON 含三部分:clusters(说话人簇:speaker 是簇号,total_ms 时长,is_mic=true 的簇大概率是记录者「我」,linked 非空表示已确认身份),candidates(声纹库候选人:person_id 与姓名),sampled(带 speaker 标注的会议片段,paragraph_index 是全文绝对段落下标)。任务:只为 linked 为空或存在矛盾证据的簇推断真实身份;每条推断给出簇号、身份(二选一:candidates 里的 person_id,或候选外的新名字 new_name——new_name 必须有自我介绍级证据)、自报 confidence(high|medium|low)、以及证据列表。证据 type 只能是:self_intro(该簇自我介绍,如「我是张伟」,quote 必须包含所指认的名字)、addressed_reply(称呼应答配对:必须给两条证据——一条在其它簇里称呼该名字,一条是该簇的应答)、third_person_exclusion(该簇以第三人称谈及某人,证明该簇不是那个人)、role_topic(角色/主题弱线索)。所有证据必须逐字存在:paragraph_index 用输入标注的绝对下标,start/end 是该段落的 Unicode scalar(char)半开区间,quote 必须逐字符精确等于该区间,禁止改写、缩略或拼接。输出 JSON:{\"assignments\":[{\"cluster\":\"R2\",\"person_id\":\"P3\",\"new_name\":null,\"confidence\":\"high\",\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":4,\"quote\":\"我是张伟\",\"type\":\"self_intro\"}]}]}。person_id 与 new_name 恰好一个非空。没有可靠推断输出 {\"assignments\":[]}。禁止为已明确关联且无矛盾证据的簇输出条目,禁止仅凭主题相似强行认人。";
+pub const IDENTIFY_SYSTEM_PROMPT: &str = "你是会议说话人身份推断器。输入 JSON 含三部分:clusters(说话人簇:speaker 是簇号,total_ms 时长,is_mic=true 的簇大概率是记录者「我」,linked 非空表示已确认身份),candidates(声纹库候选人:person_id 与姓名),sampled(带 speaker 标注的会议片段,paragraph_index 是全文绝对段落下标)。任务:只为 linked 为空或存在矛盾证据的簇推断真实身份;每条推断给出簇号、身份(二选一:candidates 里的 person_id,或候选外的新名字 new_name——new_name 必须有自我介绍级证据)、自报 confidence(high|medium|low)、以及证据列表。证据 type 只能是:self_intro(该簇自我介绍,如「我是张伟」,quote 必须包含所指认的名字)、addressed_reply(称呼应答配对:必须给两条证据——一条在其它簇里称呼该名字,一条是该簇的应答)、third_person_exclusion(该簇以第三人称谈及某人,证明该簇不是那个人)、role_topic(角色/主题弱线索)。所有证据必须逐字存在:paragraph_index 用输入标注的绝对下标,start/end 是该段落的 Unicode scalar(char)半开区间,quote 必须逐字符精确等于该区间,禁止改写、缩略或拼接。输入可能含 calendar 字段(当场会议的日历事件:标题与参会人名单,「(我)」标注记录者本人):参会人是强先验候选,但允许临时加入者/代参会,不是硬约束,不得仅凭名单在无文本证据时强行认人。输出 JSON:{\"assignments\":[{\"cluster\":\"R2\",\"person_id\":\"P3\",\"new_name\":null,\"confidence\":\"high\",\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":4,\"quote\":\"我是张伟\",\"type\":\"self_intro\"}]}]}。person_id 与 new_name 恰好一个非空。没有可靠推断输出 {\"assignments\":[]}。禁止为已明确关联且无矛盾证据的簇输出条目,禁止仅凭主题相似强行认人。";
 
 /// 簇的主信道与混合判定(与 ClusterBrief 同口径,裁决层复用)。
 fn dominant_and_mixed(stat: &ClusterStat) -> (String, bool) {
@@ -619,12 +692,13 @@ pub fn run_identify(
     stats: &[ClusterStat],
     vp: &Voiceprints,
     acoustic_enabled: bool,
+    calendar: Option<&crate::store::CalendarSnapshot>,
     executor: &dyn IdentifyExecutor,
     log: Option<&crate::ailog::Ctx>,
     now: &str,
 ) -> anyhow::Result<IdentifyDoc> {
     let members = cluster_members_from_doc(doc);
-    let ctx = build_context(note_id, doc, stats, vp, acoustic_enabled);
+    let ctx = build_context(note_id, doc, stats, vp, acoustic_enabled, calendar);
     let (raws, parse_skipped) = executor.infer(&ctx, log)?;
     if parse_skipped > 0 {
         eprintln!("identify({note_id}): {parse_skipped} 条输出条目类型非法,已跳过");
@@ -801,6 +875,7 @@ mod tests {
             session_centroids: BTreeMap::new(),
             total_ms: 10_000,
             last_seen: last_seen.into(),
+            emails: Vec::new(),
         }
     }
 
@@ -899,7 +974,7 @@ mod tests {
         s1.source_ms.insert("system".into(), 4_000);
         s1.total_ms = 10_000;
         let stats = vec![s1, stat("R2", "system", vec![0.0, 1.0], 8_000)];
-        let ctx = build_context("n1", &doc, &stats, &Voiceprints::default(), true);
+        let ctx = build_context("n1", &doc, &stats, &Voiceprints::default(), true, None);
         let r1 = ctx.clusters.iter().find(|c| c.speaker == "R1").unwrap();
         assert!(r1.mixed);
         assert!(r1.is_mic);
@@ -1056,7 +1131,7 @@ mod tests {
 
         // 第一轮:R1 建议张伟(P1)。
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d1 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t1").unwrap();
+        let d1 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t1").unwrap();
         assert_eq!(d1.assignments.len(), 1);
         assert_eq!(d1.assignments[0].status, "suggested");
         assert_eq!(d1.assignments[0].tier, Tier::High);
@@ -1067,11 +1142,11 @@ mod tests {
         d1_rejected.rejected.insert(rejected_key(&fp_r1, "P1"), "t1x".into());
         d1_rejected.assignments.clear();
         save_identify(dir.path(), &d1_rejected).unwrap();
-        let d2 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t2").unwrap();
+        let d2 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t2").unwrap();
         assert!(d2.assignments.is_empty(), "拒过的同目标建议不再生成");
         assert!(d2.rejected.contains_key(&rejected_key(&fp_r1, "P1")), "拒绝表跨代继承");
         let exec_new = MockExec(vec![raw("R1", None, Some("张老板"), vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d3 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec_new, None, "t3").unwrap();
+        let d3 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec_new, None, "t3").unwrap();
         // 「我是张伟」不含「张老板」→ self_intro 降级 → Low → 不落建议;
         // 换个含名证据检查放行路径:
         assert!(d3.assignments.is_empty());
@@ -1091,7 +1166,7 @@ mod tests {
         };
         d4.rejected.clear();
         save_identify(dir.path(), &d4).unwrap();
-        let d5 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t5").unwrap();
+        let d5 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t5").unwrap();
         assert_eq!(d5.assignments.len(), 1, "applied 保留且不重复建议");
         assert_eq!(d5.assignments[0].status, "applied");
     }
@@ -1106,7 +1181,7 @@ mod tests {
             p.name = Some("张伟".into());
         }
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t").unwrap();
+        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t").unwrap();
         assert!(d.assignments.is_empty());
     }
     #[test]
@@ -1133,4 +1208,39 @@ mod tests {
         assert_eq!(idoc.assignments[0].status, "rejected");
         assert!(idoc.rejected.contains_key(&rejected_key("fp1", "P1")));
     }
+    #[test]
+    fn calendar_candidates_email_first_then_name_and_prompt_cap() {
+        let mut vp = vp_with(vec![
+            ("P1", person("张伟", "mic", vec![1.0, 0.0, 0.0, 0.0], "2026-01-01")),
+            ("P2", person("李雷", "mic", vec![0.0, 1.0, 0.0, 0.0], "2026-01-02")),
+        ]);
+        vp.people.get_mut("P2").unwrap().emails.push("lilei@x.com".into());
+        let mut attendees: Vec<crate::store::CalendarAttendee> = vec![
+            crate::store::CalendarAttendee { name: "别人".into(), email: "lilei@x.com".into(), is_me: false },
+            crate::store::CalendarAttendee { name: "张伟".into(), email: String::new(), is_me: true },
+        ];
+        for i in 0..40 {
+            attendees.push(crate::store::CalendarAttendee { name: format!("路人{i}"), email: String::new(), is_me: false });
+        }
+        let cal = crate::store::CalendarSnapshot {
+            event_id: "ev".into(), title: "周会".into(), attendees,
+            matched_at: "t".into(), match_kind: "auto".into(),
+        };
+        // 第④路:email 命中(P2)排最前,名字命中(P1)随后。
+        let got = calendar_candidates(&cal, &vp);
+        assert_eq!(got[0].person_id, "P2", "email 精确命中最优先");
+        assert!(got.iter().any(|c| c.person_id == "P1"), "名字精确命中入选");
+        // build_context:calendar 进 ctx,参会人 cap+is_me 标注+截断占位。
+        let doc = doc_with(vec![para("R1", &[0], "开场")]);
+        let ctx = build_context("n1", &doc, &[], &vp, false, Some(&cal));
+        assert_eq!(ctx.candidates[0].person_id, "P2", "日历候选排最前");
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("calendar"), "calendar 序列化进 prompt 主体");
+        let cc = ctx.calendar.unwrap();
+        assert_eq!(cc.title, "周会");
+        assert!(cc.attendees.iter().any(|a| a == "张伟(我)"), "is_me 标注");
+        assert_eq!(cc.attendees.len(), CALENDAR_ATTENDEES_IN_PROMPT + 1, "cap+占位行");
+        assert!(cc.attendees.last().unwrap().contains("人略"));
+    }
+
 }

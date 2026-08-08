@@ -63,6 +63,10 @@ pub struct Person {
     pub total_ms: u64,
     #[serde(default)]
     pub last_seen: String,
+    /// 参会人邮箱(P3 日历):identify 建议确认时在三重唯一性防线下记录,
+    /// 下一场参会人 email 精确命中即免模糊猜。已规范化(小写)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emails: Vec<String>,
 }
 
 /// voiceprints.json 整体结构。全部字段 `#[serde(default)]`:旧文件缺字段、
@@ -253,6 +257,12 @@ impl VoiceprintStore {
             winner_person.total_ms += loser_person.total_ms;
             if winner_person.name.is_empty() && !loser_person.name.is_empty() {
                 winner_person.name = loser_person.name.clone();
+            }
+            // emails 并集:不并入会在撤销/拆回时静默丢失 loser 的邮箱。
+            for e in &loser_person.emails {
+                if !winner_person.emails.contains(e) {
+                    winner_person.emails.push(e.clone());
+                }
             }
         }
         for target in vp.redirects.values_mut() {
@@ -706,6 +716,7 @@ impl VoiceprintStore {
                     session_centroids: BTreeMap::new(),
                     total_ms: snap.total_ms,
                     last_seen: now.to_string(),
+                    emails: Vec::new(),
                 };
                 push_session_centroid(&mut person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
                 vp.people.insert(id.clone(), person);
@@ -775,10 +786,31 @@ impl VoiceprintStore {
                 session_centroids: BTreeMap::new(),
                 total_ms: 0,
                 last_seen: now.to_string(),
+                emails: Vec::new(),
             },
         );
         self.save(&vp)?;
         Ok(id)
+    }
+
+    /// 记录参会人邮箱(P3):VP_LOCK 内规范化去重追加;质点变了,该人相关的
+    /// 合并建议回执一并失效(与质心更新同理)。
+    pub fn add_person_email(&self, id: &str, email: &str) -> anyhow::Result<()> {
+        let _guard = vp_guard();
+        let normalized = email.trim().to_ascii_lowercase();
+        anyhow::ensure!(!normalized.is_empty(), "邮箱为空");
+        let mut vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
+            anyhow::bail!("未知人物: {id}");
+        };
+        let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
+        if person.emails.contains(&normalized) {
+            return Ok(());
+        }
+        person.emails.push(normalized);
+        self.save(&vp)?;
+        self.journal_invalidate(&[resolved.as_str()], "此人档案有更新");
+        Ok(())
     }
 
     /// 补偿删除:仅当此人仍是空质心/空会话质心/无样本时删除(apply 半途失败的
@@ -794,6 +826,7 @@ impl VoiceprintStore {
         };
         if !p.centroids.is_empty()
             || !p.session_centroids.is_empty()
+            || !p.emails.is_empty()
             || !self.sample_paths_existing(&resolved).is_empty()
         {
             return Ok(false);
@@ -1741,6 +1774,7 @@ mod tests {
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(0.0, 1.0), pc(0.7, 0.7)])]),
                 total_ms: 60_000,
                 last_seen: "t".into(),
+                emails: Vec::new(),
             },
         );
         vp.redirects.insert("P2".into(), "P1".into()); // 悬空/重定向不产种子
@@ -1763,6 +1797,7 @@ mod tests {
                 session_centroids: BTreeMap::from([("system".to_string(), vec![pc(0.0, 1.0)])]),
                 total_ms: 60_000,
                 last_seen: "t".into(),
+                emails: Vec::new(),
             },
         );
         let seeds = seed_clusters(&vp);
@@ -1784,6 +1819,7 @@ mod tests {
                 session_centroids: BTreeMap::from([("mic".to_string(), vec![pc(1.0, 0.0)])]),
                 total_ms: 60_000,
                 last_seen: "t".into(),
+                emails: Vec::new(),
             },
         );
         vp.people.insert(
@@ -2643,4 +2679,22 @@ mod tests {
         assert!(!store.delete_person_if_empty(&id1).unwrap());
         assert!(store.load().people.contains_key(&id1));
     }
+    #[test]
+    fn person_emails_union_on_merge_dedup_and_block_empty_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let a = store.create_person("张伟", "t").unwrap();
+        let b = store.create_person("张老板", "t").unwrap();
+        store.add_person_email(&a, " ZW@X.com ").unwrap();
+        store.add_person_email(&a, "zw@x.com").unwrap(); // 规范化后去重
+        store.add_person_email(&b, "boss@x.com").unwrap();
+        assert_eq!(store.load().people[&a].emails, vec!["zw@x.com"]);
+        // 有邮箱的空质心档案不可被补偿删除。
+        assert!(!store.delete_person_if_empty(&a).unwrap());
+        // 合并并集:b 并入 a 后邮箱不丢。
+        store.merge_journaled(&b, &a, None, "manual", None, "t2").unwrap();
+        let emails = &store.load().people[&a].emails;
+        assert!(emails.contains(&"zw@x.com".to_string()) && emails.contains(&"boss@x.com".to_string()));
+    }
+
 }
