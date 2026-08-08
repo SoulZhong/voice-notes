@@ -1,9 +1,10 @@
 // 整理收件箱的队列纯逻辑:构建队列本身。
 // UI 无关、可单测;/speakers 概览页常驻分析区与侧栏徽标共同消费。
-import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "$lib/people";
+import type { IdentifySuggestion, MergeReceipt, PersonMergeSuggestion, PersonSummary } from "$lib/people";
 
 export type TidyItem =
   | { kind: "receipt"; receipt: MergeReceipt }
+  | { kind: "identify"; suggestion: IdentifySuggestion }
   | { kind: "suggestion"; suggestion: PersonMergeSuggestion }
   | { kind: "dup"; name: string; people: PersonSummary[] }
   | { kind: "nosample"; person: PersonSummary };
@@ -12,13 +13,15 @@ export type TidyItem =
 export const tidyItemKey = (it: TidyItem): string =>
   it.kind === "receipt"
     ? `r:${it.receipt.journal_id}`
-    : it.kind === "suggestion"
-      ? `s:${it.suggestion.loser}>${it.suggestion.winner}`
-      : it.kind === "dup"
-        ? `d:${it.name}`
-        : `n:${it.person.id}`;
+    : it.kind === "identify"
+      ? `i:${it.suggestion.note_id}:${it.suggestion.fingerprint}`
+      : it.kind === "suggestion"
+        ? `s:${it.suggestion.loser}>${it.suggestion.winner}`
+        : it.kind === "dup"
+          ? `d:${it.name}`
+          : `n:${it.person.id}`;
 
-/** 收件箱队列:回执 → 拿不准的建议 → 同名组 → 无样本。people 按 last_seen 降序
+/** 收件箱队列:回执 → 身份建议 → 拿不准的合并建议 → 同名组 → 无样本。people 按 last_seen 降序
     传入(listPeople 保证),同名组主条目默认取组首=最近活跃。dismissed 是会话级
     忽略/保留集(键=tidyItemKey),建议的忽略在上游 tidy.visible 里已滤。同名组不设
     样本条件,成员可同时出现在无样本卡。 */
@@ -27,9 +30,15 @@ export function buildTidyQueue(
   suggestions: PersonMergeSuggestion[],
   receipts: MergeReceipt[],
   dismissed: Set<string> = new Set(),
+  identify: IdentifySuggestion[] = [],
 ): TidyItem[] {
   const items: TidyItem[] = receipts.map((r) => ({ kind: "receipt", receipt: r }));
   const ids = new Set(people.map((p) => p.id));
+  // 身份建议排回执之后、合并建议之前:时效性最强(稿一变就过期),先给人看。
+  // 指向库中人的建议须目标仍在库(与合并建议同款时序保险);新面孔无此约束。
+  for (const s of identify) {
+    if (s.person_id === null || ids.has(s.person_id)) items.push({ kind: "identify", suggestion: s });
+  }
   // 失效目标保险:后端建议按当前库现算,但拉取与消费之间有时序窗口——已合并/
   // 已删除的人不能再作合并目标(或来源),否则点「合并」必报「人物不存在」。
   for (const s of suggestions) {

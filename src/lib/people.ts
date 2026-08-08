@@ -90,3 +90,25 @@ export const restoreMergedPerson = (journalId: string) =>
   invoke<string>("restore_merged_person", { journalId });
 /** 已落盘的处置键全量(重启后合并进本地已忽略集合)。 */
 export const listDismissedTidyItems = () => invoke<string[]>("list_dismissed_tidy_items");
+
+/** identify(P2a)身份建议:LLM 从会议内容推断「这个说话人簇是谁」,经后端
+    裁决后只出建议;确认即关联+回灌,拒绝即同目标永久静默(后端真值)。 */
+export type IdentifySuggestion = {
+  note_id: string;
+  note_title: string;
+  cluster: string;
+  fingerprint: string;
+  person_id: string | null;
+  person_name: string;
+  is_new: boolean;
+  tier: string;
+  quote: string;
+  evidence_type: string;
+  generated_at: string;
+};
+export const listIdentifySuggestions = () =>
+  invoke<IdentifySuggestion[]>("list_identify_suggestions");
+export const applyIdentifySuggestion = (noteId: string, fingerprint: string) =>
+  invoke<void>("apply_identify_suggestion", { noteId, fingerprint });
+export const rejectIdentifySuggestion = (noteId: string, fingerprint: string) =>
+  invoke<void>("reject_identify_suggestion", { noteId, fingerprint });

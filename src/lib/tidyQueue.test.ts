@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildTidyQueue, mergeDuplicatePeople, resolveSugTarget, splitArchive, tidyItemKey, type TidyItem } from "./tidyQueue";
-import type { MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
+import type { IdentifySuggestion, MergeReceipt, PersonMergeSuggestion, PersonSummary } from "./people";
 
 const person = (id: string, name = "", samples: string[] = []): PersonSummary => ({
   id,
@@ -36,7 +36,40 @@ const receipt = (id: string, invalidReason: string | null = null): MergeReceipt 
   invalid_reason: invalidReason,
 });
 
+const idsug = (noteId: string, fp: string, personId: string | null, name = "张三"): IdentifySuggestion => ({
+  note_id: noteId,
+  note_title: "周会",
+  cluster: "R2",
+  fingerprint: fp,
+  person_id: personId,
+  person_name: name,
+  is_new: personId === null,
+  tier: "high",
+  quote: "我是张三",
+  evidence_type: "self_intro",
+  generated_at: "2026-08-08T10:00:00+08:00",
+});
+
 describe("buildTidyQueue", () => {
+  it("身份建议排在回执后、合并建议前;目标不在库的滤掉、新面孔放行", () => {
+    const people = [person("P5", "李四", ["/c.wav"]), person("P6", "", [])];
+    const q = buildTidyQueue(
+      people,
+      [sug("P6", "P5")],
+      [receipt("m-P1")],
+      new Set(),
+      [idsug("n1", "fp1", "P5"), idsug("n1", "fp2", "P404"), idsug("n2", "fp3", null, "王五")],
+    );
+    expect(q.map((i) => i.kind)).toEqual(["receipt", "identify", "identify", "suggestion", "nosample"]);
+    const keys = q.map(tidyItemKey);
+    expect(keys).toContain("i:n1:fp1");
+    expect(keys).toContain("i:n2:fp3");
+    expect(keys).not.toContain("i:n1:fp2");
+    // dismissed 的 i: 键同样过滤(动作后的乐观移除镜像)。
+    const q2 = buildTidyQueue(people, [], [], new Set(["i:n1:fp1"]), [idsug("n1", "fp1", "P5")]);
+    expect(q2.some((i) => tidyItemKey(i) === "i:n1:fp1")).toBe(false);
+  });
+
   it("按 回执→建议→同名组→无样本 排序,同名分组、无样本逐条", () => {
     const people = [
       person("P2", "张三", ["/a.wav"]),
