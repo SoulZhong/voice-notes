@@ -148,6 +148,7 @@
   let calPerm = $state("unavailable");
   let calRequesting = $state(false);
   let refineOn = $state(false);
+  let identifyAuto = $state(false);
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
@@ -241,6 +242,7 @@
     keepAudio = s.keep_audio;
     calendarMatch = s.calendar_match_enabled;
     refineOn = s.refine_enabled;
+    identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
     asrMode = s.asr_mode === "cloud" ? "cloud" : "local";
@@ -1122,6 +1124,19 @@
           bind:checked={refineOn}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
+        />
+      </label>
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.identifyAuto.label")}</span>
+          <span class="row-desc">{t("settings.identifyAuto.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={identifyAuto}
+          disabled={!settings || !refineOn}
+          onchange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
         />
       </label>
     </div>

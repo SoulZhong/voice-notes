@@ -14,7 +14,7 @@ export const tidyItemKey = (it: TidyItem): string =>
   it.kind === "receipt"
     ? `r:${it.receipt.journal_id}`
     : it.kind === "identify"
-      ? `i:${it.suggestion.note_id}:${it.suggestion.fingerprint}`
+      ? `i:${it.suggestion.note_id}:${it.suggestion.op_id ?? it.suggestion.fingerprint}`
       : it.kind === "suggestion"
         ? `s:${it.suggestion.loser}>${it.suggestion.winner}`
         : it.kind === "dup"
@@ -32,12 +32,18 @@ export function buildTidyQueue(
   dismissed: Set<string> = new Set(),
   identify: IdentifySuggestion[] = [],
 ): TidyItem[] {
-  const items: TidyItem[] = receipts.map((r) => ({ kind: "receipt", receipt: r }));
+  const items: TidyItem[] = [];
   const ids = new Set(people.map((p) => p.id));
+  // P2b 自动回执与 merge 回执同段(最前)——已发生的自动写入必须最先被看到。
+  for (const s of identify) {
+    if (s.status === "auto_applied") items.push({ kind: "identify", suggestion: s });
+  }
+  items.push(...receipts.map((r): TidyItem => ({ kind: "receipt", receipt: r })));
   // 身份建议排回执之后、合并建议之前:时效性最强(稿一变就过期),先给人看。
   // 指向库中人的建议须目标仍在库(与合并建议同款时序保险);新面孔无此约束。
   for (const s of identify) {
-    if (s.person_id === null || ids.has(s.person_id)) items.push({ kind: "identify", suggestion: s });
+    if (s.status !== "auto_applied" && (s.person_id === null || ids.has(s.person_id)))
+      items.push({ kind: "identify", suggestion: s });
   }
   // 失效目标保险:后端建议按当前库现算,但拉取与消费之间有时序窗口——已合并/
   // 已删除的人不能再作合并目标(或来源),否则点「合并」必报「人物不存在」。

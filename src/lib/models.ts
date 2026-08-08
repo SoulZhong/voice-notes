@@ -82,6 +82,7 @@ export type Settings = {
   // 方案 B(实验特性):录制期额外落一条 mixed.wav 混音成品轨。默认关。
   mix_track: boolean;
   calendar_match_enabled: boolean;
+  identify_auto_apply: boolean;
 };
 export type ModelDownloadEvent = {
   artifact: string;

@@ -65,6 +65,8 @@ export const zh = {
   "settings.record.keepVol.sysOnlySuffix": "(仅录系统声音时无效)",
   "settings.record.langFilter.label": "乱码过滤",
   "settings.record.langFilter.desc": "丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭",
+  "settings.identifyAuto.label": "自动认出说话人",
+  "settings.identifyAuto.desc": "high 档身份推断自动关联并回灌声纹(回执可撤销)。开启前请先用 speaker_eval 标注评测:high 档 ≥50 样本且误认 ≤1% 再开",
   "settings.calendar.label": "日历匹配",
   "settings.calendar.desc": "录制停止后把录音关联到当时的日历日程,参会人名单帮助认出说话人",
   "settings.calendar.cardTitle": "需要日历权限",
@@ -238,6 +240,8 @@ export const en = {
   "settings.record.langFilter.label": "Garbled text filter",
   "settings.record.langFilter.desc":
     "Drops text falsely transcribed from silence or noise. Turn off if multilingual meetings are affected",
+  "settings.identifyAuto.label": "Auto-identify speakers",
+  "settings.identifyAuto.desc": "Auto-link high-confidence identity inferences and reinforce voiceprints (undoable receipts). Before enabling, evaluate with speaker_eval: \u226550 high-tier samples with \u22641% misidentification",
   "settings.calendar.label": "Calendar matching",
   "settings.calendar.desc": "Link recordings to the calendar event in progress; attendee lists help identify speakers",
   "settings.calendar.cardTitle": "Calendar permission needed",

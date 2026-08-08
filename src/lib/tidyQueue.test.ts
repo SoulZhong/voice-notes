@@ -48,9 +48,22 @@ const idsug = (noteId: string, fp: string, personId: string | null, name = "张�
   quote: "我是张三",
   evidence_type: "self_intro",
   generated_at: "2026-08-08T10:00:00+08:00",
+  status: "suggested",
+  op_id: null,
+  revertible: true,
 });
 
 describe("buildTidyQueue", () => {
+  it("P2b 自动回执排最前(与 merge 回执同段),key 用 op_id", () => {
+    const auto = { ...idsug("n9", "fp9", "P5"), status: "auto_applied", op_id: "iop-1", revertible: true };
+    const q = buildTidyQueue([person("P5", "李四", ["/c.wav"])], [], [receipt("m-P1")], new Set(), [
+      auto,
+      idsug("n1", "fp1", "P5"),
+    ]);
+    expect(q.map((i) => i.kind)).toEqual(["identify", "receipt", "identify"]);
+    expect(tidyItemKey(q[0])).toBe("i:n9:iop-1");
+  });
+
   it("身份建议排在回执后、合并建议前;目标不在库的滤掉、新面孔放行", () => {
     const people = [person("P5", "李四", ["/c.wav"]), person("P6", "", [])];
     const q = buildTidyQueue(
