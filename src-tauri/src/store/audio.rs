@@ -182,6 +182,11 @@ pub struct SyncInfo {
     pub gaps: u32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: u32,
+    /// 本源首个真实帧相对本场最早首帧的偏移(ms)。mixed 轨里该源内容整体后移
+    /// 这么多(spec §口径差),段落 seek 到 mixed 时要加回去。续录每场覆盖,
+    /// 与本结构其余字段同限制。旧数据无此字段 → None,消费方按 0 处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_frame_offset_ms: Option<u64>,
 }
 
 /// 轨时间轴 − 墙钟。抽成纯函数是为了能被表驱动测试直接打:这条数是后续所有漂移标定
@@ -1070,6 +1075,7 @@ mod tests {
                 silence_ms: 0,
                 gaps: 0,
                 rate_fixes: 1,
+                first_frame_offset_ms: None,
             },
         )
         .unwrap();
@@ -1310,5 +1316,20 @@ mod tests {
 
         assert!(list_tracks(tmp.path()).is_empty(), "只有成品轨时源轨列表应为空");
         assert!(mixed_track(tmp.path()).is_some(), "但 mixed_track 仍应能取到它");
+    }
+
+    /// 旧 audio.json(无 first_frame_offset_ms)必须照常反序列化为 None;
+    /// 新写出的 JSON 有该字段且往返保真。字段语义:本源首个真实帧相对本场最早
+    /// 首帧的偏移(16k 口径换算成 ms),是 mixed 轨段落 seek 修正的数据来源。
+    #[test]
+    fn sync_first_frame_offset_roundtrip_and_backcompat() {
+        let old = r#"{"wall_ms":1,"samples":2,"track_ms":3,"drift_ms":2,"silence_ms":0,"gaps":0,"rate_fixes":0}"#;
+        let s: SyncInfo = serde_json::from_str(old).expect("旧数据必须能解析");
+        assert_eq!(s.first_frame_offset_ms, None);
+
+        let with = SyncInfo { first_frame_offset_ms: Some(120), ..s };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: SyncInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.first_frame_offset_ms, Some(120));
     }
 }

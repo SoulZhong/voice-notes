@@ -1880,6 +1880,7 @@ fn persist_track_sync(
             silence_ms: h.silence_ms,
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,
+            first_frame_offset_ms: Some(health.first_frame_offset_16k() / 16),
         };
         if let Err(e) = store::audio::set_track_sync(note_dir, source.as_str(), info) {
             eprintln!("对账写入失败({}): {e}", source.as_str());
@@ -6833,6 +6834,7 @@ mod tests {
                 silence_ms: 3,
                 gaps: 4,
                 rate_fixes: 5,
+                first_frame_offset_ms: None,
             },
         )
         .unwrap();

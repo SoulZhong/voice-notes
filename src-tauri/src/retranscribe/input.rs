@@ -236,6 +236,7 @@ mod tests {
     fn meta_with(mixed_dur: Option<u64>, mic_track: u64, sys_track: u64, sys_off: u64) -> AudioMeta {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         m.tracks.insert("mic".into(), TrackMeta { sync: Some(sync(mic_track)), ..Default::default() });
@@ -261,6 +262,7 @@ mod tests {
     fn mixed_trusted_for_continued_recording_using_source_duration_ms() {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         // 两场录制,mic 全长 10_000ms,但 sync.track_ms 只留了最后一场的 3_000ms
