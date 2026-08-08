@@ -119,7 +119,11 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
-    let first = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
     let p = PathBuf::from(first);
     p.is_file().then_some(p)
 }
@@ -191,7 +195,10 @@ fn refine_prompt(note_id: &str) -> String {
         "你是会议逐字稿精修与语义图谱助手。任务:完成 voice-notes 笔记 {note_id} 的文本与图谱 Aing。\n\
          步骤:\n\
          1. 调用 MCP 工具 get_note,参数 {{\"note_id\":\"{note_id}\",\"format\":\"segments\"}},\
-         取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。\n\
+         取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。\
+         每个段落带 speaker/name 字段(该段说话人的簇号与人名);精修正文时利用它做人名/称呼错字判断与称呼一致性\
+         (如称呼「小王」后由王某的段应答,可确认「王」字写法)。禁止修改说话人归属,禁止据此改写句式或把代词替换成人名,\
+         禁止把说话人名当前缀写进正文。\n\
          2. 逐段检查,只做四类修订,除此之外禁止任何改动(不改句式和语义,不合并/拆分段落):\n\
          a) 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文;\
          b) 实体归一:同一人名/产品名/术语全文统一为最常见写法;\
@@ -1422,6 +1429,19 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
                 AgentKind::Cursor => unreachable!("Cursor 在单独的 fail-closed 测试覆盖"),
             }
         }
+    }
+
+    #[test]
+    fn refine_prompt_instructs_speaker_usage() {
+        let p = refine_prompt("note-1");
+        assert!(
+            p.contains("speaker/name 字段"),
+            "必须告知 Agent 段落带说话人字段"
+        );
+        assert!(
+            p.contains("禁止修改说话人归属"),
+            "必须禁止 Agent 改动说话人归属"
+        );
     }
 
     #[test]
