@@ -236,6 +236,27 @@ pub fn get_aing_context(roots: &DataRoots, note_id: &str) -> anyhow::Result<serd
     get_aing_context_with_hook(roots, note_id, |_| {})
 }
 
+/// 读取笔记最近一次说话人身份推断结果(identify.json,只读;P2a)。附 stale
+/// 标志:生成时 source_hash 与当前稿不一致即 true——证据锚点不可信,与应用内
+/// 收件箱的新鲜度口径一致,两个入口不打架。
+pub fn identify_speakers(roots: &DataRoots, note_id: &str) -> anyhow::Result<serde_json::Value> {
+    NoteStore::new(notes_dir(roots)).load(note_id)?;
+    let anchored = store::refined::AnchoredRefinedDir::open(&notes_dir(roots), note_id)?;
+    let Some(mut idoc) = anchored.load_identify_value()? else {
+        anyhow::bail!("该笔记尚无身份推断结果:先在应用内运行 Aing(或手动触发 identify)");
+    };
+    let current_hash = anchored
+        .load_current()?
+        .map(|d| store::source_hash(&d.paragraphs));
+    let stored_hash = idoc["source_hash"].as_str().unwrap_or_default().to_string();
+    let stale = current_hash.as_deref() != Some(stored_hash.as_str());
+    if let Some(obj) = idoc.as_object_mut() {
+        obj.insert("note_id".into(), note_id.into());
+        obj.insert("stale".into(), stale.into());
+    }
+    Ok(idoc)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphIoStage {
     AfterAnchor,

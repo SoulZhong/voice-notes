@@ -390,7 +390,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 };
                 let seeds = load_voiceprint_seeds(&app);
-                let mut doc = refine::run_local(
+                let (mut doc, cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
                     &note.speakers,
@@ -496,6 +496,34 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 }
                 report("llm", &doc.stages.llm);
+                // identify(P2a 只读期):精修定稿后推断说话人身份,产物只落
+                // identify.json + 收件箱建议卡,零自动写入。执行体分派内含
+                // refine_llm_ready 门禁(用户关精修/agent provider → 静默跳过);
+                // 失败仅留日志,绝不影响 Aing 结果。
+                if let Ok(identify_exec) = identify_executor(&s) {
+                    let identify_result = (|| -> anyhow::Result<()> {
+                        let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
+                        let acoustic_enabled = vp.embedding_model == s.speaker_model;
+                        let now = chrono::Local::now().to_rfc3339();
+                        let idoc = refine::identify::run_identify(
+                            &dir,
+                            &note_id,
+                            &doc,
+                            &cluster_stats,
+                            &vp,
+                            acoustic_enabled,
+                            identify_exec.as_ref(),
+                            log_ctx.as_ref(),
+                            &now,
+                        )?;
+                        refine::identify::save_identify(&dir, &idoc)?;
+                        let _ = app.emit("identify_done", note_id.clone());
+                        Ok(())
+                    })();
+                    if let Err(e) = identify_result {
+                        eprintln!("identify({note_id}): 推断失败(不影响精修): {e}");
+                    }
+                }
                 // 图谱是纯增值产物:成功 Aing 只把全量重建标脏。scheduler 合并并发请求，
                 // 从 ledger + 全部 aing.json 取快照后原子替换；失败保留旧库且不打断 Aing。
                 if !http_refine_handled && doc.stages.llm == "done" {
@@ -2351,6 +2379,24 @@ fn relation_executor(
     }
 }
 
+/// identify(P2a)执行体分派:门禁复用 refine_llm_ready 全套——用户关闭精修或
+/// 配置不齐时返回 Err,调用方一律按「静默跳过」处理,绝不绕过外发授权。
+/// agent provider 的 identify 执行体另立计划,在那之前同样跳过。
+fn identify_executor(
+    settings: &settings::Settings,
+) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
+    if !refine_llm_ready(settings) {
+        anyhow::bail!("identify 需要已启用且配置齐全的 HTTP 精修");
+    }
+    Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
+        refine::llm::LlmConfig {
+            base_url: settings.refine_base_url.clone(),
+            model: settings.refine_model.clone(),
+            api_key: settings.refine_api_key.clone(),
+        },
+    )?))
+}
+
 fn spawn_relation_backfill_worker<Spawn, Worker, EmitFailure>(
     gate: refine::backfill::BackfillGate,
     initial: ipc::BackfillProgress,
@@ -3224,24 +3270,37 @@ fn assign_refined_person(
     speaker_id: String,
     person_id: String,
 ) -> Result<(), String> {
+    do_assign_refined_person(&app, &note_id, &speaker_id, &person_id)
+}
+
+/// 修订稿说话人关联的可复用本体:assign_refined_person 命令与 identify 建议确认
+/// (apply_identify_suggestion)共用。自带 Aing 中拒绝守卫;内部 store 写入自取
+/// NoteLock,调用方不得持任何笔记锁(嵌套会死锁)。
+fn do_assign_refined_person(
+    app: &AppHandle,
+    note_id: &str,
+    speaker_id: &str,
+    person_id: &str,
+) -> Result<(), String> {
     // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(note_id) {
         return Err(tr!(
             "该笔记正在 Aing 中，稍后再改",
             "This note is being refined by AI; try again later"
         ));
     }
-    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    let vp = open_voiceprint_store(&app)?.load();
-    let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
+    store::validate_note_id(note_id).map_err(|e| e.to_string())?;
+    let vp = open_voiceprint_store(app)?.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, person_id).map(str::to_string) else {
         return Err(tr!(
             "声纹库中没有该人物: {person_id}",
-            "No such person in the voiceprint library: {person_id}"
+            "No such person in the voiceprint library: {person_id}",
+            person_id = person_id
         ));
     };
     let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
-    let root = notes_dir(&app).map_err(|e| e.to_string())?;
-    let dir = root.join(&note_id);
+    let root = notes_dir(app).map_err(|e| e.to_string())?;
+    let dir = root.join(note_id);
     // 纠错回灌输入(prior 与 R 段落 seq 集合)必须在写入前读取:写入后
     // person_id 已变,读不到"先前关联"了。
     let feedback_input = store::load_refined(&dir).map(|doc| {
@@ -3255,13 +3314,13 @@ fn assign_refined_person(
             .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
         (seqs, prior)
     });
-    store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())?;
+    store::assign_refined_person(&dir, speaker_id, &resolved, &name).map_err(|e| e.to_string())?;
     if let Some((seqs, prior)) = feedback_input {
         if !seqs.is_empty() {
-            match store::NoteStore::new(root).load(&note_id) {
+            match store::NoteStore::new(root).load(note_id) {
                 Ok(note) => spawn_feedback(
-                    &app,
-                    note_id,
+                    app,
+                    note_id.to_string(),
                     note.segments,
                     feedback::SegFilter::Seqs(seqs),
                     prior,
@@ -3271,6 +3330,261 @@ fn assign_refined_person(
             }
         }
     }
+    Ok(())
+}
+
+/// 手动触发/重试 identify(P2a):从现稿重建簇成员与簇质心(逐段重嵌入,复用
+/// P1 feedback 纯逻辑核),走管线同一 run_identify。门禁同管线(refine_llm_ready
+/// 内含于 identify_executor);持 FEEDBACK_GATE 全程——嵌入并发与 track_pcm
+/// 临时文件竞争都收敛于此门。
+#[tauri::command]
+async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&id) {
+        return Err(tr!(
+            "该笔记正在 Aing 中,稍后再试",
+            "This note is being refined; try again later"
+        ));
+    }
+    reject_if_active(&state, &id)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let run = || -> anyhow::Result<()> {
+            let s = app2
+                .path()
+                .app_data_dir()
+                .map(|d| settings::load(&d))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let executor = identify_executor(&s)?;
+            let root = notes_dir(&app2)?;
+            let dir = root.join(&id);
+            let doc = store::load_refined(&dir)
+                .ok_or_else(|| anyhow::anyhow!(tr!("该笔记尚无精修稿,先运行 Aing", "No refined doc yet; run Aing first")))?;
+            let note = store::NoteStore::new(root).load(&id)?;
+            let vp = open_voiceprint_store(&app2).map_err(anyhow::Error::msg)?.load();
+            let acoustic_enabled = vp.embedding_model == s.speaker_model;
+            let _gate = FEEDBACK_GATE.lock().unwrap();
+
+            // 簇质心重建:每簇成员段逐段重嵌入(与管线路径的 recluster 统计等价口径)。
+            let members = refine::identify::cluster_members_from_doc(&doc);
+            let mut stats: Vec<refine::recluster::ClusterStat> = Vec::new();
+            if acoustic_enabled {
+                let meta = store::audio::load_audio_meta(&dir);
+                let mut pcm_by_source: std::collections::BTreeMap<String, (u64, Vec<f32>)> =
+                    Default::default();
+                for source in note
+                    .segments
+                    .iter()
+                    .map(|sg| sg.source.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    match store::transcode::track_pcm(&dir, source) {
+                        Ok(pcm) => {
+                            let off = meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+                            pcm_by_source.insert(source.to_string(), (off, pcm));
+                        }
+                        Err(e) => eprintln!("identify({id}): 音轨 {source} 解码失败,该轨无声学: {e}"),
+                    }
+                }
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app2))?;
+                for (speaker, seqs) in &members {
+                    let segs: Vec<&store::SegmentRecord> =
+                        note.segments.iter().filter(|sg| seqs.contains(&sg.seq)).collect();
+                    let sstats = feedback::build_source_stats(&segs, &pcm_by_source, &mut embedder);
+                    let mut centroids = std::collections::BTreeMap::new();
+                    let mut source_ms = std::collections::BTreeMap::new();
+                    let mut total = 0u64;
+                    for (src, st) in sstats {
+                        total += st.total_ms;
+                        source_ms.insert(src.clone(), st.total_ms);
+                        centroids.insert(src, st.centroid);
+                    }
+                    stats.push(refine::recluster::ClusterStat {
+                        speaker: speaker.clone(),
+                        centroids,
+                        total_ms: total,
+                        source_ms,
+                        core_seqs: seqs.iter().copied().collect(),
+                        seed: None,
+                    });
+                }
+            }
+
+            let log_ctx = data_root(&app2)
+                .ok()
+                .map(|r| ailog::Ctx { data_root: r, note_id: id.clone() });
+            let now = chrono::Local::now().to_rfc3339();
+            let idoc = refine::identify::run_identify(
+                &dir,
+                &id,
+                &doc,
+                &stats,
+                &vp,
+                acoustic_enabled,
+                executor.as_ref(),
+                log_ctx.as_ref(),
+                &now,
+            )?;
+            refine::identify::save_identify(&dir, &idoc)?;
+            let _ = app2.emit("identify_done", id.clone());
+            Ok(())
+        };
+        run().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// identify 建议动作的命令级串行门:apply/reject 都是对同一 identify.json 的
+/// 读改写,UI 双击/并发确认全收敛于此(list 只读不受影响)。
+static IDENTIFY_ACT_GATE: Mutex<()> = Mutex::new(());
+
+/// 收件箱身份建议列表:扫各笔记 identify.json,只收 status=suggested 且「新鲜」
+/// (source_hash 与现稿一致、指纹仍对应某簇、该簇当前无关联、目标人仍在库)。
+#[tauri::command]
+fn list_identify_suggestions(app: AppHandle) -> Result<Vec<ipc::IdentifySuggestion>, String> {
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    let vp = open_voiceprint_store(&app)?.load();
+    let notes = store::NoteStore::new(root.clone()).list();
+    let mut out: Vec<ipc::IdentifySuggestion> = Vec::new();
+    for n in notes {
+        let dir = root.join(&n.id);
+        let Some(idoc) = refine::identify::load_identify(&dir) else { continue };
+        if idoc.assignments.iter().all(|a| a.status != "suggested") {
+            continue;
+        }
+        let Some(doc) = store::load_refined(&dir) else { continue };
+        if store::source_hash(&doc.paragraphs) != idoc.source_hash {
+            continue; // 稿已被精修/编辑,证据锚点不可信:等下轮 identify 重建
+        }
+        let members = refine::identify::cluster_members_from_doc(&doc);
+        let fp_to_speaker: std::collections::BTreeMap<String, String> = members
+            .iter()
+            .map(|(sp, seqs)| (refine::identify::cluster_fingerprint(seqs), sp.clone()))
+            .collect();
+        let linked: std::collections::BTreeSet<&str> = doc
+            .paragraphs
+            .iter()
+            .filter(|p| p.person_id.is_some())
+            .map(|p| p.speaker.as_str())
+            .collect();
+        for a in idoc.assignments.iter().filter(|a| a.status == "suggested") {
+            let Some(speaker) = fp_to_speaker.get(&a.fingerprint) else { continue };
+            if linked.contains(speaker.as_str()) {
+                continue; // 用户已手动关联,不再打扰
+            }
+            let (person_id, person_name, is_new) = match (&a.person_id, &a.new_name) {
+                (Some(pid), _) => {
+                    let Some(rid) = store::VoiceprintStore::resolve(&vp, pid) else { continue };
+                    let name = vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default();
+                    if name.trim().is_empty() {
+                        continue;
+                    }
+                    (Some(rid.to_string()), name, false)
+                }
+                (None, Some(nn)) => (None, nn.clone(), true),
+                _ => continue,
+            };
+            let ev = a.evidence.first();
+            out.push(ipc::IdentifySuggestion {
+                note_id: n.id.clone(),
+                note_title: n.title.clone(),
+                cluster: speaker.clone(),
+                fingerprint: a.fingerprint.clone(),
+                person_id,
+                person_name,
+                is_new,
+                tier: match a.tier {
+                    refine::identify::Tier::High => "high",
+                    refine::identify::Tier::Medium => "medium",
+                    refine::identify::Tier::Low => "low",
+                }
+                .into(),
+                quote: ev.map(|e| e.quote.clone()).unwrap_or_default(),
+                evidence_type: ev.map(|e| e.r#type.clone()).unwrap_or_default(),
+                generated_at: idoc.generated_at.clone(),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.generated_at.cmp(&a.generated_at));
+    out.truncate(50);
+    Ok(out)
+}
+
+/// 确认身份建议:锁外走 do_assign_refined_person(内部自取 NoteLock,不嵌套);
+/// 新面孔先建档,assign 失败补偿删除空档案;成功后回写 status=applied。
+#[tauri::command]
+async fn apply_identify_suggestion(
+    app: AppHandle,
+    note_id: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+        let dir = notes_dir(&app2).map_err(|e| e.to_string())?.join(&note_id);
+        let mut idoc = refine::identify::load_identify(&dir)
+            .ok_or_else(|| tr!("建议已失效", "Suggestion no longer valid"))?;
+        let a = idoc
+            .assignments
+            .iter()
+            .find(|a| a.fingerprint == fingerprint && a.status == "suggested")
+            .ok_or_else(|| tr!("建议已失效", "Suggestion no longer valid"))?
+            .clone();
+        // 指纹复核:现稿仍有该成员集的簇。R 号可以变(重聚类重编号),成员集不能变。
+        let doc = store::load_refined(&dir)
+            .ok_or_else(|| tr!("精修稿缺失", "Refined doc missing"))?;
+        let members = refine::identify::cluster_members_from_doc(&doc);
+        let speaker = members
+            .iter()
+            .find(|(_, seqs)| refine::identify::cluster_fingerprint(seqs) == fingerprint)
+            .map(|(sp, _)| sp.clone());
+        let now = chrono::Local::now().to_rfc3339();
+        let Some(speaker) = speaker else {
+            let _ = refine::identify::mark_rejected(&mut idoc, &fingerprint, &now);
+            let _ = refine::identify::save_identify(&dir, &idoc);
+            return Err(tr!(
+                "建议已过期(说话人分组已变化)",
+                "Suggestion expired (speaker clusters changed)"
+            ));
+        };
+        let vp_store = open_voiceprint_store(&app2)?;
+        let (target, created) = match (&a.person_id, &a.new_name) {
+            (Some(pid), _) => (pid.clone(), false),
+            (None, Some(nn)) => (vp_store.create_person(nn, &now).map_err(|e| e.to_string())?, true),
+            _ => return Err(tr!("建议数据异常", "Corrupt suggestion")),
+        };
+        if let Err(e) = do_assign_refined_person(&app2, &note_id, &speaker, &target) {
+            if created {
+                let _ = vp_store.delete_person_if_empty(&target);
+            }
+            return Err(e);
+        }
+        refine::identify::mark_applied(&mut idoc, &fingerprint, &now).map_err(|e| e.to_string())?;
+        refine::identify::save_identify(&dir, &idoc).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 拒绝身份建议:status=rejected + 拒绝表记「指纹|目标」——同目标永不再建议,
+/// 其它候选不受影响。走后端真值,不用前端 dismissed 字符串名单。
+#[tauri::command]
+fn reject_identify_suggestion(
+    app: AppHandle,
+    note_id: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+    let mut idoc = refine::identify::load_identify(&dir)
+        .ok_or_else(|| tr!("建议已失效", "Suggestion no longer valid"))?;
+    let now = chrono::Local::now().to_rfc3339();
+    refine::identify::mark_rejected(&mut idoc, &fingerprint, &now).map_err(|e| e.to_string())?;
+    refine::identify::save_identify(&dir, &idoc).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -5446,6 +5760,10 @@ pub fn run() {
             list_notes,
             get_note,
             refine_note,
+            identify_note,
+            list_identify_suggestions,
+            apply_identify_suggestion,
+            reject_identify_suggestion,
             get_refined,
             retranscribe_note,
             retranscribe_status,

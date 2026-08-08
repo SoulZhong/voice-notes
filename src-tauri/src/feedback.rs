@@ -181,7 +181,9 @@ struct LedgerEntry {
     after: String,
 }
 
-fn scope_key(seqs: &BTreeSet<u64>) -> String {
+/// 段集合指纹:sha256(升序 seq 的 LE 字节) 前 8 字节 hex。P1 回灌账本与
+/// P2a identify 的簇指纹共用同一口径(speaker_eval 里有复刻,改动需三处同步)。
+pub(crate) fn seq_fingerprint(seqs: &BTreeSet<u64>) -> String {
     let mut h = Sha256::new();
     for s in seqs {
         h.update(s.to_le_bytes());
@@ -241,7 +243,7 @@ pub fn reinforce_person(
     }
 
     let seq_set: BTreeSet<u64> = wanted.iter().map(|s| s.seq).collect();
-    let key = scope_key(&seq_set);
+    let key = seq_fingerprint(&seq_set);
     let mut ledger = load_ledger(note_dir);
     if let Some(prev) = ledger.entries.get(&key) {
         if prev.person_id == person_id {

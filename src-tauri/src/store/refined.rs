@@ -191,6 +191,16 @@ impl AnchoredRefinedDir {
         Ok(Some(parse_doc(&self.note_id, &bytes)?))
     }
 
+    /// 只读当前 identify.json(refine::identify 的身份推断产物;文件名与
+    /// identify::IDENTIFY_FILE 一致,store 不反向依赖 refine 故用字面量)。
+    /// 缺失返回 None;与 load_current 同一锚定防护(mcp::tools 消费)。
+    pub(crate) fn load_identify_value(&self) -> anyhow::Result<Option<serde_json::Value>> {
+        let Some(bytes) = self.read_optional("identify.json")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
     /// 已持锁加载当前真值；只有 aing.json 确实不存在才读旧稿并尝试迁移。
     pub(crate) fn load_locked(&self, lock: &NoteLock) -> anyhow::Result<Option<RefinedDoc>> {
         if let Some(bytes) = self.read_optional(AING_DOC_FILE)? {

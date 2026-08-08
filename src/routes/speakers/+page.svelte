@@ -3,13 +3,16 @@
   import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     acknowledgeMerge,
+    applyIdentifySuggestion,
     deletePerson,
     listPeople,
     mergePerson,
     personNotes,
+    rejectIdentifySuggestion,
     renamePerson,
     restoreMergedPerson,
     undoMerge,
+    type IdentifySuggestion,
     type MergeReceipt,
     type PersonMergeSuggestion,
     type PersonSummary,
@@ -51,7 +54,7 @@
 
   const personById = $derived(new Map(people.map((p) => [p.id, p])));
   const queueParts = $derived(
-    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed)),
+    splitArchive(buildTidyQueue(people, tidy.visible, tidy.receipts, tidy.dismissed, tidy.visibleIdentify)),
   );
   const queue = $derived(queueParts.pending);
   const archived = $derived(queueParts.archived);
@@ -87,6 +90,7 @@
     if (item.kind === "suggestion") return [item.suggestion.loser, item.suggestion.winner];
     if (item.kind === "receipt") return [item.receipt.winner];
     if (item.kind === "dup") return item.people.map((p) => p.id);
+    if (item.kind === "identify") return item.suggestion.person_id ? [item.suggestion.person_id] : [];
     return [item.person.id];
   }
   // 首屏可见范围懒加载:queue 前 12 张卡涉及的人物才主动拉会议上下文,滚动到
@@ -226,6 +230,34 @@
       errKey,
     );
   }
+  /** 证据类型 → 展示文案(词典键强类型,不走模板串键)。 */
+  function evidenceLabel(ty: string): string {
+    if (ty === "self_intro") return t("speakers.identifyEvSelfIntro");
+    if (ty === "addressed_reply") return t("speakers.identifyEvReply");
+    if (ty === "third_person_exclusion") return t("speakers.identifyEvExclusion");
+    return t("speakers.identifyEvTopic");
+  }
+  /** 身份建议「就是 TA」:后端确认(关联+回灌+建档),成功即乐观收起。 */
+  async function doApplyIdentify(s: IdentifySuggestion) {
+    await act(
+      async () => {
+        await applyIdentifySuggestion(s.note_id, s.fingerprint);
+      },
+      () => tidy.removeIdentify(s.note_id, s.fingerprint),
+      `i:${s.note_id}:${s.fingerprint}`,
+    );
+  }
+  /** 身份建议「不是」:后端拒绝(同目标永久静默),成功即乐观收起。 */
+  async function doRejectIdentify(s: IdentifySuggestion) {
+    await act(
+      async () => {
+        await rejectIdentifySuggestion(s.note_id, s.fingerprint);
+      },
+      () => tidy.removeIdentify(s.note_id, s.fingerprint),
+      `i:${s.note_id}:${s.fingerprint}`,
+    );
+  }
+
   function doDismiss(item: TidyItem) {
     tidy.dismiss(tidyItemKey(item));
   }
@@ -480,6 +512,34 @@
           {#each queue as item (tidyItemKey(item))}
             {#if item.kind === "receipt"}
               {@render receiptCard(item.receipt)}
+            {:else if item.kind === "identify"}
+              {@const s = item.suggestion}
+              <section class="card">
+                <div class="card-tag">{t("speakers.tagIdentify")}</div>
+                <div class="card-title">
+                  {s.is_new
+                    ? t("speakers.identifyTitleNew", { name: s.person_name })
+                    : t("speakers.identifyTitle", { name: s.person_name })}
+                  {#if s.tier === "high"}
+                    <span class="sim strong">{t("speakers.identifyTierHigh")}</span>
+                  {/if}
+                </div>
+                <p class="hint">
+                  {t("speakers.identifyMeta", { title: s.note_title, cluster: s.cluster })}
+                </p>
+                {#if s.quote}
+                  <p class="hint">
+                    {t("speakers.identifyQuote", { quote: s.quote, kind: evidenceLabel(s.evidence_type) })}
+                  </p>
+                {/if}
+                <div class="acts">
+                  <button class="mini accent" disabled={busy || live} onclick={() => doApplyIdentify(s)}>
+                    {s.is_new ? t("speakers.identifyApplyNew") : t("speakers.identifyApply")}
+                  </button>
+                  <button class="mini" disabled={busy} onclick={() => doRejectIdentify(s)}>{t("speakers.identifyReject")}</button>
+                </div>
+                {@render cardError(tidyItemKey(item))}
+              </section>
             {:else if item.kind === "suggestion"}
               {@const s = item.suggestion}
               {@const skey = `${s.loser}>${s.winner}`}

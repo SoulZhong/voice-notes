@@ -110,6 +110,63 @@ fn read_json(path: &std::path::Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// 簇指纹复刻:sha256(升序 seq 的 LE 字节) 前 8 字节 hex。与库内
+/// feedback::seq_fingerprint / refine::identify::cluster_fingerprint 同口径;
+/// 本 bin 刻意不依赖库 crate,算法漂移由 fingerprint_locks_algorithm 测试钉死。
+fn fingerprint(seqs: &std::collections::BTreeSet<u64>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for s in seqs {
+        h.update(s.to_le_bytes());
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
+/// 修订稿(aing.json/refined.json)→ 每个 R 簇的成员 seq 集。
+fn doc_members(doc: &Value) -> BTreeMap<String, std::collections::BTreeSet<u64>> {
+    let mut out: BTreeMap<String, std::collections::BTreeSet<u64>> = BTreeMap::new();
+    for p in doc["paragraphs"].as_array().cloned().unwrap_or_default() {
+        let Some(spk) = p["speaker"].as_str() else { continue };
+        let seqs = p["source_seqs"].as_array().cloned().unwrap_or_default();
+        let entry = out.entry(spk.to_string()).or_default();
+        for q in seqs {
+            if let Some(v) = q.as_u64() {
+                entry.insert(v);
+            }
+        }
+    }
+    out
+}
+
+/// identify.json → (note,R簇) 的推断预测:(tier, person_id, person_name/new_name)。
+/// 按指纹匹配现稿簇(R 号会随重聚类变化,指纹不会);status 无关——评测用生成时
+/// 原始裁决,人工决策不污染模型准确率。new_name 条目 person_id 为空、按名字比对。
+fn identify_predictions(
+    note_id: &str,
+    idoc: &Value,
+    members: &BTreeMap<String, std::collections::BTreeSet<u64>>,
+    people: &BTreeMap<String, Value>,
+    redirects: &BTreeMap<String, String>,
+) -> BTreeMap<(String, String), (String, String, String)> {
+    let fp_to_speaker: BTreeMap<String, String> =
+        members.iter().map(|(sp, seqs)| (fingerprint(seqs), sp.clone())).collect();
+    let mut out = BTreeMap::new();
+    for a in idoc["assignments"].as_array().cloned().unwrap_or_default() {
+        let Some(fp) = a["fingerprint"].as_str() else { continue };
+        let Some(spk) = fp_to_speaker.get(fp) else { continue };
+        let tier = a["tier"].as_str().unwrap_or("low").to_string();
+        let (pid, name) = match a["person_id"].as_str() {
+            Some(p) => match resolve(redirects, people, p) {
+                Some(rid) => (rid.to_string(), people[rid]["name"].as_str().unwrap_or("").to_string()),
+                None => continue,
+            },
+            None => (String::new(), a["new_name"].as_str().unwrap_or("").to_string()),
+        };
+        out.insert((note_id.to_string(), spk.clone()), (tier, pid, name));
+    }
+    out
+}
+
 /// 标注模板:S 层逐说话人一行(含 segments 里出现但缺 metadata 的孤儿 id),
 /// R 层逐修订稿说话人一行;# 注释行给名字线索与首段文本。
 fn init(notes_dir: &str, note_id: &str) -> i32 {
@@ -202,6 +259,8 @@ fn run(notes_dir: &str, vp_path: &str, truth_path: &str) -> i32 {
 
     // 按 note 分组各读一次;S 层读 speakers.json,R 层读 aing.json/refined.json。
     let mut predicted: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    // identify 分档预测:(note,R簇) -> (tier, person_id, name)。
+    let mut identify_pred: BTreeMap<(String, String), (String, String, String)> = BTreeMap::new();
     let mut by_note: BTreeMap<&str, Vec<&(String, String, String)>> = BTreeMap::new();
     for t in &truth {
         by_note.entry(t.0.as_str()).or_default().push(t);
@@ -212,6 +271,10 @@ fn run(notes_dir: &str, vp_path: &str, truth_path: &str) -> i32 {
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let doc = read_json(&dir.join("aing.json")).or_else(|| read_json(&dir.join("refined.json")));
+        if let (Some(d), Some(idoc)) = (doc.as_ref(), read_json(&dir.join("identify.json"))) {
+            let members = doc_members(d);
+            identify_pred.extend(identify_predictions(note_id, &idoc, &members, &people, &redirects));
+        }
         for (_, spk, _) in rows {
             let pid = if spk.starts_with('R') {
                 doc.as_ref().and_then(|d| {
@@ -238,6 +301,33 @@ fn run(notes_dir: &str, vp_path: &str, truth_path: &str) -> i32 {
         100.0 * m.precision(),
         100.0 * m.recall()
     );
+
+    // identify 分档评测:R 层真值 × identify 推断(按指纹匹配,status 无关)。
+    if !identify_pred.is_empty() {
+        let r_truth: Vec<(String, String, String)> =
+            truth.iter().filter(|(_, spk, _)| spk.starts_with('R')).cloned().collect();
+        let new_name_n = identify_pred.values().filter(|(_, pid, _)| pid.is_empty()).count();
+        for (label, tiers) in [
+            ("high", &["high"][..]),
+            ("high+medium", &["high", "medium"][..]),
+            ("all", &["high", "medium", "low"][..]),
+        ] {
+            let bucket: BTreeMap<(String, String), (String, String)> = identify_pred
+                .iter()
+                .filter(|(_, (tier, _, _))| tiers.contains(&tier.as_str()))
+                .map(|(k, (_, pid, name))| (k.clone(), (pid.clone(), name.clone())))
+                .collect();
+            let bm = score(&r_truth, &bucket);
+            println!(
+                "[identify] {label}: 标注 {} 正确 {} 误认 {} 未识别 {}  precision {:.1}% recall {:.1}%",
+                bm.labeled, bm.correct, bm.wrong, bm.unassigned,
+                100.0 * bm.precision(), 100.0 * bm.recall()
+            );
+        }
+        if new_name_n > 0 {
+            println!("[identify] 含 {new_name_n} 条新面孔预测(按名字比对,同名风险自担)");
+        }
+    }
     0
 }
 
@@ -342,5 +432,39 @@ mod tests {
             run(root.path().to_str().unwrap(), vp.to_str().unwrap(), truth.to_str().unwrap()),
             2
         );
+    }
+    #[test]
+    fn fingerprint_locks_algorithm() {
+        // 与库内 feedback::seq_fingerprint 同口径:sha256(LE u64 序列) 前 8 字节 hex。
+        // 固定向量钉死算法,任何一侧改动都会在此炸出。
+        let seqs: std::collections::BTreeSet<u64> = [0u64, 1].into_iter().collect();
+        assert_eq!(fingerprint(&seqs), "9d34149fbd1fe777");
+    }
+
+    #[test]
+    fn identify_predictions_match_by_fingerprint_not_r_number() {
+        // 现稿 R9 的成员集 {0,1} 与 identify 里存的指纹一致:即便当年叫 R2,
+        // 仍应命中;不匹配的指纹被跳过。
+        let doc = serde_json::json!({
+            "paragraphs": [
+                { "speaker": "R9", "source_seqs": [0, 1], "text": "a" }
+            ]
+        });
+        let members = doc_members(&doc);
+        let seqs: std::collections::BTreeSet<u64> = [0u64, 1].into_iter().collect();
+        let idoc = serde_json::json!({
+            "assignments": [
+                { "fingerprint": fingerprint(&seqs), "cluster": "R2", "person_id": "P1",
+                  "tier": "high", "status": "suggested" },
+                { "fingerprint": "dead00000000beef", "cluster": "R3", "person_id": "P1",
+                  "tier": "high", "status": "suggested" }
+            ]
+        });
+        let mut people = BTreeMap::new();
+        people.insert("P1".to_string(), serde_json::json!({ "name": "张伟" }));
+        let preds = identify_predictions("n1", &idoc, &members, &people, &BTreeMap::new());
+        assert_eq!(preds.len(), 1);
+        let (tier, pid, name) = &preds[&("n1".to_string(), "R9".to_string())];
+        assert_eq!((tier.as_str(), pid.as_str(), name.as_str()), ("high", "P1", "张伟"));
     }
 }

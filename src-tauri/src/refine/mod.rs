@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod backfill;
 pub mod filter;
+pub mod identify;
 pub mod llm;
 pub mod recluster;
 pub mod relations;
@@ -252,7 +253,7 @@ pub fn run_local(
     embedder: Option<&mut dyn SpeakerEmbedder>,
     seeds: &[SeedCluster],
     generated_at: &str,
-) -> anyhow::Result<RefinedDoc> {
+) -> anyhow::Result<(RefinedDoc, Vec<recluster::ClusterStat>)> {
     let discarded = filter::discarded_seqs(segs);
     let kept: Vec<&SegmentRecord> = segs
         .iter()
@@ -270,15 +271,20 @@ pub fn run_local(
         })
         .collect();
 
-    let (assign, recluster_state) = match embedder {
+    // cluster_stats 是 identify(P2a)的声学输入,随 doc 一并返回;
+    // 降级/无嵌入路径没有簇统计,identify 拿到空表自然只走文本档。
+    let (assign, cluster_stats, recluster_state) = match embedder {
         Some(e) => match embed_all(note_dir, &kept, e) {
-            Ok(embs) => (recluster::recluster(&inputs, &embs, seeds), "done"),
+            Ok(embs) => {
+                let (assign, stats) = recluster::recluster(&inputs, &embs, seeds);
+                (assign, stats, "done")
+            }
             Err(err) => {
                 eprintln!("refine: 嵌入失败,重聚类降级: {err}");
-                (fallback_assign(&inputs), "failed")
+                (fallback_assign(&inputs), vec![], "failed")
             }
         },
-        None => (fallback_assign(&inputs), "skipped"),
+        None => (fallback_assign(&inputs), vec![], "skipped"),
     };
 
     let paragraphs = build_paragraphs(segs, &discarded, &assign, speakers);
@@ -323,7 +329,7 @@ pub fn run_local(
     }
     crate::store::ensure_graph_ids(note_id, &mut doc);
     crate::store::refined::write_refined_atomic_locked(note_dir, &doc, &note_lock)?;
-    Ok(doc)
+    Ok((doc, cluster_stats))
 }
 
 /// 时间轴 ms 区间 → 该轨文件内的 PCM 样本下标区间(16kHz 单声道,1ms=16 样本)。
@@ -1387,7 +1393,7 @@ mod tests {
             dirs: vec![a, a, b],
             i: 0,
         };
-        let doc = run_local(
+        let (doc, _) = run_local(
             dir.path(),
             &segs,
             &BTreeMap::new(),
@@ -1424,7 +1430,7 @@ mod tests {
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
-        let doc = run_local(dir.path(), &segs, &speakers, None, &[], "t").unwrap();
+        let (doc, _) = run_local(dir.path(), &segs, &speakers, None, &[], "t").unwrap();
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert_eq!(
@@ -2278,7 +2284,7 @@ mod tests {
         let baseline_graph = graph_bytes(&baseline);
         let segments = vec![seg(7, "mic", "李四负责火星计划", 0, 4000, "S1")];
 
-        let doc = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time").unwrap();
+        let (doc, _) = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time").unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
         assert_eq!(graph_bytes(&doc), baseline_graph);
@@ -2433,7 +2439,7 @@ mod tests {
         let mut embedder = crate::diar::SherpaEmbedder::new(&model_path)
             .expect("加载声纹模型失败(设置 VN_MODELS 指向模型目录)");
 
-        let doc = run_local(
+        let (doc, _) = run_local(
             &dst,
             &note.segments,
             &note.speakers,
