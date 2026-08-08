@@ -53,7 +53,7 @@ const CONTRIBUTION_RING_CAP: usize = 64;
 /// 分布。与 store 层 suggest_merges 的同名门槛(voiceprints.rs:877)同值同理——
 /// 两处场景不同(这里是种子注入时预计算,那边是整理建议时计算)各自独立定义，
 /// 不共享同一常量,避免跨模块耦合。
-const SNORM_MIN_COHORT: usize = 3;
+pub(crate) const SNORM_MIN_COHORT: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerInfo {

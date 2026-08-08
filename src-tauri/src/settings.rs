@@ -144,6 +144,11 @@ pub struct Settings {
     /// 路径未授权即静默跳过),默认开不会造成 surprise 弹窗。
     #[serde(default = "default_true")]
     pub calendar_match_enabled: bool,
+    /// P2b 自动应用:high 档身份推断自动关联+回灌(回执可撤销)。默认关——
+    /// 开启门槛是评测数据达标(spec:≥20 场标注、high 档 ≥50 样本误认 ≤1%),
+    /// 由用户在设置页自行拨开。
+    #[serde(default)]
+    pub identify_auto_apply: bool,
 }
 
 fn default_prefix() -> String {
@@ -234,6 +239,7 @@ impl Default for Settings {
             mcp_onboarded: false,
             mix_track: false,
             calendar_match_enabled: true,
+            identify_auto_apply: false,
         }
     }
 }
@@ -606,6 +612,13 @@ mod tests {
         // 显式 false 尊重用户选择。
         let off: Settings = serde_json::from_str(r#"{"calendar_match_enabled":false}"#).unwrap();
         assert!(!off.calendar_match_enabled);
+    }
+
+    #[test]
+    fn identify_auto_apply_defaults_to_false() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.identify_auto_apply, "自动应用必须默认关(评测数据门未过)");
+        assert!(!Settings::default().identify_auto_apply);
     }
 
 }

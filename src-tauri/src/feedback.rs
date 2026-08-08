@@ -139,6 +139,49 @@ pub enum ReinforceResult {
     SkippedUnknownPerson,
 }
 
+/// P2b 撤销结果:三态——还原成功 / 不可还原(带原因,持久化到 op 记录)/ 无账。
+#[derive(Debug, PartialEq)]
+pub enum UndoOutcome {
+    Restored,
+    NotRevertible(&'static str),
+    NoEntry,
+}
+
+/// 按操作 id 撤销一次自动回灌:scope 账本条目必须是**同一 op** 写的(后续人工
+/// 回灌会覆盖同 scope 条目,凭 scope 撤销会错撤人工作业);person 经 redirects
+/// 归一比较(合并后 id 变身);restore 被后续写挡下时如实报不可还原。
+pub fn undo_reinforce_op(
+    note_dir: &Path,
+    seqs: &BTreeSet<u64>,
+    expect_person: &str,
+    op_id: &str,
+    vp: &crate::store::VoiceprintStore,
+) -> anyhow::Result<UndoOutcome> {
+    let key = seq_fingerprint(seqs);
+    let mut ledger = load_ledger(note_dir);
+    let Some(entry) = ledger.entries.get(&key) else {
+        return Ok(UndoOutcome::NoEntry);
+    };
+    if entry.op_id.as_deref() != Some(op_id) {
+        return Ok(UndoOutcome::NotRevertible("superseded"));
+    }
+    let lib = vp.load();
+    let entry_person = crate::store::VoiceprintStore::resolve(&lib, &entry.person_id);
+    let expect = crate::store::VoiceprintStore::resolve(&lib, expect_person);
+    if entry_person.is_none() || entry_person != expect {
+        return Ok(UndoOutcome::NotRevertible("person-mismatch"));
+    }
+    let restored = vp.restore_feedback(&entry.person_id, &entry.before, &entry.after)?;
+    if !restored {
+        return Ok(UndoOutcome::NotRevertible("touched-since"));
+    }
+    ledger.entries.remove(&key);
+    if let Err(e) = save_ledger(note_dir, &ledger) {
+        eprintln!("feedback: 撤销后账本清理失败(无害): {e}");
+    }
+    Ok(UndoOutcome::Restored)
+}
+
 /// 指认后的回灌分派决策(纯函数,可单测;IPC 挂钩壳只做 IO)。
 /// prior = 该说话人指认前已关联的库人物(resolve 后的 id 与名字)。
 #[derive(Debug, PartialEq)]
@@ -179,6 +222,10 @@ struct LedgerEntry {
     /// 还原凭据(reinforce_feedback 返回的前后快照)。
     before: String,
     after: String,
+    /// P2b:自动应用的操作 id——撤销按 op 对账,scope 键会被后续人工回灌覆盖,
+    /// 不能只凭 scope 判断"这是我那次写的"。人工路径为 None(serde 兼容 P1 数据)。
+    #[serde(default)]
+    op_id: Option<String>,
 }
 
 /// 段集合指纹:sha256(升序 seq 的 LE 字节) 前 8 字节 hex。P1 回灌账本与
@@ -219,6 +266,7 @@ pub fn reinforce_person(
     expected_model: &str,
     embedder: &mut dyn SpeakerEmbedder,
     now: &str,
+    op_id: Option<&str>,
 ) -> anyhow::Result<ReinforceResult> {
     // 门禁:与种子注入同一严格语义(lib.rs 模型门禁)。
     if library_model != expected_model {
@@ -286,6 +334,7 @@ pub fn reinforce_person(
             at: now.to_string(),
             before: applied.person_before,
             after: applied.person_after,
+            op_id: op_id.map(str::to_string),
         },
     );
     if let Err(e) = save_ledger(note_dir, &ledger) {
@@ -450,12 +499,12 @@ mod tests {
         let model = store.load().embedding_model.clone();
 
         let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1").unwrap();
+        let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None).unwrap();
         assert!(matches!(r1, ReinforceResult::Applied { .. }), "{r1:?}");
         let total_after_first = store.load().people[&pid].total_ms;
 
         let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb2, "t2").unwrap();
+        let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb2, "t2", None).unwrap();
         assert_eq!(r2, ReinforceResult::SkippedAlreadyDone, "同段集合同人重复指认不得重复加权");
         assert_eq!(store.load().people[&pid].total_ms, total_after_first);
     }
@@ -490,13 +539,13 @@ mod tests {
         let model = store.load().embedding_model.clone();
 
         let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &filter, &pid_a, &store, &model, &model, &mut emb, "t1").unwrap();
+        reinforce_person(note.path(), &segs, &filter, &pid_a, &store, &model, &model, &mut emb, "t1", None).unwrap();
         let a_total_polluted = store.load().people[&pid_a].total_ms;
         assert!(a_total_polluted > 12_000);
 
         // 纠错:同段集合改指 B → A 的上次回灌应被还原(未被动过),B 获得回灌。
         let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &model, &model, &mut emb2, "t2").unwrap();
+        let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &model, &model, &mut emb2, "t2", None).unwrap();
         assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
         assert_eq!(store.load().people[&pid_a].total_ms, 12_000, "A 的回灌应还原");
         assert!(store.load().people[&pid_b].total_ms > 12_000, "B 获得回灌");
@@ -511,13 +560,13 @@ mod tests {
         let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
         let mut emb = MockEmbedder::new(vec![Ok(unit(0))]);
         // 门禁:严格相等,库侧默认模型 vs 期望 "eres2netv2" → 跳过。
-        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, "campplus", "eres2netv2", &mut emb, "t")
+        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, "campplus", "eres2netv2", &mut emb, "t", None)
             .unwrap();
         assert_eq!(r, ReinforceResult::SkippedModelMismatch);
         // 悬空人物:在解码/嵌入之前就短路。
         write_wav(&note.path().join("mic.wav"), 2000);
         let model = store.load().embedding_model.clone();
-        let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t").unwrap();
+        let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t", None).unwrap();
         assert_eq!(r2, ReinforceResult::SkippedUnknownPerson);
     }
     #[test]
@@ -535,4 +584,36 @@ mod tests {
             "有名先前人物=纠错,只灌新人"
         );
     }
+    #[test]
+    fn undo_reinforce_op_accounts_by_op_id() {
+        let note = tempfile::tempdir().unwrap();
+        write_wav(&note.path().join("mic.wav"), 4000);
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
+        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let model = store.load().embedding_model.clone();
+        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
+
+        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", Some("iop-9"))
+            .unwrap();
+        // 错 op id:superseded,不撤。
+        assert_eq!(
+            undo_reinforce_op(note.path(), &seqs, &pid, "iop-other", &store).unwrap(),
+            UndoOutcome::NotRevertible("superseded")
+        );
+        // 对 op id:还原成功,total_ms 回落,账本清空。
+        assert_eq!(
+            undo_reinforce_op(note.path(), &seqs, &pid, "iop-9", &store).unwrap(),
+            UndoOutcome::Restored
+        );
+        assert_eq!(store.load().people[&pid].total_ms, 12_000);
+        assert_eq!(
+            undo_reinforce_op(note.path(), &seqs, &pid, "iop-9", &store).unwrap(),
+            UndoOutcome::NoEntry,
+            "重复撤销无账"
+        );
+    }
+
 }

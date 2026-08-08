@@ -407,6 +407,60 @@ fn dominant_and_mixed(stat: &ClusterStat) -> (String, bool) {
     (dominant, stat.total_ms > 0 && other_ms * 5 > stat.total_ms)
 }
 
+/// AS-Norm 对称 z(P2b,与 registry seed_z 同口径):
+/// - 查询侧 cohort:该簇质心 × 库内**其它**有名人物(经 redirects 归一)同信道主质心;
+/// - 目标侧 cohort:目标人同信道主质心 × 本场**其它**簇的同信道质心;
+/// 两侧任一 cohort 不足 SNORM_MIN_COHORT(3,与 registry 同值)返回 None(小库/
+/// 少簇回退裸余弦口径,不惩罚小库用户);z = 两侧 z 的均值。只服务自动应用资格,
+/// 不改 tier。向量维度不一致/非有限值一律跳过。
+pub fn asnorm_z(
+    cluster_speaker: &str,
+    target_person: &str,
+    stats: &[ClusterStat],
+    vp: &Voiceprints,
+) -> Option<f32> {
+    let stat = stats.iter().find(|s| s.speaker == cluster_speaker)?;
+    let (dominant, mixed) = dominant_and_mixed(stat);
+    if mixed {
+        return None;
+    }
+    let cluster_c = stat.centroids.get(&dominant)?;
+    let person_c = &vp.people.get(target_person)?.centroids.get(&dominant)?.vec;
+    let raw = dot(cluster_c, person_c)?;
+
+    let z_of = |raw: f32, cohort: &[f32]| -> Option<f32> {
+        if cohort.len() < crate::diar::registry::SNORM_MIN_COHORT {
+            return None;
+        }
+        let n = cohort.len() as f32;
+        let mean = cohort.iter().sum::<f32>() / n;
+        let var = cohort.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / n;
+        let std = var.sqrt().max(1e-6);
+        Some((raw - mean) / std)
+    };
+
+    // 查询侧:簇 × 其它有名人物。
+    let query_cohort: Vec<f32> = vp
+        .people
+        .iter()
+        .filter(|(pid, p)| {
+            VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && pid.as_str() != target_person
+                && !p.name.trim().is_empty()
+        })
+        .filter_map(|(_, p)| p.centroids.get(&dominant).and_then(|c| dot(cluster_c, &c.vec)))
+        .collect();
+    // 目标侧:目标人 × 其它簇(同信道质心)。
+    let person_cohort: Vec<f32> = stats
+        .iter()
+        .filter(|s| s.speaker != cluster_speaker)
+        .filter_map(|s| s.centroids.get(&dominant).and_then(|c| dot(person_c, c)))
+        .collect();
+    let zq = z_of(raw, &query_cohort)?;
+    let zp = z_of(raw, &person_cohort)?;
+    Some((zq + zp) / 2.0)
+}
+
 // ---------- 输出解析与裁决 ----------
 
 use serde::Deserialize;
@@ -655,6 +709,10 @@ pub struct IdentifyAssignment {
     pub tier: Tier,
     pub llm_confidence: String,
     pub acoustic: Option<(String, f32)>,
+    /// AS-Norm 对称 z(P2b:仅当 cohort 足够时可算;None=小库回退裸余弦口径)。
+    /// 只影响自动应用资格,不改 tier——开关关闭时行为与 P2a 完全一致。
+    #[serde(default)]
+    pub acoustic_z: Option<f32>,
     pub evidence: Vec<RawIdentifyEvidence>,
     /// suggested | applied | rejected。
     pub status: String,
@@ -716,7 +774,7 @@ pub fn run_identify(
         .collect();
     if let Some(o) = &old {
         for a in &o.assignments {
-            if a.status == "applied" {
+            if a.status == "applied" || a.status == "auto_applied" {
                 if let Some(speaker) = fp_to_speaker.get(&a.fingerprint) {
                     let key = a
                         .person_id
@@ -763,6 +821,10 @@ pub fn run_identify(
             (Some(v.target_key.clone()), None)
         };
         taken.insert(raw.cluster.clone(), v.target_key.clone());
+        // AS-Norm z 只对库内已有人可算(new_name 无质心);None=小库/少簇回退。
+        let acoustic_z = person_id
+            .as_deref()
+            .and_then(|pid| asnorm_z(&raw.cluster, pid, stats, vp));
         assignments.push(IdentifyAssignment {
             fingerprint,
             cluster: raw.cluster.clone(),
@@ -771,6 +833,7 @@ pub fn run_identify(
             tier: v.tier,
             llm_confidence: raw.confidence.clone(),
             acoustic: v.acoustic,
+            acoustic_z,
             evidence: v.evidence,
             status: "suggested".into(),
             decided_at: None,
@@ -804,17 +867,124 @@ pub fn extract_marked(stdout: &str, start_tag: &str, end_tag: &str) -> Option<St
     Some(payload.trim().to_string())
 }
 
-/// 人工确认:suggested → applied。找不到(已处理/指纹不符)报错,调用方转成
-/// 「建议已失效」提示。
-pub fn mark_applied(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> anyhow::Result<()> {
+/// 状态机:合法转移仅 suggested→{applied,auto_applied,rejected} 与
+/// auto_applied→{applied(确认),rejected(撤销)}。任意串直改状态是 bug 温床。
+pub fn mark_transition(
+    doc: &mut IdentifyDoc,
+    fingerprint: &str,
+    from: &[&str],
+    to: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    const LEGAL: [(&str, &str); 5] = [
+        ("suggested", "applied"),
+        ("suggested", "auto_applied"),
+        ("suggested", "rejected"),
+        ("auto_applied", "applied"),
+        ("auto_applied", "rejected"),
+    ];
     let a = doc
         .assignments
         .iter_mut()
-        .find(|a| a.fingerprint == fingerprint && a.status == "suggested")
+        .find(|a| a.fingerprint == fingerprint && from.contains(&a.status.as_str()))
         .ok_or_else(|| anyhow::anyhow!("建议不存在或已被处理"))?;
-    a.status = "applied".into();
+    anyhow::ensure!(
+        LEGAL.contains(&(a.status.as_str(), to)),
+        "非法状态转移: {} -> {to}",
+        a.status
+    );
+    a.status = to.into();
     a.decided_at = Some(now.to_string());
     Ok(())
+}
+
+// ---------- P2b:自动应用意向日志(auto_pending)与资格 ----------
+
+pub const IDENTIFY_OPS_FILE: &str = "identify_ops.json";
+
+/// 一次自动应用的持久化记录(spec identify_journal 的最小形态)。回执永续渲染
+/// 自此记录(含当时 R 号/seqs/目标/引文),不依赖当前指纹可定位;崩溃恢复按
+/// stage 前滚;撤销按 undo 状态位推进,bool 推断不可靠。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyOp {
+    pub op_id: String,
+    pub fingerprint: String,
+    pub cluster: String,
+    pub seqs: Vec<u64>,
+    pub target_person: String,
+    pub target_name: String,
+    /// 首条证据引文(回执上「因为 TA 说……」,稿变后仍可展示)。
+    pub quote: String,
+    pub created_at: String,
+    /// pending → assigned → reinforced → done。
+    pub stage: String,
+    #[serde(default)]
+    pub acknowledged: bool,
+    /// 回灌未发生的原因(模型门禁/无段等;None=正常回灌)。
+    #[serde(default)]
+    pub reinforce_skipped: Option<String>,
+    /// 撤销进度:None=未撤销;"undo_pending"→"link_cleared"→"undone"。
+    #[serde(default)]
+    pub undo_stage: Option<String>,
+    /// 撤销时质心未能还原的原因(touched-since/superseded/…;链路已断,如实示人)。
+    #[serde(default)]
+    pub non_revertible: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IdentifyOps {
+    #[serde(default)]
+    pub ops: Vec<IdentifyOp>,
+}
+
+pub fn load_ops(note_dir: &Path) -> IdentifyOps {
+    std::fs::read_to_string(note_dir.join(IDENTIFY_OPS_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_ops(note_dir: &Path, ops: &IdentifyOps) -> anyhow::Result<()> {
+    let tmp = note_dir.join(format!("{IDENTIFY_OPS_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(ops)?)?;
+    std::fs::rename(&tmp, note_dir.join(IDENTIFY_OPS_FILE))?;
+    Ok(())
+}
+
+/// 自动应用资格(P2b):tier 不受开关影响,资格另算——
+/// suggested + High + 库内人 + 声学正向确认存在 + z 可算时 z≥SEED_ASSIGN_Z +
+/// 该簇当前全部段 person_id 空且 name 空(有手填名的簇绝不自动动,撤销无法恢复名)。
+pub fn auto_apply_targets<'a>(
+    idoc: &'a IdentifyDoc,
+    doc: &RefinedDoc,
+) -> Vec<&'a IdentifyAssignment> {
+    let members = cluster_members_from_doc(doc);
+    let fp_to_speaker: BTreeMap<String, String> = members
+        .iter()
+        .map(|(sp, seqs)| (cluster_fingerprint(seqs), sp.clone()))
+        .collect();
+    idoc.assignments
+        .iter()
+        .filter(|a| {
+            a.status == "suggested"
+                && a.tier == Tier::High
+                && a.person_id.is_some()
+                && a.acoustic.is_some()
+                && a.acoustic_z.map_or(true, |z| z >= crate::diar::registry::SEED_ASSIGN_Z)
+                && fp_to_speaker.get(&a.fingerprint).is_some_and(|sp| {
+                    doc.paragraphs.iter().filter(|p| &p.speaker == sp).all(|p| {
+                        p.person_id.is_none()
+                            && p.name.as_deref().map_or(true, |n| n.trim().is_empty())
+                    })
+                })
+        })
+        .collect()
+}
+
+/// 人工确认:suggested → applied。找不到(已处理/指纹不符)报错,调用方转成
+/// 「建议已失效」提示。
+pub fn mark_applied(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> anyhow::Result<()> {
+    mark_transition(doc, fingerprint, &["suggested"], "applied", now)
 }
 
 /// 人工拒绝:suggested → rejected,并把「指纹|目标」写入拒绝表——同目标永不
@@ -823,15 +993,17 @@ pub fn mark_rejected(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> any
     let target = {
         let a = doc
             .assignments
-            .iter_mut()
-            .find(|a| a.fingerprint == fingerprint && a.status == "suggested")
+            .iter()
+            .find(|a| {
+                a.fingerprint == fingerprint
+                    && (a.status == "suggested" || a.status == "auto_applied")
+            })
             .ok_or_else(|| anyhow::anyhow!("建议不存在或已被处理"))?;
-        a.status = "rejected".into();
-        a.decided_at = Some(now.to_string());
         a.person_id
             .clone()
             .unwrap_or_else(|| format!("name:{}", a.new_name.clone().unwrap_or_default()))
     };
+    mark_transition(doc, fingerprint, &["suggested", "auto_applied"], "rejected", now)?;
     doc.rejected.insert(rejected_key(fingerprint, &target), now.to_string());
     Ok(())
 }
@@ -1174,7 +1346,7 @@ mod tests {
             assignments: vec![IdentifyAssignment {
                 fingerprint: fp_r1.clone(), cluster: "R1".into(),
                 person_id: Some("P1".into()), new_name: None,
-                tier: Tier::High, llm_confidence: "high".into(), acoustic: None,
+                tier: Tier::High, llm_confidence: "high".into(), acoustic: None, acoustic_z: None,
                 evidence: vec![], status: "applied".into(), decided_at: Some("t4".into()),
             }],
             rejected: BTreeMap::new(),
@@ -1208,7 +1380,7 @@ mod tests {
             assignments: vec![IdentifyAssignment {
                 fingerprint: "fp1".into(), cluster: "R1".into(),
                 person_id: Some("P1".into()), new_name: None,
-                tier: Tier::High, llm_confidence: "high".into(), acoustic: None,
+                tier: Tier::High, llm_confidence: "high".into(), acoustic: None, acoustic_z: None,
                 evidence: vec![], status: "suggested".into(), decided_at: None,
             }],
             rejected: BTreeMap::new(),
@@ -1271,6 +1443,121 @@ mod tests {
         // 两对取最后一对。
         let two = format!("{st}old{en} mid {st}new{en}");
         assert_eq!(extract_marked(&two, st, en).unwrap(), "new");
+    }
+
+    // ---------- P2b:状态机 / 自动资格 / 合并保留 ----------
+
+    fn ass(fp: &str, tier: Tier, person: Option<&str>, status: &str, ac: bool, z: Option<f32>) -> IdentifyAssignment {
+        IdentifyAssignment {
+            fingerprint: fp.into(),
+            cluster: "R1".into(),
+            person_id: person.map(Into::into),
+            new_name: person.is_none().then(|| "新人".to_string()),
+            tier,
+            llm_confidence: "high".into(),
+            acoustic: ac.then(|| ("mic".to_string(), 0.8)),
+            acoustic_z: z,
+            evidence: vec![],
+            status: status.into(),
+            decided_at: None,
+        }
+    }
+
+    fn idoc_with(assignments: Vec<IdentifyAssignment>) -> IdentifyDoc {
+        IdentifyDoc {
+            schema_version: IDENTIFY_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            provider: "mock".into(),
+            model: "m".into(),
+            revision: 1,
+            source_hash: "h".into(),
+            assignments,
+            rejected: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn mark_transition_enforces_legal_moves() {
+        let mut d = idoc_with(vec![ass("fp", Tier::High, Some("P1"), "suggested", true, None)]);
+        mark_transition(&mut d, "fp", &["suggested"], "auto_applied", "t1").unwrap();
+        assert_eq!(d.assignments[0].status, "auto_applied");
+        // auto_applied → applied(确认)。
+        mark_transition(&mut d, "fp", &["auto_applied"], "applied", "t2").unwrap();
+        // applied 是终态:任何再转移都拒绝。
+        assert!(mark_transition(&mut d, "fp", &["applied"], "rejected", "t3").is_err());
+        // 撤销路径:auto_applied → rejected(mark_rejected 会带拒绝键)。
+        let mut d2 = idoc_with(vec![ass("fp", Tier::High, Some("P1"), "auto_applied", true, None)]);
+        mark_rejected(&mut d2, "fp", "t4").unwrap();
+        assert_eq!(d2.assignments[0].status, "rejected");
+        assert!(d2.rejected.contains_key(&rejected_key("fp", "P1")));
+    }
+
+    #[test]
+    fn auto_apply_targets_gate_all_preconditions() {
+        // 稿:R1(无关联)与 R2(有手填名)。
+        let mut p2 = para("R2", &[5], "b");
+        p2.name = Some("手填".into());
+        let doc = doc_with(vec![para("R1", &[0, 1], "a"), p2]);
+        let members = cluster_members_from_doc(&doc);
+        let fp1 = cluster_fingerprint(&members["R1"]);
+        let fp2 = cluster_fingerprint(&members["R2"]);
+        let d = idoc_with(vec![
+            ass(&fp1, Tier::High, Some("P1"), "suggested", true, Some(3.5)), // 全过
+            ass(&fp2, Tier::High, Some("P1"), "suggested", true, None),      // 簇有手填名 → 拒
+            ass("fp-x", Tier::High, Some("P1"), "suggested", true, None),    // 指纹失配 → 拒
+        ]);
+        let got: Vec<&str> = auto_apply_targets(&d, &doc).iter().map(|a| a.fingerprint.as_str()).collect();
+        assert_eq!(got, vec![fp1.as_str()]);
+        // z 可算但不达标 → 拒;new_name → 拒;Medium → 拒;无声学确认 → 拒。
+        let d2 = idoc_with(vec![
+            ass(&fp1, Tier::High, Some("P1"), "suggested", true, Some(2.0)),
+        ]);
+        assert!(auto_apply_targets(&d2, &doc).is_empty(), "z<3 拒");
+        let d3 = idoc_with(vec![ass(&fp1, Tier::High, None, "suggested", true, None)]);
+        assert!(auto_apply_targets(&d3, &doc).is_empty(), "new_name 永不自动建档");
+        let d4 = idoc_with(vec![ass(&fp1, Tier::Medium, Some("P1"), "suggested", true, None)]);
+        assert!(auto_apply_targets(&d4, &doc).is_empty(), "Medium 拒");
+        let d5 = idoc_with(vec![ass(&fp1, Tier::High, Some("P1"), "suggested", false, None)]);
+        assert!(auto_apply_targets(&d5, &doc).is_empty(), "无声学确认拒");
+    }
+
+    #[test]
+    fn run_identify_merge_preserves_auto_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        let fp = cluster_fingerprint(&members["R1"]);
+        let mut seeded = idoc_with(vec![ass(&fp, Tier::High, Some("P1"), "auto_applied", true, None)]);
+        seeded.source_hash = crate::store::source_hash(&doc.paragraphs);
+        save_identify(dir.path(), &seeded).unwrap();
+        let exec = MockExec(vec![]);
+        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t").unwrap();
+        assert_eq!(d.assignments.len(), 1, "auto_applied 回执跨代保留");
+        assert_eq!(d.assignments[0].status, "auto_applied");
+    }
+
+    #[test]
+    fn identify_ops_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ops = IdentifyOps::default();
+        ops.ops.push(IdentifyOp {
+            op_id: "iop-1".into(),
+            fingerprint: "fp".into(),
+            cluster: "R1".into(),
+            seqs: vec![0, 1],
+            target_person: "P1".into(),
+            target_name: "张伟".into(),
+            quote: "我是张伟".into(),
+            created_at: "t".into(),
+            stage: "done".into(),
+            acknowledged: false,
+            reinforce_skipped: None,
+            undo_stage: None,
+            non_revertible: None,
+        });
+        save_ops(dir.path(), &ops).unwrap();
+        let back = load_ops(dir.path());
+        assert_eq!(back.ops.len(), 1);
+        assert_eq!(back.ops[0].op_id, "iop-1");
     }
 
 }
