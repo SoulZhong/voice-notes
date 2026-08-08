@@ -233,6 +233,22 @@ export interface RelatedNote {
 }
 export const noteRelated = (id: string) => invoke<RelatedNote[]>("note_related", { id });
 
+/** P3 日历改选候选(按重叠降序;零重叠也列出,覆盖延迟开录)。 */
+export type CalendarCandidate = {
+  event_id: string;
+  title: string;
+  start_ms: number;
+  end_ms: number;
+  attendee_n: number;
+  overlap_ms: number;
+};
+export const listCalendarCandidates = (id: string) =>
+  invoke<CalendarCandidate[]>("list_calendar_candidates", { id });
+/** 改选(eventId)或清除(null,立 tombstone:自动匹配不再复活)。 */
+export const setNoteCalendarEvent = (id: string, eventId: string | null) =>
+  invoke<void>("set_note_calendar_event", { id, eventId });
+export const noteCalendarPermission = () => invoke<string>("calendar_permission");
+
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */
 export const noteAudioInfo = (id: string) => invoke<TrackInfo[]>("note_audio_info", { id });
