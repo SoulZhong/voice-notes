@@ -1,4 +1,9 @@
 mod audio;
+#[cfg(target_os = "macos")]
+mod calendar;
+#[cfg(not(target_os = "macos"))]
+#[path = "calendar_stub.rs"]
+mod calendar;
 mod feedback;
 mod logging;
 pub mod pipeline;
