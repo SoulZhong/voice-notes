@@ -5,6 +5,7 @@ pub mod disk;
 mod export;
 pub mod merge_journal;
 pub mod migrate;
+pub mod mix_regen;
 pub mod notelock;
 mod notes;
 pub mod refined;
