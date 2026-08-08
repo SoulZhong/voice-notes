@@ -100,6 +100,13 @@ pub struct GetAingContextParams {
     pub note_id: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentifySpeakersParams {
+    /// 笔记 id;返回最近一次说话人身份推断结果(只读,带 stale 标志)。
+    pub note_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApplyAingGraphParams {
     pub note_id: String,
@@ -377,6 +384,20 @@ impl VnMcp {
     }
 
     #[tool(
+        description = "读取笔记最近一次说话人身份推断结果(identify.json):簇指纹、目标人物/新名字、置信档、证据与人工处置状态;stale=true 表示精修稿已变化、证据锚点不再可信。只读;重新推断请在应用内触发。"
+    )]
+    async fn identify_speakers(
+        &self,
+        Parameters(p): Parameters<IdentifySpeakersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let roots = tools::resolve_roots();
+        match tools::identify_speakers(&roots, &p.note_id) {
+            Ok(value) => Ok(ok_json(value)),
+            Err(error) => Ok(err_text(error.to_string())),
+        }
+    }
+
+    #[tool(
         description = "提交当前笔记的模型实体与证据关系。必须先写回文本、再 get_aing_context；服务端在笔记锁内重载并重算所有实体/mention/evidence/relation ID 与 source hash。不能提交人工裁决、registry 或 operation。"
     )]
     async fn apply_aing_graph(
@@ -508,6 +529,11 @@ pub fn catalog() -> serde_json::Value {
             "control",
         ),
         ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。", "app"),
+        (
+            "identify_speakers",
+            "读取笔记最近一次说话人身份推断结果(簇→人物建议、置信档、证据与处置状态;stale 标志提示稿已变化)。只读。",
+            "none",
+        ),
     ];
     let cli: &[(&str, &str)] = &[
         ("voice-notes notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]", "列出会议笔记"),
@@ -560,8 +586,8 @@ mod catalog_tests {
         );
         assert_eq!(
             cat_names.len(),
-            15,
-            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status"
+            16,
+            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status + identify_speakers"
         );
         assert!(cat_names.contains("get_aing_context"));
         assert!(cat_names.contains("apply_aing_graph"));
