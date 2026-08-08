@@ -317,6 +317,40 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         stage: "all".into(),
         state: "running".into(),
     });
+    // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
+    // 里 `is_refining(id)` 占槽后复查处的同款注释)。
+    //
+    // 修正设计初稿的一个错误前提:LifecycleHandle::report 不是同步调用——它的文档
+    // 明写"只投递不等待"(actor.rs 62-63 行),tx.send() 入队即返回,不等 actor 线程
+    // 真正把 note_id 插进 Aing 集。所以不能说"上面这条 report 一返回,写就已完成"。
+    // 但互斥证明不需要这个(错误的)前提,靠 actor 信箱本身的 FIFO 单消费者顺序
+    // 就够:report() 与 is_refining() 共用同一个 tx channel,actor 严格按消息入队
+    // 顺序串行处理(actor.rs run 循环逐条 recv,QueryRefine 也在同一循环里直答)。
+    // 于是只需要「入队先后序」而不需要「处理完成」这个更强的前提：
+    //   A 线程:先 send(RefineProgress "all/running")入队,程序序上紧接着才执行
+    //     到这里读 retranscribing 槽——send 调用发生在这次读之前(实时上)。
+    //   R 线程(do_retranscribe):先写 retranscribing 槽(`*slot = Some(...)`),
+    //     之后才调用 is_refining(id)(即 send(QueryRefine)入队并阻塞等回执)。
+    // 反证:若 A 与 R"双穿"（A 读槽时空、R 的 is_refining 读到 false)同时成立，
+    // 由 A 侧读槽早于 R 写槽(A 才会读到空)可推出 A 的 send 早于 R 的 send（实时上，
+    // 见上面两条程序序链:A_send < A_read < R_write < R_send)；而 A 的 send 更早
+    // 入队，按 FIFO,actor 必先处理 A 的插入、再处理 R 的查询，R 的 is_refining
+    // 就不可能读到 false——矛盾。故双穿不可能发生：R 先写必被 A 看见（A 让步不
+    // spawn 线程),A 先"送单"必被 R 的复查看见（R 让步清槽拒绝)。
+    if retranscribing_blocks_refine(&state.retranscribing, &note_id) {
+        eprintln!(
+            "refine({note_id}): 与重转写占槽发生竞态,放弃本次 Aing(见 spawn_refine Fix 2 注释)"
+        );
+        // 把上面刚插入的 Aing 集清干净,与 worker 正常收尾同款消息序(先 all/failed
+        // 再 RefineFinished),前端/轮询方看到的事件形状不因走了这条放弃路径而变化。
+        lc.report(lifecycle::machine::Msg::RefineProgress {
+            note_id: note_id.clone(),
+            stage: "all".into(),
+            state: "failed".into(),
+        });
+        lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
+        return;
+    }
     std::thread::spawn(move || {
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
@@ -732,6 +766,20 @@ pub(crate) fn retranscribe_blocks_recording(slot: &Mutex<Option<(String, String)
 /// （session 槽覆盖 stop 早期窗口：running 已假但会话槽还没清空的那一小段时间）。
 pub(crate) fn recording_blocks_retranscribe(running: &Mutex<bool>, session_active: bool) -> bool {
     *running.lock().unwrap_or_else(|e| e.into_inner()) || session_active
+}
+
+/// Aing↔重转写占槽后互查闭环的 A 侧（spawn_refine）判定：给定重转写槽当前值与
+/// 本次 Aing 的 note_id，判断是否命中"同一笔记正被重转写占槽"（true=须清刚插入
+/// 的 Aing 集并放弃本次 Aing，不 spawn 工作线程）。纯函数，从 spawn_refine 里的
+/// 判据原样抽出——完整互斥证明见 spawn_refine/do_retranscribe 两处 Fix 2 注释
+/// （codex 第三轮）。真实竞态涉及 lifecycle actor 信箱 + 后台线程交错，无法在
+/// 单元测试里驱动出货真价实的并发窗口；这个纯函数至少把"槽命中同 note_id 时
+/// 该让步"这条判据本身纳入测试，而不是只靠现场审读代码。
+pub(crate) fn retranscribing_blocks_refine(slot: &Mutex<Option<(String, String)>>, note_id: &str) -> bool {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(running_id, _)| running_id == note_id)
 }
 
 /// start_recording / resume_recording 共用的会话启动实现：running/generation
@@ -2092,6 +2140,31 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
     }
+    // Fix 2(codex 第三轮,R 侧互查闭环——两处必须同步改,另一侧见 spawn_refine 里
+    // 占槽复查那一段的同款注释):占槽之后复查 `is_refining(id)`。开头那次
+    // "Aing 中拒"(本函数上方 `is_refining(id)` 检查)只是快速失败的 UX——它与本次
+    // 占槽之间隔着多次盘 IO(load note/audio meta/transcode.is_busy),
+    // `refine_note` 命令壳在 kernel 插入 Aing 集之前查重转写槽的那次检查完全可能
+    // 落在这个窗口里穿过去。权威判定同 Fix 1A/1B 一样是写后读:占槽(写)已经完成,
+    // 此刻再读一次 Aing 集才是真正堵死并发的那一步。
+    //
+    // 互斥证明与 spawn_refine 侧完全对称(完整推演见该函数 Fix 2 注释;那边同时
+    // 记录了一处对设计初稿前提的订正——LifecycleHandle::report 是"只投递不等待"
+    // 的异步调用,不是同步调用,证明改靠 actor 信箱 FIFO 单消费者的入队顺序,
+    // 不依赖"report 一返回 Aing 集就已插入完成"这个不成立的前提):
+    //   R: 写(占槽,上面 `*slot = Some(...)`)→ 读(is_refining(id),就是这里,
+    //      即 send(QueryRefine)入队并阻塞等回执)
+    //   A: send(RefineProgress "all/running")入队 → 读(重转写槽,spawn_refine 里
+    //      thread::spawn 之前那次复查)
+    // 若 R 的写先发生(早于 A 的 send 入队),A 那边必读到 R 已占的槽 → A 让步、
+    // 不 spawn 工作线程。若 A 的 send 先入队(早于 R 写槽这一实时点之前就已发生,
+    // 从而必早于 R 的 send 入队),按 FIFO actor 必先处理 A 的插入、再处理 R 的
+    // 查询,R 这里必读到 true → R 让步、清槽、拒绝。两侧不可能同时读到"对方还
+    // 没写"——双穿不可能发生。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
+        *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
+    }
     spawn_retranscribe(app.clone(), id.to_string(), input == "mixed");
     Ok(())
 }
@@ -2103,6 +2176,10 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
 fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
     let slot = app.state::<AppState>().retranscribing.clone();
     let last = app.state::<AppState>().retranscribe_last.clone();
+    // language_filter:与实时链路(0) 一次性读设置同款途径同源同快照——不读到并发写入的
+    // 半新半旧状态。关闭时重转写不得替用户悄悄丢外语段(Fix 1,codex 第三轮):旧代码
+    // 无条件调 is_foreign_final,会把用户已显式关闭过滤后保留下来的多语内容冲掉。
+    let language_filter = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default().language_filter;
     std::thread::spawn(move || {
         let emit = |stage: &str, state: &str, message: Option<String>, summary: Option<retranscribe::Summary>| {
             let ev = ipc::RetranscribeEvent {
@@ -2164,7 +2241,7 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 });
             };
             retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
-                &mut embedder, seeds, mixed, &mut progress)
+                &mut embedder, seeds, mixed, language_filter, &mut progress)
                 .map_err(|e| e.to_string())
         }));
         match body {
@@ -5637,6 +5714,35 @@ mod tests {
         // 槽清空后(worker 跑完)同一互斥位可以再次放行。
         *rt.lock().unwrap() = None;
         assert!(migrate_guard(&running, &dl, &rt).is_ok(), "槽清空后迁移应放行");
+    }
+
+    /// Fix 2(codex 第三轮,A↔R 占槽后互查闭环)的说明性单测:验证 A 侧判据本身——
+    /// `retranscribing_blocks_refine` 命中"同 note_id 正被重转写占槽"时必须为
+    /// true(spawn_refine 据此清 Aing 集、放弃、不 spawn),不同 note_id / 槽为空
+    /// 时必须为 false(不误伤其它笔记的正常 Aing)。
+    ///
+    /// 说明(为何不是并发回归测试):真实竞态是 do_retranscribe 的"占槽"与
+    /// spawn_refine 的"kernel 插入 Aing 集"这两个动作在两个线程间交错,需要
+    /// AppHandle + lifecycle actor 信箱 + 后台线程才能搭台,不是能在单元测试里
+    /// 稳定复现的窗口(时序依赖真实调度,搭出来的"竞态"测试要么永远命中、要么
+    /// 永远不命中，测的是测试自身的调度而非生产逻辑)。互斥的完整正确性来自
+    /// spawn_refine/do_retranscribe 两处 Fix 2 注释里的书面推演(两侧"先写自己、
+    /// 再读对方"，靠 actor 信箱 FIFO 单消费者顺序构成时序环，双穿不可能发生)，
+    /// 本测试只锁死这条推演依赖的判据函数本身不会因未来重构而跑偏。
+    #[test]
+    fn retranscribing_blocks_refine_matches_same_note_id_only() {
+        use super::retranscribing_blocks_refine;
+        use std::sync::Mutex;
+        let empty: Mutex<Option<(String, String)>> = Mutex::new(None);
+        assert!(!retranscribing_blocks_refine(&empty, "n1"), "槽为空,不阻挡任何 Aing");
+
+        let occupied: Mutex<Option<(String, String)>> =
+            Mutex::new(Some(("n1".to_string(), "decode".to_string())));
+        assert!(retranscribing_blocks_refine(&occupied, "n1"), "同 note_id 命中,须阻挡");
+        assert!(
+            !retranscribing_blocks_refine(&occupied, "n2"),
+            "不同笔记不受影响,各笔记的重转写/Aing 互不干扰"
+        );
     }
 
     #[test]

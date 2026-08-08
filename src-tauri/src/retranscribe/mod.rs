@@ -70,6 +70,7 @@ pub fn run(
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     seeds: Vec<SeedCluster>,
     mixed: bool,
+    language_filter: bool,
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<Summary> {
     let mut summary = Summary::default();
@@ -88,8 +89,14 @@ pub fn run(
         }));
         match outcome {
             Ok(Ok(t)) => {
-                if t.text.trim().is_empty() || crate::session::is_foreign_final(&t.lang, &t.text) {
-                    continue; // 空段/外语幻觉:与实时链路同口径,整段丢弃(不计入 recs)
+                // 空文本无条件丢(哪种语言都不该落空段);外语幻觉丢弃受 language_filter
+                // 开关约束——与实时链路(session.rs FinalSink,同名字段同语义)同口径:
+                // 关闭过滤时多语会议的外语段必须原样保留,否则重转写会把用户已经明确
+                // 关闭过滤保留下来的内容悄悄冲掉,构成破坏性丢失。
+                if t.text.trim().is_empty()
+                    || (language_filter && crate::session::is_foreign_final(&t.lang, &t.text))
+                {
+                    continue; // 空段:无条件丢;外语幻觉:仅 language_filter=true 时丢
                 }
                 let subs = crate::session::split_final(
                     seg.samples, seg.start_ms, seg.end_ms, &t, embedder, false,
@@ -288,7 +295,7 @@ mod tests {
         let mut rec = LenRecognizer { fail_len: None };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         let mut stages = Vec::new();
-        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false,
+        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true,
             &mut |s| stages.push(s.to_string())).unwrap();
         assert_eq!((summary.old_segments, summary.new_segments), (1, 2));
         assert_eq!(stages, vec!["decode", "transcribe", "attribute", "commit"]);
@@ -308,7 +315,7 @@ mod tests {
         let mut input = StubInput(vec![pending("mic", 0, 16000)]);
         let mut rec = LenRecognizer { fail_len: Some(16000) }; // 唯一一段必失败 → 100% 占位
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
-        let err = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, &mut |_| {});
+        let err = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, &mut |_| {});
         assert!(err.is_err());
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("旧"), "放弃时原稿必须原样保留");
@@ -324,7 +331,7 @@ mod tests {
         let mut input = StubInput(vec![pending("system", 0, 16000), pending("mic", 100, 16000)]);
         let mut rec = LenRecognizer { fail_len: None };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
-        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, &mut |_| {}).unwrap();
+        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, &mut |_| {}).unwrap();
         assert_eq!((summary.new_segments, summary.echo_dropped), (1, 1));
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("\"system\"") && !text.contains("\"mic\""));
@@ -370,7 +377,7 @@ mod tests {
         let mut rec = LenRecognizer { fail_len: None };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         let summary =
-            run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, &mut |_| {})
+            run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, &mut |_| {})
                 .unwrap();
         assert_eq!(summary.echo_dropped, 1, "只有高覆盖(0.9)的 mic 段应被电平门弃用");
         assert_eq!(summary.new_segments, 2, "低覆盖 mic 段与 system 段都应保留");
@@ -394,7 +401,31 @@ mod tests {
         let mut input = StubInput(vec![pending("mic", 0, 16000), pending("system", 5000, 16000)]);
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         // 两段全是日语 → 全丢 → 0 段 → 提交门放弃(顺带覆盖 new.is_empty 分支)
-        let err = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, &mut |_| {});
+        let err = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, true, &mut |_| {});
         assert!(err.is_err());
+    }
+
+    /// language_filter=false:多语会议场景显式关闭乱码过滤后,重转写不得替用户
+    /// 悄悄丢外语段——与实时链路(session.rs worker_language_filter_disabled_keeps_foreign_final)
+    /// 同口径。旧代码无条件调 is_foreign_final,不接收该开关,本用例在旧代码下 RED
+    /// (两段日语全被吞、提交门判 0 段放弃、err.is_err() 为真而非期望的 Ok)。
+    #[test]
+    fn run_language_filter_disabled_keeps_foreign_segments() {
+        let dir = note_dir_with_old();
+        let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
+        struct JaRecognizer;
+        impl Recognizer for JaRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(Transcript { text: "こんにちは".into(), lang: "ja".into(), tokens: vec![], timestamps: vec![] })
+            }
+        }
+        let mut input = StubInput(vec![pending("mic", 0, 16000), pending("system", 5000, 16000)]);
+        let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
+        // language_filter=false → 两段日语都应保留落盘,提交门正常通过。
+        let summary = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, false, &mut |_| {})
+            .expect("filter=false 时外语段应保留,提交应成功");
+        assert_eq!(summary.new_segments, 2, "两段日语都应保留,不因语言被丢");
+        let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
+        assert!(text.contains("こんにちは"), "日语文本应原样落盘");
     }
 }
