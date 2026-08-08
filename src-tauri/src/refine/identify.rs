@@ -789,6 +789,21 @@ pub fn run_identify(
     })
 }
 
+/// Agent stdout 的哨兵提取(标记带 per-run nonce,防会议正文/指令复述碰撞):
+/// 先定位**最后一个结束标记**,再向前找最近的开始标记——末尾孤立的开始标记
+/// 不会遮蔽前面的完整结果。载荷容忍 Markdown 代码围栏与多行 JSON。
+pub fn extract_marked(stdout: &str, start_tag: &str, end_tag: &str) -> Option<String> {
+    let end = stdout.rfind(end_tag)?;
+    let start = stdout[..end].rfind(start_tag)?;
+    let payload = stdout[start + start_tag.len()..end].trim();
+    let payload = payload
+        .strip_prefix("```json")
+        .or_else(|| payload.strip_prefix("```"))
+        .unwrap_or(payload);
+    let payload = payload.strip_suffix("```").unwrap_or(payload);
+    Some(payload.trim().to_string())
+}
+
 /// 人工确认:suggested → applied。找不到(已处理/指纹不符)报错,调用方转成
 /// 「建议已失效」提示。
 pub fn mark_applied(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> anyhow::Result<()> {
@@ -1241,6 +1256,21 @@ mod tests {
         assert!(cc.attendees.iter().any(|a| a == "张伟(我)"), "is_me 标注");
         assert_eq!(cc.attendees.len(), CALENDAR_ATTENDEES_IN_PROMPT + 1, "cap+占位行");
         assert!(cc.attendees.last().unwrap().contains("人略"));
+    }
+
+    #[test]
+    fn extract_marked_survives_noise_orphans_and_fences() {
+        let (st, en) = ("<VN_IDENTIFY_ab>", "</VN_IDENTIFY_ab>");
+        // 横幅噪音 + 围栏 + 末尾孤立开始标记:仍取前面的完整对。
+        let out = format!(
+            "banner\nthinking...\n{st}\n```json\n{{\"assignments\":[]}}\n```\n{en}\ntail {st}"
+        );
+        assert_eq!(extract_marked(&out, st, en).unwrap(), "{\"assignments\":[]}");
+        // 缺结束标记 → None。
+        assert!(extract_marked(&format!("x {st} y"), st, en).is_none());
+        // 两对取最后一对。
+        let two = format!("{st}old{en} mid {st}new{en}");
+        assert_eq!(extract_marked(&two, st, en).unwrap(), "new");
     }
 
 }

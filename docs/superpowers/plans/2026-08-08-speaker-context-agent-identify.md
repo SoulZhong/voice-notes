@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans。单任务小计划(P2a Task 10 立项的兑现)。
 
+rev2(实现随附):消化 Codex 审查(10 P1 + 12 P2)——工具面结构性关死(Claude `--tools ""`、Gemini workspace `coreTools:[]`+`mcpServers:{}`、Codex `-c mcp_servers={}`、**Cursor 拒绝**);哨兵加 per-run nonce 且「先找最后一个 end 再回找 start」(孤立开始标记不遮蔽结果),容忍围栏与多行 JSON;prompt 走 stdin(scratch 私有文件,不经 argv);scratch 复用 RelationScratch(0700+RAII);model 允空(CLI 默认模型);ailog provider 记实际厂商、失败也保留有界 stdout;分派保持 refine_llm_ready 宽 provider 语义;管线跳过时留一行原因日志;/bin/echo 测试加 cfg(unix);假 CLI 脚本端到端覆盖 stdin/提取/解析/skipped。
+
 **Goal:** 让 `refine_provider = "agent"` 的用户也能跑 identify 身份推断。此前 identify 只有 HTTP 执行体,agent 用户静默跳过。
 
 **Architecture:** 不解析裸 stdout、不扩 MCP 写面、不给 Agent 任何工具——identify 的输入(IdentifyContext JSON)全内嵌 prompt,输出走**哨兵标记单行 JSON**:Agent 被要求把结果 JSON 作为单独一行夹在 `<VN_IDENTIFY>` 与 `</VN_IDENTIFY>` 之间输出;Rust 侧取 stdout 中**最后一对**标记之间的内容解析。执行复用既有 `title_command`(零工具/零 MCP/一发一收,四家 CLI 全支持)+ `make_scratch` + `run_with_timeout`;解析与五道裁决完全复用 `parse_raw_identify`/`adjudicate`。

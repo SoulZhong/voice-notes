@@ -722,6 +722,165 @@ fn title_command(
     cmd
 }
 
+// ─────────────────── P2a 补遗:Agent identify 执行体 ───────────────────
+
+/// identify 单发单收的超时:一次 LLM 请求量级(输入 ≤ 约 8K 字符),不必给到
+/// 精修级的长超时。
+pub const IDENTIFY_AGENT_TIMEOUT_S: u64 = 180;
+/// stdout 处理上限:Agent 异常刷屏时不把整份日志载入内存/ailog。
+const IDENTIFY_STDOUT_CAP: usize = 2 * 1024 * 1024;
+
+/// per-run 哨兵标记:nonce 不求密码学强度,只求不可被会议正文/指令复述预知。
+fn identify_markers() -> (String, String) {
+    let nonce = relation_scratch_nonce().unwrap_or_else(|_| format!("{}", std::process::id()));
+    (format!("<VN_IDENTIFY_{nonce}>"), format!("</VN_IDENTIFY_{nonce}>"))
+}
+
+/// identify 的 Agent prompt:输入全内嵌(Agent 不读库不读盘),输出用哨兵标记
+/// 包住(允许多行 JSON——serde 不在乎换行,强求单行只会降服从率)。
+pub(crate) fn identify_agent_prompt(ctx_json: &str, start_tag: &str, end_tag: &str) -> String {
+    format!(
+        "{sys}\n\n输入 JSON 如下:\n{ctx}\n\n输出约定:完成推断后,把结果 JSON 输出一次,并用 {start} 与 {end} 这一对标记包住(标记各占一行,JSON 可以多行);除这一处外不要在任何位置输出这两个标记;不要调用任何工具,不要读写任何文件,不要执行任何命令。",
+        sys = super::identify::IDENTIFY_SYSTEM_PROMPT,
+        ctx = ctx_json,
+        start = start_tag,
+        end = end_tag,
+    )
+}
+
+/// identify 的命令构造:零 MCP + 结构性关死内置工具;prompt 走 stdin(不进 argv)。
+/// Cursor 在 new() 已被拒绝(print 模式带全部 write/shell 工具且无法关闭)。
+fn identify_command(kind: AgentKind, bin: &Path, model: &str, scratch: &Path) -> anyhow::Result<Command> {
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(scratch);
+    match kind {
+        AgentKind::Claude => {
+            // -p 无 prompt 参数 → 从 stdin 读;--tools "" 关内置工具,
+            // --strict-mcp-config 且不给 --mcp-config = 零 MCP。
+            cmd.args(["-p", "--strict-mcp-config", "--tools", "", "--max-turns", "1"]);
+            if !model.is_empty() {
+                cmd.args(["--model", model]);
+            }
+        }
+        AgentKind::Codex => {
+            // "-" = 从 stdin 读 prompt;清空用户级 MCP 配置;read-only 沙箱。
+            cmd.args(["exec", "--skip-git-repo-check", "--sandbox", "read-only", "-c", "mcp_servers={}"]);
+            if !model.is_empty() {
+                cmd.args(["-m", model]);
+            }
+            cmd.arg("-");
+        }
+        AgentKind::Gemini => {
+            // 工作区级配置关死内置工具与 MCP;非交互下管道 stdin 即 prompt。
+            let dir = scratch.join(".gemini");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("settings.json"),
+                serde_json::json!({ "coreTools": [], "mcpServers": {} }).to_string(),
+            )?;
+            if !model.is_empty() {
+                cmd.args(["-m", model]);
+            }
+        }
+        AgentKind::Cursor => {
+            anyhow::bail!("Cursor print 模式无法结构性关闭 write/shell 工具,identify 已安全拒绝");
+        }
+    }
+    Ok(cmd)
+}
+
+pub struct AgentIdentifyExecutor {
+    kind: AgentKind,
+    bin: PathBuf,
+    model: String,
+}
+
+impl AgentIdentifyExecutor {
+    /// model 允空(CLI 用默认模型,与 title/probe 同语义);Cursor 拒绝(同
+    /// AgentRelationExecutor 的结构性限制理由)。
+    pub fn new(kind: AgentKind, bin_override: &str, model: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !matches!(kind, AgentKind::Cursor),
+            "Cursor print 模式无法结构性关闭 write/shell 工具,identify 已安全拒绝"
+        );
+        let bin = resolve_bin(kind, bin_override).ok_or_else(|| {
+            anyhow::anyhow!(
+                "未找到 {} 命令行工具:请先安装并登录,或指定 CLI 路径",
+                kind.bin_name()
+            )
+        })?;
+        Ok(Self { kind, bin, model: model.trim().into() })
+    }
+
+    /// 可注入标记的本体(单测用固定标记 + 假 CLI 脚本走通全链)。
+    fn infer_with_markers(
+        &self,
+        ctx: &super::identify::IdentifyContext,
+        log: Option<&crate::ailog::Ctx>,
+        start_tag: &str,
+        end_tag: &str,
+    ) -> anyhow::Result<(Vec<super::identify::RawAssignment>, usize)> {
+        let scratch = RelationScratch::create("identify")?;
+        let ctx_json = serde_json::to_string(ctx)?;
+        let prompt = identify_agent_prompt(&ctx_json, start_tag, end_tag);
+        let started = std::time::Instant::now();
+        let result = (|| -> anyhow::Result<(String, Vec<super::identify::RawAssignment>, usize)> {
+            let cmd = identify_command(self.kind, &self.bin, &self.model, scratch.path())?;
+            let (exit_ok, stdout, err_tail) =
+                run_with_timeout_io(cmd, scratch.path(), IDENTIFY_AGENT_TIMEOUT_S, Some(&prompt))?;
+            let mut stdout = stdout;
+            stdout.truncate(IDENTIFY_STDOUT_CAP);
+            anyhow::ensure!(exit_ok, "Agent 退出码非 0;stderr 尾部:\n{err_tail}");
+            let payload = super::identify::extract_marked(&stdout, start_tag, end_tag)
+                .ok_or_else(|| anyhow::anyhow!("Agent 未按约定输出结果标记"))?;
+            let (assignments, skipped) = super::identify::parse_raw_identify(&payload)?;
+            Ok((stdout, assignments, skipped))
+        })();
+        if let Some(ctx_log) = log {
+            // 失败也保留有界 stdout——标记缺失/解析失败正需要原文诊断。
+            let (response, status, error) = match &result {
+                Ok((raw, _, _)) => (serde_json::Value::String(raw.clone()), "ok", None),
+                Err(e) => (serde_json::Value::Null, "error", Some(e.to_string())),
+            };
+            crate::ailog::record(
+                ctx_log,
+                crate::ailog::Draft {
+                    kind: "identify",
+                    provider: self.kind.key().into(),
+                    model: (!self.model.is_empty()).then(|| self.model.clone()),
+                    endpoint: None,
+                    request: serde_json::json!({ "prompt": prompt }),
+                    response,
+                    status,
+                    error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        }
+        result.map(|(_, assignments, skipped)| (assignments, skipped))
+    }
+}
+
+impl super::identify::IdentifyExecutor for AgentIdentifyExecutor {
+    fn provider(&self) -> &str {
+        // 与既有 Agent ailog 同口径:记实际厂商(claude/codex/gemini),不记笼统 "agent"。
+        self.kind.key()
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn infer(
+        &self,
+        ctx: &super::identify::IdentifyContext,
+        log: Option<&crate::ailog::Ctx>,
+    ) -> anyhow::Result<(Vec<super::identify::RawAssignment>, usize)> {
+        let (start_tag, end_tag) = identify_markers();
+        self.infer_with_markers(ctx, log, &start_tag, &end_tag)
+    }
+}
+
 /// GUI 从 Finder/launchd 启动不继承 shell 的代理变量;需经本地代理出海的网络环境
 /// 下,Agent CLI 直连 API 会被 403(真机实锤:同一台机器终端带 proxy 环境变量即成功,
 /// GUI spawn 无代理变量即 403 Request not allowed)。spawn 前若环境里没有任何代理
@@ -787,19 +946,38 @@ fn parse_scutil_proxy(text: &str) -> Vec<(String, String)> {
 /// 输出超过管道缓冲而这边只在轮询 try_wait 不读管道,会互相卡死。超时 kill 判失败。
 /// 返回 (exit_ok, stdout, stderr尾部)。
 fn run_with_timeout(
+    cmd: Command,
+    scratch: &Path,
+    timeout_s: u64,
+) -> anyhow::Result<(bool, String, String)> {
+    run_with_timeout_io(cmd, scratch, timeout_s, None)
+}
+
+/// 带可选 stdin 载荷的执行:载荷写入 scratch 私有文件再喂 stdin——长 prompt 不经
+/// argv(本机可见、Windows 有长度上限),文件随 scratch 清理。
+fn run_with_timeout_io(
     mut cmd: Command,
     scratch: &Path,
     timeout_s: u64,
+    stdin_payload: Option<&str>,
 ) -> anyhow::Result<(bool, String, String)> {
     for (k, v) in proxy_env_to_inject() {
         cmd.env(k, v);
     }
+    let stdin_stdio = match stdin_payload {
+        Some(payload) => {
+            let in_path = scratch.join("agent-stdin.txt");
+            std::fs::write(&in_path, payload)?;
+            Stdio::from(std::fs::File::open(&in_path)?)
+        }
+        None => Stdio::null(),
+    };
     let out_path = scratch.join("agent-stdout.log");
     let err_path = scratch.join("agent-stderr.log");
     let child_out = std::fs::File::create(&out_path)?;
     let child_err = std::fs::File::create(&err_path)?;
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(stdin_stdio)
         .stdout(Stdio::from(child_out))
         .stderr(Stdio::from(child_err))
         .spawn()?;
@@ -1856,4 +2034,95 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
         );
         std::env::remove_var("VN_APP_DATA");
     }
+    // ─────────── Agent identify 执行体测试 ───────────
+
+    fn empty_identify_ctx() -> crate::refine::identify::IdentifyContext {
+        crate::refine::identify::IdentifyContext {
+            note_id: "n1".into(),
+            revision: 1,
+            source_hash: "h".into(),
+            clusters: vec![],
+            candidates: vec![],
+            sampled: vec![],
+            calendar: None,
+        }
+    }
+
+    #[test]
+    fn identify_prompt_embeds_ctx_and_marker_contract() {
+        let ctx_json = serde_json::to_string(&empty_identify_ctx()).unwrap();
+        let p = identify_agent_prompt(&ctx_json, "<VN_IDENTIFY_x>", "</VN_IDENTIFY_x>");
+        assert!(p.contains("\"note_id\":\"n1\""), "ctx JSON 内嵌");
+        assert!(p.contains("<VN_IDENTIFY_x>") && p.contains("</VN_IDENTIFY_x>"));
+        assert!(p.contains("不要调用任何工具"));
+    }
+
+    #[test]
+    fn identify_markers_are_per_run_unique() {
+        let (a1, _) = identify_markers();
+        let (a2, _) = identify_markers();
+        assert_ne!(a1, a2, "nonce 必须逐次不同,防正文预知碰撞");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identify_command_locks_down_tools_per_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = Path::new("/bin/echo");
+        // Claude:关内置工具 + 零 MCP + 单轮;prompt 不进 argv。
+        let cmd = identify_command(AgentKind::Claude, bin, "m", tmp.path()).unwrap();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()), "{args:?}");
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(!args.iter().any(|a| a.contains("你是")), "prompt 绝不进 argv");
+        // Codex:清空用户级 MCP,stdin 读 prompt。
+        let cmd = identify_command(AgentKind::Codex, bin, "", tmp.path()).unwrap();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"mcp_servers={}".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        // Gemini:工作区配置关死 coreTools 与 MCP。
+        let _ = identify_command(AgentKind::Gemini, bin, "", tmp.path()).unwrap();
+        let settings = std::fs::read_to_string(tmp.path().join(".gemini/settings.json")).unwrap();
+        assert!(settings.contains("\"coreTools\":[]"));
+        assert!(settings.contains("\"mcpServers\":{}"));
+        // Cursor:构造即拒。
+        assert!(identify_command(AgentKind::Cursor, bin, "", tmp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identify_executor_rejects_cursor_allows_empty_model() {
+        assert!(AgentIdentifyExecutor::new(AgentKind::Cursor, "/bin/echo", "m").is_err());
+        // model 允空:CLI 用默认模型(默认配置的 Agent 用户不能被静默排除)。
+        let ok = AgentIdentifyExecutor::new(AgentKind::Claude, "/bin/echo", "  ").unwrap();
+        assert_eq!(ok.model, "");
+    }
+
+    /// 假 CLI 端到端:脚本无视 stdin,打印固定标记对包住的合法 JSON。
+    /// 覆盖 stdin 写入、超时执行、哨兵提取、解析、skipped 计数全链。
+    #[cfg(unix)]
+    #[test]
+    fn identify_infer_end_to_end_with_fake_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-agent.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncat >/dev/null\necho 'banner line'\necho '<T>'\necho '{\"assignments\":[{\"cluster\":\"R1\",\"person_id\":\"P1\",\"confidence\":\"high\",\"evidence\":[]},{\"cluster\":7}]}'\necho '</T>'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exec = AgentIdentifyExecutor {
+            kind: AgentKind::Claude,
+            bin: fake,
+            model: String::new(),
+        };
+        let (assignments, skipped) = exec
+            .infer_with_markers(&empty_identify_ctx(), None, "<T>", "</T>")
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].cluster, "R1");
+        assert_eq!(skipped, 1, "坏条目计入 skipped");
+    }
+
 }

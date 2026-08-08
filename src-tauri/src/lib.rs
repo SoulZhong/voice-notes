@@ -510,7 +510,14 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // identify.json + 收件箱建议卡,零自动写入。执行体分派内含
                 // refine_llm_ready 门禁(用户关精修/agent provider → 静默跳过);
                 // 失败仅留日志,绝不影响 Aing 结果。
-                if let Ok(identify_exec) = identify_executor(&s) {
+                let identify_exec = match identify_executor(&s) {
+                    Ok(e) => Some(e),
+                    Err(reason) => {
+                        eprintln!("identify({note_id}): 跳过——{reason}");
+                        None
+                    }
+                };
+                if let Some(identify_exec) = identify_exec {
                     let identify_result = (|| -> anyhow::Result<()> {
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
@@ -2395,14 +2402,30 @@ fn relation_executor(
     }
 }
 
-/// identify(P2a)执行体分派:门禁复用 refine_llm_ready 全套——用户关闭精修或
-/// 配置不齐时返回 Err,调用方一律按「静默跳过」处理,绝不绕过外发授权。
-/// agent provider 的 identify 执行体另立计划,在那之前同样跳过。
+/// identify(P2a)执行体分派:与精修同一外发授权语义——用户关闭精修即整体
+/// 不跑;agent provider 走零工具面的 AgentIdentifyExecutor(Cursor 拒绝),
+/// 其余沿 refine_llm_ready 的宽 provider 语义走 HTTP。返回 Err 时调用方跳过
+/// 并留一行原因日志(静默吞错会让"identify 没发生"无法诊断)。
 fn identify_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
+    anyhow::ensure!(settings.refine_enabled, "identify 需要已启用精修");
+    if settings.refine_provider == "agent" {
+        let kind = refine::agent::AgentKind::from_key(&settings.refine_agent).ok_or_else(|| {
+            anyhow::anyhow!(tr!(
+                "未知 Agent: {agent}",
+                "Unknown agent: {agent}",
+                agent = settings.refine_agent
+            ))
+        })?;
+        return Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(
+            kind,
+            &settings.refine_agent_bin,
+            &settings.refine_agent_model,
+        )?));
+    }
     if !refine_llm_ready(settings) {
-        anyhow::bail!("identify 需要已启用且配置齐全的 HTTP 精修");
+        anyhow::bail!("identify 需要配置齐全的 HTTP 精修");
     }
     Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
         refine::llm::LlmConfig {
