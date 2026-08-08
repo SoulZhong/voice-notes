@@ -306,6 +306,232 @@ pub fn build_context(
     }
 }
 
+/// 簇的主信道与混合判定(与 ClusterBrief 同口径,裁决层复用)。
+fn dominant_and_mixed(stat: &ClusterStat) -> (String, bool) {
+    let dominant = stat
+        .source_ms
+        .iter()
+        .max_by_key(|(_, ms)| **ms)
+        .map(|(src, _)| src.clone())
+        .unwrap_or_default();
+    let dom_ms = stat.source_ms.get(&dominant).copied().unwrap_or(0);
+    let other_ms = stat.total_ms.saturating_sub(dom_ms);
+    (dominant, stat.total_ms > 0 && other_ms * 5 > stat.total_ms)
+}
+
+// ---------- 输出解析与裁决 ----------
+
+use serde::Deserialize;
+
+pub const EVIDENCE_TYPES: [&str; 4] =
+    ["self_intro", "addressed_reply", "third_person_exclusion", "role_topic"];
+pub const NEW_NAME_MAX_CHARS: usize = 32;
+/// 声学正向确认阈值:与种子认人同口径(registry::SEED_ASSIGN_THRESHOLD)。
+pub use crate::diar::registry::SEED_ASSIGN_THRESHOLD as ACOUSTIC_CONFIRM_THRESHOLD;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawAssignment {
+    pub cluster: String,
+    #[serde(default)]
+    pub person_id: Option<String>,
+    #[serde(default)]
+    pub new_name: Option<String>,
+    #[serde(default)]
+    pub confidence: String,
+    #[serde(default)]
+    pub evidence: Vec<RawIdentifyEvidence>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RawIdentifyEvidence {
+    pub paragraph_index: usize,
+    pub start: usize,
+    pub end: usize,
+    pub quote: String,
+    pub r#type: String,
+}
+
+/// 宽松解析:整体先解 Value,assignments 逐条 from_value,坏条目跳过并计数——
+/// 单条类型错误不拖垮整批(与实体解析同哲学)。
+pub fn parse_raw_identify(content: &str) -> anyhow::Result<(Vec<RawAssignment>, usize)> {
+    let v: serde_json::Value = serde_json::from_str(content)?;
+    let Some(arr) = v["assignments"].as_array() else {
+        anyhow::bail!("响应缺 assignments 数组");
+    };
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for item in arr {
+        match serde_json::from_value::<RawAssignment>(item.clone()) {
+            Ok(a) => out.push(a),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((out, skipped))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug)]
+pub struct Verdict {
+    pub tier: Tier,
+    pub acoustic: Option<(String, f32)>,
+    /// Some = 整条丢弃(不落建议);&'static str 便于日志聚类。
+    pub reject_reason: Option<&'static str>,
+    /// 目标键:resolve 后 person_id,或 "name:<new_name>"(拒绝名单/冲突检测共用)。
+    pub target_key: String,
+    /// 经一致性降级后的有效证据(落盘用)。
+    pub evidence: Vec<RawIdentifyEvidence>,
+}
+
+fn reject(reason: &'static str) -> Verdict {
+    Verdict { tier: Tier::Low, acoustic: None, reject_reason: Some(reason), target_key: String::new(), evidence: vec![] }
+}
+
+/// 名字 sanitize:trim + 去控制字符;空/超长返回 None。
+fn sanitize_new_name(name: &str) -> Option<String> {
+    let cleaned: String = name.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() || cleaned.chars().count() > NEW_NAME_MAX_CHARS {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Unicode scalar 半开区间取子串;越界返回 None。
+fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
+    if start >= end {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if end > chars.len() {
+        return None;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+/// 五道裁决(spec + Codex 修订):①结构 ②区间逐字 ③证据-身份一致性
+/// ④冲突 ⑤声学门,再分档。绝不只信 LLM 自报 confidence。
+pub fn adjudicate(
+    raw: &RawAssignment,
+    doc: &RefinedDoc,
+    members: &BTreeMap<String, BTreeSet<u64>>,
+    stats: &[ClusterStat],
+    vp: &Voiceprints,
+    acoustic_enabled: bool,
+    taken: &BTreeMap<String, String>,
+) -> Verdict {
+    // ① 结构。
+    if !members.contains_key(&raw.cluster) {
+        return reject("unknown-cluster");
+    }
+    let (target_key, target_name) = match (&raw.person_id, &raw.new_name) {
+        (Some(pid), None) => {
+            let Some(resolved) = VoiceprintStore::resolve(vp, pid) else {
+                return reject("dangling-person");
+            };
+            let name = vp.people.get(resolved).map(|p| p.name.clone()).unwrap_or_default();
+            (resolved.to_string(), name)
+        }
+        (None, Some(name)) => match sanitize_new_name(name) {
+            Some(n) => (format!("name:{n}"), n),
+            None => return reject("bad-new-name"),
+        },
+        _ => return reject("person-xor-new-name"),
+    };
+
+    // ② 区间逐字校验(任一 evidence 不过 → 整条丢弃:证据造假一票否决)。
+    // 未知 type 只丢该条 evidence。
+    let mut evidence: Vec<RawIdentifyEvidence> = Vec::new();
+    for ev in &raw.evidence {
+        if !EVIDENCE_TYPES.contains(&ev.r#type.as_str()) {
+            continue;
+        }
+        let Some(p) = doc.paragraphs.get(ev.paragraph_index) else {
+            return reject("evidence-mismatch");
+        };
+        match char_slice(&p.text, ev.start, ev.end) {
+            Some(s) if s == ev.quote => evidence.push(ev.clone()),
+            _ => return reject("evidence-mismatch"),
+        }
+    }
+
+    // ③ 证据-身份一致性:self_intro 的 quote 必须含目标名(防"我是李雷"指认张伟);
+    // addressed_reply 必须构成「称呼(他簇,含目标名)+应答(本簇)」配对,
+    // 不满足的降级为 role_topic 弱证据。
+    let has_reply_in_cluster = evidence.iter().any(|e| {
+        e.r#type == "addressed_reply"
+            && doc.paragraphs.get(e.paragraph_index).map(|p| p.speaker == raw.cluster).unwrap_or(false)
+    });
+    let has_call_elsewhere = evidence.iter().any(|e| {
+        e.r#type == "addressed_reply"
+            && doc
+                .paragraphs
+                .get(e.paragraph_index)
+                .map(|p| p.speaker != raw.cluster)
+                .unwrap_or(false)
+            && (target_name.is_empty() || e.quote.contains(target_name.as_str()))
+    });
+    let reply_pair_ok = has_reply_in_cluster && has_call_elsewhere;
+    for e in &mut evidence {
+        match e.r#type.as_str() {
+            "self_intro" if target_name.is_empty() || !e.quote.contains(target_name.as_str()) => {
+                e.r#type = "role_topic".into();
+            }
+            "addressed_reply" if !reply_pair_ok => {
+                e.r#type = "role_topic".into();
+            }
+            _ => {}
+        }
+    }
+    if evidence.is_empty() {
+        return reject("no-valid-evidence");
+    }
+
+    // ④ 冲突:同簇已有裁决通过的条目、或同目标已被别的簇认领 → 上限 Medium
+    //(不丢弃:留给人裁,建议卡本来就要人拍板)。
+    let conflicted =
+        taken.contains_key(&raw.cluster) || taken.values().any(|t| t == &target_key);
+
+    // ⑤ 声学门:仅库内已有人 + 门禁通过 + 非混合簇 + 目标人有同主信道质心。
+    let acoustic = if acoustic_enabled && raw.person_id.is_some() {
+        stats.iter().find(|s| s.speaker == raw.cluster).and_then(|stat| {
+            let (dominant, mixed) = dominant_and_mixed(stat);
+            if mixed {
+                return None;
+            }
+            let cluster_c = stat.centroids.get(&dominant)?;
+            let person = vp.people.get(target_key.as_str())?;
+            let person_c = person.centroids.get(&dominant)?;
+            let cos = dot(cluster_c, &person_c.vec)?;
+            (cos >= ACOUSTIC_CONFIRM_THRESHOLD).then_some((dominant, cos))
+        })
+    } else {
+        None
+    };
+
+    // 分档:High 需 self_intro + 声学正向确认 + 无冲突;self_intro/addressed_reply
+    // 任一有效 → Medium;只剩弱证据 → Low。new_name 无质心可比,天花板 Medium。
+    let has_intro = evidence.iter().any(|e| e.r#type == "self_intro");
+    let has_strong = has_intro || evidence.iter().any(|e| e.r#type == "addressed_reply");
+    let tier = if has_intro && acoustic.is_some() && !conflicted {
+        Tier::High
+    } else if has_strong {
+        Tier::Medium
+    } else {
+        Tier::Low
+    };
+    let tier = if conflicted && tier == Tier::High { Tier::Medium } else { tier };
+
+    Verdict { tier, acoustic, reject_reason: None, target_key, evidence }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +694,132 @@ mod tests {
         assert!(r2.linked.is_none());
         assert_eq!(ctx.revision, 3);
         assert!(!ctx.source_hash.is_empty());
+    }
+    // ---------- 裁决测试 ----------
+
+    fn raw(cluster: &str, person_id: Option<&str>, new_name: Option<&str>, evs: Vec<RawIdentifyEvidence>) -> RawAssignment {
+        RawAssignment {
+            cluster: cluster.into(),
+            person_id: person_id.map(Into::into),
+            new_name: new_name.map(Into::into),
+            confidence: "high".into(),
+            evidence: evs,
+        }
+    }
+
+    fn ev(idx: usize, start: usize, end: usize, quote: &str, ty: &str) -> RawIdentifyEvidence {
+        RawIdentifyEvidence { paragraph_index: idx, start, end, quote: quote.into(), r#type: ty.into() }
+    }
+
+    /// 库:P1=张伟(mic 质心与 R1 同向)。稿:R1 说「我是张伟」,R2 喊「张伟你说」。
+    fn adjudicate_fixture() -> (RefinedDoc, BTreeMap<String, BTreeSet<u64>>, Vec<ClusterStat>, Voiceprints) {
+        let doc = doc_with(vec![
+            para("R1", &[0], "我是张伟,先说结论"),
+            para("R2", &[1], "张伟你说说进展"),
+            para("R1", &[2], "好,三点"),
+        ]);
+        let members = cluster_members_from_doc(&doc);
+        let stats = vec![
+            stat("R1", "mic", vec![1.0, 0.0, 0.0, 0.0], 60_000),
+            stat("R2", "mic", vec![0.0, 1.0, 0.0, 0.0], 30_000),
+        ];
+        let vp = vp_with(vec![("P1", person("张伟", "mic", vec![1.0, 0.0, 0.0, 0.0], "2026-08-01"))]);
+        (doc, members, stats, vp)
+    }
+
+    #[test]
+    fn parse_skips_bad_entries_keeps_good() {
+        let content = r#"{"assignments":[
+            {"cluster":"R1","person_id":"P1","confidence":"high","evidence":[]},
+            {"cluster":42},
+            {"cluster":"R2","new_name":"李雷","confidence":"medium","evidence":[]}
+        ]}"#;
+        let (ok, skipped) = parse_raw_identify(content).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert_eq!(skipped, 1);
+        assert!(parse_raw_identify("{}").is_err(), "缺 assignments 整体报错");
+    }
+
+    #[test]
+    fn evidence_quote_and_char_range_must_match() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        // 「我是张伟」= 段0 chars [0,4)。
+        let good = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert!(good.reject_reason.is_none());
+        let bad = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是李雷", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(bad.reject_reason, Some("evidence-mismatch"));
+        let oob = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 999, "x", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(oob.reject_reason, Some("evidence-mismatch"));
+    }
+
+    #[test]
+    fn self_intro_quote_must_contain_target_name() {
+        let (doc, members, stats, mut vp) = adjudicate_fixture();
+        // 库里再加个李雷:quote「我是张伟」却指认李雷 → self_intro 降级,只剩弱证据 → Low。
+        vp.people.insert("P2".into(), person("李雷", "mic", vec![0.0, 0.0, 1.0, 0.0], "2026-08-02"));
+        let v = adjudicate(&raw("R1", Some("P2"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert!(v.reject_reason.is_none());
+        assert_eq!(v.tier, Tier::Low, "偷梁换柱的 self_intro 只算弱证据");
+    }
+
+    #[test]
+    fn addressed_reply_needs_call_and_reply_pair() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        // 完整配对:他簇称呼(段1 R2 喊「张伟你说说进展」,含名)+ 本簇应答(段2 R1)。
+        let paired = adjudicate(
+            &raw("R1", Some("P1"), None, vec![
+                ev(1, 0, 5, "张伟你说说", "addressed_reply"),
+                ev(2, 0, 1, "好", "addressed_reply"),
+            ]),
+            &doc, &members, &stats, &vp, true, &BTreeMap::new(),
+        );
+        assert!(paired.reject_reason.is_none());
+        assert_eq!(paired.tier, Tier::Medium, "称呼应答配对成立=中档");
+        // 单条只有称呼,没有本簇应答 → 降为弱证据 → Low。
+        let single = adjudicate(
+            &raw("R1", Some("P1"), None, vec![ev(1, 0, 5, "张伟你说说", "addressed_reply")]),
+            &doc, &members, &stats, &vp, true, &BTreeMap::new(),
+        );
+        assert_eq!(single.tier, Tier::Low);
+    }
+
+    #[test]
+    fn conflicts_and_acoustic_gate_cap_tier() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        let intro = vec![ev(0, 0, 4, "我是张伟", "self_intro")];
+        // 声学同向 + self_intro → High。
+        let high = adjudicate(&raw("R1", Some("P1"), None, intro.clone()), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(high.tier, Tier::High);
+        assert!(high.acoustic.is_some());
+        // 门禁关闭 → 声学 None → Medium。
+        let gated = adjudicate(&raw("R1", Some("P1"), None, intro.clone()), &doc, &members, &stats, &vp, false, &BTreeMap::new());
+        assert_eq!(gated.tier, Tier::Medium);
+        assert!(gated.acoustic.is_none());
+        // 冲突:张伟已被 R2 认领 → 上限 Medium。
+        let mut taken = BTreeMap::new();
+        taken.insert("R2".to_string(), "P1".to_string());
+        let conflicted = adjudicate(&raw("R1", Some("P1"), None, intro), &doc, &members, &stats, &vp, true, &taken);
+        assert_eq!(conflicted.tier, Tier::Medium);
+    }
+
+    #[test]
+    fn structural_rejects_and_new_name_ceiling() {
+        let (doc, members, stats, vp) = adjudicate_fixture();
+        let both = adjudicate(&raw("R1", Some("P1"), Some("张伟"), vec![]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(both.reject_reason, Some("person-xor-new-name"));
+        let dangling = adjudicate(&raw("R1", Some("P99"), None, vec![]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(dangling.reject_reason, Some("dangling-person"));
+        let badname = adjudicate(&raw("R1", None, Some("   "), vec![]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(badname.reject_reason, Some("bad-new-name"));
+        let unknown_cluster = adjudicate(&raw("R9", Some("P1"), None, vec![]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(unknown_cluster.reject_reason, Some("unknown-cluster"));
+        // new_name:自报「我是张伟」建新人张伟——证据成立但无质心可比 → 天花板 Medium。
+        let newp = adjudicate(&raw("R1", None, Some("张伟"), vec![ev(0, 0, 4, "我是张伟", "self_intro")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert!(newp.reject_reason.is_none());
+        assert_eq!(newp.tier, Tier::Medium);
+        assert_eq!(newp.target_key, "name:张伟");
+        // 未知 evidence type 丢弃后无有效证据 → reject。
+        let noev = adjudicate(&raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "made_up")]), &doc, &members, &stats, &vp, true, &BTreeMap::new());
+        assert_eq!(noev.reject_reason, Some("no-valid-evidence"));
     }
 }
