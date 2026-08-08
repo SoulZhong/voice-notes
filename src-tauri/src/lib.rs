@@ -7099,6 +7099,9 @@ mod tests {
         assert_eq!(sync.samples, 1600);
         assert_eq!(sync.track_ms, 100);
         assert_eq!(sync.drift_ms, 0);
+        // 二期:首帧偏移随对账落盘(mixed seek 修正的数据来源)。默认 health 未记录
+        // 首帧 → 读数为 0,但字段必须是 Some——None 专属旧数据。
+        assert_eq!(sync.first_frame_offset_ms, Some(0));
     }
 
     #[test]

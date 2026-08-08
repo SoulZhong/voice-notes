@@ -57,8 +57,9 @@ pub fn regen_mixed_to<W: Write + Seek>(
     // 时间轴原点 = 较早的 offset;两源起点是相对原点的样本偏移。
     let origin_ms = mic_off_ms.min(sys_off_ms);
     let starts = [(mic_off_ms - origin_ms) * 16, (sys_off_ms - origin_ms) * 16];
+    // 喂料下标与 TimelineMixer 源号约定一致(编译期锁死,常量变了立刻编不过)。
+    const _: () = assert!(MIC == 0 && SYSTEM == 1);
     let pcms: [&[f32]; 2] = [&mic_pcm, &sys_pcm];
-    debug_assert!(MIC == 0 && SYSTEM == 1, "喂料下标与 TimelineMixer 源号约定一致");
 
     sink.write_all(&wav_header(0))?;
     let mut data_len: u64 = 0;

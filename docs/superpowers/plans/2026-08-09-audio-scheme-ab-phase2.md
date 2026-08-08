@@ -62,7 +62,7 @@
 - Produces: `SyncInfo.first_frame_offset_ms: Option<u64>`(None = 旧数据,按 0 消费)。
   Task 3(live MixInfo 的 seek 表)与 Task 6(mixed_playback_info)消费。
 
-- [ ] **Step 1: 写失败测试**(audio.rs tests 模块追加)
+- [x] **Step 1: 写失败测试**(audio.rs tests 模块追加)
 
 ```rust
 /// 旧 audio.json(无 first_frame_offset_ms)必须照常反序列化为 None;
@@ -83,11 +83,11 @@ fn sync_first_frame_offset_roundtrip_and_backcompat() {
 
 注意:该测试用了 `..s` 展开,`SyncInfo` 需要 `Clone`(已有 derive 则不动;没有就补)。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 `cd src-tauri && cargo test sync_first_frame_offset` — 期望编译错误(字段不存在)。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `SyncInfo`(audio.rs:160)追加字段:
 
@@ -107,11 +107,11 @@ first_frame_offset_ms: Some(health.first_frame_offset_16k() / 16),
 
 全仓 `grep -rn "SyncInfo {" src-tauri/src` 找出其余字面量构造点(mixed_untrusted 的测试等),逐个补 `first_frame_offset_ms: None,`(或 `..` 展开)。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 `cargo test sync_first_frame_offset` PASS;`cargo test` 全绿(字面量构造点全补齐才会绿)。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 `git add -A && git commit -m "feat(mix): SyncInfo 落盘首帧偏移——mixed 段落 seek 修正的数据来源"`
 
@@ -132,7 +132,7 @@ first_frame_offset_ms: Some(health.first_frame_offset_16k() / 16),
   - `mixed_untrusted` 的 mixed 时长读数链:`duration_ms → sync.track_ms → mix.track_ms`
 - Consumes: 无(Task 1 独立)。Task 3/4/5/6 消费。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 audio.rs tests:
 
@@ -180,9 +180,9 @@ fn mix_info_track_ms_serves_as_duration_fallback() {
 
 (`/* */` 处照抄同文件既有 `mixed_untrusted` 测试的构造数值,保持同一口径。)
 
-- [ ] **Step 2: 跑测试确认失败**(编译错:MixInfo 不存在)
+- [x] **Step 2: 跑测试确认失败**(编译错:MixInfo 不存在)
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 audio.rs 在 `CleanInfo` 附近新增:
 
@@ -220,9 +220,9 @@ pub struct MixInfo {
 input.rs `mixed_untrusted` 里 mixed 时长解析处(duration_ms → sync.track_ms 的链尾)追加
 `.or_else(|| track.mix.as_ref().map(|m| m.track_ms))`,并同步其文档注释。
 
-- [ ] **Step 4: 跑测试确认通过**(`cargo test set_track_mix` / `cargo test mix_info_track_ms` / 全量)
+- [x] **Step 4: 跑测试确认通过**(`cargo test set_track_mix` / `cargo test mix_info_track_ms` / 全量)
 
-- [ ] **Step 5: 提交** `feat(mix): MixInfo 完整性标记——定稿才写,兼作未转码 mixed 的时长读数`
+- [x] **Step 5: 提交** `feat(mix): MixInfo 完整性标记——定稿才写,兼作未转码 mixed 的时长读数`
 
 ---
 
@@ -237,7 +237,7 @@ input.rs `mixed_untrusted` 里 mixed 时长解析处(duration_ms → sync.track_
   `store::audio::session_track_ms(note_dir, source, base_ms)`(audio.rs:248,以实际签名为准)。
 - Produces: 正常停录后 `audio.json` 的 mixed 条目带 `mix`;所有放弃/回滚路径不带。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 扩展既有 `with_mix_produces_mixed_track_of_equal_length`(:498)结尾:
 
@@ -258,9 +258,9 @@ input.rs `mixed_untrusted` 里 mixed 时长解析处(duration_ms → sync.track_
         "放弃/回滚路径不得留下完整性标记");
 ```
 
-- [ ] **Step 2: 跑测试确认失败**(第一条 expect panic)
+- [x] **Step 2: 跑测试确认失败**(第一条 expect panic)
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 混音线程正常走完(队列自然关闭、未 abandoned、writer finalize 成功)之后、线程返回前:
 
@@ -283,9 +283,9 @@ if let Err(e) = crate::store::audio::set_track_mix(&note_dir, MIXED_TRACK, crate
 线程闭包需要 `note_dir`/`base_ms`/`first_offsets` 的克隆——`MixedSink` 已持有
 (`first_offsets` :200,装配时 clone 进线程;`note_dir`/`base_ms` 从 `inner` 或装配参数取)。
 
-- [ ] **Step 4: 跑测试确认通过**(`cargo test recording_sink` 全部,尤其 :498/:610/:716/:768/:848/:916 六条)
+- [x] **Step 4: 跑测试确认通过**(`cargo test recording_sink` 全部,尤其 :498/:610/:716/:768/:848/:916 六条)
 
-- [ ] **Step 5: 提交** `feat(mix): 实时混音正常定稿写完整性标记,放弃与回滚路径不写`
+- [x] **Step 5: 提交** `feat(mix): 实时混音正常定稿写完整性标记,放弃与回滚路径不写`
 
 ---
 
@@ -328,7 +328,7 @@ if let Err(e) = crate::store::audio::set_track_mix(&note_dir, MIXED_TRACK, crate
   流式写数据,末尾 Seek 回补 RIFF/data 长度。
 - `track_ms = bytes_to_ms(数据字节数)`;`offset_ms = origin 对应毫秒`。
 
-- [ ] **Step 1: 写失败测试**(新文件先只写 tests)
+- [x] **Step 1: 写失败测试**(新文件先只写 tests)
 
 ```rust
 #[cfg(test)]
@@ -427,14 +427,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**(`cargo test mix_regen` — 编译错)
+- [x] **Step 2: 跑测试确认失败**(`cargo test mix_regen` — 编译错)
 
-- [ ] **Step 3: 实现**(按上方要点;`store/mod.rs` 注册;`player.rs:322` fn 前加 `pub(crate)`
+- [x] **Step 3: 实现**(按上方要点;`store/mod.rs` 注册;`player.rs:322` fn 前加 `pub(crate)`
   并在 mix_regen 里复用或复刻其一行算式)
 
-- [ ] **Step 4: 跑测试确认通过**(`cargo test mix_regen`,含 render_aligned_to 分支)
+- [x] **Step 4: 跑测试确认通过**(`cargo test mix_regen`,含 render_aligned_to 分支)
 
-- [ ] **Step 5: 提交** `feat(mix): 离线补生成纯核心——同一混音器的 accept_at 离线入口`
+- [x] **Step 5: 提交** `feat(mix): 离线补生成纯核心——同一混音器的 accept_at 离线入口`
 
 ---
 
@@ -502,7 +502,7 @@ emit(stage=finish, ok)
 `pub fn reset_mixed_meta(note_dir: &Path, offset_ms: u64) -> anyhow::Result<()>`
 (读改写模板同 set_track_sync:清 codec/duration_ms/waveform/mix,写 offset_ms)。
 
-- [ ] **Step 1: 写失败测试**(lib.rs tests,守卫纯函数级)
+- [x] **Step 1: 写失败测试**(lib.rs tests,守卫纯函数级)
 
 ```rust
 /// 补生成与录制/重转写互斥:占槽判定是纯函数,三态各自可测。
@@ -519,13 +519,13 @@ fn mixed_regen_slot_blocks_and_clears() {
 录制启动侧与重转写侧的守卫都要接它——录制 spawn 前、do_retranscribe 守卫链里各加一查,
 反向互斥闭环。)
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现**(命令 + worker + 三处反向互斥接线 + invoke_handler 注册 + notes.ts 包装)
+- [x] **Step 3: 实现**(命令 + worker + 三处反向互斥接线 + invoke_handler 注册 + notes.ts 包装)
 
-- [ ] **Step 4: 跑测试确认通过**(`cargo test mixed_regen` + 全量;`npm run check`)
+- [x] **Step 4: 跑测试确认通过**(`cargo test mixed_regen` + 全量;`npm run check`)
 
-- [ ] **Step 5: 提交** `feat(mix): 离线补生成命令——守卫链/NoteLock/原子改名/事件,照重转写纪律`
+- [x] **Step 5: 提交** `feat(mix): 离线补生成命令——守卫链/NoteLock/原子改名/事件,照重转写纪律`
 
 ---
 
@@ -579,7 +579,7 @@ ab_caveat = meta.tracks.get("mic").map(|t| t.clean.is_some()).unwrap_or(false)
   完成后发 transcode_done 同款重拉信号(直接 emit "transcode_done" 即可复用前端既有订阅,:521-534)
 ```
 
-- [ ] **Step 1: 写失败测试**(lib.rs tests;构造 tempdir 笔记:双轨 sync + mixed wav + MixInfo)
+- [x] **Step 1: 写失败测试**(lib.rs tests;构造 tempdir 笔记:双轨 sync + mixed wav + MixInfo)
 
 ```rust
 /// mixed_playback_info 的读数拼装:轨在+可信 → track Some/untrusted None;
@@ -589,9 +589,9 @@ fn mixed_playback_info_assembles_readings() { /* 构造 → 调内部拼装函�
     fn assemble_mixed_playback(meta, track) 便于单测,命令壳只做 dir 解析) */ }
 ```
 
-- [ ] **Step 2: 跑失败** → **Step 3: 实现**(拼装抽纯函数)→ **Step 4: 全绿 + npm run check**
+- [x] **Step 2: 跑失败** → **Step 3: 实现**(拼装抽纯函数)→ **Step 4: 全绿 + npm run check**
 
-- [ ] **Step 5: 提交** `feat(mix): mixed_playback_info——回放消费侧一站式读数(可信性/seek 表/AB 口径告警)`
+- [x] **Step 5: 提交** `feat(mix): mixed_playback_info——回放消费侧一站式读数(可信性/seek 表/AB 口径告警)`
 
 ---
 
@@ -721,11 +721,11 @@ describe("mixed 回放装载纪律", () => {
 });
 ```
 
-- [ ] **Step 1: 写护栏测试并跑失败**(`npx vitest run src/lib/mixPlayback.test.ts`)
-- [ ] **Step 2: 实现页面改动 + i18n 键**
-- [ ] **Step 3: `npx vitest run` 全绿**(含 i18n 键集一致/无硬编码中文两道既有护栏)
-- [ ] **Step 4: `npm run check` 0 错误**
-- [ ] **Step 5: 提交** `feat(ui): 详情页回放 A/B 切换与成品轨生成——装载二选一,seek 带首帧偏移修正`
+- [x] **Step 1: 写护栏测试并跑失败**(`npx vitest run src/lib/mixPlayback.test.ts`)
+- [x] **Step 2: 实现页面改动 + i18n 键**
+- [x] **Step 3: `npx vitest run` 全绿**(含 i18n 键集一致/无硬编码中文两道既有护栏)
+- [x] **Step 4: `npm run check` 0 错误**
+- [x] **Step 5: 提交** `feat(ui): 详情页回放 A/B 切换与成品轨生成——装载二选一,seek 带首帧偏移修正`
 
 ---
 
@@ -752,9 +752,9 @@ describe("mixed 回放装载纪律", () => {
 `saveSetting((s) => (s.mix_track = mixTrack))`);`settings.rs:139` 注释里的
 「实验字段,无 UI,手改 settings.json」一句同步删掉(名不副实即改)。
 
-- [ ] **Step 1: 实现**(此 Task 纯声明式 UI,无先行失败测试;护栏是既有 i18n 双测)
-- [ ] **Step 2: `npx vitest run` + `npm run check` 全绿**
-- [ ] **Step 3: 提交** `feat(ui): 设置页开放 mix_track 开关`
+- [x] **Step 1: 实现**(此 Task 纯声明式 UI,无先行失败测试;护栏是既有 i18n 双测)
+- [x] **Step 2: `npx vitest run` + `npm run check` 全绿**
+- [x] **Step 3: 提交** `feat(ui): 设置页开放 mix_track 开关`
 
 ---
 
@@ -764,17 +764,17 @@ describe("mixed 回放装载纪律", () => {
 - Modify: `src-tauri/src/pipeline/recording_sink.rs` tests(若 Task 3 未覆盖端到端断言)
 - Test: 全仓
 
-- [ ] **Step 1: 补端到端断言**(recording_sink 既有 drain 流水线上,mix 开):
+- [x] **Step 1: 补端到端断言**(recording_sink 既有 drain 流水线上,mix 开):
   正常停录后 `load_audio_meta`:mixed 有 `mix.origin == "live"`、`mix.track_ms` 与
   `session_track_ms` 一致、`seek_offset_ms` 键集 ⊆ {mic, system};两条源轨 `sync.first_frame_offset_ms`
   为 Some 且其中至少一个为 0(最早源)。
 
-- [ ] **Step 2: 补 regen→可信闭环单测**(lib.rs 或 input.rs):tempdir 笔记造双轨(wav)+
+- [x] **Step 2: 补 regen→可信闭环单测**(lib.rs 或 input.rs):tempdir 笔记造双轨(wav)+
   sync → 直接调 worker 内层函数(把 worker 主体抽成 `fn regen_mixed_for_dir(dir) -> anyhow::Result<()>`
   便于免 Tauri 单测)→ 断言 `mixed_untrusted == None`、`mix.origin == "regen"`、
   `seek_offset_ms` 空、`offset_ms == min(源 offset)`。
 
-- [ ] **Step 3: 全套验证**
+- [x] **Step 3: 全套验证**
 
 ```bash
 cd src-tauri && cargo test            # 全绿
@@ -782,7 +782,7 @@ cd .. && npx vitest run               # 全绿
 npm run check                         # 0 错误
 ```
 
-- [ ] **Step 4: 提交 + PR**
+- [x] **Step 4: 提交 + PR**
 
 PR 描述含**真机冒烟清单**(Chromium/无头假通过前科,必须真机):
 
