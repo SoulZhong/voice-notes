@@ -87,6 +87,9 @@ pub struct TrackMeta {
     /// 墙钟-样本对账(见 SyncInfo)。None = 该轨录制期未记录(旧笔记/中断)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncInfo>,
+    /// 成品轨专用,见 MixInfo。源轨恒 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<MixInfo>,
 }
 
 /// 波形桶数,与前端 WAVE_BARS 对齐(260 桶约 1KB JSON,audio.json 体积可忽略)。
@@ -102,6 +105,25 @@ pub struct CleanInfo {
     /// Some(false)=AEC3-only(模型未在场或推理失败);Some(true)=神经级已叠加。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neural: Option<bool>,
+}
+
+/// 成品轨完整性标记 + 消费口径。只在混音**正常定稿**(实时)或补生成**原子改名
+/// 成功后**(离线)写入;回滚、放弃、panic 路径全都到不了写入点——因此它的存在
+/// 本身就是「这条轨是完整产物」的盘上证据,mixed_track() 文档里两条无标记残留
+/// 路径自此可判定。缺失不单独定罪(一期录的 mixed 没有它),时长交叉核对仍是
+/// 最终裁决,见 retranscribe::input::mixed_untrusted。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixInfo {
+    /// "live"(录制期混出,时间轴含首帧偏移)或 "regen"(离线补生成,按
+    /// offset_ms 定位,段落 seek 无需修正)。
+    pub origin: String,
+    /// 消费 mixed 时各源段落 seek 要加的修正量(ms)。live = 各源首帧偏移
+    /// (末场值;续录多场的历史场次只能近似,量级数十~数百 ms)。regen = 空表。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seek_offset_ms: BTreeMap<String, u64>,
+    /// 定稿时量出的净时长(WAV 字节口径,同 SyncInfo.track_ms 语义)。
+    /// 未转码时 mixed_untrusted 的时长读数来源。
+    pub track_ms: u64,
 }
 
 /// 墙钟-轨时间轴对账:该轨在本场录制里实际落盘的时长 vs 同一场的墙钟时长。
@@ -399,6 +421,16 @@ pub fn set_track_sync(note_dir: &Path, source: &str, info: SyncInfo) -> anyhow::
     let mut meta = load_audio_meta(note_dir);
     meta.schema_version = 1;
     meta.tracks.entry(source.to_string()).or_default().sync = Some(info);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 写成品轨完整性标记(见 MixInfo)。只允许在定稿成功的唯一出口调用——放弃/回滚
+/// 路径写不到它正是它作为完整性证据的全部依据。
+pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.schema_version = 1;
+    meta.tracks.entry(source.to_string()).or_default().mix = Some(mix);
     save_audio_meta(note_dir, &meta)
 }
 
@@ -1316,6 +1348,38 @@ mod tests {
 
         assert!(list_tracks(tmp.path()).is_empty(), "只有成品轨时源轨列表应为空");
         assert!(mixed_track(tmp.path()).is_some(), "但 mixed_track 仍应能取到它");
+    }
+
+    /// MixInfo 是「正常定稿」的盘上证据:回滚失败/线程 panic 两条残留路径(见
+    /// mixed_track 文档)都写不到它。set_track_mix 走读改写 audio.json,不碰其他字段。
+    #[test]
+    fn set_track_mix_persists_and_preserves_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_sync(
+            dir.path(),
+            "mixed",
+            SyncInfo {
+                wall_ms: 1,
+                samples: 0,
+                track_ms: 5000,
+                drift_ms: 4999,
+                silence_ms: 0,
+                gaps: 0,
+                rate_fixes: 0,
+                first_frame_offset_ms: None,
+            },
+        )
+        .unwrap();
+        let mix = MixInfo {
+            origin: "live".into(),
+            seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
+            track_ms: 5000,
+        };
+        set_track_mix(dir.path(), "mixed", mix.clone()).unwrap();
+        let meta = load_audio_meta(dir.path());
+        let t = meta.tracks.get("mixed").expect("track 条目");
+        assert_eq!(t.mix.as_ref(), Some(&mix));
+        assert!(t.sync.is_some(), "既有字段不得被覆盖丢失");
     }
 
     /// 旧 audio.json(无 first_frame_offset_ms)必须照常反序列化为 None;
