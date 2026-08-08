@@ -390,7 +390,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 };
                 let seeds = load_voiceprint_seeds(&app);
-                let mut doc = refine::run_local(
+                // cluster_stats 在 P2a Task 5 接入 identify;下划线前缀待接线时移除。
+                let (mut doc, _cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
                     &note.speakers,
