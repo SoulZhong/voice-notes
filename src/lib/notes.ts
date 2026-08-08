@@ -12,6 +12,21 @@ export type NoteSummary = {
   state: NoteState;
 };
 
+export type CalendarAttendee = {
+  name: string;
+  email: string;
+  is_me: boolean;
+};
+
+/** 日历事件快照(P3):落盘即快照,不依赖 event_id 活性。 */
+export type CalendarSnapshot = {
+  event_id: string;
+  title: string;
+  attendees: CalendarAttendee[];
+  matched_at: string;
+  match_kind: string; // "auto" | "manual"
+};
+
 export type NoteMeta = {
   schema_version: number;
   id: string;
@@ -19,6 +34,8 @@ export type NoteMeta = {
   started_at: string;
   ended_at: string | null;
   state: string;
+  calendar?: CalendarSnapshot | null;
+  calendar_cleared?: boolean;
 };
 
 export type SegmentRecord = {

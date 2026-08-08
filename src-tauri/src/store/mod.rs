@@ -57,6 +57,39 @@ pub struct NoteMeta {
     pub ended_at: Option<String>,
     /// "recording" | "complete"
     pub state: String,
+    /// 匹配到的日历事件快照(P3):serde default 兼容旧 meta;未匹配省略键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarSnapshot>,
+    /// 用户明确清除过日历关联的 tombstone:自动匹配/backfill 永不再绑,
+    /// 手动改选会复位。没有它,「清除」在下一次 backfill 就被推翻。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub calendar_cleared: bool,
+}
+
+/// 日历事件快照(P3):落盘即快照——title/attendees 是匹配时刻的副本,不依赖
+/// event_id 活性(事件被改/删后快照仍自洽);event_id 仅供改选时重新定位。
+/// 字段固定序列化(不 skip):前端 TS 类型全必填,空参会人也写空数组。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarSnapshot {
+    pub event_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub attendees: Vec<CalendarAttendee>,
+    pub matched_at: String,
+    /// "auto"(停止后/backfill 自动匹配)| "manual"(用户改选)。
+    #[serde(default)]
+    pub match_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarAttendee {
+    #[serde(default)]
+    pub name: String,
+    /// 已规范化(trim+小写,mailto 剥离+percent-decode);无邮箱为空串。
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub is_me: bool,
 }
 
 /// 一条定稿段，存 segments.jsonl（每段一行）。speaker 为 P4 说话人区分预留。

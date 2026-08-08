@@ -139,6 +139,8 @@ impl NoteWriter {
             started_at: now.to_rfc3339(),
             ended_at: None,
             state: "recording".into(),
+            calendar: None,
+            calendar_cleared: false,
         };
         write_meta_atomic(&dir, &meta)?;
         let file = OpenOptions::new()

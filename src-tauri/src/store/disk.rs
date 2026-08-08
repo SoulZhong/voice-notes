@@ -110,6 +110,8 @@ mod tests {
             started_at: started_at.into(),
             ended_at: ended_at.map(|s| s.to_string()),
             state: state.into(),
+            calendar: None,
+            calendar_cleared: false,
         };
         std::fs::write(note_dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
     }
