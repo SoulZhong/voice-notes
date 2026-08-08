@@ -347,9 +347,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     // 入队，按 FIFO,actor 必先处理 A 的插入、再处理 R 的查询，R 的 is_refining
     // 就不可能读到 false——矛盾。故双穿不可能发生：R 先写必被 A 看见（A 让步不
     // spawn 线程),A 先"送单"必被 R 的复查看见（R 让步清槽拒绝)。
-    if retranscribing_blocks_refine(&state.retranscribing, &note_id) {
+    if retranscribing_blocks_refine(&state.retranscribing, &note_id)
+        || mixed_regen_blocks_refine(&state.mixed_regen, &note_id)
+    {
         eprintln!(
-            "refine({note_id}): 与重转写占槽发生竞态,放弃本次 Aing(见 spawn_refine Fix 2 注释)"
+            "refine({note_id}): 与重转写/补生成占槽发生竞态,放弃本次 Aing(见 spawn_refine Fix 2 注释)"
         );
         // 把上面刚插入的 Aing 集清干净,与 worker 正常收尾同款消息序(先 all/failed
         // 再 RefineFinished),前端/轮询方看到的事件形状不因走了这条放弃路径而变化。
@@ -866,6 +868,16 @@ pub(crate) fn mixed_regen_busy(slot: &Mutex<Option<String>>) -> bool {
 /// （codex 第三轮）。真实竞态涉及 lifecycle actor 信箱 + 后台线程交错，无法在
 /// 单元测试里驱动出货真价实的并发窗口；这个纯函数至少把"槽命中同 note_id 时
 /// 该让步"这条判据本身纳入测试，而不是只靠现场审读代码。
+/// 补生成↔Aing 占槽后互查的 A 侧判定(codex 第三轮 P1,镜像 retranscribing_blocks_refine):
+/// regen worker 全程持目录级 NoteLock,Aing 收尾提交 aing/refined 时要拿同一把锁,
+/// 昂贵 LLM 阶段跑完才失败——同 note_id 占槽即让步。
+pub(crate) fn mixed_regen_blocks_refine(slot: &Mutex<Option<String>>, note_id: &str) -> bool {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|running_id| running_id == note_id)
+}
+
 pub(crate) fn retranscribing_blocks_refine(slot: &Mutex<Option<(String, String)>>, note_id: &str) -> bool {
     slot.lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2438,6 +2450,12 @@ pub(crate) fn do_regenerate_mixed(app: &AppHandle, id: &str) -> Result<(), Strin
     if recording_blocks_retranscribe(&state.running, session_active) {
         return Err(tr!("录制中不能补生成成品轨,请先停止录制", "Cannot regenerate the mixed track while recording"));
     }
+    // Aing 互斥(codex 第三轮 P1):worker 全程持 NoteLock,Aing 收尾提交要拿同一把
+    // 锁——放行会让昂贵 LLM 阶段跑完才失败。快拒 + 占槽后复查(下方),反向由
+    // spawn_refine 的占槽后复查闭环(FIFO actor 论证同重转写侧 Fix 2)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(id) {
+        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined by AI; try again later"));
+    }
     if retranscribe_blocks_recording(&state.retranscribing) {
         return Err(tr!("重转写进行中,稍后再试", "Re-transcription in progress; try again later"));
     }
@@ -2472,6 +2490,7 @@ pub(crate) fn do_regenerate_mixed(app: &AppHandle, id: &str) -> Result<(), Strin
     if recording_blocks_retranscribe(&state.running, session_active)
         || state.download_running.load(Ordering::SeqCst)
         || retranscribe_blocks_recording(&state.retranscribing)
+        || app.state::<lifecycle::LifecycleHandle>().is_refining(id)
     {
         *state.mixed_regen.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("状态刚发生变化(录制/迁移/重转写),稍后再试", "State just changed (recording/migration/re-transcription); try again later"));
@@ -8102,6 +8121,17 @@ mod tests {
         // 无轨:untrusted 不给原因(前端走「生成」动作,不是「不可信」态)。
         let none = super::assemble_mixed_playback(&meta, None);
         assert!(none.track.is_none() && none.untrusted.is_none());
+    }
+
+    /// codex 第三轮 P1:regen↔Aing 互查判据——同 note_id 占槽才让步,不误伤
+    /// 其它笔记的正常 Aing(镜像 retranscribing_blocks_refine 的语义)。
+    #[test]
+    fn mixed_regen_blocks_refine_matches_same_note_only() {
+        let slot: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Some("n1".into()));
+        assert!(super::mixed_regen_blocks_refine(&slot, "n1"));
+        assert!(!super::mixed_regen_blocks_refine(&slot, "n2"));
+        *slot.lock().unwrap() = None;
+        assert!(!super::mixed_regen_blocks_refine(&slot, "n1"));
     }
 
     /// 补生成占槽判定(纯函数):占了就 busy,清了就不 busy。与录制/重转写的
