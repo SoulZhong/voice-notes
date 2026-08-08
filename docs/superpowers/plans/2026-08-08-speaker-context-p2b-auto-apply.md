@@ -2,6 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans。
 
+> **rev2 状态:设计已定稿,实现推迟到评测数据临门。** Codex 审查(21 P1 + 7 P2)击穿了 rev1「不建 intent journal」的论证,修正后的必做设计如下;本轮只实现 Task 6(重新推断入口),其余任务待用户标注数据接近门槛时另开会话执行(评测数据还将反哺 AS-Norm 口径)。
+
+## rev2 修正设计(Codex 审查结论,实现时必须遵守)
+
+1. **必须建 auto_pending 意向日志**(spec identify_journal 的最小形态):每次自动应用先持久化 `{operation_id, fingerprint, cluster(当时 R 号), seqs, target_person, before(逐段 person_id/name 快照), stage: pending|assigned|reinforced|done}`,再推进各步,启动/重跑时恢复未完成操作。三个"幂等机制"不能替代它:回灌是先改库后写账本(崩溃重复累计);assign 会推进 revision(非幂等);崩溃后合并规则会吞掉回执让撤销入口消失。
+2. **自动路径回灌必须同步**(不走 spawn_feedback 异步)——否则"assign→status→用户撤销→后台回灌污染"。且不得复用 `do_assign_refined_person`(其 `is_refining` 守卫在管线内必挡);需要绕守卫的内部变体,自动应用发生在 Aing 线程内本就无并发编辑。
+3. **自动前置条件在锁内验证**:该簇全部段 `person_id == None 且 name 为空`(有用户手填 name 的簇绝不自动动——unassign 无法恢复 name);目标是库内已有人;tier High。这同时保证撤销只需覆盖 Reinforce 路径(prior 恒 None,不触 merge_journaled 不可逆分支)。
+4. **撤销 = CAS + 状态机**:仅当当前关联仍等于自动目标才解除(用户已手改则拒绝);质心还原经 operation_id 对账(ledger 需记 op id,scope 键会被后续人工覆盖);撤销自身各步带状态位(undo_pending/restored/done),bool 推断不可靠;`restore_feedback` 被后续写挡下时持久化 non_revertible + 原因展示。
+5. **回执永续可见**:回执渲染自 auto_pending/receipt 记录(含原 speaker/seqs/target),不依赖当前指纹可定位;重聚类后定位不到显示冲突态而非消失;不与建议共享 50 条淘汰上限。
+6. **`run_identify` 合并规则保留 `auto_applied`**(现只保留 applied);自动循环后禁止再保存旧 idoc 副本;identify.json 读改写全部收进 IDENTIFY_ACT_GATE(含 run_identify/save 路径)。
+7. **AS-Norm 必须与 registry 同口径**:对称 z(probe/seed 两侧)+ `SEED_ASSIGN_RAW_FLOOR=0.50` 裸分下限,不允许低余弦仅凭单侧 z 通过;`SNORM_MIN_COHORT` 等常量改 pub(crate) 共享,不写第二套相似算法;cohort 经 redirects 去重 + 维度/NaN 检查。
+8. **Tier 语义不受开关污染**:自动资格另算 `auto_eligible` 字段,不改 adjudicate 的 High 定义(默认关时建议卡与评测行为必须与 P2a 完全一致);`acoustic` 字段形状不破坏兼容——旧二元组保留,另加 `acoustic_z: Option<f32>`(identify.json 不是纯可再生缓存:rejected/applied 决策在里面)。
+9. 其它:`mark_decided` 用枚举限定转移(suggested→auto_applied→applied|rejected);acknowledge/undo 命令加录制中/Aing 中守卫;`decided_at` 前后端都是可空;`identify_note` 的 FEEDBACK_GATE 与同步回灌的自锁要拆锁序;ledger person 比较先经 redirect 归一。
+
 **Goal:** 造好 P2b「high 档自动应用 + 回执可撤销」的全部机器,**默认关闭**(`identify_auto_apply = false`):spec 的评测数据门(≥20 场标注、high 档 ≥50 样本误认 ≤1%)约束的是**开启**,不是**建造**;用户标注达标后在设置页拨开关即生效。同时补上 P2a 冒烟清单的已知缺口:详情页手动「重新推断身份」入口。
 
 **Architecture:** 自动应用挂在 `spawn_refine` 的 identify 成功之后:遍历新产出的 `status=="suggested"` 且 `tier==High` 且目标为**库内已有人**(new_name 永不自动建档)的 assignment,走与 `apply_identify_suggestion` 同一内部路径(`do_assign_refined_person` + P1 回灌),status 置 `"auto_applied"`;收件箱把 auto_applied 且未确认的条目渲染成**回执卡**(带证据引文),「好」确认、「撤销」回滚。撤销 = ① store 层新函数解除 R 簇关联;② P1 feedback 账本按 scope 条件还原质心(已有 before/after 快照,新增公开撤销入口);③ status → rejected + 拒绝键(同目标不再建议)。**不建 intent journal**:崩溃补偿由三处既有机制拼成——assign 本身幂等;回灌有账本快照且幂等;status 未落盘时,下轮 `run_identify` 的「建议目标与既有关联相同则不再生成」规则自动吞掉重复,收件箱最多短暂少一张回执卡,无数据损坏路径。AS-Norm 声学门升级为独立任务(离线 cohort z-score,High 档在开关开启时额外要求 z 达标)。
