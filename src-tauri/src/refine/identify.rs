@@ -715,6 +715,38 @@ pub fn run_identify(
     })
 }
 
+/// 人工确认:suggested → applied。找不到(已处理/指纹不符)报错,调用方转成
+/// 「建议已失效」提示。
+pub fn mark_applied(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> anyhow::Result<()> {
+    let a = doc
+        .assignments
+        .iter_mut()
+        .find(|a| a.fingerprint == fingerprint && a.status == "suggested")
+        .ok_or_else(|| anyhow::anyhow!("建议不存在或已被处理"))?;
+    a.status = "applied".into();
+    a.decided_at = Some(now.to_string());
+    Ok(())
+}
+
+/// 人工拒绝:suggested → rejected,并把「指纹|目标」写入拒绝表——同目标永不
+/// 再建议,其它候选不受影响。
+pub fn mark_rejected(doc: &mut IdentifyDoc, fingerprint: &str, now: &str) -> anyhow::Result<()> {
+    let target = {
+        let a = doc
+            .assignments
+            .iter_mut()
+            .find(|a| a.fingerprint == fingerprint && a.status == "suggested")
+            .ok_or_else(|| anyhow::anyhow!("建议不存在或已被处理"))?;
+        a.status = "rejected".into();
+        a.decided_at = Some(now.to_string());
+        a.person_id
+            .clone()
+            .unwrap_or_else(|| format!("name:{}", a.new_name.clone().unwrap_or_default()))
+    };
+    doc.rejected.insert(rejected_key(fingerprint, &target), now.to_string());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1108,29 @@ mod tests {
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
         let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, &exec, None, "t").unwrap();
         assert!(d.assignments.is_empty());
+    }
+    #[test]
+    fn mark_applied_and_rejected_update_status_and_denylist() {
+        let mut idoc = IdentifyDoc {
+            schema_version: IDENTIFY_SCHEMA_VERSION,
+            generated_at: "t".into(), provider: "mock".into(), model: "m".into(),
+            revision: 1, source_hash: "h".into(),
+            assignments: vec![IdentifyAssignment {
+                fingerprint: "fp1".into(), cluster: "R1".into(),
+                person_id: Some("P1".into()), new_name: None,
+                tier: Tier::High, llm_confidence: "high".into(), acoustic: None,
+                evidence: vec![], status: "suggested".into(), decided_at: None,
+            }],
+            rejected: BTreeMap::new(),
+        };
+        assert!(mark_applied(&mut idoc, "nope", "t1").is_err());
+        mark_applied(&mut idoc, "fp1", "t1").unwrap();
+        assert_eq!(idoc.assignments[0].status, "applied");
+        assert!(mark_applied(&mut idoc, "fp1", "t2").is_err(), "已处理不可重复");
+
+        idoc.assignments[0].status = "suggested".into();
+        mark_rejected(&mut idoc, "fp1", "t3").unwrap();
+        assert_eq!(idoc.assignments[0].status, "rejected");
+        assert!(idoc.rejected.contains_key(&rejected_key("fp1", "P1")));
     }
 }

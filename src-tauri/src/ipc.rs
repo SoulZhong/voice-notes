@@ -500,6 +500,24 @@ pub struct MergeReceipt {
     pub invalid_reason: Option<String>,
 }
 
+/// identify(P2a)身份建议卡视图:list_identify_suggestions 返回,收件箱消费。
+/// person_id=None 即「新面孔」(is_new=true,确认时建档)。
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentifySuggestion {
+    pub note_id: String,
+    pub note_title: String,
+    pub cluster: String,
+    pub fingerprint: String,
+    pub person_id: Option<String>,
+    pub person_name: String,
+    pub is_new: bool,
+    pub tier: String,
+    /// 首条证据引文与类型(卡片上「因为他说了:……」)。
+    pub quote: String,
+    pub evidence_type: String,
+    pub generated_at: String,
+}
+
 /// apply_confident_merges 返回:本次自动合并的回执 + 留给人工的建议。
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfidentMergeOutcome {
