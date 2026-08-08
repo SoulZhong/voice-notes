@@ -527,6 +527,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             .ok()
                             .and_then(|n| n.meta.calendar);
                         let now = chrono::Local::now().to_rfc3339();
+                        // 未完成 op 无条件先恢复(不依赖开关/推断成败):崩溃在
+                        // assign 后时,不先前滚,新一轮推断会因簇已关联吞掉条目。
+                        recover_identify_ops(&app, &note_id);
                         // identify.json 读改写全程收进 IDENTIFY_ACT_GATE(与
                         // apply/reject/自动应用同门,消并发覆盖)。
                         let idoc = {
@@ -546,10 +549,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             refine::identify::save_identify(&dir, &idoc)?;
                             idoc
                         };
-                        // P2b 自动应用(默认关):先前滚未完成 op,再逐条自动落地。
-                        // 注意此后 idoc 已是旧副本,绝不再保存它。
+                        // P2b 自动应用(默认关):恢复已在 run_identify 前无条件
+                        // 执行;此后 idoc 已是旧副本,绝不再保存它。
                         if s.identify_auto_apply {
-                            recover_identify_ops(&app, &note_id);
                             let fps: Vec<String> = store::load_refined(&dir)
                                 .map(|d| {
                                     refine::identify::auto_apply_targets(&idoc, &d)
@@ -3718,6 +3720,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                 .ok()
                 .map(|r| ailog::Ctx { data_root: r, note_id: id.clone() });
             let now = chrono::Local::now().to_rfc3339();
+            recover_identify_ops(&app2, &id); // 无条件前置(理由同管线路径)
             let idoc = {
                 let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
                 let idoc = refine::identify::run_identify(
@@ -3736,7 +3739,6 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                 idoc
             };
             if s.identify_auto_apply {
-                recover_identify_ops(&app2, &id);
                 let fps: Vec<String> = store::load_refined(&dir)
                     .map(|d| {
                         refine::identify::auto_apply_targets(&idoc, &d)
@@ -3824,6 +3826,7 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
         target_person: resolved.clone(),
         target_name: name.clone(),
         quote: a.evidence.first().map(|e| e.quote.clone()).unwrap_or_default(),
+        quote_type: a.evidence.first().map(|e| e.r#type.clone()).unwrap_or_default(),
         created_at: now.clone(),
         stage: "pending".into(),
         acknowledged: false,
@@ -3900,7 +3903,10 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
         let pending: Vec<String> = ops
             .ops
             .iter()
-            .filter(|o| o.stage != "done" && o.undo_stage.is_none())
+            .filter(|o| {
+                (o.stage != "done" && o.undo_stage.is_none())
+                    || matches!(o.undo_stage.as_deref(), Some("undo_pending") | Some("link_cleared"))
+            })
             .map(|o| o.op_id.clone())
             .collect();
         if pending.is_empty() {
@@ -3911,6 +3917,53 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
             .ok_or_else(|| anyhow::anyhow!("identify.json 缺失"))?;
         for op_id in pending {
             let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) else { continue };
+            // 撤销中途崩溃的恢复:undo_pending=实质动作未发生,回退到可撤状态;
+            // link_cleared=关联已清,前滚完成质心还原与拒绝键(与撤销命令 ②③ 同)。
+            match op.undo_stage.as_deref() {
+                Some("undo_pending") => {
+                    op.undo_stage = None;
+                    continue;
+                }
+                Some("link_cleared") => {
+                    let seqs: std::collections::BTreeSet<u64> =
+                        op.seqs.iter().copied().collect();
+                    if op.reinforce_skipped.is_none() {
+                        if let Ok(vp_store) = open_voiceprint_store(app) {
+                            match feedback::undo_reinforce_op(
+                                &dir,
+                                &seqs,
+                                &op.target_person,
+                                &op.op_id,
+                                &vp_store,
+                            ) {
+                                Ok(feedback::UndoOutcome::Restored) => {}
+                                Ok(feedback::UndoOutcome::NoEntry) => {
+                                    op.non_revertible
+                                        .get_or_insert("ledger-lost(账本缺失,污染未回滚)".into());
+                                }
+                                Ok(feedback::UndoOutcome::NotRevertible(r)) => {
+                                    op.non_revertible.get_or_insert(r.into());
+                                }
+                                Err(e) => {
+                                    op.non_revertible.get_or_insert(format!("restore-error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    if refine::identify::mark_rejected(&mut idoc, &op.fingerprint, &op.created_at)
+                        .is_err()
+                    {
+                        // 条目已被新一轮吞掉:拒绝键直接落(同目标不再建议)。
+                        idoc.rejected.insert(
+                            refine::identify::rejected_key(&op.fingerprint, &op.target_person),
+                            op.created_at.clone(),
+                        );
+                    }
+                    op.undo_stage = Some("undone".into());
+                    continue;
+                }
+                _ => {}
+            }
             let seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
             let linked_to_target = refine::identify::cluster_members_from_doc(&doc)
                 .iter()
@@ -3936,13 +3989,31 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
                     .get_or_insert("crash-before-reinforce(未回灌,宁缺勿重)".into());
                 op.stage = "reinforced".into();
             }
-            let _ = refine::identify::mark_transition(
+            if refine::identify::mark_transition(
                 &mut idoc,
                 &op.fingerprint,
                 &["suggested"],
                 "auto_applied",
                 &op.created_at,
-            );
+            )
+            .is_err()
+                && !idoc.assignments.iter().any(|a| a.fingerprint == op.fingerprint)
+            {
+                // 条目已被新一轮吞掉:按 op 记录合成回执条目,撤销入口不丢。
+                idoc.assignments.push(refine::identify::IdentifyAssignment {
+                    fingerprint: op.fingerprint.clone(),
+                    cluster: op.cluster.clone(),
+                    person_id: Some(op.target_person.clone()),
+                    new_name: None,
+                    tier: refine::identify::Tier::High,
+                    llm_confidence: "high".into(),
+                    acoustic: None,
+                    acoustic_z: None,
+                    evidence: vec![],
+                    status: "auto_applied".into(),
+                    decided_at: Some(op.created_at.clone()),
+                });
+            }
             op.stage = "done".into();
         }
         refine::identify::save_identify(&dir, &idoc)?;
@@ -4075,7 +4146,7 @@ fn list_identify_suggestions(app: AppHandle) -> Result<Vec<ipc::IdentifySuggesti
                 is_new: false,
                 tier: "high".into(),
                 quote: op.quote.clone(),
-                evidence_type: "self_intro".into(),
+                evidence_type: if op.quote_type.is_empty() { "self_intro".into() } else { op.quote_type.clone() },
                 generated_at: op.created_at.clone(),
                 status: "auto_applied".into(),
                 op_id: Some(op.op_id.clone()),
@@ -4136,9 +4207,9 @@ async fn undo_identify_apply(
         let idx = ops
             .ops
             .iter()
-            .position(|o| o.op_id == op_id && o.stage == "done")
+            .position(|o| o.op_id == op_id && o.stage == "done" && !o.acknowledged)
             .ok_or_else(|| tr!("回执不存在或已处理", "Receipt missing or already handled"))?;
-        let (seqs, target, fp) = {
+        let (seqs, target, fp, reinforced) = {
             let op = &mut ops.ops[idx];
             if op.undo_stage.as_deref() == Some("undone") {
                 return Ok(op.non_revertible.is_none()); // 幂等重入
@@ -4148,6 +4219,7 @@ async fn undo_identify_apply(
                 op.seqs.iter().copied().collect::<std::collections::BTreeSet<u64>>(),
                 op.target_person.clone(),
                 op.fingerprint.clone(),
+                op.reinforce_skipped.is_none(),
             )
         };
         refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
@@ -4177,29 +4249,39 @@ async fn undo_identify_apply(
         refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
 
         // ② 质心还原(按 op 对账;不可还原如实记录,绝不错撤后续人工作业)。
+        // FEEDBACK_GATE:与人工回灌对同一账本/人物快照的读改写互斥
+        // (锁序恒 IDENTIFY_ACT_GATE → FEEDBACK_GATE)。
         let vp_store = open_voiceprint_store(&app2)?;
-        let restored = match feedback::undo_reinforce_op(&dir, &seqs, &target, &op_id, &vp_store) {
-            Ok(feedback::UndoOutcome::Restored) => true,
-            Ok(feedback::UndoOutcome::NoEntry) => {
-                ops.ops[idx].non_revertible = Some("no-ledger(未曾回灌)".into());
-                true // 没灌过=无污染,视同还原完成
-            }
-            Ok(feedback::UndoOutcome::NotRevertible(reason)) => {
-                ops.ops[idx].non_revertible = Some(reason.into());
-                false
-            }
-            Err(e) => {
-                ops.ops[idx].non_revertible = Some(format!("restore-error: {e}"));
-                false
+        let restored = {
+            let _fb = FEEDBACK_GATE.lock().unwrap();
+            match feedback::undo_reinforce_op(&dir, &seqs, &target, &op_id, &vp_store) {
+                Ok(feedback::UndoOutcome::Restored) => true,
+                Ok(feedback::UndoOutcome::NoEntry) if !reinforced => true, // 未曾回灌=无污染
+                Ok(feedback::UndoOutcome::NoEntry) => {
+                    // op 声称回灌过而账本无条:账丢了,污染无法回滚,如实报。
+                    ops.ops[idx].non_revertible = Some("ledger-lost".into());
+                    false
+                }
+                Ok(feedback::UndoOutcome::NotRevertible(reason)) => {
+                    ops.ops[idx].non_revertible = Some(reason.into());
+                    false
+                }
+                Err(e) => {
+                    ops.ops[idx].non_revertible = Some(format!("restore-error: {e}"));
+                    false
+                }
             }
         };
 
         // ③ 状态与拒绝键(同目标不再建议)+ undone。
         if let Some(mut idoc) = refine::identify::load_identify(&dir) {
             let now = chrono::Local::now().to_rfc3339();
-            if refine::identify::mark_rejected(&mut idoc, &fp, &now).is_ok() {
-                let _ = refine::identify::save_identify(&dir, &idoc);
+            if refine::identify::mark_rejected(&mut idoc, &fp, &now).is_err() {
+                // 条目已被新一轮吞掉:拒绝键直接落,同目标不再建议。
+                idoc.rejected
+                    .insert(refine::identify::rejected_key(&fp, &target), now.clone());
             }
+            let _ = refine::identify::save_identify(&dir, &idoc);
         }
         ops.ops[idx].undo_stage = Some("undone".into());
         refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;

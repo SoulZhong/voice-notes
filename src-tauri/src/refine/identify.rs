@@ -432,10 +432,13 @@ pub fn asnorm_z(
         if cohort.len() < crate::diar::registry::SNORM_MIN_COHORT {
             return None;
         }
+        // 与 registry::cohort_stats 同口径:样本方差 /(n-1) + 标准差下限 1e-3——
+        // 总体方差 + 1e-6 下限在三人 cohort 上会系统性放大 z(近零方差时放大三个
+        // 数量级),把不该过门的身份放进自动应用。
         let n = cohort.len() as f32;
         let mean = cohort.iter().sum::<f32>() / n;
-        let var = cohort.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / n;
-        let std = var.sqrt().max(1e-6);
+        let var = cohort.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / (n - 1.0);
+        let std = var.sqrt().max(1e-3);
         Some((raw - mean) / std)
     };
 
@@ -915,6 +918,9 @@ pub struct IdentifyOp {
     pub target_name: String,
     /// 首条证据引文(回执上「因为 TA 说……」,稿变后仍可展示)。
     pub quote: String,
+    /// 引文的证据类型(self_intro/addressed_reply/…);老记录缺省回退 self_intro。
+    #[serde(default)]
+    pub quote_type: String,
     pub created_at: String,
     /// pending → assigned → reinforced → done。
     pub stage: String,
@@ -1547,6 +1553,7 @@ mod tests {
             target_person: "P1".into(),
             target_name: "张伟".into(),
             quote: "我是张伟".into(),
+            quote_type: "self_intro".into(),
             created_at: "t".into(),
             stage: "done".into(),
             acknowledged: false,

@@ -165,6 +165,10 @@ pub fn undo_reinforce_op(
     if entry.op_id.as_deref() != Some(op_id) {
         return Ok(UndoOutcome::NotRevertible("superseded"));
     }
+    if !entry.complete {
+        // 占位账:库可能改了但快照丢失(崩溃窗口)——如实报不可还原,不猜。
+        return Ok(UndoOutcome::NotRevertible("incomplete-record"));
+    }
     let lib = vp.load();
     let entry_person = crate::store::VoiceprintStore::resolve(&lib, &entry.person_id);
     let expect = crate::store::VoiceprintStore::resolve(&lib, expect_person);
@@ -207,6 +211,11 @@ pub fn plan_action(prior: Option<(&str, &str)>, target: &str) -> FeedbackAction 
 
 const LEDGER_FILE: &str = "feedback.json";
 
+/// 旧账本(P1 期)无 complete 键:那时写账在改库之后,存在即完整。
+fn default_complete() -> bool {
+    true
+}
+
 /// 笔记级回灌账本:幂等(同段集合同人只灌一次)+ 纠错还原凭据。
 #[derive(Default, Serialize, Deserialize)]
 struct FeedbackLedger {
@@ -222,6 +231,11 @@ struct LedgerEntry {
     /// 还原凭据(reinforce_feedback 返回的前后快照)。
     before: String,
     after: String,
+    /// 两段式落账:先插 complete=false 占位再改库,库改完回填快照置 true——
+    /// "库已改、账没写"的崩溃窗口从此只留下可识别的 incomplete 记录,
+    /// 撤销端把它如实判为不可还原,绝不误报"未曾回灌"。
+    #[serde(default = "default_complete")]
+    complete: bool,
     /// P2b:自动应用的操作 id——撤销按 op 对账,scope 键会被后续人工回灌覆盖,
     /// 不能只凭 scope 判断"这是我那次写的"。人工路径为 None(serde 兼容 P1 数据)。
     #[serde(default)]
@@ -326,19 +340,34 @@ pub fn reinforce_person(
         .iter()
         .map(|(s, st)| (s.clone(), st.centroid.clone(), st.count, st.total_ms))
         .collect();
-    let applied = vp.reinforce_feedback(person_id, &tuples, now)?;
+    // 两段式:占位账先落盘(complete=false),库改完再回填快照。占位写不进去
+    // 就整体放弃——无账的质心修改不可撤,宁可不灌。
     ledger.entries.insert(
-        key,
+        key.clone(),
         LedgerEntry {
             person_id: person_id.to_string(),
             at: now.to_string(),
-            before: applied.person_before,
-            after: applied.person_after,
+            before: String::new(),
+            after: String::new(),
+            complete: false,
             op_id: op_id.map(str::to_string),
         },
     );
+    save_ledger(note_dir, &ledger)?;
+    let applied = vp.reinforce_feedback(person_id, &tuples, now)?;
+    if let Some(entry) = ledger.entries.get_mut(&key) {
+        entry.before = applied.person_before.clone();
+        entry.after = applied.person_after.clone();
+        entry.complete = true;
+    }
     if let Err(e) = save_ledger(note_dir, &ledger) {
-        eprintln!("feedback: 账本写入失败(下次可能重复回灌): {e}");
+        // 快照回填失败:立即回滚质心,把窗口闭合成"什么都没发生"。
+        eprintln!("feedback: 账本回填失败,回滚本次回灌: {e}");
+        let _ = vp.restore_feedback(person_id, &applied.person_before, &applied.person_after);
+        let mut cleanup = load_ledger(note_dir);
+        cleanup.entries.remove(&key);
+        let _ = save_ledger(note_dir, &cleanup);
+        anyhow::bail!("账本回填失败,已回滚: {e}");
     }
     Ok(ReinforceResult::Applied {
         per_source: stats.iter().map(|(s, st)| (s.clone(), st.count)).collect(),

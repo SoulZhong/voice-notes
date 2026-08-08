@@ -60,8 +60,16 @@
   );
   const queue = $derived(queueParts.pending);
   const archived = $derived(queueParts.archived);
-  const pendingN = $derived(queue.filter((i) => i.kind !== "receipt").length);
-  const receiptsN = $derived(queue.filter((i) => i.kind === "receipt").length);
+  const pendingN = $derived(
+    queue.filter(
+      (i) => i.kind !== "receipt" && !(i.kind === "identify" && i.suggestion.status === "auto_applied"),
+    ).length,
+  );
+  const receiptsN = $derived(
+    queue.filter(
+      (i) => i.kind === "receipt" || (i.kind === "identify" && i.suggestion.status === "auto_applied"),
+    ).length,
+  );
   const nosampleN = $derived(queue.filter((i) => i.kind === "nosample").length);
   /** 一键清理控件只挂在第一张无样本卡:共享确认态若逐卡渲染,会同屏出现多组
       重复的破坏性确认按钮。 */
