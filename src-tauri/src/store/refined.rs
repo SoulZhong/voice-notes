@@ -101,6 +101,10 @@ pub struct RefinedDoc {
     /// writer 的收敛点)。历史文档缺省 0。
     #[serde(default)]
     pub revision: u64,
+    /// 段落已被重转写整体替换:本稿引用的 source_seqs/文本基于旧段,内容过期。
+    /// UI 据此提示「重新 Aing」;下一次 run_local 整写新稿时自然回 false。
+    #[serde(default)]
+    pub stale: bool,
     pub paragraphs: Vec<RefinedParagraph>,
 }
 
@@ -1012,6 +1016,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(), name: None, person_id: None,
                 start_ms: 0, end_ms: 1000, text: "灯塔计划启动".into(), source_seqs: vec![7],
@@ -1086,6 +1091,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![RefinedParagraph {
                 speaker: "R1".into(), name: Some("张三".into()), person_id: Some("P1".into()),
                 start_ms: 0, end_ms: 5000, text: "你好。".into(), source_seqs: vec![0, 3],
@@ -1182,6 +1188,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
         };
         write_refined_atomic(dir.path(), &doc).unwrap();
         let back = load_refined(dir.path()).unwrap();
@@ -1374,6 +1381,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs,
         };
         write_refined_atomic(dir, &doc).unwrap();
@@ -1521,6 +1529,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![
                 para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
                 para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留

@@ -464,6 +464,16 @@ impl TranscodeQueue {
         self.cv.notify_all();
     }
 
+    /// 该目录此刻是否被本队列占着(pending 排队中,或正是 worker 的 in-flight)。
+    /// 只读查询、不改变队列状态——供重转写守卫用:转码把 wav 编码后删除是破坏性
+    /// 操作,若此刻正待转/在转同一目录,重转写离线读盘与它并发会有踩踏窗口。
+    /// 不能用 `cancel_and_wait` 顶替:那会把 pending 项直接摘掉,wav 从此永不
+    /// 转码——是否要等、要不要拒绝,决策权必须留给调用方,这里只负责如实回答。
+    pub fn is_busy(&self, dir: &Path) -> bool {
+        let st = self.state.lock().unwrap();
+        st.current.as_deref() == Some(dir) || st.queue.iter().any(|p| p == dir)
+    }
+
     /// 续录某目录前调用:把它从队列摘掉,并阻塞到它「不再是 in-flight」为止。
     /// 为什么必须等 in-flight:续录要把 m4a 解回 wav,若此刻 worker 正把该目录的 wav
     /// 转成 m4a,两者会撞文件。摘队列 `retain` 处理「还没轮到」的情况;`while current==它`
@@ -564,6 +574,32 @@ mod queue_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// is_busy 对 pending/in-flight/空闲三态的判断——直接摆弄内部 `state` 字段
+    /// (同文件内测试模块可见私有字段),不依赖 worker 真跑 afconvert:关注点是
+    /// 查询语义本身,与转码逻辑是否跑对是两码事。
+    #[test]
+    fn is_busy_reflects_queue_and_current() {
+        let q = TranscodeQueue::new();
+        let dir = PathBuf::from("/tmp/note-busy-check");
+        assert!(!q.is_busy(&dir), "空闲队列不该算 busy");
+        {
+            let mut st = q.state.lock().unwrap();
+            st.queue.push_back(dir.clone());
+        }
+        assert!(q.is_busy(&dir), "pending 队列中应算 busy");
+        {
+            let mut st = q.state.lock().unwrap();
+            st.queue.clear();
+            st.current = Some(dir.clone());
+        }
+        assert!(q.is_busy(&dir), "in-flight 应算 busy");
+        {
+            let mut st = q.state.lock().unwrap();
+            st.current = None;
+        }
+        assert!(!q.is_busy(&dir), "转完清 current 后不再算 busy");
+    }
 
     static PROCESSED: AtomicUsize = AtomicUsize::new(0);
     fn slow_stub(_: &Path) {

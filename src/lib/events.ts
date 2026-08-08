@@ -39,6 +39,27 @@ export type RefineEvent = {
   state: string;
 };
 
+/** 文件重转写进度("retranscribe")。stage: decode/transcribe/attribute/commit/all;
+ * state: running/ok/error。message 仅 error 带;summary 仅 all/ok 带。 */
+export type RetranscribeSummary = {
+  old_segments: number;
+  new_segments: number;
+  seed_matched: number;
+  inherited: number;
+  echo_dropped: number;
+  failed_segments: number;
+};
+export type RetranscribeEvent = {
+  note_id: string;
+  stage: string;
+  state: string;
+  message?: string;
+  summary?: RetranscribeSummary;
+};
+export function onRetranscribe(cb: (e: RetranscribeEvent) => void) {
+  return listen<RetranscribeEvent>("retranscribe", (ev) => cb(ev.payload));
+}
+
 export function onPartial(cb: (e: PartialEvent) => void) {
   return listen<PartialEvent>("partial", (ev) => cb(ev.payload));
 }

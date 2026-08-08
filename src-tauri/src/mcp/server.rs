@@ -270,6 +270,14 @@ pub struct StartParams {
     pub title: Option<String>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RetranscribeParams {
+    /// 目标笔记 id
+    note_id: String,
+    /// 音频来源:"dual"(双轨,默认)| "mixed"(成品轨)
+    input: Option<String>,
+}
+
 /// UDS 桥的阻塞 IO 包一层 spawn_blocking,避免占用 tokio 工作线程。
 async fn bridge_call(op: &'static str, extra: serde_json::Value) -> CallToolResult {
     match tokio::task::spawn_blocking(move || super::bridge::call(op, extra)).await {
@@ -433,6 +441,21 @@ impl VnMcp {
     async fn resume_recording(&self) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("resume", serde_json::json!({})).await)
     }
+
+    #[tool(
+        description = "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份 segments.orig.jsonl,说话人尽量保留)。异步启动即返回,用 retranscribe_status 轮询进度;同一时刻全局只跑一个任务。需要应用运行 + 用户开启「允许 AI 控制录制」。"
+    )]
+    async fn retranscribe_note(
+        &self,
+        Parameters(p): Parameters<RetranscribeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("retranscribe", serde_json::json!({ "note_id": p.note_id, "input": p.input })).await)
+    }
+
+    #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。需要应用运行。")]
+    async fn retranscribe_status(&self) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("retranscribe_status", serde_json::json!({})).await)
+    }
 }
 
 #[tool_handler(router = self.active_tool_router())]
@@ -445,7 +468,7 @@ impl ServerHandler for VnMcp {
     }
 }
 
-/// `/ai` 页展示用的静态能力清单:MCP 十三工具 + CLI 命令一行用法。与上方 `#[tool]`
+/// `/ai` 页展示用的静态能力清单:MCP 十五工具 + CLI 命令一行用法。与上方 `#[tool]`
 /// 定义相邻放置,便于人工同步;`catalog_matches_tool_router` 测试做防漂移守卫。
 /// gate:`none` 随时可用,`app` 需 App 运行,`control` 还需用户开启「允许 AI 控制录制」。
 pub fn catalog() -> serde_json::Value {
@@ -479,6 +502,12 @@ pub fn catalog() -> serde_json::Value {
         ("stop_recording", "停止当前录制并返回笔记 id。", "control"),
         ("pause_recording", "暂停当前录制。", "control"),
         ("resume_recording", "恢复已暂停的录制。", "control"),
+        (
+            "retranscribe_note",
+            "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份,说话人尽量保留)。异步启动即返回。",
+            "control",
+        ),
+        ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。", "app"),
     ];
     let cli: &[(&str, &str)] = &[
         ("voice-notes notes list [--limit N] [--offset N] [--from 2026-07-01] [--to 2026-07-08] [--json]", "列出会议笔记"),
@@ -531,11 +560,13 @@ mod catalog_tests {
         );
         assert_eq!(
             cat_names.len(),
-            13,
-            "11 个既有工具 + get_aing_context/apply_aing_graph"
+            15,
+            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status"
         );
         assert!(cat_names.contains("get_aing_context"));
         assert!(cat_names.contains("apply_aing_graph"));
+        assert!(cat_names.contains("retranscribe_note"));
+        assert!(cat_names.contains("retranscribe_status"));
     }
 
     #[test]

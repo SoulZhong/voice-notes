@@ -30,7 +30,9 @@ const RAMP_SAMPLES: u64 = 1280;
 const MERGE_GAP_MS: u64 = 300;
 /// 孤立 <200ms 压低区间丢弃,不值得动增益。
 const MIN_SPAN_MS: u64 = 200;
-const SAMPLES_PER_MS: u64 = 16;
+/// 16k 采样率下每毫秒样本数。pub(crate):retranscribe::dedup 的覆盖率换算与本
+/// 模块的 span 样本域必须同一常量,双写会在采样率口径变化时静默漂移。
+pub(crate) const SAMPLES_PER_MS: u64 = 16;
 
 /// 帧长 20ms@16k:门控判据的时间分辨率。
 const HOP: usize = 320;
@@ -194,17 +196,50 @@ pub fn build_gate_from_wav_bytes(
     system_wav: &[u8],
     system_offset_ms: u64,
 ) -> Vec<GateSpan> {
-    let mic = frame_rms_bytes(mic_wav);
-    let sys = frame_rms_bytes(system_wav);
+    build_gate_from_envelopes(
+        &frame_rms_bytes(mic_wav),
+        mic_offset_ms,
+        &frame_rms_bytes(system_wav),
+        system_offset_ms,
+    )
+}
+
+/// 同上,输入为已解码的 16k 单声道 f32 PCM(重转写离线管线用——历史笔记只有
+/// m4a,重转写已解出 PCM,不必再绕 canonical WAV 字节)。
+pub fn build_gate_from_pcm(
+    mic: &[f32],
+    mic_offset_ms: u64,
+    sys: &[f32],
+    sys_offset_ms: u64,
+) -> Vec<GateSpan> {
+    build_gate_from_envelopes(&frame_rms_pcm(mic), mic_offset_ms, &frame_rms_pcm(sys), sys_offset_ms)
+}
+
+/// 已解码 f32 PCM 的逐帧 RMS,帧长 HOP,与 frame_rms_bytes 严格同构:尾不足一帧
+/// **同样产出短帧**(chunks 而非 chunks_exact)——两个入口对同一段音频必须算出
+/// 逐帧相同的包络,否则重转写与回放的门控判据在尾帧上分叉(真实录音几乎不可能
+/// 恰好是 20ms 整数倍)。
+fn frame_rms_pcm(pcm: &[f32]) -> Vec<f32> {
+    pcm.chunks(HOP)
+        .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
+        .collect()
+}
+
+/// 两轨局部包络(尚未摆上全局帧轴)+ offset → 门控区间。build_gate_from_wav_bytes
+/// 与 build_gate_from_pcm 共用的尾段(只是输入源不同:字节 vs f32 PCM,取完包络后
+/// 逻辑逐行同构),避免 place+build_gate_from_levels 的胶水代码复制两份。
+fn build_gate_from_envelopes(
+    mic: &[f32],
+    mic_offset_ms: u64,
+    sys: &[f32],
+    sys_offset_ms: u64,
+) -> Vec<GateSpan> {
     if mic.is_empty() || sys.is_empty() {
         return Vec::new();
     }
     let total = (mic_offset_ms as usize * SAMPLES_PER_MS as usize / HOP + mic.len())
-        .max(system_offset_ms as usize * SAMPLES_PER_MS as usize / HOP + sys.len());
-    build_gate_from_levels(
-        &place(&mic, mic_offset_ms, total),
-        &place(&sys, system_offset_ms, total),
-    )
+        .max(sys_offset_ms as usize * SAMPLES_PER_MS as usize / HOP + sys.len());
+    build_gate_from_levels(&place(mic, mic_offset_ms, total), &place(sys, sys_offset_ms, total))
 }
 
 /// 逐采样增益:区间外 1.0;区间内 DUCK_GAIN,边沿 80ms 线性渐变(落区间内侧)。
@@ -365,5 +400,49 @@ mod tests {
         let mid_out = gain_at(&spans, 48_000 - 640);
         assert!((mid_out - (1.0 + DUCK_GAIN) / 2.0).abs() < 0.02);
         assert_eq!(gain_at(&spans, 48_000), 1.0);
+    }
+
+    /// build_gate_from_pcm 与 build_gate_from_wav_bytes 在等价输入下必须产出相同的
+    /// spans:前者吃已解码 f32 PCM(重转写管线),后者吃 canonical s16 WAV 字节
+    /// (播放器路径),两者只应差在"谁替调用方做了一次 s16<->f32 转换",判据本身
+    /// 不能分叉。
+    #[test]
+    fn pcm_entry_matches_wav_bytes_entry_on_equivalent_input() {
+        // 复用 env() 的构造口径:每段 (帧数, 电平) 直接展开成常量 f32 样本——常量
+        // 输入的逐帧 RMS 就是该常量本身,这样构造出的 f32 PCM 与 env() 的"电平
+        // 序列"数值等价,不必真去算正弦波的 RMS。
+        fn pcm(parts: &[(usize, f32)]) -> Vec<f32> {
+            parts.iter().flat_map(|&(n, v)| std::iter::repeat_n(v, n * HOP)).collect()
+        }
+        fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+            let mut out = vec![0u8; 44]; // 头内容无关紧要,frame_rms_bytes 只跳过前 44 字节
+            for &s in samples {
+                let clamped = (s * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+                out.extend_from_slice(&clamped.to_le_bytes());
+            }
+            out
+        }
+
+        let mic_f32 = pcm(&[(frames(1000), 0.0), (frames(3000), 0.03), (frames(1000), 0.0)]);
+        let sys_f32 = pcm(&[(frames(1000), 0.0), (frames(3000), 0.3), (frames(1000), 0.0)]);
+        let mic_wav = wav_bytes(&mic_f32);
+        let sys_wav = wav_bytes(&sys_f32);
+
+        let from_pcm = build_gate_from_pcm(&mic_f32, 0, &sys_f32, 0);
+        let from_bytes = build_gate_from_wav_bytes(&mic_wav, 0, &sys_wav, 0);
+        assert_eq!(from_pcm, from_bytes, "等价输入下两个入口必须产出相同 spans");
+        assert!(!from_pcm.is_empty(), "本用例应产出压低区间,否则断言意义不大");
+
+        // 非整帧长度(真实录音的常态):补半帧尾巴,两入口仍须逐 span 严格相等——
+        // frame_rms_pcm 与 frame_rms_bytes 对尾帧的处理必须同构(都产短帧),
+        // 否则重转写与回放的门控包络在尾帧上分叉。
+        let mut mic_tail = mic_f32.clone();
+        mic_tail.extend(std::iter::repeat_n(0.03f32, HOP / 2));
+        let mut sys_tail = sys_f32.clone();
+        sys_tail.extend(std::iter::repeat_n(0.3f32, HOP / 2));
+        let from_pcm_tail = build_gate_from_pcm(&mic_tail, 0, &sys_tail, 0);
+        let from_bytes_tail =
+            build_gate_from_wav_bytes(&wav_bytes(&mic_tail), 0, &wav_bytes(&sys_tail), 0);
+        assert_eq!(from_pcm_tail, from_bytes_tail, "非整帧长度下两个入口仍必须严格一致");
     }
 }

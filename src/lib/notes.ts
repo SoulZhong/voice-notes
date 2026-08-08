@@ -155,6 +155,8 @@ export interface RefinedDoc {
   revision?: number;
   /** 仅供旧图谱关系保持结构完整的 mention id;不是 live mention,UI 必须过滤。 */
   graph_support_mentions?: string[];
+  /** 文件重转写(三期)后段落已变但本修订稿仍是旧文本;详情页据此提示重新执行 AI。 */
+  stale?: boolean;
 }
 
 /** Required graph fields for schema-v2 writes; `RefinedDoc` remains permissive for legacy reads. */
@@ -264,6 +266,14 @@ export function exportFileName(title: string, startedAt: string): string {
 }
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
+/** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */
+export const retranscribeNote = (id: string, input: "dual" | "mixed") =>
+  invoke<void>("retranscribe_note", { id, input });
+/** 当前重转写任务;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
+export const retranscribeStatus = () =>
+  invoke<{ note_id: string; stage: string } | null>("retranscribe_status");
+/** 成品轨入口可用性:null 可用;字符串为置灰原因。 */
+export const mixedInputStatus = (id: string) => invoke<string | null>("mixed_input_status", { id });
 /** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
 export const renameRefinedSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_refined_speaker", { noteId, speakerId, name });

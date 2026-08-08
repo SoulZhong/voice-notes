@@ -729,6 +729,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![RefinedParagraph {
                 speaker: "S1".into(),
                 name: Some("张三".into()),
