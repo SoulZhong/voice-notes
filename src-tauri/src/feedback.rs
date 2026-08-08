@@ -116,6 +116,161 @@ pub fn build_source_stats(
         .collect()
 }
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// 指认范围:原始稿按 S 号(speakers.json 域),修订稿按 source_seqs(R 段落
+/// 已把 seq 集合显式落盘,不必反查 R→S 映射)。
+pub enum SegFilter {
+    Speakers(BTreeSet<String>),
+    Seqs(BTreeSet<u64>),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ReinforceResult {
+    /// source -> 实际嵌入段数。
+    Applied { per_source: BTreeMap<String, u64> },
+    SkippedModelMismatch,
+    SkippedNoSegments,
+    SkippedAlreadyDone,
+    SkippedUnknownPerson,
+}
+
+const LEDGER_FILE: &str = "feedback.json";
+
+/// 笔记级回灌账本:幂等(同段集合同人只灌一次)+ 纠错还原凭据。
+#[derive(Default, Serialize, Deserialize)]
+struct FeedbackLedger {
+    /// key = 段集合指纹(排序 seq 的 sha256 前 16 hex)。
+    #[serde(default)]
+    entries: BTreeMap<String, LedgerEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LedgerEntry {
+    person_id: String,
+    at: String,
+    /// 还原凭据(reinforce_feedback 返回的前后快照)。
+    before: String,
+    after: String,
+}
+
+fn scope_key(seqs: &BTreeSet<u64>) -> String {
+    let mut h = Sha256::new();
+    for s in seqs {
+        h.update(s.to_le_bytes());
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
+fn load_ledger(note_dir: &Path) -> FeedbackLedger {
+    std::fs::read_to_string(note_dir.join(LEDGER_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_ledger(note_dir: &Path, ledger: &FeedbackLedger) -> anyhow::Result<()> {
+    let tmp = note_dir.join(format!("{LEDGER_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(ledger)?)?;
+    std::fs::rename(&tmp, note_dir.join(LEDGER_FILE))?;
+    Ok(())
+}
+
+/// 磁盘壳:模型门禁 → 选段 → 幂等/纠错账本 → 逐轨解码 → 纯逻辑核 →
+/// reinforce_feedback 入库。解码失败/轨缺失只收窄不报错——回灌拿得到多少
+/// 信号用多少;门禁不一致整体跳过(不同模型向量空间不可比,错灌比不灌糟)。
+#[allow(clippy::too_many_arguments)]
+pub fn reinforce_person(
+    note_dir: &Path,
+    segs: &[SegmentRecord],
+    filter: &SegFilter,
+    person_id: &str,
+    vp: &crate::store::VoiceprintStore,
+    library_model: &str,
+    expected_model: &str,
+    embedder: &mut dyn SpeakerEmbedder,
+    now: &str,
+) -> anyhow::Result<ReinforceResult> {
+    // 门禁:与种子注入同一严格语义(lib.rs 模型门禁)。
+    if library_model != expected_model {
+        return Ok(ReinforceResult::SkippedModelMismatch);
+    }
+    let wanted: Vec<&SegmentRecord> = segs
+        .iter()
+        .filter(|s| match filter {
+            SegFilter::Speakers(ids) => s.speaker.as_ref().is_some_and(|sp| ids.contains(sp)),
+            SegFilter::Seqs(seqs) => seqs.contains(&s.seq),
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Ok(ReinforceResult::SkippedNoSegments);
+    }
+    {
+        // 悬空人物在解码/嵌入之前就短路:嵌入白做还会污染账本。
+        let lib = vp.load();
+        if crate::store::VoiceprintStore::resolve(&lib, person_id).is_none() {
+            return Ok(ReinforceResult::SkippedUnknownPerson);
+        }
+    }
+
+    let seq_set: BTreeSet<u64> = wanted.iter().map(|s| s.seq).collect();
+    let key = scope_key(&seq_set);
+    let mut ledger = load_ledger(note_dir);
+    if let Some(prev) = ledger.entries.get(&key) {
+        if prev.person_id == person_id {
+            return Ok(ReinforceResult::SkippedAlreadyDone);
+        }
+        // 纠错:上一次灌错了人。未被动过就还原;动过则宁留污染不覆盖新信息。
+        match vp.restore_feedback(&prev.person_id, &prev.before, &prev.after) {
+            Ok(true) => eprintln!("feedback: 已还原 {} 的上次回灌(纠错)", prev.person_id),
+            Ok(false) => eprintln!("feedback: {} 已被其它写动过,跳过还原", prev.person_id),
+            Err(e) => eprintln!("feedback: 还原失败(忽略): {e}"),
+        }
+        ledger.entries.remove(&key);
+    }
+
+    let meta = crate::store::audio::load_audio_meta(note_dir);
+    let mut pcm_by_source: BTreeMap<String, (u64, Vec<f32>)> = BTreeMap::new();
+    for source in wanted.iter().map(|s| s.source.as_str()).collect::<BTreeSet<_>>() {
+        match crate::store::transcode::track_pcm(note_dir, source) {
+            Ok(pcm) => {
+                let offset = meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
+                pcm_by_source.insert(source.to_string(), (offset, pcm));
+            }
+            Err(e) => eprintln!("feedback: 音轨 {source} 解码失败,该轨不回灌: {e}"),
+        }
+    }
+
+    let stats = build_source_stats(&wanted, &pcm_by_source, embedder);
+    if stats.is_empty() {
+        return Ok(ReinforceResult::SkippedNoSegments);
+    }
+    let tuples: Vec<(String, Vec<f32>, u64, u64)> = stats
+        .iter()
+        .map(|(s, st)| (s.clone(), st.centroid.clone(), st.count, st.total_ms))
+        .collect();
+    let applied = vp.reinforce_feedback(person_id, &tuples, now)?;
+    ledger.entries.insert(
+        key,
+        LedgerEntry {
+            person_id: person_id.to_string(),
+            at: now.to_string(),
+            before: applied.person_before,
+            after: applied.person_after,
+        },
+    );
+    if let Err(e) = save_ledger(note_dir, &ledger) {
+        eprintln!("feedback: 账本写入失败(下次可能重复回灌): {e}");
+    }
+    Ok(ReinforceResult::Applied {
+        per_source: stats.iter().map(|(s, st)| (s.clone(), st.count)).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +379,120 @@ mod tests {
         let mut emb = MockEmbedder::new(vec![Ok(unit(0))]);
         let stats = build_source_stats(&[&m], &pcm, &mut emb);
         assert_eq!(stats["mic"].total_ms, 2000);
+    }
+    fn write_wav(path: &std::path::Path, ms: u64) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..(ms * 16) {
+            w.write_sample(3000i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn seeded_store(root: &std::path::Path, dir_vec: Vec<f32>) -> (crate::store::VoiceprintStore, String) {
+        let store = crate::store::VoiceprintStore::new(root.to_path_buf());
+        let key = format!("seed-{}", store.load().next_person);
+        let links = store
+            .upsert_from_session(
+                &[crate::diar::registry::ClusterSnapshot {
+                    id: key.clone(),
+                    centroid: dir_vec,
+                    count: 4,
+                    sources: std::collections::BTreeSet::from(["mic".to_string()]),
+                    person: None,
+                    total_ms: 12_000,
+                }],
+                "t0",
+            )
+            .unwrap();
+        let pid = links.get(&key).unwrap().clone();
+        (store, pid)
+    }
+
+    #[test]
+    fn reinforce_is_idempotent_per_scope_and_person() {
+        let note = tempfile::tempdir().unwrap();
+        write_wav(&note.path().join("mic.wav"), 4000);
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
+        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let model = store.load().embedding_model.clone();
+
+        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1").unwrap();
+        assert!(matches!(r1, ReinforceResult::Applied { .. }), "{r1:?}");
+        let total_after_first = store.load().people[&pid].total_ms;
+
+        let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb2, "t2").unwrap();
+        assert_eq!(r2, ReinforceResult::SkippedAlreadyDone, "同段集合同人重复指认不得重复加权");
+        assert_eq!(store.load().people[&pid].total_ms, total_after_first);
+    }
+
+    #[test]
+    fn correction_restores_previous_person_when_untouched() {
+        let note = tempfile::tempdir().unwrap();
+        write_wav(&note.path().join("mic.wav"), 4000);
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid_a) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        let (_, pid_b) = {
+            // 同一库再造一个 B(seeded_store 会复用同一目录的库)。
+            let store_b = crate::store::VoiceprintStore::new(vp_root.path().to_path_buf());
+            let links = store_b
+                .upsert_from_session(
+                    &[crate::diar::registry::ClusterSnapshot {
+                        id: "seed-b".into(),
+                        centroid: vec![0.0, 0.0, 1.0, 0.0],
+                        count: 4,
+                        sources: std::collections::BTreeSet::from(["mic".to_string()]),
+                        person: None,
+                        total_ms: 12_000,
+                    }],
+                    "t0",
+                )
+                .unwrap();
+            (store_b, links.get("seed-b").unwrap().clone())
+        };
+
+        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
+        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let model = store.load().embedding_model.clone();
+
+        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &filter, &pid_a, &store, &model, &model, &mut emb, "t1").unwrap();
+        let a_total_polluted = store.load().people[&pid_a].total_ms;
+        assert!(a_total_polluted > 12_000);
+
+        // 纠错:同段集合改指 B → A 的上次回灌应被还原(未被动过),B 获得回灌。
+        let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &model, &model, &mut emb2, "t2").unwrap();
+        assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
+        assert_eq!(store.load().people[&pid_a].total_ms, 12_000, "A 的回灌应还原");
+        assert!(store.load().people[&pid_b].total_ms > 12_000, "B 获得回灌");
+    }
+
+    #[test]
+    fn model_mismatch_and_unknown_person_short_circuit() {
+        let note = tempfile::tempdir().unwrap();
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        let segs = vec![seg(0, "mic", 0, 2000)];
+        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let mut emb = MockEmbedder::new(vec![Ok(unit(0))]);
+        // 门禁:严格相等,库侧默认模型 vs 期望 "eres2netv2" → 跳过。
+        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, "campplus", "eres2netv2", &mut emb, "t")
+            .unwrap();
+        assert_eq!(r, ReinforceResult::SkippedModelMismatch);
+        // 悬空人物:在解码/嵌入之前就短路。
+        write_wav(&note.path().join("mic.wav"), 2000);
+        let model = store.load().embedding_model.clone();
+        let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t").unwrap();
+        assert_eq!(r2, ReinforceResult::SkippedUnknownPerson);
     }
 }
