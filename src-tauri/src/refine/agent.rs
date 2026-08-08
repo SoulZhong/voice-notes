@@ -1083,6 +1083,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: texts
                 .iter()
                 .map(|t| RefinedParagraph {

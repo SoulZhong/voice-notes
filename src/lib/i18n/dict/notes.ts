@@ -47,6 +47,17 @@ export const zh = {
   "notes.refine.failedHint": "AI 执行失败，点击重试",
   "notes.refine.rerunFailed": "重新执行 AI 失败：{e}",
 
+  // 详情页:文件重转写(三期)
+  "notes.retrans.run": "重转写",
+  "notes.retrans.hint": "用盘上音频离线重新转写全文(覆盖原始逐字稿,自动备份)",
+  "notes.retrans.warn": "将覆盖原始逐字稿并重建说话人,原稿备份为 segments.orig.jsonl",
+  "notes.retrans.confirmDual": "双轨重转写",
+  "notes.retrans.confirmMixed": "成品轨重转写",
+  "notes.retrans.running": "重转写中（{stage}）",
+  "notes.retrans.failed": "重转写失败：{e}",
+  "notes.retrans.staleBanner": "段落已重转写，本修订稿基于旧文本，请重新执行 AI。",
+  "notes.retrans.mixedCheckFailed": "无法检测成品轨可用性",
+
   // 详情页:错误文案(加载/删除失败复用 common.loadFailed/common.deleteFailed)
   "notes.detail.editFailed": "编辑失败: {e}",
   "notes.detail.setSpeakerFailed": "修改说话人失败: {e}",
@@ -123,6 +134,16 @@ export const en = {
   "notes.refine.completeHint": "AI complete; click to run again",
   "notes.refine.failedHint": "AI failed; click to retry",
   "notes.refine.rerunFailed": "Failed to re-run AI: {e}",
+
+  "notes.retrans.run": "Re-transcribe",
+  "notes.retrans.hint": "Re-run ASR offline from the audio on disk (overwrites the raw transcript; a backup is kept)",
+  "notes.retrans.warn": "This overwrites the raw transcript and rebuilds speakers. The original is backed up as segments.orig.jsonl.",
+  "notes.retrans.confirmDual": "Dual-track",
+  "notes.retrans.confirmMixed": "Mixed-track",
+  "notes.retrans.running": "Re-transcribing ({stage})",
+  "notes.retrans.failed": "Re-transcription failed: {e}",
+  "notes.retrans.staleBanner": "Segments were re-transcribed. This refined doc is based on the old text — please re-run AI.",
+  "notes.retrans.mixedCheckFailed": "Could not check mixed-track availability",
 
   "notes.detail.editFailed": "Failed to edit: {e}",
   "notes.detail.setSpeakerFailed": "Failed to change speaker: {e}",

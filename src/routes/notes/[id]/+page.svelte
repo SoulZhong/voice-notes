@@ -6,7 +6,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
-  import { onRefine, onNoteRenamed, onNoteRealigned } from "$lib/events";
+  import { onRefine, onRetranscribe, onNoteRenamed, onNoteRealigned } from "$lib/events";
   import {
     getNote,
     renameNote,
@@ -14,6 +14,9 @@
     exportFileName,
     getRefined,
     refineNote,
+    retranscribeNote,
+    retranscribeStatus,
+    mixedInputStatus,
     formatDate,
     formatDuration,
     speakerLabel,
@@ -71,6 +74,21 @@
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
+
+  // 文件重转写(三期):离线用盘上音频重转全文,覆盖原始逐字稿(自动备份)。
+  // retransErr 复用 refineErr 同款粘性 banner 展示套路(本页无 toast 机制)。
+  let retranscribing = $state(false);
+  let retransStage = $state("");
+  let retransConfirm = $state(false);
+  let retransErr = $state("");
+  let mixedReason = $state<string | null>(null); // null = 成品轨可用
+  // Fix 4:回填查询 retranscribeStatus() 在途时，若终态事件（onRetranscribe 的
+  // ok/error）先到，迟到的回填快照会把已结束的任务重新标成"重转写中"且无人再纠正
+  // （事件只在状态变化时触发一次，不会再来一条把它拨回去）。这个旗标记录"本次 id
+  // 下是否已经见过至少一条 onRetranscribe 事件"——见过就说明事件通道已经接管了
+  // retranscribing 的真相，回填快照必须让路。回填查询的发起时机见 Fix 3（codex 第
+  // 三轮，已挪进订阅 effect，必须等 listen() resolve 之后再发）。
+  let retransEventSeen = $state(false);
   // 会议搭子人物列表:修订稿说话人条的「选人」面板用。增值层,取失败静默按空处理。
   let people = $state<PersonSummary[]>([]);
   // 相关笔记(经知识图谱共享实体):增值层,取失败静默按空。
@@ -529,6 +547,12 @@
     refineRunFailed = false;
     refineErr = "";
     confirmRefine = false;
+    retranscribing = false;
+    retransStage = "";
+    retransConfirm = false;
+    retransErr = "";
+    retransEventSeen = false;
+    mixedReason = null;
     viewMode = "refined";
     cancelHideEntityPop();
     entityPop = null;
@@ -558,6 +582,82 @@
     }).then((u) => {
       if (disposed) u();
       else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
+
+  // 文件重转写(三期):成品轨入口可用性(取失败按"未知原因"置灰,不悄悄放行)。
+  // 回填在途任务的查询(retranscribeStatus)已挪进下方订阅 effect——见 Fix 3
+  // (codex 第三轮)注释:必须等 listen() 的 promise resolve 之后再发起,不能像
+  // 这里一样与订阅 effect 各自独立跑,否则两个 effect 谁先谁后不确定,查询可能
+  // 在监听器挂到位之前就已发出/返回。
+  $effect(() => {
+    const forId = id;
+    mixedInputStatus(forId)
+      .then((r) => {
+        if (forId === id) mixedReason = r;
+      })
+      .catch(() => {
+        if (forId === id) mixedReason = t("notes.retrans.mixedCheckFailed");
+      });
+  });
+
+  // 重转写进度事件：按 id 注册/解绑（同款 onRefine 套路）。running 置 retranscribing=true；
+  // 非 running（ok/error）都是任务终态，复位并按结果刷新（ok 才重拉，error 提示不改数据）。
+  //
+  // Fix 3(codex 第三轮):回填查询(退回 retranscribeStatus 判在途任务，事件只覆盖
+  // 在页期间，若切走再切回需要靠这个补一次状态)从独立 effect 挪到这里，且必须在
+  // `onRetranscribe(...).then((u) => ...)` 里 listen() 的 promise 真正 resolve
+  // 之后才发起——旧版两个 effect 互相独立，挂载/切页瞬间任务恰好结束时可能撞上：
+  // 快照查到 running=true，而终态事件在 listen() 异步注册完成前就已发出，
+  // 监听器还没挂上，事件被漏收，没人再清 retranscribing，永久卡住（retransEventSeen
+  // 旗当时只盖住了 startRetranscribe 的 invoke 路径，管不到这条独立回填）。
+  // 现在把查询挪到 listen() resolve 之后：此后任何终态事件都必被 handler 收到并
+  // 置 retransEventSeen=true，下面 `if (retransEventSeen) return` 守卫自动让路，
+  // 不会再被这条迟到快照覆盖成"重转写中"后无人纠正。
+  $effect(() => {
+    const forId = id;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    onRetranscribe((e) => {
+      if (e.note_id !== forId) return;
+      retransEventSeen = true;
+      if (e.state === "running") {
+        retranscribing = true;
+        retransStage = e.stage;
+        return;
+      }
+      retranscribing = false;
+      retransConfirm = false;
+      if (e.state === "ok") {
+        refresh();
+        recording.bumpNotes();
+      } else if (e.message) {
+        retransErr = t("notes.retrans.failed", { e: e.message });
+      }
+    }).then((u) => {
+      if (disposed) {
+        u();
+        return;
+      }
+      unlisten = u;
+      // 监听器已挂载完成，此后任何终态事件都保证被上面的 handler 收到——现在才
+      // 发起回填查询，杜绝"快照说 running，终态事件却在监听器就位前漏发"的窗口。
+      retranscribeStatus()
+        .then((s) => {
+          if (disposed || forId !== id) return;
+          // 此刻已经收到过 onRetranscribe 事件（可能已经是终态 ok/error）——事件
+          // 通道已经接管了 retranscribing 的真相，这条迟到的快照不再可信，让路。
+          if (retransEventSeen) return;
+          if (s && s.note_id === forId) {
+            retranscribing = true;
+            retransStage = s.stage;
+          }
+        })
+        .catch(() => {});
     });
     return () => {
       disposed = true;
@@ -947,6 +1047,30 @@
     }
   }
 
+  /** 发起文件重转写:input 二选一(双轨/成品轨),破坏性(覆盖原始逐字稿),二段确认
+      已在按钮态处理(retransConfirm),这里只管发起。
+      Fix 4(codex 第二轮)快失败竞态:后端 worker 的终态事件(锁占用/模型缺失等
+      快失败)可能在 `await retranscribeNote` 决议之前就已经到达并把 retranscribing
+      清成 false——这里若无条件在 invoke 成功后把 retranscribing 置回 true,会覆盖
+      掉已经正确落地的终态,永久卡在"重转写中"没人再纠正(事件只在状态变化时触发
+      一次)。复用既有的 retransEventSeen 旗:invoke 前先清旗,invoke 成功后只有
+      "还没见过任何事件"才自己置 running 态——running 事件与终态事件都已到过,
+      说明事件通道已经接管了 retranscribing 的真相,以事件状态为准。 */
+  async function startRetranscribe(input: "dual" | "mixed") {
+    retransConfirm = false;
+    retransErr = "";
+    retransEventSeen = false;
+    try {
+      await retranscribeNote(id, input);
+      if (!retransEventSeen) {
+        retranscribing = true;
+        retransStage = "decode";
+      }
+    } catch (e) {
+      retransErr = t("notes.retrans.failed", { e });
+    }
+  }
+
   async function doResume() {
     const ok = await recording.resume(id);
     if (ok) goto("/record");
@@ -1039,6 +1163,10 @@
         <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
              可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
              Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
+        {#if refined?.stale}
+          <!-- 文件重转写(三期)已跑过但本修订稿还是旧文本(段落已变):提示重新执行 AI -->
+          <div class="banner">{t("notes.retrans.staleBanner")}</div>
+        {/if}
         <SpeakerChips
           speakers={refinedSpeakers}
           noteId={id}
@@ -1125,10 +1253,40 @@
             <AiStateLabel state={aiState} />
           </button>
         {/if}
+
+        <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
+             自动备份为 segments.orig.jsonl),二段确认同款 confirmRefine 样板。
+             来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
+             判定可用性并置灰+tooltip 给原因)。 -->
+        {#if retransConfirm}
+          <span class="refine-warn">{t("notes.retrans.warn")}</span>
+          <button class="link danger" onclick={() => startRetranscribe("dual")}>
+            {t("notes.retrans.confirmDual")}
+          </button>
+          <button
+            class="link danger"
+            disabled={mixedReason !== null}
+            title={mixedReason ?? ""}
+            onclick={() => startRetranscribe("mixed")}
+          >
+            {t("notes.retrans.confirmMixed")}
+          </button>
+          <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+        {:else}
+          <button
+            class="link"
+            disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
+            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+            onclick={() => (retransConfirm = true)}
+          >
+            {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
+          </button>
+        {/if}
       </div>
     </div>
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
+    {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
     {#if effectiveView === "refined" && refined}
       <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->

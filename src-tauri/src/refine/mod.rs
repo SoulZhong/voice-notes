@@ -299,6 +299,7 @@ pub fn run_local(
         relations: vec![],
         graph_support_mentions: vec![],
         revision: 0,
+        stale: false,
         paragraphs,
     };
     let note_lock = crate::store::notelock::NoteLock::acquire(note_dir)?
@@ -767,6 +768,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: texts.iter().map(|t| para(t)).collect(),
         }
     }
@@ -1555,6 +1557,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
@@ -1594,6 +1597,7 @@ mod tests {
             relations: vec![],
             graph_support_mentions: vec![],
             revision: 0,
+            stale: false,
             paragraphs: vec![],
         };
         let cfg = llm::LlmConfig {
