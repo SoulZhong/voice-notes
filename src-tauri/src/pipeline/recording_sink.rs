@@ -253,6 +253,9 @@ impl RecordingSink for MixedSink {
         let (tx, rx) = crossbeam_channel::bounded::<MixedChunk>(MIXED_QUEUE_CAPACITY);
         let enqueue_abandoned = Arc::new(AtomicBool::new(false));
         let worker_abandoned = enqueue_abandoned.clone();
+        // 定稿时写 MixInfo.seek_offset_ms 用:线程要在两源 sink 全部 drop 之后才收尾,
+        // 彼时 first_frame_offset 已是终值(它只在首帧记录一次,之后只读)。
+        let finalize_offsets = self.first_offsets.clone();
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
             // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
@@ -327,6 +330,32 @@ impl RecordingSink for MixedSink {
                 // 而 open() 的截短本就不可逆,再回滚一次也换不回内容。
                 drop(writer.take());
                 rollback_mixed(&mixed_path, rollback);
+            } else if !abandoned && appended {
+                // 正常定稿的唯一出口:写完整性标记(MixInfo)。所有 abandon/rollback
+                // 分支都进不到这里,「有 MixInfo ⇔ 内容完整」由控制流保证。先关 writer
+                // 让 Drop 补头刷盘,session_track_ms 量到的才是终值。写失败只降级:
+                // 轨本身是好的,消费方退回时长交叉核对(mixed_untrusted 的 duration 链)。
+                drop(writer.take());
+                match crate::store::audio::session_track_ms(&note_dir, MIXED_TRACK, base_ms) {
+                    Some(track_ms) => {
+                        let seek_offset_ms = finalize_offsets
+                            .iter()
+                            .map(|(s, h)| (s.as_str().to_string(), h.first_frame_offset_16k() / 16))
+                            .collect();
+                        if let Err(e) = crate::store::audio::set_track_mix(
+                            &note_dir,
+                            MIXED_TRACK,
+                            crate::store::audio::MixInfo {
+                                origin: "live".into(),
+                                seek_offset_ms,
+                                track_ms,
+                            },
+                        ) {
+                            eprintln!("[mix] 完整性标记写入失败(轨内容不受影响): {e}");
+                        }
+                    }
+                    None => eprintln!("[mix] 定稿后量不到 mixed 轨长,跳过完整性标记"),
+                }
             }
         }));
 
@@ -518,6 +547,15 @@ mod tests {
         for (i, &v) in mixed.iter().enumerate() {
             assert!((v as i32 - want as i32).abs() <= 2, "位置 {i}: got {v} want {want}(±2 LSB)");
         }
+        // 正常定稿的盘上证据:MixInfo 必须在(且只在)这条路径写出。
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let mix = meta
+            .tracks
+            .get(MIXED_TRACK)
+            .and_then(|t| t.mix.as_ref())
+            .expect("正常定稿必须写 MixInfo");
+        assert_eq!(mix.origin, "live");
+        assert_eq!(mix.track_ms, 1000, "16000 样本 @16k = 1000ms");
     }
 
     /// 位置正确性:本模块存在的理由。一源(mic)先跑两个不同取值的整块,另一源
@@ -602,6 +640,16 @@ mod tests {
                 .iter()
                 .all(|&v| (v as i32 - system_only as i32).abs() <= 2)
         );
+        // 首帧偏移要随定稿进 MixInfo.seek_offset_ms:mixed 消费方(段落 seek)的
+        // 修正量来源。160 样本 @16k = 10ms。
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let mix = meta
+            .tracks
+            .get(MIXED_TRACK)
+            .and_then(|t| t.mix.as_ref())
+            .expect("正常定稿必须写 MixInfo");
+        assert_eq!(mix.seek_offset_ms.get("mic"), Some(&0));
+        assert_eq!(mix.seek_offset_ms.get("system"), Some(&10));
     }
 
     /// mixed 队列必须有界且生产者永不阻塞。满队列时立即翻转 abandon 标记,后续块
@@ -742,6 +790,11 @@ mod tests {
         );
         let mic = read_pcm_i16(&dir.path().join("mic.wav"));
         assert_eq!(mic.len(), 160 * 100 + 8000 * rounds, "源轨不受混音旁路自杀影响");
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        assert!(
+            meta.tracks.get(MIXED_TRACK).and_then(|t| t.mix.as_ref()).is_none(),
+            "放弃/回滚路径不得留下完整性标记"
+        );
     }
 
     /// Bug 修复回归,与上面 starvation_after_partial_success 相反方向:同样是"守卫
