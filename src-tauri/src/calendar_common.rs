@@ -12,6 +12,8 @@ pub enum Permission {
     WriteOnly,
     Denied,
     NotDetermined,
+    /// 仅非 macOS 桩构造;macOS 构建只在 match 分支出现,允许 dead_code。
+    #[allow(dead_code)]
     Unavailable,
 }
 

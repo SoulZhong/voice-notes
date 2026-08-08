@@ -7,6 +7,9 @@
 //! 全部按 objc2-event-kit 0.3.2 生成签名调用(不猜 selector);可空返回
 //! (eventIdentifier/name/absoluteString)显式处理,无 identifier 的事件跳过。
 
+// include! 的共享文件自带测试模块,后续条目触发 items_after_test_module 风格提示,
+// 结构是刻意的(双平台同形),按文件豁免。
+#![allow(clippy::items_after_test_module)]
 include!("calendar_common.rs");
 
 use std::sync::mpsc::{channel, Sender};
