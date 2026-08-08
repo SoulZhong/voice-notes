@@ -139,6 +139,29 @@ pub enum ReinforceResult {
     SkippedUnknownPerson,
 }
 
+/// 指认后的回灌分派决策(纯函数,可单测;IPC 挂钩壳只做 IO)。
+/// prior = 该说话人指认前已关联的库人物(resolve 后的 id 与名字)。
+#[derive(Debug, PartialEq)]
+pub enum FeedbackAction {
+    /// 先前关联的是**无名**自动人物(停录时 AUTO_ENROLL 自动建的 P<n>):
+    /// journaled 合并 prior→target——质心已在库,合并比重嵌入干净(不重复计
+    /// 时长),且可经收件箱撤销/拆回;也消掉了"同一声音两个身份"的种子竞争。
+    MergePrior { prior: String },
+    /// 无先前关联,或先前是有名人物(用户纠正认错):段重嵌入回灌 target。
+    /// 有名 prior 在停录时并入的净增量 P1 无法撤销(spec P2 identify_journal)。
+    Reinforce,
+    /// 已指认给同一人:无事可做。
+    Noop,
+}
+
+pub fn plan_action(prior: Option<(&str, &str)>, target: &str) -> FeedbackAction {
+    match prior {
+        Some((id, _)) if id == target => FeedbackAction::Noop,
+        Some((id, name)) if name.trim().is_empty() => FeedbackAction::MergePrior { prior: id.to_string() },
+        _ => FeedbackAction::Reinforce,
+    }
+}
+
 const LEDGER_FILE: &str = "feedback.json";
 
 /// 笔记级回灌账本:幂等(同段集合同人只灌一次)+ 纠错还原凭据。
@@ -494,5 +517,20 @@ mod tests {
         let model = store.load().embedding_model.clone();
         let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t").unwrap();
         assert_eq!(r2, ReinforceResult::SkippedUnknownPerson);
+    }
+    #[test]
+    fn plan_action_dispatches_by_prior_state() {
+        assert_eq!(plan_action(None, "P2"), FeedbackAction::Reinforce);
+        assert_eq!(plan_action(Some(("P2", "张伟")), "P2"), FeedbackAction::Noop);
+        assert_eq!(
+            plan_action(Some(("P7", "")), "P2"),
+            FeedbackAction::MergePrior { prior: "P7".into() },
+            "无名自动人物并入目标,不重嵌入"
+        );
+        assert_eq!(
+            plan_action(Some(("P7", "李雷")), "P2"),
+            FeedbackAction::Reinforce,
+            "有名先前人物=纠错,只灌新人"
+        );
     }
 }

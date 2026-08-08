@@ -2607,13 +2607,98 @@ fn assign_note_speaker_person(
             "No such person in the voiceprint library: {person_id}"
         ));
     };
+    // 纠错回灌(spec P1-2)的输入必须在写入前同步取好:指认时刻的段快照与
+    // 先前关联,后台任务不再回读笔记,避免基于"稍后状态"的混合版本回灌。
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    let prior = note
+        .speakers
+        .get(&speaker_id)
+        .and_then(|m| m.person_id.as_deref())
+        .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+        .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
+    let note_for_feedback = note_id.clone();
+    let speaker_for_feedback = speaker_id.clone();
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::AssignPerson {
             id: note_id,
             speaker_id,
-            person_id: resolved,
+            person_id: resolved.clone(),
         },
-    })
+    })?;
+    spawn_feedback(
+        &app,
+        note_for_feedback,
+        note.segments,
+        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_for_feedback])),
+        prior,
+        resolved,
+    );
+    Ok(())
+}
+
+/// 回灌互斥门:同一时刻最多一个回灌任务在嵌入。不借用 AppState.embedder_cache
+/// (开录会 take 走它,回灌不能卡住开录、也不能被开录饿死),自建临时嵌入器,
+/// 靠此门保证回灌侧 ORT 并发最多 +1;它同时把 track_pcm 的 m4a 临时文件竞争
+/// 收敛到回灌之间自串行。
+static FEEDBACK_GATE: Mutex<()> = Mutex::new(());
+
+/// 指认成功后的纠错回灌(spec P1-2):后台 best-effort,任何失败只留日志,
+/// 绝不影响指认结果。分派逻辑见 feedback::plan_action(纯函数已单测);
+/// 无名先前人物走 journaled 合并(可撤销),其余走段重嵌入回灌。
+fn spawn_feedback(
+    app: &AppHandle,
+    note_id: String,
+    segs: Vec<store::SegmentRecord>,
+    filter: feedback::SegFilter,
+    prior: Option<(String, String)>,
+    target: String,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let run = || -> anyhow::Result<()> {
+            let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
+            let now = chrono::Local::now().to_rfc3339();
+            let action =
+                feedback::plan_action(prior.as_ref().map(|(i, n)| (i.as_str(), n.as_str())), &target);
+            match action {
+                feedback::FeedbackAction::Noop => Ok(()),
+                feedback::FeedbackAction::MergePrior { prior } => {
+                    let _gate = FEEDBACK_GATE.lock().unwrap();
+                    let receipt = vp.merge_journaled(&prior, &target, None, "feedback-assign", None, &now)?;
+                    eprintln!("feedback: 无名先前人物 {prior} 已并入 {target}(回执 {receipt})");
+                    Ok(())
+                }
+                feedback::FeedbackAction::Reinforce => {
+                    let _gate = FEEDBACK_GATE.lock().unwrap();
+                    let note_dir = notes_dir(&app)?.join(&note_id);
+                    let expected = app
+                        .path()
+                        .app_data_dir()
+                        .map(|d| settings::load(&d).speaker_model)
+                        .unwrap_or_default();
+                    let library_model = vp.load().embedding_model.clone();
+                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app))?;
+                    let r = feedback::reinforce_person(
+                        &note_dir,
+                        &segs,
+                        &filter,
+                        &target,
+                        &vp,
+                        &library_model,
+                        &expected,
+                        &mut embedder,
+                        &now,
+                    )?;
+                    eprintln!("feedback: note={note_id} target={target} result={r:?}");
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = run() {
+            eprintln!("feedback: 回灌失败(不影响指认) note={note_id}: {e}");
+        }
+    });
 }
 
 /// 某声纹库人物出现过的会议（详情页「出现过的会议」卡）：扫各笔记 speakers.json 的
@@ -3155,8 +3240,38 @@ fn assign_refined_person(
         ));
     };
     let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
-    store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    let dir = root.join(&note_id);
+    // 纠错回灌输入(prior 与 R 段落 seq 集合)必须在写入前读取:写入后
+    // person_id 已变,读不到"先前关联"了。
+    let feedback_input = store::load_refined(&dir).map(|doc| {
+        let paras: Vec<_> = doc.paragraphs.iter().filter(|p| p.speaker == speaker_id).collect();
+        let seqs: std::collections::BTreeSet<u64> =
+            paras.iter().flat_map(|p| p.source_seqs.iter().copied()).collect();
+        let prior = paras
+            .iter()
+            .find_map(|p| p.person_id.as_deref())
+            .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
+            .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
+        (seqs, prior)
+    });
+    store::assign_refined_person(&dir, &speaker_id, &resolved, &name).map_err(|e| e.to_string())?;
+    if let Some((seqs, prior)) = feedback_input {
+        if !seqs.is_empty() {
+            match store::NoteStore::new(root).load(&note_id) {
+                Ok(note) => spawn_feedback(
+                    &app,
+                    note_id,
+                    note.segments,
+                    feedback::SegFilter::Seqs(seqs),
+                    prior,
+                    resolved,
+                ),
+                Err(e) => eprintln!("feedback: 读取笔记段失败,跳过回灌: {e}"),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 笔记页 WYSIWYG 整篇保存精修稿。守卫与 rename_refined_speaker 同套:Aing 中拒绝
