@@ -425,6 +425,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 let log_ctx = data_root(&app)
                     .ok()
                     .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+                // P3 日历匹配:先于 identify 执行(参会人闭集先验要进 ctx);
+                // 失败/未授权/开关关都只收窄,不影响精修。
+                if let Err(e) = match_and_store_calendar(&app, &note_id) {
+                    eprintln!("calendar({note_id}): 匹配失败(不影响笔记): {e}");
+                }
                 let mut http_refine_handled = false;
                 if refine_agent_ready(&s) {
                     telemetry::track(
@@ -3338,6 +3343,240 @@ fn do_assign_refined_person(
     Ok(())
 }
 
+/// P3 自动日历匹配(停止后/backfill 共用):开关开、已授权、无快照且未被清除
+/// 才写。持锁复查——查询期间用户手动改选/清除则放弃。返回是否写入。
+fn match_and_store_calendar(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
+    let s = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !s.calendar_match_enabled {
+        return Ok(false);
+    }
+    if calendar::permission_status() != calendar::Permission::Full {
+        return Ok(false);
+    }
+    let root = notes_dir(app)?;
+    let note = store::NoteStore::new(root.clone()).load(note_id)?;
+    if note.meta.calendar.is_some() || note.meta.calendar_cleared {
+        return Ok(false);
+    }
+    let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments) else {
+        return Ok(false);
+    };
+    let events = calendar::events_between(start_ms - 60_000, end_ms + 60_000)?;
+    let Some(ev) = calendar::best_match(&events, start_ms, end_ms) else {
+        return Ok(false);
+    };
+    let now = chrono::Local::now().to_rfc3339();
+    let snap = calendar::snapshot_of(ev, "auto", &now);
+    store::NoteStore::new(root).update_calendar(note_id, |meta| {
+        if meta.calendar.is_some() || meta.calendar_cleared {
+            return false; // 持锁复查:自动匹配绝不覆盖用户决定
+        }
+        meta.calendar = Some(snap.clone());
+        true
+    })
+}
+
+/// backfill 并发门:授权成功后的自动回填与用户手动回填不并跑。
+static CALENDAR_BACKFILL_GATE: Mutex<()> = Mutex::new(());
+
+/// 全库回填:一次拉取覆盖全部候选笔记的时间窗,内存逐笔记匹配(不逐笔记查
+/// EventKit)。返回写入数。
+fn backfill_calendar_impl(app: &AppHandle) -> anyhow::Result<u32> {
+    let _gate = CALENDAR_BACKFILL_GATE.lock().unwrap();
+    let s = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !s.calendar_match_enabled || calendar::permission_status() != calendar::Permission::Full {
+        return Ok(0);
+    }
+    let root = notes_dir(app)?;
+    let store_ = store::NoteStore::new(root.clone());
+    // 候选:完成态、无快照、未清除;窗口按全体候选的最早开始/最晚结束一次拉取。
+    let mut windows: Vec<(String, i64, i64)> = Vec::new();
+    for n in store_.list() {
+        if n.state != "complete" {
+            continue;
+        }
+        let Ok(note) = store_.load(&n.id) else { continue };
+        if note.meta.calendar.is_some() || note.meta.calendar_cleared {
+            continue;
+        }
+        if let Some((a, b)) = calendar::note_window_ms(&note.meta, &note.segments) {
+            windows.push((n.id, a, b));
+        }
+    }
+    if windows.is_empty() {
+        return Ok(0);
+    }
+    let lo = windows.iter().map(|(_, a, _)| *a).min().unwrap() - 60_000;
+    let hi = windows.iter().map(|(_, _, b)| *b).max().unwrap() + 60_000;
+    let events = calendar::events_between(lo, hi)?;
+    let mut written = 0u32;
+    let now = chrono::Local::now().to_rfc3339();
+    for (id, a, b) in windows {
+        let Some(ev) = calendar::best_match(&events, a, b) else { continue };
+        let snap = calendar::snapshot_of(ev, "auto", &now);
+        let ok = store::NoteStore::new(root.clone()).update_calendar(&id, |meta| {
+            if meta.calendar.is_some() || meta.calendar_cleared {
+                return false;
+            }
+            meta.calendar = Some(snap.clone());
+            true
+        })?;
+        if ok {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// 日历授权态(前端设置页/详情页查询;非 macOS 恒 unavailable → 整块隐藏)。
+#[tauri::command]
+fn calendar_permission() -> String {
+    match calendar::permission_status() {
+        calendar::Permission::Full => "full",
+        calendar::Permission::WriteOnly => "write_only",
+        calendar::Permission::Denied => "denied",
+        calendar::Permission::NotDetermined => "not_determined",
+        calendar::Permission::Unavailable => "unavailable",
+    }
+    .into()
+}
+
+/// 发起系统日历授权(只能由设置页说明卡「继续」触发)。授权成功后对历史笔记
+/// 做一次 best-effort 回填。
+#[tauri::command]
+async fn request_calendar_permission(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let outcome = calendar::request_permission();
+        if outcome == calendar::AuthOutcome::Granted {
+            if let Err(e) = backfill_calendar_impl(&app) {
+                eprintln!("calendar: 授权后回填失败(忽略): {e}");
+            }
+        }
+        Ok(match outcome {
+            calendar::AuthOutcome::Granted => "granted",
+            calendar::AuthOutcome::Denied => "denied",
+            calendar::AuthOutcome::Insufficient => "insufficient",
+            calendar::AuthOutcome::Error => "error",
+            calendar::AuthOutcome::Timeout => "timeout",
+        }
+        .into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 详情页改选候选:笔记当天(前后各扩 2h)的非全天事件,按重叠降序;
+/// 零重叠也列出(延迟开录/错记场景)。
+#[tauri::command]
+async fn list_calendar_candidates(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<ipc::CalendarCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<ipc::CalendarCandidate>, String> {
+        store::validate_note_id(&id).map_err(|e| e.to_string())?;
+        let root = notes_dir(&app).map_err(|e| e.to_string())?;
+        let note = store::NoteStore::new(root).load(&id).map_err(|e| e.to_string())?;
+        let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments) else {
+            return Ok(vec![]);
+        };
+        // 当天窗:起点回拨到当日 00:00 再扩 2h,终点同理,覆盖跨午夜。
+        let day_ms = 86_400_000i64;
+        let lo = (start_ms / day_ms) * day_ms - 2 * 3_600_000;
+        let hi = ((end_ms / day_ms) + 1) * day_ms + 2 * 3_600_000;
+        let events = calendar::events_between(lo, hi).map_err(|e| e.to_string())?;
+        let mut out: Vec<ipc::CalendarCandidate> = events
+            .iter()
+            .filter(|e| !e.all_day)
+            .map(|e| ipc::CalendarCandidate {
+                event_id: e.event_id.clone(),
+                title: e.title.clone(),
+                start_ms: e.start_ms,
+                end_ms: e.end_ms,
+                attendee_n: e.attendees.len(),
+                overlap_ms: calendar::overlap_ms(start_ms, end_ms, e.start_ms, e.end_ms),
+            })
+            .collect();
+        out.sort_by(|a, b| b.overlap_ms.cmp(&a.overlap_ms).then(a.start_ms.cmp(&b.start_ms)));
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 手动改选/清除:Some(event_id) 从候选窗重取该事件快照(match_kind=manual,
+/// 复位 tombstone);None 清除并立 tombstone(自动匹配/回填永不再绑)。
+#[tauri::command]
+async fn set_note_calendar_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    event_id: Option<String>,
+) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    reject_if_active(&state, &id)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let root = notes_dir(&app).map_err(|e| e.to_string())?;
+        let store_ = store::NoteStore::new(root);
+        match event_id {
+            None => {
+                store_
+                    .update_calendar(&id, |meta| {
+                        meta.calendar = None;
+                        meta.calendar_cleared = true;
+                        true
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Some(eid) => {
+                let note = store_.load(&id).map_err(|e| e.to_string())?;
+                let Some((start_ms, end_ms)) = calendar::note_window_ms(&note.meta, &note.segments)
+                else {
+                    return Err(tr!("笔记时间信息不完整", "Note time info incomplete"));
+                };
+                let day_ms = 86_400_000i64;
+                let lo = (start_ms / day_ms) * day_ms - 2 * 3_600_000;
+                let hi = ((end_ms / day_ms) + 1) * day_ms + 2 * 3_600_000;
+                let events = calendar::events_between(lo, hi).map_err(|e| e.to_string())?;
+                let Some(ev) = events.iter().find(|e| e.event_id == eid) else {
+                    return Err(tr!(
+                        "该日程已不在候选窗口内(可能被移动或删除)",
+                        "Event no longer in the candidate window (moved or deleted)"
+                    ));
+                };
+                let now = chrono::Local::now().to_rfc3339();
+                let snap = calendar::snapshot_of(ev, "manual", &now);
+                store_
+                    .update_calendar(&id, |meta| {
+                        meta.calendar = Some(snap.clone());
+                        meta.calendar_cleared = false;
+                        true
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 手动全库回填(设置页入口可后续加;当前供授权成功后自动调用与 devtools)。
+#[tauri::command]
+async fn backfill_calendar_matches(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || backfill_calendar_impl(&app).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 手动触发/重试 identify(P2a):从现稿重建簇成员与簇质心(逐段重嵌入,复用
 /// P1 feedback 纯逻辑核),走管线同一 run_identify。门禁同管线(refine_llm_ready
 /// 内含于 identify_executor);持 FEEDBACK_GATE 全程——嵌入并发与 track_pcm
@@ -5766,6 +6005,11 @@ pub fn run() {
             get_note,
             refine_note,
             identify_note,
+            calendar_permission,
+            request_calendar_permission,
+            list_calendar_candidates,
+            set_note_calendar_event,
+            backfill_calendar_matches,
             list_identify_suggestions,
             apply_identify_suggestion,
             reject_identify_suggestion,

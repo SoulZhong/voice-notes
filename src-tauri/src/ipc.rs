@@ -500,6 +500,17 @@ pub struct MergeReceipt {
     pub invalid_reason: Option<String>,
 }
 
+/// 日历候选(P3 详情页改选下拉):overlap_ms 供前端展示与排序。
+#[derive(Debug, Clone, Serialize)]
+pub struct CalendarCandidate {
+    pub event_id: String,
+    pub title: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub attendee_n: usize,
+    pub overlap_ms: i64,
+}
+
 /// identify(P2a)身份建议卡视图:list_identify_suggestions 返回,收件箱消费。
 /// person_id=None 即「新面孔」(is_new=true,确认时建档)。
 #[derive(Debug, Clone, Serialize)]

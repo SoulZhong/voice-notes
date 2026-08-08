@@ -102,6 +102,37 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// 快照参会人上限:超大活动(数百人)不该把整个名单塞进 meta.json 与 prompt。
+pub const SNAPSHOT_ATTENDEES_MAX: usize = 100;
+
+/// 录音时间窗(unix ms):started_at 必须可解析;ended_at 缺失(录制中断残留)
+/// 用最后一段 end_ms 兜底,两者皆缺返回 None。
+pub fn note_window_ms(
+    meta: &crate::store::NoteMeta,
+    segments: &[crate::store::SegmentRecord],
+) -> Option<(i64, i64)> {
+    let start = chrono::DateTime::parse_from_rfc3339(&meta.started_at).ok()?.timestamp_millis();
+    let end = match meta.ended_at.as_deref().and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok()) {
+        Some(e) => e.timestamp_millis(),
+        None => {
+            let last = segments.iter().map(|s| s.end_ms).max()?;
+            start + last as i64
+        }
+    };
+    (end > start).then_some((start, end))
+}
+
+/// EventInfo → 落盘快照(参会人截断到上限)。
+pub fn snapshot_of(ev: &EventInfo, match_kind: &str, now: &str) -> crate::store::CalendarSnapshot {
+    crate::store::CalendarSnapshot {
+        event_id: ev.event_id.clone(),
+        title: ev.title.clone(),
+        attendees: ev.attendees.iter().take(SNAPSHOT_ATTENDEES_MAX).cloned().collect(),
+        matched_at: now.to_string(),
+        match_kind: match_kind.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod calendar_common_tests {
     use super::*;
@@ -147,4 +178,36 @@ mod calendar_common_tests {
         assert_eq!(normalize_email("  A@B.C"), "a@b.c");
         assert_eq!(normalize_email("%zz"), "%zz", "非法转义原样保留");
     }
+    #[test]
+    fn note_window_falls_back_to_last_segment() {
+        let meta = crate::store::NoteMeta {
+            schema_version: 1,
+            id: "n".into(),
+            title: "t".into(),
+            started_at: "2026-08-08T09:00:00+08:00".into(),
+            ended_at: None,
+            state: "recording".into(),
+            calendar: None,
+            calendar_cleared: false,
+        };
+        let seg = crate::store::SegmentRecord {
+            seq: 0,
+            source: "mic".into(),
+            text: "x".into(),
+            start_ms: 0,
+            end_ms: 120_000,
+            speaker: None,
+            rms: None,
+        };
+        let (s, e) = note_window_ms(&meta, &[seg]).unwrap();
+        assert_eq!(e - s, 120_000, "ended_at 缺失用最后一段兜底");
+        // ended_at 正常路径。
+        let mut m2 = meta.clone();
+        m2.ended_at = Some("2026-08-08T10:00:00+08:00".into());
+        let (s2, e2) = note_window_ms(&m2, &[]).unwrap();
+        assert_eq!(e2 - s2, 3_600_000);
+        // 两者皆缺 → None。
+        assert!(note_window_ms(&meta, &[]).is_none());
+    }
+
 }
