@@ -60,6 +60,17 @@ export function onRetranscribe(cb: (e: RetranscribeEvent) => void) {
   return listen<RetranscribeEvent>("retranscribe", (ev) => cb(ev.payload));
 }
 
+/** 补生成成品轨进度(二期)。stage: decode/align/mix/finish;state: running/ok/error。 */
+export type MixedRegenEvent = {
+  note_id: string;
+  stage: string;
+  state: string;
+  message?: string;
+};
+export function onMixedRegen(cb: (e: MixedRegenEvent) => void) {
+  return listen<MixedRegenEvent>("mixed_regen", (ev) => cb(ev.payload));
+}
+
 export function onPartial(cb: (e: PartialEvent) => void) {
   return listen<PartialEvent>("partial", (ev) => cb(ev.payload));
 }

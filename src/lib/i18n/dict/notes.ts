@@ -103,6 +103,16 @@ export const zh = {
   "notes.player.muted": "已静音",
   "notes.player.errLoad": "音轨装载",
   "notes.player.errPlay": "播放",
+
+  // 回放方案 A/B 切换(二期)
+  "notes.mix.dual": "双轨",
+  "notes.mix.mixed": "成品轨",
+  "notes.mix.title": "回放方案:双轨对齐(方案 A)或成品轨直放(方案 B)",
+  "notes.mix.none": "此笔记还没有成品轨,可离线生成后对比回放",
+  "notes.mix.generate": "生成成品轨",
+  "notes.mix.generating": "生成中（{stage}）",
+  "notes.mix.genFailed": "成品轨生成失败：{message}",
+  "notes.mix.abCaveat": "此场次 mic 轨经过离线回声清洗,A/B 听感不可直比(A 侧多一级抑制)",
 } as const satisfies Dict;
 
 export const en = {
@@ -197,4 +207,14 @@ export const en = {
   "notes.player.muted": "Muted",
   "notes.player.errLoad": "Track loading",
   "notes.player.errPlay": "Playback",
+
+  // Playback scheme A/B toggle (phase 2)
+  "notes.mix.dual": "Dual tracks",
+  "notes.mix.mixed": "Mixed track",
+  "notes.mix.title": "Playback scheme: dual-track aligned (A) or mixed direct (B)",
+  "notes.mix.none": "No mixed track yet; generate one offline to compare playback",
+  "notes.mix.generate": "Generate mixed track",
+  "notes.mix.generating": "Generating ({stage})",
+  "notes.mix.genFailed": "Failed to generate the mixed track: {message}",
+  "notes.mix.abCaveat": "The mic track was echo-cleaned offline; A/B listening is not apples-to-apples (A has one extra suppression pass)",
 } satisfies Record<keyof typeof zh, Msg>;

@@ -72,7 +72,9 @@ export type Note = {
 /** 一条音频轨道(对应后端 store::audio::TrackInfo)。offset_ms:该 WAV 的 0 时刻
     对应笔记时间轴的毫秒(轨道可中途出现:续录旧笔记/某源第二场才授权)。 */
 export type TrackInfo = {
-  source: Source;
+  // 源轨是 "mic"/"system";二期起成品轨("mixed")也走本结构进播放器
+  // (mixed_playback_info 返回,单轨装载,不进 noteAudioInfo 的源轨列表)。
+  source: Source | "mixed";
   path: string;
   offset_ms: number;
   duration_ms: number;
@@ -309,6 +311,23 @@ export const retranscribeStatus = () =>
   invoke<{ note_id: string; stage: string } | null>("retranscribe_status");
 /** 成品轨入口可用性:null 可用;字符串为置灰原因。 */
 export const mixedInputStatus = (id: string) => invoke<string | null>("mixed_input_status", { id });
+/** 回放消费侧一站式读数(二期 A/B 切换):成品轨 + 可信性 + seek 修正表 + 口径告警。 */
+export interface MixedPlaybackInfo {
+  /** null = 无成品轨(给「生成成品轨」动作)。 */
+  track: TrackInfo | null;
+  /** 非 null = 有轨但不可信(置灰 + tooltip 原因)。 */
+  untrusted: string | null;
+  /** 各源段落 seek 到 mixed 的修正量(ms);空表 = 无需修正(regen/旧轨)。 */
+  seek_offset_ms: Record<string, number>;
+  /** mic 轨经过离线回声清洗:A 侧多一级抑制,A/B 听感不可直比。 */
+  ab_caveat: boolean;
+}
+export const mixedPlaybackInfo = (id: string) =>
+  invoke<MixedPlaybackInfo>("mixed_playback_info", { id });
+/** 离线补生成成品轨(非破坏:源轨只读,mixed 原子替换)。进度走 "mixed_regen" 事件。 */
+export const regenerateMixed = (id: string) => invoke<void>("regenerate_mixed", { id });
+/** 正在补生成的 note_id;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
+export const mixedRegenStatus = () => invoke<string | null>("mixed_regen_status");
 /** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
 export const renameRefinedSpeaker = (noteId: string, speakerId: string, name: string) =>
   invoke<void>("rename_refined_speaker", { noteId, speakerId, name });
