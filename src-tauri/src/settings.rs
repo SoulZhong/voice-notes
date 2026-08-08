@@ -136,7 +136,7 @@ pub struct Settings {
     pub mcp_onboarded: bool,
     /// 方案 B:录制期把两轨混成 mixed.wav。默认关——实验特性,开启后每分钟多约
     /// 1.9MB 磁盘(转码 m4a 后大幅缩小)。仅影响新录制,已有笔记不受影响。
-    /// 实验字段,无 UI,手改 settings.json。
+    /// 设置页「录制」有开关(二期起);回放侧切换见笔记详情页。
     #[serde(default)]
     pub mix_track: bool,
     /// P3 日历匹配:录制停止后按时间窗匹配日历事件(标题+参会人入 identify 先验)。

@@ -155,6 +155,9 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
         EditOp::RenameSpeaker { id, speaker_id, name } => {
             store.rename_speaker(&id, &speaker_id, &name).map_err(|e| e.to_string())
         }
+        EditOp::DeleteSpeaker { id, speaker_id } => {
+            store.delete_speaker(&id, &speaker_id).map_err(|e| e.to_string())
+        }
         EditOp::AssignPerson { id, speaker_id, person_id } => store
             .assign_speaker_person(&id, &speaker_id, &person_id)
             .map_err(|e| e.to_string()),

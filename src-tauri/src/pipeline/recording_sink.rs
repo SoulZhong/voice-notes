@@ -250,9 +250,21 @@ impl RecordingSink for MixedSink {
             }
         };
 
+        // codex P1:装配即清旧完整性标记——writer 首次 append 就会 truncate/append
+        // 文件,旧标记(描述装配前内容)一旦残留,本场异常中断后 mixed_untrusted 会
+        // 拿旧读数为已被改动的文件背书。清不掉就整体退回方案 A:混音是纯增值旁路,
+        // 宁可这场没有成品轨,不可留下"标记与内容脱钩"的可能。
+        if let Err(e) = crate::store::audio::clear_track_mix(&note_dir, MIXED_TRACK) {
+            eprintln!("续录装配清旧 mixed 完整性标记失败,本场退回双轨方案: {e}");
+            return w;
+        }
+
         let (tx, rx) = crossbeam_channel::bounded::<MixedChunk>(MIXED_QUEUE_CAPACITY);
         let enqueue_abandoned = Arc::new(AtomicBool::new(false));
         let worker_abandoned = enqueue_abandoned.clone();
+        // 定稿时写 MixInfo.seek_offset_ms 用:线程要在两源 sink 全部 drop 之后才收尾,
+        // 彼时 first_frame_offset 已是终值(它只在首帧记录一次,之后只读)。
+        let finalize_offsets = self.first_offsets.clone();
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
             // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
@@ -327,6 +339,38 @@ impl RecordingSink for MixedSink {
                 // 而 open() 的截短本就不可逆,再回滚一次也换不回内容。
                 drop(writer.take());
                 rollback_mixed(&mixed_path, rollback);
+            } else if !abandoned && appended {
+                // 正常定稿的唯一出口:写完整性标记(MixInfo)。所有 abandon/rollback
+                // 分支都进不到这里,「有 MixInfo ⇔ 内容完整」由控制流保证。先关 writer
+                // 让 Drop 补头刷盘,session_track_ms 量到的才是终值。写失败只降级:
+                // 轨本身是好的,消费方退回时长交叉核对(mixed_untrusted 的 duration 链)。
+                drop(writer.take());
+                // track_ms 必须是**整文件**时长(codex P1):消费端(mixed_untrusted)
+                // 拿它与源轨全长终点比对;session_track_ms 的"本场净时长"口径在续录
+                // 笔记上必然偏差。直接量 WAV 字节。
+                match std::fs::metadata(&mixed_path) {
+                    Ok(m) => {
+                        let track_ms = crate::store::audio::bytes_to_ms(
+                            m.len().saturating_sub(crate::store::audio::HEADER_LEN),
+                        );
+                        let seek_offset_ms = finalize_offsets
+                            .iter()
+                            .map(|(s, h)| (s.as_str().to_string(), h.first_frame_offset_16k() / 16))
+                            .collect();
+                        if let Err(e) = crate::store::audio::set_track_mix(
+                            &note_dir,
+                            MIXED_TRACK,
+                            crate::store::audio::MixInfo {
+                                origin: "live".into(),
+                                seek_offset_ms,
+                                track_ms,
+                            },
+                        ) {
+                            eprintln!("[mix] 完整性标记写入失败(轨内容不受影响): {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("[mix] 定稿后量不到 mixed 轨长,跳过完整性标记: {e}"),
+                }
             }
         }));
 
@@ -518,6 +562,15 @@ mod tests {
         for (i, &v) in mixed.iter().enumerate() {
             assert!((v as i32 - want as i32).abs() <= 2, "位置 {i}: got {v} want {want}(±2 LSB)");
         }
+        // 正常定稿的盘上证据:MixInfo 必须在(且只在)这条路径写出。
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let mix = meta
+            .tracks
+            .get(MIXED_TRACK)
+            .and_then(|t| t.mix.as_ref())
+            .expect("正常定稿必须写 MixInfo");
+        assert_eq!(mix.origin, "live");
+        assert_eq!(mix.track_ms, 1000, "16000 样本 @16k = 1000ms");
     }
 
     /// 位置正确性:本模块存在的理由。一源(mic)先跑两个不同取值的整块,另一源
@@ -602,6 +655,16 @@ mod tests {
                 .iter()
                 .all(|&v| (v as i32 - system_only as i32).abs() <= 2)
         );
+        // 首帧偏移要随定稿进 MixInfo.seek_offset_ms:mixed 消费方(段落 seek)的
+        // 修正量来源。160 样本 @16k = 10ms。
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let mix = meta
+            .tracks
+            .get(MIXED_TRACK)
+            .and_then(|t| t.mix.as_ref())
+            .expect("正常定稿必须写 MixInfo");
+        assert_eq!(mix.seek_offset_ms.get("mic"), Some(&0));
+        assert_eq!(mix.seek_offset_ms.get("system"), Some(&10));
     }
 
     /// mixed 队列必须有界且生产者永不阻塞。满队列时立即翻转 abandon 标记,后续块
@@ -742,6 +805,11 @@ mod tests {
         );
         let mic = read_pcm_i16(&dir.path().join("mic.wav"));
         assert_eq!(mic.len(), 160 * 100 + 8000 * rounds, "源轨不受混音旁路自杀影响");
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        assert!(
+            meta.tracks.get(MIXED_TRACK).and_then(|t| t.mix.as_ref()).is_none(),
+            "放弃/回滚路径不得留下完整性标记"
+        );
     }
 
     /// Bug 修复回归,与上面 starvation_after_partial_success 相反方向:同样是"守卫
@@ -828,6 +896,49 @@ mod tests {
                 "位置 {i}: 上一场内容被改动,got {got} want {want}"
             );
         }
+        // codex P1 回归:上一场定稿写下的 MixInfo 在本场装配时必须已清掉,放弃路径
+        // 也不得把它留下——旧标记描述的是装配前的旧内容,本场 writer 已 truncate/
+        // append 过文件,异常后旧标记会为被改动过的文件背书。
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        assert!(
+            meta.tracks.get(MIXED_TRACK).and_then(|t| t.mix.as_ref()).is_none(),
+            "续录放弃后不得残留上一场的完整性标记"
+        );
+    }
+
+    /// codex P1 回归:续录正常定稿时,MixInfo.track_ms 必须是**整文件**时长——
+    /// 消费端(mixed_untrusted)拿它与源轨全长终点比对;若存本场净时长
+    /// (session_track_ms 口径,减 base_ms 前缀),续录笔记的未转码校验必然偏差。
+    #[test]
+    fn continuation_finalize_records_full_file_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第一场:1 秒,正常定稿。
+        {
+            let mut w = build_sinks(dir.path(), 0, &[Source::Mic, Source::System], true);
+            for _ in 0..100 {
+                for (_, s) in w.sinks.iter_mut() {
+                    s(&[0.25; 160]);
+                }
+            }
+            drain(w);
+        }
+        // 第二场:base_ms=1000 严丝合缝续录,再混 1 秒,正常定稿。
+        {
+            let mut w = build_sinks(dir.path(), 1000, &[Source::Mic, Source::System], true);
+            for _ in 0..100 {
+                for (_, s) in w.sinks.iter_mut() {
+                    s(&[0.25; 160]);
+                }
+            }
+            drain(w);
+        }
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let mix = meta
+            .tracks
+            .get(MIXED_TRACK)
+            .and_then(|t| t.mix.as_ref())
+            .expect("正常定稿必须写 MixInfo");
+        assert_eq!(mix.track_ms, 2000, "track_ms 必须是整文件时长(两场共 2 秒),不是本场净时长");
     }
 
     /// Bug 修复回归,与上一条同场景但**参数落在常态区间**:上一条特意选了 base_ms 与

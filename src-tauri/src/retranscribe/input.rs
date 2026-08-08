@@ -159,6 +159,9 @@ impl TranscribeInput for MixedInput {
 
 /// mixed 轨完整性校验容限。起流错峰残余同量级的初值,待实测校准(spec §MixedInput)。
 pub const MIXED_TOLERANCE_MS: u64 = 500;
+/// regen 轨的放宽容限(codex 第二轮 P1):补生成经 player_align 重采样,mic 长度
+/// 相对源轨读数改变 0.5~0.9s 是 spec 已知限制 1 记录的量级,按严格档必被误拒。
+pub const MIXED_REGEN_TOLERANCE_MS: u64 = 2_000;
 
 /// mixed 轨内容是否**不可信**(None = 可信)。一期明示 mixed 存在 ≠ 完整(回滚失败/
 /// 混音线程 panic 后 Drop 补合法头,均无盘上标记),消费前拿源轨 sync.track_ms 交叉
@@ -168,10 +171,15 @@ pub fn mixed_untrusted(meta: &AudioMeta) -> Option<String> {
     let Some(mixed) = meta.tracks.get("mixed") else {
         return Some("没有成品轨(mixed)产物".into());
     };
-    let Some(dur) = mixed.duration_ms.or_else(|| {
-        // 未转码的 mixed.wav 没有实测 duration_ms:退而用 sync.track_ms(录制期对账值)
-        mixed.sync.as_ref().map(|s| s.track_ms)
-    }) else {
+    let Some(dur) = mixed
+        .duration_ms
+        // 未转码的 mixed.wav 没有实测 duration_ms:退而用 sync.track_ms(录制期对账值)。
+        // 但 mixed 实际从不落 sync(record_sync 只遍历 mic/system 的 health),这条
+        // 回退保留只为向后兼容口径;真正兜住未转码场景的是第三读数 mix.track_ms
+        // (二期起定稿即写,Windows 无转码路径全靠它)。
+        .or_else(|| mixed.sync.as_ref().map(|s| s.track_ms))
+        .or_else(|| mixed.mix.as_ref().map(|m| m.track_ms))
+    else {
         return Some("成品轨缺少时长读数,无法校验完整性".into());
     };
     let mut expected: Option<u64> = None;
@@ -195,10 +203,20 @@ pub fn mixed_untrusted(meta: &AudioMeta) -> Option<String> {
     let Some(expected) = expected else {
         return Some("没有可对账的源轨,无法校验成品轨".into());
     };
-    let diff = dur.abs_diff(expected);
-    if diff > MIXED_TOLERANCE_MS {
+    // 口径对齐(codex 第二轮 P1):dur 是文件本地时长,expected 是全局时间轴终点,
+    // 比较前把 mixed 自己的 offset_ms 加回去——否则 origin>0 的合法轨被整个
+    // offset 量级误拒。容限按来源分档:regen 经对齐重采样,长度相对源轨读数改变
+    // 0.5~0.9s 是已知残余(spec 已知限制 1),放宽到 2s;live/无标记维持严格档。
+    let mixed_end = mixed.offset_ms + dur;
+    let tolerance = if mixed.mix.as_ref().is_some_and(|m| m.origin == "regen") {
+        MIXED_REGEN_TOLERANCE_MS
+    } else {
+        MIXED_TOLERANCE_MS
+    };
+    let diff = mixed_end.abs_diff(expected);
+    if diff > tolerance {
         return Some(format!(
-            "成品轨时长({dur}ms)与源轨对账值({expected}ms)偏差 {diff}ms,超 {MIXED_TOLERANCE_MS}ms 容限,内容不可信"
+            "成品轨终点({mixed_end}ms)与源轨对账值({expected}ms)偏差 {diff}ms,超 {tolerance}ms 容限,内容不可信"
         ));
     }
     None
@@ -236,6 +254,7 @@ mod tests {
     fn meta_with(mixed_dur: Option<u64>, mic_track: u64, sys_track: u64, sys_off: u64) -> AudioMeta {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         m.tracks.insert("mic".into(), TrackMeta { sync: Some(sync(mic_track)), ..Default::default() });
@@ -253,6 +272,55 @@ mod tests {
         assert_eq!(mixed_untrusted(&m), None);
     }
 
+    /// codex 第二轮 P1:mixed 的时长读数是**文件本地**口径,源轨终点是**全局时间轴**
+    /// 口径——比较必须把 mixed 自己的 offset_ms 加回去,否则 origin>0 的合法成品轨
+    /// (续录/系统先开等 min(源 offset)>0 的场景)会被整个 offset 的量级误拒。
+    #[test]
+    fn mixed_with_nonzero_offset_compares_on_global_timeline() {
+        let mut m = meta_with(Some(59_000), 60_000, 58_000, 1_200);
+        // 两源 offset 分别 1200/…,mixed origin=1000:文件时长 59_000,全局终点 60_000。
+        m.tracks.get_mut("mic").unwrap().offset_ms = 1_000;
+        m.tracks.get_mut("mixed").unwrap().offset_ms = 1_000;
+        // expected = max(1000+60000, 1200+58000) = 61_000;mixed 全局终点 = 1000+59_000 = 60_000
+        // 偏差 1000ms>500 会拒——把 mixed 时长调到 60_200,全局终点 61_200,偏差 200 应放行。
+        m.tracks.get_mut("mixed").unwrap().duration_ms = Some(60_200);
+        assert_eq!(mixed_untrusted(&m), None, "全局口径下 offset>0 的合法轨应放行");
+        // 反证:若实现忘加 mixed.offset_ms,60_200 vs 61_000 偏差 800 会被误拒。
+    }
+
+    /// codex 第二轮 P1(第二半):regen 轨经 player_align 重采样,mic 长度改变
+    /// 0.5~0.9s 是 spec 已知限制 1 的量级,而源轨读数仍是对齐前的——对 regen 轨
+    /// 按已知残余放宽容限,live 轨维持 500ms 严格档。
+    #[test]
+    fn regen_origin_gets_alignment_tolerance() {
+        let mk = |origin: &str| {
+            let mut m = meta_with(None, 60_000, 59_000, 1_200); // expected=60_200
+            m.tracks.get_mut("mixed").unwrap().mix = Some(crate::store::audio::MixInfo {
+                origin: origin.into(),
+                seek_offset_ms: Default::default(),
+                track_ms: 61_000, // 偏差 800ms:超 500 严格档,在 2000 放宽档内
+            });
+            m
+        };
+        assert_eq!(mixed_untrusted(&mk("regen")), None, "regen 轨按对齐残余放宽");
+        assert!(mixed_untrusted(&mk("live")).is_some(), "live 轨维持严格容限");
+    }
+
+    /// 未转码的 mixed.wav(Windows 恒如此;macOS 转码失败降级)没有 duration_ms,
+    /// mixed 又永远没有 sync(record_sync 只遍历 mic/system)——三期在这种笔记上
+    /// 恒判「缺少时长读数」。二期起 MixInfo.track_ms(定稿时量出)作第三读数来源。
+    #[test]
+    fn mix_info_track_ms_serves_as_duration_fallback() {
+        let mut m = meta_with(None, 60_000, 59_000, 1_200); // 无 duration_ms、无 sync
+        assert!(mixed_untrusted(&m).is_some(), "三读数全缺时必须拒");
+        m.tracks.get_mut("mixed").unwrap().mix = Some(crate::store::audio::MixInfo {
+            origin: "live".into(),
+            seek_offset_ms: Default::default(),
+            track_ms: 60_400, // 对账值 max(60000, 1200+59000)=60200,差 200ms ≤ 容限
+        });
+        assert_eq!(mixed_untrusted(&m), None, "有 MixInfo.track_ms 即可校验通过");
+    }
+
     /// 续录笔记(Fix 3,codex 第二轮):源轨 duration_ms 是整文件实测时长(跨全部场次),
     /// sync.track_ms 只是最后一场的净时长(set_track_sync 每场覆盖)。mixed 时长对齐
     /// 全长 duration_ms 时应判可信——若仍按 offset+sync.track_ms(只有末场)算终点,
@@ -261,6 +329,7 @@ mod tests {
     fn mixed_trusted_for_continued_recording_using_source_duration_ms() {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         // 两场录制,mic 全长 10_000ms,但 sync.track_ms 只留了最后一场的 3_000ms

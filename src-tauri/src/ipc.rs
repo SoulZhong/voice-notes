@@ -588,6 +588,18 @@ pub struct RetranscribeEvent {
     pub summary: Option<crate::retranscribe::Summary>,
 }
 
+/// 补生成成品轨进度事件("mixed_regen")。stage: decode/align/mix/finish;
+/// state: running/ok/error(message 仅 error 带原因)。与 RetranscribeEvent 的
+/// 轮询契约不同,不设终态槽:消费方只有详情页,桌面事件足够,MCP/UDS 无此入口。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MixedRegenEvent {
+    pub note_id: String,
+    pub stage: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// 用户显式发起的关系补建请求。`note_ids=None` 使用只读 preview 的默认选择；
 /// 显式列表始终逐个校验，不会在坏 id 时退回全库扫描。
 #[derive(Debug, Clone, Deserialize)]

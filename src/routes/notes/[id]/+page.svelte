@@ -6,7 +6,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
-  import { onRefine, onRetranscribe, onNoteRenamed, onNoteRealigned } from "$lib/events";
+  import { onRefine, onRetranscribe, onMixedRegen, onNoteRenamed, onNoteRealigned } from "$lib/events";
   import {
     getNote,
     renameNote,
@@ -17,6 +17,11 @@
     retranscribeNote,
     retranscribeStatus,
     mixedInputStatus,
+    deleteNoteSpeaker,
+    mixedPlaybackInfo,
+    regenerateMixed,
+    mixedRegenStatus,
+    type MixedPlaybackInfo,
     formatDate,
     formatDuration,
     speakerLabel,
@@ -107,6 +112,16 @@
   let player = $state<ReturnType<typeof AudioPlayer> | null>(null);
   let playerMs = $state(0);
   let playerPlaying = $state(false);
+
+  // 回放方案 A/B(二期):双轨对齐+门控(A)/成品轨直放(B)。会话内状态,
+  // 切笔记复位——对比场景本来就是当场切,不做持久化。
+  let playbackScheme = $state<"dual" | "mixed">("dual");
+  let mixedInfo = $state<MixedPlaybackInfo | null>(null);
+  /** A/B 切换的续播现场(codex P2):换方案会整体重装原生播放器(核心恒从 0/
+      paused 起),对比要的恰是同一时刻——切换前记下位置,onLoaded 回调里恢复。 */
+  let pendingResume = $state<{ ms: number; playing: boolean } | null>(null);
+  let regenStage = $state<string | null>(null); // 非 null = 补生成进行中(值为阶段名)
+  let regenErr = $state("");
 
   /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
       按 (start_ms, seq) 升序,前端直接消费。 */
@@ -393,8 +408,11 @@
     if (segs.length === 0 || !player) return;
     const idx = preview?.sid === sid ? (preview.idx + 1) % segs.length : 0;
     const seg = segs[idx];
-    preview = { sid, idx, endMs: Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS) };
-    player.seek(seg.start_ms);
+    // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
+    // 边界不修正会让试听提前一个首帧偏移量截停。
+    const segSource = segSourceAt(seg.start_ms);
+    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
 
@@ -534,6 +552,47 @@
       });
   });
 
+  // 成品轨读数(二期):与源轨列表同依赖同节奏重拉(transcode_done/停录都会 bump
+  // tracksVersion,补生成完成也借同一计数触发)。取失败按无成品轨处理,增值层不打扰。
+  $effect(() => {
+    const forId = id;
+    void recording.notesVersion;
+    void tracksVersion;
+    mixedPlaybackInfo(forId)
+      .then((i) => {
+        if (forId === id) mixedInfo = i;
+      })
+      .catch(() => {
+        if (forId === id) mixedInfo = null;
+      });
+  });
+
+  // mixed 不可用即强制回落 dual(轨被删/变不可信/切到无成品轨的笔记),
+  // 装载数组的二选一表达式因此永远拿不到失效的 mixed。
+  $effect(() => {
+    if (playbackScheme === "mixed" && (!mixedInfo?.track || mixedInfo.untrusted)) {
+      switchScheme("dual");
+    }
+  });
+
+  function switchScheme(s: "dual" | "mixed") {
+    if (s === playbackScheme) return;
+    pendingResume = { ms: playerMs, playing: playerPlaying };
+    playbackScheme = s;
+  }
+
+  /** AudioPlayer 每次装载完成回调:有待恢复现场就 seek 回同一时刻(越界即放弃,
+      如切到时长更短的轨);进页首次装载 pendingResume 为 null,自然 no-op。 */
+  function onPlayerLoaded() {
+    const r = pendingResume;
+    pendingResume = null;
+    if (!r || !player) return;
+    if (r.ms > 0 && r.ms < player.durationMs()) {
+      player.seek(r.ms);
+      if (r.playing) player.play();
+    }
+  }
+
   // 相关笔记:增值层,取失败静默按空。id 切换即重取。
   $effect(() => {
     const forId = id;
@@ -608,6 +667,11 @@
     retransErr = "";
     retransEventSeen = false;
     mixedReason = null;
+    playbackScheme = "dual";
+    pendingResume = null;
+    mixedInfo = null;
+    regenStage = null;
+    regenErr = "";
     viewMode = "refined";
     cancelHideEntityPop();
     entityPop = null;
@@ -720,6 +784,57 @@
     };
   });
 
+  // 补生成进度事件(二期):订阅→回填的顺序纪律与上方重转写 effect 相同(Fix 3),
+  // 回填查询必须等 listen() resolve 之后发起,终态事件才不会漏在监听器就位前。
+  $effect(() => {
+    const forId = id;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    let regenEventSeen = false;
+    onMixedRegen((e) => {
+      if (e.note_id !== forId) return;
+      regenEventSeen = true;
+      if (e.state === "running") {
+        regenStage = e.stage;
+        return;
+      }
+      regenStage = null;
+      if (e.state === "ok") {
+        // 借 tracksVersion 触发 mixedPlaybackInfo 重拉(同一依赖组)。
+        tracksVersion++;
+      } else if (e.message) {
+        regenErr = t("notes.mix.genFailed", { message: e.message });
+      }
+    }).then((u) => {
+      if (disposed) {
+        u();
+        return;
+      }
+      unlisten = u;
+      mixedRegenStatus()
+        .then((s) => {
+          if (disposed || forId !== id || regenEventSeen) return;
+          if (s === forId) regenStage = "mix";
+        })
+        .catch(() => {});
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
+
+  async function startRegen() {
+    regenErr = "";
+    regenStage = "mix"; // 立即置忙,快失败时在 catch 复位(同 startRetranscribe 竞态样板)
+    try {
+      await regenerateMixed(id);
+    } catch (e) {
+      regenStage = null;
+      regenErr = t("notes.mix.genFailed", { message: String(e) });
+    }
+  }
+
   // 后端自动改名(LLM 主题标题):只改标题字段,不整页 refresh(编辑中也安全)。
   $effect(() => {
     const forId = id;
@@ -770,14 +885,19 @@
   //    普遍 0.2+,固定封顶会齐刷刷顶格)+γ0.7 拉开动态;②确定性抖动纹理(段级 rms
   //    在段内是平台,乘 ±18% 伪随机破平顶,真实响度包络仍在);③桶多条细。 ──
   const WAVE_BARS = 260;
-  const audioTotalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
+  // 装载数组二选一(mixPlayback.test.ts 锁死):mixed 本就是 mic+system 混出来的,
+  // 与源轨同时装载 = 三重叠加(音量翻倍、听感像回声)。不可信轨(untrusted)不进装载。
+  const playerTracks = $derived(
+    playbackScheme === "mixed" && mixedInfo?.track && !mixedInfo.untrusted ? [mixedInfo.track] : tracks,
+  );
+  const audioTotalMs = $derived(playerTracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
   const waveform = $derived.by(() => {
     if (audioTotalMs <= 0) return [];
     // 真实音频波形优先(后端转码预计算/懒回填):有声音就有波形,与录音机直觉一致。
     // 多轨(mic/system)按全局时间轴对位取 max;真实数据自带起伏,不加抖动纹理。
     const real: number[] = new Array(WAVE_BARS).fill(0);
     let hasReal = false;
-    for (const t of tracks) {
+    for (const t of playerTracks) {
       if (!t.waveform?.length) continue;
       hasReal = true;
       const n = t.waveform.length;
@@ -813,7 +933,11 @@
     const s = new Set<number>();
     if (tracks.length === 0) return s;
     for (const seg of displaySegments) {
-      if (playerMs >= seg.start_ms && playerMs < seg.end_ms) s.add(seg.seq);
+      // mixed 态段落边界与 seek 同一套修正(codex P2):live 成品轨里各源内容整体
+      // 后移其首帧偏移,只修 seek 不修比较边界会让高亮/跟随提前一个偏移量。
+      if (playerMs >= seekFix(seg.start_ms, seg.source) && playerMs < seekFix(seg.end_ms, seg.source)) {
+        s.add(seg.seq);
+      }
     }
     return s;
   });
@@ -876,13 +1000,26 @@
     return () => sc.removeEventListener("wheel", onWheel);
   });
 
+  /** mixed 态段落 seek 修正:live 成品轨里各源内容整体后移其首帧偏移(spec §口径差),
+      点段落要把这段加回去,否则 system 段系统性偏 offset_sys。regen 轨按 offset_ms
+      定位、seek_offset_ms 为空表 → 修正恒 0;dual 态原样返回。 */
+  const seekFix = (ms: number, source?: string) =>
+    playbackScheme === "mixed" ? ms + (mixedInfo?.seek_offset_ms[source ?? ""] ?? 0) : ms;
+
+  /** 段落时间点反查所属源:调用方(onPlayFrom 回调链)只有毫秒数,而 seek 修正
+      按源区分。点击值即段起点,半开区间查找是精确命中;refined 段落无 source,
+      按其时间落点归到底层原始段,同一时间轴语义一致。 */
+  const segSourceAt = (ms: number) =>
+    displaySegments.find((s) => s.start_ms <= ms && ms < s.end_ms)?.source;
+
   /** 只需要 start_ms：原始段(SegmentRecord)与 Aing 段(RefinedParagraph)都结构兼容,共用同一播放逻辑。 */
-  function playFrom(pos: { start_ms: number }) {
+  function playFrom(pos: { start_ms: number; source?: string }) {
     if (!player) return;
+    const ms = seekFix(pos.start_ms, pos.source ?? segSourceAt(pos.start_ms));
     // 起点落在音频覆盖范围之外(该轨写失败提早停/音频比转写短):忽略点击,
     // 否则 seek 被钳到末尾、play 又视作"播完重来",会莫名跳回 0:00。
-    if (pos.start_ms >= player.durationMs()) return;
-    player.seek(pos.start_ms);
+    if (ms >= player.durationMs()) return;
+    player.seek(ms);
     player.play();
     resumeFollow(); // 点时间戳跳播 = 想跟着听
   }
@@ -1241,7 +1378,34 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} {tracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} />
+          </div>
+          <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
+               动作;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
+          <div class="mix-switch" title={t("notes.mix.title")}>
+            <button
+              class="link"
+              class:active={playbackScheme === "dual"}
+              onclick={() => switchScheme("dual")}>{t("notes.mix.dual")}</button
+            >
+            {#if mixedInfo?.track}
+              <button
+                class="link"
+                class:active={playbackScheme === "mixed"}
+                disabled={mixedInfo.untrusted !== null}
+                title={mixedInfo.untrusted ?? t("notes.mix.title")}
+                onclick={() => switchScheme("mixed")}>{t("notes.mix.mixed")}</button
+              >
+            {:else}
+              <button
+                class="link"
+                disabled={regenStage !== null || recording.isLive}
+                title={t("notes.mix.none")}
+                onclick={startRegen}
+              >
+                {regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate")}
+              </button>
+            {/if}
           </div>
         {/if}
         <button
@@ -1254,6 +1418,14 @@
           <span class="rec-dot"></span>
         </button>
       </div>
+      {#if playbackScheme === "mixed" && mixedInfo?.ab_caveat}
+        <!-- A/B 口径护栏(spec §对照条件):mic 轨经过离线回声清洗而 mixed 拿不到
+             这道处理,A 侧多一级抑制——此场次听感差异不能归因于录制期混音本身。 -->
+        <p class="hint">{t("notes.mix.abCaveat")}</p>
+      {/if}
+      {#if regenErr}
+        <div class="banner">{regenErr}</div>
+      {/if}
 
       {#if effectiveView === "refined"}
         <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
@@ -1287,6 +1459,7 @@
           counts={segCounts}
           people={canEdit ? people : undefined}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1648,6 +1821,22 @@
   .player-slot {
     flex: 1;
     min-width: 0;
+  }
+  /* 回放方案 A/B 切换(二期):pill 组,选中态加底色;置灰态由 button:disabled 通用样式接管 */
+  .mix-switch {
+    display: inline-flex;
+    gap: 0.15rem;
+    flex: none;
+    align-items: center;
+  }
+  .mix-switch .link {
+    font-size: 0.8rem;
+    padding: 0.2em 0.55em;
+    border-radius: 999px;
+  }
+  .mix-switch .link.active {
+    background: var(--surface-sunken, rgba(0, 0, 0, 0.08));
+    color: var(--ink);
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
      纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占

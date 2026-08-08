@@ -15,12 +15,17 @@
     waveform = [],
     currentMs = $bindable(0),
     playing = $bindable(false),
+    onLoaded,
   }: {
     tracks: TrackInfo[];
     /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
     waveform?: number[];
     currentMs?: number;
     playing?: boolean;
+    /** 装载成功回调(可选):tracks 变化触发的每次 player_load resolve 后调用。
+        宿主用它在重装后恢复播放位置(A/B 切换保位置,codex P2)——原生核心
+        每次装载都从 0/paused 起,不回调宿主无从得知何时可以 seek。 */
+    onLoaded?: () => void;
   } = $props();
 
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -32,21 +37,44 @@
     if (!trackErrors.includes(msg)) trackErrors = [...trackErrors, msg];
   }
 
-  // 装载:tracks 变化(进页/续录/transcode_done 重拉)即重载原生播放器。
+  // 装载:tracks 变化(进页/续录/transcode_done 重拉/A/B 切换)即重载原生播放器。
   // m4a 首次播放需解码到缓存(秒级、命令内完成),play() await 此 promise 即拿到就绪;
   // 缓存跨会话复用,二次装载瞬时。卸载/切笔记 → player_stop 停流放资源。
+  //
+  // 串行链 + 代次守卫(codex 第三轮 P1):player_load 后端在异步解码/对齐完成后才
+  // 写全局 PlayerHandle,并发装载谁后完成谁生效——快速切 A/B 时旧装载可能最后落地,
+  // UI 显示 B 实播 A。新装载排在旧 promise settle 之后(旧写入先落定,last-write
+  // 恒为最新意图);onLoaded 只在代次仍是最新时回调,过期装载不消耗恢复现场。
   let loadPromise: Promise<number> | null = null;
+  let loadGen = 0;
+  // 串行链单独存放:effect 的 cleanup 会先把 loadPromise 置 null 再跑下一轮,
+  // 若用 loadPromise 当前驱,新一轮读到的恒是 null,串行化形同虚设。本变量只进
+  // 不清(settle 后即释放引用,无泄漏),cleanup 不碰它。
+  let loadChain: Promise<unknown> = Promise.resolve();
   $effect(() => {
     trackErrors = [];
-    loadPromise =
-      tracks.length === 0
-        ? null
-        : invoke<number>("player_load", {
-            tracks: tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source })),
-          }).catch((e) => {
-            reportError(t("notes.player.errLoad"), `${e}`);
-            throw e;
-          });
+    if (tracks.length === 0) {
+      loadPromise = null;
+    } else {
+      const gen = ++loadGen;
+      const payload = tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source }));
+      const prev = loadChain;
+      const p = (async () => {
+        try {
+          await prev;
+        } catch {
+          /* 旧装载失败不阻断新装载 */
+        }
+        const total = await invoke<number>("player_load", { tracks: payload });
+        if (gen === loadGen) onLoaded?.();
+        return total;
+      })();
+      loadChain = p.catch(() => {});
+      loadPromise = p.catch((e) => {
+        if (gen === loadGen) reportError(t("notes.player.errLoad"), `${e}`);
+        throw e;
+      });
+    }
     return () => {
       loadPromise = null;
       void invoke("player_stop").catch(() => {});

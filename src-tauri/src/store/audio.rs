@@ -87,6 +87,9 @@ pub struct TrackMeta {
     /// 墙钟-样本对账(见 SyncInfo)。None = 该轨录制期未记录(旧笔记/中断)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncInfo>,
+    /// 成品轨专用,见 MixInfo。源轨恒 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<MixInfo>,
 }
 
 /// 波形桶数,与前端 WAVE_BARS 对齐(260 桶约 1KB JSON,audio.json 体积可忽略)。
@@ -102,6 +105,26 @@ pub struct CleanInfo {
     /// Some(false)=AEC3-only(模型未在场或推理失败);Some(true)=神经级已叠加。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neural: Option<bool>,
+}
+
+/// 成品轨完整性标记 + 消费口径。只在混音**正常定稿**(实时)或补生成**原子改名
+/// 成功后**(离线)写入;回滚、放弃、panic 路径全都到不了写入点——因此它的存在
+/// 本身就是「这条轨是完整产物」的盘上证据,mixed_track() 文档里两条无标记残留
+/// 路径自此可判定。缺失不单独定罪(一期录的 mixed 没有它),时长交叉核对仍是
+/// 最终裁决,见 retranscribe::input::mixed_untrusted。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixInfo {
+    /// "live"(录制期混出,时间轴含首帧偏移)或 "regen"(离线补生成,按
+    /// offset_ms 定位,段落 seek 无需修正)。
+    pub origin: String,
+    /// 消费 mixed 时各源段落 seek 要加的修正量(ms)。live = 各源首帧偏移
+    /// (末场值;续录多场的历史场次只能近似,量级数十~数百 ms)。regen = 空表。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seek_offset_ms: BTreeMap<String, u64>,
+    /// 定稿时量出的**整文件**时长(WAV 字节口径;续录跨全部场次,不是本场净时长
+    /// ——消费端 mixed_untrusted 拿它与源轨全长终点比对,codex P1 修正)。
+    /// 未转码时 mixed_untrusted 的时长读数来源。
+    pub track_ms: u64,
 }
 
 /// 墙钟-轨时间轴对账:该轨在本场录制里实际落盘的时长 vs 同一场的墙钟时长。
@@ -182,6 +205,11 @@ pub struct SyncInfo {
     pub gaps: u32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: u32,
+    /// 本源首个真实帧相对本场最早首帧的偏移(ms)。mixed 轨里该源内容整体后移
+    /// 这么多(spec §口径差),段落 seek 到 mixed 时要加回去。续录每场覆盖,
+    /// 与本结构其余字段同限制。旧数据无此字段 → None,消费方按 0 处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_frame_offset_ms: Option<u64>,
 }
 
 /// 轨时间轴 − 墙钟。抽成纯函数是为了能被表驱动测试直接打:这条数是后续所有漂移标定
@@ -394,6 +422,52 @@ pub fn set_track_sync(note_dir: &Path, source: &str, info: SyncInfo) -> anyhow::
     let mut meta = load_audio_meta(note_dir);
     meta.schema_version = 1;
     meta.tracks.entry(source.to_string()).or_default().sync = Some(info);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 补生成前清掉 mixed 条目的过期读数(codec/duration/waveform/mix)并写新 offset:
+/// 旧 m4a 的 duration_ms/waveform 描述的是即将被替换的旧产物,留着会被
+/// track_info_for 优先采信;mix 标记描述的也是旧内容,新产物定稿后再由
+/// set_track_mix 重写。sync 不清:mixed 从不写 sync。
+pub fn reset_mixed_meta(note_dir: &Path, offset_ms: u64) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.schema_version = 1;
+    let t = meta
+        .tracks
+        .entry(crate::pipeline::recording_sink::MIXED_TRACK.to_string())
+        .or_default();
+    t.offset_ms = offset_ms;
+    t.codec = None;
+    t.duration_ms = None;
+    t.waveform = None;
+    t.mix = None;
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 写成品轨完整性标记(见 MixInfo)。只允许在定稿成功的唯一出口调用——放弃/回滚
+/// 路径写不到它正是它作为完整性证据的全部依据。
+pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.schema_version = 1;
+    meta.tracks.entry(source.to_string()).or_default().mix = Some(mix);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 清成品轨完整性标记。**任何可能改动 mixed 轨字节的操作开始之前必须调用**
+/// (续录装配、补生成开工):旧标记描述的是旧内容,文件一旦被 truncate/append,
+/// 标记若还在,异常中断后 mixed_untrusted 会拿旧读数为已被改动的文件背书
+/// (codex 审查 P1)。条目不存在时静默成功——本就无标记可清。
+pub fn clear_track_mix(note_dir: &Path, source: &str) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    let Some(t) = meta.tracks.get_mut(source) else { return Ok(()) };
+    if t.mix.is_none() {
+        return Ok(());
+    }
+    t.mix = None;
+    meta.schema_version = 1;
     save_audio_meta(note_dir, &meta)
 }
 
@@ -1070,6 +1144,7 @@ mod tests {
                 silence_ms: 0,
                 gaps: 0,
                 rate_fixes: 1,
+                first_frame_offset_ms: None,
             },
         )
         .unwrap();
@@ -1310,5 +1385,52 @@ mod tests {
 
         assert!(list_tracks(tmp.path()).is_empty(), "只有成品轨时源轨列表应为空");
         assert!(mixed_track(tmp.path()).is_some(), "但 mixed_track 仍应能取到它");
+    }
+
+    /// MixInfo 是「正常定稿」的盘上证据:回滚失败/线程 panic 两条残留路径(见
+    /// mixed_track 文档)都写不到它。set_track_mix 走读改写 audio.json,不碰其他字段。
+    #[test]
+    fn set_track_mix_persists_and_preserves_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        set_track_sync(
+            dir.path(),
+            "mixed",
+            SyncInfo {
+                wall_ms: 1,
+                samples: 0,
+                track_ms: 5000,
+                drift_ms: 4999,
+                silence_ms: 0,
+                gaps: 0,
+                rate_fixes: 0,
+                first_frame_offset_ms: None,
+            },
+        )
+        .unwrap();
+        let mix = MixInfo {
+            origin: "live".into(),
+            seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
+            track_ms: 5000,
+        };
+        set_track_mix(dir.path(), "mixed", mix.clone()).unwrap();
+        let meta = load_audio_meta(dir.path());
+        let t = meta.tracks.get("mixed").expect("track 条目");
+        assert_eq!(t.mix.as_ref(), Some(&mix));
+        assert!(t.sync.is_some(), "既有字段不得被覆盖丢失");
+    }
+
+    /// 旧 audio.json(无 first_frame_offset_ms)必须照常反序列化为 None;
+    /// 新写出的 JSON 有该字段且往返保真。字段语义:本源首个真实帧相对本场最早
+    /// 首帧的偏移(16k 口径换算成 ms),是 mixed 轨段落 seek 修正的数据来源。
+    #[test]
+    fn sync_first_frame_offset_roundtrip_and_backcompat() {
+        let old = r#"{"wall_ms":1,"samples":2,"track_ms":3,"drift_ms":2,"silence_ms":0,"gaps":0,"rate_fixes":0}"#;
+        let s: SyncInfo = serde_json::from_str(old).expect("旧数据必须能解析");
+        assert_eq!(s.first_frame_offset_ms, None);
+
+        let with = SyncInfo { first_frame_offset_ms: Some(120), ..s };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: SyncInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.first_frame_offset_ms, Some(120));
     }
 }
