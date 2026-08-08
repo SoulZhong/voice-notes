@@ -62,4 +62,15 @@ describe("编辑器与 Svelte 响应式的边界", () => {
     expect(effect).toContain("editableNow = editable");
     expect(effect.indexOf("editableNow = editable")).toBeLessThan(effect.indexOf("view.dispatch"));
   });
+
+  it("segmentsrendered 监听器的 tick 自增必须 untrack——同步派发在 effect 追踪上下文内", () => {
+    // setSegments 的 dispatchEvent 是同步的:onSegRendered 在数据同步 effect 的
+    // 追踪上下文内执行,`segRenderTick++` 先读后写,裸写会把「读」登记成该 effect
+    // 的依赖、「写」又立刻使它失效——effect 读写同一状态,每轮自增自触发,
+    // effect_update_depth_exceeded 死循环(2026-08-09 定位;自 PR#65 即存在,被
+    // hasFocus 守卫常态遮蔽:编辑器无焦点时的离散命令〔改说话人/删段〕才踩中)。
+    const handler = detail.slice(detail.indexOf("const onSegRendered"));
+    expect(handler).toMatch(/untrack\(\(\) => \(segRenderTick \+= 1\)\)/);
+    expect(handler.slice(0, handler.indexOf("};"))).not.toMatch(/^\s*segRenderTick\+\+/m);
+  });
 });
