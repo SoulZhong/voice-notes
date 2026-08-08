@@ -168,10 +168,15 @@ pub fn mixed_untrusted(meta: &AudioMeta) -> Option<String> {
     let Some(mixed) = meta.tracks.get("mixed") else {
         return Some("没有成品轨(mixed)产物".into());
     };
-    let Some(dur) = mixed.duration_ms.or_else(|| {
-        // 未转码的 mixed.wav 没有实测 duration_ms:退而用 sync.track_ms(录制期对账值)
-        mixed.sync.as_ref().map(|s| s.track_ms)
-    }) else {
+    let Some(dur) = mixed
+        .duration_ms
+        // 未转码的 mixed.wav 没有实测 duration_ms:退而用 sync.track_ms(录制期对账值)。
+        // 但 mixed 实际从不落 sync(record_sync 只遍历 mic/system 的 health),这条
+        // 回退保留只为向后兼容口径;真正兜住未转码场景的是第三读数 mix.track_ms
+        // (二期起定稿即写,Windows 无转码路径全靠它)。
+        .or_else(|| mixed.sync.as_ref().map(|s| s.track_ms))
+        .or_else(|| mixed.mix.as_ref().map(|m| m.track_ms))
+    else {
         return Some("成品轨缺少时长读数,无法校验完整性".into());
     };
     let mut expected: Option<u64> = None;
@@ -236,6 +241,7 @@ mod tests {
     fn meta_with(mixed_dur: Option<u64>, mic_track: u64, sys_track: u64, sys_off: u64) -> AudioMeta {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         m.tracks.insert("mic".into(), TrackMeta { sync: Some(sync(mic_track)), ..Default::default() });
@@ -253,6 +259,21 @@ mod tests {
         assert_eq!(mixed_untrusted(&m), None);
     }
 
+    /// 未转码的 mixed.wav(Windows 恒如此;macOS 转码失败降级)没有 duration_ms,
+    /// mixed 又永远没有 sync(record_sync 只遍历 mic/system)——三期在这种笔记上
+    /// 恒判「缺少时长读数」。二期起 MixInfo.track_ms(定稿时量出)作第三读数来源。
+    #[test]
+    fn mix_info_track_ms_serves_as_duration_fallback() {
+        let mut m = meta_with(None, 60_000, 59_000, 1_200); // 无 duration_ms、无 sync
+        assert!(mixed_untrusted(&m).is_some(), "三读数全缺时必须拒");
+        m.tracks.get_mut("mixed").unwrap().mix = Some(crate::store::audio::MixInfo {
+            origin: "live".into(),
+            seek_offset_ms: Default::default(),
+            track_ms: 60_400, // 对账值 max(60000, 1200+59000)=60200,差 200ms ≤ 容限
+        });
+        assert_eq!(mixed_untrusted(&m), None, "有 MixInfo.track_ms 即可校验通过");
+    }
+
     /// 续录笔记(Fix 3,codex 第二轮):源轨 duration_ms 是整文件实测时长(跨全部场次),
     /// sync.track_ms 只是最后一场的净时长(set_track_sync 每场覆盖)。mixed 时长对齐
     /// 全长 duration_ms 时应判可信——若仍按 offset+sync.track_ms(只有末场)算终点,
@@ -261,6 +282,7 @@ mod tests {
     fn mixed_trusted_for_continued_recording_using_source_duration_ms() {
         let sync = |track_ms: u64| SyncInfo {
             wall_ms: track_ms, samples: 1, track_ms, drift_ms: 0, silence_ms: 0, gaps: 0, rate_fixes: 0,
+            first_frame_offset_ms: None,
         };
         let mut m = AudioMeta::default();
         // 两场录制,mic 全长 10_000ms,但 sync.track_ms 只留了最后一场的 3_000ms

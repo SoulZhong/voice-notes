@@ -319,7 +319,7 @@ fn commit_aligned(
 /// 它铺在 system 的本地时基上,但起点未必是 sys_local 0:mic 先开录时
 /// (mic_off < sys_off)起点是负的,`render_aligned` 已把那段渲进去,这里把 offset
 /// 相应前移,轨在**全局**时间轴上的起点仍是 mic 原来的起点。
-fn aligned_track_offset_ms(sys_off_ms: u64, map: &crate::player_align::TimeMap) -> u64 {
+pub(crate) fn aligned_track_offset_ms(sys_off_ms: u64, map: &crate::player_align::TimeMap) -> u64 {
     (sys_off_ms as i64 + crate::player_align::map_ms_signed(map, 0)).max(0) as u64
 }
 
