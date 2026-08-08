@@ -424,6 +424,26 @@ pub fn set_track_sync(note_dir: &Path, source: &str, info: SyncInfo) -> anyhow::
     save_audio_meta(note_dir, &meta)
 }
 
+/// 补生成前清掉 mixed 条目的过期读数(codec/duration/waveform/mix)并写新 offset:
+/// 旧 m4a 的 duration_ms/waveform 描述的是即将被替换的旧产物,留着会被
+/// track_info_for 优先采信;mix 标记描述的也是旧内容,新产物定稿后再由
+/// set_track_mix 重写。sync 不清:mixed 从不写 sync。
+pub fn reset_mixed_meta(note_dir: &Path, offset_ms: u64) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    meta.schema_version = 1;
+    let t = meta
+        .tracks
+        .entry(crate::pipeline::recording_sink::MIXED_TRACK.to_string())
+        .or_default();
+    t.offset_ms = offset_ms;
+    t.codec = None;
+    t.duration_ms = None;
+    t.waveform = None;
+    t.mix = None;
+    save_audio_meta(note_dir, &meta)
+}
+
 /// 写成品轨完整性标记(见 MixInfo)。只允许在定稿成功的唯一出口调用——放弃/回滚
 /// 路径写不到它正是它作为完整性证据的全部依据。
 pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Result<()> {

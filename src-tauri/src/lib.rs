@@ -144,6 +144,9 @@ struct AppState {
     /// 最近一次重转写的终态(跨任务保留,新任务开始不清、结束时覆盖):UDS/MCP 轮询方
     /// 靠它区分「完成」与「放弃/失败」——桌面事件是易失的,轮询面必须有可查终态。
     retranscribe_last: Arc<Mutex<Option<ipc::RetranscribeEvent>>>,
+    /// 补生成成品轨在跑任务(note_id)。单槽同 retranscribing 的理由:显式修复动作,
+    /// 静默排队会被当成卡死。与录制/重转写双向互斥(见 do_regenerate_mixed 守卫链)。
+    mixed_regen: Arc<Mutex<Option<String>>>,
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -165,6 +168,7 @@ impl Default for AppState {
             relation_backfill_run_id: Arc::new(Mutex::new(None)),
             retranscribing: Arc::new(Mutex::new(None)),
             retranscribe_last: Arc::new(Mutex::new(None)),
+            mixed_regen: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -846,6 +850,13 @@ pub(crate) fn retranscribe_blocks_recording(slot: &Mutex<Option<(String, String)
 /// （session 槽覆盖 stop 早期窗口：running 已假但会话槽还没清空的那一小段时间）。
 pub(crate) fn recording_blocks_retranscribe(running: &Mutex<bool>, session_active: bool) -> bool {
     *running.lock().unwrap_or_else(|e| e.into_inner()) || session_active
+}
+
+/// 补生成成品轨的占槽判定(纯函数,镜像 retranscribe_blocks_recording 形态)。
+/// 供三处互斥接线共用:do_regenerate_mixed 自身的槽占用拒、do_retranscribe 的
+/// 双向互查(重转写读旧 mixed 的同时补生成在原子替换它)、以及并发回归测试。
+pub(crate) fn mixed_regen_busy(slot: &Mutex<Option<String>>) -> bool {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 /// Aing↔重转写占槽后互查闭环的 A 侧（spawn_refine）判定：给定重转写槽当前值与
@@ -2185,6 +2196,12 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     if state.transcode.is_busy(&dir) {
         return Err(tr!("该笔记正在转码,稍后再试", "This note is being transcoded; try again later"));
     }
+    // 补生成互斥(二期):它会原子替换 mixed.wav 并改写 audio.json 的 mixed 条目,
+    // 与重转写(尤其 input=mixed 时读该轨)并发即读到新旧混合状态。快速失败 UX,
+    // 权威判定在占槽后(下方 Dekker 段)。
+    if mixed_regen_busy(&state.mixed_regen) {
+        return Err(tr!("正在补生成成品轨,稍后再试", "Mixed-track regeneration in progress; try again later"));
+    }
     if input == "mixed" {
         let meta = store::audio::load_audio_meta(&dir);
         if let Some(reason) = retranscribe::input::mixed_untrusted(&meta) {
@@ -2220,6 +2237,12 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
     if state.download_running.load(Ordering::SeqCst) {
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
+    }
+    // 补生成侧同款写后读(对侧在 do_regenerate_mixed 占槽后读本槽;两侧先写自己
+    // 再读对方,最坏双拒无害):
+    if mixed_regen_busy(&state.mixed_regen) {
+        *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Err(tr!("正在补生成成品轨,稍后再试", "Mixed-track regeneration in progress; try again later"));
     }
     // Fix 2(codex 第三轮,R 侧互查闭环——两处必须同步改,另一侧见 spawn_refine 里
     // 占槽复查那一段的同款注释):占槽之后复查 `is_refining(id)`。开头那次
@@ -2373,6 +2396,194 @@ fn mixed_input_status(app: AppHandle, id: String) -> Result<Option<String>, Stri
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
     let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
     Ok(retranscribe::input::mixed_untrusted(&store::audio::load_audio_meta(&dir)))
+}
+
+/// 离线补生成成品轨的守卫与启动(二期,spec §离线补生成)。守卫链照抄
+/// do_retranscribe 的顺序纪律(迁移/下载 → 录制快拒 → 重转写槽拒 → 双轨可用 →
+/// 转码中拒 → 占槽 → Dekker 写后读复查),差异两点并各有理由:
+/// - 不查 Aing:补生成只读源轨、只写 mixed.wav 与 audio.json(META_LOCK 内),
+///   与 Aing 的精修文本写面零交集;
+/// - 不要求 note complete:补生成不碰 segments,残局笔记(崩溃遗留)双轨俱在时
+///   照样能修——这正是"历史录音直接成为回归集"的目标场景。
+/// 录制侧不反查本槽:全局录制被本侧拒之门外后,录制期间新发起的补生成也进不来;
+/// 同一笔记的写冲突由 worker 全程持有的 NoteLock 兜底,别的笔记录制与本任务无盘面交集。
+pub(crate) fn do_regenerate_mixed(app: &AppHandle, id: &str) -> Result<(), String> {
+    store::validate_note_id(id).map_err(|e| e.to_string())?;
+    let state: tauri::State<AppState> = app.state();
+    if state.download_running.load(Ordering::SeqCst) {
+        return Err(tr!("正在迁移或下载,稍后再试", "Migration or download in progress; try again later"));
+    }
+    // session 读独立成句:锁序纪律同 do_retranscribe(ABBA 环,见那边注释)。
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active) {
+        return Err(tr!("录制中不能补生成成品轨,请先停止录制", "Cannot regenerate the mixed track while recording"));
+    }
+    if retranscribe_blocks_recording(&state.retranscribing) {
+        return Err(tr!("重转写进行中,稍后再试", "Re-transcription in progress; try again later"));
+    }
+    let dir = notes_dir(app).map_err(|e| e.to_string())?.join(id);
+    let meta = store::audio::load_audio_meta(&dir);
+    for src in ["mic", "system"] {
+        let present = dir.join(format!("{src}.wav")).is_file() || dir.join(format!("{src}.m4a")).is_file();
+        if !present {
+            let _ = meta; // meta 仅用于未来扩展校验;文件在场性是硬判据
+            return Err(tr!(
+                "需要 mic 与 system 双轨才能补生成成品轨(缺 {src})",
+                "Regenerating requires both mic and system tracks (missing {src})", src = src
+            ));
+        }
+    }
+    // 转码互斥理由同 do_retranscribe:worker 会把 wav 编码后删除,离线读盘有踩踏窗口。
+    if state.transcode.is_busy(&dir) {
+        return Err(tr!("该笔记正在转码,稍后再试", "This note is being transcoded; try again later"));
+    }
+    {
+        let mut slot = state.mixed_regen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = slot.as_ref() {
+            return Err(tr!(
+                "已有补生成任务在进行({running}),请等它完成",
+                "A mixed-track regeneration is already running ({running})", running = running
+            ));
+        }
+        *slot = Some(id.to_string());
+    }
+    // Dekker 写后读(占槽之后复查对侧;两侧都是"先写自己、再读对方",不可能同时穿关):
+    let session_active = state.session.lock().unwrap().is_some();
+    if recording_blocks_retranscribe(&state.running, session_active)
+        || state.download_running.load(Ordering::SeqCst)
+        || retranscribe_blocks_recording(&state.retranscribing)
+    {
+        *state.mixed_regen.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Err(tr!("状态刚发生变化(录制/迁移/重转写),稍后再试", "State just changed (recording/migration/re-transcription); try again later"));
+    }
+    spawn_mixed_regen(app.clone(), id.to_string());
+    Ok(())
+}
+
+/// 补生成后台线程:catch_unwind 兜 panic;NoteLock 全程持有;终态 emit 之后清槽
+/// (Fix 3 同款顺序:槽空时事件必已送达)。
+fn spawn_mixed_regen(app: tauri::AppHandle, note_id: String) {
+    let slot = app.state::<AppState>().mixed_regen.clone();
+    let transcode = app.state::<AppState>().transcode.clone();
+    std::thread::spawn(move || {
+        let emit = |stage: &str, state: &str, message: Option<String>| {
+            let _ = app.emit("mixed_regen", ipc::MixedRegenEvent {
+                note_id: note_id.clone(), stage: stage.into(), state: state.into(), message,
+            });
+        };
+        emit("mix", "running", None);
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+            let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+            let _lock = store::notelock::NoteLock::acquire(&dir)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| tr!(
+                    "笔记正被占用(录制/编辑中),稍后再试",
+                    "The note is busy (recording or being edited); try again later"
+                ))?;
+            store::mix_regen::regen_note_dir(&dir).map_err(|e| e.to_string())?;
+            // macOS 转码出 m4a + 实测 duration;非 macOS 队列 worker 空跑,无副作用。
+            transcode.enqueue(dir);
+            Ok(())
+        }));
+        match body {
+            Ok(Ok(())) => emit("finish", "ok", None),
+            Ok(Err(e)) => {
+                eprintln!("补生成失败({note_id}): {e}");
+                emit("finish", "error", Some(e));
+            }
+            Err(_) => {
+                eprintln!("补生成 panic({note_id})");
+                emit("finish", "error", Some(tr!("内部错误(见日志)", "Internal error (see logs)")));
+            }
+        }
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    });
+}
+
+#[tauri::command]
+fn regenerate_mixed(app: AppHandle, id: String) -> Result<(), String> {
+    do_regenerate_mixed(&app, &id)
+}
+
+#[tauri::command]
+fn mixed_regen_status(state: State<AppState>) -> Option<String> {
+    state.mixed_regen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 回放消费侧一站式读数(二期,详情页 A/B 切换用)。
+#[derive(Debug, serde::Serialize)]
+pub struct MixedPlaybackInfo {
+    /// None = 无成品轨(前端给「生成成品轨」动作)。
+    track: Option<store::audio::TrackInfo>,
+    /// Some(原因) = 有轨但不可信(置灰 + tooltip;消费前校验是 spec §错误处理的硬要求)。
+    untrusted: Option<String>,
+    /// 各源段落 seek 到 mixed 的修正量(ms)。空表 = 无需修正(regen 轨按 offset
+    /// 定位;一期旧轨无标记,按 0 容忍偏移)。
+    seek_offset_ms: std::collections::BTreeMap<String, u64>,
+    /// mic 轨带离线清洗记录:A 侧比 B 侧多一级回声抑制,听感不可直比
+    /// (spec §对照条件 选项 1 的判据落进 UI)。
+    ab_caveat: bool,
+}
+
+/// 读数拼装抽成纯函数:命令壳只做 dir 解析与懒回填,这里的口径规则全部可单测。
+fn assemble_mixed_playback(
+    meta: &store::audio::AudioMeta,
+    track: Option<store::audio::TrackInfo>,
+) -> MixedPlaybackInfo {
+    let untrusted = if track.is_some() {
+        retranscribe::input::mixed_untrusted(meta)
+    } else {
+        None
+    };
+    let seek_offset_ms = meta
+        .tracks
+        .get(pipeline::recording_sink::MIXED_TRACK)
+        .and_then(|t| t.mix.as_ref())
+        .map(|m| m.seek_offset_ms.clone())
+        .unwrap_or_default();
+    let ab_caveat = meta.tracks.get("mic").map(|t| t.clean.is_some()).unwrap_or(false);
+    MixedPlaybackInfo { track, untrusted, seek_offset_ms, ab_caveat }
+}
+
+#[tauri::command]
+fn mixed_playback_info(app: AppHandle, id: String) -> Result<MixedPlaybackInfo, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let note_dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    if !note_dir.is_dir() {
+        return Err(tr!("笔记不存在: {id}", "Note not found: {id}"));
+    }
+    let meta = store::audio::load_audio_meta(&note_dir);
+    let track = store::audio::mixed_track(&note_dir);
+    // 波形懒回填:note_audio_info 的回填循环遍历 list_tracks(),mixed 被过滤在外
+    // (spec §存储 点名二期自行触发)。样板与那边一致:in-flight 去重、后台线程、
+    // 完成发 transcode_done 复用详情页既有刷新链。仅未转码 WAV 需要——m4a 的波形
+    // 在转码期已预计算。
+    if let Some(t) = &track {
+        if t.waveform.is_none() && t.path.ends_with(".wav") {
+            static INFLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+            let key = format!("{id}/mixed");
+            let claimed = {
+                let mut g = INFLIGHT.lock().unwrap();
+                g.get_or_insert_with(Default::default).insert(key.clone())
+            };
+            if claimed {
+                let (app, note_dir, note_id) = (app.clone(), note_dir.clone(), id.clone());
+                std::thread::spawn(move || {
+                    match store::audio::backfill_wav_waveform(
+                        &note_dir,
+                        pipeline::recording_sink::MIXED_TRACK,
+                    ) {
+                        Ok(()) => {
+                            let _ = app.emit("transcode_done", ipc::TranscodeEvent { note_id });
+                        }
+                        Err(e) => eprintln!("mixed 波形回填失败({note_id}),维持段落包络: {e}"),
+                    }
+                    INFLIGHT.lock().unwrap().as_mut().map(|s| s.remove(&key));
+                });
+            }
+        }
+    }
+    Ok(assemble_mixed_playback(&meta, track))
 }
 
 fn relation_backfill_settings(app: &AppHandle) -> Result<settings::Settings, String> {
@@ -6577,6 +6788,9 @@ pub fn run() {
             undo_identify_apply,
             get_refined,
             retranscribe_note,
+            regenerate_mixed,
+            mixed_regen_status,
+            mixed_playback_info,
             retranscribe_status,
             mixed_input_status,
             save_refined,
@@ -7770,6 +7984,50 @@ mod tests {
         drop(tx_go_r);
         h_s.join().unwrap();
         h_r.join().unwrap();
+    }
+
+    /// mixed_playback_info 的读数拼装:轨在+对账过 → untrusted None;seek 表从
+    /// MixInfo 原样透传;mic 带 clean → ab_caveat(A 侧多一级清洗,不可直比)。
+    #[test]
+    fn mixed_playback_assembly_rules() {
+        use crate::store::audio::{AudioMeta, CleanInfo, MixInfo, TrackInfo, TrackMeta};
+        let mut meta = AudioMeta::default();
+        meta.tracks.insert("mic".into(), TrackMeta {
+            duration_ms: Some(1000),
+            clean: Some(CleanInfo { delay_ms: 120, confidence: 0.9, segments: 3, neural: Some(false) }),
+            ..Default::default()
+        });
+        meta.tracks.insert("mixed".into(), TrackMeta {
+            mix: Some(MixInfo {
+                origin: "live".into(),
+                seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
+                track_ms: 1000,
+            }),
+            ..Default::default()
+        });
+        let track = Some(TrackInfo {
+            source: "mixed".into(), path: "mixed.wav".into(),
+            offset_ms: 0, duration_ms: 1000, waveform: None,
+        });
+        let info = super::assemble_mixed_playback(&meta, track);
+        assert!(info.untrusted.is_none(), "对账一致应可信: {:?}", info.untrusted);
+        assert_eq!(info.seek_offset_ms.get("system"), Some(&120));
+        assert!(info.ab_caveat, "mic 带 clean 记录必须亮不可直比告警");
+        // 无轨:untrusted 不给原因(前端走「生成」动作,不是「不可信」态)。
+        let none = super::assemble_mixed_playback(&meta, None);
+        assert!(none.track.is_none() && none.untrusted.is_none());
+    }
+
+    /// 补生成占槽判定(纯函数):占了就 busy,清了就不 busy。与录制/重转写的
+    /// 互斥接线依赖这一判定(双向 Dekker 写后读,证明同上方 S/R 侧)。
+    #[test]
+    fn mixed_regen_slot_blocks_and_clears() {
+        let slot: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        assert!(!super::mixed_regen_busy(&slot));
+        *slot.lock().unwrap() = Some("n1".into());
+        assert!(super::mixed_regen_busy(&slot));
+        *slot.lock().unwrap() = None;
+        assert!(!super::mixed_regen_busy(&slot));
     }
 }
 
