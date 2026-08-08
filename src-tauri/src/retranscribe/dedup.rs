@@ -3,6 +3,7 @@
 //! 大多已无回声,此层是兜底不是主力(spec §管线)。判中弃 mic 侧:system 路是
 //! 数字信号原文,mic 路的重复必是声学回灌。
 
+use crate::player_gate::GateSpan;
 use crate::session::{overlap_fraction, text_similarity};
 
 /// 时间重叠占比下限。`overlap_fraction` 的分母是第一个参数(此处即 mic 段)自身
@@ -58,6 +59,31 @@ pub fn echo_discards(segs: &[DedupSeg]) -> Vec<usize> {
         }
     }
     out
+}
+
+/// 电平门覆盖率阈值:mic 段落在压低区间内的时长占比 ≥ 此值即弃。初值 0.6:
+/// 压低区间经 300ms 合并 + 200ms 短区丢弃,粒度粗于段,阈值过高会漏(单测锁死,
+/// 沙箱实测校准)。
+pub const GATE_COVER_MIN: f32 = 0.6;
+
+/// mic 段在 spans(时间轴样本域,player_gate::build_gate_from_pcm 产出)内的覆盖
+/// 占比。纯函数:段 [start_ms*16, end_ms*16) 与各 span 求交集样本和 / 段长。依赖
+/// spans 有序不重叠——player_gate 的合并逻辑保证这一点,此处不再重新排序/去重。
+pub fn gate_coverage(spans: &[GateSpan], start_ms: u64, end_ms: u64) -> f32 {
+    let seg_start = start_ms * 16;
+    let seg_end = end_ms * 16;
+    if seg_end <= seg_start {
+        return 0.0;
+    }
+    let covered: u64 = spans
+        .iter()
+        .map(|sp| {
+            let lo = sp.start.max(seg_start);
+            let hi = sp.end.min(seg_end);
+            hi.saturating_sub(lo)
+        })
+        .sum();
+    covered as f32 / (seg_end - seg_start) as f32
 }
 
 #[cfg(test)]
@@ -134,5 +160,45 @@ mod tests {
             seg("mic", 1200, 5200, "识别失败"),
         ];
         assert!(echo_discards(&sys_placeholder).is_empty());
+    }
+
+    fn span(start_ms: u64, end_ms: u64) -> GateSpan {
+        GateSpan { start: start_ms * 16, end: end_ms * 16 }
+    }
+
+    /// 空 spans → 覆盖率恒 0(与 player_gate 降级口径一致:门不开就不弃)。
+    #[test]
+    fn gate_coverage_empty_spans_is_zero() {
+        assert_eq!(gate_coverage(&[], 1000, 2000), 0.0);
+    }
+
+    /// 段完全落在单个 span 内 → 覆盖率 1。
+    #[test]
+    fn gate_coverage_full_overlap_is_one() {
+        let spans = [span(500, 3000)];
+        assert_eq!(gate_coverage(&spans, 1000, 2000), 1.0);
+    }
+
+    /// 段一半落在 span 内 → 覆盖率 0.5。
+    #[test]
+    fn gate_coverage_half_overlap_is_half() {
+        let spans = [span(1000, 1500)];
+        assert_eq!(gate_coverage(&spans, 1000, 2000), 0.5);
+    }
+
+    /// 段跨多个不相邻 span,覆盖率为各交集之和 / 段长。
+    #[test]
+    fn gate_coverage_sums_across_multiple_spans() {
+        // 段 [1000,2000)(长 1000ms),span1 覆盖 [1000,1300)=300ms,span2 覆盖
+        // [1700,2000)=300ms,中间 [1300,1700) 不覆盖 → 合计 600/1000=0.6。
+        let spans = [span(1000, 1300), span(1700, 2000)];
+        assert_eq!(gate_coverage(&spans, 1000, 2000), 0.6);
+    }
+
+    /// 零长段(start_ms == end_ms)防 0 除,返回 0 而非 NaN/panic。
+    #[test]
+    fn gate_coverage_zero_length_segment_is_zero() {
+        let spans = [span(500, 3000)];
+        assert_eq!(gate_coverage(&spans, 1500, 1500), 0.0);
     }
 }

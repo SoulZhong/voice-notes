@@ -17,6 +17,14 @@ pub struct PendingSegment {
 /// 差别只在读哪些轨、source 标什么。
 pub trait TranscribeInput {
     fn segments(&mut self) -> anyhow::Result<Vec<PendingSegment>>;
+
+    /// mic 轨的电平交叉门压低区间(player_gate::GateSpan,时间轴 16k 样本域)。
+    /// 仅双轨入口(DualTrackInput)在 segments() 调用之后可用——mic/system 两轨
+    /// 都存在时才有交叉可比,单轨(MixedInput、缺一轨的双轨笔记)默认空表降级=
+    /// 不开门,与 player_gate 自身"任一轨读不出即空表"的降级口径一致。
+    fn mic_gate_spans(&self) -> Vec<crate::player_gate::GateSpan> {
+        Vec::new()
+    }
 }
 
 /// 每轨喂 VAD 的块长(200ms @16k)。逐块喂并逐块排空 take_finished:VAD 内部环形
@@ -51,15 +59,23 @@ pub fn collect_track_segments(
 pub type SegmenterFactory = Box<dyn Fn() -> anyhow::Result<Box<dyn Segmenter>> + Send>;
 
 /// 双轨入口:mic/system 各自解码切段,Source 保真。轨缺失跳过(单轨笔记合法),
-/// 两轨全缺才报错。逐轨串行加载,任意时刻至多一轨全场 PCM 常驻(照 refine::embed_all)。
+/// 两轨全缺才报错。
+///
+/// 内存口径(2026-08 电平交叉门接入后有变化):切段阶段仍是逐轨串行——本轨切完
+/// 段就不再需要它的 PCM;但两轨都存在时,门控(build_gate_from_pcm)需要两条
+/// 全场 PCM 同时在手才能逐帧比电平,故本实现把两轨 PCM 暂存到 segments() 返回
+/// 前才释放,峰值内存两轨并存(不再是"至多一轨常驻")。这与 player_gate 自身
+/// mmap 两条 canonical WAV 的量级一致,且只发生在重转写这种一次性离线任务里,
+/// 已被接受(不是回放热路径的常驻开销)。
 pub struct DualTrackInput {
     note_dir: PathBuf,
     make_segmenter: SegmenterFactory,
+    gate_spans: Vec<crate::player_gate::GateSpan>,
 }
 
 impl DualTrackInput {
     pub fn new(note_dir: PathBuf, make_segmenter: SegmenterFactory) -> Self {
-        Self { note_dir, make_segmenter }
+        Self { note_dir, make_segmenter, gate_spans: Vec::new() }
     }
 }
 
@@ -68,6 +84,10 @@ impl TranscribeInput for DualTrackInput {
         let meta = crate::store::audio::load_audio_meta(&self.note_dir);
         let mut out = Vec::new();
         let mut found = false;
+        // 暂存两轨的 (offset_ms, PCM),供切段循环结束后计算门控用;单轨笔记里
+        // 缺的那一路始终是 None,门控随即降级为空表(见下方 if let)。
+        let mut mic_track: Option<(u64, Vec<f32>)> = None;
+        let mut sys_track: Option<(u64, Vec<f32>)> = None;
         for source in ["mic", "system"] {
             // 「轨不存在」与「轨存在但解码失败」不是同一件事,不能同等 continue:
             // m4a 损坏、或转码 worker 恰在删 wav 的窗口撞上,都会让 track_pcm 返回 Err，
@@ -87,11 +107,24 @@ impl TranscribeInput for DualTrackInput {
             let offset_ms = meta.tracks.get(source).map(|t| t.offset_ms).unwrap_or(0);
             let mut seg = (self.make_segmenter)()?;
             out.extend(collect_track_segments(&pcm, offset_ms, source, seg.as_mut()));
+            match source {
+                "mic" => mic_track = Some((offset_ms, pcm)),
+                "system" => sys_track = Some((offset_ms, pcm)),
+                _ => unreachable!("循环只枚举 mic/system"),
+            }
         }
         if !found {
             anyhow::bail!("mic/system 音轨均不可读,无法重转写");
         }
+        if let (Some((mic_off, mic_pcm)), Some((sys_off, sys_pcm))) = (&mic_track, &sys_track) {
+            self.gate_spans =
+                crate::player_gate::build_gate_from_pcm(mic_pcm, *mic_off, sys_pcm, *sys_off);
+        }
         Ok(out)
+    }
+
+    fn mic_gate_spans(&self) -> Vec<crate::player_gate::GateSpan> {
+        self.gate_spans.clone()
     }
 }
 

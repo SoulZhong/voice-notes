@@ -136,6 +136,11 @@ pub fn run(
     }
 
     // 双轨模式下跨轨回声去重;混音(mixed)只有一条轨,无跨轨可比,天然跳过。
+    // 文本门(echo_discards)抓「转写得清楚的回声」——回声与近端同源,识别出的
+    // 文字自然跟 system 段高度相似;电平门(下方 gate_coverage)抓文本门的盲区:
+    // 离线清洗后残留、电平已经很低但仍响到能触发 VAD 出段的回声乱码——沙箱实测
+    // 53/73 个受污染 mic 段属此类,识别结果本就是乱码,与 system 原文相似度低到
+    // 文本门抓不住(中位 0.15)。两门判据独立、互不替代,都只弃 mic 侧。
     if !mixed {
         let view: Vec<dedup::DedupSeg> = recs
             .iter()
@@ -155,6 +160,19 @@ pub fn run(
             .filter(|(i, _)| !dropset.contains(i))
             .map(|(_, r)| r)
             .collect();
+    }
+
+    // 电平交叉门:input.segments() 已在 decode 阶段跑过双轨解码,mic_gate_spans()
+    // 此刻可用(单轨入口/单轨笔记默认空表,自然跳过——与 player_gate 降级口径
+    // 一致)。落在压低区间内占比 ≥ GATE_COVER_MIN 的 mic 段视为清洗后残影,弃用。
+    let spans = input.mic_gate_spans();
+    if !spans.is_empty() {
+        let before = recs.len();
+        recs.retain(|r| {
+            r.source != "mic"
+                || dedup::gate_coverage(&spans, r.start_ms, r.end_ms) < dedup::GATE_COVER_MIN
+        });
+        summary.echo_dropped += before - recs.len();
     }
 
     progress("attribute");
@@ -310,6 +328,56 @@ mod tests {
         assert_eq!((summary.new_segments, summary.echo_dropped), (1, 1));
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("\"system\"") && !text.contains("\"mic\""));
+    }
+
+    /// TestInput:段固定不依赖 segments() 之外的状态,mic_gate_spans() 恒返回构造好
+    /// 的 spans——模拟 DualTrackInput 在 segments() 之后已算好门控区间的状态。
+    struct GateStubInput {
+        segs: Vec<PendingSegment>,
+        spans: Vec<crate::player_gate::GateSpan>,
+    }
+    impl TranscribeInput for GateStubInput {
+        fn segments(&mut self) -> anyhow::Result<Vec<PendingSegment>> {
+            Ok(std::mem::take(&mut self.segs))
+        }
+        fn mic_gate_spans(&self) -> Vec<crate::player_gate::GateSpan> {
+            self.spans.clone()
+        }
+    }
+
+    /// 电平交叉门进编排:两段 mic(一段落在压低区间内 0.9 覆盖,一段仅 0.2 覆盖)+
+    /// 一段 system(远离两段 mic 的时间轴、文本也不同,不触发文本门)——断言只有
+    /// 高覆盖 mic 段被弃,echo_dropped 计数正确,低覆盖段与 system 段都保留。
+    #[test]
+    fn run_drops_mic_segment_covered_by_level_gate() {
+        let dir = note_dir_with_old();
+        let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
+        // mic 段 A: [10_000, 11_000)ms,900ms 落在 span [10_000,10_900) 内 → 覆盖 0.9
+        // mic 段 B: [20_000, 21_000)ms,只有 200ms 落在 span [20_000,20_200) 内 → 覆盖 0.2
+        // system 段与两段 mic 时间不重叠、文本各异,不会被文本门 echo_discards 命中，
+        // 隔离出电平门单独生效的场景。
+        let mut input = GateStubInput {
+            segs: vec![
+                pending("mic", 10_000, 16_000),
+                pending("mic", 20_000, 16_000),
+                pending("system", 50_000, 16_000),
+            ],
+            spans: vec![
+                crate::player_gate::GateSpan { start: 10_000 * 16, end: 10_900 * 16 },
+                crate::player_gate::GateSpan { start: 20_000 * 16, end: 20_200 * 16 },
+            ],
+        };
+        let mut rec = LenRecognizer { fail_len: None };
+        let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
+        let summary =
+            run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, &mut |_| {})
+                .unwrap();
+        assert_eq!(summary.echo_dropped, 1, "只有高覆盖(0.9)的 mic 段应被电平门弃用");
+        assert_eq!(summary.new_segments, 2, "低覆盖 mic 段与 system 段都应保留");
+        let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("\"start_ms\":20000"), "低覆盖 mic 段应保留");
+        assert!(text.contains("\"source\":\"system\""), "system 段应保留");
     }
 
     /// 空外语段丢弃:日语标签段不落盘(与实时链路同口径)。
