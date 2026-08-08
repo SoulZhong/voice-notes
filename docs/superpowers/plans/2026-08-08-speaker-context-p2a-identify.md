@@ -2,475 +2,429 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 落地 spec P2a:refine 管线新增 identify 阶段(LLM 用会议文本推断「R 簇→真实身份」),经程序侧四道裁决后**只出建议卡/报告,零自动写入**;建议卡进整理收件箱,人工确认后落地关联并经 P1 的 feedback 链路回灌质心;每场推断结果落 identify.json,为 P2b 开闸积累评测样本。
+rev2:消化 Codex 计划审查(22 P1 + 18 P2)。骨架级修正:① **identify 移到精修完成之后**运行(证据锚定最终正文,source_hash 不再被精修立即作废;spec 的"identify 在 llm 前"连同其收益一起推迟到 P2b 自动应用时重估);② **放弃 `RefineStages.identify` 字段**——P2a 状态唯一事实源是「identify.json 是否存在且新鲜」,消掉双事实源与 stage 落盘时序问题;③ **簇指纹取自最终 RefinedDoc**(按 R 分组 source_seqs),ClusterStat 仅供质心且**按信道分开导出**;④ 门禁复用 `refine_llm_ready` 全套(绝不绕过用户关闭精修的授权);⑤ apply 并发用「锁外 assign + 前后两段锁内校验/置位」+ 命令级串行门,不嵌套 NoteLock;⑥ 拒绝键 = 指纹+目标身份(拒绝"是张伟"不封杀该簇的其它候选)。
 
-**Architecture:** recluster 增导出簇统计(质心/时长/成员 seq/信道分布);新模块 `refine/identify.rs` 承载输入打包(候选 Top-K 召回 + 轻量人名预筛采样)、输出解析与四道裁决(逐字区间校验/冲突/声学门/分档)。执行体仿 `RelationExecutor` 模式建 `IdentifyExecutor` trait,P2a 先交付 HTTP 实现(Agent 实现独立成尾部任务,可拆后续 PR)。产物落笔记目录 `identify.json`(绑 revision+source_hash+簇指纹,状态机 suggested/applied/rejected);挂进 `spawn_refine` 于 run_local 之后。IPC 三条(列建议/确认/拒绝)+ 触发重试 `identify_note`;MCP 只读工具返回最近推断结果。前端收件箱加 `identify` 卡片类型。
+**Goal:** refine 管线在精修完成后新增 identify 推断(LLM 用会议文本推断「R 簇→真实身份」),经程序侧裁决后**只出建议卡,零自动写入**;人工确认走既有 assign+P1 回灌链路;identify.json 为 P2b 积累评测样本。
 
-**Tech Stack:** Rust(Tauri 2)+ SvelteKit;无新 crate 依赖(sha2/hex/serde 已有)。
+**Architecture:** recluster 导出按信道分组的簇质心;新模块 `refine/identify.rs`:输入打包(候选三路召回+轻量采样)、`IdentifyExecutor` trait(P2a 交付 HTTP 实现)、输出宽松解析、五道裁决、identify.json 读写。挂进 `spawn_refine` 尾部(精修成功后);手动重试 `identify_note` 复用 P1 `feedback::build_source_stats` 重建簇质心。IPC 三条 + MCP 只读工具;前端收件箱加 identify 卡。
+
+**Tech Stack:** Rust(Tauri 2)+ SvelteKit;无新 crate(sha2/hex/serde 已有,bin 可直接依赖 sha2)。
 
 **Spec:** `docs/superpowers/specs/2026-08-08-speaker-context-inference-design.md`(rev2)
-**基线:** 分支 `feat/speaker-context-p2a`,叠在 `feat/speaker-context-p1`(PR #79)之上——复用 feedback 回灌与 speaker_eval。
+**基线:** 分支 `feat/speaker-context-p2a` 叠在 `feat/speaker-context-p1`(PR #79)上。
 
 ## Global Constraints
 
-- **零自动写入**:P2a 一切 identify 结论只落 identify.json + 建议卡;唯一落地路径是用户点确认(`apply_identify_suggestion`)。
-- identify 失败绝不阻塞 Aing 其余阶段:`RefineStages.identify` 独立置值(off/running/done/failed/skipped),报错只写 stage + ailog。
-- 与 spec 的三处**有意收窄**(实现时保持,并已在本计划各任务注明):① P2a 的拒绝/状态记录内嵌 identify.json(绑簇指纹),独立 identify_journal 推迟到 P2b 自动应用需要 intent 补偿时再建;② 声学门 P2a 用同信道裸余弦 ≥ `SEED_ASSIGN_THRESHOLD`(0.68)正向确认,AS-Norm z 通道推迟到 P2b 调优(P2a 全员建议卡,声学门只影响档位记录);③ MCP 工具返回**最近一次已落盘的推断结果**(只读),重新推断入口是 IPC `identify_note`。
-- 模型门禁沿用:`voiceprints.embedding_model != settings.speaker_model` 时声学门直接判「无声学确认」(不碰质心比较),文本档位照常。
-- 新 serde 字段一律 `#[serde(default)]`;`RefineStages` 结构体字面量构造点全量修复(已知:`refine/mod.rs:289,758` + `refine/mod.rs` 测试 1547/1587 + `store/refined.rs` 测试 1009/1160/1374/1522 附近,以编译器报错为准)。
-- **不跑全量 `cargo fmt`**(仓库非 rustfmt 全量干净);新文件可单独 `rustfmt src-tauri/src/refine/identify.rs`。
-- 新增 MCP 工具必须同步更新 `mcp/server.rs` 三处工具计数断言(L489/L564/L584 附近);新增 IPC 命令留意 `lib.rs:5868-5872`、`lib.rs:5990-5994` 两处解析 invoke_handler 源码文本的测试。
-- 每任务收尾:`cd src-tauri && cargo test --lib <过滤>`,提交;文案 `tr!("中文","English")` 双语。
+- **零自动写入**;唯一落地路径 `apply_identify_suggestion`(人工)。
+- **门禁**:identify 只在 `refine_llm_ready(&settings)` 为真(用户开启精修+HTTP 配置齐全)时运行;agent provider 或精修关闭 → 不跑、无痕。手动 `identify_note` 同一门禁。模型门禁(`vp.embedding_model != settings.speaker_model`)时:**声学召回路与声学门都关闭**,只走时近召回+文本档(声学 None,最高 Medium)。
+- **状态模型**:无 RefineStages 改动。`identify.json` 携带生成时 `source_hash`;「新鲜」= 与当前稿 source_hash 相等;精修/编辑后旧文件即过期,由下一次 Aing 或手动 identify_note 覆盖。UI 事件:完成后 `emit("identify_done", note_id)`。
+- **与 spec 的收窄(P2a 有效)**:拒绝/状态内嵌 identify.json(独立 journal 推迟 P2b);声学门用同信道裸余弦 ≥0.68(AS-Norm 推迟 P2b);MCP 只读返回最近结果+stale 标志;identify 时机在精修后(spec 管线图的"identify 在 llm 前"推迟 P2b 重估)。
+- 裁决产物**不可变**:assignments 的 tier/evidence 生成后不再改;人工动作只改 `status` 字段(评测读原始 tier,不被人工决策污染)。
+- 嵌入并发:手动路径复用 P1 `FEEDBACK_GATE`;管线路径天然在 `AING_GATE` 内。
+- 新 MCP 工具:同步更新 server.rs 工具计数断言、**README 的 MCP 工具表**(`mcp_stdio` 测试校验 README 含全部注册工具)、`AGENT_TOOL_NAMES` **不动**(白名单计数断言不变)。
+- 新 IPC:留意 `lib.rs` 两处解析 invoke_handler 源码的测试(~5868/~5990)。
+- 前端:`tidyQueue.ts` 的 `itemIds` 等 **switch 全分支穷举**必须补 identify 支;`tidyQueue.test.ts` 及 `buildTidyQueue` 全部调用点同步更新;卡片文案接入现有 i18n 机制(看 `+page.svelte` 既有卡片的文案写法,同款处理;若现状即中文硬编码则跟随现状,不自创第二套)。
+- 不跑全量 `cargo fmt`;每任务 `cargo test --lib <过滤>` 后提交;`tr!` 双语用于后端用户可见文案。
 
 ---
 
-### Task 1: recluster 导出簇统计
+### Task 1: recluster 导出按信道分组的簇统计
 
 **Files:**
-- Modify: `src-tauri/src/refine/recluster.rs`(主函数签名 :61、输出段 :140-204、5 个单测 :229-278)
-- Modify: `src-tauri/src/refine/mod.rs:273-282`(唯一调用点)
+- Modify: `src-tauri/src/refine/recluster.rs`(:61 签名、:140-204 输出段、既有单测)
+- Modify: `src-tauri/src/refine/mod.rs`(调用点 :275 + 模块内所有直接调用 recluster/run_local 的测试,以编译错误为准)
 
 **Interfaces:**
-- Produces:
 
 ```rust
-/// 会后簇统计:identify 的声学输入。R 号与 Assignment 一致(时长降序编号)。
 #[derive(Debug, Clone)]
 pub struct ClusterStat {
-    pub speaker: String,                     // "R1"
-    pub centroid: Vec<f32>,                  // 单位向量(merge_centroid 已归一)
+    pub speaker: String,                          // "R1"(与 Assignment 同序同名)
+    /// 按信道分组的单位质心:成员段先按 source 分组,各组内已归一嵌入求均值再归一。
+    /// 跨信道混合质心没有声学意义(与库内按信道存质心同理),不导出。
+    pub centroids: BTreeMap<String, Vec<f32>>,
     pub total_ms: u64,
-    pub member_seqs: Vec<u64>,               // 升序;簇指纹的原料
-    pub sources: BTreeMap<String, u64>,      // 信道 -> 该信道时长 ms
-    pub seed: Option<(String, String, f32)>, // 命中的库种子 (person_id, name, cosine)
+    pub source_ms: BTreeMap<String, u64>,         // 信道 -> 时长
+    /// AHC 后、传播前的核心成员(仅调试参考;身份指纹一律取最终 doc,见 Task 3)。
+    pub core_seqs: Vec<u64>,
+    /// 最佳库种子近邻:(person_id, name, cosine, adopted)。adopted=命名被采纳(>=0.68)。
+    pub seed: Option<(String, String, f32, bool)>,
 }
 
 pub fn recluster(inputs: &[SegInput], embs: &[Option<Vec<f32>>], seeds: &[SeedCluster])
     -> (Vec<Assignment>, Vec<ClusterStat>);
 ```
 
-- [ ] **Step 1: 改签名与实现**。在 :140 排序后、:189 输出 Assignment 的同一循环里,同步产出 `ClusterStat`:`member_seqs` 取 `cl.members` 映射回 `inputs[i].seq` 后排序;`sources` 按成员段 `inputs[i].source` 累加各自时长;`seed` 取 :145-155 种子命名循环算出的最佳 `(person, name, sim)`(即便 `sim < 0.68` 未采纳命名,也把最佳值记进 stat 供裁决层参考——采纳与否由 `Assignment.person` 是否 Some 区分)。无簇路径(全场无嵌入)返回 `(assign, vec![])`。
-- [ ] **Step 2: 修调用点**:`refine/mod.rs:275` 改为 `let (assign, cluster_stats) = recluster::recluster(...)`,`cluster_stats` 暂以 `let _ =` 接住(Task 6 接线),fallback/None 两分支给 `vec![]`。
-- [ ] **Step 3: 修 5 个单测**(解构元组第 0 位),并新增一测:
+- [ ] **Step 1: 实现**。在输出循环(:140-204)同步构建:`centroids` 按成员 `inputs[i].source` 分组,组内把(已归一的)嵌入求均值后再归一;`source_ms` 同组累计时长;`seed` 记最佳近邻并带 adopted 标记。无簇路径返回 `(assign, vec![])`。
+- [ ] **Step 2: 调用点**:`mod.rs:275` 解构元组;fallback/None 分支给 `vec![]`;`run_local` 签名改 `-> anyhow::Result<(RefinedDoc, Vec<ClusterStat>)>`,`lib.rs::spawn_refine` 与 mod.rs 全部测试同步解构(测试数量以 `cargo check` 报错为准,不按行号清单)。
+- [ ] **Step 3: 新增单测**:
 
 ```rust
 #[test]
-fn recluster_exports_cluster_stats_with_sources_and_members() {
-    // 两段同簇(相同嵌入向量),一段 mic 一段 system:
-    // stats 应 1 簇、member_seqs=[0,1]、sources 两键各记各自时长。
+fn recluster_exports_per_source_centroids() {
+    // 同簇两段,一 mic 一 system,嵌入向量不同方向:
+    // centroids 必须两键、各自等于该信道段的单位向量,不得跨信道平均。
     let inputs = vec![seg_input(0, "mic", 0, 3000), seg_input(1, "system", 3000, 6000)];
-    let embs = vec![Some(unit(0)), Some(unit(0))];
-    let (assign, stats) = recluster(&inputs, &embs, &[]);
-    assert_eq!(assign.len(), 2);
+    let embs = vec![Some(unit(0)), Some(unit(1))];
+    let (_, stats) = recluster(&inputs, &embs, &[]);
     assert_eq!(stats.len(), 1);
-    assert_eq!(stats[0].member_seqs, vec![0, 1]);
-    assert_eq!(stats[0].sources["mic"], 3000);
-    assert_eq!(stats[0].sources["system"], 3000);
-    assert_eq!(stats[0].total_ms, 6000);
+    assert!((stats[0].centroids["mic"][0] - 1.0).abs() < 1e-5);
+    assert!((stats[0].centroids["system"][1] - 1.0).abs() < 1e-5);
+    assert_eq!(stats[0].source_ms["mic"], 3000);
 }
 ```
 
-(`seg_input`/`unit` 按本文件既有测试工厂写法;若无则新建同款。)
-- [ ] **Step 4**: `cargo test --lib recluster` 全绿;提交 `feat(recluster): 导出簇统计(质心/成员/信道分布/种子命中)供 identify 使用`。
+(注意 AHC_THRESHOLD=0.68:正交向量不会被合并——构造时用**同段强制同簇**的场景需 sim>=0.68,可给两向量 0.9 相似再断言分组;实现本测试时以"两段进同簇"为前提调整向量,保持断言精神:**分信道质心不混合**。)
+- [ ] **Step 4**: `cargo test --lib recluster` 全绿;提交 `feat(recluster): 导出分信道簇质心与种子近邻(adopted 标记)`。
 
 ---
 
-### Task 2: RefineStages.identify 字段
-
-**Files:**
-- Modify: `src-tauri/src/store/refined.rs:68-77` + 全部构造点
-
-- [ ] **Step 1**: `RefineStages` 加 `#[serde(default = "stage_off")] pub identify: String,`(放 recluster 与 llm 之间,与管线顺序一致)。
-- [ ] **Step 2**: `cargo check --lib 2>&1 | grep E0063` 列出全部缺字段构造点,逐个补 `identify: "off".into()`(`run_local` :289 处即初值 `"off"`)。
-- [ ] **Step 3**: 新增回归测试(refined.rs tests):旧 aing.json(无 identify 字段)反序列化后 `identify == "off"`:
-
-```rust
-#[test]
-fn stages_identify_defaults_to_off_for_legacy_docs() {
-    let legacy = r#"{"filter":"done","recluster":"done","llm":"off","entities":"off","relations":"off"}"#;
-    let s: RefineStages = serde_json::from_str(legacy).unwrap();
-    assert_eq!(s.identify, "off");
-}
-```
-
-- [ ] **Step 4**: `cargo test --lib` 全绿;提交 `feat(store): RefineStages 增 identify 阶段位(serde default 向后兼容)`。
-
----
-
-### Task 3: identify 输入打包(候选召回 + 采样 + 指纹)
+### Task 2: identify 输入打包(候选召回 + 采样 + 指纹)
 
 **Files:**
 - Create: `src-tauri/src/refine/identify.rs`(`refine/mod.rs` 加 `pub mod identify;`)
-- Modify: `src-tauri/src/feedback.rs`(`scope_key` 改 `pub(crate) fn seq_fingerprint(seqs: &BTreeSet<u64>) -> String` 并导出,feedback 内部改调它;identify 复用同一指纹算法,保证 P1 账本与 P2a 指纹口径一致)
+- Modify: `src-tauri/src/feedback.rs`(`scope_key` 更名 `pub(crate) fn seq_fingerprint(&BTreeSet<u64>) -> String` 导出,内部调用点同步)
 
 **Interfaces:**
-- Consumes: `RefinedDoc.paragraphs`、Task 1 `ClusterStat`、`Voiceprints`(people/redirects)、`crate::store::source_hash(&doc.paragraphs)`(agent.rs :658 同款)。
-- Produces:
 
 ```rust
-pub const MAX_CANDIDATES: usize = 30;      // 候选人上限(全量人名不进 prompt)
-pub const ACOUSTIC_TOP_K: usize = 10;      // 声学近邻召回
-pub const RECENT_TOP_K: usize = 10;        // last_seen 最近召回
-pub const SAMPLE_CHAR_BUDGET: usize = 6000; // 采样段落总字符预算
+pub const MAX_CANDIDATES: usize = 30;
+pub const ACOUSTIC_TOP_K_PER_CLUSTER: usize = 5;   // 每簇 Top-K 后取并集(全局 Top-K 会被单簇占满)
+pub const RECENT_TOP_K: usize = 10;
+pub const SAMPLE_CHAR_BUDGET: usize = 6000;
+pub const NAME_HIT_MIN_CHARS: usize = 2;           // 单字名不做 contains 召回(误命中海量)
 
+#[derive(Serialize)]
 pub struct Candidate { pub person_id: String, pub name: String }
 
-/// LLM 输入包:序列化后即 user prompt 的 JSON 主体。
+#[derive(Serialize)]
+pub struct ClusterBrief {
+    pub speaker: String, pub fingerprint: String,
+    pub total_ms: u64, pub dominant_source: String, pub mixed: bool, pub is_mic: bool,
+    pub linked: Option<(String, String)>,          // 已采纳关联 (person_id, name)
+}
+
+#[derive(Serialize)]
+pub struct SampledParagraph { pub paragraph_index: usize, pub speaker: String, pub text: String }
+
+#[derive(Serialize)]
 pub struct IdentifyContext {
     pub note_id: String,
-    pub revision: u64,
-    pub source_hash: String,
-    pub clusters: Vec<ClusterBrief>,   // 每簇:R号/时长/主信道/现有关联/指纹
+    pub revision: u64, pub source_hash: String,
+    pub clusters: Vec<ClusterBrief>,
     pub candidates: Vec<Candidate>,
-    pub sampled: Vec<SampledParagraph>, // {paragraph_index, speaker(R号), text}
+    pub sampled: Vec<SampledParagraph>,
 }
+
+/// 指纹口径与 P1 feedback 账本一致(sha256(LE seq 序列) 前 8 字节 hex)。
+pub fn cluster_fingerprint(seqs: &BTreeSet<u64>) -> String;   // 直接转发 feedback::seq_fingerprint
+
+/// 从最终稿重建每个 R 簇的成员 seq 集(source_seqs 并集)。指纹一律以此为准——
+/// recluster 的 core_seqs 不含无嵌入传播段,与最终稿不一致,绝不能当指纹。
+pub fn cluster_members_from_doc(doc: &RefinedDoc) -> BTreeMap<String, BTreeSet<u64>>;
 
 pub fn build_context(
     note_id: &str, doc: &RefinedDoc, stats: &[ClusterStat], vp: &Voiceprints,
+    acoustic_enabled: bool,                        // 模型门禁不一致时 false:关闭声学召回路
 ) -> IdentifyContext;
 ```
 
-- [ ] **Step 1: 写失败测试**(identify.rs 内):
+- [ ] **Step 1: 失败测试**(内部 helper 带参数化 K,常量只是默认值,测试可传小 K):
 
 ```rust
 #[test]
-fn candidates_come_from_acoustic_neighbors_recent_and_seed_hits() {
-    // 库 3 人:A(质心与簇0余弦最高)、B(last_seen 最近)、C(不相关且久远)。
-    // MAX_CANDIDATES 足够大时 A、B 必在候选,顺序 A(声学) 先于 B(时近)。
-    // C 在 K 收紧到 1+1 时被挤出。
+fn fingerprint_matches_feedback_and_members_come_from_doc() {
+    // doc 两个 R 段落(R1: seqs [0,1] 含无嵌入传播段;R2: [5]):
+    // cluster_members_from_doc 按 speaker 聚合;指纹与 feedback::seq_fingerprint 相等。
 }
-
 #[test]
-fn sampling_picks_name_hits_intro_patterns_and_cluster_openings() {
-    // 段落:簇 R1 开场段、含候选人名"张伟"的段、含"我是"句式的段、无关长段。
-    // 预算内前三者必入选,无关段在预算耗尽时被裁;总字符 <= SAMPLE_CHAR_BUDGET。
+fn candidates_per_cluster_topk_and_recent_union_dedup() {
+    // helper: recall_candidates(stats, vp, acoustic_enabled, k_acoustic, k_recent)
+    // 库 4 有名人 + 1 无名人:声学近邻按簇各取 top-k(不被单簇占满);
+    // last_seen 最近补齐;无名人绝不入候选;acoustic_enabled=false 时只剩时近路。
 }
-
 #[test]
-fn fingerprint_matches_feedback_scope_key_algorithm() {
-    let seqs: std::collections::BTreeSet<u64> = [3u64, 1, 2].into_iter().collect();
-    assert_eq!(cluster_fingerprint(&seqs), crate::feedback::seq_fingerprint(&seqs));
+fn sampling_dedups_and_respects_budget() {
+    // 同一段同时命中"开场+人名+自报句式"只入选一次;
+    // 预算收紧后低优先级段被裁,总字符 <= budget(截断段计截断后长度)。
 }
 ```
 
-- [ ] **Step 2: 实现**。要点(按 spec「输入打包与候选召回」):
-  - 候选三路召回取并集,去重后截 `MAX_CANDIDATES`:① 声学近邻:每簇质心 × 每人各信道主质心裸余弦,取全局 top `ACOUSTIC_TOP_K` 人(经 redirects 归一,只收有名人物——无名 P<n> 对起名无意义);② `last_seen` 降序 top `RECENT_TOP_K` 有名人物;③ recluster 种子命中人(`ClusterStat.seed`)无条件收入;
-  - 采样(**不依赖知识图谱**,spec 循环依赖修正):优先级 a) 每簇开场 2 段;b) 文本含任一候选人名的段;c) 自报句式正则命中段(`我是|我叫|这边是|我这边是`——用 `str::contains` 多模式即可,不引 regex crate);d) 簇切换边界前后各 1 段;按优先级填充至 `SAMPLE_CHAR_BUDGET`,超预算的段截前 200 字符;
-  - `ClusterBrief`:`{ speaker, fingerprint: cluster_fingerprint(&member_seqs), total_ms, dominant_source(时长最大信道), mixed(信道>1 且次信道占比>20%), linked: Option<(person_id,name)>(来自 Assignment/seed 采纳) }`;
-  - mic 先验:`dominant_source=="mic"` 的簇在 brief 里带 `is_mic: true`(prompt 告知「mic 簇大概率是『我』」)。
-- [ ] **Step 3**: `cargo test --lib identify::` 全绿;提交 `feat(identify): 输入打包——候选三路召回、轻量人名采样、簇指纹与 P1 账本同口径`。
+- [ ] **Step 2: 实现**。候选三路:① 声学(`acoustic_enabled` 时):每簇的 `centroids` 与每个有名人物同信道主质心裸余弦(维度不一致跳过、非有限值跳过),**每簇** top `ACOUSTIC_TOP_K_PER_CLUSTER` 取并集;② `last_seen` 降序 top `RECENT_TOP_K` 有名人物;③ `stat.seed` 中 **adopted==true** 的人。并集去重(经 redirects 归一)截 `MAX_CANDIDATES`。采样:优先级(每簇开场 2 段 → 含 ≥`NAME_HIT_MIN_CHARS` 字符候选人名的段 → 自报句式段(`我是/我叫/这边是/我这边是` 的 `contains`)→ 簇边界前后段),**BTreeSet<paragraph_index> 去重**,按优先级序填充,超预算段截前 200 字符且**按截断后长度计入预算**,预算耗尽即停。`ClusterBrief.linked` 只取 adopted 种子或段落既有 person_id。
+- [ ] **Step 3**: `cargo test --lib identify::` 全绿;提交 `feat(identify): 输入打包——分簇声学召回、去重采样、指纹取自最终稿`。
 
 ---
 
-### Task 4: 输出解析与四道裁决
+### Task 3: 输出宽松解析与五道裁决
 
 **Files:**
-- Modify: `src-tauri/src/refine/identify.rs`(追加)
+- Modify: `src-tauri/src/refine/identify.rs`
 
 **Interfaces:**
 
 ```rust
-/// LLM 原始输出(json_object 解析目标;宽松:坏条目跳过不拖垮整批)。
-#[derive(Deserialize)]
-pub struct RawIdentify { pub assignments: Vec<RawAssignment> }
-#[derive(Deserialize)]
 pub struct RawAssignment {
-    pub cluster: String,                    // "R2"
-    pub person_id: Option<String>,          // 库内已有人(二选一)
-    pub new_name: Option<String>,           // 新名字(二选一)
-    pub confidence: String,                 // high|medium|low(自报,仅参考)
-    pub evidence: Vec<RawIdentifyEvidence>,
-}
-#[derive(Deserialize)]
-pub struct RawIdentifyEvidence {
-    pub paragraph_index: usize,
-    pub start: usize, pub end: usize,       // Unicode scalar 半开区间
-    pub quote: String,
-    pub r#type: String,                     // self_intro|addressed_reply|third_person_exclusion|role_topic
+    pub cluster: String,
+    pub person_id: Option<String>, pub new_name: Option<String>,
+    pub confidence: String,
+    pub evidence: Vec<RawIdentifyEvidence>,        // {paragraph_index,start,end,quote,type}
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
+/// 宽松解析:整体先解成 Value,assignments 数组逐条 from_value,坏条目跳过并计数。
+pub fn parse_raw_identify(content: &str) -> anyhow::Result<(Vec<RawAssignment>, usize /*skipped*/)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tier { High, Medium, Low }
 
-/// 裁决产物(落盘用,Task 6 定义完整 IdentifyDoc)。
 pub struct Verdict {
     pub tier: Tier,
-    pub acoustic: Option<(String, f32)>,    // (信道, 与目标人同信道余弦)
-    pub reject_reason: Option<String>,      // Some = 该条被整条丢弃(不落建议)
+    pub acoustic: Option<(String, f32)>,
+    pub reject_reason: Option<&'static str>,       // Some = 整条丢弃
 }
 
 pub fn adjudicate(
-    raw: &RawAssignment, ctx: &IdentifyContext, doc: &RefinedDoc,
-    stats: &[ClusterStat], vp: &Voiceprints, model_gate_ok: bool,
-    taken: &BTreeMap<String, String>,       // 已裁决通过的 cluster -> person 键(冲突检测)
+    raw: &RawAssignment, doc: &RefinedDoc, members: &BTreeMap<String, BTreeSet<u64>>,
+    stats: &[ClusterStat], vp: &Voiceprints, acoustic_enabled: bool,
+    taken: &BTreeMap<String, String>,
 ) -> Verdict;
 ```
 
-- [ ] **Step 1: 写失败测试**(每关一测):
+- [ ] **Step 1: 失败测试**(逐关):
 
 ```rust
-#[test]
-fn evidence_quote_and_range_must_match_paragraph_text() {
-    // 区间校验:doc.paragraphs[i].text 的 char 区间子串必须逐字等于 quote;
-    // 越界/不等 → reject_reason=Some("evidence-mismatch")。
+#[test] fn parse_skips_bad_entries_keeps_good() { /* 三条里一条类型错:返回 2 条 + skipped=1 */ }
+#[test] fn evidence_quote_and_char_range_must_match() { /* 越界/不等 → reject "evidence-mismatch";CJK 按 scalar 数 */ }
+#[test] fn self_intro_quote_must_contain_target_name() {
+    // 铁证防偷梁换柱:quote "我是李雷" + person_id 指向张伟 → self_intro 证据无效
+    //(降级为无 self_intro 处理);new_name 分支同理比对 new_name。
 }
-#[test]
-fn two_clusters_pointing_to_same_person_degrade_to_medium() {
-    // taken 里已有同 person → tier 最高 Medium,不 reject(建议卡让人裁)。
+#[test] fn addressed_reply_needs_call_and_reply_pair() {
+    // 需 >=2 条 evidence:至少一条落在目标簇段落(应答),至少一条落在其它簇段落且
+    // 含目标名(称呼)。单条只算 role_topic 弱证据。
 }
-#[test]
-fn acoustic_gate_requires_same_source_cosine() {
-    // 目标人有同 dominant_source 质心且余弦>=0.68 → acoustic Some 且可 High;
-    // 余弦不足/跨信道混合簇/目标人无同信道质心/model_gate_ok=false → 最高 Medium。
-}
-#[test]
-fn tier_high_requires_self_intro_all_gates() {
-    // self_intro 证据 + 校验过 + 无冲突 + 声学过 → High;
-    // 仅 addressed_reply → Medium;仅 role_topic → Low;
-    // person_id 与 new_name 都空/都有 → reject。
-}
+#[test] fn conflicts_and_acoustic_gate_cap_tier() { /* taken 冲突→Medium;混合簇/无同信道质心/门禁关→声学 None 上限 Medium */ }
+#[test] fn structural_rejects() { /* person_id XOR new_name;悬空 person_id;未知 evidence type;new_name trim 后为空/超 32 字符 → reject */ }
 ```
 
-- [ ] **Step 2: 实现**。裁决顺序(spec 四道):① 结构合法(person_id XOR new_name;person_id 经 resolve 存在,悬空 → reject);② 逐字区间校验(`paragraphs[i].text.chars()` 按 scalar 取 `[start,end)`,与 quote 全等;任一 evidence 不过 → 整条 reject);③ 冲突:`taken` 已含同 person 或同 cluster → 降 Medium;④ 声学门:`model_gate_ok && !mixed && 目标人存在 dominant_source 主质心 && cos >= 0.68` → 记 acoustic,否则 None;⑤ 分档:有 `self_intro` 证据且②④全过且无冲突 → High;有 `self_intro|addressed_reply` → Medium;只剩 `role_topic|third_person_exclusion` → Low。`new_name` 目标无质心可比:声学门恒 None,最高 Medium(新人必须人工拍板,spec「新建 Person 没有设计」的回应——建人发生在确认时)。
-- [ ] **Step 3**: `cargo test --lib identify::` 全绿;提交 `feat(identify): 输出解析与四道裁决(逐字区间/冲突/声学门/分档)`。
+- [ ] **Step 2: 实现**。裁决序:① 结构(XOR;resolve 悬空 → reject;`new_name` trim/去控制字符/≤32 字符;未知 evidence type 丢该条 evidence,全部丢光 → reject;confidence 非法按 "low");② 区间逐字校验(scalar 半开区间,任一 evidence 不过 → 整条 reject);③ **证据-身份一致性**:self_intro 的 quote 必须含目标名(person 现名或 new_name),否则该 evidence 降为 role_topic;addressed_reply 按上述配对规则,不满足降 role_topic;④ 冲突(taken 同 person 或同 cluster → cap Medium);⑤ 声学门:`acoustic_enabled && !brief.mixed && 目标人有 dominant_source 主质心 && 维度一致 && cos 有限 && cos>=0.68` → Some,否则 None;⑥ 分档:有效 self_intro+②③⑤过+无冲突 → High;有效 self_intro|addressed_reply → Medium;仅 role_topic/third_person_exclusion → Low。`new_name` 恒无声学 → 最高 Medium。
+- [ ] **Step 3**: 全绿提交 `feat(identify): 宽松解析与五道裁决(含证据-身份一致性)`。
 
 ---
 
-### Task 5: IdentifyExecutor trait + HTTP 实现
+### Task 4: IdentifyExecutor + HTTP 实现
 
 **Files:**
-- Modify: `src-tauri/src/refine/identify.rs`(trait + prompt)
-- Modify: `src-tauri/src/refine/llm.rs`(HTTP 实现,仿 `HttpRelationExecutor` :22)
-- Modify: `src-tauri/src/lib.rs`(分派函数,放 `relation_executor` :2321 旁)
+- Modify: `src-tauri/src/refine/identify.rs`(trait + SYSTEM_PROMPT 全文)
+- Modify: `src-tauri/src/refine/llm.rs`(`HttpIdentifyExecutor`)
+- Modify: `src-tauri/src/lib.rs`(`identify_executor(settings)` 分派,仿 `relation_executor` :2321;"agent"/其它 → Err,调用方按「跳过」处理)
 
-**Interfaces:**
+- [ ] **Step 1**: trait:
 
 ```rust
-// identify.rs
 pub trait IdentifyExecutor: Send + Sync {
     fn provider(&self) -> &str;
     fn model(&self) -> &str;
     fn infer(&self, ctx: &IdentifyContext, log: Option<&crate::ailog::Ctx>)
-        -> anyhow::Result<RawIdentify>;
+        -> anyhow::Result<(Vec<RawAssignment>, usize)>;   // parse_raw_identify 的产物
 }
-pub const IDENTIFY_SYSTEM_PROMPT: &str = "…";   // Step 2 全文
-
-// llm.rs
-pub struct HttpIdentifyExecutor { cfg: LlmConfig }   // new() 校验三字段非空,同 HttpRelationExecutor
-
-// lib.rs
-fn identify_executor(settings: &settings::Settings)
-    -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>>
-// "openai" => HttpIdentifyExecutor;"agent" => bail!("identify 的 Agent 执行体见 Task 11/后续 PR")
 ```
 
-- [ ] **Step 1: SYSTEM_PROMPT 全文**(中文单行常量,要点必须全含):角色=会议说话人身份推断器;输入=簇列表(R号/时长/主信道/现有关联/is_mic)+候选人列表(person_id+name)+采样段落(paragraph_index+speaker+text);任务=为**无名或存疑**簇推断身份;证据类型四种及各自含义;**只允许引用逐字存在的证据**,start/end 为 Unicode scalar 半开区间、quote 逐字符相等;mic 簇大概率是「我」;参考候选但允许 new_name(候选外的名字必须有 self_intro 级证据);输出 JSON `{"assignments":[{"cluster":"R2","person_id":"P3"或null,"new_name":null或"张伟","confidence":"high|medium|low","evidence":[{"paragraph_index":0,"start":0,"end":5,"quote":"我是张伟","type":"self_intro"}]}]}`;没有可靠推断输出空数组;**禁止为已明确关联且无矛盾证据的簇输出条目**。
-- [ ] **Step 2: HTTP 实现**:单次请求(不分块),`temperature 0.1` + `response_format json_object` + `apply_thinking_off`,`REQ_TIMEOUT_S` 沿用 60s;ailog `kind: "identify"`(request 全量/response 原文,仿 `call_chunk` :285-305);解析失败归 `ChunkErr::Content` 同语义(返回 Err,由调用方标 failed)。
-- [ ] **Step 3: mock 测试**(复用 Task 1/P1 的 `mock_server_capturing`):请求体含 `assignments` schema 说明与候选人名;响应解析回 RawIdentify。
-- [ ] **Step 4**: `cargo test --lib` 全绿;提交 `feat(identify): IdentifyExecutor trait 与 HTTP 实现(单次请求+ailog)`。
+- [ ] **Step 2**: `IDENTIFY_SYSTEM_PROMPT` 全文(单行中文常量,必须全含):角色=会议说话人身份推断器;输入字段释义(clusters/candidates/sampled,is_mic 簇大概率是「我」);任务=只为无名或存疑簇推断;四种证据类型定义,addressed_reply 必须给"称呼段+应答段"两条证据;**只允许逐字存在的证据**,start/end 为 Unicode scalar 半开区间、quote 逐字符相等;self_intro 的 quote 必须包含所指认的名字;优先从 candidates 选(给 person_id),候选外允许 new_name 但必须有 self_intro 级证据;输出 JSON schema(与 RawAssignment 字段一一对应,给完整示例);无可靠推断输出 `{"assignments":[]}`;禁止为已明确关联且无矛盾的簇输出条目。
+- [ ] **Step 3**: `HttpIdentifyExecutor`(仿 `HttpRelationExecutor`):单请求,`temperature 0.1`+`response_format json_object`+`apply_thinking_off`,超时 `REQ_TIMEOUT_S`;user 内容 = `serde_json::to_string(ctx)`;ailog `kind:"identify"` 全量记录;响应经 `parse_raw_identify`。mock 测试(复用 `mock_server_capturing`):请求体含 `"clusters"` 与候选名;响应解析正确。
+- [ ] **Step 4**: 全绿提交 `feat(identify): IdentifyExecutor 与 HTTP 实现`。
 
 ---
 
-### Task 6: identify.json 落盘 + spawn_refine 挂钩 + identify_note IPC
+### Task 5: identify.json 读写 + 管线挂钩 + identify_note
 
 **Files:**
-- Modify: `src-tauri/src/refine/identify.rs`(IdentifyDoc + run_identify)
-- Modify: `src-tauri/src/refine/mod.rs:273-306`(cluster_stats 从 run_local 带出——`RefinedDoc` 不动,改 `run_local` 返回 `(RefinedDoc, Vec<ClusterStat>)`,调用点两处:`spawn_refine` 与测试)
-- Modify: `src-tauri/src/lib.rs`(`spawn_refine` :402-424 之间插入;新命令 `identify_note`;invoke_handler 注册)
+- Modify: `src-tauri/src/refine/identify.rs`(IdentifyDoc/run_identify/load/save)
+- Modify: `src-tauri/src/lib.rs`(`spawn_refine` 尾部挂钩;`identify_note` 命令;注册)
 
 **Interfaces:**
 
 ```rust
-// identify.rs — 落盘结构(笔记目录 identify.json,原子写 tmp+rename)
 pub const IDENTIFY_FILE: &str = "identify.json";
+pub const IDENTIFY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 pub struct IdentifyDoc {
-    pub schema_version: u32,               // 1
-    pub generated_at: String,
-    pub provider: String, pub model: String,
-    pub revision: u64,                     // 生成时 RefinedDoc.revision
-    pub source_hash: String,               // 生成时段落 hash(过期判定)
+    pub schema_version: u32,
+    pub generated_at: String, pub provider: String, pub model: String,
+    pub revision: u64, pub source_hash: String,
     pub assignments: Vec<IdentifyAssignment>,
+    /// 拒绝记录跨代保留:key=(fingerprint, 目标键)。目标键=resolve 后 person_id 或
+    /// "name:<new_name>"。拒绝"是张伟"不封杀该簇其它候选。
+    #[serde(default)]
+    pub rejected: BTreeMap<String, String>,        // "fp|target" -> decided_at
 }
+
 #[derive(Serialize, Deserialize)]
 pub struct IdentifyAssignment {
-    pub fingerprint: String,               // 簇指纹(绑定身份,不绑 R 号)
-    pub cluster: String,                   // 生成时的 R 号(展示用)
+    pub fingerprint: String, pub cluster: String,
     pub person_id: Option<String>, pub new_name: Option<String>,
     pub tier: Tier, pub llm_confidence: String,
     pub acoustic: Option<(String, f32)>,
-    pub evidence: Vec<StoredEvidence>,     // 通过校验的证据(原样存)
-    pub status: String,                    // suggested | applied | rejected
+    pub evidence: Vec<StoredEvidence>,
+    pub status: String,                            // suggested|applied|rejected
     #[serde(default)] pub decided_at: Option<String>,
 }
 
-pub fn run_identify(
-    note_dir: &Path, note_id: &str, doc: &RefinedDoc, stats: &[ClusterStat],
-    vp: &Voiceprints, model_gate_ok: bool,
-    executor: &dyn IdentifyExecutor, log: Option<&crate::ailog::Ctx>, now: &str,
-) -> anyhow::Result<IdentifyDoc>;
+pub fn run_identify(...上下文同 rev1,增 members 参数...) -> anyhow::Result<IdentifyDoc>;
 pub fn load_identify(note_dir: &Path) -> Option<IdentifyDoc>;
-pub fn save_identify(note_dir: &Path, doc: &IdentifyDoc) -> anyhow::Result<()>;
+pub fn save_identify(note_dir: &Path, doc: &IdentifyDoc) -> anyhow::Result<()>;  // tmp+rename
 ```
 
-- [ ] **Step 1: run_identify 实现**:build_context → executor.infer → 逐条 adjudicate(reject 的丢弃仅 eprintln;Low 丢弃仅 ailog 留痕)→ 与旧 identify.json 合并:**旧稿里同指纹且 status != suggested 的决策(applied/rejected)保留不覆盖**(用户已拍板的不重复打扰);已明确关联的簇(`ClusterBrief.linked` 为 Some 且无矛盾)不出建议 → 组 IdentifyDoc 落盘。单测:mock executor 返回固定 RawIdentify,验证合并保留 rejected、High/Medium 落 suggested、Low 不落。
-- [ ] **Step 2: spawn_refine 挂钩**(lib.rs :402 report recluster 之后、:424 provider 分派之前):
+- [ ] **Step 1: run_identify**:build_context → infer → 逐条 adjudicate(taken 随过程累积)→ 过滤:reject 丢弃(eprintln);Low 丢弃(ailog);目标命中 `rejected` 名单(fp|target)不再生成;已 linked 且无矛盾的簇不生成 → 新 IdentifyDoc(**继承旧稿 rejected 全表**;旧稿 assignments 里 status==applied 的按 fp 保留原条不覆盖)。单测:rejected 继承并拦截同目标再建议、不同目标放行;applied 保留。
+- [ ] **Step 2: spawn_refine 挂钩**(HTTP 分支 `run_llm` 成功返回之后、`report("llm",..)` 附近):
 
 ```rust
-// identify(P2a 只读期):失败只标 stage,绝不影响后续 llm/agent 精修。
-doc.stages.identify = "running".into();
-report("identify", &doc.stages.identify);
-let identify_state = (|| -> anyhow::Result<&'static str> {
-    let s = /* 已加载的 settings */;
-    let executor = match identify_executor(&s) {
-        Ok(e) => e,
-        Err(_) => return Ok("skipped"),           // agent provider 等:本期跳过
-    };
-    let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
-    let gate_ok = vp.embedding_model == s.speaker_model;
-    let now = chrono::Local::now().to_rfc3339();
-    let log = /* ailog ctx,与 run_llm 同源 */;
-    refine::identify::run_identify(&note_dir, &note_id, &doc, &cluster_stats, &vp, gate_ok, executor.as_ref(), log, &now)?;
-    Ok("done")
-})()
-.unwrap_or_else(|e| { eprintln!("identify 失败(不阻塞精修): {e}"); "failed" });
-doc.stages.identify = identify_state.into();
-report("identify", &doc.stages.identify);
-// stage 值随 doc 在后续 run_llm/write 里落盘;identify.json 已独立落盘。
+// identify(P2a 只读):精修定稿后推断,证据锚定最终正文。失败只留日志。
+if let Ok(executor) = identify_executor(&s) {
+    let r = (|| -> anyhow::Result<()> {
+        let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
+        let acoustic_enabled = vp.embedding_model == s.speaker_model;
+        let members = refine::identify::cluster_members_from_doc(&doc);
+        let now = chrono::Local::now().to_rfc3339();
+        let idoc = refine::identify::run_identify(
+            &note_dir, &note_id, &doc, &cluster_stats, &members, &vp,
+            acoustic_enabled, executor.as_ref(), ailog_ctx.as_ref(), &now,
+        )?;
+        refine::identify::save_identify(&note_dir, &idoc)?;
+        let _ = app.emit("identify_done", &note_id);
+        Ok(())
+    })();
+    if let Err(e) = r { eprintln!("identify 失败(不影响精修结果): {e}"); }
+}
 ```
 
-  `run_local` 返回值改 `(RefinedDoc, Vec<ClusterStat>)`,mod.rs 与 lib.rs 调用点、mod.rs 既有测试同步解构。
-- [ ] **Step 3: `identify_note` 命令**(单独触发/重试,读盘现稿而非重跑 recluster——簇统计从现稿重建:按 `RefinedParagraph.speaker` 分组 `source_seqs`,质心经 `embed_all` 同款逐段重嵌入取均值;为控制篇幅该重建函数 `stats_from_doc(note_dir, doc, embedder)` 放 identify.rs,单测覆盖分组正确性):
+  前置:`identify_executor` 内部先查 `refine_llm_ready(&s)`,不 ready 返回 Err(挂钩处静默跳过)——**绝不绕过用户关闭精修的授权**。`doc` 用 run_llm 之后的内存稿(与盘上一致);`cluster_stats` 来自 run_local 返回元组。agent 分支不挂(执行体 Err 即跳过)。
+- [ ] **Step 3: identify_note 命令**(手动触发/重试):
 
 ```rust
 #[tauri::command]
-async fn identify_note(app: AppHandle, id: String) -> Result<(), String>
-// 守卫:validate_note_id + is_refining 拒绝 + 录制中拒绝(reject_if_active 同款语义);
-// spawn_blocking 内:load_refined → stats_from_doc → identify_executor → run_identify;
-// 完成后 emit("identify_done", note_id)(前端收件箱 refresh 用)。
+async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&id) { return Err(tr!("该笔记正在 Aing 中","This note is being refined")); }
+    reject_if_active(&state, &id)?;
+    // spawn_blocking 内(持 FEEDBACK_GATE 全程——嵌入与 track_pcm 竞争都收敛于此):
+    //   settings 门禁 → identify_executor;
+    //   load_refined 现稿 → cluster_members_from_doc;
+    //   簇质心重建:NoteStore::load 取 segments,对每簇成员 seq 调 P1 的
+    //   feedback::build_source_stats(SegFilter::Seqs 语义的筛选自己做:按 seq 集过滤段),
+    //   得到该簇按信道的 SourceStat.centroid → 组装 ClusterStat(seed 置 None,
+    //   dominant/mixed 由 source_ms 算);嵌入器临时新建 SherpaEmbedder;
+    //   run_identify + save + emit("identify_done")。
+}
 ```
 
-  注册进 invoke_handler(:5439 宏块),检查两处源码解析测试。
-- [ ] **Step 4**: `cargo test --lib` 全绿;提交 `feat(identify): identify.json 落盘、Aing 管线挂钩与 identify_note 重试命令`。
+  `build_source_stats` 签名已可复用(`segs: &[&SegmentRecord]` 直接传该簇成员段)。注册 invoke_handler,过两处源码解析测试。
+- [ ] **Step 4**: 单测(mock executor)+ `cargo test --lib` 全绿;提交 `feat(identify): identify.json 生成/继承规则、管线尾部挂钩与手动重试`。
 
 ---
 
-### Task 7: 建议动作 IPC(list / apply / reject)
+### Task 6: 建议动作 IPC(list / apply / reject)
 
 **Files:**
-- Modify: `src-tauri/src/lib.rs`(三条命令 + 注册)
-- Modify: `src-tauri/src/ipc.rs`(`IdentifySuggestion` 视图类型)
-- Modify: `src-tauri/src/store/voiceprints.rs`(`create_person(name, now) -> String`:VP_LOCK 内分配 `P<next_person>`,空质心空样本——质心随 P1 feedback 回灌自然长出)
+- Modify: `src-tauri/src/lib.rs`、`src-tauri/src/ipc.rs`、`src-tauri/src/store/voiceprints.rs`
 
 **Interfaces:**
 
 ```rust
-// ipc.rs
-#[derive(Serialize, Deserialize, Clone)]
-pub struct IdentifySuggestion {
-    pub note_id: String, pub note_title: String,
-    pub cluster: String, pub fingerprint: String,
-    pub person_id: Option<String>, pub person_name: String, // 库内人现名或 new_name
-    pub is_new: bool, pub tier: String,
-    pub quote: String, pub evidence_type: String,           // 首条证据(卡片引文)
-    pub generated_at: String,
-}
+// voiceprints.rs
+/// 建空人物(P2a 新面孔确认用):VP_LOCK 内分配 P<next_person>;空名报错;
+/// 质心为空——由确认后的 P1 feedback 回灌自然长出。
+pub fn create_person(&self, name: &str, now: &str) -> anyhow::Result<String>;
+/// 补偿:仅当此人仍为空质心空样本时删除(apply 半途失败的孤儿清理)。
+pub fn delete_person_if_empty(&self, id: &str) -> anyhow::Result<bool>;
+
+// ipc.rs — IdentifySuggestion 同 rev1(字段:note_id/note_title/cluster/fingerprint/
+// person_id/person_name/is_new/tier/quote/evidence_type/generated_at)
 
 // lib.rs
 #[tauri::command] fn list_identify_suggestions(app: AppHandle) -> Result<Vec<ipc::IdentifySuggestion>, String>
-// 扫 notes 目录各 identify.json(NoteStore::list 已有列举),收 status=="suggested",
-// 过期过滤:identify.source_hash != 当前稿 source_hash 的整篇跳过(稿已变,建议不可信);
-// person_id 经 resolve,悬空跳过;generated_at 降序,cap 50。
-
 #[tauri::command] async fn apply_identify_suggestion(app: AppHandle, note_id: String, fingerprint: String) -> Result<(), String>
-// spawn_blocking:load_identify 找 fingerprint 且 status=suggested(否则 tr! 报"建议已失效");
-// 复核 source_hash 与现稿一致、R 簇仍含该指纹的 seq 集合(load_refined 按 speaker 重算指纹比对);
-// person_id 分支:直接调 assign_refined_person 的**内部逻辑**(resolve+name+store::assign_refined_person),
-//   随后按 P1 同款 spawn_feedback(SegFilter::Seqs(该簇 source_seqs), prior, resolved) 回灌;
-// new_name 分支:vp.create_person(name) 得新 id,再走同一 assign+回灌(prior=None → Reinforce,质心由回灌长出);
-// 成功后 identify.json 该条 status="applied"+decided_at,原子回写。
-
 #[tauri::command] fn reject_identify_suggestion(app: AppHandle, note_id: String, fingerprint: String) -> Result<(), String>
-// status="rejected"+decided_at 回写;同指纹永不再建议(run_identify Step1 的合并规则保证)。
 ```
 
-- [ ] **Step 1**: `create_person` + 单测(id 递增、重名允许、空名拒绝)。
-- [ ] **Step 2**: 三条命令 + 注册;`apply` 的指纹复核逻辑抽 `fingerprint_still_valid(doc, fingerprint) -> Option<String/*R号*/>` 纯函数放 identify.rs,单测:重聚类换 R 号但成员不变 → 仍 valid;成员变了 → invalid。
-- [ ] **Step 3**: `cargo test --lib` 全绿;提交 `feat(identify): 建议列表/确认/拒绝命令——确认走 assign+P1 回灌,新名建人`。
+- [ ] **Step 1**: `create_person`/`delete_person_if_empty` + 单测(递增 id、空名 Err、非空人不删)。
+- [ ] **Step 2**: `list_identify_suggestions`:NoteStore::list 遍历,load_identify,收 `status=="suggested"` 且 ① `source_hash` == 当前稿(`load_refined_for_display` 后 `store::source_hash`)② 指纹仍与现稿某簇成员集相符 ③ 该簇**当前未关联**其它人物(用户已手动关联的不再打扰)④ person_id resolve 存在;`generated_at` 降序 cap 50。
+- [ ] **Step 3**: **apply 并发协议**(不嵌套 NoteLock,命令级串行):
+
+```rust
+static IDENTIFY_ACT_GATE: Mutex<()> = Mutex::new(());   // 双击/并发确认拒绝的 UI 竞争收敛
+// spawn_blocking 内,持 IDENTIFY_ACT_GATE:
+// ① 读 identify.json:找 fingerprint 且 status=suggested,否则 tr!("建议已失效");
+//    复核指纹仍匹配现稿(cluster_members_from_doc 重算),不匹配 → 置 status=rejected(过期)并报错;
+// ② is_new:vp.create_person(name)?;
+// ③ 调 assign_refined_person 的内部逻辑(与既有命令同函数复用,自取 NoteLock)——
+//    此刻不持任何笔记锁,无嵌套;P1 的 spawn_feedback 挂钩自动跟随(prior=None → Reinforce);
+// ④ 失败补偿:③ Err 且 is_new → vp.delete_person_if_empty(new_id)(best-effort),原样返回 Err;
+// ⑤ 成功:重读 identify.json 置该条 status=applied+decided_at 原子回写(读改写在 ①-⑤ 的
+//    同一 IDENTIFY_ACT_GATE 内,list 只读不受影响;管线重跑按 fp 保留 applied,见 Task 5)。
+```
+
+  reject:同门内读改写:该条 `status=rejected+decided_at`,并写入 `rejected["fp|target"]`。
+- [ ] **Step 4**: 复用测试:apply 的 ①⑤ 逻辑抽 `mark_applied(idoc, fp) -> Result<()>`、`mark_rejected(idoc, fp, target)` 纯函数放 identify.rs 单测;命令壳无自动化测试(与仓库现状一致),真机冒烟覆盖。
+- [ ] **Step 5**: 注册 + `cargo test --lib` 全绿;提交 `feat(identify): 建议列表/确认/拒绝——锁外 assign、新人补偿、拒绝键含目标身份`。
 
 ---
 
-### Task 8: MCP 只读工具 `identify_speakers`
+### Task 7: MCP 只读工具 `identify_speakers`
 
 **Files:**
-- Modify: `src-tauri/src/mcp/server.rs`(参数结构 + 工具方法 + **三处计数断言**)
-- Modify: `src-tauri/src/mcp/tools.rs`(业务实现)
+- Modify: `src-tauri/src/store/refined.rs`(`AnchoredRefinedDir` 增 `pub(crate) fn load_identify(&self) -> Option<identify JSON Value>`——锚定目录内读 `identify.json`,与 `load_current` 同款防护;identify.rs 的 load 也可换用它)
+- Modify: `src-tauri/src/mcp/tools.rs` + `src-tauri/src/mcp/server.rs`
+- Modify: `README.md`(MCP 工具表补一行)
 
-- [ ] **Step 1**: tools.rs 加 `pub fn identify_speakers(roots, note_id) -> anyhow::Result<Value>`:AnchoredRefinedDir 同款防护读 identify.json,返回 `{note_id, generated_at, provider, model, revision, source_hash, assignments:[{cluster, fingerprint, person_id, new_name, tier, status, evidence}]}`;无文件 → `bail!(tr!("该笔记尚无身份推断结果,先运行 Aing 或 identify_note","..."))`。
-- [ ] **Step 2**: server.rs 样板(仿 get_aing_context :365-377):`IdentifySpeakersParams { note_id }`,`#[tool(description="读取笔记最近一次说话人身份推断结果(只读;裁决与证据齐全)。重新推断请在应用内触发。")]`。**不加入** `AGENT_TOOL_NAMES`(spec:MCP 仅只读副产品,Agent 沙箱白名单本期不动)。
-- [ ] **Step 3**: 更新三处工具计数断言;`cargo test --lib mcp` + `cargo test --test mcp_stdio` 全绿;提交 `feat(mcp): identify_speakers 只读工具`。
+- [ ] **Step 1**: tools.rs `identify_speakers(roots, note_id)`:AnchoredRefinedDir::open → load_identify;同时算当前稿 source_hash,返回附 `"stale": bool`(与 UI 口径一致,消除两入口矛盾);无文件 → bail 提示先运行 Aing。
+- [ ] **Step 2**: server.rs 工具方法(仿 get_aing_context);`AGENT_TOOL_NAMES` **不加**;更新全量工具计数断言(以实际断言写法为准,agent 白名单断言不动);README 工具表加行。
+- [ ] **Step 3**: `cargo test --lib mcp && cargo test --test mcp_stdio` 全绿;提交 `feat(mcp): identify_speakers 只读工具(带 stale 标志)`。
 
 ---
 
-### Task 9: 前端收件箱 identify 建议卡
+### Task 8: 前端收件箱 identify 卡
 
 **Files:**
-- Modify: `src/lib/people.ts`(类型 + 三个 invoke 绑定)
-- Modify: `src/lib/tidyQueue.ts`(`TidyItem` 加 `{ kind: "identify"; suggestion: IdentifySuggestion }`;`tidyItemKey` 加 `i:<note_id>:<fingerprint>`;`buildTidyQueue` 增入参,排序位:回执之后、合并建议之前——身份建议时效性最强)
-- Modify: `src/lib/tidy.svelte.ts`(state 增 `identify: IdentifySuggestion[]`;`doRefresh` 并行加 `listIdentifySuggestions()`;`visible` 同款 dismissed 过滤——注意 identify 的"忽略"走 `reject_identify_suggestion`(后端真值),**不写 dismiss_tidy_item**,本地 Set 仅作乐观移除)
-- Modify: `src/routes/speakers/+page.svelte`(`{:else if item.kind === "identify"}` 卡片分支 + `doApplyIdentify`/`doRejectIdentify` 经 `act()` 包装)
+- Modify: `src/lib/people.ts`(类型 + 三绑定,同 rev1)
+- Modify: `src/lib/tidyQueue.ts`(`TidyItem` 加 identify 支;`tidyItemKey` → `i:<note_id>:<fingerprint>`;**`itemIds` 等全部按 kind 分支的函数穷举补齐**——先 `rg "kind ===" src/lib src/routes` 列全再改;`buildTidyQueue` 增参,排序:回执后、合并建议前)
+- Modify: `src/lib/tidyQueue.test.ts`(如存在:全部 buildTidyQueue 调用补参 + identify 用例:出现在正确位置、key 格式、dismissed 过滤)
+- Modify: `src/lib/tidy.svelte.ts`(state.identify + doRefresh 并行拉取 + `identify_done` 事件监听 refresh;忽略动作走 `rejectIdentifySuggestion`(后端真值),本地乐观移除,不写 dismiss_tidy_item)
+- Modify: `src/routes/speakers/+page.svelte`(卡片分支 + `doApplyIdentify`/`doRejectIdentify` 经 `act()`;文案跟随本文件既有卡片的 i18n 处理方式)
 
-- [ ] **Step 1**: people.ts:
-
-```ts
-export interface IdentifySuggestion {
-  note_id: string; note_title: string; cluster: string; fingerprint: string;
-  person_id: string | null; person_name: string; is_new: boolean;
-  tier: string; quote: string; evidence_type: string; generated_at: string;
-}
-export const listIdentifySuggestions = () => invoke<IdentifySuggestion[]>("list_identify_suggestions");
-export const applyIdentifySuggestion = (noteId: string, fingerprint: string) =>
-  invoke<void>("apply_identify_suggestion", { noteId, fingerprint });
-export const rejectIdentifySuggestion = (noteId: string, fingerprint: string) =>
-  invoke<void>("reject_identify_suggestion", { noteId, fingerprint });
-```
-
-- [ ] **Step 2**: 卡片内容(与既有建议卡同构、粉彩风格随现有):标题「这可能是 {person_name}」+ tier 徽标(high 描边强调);正文:笔记标题 + R 号 + 证据引文(`「{quote}」`,evidence_type 中文化:自我介绍/称呼应答/主题线索);按钮:「就是 TA」(apply)/「不是」(reject);`is_new` 时标题改「新面孔:{person_name}?」且确认文案「建档并关联」。
-- [ ] **Step 3**: 前端检查:`npm run check`(svelte-check)通过;如仓库有前端测试脚本按现状跑。提交 `feat(ui): 整理收件箱身份建议卡(确认即关联+回灌,拒绝即永久静默)`。
+- [ ] **Step 1**: 卡片:标题「这可能是 {person_name}」(is_new:「新面孔:{person_name}?」),tier=high 加强调徽标;正文 = 笔记标题 + {cluster} + 证据引文「{quote}」+ 证据类型中文标签;按钮「就是 TA」/「不是」(is_new 确认文案「建档并关联」)。
+- [ ] **Step 2**: `npm run check` 通过 + 前端测试(若有 tidyQueue.test.ts)全绿;提交 `feat(ui): 收件箱身份建议卡`。
 
 ---
 
-### Task 10: speaker_eval 分档评测扩展
+### Task 9: speaker_eval identify 分档评测
 
 **Files:**
-- Modify: `src-tauri/src/bin/speaker_eval.rs`
+- Modify: `src-tauri/src/bin/speaker_eval.rs`(bin 可直接 `use sha2`,与库无耦合地复刻指纹:sha256(LE u64 序列) 前 8 字节 hex——加一条与固定向量比对的单测锁死算法,防与 feedback::seq_fingerprint 漂移)
 
-- [ ] **Step 1**: `run` 增读每笔记 `identify.json`:truth 中 R 层条目若在 identify assignments 里有对应簇(按 fingerprint 无从对——truth 用 R 号,按 `cluster` 字段匹配且 `source_hash` 与现稿一致才算),按 tier 分桶另算三套 Metrics(High/Medium/整体),输出:
+- [ ] **Step 1**: run 增读每笔记 identify.json:R 层 truth 条目按「当前稿该 R 簇成员集指纹」映射到 assignments(**按 fingerprint 匹配,不按 R 号**——重聚类会重编号;**不检查 source_hash**——正文编辑不改变身份真值);分三桶输出:
 
 ```
-[identify] high:   标注 N 正确 X 误认 Y 未识别 Z  precision P% recall R%
-[identify] medium: …
-[identify] all:    …
+[identify] high:        标注 N 正确 X 误认 Y 未识别 Z  precision P% recall R%
+[identify] high+medium: …
+[identify] all:         …
 ```
 
-  P2b 开闸验收线看 `[identify] high` 的 precision(spec:样本 ≥50 且误认 ≤1%)。
-- [ ] **Step 2**: 纯函数测试:构造 identify.json fixture(High 命中、Medium 误认、过期 source_hash 被排除)断言分桶计数;e2e fixture 测试补 identify.json 路径。
-- [ ] **Step 3**: `cargo test --bin speaker_eval` 全绿;提交 `feat(eval): identify 分档 precision/recall(P2b 开闸数据门)`。
+  评测用生成时 tier 与推断目标(status 无关——人工决策不污染模型原始准确率);`new_name` 条目按名字比对并在输出尾注计数(同名风险自担)。P2b 验收线看 `[identify] high` 的 precision。
+- [ ] **Step 2**: fixture 测试:识别 fingerprint 匹配(R 号变化仍命中)、tier 分桶、指纹算法固定向量。
+- [ ] **Step 3**: `cargo test --bin speaker_eval` 全绿;提交 `feat(eval): identify 分档评测(指纹匹配,人工决策不污染样本)`。
 
 ---
 
-### Task 11(可拆后续 PR): Agent 执行体
+### Task 10(独立后续 PR,本计划仅立项): Agent 执行体
 
-**Files:** `src-tauri/src/refine/agent.rs`(`AgentIdentifyExecutor` 仿 `AgentRelationExecutor` :434;identify 指令模板;沙箱白名单加只读 `get_aing_context` 已够用——识别输入由 Rust 侧打包进 prompt,Agent 不需新工具)、`src-tauri/src/lib.rs`(`identify_executor` 的 "agent" 分支)
-
-- [ ] 指令模板:把 `IdentifyContext` 序列化 JSON 内嵌 prompt(Agent 不读库),要求输出与 HTTP 同 schema 的 JSON 到 stdout;解析与裁决完全复用。`configured_provider` 同款只允许 Claude/Gemini。测试仿 `refine_command_claude_has_strict_mcp_and_allowlist`。
-- [ ] 若本任务拆出,`identify_executor` 的 agent 分支保持 bail,identify stage 记 "skipped"——HTTP 用户(当前默认)不受影响。
+不解析 CLI stdout(与现有 Agent 架构冲突——各家输出格式不可信)。设计方向:仿 relation 路径,Agent 在隔离 scratch 目录经文件交换(prompt 内嵌 IdentifyContext JSON,要求把结果 JSON 写入指定路径),Rust 侧读文件解析+裁决复用。`configured_provider` 同款仅 Claude/Gemini。**详细设计与实现在 P2a 落地并跑通评测后另立计划**;在此之前 agent provider 用户 identify 不运行(无痕跳过)。
 
 ---
 
 ## 收尾核对
 
-- [ ] `cd src-tauri && cargo test`(lib+bins)全绿;`cargo clippy --all-targets` 无新增告警;`npm run check` 通过
-- [ ] 真机冒烟清单(PR 描述):① Aing 一场含自我介绍的多人笔记 → identify.json 生成,收件箱出现建议卡带引文;② 点「就是 TA」→ R 段落显示真名,日志出现 feedback 回灌;③ 点「不是」→ 卡片消失且重跑 Aing 不再出现;④ 新面孔确认 → 会议搭子出现新人,下一场同人命中;⑤ agent provider 用户:identify stage 显示 skipped,精修不受影响;⑥ MCP `identify_speakers` 返回裁决结果
-- [ ] PR 描述注明:P2a 零自动写入;三处对 spec 的收窄(journal 内嵌/声学门简化/MCP 只读)及理由;Task 11 是否随本 PR
+- [ ] `cd src-tauri && cargo test`(lib+bins+mcp_stdio)全绿;`cargo clippy --all-targets` 无新增告警;`npm run check` 通过
+- [ ] 真机冒烟(PR 描述):① Aing 一场含自我介绍的多人笔记 → identify.json 生成(source_hash=精修后稿),收件箱出卡带引文;② 「就是 TA」→ R 段落显真名 + 日志 feedback 回灌;③ 「不是」→ 卡片消失,重跑 Aing 同目标不再出现、换目标可再建议;④ 新面孔确认 → 搭子出新人,后续回灌日志可见;⑤ 关闭精修/agent provider → 无 identify 痕迹;⑥ MCP identify_speakers 带 stale 标志;⑦ 手动 identify_note 在未精修笔记上正常工作
+- [ ] PR 描述注明:P2a 零自动写入;对 spec 的四处收窄(时机移到精修后/无 stage 字段/journal 内嵌/声学门简化)及理由;评测积累到 ≥20 场、high 档 ≥50 样本误认 ≤1% 才启动 P2b
