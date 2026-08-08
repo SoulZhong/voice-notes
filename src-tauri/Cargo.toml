@@ -95,6 +95,21 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 screencapturekit = { version = "8", features = ["macos_13_0"] }
 # P4 VPIO spike: Apple 内建 AEC(VoiceProcessingIO)采集麦克风。crate 名 `coreaudio`。
 coreaudio-rs = { version = "0.12", default-features = false, features = ["audio_unit", "core_audio"] }
+# P3 日历匹配:EventKit 读取日程标题/参会人。版本与 tauri 传递依赖的 objc2 0.6 /
+# objc2-foundation 0.3 / block2 0.6 对齐,避免拉进第二份 objc2。
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+objc2-event-kit = { version = "0.3", features = [
+    "EKEventStore",
+    "EKEvent",
+    "EKCalendarItem",
+    "EKCalendar",
+    "EKObject",
+    "EKParticipant",
+    "EKTypes",
+    "block2",
+] }
 
 # dev 构建给本 crate 开基础优化:声纹全库比对(O(n²) 余弦)未优化时百人级库要数秒,
 # 走查/dev 体验失真;opt-level 1 约 10 倍提速,增量编译代价可接受。release 不受影响。
