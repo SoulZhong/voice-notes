@@ -8,7 +8,9 @@ import {
   applyConfidentMerges,
   dismissTidyItem,
   listDismissedTidyItems,
+  listIdentifySuggestions,
   listMergeReceipts,
+  type IdentifySuggestion,
   type MergeReceipt,
   type PersonMergeSuggestion,
 } from "$lib/people";
@@ -24,6 +26,9 @@ export const isStrong = (s: PersonMergeSuggestion) =>
 class TidyState {
   suggestions = $state<PersonMergeSuggestion[]>([]);
   receipts = $state<MergeReceipt[]>([]);
+  /** identify 身份建议(P2a)。处置走后端真值(apply/reject 命令),dismissed
+      集里的 `i:` 键只是动作后的乐观移除镜像,重启后以后端 status 为准。 */
+  identify = $state<IdentifySuggestion[]>([]);
   /** 手动合并后的撤销条(最近一次,会话级全局)。手动合并不进回执收件箱,这里是
       UI 上唯一的撤销入口——挂在页面局部状态时一次导航就永久丢失(后端日志明明
       还在),故提到 store:概览页与人物详情页同读同写,谁合并的都能在两处撤。 */
@@ -42,6 +47,18 @@ class TidyState {
   /** 未被处置的建议(展示/计数用)。 */
   get visible(): PersonMergeSuggestion[] {
     return this.suggestions.filter((s) => !this.dismissed.has(`s:${sugKey(s)}`));
+  }
+
+  /** 未被本地乐观移除的身份建议。 */
+  get visibleIdentify(): IdentifySuggestion[] {
+    return this.identify.filter((s) => !this.dismissed.has(`i:${s.note_id}:${s.fingerprint}`));
+  }
+
+  /** 身份建议动作后的乐观移除(不落 dismissed.json——后端 status 才是真值)。 */
+  removeIdentify(noteId: string, fingerprint: string) {
+    this.identify = this.identify.filter(
+      (s) => !(s.note_id === noteId && s.fingerprint === fingerprint),
+    );
   }
 
   /** 与某人相关的建议(详情页上下文提示用)。 */
@@ -80,11 +97,13 @@ class TidyState {
     try {
       // 与主流程并行拉服务端处置名单(重启后的持久化真值);失败不影响本轮
       // 整理——处置名单是增值层,拿不到顶多本地已知的这些还在生效。
-      const [outcome, dismissedFromServer] = await Promise.all([
+      const [outcome, dismissedFromServer, identify] = await Promise.all([
         applyConfidentMerges(),
         listDismissedTidyItems().catch(() => [] as string[]),
+        listIdentifySuggestions().catch(() => [] as IdentifySuggestion[]),
       ]);
       this.suggestions = outcome.remaining;
+      this.identify = identify;
       this.receipts = await listMergeReceipts();
       if (dismissedFromServer.length > 0) {
         this.dismissed = new Set([...this.dismissed, ...dismissedFromServer]);
@@ -93,6 +112,7 @@ class TidyState {
     } catch {
       this.suggestions = [];
       this.receipts = [];
+      this.identify = [];
     }
     this.loading = false;
   }

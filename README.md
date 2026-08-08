@@ -182,6 +182,7 @@ Windows 请在 “Developer PowerShell for VS 2022” 中执行同样命令；`n
 | `start_recording` / `stop_recording` / `pause_recording` / `resume_recording` | 控制录制 | App 运行中,**且**已开启「允许 AI 控制录制」 |
 | `retranscribe_note` | 对已完成笔记发起文件重转写(离线重跑 ASR,覆盖原始逐字稿,自动备份;异步启动) | App 运行中,**且**已开启「允许 AI 控制录制」 |
 | `retranscribe_status` | 当前重转写任务(note_id 与阶段;空闲 running=false);含最近一次任务的终态(last) | App 运行中 |
+| `identify_speakers` | 读取最近一次说话人身份推断结果(簇→人物建议、置信档、证据、stale 标志);只读 | 无需 App 运行,笔记须已跑过 identify |
 
 笔记与图谱类七工具直接访问本机数据文件,App 没开也能用;录制状态、实时转写、四项录制控制与重转写经 App 内本地 socket,需 App 运行。
 

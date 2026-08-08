@@ -758,6 +758,51 @@ impl VoiceprintStore {
         Ok(FeedbackApplied { person_before, person_after })
     }
 
+    /// 建空人物(P2a 新面孔确认用):VP_LOCK 内分配 P<next_person>;空名报错;
+    /// 质心/样本全空——确认后的 P1 feedback 回灌会让质心自然长出。
+    pub fn create_person(&self, name: &str, now: &str) -> anyhow::Result<String> {
+        let _guard = vp_guard();
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "人物名不能为空");
+        let mut vp = self.load();
+        let id = format!("P{}", vp.next_person);
+        vp.next_person += 1;
+        vp.people.insert(
+            id.clone(),
+            Person {
+                name: name.to_string(),
+                centroids: BTreeMap::new(),
+                session_centroids: BTreeMap::new(),
+                total_ms: 0,
+                last_seen: now.to_string(),
+            },
+        );
+        self.save(&vp)?;
+        Ok(id)
+    }
+
+    /// 补偿删除:仅当此人仍是空质心/空会话质心/无样本时删除(apply 半途失败的
+    /// 孤儿清理)。有任何积累就拒删返回 false——那已经是有信息的真人档案。
+    pub fn delete_person_if_empty(&self, id: &str) -> anyhow::Result<bool> {
+        let _guard = vp_guard();
+        let mut vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
+            return Ok(false);
+        };
+        let Some(p) = vp.people.get(&resolved) else {
+            return Ok(false);
+        };
+        if !p.centroids.is_empty()
+            || !p.session_centroids.is_empty()
+            || !self.sample_paths_existing(&resolved).is_empty()
+        {
+            return Ok(false);
+        }
+        vp.people.remove(&resolved);
+        self.save(&vp)?;
+        Ok(true)
+    }
+
     /// 纠错还原:当前状态仍逐字节等于 expected_after 时恢复 before,返回 true;
     /// 已被其它写(新会议/合并/再回灌)动过则不动返回 false——宁可留污染,
     /// 也不覆盖新信息。
@@ -2580,5 +2625,22 @@ mod tests {
             .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 0.0, 1.0, 0.0], 1, 2_000)], "t3")
             .unwrap();
         assert!(!store.restore_feedback(&pid, &applied2.person_before, &applied2.person_after).unwrap());
+    }
+    #[test]
+    fn create_person_and_delete_if_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        assert!(store.create_person("  ", "t").is_err(), "空名拒绝");
+        let id1 = store.create_person("张伟", "t").unwrap();
+        let id2 = store.create_person("张伟", "t").unwrap();
+        assert_ne!(id1, id2, "重名允许(收件箱另有疑似重复提示),id 必须递增");
+        assert!(store.delete_person_if_empty(&id2).unwrap(), "空档案可补偿删除");
+        assert!(store.load().people.get(&id2).is_none());
+        // 有质心的不删。
+        store
+            .reinforce_feedback(&id1, &[("mic".into(), vec![1.0, 0.0], 1, 2_000)], "t2")
+            .unwrap();
+        assert!(!store.delete_person_if_empty(&id1).unwrap());
+        assert!(store.load().people.contains_key(&id1));
     }
 }
