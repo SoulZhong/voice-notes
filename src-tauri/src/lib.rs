@@ -2352,6 +2352,24 @@ fn relation_executor(
     }
 }
 
+/// identify(P2a)执行体分派:门禁复用 refine_llm_ready 全套——用户关闭精修或
+/// 配置不齐时返回 Err,调用方一律按「静默跳过」处理,绝不绕过外发授权。
+/// agent provider 的 identify 执行体另立计划,在那之前同样跳过。
+fn identify_executor(
+    settings: &settings::Settings,
+) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
+    if !refine_llm_ready(settings) {
+        anyhow::bail!("identify 需要已启用且配置齐全的 HTTP 精修");
+    }
+    Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
+        refine::llm::LlmConfig {
+            base_url: settings.refine_base_url.clone(),
+            model: settings.refine_model.clone(),
+            api_key: settings.refine_api_key.clone(),
+        },
+    )?))
+}
+
 fn spawn_relation_backfill_worker<Spawn, Worker, EmitFailure>(
     gate: refine::backfill::BackfillGate,
     initial: ipc::BackfillProgress,

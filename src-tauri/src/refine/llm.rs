@@ -56,6 +56,85 @@ impl super::backfill::RelationExecutor for HttpRelationExecutor {
     }
 }
 
+/// HTTP 的 identify 执行体(P2a):单次请求(不分块——身份推断需要全局视野,
+/// 输入长度由 identify 侧采样预算控制),失败整体返回 Err 由调用方记日志。
+pub struct HttpIdentifyExecutor {
+    cfg: LlmConfig,
+}
+
+impl HttpIdentifyExecutor {
+    pub fn new(cfg: LlmConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(!cfg.base_url.trim().is_empty(), "HTTP base URL 未配置");
+        anyhow::ensure!(!cfg.model.trim().is_empty(), "HTTP model 未配置");
+        anyhow::ensure!(!cfg.api_key.trim().is_empty(), "HTTP API key 未配置");
+        Ok(Self { cfg })
+    }
+}
+
+impl super::identify::IdentifyExecutor for HttpIdentifyExecutor {
+    fn provider(&self) -> &str {
+        "openai"
+    }
+
+    fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
+    fn infer(
+        &self,
+        ctx: &super::identify::IdentifyContext,
+        log: Option<&crate::ailog::Ctx>,
+    ) -> anyhow::Result<(Vec<super::identify::RawAssignment>, usize)> {
+        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let mut body = json!({
+            "model": self.cfg.model,
+            "temperature": 0.1,
+            "response_format": { "type": "json_object" },
+            "messages": [
+                { "role": "system", "content": super::identify::IDENTIFY_SYSTEM_PROMPT },
+                { "role": "user", "content": serde_json::to_string(ctx)? },
+            ],
+        });
+        apply_thinking_off(&self.cfg.base_url, &mut body);
+        let started = std::time::Instant::now();
+        let result = (|| -> anyhow::Result<(String, Vec<super::identify::RawAssignment>, usize)> {
+            let resp_text = ureq::post(&url)
+                .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+                .set("authorization", &format!("Bearer {}", self.cfg.api_key))
+                .set("content-type", "application/json")
+                .send_string(&body.to_string())?
+                .into_string()?;
+            let envelope: Value = serde_json::from_str(&resp_text)?;
+            let content = envelope["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("响应缺 choices[0].message.content"))?;
+            let (assignments, skipped) = super::identify::parse_raw_identify(content)?;
+            Ok((resp_text, assignments, skipped))
+        })();
+        if let Some(ctx_log) = log {
+            let (response, status, error) = match &result {
+                Ok((raw, _, _)) => (Value::String(raw.clone()), "ok", None),
+                Err(e) => (Value::Null, "error", Some(e.to_string())),
+            };
+            crate::ailog::record(
+                ctx_log,
+                crate::ailog::Draft {
+                    kind: "identify",
+                    provider: "openai".into(),
+                    model: Some(self.cfg.model.clone()),
+                    endpoint: Some(url.clone()),
+                    request: body,
+                    response,
+                    status,
+                    error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        }
+        result.map(|(_, assignments, skipped)| (assignments, skipped))
+    }
+}
+
 /// HTTP provider 的关系专用调用。载荷没有 `texts` 输出位，调用方也只传不可变文档。
 pub fn extract_relations(
     cfg: &LlmConfig,
@@ -1036,6 +1115,42 @@ mod tests {
         assert_eq!(speaker_label(&p(Some("张:伟\n总"))), "张 伟 总");
         assert_eq!(speaker_label(&p(Some("   "))), "R3", "纯空白名退回簇号");
         assert_eq!(speaker_label(&p(None)), "R3");
+    }
+
+    #[test]
+    fn identify_executor_sends_context_and_parses_assignments() {
+        use crate::refine::identify::{IdentifyContext, IdentifyExecutor};
+        let content = r#"{"assignments":[{"cluster":"R1","person_id":"P1","confidence":"high","evidence":[]}]}"#;
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": content } }]
+        })
+        .to_string();
+        let (base, captured) = mock_server_capturing(vec![body]);
+        let exec = HttpIdentifyExecutor::new(LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        })
+        .unwrap();
+        let ctx = IdentifyContext {
+            note_id: "n1".into(),
+            revision: 1,
+            source_hash: "h".into(),
+            clusters: vec![],
+            candidates: vec![crate::refine::identify::Candidate {
+                person_id: "P1".into(),
+                name: "张伟".into(),
+            }],
+            sampled: vec![],
+        };
+        let (assignments, skipped) = exec.infer(&ctx, None).unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].cluster, "R1");
+        assert_eq!(skipped, 0);
+        let req = captured.lock().unwrap().join("");
+        assert!(req.contains("clusters"), "请求必须内嵌 IdentifyContext JSON");
+        assert!(req.contains("张伟"), "候选人名必须进请求");
+        assert!(req.contains("身份推断器"), "system prompt 必须就位");
     }
 
     #[test]

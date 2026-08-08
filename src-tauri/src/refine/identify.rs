@@ -306,6 +306,21 @@ pub fn build_context(
     }
 }
 
+/// identify 执行体:provider 无关(仿 RelationExecutor 模式)。P2a 只有 HTTP
+/// 实现;Agent 实现另立计划(不解析 CLI stdout,需文件交换设计)。
+pub trait IdentifyExecutor: Send + Sync {
+    fn provider(&self) -> &str;
+    fn model(&self) -> &str;
+    fn infer(
+        &self,
+        ctx: &IdentifyContext,
+        log: Option<&crate::ailog::Ctx>,
+    ) -> anyhow::Result<(Vec<RawAssignment>, usize)>;
+}
+
+/// identify 的 system prompt。与精修 SYSTEM_PROMPT 同风格:单行、契约逐条钉死。
+pub const IDENTIFY_SYSTEM_PROMPT: &str = "你是会议说话人身份推断器。输入 JSON 含三部分:clusters(说话人簇:speaker 是簇号,total_ms 时长,is_mic=true 的簇大概率是记录者「我」,linked 非空表示已确认身份),candidates(声纹库候选人:person_id 与姓名),sampled(带 speaker 标注的会议片段,paragraph_index 是全文绝对段落下标)。任务:只为 linked 为空或存在矛盾证据的簇推断真实身份;每条推断给出簇号、身份(二选一:candidates 里的 person_id,或候选外的新名字 new_name——new_name 必须有自我介绍级证据)、自报 confidence(high|medium|low)、以及证据列表。证据 type 只能是:self_intro(该簇自我介绍,如「我是张伟」,quote 必须包含所指认的名字)、addressed_reply(称呼应答配对:必须给两条证据——一条在其它簇里称呼该名字,一条是该簇的应答)、third_person_exclusion(该簇以第三人称谈及某人,证明该簇不是那个人)、role_topic(角色/主题弱线索)。所有证据必须逐字存在:paragraph_index 用输入标注的绝对下标,start/end 是该段落的 Unicode scalar(char)半开区间,quote 必须逐字符精确等于该区间,禁止改写、缩略或拼接。输出 JSON:{\"assignments\":[{\"cluster\":\"R2\",\"person_id\":\"P3\",\"new_name\":null,\"confidence\":\"high\",\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":4,\"quote\":\"我是张伟\",\"type\":\"self_intro\"}]}]}。person_id 与 new_name 恰好一个非空。没有可靠推断输出 {\"assignments\":[]}。禁止为已明确关联且无矛盾证据的簇输出条目,禁止仅凭主题相似强行认人。";
+
 /// 簇的主信道与混合判定(与 ClusterBrief 同口径,裁决层复用)。
 fn dominant_and_mixed(stat: &ClusterStat) -> (String, bool) {
     let dominant = stat
