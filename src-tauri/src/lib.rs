@@ -1,4 +1,5 @@
 mod audio;
+mod feedback;
 mod logging;
 pub mod pipeline;
 pub mod asr;
