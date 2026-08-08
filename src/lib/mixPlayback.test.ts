@@ -23,4 +23,11 @@ describe("mixed 回放装载纪律", () => {
   it("mixed 态段落 seek 必须带 seek_offset_ms 修正(live 轨首帧偏移)", () => {
     expect(page).toMatch(/seek_offset_ms\[/);
   });
+
+  it("高亮与试听边界与 seek 同一套修正——只修 seek 会让高亮/截停提前一个偏移量", () => {
+    // activeSeqs 的区间比较必须经 seekFix(codex P2)
+    expect(page).toMatch(/playerMs >= seekFix\(seg\.start_ms, seg\.source\)/);
+    // 试听 endMs 同理
+    expect(page).toMatch(/endMs: seekFix\(/);
+  });
 });

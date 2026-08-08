@@ -885,6 +885,7 @@ fn spawn_session(
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
     transcode: Arc<store::transcode::TranscodeQueue>,
     retranscribing: Arc<Mutex<Option<(String, String)>>>,
+    mixed_regen: Arc<Mutex<Option<String>>>,
     target: NoteTarget,
 ) -> Result<(), String> {
     let my_gen = {
@@ -921,6 +922,23 @@ fn spawn_session(
         return Err(tr!(
             "重转写进行中,完成后再录制",
             "A re-transcription is in progress; please record after it finishes"
+        ));
+    }
+    // 补生成侧同款写后读(codex P1:此前只有 regen 单向读 running,协议没闭环——
+    // regen 复查 running 之后、这里置 running 之前的窗口里两侧可双穿):regen 是
+    // 写(槽)→读(running),本侧是写(running)→读(槽),顺序矛盾封死双穿。回滚纪律
+    // 与上方重转写分支完全一致。
+    if mixed_regen_busy(&mixed_regen) {
+        let mut r = running.lock().unwrap();
+        let g = generation.lock().unwrap();
+        if *g == my_gen {
+            *r = false;
+        }
+        drop(g);
+        drop(r);
+        return Err(tr!(
+            "正在补生成成品轨,完成后再录制",
+            "Mixed-track regeneration is in progress; please record after it finishes"
         ));
     }
 
@@ -1765,6 +1783,7 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         state.embedder_cache.clone(),
         state.transcode.clone(),
         state.retranscribing.clone(),
+        state.mixed_regen.clone(),
         NoteTarget::New,
     );
     if result.is_ok() {
@@ -1833,6 +1852,7 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
         state.embedder_cache.clone(),
         state.transcode.clone(),
         state.retranscribing.clone(),
+        state.mixed_regen.clone(),
         NoteTarget::Resume(note_id),
     );
     if result.is_ok() {

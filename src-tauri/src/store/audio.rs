@@ -121,7 +121,8 @@ pub struct MixInfo {
     /// (末场值;续录多场的历史场次只能近似,量级数十~数百 ms)。regen = 空表。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seek_offset_ms: BTreeMap<String, u64>,
-    /// 定稿时量出的净时长(WAV 字节口径,同 SyncInfo.track_ms 语义)。
+    /// 定稿时量出的**整文件**时长(WAV 字节口径;续录跨全部场次,不是本场净时长
+    /// ——消费端 mixed_untrusted 拿它与源轨全长终点比对,codex P1 修正)。
     /// 未转码时 mixed_untrusted 的时长读数来源。
     pub track_ms: u64,
 }
@@ -451,6 +452,22 @@ pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Res
     let mut meta = load_audio_meta(note_dir);
     meta.schema_version = 1;
     meta.tracks.entry(source.to_string()).or_default().mix = Some(mix);
+    save_audio_meta(note_dir, &meta)
+}
+
+/// 清成品轨完整性标记。**任何可能改动 mixed 轨字节的操作开始之前必须调用**
+/// (续录装配、补生成开工):旧标记描述的是旧内容,文件一旦被 truncate/append,
+/// 标记若还在,异常中断后 mixed_untrusted 会拿旧读数为已被改动的文件背书
+/// (codex 审查 P1)。条目不存在时静默成功——本就无标记可清。
+pub fn clear_track_mix(note_dir: &Path, source: &str) -> anyhow::Result<()> {
+    let _guard = meta_guard();
+    let mut meta = load_audio_meta(note_dir);
+    let Some(t) = meta.tracks.get_mut(source) else { return Ok(()) };
+    if t.mix.is_none() {
+        return Ok(());
+    }
+    t.mix = None;
+    meta.schema_version = 1;
     save_audio_meta(note_dir, &meta)
 }
 

@@ -405,8 +405,11 @@
     if (segs.length === 0 || !player) return;
     const idx = preview?.sid === sid ? (preview.idx + 1) % segs.length : 0;
     const seg = segs[idx];
-    preview = { sid, idx, endMs: Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS) };
-    player.seek(seekFix(seg.start_ms, segSourceAt(seg.start_ms)));
+    // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
+    // 边界不修正会让试听提前一个首帧偏移量截停。
+    const segSource = segSourceAt(seg.start_ms);
+    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
 
@@ -908,7 +911,11 @@
     const s = new Set<number>();
     if (tracks.length === 0) return s;
     for (const seg of displaySegments) {
-      if (playerMs >= seg.start_ms && playerMs < seg.end_ms) s.add(seg.seq);
+      // mixed 态段落边界与 seek 同一套修正(codex P2):live 成品轨里各源内容整体
+      // 后移其首帧偏移,只修 seek 不修比较边界会让高亮/跟随提前一个偏移量。
+      if (playerMs >= seekFix(seg.start_ms, seg.source) && playerMs < seekFix(seg.end_ms, seg.source)) {
+        s.add(seg.seq);
+      }
     }
     return s;
   });

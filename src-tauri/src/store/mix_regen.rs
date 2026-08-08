@@ -51,31 +51,40 @@ pub fn regen_mixed_to<W: Write + Seek>(
         None => (std::borrow::Cow::Borrowed(mic), mic_off_ms),
     };
 
-    let mic_pcm = wav_body_f32(&mic_bytes)?;
-    let sys_pcm = wav_body_f32(sys)?;
+    // 流式口径(codex P2):不把整轨 s16→f32 物化成 Vec(1 小时双轨 ≈ 460MB f32,
+    // 叠上源字节与对齐渲染可冲到 GB 级)——每轮只转换当前时间轴区间(≤1s,64KB),
+    // 调用方配合 mmap 喂源字节时,全程常驻 ≈ 混音窗 + 对齐渲染产物(仅对齐分支)。
+    let bodies: [&[u8]; 2] = [wav_body(&mic_bytes)?, wav_body(sys)?];
+    let lens = [bodies[0].len() as u64 / 2, bodies[1].len() as u64 / 2];
 
     // 时间轴原点 = 较早的 offset;两源起点是相对原点的样本偏移。
     let origin_ms = mic_off_ms.min(sys_off_ms);
     let starts = [(mic_off_ms - origin_ms) * 16, (sys_off_ms - origin_ms) * 16];
     // 喂料下标与 TimelineMixer 源号约定一致(编译期锁死,常量变了立刻编不过)。
     const _: () = assert!(MIC == 0 && SYSTEM == 1);
-    let pcms: [&[f32]; 2] = [&mic_pcm, &sys_pcm];
 
     sink.write_all(&wav_header(0))?;
     let mut data_len: u64 = 0;
     let mut mixer = TimelineMixer::new(0); // 离线到达有序,无需水位余量
-    let total_end = (0..2).map(|i| starts[i] + pcms[i].len() as u64).max().unwrap_or(0);
+    let total_end = (0..2).map(|i| starts[i] + lens[i]).max().unwrap_or(0);
     let mut cursor = 0u64;
+    let mut chunk_buf: Vec<f32> = Vec::with_capacity(CHUNK as usize);
     while cursor < total_end {
         let next = (cursor + CHUNK).min(total_end);
         for src in 0..2 {
             let s_start = starts[src];
-            let s_end = s_start + pcms[src].len() as u64;
+            let s_end = s_start + lens[src];
             let lo = cursor.max(s_start);
             let hi = next.min(s_end);
             let out = if lo < hi {
                 let (a, b) = ((lo - s_start) as usize, (hi - s_start) as usize);
-                mixer.accept_at(src, lo, &pcms[src][a..b])
+                chunk_buf.clear();
+                chunk_buf.extend(
+                    bodies[src][a * 2..b * 2]
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0),
+                );
+                mixer.accept_at(src, lo, &chunk_buf)
             } else {
                 // 本源在该区间无内容(未开始/已结束):空块推进虚拟位置,水位线
                 // 才能越过该区间,窗口不随另一源的独占段增长。
@@ -95,37 +104,68 @@ pub fn regen_mixed_to<W: Write + Seek>(
     Ok(RegenOutcome { offset_ms: origin_ms, track_ms: bytes_to_ms(data_len) })
 }
 
-/// 对一个笔记目录做完整补生成:读两条源轨(wav 优先,仅 m4a 则临时解码)→
-/// 复用/现估对齐映射 → tmp 写出 → 清过期读数 → 原子改名 → 记账(offset + MixInfo)
-/// → 波形。**调用方须持有 NoteLock 并保证录制/重转写/转码互斥**(命令壳的守卫链);
-/// 本函数只管盘面正确性:任何失败都不留下可被误认的半成品(tmp 删除,正品要么
-/// 完整落位要么根本不存在)。
+/// 对一个笔记目录做完整补生成:mmap 两条源轨(wav 优先,仅 m4a 则临时解码)→
+/// 复用/现估对齐映射 → tmp 写出 → 提交。**调用方须持有 NoteLock 并保证录制/
+/// 重转写/转码互斥**(命令壳的守卫链)。
+///
+/// 提交顺序(codex P2:旧产物在新品落位前绝不销毁,失败模式只允许「旧品完好」
+/// 或「轨暂时隐身可再生」,永不「错误内容被采信」):
+/// ① 清 meta 读数与旧 mix 标记 + 写新 offset —— 失败:盘上文件全未动,旧品完好;
+///   必须先于 rename:旧标记/读数描述的是旧内容,新 wav 一旦落位就不能再被它们背书。
+///   代价:此后任一步失败,旧 m4a 因 duration 读数被清而整轨隐身(track_info_for
+///   对无读数的 m4a 判损坏跳过)——可重新生成恢复,不丢源轨数据。
+/// ② rename tmp→mixed.wav(原子;若有旧 wav 即原子替换)—— 失败:轨隐身,可再生。
+/// ③ 删旧 mixed.m4a —— 失败只警告:m4a 已无 duration 读数,不会被采信,只是死文件。
+/// ④ 写新 MixInfo —— 失败:新 wav 无标记 → mixed_untrusted 保守拒,重新生成可修。
+/// ⑤ 波形 —— 失败只降级(前端退段落包络)。
 pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
     use crate::pipeline::recording_sink::MIXED_TRACK;
     let meta = crate::store::audio::load_audio_meta(dir);
-    let read_src = |src: &str| -> anyhow::Result<(Vec<u8>, u64)> {
+    // mmap 而非整读进堆(codex P2):小时级源轨数百 MB,mmap 让"源字节"不占常驻
+    // 内存;流式转换(regen_mixed_to 内)则免去整轨 f32 物化。m4a 场景解码出的
+    // 临时 WAV 同样走 mmap,结束后连文件一起清掉(guard 的 Drop)。
+    struct SrcGuard {
+        map: memmap2::Mmap,
+        cleanup: Option<std::path::PathBuf>,
+    }
+    impl Drop for SrcGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.cleanup.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let read_src = |src: &str| -> anyhow::Result<(SrcGuard, u64)> {
         let off = meta.tracks.get(src).map(|t| t.offset_ms).unwrap_or(0);
         let wav = dir.join(format!("{src}.wav"));
-        if wav.is_file() {
-            return Ok((std::fs::read(&wav)?, off));
-        }
-        let m4a = dir.join(format!("{src}.m4a"));
-        anyhow::ensure!(m4a.is_file(), "缺少 {src} 轨(wav/m4a 都不在),无法补生成");
-        // 解码到点前缀临时名:不会被 sources_with_suffix 的目录扫描当成轨
-        let tmp = dir.join(format!(".mixregen_{src}.wav"));
-        let out = crate::store::transcode::decode_m4a_to_standard_wav(&m4a, &tmp)
-            .and_then(|_| Ok(std::fs::read(&tmp)?));
-        let _ = std::fs::remove_file(&tmp);
-        Ok((out?, off))
+        let (path, cleanup) = if wav.is_file() {
+            (wav, None)
+        } else {
+            let m4a = dir.join(format!("{src}.m4a"));
+            anyhow::ensure!(m4a.is_file(), "缺少 {src} 轨(wav/m4a 都不在),无法补生成");
+            // 解码到点前缀临时名:不会被 sources_with_suffix 的目录扫描当成轨
+            let tmp = dir.join(format!(".mixregen_{src}.wav"));
+            crate::store::transcode::decode_m4a_to_standard_wav(&m4a, &tmp)
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                })?;
+            (tmp.clone(), Some(tmp))
+        };
+        let file = std::fs::File::open(&path)?;
+        // 安全性同 player.rs 的既有用法:映射期间文件受 NoteLock/互斥守卫保护,
+        // 不会被并发改写。
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        Ok((SrcGuard { map, cleanup }, off))
     };
-    let (mic, mic_off) = read_src("mic")?;
-    let (sys, sys_off) = read_src("system")?;
+    let (mic_guard, mic_off) = read_src("mic")?;
+    let (sys_guard, sys_off) = read_src("system")?;
+    let (mic, sys): (&[u8], &[u8]) = (&mic_guard.map, &sys_guard.map);
 
     // 对齐映射:回放侧已估过就复用(同一笔记同一映射,回放与成品轨口径一致);
     // 没有则现估,worth_correcting 才采纳,采纳即落盘供回放复用。估不出 = 不纠正,
     // 与 align_mic_track 的保守语义一致(历史轨漂移烘进产物是 spec 已知限制 1)。
     let map = crate::store::align::read(dir).or_else(|| {
-        let a = crate::player_align::estimate(&mic, mic_off, &sys, sys_off)?;
+        let a = crate::player_align::estimate(mic, mic_off, sys, sys_off)?;
         if !crate::player_align::worth_correcting(&a) {
             return None;
         }
@@ -138,7 +178,7 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
     let tmp = dir.join(format!("{MIXED_TRACK}.wav.tmp"));
     let outcome = (|| -> anyhow::Result<RegenOutcome> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        let o = regen_mixed_to(&mic, mic_off, &sys, sys_off, map.as_ref(), &mut f)?;
+        let o = regen_mixed_to(mic, mic_off, sys, sys_off, map.as_ref(), &mut f)?;
         f.flush()?;
         Ok(o)
     })()
@@ -150,11 +190,22 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
         "补生成产物为空,已放弃"
     );
 
-    // 清旧形态必须在 rename 之前:mixed.m4a 若残留,track_info_for 会优先采信
-    // m4a + 旧 duration_ms,新 wav 永远读不到;旧 waveform/duration 同理是过期读数。
-    let _ = std::fs::remove_file(dir.join(format!("{MIXED_TRACK}.m4a")));
-    crate::store::audio::reset_mixed_meta(dir, outcome.offset_ms)?;
-    std::fs::rename(&tmp, dir.join(format!("{MIXED_TRACK}.wav")))?;
+    // 提交序 ①→③(顺序论证见函数头注):先清读数(旧 m4a 从此不可能被采信),
+    // 新 wav 原子落位,最后才动旧 m4a——任何一步失败都不会让旧内容被当成新产物。
+    crate::store::audio::reset_mixed_meta(dir, outcome.offset_ms)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    std::fs::rename(&tmp, dir.join(format!("{MIXED_TRACK}.wav")))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    let stale_m4a = dir.join(format!("{MIXED_TRACK}.m4a"));
+    if stale_m4a.is_file() {
+        if let Err(e) = std::fs::remove_file(&stale_m4a) {
+            eprintln!("补生成:旧 mixed.m4a 删除失败(读数已清,不会被采信,仅残留死文件): {e}");
+        }
+    }
     crate::store::audio::set_track_mix(
         dir,
         MIXED_TRACK,
@@ -176,15 +227,12 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
     Ok(outcome)
 }
 
-/// canonical WAV 的 data 段 → f32 样本(s16le / 32768,与解码端一致)。
-fn wav_body_f32(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
+/// canonical WAV 的 data 段字节切片(整样本截断,s16le)。
+fn wav_body(wav: &[u8]) -> anyhow::Result<&[u8]> {
     let body = wav
         .get(HEADER_LEN as usize..)
         .ok_or_else(|| anyhow::anyhow!("WAV 短于 {HEADER_LEN} 字节头,内容损坏"))?;
-    Ok(body
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-        .collect())
+    Ok(&body[..body.len() - body.len() % 2])
 }
 
 fn write_s16<W: Write>(sink: &mut W, samples: &[f32]) -> anyhow::Result<u64> {
@@ -340,6 +388,42 @@ mod tests {
         let meta = crate::store::audio::load_audio_meta(dir.path());
         let t = meta.tracks.get("mixed").unwrap();
         assert!(t.codec.is_none() && t.duration_ms.is_none(), "过期读数必须清零");
+    }
+
+    /// 提交序回归(codex P2):rename 落位失败时,旧 mixed.m4a 必须还在盘上,
+    /// 但其 meta 读数已清 → 轨隐身(track_info_for 对无 duration 的 m4a 判损坏
+    /// 跳过),绝不把旧内容当新产物供出;mix 标记同步清空,mixed_untrusted 保守拒。
+    /// 用目录占住 mixed.wav 路径让 rename 必败(手法同 recording_sink 的建档失败用例)。
+    #[test]
+    fn regen_commit_failure_never_serves_stale_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 1600usize;
+        std::fs::write(dir.path().join("mic.wav"), wav(&vec![1i16; n])).unwrap();
+        std::fs::write(dir.path().join("system.wav"), wav(&vec![2i16; n])).unwrap();
+        std::fs::write(dir.path().join("mixed.m4a"), b"stale-old-product").unwrap();
+        crate::store::audio::set_track_mix(
+            dir.path(),
+            "mixed",
+            crate::store::audio::MixInfo {
+                origin: "live".into(),
+                seek_offset_ms: Default::default(),
+                track_ms: 999,
+            },
+        )
+        .unwrap();
+        // rename 目标占成目录 → 提交序第 ② 步必败。
+        std::fs::create_dir(dir.path().join("mixed.wav")).unwrap();
+        assert!(regen_note_dir(dir.path()).is_err(), "落位失败必须报错");
+        assert!(dir.path().join("mixed.m4a").is_file(), "旧 m4a 不得在新品落位前被销毁");
+        let meta = crate::store::audio::load_audio_meta(dir.path());
+        let t = meta.tracks.get("mixed").unwrap();
+        assert!(t.duration_ms.is_none(), "旧读数必须已清——无读数的 m4a 不会被采信");
+        assert!(t.mix.is_none(), "旧完整性标记必须已清");
+        assert!(
+            crate::retranscribe::input::mixed_untrusted(&meta).is_some(),
+            "中断态必须被消费前校验保守拒掉"
+        );
+        assert!(!dir.path().join("mixed.wav.tmp").exists(), "tmp 半成品必须清除");
     }
 
     /// 一源远长于另一源(独占尾巴跨多个区间):内容不丢、位置不漂,
