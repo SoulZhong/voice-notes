@@ -30,7 +30,9 @@ const RAMP_SAMPLES: u64 = 1280;
 const MERGE_GAP_MS: u64 = 300;
 /// 孤立 <200ms 压低区间丢弃,不值得动增益。
 const MIN_SPAN_MS: u64 = 200;
-const SAMPLES_PER_MS: u64 = 16;
+/// 16k 采样率下每毫秒样本数。pub(crate):retranscribe::dedup 的覆盖率换算与本
+/// 模块的 span 样本域必须同一常量,双写会在采样率口径变化时静默漂移。
+pub(crate) const SAMPLES_PER_MS: u64 = 16;
 
 /// 帧长 20ms@16k:门控判据的时间分辨率。
 const HOP: usize = 320;
@@ -213,10 +215,12 @@ pub fn build_gate_from_pcm(
     build_gate_from_envelopes(&frame_rms_pcm(mic), mic_offset_ms, &frame_rms_pcm(sys), sys_offset_ms)
 }
 
-/// 已解码 f32 PCM 的逐帧 RMS,帧长 HOP,口径同 frame_rms_bytes;尾不足一帧丢弃
-/// (frame_rms_bytes 靠字节对齐天然处理,这里样本已是 f32,直接 chunks_exact)。
+/// 已解码 f32 PCM 的逐帧 RMS,帧长 HOP,与 frame_rms_bytes 严格同构:尾不足一帧
+/// **同样产出短帧**(chunks 而非 chunks_exact)——两个入口对同一段音频必须算出
+/// 逐帧相同的包络,否则重转写与回放的门控判据在尾帧上分叉(真实录音几乎不可能
+/// 恰好是 20ms 整数倍)。
 fn frame_rms_pcm(pcm: &[f32]) -> Vec<f32> {
-    pcm.chunks_exact(HOP)
+    pcm.chunks(HOP)
         .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
         .collect()
 }
@@ -428,5 +432,17 @@ mod tests {
         let from_bytes = build_gate_from_wav_bytes(&mic_wav, 0, &sys_wav, 0);
         assert_eq!(from_pcm, from_bytes, "等价输入下两个入口必须产出相同 spans");
         assert!(!from_pcm.is_empty(), "本用例应产出压低区间,否则断言意义不大");
+
+        // 非整帧长度(真实录音的常态):补半帧尾巴,两入口仍须逐 span 严格相等——
+        // frame_rms_pcm 与 frame_rms_bytes 对尾帧的处理必须同构(都产短帧),
+        // 否则重转写与回放的门控包络在尾帧上分叉。
+        let mut mic_tail = mic_f32.clone();
+        mic_tail.extend(std::iter::repeat_n(0.03f32, HOP / 2));
+        let mut sys_tail = sys_f32.clone();
+        sys_tail.extend(std::iter::repeat_n(0.3f32, HOP / 2));
+        let from_pcm_tail = build_gate_from_pcm(&mic_tail, 0, &sys_tail, 0);
+        let from_bytes_tail =
+            build_gate_from_wav_bytes(&wav_bytes(&mic_tail), 0, &wav_bytes(&sys_tail), 0);
+        assert_eq!(from_pcm_tail, from_bytes_tail, "非整帧长度下两个入口仍必须严格一致");
     }
 }

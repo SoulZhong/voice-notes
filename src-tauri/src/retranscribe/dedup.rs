@@ -70,8 +70,8 @@ pub const GATE_COVER_MIN: f32 = 0.6;
 /// 占比。纯函数:段 [start_ms*16, end_ms*16) 与各 span 求交集样本和 / 段长。依赖
 /// spans 有序不重叠——player_gate 的合并逻辑保证这一点,此处不再重新排序/去重。
 pub fn gate_coverage(spans: &[GateSpan], start_ms: u64, end_ms: u64) -> f32 {
-    let seg_start = start_ms * 16;
-    let seg_end = end_ms * 16;
+    let seg_start = start_ms * crate::player_gate::SAMPLES_PER_MS;
+    let seg_end = end_ms * crate::player_gate::SAMPLES_PER_MS;
     if seg_end <= seg_start {
         return 0.0;
     }
