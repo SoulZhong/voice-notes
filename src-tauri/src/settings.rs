@@ -139,6 +139,11 @@ pub struct Settings {
     /// 实验字段,无 UI,手改 settings.json。
     #[serde(default)]
     pub mix_track: bool,
+    /// P3 日历匹配:录制停止后按时间窗匹配日历事件(标题+参会人入 identify 先验)。
+    /// 默认开——但真正生效还需系统日历授权(授权只能由设置页说明卡触发,自动
+    /// 路径未授权即静默跳过),默认开不会造成 surprise 弹窗。
+    #[serde(default = "default_true")]
+    pub calendar_match_enabled: bool,
 }
 
 fn default_prefix() -> String {
@@ -228,6 +233,7 @@ impl Default for Settings {
             mcp_allow_control: false,
             mcp_onboarded: false,
             mix_track: false,
+            calendar_match_enabled: true,
         }
     }
 }
@@ -591,4 +597,15 @@ mod tests {
         // 否则日后有人把 impl Default 里的 mix_track 改成 true,本测试仍然全绿。
         assert!(!Settings::default().mix_track, "读设置失败时走 unwrap_or_default,默认必须是关的");
     }
+    #[test]
+    fn calendar_match_defaults_to_true_for_legacy_settings() {
+        // 旧 settings.json(无该键):default_true 兜底——裸 #[serde(default)] 会变 false。
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.calendar_match_enabled);
+        assert!(Settings::default().calendar_match_enabled);
+        // 显式 false 尊重用户选择。
+        let off: Settings = serde_json::from_str(r#"{"calendar_match_enabled":false}"#).unwrap();
+        assert!(!off.calendar_match_enabled);
+    }
+
 }
