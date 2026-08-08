@@ -2,254 +2,160 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 落地 spec P3:录制停止后按时间窗匹配系统日历事件,标题+参会人**落盘即快照**进 `NoteMeta.calendar`;参会人作为 identify 的闭集先验候选;设置页开关(默认开)+ 授权前应用内说明卡;详情页展示/改选/清除;`Person.emails` 用于同名区分。Windows 留同形桩。
+rev2:消化 Codex 审查(18 P1 + 14 P2)。骨架修正:① `EKEventStore` 是 `!Send+!Sync` → **专用串行 calendar worker 线程**持有 store,channel 收发纯 Rust 数据,所有 IPC/挂钩经它(天然并发门);② **日历匹配移进 `spawn_refine` 线程内、identify 之前同步执行**(消除与 identify 的竞速,identify 前重读 meta);③ meta 读改写收进 `NoteStore::update_calendar`(EDIT_LOCK+NoteLock,持锁条件复查);④ 清除加 tombstone(`calendar_cleared`),backfill/自动匹配不覆盖用户决定;⑤ 隐私文案如实(启用 AI 精修时标题/人名会发给所选 provider);⑥ 快照序列化不省略字段(TS 必填对齐);⑦ Person.emails 计入合并并集/journal 失效/空档判定;⑧ 授权态用 enum(含 macOS 14 write-only);删 CalendarSource trait 声明与 calendar_auth_needed 事件(权限态直接查询)。
 
-**Architecture:** 新模块 `src-tauri/src/calendar.rs`(macOS,objc2-event-kit)+ `calendar_stub.rs`(非 macOS 同形桩,`#[path]` 顶替——仿 `audio/aec` 形态)。EventKit 访问隔离在 `CalendarSource` trait 后面,时间窗匹配是纯函数(单测)。停止挂钩在 `actor.rs` DoFinalize 的 `spawn_refine` 旁起后台线程;授权流程绝不从后台线程发起——未授权时只发 `calendar_auth_needed` 事件,授权入口在设置页说明卡。identify 侧:`IdentifyContext` 增 `calendar` 字段,参会人成为候选第④路。
+**Goal:** 录制停止后按时间窗匹配日历事件,标题+参会人落盘即快照;参会人作 identify 闭集先验;设置页开关(默认开)+ 授权说明卡;详情页展示/改选/清除;`Person.emails` 同名区分。Windows 同形桩。
 
-**Tech Stack:** `objc2-event-kit 0.3` + `objc2 0.6` + `objc2-foundation 0.3` + `block2 0.6`(全家已锁在 Cargo.lock 传递依赖,版本必须对齐避免双份 objc2);chrono。
-
-**Spec:** `docs/superpowers/specs/2026-08-08-speaker-context-inference-design.md`(rev2「日历集成设计(P3)」节)
-**基线:** 分支 `feat/speaker-context-p3` 叠在 `feat/speaker-context-p2a`(PR #80)上。
+**Spec:** spec rev2「日历集成设计(P3)」节;**基线:** 分支 `feat/speaker-context-p3` 叠在 PR #80 上。
 
 ## Global Constraints
 
-- 日历任何失败(无权限/EventKit 异常/解码)绝不影响录制与精修:后台线程 best-effort,只留日志。
-- **授权只能由用户动作发起**(设置页说明卡「继续」按钮);停止挂钩发现未授权只 emit `calendar_auth_needed`,绝不拉系统弹窗。
-- macOS 13 兼容:14+ 用 `requestFullAccessToEvents`,13 回退 `requestAccessToEntityType`;运行期用 `respondsToSelector` 分叉,不能只靠编译期。
-- 落盘即快照:`NoteMeta.calendar` 存 title/attendees 副本,**不依赖 event_id 活性**;event_id 仅供改选时重新定位。
-- 匹配边界(spec):排除全天事件;`ended_at` 空用最后一段时间戳兜底;重叠比例最高者胜;**并列平手不自动绑定**;时区取系统本地(EventKit 返回绝对时间)。
-- 新 serde 字段一律 `#[serde(default, skip_serializing_if = ...)]`;`Settings` 默认 true 的 bool **必须** `#[serde(default = "default_true")]`(settings.rs:187 警示注释)且手写 `impl Default` 同步补行。
-- 与 spec 的收窄:授权引导入口 = 设置页说明卡 + 详情页未授权提示行,**不做全局弹窗**(默认开语义 = 授权后自动匹配,授权前静默等待引导);`Person.emails` 的记录时机 = identify 建议确认时参会人名精确匹配(手动关联路径后续再接)。
-- 前端文案全走 i18n(zh/en 双写);invoke 一律经 `$lib/notes`/`$lib/people` 薄封装。
-- 不跑全量 `cargo fmt`;新增 IPC 留意 lib.rs 两处 generate_handler 源码解析测试;每任务测试绿后提交。
+- 日历任何失败绝不影响录制/精修:best-effort,只留日志。授权只能由用户动作发起(设置页说明卡);自动路径未授权即静默返回。
+- EventKit 规则:store 只活在 calendar worker 线程;worker 内 `objc2::rc::autoreleasepool` 包裹每次请求;所有可空返回(eventIdentifier/title/attendees/name)显式处理,无 identifier 的事件跳过;**按 objc2-event-kit 0.3.2 生成签名实现,禁止 msg_send 猜 selector**。
+- 匹配规则:排除全天;**重叠时长(ms)最大**者胜;平手(差 <1000ms)不自动绑定;`ended_at` 空用最后一段 end_ms 兜底;attendees 过滤 declined 与 room/resource,快照上限 100 人。
+- meta 写入唯一入口 `NoteStore::update_calendar`(锁内读-改-写-原子落盘;auto 路径持锁复查「仍无快照且未被清除」)。
+- 隐私文案(plist/说明卡统一):「日程数据保存在本机;若启用 AI 精修,会议标题与参会人名会随转写一起发送给你选择的 AI 服务。」
+- serde:`CalendarSnapshot`/`CalendarAttendee` **全字段固定序列化**(不 skip,前端必填类型成立);`NoteMeta.calendar`/`calendar_cleared` 用 default;Settings 默认 true 走 `default_true` + 手写 Default 补行。
+- 前端 i18n 双语;新 IPC 过两处 generate_handler 源码解析测试;不跑全量 cargo fmt。
 
 ---
 
 ### Task 1: 依赖 + plist + entitlement + 校验脚本
 
-**Files:** `src-tauri/Cargo.toml`(macOS 段 :97-101)、`src-tauri/Info.plist`、`src-tauri/Entitlements.plist`、`scripts/check_macos_entitlements.py`
+- [ ] Cargo.toml macOS 段:`objc2 = "0.6"`、`objc2-foundation = "0.3"`、`block2 = "0.6"`、`objc2-event-kit = { version = "0.3", features = ["EKEventStore", "EKEvent", "EKCalendarItem", "EKCalendar", "EKObject", "EKParticipant", "EKTypes", "block2"] }`(features 以 0.3.2 文档为准,编译报缺再补);`cargo tree -i objc2 | head` 确认单版本。
+- [ ] Info.plist 两键(文案用上方隐私口径);Entitlements.plist 加 `com.apple.security.personal-information.calendars`。
+- [ ] `check_macos_entitlements.py` 改表驱动(entitlements 三键 + Info.plist 三键存在且非空);打包后校验超范围,PR 注明。
+- [ ] 提交。
 
-- [ ] Cargo.toml macOS 段加(feature 名以 crate 0.3 文档为准,起点:`EKEventStore`/`EKEvent`/`EKParticipant`/`block2`):
-
-```toml
-objc2 = "0.6"
-objc2-foundation = "0.3"
-block2 = "0.6"
-objc2-event-kit = { version = "0.3", features = ["EKEventStore", "EKEvent", "EKCalendarItem", "EKParticipant", "EKTypes", "block2"] }
-```
-
-  `cargo tree -p objc2 2>/dev/null | head -1` 确认仍是单版本 0.6.x。
-- [ ] Info.plist 加两键(与麦克风键同级):`NSCalendarsUsageDescription` / `NSCalendarsFullAccessUsageDescription`,文案:「读取日程标题与参会人,用于把录音自动关联到会议并帮助认出说话人;日程数据只在本机使用。」
-- [ ] Entitlements.plist 加 `com.apple.security.personal-information.calendars` = true。
-- [ ] 校验脚本改表驱动:`REQUIRED_ENTITLEMENTS = {"com.apple.security.cs.disable-library-validation": True, "com.apple.security.device.audio-input": True, "com.apple.security.personal-information.calendars": True}` 循环校验;新增 Info.plist 校验(`NSMicrophoneUsageDescription` + 两个日历键存在且非空)。`python3 scripts/check_macos_entitlements.py` 通过。
-- [ ] 提交 `build(calendar): EventKit 依赖与授权声明(objc2 单版本对齐)`。
-
----
-
-### Task 2: CalendarSnapshot + NoteMeta.calendar
-
-**Files:** `src-tauri/src/store/mod.rs`(:50-60 NoteMeta、:135 write_meta_atomic 旁)、字面量修复(`notes.rs:485`、`writer.rs:135`、`disk.rs:106`、`export.rs:361/418/439/460`,以编译错误为准)、`src/lib/notes.ts:15`(前端镜像)
+### Task 2: CalendarSnapshot + NoteMeta 字段 + tombstone
 
 ```rust
-/// 日历事件快照(P3):落盘即快照——title/attendees 是匹配时刻的副本,不依赖
-/// event_id 活性;event_id 仅供改选时重新定位,事件被改/删后快照仍自洽。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalendarSnapshot {
     pub event_id: String,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attendees: Vec<CalendarAttendee>,
-    pub matched_at: String, // RFC3339;区分"自动匹配"与"手动改选"不落盘,回执由 matched_at 变化体现
+    #[serde(default)]
+    pub attendees: Vec<CalendarAttendee>,   // 固定序列化(空数组也写)
+    pub matched_at: String,
+    #[serde(default)]
+    pub match_kind: String,                 // "auto" | "manual"
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalendarAttendee {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub email: String,
-    #[serde(default)]
-    pub is_me: bool,
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub email: String,    // 固定序列化;规范化:trim+小写,mailto 大小写不敏感剥离+percent-decode
+    #[serde(default)] pub is_me: bool,
 }
 ```
 
-- [ ] `NoteMeta` 加 `#[serde(default, skip_serializing_if = "Option::is_none")] pub calendar: Option<CalendarSnapshot>,`;`cargo check` 列字面量补 `calendar: None`。
-- [ ] 单测(store/mod.rs 或 notes.rs tests):旧 meta.json(无 calendar 键)反序列化 → None;带 calendar 往返保真。
-- [ ] `src/lib/notes.ts` `NoteMeta` 类型加 `calendar?: { event_id: string; title: string; attendees: { name: string; email: string; is_me: boolean }[]; matched_at: string } | null;`(导出 `CalendarSnapshot` 类型)。
-- [ ] 提交 `feat(store): NoteMeta.calendar 快照字段(serde default 向后兼容)`。
-
----
+- [ ] `NoteMeta` 加两字段:`calendar: Option<CalendarSnapshot>`(default/skip_none)+ `#[serde(default)] pub calendar_cleared: bool`(用户明确清除的 tombstone:auto/backfill 永不再绑,手动改选可推翻并复位)。字面量修复(`notes.rs:485`、`writer.rs:135`、`disk.rs:106`、`export.rs` 四处,以编译错误为准)。
+- [ ] `NoteStore::update_calendar(&self, id, f: impl FnOnce(&mut NoteMeta) -> bool) -> anyhow::Result<bool>`:EDIT_LOCK+NoteLock 内 read_meta→f→true 才 write_meta_atomic(仿 `rename` 的锁纪律);f 返回 false = 未修改。单测:旧 meta 兼容、往返保真、update_calendar 条件写、tmp 无残留。
+- [ ] 前端 `src/lib/notes.ts`:`NoteMeta` 加 `calendar?: CalendarSnapshot | null; calendar_cleared?: boolean;`,导出 `CalendarSnapshot`/`CalendarAttendee` 类型(字段全必填)。
+- [ ] 提交。
 
 ### Task 3: settings 开关
 
-**Files:** `src-tauri/src/settings.rs`(字段 + Default + 单测)
+- [ ] `#[serde(default = "default_true")] pub calendar_match_enabled: bool` + Default 补行 + 旧文件缺键→true 单测。提交。
 
-- [ ] `#[serde(default = "default_true")] pub calendar_match_enabled: bool,`;`impl Default` 补 `calendar_match_enabled: true,`;单测:旧 settings.json(无该键)→ true(仿现有 default_true 字段测试)。
-- [ ] 提交 `feat(settings): calendar_match_enabled(默认开)`。
+### Task 4: calendar worker(EventKit 实现 + 桩 + 纯匹配)
 
----
+**Files:** `src-tauri/src/calendar.rs`(macOS)/ `calendar_stub.rs`(其它平台,`#[path]` 顶替);lib.rs 模块声明。
 
-### Task 4: calendar 模块(EventKit 实现 + 桩 + 纯匹配逻辑)
-
-**Files:**
-- Create: `src-tauri/src/calendar.rs`(macOS)
-- Create: `src-tauri/src/calendar_stub.rs`(非 macOS 同形桩:权限恒 "unavailable"、events 恒空、request 恒 false)
-- Modify: `src-tauri/src/lib.rs` 模块声明区:
+**对外接口(两侧同形,全部经 worker channel,调用方任意线程)**:
 
 ```rust
-#[cfg(target_os = "macos")]
-mod calendar;
-#[cfg(not(target_os = "macos"))]
-#[path = "calendar_stub.rs"]
-mod calendar;
-```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission { Full, WriteOnly, Denied, NotDetermined, Unavailable }
+// WriteOnly(macOS 14 只写授权)读不了事件但≠用户拒读,前端文案单列"权限不足,去系统设置改为完全访问"。
 
-**共享接口(两侧同形;纯逻辑放 macOS 文件里但不依赖 EventKit 类型,stub 直接 `pub use` 或复制小函数——实现时取更省的)**:
-
-```rust
-/// 与 EventKit 解耦的事件视图:匹配逻辑只认它,可单测。
 #[derive(Debug, Clone)]
-pub struct EventInfo {
-    pub event_id: String,
-    pub title: String,
-    pub start_ms: i64,   // unix ms
-    pub end_ms: i64,
-    pub all_day: bool,
-    pub attendees: Vec<crate::store::CalendarAttendee>,
-}
+pub struct EventInfo { pub event_id: String, pub title: String, pub start_ms: i64, pub end_ms: i64, pub all_day: bool, pub attendees: Vec<crate::store::CalendarAttendee> }
 
-/// 授权态:"full" | "denied" | "not_determined" | "unavailable"(非 macOS 恒此值)。
-pub fn permission_status() -> &'static str;
-/// 发起系统授权(必须由用户动作触发;内部按 macOS 版本分叉 14+/13 API)。
-/// 阻塞等 completion(调用方已在 spawn_blocking),返回是否授权。
-pub fn request_permission() -> bool;
-/// 时间窗内事件(已授权前提;EventKit predicate 查询,失败返回 Err 只记日志)。
+pub fn permission_status() -> Permission;                       // 快速查询(worker 内取,同步等)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthOutcome { Granted, Denied, Insufficient, Error, Timeout }
+pub fn request_permission() -> AuthOutcome;                     // 用户动作触发;60s 超时;NSError→Error
 pub fn events_between(start_ms: i64, end_ms: i64) -> anyhow::Result<Vec<EventInfo>>;
 
-/// 纯匹配:排除全天;按与 [start,end) 的重叠时长取最大;并列平手(重叠差 <1s)
-/// 返回 None(不自动绑定,候选留给用户改选)。零重叠返回 None。
-pub fn best_match(events: &[EventInfo], start_ms: i64, end_ms: i64) -> Option<&EventInfo>;
+pub fn best_match(events: &[EventInfo], start_ms: i64, end_ms: i64) -> Option<&EventInfo>;  // 纯函数
 ```
 
-- [ ] **Step 1: 纯函数先行(TDD)**:`best_match` 单测四条——全天排除、重叠最长胜、平手 None、零重叠 None。放在两侧共享的位置(macOS 文件 + stub `include!` 或直接双份小函数,取编译最省方案;测试跑在宿主平台即可)。
-- [ ] **Step 2: EventKit 实现**(macOS)。要点:
-  - `EKEventStore::new()` 进程内单例(`OnceLock`);
-  - `permission_status`:`EKEventStore::authorizationStatusForEntityType(EKEntityType::Event)` 映射(14+ 的 `FullAccess` 与 13 的 `Authorized` 都算 "full");
-  - `request_permission`:`respondsToSelector(sel!(requestFullAccessToEventsWithCompletion:))` 分叉 14+/13 API,`block2::RcBlock` + `std::sync::mpsc` 等 completion(60s 超时按 false);
-  - `events_between`:`NSDate::dateWithTimeIntervalSince1970` 造窗 → `predicateForEventsWithStartDate_endDate_calendars(None)` → `eventsMatchingPredicate`;逐事件取 `eventIdentifier`/`title`/`startDate`/`endDate`/`isAllDay`/`attendees`(`EKParticipant`:`name`、`URL`(strip `mailto:` 得 email)、`isCurrentUser`→is_me);API 名以 objc2-event-kit 0.3 生成绑定为准,msg_send 兜底;
-  - 全部 `unsafe` 收在本文件,对外安全接口。
-- [ ] **Step 3**:`cargo check --lib`(macOS 宿主)+ 纯函数测试绿;提交 `feat(calendar): EventKit 访问层与纯匹配逻辑(非 macOS 同形桩)`。
+- [ ] **Step 1(TDD)**:`best_match` 单测:全天排除/重叠时长最大胜/平手(<1s)None/零重叠 None。纯函数与 `EventInfo` 放平台无关位置(两文件顶部 `include!("calendar_common.rs")` 或第三个共享文件 `calendar_common.rs` 由两侧 `include!`——选共享文件,测试在 stub 平台也跑)。
+- [ ] **Step 2:worker**(macOS):`std::mpsc::Sender<Req>` 静态 OnceLock;首次使用起 `calendar-worker` 线程,线程内建 `EKEventStore` 并循环处理 `Req::{Status, Request, Events{start,end}}`(reply oneshot channel);每单 `autoreleasepool`;版本分叉:`NSProcessInfo` `isOperatingSystemAtLeastVersion(14)` → `requestFullAccessToEventsWithCompletion`,否则 `requestAccessToEntityType_completion`;completion 经 `block2::RcBlock` + mpsc 回传 (granted, err_desc)。可空处理:`eventIdentifier()?` 无则跳过;attendees 过滤 `participantType` 为 room/resource 与 `participantStatus == declined`(feature 缺失时保守保留并注释);email 从 `URL().absoluteString()` 规范化。
+- [ ] **Step 3**:stub 恒 `Unavailable`/`Error`/`Ok(vec![])`。`cargo check --lib` + 纯函数测试绿;提交。
 
----
+### Task 5: 匹配落盘 + spawn_refine 前置挂钩 + IPC
 
-### Task 5: 停止挂钩 + 匹配/改选/回填 IPC
-
-**Files:** `src-tauri/src/lib.rs`(挂钩 + 5 条命令 + 注册)、`src-tauri/src/lifecycle/actor.rs:511` 旁(一行调用)
-
-- [ ] **匹配落盘函数**(lib.rs,后台线程用;read-modify-write 走 `read_meta`+`write_meta_atomic`,在 `drop(o)` 之后运行,无锁冲突):
+- [ ] **落盘函数**(lib.rs):
 
 ```rust
-/// 停止后日历匹配(best-effort):已授权且开关开才查;未授权发 calendar_auth_needed
-/// 事件(一次授权入口在设置页说明卡)。ended_at 空用最后一段时间戳兜底。
-fn spawn_calendar_match(app: &AppHandle, note_id: String) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        let run = || -> anyhow::Result<()> {
-            let s = app.path().app_data_dir().map(|d| settings::load(&d)).map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !s.calendar_match_enabled { return Ok(()); }
-            match calendar::permission_status() {
-                "full" => {}
-                "not_determined" => { let _ = app.emit("calendar_auth_needed", &note_id); return Ok(()); }
-                _ => return Ok(()), // denied/unavailable:静默
-            }
-            match_and_store_calendar(&app, &note_id)
-        };
-        if let Err(e) = run() { eprintln!("calendar({note_id}): 匹配失败(不影响笔记): {e}"); }
-    });
+/// 自动匹配(停止后/backfill 共用):开关+授权满足才查;持锁复查「无快照且未清除」
+/// 才写(查询期间用户手动改选/清除则放弃)。返回是否写入。
+fn match_and_store_calendar(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
+    let s = ...settings::load...;
+    if !s.calendar_match_enabled { return Ok(false); }
+    if calendar::permission_status() != calendar::Permission::Full { return Ok(false); }
+    let root = notes_dir(app)?;
+    let note = store::NoteStore::new(root.clone()).load(note_id)?;
+    if note.meta.calendar.is_some() || note.meta.calendar_cleared { return Ok(false); }
+    let (start_ms, end_ms) = note_window_ms(&note.meta, &note.segments);   // 纯函数,ended_at 兜底
+    let events = calendar::events_between(start_ms - 60_000, end_ms + 60_000)?;
+    let Some(ev) = calendar::best_match(&events, start_ms, end_ms) else { return Ok(false) };
+    let snap = snapshot_of(ev, "auto");                                   // attendees 截 100
+    store::NoteStore::new(root).update_calendar(note_id, |meta| {
+        if meta.calendar.is_some() || meta.calendar_cleared { return false; } // 持锁复查
+        meta.calendar = Some(snap.clone());
+        true
+    })
 }
-
-/// 读 meta(+段兜底)→ events_between → best_match → 写快照。已有 calendar 且非
-/// force 时跳过(不覆盖手动改选)。返回是否写入。
-fn match_and_store_calendar(app: &AppHandle, note_id: &str) -> anyhow::Result<()>;
 ```
 
-  时间换算:`chrono::DateTime::parse_from_rfc3339(started_at).timestamp_millis()`;`ended_at` 空 → `started_at + note.segments 最末 end_ms`。
-- [ ] **挂钩**:`actor.rs` DoFinalize 分支 `crate::do_stop_tail(&app, note_id)` 之后加 `crate::spawn_calendar_match(&app, finalize 成功的 o.note_id)`(与 spawn_refine 同款用槽内 note_id;finalize 失败不挂)。
-- [ ] **IPC 五条**(注册进 generate_handler,过两处源码解析测试):
+- [ ] **挂钩位置 = `spawn_refine` 线程内**(lib.rs,`run_local` 之后、identify 之前;该线程本就是停止后后台线程,EventKit 查询经 worker 不碰 actor):
 
 ```rust
-#[tauri::command] fn calendar_permission() -> String;                      // 函数体内薄转 calendar::permission_status
-#[tauri::command] async fn request_calendar_permission(app: AppHandle) -> Result<bool, String>;
-//   spawn_blocking 内 calendar::request_permission();授权成功后对无 calendar 的近期笔记
-//   触发一次 backfill(最近 30 天,best-effort 后台)。
-#[tauri::command] fn list_calendar_candidates(app: AppHandle, id: String) -> Result<Vec<ipc::CalendarCandidate>, String>;
-//   {event_id,title,start_ms,end_ms,attendee_n}:笔记时间窗 ±2h 的非全天事件,按重叠降序。
-#[tauri::command] fn set_note_calendar_event(app: AppHandle, id: String, event_id: Option<String>) -> Result<(), String>;
-//   Some=按 event_id 从候选窗重取该事件快照写入(matched_at=now);None=清除字段。
-//   守卫:validate_note_id + 录制中拒绝(meta 由 writer 独占)。
-#[tauri::command] async fn backfill_calendar_matches(app: AppHandle) -> Result<u32, String>;
-//   spawn_blocking:全部无 calendar 的完成态笔记逐一 match_and_store,返回写入数。
+// 日历匹配先于 identify:参会人闭集先验要进 ctx。失败不阻塞。
+let calendar_snap = match match_and_store_calendar(&app, &note_id) {
+    Ok(_) => store::NoteStore::new(notes_dir(&app)?.clone()).load(&note_id).ok().and_then(|n| n.meta.calendar),
+    Err(e) => { eprintln!("calendar({note_id}): {e}"); None }
+};
+// …identify 挂钩处把 calendar_snap.as_ref() 传给 run_identify(Task 6 改签名)
 ```
 
-  `ipc::CalendarCandidate` 新类型(Serialize)。
-- [ ] 纯逻辑单测:`note_window_ms(meta, segments) -> (i64, i64)`(ended_at 兜底)抽纯函数测两条。
-- [ ] 提交 `feat(calendar): 停止挂钩、匹配落盘与改选/回填命令`。
-
----
+  (identify_note 手动命令同样先读 meta.calendar 传入。)不再改 actor.rs;refine 完全关闭的用户,identify 也不会跑,日历匹配仍应发生 → `spawn_refine` 在 run_local 后必经此段,与 refine 开关无关,满足。
+- [ ] **IPC**(全部 async + spawn_blocking,经 worker 不阻塞 IPC 线程):
+  - `calendar_permission() -> String`(Permission serde 名);
+  - `request_calendar_permission() -> String`(AuthOutcome;Granted 后后台 backfill 最近 30 天 best-effort);
+  - `list_calendar_candidates(id) -> Vec<ipc::CalendarCandidate{event_id,title,start_ms,end_ms,attendee_n,overlap_ms}>`:窗口 = 笔记当天 00:00 前 2h 至次日 00:00 后 2h,非全天,按 overlap_ms 降序(0 也列出——延迟开录场景);
+  - `set_note_calendar_event(id, event_id: Option<String>)`:守卫 validate+录制中拒绝;Some→候选窗重取快照 `match_kind="manual"`、复位 `calendar_cleared=false`;None→`calendar=None; calendar_cleared=true`;均经 `update_calendar`;
+  - `backfill_calendar_matches() -> u32`:**一次**拉取(最早无快照笔记 start .. 最晚 end)事件,内存逐笔记 best_match,`update_calendar` 计数;静态 `CALENDAR_BACKFILL_GATE: Mutex<()>` 防并发重入。
+- [ ] `note_window_ms` 单测两条;注册命令;提交。
 
 ### Task 6: identify 接入 + Person.emails
 
-**Files:** `src-tauri/src/refine/identify.rs`、`src-tauri/src/store/voiceprints.rs`、`src-tauri/src/lib.rs`(两处 run_identify 调用点 + apply)
-
-- [ ] `Person` 加 `#[serde(default, skip_serializing_if = "Vec::is_empty")] pub emails: Vec<String>,`(构造点补字段;schema_version 数值不动——仓库该字段无读者,bump 纯声明,如实注释)。`VoiceprintStore::add_person_email(id, email)`(VP_LOCK 内去重追加)+ 单测。
-- [ ] `IdentifyContext` 加 `#[serde(skip_serializing_if = "Option::is_none")] pub calendar: Option<CalendarContext>`:
-
-```rust
-#[derive(Debug, Serialize)]
-pub struct CalendarContext {
-    pub title: String,
-    pub attendees: Vec<String>, // 名字列表;is_me 的标注成 "名字(我)"
-}
-```
-
-  `build_context` 加参 `calendar: Option<&crate::store::CalendarSnapshot>`;候选召回加第④路:参会人 email 精确命中 `Person.emails` 的人、或参会人名精确等于库中人名的人(闭集先验,排履历最前);prompt 无需改(ctx 序列化自带),SYSTEM_PROMPT 补一句「calendar 为当场会议的日历事件(标题与参会人名单):参会人是强先验候选,但允许临时加入者/代参会,不是硬约束」。
-- [ ] 两处 run_identify 调用点(spawn_refine 挂钩 + identify_note)读 `NoteMeta.calendar` 传入(`store::NoteStore::load` 的 meta 或 read_meta)。
-- [ ] `apply_identify_suggestion` 成功路径补:目标人名精确等于某参会人名且 attendee.email 非空 → `add_person_email`(best-effort,失败只日志)——下一场同人 email 精确匹配,不再靠模糊猜。
-- [ ] 单测:candidates 第④路(email 命中 + 名字命中 + is_me 标注);calendar 字段序列化进 ctx。
-- [ ] 提交 `feat(identify): 日历参会人闭集先验与 Person.emails`。
-
----
+- [ ] `Person.emails: Vec<String>`(default/skip_empty 可以——后端自读自写,前端不消费);连锁:**合并路径 emails 并集**(`merge_journaled`/`do_merge_person` 的字段手工合并处,以 grep `winner_person`/合并实现为准)、`delete_person_if_empty` 计入 emails 非空即拒删、`add_person_email(id, email)`(VP_LOCK、规范化、去重、`journal_invalidate(该人, "此人档案有更新")`)。单测:并集、拒删、去重。
+- [ ] `IdentifyContext.calendar: Option<CalendarContext{title, attendees: Vec<String>}>`(is_me 标注成 `名字(我)`;**上限 30 人**,超出截断并在字段里注明 `"(其余 N 人略)"` 附加项);`build_context`/`run_identify` 加参;候选第④路:attendee email 命中 `Person.emails` 或 attendee 名精确等于库中人名 → 候选(**插在最前**,超 cap 时后路被挤,顺序稳定:email 命中→名字命中→原三路);SYSTEM_PROMPT 补 calendar 释义句(闭集先验非硬约束)。
+- [ ] `apply_identify_suggestion` 成功后:目标人名与某 attendee 名精确相等 **且该名在参会人中唯一 且该名在库中唯一** 且 email 非空 → `add_person_email`(best-effort;三重唯一性防同名污染,残余风险=确认本身指错人,注释注明)。
+- [ ] 单测:第④路两种命中与排序、cap 截断、calendar 序列化进 ctx、apply 写 email 的唯一性防线。
+- [ ] 提交。
 
 ### Task 7: 设置页开关 + 授权说明卡
 
-**Files:** `src/routes/settings/+page.svelte`(sync :213 / saveSetting :376 / 模板 :811 附近)、`src/lib/models.ts` 或 `src/lib/notes.ts`(命令绑定,就近)、`src/lib/i18n/dict/settings.ts`
-
-- [ ] 绑定:`calendarPermission()` / `requestCalendarPermission()`;本地镜像 `calendarMatch` + `calPerm`(挂载时查询)。
-- [ ] 模板(录音区块内):开关行(仿 keep_audio)+ 权限态副行:
-  - 开关开且 `calPerm === "not_determined"` → 显示**说明卡**(卡片内文案讲清为什么+只在本机,按钮「继续」→ `requestCalendarPermission()`;授权成功刷新 calPerm,失败提示去系统设置);
-  - `calPerm === "denied"` → 提示行「日历权限被拒,去系统设置开启」;
-  - 开关关闭 → 说明卡/提示都不显示。仿 `toggleShortcutEnabled` 形态:开关本身照常 saveSetting,授权副作用只由说明卡按钮触发(**开关切换绝不直接拉系统弹窗**)。
-- [ ] layout 监听 `calendar_auth_needed` → 置一个轻量提示(复用现有 toast/banner 机制,若无则在设置入口加红点 state;实现取现有机制,不新造)。
-- [ ] i18n zh/en:`settings.calendar.label/desc/cardTitle/cardBody/cardContinue/denied`。
-- [ ] `npm run check` + vitest 绿;提交 `feat(ui): 日历匹配开关与授权说明卡`。
-
----
+- [ ] 绑定 `calendarPermission`/`requestCalendarPermission`(`$lib/notes.ts` 就近);设置页:开关行(仿 keep_audio)+ 状态副区:开且 `not_determined` → 说明卡(隐私口径文案 + 「继续」→ request → 刷新态;`denied`/`insufficient` → 去系统设置提示;`unavailable`(Windows)→ 整行隐藏)。开关切换绝不直接拉系统弹窗。
+- [ ] i18n zh/en:`settings.calendar.{label,desc,cardTitle,cardBody,cardContinue,denied,insufficient}`。
+- [ ] `npm run check` + vitest;提交。
 
 ### Task 8: 详情页日历行
 
-**Files:** `src/routes/notes/[id]/+page.svelte`(:1118 `.meta` 行后)、`src/lib/notes.ts`(3 个命令绑定 + 类型)、`src/lib/i18n/dict/notes.ts`
-
-- [ ] `notes.ts`:`listCalendarCandidates(id)` / `setNoteCalendarEvent(id, eventId | null)`。
-- [ ] `.header-main` 内 `.meta` 之后加日历行:
-  - 有快照:📅 `{title}` + 参会人数;悬停/点击展开参会人名单(is_me 标「我」);「改选」→ 下拉列出 candidates(标题+时间+重叠),选中调 set;「清除」→ set(null);
-  - 无快照且开关开且已授权:「关联日程…」按钮(打开同一候选下拉);
-  - 未授权:灰字提示(链接去设置页)。
-- [ ] i18n zh/en:`notes.calendar.*`。
-- [ ] `npm run check` + vitest 绿;提交 `feat(ui): 详情页日历事件行(展示/改选/清除)`。
+- [ ] `notes.ts`:`listCalendarCandidates`/`setNoteCalendarEvent` 绑定。
+- [ ] `.header-main` 的 `.meta` 后加行:有快照 → 📅 标题+人数,展开名单(is_me 标「我」),「改选」下拉(候选含时间与 overlap_ms 显示)/「清除」;无快照且开且 `full` → 「关联日程…」;`not_determined`/`denied` 且开 → 灰字去设置提示;`unavailable`/开关关 → 不渲染。
+- [ ] i18n `notes.calendar.*`;`npm run check` + vitest;提交。
 
 ---
 
 ## 收尾核对
 
-- [ ] `cargo test --lib --bins` + `cargo test --test mcp_stdio` + `npm run check` + `npm test` 全绿;`python3 scripts/check_macos_entitlements.py` 通过;`cargo tree -p objc2` 单版本
-- [ ] 真机冒烟(PR 描述):① 设置页开关默认开,说明卡出现 → 「继续」拉起系统授权;② 录一段覆盖某日历事件的音频,停止后详情页出现事件行(标题+参会人);③ 改选/清除生效且重启保留;④ backfill 给历史笔记补快照;⑤ 拒权后录制/精修完全不受影响,详情页显示去设置提示;⑥ identify:参会人出现在候选、prompt 含 calendar 字段(看 ailog);⑦ 确认建议后 Person.emails 记录(voiceprints.json 可见)
-- [ ] PR 描述注明:授权引导两处收窄(设置页说明卡+详情页提示,不做全局弹窗);Windows 桩恒 unavailable;EventKit 绑定 API 名如与 objc2-event-kit 0.3 生成名有出入以实际为准
+- [ ] `cargo test --lib --bins` + mcp_stdio + `npm run check` + `npm test` 全绿;entitlements 脚本过;`cargo tree -i objc2` 单版本
+- [ ] 真机冒烟(PR 描述):① 说明卡→系统授权;② 覆盖日历事件的录音停止后详情页出现事件行且 identify prompt 含 calendar(ailog);③ 改选/清除持久且 backfill 不复活已清除;④ 拒权/只写权限文案正确且录制精修无恙;⑤ 确认建议后 voiceprints.json 出现 emails;⑥ Windows 构建(桩)通过
+- [ ] PR 注明:打包后 plist 校验超范围;participantType/Status 过滤若 feature 不可用的降级;授权引导两处(设置页+详情页),无全局弹窗
