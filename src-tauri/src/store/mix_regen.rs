@@ -165,7 +165,27 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
     // 对齐映射:回放侧已估过就复用(同一笔记同一映射,回放与成品轨口径一致);
     // 没有则现估,worth_correcting 才采纳,采纳即落盘供回放复用。估不出 = 不纠正,
     // 与 align_mic_track 的保守语义一致(历史轨漂移烘进产物是 spec 已知限制 1)。
-    let map = crate::store::align::read(dir).or_else(|| {
+    //
+    // 新鲜度校验(codex 第四轮 P1):续录会改写/追加源轨而不清 align.json;player.rs
+    // 复用前按源轨 mtime 校验,这里同口径——映射文件必须晚于两条源轨的最后修改才可
+    // 复用,否则按不存在处理、现估重写(过期映射会把拉伸/错位永久烘进成品轨)。
+    // 任何 mtime 读不到都按不新鲜(保守重估,代价只是几秒计算)。
+    let src_mtime = |name: &str| -> Option<std::time::SystemTime> {
+        ["wav", "m4a"].iter().find_map(|ext| {
+            std::fs::metadata(dir.join(format!("{name}.{ext}")))
+                .ok()
+                .and_then(|m| m.modified().ok())
+        })
+    };
+    let align_fresh = (|| {
+        let a = std::fs::metadata(dir.join(crate::store::align::ALIGN_FILE))
+            .ok()?
+            .modified()
+            .ok()?;
+        Some(a > src_mtime("mic")? && a > src_mtime("system")?)
+    })()
+    .unwrap_or(false);
+    let map = (if align_fresh { crate::store::align::read(dir) } else { None }).or_else(|| {
         let a = crate::player_align::estimate(mic, mic_off, sys, sys_off)?;
         if !crate::player_align::worth_correcting(&a) {
             return None;
@@ -392,6 +412,44 @@ mod tests {
         let meta = crate::store::audio::load_audio_meta(dir.path());
         let t = meta.tracks.get("mixed").unwrap();
         assert!(t.codec.is_none() && t.duration_ms.is_none(), "过期读数必须清零");
+    }
+
+    /// codex 第四轮 P1:align.json 早于源轨最后修改(续录改写过源轨)即视为过期,
+    /// 必须丢弃重估——过期映射会把拉伸/错位烘进成品轨。短轨重估必然返回 None,
+    /// 所以「过期被丢弃」的可观察结果就是直混(offset 不带映射平移、逐样本和)。
+    #[test]
+    fn stale_align_map_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        // 先写一份"把 mic 平移 +5s"的映射,再写源轨 → 源轨更新于映射之后 = 映射过期。
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 5.0), (10.0, 15.0)]).unwrap();
+        crate::store::align::write(dir.path(), &map).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let n = 1600usize;
+        std::fs::write(dir.path().join("mic.wav"), wav(&vec![100i16; n])).unwrap();
+        std::fs::write(dir.path().join("system.wav"), wav(&vec![10i16; n])).unwrap();
+        let outcome = regen_note_dir(dir.path()).unwrap();
+        assert_eq!(outcome.offset_ms, 0, "过期映射不得参与(否则 offset 被平移 5s)");
+        assert_eq!(outcome.track_ms, 100, "1600 样本直混 = 100ms,无 5s 拉伸");
+        let pcm = pcm_of(&std::fs::read(dir.path().join("mixed.wav")).unwrap());
+        assert!(pcm.iter().all(|&s| (s as i32 - 110).abs() <= 1), "直混逐样本和");
+    }
+
+    /// 对照:映射晚于源轨(新鲜)即复用——mic 被平移 +5s 烘进产物,时长膨胀。
+    #[test]
+    fn fresh_align_map_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 1600usize;
+        std::fs::write(dir.path().join("mic.wav"), wav(&vec![100i16; n])).unwrap();
+        std::fs::write(dir.path().join("system.wav"), wav(&vec![10i16; n])).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let map = crate::player_align::TimeMap::new(vec![(0.0, 5.0), (10.0, 15.0)]).unwrap();
+        crate::store::align::write(dir.path(), &map).unwrap();
+        let outcome = regen_note_dir(dir.path()).unwrap();
+        assert!(
+            outcome.track_ms >= 5_000,
+            "新鲜映射应被复用:mic 平移 +5s,产物时长应 ≥5s,实测 {}ms",
+            outcome.track_ms
+        );
     }
 
     /// 提交序回归(codex P2):rename 落位失败时,旧 mixed.m4a 必须还在盘上,
