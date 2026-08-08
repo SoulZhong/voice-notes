@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod backfill;
 pub mod filter;
+pub mod identify;
 pub mod llm;
 pub mod recluster;
 pub mod relations;
