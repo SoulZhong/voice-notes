@@ -55,6 +55,8 @@
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
+  import Segmented from "$lib/Segmented.svelte";
+  import type { SegmentedItem } from "$lib/segmented";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -122,6 +124,33 @@
   let pendingResume = $state<{ ms: number; playing: boolean } | null>(null);
   let regenStage = $state<string | null>(null); // 非 null = 补生成进行中(值为阶段名)
   let regenErr = $state("");
+
+  // mix-switch 的 segmented 数据:有成品轨给 双轨/成品轨 切换(不可信置灰+tooltip 原因);
+  // 没有则第二段是「生成」动作段(momentary,滑块不落位),沿用 startRegen/regenStage 原逻辑。
+  const mixItems = $derived.by((): SegmentedItem[] => {
+    const dual: SegmentedItem = { id: "dual", label: t("notes.mix.dual") };
+    if (mixedInfo?.track) {
+      return [
+        dual,
+        {
+          id: "mixed",
+          label: t("notes.mix.mixed"),
+          disabled: mixedInfo.untrusted !== null,
+          title: mixedInfo.untrusted ?? t("notes.mix.title"),
+        },
+      ];
+    }
+    return [
+      dual,
+      {
+        id: "gen",
+        label: regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate"),
+        momentary: true,
+        disabled: regenStage !== null || recording.isLive,
+        title: t("notes.mix.none"),
+      },
+    ];
+  });
 
   /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
       按 (start_ms, seq) 升序,前端直接消费。 */
@@ -1381,31 +1410,15 @@
             <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
-               动作;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
+               动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
           <div class="mix-switch" title={t("notes.mix.title")}>
-            <button
-              class="link"
-              class:active={playbackScheme === "dual"}
-              onclick={() => switchScheme("dual")}>{t("notes.mix.dual")}</button
-            >
-            {#if mixedInfo?.track}
-              <button
-                class="link"
-                class:active={playbackScheme === "mixed"}
-                disabled={mixedInfo.untrusted !== null}
-                title={mixedInfo.untrusted ?? t("notes.mix.title")}
-                onclick={() => switchScheme("mixed")}>{t("notes.mix.mixed")}</button
-              >
-            {:else}
-              <button
-                class="link"
-                disabled={regenStage !== null || recording.isLive}
-                title={t("notes.mix.none")}
-                onclick={startRegen}
-              >
-                {regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate")}
-              </button>
-            {/if}
+            <Segmented
+              size="sm"
+              items={mixItems}
+              value={playbackScheme}
+              onSelect={(id) => switchScheme(id as "dual" | "mixed")}
+              onAction={() => startRegen()}
+            />
           </div>
         {/if}
         <button
@@ -1822,21 +1835,12 @@
     flex: 1;
     min-width: 0;
   }
-  /* 回放方案 A/B 切换(二期):pill 组,选中态加底色;置灰态由 button:disabled 通用样式接管 */
+  /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位 */
   .mix-switch {
     display: inline-flex;
     gap: 0.15rem;
     flex: none;
     align-items: center;
-  }
-  .mix-switch .link {
-    font-size: 0.8rem;
-    padding: 0.2em 0.55em;
-    border-radius: 999px;
-  }
-  .mix-switch .link.active {
-    background: var(--surface-sunken, rgba(0, 0, 0, 0.08));
-    color: var(--ink);
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
      纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占
