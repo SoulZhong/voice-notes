@@ -53,6 +53,8 @@
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
+  import { schemeToDefaultPlayback } from "$lib/audioScheme";
+  import { getSettings } from "$lib/models";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
@@ -120,6 +122,9 @@
   // 回放方案 A/B(二期):双轨对齐+门控(A)/成品轨直放(B)。会话内状态,
   // 切笔记复位——对比场景本来就是当场切,不做持久化。
   let playbackScheme = $state<"dual" | "mixed">("dual");
+  /** 设置页三档决定的默认回放(spec 2026-08-10)。增值层:取失败按 a(双轨)不打扰。
+      挂载取一次即定,id 切换复位用它;会话内手动切换语义不变。 */
+  let defaultPlayback = $state<"dual" | "mixed">("dual");
   let mixedInfo = $state<MixedPlaybackInfo | null>(null);
   /** A/B 切换的续播现场(codex P2):换方案会整体重装原生播放器(核心恒从 0/
       paused 起),对比要的恰是同一时刻——切换前记下位置,onLoaded 回调里恢复。 */
@@ -708,7 +713,7 @@
     retransErr = "";
     retransEventSeen = false;
     mixedReason = null;
-    playbackScheme = "dual";
+    playbackScheme = defaultPlayback;
     pendingResume = null;
     mixedInfo = null;
     regenStage = null;
@@ -921,6 +926,16 @@
     if (editing) return;
     exportMsg = "";
     refresh();
+  });
+
+  // 挂载取一次设置：确定默认回放方案。增值层,取失败按 a(双轨)不打扰。
+  $effect(() => {
+    getSettings()
+      .then((s) => {
+        defaultPlayback = schemeToDefaultPlayback(s.audio_scheme);
+        playbackScheme = defaultPlayback;
+      })
+      .catch(() => {});
   });
 
   // ── 波形音轨:按音频总长等分 260 桶,取桶内段落 rms 峰值。观感三件套(首版全高
