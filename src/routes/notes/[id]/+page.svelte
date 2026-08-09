@@ -169,6 +169,16 @@
   );
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
+  /** 视图切换 segmented:无修订稿时该段置灰 + tooltip 原因(行为与旧 .link 版完全一致) */
+  const viewItems = $derived<SegmentedItem[]>([
+    {
+      id: "refined",
+      label: t("notes.view.refined"),
+      disabled: !refinedAvailable,
+      title: refinedAvailable ? undefined : t("notes.view.noRefined"),
+    },
+    { id: "raw", label: t("notes.view.raw") },
+  ]);
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
@@ -1483,18 +1493,7 @@
       {/if}
 
       <div class="view-switch">
-        <button
-          class="link"
-          class:active={effectiveView === "refined"}
-          disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : t("notes.view.noRefined")}
-          onclick={() => (viewMode = "refined")}
-        >
-          {t("notes.view.refined")}
-        </button>
-        <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
-          {t("notes.view.raw")}
-        </button>
+        <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
         <span class="spacer"></span>
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
@@ -1556,11 +1555,15 @@
           <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
         {:else}
           <button
-            class="link"
+            class="ghost"
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
             onclick={() => (retransConfirm = true)}
           >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
+              <path d="M13.4 1.8v2.8h-2.8" />
+            </svg>
             {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
           </button>
         {/if}
@@ -1824,6 +1827,35 @@
   .act-btn:hover {
     color: var(--ink);
   }
+  /* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
+     hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
+  .ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border: none;
+    background: transparent;
+    padding: 0.4em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-md);
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      transform 120ms ease;
+  }
+  .ghost:hover:not(:disabled) {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .ghost:active:not(:disabled) {
+    transform: translateY(0.5px);
+  }
+  .ghost svg {
+    flex: none;
+  }
   /* 控制行:录音 + 播放器整合一行(录音机式) */
   .transport {
     display: flex;
@@ -2059,22 +2091,12 @@
   .link:disabled:hover {
     text-decoration: none;
   }
-  /* 视图切换条:修订稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新 Aing(默认 button-secondary)。 */
+  /* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
   .view-switch {
     display: flex;
     align-items: center;
-    gap: 0.2rem;
+    gap: 0.5rem;
     margin: 0 0 0.75rem;
-  }
-  .view-switch .link {
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.35em 0.7em;
-    border-radius: var(--radius-md);
-  }
-  .view-switch .link.active {
-    background: var(--accent-tint);
-    color: var(--accent);
   }
   .view-switch .spacer {
     flex: 1;
