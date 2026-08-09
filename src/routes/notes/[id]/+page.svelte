@@ -1995,26 +1995,32 @@
     flex: 1;
     min-width: 23rem;
   }
-  /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位 */
+  /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位。
+     margin-left:auto 让「segmented+录制键」聚成一簇靠右——宽窗时播放器 flex:1
+     已占满空间无感;窄窗换行后这簇整体落在第二行右端,不与录制键分居两端(冒烟反馈)。 */
   .mix-switch {
     display: inline-flex;
     gap: 0.15rem;
     flex: none;
     align-items: center;
+    margin-left: auto;
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
      纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占
-     音轨宽度),悬停 title/aria-label 兜底可达性。无播放器时 margin-left:auto 仍靠右。 */
+     音轨宽度),悬停 title/aria-label 兜底可达性。靠右由 .mix-switch 的 auto margin
+     统一负责;无播放器(录制中只剩录制键)时它是首子元素,自己补 auto 仍靠右。 */
   .rec-btn {
     width: 2.4rem;
     height: 2.4rem;
     padding: 0;
     flex: none;
-    margin-left: auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     border-radius: var(--radius-full);
+  }
+  .rec-btn:first-child {
+    margin-left: auto;
   }
   .rec-dot {
     width: 12px;
