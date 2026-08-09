@@ -28,8 +28,8 @@
       thumb = { ...thumb, width: 0 };
       return;
     }
-    // offsetLeft 相对 offsetParent 边框盒,减 clientLeft(轨道 1px 边)对齐 padding 盒
-    thumb = { left: btn.offsetLeft - trackEl.clientLeft, width: btn.offsetWidth, ready: thumb.ready };
+    // offsetLeft 与绝对定位 left:0 同以轨道 padding 盒为参考系,无需再减边框
+    thumb = { left: btn.offsetLeft, width: btn.offsetWidth, ready: thumb.ready };
     if (!thumb.ready) requestAnimationFrame(() => (thumb = { ...thumb, ready: true }));
   }
 
