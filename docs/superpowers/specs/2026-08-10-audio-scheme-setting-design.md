@@ -34,7 +34,7 @@
 ### 3. 消费端(两处)
 
 - **录制管线**(lib.rs 现读 `settings.mix_track` 处):改读 `audio_scheme != A`——ab 与 b 都产成品轨;
-- **笔记页默认回放**:`playbackScheme` 初始值与 id 切换复位值(现硬编码 `"dual"`)改按设置:`b → "mixed"`,其余 `"dual"`。挂载时 `getSettings()` 取一次(增值层,取失败按 a 处理不打扰);既有"mixed 不可用强制回落 dual"的 effect 原样兜底。映射提为纯函数 `schemeToDefaultPlayback` 配 vitest。
+- **笔记页默认回放**:`playbackScheme` 初始值与 id 切换复位值(现硬编码 `"dual"`)改按设置:`b → "mixed"`,其余 `"dual"`。挂载时 `getSettings()` 取一次(增值层,取失败按 a 处理不打扰);既有"mixed 不可用强制回落 dual"的 effect 加 mixedPending 守卫后兜底(读数落定才判——否则 b 档默认成品轨会被复位清空的 mixedInfo 秒降回双轨,原"原样勿动"假设经终审证伪)。映射提为纯函数 `schemeToDefaultPlayback` 配 vitest。
 
 ### 4. UI 与 i18n
 

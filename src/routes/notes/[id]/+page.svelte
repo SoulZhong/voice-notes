@@ -126,6 +126,8 @@
       挂载取一次即定,id 切换复位用它;会话内手动切换语义不变。 */
   let defaultPlayback = $state<"dual" | "mixed">("dual");
   let mixedInfo = $state<MixedPlaybackInfo | null>(null);
+  /** 成品轨读数进行中:true 期间回落判定不抢跑——mixedInfo=null 是"未知"不是"确无"。 */
+  let mixedPending = $state(true);
   /** A/B 切换的续播现场(codex P2):换方案会整体重装原生播放器(核心恒从 0/
       paused 起),对比要的恰是同一时刻——切换前记下位置,onLoaded 回调里恢复。 */
   let pendingResume = $state<{ ms: number; playing: boolean } | null>(null);
@@ -600,23 +602,33 @@
 
   // 成品轨读数(二期):与源轨列表同依赖同节奏重拉(transcode_done/停录都会 bump
   // tracksVersion,补生成完成也借同一计数触发)。取失败按无成品轨处理,增值层不打扰。
+  // pending 落定后回落判定才生效。
   $effect(() => {
     const forId = id;
     void recording.notesVersion;
     void tracksVersion;
+    mixedPending = true;
     mixedPlaybackInfo(forId)
       .then((i) => {
-        if (forId === id) mixedInfo = i;
+        if (forId === id) {
+          mixedInfo = i;
+          mixedPending = false;
+        }
       })
       .catch(() => {
-        if (forId === id) mixedInfo = null;
+        if (forId === id) {
+          mixedInfo = null;
+          mixedPending = false;
+        }
       });
   });
 
-  // mixed 不可用即强制回落 dual(轨被删/变不可信/切到无成品轨的笔记),
-  // 装载数组的二选一表达式因此永远拿不到失效的 mixed。
+  // mixed 不可用即强制回落 dual(轨被删/变不可信/切到无成品轨的笔记/读数失败),
+  // 装载数组的二选一表达式因此永远拿不到失效的 mixed。读数进行中(mixedPending)
+  // 不判:b 档默认成品轨时,复位刚清掉的 mixedInfo 是"未知"不是"确无",抢跑会把
+  // 默认成品轨秒降回双轨且无人再升回(终审回归实锤)。
   $effect(() => {
-    if (playbackScheme === "mixed" && (!mixedInfo?.track || mixedInfo.untrusted)) {
+    if (!mixedPending && playbackScheme === "mixed" && (!mixedInfo?.track || mixedInfo.untrusted)) {
       switchScheme("dual");
     }
   });
@@ -929,14 +941,12 @@
   });
 
   // 挂载取一次设置：确定默认回放方案。增值层,取失败按 a(双轨)不打扰。
-  $effect(() => {
-    getSettings()
-      .then((s) => {
-        defaultPlayback = schemeToDefaultPlayback(s.audio_scheme);
-        playbackScheme = defaultPlayback;
-      })
-      .catch(() => {});
-  });
+  void getSettings()
+    .then((s) => {
+      defaultPlayback = schemeToDefaultPlayback(s.audio_scheme);
+      playbackScheme = defaultPlayback;
+    })
+    .catch(() => {});
 
   // ── 波形音轨:按音频总长等分 260 桶,取桶内段落 rms 峰值。观感三件套(首版全高
   //    平顶像方块阵,冒烟反馈"不像声音波形"):①按本条录音的 rms 峰值归一(AGC 后
