@@ -33,6 +33,8 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
+  import Segmented from "$lib/Segmented.svelte";
+  import type { SegmentedItem } from "$lib/segmented";
 
   let settings = $state<Settings | null>(null);
 
@@ -143,7 +145,7 @@
   let keepVol = $state(false);
   let langFilter = $state(false);
   let keepAudio = $state(false);
-  let mixTrack = $state(false);
+  let audioScheme = $state<"a" | "ab" | "b">("a");
   let calendarMatch = $state(true);
   /** 日历授权态(unavailable = 非 macOS,整块隐藏)。 */
   let calPerm = $state("unavailable");
@@ -206,6 +208,13 @@
   const dataDirLabel = $derived(settings?.data_dir || t("settings.store.defaultDir"));
   const modelsDirLabel = $derived(settings?.models_dir || t("settings.store.defaultDir"));
 
+  // 声音处理方案三档(spec 2026-08-10)。settings 未回填前整组禁用,与其它开关同纪律。
+  const audioSchemeItems = $derived<SegmentedItem[]>([
+    { id: "a", label: t("settings.record.audioScheme.a"), disabled: !settings },
+    { id: "ab", label: t("settings.record.audioScheme.ab"), disabled: !settings },
+    { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
+  ]);
+
   async function refreshSettings() {
     try {
       settings = await getSettings();
@@ -241,7 +250,7 @@
     keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
     keepAudio = s.keep_audio;
-    mixTrack = s.mix_track;
+    audioScheme = s.audio_scheme;
     calendarMatch = s.calendar_match_enabled;
     refineOn = s.refine_enabled;
     identifyAuto = s.identify_auto_apply;
@@ -849,19 +858,20 @@
           onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
         />
       </label>
-      <label class="row">
+      <div class="row">
         <div class="row-info">
-          <span class="row-label">{t("settings.record.mixTrack.label")}</span>
-          <span class="row-desc">{t("settings.record.mixTrack.desc")}</span>
+          <span class="row-label">{t("settings.record.audioScheme.label")}</span>
+          <span class="row-desc">{t("settings.record.audioScheme.desc")}</span>
         </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={mixTrack}
-          disabled={!settings}
-          onchange={() => saveSetting((s) => (s.mix_track = mixTrack))}
+        <Segmented
+          items={audioSchemeItems}
+          value={audioScheme}
+          onSelect={(id) => {
+            audioScheme = id as "a" | "ab" | "b";
+            saveSetting((s) => (s.audio_scheme = audioScheme));
+          }}
         />
-      </label>
+      </div>
       {#if calPerm !== "unavailable"}
         <label class="row">
           <div class="row-info">
