@@ -1497,9 +1497,11 @@
         <span class="spacer"></span>
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
-          <span class="refine-warn">{t("notes.refine.loseNames")}</span>
-          <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
-          <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
+          <div class="confirm-capsule">
+            <span class="refine-warn">{t("notes.refine.loseNames")}</span>
+            <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
+            <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
+          </div>
         {:else}
           <button
             class="reaing"
@@ -1540,19 +1542,21 @@
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
         {#if retransConfirm}
-          <span class="refine-warn">{t("notes.retrans.warn")}</span>
-          <button class="link danger" onclick={() => startRetranscribe("dual")}>
-            {t("notes.retrans.confirmDual")}
-          </button>
-          <button
-            class="link danger"
-            disabled={mixedReason !== null}
-            title={mixedReason ?? ""}
-            onclick={() => startRetranscribe("mixed")}
-          >
-            {t("notes.retrans.confirmMixed")}
-          </button>
-          <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+          <div class="confirm-capsule">
+            <span class="refine-warn">{t("notes.retrans.warn")}</span>
+            <button class="link danger" onclick={() => startRetranscribe("dual")}>
+              {t("notes.retrans.confirmDual")}
+            </button>
+            <button
+              class="link danger"
+              disabled={mixedReason !== null}
+              title={mixedReason ?? ""}
+              onclick={() => startRetranscribe("mixed")}
+            >
+              {t("notes.retrans.confirmMixed")}
+            </button>
+            <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+          </div>
         {:else}
           <button
             class="ghost"
@@ -2105,6 +2109,33 @@
   .refine-warn {
     color: var(--warning-ink);
     font-size: 0.8rem;
+  }
+  /* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
+     120ms 淡入下移 2px,行内占位不换行不跳版。 */
+  .confirm-capsule {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.5rem 0.25rem 0.75rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    animation: capsule-in 120ms ease;
+  }
+  @keyframes capsule-in {
+    from {
+      opacity: 0;
+      transform: translateY(-2px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .confirm-capsule {
+      animation: none;
+    }
   }
   /* 重新 Aing = Aing 的「施法键」:22px 彩色魔杖(手柄 currentColor,杖头金色星芒 + 紫/青/粉星火,禁 emoji)。
      idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +
