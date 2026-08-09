@@ -647,6 +647,14 @@ mod tests {
     }
 
     #[test]
+    fn explicit_new_key_wins_over_legacy_mix_track() {
+        // 新键在场(非默认)则旧键忽略——守卫条件 audio_scheme == A 的另一半语义
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b","mix_track":true}"#).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
+    }
+
+    #[test]
     fn save_writes_scheme_and_drops_legacy_key() {
         // 写盘只写新键:round-trip 保留档位,mix_track 不再出现
         let tmp = tempfile::tempdir().unwrap();
@@ -654,6 +662,7 @@ mod tests {
         save(tmp.path(), &s).unwrap();
         let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
         assert!(!raw.contains("mix_track"), "旧键不得再写盘: {raw}");
+        assert!(raw.contains(r#""audio_scheme": "b""#), "serde 小写契约: {raw}");
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
     }
     #[test]
