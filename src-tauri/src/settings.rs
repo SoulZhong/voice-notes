@@ -134,11 +134,15 @@ pub struct Settings {
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
     #[serde(default)]
     pub mcp_onboarded: bool,
-    /// 方案 B:录制期把两轨混成 mixed.wav。默认关——实验特性,开启后每分钟多约
-    /// 1.9MB 磁盘(转码 m4a 后大幅缩小)。仅影响新录制,已有笔记不受影响。
-    /// 设置页「录制」有开关(二期起);回放侧切换见笔记详情页。
+    /// 声音处理方案(spec 2026-08-10):录制期混音与笔记页默认回放的统一档位。
+    /// a=双轨(默认,不混音);ab=对照(混音,默认回放仍双轨);b=成品轨(混音,默认回放成品轨)。
+    /// 混音开启后每分钟多约 1.9MB 磁盘(转码 m4a 后大幅缩小),仅影响新录制。
     #[serde(default)]
-    pub mix_track: bool,
+    pub audio_scheme: AudioScheme,
+    /// 旧布尔键「录制期混出成品轨」(≤2026-08-09):仅为 load 迁移而保留读取,
+    /// save 不再写出(skip_serializing)。语义等价:true=混音+默认双轨=Ab。
+    #[serde(default, rename = "mix_track", skip_serializing)]
+    pub legacy_mix_track: Option<bool>,
     /// P3 日历匹配:录制停止后按时间窗匹配日历事件(标题+参会人入 identify 先验)。
     /// 默认开——但真正生效还需系统日历授权(授权只能由设置页说明卡触发,自动
     /// 路径未授权即静默跳过),默认开不会造成 surprise 弹窗。
@@ -149,6 +153,23 @@ pub struct Settings {
     /// 由用户在设置页自行拨开。
     #[serde(default)]
     pub identify_auto_apply: bool,
+}
+
+/// 声音处理方案档位。serde 小写:"a"/"ab"/"b"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioScheme {
+    #[default]
+    A,
+    Ab,
+    B,
+}
+
+impl AudioScheme {
+    /// 录制期是否混出成品轨(ab/b 档)。
+    pub fn mix_track(self) -> bool {
+        self != AudioScheme::A
+    }
 }
 
 fn default_prefix() -> String {
@@ -237,7 +258,8 @@ impl Default for Settings {
             completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
-            mix_track: false,
+            audio_scheme: AudioScheme::A,
+            legacy_mix_track: None,
             calendar_match_enabled: true,
             identify_auto_apply: false,
         }
@@ -253,12 +275,17 @@ pub fn resolve_data_root(app_data: &Path, s: &Settings) -> PathBuf {
     }
 }
 
-/// 缺失/损坏 → 默认值（容忍，不报错）。
+/// 缺失/损坏 → 默认值（容忍，不报错）。旧 mix_track 布尔键在此迁移(见字段注释)。
 pub fn load(app_data: &Path) -> Settings {
-    std::fs::read_to_string(app_data.join("settings.json"))
+    let mut s: Settings = std::fs::read_to_string(app_data.join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 新键在场(非默认 a)则旧键忽略;新写盘不再输出旧键,此分支只服务存量文件。
+    if s.legacy_mix_track == Some(true) && s.audio_scheme == AudioScheme::A {
+        s.audio_scheme = AudioScheme::Ab;
+    }
+    s
 }
 
 pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
@@ -593,15 +620,41 @@ mod tests {
     }
 
     #[test]
-    fn mix_track_defaults_false_and_old_files_parse() {
+    fn audio_scheme_defaults_a_and_old_files_parse() {
         // 旧配置文件无该字段,必须仍可解析(仓库既有约定:新字段 serde(default))
         let s: Settings = serde_json::from_str("{}").expect("旧文件应可解析");
-        assert!(!s.mix_track, "默认关闭:方案 B 是实验特性,不改变现有用户行为");
-        // 上面走的是 serde 字段级 #[serde(default)](bool → false),不覆盖手写的
-        // impl Default for Settings。lib.rs 的 app_data_dir() 不可用时读设置走
-        // unwrap_or_default(),真正生效的是这里的手写默认值——必须单独断言,
-        // 否则日后有人把 impl Default 里的 mix_track 改成 true,本测试仍然全绿。
-        assert!(!Settings::default().mix_track, "读设置失败时走 unwrap_or_default,默认必须是关的");
+        assert_eq!(s.audio_scheme, AudioScheme::A, "默认方案 A:不改变现有用户行为");
+        assert!(!s.audio_scheme.mix_track(), "A 档不混音");
+        // lib.rs 读设置失败走 unwrap_or_default,真正生效的是手写 Default——单独断言
+        assert_eq!(Settings::default().audio_scheme, AudioScheme::A);
+    }
+
+    #[test]
+    fn legacy_mix_track_true_migrates_to_ab() {
+        // 旧键 true 的行为=混音+默认双轨,语义等价档位是 Ab
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mix_track":true}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.audio_scheme, AudioScheme::Ab);
+        assert!(s.audio_scheme.mix_track());
+    }
+
+    #[test]
+    fn legacy_mix_track_false_stays_a() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mix_track":false}"#).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A);
+    }
+
+    #[test]
+    fn save_writes_scheme_and_drops_legacy_key() {
+        // 写盘只写新键:round-trip 保留档位,mix_track 不再出现
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Settings { audio_scheme: AudioScheme::B, ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        assert!(!raw.contains("mix_track"), "旧键不得再写盘: {raw}");
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
     }
     #[test]
     fn calendar_match_defaults_to_true_for_legacy_settings() {

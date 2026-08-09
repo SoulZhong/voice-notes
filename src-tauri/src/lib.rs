@@ -981,18 +981,18 @@ fn spawn_session(
         };
 
         // 0) 一次性读设置：record_system_only / keep_audio / language_filter /
-        // keep_output_volume / mix_track / 识别方式与云端凭证 同源同快照（避免多次
-        // load 读到并发写入的不同代）。app_data_dir 不可用时整体回落 Settings::default
-        // （仅系统声=否、保留音频=是、语言过滤=开、保持外放音量=否、混音成品轨=否、
-        // 识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型之前：识别
-        // 方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
+        // keep_output_volume / audio_scheme(录制期混音) / 识别方式与云端凭证 同源同快照
+        // （避免多次 load 读到并发写入的不同代）。app_data_dir 不可用时整体回落
+        // Settings::default（仅系统声=否、保留音频=是、语言过滤=开、保持外放音量=否、
+        // 混音成品轨=否、识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型
+        // 之前：识别方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
         let (record_system_only, keep_audio, language_filter, keep_output_volume, mix_track) = (
             cfg.record_system_only,
             cfg.keep_audio,
             cfg.language_filter,
             cfg.keep_output_volume,
-            cfg.mix_track,
+            cfg.audio_scheme.mix_track(),
         );
         let cloud_mode = cfg.asr_mode == settings::ASR_MODE_CLOUD;
 
