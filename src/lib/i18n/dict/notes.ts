@@ -36,7 +36,7 @@ export const zh = {
   "notes.export.audioNone": "此笔记还没有成品轨,先在播放器行生成",
   "notes.dir.open": "打开目录",
   "notes.dir.openHint": "在系统文件管理器中打开这条笔记的存储目录",
-  "notes.dir.openFailed": "打开目录失败:{e}",
+  "notes.dir.openFailed": "打开目录失败: {e}",
   "notes.record.busy": "已有录制进行中",
   "notes.record.resume": "继续录制",
   "notes.resume.blocked": "无法继续录制:请确认没有正在进行的录制",

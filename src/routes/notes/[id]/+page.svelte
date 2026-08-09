@@ -718,6 +718,8 @@
     entityPop = null;
     refinedBadgePop = null;
     refinedSaveErr = "";
+    exportMenuOpen = false;
+    exportMsg = "";
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。

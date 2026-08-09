@@ -36,7 +36,7 @@
   // 选中变化/文案变化(i18n 切换、「生成中(阶段)」计数)→ 重测;ResizeObserver 兜底容器与字体变化
   $effect(() => {
     void activeIdx;
-    void items.map((it) => it.label).join("");
+    void items.map((it) => it.label).join("\0");
     measure();
   });
   $effect(() => {
