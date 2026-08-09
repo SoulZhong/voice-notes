@@ -31,7 +31,7 @@
 **Interfaces:**
 - Produces: `settings::AudioScheme`(serde 值 `"a"|"ab"|"b"`,`Default = A`,方法 `mix_track(self) -> bool`);`Settings.audio_scheme: AudioScheme`(前端 JSON 里键名 `audio_scheme`,值为小写字符串——Task 2 的 TS 类型按此写)。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 替换 settings.rs 测试区的 `mix_track_defaults_false_and_old_files_parse` 为四个新测试(tempfile 已是 dev-dependency,与仓库其它测试同款):
 
@@ -75,12 +75,12 @@ fn save_writes_scheme_and_drops_legacy_key() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml audio_scheme`
 Expected: 编译错误(`AudioScheme` 不存在)——RED 证据。
 
-- [ ] **Step 3: 实现枚举与迁移**
+- [x] **Step 3: 实现枚举与迁移**
 
 settings.rs 中,`mix_track` 字段位置(~L137)替换为:
 
@@ -141,12 +141,12 @@ pub fn load(app_data: &Path) -> Settings {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml audio_scheme && cargo test --manifest-path src-tauri/Cargo.toml legacy_mix && cargo test --manifest-path src-tauri/Cargo.toml settings`
 Expected: 新 4 例 + settings 其余测试全绿。
 
-- [ ] **Step 5: lib.rs 消费点(两处)**
+- [x] **Step 5: lib.rs 消费点(两处)**
 
 ~L984 快照区:注释里的 `mix_track` 提法改为 `audio_scheme(录制期混音)`,元组行:
 
@@ -164,12 +164,12 @@ let (record_system_only, keep_audio, language_filter, keep_output_volume, mix_tr
 
 grep 确认无其它 `cfg.mix_track` / `.mix_track` 字段访问残留:`grep -n "\.mix_track" src-tauri/src/lib.rs` 应只剩 `audio_scheme.mix_track()` 一处与局部变量。
 
-- [ ] **Step 6: 验证**
+- [x] **Step 6: 验证**
 
 Run: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml settings`
 Expected: 编译过、无新警告、settings 测试全绿。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src-tauri/src/settings.rs src-tauri/src/lib.rs
@@ -189,7 +189,7 @@ git commit -m "feat(settings): AudioScheme 三档枚举替换 mix_track——旧
 - Consumes: Task 1 的 serde 键 `audio_scheme: "a"|"ab"|"b"`。
 - Produces: `Settings.audio_scheme: "a" | "ab" | "b"`(models.ts);`schemeToDefaultPlayback(scheme: string): "dual" | "mixed"` 自 `$lib/audioScheme` 导出——Task 3/4 按此引用。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `src/lib/audioScheme.test.ts`:
 
@@ -215,7 +215,7 @@ describe("schemeToDefaultPlayback(声音处理方案→默认回放)", () => {
 Run: `npx vitest run src/lib/audioScheme.test.ts`
 Expected: FAIL(模块不存在)。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 `src/lib/audioScheme.ts`:
 
@@ -233,7 +233,7 @@ export function schemeToDefaultPlayback(scheme: string): "dual" | "mixed" {
 audio_scheme: "a" | "ab" | "b";
 ```
 
-- [ ] **Step 3: 验证**
+- [x] **Step 3: 验证**
 
 Run: `npx vitest run src/lib/audioScheme.test.ts && npm run check`
 Expected: 测试绿;check 会在设置页报 `mix_track` 类型错误——**属预期**(Task 3 修复),若报错仅限 settings/+page.svelte 的 mix_track 引用即算通过本步;为不留红提交,本任务与 Task 3 **合并提交**(见 Task 3 Step 5)。
@@ -249,7 +249,7 @@ Expected: 测试绿;check 会在设置页报 `mix_track` 类型错误——**属
 **Interfaces:**
 - Consumes: Task 2 的 `Settings.audio_scheme` 类型;`$lib/Segmented.svelte` + `SegmentedItem`(基底分支已有)。
 
-- [ ] **Step 1: i18n 键替换(zh/en 两块,`settings.record.mixTrack.*` 两条删除,新增五条)**
+- [x] **Step 1: i18n 键替换(zh/en 两块,`settings.record.mixTrack.*` 两条删除,新增五条)**
 
 zh:
 
@@ -271,7 +271,7 @@ en:
 "settings.record.audioScheme.b": "Scheme B · Mixed",
 ```
 
-- [ ] **Step 2: script 区改造**
+- [x] **Step 2: script 区改造**
 
 import 区加:
 
@@ -299,7 +299,7 @@ const audioSchemeItems = $derived<SegmentedItem[]>([
 ]);
 ```
 
-- [ ] **Step 3: 行标记替换(~L852-864 的 mixTrack `<label class="row">` 整块)**
+- [x] **Step 3: 行标记替换(~L852-864 的 mixTrack `<label class="row">` 整块)**
 
 ```svelte
 <div class="row">
@@ -320,11 +320,11 @@ const audioSchemeItems = $derived<SegmentedItem[]>([
 
 注意:原行是 `<label>`(为 checkbox 服务),换 `<div>` 后确认 `.row` 系样式按 class 命中不受元素名影响(该页 .row 是 class 选择器,应无差);若 `.row` 有 `label.row` 形态的选择器,同步放宽。
 
-- [ ] **Step 4: 死引用扫尾**
+- [x] **Step 4: 死引用扫尾**
 
 `grep -rn "mixTrack\|mix_track" src/routes/settings/+page.svelte src/lib/models.ts` 应无输出;`grep -rn "settings.record.mixTrack" src` 应无输出。
 
-- [ ] **Step 5: 验证 + 与 Task 2 合并提交**
+- [x] **Step 5: 验证 + 与 Task 2 合并提交**
 
 Run: `npm run check && npm test`
 Expected: check 0 错 0 警(Task 2 遗留的类型错在此步消失);vitest 全绿(含 i18n parity 哨兵)。
@@ -344,7 +344,7 @@ git commit -m "feat(settings): 设置页声音处理方案三档 Segmented——
 **Interfaces:**
 - Consumes: `schemeToDefaultPlayback`(`$lib/audioScheme`)、`getSettings`(`$lib/models`,已存在)。
 
-- [ ] **Step 1: 引入默认回放**
+- [x] **Step 1: 引入默认回放**
 
 import 区加(`getSettings` 若未 import 则一并加,来自 `$lib/models`):
 
@@ -371,9 +371,9 @@ getSettings()
   .catch(() => {});
 ```
 
-注:紧随其后的既有 effect("mixed 不可用即强制回落 dual")原样兜底 b 档打开无成品轨笔记的场景,勿动。
+注(执行中修订,见 spec §3):"原样勿动"假设经终审证伪——复位清空的 mixedInfo 是 pending 不是"确无",原 effect 会把 b 档默认成品轨秒降回双轨。实际实现为 mixedPending 三态守卫 + shouldFallbackToDual 纯函数(a1d1418/430094a)。
 
-- [ ] **Step 2: id 复位改用默认值**
+- [x] **Step 2: id 复位改用默认值**
 
 ~L711 复位块中 `playbackScheme = "dual";` 替换为:
 
@@ -381,12 +381,12 @@ getSettings()
 playbackScheme = defaultPlayback;
 ```
 
-- [ ] **Step 3: 全量验证**
+- [x] **Step 3: 全量验证**
 
 Run: `npm run check && npm test && cargo test --manifest-path src-tauri/Cargo.toml settings`
 Expected: 全绿。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add "src/routes/notes/[id]/+page.svelte"
@@ -397,5 +397,5 @@ git commit -m "feat(notes): 默认回放跟随声音处理方案——b 档进�
 
 ### 收尾(不在任务内,提醒执行者)
 
-- 真机冒烟(用户做,写进 PR 描述):三档各录一段——a 无 mixed 产物 / ab 有产物且默认双轨 / b 有产物且默认成品轨;b 档打开无成品轨旧笔记自动回落双轨;旧 settings.json(mix_track:true)升级后档位显示 A+B 对照。
+- 真机冒烟(用户做,写进 PR 描述):三档各录一段——a 无 mixed 产物 / ab 有产物且默认双轨 / b 有产物且默认成品轨;b 档打开无成品轨旧笔记自动回落双轨;**b 档下在两篇有成品轨的笔记间切换,默认保持成品轨不闪降双轨**(即终审抓出的复位竞态场景);旧 settings.json(mix_track:true)升级后档位显示 A+B 对照。
 - PR 基于 note-header-redesign 叠放;PR#84 合并后 rebase 到 master 再提。提交信息无 Co-Authored-By。
