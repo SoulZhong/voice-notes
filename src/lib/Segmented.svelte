@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { nextEnabledIndex, type SegmentedItem } from "./segmented";
 
   let {
@@ -17,27 +18,32 @@
 
   let trackEl: HTMLDivElement | undefined = $state();
   let btns: (HTMLButtonElement | undefined)[] = $state([]);
-  // 滑块几何。ready=false 时不播过渡:首帧直接落位,不从 0 滑入。
-  let thumb = $state({ left: 0, width: 0, ready: false });
+  // 滑块几何与过渡开关分开存,measure 只写不读它们:在 $effect 里读写同一 state
+  // 会无限重跑,effect_update_depth_exceeded 冻死整页反应性(2026-08-09 实锤:
+  // 首帧渲染正常,之后全应用点击无响应)。ready=false 时不播过渡:首帧直接落位。
+  let thumb = $state({ left: 0, width: 0 });
+  let ready = $state(false);
 
   const activeIdx = $derived(items.findIndex((it) => !it.momentary && it.id === value));
 
   function measure() {
     const btn = activeIdx >= 0 ? btns[activeIdx] : undefined;
     if (!btn || !trackEl) {
-      thumb = { ...thumb, width: 0 };
+      thumb = { left: 0, width: 0 };
       return;
     }
     // offsetLeft 与绝对定位 left:0 同以轨道 padding 盒为参考系,无需再减边框
-    thumb = { left: btn.offsetLeft, width: btn.offsetWidth, ready: thumb.ready };
-    if (!thumb.ready) requestAnimationFrame(() => (thumb = { ...thumb, ready: true }));
+    thumb = { left: btn.offsetLeft, width: btn.offsetWidth };
+    if (!ready) requestAnimationFrame(() => (ready = true));
   }
 
-  // 选中变化/文案变化(i18n 切换、「生成中(阶段)」计数)→ 重测;ResizeObserver 兜底容器与字体变化
+  // 选中变化/文案变化(i18n 切换、「生成中(阶段)」计数)→ 重测;ResizeObserver 兜底
+  // 容器与字体变化。measure 用 untrack 包住:它写 thumb/读 ready,任其入依赖都会
+  // 形成写后重跑环;依赖显式收敛为 activeIdx 与 label 串。
   $effect(() => {
     void activeIdx;
     void items.map((it) => it.label).join("\0");
-    measure();
+    untrack(measure);
   });
   $effect(() => {
     if (!trackEl) return;
@@ -59,7 +65,7 @@
 <div class="seg" class:sm={size === "sm"} role="tablist" bind:this={trackEl}>
   <span
     class="thumb"
-    class:ready={thumb.ready}
+    class:ready={ready}
     class:gone={thumb.width === 0}
     style={`transform: translateX(${thumb.left}px); width: ${thumb.width}px;`}
     aria-hidden="true"
