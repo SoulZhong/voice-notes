@@ -1891,16 +1891,19 @@
     background: linear-gradient(var(--canvas), transparent);
     pointer-events: none;
   }
-  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上) */
+  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上)。
+     窄窗(默认 800x600)可换行:动作组 flex:none 不收缩,标题区给 min-width 下限,
+     空间不足时整组动作换到标题下一行右对齐——否则标题被挤成一列多行(冒烟实锤)。 */
   .header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 0.25rem 1rem;
+    flex-wrap: wrap;
   }
   .header-main {
     flex: 1;
-    min-width: 0;
+    min-width: 14rem;
   }
   .row {
     display: flex;
@@ -1909,6 +1912,7 @@
     flex: none;
     justify-content: flex-end;
     padding-top: 0.2rem;
+    margin-left: auto;
   }
   /* 头部动作钮:幽灵族(.ghost)+图标文字并排;「导出」带浮层菜单(DESIGN 浮层规范) */
   .export-wrap {
@@ -1980,12 +1984,16 @@
   .transport {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem 0.75rem;
     margin: 0 0 1rem;
+    flex-wrap: wrap;
   }
+  /* 播放器槽的 min-width 下限 ≈ AudioPlayer 的 min-content(播放键+双时间+波形下限
+     +音轨选择器+内边距):低于它内容会从槽里溢出垫到右侧控件底下(冒烟实锤,
+     AudioPlayer 内波形条自适应同一教训)。空间不足时 segmented+录制键换到下一行。 */
   .player-slot {
     flex: 1;
-    min-width: 0;
+    min-width: 23rem;
   }
   /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位 */
   .mix-switch {
@@ -2212,11 +2220,13 @@
     text-decoration: none;
   }
   /* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
+  /* 同款窄窗纪律:二段确认警示胶囊展开时宽于窗口即换行,不挤压 segmented */
   .view-switch {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin: 0 0 0.75rem;
+    flex-wrap: wrap;
   }
   .view-switch .spacer {
     flex: 1;
