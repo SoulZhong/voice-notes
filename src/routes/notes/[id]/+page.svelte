@@ -53,7 +53,7 @@
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
-  import { schemeToDefaultPlayback } from "$lib/audioScheme";
+  import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
   import { getSettings } from "$lib/models";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -626,9 +626,10 @@
   // mixed 不可用即强制回落 dual(轨被删/变不可信/切到无成品轨的笔记/读数失败),
   // 装载数组的二选一表达式因此永远拿不到失效的 mixed。读数进行中(mixedPending)
   // 不判:b 档默认成品轨时,复位刚清掉的 mixedInfo 是"未知"不是"确无",抢跑会把
-  // 默认成品轨秒降回双轨且无人再升回(终审回归实锤)。
+  // 默认成品轨秒降回双轨且无人再升回(终审回归实锤)。判定逻辑抽为 shouldFallbackToDual 配单测;
+  // mixedPending 先于复位置位依赖本文件 effect 声明序——fetch effect 在前,勿调换。
   $effect(() => {
-    if (!mixedPending && playbackScheme === "mixed" && (!mixedInfo?.track || mixedInfo.untrusted)) {
+    if (shouldFallbackToDual(mixedPending, playbackScheme, mixedInfo)) {
       switchScheme("dual");
     }
   });
