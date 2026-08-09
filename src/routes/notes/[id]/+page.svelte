@@ -11,6 +11,8 @@
     getNote,
     renameNote,
     exportNote,
+    exportNoteAudio,
+    openNoteDir,
     exportFileName,
     getRefined,
     refineNote,
@@ -1233,6 +1235,8 @@
     }
   }
 
+  let exportMenuOpen = $state(false);
+
   async function doExport(format: "md") {
     exportMsg = "";
     if (!note) return;
@@ -1257,6 +1261,36 @@
       if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
     } catch (e) {
       error = t("notes.export.failed", { e });
+    }
+  }
+
+  /** 导出成品轨音频:与 doExport 同款快照/保存对话框/提示纪律,扩展名取成品轨实际后缀。 */
+  async function doExportAudio() {
+    exportMsg = "";
+    if (!note) return;
+    const track = mixedInfo?.track;
+    if (!track) return;
+    const noteId = id;
+    const ext = track.path.split(".").pop() || "m4a";
+    try {
+      const dest = await save({
+        defaultPath: exportFileName(note.meta.title, note.meta.started_at, ext),
+        filters: [{ name: "Audio", extensions: [ext] }],
+      });
+      if (!dest) return;
+      const path = await exportNoteAudio(noteId, dest);
+      exportMsg = t("notes.export.done", { path });
+      if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
+    } catch (e) {
+      error = t("notes.export.failed", { e });
+    }
+  }
+
+  async function doOpenDir() {
+    try {
+      await openNoteDir(id);
+    } catch (e) {
+      error = t("notes.dir.openFailed", { e });
     }
   }
 
@@ -1317,6 +1351,13 @@
         : t("notes.resume.blocked");
   }
 </script>
+
+<svelte:window
+  onclick={() => (exportMenuOpen = false)}
+  onkeydown={(e) => {
+    if (e.key === "Escape") exportMenuOpen = false;
+  }}
+/>
 
 <main class="container">
   {#if error}
@@ -1386,20 +1427,68 @@
           {/if}
         </div>
 
-        <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态。
-             只留 MD(冒烟反馈:TXT 用不上,按钮撤了);txt 渲染能力在导出层与
+        <!-- 头部动作组:重新推断身份 / 导出(MD、成品轨音频)浮层菜单 / 打开目录,
+             均为幽灵族(.ghost)图标+文字按钮。txt 渲染能力在导出层与
              CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
-          <button class="act-btn" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+          <button class="ghost" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="6" cy="5" r="2.5" />
+              <path d="M2.2 13.8c0-2.2 1.7-4 3.8-4 1 0 1.9.4 2.6 1" />
+              <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
+              <path d="M13.9 6.9v2.4h-2.4" />
+            </svg>
             {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
           </button>
-          <button class="act-btn" onclick={() => doExport("md")}>
+          <div class="export-wrap">
+            <button
+              class="ghost"
+              aria-haspopup="menu"
+              aria-expanded={exportMenuOpen}
+              onclick={(e) => {
+                e.stopPropagation();
+                exportMenuOpen = !exportMenuOpen;
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+                <path d="M9.5 1.8V5h3.2" />
+                <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+              </svg>
+              {t("notes.export.button")}
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 4 5 6.5 7.5 4" />
+              </svg>
+            </button>
+            {#if exportMenuOpen}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="export-menu" role="menu" onclick={(e) => e.stopPropagation()}>
+                <button
+                  class="export-item"
+                  role="menuitem"
+                  onclick={() => {
+                    exportMenuOpen = false;
+                    void doExport("md");
+                  }}>{t("notes.export.md")}</button
+                >
+                <button
+                  class="export-item"
+                  role="menuitem"
+                  disabled={!mixedInfo?.track}
+                  title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
+                  onclick={() => {
+                    exportMenuOpen = false;
+                    void doExportAudio();
+                  }}>{t("notes.export.audio")}</button
+                >
+              </div>
+            {/if}
+          </div>
+          <button class="ghost" title={t("notes.dir.openHint")} onclick={() => void doOpenDir()}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-              <path d="M9.5 1.8V5h3.2" />
-              <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+              <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
             </svg>
-            {t("notes.export.md")}
+            {t("notes.dir.open")}
           </button>
         </div>
       </div>
@@ -1819,17 +1908,42 @@
     justify-content: flex-end;
     padding-top: 0.2rem;
   }
-  /* 头部动作钮:button-secondary 形态 + 图标与文字并排(纯图标看不出功能) */
-  .act-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    padding: 0.4em 0.8em;
-    font-size: 0.85rem;
-    color: var(--ink-secondary);
+  /* 头部动作钮:幽灵族(.ghost)+图标文字并排;「导出」带浮层菜单(DESIGN 浮层规范) */
+  .export-wrap {
+    position: relative;
   }
-  .act-btn:hover {
+  .export-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 30;
+    min-width: 9rem;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+  }
+  .export-item {
+    border: none;
+    background: none;
+    box-shadow: none;
+    text-align: left;
+    padding: 0.45em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
     color: var(--ink);
+    border-radius: var(--radius-md);
+    transition: background 120ms ease;
+  }
+  .export-item:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .export-item:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
   /* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
      hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
