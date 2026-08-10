@@ -24,6 +24,7 @@
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
+  import { matchesSpeakerFilter, searchHits } from "$lib/liveView";
 
   let models = $state<ModelsStatus | null>(null);
 
@@ -448,6 +449,48 @@
       sc.removeEventListener("scroll", onScroll);
     };
   });
+
+  // ── 回看工具条:页内搜索(高亮+跳转,不隐藏行) + 说话人过滤(隐藏行) ──────────
+  // 口径:任一激活 → follow=false(与实时跟随互斥,回看时不能被新内容顶走);
+  // 两者都清空由 clearReview() 显式 jumpToLatest() 恢复跟随——沿用既有"回到最新"
+  // 入口，不额外为"手动删空搜索框"这条冷门路径加自动恢复，避免用户回看到一半
+  // 因为退格误清空又被拽回最新。
+  let searchQuery = $state("");
+  let activeHit = $state(0); // hits 内下标
+  let selectedSpeakers = $state<Set<string>>(new Set());
+  const hits = $derived(searchHits(recording.finals, searchQuery));
+  /** each 内 O(n) 判定命中(而非 hits.includes(i) 的 O(n²))：finals 行数虽然通常
+      只有数百，但录制可长达数小时，直接派生 Set 零成本。 */
+  const hitSet = $derived(new Set(hits));
+  const reviewActive = $derived(searchQuery.trim() !== "" || selectedSpeakers.size > 0);
+
+  $effect(() => {
+    if (reviewActive) follow = false;
+  });
+  // 换一次查询词，命中列表整个变了，上一次的"第几个命中"下标不再有意义——
+  // 重新从第一个命中数起，而非停留在旧下标显示出"5/3"这种错位计数。
+  $effect(() => {
+    void searchQuery;
+    activeHit = 0;
+  });
+  function clearReview() {
+    searchQuery = "";
+    selectedSpeakers = new Set();
+    activeHit = 0;
+    jumpToLatest();
+  }
+  function gotoHit(delta: number) {
+    if (!hits.length) return;
+    activeHit = (activeHit + delta + hits.length) % hits.length;
+    document
+      .getElementById(`seg-${recording.finals[hits[activeHit]].seq}`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+  function toggleSpeaker(id: string) {
+    const next = new Set(selectedSpeakers);
+    next.has(id) ? next.delete(id) : next.add(id);
+    selectedSpeakers = next;
+  }
 </script>
 
 <div class="container">
@@ -532,6 +575,39 @@
           </div>
         {/if}
       </div>
+
+      <!-- 回看工具条:页内搜索(高亮+跳转) + 说话人过滤 chips。只在有转写内容可回看时
+           出现(录制中或已有定稿行)，空转写页不占位。 -->
+      {#if recording.isLive || recording.finals.length > 0}
+        <div class="review-bar">
+          <input
+            class="search"
+            placeholder={t("record.search.placeholder")}
+            bind:value={searchQuery}
+            onkeydown={(e) => {
+              if (e.key === "Enter") gotoHit(e.shiftKey ? -1 : 1);
+              if (e.key === "Escape") clearReview();
+            }}
+          />
+          {#if searchQuery.trim()}
+            <span class="hit-count">
+              {hits.length ? `${activeHit + 1}/${hits.length}` : t("record.search.none")}
+            </span>
+            <button class="ghosty" onclick={() => gotoHit(-1)} title={t("record.search.prev")}>↑</button>
+            <button class="ghosty" onclick={() => gotoHit(1)} title={t("record.search.next")}>↓</button>
+          {/if}
+          {#each speakerIds as sid (sid)}
+            <button
+              class="chip"
+              class:on={selectedSpeakers.has(sid)}
+              onclick={() => toggleSpeaker(sid)}
+            >{speakerLabel(sid, "mic", recording.speakers)}</button>
+          {/each}
+          {#if reviewActive}
+            <button class="ghosty" onclick={clearReview}>{t("record.search.clear")}</button>
+          {/if}
+        </div>
+      {/if}
 
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行。
            System 分类错误(isSystemDenied/isSystemUnavailable)不重复展示这行原始
@@ -631,8 +707,15 @@
     {/if}
 
     <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
-      {#each recording.finals as line (line.seq)}
-        <p class="final" class:current={recording.isLive && !hasPartial && line.seq === lastFinalSeq}>
+      {#each recording.finals as line, i (line.seq)}
+        <p
+          id="seg-{line.seq}"
+          class="final"
+          class:current={recording.isLive && !hasPartial && line.seq === lastFinalSeq}
+          class:hidden={!matchesSpeakerFilter(line, selectedSpeakers)}
+          class:hit={hitSet.has(i)}
+          class:hit-active={hits[activeHit] === i}
+        >
           <span class="spk-anchor">
             <button
               class="badge as-btn"
@@ -907,6 +990,69 @@
   }
   .wave-live.frozen .bar {
     background: var(--ink-faint);
+  }
+
+  /* 回看工具条:页内搜索 + 说话人过滤 chips，紧贴 controls 下方。 */
+  .review-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+  }
+  .review-bar .search {
+    min-width: 12rem;
+    font: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    padding: 0.35em 0.6em;
+  }
+  .review-bar .hit-count {
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  /* 幽灵按钮:无边透明底，弱化成次级操作(上一个/下一个/清除)，不与说话人 chip 抢视觉。 */
+  .review-bar .ghosty {
+    border: none;
+    background: none;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-md);
+    padding: 0.25em 0.5em;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .review-bar .ghosty:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .review-bar .chip {
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.6em;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--ink-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .review-bar .chip.on {
+    background: var(--accent-tint);
+    border-color: var(--accent);
+    color: var(--ink);
+  }
+
+  /* 搜索命中:高亮不隐藏(与说话人过滤的"隐藏"口径不同)。当前命中额外描边定位。 */
+  p.final.hidden {
+    display: none;
+  }
+  p.final.hit {
+    background: var(--accent-tint);
+    border-radius: var(--radius-md);
+  }
+  p.final.hit-active {
+    outline: 2px solid var(--accent);
   }
 
   /* 错误详情行(仅出错时):danger 色,完整展开可能较长的错误文案 */

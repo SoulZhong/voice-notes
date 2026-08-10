@@ -63,6 +63,13 @@ export const zh = {
   "record.emptyHint": "（开始说话…）",
   "record.jumpLatest": "↓ 回到最新",
 
+  // 回看工具条:页内搜索(高亮+跳转,不隐藏) + 说话人过滤(隐藏行)
+  "record.search.placeholder": "搜索转写内容",
+  "record.search.none": "无命中",
+  "record.search.prev": "上一个",
+  "record.search.next": "下一个",
+  "record.search.clear": "清除",
+
   // 当场纠正(行内编辑文本 / 改派说话人 / 命名改名):后端为唯一真值源,前端不做
   // 乐观更新,失败原样展示、不自动重试。
   "record.edit.text": "编辑这一句",
@@ -136,6 +143,12 @@ export const en = {
   "record.badge.them": "Them",
   "record.emptyHint": "(Start speaking…)",
   "record.jumpLatest": "↓ Back to latest",
+
+  "record.search.placeholder": "Search transcript",
+  "record.search.none": "No matches",
+  "record.search.prev": "Previous",
+  "record.search.next": "Next",
+  "record.search.clear": "Clear",
 
   "record.edit.text": "Edit this line",
   "record.edit.speaker": "Change speaker",
