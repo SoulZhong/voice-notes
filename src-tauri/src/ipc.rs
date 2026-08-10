@@ -22,7 +22,7 @@ pub struct StatusEvent {
     pub elapsed_ms: u64,
 }
 
-/// 采集电平(闸前 RMS,0..1 量级),事件名 "level",每源约 10Hz。
+/// 采集电平（闸前 RMS，0..1 量级），事件名 "level"，每源约 10Hz。
 #[derive(Debug, Clone, Serialize)]
 pub struct LevelEvent {
     pub source: String, // "mic" | "system"
@@ -645,7 +645,7 @@ pub struct BackfillProgress {
 mod tests {
     use super::*;
 
-    /// 前端按 source 分路(recording store levels.mic/levels.system),
+    /// 前端按 source 分路（recording store levels.mic/levels.system），
     /// 字段名与取值是跨语言契约。
     #[test]
     fn level_event_carries_source() {
