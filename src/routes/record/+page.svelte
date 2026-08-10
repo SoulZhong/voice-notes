@@ -466,6 +466,16 @@
   let searchQuery = $state("");
   let activeHit = $state(0); // hits 内下标
   let selectedSpeakers = $state<Set<string>>(new Set());
+  // 选中集随说话人表收敛(Codex P2):live 合并会把 loser 从表里移除并把其段落改写给
+  // winner——若选中集还留着 loser,过滤会隐藏全部改写行且对应 chip 已消失,整页空白
+  // 只能靠「清除」自救。fail-open 剪掉失效 id(不映射到 winner:合并是算法行为,
+  // 悄悄替换用户的过滤对象反而更意外)。
+  $effect(() => {
+    const ids = new Set(speakerIds);
+    if ([...selectedSpeakers].some((sid) => !ids.has(sid))) {
+      selectedSpeakers = new Set([...selectedSpeakers].filter((sid) => ids.has(sid)));
+    }
+  });
   // 命中=可见命中:搜索导航永不落在被过滤行上——先拿文本命中，再叠一层说话人过滤，
   // 否则「下一个」可能跳到 display:none 的行（scrollIntoView 对隐藏元素静默 no-op），
   // 计数也会把不可见行算进去。
