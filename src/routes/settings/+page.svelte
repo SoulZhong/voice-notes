@@ -96,7 +96,7 @@
     updateError = "";
     updatingLabel = t("settings.update.updating");
     try {
-      const r = await applyUpdate((label) => (updatingLabel = label));
+      const r = await applyUpdate((p) => (updatingLabel = p.label));
       if (r === "none") {
         // GitHub API 已见新版但 latest.json 未就绪(发布产物上传有时差)。
         updateError = t("settings.update.notReady");

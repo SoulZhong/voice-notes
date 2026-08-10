@@ -65,8 +65,8 @@ describe("applyUpdate", () => {
     expect(relaunch).not.toHaveBeenCalled();
   });
 
-  it("进度回调:Progress 报百分比,Finished 切「安装中…」(否则安装期像卡死在 100%)", async () => {
-    const labels: string[] = [];
+  it("进度回调:Progress 报结构化百分比,Finished 切安装态(否则安装期像卡死在 100%)", async () => {
+    const events: { pct: number | null; installing: boolean; label: string }[] = [];
     vi.mocked(check).mockResolvedValue({
       downloadAndInstall: async (cb: (e: unknown) => void) => {
         cb({ event: "Started", data: { contentLength: 100 } });
@@ -75,9 +75,25 @@ describe("applyUpdate", () => {
         cb({ event: "Finished" });
       },
     } as never);
-    await applyUpdate((label) => labels.push(label));
-    expect(labels).toEqual([updatingPct(50), updatingPct(100), installing]);
+    await applyUpdate((p) => events.push(p));
+    expect(events).toEqual([
+      { pct: 50, installing: false, label: updatingPct(50) },
+      { pct: 100, installing: false, label: updatingPct(100) },
+      { pct: null, installing: true, label: installing },
+    ]);
     expect(relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("无 Content-Length 时 pct 为 null(横幅退化为扫描态而非假百分比)", async () => {
+    const events: { pct: number | null; label: string }[] = [];
+    vi.mocked(check).mockResolvedValue({
+      downloadAndInstall: async (cb: (e: unknown) => void) => {
+        cb({ event: "Started", data: { contentLength: null } });
+        cb({ event: "Progress", data: { chunkLength: 50 } });
+      },
+    } as never);
+    await applyUpdate((p) => events.push(p));
+    expect(events).toEqual([{ pct: null, installing: false, label: updating }]);
   });
 
   it("单飞:进行中再次调用复用同一 promise,不并发第二趟下载安装", async () => {

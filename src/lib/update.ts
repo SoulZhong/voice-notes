@@ -46,6 +46,16 @@ export function updateProgressLabel(downloaded: number, total: number | undefine
   return t("settings.update.updatingPct", { pct: Math.min(100, Math.round((downloaded / total) * 100)) });
 }
 
+/** 结构化更新进度:横幅要画进度条,光有文案不够。 */
+export type UpdateProgress = {
+  /** 0-100;总长未知(部分 CDN 不给 Content-Length)为 null,渲染为往复扫描。 */
+  pct: number | null;
+  /** 下载完毕后的签名校验+解包安装阶段(可能几十秒,进度不可知)。 */
+  installing: boolean;
+  /** 现成文案(设置页按钮直接用)。 */
+  label: string;
+};
+
 /** 网络请求超时(查询与下载各自适用):连接悬死不能让按钮永远停在「更新中」。 */
 const UPDATE_TIMEOUT_MS = 30_000;
 
@@ -61,14 +71,14 @@ let inFlight: Promise<"none"> | null = null;
  * (Windows 上安装器会先行结束应用,relaunch 根本执行不到——由安装器负责收尾)。
  * 任何失败向上抛:调用方兜底到「打开发布页」手动路径——一键更新是增强,
  * 不能因签名/网络问题把用户堵死在无法更新的状态。 */
-export function applyUpdate(onProgress: (label: string) => void): Promise<"none"> {
+export function applyUpdate(onProgress: (p: UpdateProgress) => void): Promise<"none"> {
   if (!inFlight) {
     inFlight = doApplyUpdate(onProgress).finally(() => (inFlight = null));
   }
   return inFlight;
 }
 
-async function doApplyUpdate(onProgress: (label: string) => void): Promise<"none"> {
+async function doApplyUpdate(onProgress: (p: UpdateProgress) => void): Promise<"none"> {
   const { check } = await import("@tauri-apps/plugin-updater");
   const { relaunch } = await import("@tauri-apps/plugin-process");
   const update = await check({ timeout: UPDATE_TIMEOUT_MS });
@@ -81,11 +91,15 @@ async function doApplyUpdate(onProgress: (label: string) => void): Promise<"none
         total = event.data.contentLength ?? undefined;
       } else if (event.event === "Progress") {
         downloaded += event.data.chunkLength;
-        onProgress(updateProgressLabel(downloaded, total));
+        onProgress({
+          pct: total ? Math.min(100, Math.round((downloaded / total) * 100)) : null,
+          installing: false,
+          label: updateProgressLabel(downloaded, total),
+        });
       } else if (event.event === "Finished") {
         // 下载完成后还有签名校验+解包安装,可能要几十秒;不处理会停在
         // 「更新中 100%」像卡死。
-        onProgress(t("settings.update.installing"));
+        onProgress({ pct: null, installing: true, label: t("settings.update.installing") });
       }
     },
     { timeout: UPDATE_TIMEOUT_MS },
