@@ -304,7 +304,9 @@ fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&P
 /// create_new 遇到已存在路径(含符号链接本身)直接失败不跟随,rename 替换的是目录项
 /// 本身(预置链接被整体换成普通文件)。与 store::align::write 同一防线。
 /// best-effort:失败只意味着下次装载再估一遍,不上抛。
-fn write_align_skip_marker(note_dir: &Path) {
+/// 返回落盘后标记的 mtime(所有权凭据):回滚方凭它识别「还是不是我写的那份」——
+/// 并发新装载若已覆写标记,mtime 不同,回滚不得误删(Codex 十一轮 P2)。
+fn write_align_skip_marker(note_dir: &Path) -> Option<std::time::SystemTime> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
     let tmp = note_dir.join(format!(
@@ -313,10 +315,15 @@ fn write_align_skip_marker(note_dir: &Path) {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    if std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).is_ok()
-        && std::fs::rename(&tmp, &marker).is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        Ok(_) => {
+            if std::fs::rename(&tmp, &marker).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+            std::fs::metadata(&marker).and_then(|m| m.modified()).ok()
+        }
+        Err(_) => None,
     }
 }
 
@@ -499,13 +506,18 @@ async fn align_mic_track(
                     eprintln!("回放对齐: 估计期间源轨已变,不发布跳过标记(下次装载重估)");
                     return;
                 }
-                write_align_skip_marker(&nd);
+                let ours = write_align_skip_marker(&nd);
                 // 发布后复验(Codex 九轮 P2):比对与落盘之间源又被改写,标记 mtime 反而
-                // 比新源新,会压掉对新音频的重估——发现快照变了就撤回。撤回之后若源再变,
-                // 标记比新源旧,本就判不新鲜,链路自洽。
+                // 比新源新,会压掉对新音频的重估——发现快照变了就撤回。撤回只删**自己
+                // 那份**(mtime 凭据一致,Codex 十一轮 P2):并发新装载已覆写的有效标记
+                // 不动。撤回后源再变,标记比新源旧本就判不新鲜,链路自洽。
                 if (mtime(&m2), mtime(&s2)) != pre {
-                    eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
-                    let _ = std::fs::remove_file(nd.join(crate::store::align::ALIGN_SKIP_FILE));
+                    let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
+                    let now_mtime = std::fs::metadata(&marker).and_then(|m| m.modified()).ok();
+                    if ours.is_some() && now_mtime == ours {
+                        eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
+                        let _ = std::fs::remove_file(&marker);
+                    }
                 }
             };
             let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
