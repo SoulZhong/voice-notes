@@ -77,7 +77,13 @@
         // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
         // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
         if (gen !== loadGen) throw SUPERSEDED;
-        const total = await invoke<number>("player_load", { tracks: payload });
+        const total = await invoke<number>("player_load", { tracks: payload }).catch((e) => {
+          // 后端代次门的拒绝统一折算成取消哨兵(Codex P2):凡 invoke 失败且本地已
+          // 换代,必是切换导致的取代而非故障——不按本地化文案匹配,按换代事实判定;
+          // 否则排队的 play 会把「已取代」当播放错误刷进新轨的 UI。
+          if (gen !== loadGen) throw SUPERSEDED;
+          throw e;
+        });
         // invoke 期间换代/卸载(后端 player_stop 已作废在途装载,但本地也要拒绝:
         // 排队的 play/seek 不得对导航后的新状态开火)。
         if (gen !== loadGen) throw SUPERSEDED;
