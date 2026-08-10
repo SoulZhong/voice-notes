@@ -24,7 +24,7 @@
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
-  import { matchesSpeakerFilter, searchHits } from "$lib/liveView";
+  import { matchesSpeakerFilter, nearestIndexByMs, searchHits } from "$lib/liveView";
 
   let models = $state<ModelsStatus | null>(null);
 
@@ -513,6 +513,33 @@
     next.has(id) ? next.delete(id) : next.add(id);
     selectedSpeakers = next;
   }
+
+  // ── 右缘迷你时间轴:细轨映射 0..elapsedMs,点击定位最近行 ──────────────────
+  /** 每 5 分钟一个刻度的纵向百分比。elapsedMs 是走表值(每秒变化),派生成本
+      是一次数组构建，量级在"总时长/5分钟"，秒级重算可接受，无需额外节流。 */
+  const ticksView = $derived.by(() => {
+    const total = recording.elapsedMs;
+    if (total < 60_000) return [] as number[];
+    const out: number[] = [];
+    for (let ms = 300_000; ms < total; ms += 300_000) out.push((ms / total) * 100);
+    return out;
+  });
+
+  function handleTimelineClick(e: MouseEvent) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ms = ((e.clientY - rect.top) / rect.height) * recording.elapsedMs;
+    // 口径同 Task 9 的 hits：定位候选先按当前说话人过滤筛出可见子集，再取最近行，
+    // 否则命中的行可能是 display:none（被过滤隐藏），scrollIntoView 会静默 no-op。
+    const visible = recording.finals.filter((l) => matchesSpeakerFilter(l, selectedSpeakers));
+    const idx = nearestIndexByMs(visible, ms);
+    if (idx < 0) return;
+    // 时间轴点击不算"回看激活态"（不进 reviewActive），只是暂停跟随——与手动上滑
+    // 同类；follow 恢复靠既有的"回到最新"按钮，不额外造恢复逻辑。
+    follow = false;
+    document
+      .getElementById(`seg-${visible[idx].seq}`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
 </script>
 
 <div class="container">
@@ -728,7 +755,8 @@
       </div>
     {/if}
 
-    <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
+    <div class="transcript-wrap">
+      <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
       {#each recording.finals as line, i (line.seq)}
         <p
           id="seg-{line.seq}"
@@ -810,6 +838,15 @@
       {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
         <p class="hint">{t("record.emptyHint")}</p>
       {/if}
+    </div>
+    {#if recording.finals.length > 1 && recording.elapsedMs > 60_000}
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+      <div class="timeline" onclick={handleTimelineClick}>
+        {#each ticksView as topPct (topPct)}
+          <span class="tick" style="top: {topPct}%"></span>
+        {/each}
+      </div>
+    {/if}
     </div>
 
     <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失 -->
@@ -1109,6 +1146,11 @@
     font-weight: 500;
   }
 
+  /* 右缘迷你时间轴的定位基准；本身不裁剪，时间轴细轨叠在 transcript 的 20px 右内边距上。 */
+  .transcript-wrap {
+    position: relative;
+  }
+
   /* transcript-container：surface 底、rounded-xl、正文用 transcript 字级(1.02rem/1.7) */
   .transcript {
     min-height: 8rem;
@@ -1169,6 +1211,29 @@
     text-align: center;
     padding: 2.6rem 0;
     margin: 0;
+  }
+
+  /* 右缘迷你时间轴:细轨映射 0..elapsedMs，点击按 start_ms 定位最近可见行；
+     长录制（>1min 且 ≥2 行）才现身，短录没有滚动意义。 */
+  .timeline {
+    position: absolute;
+    right: 0;
+    top: 0.5rem;
+    bottom: 0.5rem;
+    width: 14px;
+    cursor: pointer;
+    border-left: 2px solid var(--hairline);
+  }
+  .timeline:hover {
+    border-left-color: var(--hairline-strong);
+  }
+  .timeline .tick {
+    position: absolute;
+    left: -4px;
+    width: 6px;
+    height: 2px;
+    background: var(--ink-faint);
+    border-radius: 1px;
   }
 
   /* speaker-badge：粉彩底 + 同色相文字(soft 公式)、rounded-sm、micro 字级；
