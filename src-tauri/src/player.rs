@@ -468,14 +468,25 @@ async fn align_mic_track(
     state: &State<'_, PlayerHandle>,
     gen: u64,
     plan: &mut [(PathBuf, u64, String)],
+    durable: &[(String, PathBuf)],
     note_dir: Option<&Path>,
 ) {
     let idx = |src: &str| plan.iter().position(|(_, _, s)| s == src);
+    // 持久源路径(原始 m4a/wav):标记新鲜度与估计期间变更检测的锚点——解码缓存
+    // 会淘汰重建,不配当锚点。找不到对应项时回退缓存路径(行为同旧,不失效)。
+    let durable_of = |src: &str, fallback: &Path| -> PathBuf {
+        durable
+            .iter()
+            .find(|(s, _)| s == src)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| fallback.to_path_buf())
+    };
     let (Some(mi), Some(si)) = (idx("mic"), idx("system")) else {
         return; // 单轨笔记没有跨轨时基可言
     };
     let (mic_path, mic_off) = (plan[mi].0.clone(), plan[mi].1);
     let (sys_path, sys_off) = (plan[si].0.clone(), plan[si].1);
+    let (mic_src, sys_src) = (durable_of("mic", &mic_path), durable_of("system", &sys_path));
     let (dm, ds) = (wav_duration_ms(&mic_path), wav_duration_ms(&sys_path));
     if !alignment_worth_attempting(dm, ds) {
         return;
@@ -490,7 +501,7 @@ async fn align_mic_track(
         // 负结果缓存:上次已判定"估不出/不值得纠正"且源轨未变,不再重跑 60-100s 的
         // 估计(2026-08-10 排障:大笔记每次进页白跑一遍,装载期间播放无响应)。
         let skip_marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
-        if align_skip_is_fresh(&skip_marker, &[&mic_path, &sys_path]) {
+        if align_skip_is_fresh(&skip_marker, &[&mic_src, &sys_src]) {
             // 自愈(Codex P1):此处若还躺着 align.json,它必然过期(新鲜的正缓存在上方
             // 分支就命中了)——留着它,notes 读路径仍按旧映射改写转写时间戳,而回放走
             // 原始轨,两边永久错位。删之并通知页面重拉(Codex P2:页面在装载前已按旧
@@ -498,7 +509,7 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):同一笔记两次装载重叠时,过期装载不得删新装载
             // 可能刚提交的有效映射——只有仍是最新代次才有资格做对齐副作用。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_src, &sys_src]);
             }
             return;
         }
@@ -510,16 +521,18 @@ async fn align_mic_track(
         );
         let (m2, s2, c2, nd) =
             (mic_path.clone(), sys_path.clone(), cache.clone(), note_dir.to_path_buf());
+        let (md, sd) = (mic_src.clone(), sys_src.clone());
         let gen_probe = state.load_gen.clone();
         let built = tauri::async_runtime::spawn_blocking(move || -> Option<u64> {
             // mmap 而不是 read:估计要同时看两条完整音轨,一小时双轨读进堆里就是
             // ~230MB 常驻,而 player_align 已改成按字节视图逐样本取值,页由系统按需
             // 调入/回收即可(与回放热路径同一套 mmap 策略)。
             let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-            // 估计前采源轨快照:估计要跑几十秒,期间续录/重解码会换掉源文件——那时
-            // 结论只代表旧音频,标记不得发布(Codex P2:晚发布的标记 mtime 反而更新,
-            // 会把针对新音频的必要重估压掉)。
-            let pre = (mtime(&m2), mtime(&s2));
+            // 估计前采**持久源**快照(原始 m4a/wav,非解码缓存):估计要跑几十秒,期间
+            // 续录会换掉源文件——那时结论只代表旧音频,标记不得发布(Codex P2:晚发布
+            // 的标记 mtime 反而更新,会把针对新音频的必要重估压掉)。锚持久源还避免
+            // 缓存淘汰重建的 mtime 噪声(Codex 十五轮)。
+            let pre = (mtime(&md), mtime(&sd));
             let map_file = |p: &Path| -> Option<Mmap> {
                 let f = std::fs::File::open(p).ok()?;
                 unsafe { Mmap::map(&f).ok() }
@@ -532,7 +545,7 @@ async fn align_mic_track(
             // 发 note_realigned);本闭包只负责标记。崩在两步之间 = 标记在、旧映射在,
             // 由上方 skip-fresh 分支的自愈补删,不留永久错位。
             let mark_skip = || {
-                if (mtime(&m2), mtime(&s2)) != pre {
+                if (mtime(&md), mtime(&sd)) != pre {
                     eprintln!("回放对齐: 估计期间源轨已变,不发布跳过标记(下次装载重估)");
                     return;
                 }
@@ -541,7 +554,7 @@ async fn align_mic_track(
                 // 比新源新,会压掉对新音频的重估——发现快照变了就撤回。撤回只删**自己
                 // 那份**(mtime 凭据一致,Codex 十一轮 P2):并发新装载已覆写的有效标记
                 // 不动。撤回后源再变,标记比新源旧本就判不新鲜,链路自洽。
-                if (mtime(&m2), mtime(&s2)) != pre {
+                if (mtime(&md), mtime(&sd)) != pre {
                     // 读-比对-删除与标记发布同锁(Codex 十三轮 P2):否则读到自己 token
                     // 后被挂起,新标记落地,恢复后的删除仍会误删。
                     let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
@@ -585,7 +598,7 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):过期装载的负结论可能晚于新装载的有效提交抵达,
             // 无差别删除会拆掉新映射;过期即放弃副作用(标记写入另有 mtime 快照门)。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_src, &sys_src]);
             }
             return;
         };
@@ -628,8 +641,13 @@ pub async fn player_load(
     // 各轨同属一个笔记,取一次即可)——segments.jsonl 与音轨文件同目录。
     let mut note_dir: Option<PathBuf> = None;
     let mut plan: Vec<(PathBuf, u64, String)> = Vec::new();
+    // 持久源(校验后的原始 m4a/wav 路径):跳过标记的新鲜度锚点。解码缓存会被 7 天
+    // 淘汰再重建,mtime 随之变新——拿缓存当锚点,录音没变也会每次淘汰后白跑一遍
+    // 60-100s 估计(Codex 十五轮 P2)。
+    let mut durable: Vec<(String, PathBuf)> = Vec::new();
     for t in &tracks {
         let src = validate_under_notes(&app, Path::new(&t.path))?;
+        let src_orig = src.clone();
         if note_dir.is_none() {
             note_dir = src.parent().map(|p| p.to_path_buf());
         }
@@ -656,6 +674,7 @@ pub async fn player_load(
             src
         };
         plan.push((wav, t.offset_ms, t.source.clone()));
+        durable.push((t.source.clone(), src_orig));
     }
 
     // 跨轨时基对齐:历史录音里 mic 轨可能整条被压缩(采集侧把设备实际出样速率记错,
@@ -664,7 +683,7 @@ pub async fn player_load(
     // 在 400ms 内,不先把时基掰正,门控只会压错地方。
     //
     // 只对"轨长明显对不上"的笔记做:估计要跑几秒,健康的笔记不该为它买单。
-    align_mic_track(&app, &state, gen, &mut plan, note_dir.as_deref()).await;
+    align_mic_track(&app, &state, gen, &mut plan, &durable, note_dir.as_deref()).await;
 
     // 回放门控:按两轨逐帧电平构建 mic 压低区间(任何失败空表降级=不门控)。
     // 判据不再取自转写段——回声残影本身会被识别成 mic 段,旧的"mic 有段即保护"
