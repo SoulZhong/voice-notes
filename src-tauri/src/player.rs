@@ -312,6 +312,20 @@ fn write_align_skip_marker(note_dir: &Path) {
     }
 }
 
+/// 移除过期正映射并通知详情页重拉(负结论路径共用):align.json 在负结论下只会让
+/// notes 读路径的转写时间戳与原始轨回放错位。文件不存在则两者皆不做(无谓刷新)。
+/// drift_ms=0 语义为「映射移除,回到原始时基」,消费方只按 note_id refresh。
+fn remove_align_map_and_notify(app: &AppHandle, note_dir: &Path, align_json: &Path) {
+    if std::fs::remove_file(align_json).is_ok() {
+        if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
+            let _ = app.emit(
+                "note_realigned",
+                crate::ipc::NoteRealignedEvent { note_id: note_id.to_string(), drift_ms: 0 },
+            );
+        }
+    }
+}
+
 /// 跳过标记是否有效:比全部源轨新即有效(负结果缓存,见 store::align::ALIGN_SKIP_FILE)。
 fn align_skip_is_fresh(marker: &Path, sources: &[&Path]) -> bool {
     let newest_src = sources
@@ -414,8 +428,9 @@ async fn align_mic_track(
         if align_skip_is_fresh(&skip_marker, &[&mic_path, &sys_path]) {
             // 自愈(Codex P1):此处若还躺着 align.json,它必然过期(新鲜的正缓存在上方
             // 分支就命中了)——留着它,notes 读路径仍按旧映射改写转写时间戳,而回放走
-            // 原始轨,两边永久错位。删之,转写与回放同回原始时基。
-            let _ = std::fs::remove_file(&align_json);
+            // 原始轨,两边永久错位。删之并通知页面重拉(Codex P2:页面在装载前已按旧
+            // 映射改写过时间戳,不通知就一直错位到下次刷新;drift_ms=0 表示映射移除)。
+            remove_align_map_and_notify(app, note_dir, &align_json);
             return;
         }
         eprintln!(
@@ -443,14 +458,14 @@ async fn align_mic_track(
             let sys = map_file(&s2)?;
             // 负结果也落盘(空文件标记):mmap 失败(上方 ?)不落——那是环境性故障,
             // 该重试;"估不出/不值得"是对这份音频的稳定判定,源轨不变结论不变。
+            // 过期正映射的删除与页面通知在 await 之后的异步侧做(那里有 AppHandle 能
+            // 发 note_realigned);本闭包只负责标记。崩在两步之间 = 标记在、旧映射在,
+            // 由上方 skip-fresh 分支的自愈补删,不留永久错位。
             let mark_skip = || {
                 if (mtime(&m2), mtime(&s2)) != pre {
                     eprintln!("回放对齐: 估计期间源轨已变,不发布跳过标记(下次装载重估)");
                     return;
                 }
-                // 先删过期正映射再落标记(Codex P1):负结论确立后,旧 align.json 只会让
-                // 转写时间戳与原始轨回放错位;先删后标,崩在中间也只是回到"下次重估"。
-                let _ = std::fs::remove_file(nd.join(crate::store::align::ALIGN_FILE));
                 write_align_skip_marker(&nd);
             };
             let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
@@ -477,7 +492,13 @@ async fn align_mic_track(
             eprintln!("回放对齐: 任务失败({e}),本次回放不对齐");
             None
         });
-        let Some(drift_ms) = built else { return };
+        let Some(drift_ms) = built else {
+            // 负结论(估不出/不值得/任务失败):过期正映射一并移除并通知页面重拉
+            // (Codex P1+P2)——负结论确立后旧 align.json 只会让转写时间戳与原始轨
+            // 回放错位,页面在装载前已按旧映射改写过时间戳,不通知就错位到下次刷新。
+            remove_align_map_and_notify(app, note_dir, &align_json);
+            return;
+        };
         // 详情页手里那份段是旧时基的,通知它整页重拉。
         if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
             let _ = app.emit(
