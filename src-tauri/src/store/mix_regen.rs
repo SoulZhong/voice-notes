@@ -190,6 +190,9 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
         if !crate::player_align::worth_correcting(&a) {
             return None;
         }
+        // 持共享锁写映射(Codex 十七轮):与回放侧的负结论清理/正结论提交串行,
+        // 防「本处刚发布的有效映射被过期装载的清理删掉、随后又烘进 mixed」的错配。
+        let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
         if let Err(e) = crate::store::align::write(dir, &a.map) {
             eprintln!("补生成:对齐映射落盘失败(不影响本次产物): {e}");
         }

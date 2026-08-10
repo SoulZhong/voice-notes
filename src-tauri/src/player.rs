@@ -322,7 +322,7 @@ fn write_align_skip_marker(note_dir: &Path) -> Option<String> {
             }
             // 发布入锁(Codex 十三轮 P2):与回滚侧的「读 token-比对-删除」互斥,
             // 防回滚方读到自己的 token 后被挂起、本发布落地、恢复后误删新标记。
-            let _fs = ALIGN_FS_LOCK.lock().unwrap();
+            let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
             if std::fs::rename(&tmp, &marker).is_err() {
                 let _ = std::fs::remove_file(&tmp);
                 return None;
@@ -333,11 +333,6 @@ fn write_align_skip_marker(note_dir: &Path) -> Option<String> {
     }
 }
 
-/// 对齐产物(align.json/对齐音轨)的写与删共用的进程级串行锁:代次门是快照判断,
-/// 判断与动作之间线程可能被挂起任意久——同一笔记重叠装载下,过期装载可能删掉新装载
-/// 刚提交的有效映射(Codex 八轮)。写(commit_aligned)与删(下方)都持本锁,删除前
-/// 在锁内复验缓存新鲜度,两侧任一次序都保住有效映射。
-static ALIGN_FS_LOCK: Mutex<()> = Mutex::new(());
 
 /// 移除过期正映射并通知详情页重拉(负结论路径共用):align.json 在负结论下只会让
 /// notes 读路径的转写时间戳与原始轨回放错位。持 ALIGN_FS_LOCK 并复验——正缓存已被
@@ -350,9 +345,23 @@ fn remove_align_map_and_notify(
     cache: &Path,
     sources: &[&Path],
 ) {
-    let _fs = ALIGN_FS_LOCK.lock().unwrap();
+    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
     if aligned_cache_is_fresh(cache, Some(align_json), sources) {
         return; // 新装载刚提交的有效映射,不是要清的过期货
+    }
+    // 新鲜映射护栏(Codex 十七轮):映射比全部源轨新 = 刚被有意发布(mix_regen 或
+    // 另一装载),即便配套音轨缓存缺失/未建也不是陈旧货——本函数只清早于当前源的
+    // 过期映射。regen 发布映射与烘焙 mixed 之间的窗口由此免疫清理。
+    let newest_src = sources
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    let map_is_newer = matches!(
+        (std::fs::metadata(align_json).and_then(|m| m.modified()), newest_src),
+        (Ok(am), Some(src)) if am >= src
+    );
+    if map_is_newer {
+        return;
     }
     // 成品轨护栏(Codex 十四轮 P2):mix_regen 可能已把本映射烘进 mixed.m4a——删映射
     // 会让转写回原始时基,而成品轨仍是纠正过的,按成品轨回放的定位/高亮从此错位。
@@ -430,7 +439,7 @@ fn commit_aligned(
     // 发布临界区(Codex 十三轮 P1):代次检查必须先于缓存音轨 rename,且 rename 与
     // 映射写入同锁——否则过期渲染可在新装载的 cache+map 配对之上单独覆写音轨,
     // 覆写后的新 mtime 让 aligned_cache_is_fresh 永远接受这对错配。
-    let _fs = ALIGN_FS_LOCK.lock().unwrap();
+    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
     if !is_current() {
         eprintln!("回放对齐: 装载已被更新的请求取代,正结论不发布");
         let _ = std::fs::remove_file(&tmp);
@@ -561,7 +570,7 @@ async fn align_mic_track(
                     // 读-比对-删除与标记发布同锁(Codex 十三轮 P2):否则读到自己 token
                     // 后被挂起,新标记落地,恢复后的删除仍会误删。
                     let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
-                    let _fs = ALIGN_FS_LOCK.lock().unwrap();
+                    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
                     let content = std::fs::read_to_string(&marker).ok();
                     if ours.is_some() && content == ours {
                         eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
