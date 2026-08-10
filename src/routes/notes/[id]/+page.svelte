@@ -1456,23 +1456,31 @@
         </div>
 
         <!-- 头部动作组:重新推断身份 / 导出(MD、成品轨音频)浮层菜单 / 打开目录,
-             均为幽灵族(.ghost)图标+文字按钮。txt 渲染能力在导出层与
-             CLI(notes get --format txt)保留,GUI 不再暴露。 -->
+             均为幽灵族(.ghost)纯图标按钮(冒烟反馈:文字太占行,图标+tooltip 交代
+             名称与说明;aria-label 保读屏可达)。运行态图标加 .spin 旋转反馈。
+             txt 渲染能力在导出层与 CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
-          <button class="ghost" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <button
+            class="ghost"
+            disabled={identifying}
+            title={identifying ? t("notes.identify.running") : `${t("notes.identify.rerun")}——${t("notes.identify.rerunHint")}`}
+            aria-label={t("notes.identify.rerun")}
+            onclick={() => void rerunIdentify()}
+          >
+            <svg class:spin={identifying} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="6" cy="5" r="2.5" />
               <path d="M2.2 13.8c0-2.2 1.7-4 3.8-4 1 0 1.9.4 2.6 1" />
               <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
               <path d="M13.9 6.9v2.4h-2.4" />
             </svg>
-            {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
           </button>
           <div class="export-wrap">
             <button
               class="ghost"
               aria-haspopup="menu"
               aria-expanded={exportMenuOpen}
+              title={t("notes.export.button")}
+              aria-label={t("notes.export.button")}
               onclick={(e) => {
                 e.stopPropagation();
                 exportMenuOpen = !exportMenuOpen;
@@ -1483,7 +1491,6 @@
                 <path d="M9.5 1.8V5h3.2" />
                 <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
               </svg>
-              {t("notes.export.button")}
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M2.5 4 5 6.5 7.5 4" />
               </svg>
@@ -1512,11 +1519,15 @@
               </div>
             {/if}
           </div>
-          <button class="ghost" title={t("notes.dir.openHint")} onclick={() => void doOpenDir()}>
+          <button
+            class="ghost"
+            title={`${t("notes.dir.open")}——${t("notes.dir.openHint")}`}
+            aria-label={t("notes.dir.open")}
+            onclick={() => void doOpenDir()}
+          >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
             </svg>
-            {t("notes.dir.open")}
           </button>
         </div>
       </div>
@@ -1678,14 +1689,14 @@
           <button
             class="ghost"
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
-            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+            title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : `${t("notes.retrans.run")}——${t("notes.retrans.hint")}`}
+            aria-label={t("notes.retrans.run")}
             onclick={() => (retransConfirm = true)}
           >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg class:spin={retranscribing} width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
               <path d="M13.4 1.8v2.8h-2.8" />
             </svg>
-            {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
           </button>
         {/if}
       </div>
@@ -1979,13 +1990,23 @@
   }
   /* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
      hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
+  /* 运行态图标旋转(重新推断/重转写进行中):按钮已 disabled,旋转是唯一进行中信号。 */
+  .ghost svg.spin {
+    animation: ghost-spin 1.2s linear infinite;
+  }
+  @keyframes ghost-spin {
+    to { transform: rotate(360deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ghost svg.spin { animation: none; }
+  }
   .ghost {
     display: inline-flex;
     align-items: center;
     gap: 0.4em;
     border: none;
     background: transparent;
-    padding: 0.4em 0.7em;
+    padding: 0.4em 0.55em; /* 纯图标形态:横向收紧,点击区仍 ≥28px */
     font-size: 0.85rem;
     font-weight: 500;
     letter-spacing: 0.2px;
