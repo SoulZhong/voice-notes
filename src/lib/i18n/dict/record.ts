@@ -20,6 +20,7 @@ export const zh = {
   "record.btn.stop": "停止",
 
   "record.micLevel": "麦克风电平",
+  "record.systemLevel": "对方声音电平",
 
   // 云端识别连接状态条
   "record.cloud.reconnecting": "云端识别中断,重连中…{reason}",
@@ -82,6 +83,7 @@ export const en = {
   "record.btn.stop": "Stop",
 
   "record.micLevel": "Microphone level",
+  "record.systemLevel": "Their audio level",
 
   "record.cloud.reconnecting": "Cloud transcription interrupted, reconnecting…{reason}",
   "record.cloud.backfilling": "Backfilling…",

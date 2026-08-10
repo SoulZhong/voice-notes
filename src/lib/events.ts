@@ -101,7 +101,7 @@ export function onTranscodeDone(cb: (e: TranscodeEvent) => void) {
   return listen<TranscodeEvent>("transcode_done", (ev) => cb(ev.payload));
 }
 
-export type LevelEvent = { rms: number };
+export type LevelEvent = { source: Source; rms: number };
 
 export function onLevel(cb: (e: LevelEvent) => void) {
   return listen<LevelEvent>("level", (ev) => cb(ev.payload));

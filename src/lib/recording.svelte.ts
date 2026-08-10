@@ -43,7 +43,7 @@ let paused = $state(false);
 let elapsedBaseMs = $state(0);
 let tickAnchor = $state<number | null>(null);
 let nowTick = $state(Date.now());
-let level = $state(0);
+let levels = $state({ mic: 0, system: 0 });
 
 let initialized = false;
 /** 续录一次性标志：置位期间 "recording" 事件不清 finals/speakers（已由 resume() 灌注历史）。 */
@@ -70,7 +70,7 @@ export const recording = {
   get paused() { return paused; },
   get stopping() { return status === "stopping"; },
   get isLive() { return status === "recording" || status === "paused"; },
-  get level() { return level; },
+  get levels() { return levels; },
   /** 活跃录制毫秒：后端快照 + 本地走表（暂停/停止时不走）。 */
   get elapsedMs() { return elapsedBaseMs + (tickAnchor !== null ? nowTick - tickAnchor : 0); },
 
@@ -154,7 +154,7 @@ export const recording = {
         paused = false;
         elapsedBaseMs = 0;
         tickAnchor = null;
-        level = 0;
+        levels = { mic: 0, system: 0 };
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
@@ -169,7 +169,7 @@ export const recording = {
       }
     });
     onLevel((e) => {
-      level = e.rms;
+      levels = { ...levels, [e.source]: e.rms };
     });
     setInterval(() => {
       nowTick = Date.now();
@@ -295,7 +295,7 @@ export const recording = {
     status = "stopping";
     paused = false;
     tickAnchor = null;
-    level = 0;
+    levels = { mic: 0, system: 0 };
     try {
       await invoke("stop_recording");
     } catch (err) {

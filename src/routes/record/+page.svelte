@@ -252,34 +252,45 @@
   async function startRecording() {
     await recording.start(); // 已在录制页，无需跳转
   }
-  const levelPct = $derived.by(() => {
-    if (!recording.isLive || recording.level <= 0) return 0;
-    const db = 20 * Math.log10(recording.level);
+  /** rms → 0..100% 显示映射,mic/system 两路共用(数值映射与原单通道版本一致)。 */
+  const pctOf = (rms: number) => {
+    if (!recording.isLive || rms <= 0) return 0;
+    const db = 20 * Math.log10(rms);
     return Math.max(0, Math.min(100, ((db + 50) / 50) * 100)); // -50dBFS..0dBFS → 0..100%
-  });
+  };
+  const micPct = $derived.by(() => pctOf(recording.levels.mic));
+  const sysPct = $derived.by(() => pctOf(recording.levels.system));
 
   // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移,
   //    滚动保留最近 240 条(约 29s);暂停冻结不清空,停止清空。interval 回调里读
-  //    levelPct 是瞬时值,不进 effect 依赖。 ──
+  //    micPct/sysPct 是瞬时值,不进 effect 依赖。mic/system 各一条独立数组。 ──
   const LIVE_BARS = 240;
-  let liveBars = $state<number[]>([]);
+  let liveBarsMic = $state<number[]>([]);
+  let liveBarsSys = $state<number[]>([]);
   $effect(() => {
     if (!recording.isLive) {
-      liveBars = [];
+      liveBarsMic = [];
+      liveBarsSys = [];
       return;
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
     const t = setInterval(() => {
-      liveBars = [...liveBars.slice(-(LIVE_BARS - 1)), levelPct];
+      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), micPct];
+      liveBarsSys = [...liveBarsSys.slice(-(LIVE_BARS - 1)), sysPct];
     }, 120);
     return () => clearInterval(t);
   });
   /** 渲染用:前导补零到 LIVE_BARS,让波形从开录起就铺满整行(与详情页全宽波形一致),
       而非少量样本挤在右缘、左侧留大片空——补的零段是低平基线,新声仍从右侧进入。 */
-  const liveBarsView = $derived(
-    liveBars.length >= LIVE_BARS
-      ? liveBars
-      : [...new Array(LIVE_BARS - liveBars.length).fill(0), ...liveBars],
+  const liveBarsMicView = $derived(
+    liveBarsMic.length >= LIVE_BARS
+      ? liveBarsMic
+      : [...new Array(LIVE_BARS - liveBarsMic.length).fill(0), ...liveBarsMic],
+  );
+  const liveBarsSysView = $derived(
+    liveBarsSys.length >= LIVE_BARS
+      ? liveBarsSys
+      : [...new Array(LIVE_BARS - liveBarsSys.length).fill(0), ...liveBarsSys],
   );
 
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
@@ -378,10 +389,15 @@
 
         <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
         {#if recording.isLive}
-          <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")} aria-hidden="true">
-            {#each liveBarsView as h, i (i)}
-              <span class="bar" style="height: {Math.max(6, h)}%"></span>
-            {/each}
+          <div class="wave-stack" aria-hidden="true">
+            <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")}>
+              <span class="wave-tag mic">{t("record.badge.me")}</span>
+              {#each liveBarsMicView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
+            </div>
+            <div class="wave-live" class:frozen={recording.paused} title={t("record.systemLevel")}>
+              <span class="wave-tag system">{t("record.badge.them")}</span>
+              {#each liveBarsSysView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
+            </div>
           </div>
         {/if}
 
@@ -616,20 +632,39 @@
     color: var(--ink-secondary);
   }
   .timer.pausedTimer { color: var(--ink-faint); }
-  /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
-     record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
+  /* 双通道纵排:mic/system 各占一行,行高减半(32px→16px×2),总高与原单通道一致。
+     flex:1 从单行 wave-live 移到外层 wave-stack,继续吃满控制条与右侧计时之间的整行。
      空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
-  .wave-live {
-    /* 全宽填充:与详情页播放 transport 的 waveform-track 一致——条 flex:1 均分铺满
-       控制与右侧计时之间的整行(配合前导补零,开录起就满行,不缩在右缘)。 */
+  .wave-stack {
     flex: 1;
     min-width: 0;
-    height: 32px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+  }
+  /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
+     record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。 */
+  .wave-live {
+    min-width: 0;
+    height: 16px;
     display: flex;
     align-items: center;
     gap: 1px;
     overflow: hidden;
   }
+  /* 行首来源徽章:配色令牌复用 .badge mic/system,12px 次级墨小标,不参与 flex:1 均分。 */
+  .wave-tag {
+    flex: none;
+    font-size: 0.68rem;
+    font-weight: 500;
+    line-height: 1;
+    padding: 0.1em 0.35em;
+    margin-right: 0.35em;
+    border-radius: var(--radius-sm);
+  }
+  .wave-tag.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
+  .wave-tag.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
   .wave-live .bar {
     flex: 1;
     min-width: 1px;
