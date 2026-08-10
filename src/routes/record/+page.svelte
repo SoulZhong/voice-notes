@@ -593,14 +593,16 @@
     align-items: center;
     gap: 0.75rem;
     margin: 0 0 1rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    /* 几何量常驻，暂停只切颜色——零跳动（照 #84 胶囊纪律） */
   }
   /* 暂停:整条控制条升格为 warning 基调，呼应"没在录"这一异常态——不再只靠
      右侧小灰点交代，误以为还在录、白等一场的事故率最高的一刻。 */
   .controls.paused {
     background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
-    border-radius: var(--radius-lg);
-    padding: 0.5rem 0.75rem;
+    border-color: var(--warning-line);
   }
   .ctl-group {
     display: flex;
