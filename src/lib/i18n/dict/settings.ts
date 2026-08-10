@@ -58,11 +58,6 @@ export const zh = {
 
   // —— 录制 ——
   "settings.section.record": "录制",
-  "settings.record.sysOnly.label": "仅录制系统声音",
-  "settings.record.sysOnly.desc": "不开麦克风,只录电脑播放的声音。适合直播、网课等旁听场景",
-  "settings.record.keepVol.label": "保持外放音量",
-  "settings.record.keepVol.desc": "外放开会时音量不再被系统压低,回声自动消除",
-  "settings.record.keepVol.sysOnlySuffix": "(仅录系统声音时无效)",
   "settings.record.langFilter.label": "乱码过滤",
   "settings.record.langFilter.desc": "丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭",
   "settings.identifyAuto.label": "自动认出说话人",
@@ -75,13 +70,16 @@ export const zh = {
   "settings.calendar.requesting": "请求中…",
   "settings.calendar.denied": "日历权限已被拒绝:去 系统设置 → 隐私与安全性 → 日历 中开启",
   "settings.calendar.insufficient": "当前仅有\u201c添加日程\u201d权限,读取日程需要完全访问:去 系统设置 → 隐私与安全性 → 日历 调整",
-  "settings.record.keepAudio.label": "保留录音音频",
-  "settings.record.keepAudio.desc": "录完可回放核对;关闭可节省磁盘",
   "settings.record.audioScheme.label": "声音处理方案",
   "settings.record.audioScheme.desc": "A:双轨对齐回放;A+B:录制期混出成品轨供对照(默认仍放双轨);B:默认直接播成品轨。混音仅影响新录制,每分钟约多占 1.9MB(转码后大幅缩小)",
   "settings.record.audioScheme.a": "方案 A · 双轨",
   "settings.record.audioScheme.ab": "A+B 对照",
   "settings.record.audioScheme.b": "方案 B · 成品轨",
+  "settings.record.audioRetention.label": "音频保留期",
+  "settings.record.audioRetention.desc": "到期后台自动清理录音音频(笔记文字与说话人不受影响,同「清理…」手动结果一致)",
+  "settings.record.audioRetention.forever": "不清理",
+  "settings.record.audioRetention.d90": "90 天",
+  "settings.record.audioRetention.d30": "30 天",
   "settings.lockHint.recording": "录制进行中:识别方式已锁定,其余更改下一场录制生效。",
   "settings.lockHint.idle": "更改在下一场录制生效。",
 
@@ -163,6 +161,10 @@ export const zh = {
   "settings.mirror.test": "测试",
   "settings.mirror.aria": "使用镜像加速",
 
+  // —— 高级(默认收起) ——
+  "settings.section.advanced": "高级",
+  "settings.section.advancedDesc": "低频/进阶选项:乱码过滤、自动认出说话人",
+
   // —— 关于 / 更新 ——
   "settings.section.about": "关于",
   "settings.about.version": "当前版本 v{v}",
@@ -235,13 +237,6 @@ export const en = {
   "settings.migrate.start": "Start migration",
 
   "settings.section.record": "Recording",
-  "settings.record.sysOnly.label": "Record system audio only",
-  "settings.record.sysOnly.desc":
-    "Keeps the microphone off and records only what this computer plays. Good for listen-only scenarios like livestreams and online classes",
-  "settings.record.keepVol.label": "Keep speaker volume",
-  "settings.record.keepVol.desc":
-    "Speaker volume is no longer lowered by the system during calls; echo is cancelled automatically",
-  "settings.record.keepVol.sysOnlySuffix": " (no effect when recording system audio only)",
   "settings.record.langFilter.label": "Garbled text filter",
   "settings.record.langFilter.desc":
     "Drops text falsely transcribed from silence or noise. Turn off if multilingual meetings are affected",
@@ -255,13 +250,16 @@ export const en = {
   "settings.calendar.requesting": "Requesting\u2026",
   "settings.calendar.denied": "Calendar access denied: enable it in System Settings \u2192 Privacy & Security \u2192 Calendars",
   "settings.calendar.insufficient": "Only add-events permission granted; reading events needs Full Access: adjust in System Settings \u2192 Privacy & Security \u2192 Calendars",
-  "settings.record.keepAudio.label": "Keep recording audio",
-  "settings.record.keepAudio.desc": "Play back recordings to verify; turn off to save disk space",
   "settings.record.audioScheme.label": "Audio processing scheme",
   "settings.record.audioScheme.desc": "A: aligned dual-track playback; A+B: also mix a combined track while recording for comparison (playback still defaults to dual); B: play the mixed track by default. Mixing affects new recordings only; ~1.9MB more per minute (much smaller after transcoding)",
   "settings.record.audioScheme.a": "Scheme A · Dual",
   "settings.record.audioScheme.ab": "A+B compare",
   "settings.record.audioScheme.b": "Scheme B · Mixed",
+  "settings.record.audioRetention.label": "Audio retention",
+  "settings.record.audioRetention.desc": "Recording audio is auto-purged after this period in the background (note text and speakers are unaffected, same result as manual Clean up…)",
+  "settings.record.audioRetention.forever": "Keep forever",
+  "settings.record.audioRetention.d90": "90 days",
+  "settings.record.audioRetention.d30": "30 days",
   "settings.lockHint.recording":
     "Recording in progress: transcription mode is locked; other changes take effect on the next recording.",
   "settings.lockHint.idle": "Changes take effect on the next recording.",
@@ -336,6 +334,9 @@ export const en = {
   "settings.mirror.desc": "Faster model downloads on networks in China",
   "settings.mirror.test": "Test",
   "settings.mirror.aria": "Use mirror acceleration",
+
+  "settings.section.advanced": "Advanced",
+  "settings.section.advancedDesc": "Low-frequency/advanced options: garbled text filter, auto-identify speakers",
 
   "settings.section.about": "About",
   "settings.about.version": "Current version v{v}",

@@ -65,9 +65,9 @@
     await requestScreenPerm();
   }
 
-  // 蓝牙外放预警:「保持外放音量」+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件
-  // 回声消除的追踪范围,mic 会混入近乎全量的对方声音(面试录音实锤)。开录前提示,
-  // 查询失败按"无风险"静默。
+  // 蓝牙外放预警:采集路径=aec(普通输入 + 软件 AEC,现为默认;三删一藏前叫「保持外放
+  // 音量」)+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件回声消除的追踪范围,mic 会混入
+  // 近乎全量的对方声音(面试录音实锤)。开录前提示,查询失败按"无风险"静默。
   let btEchoRisk = $state(false);
   async function refreshBtRisk() {
     try {
@@ -75,14 +75,15 @@
         getSettings(),
         invoke<boolean>("output_is_bluetooth"),
       ]);
-      btEchoRisk = s.keep_output_volume && bt;
+      btEchoRisk = s.capture_path === "aec" && bt;
     } catch {
       btEchoRisk = false;
     }
   }
 
   // 输入音量过低预警(普通麦克风模式):系统输入音量被会议软件拉低会录得很轻。
-  // 开录前 + 录制中都检测,一键调回可用电平;VPIO 模式(自带 AGC)/仅系统声不检测。
+  // 开录前 + 录制中都检测,一键调回可用电平;VPIO 模式(自带 AGC)不检测——硬承诺双轨下
+  // 麦克风恒必备(仅录系统声的旧选项已随三删一藏下线),不再有跳过麦克风检测的路径。
   const LOW_INPUT_THRESHOLD = 50;
   const INPUT_TARGET = 75;
   const POLL_MS = 4000;
@@ -94,9 +95,7 @@
         invoke<number | null>("input_volume"),
       ]);
       lowInputVol =
-        s.keep_output_volume && !s.record_system_only && vol != null && vol < LOW_INPUT_THRESHOLD
-          ? { vol }
-          : null;
+        s.capture_path === "aec" && vol != null && vol < LOW_INPUT_THRESHOLD ? { vol } : null;
     } catch {
       lowInputVol = null;
     }
