@@ -76,7 +76,7 @@ pub struct TrackMeta {
     /// 音轨,替代按转写段落 rms 聚合的包络(说话稀疏时后者近乎空白,像显示故障)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waveform: Option<Vec<u8>>,
-    /// 本轨录制时走了软件 AEC 路径(「保持外放音量」):转码前的离线回声清洗
+    /// 本轨录制时走了软件 AEC 路径(capture_path=aec):转码前的离线回声清洗
     /// 只对这类轨道启动。录制启用时写 true,从不清除(续录混合场景由清洗端的
     /// 置信度门限兜底)。
     #[serde(default, skip_serializing_if = "Option::is_none")]

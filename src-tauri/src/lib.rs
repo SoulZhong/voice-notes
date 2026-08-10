@@ -6514,8 +6514,9 @@ fn apply_shortcut(app: AppHandle) -> Result<(), String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-/// 当前默认输出是否蓝牙:录制页在「保持外放音量」开启时预警蓝牙外放
-/// (蓝牙延迟超出软件 AEC 的延迟估计范围,回声消除失效,见 audio::default_output_is_bluetooth)。
+/// 当前默认输出是否蓝牙:录制页据此预警蓝牙外放(蓝牙延迟超出软件 AEC 的延迟估计
+/// 范围,回声消除失效)。与 capture_path(aec/vpio)设置无关,不按设置项门控——
+/// 见 audio::default_output_is_bluetooth。
 #[tauri::command]
 fn output_is_bluetooth() -> bool {
     audio::default_output_is_bluetooth()
