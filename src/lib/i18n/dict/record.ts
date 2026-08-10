@@ -18,8 +18,11 @@ export const zh = {
   "record.btn.resume": "恢复",
   "record.btn.pause": "暂停",
   "record.btn.stop": "停止",
+  "record.btn.stopConfirmYes": "停止",
+  "record.btn.stopConfirmNo": "继续录",
 
   "record.micLevel": "麦克风电平",
+  "record.systemLevel": "对方声音电平",
 
   // 云端识别连接状态条
   "record.cloud.reconnecting": "云端识别中断,重连中…{reason}",
@@ -59,6 +62,21 @@ export const zh = {
   "record.emptyHint": "（开始说话…）",
   "record.jumpLatest": "↓ 回到最新",
 
+  // 回看工具条:页内搜索(高亮+跳转,不隐藏) + 说话人过滤(隐藏行)
+  "record.search.placeholder": "搜索转写内容",
+  "record.search.none": "无命中",
+  "record.search.prev": "上一个",
+  "record.search.next": "下一个",
+  "record.search.clear": "清除",
+
+  // 当场纠正(行内编辑文本 / 改派说话人 / 命名改名):后端为唯一真值源,前端不做
+  // 乐观更新,失败原样展示、不自动重试。
+  "record.edit.text": "编辑这一句",
+  "record.edit.speaker": "改说话人",
+  "record.edit.rename": "命名/改名…",
+  "record.edit.failed": "编辑失败:{e}",
+  "record.edit.dismiss": "关闭",
+
   // AiStateLabel 无障碍标签
   "record.ai.idle": "AI",
   "record.ai.running": "Aing，正在执行",
@@ -80,8 +98,11 @@ export const en = {
   "record.btn.resume": "Resume",
   "record.btn.pause": "Pause",
   "record.btn.stop": "Stop",
+  "record.btn.stopConfirmYes": "Stop",
+  "record.btn.stopConfirmNo": "Keep going",
 
   "record.micLevel": "Microphone level",
+  "record.systemLevel": "Their audio level",
 
   "record.cloud.reconnecting": "Cloud transcription interrupted, reconnecting…{reason}",
   "record.cloud.backfilling": "Backfilling…",
@@ -120,6 +141,18 @@ export const en = {
   "record.badge.them": "Them",
   "record.emptyHint": "(Start speaking…)",
   "record.jumpLatest": "↓ Back to latest",
+
+  "record.search.placeholder": "Search transcript",
+  "record.search.none": "No matches",
+  "record.search.prev": "Previous",
+  "record.search.next": "Next",
+  "record.search.clear": "Clear",
+
+  "record.edit.text": "Edit this line",
+  "record.edit.speaker": "Change speaker",
+  "record.edit.rename": "Name/rename…",
+  "record.edit.failed": "Edit failed: {e}",
+  "record.edit.dismiss": "Dismiss",
 
   "record.ai.idle": "AI",
   "record.ai.running": "Aing, running",

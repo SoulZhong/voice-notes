@@ -8,15 +8,18 @@ import {
   onSpeakers,
   onRetract,
   onLevel,
+  onSegmentEdited,
   type Source,
   type SystemAudio,
   type Diarization,
   type StatusEvent,
 } from "./events";
 import { getNote, resumeRecording } from "./notes";
+import { hasSeq } from "./liveView";
 
-/** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。 */
-export type Line = { source: Source; text: string; speaker: string | null; start_ms: number };
+/** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。
+ * seq:磁盘段 seq,录制中段编辑的寻址锚点。 */
+export type Line = { seq: number; source: Source; text: string; speaker: string | null; start_ms: number };
 export type SpeakerMap = Record<
   string,
   { name: string; sources: string[]; person_id?: string | null }
@@ -43,7 +46,7 @@ let paused = $state(false);
 let elapsedBaseMs = $state(0);
 let tickAnchor = $state<number | null>(null);
 let nowTick = $state(Date.now());
-let level = $state(0);
+let levels = $state({ mic: 0, system: 0 });
 
 let initialized = false;
 /** 续录一次性标志：置位期间 "recording" 事件不清 finals/speakers（已由 resume() 灌注历史）。 */
@@ -70,7 +73,7 @@ export const recording = {
   get paused() { return paused; },
   get stopping() { return status === "stopping"; },
   get isLive() { return status === "recording" || status === "paused"; },
-  get level() { return level; },
+  get levels() { return levels; },
   /** 活跃录制毫秒：后端快照 + 本地走表（暂停/停止时不走）。 */
   get elapsedMs() { return elapsedBaseMs + (tickAnchor !== null ? nowTick - tickAnchor : 0); },
 
@@ -101,8 +104,11 @@ export const recording = {
       else partialSystem = e.text;
     });
     onFinal((e) => {
-      if (e.text.trim())
-        finals = [...finals, { source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
+      // 水合快照与在途事件竞态:后端先落盘后 emit，hydrateFromDisk（冷刷新对账/续录已灌注历史的
+      // "已在录制"分支）读到的磁盘快照可能已含此段，该段 final 事件随后又抵达一次——按 seq 去重，
+      // 否则重复 append 会撞出重复 seq，keyed each (line.seq) 在 dev 下直接崩页。
+      if (e.text.trim() && !hasSeq(finals, e.seq))
+        finals = [...finals, { seq: e.seq, source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
       if (e.source === "mic") partialMic = "";
       else partialSystem = "";
     });
@@ -112,6 +118,13 @@ export const recording = {
         (l) => l.source === e.source && l.start_ms === e.start_ms && l.text === e.text,
       );
       if (idx >= 0) finals = [...finals.slice(0, idx), ...finals.slice(idx + 1)];
+    });
+    // 录制中段编辑落盘成功:后端为唯一真值源,前端不做乐观更新,收到事件才按 seq 改写。
+    onSegmentEdited((e) => {
+      if (e.note_id !== noteId) return;
+      finals = finals.map((l) =>
+        l.seq === e.seq ? { ...l, text: e.text ?? l.text, speaker: e.speaker ?? l.speaker } : l,
+      );
     });
     onStatus((e) => {
       if (e.state === "recording") {
@@ -154,7 +167,7 @@ export const recording = {
         paused = false;
         elapsedBaseMs = 0;
         tickAnchor = null;
-        level = 0;
+        levels = { mic: 0, system: 0 };
         partialMic = "";
         partialSystem = "";
         storageDegraded = false;
@@ -169,7 +182,7 @@ export const recording = {
       }
     });
     onLevel((e) => {
-      level = e.rms;
+      levels = { ...levels, [e.source]: e.rms };
     });
     setInterval(() => {
       nowTick = Date.now();
@@ -245,7 +258,7 @@ export const recording = {
     try {
       // getNote 失败：不灌注、不置 resuming，原样冒泡为 error 状态。
       const note = await getNote(noteId_);
-      finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
+      finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
       speakers = { ...note.speakers };
       noteId = noteId_;
       resuming = true;
@@ -295,7 +308,7 @@ export const recording = {
     status = "stopping";
     paused = false;
     tickAnchor = null;
-    level = 0;
+    levels = { mic: 0, system: 0 };
     try {
       await invoke("stop_recording");
     } catch (err) {
@@ -314,7 +327,7 @@ async function hydrateFromDisk(id: string) {
   if (!id) return;
   try {
     const note = await getNote(id);
-    finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
+    finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
     speakers = { ...note.speakers };
   } catch {
     // 水合失败仅影响历史段回显，不阻塞录制状态重建。

@@ -2,9 +2,17 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { recording } from "$lib/recording.svelte";
+  import { recording, type Line } from "$lib/recording.svelte";
   import { t } from "$lib/i18n/index.svelte";
-  import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
+  import {
+    speakerLabel,
+    speakerColor,
+    speakerInk,
+    speakerIdCompare,
+    editSegment,
+    setSegmentSpeaker,
+    renameSpeaker,
+  } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import {
     modelsStatus,
@@ -16,6 +24,7 @@
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
+  import { matchesSpeakerFilter, nearestIndexByMs, searchHits } from "$lib/liveView";
 
   let models = $state<ModelsStatus | null>(null);
 
@@ -177,6 +186,107 @@
     wasLive = live;
   });
 
+  // 停止二段确认:悬停态胶囊仅在"这一场"有效——录制结束(isLive 翻 false，无论是
+  // 经这次确认停止、还是场次因错误/别处自行终止)都必须复位，否则下一场开录后
+  // 控制条会带着上一场遗留的确认胶囊出现。
+  let confirmStop = $state(false);
+  $effect(() => {
+    if (!recording.isLive) confirmStop = false;
+  });
+
+  // ── 当场纠正:行内编辑文本 / 点行首徽章改派说话人 / 命名改名 ──────────────────
+  // segment_edited 是唯一真值源(见 recording.svelte.ts 订阅),这里不做乐观更新——
+  // 提交后只清本地的"正在编辑"标记,展示的文字/说话人等事件把 finals 改回来。
+  let editingSeq = $state<number | null>(null);
+  let editingText = $state("");
+  let speakerMenuSeq = $state<number | null>(null);
+  let renamingSeq = $state<number | null>(null);
+  let renameText = $state("");
+  let editError = $state("");
+
+  // 录制结束(停止/出错)后清空所有悬浮编辑态,不带着上一场的态出现在下一场。
+  // 回看态(搜索词/说话人过滤/命中下标)一并清空:同一页面实例跨场复用时,说话人 id
+  // 按场编号(S0/S1...)跨场高概率复用,上一场遗留的过滤 chip 会静默把新场的转写行
+  // 过滤掉、follow 卡暂停。清空会让下面的 reviewActive 产生 true→false 边沿从而
+  // 触发 jumpToLatest——停录时刻滚回底部是可接受行为,这里不额外同步 prevReviewActive
+  // 去绕过这条边沿。
+  $effect(() => {
+    if (!recording.isLive) {
+      editingSeq = null;
+      speakerMenuSeq = null;
+      renamingSeq = null;
+      searchQuery = "";
+      selectedSpeakers = new Set();
+      activeHit = 0;
+    }
+  });
+
+  /** keyed each 用 line.seq；「当前句」判定不再依赖 #each 的索引 i。 */
+  const lastFinalSeq = $derived(
+    recording.finals.length ? recording.finals[recording.finals.length - 1].seq : null,
+  );
+  /** 改派菜单只列本场已有说话人——不提供「新说话人」选项(后端会拒 "new",
+      Task 6 审查结论:别让用户在这条路上撞错)。 */
+  const speakerIds = $derived(Object.keys(recording.speakers).sort(speakerIdCompare));
+
+  function beginEdit(line: Line) {
+    speakerMenuSeq = null;
+    editingSeq = line.seq;
+    editingText = line.text;
+  }
+
+  async function commitEdit(line: Line) {
+    const newText = editingText.trim();
+    if (!newText || newText === line.text) {
+      editingSeq = null;
+      return;
+    }
+    try {
+      await editSegment(recording.noteId!, line.seq, line.text, newText);
+      editingSeq = null;
+    } catch (e) {
+      // 后端可能报"录制会话已结束,请重试"或"该笔记正被占用…"这类停录竞态错误——
+      // 如实展示原文,不自动重试(由用户自行判断是否重试)。
+      editError = t("record.edit.failed", { e });
+    }
+  }
+
+  function toggleSpeakerMenu(seq: number) {
+    editingSeq = null;
+    renamingSeq = null;
+    speakerMenuSeq = speakerMenuSeq === seq ? null : seq;
+  }
+
+  async function pickSpeaker(line: Line, speakerId: string) {
+    speakerMenuSeq = null;
+    try {
+      await setSegmentSpeaker(recording.noteId!, line.seq, line.text, speakerId);
+    } catch (e) {
+      editError = t("record.edit.failed", { e });
+    }
+  }
+
+  function beginRename(line: Line) {
+    if (!line.speaker) return; // 未标注说话人(source 兜底"我/对方")没有 id 可改名
+    renamingSeq = line.seq;
+    renameText = recording.speakers[line.speaker]?.name ?? "";
+  }
+
+  /** renamingSeq 卫语句：Escape 已在按键处同步清空 renamingSeq，随后触发的 blur
+      再调本函数会被这层卫语句挡住，不会把取消误提交（同 SpeakerChips 的既有写法）。 */
+  async function commitRename(line: Line) {
+    if (renamingSeq !== line.seq || !line.speaker) return;
+    renamingSeq = null;
+    const name = renameText.trim();
+    if (!name) return;
+    try {
+      await renameSpeaker(recording.noteId!, line.speaker, name);
+      speakerMenuSeq = null;
+    } catch (e) {
+      editError = t("record.edit.failed", { e });
+    }
+  }
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
@@ -252,34 +362,42 @@
   async function startRecording() {
     await recording.start(); // 已在录制页，无需跳转
   }
-  const levelPct = $derived.by(() => {
-    if (!recording.isLive || recording.level <= 0) return 0;
-    const db = 20 * Math.log10(recording.level);
+  /** rms → 0..100% 显示映射,mic/system 两路共用(数值映射与原单通道版本一致)。 */
+  const pctOf = (rms: number) => {
+    if (!recording.isLive || rms <= 0) return 0;
+    const db = 20 * Math.log10(rms);
     return Math.max(0, Math.min(100, ((db + 50) / 50) * 100)); // -50dBFS..0dBFS → 0..100%
-  });
+  };
+  const micPct = $derived.by(() => pctOf(recording.levels.mic));
+  const sysPct = $derived.by(() => pctOf(recording.levels.system));
 
   // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移,
   //    滚动保留最近 240 条(约 29s);暂停冻结不清空,停止清空。interval 回调里读
-  //    levelPct 是瞬时值,不进 effect 依赖。 ──
+  //    micPct/sysPct 是瞬时值,不进 effect 依赖。
+  //    波形只画 mic(冒烟反馈:双轨两行太吵);系统声降级为「对方」指示灯——
+  //    sysHold 是带保持的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),灯不闪烁。 ──
   const LIVE_BARS = 240;
-  let liveBars = $state<number[]>([]);
+  let liveBarsMic = $state<number[]>([]);
+  let sysHold = $state(0);
   $effect(() => {
     if (!recording.isLive) {
-      liveBars = [];
+      liveBarsMic = [];
+      sysHold = 0;
       return;
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
     const t = setInterval(() => {
-      liveBars = [...liveBars.slice(-(LIVE_BARS - 1)), levelPct];
+      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), micPct];
+      sysHold = sysPct > 0 ? 8 : Math.max(0, sysHold - 1);
     }, 120);
     return () => clearInterval(t);
   });
   /** 渲染用:前导补零到 LIVE_BARS,让波形从开录起就铺满整行(与详情页全宽波形一致),
       而非少量样本挤在右缘、左侧留大片空——补的零段是低平基线,新声仍从右侧进入。 */
-  const liveBarsView = $derived(
-    liveBars.length >= LIVE_BARS
-      ? liveBars
-      : [...new Array(LIVE_BARS - liveBars.length).fill(0), ...liveBars],
+  const liveBarsMicView = $derived(
+    liveBarsMic.length >= LIVE_BARS
+      ? liveBarsMic
+      : [...new Array(LIVE_BARS - liveBarsMic.length).fill(0), ...liveBarsMic],
   );
 
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
@@ -327,7 +445,10 @@
       if (e.deltaY < 0 && recording.isLive && sc.scrollHeight > sc.clientHeight + 4) follow = false;
     };
     const onScroll = () => {
-      if (sc.scrollHeight - sc.scrollTop - sc.clientHeight <= BOTTOM_SLOP) follow = true;
+      // 回看态(reviewActive)下 follow 由下方边沿 effect 专管：过滤/搜索命中收紧会隐藏行，
+      // scrollHeight 收缩触发浏览器钳制 scrollTop，落入贴底判定带——这是布局副作用，不是
+      // 用户主动划回底部的意图，scroll 事件在此不得抢跑把 follow 重新打开。
+      if (!reviewActive && sc.scrollHeight - sc.scrollTop - sc.clientHeight <= BOTTOM_SLOP) follow = true;
     };
     sc.addEventListener("wheel", onWheel, { passive: true });
     sc.addEventListener("scroll", onScroll, { passive: true });
@@ -336,6 +457,99 @@
       sc.removeEventListener("scroll", onScroll);
     };
   });
+
+  // ── 回看工具条:页内搜索(高亮+跳转,不隐藏行) + 说话人过滤(隐藏行) ──────────
+  // 口径:状态条件——reviewActive 由 false 变 true 即暂停跟随；由 true 变 false
+  // （无论哪条路径：Esc、「清除」按钮、退格删空搜索框、取消最后一个说话人 chip）
+  // 都恢复跟随并跳到最新。用 prevReviewActive 记边沿，只在转换瞬间触发一次，
+  // 避免每次输入/每次 chip 切换都强制滚动。
+  let searchQuery = $state("");
+  let activeHit = $state(0); // hits 内下标
+  let selectedSpeakers = $state<Set<string>>(new Set());
+  // 选中集随说话人表收敛(Codex P2):live 合并会把 loser 从表里移除并把其段落改写给
+  // winner——若选中集还留着 loser,过滤会隐藏全部改写行且对应 chip 已消失,整页空白
+  // 只能靠「清除」自救。fail-open 剪掉失效 id(不映射到 winner:合并是算法行为,
+  // 悄悄替换用户的过滤对象反而更意外)。
+  $effect(() => {
+    const ids = new Set(speakerIds);
+    if ([...selectedSpeakers].some((sid) => !ids.has(sid))) {
+      selectedSpeakers = new Set([...selectedSpeakers].filter((sid) => ids.has(sid)));
+    }
+  });
+  // 命中=可见命中:搜索导航永不落在被过滤行上——先拿文本命中，再叠一层说话人过滤，
+  // 否则「下一个」可能跳到 display:none 的行（scrollIntoView 对隐藏元素静默 no-op），
+  // 计数也会把不可见行算进去。
+  const hits = $derived(
+    searchHits(recording.finals, searchQuery).filter((i) =>
+      matchesSpeakerFilter(recording.finals[i], selectedSpeakers),
+    ),
+  );
+  /** each 内 O(n) 判定命中(而非 hits.includes(i) 的 O(n²))：finals 行数虽然通常
+      只有数百，但录制可长达数小时，直接派生 Set 零成本。 */
+  const hitSet = $derived(new Set(hits));
+  /** hits 收缩时(说话人过滤收紧、命中行被回声撤回…)activeHit 可能越界——渲染计数/
+      高亮、gotoHit 的跳转基点统一读钳制值，避免出现「6/5」这种越界展示。 */
+  const activeHitClamped = $derived(Math.min(activeHit, Math.max(0, hits.length - 1)));
+  const reviewActive = $derived(searchQuery.trim() !== "" || selectedSpeakers.size > 0);
+
+  let prevReviewActive = false;
+  $effect(() => {
+    if (reviewActive && !prevReviewActive) follow = false;
+    if (!reviewActive && prevReviewActive) jumpToLatest();
+    prevReviewActive = reviewActive;
+  });
+  // 换一次查询词，命中列表整个变了，上一次的"第几个命中"下标不再有意义——
+  // 重新从第一个命中数起，而非停留在旧下标显示出"5/3"这种错位计数。
+  $effect(() => {
+    void searchQuery;
+    activeHit = 0;
+  });
+  function clearReview() {
+    searchQuery = "";
+    selectedSpeakers = new Set();
+    activeHit = 0;
+    // 恢复跟随/跳到最新交给上面的 reviewActive 边沿监听——这里不再重复调用
+    // jumpToLatest()，否则 Esc/「清除」路径会触发两次滚动。
+  }
+  function gotoHit(delta: number) {
+    if (!hits.length) return;
+    activeHit = (activeHitClamped + delta + hits.length) % hits.length;
+    document
+      .getElementById(`seg-${recording.finals[hits[activeHit]].seq}`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+  function toggleSpeaker(id: string) {
+    const next = new Set(selectedSpeakers);
+    next.has(id) ? next.delete(id) : next.add(id);
+    selectedSpeakers = next;
+  }
+
+  // ── 右缘迷你时间轴:细轨映射 0..elapsedMs,点击定位最近行 ──────────────────
+  /** 每 5 分钟一个刻度的纵向百分比。elapsedMs 是走表值(每秒变化),派生成本
+      是一次数组构建，量级在"总时长/5分钟"，秒级重算可接受，无需额外节流。 */
+  const ticksView = $derived.by(() => {
+    const total = recording.elapsedMs;
+    if (total < 60_000) return [] as number[];
+    const out: number[] = [];
+    for (let ms = 300_000; ms < total; ms += 300_000) out.push((ms / total) * 100);
+    return out;
+  });
+
+  function handleTimelineClick(e: MouseEvent) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ms = ((e.clientY - rect.top) / rect.height) * recording.elapsedMs;
+    // 口径同 Task 9 的 hits：定位候选先按当前说话人过滤筛出可见子集，再取最近行，
+    // 否则命中的行可能是 display:none（被过滤隐藏），scrollIntoView 会静默 no-op。
+    const visible = recording.finals.filter((l) => matchesSpeakerFilter(l, selectedSpeakers));
+    const idx = nearestIndexByMs(visible, ms);
+    if (idx < 0) return;
+    // 时间轴点击不算"回看激活态"（不进 reviewActive），只是暂停跟随——与手动上滑
+    // 同类；follow 恢复靠既有的"回到最新"按钮，不额外造恢复逻辑。
+    follow = false;
+    document
+      .getElementById(`seg-${visible[idx].seq}`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
 </script>
 
 <div class="container">
@@ -353,7 +567,7 @@
     {#if !models || models.recording_ready}
       <!-- 两端对齐:控制钮组贴左、计时+状态贴右、实时波形限宽居中(space-between 把
            富余横向空间分到两侧间隙,波形不再 flex:1 拉满整屏成一根横贯全宽的细带)。 -->
-      <div class="controls">
+      <div class="controls" class:paused={recording.paused}>
         <!-- 左:控制钮组 -->
         <div class="ctl-group">
           {#if recording.stopping}
@@ -366,23 +580,46 @@
             </button>
           {:else}
             {#if recording.paused}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>{t("record.btn.resume")}</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>
+                <span class="sym play"></span>{t("record.btn.resume")}
+              </button>
             {:else}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>{t("record.btn.pause")}</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>
+                <span class="sym pause"></span>{t("record.btn.pause")}
+              </button>
             {/if}
-            <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}>
-              <span class="sym square"></span>{t("record.btn.stop")}
-            </button>
+            {#if confirmStop}
+              <!-- 紧凑确认胶囊(冒烟反馈:问句+两个全尺寸按钮太拥挤):胶囊底色即警示
+                   语义,只留两个 link 型小按钮,与相邻 .ctl 同高不跳版。 -->
+              <span class="stop-confirm">
+                <!-- pending(暂停/恢复在途)时禁用(Codex P2):此时 stop() 的幂等守卫会
+                     静默返回,若仍关胶囊,用户会误以为已停止。禁用到 pending 落定再点。 -->
+                <button
+                  class="link danger"
+                  disabled={recording.pending}
+                  onclick={() => {
+                    confirmStop = false;
+                    recording.stop().catch((err) => console.error("停止录制失败", err));
+                  }}
+                >{t("record.btn.stopConfirmYes")}</button>
+                <button class="link" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
+              </span>
+            {:else}
+              <button class="ctl danger" disabled={recording.pending} onclick={() => (confirmStop = true)}>
+                <span class="sym square"></span>{t("record.btn.stop")}
+              </button>
+            {/if}
           {/if}
         </div>
 
-        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
+        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形,新声从右缘进入。
+             只画 mic 一条(冒烟反馈:双行太吵);系统声是否在收音由右侧「对方」
+             指示灯回答——有电平点亮 mint 色,静默退灰。 -->
         {#if recording.isLive}
           <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")} aria-hidden="true">
-            {#each liveBarsView as h, i (i)}
-              <span class="bar" style="height: {Math.max(6, h)}%"></span>
-            {/each}
+            {#each liveBarsMicView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
           </div>
+          <span class="sys-ind" class:on={sysHold > 0} title={t("record.systemLevel")}>{t("record.badge.them")}</span>
         {/if}
 
         <!-- 右:计时 + 状态,同一簇(不再单挂一行);状态点是唯一动态信号。
@@ -391,12 +628,49 @@
         {#if recording.isLive}
           <div class="live-meta">
             <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
-            <span class="status-inline">
+            <span class="status-inline" class:pausedTag={recording.paused}>
               <span class="status-dot" class:live={!recording.paused}></span>{statusLabel}
             </span>
           </div>
         {/if}
       </div>
+
+      <!-- 回看工具条:页内搜索(高亮+跳转) + 说话人过滤 chips。只在有转写内容可回看时
+           出现(录制中或已有定稿行)，空转写页不占位。 -->
+      {#if recording.isLive || recording.finals.length > 0}
+        <div class="review-bar">
+          <input
+            class="search"
+            placeholder={t("record.search.placeholder")}
+            bind:value={searchQuery}
+            onkeydown={(e) => {
+              if (e.key === "Enter") gotoHit(e.shiftKey ? -1 : 1);
+              if (e.key === "Escape") clearReview();
+            }}
+          />
+          {#if searchQuery.trim()}
+            <span class="hit-count">
+              {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
+            </span>
+            <button class="ghosty" onclick={() => gotoHit(-1)} title={t("record.search.prev")}>↑</button>
+            <button class="ghosty" onclick={() => gotoHit(1)} title={t("record.search.next")}>↓</button>
+          {/if}
+          <!-- 过滤 chips 只在 ≥2 个说话人时出现:单说话人过滤无意义,还与下方
+               SpeakerChips 管理条视觉重复(冒烟反馈)。 -->
+          {#if speakerIds.length >= 2}
+            {#each speakerIds as sid (sid)}
+              <button
+                class="chip"
+                class:on={selectedSpeakers.has(sid)}
+                onclick={() => toggleSpeaker(sid)}
+              >{speakerLabel(sid, "mic", recording.speakers)}</button>
+            {/each}
+          {/if}
+          {#if reviewActive}
+            <button class="ghosty" onclick={clearReview}>{t("record.search.clear")}</button>
+          {/if}
+        </div>
+      {/if}
 
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行。
            System 分类错误(isSystemDenied/isSystemUnavailable)不重复展示这行原始
@@ -486,13 +760,87 @@
       <div class="banner">{t("record.banner.storageDegraded")}</div>
     {/if}
 
-    <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
-      {#each recording.finals as line, i}
-        <p class="final" class:current={recording.isLive && !hasPartial && i === recording.finals.length - 1}>
-          <span class="badge" style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}">
-            {speakerLabel(line.speaker, line.source, recording.speakers)}
+    <!-- 当场纠正失败提示:后端停录竞态会报"会话已结束/笔记正被占用"等,原文展示、
+         不自动重试;可手动关闭。 -->
+    {#if editError}
+      <div class="banner banner-danger">
+        {editError}
+        <button class="link" onclick={() => (editError = "")}>{t("record.edit.dismiss")}</button>
+      </div>
+    {/if}
+
+    <div class="transcript-wrap">
+      <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
+      {#each recording.finals as line, i (line.seq)}
+        <p
+          id="seg-{line.seq}"
+          class="final"
+          class:current={recording.isLive && !hasPartial && line.seq === lastFinalSeq}
+          class:hidden={!matchesSpeakerFilter(line, selectedSpeakers)}
+          class:hit={hitSet.has(i)}
+          class:hit-active={hits[activeHitClamped] === i}
+        >
+          <span class="spk-anchor">
+            <button
+              class="badge as-btn"
+              style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}"
+              disabled={!recording.isLive || recording.stopping}
+              title={t("record.edit.speaker")}
+              onclick={() => toggleSpeakerMenu(line.seq)}
+            >{speakerLabel(line.speaker, line.source, recording.speakers)}</button>
+            {#if speakerMenuSeq === line.seq}
+              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
+              <span class="spk-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+                {#each speakerIds as sid (sid)}
+                  <button class="spk-item" role="menuitem" onclick={() => pickSpeaker(line, sid)}>
+                    {speakerLabel(sid, "mic", recording.speakers)}
+                  </button>
+                {/each}
+                {#if line.speaker}
+                  <span class="spk-sep"></span>
+                  {#if renamingSeq === line.seq}
+                    <!-- svelte-ignore a11y_autofocus -->
+                    <input
+                      class="spk-rename-input"
+                      autofocus
+                      bind:value={renameText}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter") commitRename(line);
+                        if (e.key === "Escape") renamingSeq = null;
+                      }}
+                      onblur={() => commitRename(line)}
+                    />
+                  {:else}
+                    <button class="spk-item" role="menuitem" onclick={() => beginRename(line)}>
+                      {t("record.edit.rename")}
+                    </button>
+                  {/if}
+                {/if}
+              </span>
+            {/if}
           </span>
-          {line.text}
+          {#if editingSeq === line.seq}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="edit-inline"
+              autofocus
+              bind:value={editingText}
+              onkeydown={(e) => {
+                if (e.key === "Enter") commitEdit(line);
+                if (e.key === "Escape") editingSeq = null;
+              }}
+              onblur={() => (editingSeq = null)}
+            />
+          {:else}
+            {line.text}
+            {#if recording.isLive && !recording.stopping}
+              <button class="row-act" title={t("record.edit.text")} onclick={() => beginEdit(line)}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M11.3 2.4l2.3 2.3L5.3 13l-3 .7.7-3z" />
+                </svg>
+              </button>
+            {/if}
+          {/if}
         </p>
       {/each}
       {#if recording.partialMic}
@@ -504,6 +852,16 @@
       {#if recording.finals.length === 0 && !recording.partialMic && !recording.partialSystem}
         <p class="hint">{t("record.emptyHint")}</p>
       {/if}
+    </div>
+    {#if recording.finals.length > 1 && recording.elapsedMs > 60_000}
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+      <div class="timeline" onclick={handleTimelineClick}>
+        <!-- key 用下标:topPct 随走表每秒漂移,拿它当 key 会整批重建节点 -->
+        {#each ticksView as topPct, i (i)}
+          <span class="tick" style="top: {topPct}%"></span>
+        {/each}
+      </div>
+    {/if}
     </div>
 
     <!-- 跟随被用户上滑打断时的返回入口：sticky 钉在滚动视口底部，恢复跟随即消失 -->
@@ -551,6 +909,17 @@
     align-items: center;
     gap: 0.75rem;
     margin: 0 0 1rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    /* 几何量常驻，暂停只切颜色——零跳动（照 #84 胶囊纪律） */
+  }
+  /* 暂停:整条控制条升格为 warning 基调，呼应"没在录"这一异常态——不再只靠
+     右侧小灰点交代，误以为还在录、白等一场的事故率最高的一刻。 */
+  /* 暂停:只上淡底不描边(冒烟反馈:边框盒+内部胶囊双重嵌套太重),醒目信号由
+     加重的「已暂停」状态字 + 计时变灰 + 波形冻结共同承担。 */
+  .controls.paused {
+    background: var(--warning-tint);
   }
   .ctl-group {
     display: flex;
@@ -573,6 +942,11 @@
     color: var(--ink-faint);
     font-size: 0.85rem;
     white-space: nowrap;
+  }
+  /* 暂停时状态标签升格：不再是小灰字，warning 墨色 + 加粗，与整条变调呼应 */
+  .status-inline.pausedTag {
+    color: var(--warning-ink);
+    font-weight: 600;
   }
   /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
@@ -608,6 +982,53 @@
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
   .sym.dot.on-blue { background: var(--on-primary); }
   .sym.square { border-radius: 2px; background: var(--record); }
+  .sym.pause {
+    width: 8px;
+    height: 10px;
+    border-left: 3px solid currentColor;
+    border-right: 3px solid currentColor;
+  }
+  .sym.play {
+    width: 0;
+    height: 0;
+    border-left: 9px solid currentColor;
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+  }
+  /* 停止二段确认胶囊：#84 同款 warning-tint 行内胶囊，120ms 淡入，不引起行高跳动
+     （padding/字号/行高与常态 .ctl-group 一致，只是行内多出一段文案+两枚按钮）。 */
+  .stop-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    color: var(--warning-ink);
+    border-radius: var(--radius-full);
+    padding: 0.15rem 0.5rem;
+    animation: fadein 120ms ease-out;
+  }
+  /* 胶囊内 link 型小按钮(照笔记页 confirm-capsule 惯例):无底无框,danger 承载
+     破坏性着色——胶囊自身即警示语境,不再堆叠全尺寸按钮。 */
+  .stop-confirm .link {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    padding: 0.15em 0.4em;
+    border-radius: var(--radius-md);
+  }
+  .stop-confirm .link:hover { background: var(--surface-press); }
+  .stop-confirm .link.danger { color: var(--danger); }
+  @keyframes fadein {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .stop-confirm { animation: none; }
+  }
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
     font-variant-numeric: tabular-nums;
@@ -618,10 +1039,8 @@
   .timer.pausedTimer { color: var(--ink-faint); }
   /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
      record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
-     空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
+     只画 mic 一条(冒烟反馈:双行太吵),flex:1 吃满控制条与右侧计时之间的整行。 */
   .wave-live {
-    /* 全宽填充:与详情页播放 transport 的 waveform-track 一致——条 flex:1 均分铺满
-       控制与右侧计时之间的整行(配合前导补零,开录起就满行,不缩在右缘)。 */
     flex: 1;
     min-width: 0;
     height: 32px;
@@ -629,6 +1048,24 @@
     align-items: center;
     gap: 1px;
     overflow: hidden;
+  }
+  /* 「对方」指示灯:系统声在收音时点亮(mint,同 .badge.system 配色令牌),静默退灰。
+     常驻占位不闪现,回答"对方声音有没有在录"而不额外占一行波形。 */
+  .sys-ind {
+    flex: none;
+    font-size: 0.68rem;
+    font-weight: 500;
+    line-height: 1;
+    padding: 0.15em 0.4em;
+    border-radius: var(--radius-sm);
+    color: var(--ink-faint);
+    border: 1px solid var(--hairline);
+    transition: background 200ms, color 200ms;
+  }
+  .sys-ind.on {
+    background: var(--tint-mint);
+    color: var(--tint-mint-ink);
+    border-color: transparent;
   }
   .wave-live .bar {
     flex: 1;
@@ -639,6 +1076,74 @@
   }
   .wave-live.frozen .bar {
     background: var(--ink-faint);
+  }
+  /* 冻结波形整体退后:低电平段在暂停态下呈虚线感,降透明度免得像一条破折号横贯全行 */
+  .wave-live.frozen {
+    opacity: 0.35;
+  }
+
+  /* 回看工具条:页内搜索 + 说话人过滤 chips，紧贴 controls 下方。 */
+  .review-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+  }
+  .review-bar .search {
+    min-width: 12rem;
+    max-width: 16rem; /* 冒烟反馈:全宽搜索框喧宾夺主,收窄成工具位 */
+    font: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    padding: 0.35em 0.6em;
+  }
+  .review-bar .hit-count {
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  /* 幽灵按钮:无边透明底，弱化成次级操作(上一个/下一个/清除)，不与说话人 chip 抢视觉。 */
+  .review-bar .ghosty {
+    border: none;
+    background: none;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-md);
+    padding: 0.25em 0.5em;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .review-bar .ghosty:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .review-bar .chip {
+    border-radius: var(--radius-full);
+    padding: 0.1em 0.6em;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--ink-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .review-bar .chip.on {
+    background: var(--accent-tint);
+    border-color: var(--accent);
+    color: var(--ink);
+  }
+
+  /* 搜索命中:高亮不隐藏(与说话人过滤的"隐藏"口径不同)。当前命中额外描边定位。 */
+  p.final.hidden {
+    display: none;
+  }
+  p.final.hit {
+    background: var(--accent-tint);
+    border-radius: var(--radius-md);
+  }
+  p.final.hit-active {
+    outline: 2px solid var(--accent);
   }
 
   /* 错误详情行(仅出错时):danger 色,完整展开可能较长的错误文案 */
@@ -658,11 +1163,24 @@
   }
   .status-dot.live {
     background: var(--record);
+    animation: breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-dot.live { animation: none; }
   }
 
   .status.error {
     color: var(--danger);
     font-weight: 500;
+  }
+
+  /* 右缘迷你时间轴的定位基准；本身不裁剪，时间轴细轨叠在 transcript 的 20px 右内边距上。 */
+  .transcript-wrap {
+    position: relative;
   }
 
   /* transcript-container：surface 底、rounded-xl、正文用 transcript 字级(1.02rem/1.7) */
@@ -727,6 +1245,29 @@
     margin: 0;
   }
 
+  /* 右缘迷你时间轴:细轨映射 0..elapsedMs，点击按 start_ms 定位最近可见行；
+     长录制（>1min 且 ≥2 行）才现身，短录没有滚动意义。 */
+  .timeline {
+    position: absolute;
+    right: 0;
+    top: 0.5rem;
+    bottom: 0.5rem;
+    width: 14px;
+    cursor: pointer;
+    border-left: 2px solid var(--hairline);
+  }
+  .timeline:hover {
+    border-left-color: var(--hairline-strong);
+  }
+  .timeline .tick {
+    position: absolute;
+    left: -4px;
+    width: 6px;
+    height: 2px;
+    background: var(--ink-faint);
+    border-radius: 1px;
+  }
+
   /* speaker-badge：粉彩底 + 同色相文字(soft 公式)、rounded-sm、micro 字级；
      mic/system 是尚未解析出说话人时的占位色，固定取 tint-sky/tint-mint，与
      speakerColor()/speakerInk() 的兜底分支保持一致视觉。 */
@@ -742,6 +1283,112 @@
   }
   .badge.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
   .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
+
+  /* 当场纠正:行首徽章变按钮(点开改派菜单),static 态与 span 视觉一致——border 清空、
+     cursor 指示可点;录制结束/停止中禁用(disabled 由模板判定 isLive && !stopping)。 */
+  .badge.as-btn {
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+  }
+  .badge.as-btn:disabled {
+    cursor: default;
+  }
+  /* 徽章 + 改派菜单的定位锚点:inline-block 让 .spk-menu 精确贴着徽章下缘展开,
+     不受同行后续文字影响。 */
+  .spk-anchor {
+    position: relative;
+    display: inline-block;
+  }
+  /* menu/popover（改派说话人）：DESIGN.md 浮层规范——surface-press 底、hairline 边、
+     radius-lg、shadow-popover，与 SpeakerChips .panel / 详情页 .export-menu 同规格。 */
+  .spk-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 8rem;
+    padding: 0.25rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    font-size: 0.85rem;
+    font-weight: 400;
+    cursor: default;
+  }
+  .spk-item {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    color: var(--ink);
+    text-align: left;
+    padding: 0.35rem 0.55rem;
+    border-radius: var(--radius-md);
+    font: inherit;
+    cursor: pointer;
+  }
+  .spk-item:hover {
+    background: var(--surface-soft);
+  }
+  .spk-sep {
+    display: block;
+    height: 1px;
+    background: var(--hairline);
+    margin: 0.2rem 0.1rem;
+  }
+  .spk-rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.35rem 0.55rem;
+    background: transparent;
+    border: none;
+    outline: none;
+    font: inherit;
+    color: var(--ink);
+  }
+
+  /* 段落文本行内编辑:与徽章齐平，覆盖当前段文字的量 */
+  .edit-inline {
+    width: min(100%, 32rem);
+    font: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-sm);
+    padding: 0.1em 0.4em;
+  }
+
+  /* 行级操作(编辑铅笔):悬停显影惯例(DESIGN.md #6)——默认隐身，行 hover 或
+     自身 focus-visible 时浮现，保持转写区安静。 */
+  .row-act {
+    visibility: hidden;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    width: 1.5rem;
+    height: 1.5rem;
+    margin-left: 0.2em;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .final:hover .row-act,
+  .row-act:focus-visible {
+    visibility: visible;
+  }
+  .row-act:hover {
+    color: var(--accent);
+    background: var(--surface-soft);
+  }
 
   /* 「回到最新」药丸：零高锚点 + sticky bottom，钉在滚动视口底部居中，
      不占版面高度、不遮转写。flex-end 让按钮底边贴锚点线向上生长——不能用
@@ -793,5 +1440,11 @@
     margin-top: 0.4rem;
     padding-top: 0.4rem;
     border-top: 1px solid var(--warning-line);
+  }
+  /* 错误横幅换 danger 色系(当场纠正失败:后端停录竞态报错原样展示) */
+  .banner.banner-danger {
+    background: var(--danger-tint);
+    border-color: var(--danger-line);
+    color: var(--danger-ink);
   }
 </style>

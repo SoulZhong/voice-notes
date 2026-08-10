@@ -5,6 +5,7 @@ export type SystemAudio = "on" | "denied" | "unavailable" | "";
 
 export type PartialEvent = { source: Source; text: string };
 export type FinalEvent = {
+  seq: number;
   source: Source;
   text: string;
   start_ms: number;
@@ -101,7 +102,7 @@ export function onTranscodeDone(cb: (e: TranscodeEvent) => void) {
   return listen<TranscodeEvent>("transcode_done", (ev) => cb(ev.payload));
 }
 
-export type LevelEvent = { rms: number };
+export type LevelEvent = { source: Source; rms: number };
 
 export function onLevel(cb: (e: LevelEvent) => void) {
   return listen<LevelEvent>("level", (ev) => cb(ev.payload));
@@ -134,6 +135,12 @@ export type NoteRenamedEvent = { note_id: string; title: string };
 
 export function onNoteRenamed(cb: (e: NoteRenamedEvent) => void) {
   return listen<NoteRenamedEvent>("note_renamed", (ev) => cb(ev.payload));
+}
+
+/** 录制中段编辑落盘成功(后端为唯一真值源,前端不做乐观更新)。未动字段为 null。 */
+export type SegmentEditedEvent = { note_id: string; seq: number; text: string | null; speaker: string | null };
+export function onSegmentEdited(cb: (e: SegmentEditedEvent) => void) {
+  return listen<SegmentEditedEvent>("segment_edited", (ev) => cb(ev.payload));
 }
 
 /** 跨轨时基已纠正(mic 轨时钟漂移过,回放侧实测出映射并落盘)。详情页手里那份转写段

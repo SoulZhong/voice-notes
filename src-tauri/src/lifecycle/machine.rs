@@ -164,6 +164,12 @@ pub enum Msg {
     AbortSession { note_id: String },
     SetTitle { note_id: String, title: String },
     RenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
+    /// 录制中段编辑(与 SetTitle/RenameActiveSpeaker 同类:writer 语义消息,与录制
+    /// 主时间轴正交,不改会话态)。note_id 供 actor 与槽内 writer 对账——判定活动
+    /// 在命令线程、执行在 actor 线程,中间可能已停录/换会话,绝不能误写新会话。
+    EditActiveSegment { note_id: String, seq: u64, expected_text: String, new_text: String },
+    /// 同上,改派段说话人(目标限本场表内已有 id,"new" 由命令壳先拒)。
+    SetActiveSegmentSpeaker { note_id: String, seq: u64, expected_text: String, speaker_id: String },
     // —— P3 新增:Aing 维度 ——
     /// 手动 Aing(refine_note 命令壳经 request 带回执):守卫裁决入内核——录制中
     /// 拒绝、同 id Aing 中拒绝,文案与旧命令壳逐字一致。
@@ -215,6 +221,11 @@ pub enum Effect {
     DoSetTitle { note_id: String, title: String },
     /// runner 落活动会话说话人改名(persist+speakers 快照 emit)。
     DoRenameActiveSpeaker { note_id: String, speaker_id: String, name: String },
+    /// runner 用槽内 writer 改写活动会话的段文本(重写 segments.jsonl + emit
+    /// "segment_edited")。note_id 与槽内不符则报错回执,绝不误写新会话。
+    DoEditActiveSegment { note_id: String, seq: u64, expected_text: String, new_text: String },
+    /// 同上,改派段说话人。
+    DoSetActiveSegmentSpeaker { note_id: String, seq: u64, expected_text: String, speaker_id: String },
     /// runner 执行七个非活动编辑操作之一。op 不随效果携带,从本轮原始
     /// `Msg::EditNote` 一次性取走(与 DoAdopt/DoPipeline 同模式——EditOp 无需
     /// Clone,内核对每条 EditNote 消息恰发一个 DoEdit)。
@@ -282,8 +293,9 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
             (with_session(Idle), effects)
         }
         // —— P2 新增:writer 语义消息 ——
-        // AdoptWriter/Pipeline/SetTitle/RenameActiveSpeaker/AbortSession 均不改会话态
-        // (writer 归属、说话人表、标题都是 runner 侧状态,内核只转发一个 Do* 指令),
+        // AdoptWriter/Pipeline/SetTitle/RenameActiveSpeaker/EditActiveSegment/
+        // SetActiveSegmentSpeaker/AbortSession 均不改会话态
+        // (writer 归属、说话人表、标题、段文本都是 runner 侧状态,内核只转发一个 Do* 指令),
         // 也从不产生 ShadowMismatch——它们与「录制中/停止中」这条主时间轴正交,
         // 任何状态下发生都不构成对账矛盾。
         Msg::AdoptWriter { .. } => (state.clone(), vec![DoAdopt]),
@@ -364,6 +376,24 @@ pub fn handle(state: &LifecycleState, msg: &Msg) -> (LifecycleState, Vec<Effect>
                 note_id: note_id.clone(),
                 speaker_id: speaker_id.clone(),
                 name: name.clone(),
+            }],
+        ),
+        Msg::EditActiveSegment { note_id, seq, expected_text, new_text } => (
+            state.clone(),
+            vec![DoEditActiveSegment {
+                note_id: note_id.clone(),
+                seq: *seq,
+                expected_text: expected_text.clone(),
+                new_text: new_text.clone(),
+            }],
+        ),
+        Msg::SetActiveSegmentSpeaker { note_id, seq, expected_text, speaker_id } => (
+            state.clone(),
+            vec![DoSetActiveSegmentSpeaker {
+                note_id: note_id.clone(),
+                seq: *seq,
+                expected_text: expected_text.clone(),
+                speaker_id: speaker_id.clone(),
             }],
         ),
         // Finalize:状态收敛与 SessionEnded 同规则(Recording{id}/Stopping{id} 顺流
@@ -595,9 +625,10 @@ mod tests {
         Box::new(w)
     }
 
-    /// P2 迁移规则矩阵(5 类新消息 × 4 状态):AdoptWriter/Pipeline/SetTitle/
-    /// RenameActiveSpeaker/AbortSession 与「录制中/停止中」主时间轴正交——writer
-    /// 归属、说话人表、标题都是 runner 侧状态,内核只转发指令。任何状态下都应
+    /// P2 迁移规则矩阵(7 类新消息 × 4 状态):AdoptWriter/Pipeline/SetTitle/
+    /// RenameActiveSpeaker/EditActiveSegment/SetActiveSegmentSpeaker/AbortSession
+    /// 与「录制中/停止中」主时间轴正交——writer
+    /// 归属、说话人表、标题、段文本都是 runner 侧状态,内核只转发指令。任何状态下都应
     /// 状态不变 + 恰一个对应 Do* 效果 + 零 ShadowMismatch(载荷不进内核判定)。
     #[test]
     fn writer_semantic_msgs_are_state_orthogonal_in_every_state() {
@@ -657,6 +688,50 @@ mod tests {
                     fx.as_slice(),
                     [Effect::DoRenameActiveSpeaker { note_id, speaker_id, name }]
                         if note_id == "n1" && speaker_id == "spk1" && name == "张三"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let (next, fx) = handle(
+                s,
+                &Msg::EditActiveSegment {
+                    note_id: "n1".into(),
+                    seq: 7,
+                    expected_text: "原文".into(),
+                    new_text: "改后".into(),
+                },
+            );
+            assert_eq!(&next, s, "EditActiveSegment 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoEditActiveSegment { note_id, seq, expected_text, new_text }]
+                        if note_id == "n1"
+                            && *seq == 7
+                            && expected_text == "原文"
+                            && new_text == "改后"
+                ),
+                "state={s:?} fx={fx:?}"
+            );
+
+            let (next, fx) = handle(
+                s,
+                &Msg::SetActiveSegmentSpeaker {
+                    note_id: "n1".into(),
+                    seq: 7,
+                    expected_text: "原文".into(),
+                    speaker_id: "S2".into(),
+                },
+            );
+            assert_eq!(&next, s, "SetActiveSegmentSpeaker 不应改变状态:state={s:?}");
+            assert!(
+                matches!(
+                    fx.as_slice(),
+                    [Effect::DoSetActiveSegmentSpeaker { note_id, seq, expected_text, speaker_id }]
+                        if note_id == "n1"
+                            && *seq == 7
+                            && expected_text == "原文"
+                            && speaker_id == "S2"
                 ),
                 "state={s:?} fx={fx:?}"
             );

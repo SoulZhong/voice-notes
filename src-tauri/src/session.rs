@@ -1956,10 +1956,9 @@ pub fn start_session(
     on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
-    on_mic_level: Option<Box<dyn Fn(f32) + Send>>,
+    on_level: Option<std::sync::Arc<dyn Fn(Source, f32) + Send + Sync>>,
 ) -> Result<SessionStart, StartError> {
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut mic_level = on_mic_level;
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
     let mut slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)> = Vec::new();
     let mut captures: Vec<Box<dyn AudioCapture>> = Vec::new();
@@ -1987,7 +1986,10 @@ pub fn start_session(
         let final_tx = finals_tx.clone();
         // 先起 worker（消费者），再启动 capture：兼容同步灌帧的 MockCapture，
         // 且若 capture 启动失败，ftx 在 start 内被 drop → frx 关闭 → worker 立即退出。
-        let level_cb = if source == Source::Mic { mic_level.take() } else { None };
+        let level_cb: Option<Box<dyn Fn(f32) + Send>> = on_level.as_ref().map(|cb| {
+            let cb = cb.clone();
+            Box::new(move |r: f32| cb(source, r)) as Box<dyn Fn(f32) + Send>
+        });
         let audio_sink = audio_sinks
             .iter()
             .position(|(s, _)| *s == source)
@@ -3504,6 +3506,73 @@ mod session_tests {
         }
         let _ = start.handle.stop(); // 真停止：停 capture → join workers → join asr
         assert!(ok, "两源都应产出带标记的 final");
+    }
+
+    /// on_level 按源路由(见 a4b8a72):start_session 为每源烘焙一份带 source 的回调，
+    /// mic 源的电平应标为 Source::Mic、system 源应标为 Source::System，不能串源——
+    /// 这是本次「LevelEvent 双通道」变更的核心行为，此前无用例锁定（既有测试全传 None）。
+    /// 两路 fixture(mic 6679 样本、system 65471 样本，见 sample_16k.wav / sample_zh_16k.wav)
+    /// 都远超 LEVEL_INTERVAL_SAMPLES=1600(@16kHz≈100ms)，足以各自触发至少一次电平上报。
+    #[test]
+    fn on_level_routes_per_source() {
+        let levels = Arc::new(Mutex::new(Vec::<(Source, f32)>::new()));
+        let l2 = levels.clone();
+
+        let sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = vec![
+            (Source::Mic, Box::new(IdlingCapture::from_fixture()), Box::new(MockSegmenter::new(2000))),
+            (
+                Source::System,
+                Box::new(IdlingCapture::from_wav(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/sample_zh_16k.wav"
+                ))),
+                Box::new(MockSegmenter::new(2000)),
+            ),
+        ];
+
+        let start = start_session(
+            sources,
+            AsrEngine::Local(Box::new(ContentDigestRecognizer)),
+            None,
+            SpeakerRegistry::new(),
+            TEST_ECHO_HOLD,
+            true, // language_filter: 既有测试语义不变(过滤开)
+            16000,
+            4000,
+            vec![],
+            vec![],
+            |_, _, _, _, _, _| {},
+            |_, _| {},
+            |_| {},
+            Some(Arc::new(move |s: Source, rms: f32| {
+                l2.lock().unwrap().push((s, rms));
+            }) as Arc<dyn Fn(Source, f32) + Send + Sync>),
+        )
+        .expect("start_session");
+
+        assert_eq!(start.active.len(), 2, "两源都应启动");
+
+        // 等待两源都产出至少一次电平上报（有界轮询）。
+        let mut ok = false;
+        for _ in 0..300 {
+            let g = levels.lock().unwrap();
+            let has_mic = g.iter().any(|(s, _)| *s == Source::Mic);
+            let has_sys = g.iter().any(|(s, _)| *s == Source::System);
+            if has_mic && has_sys {
+                ok = true;
+                break;
+            }
+            drop(g);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = start.handle.stop();
+        assert!(ok, "两源都应各自收到带正确 source 标记的电平回调");
+
+        let g = levels.lock().unwrap();
+        assert!(
+            g.iter().all(|(_, rms)| rms.is_finite() && *rms >= 0.0),
+            "rms 应为非负有限值: {g:?}"
+        );
     }
 
     /// 音频保留接线:sink 按源路由,写出的 WAV 与段时间轴按构造对齐——

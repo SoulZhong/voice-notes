@@ -233,6 +233,12 @@ impl NoteWriter {
         &self.meta.id
     }
 
+    /// 下一段将被分配的 seq。actor 在 append_final 前读取即得本段 seq
+    /// (actor 单线程串行,读取与 append 之间无并发写入)。
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// 续录时间轴偏移量（create 路径恒 0，resume 路径 = 续录前最大 end_ms）。
     pub fn base_ms(&self) -> u64 {
         self.base_ms
@@ -478,10 +484,10 @@ impl NoteWriter {
         }
         let tmp = self.dir.join("segments.jsonl.tmp");
         std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, &path)?;
-        // 重写替换了 segments.jsonl 的磁盘文件，旧句柄仍指向被替换前的 inode；
-        // 丢弃句柄，下次 flush_pending 会按新路径重开，避免写入"消失"的文件。
+        // 先丢句柄再 rename:同 rewrite_segment(Codex P1)——Windows 上带开着的追加
+        // 句柄替换目标可能共享冲突;句柄已 flush,提前关闭无损,下次 flush_pending 重开。
         self.file = None;
+        std::fs::rename(&tmp, &path)?;
 
         if let Some(loser_meta) = self.speakers.remove(loser) {
             let winner_entry =
@@ -510,6 +516,75 @@ impl NoteWriter {
             }
         }
         write_speakers_atomic(&self.dir, &self.speakers)
+    }
+
+    /// 录制中段编辑共用骨架:flush 待写队列 → 按 seq 定位并做 expected_text 乐观
+    /// 校验 → edit 改行 → tmp+rename 原子替换 → 丢弃旧句柄(重写换了 inode,照
+    /// merge_speaker 先例)。读失败中止,绝不以空内容覆写(同 merge_speaker 注释)。
+    fn rewrite_segment(
+        &mut self,
+        seq: u64,
+        expected_text: &str,
+        edit: impl Fn(&mut SegmentRecord),
+    ) -> anyhow::Result<()> {
+        self.flush_pending()?;
+        let path = self.dir.join("segments.jsonl");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("读 segments.jsonl 失败（编辑中止，避免清空）: {e}"))?;
+        let mut found = false;
+        let mut out = String::new();
+        for line in content.lines() {
+            match serde_json::from_str::<SegmentRecord>(line) {
+                Ok(mut rec) => {
+                    if rec.seq == seq {
+                        anyhow::ensure!(rec.text == expected_text, "段落内容已变化，请刷新后重试");
+                        edit(&mut rec);
+                        found = true;
+                    }
+                    out.push_str(&serde_json::to_string(&rec)?);
+                }
+                Err(_) => out.push_str(line), // 不可解析行原样保留(同 merge_speaker)
+            }
+            out.push('\n');
+        }
+        anyhow::ensure!(found, "段落不存在（seq={seq}）");
+        let tmp = self.dir.join("segments.jsonl.tmp");
+        std::fs::write(&tmp, out)?;
+        // **先丢句柄再 rename**(Codex P1):Windows 上目标文件带着我们自己打开的追加
+        // 句柄时,MoveFileEx 替换可能因共享冲突失败——句柄已 flush 过,提前关闭无损;
+        // rename 失败时句柄同样该重开(状态一致),下次 flush_pending 按需重建。
+        // (POSIX 侧顺序无所谓,旧句柄指向被替换前 inode 的注释语义不变。)
+        self.file = None;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// 录制中编辑段文本(actor 串行执行,与定稿追加互斥)。
+    pub fn edit_segment_text(
+        &mut self,
+        seq: u64,
+        expected_text: &str,
+        new_text: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!new_text.trim().is_empty(), "文本不能为空");
+        self.rewrite_segment(seq, expected_text, |rec| rec.text = new_text.to_string())
+    }
+
+    /// 录制中改派段说话人:目标限本场表内已有 id——"new" 分配与 diar 注册表的
+    /// S-id 空间会撞车,录制中一律不开放。
+    pub fn set_segment_speaker_live(
+        &mut self,
+        seq: u64,
+        expected_text: &str,
+        speaker_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.speakers.contains_key(speaker_id),
+            "录制中只能改派为本场已有说话人"
+        );
+        self.rewrite_segment(seq, expected_text, |rec| {
+            rec.speaker = Some(speaker_id.to_string())
+        })
     }
 
     /// 孤儿说话人清理（finalize 兜底）：扫 segments.jsonl，凡 speaker 引用了表里
@@ -707,6 +782,19 @@ mod tests {
             load_meta(tmp.path(), w3.note_id()).title,
             format!("{base} 3")
         );
+    }
+
+    /// actor 在 append_final 前读 next_seq 作为本段 seq 并随 FinalEvent 透传;
+    /// 该值必须等于落盘记录里的 seq。
+    #[test]
+    fn next_seq_previews_the_seq_append_will_assign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        assert_eq!(w.next_seq(), 0);
+        w.append_final("mic", "第一句", 0, 900, None, None).unwrap();
+        assert_eq!(w.next_seq(), 1);
+        let content = std::fs::read_to_string(w.dir().join("segments.jsonl")).unwrap();
+        assert!(content.contains("\"seq\":0"), "{content}");
     }
 
     fn load_meta(root: &std::path::Path, id: &str) -> NoteMeta {
@@ -1188,6 +1276,43 @@ mod tests {
         assert_eq!(s9.name, "老王");
         assert_eq!(s9.centroid, None, "旧格式无 centroid 字段应兜底为 None");
         assert_eq!(s9.count, 0, "旧格式无 count 字段应兜底为 0");
+    }
+
+    #[test]
+    fn live_edit_text_and_speaker_rewrite_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        w.append_final("mic", "原文一", 0, 900, Some("S1"), None)
+            .unwrap();
+        w.append_final("system", "原文二", 1000, 1900, None, None)
+            .unwrap();
+        w.sync_speakers(&[
+            ("S1".into(), vec!["mic".into()]),
+            ("S2".into(), vec!["system".into()]),
+        ])
+        .unwrap();
+
+        // 文本编辑:命中 + 乐观校验通过
+        w.edit_segment_text(0, "原文一", "改后一").unwrap();
+        // 说话人改派:目标必须在本场表内
+        w.set_segment_speaker_live(1, "原文二", "S2").unwrap();
+        let content = std::fs::read_to_string(w.dir().join("segments.jsonl")).unwrap();
+        assert!(
+            content.contains("改后一") && !content.contains("原文一"),
+            "{content}"
+        );
+        assert!(content.contains("\"speaker\":\"S2\""), "{content}");
+
+        // 三类拒绝:expected 失配 / seq 不存在 / 说话人不在表内
+        assert!(w.edit_segment_text(0, "原文一", "x").is_err());
+        assert!(w.edit_segment_text(99, "改后一", "x").is_err());
+        assert!(w.set_segment_speaker_live(0, "改后一", "S99").is_err());
+
+        // 重写后追加不丢(句柄按需重开)
+        w.append_final("mic", "第三句", 2000, 2900, None, None)
+            .unwrap();
+        let content = std::fs::read_to_string(w.dir().join("segments.jsonl")).unwrap();
+        assert!(content.contains("第三句"), "{content}");
     }
 
     /// 终审 triage①(writer 层):sources 为空(⇔ 未命中的库种子簇)且表中此前无该 id

@@ -4,6 +4,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import { onNoteRenamed } from "$lib/events";
   import { recording } from "$lib/recording.svelte";
+  import { noteBadgeKind, type NoteBadgeKind } from "$lib/noteBadge";
   import {
     listNotes,
     renameNote,
@@ -275,8 +276,13 @@
     }
   }
 
-  const stateBadge = (s: NoteSummary["state"]) =>
-    s === "active" ? t("shell.note.stateActive") : s === "recording" ? t("shell.note.stateInterrupted") : "";
+  // 暂停是运行时标志(不落盘),active 笔记叠加 recording.paused 显示「已暂停」,
+  // 与录制按钮(下方 365 行)/实时转写页头同口径。合成逻辑抽 noteBadgeKind(带单测)。
+  const badgeLabel: Record<NoteBadgeKind, () => string> = {
+    active: () => t("shell.note.stateActive"),
+    paused: () => t("shell.note.statePaused"),
+    interrupted: () => t("shell.note.stateInterrupted"),
+  };
 </script>
 
 {#snippet personRow(p: PersonSummary)}
@@ -559,15 +565,17 @@
               onblur={commitRename}
             />
           {:else}
+            {@const kind = noteBadgeKind(n.state, recording.paused)}
             <a class="title" href={n.state === "active" ? "/record" : `/notes/${n.id}`}>
               {n.title}
-              {#if stateBadge(n.state)}
+              {#if kind}
                 <span
                   class="state"
-                  class:interrupted={n.state === "recording"}
-                  class:active={n.state === "active"}
+                  class:interrupted={kind === "interrupted"}
+                  class:active={kind === "active"}
+                  class:paused={kind === "paused"}
                 >
-                  {stateBadge(n.state)}
+                  {badgeLabel[kind]()}
                 </span>
               {/if}
             </a>
@@ -1009,6 +1017,12 @@
   .state.active {
     background: var(--record);
     color: var(--on-record);
+  }
+  /* 已暂停：录制的中性挂起态，退为灰底次级墨——与实时转写页头的灰点「已暂停」
+     同语义降调，红底只留给真正在录的信号。 */
+  .state.paused {
+    background: var(--surface-press);
+    color: var(--ink-secondary);
   }
   /* 右键菜单:popover 规范(surface-press 底 + hairline + shadow-popover);
      暗色下 canvas 比承载面更黑,浮层若用 canvas 会成"洞",故底走 surface-press。
