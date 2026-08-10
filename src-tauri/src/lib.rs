@@ -809,24 +809,18 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
     }
 }
 
-/// 本场录制的「必备源集合」：这些源必须全部出现在 start.active 里，任一缺失即整场
-/// 拆除报错（不做静默降级）。为什么随 system_only 变：
-///  - 默认场景 → [Mic]：会议里本机说话人主要走麦克风，mic 是刚需；系统声音则可降级
-///    （拿不到就只录 mic），故 System 不在必备集合。
-///  - 仅系统声音场景 → [System]：这是「纯外放」用法（会议软件把远端声音从扬声器放出、
-///    本机不对着 mic 说话）。此时刻意不建 mic 源——即便有 AEC，mic 路仍会漏进扬声器
-///    回声的残渣污染转写；关掉 mic 从根上消除这条污染路径，System 随之升格为该场景下
-///    唯一且必备的源。纯函数（单测覆盖），供 spawn_session 的源构建与 Fix A 守卫共用。
+/// 本场录制的「必备源集合」：硬承诺双轨（settings-overhaul spec §4）——Mic 与 System
+/// 两源都必备，任一未出现在 start.active 里即整场拆除报错（不做静默降级）。
 ///
-/// 「仅系统声音场景」曾由 `Settings::record_system_only` 驱动，该字段随三删一藏移除，
-/// 目前唯一调用点恒传 `false`——`system_only=true` 分支暂为死代码，留给 Task 3 重做
-/// 真正的必备源判定（逃生舱化），本函数签名/两条分支先保持不动。
-fn required_sources(system_only: bool) -> Vec<Source> {
-    if system_only {
-        vec![Source::System]
-    } else {
-        vec![Source::Mic]
-    }
+/// 为什么不再区分场景降级 System：会议笔记的核心承诺是「对方/外放说了什么都要被录到」，
+/// System 拿不到就默默只录 mic，等于用户以为记完整了、实际漏了对方发言而不自知——这类
+/// 静默降级比直接拒录更有害（2026-07-07 复盘：用户所有笔记都没有 system 轨，自己毫无
+/// 察觉）。因此 System 起不来（无论是权限未授权还是设备/组件不可用）一律整场拆除，
+/// 错误消息里带上权限/设备的分类，前端据此弹出授权引导卡（拒录，不降级）。
+///
+/// 纯函数（单测覆盖），供 spawn_session 的源构建与 Fix A 守卫共用。
+fn required_sources() -> Vec<Source> {
+    vec![Source::Mic, Source::System]
 }
 
 /// 源的中文显示名，仅用于「XX未能启动」失败文案（沿用既有文案风格）。
@@ -1032,12 +1026,19 @@ fn spawn_session(
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
-        // 2) 构建源（各自 VAD）。恒建麦克风（必备）+ 系统声音（可降级,构建失败只打日志
-        // 降级为仅麦克风,见下方两块的 Err 分支)。record_system_only(仅系统声)已随
-        // 三删一藏移除,不再有跳过麦克风的路径——required_sources 的必备源判定守卫由
-        // Task 3 重做。
+        // 2) 构建源（各自 VAD）。恒建麦克风 + 系统声音，硬承诺双轨下两源皆必备——
+        // System 的 VAD 构建失败不再静默跳过（旧行为:打日志降级为仅麦克风），改记入
+        // pre_start_failed,走下方 match start 处的 Fix A 拆除路径统一处理（见两块
+        // cfg(target_os = "macos") / cfg(windows) 的 Err 分支）。record_system_only
+        // (仅系统声)已随三删一藏移除,不再有跳过麦克风的路径。
         let vad_path = models::root().join("silero_vad.onnx");
         let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
+        // 源在装配阶段（sources 构建期,start_session 之前）就失败的记录——目前只有
+        // System 的 VAD 构建失败会走到这里。与 start_session 返回的 SessionStart::failed
+        // （capture.start() 失败,装配之后）分属两个阶段,下方 match start 处合并两者
+        // 供 Fix A 的错误文案与分类判定共用（classify_system 的既有 unauthorized 判据
+        // 不变，见该函数注释）。
+        let mut pre_start_failed: Vec<(Source, String)> = Vec::new();
         // 每源健康计数(FrameTap 写、pipeline_health 读),随 ActiveSession 存活一场。
         let mut session_health: Vec<(Source, Arc<SourceHealth>)> = Vec::new();
         // 两源首个真实帧共享一个单调时钟原点。谁先到谁把 0 点钉住,后到源把偏移
@@ -1194,10 +1195,12 @@ fn spawn_session(
                     sources.push((Source::System, sys, sys_seg));
                 }
                 Err(e) => {
-                    // 系统声音 VAD 构建失败非致命：不发 error 状态（避免闪烁），
-                    // 静默跳过该源；classify_system 会因 System 既不在 active 也不在
-                    // failed 里而归类为 "unavailable"，UI 仍会显示降级横幅。
-                    eprintln!("系统声音 VAD 构建失败，降级为仅麦克风: {e}");
+                    // 硬承诺双轨：System 是必备源，VAD 构建失败不再静默跳过——记入
+                    // pre_start_failed，走下方 Fix A 拆除路径（整场报错，不留仅 mic
+                    // 的半场笔记）。VAD 构建失败非权限问题，classify_system 的既有
+                    // "unauthorized" 判据不会命中，恒归类 unavailable（设备/组件问题）。
+                    eprintln!("系统声音 VAD 构建失败: {e}");
+                    pre_start_failed.push((Source::System, e.to_string()));
                 }
             }
         }
@@ -1261,7 +1264,10 @@ fn spawn_session(
                     sources.push((Source::System, sys, sys_seg));
                 }
                 Err(e) => {
-                    eprintln!("系统声音 VAD 构建失败，降级为仅麦克风: {e}");
+                    // 同上（macOS 分支注释）：硬承诺双轨下不再静默跳过，记入
+                    // pre_start_failed 走 Fix A 拆除路径；Windows 无授权概念，恒 unavailable。
+                    eprintln!("系统声音 VAD 构建失败: {e}");
+                    pre_start_failed.push((Source::System, e.to_string()));
                 }
             }
         }
@@ -1649,12 +1655,18 @@ fn spawn_session(
         match start {
             Ok(start) => {
                 // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
-                // 就整场拆除报错(不静默降级)。恒传 false → required=[Mic],与原先
-                // "mic 必备"逐字节等价(先 stop 排干可能已产生的其它源 finals → stash
-                // 模型 → AbortSession → 带源名 fail)。record_system_only 已随三删一藏
-                // 移除,system_only=true 分支暂时死代码(参数留待 Task 3 重做必备源判定,
-                // 换成真正的可配置逃生舱)。
-                if let Some(&missing) = required_sources(false)
+                // 就整场拆除报错(不静默降级)。硬承诺双轨下 required=[Mic, System]
+                // （先 stop 排干可能已产生的其它源 finals → stash 模型 → AbortSession →
+                // 带源名+分类 fail)。装配阶段失败(pre_start_failed,VAD 构建等)与
+                // start_session 内 capture 启动阶段失败(start.failed)分属两个阶段,
+                // 这里合并起来供错误文案查找——否则 VAD 构建失败的 System 既不在
+                // active 也不在 start.failed 里,分类会漏判。
+                let all_failed: Vec<(Source, String)> = pre_start_failed
+                    .iter()
+                    .cloned()
+                    .chain(start.failed.iter().cloned())
+                    .collect();
+                if let Some(&missing) = required_sources()
                     .iter()
                     .find(|s| !start.active.contains(s))
                 {
@@ -1666,16 +1678,35 @@ fn spawn_session(
                     // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
                     lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
                     let name = source_display(missing);
-                    let err = start.failed.iter()
+                    // System 缺失时错误串里带上稳定分类 token(system_denied / system_unavailable,
+                    // 沿用 classify_system 的既有 unauthorized 判据),前端据此分支渲染授权引导卡
+                    // （拒录，不做静默降级)；Mic 缺失沿用原先的纯文案，无分类 token。
+                    let system_token = |msg: Option<&str>| -> &'static str {
+                        match msg {
+                            Some(m) if m.contains("unauthorized") => "system_denied",
+                            _ => "system_unavailable",
+                        }
+                    };
+                    let err = all_failed.iter()
                         .find(|(s, _)| *s == missing)
                         .map(|(_, msg)| {
-                            format!(
+                            let base = format!(
                                 "error: {}",
                                 tr!("{name}未能启动: {msg}", "{name} failed to start: {msg}")
-                            )
+                            );
+                            if missing == Source::System {
+                                format!("{base} [{}]", system_token(Some(msg)))
+                            } else {
+                                base
+                            }
                         })
                         .unwrap_or_else(|| {
-                            format!("error: {}", tr!("{name}未能启动", "{name} failed to start"))
+                            let base = format!("error: {}", tr!("{name}未能启动", "{name} failed to start"));
+                            if missing == Source::System {
+                                format!("{base} [{}]", system_token(None))
+                            } else {
+                                base
+                            }
                         });
                     return fail(&app, &running, &generation, my_gen, err);
                 }
@@ -1792,9 +1823,9 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         NoteTarget::New,
     );
     if result.is_ok() {
-        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别——
-        // 固定按 Both 上报(macOS 双源、其它平台历史上也统计为 mic,遥测只要低基数类别,
-        // 不追精确;Task 3 若把必备源判定做成真逃生舱,这里再按需细分)。
+        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别；
+        // Task 3(硬承诺双轨)落地后 Mic+System 是必备源集合,能走到这里(result.is_ok())
+        // 就意味着两源皆已启动——固定按 Both 上报不再是近似,而是准确值。
         telemetry::track(app, telemetry::Event::RecordingStarted { source: telemetry::RecordSource::Both });
     }
     result
@@ -1860,9 +1891,9 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
         NoteTarget::Resume(note_id),
     );
     if result.is_ok() {
-        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别——
-        // 固定按 Both 上报(macOS 双源、其它平台历史上也统计为 mic,遥测只要低基数类别,
-        // 不追精确;Task 3 若把必备源判定做成真逃生舱,这里再按需细分)。
+        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别；
+        // Task 3(硬承诺双轨)落地后 Mic+System 是必备源集合,能走到这里(result.is_ok())
+        // 就意味着两源皆已启动——固定按 Both 上报不再是近似,而是准确值。
         telemetry::track(app, telemetry::Event::RecordingStarted { source: telemetry::RecordSource::Both });
     }
     result
@@ -6460,9 +6491,10 @@ fn pipeline_health(state: State<AppState>) -> Vec<frame_tap::HealthSnapshot> {
         .unwrap_or_default()
 }
 
-/// 屏幕录制权限预检(macOS):系统声音采集(ScreenCaptureKit)依赖该权限,未授权时
-/// System 源只会在开录后静默降级为仅麦克风——录制页据此在**开录前**就给出常驻
-/// 提示与授权入口,终结"录了半天发现对方声音全没进笔记"。
+/// 屏幕录制权限预检(macOS):系统声音采集(ScreenCaptureKit)依赖该权限。硬承诺
+/// 双轨下未授权时 System 源在开录后会被 Fix A 拆除整场(不再是静默降级为仅麦克风)——
+/// 录制页据此在**开录前**就给出常驻提示与授权入口,把"根本录不了"提前到点开录之前,
+/// 而不是等用户点了开始才被拒录打断。
 #[tauri::command]
 fn screen_capture_permission() -> bool {
     #[cfg(target_os = "macos")]
@@ -6499,6 +6531,29 @@ fn reset_screen_capture_permission(app: tauri::AppHandle) -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+}
+
+/// 打开系统设置的屏幕录制隐私页(硬承诺双轨的授权引导:录制页 system_denied 引导卡
+/// 「打开系统设置」按钮走这个命令)。opener 用法同 open_models_dir 先例。Windows 无
+/// 对应的隐私页/URL scheme,该平台的引导卡走 unavailable 文案(无按钮),命令本身
+/// 仍做平台分支返回 Err 兜底,避免误按下静默失败。
+#[tauri::command]
+fn open_screen_capture_settings(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture", None::<&str>)
+            .map_err(|e| tr!("打开系统设置失败: {e}", "Failed to open System Settings: {e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(tr!(
+            "本平台暂不支持自动跳转系统设置，请手动前往系统隐私设置授权",
+            "Automatic navigation to System Settings isn't supported on this platform yet; please open your system's privacy settings manually"
+        ))
     }
 }
 
@@ -6938,6 +6993,7 @@ pub fn run() {
             screen_capture_permission,
             request_screen_capture_permission,
             reset_screen_capture_permission,
+            open_screen_capture_settings,
             input_volume,
             set_input_volume,
             output_is_bluetooth,
@@ -7206,15 +7262,13 @@ mod tests {
         assert_eq!(sync.first_frame_offset_ms, Some(0));
     }
 
-    /// record_system_only 设置字段已随三删一藏移除,spawn_session 的唯一调用点现在
-    /// 恒传 false(见该处注释)——这条测试改为断言默认必备源集合本身没被这次删除动到。
-    /// `required_sources(true)` 分支眼下已无调用方触达,留给 Task 3 重做真正的必备源
-    /// 判定(逃生舱化),这里只保它作为纯函数仍按参数分支返回正确值,不做行为收窄。
+    /// 硬承诺双轨(Task 3,settings-overhaul spec §4):required_sources 去参数化,
+    /// 恒返 [Mic, System]——两源皆必备,任一起不来即整场拆除(Fix A 守卫),不再有
+    /// 「仅系统声」的降级分支可选。
     #[test]
-    fn required_sources_default_call_site_uses_mic_only() {
+    fn required_sources_always_requires_mic_and_system() {
         use crate::audio::Source;
-        assert_eq!(super::required_sources(false), vec![Source::Mic]);
-        assert_eq!(super::required_sources(true), vec![Source::System]);
+        assert_eq!(super::required_sources(), vec![Source::Mic, Source::System]);
     }
 
     #[test]

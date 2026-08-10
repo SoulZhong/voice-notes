@@ -7,7 +7,13 @@
   import { t } from "$lib/i18n/index.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
-  import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
+  import {
+    modelsStatus,
+    getSettings,
+    setSettings,
+    openScreenCaptureSettings,
+    type ModelsStatus,
+  } from "$lib/models";
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
@@ -228,6 +234,28 @@
     );
   }
 
+  // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
+  // system_denied=屏幕录制权限缺失(可操作:引导去系统设置);system_unavailable=
+  // 设备/组件问题或 Windows(该平台无此权限模型,恒 unavailable,见 lib.rs
+  // open_screen_capture_settings 注释)。denied 判定放前面:denied 场景下字符串里
+  // 不会同时出现 unavailable,顺序无所谓,但先判更符合"先看能不能引导授权"的直觉。
+  const isSystemDenied = $derived(
+    isError(recording.status) && recording.status.includes("system_denied"),
+  );
+  const isSystemUnavailable = $derived(
+    isError(recording.status) &&
+      !isSystemDenied &&
+      recording.status.includes("system_unavailable"),
+  );
+  async function openSystemAudioPrivacySettings() {
+    try {
+      await openScreenCaptureSettings();
+    } catch {
+      // Windows/非 macOS 命令恒 Err;引导卡的「打开系统设置」按钮只在 denied 分支
+      // 渲染(该分支目前只有 macOS 权限缺失会触发),此处兜底不弹二次错误打扰用户。
+    }
+  }
+
   async function startRecording() {
     await recording.start(); // 已在录制页，无需跳转
   }
@@ -380,6 +408,21 @@
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
       {#if isError(recording.status)}
         <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      {/if}
+
+      <!-- 硬承诺双轨拒录引导卡:System 起不来时后端整场拆除(不静默降级),这里按分类
+           分支引导——权限缺失给可操作的「打开系统设置」;设备/组件不可用（含 Windows）
+           只给说明,没有可操作的跳转。 -->
+      {#if isSystemDenied}
+        <div class="banner">
+          <strong>{t("record.systemDenied.title")}</strong>
+          {t("record.systemDenied.desc")}
+          <button class="link" onclick={openSystemAudioPrivacySettings}>
+            {t("record.systemDenied.openSettings")}
+          </button>
+        </div>
+      {:else if isSystemUnavailable}
+        <div class="banner">{t("record.systemUnavailable.desc")}</div>
       {/if}
 
       <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->

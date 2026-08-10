@@ -48,6 +48,15 @@ export const zh = {
   "record.banner.diarUnavailable": "说话人区分不可用（相关模型未下载）。转写与录音不受影响。",
   "record.banner.storageDegraded": "落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。",
 
+  // 硬承诺双轨(拒录引导卡):System 起不来时整场拆除,开录失败错误串带 system_denied /
+  // system_unavailable 分类,前端据此渲染引导卡(权限缺失=可操作的授权引导;设备/组件
+  // 不可用=纯提示,无跳转)。
+  "record.systemDenied.title": "系统声音未获授权",
+  "record.systemDenied.desc":
+    "会议笔记需要录制系统声音；请在 系统设置→隐私与安全性→屏幕录制 中允许本应用，然后重试。",
+  "record.systemDenied.openSettings": "打开系统设置",
+  "record.systemUnavailable.desc": "系统声音当前不可用（设备或组件问题），本场无法开录；请检查后重试。",
+
   // 转写区
   "record.badge.me": "我",
   "record.badge.them": "对方",
@@ -106,6 +115,13 @@ export const en = {
     "Speaker diarization unavailable (model not downloaded). Transcription and recording are unaffected.",
   "record.banner.storageDegraded":
     "Disk write issue: content is buffered in memory and retried automatically; please check disk space. Recording is unaffected.",
+
+  "record.systemDenied.title": "System audio not authorized",
+  "record.systemDenied.desc":
+    "Meeting notes needs to record system audio; please allow this app under System Settings → Privacy & Security → Screen Recording, then try again.",
+  "record.systemDenied.openSettings": "Open System Settings",
+  "record.systemUnavailable.desc":
+    "System audio is currently unavailable (a device or component issue); recording could not start. Please check and try again.",
 
   "record.badge.me": "Me",
   "record.badge.them": "Them",

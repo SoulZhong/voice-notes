@@ -95,6 +95,9 @@ export type MigrateEvent = { kind: "data" | "models"; phase: "copying" | "done" 
 
 export const modelsStatus = () => invoke<ModelsStatus>("models_status");
 export const openModelsDir = () => invoke<void>("open_models_dir");
+/** 硬承诺双轨的拒录引导卡「打开系统设置」按钮:跳转屏幕录制隐私页(macOS)。
+ * Windows 无对应页面,后端返回 Err(引导卡在 unavailable 分支不渲染该按钮)。 */
+export const openScreenCaptureSettings = () => invoke<void>("open_screen_capture_settings");
 export const downloadModels = (ids?: string[]) => invoke<void>("download_models", { ids: ids ?? null });
 export const deleteModel = (id: string) => invoke<void>("delete_model", { id });
 export const cancelModelsDownload = () => invoke<void>("cancel_models_download");
