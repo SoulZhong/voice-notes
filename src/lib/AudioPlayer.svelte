@@ -54,6 +54,9 @@
   // 若用 loadPromise 当前驱,新一轮读到的恒是 null,串行化形同虚设。本变量只进
   // 不清(settle 后即释放引用,无泄漏),cleanup 不碰它。
   let loadChain: Promise<unknown> = Promise.resolve();
+  /** 过期装载的取消哨兵:排队中的 play/seek 链在 catch 里识别后静默复位(playing
+   * 回 false),不当错误上报——它不是故障,只是用户切走了。 */
+  const SUPERSEDED = "player-load-superseded";
   $effect(() => {
     trackErrors = [];
     if (tracks.length === 0) {
@@ -71,7 +74,9 @@
         }
         // 排队期间实例已卸载/换代(切笔记):放弃发起,不让过期装载进后端抢内核。
         // 后端另有代次守卫兜底(跨实例并发窗口),这里省掉一次注定作废的重装载。
-        if (gen !== loadGen) return 0;
+        // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
+        // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
+        if (gen !== loadGen) throw SUPERSEDED;
         const total = await invoke<number>("player_load", { tracks: payload });
         if (gen === loadGen) onLoaded?.();
         return total;
@@ -86,7 +91,7 @@
         },
       );
       loadPromise = p.catch((e) => {
-        if (gen === loadGen) reportError(t("notes.player.errLoad"), `${e}`);
+        if (gen === loadGen && e !== SUPERSEDED) reportError(t("notes.player.errLoad"), `${e}`);
         throw e;
       });
     }
@@ -146,7 +151,7 @@
       .then(() => invoke("player_play"))
       .catch((e) => {
         playing = false;
-        reportError(t("notes.player.errPlay"), `${e}`);
+        if (e !== SUPERSEDED) reportError(t("notes.player.errPlay"), `${e}`);
       });
   }
 
