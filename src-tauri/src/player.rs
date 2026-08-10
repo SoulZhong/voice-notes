@@ -367,13 +367,14 @@ fn remove_align_map_and_notify(
     // 会让转写回原始时基,而成品轨仍是纠正过的,按成品轨回放的定位/高亮从此错位。
     // mixed 不老于映射(烘焙不早于映射发布)即保留映射:成品轨一致性优先于双轨
     // 原始回放(负结论下双轨本就不换轨,保留映射维持既有观感,不引入新错位)。
-    let mixed = note_dir.join("mixed.m4a");
+    // 两种成品形态都查(Codex 十八轮):regen 对 WAV 源笔记有意产出 mixed.wav 不转码。
+    let newest_mixed = ["mixed.m4a", "mixed.wav"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(note_dir.join(f)).and_then(|m| m.modified()).ok())
+        .max();
     let baked = matches!(
-        (
-            std::fs::metadata(&mixed).and_then(|m| m.modified()),
-            std::fs::metadata(align_json).and_then(|m| m.modified()),
-        ),
-        (Ok(mm), Ok(am)) if mm >= am
+        (newest_mixed, std::fs::metadata(align_json).and_then(|m| m.modified())),
+        (Some(mm), Ok(am)) if mm >= am
     );
     if baked {
         return;
