@@ -451,10 +451,10 @@
   });
 
   // ── 回看工具条:页内搜索(高亮+跳转,不隐藏行) + 说话人过滤(隐藏行) ──────────
-  // 口径:任一激活 → follow=false(与实时跟随互斥,回看时不能被新内容顶走);
-  // 两者都清空由 clearReview() 显式 jumpToLatest() 恢复跟随——沿用既有"回到最新"
-  // 入口，不额外为"手动删空搜索框"这条冷门路径加自动恢复，避免用户回看到一半
-  // 因为退格误清空又被拽回最新。
+  // 口径:状态条件——reviewActive 由 false 变 true 即暂停跟随；由 true 变 false
+  // （无论哪条路径：Esc、「清除」按钮、退格删空搜索框、取消最后一个说话人 chip）
+  // 都恢复跟随并跳到最新。用 prevReviewActive 记边沿，只在转换瞬间触发一次，
+  // 避免每次输入/每次 chip 切换都强制滚动。
   let searchQuery = $state("");
   let activeHit = $state(0); // hits 内下标
   let selectedSpeakers = $state<Set<string>>(new Set());
@@ -464,8 +464,11 @@
   const hitSet = $derived(new Set(hits));
   const reviewActive = $derived(searchQuery.trim() !== "" || selectedSpeakers.size > 0);
 
+  let prevReviewActive = false;
   $effect(() => {
-    if (reviewActive) follow = false;
+    if (reviewActive && !prevReviewActive) follow = false;
+    if (!reviewActive && prevReviewActive) jumpToLatest();
+    prevReviewActive = reviewActive;
   });
   // 换一次查询词，命中列表整个变了，上一次的"第几个命中"下标不再有意义——
   // 重新从第一个命中数起，而非停留在旧下标显示出"5/3"这种错位计数。
@@ -477,7 +480,8 @@
     searchQuery = "";
     selectedSpeakers = new Set();
     activeHit = 0;
-    jumpToLatest();
+    // 恢复跟随/跳到最新交给上面的 reviewActive 边沿监听——这里不再重复调用
+    // jumpToLatest()，否则 Esc/「清除」路径会触发两次滚动。
   }
   function gotoHit(delta: number) {
     if (!hits.length) return;
