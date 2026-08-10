@@ -111,6 +111,9 @@ export const zh = {
   "settings.asr.whisperDesc": "多语种支持广,说话人区分较粗",
   "settings.asr.paraformerDesc": "中文更准、英文较弱",
   "settings.asr.qwen3Desc": "中英混说最准,识别稍慢,说话人区分较粗",
+  "settings.asr.hotwordsLabel": "热词",
+  "settings.asr.hotwordsDesc": "人名/产品名/术语,逗号分隔;声纹库人名自动并入,提升专名识别",
+  "settings.asr.hotwordsPlaceholder": "如: 语音笔记, DashScope, 张伟",
   "settings.asr.modelMissing": "所选识别引擎的模型未下载,请在下方「语音模型」中下载。",
 
   // —— 声纹模型 ——
@@ -291,6 +294,9 @@ export const en = {
   "settings.asr.whisperDesc": "Broad multilingual support; coarser speaker separation",
   "settings.asr.paraformerDesc": "More accurate Chinese; weaker English",
   "settings.asr.qwen3Desc": "Best for mixed Chinese-English; slightly slower; coarser speaker separation",
+  "settings.asr.hotwordsLabel": "Hotwords",
+  "settings.asr.hotwordsDesc": "Names, products, and terms, comma-separated; speaker-library names are merged in automatically",
+  "settings.asr.hotwordsPlaceholder": "e.g. Voice Notes, DashScope, Alice",
   "settings.asr.modelMissing":
     "The model for the selected engine is not downloaded; download it under Speech models below.",
 

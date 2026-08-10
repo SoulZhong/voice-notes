@@ -132,6 +132,8 @@
   let volcAppKey = $state("");
   let volcAccessKey = $state("");
   let dashKey = $state("");
+  /** 热词词表(仅 Qwen3 引擎消费,声纹人名由后端自动并入)。 */
+  let hotwords = $state("");
   /** 「测试连接」按钮态与结果(逻辑照搬 runMirrorTest)。 */
   let testingCloud = $state(false);
   let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
@@ -301,6 +303,7 @@
     volcAppKey = s.volc_app_key;
     volcAccessKey = s.volc_access_key;
     dashKey = s.dashscope_api_key;
+    hotwords = s.asr_hotwords;
   }
 
   async function refreshDiskUsage() {
@@ -1063,6 +1066,21 @@
             </label>
           </div>
         </div>
+        {#if asrChoice === "qwen3"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.asr.hotwordsLabel")}</span>
+              <span class="row-desc">{t("settings.asr.hotwordsDesc")}</span>
+            </div>
+            <input
+              class="row-input"
+              placeholder={t("settings.asr.hotwordsPlaceholder")}
+              bind:value={hotwords}
+              disabled={recording.isLive}
+              onblur={() => saveSetting((s) => (s.asr_hotwords = hotwords))}
+            />
+          </div>
+        {/if}
       {/if}
       <div class="row">
         <div class="row-info">

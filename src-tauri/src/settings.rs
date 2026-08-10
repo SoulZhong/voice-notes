@@ -51,6 +51,10 @@ pub struct Settings {
     /// 默认(0.6.8 硬编码 CPU);macOS 可填 "coreml" 实验加速(见 2026-07-28 ASR 调研)。
     /// 值原样透传 sherpa/onnxruntime,不做白名单;加载失败会走既有报错路径,不静默降级。
     pub asr_provider: String,
+    /// 热词/上下文偏置词表:逗号或换行分隔的专名(人名/产品名/术语)。当前仅
+    /// Qwen3-ASR 引擎消费(prompt 注入偏置);其余引擎忽略。空 = 不启用。
+    /// 传给识别器时还会自动并入声纹库人名(见 lib.rs qwen3_hotwords)。
+    pub asr_hotwords: String,
     /// 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(set_settings 保护)。
     pub asr_mode: String,
     /// 云端厂商:"volcano" / "aliyun"。
@@ -150,6 +154,8 @@ struct SettingsRepr {
     asr_model: String,
     #[serde(default)]
     asr_provider: String,
+    #[serde(default)]
+    asr_hotwords: String,
     #[serde(default = "default_asr_mode")]
     asr_mode: String,
     #[serde(default = "default_cloud_provider")]
@@ -225,6 +231,7 @@ impl From<SettingsRepr> for Settings {
             models_dir: r.models_dir,
             asr_model: r.asr_model,
             asr_provider: r.asr_provider,
+            asr_hotwords: r.asr_hotwords,
             asr_mode: r.asr_mode,
             cloud_asr_provider: r.cloud_asr_provider,
             volc_app_key: r.volc_app_key,
@@ -372,6 +379,7 @@ impl Default for Settings {
             models_dir: None,
             asr_model: default_asr(),
             asr_provider: String::new(),
+            asr_hotwords: String::new(),
             asr_mode: default_asr_mode(),
             cloud_asr_provider: default_cloud_provider(),
             volc_app_key: String::new(),

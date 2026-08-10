@@ -24,6 +24,8 @@ export type Settings = {
   asr_model: string;
   /** sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json;空 = CPU)。 */
   asr_provider: string;
+  /** 热词词表(逗号/换行分隔;仅 Qwen3 引擎消费,声纹人名由后端自动并入)。 */
+  asr_hotwords: string;
   /** 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(后端 set_settings 拦截)。 */
   asr_mode: string;
   /** 云端厂商:"volcano" / "aliyun"。 */

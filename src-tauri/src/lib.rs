@@ -11,9 +11,9 @@ pub mod asr;
 mod ipc;
 pub mod models;
 mod session;
-mod settings;
+pub mod settings;
 mod shortcuts;
-mod store;
+pub mod store;
 mod i18n;
 mod player;
 mod player_align;
@@ -23,7 +23,7 @@ mod update;
 pub mod diar;
 mod ailog;
 mod refine;
-mod retranscribe;
+pub mod retranscribe;
 mod graph;
 pub mod mcp;
 mod telemetry;
@@ -691,36 +691,87 @@ impl Drop for ResetOnDrop {
     }
 }
 
-fn sense_voice_dir() -> PathBuf {
-    models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
-}
-
-fn whisper_dir() -> PathBuf {
-    models::root().join("sherpa-onnx-whisper-base")
-}
-
-fn paraformer_dir() -> PathBuf {
-    models::root().join(models::PF_DIR)
-}
-
-fn qwen3_dir() -> PathBuf {
-    models::root().join(models::QWEN3_DIR)
-}
-
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
-/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
+/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。pub:asr_bench 评测工具
+/// 复用同一实例化点(bin 是独立 crate,pub(crate) 不够)。
 /// provider 经 settings.asr_provider 覆盖(实验字段,默认 None = CPU)。
-fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+/// hotwords 仅 Qwen3 消费(prompt 注入偏置),其余引擎无解码级热词入口,忽略。
+pub fn new_recognizer(
+    asr_model: &str,
+    provider: Option<String>,
+    hotwords: Option<String>,
+) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+    let dir = models::asr_model_dir(asr_model);
     if asr_model == settings::ASR_WHISPER {
-        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_PARAFORMER {
-        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_QWEN3 {
-        // 热词暂传 None:等术语库(改进计划 Phase 5)落地后从设置注入。
-        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&qwen3_dir(), provider, None)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&dir, provider, hotwords)?) as Box<dyn asr::Recognizer>)
     } else {
-        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     }
+}
+
+/// 热词词表上限。词表越大,偏置越被稀释,且空/静音段的幻觉风险越高
+/// (sherpa-onnx #3509:热词会被整句吐出);上限内先收用户手填词,再收声纹人名。
+const HOTWORDS_MAX: usize = 100;
+
+/// 合并热词词表(纯逻辑):用户手填(逗号/中文逗号/顿号/分号/换行分隔)优先,
+/// 其后并入声纹库人名;去重保序,超上限截断;空集 → None(引擎不启用偏置)。
+fn merge_hotwords<I: IntoIterator<Item = String>>(user: &str, names: I) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let user_words = user.split([',', '，', '、', ';', '；', '\n']).map(str::to_string);
+    for w in user_words.chain(names) {
+        let w = w.trim();
+        if !w.is_empty() && words.len() < HOTWORDS_MAX && seen.insert(w.to_string()) {
+            words.push(w.to_string());
+        }
+    }
+    if words.is_empty() { None } else { Some(words.join(",")) }
+}
+
+#[cfg(test)]
+mod hotwords_tests {
+    use super::{merge_hotwords, HOTWORDS_MAX};
+
+    #[test]
+    fn merge_splits_dedupes_and_keeps_user_words_first() {
+        let names = vec!["张伟".to_string(), " ".to_string(), "Alice".to_string()];
+        let got = merge_hotwords("DashScope，语音笔记、Alice\n张伟;  ", names);
+        // 用户词序在前;名单里的重复(Alice/张伟)与空白被去掉。
+        assert_eq!(got.as_deref(), Some("DashScope,语音笔记,Alice,张伟"));
+    }
+
+    #[test]
+    fn merge_empty_everything_is_none() {
+        assert_eq!(merge_hotwords("", Vec::new()), None);
+        assert_eq!(merge_hotwords(" ,，、\n ", vec!["".into(), "  ".into()]), None);
+    }
+
+    #[test]
+    fn merge_caps_at_limit_user_words_win() {
+        let user = (0..HOTWORDS_MAX).map(|i| format!("u{i}")).collect::<Vec<_>>().join(",");
+        let got = merge_hotwords(&user, vec!["溢出词".to_string()]).unwrap();
+        let words: Vec<&str> = got.split(',').collect();
+        assert_eq!(words.len(), HOTWORDS_MAX);
+        assert!(!words.contains(&"溢出词"), "超上限后声纹人名不再挤入");
+        assert_eq!(words[0], "u0");
+    }
+}
+
+/// 当前设置与声纹库拼出的 Qwen3 热词。设置读取失败/声纹库缺失都只降级为少词,
+/// 绝不挡识别器装配。非 Qwen3 引擎调用方也可无脑传入(new_recognizer 会忽略)。
+fn qwen3_hotwords(app: &AppHandle) -> Option<String> {
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    let names: Vec<String> = data_root(app)
+        .map(|root| {
+            let vp = store::VoiceprintStore::new(root).load();
+            vp.people.values().map(|p| p.name.clone()).collect()
+        })
+        .unwrap_or_default();
+    merge_hotwords(&s.asr_hotwords, names)
 }
 
 /// 云端识别器唯一实例化点(对称 new_recognizer):按 provider 造火山/阿里适配器。
@@ -1052,7 +1103,7 @@ fn spawn_session(
             let taken = recognizer_cache.lock().unwrap().take();
             Some(match taken {
                 Some(r) => r,
-                None => match new_recognizer(&current_asr(&app), current_asr_provider(&app)) {
+                None => match new_recognizer(&current_asr(&app), current_asr_provider(&app), qwen3_hotwords(&app)) {
                     Ok(r) => r,
                     Err(e) => {
                         return fail(&app, &running, &generation, my_gen, format!("error: {e}"))
@@ -2399,7 +2450,7 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 ))?;
             // 独立识别器实例:不碰常驻 recognizer_cache 槽(那是录制会话的);
             // 恒用本地识别器,云端协议是录制期流式,不适配离线整轨(spec 已知限制 5)。
-            let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app))
+            let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app), qwen3_hotwords(&app))
                 .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?;
             let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
                 match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
@@ -5738,7 +5789,7 @@ fn preload_models(
             .unwrap_or(false);
         let mut slot = cache.lock().unwrap();
         if slot.is_none() && !cloud_mode {
-            match new_recognizer(&asr_model, current_asr_provider(&app)) {
+            match new_recognizer(&asr_model, current_asr_provider(&app), qwen3_hotwords(&app)) {
                 Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
