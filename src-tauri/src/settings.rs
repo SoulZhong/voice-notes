@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_MIRROR_PREFIX: &str = "https://ghfast.top/";
-/// 旧默认前缀(v0.4.1 及之前)。仅用于一次性迁移判定:UI 从不允许编辑前缀,故存量等于此
-/// 值者必是旧默认而非用户自定义,可安全抬到新默认。
-pub const LEGACY_MIRROR_PREFIX: &str = "https://ghproxy.net/";
+/// 镜像加速前缀。曾经是可存盘/可迁移的字段(`Settings::mirror_prefix`),但 UI 从不
+/// 允许用户编辑它——值永远等于内置默认,字段与其迁移逻辑(`migrate_mirror_prefix`)
+/// 纯属历史包袱。三删一藏(配置项大梳理)改为编译期常量,不再落盘、不再有迁移代码。
+pub const MIRROR_PREFIX: &str = "https://ghfast.top/";
 
 /// ASR 模型选型标识,供 settings.asr_model 与后续选型逻辑复用。
 pub const ASR_SENSE_VOICE: &str = "sense_voice";
@@ -39,7 +39,6 @@ pub const CLOUD_ALIYUN: &str = "aliyun";
 #[serde(from = "SettingsRepr")]
 pub struct Settings {
     pub mirror_enabled: bool,
-    pub mirror_prefix: String,
     /// 自定义数据目录(录音/转写等落盘位置);None 时回退到 app_data_dir。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
@@ -69,17 +68,8 @@ pub struct Settings {
     /// UI 语言:"system"(跟随系统)/"zh"/"en"。前端界面与托盘/后端用户可见文案共用。
     /// 注意与 language_filter(转写乱码过滤)语义无关。
     pub ui_lang: String,
-    /// 仅录系统声(不录麦克风),消费任务:录制开关。
-    pub record_system_only: bool,
-    /// 录制时保持外放音量:麦克风采集用普通输入代替 VPIO(通话模式)。VPIO 启动即触发
-    /// macOS 把其它音频压低 12-16dB(ducking,Min 档仍生效,固有行为);普通输入无 ducking,
-    /// 回声改由软件 AEC(WebRTC AEC3,system 采集流为参考,见 audio::aec)消除,
-    /// 文本回声去重链保留为兜底。默认关(走 VPIO)。
-    pub keep_output_volume: bool,
     /// 语言过滤开关,消费任务:转写语言过滤;默认开启。
     pub language_filter: bool,
-    /// 保留原始录音音频,消费任务:录制开关;默认开启。
-    pub keep_audio: bool,
     /// 全局快捷键开关,消费任务:快捷键;默认关闭(避免未经用户同意即占用系统快捷键)。
     pub shortcut_enabled: bool,
     /// 全局快捷键组合,消费任务:快捷键。
@@ -143,12 +133,15 @@ pub struct Settings {
 /// 是否在场")和额外的 `legacy_mix_track`(旧 `mix_track` 布尔键,只在这里出现,`Settings`
 /// 上不再暴露)。`From<SettingsRepr> for Settings` 用显式逐字段映射(不用 `..Default::default()`
 /// 展开),新增字段忘记在 `From` 里补上会直接编译失败,不会被 spread 语法悄悄吞掉。
+///
+/// **护栏:新增配置字段必须同时改三处**——`Settings`(公开字段)、`SettingsRepr`(本
+/// 结构,带默认值/重命名)、`From<SettingsRepr> for Settings`(逐字段映射)。三处任一
+/// 漏改都会编译失败(`Settings` 缺字段 / `From` 里少一行 struct literal 字段),这是
+/// 故意设计的编译期后盾,不是三份重复代码的疏漏。
 #[derive(Debug, Clone, Deserialize)]
 struct SettingsRepr {
     #[serde(default = "default_true")]
     mirror_enabled: bool,
-    #[serde(default = "default_prefix")]
-    mirror_prefix: String,
     #[serde(default)]
     data_dir: Option<String>,
     #[serde(default)]
@@ -173,14 +166,8 @@ struct SettingsRepr {
     theme: String,
     #[serde(default = "default_ui_lang")]
     ui_lang: String,
-    #[serde(default)]
-    record_system_only: bool,
-    #[serde(default)]
-    keep_output_volume: bool,
     #[serde(default = "default_true")]
     language_filter: bool,
-    #[serde(default = "default_true")]
-    keep_audio: bool,
     #[serde(default)]
     shortcut_enabled: bool,
     #[serde(default = "default_shortcut")]
@@ -234,7 +221,6 @@ impl From<SettingsRepr> for Settings {
     fn from(r: SettingsRepr) -> Self {
         Self {
             mirror_enabled: r.mirror_enabled,
-            mirror_prefix: r.mirror_prefix,
             data_dir: r.data_dir,
             models_dir: r.models_dir,
             asr_model: r.asr_model,
@@ -247,10 +233,7 @@ impl From<SettingsRepr> for Settings {
             speaker_model: r.speaker_model,
             theme: r.theme,
             ui_lang: r.ui_lang,
-            record_system_only: r.record_system_only,
-            keep_output_volume: r.keep_output_volume,
             language_filter: r.language_filter,
-            keep_audio: r.keep_audio,
             shortcut_enabled: r.shortcut_enabled,
             shortcut: r.shortcut,
             tray_enabled: r.tray_enabled,
@@ -337,10 +320,6 @@ impl AudioRetention {
     }
 }
 
-fn default_prefix() -> String {
-    DEFAULT_MIRROR_PREFIX.into()
-}
-
 fn default_speaker_model() -> String {
     "campplus".into()
 }
@@ -381,8 +360,8 @@ pub fn cloud_creds_ok(s: &Settings) -> bool {
 }
 
 /// serde `#[derive(Deserialize)]` 的裸 `#[serde(default)]` 总是取字段类型的
-/// `Default::default()`(bool → false)。language_filter/keep_audio/tray_enabled
-/// 三个字段的产品默认值是 true,所以必须显式挂这个辅助函数,不能偷懒裸写 default。
+/// `Default::default()`(bool → false)。language_filter/tray_enabled 等字段的
+/// 产品默认值是 true,所以必须显式挂这个辅助函数,不能偷懒裸写 default。
 fn default_true() -> bool {
     true
 }
@@ -391,7 +370,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mirror_enabled: true,
-            mirror_prefix: default_prefix(),
             data_dir: None,
             models_dir: None,
             asr_model: default_asr(),
@@ -404,10 +382,7 @@ impl Default for Settings {
             speaker_model: default_speaker_model(),
             theme: default_theme(),
             ui_lang: default_ui_lang(),
-            record_system_only: false,
-            keep_output_volume: false,
             language_filter: true,
-            keep_audio: true,
             shortcut_enabled: false,
             shortcut: default_shortcut(),
             tray_enabled: true,
@@ -532,6 +507,15 @@ fn salvage(text: &str) -> Settings {
         Ok(serde_json::Value::Object(m)) => m,
         _ => return Settings::default(),
     };
+    // `base` 来自 `Settings::default()` 序列化,必然带着 "audio_scheme":"b"(新默认)——
+    // 若不处理,一份根本没有 audio_scheme 键的坏源文件(比如
+    // `{"mix_track":true,"theme":123}`)会被这份 base 快照的默认值抢跑,抢救出 B
+    // 而不是走 `SettingsRepr` 的 None 分支去看 legacy_mix_track,本该迁移成 Ab 的
+    // 存量反而丢了迁移结果。源对象缺这个键时,先从 base 里也去掉它,让最终反序列化
+    // 落回 repr 的键存在性判定(同 `load()` 正常路径的迁移语义)。
+    if !obj.contains_key("audio_scheme") {
+        base.remove("audio_scheme");
+    }
     for (k, val) in obj {
         let mut probe = base.clone();
         probe.insert(k.clone(), val.clone());
@@ -594,16 +578,6 @@ pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<
     Ok(s)
 }
 
-/// 一次性迁移:存量 mirror_prefix 若等于旧默认(ghproxy.net),抬到新默认(ghfast.top)。
-/// 幂等——非旧默认值(新默认 / 未来自定义)不动。走 update 复用 WRITE_LOCK 串行化。
-pub fn migrate_mirror_prefix(app_data: &Path) -> anyhow::Result<Settings> {
-    update(app_data, |s| {
-        if s.mirror_prefix == LEGACY_MIRROR_PREFIX {
-            s.mirror_prefix = DEFAULT_MIRROR_PREFIX.into();
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +587,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = load(tmp.path());
         assert!(s.mirror_enabled);
-        assert_eq!(s.mirror_prefix, DEFAULT_MIRROR_PREFIX);
         std::fs::write(tmp.path().join("settings.json"), "not json").unwrap();
         assert!(load(tmp.path()).mirror_enabled, "损坏 → 默认值");
     }
@@ -621,11 +594,10 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = Settings { mirror_enabled: true, mirror_prefix: "https://mirror.example/".into(), ..Default::default() };
+        let s = Settings { mirror_enabled: true, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert!(got.mirror_enabled);
-        assert_eq!(got.mirror_prefix, "https://mirror.example/");
         assert!(!tmp.path().join("settings.json.tmp").exists(), "原子写不留 tmp");
     }
 
@@ -697,24 +669,22 @@ mod tests {
     #[test]
     fn enhancement_fields_default_and_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":false,"mirror_prefix":"x"}"#).unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mirror_enabled":false}"#).unwrap();
         let s = load(tmp.path());
         assert_eq!(s.theme, "system");
         assert_eq!(s.ui_lang, "system", "老配置缺 ui_lang 应回落跟随系统");
-        assert!(!s.record_system_only && s.language_filter && s.keep_audio);
-        assert!(!s.keep_output_volume, "保持外放音量默认关(保留 AEC)");
+        assert!(s.language_filter);
         assert!(!s.shortcut_enabled);
         assert_eq!(s.shortcut, "Alt+CmdOrCtrl+R");
         assert!(s.tray_enabled);
-        let s = Settings { theme: "dark".into(), ui_lang: "en".into(), record_system_only: true,
-            language_filter: false, keep_audio: false, keep_output_volume: true, shortcut_enabled: true,
+        let s = Settings { theme: "dark".into(), ui_lang: "en".into(),
+            language_filter: false, shortcut_enabled: true,
             shortcut: "Alt+CmdOrCtrl+K".into(), tray_enabled: false, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
         assert_eq!(got.theme, "dark");
         assert_eq!(got.ui_lang, "en");
-        assert!(got.record_system_only && !got.language_filter && !got.keep_audio);
-        assert!(got.keep_output_volume);
+        assert!(!got.language_filter);
         assert!(got.shortcut_enabled && !got.tray_enabled);
         assert_eq!(got.shortcut, "Alt+CmdOrCtrl+K");
     }
@@ -794,43 +764,6 @@ mod tests {
         };
         save(tmp.path(), &s).unwrap();
         assert_eq!(load(tmp.path()).completed_guides, s.completed_guides);
-    }
-
-    #[test]
-    fn migrate_bumps_legacy_prefix_to_new_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        // 存量:旧默认 ghproxy.net
-        std::fs::write(
-            tmp.path().join("settings.json"),
-            format!(r#"{{"mirror_enabled":true,"mirror_prefix":"{LEGACY_MIRROR_PREFIX}"}}"#),
-        )
-        .unwrap();
-        let got = migrate_mirror_prefix(tmp.path()).unwrap();
-        assert_eq!(got.mirror_prefix, DEFAULT_MIRROR_PREFIX, "旧默认应被抬到新默认");
-        assert_eq!(load(tmp.path()).mirror_prefix, DEFAULT_MIRROR_PREFIX, "已持久化");
-    }
-
-    #[test]
-    fn migrate_leaves_non_legacy_prefix_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
-        // 非旧默认值(模拟用户/未来自定义)不应被迁移改动。
-        std::fs::write(
-            tmp.path().join("settings.json"),
-            r#"{"mirror_enabled":true,"mirror_prefix":"https://custom.example/"}"#,
-        )
-        .unwrap();
-        let got = migrate_mirror_prefix(tmp.path()).unwrap();
-        assert_eq!(got.mirror_prefix, "https://custom.example/", "自定义值不动");
-    }
-
-    #[test]
-    fn migrate_is_idempotent_on_new_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        // 无文件:load 得新默认;迁移后仍是新默认,不误改。
-        let got = migrate_mirror_prefix(tmp.path()).unwrap();
-        assert_eq!(got.mirror_prefix, DEFAULT_MIRROR_PREFIX);
-        let again = migrate_mirror_prefix(tmp.path()).unwrap();
-        assert_eq!(again.mirror_prefix, DEFAULT_MIRROR_PREFIX);
     }
 
     #[test]
@@ -1121,6 +1054,47 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert!(!s.identify_auto_apply, "自动应用必须默认关(评测数据门未过)");
         assert!(!Settings::default().identify_auto_apply);
+    }
+
+    /// 三删一藏(配置项大梳理):`keep_audio`/`record_system_only`/`keep_output_volume`/
+    /// `mirror_prefix` 四个旧键从 `Settings`/`SettingsRepr` 上彻底移除后,存量文件里
+    /// 携带这些键必须仍能正常 load(serde 未知字段默认忽略,不报错),且 save 落盘后
+    /// 这些键不得复活(Settings 已没有对应字段,序列化天然写不出)。
+    #[test]
+    fn deleted_legacy_keys_still_parse_and_are_dropped_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"keep_audio":false,"record_system_only":true,"keep_output_volume":true,"mirror_prefix":"https://x/"}"#,
+        )
+        .unwrap();
+        let s = load(tmp.path());
+        save(tmp.path(), &s).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        for k in ["keep_audio", "record_system_only", "keep_output_volume", "mirror_prefix"] {
+            assert!(!raw.contains(k), "旧键 {k} 不得复活: {raw}");
+        }
+        // 且备份已存在(Task 1 的 looks_legacy 覆盖这些键)
+        assert!(tmp.path().join("settings.json.bak-pre-overhaul").exists());
+    }
+
+    /// salvage 键缺失语义(Task 1 review 折入本任务):`salvage()` 的 `base` 快照来自
+    /// `Settings::default()` 序列化,必然带着新默认 "audio_scheme":"b"——若不特殊处理,
+    /// 一份根本没有 audio_scheme 键的坏源文件会被这份默认值抢跑,得到 B 而不是走
+    /// `SettingsRepr` 的键缺失分支去看旧 `mix_track`,本该迁移成 Ab 的存量反而丢了
+    /// 迁移结果。`{"mix_track":true,"theme":123}`:theme 类型错拖垮整体反序列化 →
+    /// 落到 salvage 路径;theme 坏字段回默认,mix_track 好字段应驱动迁移到 Ab。
+    #[test]
+    fn salvage_missing_audio_scheme_key_still_migrates_legacy_mix_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"mix_track":true,"theme":123}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(
+            s.audio_scheme,
+            AudioScheme::Ab,
+            "缺 audio_scheme 键的坏文件抢救后仍须走 mix_track 迁移,不能被 base 默认 B 抢跑"
+        );
+        assert_eq!(s.theme, "system", "theme 类型错,坏字段回默认");
     }
 
 }

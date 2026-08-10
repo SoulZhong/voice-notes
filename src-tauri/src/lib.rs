@@ -817,6 +817,10 @@ fn classify_system(active: &[Source], failed: &[(Source, String)]) -> String {
 ///    本机不对着 mic 说话）。此时刻意不建 mic 源——即便有 AEC，mic 路仍会漏进扬声器
 ///    回声的残渣污染转写；关掉 mic 从根上消除这条污染路径，System 随之升格为该场景下
 ///    唯一且必备的源。纯函数（单测覆盖），供 spawn_session 的源构建与 Fix A 守卫共用。
+///
+/// 「仅系统声音场景」曾由 `Settings::record_system_only` 驱动，该字段随三删一藏移除，
+/// 目前唯一调用点恒传 `false`——`system_only=true` 分支暂为死代码，留给 Task 3 重做
+/// 真正的必备源判定（逃生舱化），本函数签名/两条分支先保持不动。
 fn required_sources(system_only: bool) -> Vec<Source> {
     if system_only {
         vec![Source::System]
@@ -980,18 +984,16 @@ fn spawn_session(
             app.state::<lifecycle::LifecycleHandle>().report(lifecycle::machine::Msg::SessionFailed);
         };
 
-        // 0) 一次性读设置：record_system_only / keep_audio / language_filter /
-        // keep_output_volume / audio_scheme(录制期混音) / 识别方式与云端凭证 同源同快照
+        // 0) 一次性读设置：language_filter / capture_path(采集路径逃生舱)/
+        // audio_scheme(录制期混音) / 识别方式与云端凭证 同源同快照
         // （避免多次 load 读到并发写入的不同代）。app_data_dir 不可用时整体回落
-        // Settings::default（仅系统声=否、保留音频=是、语言过滤=开、保持外放音量=否、
-        // 混音成品轨=否、识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型
+        // Settings::default（语言过滤=开、采集路径=AEC(软件回声消除)、
+        // 混音成品轨=是、识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型
         // 之前：识别方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
-        let (record_system_only, keep_audio, language_filter, keep_output_volume, mix_track) = (
-            cfg.record_system_only,
-            cfg.keep_audio,
+        let (language_filter, use_aec_capture, mix_track) = (
             cfg.language_filter,
-            cfg.keep_output_volume,
+            cfg.capture_path == settings::CapturePath::Aec,
             cfg.audio_scheme.mix_track(),
         );
         let cloud_mode = cfg.asr_mode == settings::ASR_MODE_CLOUD;
@@ -1030,8 +1032,10 @@ fn spawn_session(
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
-        // 2) 构建源（各自 VAD）。默认建麦克风（必备）+ 系统声音（可降级）；
-        // record_system_only 时刻意不建麦克风（跳过 VPIO/mic VAD），源列表只剩 System。
+        // 2) 构建源（各自 VAD）。恒建麦克风（必备）+ 系统声音（可降级,构建失败只打日志
+        // 降级为仅麦克风,见下方两块的 Err 分支)。record_system_only(仅系统声)已随
+        // 三删一藏移除,不再有跳过麦克风的路径——required_sources 的必备源判定守卫由
+        // Task 3 重做。
         let vad_path = models::root().join("silero_vad.onnx");
         let mut sources: Vec<(Source, Box<dyn AudioCapture>, Box<dyn Segmenter>)> = Vec::new();
         // 每源健康计数(FrameTap 写、pipeline_health 读),随 ActiveSession 存活一场。
@@ -1039,99 +1043,94 @@ fn spawn_session(
         // 两源首个真实帧共享一个单调时钟原点。谁先到谁把 0 点钉住,后到源把偏移
         // 写进 SourceHealth,供 mixed sink 在 16k 时间轴上插入准确的前导静音。
         let timeline_origin = Arc::new(OnceLock::new());
-        if !record_system_only {
-            let mic_seg = match new_silero(&vad_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    stash_model(&recognizer_cache, recognizer);
-                    stash_model(&embedder_cache, embedder);
-                    return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
-                }
-            };
-            // 麦克风源：macOS 默认用带 Apple AEC 的 VPIO（内部失败自动回退 cpal）；
-            // 「保持外放音量」开启时改用普通 cpal 输入——VPIO(通话模式)一启动 macOS
-            // 就把其它音频压低 12-16dB(ducking,Min 档配置下仍如此,系统固有行为),
-            // 外放开会场景既听不清、录下的系统声轨电平也小;普通输入无 ducking,
-            // 回声由下方装配的软件 AEC(WebRTC AEC3)消除,文本回声去重链保留为兜底。
-            // 其他平台恒用 cpal。
-            // 采集栈:TappedCapture(ResilientCapture(真实采集))。
-            //  - Resilient:流错误/失联时工厂重建采集,复用同一帧通道,worker 无感;
-            //  - Tap:健康统计 + 断流期按墙钟补零(时间轴不塌,双轨对齐不断裂),
-            //    其失联通知(>3s 无帧)踢 Resilient 重启——覆盖 VPIO 这类未接
-            //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
-            #[cfg(target_os = "macos")]
-            let mic_factory: audio::resilient::CaptureFactory = if keep_output_volume {
-                Box::new(|| {
-                    let (etx, erx) = crossbeam_channel::unbounded();
-                    (
-                        Box::new(audio::microphone::Microphone::with_events(etx))
-                            as Box<dyn AudioCapture>,
-                        erx,
-                    )
-                })
-            } else {
-                Box::new(|| {
-                    // VPIO 无运行期错误回调:事件通道空置(发送端即弃),
-                    // 死亡由 Tap 帧荒检测兜底。
-                    let (_etx, erx) = crossbeam_channel::unbounded::<audio::CaptureEvent>();
-                    (Box::new(audio::vpio::VpioMicrophone::new()) as Box<dyn AudioCapture>, erx)
-                })
-            };
-            #[cfg(not(target_os = "macos"))]
-            let mic_factory: audio::resilient::CaptureFactory = Box::new(|| {
+        let mic_seg = match new_silero(&vad_path) {
+            Ok(s) => s,
+            Err(e) => {
+                stash_model(&recognizer_cache, recognizer);
+                stash_model(&embedder_cache, embedder);
+                return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
+            }
+        };
+        // 麦克风源：macOS 默认用普通 cpal 输入 + 软件 AEC(采集路径逃生舱 capture_path
+        // 默认 aec);vpio 档改用带 Apple AEC 的 VPIO(通话模式,内部失败自动回退
+        // cpal)——VPIO 一启动 macOS 就把其它音频压低 12-16dB(ducking,Min 档配置下仍
+        // 如此,系统固有行为),外放开会场景既听不清、录下的系统声轨电平也小;普通输入
+        // 无 ducking,回声由下方装配的软件 AEC(WebRTC AEC3)消除,文本回声去重链保留
+        // 为兜底。其他平台恒用 cpal。
+        // 采集栈:TappedCapture(ResilientCapture(真实采集))。
+        //  - Resilient:流错误/失联时工厂重建采集,复用同一帧通道,worker 无感;
+        //  - Tap:健康统计 + 断流期按墙钟补零(时间轴不塌,双轨对齐不断裂),
+        //    其失联通知(>3s 无帧)踢 Resilient 重启——覆盖 VPIO 这类未接
+        //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
+        #[cfg(target_os = "macos")]
+        let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture {
+            Box::new(|| {
                 let (etx, erx) = crossbeam_channel::unbounded();
                 (
                     Box::new(audio::microphone::Microphone::with_events(etx))
                         as Box<dyn AudioCapture>,
                     erx,
                 )
-            });
-            let mic_health = Arc::new(SourceHealth::default());
-            let mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
-                let app = app.clone();
-                let health = mic_health.clone();
-                let app2 = app.clone();
-                audio::resilient::ResilientNotify {
-                    on_recovered: Some(Box::new(move || {
-                        health.restarts.fetch_add(1, Ordering::Relaxed);
-                        let _ = app.emit(
-                            "source_health",
-                            ipc::SourceHealthEvent {
-                                source: "mic".into(),
-                                state: "recovered".into(),
-                            },
-                        );
-                    })),
-                    on_lost: Some(Box::new(move || {
-                        let _ = app2.emit(
-                            "source_health",
-                            ipc::SourceHealthEvent { source: "mic".into(), state: "lost".into() },
-                        );
-                    })),
-                }
-            });
-            let mic_kicker = mic_resilient.kicker();
-            let mic_notify = TapNotify {
-                on_stall: Some(Box::new(move || {
-                    eprintln!("麦克风采集失联(>3s 无帧):静音填充维持时间轴,触发自愈重启");
-                    let _ = mic_kicker.try_send(());
+            })
+        } else {
+            Box::new(|| {
+                // VPIO 无运行期错误回调:事件通道空置(发送端即弃),
+                // 死亡由 Tap 帧荒检测兜底。
+                let (_etx, erx) = crossbeam_channel::unbounded::<audio::CaptureEvent>();
+                (Box::new(audio::vpio::VpioMicrophone::new()) as Box<dyn AudioCapture>, erx)
+            })
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mic_factory: audio::resilient::CaptureFactory = Box::new(|| {
+            let (etx, erx) = crossbeam_channel::unbounded();
+            (
+                Box::new(audio::microphone::Microphone::with_events(etx))
+                    as Box<dyn AudioCapture>,
+                erx,
+            )
+        });
+        let mic_health = Arc::new(SourceHealth::default());
+        let mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
+            let app = app.clone();
+            let health = mic_health.clone();
+            let app2 = app.clone();
+            audio::resilient::ResilientNotify {
+                on_recovered: Some(Box::new(move || {
+                    health.restarts.fetch_add(1, Ordering::Relaxed);
+                    let _ = app.emit(
+                        "source_health",
+                        ipc::SourceHealthEvent {
+                            source: "mic".into(),
+                            state: "recovered".into(),
+                        },
+                    );
                 })),
-                on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
-            };
-            let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new_with_timeline_origin(
-                Box::new(mic_resilient),
-                Source::Mic,
-                TapPolicy::mic(),
-                mic_health.clone(),
-                mic_notify,
-                timeline_origin.clone(),
-            ));
-            session_health.push((Source::Mic, mic_health));
-            sources.push((Source::Mic, mic, mic_seg));
-        }
-        // record_system_only 且非 macOS/Windows(如 Linux):System 源不存在,源列表
-        // 将为空,start_session 会因无源可启动返回 Err、开录失败——正是 required
-        // 守卫要兜住的场景。macOS 走 SCK、Windows 走 WASAPI loopback(下方两块)。
+                on_lost: Some(Box::new(move || {
+                    let _ = app2.emit(
+                        "source_health",
+                        ipc::SourceHealthEvent { source: "mic".into(), state: "lost".into() },
+                    );
+                })),
+            }
+        });
+        let mic_kicker = mic_resilient.kicker();
+        let mic_notify = TapNotify {
+            on_stall: Some(Box::new(move || {
+                eprintln!("麦克风采集失联(>3s 无帧):静音填充维持时间轴,触发自愈重启");
+                let _ = mic_kicker.try_send(());
+            })),
+            on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
+        };
+        let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new_with_timeline_origin(
+            Box::new(mic_resilient),
+            Source::Mic,
+            TapPolicy::mic(),
+            mic_health.clone(),
+            mic_notify,
+            timeline_origin.clone(),
+        ));
+        session_health.push((Source::Mic, mic_health));
+        sources.push((Source::Mic, mic, mic_seg));
 
         #[cfg(target_os = "macos")]
         {
@@ -1267,14 +1266,14 @@ fn spawn_session(
             }
         }
 
-        // 软件回声消除(WebRTC AEC3):「保持外放音量」下 VPIO 不启动,改由本模块以
+        // 软件回声消除(WebRTC AEC3):capture_path=aec(默认)下 VPIO 不启动,改由本模块以
         // system 采集流为远端参考,把外放回声从 mic 波形里消掉——mic 路只剩本人声音,
         // 文本级回声去重链降级为兜底。仅 mic+system 双源齐备才有意义;初始化失败
-        // 降级为无 AEC(行为同引入前),绝不挡录制。VPIO 模式(默认)不叠加软件 AEC。
+        // 降级为无 AEC(行为同引入前),绝不挡录制。capture_path=vpio 逃生舱不叠加软件 AEC。
         // Windows 恒尝试:该平台无 VPIO 可选,软件 AEC 是唯一声学消回声路径
         // (当前为 stub,构造返回 Err → 走下方降级日志,文本级回声去重兜底)。
         let mut aec_roles: Vec<(Source, audio::aec::AecRole)> = Vec::new();
-        if (keep_output_volume || cfg!(windows))
+        if (use_aec_capture || cfg!(windows))
             && sources.iter().any(|(s, _, _)| *s == Source::Mic)
             && sources.iter().any(|(s, _, _)| *s == Source::System)
         {
@@ -1428,22 +1427,17 @@ fn spawn_session(
         // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
         // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
         // 待写队列同哲学:内存暂存优于丢内容。base_ms 对齐语义见 AudioTrackWriter。
-        // keep_audio=false 时完全跳过写盘器/写盘线程构建(两者留空 Vec):关闭音频保留,
-        // 转写/声纹零影响——音频落盘是纯增值旁路,sink 仅把采集帧复制一份写 WAV,不在
-        // 转写热路径上;audio_joins 空 Vec 在 stop 时 join 无害(空循环),start_session
-        // 签名不变(空 sinks 即不落任何音频轨)。
+        // keep_audio 开关已随三删一藏移除,固定保留音频——恒装配写盘器/写盘线程。
         //
         // 录制期产物装配移交 pipeline::recording_sink:mix_track 开启时多落一条
-        // mixed.wav(方案 B)。keep_audio=false 时不调 build_sinks、直接给空 Vec,
-        // 关闭音频保留不该产生任何轨(含成品轨),行为与此前完全一致。build_sinks
-        // 没有 keep_audio 参数,短路必须留在这层调用方。
+        // mixed.wav(方案 B)。
         //
         // sources 在此处只是"配置期建了 capture 对象"的源(可能活跃),真正的
         // capture.start() 在 spawn_session 里才跑,启动失败的源其 sink 随 worker 一起
         // 丢弃(session.rs)——mix_track 装配时无法区分"确实活跃"与"仅配置存在",
         // 这个缺口由 MixedSink 的队列/窗口守卫与收尾 seen 检查兜住(一源不喂料就
         // 放弃成品轨,不影响两条源轨),此处不为此调整启动顺序。
-        let (audio_sinks, audio_joins, audio_activity) = if keep_audio {
+        let (audio_sinks, audio_joins, audio_activity) = {
             let srcs: Vec<Source> = sources.iter().map(|(s, _, _)| *s).collect();
             let w = pipeline::recording_sink::build_sinks_with_first_offsets(
                 &note_dir,
@@ -1453,8 +1447,6 @@ fn spawn_session(
                 mix_track,
             );
             (w.sinks, w.joins, w.activity)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
         };
 
         // 识别引擎装配。云端两件调用方专属的注入(见 session::AsrEngine):
@@ -1521,7 +1513,7 @@ fn spawn_session(
             ),
         };
         // language_filter:会议场景默认过滤中日韩误判幻觉段,多语会议可在设置里关闭以
-        // 保留外语真实发言。值在上方与 record_system_only/keep_audio 同一次 settings
+        // 保留外语真实发言。值在上方与 use_aec_capture/mix_track 同一次 settings
         // load 读出(读取失败已保守回落默认过滤开,与 Settings::default 一致)。
         let start = session::start_session(
             sources,
@@ -1657,11 +1649,12 @@ fn spawn_session(
         match start {
             Ok(start) => {
                 // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
-                // 就整场拆除报错(不静默降级)。默认配置 required=[Mic],与原先"mic 必备"
-                // 逐字节等价(同样先 stop 排干可能已产生的其它源 finals → stash 模型 →
-                // AbortSession → 带源名 fail);system_only 下 required=[System],改由
-                // System 缺失触发同一条拆除路径。
-                if let Some(&missing) = required_sources(record_system_only)
+                // 就整场拆除报错(不静默降级)。恒传 false → required=[Mic],与原先
+                // "mic 必备"逐字节等价(先 stop 排干可能已产生的其它源 finals → stash
+                // 模型 → AbortSession → 带源名 fail)。record_system_only 已随三删一藏
+                // 移除,system_only=true 分支暂时死代码(参数留待 Task 3 重做必备源判定,
+                // 换成真正的可配置逃生舱)。
+                if let Some(&missing) = required_sources(false)
                     .iter()
                     .find(|s| !start.active.contains(s))
                 {
@@ -1799,11 +1792,10 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         NoteTarget::New,
     );
     if result.is_ok() {
-        if let Ok(dir) = app.path().app_data_dir() {
-            let source =
-                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
-            telemetry::track(app, telemetry::Event::RecordingStarted { source });
-        }
+        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别——
+        // 固定按 Both 上报(macOS 双源、其它平台历史上也统计为 mic,遥测只要低基数类别,
+        // 不追精确;Task 3 若把必备源判定做成真逃生舱,这里再按需细分)。
+        telemetry::track(app, telemetry::Event::RecordingStarted { source: telemetry::RecordSource::Both });
     }
     result
 }
@@ -1868,11 +1860,10 @@ fn do_resume_note_recording(app: &AppHandle, note_id: String, refining: bool) ->
         NoteTarget::Resume(note_id),
     );
     if result.is_ok() {
-        if let Ok(dir) = app.path().app_data_dir() {
-            let source =
-                telemetry::RecordSource::from_settings(settings::load(&dir).record_system_only);
-            telemetry::track(app, telemetry::Event::RecordingStarted { source });
-        }
+        // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别——
+        // 固定按 Both 上报(macOS 双源、其它平台历史上也统计为 mic,遥测只要低基数类别,
+        // 不追精确;Task 3 若把必备源判定做成真逃生舱,这里再按需细分)。
+        telemetry::track(app, telemetry::Event::RecordingStarted { source: telemetry::RecordSource::Both });
     }
     result
 }
@@ -1975,8 +1966,8 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     for j in s.audio_joins {
         let _ = j.join();
     }
-    // 只覆盖本场 writer 真正成功追加过的源。配置过但启动失败、活跃却无帧、以及
-    // keep_audio=false 的续录都保留旧 sync,不会拿旧 WAV 配本场零计数造假。
+    // 只覆盖本场 writer 真正成功追加过的源。配置过但启动失败、以及活跃却无帧的
+    // 续录都保留旧 sync,不会拿旧 WAV 配本场零计数造假。
     persist_track_sync(&s.note_dir, s.base_ms, wall_ms, &s.health, &s.audio_activity);
     Some(s.note_id)
 }
@@ -5795,7 +5786,6 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
         let app_pl = app.clone();
         let app_done = app.clone();
         let mirror_enabled = s.mirror_enabled;
-        let mirror_prefix = s.mirror_prefix.clone();
         let items: Vec<&models::Artifact> = selected; // ARTIFACTS 原顺序,进度/展示稳定
         let next = std::sync::atomic::AtomicUsize::new(0);
         let all_ok = std::sync::atomic::AtomicBool::new(true);
@@ -5809,7 +5799,6 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                 let all_ok = &all_ok;
                 let root = &root;
                 let items = &items;
-                let mirror_prefix = mirror_prefix.as_str();
                 scope.spawn(move || {
                     let emit = move |id: &str, phase: &str, received: u64, total: u64, message: &str| {
                         let _ = app_w.emit(
@@ -5835,7 +5824,7 @@ fn download_models(app: AppHandle, state: State<AppState>, ids: Option<Vec<Strin
                         if models::artifact_present(root, a) {
                             continue;
                         }
-                        match download_one(a, root, mirror_enabled, mirror_prefix, cancel, &emit) {
+                        match download_one(a, root, mirror_enabled, settings::MIRROR_PREFIX, cancel, &emit) {
                             Ok(()) => {}
                             Err(msg) if msg == "cancelled" => {
                                 emit(a.id, "cancelled", 0, 0, "cancelled");
@@ -6761,11 +6750,8 @@ pub fn run() {
             if let Some(dir) = &app_data {
                 logging::redirect_stdio_to_file(dir);
             }
-            // 一次性迁移:把存量旧默认镜像前缀抬到新默认(见 settings::migrate_mirror_prefix)。
-            // 必须先于本函数后续的 settings::load,使其读到迁移后的值。
-            if let Some(dir) = &app_data {
-                let _ = settings::migrate_mirror_prefix(dir);
-            }
+            // 镜像前缀已随三删一藏改为编译期常量(settings::MIRROR_PREFIX),不再有
+            // mirror_prefix 字段可迁移——一次性 migrate_mirror_prefix 启动调用随之删除。
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
@@ -7137,8 +7123,10 @@ mod tests {
         assert_eq!(active_elapsed_ms(s(1), s(5), None, 0), 0, "异常倒挂饱和为 0 不 panic");
     }
 
-    /// 续录时只有本场 writer 真正追加过样本的源才能更新 sync。否则启动失败或
-    /// keep_audio=false 会拿旧 WAV 配上本场零计数,覆盖上一场可信记录。
+    /// 续录时只有本场 writer 真正追加过样本的源才能更新 sync。否则(启动失败/活跃却
+    /// 无帧写入等一般性场景)会拿旧 WAV 配上本场零计数,覆盖上一场可信记录——
+    /// keep_audio 开关已随三删一藏移除(固定保留音频),这里锁的是更一般的
+    /// "writer 未写入"契约,不再是某个可关闭开关的专属场景。
     #[test]
     fn sync_persistence_preserves_prior_record_when_current_writer_wrote_nothing() {
         use crate::audio::Source;
@@ -7218,8 +7206,12 @@ mod tests {
         assert_eq!(sync.first_frame_offset_ms, Some(0));
     }
 
+    /// record_system_only 设置字段已随三删一藏移除,spawn_session 的唯一调用点现在
+    /// 恒传 false(见该处注释)——这条测试改为断言默认必备源集合本身没被这次删除动到。
+    /// `required_sources(true)` 分支眼下已无调用方触达,留给 Task 3 重做真正的必备源
+    /// 判定(逃生舱化),这里只保它作为纯函数仍按参数分支返回正确值,不做行为收窄。
     #[test]
-    fn required_sources_follow_system_only() {
+    fn required_sources_default_call_site_uses_mic_only() {
         use crate::audio::Source;
         assert_eq!(super::required_sources(false), vec![Source::Mic]);
         assert_eq!(super::required_sources(true), vec![Source::System]);
