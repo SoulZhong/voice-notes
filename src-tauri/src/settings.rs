@@ -346,10 +346,12 @@ const LEGACY_MARKERS: [&str; 5] = [
 /// "mix_track":true}` 必须停在 B,不能被旧键拖回 Ab)。键缺失时才看旧 `mix_track`;
 /// 都缺 → 新默认 B。
 ///
-/// 也被 `update()` 复用:`set_settings` 这类整体替换 `Settings`(`*s = new_settings`)的
-/// 闭包会让 skip 序列化的 `audio_scheme` 字段被重置为类型默认值(因为它不参与
-/// deserialize),必须在 save 前重新从随结构体一起被替换的 `audio_scheme_raw` 派生一次,
-/// 否则 `save()` 的"从 audio_scheme 回写 raw"会用这个陈旧默认值覆盖前端刚提交的档位。
+/// 也被 `update()` 条件性复用(仅当闭包改动了 `audio_scheme_raw` 时才调用,见
+/// `update()` 内的对称判定注释):`set_settings` 这类整体替换 `Settings`
+/// (`*s = new_settings`)的闭包会让 skip 序列化的 `audio_scheme` 字段被重置为类型
+/// 默认值(因为它不参与 deserialize),必须在 save 前重新从随结构体一起被替换的
+/// `audio_scheme_raw` 派生一次,否则 `save()` 的"从 audio_scheme 回写 raw"会用这个
+/// 陈旧默认值覆盖前端刚提交的档位。
 fn resolve_audio_scheme(s: &mut Settings) {
     s.audio_scheme = match s.audio_scheme_raw {
         Some(v) => v,
@@ -358,6 +360,35 @@ fn resolve_audio_scheme(s: &mut Settings) {
             _ => AudioScheme::B,
         },
     };
+}
+
+/// 尸检文件序号:同一进程内短时间连续触发抢救(比如批量场景,或一次 load 里先后遇到
+/// 类型错和截断两种坏文件)按 unix 秒起名会撞同名,后一次覆盖掉前一次的尸体——叠加
+/// 进程内单调计数,保证同一秒内多次调用文件名也不同,不互相覆盖(Minor 3)。
+static CORRUPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 含凭证的整文件副本落盘,权限须与正文 settings.json 一致(0600,仅本人可读)。
+/// 升级备份(`.bak-pre-overhaul`)与尸检(`.corrupt-*`)都是逐字节拷贝,若沿用
+/// `std::fs::write` 默认的 0644,会把 API key 等凭证经这两份 derivative 泄露给
+/// 同机其它用户——这正是 save() 特意收紧正文权限要防的事,备份/尸检不能是漏洞。
+fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 同 save() 的理由:mode() 只对新建文件生效，已存在的文件(比如上次崩溃残留)
+        // 权限可能更宽，显式收紧。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(content.as_bytes())?;
+    Ok(())
 }
 
 /// 缺失/损坏 → 默认值（容忍，不报错）。旧 mix_track 布尔键在此迁移(见字段注释)。
@@ -371,7 +402,7 @@ pub fn load(app_data: &Path) -> Settings {
         let looks_legacy = LEGACY_MARKERS.iter().any(|k| text.contains(k));
         let bak = app_data.join("settings.json.bak-pre-overhaul");
         if looks_legacy && !bak.exists() {
-            let _ = std::fs::write(&bak, text);
+            let _ = write_owner_only(&bak, text);
         }
     }
     let mut s: Settings = match raw.as_deref().map(serde_json::from_str::<Settings>) {
@@ -384,8 +415,9 @@ pub fn load(app_data: &Path) -> Settings {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let _ = std::fs::write(
-                app_data.join(format!("settings.json.corrupt-{ts}")),
+            let seq = CORRUPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = write_owner_only(
+                &app_data.join(format!("settings.json.corrupt-{ts}-{seq}")),
                 raw.as_deref().unwrap_or(""),
             );
             salvage(raw.as_deref().unwrap_or(""))
@@ -468,14 +500,21 @@ static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<Settings> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut s = load(app_data);
+    // load() 之后 audio_scheme_raw 恒为 Some(当前真值)(见 load() 尾部注释)。记下闭包前
+    // 的快照,用来对称判定闭包到底动没动 raw——不能无条件 resolve:那样会把 load() 时
+    // 缓存的旧 raw 覆盖回闭包刚直接写的 `s.audio_scheme`,静默吞掉调用方的修改。
+    let before_raw = s.audio_scheme_raw;
     f(&mut s);
-    // 闭包可能整体替换 s(如 lib.rs::set_settings 的 `*s = new_settings`):替换后的
-    // audio_scheme_raw 来自前端提交的 JSON,是新的真值,但 skip 序列化的 audio_scheme
-    // 字段不参与 deserialize,会被替换回类型默认值。这里重新 resolve 一次,让 audio_scheme
-    // 跟着刚替换进来的 raw 走,save() 的"从 audio_scheme 回写 raw"才不会用陈旧默认值
-    // 覆盖掉前端刚提交的档位。闭包若只改其它字段(未接触 audio_scheme_raw),此调用是
-    // 幂等空操作(raw 已在 load() 里与 audio_scheme 同步过)。
-    resolve_audio_scheme(&mut s);
+    // 仅当闭包让 audio_scheme_raw 变化了(典型场景:lib.rs::set_settings 的
+    // `*s = new_settings` 整体替换,把前端提交的新 raw 带进来,同时把 skip 序列化的
+    // 公开字段 audio_scheme 重置回类型默认值,因为它不参与 deserialize)才需要重新
+    // resolve,让公开字段跟上刚替换进来的 raw,save() 的"公开字段回写 raw"才不会用
+    // 这个陈旧默认值覆盖前端刚提交的档位。若闭包只是直接改公开字段(比如未来某个任务
+    // 写 `s.audio_scheme = X` 这种单字段改法,raw 未被触碰),这里必须放过——公开字段
+    // 此时就是真值,交给 save() 的"公开→raw"同步落盘,而不是被这里的 resolve 覆盖回旧值。
+    if s.audio_scheme_raw != before_raw {
+        resolve_audio_scheme(&mut s);
+    }
     save(app_data, &s)?;
     Ok(s)
 }
@@ -809,7 +848,7 @@ mod tests {
 
     #[test]
     fn load_backs_up_original_file_once_before_first_rewrite() {
-        // 升级备份:load 发现旧格式(存在 mix_track 键或缺 settings_schema 标记)时拷贝一份,
+        // 升级备份:load 发现旧格式(存在 mix_track 键)时拷贝一份,
         // 已有备份不覆盖(Codex P1#2:save 会立刻抹掉旧键,备份是唯一回退路径)
         let tmp = tempfile::tempdir().unwrap();
         let orig = r#"{"mix_track":true,"keep_audio":false}"#;
@@ -836,16 +875,27 @@ mod tests {
         assert_eq!(s.audio_scheme, AudioScheme::B, "坏字段回默认");
         assert_eq!(s.dashscope_api_key, "sk-live", "好字段(凭证)不得丢");
         assert_eq!(s.theme, "dark");
+        // 上面这次 load 本身(audio_scheme:123 类型错)也会触发一次尸检写入;截断段要
+        // 证明的是"这次 load 自己又新留了一具尸体",不能靠"目录里非空"这种弱断言被上一次
+        // 遗留的尸体蒙混过关(Minor 3)——改成比较该段前后的尸检文件集合确实有新增。
+        let corpse_names = |dir: &Path| -> std::collections::HashSet<std::ffi::OsString> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .filter(|n| n.to_string_lossy().starts_with("settings.json.corrupt-"))
+                .collect()
+        };
+        let before = corpse_names(tmp.path());
         // 整文件截断:抢救不出任何字段 → 默认,但坏文件要留尸检
         std::fs::write(tmp.path().join("settings.json"), r#"{"broken"#).unwrap();
         let s = load(tmp.path());
         assert_eq!(s.audio_scheme, AudioScheme::B);
-        let corpses: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("settings.json.corrupt-"))
-            .collect();
-        assert!(!corpses.is_empty(), "截断文件须备份为 corrupt-*");
+        let after = corpse_names(tmp.path());
+        assert!(
+            after.len() > before.len(),
+            "截断文件须新增一份 corrupt-* 尸检,而非复用/掩盖之前的尸体:before={before:?} after={after:?}"
+        );
     }
 
     #[test]
@@ -874,6 +924,7 @@ mod tests {
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B, "默认值同样须显式存活");
         let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
         assert!(!raw.contains("mix_track"), "旧键不得再写盘: {raw}");
+        assert!(raw.contains(r#""audio_scheme": "b""#), "落盘小写契约,真实序列化格式: {raw}");
     }
 
     #[test]
@@ -916,6 +967,51 @@ mod tests {
         .unwrap();
         assert_eq!(got.audio_scheme, AudioScheme::A, "update() 返回值须是前端刚提交的档位");
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A, "落盘也须是前端提交的档位");
+    }
+
+    #[test]
+    fn update_closure_writing_audio_scheme_field_directly_is_not_overwritten() {
+        // 对称判定的另一半:闭包不碰 audio_scheme_raw、只直接改公开字段
+        // `s.audio_scheme`(不同于 set_settings 的整体替换)时,update() 事后的
+        // resolve 不能无条件执行——那样会用 load() 时缓存的旧 raw 把这次直接写入覆盖
+        // 回旧值,静默吞掉调用方的修改,给后续任务埋雷(Review Important 1)。
+        let tmp = tempfile::tempdir().unwrap();
+        // 起始档位与目标档位都不是 AudioScheme::default(),避免巧合掩盖判定错误。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b"}"#).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
+
+        let got = update(tmp.path(), |s| s.audio_scheme = AudioScheme::A).unwrap();
+        assert_eq!(got.audio_scheme, AudioScheme::A, "闭包直接写公开字段的改动不能被吞");
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A, "落盘也须是闭包写入的值");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_and_corrupt_files_are_owner_only_like_settings_json() {
+        // 备份/尸检是含凭证的整文件逐字节拷贝,权限不能比正文本体(0600)更宽松,
+        // 否则凭证经这两份 derivative 泄露给同机其它用户(Review Important 2)。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"mix_track":true,"dashscope_api_key":"sk-live"}"#,
+        )
+        .unwrap();
+        let _ = load(tmp.path());
+        let bak = tmp.path().join("settings.json.bak-pre-overhaul");
+        let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "升级备份文件含凭证,权限须与正文一致");
+
+        std::fs::write(tmp.path().join("settings.json"), r#"{"broken"#).unwrap();
+        let _ = load(tmp.path());
+        let corpse = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("settings.json.corrupt-"))
+            .expect("尸检文件应存在");
+        let mode = std::fs::metadata(corpse.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "尸检文件含凭证,权限须与正文一致");
     }
 
     #[test]
