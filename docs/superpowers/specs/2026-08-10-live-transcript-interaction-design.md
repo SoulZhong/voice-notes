@@ -31,8 +31,8 @@
 ### 3. 当场纠正(前后端)
 
 - **seq 透传**:定稿落盘时后端已知 `seq`,`FinalEvent` 增加 `seq: number`;`Line` 同步增加;retract 匹配逻辑不变(仍按 source+start_ms+text)。续录/冷刷新回灌路径从磁盘段直接带 seq。
-- **live 编辑 IPC 三条**:`live_set_segment_speaker` / `live_edit_segment` / `live_rename_speaker`,参数与冷路径同构(seq + expectedText 乐观校验 / speaker_id / name)。实现:命令投递到录制会话 actor,由 actor 串行执行(与 ASR 定稿追加天然互斥,无并发写 segments.jsonl),改写后通过既有事件回发前端(speaker 改名走 speakers 事件,段变更新增 `segment_edited` 事件,前端按 seq 更新 finals)。会话不在录(状态不符/note_id 不匹配)时返回明确错误。
-- **UI**:已定稿行 hover 浮现操作钮(幽灵形态):改说话人(菜单:现有说话人列表+新说话人,复用笔记页 speakerPick 逻辑)/编辑文本(行内 input,Enter 提交、Esc 取消,expectedText 冲突时提示刷新);partial 行不可编辑;暂停与录制中均可操作。
+- **live 编辑走既有命令自动分流**(计划期修订:发现 `rename_speaker` 已有 active 分流先例、所有编辑命令已经 actor 串行,新开 IPC 是重复面):`edit_segment` / `set_segment_speaker` 命令壳按 session 槽判定活动笔记,活动时改投新增的 `Msg::EditActiveSegment` / `Msg::SetActiveSegmentSpeaker`,由 actor 在 `owned.writer` 上执行(与 ASR 定稿追加天然互斥;writer 新增 `edit_segment_text`/`set_segment_speaker_live`,重写模式照 `merge_speaker` 先例);`rename_speaker` 的 live 路径(`RenameActiveSpeaker`)已存在,直接复用。前端调用方无感。改写成功后发新增 `segment_edited` 事件(编辑后终值),前端按 seq 更新 finals,不做乐观更新。会话不在录/note_id 不匹配时返回明确错误。
+- **UI**:已定稿行 hover 浮现操作钮(幽灵形态):改说话人(菜单:本场已有说话人 + 命名/改名入口;**不开放"新说话人"分配**——与 diar 注册表的 S-id 分配空间撞车,录完再建)/编辑文本(行内 input,Enter 提交、Esc 取消,expectedText 冲突时提示刷新);partial 行不可编辑;暂停与录制中均可操作。
 - **不做**(YAGNI,与用户确认的范围一致):录制中删段、撤销栈、批量改。停录后笔记页能力不变。
 
 ### 4. 测试与验收
