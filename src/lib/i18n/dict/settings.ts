@@ -80,8 +80,9 @@ export const zh = {
   "settings.record.audioRetention.forever": "不清理",
   "settings.record.audioRetention.d90": "90 天",
   "settings.record.audioRetention.d30": "30 天",
-  "settings.lockHint.recording": "录制进行中:识别方式已锁定,其余更改下一场录制生效。",
-  "settings.lockHint.idle": "更改在下一场录制生效。",
+  "settings.lockHint.recording":
+    "录制进行中：识别方式已锁定，结束后生效；外观、菜单栏常驻、界面语言的更改立即生效；其余设置下一场录制生效。",
+  "settings.lockHint.idle": "外观、菜单栏常驻、界面语言的更改立即生效；其余设置下一场录制生效。",
 
   // —— 识别方式(本地/云端)——
   "settings.asrMode.label": "识别方式",
@@ -129,6 +130,8 @@ export const zh = {
   "settings.refine.label": "会后 AI",
   "settings.refine.desc":
     "停止录制后自动用大模型整理转写稿（错字修正、段落归并）；在线接口或本机 Agent 在左侧 AI 页配置",
+  "settings.refine.notReady": "未配置完成",
+  "settings.refine.goConfig": "去 AI 页配置",
 
   // —— 语音模型 ——
   "settings.section.models": "语音模型",
@@ -261,8 +264,9 @@ export const en = {
   "settings.record.audioRetention.d90": "90 days",
   "settings.record.audioRetention.d30": "30 days",
   "settings.lockHint.recording":
-    "Recording in progress: transcription mode is locked; other changes take effect on the next recording.",
-  "settings.lockHint.idle": "Changes take effect on the next recording.",
+    "Recording in progress: transcription mode is locked and applies once it ends; appearance, tray, and UI language changes take effect immediately; other changes take effect on the next recording.",
+  "settings.lockHint.idle":
+    "Appearance, tray, and UI language changes take effect immediately; other changes take effect on the next recording.",
 
   "settings.asrMode.label": "Transcription mode",
   "settings.asrMode.cloudDesc": "Audio is streamed to the selected provider in real time",
@@ -305,6 +309,8 @@ export const en = {
   "settings.refine.label": "Post-meeting AI",
   "settings.refine.desc":
     "After recording stops, a large model tidies the transcript automatically (typo fixes, paragraph merging); configure the online API or local agent on the AI page",
+  "settings.refine.notReady": "Not fully configured",
+  "settings.refine.goConfig": "Configure on AI page",
 
   "settings.section.models": "Speech models",
   "settings.models.openDir": "Open in file manager",

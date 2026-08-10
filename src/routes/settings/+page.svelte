@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { open } from "@tauri-apps/plugin-dialog";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
@@ -30,6 +31,7 @@
     type MigrateEvent,
   } from "$lib/models";
   import { countPeopleWithoutSamples } from "$lib/people";
+  import { refineReady } from "$lib/refineReady";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
@@ -198,6 +200,11 @@
   const asrModelMissing = $derived(
     !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
+
+  // 会后 AI 就绪状态徽标:开关已开但配置未齐备(openai 档缺 base_url/model/api_key,
+  // 或 provider 未回填)时提示,口径对齐后端 readiness(refineReady,见 $lib/refineReady)。
+  // settings 未回填前 refineOn 恒 false,徽标天然不出现,不需要额外判空。
+  const refineConfigReady = $derived(!!settings && refineReady(settings));
 
   // 迁移/更改目录被阻断的原因(禁用 title 用);录制中/下载中/迁移中皆阻断。
   const migrateBlockReason = $derived(
@@ -1086,10 +1093,20 @@
           </div>
         </div>
       {/if}
-      <label class="row">
+      <!-- 非 <label>:徽标里挂了跳转按钮,若整行仍是 <label> 点按钮会被浏览器
+           顺带判成"点了 label"而误触开关(nested interactive 元素的经典坑)。 -->
+      <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.refine.label")}</span>
           <span class="row-desc">{t("settings.refine.desc")}</span>
+          {#if refineOn && !refineConfigReady}
+            <span class="row-badge">
+              {t("settings.refine.notReady")}
+              <button type="button" class="link" onclick={() => goto("/ai")}>
+                {t("settings.refine.goConfig")}
+              </button>
+            </span>
+          {/if}
         </div>
         <input
           type="checkbox"
@@ -1098,7 +1115,7 @@
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
         />
-      </label>
+      </div>
     </div>
     {#if asrMode === "local" && asrModelMissing}
       <div class="banner warn">{t("settings.asr.modelMissing")}</div>
@@ -1454,6 +1471,18 @@
     font-size: 0.8rem;
     color: var(--ink-secondary);
     word-break: break-all;
+  }
+  /* 会后 AI 就绪徽标:开关开但配置未齐备时旁挂,warning-ink 小字 + 去配置链接 */
+  .row-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.78rem;
+    color: var(--warning-ink);
+  }
+  .row-badge .link {
+    font-size: inherit;
+    padding: 0 0.2em;
   }
   /* 「语音模型」区的存储位置行:整行可点,在文件管理器中打开目录。 */
   .models-path {

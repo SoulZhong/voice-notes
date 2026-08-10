@@ -65,37 +65,29 @@
     await requestScreenPerm();
   }
 
-  // 蓝牙外放预警:采集路径=aec(普通输入 + 软件 AEC,现为默认;三删一藏前叫「保持外放
-  // 音量」)+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件回声消除的追踪范围,mic 会混入
-  // 近乎全量的对方声音(面试录音实锤)。开录前提示,查询失败按"无风险"静默。
+  // 蓝牙外放预警:常态检测,只看设备现实——蓝牙输出正在使用时,蓝牙延迟(300~600ms+)
+  // 超出软件回声消除的追踪范围,mic 会混入近乎全量的对方声音(面试录音实锤)。
+  // 与 capture_path(aec/vpio)设置无关(那是采集路径的逃生舱,不是这条风险的成因),
+  // 现默认 aec 下不再按设置项门控这条提示。开录前提示,查询失败按"无风险"静默。
   let btEchoRisk = $state(false);
   async function refreshBtRisk() {
     try {
-      const [s, bt] = await Promise.all([
-        getSettings(),
-        invoke<boolean>("output_is_bluetooth"),
-      ]);
-      btEchoRisk = s.capture_path === "aec" && bt;
+      btEchoRisk = await invoke<boolean>("output_is_bluetooth");
     } catch {
       btEchoRisk = false;
     }
   }
 
-  // 输入音量过低预警(普通麦克风模式):系统输入音量被会议软件拉低会录得很轻。
-  // 开录前 + 录制中都检测,一键调回可用电平;VPIO 模式(自带 AGC)不检测——硬承诺双轨下
-  // 麦克风恒必备(仅录系统声的旧选项已随三删一藏下线),不再有跳过麦克风检测的路径。
+  // 输入音量过低预警:系统输入音量被会议软件拉低会录得很轻,与采集路径设置无关,
+  // 纯按当前电平判定。开录前 + 录制中都检测,一键调回可用电平。
   const LOW_INPUT_THRESHOLD = 50;
   const INPUT_TARGET = 75;
   const POLL_MS = 4000;
   let lowInputVol = $state<{ vol: number } | null>(null);
   async function refreshInputVol() {
     try {
-      const [s, vol] = await Promise.all([
-        getSettings(),
-        invoke<number | null>("input_volume"),
-      ]);
-      lowInputVol =
-        s.capture_path === "aec" && vol != null && vol < LOW_INPUT_THRESHOLD ? { vol } : null;
+      const vol = await invoke<number | null>("input_volume");
+      lowInputVol = vol != null && vol < LOW_INPUT_THRESHOLD ? { vol } : null;
     } catch {
       lowInputVol = null;
     }
@@ -425,7 +417,10 @@
           </button>
         </div>
       {:else if isSystemUnavailable}
-        <div class="banner">{t("record.systemUnavailable.desc")}</div>
+        <div class="banner">
+          {t("record.systemUnavailable.desc")}
+          <span class="hint">{displayStatus}</span>
+        </div>
       {/if}
 
       <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->
@@ -451,13 +446,15 @@
       </div>
     {/if}
 
-    {#if btEchoRisk && !recording.isLive}
+    <!-- 常态检测(设备现实驱动,与 isSystemDenied/isSystemUnavailable 引导卡互斥):
+         那两张卡是"根本录不了"的唯一信息面,同屏再叠加音质类提示只会分散注意力。 -->
+    {#if btEchoRisk && !recording.isLive && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.btEcho")}
       </div>
     {/if}
 
-    {#if lowInputVol}
+    {#if lowInputVol && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.lowInput", { vol: lowInputVol.vol })}
         <button class="link" onclick={fixInputVol}>{t("record.banner.setVolume", { target: INPUT_TARGET })}</button>

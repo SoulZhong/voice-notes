@@ -31,8 +31,7 @@ export const zh = {
   "record.banner.mcpHint": "新功能：把会议笔记接入 Claude / Cursor 等 AI 助手（MCP）。",
   "record.banner.mcpGo": "去 AI 页",
   "record.banner.mcpDismiss": "知道了",
-  "record.banner.btEcho":
-    "检测到蓝牙外放 + 「保持外放音量」：蓝牙延迟会让回声消除失效，录音会混入对方声音（回放像回音）。建议改用有线外放/耳机，或到设置关闭「保持外放音量」。",
+  "record.banner.btEcho": "蓝牙耳机延迟可能影响回声消除效果，建议改用有线耳机或内置扬声器。",
   "record.banner.lowInput": "麦克风输入音量偏低（{vol}%），可能录得很轻。",
   "record.banner.setVolume": "调到 {target}%",
   "record.banner.screenPerm": "系统声音未授权：只能录到麦克风，对方/外放的声音不会进笔记。",
@@ -93,7 +92,7 @@ export const en = {
   "record.banner.mcpGo": "Open AI page",
   "record.banner.mcpDismiss": "Got it",
   "record.banner.btEcho":
-    "Bluetooth output with \"Keep output volume\" detected: Bluetooth latency defeats echo cancellation, so the other side's audio will bleed into the recording (playback sounds like an echo). Use wired speakers/headphones, or turn off \"Keep output volume\" in Settings.",
+    "Bluetooth headset latency may affect echo cancellation; consider using wired headphones or the built-in speaker instead.",
   "record.banner.lowInput": "Microphone input volume is low ({vol}%); the recording may be very quiet.",
   "record.banner.setVolume": "Set to {target}%",
   "record.banner.screenPerm":
