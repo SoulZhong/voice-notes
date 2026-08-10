@@ -177,6 +177,14 @@
     wasLive = live;
   });
 
+  // 停止二段确认:悬停态胶囊仅在"这一场"有效——录制结束(isLive 翻 false，无论是
+  // 经这次确认停止、还是场次因错误/别处自行终止)都必须复位，否则下一场开录后
+  // 控制条会带着上一场遗留的确认胶囊出现。
+  let confirmStop = $state(false);
+  $effect(() => {
+    if (!recording.isLive) confirmStop = false;
+  });
+
   onMount(() => {
     refreshModels();
     refreshScreenPerm();
@@ -364,7 +372,7 @@
     {#if !models || models.recording_ready}
       <!-- 两端对齐:控制钮组贴左、计时+状态贴右、实时波形限宽居中(space-between 把
            富余横向空间分到两侧间隙,波形不再 flex:1 拉满整屏成一根横贯全宽的细带)。 -->
-      <div class="controls">
+      <div class="controls" class:paused={recording.paused}>
         <!-- 左:控制钮组 -->
         <div class="ctl-group">
           {#if recording.stopping}
@@ -377,13 +385,31 @@
             </button>
           {:else}
             {#if recording.paused}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>{t("record.btn.resume")}</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>
+                <span class="sym play"></span>{t("record.btn.resume")}
+              </button>
             {:else}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>{t("record.btn.pause")}</button>
+              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>
+                <span class="sym pause"></span>{t("record.btn.pause")}
+              </button>
             {/if}
-            <button class="ctl danger" disabled={recording.pending} onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}>
-              <span class="sym square"></span>{t("record.btn.stop")}
-            </button>
+            {#if confirmStop}
+              <span class="stop-confirm">
+                {t("record.btn.stopConfirmMsg")}
+                <button
+                  class="ctl danger"
+                  onclick={() => {
+                    confirmStop = false;
+                    recording.stop().catch((err) => console.error("停止录制失败", err));
+                  }}
+                >{t("record.btn.stopConfirmYes")}</button>
+                <button class="ctl" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
+              </span>
+            {:else}
+              <button class="ctl danger" disabled={recording.pending} onclick={() => (confirmStop = true)}>
+                <span class="sym square"></span>{t("record.btn.stop")}
+              </button>
+            {/if}
           {/if}
         </div>
 
@@ -407,7 +433,7 @@
         {#if recording.isLive}
           <div class="live-meta">
             <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
-            <span class="status-inline">
+            <span class="status-inline" class:pausedTag={recording.paused}>
               <span class="status-dot" class:live={!recording.paused}></span>{statusLabel}
             </span>
           </div>
@@ -568,6 +594,14 @@
     gap: 0.75rem;
     margin: 0 0 1rem;
   }
+  /* 暂停:整条控制条升格为 warning 基调，呼应"没在录"这一异常态——不再只靠
+     右侧小灰点交代，误以为还在录、白等一场的事故率最高的一刻。 */
+  .controls.paused {
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    padding: 0.5rem 0.75rem;
+  }
   .ctl-group {
     display: flex;
     align-items: center;
@@ -589,6 +623,11 @@
     color: var(--ink-faint);
     font-size: 0.85rem;
     white-space: nowrap;
+  }
+  /* 暂停时状态标签升格：不再是小灰字，warning 墨色 + 加粗，与整条变调呼应 */
+  .status-inline.pausedTag {
+    color: var(--warning-ink);
+    font-weight: 600;
   }
   /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
      唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
@@ -624,6 +663,39 @@
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
   .sym.dot.on-blue { background: var(--on-primary); }
   .sym.square { border-radius: 2px; background: var(--record); }
+  .sym.pause {
+    width: 8px;
+    height: 10px;
+    border-left: 3px solid currentColor;
+    border-right: 3px solid currentColor;
+  }
+  .sym.play {
+    width: 0;
+    height: 0;
+    border-left: 9px solid currentColor;
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+  }
+  /* 停止二段确认胶囊：#84 同款 warning-tint 行内胶囊，120ms 淡入，不引起行高跳动
+     （padding/字号/行高与常态 .ctl-group 一致，只是行内多出一段文案+两枚按钮）。 */
+  .stop-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    color: var(--warning-ink);
+    border-radius: var(--radius-full);
+    padding: 0.15rem 0.6rem;
+    animation: fadein 120ms ease-out;
+  }
+  @keyframes fadein {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .stop-confirm { animation: none; }
+  }
   /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
   .timer {
     font-variant-numeric: tabular-nums;
@@ -693,6 +765,14 @@
   }
   .status-dot.live {
     background: var(--record);
+    animation: breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-dot.live { animation: none; }
   }
 
   .status.error {
