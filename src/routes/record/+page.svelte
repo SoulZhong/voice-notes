@@ -582,8 +582,11 @@
               <!-- 紧凑确认胶囊(冒烟反馈:问句+两个全尺寸按钮太拥挤):胶囊底色即警示
                    语义,只留两个 link 型小按钮,与相邻 .ctl 同高不跳版。 -->
               <span class="stop-confirm">
+                <!-- pending(暂停/恢复在途)时禁用(Codex P2):此时 stop() 的幂等守卫会
+                     静默返回,若仍关胶囊,用户会误以为已停止。禁用到 pending 落定再点。 -->
                 <button
                   class="link danger"
+                  disabled={recording.pending}
                   onclick={() => {
                     confirmStop = false;
                     recording.stop().catch((err) => console.error("停止录制失败", err));

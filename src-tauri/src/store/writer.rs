@@ -484,10 +484,10 @@ impl NoteWriter {
         }
         let tmp = self.dir.join("segments.jsonl.tmp");
         std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, &path)?;
-        // 重写替换了 segments.jsonl 的磁盘文件，旧句柄仍指向被替换前的 inode；
-        // 丢弃句柄，下次 flush_pending 会按新路径重开，避免写入"消失"的文件。
+        // 先丢句柄再 rename:同 rewrite_segment(Codex P1)——Windows 上带开着的追加
+        // 句柄替换目标可能共享冲突;句柄已 flush,提前关闭无损,下次 flush_pending 重开。
         self.file = None;
+        std::fs::rename(&tmp, &path)?;
 
         if let Some(loser_meta) = self.speakers.remove(loser) {
             let winner_entry =
@@ -550,10 +550,12 @@ impl NoteWriter {
         anyhow::ensure!(found, "段落不存在（seq={seq}）");
         let tmp = self.dir.join("segments.jsonl.tmp");
         std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, &path)?;
-        // 重写替换了 segments.jsonl 的磁盘文件，旧句柄仍指向被替换前的 inode；
-        // 丢弃句柄，下次 flush_pending 会按新路径重开，避免写入"消失"的文件。
+        // **先丢句柄再 rename**(Codex P1):Windows 上目标文件带着我们自己打开的追加
+        // 句柄时,MoveFileEx 替换可能因共享冲突失败——句柄已 flush 过,提前关闭无损;
+        // rename 失败时句柄同样该重开(状态一致),下次 flush_pending 按需重建。
+        // (POSIX 侧顺序无所谓,旧句柄指向被替换前 inode 的注释语义不变。)
         self.file = None;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
