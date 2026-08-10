@@ -2,7 +2,6 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
@@ -28,8 +27,9 @@
     }
   }
 
-  // 屏幕录制权限预检:未授权时系统声音只会在开录后静默降级,这里在开录前就常驻
-  // 提示(2026-07-07 实锤:用户所有笔记都没有 system 轨,自己毫无察觉)。
+  // 屏幕录制权限预检:硬承诺双轨下未授权时开录会被后端整场拆除(不再是静默降级),
+  // 这里在开录前就常驻提示,把"根本录不了"提前到点开录之前(2026-07-07 实锤:
+  // 用户所有笔记都没有 system 轨,自己毫无察觉——那是静默降级年代的教训)。
   // 查询失败按已授权处理,不误伤非 macOS/老系统。
   let screenPerm = $state(true);
   async function refreshScreenPerm() {
@@ -43,9 +43,9 @@
     try {
       // 系统授权弹窗一生只弹一次;已弹过(返回 false)就直接带去系统设置。
       const ok = await invoke<boolean>("request_screen_capture_permission");
-      if (!ok) await openScreenRecordingSettings();
+      if (!ok) await openScreenCaptureSettings();
     } catch {
-      await openScreenRecordingSettings();
+      await openScreenCaptureSettings();
     }
     triedScreenAuth = true;
     await refreshScreenPerm();
@@ -228,11 +228,6 @@
             ? t("record.status.stopped")
             : t("record.status.ready"),
   );
-  async function openScreenRecordingSettings() {
-    await openUrl(
-      "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-    );
-  }
 
   // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
   // system_denied=屏幕录制权限缺失(可操作:引导去系统设置);system_unavailable=
@@ -246,6 +241,13 @@
     isError(recording.status) &&
       !isSystemDenied &&
       recording.status.includes("system_unavailable"),
+  );
+  /** 展示用状态串:剥掉后端塞进错误串给前端分支用的分类 token(用户不需要看到
+      " [system_denied]" 这种内部标记)。仅在下方红色详情行渲染时使用；
+      isSystemDenied/isSystemUnavailable 场景下该行整体不渲染,引导卡是唯一
+      信息面(见下方 markup)。 */
+  const displayStatus = $derived(
+    recording.status.replace(/ \[system_(denied|unavailable)\]$/, ""),
   );
   async function openSystemAudioPrivacySettings() {
     try {
@@ -405,9 +407,11 @@
         {/if}
       </div>
 
-      <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
-      {#if isError(recording.status)}
-        <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行。
+           System 分类错误(isSystemDenied/isSystemUnavailable)不重复展示这行原始
+           串——下方引导卡是这类错误的唯一信息面,避免同一件事说两遍。 -->
+      {#if isError(recording.status) && !isSystemDenied && !isSystemUnavailable}
+        <p class="status error"><span class="status-dot"></span>{displayStatus}</p>
       {/if}
 
       <!-- 硬承诺双轨拒录引导卡:System 起不来时后端整场拆除(不静默降级),这里按分类
@@ -418,7 +422,7 @@
           <strong>{t("record.systemDenied.title")}</strong>
           {t("record.systemDenied.desc")}
           <button class="link" onclick={openSystemAudioPrivacySettings}>
-            {t("record.systemDenied.openSettings")}
+            {t("record.banner.openSettings")}
           </button>
         </div>
       {:else if isSystemUnavailable}
@@ -461,7 +465,9 @@
       </div>
     {/if}
 
-    {#if !screenPerm && !recording.isLive}
+    <!-- isSystemDenied 时上方引导卡已是唯一授权引导面,这条常驻预检横幅让位,
+         避免同一件"去系统设置授权"的事同屏说两遍。 -->
+    {#if !screenPerm && !recording.isLive && !isSystemDenied}
       <div class="banner">
         {t("record.banner.screenPerm")}
         <button class="link" onclick={requestScreenPerm}>{t("record.banner.authorizeNow")}</button>
@@ -473,14 +479,6 @@
             <span class="hint">{t("record.banner.permFixHint")}</span>
           </div>
         {/if}
-      </div>
-    {/if}
-
-    {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
-      <div class="banner">
-        {t("record.banner.sysAudioOff")}
-        <button class="link" onclick={openScreenRecordingSettings}>{t("record.banner.openSettings")}</button>
-        <span class="hint">{t("record.banner.sysAudioOffHint")}</span>
       </div>
     {/if}
 

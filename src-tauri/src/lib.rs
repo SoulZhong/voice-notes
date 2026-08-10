@@ -831,6 +831,48 @@ fn source_display(s: Source) -> String {
     }
 }
 
+/// Fix A 拆除路径的错误文案构造（纯函数，单测覆盖）：`missing` 是 required_sources
+/// 里缺失的那个源，`failed` 是合并后的失败记录（spawn_session 里 pre_start_failed
+/// ++ start.failed，装配阶段 + capture 启动阶段两段失败的并集）。返回值恒以
+/// "error: " 前缀开头，供 fail() 直接作为 status 事件的 state 使用。
+///
+/// System 缺失时在文案末尾追加稳定分类 token（" [system_denied]" / "
+/// [system_unavailable]"，判据沿用 classify_system 的既有 "unauthorized" 子串
+/// 匹配）——前端 record 页据此渲染授权引导卡。Mic 缺失沿用硬承诺双轨改造前的
+/// 纯文案，不带任何 token（逐字节兼容旧格式，Mic 缺失没有"打开系统设置"这类
+/// 可操作的引导可给）。
+fn missing_source_error(missing: Source, failed: &[(Source, String)]) -> String {
+    let name = source_display(missing);
+    let system_token = |msg: Option<&str>| -> &'static str {
+        match msg {
+            Some(m) if m.contains("unauthorized") => "system_denied",
+            _ => "system_unavailable",
+        }
+    };
+    failed
+        .iter()
+        .find(|(s, _)| *s == missing)
+        .map(|(_, msg)| {
+            let base = format!(
+                "error: {}",
+                tr!("{name}未能启动: {msg}", "{name} failed to start: {msg}")
+            );
+            if missing == Source::System {
+                format!("{base} [{}]", system_token(Some(msg)))
+            } else {
+                base
+            }
+        })
+        .unwrap_or_else(|| {
+            let base = format!("error: {}", tr!("{name}未能启动", "{name} failed to start"));
+            if missing == Source::System {
+                format!("{base} [{}]", system_token(None))
+            } else {
+                base
+            }
+        })
+}
+
 /// 会话加载线程要落盘的目标笔记：New = 新建，Resume = 续录既有非活动笔记
 /// （已中断或已完成均可）。spawn_session 据此分支 writer 的创建方式。
 enum NoteTarget {
@@ -1656,58 +1698,40 @@ fn spawn_session(
             Ok(start) => {
                 // Fix A(泛化): required_sources 里的每个源都必备——任一未出现在 active
                 // 就整场拆除报错(不静默降级)。硬承诺双轨下 required=[Mic, System]
-                // （先 stop 排干可能已产生的其它源 finals → stash 模型 → AbortSession →
-                // 带源名+分类 fail)。装配阶段失败(pre_start_failed,VAD 构建等)与
-                // start_session 内 capture 启动阶段失败(start.failed)分属两个阶段,
-                // 这里合并起来供错误文案查找——否则 VAD 构建失败的 System 既不在
-                // active 也不在 start.failed 里,分类会漏判。
-                let all_failed: Vec<(Source, String)> = pre_start_failed
-                    .iter()
-                    .cloned()
-                    .chain(start.failed.iter().cloned())
-                    .collect();
+                // （先 stop 排干可能已产生的其它源 finals → join audio_joins → stash
+                // 模型 → AbortSession → 带源名+分类 fail)。
                 if let Some(&missing) = required_sources()
                     .iter()
                     .find(|s| !start.active.contains(s))
                 {
+                    // 装配阶段失败(pre_start_failed,VAD 构建等)与 start_session 内
+                    // capture 启动阶段失败(start.failed)分属两个阶段,合并起来供
+                    // missing_source_error 查找——否则 VAD 构建失败的 System 既不在
+                    // active 也不在 start.failed 里,分类会漏判。真缺源才需要这份
+                    // 合并,克隆放在本分支内,不给源齐备的正常路径背这两次 clone。
+                    let all_failed: Vec<(Source, String)> = pre_start_failed
+                        .iter()
+                        .cloned()
+                        .chain(start.failed.iter().cloned())
+                        .collect();
                     let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
+                    // 镜像正常停止路径(do_stop_teardown 里 `for j in s.audio_joins`
+                    // 那段):分段 worker 已随 handle.stop() join → audio sink 已 drop →
+                    // 写盘线程排干无界队列后自退,这里 join 等它们真正退出,确保文件
+                    // 句柄已关闭。硬承诺双轨把这条拆除路径推成"mic 已在满速写盘、
+                    // System 却起不来"的常见触发点——不 join 会在 Windows 上让后续
+                    // remove_dir_all(如删除/清理该笔记目录)撞上仍打开的句柄,留下
+                    // 删不掉的孤儿目录。
+                    for j in audio_joins {
+                        let _ = j.join();
+                    }
                     // 排干的 finals 已作为 Pipeline 消息入队(worker 已 join,happens-before
                     // 本条投递),abort 恒在它们之后执行——内容先落盘再按 abort 语义收尾。
                     // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
                     lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
-                    let name = source_display(missing);
-                    // System 缺失时错误串里带上稳定分类 token(system_denied / system_unavailable,
-                    // 沿用 classify_system 的既有 unauthorized 判据),前端据此分支渲染授权引导卡
-                    // （拒录，不做静默降级)；Mic 缺失沿用原先的纯文案，无分类 token。
-                    let system_token = |msg: Option<&str>| -> &'static str {
-                        match msg {
-                            Some(m) if m.contains("unauthorized") => "system_denied",
-                            _ => "system_unavailable",
-                        }
-                    };
-                    let err = all_failed.iter()
-                        .find(|(s, _)| *s == missing)
-                        .map(|(_, msg)| {
-                            let base = format!(
-                                "error: {}",
-                                tr!("{name}未能启动: {msg}", "{name} failed to start: {msg}")
-                            );
-                            if missing == Source::System {
-                                format!("{base} [{}]", system_token(Some(msg)))
-                            } else {
-                                base
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            let base = format!("error: {}", tr!("{name}未能启动", "{name} failed to start"));
-                            if missing == Source::System {
-                                format!("{base} [{}]", system_token(None))
-                            } else {
-                                base
-                            }
-                        });
+                    let err = missing_source_error(missing, &all_failed);
                     return fail(&app, &running, &generation, my_gen, err);
                 }
                 // 停/存竞态保护：存 session、running 检查、generation 检查必须在同一把
@@ -7269,6 +7293,51 @@ mod tests {
     fn required_sources_always_requires_mic_and_system() {
         use crate::audio::Source;
         assert_eq!(super::required_sources(), vec![Source::Mic, Source::System]);
+    }
+
+    /// Fix A 拆除路径错误文案的三分支(硬承诺双轨,Task 3 审查修复):System 缺失
+    /// 且底层失败带 "unauthorized" → system_denied token(屏幕录制权限缺失,
+    /// 前端渲染可操作的授权引导卡)。语言锁到 zh,避免与其它切换语言的用例并发互踩
+    /// (见 i18n::test_lang_guard 注释)。
+    #[test]
+    fn missing_source_error_system_unauthorized_yields_denied_token() {
+        use crate::audio::Source;
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
+        let failed = vec![(Source::System, "unauthorized: 未授权屏幕录制".to_string())];
+        let err = super::missing_source_error(Source::System, &failed);
+        assert!(err.starts_with("error: "));
+        assert!(err.contains("system_denied"), "{err}");
+        assert!(!err.contains("system_unavailable"), "{err}");
+        crate::i18n::set_lang("zh"); // 恢复默认,避免污染同进程其它用例
+    }
+
+    /// System 缺失但失败原因不含 "unauthorized"(如 VAD 构建失败/设备问题)→
+    /// system_unavailable token,不是权限问题,前端不给「打开系统设置」按钮。
+    #[test]
+    fn missing_source_error_system_other_failure_yields_unavailable_token() {
+        use crate::audio::Source;
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
+        let failed = vec![(Source::System, "vad 构建失败: 模型文件缺失".to_string())];
+        let err = super::missing_source_error(Source::System, &failed);
+        assert!(err.contains("system_unavailable"), "{err}");
+        assert!(!err.contains("system_denied"), "{err}");
+        crate::i18n::set_lang("zh");
+    }
+
+    /// Mic 缺失沿用硬承诺双轨改造前的纯文案,不带任何分类 token——逐字节等价旧
+    /// 格式(Mic 缺失没有"打开系统设置"这类可操作引导可给,不该被误判成 System 相关)。
+    #[test]
+    fn missing_source_error_mic_missing_has_no_token_and_matches_legacy_format() {
+        use crate::audio::Source;
+        let _guard = crate::i18n::test_lang_guard();
+        crate::i18n::set_lang("zh");
+        let failed = vec![(Source::Mic, "设备被占用".to_string())];
+        let err = super::missing_source_error(Source::Mic, &failed);
+        assert_eq!(err, "error: 麦克风未能启动: 设备被占用");
+        assert!(!err.contains("system_denied") && !err.contains("system_unavailable"), "{err}");
+        crate::i18n::set_lang("zh");
     }
 
     #[test]

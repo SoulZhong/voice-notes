@@ -42,19 +42,16 @@ export const zh = {
   "record.banner.permFixBtn": "修复授权",
   "record.banner.permFixHint":
     "清除残留后重新弹出系统授权；若未弹出，退出并重新打开应用后再点「立即授权」。",
-  "record.banner.sysAudioOff": "系统声音不可用（未授权屏幕录制）。仅麦克风在录。",
   "record.banner.openSettings": "打开系统设置",
-  "record.banner.sysAudioOffHint": "授权后重新开录生效。",
   "record.banner.diarUnavailable": "说话人区分不可用（相关模型未下载）。转写与录音不受影响。",
   "record.banner.storageDegraded": "落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。",
 
   // 硬承诺双轨(拒录引导卡):System 起不来时整场拆除,开录失败错误串带 system_denied /
-  // system_unavailable 分类,前端据此渲染引导卡(权限缺失=可操作的授权引导;设备/组件
-  // 不可用=纯提示,无跳转)。
+  // system_unavailable 分类,前端据此渲染引导卡(权限缺失=可操作的授权引导,复用
+  // record.banner.openSettings 按钮文案;设备/组件不可用=纯提示,无跳转)。
   "record.systemDenied.title": "系统声音未获授权",
   "record.systemDenied.desc":
     "会议笔记需要录制系统声音；请在 系统设置→隐私与安全性→屏幕录制 中允许本应用，然后重试。",
-  "record.systemDenied.openSettings": "打开系统设置",
   "record.systemUnavailable.desc": "系统声音当前不可用（设备或组件问题），本场无法开录；请检查后重试。",
 
   // 转写区
@@ -108,9 +105,7 @@ export const en = {
   "record.banner.permFixBtn": "Repair permission",
   "record.banner.permFixHint":
     "Clearing the stale record re-triggers the system prompt; if it doesn't appear, quit and reopen the app, then click \"Authorize now\" again.",
-  "record.banner.sysAudioOff": "System audio unavailable (screen recording not authorized). Recording microphone only.",
   "record.banner.openSettings": "Open System Settings",
-  "record.banner.sysAudioOffHint": "Takes effect after you start a new recording once authorized.",
   "record.banner.diarUnavailable":
     "Speaker diarization unavailable (model not downloaded). Transcription and recording are unaffected.",
   "record.banner.storageDegraded":
@@ -119,7 +114,6 @@ export const en = {
   "record.systemDenied.title": "System audio not authorized",
   "record.systemDenied.desc":
     "Meeting notes needs to record system audio; please allow this app under System Settings → Privacy & Security → Screen Recording, then try again.",
-  "record.systemDenied.openSettings": "Open System Settings",
   "record.systemUnavailable.desc":
     "System audio is currently unavailable (a device or component issue); recording could not start. Please check and try again.",
 
