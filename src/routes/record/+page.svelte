@@ -842,7 +842,8 @@
     {#if recording.finals.length > 1 && recording.elapsedMs > 60_000}
       <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
       <div class="timeline" onclick={handleTimelineClick}>
-        {#each ticksView as topPct (topPct)}
+        <!-- key 用下标:topPct 随走表每秒漂移,拿它当 key 会整批重建节点 -->
+        {#each ticksView as topPct, i (i)}
           <span class="tick" style="top: {topPct}%"></span>
         {/each}
       </div>
