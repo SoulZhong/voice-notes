@@ -593,6 +593,64 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             })();
                             if result.is_ok() { result = r; }
                         }
+                        Effect::DoEditActiveSegment { note_id, seq, expected_text, new_text } => {
+                            // 录制中改段文本:与 DoRenameActiveSpeaker 同骨架——先按
+                            // note_id 与槽内 writer 对账(判定活动在命令线程、执行在此
+                            // 线程,中间可能已停录/换会话),再走 writer 单写者路径重写
+                            // segments.jsonl。与定稿追加同线程串行,天然无覆盖窗口。
+                            let r = (|| {
+                                let o = match owned.as_mut() {
+                                    Some(o) if o.note_id == *note_id => o,
+                                    // 竞态窗口(判定与执行之间恰逢停录):报错让调用方
+                                    // 重试,重试会走非活动的冷路径(此刻已合法)。
+                                    _ => return Err("录制会话已结束,请重试".to_string()),
+                                };
+                                o.writer
+                                    .edit_segment_text(*seq, expected_text, new_text)
+                                    .map_err(|e| format!("段落编辑失败: {e}"))?;
+                                // 落盘成功才发事件:前端不做乐观更新,事件是唯一真值源。
+                                let _ = app.emit(
+                                    "segment_edited",
+                                    crate::ipc::SegmentEditedEvent {
+                                        note_id: note_id.clone(),
+                                        seq: *seq,
+                                        text: Some(new_text.clone()),
+                                        speaker: None,
+                                    },
+                                );
+                                Ok(())
+                            })();
+                            if result.is_ok() { result = r; }
+                        }
+                        Effect::DoSetActiveSegmentSpeaker {
+                            note_id,
+                            seq,
+                            expected_text,
+                            speaker_id,
+                        } => {
+                            // 同上骨架;writer 侧另有「目标须在本场说话人表内」的校验
+                            // (录制中不开放 "new" 分配,命令壳已先拒)。
+                            let r = (|| {
+                                let o = match owned.as_mut() {
+                                    Some(o) if o.note_id == *note_id => o,
+                                    _ => return Err("录制会话已结束,请重试".to_string()),
+                                };
+                                o.writer
+                                    .set_segment_speaker_live(*seq, expected_text, speaker_id)
+                                    .map_err(|e| format!("段落改派说话人失败: {e}"))?;
+                                let _ = app.emit(
+                                    "segment_edited",
+                                    crate::ipc::SegmentEditedEvent {
+                                        note_id: note_id.clone(),
+                                        seq: *seq,
+                                        text: None,
+                                        speaker: Some(speaker_id.clone()),
+                                    },
+                                );
+                                Ok(())
+                            })();
+                            if result.is_ok() { result = r; }
+                        }
                         Effect::DoEdit => {
                             if let Some(op) = edit_payload.take() {
                                 let r = run_edit(&app, op);

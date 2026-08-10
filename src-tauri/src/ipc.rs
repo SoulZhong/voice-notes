@@ -44,6 +44,17 @@ pub struct FinalEvent {
     pub speaker: Option<String>,
 }
 
+/// 录制中段编辑落盘成功，事件名 "segment_edited"。text/speaker 为编辑后终值
+/// （本次未改动的字段为 None）。前端按 seq 更新 finals——事件是唯一真值源，
+/// UI 不做乐观更新（落盘失败时命令壳返回 Err，屏上内容保持编辑前的样子）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SegmentEditedEvent {
+    pub note_id: String,
+    pub seq: u64,
+    pub text: Option<String>,
+    pub speaker: Option<String>,
+}
+
 /// 追溯回声撤回，事件名 "final_retract"：一条已上屏的 mic 段事后被确认为 system
 /// 段的回声（system 长句晚于 mic 回声段定稿）。前端应从已显示的 finals 中移除
 /// (source, start_ms, text) 精确匹配的那一行；磁盘侧由后端同步删除。
@@ -654,5 +665,32 @@ mod tests {
         let json = serde_json::to_string(&LevelEvent { source: "system".into(), rms: 0.5 }).unwrap();
         assert!(json.contains("\"source\":\"system\""), "{json}");
         assert!(json.contains("\"rms\":0.5"), "{json}");
+    }
+
+    /// 前端按 seq 定位 finals 并只覆盖非 null 字段（recording store）：字段名、
+    /// seq 数值型、以及"未改动字段序列化为 null"都是跨语言契约。
+    #[test]
+    fn segment_edited_event_carries_seq_and_nulls_untouched_fields() {
+        let json = serde_json::to_string(&SegmentEditedEvent {
+            note_id: "n1".into(),
+            seq: 7,
+            text: Some("改后".into()),
+            speaker: None,
+        })
+        .unwrap();
+        assert!(json.contains("\"note_id\":\"n1\""), "{json}");
+        assert!(json.contains("\"seq\":7"), "{json}");
+        assert!(json.contains("\"text\":\"改后\""), "{json}");
+        assert!(json.contains("\"speaker\":null"), "{json}");
+
+        let json = serde_json::to_string(&SegmentEditedEvent {
+            note_id: "n1".into(),
+            seq: 7,
+            text: None,
+            speaker: Some("S2".into()),
+        })
+        .unwrap();
+        assert!(json.contains("\"text\":null"), "{json}");
+        assert!(json.contains("\"speaker\":\"S2\""), "{json}");
     }
 }

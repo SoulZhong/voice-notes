@@ -4882,6 +4882,15 @@ fn reject_if_active(state: &State<AppState>, note_id: &str) -> Result<(), String
     Ok(())
 }
 
+/// 活动会话判定：与 rename_speaker 同款 statement-scoped 取值——request() 阻塞等
+/// actor,而 actor 的执行体可能要取 session 锁,持锁等 reply 会成环(见 actor.rs
+/// 死锁注记③)。判定与执行之间的停录竞态由执行器按槽内 note_id 对账兜底报错。
+fn is_active_note(state: &State<AppState>, note_id: &str) -> bool {
+    state.session.lock().unwrap().as_ref().map(|s| s.note_id == note_id).unwrap_or(false)
+}
+
+/// 改段文本：活动笔记走 lifecycle 信箱的 writer 单写者路径(与定稿追加同线程串行),
+/// 非活动笔记走既有 EditNote 冷路径直改磁盘。前端调用方无感,同一个命令。
 #[tauri::command]
 fn edit_segment(
     app: AppHandle,
@@ -4891,7 +4900,11 @@ fn edit_segment(
     expected_text: String,
     new_text: String,
 ) -> Result<(), String> {
-    reject_if_active(&state, &note_id)?;
+    if is_active_note(&state, &note_id) {
+        return app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::EditActiveSegment { note_id, seq, expected_text, new_text },
+        );
+    }
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::EditText { id: note_id, seq, expected_text, new_text },
     })
@@ -4920,7 +4933,26 @@ fn set_segment_speaker(
     expected_text: String,
     speaker_id: String,
 ) -> Result<String, String> {
-    reject_if_active(&state, &note_id)?;
+    if is_active_note(&state, &note_id) {
+        // 录制中不开放新建说话人:"new" 分配的 id 会与 diar 注册表的 S-id 空间撞车
+        // (writer 侧亦有同款拒绝,此处先拒是为给出面向用户的双语文案)。
+        if speaker_id == "new" {
+            return Err(tr!(
+                "录制中不能新建说话人，请先停止录制",
+                "Cannot create a new speaker while recording"
+            ));
+        }
+        app.state::<lifecycle::LifecycleHandle>().request(
+            lifecycle::machine::Msg::SetActiveSegmentSpeaker {
+                note_id,
+                seq,
+                expected_text,
+                speaker_id: speaker_id.clone(),
+            },
+        )?;
+        // live 路径不分配新 id,终值即入参(冷路径靠重查取回新分配的 id)。
+        return Ok(speaker_id);
+    }
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::SetSegmentSpeaker {
             id: note_id.clone(),
