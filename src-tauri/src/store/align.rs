@@ -13,6 +13,10 @@ use crate::player_align::TimeMap;
 use std::path::Path;
 
 pub const ALIGN_FILE: &str = "align.json";
+/// 对齐"估不出/不值得纠正"的负结果标记(空文件,mtime 即判据):没有它,大笔记每次
+/// 装载都会重跑 60-100s 的时基估计。比两条源轨都新才有效,源轨更新(续录)即重估;
+/// 删掉它即强制下次装载重估。
+pub const ALIGN_SKIP_FILE: &str = "align.skip";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AlignDoc {

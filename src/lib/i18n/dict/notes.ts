@@ -107,6 +107,7 @@ export const zh = {
   "notes.player.mic": "麦克风",
   "notes.player.system": "系统声",
   "notes.player.muted": "已静音",
+  "notes.player.loading": "正在装载音轨(长录音首次装载需对齐,可能要一会儿)…",
   "notes.player.errLoad": "音轨装载",
   "notes.player.errPlay": "播放",
 
@@ -217,6 +218,7 @@ export const en = {
   "notes.player.mic": "Microphone",
   "notes.player.system": "System audio",
   "notes.player.muted": "Muted",
+  "notes.player.loading": "Loading audio (first load of a long recording may take a while to align)…",
   "notes.player.errLoad": "Track loading",
   "notes.player.errPlay": "Playback",
 

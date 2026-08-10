@@ -154,11 +154,27 @@ pub struct PlayerHandle {
     core: Mutex<Option<Arc<Core>>>,
     /// 流线程停止通道(drop/发送皆停,与 microphone.rs 同模式)。
     stop_tx: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    /// 装载代次(2026-08-10 排障):快速切笔记时多个 player_load 并发在跑,完成序由
+    /// 装载耗时(解码/对齐/门控)决定而非请求序——后完成的旧笔记装载会覆盖当前内核
+    /// (wrong-writer-wins),表现为点播放被掐、图标弹回、放错笔记的音频。
+    /// 入口取号,只有仍是最新代次的装载允许装内核/起流。
+    load_gen: AtomicU64,
 }
 
 impl Default for PlayerHandle {
     fn default() -> Self {
-        Self { core: Mutex::new(None), stop_tx: Mutex::new(None) }
+        Self { core: Mutex::new(None), stop_tx: Mutex::new(None), load_gen: AtomicU64::new(0) }
+    }
+}
+
+impl PlayerHandle {
+    /// 新装载入口取号:此后到达的装载代次更大,本代次随之过期。
+    fn begin_load(&self) -> u64 {
+        self.load_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    /// 本代次是否仍是最新。装内核前与起流后各查一次(见 player_load 注释)。
+    fn is_current(&self, gen: u64) -> bool {
+        self.load_gen.load(Ordering::SeqCst) == gen
     }
 }
 
@@ -265,6 +281,18 @@ fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&P
     newer_than_src(cache) && align_json.map(newer_than_src).unwrap_or(false)
 }
 
+/// 跳过标记是否有效:比全部源轨新即有效(负结果缓存,见 store::align::ALIGN_SKIP_FILE)。
+fn align_skip_is_fresh(marker: &Path, sources: &[&Path]) -> bool {
+    let newest_src = sources
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    match (std::fs::metadata(marker).and_then(|m| m.modified()), newest_src) {
+        (Ok(t), Some(src)) => t >= src,
+        _ => false,
+    }
+}
+
 /// 提交对齐结果:音轨先写临时文件 → 校验长度 → 原子 rename → **最后**发布映射。
 /// 返回是否整体提交成功;任一步失败都会清理临时文件并返回 false(下次装载重算)。
 ///
@@ -349,6 +377,12 @@ async fn align_mic_track(
     let align_json = note_dir.join(crate::store::align::ALIGN_FILE);
 
     if !aligned_cache_is_fresh(&cache, Some(&align_json), &[&mic_path, &sys_path]) {
+        // 负结果缓存:上次已判定"估不出/不值得纠正"且源轨未变,不再重跑 60-100s 的
+        // 估计(2026-08-10 排障:大笔记每次进页白跑一遍,装载期间播放无响应)。
+        let skip_marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
+        if align_skip_is_fresh(&skip_marker, &[&mic_path, &sys_path]) {
+            return;
+        }
         eprintln!(
             "回放对齐: 两轨长度差 {:.1}s(mic {:.0}s / system {:.0}s),估计时基映射…",
             (ds - dm).abs() as f64 / 1000.0,
@@ -367,9 +401,19 @@ async fn align_mic_track(
             };
             let mic = map_file(&m2)?;
             let sys = map_file(&s2)?;
-            let a = crate::player_align::estimate(&mic, mic_off, &sys, sys_off)?;
+            // 负结果也落盘(空文件标记):mmap 失败(上方 ?)不落——那是环境性故障,
+            // 该重试;"估不出/不值得"是对这份音频的稳定判定,源轨不变结论不变。
+            let mark_skip = || {
+                let _ = std::fs::write(nd.join(crate::store::align::ALIGN_SKIP_FILE), b"");
+            };
+            let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
+                eprintln!("回放对齐: 估不出可信映射,记录跳过标记(源轨变更后重估)");
+                mark_skip();
+                return None;
+            };
             if !crate::player_align::worth_correcting(&a) {
-                eprintln!("回放对齐: 实测漂移仅 {:.2}s,不值得纠正", a.drift_secs);
+                eprintln!("回放对齐: 实测漂移仅 {:.2}s,不值得纠正(记录跳过标记)", a.drift_secs);
+                mark_skip();
                 return None;
             }
             eprintln!(
@@ -410,7 +454,9 @@ pub async fn player_load(
     state: State<'_, PlayerHandle>,
     tracks: Vec<LoadTrack>,
 ) -> Result<u64, String> {
-    // 先停旧流(切笔记):旧 Core 一并丢弃,防旧事件串台。
+    // 入口取号:到达时刻本装载即最新意图;先停旧流(切笔记),旧 Core 一并丢弃,
+    // 防旧事件串台。此后若有更新的装载进入,本代次过期,装内核前的检查会拦下。
+    let gen = state.begin_load();
     stop_stream(&state);
 
     // 路径校验 + m4a 解码规划(阻塞段全部挪到 spawn_blocking)。
@@ -525,10 +571,25 @@ pub async fn player_load(
         cursor_bits: AtomicU64::new(0f64.to_bits()),
         playing: AtomicBool::new(false),
     });
-    *state.core.lock().unwrap() = Some(core.clone());
+    // 装内核前查代次:解码/对齐/门控期间用户已切走(有更新的装载进入)就整体放弃,
+    // 绝不把旧笔记的内核装给新页面。检查与写入同持 core 锁,与新装载入口的
+    // stop_stream(它也取 core 锁)天然互斥,无检查-安装间隙。
+    {
+        let mut g = state.core.lock().unwrap();
+        if !state.is_current(gen) {
+            return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
+        }
+        *g = Some(core.clone());
+    }
     if let Err(e) = start_stream(&app, &state, core) {
         stop_stream(&state); // 起流失败不留残核:否则后续 play 假成功、UI 卡"播放中"
         return Err(e);
+    }
+    // 起流后复查:装内核→起流之间若有新装载进入并 stop_stream,上面刚起的流会带着
+    // 过期内核复活(新装载的 stop 先于本次 start 落地)。过期即自我了断。
+    if !state.is_current(gen) {
+        stop_stream(&state);
+        return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
     }
     Ok((total_samples as f64 / SRC_RATE * 1000.0) as u64)
 }
@@ -722,6 +783,36 @@ mod tests {
 
         // 无笔记目录(拿不到 align.json 路径)一律不新鲜
         assert!(!aligned_cache_is_fresh(&cache, None, &srcs));
+    }
+
+    // ── 装载代次守卫(2026-08-10 排障):快速切笔记时多个 player_load 并发,完成序
+    // 由装载耗时决定,后完成的旧笔记装载会覆盖当前笔记内核(wrong-writer-wins),
+    // 用户点播放被掐、放错笔记音频。只有最新代次允许装内核。 ──
+    #[test]
+    fn load_generation_only_newest_wins() {
+        let h = PlayerHandle::default();
+        let g1 = h.begin_load();
+        assert!(h.is_current(g1), "唯一在飞的装载即最新");
+        let g2 = h.begin_load();
+        assert!(!h.is_current(g1), "更新的装载进入后,旧装载过期");
+        assert!(h.is_current(g2));
+    }
+
+    /// 跳过标记(估不出/不值得纠正的负缓存):此前这两种结局不落任何产物,大笔记
+    /// 每次进页都重跑 60-100s 估计。标记比两条源轨都新才有效,源轨更新(续录)即重估。
+    #[test]
+    fn align_skip_marker_freshness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mic, sys) = (tmp.path().join("mic.wav"), tmp.path().join("system.wav"));
+        wav_of_ms(&mic, 10);
+        wav_of_ms(&sys, 10);
+        let marker = tmp.path().join(crate::store::align::ALIGN_SKIP_FILE);
+        let srcs: [&Path; 2] = [&mic, &sys];
+        assert!(!align_skip_is_fresh(&marker, &srcs), "无标记即重估");
+        std::fs::write(&marker, b"").unwrap();
+        assert!(align_skip_is_fresh(&marker, &srcs), "标记比源新:跳过重估");
+        touch_newer(&mic);
+        assert!(!align_skip_is_fresh(&marker, &srcs), "源轨更新(续录)后标记失效");
     }
 
     #[test]

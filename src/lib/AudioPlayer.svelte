@@ -47,6 +47,9 @@
   // 恒为最新意图);onLoaded 只在代次仍是最新时回调,过期装载不消耗恢复现场。
   let loadPromise: Promise<number> | null = null;
   let loadGen = 0;
+  /** 装载进行中(解码/对齐/门控可能要几十秒,长录音首次尤甚):给出可见反馈,
+   * 免得用户点播放"毫无反应"(2026-08-10 排障:装载期间点击只是静默排队)。 */
+  let loading = $state(false);
   // 串行链单独存放:effect 的 cleanup 会先把 loadPromise 置 null 再跑下一轮,
   // 若用 loadPromise 当前驱,新一轮读到的恒是 null,串行化形同虚设。本变量只进
   // 不清(settle 后即释放引用,无泄漏),cleanup 不碰它。
@@ -59,23 +62,38 @@
       const gen = ++loadGen;
       const payload = tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source }));
       const prev = loadChain;
+      loading = true;
       const p = (async () => {
         try {
           await prev;
         } catch {
           /* 旧装载失败不阻断新装载 */
         }
+        // 排队期间实例已卸载/换代(切笔记):放弃发起,不让过期装载进后端抢内核。
+        // 后端另有代次守卫兜底(跨实例并发窗口),这里省掉一次注定作废的重装载。
+        if (gen !== loadGen) return 0;
         const total = await invoke<number>("player_load", { tracks: payload });
         if (gen === loadGen) onLoaded?.();
         return total;
       })();
       loadChain = p.catch(() => {});
+      p.then(
+        () => {
+          if (gen === loadGen) loading = false;
+        },
+        () => {
+          if (gen === loadGen) loading = false;
+        },
+      );
       loadPromise = p.catch((e) => {
         if (gen === loadGen) reportError(t("notes.player.errLoad"), `${e}`);
         throw e;
       });
     }
     return () => {
+      // 换代:让已排队但尚未发起的旧装载放弃(上方 gen 检查),防旧实例的装载
+      // 在切笔记后才进入后端、掐掉新页面刚起的播放(2026-08-10 排障)。
+      loadGen++;
       loadPromise = null;
       void invoke("player_stop").catch(() => {});
     };
@@ -287,6 +305,9 @@
     </div>
   {/if}
 </div>
+{#if loading}
+  <div class="loading-hint">{t("notes.player.loading")}</div>
+{/if}
 {#if trackErrors.length > 0}
   <div class="track-errors">
     {#each trackErrors as e (e)}
@@ -436,6 +457,12 @@
   /* 音轨错误可视化:danger 色小字,贴在播放器下方 */
   .track-errors {
     color: var(--danger);
+    font-size: 0.8rem;
+    margin: 0.3rem 0 0 0.2rem;
+  }
+  /* 装载进行中提示:次级墨小字,同错误行位置(装载完成即消失) */
+  .loading-hint {
+    color: var(--ink-secondary);
     font-size: 0.8rem;
     margin: 0.3rem 0 0 0.2rem;
   }
