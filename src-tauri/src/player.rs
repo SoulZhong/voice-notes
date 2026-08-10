@@ -509,7 +509,10 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):同一笔记两次装载重叠时,过期装载不得删新装载
             // 可能刚提交的有效映射——只有仍是最新代次才有资格做对齐副作用。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_src, &sys_src]);
+                // 清理复验锚**缓存对**(Codex 十六轮:与顶部新鲜度判定同口径)——缓存重建后
+                // 旧 cache+map 对确凿过期,此时若拿持久源复验会误判新鲜、保留映射,而
+                // plan 未换对齐轨,转写映射与原始回放错位。持久源只锚跳过标记。
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
             }
             return;
         }
@@ -598,7 +601,10 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):过期装载的负结论可能晚于新装载的有效提交抵达,
             // 无差别删除会拆掉新映射;过期即放弃副作用(标记写入另有 mtime 快照门)。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_src, &sys_src]);
+                // 清理复验锚**缓存对**(Codex 十六轮:与顶部新鲜度判定同口径)——缓存重建后
+                // 旧 cache+map 对确凿过期,此时若拿持久源复验会误判新鲜、保留映射,而
+                // plan 未换对齐轨,转写映射与原始回放错位。持久源只锚跳过标记。
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
             }
             return;
         };
