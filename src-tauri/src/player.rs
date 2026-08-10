@@ -316,7 +316,14 @@ fn write_align_skip_marker(note_dir: &Path) -> Option<String> {
     let tmp = note_dir.join(format!("{}.{token}.tmp", crate::store::align::ALIGN_SKIP_FILE));
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
         Ok(mut f) => {
-            if f.write_all(token.as_bytes()).is_err() || std::fs::rename(&tmp, &marker).is_err() {
+            if f.write_all(token.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+            // 发布入锁(Codex 十三轮 P2):与回滚侧的「读 token-比对-删除」互斥,
+            // 防回滚方读到自己的 token 后被挂起、本发布落地、恢复后误删新标记。
+            let _fs = ALIGN_FS_LOCK.lock().unwrap();
+            if std::fs::rename(&tmp, &marker).is_err() {
                 let _ = std::fs::remove_file(&tmp);
                 return None;
             }
@@ -405,20 +412,20 @@ fn commit_aligned(
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
+    // 发布临界区(Codex 十三轮 P1):代次检查必须先于缓存音轨 rename,且 rename 与
+    // 映射写入同锁——否则过期渲染可在新装载的 cache+map 配对之上单独覆写音轨,
+    // 覆写后的新 mtime 让 aligned_cache_is_fresh 永远接受这对错配。
+    let _fs = ALIGN_FS_LOCK.lock().unwrap();
+    if !is_current() {
+        eprintln!("回放对齐: 装载已被更新的请求取代,正结论不发布");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
     // std::fs::rename 在 Windows 走 MoveFileEx + MOVEFILE_REPLACE_EXISTING,
     // 覆盖已有目标是既定语义,无需另写平台分支。
     if let Err(e) = std::fs::rename(&tmp, cache) {
         eprintln!("回放对齐: 对齐音轨发布失败({e}),本次不对齐(下次装载重试)");
         let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-    // 与删除侧同锁(见 ALIGN_FS_LOCK):映射发布不被过期装载的清理穿插。
-    let _fs = ALIGN_FS_LOCK.lock().unwrap();
-    // 正结论也过代次门(Codex 十二轮):重叠装载各自按不同源修订估计时,过期任务的
-    // 正结论若晚到,会把旧音频的映射发布在新结果之上——转写按旧映射、回放按新结果。
-    // 锁内复核,过期即弃(上面已 rename 的缓存音轨成孤儿,无映射即不新鲜,无害)。
-    if !is_current() {
-        eprintln!("回放对齐: 装载已被更新的请求取代,正结论不发布");
         return false;
     }
     if let Err(e) = crate::store::align::write(note_dir, map) {
@@ -520,7 +527,10 @@ async fn align_mic_track(
                 // 那份**(mtime 凭据一致,Codex 十一轮 P2):并发新装载已覆写的有效标记
                 // 不动。撤回后源再变,标记比新源旧本就判不新鲜,链路自洽。
                 if (mtime(&m2), mtime(&s2)) != pre {
+                    // 读-比对-删除与标记发布同锁(Codex 十三轮 P2):否则读到自己 token
+                    // 后被挂起,新标记落地,恢复后的删除仍会误删。
                     let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
+                    let _fs = ALIGN_FS_LOCK.lock().unwrap();
                     let content = std::fs::read_to_string(&marker).ok();
                     if ours.is_some() && content == ours {
                         eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
