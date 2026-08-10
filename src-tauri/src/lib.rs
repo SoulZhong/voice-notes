@@ -1688,9 +1688,9 @@ fn spawn_session(
             },
             {
                 let app_l = app.clone();
-                Some(Box::new(move |rms: f32| {
-                    let _ = app_l.emit("level", ipc::LevelEvent { rms });
-                }) as Box<dyn Fn(f32) + Send>)
+                Some(std::sync::Arc::new(move |source: crate::audio::Source, rms: f32| {
+                    let _ = app_l.emit("level", ipc::LevelEvent { source: source.as_str().into(), rms });
+                }) as std::sync::Arc<dyn Fn(crate::audio::Source, f32) + Send + Sync>)
             },
         );
 

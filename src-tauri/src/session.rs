@@ -1956,10 +1956,9 @@ pub fn start_session(
     on_final: impl FnMut(Source, String, u64, u64, Option<String>, Option<f32>) + Send + 'static,
     on_partial: impl FnMut(Source, String) + Send + 'static,
     on_diar: impl FnMut(DiarEvent) + Send + 'static,
-    on_mic_level: Option<Box<dyn Fn(f32) + Send>>,
+    on_level: Option<std::sync::Arc<dyn Fn(Source, f32) + Send + Sync>>,
 ) -> Result<SessionStart, StartError> {
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut mic_level = on_mic_level;
     let (finals_tx, finals_rx) = crossbeam_channel::unbounded::<FinalJob>();
     let mut slots: Vec<(Source, Arc<Mutex<Option<PartialJob>>>)> = Vec::new();
     let mut captures: Vec<Box<dyn AudioCapture>> = Vec::new();
@@ -1987,7 +1986,10 @@ pub fn start_session(
         let final_tx = finals_tx.clone();
         // 先起 worker（消费者），再启动 capture：兼容同步灌帧的 MockCapture，
         // 且若 capture 启动失败，ftx 在 start 内被 drop → frx 关闭 → worker 立即退出。
-        let level_cb = if source == Source::Mic { mic_level.take() } else { None };
+        let level_cb: Option<Box<dyn Fn(f32) + Send>> = on_level.as_ref().map(|cb| {
+            let cb = cb.clone();
+            Box::new(move |r: f32| cb(source, r)) as Box<dyn Fn(f32) + Send>
+        });
         let audio_sink = audio_sinks
             .iter()
             .position(|(s, _)| *s == source)

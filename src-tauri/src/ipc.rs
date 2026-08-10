@@ -22,9 +22,10 @@ pub struct StatusEvent {
     pub elapsed_ms: u64,
 }
 
-/// 麦克风电平（闸前 RMS，0..1 量级），事件名 "level"，约 10Hz。
+/// 采集电平(闸前 RMS,0..1 量级),事件名 "level",每源约 10Hz。
 #[derive(Debug, Clone, Serialize)]
 pub struct LevelEvent {
+    pub source: String, // "mic" | "system"
     pub rms: f32,
 }
 
@@ -638,4 +639,18 @@ pub struct BackfillProgress {
     pub failed: Vec<BackfillFailure>,
     pub rebuild_generation: Option<u64>,
     pub index_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 前端按 source 分路(recording store levels.mic/levels.system),
+    /// 字段名与取值是跨语言契约。
+    #[test]
+    fn level_event_carries_source() {
+        let json = serde_json::to_string(&LevelEvent { source: "system".into(), rms: 0.5 }).unwrap();
+        assert!(json.contains("\"source\":\"system\""), "{json}");
+        assert!(json.contains("\"rms\":0.5"), "{json}");
+    }
 }
