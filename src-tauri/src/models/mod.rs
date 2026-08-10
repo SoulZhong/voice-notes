@@ -27,6 +27,18 @@ pub fn set_models_override(dir: Option<PathBuf>) {
 }
 
 /// 模型根目录。见模块注释的解析顺序；多处兜底保证测试进程（未 init）行为与历史一致。
+/// 按 ASR 选型返回模型目录。lib.rs 识别器装配与 asr_bench 评测工具共用,
+/// 防两处各拼一份路径漂移。未知值按 SenseVoice 兜底,与 new_recognizer 分支一致。
+pub fn asr_model_dir(asr_model: &str) -> PathBuf {
+    let dir = match asr_model {
+        "whisper" => "sherpa-onnx-whisper-base",
+        "paraformer" => PF_DIR,
+        "qwen3" => QWEN3_DIR,
+        _ => SV_DIR,
+    };
+    root().join(dir)
+}
+
 pub fn root() -> PathBuf {
     if let Ok(p) = std::env::var("VN_MODELS") {
         if !p.is_empty() {
