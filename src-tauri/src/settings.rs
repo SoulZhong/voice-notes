@@ -134,15 +134,34 @@ pub struct Settings {
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
     #[serde(default)]
     pub mcp_onboarded: bool,
-    /// 声音处理方案(spec 2026-08-10):录制期混音与笔记页默认回放的统一档位。
-    /// a=双轨(默认,不混音);ab=对照(混音,默认回放仍双轨);b=成品轨(混音,默认回放成品轨)。
-    /// 混音开启后每分钟多约 1.9MB 磁盘(转码 m4a 后大幅缩小),仅影响新录制。
-    #[serde(default)]
+    /// 声音处理方案(spec 2026-08-10,2026-08-10 用户拍板默认翻 B):录制期混音与笔记页
+    /// 默认回放的统一档位。a=双轨(不混音);ab=对照(混音,默认回放仍双轨);
+    /// b=成品轨(默认,混音,默认回放成品轨)。混音开启后每分钟多约 1.9MB 磁盘
+    /// (转码 m4a 后大幅缩小),仅影响新录制。
+    /// 内部 `Option` 仅为判"键是否在场":迁移必须看原始键存在性,不能比较值==默认——
+    /// 默认翻转后显式写入的 "b" 会被误判为"未设置"(Codex P1#1)。`load()` resolve 后
+    /// `audio_scheme` 恒为具体值;`save()` 前从 `audio_scheme` 回写本字段,否则 skip
+    /// 序列化会把键从磁盘上写丢。
+    // pub(crate) 而非纯私有:同 crate 内(lib.rs 测试用的 `Settings { .., ..Default::default() }`
+    // 函数式更新语法)即便不显式点名该字段,也要求它在字面量构造点可见,否则 E0451——
+    // 跨模块仍不可见,对外 API 面不变,符合"私有,serde 专用"的本意。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "audio_scheme")]
+    pub(crate) audio_scheme_raw: Option<AudioScheme>,
+    /// resolve 后的对外真值。跳过 (反)序列化——落盘/收发都走上面的 `audio_scheme_raw`,
+    /// 外部代码(lib.rs 等)照常读这个字段,不感知内部 Option 机制。
+    #[serde(skip)]
     pub audio_scheme: AudioScheme,
     /// 旧布尔键「录制期混出成品轨」(≤2026-08-09):仅为 load 迁移而保留读取,
     /// save 不再写出(skip_serializing)。语义等价:true=混音+默认双轨=Ab。
     #[serde(default, rename = "mix_track", skip_serializing)]
     pub legacy_mix_track: Option<bool>,
+    /// 采集路径逃生舱(json-only 无 UI,同 asr_provider 先例):aec=普通输入+软件AEC(默认),
+    /// vpio=系统通话模式(蓝牙击穿/设备格式不兼容时的手改退路)。
+    #[serde(default)]
+    pub capture_path: CapturePath,
+    /// 音频自动保留期:到期笔记仅清音频轨(转写/精修稿永留)。默认永久。
+    #[serde(default)]
+    pub audio_retention: AudioRetention,
     /// P3 日历匹配:录制停止后按时间窗匹配日历事件(标题+参会人入 identify 先验)。
     /// 默认开——但真正生效还需系统日历授权(授权只能由设置页说明卡触发,自动
     /// 路径未授权即静默跳过),默认开不会造成 surprise 弹窗。
@@ -159,9 +178,9 @@ pub struct Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioScheme {
-    #[default]
     A,
     Ab,
+    #[default]
     B,
 }
 
@@ -169,6 +188,41 @@ impl AudioScheme {
     /// 录制期是否混出成品轨(ab/b 档)。
     pub fn mix_track(self) -> bool {
         self != AudioScheme::A
+    }
+}
+
+/// 采集路径逃生舱档位。serde 小写:"aec"/"vpio"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapturePath {
+    #[default]
+    Aec,
+    Vpio,
+}
+
+/// 音频自动保留期档位。serde:"forever"/"90d"/"30d"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioRetention {
+    #[default]
+    #[serde(rename = "forever")]
+    Forever,
+    #[serde(rename = "90d")]
+    D90,
+    #[serde(rename = "30d")]
+    D30,
+}
+
+impl AudioRetention {
+    /// 保留天数;Forever = None(永不清理)。
+    /// #[allow(dead_code)]:本任务(Task 1)只加字段/枚举地基,尚无消费者调用此方法做
+    /// 实际清理判定——留给后续接线音频保留期清理逻辑的任务,届时移除本 allow。
+    #[allow(dead_code)]
+    pub fn days(self) -> Option<u32> {
+        match self {
+            Self::Forever => None,
+            Self::D90 => Some(90),
+            Self::D30 => Some(30),
+        }
     }
 }
 
@@ -258,8 +312,11 @@ impl Default for Settings {
             completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
-            audio_scheme: AudioScheme::A,
+            audio_scheme_raw: None,
+            audio_scheme: AudioScheme::B,
             legacy_mix_track: None,
+            capture_path: CapturePath::Aec,
+            audio_retention: AudioRetention::Forever,
             calendar_match_enabled: true,
             identify_auto_apply: false,
         }
@@ -275,21 +332,109 @@ pub fn resolve_data_root(app_data: &Path, s: &Settings) -> PathBuf {
     }
 }
 
+/// 旧格式判定关键字:任一存在即视为"升级前"的文件,触发一次性整文件备份。
+const LEGACY_MARKERS: [&str; 5] = [
+    "\"mix_track\"",
+    "\"keep_audio\"",
+    "\"record_system_only\"",
+    "\"keep_output_volume\"",
+    "\"mirror_prefix\"",
+];
+
+/// audio_scheme 迁移 resolve:原始键在场(`audio_scheme_raw`)则照旧,任意值都算用户
+/// 显式选择,不受旧 `mix_track` 影响(Codex P1#1 的翻车组合:`{"audio_scheme":"b",
+/// "mix_track":true}` 必须停在 B,不能被旧键拖回 Ab)。键缺失时才看旧 `mix_track`;
+/// 都缺 → 新默认 B。
+///
+/// 也被 `update()` 复用:`set_settings` 这类整体替换 `Settings`(`*s = new_settings`)的
+/// 闭包会让 skip 序列化的 `audio_scheme` 字段被重置为类型默认值(因为它不参与
+/// deserialize),必须在 save 前重新从随结构体一起被替换的 `audio_scheme_raw` 派生一次,
+/// 否则 `save()` 的"从 audio_scheme 回写 raw"会用这个陈旧默认值覆盖前端刚提交的档位。
+fn resolve_audio_scheme(s: &mut Settings) {
+    s.audio_scheme = match s.audio_scheme_raw {
+        Some(v) => v,
+        None => match s.legacy_mix_track {
+            Some(true) => AudioScheme::Ab,
+            _ => AudioScheme::B,
+        },
+    };
+}
+
 /// 缺失/损坏 → 默认值（容忍，不报错）。旧 mix_track 布尔键在此迁移(见字段注释)。
+/// 升级备份 + 逐字段抢救,详见 `resolve_audio_scheme` 与 `salvage`。
 pub fn load(app_data: &Path) -> Settings {
-    let mut s: Settings = std::fs::read_to_string(app_data.join("settings.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // 新键在场(非默认 a)则旧键忽略;新写盘不再输出旧键,此分支只服务存量文件。
-    if s.legacy_mix_track == Some(true) && s.audio_scheme == AudioScheme::A {
-        s.audio_scheme = AudioScheme::Ab;
+    let path = app_data.join("settings.json");
+    let raw = std::fs::read_to_string(&path).ok();
+    // 升级备份:旧格式文件(命中任一旧键关键字)首次见到即整文件备份,已有备份不覆盖
+    //(Codex P1#2:save 会立刻用新键覆盖/抹掉旧键,备份是升级后唯一的手工回退路径)。
+    if let Some(text) = &raw {
+        let looks_legacy = LEGACY_MARKERS.iter().any(|k| text.contains(k));
+        let bak = app_data.join("settings.json.bak-pre-overhaul");
+        if looks_legacy && !bak.exists() {
+            let _ = std::fs::write(&bak, text);
+        }
     }
+    let mut s: Settings = match raw.as_deref().map(serde_json::from_str::<Settings>) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            // 整对象反序列化失败(单字段类型错也会拖垮整体,Codex P1#9)→ 尸检备份 +
+            // 逐字段抢救,不能静默整体重置(会把凭证等好字段一起丢)。
+            eprintln!("settings.json 解析失败,逐字段抢救: {e}");
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = std::fs::write(
+                app_data.join(format!("settings.json.corrupt-{ts}")),
+                raw.as_deref().unwrap_or(""),
+            );
+            salvage(raw.as_deref().unwrap_or(""))
+        }
+        None => Settings::default(),
+    };
+    resolve_audio_scheme(&mut s);
+    // 回写 raw:保证 get_settings 经 IPC 序列化给前端时 audio_scheme 键不会因为
+    //(旧文件迁移/全新安装场景下)raw 本就是 None 而被 skip 字段吞掉;也让随后若
+    // 直接对这份 Settings 调 save() 时天然带着正确值,无需依赖调用方记得回写。
+    s.audio_scheme_raw = Some(s.audio_scheme);
     s
+}
+
+/// 逐字段抢救:整体 JSON 不合法或字段类型错时,能从 Value 读出的字段保留,读不出的用默认。
+/// 增量叠加而非"整体覆盖再逐键剔除试探":后一种做法(剔除法)每一步只检验"剔除/替换这个
+/// 键之后能否整体反序列化成功",而不比较剔除前是否本就能成功——对一个本来就合法的好字段
+/// (比如 theme:"dark"),把它替换成默认值 "system" 之后一样能整体解析成功,于是会被贪心
+/// 判定为"坏源"一并打回默认,好字段反而丢失。这里改用从自洽的默认对象出发、逐键尝试叠加
+/// 原始值的增量法:只有"叠加后仍能整体解析"的字段才会被采纳,天然不会误伤好字段。
+fn salvage(text: &str) -> Settings {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Settings::default();
+    };
+    let Some(obj) = v.as_object() else {
+        return Settings::default();
+    };
+    let mut base = match serde_json::to_value(Settings::default()) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => return Settings::default(),
+    };
+    for (k, val) in obj {
+        let mut probe = base.clone();
+        probe.insert(k.clone(), val.clone());
+        if serde_json::from_value::<Settings>(serde_json::Value::Object(probe.clone())).is_ok() {
+            base = probe;
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(base)).unwrap_or_default()
 }
 
 pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
+    // audio_scheme 是 skip 序列化的对外字段,真正落盘的是 audio_scheme_raw;写盘前必须
+    // 从当前真值回写一次,否则(比如测试/调用方直接构造 Settings 而不知道 raw 内部机制时)
+    // 键会从磁盘上消失,下次 load 又摔回默认(见 P1#1/P1#2 相关注释)。克隆而非改 &self,
+    // 保持 save 对调用方传入值只读的既有契约。
+    let mut s2 = s.clone();
+    s2.audio_scheme_raw = Some(s2.audio_scheme);
     let tmp = app_data.join("settings.json.tmp");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -305,7 +450,7 @@ pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
         // tmp 可能来自上次崩溃且权限较宽；mode() 只对新建文件生效，显式收紧。
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(serde_json::to_string_pretty(s)?.as_bytes())?;
+    file.write_all(serde_json::to_string_pretty(&s2)?.as_bytes())?;
     drop(file);
     std::fs::rename(&tmp, app_data.join("settings.json"))?;
     Ok(())
@@ -324,6 +469,13 @@ pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<
     let _guard = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut s = load(app_data);
     f(&mut s);
+    // 闭包可能整体替换 s(如 lib.rs::set_settings 的 `*s = new_settings`):替换后的
+    // audio_scheme_raw 来自前端提交的 JSON,是新的真值,但 skip 序列化的 audio_scheme
+    // 字段不参与 deserialize,会被替换回类型默认值。这里重新 resolve 一次,让 audio_scheme
+    // 跟着刚替换进来的 raw 走,save() 的"从 audio_scheme 回写 raw"才不会用陈旧默认值
+    // 覆盖掉前端刚提交的档位。闭包若只改其它字段(未接触 audio_scheme_raw),此调用是
+    // 幂等空操作(raw 已在 load() 里与 audio_scheme 同步过)。
+    resolve_audio_scheme(&mut s);
     save(app_data, &s)?;
     Ok(s)
 }
@@ -620,51 +772,152 @@ mod tests {
     }
 
     #[test]
-    fn audio_scheme_defaults_a_and_old_files_parse() {
-        // 旧配置文件无该字段,必须仍可解析(仓库既有约定:新字段 serde(default))
-        let s: Settings = serde_json::from_str("{}").expect("旧文件应可解析");
-        assert_eq!(s.audio_scheme, AudioScheme::A, "默认方案 A:不改变现有用户行为");
-        assert!(!s.audio_scheme.mix_track(), "A 档不混音");
-        // lib.rs 读设置失败走 unwrap_or_default,真正生效的是手写 Default——单独断言
-        assert_eq!(Settings::default().audio_scheme, AudioScheme::A);
-    }
-
-    #[test]
-    fn legacy_mix_track_true_migrates_to_ab() {
-        // 旧键 true 的行为=混音+默认双轨,语义等价档位是 Ab
+    fn audio_scheme_defaults_b_for_fresh_and_untouched_files() {
+        // 全新安装(无文件)与旧默认文件(空对象)都落新默认 B
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("settings.json"), r#"{"mix_track":true}"#).unwrap();
-        let s = load(tmp.path());
-        assert_eq!(s.audio_scheme, AudioScheme::Ab);
-        assert!(s.audio_scheme.mix_track());
-    }
-
-    #[test]
-    fn legacy_mix_track_false_stays_a() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("settings.json"), r#"{"mix_track":false}"#).unwrap();
-        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A);
-    }
-
-    #[test]
-    fn explicit_new_key_wins_over_legacy_mix_track() {
-        // 新键在场(非默认)则旧键忽略——守卫条件 audio_scheme == A 的另一半语义
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b","mix_track":true}"#).unwrap();
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
+        std::fs::write(tmp.path().join("settings.json"), "{}").unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
+        assert_eq!(Settings::default().audio_scheme, AudioScheme::B, "unwrap 兜底口径");
     }
 
     #[test]
-    fn save_writes_scheme_and_drops_legacy_key() {
-        // 写盘只写新键:round-trip 保留档位,mix_track 不再出现
+    fn explicit_audio_scheme_always_wins_regardless_of_legacy() {
+        // 键在场任意值照旧——含与陈旧 mix_track 并存(Codex P1#1 的翻车组合)
+        for (raw, want) in [
+            (r#"{"audio_scheme":"a"}"#, AudioScheme::A),
+            (r#"{"audio_scheme":"b","mix_track":true}"#, AudioScheme::B),
+            (r#"{"audio_scheme":"ab","mix_track":false}"#, AudioScheme::Ab),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("settings.json"), raw).unwrap();
+            assert_eq!(load(tmp.path()).audio_scheme, want, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn legacy_mix_track_migrates_only_when_new_key_absent() {
+        for (raw, want) in [
+            (r#"{"mix_track":true}"#, AudioScheme::Ab),
+            (r#"{"mix_track":false}"#, AudioScheme::B), // 旧默认非显式选择,随新默认(用户拍板)
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("settings.json"), raw).unwrap();
+            assert_eq!(load(tmp.path()).audio_scheme, want, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn load_backs_up_original_file_once_before_first_rewrite() {
+        // 升级备份:load 发现旧格式(存在 mix_track 键或缺 settings_schema 标记)时拷贝一份,
+        // 已有备份不覆盖(Codex P1#2:save 会立刻抹掉旧键,备份是唯一回退路径)
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = r#"{"mix_track":true,"keep_audio":false}"#;
+        std::fs::write(tmp.path().join("settings.json"), orig).unwrap();
+        let _ = load(tmp.path());
+        let bak = tmp.path().join("settings.json.bak-pre-overhaul");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), orig, "备份=原文");
+        // 二次 load(备份已存在)不得覆盖
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"a"}"#).unwrap();
+        let _ = load(tmp.path());
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), orig, "备份不被后续覆盖");
+    }
+
+    #[test]
+    fn corrupt_file_is_salvaged_field_by_field_not_reset() {
+        // 单字段类型错不再拖垮整对象(Codex P1#9):坏字段用默认,好字段保留
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"audio_scheme":123,"dashscope_api_key":"sk-live","theme":"dark"}"#,
+        )
+        .unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.audio_scheme, AudioScheme::B, "坏字段回默认");
+        assert_eq!(s.dashscope_api_key, "sk-live", "好字段(凭证)不得丢");
+        assert_eq!(s.theme, "dark");
+        // 整文件截断:抢救不出任何字段 → 默认,但坏文件要留尸检
+        std::fs::write(tmp.path().join("settings.json"), r#"{"broken"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.audio_scheme, AudioScheme::B);
+        let corpses: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("settings.json.corrupt-"))
+            .collect();
+        assert!(!corpses.is_empty(), "截断文件须备份为 corrupt-*");
+    }
+
+    #[test]
+    fn capture_path_and_retention_default_and_parse() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.capture_path, CapturePath::Aec);
+        assert_eq!(s.audio_retention, AudioRetention::Forever);
+        let s: Settings =
+            serde_json::from_str(r#"{"capture_path":"vpio","audio_retention":"30d"}"#).unwrap();
+        assert_eq!(s.capture_path, CapturePath::Vpio);
+        assert_eq!(s.audio_retention, AudioRetention::D30);
+    }
+
+    #[test]
+    fn save_reload_roundtrip_preserves_explicit_scheme_including_default_valued_b() {
+        // save→reload 必须保住显式值,含"恰好等于新默认"的显式 b(不能被误判成未设置而
+        // 走迁移分支,这正是 P1#1 要防的翻车)。
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Settings { audio_scheme: AudioScheme::A, ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A, "非默认显式值须存活");
+
         let tmp = tempfile::tempdir().unwrap();
         let s = Settings { audio_scheme: AudioScheme::B, ..Default::default() };
         save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B, "默认值同样须显式存活");
         let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
         assert!(!raw.contains("mix_track"), "旧键不得再写盘: {raw}");
-        assert!(raw.contains(r#""audio_scheme": "b""#), "serde 小写契约: {raw}");
-        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
     }
+
+    #[test]
+    fn explicit_b_file_survives_save_reload_and_key_never_vanishes() {
+        // 保护 skip/raw 同步:显式写了 "audio_scheme":"b" 的文件,load→save→reload 后
+        // 值仍是 b,且磁盘文件必须继续含 audio_scheme 键(不能因为 skip 序列化把键写丢)。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b"}"#).unwrap();
+        let s = load(tmp.path());
+        assert_eq!(s.audio_scheme, AudioScheme::B);
+        save(tmp.path(), &s).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        assert!(raw.contains("\"audio_scheme\""), "audio_scheme 键不得从磁盘消失: {raw}");
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B, "reload 后仍是 b");
+    }
+
+    #[test]
+    fn update_full_struct_replace_like_set_settings_keeps_submitted_audio_scheme() {
+        // 复刻 lib.rs::set_settings 的写入形状:闭包整体替换 `*s = new_settings`
+        //(new_settings 由前端 JSON 反序列化而来)。这会让 skip 序列化的公开字段
+        // audio_scheme 被重置为类型默认值(反序列化不经过它),必须验证 update() 事后
+        // 重新 resolve,否则 save() 的"公开字段回写 raw"会用这个陈旧默认值覆盖前端刚
+        // 提交的档位——前端选 b,落盘却变成别的值,静默丢用户设置。
+        let tmp = tempfile::tempdir().unwrap();
+        // 存量:已显式选过 b(新默认,当心测试值不要恰好等于 AudioScheme::default(),
+        // 否则"忘了 resolve"这个回归会被类型默认值巧合掩盖,测试失去意义)。
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b"}"#).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
+
+        // 前端把新值经 JSON 传回来(rename 目标键 "audio_scheme"),模拟 tauri command
+        // 参数 `new_settings: settings::Settings` 的反序列化产物。刻意选与
+        // AudioScheme::default() 不同的档位(a),这样"忘了在 update() 里重新 resolve"
+        // 这个回归不会被类型默认值碰巧等于提交值给掩盖掉。
+        let wire = r#"{"audio_scheme":"a"}"#;
+        let new_settings: Settings = serde_json::from_str(wire).unwrap();
+
+        let got = update(tmp.path(), |s| {
+            *s = new_settings.clone();
+        })
+        .unwrap();
+        assert_eq!(got.audio_scheme, AudioScheme::A, "update() 返回值须是前端刚提交的档位");
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A, "落盘也须是前端提交的档位");
+    }
+
     #[test]
     fn calendar_match_defaults_to_true_for_legacy_settings() {
         // 旧 settings.json(无该键):default_true 兜底——裸 #[serde(default)] 会变 false。
