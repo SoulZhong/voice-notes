@@ -205,11 +205,19 @@
   let editError = $state("");
 
   // 录制结束(停止/出错)后清空所有悬浮编辑态,不带着上一场的态出现在下一场。
+  // 回看态(搜索词/说话人过滤/命中下标)一并清空:同一页面实例跨场复用时,说话人 id
+  // 按场编号(S0/S1...)跨场高概率复用,上一场遗留的过滤 chip 会静默把新场的转写行
+  // 过滤掉、follow 卡暂停。清空会让下面的 reviewActive 产生 true→false 边沿从而
+  // 触发 jumpToLatest——停录时刻滚回底部是可接受行为,这里不额外同步 prevReviewActive
+  // 去绕过这条边沿。
   $effect(() => {
     if (!recording.isLive) {
       editingSeq = null;
       speakerMenuSeq = null;
       renamingSeq = null;
+      searchQuery = "";
+      selectedSpeakers = new Set();
+      activeHit = 0;
     }
   });
 
@@ -458,10 +466,20 @@
   let searchQuery = $state("");
   let activeHit = $state(0); // hits 内下标
   let selectedSpeakers = $state<Set<string>>(new Set());
-  const hits = $derived(searchHits(recording.finals, searchQuery));
+  // 命中=可见命中:搜索导航永不落在被过滤行上——先拿文本命中，再叠一层说话人过滤，
+  // 否则「下一个」可能跳到 display:none 的行（scrollIntoView 对隐藏元素静默 no-op），
+  // 计数也会把不可见行算进去。
+  const hits = $derived(
+    searchHits(recording.finals, searchQuery).filter((i) =>
+      matchesSpeakerFilter(recording.finals[i], selectedSpeakers),
+    ),
+  );
   /** each 内 O(n) 判定命中(而非 hits.includes(i) 的 O(n²))：finals 行数虽然通常
       只有数百，但录制可长达数小时，直接派生 Set 零成本。 */
   const hitSet = $derived(new Set(hits));
+  /** hits 收缩时(说话人过滤收紧、命中行被回声撤回…)activeHit 可能越界——渲染计数/
+      高亮、gotoHit 的跳转基点统一读钳制值，避免出现「6/5」这种越界展示。 */
+  const activeHitClamped = $derived(Math.min(activeHit, Math.max(0, hits.length - 1)));
   const reviewActive = $derived(searchQuery.trim() !== "" || selectedSpeakers.size > 0);
 
   let prevReviewActive = false;
@@ -485,7 +503,7 @@
   }
   function gotoHit(delta: number) {
     if (!hits.length) return;
-    activeHit = (activeHit + delta + hits.length) % hits.length;
+    activeHit = (activeHitClamped + delta + hits.length) % hits.length;
     document
       .getElementById(`seg-${recording.finals[hits[activeHit]].seq}`)
       ?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -595,7 +613,7 @@
           />
           {#if searchQuery.trim()}
             <span class="hit-count">
-              {hits.length ? `${activeHit + 1}/${hits.length}` : t("record.search.none")}
+              {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
             </span>
             <button class="ghosty" onclick={() => gotoHit(-1)} title={t("record.search.prev")}>↑</button>
             <button class="ghosty" onclick={() => gotoHit(1)} title={t("record.search.next")}>↓</button>
@@ -718,7 +736,7 @@
           class:current={recording.isLive && !hasPartial && line.seq === lastFinalSeq}
           class:hidden={!matchesSpeakerFilter(line, selectedSpeakers)}
           class:hit={hitSet.has(i)}
-          class:hit-active={hits[activeHit] === i}
+          class:hit-active={hits[activeHitClamped] === i}
         >
           <span class="spk-anchor">
             <button
