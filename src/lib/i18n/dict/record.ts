@@ -63,6 +63,14 @@ export const zh = {
   "record.emptyHint": "（开始说话…）",
   "record.jumpLatest": "↓ 回到最新",
 
+  // 当场纠正(行内编辑文本 / 改派说话人 / 命名改名):后端为唯一真值源,前端不做
+  // 乐观更新,失败原样展示、不自动重试。
+  "record.edit.text": "编辑这一句",
+  "record.edit.speaker": "改说话人",
+  "record.edit.rename": "命名/改名…",
+  "record.edit.failed": "编辑失败:{e}",
+  "record.edit.dismiss": "关闭",
+
   // AiStateLabel 无障碍标签
   "record.ai.idle": "AI",
   "record.ai.running": "Aing，正在执行",
@@ -128,6 +136,12 @@ export const en = {
   "record.badge.them": "Them",
   "record.emptyHint": "(Start speaking…)",
   "record.jumpLatest": "↓ Back to latest",
+
+  "record.edit.text": "Edit this line",
+  "record.edit.speaker": "Change speaker",
+  "record.edit.rename": "Name/rename…",
+  "record.edit.failed": "Edit failed: {e}",
+  "record.edit.dismiss": "Dismiss",
 
   "record.ai.idle": "AI",
   "record.ai.running": "Aing, running",

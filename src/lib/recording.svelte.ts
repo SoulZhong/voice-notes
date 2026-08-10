@@ -8,6 +8,7 @@ import {
   onSpeakers,
   onRetract,
   onLevel,
+  onSegmentEdited,
   type Source,
   type SystemAudio,
   type Diarization,
@@ -113,6 +114,13 @@ export const recording = {
         (l) => l.source === e.source && l.start_ms === e.start_ms && l.text === e.text,
       );
       if (idx >= 0) finals = [...finals.slice(0, idx), ...finals.slice(idx + 1)];
+    });
+    // 录制中段编辑落盘成功:后端为唯一真值源,前端不做乐观更新,收到事件才按 seq 改写。
+    onSegmentEdited((e) => {
+      if (e.note_id !== noteId) return;
+      finals = finals.map((l) =>
+        l.seq === e.seq ? { ...l, text: e.text ?? l.text, speaker: e.speaker ?? l.speaker } : l,
+      );
     });
     onStatus((e) => {
       if (e.state === "recording") {

@@ -2,9 +2,17 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { recording } from "$lib/recording.svelte";
+  import { recording, type Line } from "$lib/recording.svelte";
   import { t } from "$lib/i18n/index.svelte";
-  import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
+  import {
+    speakerLabel,
+    speakerColor,
+    speakerInk,
+    speakerIdCompare,
+    editSegment,
+    setSegmentSpeaker,
+    renameSpeaker,
+  } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import {
     modelsStatus,
@@ -184,6 +192,91 @@
   $effect(() => {
     if (!recording.isLive) confirmStop = false;
   });
+
+  // ── 当场纠正:行内编辑文本 / 点行首徽章改派说话人 / 命名改名 ──────────────────
+  // segment_edited 是唯一真值源(见 recording.svelte.ts 订阅),这里不做乐观更新——
+  // 提交后只清本地的"正在编辑"标记,展示的文字/说话人等事件把 finals 改回来。
+  let editingSeq = $state<number | null>(null);
+  let editingText = $state("");
+  let speakerMenuSeq = $state<number | null>(null);
+  let renamingSeq = $state<number | null>(null);
+  let renameText = $state("");
+  let editError = $state("");
+
+  // 录制结束(停止/出错)后清空所有悬浮编辑态,不带着上一场的态出现在下一场。
+  $effect(() => {
+    if (!recording.isLive) {
+      editingSeq = null;
+      speakerMenuSeq = null;
+      renamingSeq = null;
+    }
+  });
+
+  /** keyed each 用 line.seq；「当前句」判定不再依赖 #each 的索引 i。 */
+  const lastFinalSeq = $derived(
+    recording.finals.length ? recording.finals[recording.finals.length - 1].seq : null,
+  );
+  /** 改派菜单只列本场已有说话人——不提供「新说话人」选项(后端会拒 "new",
+      Task 6 审查结论:别让用户在这条路上撞错)。 */
+  const speakerIds = $derived(Object.keys(recording.speakers).sort(speakerIdCompare));
+
+  function beginEdit(line: Line) {
+    speakerMenuSeq = null;
+    editingSeq = line.seq;
+    editingText = line.text;
+  }
+
+  async function commitEdit(line: Line) {
+    const newText = editingText.trim();
+    if (!newText || newText === line.text) {
+      editingSeq = null;
+      return;
+    }
+    try {
+      await editSegment(recording.noteId!, line.seq, line.text, newText);
+      editingSeq = null;
+    } catch (e) {
+      // 后端可能报"录制会话已结束,请重试"或"该笔记正被占用…"这类停录竞态错误——
+      // 如实展示原文,不自动重试(由用户自行判断是否重试)。
+      editError = t("record.edit.failed", { e });
+    }
+  }
+
+  function toggleSpeakerMenu(seq: number) {
+    editingSeq = null;
+    renamingSeq = null;
+    speakerMenuSeq = speakerMenuSeq === seq ? null : seq;
+  }
+
+  async function pickSpeaker(line: Line, speakerId: string) {
+    speakerMenuSeq = null;
+    try {
+      await setSegmentSpeaker(recording.noteId!, line.seq, line.text, speakerId);
+    } catch (e) {
+      editError = t("record.edit.failed", { e });
+    }
+  }
+
+  function beginRename(line: Line) {
+    if (!line.speaker) return; // 未标注说话人(source 兜底"我/对方")没有 id 可改名
+    renamingSeq = line.seq;
+    renameText = recording.speakers[line.speaker]?.name ?? "";
+  }
+
+  /** renamingSeq 卫语句：Escape 已在按键处同步清空 renamingSeq，随后触发的 blur
+      再调本函数会被这层卫语句挡住，不会把取消误提交（同 SpeakerChips 的既有写法）。 */
+  async function commitRename(line: Line) {
+    if (renamingSeq !== line.seq || !line.speaker) return;
+    renamingSeq = null;
+    const name = renameText.trim();
+    if (!name) return;
+    try {
+      await renameSpeaker(recording.noteId!, line.speaker, name);
+      speakerMenuSeq = null;
+    } catch (e) {
+      editError = t("record.edit.failed", { e });
+    }
+  }
 
   onMount(() => {
     refreshModels();
@@ -528,13 +621,79 @@
       <div class="banner">{t("record.banner.storageDegraded")}</div>
     {/if}
 
+    <!-- 当场纠正失败提示:后端停录竞态会报"会话已结束/笔记正被占用"等,原文展示、
+         不自动重试;可手动关闭。 -->
+    {#if editError}
+      <div class="banner banner-danger">
+        {editError}
+        <button class="link" onclick={() => (editError = "")}>{t("record.edit.dismiss")}</button>
+      </div>
+    {/if}
+
     <div class="transcript" class:live={recording.isLive} bind:this={transcriptEl}>
-      {#each recording.finals as line, i}
-        <p class="final" class:current={recording.isLive && !hasPartial && i === recording.finals.length - 1}>
-          <span class="badge" style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}">
-            {speakerLabel(line.speaker, line.source, recording.speakers)}
+      {#each recording.finals as line (line.seq)}
+        <p class="final" class:current={recording.isLive && !hasPartial && line.seq === lastFinalSeq}>
+          <span class="spk-anchor">
+            <button
+              class="badge as-btn"
+              style="background: {speakerColor(line.speaker, line.source, recording.speakers)}; color: {speakerInk(line.speaker, line.source, recording.speakers)}"
+              disabled={!recording.isLive || recording.stopping}
+              title={t("record.edit.speaker")}
+              onclick={() => toggleSpeakerMenu(line.seq)}
+            >{speakerLabel(line.speaker, line.source, recording.speakers)}</button>
+            {#if speakerMenuSeq === line.seq}
+              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
+              <span class="spk-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+                {#each speakerIds as sid (sid)}
+                  <button class="spk-item" role="menuitem" onclick={() => pickSpeaker(line, sid)}>
+                    {speakerLabel(sid, "mic", recording.speakers)}
+                  </button>
+                {/each}
+                {#if line.speaker}
+                  <span class="spk-sep"></span>
+                  {#if renamingSeq === line.seq}
+                    <!-- svelte-ignore a11y_autofocus -->
+                    <input
+                      class="spk-rename-input"
+                      autofocus
+                      bind:value={renameText}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter") commitRename(line);
+                        if (e.key === "Escape") renamingSeq = null;
+                      }}
+                      onblur={() => commitRename(line)}
+                    />
+                  {:else}
+                    <button class="spk-item" role="menuitem" onclick={() => beginRename(line)}>
+                      {t("record.edit.rename")}
+                    </button>
+                  {/if}
+                {/if}
+              </span>
+            {/if}
           </span>
-          {line.text}
+          {#if editingSeq === line.seq}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="edit-inline"
+              autofocus
+              bind:value={editingText}
+              onkeydown={(e) => {
+                if (e.key === "Enter") commitEdit(line);
+                if (e.key === "Escape") editingSeq = null;
+              }}
+              onblur={() => (editingSeq = null)}
+            />
+          {:else}
+            {line.text}
+            {#if recording.isLive && !recording.stopping}
+              <button class="row-act" title={t("record.edit.text")} onclick={() => beginEdit(line)}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M11.3 2.4l2.3 2.3L5.3 13l-3 .7.7-3z" />
+                </svg>
+              </button>
+            {/if}
+          {/if}
         </p>
       {/each}
       {#if recording.partialMic}
@@ -860,6 +1019,112 @@
   .badge.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
   .badge.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
 
+  /* 当场纠正:行首徽章变按钮(点开改派菜单),static 态与 span 视觉一致——border 清空、
+     cursor 指示可点;录制结束/停止中禁用(disabled 由模板判定 isLive && !stopping)。 */
+  .badge.as-btn {
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+  }
+  .badge.as-btn:disabled {
+    cursor: default;
+  }
+  /* 徽章 + 改派菜单的定位锚点:inline-block 让 .spk-menu 精确贴着徽章下缘展开,
+     不受同行后续文字影响。 */
+  .spk-anchor {
+    position: relative;
+    display: inline-block;
+  }
+  /* menu/popover（改派说话人）：DESIGN.md 浮层规范——surface-press 底、hairline 边、
+     radius-lg、shadow-popover，与 SpeakerChips .panel / 详情页 .export-menu 同规格。 */
+  .spk-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 8rem;
+    padding: 0.25rem;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    font-size: 0.85rem;
+    font-weight: 400;
+    cursor: default;
+  }
+  .spk-item {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    color: var(--ink);
+    text-align: left;
+    padding: 0.35rem 0.55rem;
+    border-radius: var(--radius-md);
+    font: inherit;
+    cursor: pointer;
+  }
+  .spk-item:hover {
+    background: var(--surface-soft);
+  }
+  .spk-sep {
+    display: block;
+    height: 1px;
+    background: var(--hairline);
+    margin: 0.2rem 0.1rem;
+  }
+  .spk-rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.35rem 0.55rem;
+    background: transparent;
+    border: none;
+    outline: none;
+    font: inherit;
+    color: var(--ink);
+  }
+
+  /* 段落文本行内编辑:与徽章齐平，覆盖当前段文字的量 */
+  .edit-inline {
+    width: min(100%, 32rem);
+    font: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-sm);
+    padding: 0.1em 0.4em;
+  }
+
+  /* 行级操作(编辑铅笔):悬停显影惯例(DESIGN.md #6)——默认隐身，行 hover 或
+     自身 focus-visible 时浮现，保持转写区安静。 */
+  .row-act {
+    visibility: hidden;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    width: 1.5rem;
+    height: 1.5rem;
+    margin-left: 0.2em;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--ink-faint);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .final:hover .row-act,
+  .row-act:focus-visible {
+    visibility: visible;
+  }
+  .row-act:hover {
+    color: var(--accent);
+    background: var(--surface-soft);
+  }
+
   /* 「回到最新」药丸：零高锚点 + sticky bottom，钉在滚动视口底部居中，
      不占版面高度、不遮转写。flex-end 让按钮底边贴锚点线向上生长——不能用
      translateY(-100%)：零高容器的默认 stretch 会把按钮使用高度压成 0，
@@ -910,5 +1175,11 @@
     margin-top: 0.4rem;
     padding-top: 0.4rem;
     border-top: 1px solid var(--warning-line);
+  }
+  /* 错误横幅换 danger 色系(当场纠正失败:后端停录竞态报错原样展示) */
+  .banner.banner-danger {
+    background: var(--danger-tint);
+    border-color: var(--danger-line);
+    color: var(--danger-ink);
   }
 </style>
