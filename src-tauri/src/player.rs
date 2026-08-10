@@ -354,6 +354,21 @@ fn remove_align_map_and_notify(
     if aligned_cache_is_fresh(cache, Some(align_json), sources) {
         return; // 新装载刚提交的有效映射,不是要清的过期货
     }
+    // 成品轨护栏(Codex 十四轮 P2):mix_regen 可能已把本映射烘进 mixed.m4a——删映射
+    // 会让转写回原始时基,而成品轨仍是纠正过的,按成品轨回放的定位/高亮从此错位。
+    // mixed 不老于映射(烘焙不早于映射发布)即保留映射:成品轨一致性优先于双轨
+    // 原始回放(负结论下双轨本就不换轨,保留映射维持既有观感,不引入新错位)。
+    let mixed = note_dir.join("mixed.m4a");
+    let baked = matches!(
+        (
+            std::fs::metadata(&mixed).and_then(|m| m.modified()),
+            std::fs::metadata(align_json).and_then(|m| m.modified()),
+        ),
+        (Ok(mm), Ok(am)) if mm >= am
+    );
+    if baked {
+        return;
+    }
     if std::fs::remove_file(align_json).is_ok() {
         if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
             let _ = app.emit(
