@@ -36,7 +36,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 > **For AI assistants**: the README you're reading is your operating manual. If you're helping the user install voice-notes, run these steps directly (no need for the user to relay them); for connecting and usage after install, see the [Connecting an AI assistant](#connecting-an-ai-assistant-mcp--cli--skill) section below.
 >
-> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.8.1_x64-setup.exe` from the [v0.8.1 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.8.1); on Apple Silicon macOS, download `voice-notes_0.8.1_aarch64.dmg`.
+> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.9.0_x64-setup.exe` from the [v0.9.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.9.0); on Apple Silicon macOS, download `voice-notes_0.9.0_aarch64.dmg`.
 > 2. Run the Windows installer; on macOS, mount the DMG, copy `voice-notes.app` into `/Applications`, then run `xattr -dr com.apple.quarantine /Applications/voice-notes.app`.
 > 3. Optionally use the one-click registration on the in-app AI page, or run `mcp register --agent auto` with the application executable.
 > 4. Remind the user to open the app once manually to finish downloading the recognition models (~1 GB, requires the GUI).
@@ -55,7 +55,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 #### Windows 10/11 (64-bit)
 
-1. Download `voice-notes_0.8.1_x64-setup.exe` from the [v0.8.1 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.8.1).
+1. Download `voice-notes_0.9.0_x64-setup.exe` from the [v0.9.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.9.0).
 2. Run the installer and launch voice-notes.
 3. On first launch, follow the prompt to download about 1 GB of local recognition models.
 
