@@ -1758,6 +1758,16 @@ fn spawn_session(
                     let (r, e) = start.handle.stop();
                     stash_model(&recognizer_cache, r);
                     stash_model(&embedder_cache, e);
+                    // 镜像上方 Fix A 拆除路径与正常停止路径(do_stop_teardown 里
+                    // `for j in s.audio_joins` 那段)的 join:分段 worker 已随
+                    // handle.stop() join → audio sink 已 drop → 写盘线程排干无界队列后
+                    // 自退,这里 join 等它们真正退出,确保文件句柄已关闭——这条兄弟拆除
+                    // 路径同样可能撞上 Windows 上删不掉的孤儿目录。audio_joins 此刻仍属
+                    // 本函数所有(直到下方成功路径才移交进 ActiveSession),可安全消费,
+                    // 于是本函数内两条 abort 路径与正常停止路径三处共守同一 join 不变式。
+                    for j in audio_joins {
+                        let _ = j.join();
+                    }
                     // 被 stop/新 start(/resume) 抢先:经信箱 abort——有内容则收尾保全
                     // (flush 失败时留 recording)。排干的 finals 先于本条入队,不丢内容。
                     // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
@@ -6449,8 +6459,14 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 /// 状态机出现 running=false 但 session 槽未及时清空的窗口,也不至于删正在使用的笔记的音频)。
 /// 这与 `reject_if_active`(单笔记编辑命令按 note_id 拒绝活动笔记)同源:那边有具体 note_id
 /// 可比对,这边是批量清理、无单一 note_id,故退化为「跳过 == session 槽笔记」的防御性比对。
-#[tauri::command]
-fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u32>) -> Result<u64, String> {
+///
+/// 清理本体,`purge_audio` 命令与启动期音频保留期自动清理(见 setup 内
+/// `tauri::async_runtime::spawn`)共用同一实现,防两处漂移。`older_than_days` 为
+/// `None` 时清理全部已完成笔记的音频(命令原语义,前端传 `null` 触发);`Some(d)`
+/// 时只清理 `d` 天前的。活动笔记豁免(上文两段注释所述的 session 槽比对 + `migrate_guard`
+/// 的 running 检查)对两个调用方一体生效——自动清理绝不会碰正在录制的笔记。
+fn purge_audio_older_than(app: &AppHandle, older_than_days: Option<u32>) -> Result<u64, String> {
+    let state = app.state::<AppState>();
     migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
     let _reset = ResetOnDrop(state.download_running.clone());
     state.transcode.pause_and_wait();
@@ -6459,7 +6475,7 @@ fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u
     let cutoff = older_than_days
         .map(|d| (chrono::Local::now() - chrono::Duration::days(d as i64)).to_rfc3339());
     let active_id = state.session.lock().unwrap().as_ref().map(|s| s.note_id.clone());
-    let notes = notes_dir(&app).map_err(|e| e.to_string())?;
+    let notes = notes_dir(app).map_err(|e| e.to_string())?;
     let Ok(rd) = std::fs::read_dir(&notes) else {
         return Ok(0);
     };
@@ -6476,6 +6492,11 @@ fn purge_audio(app: AppHandle, state: State<AppState>, older_than_days: Option<u
         freed += store::disk::purge_note_audio(&note_dir);
     }
     Ok(freed)
+}
+
+#[tauri::command]
+fn purge_audio(app: AppHandle, older_than_days: Option<u32>) -> Result<u64, String> {
+    purge_audio_older_than(&app, older_than_days)
 }
 
 /// 设置页保存快捷键后调用:按最新设置(重)注册。失败时把 shortcut_enabled 写回 false
@@ -6938,6 +6959,19 @@ pub fn run() {
             }
             // UDS listener:MCP stdio 进程的活能力后端(状态/实时/控制)。
             mcp::uds::spawn_listener(handle.clone());
+            // 音频自动保留期(spec §5):到期笔记仅清音频轨,转写/精修稿永留。启动后台跑一次,
+            // 失败仅打日志(容量治理是增值层,绝不挡启动)。录制中笔记天然不在清理范围——
+            // 复用 purge_audio 命令的同一份实现 purge_audio_older_than,其活动笔记豁免
+            // (session 槽比对 + migrate_guard 的 running 检查)对自动路径同样生效。
+            if let Some(days) = s.audio_retention.days() {
+                let app2 = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    match purge_audio_older_than(&app2, Some(days)) {
+                        Ok(freed) => eprintln!("音频保留期清理完成: 释放 {freed} 字节(>{days} 天)"),
+                        Err(e) => eprintln!("音频保留期清理失败(不影响使用): {e}"),
+                    }
+                });
+            }
             telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })

@@ -307,10 +307,8 @@ pub enum AudioRetention {
 }
 
 impl AudioRetention {
-    /// 保留天数;Forever = None(永不清理)。
-    /// #[allow(dead_code)]:本任务(Task 1)只加字段/枚举地基,尚无消费者调用此方法做
-    /// 实际清理判定——留给后续接线音频保留期清理逻辑的任务,届时移除本 allow。
-    #[allow(dead_code)]
+    /// 保留天数;Forever = None(永不清理)。启动后台清理任务(lib.rs setup 内)据此
+    /// 判定是否需要跑一次 `purge_audio_older_than`。
     pub fn days(self) -> Option<u32> {
         match self {
             Self::Forever => None,
