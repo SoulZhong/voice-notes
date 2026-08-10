@@ -78,7 +78,10 @@
         // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
         if (gen !== loadGen) throw SUPERSEDED;
         const total = await invoke<number>("player_load", { tracks: payload });
-        if (gen === loadGen) onLoaded?.();
+        // invoke 期间换代/卸载(后端 player_stop 已作废在途装载,但本地也要拒绝:
+        // 排队的 play/seek 不得对导航后的新状态开火)。
+        if (gen !== loadGen) throw SUPERSEDED;
+        onLoaded?.();
         return total;
       })();
       loadChain = p.catch(() => {});

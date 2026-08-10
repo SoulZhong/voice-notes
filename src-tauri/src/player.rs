@@ -787,6 +787,10 @@ pub fn player_set_muted(state: State<'_, PlayerHandle>, source: String, muted: b
 
 #[tauri::command]
 pub fn player_stop(state: State<'_, PlayerHandle>) -> Result<(), String> {
+    // 停止=清空播放意图,同时推进装载代次让**在途装载**过期(Codex P1):组件销毁后
+    // 只清流不作废代次的话,仍在解码/对齐中的装载完成时会复活流+重装内核,排队的
+    // play 还会对已离开的笔记开火。推进代次后它们在发布段被拦下,自行返回「已取代」。
+    state.begin_load();
     stop_stream(&state);
     Ok(())
 }
