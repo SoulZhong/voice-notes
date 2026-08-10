@@ -1199,4 +1199,58 @@ mod tests {
         assert!(!needs_heal(tmp.path()), "干净新格式文件不应触发无谓的自愈重写");
     }
 
+    /// 双尸检回归(2026-08-10 二审 Important):setup 旧写法是先纯 `load(d)` 拿 `s`(坏文件
+    /// 在这一步就当场写一具 `settings.json.corrupt-*` 尸体),再 `if needs_heal { update(d,
+    /// |_|{}) }`——`update` 内部又对同一份坏文件重新 `load` 一次,再写第二具尸体。一次启动
+    /// 堵出两具尸检,而磁盘上其实只坏了一份文件。lib.rs setup 现已改为:先探测 `needs_heal`
+    /// (纯 `from_str`,不写盘),为真时才用 `update` 的返回值直接当 `s`(那一次 `update`
+    /// 内部的 `load` 就是唯一一次可能写尸检的 load);为假则直接 `load`,全程不落盘。
+    /// setup 本身不可单测,这里在 settings.rs 层复刻同样的探测→按需 update→(否则)load 顺序,
+    /// 断言全程只堵出一具尸体。
+    #[test]
+    fn heal_first_flow_probe_then_update_produces_exactly_one_corpse() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"audio_scheme":123,"dashscope_api_key":"sk-live","theme":"dark"}"#,
+        )
+        .unwrap();
+
+        let corpse_names = |dir: &Path| -> std::collections::HashSet<std::ffi::OsString> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .filter(|n| n.to_string_lossy().starts_with("settings.json.corrupt-"))
+                .collect()
+        };
+
+        // 复刻 lib.rs setup 改后的顺序:先探测,为真才 update(拿它的返回值当 s),否则纯 load。
+        let s = if needs_heal(tmp.path()) {
+            update(tmp.path(), |_| {}).unwrap_or_else(|_| load(tmp.path()))
+        } else {
+            load(tmp.path())
+        };
+
+        assert_eq!(s.theme, "dark", "自愈不得丢好字段");
+        assert_eq!(s.dashscope_api_key, "sk-live", "自愈不得丢凭证等好字段");
+        assert!(!needs_heal(tmp.path()), "自愈落盘后不应再判定需要愈合");
+
+        let corpses = corpse_names(tmp.path());
+        assert_eq!(
+            corpses.len(),
+            1,
+            "先探测再按需 update 应只堵出一具尸体(旧的 load-then-heal 顺序会堵出两具): {corpses:?}"
+        );
+
+        // 后续启动(文件已干净)再走同样的流程,不应新增尸体。
+        let before = corpses;
+        let _ = if needs_heal(tmp.path()) {
+            update(tmp.path(), |_| {}).unwrap_or_else(|_| load(tmp.path()))
+        } else {
+            load(tmp.path())
+        };
+        assert_eq!(before, corpse_names(tmp.path()), "文件已干净的后续启动不应再新增尸体");
+    }
+
 }

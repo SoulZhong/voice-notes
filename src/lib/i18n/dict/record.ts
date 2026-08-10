@@ -34,7 +34,7 @@ export const zh = {
   "record.banner.btEcho": "蓝牙耳机延迟可能影响回声消除效果，建议改用有线耳机或内置扬声器。",
   "record.banner.lowInput": "麦克风输入音量偏低（{vol}%），可能录得很轻。",
   "record.banner.setVolume": "调到 {target}%",
-  "record.banner.screenPerm": "系统声音未授权：只能录到麦克风，对方/外放的声音不会进笔记。",
+  "record.banner.screenPerm": "无该权限无法开始录制（会议笔记需同时录制系统声音），请授权后重试。",
   "record.banner.authorizeNow": "立即授权",
   "record.banner.screenPermHint": "系统设置里勾选 voice-notes 后切回本页即可。",
   "record.banner.permFix": "系统设置里已勾选却仍提示未授权？多半是旧版本的授权记录残留，开关是失效的。",
@@ -96,7 +96,7 @@ export const en = {
   "record.banner.lowInput": "Microphone input volume is low ({vol}%); the recording may be very quiet.",
   "record.banner.setVolume": "Set to {target}%",
   "record.banner.screenPerm":
-    "System audio not authorized: only your microphone will be recorded; the other side's / speaker audio won't make it into notes.",
+    "Recording can't start without this permission (meeting notes require system audio too); please authorize and try again.",
   "record.banner.authorizeNow": "Authorize now",
   "record.banner.screenPermHint": "Check voice-notes in System Settings, then switch back to this page.",
   "record.banner.permFix":

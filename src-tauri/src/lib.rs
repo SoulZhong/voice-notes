@@ -6465,6 +6465,10 @@ fn audio_disk_usage(app: AppHandle) -> Result<u64, String> {
 /// `None` 时清理全部已完成笔记的音频(命令原语义,前端传 `null` 触发);`Some(d)`
 /// 时只清理 `d` 天前的。活动笔记豁免(上文两段注释所述的 session 槽比对 + `migrate_guard`
 /// 的 running 检查)对两个调用方一体生效——自动清理绝不会碰正在录制的笔记。
+/// 以上豁免只覆盖本进程的 `AppState`:另一个共享同一数据目录的应用实例仍可能正在
+/// 转写/补生成/续录某个笔记(全程持 `NoteLock`)。因此逐笔记清理时还要非阻塞探锁
+/// (`store::disk::purge_note_audio_if_unlocked`),拿不到就跳过该笔记,不计入 freed——
+/// 与启动扫描、转码 worker 的探锁语义一致。
 fn purge_audio_older_than(app: &AppHandle, older_than_days: Option<u32>) -> Result<u64, String> {
     let state = app.state::<AppState>();
     migrate_guard(&state.running, &state.download_running, &state.retranscribing, &state.mixed_regen)?;
@@ -6486,10 +6490,14 @@ fn purge_audio_older_than(app: &AppHandle, older_than_days: Option<u32>) -> Resu
             continue;
         }
         let is_active = active_id.as_deref() == note_dir.file_name().and_then(|n| n.to_str());
-        if is_active || !store::disk::should_purge(&note_dir, cutoff.as_deref()) {
+        if is_active {
             continue;
         }
-        freed += store::disk::purge_note_audio(&note_dir);
+        // 跨进程互斥探锁 + should_purge 判定 + 实际清理三者一体,见
+        // store::disk::purge_note_audio_if_unlocked 顶部注释:本进程的活动笔记豁免(上面
+        // 的 is_active)只覆盖本进程,另一实例可能正持 NoteLock 在转写/补生成/续录同一
+        // 笔记,该函数内部非阻塞探锁,拿不到就整笔记跳过(不计入 freed),不与它相撞。
+        freed += store::disk::purge_note_audio_if_unlocked(&note_dir, cutoff.as_deref());
     }
     Ok(freed)
 }
@@ -6853,20 +6861,22 @@ pub fn run() {
             }
             // 镜像前缀已随三删一藏改为编译期常量(settings::MIRROR_PREFIX),不再有
             // mirror_prefix 字段可迁移——一次性 migrate_mirror_prefix 启动调用随之删除。
-            let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
-            // 启动一次性自愈(2026-08-10 review Important:堵尸检累积回归):上面这行
-            // `load` 只在内存里 salvage/迁移损坏或旧格式文件,从不回写磁盘——纯 load
-            // 调用链路里没有别处会把结果落盘。若不补这一步,同一份坏 settings.json
-            // 每次启动都会重新触发"整体解析失败→尸检备份",在 app_data 目录里无限
-            // 累积 `settings.json.corrupt-*` 尸体,旧键也永远学不会离开磁盘。用
-            // `needs_heal` 探测是否真的需要(全新安装/已是干净新格式都不触发),需要时
-            // 一次性 `update(&d, |_| {})` 走 load→save round-trip 落盘,下次启动即可
-            // 直接解析干净版本,不再新增尸体。详见 settings::needs_heal 文档。
-            if let Some(dir) = &app_data {
-                if settings::needs_heal(dir) {
-                    let _ = settings::update(dir, |_| {});
-                }
-            }
+            //
+            // 启动一次性自愈(2026-08-10 review Important:堵尸检累积回归 → 同日二审 Important:
+            // 堵双尸检回归):先前的写法是先 `load(d)` 拿 `s`,再 `if needs_heal { update(d, |_|{}) }`
+            // ——`load` 对坏文件会当场写一具 `settings.json.corrupt-*` 尸体,而 `update` 内部
+            // 又会重新 `load` 同一份坏文件,再写第二具尸体,一次启动堵出两具。改为:先探测
+            // `needs_heal`(纯 `from_str`,不写盘,见 settings::needs_heal 文档),只有它为 true
+            // 时才走一次 `load→save` round-trip(`update`),并直接拿 `update` 返回的落盘快照
+            // 当 `s` 用——那一次 `load` 就是产出尸检文件的唯一一次,不再另起一次探测性 load。
+            // 探测为 false(全新安装/已是干净新格式)则直接 `load`,全程不落盘也不产生尸体。
+            // `update` 失败(权限/IO 等极端情况)保底退回纯 `load`,行为不劣于旧代码。
+            let s = match &app_data {
+                Some(dir) if settings::needs_heal(dir) => settings::update(dir, |_| {})
+                    .unwrap_or_else(|_| settings::load(dir)),
+                Some(dir) => settings::load(dir),
+                None => settings::Settings::default(),
+            };
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
