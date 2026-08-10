@@ -6965,7 +6965,7 @@ pub fn run() {
             // (session 槽比对 + migrate_guard 的 running 检查)对自动路径同样生效。
             if let Some(days) = s.audio_retention.days() {
                 let app2 = handle.clone();
-                tauri::async_runtime::spawn(async move {
+                tauri::async_runtime::spawn_blocking(move || {
                     match purge_audio_older_than(&app2, Some(days)) {
                         Ok(freed) => eprintln!("音频保留期清理完成: 释放 {freed} 字节(>{days} 天)"),
                         Err(e) => eprintln!("音频保留期清理失败(不影响使用): {e}"),
