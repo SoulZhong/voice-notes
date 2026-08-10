@@ -197,6 +197,9 @@ fn abort_owned(mut o: Owned) {
 fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
     match op {
         PipelineOp::Final { source, text, start_ms, end_ms, speaker, rms } => {
+            // append 前读 next_seq 即本段将被分配的 seq：actor 单线程串行，
+            // 读取与 append 之间无并发写入，成功/降级两条路径下都成立。
+            let seq = owned.writer.next_seq();
             // 不丢内容优先：先落盘（失败进待写队列），再通知 UI。
             match owned
                 .writer
@@ -218,7 +221,7 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
             }
             let _ = app.emit(
                 "final",
-                crate::ipc::FinalEvent { source, text, start_ms, end_ms, speaker },
+                crate::ipc::FinalEvent { seq, source, text, start_ms, end_ms, speaker },
             );
         }
         PipelineOp::Diar(ev) => match ev {

@@ -233,6 +233,12 @@ impl NoteWriter {
         &self.meta.id
     }
 
+    /// 下一段将被分配的 seq。actor 在 append_final 前读取即得本段 seq
+    /// (actor 单线程串行,读取与 append 之间无并发写入)。
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// 续录时间轴偏移量（create 路径恒 0，resume 路径 = 续录前最大 end_ms）。
     pub fn base_ms(&self) -> u64 {
         self.base_ms
@@ -707,6 +713,19 @@ mod tests {
             load_meta(tmp.path(), w3.note_id()).title,
             format!("{base} 3")
         );
+    }
+
+    /// actor 在 append_final 前读 next_seq 作为本段 seq 并随 FinalEvent 透传;
+    /// 该值必须等于落盘记录里的 seq。
+    #[test]
+    fn next_seq_previews_the_seq_append_will_assign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        assert_eq!(w.next_seq(), 0);
+        w.append_final("mic", "第一句", 0, 900, None, None).unwrap();
+        assert_eq!(w.next_seq(), 1);
+        let content = std::fs::read_to_string(w.dir().join("segments.jsonl")).unwrap();
+        assert!(content.contains("\"seq\":0"), "{content}");
     }
 
     fn load_meta(root: &std::path::Path, id: &str) -> NoteMeta {

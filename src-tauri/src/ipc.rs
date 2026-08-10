@@ -32,6 +32,8 @@ pub struct LevelEvent {
 /// 一句定稿文本，事件名 "final"。
 #[derive(Debug, Clone, Serialize)]
 pub struct FinalEvent {
+    /// 磁盘段 seq(跨续录单调唯一),录制中段编辑的寻址锚点。
+    pub seq: u64,
     pub source: String, // "mic" | "system"
     pub text: String,
     /// 相对该源流开始的毫秒（≈会议开始；双源起点存在毫秒级偏差，

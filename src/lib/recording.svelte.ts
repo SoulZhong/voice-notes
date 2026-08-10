@@ -15,8 +15,9 @@ import {
 } from "./events";
 import { getNote, resumeRecording } from "./notes";
 
-/** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。 */
-export type Line = { source: Source; text: string; speaker: string | null; start_ms: number };
+/** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。
+ * seq:磁盘段 seq,录制中段编辑的寻址锚点。 */
+export type Line = { seq: number; source: Source; text: string; speaker: string | null; start_ms: number };
 export type SpeakerMap = Record<
   string,
   { name: string; sources: string[]; person_id?: string | null }
@@ -102,7 +103,7 @@ export const recording = {
     });
     onFinal((e) => {
       if (e.text.trim())
-        finals = [...finals, { source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
+        finals = [...finals, { seq: e.seq, source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
       if (e.source === "mic") partialMic = "";
       else partialSystem = "";
     });
@@ -245,7 +246,7 @@ export const recording = {
     try {
       // getNote 失败：不灌注、不置 resuming，原样冒泡为 error 状态。
       const note = await getNote(noteId_);
-      finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
+      finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
       speakers = { ...note.speakers };
       noteId = noteId_;
       resuming = true;
@@ -314,7 +315,7 @@ async function hydrateFromDisk(id: string) {
   if (!id) return;
   try {
     const note = await getNote(id);
-    finals = note.segments.map((s) => ({ source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
+    finals = note.segments.map((s) => ({ seq: s.seq, source: s.source, text: s.text, speaker: s.speaker, start_ms: s.start_ms }));
     speakers = { ...note.speakers };
   } catch {
     // 水合失败仅影响历史段回显，不阻塞录制状态重建。

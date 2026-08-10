@@ -5,6 +5,7 @@ export type SystemAudio = "on" | "denied" | "unavailable" | "";
 
 export type PartialEvent = { source: Source; text: string };
 export type FinalEvent = {
+  seq: number;
   source: Source;
   text: string;
   start_ms: number;
