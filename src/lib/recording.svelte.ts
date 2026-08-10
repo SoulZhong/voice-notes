@@ -15,6 +15,7 @@ import {
   type StatusEvent,
 } from "./events";
 import { getNote, resumeRecording } from "./notes";
+import { hasSeq } from "./liveView";
 
 /** start_ms:回声撤回按 (source, start_ms, text) 精确定位行,展示层不消费。
  * seq:磁盘段 seq,录制中段编辑的寻址锚点。 */
@@ -103,7 +104,10 @@ export const recording = {
       else partialSystem = e.text;
     });
     onFinal((e) => {
-      if (e.text.trim())
+      // 水合快照与在途事件竞态:后端先落盘后 emit，hydrateFromDisk（冷刷新对账/续录已灌注历史的
+      // "已在录制"分支）读到的磁盘快照可能已含此段，该段 final 事件随后又抵达一次——按 seq 去重，
+      // 否则重复 append 会撞出重复 seq，keyed each (line.seq) 在 dev 下直接崩页。
+      if (e.text.trim() && !hasSeq(finals, e.seq))
         finals = [...finals, { seq: e.seq, source: e.source, text: e.text, speaker: e.speaker, start_ms: e.start_ms }];
       if (e.source === "mic") partialMic = "";
       else partialSystem = "";

@@ -448,7 +448,10 @@
       if (e.deltaY < 0 && recording.isLive && sc.scrollHeight > sc.clientHeight + 4) follow = false;
     };
     const onScroll = () => {
-      if (sc.scrollHeight - sc.scrollTop - sc.clientHeight <= BOTTOM_SLOP) follow = true;
+      // 回看态(reviewActive)下 follow 由下方边沿 effect 专管：过滤/搜索命中收紧会隐藏行，
+      // scrollHeight 收缩触发浏览器钳制 scrollTop，落入贴底判定带——这是布局副作用，不是
+      // 用户主动划回底部的意图，scroll 事件在此不得抢跑把 follow 重新打开。
+      if (!reviewActive && sc.scrollHeight - sc.scrollTop - sc.clientHeight <= BOTTOM_SLOP) follow = true;
     };
     sc.addEventListener("wheel", onWheel, { passive: true });
     sc.addEventListener("scroll", onScroll, { passive: true });

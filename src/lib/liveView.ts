@@ -18,6 +18,12 @@ export function matchesSpeakerFilter(
   return selected.size === 0 || (line.speaker !== null && selected.has(line.speaker));
 }
 
+/** finals 是否已含该 seq——水合快照(hydrateFromDisk)与在途 final 事件的竞态去重判定：
+ * 后端先落盘后 emit，冷刷新/对账读到的磁盘快照可能已含某段，该段事件随后又抵达一次。 */
+export function hasSeq(lines: { seq: number }[], seq: number): boolean {
+  return lines.some((l) => l.seq === seq);
+}
+
 export function nearestIndexByMs(lines: { start_ms: number }[], targetMs: number): number {
   let best = -1;
   let bestD = Infinity;

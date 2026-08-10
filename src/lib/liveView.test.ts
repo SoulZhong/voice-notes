@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchesSpeakerFilter, nearestIndexByMs, searchHits } from "./liveView";
+import { hasSeq, matchesSpeakerFilter, nearestIndexByMs, searchHits } from "./liveView";
 
 describe("searchHits", () => {
   const lines = [{ text: "预算下周对齐" }, { text: "Budget 已批" }, { text: "无关" }];
@@ -19,6 +19,14 @@ describe("matchesSpeakerFilter", () => {
     expect(matchesSpeakerFilter({ speaker: "S1" }, new Set(["S1", "S2"]))).toBe(true);
     expect(matchesSpeakerFilter({ speaker: "S3" }, new Set(["S1"]))).toBe(false);
     expect(matchesSpeakerFilter({ speaker: null }, new Set(["S1"]))).toBe(false);
+  });
+});
+
+describe("hasSeq", () => {
+  it("已含该 seq 判 true;空数组/不含判 false", () => {
+    expect(hasSeq([{ seq: 1 }, { seq: 2 }], 2)).toBe(true);
+    expect(hasSeq([{ seq: 1 }], 3)).toBe(false);
+    expect(hasSeq([], 5)).toBe(false);
   });
 });
 
