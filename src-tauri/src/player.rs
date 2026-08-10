@@ -312,10 +312,27 @@ fn write_align_skip_marker(note_dir: &Path) {
     }
 }
 
+/// 对齐产物(align.json/对齐音轨)的写与删共用的进程级串行锁:代次门是快照判断,
+/// 判断与动作之间线程可能被挂起任意久——同一笔记重叠装载下,过期装载可能删掉新装载
+/// 刚提交的有效映射(Codex 八轮)。写(commit_aligned)与删(下方)都持本锁,删除前
+/// 在锁内复验缓存新鲜度,两侧任一次序都保住有效映射。
+static ALIGN_FS_LOCK: Mutex<()> = Mutex::new(());
+
 /// 移除过期正映射并通知详情页重拉(负结论路径共用):align.json 在负结论下只会让
-/// notes 读路径的转写时间戳与原始轨回放错位。文件不存在则两者皆不做(无谓刷新)。
+/// notes 读路径的转写时间戳与原始轨回放错位。持 ALIGN_FS_LOCK 并复验——正缓存已被
+/// 重叠的新装载变新鲜(有效映射)则放弃删除;只清确凿过期的映射。
 /// drift_ms=0 语义为「映射移除,回到原始时基」,消费方只按 note_id refresh。
-fn remove_align_map_and_notify(app: &AppHandle, note_dir: &Path, align_json: &Path) {
+fn remove_align_map_and_notify(
+    app: &AppHandle,
+    note_dir: &Path,
+    align_json: &Path,
+    cache: &Path,
+    sources: &[&Path],
+) {
+    let _fs = ALIGN_FS_LOCK.lock().unwrap();
+    if aligned_cache_is_fresh(cache, Some(align_json), sources) {
+        return; // 新装载刚提交的有效映射,不是要清的过期货
+    }
     if std::fs::remove_file(align_json).is_ok() {
         if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
             let _ = app.emit(
@@ -380,6 +397,8 @@ fn commit_aligned(
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
+    // 与删除侧同锁(见 ALIGN_FS_LOCK):映射发布不被过期装载的清理穿插。
+    let _fs = ALIGN_FS_LOCK.lock().unwrap();
     if let Err(e) = crate::store::align::write(note_dir, map) {
         eprintln!("回放对齐: 映射落盘失败({e}),本次不对齐(下次装载重试)");
         return false;
@@ -435,7 +454,7 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):同一笔记两次装载重叠时,过期装载不得删新装载
             // 可能刚提交的有效映射——只有仍是最新代次才有资格做对齐副作用。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json);
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
             }
             return;
         }
@@ -505,7 +524,7 @@ async fn align_mic_track(
             // 代次门(Codex 五轮 P1):过期装载的负结论可能晚于新装载的有效提交抵达,
             // 无差别删除会拆掉新映射;过期即放弃副作用(标记写入另有 mtime 快照门)。
             if state.is_current(gen) {
-                remove_align_map_and_notify(app, note_dir, &align_json);
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
             }
             return;
         };
