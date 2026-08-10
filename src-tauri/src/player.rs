@@ -188,6 +188,14 @@ impl PlayerHandle {
     }
 }
 
+/// player_load 的返回:总长之外带回本次装载的后端代次——前端 cleanup 用它做
+/// **条件停止**(ifGen):旧组件迟到的 stop 不得作废新组件的装载(Codex 十轮 P1)。
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadResult {
+    pub total_ms: u64,
+    pub gen: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoadTrack {
     pub path: String,
@@ -557,7 +565,7 @@ pub async fn player_load(
     app: AppHandle,
     state: State<'_, PlayerHandle>,
     tracks: Vec<LoadTrack>,
-) -> Result<u64, String> {
+) -> Result<LoadResult, String> {
     // 入口取号+拆除同锁原子(Codex 九轮 P1):取号与拆除若分离,老装载在取号后挂起、
     // 新装载已发布的情形下,老装载恢复后的无差别拆除会拆掉新核。锁内成对后,取号时刻
     // 本代次必为最新、锁内拆到的只可能是旧核;发布段与 player_stop 共用同一把锁定序。
@@ -703,7 +711,7 @@ pub async fn player_load(
         stop_stream(&state);
         return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
     }
-    Ok((total_samples as f64 / SRC_RATE * 1000.0) as u64)
+    Ok(LoadResult { total_ms: (total_samples as f64 / SRC_RATE * 1000.0) as u64, gen })
 }
 
 /// 起输出流线程:线程独占 !Send 的 cpal Stream,兼任 200ms 位置事件发射;
@@ -818,13 +826,21 @@ pub fn player_set_muted(state: State<'_, PlayerHandle>, source: String, muted: b
 }
 
 #[tauri::command]
-pub fn player_stop(state: State<'_, PlayerHandle>) -> Result<(), String> {
+pub fn player_stop(state: State<'_, PlayerHandle>, if_gen: Option<u64>) -> Result<(), String> {
     // 停止=清空播放意图,同时推进装载代次让**在途装载**过期(Codex P1):组件销毁后
     // 只清流不作废代次的话,仍在解码/对齐中的装载完成时会复活流+重装内核,排队的
     // play 还会对已离开的笔记开火。推进代次后它们在发布段被拦下,自行返回「已取代」。
     // 取号+拆除进 publish 锁(Codex 九轮 P1):挂起在两步之间的 stop 恢复后不得拆掉
     // 后续装载已发布的核——锁内成对 + 发布段同锁,定序即正确。
+    // if_gen 归属条件(Codex 十轮 P1):旧组件 fire-and-forget 的 stop 可能晚于新组件
+    // 的装载执行——带上自己最后一次成功装载的代次,后端代次已前进(有更新意图)就
+    // no-op,不作废别人的装载;不带条件(None)保留无条件停止语义(显式全停场景)。
     let _publish = state.publish.lock().unwrap();
+    if let Some(g) = if_gen {
+        if !state.is_current(g) {
+            return Ok(());
+        }
+    }
     state.begin_load();
     stop_stream(&state);
     Ok(())

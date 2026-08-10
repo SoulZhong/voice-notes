@@ -57,6 +57,10 @@
   /** 过期装载的取消哨兵:排队中的 play/seek 链在 catch 里识别后静默复位(playing
    * 回 false),不当错误上报——它不是故障,只是用户切走了。 */
   const SUPERSEDED = "player-load-superseded";
+  /** 本实例最后一次成功装载的**后端**代次:cleanup 的条件停止(ifGen)用——旧组件
+   * fire-and-forget 的 stop 可能晚于新组件的装载执行,带条件后后端代次已前进就
+   * no-op,不作废别人的装载(Codex 十轮 P1)。 */
+  let lastBackendGen: number | null = null;
   $effect(() => {
     trackErrors = [];
     if (tracks.length === 0) {
@@ -77,18 +81,23 @@
         // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
         // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
         if (gen !== loadGen) throw SUPERSEDED;
-        const total = await invoke<number>("player_load", { tracks: payload }).catch((e) => {
+        const res = await invoke<{ total_ms: number; gen: number }>("player_load", { tracks: payload }).catch((e) => {
           // 后端代次门的拒绝统一折算成取消哨兵(Codex P2):凡 invoke 失败且本地已
           // 换代,必是切换导致的取代而非故障——不按本地化文案匹配,按换代事实判定;
           // 否则排队的 play 会把「已取代」当播放错误刷进新轨的 UI。
           if (gen !== loadGen) throw SUPERSEDED;
           throw e;
         });
-        // invoke 期间换代/卸载(后端 player_stop 已作废在途装载,但本地也要拒绝:
-        // 排队的 play/seek 不得对导航后的新状态开火)。
-        if (gen !== loadGen) throw SUPERSEDED;
+        // invoke 期间换代/卸载:后端已发布(装载成功)但本实例意图已作废——发条件
+        // 停止回收自己刚发布的核(代次已被更新者接管则 no-op),本地拒绝让排队的
+        // play/seek 不对导航后的新状态开火。
+        if (gen !== loadGen) {
+          void invoke("player_stop", { ifGen: res.gen }).catch(() => {});
+          throw SUPERSEDED;
+        }
+        lastBackendGen = res.gen;
         onLoaded?.();
-        return total;
+        return res.total_ms;
       })();
       loadChain = p.catch(() => {});
       p.then(
@@ -113,7 +122,12 @@
       // 在切笔记后才进入后端、掐掉新页面刚起的播放(2026-08-10 排障)。
       loadGen++;
       loadPromise = null;
-      void invoke("player_stop").catch(() => {});
+      // 条件停止(Codex 十轮 P1):只回收**自己**最后一次成功装载的核——迟到的
+      // 本 stop 若发现后端代次已前进(新组件已在装载),no-op 不拆别人;从未成功
+      // 装载过则无核可收,不发。在途装载的回收由上方 invoke 后的换代分支自理。
+      const g = lastBackendGen;
+      lastBackendGen = null;
+      if (g !== null) void invoke("player_stop", { ifGen: g }).catch(() => {});
     };
   });
 
