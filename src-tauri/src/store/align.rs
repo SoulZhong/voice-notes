@@ -13,6 +13,16 @@ use crate::player_align::TimeMap;
 use std::path::Path;
 
 pub const ALIGN_FILE: &str = "align.json";
+/// align.json 及关联产物(对齐音轨缓存/跳过标记)的**全写删方共用**串行锁:
+/// 写入者不止回放侧(mix_regen 也直写),各持各的锁等于没锁——过期清理可在
+/// regen 刚发布有效映射后把它删掉,映射却已烘进随后落盘的 mixed(Codex 十七轮)。
+/// 约定:任何 align.json 的写/删,以及需要与之原子的产物操作,统一持本锁;
+/// `write` 不自取锁(调用方可能要把它与相邻操作圈进同一临界区,嵌套自锁会死锁)。
+pub static ALIGN_FS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 对齐"估不出/不值得纠正"的负结果标记(空文件,mtime 即判据):没有它,大笔记每次
+/// 装载都会重跑 60-100s 的时基估计。比两条源轨都新才有效,源轨更新(续录)即重估;
+/// 删掉它即强制下次装载重估。
+pub const ALIGN_SKIP_FILE: &str = "align.skip";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AlignDoc {

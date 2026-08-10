@@ -154,12 +154,47 @@ pub struct PlayerHandle {
     core: Mutex<Option<Arc<Core>>>,
     /// 流线程停止通道(drop/发送皆停,与 microphone.rs 同模式)。
     stop_tx: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    /// 装载代次(2026-08-10 排障):快速切笔记时多个 player_load 并发在跑,完成序由
+    /// 装载耗时(解码/对齐/门控)决定而非请求序——后完成的旧笔记装载会覆盖当前内核
+    /// (wrong-writer-wins),表现为点播放被掐、图标弹回、放错笔记的音频。
+    /// 入口取号,只有仍是最新代次的装载允许装内核/起流。Arc:对齐闭包跑在
+    /// spawn_blocking('static),要携带代次探针在正结论提交前复核(Codex 十二轮)。
+    load_gen: Arc<AtomicU64>,
+    /// 发布互斥(Codex P1):把「查代次→装内核→起流→复查」整段串行化。没有它,
+    /// 过期装载 A 起流期间新装载 B 完成发布,A 的兜底 stop_stream 会无差别拆掉 B
+    /// 刚装好的内核/停止通道——B 返回 Ok 但 play 报"尚未装载"。持锁期间过期装载
+    /// 只可能清到自己刚发布的产物(更新装载的发布必须先拿到本锁)。
+    publish: Mutex<()>,
 }
 
 impl Default for PlayerHandle {
     fn default() -> Self {
-        Self { core: Mutex::new(None), stop_tx: Mutex::new(None) }
+        Self {
+            core: Mutex::new(None),
+            stop_tx: Mutex::new(None),
+            load_gen: Arc::new(AtomicU64::new(0)),
+            publish: Mutex::new(()),
+        }
     }
+}
+
+impl PlayerHandle {
+    /// 新装载入口取号:此后到达的装载代次更大,本代次随之过期。
+    fn begin_load(&self) -> u64 {
+        self.load_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    /// 本代次是否仍是最新。装内核前与起流后各查一次(见 player_load 注释)。
+    fn is_current(&self, gen: u64) -> bool {
+        self.load_gen.load(Ordering::SeqCst) == gen
+    }
+}
+
+/// player_load 的返回:总长之外带回本次装载的后端代次——前端 cleanup 用它做
+/// **条件停止**(ifGen):旧组件迟到的 stop 不得作废新组件的装载(Codex 十轮 P1)。
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadResult {
+    pub total_ms: u64,
+    pub gen: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +300,107 @@ fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&P
     newer_than_src(cache) && align_json.map(newer_than_src).unwrap_or(false)
 }
 
+/// 写跳过标记(负结果缓存):唯一名 tmp + create_new + rename——固定名 `fs::write`
+/// 会跟随目录里预置的同名符号链接,把写入打到链接指向的任意可写文件上(Codex P1);
+/// create_new 遇到已存在路径(含符号链接本身)直接失败不跟随,rename 替换的是目录项
+/// 本身(预置链接被整体换成普通文件)。与 store::align::write 同一防线。
+/// best-effort:失败只意味着下次装载再估一遍,不上抛。
+/// 返回写入标记的**内容 token**(所有权凭据):回滚方读回内容一致才认「还是我那份」。
+/// mtime 做凭据有双重歧义(并发覆写后 stat 到别人的 mtime;粗分辨率文件系统 mtime
+/// 相等),内容 token 无歧义(Codex 十二轮 P2)。标记新鲜度判定只看 mtime,内容自由。
+fn write_align_skip_marker(note_dir: &Path) -> Option<String> {
+    use std::io::Write;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let token = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+    let marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
+    let tmp = note_dir.join(format!("{}.{token}.tmp", crate::store::align::ALIGN_SKIP_FILE));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        Ok(mut f) => {
+            if f.write_all(token.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+            // 发布入锁(Codex 十三轮 P2):与回滚侧的「读 token-比对-删除」互斥,
+            // 防回滚方读到自己的 token 后被挂起、本发布落地、恢复后误删新标记。
+            let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
+            if std::fs::rename(&tmp, &marker).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+            Some(token)
+        }
+        Err(_) => None,
+    }
+}
+
+
+/// 移除过期正映射并通知详情页重拉(负结论路径共用):align.json 在负结论下只会让
+/// notes 读路径的转写时间戳与原始轨回放错位。持 ALIGN_FS_LOCK 并复验——正缓存已被
+/// 重叠的新装载变新鲜(有效映射)则放弃删除;只清确凿过期的映射。
+/// drift_ms=0 语义为「映射移除,回到原始时基」,消费方只按 note_id refresh。
+fn remove_align_map_and_notify(
+    app: &AppHandle,
+    note_dir: &Path,
+    align_json: &Path,
+    cache: &Path,
+    sources: &[&Path],
+) {
+    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
+    if aligned_cache_is_fresh(cache, Some(align_json), sources) {
+        return; // 新装载刚提交的有效映射,不是要清的过期货
+    }
+    // 新鲜映射护栏(Codex 十七轮):映射比全部源轨新 = 刚被有意发布(mix_regen 或
+    // 另一装载),即便配套音轨缓存缺失/未建也不是陈旧货——本函数只清早于当前源的
+    // 过期映射。regen 发布映射与烘焙 mixed 之间的窗口由此免疫清理。
+    let newest_src = sources
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    let map_is_newer = matches!(
+        (std::fs::metadata(align_json).and_then(|m| m.modified()), newest_src),
+        (Ok(am), Some(src)) if am >= src
+    );
+    if map_is_newer {
+        return;
+    }
+    // 成品轨护栏(Codex 十四轮 P2):mix_regen 可能已把本映射烘进 mixed.m4a——删映射
+    // 会让转写回原始时基,而成品轨仍是纠正过的,按成品轨回放的定位/高亮从此错位。
+    // mixed 不老于映射(烘焙不早于映射发布)即保留映射:成品轨一致性优先于双轨
+    // 原始回放(负结论下双轨本就不换轨,保留映射维持既有观感,不引入新错位)。
+    // 两种成品形态都查(Codex 十八轮):regen 对 WAV 源笔记有意产出 mixed.wav 不转码。
+    let newest_mixed = ["mixed.m4a", "mixed.wav"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(note_dir.join(f)).and_then(|m| m.modified()).ok())
+        .max();
+    let baked = matches!(
+        (newest_mixed, std::fs::metadata(align_json).and_then(|m| m.modified())),
+        (Some(mm), Ok(am)) if mm >= am
+    );
+    if baked {
+        return;
+    }
+    if std::fs::remove_file(align_json).is_ok() {
+        if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
+            let _ = app.emit(
+                "note_realigned",
+                crate::ipc::NoteRealignedEvent { note_id: note_id.to_string(), drift_ms: 0 },
+            );
+        }
+    }
+}
+
+/// 跳过标记是否有效:比全部源轨新即有效(负结果缓存,见 store::align::ALIGN_SKIP_FILE)。
+fn align_skip_is_fresh(marker: &Path, sources: &[&Path]) -> bool {
+    let newest_src = sources
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    match (std::fs::metadata(marker).and_then(|m| m.modified()), newest_src) {
+        (Ok(t), Some(src)) => t >= src,
+        _ => false,
+    }
+}
+
 /// 提交对齐结果:音轨先写临时文件 → 校验长度 → 原子 rename → **最后**发布映射。
 /// 返回是否整体提交成功;任一步失败都会清理临时文件并返回 false(下次装载重算)。
 ///
@@ -277,6 +413,7 @@ fn commit_aligned(
     render: impl FnOnce(&mut std::fs::File) -> std::io::Result<u64>,
     note_dir: &Path,
     map: &crate::player_align::TimeMap,
+    is_current: impl Fn() -> bool,
 ) -> bool {
     // 唯一名 + create_new:同 store::align::write 的理由(不跟随预置符号链接)。
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -297,6 +434,15 @@ fn commit_aligned(
     };
     if !complete {
         eprintln!("回放对齐: 对齐音轨写入不完整,本次不对齐(下次装载重试)");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // 发布临界区(Codex 十三轮 P1):代次检查必须先于缓存音轨 rename,且 rename 与
+    // 映射写入同锁——否则过期渲染可在新装载的 cache+map 配对之上单独覆写音轨,
+    // 覆写后的新 mtime 让 aligned_cache_is_fresh 永远接受这对错配。
+    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
+    if !is_current() {
+        eprintln!("回放对齐: 装载已被更新的请求取代,正结论不发布");
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
@@ -329,15 +475,28 @@ pub(crate) fn aligned_track_offset_ms(sys_off_ms: u64, map: &crate::player_align
 /// 回放行为与不对齐时完全一致。结果按两条源轨的路径+mtime 落缓存,同一笔记只算一次。
 async fn align_mic_track(
     app: &AppHandle,
+    state: &State<'_, PlayerHandle>,
+    gen: u64,
     plan: &mut [(PathBuf, u64, String)],
+    durable: &[(String, PathBuf)],
     note_dir: Option<&Path>,
 ) {
     let idx = |src: &str| plan.iter().position(|(_, _, s)| s == src);
+    // 持久源路径(原始 m4a/wav):标记新鲜度与估计期间变更检测的锚点——解码缓存
+    // 会淘汰重建,不配当锚点。找不到对应项时回退缓存路径(行为同旧,不失效)。
+    let durable_of = |src: &str, fallback: &Path| -> PathBuf {
+        durable
+            .iter()
+            .find(|(s, _)| s == src)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| fallback.to_path_buf())
+    };
     let (Some(mi), Some(si)) = (idx("mic"), idx("system")) else {
         return; // 单轨笔记没有跨轨时基可言
     };
     let (mic_path, mic_off) = (plan[mi].0.clone(), plan[mi].1);
     let (sys_path, sys_off) = (plan[si].0.clone(), plan[si].1);
+    let (mic_src, sys_src) = (durable_of("mic", &mic_path), durable_of("system", &sys_path));
     let (dm, ds) = (wav_duration_ms(&mic_path), wav_duration_ms(&sys_path));
     if !alignment_worth_attempting(dm, ds) {
         return;
@@ -349,6 +508,24 @@ async fn align_mic_track(
     let align_json = note_dir.join(crate::store::align::ALIGN_FILE);
 
     if !aligned_cache_is_fresh(&cache, Some(&align_json), &[&mic_path, &sys_path]) {
+        // 负结果缓存:上次已判定"估不出/不值得纠正"且源轨未变,不再重跑 60-100s 的
+        // 估计(2026-08-10 排障:大笔记每次进页白跑一遍,装载期间播放无响应)。
+        let skip_marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
+        if align_skip_is_fresh(&skip_marker, &[&mic_src, &sys_src]) {
+            // 自愈(Codex P1):此处若还躺着 align.json,它必然过期(新鲜的正缓存在上方
+            // 分支就命中了)——留着它,notes 读路径仍按旧映射改写转写时间戳,而回放走
+            // 原始轨,两边永久错位。删之并通知页面重拉(Codex P2:页面在装载前已按旧
+            // 映射改写过时间戳,不通知就一直错位到下次刷新;drift_ms=0 表示映射移除)。
+            // 代次门(Codex 五轮 P1):同一笔记两次装载重叠时,过期装载不得删新装载
+            // 可能刚提交的有效映射——只有仍是最新代次才有资格做对齐副作用。
+            if state.is_current(gen) {
+                // 清理复验锚**缓存对**(Codex 十六轮:与顶部新鲜度判定同口径)——缓存重建后
+                // 旧 cache+map 对确凿过期,此时若拿持久源复验会误判新鲜、保留映射,而
+                // plan 未换对齐轨,转写映射与原始回放错位。持久源只锚跳过标记。
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
+            }
+            return;
+        }
         eprintln!(
             "回放对齐: 两轨长度差 {:.1}s(mic {:.0}s / system {:.0}s),估计时基映射…",
             (ds - dm).abs() as f64 / 1000.0,
@@ -357,19 +534,59 @@ async fn align_mic_track(
         );
         let (m2, s2, c2, nd) =
             (mic_path.clone(), sys_path.clone(), cache.clone(), note_dir.to_path_buf());
+        let (md, sd) = (mic_src.clone(), sys_src.clone());
+        let gen_probe = state.load_gen.clone();
         let built = tauri::async_runtime::spawn_blocking(move || -> Option<u64> {
             // mmap 而不是 read:估计要同时看两条完整音轨,一小时双轨读进堆里就是
             // ~230MB 常驻,而 player_align 已改成按字节视图逐样本取值,页由系统按需
             // 调入/回收即可(与回放热路径同一套 mmap 策略)。
+            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            // 估计前采**持久源**快照(原始 m4a/wav,非解码缓存):估计要跑几十秒,期间
+            // 续录会换掉源文件——那时结论只代表旧音频,标记不得发布(Codex P2:晚发布
+            // 的标记 mtime 反而更新,会把针对新音频的必要重估压掉)。锚持久源还避免
+            // 缓存淘汰重建的 mtime 噪声(Codex 十五轮)。
+            let pre = (mtime(&md), mtime(&sd));
             let map_file = |p: &Path| -> Option<Mmap> {
                 let f = std::fs::File::open(p).ok()?;
                 unsafe { Mmap::map(&f).ok() }
             };
             let mic = map_file(&m2)?;
             let sys = map_file(&s2)?;
-            let a = crate::player_align::estimate(&mic, mic_off, &sys, sys_off)?;
+            // 负结果也落盘(空文件标记):mmap 失败(上方 ?)不落——那是环境性故障,
+            // 该重试;"估不出/不值得"是对这份音频的稳定判定,源轨不变结论不变。
+            // 过期正映射的删除与页面通知在 await 之后的异步侧做(那里有 AppHandle 能
+            // 发 note_realigned);本闭包只负责标记。崩在两步之间 = 标记在、旧映射在,
+            // 由上方 skip-fresh 分支的自愈补删,不留永久错位。
+            let mark_skip = || {
+                if (mtime(&md), mtime(&sd)) != pre {
+                    eprintln!("回放对齐: 估计期间源轨已变,不发布跳过标记(下次装载重估)");
+                    return;
+                }
+                let ours = write_align_skip_marker(&nd);
+                // 发布后复验(Codex 九轮 P2):比对与落盘之间源又被改写,标记 mtime 反而
+                // 比新源新,会压掉对新音频的重估——发现快照变了就撤回。撤回只删**自己
+                // 那份**(mtime 凭据一致,Codex 十一轮 P2):并发新装载已覆写的有效标记
+                // 不动。撤回后源再变,标记比新源旧本就判不新鲜,链路自洽。
+                if (mtime(&md), mtime(&sd)) != pre {
+                    // 读-比对-删除与标记发布同锁(Codex 十三轮 P2):否则读到自己 token
+                    // 后被挂起,新标记落地,恢复后的删除仍会误删。
+                    let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
+                    let _fs = crate::store::align::ALIGN_FS_LOCK.lock().unwrap();
+                    let content = std::fs::read_to_string(&marker).ok();
+                    if ours.is_some() && content == ours {
+                        eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
+                        let _ = std::fs::remove_file(&marker);
+                    }
+                }
+            };
+            let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
+                eprintln!("回放对齐: 估不出可信映射,记录跳过标记(源轨变更后重估)");
+                mark_skip();
+                return None;
+            };
             if !crate::player_align::worth_correcting(&a) {
-                eprintln!("回放对齐: 实测漂移仅 {:.2}s,不值得纠正", a.drift_secs);
+                eprintln!("回放对齐: 实测漂移仅 {:.2}s,不值得纠正(记录跳过标记)", a.drift_secs);
+                mark_skip();
                 return None;
             }
             eprintln!(
@@ -379,14 +596,28 @@ async fn align_mic_track(
             let render = |f: &mut std::fs::File| {
                 crate::player_align::render_aligned_to(&mic, &a.map, f).map(|(n, _)| n)
             };
-            commit_aligned(&c2, render, &nd, &a.map).then(|| (a.drift_secs * 1000.0) as u64)
+            commit_aligned(&c2, render, &nd, &a.map, || gen_probe.load(Ordering::SeqCst) == gen)
+                .then(|| (a.drift_secs * 1000.0) as u64)
         })
         .await
         .unwrap_or_else(|e| {
             eprintln!("回放对齐: 任务失败({e}),本次回放不对齐");
             None
         });
-        let Some(drift_ms) = built else { return };
+        let Some(drift_ms) = built else {
+            // 负结论(估不出/不值得/任务失败):过期正映射一并移除并通知页面重拉
+            // (Codex P1+P2)——负结论确立后旧 align.json 只会让转写时间戳与原始轨
+            // 回放错位,页面在装载前已按旧映射改写过时间戳,不通知就错位到下次刷新。
+            // 代次门(Codex 五轮 P1):过期装载的负结论可能晚于新装载的有效提交抵达,
+            // 无差别删除会拆掉新映射;过期即放弃副作用(标记写入另有 mtime 快照门)。
+            if state.is_current(gen) {
+                // 清理复验锚**缓存对**(Codex 十六轮:与顶部新鲜度判定同口径)——缓存重建后
+                // 旧 cache+map 对确凿过期,此时若拿持久源复验会误判新鲜、保留映射,而
+                // plan 未换对齐轨,转写映射与原始回放错位。持久源只锚跳过标记。
+                remove_align_map_and_notify(app, note_dir, &align_json, &cache, &[&mic_path, &sys_path]);
+            }
+            return;
+        };
         // 详情页手里那份段是旧时基的,通知它整页重拉。
         if let Some(note_id) = note_dir.file_name().and_then(|s| s.to_str()) {
             let _ = app.emit(
@@ -409,17 +640,30 @@ pub async fn player_load(
     app: AppHandle,
     state: State<'_, PlayerHandle>,
     tracks: Vec<LoadTrack>,
-) -> Result<u64, String> {
-    // 先停旧流(切笔记):旧 Core 一并丢弃,防旧事件串台。
-    stop_stream(&state);
+) -> Result<LoadResult, String> {
+    // 入口取号+拆除同锁原子(Codex 九轮 P1):取号与拆除若分离,老装载在取号后挂起、
+    // 新装载已发布的情形下,老装载恢复后的无差别拆除会拆掉新核。锁内成对后,取号时刻
+    // 本代次必为最新、锁内拆到的只可能是旧核;发布段与 player_stop 共用同一把锁定序。
+    // 锁在入口段结束即释放,不覆盖后续解码/对齐长路径。
+    let gen = {
+        let _publish = state.publish.lock().unwrap();
+        let g = state.begin_load();
+        stop_stream(&state);
+        g
+    };
 
     // 路径校验 + m4a 解码规划(阻塞段全部挪到 spawn_blocking)。
     // note_dir:取首条轨校验后路径的父目录(m4a 会被换成缓存路径,故须在换之前取,
     // 各轨同属一个笔记,取一次即可)——segments.jsonl 与音轨文件同目录。
     let mut note_dir: Option<PathBuf> = None;
     let mut plan: Vec<(PathBuf, u64, String)> = Vec::new();
+    // 持久源(校验后的原始 m4a/wav 路径):跳过标记的新鲜度锚点。解码缓存会被 7 天
+    // 淘汰再重建,mtime 随之变新——拿缓存当锚点,录音没变也会每次淘汰后白跑一遍
+    // 60-100s 估计(Codex 十五轮 P2)。
+    let mut durable: Vec<(String, PathBuf)> = Vec::new();
     for t in &tracks {
         let src = validate_under_notes(&app, Path::new(&t.path))?;
+        let src_orig = src.clone();
         if note_dir.is_none() {
             note_dir = src.parent().map(|p| p.to_path_buf());
         }
@@ -446,6 +690,7 @@ pub async fn player_load(
             src
         };
         plan.push((wav, t.offset_ms, t.source.clone()));
+        durable.push((t.source.clone(), src_orig));
     }
 
     // 跨轨时基对齐:历史录音里 mic 轨可能整条被压缩(采集侧把设备实际出样速率记错,
@@ -454,7 +699,7 @@ pub async fn player_load(
     // 在 400ms 内,不先把时基掰正,门控只会压错地方。
     //
     // 只对"轨长明显对不上"的笔记做:估计要跑几秒,健康的笔记不该为它买单。
-    align_mic_track(&app, &mut plan, note_dir.as_deref()).await;
+    align_mic_track(&app, &state, gen, &mut plan, &durable, note_dir.as_deref()).await;
 
     // 回放门控:按两轨逐帧电平构建 mic 压低区间(任何失败空表降级=不门控)。
     // 判据不再取自转写段——回声残影本身会被识别成 mic 段,旧的"mic 有段即保护"
@@ -525,12 +770,29 @@ pub async fn player_load(
         cursor_bits: AtomicU64::new(0f64.to_bits()),
         playing: AtomicBool::new(false),
     });
-    *state.core.lock().unwrap() = Some(core.clone());
+    // 发布段(持 publish 互斥,Codex P1):查代次→装内核→起流→复查整段串行。
+    // 过期装载在首查即弃(未触碰任何共享态);持锁期间发布后才发现过期(新装载
+    // 恰在本段进行中进入并 bump 代次)时,兜底 stop_stream 清到的只会是自己刚
+    // 发布的产物——更新装载的发布必须先拿本锁,不可能被误拆。
+    let _publish = state.publish.lock().unwrap();
+    {
+        let mut g = state.core.lock().unwrap();
+        if !state.is_current(gen) {
+            return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
+        }
+        *g = Some(core.clone());
+    }
     if let Err(e) = start_stream(&app, &state, core) {
         stop_stream(&state); // 起流失败不留残核:否则后续 play 假成功、UI 卡"播放中"
         return Err(e);
     }
-    Ok((total_samples as f64 / SRC_RATE * 1000.0) as u64)
+    // 起流后复查:装内核→起流之间若有新装载**进入**(入口 stop_stream 不走 publish
+    // 锁,会清掉本次刚装的内核),刚起的流带着过期内核复活。过期即自我了断。
+    if !state.is_current(gen) {
+        stop_stream(&state);
+        return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
+    }
+    Ok(LoadResult { total_ms: (total_samples as f64 / SRC_RATE * 1000.0) as u64, gen })
 }
 
 /// 起输出流线程:线程独占 !Send 的 cpal Stream,兼任 200ms 位置事件发射;
@@ -645,7 +907,22 @@ pub fn player_set_muted(state: State<'_, PlayerHandle>, source: String, muted: b
 }
 
 #[tauri::command]
-pub fn player_stop(state: State<'_, PlayerHandle>) -> Result<(), String> {
+pub fn player_stop(state: State<'_, PlayerHandle>, if_gen: Option<u64>) -> Result<(), String> {
+    // 停止=清空播放意图,同时推进装载代次让**在途装载**过期(Codex P1):组件销毁后
+    // 只清流不作废代次的话,仍在解码/对齐中的装载完成时会复活流+重装内核,排队的
+    // play 还会对已离开的笔记开火。推进代次后它们在发布段被拦下,自行返回「已取代」。
+    // 取号+拆除进 publish 锁(Codex 九轮 P1):挂起在两步之间的 stop 恢复后不得拆掉
+    // 后续装载已发布的核——锁内成对 + 发布段同锁,定序即正确。
+    // if_gen 归属条件(Codex 十轮 P1):旧组件 fire-and-forget 的 stop 可能晚于新组件
+    // 的装载执行——带上自己最后一次成功装载的代次,后端代次已前进(有更新意图)就
+    // no-op,不作废别人的装载;不带条件(None)保留无条件停止语义(显式全停场景)。
+    let _publish = state.publish.lock().unwrap();
+    if let Some(g) = if_gen {
+        if !state.is_current(g) {
+            return Ok(());
+        }
+    }
+    state.begin_load();
     stop_stream(&state);
     Ok(())
 }
@@ -724,13 +1001,61 @@ mod tests {
         assert!(!aligned_cache_is_fresh(&cache, None, &srcs));
     }
 
+    // ── 装载代次守卫(2026-08-10 排障):快速切笔记时多个 player_load 并发,完成序
+    // 由装载耗时决定,后完成的旧笔记装载会覆盖当前笔记内核(wrong-writer-wins),
+    // 用户点播放被掐、放错笔记音频。只有最新代次允许装内核。 ──
+    #[test]
+    fn load_generation_only_newest_wins() {
+        let h = PlayerHandle::default();
+        let g1 = h.begin_load();
+        assert!(h.is_current(g1), "唯一在飞的装载即最新");
+        let g2 = h.begin_load();
+        assert!(!h.is_current(g1), "更新的装载进入后,旧装载过期");
+        assert!(h.is_current(g2));
+    }
+
+    /// 跳过标记(估不出/不值得纠正的负缓存):此前这两种结局不落任何产物,大笔记
+    /// 每次进页都重跑 60-100s 估计。标记比两条源轨都新才有效,源轨更新(续录)即重估。
+    #[test]
+    fn align_skip_marker_freshness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mic, sys) = (tmp.path().join("mic.wav"), tmp.path().join("system.wav"));
+        wav_of_ms(&mic, 10);
+        wav_of_ms(&sys, 10);
+        let marker = tmp.path().join(crate::store::align::ALIGN_SKIP_FILE);
+        let srcs: [&Path; 2] = [&mic, &sys];
+        assert!(!align_skip_is_fresh(&marker, &srcs), "无标记即重估");
+        std::fs::write(&marker, b"").unwrap();
+        assert!(align_skip_is_fresh(&marker, &srcs), "标记比源新:跳过重估");
+        touch_newer(&mic);
+        assert!(!align_skip_is_fresh(&marker, &srcs), "源轨更新(续录)后标记失效");
+    }
+
+    /// 预置同名符号链接不得被写穿(Codex P1):固定名 fs::write 会跟随链接把内容打到
+    /// 任意可写文件;安全写法(tmp+create_new+rename)应整体替换链接为普通文件。
+    #[cfg(unix)]
+    #[test]
+    fn skip_marker_never_follows_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        let note = tmp.path().join("note");
+        std::fs::create_dir(&note).unwrap();
+        let marker = note.join(crate::store::align::ALIGN_SKIP_FILE);
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        write_align_skip_marker(&note);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "链接目标不得被写穿");
+        let meta = std::fs::symlink_metadata(&marker).unwrap();
+        assert!(meta.file_type().is_file(), "标记应把链接整体替换为普通空文件");
+    }
+
     #[test]
     fn commit_aligned_publishes_audio_then_map() {
         let tmp = tempfile::tempdir().unwrap();
         let note = tmp.path().join("note");
         std::fs::create_dir(&note).unwrap();
         let cache = tmp.path().join("aligned.wav");
-        assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap(), || true));
         assert_eq!(std::fs::read(&cache).unwrap(), b"PCMDATA");
         assert_eq!(crate::store::align::read(&note), Some(tmap()));
         // 不留临时文件
@@ -754,7 +1079,7 @@ mod tests {
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("occupied"), b"x").unwrap();
 
-        assert!(!commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert!(!commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap(), || true));
         assert!(
             crate::store::align::read(&note).is_none(),
             "音轨发布失败时映射不得落盘(否则时间戳与音频对不上)"
@@ -775,7 +1100,7 @@ mod tests {
         std::fs::create_dir(&note).unwrap();
         let cache = tmp.path().join("aligned.wav");
         for i in 0..3u8 {
-            assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, &[i; 16]).map(|_| 16), &note, &tmap()), "第 {i} 次提交");
+            assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, &[i; 16]).map(|_| 16), &note, &tmap(), || true), "第 {i} 次提交");
         }
         assert_eq!(std::fs::read(&cache).unwrap(), vec![2u8; 16], "最后一次胜出");
     }

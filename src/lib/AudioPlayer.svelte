@@ -47,10 +47,20 @@
   // 恒为最新意图);onLoaded 只在代次仍是最新时回调,过期装载不消耗恢复现场。
   let loadPromise: Promise<number> | null = null;
   let loadGen = 0;
+  /** 装载进行中(解码/对齐/门控可能要几十秒,长录音首次尤甚):给出可见反馈,
+   * 免得用户点播放"毫无反应"(2026-08-10 排障:装载期间点击只是静默排队)。 */
+  let loading = $state(false);
   // 串行链单独存放:effect 的 cleanup 会先把 loadPromise 置 null 再跑下一轮,
   // 若用 loadPromise 当前驱,新一轮读到的恒是 null,串行化形同虚设。本变量只进
   // 不清(settle 后即释放引用,无泄漏),cleanup 不碰它。
   let loadChain: Promise<unknown> = Promise.resolve();
+  /** 过期装载的取消哨兵:排队中的 play/seek 链在 catch 里识别后静默复位(playing
+   * 回 false),不当错误上报——它不是故障,只是用户切走了。 */
+  const SUPERSEDED = "player-load-superseded";
+  /** 本实例最后一次成功装载的**后端**代次:cleanup 的条件停止(ifGen)用——旧组件
+   * fire-and-forget 的 stop 可能晚于新组件的装载执行,带条件后后端代次已前进就
+   * no-op,不作废别人的装载(Codex 十轮 P1)。 */
+  let lastBackendGen: number | null = null;
   $effect(() => {
     trackErrors = [];
     if (tracks.length === 0) {
@@ -59,25 +69,65 @@
       const gen = ++loadGen;
       const payload = tracks.map((t) => ({ path: t.path, offset_ms: t.offset_ms, source: t.source }));
       const prev = loadChain;
+      loading = true;
       const p = (async () => {
         try {
           await prev;
         } catch {
           /* 旧装载失败不阻断新装载 */
         }
-        const total = await invoke<number>("player_load", { tracks: payload });
-        if (gen === loadGen) onLoaded?.();
-        return total;
+        // 排队期间实例已卸载/换代(切笔记):放弃发起,不让过期装载进后端抢内核。
+        // 后端另有代次守卫兜底(跨实例并发窗口),这里省掉一次注定作废的重装载。
+        // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
+        // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
+        if (gen !== loadGen) throw SUPERSEDED;
+        const res = await invoke<{ total_ms: number; gen: number }>("player_load", { tracks: payload }).catch((e) => {
+          // 后端代次门的拒绝统一折算成取消哨兵(Codex P2):凡 invoke 失败且本地已
+          // 换代,必是切换导致的取代而非故障——不按本地化文案匹配,按换代事实判定;
+          // 否则排队的 play 会把「已取代」当播放错误刷进新轨的 UI。
+          if (gen !== loadGen) throw SUPERSEDED;
+          throw e;
+        });
+        // invoke 期间换代/卸载:后端已发布(装载成功)但本实例意图已作废——发条件
+        // 停止回收自己刚发布的核(代次已被更新者接管则 no-op),本地拒绝让排队的
+        // play/seek 不对导航后的新状态开火。
+        if (gen !== loadGen) {
+          void invoke("player_stop", { ifGen: res.gen }).catch(() => {});
+          throw SUPERSEDED;
+        }
+        lastBackendGen = res.gen;
+        onLoaded?.();
+        return res.total_ms;
       })();
       loadChain = p.catch(() => {});
+      p.then(
+        () => {
+          if (gen === loadGen) loading = false;
+        },
+        () => {
+          if (gen === loadGen) loading = false;
+        },
+      );
       loadPromise = p.catch((e) => {
-        if (gen === loadGen) reportError(t("notes.player.errLoad"), `${e}`);
+        if (gen === loadGen && e !== SUPERSEDED) reportError(t("notes.player.errLoad"), `${e}`);
         throw e;
       });
+      // 终端兜底(Codex P2):无人排队 play/seek 时,上面的 rethrow 会成为无消费的
+      // 拒绝,快速切换笔记就刷 unhandledrejection。挂一个空 catch 收尾——排队命令
+      // 链在 loadPromise 上,仍能看到拒绝,不受影响。
+      loadPromise.catch(() => {});
     }
     return () => {
+      // 换代:让已排队但尚未发起的旧装载放弃(上方 gen 检查),防旧实例的装载
+      // 在切笔记后才进入后端、掐掉新页面刚起的播放(2026-08-10 排障)。
+      loadGen++;
       loadPromise = null;
-      void invoke("player_stop").catch(() => {});
+      // 条件停止(Codex 十轮 P1):只回收**自己**最后一次成功装载的核——迟到的
+      // 本 stop 若发现后端代次已前进(新组件已在装载),no-op 不拆别人;从未成功
+      // 装载过则无核可收,不发。在途装载的回收由上方 invoke 后的换代分支自理。
+      const g = lastBackendGen;
+      lastBackendGen = null;
+      if (g !== null) void invoke("player_stop", { ifGen: g }).catch(() => {});
     };
   });
 
@@ -128,7 +178,7 @@
       .then(() => invoke("player_play"))
       .catch((e) => {
         playing = false;
-        reportError(t("notes.player.errPlay"), `${e}`);
+        if (e !== SUPERSEDED) reportError(t("notes.player.errPlay"), `${e}`);
       });
   }
 
@@ -287,6 +337,9 @@
     </div>
   {/if}
 </div>
+{#if loading}
+  <div class="loading-hint">{t("notes.player.loading")}</div>
+{/if}
 {#if trackErrors.length > 0}
   <div class="track-errors">
     {#each trackErrors as e (e)}
@@ -436,6 +489,12 @@
   /* 音轨错误可视化:danger 色小字,贴在播放器下方 */
   .track-errors {
     color: var(--danger);
+    font-size: 0.8rem;
+    margin: 0.3rem 0 0 0.2rem;
+  }
+  /* 装载进行中提示:次级墨小字,同错误行位置(装载完成即消失) */
+  .loading-hint {
+    color: var(--ink-secondary);
     font-size: 0.8rem;
     margin: 0.3rem 0 0 0.2rem;
   }
