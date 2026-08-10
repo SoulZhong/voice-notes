@@ -19,25 +19,22 @@ pub const APP_KEY: &str = "A-SH-4723952967";
 pub const APTABASE_HOST: &str = "https://aptabase.tutorkin.com";
 
 /// 录制源类别。由设置推断而非实际启动结果:遥测只要低基数类别,不追精确。
+///
+/// `Mic`/`System` 两档目前无构造点(`RecordSource::from_settings` 随 record_system_only
+/// 字段一起被三删一藏移除,唯一调用点固定按 `Both` 上报,见 lib.rs 的 do_start_recording/
+/// do_resume_note_recording)。不删这两个变体——它们仍是遥测面板已有的历史类别定义,
+/// Task 3 若把必备源判定做成真逃生舱,细分录制源类别时会重新用上;`#[allow(dead_code)]`
+/// 消掉噪音而不是删掉这份枚举契约。
 #[derive(Debug, PartialEq)]
 pub enum RecordSource {
+    #[allow(dead_code)]
     Mic,
+    #[allow(dead_code)]
     System,
     Both,
 }
 
 impl RecordSource {
-    /// 仅录系统声 → system;否则 macOS 双源 both、其他平台 mic。
-    pub fn from_settings(record_system_only: bool) -> Self {
-        if record_system_only {
-            RecordSource::System
-        } else if cfg!(target_os = "macos") {
-            RecordSource::Both
-        } else {
-            RecordSource::Mic
-        }
-    }
-
     fn as_str(&self) -> &'static str {
         match self {
             RecordSource::Mic => "mic",

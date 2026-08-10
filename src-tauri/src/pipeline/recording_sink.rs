@@ -8,7 +8,8 @@
 //! 两条源轨与转写热路径不受任何影响。mixed 使用有界 `try_send`:满即整轨放弃并
 //! 回滚,绝不反压 segment worker;另由 MAX_MIXER_WINDOW_SAMPLES 防一源停摆时窗增长。
 //!
-//! 单源会话(record_system_only)无从混音,直接不建混音线程:该笔记只有方案 A 可选。
+//! 单源会话(比如系统声音源构建失败,只剩麦克风)无从混音,直接不建混音线程:该笔记
+//! 只有方案 A 可选。
 //!
 //! 装配契约:喂进 TimelineMixer 的必须是 **post-frame_tap** 流。FrameTap 记录首帧
 //! 相对共同单调时钟的偏移,断流则补零;本层用首帧偏移 + 后续样本数组成真实时间轴。
@@ -141,7 +142,7 @@ pub struct Wiring {
     pub sinks: Vec<(Source, Box<dyn FnMut(&[f32]) + Send>)>,
     pub joins: Vec<std::thread::JoinHandle<()>>,
     /// 每源 writer 本场至少成功追加过一个非空块。停录对账只消费这些源,避免旧 WAV
-    /// 在启动失败或 keep_audio=false 续录中被误当成本场产物。
+    /// 在启动失败的续录中被误当成本场产物。
     pub activity: Vec<(Source, Arc<AtomicBool>)>,
 }
 
@@ -220,7 +221,8 @@ impl RecordingSink for MixedSink {
         // 上([Mic, Mic] 会通过 len() < 2 判据继续往下走)。但这只挡住了混音线程本身,
         // 不是重复源的通用防线:[Mic, Mic] 传进 DualTrackSink::into_wiring 仍会为每个
         // 元素各开一个 writer,两者抢同一个 mic.wav——如实说,这里没有堵住那个问题。
-        // 单源会话(record_system_only)无从混音:直接退化为方案 A,该笔记只有 A 可选。
+        // 单源会话(比如系统声音源构建失败,只剩麦克风)无从混音:直接退化为方案 A,
+        // 该笔记只有 A 可选。
         if !(self.inner.sources.contains(&Source::Mic) && self.inner.sources.contains(&Source::System)) {
             return Box::new(self.inner).into_wiring();
         }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { open } from "@tauri-apps/plugin-dialog";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { recording } from "$lib/recording.svelte";
@@ -30,6 +31,7 @@
     type MigrateEvent,
   } from "$lib/models";
   import { countPeopleWithoutSamples } from "$lib/people";
+  import { refineReady } from "$lib/refineReady";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
@@ -47,18 +49,21 @@
   let mirrorTesting = $state(false);
   let expandedId = $state<string | null>(null);
 
-  /** 镜像开启时返回「前缀+原始url」(等同后端 apply_mirror);关闭/空前缀返回原始 url。 */
+  /** 镜像前缀:曾是设置项上的可编辑字段,三删一藏后 UI 从不允许编辑它——值永远等于后端
+   * 内置常量,该字段随之从设置类型上移除。这里保留同值字面量只为拼预览 URL / 传给
+   * test_mirror,不代表前端可配置。 */
+  const MIRROR_PREFIX = "https://ghfast.top/";
+  /** 镜像开启时返回「前缀+原始url」(等同后端 apply_mirror);关闭时返回原始 url。 */
   function effectiveUrl(url: string): string {
-    const p = (settings?.mirror_prefix ?? "").trim();
-    if (!settings?.mirror_enabled || !p) return url;
-    return p.endsWith("/") ? `${p}${url}` : `${p}/${url}`;
+    if (!settings?.mirror_enabled) return url;
+    return `${MIRROR_PREFIX}${url}`;
   }
   async function runMirrorTest() {
     if (!settings) return;
     mirrorTesting = true;
     mirrorTest = null;
     try {
-      mirrorTest = { ok: true, msg: await testMirror(settings.mirror_prefix) };
+      mirrorTest = { ok: true, msg: await testMirror(MIRROR_PREFIX) };
     } catch (e) {
       mirrorTest = { ok: false, msg: String(e) };
     } finally {
@@ -141,11 +146,9 @@
   /** UI 语言 radio:"system" | "zh" | "en"。 */
   let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
-  let sysOnly = $state(false);
-  let keepVol = $state(false);
   let langFilter = $state(false);
-  let keepAudio = $state(false);
   let audioScheme = $state<"a" | "ab" | "b">("a");
+  let audioRetention = $state<"forever" | "90d" | "30d">("forever");
   let calendarMatch = $state(true);
   /** 日历授权态(unavailable = 非 macOS,整块隐藏)。 */
   let calPerm = $state("unavailable");
@@ -158,6 +161,10 @@
   let autostartEnabled = $state(false);
   /** 快捷键录入框聚焦态:聚焦时清空显示并提示「按下组合键…」。 */
   let capturingShortcut = $state(false);
+
+  /** 「高级」折叠区展开态:纯组件 $state,只在本次页面挂载内存活——刷新页面/重新
+   * 进入设置路由都会回到收起。不落 settings.json,也不跨会话记忆,如实注释。 */
+  let advOpen = $state(false);
 
   /** 磁盘:录音音频占用字节(null=统计中);清理展开态与选项;上次释放量文案。 */
   let audioBytes = $state<number | null>(null);
@@ -194,6 +201,11 @@
     !!status && !status.artifacts.find((a) => a.id === asrArtifactId)?.present,
   );
 
+  // 会后 AI 就绪状态徽标:开关已开但配置未齐备(openai 档缺 base_url/model/api_key,
+  // 或 provider 未回填)时提示,口径对齐后端 readiness(refineReady,见 $lib/refineReady)。
+  // settings 未回填前 refineOn 恒 false,徽标天然不出现,不需要额外判空。
+  const refineConfigReady = $derived(!!settings && refineReady(settings));
+
   // 迁移/更改目录被阻断的原因(禁用 title 用);录制中/下载中/迁移中皆阻断。
   const migrateBlockReason = $derived(
     recording.isLive
@@ -213,6 +225,36 @@
     { id: "a", label: t("settings.record.audioScheme.a"), disabled: !settings },
     { id: "ab", label: t("settings.record.audioScheme.ab"), disabled: !settings },
     { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
+  ]);
+
+  // 录音音频保留期三档,同 audioSchemeItems 纪律。
+  const audioRetentionItems = $derived<SegmentedItem[]>([
+    { id: "forever", label: t("settings.record.audioRetention.forever"), disabled: !settings },
+    { id: "90d", label: t("settings.record.audioRetention.d90"), disabled: !settings },
+    { id: "30d", label: t("settings.record.audioRetention.d30"), disabled: !settings },
+  ]);
+
+  // 外观主题 / UI 语言:settings 未回填前整组禁用,选中态用本地镜像(themeChoice/langChoice)。
+  const themeItems = $derived<SegmentedItem[]>([
+    { id: "light", label: t("settings.theme.light"), disabled: !settings },
+    { id: "dark", label: t("settings.theme.dark"), disabled: !settings },
+    { id: "system", label: t("settings.theme.system"), disabled: !settings },
+  ]);
+  const langItems = $derived<SegmentedItem[]>([
+    { id: "zh", label: t("common.language.zh"), disabled: !settings },
+    { id: "en", label: t("common.language.en"), disabled: !settings },
+    { id: "system", label: t("common.language.system"), disabled: !settings },
+  ]);
+
+  // 识别方式 / 云厂商:录制中被后端拒改(set_settings 拦截),前端同步锁 UI——
+  // disabled 叠加 recording.isLive,与原 radio 版 `.seg.disabled` 视觉锁同语义。
+  const asrModeItems = $derived<SegmentedItem[]>([
+    { id: "local", label: t("settings.asrMode.local"), disabled: recording.isLive || !settings },
+    { id: "cloud", label: t("settings.asrMode.cloud"), disabled: recording.isLive || !settings },
+  ]);
+  const cloudProviderItems = $derived<SegmentedItem[]>([
+    { id: "volcano", label: t("settings.cloud.volcano"), disabled: recording.isLive || !settings },
+    { id: "aliyun", label: t("settings.cloud.aliyun"), disabled: recording.isLive || !settings },
   ]);
 
   async function refreshSettings() {
@@ -246,11 +288,9 @@
   function syncLocalFromSettings(s: Settings) {
     themeChoice = s.theme;
     langChoice = s.ui_lang;
-    sysOnly = s.record_system_only;
-    keepVol = s.keep_output_volume;
     langFilter = s.language_filter;
-    keepAudio = s.keep_audio;
     audioScheme = s.audio_scheme;
+    audioRetention = s.audio_retention;
     calendarMatch = s.calendar_match_enabled;
     refineOn = s.refine_enabled;
     identifyAuto = s.identify_auto_apply;
@@ -533,6 +573,15 @@
   const eres2Missing = $derived(
     !!status && !status.artifacts.find((a) => a.id === "speaker-eres2netv2")?.present,
   );
+  const speakerModelItems = $derived<SegmentedItem[]>([
+    { id: "campplus", label: "CAM++", disabled: recording.isLive || !settings },
+    {
+      id: "eres2netv2",
+      label: "ERes2NetV2",
+      disabled: recording.isLive || !settings || eres2Missing,
+      title: eres2Missing ? t("settings.speaker.eres2Missing") : undefined,
+    },
+  ]);
   // 切换前先弹一步轻量行内确认(同存储区「清理…」的 purge-bar 形态):无样本人物
   // 换模型后质心被清空、重建前认不出,得让用户知情再动手。
   let pendingSpeakerModel = $state<string | null>(null);
@@ -683,31 +732,25 @@
     <div class="rows">
       <div class="row">
         <div class="row-info"><span class="row-label">{t("settings.theme.label")}</span></div>
-        <div class="seg">
-          <label class="seg-item">
-            <input type="radio" name="theme" value="light" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.light")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="theme" value="dark" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.dark")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="theme" value="system" bind:group={themeChoice} disabled={!settings} onchange={changeTheme} />{t("settings.theme.system")}
-          </label>
-        </div>
+        <Segmented
+          items={themeItems}
+          value={themeChoice}
+          onSelect={(id) => {
+            themeChoice = id;
+            changeTheme();
+          }}
+        />
       </div>
       <div class="row">
         <div class="row-info"><span class="row-label">{t("common.language.label")}</span></div>
-        <div class="seg">
-          <label class="seg-item">
-            <input type="radio" name="ui-lang" value="zh" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.zh")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="ui-lang" value="en" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.en")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="ui-lang" value="system" bind:group={langChoice} disabled={!settings} onchange={changeLang} />{t("common.language.system")}
-          </label>
-        </div>
+        <Segmented
+          items={langItems}
+          value={langChoice}
+          onSelect={(id) => {
+            langChoice = id;
+            changeLang();
+          }}
+        />
       </div>
       <div class="row">
         <div class="row-info">
@@ -779,6 +822,20 @@
           >
         {/if}
       </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.record.audioRetention.label")}</span>
+          <span class="row-desc">{t("settings.record.audioRetention.desc")}</span>
+        </div>
+        <Segmented
+          items={audioRetentionItems}
+          value={audioRetention}
+          onSelect={(id) => {
+            audioRetention = id as "forever" | "90d" | "30d";
+            saveSetting((s) => (s.audio_retention = audioRetention));
+          }}
+        />
+      </div>
     </div>
     {#if showPurge}
       <div class="purge-bar">
@@ -806,58 +863,6 @@
   <section>
     <h2 class="section-title">{t("settings.section.record")}</h2>
     <div class="rows">
-      <label class="row">
-        <div class="row-info">
-          <span class="row-label">{t("settings.record.sysOnly.label")}</span>
-          <span class="row-desc">{t("settings.record.sysOnly.desc")}</span>
-        </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={sysOnly}
-          disabled={!settings}
-          onchange={() => saveSetting((s) => (s.record_system_only = sysOnly))}
-        />
-      </label>
-      <label class="row" class:dim={sysOnly}>
-        <div class="row-info">
-          <span class="row-label">{t("settings.record.keepVol.label")}</span>
-          <span class="row-desc">{t("settings.record.keepVol.desc")}{sysOnly ? t("settings.record.keepVol.sysOnlySuffix") : ""}</span>
-        </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={keepVol}
-          disabled={!settings || sysOnly}
-          onchange={() => saveSetting((s) => (s.keep_output_volume = keepVol))}
-        />
-      </label>
-      <label class="row">
-        <div class="row-info">
-          <span class="row-label">{t("settings.record.langFilter.label")}</span>
-          <span class="row-desc">{t("settings.record.langFilter.desc")}</span>
-        </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={langFilter}
-          disabled={!settings}
-          onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
-        />
-      </label>
-      <label class="row">
-        <div class="row-info">
-          <span class="row-label">{t("settings.record.keepAudio.label")}</span>
-          <span class="row-desc">{t("settings.record.keepAudio.desc")}</span>
-        </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={keepAudio}
-          disabled={!settings}
-          onchange={() => saveSetting((s) => (s.keep_audio = keepAudio))}
-        />
-      </label>
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.record.audioScheme.label")}</span>
@@ -909,60 +914,27 @@
             {asrMode === "cloud" ? t("settings.asrMode.cloudDesc") : t("settings.asrMode.localDesc")}
           </span>
         </div>
-        <div class="seg" class:disabled={recording.isLive}>
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="asrmode"
-              value="local"
-              bind:group={asrMode}
-              disabled={recording.isLive || !settings}
-              onchange={() => changeAsrMode("local")}
-            />{t("settings.asrMode.local")}
-          </label>
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="asrmode"
-              value="cloud"
-              bind:group={asrMode}
-              disabled={recording.isLive || !settings}
-              onchange={() => changeAsrMode("cloud")}
-            />{t("settings.asrMode.cloud")}
-          </label>
-        </div>
+        <Segmented
+          items={asrModeItems}
+          value={asrMode}
+          onSelect={(id) => {
+            asrMode = id;
+            changeAsrMode(id);
+          }}
+        />
       </div>
       {#if asrMode === "cloud"}
         <div class="row">
           <div class="row-info"><span class="row-label">{t("settings.cloud.provider")}</span></div>
-          <div class="seg" class:disabled={recording.isLive}>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="cloudprovider"
-                value="volcano"
-                bind:group={cloudProvider}
-                disabled={recording.isLive || !settings}
-                onchange={() => {
-                  invalidateCloudTest();
-                  saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
-                }}
-              />{t("settings.cloud.volcano")}
-            </label>
-            <label class="seg-item">
-              <input
-                type="radio"
-                name="cloudprovider"
-                value="aliyun"
-                bind:group={cloudProvider}
-                disabled={recording.isLive || !settings}
-                onchange={() => {
-                  invalidateCloudTest();
-                  saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
-                }}
-              />{t("settings.cloud.aliyun")}
-            </label>
-          </div>
+          <Segmented
+            items={cloudProviderItems}
+            value={cloudProvider}
+            onSelect={(id) => {
+              cloudProvider = id;
+              invalidateCloudTest();
+              saveSetting((s) => (s.cloud_asr_provider = cloudProvider));
+            }}
+          />
         </div>
         {#if cloudProvider === "volcano"}
           <div class="row">
@@ -1101,31 +1073,14 @@
               : t("settings.speaker.campplusDesc")}
           </span>
         </div>
-        <div class="seg" class:disabled={recording.isLive}>
-          <label class="seg-item">
-            <input
-              type="radio"
-              name="speaker-model"
-              value="campplus"
-              bind:group={speakerChoice}
-              disabled={recording.isLive || !settings}
-              onchange={() => changeSpeakerModel("campplus")}
-            />CAM++
-          </label>
-          <label
-            class="seg-item"
-            title={eres2Missing ? t("settings.speaker.eres2Missing") : ""}
-          >
-            <input
-              type="radio"
-              name="speaker-model"
-              value="eres2netv2"
-              bind:group={speakerChoice}
-              disabled={recording.isLive || !settings || eres2Missing}
-              onchange={() => changeSpeakerModel("eres2netv2")}
-            />ERes2NetV2
-          </label>
-        </div>
+        <Segmented
+          items={speakerModelItems}
+          value={speakerChoice}
+          onSelect={(id) => {
+            speakerChoice = id;
+            changeSpeakerModel(id);
+          }}
+        />
       </div>
       {#if pendingSpeakerModel}
         <div class="purge-bar">
@@ -1138,10 +1093,20 @@
           </div>
         </div>
       {/if}
-      <label class="row">
+      <!-- 非 <label>:徽标里挂了跳转按钮,若整行仍是 <label> 点按钮会被浏览器
+           顺带判成"点了 label"而误触开关(nested interactive 元素的经典坑)。 -->
+      <div class="row">
         <div class="row-info">
           <span class="row-label">{t("settings.refine.label")}</span>
           <span class="row-desc">{t("settings.refine.desc")}</span>
+          {#if refineOn && !refineConfigReady}
+            <span class="row-badge">
+              {t("settings.refine.notReady")}
+              <button type="button" class="link" onclick={() => goto("/ai")}>
+                {t("settings.refine.goConfig")}
+              </button>
+            </span>
+          {/if}
         </div>
         <input
           type="checkbox"
@@ -1150,20 +1115,7 @@
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.refine_enabled = refineOn))}
         />
-      </label>
-      <label class="row">
-        <div class="row-info">
-          <span class="row-label">{t("settings.identifyAuto.label")}</span>
-          <span class="row-desc">{t("settings.identifyAuto.desc")}</span>
-        </div>
-        <input
-          type="checkbox"
-          class="ctl switch"
-          bind:checked={identifyAuto}
-          disabled={!settings || !refineOn}
-          onchange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
-        />
-      </label>
+      </div>
     </div>
     {#if asrMode === "local" && asrModelMissing}
       <div class="banner warn">{t("settings.asr.modelMissing")}</div>
@@ -1244,7 +1196,7 @@
               </div>
               <div class="url-line">
                 <span class="url-tag">{t("settings.models.mirrorUrl")}</span>
-                {#if settings?.mirror_enabled && (settings?.mirror_prefix ?? "").trim()}
+                {#if settings?.mirror_enabled}
                   <code class="url-text">{effectiveUrl(a.url)}</code>
                   <button class="link" onclick={() => navigator.clipboard.writeText(effectiveUrl(a.url))}>{t("settings.models.copy")}</button>
                 {:else}
@@ -1283,6 +1235,55 @@
           disabled={!settings}
           onchange={toggleMirror}
         />
+      </div>
+    </div>
+  </section>
+
+  <!-- —— 高级(默认收起,低频/进阶选项)—— -->
+  <section>
+    <h2 class="section-title">
+      <button
+        type="button"
+        class="adv-toggle"
+        aria-expanded={advOpen}
+        aria-controls="adv-body"
+        onclick={() => (advOpen = !advOpen)}
+      >
+        <span class="caret adv-caret" class:open={advOpen}>▸</span>
+        {t("settings.section.advanced")}
+      </button>
+    </h2>
+    <p class="desc adv-desc">{t("settings.section.advancedDesc")}</p>
+    <div id="adv-body" class="adv-body" class:open={advOpen} inert={!advOpen}>
+      <div class="adv-body-inner">
+        <div class="rows">
+          <label class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.record.langFilter.label")}</span>
+              <span class="row-desc">{t("settings.record.langFilter.desc")}</span>
+            </div>
+            <input
+              type="checkbox"
+              class="ctl switch"
+              bind:checked={langFilter}
+              disabled={!settings}
+              onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
+            />
+          </label>
+          <label class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.identifyAuto.label")}</span>
+              <span class="row-desc">{t("settings.identifyAuto.desc")}</span>
+            </div>
+            <input
+              type="checkbox"
+              class="ctl switch"
+              bind:checked={identifyAuto}
+              disabled={!settings || !refineOn}
+              onchange={() => saveSetting((s) => (s.identify_auto_apply = identifyAuto))}
+            />
+          </label>
+        </div>
       </div>
     </div>
   </section>
@@ -1388,6 +1389,47 @@
     color: var(--ink-secondary);
     margin: 0 0 0.45rem;
   }
+  /* 「高级」折叠区:disclosure 按钮复用 section-title 字号/颜色,chevron 与「语音模型」
+     区的 url-toggle 同款旋转;展开态用 grid-template-rows 0fr→1fr 做无需测高的
+     max-height 式过渡(内容行数变化也不用重算),配合 opacity 一起淡入。 */
+  .adv-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+  }
+  .adv-desc {
+    margin: 0 0 0.45rem;
+  }
+  .adv-body {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition:
+      grid-template-rows 120ms ease,
+      opacity 120ms ease;
+  }
+  .adv-body.open {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+  .adv-body-inner {
+    overflow: hidden;
+    min-height: 0;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .adv-body,
+    .caret {
+      transition: none;
+    }
+  }
   /* 设置行卡片(macOS 系统设置式):surface 底承载各行,行间 hairline 分隔,
      左标题+一行说明、右侧控件;label 行整行可点切换开关 */
   .rows {
@@ -1409,9 +1451,6 @@
   label.row {
     cursor: pointer;
   }
-  .row.dim {
-    opacity: 0.55;
-  }
   .row-info {
     flex: 1;
     min-width: 0;
@@ -1432,6 +1471,18 @@
     font-size: 0.8rem;
     color: var(--ink-secondary);
     word-break: break-all;
+  }
+  /* 会后 AI 就绪徽标:开关开但配置未齐备时旁挂,warning-ink 小字 + 去配置链接 */
+  .row-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.78rem;
+    color: var(--warning-ink);
+  }
+  .row-badge .link {
+    font-size: inherit;
+    padding: 0 0.2em;
   }
   /* 「语音模型」区的存储位置行:整行可点,在文件管理器中打开目录。 */
   .models-path {

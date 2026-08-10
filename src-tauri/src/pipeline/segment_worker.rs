@@ -41,7 +41,7 @@ fn emit_finished(
 /// 节流上报——暂停期间持续，供 UI 确认麦克风存活。
 /// audio_sink（音频保留）在暂停闸之后、segmenter.accept 之前收到与 accept 严格
 /// 同源的样本——写成 WAV 后「文件位置 == 段时间轴」按构造对齐;暂停期不写。
-/// aec（软件回声消除,「保持外放音量」模式）:system 路 Render 喂远端参考(样本不变),
+/// aec（软件回声消除,capture_path=aec 路径）:system 路 Render 喂远端参考(样本不变),
 /// mic 路 Capture 消回声——sink 与 accept 收到的都是消除后的干净样本,录音回放与
 /// 转写一致。电平表在 AEC 之前:反映麦克风真实听到的(含外放),供确认设备存活。
 #[allow(clippy::too_many_arguments)]

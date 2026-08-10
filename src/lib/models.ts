@@ -19,7 +19,6 @@ export type ModelsStatus = {
 };
 export type Settings = {
   mirror_enabled: boolean;
-  mirror_prefix: string;
   data_dir?: string | null;
   models_dir?: string | null;
   asr_model: string;
@@ -41,14 +40,14 @@ export type Settings = {
   theme: string;
   // UI 语言:"system" | "zh" | "en"。注意与 language_filter(转写乱码过滤)无关。
   ui_lang: string;
-  // 仅录系统声(不录麦克风)
-  record_system_only: boolean;
-  // 录制时保持外放音量:麦克风用普通输入代替 VPIO(无 ducking,失去系统回声消除)
-  keep_output_volume: boolean;
+  /** 麦克风采集路径逃生舱:"aec"(默认,普通输入 + 软件 AEC)/ "vpio"(通话模式,系统级
+   * ducking + Apple AEC)。json-only,无 UI——手改 settings.json 才会切到 vpio。 */
+  capture_path: "aec" | "vpio";
   // 转写语言过滤开关
   language_filter: boolean;
-  // 是否保留原始录音音频
-  keep_audio: boolean;
+  /** 录音音频保留期:"forever"(默认,不清理)/ "90d" / "30d"。到期后台自动清理音频轨
+   * (笔记文字与说话人不受影响,同手动「清理…」的语义)。 */
+  audio_retention: "forever" | "90d" | "30d";
   // 全局快捷键开关
   shortcut_enabled: boolean;
   // 全局快捷键组合(tauri accelerator 格式,如 "Alt+CmdOrCtrl+R")
@@ -95,6 +94,9 @@ export type MigrateEvent = { kind: "data" | "models"; phase: "copying" | "done" 
 
 export const modelsStatus = () => invoke<ModelsStatus>("models_status");
 export const openModelsDir = () => invoke<void>("open_models_dir");
+/** 硬承诺双轨的拒录引导卡「打开系统设置」按钮:跳转屏幕录制隐私页(macOS)。
+ * Windows 无对应页面,后端返回 Err(引导卡在 unavailable 分支不渲染该按钮)。 */
+export const openScreenCaptureSettings = () => invoke<void>("open_screen_capture_settings");
 export const downloadModels = (ids?: string[]) => invoke<void>("download_models", { ids: ids ?? null });
 export const deleteModel = (id: string) => invoke<void>("delete_model", { id });
 export const cancelModelsDownload = () => invoke<void>("cancel_models_download");

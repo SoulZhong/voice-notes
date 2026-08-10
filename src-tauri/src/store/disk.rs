@@ -67,6 +67,36 @@ pub fn should_purge(note_dir: &Path, cutoff_rfc3339: Option<&str>) -> bool {
     ts < cutoff
 }
 
+/// `should_purge` + 跨进程互斥探锁 + `purge_note_audio` 的一体版:调用方(自动保留期清理
+/// 与 `purge_audio` 命令共用的 `purge_audio_older_than`)按笔记逐个调用即可,不必自己重复
+/// 探锁逻辑。
+///
+/// 动机:本进程的 `AppState`(running/session 槽)只反映"这个进程"的活动状态——另一个
+/// 共享同一数据目录的应用实例仍可能正在转写/补生成/续录这个笔记(那些路径全程持
+/// `NoteLock`,见 refine/retranscribe/regen worker 的注释),自动清理若无视这一点直接删
+/// 音频/改写 audio.json,会和它们的写入相撞。做法与启动扫描(探锁修 WAV 头)、转码
+/// worker(探锁转码删源 WAV)完全一致:非阻塞 `try_exclusive`,拿不到就跳过整个笔记
+/// (只打日志,不算入释放字节,下次清理窗口再试,不丢);拿到则持锁贯穿"删音频文件 +
+/// 改写 audio.json"两步,直到清理完成才释放。
+pub fn purge_note_audio_if_unlocked(note_dir: &Path, cutoff_rfc3339: Option<&str>) -> u64 {
+    if !should_purge(note_dir, cutoff_rfc3339) {
+        return 0;
+    }
+    let lock = match super::notelock::NoteLock::try_exclusive(note_dir) {
+        Ok(Some(l)) => l,
+        _ => {
+            eprintln!(
+                "清理跳过笔记(另一实例持锁,可能在转写/补生成/续录): {}",
+                note_dir.display()
+            );
+            return 0;
+        }
+    };
+    let freed = purge_note_audio(note_dir);
+    drop(lock);
+    freed
+}
+
 /// 删除该笔记目录下的音频文件(m4a/wav/m4a.bad),并清掉 audio.json 里对应 track 的
 /// codec/duration_ms(回落到"无压缩产物"的记录形状,offset_ms 保留——它是时间轴对齐
 /// 信息,和音频是否还在磁盘上无关)。返回实际删除的字节数。
@@ -224,5 +254,36 @@ mod tests {
         write_meta(tmp.path(), "complete", "2026-01-01T00:00:00+08:00", None);
         // 无任何音频文件、无 audio.json:应安全返回 0,不 panic。
         assert_eq!(purge_note_audio(tmp.path()), 0);
+    }
+
+    #[test]
+    fn purge_note_audio_if_unlocked_skips_when_another_holder_has_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_meta(tmp.path(), "complete", "2026-01-01T00:00:00+08:00", None);
+        std::fs::write(tmp.path().join("mic.wav"), vec![0u8; 30]).unwrap();
+
+        // 模拟另一实例正在使用这个笔记目录(转写/补生成/续录全程持 NoteLock)。
+        let held = super::super::notelock::NoteLock::try_exclusive(tmp.path())
+            .unwrap()
+            .expect("测试需先拿到锁以模拟另一持有者");
+
+        let freed = purge_note_audio_if_unlocked(tmp.path(), None);
+        assert_eq!(freed, 0, "锁被占用时应整笔记跳过,不计入释放字节");
+        assert!(tmp.path().join("mic.wav").exists(), "被跳过的笔记音频应原样保留");
+
+        drop(held);
+        let freed = purge_note_audio_if_unlocked(tmp.path(), None);
+        assert_eq!(freed, 30, "锁释放后应正常清理");
+        assert!(!tmp.path().join("mic.wav").exists());
+    }
+
+    #[test]
+    fn purge_note_audio_if_unlocked_returns_zero_when_should_not_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_meta(tmp.path(), "recording", "2026-01-01T00:00:00+08:00", None);
+        std::fs::write(tmp.path().join("mic.wav"), vec![0u8; 30]).unwrap();
+        // 不满足 should_purge(录制中)时不该走到探锁,直接返回 0。
+        assert_eq!(purge_note_audio_if_unlocked(tmp.path(), None), 0);
+        assert!(tmp.path().join("mic.wav").exists());
     }
 }

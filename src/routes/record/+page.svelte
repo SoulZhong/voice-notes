@@ -2,12 +2,17 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import { recording } from "$lib/recording.svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { speakerLabel, speakerColor, speakerInk } from "$lib/notes";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
-  import { modelsStatus, getSettings, setSettings, type ModelsStatus } from "$lib/models";
+  import {
+    modelsStatus,
+    getSettings,
+    setSettings,
+    openScreenCaptureSettings,
+    type ModelsStatus,
+  } from "$lib/models";
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
@@ -22,8 +27,9 @@
     }
   }
 
-  // 屏幕录制权限预检:未授权时系统声音只会在开录后静默降级,这里在开录前就常驻
-  // 提示(2026-07-07 实锤:用户所有笔记都没有 system 轨,自己毫无察觉)。
+  // 屏幕录制权限预检:硬承诺双轨下未授权时开录会被后端整场拆除(不再是静默降级),
+  // 这里在开录前就常驻提示,把"根本录不了"提前到点开录之前(2026-07-07 实锤:
+  // 用户所有笔记都没有 system 轨,自己毫无察觉——那是静默降级年代的教训)。
   // 查询失败按已授权处理,不误伤非 macOS/老系统。
   let screenPerm = $state(true);
   async function refreshScreenPerm() {
@@ -37,9 +43,9 @@
     try {
       // 系统授权弹窗一生只弹一次;已弹过(返回 false)就直接带去系统设置。
       const ok = await invoke<boolean>("request_screen_capture_permission");
-      if (!ok) await openScreenRecordingSettings();
+      if (!ok) await openScreenCaptureSettings();
     } catch {
-      await openScreenRecordingSettings();
+      await openScreenCaptureSettings();
     }
     triedScreenAuth = true;
     await refreshScreenPerm();
@@ -59,38 +65,29 @@
     await requestScreenPerm();
   }
 
-  // 蓝牙外放预警:「保持外放音量」+ 蓝牙输出时,蓝牙延迟(300~600ms+)超出软件
-  // 回声消除的追踪范围,mic 会混入近乎全量的对方声音(面试录音实锤)。开录前提示,
-  // 查询失败按"无风险"静默。
+  // 蓝牙外放预警:常态检测,只看设备现实——蓝牙输出正在使用时,蓝牙延迟(300~600ms+)
+  // 超出软件回声消除的追踪范围,mic 会混入近乎全量的对方声音(面试录音实锤)。
+  // 与 capture_path(aec/vpio)设置无关(那是采集路径的逃生舱,不是这条风险的成因),
+  // 现默认 aec 下不再按设置项门控这条提示。开录前提示,查询失败按"无风险"静默。
   let btEchoRisk = $state(false);
   async function refreshBtRisk() {
     try {
-      const [s, bt] = await Promise.all([
-        getSettings(),
-        invoke<boolean>("output_is_bluetooth"),
-      ]);
-      btEchoRisk = s.keep_output_volume && bt;
+      btEchoRisk = await invoke<boolean>("output_is_bluetooth");
     } catch {
       btEchoRisk = false;
     }
   }
 
-  // 输入音量过低预警(普通麦克风模式):系统输入音量被会议软件拉低会录得很轻。
-  // 开录前 + 录制中都检测,一键调回可用电平;VPIO 模式(自带 AGC)/仅系统声不检测。
+  // 输入音量过低预警:系统输入音量被会议软件拉低会录得很轻,与采集路径设置无关,
+  // 纯按当前电平判定。开录前 + 录制中都检测,一键调回可用电平。
   const LOW_INPUT_THRESHOLD = 50;
   const INPUT_TARGET = 75;
   const POLL_MS = 4000;
   let lowInputVol = $state<{ vol: number } | null>(null);
   async function refreshInputVol() {
     try {
-      const [s, vol] = await Promise.all([
-        getSettings(),
-        invoke<number | null>("input_volume"),
-      ]);
-      lowInputVol =
-        s.keep_output_volume && !s.record_system_only && vol != null && vol < LOW_INPUT_THRESHOLD
-          ? { vol }
-          : null;
+      const vol = await invoke<number | null>("input_volume");
+      lowInputVol = vol != null && vol < LOW_INPUT_THRESHOLD ? { vol } : null;
     } catch {
       lowInputVol = null;
     }
@@ -222,10 +219,34 @@
             ? t("record.status.stopped")
             : t("record.status.ready"),
   );
-  async function openScreenRecordingSettings() {
-    await openUrl(
-      "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-    );
+
+  // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
+  // system_denied=屏幕录制权限缺失(可操作:引导去系统设置);system_unavailable=
+  // 设备/组件问题或 Windows(该平台无此权限模型,恒 unavailable,见 lib.rs
+  // open_screen_capture_settings 注释)。denied 判定放前面:denied 场景下字符串里
+  // 不会同时出现 unavailable,顺序无所谓,但先判更符合"先看能不能引导授权"的直觉。
+  const isSystemDenied = $derived(
+    isError(recording.status) && recording.status.includes("system_denied"),
+  );
+  const isSystemUnavailable = $derived(
+    isError(recording.status) &&
+      !isSystemDenied &&
+      recording.status.includes("system_unavailable"),
+  );
+  /** 展示用状态串:剥掉后端塞进错误串给前端分支用的分类 token(用户不需要看到
+      " [system_denied]" 这种内部标记)。仅在下方红色详情行渲染时使用；
+      isSystemDenied/isSystemUnavailable 场景下该行整体不渲染,引导卡是唯一
+      信息面(见下方 markup)。 */
+  const displayStatus = $derived(
+    recording.status.replace(/ \[system_(denied|unavailable)\]$/, ""),
+  );
+  async function openSystemAudioPrivacySettings() {
+    try {
+      await openScreenCaptureSettings();
+    } catch {
+      // Windows/非 macOS 命令恒 Err;引导卡的「打开系统设置」按钮只在 denied 分支
+      // 渲染(该分支目前只有 macOS 权限缺失会触发),此处兜底不弹二次错误打扰用户。
+    }
   }
 
   async function startRecording() {
@@ -377,9 +398,29 @@
         {/if}
       </div>
 
-      <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行 -->
-      {#if isError(recording.status)}
-        <p class="status error"><span class="status-dot"></span>{recording.status}</p>
+      <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行。
+           System 分类错误(isSystemDenied/isSystemUnavailable)不重复展示这行原始
+           串——下方引导卡是这类错误的唯一信息面,避免同一件事说两遍。 -->
+      {#if isError(recording.status) && !isSystemDenied && !isSystemUnavailable}
+        <p class="status error"><span class="status-dot"></span>{displayStatus}</p>
+      {/if}
+
+      <!-- 硬承诺双轨拒录引导卡:System 起不来时后端整场拆除(不静默降级),这里按分类
+           分支引导——权限缺失给可操作的「打开系统设置」;设备/组件不可用（含 Windows）
+           只给说明,没有可操作的跳转。 -->
+      {#if isSystemDenied}
+        <div class="banner">
+          <strong>{t("record.systemDenied.title")}</strong>
+          {t("record.systemDenied.desc")}
+          <button class="link" onclick={openSystemAudioPrivacySettings}>
+            {t("record.banner.openSettings")}
+          </button>
+        </div>
+      {:else if isSystemUnavailable}
+        <div class="banner">
+          {t("record.systemUnavailable.desc")}
+          <span class="hint">{displayStatus}</span>
+        </div>
       {/if}
 
       <!-- 云端识别连接状态:仅云端模式录制时有事件,细提示条,不打断转写视线 -->
@@ -405,20 +446,24 @@
       </div>
     {/if}
 
-    {#if btEchoRisk && !recording.isLive}
+    <!-- 常态检测(设备现实驱动,与 isSystemDenied/isSystemUnavailable 引导卡互斥):
+         那两张卡是"根本录不了"的唯一信息面,同屏再叠加音质类提示只会分散注意力。 -->
+    {#if btEchoRisk && !recording.isLive && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.btEcho")}
       </div>
     {/if}
 
-    {#if lowInputVol}
+    {#if lowInputVol && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.lowInput", { vol: lowInputVol.vol })}
         <button class="link" onclick={fixInputVol}>{t("record.banner.setVolume", { target: INPUT_TARGET })}</button>
       </div>
     {/if}
 
-    {#if !screenPerm && !recording.isLive}
+    <!-- isSystemDenied 时上方引导卡已是唯一授权引导面,这条常驻预检横幅让位,
+         避免同一件"去系统设置授权"的事同屏说两遍。 -->
+    {#if !screenPerm && !recording.isLive && !isSystemDenied}
       <div class="banner">
         {t("record.banner.screenPerm")}
         <button class="link" onclick={requestScreenPerm}>{t("record.banner.authorizeNow")}</button>
@@ -430,14 +475,6 @@
             <span class="hint">{t("record.banner.permFixHint")}</span>
           </div>
         {/if}
-      </div>
-    {/if}
-
-    {#if recording.isLive && recording.systemAudio !== "on" && recording.systemAudio !== ""}
-      <div class="banner">
-        {t("record.banner.sysAudioOff")}
-        <button class="link" onclick={openScreenRecordingSettings}>{t("record.banner.openSettings")}</button>
-        <span class="hint">{t("record.banner.sysAudioOffHint")}</span>
       </div>
     {/if}
 
