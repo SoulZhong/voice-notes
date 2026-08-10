@@ -1,0 +1,1002 @@
+# 笔记头部操作区重设计 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 把笔记详情页 topbar 的按钮统一为三级控件体系(英雄级/segmented/幽灵),两处切换换成凹槽式 segmented(滑块平滑滑动),破坏性二段确认包进警示胶囊;并新增两个笔记级动作:导出成品轨音频、打开存储目录(头部导出收成一个菜单钮)。
+
+**Architecture:** 新增通用组件 `src/lib/Segmented.svelte`(滑块用绝对定位 + offsetLeft/offsetWidth 测量,键盘导航逻辑抽成纯函数可单测);`src/routes/notes/[id]/+page.svelte` 的 topbar 区域换用该组件并统一幽灵按钮/警示胶囊样式;后端在 store/export.rs 与 lib.rs 加 `export_audio_to`/`export_note_audio`/`open_note_dir`(守卫与 export_to 同源,opener 走 open_models_dir 先例)。
+
+**Tech Stack:** Svelte 5(runes:`$props/$state/$derived/$effect`)、vitest(纯逻辑单测,node 环境跑不了组件挂载——仓库既有约定)、Rust/Tauri 2(tauri-plugin-opener)、CSS 自定义属性 token(真值源 `src/app.css`)。
+
+**Spec:** `docs/superpowers/specs/2026-08-09-note-header-redesign-design.md`
+
+## Global Constraints
+
+- 业务逻辑/状态机/事件一字不改:`rerunIdentify`、`doExport`、`switchScheme`、`startRegen`、`rerunRefine`、`startRetranscribe` 的行为与禁用条件全部保留,只换视觉壳。
+- AI 魔杖按钮(`.reaing` 及其全部动效)**原样保留,不碰**。
+- 图标一律 16px 线性 SVG(`stroke="currentColor"`),**禁 emoji 与 Unicode 符号字符**(DESIGN.md 原则 7)。
+- 颜色/圆角/阴影只用 `src/app.css` 已定义 token;注意 `--surface-sunken` **未定义**(旧代码靠 fallback),凹槽轨道用 `--surface-soft`。
+- 全部过渡 120ms ease;`prefers-reduced-motion: reduce` 时禁用滑块滑动与胶囊入场动画。
+- i18n:所有文案走 `t()`;既有 key 不改语义,新增仅限 Task 6 的 6 个 key(zh/en 双语齐平,过 parity 测试)。
+- 提交信息**不加任何 Co-Authored-By trailer**(仓库纪律)。
+- 工作分支:`note-header-redesign`(已存在,基于 master)。
+- 每个任务收尾跑 `npm run check` 与 `npm test`,全绿才提交。
+
+---
+
+### Task 1: Segmented 组件(纯函数 + 组件)
+
+**Files:**
+- Create: `src/lib/segmented.ts`
+- Create: `src/lib/segmented.test.ts`
+- Create: `src/lib/Segmented.svelte`
+
+**Interfaces:**
+- Produces:
+  - `SegmentedItem`(`{ id: string; label: string; disabled?: boolean; title?: string; momentary?: boolean }`)与 `nextEnabledIndex(items, current, dir): number`,自 `$lib/segmented` 导出;
+  - `Segmented.svelte` props:`{ items: SegmentedItem[]; value: string; onSelect: (id: string) => void; onAction?: (id: string) => void; size?: "sm" | "md" }`。后续任务按此签名引用。
+
+- [ ] **Step 1: 写失败测试**
+
+`src/lib/segmented.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { nextEnabledIndex } from "./segmented";
+
+describe("nextEnabledIndex(segmented 方向键导航)", () => {
+  it("正向走到下一个可选段", () => {
+    expect(nextEnabledIndex([{}, {}], 0, 1)).toBe(1);
+  });
+  it("到末尾环绕回开头", () => {
+    expect(nextEnabledIndex([{}, {}], 1, 1)).toBe(0);
+  });
+  it("跳过 disabled 段", () => {
+    expect(nextEnabledIndex([{}, { disabled: true }, {}], 0, 1)).toBe(2);
+  });
+  it("跳过 momentary 动作段(如「生成成品轨」)——环绕一圈只剩自己", () => {
+    expect(nextEnabledIndex([{}, { momentary: true }], 0, 1)).toBe(0);
+  });
+  it("反向同样跳过不可选段", () => {
+    expect(nextEnabledIndex([{}, { disabled: true }, {}], 2, -1)).toBe(0);
+  });
+  it("空列表原样返回 current", () => {
+    expect(nextEnabledIndex([], -1, 1)).toBe(-1);
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `npx vitest run src/lib/segmented.test.ts`
+Expected: FAIL(`Cannot find module './segmented'` 或同义报错)
+
+- [ ] **Step 3: 实现 `src/lib/segmented.ts`**
+
+```ts
+// Segmented 控件的数据模型与键盘导航纯函数(组件运行时行为在 node 单测里
+// 跑不起来——仓库既有约定,可测逻辑抽到这里)。
+
+export interface SegmentedItem {
+  id: string;
+  label: string;
+  disabled?: boolean;
+  /** 悬停提示;disabled 时用来解释原因 */
+  title?: string;
+  /** 动作段:点击触发 onAction 而非切换,滑块不落位(如 mix-switch 的「生成成品轨」) */
+  momentary?: boolean;
+}
+
+/** 方向键导航:从 current 沿 dir 环绕找下一个可选段(跳过 disabled 与 momentary);
+    全都不可选时原样返回 current。 */
+export function nextEnabledIndex(
+  items: Pick<SegmentedItem, "disabled" | "momentary">[],
+  current: number,
+  dir: 1 | -1,
+): number {
+  const n = items.length;
+  if (n === 0) return current;
+  for (let step = 1; step <= n; step++) {
+    const i = (((current + dir * step) % n) + n) % n;
+    const it = items[i]!;
+    if (!it.disabled && !it.momentary) return i;
+  }
+  return current;
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `npx vitest run src/lib/segmented.test.ts`
+Expected: PASS(6 个用例全绿)
+
+- [ ] **Step 5: 实现 `src/lib/Segmented.svelte`**
+
+```svelte
+<script lang="ts">
+  import { nextEnabledIndex, type SegmentedItem } from "./segmented";
+
+  let {
+    items,
+    value,
+    onSelect,
+    onAction,
+    size = "md",
+  }: {
+    items: SegmentedItem[];
+    value: string;
+    onSelect: (id: string) => void;
+    onAction?: (id: string) => void;
+    size?: "sm" | "md";
+  } = $props();
+
+  let trackEl: HTMLDivElement | undefined = $state();
+  let btns: (HTMLButtonElement | undefined)[] = $state([]);
+  // 滑块几何。ready=false 时不播过渡:首帧直接落位,不从 0 滑入。
+  let thumb = $state({ left: 0, width: 0, ready: false });
+
+  const activeIdx = $derived(items.findIndex((it) => !it.momentary && it.id === value));
+
+  function measure() {
+    const btn = activeIdx >= 0 ? btns[activeIdx] : undefined;
+    if (!btn || !trackEl) {
+      thumb = { ...thumb, width: 0 };
+      return;
+    }
+    // offsetLeft 相对 offsetParent 边框盒,减 clientLeft(轨道 1px 边)对齐 padding 盒
+    thumb = { left: btn.offsetLeft - trackEl.clientLeft, width: btn.offsetWidth, ready: thumb.ready };
+    if (!thumb.ready) requestAnimationFrame(() => (thumb = { ...thumb, ready: true }));
+  }
+
+  // 选中变化/文案变化(i18n 切换、「生成中(阶段)」计数)→ 重测;ResizeObserver 兜底容器与字体变化
+  $effect(() => {
+    void activeIdx;
+    void items.map((it) => it.label).join("\0");
+    measure();
+  });
+  $effect(() => {
+    if (!trackEl) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(trackEl);
+    return () => ro.disconnect();
+  });
+
+  function handleKey(e: KeyboardEvent) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const next = nextEnabledIndex(items, activeIdx, e.key === "ArrowRight" ? 1 : -1);
+    if (next === activeIdx || next < 0) return;
+    e.preventDefault();
+    onSelect(items[next]!.id);
+    btns[next]?.focus();
+  }
+</script>
+
+<div class="seg" class:sm={size === "sm"} role="tablist" bind:this={trackEl}>
+  <span
+    class="thumb"
+    class:ready={thumb.ready}
+    class:gone={thumb.width === 0}
+    style={`transform: translateX(${thumb.left}px); width: ${thumb.width}px;`}
+    aria-hidden="true"
+  ></span>
+  {#each items as it, i (it.id)}
+    <button
+      bind:this={btns[i]}
+      type="button"
+      role={it.momentary ? undefined : "tab"}
+      aria-selected={it.momentary ? undefined : it.id === value}
+      class="seg-btn"
+      class:active={!it.momentary && it.id === value}
+      disabled={it.disabled}
+      title={it.title}
+      tabindex={it.momentary ? 0 : it.id === value ? 0 : -1}
+      onclick={() => (it.momentary ? onAction?.(it.id) : onSelect(it.id))}
+      onkeydown={handleKey}
+    >{it.label}</button>
+  {/each}
+</div>
+
+<style>
+  /* 凹槽式 segmented(DESIGN.md 命令面板语言):surface-soft 凹槽轨道 + 发丝线边,
+     选中项是抬升滑块(surface-press + hairline-strong + shadow-btn),120ms 滑动。 */
+  .seg {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    padding: 2px;
+    background: var(--surface-soft);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
+  }
+  .thumb {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 0;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline-strong);
+    border-radius: calc(var(--radius-md) - 2px);
+    box-shadow: var(--shadow-btn);
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .thumb.ready {
+    transition:
+      transform 120ms ease,
+      width 120ms ease;
+  }
+  .thumb.gone {
+    opacity: 0;
+  }
+  .seg-btn {
+    position: relative;
+    border: none;
+    background: none;
+    box-shadow: none;
+    padding: 0.28em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    line-height: 1.3;
+    letter-spacing: 0.2px;
+    color: var(--ink-secondary);
+    border-radius: calc(var(--radius-md) - 2px);
+    cursor: pointer;
+    transition: color 120ms ease;
+  }
+  .sm .seg-btn {
+    font-size: 0.8rem;
+    padding: 0.2em 0.55em;
+  }
+  .seg-btn:hover:not(:disabled),
+  .seg-btn.active {
+    color: var(--ink);
+  }
+  .seg-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .seg-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .thumb.ready {
+      transition: none;
+    }
+  }
+</style>
+```
+
+- [ ] **Step 6: 类型/编译检查**
+
+Run: `npm run check`
+Expected: 0 errors(warnings 与改动前持平)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/lib/segmented.ts src/lib/segmented.test.ts src/lib/Segmented.svelte
+git commit -m "feat(ui): 凹槽式 Segmented 组件——抬升滑块+方向键导航,统一切换控件语言"
+```
+
+---
+
+### Task 2: transport 行的 双轨/成品轨 换用 Segmented
+
+**Files:**
+- Modify: `src/routes/notes/[id]/+page.svelte`(标记区 `.mix-switch` 一段,约 L1385-1409;script 区新增 derived;style 区删 `.mix-switch .link` 两条规则)
+
+**Interfaces:**
+- Consumes: Task 1 的 `Segmented.svelte` 与 `SegmentedItem`。
+- Produces: 无(页面内部改动)。
+
+- [ ] **Step 1: script 区加 import 与 mixItems derived**
+
+在 `+page.svelte` script 顶部 import 区追加:
+
+```ts
+import Segmented from "$lib/Segmented.svelte";
+import type { SegmentedItem } from "$lib/segmented";
+```
+
+在 `playbackScheme`/`mixedInfo` 声明附近(约 L116 一带)追加:
+
+```ts
+// mix-switch 的 segmented 数据:有成品轨给 双轨/成品轨 切换(不可信置灰+tooltip 原因);
+// 没有则第二段是「生成」动作段(momentary,滑块不落位),沿用 startRegen/regenStage 原逻辑。
+const mixItems = $derived.by((): SegmentedItem[] => {
+  const dual: SegmentedItem = { id: "dual", label: t("notes.mix.dual") };
+  if (mixedInfo?.track) {
+    return [
+      dual,
+      {
+        id: "mixed",
+        label: t("notes.mix.mixed"),
+        disabled: mixedInfo.untrusted !== null,
+        title: mixedInfo.untrusted ?? t("notes.mix.title"),
+      },
+    ];
+  }
+  return [
+    dual,
+    {
+      id: "gen",
+      label: regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate"),
+      momentary: true,
+      disabled: regenStage !== null || recording.isLive,
+      title: t("notes.mix.none"),
+    },
+  ];
+});
+```
+
+- [ ] **Step 2: 替换 mix-switch 标记**
+
+把现有整块(从 `<div class="mix-switch" title={t("notes.mix.title")}>` 到其闭合 `</div>`,内含三个 `.link` 按钮的条件分支)替换为:
+
+```svelte
+<!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
+     动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
+<div class="mix-switch" title={t("notes.mix.title")}>
+  <Segmented
+    size="sm"
+    items={mixItems}
+    value={playbackScheme}
+    onSelect={(id) => switchScheme(id as "dual" | "mixed")}
+    onAction={startRegen}
+  />
+</div>
+```
+
+- [ ] **Step 3: style 区清理**
+
+`.mix-switch` 保留(flex 容器定位用),删除 `.mix-switch .link` 与 `.mix-switch .link.active` 两条规则:
+
+```css
+/* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位 */
+.mix-switch {
+  display: inline-flex;
+  gap: 0.15rem;
+  flex: none;
+  align-items: center;
+}
+```
+
+- [ ] **Step 4: 验证**
+
+Run: `npm run check && npm test`
+Expected: 全绿(`switchScheme` 的入参窄化 `id as "dual" | "mixed"` 不应报错;若 `startRegen` 签名带参不匹配 `onAction?: (id: string) => void`,包一层 `onAction={() => startRegen()}`)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add "src/routes/notes/[id]/+page.svelte"
+git commit -m "feat(ui): 双轨/成品轨切换换用 Segmented——生成动作段 momentary,置灰原因保留"
+```
+
+---
+
+### Task 3: 视图切换行——修订稿/原始逐字稿 换 Segmented,重转写升级幽灵按钮
+
+**Files:**
+- Modify: `src/routes/notes/[id]/+page.svelte`(`.view-switch` 标记区约 L1472-1554;style 区改 `.view-switch` 系规则、新增 `.ghost` 族)
+
+**Interfaces:**
+- Consumes: Task 1 的 `Segmented.svelte`/`SegmentedItem`(Task 2 已 import)。
+- Produces: `.ghost` CSS class(幽灵按钮族:无边框、ink-secondary、hover 浮现 surface-soft 底)——Task 5 的头部动作组复用,选择器就叫 `.ghost`。
+
+- [ ] **Step 1: script 区加 viewItems derived**
+
+在 `viewMode`/`refinedAvailable` 声明附近追加:
+
+```ts
+// 视图切换 segmented:无修订稿时该段置灰 + tooltip 原因(行为与旧 .link 版完全一致)
+const viewItems = $derived<SegmentedItem[]>([
+  {
+    id: "refined",
+    label: t("notes.view.refined"),
+    disabled: !refinedAvailable,
+    title: refinedAvailable ? undefined : t("notes.view.noRefined"),
+  },
+  { id: "raw", label: t("notes.view.raw") },
+]);
+```
+
+- [ ] **Step 2: 替换视图切换两个 tab 按钮**
+
+`.view-switch` 内开头两个 `.link` 按钮(修订稿/原始逐字稿)替换为:
+
+```svelte
+<Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
+```
+
+`<span class="spacer"></span>`、confirmRefine 分支、`.reaing` 按钮、retransConfirm 分支**全部原样保留**(胶囊化在 Task 4)。
+
+- [ ] **Step 3: 重转写按钮换幽灵形态**
+
+把 retransConfirm 的 else 分支里 `class="link"` 的重转写按钮替换为(逻辑与禁用条件一字不改,只换 class 和加图标):
+
+```svelte
+<button
+  class="ghost"
+  disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
+  title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
+  onclick={() => (retransConfirm = true)}
+>
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
+    <path d="M13.4 1.8v2.8h-2.8" />
+  </svg>
+  {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
+</button>
+```
+
+- [ ] **Step 4: style 区改造**
+
+删除 `.view-switch .link` 与 `.view-switch .link.active` 规则(`.link` 基础类保留——confirm 分支和日历行还在用);`.view-switch` 本体与 `.spacer` 保留,gap 调到 0.5rem 对齐 8px 栅格:
+
+```css
+/* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
+.view-switch {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem;
+}
+.view-switch .spacer {
+  flex: 1;
+}
+```
+
+新增幽灵按钮族(放在 `.act-btn` 规则附近,Task 5 会让头部动作组也用它):
+
+```css
+/* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
+   hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
+.ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  border: none;
+  background: transparent;
+  padding: 0.4em 0.7em;
+  font-size: 0.85rem;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: var(--ink-secondary);
+  border-radius: var(--radius-md);
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+.ghost:hover:not(:disabled) {
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+.ghost:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+.ghost svg {
+  flex: none;
+}
+```
+
+注意页面底部有元素级 `button { border: 1px solid ... }` 规则,`.ghost` 的 `border: none; background: transparent` 已覆盖;确认声明顺序在其后或特异性足够(class > 元素,足够)。
+
+- [ ] **Step 5: 验证**
+
+Run: `npm run check && npm test`
+Expected: 全绿
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add "src/routes/notes/[id]/+page.svelte"
+git commit -m "feat(ui): 视图切换换 Segmented,重转写升级幽灵按钮——工具行三级层级成形"
+```
+
+---
+
+### Task 4: 破坏性二段确认——警示胶囊
+
+**Files:**
+- Modify: `src/routes/notes/[id]/+page.svelte`(confirmRefine 与 retransConfirm 两个分支的标记;style 区新增 `.confirm-capsule`)
+
+**Interfaces:**
+- Consumes: 无新依赖。
+- Produces: `.confirm-capsule` CSS class(本页内两处共用,不抽组件——spec 明确)。
+
+- [ ] **Step 1: confirmRefine 分支包进胶囊**
+
+```svelte
+{#if confirmRefine}
+  <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
+  <div class="confirm-capsule">
+    <span class="refine-warn">{t("notes.refine.loseNames")}</span>
+    <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
+    <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
+  </div>
+{:else}
+```
+
+(else 分支 `.reaing` 原样不动。)
+
+- [ ] **Step 2: retransConfirm 分支包进胶囊**
+
+```svelte
+{#if retransConfirm}
+  <div class="confirm-capsule">
+    <span class="refine-warn">{t("notes.retrans.warn")}</span>
+    <button class="link danger" onclick={() => startRetranscribe("dual")}>
+      {t("notes.retrans.confirmDual")}
+    </button>
+    <button
+      class="link danger"
+      disabled={mixedReason !== null}
+      title={mixedReason ?? ""}
+      onclick={() => startRetranscribe("mixed")}
+    >
+      {t("notes.retrans.confirmMixed")}
+    </button>
+    <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+  </div>
+{:else}
+```
+
+(else 分支即 Task 3 的幽灵重转写按钮。)
+
+- [ ] **Step 3: style 区新增胶囊规则**
+
+放在 `.refine-warn` 规则旁:
+
+```css
+/* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
+   120ms 淡入下移 2px,行内占位不换行不跳版。 */
+.confirm-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem 0.25rem 0.75rem;
+  background: var(--warning-tint);
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-lg);
+  animation: capsule-in 120ms ease;
+}
+@keyframes capsule-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .confirm-capsule {
+    animation: none;
+  }
+}
+```
+
+`.refine-warn`(warning-ink 0.8rem)保留原规则不动。
+
+- [ ] **Step 4: 验证**
+
+Run: `npm run check && npm test`
+Expected: 全绿
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add "src/routes/notes/[id]/+page.svelte"
+git commit -m "feat(ui): 二段确认包进警示胶囊——warning token 三件套,行内不跳版"
+```
+
+---
+
+### Task 5: 后端——导出音频命令 + 打开笔记目录命令
+
+**Files:**
+- Modify: `src-tauri/src/store/export.rs`(新增 `export_audio_to` + 单测)
+- Modify: `src-tauri/src/lib.rs`(两个 `#[tauri::command]` + generate_handler 注册)
+
+**Interfaces:**
+- Consumes: `store::audio::mixed_track(note_dir: &Path) -> Option<TrackInfo>`(已有,src-tauri/src/store/audio.rs:792);`notes_dir(&app)`、`tr!` 宏、`open_models_dir` 先例(lib.rs:5678)。
+- Produces: 前端可 invoke 的 `export_note_audio(id, dest) -> String`(返回 dest)与 `open_note_dir(id) -> ()`。Task 6 按此名调用。
+
+- [ ] **Step 1: 写失败测试(export.rs 测试区,紧挨 export_to 既有测试,同款 tempdir 样板)**
+
+```rust
+#[test]
+fn export_audio_to_copies_mixed_track_to_dest() {
+    let (store, id) = fixture_note(); // 与 export_to_writes_rendered_content_at_dest 同款建档辅助;
+                                      // 若既有测试是内联建档,照抄其建档代码
+    let note_dir = store.note_dir(&id).unwrap();
+    std::fs::write(note_dir.join("mixed.wav"), b"RIFFfakewav").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("a.wav");
+    store.export_audio_to(&id, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"RIFFfakewav");
+}
+
+#[test]
+fn export_audio_to_errors_when_no_mixed_track() {
+    let (store, id) = fixture_note();
+    let out = tempfile::tempdir().unwrap();
+    assert!(store.export_audio_to(&id, &out.path().join("a.wav")).is_err());
+}
+
+#[test]
+fn export_audio_to_rejects_dest_inside_notes_dir() {
+    let (store, id) = fixture_note();
+    let note_dir = store.note_dir(&id).unwrap();
+    std::fs::write(note_dir.join("mixed.wav"), b"x").unwrap();
+    assert!(store.export_audio_to(&id, &note_dir.join("a.wav")).is_err());
+}
+```
+
+注:`mixed.wav` 是否被 `mixed_track` 识别以 audio.rs:1338 既有测试 `mixed_track_returns_the_mixed_source_with_consistent_semantics` 的 fixture 写法为准——先读它,照抄其落盘方式(可能还需 meta 标记)。
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml export_audio_to`
+Expected: FAIL(`export_audio_to` 不存在,编译错误)
+
+- [ ] **Step 3: 实现 `export_audio_to`(store/export.rs impl NoteStore 内)**
+
+把 `export_to` 里的 dest 守卫(绝对路径检查→file_name→canon_root→dest_parent→starts_with 检查,export.rs:20-40)提取为私有方法 `validate_export_dest(&self, id, dest) -> anyhow::Result<()>`,`export_to` 改调它,然后:
+
+```rust
+/// 导出成品轨音频到用户选定路径(保存对话框流程)。守卫与 export_to 同源
+/// (validate_export_dest);源文件由 mixed_track 解析,无成品轨报错。
+/// 拷贝走同目录临时文件 + rename 原子替换,与 export_to 同款崩溃纪律。
+pub fn export_audio_to(&self, id: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    self.validate_export_dest(id, dest)?;
+    let note_dir = self.note_dir(id)?;
+    let track = super::audio::mixed_track(&note_dir)
+        .ok_or_else(|| anyhow::anyhow!("此笔记没有成品轨"))?;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("导出路径缺少文件名"))?;
+    let tmp = dest.with_file_name(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::copy(&track.path, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+```
+
+(`TrackInfo.path` 字段类型以 audio.rs 实际定义为准——若是 `String` 则 `&track.path` 直接可用于 `fs::copy`;若是 `PathBuf` 同样可用。)
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml export_audio_to && cargo test --manifest-path src-tauri/Cargo.toml export_to`
+Expected: 新 3 例 + export_to 既有 5 例全绿(守卫提取不破坏旧测试)
+
+- [ ] **Step 5: lib.rs 两个命令 + 注册**
+
+放在 `export_note`(lib.rs:4900)旁:
+
+```rust
+/// 导出成品轨音频到用户选定路径(前端保存对话框拿到 dest)。守卫在 store 层
+/// (export_audio_to):绝对路径、不落数据目录内、tmp+rename 原子替换。
+#[tauri::command]
+fn export_note_audio(app: AppHandle, id: String, dest: String) -> Result<String, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .export_audio_to(&id, std::path::Path::new(&dest))
+        .map(|_| dest)
+        .map_err(|e| e.to_string())
+}
+
+/// 在系统文件管理器中打开该笔记的存储目录。走 Rust 侧 opener,
+/// 同 open_models_dir 先例:能直接打开目录本身,不依赖前端路径白名单。
+#[tauri::command]
+fn open_note_dir(app: AppHandle, id: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    if !dir.is_dir() {
+        return Err(tr!(
+            "笔记目录不存在: {path}",
+            "Note directory does not exist: {path}",
+            path = dir.display()
+        ));
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| tr!("打开目录失败: {e}", "Failed to open the directory: {e}"))
+}
+```
+
+在 `generate_handler![` 块(lib.rs:6848 起)`export_note,` 一行后追加 `export_note_audio,`、`open_note_dir,`。
+
+- [ ] **Step 6: 验证**
+
+Run: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml export`
+Expected: 编译过,export 相关测试全绿。**不要跑全量 cargo fmt**(仓库纪律)——只对改动文件 `rustfmt src-tauri/src/store/export.rs src-tauri/src/lib.rs`(若 rustfmt 直跑不便,保持手写风格与四邻一致即可)。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src-tauri/src/store/export.rs src-tauri/src/lib.rs
+git commit -m "feat(export): 后端导出成品轨音频 + 打开笔记目录命令——守卫与 export_to 同源"
+```
+
+---
+
+### Task 6: 前端——右上角动作组(重新推断身份 / 导出菜单 / 打开目录)+ 死样式清理 + 全量验证
+
+**Files:**
+- Modify: `src/lib/notes.ts`(`exportFileName` 加 ext 参数;新增 `exportNoteAudio`/`openNoteDir` 包装)
+- Modify: `src/lib/notes.test.ts`(`exportFileName` ext 用例)
+- Modify: `src/lib/i18n/dict/notes.ts`(6 个新 key,zh/en 双语)
+- Modify: `src/routes/notes/[id]/+page.svelte`(header `.row` 重构;style 区删 `.act-btn`、加 `.export-wrap/.export-menu`)
+
+**Interfaces:**
+- Consumes: Task 3 的 `.ghost` class;Task 5 的 `export_note_audio`/`open_note_dir` 命令;页面已有 `mixedInfo`、`doExport`、`exportMsg`/`error` 状态。
+- Produces: 无(收口任务)。
+
+- [ ] **Step 1: 写失败测试(exportFileName ext 参数)**
+
+`src/lib/notes.test.ts` 的 `describe("exportFileName")` 内追加:
+
+```ts
+it("ext 参数换扩展名(音频导出复用同一命名纪律)", () => {
+  expect(exportFileName("会议", "2026-08-07T16:44:00", "m4a")).toMatch(/^会议-20260807-1644\.m4a$/);
+});
+it("ext 缺省仍是 md", () => {
+  expect(exportFileName("会议", "2026-08-07T16:44:00")).toMatch(/\.md$/);
+});
+```
+
+Run: `npx vitest run src/lib/notes.test.ts`
+Expected: FAIL(ext 参数不存在,TS 报错或断言失败)
+
+- [ ] **Step 2: 实现 notes.ts 改动**
+
+`exportFileName` 签名与末行改为:
+
+```ts
+export function exportFileName(title: string, startedAt: string, ext = "md"): string {
+  // …函数体不动,仅末行:
+  return `${stem}.${ext}`;
+}
+```
+
+在 `exportNote` 旁追加:
+
+```ts
+/** 导出成品轨音频到用户选定路径(保存对话框流程);无成品轨后端报错。 */
+export const exportNoteAudio = (id: string, dest: string) =>
+  invoke<string>("export_note_audio", { id, dest });
+/** 在系统文件管理器中打开该笔记的存储目录。 */
+export const openNoteDir = (id: string) => invoke<void>("open_note_dir", { id });
+```
+
+Run: `npx vitest run src/lib/notes.test.ts`
+Expected: PASS
+
+- [ ] **Step 3: i18n 新 key(zh 块与 en 块各加 6 条,位置紧挨既有 notes.export.* / 详情页组)**
+
+zh 块:
+
+```ts
+"notes.export.button": "导出",
+"notes.export.audio": "导出音频",
+"notes.export.audioNone": "此笔记还没有成品轨,先在播放器行生成",
+"notes.dir.open": "打开目录",
+"notes.dir.openHint": "在系统文件管理器中打开这条笔记的存储目录",
+"notes.dir.openFailed": "打开目录失败:{e}",
+```
+
+en 块:
+
+```ts
+"notes.export.button": "Export",
+"notes.export.audio": "Export audio",
+"notes.export.audioNone": "No finished mix track yet; generate it from the player row first",
+"notes.dir.open": "Open folder",
+"notes.dir.openHint": "Open this note's storage folder in the system file manager",
+"notes.dir.openFailed": "Failed to open the folder: {e}",
+```
+
+Run: `npx vitest run src/lib/i18n`(parity 哨兵测试须绿)
+
+- [ ] **Step 4: 页面 script 区——菜单态与两个动作函数**
+
+import 区把 `exportNote` 的引入行补上 `exportNoteAudio, openNoteDir`(同来自 `$lib/notes`)。`doExport` 函数旁追加:
+
+```ts
+let exportMenuOpen = $state(false);
+
+/** 导出成品轨音频:与 doExport 同款快照/保存对话框/提示纪律,扩展名取成品轨实际后缀。 */
+async function doExportAudio() {
+  exportMsg = "";
+  if (!note) return;
+  const track = mixedInfo?.track;
+  if (!track) return;
+  const noteId = id;
+  const ext = track.path.split(".").pop() || "m4a";
+  try {
+    const dest = await save({
+      defaultPath: exportFileName(note.meta.title, note.meta.started_at, ext),
+      filters: [{ name: "Audio", extensions: [ext] }],
+    });
+    if (!dest) return;
+    const path = await exportNoteAudio(noteId, dest);
+    exportMsg = t("notes.export.done", { path });
+    if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
+  } catch (e) {
+    error = t("notes.export.failed", { e });
+  }
+}
+
+async function doOpenDir() {
+  try {
+    await openNoteDir(id);
+  } catch (e) {
+    error = t("notes.dir.openFailed", { e });
+  }
+}
+```
+
+(`exportFileName` 若尚未在本页 import,从 `$lib/notes` 补上——doExport 已在用,应已存在。)
+
+- [ ] **Step 5: header `.row` 重构(三个幽灵钮 + 导出菜单)**
+
+```svelte
+<div class="row">
+  <button class="ghost" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="6" cy="5" r="2.5" />
+      <path d="M2.2 13.8c0-2.2 1.7-4 3.8-4 1 0 1.9.4 2.6 1" />
+      <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
+      <path d="M13.9 6.9v2.4h-2.4" />
+    </svg>
+    {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
+  </button>
+  <div class="export-wrap">
+    <button
+      class="ghost"
+      aria-haspopup="menu"
+      aria-expanded={exportMenuOpen}
+      onclick={(e) => {
+        e.stopPropagation();
+        exportMenuOpen = !exportMenuOpen;
+      }}
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+        <path d="M9.5 1.8V5h3.2" />
+        <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+      </svg>
+      {t("notes.export.button")}
+      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 4 5 6.5 7.5 4" />
+      </svg>
+    </button>
+    {#if exportMenuOpen}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="export-menu" role="menu" onclick={(e) => e.stopPropagation()}>
+        <button
+          class="export-item"
+          role="menuitem"
+          onclick={() => {
+            exportMenuOpen = false;
+            void doExport("md");
+          }}>{t("notes.export.md")}</button
+        >
+        <button
+          class="export-item"
+          role="menuitem"
+          disabled={!mixedInfo?.track}
+          title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
+          onclick={() => {
+            exportMenuOpen = false;
+            void doExportAudio();
+          }}>{t("notes.export.audio")}</button
+        >
+      </div>
+    {/if}
+  </div>
+  <button class="ghost" title={t("notes.dir.openHint")} onclick={() => void doOpenDir()}>
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
+    </svg>
+    {t("notes.dir.open")}
+  </button>
+</div>
+```
+
+菜单的外点/Esc 关闭:页面若已有 `<svelte:window>` 元素则把处理器并进去,否则在模板顶部新增:
+
+```svelte
+<svelte:window
+  onclick={() => (exportMenuOpen = false)}
+  onkeydown={(e) => {
+    if (e.key === "Escape") exportMenuOpen = false;
+  }}
+/>
+```
+
+- [ ] **Step 6: style 区——删 `.act-btn` 两条规则,新增菜单样式**
+
+`.act-btn`/`.act-btn:hover` 删除,原注释位置放:
+
+```css
+/* 头部动作钮:幽灵族(.ghost)+图标文字并排;「导出」带浮层菜单(DESIGN 浮层规范) */
+.export-wrap {
+  position: relative;
+}
+.export-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 9rem;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface-press);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-popover);
+}
+.export-item {
+  border: none;
+  background: none;
+  box-shadow: none;
+  text-align: left;
+  padding: 0.45em 0.7em;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--ink);
+  border-radius: var(--radius-md);
+  transition: background 120ms ease;
+}
+.export-item:hover:not(:disabled) {
+  background: var(--surface-soft);
+}
+.export-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+```
+
+(`--shadow-popover` token 名以 app.css 实际为准——grep 确认,DESIGN.md 写作 shadow-popover。)
+
+- [ ] **Step 7: 死代码扫尾**
+
+`grep -n "act-btn\|mix-switch .link\|view-switch .link" "src/routes/notes/[id]/+page.svelte"` 应无输出(`.link` 基础类、`.link.danger`、`.mini.plain` 日历行保留是预期)。
+
+- [ ] **Step 8: 全量验证**
+
+Run: `npm run check && npm test && cargo test --manifest-path src-tauri/Cargo.toml export`
+Expected: 全绿(noHardcodedCjk 哨兵测试尤其要过——新文案全部走了 t())。
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/lib/notes.ts src/lib/notes.test.ts src/lib/i18n/dict/notes.ts "src/routes/notes/[id]/+page.svelte"
+git commit -m "feat(ui): 头部动作组重构——导出菜单(MD/成品轨音频)+打开目录,幽灵族收口"
+```
+
+---
+
+### 收尾(不在任务内,提醒执行者)
+
+- 真机人眼冒烟(执行完由用户做,写进 PR 描述):segmented 滑块滑动、暗/亮双主题凹槽与滑块对比度、成品轨置灰 tooltip、生成动作段进行中文案、二段确认胶囊不跳版、reduced-motion 无动画、键盘方向键切换 + 焦点环、导出菜单开合(外点/Esc 关闭)、导出音频落盘可播、无成品轨时导出音频置灰、打开目录落在正确笔记目录。
+- PR 走仓库常规流程;提交信息不加 Co-Authored-By。

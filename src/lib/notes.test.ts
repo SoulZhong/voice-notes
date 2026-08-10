@@ -168,4 +168,10 @@ describe("exportFileName", () => {
     expect(exportFileName("CON", "not-a-date")).toBe("CON_.md");
     expect(exportFileName("CON", "2026-07-16T15:30:09+08:00")).toBe("CON-20260716-1530.md");
   });
+  it("ext 参数换扩展名(音频导出复用同一命名纪律)", () => {
+    expect(exportFileName("会议", "2026-08-07T16:44:00", "m4a")).toMatch(/^会议-20260807-1644\.m4a$/);
+  });
+  it("ext 缺省仍是 md", () => {
+    expect(exportFileName("会议", "2026-08-07T16:44:00")).toMatch(/\.md$/);
+  });
 });

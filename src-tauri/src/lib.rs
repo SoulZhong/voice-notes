@@ -4926,6 +4926,37 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool,
     result
 }
 
+/// 导出成品轨音频到用户选定路径(前端保存对话框拿到 dest)。守卫在 store 层
+/// (export_audio_to):绝对路径、不落数据目录内、tmp+rename 原子替换。
+#[tauri::command]
+fn export_note_audio(app: AppHandle, id: String, dest: String) -> Result<String, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir)
+        .export_audio_to(&id, std::path::Path::new(&dest))
+        .map(|_| dest)
+        .map_err(|e| e.to_string())
+}
+
+/// 在系统文件管理器中打开该笔记的存储目录。走 Rust 侧 opener,
+/// 同 open_models_dir 先例:能直接打开目录本身,不依赖前端路径白名单。
+#[tauri::command]
+fn open_note_dir(app: AppHandle, id: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    if !dir.is_dir() {
+        return Err(tr!(
+            "笔记目录不存在: {path}",
+            "Note directory does not exist: {path}",
+            path = dir.display()
+        ));
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| tr!("打开目录失败: {e}", "Failed to open the directory: {e}"))
+}
+
 /// 声纹库四命令共用：打开 data_root 下的 VoiceprintStore（与逐场笔记目录并列，
 /// 不是 notes_dir 的子目录）。
 fn open_voiceprint_store(app: &AppHandle) -> Result<store::VoiceprintStore, String> {
@@ -6910,6 +6941,8 @@ pub fn run() {
             rename_note,
             delete_note,
             export_note,
+            export_note_audio,
+            open_note_dir,
             rename_speaker,
             delete_note_speaker,
             edit_segment,

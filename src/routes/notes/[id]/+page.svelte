@@ -11,6 +11,8 @@
     getNote,
     renameNote,
     exportNote,
+    exportNoteAudio,
+    openNoteDir,
     exportFileName,
     getRefined,
     refineNote,
@@ -55,6 +57,8 @@
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
+  import Segmented from "$lib/Segmented.svelte";
+  import type { SegmentedItem } from "$lib/segmented";
 
   let note = $state<Note | null>(null);
   let error = $state("");
@@ -123,6 +127,33 @@
   let regenStage = $state<string | null>(null); // 非 null = 补生成进行中(值为阶段名)
   let regenErr = $state("");
 
+  // mix-switch 的 segmented 数据:有成品轨给 双轨/成品轨 切换(不可信置灰+tooltip 原因);
+  // 没有则第二段是「生成」动作段(momentary,滑块不落位),沿用 startRegen/regenStage 原逻辑。
+  const mixItems = $derived.by((): SegmentedItem[] => {
+    const dual: SegmentedItem = { id: "dual", label: t("notes.mix.dual") };
+    if (mixedInfo?.track) {
+      return [
+        dual,
+        {
+          id: "mixed",
+          label: t("notes.mix.mixed"),
+          disabled: mixedInfo.untrusted !== null,
+          title: mixedInfo.untrusted ?? t("notes.mix.title"),
+        },
+      ];
+    }
+    return [
+      dual,
+      {
+        id: "gen",
+        label: regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate"),
+        momentary: true,
+        disabled: regenStage !== null || recording.isLive,
+        title: t("notes.mix.none"),
+      },
+    ];
+  });
+
   /** 展示序:filter+sort 已下沉 NoteStore::load(单一真值源),后端保证无空白段、
       按 (start_ms, seq) 升序,前端直接消费。 */
   const displaySegments = $derived(note ? note.segments : []);
@@ -140,6 +171,16 @@
   );
   /** 实际渲染的视图：viewMode 是用户意图，refinedAvailable=false 时无条件降级为 raw。 */
   const effectiveView = $derived(refinedAvailable ? viewMode : "raw");
+  /** 视图切换 segmented:无修订稿时该段置灰 + tooltip 原因(行为与旧 .link 版完全一致) */
+  const viewItems = $derived<SegmentedItem[]>([
+    {
+      id: "refined",
+      label: t("notes.view.refined"),
+      disabled: !refinedAvailable,
+      title: refinedAvailable ? undefined : t("notes.view.noRefined"),
+    },
+    { id: "raw", label: t("notes.view.raw") },
+  ]);
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
@@ -677,6 +718,8 @@
     entityPop = null;
     refinedBadgePop = null;
     refinedSaveErr = "";
+    exportMenuOpen = false;
+    exportMsg = "";
   });
 
   // Aing 进度事件：按 id 注册/解绑（切页时旧监听必须解绑，否则会用旧 note_id 的事件误刷当前页）。
@@ -1194,6 +1237,8 @@
     }
   }
 
+  let exportMenuOpen = $state(false);
+
   async function doExport(format: "md") {
     exportMsg = "";
     if (!note) return;
@@ -1218,6 +1263,36 @@
       if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
     } catch (e) {
       error = t("notes.export.failed", { e });
+    }
+  }
+
+  /** 导出成品轨音频:与 doExport 同款快照/保存对话框/提示纪律,扩展名取成品轨实际后缀。 */
+  async function doExportAudio() {
+    exportMsg = "";
+    if (!note) return;
+    const track = mixedInfo?.track;
+    if (!track) return;
+    const noteId = id;
+    const ext = track.path.split(".").pop() || "m4a";
+    try {
+      const dest = await save({
+        defaultPath: exportFileName(note.meta.title, note.meta.started_at, ext),
+        filters: [{ name: "Audio", extensions: [ext] }],
+      });
+      if (!dest) return;
+      const path = await exportNoteAudio(noteId, dest);
+      exportMsg = t("notes.export.done", { path });
+      if (error.startsWith(t("notes.export.failed", { e: "" }))) error = "";
+    } catch (e) {
+      error = t("notes.export.failed", { e });
+    }
+  }
+
+  async function doOpenDir() {
+    try {
+      await openNoteDir(id);
+    } catch (e) {
+      error = t("notes.dir.openFailed", { e });
     }
   }
 
@@ -1278,6 +1353,13 @@
         : t("notes.resume.blocked");
   }
 </script>
+
+<svelte:window
+  onclick={() => (exportMenuOpen = false)}
+  onkeydown={(e) => {
+    if (e.key === "Escape") exportMenuOpen = false;
+  }}
+/>
 
 <main class="container">
   {#if error}
@@ -1347,20 +1429,68 @@
           {/if}
         </div>
 
-        <!-- 导出动作:图标+文字(冒烟反馈:纯图标看不出功能),button-secondary 形态。
-             只留 MD(冒烟反馈:TXT 用不上,按钮撤了);txt 渲染能力在导出层与
+        <!-- 头部动作组:重新推断身份 / 导出(MD、成品轨音频)浮层菜单 / 打开目录,
+             均为幽灵族(.ghost)图标+文字按钮。txt 渲染能力在导出层与
              CLI(notes get --format txt)保留,GUI 不再暴露。 -->
         <div class="row">
-          <button class="act-btn" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+          <button class="ghost" disabled={identifying} title={t("notes.identify.rerunHint")} onclick={() => void rerunIdentify()}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="6" cy="5" r="2.5" />
+              <path d="M2.2 13.8c0-2.2 1.7-4 3.8-4 1 0 1.9.4 2.6 1" />
+              <path d="M13.8 11.2a2.9 2.9 0 1 1-.9-2.1" />
+              <path d="M13.9 6.9v2.4h-2.4" />
+            </svg>
             {identifying ? t("notes.identify.running") : t("notes.identify.rerun")}
           </button>
-          <button class="act-btn" onclick={() => doExport("md")}>
+          <div class="export-wrap">
+            <button
+              class="ghost"
+              aria-haspopup="menu"
+              aria-expanded={exportMenuOpen}
+              onclick={(e) => {
+                e.stopPropagation();
+                exportMenuOpen = !exportMenuOpen;
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
+                <path d="M9.5 1.8V5h3.2" />
+                <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+              </svg>
+              {t("notes.export.button")}
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 4 5 6.5 7.5 4" />
+              </svg>
+            </button>
+            {#if exportMenuOpen}
+              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
+              <div class="export-menu" role="menu" onclick={(e) => e.stopPropagation()}>
+                <button
+                  class="export-item"
+                  role="menuitem"
+                  onclick={() => {
+                    exportMenuOpen = false;
+                    void doExport("md");
+                  }}>{t("notes.export.md")}</button
+                >
+                <button
+                  class="export-item"
+                  role="menuitem"
+                  disabled={!mixedInfo?.track}
+                  title={mixedInfo?.track ? "" : t("notes.export.audioNone")}
+                  onclick={() => {
+                    exportMenuOpen = false;
+                    void doExportAudio();
+                  }}>{t("notes.export.audio")}</button
+                >
+              </div>
+            {/if}
+          </div>
+          <button class="ghost" title={t("notes.dir.openHint")} onclick={() => void doOpenDir()}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9.5 1.8H4.2a.9.9 0 0 0-.9.9v10.6c0 .5.4.9.9.9h7.6c.5 0 .9-.4.9-.9V5z" />
-              <path d="M9.5 1.8V5h3.2" />
-              <path d="M5.6 11.6V8.4l1.7 1.9 1.7-1.9v3.2" stroke-width="1.2" />
+              <path d="M1.8 4.2c0-.5.4-.9.9-.9h3.1l1.5 1.6h5.9c.5 0 .9.4.9.9v6.9c0 .5-.4.9-.9.9H2.7a.9.9 0 0 1-.9-.9z" />
             </svg>
-            {t("notes.export.md")}
+            {t("notes.dir.open")}
           </button>
         </div>
       </div>
@@ -1381,31 +1511,15 @@
             <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
-               动作;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
+               动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
           <div class="mix-switch" title={t("notes.mix.title")}>
-            <button
-              class="link"
-              class:active={playbackScheme === "dual"}
-              onclick={() => switchScheme("dual")}>{t("notes.mix.dual")}</button
-            >
-            {#if mixedInfo?.track}
-              <button
-                class="link"
-                class:active={playbackScheme === "mixed"}
-                disabled={mixedInfo.untrusted !== null}
-                title={mixedInfo.untrusted ?? t("notes.mix.title")}
-                onclick={() => switchScheme("mixed")}>{t("notes.mix.mixed")}</button
-              >
-            {:else}
-              <button
-                class="link"
-                disabled={regenStage !== null || recording.isLive}
-                title={t("notes.mix.none")}
-                onclick={startRegen}
-              >
-                {regenStage ? t("notes.mix.generating", { stage: regenStage }) : t("notes.mix.generate")}
-              </button>
-            {/if}
+            <Segmented
+              size="sm"
+              items={mixItems}
+              value={playbackScheme}
+              onSelect={(id) => switchScheme(id as "dual" | "mixed")}
+              onAction={() => startRegen()}
+            />
           </div>
         {/if}
         <button
@@ -1470,24 +1584,15 @@
       {/if}
 
       <div class="view-switch">
-        <button
-          class="link"
-          class:active={effectiveView === "refined"}
-          disabled={!refinedAvailable}
-          title={refinedAvailable ? "" : t("notes.view.noRefined")}
-          onclick={() => (viewMode = "refined")}
-        >
-          {t("notes.view.refined")}
-        </button>
-        <button class="link" class:active={effectiveView === "raw"} onclick={() => (viewMode = "raw")}>
-          {t("notes.view.raw")}
-        </button>
+        <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
         <span class="spacer"></span>
         {#if confirmRefine}
           <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
-          <span class="refine-warn">{t("notes.refine.loseNames")}</span>
-          <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
-          <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
+          <div class="confirm-capsule">
+            <span class="refine-warn">{t("notes.refine.loseNames")}</span>
+            <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
+            <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
+          </div>
         {:else}
           <button
             class="reaing"
@@ -1528,26 +1633,32 @@
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
         {#if retransConfirm}
-          <span class="refine-warn">{t("notes.retrans.warn")}</span>
-          <button class="link danger" onclick={() => startRetranscribe("dual")}>
-            {t("notes.retrans.confirmDual")}
-          </button>
-          <button
-            class="link danger"
-            disabled={mixedReason !== null}
-            title={mixedReason ?? ""}
-            onclick={() => startRetranscribe("mixed")}
-          >
-            {t("notes.retrans.confirmMixed")}
-          </button>
-          <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+          <div class="confirm-capsule">
+            <span class="refine-warn">{t("notes.retrans.warn")}</span>
+            <button class="link danger" onclick={() => startRetranscribe("dual")}>
+              {t("notes.retrans.confirmDual")}
+            </button>
+            <button
+              class="link danger"
+              disabled={mixedReason !== null}
+              title={mixedReason ?? ""}
+              onclick={() => startRetranscribe("mixed")}
+            >
+              {t("notes.retrans.confirmMixed")}
+            </button>
+            <button class="link" onclick={() => (retransConfirm = false)}>{t("notes.cancel")}</button>
+          </div>
         {:else}
           <button
-            class="link"
+            class="ghost"
             disabled={retranscribing || refining || recording.isLive || note.meta.state !== "complete"}
             title={retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.hint")}
             onclick={() => (retransConfirm = true)}
           >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.8" />
+              <path d="M13.4 1.8v2.8h-2.8" />
+            </svg>
             {retranscribing ? t("notes.retrans.running", { stage: retransStage }) : t("notes.retrans.run")}
           </button>
         {/if}
@@ -1780,16 +1891,19 @@
     background: linear-gradient(var(--canvas), transparent);
     pointer-events: none;
   }
-  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上) */
+  /* 标题行:左标题+时间,右上角动作按钮(冒烟反馈:按钮移右上)。
+     窄窗(默认 800x600)可换行:动作组 flex:none 不收缩,标题区给 min-width 下限,
+     空间不足时整组动作换到标题下一行右对齐——否则标题被挤成一列多行(冒烟实锤)。 */
   .header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 0.25rem 1rem;
+    flex-wrap: wrap;
   }
   .header-main {
     flex: 1;
-    min-width: 0;
+    min-width: 14rem;
   }
   .row {
     display: flex;
@@ -1798,59 +1912,115 @@
     flex: none;
     justify-content: flex-end;
     padding-top: 0.2rem;
+    margin-left: auto;
   }
-  /* 头部动作钮:button-secondary 形态 + 图标与文字并排(纯图标看不出功能) */
-  .act-btn {
+  /* 头部动作钮:幽灵族(.ghost)+图标文字并排;「导出」带浮层菜单(DESIGN 浮层规范) */
+  .export-wrap {
+    position: relative;
+  }
+  .export-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 30;
+    min-width: 9rem;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    background: var(--surface-press);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+  }
+  .export-item {
+    border: none;
+    background: none;
+    box-shadow: none;
+    text-align: left;
+    padding: 0.45em 0.7em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--ink);
+    border-radius: var(--radius-md);
+    transition: background 120ms ease;
+  }
+  .export-item:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .export-item:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  /* 幽灵按钮族:低频动作统一形态——无边框、次级墨色+16px 线性图标,
+     hover 浮现 surface-soft 底并提亮(悬停显影原则),按压下沉 0.5px。 */
+  .ghost {
     display: inline-flex;
     align-items: center;
     gap: 0.4em;
-    padding: 0.4em 0.8em;
+    border: none;
+    background: transparent;
+    padding: 0.4em 0.7em;
     font-size: 0.85rem;
+    font-weight: 500;
+    letter-spacing: 0.2px;
     color: var(--ink-secondary);
+    border-radius: var(--radius-md);
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      transform 120ms ease;
   }
-  .act-btn:hover {
+  .ghost:hover:not(:disabled) {
+    background: var(--surface-soft);
     color: var(--ink);
+  }
+  .ghost:active:not(:disabled) {
+    transform: translateY(0.5px);
+  }
+  .ghost svg {
+    flex: none;
   }
   /* 控制行:录音 + 播放器整合一行(录音机式) */
   .transport {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem 0.75rem;
     margin: 0 0 1rem;
+    flex-wrap: wrap;
   }
+  /* 播放器槽的 min-width 下限 ≈ AudioPlayer 的 min-content(播放键+双时间+波形下限
+     +音轨选择器+内边距):低于它内容会从槽里溢出垫到右侧控件底下(冒烟实锤,
+     AudioPlayer 内波形条自适应同一教训)。空间不足时 segmented+录制键换到下一行。 */
   .player-slot {
     flex: 1;
-    min-width: 0;
+    min-width: 23rem;
   }
-  /* 回放方案 A/B 切换(二期):pill 组,选中态加底色;置灰态由 button:disabled 通用样式接管 */
+  /* 回放方案 A/B 切换(二期):Segmented(sm)承载,容器只管行内定位。
+     margin-left:auto 让「segmented+录制键」聚成一簇靠右——宽窗时播放器 flex:1
+     已占满空间无感;窄窗换行后这簇整体落在第二行右端,不与录制键分居两端(冒烟反馈)。 */
   .mix-switch {
     display: inline-flex;
     gap: 0.15rem;
     flex: none;
     align-items: center;
-  }
-  .mix-switch .link {
-    font-size: 0.8rem;
-    padding: 0.2em 0.55em;
-    border-radius: 999px;
-  }
-  .mix-switch .link.active {
-    background: var(--surface-sunken, rgba(0, 0, 0, 0.08));
-    color: var(--ink);
+    margin-left: auto;
   }
   /* 继续录制:录音机标志式圆形录音键(圆环 + 居中红点),行尾右置,与播放键同语言。
      纯图标是用户拍板的特例(2026-07-07:录音红点属录音机通识符号,文字反而挤占
-     音轨宽度),悬停 title/aria-label 兜底可达性。无播放器时 margin-left:auto 仍靠右。 */
+     音轨宽度),悬停 title/aria-label 兜底可达性。靠右由 .mix-switch 的 auto margin
+     统一负责;无播放器(录制中只剩录制键)时它是首子元素,自己补 auto 仍靠右。 */
   .rec-btn {
     width: 2.4rem;
     height: 2.4rem;
     padding: 0;
     flex: none;
-    margin-left: auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     border-radius: var(--radius-full);
+  }
+  .rec-btn:first-child {
+    margin-left: auto;
   }
   .rec-dot {
     width: 12px;
@@ -2055,22 +2225,14 @@
   .link:disabled:hover {
     text-decoration: none;
   }
-  /* 视图切换条:修订稿/原始逐字稿(btn-link,当前态 tint 底高亮) + 重新 Aing(默认 button-secondary)。 */
+  /* 视图切换条:Segmented(修订稿/原始逐字稿) + 右侧内容级动作(AI 魔杖 / 重转写幽灵钮) */
+  /* 同款窄窗纪律:二段确认警示胶囊展开时宽于窗口即换行,不挤压 segmented */
   .view-switch {
     display: flex;
     align-items: center;
-    gap: 0.2rem;
+    gap: 0.5rem;
     margin: 0 0 0.75rem;
-  }
-  .view-switch .link {
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.35em 0.7em;
-    border-radius: var(--radius-md);
-  }
-  .view-switch .link.active {
-    background: var(--accent-tint);
-    color: var(--accent);
+    flex-wrap: wrap;
   }
   .view-switch .spacer {
     flex: 1;
@@ -2079,6 +2241,33 @@
   .refine-warn {
     color: var(--warning-ink);
     font-size: 0.8rem;
+  }
+  /* 破坏性二段确认的警示胶囊:warning 三件套 token 包裹整组(文案+确认+取消),
+     120ms 淡入下移 2px,行内占位不换行不跳版。 */
+  .confirm-capsule {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.5rem 0.25rem 0.75rem;
+    background: var(--warning-tint);
+    border: 1px solid var(--warning-line);
+    border-radius: var(--radius-lg);
+    animation: capsule-in 120ms ease;
+  }
+  @keyframes capsule-in {
+    from {
+      opacity: 0;
+      transform: translateY(-2px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .confirm-capsule {
+      animation: none;
+    }
   }
   /* 重新 Aing = Aing 的「施法键」:22px 彩色魔杖(手柄 currentColor,杖头金色星芒 + 紫/青/粉星火,禁 emoji)。
      idle 已是彩色魔杖;hover 星火向外迸射、金星芒放大旋转带光晕;施法(casting)时魔杖大幅挥动 +

@@ -17,12 +17,38 @@ impl NoteStore {
         if format != "md" && format != "txt" {
             anyhow::bail!("未知导出格式: {format}");
         }
-        if !dest.is_absolute() {
-            anyhow::bail!("导出路径必须是绝对路径");
-        }
+        self.validate_export_dest(id, dest)?;
         let file_name = dest
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("导出路径缺少文件名"))?;
+        let content = match refined {
+            Some(doc) => render_refined(&self.load(id)?.meta.title, doc, format == "md"),
+            None => self.render(id, format)?,
+        };
+        let tmp = dest.with_file_name(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// export_to / export_audio_to 共用的 dest 守卫:必须绝对路径,且不得落在
+    /// 笔记数据目录内(防误选/被误传毁库——那里放着 meta.json/segments.jsonl 等
+    /// 笔记本体,原子替换一旦命中会静默摧毁笔记)。父目录不代建,由调用方各自处理
+    /// ENOENT。
+    fn validate_export_dest(&self, id: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+        if !dest.is_absolute() {
+            anyhow::bail!("导出路径必须是绝对路径");
+        }
         let note_dir = self.note_dir(id)?;
         let data_root = note_dir
             .parent()
@@ -38,16 +64,26 @@ impl NoteStore {
         if canon_parent.starts_with(&canon_root) {
             anyhow::bail!("导出目标不能位于笔记数据目录内");
         }
-        let content = match refined {
-            Some(doc) => render_refined(&self.load(id)?.meta.title, doc, format == "md"),
-            None => self.render(id, format)?,
-        };
+        Ok(())
+    }
+
+    /// 导出成品轨音频到用户选定路径(保存对话框流程)。守卫与 export_to 同源
+    /// (validate_export_dest);源文件由 mixed_track 解析,无成品轨报错。
+    /// 拷贝走同目录临时文件 + rename 原子替换,与 export_to 同款崩溃纪律。
+    pub fn export_audio_to(&self, id: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+        self.validate_export_dest(id, dest)?;
+        let note_dir = self.note_dir(id)?;
+        let track = super::audio::mixed_track(&note_dir)
+            .ok_or_else(|| anyhow::anyhow!("此笔记没有成品轨"))?;
+        let file_name = dest
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("导出路径缺少文件名"))?;
         let tmp = dest.with_file_name(format!(
             ".{}.tmp-{}",
             file_name.to_string_lossy(),
             std::process::id()
         ));
-        if let Err(e) = std::fs::write(&tmp, &content) {
+        if let Err(e) = std::fs::copy(&track.path, &tmp) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
@@ -616,5 +652,61 @@ mod export_to_tests {
         let (_tmp, out, store, id) = setup();
         let dest = out.path().join("不存在的目录/x.md");
         assert!(store.export_to(&id, "md", None, &dest).is_err());
+    }
+}
+
+#[cfg(test)]
+mod export_audio_to_tests {
+    use crate::pipeline::recording_sink::MIXED_TRACK;
+    use crate::store::audio::AudioTrackWriter;
+    use crate::store::writer::NoteWriter;
+    use crate::store::NoteStore;
+
+    /// 建一条单段笔记,返回 (notes 根目录, 导出目录, store, id)——与 export_to_tests::setup
+    /// 同款建档辅助。
+    fn fixture_note() -> (tempfile::TempDir, tempfile::TempDir, NoteStore, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), chrono::Local::now()).unwrap();
+        let id = w.note_id().to_string();
+        w.append_final("mic", "音频导出。", 1_000, 2_000, None, None).unwrap();
+        w.finalize(chrono::Local::now()).unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        (tmp, out, store, id)
+    }
+
+    /// 在 note_dir 下落一条真实可被 mixed_track 识别的成品轨(与 audio.rs
+    /// mixed_track_returns_the_mixed_source_with_consistent_semantics 同款写法:
+    /// 走 AudioTrackWriter 而非手写字节,保证 WAV 头合法、字节数超过 HEADER_LEN,
+    /// mixed_track 才认得出这条轨)。
+    fn write_mixed_track(note_dir: &std::path::Path) {
+        let mut w = AudioTrackWriter::new(note_dir, MIXED_TRACK, 0);
+        let _ = w.append(&vec![0.2f32; 8_000]); // 0.5s @ 16kHz，足够超过 44 字节头
+        drop(w);
+    }
+
+    #[test]
+    fn export_audio_to_copies_mixed_track_to_dest() {
+        let (_tmp, out, store, id) = fixture_note();
+        let note_dir = store.note_dir(&id).unwrap();
+        write_mixed_track(&note_dir);
+        let source_bytes = std::fs::read(note_dir.join("mixed.wav")).unwrap();
+        let dest = out.path().join("a.wav");
+        store.export_audio_to(&id, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn export_audio_to_errors_when_no_mixed_track() {
+        let (_tmp, out, store, id) = fixture_note();
+        assert!(store.export_audio_to(&id, &out.path().join("a.wav")).is_err());
+    }
+
+    #[test]
+    fn export_audio_to_rejects_dest_inside_notes_dir() {
+        let (_tmp, _out, store, id) = fixture_note();
+        let note_dir = store.note_dir(&id).unwrap();
+        write_mixed_track(&note_dir);
+        assert!(store.export_audio_to(&id, &note_dir.join("a.wav")).is_err());
     }
 }
