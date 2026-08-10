@@ -601,8 +601,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             let r = (|| {
                                 let o = match owned.as_mut() {
                                     Some(o) if o.note_id == *note_id => o,
-                                    // 竞态窗口(判定与执行之间恰逢停录):报错让调用方
-                                    // 重试,重试会走非活动的冷路径(此刻已合法)。
+                                    // 竞态窗口(判定与执行之间恰逢停录):报错让调用方重试。
+                                    // 重试在 writer 离槽(DoFinalize)后才走冷路径;停录排干
+                                    // 窗口内冷路径会被笔记目录锁挡下,报"正被占用"——前端按
+                                    // 文案分支处理,勿盲目自动重试。
                                     _ => return Err("录制会话已结束,请重试".to_string()),
                                 };
                                 o.writer
