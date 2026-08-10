@@ -159,11 +159,21 @@ pub struct PlayerHandle {
     /// (wrong-writer-wins),表现为点播放被掐、图标弹回、放错笔记的音频。
     /// 入口取号,只有仍是最新代次的装载允许装内核/起流。
     load_gen: AtomicU64,
+    /// 发布互斥(Codex P1):把「查代次→装内核→起流→复查」整段串行化。没有它,
+    /// 过期装载 A 起流期间新装载 B 完成发布,A 的兜底 stop_stream 会无差别拆掉 B
+    /// 刚装好的内核/停止通道——B 返回 Ok 但 play 报"尚未装载"。持锁期间过期装载
+    /// 只可能清到自己刚发布的产物(更新装载的发布必须先拿到本锁)。
+    publish: Mutex<()>,
 }
 
 impl Default for PlayerHandle {
     fn default() -> Self {
-        Self { core: Mutex::new(None), stop_tx: Mutex::new(None), load_gen: AtomicU64::new(0) }
+        Self {
+            core: Mutex::new(None),
+            stop_tx: Mutex::new(None),
+            load_gen: AtomicU64::new(0),
+            publish: Mutex::new(()),
+        }
     }
 }
 
@@ -279,6 +289,27 @@ fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&P
         _ => false,
     };
     newer_than_src(cache) && align_json.map(newer_than_src).unwrap_or(false)
+}
+
+/// 写跳过标记(负结果缓存):唯一名 tmp + create_new + rename——固定名 `fs::write`
+/// 会跟随目录里预置的同名符号链接,把写入打到链接指向的任意可写文件上(Codex P1);
+/// create_new 遇到已存在路径(含符号链接本身)直接失败不跟随,rename 替换的是目录项
+/// 本身(预置链接被整体换成普通文件)。与 store::align::write 同一防线。
+/// best-effort:失败只意味着下次装载再估一遍,不上抛。
+fn write_align_skip_marker(note_dir: &Path) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
+    let tmp = note_dir.join(format!(
+        "{}.{}-{}.tmp",
+        crate::store::align::ALIGN_SKIP_FILE,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).is_ok()
+        && std::fs::rename(&tmp, &marker).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// 跳过标记是否有效:比全部源轨新即有效(负结果缓存,见 store::align::ALIGN_SKIP_FILE)。
@@ -403,9 +434,7 @@ async fn align_mic_track(
             let sys = map_file(&s2)?;
             // 负结果也落盘(空文件标记):mmap 失败(上方 ?)不落——那是环境性故障,
             // 该重试;"估不出/不值得"是对这份音频的稳定判定,源轨不变结论不变。
-            let mark_skip = || {
-                let _ = std::fs::write(nd.join(crate::store::align::ALIGN_SKIP_FILE), b"");
-            };
+            let mark_skip = || write_align_skip_marker(&nd);
             let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
                 eprintln!("回放对齐: 估不出可信映射,记录跳过标记(源轨变更后重估)");
                 mark_skip();
@@ -571,9 +600,11 @@ pub async fn player_load(
         cursor_bits: AtomicU64::new(0f64.to_bits()),
         playing: AtomicBool::new(false),
     });
-    // 装内核前查代次:解码/对齐/门控期间用户已切走(有更新的装载进入)就整体放弃,
-    // 绝不把旧笔记的内核装给新页面。检查与写入同持 core 锁,与新装载入口的
-    // stop_stream(它也取 core 锁)天然互斥,无检查-安装间隙。
+    // 发布段(持 publish 互斥,Codex P1):查代次→装内核→起流→复查整段串行。
+    // 过期装载在首查即弃(未触碰任何共享态);持锁期间发布后才发现过期(新装载
+    // 恰在本段进行中进入并 bump 代次)时,兜底 stop_stream 清到的只会是自己刚
+    // 发布的产物——更新装载的发布必须先拿本锁,不可能被误拆。
+    let _publish = state.publish.lock().unwrap();
     {
         let mut g = state.core.lock().unwrap();
         if !state.is_current(gen) {
@@ -585,8 +616,8 @@ pub async fn player_load(
         stop_stream(&state); // 起流失败不留残核:否则后续 play 假成功、UI 卡"播放中"
         return Err(e);
     }
-    // 起流后复查:装内核→起流之间若有新装载进入并 stop_stream,上面刚起的流会带着
-    // 过期内核复活(新装载的 stop 先于本次 start 落地)。过期即自我了断。
+    // 起流后复查:装内核→起流之间若有新装载**进入**(入口 stop_stream 不走 publish
+    // 锁,会清掉本次刚装的内核),刚起的流带着过期内核复活。过期即自我了断。
     if !state.is_current(gen) {
         stop_stream(&state);
         return Err(crate::tr!("装载已被更新的请求取代", "Load superseded by a newer request"));
@@ -813,6 +844,24 @@ mod tests {
         assert!(align_skip_is_fresh(&marker, &srcs), "标记比源新:跳过重估");
         touch_newer(&mic);
         assert!(!align_skip_is_fresh(&marker, &srcs), "源轨更新(续录)后标记失效");
+    }
+
+    /// 预置同名符号链接不得被写穿(Codex P1):固定名 fs::write 会跟随链接把内容打到
+    /// 任意可写文件;安全写法(tmp+create_new+rename)应整体替换链接为普通文件。
+    #[cfg(unix)]
+    #[test]
+    fn skip_marker_never_follows_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        let note = tmp.path().join("note");
+        std::fs::create_dir(&note).unwrap();
+        let marker = note.join(crate::store::align::ALIGN_SKIP_FILE);
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        write_align_skip_marker(&note);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "链接目标不得被写穿");
+        let meta = std::fs::symlink_metadata(&marker).unwrap();
+        assert!(meta.file_type().is_file(), "标记应把链接整体替换为普通空文件");
     }
 
     #[test]
