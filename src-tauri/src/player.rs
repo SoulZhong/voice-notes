@@ -412,6 +412,10 @@ async fn align_mic_track(
         // 估计(2026-08-10 排障:大笔记每次进页白跑一遍,装载期间播放无响应)。
         let skip_marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
         if align_skip_is_fresh(&skip_marker, &[&mic_path, &sys_path]) {
+            // 自愈(Codex P1):此处若还躺着 align.json,它必然过期(新鲜的正缓存在上方
+            // 分支就命中了)——留着它,notes 读路径仍按旧映射改写转写时间戳,而回放走
+            // 原始轨,两边永久错位。删之,转写与回放同回原始时基。
+            let _ = std::fs::remove_file(&align_json);
             return;
         }
         eprintln!(
@@ -426,6 +430,11 @@ async fn align_mic_track(
             // mmap 而不是 read:估计要同时看两条完整音轨,一小时双轨读进堆里就是
             // ~230MB 常驻,而 player_align 已改成按字节视图逐样本取值,页由系统按需
             // 调入/回收即可(与回放热路径同一套 mmap 策略)。
+            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            // 估计前采源轨快照:估计要跑几十秒,期间续录/重解码会换掉源文件——那时
+            // 结论只代表旧音频,标记不得发布(Codex P2:晚发布的标记 mtime 反而更新,
+            // 会把针对新音频的必要重估压掉)。
+            let pre = (mtime(&m2), mtime(&s2));
             let map_file = |p: &Path| -> Option<Mmap> {
                 let f = std::fs::File::open(p).ok()?;
                 unsafe { Mmap::map(&f).ok() }
@@ -434,7 +443,16 @@ async fn align_mic_track(
             let sys = map_file(&s2)?;
             // 负结果也落盘(空文件标记):mmap 失败(上方 ?)不落——那是环境性故障,
             // 该重试;"估不出/不值得"是对这份音频的稳定判定,源轨不变结论不变。
-            let mark_skip = || write_align_skip_marker(&nd);
+            let mark_skip = || {
+                if (mtime(&m2), mtime(&s2)) != pre {
+                    eprintln!("回放对齐: 估计期间源轨已变,不发布跳过标记(下次装载重估)");
+                    return;
+                }
+                // 先删过期正映射再落标记(Codex P1):负结论确立后,旧 align.json 只会让
+                // 转写时间戳与原始轨回放错位;先删后标,崩在中间也只是回到"下次重估"。
+                let _ = std::fs::remove_file(nd.join(crate::store::align::ALIGN_FILE));
+                write_align_skip_marker(&nd);
+            };
             let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
                 eprintln!("回放对齐: 估不出可信映射,记录跳过标记(源轨变更后重估)");
                 mark_skip();
