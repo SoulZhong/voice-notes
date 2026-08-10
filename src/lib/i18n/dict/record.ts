@@ -18,7 +18,6 @@ export const zh = {
   "record.btn.resume": "恢复",
   "record.btn.pause": "暂停",
   "record.btn.stop": "停止",
-  "record.btn.stopConfirmMsg": "确认停止？",
   "record.btn.stopConfirmYes": "停止",
   "record.btn.stopConfirmNo": "继续录",
 
@@ -99,7 +98,6 @@ export const en = {
   "record.btn.resume": "Resume",
   "record.btn.pause": "Pause",
   "record.btn.stop": "Stop",
-  "record.btn.stopConfirmMsg": "Stop recording?",
   "record.btn.stopConfirmYes": "Stop",
   "record.btn.stopConfirmNo": "Keep going",
 

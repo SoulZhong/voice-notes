@@ -579,16 +579,17 @@
               </button>
             {/if}
             {#if confirmStop}
+              <!-- 紧凑确认胶囊(冒烟反馈:问句+两个全尺寸按钮太拥挤):胶囊底色即警示
+                   语义,只留两个 link 型小按钮,与相邻 .ctl 同高不跳版。 -->
               <span class="stop-confirm">
-                {t("record.btn.stopConfirmMsg")}
                 <button
-                  class="ctl danger"
+                  class="link danger"
                   onclick={() => {
                     confirmStop = false;
                     recording.stop().catch((err) => console.error("停止录制失败", err));
                   }}
                 >{t("record.btn.stopConfirmYes")}</button>
-                <button class="ctl" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
+                <button class="link" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
               </span>
             {:else}
               <button class="ctl danger" disabled={recording.pending} onclick={() => (confirmStop = true)}>
@@ -641,13 +642,17 @@
             <button class="ghosty" onclick={() => gotoHit(-1)} title={t("record.search.prev")}>↑</button>
             <button class="ghosty" onclick={() => gotoHit(1)} title={t("record.search.next")}>↓</button>
           {/if}
-          {#each speakerIds as sid (sid)}
-            <button
-              class="chip"
-              class:on={selectedSpeakers.has(sid)}
-              onclick={() => toggleSpeaker(sid)}
-            >{speakerLabel(sid, "mic", recording.speakers)}</button>
-          {/each}
+          <!-- 过滤 chips 只在 ≥2 个说话人时出现:单说话人过滤无意义,还与下方
+               SpeakerChips 管理条视觉重复(冒烟反馈)。 -->
+          {#if speakerIds.length >= 2}
+            {#each speakerIds as sid (sid)}
+              <button
+                class="chip"
+                class:on={selectedSpeakers.has(sid)}
+                onclick={() => toggleSpeaker(sid)}
+              >{speakerLabel(sid, "mic", recording.speakers)}</button>
+            {/each}
+          {/if}
           {#if reviewActive}
             <button class="ghosty" onclick={clearReview}>{t("record.search.clear")}</button>
           {/if}
@@ -898,9 +903,10 @@
   }
   /* 暂停:整条控制条升格为 warning 基调，呼应"没在录"这一异常态——不再只靠
      右侧小灰点交代，误以为还在录、白等一场的事故率最高的一刻。 */
+  /* 暂停:只上淡底不描边(冒烟反馈:边框盒+内部胶囊双重嵌套太重),醒目信号由
+     加重的「已暂停」状态字 + 计时变灰 + 波形冻结共同承担。 */
   .controls.paused {
     background: var(--warning-tint);
-    border-color: var(--warning-line);
   }
   .ctl-group {
     display: flex;
@@ -981,14 +987,28 @@
   .stop-confirm {
     display: inline-flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.25rem;
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);
     color: var(--warning-ink);
     border-radius: var(--radius-full);
-    padding: 0.15rem 0.6rem;
+    padding: 0.15rem 0.5rem;
     animation: fadein 120ms ease-out;
   }
+  /* 胶囊内 link 型小按钮(照笔记页 confirm-capsule 惯例):无底无框,danger 承载
+     破坏性着色——胶囊自身即警示语境,不再堆叠全尺寸按钮。 */
+  .stop-confirm .link {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    padding: 0.15em 0.4em;
+    border-radius: var(--radius-md);
+  }
+  .stop-confirm .link:hover { background: var(--surface-press); }
+  .stop-confirm .link.danger { color: var(--danger); }
   @keyframes fadein {
     from { opacity: 0; }
     to { opacity: 1; }
@@ -1044,6 +1064,10 @@
   .wave-live.frozen .bar {
     background: var(--ink-faint);
   }
+  /* 冻结波形整体退后:低电平段在暂停态下呈虚线感,降透明度免得像一条破折号横贯全行 */
+  .wave-live.frozen {
+    opacity: 0.35;
+  }
 
   /* 回看工具条:页内搜索 + 说话人过滤 chips，紧贴 controls 下方。 */
   .review-bar {
@@ -1055,6 +1079,7 @@
   }
   .review-bar .search {
     min-width: 12rem;
+    max-width: 16rem; /* 冒烟反馈:全宽搜索框喧宾夺主,收窄成工具位 */
     font: inherit;
     color: var(--ink);
     background: var(--surface);
