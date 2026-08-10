@@ -24,154 +24,265 @@ pub const ASR_MODE_CLOUD: &str = "cloud";
 pub const CLOUD_VOLCANO: &str = "volcano";
 pub const CLOUD_ALIYUN: &str = "aliyun";
 
+/// `Settings` 的 (反)序列化通过 `#[serde(from = "SettingsRepr")]` 整体路由:磁盘/前端 JSON
+/// 先落到 `SettingsRepr`(逐字段带各自的迁移/默认语义,`audio_scheme` 在那边是纯 `Option`
+/// 用于判键存在性),再经 `From<SettingsRepr>` 一次性 resolve 成这里的普通字段。
+/// 这样 `Settings` 本身对外恒是自洽的:序列化必定带上每个字段的当前真值,反序列化
+/// 出来的每个字段也必定是"resolve 过的具体值",不存在中间态——不再需要 Option 影子
+/// 字段、`#[serde(skip)]`、或者在 `update()`/`save()` 里补写"回写"逻辑,从根上堵死了
+/// "整体替换后公开字段与影子字段不同步导致互相覆盖"这类问题(2026-08-10 review 升级为
+/// Critical:旧的 raw/skip 方案下,`set_settings` 提交"未改动 audio_scheme"这条最常见路径——
+/// 磁盘 a、wire 原样带回 a——会被 `update()` 的对称判定误判为"闭包没碰 raw"从而不重新
+/// resolve,而 skip 字段又已经在反序列化时被重置成类型默认值,最终把 a 悄悄存成默认值,
+/// 且没有任何基于"闭包做了什么"的启发式能可靠区分这种路径与其它路径)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "SettingsRepr")]
 pub struct Settings {
-    #[serde(default = "default_true")]
     pub mirror_enabled: bool,
-    #[serde(default = "default_prefix")]
     pub mirror_prefix: String,
     /// 自定义数据目录(录音/转写等落盘位置);None 时回退到 app_data_dir。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
     /// 自定义模型目录覆盖;None 时使用内置默认路径。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub models_dir: Option<String>,
     /// ASR 选型,见 ASR_SENSE_VOICE / ASR_WHISPER。
-    #[serde(default = "default_asr")]
     pub asr_model: String,
     /// sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json)。空 = sherpa
     /// 默认(0.6.8 硬编码 CPU);macOS 可填 "coreml" 实验加速(见 2026-07-28 ASR 调研)。
     /// 值原样透传 sherpa/onnxruntime,不做白名单;加载失败会走既有报错路径,不静默降级。
-    #[serde(default)]
     pub asr_provider: String,
     /// 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(set_settings 保护)。
-    #[serde(default = "default_asr_mode")]
     pub asr_mode: String,
     /// 云端厂商:"volcano" / "aliyun"。
-    #[serde(default = "default_cloud_provider")]
     pub cloud_asr_provider: String,
     /// 火山凭证(APP ID / Access Token)。明文存储,同 refine_api_key 先例。
-    #[serde(default)]
     pub volc_app_key: String,
-    #[serde(default)]
     pub volc_access_key: String,
     /// 阿里 DashScope API Key。明文,同上。
-    #[serde(default)]
     pub dashscope_api_key: String,
     /// 声纹嵌入模型选型:"campplus"(默认)/"eres2netv2"。不同模型嵌入空间不可混用,
     /// 切换会触发声纹库从录音样本后台重建(见 lib.rs set_settings)。
-    #[serde(default = "default_speaker_model")]
     pub speaker_model: String,
     /// 外观主题,消费任务:主题切换。"system"/"light"/"dark"。
-    #[serde(default = "default_theme")]
     pub theme: String,
     /// UI 语言:"system"(跟随系统)/"zh"/"en"。前端界面与托盘/后端用户可见文案共用。
     /// 注意与 language_filter(转写乱码过滤)语义无关。
-    #[serde(default = "default_ui_lang")]
     pub ui_lang: String,
     /// 仅录系统声(不录麦克风),消费任务:录制开关。
-    #[serde(default)]
     pub record_system_only: bool,
     /// 录制时保持外放音量:麦克风采集用普通输入代替 VPIO(通话模式)。VPIO 启动即触发
     /// macOS 把其它音频压低 12-16dB(ducking,Min 档仍生效,固有行为);普通输入无 ducking,
     /// 回声改由软件 AEC(WebRTC AEC3,system 采集流为参考,见 audio::aec)消除,
     /// 文本回声去重链保留为兜底。默认关(走 VPIO)。
-    #[serde(default)]
     pub keep_output_volume: bool,
     /// 语言过滤开关,消费任务:转写语言过滤;默认开启。
-    #[serde(default = "default_true")]
     pub language_filter: bool,
     /// 保留原始录音音频,消费任务:录制开关;默认开启。
-    #[serde(default = "default_true")]
     pub keep_audio: bool,
     /// 全局快捷键开关,消费任务:快捷键;默认关闭(避免未经用户同意即占用系统快捷键)。
-    #[serde(default)]
     pub shortcut_enabled: bool,
     /// 全局快捷键组合,消费任务:快捷键。
-    #[serde(default = "default_shortcut")]
     pub shortcut: String,
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
-    #[serde(default = "default_true")]
     pub tray_enabled: bool,
     /// 会后 LLM Aing 总开关(A2)。默认关,配好 key 后由用户打开。
-    #[serde(default)]
     pub refine_enabled: bool,
     /// A2 执行体:"openai"(HTTP chat completions)| "agent"(本机 Agent CLI 经
     /// MCP 读写回)。老配置缺字段 → openai,行为不变。
-    #[serde(default = "default_refine_provider")]
     pub refine_provider: String,
     /// provider=agent 时用哪家 CLI:claude|codex|gemini|cursor。
-    #[serde(default = "default_refine_agent")]
     pub refine_agent: String,
     /// Agent CLI 可执行文件路径覆盖;空 = 按常见安装位置自动探测。
-    #[serde(default)]
     pub refine_agent_bin: String,
     /// Agent 模型名(传给 CLI 的 --model/-m);空 = 该 CLI 自己的默认模型。
-    #[serde(default)]
     pub refine_agent_model: String,
     /// OpenAI 兼容 chat completions 的 base_url,如 https://api.deepseek.com。
-    #[serde(default)]
     pub refine_base_url: String,
     /// 模型名,如 deepseek-chat。
-    #[serde(default)]
     pub refine_model: String,
     /// API key。明文存本机 settings.json(单机应用,设置页已注明)。
-    #[serde(default)]
     pub refine_api_key: String,
     /// 首启引导已完成(欢迎层「开始使用」下载完成或进入「高级设置」时置 true)。
     /// 老用户升级(字段缺失)反序列化为 false,但 layout 侧发现模型已就绪会静默补 true,
     /// 不会对老用户弹引导。
-    #[serde(default)]
     pub onboarded: bool,
     /// 已完成的功能引导 ID。每项功能/重大版本独立记账，不能让一个全局 bool
     /// 永久吞掉后续新增功能的引导。
-    #[serde(default)]
     pub completed_guides: Vec<String>,
     /// 允许 MCP(AI 助手)控制录制(start/stop/pause/resume)。默认关:开录是隐私
     /// 敏感操作,必须用户显式授权。
-    #[serde(default)]
     pub mcp_allow_control: bool,
     /// MCP 接入引导已展示过(欢迎页步骤走完,或存量用户提示条被关闭)。
-    #[serde(default)]
     pub mcp_onboarded: bool,
     /// 声音处理方案(spec 2026-08-10,2026-08-10 用户拍板默认翻 B):录制期混音与笔记页
     /// 默认回放的统一档位。a=双轨(不混音);ab=对照(混音,默认回放仍双轨);
     /// b=成品轨(默认,混音,默认回放成品轨)。混音开启后每分钟多约 1.9MB 磁盘
-    /// (转码 m4a 后大幅缩小),仅影响新录制。
-    /// 内部 `Option` 仅为判"键是否在场":迁移必须看原始键存在性,不能比较值==默认——
-    /// 默认翻转后显式写入的 "b" 会被误判为"未设置"(Codex P1#1)。`load()` resolve 后
-    /// `audio_scheme` 恒为具体值;`save()` 前从 `audio_scheme` 回写本字段,否则 skip
-    /// 序列化会把键从磁盘上写丢。
-    // pub(crate) 而非纯私有:同 crate 内(lib.rs 测试用的 `Settings { .., ..Default::default() }`
-    // 函数式更新语法)即便不显式点名该字段,也要求它在字面量构造点可见,否则 E0451——
-    // 跨模块仍不可见,对外 API 面不变,符合"私有,serde 专用"的本意。
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "audio_scheme")]
-    pub(crate) audio_scheme_raw: Option<AudioScheme>,
-    /// resolve 后的对外真值。跳过 (反)序列化——落盘/收发都走上面的 `audio_scheme_raw`,
-    /// 外部代码(lib.rs 等)照常读这个字段,不感知内部 Option 机制。
-    #[serde(skip)]
+    /// (转码 m4a 后大幅缩小),仅影响新录制。普通字段,序列化恒写出当前真值——
+    /// 键存在性迁移(旧 `mix_track` 布尔键、Codex P1#1 的"默认翻转后显式 b 不能被误判成
+    /// 未设置")全部在 `SettingsRepr` → `Settings` 的 `From` 转换里一次性做完,见该 impl。
     pub audio_scheme: AudioScheme,
-    /// 旧布尔键「录制期混出成品轨」(≤2026-08-09):仅为 load 迁移而保留读取,
-    /// save 不再写出(skip_serializing)。语义等价:true=混音+默认双轨=Ab。
-    #[serde(default, rename = "mix_track", skip_serializing)]
-    pub legacy_mix_track: Option<bool>,
     /// 采集路径逃生舱(json-only 无 UI,同 asr_provider 先例):aec=普通输入+软件AEC(默认),
     /// vpio=系统通话模式(蓝牙击穿/设备格式不兼容时的手改退路)。
-    #[serde(default)]
     pub capture_path: CapturePath,
     /// 音频自动保留期:到期笔记仅清音频轨(转写/精修稿永留)。默认永久。
-    #[serde(default)]
     pub audio_retention: AudioRetention,
     /// P3 日历匹配:录制停止后按时间窗匹配日历事件(标题+参会人入 identify 先验)。
     /// 默认开——但真正生效还需系统日历授权(授权只能由设置页说明卡触发,自动
     /// 路径未授权即静默跳过),默认开不会造成 surprise 弹窗。
-    #[serde(default = "default_true")]
     pub calendar_match_enabled: bool,
     /// P2b 自动应用:high 档身份推断自动关联+回灌(回执可撤销)。默认关——
     /// 开启门槛是评测数据达标(spec:≥20 场标注、high 档 ≥50 样本误认 ≤1%),
     /// 由用户在设置页自行拨开。
-    #[serde(default)]
     pub identify_auto_apply: bool,
+}
+
+/// `Settings` 反序列化的中间表征:逐字段镜像 `Settings`,携带解析期需要的默认值/重命名
+/// 属性(原本挂在 `Settings` 字段上的那些 `#[serde(default = ...)]`/`rename` 全部搬到这里)。
+/// 与 `Settings` 唯一的结构性差异是 `audio_scheme`(纯 `Option`,没有 rename,用来判"键
+/// 是否在场")和额外的 `legacy_mix_track`(旧 `mix_track` 布尔键,只在这里出现,`Settings`
+/// 上不再暴露)。`From<SettingsRepr> for Settings` 用显式逐字段映射(不用 `..Default::default()`
+/// 展开),新增字段忘记在 `From` 里补上会直接编译失败,不会被 spread 语法悄悄吞掉。
+#[derive(Debug, Clone, Deserialize)]
+struct SettingsRepr {
+    #[serde(default = "default_true")]
+    mirror_enabled: bool,
+    #[serde(default = "default_prefix")]
+    mirror_prefix: String,
+    #[serde(default)]
+    data_dir: Option<String>,
+    #[serde(default)]
+    models_dir: Option<String>,
+    #[serde(default = "default_asr")]
+    asr_model: String,
+    #[serde(default)]
+    asr_provider: String,
+    #[serde(default = "default_asr_mode")]
+    asr_mode: String,
+    #[serde(default = "default_cloud_provider")]
+    cloud_asr_provider: String,
+    #[serde(default)]
+    volc_app_key: String,
+    #[serde(default)]
+    volc_access_key: String,
+    #[serde(default)]
+    dashscope_api_key: String,
+    #[serde(default = "default_speaker_model")]
+    speaker_model: String,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default = "default_ui_lang")]
+    ui_lang: String,
+    #[serde(default)]
+    record_system_only: bool,
+    #[serde(default)]
+    keep_output_volume: bool,
+    #[serde(default = "default_true")]
+    language_filter: bool,
+    #[serde(default = "default_true")]
+    keep_audio: bool,
+    #[serde(default)]
+    shortcut_enabled: bool,
+    #[serde(default = "default_shortcut")]
+    shortcut: String,
+    #[serde(default = "default_true")]
+    tray_enabled: bool,
+    #[serde(default)]
+    refine_enabled: bool,
+    #[serde(default = "default_refine_provider")]
+    refine_provider: String,
+    #[serde(default = "default_refine_agent")]
+    refine_agent: String,
+    #[serde(default)]
+    refine_agent_bin: String,
+    #[serde(default)]
+    refine_agent_model: String,
+    #[serde(default)]
+    refine_base_url: String,
+    #[serde(default)]
+    refine_model: String,
+    #[serde(default)]
+    refine_api_key: String,
+    #[serde(default)]
+    onboarded: bool,
+    #[serde(default)]
+    completed_guides: Vec<String>,
+    #[serde(default)]
+    mcp_allow_control: bool,
+    #[serde(default)]
+    mcp_onboarded: bool,
+    /// 键存在性判定的核心:没有 rename(键名就是 "audio_scheme"),纯 `Option`——
+    /// 在场则 `Some(任意值)`,不论是不是恰好等于新默认 B(Codex P1#1);缺失则 `None`,
+    /// 由 `From` impl 再看 `legacy_mix_track` 决定落 Ab 还是新默认 B。
+    #[serde(default)]
+    audio_scheme: Option<AudioScheme>,
+    /// 旧布尔键「录制期混出成品轨」(≤2026-08-09):只在这个中间表征里出现,`Settings`
+    /// 本体不再暴露,也不会被序列化回磁盘(`Settings` 没有这个字段,自然写不出来)。
+    #[serde(default, rename = "mix_track")]
+    legacy_mix_track: Option<bool>,
+    #[serde(default)]
+    capture_path: CapturePath,
+    #[serde(default)]
+    audio_retention: AudioRetention,
+    #[serde(default = "default_true")]
+    calendar_match_enabled: bool,
+    #[serde(default)]
+    identify_auto_apply: bool,
+}
+
+impl From<SettingsRepr> for Settings {
+    fn from(r: SettingsRepr) -> Self {
+        Self {
+            mirror_enabled: r.mirror_enabled,
+            mirror_prefix: r.mirror_prefix,
+            data_dir: r.data_dir,
+            models_dir: r.models_dir,
+            asr_model: r.asr_model,
+            asr_provider: r.asr_provider,
+            asr_mode: r.asr_mode,
+            cloud_asr_provider: r.cloud_asr_provider,
+            volc_app_key: r.volc_app_key,
+            volc_access_key: r.volc_access_key,
+            dashscope_api_key: r.dashscope_api_key,
+            speaker_model: r.speaker_model,
+            theme: r.theme,
+            ui_lang: r.ui_lang,
+            record_system_only: r.record_system_only,
+            keep_output_volume: r.keep_output_volume,
+            language_filter: r.language_filter,
+            keep_audio: r.keep_audio,
+            shortcut_enabled: r.shortcut_enabled,
+            shortcut: r.shortcut,
+            tray_enabled: r.tray_enabled,
+            refine_enabled: r.refine_enabled,
+            refine_provider: r.refine_provider,
+            refine_agent: r.refine_agent,
+            refine_agent_bin: r.refine_agent_bin,
+            refine_agent_model: r.refine_agent_model,
+            refine_base_url: r.refine_base_url,
+            refine_model: r.refine_model,
+            refine_api_key: r.refine_api_key,
+            onboarded: r.onboarded,
+            completed_guides: r.completed_guides,
+            mcp_allow_control: r.mcp_allow_control,
+            mcp_onboarded: r.mcp_onboarded,
+            // 迁移 resolve 的唯一落点:键在场(`Some`)恒照旧,任意值都算用户显式选择,
+            // 不受旧 `mix_track` 影响(Codex P1#1 的翻车组合:`{"audio_scheme":"b",
+            // "mix_track":true}` 必须停在 B,不能被旧键拖回 Ab)。键缺失时才看旧
+            // `mix_track`;都缺 → 新默认 B。
+            audio_scheme: match r.audio_scheme {
+                Some(v) => v,
+                None => match r.legacy_mix_track {
+                    Some(true) => AudioScheme::Ab,
+                    _ => AudioScheme::B,
+                },
+            },
+            capture_path: r.capture_path,
+            audio_retention: r.audio_retention,
+            calendar_match_enabled: r.calendar_match_enabled,
+            identify_auto_apply: r.identify_auto_apply,
+        }
+    }
 }
 
 /// 声音处理方案档位。serde 小写:"a"/"ab"/"b"。
@@ -312,9 +423,7 @@ impl Default for Settings {
             completed_guides: Vec::new(),
             mcp_allow_control: false,
             mcp_onboarded: false,
-            audio_scheme_raw: None,
             audio_scheme: AudioScheme::B,
-            legacy_mix_track: None,
             capture_path: CapturePath::Aec,
             audio_retention: AudioRetention::Forever,
             calendar_match_enabled: true,
@@ -340,27 +449,6 @@ const LEGACY_MARKERS: [&str; 5] = [
     "\"keep_output_volume\"",
     "\"mirror_prefix\"",
 ];
-
-/// audio_scheme 迁移 resolve:原始键在场(`audio_scheme_raw`)则照旧,任意值都算用户
-/// 显式选择,不受旧 `mix_track` 影响(Codex P1#1 的翻车组合:`{"audio_scheme":"b",
-/// "mix_track":true}` 必须停在 B,不能被旧键拖回 Ab)。键缺失时才看旧 `mix_track`;
-/// 都缺 → 新默认 B。
-///
-/// 也被 `update()` 条件性复用(仅当闭包改动了 `audio_scheme_raw` 时才调用,见
-/// `update()` 内的对称判定注释):`set_settings` 这类整体替换 `Settings`
-/// (`*s = new_settings`)的闭包会让 skip 序列化的 `audio_scheme` 字段被重置为类型
-/// 默认值(因为它不参与 deserialize),必须在 save 前重新从随结构体一起被替换的
-/// `audio_scheme_raw` 派生一次,否则 `save()` 的"从 audio_scheme 回写 raw"会用这个
-/// 陈旧默认值覆盖前端刚提交的档位。
-fn resolve_audio_scheme(s: &mut Settings) {
-    s.audio_scheme = match s.audio_scheme_raw {
-        Some(v) => v,
-        None => match s.legacy_mix_track {
-            Some(true) => AudioScheme::Ab,
-            _ => AudioScheme::B,
-        },
-    };
-}
 
 /// 尸检文件序号:同一进程内短时间连续触发抢救(比如批量场景,或一次 load 里先后遇到
 /// 类型错和截断两种坏文件)按 unix 秒起名会撞同名,后一次覆盖掉前一次的尸体——叠加
@@ -391,8 +479,9 @@ fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 缺失/损坏 → 默认值（容忍，不报错）。旧 mix_track 布尔键在此迁移(见字段注释)。
-/// 升级备份 + 逐字段抢救,详见 `resolve_audio_scheme` 与 `salvage`。
+/// 缺失/损坏 → 默认值（容忍，不报错）。旧 mix_track 布尔键在此迁移(见 `SettingsRepr` →
+/// `Settings` 的 `From` 实现)。升级备份 + 逐字段抢救,详见 `salvage`。反序列化本身已经
+/// 自洽(`Settings` 的 `#[serde(from = "SettingsRepr")]`),这里不需要再补一步 resolve。
 pub fn load(app_data: &Path) -> Settings {
     let path = app_data.join("settings.json");
     let raw = std::fs::read_to_string(&path).ok();
@@ -405,7 +494,7 @@ pub fn load(app_data: &Path) -> Settings {
             let _ = write_owner_only(&bak, text);
         }
     }
-    let mut s: Settings = match raw.as_deref().map(serde_json::from_str::<Settings>) {
+    match raw.as_deref().map(serde_json::from_str::<Settings>) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
             // 整对象反序列化失败(单字段类型错也会拖垮整体,Codex P1#9)→ 尸检备份 +
@@ -423,13 +512,7 @@ pub fn load(app_data: &Path) -> Settings {
             salvage(raw.as_deref().unwrap_or(""))
         }
         None => Settings::default(),
-    };
-    resolve_audio_scheme(&mut s);
-    // 回写 raw:保证 get_settings 经 IPC 序列化给前端时 audio_scheme 键不会因为
-    //(旧文件迁移/全新安装场景下)raw 本就是 None 而被 skip 字段吞掉;也让随后若
-    // 直接对这份 Settings 调 save() 时天然带着正确值,无需依赖调用方记得回写。
-    s.audio_scheme_raw = Some(s.audio_scheme);
-    s
+    }
 }
 
 /// 逐字段抢救:整体 JSON 不合法或字段类型错时,能从 Value 读出的字段保留,读不出的用默认。
@@ -461,12 +544,8 @@ fn salvage(text: &str) -> Settings {
 
 pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
     std::fs::create_dir_all(app_data)?;
-    // audio_scheme 是 skip 序列化的对外字段,真正落盘的是 audio_scheme_raw;写盘前必须
-    // 从当前真值回写一次,否则(比如测试/调用方直接构造 Settings 而不知道 raw 内部机制时)
-    // 键会从磁盘上消失,下次 load 又摔回默认(见 P1#1/P1#2 相关注释)。克隆而非改 &self,
-    // 保持 save 对调用方传入值只读的既有契约。
-    let mut s2 = s.clone();
-    s2.audio_scheme_raw = Some(s2.audio_scheme);
+    // audio_scheme 现在是普通字段,Serialize 恒写出当前真值——不再需要"从公开字段回写
+    // 影子 raw 字段"这一步,序列化结果天然自洽,键不会因为任何 skip 机关而消失。
     let tmp = app_data.join("settings.json.tmp");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -482,7 +561,7 @@ pub fn save(app_data: &Path, s: &Settings) -> anyhow::Result<()> {
         // tmp 可能来自上次崩溃且权限较宽；mode() 只对新建文件生效，显式收紧。
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(serde_json::to_string_pretty(&s2)?.as_bytes())?;
+    file.write_all(serde_json::to_string_pretty(s)?.as_bytes())?;
     drop(file);
     std::fs::rename(&tmp, app_data.join("settings.json"))?;
     Ok(())
@@ -497,24 +576,20 @@ static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 原子化读-改-写:锁内 load → f(&mut s) → save,返回落盘后的新值。所有会修改
 /// settings.json 的路径都应走这里(而非各自 load 后 save),否则并发写互相覆盖(见
 /// WRITE_LOCK 注释)。中毒锁降级取值继续(设置写入不该因一次 panic 永久卡死)。
+///
+/// 不再需要针对 `audio_scheme` 的特判(对比旧版本:曾经因为影子 raw 字段 + `#[serde(skip)]`
+/// 公开字段这套机关,需要在这里判断闭包到底改没改 raw 才决定要不要重新 resolve——
+/// 但这个"猜闭包意图"的启发式挡不住 `set_settings` 整体替换且档位未变这条最常见路径
+/// (磁盘 a、闭包整体换成 wire 里同样是 a 的 `Settings`:raw 前后相等,判定为"没改",
+/// 于是不重新 resolve,而 skip 字段在反序列化时已经被悄悄重置成类型默认值,最终把 a
+/// 存丢),2026-08-10 review 升级为 Critical。改用 `#[serde(from = "SettingsRepr")]`
+/// 后,`f(&mut s)` 不管是整体替换 `*s = new_settings` 还是直接改单个字段 `s.audio_scheme
+/// = X`,`s.audio_scheme` 在闭包跑完之后永远就是调用方想要的最终值——因为它不再有
+/// "反序列化不经过它"这个特例,`save()` 也不需要再从别的字段回写它。
 pub fn update(app_data: &Path, f: impl FnOnce(&mut Settings)) -> anyhow::Result<Settings> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut s = load(app_data);
-    // load() 之后 audio_scheme_raw 恒为 Some(当前真值)(见 load() 尾部注释)。记下闭包前
-    // 的快照,用来对称判定闭包到底动没动 raw——不能无条件 resolve:那样会把 load() 时
-    // 缓存的旧 raw 覆盖回闭包刚直接写的 `s.audio_scheme`,静默吞掉调用方的修改。
-    let before_raw = s.audio_scheme_raw;
     f(&mut s);
-    // 仅当闭包让 audio_scheme_raw 变化了(典型场景:lib.rs::set_settings 的
-    // `*s = new_settings` 整体替换,把前端提交的新 raw 带进来,同时把 skip 序列化的
-    // 公开字段 audio_scheme 重置回类型默认值,因为它不参与 deserialize)才需要重新
-    // resolve,让公开字段跟上刚替换进来的 raw,save() 的"公开字段回写 raw"才不会用
-    // 这个陈旧默认值覆盖前端刚提交的档位。若闭包只是直接改公开字段(比如未来某个任务
-    // 写 `s.audio_scheme = X` 这种单字段改法,raw 未被触碰),这里必须放过——公开字段
-    // 此时就是真值,交给 save() 的"公开→raw"同步落盘,而不是被这里的 resolve 覆盖回旧值。
-    if s.audio_scheme_raw != before_raw {
-        resolve_audio_scheme(&mut s);
-    }
     save(app_data, &s)?;
     Ok(s)
 }
@@ -944,20 +1019,19 @@ mod tests {
     #[test]
     fn update_full_struct_replace_like_set_settings_keeps_submitted_audio_scheme() {
         // 复刻 lib.rs::set_settings 的写入形状:闭包整体替换 `*s = new_settings`
-        //(new_settings 由前端 JSON 反序列化而来)。这会让 skip 序列化的公开字段
-        // audio_scheme 被重置为类型默认值(反序列化不经过它),必须验证 update() 事后
-        // 重新 resolve,否则 save() 的"公开字段回写 raw"会用这个陈旧默认值覆盖前端刚
-        // 提交的档位——前端选 b,落盘却变成别的值,静默丢用户设置。
+        //(new_settings 由前端 JSON 反序列化而来,提交的新档位与磁盘存量不同)。改用
+        // `#[serde(from = "SettingsRepr")]` 之后,`new_settings.audio_scheme` 在反序列化
+        // 那一刻就已经是 resolve 过的具体值(键存在性判定在 `SettingsRepr::From` 里做完),
+        // 不存在"公开字段被重置成类型默认值、事后还要在 update() 里补一次 resolve"这回事——
+        // 这个测试锁的是"整体替换且档位确实变了"这条路径依旧正确。
         let tmp = tempfile::tempdir().unwrap();
         // 存量:已显式选过 b(新默认,当心测试值不要恰好等于 AudioScheme::default(),
-        // 否则"忘了 resolve"这个回归会被类型默认值巧合掩盖,测试失去意义)。
+        // 否则回归会被类型默认值巧合掩盖,测试失去意义)。
         std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b"}"#).unwrap();
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
 
-        // 前端把新值经 JSON 传回来(rename 目标键 "audio_scheme"),模拟 tauri command
-        // 参数 `new_settings: settings::Settings` 的反序列化产物。刻意选与
-        // AudioScheme::default() 不同的档位(a),这样"忘了在 update() 里重新 resolve"
-        // 这个回归不会被类型默认值碰巧等于提交值给掩盖掉。
+        // 前端把新值经 JSON 传回来,模拟 tauri command 参数
+        // `new_settings: settings::Settings` 的反序列化产物。刻意选与磁盘存量不同的档位。
         let wire = r#"{"audio_scheme":"a"}"#;
         let new_settings: Settings = serde_json::from_str(wire).unwrap();
 
@@ -971,18 +1045,35 @@ mod tests {
 
     #[test]
     fn update_closure_writing_audio_scheme_field_directly_is_not_overwritten() {
-        // 对称判定的另一半:闭包不碰 audio_scheme_raw、只直接改公开字段
-        // `s.audio_scheme`(不同于 set_settings 的整体替换)时,update() 事后的
-        // resolve 不能无条件执行——那样会用 load() 时缓存的旧 raw 把这次直接写入覆盖
-        // 回旧值,静默吞掉调用方的修改,给后续任务埋雷(Review Important 1)。
+        // 闭包直接改公开字段 `s.audio_scheme = X`(不同于 set_settings 的整体替换)这种
+        // 写法。旧的 raw/skip 方案下 update() 需要一段"猜闭包有没有碰 raw"的对称判定
+        // 才能不吞掉这种写法;现在 `audio_scheme` 是普通字段,`update()` 里完全没有特判,
+        // 这个场景"自动"就是对的——保留这个测试是为了锁住"不要再往 update() 里加特判"
+        // 这个不变式,回归会立刻在这里炸。
         let tmp = tempfile::tempdir().unwrap();
-        // 起始档位与目标档位都不是 AudioScheme::default(),避免巧合掩盖判定错误。
         std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"b"}"#).unwrap();
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::B);
 
         let got = update(tmp.path(), |s| s.audio_scheme = AudioScheme::A).unwrap();
         assert_eq!(got.audio_scheme, AudioScheme::A, "闭包直接写公开字段的改动不能被吞");
         assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A, "落盘也须是闭包写入的值");
+    }
+
+    #[test]
+    fn full_replace_with_unchanged_scheme_preserves_disk_value() {
+        // set_settings 最常见的主路径,也是 2026-08-10 review 升级为 Critical 的那条:
+        // 磁盘 a,用户只改了别的设置,前端把整份 Settings(含未改动的 audio_scheme:"a")
+        // 原样带回来,`*s = wire` 整体替换。旧的 raw/skip 方案下,这条路径 raw 前后相等
+        // (都是 Some(A)),会被 update() 的"raw 没变就不 resolve"判定为"闭包没碰它",
+        // 于是不重新 resolve;但 skip 字段在 `new_settings` 反序列化那一刻已经被重置成
+        // 类型默认值(B),没人把它纠正回来,save() 又是"从公开字段回写 raw",于是把 A
+        // 静默存成了 B。serde(from) 重建后,`wire.audio_scheme` 从反序列化那一刻起就已经
+        // 是 A(没有中间态),这个类别的 bug 从架构上不可能再发生。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.json"), r#"{"audio_scheme":"a"}"#).unwrap();
+        let wire: Settings = serde_json::from_str(r#"{"audio_scheme":"a"}"#).unwrap();
+        update(tmp.path(), |s| *s = wire.clone()).unwrap();
+        assert_eq!(load(tmp.path()).audio_scheme, AudioScheme::A);
     }
 
     #[cfg(unix)]
