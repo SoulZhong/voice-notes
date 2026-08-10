@@ -373,20 +373,22 @@
 
   // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移,
   //    滚动保留最近 240 条(约 29s);暂停冻结不清空,停止清空。interval 回调里读
-  //    micPct/sysPct 是瞬时值,不进 effect 依赖。mic/system 各一条独立数组。 ──
+  //    micPct/sysPct 是瞬时值,不进 effect 依赖。
+  //    波形只画 mic(冒烟反馈:双轨两行太吵);系统声降级为「对方」指示灯——
+  //    sysHold 是带保持的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),灯不闪烁。 ──
   const LIVE_BARS = 240;
   let liveBarsMic = $state<number[]>([]);
-  let liveBarsSys = $state<number[]>([]);
+  let sysHold = $state(0);
   $effect(() => {
     if (!recording.isLive) {
       liveBarsMic = [];
-      liveBarsSys = [];
+      sysHold = 0;
       return;
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
     const t = setInterval(() => {
       liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), micPct];
-      liveBarsSys = [...liveBarsSys.slice(-(LIVE_BARS - 1)), sysPct];
+      sysHold = sysPct > 0 ? 8 : Math.max(0, sysHold - 1);
     }, 120);
     return () => clearInterval(t);
   });
@@ -396,11 +398,6 @@
     liveBarsMic.length >= LIVE_BARS
       ? liveBarsMic
       : [...new Array(LIVE_BARS - liveBarsMic.length).fill(0), ...liveBarsMic],
-  );
-  const liveBarsSysView = $derived(
-    liveBarsSys.length >= LIVE_BARS
-      ? liveBarsSys
-      : [...new Array(LIVE_BARS - liveBarsSys.length).fill(0), ...liveBarsSys],
   );
 
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
@@ -601,18 +598,14 @@
           {/if}
         </div>
 
-        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形/电平表,新声从右缘进入 -->
+        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形,新声从右缘进入。
+             只画 mic 一条(冒烟反馈:双行太吵);系统声是否在收音由右侧「对方」
+             指示灯回答——有电平点亮 mint 色,静默退灰。 -->
         {#if recording.isLive}
-          <div class="wave-stack" aria-hidden="true">
-            <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")}>
-              <span class="wave-tag mic">{t("record.badge.me")}</span>
-              {#each liveBarsMicView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
-            </div>
-            <div class="wave-live" class:frozen={recording.paused} title={t("record.systemLevel")}>
-              <span class="wave-tag system">{t("record.badge.them")}</span>
-              {#each liveBarsSysView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
-            </div>
+          <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")} aria-hidden="true">
+            {#each liveBarsMicView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
           </div>
+          <span class="sys-ind" class:on={sysHold > 0} title={t("record.systemLevel")}>{t("record.badge.them")}</span>
         {/if}
 
         <!-- 右:计时 + 状态,同一簇(不再单挂一行);状态点是唯一动态信号。
@@ -1011,39 +1004,36 @@
     color: var(--ink-secondary);
   }
   .timer.pausedTimer { color: var(--ink-faint); }
-  /* 双通道纵排:mic/system 各占一行,行高减半(32px→16px×2),总高与原单通道一致。
-     flex:1 从单行 wave-live 移到外层 wave-stack,继续吃满控制条与右侧计时之间的整行。
-     空闲时容器空置但保留 flex:1 占位,把计时推到行尾、行高不跳。 */
-  .wave-stack {
+  /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
+     record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
+     只画 mic 一条(冒烟反馈:双行太吵),flex:1 吃满控制条与右侧计时之间的整行。 */
+  .wave-live {
     flex: 1;
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-  }
-  /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
-     record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。 */
-  .wave-live {
-    min-width: 0;
-    height: 16px;
+    height: 32px;
     display: flex;
     align-items: center;
     gap: 1px;
     overflow: hidden;
   }
-  /* 行首来源徽章:配色令牌复用 .badge mic/system,12px 次级墨小标,不参与 flex:1 均分。 */
-  .wave-tag {
+  /* 「对方」指示灯:系统声在收音时点亮(mint,同 .badge.system 配色令牌),静默退灰。
+     常驻占位不闪现,回答"对方声音有没有在录"而不额外占一行波形。 */
+  .sys-ind {
     flex: none;
     font-size: 0.68rem;
     font-weight: 500;
     line-height: 1;
-    padding: 0.1em 0.35em;
-    margin-right: 0.35em;
+    padding: 0.15em 0.4em;
     border-radius: var(--radius-sm);
+    color: var(--ink-faint);
+    border: 1px solid var(--hairline);
+    transition: background 200ms, color 200ms;
   }
-  .wave-tag.mic { background: var(--tint-sky); color: var(--tint-sky-ink); }
-  .wave-tag.system { background: var(--tint-mint); color: var(--tint-mint-ink); }
+  .sys-ind.on {
+    background: var(--tint-mint);
+    color: var(--tint-mint-ink);
+    border-color: transparent;
+  }
   .wave-live .bar {
     flex: 1;
     min-width: 1px;
