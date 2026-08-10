@@ -157,8 +157,9 @@ pub struct PlayerHandle {
     /// 装载代次(2026-08-10 排障):快速切笔记时多个 player_load 并发在跑,完成序由
     /// 装载耗时(解码/对齐/门控)决定而非请求序——后完成的旧笔记装载会覆盖当前内核
     /// (wrong-writer-wins),表现为点播放被掐、图标弹回、放错笔记的音频。
-    /// 入口取号,只有仍是最新代次的装载允许装内核/起流。
-    load_gen: AtomicU64,
+    /// 入口取号,只有仍是最新代次的装载允许装内核/起流。Arc:对齐闭包跑在
+    /// spawn_blocking('static),要携带代次探针在正结论提交前复核(Codex 十二轮)。
+    load_gen: Arc<AtomicU64>,
     /// 发布互斥(Codex P1):把「查代次→装内核→起流→复查」整段串行化。没有它,
     /// 过期装载 A 起流期间新装载 B 完成发布,A 的兜底 stop_stream 会无差别拆掉 B
     /// 刚装好的内核/停止通道——B 返回 Ok 但 play 报"尚未装载"。持锁期间过期装载
@@ -171,7 +172,7 @@ impl Default for PlayerHandle {
         Self {
             core: Mutex::new(None),
             stop_tx: Mutex::new(None),
-            load_gen: AtomicU64::new(0),
+            load_gen: Arc::new(AtomicU64::new(0)),
             publish: Mutex::new(()),
         }
     }
@@ -304,24 +305,22 @@ fn aligned_cache_is_fresh(cache: &Path, align_json: Option<&Path>, sources: &[&P
 /// create_new 遇到已存在路径(含符号链接本身)直接失败不跟随,rename 替换的是目录项
 /// 本身(预置链接被整体换成普通文件)。与 store::align::write 同一防线。
 /// best-effort:失败只意味着下次装载再估一遍,不上抛。
-/// 返回落盘后标记的 mtime(所有权凭据):回滚方凭它识别「还是不是我写的那份」——
-/// 并发新装载若已覆写标记,mtime 不同,回滚不得误删(Codex 十一轮 P2)。
-fn write_align_skip_marker(note_dir: &Path) -> Option<std::time::SystemTime> {
+/// 返回写入标记的**内容 token**(所有权凭据):回滚方读回内容一致才认「还是我那份」。
+/// mtime 做凭据有双重歧义(并发覆写后 stat 到别人的 mtime;粗分辨率文件系统 mtime
+/// 相等),内容 token 无歧义(Codex 十二轮 P2)。标记新鲜度判定只看 mtime,内容自由。
+fn write_align_skip_marker(note_dir: &Path) -> Option<String> {
+    use std::io::Write;
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    let token = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
     let marker = note_dir.join(crate::store::align::ALIGN_SKIP_FILE);
-    let tmp = note_dir.join(format!(
-        "{}.{}-{}.tmp",
-        crate::store::align::ALIGN_SKIP_FILE,
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let tmp = note_dir.join(format!("{}.{token}.tmp", crate::store::align::ALIGN_SKIP_FILE));
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
-        Ok(_) => {
-            if std::fs::rename(&tmp, &marker).is_err() {
+        Ok(mut f) => {
+            if f.write_all(token.as_bytes()).is_err() || std::fs::rename(&tmp, &marker).is_err() {
                 let _ = std::fs::remove_file(&tmp);
                 return None;
             }
-            std::fs::metadata(&marker).and_then(|m| m.modified()).ok()
+            Some(token)
         }
         Err(_) => None,
     }
@@ -382,6 +381,7 @@ fn commit_aligned(
     render: impl FnOnce(&mut std::fs::File) -> std::io::Result<u64>,
     note_dir: &Path,
     map: &crate::player_align::TimeMap,
+    is_current: impl Fn() -> bool,
 ) -> bool {
     // 唯一名 + create_new:同 store::align::write 的理由(不跟随预置符号链接)。
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -414,6 +414,13 @@ fn commit_aligned(
     }
     // 与删除侧同锁(见 ALIGN_FS_LOCK):映射发布不被过期装载的清理穿插。
     let _fs = ALIGN_FS_LOCK.lock().unwrap();
+    // 正结论也过代次门(Codex 十二轮):重叠装载各自按不同源修订估计时,过期任务的
+    // 正结论若晚到,会把旧音频的映射发布在新结果之上——转写按旧映射、回放按新结果。
+    // 锁内复核,过期即弃(上面已 rename 的缓存音轨成孤儿,无映射即不新鲜,无害)。
+    if !is_current() {
+        eprintln!("回放对齐: 装载已被更新的请求取代,正结论不发布");
+        return false;
+    }
     if let Err(e) = crate::store::align::write(note_dir, map) {
         eprintln!("回放对齐: 映射落盘失败({e}),本次不对齐(下次装载重试)");
         return false;
@@ -481,6 +488,7 @@ async fn align_mic_track(
         );
         let (m2, s2, c2, nd) =
             (mic_path.clone(), sys_path.clone(), cache.clone(), note_dir.to_path_buf());
+        let gen_probe = state.load_gen.clone();
         let built = tauri::async_runtime::spawn_blocking(move || -> Option<u64> {
             // mmap 而不是 read:估计要同时看两条完整音轨,一小时双轨读进堆里就是
             // ~230MB 常驻,而 player_align 已改成按字节视图逐样本取值,页由系统按需
@@ -513,8 +521,8 @@ async fn align_mic_track(
                 // 不动。撤回后源再变,标记比新源旧本就判不新鲜,链路自洽。
                 if (mtime(&m2), mtime(&s2)) != pre {
                     let marker = nd.join(crate::store::align::ALIGN_SKIP_FILE);
-                    let now_mtime = std::fs::metadata(&marker).and_then(|m| m.modified()).ok();
-                    if ours.is_some() && now_mtime == ours {
+                    let content = std::fs::read_to_string(&marker).ok();
+                    if ours.is_some() && content == ours {
                         eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
                         let _ = std::fs::remove_file(&marker);
                     }
@@ -537,7 +545,8 @@ async fn align_mic_track(
             let render = |f: &mut std::fs::File| {
                 crate::player_align::render_aligned_to(&mic, &a.map, f).map(|(n, _)| n)
             };
-            commit_aligned(&c2, render, &nd, &a.map).then(|| (a.drift_secs * 1000.0) as u64)
+            commit_aligned(&c2, render, &nd, &a.map, || gen_probe.load(Ordering::SeqCst) == gen)
+                .then(|| (a.drift_secs * 1000.0) as u64)
         })
         .await
         .unwrap_or_else(|e| {
@@ -986,7 +995,7 @@ mod tests {
         let note = tmp.path().join("note");
         std::fs::create_dir(&note).unwrap();
         let cache = tmp.path().join("aligned.wav");
-        assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap(), || true));
         assert_eq!(std::fs::read(&cache).unwrap(), b"PCMDATA");
         assert_eq!(crate::store::align::read(&note), Some(tmap()));
         // 不留临时文件
@@ -1010,7 +1019,7 @@ mod tests {
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("occupied"), b"x").unwrap();
 
-        assert!(!commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap()));
+        assert!(!commit_aligned(&cache, |f| std::io::Write::write_all(f, b"PCMDATA").map(|_| 7), &note, &tmap(), || true));
         assert!(
             crate::store::align::read(&note).is_none(),
             "音轨发布失败时映射不得落盘(否则时间戳与音频对不上)"
@@ -1031,7 +1040,7 @@ mod tests {
         std::fs::create_dir(&note).unwrap();
         let cache = tmp.path().join("aligned.wav");
         for i in 0..3u8 {
-            assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, &[i; 16]).map(|_| 16), &note, &tmap()), "第 {i} 次提交");
+            assert!(commit_aligned(&cache, |f| std::io::Write::write_all(f, &[i; 16]).map(|_| 16), &note, &tmap(), || true), "第 {i} 次提交");
         }
         assert_eq!(std::fs::read(&cache).unwrap(), vec![2u8; 16], "最后一次胜出");
     }
