@@ -402,6 +402,8 @@ pub(crate) fn aligned_track_offset_ms(sys_off_ms: u64, map: &crate::player_align
 /// 回放行为与不对齐时完全一致。结果按两条源轨的路径+mtime 落缓存,同一笔记只算一次。
 async fn align_mic_track(
     app: &AppHandle,
+    state: &State<'_, PlayerHandle>,
+    gen: u64,
     plan: &mut [(PathBuf, u64, String)],
     note_dir: Option<&Path>,
 ) {
@@ -430,7 +432,11 @@ async fn align_mic_track(
             // 分支就命中了)——留着它,notes 读路径仍按旧映射改写转写时间戳,而回放走
             // 原始轨,两边永久错位。删之并通知页面重拉(Codex P2:页面在装载前已按旧
             // 映射改写过时间戳,不通知就一直错位到下次刷新;drift_ms=0 表示映射移除)。
-            remove_align_map_and_notify(app, note_dir, &align_json);
+            // 代次门(Codex 五轮 P1):同一笔记两次装载重叠时,过期装载不得删新装载
+            // 可能刚提交的有效映射——只有仍是最新代次才有资格做对齐副作用。
+            if state.is_current(gen) {
+                remove_align_map_and_notify(app, note_dir, &align_json);
+            }
             return;
         }
         eprintln!(
@@ -496,7 +502,11 @@ async fn align_mic_track(
             // 负结论(估不出/不值得/任务失败):过期正映射一并移除并通知页面重拉
             // (Codex P1+P2)——负结论确立后旧 align.json 只会让转写时间戳与原始轨
             // 回放错位,页面在装载前已按旧映射改写过时间戳,不通知就错位到下次刷新。
-            remove_align_map_and_notify(app, note_dir, &align_json);
+            // 代次门(Codex 五轮 P1):过期装载的负结论可能晚于新装载的有效提交抵达,
+            // 无差别删除会拆掉新映射;过期即放弃副作用(标记写入另有 mtime 快照门)。
+            if state.is_current(gen) {
+                remove_align_map_and_notify(app, note_dir, &align_json);
+            }
             return;
         };
         // 详情页手里那份段是旧时基的,通知它整页重拉。
@@ -568,7 +578,7 @@ pub async fn player_load(
     // 在 400ms 内,不先把时基掰正,门控只会压错地方。
     //
     // 只对"轨长明显对不上"的笔记做:估计要跑几秒,健康的笔记不该为它买单。
-    align_mic_track(&app, &mut plan, note_dir.as_deref()).await;
+    align_mic_track(&app, &state, gen, &mut plan, note_dir.as_deref()).await;
 
     // 回放门控:按两轨逐帧电平构建 mic 压低区间(任何失败空表降级=不门控)。
     // 判据不再取自转写段——回声残影本身会被识别成 mic 段,旧的"mic 有段即保护"

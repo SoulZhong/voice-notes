@@ -94,6 +94,10 @@
         if (gen === loadGen && e !== SUPERSEDED) reportError(t("notes.player.errLoad"), `${e}`);
         throw e;
       });
+      // 终端兜底(Codex P2):无人排队 play/seek 时,上面的 rethrow 会成为无消费的
+      // 拒绝,快速切换笔记就刷 unhandledrejection。挂一个空 catch 收尾——排队命令
+      // 链在 loadPromise 上,仍能看到拒绝,不受影响。
+      loadPromise.catch(() => {});
     }
     return () => {
       // 换代:让已排队但尚未发起的旧装载放弃(上方 gen 检查),防旧实例的装载
