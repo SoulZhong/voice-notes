@@ -30,7 +30,7 @@ PR#85 落地声音处理方案三档(a/ab/b,默认 a)。本单:B 升为旗舰默
 
 - **删 `keep_audio`**(固定保留):lib.rs 快照与 sink 装配分支;**lib.rs:7140 续录同步测试的 keep_audio=false 契约改写为"writer 未写入"一般性场景**;设置行+i18n。
 - **删 `record_system_only`**(固定双轨):lib.rs 两个录制入口的 `RecordSource` 计算与 `RecordSource::from_settings`(telemetry.rs:21)——**遥测枚举改为常量 Both 或删除该维度**;`required_sources_follow_system_only` 测试重写;设置行+i18n。
-- **删 `keep_output_volume`**(固定普通输入+AEC):lib.rs 采集路径分支;**录音页两处消费者改常态检测**——蓝牙回声风险提示(record/+page.svelte:62)与低输入音量提示(:78)不再依赖开关、始终按设备状态判定;**record.ts 蓝牙提示文案重写**(原文案指向已删除的设置开关,改为提示蓝牙设备可能击穿回声消除+指引换设备/逃生舱)。
+- **删 `keep_output_volume`**(固定普通输入+AEC):lib.rs 采集路径分支;**录音页两处消费者改常态检测**——蓝牙回声风险提示(record/+page.svelte:62)与低输入音量提示(:78)不再依赖开关、始终按设备状态判定;**record.ts 蓝牙提示文案重写**(原文案指向已删除的设置开关,改为提示蓝牙设备可能击穿回声消除+指引换设备/逃生舱)。(执行修订:落地文案不指向逃生舱——json-only 字段不向横幅用户宣传,引导换有线/内置设备即可;逃生舱留给排障文档。)
 - **AEC 逃生舱**(Codex P1#5,用户拍板):新后端字段 `capture_path: "aec"|"vpio"`(默认 `"aec"`,**无 UI**,手改 json,同 `asr_provider` 先例)。蓝牙击穿/设备格式不兼容(microphone.rs 仅收默认设备 F32)等翻车场景的运行时退路。
 - **藏 `language_filter`**:行为不动,UI 入高级折叠区。
 

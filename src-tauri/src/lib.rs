@@ -6854,6 +6854,19 @@ pub fn run() {
             // 镜像前缀已随三删一藏改为编译期常量(settings::MIRROR_PREFIX),不再有
             // mirror_prefix 字段可迁移——一次性 migrate_mirror_prefix 启动调用随之删除。
             let s = app_data.as_ref().map(|d| settings::load(d)).unwrap_or_default();
+            // 启动一次性自愈(2026-08-10 review Important:堵尸检累积回归):上面这行
+            // `load` 只在内存里 salvage/迁移损坏或旧格式文件,从不回写磁盘——纯 load
+            // 调用链路里没有别处会把结果落盘。若不补这一步,同一份坏 settings.json
+            // 每次启动都会重新触发"整体解析失败→尸检备份",在 app_data 目录里无限
+            // 累积 `settings.json.corrupt-*` 尸体,旧键也永远学不会离开磁盘。用
+            // `needs_heal` 探测是否真的需要(全新安装/已是干净新格式都不触发),需要时
+            // 一次性 `update(&d, |_| {})` 走 load→save round-trip 落盘,下次启动即可
+            // 直接解析干净版本,不再新增尸体。详见 settings::needs_heal 文档。
+            if let Some(dir) = &app_data {
+                if settings::needs_heal(dir) {
+                    let _ = settings::update(dir, |_| {});
+                }
+            }
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。

@@ -423,6 +423,27 @@ const LEGACY_MARKERS: [&str; 5] = [
     "\"mirror_prefix\"",
 ];
 
+/// 启动自愈探测:磁盘文件存在,且(整体反序列化失败 或 命中任一 `LEGACY_MARKERS` 关键字)。
+///
+/// 为什么需要这个探测:`load()` 对损坏/旧格式文件只在内存里 salvage/迁移,从不回写
+/// 磁盘——这是它的正确职责边界(纯读路径不该有写副作用)。但这意味着,如果调用方
+/// 只是反复 `load()` 而从不落盘一次,同一份坏文件每次启动都会重新触发"整体解析失败→
+/// 尸检备份"流程,在 app_data 目录里累积无穷多具 `settings.json.corrupt-*` 尸体,旧键
+/// 也永远学不会离开磁盘(2026-08-10 review Important:setup 里的启动调用一度退化成
+/// 纯 `load`,这条自愈链路随之消失)。调用方据此判断是否需要追加一次性
+/// `update(&d, |_| {})`,把 salvage/迁移结果落盘——之后磁盘上就是干净的新格式,后续
+/// 启动 `needs_heal` 归 false,不再重复触发抢救,也不再新增尸体。
+///
+/// 只在文件确实存在时才可能返回 true:全新安装(没有 settings.json)没有"愈合"这回事,
+/// 不能被这个探测误判去触发一次无意义的落盘。
+pub fn needs_heal(app_data: &Path) -> bool {
+    let path = app_data.join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    serde_json::from_str::<Settings>(&text).is_err() || LEGACY_MARKERS.iter().any(|k| text.contains(k))
+}
+
 /// 尸检文件序号:同一进程内短时间连续触发抢救(比如批量场景,或一次 load 里先后遇到
 /// 类型错和截断两种坏文件)按 unix 秒起名会撞同名,后一次覆盖掉前一次的尸体——叠加
 /// 进程内单调计数,保证同一秒内多次调用文件名也不同,不互相覆盖(Minor 3)。
@@ -1093,6 +1114,89 @@ mod tests {
             "缺 audio_scheme 键的坏文件抢救后仍须走 mix_track 迁移,不能被 base 默认 B 抢跑"
         );
         assert_eq!(s.theme, "system", "theme 类型错,坏字段回默认");
+    }
+
+    /// 启动自愈堵尸检累积回归:PR#66 后 lib.rs setup 的启动调用退化成纯 `load()`——
+    /// `load()` 对损坏/旧格式文件只在内存里 salvage/迁移,从不回写磁盘,于是同一份坏
+    /// 文件每次启动都会重新触发一次"解析失败→尸检备份"流程,在 app_data 目录里累积
+    /// 无穷多具 `settings.json.corrupt-*` 尸体,旧键也永远学不会离开磁盘。这里验证
+    /// `needs_heal` 探测 + 一次性 `update(&d, |_| {})` round-trip 能把这条回归堵死:
+    /// 愈合后 `needs_heal` 归 false,且再次 `load` 不会新增尸检文件(尸检去重证据)。
+    #[test]
+    fn needs_heal_true_for_corrupt_file_then_false_after_one_shot_heal_no_new_corpse() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"audio_scheme":123,"dashscope_api_key":"sk-live","theme":"dark"}"#,
+        )
+        .unwrap();
+        assert!(needs_heal(tmp.path()), "整体解析失败的坏文件应判定需要自愈");
+
+        // 一次性自愈:load(salvage)→save round-trip,把抢救结果落盘。
+        update(tmp.path(), |_| {}).unwrap();
+        assert!(!needs_heal(tmp.path()), "自愈落盘后磁盘文件已是干净新格式,不再需要愈合");
+        assert_eq!(load(tmp.path()).theme, "dark", "自愈不得丢好字段");
+        assert_eq!(
+            load(tmp.path()).dashscope_api_key,
+            "sk-live",
+            "自愈不得丢凭证等好字段"
+        );
+
+        // 尸检去重证据:自愈之后再 load 同一份(已干净)文件,不应新增 corrupt-* 尸体。
+        let corpse_names = |dir: &Path| -> std::collections::HashSet<std::ffi::OsString> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .filter(|n| n.to_string_lossy().starts_with("settings.json.corrupt-"))
+                .collect()
+        };
+        let before = corpse_names(tmp.path());
+        let _ = load(tmp.path());
+        let after = corpse_names(tmp.path());
+        assert_eq!(
+            before, after,
+            "自愈后再次 load 不得新增尸检文件(堵住尸检累积回归):before={before:?} after={after:?}"
+        );
+    }
+
+    /// 旧键文件(命中 LEGACY_MARKERS,但本身能整体解析成功——比如仅带 `mix_track`)
+    /// 同样须判定需要自愈:一次性 `update` 落盘后旧键从磁盘消失,`needs_heal` 归 false。
+    #[test]
+    fn needs_heal_true_for_legacy_keys_then_heals_to_clean_keys_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"mix_track":true,"mirror_prefix":"https://x/"}"#,
+        )
+        .unwrap();
+        assert!(needs_heal(tmp.path()), "命中旧键关键字的文件应判定需要自愈");
+
+        update(tmp.path(), |_| {}).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        assert!(
+            !raw.contains("mix_track") && !raw.contains("mirror_prefix"),
+            "自愈落盘后旧键不得残留: {raw}"
+        );
+        assert!(!needs_heal(tmp.path()), "自愈后应不再需要愈合");
+        assert_eq!(
+            load(tmp.path()).audio_scheme,
+            AudioScheme::Ab,
+            "旧 mix_track:true 的迁移结果应已落盘"
+        );
+    }
+
+    /// 反向断言:全新安装(文件不存在)与已是干净新格式的文件都不应判定需要愈合——
+    /// 前者是"没有可愈合的东西",后者是避免无谓重写(每次启动都 save 一遍不是免费的,
+    /// 且违背"只在真正需要时才写盘"的最小惊讶)。
+    #[test]
+    fn needs_heal_false_for_missing_file_and_pristine_new_format_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!needs_heal(tmp.path()), "全新安装(文件不存在)不应判定需要愈合");
+
+        let s = Settings { theme: "dark".into(), ..Default::default() };
+        save(tmp.path(), &s).unwrap();
+        assert!(!needs_heal(tmp.path()), "干净新格式文件不应触发无谓的自愈重写");
     }
 
 }
