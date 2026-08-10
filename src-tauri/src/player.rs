@@ -492,6 +492,13 @@ async fn align_mic_track(
                     return;
                 }
                 write_align_skip_marker(&nd);
+                // 发布后复验(Codex 九轮 P2):比对与落盘之间源又被改写,标记 mtime 反而
+                // 比新源新,会压掉对新音频的重估——发现快照变了就撤回。撤回之后若源再变,
+                // 标记比新源旧,本就判不新鲜,链路自洽。
+                if (mtime(&m2), mtime(&s2)) != pre {
+                    eprintln!("回放对齐: 标记落盘期间源轨已变,撤回跳过标记");
+                    let _ = std::fs::remove_file(nd.join(crate::store::align::ALIGN_SKIP_FILE));
+                }
             };
             let Some(a) = crate::player_align::estimate(&mic, mic_off, &sys, sys_off) else {
                 eprintln!("回放对齐: 估不出可信映射,记录跳过标记(源轨变更后重估)");
@@ -551,10 +558,16 @@ pub async fn player_load(
     state: State<'_, PlayerHandle>,
     tracks: Vec<LoadTrack>,
 ) -> Result<u64, String> {
-    // 入口取号:到达时刻本装载即最新意图;先停旧流(切笔记),旧 Core 一并丢弃,
-    // 防旧事件串台。此后若有更新的装载进入,本代次过期,装内核前的检查会拦下。
-    let gen = state.begin_load();
-    stop_stream(&state);
+    // 入口取号+拆除同锁原子(Codex 九轮 P1):取号与拆除若分离,老装载在取号后挂起、
+    // 新装载已发布的情形下,老装载恢复后的无差别拆除会拆掉新核。锁内成对后,取号时刻
+    // 本代次必为最新、锁内拆到的只可能是旧核;发布段与 player_stop 共用同一把锁定序。
+    // 锁在入口段结束即释放,不覆盖后续解码/对齐长路径。
+    let gen = {
+        let _publish = state.publish.lock().unwrap();
+        let g = state.begin_load();
+        stop_stream(&state);
+        g
+    };
 
     // 路径校验 + m4a 解码规划(阻塞段全部挪到 spawn_blocking)。
     // note_dir:取首条轨校验后路径的父目录(m4a 会被换成缓存路径,故须在换之前取,
@@ -809,6 +822,9 @@ pub fn player_stop(state: State<'_, PlayerHandle>) -> Result<(), String> {
     // 停止=清空播放意图,同时推进装载代次让**在途装载**过期(Codex P1):组件销毁后
     // 只清流不作废代次的话,仍在解码/对齐中的装载完成时会复活流+重装内核,排队的
     // play 还会对已离开的笔记开火。推进代次后它们在发布段被拦下,自行返回「已取代」。
+    // 取号+拆除进 publish 锁(Codex 九轮 P1):挂起在两步之间的 stop 恢复后不得拆掉
+    // 后续装载已发布的核——锁内成对 + 发布段同锁,定序即正确。
+    let _publish = state.publish.lock().unwrap();
     state.begin_load();
     stop_stream(&state);
     Ok(())
