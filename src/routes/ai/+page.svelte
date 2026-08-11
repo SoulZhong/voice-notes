@@ -69,11 +69,18 @@
       明文存 key 同一威胁模型;真正生效的配置仍以 settings 为唯一真源,草稿只是
       各家的编辑缓冲。自定义地址(不命中任何预设)不入草稿:无稳定身份,避免误回填。 */
   const REFINE_DRAFTS_KEY = "vn.refineDrafts";
-  let refineDrafts = $state<Record<string, { model: string; key: string }>>({});
+  let refineDrafts = $state<Record<string, { base?: string; model: string; key: string }>>({});
+  /** 服务商 tab 的当前页:命中预设显示该家,否则落「自定义」页。 */
+  const activeProviderTab = $derived(activePreset?.label ?? "custom");
   function stashDraft() {
-    const id = REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim())?.label;
+    const preset = REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim());
+    // 自定义地址也入草稿(连 base 一起存,tab 切回时整体回填);全空则无可存。
+    const id = preset ? preset.label : refineBaseUrl.trim() ? "custom" : null;
     if (!id) return;
-    refineDrafts = { ...refineDrafts, [id]: { model: refineModel.trim(), key: refineKey.trim() } };
+    refineDrafts = {
+      ...refineDrafts,
+      [id]: { base: refineBaseUrl.trim(), model: refineModel.trim(), key: refineKey.trim() },
+    };
     try {
       localStorage.setItem(REFINE_DRAFTS_KEY, JSON.stringify(refineDrafts));
     } catch {
@@ -320,14 +327,24 @@
     }
   }
 
-  function applyPreset(p: { label: string; base: string; model: string }) {
-    stashDraft(); // 先存走当前服务商的填写,再切换
-    const d = refineDrafts[p.label];
-    refineBaseUrl = p.base;
-    refineModel = d ? d.model : p.model;
-    // key 是各家各自的凭证:有草稿则回填,首次切到该家则清空——沿用上一家的
-    // key 只会让「测试连接」拿错凭证白失败一次。
-    refineKey = d ? d.key : "";
+  /** 切服务商 tab:先暂存当前页填写,再回填目标页草稿(无草稿用该家默认值起底)。
+      key 是各家各自的凭证:首次切到新家清空——沿用上一家的 key 只会让「测试连接」
+      拿错凭证白失败一次。 */
+  function selectProviderTab(id: string) {
+    if (id === activeProviderTab) return;
+    stashDraft();
+    const d = refineDrafts[id];
+    if (id === "custom") {
+      refineBaseUrl = d?.base ?? "";
+      refineModel = d?.model ?? "";
+      refineKey = d?.key ?? "";
+    } else {
+      const p = REFINE_PRESETS.find((x) => x.label === id);
+      if (!p) return;
+      refineBaseUrl = p.base;
+      refineModel = d ? d.model : p.model;
+      refineKey = d ? d.key : "";
+    }
     saveRefine();
   }
   function saveRefine() {
@@ -622,25 +639,33 @@
         {/if}
         <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
       {:else}
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.preset.label")}</span>
-            <span class="row-desc">{t("ai.aing.preset.desc")}</span>
-          </div>
-          <!-- 服务商芯片:选中态高亮当前生效的一家;绿点 = 该家已存过密钥,切回即回填。 -->
-          <div class="preset-btns">
-            {#each REFINE_PRESETS as p (p.label)}
-              <button
-                class="preset-chip"
-                class:active={activePreset?.label === p.label}
-                title={refineDrafts[p.label]?.key ? t("ai.aing.preset.savedTitle") : undefined}
-                onclick={() => applyPreset(p)}
-              >
-                {p.labelKey ? t(p.labelKey) : p.label}
-                {#if refineDrafts[p.label]?.key}<span class="chip-dot"></span>{/if}
-              </button>
-            {/each}
-          </div>
+        <!-- 服务商 tab(2026-08-11 用户拍板:去掉「一键填充」说明行,直接 tab 切换):
+             选中页 = 下方表单正在编辑的那家;绿点 = 该家已存过密钥,切回即回填。 -->
+        <div class="provider-tabs" role="tablist">
+          {#each REFINE_PRESETS as p (p.label)}
+            <button
+              role="tab"
+              aria-selected={activeProviderTab === p.label}
+              class="ptab"
+              class:active={activeProviderTab === p.label}
+              title={refineDrafts[p.label]?.key ? t("ai.aing.preset.savedTitle") : undefined}
+              onclick={() => selectProviderTab(p.label)}
+            >
+              {p.labelKey ? t(p.labelKey) : p.label}
+              {#if refineDrafts[p.label]?.key}<span class="chip-dot"></span>{/if}
+            </button>
+          {/each}
+          <button
+            role="tab"
+            aria-selected={activeProviderTab === "custom"}
+            class="ptab"
+            class:active={activeProviderTab === "custom"}
+            title={refineDrafts["custom"]?.key ? t("ai.aing.preset.savedTitle") : undefined}
+            onclick={() => selectProviderTab("custom")}
+          >
+            {t("ai.aing.tab.custom")}
+            {#if refineDrafts["custom"]?.key}<span class="chip-dot"></span>{/if}
+          </button>
         </div>
         <div class="row">
           <div class="row-info">
@@ -1230,40 +1255,36 @@
     gap: 0.7rem;
     padding: 0.8rem 1rem 0.9rem;
   }
-  /* 一键填充按钮簇(settings-row 右侧,窄窗随 .row 换行整体落下一行,右对齐) */
-  .preset-btns {
+  /* 服务商 tab 条:横贯配置区,底部 hairline,选中页 accent 下划线——
+     「下方表单属于哪家」一目了然;各页草稿独立,切换不丢。 */
+  .provider-tabs {
     display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 0.45rem;
+    align-items: stretch;
+    gap: 1.15rem;
+    border-bottom: 1px solid var(--hairline-strong);
     flex-wrap: wrap;
-    margin-left: auto;
   }
-  /* 服务商芯片:胶囊形,选中态 accent 描边+浅底;悬停轻抬。与 .seg 同一控件语言,
-     但预设是「多选一 + 各自带记忆」,选中态必须常显,不能做成瞬时按钮。 */
-  .preset-chip {
-    flex: none;
+  .ptab {
     display: inline-flex;
     align-items: center;
     gap: 0.4em;
-    border-radius: var(--radius-full);
-    border: 1px solid var(--hairline-strong);
-    padding: 0.32em 0.85em;
-    font-size: 0.85rem;
+    border: none;
+    background: none;
+    padding: 0.45em 0.15em;
+    margin-bottom: -1px; /* 下划线压住 tab 条 hairline */
+    font-size: 0.88rem;
     font-weight: 500;
-    cursor: pointer;
-    background: transparent;
     color: var(--ink-secondary);
-    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s ease, border-color 0.15s ease;
   }
-  .preset-chip:hover {
-    background: var(--surface-soft);
+  .ptab:hover {
     color: var(--ink);
   }
-  .preset-chip.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  .ptab.active {
+    color: var(--ink);
+    border-bottom-color: var(--accent);
   }
   /* 已存密钥标记:小绿点,含义由 title 提示补全 */
   .chip-dot {
