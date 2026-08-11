@@ -12,7 +12,14 @@
   import { i18n, t } from "$lib/i18n/index.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { listen } from "@tauri-apps/api/event";
-  import { checkUpdate, applyUpdate, updateDismissed, dismissUpdate, type UpdateInfo } from "$lib/update";
+  import {
+    checkUpdate,
+    applyUpdate,
+    updateDismissed,
+    dismissUpdate,
+    type UpdateInfo,
+    type UpdateProgress,
+  } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
 
@@ -21,9 +28,10 @@
   // 升级提示放全局布局:app 启动落地页可能是笔记详情/录制/空态任一(见根路由重定向),
   // 布局却必挂载且跨路由常驻——查一次、有新版且未忽略就在内容区顶部出可关闭横幅。
   let update = $state<UpdateInfo | null>(null);
-  // 一键更新态:进行中禁点、按钮显进度;失败退回「打开发布页」手动路径(文案联动)。
+  // 一键更新态:进行中按钮换成锻造进度条;失败退回「打开发布页」手动路径(文案联动)。
   let updating = $state(false);
-  let updatingLabel = $state(t("shell.update.updating"));
+  // null = 尚无进度事件(刚起步/总长未知),进度条走往复扫描态。
+  let updateProg = $state<UpdateProgress | null>(null);
   let updateFailed = $state(false);
   // 安装成功即 relaunch:录音/收尾进行中点更新会把识别尾包和终稿截在半路,
   // 静默丢数据——录音期间禁点,结束后再更新。
@@ -37,9 +45,9 @@
     }
     if (updateBlocked) return;
     updating = true;
-    updatingLabel = t("shell.update.updating");
+    updateProg = null;
     try {
-      const r = await applyUpdate((label) => (updatingLabel = label));
+      const r = await applyUpdate((p) => (updateProg = p));
       if (r === "none") updateFailed = true; // latest.json 未就绪等,退手动
     } catch {
       updateFailed = true;
@@ -115,14 +123,33 @@
     {#if update}
       <div class="update-banner">
         <span class="upd-dot"></span>{t("shell.update.found", { latest: update.latest, current: update.current })}
-        <button
-          class="link"
-          onclick={openUpdate}
-          disabled={updating || (!updateFailed && updateBlocked)}
-          title={!updateFailed && updateBlocked ? t("shell.update.blockedTitle") : undefined}
-        >
-          {updating ? updatingLabel : updateFailed ? t("shell.update.openRelease") : t("shell.update.oneClick")}
-        </button>
+        {#if updating}
+          <!-- 锻造激光进度:确定进度时熔金填充+白热激光头,总长未知/安装期退化为光束往复扫描 -->
+          <span
+            class="forge"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={updateProg?.pct ?? undefined}
+            aria-label={updateProg?.label ?? t("shell.update.updating")}
+          >
+            <span class="forge-track" class:scan={updateProg?.pct == null}>
+              <span class="forge-fill" style:width={updateProg?.pct != null ? `${updateProg.pct}%` : undefined}>
+                <span class="forge-head"></span>
+              </span>
+            </span>
+            <span class="forge-label">{updateProg?.label ?? t("shell.update.updating")}</span>
+          </span>
+        {:else}
+          <button
+            class="link"
+            onclick={openUpdate}
+            disabled={!updateFailed && updateBlocked}
+            title={!updateFailed && updateBlocked ? t("shell.update.blockedTitle") : undefined}
+          >
+            {updateFailed ? t("shell.update.openRelease") : t("shell.update.oneClick")}
+          </button>
+        {/if}
         <!-- 更新中禁「知道了」:横幅一收,下载安装仍在后台跑,几分钟后应用
              无预警重启,用户会以为闪退。 -->
         <button class="link" onclick={dismissUpdateBanner} disabled={updating}>{t("shell.update.dismiss")}</button>
@@ -155,6 +182,8 @@
   /* 全局升级横幅:内容区顶部,与页面内边距对齐(各页 container 多为 1.5rem 内边距) */
   .update-banner {
     display: flex;
+    /* 窄窗允许折行:定宽进度条+不折行文案会把「知道了」挤出可视区(codex P2) */
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.4em;
     background: var(--warning-tint);
@@ -182,5 +211,107 @@
     cursor: pointer;
     padding: 0 0.2em;
     font-size: inherit;
+  }
+  /* —— 锻造激光进度条:更新=把新版本锻出来 —— */
+  .forge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55em;
+    margin: 0 0.2em;
+    /* 随横幅弹性伸缩,窄窗时轨道先让位(min-width 兜底可辨认) */
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .forge-track {
+    position: relative;
+    flex: 1 1 90px;
+    max-width: 150px;
+    min-width: 60px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--warning-ink) 18%, transparent);
+    box-shadow: inset 0 1px 3px rgb(0 0 0 / 35%);
+    overflow: hidden;
+  }
+  .forge-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 0;
+    border-radius: inherit;
+    /* 熔金渐变:尾部暗红余温 → 前端白热 */
+    background: linear-gradient(90deg, #b3400c, #ff6a00 45%, #ffb84d 80%, #ffe9c2);
+    box-shadow: 0 0 10px rgb(255 122 0 / 75%);
+    transition: width 0.25s ease;
+  }
+  .forge-fill::after {
+    /* 熔流高光沿条身反复掠过 */
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(100deg, transparent 25%, rgb(255 255 255 / 55%) 50%, transparent 75%);
+    background-size: 220% 100%;
+    animation: forge-shimmer 1.3s linear infinite;
+  }
+  .forge-head {
+    /* 激光锻造头:白热光点,火花式高频闪烁 */
+    position: absolute;
+    right: -2px;
+    top: 50%;
+    width: 13px;
+    height: 13px;
+    transform: translateY(-50%);
+    border-radius: var(--radius-full);
+    background: radial-gradient(circle, #fff 0%, #ffd27a 45%, rgb(255 170 60 / 0%) 72%);
+    filter: drop-shadow(0 0 5px #ffae00) drop-shadow(0 0 12px rgb(255 110 0 / 80%));
+    animation: forge-flicker 0.14s steps(2, end) infinite;
+  }
+  /* 进度未知(无 Content-Length)与安装期:一束激光往复扫描 */
+  .forge-track.scan .forge-fill {
+    width: 34%;
+    transition: none;
+    animation: forge-scan 1.1s ease-in-out infinite alternate;
+  }
+  .forge-label {
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  @keyframes forge-shimmer {
+    from {
+      background-position: 220% 0;
+    }
+    to {
+      background-position: -120% 0;
+    }
+  }
+  @keyframes forge-flicker {
+    0% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.55;
+    }
+    100% {
+      opacity: 0.9;
+    }
+  }
+  @keyframes forge-scan {
+    from {
+      left: -4%;
+    }
+    to {
+      left: 70%;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .forge-fill::after,
+    .forge-head {
+      animation: none;
+    }
+    .forge-track.scan .forge-fill {
+      animation-duration: 2.4s;
+    }
   }
 </style>
