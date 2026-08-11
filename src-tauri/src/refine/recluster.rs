@@ -66,7 +66,8 @@ fn knn_vote_neighbor(centroid: &[f32], seeds: &[SeedCluster]) -> Option<(String,
     for (i, s) in seeds.iter().enumerate() {
         let Some(u) = normalize(&s.centroid) else { continue };
         let sim = dot(centroid, &u);
-        let pos = top.partition_point(|&(t, _)| t > sim);
+        // >=:同分后插——先到的同分席位不被后来者挤出(K 边界防翻票,codex P2)。
+        let pos = top.partition_point(|&(t, _)| t >= sim);
         if pos < SEED_KNN_K {
             top.insert(pos, (sim, i));
             top.truncate(SEED_KNN_K);

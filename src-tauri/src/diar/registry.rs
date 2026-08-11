@@ -352,7 +352,9 @@ impl SpeakerRegistry {
             if !c.is_seed() {
                 continue;
             }
-            let pos = neighbors.partition_point(|&(s, _)| s > sim);
+            // >=:同分后插——先到的同分席位不被后来者挤出(与旧稳定 sort 的
+            // 保序语义一致,防同分席位在 K 边界翻票,codex P2)。
+            let pos = neighbors.partition_point(|&(s, _)| s >= sim);
             if pos < SEED_KNN_K {
                 neighbors.insert(pos, (sim, idx));
                 neighbors.truncate(SEED_KNN_K);
@@ -2011,6 +2013,26 @@ mod tests {
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PA"), "平票应取最高分席位所属的人");
+    }
+
+    #[test]
+    fn knn_tied_seats_at_boundary_keep_first_seen_order() {
+        // 六席全同分(同一质心):甲 3 席先注入,乙 3 席后注入。top-5 必须保序
+        // 留下 甲甲甲乙乙 → 甲 3:2 胜;若同分后来者挤出先到者则乙反超(回归)。
+        let seeds: Vec<SeedCluster> = ["PA", "PA", "PA", "PB", "PB", "PB"]
+            .iter()
+            .map(|p| SeedCluster {
+                person: (*p).into(),
+                name: if *p == "PA" { "甲".into() } else { "乙".into() },
+                centroid: at_cos(0.70),
+                count: 10,
+                source: "mic".into(),
+            })
+            .collect();
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "同分席位先到先占,K 边界不得翻票");
     }
 
     #[test]
