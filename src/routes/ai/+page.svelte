@@ -52,8 +52,6 @@
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
-  /** 「+」新建菜单(模板列表)开合。 */
-  let addMenuOpen = $state(false);
   let confirmDeleteProfile = $state(false);
   /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案(存 i18n 键,渲染处 t() 取值)。
       豆包(火山方舟)的调用凭据是控制台创建的「推理接入点」ID(ep- 开头),不是
@@ -173,7 +171,6 @@
   }
 
   function addProfile(tpl: { label: string; labelKey?: string; base: string; model: string }) {
-    addMenuOpen = false;
     const id = newProfileId();
     const label = uniqueLabel(tpl.labelKey ? t(tpl.labelKey) : tpl.label);
     void saveSetting((s) => {
@@ -720,19 +717,20 @@
             {#if p.api_key.trim()}<span class="chip-dot"></span>{/if}
           </button>
         {/each}
-        <div class="add-wrap">
-          <button class="ptab add" title={t("ai.res.add")} onclick={() => (addMenuOpen = !addMenuOpen)}>+</button>
-          {#if addMenuOpen}
-            <div class="add-menu" role="menu">
-              {#each REFINE_PRESETS as p (p.label)}
-                <button class="add-item" onclick={() => addProfile(p)}>{p.labelKey ? t(p.labelKey) : p.label}</button>
-              {/each}
-              <button class="add-item" onclick={() => addProfile({ label: t("ai.aing.tab.custom"), base: "", model: "" })}>
-                {t("ai.aing.tab.custom")}
-              </button>
-            </div>
-          {/if}
-        </div>
+        <!-- 模板平铺(2026-08-11 冒烟反馈:弹出菜单会被容器裁切):幽灵芯片直接
+             排在档案 tab 之后,点即新建,tab 条自身 flex-wrap 窄窗换行,无遮挡面。 -->
+        {#each REFINE_PRESETS as p (p.label)}
+          <button class="tpl-chip" title={t("ai.res.add")} onclick={() => addProfile(p)}>
+            + {p.labelKey ? t(p.labelKey) : p.label}
+          </button>
+        {/each}
+        <button
+          class="tpl-chip"
+          title={t("ai.res.add")}
+          onclick={() => addProfile({ label: t("ai.aing.tab.custom"), base: "", model: "" })}
+        >
+          + {t("ai.aing.tab.custom")}
+        </button>
       </div>
       {#if selectedProfile}
         <div class="row">
@@ -1457,41 +1455,24 @@
     background: var(--success, var(--accent));
     flex: none;
   }
-  /* 「+」新建档案:tab 条末位,弹出模板菜单 */
-  .add-wrap {
-    position: relative;
+  /* 新建模板芯片:幽灵态(虚线胶囊)与真实档案 tab(下划线)可一眼区分 */
+  .tpl-chip {
     display: inline-flex;
-  }
-  .ptab.add {
-    font-size: 1rem;
-    padding: 0.3em 0.5em;
-  }
-  .add-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    z-index: 20;
-    display: flex;
-    flex-direction: column;
-    min-width: 9rem;
-    background: var(--surface, var(--canvas));
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    box-shadow: 0 6px 24px rgb(0 0 0 / 18%);
-    padding: 0.3rem;
-  }
-  .add-item {
-    border: none;
+    align-items: center;
+    align-self: center;
+    border: 1px dashed var(--hairline-strong);
+    border-radius: var(--radius-full);
     background: none;
-    text-align: left;
-    padding: 0.45em 0.7em;
-    font-size: 0.88rem;
-    color: var(--ink);
+    padding: 0.18em 0.7em;
+    font-size: 0.8rem;
+    color: var(--ink-faint, var(--ink-secondary));
     cursor: pointer;
-    border-radius: var(--radius-sm, 6px);
+    white-space: nowrap;
+    transition: color 0.15s ease, border-color 0.15s ease;
   }
-  .add-item:hover {
-    background: var(--surface-soft);
+  .tpl-chip:hover {
+    color: var(--ink);
+    border-color: var(--ink-secondary);
   }
   /* 执行体选择器:与 row-input 同语言的原生 select */
   .row-select {
