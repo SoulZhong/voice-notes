@@ -445,6 +445,22 @@
     return next;
   }
 
+  /** MCP 注册键 → 执行体 kind:可作 Aing 执行体的四家;其余(桌面端/第三方)仅注册接入。 */
+  const EXEC_KIND: Record<string, string> = {
+    "claude-code": "claude",
+    codex: "codex",
+    gemini: "gemini",
+    cursor: "cursor",
+  };
+  /** 智能体 tab 当前页(与在线模型同构,2026-08-11 冒烟反馈按智能体整合)。 */
+  let selectedAgentKey = $state("claude-code");
+  const currentAgent = $derived(mcpAgents.find((a) => a.key === selectedAgentKey));
+  function selectAgentTab(key: string) {
+    selectedAgentKey = key;
+    const kind = EXEC_KIND[key];
+    if (kind) selectAgentKind(kind); // 执行体四家:同步装载该家 bin/model 编辑缓冲
+  }
+
   /** Agent 卡:切编辑哪家 CLI(纯 UI 态,不落盘)/字段失焦保存该家档案。 */
   function selectAgentKind(kind: string) {
     refineAgent = kind;
@@ -812,143 +828,146 @@
   <section id="assistant-connect" class="anchor-section" class:guide-target={guideActive && guideStep === 1}>
     <h2 class="section-title">{t("ai.mcp.sectionTitle")}</h2>
     <div class="rows">
-      <!-- 本机 Agent 档案(资源区并入):每家 CLI 一份 bin/model,可被功能层引用为执行体 -->
-      <div class="group-title">{t("ai.res.agentTitle")}</div>
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label">Agent</span>
-          <span class="row-desc">
-            {#if refineAgentBin.trim()}
-              {t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
-            {:else if agentProbe[refineAgent]}
-              {t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
-            {:else if refineAgent in agentProbe}
-              <span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
-            {:else}
-              {t("ai.aing.agent.detecting")}
-            {/if}
-          </span>
-        </div>
-        <div class="seg">
-          {#each AGENT_OPTIONS as a (a.key)}
-            <label class="seg-item">
-              <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={() => selectAgentKind(a.key)} />
-              {a.label}
-            </label>
-          {/each}
-        </div>
-      </div>
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label">{t("ai.aing.model.label")}</span>
-          <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
-        </div>
-        <input
-          class="row-input"
-          placeholder={t(selectedAgentOption.modelHint)}
-          bind:value={refineAgentModel}
-          onblur={saveRefineAgent}
-          oninput={() => (agentTest = null)}
-        />
-      </div>
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label">{t("ai.aing.cliPath.label")}</span>
-          <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
-        </div>
-        <input
-          class="row-input wide"
-          placeholder={t("ai.aing.cliPath.placeholder")}
-          bind:value={refineAgentBin}
-          onblur={saveRefineAgent}
-          oninput={() => (agentTest = null)}
-        />
-      </div>
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label">{t("ai.aing.testRun.label")}</span>
-          <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
-        </div>
-        <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
-          {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-        </button>
-      </div>
-      {#if agentTest}
-        <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
-          {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
-        </p>
-      {/if}
-      <div class="group-title">{t("ai.mcp.groupRegister")}</div>
       {#if mcpError}
         <div class="banner warn">{mcpError}</div>
       {/if}
-      {#each mcpAgents as a (a.key)}
+      <!-- 智能体 tab(与在线模型同构,2026-08-11 冒烟反馈):每家一页,探测/模型/
+           CLI 路径/测试/MCP 注册/技能全在本家面板;绿点 = 已注册。可作 Aing 执行体
+           的四家(Claude Code/Codex/Gemini/Cursor)额外露出模型与路径配置。 -->
+      <div class="provider-tabs" role="tablist">
+        {#each mcpAgents as a (a.key)}
+          <button
+            role="tab"
+            aria-selected={selectedAgentKey === a.key}
+            class="ptab"
+            class:active={selectedAgentKey === a.key}
+            onclick={() => selectAgentTab(a.key)}
+          >
+            {a.name}
+            {#if a.registered}<span class="chip-dot"></span>{/if}
+          </button>
+        {/each}
+      </div>
+      {#if currentAgent}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">{a.name}</span>
+            <span class="row-label">{t("ai.mcp.statusLabel")}</span>
             <span class="row-desc">
-              {#if !a.installed && !a.registered}{t("ai.mcp.status.notInstalled")}
-              {:else if a.stale}{t("ai.mcp.status.stale")}
-              {:else if a.registered}{t("ai.mcp.status.registered")}
+              {#if !currentAgent.installed && !currentAgent.registered}{t("ai.mcp.status.notInstalled")}
+              {:else if currentAgent.stale}{t("ai.mcp.status.stale")}
+              {:else if currentAgent.registered}{t("ai.mcp.status.registered")}
               {:else}{t("ai.mcp.status.unregistered")}{/if}
+              {#if EXEC_KIND[currentAgent.key]}
+                ·
+                {#if refineAgentBin.trim()}{t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
+                {:else if agentProbe[refineAgent]}{t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
+                {:else if refineAgent in agentProbe}<span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
+                {:else}{t("ai.aing.agent.detecting")}{/if}
+              {/if}
             </span>
           </div>
-          {#if a.installed || a.registered}
-            <button class="btn-secondary" disabled={mcpBusy === a.key} onclick={() => mcpToggleRegister(a)}>
-              {a.registered ? t("ai.action.remove") : t("ai.mcp.register")}
+          {#if currentAgent.installed || currentAgent.registered}
+            <button class="btn-secondary" disabled={mcpBusy === currentAgent.key} onclick={() => currentAgent && mcpToggleRegister(currentAgent)}>
+              {currentAgent.registered ? t("ai.action.remove") : t("ai.mcp.register")}
             </button>
           {/if}
         </div>
-      {/each}
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label-line">
-            <span class="row-label">{t("ai.mcp.skill.label")}</span>
-            {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
-            {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
-            {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
-            {/if}
-          </span>
-          <span class="row-desc">
-            {#if skillState === "current"}{t("ai.mcp.skill.currentDesc")}
-            {:else if skillState === "stale"}{t("ai.mcp.skill.staleDesc")}
-            {:else if skillState === "unmanaged"}{t("ai.mcp.skill.unmanagedDesc")}
-            {:else}{t("ai.mcp.skill.installDesc")}
-            {/if}
-          </span>
-        </div>
-        {#if skillState !== null}
-          <div class="row-actions">
-            <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
-              {t("ai.mcp.skill.viewEdit")}
-            </button>
-            {#if skillState !== "unmanaged"}
-              <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
-              <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
-                {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
-              </button>
-            {/if}
-          </div>
-        {/if}
-      </div>
-      {#if skillEditOpen}
-        <div class="config">
-          <textarea
-            class="skill-textarea mono"
-            bind:value={skillContent}
-            spellcheck="false"
-            disabled={skillEditBusy}
-          ></textarea>
-          <div class="skill-edit-actions">
-            <div class="skill-edit-buttons">
-              <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
-              <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
+        {#if EXEC_KIND[currentAgent.key]}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.model.label")}</span>
+              <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
             </div>
-            <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
+            <input
+              class="row-input"
+              placeholder={t(selectedAgentOption.modelHint)}
+              bind:value={refineAgentModel}
+              onblur={saveRefineAgent}
+              oninput={() => (agentTest = null)}
+            />
           </div>
-        </div>
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.cliPath.label")}</span>
+              <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
+            </div>
+            <input
+              class="row-input wide"
+              placeholder={t("ai.aing.cliPath.placeholder")}
+              bind:value={refineAgentBin}
+              onblur={saveRefineAgent}
+              oninput={() => (agentTest = null)}
+            />
+          </div>
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.testRun.label")}</span>
+              <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
+            </div>
+            <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
+              {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+            </button>
+          </div>
+          {#if agentTest}
+            <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
+              {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
+            </p>
+          {/if}
+        {/if}
+        {#if currentAgent.key === "claude-code"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label-line">
+                <span class="row-label">{t("ai.mcp.skill.label")}</span>
+                {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
+                {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
+                {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
+                {/if}
+              </span>
+              <span class="row-desc">
+                {#if skillState === "current"}{t("ai.mcp.skill.currentDesc")}
+                {:else if skillState === "stale"}{t("ai.mcp.skill.staleDesc")}
+                {:else if skillState === "unmanaged"}{t("ai.mcp.skill.unmanagedDesc")}
+                {:else}{t("ai.mcp.skill.installDesc")}
+                {/if}
+              </span>
+            </div>
+            {#if skillState !== null}
+              <div class="row-actions">
+                <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
+                  {t("ai.mcp.skill.viewEdit")}
+                </button>
+                {#if skillState !== "unmanaged"}
+                  <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
+                  <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
+                    {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
+                  </button>
+                {/if}
+              </div>
+            {/if}
+          </div>
+          {#if skillEditOpen}
+            <div class="config">
+              <textarea
+                class="skill-textarea mono"
+                bind:value={skillContent}
+                spellcheck="false"
+                disabled={skillEditBusy}
+              ></textarea>
+              <div class="skill-edit-actions">
+                <div class="skill-edit-buttons">
+                  <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
+                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
+                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
+                  <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
+                </div>
+                <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
+              </div>
+            </div>
+          {/if}
+        {/if}
+      {:else}
+        <p class="config-hint">{t("ai.aing.agent.detecting")}</p>
       {/if}
       <label class="row">
         <div class="row-info">
@@ -1507,39 +1526,6 @@
   .test-result { font-size: 0.85rem; margin: 0.4rem 0 0.2rem; }
   .test-result.ok { color: var(--success, var(--ink-secondary)); }
   .test-result.err { color: var(--danger-ink); }
-  /* 分段单选(与设置页 .seg 同一控件语言);margin-left:auto 保证窄窗换行后仍右对齐 */
-  .seg {
-    display: flex;
-    gap: 2px;
-    flex: none;
-    margin-left: auto;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-    padding: 2px;
-  }
-  .seg-item {
-    position: relative;
-    padding: 0.26em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    border-radius: calc(var(--radius-md) - 2px);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .seg-item:hover {
-    color: var(--ink);
-  }
-  .seg-item:has(input:checked) {
-    background: var(--canvas);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
-  .seg-item input {
-    position: absolute;
-    opacity: 0;
-    pointer-events: none;
-  }
   /* 行内输入(settings-row 右侧控件版 input:surface-press 底、无边,聚焦浮出 canvas + accent 环) */
   .row-input {
     flex: none;

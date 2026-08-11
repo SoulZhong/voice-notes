@@ -87,6 +87,7 @@ export const zh = {
 
   // —— /ai「AI 助手接入」区(MCP) ——
   "ai.mcp.sectionTitle": "AI 助手接入",
+  "ai.mcp.statusLabel": "状态",
   "ai.mcp.status.notInstalled": "未检测到安装",
   "ai.mcp.status.stale": "已注册(路径已由自愈修复或待修复)",
   "ai.mcp.status.registered": "已注册",
@@ -133,8 +134,6 @@ export const zh = {
   "ai.res.empty": "还没有在线模型配置:点「+」从模板新建,配置一次可被多个 AI 功能复用",
   "ai.res.deleteInUse": "该配置正被 AI 功能使用,请先在功能区改选其它执行体",
   "ai.res.confirmDelete": "确认删除",
-  "ai.res.agentTitle": "本机 Agent",
-  "ai.mcp.groupRegister": "注册接入",
 
   // —— /ai「Agent 能调用什么」区 ——
   "ai.cap.sectionTitle": "Agent 能调用什么",
@@ -272,6 +271,7 @@ export const en = {
   "ai.aing.agentModelHint.cursor": "e.g. sonnet-4.5",
 
   "ai.mcp.sectionTitle": "AI Assistant Access",
+  "ai.mcp.statusLabel": "Status",
   "ai.mcp.status.notInstalled": "Not detected",
   "ai.mcp.status.stale": "Registered (path self-healed or pending repair)",
   "ai.mcp.status.registered": "Registered",
@@ -322,8 +322,6 @@ export const en = {
   "ai.res.empty": "No online model profiles yet: click \"+\" to create one from a template; configure once, reuse across AI features",
   "ai.res.deleteInUse": "This profile is in use by an AI feature; pick another executor there first",
   "ai.res.confirmDelete": "Confirm delete",
-  "ai.res.agentTitle": "Local agents",
-  "ai.mcp.groupRegister": "Registration",
 
   "ai.cap.sectionTitle": "What Agents Can Call",
   "ai.cap.tools": "MCP tools",
