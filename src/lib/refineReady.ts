@@ -1,15 +1,25 @@
 import type { Settings } from "./models";
 
-/** 会后 AI 配置是否齐备,口径对齐后端 readiness 判定(src-tauri/src/lib.rs
- * refine_llm_ready/refine_agent_ready,约 266-278 行):
- *  - openai 档(provider != "agent"):base_url/model/api_key 三项均非空;
- *  - agent 档:只看 provider == "agent" 本身——bin 由运行时探测(未装 CLI 时 refine
- *    阶段自行落 failed + 日志),探测结果不计入"是否配置完成",后端同样不检查。
+/** 执行体引用是否就绪,口径对齐后端 settings::executor_ready(执行体分层):
+ *  - "llm:<id>":档案存在且 base_url/model/api_key 三项均非空;
+ *  - "agent:<kind>":引用即就绪——bin 由运行时探测,不计入"是否配置完成";
+ *  - 空/悬空引用:未就绪。
  * 与 refine_enabled 无关:调用方按 refineOn && !refineReady(settings) 才决定是否
  * 显示"未配置完成"徽标。 */
-export function refineReady(
-  s: Pick<Settings, "refine_provider" | "refine_base_url" | "refine_model" | "refine_api_key">,
+export function executorReady(
+  s: Pick<Settings, "llm_profiles">,
+  executor: string,
 ): boolean {
-  if (s.refine_provider === "agent") return true;
-  return !!s.refine_base_url && !!s.refine_model && !!s.refine_api_key;
+  if (executor.startsWith("agent:")) return true;
+  if (executor.startsWith("llm:")) {
+    const id = executor.slice(4);
+    const p = s.llm_profiles.find((x) => x.id === id);
+    return !!p && !!p.base_url.trim() && !!p.model.trim() && !!p.api_key.trim();
+  }
+  return false;
+}
+
+/** 会后 AI(整理)配置是否齐备。 */
+export function refineReady(s: Pick<Settings, "llm_profiles" | "refine_executor">): boolean {
+  return executorReady(s, s.refine_executor.trim());
 }

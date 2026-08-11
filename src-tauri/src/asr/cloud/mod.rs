@@ -47,6 +47,75 @@ pub trait CloudAsr: Send + Sync {
     fn transcribe_batch(&self, samples: &[f32]) -> anyhow::Result<Vec<DefiniteUtterance>>;
 }
 
+/// 把云端批式识别包成本地 `Recognizer` 形状:local_cloud 模式的会后二遍经
+/// 现有 retranscribe 框架跑云端。段来自本地 VAD(≤15s),恰是 transcribe_batch
+/// 的调用契约。tokens/timestamps 恒空——厂商词级时间戳口径不一(阿里批式没有),
+/// 统一走段级降级(同本地 Qwen3),段内说话人切分退化为整段单说话人。
+pub struct BatchRecognizer {
+    inner: std::sync::Arc<dyn CloudAsr>,
+}
+
+impl BatchRecognizer {
+    pub fn new(inner: std::sync::Arc<dyn CloudAsr>) -> Self {
+        Self { inner }
+    }
+}
+
+impl crate::asr::Recognizer for BatchRecognizer {
+    fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<crate::asr::Transcript> {
+        let utts = self.inner.transcribe_batch(samples)?;
+        let text: String = utts.iter().map(|u| u.text.as_str()).collect();
+        // 厂商语种标签常为空;取第一条非空的,语言过滤自然回落文本兜底。
+        let lang = utts.iter().map(|u| u.lang.clone()).find(|l| !l.is_empty()).unwrap_or_default();
+        Ok(crate::asr::Transcript { text, lang, tokens: Vec::new(), timestamps: Vec::new() })
+    }
+}
+
+#[cfg(test)]
+mod batch_recognizer_tests {
+    use super::*;
+    use crate::asr::Recognizer;
+
+    struct FakeCloud(Vec<DefiniteUtterance>);
+    impl CloudAsr for FakeCloud {
+        fn open_stream(&self) -> anyhow::Result<CloudStream> {
+            anyhow::bail!("测试不开流")
+        }
+        fn transcribe_batch(&self, _samples: &[f32]) -> anyhow::Result<Vec<DefiniteUtterance>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn utt(text: &str, lang: &str) -> DefiniteUtterance {
+        DefiniteUtterance {
+            text: text.into(),
+            start_ms: 0,
+            end_ms: 1000,
+            words: Vec::new(),
+            lang: lang.into(),
+        }
+    }
+
+    #[test]
+    fn joins_utterances_and_degrades_to_segment_level() {
+        let mut r = BatchRecognizer::new(std::sync::Arc::new(FakeCloud(vec![
+            utt("今天开会,", ""),
+            utt("先对齐目标。", "zh"),
+        ])));
+        let t = r.recognize(&[0.0; 160]).expect("识别");
+        assert_eq!(t.text, "今天开会,先对齐目标。");
+        assert_eq!(t.lang, "zh", "取第一条非空语种标签");
+        assert!(t.tokens.is_empty() && t.timestamps.is_empty(), "段级降级契约");
+    }
+
+    #[test]
+    fn empty_result_is_empty_transcript_not_error() {
+        let mut r = BatchRecognizer::new(std::sync::Arc::new(FakeCloud(Vec::new())));
+        let t = r.recognize(&[0.0; 160]).expect("空结果不该报错");
+        assert!(t.text.is_empty() && t.lang.is_empty());
+    }
+}
+
 /// f32 [-1,1] → PCM s16le 字节(两家线上格式)。超界钳制防 AGC 毛刺回绕。
 pub fn f32_to_pcm_s16le(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);

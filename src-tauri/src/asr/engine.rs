@@ -30,6 +30,8 @@ pub enum ModelSpec {
         /// 逗号分隔热词(上下文偏置),None = 不启用。
         hotwords: Option<String>,
     },
+    /// FireRedASR2-AED(encoder-decoder 双 onnx + tokens.txt)。
+    FireRed { encoder: String, decoder: String, tokens: String },
 }
 
 pub struct OfflineEngine {
@@ -94,6 +96,11 @@ impl OfflineEngine {
                 if let Some(h) = hotwords {
                     config.model_config.qwen3_asr.hotwords = c(h, &mut keep);
                 }
+            }
+            ModelSpec::FireRed { encoder, decoder, tokens } => {
+                config.model_config.fire_red_asr.encoder = c(encoder, &mut keep);
+                config.model_config.fire_red_asr.decoder = c(decoder, &mut keep);
+                config.model_config.tokens = c(tokens, &mut keep);
             }
         }
         let ptr = unsafe { sys::SherpaOnnxCreateOfflineRecognizer(&config) };

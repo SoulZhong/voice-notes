@@ -1,11 +1,16 @@
 use super::segmenter::{Segment, Segmenter};
+use std::collections::VecDeque;
 use std::path::Path;
 
 /// 基于 sherpa-onnx Silero VAD 的语句分段器。
 /// 内部维护"当前句"缓冲：只在说话时累积，VAD 切出完整段时清空，用于实时 partial。
+/// 另维护近期原始样本的滚动历史(history),供段出炉时句首/句尾补帧(pre/post-roll)。
 pub struct SileroSegmenter {
     vad: sherpa_onnx::VoiceActivityDetector,
     current: Vec<f32>,
+    history: SampleHistory,
+    /// 上一段(含补帧)的绝对末样本号:pre-roll 的不重叠钳制基准。
+    padded_end: usize,
 }
 
 impl SileroSegmenter {
@@ -37,8 +42,73 @@ impl SileroSegmenter {
         // buffer_size_in_seconds：内部环形缓冲容量，给足
         let vad = sherpa_onnx::VoiceActivityDetector::create(&config, 30.0)
             .ok_or_else(|| anyhow::anyhow!("加载 Silero VAD 失败(检查 {:?})", model_path))?;
-        Ok(Self { vad, current: Vec::new() })
+        Ok(Self { vad, current: Vec::new(), history: SampleHistory::new(), padded_end: 0 })
     }
+}
+
+/// 句首/句尾补帧量。VAD 判定语音起点普遍偏晚(阈值需数帧爬升),句首辅音/弱起音
+/// 被掐掉,识别端表现为漏字;句尾程度轻但同理。补帧取历史缓冲里的真实样本而非
+/// 填零——被掐掉的音头就在那段"历史"里。两侧之和(0.5s)严格小于
+/// min_silence_duration(1.2s):相邻两段的补帧不可能吃进对方的语音。
+const PRE_ROLL_SAMPLES: usize = 16000 * 300 / 1000;
+const POST_ROLL_SAMPLES: usize = 16000 * 200 / 1000;
+/// 历史缓冲容量:段最长 15s + 静音判定滞后 1.2s + VAD 内部缓冲余量,取 20s
+/// (~1.25MB/实例)。超范围的补帧请求按可用范围钳制(少补,不出错)。
+const HISTORY_SAMPLES: usize = 20 * 16000;
+
+/// 绝对样本号索引的滚动历史缓冲(base = buf[0] 的绝对样本号)。
+struct SampleHistory {
+    buf: VecDeque<f32>,
+    base: usize,
+}
+
+impl SampleHistory {
+    fn new() -> Self {
+        Self { buf: VecDeque::new(), base: 0 }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        self.buf.extend(samples);
+        if self.buf.len() > HISTORY_SAMPLES {
+            let drop = self.buf.len() - HISTORY_SAMPLES;
+            self.buf.drain(..drop);
+            self.base += drop;
+        }
+    }
+
+    fn end(&self) -> usize {
+        self.base + self.buf.len()
+    }
+
+    /// 取绝对样本区间 [from, to),越界部分钳制,返回 (实际起点, 样本)。
+    /// 区间完全不可得时返回 (from, 空)。
+    fn range(&self, from: usize, to: usize) -> (usize, Vec<f32>) {
+        let lo = from.max(self.base);
+        let hi = to.min(self.end());
+        if hi <= lo {
+            return (from, Vec::new());
+        }
+        (lo, self.buf.range(lo - self.base..hi - self.base).copied().collect())
+    }
+}
+
+/// 用历史缓冲给 VAD 原始段补 pre/post-roll。prev_end 是上一段(含补帧)的绝对末
+/// 样本号:pre-roll 不越过它。按当前参数(0.5s < 1.2s 静音门)本不会相撞,钳制是
+/// 参数改动/极端切分下的不变式兜底——任何情况下输出段之间零样本重叠,时间轴单调。
+fn pad_segment(seg: Segment, hist: &SampleHistory, prev_end: usize) -> Segment {
+    let want_from = seg.start.saturating_sub(PRE_ROLL_SAMPLES).max(prev_end);
+    let (pre_from, pre) = hist.range(want_from, seg.start);
+    let seg_end = seg.start + seg.samples.len();
+    let (_, post) = hist.range(seg_end, seg_end + POST_ROLL_SAMPLES);
+    if pre.is_empty() && post.is_empty() {
+        return seg;
+    }
+    let mut samples = Vec::with_capacity(pre.len() + seg.samples.len() + post.len());
+    samples.extend_from_slice(&pre);
+    samples.extend_from_slice(&seg.samples);
+    samples.extend_from_slice(&post);
+    let start = if pre.is_empty() { seg.start } else { pre_from };
+    Segment { samples, start }
 }
 
 /// 段长硬上限(样本数,16kHz × 15s),与 config.max_speech_duration 对齐。
@@ -108,6 +178,8 @@ impl Segmenter for SileroSegmenter {
             .map(|&x| if x.is_finite() { x } else { 0.0 })
             .collect();
         let samples = samples.as_slice();
+        // 历史缓冲与 VAD 喂同一份消毒后样本:补帧取到的内容与 VAD 判定所见严格同源。
+        self.history.push(samples);
         self.vad.accept_waveform(samples);
         if self.vad.detected() {
             self.current.extend_from_slice(samples);
@@ -122,9 +194,14 @@ impl Segmenter for SileroSegmenter {
         let mut out = Vec::new();
         while !self.vad.is_empty() {
             let Some(seg) = self.vad.front() else { break };
-            out.extend(split_long(seg.samples().to_vec(), seg.start().max(0) as usize));
+            let raw = Segment { samples: seg.samples().to_vec(), start: seg.start().max(0) as usize };
             drop(seg); // front 是借用视图,pop 前先归还
             self.vad.pop();
+            // 先补帧再硬切:split_long 的内部切点两侧是连续语音,不补(补了会在
+            // 切口两侧重复 0.5s 内容);补帧只发生在 VAD 判定的真实句边界。
+            let padded = pad_segment(raw, &self.history, self.padded_end);
+            self.padded_end = padded.start + padded.samples.len();
+            out.extend(split_long(padded.samples, padded.start));
         }
         if !out.is_empty() {
             // 已完成的语句对应的"当前句"已结束，清空预览缓冲。
@@ -240,6 +317,78 @@ mod tests {
             assert_eq!(p.start, prev_end, "偏移应单调衔接");
             prev_end = p.start + p.samples.len();
         }
+    }
+
+    /// 构造内容可验证的历史:绝对样本号 i 的值为 i as f32,补进来的每个样本
+    /// 都能对出它来自哪个绝对位置。
+    fn indexed_history(total: usize) -> SampleHistory {
+        let mut h = SampleHistory::new();
+        let samples: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        h.push(&samples);
+        h
+    }
+
+    /// 补帧基本形:前后各补足额,start 前移 PRE_ROLL,内容与历史逐样本一致。
+    #[test]
+    fn pad_segment_prepends_and_appends_from_history() {
+        let hist = indexed_history(100_000);
+        let seg = Segment { samples: (20_000..40_000).map(|i| i as f32).collect(), start: 20_000 };
+        let padded = pad_segment(seg, &hist, 0);
+        assert_eq!(padded.start, 20_000 - PRE_ROLL_SAMPLES);
+        assert_eq!(padded.samples.len(), 20_000 + PRE_ROLL_SAMPLES + POST_ROLL_SAMPLES);
+        // 逐样本核对:整段应等于历史区间 [start, start+len)
+        for (k, &v) in padded.samples.iter().enumerate() {
+            assert_eq!(v, (padded.start + k) as f32, "样本 {k} 应来自绝对位置 {}", padded.start + k);
+        }
+    }
+
+    /// pre-roll 不越过上一段末尾:即使请求区间更早,也从 prev_end 起补。
+    #[test]
+    fn pad_segment_clamps_pre_roll_at_previous_end() {
+        let hist = indexed_history(100_000);
+        let prev_end = 19_000;
+        let seg = Segment { samples: (20_000..30_000).map(|i| i as f32).collect(), start: 20_000 };
+        let padded = pad_segment(seg, &hist, prev_end);
+        assert_eq!(padded.start, prev_end, "pre-roll 应被钳制在上一段末尾");
+        assert_eq!(padded.samples[0], prev_end as f32);
+    }
+
+    /// 尾段 post-roll 不足(flush 时流已尽):按历史可用范围截断,不填零不越界。
+    #[test]
+    fn pad_segment_truncates_post_roll_at_stream_end() {
+        let total = 30_000 + POST_ROLL_SAMPLES / 2; // 段后只剩半个 post-roll
+        let hist = indexed_history(total);
+        let seg = Segment { samples: (20_000..30_000).map(|i| i as f32).collect(), start: 20_000 };
+        let padded = pad_segment(seg, &hist, 0);
+        let end = padded.start + padded.samples.len();
+        assert_eq!(end, total, "post-roll 应止于流末尾");
+        assert_eq!(*padded.samples.last().unwrap(), (total - 1) as f32);
+    }
+
+    /// 历史已滚动淘汰的区间取不到:pre-roll 钳制到缓冲底,start 相应少前移。
+    #[test]
+    fn pad_segment_degrades_when_history_evicted() {
+        let mut hist = SampleHistory::new();
+        let total = HISTORY_SAMPLES + 50_000; // 触发淘汰,base = 50_000
+        let samples: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        hist.push(&samples);
+        assert_eq!(hist.base, 50_000);
+        // 段起点恰在缓冲底附近,请求的 pre-roll 大半已被淘汰。
+        let start = 50_000 + PRE_ROLL_SAMPLES / 4;
+        let seg = Segment { samples: (start..start + 8_000).map(|i| i as f32).collect(), start };
+        let padded = pad_segment(seg, &hist, 0);
+        assert_eq!(padded.start, 50_000, "只能补到缓冲底,不得虚构更早样本");
+        assert_eq!(padded.samples[0], 50_000.0);
+    }
+
+    /// 历史完全不可得(退化):原段原样返回。
+    #[test]
+    fn pad_segment_noop_without_history() {
+        let hist = SampleHistory::new();
+        let seg = Segment { samples: vec![0.5; 1000], start: 5_000 };
+        let padded = pad_segment(seg, &hist, 0);
+        assert_eq!(padded.start, 5_000);
+        assert_eq!(padded.samples.len(), 1000);
     }
 
     /// 暂停功能依赖：flush 之后继续 accept，段的 start 样本偏移必须延续而非归零。

@@ -7,6 +7,7 @@ export const zh = {
   "settings.title": "设置",
   "settings.desc.local": "所有录音与识别都在本机完成，不上传任何音频。",
   "settings.desc.cloud": "录音仍保存在本机；识别时音频会发送到当前选择的云服务商。",
+  "settings.desc.localCloud": "实时识别在本机完成；停录后音频会发送到所选云服务商做一遍精修。",
   "settings.loadSettingsFailed": "读取设置失败: {e}",
   "settings.cancel": "取消",
 
@@ -71,10 +72,10 @@ export const zh = {
   "settings.calendar.denied": "日历权限已被拒绝:去 系统设置 → 隐私与安全性 → 日历 中开启",
   "settings.calendar.insufficient": "当前仅有\u201c添加日程\u201d权限,读取日程需要完全访问:去 系统设置 → 隐私与安全性 → 日历 调整",
   "settings.record.audioScheme.label": "声音处理方案",
-  "settings.record.audioScheme.desc": "A:双轨对齐回放;A+B:录制期混出成品轨供对照(默认仍放双轨);B:默认直接播成品轨。混音仅影响新录制,每分钟约多占 1.9MB(转码后大幅缩小)",
-  "settings.record.audioScheme.a": "方案 A · 双轨",
-  "settings.record.audioScheme.ab": "A+B 对照",
-  "settings.record.audioScheme.b": "方案 B · 成品轨",
+  "settings.record.audioScheme.desc": "成品轨:混音成单条音轨,默认直接播它;双轨:mic/系统两轨对齐回放,不混音;对照:录制期也混出成品轨,默认回放仍是双轨。混音仅影响新录制,每分钟约多占 1.9MB(转码后大幅缩小)",
+  "settings.record.audioScheme.a": "双轨",
+  "settings.record.audioScheme.ab": "对照",
+  "settings.record.audioScheme.b": "成品轨",
   "settings.record.audioRetention.label": "音频保留期",
   "settings.record.audioRetention.desc": "到期后台自动清理录音音频(笔记文字与说话人不受影响,同「清理…」手动结果一致)",
   "settings.record.audioRetention.forever": "不清理",
@@ -90,6 +91,8 @@ export const zh = {
   "settings.asrMode.localDesc": "识别在本机完成,数据不出设备",
   "settings.asrMode.local": "本地模型",
   "settings.asrMode.cloud": "云端 API",
+  "settings.asrMode.localCloud": "本地+云端精修",
+  "settings.asrMode.localCloudDesc": "录制实时用本地模型;停录后自动用云端 API 重转写整场,失败时保留本地稿",
 
   // —— 云端 ASR ——
   "settings.cloud.provider": "厂商",
@@ -111,6 +114,10 @@ export const zh = {
   "settings.asr.whisperDesc": "多语种支持广,说话人区分较粗",
   "settings.asr.paraformerDesc": "中文更准、英文较弱",
   "settings.asr.qwen3Desc": "中英混说最准,识别稍慢,说话人区分较粗",
+  "settings.asr.fireredDesc": "中文精度最高(FireRedASR2),混说/方言强;识别较慢,说话人区分较粗,模型约 1.2GB",
+  "settings.asr.hotwordsLabel": "热词",
+  "settings.asr.hotwordsDesc": "人名/产品名/术语,逗号分隔;声纹库人名自动并入,提升专名识别",
+  "settings.asr.hotwordsPlaceholder": "如: 语音笔记, DashScope, 张伟",
   "settings.asr.modelMissing": "所选识别引擎的模型未下载,请在下方「语音模型」中下载。",
 
   // —— 声纹模型 ——
@@ -193,6 +200,8 @@ export const en = {
   "settings.desc.local": "All recording and transcription happen on this device; no audio is ever uploaded.",
   "settings.desc.cloud":
     "Recordings stay on this device; audio is sent to the selected cloud provider for transcription.",
+  "settings.desc.localCloud":
+    "Live transcription happens on this device; after recording stops, audio is sent to the selected cloud provider for one polishing pass.",
   "settings.loadSettingsFailed": "Failed to read settings: {e}",
   "settings.cancel": "Cancel",
 
@@ -254,10 +263,10 @@ export const en = {
   "settings.calendar.denied": "Calendar access denied: enable it in System Settings \u2192 Privacy & Security \u2192 Calendars",
   "settings.calendar.insufficient": "Only add-events permission granted; reading events needs Full Access: adjust in System Settings \u2192 Privacy & Security \u2192 Calendars",
   "settings.record.audioScheme.label": "Audio processing scheme",
-  "settings.record.audioScheme.desc": "A: aligned dual-track playback; A+B: also mix a combined track while recording for comparison (playback still defaults to dual); B: play the mixed track by default. Mixing affects new recordings only; ~1.9MB more per minute (much smaller after transcoding)",
-  "settings.record.audioScheme.a": "Scheme A · Dual",
-  "settings.record.audioScheme.ab": "A+B compare",
-  "settings.record.audioScheme.b": "Scheme B · Mixed",
+  "settings.record.audioScheme.desc": "Mixed: blend into one track and play it by default; Dual: aligned mic/system playback without mixing; Compare: also mix a combined track while recording, playback still defaults to dual. Mixing affects new recordings only; ~1.9MB more per minute (much smaller after transcoding)",
+  "settings.record.audioScheme.a": "Dual",
+  "settings.record.audioScheme.ab": "Compare",
+  "settings.record.audioScheme.b": "Mixed",
   "settings.record.audioRetention.label": "Audio retention",
   "settings.record.audioRetention.desc": "Recording audio is auto-purged after this period in the background (note text and speakers are unaffected, same result as manual Clean up…)",
   "settings.record.audioRetention.forever": "Keep forever",
@@ -273,6 +282,8 @@ export const en = {
   "settings.asrMode.localDesc": "Transcription runs on this device; data never leaves it",
   "settings.asrMode.local": "Local model",
   "settings.asrMode.cloud": "Cloud API",
+  "settings.asrMode.localCloud": "Local + cloud polish",
+  "settings.asrMode.localCloudDesc": "Live transcription runs locally; after recording stops the audio is re-transcribed via the cloud API, keeping the local draft on failure",
 
   "settings.cloud.provider": "Provider",
   "settings.cloud.volcano": "Volcano Engine",
@@ -291,6 +302,10 @@ export const en = {
   "settings.asr.whisperDesc": "Broad multilingual support; coarser speaker separation",
   "settings.asr.paraformerDesc": "More accurate Chinese; weaker English",
   "settings.asr.qwen3Desc": "Best for mixed Chinese-English; slightly slower; coarser speaker separation",
+  "settings.asr.fireredDesc": "Highest Chinese accuracy (FireRedASR2); strong code-switch/dialects; slower; coarser speaker separation; ~1.2GB model",
+  "settings.asr.hotwordsLabel": "Hotwords",
+  "settings.asr.hotwordsDesc": "Names, products, and terms, comma-separated; speaker-library names are merged in automatically",
+  "settings.asr.hotwordsPlaceholder": "e.g. Voice Notes, DashScope, Alice",
   "settings.asr.modelMissing":
     "The model for the selected engine is not downloaded; download it under Speech models below.",
 

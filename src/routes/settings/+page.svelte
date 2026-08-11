@@ -20,6 +20,7 @@
     purgeAudio,
     onMigrate,
     onModelDownload,
+    cancelModelsDownload,
     openModelsDir,
     testMirror,
     testCloudAsr,
@@ -32,6 +33,7 @@
   } from "$lib/models";
   import { countPeopleWithoutSamples } from "$lib/people";
   import { refineReady } from "$lib/refineReady";
+  import EditableField from "$lib/EditableField.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
@@ -114,11 +116,12 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
-  /** asr_model 后端值 → radio 本地 value 的四态映射(whisper/paraformer/qwen3/sense_voice)。 */
+  /** asr_model 后端值 → radio 本地 value 的五态映射(whisper/paraformer/qwen3/firered/sense_voice)。 */
   function asrModelToChoice(m: string | undefined): string {
     return m === "whisper" ? "whisper"
       : m === "paraformer" ? "paraformer"
       : m === "qwen3" ? "qwen3"
+      : m === "firered" ? "firered"
       : "sense_voice";
   }
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
@@ -132,6 +135,8 @@
   let volcAppKey = $state("");
   let volcAccessKey = $state("");
   let dashKey = $state("");
+  /** 热词词表(仅 Qwen3 引擎消费,声纹人名由后端自动并入)。 */
+  let hotwords = $state("");
   /** 「测试连接」按钮态与结果(逻辑照搬 runMirrorTest)。 */
   let testingCloud = $state(false);
   let cloudTestResult = $state<{ ok: boolean; msg: string } | null>(null);
@@ -195,6 +200,7 @@
     settings?.asr_model === "whisper" ? "whisper"
       : settings?.asr_model === "paraformer" ? "paraformer"
       : settings?.asr_model === "qwen3" ? "qwen3"
+      : settings?.asr_model === "firered" ? "firered"
       : "asr",
   );
   const asrModelMissing = $derived(
@@ -221,10 +227,11 @@
   const modelsDirLabel = $derived(settings?.models_dir || t("settings.store.defaultDir"));
 
   // 声音处理方案三档(spec 2026-08-10)。settings 未回填前整组禁用,与其它开关同纪律。
+  // 默认档(成品轨)放首位;底层值 a/ab/b 不变,仅展示顺序与命名(2026-08-11 用户拍板去代号)。
   const audioSchemeItems = $derived<SegmentedItem[]>([
+    { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
     { id: "a", label: t("settings.record.audioScheme.a"), disabled: !settings },
     { id: "ab", label: t("settings.record.audioScheme.ab"), disabled: !settings },
-    { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
   ]);
 
   // 录音音频保留期三档,同 audioSchemeItems 纪律。
@@ -251,6 +258,7 @@
   const asrModeItems = $derived<SegmentedItem[]>([
     { id: "local", label: t("settings.asrMode.local"), disabled: recording.isLive || !settings },
     { id: "cloud", label: t("settings.asrMode.cloud"), disabled: recording.isLive || !settings },
+    { id: "local_cloud", label: t("settings.asrMode.localCloud"), disabled: recording.isLive || !settings },
   ]);
   const cloudProviderItems = $derived<SegmentedItem[]>([
     { id: "volcano", label: t("settings.cloud.volcano"), disabled: recording.isLive || !settings },
@@ -296,11 +304,12 @@
     identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
-    asrMode = s.asr_mode === "cloud" ? "cloud" : "local";
+    asrMode = s.asr_mode === "cloud" || s.asr_mode === "local_cloud" ? s.asr_mode : "local";
     cloudProvider = s.cloud_asr_provider === "aliyun" ? "aliyun" : "volcano";
     volcAppKey = s.volc_app_key;
     volcAccessKey = s.volc_access_key;
     dashKey = s.dashscope_api_key;
+    hotwords = s.asr_hotwords;
   }
 
   async function refreshDiskUsage() {
@@ -658,7 +667,7 @@
     } catch (e) {
       error = `${e}`;
       settings = await getSettings().catch(() => settings);
-      asrMode = settings?.asr_mode === "cloud" ? "cloud" : "local";
+      asrMode = settings?.asr_mode === "cloud" || settings?.asr_mode === "local_cloud" ? settings.asr_mode : "local";
     }
   }
 
@@ -719,7 +728,11 @@
 <main class="container">
   <h1>{t("settings.title")}</h1>
   <p class="desc">
-    {asrMode === "cloud" ? t("settings.desc.cloud") : t("settings.desc.local")}
+    {asrMode === "cloud"
+      ? t("settings.desc.cloud")
+      : asrMode === "local_cloud"
+        ? t("settings.desc.localCloud")
+        : t("settings.desc.local")}
   </p>
 
   {#if error}
@@ -911,7 +924,11 @@
         <div class="row-info">
           <span class="row-label">{t("settings.asrMode.label")}</span>
           <span class="row-desc">
-            {asrMode === "cloud" ? t("settings.asrMode.cloudDesc") : t("settings.asrMode.localDesc")}
+            {asrMode === "cloud"
+              ? t("settings.asrMode.cloudDesc")
+              : asrMode === "local_cloud"
+                ? t("settings.asrMode.localCloudDesc")
+                : t("settings.asrMode.localDesc")}
           </span>
         </div>
         <Segmented
@@ -923,7 +940,7 @@
           }}
         />
       </div>
-      {#if asrMode === "cloud"}
+      {#if asrMode !== "local"}
         <div class="row">
           <div class="row-info"><span class="row-label">{t("settings.cloud.provider")}</span></div>
           <Segmented
@@ -942,13 +959,12 @@
               <span class="row-label">APP ID</span>
               <span class="row-desc">{t("settings.cloud.volcAppIdDesc")}</span>
             </div>
-            <input
-              class="row-input"
+            <EditableField
+              value={volcAppKey}
               placeholder="APP ID"
-              bind:value={volcAppKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.volc_app_key = volcAppKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { volcAppKey = v; return saveSetting((s) => (s.volc_app_key = v)); }}
             />
           </div>
           <div class="row">
@@ -956,14 +972,13 @@
               <span class="row-label">Access Token</span>
               <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
-            <input
-              class="row-input"
-              type="password"
+            <EditableField
+              masked
+              value={volcAccessKey}
               placeholder="Access Token"
-              bind:value={volcAccessKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.volc_access_key = volcAccessKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { volcAccessKey = v; return saveSetting((s) => (s.volc_access_key = v)); }}
             />
           </div>
         {:else}
@@ -972,14 +987,13 @@
               <span class="row-label">API Key</span>
               <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
-            <input
-              class="row-input"
-              type="password"
+            <EditableField
+              masked
+              value={dashKey}
               placeholder="DashScope API Key"
-              bind:value={dashKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.dashscope_api_key = dashKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { dashKey = v; return saveSetting((s) => (s.dashscope_api_key = v)); }}
             />
           </div>
         {/if}
@@ -1006,7 +1020,9 @@
             {testingCloud ? t("settings.testing") : t("settings.cloud.test")}
           </button>
         </div>
-      {:else}
+      {/if}
+      <!-- 本地引擎选型:local 与 local_cloud 都要(后者实时仍走本地引擎)。 -->
+      {#if asrMode !== "cloud"}
         <div class="row">
           <div class="row-info">
             <span class="row-label">{t("settings.asr.label")}</span>
@@ -1017,7 +1033,9 @@
                   ? t("settings.asr.paraformerDesc")
                   : asrChoice === "qwen3"
                     ? t("settings.asr.qwen3Desc")
-                    : t("settings.asr.senseVoiceDesc")}
+                    : asrChoice === "firered"
+                      ? t("settings.asr.fireredDesc")
+                      : t("settings.asr.senseVoiceDesc")}
             </span>
           </div>
           <div class="seg" class:disabled={recording.isLive}>
@@ -1061,8 +1079,33 @@
                 onchange={() => changeAsr("qwen3")}
               />Qwen3
             </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="firered"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("firered")}
+              />FireRed
+            </label>
           </div>
         </div>
+        {#if asrChoice === "qwen3"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.asr.hotwordsLabel")}</span>
+              <span class="row-desc">{t("settings.asr.hotwordsDesc")}</span>
+            </div>
+            <EditableField
+              wide
+              value={hotwords}
+              placeholder={t("settings.asr.hotwordsPlaceholder")}
+              disabled={recording.isLive}
+              onSave={(v) => { hotwords = v; return saveSetting((s) => (s.asr_hotwords = v)); }}
+            />
+          </div>
+        {/if}
       {/if}
       <div class="row">
         <div class="row-info">
@@ -1162,6 +1205,11 @@
                   {/if}
                 </span>
                 <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
+                <!-- 镜像僵死等场景的逃生口:后端置取消标志,worker 发 cancelled 事件清本行。
+                     已下字节保留在 .part,再点下载走 Range 续传不白费。 -->
+                {#if prog[a.id].phase === "downloading"}
+                  <button class="link" onclick={() => cancelModelsDownload()}>{t("settings.cancel")}</button>
+                {/if}
               </div>
             {:else if a.present}
               {#if confirmDeleteId === a.id}
@@ -1563,28 +1611,6 @@
   .mtest-err { color: var(--danger-ink); }
   /* 行内输入(与 AI 页 .row-input 同款):surface-press 底、无边,聚焦浮出 canvas + accent 环。
      云端 ASR 凭证输入(APP ID / Access Token / API Key)复用此形态。 */
-  .row-input {
-    flex: none;
-    width: 14rem;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .row-input:focus {
-    outline: none;
-    background: var(--canvas);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .row-input::placeholder {
-    color: var(--ink-faint);
-  }
-  .row-input:disabled {
-    opacity: 0.6;
-  }
   /* button-secondary */
   .btn-secondary {
     flex: none;

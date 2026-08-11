@@ -1,54 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { refineReady } from "./refineReady";
+import { executorReady, refineReady } from "./refineReady";
 
-describe("refineReady(会后 AI 就绪判定,口径对齐 lib.rs refine_llm_ready/refine_agent_ready)", () => {
-  it("openai 档:三项均非空才就绪", () => {
-    expect(
-      refineReady({
-        refine_provider: "openai",
-        refine_base_url: "https://api.example.com",
-        refine_model: "gpt-4o-mini",
-        refine_api_key: "sk-xxx",
-      }),
-    ).toBe(true);
+const profile = (over: Partial<{ id: string; base_url: string; model: string; api_key: string }> = {}) => ({
+  id: "p1",
+  label: "T",
+  base_url: "https://api.example.com",
+  model: "gpt-4o-mini",
+  api_key: "sk-xxx",
+  ...over,
+});
+
+describe("executorReady(执行体就绪判定,口径对齐 settings::executor_ready)", () => {
+  it("llm 引用:档案存在且三项均非空才就绪", () => {
+    expect(executorReady({ llm_profiles: [profile()] }, "llm:p1")).toBe(true);
+    expect(executorReady({ llm_profiles: [profile({ base_url: "" })] }, "llm:p1")).toBe(false);
+    expect(executorReady({ llm_profiles: [profile({ model: "" })] }, "llm:p1")).toBe(false);
+    expect(executorReady({ llm_profiles: [profile({ api_key: "" })] }, "llm:p1")).toBe(false);
   });
-  it("openai 档:任一字段为空 → 未就绪", () => {
-    const base = {
-      refine_provider: "openai",
-      refine_base_url: "https://api.example.com",
-      refine_model: "gpt-4o-mini",
-      refine_api_key: "sk-xxx",
-    };
-    expect(refineReady({ ...base, refine_base_url: "" })).toBe(false);
-    expect(refineReady({ ...base, refine_model: "" })).toBe(false);
-    expect(refineReady({ ...base, refine_api_key: "" })).toBe(false);
+  it("悬空引用(档案已删)→ 未就绪", () => {
+    expect(executorReady({ llm_profiles: [] }, "llm:ghost")).toBe(false);
   });
-  it("agent 档:恒就绪,不看 base_url/model/api_key(后端同口径不查 bin/model)", () => {
-    expect(
-      refineReady({
-        refine_provider: "agent",
-        refine_base_url: "",
-        refine_model: "",
-        refine_api_key: "",
-      }),
-    ).toBe(true);
+  it("agent 引用:恒就绪(bin 探测留运行时,后端同口径)", () => {
+    expect(executorReady({ llm_profiles: [] }, "agent:claude")).toBe(true);
   });
-  it("provider 坏值(手改 settings.json)按 openai 对待,同后端默认执行体口径", () => {
-    expect(
-      refineReady({
-        refine_provider: "banana",
-        refine_base_url: "",
-        refine_model: "",
-        refine_api_key: "",
-      }),
-    ).toBe(false);
-    expect(
-      refineReady({
-        refine_provider: "banana",
-        refine_base_url: "u",
-        refine_model: "m",
-        refine_api_key: "k",
-      }),
-    ).toBe(true);
+  it("空引用/坏值 → 未就绪", () => {
+    expect(executorReady({ llm_profiles: [profile()] }, "")).toBe(false);
+    expect(executorReady({ llm_profiles: [profile()] }, "banana")).toBe(false);
+  });
+});
+
+describe("refineReady(会后 AI 就绪 = refine_executor 的执行体就绪)", () => {
+  it("引用就绪的档案 → 就绪;未配置 → 未就绪", () => {
+    expect(refineReady({ llm_profiles: [profile()], refine_executor: "llm:p1" })).toBe(true);
+    expect(refineReady({ llm_profiles: [profile()], refine_executor: "" })).toBe(false);
   });
 });

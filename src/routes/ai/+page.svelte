@@ -1,7 +1,16 @@
 <script lang="ts">
   // AI 页:Aing 大模型配置 + AI 助手接入(Task 2 自设置页迁入)。
   import { onMount } from "svelte";
-  import { getSettings, setSettings, testRefineLlm, testRefineAgent, type Settings } from "$lib/models";
+  import {
+    getSettings,
+    setSettings,
+    testRefineLlm,
+    testRefineAgent,
+    type Settings,
+    type LlmProfile,
+    type AgentProfile,
+  } from "$lib/models";
+  import { executorReady } from "$lib/refineReady";
   import {
     mcpAgentsStatus,
     mcpRegister,
@@ -24,16 +33,27 @@
   import { page } from "$app/stores";
   import { aiLogsQuery } from "$lib/ailog";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
+  import EditableField from "$lib/EditableField.svelte";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
 
   let settings = $state<Settings | null>(null);
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
   let error = $state("");
 
-  /** Aing:接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。开关已移至设置页「录制」区。 */
+  // —— 执行体分层(2026-08-11 设计):资源层(在线模型档案/Agent 档案)与功能层
+  //    (refine_executor/relations_executor 引用)解耦,配置一次处处可用。 ——
+  /** 在线模型档案(settings 镜像)。 */
+  let llmProfiles = $state<LlmProfile[]>([]);
+  let agentProfiles = $state<AgentProfile[]>([]);
+  let refineExecutor = $state("");
+  let relationsExecutor = $state("");
+  /** 资源区当前编辑的档案 id 与其字段编辑缓冲(失焦保存回 llm_profiles)。 */
+  let selectedProfileId = $state("");
+  let profLabel = $state("");
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
+  let confirmDeleteProfile = $state(false);
   /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案(存 i18n 键,渲染处 t() 取值)。
       豆包(火山方舟)的调用凭据是控制台创建的「推理接入点」ID(ep- 开头),不是
       裸模型名——预填模型名对要求接入点的账号是坏值,故 model 留空、整行换文案。 */
@@ -61,11 +81,150 @@
     modelDesc?: string;
     modelPlaceholder?: string;
   }[];
-  /** 当前接口地址命中的预设(用户手改过地址就不再套预设文案)。 */
+  /** 选中档案命中的模板(定制「模型」字段文案,如豆包的接入点说明)。 */
   const activePreset = $derived(REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim()));
+  const selectedProfile = $derived(llmProfiles.find((p) => p.id === selectedProfileId));
 
-  // —— Aing 执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
-  let refineProvider = $state("openai");
+  /** 旧世界 localStorage 草稿(vn.refineDrafts)一次性转正为正式档案:用户在分层
+      改造前存过的多家 key 不丢。按 base_url 去重(后端迁移已把生效配置转成档案);
+      转正后清掉草稿键,此路径此后不再触发。 */
+  const REFINE_DRAFTS_KEY = "vn.refineDrafts";
+  async function migrateLegacyDrafts(s: Settings) {
+    let drafts: Record<string, { base?: string; model: string; key: string }>;
+    try {
+      const raw = localStorage.getItem(REFINE_DRAFTS_KEY);
+      if (!raw) return;
+      drafts = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const additions: LlmProfile[] = [];
+    for (const [label, d] of Object.entries(drafts)) {
+      if (!d?.key?.trim()) continue; // 只转有密钥的草稿,空壳无价值
+      const preset = REFINE_PRESETS.find((p) => p.label === label);
+      const base = (preset?.base ?? d.base ?? "").trim();
+      if (!base) continue;
+      const exists = [...s.llm_profiles, ...additions].some((p) => p.base_url.trim() === base);
+      if (exists) continue;
+      additions.push({
+        id: newProfileId(),
+        label: preset ? label : t("ai.aing.tab.custom"),
+        base_url: base,
+        model: (d.model ?? "").trim() || (preset?.model ?? ""),
+        api_key: d.key.trim(),
+      });
+    }
+    if (additions.length) {
+      const ok = await saveSetting((fresh) => {
+        fresh.llm_profiles.push(...additions);
+      });
+      // 保存失败不清草稿(codex 2026-08-11 P1):草稿是这些 key 的唯一副本,
+      // 落盘未确认就删等于丢密钥;下次进页会带着草稿重试。
+      if (!ok) return;
+    }
+    try {
+      localStorage.removeItem(REFINE_DRAFTS_KEY);
+    } catch {
+      /* 清不掉也无害:下次去重后仍是零新增 */
+    }
+  }
+
+  function newProfileId(): string {
+    return "p-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  /** 同名模板重复新建时给 label 编号(DeepSeek、DeepSeek 2、…),id 才是身份。 */
+  function uniqueLabel(base: string): string {
+    if (!llmProfiles.some((p) => p.label === base)) return base;
+    let n = 2;
+    while (llmProfiles.some((p) => p.label === `${base} ${n}`)) n += 1;
+    return `${base} ${n}`;
+  }
+
+  function loadProfileFields() {
+    const p = llmProfiles.find((x) => x.id === selectedProfileId);
+    profLabel = p?.label ?? "";
+    refineBaseUrl = p?.base_url ?? "";
+    refineModel = p?.model ?? "";
+    refineKey = p?.api_key ?? "";
+  }
+
+  function selectProfile(id: string) {
+    if (id === selectedProfileId) return;
+    selectedProfileId = id;
+    llmTest = null;
+    confirmDeleteProfile = false;
+    loadProfileFields();
+  }
+
+  function saveProfile(): Promise<unknown> {
+    llmTest = null;
+    const id = selectedProfileId;
+    if (!id) return Promise.resolve(false);
+    // 与 id 一起快照全部字段(codex 2026-08-11 P1):mutator 在 saveChain 排队后
+    // 才执行,期间切档案 tab 会把字段缓冲换成别家的值,晚读=拿 B 家的端点/密钥
+    // 覆写 A 家档案。
+    const label = profLabel.trim();
+    const baseUrl = refineBaseUrl.trim();
+    const model = refineModel.trim();
+    const apiKey = refineKey.trim();
+    return saveSetting((s) => {
+      const p = s.llm_profiles.find((x) => x.id === id);
+      if (!p) return;
+      p.label = label || p.label;
+      p.base_url = baseUrl;
+      p.model = model;
+      p.api_key = apiKey;
+    });
+  }
+
+  function addProfile(tpl: { label: string; labelKey?: string; base: string; model: string }) {
+    const id = newProfileId();
+    const label = uniqueLabel(tpl.labelKey ? t(tpl.labelKey) : tpl.label);
+    void saveSetting((s) => {
+      s.llm_profiles.push({ id, label, base_url: tpl.base, model: tpl.model, api_key: "" });
+      // 首个档案顺手成为 AI 整理执行体:免去「建完还要去功能区选一次」的空转。
+      if (!s.refine_executor.trim()) s.refine_executor = `llm:${id}`;
+    }).then(() => {
+      selectedProfileId = id;
+      loadProfileFields();
+    });
+  }
+
+  function deleteProfile() {
+    confirmDeleteProfile = false;
+    // 快照被删档案 id(codex 2026-08-11 P1):mutator 排队期间切档案 tab 会改
+    // selectedProfileId,晚读=删掉切过去的那家而不是按下删除键的那家。
+    const id = selectedProfileId;
+    const refstr = `llm:${id}`;
+    if (refineExecutor.trim() === refstr || relationsExecutor.trim() === refstr) {
+      error = t("ai.res.deleteInUse");
+      return;
+    }
+    void saveSetting((s) => {
+      // 权威在用判定必须对着链上的 fresh 设置再做一次(codex 2026-08-11 P2):
+      // 上面的镜像快检只是即时反馈——「设为执行体」还排在本次之前的队里时,
+      // 镜像尚未同步,单靠它会删出悬空执行体引用。
+      if (s.refine_executor.trim() === refstr || s.relations_executor.trim() === refstr) {
+        error = t("ai.res.deleteInUse");
+        return;
+      }
+      s.llm_profiles = s.llm_profiles.filter((p) => p.id !== id);
+    });
+  }
+
+  // —— 功能层:执行体引用 ——
+  function setRefineExecutor(v: string) {
+    void saveSetting((s) => (s.refine_executor = v));
+  }
+  function setRelationsExecutor(v: string) {
+    void saveSetting((s) => (s.relations_executor = v));
+  }
+  const refineExecReady = $derived(
+    !!settings && !!refineExecutor.trim() && executorReady(settings, refineExecutor.trim()),
+  );
+
+  // —— 本机 Agent 档案(资源区):kind 为当前编辑的一家,bin/model 是其档案字段缓冲 ——
   let refineAgent = $state("claude");
   let refineAgentBin = $state("");
   let refineAgentModel = $state("");
@@ -247,15 +406,8 @@
     (async () => {
       try {
         const s = await getSettings();
-        settings = s;
-        refineBaseUrl = s.refine_base_url;
-        refineModel = s.refine_model;
-        refineKey = s.refine_api_key;
-        refineProvider = s.refine_provider;
-        refineAgent = s.refine_agent;
-        refineAgentBin = s.refine_agent_bin;
-        refineAgentModel = s.refine_agent_model;
-        mcpAllowControl = s.mcp_allow_control;
+        syncFromSettings(s);
+        await migrateLegacyDrafts(s); // 旧 localStorage 草稿一次性转正为档案
       } catch { /* 首载失败:控件保持默认,操作时会再报错 */ }
     })();
     refineAgentsProbe().then((v) => (agentProbe = v)).catch(() => {});
@@ -266,58 +418,83 @@
     mcpCapabilities().then((v) => (capabilities = v)).catch((e) => (capError = String(e)));
   });
 
-  // —— 通用「取新鲜值→改→存」保存(精简自设置页 saveSetting:只回弹本页用到的字段) ——
-  async function saveSetting(mut: (s: Settings) => void) {
-    error = "";
-    try {
-      const fresh = await getSettings();
-      mut(fresh);
-      await setSettings(fresh);
-      settings = fresh;
-      refineBaseUrl = fresh.refine_base_url;
-      refineModel = fresh.refine_model;
-      refineKey = fresh.refine_api_key;
-      refineProvider = fresh.refine_provider;
-      refineAgent = fresh.refine_agent;
-      refineAgentBin = fresh.refine_agent_bin;
-      refineAgentModel = fresh.refine_agent_model;
-      mcpAllowControl = fresh.mcp_allow_control;
-    } catch (e) {
-      error = t("common.saveFailed", { e });
-      settings = await getSettings().catch(() => settings);
-      if (settings) {
-        refineBaseUrl = settings.refine_base_url;
-        refineModel = settings.refine_model;
-        refineKey = settings.refine_api_key;
-        refineProvider = settings.refine_provider;
-        refineAgent = settings.refine_agent;
-        refineAgentBin = settings.refine_agent_bin;
-        refineAgentModel = settings.refine_agent_model;
-        mcpAllowControl = settings.mcp_allow_control;
-      }
+  /** settings → 本页各镜像 state。selectedProfileId 悬空时回落第一份档案。 */
+  function syncFromSettings(s: Settings) {
+    settings = s;
+    llmProfiles = s.llm_profiles;
+    agentProfiles = s.agent_profiles;
+    refineExecutor = s.refine_executor;
+    relationsExecutor = s.relations_executor;
+    mcpAllowControl = s.mcp_allow_control;
+    if (!llmProfiles.some((p) => p.id === selectedProfileId)) {
+      selectedProfileId = llmProfiles[0]?.id ?? "";
     }
+    loadProfileFields();
+    const ap = agentProfiles.find((a) => a.kind === refineAgent);
+    refineAgentBin = ap?.bin ?? "";
+    refineAgentModel = ap?.model ?? "";
   }
 
-  function applyPreset(p: { base: string; model: string }) {
-    refineBaseUrl = p.base;
-    refineModel = p.model;
-    saveRefine();
+  // —— 通用「取新鲜值→改→存」保存(失败回弹全部镜像)。
+  //    串行化(codex 2026-08-11 P1):blur 保存与紧随其后的执行体切换可能并发,
+  //    两次都读到同一旧快照,后写覆盖先写,静默回退前一处修改——用 promise 链
+  //    排队,后一次保存必然读到前一次落盘后的新鲜值。返回本次保存是否成功,
+  //    供草稿迁移这类"成功才可清理"的调用方判定。 ——
+  let saveChain: Promise<boolean> = Promise.resolve(true);
+  function saveSetting(mut: (s: Settings) => void): Promise<boolean> {
+    const next = saveChain
+      .catch(() => false) // 链上前一次失败不阻断后续保存
+      .then(async () => {
+        error = "";
+        try {
+          const fresh = await getSettings();
+          mut(fresh);
+          await setSettings(fresh);
+          syncFromSettings(fresh);
+          return true;
+        } catch (e) {
+          error = t("common.saveFailed", { e });
+          const rolled = await getSettings().catch(() => settings);
+          if (rolled) syncFromSettings(rolled);
+          return false;
+        }
+      });
+    saveChain = next;
+    return next;
   }
-  function saveRefine() {
-    llmTest = null;
-    saveSetting((s) => {
-      s.refine_base_url = refineBaseUrl.trim();
-      s.refine_model = refineModel.trim();
-      s.refine_api_key = refineKey.trim();
-    });
+
+  /** MCP 注册键 → 执行体 kind:可作 Aing 执行体的四家;其余(桌面端/第三方)仅注册接入。 */
+  const EXEC_KIND: Record<string, string> = {
+    "claude-code": "claude",
+    codex: "codex",
+    gemini: "gemini",
+    cursor: "cursor",
+  };
+  /** 智能体 tab 当前页(与在线模型同构,2026-08-11 冒烟反馈按智能体整合)。 */
+  let selectedAgentKey = $state("claude-code");
+  const currentAgent = $derived(mcpAgents.find((a) => a.key === selectedAgentKey));
+  function selectAgentTab(key: string) {
+    selectedAgentKey = key;
+    const kind = EXEC_KIND[key];
+    if (kind) selectAgentKind(kind); // 执行体四家:同步装载该家 bin/model 编辑缓冲
   }
-  function saveRefineAgent() {
+
+  /** Agent 卡:切编辑哪家 CLI(纯 UI 态,不落盘)/字段失焦保存该家档案。 */
+  function selectAgentKind(kind: string) {
+    refineAgent = kind;
     agentTest = null;
-    saveSetting((s) => {
-      s.refine_provider = refineProvider;
-      s.refine_agent = refineAgent;
-      s.refine_agent_bin = refineAgentBin.trim();
-      s.refine_agent_model = refineAgentModel.trim();
+    const ap = agentProfiles.find((a) => a.kind === kind);
+    refineAgentBin = ap?.bin ?? "";
+    refineAgentModel = ap?.model ?? "";
+  }
+  function saveRefineAgent(): Promise<unknown> {
+    agentTest = null;
+    const kind = refineAgent;
+    const entry = { kind, bin: refineAgentBin.trim(), model: refineAgentModel.trim() };
+    return saveSetting((s) => {
+      const i = s.agent_profiles.findIndex((a) => a.kind === kind);
+      if (i >= 0) s.agent_profiles[i] = entry;
+      else s.agent_profiles.push(entry);
     });
   }
 
@@ -456,6 +633,35 @@
 <div class="page">
   <header class="topbar"><h1>AI</h1></header>
 
+  <!-- 执行体选项(功能区两个选择器共用):在线模型档案 + 本机 Agent,
+       未就绪状态直接标注在选项文本里,不让用户选完才发现不可用。
+       forRelations:关系补建后端结构性只放行 Claude/Gemini(工具面收敛,见
+       AgentRelationExecutor::new),其余 Agent 禁选并标注原因,不让用户选完
+       跑一次预览/补建才发现必败(codex 2026-08-11 P2)。 -->
+  {#snippet executorOptions(forRelations: boolean)}
+    {#if llmProfiles.length}
+      <optgroup label={t("ai.exec.groupLlm")}>
+        {#each llmProfiles as p (p.id)}
+          <option value={"llm:" + p.id}>
+            {p.label}{p.api_key.trim() ? "" : ` · ${t("ai.exec.missingKey")}`}
+          </option>
+        {/each}
+      </optgroup>
+    {/if}
+    <optgroup label={t("ai.exec.groupAgent")}>
+      {#each AGENT_OPTIONS as a (a.key)}
+        {@const relationsBlocked = forRelations && a.key !== "claude" && a.key !== "gemini"}
+        <option value={"agent:" + a.key} disabled={relationsBlocked}>
+          {a.label}{relationsBlocked
+            ? ` · ${t("ai.exec.relationsUnsupported")}`
+            : !(a.key in agentProbe) || agentProbe[a.key]
+              ? ""
+              : ` · ${t("ai.exec.notDetected")}`}
+        </option>
+      {/each}
+    </optgroup>
+  {/snippet}
+
   {#if error}
     <div class="banner">{error}</div>
   {/if}
@@ -505,117 +711,88 @@
     </p>
   </section>
 
-  <!-- —— Aing:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
+  <!-- —— AI 整理(功能区):只选执行体;模型/Agent 的连接配置在下方资源区,
+       配置一次可被多个 AI 功能复用(2026-08-11 执行体分层) —— -->
   <section id="aing-settings" class="anchor-section" class:guide-target={guideActive && guideStep === 0}>
     <h2 class="section-title">{t("ai.aing.sectionTitle")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">{t("ai.aing.provider.label")}</span>
+          <span class="row-label">{t("ai.exec.label")}</span>
           <span class="row-desc">
-            {refineProvider === "agent"
-              ? t("ai.aing.provider.agentDesc")
-              : t("ai.aing.provider.openaiDesc")}
+            {#if !refineExecutor.trim()}
+              {t("ai.exec.noneDesc")}
+            {:else if !refineExecReady}
+              <span class="desc-warn">{t("ai.exec.notReadyDesc")}</span>
+            {:else}
+              {t("ai.exec.refineDesc")}
+            {/if}
           </span>
         </div>
-        <div class="seg">
-          <label class="seg-item">
-            <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.openai")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.agent")}
-          </label>
-        </div>
+        <select
+          class="row-select"
+          value={refineExecutor}
+          onchange={(e) => setRefineExecutor(e.currentTarget.value)}
+        >
+          <option value="">{t("ai.exec.none")}</option>
+          {@render executorOptions(false)}
+        </select>
       </div>
-      {#if refineProvider === "agent"}
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">Agent</span>
-            <span class="row-desc">
-              {#if refineAgentBin.trim()}
-                {t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
-              {:else if agentProbe[refineAgent]}
-                {t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
-              {:else if refineAgent in agentProbe}
-                <span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
-              {:else}
-                {t("ai.aing.agent.detecting")}
-              {/if}
-            </span>
-          </div>
-          <div class="seg">
-            {#each AGENT_OPTIONS as a (a.key)}
-              <label class="seg-item">
-                <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={saveRefineAgent} />
-                {a.label}
-              </label>
-            {/each}
-          </div>
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.model.label")}</span>
-            <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
-          </div>
-          <input
-            class="row-input"
-            placeholder={t(selectedAgentOption.modelHint)}
-            bind:value={refineAgentModel}
-            onblur={saveRefineAgent}
-            oninput={() => (agentTest = null)}
-          />
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.cliPath.label")}</span>
-            <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
-          </div>
-          <input
-            class="row-input wide"
-            placeholder={t("ai.aing.cliPath.placeholder")}
-            bind:value={refineAgentBin}
-            onblur={saveRefineAgent}
-            oninput={() => (agentTest = null)}
-          />
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.testRun.label")}</span>
-            <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
-          </div>
-          <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
-            {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+      <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
+    </div>
+  </section>
+
+  <!-- —— 在线模型(资源区):档案化的服务商连接,tab=档案,绿点=已配密钥 —— -->
+  <section id="online-models" class="anchor-section">
+    <h2 class="section-title">{t("ai.res.modelsTitle")}</h2>
+    <div class="rows">
+      <div class="provider-tabs" role="tablist">
+        {#each llmProfiles as p (p.id)}
+          <button
+            role="tab"
+            aria-selected={selectedProfileId === p.id}
+            class="ptab"
+            class:active={selectedProfileId === p.id}
+            onclick={() => selectProfile(p.id)}
+          >
+            {p.label}
+            {#if p.api_key.trim()}<span class="chip-dot"></span>{/if}
           </button>
-        </div>
-        {#if agentTest}
-          <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
-            {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
-          </p>
-        {/if}
-        <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
-      {:else}
+        {/each}
+        <!-- 模板平铺(2026-08-11 冒烟反馈:弹出菜单会被容器裁切):幽灵芯片直接
+             排在档案 tab 之后,点即新建,tab 条自身 flex-wrap 窄窗换行,无遮挡面。 -->
+        {#each REFINE_PRESETS as p (p.label)}
+          <button class="tpl-chip" title={t("ai.res.add")} onclick={() => addProfile(p)}>
+            + {p.labelKey ? t(p.labelKey) : p.label}
+          </button>
+        {/each}
+        <button
+          class="tpl-chip"
+          title={t("ai.res.add")}
+          onclick={() => addProfile({ label: t("ai.aing.tab.custom"), base: "", model: "" })}
+        >
+          + {t("ai.aing.tab.custom")}
+        </button>
+      </div>
+      {#if selectedProfile}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">{t("ai.aing.preset.label")}</span>
-            <span class="row-desc">{t("ai.aing.preset.desc")}</span>
+            <span class="row-label">{t("ai.res.name")}</span>
+            <span class="row-desc">{t("ai.res.nameDesc")}</span>
           </div>
-          <div class="preset-btns">
-            {#each REFINE_PRESETS as p (p.label)}
-              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.labelKey ? t(p.labelKey) : p.label}</button>
-            {/each}
-          </div>
+          <EditableField value={profLabel} onSave={(v) => { profLabel = v; return saveProfile(); }} />
         </div>
         <div class="row">
           <div class="row-info">
             <span class="row-label">{t("ai.aing.baseUrl.label")}</span>
             <span class="row-desc">{t("ai.aing.baseUrl.desc")}</span>
           </div>
-          <input
-            class="row-input wide"
+          <EditableField
+            wide
+            value={refineBaseUrl}
             placeholder="https://api.deepseek.com/v1"
-            bind:value={refineBaseUrl}
-            onblur={saveRefine}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineBaseUrl = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -623,12 +800,11 @@
             <span class="row-label">{activePreset?.modelLabel ? t(activePreset.modelLabel) : t("ai.aing.model.label")}</span>
             <span class="row-desc">{activePreset?.modelDesc ? t(activePreset.modelDesc) : t("ai.aing.model.desc")}</span>
           </div>
-          <input
-            class="row-input"
+          <EditableField
+            value={refineModel}
             placeholder={activePreset?.modelPlaceholder ?? "deepseek-chat"}
-            bind:value={refineModel}
-            onblur={saveRefine}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineModel = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -636,13 +812,13 @@
             <span class="row-label">API Key</span>
             <span class="row-desc">{t("ai.aing.apiKey.desc")}</span>
           </div>
-          <input
-            class="row-input wide"
-            type="password"
+          <EditableField
+            wide
+            masked
+            value={refineKey}
             placeholder="sk-..."
-            bind:value={refineKey}
-            onblur={saveRefine}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineKey = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -650,18 +826,25 @@
             <span class="row-label">{t("ai.aing.testConn.label")}</span>
             <span class="row-desc">{t("ai.aing.testConn.desc")}</span>
           </div>
-          <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
-            {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-          </button>
+          <div class="row-actions">
+            {#if confirmDeleteProfile}
+              <button class="btn-secondary danger" onclick={deleteProfile}>{t("ai.res.confirmDelete")}</button>
+              <button class="btn-secondary" onclick={() => (confirmDeleteProfile = false)}>{t("settings.cancel")}</button>
+            {:else}
+              <button class="btn-secondary danger" onclick={() => (confirmDeleteProfile = true)}>{t("ai.action.remove")}</button>
+            {/if}
+            <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
+              {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+            </button>
+          </div>
         </div>
         {#if llmTest}
           <p class="test-result" class:ok={llmTest.ok} class:err={!llmTest.ok}>
             {llmTest.ok ? t("ai.aing.testOk", { msg: llmTest.msg }) : t("ai.aing.testFail", { msg: llmTest.msg })}
           </p>
         {/if}
-        {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">{t("ai.aing.configHint")}</p>
-        {/if}
+      {:else}
+        <p class="config-hint">{t("ai.res.empty")}</p>
       {/if}
     </div>
   </section>
@@ -673,73 +856,142 @@
       {#if mcpError}
         <div class="banner warn">{mcpError}</div>
       {/if}
-      {#each mcpAgents as a (a.key)}
+      <!-- 智能体 tab(与在线模型同构,2026-08-11 冒烟反馈):每家一页,探测/模型/
+           CLI 路径/测试/MCP 注册/技能全在本家面板;绿点 = 已注册。可作 Aing 执行体
+           的四家(Claude Code/Codex/Gemini/Cursor)额外露出模型与路径配置。 -->
+      <div class="provider-tabs" role="tablist">
+        {#each mcpAgents as a (a.key)}
+          <button
+            role="tab"
+            aria-selected={selectedAgentKey === a.key}
+            class="ptab"
+            class:active={selectedAgentKey === a.key}
+            onclick={() => selectAgentTab(a.key)}
+          >
+            {a.name}
+            {#if a.registered}<span class="chip-dot"></span>{/if}
+          </button>
+        {/each}
+      </div>
+      {#if currentAgent}
         <div class="row">
           <div class="row-info">
-            <span class="row-label">{a.name}</span>
+            <span class="row-label">{t("ai.mcp.statusLabel")}</span>
             <span class="row-desc">
-              {#if !a.installed && !a.registered}{t("ai.mcp.status.notInstalled")}
-              {:else if a.stale}{t("ai.mcp.status.stale")}
-              {:else if a.registered}{t("ai.mcp.status.registered")}
+              {#if !currentAgent.installed && !currentAgent.registered}{t("ai.mcp.status.notInstalled")}
+              {:else if currentAgent.stale}{t("ai.mcp.status.stale")}
+              {:else if currentAgent.registered}{t("ai.mcp.status.registered")}
               {:else}{t("ai.mcp.status.unregistered")}{/if}
+              {#if EXEC_KIND[currentAgent.key]}
+                ·
+                {#if refineAgentBin.trim()}{t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
+                {:else if agentProbe[refineAgent]}{t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
+                {:else if refineAgent in agentProbe}<span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
+                {:else}{t("ai.aing.agent.detecting")}{/if}
+              {/if}
             </span>
           </div>
-          {#if a.installed || a.registered}
-            <button class="btn-secondary" disabled={mcpBusy === a.key} onclick={() => mcpToggleRegister(a)}>
-              {a.registered ? t("ai.action.remove") : t("ai.mcp.register")}
+          {#if currentAgent.installed || currentAgent.registered}
+            <button class="btn-secondary" disabled={mcpBusy === currentAgent.key} onclick={() => currentAgent && mcpToggleRegister(currentAgent)}>
+              {currentAgent.registered ? t("ai.action.remove") : t("ai.mcp.register")}
             </button>
           {/if}
         </div>
-      {/each}
-      <div class="row">
-        <div class="row-info">
-          <span class="row-label-line">
-            <span class="row-label">{t("ai.mcp.skill.label")}</span>
-            {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
-            {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
-            {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
-            {/if}
-          </span>
-          <span class="row-desc">
-            {#if skillState === "current"}{t("ai.mcp.skill.currentDesc")}
-            {:else if skillState === "stale"}{t("ai.mcp.skill.staleDesc")}
-            {:else if skillState === "unmanaged"}{t("ai.mcp.skill.unmanagedDesc")}
-            {:else}{t("ai.mcp.skill.installDesc")}
-            {/if}
-          </span>
-        </div>
-        {#if skillState !== null}
-          <div class="row-actions">
-            <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
-              {t("ai.mcp.skill.viewEdit")}
-            </button>
-            {#if skillState !== "unmanaged"}
-              <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
-              <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
-                {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
-              </button>
-            {/if}
-          </div>
-        {/if}
-      </div>
-      {#if skillEditOpen}
-        <div class="config">
-          <textarea
-            class="skill-textarea mono"
-            bind:value={skillContent}
-            spellcheck="false"
-            disabled={skillEditBusy}
-          ></textarea>
-          <div class="skill-edit-actions">
-            <div class="skill-edit-buttons">
-              <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
-              <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
-              <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
+        {#if EXEC_KIND[currentAgent.key]}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.model.label")}</span>
+              <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
             </div>
-            <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
+            <EditableField
+              value={refineAgentModel}
+              placeholder={t(selectedAgentOption.modelHint)}
+              onEditStart={() => (agentTest = null)}
+              onSave={(v) => { refineAgentModel = v; return saveRefineAgent(); }}
+            />
           </div>
-        </div>
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.cliPath.label")}</span>
+              <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
+            </div>
+            <EditableField
+              wide
+              value={refineAgentBin}
+              placeholder={t("ai.aing.cliPath.placeholder")}
+              onEditStart={() => (agentTest = null)}
+              onSave={(v) => { refineAgentBin = v; return saveRefineAgent(); }}
+            />
+          </div>
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label">{t("ai.aing.testRun.label")}</span>
+              <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
+            </div>
+            <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
+              {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+            </button>
+          </div>
+          {#if agentTest}
+            <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
+              {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
+            </p>
+          {/if}
+        {/if}
+        {#if currentAgent.key === "claude-code"}
+          <div class="row">
+            <div class="row-info">
+              <span class="row-label-line">
+                <span class="row-label">{t("ai.mcp.skill.label")}</span>
+                {#if skillState === "current"}<span class="pill">{t("ai.mcp.skill.current")}</span>
+                {:else if skillState === "stale"}<span class="pill warn">{t("ai.mcp.skill.stale")}</span>
+                {:else if skillState === "unmanaged"}<span class="pill">{t("ai.mcp.skill.unmanaged")}</span>
+                {/if}
+              </span>
+              <span class="row-desc">
+                {#if skillState === "current"}{t("ai.mcp.skill.currentDesc")}
+                {:else if skillState === "stale"}{t("ai.mcp.skill.staleDesc")}
+                {:else if skillState === "unmanaged"}{t("ai.mcp.skill.unmanagedDesc")}
+                {:else}{t("ai.mcp.skill.installDesc")}
+                {/if}
+              </span>
+            </div>
+            {#if skillState !== null}
+              <div class="row-actions">
+                <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={() => (skillEditOpen ? (skillEditOpen = false) : openSkillEdit())}>
+                  {t("ai.mcp.skill.viewEdit")}
+                </button>
+                {#if skillState !== "unmanaged"}
+                  <!-- 忙时禁用而非消失(原可见性语义);加 skillEditBusy 与编辑卡操作互斥,防竞态 -->
+                  <button class="btn-secondary" disabled={skillBusy || skillEditBusy} onclick={toggleSkill}>
+                    {skillState === "not_installed" ? t("ai.action.install") : t("ai.action.remove")}
+                  </button>
+                {/if}
+              </div>
+            {/if}
+          </div>
+          {#if skillEditOpen}
+            <div class="config">
+              <textarea
+                class="skill-textarea mono"
+                bind:value={skillContent}
+                spellcheck="false"
+                disabled={skillEditBusy}
+              ></textarea>
+              <div class="skill-edit-actions">
+                <div class="skill-edit-buttons">
+                  <!-- 保存/恢复默认加 skillBusy:与行上「安装/移除」互斥,防止卸载进行中把旧内容写回 -->
+                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={saveSkillEdit}>{t("ai.action.save")}</button>
+                  <button class="btn-secondary" disabled={skillEditBusy || skillBusy} onclick={restoreSkillDefault}>{t("ai.mcp.skill.restore")}</button>
+                  <button class="btn-secondary" disabled={skillEditBusy} onclick={() => (skillEditOpen = false)}>{t("ai.action.collapse")}</button>
+                </div>
+                <p class="config-hint">{t("ai.mcp.skill.savedHint")}</p>
+              </div>
+            </div>
+          {/if}
+        {/if}
+      {:else}
+        <p class="config-hint">{t("ai.aing.agent.detecting")}</p>
       {/if}
       <label class="row">
         <div class="row-info">
@@ -782,19 +1034,19 @@
       {/if}
       {#if capabilities}
         <div class="group-title">{t("ai.cap.tools")}</div>
+        <!-- 2026-08-11 用户拍板去掉 gate 徽章(「需应用运行/已允许控制」这类状态标签
+             对用户是噪声):正常状态零标注;唯一值得说的是「控制类工具因上方开关关闭
+             而不可用」——用整行置灰 + 描述后缀一句话指路,开关一开即恢复常态。 -->
         {#each capabilities.tools as tool (tool.name)}
-          <div class="row">
+          {@const controlLocked = tool.gate === "control" && !mcpAllowControl}
+          <div class="row" class:dimmed={controlLocked}>
             <div class="row-info">
               <span class="row-label mono">{tool.name}</span>
-              <span class="row-desc">{tool.desc}</span>
+              <span class="row-desc">
+                {tool.desc}
+                {#if controlLocked}{t("ai.cap.controlLockedHint")}{/if}
+              </span>
             </div>
-            <!-- catalog 的 gate 是静态前置条件声明;control 一档按上方开关的实时值
-                 显示当前状态,否则开关打开后徽章不变,会被读成「开了也没生效」。 -->
-            {#if tool.gate === "app"}<span class="pill">{t("ai.cap.gateApp")}</span>
-            {:else if tool.gate === "control"}
-              {#if mcpAllowControl}<span class="pill">{t("ai.cap.gateControlOn")}</span>
-              {:else}<span class="pill warn">{t("ai.cap.gateControlOff")}</span>{/if}
-            {/if}
           </div>
         {/each}
         <div class="group-title">{t("ai.cap.cli")}</div>
@@ -814,6 +1066,20 @@
   <section>
     <h2 class="section-title">{t("ai.relations.sectionTitle")}</h2>
     <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("ai.exec.label")}</span>
+          <span class="row-desc">{t("ai.exec.relationsDesc")}</span>
+        </div>
+        <select
+          class="row-select"
+          value={relationsExecutor}
+          onchange={(e) => setRelationsExecutor(e.currentTarget.value)}
+        >
+          <option value="">{t("ai.exec.follow")}</option>
+          {@render executorOptions(true)}
+        </select>
+      </div>
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("ai.relations.label")}</span>
@@ -1112,6 +1378,10 @@
     gap: 0.4rem;
   }
   /* 徽章:soft 底 + 中性文字色,micro 字级(尺寸沿用说话人徽章的形态,颜色改中性/warning 语义) */
+  /* 控制类工具在「允许控制」关闭时整行置灰:状态用视觉表达,不用术语徽章。 */
+  .row.dimmed {
+    opacity: 0.45;
+  }
   .pill {
     flex: none;
     font-size: 0.78rem;
@@ -1189,14 +1459,88 @@
     gap: 0.7rem;
     padding: 0.8rem 1rem 0.9rem;
   }
-  /* 一键填充按钮簇(settings-row 右侧,窄窗随 .row 换行整体落下一行,右对齐) */
-  .preset-btns {
+  /* 服务商 tab 条:横贯配置区,底部 hairline,选中页 accent 下划线——
+     「下方表单属于哪家」一目了然;各页草稿独立,切换不丢。 */
+  .provider-tabs {
     display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 0.45rem;
+    align-items: stretch;
+    gap: 1.15rem;
+    border-bottom: 1px solid var(--hairline-strong);
     flex-wrap: wrap;
+  }
+  .ptab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border: none;
+    background: none;
+    padding: 0.45em 0.15em;
+    margin-bottom: -1px; /* 下划线压住 tab 条 hairline */
+    font-size: 0.88rem;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .ptab:hover {
+    color: var(--ink);
+  }
+  .ptab.active {
+    color: var(--ink);
+    border-bottom-color: var(--accent);
+  }
+  /* 已存密钥标记:小绿点 */
+  .chip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-full);
+    background: var(--success, var(--accent));
+    flex: none;
+  }
+  /* 新建模板芯片:幽灵态(虚线胶囊)与真实档案 tab(下划线)可一眼区分 */
+  .tpl-chip {
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    border: 1px dashed var(--hairline-strong);
+    border-radius: var(--radius-full);
+    background: none;
+    padding: 0.18em 0.7em;
+    font-size: 0.8rem;
+    color: var(--ink-faint, var(--ink-secondary));
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .tpl-chip:hover {
+    color: var(--ink);
+    border-color: var(--ink-secondary);
+  }
+  /* 执行体选择器:与 row-input 同语言的原生 select */
+  .row-select {
+    flex: none;
+    max-width: 16rem;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    padding: 0.4em 0.6em;
+    font-size: 0.88rem;
+  }
+  .row-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  /* 资源区行尾的按钮组(删除+测试并排) */
+  .row-actions {
+    display: flex;
+    gap: 0.45rem;
     margin-left: auto;
+  }
+  .btn-secondary.danger {
+    color: var(--danger-ink);
+    border-color: var(--danger-ink);
   }
   .config-hint {
     font-size: 0.8rem;
@@ -1206,63 +1550,6 @@
   .test-result { font-size: 0.85rem; margin: 0.4rem 0 0.2rem; }
   .test-result.ok { color: var(--success, var(--ink-secondary)); }
   .test-result.err { color: var(--danger-ink); }
-  /* 分段单选(与设置页 .seg 同一控件语言);margin-left:auto 保证窄窗换行后仍右对齐 */
-  .seg {
-    display: flex;
-    gap: 2px;
-    flex: none;
-    margin-left: auto;
-    background: var(--surface-press);
-    border-radius: var(--radius-md);
-    padding: 2px;
-  }
-  .seg-item {
-    position: relative;
-    padding: 0.26em 0.7em;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    border-radius: calc(var(--radius-md) - 2px);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .seg-item:hover {
-    color: var(--ink);
-  }
-  .seg-item:has(input:checked) {
-    background: var(--canvas);
-    color: var(--ink);
-    box-shadow: var(--shadow-btn);
-  }
-  .seg-item input {
-    position: absolute;
-    opacity: 0;
-    pointer-events: none;
-  }
-  /* 行内输入(settings-row 右侧控件版 input:surface-press 底、无边,聚焦浮出 canvas + accent 环) */
-  .row-input {
-    flex: none;
-    width: 11rem;
-    margin-left: auto;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .row-input.wide {
-    width: 18rem;
-  }
-  .row-input:focus {
-    outline: none;
-    background: var(--canvas);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .row-input::placeholder {
-    color: var(--ink-faint);
-  }
   .desc-warn {
     color: var(--warning-ink);
   }

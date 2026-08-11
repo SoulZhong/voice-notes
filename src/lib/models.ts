@@ -17,6 +17,22 @@ export type ModelsStatus = {
   /** 模型存储目录(设置页展示,点击经 open_models_dir 在文件管理器中打开)。 */
   root: string;
 };
+/** 在线模型档案(资源层)。id 稳定,label 用户可改;api_key 明文存本机。 */
+export type LlmProfile = {
+  id: string;
+  label: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+};
+
+/** 本机 Agent 档案:kind ∈ claude|codex|gemini|cursor;bin 空 = 自动探测。 */
+export type AgentProfile = {
+  kind: string;
+  bin: string;
+  model: string;
+};
+
 export type Settings = {
   mirror_enabled: boolean;
   data_dir?: string | null;
@@ -24,6 +40,8 @@ export type Settings = {
   asr_model: string;
   /** sherpa 推理 provider 覆盖(实验字段,无 UI,手改 settings.json;空 = CPU)。 */
   asr_provider: string;
+  /** 热词词表(逗号/换行分隔;仅 Qwen3 引擎消费,声纹人名由后端自动并入)。 */
+  asr_hotwords: string;
   /** 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(后端 set_settings 拦截)。 */
   asr_mode: string;
   /** 云端厂商:"volcano" / "aliyun"。 */
@@ -56,20 +74,14 @@ export type Settings = {
   tray_enabled: boolean;
   // ASR Aing 开关
   refine_enabled: boolean;
-  // Aing 执行体:"openai"(HTTP 接口)| "agent"(本机 Agent CLI 经 MCP 读写回)
-  refine_provider: string;
-  // provider=agent 时用哪家 CLI:"claude" | "codex" | "gemini" | "cursor"
-  refine_agent: string;
-  // Agent CLI 可执行文件路径覆盖;空 = 自动探测
-  refine_agent_bin: string;
-  // Agent 模型名(--model);空 = CLI 默认
-  refine_agent_model: string;
-  // ASR Aing 服务基础 URL
-  refine_base_url: string;
-  // ASR Aing LLM 模型
-  refine_model: string;
-  // ASR Aing API 密钥
-  refine_api_key: string;
+  /** 资源层:在线模型档案(2026-08-11 执行体分层),可被多个 AI 功能引用。 */
+  llm_profiles: LlmProfile[];
+  /** 资源层:本机 Agent 档案,kind 即身份,至多一条/种。 */
+  agent_profiles: AgentProfile[];
+  /** 功能层:AI 整理执行体引用。"llm:<profile_id>" | "agent:<kind>" | ""。 */
+  refine_executor: string;
+  /** 功能层:关系分析执行体;空 = 跟随 refine_executor。 */
+  relations_executor: string;
   // 首启引导已完成(欢迎层走完或模型已就绪时静默补 true)
   onboarded: boolean;
   // 已完成的功能引导 ID；每项功能独立记录，新增功能不能复用 onboarded 判断

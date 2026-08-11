@@ -11,9 +11,9 @@ pub mod asr;
 mod ipc;
 pub mod models;
 mod session;
-mod settings;
+pub mod settings;
 mod shortcuts;
-mod store;
+pub mod store;
 mod i18n;
 mod player;
 mod player_align;
@@ -23,7 +23,7 @@ mod update;
 pub mod diar;
 mod ailog;
 mod refine;
-mod retranscribe;
+pub mod retranscribe;
 mod graph;
 pub mod mcp;
 mod telemetry;
@@ -121,6 +121,10 @@ struct AppState {
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    /// 录制中发生过声纹人名变更(Qwen3 热词已过期):停录归还识别器时消费,
+    /// 丢弃归还件交预载重建。录制外的变更直接清槽,不经此标记
+    /// (见 refresh_qwen_hotwords_cache)。
+    hotwords_dirty: Arc<AtomicBool>,
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
@@ -159,6 +163,7 @@ impl Default for AppState {
             session: Arc::new(Mutex::new(None)),
             recognizer_cache: Arc::new(Mutex::new(None)),
             embedder_cache: Arc::new(Mutex::new(None)),
+            hotwords_dirty: Arc::new(AtomicBool::new(false)),
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
@@ -259,22 +264,37 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
-/// HTTP(OpenAI 兼容)Aing 配置是否齐备（开关开、provider 非 agent、三项均非空）：
-/// 抽成纯函数供 spawn_refine 判定与单测，避免把「要不要发起网络请求」这条判断逻辑
-/// 埋进整个后台线程闭包里难以单独验证。provider 值未知(手改 settings.json)时按
-/// openai 对待——那是默认执行体,坏值不该让 Aing 整个哑掉。
-fn refine_llm_ready(s: &settings::Settings) -> bool {
-    s.refine_enabled
-        && s.refine_provider != "agent"
-        && !s.refine_base_url.is_empty()
-        && !s.refine_model.is_empty()
-        && !s.refine_api_key.is_empty()
+/// Aing 生效执行体(2026-08-11 执行体分层):功能开关 + 引用解析 + HTTP 就绪门,
+/// None = 关闭/未配置/引用悬空/HTTP 缺项。HTTP 缺项不回落 Agent——用户显式选了
+/// 哪个执行体就用哪个,缺项即未就绪(与旧世界 provider 二选一语义等价)。
+/// Agent 引用即尝试,bin 探测留运行时(探测结果随装/卸 CLI 变化,不静态判定)。
+fn active_refine_executor(s: &settings::Settings) -> Option<settings::ResolvedExecutor> {
+    if !s.refine_enabled {
+        return None;
+    }
+    if !settings::executor_ready(s, settings::AiFeature::Refine) {
+        return None;
+    }
+    settings::resolve_executor(s, settings::AiFeature::Refine)
 }
 
-/// Agent(本机 CLI 经 MCP 读写回)Aing 是否应当尝试。bin 探测留到运行时——探测结果
-/// 随用户装/卸 CLI 变化,不该在这里静态判定;解析失败由 agent 分支落 failed 并留日志。
+/// 旧判定的等价薄壳(标题生成等多处调用点沿用其名义语义)。
+fn refine_llm_ready(s: &settings::Settings) -> bool {
+    matches!(active_refine_executor(s), Some(settings::ResolvedExecutor::Http { .. }))
+}
+
 fn refine_agent_ready(s: &settings::Settings) -> bool {
-    s.refine_enabled && s.refine_provider == "agent"
+    matches!(active_refine_executor(s), Some(settings::ResolvedExecutor::Agent { .. }))
+}
+
+/// 遥测分类的适配(classify 的旧签名是 provider+base_url 字符串对)。
+fn telemetry_provider(e: &settings::ResolvedExecutor) -> telemetry::Provider {
+    match e {
+        settings::ResolvedExecutor::Agent { .. } => telemetry::Provider::classify("agent", ""),
+        settings::ResolvedExecutor::Http { base_url, .. } => {
+            telemetry::Provider::classify("openai", base_url)
+        }
+    }
 }
 
 /// HTTP Aing 的提交→索引交接边界：note 写失败时绝不请求 rebuild；note 已写成功而
@@ -388,6 +408,67 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
+                // local_cloud 云端二遍:读 note 之前先用云端批式对整场重转写(实时
+                // 本地快稿 + Aing 前云端精修覆盖 segments,2026-08-11 用户拍板)。
+                // 放在 AING_GATE 内、refine 读盘之前:与本 worker 天然串行,后续
+                // filter/recluster 读到的就是二遍后的文本;NoteLock 在
+                // run_retranscribe_once 内取放,与 run_local 的取锁先后互不重叠。
+                // 仅首次停录自动路径(enqueue_transcode_after_local)做——手动重跑
+                // Aing 时 segments 可能已被用户编辑,悄悄重转写会冲掉人工修订。
+                // 任何失败只降级保留实时稿,绝不挡 Aing;续录已重开则跳过(与转码
+                // 入队的 F1 守卫同因:音频正被追加写)。
+                if enqueue_transcode_after_local {
+                    let s2 = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+                    // 续录判别(codex 2026-08-11 P1):enqueue_transcode_after_local 在
+                    // 「续录后再次停止」时同样为 true,而重转写会整篇覆盖 segments,冲掉
+                    // 用户在续录前做过的文字编辑。判据用盘上 refined.json 的在场性:
+                    // 每次停录的自动 Aing 都会写它,故「已有 refined.json」⇔ 本篇经历过
+                    // 至少一次完整停录 ⇔ 这是续录收尾;首次停录时它必然还不存在
+                    // (云端二遍先于本轮 refine 读盘执行)。录制期间持 NoteLock,编辑
+                    // 不可能发生在首次停录完成之前,所以首停做二遍恒安全。
+                    let resumed_note = notes_dir(&app)
+                        .ok()
+                        .map(|root| store::load_refined(&root.join(&note_id)).is_some())
+                        .unwrap_or(true); // 判别不了按"续录"保守处理:宁可不精修,不冒覆盖编辑的险
+                    if settings::cloud_second_pass_wanted(&s2) {
+                        if resumed_note {
+                            eprintln!("refine({note_id}): 本篇已有历史停录(或判别失败),跳过云端二遍以保护既有编辑");
+                        } else if is_resumed_by_active_session(&note_id) {
+                            eprintln!("refine({note_id}): 续录已重开,跳过云端二遍");
+                        } else {
+                            report("cloud_pass", "running");
+                            // 停录收尾的 writer 锁在 spawn_refine 返回后才释放,与本
+                            // worker 存在毫秒级竞窗;NoteLock 自身只重试 ~100ms,不够
+                            // 覆盖调度抖动(codex P2)——这里再包一层有界重试(~3s),
+                            // 「笔记正被占用」以外的错误立刻放弃不重试。
+                            let mut outcome = Err(String::new());
+                            for attempt in 0..10 {
+                                // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
+                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, &mut |_| {});
+                                match &outcome {
+                                    Err(e) if e.contains("正被占用") || e.contains("busy") => {
+                                        if attempt < 9 {
+                                            std::thread::sleep(std::time::Duration::from_millis(300));
+                                            continue;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            match outcome {
+                                Ok(sum) => {
+                                    eprintln!("云端二遍完成({note_id}): {sum:?}");
+                                    report("cloud_pass", "ok");
+                                }
+                                Err(e) => {
+                                    eprintln!("云端二遍失败({note_id}),保留实时稿: {e}");
+                                    report("cloud_pass", "failed");
+                                }
+                            }
+                        }
+                    }
+                }
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
@@ -437,16 +518,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     eprintln!("calendar({note_id}): 匹配失败(不影响笔记): {e}");
                 }
                 let mut http_refine_handled = false;
-                if refine_agent_ready(&s) {
+                let refine_exec = active_refine_executor(&s);
+                if let Some(settings::ResolvedExecutor::Agent { kind, bin, model }) = &refine_exec {
                     telemetry::track(
                         &app,
-                        telemetry::Event::NoteRefined {
-                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
-                        },
+                        telemetry::Event::NoteRefined { provider: telemetry_provider(refine_exec.as_ref().unwrap()) },
                     );
                     report("llm", "running");
-                    let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
-                        .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
+                    let resolved = refine::agent::AgentKind::from_key(kind)
+                        .and_then(|k| refine::agent::resolve_bin(k, bin).map(|b| (k, b)));
                     match resolved {
                         Some((kind, bin)) => {
                             if let Err(e) = refine::agent::run_refine(
@@ -454,7 +534,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 &note_id,
                                 kind,
                                 &bin,
-                                &s.refine_agent_model,
+                                model,
                                 log_ctx.as_ref(),
                             ) {
                                 eprintln!("refine: agent Aing 失败: {e}");
@@ -466,8 +546,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             }
                         }
                         None => eprintln!(
-                            "refine: 未找到 {} 的 CLI(可在 AI 页指定可执行文件路径),Agent Aing 跳过",
-                            s.refine_agent
+                            "refine: 未找到 {kind} 的 CLI(可在 AI 页指定可执行文件路径),Agent Aing 跳过"
                         ),
                     }
                     // 与 run_llm 的 F4 同一语义:本轮没落成 done 就是 failed,盘上与
@@ -478,25 +557,23 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             eprintln!("refine: agent 失败态落盘失败: {e}");
                         }
                     }
-                } else if refine_llm_ready(&s) {
+                } else if let Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) = &refine_exec {
                     http_refine_handled = true;
                     telemetry::track(
                         &app,
-                        telemetry::Event::NoteRefined {
-                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
-                        },
+                        telemetry::Event::NoteRefined { provider: telemetry_provider(refine_exec.as_ref().unwrap()) },
                     );
                     report("llm", "running");
                     let cfg = refine::llm::LlmConfig {
-                        base_url: s.refine_base_url.clone(),
-                        model: s.refine_model.clone(),
-                        api_key: s.refine_api_key.clone(),
+                        base_url: base_url.clone(),
+                        model: model.clone(),
+                        api_key: api_key.clone(),
                     };
                     let write_result = refine::run_llm(
                         &dir,
                         &mut doc,
                         &cfg,
-                        &s.refine_model,
+                        model,
                         log_ctx.as_ref(),
                     );
                     if let Err(error) = handoff_http_refine_write(write_result, || {
@@ -603,31 +680,32 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // LLM Aing 阶段成功(标题是独立的小调用,Aing 分块失败不代表标题也会
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
-                if (refine_agent_ready(&s) || refine_llm_ready(&s))
-                    && store::writer::is_default_title(&note.meta.title)
-                {
+                if refine_exec.is_some() && store::writer::is_default_title(&note.meta.title) {
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
-                    let title = if refine_agent_ready(&s) {
-                        refine::agent::AgentKind::from_key(&s.refine_agent)
-                            .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)))
-                            .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
-                            .and_then(|(kind, bin)| {
-                                refine::agent::gen_title(
-                                    kind,
-                                    &bin,
-                                    &s.refine_agent_model,
-                                    &doc.paragraphs,
-                                    log_ctx.as_ref(),
-                                )
-                            })
-                    } else {
-                        let cfg = refine::llm::LlmConfig {
-                            base_url: s.refine_base_url.clone(),
-                            model: s.refine_model.clone(),
-                            api_key: s.refine_api_key.clone(),
-                        };
-                        refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
+                    let title = match refine_exec.as_ref().unwrap() {
+                        settings::ResolvedExecutor::Agent { kind, bin, model } => {
+                            refine::agent::AgentKind::from_key(kind)
+                                .and_then(|k| refine::agent::resolve_bin(k, bin).map(|b| (k, b)))
+                                .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
+                                .and_then(|(kind, bin)| {
+                                    refine::agent::gen_title(
+                                        kind,
+                                        &bin,
+                                        model,
+                                        &doc.paragraphs,
+                                        log_ctx.as_ref(),
+                                    )
+                                })
+                        }
+                        settings::ResolvedExecutor::Http { base_url, model, api_key } => {
+                            let cfg = refine::llm::LlmConfig {
+                                base_url: base_url.clone(),
+                                model: model.clone(),
+                                api_key: api_key.clone(),
+                            };
+                            refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
+                        }
                     };
                     match title {
                         Ok(title) => {
@@ -691,36 +769,108 @@ impl Drop for ResetOnDrop {
     }
 }
 
-fn sense_voice_dir() -> PathBuf {
-    models::root().join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
-}
-
-fn whisper_dir() -> PathBuf {
-    models::root().join("sherpa-onnx-whisper-base")
-}
-
-fn paraformer_dir() -> PathBuf {
-    models::root().join(models::PF_DIR)
-}
-
-fn qwen3_dir() -> PathBuf {
-    models::root().join(models::QWEN3_DIR)
-}
-
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
-/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。
+/// 槽空兜底都经此，杜绝两处各写一份 new 而漏掉某一选型。pub:asr_bench 评测工具
+/// 复用同一实例化点(bin 是独立 crate,pub(crate) 不够)。
 /// provider 经 settings.asr_provider 覆盖(实验字段,默认 None = CPU)。
-fn new_recognizer(asr_model: &str, provider: Option<String>) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+/// hotwords 仅 Qwen3 消费(prompt 注入偏置),其余引擎无解码级热词入口,忽略。
+pub fn new_recognizer(
+    asr_model: &str,
+    provider: Option<String>,
+    hotwords: Option<String>,
+) -> anyhow::Result<Box<dyn asr::Recognizer>> {
+    let dir = models::asr_model_dir(asr_model);
     if asr_model == settings::ASR_WHISPER {
-        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&whisper_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::whisper::WhisperRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_PARAFORMER {
-        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&paraformer_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_QWEN3 {
-        // 热词暂传 None:等术语库(改进计划 Phase 5)落地后从设置注入。
-        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&qwen3_dir(), provider, None)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&dir, provider, hotwords)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_FIRERED {
+        Ok(Box::new(asr::fire_red::FireRedRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else {
-        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&sense_voice_dir(), provider)?) as Box<dyn asr::Recognizer>)
+        Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     }
+}
+
+/// 热词词表上限。词表越大,偏置越被稀释,且空/静音段的幻觉风险越高
+/// (sherpa-onnx #3509:热词会被整句吐出);上限内先收用户手填词,再收声纹人名。
+const HOTWORDS_MAX: usize = 100;
+
+/// 合并热词词表(纯逻辑):用户手填(逗号/中文逗号/顿号/分号/换行分隔)优先,
+/// 其后并入声纹库人名;去重保序,超上限截断;空集 → None(引擎不启用偏置)。
+fn merge_hotwords<I: IntoIterator<Item = String>>(user: &str, names: I) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let user_words = user.split([',', '，', '、', ';', '；', '\n']).map(str::to_string);
+    for w in user_words.chain(names) {
+        let w = w.trim();
+        if !w.is_empty() && words.len() < HOTWORDS_MAX && seen.insert(w.to_string()) {
+            words.push(w.to_string());
+        }
+    }
+    if words.is_empty() { None } else { Some(words.join(",")) }
+}
+
+#[cfg(test)]
+mod hotwords_tests {
+    use super::{merge_hotwords, HOTWORDS_MAX};
+
+    #[test]
+    fn merge_splits_dedupes_and_keeps_user_words_first() {
+        let names = vec!["张伟".to_string(), " ".to_string(), "Alice".to_string()];
+        let got = merge_hotwords("DashScope，语音笔记、Alice\n张伟;  ", names);
+        // 用户词序在前;名单里的重复(Alice/张伟)与空白被去掉。
+        assert_eq!(got.as_deref(), Some("DashScope,语音笔记,Alice,张伟"));
+    }
+
+    #[test]
+    fn merge_empty_everything_is_none() {
+        assert_eq!(merge_hotwords("", Vec::new()), None);
+        assert_eq!(merge_hotwords(" ,，、\n ", vec!["".into(), "  ".into()]), None);
+    }
+
+    #[test]
+    fn merge_caps_at_limit_user_words_win() {
+        let user = (0..HOTWORDS_MAX).map(|i| format!("u{i}")).collect::<Vec<_>>().join(",");
+        let got = merge_hotwords(&user, vec!["溢出词".to_string()]).unwrap();
+        let words: Vec<&str> = got.split(',').collect();
+        assert_eq!(words.len(), HOTWORDS_MAX);
+        assert!(!words.contains(&"溢出词"), "超上限后声纹人名不再挤入");
+        assert_eq!(words[0], "u0");
+    }
+}
+
+/// 当前设置与声纹库拼出的 Qwen3 热词。设置读取失败/声纹库缺失都只降级为少词,
+/// 绝不挡识别器装配。非 Qwen3 引擎调用方也可无脑传入(new_recognizer 会忽略)。
+fn qwen3_hotwords(app: &AppHandle) -> Option<String> {
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    let names: Vec<String> = data_root(app)
+        .map(|root| {
+            let vp = store::VoiceprintStore::new(root).load();
+            vp.people.values().map(|p| p.name.clone()).collect()
+        })
+        .unwrap_or_default();
+    merge_hotwords(&s.asr_hotwords, names)
+}
+
+/// 声纹人名变更(改名/合并/删除/撤销合并)后失效常驻识别器:Qwen3 热词在识别器
+/// 构造时快照声纹人名,常驻缓存跨场复用会让变更后仍偏置旧名直到重启或无关设置
+/// 变更(codex 2026-08-11 P2)。仅 Qwen3 吃热词,其余引擎清槽纯属白重载几 GB
+/// 模型,按当前选型门控。录制中(仅改名可达,合并/删除录制中被拒)清槽/预载都
+/// 无效——识别器已被本场取走,preload 会跳过,停录 stash 又把旧热词件还回来;
+/// 改置脏标记,由停录归还处丢弃重载(本场热词开录已定型,无法热更)。
+fn refresh_qwen_hotwords_cache(app: &AppHandle) {
+    if current_asr(app) != settings::ASR_QWEN3 {
+        return;
+    }
+    let state = app.state::<AppState>();
+    if state.session.lock().unwrap().is_some() {
+        state.hotwords_dirty.store(true, Ordering::Relaxed);
+        return;
+    }
+    *state.recognizer_cache.lock().unwrap() = None;
+    preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
 
 /// 云端识别器唯一实例化点(对称 new_recognizer):按 provider 造火山/阿里适配器。
@@ -1052,7 +1202,7 @@ fn spawn_session(
             let taken = recognizer_cache.lock().unwrap().take();
             Some(match taken {
                 Some(r) => r,
-                None => match new_recognizer(&current_asr(&app), current_asr_provider(&app)) {
+                None => match new_recognizer(&current_asr(&app), current_asr_provider(&app), qwen3_hotwords(&app)) {
                     Ok(r) => r,
                     Err(e) => {
                         return fail(&app, &running, &generation, my_gen, format!("error: {e}"))
@@ -2026,6 +2176,11 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
     stash_model(&state.embedder_cache, embedder);
+    // 本场录制中发生过声纹改名:归还件的 Qwen3 热词已过期,丢弃,停录收尾的
+    // preload 会按新名单重建(见 refresh_qwen_hotwords_cache 的脏标记分支)。
+    if state.hotwords_dirty.swap(false, Ordering::Relaxed) {
+        *state.recognizer_cache.lock().unwrap() = None;
+    }
     // 分段 worker 已 join → audio sink 已 drop → 写盘线程排干后自退,join 保证
     // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
     for j in s.audio_joins {
@@ -2365,6 +2520,58 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
 /// 那两槽是录制会话的常驻资源,重转写是离线一次性任务,混用会让二者互相饿死对方)。
 /// 事件不经 lifecycle actor 直发(见 ipc::RetranscribeEvent 注释):重转写与录制会话
 /// 全局互斥,不存在与管线事件的排序耦合,直发省一层转发不丢语义。
+/// 一次离线重转写的公共装配:目录 → NoteLock → 识别器 → 嵌入器 → 种子 → 输入 → run。
+/// spawn_retranscribe(手动/UI)与 Aing 前置云端二遍(spawn_refine,local_cloud)共用,
+/// 不各配一份漂移。识别器按设置决策:local_cloud 且凭证齐 → 云端批式(手动重转写
+/// 与自动二遍同引擎,结果口径一致);否则本地引擎(不碰常驻 recognizer_cache 槽——
+/// 那是录制会话的常驻资源,离线任务混用会互相饿死对方)。
+fn run_retranscribe_once(
+    app: &tauri::AppHandle,
+    note_id: &str,
+    mixed: bool,
+    language_filter: bool,
+    strict: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<retranscribe::Summary, String> {
+    let dir = notes_dir(app).map_err(|e| e.to_string())?.join(note_id);
+    // NoteLock 在本函数内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
+    // 文案不写"或转码中":转码走队列不持 NoteLock,与此锁失败的实际成因无关
+    // (会撞这把锁的只有录制/编辑写手柄);写成"转码中"是与事实不符的误导。
+    let lock = store::notelock::NoteLock::acquire(&dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| tr!(
+            "笔记正被占用(录制/编辑中),稍后再试",
+            "The note is busy (recording or being edited); try again later"
+        ))?;
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    let mut recognizer: Box<dyn asr::Recognizer> = if settings::cloud_second_pass_wanted(&s) {
+        let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        Box::new(asr::cloud::BatchRecognizer::new(cloud))
+    } else {
+        new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
+            .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?
+    };
+    let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
+        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+            Ok(e) => Some(Box::new(e)),
+            Err(e) => {
+                eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
+                None
+            }
+        };
+    let seeds = load_voiceprint_seeds(app);
+    let vad_path = models::root().join("silero_vad.onnx");
+    let factory: retranscribe::input::SegmenterFactory = Box::new(move || new_silero(&vad_path));
+    let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
+        Box::new(retranscribe::input::MixedInput::new(dir.clone(), factory))
+    } else {
+        Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
+    };
+    retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
+        &mut embedder, seeds, mixed, language_filter, strict, progress)
+        .map_err(|e| e.to_string())
+}
+
 fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
     let slot = app.state::<AppState>().retranscribing.clone();
     let last = app.state::<AppState>().retranscribe_last.clone();
@@ -2387,37 +2594,6 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
         };
         emit("all", "running", None, None);
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<retranscribe::Summary, String> {
-            let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
-            // NoteLock 在 worker 内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
-            // 文案不写"或转码中":转码走队列不持 NoteLock,与此锁失败的实际成因无关
-            // (会撞这把锁的只有录制/编辑写手柄);写成"转码中"是与事实不符的误导。
-            let lock = store::notelock::NoteLock::acquire(&dir)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| tr!(
-                    "笔记正被占用(录制/编辑中),稍后再试",
-                    "The note is busy (recording or being edited); try again later"
-                ))?;
-            // 独立识别器实例:不碰常驻 recognizer_cache 槽(那是录制会话的);
-            // 恒用本地识别器,云端协议是录制期流式,不适配离线整轨(spec 已知限制 5)。
-            let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app))
-                .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?;
-            let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
-                match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
-                    Ok(e) => Some(Box::new(e)),
-                    Err(e) => {
-                        eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
-                        None
-                    }
-                };
-            let seeds = load_voiceprint_seeds(&app);
-            let vad_path = models::root().join("silero_vad.onnx");
-            let factory: retranscribe::input::SegmenterFactory =
-                Box::new(move || new_silero(&vad_path));
-            let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
-                Box::new(retranscribe::input::MixedInput::new(dir.clone(), factory))
-            } else {
-                Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
-            };
             let slot2 = slot.clone();
             let note_id2 = note_id.clone();
             let app2 = app.clone();
@@ -2432,9 +2608,8 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                     message: None, summary: None,
                 });
             };
-            retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
-                &mut embedder, seeds, mixed, language_filter, &mut progress)
-                .map_err(|e| e.to_string())
+            // 手动路径宽容(strict=false):失败段落占位,用户看 summary 自行决定。
+            run_retranscribe_once(&app, &note_id, mixed, language_filter, false, &mut progress)
         }));
         match body {
             Ok(Ok(summary)) => {
@@ -2703,12 +2878,19 @@ fn ensure_requested_backfill_provider(
     request: &ipc::BackfillRequest,
     settings: &settings::Settings,
 ) -> Result<(), String> {
-    if request.provider != settings.refine_provider {
+    // 对账词表沿用旧的 "openai"/"agent"(preview.provider 同源):按当前关系执行体
+    // 的解析结果推导,请求与现状不一致即拒(用户在 preview 后改了执行体的 TOCTOU 守卫)。
+    let current = match settings::resolve_executor(settings, settings::AiFeature::Relations) {
+        Some(settings::ResolvedExecutor::Http { .. }) => "openai",
+        Some(settings::ResolvedExecutor::Agent { .. }) => "agent",
+        None => "",
+    };
+    if request.provider != current {
         return Err(tr!(
             "补建 provider 与当前配置不一致:请求 {requested},当前 {current}",
             "Backfill provider does not match the current configuration: requested {requested}, current {current}",
             requested = request.provider,
-            current = settings.refine_provider
+            current = current
         ));
     }
     Ok(())
@@ -2717,32 +2899,23 @@ fn ensure_requested_backfill_provider(
 fn relation_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::backfill::RelationExecutor>> {
-    match settings.refine_provider.as_str() {
-        "openai" => Ok(Box::new(refine::llm::HttpRelationExecutor::new(
-            refine::llm::LlmConfig {
-                base_url: settings.refine_base_url.clone(),
-                model: settings.refine_model.clone(),
-                api_key: settings.refine_api_key.clone(),
-            },
-        )?)),
-        "agent" => {
-            let kind = refine::agent::AgentKind::from_key(&settings.refine_agent)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(tr!(
-                        "未知 Agent: {agent}",
-                        "Unknown agent: {agent}",
-                        agent = settings.refine_agent
-                    ))
-                })?;
-            Ok(Box::new(refine::agent::AgentRelationExecutor::new(
-                kind,
-                &settings.refine_agent_bin,
-                &settings.refine_agent_model,
-            )?))
+    match settings::resolve_executor(settings, settings::AiFeature::Relations) {
+        Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) => {
+            Ok(Box::new(refine::llm::HttpRelationExecutor::new(refine::llm::LlmConfig {
+                base_url,
+                model,
+                api_key,
+            })?))
         }
-        provider => anyhow::bail!(tr!(
-            "未知关系补建 provider: {provider}",
-            "Unknown relation backfill provider: {provider}"
+        Some(settings::ResolvedExecutor::Agent { kind, bin, model }) => {
+            let k = refine::agent::AgentKind::from_key(&kind).ok_or_else(|| {
+                anyhow::anyhow!(tr!("未知 Agent: {agent}", "Unknown agent: {agent}", agent = kind))
+            })?;
+            Ok(Box::new(refine::agent::AgentRelationExecutor::new(k, &bin, &model)?))
+        }
+        None => anyhow::bail!(tr!(
+            "关系分析执行体未配置(在 AI 页选择执行体)",
+            "Relation analysis executor is not configured (choose one on the AI page)"
         )),
     }
 }
@@ -2755,30 +2928,25 @@ fn identify_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
     anyhow::ensure!(settings.refine_enabled, "identify 需要已启用精修");
-    if settings.refine_provider == "agent" {
-        let kind = refine::agent::AgentKind::from_key(&settings.refine_agent).ok_or_else(|| {
-            anyhow::anyhow!(tr!(
-                "未知 Agent: {agent}",
-                "Unknown agent: {agent}",
-                agent = settings.refine_agent
-            ))
-        })?;
-        return Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(
-            kind,
-            &settings.refine_agent_bin,
-            &settings.refine_agent_model,
-        )?));
+    match settings::resolve_executor(settings, settings::AiFeature::Refine) {
+        Some(settings::ResolvedExecutor::Agent { kind, bin, model }) => {
+            let k = refine::agent::AgentKind::from_key(&kind).ok_or_else(|| {
+                anyhow::anyhow!(tr!("未知 Agent: {agent}", "Unknown agent: {agent}", agent = kind))
+            })?;
+            Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(k, &bin, &model)?))
+        }
+        Some(settings::ResolvedExecutor::Http { .. }) if !refine_llm_ready(settings) => {
+            anyhow::bail!("identify 需要配置齐全的 HTTP 精修")
+        }
+        Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) => {
+            Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(refine::llm::LlmConfig {
+                base_url,
+                model,
+                api_key,
+            })?))
+        }
+        None => anyhow::bail!("identify 需要已配置的 AI 执行体"),
     }
-    if !refine_llm_ready(settings) {
-        anyhow::bail!("identify 需要配置齐全的 HTTP 精修");
-    }
-    Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
-        refine::llm::LlmConfig {
-            base_url: settings.refine_base_url.clone(),
-            model: settings.refine_model.clone(),
-            api_key: settings.refine_api_key.clone(),
-        },
-    )?))
 }
 
 fn spawn_relation_backfill_worker<Spawn, Worker, EmitFailure>(
@@ -3009,6 +3177,7 @@ fn rename_refined_speaker(
         if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
             match vp_store.rename(&resolved, name) {
                 Ok(()) => {
+                    refresh_qwen_hotwords_cache(&app);
                     queue_person_graph_rebuild(&app, graph_root, &tr!("人物改名", "Person rename"))?
                 }
                 Err(e) => eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}"),
@@ -3641,9 +3810,16 @@ fn rename_entity_with_rebuild(
 #[tauri::command]
 fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
-    rename_entity_with_rebuild(root, id, new_name, |root| {
+    let is_person = !id.starts_with("e:");
+    let result = rename_entity_with_rebuild(root, id, new_name, |root| {
         queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
-    })
+    });
+    // 人实体改名落进声纹库,刷新 Qwen 热词缓存。放在 ? 之前:重建排队失败时改名
+    // 可能已落库(rebuild 是 rename 之后的独立一步),宁可多刷一次不可漏刷。
+    if is_person {
+        refresh_qwen_hotwords_cache(&app);
+    }
+    result
 }
 
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
@@ -5141,6 +5317,7 @@ fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String>
     store::VoiceprintStore::new(root.clone())
         .rename(&id, name)
         .map_err(|e| e.to_string())?;
+    refresh_qwen_hotwords_cache(&app);
     queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
 }
 
@@ -5292,6 +5469,7 @@ async fn merge_person(
             return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
         }
         let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
+        refresh_qwen_hotwords_cache(&app);
         let root = data_root(&app).map_err(|e| e.to_string())?;
         queue_person_graph_rebuild(&app, root, &tr!("人物合并", "Person merge"))?;
         Ok(journal_id)
@@ -5317,6 +5495,7 @@ async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -
         store::VoiceprintStore::new(root.clone())
             .delete(&id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("人物删除", "Person deletion"))
     })
     .await
@@ -5474,6 +5653,7 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
         store::VoiceprintStore::new(root.clone())
             .undo_merge(&journal_id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
     .await
@@ -5501,6 +5681,7 @@ async fn restore_merged_person(
         let pid = store::VoiceprintStore::new(root.clone())
             .restore_merged_person(&journal_id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)
     })
@@ -5738,7 +5919,7 @@ fn preload_models(
             .unwrap_or(false);
         let mut slot = cache.lock().unwrap();
         if slot.is_none() && !cloud_mode {
-            match new_recognizer(&asr_model, current_asr_provider(&app)) {
+            match new_recognizer(&asr_model, current_asr_provider(&app), qwen3_hotwords(&app)) {
                 Ok(r) => *slot = Some(r),
                 Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
             }
@@ -6119,6 +6300,17 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
             "Cannot switch the recognition model while recording"
         ));
     }
+    // 热词变更(codex 2026-08-11 P2):常驻识别器在预载时已把 hotwords 焊进 prompt,
+    // 只改设置不清缓存的话,下一场录音仍拿旧词表。与 asr_changed 同路径:清槽+重预载。
+    // 录制中同样拒绝——停录 stash 会把持旧词表的会话识别器塞回缓存槽,清槽白清
+    // (前端热词输入本就 recording.isLive 时禁用,这里是后端兜底)。
+    let hotwords_changed = old.asr_hotwords != new_settings.asr_hotwords;
+    if hotwords_changed && *state.running.lock().unwrap() {
+        return Err(tr!(
+            "录制中不能修改热词",
+            "Cannot change hotwords while recording"
+        ));
+    }
     // 识别方式(本地/云端)与云端凭证变更:与 ASR 选型同理,录制中改会让正在跑的会话与
     // 设置对不上(云端流已按旧凭证握手、本地 worker 已持旧识别器),拒绝。凭证也在内:
     // 改 key 不会重开流,却会让下一次重连/补识用上另一套账号,静默分裂到两个厂商账号下。
@@ -6158,7 +6350,7 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
         s.data_dir = data_dir;
         s.models_dir = models_dir;
     }).map_err(|e| e.to_string())?;
-    if asr_changed {
+    if asr_changed || hotwords_changed {
         *state.recognizer_cache.lock().unwrap() = None;
         preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
     } else if mode_changed {
@@ -8193,46 +8385,51 @@ mod tests {
     }
 
     #[test]
-    fn refine_llm_ready_requires_all_four_fields() {
+    fn refine_llm_ready_requires_switch_and_complete_profile() {
         use super::refine_llm_ready;
         let base = crate::settings::Settings::default();
-        assert!(!refine_llm_ready(&base), "默认全空/关闭 → 未就绪");
+        assert!(!refine_llm_ready(&base), "默认未配置/关闭 → 未就绪");
 
         let mut s = base.clone();
-        s.refine_base_url = "https://api.deepseek.com".into();
-        s.refine_model = "deepseek-chat".into();
-        s.refine_api_key = "sk-xxx".into();
-        assert!(!refine_llm_ready(&s), "四项齐全但总开关未开 → 仍未就绪");
+        s.llm_profiles.push(crate::settings::LlmProfile {
+            id: "p1".into(),
+            label: "DeepSeek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-chat".into(),
+            api_key: "sk-xxx".into(),
+        });
+        s.refine_executor = "llm:p1".into();
+        assert!(!refine_llm_ready(&s), "档案齐全但总开关未开 → 仍未就绪");
 
         s.refine_enabled = true;
-        assert!(refine_llm_ready(&s), "开关开且四项齐全 → 就绪");
+        assert!(refine_llm_ready(&s), "开关开且档案三项齐全 → 就绪");
 
         for field in ["base_url", "model", "api_key"] {
             let mut s2 = s.clone();
             match field {
-                "base_url" => s2.refine_base_url.clear(),
-                "model" => s2.refine_model.clear(),
-                _ => s2.refine_api_key.clear(),
+                "base_url" => s2.llm_profiles[0].base_url.clear(),
+                "model" => s2.llm_profiles[0].model.clear(),
+                _ => s2.llm_profiles[0].api_key.clear(),
             }
             assert!(!refine_llm_ready(&s2), "{field} 为空 → 未就绪");
         }
 
         let mut s3 = s.clone();
-        s3.refine_provider = "agent".into();
-        assert!(!refine_llm_ready(&s3), "provider=agent 时不走 HTTP,即使三项齐全");
-        s3.refine_provider = "bogus".into();
-        assert!(refine_llm_ready(&s3), "未知 provider 按默认 openai 对待,Aing 不哑掉");
+        s3.refine_executor = "agent:claude".into();
+        assert!(!refine_llm_ready(&s3), "执行体是 Agent 时不走 HTTP");
+        s3.refine_executor = "llm:ghost".into();
+        assert!(!refine_llm_ready(&s3), "悬空引用(档案已删)→ 未就绪");
     }
 
     #[test]
-    fn refine_agent_ready_follows_switch_and_provider() {
+    fn refine_agent_ready_follows_switch_and_executor() {
         use super::refine_agent_ready;
         let mut s = crate::settings::Settings::default();
-        assert!(!refine_agent_ready(&s), "默认 provider=openai → 不走 Agent");
-        s.refine_provider = "agent".into();
+        assert!(!refine_agent_ready(&s), "默认未配置 → 不走 Agent");
+        s.refine_executor = "agent:claude".into();
         assert!(!refine_agent_ready(&s), "总开关未开 → 不走");
         s.refine_enabled = true;
-        assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
+        assert!(refine_agent_ready(&s), "开关开 + agent 引用 → 尝试(bin 探测留给运行时)");
     }
 
     // resume_blocked_by_refining_matches_refining_set 已随 Aing 集入内核而删除:
