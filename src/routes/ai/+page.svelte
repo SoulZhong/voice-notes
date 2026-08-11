@@ -116,9 +116,12 @@
       });
     }
     if (additions.length) {
-      await saveSetting((fresh) => {
+      const ok = await saveSetting((fresh) => {
         fresh.llm_profiles.push(...additions);
       });
+      // 保存失败不清草稿(codex 2026-08-11 P1):草稿是这些 key 的唯一副本,
+      // 落盘未确认就删等于丢密钥;下次进页会带着草稿重试。
+      if (!ok) return;
     }
     try {
       localStorage.removeItem(REFINE_DRAFTS_KEY);
@@ -417,19 +420,32 @@
     refineAgentModel = ap?.model ?? "";
   }
 
-  // —— 通用「取新鲜值→改→存」保存(精简自设置页 saveSetting:失败回弹全部镜像) ——
-  async function saveSetting(mut: (s: Settings) => void) {
-    error = "";
-    try {
-      const fresh = await getSettings();
-      mut(fresh);
-      await setSettings(fresh);
-      syncFromSettings(fresh);
-    } catch (e) {
-      error = t("common.saveFailed", { e });
-      const rolled = await getSettings().catch(() => settings);
-      if (rolled) syncFromSettings(rolled);
-    }
+  // —— 通用「取新鲜值→改→存」保存(失败回弹全部镜像)。
+  //    串行化(codex 2026-08-11 P1):blur 保存与紧随其后的执行体切换可能并发,
+  //    两次都读到同一旧快照,后写覆盖先写,静默回退前一处修改——用 promise 链
+  //    排队,后一次保存必然读到前一次落盘后的新鲜值。返回本次保存是否成功,
+  //    供草稿迁移这类"成功才可清理"的调用方判定。 ——
+  let saveChain: Promise<boolean> = Promise.resolve(true);
+  function saveSetting(mut: (s: Settings) => void): Promise<boolean> {
+    const next = saveChain
+      .catch(() => false) // 链上前一次失败不阻断后续保存
+      .then(async () => {
+        error = "";
+        try {
+          const fresh = await getSettings();
+          mut(fresh);
+          await setSettings(fresh);
+          syncFromSettings(fresh);
+          return true;
+        } catch (e) {
+          error = t("common.saveFailed", { e });
+          const rolled = await getSettings().catch(() => settings);
+          if (rolled) syncFromSettings(rolled);
+          return false;
+        }
+      });
+    saveChain = next;
+    return next;
   }
 
   /** Agent 卡:切编辑哪家 CLI(纯 UI 态,不落盘)/字段失焦保存该家档案。 */

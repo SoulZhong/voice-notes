@@ -414,12 +414,44 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 入队的 F1 守卫同因:音频正被追加写)。
                 if enqueue_transcode_after_local {
                     let s2 = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+                    // 续录判别(codex 2026-08-11 P1):enqueue_transcode_after_local 在
+                    // 「续录后再次停止」时同样为 true,而重转写会整篇覆盖 segments,冲掉
+                    // 用户在续录前做过的文字编辑。判据用盘上 refined.json 的在场性:
+                    // 每次停录的自动 Aing 都会写它,故「已有 refined.json」⇔ 本篇经历过
+                    // 至少一次完整停录 ⇔ 这是续录收尾;首次停录时它必然还不存在
+                    // (云端二遍先于本轮 refine 读盘执行)。录制期间持 NoteLock,编辑
+                    // 不可能发生在首次停录完成之前,所以首停做二遍恒安全。
+                    let resumed_note = notes_dir(&app)
+                        .ok()
+                        .map(|root| store::load_refined(&root.join(&note_id)).is_some())
+                        .unwrap_or(true); // 判别不了按"续录"保守处理:宁可不精修,不冒覆盖编辑的险
                     if settings::cloud_second_pass_wanted(&s2) {
-                        if is_resumed_by_active_session(&note_id) {
+                        if resumed_note {
+                            eprintln!("refine({note_id}): 本篇已有历史停录(或判别失败),跳过云端二遍以保护既有编辑");
+                        } else if is_resumed_by_active_session(&note_id) {
                             eprintln!("refine({note_id}): 续录已重开,跳过云端二遍");
                         } else {
                             report("cloud_pass", "running");
-                            match run_retranscribe_once(&app, &note_id, false, s2.language_filter, &mut |_| {}) {
+                            // 停录收尾的 writer 锁在 spawn_refine 返回后才释放,与本
+                            // worker 存在毫秒级竞窗;NoteLock 自身只重试 ~100ms,不够
+                            // 覆盖调度抖动(codex P2)——这里再包一层有界重试(~3s),
+                            // 「笔记正被占用」以外的错误立刻放弃不重试。
+                            let mut outcome = Err(String::new());
+                            for attempt in 0..10 {
+                                // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
+                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, &mut |_| {});
+                                match &outcome {
+                                    Err(e) if e.contains("正被占用") || e.contains("busy") => {
+                                        if attempt < 9 {
+                                            std::thread::sleep(std::time::Duration::from_millis(300));
+                                            continue;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            match outcome {
                                 Ok(sum) => {
                                     eprintln!("云端二遍完成({note_id}): {sum:?}");
                                     report("cloud_pass", "ok");
@@ -2469,6 +2501,7 @@ fn run_retranscribe_once(
     note_id: &str,
     mixed: bool,
     language_filter: bool,
+    strict: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<retranscribe::Summary, String> {
     let dir = notes_dir(app).map_err(|e| e.to_string())?.join(note_id);
@@ -2506,7 +2539,7 @@ fn run_retranscribe_once(
         Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
     };
     retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
-        &mut embedder, seeds, mixed, language_filter, progress)
+        &mut embedder, seeds, mixed, language_filter, strict, progress)
         .map_err(|e| e.to_string())
 }
 
@@ -2546,7 +2579,8 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                     message: None, summary: None,
                 });
             };
-            run_retranscribe_once(&app, &note_id, mixed, language_filter, &mut progress)
+            // 手动路径宽容(strict=false):失败段落占位,用户看 summary 自行决定。
+            run_retranscribe_once(&app, &note_id, mixed, language_filter, false, &mut progress)
         }));
         match body {
             Ok(Ok(summary)) => {
@@ -6224,6 +6258,17 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
             "Cannot switch the recognition model while recording"
         ));
     }
+    // 热词变更(codex 2026-08-11 P2):常驻识别器在预载时已把 hotwords 焊进 prompt,
+    // 只改设置不清缓存的话,下一场录音仍拿旧词表。与 asr_changed 同路径:清槽+重预载。
+    // 录制中同样拒绝——停录 stash 会把持旧词表的会话识别器塞回缓存槽,清槽白清
+    // (前端热词输入本就 recording.isLive 时禁用,这里是后端兜底)。
+    let hotwords_changed = old.asr_hotwords != new_settings.asr_hotwords;
+    if hotwords_changed && *state.running.lock().unwrap() {
+        return Err(tr!(
+            "录制中不能修改热词",
+            "Cannot change hotwords while recording"
+        ));
+    }
     // 识别方式(本地/云端)与云端凭证变更:与 ASR 选型同理,录制中改会让正在跑的会话与
     // 设置对不上(云端流已按旧凭证握手、本地 worker 已持旧识别器),拒绝。凭证也在内:
     // 改 key 不会重开流,却会让下一次重连/补识用上另一套账号,静默分裂到两个厂商账号下。
@@ -6263,7 +6308,7 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
         s.data_dir = data_dir;
         s.models_dir = models_dir;
     }).map_err(|e| e.to_string())?;
-    if asr_changed {
+    if asr_changed || hotwords_changed {
         *state.recognizer_cache.lock().unwrap() = None;
         preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
     } else if mode_changed {
