@@ -41,6 +41,10 @@
   // 用户所有笔记都没有 system 轨,自己毫无察觉——那是静默降级年代的教训)。
   // 查询失败按已授权处理,不误伤非 macOS/老系统。
   let screenPerm = $state(true);
+  // 拒录引导卡上的「修复授权」行按平台门控:tccutil 双清只在 macOS 有意义,
+  // Windows 的 unavailable 卡不能出现一个点了也没用的修复按钮。WKWebView 的
+  // UA 恒含 "Macintosh",取一次即定值。
+  const isMacPlatform = navigator.userAgent.includes("Mac");
   async function refreshScreenPerm() {
     try {
       screenPerm = await invoke<boolean>("screen_capture_permission");
@@ -682,7 +686,11 @@
 
       <!-- 硬承诺双轨拒录引导卡:System 起不来时后端整场拆除(不静默降级),这里按分类
            分支引导——权限缺失给可操作的「打开系统设置」;设备/组件不可用（含 Windows）
-           只给说明,没有可操作的跳转。 -->
+           给说明,macOS 下附修复入口。两张卡都带「修复授权」(codex 2026-08-11 P1):
+           仅 AudioCapture 残留时 ScreenCapture preflight 仍为 true,上方 screenPerm
+           横幅(修复入口原本唯一挂载点)根本不亮,而采集失败按分类会落进这两张卡——
+           不在这里给入口,本 PR 要修的场景就永远触达不了 tccutil 双清。unavailable
+           卡的 Windows 场景没有 TCC,按平台隐藏修复行。 -->
       {#if isSystemDenied}
         <div class="banner">
           <strong>{t("record.systemDenied.title")}</strong>
@@ -690,11 +698,23 @@
           <button class="link" onclick={openSystemAudioPrivacySettings}>
             {t("record.banner.openSettings")}
           </button>
+          <div class="fixline">
+            {t("record.banner.permFix")}
+            <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+            <span class="hint">{t("record.banner.permFixHint")}</span>
+          </div>
         </div>
       {:else if isSystemUnavailable}
         <div class="banner">
           {t("record.systemUnavailable.desc")}
           <span class="hint">{displayStatus}</span>
+          {#if isMacPlatform}
+            <div class="fixline">
+              {t("record.banner.permFix")}
+              <button class="link" onclick={fixScreenPerm}>{t("record.banner.permFixBtn")}</button>
+              <span class="hint">{t("record.banner.permFixHint")}</span>
+            </div>
+          {/if}
         </div>
       {/if}
 
