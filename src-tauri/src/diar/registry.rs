@@ -345,16 +345,19 @@ impl SpeakerRegistry {
         // 最多者胜出(平票取最高分席位所属的人),且胜者须有至少一个席位过上面
         // 的命中三闸才拍板。胜者无合格席位 → 种子路空手而归,不降格给第二名
         // (误命名比不命名糟),探针留给普通簇/软归属/新建簇路径。
-        let mut neighbors: Vec<(f32, usize)> = self
-            .clusters
-            .iter()
-            .zip(&sims)
-            .enumerate()
-            .filter(|&(_, (c, _))| c.is_seed())
-            .map(|(idx, (_, &sim))| (sim, idx))
-            .collect();
-        neighbors.sort_by(|a, b| b.0.total_cmp(&a.0));
-        neighbors.truncate(SEED_KNN_K);
+        // 有界 top-K 选择(O(S·K)):种子库可能很大(每人多份信道/会话变体),
+        // 这里是逐段热路径,不做整库排序/全量临时分配。
+        let mut neighbors: Vec<(f32, usize)> = Vec::with_capacity(SEED_KNN_K + 1);
+        for (idx, (c, &sim)) in self.clusters.iter().zip(&sims).enumerate() {
+            if !c.is_seed() {
+                continue;
+            }
+            let pos = neighbors.partition_point(|&(s, _)| s > sim);
+            if pos < SEED_KNN_K {
+                neighbors.insert(pos, (sim, idx));
+                neighbors.truncate(SEED_KNN_K);
+            }
+        }
         let mut tally: std::collections::BTreeMap<&str, (usize, f32)> = std::collections::BTreeMap::new();
         for &(sim, idx) in &neighbors {
             if let Some(p) = self.clusters[idx].person.as_deref() {

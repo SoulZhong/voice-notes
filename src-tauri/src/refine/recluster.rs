@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::diar::registry::{SeedCluster, SEED_ASSIGN_THRESHOLD};
+use crate::diar::registry::{SeedCluster, SEED_ASSIGN_THRESHOLD, SEED_KNN_K};
 
 /// AHC 合并阈值(余弦)。低于在线 MERGE_THRESHOLD(0.74):全局视角下可更宽。
 /// golden 校准定为 0.68:0.60 时次大簇(R2)污染更重,0.72+ 标签数超标(>12);
@@ -56,6 +56,36 @@ fn normalize(v: &[f32]) -> Option<Vec<f32>> {
         return None;
     }
     Some(v.iter().map(|x| x / n).collect())
+}
+
+/// k-NN 票决的胜者及其最佳席位:(person, name, best_sim)。每份种子质心一席,
+/// 只取与簇质心最相近的 SEED_KNN_K 席计票,按 person 计席多数决,平票取最高分
+/// 席位所属的人。有界选择(O(S·K)),不整库排序。无种子/全部无法归一 → None。
+fn knn_vote_neighbor(centroid: &[f32], seeds: &[SeedCluster]) -> Option<(String, String, f32)> {
+    let mut top: Vec<(f32, usize)> = Vec::with_capacity(SEED_KNN_K + 1);
+    for (i, s) in seeds.iter().enumerate() {
+        let Some(u) = normalize(&s.centroid) else { continue };
+        let sim = dot(centroid, &u);
+        let pos = top.partition_point(|&(t, _)| t > sim);
+        if pos < SEED_KNN_K {
+            top.insert(pos, (sim, i));
+            top.truncate(SEED_KNN_K);
+        }
+    }
+    // person -> (席位数, 最高分, 最高分席位的种子下标)
+    let mut tally: BTreeMap<&str, (usize, f32, usize)> = BTreeMap::new();
+    for &(sim, i) in &top {
+        let e = tally.entry(seeds[i].person.as_str()).or_insert((0, f32::MIN, i));
+        e.0 += 1;
+        if sim > e.1 {
+            e.1 = sim;
+            e.2 = i;
+        }
+    }
+    tally
+        .into_values()
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .map(|(_, best_sim, i)| (seeds[i].person.clone(), seeds[i].name.clone(), best_sim))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -164,20 +194,14 @@ pub fn recluster(
     // 4. 按总时长降序编号 R1..Rk。
     cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
 
-    // 5. 种子命名/认人:簇质心对每个 seed 算余弦。最佳近邻(无论是否过阈值)进
-    //    ClusterStat 供 identify 裁决参考;命名采纳(adopted)仍要求最高且
-    //    ≥ SEED_ASSIGN_THRESHOLD。未命名的库人物也参与——person id 是修订稿改名
-    //    同步进声纹库的锚点,不能因为还没名字就丢掉身份。
-    let best_neighbors: Vec<Option<(String, String, f32)>> = cls
-        .iter()
-        .map(|c| {
-            seeds
-                .iter()
-                .filter_map(|s| normalize(&s.centroid).map(|u| (s, dot(&c.centroid, &u))))
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(s, sim)| (s.person.clone(), s.name.clone(), sim))
-        })
-        .collect();
+    // 5. 种子命名/认人:k-NN 多数票(与 registry::assign_inner 同语义,2026-08-12
+    //    算法升级——离线终稿若仍用单最近邻,实时路的票决结果会在精修落稿时被
+    //    离群质心翻案)。票决胜者(无论是否过阈值)进 ClusterStat 供 identify
+    //    裁决参考;命名采纳(adopted)仍要求胜者最佳席位 ≥ SEED_ASSIGN_THRESHOLD。
+    //    未命名的库人物也参与——person id 是修订稿改名同步进声纹库的锚点,
+    //    不能因为还没名字就丢掉身份。
+    let best_neighbors: Vec<Option<(String, String, f32)>> =
+        cls.iter().map(|c| knn_vote_neighbor(&c.centroid, seeds)).collect();
     let matches: Vec<Option<(String, String)>> = best_neighbors
         .iter()
         .map(|n| {
@@ -378,6 +402,31 @@ mod tests {
         assert_eq!(st.total_ms, 22_000);
         assert_eq!(st.core_seqs, vec![0, 1]);
         assert!(st.seed.is_none());
+    }
+
+    /// 种子命名走 k-NN 多数票(与 registry::assign_inner 同语义):乙 3 份变体
+    /// 席位(0.72/0.71/0.70)应压过甲单个更近的离群席位(0.80)。
+    #[test]
+    fn seed_naming_uses_knn_majority_vote() {
+        let a = [1.0, 0.0, 0.0];
+        let inputs = vec![seg(0, 0, 10_000), seg(1, 10_000, 20_000)];
+        let embs = vec![v(a, 0.0), v(a, 0.01)];
+        let at = |x: f32| vec![x, (1.0f32 - x * x).sqrt(), 0.0];
+        let sc = |p: &str, n: &str, c: Vec<f32>| crate::diar::registry::SeedCluster {
+            person: p.into(), name: n.into(), centroid: c, count: 5, source: "mic".into(),
+        };
+        let seeds = vec![
+            sc("PA", "甲", at(0.80)),
+            sc("PB", "乙", at(0.72)),
+            sc("PB", "乙", at(0.71)),
+            sc("PB", "乙", at(0.70)),
+        ];
+        let (out, stats) = recluster(&inputs, &embs, &seeds);
+        assert_eq!(out[0].person.as_deref(), Some("PB"), "3 席多数应压过单个更近席位");
+        assert_eq!(out[0].name.as_deref(), Some("乙"));
+        let (pid, _, sim, adopted) = stats[0].seed.clone().unwrap();
+        assert_eq!(pid, "PB");
+        assert!(adopted, "胜者最佳席位 {sim} ≥ 0.68 应采纳");
     }
 
     /// 新增:种子近邻带 adopted 标记——低于 0.68 的最佳近邻记录在 stat 但不采纳命名。
