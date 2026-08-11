@@ -64,6 +64,23 @@
   /** 当前接口地址命中的预设(用户手改过地址就不再套预设文案)。 */
   const activePreset = $derived(REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim()));
 
+  /** 各服务商草稿(model/key):切换预设先暂存当前填写,切回时原样回填——配置不再被
+      预设默认值覆盖丢失(2026-08-11 冒烟反馈)。localStorage 持久,与 settings.json
+      明文存 key 同一威胁模型;真正生效的配置仍以 settings 为唯一真源,草稿只是
+      各家的编辑缓冲。自定义地址(不命中任何预设)不入草稿:无稳定身份,避免误回填。 */
+  const REFINE_DRAFTS_KEY = "vn.refineDrafts";
+  let refineDrafts = $state<Record<string, { model: string; key: string }>>({});
+  function stashDraft() {
+    const id = REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim())?.label;
+    if (!id) return;
+    refineDrafts = { ...refineDrafts, [id]: { model: refineModel.trim(), key: refineKey.trim() } };
+    try {
+      localStorage.setItem(REFINE_DRAFTS_KEY, JSON.stringify(refineDrafts));
+    } catch {
+      /* localStorage 不可用:仅本会话内记忆 */
+    }
+  }
+
   // —— Aing 执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
   let refineProvider = $state("openai");
   let refineAgent = $state("claude");
@@ -243,6 +260,11 @@
 
   onMount(() => {
     backfillOpen = new URLSearchParams(window.location.search).get("backfill") === "relations";
+    try {
+      refineDrafts = JSON.parse(localStorage.getItem(REFINE_DRAFTS_KEY) ?? "{}");
+    } catch {
+      /* 草稿损坏:按空处理,不影响 settings 里的生效配置 */
+    }
     loadAiLogsTotal();
     (async () => {
       try {
@@ -298,13 +320,19 @@
     }
   }
 
-  function applyPreset(p: { base: string; model: string }) {
+  function applyPreset(p: { label: string; base: string; model: string }) {
+    stashDraft(); // 先存走当前服务商的填写,再切换
+    const d = refineDrafts[p.label];
     refineBaseUrl = p.base;
-    refineModel = p.model;
+    refineModel = d ? d.model : p.model;
+    // key 是各家各自的凭证:有草稿则回填,首次切到该家则清空——沿用上一家的
+    // key 只会让「测试连接」拿错凭证白失败一次。
+    refineKey = d ? d.key : "";
     saveRefine();
   }
   function saveRefine() {
     llmTest = null;
+    stashDraft(); // 字段编辑同步进当前服务商草稿,切走切回不丢
     saveSetting((s) => {
       s.refine_base_url = refineBaseUrl.trim();
       s.refine_model = refineModel.trim();
@@ -599,9 +627,18 @@
             <span class="row-label">{t("ai.aing.preset.label")}</span>
             <span class="row-desc">{t("ai.aing.preset.desc")}</span>
           </div>
+          <!-- 服务商芯片:选中态高亮当前生效的一家;绿点 = 该家已存过密钥,切回即回填。 -->
           <div class="preset-btns">
             {#each REFINE_PRESETS as p (p.label)}
-              <button class="btn-secondary" onclick={() => applyPreset(p)}>{p.labelKey ? t(p.labelKey) : p.label}</button>
+              <button
+                class="preset-chip"
+                class:active={activePreset?.label === p.label}
+                title={refineDrafts[p.label]?.key ? t("ai.aing.preset.savedTitle") : undefined}
+                onclick={() => applyPreset(p)}
+              >
+                {p.labelKey ? t(p.labelKey) : p.label}
+                {#if refineDrafts[p.label]?.key}<span class="chip-dot"></span>{/if}
+              </button>
             {/each}
           </div>
         </div>
@@ -1201,6 +1238,40 @@
     gap: 0.45rem;
     flex-wrap: wrap;
     margin-left: auto;
+  }
+  /* 服务商芯片:胶囊形,选中态 accent 描边+浅底;悬停轻抬。与 .seg 同一控件语言,
+     但预设是「多选一 + 各自带记忆」,选中态必须常显,不能做成瞬时按钮。 */
+  .preset-chip {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--hairline-strong);
+    padding: 0.32em 0.85em;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    background: transparent;
+    color: var(--ink-secondary);
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+  .preset-chip:hover {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+  .preset-chip.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  /* 已存密钥标记:小绿点,含义由 title 提示补全 */
+  .chip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-full);
+    background: var(--success, var(--accent));
+    flex: none;
   }
   .config-hint {
     font-size: 0.8rem;
