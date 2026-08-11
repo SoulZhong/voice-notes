@@ -782,19 +782,19 @@
       {/if}
       {#if capabilities}
         <div class="group-title">{t("ai.cap.tools")}</div>
+        <!-- 2026-08-11 用户拍板去掉 gate 徽章(「需应用运行/已允许控制」这类状态标签
+             对用户是噪声):正常状态零标注;唯一值得说的是「控制类工具因上方开关关闭
+             而不可用」——用整行置灰 + 描述后缀一句话指路,开关一开即恢复常态。 -->
         {#each capabilities.tools as tool (tool.name)}
-          <div class="row">
+          {@const controlLocked = tool.gate === "control" && !mcpAllowControl}
+          <div class="row" class:dimmed={controlLocked}>
             <div class="row-info">
               <span class="row-label mono">{tool.name}</span>
-              <span class="row-desc">{tool.desc}</span>
+              <span class="row-desc">
+                {tool.desc}
+                {#if controlLocked}{t("ai.cap.controlLockedHint")}{/if}
+              </span>
             </div>
-            <!-- catalog 的 gate 是静态前置条件声明;control 一档按上方开关的实时值
-                 显示当前状态,否则开关打开后徽章不变,会被读成「开了也没生效」。 -->
-            {#if tool.gate === "app"}<span class="pill">{t("ai.cap.gateApp")}</span>
-            {:else if tool.gate === "control"}
-              {#if mcpAllowControl}<span class="pill">{t("ai.cap.gateControlOn")}</span>
-              {:else}<span class="pill warn">{t("ai.cap.gateControlOff")}</span>{/if}
-            {/if}
           </div>
         {/each}
         <div class="group-title">{t("ai.cap.cli")}</div>
@@ -1112,6 +1112,10 @@
     gap: 0.4rem;
   }
   /* 徽章:soft 底 + 中性文字色,micro 字级(尺寸沿用说话人徽章的形态,颜色改中性/warning 语义) */
+  /* 控制类工具在「允许控制」关闭时整行置灰:状态用视觉表达,不用术语徽章。 */
+  .row.dimmed {
+    opacity: 0.45;
+  }
   .pill {
     flex: none;
     font-size: 0.78rem;

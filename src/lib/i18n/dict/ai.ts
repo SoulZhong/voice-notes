@@ -125,9 +125,7 @@ export const zh = {
   "ai.cap.sectionTitle": "Agent 能调用什么",
   "ai.cap.tools": "MCP 工具",
   "ai.cap.cli": "CLI 命令",
-  "ai.cap.gateApp": "需应用运行",
-  "ai.cap.gateControlOn": "已允许控制",
-  "ai.cap.gateControlOff": "需允许控制",
+  "ai.cap.controlLockedHint": "(暂不可用:需开启上方「允许 AI 控制录制」)",
 
   // —— /ai「历史语义关系」区 ——
   "ai.relations.sectionTitle": "历史语义关系",
@@ -301,9 +299,7 @@ export const en = {
   "ai.cap.sectionTitle": "What Agents Can Call",
   "ai.cap.tools": "MCP tools",
   "ai.cap.cli": "CLI commands",
-  "ai.cap.gateApp": "Requires app running",
-  "ai.cap.gateControlOn": "Control allowed",
-  "ai.cap.gateControlOff": "Requires control permission",
+  "ai.cap.controlLockedHint": "(Unavailable: enable \"Allow AI to control recording\" above)",
 
   "ai.relations.sectionTitle": "Semantic Relation History",
   "ai.relations.label": "Note relation analysis",
