@@ -4,6 +4,8 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>用于实时转写你的语音。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>录制电脑播放的系统声音，与麦克风声音一起生成完整的会议笔记。</string>
     <key>NSCalendarsUsageDescription</key>
     <string>读取日程标题与参会人,把录音自动关联到会议并帮助认出说话人。日程数据保存在本机;若启用 AI 精修,会议标题与参会人名会随转写一起发送给你选择的 AI 服务。</string>
     <key>NSCalendarsFullAccessUsageDescription</key>

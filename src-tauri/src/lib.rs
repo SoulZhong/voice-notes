@@ -6599,10 +6599,27 @@ fn request_screen_capture_permission() -> bool {
     true
 }
 
+/// 依次执行全部捕获权限清理；任一项失败时仍继续，最终统一报告结果。
+#[cfg(any(target_os = "macos", test))]
+fn reset_capture_permissions_with(
+    identifier: &str,
+    mut reset: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    let mut all_ok = true;
+    for service in ["ScreenCapture", "AudioCapture"] {
+        // 不短路：即使一项失败，也要尝试清理另一项，避免留下新的半修复状态。
+        all_ok &= reset(service, identifier);
+    }
+    all_ok
+}
+
 /// 清除本应用在「屏幕录制」里的 TCC 授权记录(tccutil reset)。修复授权残留:
 /// 换签名后(如 v0.1.x ad-hoc → 稳定证书)旧条目的 csreq 与新二进制不匹配,系统
 /// 设置里开关看似已开、实际 SCShareableContent 始终被拒,且拨动开关/重启均无效
 /// (2026-07-10 实锤:一个 bundle id 下积了 3 条残留)。清除后由前端引导重新授权。
+///
+/// 增强(2026-08-11,macOS 26.6.1 实锤):新版系统还会为系统声音维护独立的
+/// AudioCapture 条目；两项任一残留旧 csreq 都会让双轨录制失败，因此必须一起清除。
 #[tauri::command]
 fn reset_screen_capture_permission(app: tauri::AppHandle) -> bool {
     #[cfg(not(target_os = "macos"))]
@@ -6612,11 +6629,13 @@ fn reset_screen_capture_permission(app: tauri::AppHandle) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/usr/bin/tccutil")
-            .args(["reset", "ScreenCapture", &app.config().identifier])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        reset_capture_permissions_with(&app.config().identifier, |service, identifier| {
+            std::process::Command::new("/usr/bin/tccutil")
+                .args(["reset", service, identifier])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -7383,6 +7402,32 @@ mod tests {
     fn required_sources_always_requires_mic_and_system() {
         use crate::audio::Source;
         assert_eq!(super::required_sources(), vec![Source::Mic, Source::System]);
+    }
+
+    /// 新版 macOS 将系统声音单列为 AudioCapture TCC 服务；修复旧签名残留时必须
+    /// 与 ScreenCapture 一起清理，而且首项失败也不能阻止第二项继续尝试。
+    #[test]
+    fn reset_capture_permissions_attempts_both_tcc_services() {
+        let mut calls = Vec::new();
+        let ok = super::reset_capture_permissions_with("com.teemo.voice-notes", |service, id| {
+            calls.push((service.to_string(), id.to_string()));
+            service != "ScreenCapture"
+        });
+
+        assert!(!ok);
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "ScreenCapture".to_string(),
+                    "com.teemo.voice-notes".to_string()
+                ),
+                (
+                    "AudioCapture".to_string(),
+                    "com.teemo.voice-notes".to_string()
+                ),
+            ]
+        );
     }
 
     /// Fix A 拆除路径错误文案的三分支(硬承诺双轨,Task 3 审查修复):System 缺失

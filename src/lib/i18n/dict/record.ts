@@ -43,7 +43,7 @@ export const zh = {
   "record.banner.permFix": "系统设置里已勾选却仍提示未授权？多半是旧版本的授权记录残留，开关是失效的。",
   "record.banner.permFixBtn": "修复授权",
   "record.banner.permFixHint":
-    "清除残留后重新弹出系统授权；若未弹出，退出并重新打开应用后再点「立即授权」。",
+    "会同时清除屏幕录制和系统声音的旧授权；重新授权后请退出并重新打开应用。",
   "record.banner.openSettings": "打开系统设置",
   "record.banner.diarUnavailable": "说话人区分不可用（相关模型未下载）。转写与录音不受影响。",
   "record.banner.storageDegraded": "落盘异常：内容暂存内存并自动重试，请检查磁盘空间。录制不受影响。",
@@ -53,7 +53,7 @@ export const zh = {
   // record.banner.openSettings 按钮文案;设备/组件不可用=纯提示,无跳转)。
   "record.systemDenied.title": "系统声音未获授权",
   "record.systemDenied.desc":
-    "会议笔记需要录制系统声音；请在 系统设置→隐私与安全性→屏幕录制 中允许本应用，然后重试。",
+    "会议笔记需要录制系统声音；请在 系统设置→隐私与安全性→录屏与系统录音 中允许本应用，然后重新打开应用。",
   "record.systemUnavailable.desc": "系统声音当前不可用（设备或组件问题），本场无法开录；请检查后重试。",
 
   // 转写区
@@ -124,7 +124,7 @@ export const en = {
     "Checked in System Settings but still shown as unauthorized? A stale permission record from an old build is likely blocking it — the toggle no longer works.",
   "record.banner.permFixBtn": "Repair permission",
   "record.banner.permFixHint":
-    "Clearing the stale record re-triggers the system prompt; if it doesn't appear, quit and reopen the app, then click \"Authorize now\" again.",
+    "This clears stale screen-recording and system-audio permissions together; authorize again, then quit and reopen the app.",
   "record.banner.openSettings": "Open System Settings",
   "record.banner.diarUnavailable":
     "Speaker diarization unavailable (model not downloaded). Transcription and recording are unaffected.",
@@ -133,7 +133,7 @@ export const en = {
 
   "record.systemDenied.title": "System audio not authorized",
   "record.systemDenied.desc":
-    "Meeting notes needs to record system audio; please allow this app under System Settings → Privacy & Security → Screen Recording, then try again.",
+    "Meeting notes needs system audio; allow this app under System Settings → Privacy & Security → Screen & System Audio Recording, then reopen the app.",
   "record.systemUnavailable.desc":
     "System audio is currently unavailable (a device or component issue); recording could not start. Please check and try again.",
 
