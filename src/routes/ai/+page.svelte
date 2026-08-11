@@ -161,13 +161,20 @@
     llmTest = null;
     const id = selectedProfileId;
     if (!id) return Promise.resolve(false);
+    // 与 id 一起快照全部字段(codex 2026-08-11 P1):mutator 在 saveChain 排队后
+    // 才执行,期间切档案 tab 会把字段缓冲换成别家的值,晚读=拿 B 家的端点/密钥
+    // 覆写 A 家档案。
+    const label = profLabel.trim();
+    const baseUrl = refineBaseUrl.trim();
+    const model = refineModel.trim();
+    const apiKey = refineKey.trim();
     return saveSetting((s) => {
       const p = s.llm_profiles.find((x) => x.id === id);
       if (!p) return;
-      p.label = profLabel.trim() || p.label;
-      p.base_url = refineBaseUrl.trim();
-      p.model = refineModel.trim();
-      p.api_key = refineKey.trim();
+      p.label = label || p.label;
+      p.base_url = baseUrl;
+      p.model = model;
+      p.api_key = apiKey;
     });
   }
 
@@ -186,13 +193,16 @@
 
   function deleteProfile() {
     confirmDeleteProfile = false;
-    const refstr = `llm:${selectedProfileId}`;
+    // 快照被删档案 id(codex 2026-08-11 P1):mutator 排队期间切档案 tab 会改
+    // selectedProfileId,晚读=删掉切过去的那家而不是按下删除键的那家。
+    const id = selectedProfileId;
+    const refstr = `llm:${id}`;
     if (refineExecutor.trim() === refstr || relationsExecutor.trim() === refstr) {
       error = t("ai.res.deleteInUse");
       return;
     }
     void saveSetting((s) => {
-      s.llm_profiles = s.llm_profiles.filter((p) => p.id !== selectedProfileId);
+      s.llm_profiles = s.llm_profiles.filter((p) => p.id !== id);
     });
   }
 
@@ -617,8 +627,11 @@
   <header class="topbar"><h1>AI</h1></header>
 
   <!-- 执行体选项(功能区两个选择器共用):在线模型档案 + 本机 Agent,
-       未就绪状态直接标注在选项文本里,不让用户选完才发现不可用。 -->
-  {#snippet executorOptions()}
+       未就绪状态直接标注在选项文本里,不让用户选完才发现不可用。
+       forRelations:关系补建后端结构性只放行 Claude/Gemini(工具面收敛,见
+       AgentRelationExecutor::new),其余 Agent 禁选并标注原因,不让用户选完
+       跑一次预览/补建才发现必败(codex 2026-08-11 P2)。 -->
+  {#snippet executorOptions(forRelations: boolean)}
     {#if llmProfiles.length}
       <optgroup label={t("ai.exec.groupLlm")}>
         {#each llmProfiles as p (p.id)}
@@ -630,8 +643,13 @@
     {/if}
     <optgroup label={t("ai.exec.groupAgent")}>
       {#each AGENT_OPTIONS as a (a.key)}
-        <option value={"agent:" + a.key}>
-          {a.label}{!(a.key in agentProbe) || agentProbe[a.key] ? "" : ` · ${t("ai.exec.notDetected")}`}
+        {@const relationsBlocked = forRelations && a.key !== "claude" && a.key !== "gemini"}
+        <option value={"agent:" + a.key} disabled={relationsBlocked}>
+          {a.label}{relationsBlocked
+            ? ` · ${t("ai.exec.relationsUnsupported")}`
+            : !(a.key in agentProbe) || agentProbe[a.key]
+              ? ""
+              : ` · ${t("ai.exec.notDetected")}`}
         </option>
       {/each}
     </optgroup>
@@ -710,7 +728,7 @@
           onchange={(e) => setRefineExecutor(e.currentTarget.value)}
         >
           <option value="">{t("ai.exec.none")}</option>
-          {@render executorOptions()}
+          {@render executorOptions(false)}
         </select>
       </div>
       <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
@@ -1052,7 +1070,7 @@
           onchange={(e) => setRelationsExecutor(e.currentTarget.value)}
         >
           <option value="">{t("ai.exec.follow")}</option>
-          {@render executorOptions()}
+          {@render executorOptions(true)}
         </select>
       </div>
       <div class="row">

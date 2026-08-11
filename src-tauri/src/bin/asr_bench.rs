@@ -54,6 +54,20 @@ fn parse_args() -> Args {
             "--engines" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 engines = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                // 未知名必须在这里拦死:new_recognizer 对未知名回落 SenseVoice,
+                // 打错字(如 qwen)会把 SenseVoice 结果写进 qwen.jsonl,静默作废
+                // 整轮对比(codex 2026-08-11 P2)。
+                const KNOWN: [&str; 5] = [
+                    settings::ASR_SENSE_VOICE,
+                    settings::ASR_WHISPER,
+                    settings::ASR_PARAFORMER,
+                    settings::ASR_QWEN3,
+                    settings::ASR_FIRERED,
+                ];
+                if let Some(bad) = engines.iter().find(|e| !KNOWN.contains(&e.as_str())) {
+                    eprintln!("未知引擎名: {bad}(可用: {})", KNOWN.join(","));
+                    std::process::exit(2);
+                }
             }
             "--cloud" => cloud = Some(it.next().unwrap_or_else(|| usage())),
             "--app-data" => app_data = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),

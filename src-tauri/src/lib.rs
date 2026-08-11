@@ -849,6 +849,20 @@ fn qwen3_hotwords(app: &AppHandle) -> Option<String> {
     merge_hotwords(&s.asr_hotwords, names)
 }
 
+/// 声纹人名变更(改名/合并/删除)后失效常驻识别器:Qwen3 热词在识别器构造时快照
+/// 声纹人名,常驻缓存跨场复用会让变更后仍偏置旧名直到重启或无关设置变更
+/// (codex 2026-08-11 P2)。仅 Qwen3 吃热词,其余引擎清槽纯属白重载几 GB 模型,
+/// 按当前选型门控。录制中调用是空操作(槽已被开录取走,preload 也会跳过)——
+/// 本场热词开录时已定型,无法热更;该残留会在下一次人名/设置变更时刷新。
+fn refresh_qwen_hotwords_cache(app: &AppHandle) {
+    if current_asr(app) != settings::ASR_QWEN3 {
+        return;
+    }
+    let state = app.state::<AppState>();
+    *state.recognizer_cache.lock().unwrap() = None;
+    preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+}
+
 /// 云端识别器唯一实例化点(对称 new_recognizer):按 provider 造火山/阿里适配器。
 /// 凭证不齐直接 bail——开录/测试连接都走这里,错误文案单一真源,避免"连上了才发现
 /// 没填 key"这种要等一次握手往返才暴露的失败。
@@ -3148,6 +3162,7 @@ fn rename_refined_speaker(
         if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
             match vp_store.rename(&resolved, name) {
                 Ok(()) => {
+                    refresh_qwen_hotwords_cache(&app);
                     queue_person_graph_rebuild(&app, graph_root, &tr!("人物改名", "Person rename"))?
                 }
                 Err(e) => eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}"),
@@ -3780,9 +3795,15 @@ fn rename_entity_with_rebuild(
 #[tauri::command]
 fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::RenameEntityResult, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
-    rename_entity_with_rebuild(root, id, new_name, |root| {
+    let is_person = !id.starts_with("e:");
+    let result = rename_entity_with_rebuild(root, id, new_name, |root| {
         queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
-    })
+    })?;
+    // 人实体改名落进声纹库,同步刷新 Qwen 热词缓存(见 refresh_qwen_hotwords_cache)。
+    if is_person {
+        refresh_qwen_hotwords_cache(&app);
+    }
+    Ok(result)
 }
 
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
@@ -5280,6 +5301,7 @@ fn rename_person(app: AppHandle, id: String, name: String) -> Result<(), String>
     store::VoiceprintStore::new(root.clone())
         .rename(&id, name)
         .map_err(|e| e.to_string())?;
+    refresh_qwen_hotwords_cache(&app);
     queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
 }
 
@@ -5431,6 +5453,7 @@ async fn merge_person(
             return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
         }
         let journal_id = do_merge_person(&app, &loser, &winner, "manual", None, &mut emb)?;
+        refresh_qwen_hotwords_cache(&app);
         let root = data_root(&app).map_err(|e| e.to_string())?;
         queue_person_graph_rebuild(&app, root, &tr!("人物合并", "Person merge"))?;
         Ok(journal_id)
@@ -5456,6 +5479,7 @@ async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -
         store::VoiceprintStore::new(root.clone())
             .delete(&id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("人物删除", "Person deletion"))
     })
     .await
