@@ -289,7 +289,19 @@ pub fn download_artifact(
     let part = root.join(format!("{}.part", a.id));
     let mut offset = part.metadata().map(|m| m.len()).unwrap_or(0);
 
-    let req = ureq::get(url).timeout(Duration::from_secs(600 * 60)); // 大文件慢链路：整体超时放极宽，靠取消兜底
+    // 分层超时取代旧的"整体 10 小时"单一超时(2026-08-11 冒烟实证的坑:镜像对大文件
+    // 建连后迟迟不吐首字节,整体超时不到期 → download_one 的候选 URL 轮换永远轮不到
+    // 原站,UI 卡"下载中"且取消在阻塞读里失灵):
+    // - connect 15s:死镜像/黑洞路由快速失败,候选链真正生效;
+    // - 每次 read 30s:只限"无数据流动"的僵死,不限总时长——慢链路只要字节在走就
+    //   永不误杀;读间隙的取消检查也因此最迟 30s 内响应。
+    // 读超时错误文案含 "timed out",经 retryable_download_error 判定可重试,同 URL
+    // Range 续传后再轮换,已下字节不浪费。
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    let req = agent.get(url);
     let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
     let resp = match req.call() {
         Ok(r) => r,

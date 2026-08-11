@@ -20,6 +20,7 @@
     purgeAudio,
     onMigrate,
     onModelDownload,
+    cancelModelsDownload,
     openModelsDir,
     testMirror,
     testCloudAsr,
@@ -1206,6 +1207,11 @@
                   {/if}
                 </span>
                 <div class="bar"><div class="fill" style="width:{pct(prog[a.id])}%"></div></div>
+                <!-- 镜像僵死等场景的逃生口:后端置取消标志,worker 发 cancelled 事件清本行。
+                     已下字节保留在 .part,再点下载走 Range 续传不白费。 -->
+                {#if prog[a.id].phase === "downloading"}
+                  <button class="link" onclick={() => cancelModelsDownload()}>{t("settings.cancel")}</button>
+                {/if}
               </div>
             {:else if a.present}
               {#if confirmDeleteId === a.id}
