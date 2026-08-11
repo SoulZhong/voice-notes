@@ -17,9 +17,20 @@ pub const ASR_WHISPER: &str = "whisper";
 pub const ASR_PARAFORMER: &str = "paraformer";
 /// Qwen3-ASR 0.6B int8 选型(52 语种/中英混说,LLM 解码,支持热词)。
 pub const ASR_QWEN3: &str = "qwen3";
+/// FireRedASR2-AED int8(2026-08-11 调研接入:中文精度天花板,带 token 时间戳)。
+pub const ASR_FIRERED: &str = "firered";
 /// 识别方式:本地模型 / 云端 API(spec 2026-07-29-cloud-asr-design)。
 pub const ASR_MODE_LOCAL: &str = "local";
 pub const ASR_MODE_CLOUD: &str = "cloud";
+/// 本地+云端精修:录制实时走本地引擎,停录 Aing 前自动用云端批式对整场重转写
+/// (spec 2026-08-11 用户拍板)。凭证不齐时二遍静默跳过,实时稿保留。
+pub const ASR_MODE_LOCAL_CLOUD: &str = "local_cloud";
+
+/// 云端二遍是否应当尝试(local_cloud 模式且凭证齐)。抽纯函数:Aing 前置二遍与
+/// 手动重转写的引擎决策共用同一判据,不各写一份漂移。
+pub fn cloud_second_pass_wanted(s: &Settings) -> bool {
+    s.asr_mode == ASR_MODE_LOCAL_CLOUD && cloud_creds_ok(s)
+}
 /// 云端厂商标识。
 pub const CLOUD_VOLCANO: &str = "volcano";
 pub const CLOUD_ALIYUN: &str = "aliyun";
@@ -814,6 +825,31 @@ mod tests {
             .unwrap()
             .insert("telemetry_enabled".into(), serde_json::Value::Bool(false));
         assert!(serde_json::from_value::<Settings>(v).is_ok());
+    }
+
+    #[test]
+    fn cloud_second_pass_only_in_local_cloud_mode_with_creds() {
+        // local_cloud + 凭证齐 → 二遍;缺任一条件都不做(录制照常,不挡不弹)。
+        let ready = Settings {
+            asr_mode: ASR_MODE_LOCAL_CLOUD.into(),
+            cloud_asr_provider: CLOUD_ALIYUN.into(),
+            dashscope_api_key: "sk-x".into(),
+            ..Default::default()
+        };
+        assert!(cloud_second_pass_wanted(&ready));
+        let no_creds = Settings { asr_mode: ASR_MODE_LOCAL_CLOUD.into(), ..Default::default() };
+        assert!(!cloud_second_pass_wanted(&no_creds), "凭证不齐:静默跳过二遍");
+        let cloud_only = Settings {
+            asr_mode: ASR_MODE_CLOUD.into(),
+            cloud_asr_provider: CLOUD_ALIYUN.into(),
+            dashscope_api_key: "sk-x".into(),
+            ..Default::default()
+        };
+        assert!(!cloud_second_pass_wanted(&cloud_only), "纯云端模式识别已在云端,无二遍");
+        // local_cloud 的 serde 往返:字符串字段,老版本读到未知值也只是当普通字符串。
+        let tmp = tempfile::tempdir().unwrap();
+        save(tmp.path(), &ready).unwrap();
+        assert_eq!(load(tmp.path()).asr_mode, ASR_MODE_LOCAL_CLOUD);
     }
 
     #[test]

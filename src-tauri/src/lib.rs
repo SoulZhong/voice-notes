@@ -388,6 +388,35 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
+                // local_cloud 云端二遍:读 note 之前先用云端批式对整场重转写(实时
+                // 本地快稿 + Aing 前云端精修覆盖 segments,2026-08-11 用户拍板)。
+                // 放在 AING_GATE 内、refine 读盘之前:与本 worker 天然串行,后续
+                // filter/recluster 读到的就是二遍后的文本;NoteLock 在
+                // run_retranscribe_once 内取放,与 run_local 的取锁先后互不重叠。
+                // 仅首次停录自动路径(enqueue_transcode_after_local)做——手动重跑
+                // Aing 时 segments 可能已被用户编辑,悄悄重转写会冲掉人工修订。
+                // 任何失败只降级保留实时稿,绝不挡 Aing;续录已重开则跳过(与转码
+                // 入队的 F1 守卫同因:音频正被追加写)。
+                if enqueue_transcode_after_local {
+                    let s2 = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+                    if settings::cloud_second_pass_wanted(&s2) {
+                        if is_resumed_by_active_session(&note_id) {
+                            eprintln!("refine({note_id}): 续录已重开,跳过云端二遍");
+                        } else {
+                            report("cloud_pass", "running");
+                            match run_retranscribe_once(&app, &note_id, false, s2.language_filter, &mut |_| {}) {
+                                Ok(sum) => {
+                                    eprintln!("云端二遍完成({note_id}): {sum:?}");
+                                    report("cloud_pass", "ok");
+                                }
+                                Err(e) => {
+                                    eprintln!("云端二遍失败({note_id}),保留实时稿: {e}");
+                                    report("cloud_pass", "failed");
+                                }
+                            }
+                        }
+                    }
+                }
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
@@ -708,6 +737,8 @@ pub fn new_recognizer(
         Ok(Box::new(asr::paraformer::ParaformerRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else if asr_model == settings::ASR_QWEN3 {
         Ok(Box::new(asr::qwen3::Qwen3Recognizer::new(&dir, provider, hotwords)?) as Box<dyn asr::Recognizer>)
+    } else if asr_model == settings::ASR_FIRERED {
+        Ok(Box::new(asr::fire_red::FireRedRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     } else {
         Ok(Box::new(asr::sense_voice::SenseVoiceRecognizer::new(&dir, provider)?) as Box<dyn asr::Recognizer>)
     }
@@ -2416,6 +2447,57 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
 /// 那两槽是录制会话的常驻资源,重转写是离线一次性任务,混用会让二者互相饿死对方)。
 /// 事件不经 lifecycle actor 直发(见 ipc::RetranscribeEvent 注释):重转写与录制会话
 /// 全局互斥,不存在与管线事件的排序耦合,直发省一层转发不丢语义。
+/// 一次离线重转写的公共装配:目录 → NoteLock → 识别器 → 嵌入器 → 种子 → 输入 → run。
+/// spawn_retranscribe(手动/UI)与 Aing 前置云端二遍(spawn_refine,local_cloud)共用,
+/// 不各配一份漂移。识别器按设置决策:local_cloud 且凭证齐 → 云端批式(手动重转写
+/// 与自动二遍同引擎,结果口径一致);否则本地引擎(不碰常驻 recognizer_cache 槽——
+/// 那是录制会话的常驻资源,离线任务混用会互相饿死对方)。
+fn run_retranscribe_once(
+    app: &tauri::AppHandle,
+    note_id: &str,
+    mixed: bool,
+    language_filter: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<retranscribe::Summary, String> {
+    let dir = notes_dir(app).map_err(|e| e.to_string())?.join(note_id);
+    // NoteLock 在本函数内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
+    // 文案不写"或转码中":转码走队列不持 NoteLock,与此锁失败的实际成因无关
+    // (会撞这把锁的只有录制/编辑写手柄);写成"转码中"是与事实不符的误导。
+    let lock = store::notelock::NoteLock::acquire(&dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| tr!(
+            "笔记正被占用(录制/编辑中),稍后再试",
+            "The note is busy (recording or being edited); try again later"
+        ))?;
+    let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+    let mut recognizer: Box<dyn asr::Recognizer> = if settings::cloud_second_pass_wanted(&s) {
+        let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        Box::new(asr::cloud::BatchRecognizer::new(cloud))
+    } else {
+        new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
+            .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?
+    };
+    let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
+        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+            Ok(e) => Some(Box::new(e)),
+            Err(e) => {
+                eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
+                None
+            }
+        };
+    let seeds = load_voiceprint_seeds(app);
+    let vad_path = models::root().join("silero_vad.onnx");
+    let factory: retranscribe::input::SegmenterFactory = Box::new(move || new_silero(&vad_path));
+    let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
+        Box::new(retranscribe::input::MixedInput::new(dir.clone(), factory))
+    } else {
+        Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
+    };
+    retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
+        &mut embedder, seeds, mixed, language_filter, progress)
+        .map_err(|e| e.to_string())
+}
+
 fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
     let slot = app.state::<AppState>().retranscribing.clone();
     let last = app.state::<AppState>().retranscribe_last.clone();
@@ -2438,37 +2520,6 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
         };
         emit("all", "running", None, None);
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<retranscribe::Summary, String> {
-            let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
-            // NoteLock 在 worker 内 acquire 且持有全程(run() 要求调用方贯穿持锁)。
-            // 文案不写"或转码中":转码走队列不持 NoteLock,与此锁失败的实际成因无关
-            // (会撞这把锁的只有录制/编辑写手柄);写成"转码中"是与事实不符的误导。
-            let lock = store::notelock::NoteLock::acquire(&dir)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| tr!(
-                    "笔记正被占用(录制/编辑中),稍后再试",
-                    "The note is busy (recording or being edited); try again later"
-                ))?;
-            // 独立识别器实例:不碰常驻 recognizer_cache 槽(那是录制会话的);
-            // 恒用本地识别器,云端协议是录制期流式,不适配离线整轨(spec 已知限制 5)。
-            let mut recognizer = new_recognizer(&current_asr(&app), current_asr_provider(&app), qwen3_hotwords(&app))
-                .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?;
-            let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
-                match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
-                    Ok(e) => Some(Box::new(e)),
-                    Err(e) => {
-                        eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
-                        None
-                    }
-                };
-            let seeds = load_voiceprint_seeds(&app);
-            let vad_path = models::root().join("silero_vad.onnx");
-            let factory: retranscribe::input::SegmenterFactory =
-                Box::new(move || new_silero(&vad_path));
-            let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
-                Box::new(retranscribe::input::MixedInput::new(dir.clone(), factory))
-            } else {
-                Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
-            };
             let slot2 = slot.clone();
             let note_id2 = note_id.clone();
             let app2 = app.clone();
@@ -2483,9 +2534,7 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                     message: None, summary: None,
                 });
             };
-            retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
-                &mut embedder, seeds, mixed, language_filter, &mut progress)
-                .map_err(|e| e.to_string())
+            run_retranscribe_once(&app, &note_id, mixed, language_filter, &mut progress)
         }));
         match body {
             Ok(Ok(summary)) => {

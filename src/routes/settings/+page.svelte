@@ -114,11 +114,12 @@
    * 选中移到新项——本地 state 显式改回旧值必触发 DOM 对齐,天然回弹。
    */
   let asrChoice = $state("sense_voice");
-  /** asr_model 后端值 → radio 本地 value 的四态映射(whisper/paraformer/qwen3/sense_voice)。 */
+  /** asr_model 后端值 → radio 本地 value 的五态映射(whisper/paraformer/qwen3/firered/sense_voice)。 */
   function asrModelToChoice(m: string | undefined): string {
     return m === "whisper" ? "whisper"
       : m === "paraformer" ? "paraformer"
       : m === "qwen3" ? "qwen3"
+      : m === "firered" ? "firered"
       : "sense_voice";
   }
   /** danger 横幅：迁移/删除/切型/下载的错误统一在此显示。 */
@@ -197,6 +198,7 @@
     settings?.asr_model === "whisper" ? "whisper"
       : settings?.asr_model === "paraformer" ? "paraformer"
       : settings?.asr_model === "qwen3" ? "qwen3"
+      : settings?.asr_model === "firered" ? "firered"
       : "asr",
   );
   const asrModelMissing = $derived(
@@ -223,10 +225,11 @@
   const modelsDirLabel = $derived(settings?.models_dir || t("settings.store.defaultDir"));
 
   // 声音处理方案三档(spec 2026-08-10)。settings 未回填前整组禁用,与其它开关同纪律。
+  // 默认档(成品轨)放首位;底层值 a/ab/b 不变,仅展示顺序与命名(2026-08-11 用户拍板去代号)。
   const audioSchemeItems = $derived<SegmentedItem[]>([
+    { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
     { id: "a", label: t("settings.record.audioScheme.a"), disabled: !settings },
     { id: "ab", label: t("settings.record.audioScheme.ab"), disabled: !settings },
-    { id: "b", label: t("settings.record.audioScheme.b"), disabled: !settings },
   ]);
 
   // 录音音频保留期三档,同 audioSchemeItems 纪律。
@@ -253,6 +256,7 @@
   const asrModeItems = $derived<SegmentedItem[]>([
     { id: "local", label: t("settings.asrMode.local"), disabled: recording.isLive || !settings },
     { id: "cloud", label: t("settings.asrMode.cloud"), disabled: recording.isLive || !settings },
+    { id: "local_cloud", label: t("settings.asrMode.localCloud"), disabled: recording.isLive || !settings },
   ]);
   const cloudProviderItems = $derived<SegmentedItem[]>([
     { id: "volcano", label: t("settings.cloud.volcano"), disabled: recording.isLive || !settings },
@@ -298,7 +302,7 @@
     identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
-    asrMode = s.asr_mode === "cloud" ? "cloud" : "local";
+    asrMode = s.asr_mode === "cloud" || s.asr_mode === "local_cloud" ? s.asr_mode : "local";
     cloudProvider = s.cloud_asr_provider === "aliyun" ? "aliyun" : "volcano";
     volcAppKey = s.volc_app_key;
     volcAccessKey = s.volc_access_key;
@@ -661,7 +665,7 @@
     } catch (e) {
       error = `${e}`;
       settings = await getSettings().catch(() => settings);
-      asrMode = settings?.asr_mode === "cloud" ? "cloud" : "local";
+      asrMode = settings?.asr_mode === "cloud" || settings?.asr_mode === "local_cloud" ? settings.asr_mode : "local";
     }
   }
 
@@ -722,7 +726,11 @@
 <main class="container">
   <h1>{t("settings.title")}</h1>
   <p class="desc">
-    {asrMode === "cloud" ? t("settings.desc.cloud") : t("settings.desc.local")}
+    {asrMode === "cloud"
+      ? t("settings.desc.cloud")
+      : asrMode === "local_cloud"
+        ? t("settings.desc.localCloud")
+        : t("settings.desc.local")}
   </p>
 
   {#if error}
@@ -914,7 +922,11 @@
         <div class="row-info">
           <span class="row-label">{t("settings.asrMode.label")}</span>
           <span class="row-desc">
-            {asrMode === "cloud" ? t("settings.asrMode.cloudDesc") : t("settings.asrMode.localDesc")}
+            {asrMode === "cloud"
+              ? t("settings.asrMode.cloudDesc")
+              : asrMode === "local_cloud"
+                ? t("settings.asrMode.localCloudDesc")
+                : t("settings.asrMode.localDesc")}
           </span>
         </div>
         <Segmented
@@ -926,7 +938,7 @@
           }}
         />
       </div>
-      {#if asrMode === "cloud"}
+      {#if asrMode !== "local"}
         <div class="row">
           <div class="row-info"><span class="row-label">{t("settings.cloud.provider")}</span></div>
           <Segmented
@@ -1009,7 +1021,9 @@
             {testingCloud ? t("settings.testing") : t("settings.cloud.test")}
           </button>
         </div>
-      {:else}
+      {/if}
+      <!-- 本地引擎选型:local 与 local_cloud 都要(后者实时仍走本地引擎)。 -->
+      {#if asrMode !== "cloud"}
         <div class="row">
           <div class="row-info">
             <span class="row-label">{t("settings.asr.label")}</span>
@@ -1020,7 +1034,9 @@
                   ? t("settings.asr.paraformerDesc")
                   : asrChoice === "qwen3"
                     ? t("settings.asr.qwen3Desc")
-                    : t("settings.asr.senseVoiceDesc")}
+                    : asrChoice === "firered"
+                      ? t("settings.asr.fireredDesc")
+                      : t("settings.asr.senseVoiceDesc")}
             </span>
           </div>
           <div class="seg" class:disabled={recording.isLive}>
@@ -1063,6 +1079,16 @@
                 disabled={recording.isLive || !settings}
                 onchange={() => changeAsr("qwen3")}
               />Qwen3
+            </label>
+            <label class="seg-item">
+              <input
+                type="radio"
+                name="asr"
+                value="firered"
+                bind:group={asrChoice}
+                disabled={recording.isLive || !settings}
+                onchange={() => changeAsr("firered")}
+              />FireRed
             </label>
           </div>
         </div>

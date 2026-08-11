@@ -34,6 +34,7 @@ pub fn asr_model_dir(asr_model: &str) -> PathBuf {
         "whisper" => "sherpa-onnx-whisper-base",
         "paraformer" => PF_DIR,
         "qwen3" => QWEN3_DIR,
+        "firered" => FR_DIR,
         _ => SV_DIR,
     };
     root().join(dir)
@@ -93,6 +94,7 @@ pub struct Artifact {
 
 const SV_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 pub const PF_DIR: &str = "sherpa-onnx-paraformer-zh-2023-09-14";
+pub const FR_DIR: &str = "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26";
 pub const QWEN3_DIR: &str = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
 
 pub const ARTIFACTS: &[Artifact] = &[
@@ -247,6 +249,31 @@ pub const ARTIFACTS: &[Artifact] = &[
             },
         ],
     },
+    Artifact {
+        id: "firered",
+        label: "语音识别（FireRedASR2 高精度）",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2",
+        kind: ArtifactKind::TarBz2 { dest_dir: FR_DIR },
+        approx_mb: 800,
+        prune: &["sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/test_wavs"],
+        files: &[
+            FinalFile {
+                rel_path: "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx",
+                bytes: 817_286_833,
+                sha256: "54048d66b6e8f3c80ea7ce95efe794587b0fd81d7271651d0decd3803852ae82",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/decoder.int8.onnx",
+                bytes: 417_291_928,
+                sha256: "b840ce7196ae4a14d05ae84bbf56082b6b61ccec5610fda907dddbcea37354ff",
+            },
+            FinalFile {
+                rel_path: "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/tokens.txt",
+                bytes: 79_172,
+                sha256: "1bc613de2112d257e61a349c3e72d1b1a9cf19c33d3ca954197ad2171e5ea07b",
+            },
+        ],
+    },
     // DTLN-aec 256 档：增值层神经残余回声消除。两个裸 onnx 工件（非压缩包），
     // 各自独立 URL/哈希，形状照抄 vad/speaker 的单文件 Artifact（File kind 一 url 一 file，
     // TarBz2 不适用——非压缩包）。not required_for_recording：模型不在场时清洗管线
@@ -293,10 +320,12 @@ pub fn required_now(id: &str, asr_model: &str) -> bool {
             asr_model != crate::settings::ASR_WHISPER
                 && asr_model != crate::settings::ASR_PARAFORMER
                 && asr_model != crate::settings::ASR_QWEN3
+                && asr_model != crate::settings::ASR_FIRERED
         }
         "whisper" => asr_model == crate::settings::ASR_WHISPER,
         "paraformer" => asr_model == crate::settings::ASR_PARAFORMER,
         "qwen3" => asr_model == crate::settings::ASR_QWEN3,
+        "firered" => asr_model == crate::settings::ASR_FIRERED,
         _ => false,
     }
 }
@@ -413,13 +442,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_covers_nine_artifacts_with_qwen3_whisper_paraformer_and_dtln_aec() {
+    fn manifest_covers_ten_artifacts_with_qwen3_firered_whisper_paraformer_and_dtln_aec() {
         let ids: Vec<&str> = ARTIFACTS.iter().map(|a| a.id).collect();
         assert_eq!(
             ids,
             vec![
                 "vad", "speaker", "speaker-eres2netv2", "asr", "whisper", "paraformer",
-                "qwen3", "dtln_aec_256_1", "dtln_aec_256_2",
+                "qwen3", "firered", "dtln_aec_256_1", "dtln_aec_256_2",
             ]
         );
         let w = ARTIFACTS.iter().find(|a| a.id == "whisper").unwrap();
@@ -430,9 +459,20 @@ mod tests {
         assert!(matches!(q.kind, ArtifactKind::TarBz2 { dest_dir: QWEN3_DIR }));
         assert_eq!(q.files.len(), 6, "三个 onnx + tokenizer 三件");
         assert!(!q.prune.is_empty(), "test_wavs 装好即删");
+        let fr = ARTIFACTS.iter().find(|a| a.id == "firered").unwrap();
+        assert!(matches!(fr.kind, ArtifactKind::TarBz2 { dest_dir: FR_DIR }));
+        assert_eq!(fr.files.len(), 3, "encoder + decoder + tokens");
+        assert!(!fr.prune.is_empty(), "test_wavs 装好即删");
         for a in ARTIFACTS {
             for f in a.files { assert_eq!(f.sha256.len(), 64); }
         }
+    }
+
+    #[test]
+    fn firered_required_only_when_selected() {
+        assert!(required_now("firered", crate::settings::ASR_FIRERED));
+        assert!(!required_now("firered", crate::settings::ASR_SENSE_VOICE));
+        assert!(!required_now("asr", crate::settings::ASR_FIRERED), "选 firered 时 SenseVoice 非必需");
     }
 
     #[test]
