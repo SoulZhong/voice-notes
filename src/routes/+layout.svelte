@@ -182,6 +182,8 @@
   /* 全局升级横幅:内容区顶部,与页面内边距对齐(各页 container 多为 1.5rem 内边距) */
   .update-banner {
     display: flex;
+    /* 窄窗允许折行:定宽进度条+不折行文案会把「知道了」挤出可视区(codex P2) */
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.4em;
     background: var(--warning-tint);
@@ -216,12 +218,16 @@
     align-items: center;
     gap: 0.55em;
     margin: 0 0.2em;
+    /* 随横幅弹性伸缩,窄窗时轨道先让位(min-width 兜底可辨认) */
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .forge-track {
     position: relative;
-    width: 150px;
+    flex: 1 1 90px;
+    max-width: 150px;
+    min-width: 60px;
     height: 7px;
-    flex: none;
     border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--warning-ink) 18%, transparent);
     box-shadow: inset 0 1px 3px rgb(0 0 0 / 35%);
