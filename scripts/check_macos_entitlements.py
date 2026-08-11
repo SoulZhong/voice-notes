@@ -24,6 +24,7 @@ REQUIRED_ENTITLEMENTS = {
 # Info.plist 用途声明键:必须存在且非空字符串。
 REQUIRED_USAGE_KEYS = [
     "NSMicrophoneUsageDescription",
+    "NSAudioCaptureUsageDescription",
     "NSCalendarsUsageDescription",
     "NSCalendarsFullAccessUsageDescription",
 ]

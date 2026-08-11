@@ -63,6 +63,7 @@
   // 授权残留自愈:换签名后旧 TCC 条目压住新二进制——系统设置里开关已开却仍未授权,
   // 拨动开关/重启都无效。走过一轮「立即授权」仍失败才亮出修复入口(避免吓到首次
   // 授权的用户);修复=清掉本应用的屏幕录制授权记录,再重走一遍系统授权。
+  // 增强(macOS 26.6.1):修复同时清掉 ScreenCapture 与 AudioCapture 两份旧签名记录。
   let triedScreenAuth = $state(false);
   const showPermFix = $derived(triedScreenAuth && !screenPerm);
   async function fixScreenPerm() {
