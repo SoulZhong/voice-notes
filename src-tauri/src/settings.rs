@@ -31,6 +31,113 @@ pub const ASR_MODE_LOCAL_CLOUD: &str = "local_cloud";
 pub fn cloud_second_pass_wanted(s: &Settings) -> bool {
     s.asr_mode == ASR_MODE_LOCAL_CLOUD && cloud_creds_ok(s)
 }
+
+// —— AI 执行体分层(2026-08-11 设计:docs/superpowers/specs/2026-08-11-ai-executor-separation-design.md)——
+// 资源层(LlmProfile/AgentProfile)与功能层(refine_executor/relations_executor 引用)
+// 解耦;所有 AI 功能(整理/标题/关系分析/未来纠错)一律经 resolve_executor 取执行体,
+// 不再各自读散字段。
+
+/// 在线模型档案。id 稳定(增删改不影响引用),label 用户可改。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmProfile {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+/// 本机 Agent 档案:kind 即身份。bin 空 = 按常见安装位置自动探测;
+/// model 空 = 该 CLI 自己的默认模型。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub kind: String,
+    #[serde(default)]
+    pub bin: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+/// 引用执行体的 AI 功能。新功能 = 此枚举加一项 + settings 加一个 `<feature>_executor`。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AiFeature {
+    Refine,
+    Relations,
+}
+
+/// 解析后的执行体(provider 无关的消费面)。转 refine::llm::LlmConfig /
+/// refine::agent::AgentKind 在调用方边缘做,settings 层不反向依赖 refine。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedExecutor {
+    Http { base_url: String, model: String, api_key: String },
+    Agent { kind: String, bin: String, model: String },
+}
+
+/// 功能 → 执行体引用字符串(Relations 空引用回落 Refine)。
+fn executor_ref<'a>(s: &'a Settings, f: AiFeature) -> &'a str {
+    match f {
+        AiFeature::Refine => s.refine_executor.trim(),
+        AiFeature::Relations => {
+            let r = s.relations_executor.trim();
+            if r.is_empty() { s.refine_executor.trim() } else { r }
+        }
+    }
+}
+
+/// 执行体解析单一真源。引用悬空(profile 已删/未配置)→ None,调用方按未配置降级。
+/// agent 引用即使无档案条目也解析成功(bin/model 走默认探测)——与旧
+/// refine_agent_ready "bin 探测留给运行时" 的语义一致。
+pub fn resolve_executor(s: &Settings, f: AiFeature) -> Option<ResolvedExecutor> {
+    let r = executor_ref(s, f);
+    if let Some(id) = r.strip_prefix("llm:") {
+        s.llm_profiles.iter().find(|p| p.id == id).map(|p| ResolvedExecutor::Http {
+            base_url: p.base_url.trim().to_string(),
+            model: p.model.trim().to_string(),
+            api_key: p.api_key.trim().to_string(),
+        })
+    } else if let Some(kind) = r.strip_prefix("agent:") {
+        let ap = s.agent_profiles.iter().find(|a| a.kind == kind);
+        Some(ResolvedExecutor::Agent {
+            kind: kind.to_string(),
+            bin: ap.map(|a| a.bin.trim().to_string()).unwrap_or_default(),
+            model: ap.map(|a| a.model.trim().to_string()).unwrap_or_default(),
+        })
+    } else {
+        None
+    }
+}
+
+/// 执行体就绪:Http 三项齐;Agent 引用即就绪(bin 探测留运行时)。
+/// 注意这里不含 refine_enabled——功能开关与执行体就绪是两回事,由调用方组合。
+pub fn executor_ready(s: &Settings, f: AiFeature) -> bool {
+    match resolve_executor(s, f) {
+        Some(ResolvedExecutor::Http { base_url, model, api_key }) => {
+            !base_url.is_empty() && !model.is_empty() && !api_key.is_empty()
+        }
+        Some(ResolvedExecutor::Agent { .. }) => true,
+        None => false,
+    }
+}
+
+/// 迁移用:旧单份 HTTP 配置生成的档案固定 id(迁移幂等的一部分)。
+pub const MIGRATED_LLM_PROFILE_ID: &str = "p-migrated";
+
+/// 按 base_url 猜服务商名做迁移档案的初始 label(用户可改,猜错无害)。
+fn guess_llm_label(base_url: &str) -> String {
+    let b = base_url.to_lowercase();
+    for (needle, label) in [
+        ("deepseek", "DeepSeek"),
+        ("dashscope", "Qwen"),
+        ("volces", "Doubao"),
+        ("moonshot", "Kimi"),
+        ("openai.com", "OpenAI"),
+    ] {
+        if b.contains(needle) {
+            return label.to_string();
+        }
+    }
+    "Custom".to_string()
+}
 /// 云端厂商标识。
 pub const CLOUD_VOLCANO: &str = "volcano";
 pub const CLOUD_ALIYUN: &str = "aliyun";
@@ -91,23 +198,19 @@ pub struct Settings {
     pub shortcut: String,
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
     pub tray_enabled: bool,
-    /// 会后 LLM Aing 总开关(A2)。默认关,配好 key 后由用户打开。
+    /// 会后 LLM Aing 总开关(A2)。默认关,配好执行体后由用户打开。
     pub refine_enabled: bool,
-    /// A2 执行体:"openai"(HTTP chat completions)| "agent"(本机 Agent CLI 经
-    /// MCP 读写回)。老配置缺字段 → openai,行为不变。
-    pub refine_provider: String,
-    /// provider=agent 时用哪家 CLI:claude|codex|gemini|cursor。
-    pub refine_agent: String,
-    /// Agent CLI 可执行文件路径覆盖;空 = 按常见安装位置自动探测。
-    pub refine_agent_bin: String,
-    /// Agent 模型名(传给 CLI 的 --model/-m);空 = 该 CLI 自己的默认模型。
-    pub refine_agent_model: String,
-    /// OpenAI 兼容 chat completions 的 base_url,如 https://api.deepseek.com。
-    pub refine_base_url: String,
-    /// 模型名,如 deepseek-chat。
-    pub refine_model: String,
-    /// API key。明文存本机 settings.json(单机应用,设置页已注明)。
-    pub refine_api_key: String,
+    /// 资源层:在线模型档案(2026-08-11 执行体分层设计)。可被多个 AI 功能引用,
+    /// 配置一次处处可用;api_key 明文存本机(单机应用,设置页已注明)。
+    pub llm_profiles: Vec<LlmProfile>,
+    /// 资源层:本机 Agent 档案。kind 即身份(claude|codex|gemini|cursor),
+    /// 至多一条/种;探测状态是运行时信息,不落盘。
+    pub agent_profiles: Vec<AgentProfile>,
+    /// 功能层:AI 整理(含标题生成)的执行体引用。
+    /// 格式 "llm:<profile_id>" | "agent:<kind>" | ""(未配置)。
+    pub refine_executor: String,
+    /// 功能层:关系分析执行体;空 = 跟随 refine_executor(默认,免二次配置)。
+    pub relations_executor: String,
     /// 首启引导已完成(欢迎层「开始使用」下载完成或进入「高级设置」时置 true)。
     /// 老用户升级(字段缺失)反序列化为 false,但 layout 侧发现模型已就绪会静默补 true,
     /// 不会对老用户弹引导。
@@ -193,6 +296,16 @@ struct SettingsRepr {
     tray_enabled: bool,
     #[serde(default)]
     refine_enabled: bool,
+    // —— 新键(2026-08-11 执行体分层) ——
+    #[serde(default)]
+    llm_profiles: Vec<LlmProfile>,
+    #[serde(default)]
+    agent_profiles: Vec<AgentProfile>,
+    #[serde(default)]
+    refine_executor: String,
+    #[serde(default)]
+    relations_executor: String,
+    // —— 旧键(仅迁移期反序列化,Settings 不再持有,写出时不再出现) ——
     #[serde(default = "default_refine_provider")]
     refine_provider: String,
     #[serde(default = "default_refine_agent")]
@@ -236,6 +349,44 @@ struct SettingsRepr {
 
 impl From<SettingsRepr> for Settings {
     fn from(r: SettingsRepr) -> Self {
+        // 旧 refine_* 散字段 → 资源档案 + executor 引用的一次性迁移。幂等判据:
+        // 新键任一有内容(档案非空或 refine_executor 非空)即视为已迁移/新世界写入,
+        // 完全忽略旧键——set_settings 回写的全量 JSON 只带新键,不会重复触发。
+        // 三种老形态:纯 HTTP(base_url 非空)/纯 agent(provider=agent)/两者都配过
+        // ——资源全迁,executor 按旧 provider 定向;失败面为零(纯字段搬运,无 IO)。
+        let migrated = !r.llm_profiles.is_empty()
+            || !r.agent_profiles.is_empty()
+            || !r.refine_executor.trim().is_empty();
+        let mut llm_profiles = r.llm_profiles.clone();
+        let mut agent_profiles = r.agent_profiles.clone();
+        let mut refine_executor = r.refine_executor.clone();
+        if !migrated {
+            if !r.refine_base_url.trim().is_empty() {
+                llm_profiles.push(LlmProfile {
+                    id: MIGRATED_LLM_PROFILE_ID.into(),
+                    label: guess_llm_label(&r.refine_base_url),
+                    base_url: r.refine_base_url.trim().into(),
+                    model: r.refine_model.trim().into(),
+                    api_key: r.refine_api_key.trim().into(),
+                });
+            }
+            let agent_configured =
+                !r.refine_agent_bin.trim().is_empty() || !r.refine_agent_model.trim().is_empty();
+            if r.refine_provider == "agent" || agent_configured {
+                agent_profiles.push(AgentProfile {
+                    kind: r.refine_agent.clone(),
+                    bin: r.refine_agent_bin.trim().into(),
+                    model: r.refine_agent_model.trim().into(),
+                });
+            }
+            refine_executor = if r.refine_provider == "agent" {
+                format!("agent:{}", r.refine_agent)
+            } else if !r.refine_base_url.trim().is_empty() {
+                format!("llm:{MIGRATED_LLM_PROFILE_ID}")
+            } else {
+                String::new()
+            };
+        }
         Self {
             mirror_enabled: r.mirror_enabled,
             data_dir: r.data_dir,
@@ -256,13 +407,10 @@ impl From<SettingsRepr> for Settings {
             shortcut: r.shortcut,
             tray_enabled: r.tray_enabled,
             refine_enabled: r.refine_enabled,
-            refine_provider: r.refine_provider,
-            refine_agent: r.refine_agent,
-            refine_agent_bin: r.refine_agent_bin,
-            refine_agent_model: r.refine_agent_model,
-            refine_base_url: r.refine_base_url,
-            refine_model: r.refine_model,
-            refine_api_key: r.refine_api_key,
+            llm_profiles,
+            agent_profiles,
+            refine_executor,
+            relations_executor: r.relations_executor,
             onboarded: r.onboarded,
             completed_guides: r.completed_guides,
             mcp_allow_control: r.mcp_allow_control,
@@ -404,13 +552,10 @@ impl Default for Settings {
             shortcut: default_shortcut(),
             tray_enabled: true,
             refine_enabled: false,
-            refine_provider: default_refine_provider(),
-            refine_agent: default_refine_agent(),
-            refine_agent_bin: String::new(),
-            refine_agent_model: String::new(),
-            refine_base_url: String::new(),
-            refine_model: String::new(),
-            refine_api_key: String::new(),
+            llm_profiles: Vec::new(),
+            agent_profiles: Vec::new(),
+            refine_executor: String::new(),
+            relations_executor: String::new(),
             onboarded: false,
             completed_guides: Vec::new(),
             mcp_allow_control: false,
@@ -757,10 +902,10 @@ mod tests {
     fn refine_defaults_off_and_empty() {
         let s = Settings::default();
         assert!(!s.refine_enabled);
-        assert!(s.refine_base_url.is_empty() && s.refine_model.is_empty() && s.refine_api_key.is_empty());
-        assert_eq!(s.refine_provider, "openai", "默认执行体是 HTTP,老用户行为不变");
-        assert_eq!(s.refine_agent, "claude");
-        assert!(s.refine_agent_bin.is_empty() && s.refine_agent_model.is_empty());
+        assert!(s.llm_profiles.is_empty() && s.agent_profiles.is_empty());
+        assert!(s.refine_executor.is_empty() && s.relations_executor.is_empty());
+        assert_eq!(resolve_executor(&s, AiFeature::Refine), None, "未配置 → 无执行体");
+        assert!(!executor_ready(&s, AiFeature::Refine));
         assert_eq!(ASR_PARAFORMER, "paraformer");
     }
 
@@ -771,8 +916,117 @@ mod tests {
         let s = load(dir.path());
         assert_eq!(s.asr_model, "whisper");
         assert!(!s.refine_enabled);
-        assert_eq!(s.refine_provider, "openai", "缺字段回落 openai");
-        assert_eq!(s.refine_agent, "claude");
+        assert!(s.llm_profiles.is_empty() && s.refine_executor.is_empty(), "无旧配置无可迁移");
+    }
+
+    // —— 执行体分层:迁移与解析(2026-08-11 设计) ——
+
+    #[test]
+    fn migration_pure_http_becomes_profile_and_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"refine_enabled":true,"refine_provider":"openai",
+                "refine_base_url":"https://api.deepseek.com/v1",
+                "refine_model":"deepseek-chat","refine_api_key":"sk-x"}"#,
+        )
+        .unwrap();
+        let s = load(dir.path());
+        assert_eq!(s.llm_profiles.len(), 1);
+        let p = &s.llm_profiles[0];
+        assert_eq!((p.id.as_str(), p.label.as_str()), (MIGRATED_LLM_PROFILE_ID, "DeepSeek"));
+        assert_eq!(s.refine_executor, format!("llm:{MIGRATED_LLM_PROFILE_ID}"));
+        assert_eq!(
+            resolve_executor(&s, AiFeature::Refine),
+            Some(ResolvedExecutor::Http {
+                base_url: "https://api.deepseek.com/v1".into(),
+                model: "deepseek-chat".into(),
+                api_key: "sk-x".into()
+            })
+        );
+        assert!(executor_ready(&s, AiFeature::Refine));
+        // Relations 空引用回落 Refine。
+        assert_eq!(resolve_executor(&s, AiFeature::Relations), resolve_executor(&s, AiFeature::Refine));
+    }
+
+    #[test]
+    fn migration_agent_and_mixed_configs() {
+        // 纯 agent。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"refine_provider":"agent","refine_agent":"codex","refine_agent_model":"gpt-5-codex"}"#,
+        )
+        .unwrap();
+        let s = load(dir.path());
+        assert_eq!(s.refine_executor, "agent:codex");
+        assert_eq!(s.agent_profiles.len(), 1);
+        assert_eq!(
+            resolve_executor(&s, AiFeature::Refine),
+            Some(ResolvedExecutor::Agent { kind: "codex".into(), bin: String::new(), model: "gpt-5-codex".into() })
+        );
+        // 两者都配过:资源全迁,executor 按旧 provider(agent)定向。
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir2.path().join("settings.json"),
+            r#"{"refine_provider":"agent","refine_agent":"claude",
+                "refine_base_url":"https://api.moonshot.cn/v1","refine_model":"m","refine_api_key":"k"}"#,
+        )
+        .unwrap();
+        let s2 = load(dir2.path());
+        assert_eq!(s2.llm_profiles.len(), 1, "HTTP 配置也保留为档案");
+        assert_eq!(s2.llm_profiles[0].label, "Kimi");
+        assert_eq!(s2.refine_executor, "agent:claude");
+    }
+
+    #[test]
+    fn migration_idempotent_new_keys_win() {
+        // 新旧键并存(迁移后又被旧版本写过旧键的极端情形):新键在场即忽略旧键。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"llm_profiles":[{"id":"p1","label":"A","base_url":"https://a/v1","model":"m1","api_key":"k1"}],
+                "refine_executor":"llm:p1",
+                "refine_base_url":"https://legacy/v1","refine_model":"legacy","refine_api_key":"lk"}"#,
+        )
+        .unwrap();
+        let s = load(dir.path());
+        assert_eq!(s.llm_profiles.len(), 1, "不重复生成迁移档案");
+        assert_eq!(s.llm_profiles[0].id, "p1");
+        assert_eq!(s.refine_executor, "llm:p1");
+        // 落盘回读(新世界只写新键)仍稳定。
+        save(dir.path(), &s).unwrap();
+        let s2 = load(dir.path());
+        assert_eq!(s2.llm_profiles, s.llm_profiles);
+        assert_eq!(s2.refine_executor, "llm:p1");
+    }
+
+    #[test]
+    fn executor_resolution_edge_cases() {
+        let mut s = Settings::default();
+        s.llm_profiles.push(LlmProfile {
+            id: "p1".into(),
+            label: "A".into(),
+            base_url: "https://a/v1".into(),
+            model: "m".into(),
+            api_key: String::new(),
+        });
+        // 悬空引用 → None(profile 已删)。
+        s.refine_executor = "llm:ghost".into();
+        assert_eq!(resolve_executor(&s, AiFeature::Refine), None);
+        // key 缺 → 可解析但未就绪。
+        s.refine_executor = "llm:p1".into();
+        assert!(resolve_executor(&s, AiFeature::Refine).is_some());
+        assert!(!executor_ready(&s, AiFeature::Refine), "HTTP 缺 key 未就绪");
+        // agent 引用无档案条目:解析成功(bin/model 空,探测留运行时),即就绪。
+        s.refine_executor = "agent:claude".into();
+        assert!(executor_ready(&s, AiFeature::Refine));
+        // Relations 显式引用优先于跟随。
+        s.relations_executor = "llm:p1".into();
+        assert!(matches!(
+            resolve_executor(&s, AiFeature::Relations),
+            Some(ResolvedExecutor::Http { .. })
+        ));
     }
 
     #[test]

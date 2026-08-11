@@ -1,7 +1,16 @@
 <script lang="ts">
   // AI 页:Aing 大模型配置 + AI 助手接入(Task 2 自设置页迁入)。
   import { onMount } from "svelte";
-  import { getSettings, setSettings, testRefineLlm, testRefineAgent, type Settings } from "$lib/models";
+  import {
+    getSettings,
+    setSettings,
+    testRefineLlm,
+    testRefineAgent,
+    type Settings,
+    type LlmProfile,
+    type AgentProfile,
+  } from "$lib/models";
+  import { executorReady } from "$lib/refineReady";
   import {
     mcpAgentsStatus,
     mcpRegister,
@@ -30,10 +39,22 @@
   /** danger 横幅：本页保存类操作的错误统一在此显示(精简自设置页的全局 error 横幅)。 */
   let error = $state("");
 
-  /** Aing:接口三字段的本地镜像(失败回弹靠本地 state 强制 DOM 对齐)。开关已移至设置页「录制」区。 */
+  // —— 执行体分层(2026-08-11 设计):资源层(在线模型档案/Agent 档案)与功能层
+  //    (refine_executor/relations_executor 引用)解耦,配置一次处处可用。 ——
+  /** 在线模型档案(settings 镜像)。 */
+  let llmProfiles = $state<LlmProfile[]>([]);
+  let agentProfiles = $state<AgentProfile[]>([]);
+  let refineExecutor = $state("");
+  let relationsExecutor = $state("");
+  /** 资源区当前编辑的档案 id 与其字段编辑缓冲(失焦保存回 llm_profiles)。 */
+  let selectedProfileId = $state("");
+  let profLabel = $state("");
   let refineBaseUrl = $state("");
   let refineModel = $state("");
   let refineKey = $state("");
+  /** 「+」新建菜单(模板列表)开合。 */
+  let addMenuOpen = $state(false);
+  let confirmDeleteProfile = $state(false);
   /** modelLabel/modelDesc/modelPlaceholder:该服务商对「模型」字段的定制文案(存 i18n 键,渲染处 t() 取值)。
       豆包(火山方舟)的调用凭据是控制台创建的「推理接入点」ID(ep- 开头),不是
       裸模型名——预填模型名对要求接入点的账号是坏值,故 model 留空、整行换文案。 */
@@ -61,35 +82,131 @@
     modelDesc?: string;
     modelPlaceholder?: string;
   }[];
-  /** 当前接口地址命中的预设(用户手改过地址就不再套预设文案)。 */
+  /** 选中档案命中的模板(定制「模型」字段文案,如豆包的接入点说明)。 */
   const activePreset = $derived(REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim()));
+  const selectedProfile = $derived(llmProfiles.find((p) => p.id === selectedProfileId));
 
-  /** 各服务商草稿(model/key):切换预设先暂存当前填写,切回时原样回填——配置不再被
-      预设默认值覆盖丢失(2026-08-11 冒烟反馈)。localStorage 持久,与 settings.json
-      明文存 key 同一威胁模型;真正生效的配置仍以 settings 为唯一真源,草稿只是
-      各家的编辑缓冲。自定义地址(不命中任何预设)不入草稿:无稳定身份,避免误回填。 */
+  /** 旧世界 localStorage 草稿(vn.refineDrafts)一次性转正为正式档案:用户在分层
+      改造前存过的多家 key 不丢。按 base_url 去重(后端迁移已把生效配置转成档案);
+      转正后清掉草稿键,此路径此后不再触发。 */
   const REFINE_DRAFTS_KEY = "vn.refineDrafts";
-  let refineDrafts = $state<Record<string, { base?: string; model: string; key: string }>>({});
-  /** 服务商 tab 的当前页:命中预设显示该家,否则落「自定义」页。 */
-  const activeProviderTab = $derived(activePreset?.label ?? "custom");
-  function stashDraft() {
-    const preset = REFINE_PRESETS.find((p) => p.base === refineBaseUrl.trim());
-    // 自定义地址也入草稿(连 base 一起存,tab 切回时整体回填);全空则无可存。
-    const id = preset ? preset.label : refineBaseUrl.trim() ? "custom" : null;
-    if (!id) return;
-    refineDrafts = {
-      ...refineDrafts,
-      [id]: { base: refineBaseUrl.trim(), model: refineModel.trim(), key: refineKey.trim() },
-    };
+  async function migrateLegacyDrafts(s: Settings) {
+    let drafts: Record<string, { base?: string; model: string; key: string }>;
     try {
-      localStorage.setItem(REFINE_DRAFTS_KEY, JSON.stringify(refineDrafts));
+      const raw = localStorage.getItem(REFINE_DRAFTS_KEY);
+      if (!raw) return;
+      drafts = JSON.parse(raw);
     } catch {
-      /* localStorage 不可用:仅本会话内记忆 */
+      return;
+    }
+    const additions: LlmProfile[] = [];
+    for (const [label, d] of Object.entries(drafts)) {
+      if (!d?.key?.trim()) continue; // 只转有密钥的草稿,空壳无价值
+      const preset = REFINE_PRESETS.find((p) => p.label === label);
+      const base = (preset?.base ?? d.base ?? "").trim();
+      if (!base) continue;
+      const exists = [...s.llm_profiles, ...additions].some((p) => p.base_url.trim() === base);
+      if (exists) continue;
+      additions.push({
+        id: newProfileId(),
+        label: preset ? label : t("ai.aing.tab.custom"),
+        base_url: base,
+        model: (d.model ?? "").trim() || (preset?.model ?? ""),
+        api_key: d.key.trim(),
+      });
+    }
+    if (additions.length) {
+      await saveSetting((fresh) => {
+        fresh.llm_profiles.push(...additions);
+      });
+    }
+    try {
+      localStorage.removeItem(REFINE_DRAFTS_KEY);
+    } catch {
+      /* 清不掉也无害:下次去重后仍是零新增 */
     }
   }
 
-  // —— Aing 执行体:在线接口(openai) / 本机 Agent CLI(agent,经 MCP 读写回) ——
-  let refineProvider = $state("openai");
+  function newProfileId(): string {
+    return "p-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  /** 同名模板重复新建时给 label 编号(DeepSeek、DeepSeek 2、…),id 才是身份。 */
+  function uniqueLabel(base: string): string {
+    if (!llmProfiles.some((p) => p.label === base)) return base;
+    let n = 2;
+    while (llmProfiles.some((p) => p.label === `${base} ${n}`)) n += 1;
+    return `${base} ${n}`;
+  }
+
+  function loadProfileFields() {
+    const p = llmProfiles.find((x) => x.id === selectedProfileId);
+    profLabel = p?.label ?? "";
+    refineBaseUrl = p?.base_url ?? "";
+    refineModel = p?.model ?? "";
+    refineKey = p?.api_key ?? "";
+  }
+
+  function selectProfile(id: string) {
+    if (id === selectedProfileId) return;
+    selectedProfileId = id;
+    llmTest = null;
+    confirmDeleteProfile = false;
+    loadProfileFields();
+  }
+
+  function saveProfile() {
+    llmTest = null;
+    const id = selectedProfileId;
+    if (!id) return;
+    void saveSetting((s) => {
+      const p = s.llm_profiles.find((x) => x.id === id);
+      if (!p) return;
+      p.label = profLabel.trim() || p.label;
+      p.base_url = refineBaseUrl.trim();
+      p.model = refineModel.trim();
+      p.api_key = refineKey.trim();
+    });
+  }
+
+  function addProfile(tpl: { label: string; labelKey?: string; base: string; model: string }) {
+    addMenuOpen = false;
+    const id = newProfileId();
+    const label = uniqueLabel(tpl.labelKey ? t(tpl.labelKey) : tpl.label);
+    void saveSetting((s) => {
+      s.llm_profiles.push({ id, label, base_url: tpl.base, model: tpl.model, api_key: "" });
+      // 首个档案顺手成为 AI 整理执行体:免去「建完还要去功能区选一次」的空转。
+      if (!s.refine_executor.trim()) s.refine_executor = `llm:${id}`;
+    }).then(() => {
+      selectedProfileId = id;
+      loadProfileFields();
+    });
+  }
+
+  function deleteProfile() {
+    confirmDeleteProfile = false;
+    const refstr = `llm:${selectedProfileId}`;
+    if (refineExecutor.trim() === refstr || relationsExecutor.trim() === refstr) {
+      error = t("ai.res.deleteInUse");
+      return;
+    }
+    void saveSetting((s) => {
+      s.llm_profiles = s.llm_profiles.filter((p) => p.id !== selectedProfileId);
+    });
+  }
+
+  // —— 功能层:执行体引用 ——
+  function setRefineExecutor(v: string) {
+    void saveSetting((s) => (s.refine_executor = v));
+  }
+  function setRelationsExecutor(v: string) {
+    void saveSetting((s) => (s.relations_executor = v));
+  }
+  const refineExecReady = $derived(
+    !!settings && !!refineExecutor.trim() && executorReady(settings, refineExecutor.trim()),
+  );
+
+  // —— 本机 Agent 档案(资源区):kind 为当前编辑的一家,bin/model 是其档案字段缓冲 ——
   let refineAgent = $state("claude");
   let refineAgentBin = $state("");
   let refineAgentModel = $state("");
@@ -267,24 +384,12 @@
 
   onMount(() => {
     backfillOpen = new URLSearchParams(window.location.search).get("backfill") === "relations";
-    try {
-      refineDrafts = JSON.parse(localStorage.getItem(REFINE_DRAFTS_KEY) ?? "{}");
-    } catch {
-      /* 草稿损坏:按空处理,不影响 settings 里的生效配置 */
-    }
     loadAiLogsTotal();
     (async () => {
       try {
         const s = await getSettings();
-        settings = s;
-        refineBaseUrl = s.refine_base_url;
-        refineModel = s.refine_model;
-        refineKey = s.refine_api_key;
-        refineProvider = s.refine_provider;
-        refineAgent = s.refine_agent;
-        refineAgentBin = s.refine_agent_bin;
-        refineAgentModel = s.refine_agent_model;
-        mcpAllowControl = s.mcp_allow_control;
+        syncFromSettings(s);
+        await migrateLegacyDrafts(s); // 旧 localStorage 草稿一次性转正为档案
       } catch { /* 首载失败:控件保持默认,操作时会再报错 */ }
     })();
     refineAgentsProbe().then((v) => (agentProbe = v)).catch(() => {});
@@ -295,74 +400,54 @@
     mcpCapabilities().then((v) => (capabilities = v)).catch((e) => (capError = String(e)));
   });
 
-  // —— 通用「取新鲜值→改→存」保存(精简自设置页 saveSetting:只回弹本页用到的字段) ——
+  /** settings → 本页各镜像 state。selectedProfileId 悬空时回落第一份档案。 */
+  function syncFromSettings(s: Settings) {
+    settings = s;
+    llmProfiles = s.llm_profiles;
+    agentProfiles = s.agent_profiles;
+    refineExecutor = s.refine_executor;
+    relationsExecutor = s.relations_executor;
+    mcpAllowControl = s.mcp_allow_control;
+    if (!llmProfiles.some((p) => p.id === selectedProfileId)) {
+      selectedProfileId = llmProfiles[0]?.id ?? "";
+    }
+    loadProfileFields();
+    const ap = agentProfiles.find((a) => a.kind === refineAgent);
+    refineAgentBin = ap?.bin ?? "";
+    refineAgentModel = ap?.model ?? "";
+  }
+
+  // —— 通用「取新鲜值→改→存」保存(精简自设置页 saveSetting:失败回弹全部镜像) ——
   async function saveSetting(mut: (s: Settings) => void) {
     error = "";
     try {
       const fresh = await getSettings();
       mut(fresh);
       await setSettings(fresh);
-      settings = fresh;
-      refineBaseUrl = fresh.refine_base_url;
-      refineModel = fresh.refine_model;
-      refineKey = fresh.refine_api_key;
-      refineProvider = fresh.refine_provider;
-      refineAgent = fresh.refine_agent;
-      refineAgentBin = fresh.refine_agent_bin;
-      refineAgentModel = fresh.refine_agent_model;
-      mcpAllowControl = fresh.mcp_allow_control;
+      syncFromSettings(fresh);
     } catch (e) {
       error = t("common.saveFailed", { e });
-      settings = await getSettings().catch(() => settings);
-      if (settings) {
-        refineBaseUrl = settings.refine_base_url;
-        refineModel = settings.refine_model;
-        refineKey = settings.refine_api_key;
-        refineProvider = settings.refine_provider;
-        refineAgent = settings.refine_agent;
-        refineAgentBin = settings.refine_agent_bin;
-        refineAgentModel = settings.refine_agent_model;
-        mcpAllowControl = settings.mcp_allow_control;
-      }
+      const rolled = await getSettings().catch(() => settings);
+      if (rolled) syncFromSettings(rolled);
     }
   }
 
-  /** 切服务商 tab:先暂存当前页填写,再回填目标页草稿(无草稿用该家默认值起底)。
-      key 是各家各自的凭证:首次切到新家清空——沿用上一家的 key 只会让「测试连接」
-      拿错凭证白失败一次。 */
-  function selectProviderTab(id: string) {
-    if (id === activeProviderTab) return;
-    stashDraft();
-    const d = refineDrafts[id];
-    if (id === "custom") {
-      refineBaseUrl = d?.base ?? "";
-      refineModel = d?.model ?? "";
-      refineKey = d?.key ?? "";
-    } else {
-      const p = REFINE_PRESETS.find((x) => x.label === id);
-      if (!p) return;
-      refineBaseUrl = p.base;
-      refineModel = d ? d.model : p.model;
-      refineKey = d ? d.key : "";
-    }
-    saveRefine();
-  }
-  function saveRefine() {
-    llmTest = null;
-    stashDraft(); // 字段编辑同步进当前服务商草稿,切走切回不丢
-    saveSetting((s) => {
-      s.refine_base_url = refineBaseUrl.trim();
-      s.refine_model = refineModel.trim();
-      s.refine_api_key = refineKey.trim();
-    });
+  /** Agent 卡:切编辑哪家 CLI(纯 UI 态,不落盘)/字段失焦保存该家档案。 */
+  function selectAgentKind(kind: string) {
+    refineAgent = kind;
+    agentTest = null;
+    const ap = agentProfiles.find((a) => a.kind === kind);
+    refineAgentBin = ap?.bin ?? "";
+    refineAgentModel = ap?.model ?? "";
   }
   function saveRefineAgent() {
     agentTest = null;
-    saveSetting((s) => {
-      s.refine_provider = refineProvider;
-      s.refine_agent = refineAgent;
-      s.refine_agent_bin = refineAgentBin.trim();
-      s.refine_agent_model = refineAgentModel.trim();
+    const kind = refineAgent;
+    const entry = { kind, bin: refineAgentBin.trim(), model: refineAgentModel.trim() };
+    void saveSetting((s) => {
+      const i = s.agent_profiles.findIndex((a) => a.kind === kind);
+      if (i >= 0) s.agent_profiles[i] = entry;
+      else s.agent_profiles.push(entry);
     });
   }
 
@@ -501,6 +586,27 @@
 <div class="page">
   <header class="topbar"><h1>AI</h1></header>
 
+  <!-- 执行体选项(功能区两个选择器共用):在线模型档案 + 本机 Agent,
+       未就绪状态直接标注在选项文本里,不让用户选完才发现不可用。 -->
+  {#snippet executorOptions()}
+    {#if llmProfiles.length}
+      <optgroup label={t("ai.exec.groupLlm")}>
+        {#each llmProfiles as p (p.id)}
+          <option value={"llm:" + p.id}>
+            {p.label}{p.api_key.trim() ? "" : ` · ${t("ai.exec.missingKey")}`}
+          </option>
+        {/each}
+      </optgroup>
+    {/if}
+    <optgroup label={t("ai.exec.groupAgent")}>
+      {#each AGENT_OPTIONS as a (a.key)}
+        <option value={"agent:" + a.key}>
+          {a.label}{!(a.key in agentProbe) || agentProbe[a.key] ? "" : ` · ${t("ai.exec.notDetected")}`}
+        </option>
+      {/each}
+    </optgroup>
+  {/snippet}
+
   {#if error}
     <div class="banner">{error}</div>
   {/if}
@@ -550,122 +656,75 @@
     </p>
   </section>
 
-  <!-- —— Aing:settings-row 语言,与下方「AI 助手接入」卡同构 —— -->
+  <!-- —— AI 整理(功能区):只选执行体;模型/Agent 的连接配置在下方资源区,
+       配置一次可被多个 AI 功能复用(2026-08-11 执行体分层) —— -->
   <section id="aing-settings" class="anchor-section" class:guide-target={guideActive && guideStep === 0}>
     <h2 class="section-title">{t("ai.aing.sectionTitle")}</h2>
     <div class="rows">
       <div class="row">
         <div class="row-info">
-          <span class="row-label">{t("ai.aing.provider.label")}</span>
+          <span class="row-label">{t("ai.exec.label")}</span>
           <span class="row-desc">
-            {refineProvider === "agent"
-              ? t("ai.aing.provider.agentDesc")
-              : t("ai.aing.provider.openaiDesc")}
+            {#if !refineExecutor.trim()}
+              {t("ai.exec.noneDesc")}
+            {:else if !refineExecReady}
+              <span class="desc-warn">{t("ai.exec.notReadyDesc")}</span>
+            {:else}
+              {t("ai.exec.refineDesc")}
+            {/if}
           </span>
         </div>
-        <div class="seg">
-          <label class="seg-item">
-            <input type="radio" name="refine-provider" value="openai" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.openai")}
-          </label>
-          <label class="seg-item">
-            <input type="radio" name="refine-provider" value="agent" bind:group={refineProvider} onchange={saveRefineAgent} />{t("ai.aing.provider.agent")}
-          </label>
-        </div>
+        <select
+          class="row-select"
+          value={refineExecutor}
+          onchange={(e) => setRefineExecutor(e.currentTarget.value)}
+        >
+          <option value="">{t("ai.exec.none")}</option>
+          {@render executorOptions()}
+        </select>
       </div>
-      {#if refineProvider === "agent"}
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">Agent</span>
-            <span class="row-desc">
-              {#if refineAgentBin.trim()}
-                {t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
-              {:else if agentProbe[refineAgent]}
-                {t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
-              {:else if refineAgent in agentProbe}
-                <span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
-              {:else}
-                {t("ai.aing.agent.detecting")}
-              {/if}
-            </span>
-          </div>
-          <div class="seg">
-            {#each AGENT_OPTIONS as a (a.key)}
-              <label class="seg-item">
-                <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={saveRefineAgent} />
-                {a.label}
-              </label>
-            {/each}
-          </div>
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.model.label")}</span>
-            <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
-          </div>
-          <input
-            class="row-input"
-            placeholder={t(selectedAgentOption.modelHint)}
-            bind:value={refineAgentModel}
-            onblur={saveRefineAgent}
-            oninput={() => (agentTest = null)}
-          />
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.cliPath.label")}</span>
-            <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
-          </div>
-          <input
-            class="row-input wide"
-            placeholder={t("ai.aing.cliPath.placeholder")}
-            bind:value={refineAgentBin}
-            onblur={saveRefineAgent}
-            oninput={() => (agentTest = null)}
-          />
-        </div>
-        <div class="row">
-          <div class="row-info">
-            <span class="row-label">{t("ai.aing.testRun.label")}</span>
-            <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
-          </div>
-          <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
-            {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-          </button>
-        </div>
-        {#if agentTest}
-          <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
-            {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
-          </p>
-        {/if}
-        <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
-      {:else}
-        <!-- 服务商 tab(2026-08-11 用户拍板:去掉「一键填充」说明行,直接 tab 切换):
-             选中页 = 下方表单正在编辑的那家;绿点 = 该家已存过密钥,切回即回填。 -->
-        <div class="provider-tabs" role="tablist">
-          {#each REFINE_PRESETS as p (p.label)}
-            <button
-              role="tab"
-              aria-selected={activeProviderTab === p.label}
-              class="ptab"
-              class:active={activeProviderTab === p.label}
-              title={refineDrafts[p.label]?.key ? t("ai.aing.preset.savedTitle") : undefined}
-              onclick={() => selectProviderTab(p.label)}
-            >
-              {p.labelKey ? t(p.labelKey) : p.label}
-              {#if refineDrafts[p.label]?.key}<span class="chip-dot"></span>{/if}
-            </button>
-          {/each}
+      <p class="config-hint">{t("ai.aing.agentFailNote")}</p>
+    </div>
+  </section>
+
+  <!-- —— 在线模型(资源区):档案化的服务商连接,tab=档案,绿点=已配密钥 —— -->
+  <section id="online-models" class="anchor-section">
+    <h2 class="section-title">{t("ai.res.modelsTitle")}</h2>
+    <div class="rows">
+      <div class="provider-tabs" role="tablist">
+        {#each llmProfiles as p (p.id)}
           <button
             role="tab"
-            aria-selected={activeProviderTab === "custom"}
+            aria-selected={selectedProfileId === p.id}
             class="ptab"
-            class:active={activeProviderTab === "custom"}
-            title={refineDrafts["custom"]?.key ? t("ai.aing.preset.savedTitle") : undefined}
-            onclick={() => selectProviderTab("custom")}
+            class:active={selectedProfileId === p.id}
+            onclick={() => selectProfile(p.id)}
           >
-            {t("ai.aing.tab.custom")}
-            {#if refineDrafts["custom"]?.key}<span class="chip-dot"></span>{/if}
+            {p.label}
+            {#if p.api_key.trim()}<span class="chip-dot"></span>{/if}
           </button>
+        {/each}
+        <div class="add-wrap">
+          <button class="ptab add" title={t("ai.res.add")} onclick={() => (addMenuOpen = !addMenuOpen)}>+</button>
+          {#if addMenuOpen}
+            <div class="add-menu" role="menu">
+              {#each REFINE_PRESETS as p (p.label)}
+                <button class="add-item" onclick={() => addProfile(p)}>{p.labelKey ? t(p.labelKey) : p.label}</button>
+              {/each}
+              <button class="add-item" onclick={() => addProfile({ label: t("ai.aing.tab.custom"), base: "", model: "" })}>
+                {t("ai.aing.tab.custom")}
+              </button>
+            </div>
+          {/if}
+        </div>
+      </div>
+      {#if selectedProfile}
+        <div class="row">
+          <div class="row-info">
+            <span class="row-label">{t("ai.res.name")}</span>
+            <span class="row-desc">{t("ai.res.nameDesc")}</span>
+          </div>
+          <input class="row-input" bind:value={profLabel} onblur={saveProfile} />
         </div>
         <div class="row">
           <div class="row-info">
@@ -676,7 +735,7 @@
             class="row-input wide"
             placeholder="https://api.deepseek.com/v1"
             bind:value={refineBaseUrl}
-            onblur={saveRefine}
+            onblur={saveProfile}
             oninput={() => (llmTest = null)}
           />
         </div>
@@ -689,7 +748,7 @@
             class="row-input"
             placeholder={activePreset?.modelPlaceholder ?? "deepseek-chat"}
             bind:value={refineModel}
-            onblur={saveRefine}
+            onblur={saveProfile}
             oninput={() => (llmTest = null)}
           />
         </div>
@@ -703,7 +762,7 @@
             type="password"
             placeholder="sk-..."
             bind:value={refineKey}
-            onblur={saveRefine}
+            onblur={saveProfile}
             oninput={() => (llmTest = null)}
           />
         </div>
@@ -712,18 +771,25 @@
             <span class="row-label">{t("ai.aing.testConn.label")}</span>
             <span class="row-desc">{t("ai.aing.testConn.desc")}</span>
           </div>
-          <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
-            {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
-          </button>
+          <div class="row-actions">
+            {#if confirmDeleteProfile}
+              <button class="btn-secondary danger" onclick={deleteProfile}>{t("ai.res.confirmDelete")}</button>
+              <button class="btn-secondary" onclick={() => (confirmDeleteProfile = false)}>{t("settings.cancel")}</button>
+            {:else}
+              <button class="btn-secondary danger" onclick={() => (confirmDeleteProfile = true)}>{t("ai.action.remove")}</button>
+            {/if}
+            <button class="btn-secondary" onclick={runLlmTest} disabled={llmTesting || llmMissing}>
+              {llmTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+            </button>
+          </div>
         </div>
         {#if llmTest}
           <p class="test-result" class:ok={llmTest.ok} class:err={!llmTest.ok}>
             {llmTest.ok ? t("ai.aing.testOk", { msg: llmTest.msg }) : t("ai.aing.testFail", { msg: llmTest.msg })}
           </p>
         {/if}
-        {#if !refineBaseUrl || !refineModel || !refineKey}
-          <p class="config-hint">{t("ai.aing.configHint")}</p>
-        {/if}
+      {:else}
+        <p class="config-hint">{t("ai.res.empty")}</p>
       {/if}
     </div>
   </section>
@@ -732,6 +798,73 @@
   <section id="assistant-connect" class="anchor-section" class:guide-target={guideActive && guideStep === 1}>
     <h2 class="section-title">{t("ai.mcp.sectionTitle")}</h2>
     <div class="rows">
+      <!-- 本机 Agent 档案(资源区并入):每家 CLI 一份 bin/model,可被功能层引用为执行体 -->
+      <div class="group-title">{t("ai.res.agentTitle")}</div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">Agent</span>
+          <span class="row-desc">
+            {#if refineAgentBin.trim()}
+              {t("ai.aing.agent.usingPath", { path: shortPath(refineAgentBin) })}
+            {:else if agentProbe[refineAgent]}
+              {t("ai.aing.agent.found", { path: shortPath(agentProbe[refineAgent] ?? "") })}
+            {:else if refineAgent in agentProbe}
+              <span class="desc-warn">{t("ai.aing.agent.notFound")}</span>
+            {:else}
+              {t("ai.aing.agent.detecting")}
+            {/if}
+          </span>
+        </div>
+        <div class="seg">
+          {#each AGENT_OPTIONS as a (a.key)}
+            <label class="seg-item">
+              <input type="radio" name="refine-agent" value={a.key} bind:group={refineAgent} onchange={() => selectAgentKind(a.key)} />
+              {a.label}
+            </label>
+          {/each}
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("ai.aing.model.label")}</span>
+          <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
+        </div>
+        <input
+          class="row-input"
+          placeholder={t(selectedAgentOption.modelHint)}
+          bind:value={refineAgentModel}
+          onblur={saveRefineAgent}
+          oninput={() => (agentTest = null)}
+        />
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("ai.aing.cliPath.label")}</span>
+          <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
+        </div>
+        <input
+          class="row-input wide"
+          placeholder={t("ai.aing.cliPath.placeholder")}
+          bind:value={refineAgentBin}
+          onblur={saveRefineAgent}
+          oninput={() => (agentTest = null)}
+        />
+      </div>
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("ai.aing.testRun.label")}</span>
+          <span class="row-desc">{t("ai.aing.testRun.desc")}</span>
+        </div>
+        <button class="btn-secondary" onclick={runAgentTest} disabled={agentTesting || agentMissing}>
+          {agentTesting ? t("ai.aing.testing") : t("ai.aing.test")}
+        </button>
+      </div>
+      {#if agentTest}
+        <p class="test-result" class:ok={agentTest.ok} class:err={!agentTest.ok}>
+          {agentTest.ok ? t("ai.aing.testOk", { msg: agentTest.msg }) : t("ai.aing.testFail", { msg: agentTest.msg })}
+        </p>
+      {/if}
+      <div class="group-title">{t("ai.mcp.groupRegister")}</div>
       {#if mcpError}
         <div class="banner warn">{mcpError}</div>
       {/if}
@@ -876,6 +1009,20 @@
   <section>
     <h2 class="section-title">{t("ai.relations.sectionTitle")}</h2>
     <div class="rows">
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("ai.exec.label")}</span>
+          <span class="row-desc">{t("ai.exec.relationsDesc")}</span>
+        </div>
+        <select
+          class="row-select"
+          value={relationsExecutor}
+          onchange={(e) => setRelationsExecutor(e.currentTarget.value)}
+        >
+          <option value="">{t("ai.exec.follow")}</option>
+          {@render executorOptions()}
+        </select>
+      </div>
       <div class="row">
         <div class="row-info">
           <span class="row-label">{t("ai.relations.label")}</span>
@@ -1286,13 +1433,74 @@
     color: var(--ink);
     border-bottom-color: var(--accent);
   }
-  /* 已存密钥标记:小绿点,含义由 title 提示补全 */
+  /* 已存密钥标记:小绿点 */
   .chip-dot {
     width: 6px;
     height: 6px;
     border-radius: var(--radius-full);
     background: var(--success, var(--accent));
     flex: none;
+  }
+  /* 「+」新建档案:tab 条末位,弹出模板菜单 */
+  .add-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .ptab.add {
+    font-size: 1rem;
+    padding: 0.3em 0.5em;
+  }
+  .add-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 9rem;
+    background: var(--surface, var(--canvas));
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--radius-md);
+    box-shadow: 0 6px 24px rgb(0 0 0 / 18%);
+    padding: 0.3rem;
+  }
+  .add-item {
+    border: none;
+    background: none;
+    text-align: left;
+    padding: 0.45em 0.7em;
+    font-size: 0.88rem;
+    color: var(--ink);
+    cursor: pointer;
+    border-radius: var(--radius-sm, 6px);
+  }
+  .add-item:hover {
+    background: var(--surface-soft);
+  }
+  /* 执行体选择器:与 row-input 同语言的原生 select */
+  .row-select {
+    flex: none;
+    max-width: 16rem;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    padding: 0.4em 0.6em;
+    font-size: 0.88rem;
+  }
+  .row-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  /* 资源区行尾的按钮组(删除+测试并排) */
+  .row-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-left: auto;
+  }
+  .btn-secondary.danger {
+    color: var(--danger-ink);
+    border-color: var(--danger-ink);
   }
   .config-hint {
     font-size: 0.8rem;

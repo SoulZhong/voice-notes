@@ -291,32 +291,45 @@ fn run_retitle(args: &[String]) -> Result<i32, String> {
     let model_override = opt_value(args, "--model")?;
     let provider = match opt_value(args, "--agent")? {
         Some(key) => {
+            // 显式指定 agent:bin 覆盖取该 kind 自己的档案(执行体分层后按 kind 定位,
+            // 不再误用全局单一 bin 覆盖)。
             let kind = crate::refine::agent::AgentKind::from_key(&key)
                 .ok_or_else(|| format!("未知 agent: {key}(可用 claude|codex|gemini|cursor)"))?;
-            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin).ok_or_else(|| {
+            let bin_override = s
+                .agent_profiles
+                .iter()
+                .find(|a| a.kind == key)
+                .map(|a| a.bin.clone())
+                .unwrap_or_default();
+            let bin = crate::refine::agent::resolve_bin(kind, &bin_override).ok_or_else(|| {
                 format!("未检测到 {} 的命令行工具,请先安装并登录", kind.bin_name())
             })?;
             TitleProvider::Agent(kind, bin, model_override.unwrap_or_default())
         }
-        None if s.refine_provider == "agent" => {
-            let kind = crate::refine::agent::AgentKind::from_key(&s.refine_agent)
-                .ok_or_else(|| format!("设置里的 refine_agent 不认识: {}", s.refine_agent))?;
-            let bin = crate::refine::agent::resolve_bin(kind, &s.refine_agent_bin)
-                .ok_or_else(|| format!("未检测到 {} 的命令行工具", kind.bin_name()))?;
-            TitleProvider::Agent(kind, bin, model_override.unwrap_or(s.refine_agent_model))
-        }
-        None => {
-            if s.refine_base_url.is_empty() || s.refine_model.is_empty() || s.refine_api_key.is_empty() {
-                return Err("App 设置里没有可用的 AI 执行体(在线接口三项未配齐);\
-                            可在 AI 页配置,或用 --agent claude 直接走本机 Agent"
-                    .into());
+        // 未显式指定:跟随 AI 整理执行体(resolve_executor 单一真源)。
+        None => match crate::settings::resolve_executor(&s, crate::settings::AiFeature::Refine) {
+            Some(crate::settings::ResolvedExecutor::Agent { kind, bin, model }) => {
+                let k = crate::refine::agent::AgentKind::from_key(&kind)
+                    .ok_or_else(|| format!("设置里的 Agent 不认识: {kind}"))?;
+                let b = crate::refine::agent::resolve_bin(k, &bin)
+                    .ok_or_else(|| format!("未检测到 {} 的命令行工具", k.bin_name()))?;
+                TitleProvider::Agent(k, b, model_override.unwrap_or(model))
             }
-            TitleProvider::Http(crate::refine::llm::LlmConfig {
-                base_url: s.refine_base_url.clone(),
-                model: model_override.unwrap_or_else(|| s.refine_model.clone()),
-                api_key: s.refine_api_key.clone(),
-            })
-        }
+            Some(crate::settings::ResolvedExecutor::Http { base_url, model, api_key })
+                if !base_url.is_empty() && !model.is_empty() && !api_key.is_empty() =>
+            {
+                TitleProvider::Http(crate::refine::llm::LlmConfig {
+                    base_url,
+                    model: model_override.unwrap_or(model),
+                    api_key,
+                })
+            }
+            _ => {
+                return Err("App 设置里没有可用的 AI 执行体(未配置或未配齐);\
+                            可在 AI 页配置,或用 --agent claude 直接走本机 Agent"
+                    .into())
+            }
+        },
     };
 
     let mut renamed = 0usize;

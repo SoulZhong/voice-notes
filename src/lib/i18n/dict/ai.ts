@@ -37,7 +37,7 @@ export const zh = {
   "ai.guide.step1.eyebrow": "1 / 3 · 整理单次录音",
   "ai.guide.step1.title": "先选择 AI 的执行方式",
   "ai.guide.step1.body":
-    "这就是实际生效的设置。在线接口适合固定模型；本机 Agent 可复用已经登录的 Claude、Codex 等工具。你可以现在直接选择并测试。",
+    "在这里为 AI 整理选择执行体：在线模型档案适合固定模型，本机 Agent 可复用已登录的 Claude、Codex 等工具。模型与 Agent 在下方资源区配置一次，处处可用。",
   "ai.guide.step2.eyebrow": "2 / 3 · 接入现有工具",
   "ai.guide.step2.title": "在这里把笔记交给常用助手",
   "ai.guide.step2.body":
@@ -52,11 +52,6 @@ export const zh = {
 
   // —— /ai「AI 整理」区(Aing 配置) ——
   "ai.aing.sectionTitle": "AI 整理",
-  "ai.aing.provider.label": "AI 方式",
-  "ai.aing.provider.agentDesc": "用本机已登录的 AI 助手整理，不需要 API Key",
-  "ai.aing.provider.openaiDesc": "用 OpenAI 兼容的在线接口整理，需要 API Key",
-  "ai.aing.provider.openai": "在线接口",
-  "ai.aing.provider.agent": "本机 Agent",
   "ai.aing.agent.usingPath": "使用指定路径 {path}",
   "ai.aing.agent.found": "已找到 {path}",
   "ai.aing.agent.notFound": "未找到命令行工具:请先安装并登录,或在下方指定路径",
@@ -76,7 +71,6 @@ export const zh = {
   "ai.aing.agentFailNote": "AI 处理失败（如 Agent 未登录）时保留原文，不影响已保存的笔记。",
   // 服务商品牌名:中文界面用中文名,英文界面用其官方英文名(通义千问=Qwen、豆包=Doubao)。
   "ai.aing.preset.qwen": "通义千问",
-  "ai.aing.preset.savedTitle": "已保存过该服务商的配置,点击回填",
   "ai.aing.tab.custom": "自定义",
   "ai.aing.preset.doubao": "豆包",
   "ai.aing.baseUrl.label": "接口地址",
@@ -84,7 +78,6 @@ export const zh = {
   "ai.aing.apiKey.desc": "只保存在本机,不随笔记上传",
   "ai.aing.testConn.label": "测试连接",
   "ai.aing.testConn.desc": "发一条最小请求,验证接口地址 / 密钥 / 模型可用",
-  "ai.aing.configHint": "三项配齐后会后 AI 生效。",
   "ai.aing.doubao.modelLabel": "接入点",
   "ai.aing.doubao.modelDesc": "火山方舟的推理接入点 ID,在方舟控制台「在线推理」创建;部分模型也可直接填模型名",
   "ai.aing.agentModelHint.claude": "如 haiku、sonnet",
@@ -120,6 +113,28 @@ export const zh = {
   "ai.mcp.healed": "应用位置变更:已自动更新 {n} 个 AI 助手的注册路径。",
   "ai.mcp.privacyNote": "笔记内容经 AI 助手检索后会进入其模型上下文;本应用自身不联网上传任何内容。",
   "ai.mcp.readme": "详见 README",
+
+  // —— 执行体分层(2026-08-11):功能区选择器与在线模型资源区 ——
+  "ai.exec.label": "执行体",
+  "ai.exec.none": "未配置",
+  "ai.exec.noneDesc": "选择用哪个在线模型或本机 Agent 来整理转写(标题生成跟随)",
+  "ai.exec.notReadyDesc": "所选执行体未就绪:检查在线模型的密钥,或安装对应 Agent",
+  "ai.exec.refineDesc": "AI 整理与标题生成使用此执行体",
+  "ai.exec.relationsDesc": "关系分析使用的执行体;默认跟随 AI 整理",
+  "ai.exec.follow": "跟随 AI 整理",
+  "ai.exec.groupLlm": "在线模型",
+  "ai.exec.groupAgent": "本机 Agent",
+  "ai.exec.missingKey": "缺密钥",
+  "ai.exec.notDetected": "未检测到",
+  "ai.res.modelsTitle": "在线模型",
+  "ai.res.name": "名称",
+  "ai.res.nameDesc": "这份配置的显示名,可自定义",
+  "ai.res.add": "从模板新建配置",
+  "ai.res.empty": "还没有在线模型配置:点「+」从模板新建,配置一次可被多个 AI 功能复用",
+  "ai.res.deleteInUse": "该配置正被 AI 功能使用,请先在功能区改选其它执行体",
+  "ai.res.confirmDelete": "确认删除",
+  "ai.res.agentTitle": "本机 Agent",
+  "ai.mcp.groupRegister": "注册接入",
 
   // —— /ai「Agent 能调用什么」区 ——
   "ai.cap.sectionTitle": "Agent 能调用什么",
@@ -206,7 +221,7 @@ export const en = {
   "ai.guide.step1.eyebrow": "1 / 3 · Tidy a single recording",
   "ai.guide.step1.title": "First, choose how AI runs",
   "ai.guide.step1.body":
-    "These settings actually take effect. The online API suits a fixed model; a local agent reuses tools you are already signed in to, like Claude or Codex. You can pick one and test it right now.",
+    "Choose the executor for AI refine here: online model profiles suit a fixed model, while local agents reuse tools like Claude or Codex you are already signed in to. Configure models and agents once in the resource sections below and reuse them everywhere.",
   "ai.guide.step2.eyebrow": "2 / 3 · Connect existing tools",
   "ai.guide.step2.title": "Hand notes to the assistants you use",
   "ai.guide.step2.body":
@@ -221,11 +236,6 @@ export const en = {
   "ai.guide.next": "Next",
 
   "ai.aing.sectionTitle": "AI Refinement",
-  "ai.aing.provider.label": "AI method",
-  "ai.aing.provider.agentDesc": "Refine with an AI assistant already signed in on this machine; no API key needed",
-  "ai.aing.provider.openaiDesc": "Refine via an OpenAI-compatible online API; API key required",
-  "ai.aing.provider.openai": "Online API",
-  "ai.aing.provider.agent": "Local agent",
   "ai.aing.agent.usingPath": "Using specified path {path}",
   "ai.aing.agent.found": "Found {path}",
   "ai.aing.agent.notFound": "CLI tool not found: install and sign in first, or specify a path below",
@@ -246,7 +256,6 @@ export const en = {
   "ai.aing.agentFailNote":
     "If AI processing fails (e.g. the agent is not signed in), the original text is kept and saved notes are unaffected.",
   "ai.aing.preset.qwen": "Qwen",
-  "ai.aing.preset.savedTitle": "Config saved for this provider; click to restore",
   "ai.aing.tab.custom": "Custom",
   "ai.aing.preset.doubao": "Doubao",
   "ai.aing.baseUrl.label": "API base URL",
@@ -254,7 +263,6 @@ export const en = {
   "ai.aing.apiKey.desc": "Stored only on this device; never uploaded with your notes",
   "ai.aing.testConn.label": "Test connection",
   "ai.aing.testConn.desc": "Sends a minimal request to verify the base URL, key, and model work",
-  "ai.aing.configHint": "Post-meeting AI activates once all three fields are set.",
   "ai.aing.doubao.modelLabel": "Endpoint",
   "ai.aing.doubao.modelDesc":
     "Volcano Ark inference endpoint ID, created under “Online Inference” in the Ark console; some models also accept a plain model name",
@@ -295,6 +303,27 @@ export const en = {
   "ai.mcp.privacyNote":
     "Note content retrieved by an AI assistant enters that assistant's model context; this app itself never uploads anything.",
   "ai.mcp.readme": "See README",
+
+  "ai.exec.label": "Executor",
+  "ai.exec.none": "Not configured",
+  "ai.exec.noneDesc": "Choose which online model or local agent refines transcripts (titles follow)",
+  "ai.exec.notReadyDesc": "Selected executor is not ready: check the model's API key or install the agent",
+  "ai.exec.refineDesc": "Used by AI refine and title generation",
+  "ai.exec.relationsDesc": "Executor for relation analysis; follows AI refine by default",
+  "ai.exec.follow": "Follow AI refine",
+  "ai.exec.groupLlm": "Online models",
+  "ai.exec.groupAgent": "Local agents",
+  "ai.exec.missingKey": "no key",
+  "ai.exec.notDetected": "not detected",
+  "ai.res.modelsTitle": "Online models",
+  "ai.res.name": "Name",
+  "ai.res.nameDesc": "Display name of this profile; customizable",
+  "ai.res.add": "New profile from template",
+  "ai.res.empty": "No online model profiles yet: click \"+\" to create one from a template; configure once, reuse across AI features",
+  "ai.res.deleteInUse": "This profile is in use by an AI feature; pick another executor there first",
+  "ai.res.confirmDelete": "Confirm delete",
+  "ai.res.agentTitle": "Local agents",
+  "ai.mcp.groupRegister": "Registration",
 
   "ai.cap.sectionTitle": "What Agents Can Call",
   "ai.cap.tools": "MCP tools",

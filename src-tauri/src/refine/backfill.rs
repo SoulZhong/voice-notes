@@ -107,34 +107,30 @@ pub(crate) fn request_cancel(
     Ok(())
 }
 
-fn configured_provider(settings: &Settings) -> anyhow::Result<(&str, &str)> {
-    match settings.refine_provider.as_str() {
-        "openai" => {
-            anyhow::ensure!(
-                !settings.refine_model.trim().is_empty(),
-                "关系补建模型未配置"
-            );
-            Ok(("openai", settings.refine_model.trim()))
+/// 关系分析执行体的 (provider 标签, 模型):经 resolve_executor(Relations,空引用
+/// 回落 Refine)取执行体,标签沿用旧词表 "openai"/"agent"(preview↔confirm 对账与
+/// RelationExecutor::provider() 同词表)。
+fn configured_provider(settings: &Settings) -> anyhow::Result<(&'static str, String)> {
+    match crate::settings::resolve_executor(settings, crate::settings::AiFeature::Relations) {
+        Some(crate::settings::ResolvedExecutor::Http { model, .. }) => {
+            anyhow::ensure!(!model.trim().is_empty(), "关系补建模型未配置");
+            Ok(("openai", model.trim().to_string()))
         }
-        "agent" => {
-            let kind = crate::refine::agent::AgentKind::from_key(&settings.refine_agent)
-                .ok_or_else(|| anyhow::anyhow!("未知 Agent provider: {}", settings.refine_agent))?;
+        Some(crate::settings::ResolvedExecutor::Agent { kind, model, .. }) => {
+            let k = crate::refine::agent::AgentKind::from_key(&kind)
+                .ok_or_else(|| anyhow::anyhow!("未知 Agent provider: {kind}"))?;
             anyhow::ensure!(
                 matches!(
-                    kind,
+                    k,
                     crate::refine::agent::AgentKind::Claude
                         | crate::refine::agent::AgentKind::Gemini
                 ),
-                "{} Agent 无法结构性限制为两个关系 MCP 工具，本次补建已安全拒绝",
-                settings.refine_agent
+                "{kind} Agent 无法结构性限制为两个关系 MCP 工具，本次补建已安全拒绝"
             );
-            anyhow::ensure!(
-                !settings.refine_agent_model.trim().is_empty(),
-                "关系补建 Agent 模型未配置"
-            );
-            Ok(("agent", settings.refine_agent_model.trim()))
+            anyhow::ensure!(!model.trim().is_empty(), "关系补建 Agent 模型未配置");
+            Ok(("agent", model.trim().to_string()))
         }
-        provider => anyhow::bail!("未知关系补建 provider: {provider}"),
+        None => anyhow::bail!("关系分析执行体未配置(在 AI 页选择执行体)"),
     }
 }
 
@@ -303,7 +299,7 @@ pub fn preview(
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(BackfillPreview {
-                        consent_token: consent_token(&notes_root, &selected, provider, model)?,
+                        consent_token: consent_token(&notes_root, &selected, provider, &model)?,
                         note_ids: selected,
                         provider: provider.into(),
                         model: model.into(),
@@ -334,7 +330,7 @@ pub fn preview(
         }
     };
     Ok(BackfillPreview {
-        consent_token: consent_token(&notes_root, &note_ids, provider, model)?,
+        consent_token: consent_token(&notes_root, &note_ids, provider, &model)?,
         note_ids,
         provider: provider.into(),
         model: model.into(),
@@ -689,6 +685,25 @@ pub(crate) fn panic_progress(
 
 #[cfg(test)]
 mod tests {
+    /// 执行体分层后的测试装配:一条 HTTP 档案 + refine_executor 指向它。
+    fn set_http_executor(s: &mut crate::settings::Settings, model: &str) {
+        s.llm_profiles = vec![crate::settings::LlmProfile {
+            id: "t-http".into(),
+            label: "T".into(),
+            base_url: "https://t/v1".into(),
+            model: model.into(),
+            api_key: "k".into(),
+        }];
+        s.refine_executor = "llm:t-http".into();
+    }
+    fn set_agent_executor(s: &mut crate::settings::Settings, kind: &str, bin: &str, model: &str) {
+        s.agent_profiles = vec![crate::settings::AgentProfile {
+            kind: kind.into(),
+            bin: bin.into(),
+            model: model.into(),
+        }];
+        s.refine_executor = format!("agent:{kind}");
+    }
     use super::*;
     use crate::refine::llm::{RawEvidence, RawRelation};
     use crate::store::{
@@ -897,8 +912,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("notes/unrefined")).unwrap();
 
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "openai".into();
-        settings.refine_model = "relation-model".into();
+        set_http_executor(&mut settings, "relation-model");
         let found = preview(root.path(), &settings, None).unwrap();
         assert_eq!(found.note_ids, vec!["failed", "off", "old", "stale"]);
         assert_eq!(found.provider, "openai");
@@ -925,23 +939,21 @@ mod tests {
     fn agent_preview_only_advertises_executors_that_start_can_construct() {
         let root = tempfile::tempdir().unwrap();
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "agent".into();
-        settings.refine_agent_model = "agent-model".into();
         let fake_bin = root.path().join("fake-agent");
         std::fs::write(&fake_bin, b"").unwrap();
-        settings.refine_agent_bin = fake_bin.to_string_lossy().into_owned();
+        let bin = fake_bin.to_string_lossy().into_owned();
 
         for unsupported in ["codex", "cursor"] {
-            settings.refine_agent = unsupported.into();
+            set_agent_executor(&mut settings, unsupported, &bin, "agent-model");
             assert!(preview(root.path(), &settings, None).is_err());
         }
 
-        settings.refine_agent = "claude".into();
+        set_agent_executor(&mut settings, "claude", &bin, "agent-model");
         let shown = preview(root.path(), &settings, None).unwrap();
         let executor = crate::refine::agent::AgentRelationExecutor::new(
             crate::refine::agent::AgentKind::Claude,
-            &settings.refine_agent_bin,
-            &settings.refine_agent_model,
+            &bin,
+            "agent-model",
         )
         .unwrap();
         assert_eq!(shown.provider, executor.provider());
@@ -954,8 +966,7 @@ mod tests {
         let note_id = "consent-bound";
         write_note(root.path(), note_id, &fixture_doc(note_id, 0, "failed"));
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "openai".into();
-        settings.refine_model = "relation-model-a".into();
+        set_http_executor(&mut settings, "relation-model-a");
 
         let first = preview(root.path(), &settings, Some(&[note_id.into()])).unwrap();
         assert!(first.consent_token.starts_with("backfill-preview-"));
@@ -978,7 +989,7 @@ mod tests {
         assert_ne!(source_changed.consent_token, first.consent_token);
         assert!(validate_request(&source_changed, &exact).is_err());
 
-        settings.refine_model = "relation-model-b".into();
+        set_http_executor(&mut settings, "relation-model-b");
         let model_changed = preview(root.path(), &settings, Some(&[note_id.into()])).unwrap();
         assert_ne!(model_changed.consent_token, source_changed.consent_token);
         assert!(validate_request(&model_changed, &exact).is_err());
@@ -992,8 +1003,7 @@ mod tests {
             write_note(root.path(), note_id, &fixture_doc(note_id, 0, "failed"));
         }
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "openai".into();
-        settings.refine_model = "relation-model".into();
+        set_http_executor(&mut settings, "relation-model");
         let shown = preview(root.path(), &settings, Some(&note_ids)).unwrap();
         let request = BackfillRequest {
             run_id: "run-source-drift".into(),
@@ -1098,8 +1108,7 @@ mod tests {
         )
         .unwrap();
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "openai".into();
-        settings.refine_model = "relation-model".into();
+        set_http_executor(&mut settings, "relation-model");
 
         let error = preview(root.path(), &settings, Some(&["../must-not-scan".into()]))
             .unwrap_err()
@@ -1563,8 +1572,7 @@ mod tests {
         )
         .unwrap();
         let mut settings = crate::settings::Settings::default();
-        settings.refine_provider = "openai".into();
-        settings.refine_model = "relation-model".into();
+        set_http_executor(&mut settings, "relation-model");
         assert!(preview(root.path(), &settings, Some(&[note_id.into()])).is_err());
     }
 }

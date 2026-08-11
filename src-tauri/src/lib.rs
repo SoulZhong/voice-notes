@@ -259,22 +259,37 @@ fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>)
     }
 }
 
-/// HTTP(OpenAI 兼容)Aing 配置是否齐备（开关开、provider 非 agent、三项均非空）：
-/// 抽成纯函数供 spawn_refine 判定与单测，避免把「要不要发起网络请求」这条判断逻辑
-/// 埋进整个后台线程闭包里难以单独验证。provider 值未知(手改 settings.json)时按
-/// openai 对待——那是默认执行体,坏值不该让 Aing 整个哑掉。
-fn refine_llm_ready(s: &settings::Settings) -> bool {
-    s.refine_enabled
-        && s.refine_provider != "agent"
-        && !s.refine_base_url.is_empty()
-        && !s.refine_model.is_empty()
-        && !s.refine_api_key.is_empty()
+/// Aing 生效执行体(2026-08-11 执行体分层):功能开关 + 引用解析 + HTTP 就绪门,
+/// None = 关闭/未配置/引用悬空/HTTP 缺项。HTTP 缺项不回落 Agent——用户显式选了
+/// 哪个执行体就用哪个,缺项即未就绪(与旧世界 provider 二选一语义等价)。
+/// Agent 引用即尝试,bin 探测留运行时(探测结果随装/卸 CLI 变化,不静态判定)。
+fn active_refine_executor(s: &settings::Settings) -> Option<settings::ResolvedExecutor> {
+    if !s.refine_enabled {
+        return None;
+    }
+    if !settings::executor_ready(s, settings::AiFeature::Refine) {
+        return None;
+    }
+    settings::resolve_executor(s, settings::AiFeature::Refine)
 }
 
-/// Agent(本机 CLI 经 MCP 读写回)Aing 是否应当尝试。bin 探测留到运行时——探测结果
-/// 随用户装/卸 CLI 变化,不该在这里静态判定;解析失败由 agent 分支落 failed 并留日志。
+/// 旧判定的等价薄壳(标题生成等多处调用点沿用其名义语义)。
+fn refine_llm_ready(s: &settings::Settings) -> bool {
+    matches!(active_refine_executor(s), Some(settings::ResolvedExecutor::Http { .. }))
+}
+
 fn refine_agent_ready(s: &settings::Settings) -> bool {
-    s.refine_enabled && s.refine_provider == "agent"
+    matches!(active_refine_executor(s), Some(settings::ResolvedExecutor::Agent { .. }))
+}
+
+/// 遥测分类的适配(classify 的旧签名是 provider+base_url 字符串对)。
+fn telemetry_provider(e: &settings::ResolvedExecutor) -> telemetry::Provider {
+    match e {
+        settings::ResolvedExecutor::Agent { .. } => telemetry::Provider::classify("agent", ""),
+        settings::ResolvedExecutor::Http { base_url, .. } => {
+            telemetry::Provider::classify("openai", base_url)
+        }
+    }
 }
 
 /// HTTP Aing 的提交→索引交接边界：note 写失败时绝不请求 rebuild；note 已写成功而
@@ -466,16 +481,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     eprintln!("calendar({note_id}): 匹配失败(不影响笔记): {e}");
                 }
                 let mut http_refine_handled = false;
-                if refine_agent_ready(&s) {
+                let refine_exec = active_refine_executor(&s);
+                if let Some(settings::ResolvedExecutor::Agent { kind, bin, model }) = &refine_exec {
                     telemetry::track(
                         &app,
-                        telemetry::Event::NoteRefined {
-                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
-                        },
+                        telemetry::Event::NoteRefined { provider: telemetry_provider(refine_exec.as_ref().unwrap()) },
                     );
                     report("llm", "running");
-                    let resolved = refine::agent::AgentKind::from_key(&s.refine_agent)
-                        .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)));
+                    let resolved = refine::agent::AgentKind::from_key(kind)
+                        .and_then(|k| refine::agent::resolve_bin(k, bin).map(|b| (k, b)));
                     match resolved {
                         Some((kind, bin)) => {
                             if let Err(e) = refine::agent::run_refine(
@@ -483,7 +497,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 &note_id,
                                 kind,
                                 &bin,
-                                &s.refine_agent_model,
+                                model,
                                 log_ctx.as_ref(),
                             ) {
                                 eprintln!("refine: agent Aing 失败: {e}");
@@ -495,8 +509,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             }
                         }
                         None => eprintln!(
-                            "refine: 未找到 {} 的 CLI(可在 AI 页指定可执行文件路径),Agent Aing 跳过",
-                            s.refine_agent
+                            "refine: 未找到 {kind} 的 CLI(可在 AI 页指定可执行文件路径),Agent Aing 跳过"
                         ),
                     }
                     // 与 run_llm 的 F4 同一语义:本轮没落成 done 就是 failed,盘上与
@@ -507,25 +520,23 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             eprintln!("refine: agent 失败态落盘失败: {e}");
                         }
                     }
-                } else if refine_llm_ready(&s) {
+                } else if let Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) = &refine_exec {
                     http_refine_handled = true;
                     telemetry::track(
                         &app,
-                        telemetry::Event::NoteRefined {
-                            provider: telemetry::Provider::classify(&s.refine_provider, &s.refine_base_url),
-                        },
+                        telemetry::Event::NoteRefined { provider: telemetry_provider(refine_exec.as_ref().unwrap()) },
                     );
                     report("llm", "running");
                     let cfg = refine::llm::LlmConfig {
-                        base_url: s.refine_base_url.clone(),
-                        model: s.refine_model.clone(),
-                        api_key: s.refine_api_key.clone(),
+                        base_url: base_url.clone(),
+                        model: model.clone(),
+                        api_key: api_key.clone(),
                     };
                     let write_result = refine::run_llm(
                         &dir,
                         &mut doc,
                         &cfg,
-                        &s.refine_model,
+                        model,
                         log_ctx.as_ref(),
                     );
                     if let Err(error) = handoff_http_refine_write(write_result, || {
@@ -632,31 +643,32 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // LLM Aing 阶段成功(标题是独立的小调用,Aing 分块失败不代表标题也会
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
-                if (refine_agent_ready(&s) || refine_llm_ready(&s))
-                    && store::writer::is_default_title(&note.meta.title)
-                {
+                if refine_exec.is_some() && store::writer::is_default_title(&note.meta.title) {
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
-                    let title = if refine_agent_ready(&s) {
-                        refine::agent::AgentKind::from_key(&s.refine_agent)
-                            .and_then(|k| refine::agent::resolve_bin(k, &s.refine_agent_bin).map(|b| (k, b)))
-                            .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
-                            .and_then(|(kind, bin)| {
-                                refine::agent::gen_title(
-                                    kind,
-                                    &bin,
-                                    &s.refine_agent_model,
-                                    &doc.paragraphs,
-                                    log_ctx.as_ref(),
-                                )
-                            })
-                    } else {
-                        let cfg = refine::llm::LlmConfig {
-                            base_url: s.refine_base_url.clone(),
-                            model: s.refine_model.clone(),
-                            api_key: s.refine_api_key.clone(),
-                        };
-                        refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
+                    let title = match refine_exec.as_ref().unwrap() {
+                        settings::ResolvedExecutor::Agent { kind, bin, model } => {
+                            refine::agent::AgentKind::from_key(kind)
+                                .and_then(|k| refine::agent::resolve_bin(k, bin).map(|b| (k, b)))
+                                .ok_or_else(|| anyhow::anyhow!("Agent CLI 不可用"))
+                                .and_then(|(kind, bin)| {
+                                    refine::agent::gen_title(
+                                        kind,
+                                        &bin,
+                                        model,
+                                        &doc.paragraphs,
+                                        log_ctx.as_ref(),
+                                    )
+                                })
+                        }
+                        settings::ResolvedExecutor::Http { base_url, model, api_key } => {
+                            let cfg = refine::llm::LlmConfig {
+                                base_url: base_url.clone(),
+                                model: model.clone(),
+                                api_key: api_key.clone(),
+                            };
+                            refine::llm::gen_title(&cfg, &doc.paragraphs, log_ctx.as_ref())
+                        }
                     };
                     match title {
                         Ok(title) => {
@@ -2803,12 +2815,19 @@ fn ensure_requested_backfill_provider(
     request: &ipc::BackfillRequest,
     settings: &settings::Settings,
 ) -> Result<(), String> {
-    if request.provider != settings.refine_provider {
+    // 对账词表沿用旧的 "openai"/"agent"(preview.provider 同源):按当前关系执行体
+    // 的解析结果推导,请求与现状不一致即拒(用户在 preview 后改了执行体的 TOCTOU 守卫)。
+    let current = match settings::resolve_executor(settings, settings::AiFeature::Relations) {
+        Some(settings::ResolvedExecutor::Http { .. }) => "openai",
+        Some(settings::ResolvedExecutor::Agent { .. }) => "agent",
+        None => "",
+    };
+    if request.provider != current {
         return Err(tr!(
             "补建 provider 与当前配置不一致:请求 {requested},当前 {current}",
             "Backfill provider does not match the current configuration: requested {requested}, current {current}",
             requested = request.provider,
-            current = settings.refine_provider
+            current = current
         ));
     }
     Ok(())
@@ -2817,32 +2836,23 @@ fn ensure_requested_backfill_provider(
 fn relation_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::backfill::RelationExecutor>> {
-    match settings.refine_provider.as_str() {
-        "openai" => Ok(Box::new(refine::llm::HttpRelationExecutor::new(
-            refine::llm::LlmConfig {
-                base_url: settings.refine_base_url.clone(),
-                model: settings.refine_model.clone(),
-                api_key: settings.refine_api_key.clone(),
-            },
-        )?)),
-        "agent" => {
-            let kind = refine::agent::AgentKind::from_key(&settings.refine_agent)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(tr!(
-                        "未知 Agent: {agent}",
-                        "Unknown agent: {agent}",
-                        agent = settings.refine_agent
-                    ))
-                })?;
-            Ok(Box::new(refine::agent::AgentRelationExecutor::new(
-                kind,
-                &settings.refine_agent_bin,
-                &settings.refine_agent_model,
-            )?))
+    match settings::resolve_executor(settings, settings::AiFeature::Relations) {
+        Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) => {
+            Ok(Box::new(refine::llm::HttpRelationExecutor::new(refine::llm::LlmConfig {
+                base_url,
+                model,
+                api_key,
+            })?))
         }
-        provider => anyhow::bail!(tr!(
-            "未知关系补建 provider: {provider}",
-            "Unknown relation backfill provider: {provider}"
+        Some(settings::ResolvedExecutor::Agent { kind, bin, model }) => {
+            let k = refine::agent::AgentKind::from_key(&kind).ok_or_else(|| {
+                anyhow::anyhow!(tr!("未知 Agent: {agent}", "Unknown agent: {agent}", agent = kind))
+            })?;
+            Ok(Box::new(refine::agent::AgentRelationExecutor::new(k, &bin, &model)?))
+        }
+        None => anyhow::bail!(tr!(
+            "关系分析执行体未配置(在 AI 页选择执行体)",
+            "Relation analysis executor is not configured (choose one on the AI page)"
         )),
     }
 }
@@ -2855,30 +2865,25 @@ fn identify_executor(
     settings: &settings::Settings,
 ) -> anyhow::Result<Box<dyn refine::identify::IdentifyExecutor>> {
     anyhow::ensure!(settings.refine_enabled, "identify 需要已启用精修");
-    if settings.refine_provider == "agent" {
-        let kind = refine::agent::AgentKind::from_key(&settings.refine_agent).ok_or_else(|| {
-            anyhow::anyhow!(tr!(
-                "未知 Agent: {agent}",
-                "Unknown agent: {agent}",
-                agent = settings.refine_agent
-            ))
-        })?;
-        return Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(
-            kind,
-            &settings.refine_agent_bin,
-            &settings.refine_agent_model,
-        )?));
+    match settings::resolve_executor(settings, settings::AiFeature::Refine) {
+        Some(settings::ResolvedExecutor::Agent { kind, bin, model }) => {
+            let k = refine::agent::AgentKind::from_key(&kind).ok_or_else(|| {
+                anyhow::anyhow!(tr!("未知 Agent: {agent}", "Unknown agent: {agent}", agent = kind))
+            })?;
+            Ok(Box::new(refine::agent::AgentIdentifyExecutor::new(k, &bin, &model)?))
+        }
+        Some(settings::ResolvedExecutor::Http { .. }) if !refine_llm_ready(settings) => {
+            anyhow::bail!("identify 需要配置齐全的 HTTP 精修")
+        }
+        Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) => {
+            Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(refine::llm::LlmConfig {
+                base_url,
+                model,
+                api_key,
+            })?))
+        }
+        None => anyhow::bail!("identify 需要已配置的 AI 执行体"),
     }
-    if !refine_llm_ready(settings) {
-        anyhow::bail!("identify 需要配置齐全的 HTTP 精修");
-    }
-    Ok(Box::new(refine::llm::HttpIdentifyExecutor::new(
-        refine::llm::LlmConfig {
-            base_url: settings.refine_base_url.clone(),
-            model: settings.refine_model.clone(),
-            api_key: settings.refine_api_key.clone(),
-        },
-    )?))
 }
 
 fn spawn_relation_backfill_worker<Spawn, Worker, EmitFailure>(
@@ -8248,46 +8253,51 @@ mod tests {
     }
 
     #[test]
-    fn refine_llm_ready_requires_all_four_fields() {
+    fn refine_llm_ready_requires_switch_and_complete_profile() {
         use super::refine_llm_ready;
         let base = crate::settings::Settings::default();
-        assert!(!refine_llm_ready(&base), "默认全空/关闭 → 未就绪");
+        assert!(!refine_llm_ready(&base), "默认未配置/关闭 → 未就绪");
 
         let mut s = base.clone();
-        s.refine_base_url = "https://api.deepseek.com".into();
-        s.refine_model = "deepseek-chat".into();
-        s.refine_api_key = "sk-xxx".into();
-        assert!(!refine_llm_ready(&s), "四项齐全但总开关未开 → 仍未就绪");
+        s.llm_profiles.push(crate::settings::LlmProfile {
+            id: "p1".into(),
+            label: "DeepSeek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-chat".into(),
+            api_key: "sk-xxx".into(),
+        });
+        s.refine_executor = "llm:p1".into();
+        assert!(!refine_llm_ready(&s), "档案齐全但总开关未开 → 仍未就绪");
 
         s.refine_enabled = true;
-        assert!(refine_llm_ready(&s), "开关开且四项齐全 → 就绪");
+        assert!(refine_llm_ready(&s), "开关开且档案三项齐全 → 就绪");
 
         for field in ["base_url", "model", "api_key"] {
             let mut s2 = s.clone();
             match field {
-                "base_url" => s2.refine_base_url.clear(),
-                "model" => s2.refine_model.clear(),
-                _ => s2.refine_api_key.clear(),
+                "base_url" => s2.llm_profiles[0].base_url.clear(),
+                "model" => s2.llm_profiles[0].model.clear(),
+                _ => s2.llm_profiles[0].api_key.clear(),
             }
             assert!(!refine_llm_ready(&s2), "{field} 为空 → 未就绪");
         }
 
         let mut s3 = s.clone();
-        s3.refine_provider = "agent".into();
-        assert!(!refine_llm_ready(&s3), "provider=agent 时不走 HTTP,即使三项齐全");
-        s3.refine_provider = "bogus".into();
-        assert!(refine_llm_ready(&s3), "未知 provider 按默认 openai 对待,Aing 不哑掉");
+        s3.refine_executor = "agent:claude".into();
+        assert!(!refine_llm_ready(&s3), "执行体是 Agent 时不走 HTTP");
+        s3.refine_executor = "llm:ghost".into();
+        assert!(!refine_llm_ready(&s3), "悬空引用(档案已删)→ 未就绪");
     }
 
     #[test]
-    fn refine_agent_ready_follows_switch_and_provider() {
+    fn refine_agent_ready_follows_switch_and_executor() {
         use super::refine_agent_ready;
         let mut s = crate::settings::Settings::default();
-        assert!(!refine_agent_ready(&s), "默认 provider=openai → 不走 Agent");
-        s.refine_provider = "agent".into();
+        assert!(!refine_agent_ready(&s), "默认未配置 → 不走 Agent");
+        s.refine_executor = "agent:claude".into();
         assert!(!refine_agent_ready(&s), "总开关未开 → 不走");
         s.refine_enabled = true;
-        assert!(refine_agent_ready(&s), "开关开 + provider=agent → 尝试(bin 探测留给运行时)");
+        assert!(refine_agent_ready(&s), "开关开 + agent 引用 → 尝试(bin 探测留给运行时)");
     }
 
     // resume_blocked_by_refining_matches_refining_set 已随 Aing 集入内核而删除:
