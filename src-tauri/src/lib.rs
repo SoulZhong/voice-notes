@@ -121,6 +121,10 @@ struct AppState {
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
     embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    /// 录制中发生过声纹人名变更(Qwen3 热词已过期):停录归还识别器时消费,
+    /// 丢弃归还件交预载重建。录制外的变更直接清槽,不经此标记
+    /// (见 refresh_qwen_hotwords_cache)。
+    hotwords_dirty: Arc<AtomicBool>,
     /// 模型下载互斥位（true = 下载线程在跑）与取消信号。
     download_running: Arc<AtomicBool>,
     download_cancel: Arc<AtomicBool>,
@@ -159,6 +163,7 @@ impl Default for AppState {
             session: Arc::new(Mutex::new(None)),
             recognizer_cache: Arc::new(Mutex::new(None)),
             embedder_cache: Arc::new(Mutex::new(None)),
+            hotwords_dirty: Arc::new(AtomicBool::new(false)),
             download_running: Arc::new(AtomicBool::new(false)),
             download_cancel: Arc::new(AtomicBool::new(false)),
             transcode: store::transcode::TranscodeQueue::new(),
@@ -849,16 +854,21 @@ fn qwen3_hotwords(app: &AppHandle) -> Option<String> {
     merge_hotwords(&s.asr_hotwords, names)
 }
 
-/// 声纹人名变更(改名/合并/删除)后失效常驻识别器:Qwen3 热词在识别器构造时快照
-/// 声纹人名,常驻缓存跨场复用会让变更后仍偏置旧名直到重启或无关设置变更
-/// (codex 2026-08-11 P2)。仅 Qwen3 吃热词,其余引擎清槽纯属白重载几 GB 模型,
-/// 按当前选型门控。录制中调用是空操作(槽已被开录取走,preload 也会跳过)——
-/// 本场热词开录时已定型,无法热更;该残留会在下一次人名/设置变更时刷新。
+/// 声纹人名变更(改名/合并/删除/撤销合并)后失效常驻识别器:Qwen3 热词在识别器
+/// 构造时快照声纹人名,常驻缓存跨场复用会让变更后仍偏置旧名直到重启或无关设置
+/// 变更(codex 2026-08-11 P2)。仅 Qwen3 吃热词,其余引擎清槽纯属白重载几 GB
+/// 模型,按当前选型门控。录制中(仅改名可达,合并/删除录制中被拒)清槽/预载都
+/// 无效——识别器已被本场取走,preload 会跳过,停录 stash 又把旧热词件还回来;
+/// 改置脏标记,由停录归还处丢弃重载(本场热词开录已定型,无法热更)。
 fn refresh_qwen_hotwords_cache(app: &AppHandle) {
     if current_asr(app) != settings::ASR_QWEN3 {
         return;
     }
     let state = app.state::<AppState>();
+    if state.session.lock().unwrap().is_some() {
+        state.hotwords_dirty.store(true, Ordering::Relaxed);
+        return;
+    }
     *state.recognizer_cache.lock().unwrap() = None;
     preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
 }
@@ -2166,6 +2176,11 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
     stash_model(&state.embedder_cache, embedder);
+    // 本场录制中发生过声纹改名:归还件的 Qwen3 热词已过期,丢弃,停录收尾的
+    // preload 会按新名单重建(见 refresh_qwen_hotwords_cache 的脏标记分支)。
+    if state.hotwords_dirty.swap(false, Ordering::Relaxed) {
+        *state.recognizer_cache.lock().unwrap() = None;
+    }
     // 分段 worker 已 join → audio sink 已 drop → 写盘线程排干后自退,join 保证
     // finalize 前 WAV 头已收尾(正常情况下队列近空,瞬时完成)。
     for j in s.audio_joins {
@@ -3798,12 +3813,13 @@ fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::Re
     let is_person = !id.starts_with("e:");
     let result = rename_entity_with_rebuild(root, id, new_name, |root| {
         queue_person_graph_rebuild(&app, root, &tr!("人物改名", "Person rename"))
-    })?;
-    // 人实体改名落进声纹库,同步刷新 Qwen 热词缓存(见 refresh_qwen_hotwords_cache)。
+    });
+    // 人实体改名落进声纹库,刷新 Qwen 热词缓存。放在 ? 之前:重建排队失败时改名
+    // 可能已落库(rebuild 是 rename 之后的独立一步),宁可多刷一次不可漏刷。
     if is_person {
         refresh_qwen_hotwords_cache(&app);
     }
-    Ok(result)
+    result
 }
 
 /// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
@@ -5637,6 +5653,7 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
         store::VoiceprintStore::new(root.clone())
             .undo_merge(&journal_id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
     .await
@@ -5664,6 +5681,7 @@ async fn restore_merged_person(
         let pid = store::VoiceprintStore::new(root.clone())
             .restore_merged_person(&journal_id)
             .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)
     })

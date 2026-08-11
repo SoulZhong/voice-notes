@@ -202,6 +202,13 @@
       return;
     }
     void saveSetting((s) => {
+      // 权威在用判定必须对着链上的 fresh 设置再做一次(codex 2026-08-11 P2):
+      // 上面的镜像快检只是即时反馈——「设为执行体」还排在本次之前的队里时,
+      // 镜像尚未同步,单靠它会删出悬空执行体引用。
+      if (s.refine_executor.trim() === refstr || s.relations_executor.trim() === refstr) {
+        error = t("ai.res.deleteInUse");
+        return;
+      }
       s.llm_profiles = s.llm_profiles.filter((p) => p.id !== id);
     });
   }
