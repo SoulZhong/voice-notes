@@ -44,6 +44,10 @@ pub const SEED_MIN_SAMPLES: usize = 32_000;
 pub const SEED_ASSIGN_Z: f32 = 3.0;
 /// 见 SEED_ASSIGN_Z:跨信道 z 通道命中仍要求的裸分地板。待评测集校准的初值。
 pub const SEED_ASSIGN_RAW_FLOOR: f32 = 0.50;
+/// 种子路 k-NN 票决席位数(2026-08-12 算法升级):探针只与最相近的这么多个库种子
+/// 席位计票,按 person 计席多数决,胜者还须有席位过命中三闸才认领。5 席 = 足以
+/// 让一个人的多份变体(主质心+会话质心)形成共识,又小到单个离群质心翻不了盘。
+pub const SEED_KNN_K: usize = 5;
 /// "近期贡献环"容量:回声追溯撤回窗口(session.rs RETRACT_WINDOW_MS=30s)内可能
 /// 被撤销的 assign 调用数上限,防止长会话无界增长。超出容量的旧条目被静默淘汰
 /// ——淘汰后对应的撤回请求视为 no-op(近似值,回声窗口内的高频 assign 场景下
@@ -293,51 +297,96 @@ impl SpeakerRegistry {
             }
         }
 
-        let mut best_idx: Option<(f32, usize)> = None;
-        for (idx, (c, &sim)) in self.clusters.iter().zip(&sims).enumerate() {
-            // 种子簇(关联库 person 且非本场实时入库)用更高门槛:跨会议信道差异大,
-            // 误命名比不命名糟(待校准)。本场实时入库的簇质心是本场新鲜聚出的,
-            // 维持普通阈值——拿到全局 id 不该让归簇变严。
-            // 门槛在候选过滤阶段生效——若全局最相似是"够不着的种子簇",不得挡住
-            // 本可命中的普通簇(否则会话内簇碎片化)。
-            let eligible = if c.is_seed() {
-                match c.seed_source.as_deref() {
-                    Some(seed_src) => {
-                        // 种子命中三闸:①段长 ≥ SEED_MIN_SAMPLES 才有资格拍板;
-                        // ②同信道走裸分快路(阈值不变,与现状逐位一致);③跨信道
-                        // 只走 AS-Norm z 通道——裸余弦跨信道不可比,mic 段撞 system
-                        // 质心分数系统性走低/走高都不可信,归一化后才有资格认领。
-                        let same_channel = seed_src == source;
-                        let seed_eligible = num_samples >= SEED_MIN_SAMPLES;
-                        let fast_hit = same_channel && sim >= SEED_ASSIGN_THRESHOLD;
-                        // 惰性化:cohort_stats/seed_z 各带一次 Vec 分配,只在真正可能
-                        // 走到 z 通道时才算——快路已命中(fast_hit)或压根不够资格
-                        // (!seed_eligible)或裸分够不着地板时,z 值本就无关判定结果,
-                        // 白算一次不改变行为(z_hit 原本就 AND 着这三个条件)。
-                        let z_hit = !self.seed_z_disabled
-                            && seed_eligible
-                            && !fast_hit
-                            && sim >= SEED_ASSIGN_RAW_FLOOR
-                            && c.person.as_deref().is_some_and(|p| {
-                                matches!(
-                                    seed_z(sim, &person_max, p, c.seed_cohort),
-                                    Some(z) if z >= SEED_ASSIGN_Z
-                                )
-                            });
-                        seed_eligible && (fast_hit || z_hit)
-                    }
-                    // 续录恢复簇信道未知,维持原语义,待快照带信道后收紧:裸
-                    // cos ≥ SEED_ASSIGN_THRESHOLD 即命中,不分信道、无 z 通道、
-                    // 也不受三闸①的短段门槛约束。
-                    None => sim >= SEED_ASSIGN_THRESHOLD,
+        // 种子命中三闸(闭包供 k-NN 票决后的资格审查调用,判定逻辑与旧单最近邻
+        // 逐位一致):①段长 ≥ SEED_MIN_SAMPLES 才有资格拍板;②同信道走裸分快路
+        // (阈值不变);③跨信道只走 AS-Norm z 通道——裸余弦跨信道不可比,mic 段撞
+        // system 质心分数系统性走低/走高都不可信,归一化后才有资格认领。
+        // 惰性化:cohort_stats/seed_z 各带一次 Vec 分配,只在真正可能走到 z 通道时
+        // 才算——快路已命中或不够资格或裸分够不着地板时,z 值本就无关判定结果。
+        let seed_z_disabled = self.seed_z_disabled;
+        let seed_hit = |c: &Cluster, sim: f32| -> bool {
+            match c.seed_source.as_deref() {
+                Some(seed_src) => {
+                    let same_channel = seed_src == source;
+                    let seed_eligible = num_samples >= SEED_MIN_SAMPLES;
+                    let fast_hit = same_channel && sim >= SEED_ASSIGN_THRESHOLD;
+                    let z_hit = !seed_z_disabled
+                        && seed_eligible
+                        && !fast_hit
+                        && sim >= SEED_ASSIGN_RAW_FLOOR
+                        && c.person.as_deref().is_some_and(|p| {
+                            matches!(
+                                seed_z(sim, &person_max, p, c.seed_cohort),
+                                Some(z) if z >= SEED_ASSIGN_Z
+                            )
+                        });
+                    seed_eligible && (fast_hit || z_hit)
                 }
-            } else {
-                sim >= ASSIGN_THRESHOLD
-            };
-            if eligible && best_idx.is_none_or(|(bs, _)| sim > bs) {
-                best_idx = Some((sim, idx));
+                // 续录恢复簇信道未知,维持原语义,待快照带信道后收紧:裸
+                // cos ≥ SEED_ASSIGN_THRESHOLD 即命中,不分信道、无 z 通道、
+                // 也不受三闸①的短段门槛约束。
+                None => sim >= SEED_ASSIGN_THRESHOLD,
+            }
+        };
+
+        // 普通簇(本场实时聚出):维持单最近邻 + ASSIGN_THRESHOLD。种子的更高门槛
+        // 只在种子路生效——若全局最相似是"够不着的种子簇",不得挡住本可命中的
+        // 普通簇(否则会话内簇碎片化)。
+        let mut best_regular: Option<(f32, usize)> = None;
+        for (idx, (c, &sim)) in self.clusters.iter().zip(&sims).enumerate() {
+            if !c.is_seed() && sim >= ASSIGN_THRESHOLD && best_regular.is_none_or(|(bs, _)| sim > bs) {
+                best_regular = Some((sim, idx));
             }
         }
+
+        // 种子簇(库中采集来的声纹):k-NN 多数票(2026-08-12 算法升级)。旧逻辑
+        // 是全库单最近邻,一个离群质心即可劫持认领;现在探针只看与它最相近的
+        // SEED_KNN_K 个种子席位(一人多份变体各占一席),按 person 计席,席位
+        // 最多者胜出(平票取最高分席位所属的人),且胜者须有至少一个席位过上面
+        // 的命中三闸才拍板。胜者无合格席位 → 种子路空手而归,不降格给第二名
+        // (误命名比不命名糟),探针留给普通簇/软归属/新建簇路径。
+        let mut neighbors: Vec<(f32, usize)> = self
+            .clusters
+            .iter()
+            .zip(&sims)
+            .enumerate()
+            .filter(|&(_, (c, _))| c.is_seed())
+            .map(|(idx, (_, &sim))| (sim, idx))
+            .collect();
+        neighbors.sort_by(|a, b| b.0.total_cmp(&a.0));
+        neighbors.truncate(SEED_KNN_K);
+        let mut tally: std::collections::BTreeMap<&str, (usize, f32)> = std::collections::BTreeMap::new();
+        for &(sim, idx) in &neighbors {
+            if let Some(p) = self.clusters[idx].person.as_deref() {
+                let e = tally.entry(p).or_insert((0, f32::MIN));
+                e.0 += 1;
+                if sim > e.1 {
+                    e.1 = sim;
+                }
+            }
+        }
+        let winner: Option<String> = tally
+            .iter()
+            .max_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)))
+            .map(|(p, _)| p.to_string());
+        let mut best_seed: Option<(f32, usize)> = None;
+        if let Some(wp) = winner.as_deref() {
+            for &(sim, idx) in &neighbors {
+                let c = &self.clusters[idx];
+                if c.person.as_deref() == Some(wp)
+                    && seed_hit(c, sim)
+                    && best_seed.is_none_or(|(bs, _)| sim > bs)
+                {
+                    best_seed = Some((sim, idx));
+                }
+            }
+        }
+
+        // 两路取分高者(与旧逻辑的全局 max 语义对齐:种子/普通各自选出候选后比分)。
+        let best_idx = match (best_regular, best_seed) {
+            (Some(r), Some(s)) => Some(if s.0 > r.0 { s } else { r }),
+            (r, s) => r.or(s),
+        };
         let best = best_idx.map(|(sim, idx)| (sim, &mut self.clusters[idx]));
 
         if let Some((_sim, cluster)) = best {
@@ -1905,5 +1954,81 @@ mod tests {
         let idx3 = r3.clusters.iter().position(|c| c.id == mid3).unwrap();
         r3.clusters[idx3].centroid = v(0.70, (1.0f32 - 0.70 * 0.70).sqrt(), 0.0);
         assert_eq!(r3.take_merges().len(), 1, "同信道 0.70 ≥ SEED_ASSIGN_THRESHOLD(0.68) 照并,死区语义不变");
+    }
+
+    /// 与探针余弦恰为 x 的单位向量(同 v 的三维空间,y 分量补齐模长)。
+    fn at_cos(x: f32) -> Vec<f32> {
+        v(x, (1.0f32 - x * x).sqrt(), 0.0)
+    }
+
+    #[test]
+    fn knn_vote_majority_beats_single_nearest() {
+        // 乙有 3 份采集来的变体质心(0.72/0.71/0.70,全过同信道快路 0.68),
+        // 甲只有 1 份但离探针最近(0.80)。旧单最近邻会判甲;k-NN 票决下
+        // top-4 席位乙占 3 席,乙胜出,认领落在乙的最高分席位上。
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PB"), "多数票(3 席)应压过单个更近的离群席位");
+    }
+
+    #[test]
+    fn knn_vote_winner_without_qualified_seat_claims_nothing() {
+        // 乙 3 席全在阈值下(0.64/0.63/0.62 < 0.68,两人成不了 z cohort),
+        // 甲 1 席 0.80 过阈但只是少数派。票决胜者乙无合格席位 → 种子路
+        // 不认领也不降格给第二名(误命名比不命名糟),探针新建无主簇。
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.64), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.63), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.62), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person, None, "票决胜者不过阈,不得回落认领少数派");
+    }
+
+    #[test]
+    fn knn_vote_tie_breaks_by_best_similarity() {
+        // 甲乙各 2 席平票,甲的最高分(0.75)高于乙(0.73)→ 甲胜。
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.75), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.73), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "平票应取最高分席位所属的人");
+    }
+
+    #[test]
+    fn knn_vote_only_counts_five_nearest_seats() {
+        // 乙 4 份远席位(0.30 附近)加 1 份 0.69 近席位;甲 4 席 0.75~0.72。
+        // top-5 = 甲 4 席 + 乙 0.69 一席 → 甲以 4:1 胜;若错把全库席位都
+        // 计票,乙 5 席反超,此测试即失败。
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.75), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.74), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.73), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.32), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.31), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.30), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.29), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "只有最近 5 席有投票权");
     }
 }
