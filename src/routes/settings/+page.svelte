@@ -33,6 +33,7 @@
   } from "$lib/models";
   import { countPeopleWithoutSamples } from "$lib/people";
   import { refineReady } from "$lib/refineReady";
+  import EditableField from "$lib/EditableField.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
@@ -958,13 +959,12 @@
               <span class="row-label">APP ID</span>
               <span class="row-desc">{t("settings.cloud.volcAppIdDesc")}</span>
             </div>
-            <input
-              class="row-input"
+            <EditableField
+              value={volcAppKey}
               placeholder="APP ID"
-              bind:value={volcAppKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.volc_app_key = volcAppKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { volcAppKey = v; return saveSetting((s) => (s.volc_app_key = v)); }}
             />
           </div>
           <div class="row">
@@ -972,14 +972,13 @@
               <span class="row-label">Access Token</span>
               <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
-            <input
-              class="row-input"
-              type="password"
+            <EditableField
+              masked
+              value={volcAccessKey}
               placeholder="Access Token"
-              bind:value={volcAccessKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.volc_access_key = volcAccessKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { volcAccessKey = v; return saveSetting((s) => (s.volc_access_key = v)); }}
             />
           </div>
         {:else}
@@ -988,14 +987,13 @@
               <span class="row-label">API Key</span>
               <span class="row-desc">{t("settings.cloud.secretDesc")}</span>
             </div>
-            <input
-              class="row-input"
-              type="password"
+            <EditableField
+              masked
+              value={dashKey}
               placeholder="DashScope API Key"
-              bind:value={dashKey}
               disabled={recording.isLive}
-              oninput={invalidateCloudTest}
-              onblur={() => saveSetting((s) => (s.dashscope_api_key = dashKey))}
+              onEditStart={invalidateCloudTest}
+              onSave={(v) => { dashKey = v; return saveSetting((s) => (s.dashscope_api_key = v)); }}
             />
           </div>
         {/if}
@@ -1099,12 +1097,12 @@
               <span class="row-label">{t("settings.asr.hotwordsLabel")}</span>
               <span class="row-desc">{t("settings.asr.hotwordsDesc")}</span>
             </div>
-            <input
-              class="row-input"
+            <EditableField
+              wide
+              value={hotwords}
               placeholder={t("settings.asr.hotwordsPlaceholder")}
-              bind:value={hotwords}
               disabled={recording.isLive}
-              onblur={() => saveSetting((s) => (s.asr_hotwords = hotwords))}
+              onSave={(v) => { hotwords = v; return saveSetting((s) => (s.asr_hotwords = v)); }}
             />
           </div>
         {/if}
@@ -1613,28 +1611,6 @@
   .mtest-err { color: var(--danger-ink); }
   /* 行内输入(与 AI 页 .row-input 同款):surface-press 底、无边,聚焦浮出 canvas + accent 环。
      云端 ASR 凭证输入(APP ID / Access Token / API Key)复用此形态。 */
-  .row-input {
-    flex: none;
-    width: 14rem;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .row-input:focus {
-    outline: none;
-    background: var(--canvas);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .row-input::placeholder {
-    color: var(--ink-faint);
-  }
-  .row-input:disabled {
-    opacity: 0.6;
-  }
   /* button-secondary */
   .btn-secondary {
     flex: none;

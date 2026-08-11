@@ -33,6 +33,7 @@
   import { page } from "$app/stores";
   import { aiLogsQuery } from "$lib/ailog";
   import RelationBackfillDialog from "$lib/RelationBackfillDialog.svelte";
+  import EditableField from "$lib/EditableField.svelte";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
 
   let settings = $state<Settings | null>(null);
@@ -156,11 +157,11 @@
     loadProfileFields();
   }
 
-  function saveProfile() {
+  function saveProfile(): Promise<unknown> {
     llmTest = null;
     const id = selectedProfileId;
-    if (!id) return;
-    void saveSetting((s) => {
+    if (!id) return Promise.resolve(false);
+    return saveSetting((s) => {
       const p = s.llm_profiles.find((x) => x.id === id);
       if (!p) return;
       p.label = profLabel.trim() || p.label;
@@ -469,11 +470,11 @@
     refineAgentBin = ap?.bin ?? "";
     refineAgentModel = ap?.model ?? "";
   }
-  function saveRefineAgent() {
+  function saveRefineAgent(): Promise<unknown> {
     agentTest = null;
     const kind = refineAgent;
     const entry = { kind, bin: refineAgentBin.trim(), model: refineAgentModel.trim() };
-    void saveSetting((s) => {
+    return saveSetting((s) => {
       const i = s.agent_profiles.findIndex((a) => a.kind === kind);
       if (i >= 0) s.agent_profiles[i] = entry;
       else s.agent_profiles.push(entry);
@@ -754,19 +755,19 @@
             <span class="row-label">{t("ai.res.name")}</span>
             <span class="row-desc">{t("ai.res.nameDesc")}</span>
           </div>
-          <input class="row-input" bind:value={profLabel} onblur={saveProfile} />
+          <EditableField value={profLabel} onSave={(v) => { profLabel = v; return saveProfile(); }} />
         </div>
         <div class="row">
           <div class="row-info">
             <span class="row-label">{t("ai.aing.baseUrl.label")}</span>
             <span class="row-desc">{t("ai.aing.baseUrl.desc")}</span>
           </div>
-          <input
-            class="row-input wide"
+          <EditableField
+            wide
+            value={refineBaseUrl}
             placeholder="https://api.deepseek.com/v1"
-            bind:value={refineBaseUrl}
-            onblur={saveProfile}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineBaseUrl = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -774,12 +775,11 @@
             <span class="row-label">{activePreset?.modelLabel ? t(activePreset.modelLabel) : t("ai.aing.model.label")}</span>
             <span class="row-desc">{activePreset?.modelDesc ? t(activePreset.modelDesc) : t("ai.aing.model.desc")}</span>
           </div>
-          <input
-            class="row-input"
+          <EditableField
+            value={refineModel}
             placeholder={activePreset?.modelPlaceholder ?? "deepseek-chat"}
-            bind:value={refineModel}
-            onblur={saveProfile}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineModel = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -787,13 +787,13 @@
             <span class="row-label">API Key</span>
             <span class="row-desc">{t("ai.aing.apiKey.desc")}</span>
           </div>
-          <input
-            class="row-input wide"
-            type="password"
+          <EditableField
+            wide
+            masked
+            value={refineKey}
             placeholder="sk-..."
-            bind:value={refineKey}
-            onblur={saveProfile}
-            oninput={() => (llmTest = null)}
+            onEditStart={() => (llmTest = null)}
+            onSave={(v) => { refineKey = v; return saveProfile(); }}
           />
         </div>
         <div class="row">
@@ -878,12 +878,11 @@
               <span class="row-label">{t("ai.aing.model.label")}</span>
               <span class="row-desc">{t("ai.aing.model.defaultDesc", { label: selectedAgentOption.label })}</span>
             </div>
-            <input
-              class="row-input"
+            <EditableField
+              value={refineAgentModel}
               placeholder={t(selectedAgentOption.modelHint)}
-              bind:value={refineAgentModel}
-              onblur={saveRefineAgent}
-              oninput={() => (agentTest = null)}
+              onEditStart={() => (agentTest = null)}
+              onSave={(v) => { refineAgentModel = v; return saveRefineAgent(); }}
             />
           </div>
           <div class="row">
@@ -891,12 +890,12 @@
               <span class="row-label">{t("ai.aing.cliPath.label")}</span>
               <span class="row-desc">{t("ai.aing.cliPath.desc")}</span>
             </div>
-            <input
-              class="row-input wide"
+            <EditableField
+              wide
+              value={refineAgentBin}
               placeholder={t("ai.aing.cliPath.placeholder")}
-              bind:value={refineAgentBin}
-              onblur={saveRefineAgent}
-              oninput={() => (agentTest = null)}
+              onEditStart={() => (agentTest = null)}
+              onSave={(v) => { refineAgentBin = v; return saveRefineAgent(); }}
             />
           </div>
           <div class="row">
@@ -1526,30 +1525,6 @@
   .test-result { font-size: 0.85rem; margin: 0.4rem 0 0.2rem; }
   .test-result.ok { color: var(--success, var(--ink-secondary)); }
   .test-result.err { color: var(--danger-ink); }
-  /* 行内输入(settings-row 右侧控件版 input:surface-press 底、无边,聚焦浮出 canvas + accent 环) */
-  .row-input {
-    flex: none;
-    width: 11rem;
-    margin-left: auto;
-    box-sizing: border-box;
-    padding: 0.32em 0.6em;
-    border: none;
-    border-radius: var(--radius-md);
-    background: var(--surface-press);
-    color: var(--ink);
-    font-size: 0.85rem;
-  }
-  .row-input.wide {
-    width: 18rem;
-  }
-  .row-input:focus {
-    outline: none;
-    background: var(--canvas);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  .row-input::placeholder {
-    color: var(--ink-faint);
-  }
   .desc-warn {
     color: var(--warning-ink);
   }
