@@ -15,6 +15,7 @@
 //! 帧荒超阈值报一次 stall(去抖:恢复前不重复),恢复后报 recover 并允许再触发。
 
 use crate::audio::{AudioCapture, AudioFrame, Source};
+use crate::pipeline::drift_monitor::DriftMonitor;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -271,6 +272,8 @@ pub struct TappedCapture {
     notify: Option<TapNotify>,
     tap: Option<std::thread::JoinHandle<()>>,
     timeline_origin: Arc<OnceLock<Instant>>,
+    /// 时钟漂移监视器(Task 5 接线);None = 不采样(未启用/未装配)。
+    drift: Option<Arc<DriftMonitor>>,
 }
 
 impl TappedCapture {
@@ -308,7 +311,14 @@ impl TappedCapture {
             notify: Some(notify),
             tap: None,
             timeline_origin,
+            drift: None,
         }
+    }
+
+    /// builder:接入该源的时钟漂移监视器(可选)。不改变既有构造函数签名/调用点。
+    pub fn with_drift(mut self, m: Arc<DriftMonitor>) -> Self {
+        self.drift = Some(m);
+        self
     }
 }
 
@@ -320,8 +330,9 @@ impl AudioCapture for TappedCapture {
         let source = self.source;
         let notify = self.notify.take().unwrap_or_else(TapNotify::none);
         let timeline_origin = self.timeline_origin.clone();
+        let drift = self.drift.clone();
         self.tap = Some(std::thread::spawn(move || {
-            run_frame_tap_with_origin(
+            run_frame_tap_with_drift(
                 source,
                 cap_rx,
                 sink,
@@ -329,6 +340,7 @@ impl AudioCapture for TappedCapture {
                 policy,
                 notify,
                 timeline_origin,
+                drift,
             )
         }));
         self.inner.start(cap_tx)
@@ -353,7 +365,7 @@ pub fn run_frame_tap(
     policy: TapPolicy,
     notify: TapNotify,
 ) {
-    run_frame_tap_with_origin(
+    run_frame_tap_with_drift(
         _source,
         from_capture,
         to_worker,
@@ -361,10 +373,11 @@ pub fn run_frame_tap(
         policy,
         notify,
         Arc::new(OnceLock::new()),
+        None,
     )
 }
 
-fn run_frame_tap_with_origin(
+fn run_frame_tap_with_drift(
     _source: Source,
     from_capture: Receiver<AudioFrame>,
     to_worker: Sender<AudioFrame>,
@@ -372,6 +385,7 @@ fn run_frame_tap_with_origin(
     policy: TapPolicy,
     notify: TapNotify,
     timeline_origin: Arc<OnceLock<Instant>>,
+    drift: Option<Arc<DriftMonitor>>,
 ) {
     // 最近一次真实帧的格式:没收到过帧就不填充(源可能根本没起来,
     // 填零会凭空造出一条空白轨)。
@@ -420,10 +434,24 @@ fn run_frame_tap_with_origin(
     // 本次断流是否已计 gap / 已报 stall(去抖:恢复前不重复)。
     let mut gap_counted = false;
     let mut stalled = false;
+    // 本次断流是否已实际发过补零帧(Task 5):true 时下一个真实帧到达即视为
+    // "补零段结束",据此喂 DriftMonitor 一次 reanchor(soft:保频率,只清相位)。
+    let mut filled_gap = false;
 
     loop {
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
+                // Task 5:真实帧原始声明率下喂 DriftMonitor(必须在下方时钟核对
+                // 改写 sample_rate 之前——DLL 要的是设备原始声明率口径的样本计数
+                // 与真实时间戳);补零段结束(此前发过补零帧)在此顺带记一次
+                // soft reanchor(保频率,只清相位)。
+                if let Some(m) = &drift {
+                    m.feed(&frame);
+                    if filled_gap {
+                        m.mark_reanchor("gap_end", false);
+                    }
+                }
+                filled_gap = false;
                 if stalled {
                     if let Some(cb) = &notify.on_recover {
                         cb();
@@ -484,6 +512,9 @@ fn run_frame_tap_with_origin(
                                 applied_rate = Some(observed.round() as u32);
                                 health.rate_fixes.fetch_add(1, Ordering::Relaxed);
                                 settle_debt = true;
+                                if let Some(m) = &drift {
+                                    m.mark_reanchor("rate_fix", true);
+                                }
                             }
                         } else {
                             eprintln!(
@@ -601,6 +632,7 @@ fn run_frame_tap_with_origin(
                 if to_worker.send(silence).is_err() {
                     return;
                 }
+                filled_gap = true;
             }
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -1363,5 +1395,47 @@ mod tests {
         });
         ctx.send(frame(160)).unwrap();
         t.join().unwrap(); // send 失败即返回
+    }
+
+    /// Task 5 接线:真实帧喂 DriftMonitor,补零帧不喂;补零段结束(恢复收到真实帧)
+    /// 必须记一次 reanchor 事件。
+    ///
+    /// 事件 kind 断言用 "reanchor_soft"(而非设计文档草案里的字面 "reanchor"):
+    /// `DriftMonitor::mark_reanchor` 的既有实现(Task 4,commit 1d01b5c)按
+    /// `full` 参数区分写 "reanchor_full"/"reanchor_soft" 两种 kind——gap_end 传
+    /// full=false(保频率,只清相位),故落地为 "reanchor_soft"。这是 Task 4 已落地
+    /// 的既定契约,本任务(仅接线 frame_tap)不改 drift_monitor.rs。
+    #[test]
+    fn drift_monitor_fed_with_real_frames_only() {
+        use crate::pipeline::drift_monitor::DriftMonitor;
+        let monitor = std::sync::Arc::new(DriftMonitor::new(16_000));
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_millis(50), ..wallclock_policy() };
+        let m2 = monitor.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap_with_drift(
+                Source::Mic, cap_rx, out_tx, health, policy, TapNotify::none(),
+                std::sync::Arc::new(OnceLock::new()), Some(m2),
+            )
+        });
+        // 两个真实帧 → 帧荒 200ms(触发补零) → 再一个真实帧
+        for k in 0..2u64 {
+            cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+                host_time_ns: Some(k * 10_000_000) }).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(300_000_000) }).unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+        while out_rx.try_recv().is_ok() {}
+        let r = monitor.snapshot();
+        // 3 个真实帧全喂,补零帧不喂:全程带时间戳,quality 应仍是 "hw"。
+        assert_eq!(r.quality, "hw");
+        // 补零段结束应记一次重锚事件(soft:gap_end 保频率,只清相位)。
+        assert!(r.events.iter().any(|e| e.kind == "reanchor_soft" && e.why == "gap_end"),
+            "补零恢复必须重锚,events: {:?}", r.events);
     }
 }
