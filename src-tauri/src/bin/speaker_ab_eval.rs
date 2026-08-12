@@ -308,15 +308,25 @@ fn main() {
         }
     }
 
+    if total == 0 {
+        // 空库/坏数据根目录会被 VoiceprintStore::load 降级成空库,零探针的"成功"
+        // 输出全是 NaN,只会误导——显式报错退出(codex P2)。
+        eprintln!("没有任何会话变体探针:data_root 是否指错?(voiceprints.json 缺失/损坏也会降级为空库)");
+        std::process::exit(2);
+    }
     println!("探针(库会话变体留一): {total} 条,人物 {} 个", vp.people.len());
     old_t.report("旧·全库单最近邻", total);
     new_t.report("新·top-5 k-NN 票决", total);
     for ((k, w), t) in sweep.iter().zip(&sweep_t) {
         t.report(&format!("变体 k={k}{}", if *w { " 加权" } else { "" }), total);
     }
-    println!("—— 仅已命名人物({named_total} 条探针)——");
-    old_named.report("旧·全库单最近邻", named_total);
-    new_named.report("新·top-5 k-NN 票决", named_total);
+    if named_total == 0 {
+        println!("—— 无已命名人物探针,跳过命名子集统计 ——");
+    } else {
+        println!("—— 仅已命名人物({named_total} 条探针)——");
+        old_named.report("旧·全库单最近邻", named_total);
+        new_named.report("新·top-5 k-NN 票决", named_total);
+    }
     println!("—— 两算法判定不同的探针({} 条)——", diffs.len());
     for d in &diffs {
         println!("{d}");

@@ -58,16 +58,19 @@ fn normalize(v: &[f32]) -> Option<Vec<f32>> {
     Some(v.iter().map(|x| x / n).collect())
 }
 
-/// 簇质心对库种子的「参考近邻」:席位表交给匹配策略(与 registry::assign_inner
-/// 同一 SeedMatcher 实例语义),返回 (person, name, 该席位裸分)。合格性口径:
-/// Aing 离线侧无信道/z 通道语义(质心已按信道分组导出,匹配用裸余弦),
-/// eligible = sim ≥ SEED_ASSIGN_THRESHOLD;策略的 reference 无合格性约束,
-/// 未达阈的最佳近邻也记录(供 identify 裁决层参考),adopted 由调用方判定。
-fn seed_neighbor(
+/// 簇质心对库种子的策略判定:reference=参考近邻(无合格性约束,进 ClusterStat
+/// 供 identify 裁决参考,未达阈也记录),claim=认领(合格性约束下的采纳判定,
+/// 与实时路/重转写同一 claim 契约——若只按裸阈值判采纳,自带弃权语义的策略
+/// 会被绕过,三条路径认人分叉,codex P2)。合格性口径:Aing 离线侧无信道/z
+/// 通道语义(质心已按信道分组导出,匹配用裸余弦),eligible = sim ≥
+/// SEED_ASSIGN_THRESHOLD。返回 (参考近邻, 认领结果),元素均为
+/// (person, name, 该席位裸分)。
+#[allow(clippy::type_complexity)]
+fn seed_pick(
     centroid: &[f32],
     seeds: &[SeedCluster],
     matcher: &dyn SeedMatcher,
-) -> Option<(String, String, f32)> {
+) -> (Option<(String, String, f32)>, Option<(String, String, f32)>) {
     let units: Vec<(usize, Vec<f32>)> = seeds
         .iter()
         .enumerate()
@@ -80,10 +83,11 @@ fn seed_neighbor(
             SeedSeat { person: seeds[*i].person.as_str(), sim, eligible: sim >= SEED_ASSIGN_THRESHOLD }
         })
         .collect();
-    matcher.reference(&seats).map(|k| {
+    let pick = |k: usize| {
         let i = units[k].0;
         (seeds[i].person.clone(), seeds[i].name.clone(), seats[k].sim)
-    })
+    };
+    (matcher.reference(&seats).map(pick), matcher.claim(&seats).map(pick))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -194,20 +198,17 @@ pub fn recluster(
     cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
 
     // 5. 种子命名/认人:与实时路(registry::assign_inner)共用同一个 SeedMatcher
-    //    策略——离线终稿与实时若用不同选席逻辑,精修落稿会翻案实时结果。策略的
-    //    参考近邻(无论是否过阈值)进 ClusterStat 供 identify 裁决参考;命名采纳
-    //    (adopted)仍要求该席位 ≥ SEED_ASSIGN_THRESHOLD。未命名的库人物也参与
-    //    ——person id 是修订稿改名同步进声纹库的锚点,不能因为还没名字就丢掉身份。
+    //    策略——离线终稿与实时若用不同选席逻辑,精修落稿会翻案实时结果。命名
+    //    采纳走策略的 claim(合格性=裸分 ≥ SEED_ASSIGN_THRESHOLD);参考近邻
+    //    (reference,无论是否过阈值)进 ClusterStat 供 identify 裁决参考。
+    //    未命名的库人物也参与——person id 是修订稿改名同步进声纹库的锚点,
+    //    不能因为还没名字就丢掉身份。
+    let picks: Vec<(Option<(String, String, f32)>, Option<(String, String, f32)>)> =
+        cls.iter().map(|c| seed_pick(&c.centroid, seeds, matcher)).collect();
     let best_neighbors: Vec<Option<(String, String, f32)>> =
-        cls.iter().map(|c| seed_neighbor(&c.centroid, seeds, matcher)).collect();
-    let matches: Vec<Option<(String, String)>> = best_neighbors
-        .iter()
-        .map(|n| {
-            n.as_ref()
-                .filter(|(_, _, sim)| *sim >= SEED_ASSIGN_THRESHOLD)
-                .map(|(p, name, _)| (p.clone(), name.clone()))
-        })
-        .collect();
+        picks.iter().map(|(r, _)| r.clone()).collect();
+    let matches: Vec<Option<(String, String)>> =
+        picks.iter().map(|(_, c)| c.as_ref().map(|(p, name, _)| (p.clone(), name.clone()))).collect();
 
     // 5b. 簇统计(identify 的声学输入):分信道质心 + 时长分布 + 核心成员 + 种子近邻。
     let stats: Vec<ClusterStat> = cls
@@ -248,8 +249,11 @@ pub fn recluster(
                 total_ms: c.total_ms,
                 source_ms,
                 core_seqs,
+                // adopted = 该参考近邻的 person 被 claim 采纳(与 matches/Assignment
+                // 同源;策略弃权或认了别人时为 false,近邻仍留档供裁决层参考)。
                 seed: best_neighbors[k].as_ref().map(|(p, n, sim)| {
-                    (p.clone(), n.clone(), *sim, *sim >= SEED_ASSIGN_THRESHOLD)
+                    let adopted = matches[k].as_ref().is_some_and(|(cp, _)| cp == p);
+                    (p.clone(), n.clone(), *sim, adopted)
                 }),
             }
         })

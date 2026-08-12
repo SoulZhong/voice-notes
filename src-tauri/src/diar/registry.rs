@@ -208,10 +208,18 @@ impl SeedMatcher for KnnVoteMatcher {
                 neighbors.truncate(SEED_KNN_K);
             }
         }
-        neighbors
-            .into_iter()
-            .filter(|&i| seats[i].person == winner && seats[i].eligible)
-            .max_by(|&a, &b| seats[a].sim.total_cmp(&seats[b].sim))
+        // 严格大于保先到:胜者多个同分合格席位时取先注入者,与本策略其余
+        // 同分保序语义一致(max_by 平手取后者,codex P2)。
+        let mut best: Option<usize> = None;
+        for i in neighbors {
+            if seats[i].person == winner
+                && seats[i].eligible
+                && best.is_none_or(|b: usize| seats[i].sim > seats[b].sim)
+            {
+                best = Some(i);
+            }
+        }
+        best
     }
     fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
         Self::winner_best(seats)
