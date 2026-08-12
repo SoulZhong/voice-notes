@@ -55,6 +55,9 @@ struct Inner {
     series: Vec<(f64, f64)>,
     events: Vec<DriftEvent>,
     converge_secs: Option<f64>,
+    /// DLL 实例被 nominal 重锁替换时,旧实例的重锚计数结转于此,保证全会话单调
+    /// (不因换实例而清零)。
+    reanchor_carry: u32,
 }
 
 /// 每源时钟漂移监视器。内部 `Mutex<Inner>`:frame_tap 线程串行调用 `feed`,
@@ -83,6 +86,7 @@ impl DriftMonitor {
                 series: Vec::new(),
                 events: Vec::new(),
                 converge_secs: None,
+                reanchor_carry: 0,
             }),
         }
     }
@@ -103,9 +107,14 @@ impl DriftMonitor {
         // (那些以本源会话起点为准,与 DLL 内部锚点是两回事)。
         if frame.sample_rate > 0 && frame.sample_rate != g.nominal_hz {
             let old = g.nominal_hz;
+            // 旧 DLL 实例即将被丢弃,其累计重锚数结转到 reanchor_carry,否则
+            // snapshot() 直接读新实例的 reanchors 会把切换前的重锚历史静默清零。
+            g.reanchor_carry += g.dll.estimate().reanchors;
             g.dll = DriftDll::new(frame.sample_rate as f64, DllConfig::default());
             g.nominal_hz = frame.sample_rate;
             g.total_samples = 0;
+            // 换标称率后频率状态全部作废,收敛需重新计时,故清空 converge_secs。
+            g.converge_secs = None;
             let t_s = g.last_t_s;
             g.events.push(DriftEvent {
                 t_s,
@@ -171,7 +180,7 @@ impl DriftMonitor {
             rate_ppm: est.rate_ppm,
             converged: est.converged,
             converge_secs: g.converge_secs,
-            reanchors: est.reanchors,
+            reanchors: g.reanchor_carry + est.reanchors,
             rate_ppm_series: g.series.clone(),
             events: g.events.clone(),
         }
@@ -305,6 +314,34 @@ mod tests {
             r.events.iter().any(|e| e.kind == "nominal_relock"),
             "events: {:?}",
             r.events
+        );
+    }
+
+    #[test]
+    fn nominal_relock_carries_over_reanchor_count_and_resets_converge() {
+        let m = DriftMonitor::new(48_000);
+        for k in 0..100u64 {
+            let ns = k * 10_000_000; // 10ms/帧
+            m.feed(&frame(480, 48_000, Some(ns)));
+        }
+        // 换率前先制造一次重锚,验证其计数不会被 relock 换实例清零。
+        m.mark_reanchor("gap_end", false);
+        // 设备中途换率:标称率重锁,内部 DriftDll 被整体替换成新实例。
+        let base_ns = 100 * 10_000_000;
+        for k in 0..10u64 {
+            let ns = base_ns + k * 10_000_000;
+            m.feed(&frame(441, 44_100, Some(ns)));
+        }
+        let r = m.snapshot();
+        assert_eq!(r.nominal_hz, 44_100);
+        assert!(
+            r.reanchors >= 1,
+            "换实例前的重锚计数应结转,不应被清零: {}",
+            r.reanchors
+        );
+        assert_eq!(
+            r.converge_secs, None,
+            "重锁后应重新计收敛,converge_secs 应被重置"
         );
     }
 
