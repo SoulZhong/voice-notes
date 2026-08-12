@@ -446,10 +446,19 @@ fn run_frame_tap_with_drift(
                 // 与真实时间戳);补零段结束(此前发过补零帧)在此顺带记一次
                 // soft reanchor(保频率,只清相位)。
                 if let Some(m) = &drift {
-                    m.feed(&frame);
+                    // 必须先 mark_reanchor 后 feed:补零段必然 ≥ fill_after(500ms+),
+                    // 远超 DLL 内部自动重锚阈值(5ms)。若先 feed,恢复帧的 push 会先
+                    // 触发一次 DLL 内部自动重锚(reanchors 内部 +1)并把巨大相位误差
+                    // 写进 last_e(phase_err_us 假尖峰),随后 mark_reanchor 又计一次
+                    // ——每个补零段被计 2 次,两次正常断流就把 build_report 的
+                    // reanchors>3 阈值撞出误报。reanchor(keep_freq=true)会先置
+                    // started_at=None,随后 feed 的 push 就会走"首点纯锚定"早退分支,
+                    // 不触发内部自动重锚、不污染 last_e,每个 gap 恰好计 1 次(代价:
+                    // 事件 t_s 取的是断流前最后一次 feed 的时刻而非恢复帧时刻,可接受)。
                     if filled_gap {
                         m.mark_reanchor("gap_end", false);
                     }
+                    m.feed(&frame);
                 }
                 filled_gap = false;
                 if stalled {
@@ -1437,5 +1446,8 @@ mod tests {
         // 补零段结束应记一次重锚事件(soft:gap_end 保频率,只清相位)。
         assert!(r.events.iter().any(|e| e.kind == "reanchor_soft" && e.why == "gap_end"),
             "补零恢复必须重锚,events: {:?}", r.events);
+        // 回归锁定:先 mark_reanchor 后 feed,单次断流的 reanchors 恰为 1(不会
+        // 因 DLL 内部自动重锚被顺带触发而计成 2,见本函数上方 gap_end 顺序注释)。
+        assert_eq!(r.reanchors, 1, "单次断流应恰好计 1 次 reanchor,snapshot: {:?}", r);
     }
 }
