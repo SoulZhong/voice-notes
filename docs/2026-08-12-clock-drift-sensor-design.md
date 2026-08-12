@@ -111,6 +111,8 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 | E3 A-spike | 14.2+ 私有聚合设备(`subdevices:[mic(master)], taps:[CATap], private:1, drift:1`),同场景采集,用 E1 方法量残余错位/延迟/CPU,考察热插拔与 TCC 授权 | 路线 A 的真实成色 |
 
 > **实现期修订(E1 工具落地,`bin/xcorr_align.rs` + `scripts/drift-calibration.md`)**:互相关工具调用顺序固定为 `xcorr_align <note_dir>/system.wav <note_dir>/mic.wav`(system 在前、mic 在后)——这样输出的斜率符号与 `drift_report.json` 的 `inter_track.rel_ppm`(定义为 `mic.rate_ppm - system.rate_ppm`)直接同号可比,调换顺序会导致符号相反。判据口径不变:两者斜率之差 < 5ppm 视为传感器精度达标,可作裁判。详细步骤见 `scripts/drift-calibration.md`。
+>
+> **实现期修订(Codex review 终审发现,AEC 消掉标定刺激)**:默认 capture_path=aec 下,软件 AEC(WebRTC AEC3)在 mic.wav 落盘之前就以 system 路为参考消回声,而 E1 播放的 click 恰恰是"系统回放 → mic 收到的房间回声"这个信号本身——被定向消除后 xcorr 的 0.5 相关阈值会拒掉所有窗,标定测不出任何东西;capture_path=vpio 档同理(Apple AEC 在采集端就把回声压掉)。裁定的修法是环境变量旁路 `VOICE_NOTES_CALIBRATION=1`(`lib.rs` 会话装配处):置位时①强制普通 cpal 麦克风(不进 VPIO)②跳过软件 AEC 角色构建(`aec_roles` 留空),仅对本场生效,不进设置系统/UI——AEC 本身是 PR#86 定死不可配的,标定是唯一例外。该场录音因此会有回声(mic 能听见系统外放)属预期。详见 `scripts/drift-calibration.md` 的启动命令。
 
 **裁决标准(现在预注册,防事后拍脑袋)**——A 达标 = 同时满足:
 

@@ -141,6 +141,10 @@ impl DriftMonitor {
                 // 旧 DLL 实例即将被丢弃,其累计重锚数结转到 reanchor_carry,否则
                 // snapshot() 直接读新实例的 reanchors 会把切换前的重锚历史静默清零。
                 g.reanchor_carry += g.dll.estimate().reanchors;
+                // Codex review Fix 2(P2):旧标称率下测得的 actual_rate_ppm 是旧设备/旧
+                // 标称率的旁证,换标称率后继续挂在新设备名下会误导——不结转,清空等
+                // 下一次轮询(Task 7,10s 一次)重新对新标称率打一个新值。
+                g.actual_rate_ppm = None;
             }
             g.dll = DriftDll::new(frame.sample_rate as f64, DllConfig::default());
             g.nominal_hz = frame.sample_rate;
@@ -224,7 +228,8 @@ impl DriftMonitor {
 
 /// 汇总各源报告成 drift_report.json 的顶层结构(纯函数,好测)。
 /// schema:`{"schema":1,"sources":{...},"inter_track":{...},"anomalies":[...]}`;
-/// `inter_track` 仅双源(mic + system 都在)时给值,否则为 `null`;
+/// `inter_track` 仅双源(mic + system 都在)**且两源都已收敛**时给值,否则为
+/// `null`(Codex review Fix 3,P2:未收敛的 rate_ppm 噪声大,发布出去是假精度);
 /// anomalies 每条 `{"source","kind","value"}`,按三条设计阈值生成。
 pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Value {
     let mut sources_obj = serde_json::Map::new();
@@ -264,8 +269,11 @@ pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Valu
         .iter()
         .find(|(s, _)| *s == Source::System)
         .map(|(_, r)| r);
+    // Codex review Fix 3(P2):双源都收敛才发布 inter_track——未收敛的 rate_ppm 估计
+    // 噪声大,拿它算出的 rel_ppm/est_misalign 是假精度,读者拿着当结论用会被误导。
+    // 未双收敛时按"没有可用的双源结论"处理,与单源情形(只有一个源时)同为 null。
     let inter_track = match (mic, system) {
-        (Some(mic), Some(system)) => {
+        (Some(mic), Some(system)) if mic.converged && system.converged => {
             let rel_ppm = mic.rate_ppm - system.rate_ppm;
             serde_json::json!({
                 "rel_ppm": rel_ppm,
@@ -380,6 +388,10 @@ mod tests {
         }
         // 换率前先制造一次重锚,验证其计数不会被 relock 换实例清零。
         m.mark_reanchor("gap_end", false);
+        // Codex review Fix 2(P2):relock 前先打一个 actual_rate_ppm 旁证值,验证
+        // relock 会把它清掉(旧标称率/旧设备的旁证不得挂在新标称率名下)。
+        m.set_actual_rate_hz(48_000.48); // +10ppm(相对旧 nominal_hz=48000)
+        assert!(m.snapshot().actual_rate_ppm.is_some(), "预置旁证应先生效");
         // 设备中途换率:标称率重锁,内部 DriftDll 被整体替换成新实例。
         let base_ns = 100 * 10_000_000;
         for k in 0..10u64 {
@@ -396,6 +408,10 @@ mod tests {
         assert_eq!(
             r.converge_secs, None,
             "重锁后应重新计收敛,converge_secs 应被重置"
+        );
+        assert_eq!(
+            r.actual_rate_ppm, None,
+            "relock 后旧标称率的 actual_rate_ppm 旁证不得沿用到新设备名下"
         );
     }
 
@@ -435,6 +451,36 @@ mod tests {
         assert_eq!(
             anomalies.iter().filter(|a| a["source"] == "system").count(),
             3
+        );
+    }
+
+    /// Codex review Fix 3(P2):一源未收敛时 inter_track 必须为 null——未收敛的
+    /// rate_ppm 估计噪声大,发布出去是假精度。双源都在但只有一个 converged=false
+    /// 就该按"没有可用的双源结论"处理,与只有单源时同为 null。
+    #[test]
+    fn inter_track_is_null_when_either_source_has_not_converged() {
+        let mic = DriftSourceReport {
+            nominal_hz: 48_000,
+            quality: "hw".into(),
+            rate_ppm: 100.0,
+            converged: true,
+            converge_secs: Some(14.0),
+            reanchors: 0,
+            rate_ppm_series: vec![],
+            events: vec![],
+            actual_rate_ppm: None,
+        };
+        let sys_not_converged = DriftSourceReport {
+            rate_ppm: -600.0,
+            converged: false,
+            converge_secs: None,
+            ..mic.clone()
+        };
+        let v = build_report(&[(Source::Mic, mic), (Source::System, sys_not_converged)]);
+        assert!(
+            v["inter_track"].is_null(),
+            "一源未收敛时 inter_track 应为 null,实得: {:?}",
+            v["inter_track"]
         );
     }
 

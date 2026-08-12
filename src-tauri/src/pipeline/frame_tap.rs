@@ -441,6 +441,13 @@ fn run_frame_tap_with_drift(
     // 判定"设备是否换了"只服务于要不要喂一次 device_switch reanchor,不该跟时钟
     // 核对的重置时机耦合。见下方 Ok 分支顶部旁挂块。
     let mut drift_last_format: Option<(u32, u16)> = None;
+    // Codex review Fix 1(P2):`drift_last_format` 只看 (sample_rate, channels),
+    // 同格式换设备(如 48k mono → 48k mono 换了台新麦克风,常见)完全漏检,新设备会
+    // 继承旧晶振的 ppm 估计与收敛状态。`health.restarts` 由 ResilientCapture 在采集
+    // 重启时递增,是与格式无关的"真的换了后端实例"信号,独立判定并优先于
+    // device_switch/gap_end。初值取进入循环时的 restarts 值(此前的重启与本次 tap
+    // 生命周期无关,不该在第一帧就误判)。
+    let mut drift_last_restarts: u32 = health.restarts.load(Ordering::Relaxed);
 
     loop {
         match from_capture.recv_timeout(policy.tick) {
@@ -456,25 +463,37 @@ fn run_frame_tap_with_drift(
                 // 语义覆盖 gap_end(full 重锚已经把相位一并清了,soft 重锚是它的子集,
                 // 不必再叠加);只有格式没变、纯粹补零结束时才记 gap_end。
                 if let Some(m) = &drift {
-                    let switched = drift_last_format
-                        .is_some_and(|f| f != (frame.sample_rate, frame.channels));
-                    if switched {
-                        // 设备真的换了,晶振不再是同一颗:DLL 里攒的频率状态对新设备
-                        // 没有意义,连同相位一并全清(full=true)。
-                        m.mark_reanchor("device_switch", true);
-                    } else if filled_gap {
-                        // 必须先 mark_reanchor 后 feed:补零段必然 ≥ fill_after(500ms+),
-                        // 远超 DLL 内部自动重锚阈值(5ms)。若先 feed,恢复帧的 push 会先
-                        // 触发一次 DLL 内部自动重锚(reanchors 内部 +1)并把巨大相位误差
-                        // 写进 last_e(phase_err_us 假尖峰),随后 mark_reanchor 又计一次
-                        // ——每个补零段被计 2 次,两次正常断流就把 build_report 的
-                        // reanchors>3 阈值撞出误报。reanchor(keep_freq=true)会先置
-                        // started_at=None,随后 feed 的 push 就会走"首点纯锚定"早退分支,
-                        // 不触发内部自动重锚、不污染 last_e,每个 gap 恰好计 1 次(代价:
-                        // 事件 t_s 取的是断流前最后一次 feed 的时刻而非恢复帧时刻,可接受)。
-                        m.mark_reanchor("gap_end", false);
+                    // Codex review Fix 1(P2):采集重启(可能已换物理设备)优先级最高,
+                    // 同帧只发最高一个——命中时下方 switched/filled_gap 判定整体跳过,
+                    // 不叠加 device_switch/gap_end(全清已经覆盖它们的语义)。
+                    let restarts_now = health.restarts.load(Ordering::Relaxed);
+                    let restarted = restarts_now != drift_last_restarts;
+                    if restarted {
+                        // 采集重启可能已换物理设备,晶振不再是同一颗:与 device_switch
+                        // 同等保守处理,连同相位一并全清(full=true)。
+                        m.mark_reanchor("capture_restart", true);
+                    } else {
+                        let switched = drift_last_format
+                            .is_some_and(|f| f != (frame.sample_rate, frame.channels));
+                        if switched {
+                            // 设备真的换了,晶振不再是同一颗:DLL 里攒的频率状态对新设备
+                            // 没有意义,连同相位一并全清(full=true)。
+                            m.mark_reanchor("device_switch", true);
+                        } else if filled_gap {
+                            // 必须先 mark_reanchor 后 feed:补零段必然 ≥ fill_after(500ms+),
+                            // 远超 DLL 内部自动重锚阈值(5ms)。若先 feed,恢复帧的 push 会先
+                            // 触发一次 DLL 内部自动重锚(reanchors 内部 +1)并把巨大相位误差
+                            // 写进 last_e(phase_err_us 假尖峰),随后 mark_reanchor 又计一次
+                            // ——每个补零段被计 2 次,两次正常断流就把 build_report 的
+                            // reanchors>3 阈值撞出误报。reanchor(keep_freq=true)会先置
+                            // started_at=None,随后 feed 的 push 就会走"首点纯锚定"早退分支,
+                            // 不触发内部自动重锚、不污染 last_e,每个 gap 恰好计 1 次(代价:
+                            // 事件 t_s 取的是断流前最后一次 feed 的时刻而非恢复帧时刻,可接受)。
+                            m.mark_reanchor("gap_end", false);
+                        }
                     }
                     drift_last_format = Some((frame.sample_rate, frame.channels));
+                    drift_last_restarts = restarts_now;
                     m.feed(&frame);
                 }
                 filled_gap = false;
@@ -1551,6 +1570,69 @@ mod tests {
             "device_switch 的 mark 计入旧实例(48k)后被 nominal_relock 结转,\
              新实例(44.1k)尚无重锚,snapshot: {:?}",
             r
+        );
+    }
+
+    /// Codex review Fix 1(P2):同格式换设备(如 48k mono → 48k mono 换了台新麦克风)
+    /// 只看 (sample_rate, channels) 的 device_switch 检测不到,但 ResilientCapture
+    /// 采集重启(health.restarts 递增)是真正的"换了后端实例"信号,必须独立触发
+    /// capture_restart 全清重锚,且该帧不得再叠加发出 gap_end。
+    #[test]
+    fn capture_restart_triggers_reanchor_without_double_counting_gap_end() {
+        use crate::pipeline::drift_monitor::DriftMonitor;
+        let monitor = std::sync::Arc::new(DriftMonitor::new(0));
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let policy = TapPolicy { fill_after: Duration::from_millis(50), ..wallclock_policy() };
+        let m2 = monitor.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap_with_drift(
+                Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none(),
+                std::sync::Arc::new(OnceLock::new()), Some(m2),
+            )
+        });
+        // 首帧:建立格式(48k mono)与 DLL 锚点。
+        cap_tx
+            .send(AudioFrame {
+                samples: vec![0.5; 480],
+                sample_rate: 48_000,
+                channels: 1,
+                host_time_ns: Some(0),
+            })
+            .unwrap();
+        // 断流超过 fill_after(50ms),tap 会补零(filled_gap=true)——不加这一步就测不出
+        // "capture_restart 优先于 gap_end、同帧只发一个"这条,因为没有断流本就不会有
+        // gap_end 候选。
+        std::thread::sleep(Duration::from_millis(200));
+        // 模拟采集重启:ResilientCapture 换了后端实例,但新设备恰好也是 48k mono
+        // ——格式元组不变,device_switch 检测不到。
+        health.restarts.fetch_add(1, Ordering::Relaxed);
+        // 恢复帧格式不变(同格式换设备):若无本修复,会走 filled_gap 分支记 gap_end;
+        // 修复后应改记 capture_restart,且不再叠加 gap_end。
+        cap_tx
+            .send(AudioFrame {
+                samples: vec![0.5; 480],
+                sample_rate: 48_000,
+                channels: 1,
+                host_time_ns: Some(300_000_000),
+            })
+            .unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+        while out_rx.try_recv().is_ok() {}
+
+        let r = monitor.snapshot();
+        assert!(
+            r.events.iter().any(|e| e.why == "capture_restart" && e.kind == "reanchor_full"),
+            "采集重启应记一次 capture_restart 全清重锚,events: {:?}",
+            r.events
+        );
+        assert!(
+            !r.events.iter().any(|e| e.why == "gap_end"),
+            "capture_restart 帧不得同帧再叠加 gap_end,events: {:?}",
+            r.events
         );
     }
 }

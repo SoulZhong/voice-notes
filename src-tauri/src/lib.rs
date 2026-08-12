@@ -1256,6 +1256,13 @@ fn spawn_session(
         // 两源首个真实帧共享一个单调时钟原点。谁先到谁把 0 点钉住,后到源把偏移
         // 写进 SourceHealth,供 mixed sink 在 16k 时间轴上插入准确的前导静音。
         let timeline_origin = Arc::new(OnceLock::new());
+        // Codex review Fix 4(P2):时钟漂移传感器 E1 标定场需要 AEC 完全不介入——
+        // 默认 capture_path=aec 下软件 AEC 在 mic.wav 落盘前工作,E1 标定播放的
+        // click 恰是"系统回放→mic 回声",会被定向消除,xcorr 的刺激没了就测不出
+        // 传感器精度;VPIO 路径同理(Apple AEC)。VOICE_NOTES_CALIBRATION=1 时旁路:
+        // 强制普通 cpal 麦克风(不走 VPIO)、跳过软件 AEC 角色构建。只读一次环境变量
+        // 存 bool,不进设置系统/UI——AEC 是 PR#86 定死不可配的,校准是唯一例外。
+        let calibration = std::env::var("VOICE_NOTES_CALIBRATION").as_deref() == Ok("1");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
             Err(e) => {
@@ -1275,8 +1282,13 @@ fn spawn_session(
         //  - Tap:健康统计 + 断流期按墙钟补零(时间轴不塌,双轨对齐不断裂),
         //    其失联通知(>3s 无帧)踢 Resilient 重启——覆盖 VPIO 这类未接
         //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
+        // 标定模式(calibration)下即便 vpio 档也不许走 VPIO——同一 Codex review Fix 4
+        // 理由:Apple AEC 会把标定刺激的房间回声消掉,校准是唯一例外,不进设置系统。
         #[cfg(target_os = "macos")]
-        let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture {
+        let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture || calibration {
+            if calibration && !use_aec_capture {
+                eprintln!("[标定模式] AEC 已停用(本场)");
+            }
             Box::new(|| {
                 let (etx, erx) = crossbeam_channel::unbounded();
                 (
@@ -1527,7 +1539,13 @@ fn spawn_session(
         // Windows 恒尝试:该平台无 VPIO 可选,软件 AEC 是唯一声学消回声路径
         // (当前为 stub,构造返回 Err → 走下方降级日志,文本级回声去重兜底)。
         let mut aec_roles: Vec<(Source, audio::aec::AecRole)> = Vec::new();
+        if calibration {
+            eprintln!("[标定模式] AEC 已停用(本场)");
+        }
+        // Codex review Fix 4(P2):标定模式下跳过软件 AEC 角色构建(aec_roles 留空)
+        // ——原因见上方 calibration 声明处注释。
         if (use_aec_capture || cfg!(windows))
+            && !calibration
             && sources.iter().any(|(s, _, _)| *s == Source::Mic)
             && sources.iter().any(|(s, _, _)| *s == Source::System)
         {
