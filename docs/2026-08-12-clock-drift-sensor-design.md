@@ -46,6 +46,8 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 
 交叉验证:mic 侧同时轮询 CoreAudio `mRateScalar`(系统现成的实测/标称速率比),写进报告作旁证;SCK 侧无此物,不强求。
 
+> **实现期修订**:旁证口径改为 `kAudioDevicePropertyActualSampleRate`(默认输入设备实测采样率),而非逐回调的 `mRateScalar`——两者是等价的设备级速率旁证,但 `ActualSampleRate` 有现成绑定、无需逐帧回调开销;实现为独立线程每 10s 轮询一次(`audio/actual_rate.rs` + `lib.rs` 中的 10s 定时循环),换算成 ppm 写入 `DriftSourceReport.actual_rate_ppm` 字段(报告字段名同步由"rate_scalar_ppm"改为 `actual_rate_ppm`,见下方第四节修订)。
+
 ## 三、传感器接线(pipeline/frame_tap.rs)
 
 每源一个 DLL 实例,挂在 frame_tap(逐源健康统计与墙钟对账已在此,归属顺理成章):
@@ -55,7 +57,16 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 - 补零帧不喂 DLL(它们没有真实时间戳);补零段结束视同重锚事件;
 - 暂停:DLL 状态冻结,恢复后硬重锚(时间轴冻结语义与现状一致)。
 
+> **实现期修订(重锚语义:full/soft 二分)**:重锚不再是单一"重新初始化"动作,区分 `full`(dll 全清,含频率状态)与 `soft`(保留频率状态,只清相位)两种,由 `mark_reanchor(why, full)` 的 `full` 参数选择:
+> - **rate_fix → soft**(设计草案原意是 full/清空):既有 1% 容差对账改写下游采样率(`health.rate_fixes` 计数)时触发。用户已裁定:rate_fix 恰恰是对账**证实**了 DLL 正在测的偏差(同一颗晶振、同一声明率下频率状态仍然有效)——不是"判断失灵要推倒重来",清空频率状态反而会把最该出数的设备的 ppm 抹掉;只清相位是因为改写声明率会给下游引入一次相位跳变,这笔相位差不能沿用旧锚点。
+> - **device_switch → full**:设备真的换了(采样率或声道数变化),晶振不再是同一颗,频率状态对新设备没有意义,连同相位一并全清。
+> - **gap_end(补零段结束)→ soft**,且**接线顺序是先 `mark_reanchor` 后 `feed`**(设计草案未预见此顺序要求):补零段普遍 ≥ `fill_after`(500ms+),远超 DLL 内部自动重锚阈值(`DLL_REANCHOR_ERR_MS = 5.0`)。若先喂恢复帧再重锚,`push` 会先触发一次 DLL 内部自动重锚(`reanchors` 内部 +1)并把巨大相位误差写入相位状态,随后显式 `mark_reanchor` 又计一次——同一次断流被计两次重锚,足以把 `build_report` 的"单场重锚 >3 次"异常阈值撞出误报。先重锚(`soft`,内部先置"未锚定"状态)再喂帧,恢复帧的 push 走"首点纯锚定"早退分支,不触发内部自动重锚,每个 gap 恰好计 1 次。
+
 轨间相对量:两源 DLL 都在 host 时基上,相对漂移 = 两条速率估计之差;累计错位 = 两条映射在同一 host 时刻的样本位置差。
+
+> **新增(设计文档未预见,实现期增补)**:
+> - **DriftMonitor 声明率自动重锁**(`nominal_relock`):frame_tap 转发的帧 `sample_rate` 中途变化(拔插耳机/切设备)时,`DriftMonitor::feed` 内部重建 DLL 实例并重锁 `nominal_hz`;旧实例的重锚计数结转到 `reanchor_carry`(否则 `snapshot()` 直读新实例会把切换前的重锚历史静默清零),`converge_secs` 清空重新计时。首帧惰性锁定(`DriftMonitor::new(0)` 的"标称率未知,以首帧声明率为准"哨兵路径)不算真正换率,不记事件、不结转计数。
+> - **frame_tap 设备格式变化分支**:`frame_tap.rs` 中原有的"声明格式变化 → 丢弃旧实测结论、按新声明值从头核对"分支,顺带调用 `mark_reanchor("device_switch", true)` 触发全清重锚,与上方 DriftMonitor 侧的 `nominal_relock` 是同一物理事件的两处响应(一处管 DLL 状态,一处管报告事件与计数口径)。
 
 ## 四、数据出口(全本地,无网络上报)
 
@@ -65,12 +76,17 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
      "schema": 1,
      "sources": { "mic": { "nominal_hz": 48000, "quality": "hw|degraded",
        "rate_ppm_series": [[t_s, ppm], ...],   // 每 10s 一点
-       "converge_secs": 14.2, "reanchors": 1, "rate_scalar_ppm": 23.5 },
+       "converge_secs": 14.2, "reanchors": 1, "actual_rate_ppm": 23.5 },
        "system": { ... } },
-     "inter_track": { "rel_ppm_median": 87.0, "est_misalign_ms_per_hour": 313.0 },
-     "events": [ { "t_s": 601.2, "kind": "reanchor", "source": "mic", "why": "device_switch" } ]
+     "inter_track": { "rel_ppm": 87.0, "est_misalign_ms_per_hour": 313.2 },
+     "events": [ { "t_s": 601.2, "kind": "reanchor_full", "why": "device_switch" } ]
    }
    ```
+   > **实现期修订**:
+   > - `events[].kind` 实际取值为 `reanchor_full`(设备切换等全清场景)/`reanchor_soft`(rate_fix、补零段结束等保频率场景)/`nominal_relock`(声明率变化触发的自动重锁;首帧惰性锁定不记事件)——而非草案示例里字面的 `"reanchor"`,三种 kind 的语义与触发点见上方第三节修订。
+   > - `events[]` 每条记录挂在其所属源的 `sources.<name>.events` 数组下(实现按源分桶,而非草案示例的顶层单一数组带 `source` 字段;字段集也相应去掉 `source`,只留 `t_s`/`kind`/`why`)。
+   > - `rate_scalar_ppm` 字段名改为 `actual_rate_ppm`(旁证口径变更,见上方第二节修订)。
+   > - `inter_track` 字段名为 `rel_ppm`(非 `rel_ppm_median`——单值差,非序列统计量)。
 2. **异常打点**:|漂移|>500ppm、时间戳缺失、单场重锚 >3 次 → 记入 drift_report 的 `anomalies` 数组 + eprintln 日志(勘误:原写"ailog 切面",但 ailog 是 AI 调用日志、telemetry 是网络遥测,均不合适;全本地红线下就地落报告)。
 3. **汇总工具** `bin/drift_stats.rs`:扫全部笔记的 drift_report,输出分布(P50/P95/最差设备组合/degraded 占比)——"真实分布"的出口,也是二期裁决的输入。
 
@@ -83,6 +99,8 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 | E1 标定 | 播放已知 click/chirp 序列双轨同录,互相关量真实错位曲线,对照传感器估计 | 传感器自身精度(目标:亚毫秒),使其具备裁判资格 |
 | E2 基线 | 日常真实会议若干场 + 开发机设备组合(内置 mic/AirPods/USB)标准场景 | 真实硬件上漂移多大、多稳定 |
 | E3 A-spike | 14.2+ 私有聚合设备(`subdevices:[mic(master)], taps:[CATap], private:1, drift:1`),同场景采集,用 E1 方法量残余错位/延迟/CPU,考察热插拔与 TCC 授权 | 路线 A 的真实成色 |
+
+> **实现期修订(E1 工具落地,`bin/xcorr_align.rs` + `scripts/drift-calibration.md`)**:互相关工具调用顺序固定为 `xcorr_align <note_dir>/system.wav <note_dir>/mic.wav`(system 在前、mic 在后)——这样输出的斜率符号与 `drift_report.json` 的 `inter_track.rel_ppm`(定义为 `mic.rate_ppm - system.rate_ppm`)直接同号可比,调换顺序会导致符号相反。判据口径不变:两者斜率之差 < 5ppm 视为传感器精度达标,可作裁判。详细步骤见 `scripts/drift-calibration.md`。
 
 **裁决标准(现在预注册,防事后拍脑袋)**——A 达标 = 同时满足:
 
