@@ -55,6 +55,65 @@ mod tests {
         let pts: Vec<(f64, f64)> = (0..30).map(|k| (k as f64 * 10.0, k as f64 * 10.0 * 0.1)).collect();
         assert!((linear_slope_ppm(&pts).unwrap() - 100.0).abs() < 1e-6);
     }
+
+    /// 符号回归:锁死 xcorr_offset + linear_slope_ppm 的符号约定,防止调用顺序/公式改动
+    /// 后再次把 E1 标定的判据方向搞反(见 scripts/drift-calibration.md)。
+    ///
+    /// 物理模型:存在一条"真实内容"时间线 src。轨道 x 的第 n 个采样对应真实时间
+    /// t = n / (R·(1+e_x)),即它在 src 上取的是第 n/(1+e_x) 个样本(四舍五入)。
+    /// e_x > 0 表示该轨道的实际采样率快于标称值(单位时间录得更多样本)。
+    ///
+    /// 构造 mic 偏快 +80ppm、system 偏慢 -80ppm,则
+    /// inter_track.rel_ppm = mic.rate_ppm - system.rate_ppm = +160ppm。
+    /// 按标定文档 Step 4 修正后的调用顺序 xcorr_align system.wav mic.wav(即 a=system,b=mic),
+    /// 推导(并经独立数值模拟验证)得 linear_slope_ppm(a,b) ≈ rate_ppm(b) - rate_ppm(a)
+    /// = mic.rate_ppm - system.rate_ppm = rel_ppm,应直接读出 +160ppm 左右(而不是 -160ppm)。
+    #[test]
+    fn slope_sign_matches_rel_ppm_with_system_then_mic_order() {
+        let mut seed = 7u64;
+        let mut noise = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 40) as f32 / 8388608.0 - 1.0 };
+        let src_len = 700_000usize;
+        let src: Vec<f32> = (0..src_len).map(|_| noise()).collect();
+
+        // 按上述物理模型,从公共内容时间线 src 重采样出一条偏快/偏慢 rate_ppm 的轨道。
+        let build = |rate_ppm: f64, n_out: usize| -> Vec<f32> {
+            let e = rate_ppm / 1e6;
+            (0..n_out)
+                .map(|n| {
+                    let idx = (n as f64 / (1.0 + e)).round();
+                    if idx < 0.0 || idx as usize >= src_len { 0.0 } else { src[idx as usize] }
+                })
+                .collect()
+        };
+
+        let r = 8_000f64;
+        let n_out = 650_000usize;
+        let mic = build(80.0, n_out); // mic 实际采样率偏快 +80ppm
+        let system = build(-80.0, n_out); // system 实际采样率偏慢 -80ppm
+        let rel_ppm = 80.0 - (-80.0); // = 160.0,对照 drift_report.inter_track.rel_ppm 口径
+
+        // 调用顺序 a=system, b=mic,对齐文档 Step 4 修正后的顺序。
+        let (win, step, search) = (800usize, 40_000usize, 300i64);
+        let mut pts = Vec::new();
+        let mut t0 = 0usize;
+        while t0 + win < system.len().min(mic.len()) {
+            if let Some((off, _corr)) = xcorr_offset(&system, &mic, t0, win, search) {
+                let t_s = t0 as f64 / r;
+                let off_ms = off as f64 * 1000.0 / r;
+                pts.push((t_s, off_ms));
+            }
+            t0 += step;
+        }
+        let ppm = linear_slope_ppm(&pts).expect("应能从多窗采样点拟合出斜率");
+
+        assert!(
+            (ppm - rel_ppm).abs() < rel_ppm.abs() * 0.2,
+            "符号/数值回归失败:mic 实际偏快 +80ppm、system 实际偏慢 -80ppm 时 rel_ppm=mic-system={rel_ppm:+.1}ppm;\
+             xcorr_align 以 (a=system, b=mic) 顺序调用时 linear_slope_ppm 应 ≈ +{rel_ppm:.1}ppm(即 rate_ppm(b)-rate_ppm(a)),\
+             容差 ±20%,实得 {ppm:+.1}ppm。若变号或量级偏差过大,说明 xcorr_offset/linear_slope_ppm 的符号约定或\
+             drift-calibration.md 里约定的调用顺序(system.wav 在前、mic.wav 在后)被破坏了。"
+        );
+    }
 }
 
 fn main() {
@@ -83,7 +142,13 @@ fn main() {
         t0 += step;
     }
     match linear_slope_ppm(&pts) {
-        Some(ppm) => println!("互相关口径轨间漂移: {ppm:+.1} ppm(对照 drift_report.inter_track.rel_ppm)"),
+        // 符号约定:linear_slope_ppm(a, b) ≈ rate_ppm(b) - rate_ppm(a),即正值 = 第二个文件
+        // (b)相对第一个文件(a)实际采样率偏快。按标定文档顺序 xcorr_align system.wav mic.wav
+        // 调用(a=system, b=mic)时,本值直接对齐 drift_report.inter_track.rel_ppm
+        // = mic.rate_ppm - system.rate_ppm,可与之直接作差比较,无需再取反。
+        Some(ppm) => println!(
+            "互相关口径轨间漂移: {ppm:+.1} ppm(正值=第二个文件相对第一个偏快;若按 <system.wav> <mic.wav> 顺序调用,口径对齐 drift_report.inter_track.rel_ppm = mic.rate_ppm - system.rate_ppm)"
+        ),
         None => println!("有效窗不足,无法拟合"),
     }
 }
