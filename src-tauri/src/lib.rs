@@ -103,6 +103,8 @@ struct ActiveSession {
     /// stop 发送端。仅持有以随会话拆除而 drop——drop 即断开会合通道,轮询线程的
     /// `recv_timeout` 立即返回 Disconnected 退出,不裸 loop+sleep 泄漏线程(与
     /// vpio.rs 的 stop 通道同款惯例)。
+    /// 故意 write-only:唯一职责是被 Drop,从不读取。
+    #[allow(dead_code)]
     actual_rate_stop: crossbeam_channel::Sender<()>,
     /// 笔记目录快照:停录时写墙钟-样本对账要用(该路径在 writer 移交前已确定,
     /// 见 start 处 `writer.dir()`)。
