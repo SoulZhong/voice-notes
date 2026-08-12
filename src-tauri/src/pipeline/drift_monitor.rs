@@ -5,7 +5,8 @@
 
 use crate::audio::drift_dll::{DllConfig, DriftDll};
 use crate::audio::{AudioFrame, Source};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// 每 10s 记一个 (自首帧秒, ppm) 采样点,供报告画趋势线。
 const SERIES_BUCKET_SECS: f64 = 10.0;
@@ -107,20 +108,29 @@ impl DriftMonitor {
         // (那些以本源会话起点为准,与 DLL 内部锚点是两回事)。
         if frame.sample_rate > 0 && frame.sample_rate != g.nominal_hz {
             let old = g.nominal_hz;
-            // 旧 DLL 实例即将被丢弃,其累计重锚数结转到 reanchor_carry,否则
-            // snapshot() 直接读新实例的 reanchors 会把切换前的重锚历史静默清零。
-            g.reanchor_carry += g.dll.estimate().reanchors;
+            // old==0 是 `DriftMonitor::new(0)` 的惰性初始化:装配处不知道设备声明率
+            // (mic 声明率要 start 后才可知),约定 0 表示"以首帧声明率为准"。这不是
+            // 真正的"换率"——没有旧状态可言,不记 nominal_relock 事件、不结转重锚数,
+            // 静默锁定即可。真正的换率(old!=0)才是运行期异常,照旧记事件。
+            let is_initial_lock = old == 0;
+            if !is_initial_lock {
+                // 旧 DLL 实例即将被丢弃,其累计重锚数结转到 reanchor_carry,否则
+                // snapshot() 直接读新实例的 reanchors 会把切换前的重锚历史静默清零。
+                g.reanchor_carry += g.dll.estimate().reanchors;
+            }
             g.dll = DriftDll::new(frame.sample_rate as f64, DllConfig::default());
             g.nominal_hz = frame.sample_rate;
             g.total_samples = 0;
             // 换标称率后频率状态全部作废,收敛需重新计时,故清空 converge_secs。
             g.converge_secs = None;
-            let t_s = g.last_t_s;
-            g.events.push(DriftEvent {
-                t_s,
-                kind: "nominal_relock".into(),
-                why: format!("rate {old}->{}", frame.sample_rate),
-            });
+            if !is_initial_lock {
+                let t_s = g.last_t_s;
+                g.events.push(DriftEvent {
+                    t_s,
+                    kind: "nominal_relock".into(),
+                    why: format!("rate {old}->{}", frame.sample_rate),
+                });
+            }
         }
         let ns = match frame.host_time_ns {
             Some(ns) => ns,
@@ -246,6 +256,25 @@ pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Valu
         "inter_track": inter_track,
         "anomalies": anomalies,
     })
+}
+
+/// 停录单点调用:各源 snapshot → `build_report` → 覆盖写 `<note_dir>/drift_report.json`。
+/// 一期铁律:传感器只测不动数据,本函数只负责落盘,不影响停录主流程——调用方
+/// (lib.rs `do_stop_teardown`)对本函数的 `Err` 只 eprintln,绝不中断/回滚停录。
+/// 报告是终值(会话已结束、各源不会再 feed),故直接覆盖写,无需加锁保护文件。
+/// 返回写入的 anomalies 数组,供调用方逐条打日志(不强制——测试只关心文件内容)。
+pub fn persist_report(
+    note_dir: &Path,
+    sources: &[(Source, Arc<DriftMonitor>)],
+) -> std::io::Result<Vec<serde_json::Value>> {
+    let reports: Vec<(Source, DriftSourceReport)> =
+        sources.iter().map(|(src, m)| (*src, m.snapshot())).collect();
+    let report = build_report(&reports);
+    let anomalies = report["anomalies"].as_array().cloned().unwrap_or_default();
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(note_dir.join("drift_report.json"), json)?;
+    Ok(anomalies)
 }
 
 #[cfg(test)]
@@ -381,5 +410,40 @@ mod tests {
             anomalies.iter().filter(|a| a["source"] == "system").count(),
             3
         );
+    }
+
+    #[test]
+    fn lazy_nominal_rate_locks_to_first_frame() {
+        let m = DriftMonitor::new(0);
+        m.feed(&frame(441, 44_100, Some(0)));
+        assert_eq!(m.snapshot().nominal_hz, 44_100);
+    }
+
+    #[test]
+    fn lazy_nominal_rate_lock_is_not_recorded_as_relock_event() {
+        // 惰性初始化(new(0))的首帧锁定不是"运行期换率",不该产生 nominal_relock
+        // 事件,也不该有重锚计数结转——那是留给真实换率(设备中途切率)的语义。
+        let m = DriftMonitor::new(0);
+        m.feed(&frame(441, 44_100, Some(0)));
+        let r = m.snapshot();
+        assert!(
+            r.events.is_empty(),
+            "惰性首帧锁定不应记事件: {:?}",
+            r.events
+        );
+        assert_eq!(r.reanchors, 0);
+    }
+
+    #[test]
+    fn persist_report_writes_json_with_anomalies() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = std::sync::Arc::new(DriftMonitor::new(48_000));
+        m.feed(&frame(480, 48_000, None)); // degraded → 必然产生一条 anomaly
+        persist_report(dir.path(), &[(Source::Mic, m)]).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("drift_report.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["sources"]["mic"]["quality"], "degraded");
+        assert!(!v["anomalies"].as_array().unwrap().is_empty());
     }
 }
