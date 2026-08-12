@@ -15,6 +15,7 @@ pub mod echo_clean;
 pub mod aec_align;
 pub mod neural_aec;
 pub mod host_time;
+pub mod drift_dll;
 #[cfg(target_os = "macos")]
 pub mod system;
 #[cfg(target_os = "macos")]
