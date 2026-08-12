@@ -27,7 +27,7 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 - **参数**(常量,标注"调研共识初值,标定实验后校准"):
   - 稳态带宽 `DLL_BW_STEADY = 0.05 Hz`(zita 0.05 / PipeWire 0.016–0.128 共识区);
   - 启动加速:首点硬对齐,随后 `DLL_WARMUP_SECS = 4.0` 内用 `DLL_BW_WARMUP = 0.5 Hz`,再降稳态(zita 配方,总收敛 ~15s);
-  - 重锚阈值 `DLL_REANCHOR_ERR_MS = 5.0`:相位误差超此值(或设备切换/采样率变化/长补零)→ 重新初始化 + 硬重锚,不让环路慢慢爬回。
+  - 重锚阈值 `DLL_REANCHOR_ERR_MS = 5.0`:相位误差超此值 → 内部自动重锚保频率(soft:只清相位,不清频率状态,`push()` 内部处理),不让环路慢慢爬回;设备切换/采样率变化走外部显式重锚,语义与阈值无关(见第三节)。
 - **输入**:单调递增的(累计样本数,host 时刻 ns)测量点。
 - **输出**:`DriftEstimate { rate_ppm, phase_err_us, converged, reanchor_count }`——`rate_ppm` 即频率状态换算的"实测速率相对标称的偏差";另提供 `map_sample_to_host_ns()` 平滑映射(二期执行端/验收用)。
 
@@ -57,6 +57,12 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 - 补零帧不喂 DLL(它们没有真实时间戳);补零段结束视同重锚事件;
 - 暂停:DLL 状态冻结,恢复后硬重锚(时间轴冻结语义与现状一致)。
 
+> **实现期修订(暂停语义与设计草案不符)**:上面"暂停:DLL 状态冻结,恢复后硬重锚"是设计阶段的意图,与实现不符——暂停闸落在 `pipeline/segment_worker.rs`(`paused` 置位期间丢帧,冻结的是**笔记自己的时间轴**),`frame_tap`/`DriftMonitor` 在 segment_worker 的上游,对暂停完全无感:暂停期间上游仍在到达的真实帧照常喂 DLL,不冻结、不重锚。这是刻意保留而非遗漏:暂停期间时间戳本身连续,DLL 没有相位跳变可言,若强行重锚反而会丢掉本可继续估计的频率状态,精度更差。
+>
+> 后果:`rate_ppm_series`/`events` 的 `t_s` 是**含暂停时长的 host 实时轴**,与笔记自己的时间轴(暂停冻结、不含暂停时长)**不对齐**——二期做时间对齐(E1/E2 等实验、或把 drift 事件映射回笔记时间轴)时须先扣掉该时刻之前累计的暂停时长,否则会有系统性偏差。
+>
+> 另:device_switch 与 gap_end 若落在同一恢复帧(拔插耳机=断流+换率,物理上一次事件)只计 **一次** device_switch,不叠加 gap_end——full 语义(全清频率+相位)已覆盖 soft 语义(只清相位)的效果,重复计两次会把 `build_report` 的"单场重锚 >3 次"异常阈值撞出误报(2026-08-12 终审 P1 修复;回归锁见 `frame_tap.rs` 测试 `device_switch_after_gap_counts_once_not_twice`)。
+>
 > **实现期修订(重锚语义:full/soft 二分)**:重锚不再是单一"重新初始化"动作,区分 `full`(dll 全清,含频率状态)与 `soft`(保留频率状态,只清相位)两种,由 `mark_reanchor(why, full)` 的 `full` 参数选择:
 > - **rate_fix → soft**(设计草案原意是 full/清空):既有 1% 容差对账改写下游采样率(`health.rate_fixes` 计数)时触发。用户已裁定:rate_fix 恰恰是对账**证实**了 DLL 正在测的偏差(同一颗晶振、同一声明率下频率状态仍然有效)——不是"判断失灵要推倒重来",清空频率状态反而会把最该出数的设备的 ppm 抹掉;只清相位是因为改写声明率会给下游引入一次相位跳变,这笔相位差不能沿用旧锚点。
 > - **device_switch → full**:设备真的换了(采样率或声道数变化),晶振不再是同一颗,频率状态对新设备没有意义,连同相位一并全清。
@@ -89,6 +95,10 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
    > - `inter_track` 字段名为 `rel_ppm`(非 `rel_ppm_median`——单值差,非序列统计量)。
 2. **异常打点**:|漂移|>500ppm、时间戳缺失、单场重锚 >3 次 → 记入 drift_report 的 `anomalies` 数组 + eprintln 日志(勘误:原写"ailog 切面",但 ailog 是 AI 调用日志、telemetry 是网络遥测,均不合适;全本地红线下就地落报告)。
 3. **汇总工具** `bin/drift_stats.rs`:扫全部笔记的 drift_report,输出分布(P50/P95/最差设备组合/degraded 占比)——"真实分布"的出口,也是二期裁决的输入。
+
+   > **实现期修订(设备组合维度降到二期)**:当前 `DriftSourceReport`/`drift_report.json` schema 不带任何设备标识(型号/名称/唯一 ID)——一期采样点只知道"哪个源(mic/system)"和"标称率是多少",不知道"哪台设备",无法按设备组合分桶,"最差设备组合"因此在一期不可实现,不是漏做而是当前 schema 结构性做不到。降到二期:届时 schema 加 device 字段(设备名/型号,采集端已知但未透传到 drift 报告),`drift_stats` 才能按设备组合聚合"最差组合"。
+   >
+   > 一期 `bin/drift_stats.rs` 的实际输出(见其源码与内测 `ingest_and_percentiles`):场次数、含 degraded 源的场次占比、轨间 `|rel_ppm|` 的 P50/P95/max、全库重锚总数、异常清单(逐条打印,截断前 20 条)。
 
 旁路契约(同 mixed 轨先例):传感器任何失败(时间戳异常、DLL 数值异常、写盘失败)只丢 drift_report,不影响录音主链路。
 

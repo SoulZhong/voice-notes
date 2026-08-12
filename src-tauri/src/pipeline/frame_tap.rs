@@ -437,27 +437,44 @@ fn run_frame_tap_with_drift(
     // 本次断流是否已实际发过补零帧(Task 5):true 时下一个真实帧到达即视为
     // "补零段结束",据此喂 DriftMonitor 一次 reanchor(soft:保频率,只清相位)。
     let mut filled_gap = false;
+    // drift 旁挂自持的格式记忆,与下方 `last_format`(时钟核对用)独立、不共用:
+    // 判定"设备是否换了"只服务于要不要喂一次 device_switch reanchor,不该跟时钟
+    // 核对的重置时机耦合。见下方 Ok 分支顶部旁挂块。
+    let mut drift_last_format: Option<(u32, u16)> = None;
 
     loop {
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
                 // Task 5:真实帧原始声明率下喂 DriftMonitor(必须在下方时钟核对
                 // 改写 sample_rate 之前——DLL 要的是设备原始声明率口径的样本计数
-                // 与真实时间戳);补零段结束(此前发过补零帧)在此顺带记一次
-                // soft reanchor(保频率,只清相位)。
+                // 与真实时间戳)。
+                //
+                // 设备换率(拔插耳机/切设备)与补零段结束在此合并判定,不许同一帧
+                // 计两次:拔耳机=断流+换率,物理上是一次事件,若各自旁挂各记一次
+                // (device_switch + gap_end)会一来一回把正常会话的 reanchors 计数
+                // 撞出 build_report 的 >3 异常阈值(2026-08-12 终审发现)。device_switch
+                // 语义覆盖 gap_end(full 重锚已经把相位一并清了,soft 重锚是它的子集,
+                // 不必再叠加);只有格式没变、纯粹补零结束时才记 gap_end。
                 if let Some(m) = &drift {
-                    // 必须先 mark_reanchor 后 feed:补零段必然 ≥ fill_after(500ms+),
-                    // 远超 DLL 内部自动重锚阈值(5ms)。若先 feed,恢复帧的 push 会先
-                    // 触发一次 DLL 内部自动重锚(reanchors 内部 +1)并把巨大相位误差
-                    // 写进 last_e(phase_err_us 假尖峰),随后 mark_reanchor 又计一次
-                    // ——每个补零段被计 2 次,两次正常断流就把 build_report 的
-                    // reanchors>3 阈值撞出误报。reanchor(keep_freq=true)会先置
-                    // started_at=None,随后 feed 的 push 就会走"首点纯锚定"早退分支,
-                    // 不触发内部自动重锚、不污染 last_e,每个 gap 恰好计 1 次(代价:
-                    // 事件 t_s 取的是断流前最后一次 feed 的时刻而非恢复帧时刻,可接受)。
-                    if filled_gap {
+                    let switched = drift_last_format
+                        .is_some_and(|f| f != (frame.sample_rate, frame.channels));
+                    if switched {
+                        // 设备真的换了,晶振不再是同一颗:DLL 里攒的频率状态对新设备
+                        // 没有意义,连同相位一并全清(full=true)。
+                        m.mark_reanchor("device_switch", true);
+                    } else if filled_gap {
+                        // 必须先 mark_reanchor 后 feed:补零段必然 ≥ fill_after(500ms+),
+                        // 远超 DLL 内部自动重锚阈值(5ms)。若先 feed,恢复帧的 push 会先
+                        // 触发一次 DLL 内部自动重锚(reanchors 内部 +1)并把巨大相位误差
+                        // 写进 last_e(phase_err_us 假尖峰),随后 mark_reanchor 又计一次
+                        // ——每个补零段被计 2 次,两次正常断流就把 build_report 的
+                        // reanchors>3 阈值撞出误报。reanchor(keep_freq=true)会先置
+                        // started_at=None,随后 feed 的 push 就会走"首点纯锚定"早退分支,
+                        // 不触发内部自动重锚、不污染 last_e,每个 gap 恰好计 1 次(代价:
+                        // 事件 t_s 取的是断流前最后一次 feed 的时刻而非恢复帧时刻,可接受)。
                         m.mark_reanchor("gap_end", false);
                     }
+                    drift_last_format = Some((frame.sample_rate, frame.channels));
                     m.feed(&frame);
                 }
                 filled_gap = false;
@@ -480,11 +497,10 @@ fn run_frame_tap_with_drift(
                     applied_rate = None;
                     clock_span = Duration::ZERO;
                     clock_samples = 0;
-                    // 设备真的换了,晶振不再是同一颗:DLL 里攒的频率状态对新设备
-                    // 没有意义,连同相位一并全清(full=true)。
-                    if let Some(m) = &drift {
-                        m.mark_reanchor("device_switch", true);
-                    }
+                    // device_switch 的 drift reanchor 已在本函数顶部的旁挂块里、按
+                    // drift_last_format 独立判定并处理(与 gap_end 合并去重,见该处
+                    // 注释),这里不再重复喂——两处各自摸一次同一物理事件曾是 P1 双计
+                    // 缺陷的根(2026-08-12 终审)。
                 }
                 last_format = Some((frame.sample_rate, frame.channels));
                 last_frame_at = now;
@@ -1459,5 +1475,82 @@ mod tests {
         // 回归锁定:先 mark_reanchor 后 feed,单次断流的 reanchors 恰为 1(不会
         // 因 DLL 内部自动重锚被顺带触发而计成 2,见本函数上方 gap_end 顺序注释)。
         assert_eq!(r.reanchors, 1, "单次断流应恰好计 1 次 reanchor,snapshot: {:?}", r);
+    }
+
+    /// 终审 P1 回归锁:拔插耳机=断流(gap_end)+换率(device_switch)一次物理事件,
+    /// 不得被旁挂各记一次而计成 2。场景:先喂 48k 帧,断流超过 fill_after,再以
+    /// 44.1k 恢复(既是"补零段结束"又是"格式变了")。
+    ///
+    /// 断言口径按实际链路推演(非拍脑袋放宽):
+    /// - events 里恰一条 device_switch(kind="reanchor_full"),没有 gap_end——
+    ///   device_switch 分支覆盖了 gap_end 分支(见 run_frame_tap_with_drift 顶部
+    ///   旁挂块的 if/else if)。另有一条 nominal_relock 事件(DriftMonitor::feed
+    ///   自身对"标称率变了"的既有记录,与本次修复无关,不断言其存不存在之外的内容)。
+    /// - snapshot().reanchors == 1:mark_reanchor("device_switch", true) 发生在
+    ///   *旧* DriftDll 实例(nominal_hz=48000)身上,使其内部 reanchors 计数变 1;
+    ///   随后 feed(44100 帧) 检测到标称率变化,触发 nominal_relock,把旧实例的
+    ///   reanchors(=1)结转进 reanchor_carry,再换上全新的 44100 实例(reanchors=0)。
+    ///   snapshot 的 reanchors = reanchor_carry(1) + 新实例.reanchors(0) = 1。
+    #[test]
+    fn device_switch_after_gap_counts_once_not_twice() {
+        use crate::pipeline::drift_monitor::DriftMonitor;
+        // 0 = 惰性初始化,与生产装配(lib.rs)同款:首帧到达前不知道设备声明率。
+        let monitor = std::sync::Arc::new(DriftMonitor::new(0));
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_millis(50), ..wallclock_policy() };
+        let m2 = monitor.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap_with_drift(
+                Source::Mic, cap_rx, out_tx, health, policy, TapNotify::none(),
+                std::sync::Arc::new(OnceLock::new()), Some(m2),
+            )
+        });
+        // 48k 首帧,建立格式与 DLL 锚点。
+        cap_tx
+            .send(AudioFrame {
+                samples: vec![0.5; 480],
+                sample_rate: 48_000,
+                channels: 1,
+                host_time_ns: Some(0),
+            })
+            .unwrap();
+        // 断流远超 fill_after(50ms),确保至少发出一次补零帧(filled_gap=true)。
+        std::thread::sleep(Duration::from_millis(200));
+        // 以不同采样率恢复:物理上"拔插耳机"的一次事件,应只记 device_switch。
+        cap_tx
+            .send(AudioFrame {
+                samples: vec![0.5; 441],
+                sample_rate: 44_100,
+                channels: 1,
+                host_time_ns: Some(300_000_000),
+            })
+            .unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+        while out_rx.try_recv().is_ok() {}
+
+        let r = monitor.snapshot();
+        let device_switch_events: Vec<_> =
+            r.events.iter().filter(|e| e.why == "device_switch").collect();
+        assert_eq!(
+            device_switch_events.len(),
+            1,
+            "应恰有一条 device_switch 事件,events: {:?}",
+            r.events
+        );
+        assert_eq!(device_switch_events[0].kind, "reanchor_full");
+        assert!(
+            !r.events.iter().any(|e| e.why == "gap_end"),
+            "device_switch 应覆盖 gap_end,不得同时出现: {:?}",
+            r.events
+        );
+        assert_eq!(
+            r.reanchors, 1,
+            "device_switch 的 mark 计入旧实例(48k)后被 nominal_relock 结转,\
+             新实例(44.1k)尚无重锚,snapshot: {:?}",
+            r
+        );
     }
 }
