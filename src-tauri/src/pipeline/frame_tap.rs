@@ -480,6 +480,11 @@ fn run_frame_tap_with_drift(
                     applied_rate = None;
                     clock_span = Duration::ZERO;
                     clock_samples = 0;
+                    // 设备真的换了,晶振不再是同一颗:DLL 里攒的频率状态对新设备
+                    // 没有意义,连同相位一并全清(full=true)。
+                    if let Some(m) = &drift {
+                        m.mark_reanchor("device_switch", true);
+                    }
                 }
                 last_format = Some((frame.sample_rate, frame.channels));
                 last_frame_at = now;
@@ -521,8 +526,13 @@ fn run_frame_tap_with_drift(
                                 applied_rate = Some(observed.round() as u32);
                                 health.rate_fixes.fetch_add(1, Ordering::Relaxed);
                                 settle_debt = true;
+                                // rate_fix 恰恰是对账**证实**了 DLL 正在测的偏差(同一颗
+                                // 晶振、同一声明率下频率状态仍然有效),不是"判断失灵要
+                                // 推倒重来"——清零频率状态反而会把最该出数的设备的 ppm
+                                // 抹掉。只清相位:声明率被改写会给下游引入一次相位跳变,
+                                // 这笔相位差不能沿用旧锚点。
                                 if let Some(m) = &drift {
-                                    m.mark_reanchor("rate_fix", true);
+                                    m.mark_reanchor("rate_fix", false);
                                 }
                             }
                         } else {

@@ -95,6 +95,24 @@ impl DriftMonitor {
     /// `dll`(单声道 nominal_hz)口径一致的样本推进量。
     pub fn feed(&self, frame: &AudioFrame) {
         let mut g = self.inner.lock().unwrap();
+        // 设备中途换了声明率(拔插耳机/切设备后 frame_tap 转发的帧 sample_rate 变了):
+        // 旧 nominal_hz 下积累的频率状态在新标称率下全盘失真,ppm/quality 却仍会照旧
+        // 标 "hw" ——必须重锁标称率,这是 quality 语义成立的前提。重建的新 DLL 从零
+        // 锚定,本帧(改口径后的第一帧)就是它的首个测量点,故只重置 total_samples
+        // 让 push 的样本基准与新 DLL 对齐;first_feed_ns/系列点等报告口径不动
+        // (那些以本源会话起点为准,与 DLL 内部锚点是两回事)。
+        if frame.sample_rate > 0 && frame.sample_rate != g.nominal_hz {
+            let old = g.nominal_hz;
+            g.dll = DriftDll::new(frame.sample_rate as f64, DllConfig::default());
+            g.nominal_hz = frame.sample_rate;
+            g.total_samples = 0;
+            let t_s = g.last_t_s;
+            g.events.push(DriftEvent {
+                t_s,
+                kind: "nominal_relock".into(),
+                why: format!("rate {old}->{}", frame.sample_rate),
+            });
+        }
         let ns = match frame.host_time_ns {
             Some(ns) => ns,
             None => {
@@ -266,6 +284,28 @@ mod tests {
         let r = m.snapshot();
         assert_eq!(r.events.len(), 1);
         assert_eq!(r.events[0].why, "device_switch");
+    }
+
+    #[test]
+    fn nominal_rate_change_relocks_and_records_event() {
+        let m = DriftMonitor::new(48_000);
+        for k in 0..100u64 {
+            let ns = k * 10_000_000; // 10ms/帧
+            m.feed(&frame(480, 48_000, Some(ns)));
+        }
+        // 设备中途换率(如声明改写成 44.1kHz):标称率必须跟着重锁。
+        let base_ns = 100 * 10_000_000;
+        for k in 0..10u64 {
+            let ns = base_ns + k * 10_000_000;
+            m.feed(&frame(441, 44_100, Some(ns)));
+        }
+        let r = m.snapshot();
+        assert_eq!(r.nominal_hz, 44_100);
+        assert!(
+            r.events.iter().any(|e| e.kind == "nominal_relock"),
+            "events: {:?}",
+            r.events
+        );
     }
 
     #[test]
