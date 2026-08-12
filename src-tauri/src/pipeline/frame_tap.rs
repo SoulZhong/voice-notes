@@ -595,6 +595,8 @@ fn run_frame_tap_with_origin(
                     samples: vec![0.0; frames_n * channels as usize],
                     sample_rate: rate,
                     channels,
+                    // 合成补零帧，无真实硬件时间戳。
+                    host_time_ns: None,
                 };
                 if to_worker.send(silence).is_err() {
                     return;
@@ -625,7 +627,7 @@ mod tests {
     }
 
     fn frame(n: usize) -> AudioFrame {
-        AudioFrame { samples: vec![0.5; n], sample_rate: 16000, channels: 1 }
+        AudioFrame { samples: vec![0.5; n], sample_rate: 16000, channels: 1, host_time_ns: None }
     }
 
     fn fast_policy() -> TapPolicy {
@@ -674,7 +676,12 @@ mod tests {
                 continue;
             }
             if ctx
-                .send(AudioFrame { samples: vec![0.2; n], sample_rate: declared, channels: 1 })
+                .send(AudioFrame {
+                    samples: vec![0.2; n],
+                    sample_rate: declared,
+                    channels: 1,
+                    host_time_ns: None,
+                })
                 .is_err()
             {
                 break;
@@ -900,7 +907,13 @@ mod tests {
                     // 以首帧为原点;脉冲是本帧第 0 个样本,即本帧起点。
                     mark_wall = now.duration_since(first_sent.unwrap_or(now)).as_secs_f64();
                 }
-                ctx.send(AudioFrame { samples, sample_rate: DECLARED, channels: 1 }).unwrap();
+                ctx.send(AudioFrame {
+                    samples,
+                    sample_rate: DECLARED,
+                    channels: 1,
+                    host_time_ns: None,
+                })
+                .unwrap();
                 first_sent.get_or_insert(now);
                 sent = want;
             }
@@ -1023,6 +1036,7 @@ mod tests {
                 samples: vec![0.2; (RATE as f64 * 0.2) as usize],
                 sample_rate: RATE,
                 channels: 1,
+                host_time_ns: None,
             })
             .unwrap();
         }
@@ -1261,6 +1275,7 @@ mod tests {
                         samples: vec![0.3; 160],
                         sample_rate: 16000,
                         channels: 1,
+                        host_time_ns: None,
                     });
                 }
                 if self.error_after_start {

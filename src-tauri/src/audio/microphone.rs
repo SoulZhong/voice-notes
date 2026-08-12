@@ -63,13 +63,30 @@ impl AudioCapture for Microphone {
                     let _ = tx.send(CaptureEvent::Error(e.to_string()));
                 }
             };
+            // 首个回调锚定 (capture StreamInstant, host_time::now_ns())，此后用
+            // capture.duration_since(anchor) 做差换算——StreamInstant 字段私有，
+            // 只能做差，不能直接取绝对值。anchor_ns 是回调进入时刻，与硬件时刻
+            // 差一个缓冲时长量级的常量偏移，不影响斜率(ppm)；绝对偏移由 E1 互相关标定。
+            let mut anchor: Option<(cpal::StreamInstant, u64)> = None;
             let stream = match device.build_input_stream(
                 &stream_config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    let cap = info.timestamp().capture;
+                    let host_time_ns = match anchor {
+                        None => {
+                            let now = crate::audio::host_time::now_ns();
+                            anchor = Some((cap, now));
+                            Some(now)
+                        }
+                        Some((a_inst, a_ns)) => {
+                            cap.duration_since(&a_inst).map(|d| a_ns + d.as_nanos() as u64)
+                        }
+                    };
                     let _ = sink.send(AudioFrame {
                         samples: data.to_vec(),
                         sample_rate,
                         channels,
+                        host_time_ns,
                     });
                 },
                 err_fn,

@@ -134,11 +134,21 @@ unsafe extern "C" fn input_cb(
         return 0;
     }
 
+    // 硬件时间戳：mHostTime 与 mach_absolute_time 同源，直接换算成 ns。
+    // kAudioTimeStampHostTimeValid 来自 coreaudio::sys（值 1<<1），本文件顶部
+    // `use coreaudio::sys::*;` 已带入作用域。
+    let host_time_ns = if (*in_time_stamp).mFlags & kAudioTimeStampHostTimeValid != 0 {
+        Some(crate::audio::host_time::mach_ticks_to_ns((*in_time_stamp).mHostTime))
+    } else {
+        None
+    };
+
     // 下游已断开（会话结束）时 send 返回 Err，忽略即可。
     let _ = ctx.sink.send(AudioFrame {
         samples: buf,
         sample_rate: ctx.sample_rate,
         channels: 1,
+        host_time_ns,
     });
     0
 }

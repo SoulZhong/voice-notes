@@ -77,6 +77,8 @@ impl AudioCapture for LoopbackCapture {
                             samples: data.to_vec(),
                             sample_rate,
                             channels,
+                            // Windows 环回：无硬件时间戳来源，漂移传感器按到达墙钟降级。
+                            host_time_ns: None,
                         });
                     },
                     err_fn,
@@ -87,7 +89,12 @@ impl AudioCapture for LoopbackCapture {
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         let samples: Vec<f32> =
                             data.iter().map(|s| *s as f32 / 32768.0).collect();
-                        let _ = sink.send(AudioFrame { samples, sample_rate, channels });
+                        let _ = sink.send(AudioFrame {
+                            samples,
+                            sample_rate,
+                            channels,
+                            host_time_ns: None,
+                        });
                     },
                     err_fn,
                     None,

@@ -31,6 +31,9 @@ pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub channels: u16,
+    /// 帧首样本的 host 时刻(ns,mach 时基;见 audio/host_time.rs)。
+    /// None = 采集后端拿不到硬件时间戳,漂移传感器按"到达墙钟"降级(行为等同引入前)。
+    pub host_time_ns: Option<u64>,
 }
 
 /// 音频来源标记：接线时确定，随 Job/事件流转。
