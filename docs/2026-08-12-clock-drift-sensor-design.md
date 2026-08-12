@@ -71,7 +71,7 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
      "events": [ { "t_s": 601.2, "kind": "reanchor", "source": "mic", "why": "device_switch" } ]
    }
    ```
-2. **ailog 异常打点**:|漂移|>500ppm、时间戳缺失、单场重锚 >3 次。
+2. **异常打点**:|漂移|>500ppm、时间戳缺失、单场重锚 >3 次 → 记入 drift_report 的 `anomalies` 数组 + eprintln 日志(勘误:原写"ailog 切面",但 ailog 是 AI 调用日志、telemetry 是网络遥测,均不合适;全本地红线下就地落报告)。
 3. **汇总工具** `bin/drift_stats.rs`:扫全部笔记的 drift_report,输出分布(P50/P95/最差设备组合/degraded 占比)——"真实分布"的出口,也是二期裁决的输入。
 
 旁路契约(同 mixed 轨先例):传感器任何失败(时间戳异常、DLL 数值异常、写盘失败)只丢 drift_report,不影响录音主链路。
