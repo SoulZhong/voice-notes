@@ -173,6 +173,10 @@ pub struct Settings {
     /// Qwen3-ASR 引擎消费(prompt 注入偏置);其余引擎忽略。空 = 不启用。
     /// 传给识别器时还会自动并入声纹库人名(见 lib.rs qwen3_hotwords)。
     pub asr_hotwords: String,
+    /// 说话人识别方法(库声纹种子匹配策略):nearest(默认,单最近邻,2026-08-12
+    /// 离线评测胜出)/ knn_vote(top-5 多数票,实验)。策略清单与语义见
+    /// diar::registry::matcher_from_key;未知值按 nearest 处理,配置脏不挡识别。
+    pub speaker_match: String,
     /// 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(set_settings 保护)。
     pub asr_mode: String,
     /// 云端厂商:"volcano" / "aliyun"。
@@ -270,6 +274,8 @@ struct SettingsRepr {
     asr_provider: String,
     #[serde(default)]
     asr_hotwords: String,
+    #[serde(default = "default_speaker_match")]
+    speaker_match: String,
     #[serde(default = "default_asr_mode")]
     asr_mode: String,
     #[serde(default = "default_cloud_provider")]
@@ -394,6 +400,7 @@ impl From<SettingsRepr> for Settings {
             asr_model: r.asr_model,
             asr_provider: r.asr_provider,
             asr_hotwords: r.asr_hotwords,
+            speaker_match: r.speaker_match,
             asr_mode: r.asr_mode,
             cloud_asr_provider: r.cloud_asr_provider,
             volc_app_key: r.volc_app_key,
@@ -492,6 +499,11 @@ fn default_asr() -> String {
     ASR_SENSE_VOICE.into()
 }
 
+/// 默认说话人识别方法:单一真源在 diar::registry(策略注册处)。
+fn default_speaker_match() -> String {
+    crate::diar::registry::SPEAKER_MATCH_NEAREST.into()
+}
+
 fn default_theme() -> String {
     "system".into()
 }
@@ -539,6 +551,7 @@ impl Default for Settings {
             asr_model: default_asr(),
             asr_provider: String::new(),
             asr_hotwords: String::new(),
+            speaker_match: default_speaker_match(),
             asr_mode: default_asr_mode(),
             cloud_asr_provider: default_cloud_provider(),
             volc_app_key: String::new(),

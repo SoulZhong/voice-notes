@@ -44,10 +44,12 @@ pub const SEED_MIN_SAMPLES: usize = 32_000;
 pub const SEED_ASSIGN_Z: f32 = 3.0;
 /// 见 SEED_ASSIGN_Z:跨信道 z 通道命中仍要求的裸分地板。待评测集校准的初值。
 pub const SEED_ASSIGN_RAW_FLOOR: f32 = 0.50;
-/// 种子路 k-NN 票决席位数(2026-08-12 算法升级):探针只与最相近的这么多个库种子
-/// 席位计票,按 person 计席多数决,胜者还须有席位过命中三闸才认领。5 席 = 足以
-/// 让一个人的多份变体(主质心+会话质心)形成共识,又小到单个离群质心翻不了盘。
+/// KnnVoteMatcher 的票决席位数:探针只与最相近的这么多个库种子席位计票。
 pub const SEED_KNN_K: usize = 5;
+/// settings.speaker_match 取值:单最近邻(默认)。
+pub const SPEAKER_MATCH_NEAREST: &str = "nearest";
+/// settings.speaker_match 取值:top-K 多数票(实验项)。
+pub const SPEAKER_MATCH_KNN_VOTE: &str = "knn_vote";
 /// "近期贡献环"容量:回声追溯撤回窗口(session.rs RETRACT_WINDOW_MS=30s)内可能
 /// 被撤销的 assign 调用数上限,防止长会话无界增长。超出容量的旧条目被静默淘汰
 /// ——淘汰后对应的撤回请求视为 no-op(近似值,回声窗口内的高频 assign 场景下
@@ -105,6 +107,124 @@ pub struct SeedCluster {
     /// 该质心来自的信道(如 "mic"/"system")。跨信道种子只走归一化通道
     /// (Task 2)的前提:注入后要知道自己质心的信道身份。
     pub source: String,
+}
+
+/// —— 种子匹配策略(说话人识别方法)——
+///
+/// 探针对全部库种子的一次判定被抽象为「席位表 → 选席」:一个席位 = 某人某份
+/// 质心(主质心/会话变体)对探针的裸相似度 + 是否已过命中三闸(段长/同信道
+/// 快路/跨信道 z 通道)。门槛判定始终在 registry/调用方,策略只做排名与选择
+/// ——新增第三种识别方法时只需一个 impl 并在 matcher_from_key 注册,
+/// settings.speaker_match 即可选到。
+pub struct SeedSeat<'a> {
+    pub person: &'a str,
+    pub sim: f32,
+    /// 已过命中三闸。claim 返回的席位必须 eligible(认领=建立库关联,不合格
+    /// 不许认);reference 不受此约束。
+    pub eligible: bool,
+}
+
+pub trait SeedMatcher: Send {
+    /// 认领席位下标:策略在合格性约束下选出可认领的席位;None = 不认领。
+    fn claim(&self, seats: &[SeedSeat<'_>]) -> Option<usize>;
+    /// 参考近邻下标(无合格性约束):Aing 簇统计据此记录「最佳库近邻」供
+    /// identify 裁决层参考,即使未达认领门槛也要记录。
+    fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize>;
+}
+
+/// 单最近邻(默认):合格席位中取最近。2026-08-12 离线评测(真实库 334 探针
+/// 留一)出手准确率 95.5%/召回 95.2%,显著优于多数票——库内每人席位少
+/// (中位 2~3 席),票决邻域多为不同人各一席,多数票反而压掉正确最近邻。
+pub struct NearestMatcher;
+
+impl SeedMatcher for NearestMatcher {
+    // 严格大于 + 保先到:与 PR#94 之前的选择循环逐位一致——库里存在完全相同的
+    // 质心(同声重复入库)时平手,历史行为取先注入者,max_by 会取后者(实测
+    // P14/P342 同分翻案,评测互验抓到),故不用 max_by。
+    fn claim(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, s) in seats.iter().enumerate() {
+            if s.eligible && best.is_none_or(|b: usize| s.sim > seats[b].sim) {
+                best = Some(i);
+            }
+        }
+        best
+    }
+    fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, s) in seats.iter().enumerate() {
+            if best.is_none_or(|b: usize| s.sim > seats[b].sim) {
+                best = Some(i);
+            }
+        }
+        best
+    }
+}
+
+/// top-K 多数票(PR#94,实验项;每人样本足够密时理论上抗单席离群劫持):最近
+/// SEED_KNN_K 席按 person 计席,席位最多者胜出(平票取最高分席位所属的人,
+/// 同分先到先占),认领还须胜者有合格席位——胜者不过阈不降格给第二名
+/// (误命名比不命名糟)。
+pub struct KnnVoteMatcher;
+
+impl KnnVoteMatcher {
+    /// 票决胜者及其最高分席位下标(无合格性约束)。
+    fn winner_best(seats: &[SeedSeat<'_>]) -> Option<usize> {
+        // 有界 top-K 选择(O(S·K));>= 同分后插,先到的同分席位不被挤出。
+        let mut neighbors: Vec<usize> = Vec::with_capacity(SEED_KNN_K + 1);
+        for (i, s) in seats.iter().enumerate() {
+            let pos = neighbors.partition_point(|&j| seats[j].sim >= s.sim);
+            if pos < SEED_KNN_K {
+                neighbors.insert(pos, i);
+                neighbors.truncate(SEED_KNN_K);
+            }
+        }
+        let mut tally: std::collections::BTreeMap<&str, (usize, f32, usize)> =
+            std::collections::BTreeMap::new();
+        for &i in &neighbors {
+            let e = tally.entry(seats[i].person).or_insert((0, f32::MIN, i));
+            e.0 += 1;
+            if seats[i].sim > e.1 {
+                e.1 = seats[i].sim;
+                e.2 = i;
+            }
+        }
+        tally
+            .into_values()
+            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+            .map(|(_, _, i)| i)
+    }
+}
+
+impl SeedMatcher for KnnVoteMatcher {
+    fn claim(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
+        let winner = seats[Self::winner_best(seats)?].person;
+        // 胜者在票决邻域内的最高分合格席位;重算邻域成本可忽略(K=5)。
+        let mut neighbors: Vec<usize> = Vec::with_capacity(SEED_KNN_K + 1);
+        for (i, s) in seats.iter().enumerate() {
+            let pos = neighbors.partition_point(|&j| seats[j].sim >= s.sim);
+            if pos < SEED_KNN_K {
+                neighbors.insert(pos, i);
+                neighbors.truncate(SEED_KNN_K);
+            }
+        }
+        neighbors
+            .into_iter()
+            .filter(|&i| seats[i].person == winner && seats[i].eligible)
+            .max_by(|&a, &b| seats[a].sim.total_cmp(&seats[b].sim))
+    }
+    fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
+        Self::winner_best(seats)
+    }
+}
+
+/// settings.speaker_match → 策略实例。未知/脏值回落默认最近邻——配置不该
+/// 挡识别,与 settings 读失败回落默认的纪律一致。
+pub fn matcher_from_key(key: &str) -> Box<dyn SeedMatcher> {
+    match key {
+        SPEAKER_MATCH_KNN_VOTE => Box::new(KnnVoteMatcher),
+        _ => Box::new(NearestMatcher),
+    }
 }
 
 struct Cluster {
@@ -170,6 +290,8 @@ pub struct SpeakerRegistry {
     /// 三期 mixed 降级口径:关闭种子 z 通道(assign_inner 的 z_hit 整体短路)。
     /// mixed 单轨无信道可分,AS-Norm 的"跨信道归一化"前提不成立(spec §降级口径)。
     seed_z_disabled: bool,
+    /// 种子匹配策略(settings.speaker_match):默认单最近邻,set_matcher 切换。
+    matcher: Box<dyn SeedMatcher>,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -231,12 +353,18 @@ impl SpeakerRegistry {
             enroller: None,
             contributions: VecDeque::new(),
             seed_z_disabled: false,
+            matcher: Box::new(NearestMatcher),
         }
     }
 
     /// 装配会话中实时入库回调(lib.rs 在 with_seeds 之后调用)。
     pub fn set_enroller(&mut self, min_ms: u64, f: EnrollFn) {
         self.enroller = Some((min_ms, f));
+    }
+
+    /// 切换种子匹配策略(settings.speaker_match → matcher_from_key)。
+    pub fn set_matcher(&mut self, m: Box<dyn SeedMatcher>) {
+        self.matcher = m;
     }
 
     /// 关闭种子 AS-Norm z 通道(mixed 重转写用;默认开启,实时链路不受影响)。
@@ -339,53 +467,21 @@ impl SpeakerRegistry {
             }
         }
 
-        // 种子簇(库中采集来的声纹):k-NN 多数票(2026-08-12 算法升级)。旧逻辑
-        // 是全库单最近邻,一个离群质心即可劫持认领;现在探针只看与它最相近的
-        // SEED_KNN_K 个种子席位(一人多份变体各占一席),按 person 计席,席位
-        // 最多者胜出(平票取最高分席位所属的人),且胜者须有至少一个席位过上面
-        // 的命中三闸才拍板。胜者无合格席位 → 种子路空手而归,不降格给第二名
-        // (误命名比不命名糟),探针留给普通簇/软归属/新建簇路径。
-        // 有界 top-K 选择(O(S·K)):种子库可能很大(每人多份信道/会话变体),
-        // 这里是逐段热路径,不做整库排序/全量临时分配。
-        let mut neighbors: Vec<(f32, usize)> = Vec::with_capacity(SEED_KNN_K + 1);
+        // 种子簇(库中采集来的声纹):席位表交给可插拔匹配策略(settings.speaker_match,
+        // 默认单最近邻;策略语义与取舍见 SeedMatcher/NearestMatcher/KnnVoteMatcher
+        // 各自的文档注释)。席位顺序与簇注入顺序一致,策略的同分保序依赖它。
+        let mut seat_cluster: Vec<usize> = Vec::new();
+        let mut seats: Vec<SeedSeat<'_>> = Vec::new();
         for (idx, (c, &sim)) in self.clusters.iter().zip(&sims).enumerate() {
+            let Some(person) = c.person.as_deref() else { continue };
             if !c.is_seed() {
                 continue;
             }
-            // >=:同分后插——先到的同分席位不被后来者挤出(与旧稳定 sort 的
-            // 保序语义一致,防同分席位在 K 边界翻票,codex P2)。
-            let pos = neighbors.partition_point(|&(s, _)| s >= sim);
-            if pos < SEED_KNN_K {
-                neighbors.insert(pos, (sim, idx));
-                neighbors.truncate(SEED_KNN_K);
-            }
+            seat_cluster.push(idx);
+            seats.push(SeedSeat { person, sim, eligible: seed_hit(c, sim) });
         }
-        let mut tally: std::collections::BTreeMap<&str, (usize, f32)> = std::collections::BTreeMap::new();
-        for &(sim, idx) in &neighbors {
-            if let Some(p) = self.clusters[idx].person.as_deref() {
-                let e = tally.entry(p).or_insert((0, f32::MIN));
-                e.0 += 1;
-                if sim > e.1 {
-                    e.1 = sim;
-                }
-            }
-        }
-        let winner: Option<String> = tally
-            .iter()
-            .max_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)))
-            .map(|(p, _)| p.to_string());
-        let mut best_seed: Option<(f32, usize)> = None;
-        if let Some(wp) = winner.as_deref() {
-            for &(sim, idx) in &neighbors {
-                let c = &self.clusters[idx];
-                if c.person.as_deref() == Some(wp)
-                    && seed_hit(c, sim)
-                    && best_seed.is_none_or(|(bs, _)| sim > bs)
-                {
-                    best_seed = Some((sim, idx));
-                }
-            }
-        }
+        let best_seed: Option<(f32, usize)> =
+            self.matcher.claim(&seats).map(|i| (seats[i].sim, seat_cluster[i]));
 
         // 两路取分高者(与旧逻辑的全局 max 语义对齐:种子/普通各自选出候选后比分)。
         let best_idx = match (best_regular, best_seed) {
@@ -760,6 +856,7 @@ impl SpeakerRegistry {
             enroller: None,
             contributions: VecDeque::new(),
             seed_z_disabled: false,
+            matcher: Box::new(NearestMatcher),
         }
     }
 
@@ -1978,6 +2075,7 @@ mod tests {
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PB"), "多数票(3 席)应压过单个更近的离群席位");
@@ -1995,6 +2093,7 @@ mod tests {
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.62), count: 10, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person, None, "票决胜者不过阈,不得回落认领少数派");
@@ -2010,9 +2109,46 @@ mod tests {
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PA"), "平票应取最高分席位所属的人");
+    }
+
+    /// 锁定默认最近邻语义:更近但不合格的席位不得挡住更远的合格席位——
+    /// 「合格者中取最近」,不是「最近者必须合格」(后者是 k=1 票决的语义)。
+    /// 甲跨信道 0.80(仅 2 人,z cohort 不足,不合格);乙同信道 0.70 合格 → 认乙。
+    #[test]
+    fn nearest_picks_best_eligible_not_nearest_overall() {
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "system".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PB"), "跨信道不合格的更近席位不得挡合格席位");
+    }
+
+    /// matcher_from_key:未知/脏配置值回落默认最近邻,不 panic 不挡识别。
+    #[test]
+    fn matcher_from_key_falls_back_to_nearest() {
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(matcher_from_key("garbage-value"));
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "脏值回落最近邻:0.80 单席应胜");
+        let mut r2 = SpeakerRegistry::with_seeds(&[], &seeds);
+        r2.set_matcher(matcher_from_key(SPEAKER_MATCH_KNN_VOTE));
+        let id2 = r2.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info2 = r2.speakers().into_iter().find(|s| s.id == id2).unwrap();
+        assert_eq!(info2.person.as_deref(), Some("PB"), "knn_vote 键应选到票决策略");
     }
 
     #[test]
@@ -2030,6 +2166,7 @@ mod tests {
             })
             .collect();
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PA"), "同分席位先到先占,K 边界不得翻票");
@@ -2052,6 +2189,7 @@ mod tests {
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.29), count: 10, source: "mic".into() },
         ];
         let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PA"), "只有最近 5 席有投票权");

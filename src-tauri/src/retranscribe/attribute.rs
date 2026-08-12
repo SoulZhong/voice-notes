@@ -24,6 +24,7 @@ pub fn assign_clusters(
     embedder: &mut Option<Box<dyn SpeakerEmbedder>>,
     seeds: Vec<SeedCluster>,
     mixed: bool,
+    speaker_match: &str,
 ) -> (Vec<Option<String>>, Vec<SpeakerInfo>, Vec<ClusterSnapshot>) {
     let Some(embedder) = embedder.as_mut() else {
         return (vec![None; segs.len()], Vec::new(), Vec::new());
@@ -36,6 +37,8 @@ pub fn assign_clusters(
         seeds
     };
     let mut registry = SpeakerRegistry::with_seeds(&[], &seeds);
+    // 说话人识别方法(settings.speaker_match):与实时路同一策略注册表。
+    registry.set_matcher(crate::diar::registry::matcher_from_key(speaker_match));
     if mixed {
         registry.disable_seed_z();
     }
@@ -245,7 +248,7 @@ mod tests {
         }];
         let segs = vec![rec("mic", 0, 3000)]; // 3s=48000 样本,过 SEED_MIN_SAMPLES
         let mut emb: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ScriptEmbedder(vec![unit(0, 8)], 0)));
-        let (clusters, infos, _snaps) = assign_clusters(&segs, &mut emb, seeds, false);
+        let (clusters, infos, _snaps) = assign_clusters(&segs, &mut emb, seeds, false, "nearest");
         let id = clusters[0].clone().expect("裸分 1.0 必命中种子");
         let info = infos.iter().find(|i| i.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("P1"));
@@ -257,7 +260,7 @@ mod tests {
     fn missing_embedder_degrades_to_no_clusters() {
         let segs = vec![rec("mic", 0, 3000)];
         let mut emb: Option<Box<dyn SpeakerEmbedder>> = None;
-        let (clusters, infos, snaps) = assign_clusters(&segs, &mut emb, vec![], false);
+        let (clusters, infos, snaps) = assign_clusters(&segs, &mut emb, vec![], false, "nearest");
         assert_eq!(clusters, vec![None]);
         assert!(infos.is_empty() && snaps.is_empty());
     }
@@ -270,7 +273,7 @@ mod tests {
         }];
         let segs = vec![rec("mixed", 0, 3000)];
         let mut emb: Option<Box<dyn SpeakerEmbedder>> = Some(Box::new(ScriptEmbedder(vec![unit(0, 8)], 0)));
-        let (clusters, infos, _snaps) = assign_clusters(&segs, &mut emb, seeds, true);
+        let (clusters, infos, _snaps) = assign_clusters(&segs, &mut emb, seeds, true, "nearest");
         let id = clusters[0].clone().expect("source 改写后 mixed 段应走同信道快路命中");
         assert_eq!(infos.iter().find(|i| i.id == id).unwrap().person.as_deref(), Some("P1"));
     }

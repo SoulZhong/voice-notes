@@ -120,6 +120,15 @@ export const zh = {
   "settings.asr.hotwordsPlaceholder": "如: 语音笔记, DashScope, 张伟",
   "settings.asr.modelMissing": "所选识别引擎的模型未下载,请在下方「语音模型」中下载。",
 
+  // —— 说话人识别方法 ——
+  "settings.speakerMatch.label": "说话人识别方法",
+  "settings.speakerMatch.nearest": "最近邻",
+  "settings.speakerMatch.knnVote": "多数票",
+  "settings.speakerMatch.nearestDesc":
+    "推荐 · 与库中最相似的一份声纹比对认人;历史数据离线评测准确率最高",
+  "settings.speakerMatch.knnVoteDesc":
+    "实验 · 取最相近的 5 份声纹按人投票,需同一人多份采集形成共识;每人样本少时会不如最近邻",
+
   // —— 声纹模型 ——
   "settings.speaker.label": "声纹模型",
   "settings.speaker.campplusDesc":
@@ -308,6 +317,14 @@ export const en = {
   "settings.asr.hotwordsPlaceholder": "e.g. Voice Notes, DashScope, Alice",
   "settings.asr.modelMissing":
     "The model for the selected engine is not downloaded; download it under Speech models below.",
+
+  "settings.speakerMatch.label": "Speaker matching",
+  "settings.speakerMatch.nearest": "Nearest",
+  "settings.speakerMatch.knnVote": "Majority vote",
+  "settings.speakerMatch.nearestDesc":
+    "Recommended · Match against the single most similar voiceprint; highest accuracy in offline evaluation on historical data",
+  "settings.speakerMatch.knnVoteDesc":
+    "Experimental · The 5 nearest voiceprints vote per person; needs multiple samples per person to form a consensus, weaker than Nearest when samples are sparse",
 
   "settings.speaker.label": "Voiceprint model",
   "settings.speaker.campplusDesc":

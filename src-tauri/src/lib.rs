@@ -489,6 +489,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     embedder.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
+                    &current_speaker_match(&app),
                 )?;
                 report("filter", &doc.stages.filter);
                 report("recluster", &doc.stages.recluster);
@@ -910,6 +911,12 @@ fn current_asr_provider(app: &AppHandle) -> Option<String> {
         .app_data_dir()
         .ok()
         .and_then(|d| asr::provider_override(&settings::load(&d).asr_provider))
+}
+
+/// 当前说话人识别方法(种子匹配策略键):读设置失败回落空串 → matcher_from_key
+/// 按默认最近邻处理,与 current_asr 的兜底纪律一致。
+fn current_speaker_match(app: &AppHandle) -> String {
+    app.path().app_data_dir().map(|d| settings::load(&d).speaker_match).unwrap_or_default()
 }
 
 /// 当前 ASR 选型：app_data_dir → settings.json 读 asr_model；app_data_dir 不可用时
@@ -1565,6 +1572,8 @@ fn spawn_session(
         let seeds = load_voiceprint_seeds(&app);
         let mut registry =
             crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
+        // 说话人识别方法(设置项):与本场其余配置同一快照,场中改设置不影响进行中会话。
+        registry.set_matcher(crate::diar::registry::matcher_from_key(&cfg.speaker_match));
         // 本场实时入库产生的 person id 集合:enroller(ASR worker 线程)写入,停止时的
         // Snapshot 分支读取,用于区分「本场新入库的陌生声音」与「种子命中的老熟人」——
         // 样本只为前者写(见 Snapshot 分支注释)。
@@ -2568,7 +2577,8 @@ fn run_retranscribe_once(
         Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
     };
     retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
-        &mut embedder, seeds, mixed, language_filter, strict, progress)
+        &mut embedder, seeds, mixed, language_filter, strict, progress,
+        &current_speaker_match(app))
         .map_err(|e| e.to_string())
 }
 

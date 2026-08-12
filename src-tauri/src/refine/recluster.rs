@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::diar::registry::{SeedCluster, SEED_ASSIGN_THRESHOLD, SEED_KNN_K};
+use crate::diar::registry::{SeedCluster, SeedMatcher, SeedSeat, SEED_ASSIGN_THRESHOLD};
 
 /// AHC 合并阈值(余弦)。低于在线 MERGE_THRESHOLD(0.74):全局视角下可更宽。
 /// golden 校准定为 0.68:0.60 时次大簇(R2)污染更重,0.72+ 标签数超标(>12);
@@ -58,35 +58,32 @@ fn normalize(v: &[f32]) -> Option<Vec<f32>> {
     Some(v.iter().map(|x| x / n).collect())
 }
 
-/// k-NN 票决的胜者及其最佳席位:(person, name, best_sim)。每份种子质心一席,
-/// 只取与簇质心最相近的 SEED_KNN_K 席计票,按 person 计席多数决,平票取最高分
-/// 席位所属的人。有界选择(O(S·K)),不整库排序。无种子/全部无法归一 → None。
-fn knn_vote_neighbor(centroid: &[f32], seeds: &[SeedCluster]) -> Option<(String, String, f32)> {
-    let mut top: Vec<(f32, usize)> = Vec::with_capacity(SEED_KNN_K + 1);
-    for (i, s) in seeds.iter().enumerate() {
-        let Some(u) = normalize(&s.centroid) else { continue };
-        let sim = dot(centroid, &u);
-        // >=:同分后插——先到的同分席位不被后来者挤出(K 边界防翻票,codex P2)。
-        let pos = top.partition_point(|&(t, _)| t >= sim);
-        if pos < SEED_KNN_K {
-            top.insert(pos, (sim, i));
-            top.truncate(SEED_KNN_K);
-        }
-    }
-    // person -> (席位数, 最高分, 最高分席位的种子下标)
-    let mut tally: BTreeMap<&str, (usize, f32, usize)> = BTreeMap::new();
-    for &(sim, i) in &top {
-        let e = tally.entry(seeds[i].person.as_str()).or_insert((0, f32::MIN, i));
-        e.0 += 1;
-        if sim > e.1 {
-            e.1 = sim;
-            e.2 = i;
-        }
-    }
-    tally
-        .into_values()
-        .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
-        .map(|(_, best_sim, i)| (seeds[i].person.clone(), seeds[i].name.clone(), best_sim))
+/// 簇质心对库种子的「参考近邻」:席位表交给匹配策略(与 registry::assign_inner
+/// 同一 SeedMatcher 实例语义),返回 (person, name, 该席位裸分)。合格性口径:
+/// Aing 离线侧无信道/z 通道语义(质心已按信道分组导出,匹配用裸余弦),
+/// eligible = sim ≥ SEED_ASSIGN_THRESHOLD;策略的 reference 无合格性约束,
+/// 未达阈的最佳近邻也记录(供 identify 裁决层参考),adopted 由调用方判定。
+fn seed_neighbor(
+    centroid: &[f32],
+    seeds: &[SeedCluster],
+    matcher: &dyn SeedMatcher,
+) -> Option<(String, String, f32)> {
+    let units: Vec<(usize, Vec<f32>)> = seeds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| normalize(&s.centroid).map(|u| (i, u)))
+        .collect();
+    let seats: Vec<SeedSeat<'_>> = units
+        .iter()
+        .map(|(i, u)| {
+            let sim = dot(centroid, u);
+            SeedSeat { person: seeds[*i].person.as_str(), sim, eligible: sim >= SEED_ASSIGN_THRESHOLD }
+        })
+        .collect();
+    matcher.reference(&seats).map(|k| {
+        let i = units[k].0;
+        (seeds[i].person.clone(), seeds[i].name.clone(), seats[k].sim)
+    })
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -114,6 +111,7 @@ pub fn recluster(
     inputs: &[SegInput],
     embs: &[Option<Vec<f32>>],
     seeds: &[SeedCluster],
+    matcher: &dyn SeedMatcher,
 ) -> (Vec<Assignment>, Vec<ClusterStat>) {
     assert_eq!(inputs.len(), embs.len());
 
@@ -195,14 +193,13 @@ pub fn recluster(
     // 4. 按总时长降序编号 R1..Rk。
     cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
 
-    // 5. 种子命名/认人:k-NN 多数票(与 registry::assign_inner 同语义,2026-08-12
-    //    算法升级——离线终稿若仍用单最近邻,实时路的票决结果会在精修落稿时被
-    //    离群质心翻案)。票决胜者(无论是否过阈值)进 ClusterStat 供 identify
-    //    裁决参考;命名采纳(adopted)仍要求胜者最佳席位 ≥ SEED_ASSIGN_THRESHOLD。
-    //    未命名的库人物也参与——person id 是修订稿改名同步进声纹库的锚点,
-    //    不能因为还没名字就丢掉身份。
+    // 5. 种子命名/认人:与实时路(registry::assign_inner)共用同一个 SeedMatcher
+    //    策略——离线终稿与实时若用不同选席逻辑,精修落稿会翻案实时结果。策略的
+    //    参考近邻(无论是否过阈值)进 ClusterStat 供 identify 裁决参考;命名采纳
+    //    (adopted)仍要求该席位 ≥ SEED_ASSIGN_THRESHOLD。未命名的库人物也参与
+    //    ——person id 是修订稿改名同步进声纹库的锚点,不能因为还没名字就丢掉身份。
     let best_neighbors: Vec<Option<(String, String, f32)>> =
-        cls.iter().map(|c| knn_vote_neighbor(&c.centroid, seeds)).collect();
+        cls.iter().map(|c| seed_neighbor(&c.centroid, seeds, matcher)).collect();
     let matches: Vec<Option<(String, String)>> = best_neighbors
         .iter()
         .map(|n| {
@@ -331,7 +328,7 @@ mod tests {
             seg(5, 50_000, 52_000),                                             // A 碎片 2s(独立会成小簇)
         ];
         let embs = vec![v(a, 0.01), v(a, 0.02), v(a, 0.0), v(b, 0.01), v(b, 0.0), v(a, 0.03)];
-        let (out, _) = recluster(&inputs, &embs, &[]);
+        let (out, _) = recluster(&inputs, &embs, &[], &crate::diar::registry::NearestMatcher);
         let l = |q: u64| out.iter().find(|x| x.seq == q).unwrap().speaker.clone();
         assert_eq!(l(0), l(1));
         assert_eq!(l(0), l(2));
@@ -346,7 +343,7 @@ mod tests {
         let a = [1.0, 0.0, 0.0];
         let inputs = vec![seg(0, 0, 10_000), seg(1, 10_100, 11_000), seg(2, 20_000, 30_000)];
         let embs = vec![v(a, 0.0), None, v(a, 0.01)];
-        let (out, _) = recluster(&inputs, &embs, &[]);
+        let (out, _) = recluster(&inputs, &embs, &[], &crate::diar::registry::NearestMatcher);
         assert_eq!(out[1].speaker, out[0].speaker, "无嵌入短段跟时间最近邻(gap 100ms < 9s)");
     }
 
@@ -358,7 +355,7 @@ mod tests {
         let seeds = vec![crate::diar::registry::SeedCluster {
             person: "P1".into(), name: "张三".into(), centroid: vec![1.0, 0.0, 0.0], count: 5, source: "mic".into(),
         }];
-        let (out, _) = recluster(&inputs, &embs, &seeds);
+        let (out, _) = recluster(&inputs, &embs, &seeds, &crate::diar::registry::NearestMatcher);
         assert_eq!(out[0].name.as_deref(), Some("张三"));
         assert_eq!(out[0].person.as_deref(), Some("P1"), "命中种子须带出人物 id");
     }
@@ -372,7 +369,7 @@ mod tests {
         let seeds = vec![crate::diar::registry::SeedCluster {
             person: "P4".into(), name: String::new(), centroid: vec![1.0, 0.0, 0.0], count: 5, source: "mic".into(),
         }];
-        let (out, _) = recluster(&inputs, &embs, &seeds);
+        let (out, _) = recluster(&inputs, &embs, &seeds, &crate::diar::registry::NearestMatcher);
         assert!(out[0].name.is_none(), "未命名人物不产生名字");
         assert_eq!(out[0].person.as_deref(), Some("P4"));
     }
@@ -380,7 +377,7 @@ mod tests {
     #[test]
     fn all_none_embeddings_keeps_old_speakers() {
         let mut i0 = seg(0, 0, 1000); i0.old_speaker = Some("S8".into());
-        let (out, _) = recluster(&[i0], &[None], &[]);
+        let (out, _) = recluster(&[i0], &[None], &[], &crate::diar::registry::NearestMatcher);
         assert_eq!(out[0].speaker, "S8");
     }
     /// 新增:分信道质心导出。两段余弦 0.8(>0.68)进同簇,但 mic/system 各自的
@@ -392,7 +389,7 @@ mod tests {
         let mut s1 = seg(1, 10_000, 22_000);
         s1.source = "system".into();
         let embs = vec![Some(vec![1.0, 0.0, 0.0]), Some(vec![0.8, 0.6, 0.0])];
-        let (out, stats) = recluster(&[s0, s1], &embs, &[]);
+        let (out, stats) = recluster(&[s0, s1], &embs, &[], &crate::diar::registry::NearestMatcher);
         assert_eq!(out[0].speaker, out[1].speaker, "余弦 0.8 应并簇");
         assert_eq!(stats.len(), 1);
         let st = &stats[0];
@@ -405,8 +402,8 @@ mod tests {
         assert!(st.seed.is_none());
     }
 
-    /// 种子命名走 k-NN 多数票(与 registry::assign_inner 同语义):乙 3 份变体
-    /// 席位(0.72/0.71/0.70)应压过甲单个更近的离群席位(0.80)。
+    /// 选 KnnVoteMatcher 策略时种子命名走多数票(与 registry::assign_inner 同
+    /// 语义):乙 3 份变体席位(0.72/0.71/0.70)应压过甲单个更近的离群席位(0.80)。
     #[test]
     fn seed_naming_uses_knn_majority_vote() {
         let a = [1.0, 0.0, 0.0];
@@ -422,7 +419,7 @@ mod tests {
             sc("PB", "乙", at(0.71)),
             sc("PB", "乙", at(0.70)),
         ];
-        let (out, stats) = recluster(&inputs, &embs, &seeds);
+        let (out, stats) = recluster(&inputs, &embs, &seeds, &crate::diar::registry::KnnVoteMatcher);
         assert_eq!(out[0].person.as_deref(), Some("PB"), "3 席多数应压过单个更近席位");
         assert_eq!(out[0].name.as_deref(), Some("乙"));
         let (pid, _, sim, adopted) = stats[0].seed.clone().unwrap();
@@ -439,7 +436,7 @@ mod tests {
         let seeds = vec![crate::diar::registry::SeedCluster {
             person: "P9".into(), name: "王五".into(), centroid: vec![0.5, 0.86, 0.0], count: 5, source: "mic".into(),
         }];
-        let (out, stats) = recluster(&inputs, &embs, &seeds);
+        let (out, stats) = recluster(&inputs, &embs, &seeds, &crate::diar::registry::NearestMatcher);
         assert!(out[0].person.is_none(), "低于阈值不得采纳认人");
         let (pid, _, sim, adopted) = stats[0].seed.clone().unwrap();
         assert_eq!(pid, "P9");
