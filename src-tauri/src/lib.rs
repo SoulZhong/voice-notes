@@ -99,6 +99,11 @@ struct ActiveSession {
     /// 每源时钟漂移监视器(Task 6 接线):停录时 snapshot 落 drift_report.json,
     /// 会话拆除即随本结构丢弃——与 health 同寿命、同语义(只描述"这一场")。
     drift: Vec<(Source, Arc<pipeline::drift_monitor::DriftMonitor>)>,
+    /// Task 7:mic 实测采样率(`kAudioDevicePropertyActualSampleRate`)10s 轮询线程的
+    /// stop 发送端。仅持有以随会话拆除而 drop——drop 即断开会合通道,轮询线程的
+    /// `recv_timeout` 立即返回 Disconnected 退出,不裸 loop+sleep 泄漏线程(与
+    /// vpio.rs 的 stop 通道同款惯例)。
+    actual_rate_stop: crossbeam_channel::Sender<()>,
     /// 笔记目录快照:停录时写墙钟-样本对账要用(该路径在 writer 移交前已确定,
     /// 见 start 处 `writer.dir()`)。
     note_dir: std::path::PathBuf,
@@ -1342,7 +1347,26 @@ fn spawn_session(
             .with_drift(mic_drift.clone()),
         );
         session_health.push((Source::Mic, mic_health));
-        session_drift.push((Source::Mic, mic_drift));
+        session_drift.push((Source::Mic, mic_drift.clone()));
+        // Task 7:实测采样率旁证——10s 一次查询默认输入设备的 ActualSampleRate,喂给
+        // mic DriftMonitor,与 DLL 频率估计互为旁证。一期铁律:只测不动数据,查询
+        // 失败(非 macOS/无权限/设备异常)一律返回 None,静默跳过,不影响录音。
+        // stop_tx 存进 ActiveSession,随会话拆除 drop 触发线程退出(见该字段注释)。
+        let (actual_rate_stop_tx, actual_rate_stop_rx) = crossbeam_channel::bounded::<()>(0);
+        {
+            let mic_drift = mic_drift.clone();
+            std::thread::spawn(move || loop {
+                match actual_rate_stop_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    // 超时(10s 到)= 轮询一次;stop 发送端已断开 = 会话已结束,退出。
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if let Some(hz) = audio::actual_rate::default_input_actual_hz() {
+                            mic_drift.set_actual_rate_hz(hz);
+                        }
+                    }
+                    _ => break,
+                }
+            });
+        }
         sources.push((Source::Mic, mic, mic_seg));
 
         #[cfg(target_os = "macos")]
@@ -1973,6 +1997,7 @@ fn spawn_session(
                     audio_activity,
                     health: session_health,
                     drift: session_drift,
+                    actual_rate_stop: actual_rate_stop_tx,
                     note_dir: note_dir.clone(),
                 });
                 drop(running_guard);

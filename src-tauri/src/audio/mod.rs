@@ -16,6 +16,7 @@ pub mod aec_align;
 pub mod neural_aec;
 pub mod host_time;
 pub mod drift_dll;
+pub mod actual_rate;
 #[cfg(target_os = "macos")]
 pub mod system;
 #[cfg(target_os = "macos")]

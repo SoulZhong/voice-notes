@@ -30,6 +30,10 @@ pub struct DriftSourceReport {
     /// (自首帧秒, ppm),每 10s 一点。
     pub rate_ppm_series: Vec<(f64, f64)>,
     pub events: Vec<DriftEvent>,
+    /// 系统实测采样率旁证(Task 7,`kAudioDevicePropertyActualSampleRate`)相对
+    /// nominal_hz 的偏差(ppm),与 DLL 估计的 `rate_ppm` 互为旁证。None = 尚未
+    /// 收到过一次成功查询(非 macOS/查询失败/nominal 未锁定)。
+    pub actual_rate_ppm: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -59,6 +63,9 @@ struct Inner {
     /// DLL 实例被 nominal 重锁替换时,旧实例的重锚计数结转于此,保证全会话单调
     /// (不因换实例而清零)。
     reanchor_carry: u32,
+    /// 最近一次 `set_actual_rate_hz` 换算出的 ppm(Task 7 旁证)。None = 尚未成功
+    /// 查询过一次。
+    actual_rate_ppm: Option<f64>,
 }
 
 /// 每源时钟漂移监视器。内部 `Mutex<Inner>`:frame_tap 线程串行调用 `feed`,
@@ -88,8 +95,25 @@ impl DriftMonitor {
                 events: Vec::new(),
                 converge_secs: None,
                 reanchor_carry: 0,
+                actual_rate_ppm: None,
             }),
         }
+    }
+
+    /// 系统实测采样率旁证(Task 7):`hz` 来自
+    /// `audio::actual_rate::default_input_actual_hz()`(CoreAudio 查询默认输入设备的
+    /// `kAudioDevicePropertyActualSampleRate`),按当前 nominal_hz 换算成 ppm 存入报告,
+    /// 与 DLL 频率估计互为旁证。
+    ///
+    /// 除零防御:nominal_hz==0 是 `DriftMonitor::new(0)` 的惰性初始化未锁定态(首帧尚
+    /// 未到达,见 `feed` 顶部注释)——此时没有基准可换算,静默跳过不存值,等首帧锁定
+    /// 标称率后,下一次轮询自然回到有效路径。
+    pub fn set_actual_rate_hz(&self, hz: f64) {
+        let mut g = self.inner.lock().unwrap();
+        if g.nominal_hz == 0 {
+            return;
+        }
+        g.actual_rate_ppm = Some((hz / g.nominal_hz as f64 - 1.0) * 1e6);
     }
 
     /// frame_tap 对每个【真实】帧调用(补零帧不喂)。带时间戳→hw 路径;无→降级用
@@ -193,6 +217,7 @@ impl DriftMonitor {
             reanchors: g.reanchor_carry + est.reanchors,
             rate_ppm_series: g.series.clone(),
             events: g.events.clone(),
+            actual_rate_ppm: g.actual_rate_ppm,
         }
     }
 }
@@ -385,6 +410,7 @@ mod tests {
             reanchors: 0,
             rate_ppm_series: vec![],
             events: vec![],
+            actual_rate_ppm: None,
         };
         let sys = DriftSourceReport {
             rate_ppm: -600.0,
@@ -432,6 +458,15 @@ mod tests {
             r.events
         );
         assert_eq!(r.reanchors, 0);
+    }
+
+    #[test]
+    fn actual_rate_ppm_is_relative_to_nominal() {
+        let m = DriftMonitor::new(48_000);
+        m.feed(&frame(480, 48_000, Some(0)));
+        m.set_actual_rate_hz(48_000.48); // +10ppm
+        let r = m.snapshot();
+        assert!((r.actual_rate_ppm.unwrap() - 10.0).abs() < 0.01);
     }
 
     #[test]
