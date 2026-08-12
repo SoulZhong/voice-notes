@@ -233,8 +233,9 @@ fn main() {
 
     let mut total = 0usize;
     let (mut old_t, mut new_t) = (Tally::default(), Tally::default());
-    // 口径B(主质心去污染,见下):另一套计数。
+    // 口径B(主质心近似退混)/口径C(主质心整席拿掉,严格无泄漏):各一套计数。
     let (mut old_b, mut new_b) = (Tally::default(), Tally::default());
+    let (mut old_c, mut new_c) = (Tally::default(), Tally::default());
     let mut diffs: Vec<String> = Vec::new();
     let mut named_total = 0usize;
     let (mut old_named, mut new_named) = (Tally::default(), Tally::default());
@@ -254,10 +255,11 @@ fn main() {
                 let mut vp2 = vp.clone();
                 vp2.people.get_mut(pid).unwrap().session_centroids.get_mut(src).unwrap().remove(i);
                 let seeds = seed_clusters(&vp2);
-                // 口径B(主质心去污染):再把该场从主质心里近似退混——主质心是
-                // 计数加权平均的归一向量,raw ≈ main*mc − var*vc,退混后归一;
-                // mc ≤ vc 或退化(同向量相消)则整席拿掉。近似误差来自逐次合并后
-                // 的再归一,量级远小于席位有无之差。
+                // 口径B(主质心近似退混):raw ≈ main*mc − var*vc 后归一;mc ≤ vc
+                // 或退化则整席拿掉。注意这不是合并的严格逆——merge_centroid 每次
+                // 合并后都归一,模长已丢,残留方向可能仍偏向探针(利 nearest)或
+                // 过度扣除(损两家),只能当"减轻泄漏"的参考口径(codex 终审复核)。
+                // 严格无泄漏看口径C。
                 let mut vp3 = vp2.clone();
                 {
                     let p3 = vp3.people.get_mut(pid).unwrap();
@@ -292,6 +294,14 @@ fn main() {
                 let new_clean = production_match(&seeds_b, &probe, src, SPEAKER_MATCH_KNN_VOTE);
                 old_b.add(&old_clean, pid);
                 new_b.add(&new_clean, pid);
+                // 口径C(严格无泄漏):探针人的该信道主质心整席拿掉,只留其余会话
+                // 变体。两算法面对同一份确定不含探针场次的库;探针人少一个合法
+                // 席位,绝对值偏悲观,但杜绝任何方向残留。
+                let mut vp4 = vp2.clone();
+                vp4.people.get_mut(pid).unwrap().centroids.remove(src);
+                let seeds_c = seed_clusters(&vp4);
+                old_c.add(&production_match(&seeds_c, &probe, src, SPEAKER_MATCH_NEAREST), pid);
+                new_c.add(&production_match(&seeds_c, &probe, src, SPEAKER_MATCH_KNN_VOTE), pid);
                 let eval_seeds = build_eval_seeds(&seeds);
                 let sims: Vec<f32> = eval_seeds.iter().map(|s| dot(&s.unit, &probe)).collect();
                 let mut person_max: BTreeMap<&str, f32> = BTreeMap::new();
@@ -364,9 +374,12 @@ fn main() {
     for ((k, w), t) in sweep.iter().zip(&sweep_t) {
         t.report(&format!("变体 k={k}{}", if *w { " 加权" } else { "" }), total);
     }
-    println!("—— 口径B:主质心去污染(退混被留出场次,两算法同一无泄漏基准)——");
+    println!("—— 口径B:主质心近似退混(减轻泄漏;非严格逆,残留方向不定)——");
     old_b.report("最近邻", total);
     new_b.report("top-5 票决", total);
+    println!("—— 口径C:探针人主质心整席拿掉(严格无泄漏;探针人少一合法席位,偏悲观)——");
+    old_c.report("最近邻", total);
+    new_c.report("top-5 票决", total);
     if named_total == 0 {
         println!("—— 无已命名人物探针,跳过命名子集统计 ——");
     } else {
