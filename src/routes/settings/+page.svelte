@@ -310,6 +310,7 @@
     volcAccessKey = s.volc_access_key;
     dashKey = s.dashscope_api_key;
     hotwords = s.asr_hotwords;
+    speakerMatchChoice = s.speaker_match === "knn_vote" ? "knn_vote" : "nearest";
   }
 
   async function refreshDiskUsage() {
@@ -582,6 +583,14 @@
   const eres2Missing = $derived(
     !!status && !status.artifacts.find((a) => a.id === "speaker-eres2netv2")?.present,
   );
+  // 说话人识别方法(库声纹匹配策略):nearest=单最近邻(默认,2026-08-12 离线评测
+  // 胜出),knn_vote=top-5 多数票(实验;每人多份采集足够密时理论上抗离群劫持)。
+  // 未知历史值按 nearest 展示,与后端 matcher_from_key 回落一致。
+  let speakerMatchChoice = $state("nearest");
+  const speakerMatchItems = $derived<SegmentedItem[]>([
+    { id: "nearest", label: t("settings.speakerMatch.nearest"), disabled: !settings },
+    { id: "knn_vote", label: t("settings.speakerMatch.knnVote"), disabled: !settings },
+  ]);
   const speakerModelItems = $derived<SegmentedItem[]>([
     { id: "campplus", label: "CAM++", disabled: recording.isLive || !settings },
     {
@@ -1136,6 +1145,25 @@
           </div>
         </div>
       {/if}
+      <!-- 说话人识别方法:立即生效于下一场录制/重转写/精修(进行中会话用开录时快照)。 -->
+      <div class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.speakerMatch.label")}</span>
+          <span class="row-desc">
+            {speakerMatchChoice === "knn_vote"
+              ? t("settings.speakerMatch.knnVoteDesc")
+              : t("settings.speakerMatch.nearestDesc")}
+          </span>
+        </div>
+        <Segmented
+          items={speakerMatchItems}
+          value={speakerMatchChoice}
+          onSelect={(id) => {
+            speakerMatchChoice = id;
+            saveSetting((s) => (s.speaker_match = id));
+          }}
+        />
+      </div>
       <!-- 非 <label>:徽标里挂了跳转按钮,若整行仍是 <label> 点按钮会被浏览器
            顺带判成"点了 label"而误触开关(nested interactive 元素的经典坑)。 -->
       <div class="row">

@@ -77,6 +77,7 @@ pub fn run(
     language_filter: bool,
     strict: bool,
     progress: &mut dyn FnMut(&str),
+    speaker_match: &str,
 ) -> anyhow::Result<Summary> {
     let mut summary = Summary::default();
 
@@ -192,7 +193,7 @@ pub fn run(
     let old_segs = read_old_segments(note_dir);
     let old_speakers = read_old_speakers(note_dir);
     summary.old_segments = old_segs.len();
-    let (clusters, infos, snaps) = attribute::assign_clusters(&recs, embedder, seeds, mixed);
+    let (clusters, infos, snaps) = attribute::assign_clusters(&recs, embedder, seeds, mixed, speaker_match);
     let (speakers, table, stats) =
         attribute::finalize_speakers(&recs, &clusters, &infos, &snaps, &old_segs, &old_speakers);
     summary.seed_matched = stats.seed_matched;
@@ -307,7 +308,7 @@ mod tests {
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         let mut stages = Vec::new();
         let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false,
-            &mut |s| stages.push(s.to_string())).unwrap();
+            &mut |s| stages.push(s.to_string()), "nearest").unwrap();
         assert_eq!((summary.old_segments, summary.new_segments), (1, 2));
         assert_eq!(stages, vec!["decode", "transcribe", "attribute", "commit"]);
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
@@ -326,7 +327,7 @@ mod tests {
         let mut input = StubInput(vec![pending("mic", 0, 16000)]);
         let mut rec = LenRecognizer { fail_len: Some(16000) }; // 唯一一段必失败 → 100% 占位
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
-        let err = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {});
+        let err = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {}, "nearest");
         assert!(err.is_err());
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("旧"), "放弃时原稿必须原样保留");
@@ -348,7 +349,7 @@ mod tests {
         let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
         let mut rec = LenRecognizer { fail_len: Some(32000) };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
-        let err = run(dir.path(), &lock, &mut make_input(), &mut rec, &mut emb, vec![], false, true, true, &mut |_| {});
+        let err = run(dir.path(), &lock, &mut make_input(), &mut rec, &mut emb, vec![], false, true, true, &mut |_| {}, "nearest");
         assert!(err.is_err(), "strict 下任一占位段都不得提交");
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("旧"), "strict 放弃时原稿必须原样保留");
@@ -357,7 +358,7 @@ mod tests {
         let dir2 = note_dir_with_old();
         let lock2 = NoteLock::acquire(dir2.path()).unwrap().unwrap();
         let mut rec2 = LenRecognizer { fail_len: Some(32000) };
-        let summary = run(dir2.path(), &lock2, &mut make_input(), &mut rec2, &mut emb, vec![], false, true, false, &mut |_| {})
+        let summary = run(dir2.path(), &lock2, &mut make_input(), &mut rec2, &mut emb, vec![], false, true, false, &mut |_| {}, "nearest")
             .expect("宽容模式 1/3 占位应提交");
         assert_eq!(summary.failed_segments, 1);
         let text2 = std::fs::read_to_string(dir2.path().join("segments.jsonl")).unwrap();
@@ -373,7 +374,7 @@ mod tests {
         let mut input = StubInput(vec![pending("system", 0, 16000), pending("mic", 100, 16000)]);
         let mut rec = LenRecognizer { fail_len: None };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
-        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {}).unwrap();
+        let summary = run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {}, "nearest").unwrap();
         assert_eq!((summary.new_segments, summary.echo_dropped), (1, 1));
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();
         assert!(text.contains("\"system\"") && !text.contains("\"mic\""));
@@ -419,7 +420,7 @@ mod tests {
         let mut rec = LenRecognizer { fail_len: None };
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         let summary =
-            run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {})
+            run(dir.path(), &lock, &mut input, &mut rec, &mut emb, vec![], false, true, false, &mut |_| {}, "nearest")
                 .unwrap();
         assert_eq!(summary.echo_dropped, 1, "只有高覆盖(0.9)的 mic 段应被电平门弃用");
         assert_eq!(summary.new_segments, 2, "低覆盖 mic 段与 system 段都应保留");
@@ -443,7 +444,7 @@ mod tests {
         let mut input = StubInput(vec![pending("mic", 0, 16000), pending("system", 5000, 16000)]);
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         // 两段全是日语 → 全丢 → 0 段 → 提交门放弃(顺带覆盖 new.is_empty 分支)
-        let err = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, true, false, &mut |_| {});
+        let err = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, true, false, &mut |_| {}, "nearest");
         assert!(err.is_err());
     }
 
@@ -464,7 +465,7 @@ mod tests {
         let mut input = StubInput(vec![pending("mic", 0, 16000), pending("system", 5000, 16000)]);
         let mut emb: Option<Box<dyn crate::diar::SpeakerEmbedder>> = None;
         // language_filter=false → 两段日语都应保留落盘,提交门正常通过。
-        let summary = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, false, false, &mut |_| {})
+        let summary = run(dir.path(), &lock, &mut input, &mut JaRecognizer, &mut emb, vec![], false, false, false, &mut |_| {}, "nearest")
             .expect("filter=false 时外语段应保留,提交应成功");
         assert_eq!(summary.new_segments, 2, "两段日语都应保留,不因语言被丢");
         let text = std::fs::read_to_string(dir.path().join("segments.jsonl")).unwrap();

@@ -42,6 +42,8 @@ export type Settings = {
   asr_provider: string;
   /** 热词词表(逗号/换行分隔;仅 Qwen3 引擎消费,声纹人名由后端自动并入)。 */
   asr_hotwords: string;
+  /** 说话人识别方法:"nearest"(默认,单最近邻)/ "knn_vote"(top-5 多数票,实验)。 */
+  speaker_match: string;
   /** 识别方式:"local"(默认,现状) / "cloud"。录制中禁改(后端 set_settings 拦截)。 */
   asr_mode: string;
   /** 云端厂商:"volcano" / "aliyun"。 */

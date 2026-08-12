@@ -253,6 +253,7 @@ pub fn run_local(
     embedder: Option<&mut dyn SpeakerEmbedder>,
     seeds: &[SeedCluster],
     generated_at: &str,
+    speaker_match: &str,
 ) -> anyhow::Result<(RefinedDoc, Vec<recluster::ClusterStat>)> {
     let discarded = filter::discarded_seqs(segs);
     let kept: Vec<&SegmentRecord> = segs
@@ -276,7 +277,8 @@ pub fn run_local(
     let (assign, cluster_stats, recluster_state) = match embedder {
         Some(e) => match embed_all(note_dir, &kept, e) {
             Ok(embs) => {
-                let (assign, stats) = recluster::recluster(&inputs, &embs, seeds);
+                let matcher = crate::diar::registry::matcher_from_key(speaker_match);
+                let (assign, stats) = recluster::recluster(&inputs, &embs, seeds, matcher.as_ref());
                 (assign, stats, "done")
             }
             Err(err) => {
@@ -1400,6 +1402,7 @@ mod tests {
             Some(&mut e),
             &[],
             "2026-07-06T15:00:00+08:00",
+            "nearest",
         )
         .unwrap();
         assert_eq!(doc.discarded_seqs, vec![1]);
@@ -1430,7 +1433,7 @@ mod tests {
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
-        let (doc, _) = run_local(dir.path(), &segs, &speakers, None, &[], "t").unwrap();
+        let (doc, _) = run_local(dir.path(), &segs, &speakers, None, &[], "t", "nearest").unwrap();
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert_eq!(
@@ -2284,7 +2287,7 @@ mod tests {
         let baseline_graph = graph_bytes(&baseline);
         let segments = vec![seg(7, "mic", "李四负责火星计划", 0, 4000, "S1")];
 
-        let (doc, _) = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time").unwrap();
+        let (doc, _) = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time", "nearest").unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
         assert_eq!(graph_bytes(&doc), baseline_graph);
@@ -2360,6 +2363,7 @@ mod tests {
             None,
             &[],
             "new-time",
+            "nearest",
         );
         assert!(
             local_result.is_err(),
@@ -2446,6 +2450,7 @@ mod tests {
             Some(&mut embedder as &mut dyn crate::diar::SpeakerEmbedder),
             &[],
             "golden",
+            "nearest",
         )
         .unwrap();
 
