@@ -179,20 +179,24 @@ impl KnnVoteMatcher {
                 neighbors.truncate(SEED_KNN_K);
             }
         }
-        let mut tally: std::collections::BTreeMap<&str, (usize, f32, usize)> =
+        // (席位数, 最高分, 最高分席位, 最早席位)。最早席位参与终局裁决:席位数
+        // 与最高分都相等的跨人全平票保先注入者——BTreeMap 迭代按 person id 序,
+        // 单靠 max_by 会取字典序最大的 id(codex 终审 P2)。
+        let mut tally: std::collections::BTreeMap<&str, (usize, f32, usize, usize)> =
             std::collections::BTreeMap::new();
         for &i in &neighbors {
-            let e = tally.entry(seats[i].person).or_insert((0, f32::MIN, i));
+            let e = tally.entry(seats[i].person).or_insert((0, f32::MIN, i, i));
             e.0 += 1;
             if seats[i].sim > e.1 {
                 e.1 = seats[i].sim;
                 e.2 = i;
             }
+            e.3 = e.3.min(i);
         }
         tally
             .into_values()
-            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
-            .map(|(_, _, i)| i)
+            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(b.3.cmp(&a.3)))
+            .map(|(_, _, i, _)| i)
     }
 }
 
@@ -475,27 +479,42 @@ impl SpeakerRegistry {
             }
         }
 
-        // 种子簇(库中采集来的声纹):席位表交给可插拔匹配策略(settings.speaker_match,
-        // 默认单最近邻;策略语义与取舍见 SeedMatcher/NearestMatcher/KnnVoteMatcher
-        // 各自的文档注释)。席位顺序与簇注入顺序一致,策略的同分保序依赖它。
+        // 种子簇(库中采集来的声纹,seed_source 有值):席位表交给可插拔匹配策略
+        // (settings.speaker_match,默认单最近邻;策略语义见 SeedMatcher 各实现的
+        // 文档注释)。席位顺序与簇注入顺序一致,策略的同分保序依赖它。
+        // 续录快照恢复的簇(seed_source=None)不进票池(codex 终审 P1):with_seeds
+        // 已压掉快照 person 的库种子,该人恒只有 1 席,票决下 cos 1.0 的精确续录
+        // 匹配会被别人的多席变体投翻——快照簇恒走最近邻通道(其命中语义本就是
+        // 裸阈值单席,与策略无关),与策略认领比分取高者。
         let mut seat_cluster: Vec<usize> = Vec::new();
         let mut seats: Vec<SeedSeat<'_>> = Vec::new();
+        let mut best_snapshot: Option<(f32, usize)> = None;
         for (idx, (c, &sim)) in self.clusters.iter().zip(&sims).enumerate() {
-            let Some(person) = c.person.as_deref() else { continue };
-            if !c.is_seed() {
+            if c.person.is_none() || !c.is_seed() {
+                continue;
+            }
+            if c.seed_source.is_none() {
+                if seed_hit(c, sim)
+                    && best_snapshot.is_none_or(|(bs, _): (f32, usize)| sim > bs)
+                {
+                    best_snapshot = Some((sim, idx));
+                }
                 continue;
             }
             seat_cluster.push(idx);
-            seats.push(SeedSeat { person, sim, eligible: seed_hit(c, sim) });
+            seats.push(SeedSeat { person: c.person.as_deref().unwrap(), sim, eligible: seed_hit(c, sim) });
         }
-        let best_seed: Option<(f32, usize)> =
+        let strategy_claim: Option<(f32, usize)> =
             self.matcher.claim(&seats).map(|i| (seats[i].sim, seat_cluster[i]));
 
-        // 两路取分高者(与旧逻辑的全局 max 语义对齐:种子/普通各自选出候选后比分)。
-        let best_idx = match (best_regular, best_seed) {
-            (Some(r), Some(s)) => Some(if s.0 > r.0 { s } else { r }),
-            (r, s) => r.or(s),
+        // 候选合并:比分取高,同分保簇注入序靠前者(快照先于种子、种子先于普通簇,
+        // 与旧单遍扫描"严格大于保先"逐位一致,codex 终审 P2)。
+        let pick = |a: Option<(f32, usize)>, b: Option<(f32, usize)>| match (a, b) {
+            (Some(x), Some(y)) => Some(if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) { y } else { x }),
+            (x, y) => x.or(y),
         };
+        let best_seed = pick(strategy_claim, best_snapshot);
+        let best_idx = pick(best_regular, best_seed);
         let best = best_idx.map(|(sim, idx)| (sim, &mut self.clusters[idx]));
 
         if let Some((_sim, cluster)) = best {
@@ -2136,6 +2155,66 @@ mod tests {
         let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PB"), "跨信道不合格的更近席位不得挡合格席位");
+    }
+
+    /// 续录快照簇不进票池(codex 终审 P1):with_seeds 会压掉快照 person 的库
+    /// 种子,该人恒只有 1 席;票决下 cos 1.0 的精确续录匹配会被别人的多席
+    /// 变体投翻。快照簇走独立最近邻通道,精确匹配必须赢。
+    #[test]
+    fn knn_vote_does_not_outvote_resumed_snapshot_exact_match() {
+        let snap = ClusterSnapshot {
+            id: "S7".into(),
+            centroid: v(1.0, 0.0, 0.0),
+            count: 5,
+            sources: BTreeSet::from(["mic".to_string()]),
+            person: Some("P9".into()),
+            total_ms: 0,
+        };
+        let seeds = vec![
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.71), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[snap], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("P9"), "续录精确匹配不得被库种子多数票压掉");
+    }
+
+    /// 票决跨人完全平票(席位数与最高分都相等)保先注入,不按 person id 字典序
+    /// (codex 终审 P2):PA 先注入且字典序更小——若实现按 id 序取最大,会错判
+    /// 后注入的 PB;正确行为是保先注入的 PA。
+    #[test]
+    fn knn_vote_full_tie_across_persons_keeps_first_seen() {
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.69), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.69), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        r.set_matcher(Box::new(KnnVoteMatcher));
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "全平票应保先注入者,不得按 id 字典序");
+    }
+
+    /// 种子簇与普通簇同分(codex 终审 P2):种子先于普通簇注入,历史单遍扫描
+    /// 严格大于保先——同分应认种子(带人名),不得改判后建的普通簇。
+    #[test]
+    fn nearest_tie_between_seed_and_regular_keeps_seed() {
+        let seeds = vec![SeedCluster {
+            person: "P1".into(), name: "甲".into(), centroid: v(1.0, 0.0, 0.0), count: 10, source: "mic".into(),
+        }];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        // 先造一个正交方向的普通簇。
+        r.assign(&v(0.0, 1.0, 0.0), "mic", LONG).unwrap();
+        // 与种子/普通簇等距(cos ≈ 0.7071,两边都过各自阈值)。
+        let probe = v(std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0);
+        let id = r.assign(&probe, "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("P1"), "同分应保先扫到的种子簇");
     }
 
     /// matcher_from_key:未知/脏配置值回落默认最近邻,不 panic 不挡识别。

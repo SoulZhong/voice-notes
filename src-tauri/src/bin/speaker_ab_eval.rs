@@ -20,7 +20,7 @@ use app_lib::diar::registry::{
     SeedCluster, SpeakerRegistry, SEED_ASSIGN_RAW_FLOOR, SEED_ASSIGN_THRESHOLD, SEED_ASSIGN_Z,
     SEED_KNN_K, SPEAKER_MATCH_KNN_VOTE, SPEAKER_MATCH_NEAREST,
 };
-use app_lib::store::{seed_clusters, VoiceprintStore};
+use app_lib::store::{seed_clusters, PersonCentroid, VoiceprintStore};
 
 /// registry::SNORM_MIN_COHORT 是 pub(crate),此处同值复刻(评测器与生产共用
 /// 语义,若那边改动,下方的生产代码互验会立刻失配报错,不会静默漂移)。
@@ -233,6 +233,8 @@ fn main() {
 
     let mut total = 0usize;
     let (mut old_t, mut new_t) = (Tally::default(), Tally::default());
+    // 口径B(主质心去污染,见下):另一套计数。
+    let (mut old_b, mut new_b) = (Tally::default(), Tally::default());
     let mut diffs: Vec<String> = Vec::new();
     let mut named_total = 0usize;
     let (mut old_named, mut new_named) = (Tally::default(), Tally::default());
@@ -245,10 +247,51 @@ fn main() {
         for (src, list) in &person.session_centroids {
             for i in 0..list.len() {
                 let Some(probe) = normalize(&list[i].vec) else { continue };
-                // 留一:去掉本变体后的库 → 种子。
+                // 口径A(保留主质心):去掉本变体后的库 → 种子。主质心含被留出
+                // 场次的历史贡献——这份泄漏对单最近邻更有利(它只需这一席),
+                // 对票决帮助小(需要多席),口径A的对比对票决系统性偏严
+                // (codex 终审 P2)。
                 let mut vp2 = vp.clone();
                 vp2.people.get_mut(pid).unwrap().session_centroids.get_mut(src).unwrap().remove(i);
                 let seeds = seed_clusters(&vp2);
+                // 口径B(主质心去污染):再把该场从主质心里近似退混——主质心是
+                // 计数加权平均的归一向量,raw ≈ main*mc − var*vc,退混后归一;
+                // mc ≤ vc 或退化(同向量相消)则整席拿掉。近似误差来自逐次合并后
+                // 的再归一,量级远小于席位有无之差。
+                let mut vp3 = vp2.clone();
+                {
+                    let p3 = vp3.people.get_mut(pid).unwrap();
+                    let vc = list[i].count.max(1);
+                    let keep = match p3.centroids.get(src) {
+                        Some(main) if main.count > vc => {
+                            let mixed: Vec<f32> = main
+                                .vec
+                                .iter()
+                                .zip(&list[i].vec)
+                                .map(|(m, v)| m * main.count as f32 - v * vc as f32)
+                                .collect();
+                            normalize(&mixed).map(|u| PersonCentroid {
+                                vec: u,
+                                count: main.count - vc,
+                                seen: main.seen.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    match keep {
+                        Some(c) => {
+                            p3.centroids.insert(src.clone(), c);
+                        }
+                        None => {
+                            p3.centroids.remove(src);
+                        }
+                    }
+                }
+                let seeds_b = seed_clusters(&vp3);
+                let old_clean = production_match(&seeds_b, &probe, src, SPEAKER_MATCH_NEAREST);
+                let new_clean = production_match(&seeds_b, &probe, src, SPEAKER_MATCH_KNN_VOTE);
+                old_b.add(&old_clean, pid);
+                new_b.add(&new_clean, pid);
                 let eval_seeds = build_eval_seeds(&seeds);
                 let sims: Vec<f32> = eval_seeds.iter().map(|s| dot(&s.unit, &probe)).collect();
                 let mut person_max: BTreeMap<&str, f32> = BTreeMap::new();
@@ -315,11 +358,15 @@ fn main() {
         std::process::exit(2);
     }
     println!("探针(库会话变体留一): {total} 条,人物 {} 个", vp.people.len());
-    old_t.report("旧·全库单最近邻", total);
-    new_t.report("新·top-5 k-NN 票决", total);
+    println!("—— 口径A:保留主质心(含被留出场次,泄漏偏乐观;对票决偏严)——");
+    old_t.report("最近邻", total);
+    new_t.report("top-5 票决", total);
     for ((k, w), t) in sweep.iter().zip(&sweep_t) {
         t.report(&format!("变体 k={k}{}", if *w { " 加权" } else { "" }), total);
     }
+    println!("—— 口径B:主质心去污染(退混被留出场次,两算法同一无泄漏基准)——");
+    old_b.report("最近邻", total);
+    new_b.report("top-5 票决", total);
     if named_total == 0 {
         println!("—— 无已命名人物探针,跳过命名子集统计 ——");
     } else {
