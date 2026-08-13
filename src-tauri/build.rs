@@ -14,11 +14,14 @@ fn main() {
     // issue #98:sherpa C API 无异常防护,onnxruntime 的 C++ 异常穿 FFI 会让 Rust
     // abort。cxx/sherpa_barrier.cc 在 C++ 侧包 try/catch;SherpaOnnx* 符号由既有
     // sherpa 静态库在最终链接期解析(shim 自声明原型,不依赖其头文件)。
-    cc::Build::new()
-        .cpp(true)
-        .std("c++17")
-        .file("cxx/sherpa_barrier.cc")
-        .compile("sherpa_barrier");
+    let mut barrier = cc::Build::new();
+    barrier.cpp(true).std("c++17").file("cxx/sherpa_barrier.cc");
+    // Windows:sherpa 预编译静态库为 /MT(static CRT),cc 默认 /MD 会触发对象级
+    // LNK2038 RuntimeLibrary 硬冲突(CI 实证)——shim 必须同为 /MT。
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        barrier.static_crt(true);
+    }
+    barrier.compile("sherpa_barrier");
     println!("cargo:rerun-if-changed=cxx/sherpa_barrier.cc");
     tauri_build::build()
 }
