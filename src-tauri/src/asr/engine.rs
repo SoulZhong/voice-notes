@@ -14,7 +14,26 @@ use super::Transcript;
 use serde::Deserialize;
 use sherpa_onnx_sys as sys;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
+
+// issue #98:sherpa C API 全链路无 try/catch,onnxruntime 的 C++ 异常穿 extern "C"
+// 进 Rust 会在 catch_unwind 处 abort(__rust_foreign_exception,三例 SIGABRT 同签名)。
+// 识别调用一律改走 cxx/sherpa_barrier.cc 的 C++ 侧屏障:异常降级为错误码,
+// what() 打 stderr。不透明指针以 c_void 过 FFI,与 sys 类型仅作指针转型。
+extern "C" {
+    fn vn_sherpa_create_offline_recognizer(config: *const c_void) -> *const c_void;
+    /// 0=成功(*out_json 可能为 null=无结果);-1=C++ 异常已捕获;-2=建流失败。
+    fn vn_sherpa_transcribe(
+        recognizer: *const c_void,
+        sample_rate: i32,
+        samples: *const f32,
+        n: i32,
+        out_json: *mut *const c_char,
+    ) -> i32;
+    /// 屏障机制自测(单测用):mode=1 人为 C++ throw,期望 -1;mode=0 期望 0。
+    #[allow(dead_code)]
+    fn vn_sherpa_barrier_selftest(mode: i32) -> i32;
+}
 
 /// 支持的离线模型族与各自的文件布局(路径为绝对路径字符串)。
 pub enum ModelSpec {
@@ -103,24 +122,36 @@ impl OfflineEngine {
                 config.model_config.tokens = c(tokens, &mut keep);
             }
         }
-        let ptr = unsafe { sys::SherpaOnnxCreateOfflineRecognizer(&config) };
+        // SAFETY: config 为本函数栈上 POD,屏障只透传指针给 sherpa create。
+        let ptr = unsafe {
+            vn_sherpa_create_offline_recognizer(&config as *const _ as *const c_void)
+                as *const sys::OfflineRecognizer
+        };
         drop(keep);
-        anyhow::ensure!(!ptr.is_null(), "创建离线识别器失败(检查模型文件是否完整)");
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "创建离线识别器失败(模型文件不完整,或引擎内部异常——见 stderr 的 [sherpa-barrier] 行)"
+        );
         Ok(Self { ptr })
     }
 
     pub fn transcribe(&mut self, sample_rate: i32, samples: &[f32]) -> anyhow::Result<Transcript> {
+        // SAFETY: 指针来自本引擎;samples 在调用期间存活;整段 C 调用在 C++ 屏障内,
+        // onnxruntime 异常不会穿 FFI(issue #98)。
         unsafe {
-            let stream = sys::SherpaOnnxCreateOfflineStream(self.ptr);
-            anyhow::ensure!(!stream.is_null(), "创建识别流失败");
-            sys::SherpaOnnxAcceptWaveformOffline(
-                stream,
+            let mut json_ptr: *const c_char = std::ptr::null();
+            let rc = vn_sherpa_transcribe(
+                self.ptr as *const c_void,
                 sample_rate,
                 samples.as_ptr(),
                 samples.len() as i32,
+                &mut json_ptr,
             );
-            sys::SherpaOnnxDecodeOfflineStream(self.ptr, stream);
-            let json_ptr = sys::SherpaOnnxGetOfflineStreamResultAsJson(stream);
+            match rc {
+                0 => {}
+                -2 => anyhow::bail!("创建识别流失败"),
+                _ => anyhow::bail!("识别引擎内部异常(已被屏障捕获,见 stderr 的 [sherpa-barrier] 行)"),
+            }
             let transcript = if json_ptr.is_null() {
                 Transcript::default()
             } else {
@@ -128,7 +159,6 @@ impl OfflineEngine {
                 sys::SherpaOnnxDestroyOfflineStreamResultJson(json_ptr);
                 parse_result_json(&json)
             };
-            sys::SherpaOnnxDestroyOfflineStream(stream);
             Ok(transcript)
         }
     }
@@ -199,5 +229,15 @@ mod tests {
     fn parse_malformed_json_falls_back_to_empty_transcript() {
         let t = parse_result_json("not json {{");
         assert!(t.text.is_empty() && t.lang.is_empty() && t.tokens.is_empty());
+    }
+
+    /// issue #98 回归:sherpa C API 无 try/catch,onnxruntime 的 C++ 异常穿过
+    /// extern "C" 进 Rust 会在 catch_unwind 处 abort(__rust_foreign_exception)。
+    /// 屏障 shim 必须在 C++ 侧把异常吃成错误码——mode=1 人为 throw,mode=0 正常。
+    /// 本测试若让进程 SIGABRT 而非断言失败,即屏障失效。
+    #[test]
+    fn cxx_exception_barrier_catches_foreign_throw() {
+        assert_eq!(unsafe { vn_sherpa_barrier_selftest(1) }, -1, "C++ 异常必须被 shim 捕获为 -1");
+        assert_eq!(unsafe { vn_sherpa_barrier_selftest(0) }, 0, "无异常路径返回 0");
     }
 }

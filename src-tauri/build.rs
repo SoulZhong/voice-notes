@@ -11,5 +11,14 @@ fn main() {
         // 不存在,dyld 会继续走 cargo 注入的 DYLD_FALLBACK_LIBRARY_PATH,无害。
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     }
+    // issue #98:sherpa C API 无异常防护,onnxruntime 的 C++ 异常穿 FFI 会让 Rust
+    // abort。cxx/sherpa_barrier.cc 在 C++ 侧包 try/catch;SherpaOnnx* 符号由既有
+    // sherpa 静态库在最终链接期解析(shim 自声明原型,不依赖其头文件)。
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .file("cxx/sherpa_barrier.cc")
+        .compile("sherpa_barrier");
+    println!("cargo:rerun-if-changed=cxx/sherpa_barrier.cc");
     tauri_build::build()
 }

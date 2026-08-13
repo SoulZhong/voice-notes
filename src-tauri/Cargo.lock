@@ -6210,6 +6210,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "bzip2 0.5.2",
+ "cc",
  "chrono",
  "coreaudio-rs 0.12.1",
  "cpal",
