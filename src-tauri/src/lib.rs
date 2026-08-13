@@ -96,6 +96,16 @@ struct ActiveSession {
     /// 每源管线健康计数(FrameTap 写入):pipeline_health 命令随时快照,
     /// 会话拆除即随本结构丢弃——健康数据只描述"这一场",无跨场语义。
     health: Vec<(Source, Arc<SourceHealth>)>,
+    /// 每源时钟漂移监视器(Task 6 接线):停录时 snapshot 落 drift_report.json,
+    /// 会话拆除即随本结构丢弃——与 health 同寿命、同语义(只描述"这一场")。
+    drift: Vec<(Source, Arc<pipeline::drift_monitor::DriftMonitor>)>,
+    /// Task 7:mic 实测采样率(`kAudioDevicePropertyActualSampleRate`)10s 轮询线程的
+    /// stop 发送端。仅持有以随会话拆除而 drop——drop 即断开会合通道,轮询线程的
+    /// `recv_timeout` 立即返回 Disconnected 退出,不裸 loop+sleep 泄漏线程(与
+    /// vpio.rs 的 stop 通道同款惯例)。
+    /// 故意 write-only:唯一职责是被 Drop,从不读取。
+    #[allow(dead_code)]
+    actual_rate_stop: crossbeam_channel::Sender<()>,
     /// 笔记目录快照:停录时写墙钟-样本对账要用(该路径在 writer 移交前已确定,
     /// 见 start 处 `writer.dir()`)。
     note_dir: std::path::PathBuf,
@@ -1240,9 +1250,19 @@ fn spawn_session(
         let mut pre_start_failed: Vec<(Source, String)> = Vec::new();
         // 每源健康计数(FrameTap 写、pipeline_health 读),随 ActiveSession 存活一场。
         let mut session_health: Vec<(Source, Arc<SourceHealth>)> = Vec::new();
+        // 每源时钟漂移监视器(Task 6),随 ActiveSession 存活一场,停录落 drift_report.json。
+        let mut session_drift: Vec<(Source, Arc<pipeline::drift_monitor::DriftMonitor>)> =
+            Vec::new();
         // 两源首个真实帧共享一个单调时钟原点。谁先到谁把 0 点钉住,后到源把偏移
         // 写进 SourceHealth,供 mixed sink 在 16k 时间轴上插入准确的前导静音。
         let timeline_origin = Arc::new(OnceLock::new());
+        // Codex review Fix 4(P2):时钟漂移传感器 E1 标定场需要 AEC 完全不介入——
+        // 默认 capture_path=aec 下软件 AEC 在 mic.wav 落盘前工作,E1 标定播放的
+        // click 恰是"系统回放→mic 回声",会被定向消除,xcorr 的刺激没了就测不出
+        // 传感器精度;VPIO 路径同理(Apple AEC)。VOICE_NOTES_CALIBRATION=1 时旁路:
+        // 强制普通 cpal 麦克风(不走 VPIO)、跳过软件 AEC 角色构建。只读一次环境变量
+        // 存 bool,不进设置系统/UI——AEC 是 PR#86 定死不可配的,校准是唯一例外。
+        let calibration = std::env::var("VOICE_NOTES_CALIBRATION").as_deref() == Ok("1");
         let mic_seg = match new_silero(&vad_path) {
             Ok(s) => s,
             Err(e) => {
@@ -1262,8 +1282,13 @@ fn spawn_session(
         //  - Tap:健康统计 + 断流期按墙钟补零(时间轴不塌,双轨对齐不断裂),
         //    其失联通知(>3s 无帧)踢 Resilient 重启——覆盖 VPIO 这类未接
         //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
+        // 标定模式(calibration)下即便 vpio 档也不许走 VPIO——同一 Codex review Fix 4
+        // 理由:Apple AEC 会把标定刺激的房间回声消掉,校准是唯一例外,不进设置系统。
         #[cfg(target_os = "macos")]
-        let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture {
+        let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture || calibration {
+            if calibration && !use_aec_capture {
+                eprintln!("[标定模式] AEC 已停用(本场)");
+            }
             Box::new(|| {
                 let (etx, erx) = crossbeam_channel::unbounded();
                 (
@@ -1290,6 +1315,9 @@ fn spawn_session(
             )
         });
         let mic_health = Arc::new(SourceHealth::default());
+        // nominal_hz=0:tap 在重采样之前,mic 声明率在 start 后才可知(cpal 默认配置)
+        // ——DriftMonitor 惰性初始化,以首帧声明率为准现场锁定(见 drift_monitor.rs feed)。
+        let mic_drift = Arc::new(pipeline::drift_monitor::DriftMonitor::new(0));
         let mic_resilient = audio::resilient::ResilientCapture::new(mic_factory, {
             let app = app.clone();
             let health = mic_health.clone();
@@ -1321,15 +1349,38 @@ fn spawn_session(
             })),
             on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
         };
-        let mic: Box<dyn AudioCapture> = Box::new(TappedCapture::new_with_timeline_origin(
-            Box::new(mic_resilient),
-            Source::Mic,
-            TapPolicy::mic(),
-            mic_health.clone(),
-            mic_notify,
-            timeline_origin.clone(),
-        ));
+        let mic: Box<dyn AudioCapture> = Box::new(
+            TappedCapture::new_with_timeline_origin(
+                Box::new(mic_resilient),
+                Source::Mic,
+                TapPolicy::mic(),
+                mic_health.clone(),
+                mic_notify,
+                timeline_origin.clone(),
+            )
+            .with_drift(mic_drift.clone()),
+        );
         session_health.push((Source::Mic, mic_health));
+        session_drift.push((Source::Mic, mic_drift.clone()));
+        // Task 7:实测采样率旁证——10s 一次查询默认输入设备的 ActualSampleRate,喂给
+        // mic DriftMonitor,与 DLL 频率估计互为旁证。一期铁律:只测不动数据,查询
+        // 失败(非 macOS/无权限/设备异常)一律返回 None,静默跳过,不影响录音。
+        // stop_tx 存进 ActiveSession,随会话拆除 drop 触发线程退出(见该字段注释)。
+        let (actual_rate_stop_tx, actual_rate_stop_rx) = crossbeam_channel::bounded::<()>(0);
+        {
+            let mic_drift = mic_drift.clone();
+            std::thread::spawn(move || loop {
+                match actual_rate_stop_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    // 超时(10s 到)= 轮询一次;stop 发送端已断开 = 会话已结束,退出。
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if let Some(hz) = audio::actual_rate::default_input_actual_hz() {
+                            mic_drift.set_actual_rate_hz(hz);
+                        }
+                    }
+                    _ => break,
+                }
+            });
+        }
         sources.push((Source::Mic, mic, mic_seg));
 
         #[cfg(target_os = "macos")]
@@ -1346,6 +1397,8 @@ fn spawn_session(
                         )
                     });
                     let sys_health = Arc::new(SourceHealth::default());
+                    // 同 mic:声明率待 start 后可知,惰性初始化(见上方 mic_drift 注释)。
+                    let sys_drift = Arc::new(pipeline::drift_monitor::DriftMonitor::new(0));
                     let sys_resilient =
                         audio::resilient::ResilientCapture::new(sys_factory, {
                             let app = app.clone();
@@ -1381,16 +1434,19 @@ fn spawn_session(
                         })),
                         on_recover: Some(Box::new(|| eprintln!("系统声音采集恢复"))),
                     };
-                    let sys: Box<dyn AudioCapture> =
-                        Box::new(TappedCapture::new_with_timeline_origin(
+                    let sys: Box<dyn AudioCapture> = Box::new(
+                        TappedCapture::new_with_timeline_origin(
                             Box::new(sys_resilient),
                             Source::System,
                             TapPolicy::system_sck(),
                             sys_health.clone(),
                             sys_notify,
                             timeline_origin.clone(),
-                        ));
+                        )
+                        .with_drift(sys_drift.clone()),
+                    );
                     session_health.push((Source::System, sys_health));
+                    session_drift.push((Source::System, sys_drift));
                     sources.push((Source::System, sys, sys_seg));
                 }
                 Err(e) => {
@@ -1421,6 +1477,8 @@ fn spawn_session(
                         )
                     });
                     let sys_health = Arc::new(SourceHealth::default());
+                    // 同 mic:声明率待 start 后可知,惰性初始化(见上方 mic_drift 注释)。
+                    let sys_drift = Arc::new(pipeline::drift_monitor::DriftMonitor::new(0));
                     let sys_resilient =
                         audio::resilient::ResilientCapture::new(sys_factory, {
                             let app = app.clone();
@@ -1450,16 +1508,19 @@ fn spawn_session(
                         });
                     // 环回静默是常态(policy stall_after=None,tap 不判失联),
                     // 自愈只由 cpal 错误事件驱动,kicker 不接。
-                    let sys: Box<dyn AudioCapture> =
-                        Box::new(TappedCapture::new_with_timeline_origin(
+                    let sys: Box<dyn AudioCapture> = Box::new(
+                        TappedCapture::new_with_timeline_origin(
                             Box::new(sys_resilient),
                             Source::System,
                             TapPolicy::system_loopback(),
                             sys_health.clone(),
                             TapNotify::none(),
                             timeline_origin.clone(),
-                        ));
+                        )
+                        .with_drift(sys_drift.clone()),
+                    );
                     session_health.push((Source::System, sys_health));
+                    session_drift.push((Source::System, sys_drift));
                     sources.push((Source::System, sys, sys_seg));
                 }
                 Err(e) => {
@@ -1478,7 +1539,13 @@ fn spawn_session(
         // Windows 恒尝试:该平台无 VPIO 可选,软件 AEC 是唯一声学消回声路径
         // (当前为 stub,构造返回 Err → 走下方降级日志,文本级回声去重兜底)。
         let mut aec_roles: Vec<(Source, audio::aec::AecRole)> = Vec::new();
+        if calibration {
+            eprintln!("[标定模式] AEC 已停用(本场)");
+        }
+        // Codex review Fix 4(P2):标定模式下跳过软件 AEC 角色构建(aec_roles 留空)
+        // ——原因见上方 calibration 声明处注释。
         if (use_aec_capture || cfg!(windows))
+            && !calibration
             && sources.iter().any(|(s, _, _)| *s == Source::Mic)
             && sources.iter().any(|(s, _, _)| *s == Source::System)
         {
@@ -1949,6 +2016,8 @@ fn spawn_session(
                     audio_joins,
                     audio_activity,
                     health: session_health,
+                    drift: session_drift,
+                    actual_rate_stop: actual_rate_stop_tx,
                     note_dir: note_dir.clone(),
                 });
                 drop(running_guard);
@@ -2198,6 +2267,16 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     // 只覆盖本场 writer 真正成功追加过的源。配置过但启动失败、以及活跃却无帧的
     // 续录都保留旧 sync,不会拿旧 WAV 配本场零计数造假。
     persist_track_sync(&s.note_dir, s.base_ms, wall_ms, &s.health, &s.audio_activity);
+    // 时钟漂移传感器一期:只测不动数据,报告只写 note_dir、不进 telemetry;
+    // 失败/异常都只 eprintln,绝不影响停录主流程(旁路纪律)。
+    match pipeline::drift_monitor::persist_report(&s.note_dir, &s.drift) {
+        Ok(anomalies) => {
+            for a in anomalies {
+                eprintln!("[drift] 异常: {a}");
+            }
+        }
+        Err(e) => eprintln!("[drift] 报告写入失败: {e}"),
+    }
     Some(s.note_id)
 }
 

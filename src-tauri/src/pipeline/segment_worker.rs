@@ -235,7 +235,7 @@ mod tests {
         // Two 50-sample mono 16kHz frames; each exactly hits the throttle.
         // Tick 1: current_partial() → Some  → slot = Some(...)
         // Tick 2: current_partial() → None  → slot = None  (Fix B; old code left slot stale)
-        let frame = AudioFrame { samples: vec![0.0; 50], sample_rate: 16000, channels: 1 };
+        let frame = AudioFrame { samples: vec![0.0; 50], sample_rate: 16000, channels: 1, host_time_ns: None };
         ftx.send(frame.clone()).unwrap();
         ftx.send(frame).unwrap();
         drop(ftx); // close channel → worker exits after processing both frames
@@ -265,7 +265,7 @@ mod tests {
                 None,
             );
         });
-        let frame = |n: usize| AudioFrame { samples: vec![0.1; n], sample_rate: 16000, channels: 1 };
+        let frame = |n: usize| AudioFrame { samples: vec![0.1; n], sample_rate: 16000, channels: 1, host_time_ns: None };
 
         // 1) 2500 样本 → 1 段定稿(2000)，在途 500。
         ftx.send(frame(2500)).unwrap();
@@ -315,7 +315,7 @@ mod tests {
             );
         });
         // 两帧、每帧恰好 LEVEL_INTERVAL_SAMPLES(1600) 个 0.5 → 各触发一次回调，RMS≈0.5。
-        let frame = AudioFrame { samples: vec![0.5; LEVEL_INTERVAL_SAMPLES], sample_rate: 16000, channels: 1 };
+        let frame = AudioFrame { samples: vec![0.5; LEVEL_INTERVAL_SAMPLES], sample_rate: 16000, channels: 1, host_time_ns: None };
         ftx.send(frame.clone()).unwrap();
         ftx.send(frame).unwrap();
         drop(ftx);
@@ -344,15 +344,15 @@ mod tests {
         });
 
         // 1) 正常帧 2500 样本 → sink 全收(与 accept 同源同量)。
-        ftx.send(AudioFrame { samples: vec![0.25; 2500], sample_rate: 16000, channels: 1 }).unwrap();
+        ftx.send(AudioFrame { samples: vec![0.25; 2500], sample_rate: 16000, channels: 1, host_time_ns: None }).unwrap();
         let _ = final_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("首段定稿");
         // 2) 暂停期帧不写(时间轴冻结,音频同步冻结)。
         paused.store(true, Ordering::Relaxed);
-        ftx.send(AudioFrame { samples: vec![0.9; 800], sample_rate: 16000, channels: 1 }).unwrap();
+        ftx.send(AudioFrame { samples: vec![0.9; 800], sample_rate: 16000, channels: 1, host_time_ns: None }).unwrap();
         let _ = final_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("暂停跳变 flush");
         // 3) 恢复后继续写。
         paused.store(false, Ordering::Relaxed);
-        ftx.send(AudioFrame { samples: vec![0.5; 300], sample_rate: 16000, channels: 1 }).unwrap();
+        ftx.send(AudioFrame { samples: vec![0.5; 300], sample_rate: 16000, channels: 1, host_time_ns: None }).unwrap();
         drop(ftx);
         worker.join().unwrap();
 

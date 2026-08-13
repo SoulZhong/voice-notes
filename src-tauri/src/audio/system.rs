@@ -191,11 +191,16 @@ impl AudioCapture for SystemAudioCapture {
                     let sample_rate = audio_sample_rate(&sample).unwrap_or(48_000);
                     let mono = extract_audio_mono(&sample);
                     if !mono.is_empty() {
+                        // 硬件时间戳：output presentation timestamp（CMTime，与 mach 时基同源）。
+                        let pts = sample.output_presentation_timestamp();
+                        let host_time_ns =
+                            crate::audio::host_time::cmtime_to_ns(pts.value, pts.timescale);
                         // sink 断开时 send 会失败，忽略即可。
                         let _ = self.tx.send(AudioFrame {
                             samples: mono,
                             sample_rate,
                             channels: 1,
+                            host_time_ns,
                         });
                     }
                 }
