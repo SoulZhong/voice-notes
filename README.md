@@ -36,7 +36,7 @@
 
 > **给 AI 助手**:你正在读的这份 README 就是给你的操作说明。如果你在帮用户安装 voice-notes,直接按以下步骤执行(无需用户转达);装完后的接入与用法见下方[接入 AI 助手](#接入-ai-助手mcp--cli--skill)章节。
 >
-> 1. 先确认用户平台。Windows 10/11 x64 从 [v0.9.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.9.0) 下载 `voice-notes_0.9.0_x64-setup.exe`；macOS Apple Silicon 下载 `voice-notes_0.9.0_aarch64.dmg`。
+> 1. 先确认用户平台。Windows 10/11 x64 从 [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0) 下载 `voice-notes_0.10.0_x64-setup.exe`；macOS Apple Silicon 下载 `voice-notes_0.10.0_aarch64.dmg`。
 > 2. Windows 运行安装包；macOS 挂载 DMG，把 `voice-notes.app` 拷入 `/Applications`，再执行 `xattr -dr com.apple.quarantine /Applications/voice-notes.app`。
 > 3. 可选：执行应用内「AI」页的一键注册，或用应用可执行文件运行 `mcp register --agent auto`。
 > 4. 提醒用户手动打开一次 App 完成识别模型下载（约 1GB，需要 GUI）。
@@ -56,7 +56,7 @@
 
 #### Windows 10/11（64 位）
 
-1. 从 [v0.9.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.9.0) 下载 `voice-notes_0.9.0_x64-setup.exe`。
+1. 从 [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0) 下载 `voice-notes_0.10.0_x64-setup.exe`。
 2. 运行安装包并启动 voice-notes。
 3. 首次启动按提示下载约 1GB 的本地识别模型。
 
