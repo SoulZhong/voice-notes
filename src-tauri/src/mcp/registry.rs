@@ -20,19 +20,26 @@ pub struct AgentDef {
     detect_rel: &'static str,
     /// 相对 $HOME 的配置文件路径。
     config_rel: &'static str,
+    /// Windows 上与 Unix 不同形才设(如 Claude Desktop 在 %APPDATA%)。注意基准不同:
+    /// win 变体相对 roaming 根(真实 %APPDATA%,可被重定向到别的盘/UNC),
+    /// None = 沿用 Unix 路径且仍相对 $HOME(dotdir 系在 Windows 也在 %USERPROFILE% 下)。
+    win_detect_rel: Option<&'static str>,
+    win_config_rel: Option<&'static str>,
     pub fmt: Fmt,
 }
 
 /// 内置支持的八家(已拍板:第二梯队不内置,靠设置页手动配置卡片)。
+/// dotdir 系(.claude/.cursor/...)在 Windows 也直接落在 %USERPROFILE% 下,两平台同形;
+/// 唯 Claude Desktop 按系统惯例放平台数据目录,需要 Windows 变体。
 pub const AGENTS: &[AgentDef] = &[
-    AgentDef { key: "claude-code", name: "Claude Code", detect_rel: ".claude", config_rel: ".claude.json", fmt: Fmt::Json(&["mcpServers"]) },
-    AgentDef { key: "claude-desktop", name: "Claude Desktop", detect_rel: "Library/Application Support/Claude", config_rel: "Library/Application Support/Claude/claude_desktop_config.json", fmt: Fmt::Json(&["mcpServers"]) },
-    AgentDef { key: "cursor", name: "Cursor", detect_rel: ".cursor", config_rel: ".cursor/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
-    AgentDef { key: "codex", name: "Codex CLI", detect_rel: ".codex", config_rel: ".codex/config.toml", fmt: Fmt::Toml },
-    AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", fmt: Fmt::Json(&["mcpServers"]) },
-    AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", fmt: Fmt::Json(&["mcpServers"]) },
-    AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", fmt: Fmt::Json(&["mcp", "servers"]) },
-    AgentDef { key: "hermes", name: "Hermes Agent", detect_rel: ".hermes", config_rel: ".hermes/config.yaml", fmt: Fmt::Yaml },
+    AgentDef { key: "claude-code", name: "Claude Code", detect_rel: ".claude", config_rel: ".claude.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "claude-desktop", name: "Claude Desktop", detect_rel: "Library/Application Support/Claude", config_rel: "Library/Application Support/Claude/claude_desktop_config.json", win_detect_rel: Some("Claude"), win_config_rel: Some("Claude/claude_desktop_config.json"), fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "cursor", name: "Cursor", detect_rel: ".cursor", config_rel: ".cursor/mcp.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "codex", name: "Codex CLI", detect_rel: ".codex", config_rel: ".codex/config.toml", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Toml },
+    AgentDef { key: "gemini", name: "Gemini CLI", detect_rel: ".gemini", config_rel: ".gemini/settings.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "workbuddy", name: "WorkBuddy", detect_rel: ".workbuddy", config_rel: ".workbuddy/mcp.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcpServers"]) },
+    AgentDef { key: "openclaw", name: "OpenClaw", detect_rel: ".openclaw", config_rel: ".openclaw/openclaw.json", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Json(&["mcp", "servers"]) },
+    AgentDef { key: "hermes", name: "Hermes Agent", detect_rel: ".hermes", config_rel: ".hermes/config.yaml", win_detect_rel: None, win_config_rel: None, fmt: Fmt::Yaml },
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,21 +54,71 @@ pub struct AgentStatus {
     pub stale: bool,
 }
 
-/// home/exe 显式注入:生产走 new()(真 $HOME + current_exe),测试注入 tempdir。
+/// home/exe 显式注入:生产走 new()(真主目录 + current_exe),测试注入 tempdir。
+/// windows 决定 AGENTS 表取哪套路径;roaming 是真实 %APPDATA% 根(可被系统重定向,
+/// 不能从 home 猜)。可注入是为了在任一平台测另一平台的形态。
 pub struct Registry {
     home: PathBuf,
+    roaming: PathBuf,
     exe: PathBuf,
+    windows: bool,
+}
+
+/// %APPDATA%(非空)优先;未设时按默认布局 home\AppData\Roaming 猜。
+fn roaming_from(appdata: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    appdata
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+}
+
+/// canonicalize 在 Windows 产出 `\\?\` verbatim 前缀;写进 Agent 配置的 command
+/// 应还原普通形——个别 Agent spawn 不认 verbatim 前缀,对用户也更可读。
+fn simplify_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
+    }
+    p
+}
+
+/// 同一文件的两种写法(相对段/符号链接/verbatim 前缀/大小写)视为同一二进制。
+/// 先词法短路;再 canonicalize 双方比较——任一方不存在(canonicalize 失败)时
+/// 回落词法结论(即视为不同),与旧行为一致。
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 impl Registry {
     pub fn new() -> anyhow::Result<Self> {
-        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME 不可用"))?;
-        let exe = std::env::current_exe()?.canonicalize()?;
-        Ok(Self::with(PathBuf::from(home), exe))
+        let home = crate::mcp::home_dir()?;
+        let exe = simplify_verbatim(std::env::current_exe()?.canonicalize()?);
+        let mut reg = Self::with(home, exe);
+        if reg.windows {
+            reg.roaming = roaming_from(std::env::var_os("APPDATA"), &reg.home);
+        }
+        Ok(reg)
     }
 
     pub fn with(home: PathBuf, exe: PathBuf) -> Self {
-        Self { home, exe }
+        Self::with_os(home, exe, cfg!(windows))
+    }
+
+    pub fn with_os(home: PathBuf, exe: PathBuf, windows: bool) -> Self {
+        let roaming = home.join("AppData").join("Roaming");
+        Self { home, roaming, exe, windows }
+    }
+
+    /// 测试钩子:注入重定向后的 roaming 根(生产由 new() 从 %APPDATA% 解析)。
+    pub fn roaming(mut self, roaming: PathBuf) -> Self {
+        self.roaming = roaming;
+        self
     }
 
     fn def(key: &str) -> anyhow::Result<&'static AgentDef> {
@@ -69,7 +126,17 @@ impl Registry {
     }
 
     fn config_path(&self, def: &AgentDef) -> PathBuf {
-        self.home.join(def.config_rel)
+        match (self.windows, def.win_config_rel) {
+            (true, Some(rel)) => self.roaming.join(rel),
+            _ => self.home.join(def.config_rel),
+        }
+    }
+
+    fn detect_path(&self, def: &AgentDef) -> PathBuf {
+        match (self.windows, def.win_detect_rel) {
+            (true, Some(rel)) => self.roaming.join(rel),
+            _ => self.home.join(def.detect_rel),
+        }
     }
 
     /// 手动配置卡片/README 用的 JSON 片段(command 为本机真实路径)。
@@ -85,10 +152,10 @@ impl Registry {
     }
 
     fn status_one(&self, def: &AgentDef) -> AgentStatus {
-        let installed = self.home.join(def.detect_rel).exists();
+        let installed = self.detect_path(def).exists();
         let command = self.read_command(def);
         let registered = command.is_some();
-        let stale = command.as_deref().map(|c| Path::new(c) != self.exe.as_path()).unwrap_or(false);
+        let stale = command.as_deref().map(|c| !same_file(Path::new(c), &self.exe)).unwrap_or(false);
         AgentStatus {
             key: def.key.into(),
             name: def.name.into(),
@@ -389,6 +456,99 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&snippet).expect("必须是合法 JSON");
         assert_eq!(v["voice-notes"]["command"], "/Applications/voice-notes.app/Contents/MacOS/voice-notes");
         assert_eq!(v["voice-notes"]["args"], serde_json::json!(["mcp", "serve"]));
+    }
+
+    /// Windows 形态:Claude Desktop 的检测/配置在 %APPDATA%(home\AppData\Roaming),
+    /// 不是 macOS 的 Library/Application Support;其余点位(.claude/.cursor/...)两平台同形。
+    #[test]
+    fn windows_claude_desktop_lives_under_appdata_roaming() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("AppData/Roaming/Claude")).unwrap();
+        let exe = PathBuf::from("C:\\Program Files\\voice-notes\\voice-notes.exe");
+        let win = Registry::with_os(tmp.path().to_path_buf(), exe.clone(), true);
+
+        let st = win.status();
+        let cd = st.iter().find(|s| s.key == "claude-desktop").unwrap();
+        assert!(cd.installed, "AppData/Roaming/Claude 存在即视为已安装");
+
+        win.register("claude-desktop").unwrap();
+        let cfg = tmp.path().join("AppData/Roaming/Claude/claude_desktop_config.json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["voice-notes"]["command"], exe.to_string_lossy().as_ref());
+        let cd = win.status().into_iter().find(|s| s.key == "claude-desktop").unwrap();
+        assert!(cd.registered && !cd.stale, "写入后 read_command 必须能读回同一路径:{cd:?}");
+
+        // 同一 home 的 macOS 形态看不到它(路径按平台分,不混淆)
+        let mac = Registry::with_os(tmp.path().to_path_buf(), exe, false);
+        let cd = mac.status().into_iter().find(|s| s.key == "claude-desktop").unwrap();
+        assert!(!cd.installed && !cd.registered);
+    }
+
+    /// roaming profile 重定向(APPDATA 指向别的盘/UNC)时,Claude Desktop 的检测与写入
+    /// 必须跟着真实 APPDATA 走,不能猜 home\AppData\Roaming。
+    #[test]
+    fn windows_redirected_appdata_overrides_home_guess() {
+        let home = tempfile::tempdir().unwrap();
+        let redirected = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(redirected.path().join("Claude")).unwrap();
+        let exe = PathBuf::from("C:\\Program Files\\voice-notes\\voice-notes.exe");
+        let win = Registry::with_os(home.path().to_path_buf(), exe, true).roaming(redirected.path().to_path_buf());
+
+        let cd = win.status().into_iter().find(|s| s.key == "claude-desktop").unwrap();
+        assert!(cd.installed, "检测应看重定向后的 roaming 根");
+
+        win.register("claude-desktop").unwrap();
+        assert!(
+            redirected.path().join("Claude/claude_desktop_config.json").exists(),
+            "配置写进重定向后的 roaming 根"
+        );
+        assert!(!home.path().join("AppData").exists(), "不得往 home 下猜出来的位置写");
+    }
+
+    #[test]
+    fn roaming_from_prefers_appdata_env_then_home_guess() {
+        let appdata = PathBuf::from("D:\\Profiles\\a").join("Roaming");
+        assert_eq!(roaming_from(Some(appdata.clone().into()), Path::new("C:\\Users\\a")), appdata);
+        assert_eq!(
+            roaming_from(None, Path::new("C:\\Users\\a")),
+            Path::new("C:\\Users\\a").join("AppData").join("Roaming"),
+            "无 APPDATA 回落 home\\AppData\\Roaming"
+        );
+        assert_eq!(
+            roaming_from(Some("".into()), Path::new("C:\\Users\\a")),
+            Path::new("C:\\Users\\a").join("AppData").join("Roaming"),
+            "空串 APPDATA 视为未设置"
+        );
+    }
+
+    /// 指向同一文件的等价写法(相对段/符号链接/Windows 的 \\?\ 前缀)不得判 stale——
+    /// 否则启动自愈会无意义地改写用户配置。
+    #[test]
+    fn stale_compares_canonical_identity_not_lexical_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("voice-notes");
+        std::fs::write(&exe, "").unwrap();
+        let equivalent = bin_dir.join("..").join("bin").join("voice-notes");
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            format!(r#"{{"mcpServers":{{"voice-notes":{{"command":{},"args":["mcp","serve"]}}}}}}"#,
+                serde_json::to_string(&equivalent.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        let r = Registry::with(tmp.path().to_path_buf(), exe);
+        let cc = r.status().into_iter().find(|s| s.key == "claude-code").unwrap();
+        assert!(cc.registered && !cc.stale, "等价路径不是 stale:{cc:?}");
+    }
+
+    /// canonicalize 在 Windows 产出 \\?\ 前缀路径;写进各家配置的 command 应还原为
+    /// 普通形(个别 Agent 不认 verbatim 前缀,对用户也更可读)。
+    #[test]
+    fn verbatim_prefix_is_simplified_for_display_and_spawn() {
+        assert_eq!(simplify_verbatim(PathBuf::from(r"\\?\C:\Program Files\vn\vn.exe")), PathBuf::from(r"C:\Program Files\vn\vn.exe"));
+        assert_eq!(simplify_verbatim(PathBuf::from(r"\\?\UNC\srv\share\vn.exe")), PathBuf::from(r"\\srv\share\vn.exe"));
+        assert_eq!(simplify_verbatim(PathBuf::from("/Applications/vn")), PathBuf::from("/Applications/vn"), "非 verbatim 原样");
     }
 
     #[test]

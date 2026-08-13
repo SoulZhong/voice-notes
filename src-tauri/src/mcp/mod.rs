@@ -1,7 +1,8 @@
 //! MCP 子系统入口:argv `voice-notes mcp ...` 的 CLI 分发,与无 tauri 环境下的
 //! app_data 解析(stdio 服务进程/注册 CLI 都不经过 tauri Builder)。
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 // GUI↔stdio 的 UDS 桥:std 不在 Windows 暴露 Unix socket,#[path] 顶替同形桩
 // (控制类降级为人话指引,查询类直读磁盘不受影响),与 audio/aec 的门控手法一致。
@@ -22,6 +23,19 @@ pub mod uds;
 #[path = "uds_stub.rs"]
 pub mod uds;
 
+/// 用户主目录:HOME → USERPROFILE 回落。Windows 上没有 HOME(只有 USERPROFILE),
+/// 只读 HOME 会让整个 MCP 注册/skill 子系统报"不可用"(设置页 AI 助手接入区整区瘫痪)。
+pub fn home_dir() -> anyhow::Result<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+fn home_from(home: Option<OsString>, userprofile: Option<OsString>) -> anyhow::Result<PathBuf> {
+    home.filter(|v| !v.is_empty())
+        .or_else(|| userprofile.filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("主目录不可用(HOME/USERPROFILE 均未设置)"))
+}
+
 /// 无 tauri 环境下的 app_data_dir。identifier 与 tauri.conf.json 保持一致——
 /// GUI 侧 `app.path().app_data_dir()` 解析到的正是这个目录。VN_APP_DATA 供
 /// 测试与 e2e 注入 tempdir(生产不设)。
@@ -31,8 +45,23 @@ pub fn app_data_dir() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/com.teemo.voice-notes")
+    let home = home_dir().unwrap_or_default();
+    default_app_data_dir(cfg!(windows), std::env::var_os("APPDATA"), &home)
+}
+
+/// tauri v2 的 app_data_dir 形状:Windows 是 %APPDATA%\{id},macOS 是
+/// ~/Library/Application Support/{id}。windows 用参数注入(而非 cfg)以便两分支都可测。
+fn default_app_data_dir(windows: bool, appdata: Option<OsString>, home: &Path) -> PathBuf {
+    const ID: &str = "com.teemo.voice-notes";
+    if windows {
+        appdata
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join(ID)
+    } else {
+        home.join("Library/Application Support").join(ID)
+    }
 }
 
 /// 顶层 CLI 分发:main.rs 把 mcp|notes|speakers|skill|record 都送到这里(args[0] 即
@@ -182,8 +211,15 @@ mod tests {
         std::env::set_var("VN_APP_DATA", "/tmp/vn-test-app-data");
         assert_eq!(app_data_dir(), PathBuf::from("/tmp/vn-test-app-data"));
         std::env::remove_var("VN_APP_DATA");
+        // 回落形状按运行平台断言(default_app_data_dir 的两分支另有专测):
+        // 在 Windows 上跑测试时不能写死 macOS 的 Library 路径。
         let p = app_data_dir();
-        assert!(p.ends_with("Library/Application Support/com.teemo.voice-notes"), "{p:?}");
+        let expected = default_app_data_dir(
+            cfg!(windows),
+            std::env::var_os("APPDATA"),
+            &home_dir().unwrap_or_default(),
+        );
+        assert_eq!(p, expected, "{p:?}");
     }
 
     #[test]
@@ -199,6 +235,47 @@ mod tests {
         // 子分发的用法错穿透(mcp 裸 → 2;notes 裸 → 2)
         assert_eq!(cli_entry(&["mcp".into()]), 2);
         assert_eq!(cli_entry(&["notes".into()]), 2);
+    }
+
+    #[test]
+    fn home_from_prefers_home_then_userprofile() {
+        assert_eq!(
+            home_from(Some("/Users/a".into()), Some("C:\\Users\\a".into())).unwrap(),
+            PathBuf::from("/Users/a"),
+            "HOME 优先"
+        );
+        assert_eq!(
+            home_from(None, Some("C:\\Users\\a".into())).unwrap(),
+            PathBuf::from("C:\\Users\\a"),
+            "无 HOME 回落 USERPROFILE"
+        );
+        assert_eq!(
+            home_from(Some("".into()), Some("C:\\Users\\a".into())).unwrap(),
+            PathBuf::from("C:\\Users\\a"),
+            "空串 HOME 视为未设置"
+        );
+        let err = home_from(None, None).unwrap_err();
+        assert!(err.to_string().contains("不可用"), "{err}");
+    }
+
+    #[test]
+    fn default_app_data_dir_per_platform() {
+        let appdata = PathBuf::from("C:\\Users\\a").join("AppData").join("Roaming");
+        assert_eq!(
+            default_app_data_dir(true, Some(appdata.clone().into()), Path::new("D:\\elsewhere")),
+            appdata.join("com.teemo.voice-notes"),
+            "Windows 有 APPDATA 时以其为准(与 tauri app_data_dir 一致)"
+        );
+        assert_eq!(
+            default_app_data_dir(true, None, Path::new("C:\\Users\\a")),
+            Path::new("C:\\Users\\a").join("AppData").join("Roaming").join("com.teemo.voice-notes"),
+            "Windows 无 APPDATA 回落 home\\AppData\\Roaming"
+        );
+        assert_eq!(
+            default_app_data_dir(false, None, Path::new("/Users/a")),
+            PathBuf::from("/Users/a/Library/Application Support/com.teemo.voice-notes"),
+            "macOS 形状不变"
+        );
     }
 
     #[test]
