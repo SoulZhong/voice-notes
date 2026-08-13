@@ -19,6 +19,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# issue #98:编译 cxx/sherpa_barrier.cc(C++ 异常屏障,防 onnxruntime 异常穿 FFI)
+cc = "1"
 
 [dependencies]
 # tray-icon: 启用 TrayIconBuilder 等托盘 API;image-png: Image::from_bytes 解码 PNG 图标所需。
