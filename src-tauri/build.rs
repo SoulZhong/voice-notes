@@ -18,8 +18,13 @@ fn main() {
     barrier.cpp(true).std("c++17").file("cxx/sherpa_barrier.cc");
     // Windows:sherpa 预编译静态库为 /MT(static CRT),cc 默认 /MD 会触发对象级
     // LNK2038 RuntimeLibrary 硬冲突(CI 实证)——shim 必须同为 /MT。
+    // /EHs(Codex P1):cc 在 MSVC 不加任何 /EH 标志,旧式 EH 下 catch(...) 会连
+    // SEH 结构化异常(访问违例)一起吞掉,损坏态继续跑比 abort 更糟;/EHs 限定
+    // 只接同步 C++ 异常且全展开。刻意不用 /EHsc:/EHc 假定 extern "C" 不抛,
+    // 而本屏障的前提恰是 sherpa 的 extern "C" 会抛 C++ 异常,/EHc 会废掉 try/catch。
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         barrier.static_crt(true);
+        barrier.flag("/EHs");
     }
     barrier.compile("sherpa_barrier");
     println!("cargo:rerun-if-changed=cxx/sherpa_barrier.cc");
