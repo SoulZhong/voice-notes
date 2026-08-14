@@ -142,6 +142,7 @@ mod tests {
             state: state.into(),
             calendar: None,
             calendar_cleared: false,
+            asr_engine: None,
         };
         std::fs::write(note_dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
     }

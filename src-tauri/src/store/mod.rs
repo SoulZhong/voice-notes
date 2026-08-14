@@ -65,6 +65,12 @@ pub struct NoteMeta {
     /// 手动改选会复位。没有它,「清除」在下一次 backfill 就被推翻。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub calendar_cleared: bool,
+    /// 本场转写实际使用的识别引擎("firered"/"qwen3"/…,云端记 "cloud:厂商")。
+    /// 每场覆盖:续录换了引擎以最后一场为准(与 SyncInfo 同限制)。2026-08-14
+    /// 排查教训:引擎选型与实际生效可能不一致(模型未就绪、录制中切换),
+    /// 不落盘就无从对证是哪个引擎转的这场。serde default 兼容旧 meta。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_engine: Option<String>,
 }
 
 /// 日历事件快照(P3):落盘即快照——title/attendees 是匹配时刻的副本,不依赖

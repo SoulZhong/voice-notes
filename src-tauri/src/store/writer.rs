@@ -141,6 +141,7 @@ impl NoteWriter {
             state: "recording".into(),
             calendar: None,
             calendar_cleared: false,
+            asr_engine: None,
         };
         write_meta_atomic(&dir, &meta)?;
         let file = OpenOptions::new()
@@ -358,6 +359,12 @@ impl NoteWriter {
     /// 这里——内存与磁盘同步更新,finalize 自然保留。
     pub fn set_title(&mut self, title: &str) -> anyhow::Result<()> {
         self.meta.title = title.to_string();
+        write_meta_atomic(&self.dir, &self.meta)
+    }
+
+    /// 记录本场实际使用的识别引擎(每场覆盖;语义见 NoteMeta::asr_engine)。
+    pub fn set_asr_engine(&mut self, engine: &str) -> anyhow::Result<()> {
+        self.meta.asr_engine = Some(engine.to_string());
         write_meta_atomic(&self.dir, &self.meta)
     }
 
@@ -915,6 +922,36 @@ mod tests {
         assert!(meta.ended_at.is_some());
         let lines = read_lines(&dir);
         assert_eq!(lines.len(), 2, "两段都应补写，一段不丢");
+    }
+
+    #[test]
+    /// 引擎身份落盘(2026-08-14 排查教训:引擎选型与实际生效可能不一致——模型
+    /// 未就绪、下载中途切换——事后无从对证是哪个引擎转的这场):开录写入、续录
+    /// 覆盖(以最后一场为准)、finalize 后存活、旧 meta 无此键可读。
+    #[test]
+    fn set_asr_engine_persists_resume_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = NoteWriter::create(tmp.path(), now()).unwrap();
+        let id = w.note_id().to_string();
+        let dir = w.dir().to_path_buf();
+        w.set_asr_engine("qwen3").unwrap();
+        let meta = read_meta(&dir);
+        assert_eq!(meta.asr_engine.as_deref(), Some("qwen3"));
+        w.finalize(now()).unwrap();
+        assert_eq!(read_meta(&dir).asr_engine.as_deref(), Some("qwen3"), "finalize 后存活");
+        drop(w);
+
+        let mut w = NoteWriter::resume(tmp.path(), &id).unwrap();
+        w.set_asr_engine("cloud:volcano").unwrap();
+        drop(w);
+        assert_eq!(read_meta(&dir).asr_engine.as_deref(), Some("cloud:volcano"), "续录覆盖为最后一场");
+
+        // 旧 meta 无 asr_engine 键 → 反序列化为 None,不破坏读取。
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("asr_engine");
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(read_meta(&dir).asr_engine, None);
     }
 
     #[test]

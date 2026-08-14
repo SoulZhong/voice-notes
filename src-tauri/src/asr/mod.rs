@@ -23,6 +23,14 @@ pub struct Transcript {
 /// 后续计划可新增其它实现（如 whisper-rs）而不动调用方。
 pub trait Recognizer: Send {
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript>;
+
+    /// 本实例是哪个引擎(落进 NoteMeta.asr_engine 供事后取证)。
+    /// 必须由实例自报而不是回头再读设置:识别器可能来自开录前的常驻预载,
+    /// 用户在预载与开录之间改了选型时,设置里的值与真正在跑的实例就对不上了
+    /// ——那恰好是本字段要抓的场景(Codex review P2)。默认值只兜底测试桩。
+    fn engine_id(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// settings.asr_provider → sherpa provider 覆盖。空/空白 = 不覆盖(沿用 sherpa 默认)。

@@ -171,6 +171,24 @@ const FOREIGN_RATIO_THRESHOLD: f32 = 0.3;
 /// 占比兜底对模型标为 zh 的段同样生效(未提前用标签放行),系有意为之:混杂幻觉
 /// (如假名混中文)模型常仍标 zh,标签本身不可靠;误杀面(中文夹整句日语引用)
 /// 待 rms/误杀数据复盘时与阈值一并校准。
+/// 无内容幻觉段:ASR(尤其自回归解码的 Qwen3/FireRed)在回声残渣、底噪上会
+/// 幻觉出纯标点段("."/"。"),污染笔记与说话人表(2026-08-14 腾讯会议实锤:
+/// 42 分钟场 mic 轨 274 段里 66 个纯标点段;近期 14 场共 114 个)。
+/// 判据只有一条且刻意保守:**全段没有一个字母/数字/汉字**——这样的文本无论
+/// 多长都不携带任何信息,抑制它零风险。
+///
+/// 曾经还有一条"有效字符 ≤2 且段长 ≥3s"的低密度判据,已按真实数据撤除:
+/// 那 41 个命中段里既有 '工作。''解决''一个。' 这类真实短发言,也有 rms 高于
+/// 正常段的长段(如 8.5s 的 '规划'、13.8s 的 '可以。')——后者不是残渣,而是
+/// "十几秒真实发言只转出两个字"的转写失败,抑制它等于掩盖内容丢失。
+/// 会议纪要宁可留下碎片,也不能悄悄吞掉说过的话(与 collapse_repeats 同一准则)。
+///
+/// 与语言无关,不挂 language_filter 开关;空串/纯空白不归本过滤管
+/// (维持既有空串路径的行为),占位段"[识别失败]"含字母天然放行。
+pub(crate) fn is_no_content_final(text: &str) -> bool {
+    !text.trim().is_empty() && !text.chars().any(|c| c.is_alphanumeric())
+}
+
 pub(crate) fn is_foreign_final(lang: &str, text: &str) -> bool {
     let tag: String = lang
         .trim_matches(|c: char| c == '<' || c == '|' || c == '>')
@@ -645,6 +663,27 @@ where
                 end_ms,
                 rms: Some(rms_of(samples)),
                 reason: "foreign_language".into(),
+            });
+            return;
+        }
+
+        // 无内容幻觉段(纯标点/低密度碎段):与语言过滤同一待遇——不 embed/
+        // 不 assign/不 emit/不落盘;判定与语言无关,不受 language_filter 开关约束。
+        if is_no_content_final(&t.text) {
+            eprintln!(
+                "无内容过滤: 丢弃 {:?} 段 span={}ms text=\"{}\"",
+                source,
+                end_ms.saturating_sub(start_ms),
+                text_prefix20(&t.text)
+            );
+            (self.on_partial)(source, String::new());
+            (self.on_diar)(DiarEvent::SuppressedFinal {
+                source,
+                text: t.text,
+                start_ms,
+                end_ms,
+                rms: Some(rms_of(samples)),
+                reason: "no_content".into(),
             });
             return;
         }
@@ -3026,6 +3065,66 @@ mod asr_worker_tests {
         let rms = finals[0].1.expect("正常段必须带 rms");
         assert!((rms - 0.5).abs() < 1e-3, "全 0.5 样本的 RMS 应为 0.5,得 {rms}");
         assert_eq!(suppressed, vec![("でかし".into(), "foreign_language".into())]);
+    }
+
+    /// 无内容幻觉段判定:只拦纯标点(真实数据里 114 段),任何时长都拦。
+    /// 一切含字母/数字/汉字的文本一律放行——哪怕只有一两个字、哪怕段很长:
+    /// 那既可能是真实短发言,也可能是转写失败的残留证据,两种都不该被悄悄吞掉
+    /// (低密度判据已按数据撤除,理由见 is_no_content_final 文档)。
+    #[test]
+    fn no_content_final_rules() {
+        assert!(is_no_content_final("."), "纯句点");
+        assert!(is_no_content_final("。"), "全角句号");
+        assert!(is_no_content_final(" . 。"), "多个标点混空白");
+        assert!(is_no_content_final("，、；"), "任意标点组合");
+        assert!(!is_no_content_final("So."), "含字母 → 放行");
+        assert!(!is_no_content_final("上"), "单字也是内容 → 放行");
+        assert!(!is_no_content_final("解决"), "长段里的两个字可能是转写失败的残留证据 → 放行");
+        assert!(!is_no_content_final("嗯。"), "正常短应答放行");
+        assert!(!is_no_content_final("这是正常句子"), "正常句子放行");
+        assert!(!is_no_content_final("[识别失败]"), "占位段放行(含字母)");
+        assert!(!is_no_content_final(""), "空串不归本过滤管");
+        assert!(!is_no_content_final("   "), "纯空白不归本过滤管");
+    }
+
+    /// 无内容段走与语言过滤同一条抑制管道(SuppressedFinal/no_content),且
+    /// **不受 language_filter 开关影响**——纯标点在任何语言设置下都是垃圾。
+    #[test]
+    fn worker_drops_no_content_final_even_with_language_filter_off() {
+        struct ScriptRecognizer(std::collections::VecDeque<Transcript>);
+        impl Recognizer for ScriptRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(self.0.pop_front().unwrap_or_default())
+            }
+        }
+        let script = vec![
+            Transcript { text: ".".into(), lang: "<|zh|>".into(), ..Default::default() },
+            Transcript { text: "正常句子".into(), lang: "<|zh|>".into(), ..Default::default() },
+        ];
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 0, end_ms: 5000 }).unwrap();
+        tx.send(FinalJob { source: Source::Mic, samples: vec![0.5; 1600], start_ms: 5200, end_ms: 5300 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<String> = Vec::new();
+        let mut suppressed = Vec::new();
+        run_asr_worker(
+            Box::new(ScriptRecognizer(script.into())),
+            None,
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            false, // 语言过滤关着也要拦
+            Vec::new(),
+            |_src, text, _s, _e, _spk, _rms| finals.push(text),
+            |_, _| {},
+            |event| {
+                if let DiarEvent::SuppressedFinal { text, reason, .. } = event {
+                    suppressed.push((text, reason));
+                }
+            },
+        );
+        assert_eq!(finals, vec!["正常句子".to_string()], "纯标点段不得落 final");
+        assert_eq!(suppressed, vec![(".".into(), "no_content".into())]);
     }
 
     /// language_filter=false:多语会议场景显式关闭本过滤后,即便命中中日韩白名单

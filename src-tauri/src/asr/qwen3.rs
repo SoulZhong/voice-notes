@@ -42,6 +42,10 @@ impl Qwen3Recognizer {
 }
 
 impl Recognizer for Qwen3Recognizer {
+    fn engine_id(&self) -> &'static str {
+        crate::settings::ASR_QWEN3
+    }
+
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         // LLM 解码无 token 时间戳(timestamps 恒空 → diarization 段级降级);
         // lang 若模型给出则透传。

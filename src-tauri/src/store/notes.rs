@@ -538,6 +538,7 @@ fn fallback_meta(dir: &Path) -> NoteMeta {
         state: "complete".into(),
         calendar: None,
         calendar_cleared: false,
+            asr_engine: None,
     }
 }
 
@@ -1245,6 +1246,7 @@ mod tests {
             state: "complete".into(),
             calendar: None,
             calendar_cleared: false,
+            asr_engine: None,
         };
         write_meta_atomic(&dir, &meta).unwrap();
 

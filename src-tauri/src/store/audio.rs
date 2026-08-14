@@ -179,7 +179,7 @@ pub struct MixInfo {
 /// `AudioTrackWriter::open()` 是懒调用,首次 append 才跑;若本场一个样本都没写,
 /// 对齐用的 set_len 从未执行,文件仍停在上一场结束时的长度——这个长度若与 base_ms
 /// 不齐,会被换算出一个非零的假漂移。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncInfo {
     /// 本场录制墙钟时长(ms,已扣暂停)。
     pub wall_ms: u64,
@@ -205,6 +205,19 @@ pub struct SyncInfo {
     pub gaps: u32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: u32,
+    /// 硬件时基不连续次数(采集侧真有洞的直接计数;消费端慢不计入)。
+    /// 新增字段走 serde default:老记录按 0 读入,不破坏反序列化。
+    #[serde(default)]
+    pub hw_gaps: u32,
+    /// 采集→tap 队列深度高水位。持续走高 = tap 或其下游追不上采集节奏。
+    #[serde(default)]
+    pub cap_queue_hw: u32,
+    /// tap 向 worker 转发被阻塞的累计/单次峰值毫秒(>0 = worker 背压顶到 tap;
+    /// 逼近采集缓冲总量时回调将被阻塞、HAL 开始真丢样)。
+    #[serde(default)]
+    pub send_wait_ms: u64,
+    #[serde(default)]
+    pub send_wait_max_ms: u64,
     /// 本源首个真实帧相对本场最早首帧的偏移(ms)。mixed 轨里该源内容整体后移
     /// 这么多(spec §口径差),段落 seek 到 mixed 时要加回去。续录每场覆盖,
     /// 与本结构其余字段同限制。旧数据无此字段 → None,消费方按 0 处理。
@@ -1144,7 +1157,7 @@ mod tests {
                 silence_ms: 0,
                 gaps: 0,
                 rate_fixes: 1,
-                first_frame_offset_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1403,7 +1416,7 @@ mod tests {
                 silence_ms: 0,
                 gaps: 0,
                 rate_fixes: 0,
-                first_frame_offset_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -27,6 +27,10 @@ impl ParaformerRecognizer {
 }
 
 impl Recognizer for ParaformerRecognizer {
+    fn engine_id(&self) -> &'static str {
+        crate::settings::ASR_PARAFORMER
+    }
+
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         // paraformer 无语言标签时 lang 为空串:语言过滤走文本兜底(whisper 同路径)
         self.inner.transcribe(16000, samples)
