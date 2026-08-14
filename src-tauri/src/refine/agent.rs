@@ -76,10 +76,7 @@ pub fn resolve_bin(kind: AgentKind, override_path: &str) -> Option<PathBuf> {
         let p = PathBuf::from(override_path.trim());
         return p.is_file().then_some(p);
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::mcp::home_dir().unwrap_or_default();
     let name = kind.bin_name();
     let mut candidates = vec![
         home.join(".local/bin").join(name),

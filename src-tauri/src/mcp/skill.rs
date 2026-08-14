@@ -129,7 +129,7 @@ pub fn heal_in(home: &Path) -> bool {
 }
 
 fn real_home() -> anyhow::Result<PathBuf> {
-    std::env::var("HOME").map(PathBuf::from).map_err(|_| anyhow::anyhow!("HOME 不可用"))
+    crate::mcp::home_dir()
 }
 
 pub fn status() -> anyhow::Result<SkillState> {
