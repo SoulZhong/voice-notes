@@ -36,8 +36,8 @@
 
 > **给 AI 助手**:你正在读的这份 README 就是给你的操作说明。如果你在帮用户安装 voice-notes,直接按以下步骤执行(无需用户转达);装完后的接入与用法见下方[接入 AI 助手](#接入-ai-助手mcp--cli--skill)章节。
 >
-> 1. 先确认用户平台。Windows 10/11 x64 从 [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0) 下载 `voice-notes_0.10.0_x64-setup.exe`；macOS Apple Silicon 下载 `voice-notes_0.10.0_aarch64.dmg`。
-> 2. Windows 运行安装包；macOS 挂载 DMG，把 `voice-notes.app` 拷入 `/Applications`，再执行 `xattr -dr com.apple.quarantine /Applications/voice-notes.app`。
+> 1. 先确认用户平台,从[最新 Release](https://github.com/SoulZhong/voice-notes/releases/latest) 下载对应安装包:Windows 10/11 x64 取 `voice-notes_x.y.z_x64-setup.exe`,macOS Apple Silicon 取 `voice-notes_x.y.z_aarch64.dmg`。
+> 2. Windows 运行安装包；macOS 挂载 DMG，把 `voice-notes.app` 拷入 `/Applications`(安装包已签名并经 Apple 公证,直接打开即可,无需 xattr 放行)。
 > 3. 可选：执行应用内「AI」页的一键注册，或用应用可执行文件运行 `mcp register --agent auto`。
 > 4. 提醒用户手动打开一次 App 完成识别模型下载（约 1GB，需要 GUI）。
 >
@@ -56,7 +56,7 @@
 
 #### Windows 10/11（64 位）
 
-1. 从 [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0) 下载 `voice-notes_0.10.0_x64-setup.exe`。
+1. 从[最新 Release](https://github.com/SoulZhong/voice-notes/releases/latest) 下载 `voice-notes_x.y.z_x64-setup.exe`。
 2. 运行安装包并启动 voice-notes。
 3. 首次启动按提示下载约 1GB 的本地识别模型。
 
@@ -64,12 +64,9 @@
 
 #### macOS（Apple Silicon）
 
-1. 到 [Releases](https://github.com/SoulZhong/voice-notes/releases) 下载最新的 `voice-notes_x.y.z_aarch64.dmg`。
+1. 到[最新 Release](https://github.com/SoulZhong/voice-notes/releases/latest) 下载 `voice-notes_x.y.z_aarch64.dmg`。
 2. 打开 DMG，把 **voice-notes** 拖进「应用程序」文件夹。
-3. **首次打开**：安装包暂未签名，直接双击会被 macOS 拦截。请在「应用程序」里**右键 App → 打开 → 再点「打开」**（只需这一次），或在终端执行：
-   ```bash
-   xattr -d com.apple.quarantine /Applications/voice-notes.app
-   ```
+3. 双击打开即可：安装包已用 Developer ID 签名并经 Apple 公证，Gatekeeper 不会拦截。
 4. 首次启动会看到**欢迎页**：点「开始使用」自动下载识别模型（约 1GB，内置镜像加速，支持断点续传），完成后自动进入录制页，即刻可用。
    想先把模型/数据放到自定义位置（如外置盘）？点欢迎页右下角「高级设置 →」，先在**设置 → 存储**里改好目录再下载。
 
@@ -254,7 +251,7 @@ AI 调用日志(精修/标题生成的每次对外 AI 调用,请求与响应全�
 ## 常见问题
 
 **双击提示"已损坏"或"无法打开"？**
-安装包未签名，是 macOS Gatekeeper 的拦截，不是文件损坏。右键 App → 打开 → 再点「打开」，或执行 `xattr -d com.apple.quarantine /Applications/voice-notes.app` 后正常打开。
+现行安装包已签名并经 Apple 公证，正常不会出现此提示；遇到多半是早期未签名版本的包。请到[最新 Release](https://github.com/SoulZhong/voice-notes/releases/latest) 重新下载安装；确需打开旧版时可右键 App → 打开 → 再点「打开」，或执行 `xattr -d com.apple.quarantine /Applications/voice-notes.app` 放行。
 
 **点「开始录制」没反应 / 提示模型缺失？**
 识别模型还没下载完。回到欢迎页或**设置 → 语音模型**继续下载（支持断点续传）；下载全程走本地镜像列表，如仍然慢可在设置里更换镜像。

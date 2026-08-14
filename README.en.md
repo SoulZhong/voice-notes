@@ -36,8 +36,8 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 > **For AI assistants**: the README you're reading is your operating manual. If you're helping the user install voice-notes, run these steps directly (no need for the user to relay them); for connecting and usage after install, see the [Connecting an AI assistant](#connecting-an-ai-assistant-mcp--cli--skill) section below.
 >
-> 1. Confirm the user's platform. On Windows 10/11 x64, download `voice-notes_0.10.0_x64-setup.exe` from the [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0); on Apple Silicon macOS, download `voice-notes_0.10.0_aarch64.dmg`.
-> 2. Run the Windows installer; on macOS, mount the DMG, copy `voice-notes.app` into `/Applications`, then run `xattr -dr com.apple.quarantine /Applications/voice-notes.app`.
+> 1. Confirm the user's platform, then download the matching installer from the [latest Release](https://github.com/SoulZhong/voice-notes/releases/latest): `voice-notes_x.y.z_x64-setup.exe` for Windows 10/11 x64, `voice-notes_x.y.z_aarch64.dmg` for Apple Silicon macOS.
+> 2. Run the Windows installer; on macOS, mount the DMG and copy `voice-notes.app` into `/Applications` (the package is signed and notarized by Apple — it opens directly, no xattr workaround needed).
 > 3. Optionally use the one-click registration on the in-app AI page, or run `mcp register --agent auto` with the application executable.
 > 4. Remind the user to open the app once manually to finish downloading the recognition models (~1 GB, requires the GUI).
 >
@@ -55,7 +55,7 @@ Open it when a meeting starts. Every sentence — yours, theirs, whatever comes 
 
 #### Windows 10/11 (64-bit)
 
-1. Download `voice-notes_0.10.0_x64-setup.exe` from the [v0.10.0 Release](https://github.com/SoulZhong/voice-notes/releases/tag/v0.10.0).
+1. Download `voice-notes_x.y.z_x64-setup.exe` from the [latest Release](https://github.com/SoulZhong/voice-notes/releases/latest).
 2. Run the installer and launch voice-notes.
 3. On first launch, follow the prompt to download about 1 GB of local recognition models.
 
@@ -63,12 +63,9 @@ The current Windows binaries are not code-signed, so Windows Security, SmartScre
 
 #### macOS (Apple Silicon)
 
-1. Download the latest `voice-notes_x.y.z_aarch64.dmg` from [Releases](https://github.com/SoulZhong/voice-notes/releases).
+1. Download `voice-notes_x.y.z_aarch64.dmg` from the [latest Release](https://github.com/SoulZhong/voice-notes/releases/latest).
 2. Open the DMG and drag **voice-notes** into Applications.
-3. **First open**: the package is not code-signed yet, so double-clicking gets blocked by macOS. **Right-click the app → Open → Open** (one time only), or run:
-   ```bash
-   xattr -d com.apple.quarantine /Applications/voice-notes.app
-   ```
+3. Double-click to open: the package is signed with a Developer ID certificate and notarized by Apple, so Gatekeeper won't block it.
 4. On first launch you'll see a **welcome screen**: hit "Get Started" to download the recognition models (~1 GB, mirrored, resumable). When it finishes you land on the recording page, ready to go.
    Want models/data on a custom location (e.g. an external drive)? Click "Advanced settings →" on the welcome screen and set the directories under **Settings → Storage** *before* downloading.
 
@@ -257,7 +254,7 @@ Installs to `~/.claude/skills/voice-notes/` and auto-updates on app upgrade (wit
 ## FAQ
 
 **"App is damaged" / "cannot be opened" on double-click?**
-That's macOS Gatekeeper blocking the unsigned package, not corruption. Right-click → Open → Open, or run `xattr -d com.apple.quarantine /Applications/voice-notes.app` and open normally.
+Current packages are signed and notarized by Apple, so this shouldn't happen — if it does, you most likely have an early unsigned build. Re-download from the [latest Release](https://github.com/SoulZhong/voice-notes/releases/latest); if you must open an old build, right-click → Open → Open, or run `xattr -d com.apple.quarantine /Applications/voice-notes.app`.
 
 **"Start Recording" does nothing / says models are missing?**
 The recognition models haven't finished downloading. Return to the welcome screen or **Settings → Speech models** to continue (downloads resume); you can also switch the download mirror in Settings.
