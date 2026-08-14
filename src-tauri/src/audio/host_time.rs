@@ -46,6 +46,18 @@ pub fn mach_ticks_to_ns(ticks: u64) -> u64 {
             (1, 1)
         }
     });
+    ticks_to_ns_with(ticks, numer, denom)
+}
+
+/// mach 时基换算的纯算术(抽出来是为了能直测非 1:1 时基:Apple Silicon 的
+/// timebase 恰为 1:1,在本机跑 `mach_ticks_to_ns` 等于没验算术,而 Intel Mac
+/// 上是 125/3 之类的真分数——算错就是整条 hw 时间轴错。issue #100 条 7)。
+/// u128 中间量防溢出;denom==0 是非法时基,按 1:1 退化(与查询失败同待遇)。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn ticks_to_ns_with(ticks: u64, numer: u64, denom: u64) -> u64 {
+    if denom == 0 {
+        return ticks;
+    }
     (ticks as u128 * numer as u128 / denom as u128) as u64
 }
 
@@ -71,6 +83,22 @@ mod tests {
         let a = now_ns();
         let b = now_ns();
         assert!(b >= a, "host 时钟必须单调不减: {a} -> {b}");
+    }
+
+    /// issue #100 条 7:mach 时基换算的非 1:1 分支从未被直测过。Apple Silicon 的
+    /// timebase 恰是 1:1,`mach_ticks_to_ns` 在本机跑等于没验算术;Intel Mac 上
+    /// 是 125/3 之类的真分数,算错就是整条 hw 时间轴错。把算术抽成纯函数直测,
+    /// 不必等 Intel 机器冒烟。
+    #[test]
+    fn mach_ticks_scale_handles_non_unity_timebase() {
+        // 1:1(Apple Silicon):原样透传
+        assert_eq!(ticks_to_ns_with(1_000, 1, 1), 1_000);
+        // 125/3(Intel Mac 常见):24 ticks = 1000ns
+        assert_eq!(ticks_to_ns_with(24, 125, 3), 1_000);
+        // 大数不得溢出:u64 上限量级的 ticks 走 u128 中间量
+        assert_eq!(ticks_to_ns_with(u64::MAX / 125, 125, 1), (u64::MAX / 125) * 125);
+        // 分母为 0 是非法时基,按 1:1 退化而不是除零 panic
+        assert_eq!(ticks_to_ns_with(1_000, 125, 0), 1_000);
     }
 
     #[test]
