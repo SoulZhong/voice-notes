@@ -1,13 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { i18n, localeVariants, resolveLocale, shards, t } from "./index.svelte";
 
 describe("i18n 核心", () => {
-  it("resolveLocale:显式 zh/en 原样,system 按系统语言,node 无 navigator 回落 en", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // 系统语言必须由用例自己钉死,不能依赖运行环境:Node 21 起提供了全局
+  // navigator(本机 navigator.language = "zh-CN"),旧用例"node 环境无
+  // navigator"的假设随 Node 升级失效,于是在开发机上必挂。
+  it("resolveLocale:显式 zh/en 原样,system 按系统语言解析", () => {
     expect(resolveLocale("zh")).toBe("zh");
     expect(resolveLocale("en")).toBe("en");
-    // node 环境无 navigator → 非中文系统语义,回落 en
+
+    vi.stubGlobal("navigator", { language: "zh-CN" });
+    expect(resolveLocale("system")).toBe("zh");
+    expect(resolveLocale("")).toBe("zh");
+
+    vi.stubGlobal("navigator", { language: "en-US" });
     expect(resolveLocale("system")).toBe("en");
-    expect(resolveLocale("")).toBe("en");
+
+    // 语言缺失(navigator 存在但 language 为空)→ 回落 en
+    vi.stubGlobal("navigator", { language: "" });
+    expect(resolveLocale("system")).toBe("en");
   });
 
   it("t:静态文案按 locale 取值,切换即生效", () => {
