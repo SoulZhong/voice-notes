@@ -13,9 +13,31 @@ struct Agg {
     // 被过滤掉的场次(as_f64() 对 null 返回 None)。这个计数让"多少场被过滤掉了"
     // 这件事本身可见,而不是悄悄少算。
     with_inter_track: usize,
+    /// 按设备名归类(issue #100 条 6):内置麦、蓝牙 HFP、USB 声卡的漂移特性天差
+    /// 地别,混在一起的分布看不出"最差设备组合"。设备名缺失(旧报告/非 macOS/
+    /// 查询失败)的场次归到 "(未知设备)"。
+    by_device: std::collections::BTreeMap<String, DeviceAgg>,
 }
 
+#[derive(Default)]
+struct DeviceAgg {
+    sessions: usize,
+    reanchors: u64,
+    degraded: usize,
+}
+
+const UNKNOWN_DEVICE: &str = "(未知设备)";
+
+/// 一份报告(顶层 = 最新场次)可能带 history(issue #100 条 4:续录/多次停录的
+/// 旧场次)。逐场次全部计入,否则续录笔记只有最后一场进统计。
 fn ingest(agg: &mut Agg, v: &serde_json::Value, origin: &str) {
+    for old in v["history"].as_array().into_iter().flatten() {
+        ingest_one(agg, old, origin);
+    }
+    ingest_one(agg, v, origin);
+}
+
+fn ingest_one(agg: &mut Agg, v: &serde_json::Value, origin: &str) {
     agg.sessions += 1;
     if v["sources"].as_object().map_or(false, |m| m.values().any(|s| s["quality"] == "degraded")) {
         agg.degraded += 1;
@@ -27,8 +49,23 @@ fn ingest(agg: &mut Agg, v: &serde_json::Value, origin: &str) {
         agg.rel_ppm.push(p.abs());
         agg.with_inter_track += 1;
     }
+    // 设备维度取 mic 的设备名(system 走 SCK,不绑具体输入设备)。
+    let device = v["sources"]["mic"]["device_name"]
+        .as_str()
+        .unwrap_or(UNKNOWN_DEVICE)
+        .to_string();
+    let degraded_here = v["sources"]
+        .as_object()
+        .map_or(false, |m| m.values().any(|s| s["quality"] == "degraded"));
+    let d = agg.by_device.entry(device).or_default();
+    d.sessions += 1;
+    if degraded_here {
+        d.degraded += 1;
+    }
     for s in v["sources"].as_object().into_iter().flat_map(|m| m.values()) {
-        agg.reanchors += s["reanchors"].as_u64().unwrap_or(0);
+        let n = s["reanchors"].as_u64().unwrap_or(0);
+        agg.reanchors += n;
+        d.reanchors += n;
     }
     for a in v["anomalies"].as_array().into_iter().flatten() {
         agg.anomalies.push(format!("{origin}: {a}"));
@@ -62,6 +99,35 @@ mod tests {
         assert_eq!(percentile(&agg.rel_ppm, 0.5), Some(50.0));
         assert_eq!(percentile(&agg.rel_ppm, 1.0), Some(120.0));
         assert_eq!(agg.with_inter_track, 3, "三条都带 inter_track,应全计入");
+    }
+
+    /// issue #100 条 6:按设备归类。同一台机器上内置麦/蓝牙 HFP/USB 声卡的漂移
+    /// 特性完全不同,混在一起的分布没有意义——「最差设备组合」得能被看出来。
+    /// 另:条 4 起 drift_report 会把旧场次收进 history,续录笔记的每一场都要计入,
+    /// 否则统计仍然只看得到最后一场。
+    #[test]
+    fn aggregates_per_device_and_walks_history() {
+        let mut agg = Agg::default();
+        let v = serde_json::json!({
+            "schema": 1,
+            "sources": {"mic": {"quality": "hw", "reanchors": 2, "device_name": "MacBook Pro麦克风"}},
+            "inter_track": serde_json::Value::Null,
+            "anomalies": [],
+            "history": [
+                {"schema": 1, "anomalies": [],
+                 "sources": {"mic": {"quality": "degraded", "reanchors": 7, "device_name": "OpenRun Pro by Shokz"}}},
+                {"schema": 1, "anomalies": [],
+                 "sources": {"mic": {"quality": "hw", "reanchors": 1, "device_name": "MacBook Pro麦克风"}}}
+            ]
+        });
+        ingest(&mut agg, &v, "note");
+        assert_eq!(agg.sessions, 3, "history 里的两场也要计入");
+        assert_eq!(agg.reanchors, 10);
+        assert_eq!(agg.degraded, 1, "只有蓝牙那场降级");
+        let built_in = agg.by_device.get("MacBook Pro麦克风").expect("内置麦应有条目");
+        assert_eq!((built_in.sessions, built_in.reanchors, built_in.degraded), (2, 3, 0));
+        let bt = agg.by_device.get("OpenRun Pro by Shokz").expect("蓝牙应有条目");
+        assert_eq!((bt.sessions, bt.reanchors, bt.degraded), (1, 7, 1));
     }
 
     /// Codex review Fix 3(P2)配套:inter_track 为 null 的场次(单源,或双源未同时
@@ -113,5 +179,21 @@ fn main() {
     println!("|轨间漂移| ppm  P50={:?} P95={:?} max={:?}",
         percentile(&agg.rel_ppm, 0.5), percentile(&agg.rel_ppm, 0.95), percentile(&agg.rel_ppm, 1.0));
     println!("重锚总数: {}", agg.reanchors);
+    // 「最差设备组合」:按每场平均重锚数降序,一眼看出哪套设备最不稳。
+    let mut devs: Vec<_> = agg.by_device.iter().collect();
+    devs.sort_by(|a, b| {
+        let per = |d: &DeviceAgg| d.reanchors as f64 / d.sessions.max(1) as f64;
+        per(b.1).partial_cmp(&per(a.1)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!("按设备(重锚/场 降序):");
+    for (name, d) in devs {
+        println!(
+            "  {name}: {} 场,重锚 {}(均 {:.1}/场),降级 {} 场",
+            d.sessions,
+            d.reanchors,
+            d.reanchors as f64 / d.sessions.max(1) as f64,
+            d.degraded
+        );
+    }
     for a in agg.anomalies.iter().take(20) { println!("异常 {a}"); }
 }

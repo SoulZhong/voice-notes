@@ -9,11 +9,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// 每 10s 记一个 (自首帧秒, ppm) 采样点,供报告画趋势线。
+///
+/// 桶号非单调(issue #100 条 7):t_s 取自帧的硬件时间戳,设备缓冲回吐、时戳跳变
+/// 都可能让相邻两帧的 t_s 回退,于是桶号会倒退,同一个桶号也可能被跨越两次。
+/// `last_series_bucket` 只做"同桶去重",不保证序列点严格等距、严格递增——读
+/// rate_ppm_series 时要按点自带的 t_s 定位,不能拿下标当时间。
 const SERIES_BUCKET_SECS: f64 = 10.0;
 /// 报告阈值:|rate_ppm| 超过此值判异常(设计文档第四节)。
 const ANOMALY_RATE_PPM: f64 = 500.0;
 /// 报告阈值:单源重锚次数超过此值判异常。
 const ANOMALY_REANCHORS: u32 = 3;
+/// 重锚风暴判据(issue #100 条 1):每分钟重锚次数的峰值超过此值 → 声明率不可信。
+/// 用密度而非总数:长会话自然会攒出几次零星重锚(补零段结束、暂停恢复),而
+/// 风暴是短时间内连打——冒烟③单场 4420 次,2026-08-14 两场故障录音是 12.9 与
+/// 31.9 次/分钟,健康会话则是 0。取 10 次/分钟,三个真实案例全覆盖且远离健康值。
+const ANOMALY_REANCHOR_BURST_PER_MIN: u32 = 10;
+/// 风暴密度的统计窗(秒)。
+const REANCHOR_BURST_WINDOW_SECS: f64 = 60.0;
+/// drift_report 保留的历史场次上限(issue #100 条 4)。续录一场笔记可能停录几十次,
+/// 不设上限会让报告无限膨胀;保留最近若干场足够回溯。
+const HISTORY_MAX: usize = 20;
 /// mixed 时间轴换算:1ppm 相对速率偏差,一小时累计的错位(毫秒)。
 /// 3600s × 1e-6 × 1000ms/s = 3.6ms/h/ppm。
 const MS_PER_HOUR_PER_PPM: f64 = 3.6;
@@ -27,6 +42,10 @@ pub struct DriftSourceReport {
     pub converged: bool,
     pub converge_secs: Option<f64>,
     pub reanchors: u32,
+    /// 任一 60s 窗口内的重锚次数峰值(issue #100 条 1)。风暴看密度不看总数:
+    /// 长会话零星重锚是正常的,短时间连打才说明声明率不可信。
+    #[serde(default)]
+    pub reanchor_burst_per_min: u32,
     /// (自首帧秒, ppm),每 10s 一点。
     pub rate_ppm_series: Vec<(f64, f64)>,
     pub events: Vec<DriftEvent>,
@@ -34,6 +53,11 @@ pub struct DriftSourceReport {
     /// nominal_hz 的偏差(ppm),与 DLL 估计的 `rate_ppm` 互为旁证。None = 尚未
     /// 收到过一次成功查询(非 macOS/查询失败/nominal 未锁定)。
     pub actual_rate_ppm: Option<f64>,
+    /// 录音设备名(issue #100 条 6):按设备归类才能看出"最差设备组合"——
+    /// 同一台机器上内置麦、蓝牙 HFP、USB 声卡的漂移特性完全不同,混在一起统计
+    /// 出来的分布没有意义。会话起点取一次,查询失败为 None(纯诊断,不影响行为)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -66,6 +90,18 @@ struct Inner {
     /// 最近一次 `set_actual_rate_hz` 换算出的 ppm(Task 7 旁证)。None = 尚未成功
     /// 查询过一次。
     actual_rate_ppm: Option<f64>,
+    /// 重锚发生时刻(自首帧秒),用于算密度峰值。只留最近 REANCHOR_BURST_WINDOW_SECS
+    /// 窗口内的,不随会话长度增长。
+    reanchor_times: std::collections::VecDeque<f64>,
+    /// 任一 60s 窗口内的重锚次数峰值。
+    reanchor_burst_peak: u32,
+    /// 会话起点(单调墙钟)。重锚密度以真实时间为分母,不能用可回退的帧时间戳。
+    session_start: std::time::Instant,
+    /// 录音设备名(首次成功解析时取一次)。
+    device_name: Option<String>,
+    /// 设备归属已作废(会话中途换过设备):此后拒收实测率,报告里 device_name/
+    /// actual_rate_ppm 均为 None。
+    device_evidence_void: bool,
 }
 
 /// 每源时钟漂移监视器。内部 `Mutex<Inner>`:frame_tap 线程串行调用 `feed`,
@@ -96,21 +132,48 @@ impl DriftMonitor {
                 converge_secs: None,
                 reanchor_carry: 0,
                 actual_rate_ppm: None,
+                device_name: None,
+                device_evidence_void: false,
+                reanchor_times: std::collections::VecDeque::new(),
+                reanchor_burst_peak: 0,
+                session_start: std::time::Instant::now(),
             }),
         }
     }
 
+    /// 录音设备名(issue #100 条 6),由装配层在首次成功解析设备时给一次。
+    /// 归属一旦作废就不再接受新名字——报告里只留一个孤零零的设备名而没有旁证,
+    /// 反而会让读者以为这就是本场录音的设备。
+    pub fn set_device_name(&self, name: String) {
+        let mut g = self.inner.lock().unwrap();
+        if g.device_evidence_void {
+            return;
+        }
+        g.device_name = Some(name);
+    }
+
+    /// 设备中途变了(默认输入被改 / 断连自愈重开了另一只麦):此前测得的实测率
+    /// 与设备名都归属不明,一并作废并锁死,不再接受新值。宁可报 None,也不发布
+    /// 一个张冠李戴的旁证(Codex review P1)。
+    pub fn invalidate_device_evidence(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.actual_rate_ppm = None;
+        g.device_name = None;
+        g.device_evidence_void = true;
+    }
+
     /// 系统实测采样率旁证(Task 7):`hz` 来自
-    /// `audio::actual_rate::default_input_actual_hz()`(CoreAudio 查询默认输入设备的
-    /// `kAudioDevicePropertyActualSampleRate`),按当前 nominal_hz 换算成 ppm 存入报告,
-    /// 与 DLL 频率估计互为旁证。
+    /// `audio::actual_rate::actual_hz_of(dev)`(CoreAudio 查询**本场录音所绑定设备**的
+    /// `kAudioDevicePropertyActualSampleRate`;设备在会话起点解析一次并固定,
+    /// 见 issue #100 条 2),按当前 nominal_hz 换算成 ppm 存入报告,与 DLL 频率估计
+    /// 互为旁证。
     ///
     /// 除零防御:nominal_hz==0 是 `DriftMonitor::new(0)` 的惰性初始化未锁定态(首帧尚
     /// 未到达,见 `feed` 顶部注释)——此时没有基准可换算,静默跳过不存值,等首帧锁定
     /// 标称率后,下一次轮询自然回到有效路径。
     pub fn set_actual_rate_hz(&self, hz: f64) {
         let mut g = self.inner.lock().unwrap();
-        if g.nominal_hz == 0 {
+        if g.nominal_hz == 0 || g.device_evidence_void {
             return;
         }
         g.actual_rate_ppm = Some((hz / g.nominal_hz as f64 - 1.0) * 1e6);
@@ -190,9 +253,32 @@ impl DriftMonitor {
     /// 补零段结束/暂停恢复 → full=false(dll 保留频率状态,只清相位)。
     /// 记一条事件;`t_s` 取最近一次 `feed` 换算的自首帧秒,没有 feed 过则记 0.0。
     pub fn mark_reanchor(&self, why: &'static str, full: bool) {
+        // 密度按**真实时间**算,故用会话单调墙钟,不用帧的 t_s:`feed` 明确容忍
+        // 硬件时间戳回退(设备吐旧缓冲/时戳跳变),拿它当基准时滑窗会乱序,前端
+        // 淘汰再也推不动,稀疏重锚被累积成假风暴(Codex review P1)。墙钟单调,
+        // 且"每分钟多少次"本就该以真实时间为分母。
+        let now_s = self.inner.lock().unwrap().session_start.elapsed().as_secs_f64();
+        self.mark_reanchor_at(why, full, now_s);
+    }
+
+    /// 时钟可注入版:生产走 `mark_reanchor`(会话单调墙钟),测试直接给时刻——
+    /// 否则"每 90 秒一次不算风暴"这类用例只能靠真睡 90 秒来表达。
+    pub(crate) fn mark_reanchor_at(&self, why: &'static str, full: bool, now_s: f64) {
         let mut g = self.inner.lock().unwrap();
         g.dll.reanchor(!full);
         let t_s = g.last_t_s;
+        // 风暴密度(issue #100 条 1):滑窗内计数,记峰值。窗口只留 60s 内的时刻,
+        // 内存不随会话长度增长;now_s 单调 ⇒ 队列有序 ⇒ 前端淘汰必定推进。
+        g.reanchor_times.push_back(now_s);
+        while g
+            .reanchor_times
+            .front()
+            .is_some_and(|&t| now_s - t > REANCHOR_BURST_WINDOW_SECS)
+        {
+            g.reanchor_times.pop_front();
+        }
+        let burst = g.reanchor_times.len() as u32;
+        g.reanchor_burst_peak = g.reanchor_burst_peak.max(burst);
         g.events.push(DriftEvent {
             t_s,
             kind: if full {
@@ -219,9 +305,11 @@ impl DriftMonitor {
             converged: est.converged,
             converge_secs: g.converge_secs,
             reanchors: g.reanchor_carry + est.reanchors,
+            reanchor_burst_per_min: g.reanchor_burst_peak,
             rate_ppm_series: g.series.clone(),
             events: g.events.clone(),
             actual_rate_ppm: g.actual_rate_ppm,
+            device_name: g.device_name.clone(),
         }
     }
 }
@@ -256,6 +344,21 @@ pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Valu
                 "source": key,
                 "kind": "reanchors_high",
                 "value": report.reanchors,
+            }));
+        }
+        // 重锚风暴 = 声明率不可信(issue #100 条 1)。CoreAudio 在默认设备下透明换
+        // 硬件时声明率不变、流不重启,nominal_relock/capture_restart 都不触发,
+        // 只有重锚密度会飙——这条把间接线索升格为直说的诊断。
+        //
+        // 刻意**不**联动"提前触发 rate_fix":issue 原文提出过这个设想,但 PR #103
+        // 查明,那两场风暴的重锚全部来自 rate_fix 本身,而 rate_fix 是被"用到达间隔
+        // 测采样率"这个错误测量骗出来的(已改用硬件时间戳根治,同机同麦复测 0 次)。
+        // 把执行器调得更激进,等于把刚修好的音调失真重新放出来。
+        if report.reanchor_burst_per_min >= ANOMALY_REANCHOR_BURST_PER_MIN {
+            anomalies.push(serde_json::json!({
+                "source": key,
+                "kind": "declared_rate_untrusted",
+                "value": report.reanchor_burst_per_min,
             }));
         }
         sources_obj.insert(key.to_string(), serde_json::to_value(report).unwrap());
@@ -302,11 +405,33 @@ pub fn persist_report(
 ) -> std::io::Result<Vec<serde_json::Value>> {
     let reports: Vec<(Source, DriftSourceReport)> =
         sources.iter().map(|(src, m)| (*src, m.snapshot())).collect();
-    let report = build_report(&reports);
+    let mut report = build_report(&reports);
     let anomalies = report["anomalies"].as_array().cloned().unwrap_or_default();
+    let path = note_dir.join("drift_report.json");
+    // 续录/多次停录不再丢证据(issue #100 条 4):旧报告收进 history,顶层仍是本场
+    // ——drift_stats 等既有读者的口径完全不变,不必跟着改。history 内的条目自身
+    // 先剥掉 history 再存,否则每停录一次就把整棵历史再套一层,指数膨胀。
+    let mut history: Vec<serde_json::Value> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(mut prev) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(old) = prev.get_mut("history").and_then(|h| h.as_array_mut()) {
+                history.append(old);
+            }
+            if let Some(obj) = prev.as_object_mut() {
+                obj.remove("history");
+            }
+            history.push(prev);
+        }
+    }
+    if history.len() > HISTORY_MAX {
+        history.drain(..history.len() - HISTORY_MAX);
+    }
+    if !history.is_empty() {
+        report["history"] = serde_json::Value::Array(history);
+    }
     let json = serde_json::to_string_pretty(&report)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(note_dir.join("drift_report.json"), json)?;
+    std::fs::write(path, json)?;
     Ok(anomalies)
 }
 
@@ -424,13 +549,16 @@ mod tests {
             converged: true,
             converge_secs: Some(14.0),
             reanchors: 0,
+            reanchor_burst_per_min: 0,
             rate_ppm_series: vec![],
             events: vec![],
             actual_rate_ppm: None,
+            device_name: None,
         };
         let sys = DriftSourceReport {
             rate_ppm: -600.0,
             reanchors: 5,
+            reanchor_burst_per_min: 0,
             quality: "degraded".into(),
             ..mic.clone()
         };
@@ -466,9 +594,11 @@ mod tests {
             converged: true,
             converge_secs: Some(14.0),
             reanchors: 0,
+            reanchor_burst_per_min: 0,
             rate_ppm_series: vec![],
             events: vec![],
             actual_rate_ppm: None,
+            device_name: None,
         };
         let sys_not_converged = DriftSourceReport {
             rate_ppm: -600.0,
@@ -513,6 +643,133 @@ mod tests {
         m.set_actual_rate_hz(48_000.48); // +10ppm
         let r = m.snapshot();
         assert!((r.actual_rate_ppm.unwrap() - 10.0).abs() < 0.01);
+    }
+
+    /// issue #100 条 1:重锚风暴升格为显式诊断。CoreAudio 在默认设备下透明换硬件
+    /// 时声明率不变、流不重启,nominal_relock/capture_restart 都不触发,只能靠
+    /// DLL 重锚风暴间接暴露(冒烟③单场 4420 次)。总数阈值不够用——长会话自然会
+    /// 攒出几次;真正的判据是**密度**(每分钟多少次)。
+    #[test]
+    fn reanchor_storm_is_reported_as_declared_rate_untrusted() {
+        let m = DriftMonitor::new(48_000);
+        // 推进到 t≈30s,然后在 1 秒内连打 20 次重锚 = 远超每分钟阈值。
+        for _ in 0..3000 {
+            m.feed(&frame(480, 48_000, Some(0)));
+        }
+        for i in 0..20 {
+            m.mark_reanchor_at("rate_fix", false, i as f64 * 0.05); // 1 秒内连打 20 次
+        }
+        let r = m.snapshot();
+        assert!(r.reanchor_burst_per_min >= 20, "峰值密度应记满: {}", r.reanchor_burst_per_min);
+        let v = build_report(&[(Source::Mic, r)]);
+        let kinds: Vec<&str> = v["anomalies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"declared_rate_untrusted"), "应升格为显式诊断: {kinds:?}");
+    }
+
+    /// 零星重锚(正常会话:补零段结束、暂停恢复)不得被误报成风暴。
+    /// 每次重锚之间真推进 90 秒——早先这里只把时间戳从 0 加到 4(纳秒),
+    /// 等于根本没推进时间,测试是靠"总数不够"蒙混过关的(Codex review P1 指出)。
+    #[test]
+    fn occasional_reanchors_are_not_a_storm() {
+        let m = DriftMonitor::new(48_000);
+        for i in 0..20u64 {
+            m.feed(&frame(480, 48_000, Some(i * 90_000_000_000)));
+            m.mark_reanchor_at("gap_end", false, i as f64 * 90.0); // 真实时间每步 +90s
+        }
+        let r = m.snapshot();
+        assert_eq!(r.reanchors, 20, "总数确实攒到了 20(超过 reanchors_high 阈值)");
+        assert!(
+            r.reanchor_burst_per_min <= 1,
+            "每 90 秒一次 = 密度 1/分钟,不是风暴: {}",
+            r.reanchor_burst_per_min
+        );
+        let v = build_report(&[(Source::Mic, r)]);
+        let kinds: Vec<&str> = v["anomalies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["kind"].as_str().unwrap())
+            .collect();
+        assert!(!kinds.contains(&"declared_rate_untrusted"), "稀疏重锚不是风暴: {kinds:?}");
+    }
+
+    /// Codex review P1:`feed` 明确容忍硬件时间戳回退(设备缓冲回吐/时戳跳变),
+    /// 于是 t_s 会倒退。滑窗若直接用"当前 t_s − 队首"淘汰,队首一旦位于"未来"
+    /// 差值就恒为负,旧重锚永远淘汰不掉,稀疏重锚累积成假风暴。
+    #[test]
+    fn burst_window_survives_timestamp_regression() {
+        let m = DriftMonitor::new(48_000);
+        // 真实时间每 70 秒一次(稀疏),但帧的硬件时间戳来回跳:先递增再整体回退。
+        // 密度以真实时间为准,不该被时戳回退带偏。
+        for i in 0..10u64 {
+            m.feed(&frame(480, 48_000, Some(i * 60_000_000_000)));
+            m.mark_reanchor_at("gap_end", false, i as f64 * 70.0);
+        }
+        for i in 0..10u64 {
+            m.feed(&frame(480, 48_000, Some(i * 60_000_000_000))); // 时戳回退
+            m.mark_reanchor_at("gap_end", false, 700.0 + i as f64 * 70.0);
+        }
+        let r = m.snapshot();
+        assert!(
+            r.reanchor_burst_per_min < ANOMALY_REANCHOR_BURST_PER_MIN,
+            "时戳回退不得把稀疏重锚累积成假风暴: {}",
+            r.reanchor_burst_per_min
+        );
+    }
+
+    /// Codex review P1:会话中途换设备(用户改默认输入,或断连自愈重开了另一只麦)
+    /// 后,此前测得的实测率属于另一只设备。cpal 不暴露流绑定的 AudioDeviceID,
+    /// 归属无法确定时就不发布——作废并锁死,而不是发一个张冠李戴的数字。
+    #[test]
+    fn device_change_voids_evidence_permanently() {
+        let m = DriftMonitor::new(48_000);
+        m.set_device_name("MacBook Pro麦克风".into());
+        m.set_actual_rate_hz(48_000.48);
+        assert!(m.snapshot().actual_rate_ppm.is_some(), "换设备前正常发布");
+
+        m.invalidate_device_evidence();
+        let r = m.snapshot();
+        assert_eq!(r.actual_rate_ppm, None, "旁证作废");
+        assert_eq!(r.device_name, None, "设备名一并作废");
+
+        // 作废后即便再来新值也不收:归属已经不明,发什么都是猜的。
+        m.set_actual_rate_hz(48_000.48);
+        m.set_device_name("OpenRun Pro by Shokz".into());
+        let r = m.snapshot();
+        assert_eq!(r.actual_rate_ppm, None, "作废是锁死的");
+        assert_eq!(r.device_name, None, "设备名同样不再接受——只留名字没有旁证更误导");
+    }
+
+    /// issue #100 条 4:续录/多次停录时 drift_report 被覆盖写,只剩最后一场,
+    /// 前面场次的证据全丢。改为把旧报告收进 history(顶层仍是最新场次,
+    /// drift_stats 等既有读者零改动)。
+    #[test]
+    fn persist_report_keeps_previous_sessions_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |untimed: bool| {
+            let m = std::sync::Arc::new(DriftMonitor::new(48_000));
+            m.feed(&frame(480, 48_000, if untimed { None } else { Some(0) }));
+            m
+        };
+        persist_report(dir.path(), &[(Source::Mic, mk(true))]).unwrap();
+        persist_report(dir.path(), &[(Source::Mic, mk(false))]).unwrap();
+        persist_report(dir.path(), &[(Source::Mic, mk(false))]).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("drift_report.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // 顶层 = 最新一场(既有读者的口径不变)
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["sources"]["mic"]["quality"], "hw");
+        // 历史按时间顺序保留前两场,且 history 自身不嵌套 history(不指数膨胀)
+        let hist = v["history"].as_array().expect("应有 history");
+        assert_eq!(hist.len(), 2, "两场旧报告都要在");
+        assert_eq!(hist[0]["sources"]["mic"]["quality"], "degraded", "最早那场在最前");
+        assert!(hist[0].get("history").is_none(), "history 内不得再嵌套 history");
     }
 
     #[test]

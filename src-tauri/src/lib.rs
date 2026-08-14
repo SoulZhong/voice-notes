@@ -1367,20 +1367,58 @@ fn spawn_session(
         // 失败(非 macOS/无权限/设备异常)一律返回 None,静默跳过,不影响录音。
         // stop_tx 存进 ActiveSession,随会话拆除 drop 触发线程退出(见该字段注释)。
         let (actual_rate_stop_tx, actual_rate_stop_rx) = crossbeam_channel::bounded::<()>(0);
+        // 非 macOS 上 actual_hz_of 恒为 None,起这条线程等于让每场录音白白空转
+        // 一个 10s 轮询到底(issue #100 条 7);整段 cfg 门控掉。
+        #[cfg(target_os = "macos")]
         {
             let mic_drift = mic_drift.clone();
-            std::thread::spawn(move || loop {
-                match actual_rate_stop_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                    // 超时(10s 到)= 轮询一次;stop 发送端已断开 = 会话已结束,退出。
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if let Some(hz) = audio::actual_rate::default_input_actual_hz() {
-                            mic_drift.set_actual_rate_hz(hz);
+            // 设备归属(issue #100 条 2 + Codex review P1)。旁证只有在能确定"测的
+            // 就是本场录音那只设备"时才有意义,而 cpal 不暴露流所绑定的
+            // AudioDeviceID,我们只能查系统默认输入。两种误判都真实存在:
+            //   · 每轮重解析 → 用户中途改默认输入,就测到了与本场无关的设备;
+            //   · 起点解析一次后钉死 → ResilientCapture 断连自愈会重开默认设备,
+            //     可能换成另一只物理麦,而我们仍指着旧的。
+            // 既然无法确定归属,就不猜:逐轮解析,一旦设备中途变过,直接把旁证与
+            // 设备名作废(报告里为 None),而不是发布一个可能张冠李戴的数字。
+            // 一期铁律是只测不动数据——测不准时闭嘴,比报错数强。
+            std::thread::spawn(move || {
+                let mut pinned: Option<u32> = None;
+                let mut invalidated = false;
+                loop {
+                    match actual_rate_stop_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        // 超时(10s 到)= 轮询一次;stop 发送端已断开 = 会话已结束,退出。
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            let Some(dev) = audio::actual_rate::default_input_device_id() else {
+                                continue;
+                            };
+                            match pinned {
+                                None => {
+                                    pinned = Some(dev);
+                                    if let Some(name) = audio::actual_rate::device_name(dev) {
+                                        mic_drift.set_device_name(name);
+                                    }
+                                }
+                                Some(p) if p != dev => {
+                                    // 设备换了:此前测得的旁证属于另一只设备,作废。
+                                    invalidated = true;
+                                    mic_drift.invalidate_device_evidence();
+                                }
+                                _ => {}
+                            }
+                            if invalidated {
+                                continue;
+                            }
+                            if let Some(hz) = audio::actual_rate::actual_hz_of(dev) {
+                                mic_drift.set_actual_rate_hz(hz);
+                            }
                         }
+                        _ => break,
                     }
-                    _ => break,
                 }
             });
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = &actual_rate_stop_rx;
         sources.push((Source::Mic, mic, mic_seg));
 
         #[cfg(target_os = "macos")]
