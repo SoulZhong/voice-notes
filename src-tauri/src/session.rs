@@ -712,6 +712,27 @@ where
 
         for sub in subs {
             let seg_rms = rms_of(&sub.samples);
+            // 子段要再过一遍无内容过滤:母段整体有内容、切开后某一片只剩标点,是
+            // 段内切分的常态(2026-08-15 实测:"……时间轴不跑偏。" 被切成
+            // ["时间轴不跑偏", "。"],后者照样落盘)。只在母段上拦漏掉这一类。
+            if is_no_content_final(&sub.text) {
+                eprintln!(
+                    "无内容过滤: 丢弃 {:?} 子段 span={}ms text=\"{}\"",
+                    source,
+                    sub.end_ms.saturating_sub(sub.start_ms),
+                    text_prefix20(&sub.text)
+                );
+                (self.on_partial)(source, String::new());
+                (self.on_diar)(DiarEvent::SuppressedFinal {
+                    source,
+                    text: sub.text,
+                    start_ms: sub.start_ms,
+                    end_ms: sub.end_ms,
+                    rms: Some(seg_rms),
+                    reason: "no_content".into(),
+                });
+                continue;
+            }
             match source {
                 Source::System => self.push_system_sub(sub, seg_rms),
                 Source::Mic => self.push_mic_sub(sub, seg_rms),
@@ -3085,6 +3106,82 @@ mod asr_worker_tests {
         assert!(!is_no_content_final("[识别失败]"), "占位段放行(含字母)");
         assert!(!is_no_content_final(""), "空串不归本过滤管");
         assert!(!is_no_content_final("   "), "纯空白不归本过滤管");
+    }
+
+    /// 2026-08-15 真机实测缺口:母段过了 no_content 过滤,但 `split_final` 段内切分
+    /// 出来的**子段**直接进 push_*_sub,没有再过一遍——于是"……不跑偏。"被切开后,
+    /// 那个只剩 '。' 的子段照样落盘(实测笔记 20260815-072046 第 170.3-172.3 秒)。
+    #[test]
+    fn no_content_filter_also_covers_split_sub_segments() {
+        struct ScriptRecognizer(std::collections::VecDeque<Transcript>);
+        impl Recognizer for ScriptRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(self.0.pop_front().unwrap_or_default())
+            }
+        }
+        // 前半 0.1 / 后半 0.9 的样本 → 滑窗嵌入前后不同 → split_final 检出一个变更点
+        // (与 worker_splits_mixed_segment_into_two_finals 同款手法)。
+        struct ContentEmbedder;
+        impl SpeakerEmbedder for ContentEmbedder {
+            fn embed(&mut self, s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                Ok(if mean < 0.5 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+            }
+        }
+        // 母段本身有内容(过得了母段那道过滤),但后半只有一个句号——切开后
+        // 第二个子段就是纯标点,正是实测落盘的那种垃圾。
+        struct TimedRecognizer;
+        impl Recognizer for TimedRecognizer {
+            fn recognize(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+                Ok(Transcript {
+                    text: "时间轴不跑偏。".into(),
+                    tokens: vec![
+                        "时".into(), "间".into(), "轴".into(), "不".into(),
+                        "跑".into(), "偏".into(), "。".into(),
+                    ],
+                    timestamps: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 6.0],
+                    ..Default::default()
+                })
+            }
+        }
+        let (tx, rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let mut samples = vec![0.1f32; 16000 * 4];
+        samples.extend(std::iter::repeat(0.9).take(16000 * 4)); // 后半换人
+        tx.send(FinalJob { source: Source::Mic, samples, start_ms: 0, end_ms: 8000 }).unwrap();
+        drop(tx);
+        let mut finals: Vec<String> = Vec::new();
+        let mut suppressed: Vec<(String, String)> = Vec::new();
+        run_asr_worker(
+            Box::new(TimedRecognizer),
+            Some(Box::new(ContentEmbedder)),
+            SpeakerRegistry::new(),
+            rx,
+            Duration::from_millis(0),
+            false,
+            Vec::new(),
+            |_src, text, _s, _e, _spk, _rms| finals.push(text),
+            |_, _| {},
+            |event| {
+                if let DiarEvent::SuppressedFinal { text, reason, .. } = event {
+                    suppressed.push((text, reason));
+                }
+            },
+        );
+        // 防空跑:必须真的切出过一个纯标点子段并被拦下——这条抑制记录同时证明了
+        // ①段内切分确实发生;②拦截点在子段这一层(母段"时间轴不跑偏。"有内容,
+        // 过得了母段那道过滤)。
+        assert!(
+            suppressed.iter().any(|(t, r)| r == "no_content" && t == "。"),
+            "应切出纯标点子段并被拦下,否则本用例没测到东西: {suppressed:?}"
+        );
+        assert!(
+            finals.iter().all(|t| !is_no_content_final(t)),
+            "纯标点子段不得落盘: {finals:?}"
+        );
+        assert!(
+            finals.iter().any(|t| t.contains("时间轴")),
+            "真实内容必须保留,不能连正文一起丢: {finals:?}"
+        );
     }
 
     /// 无内容段走与语言过滤同一条抑制管道(SuppressedFinal/no_content),且
