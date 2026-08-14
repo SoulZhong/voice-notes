@@ -37,6 +37,10 @@ impl FireRedRecognizer {
 }
 
 impl Recognizer for FireRedRecognizer {
+    fn engine_id(&self) -> &'static str {
+        crate::settings::ASR_FIRERED
+    }
+
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         // FireRed 无语言标签(lang 空):语言过滤走文本兜底(paraformer/whisper 同路径)。
         self.inner.transcribe(16000, samples)

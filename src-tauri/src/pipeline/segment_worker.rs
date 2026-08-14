@@ -4,9 +4,116 @@ use crate::session::{FinalJob, PartialJob};
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// 电平上报节流窗口：1600 样本 = 100ms @16kHz。
 pub const LEVEL_INTERVAL_SAMPLES: usize = 1600;
+
+/// worker 分阶段耗时账本(单线程本地,worker 退出时打一行汇总进日志)。
+/// 2026-08-14 采集链背压事故的仪表:tap 侧的 send_wait/cap_queue_hw 只能说明
+/// "worker 慢",这本账说明"慢在哪一段"(重采样/AEC/写盘入队/VAD)。不走
+/// SourceHealth 原子:纯本地累加零开销,也免去把 health 穿透 start_session
+/// 十几个调用点的签名churn;取证通道与本次排查一致——stderr.log。
+pub(crate) struct StageClock {
+    pub frames: u64,
+    pub resample_us: u64,
+    /// 电平表:RMS 遍历 + on_level 回调(后者做 Tauri 事件发送,是真能阻塞
+    /// worker 的 IPC)。必须单列——落在 resample 与 aec 之间的这段若不入账,
+    /// 日志会显示各阶段都很快却解释不了 tap 侧的背压(Codex review P2)。
+    pub level_us: u64,
+    pub aec_us: u64,
+    pub sink_us: u64,
+    pub vad_us: u64,
+    /// 单帧四阶段之和的最大值:偶发长停顿(如 AEC 内部重建/写盘毛刺)靠它现形,
+    /// 均摊值会把它抹平。
+    pub frame_max_us: u64,
+    /// 静音归因探针(2026-08-14):两场故障录音的 mic 轨里有 118-158 秒数字静音,
+    /// 而 frame_tap 只补了 3.4 秒——静音是下游造的,但补零、AAC 压缩、离线清洗、
+    /// 回放门控、重采样器重建逐一排除后仍未定位。AEC 前后各数一次近零样本,
+    /// 差值直接指认 AEC 是不是那个制造者,下次复现即可一锤定音。
+    pub pre_aec_zeros: u64,
+    pub post_aec_zeros: u64,
+    pub sink_samples: u64,
+}
+
+impl StageClock {
+    pub fn new() -> Self {
+        Self {
+            frames: 0,
+            resample_us: 0,
+            level_us: 0,
+            aec_us: 0,
+            sink_us: 0,
+            vad_us: 0,
+            frame_max_us: 0,
+            pre_aec_zeros: 0,
+            post_aec_zeros: 0,
+            sink_samples: 0,
+        }
+    }
+
+    /// 近零判据与离线分析口径一致(|x| < 1e-5):真实麦克风底噪远高于此,
+    /// 落到这个量级只能是被谁写成了静音。pre 侧传计数而非切片——热路径上
+    /// 就地数一遍即可,不为诊断在实时链里多做一次分配。
+    pub fn zeros(&mut self, pre_zeros: u64, post: &[f32]) {
+        self.pre_aec_zeros += pre_zeros;
+        self.post_aec_zeros += post.iter().filter(|s| s.abs() < 1e-5).count() as u64;
+        self.sink_samples += post.len() as u64;
+    }
+
+    /// 计数辅助:与 `zeros` 同判据,供调用方在 AEC 之前就地统计。
+    pub fn count_zeros(buf: &[f32]) -> u64 {
+        buf.iter().filter(|s| s.abs() < 1e-5).count() as u64
+    }
+
+    pub fn frame(
+        &mut self,
+        resample: std::time::Duration,
+        level: std::time::Duration,
+        aec: std::time::Duration,
+        sink: std::time::Duration,
+        vad: std::time::Duration,
+    ) {
+        let (r, l, a, s, v) = (
+            resample.as_micros() as u64,
+            level.as_micros() as u64,
+            aec.as_micros() as u64,
+            sink.as_micros() as u64,
+            vad.as_micros() as u64,
+        );
+        self.frames += 1;
+        self.resample_us += r;
+        self.level_us += l;
+        self.aec_us += a;
+        self.sink_us += s;
+        self.vad_us += v;
+        self.frame_max_us = self.frame_max_us.max(r + l + a + s + v);
+    }
+
+    pub fn summary(&self, source: Source) -> String {
+        let per = |total: u64| if self.frames == 0 { 0 } else { total / self.frames };
+        format!(
+            "[采集计量] {} worker: 帧 {},均摊/帧 resample {}µs level {}µs aec {}µs sink {}µs vad {}µs,单帧峰值 {}µs",
+            source.as_str(),
+            self.frames,
+            per(self.resample_us),
+            per(self.level_us),
+            per(self.aec_us),
+            per(self.sink_us),
+            per(self.vad_us),
+            self.frame_max_us
+        ) + &{
+            let pct = |n: u64| {
+                if self.sink_samples == 0 { 0.0 } else { n as f64 * 100.0 / self.sink_samples as f64 }
+            };
+            format!(
+                ";近零样本 AEC前 {:.1}% → 后 {:.1}%",
+                pct(self.pre_aec_zeros),
+                pct(self.post_aec_zeros)
+            )
+        }
+    }
+}
 
 /// 把 segmenter 里已完成的段全部定稿发出，返回段数。定稿即清过时 partial 预览。
 fn emit_finished(
@@ -66,14 +173,18 @@ pub fn run_segment_worker(
     // 漂移(两轨每分钟漂 ~110ms,AEC 参考流脱锁,见 StreamResampler 文档)。
     // 设备中途换率(如拔插耳机)时按新率重建——相位清零可接受,率切换本身就是断点。
     let mut resampler: Option<StreamResampler> = None;
+    let mut clock = StageClock::new();
     for frame in frame_rx.iter() {
+        let stage_t = std::time::Instant::now();
         let mono = to_mono(&frame.samples, frame.channels);
         let rs = match &mut resampler {
             Some(r) if r.from_rate() == frame.sample_rate => r,
             _ => resampler.insert(StreamResampler::new(frame.sample_rate, target_rate)),
         };
         let resampled = rs.process(&mono);
+        let t_resample = stage_t.elapsed();
 
+        let stage_t = std::time::Instant::now();
         if let Some(cb) = &on_level {
             level_sumsq += resampled.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
             level_count += resampled.len();
@@ -83,8 +194,10 @@ pub fn run_segment_worker(
                 level_count = 0;
             }
         }
+        let t_level = stage_t.elapsed();
 
         if paused.load(Ordering::Relaxed) {
+            let stage_t = std::time::Instant::now();
             if !was_paused {
                 was_paused = true;
                 // 暂停跳变：在途语句立刻定稿（不丢已说的话），清预览。
@@ -93,12 +206,17 @@ pub fn run_segment_worker(
                 *partial_slot.lock().unwrap() = None;
                 since_partial = 0;
             }
+            // 暂停跳变那一帧要做 flush + 定稿,同样能阻塞 worker;记进 vad 档,
+            // 免得成为账本盲区(Codex review P2)。
+            clock.frame(t_resample, t_level, Duration::ZERO, Duration::ZERO, stage_t.elapsed());
             continue; // 丢帧：暂停期时间轴冻结
         }
         was_paused = false;
 
         // 软件回声消除:mic 路消回声(输出为 10ms 整帧倍数,余量滞留 AEC 内部),
         // system 路喂远端参考后原样继续。暂停期在闸前丢帧,两侧都不喂 AEC。
+        let stage_t = std::time::Instant::now();
+        let pre_zeros = StageClock::count_zeros(&resampled);
         let resampled = match aec.as_mut() {
             Some(crate::audio::aec::AecRole::Capture(c)) => c.process(&resampled),
             Some(crate::audio::aec::AecRole::Render(r)) => {
@@ -107,13 +225,21 @@ pub fn run_segment_worker(
             }
             None => resampled,
         };
+        let t_aec = stage_t.elapsed();
         if resampled.is_empty() {
+            clock.frame(t_resample, t_level, t_aec, Duration::ZERO, Duration::ZERO);
             continue; // capture 侧不足一个 10ms 帧:本轮无输出,等凑齐
         }
 
+        // 静音归因:AEC 输出可能比输入短(内部按 10ms 帧攒),两侧各自按自身长度
+        // 统计占比即可,不要求逐样本对齐。
+        clock.zeros(pre_zeros, &resampled);
+        let stage_t = std::time::Instant::now();
         if let Some(sink) = &mut audio_sink {
             sink(&resampled);
         }
+        let t_sink = stage_t.elapsed();
+        let stage_t = std::time::Instant::now();
         since_partial += resampled.len();
         segmenter.accept(&resampled);
         if emit_finished(&mut segmenter, &partial_slot, &finals_tx, source, target_rate) > 0 {
@@ -124,6 +250,10 @@ pub fn run_segment_worker(
             *partial_slot.lock().unwrap() =
                 segmenter.current_partial().map(|cur| PartialJob { source, samples: cur });
         }
+        clock.frame(t_resample, t_level, t_aec, t_sink, stage_t.elapsed());
+    }
+    if clock.frames > 0 {
+        eprintln!("{}", clock.summary(source));
     }
 
     // 采集结束:先排空 AEC 签名预对齐在 capture 侧扣压的尾部(参考迟到场景下
@@ -246,6 +376,77 @@ mod tests {
             slot.lock().unwrap().is_none(),
             "slot must be cleared to None when throttle fires with no current partial"
         );
+    }
+
+    /// 分阶段耗时账本:2026-08-14 采集链背压事故的仪表——下一场"效果差"直接从
+    /// 日志读出 worker 哪一段慢,不再靠对账风暴倒推。账本是单线程本地的纯累加器,
+    /// 在此单测数值语义;worker 退出时打一行汇总(见 run_segment_worker 尾部)。
+    #[test]
+    fn stage_clock_accumulates_and_reports_worst_frame() {
+        let us = Duration::from_micros;
+        let mut c = StageClock::new();
+        c.frame(us(100), us(5), us(200), us(30), us(70));
+        c.frame(us(50), us(3), us(1_500), us(10), us(40));
+        // 静音归因探针:AEC 前后各数一次近零样本。差值 = AEC 制造的静音。
+        c.zeros(StageClock::count_zeros(&[0.0, 0.0, 0.5, 0.5]), &[0.0, 0.0, 0.0, 0.5]);
+        assert_eq!(c.pre_aec_zeros, 2);
+        assert_eq!(c.post_aec_zeros, 3);
+        assert_eq!(c.sink_samples, 4);
+        assert_eq!(c.frames, 2);
+        assert_eq!(c.resample_us, 150);
+        assert_eq!(c.level_us, 8);
+        assert_eq!(c.aec_us, 1_700);
+        assert_eq!(c.sink_us, 40);
+        assert_eq!(c.vad_us, 110);
+        assert_eq!(c.frame_max_us, 1_603, "单帧峰值 = 各阶段之和的最大值");
+        let s = c.summary(Source::Mic);
+        assert!(s.contains("mic"), "{s}");
+        assert!(s.contains("帧 2"), "{s}");
+        assert!(s.contains("level"), "电平/IPC 阶段必须单列——它做 Tauri 事件发送,能阻塞 worker");
+        assert!(s.contains("峰值 1603µs"), "{s}");
+        assert!(s.contains("近零样本"), "静音归因必须进汇总行:{s}");
+    }
+
+    /// Codex review P2:计量不得留盲区。电平回调(RMS 遍历 + Tauri IPC)与暂停
+    /// 分支的 flush 都能阻塞 worker,若不入账,日志会显示"各阶段都很快"却解释不了
+    /// tap 侧观测到的背压。这里用一个刻意慢的 on_level 验证它确实被计进去。
+    #[test]
+    fn stage_clock_accounts_for_level_callback_time() {
+        let (ftx, frx) = crossbeam_channel::bounded::<AudioFrame>(8);
+        let (final_tx, _final_rx) = crossbeam_channel::unbounded::<FinalJob>();
+        let slot = Arc::new(Mutex::new(None));
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen2 = seen.clone();
+        let worker = std::thread::spawn(move || {
+            run_segment_worker(
+                Source::Mic,
+                frx,
+                16000,
+                1_000_000,
+                final_tx,
+                slot,
+                Box::new(MockSegmenter::new(1_000_000)),
+                Arc::new(AtomicBool::new(false)),
+                Some(Box::new(move |_r| {
+                    std::thread::sleep(Duration::from_millis(12));
+                    seen2.fetch_add(1, Ordering::Relaxed);
+                })),
+                None,
+                None,
+            );
+        });
+        for _ in 0..3 {
+            ftx.send(AudioFrame {
+                samples: vec![0.3; LEVEL_INTERVAL_SAMPLES],
+                sample_rate: 16000,
+                channels: 1,
+                host_time_ns: None,
+            })
+            .unwrap();
+        }
+        drop(ftx);
+        worker.join().unwrap();
+        assert!(seen.load(Ordering::Relaxed) >= 3, "电平回调应被触发");
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};

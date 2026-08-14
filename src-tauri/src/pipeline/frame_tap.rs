@@ -120,6 +120,17 @@ pub struct SourceHealth {
     pub restarts: AtomicU32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: AtomicU32,
+    /// 硬件时基不连续次数(时戳回退,或跳变 ≥ fill_after)。它是「采集侧真有洞」
+    /// 的直接计数:消费端再慢,只要采集连续,hw 时基就连续,此值不动——与
+    /// send_wait/cap_queue_hw 合起来能把「worker 慢」和「设备/HAL 丢帧」分开。
+    pub hw_gaps: AtomicU32,
+    /// 采集→tap 队列深度高水位(tap 每收一帧采样一次残余深度)。持续走高 =
+    /// tap 或其下游追不上采集节奏。
+    pub cap_queue_hw: AtomicU32,
+    /// tap 向 worker 转发被阻塞的累计/单次峰值毫秒数。>0 = worker 侧背压已经
+    /// 顶到 tap;逼近采集缓冲总量时回调将被阻塞、HAL 开始真丢样。
+    pub send_wait_ms: AtomicU64,
+    pub send_wait_max_ms: AtomicU64,
     /// 首个真实帧相对本场最早首帧的 16k 样本偏移,+1 编码(0 表示尚未见首帧)。
     /// mixed sink 在首个重采样块到达时读取,把两源放进同一墙钟原点。
     first_frame_offset_16k_plus_one: AtomicU64,
@@ -135,6 +146,10 @@ pub struct HealthSnapshot {
     pub silence_ms: u64,
     pub restarts: u32,
     pub rate_fixes: u32,
+    pub hw_gaps: u32,
+    pub cap_queue_hw: u32,
+    pub send_wait_ms: u64,
+    pub send_wait_max_ms: u64,
 }
 
 impl SourceHealth {
@@ -147,6 +162,10 @@ impl SourceHealth {
             silence_ms: self.silence_ms.load(Ordering::Relaxed),
             restarts: self.restarts.load(Ordering::Relaxed),
             rate_fixes: self.rate_fixes.load(Ordering::Relaxed),
+            hw_gaps: self.hw_gaps.load(Ordering::Relaxed),
+            cap_queue_hw: self.cap_queue_hw.load(Ordering::Relaxed),
+            send_wait_ms: self.send_wait_ms.load(Ordering::Relaxed),
+            send_wait_max_ms: self.send_wait_max_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -406,6 +425,20 @@ fn run_frame_tap_with_drift(
     let mut applied_rate: Option<u32> = None;
     let mut clock_span = Duration::ZERO;
     let mut clock_samples: u64 = 0;
+    // 测率时基优先用帧自带的硬件时间戳(cpal capture/SCK PTS/VPIO host time):
+    // 到达间隔测出的是「采集+排队+tap 调度+下游阻塞」后的交付率,消费端一被抢占
+    // 就产出假低率,改写采样率把整场音频变速(2026-08-14 实锤:内置麦被反复改写到
+    // 42-46kHz,时间轴拉伸 1.14×,而设备 ActualSampleRate 全程 48k±3ppm)。硬件时基
+    // 只随捕获推进,交付抖动天然不进测量;无硬件时戳的源(Windows loopback/合成帧)
+    // 退回到达间隔并沿用旧语义。hw_pending:样本数与「前一帧时戳→本帧时戳」的区间
+    // 配对(本帧样本对应的区间要等下一帧时戳才闭合)。
+    let mut clock_hw_prev: Option<u64> = None;
+    let mut clock_hw_pending: u64 = 0;
+    // 当前统计窗用的是硬件时基还是到达间隔。hw 时戳会偶发缺失(cpal 的
+    // duration_since 返回 None、SCK 的 CMTime 无效、VPIO 的 HostTime 标志位
+    // 未置),两种口径的时间绝不能累进同一个 clock_span——混合后足以把观测率
+    // 推过阈值,重新触发本模块正要根除的错误改率。切换即重开窗。
+    let mut clock_hw_mode = false;
     // 相位债务(秒,带符号):检测期间按错的率发出去的时长与墙钟的差。
     // 正 = 发多了(实际率高于声明),负 = 发少了。改率只止住继续发散,这笔账要单独还。
     //
@@ -516,6 +549,8 @@ fn run_frame_tap_with_drift(
                     applied_rate = None;
                     clock_span = Duration::ZERO;
                     clock_samples = 0;
+                    clock_hw_prev = None;
+                    clock_hw_pending = 0;
                     // device_switch 的 drift reanchor 已在本函数顶部的旁挂块里、按
                     // drift_last_format 独立判定并处理(与 gap_end 合并去重,见该处
                     // 注释),这里不再重复喂——两处各自摸一次同一物理事件曾是 P1 双计
@@ -530,12 +565,62 @@ fn run_frame_tap_with_drift(
                 if frame.sample_rate > 0 {
                     // 只统计「连续出帧」的时间:断流本身以及紧随其后的一次缓冲回吐
                     // (蓝牙 mic 常态)会让瞬时速率忽低忽高,计进去就是把噪声当信号。
-                    if !first && gap < policy.fill_after {
-                        clock_span += gap;
-                        clock_samples += per_channel as u64;
-                    } else {
-                        clock_span = Duration::ZERO;
-                        clock_samples = 0;
+                    // 时基选取见 clock_hw_prev 处注释:有硬件时戳按捕获时钟,无则到达间隔。
+                    match frame.host_time_ns {
+                        Some(ns) => {
+                            if !clock_hw_mode {
+                                clock_span = Duration::ZERO;
+                                clock_samples = 0;
+                                clock_hw_mode = true;
+                            }
+                            if let Some(prev) = clock_hw_prev {
+                                let delta_ns = ns.saturating_sub(prev);
+                                let delta = Duration::from_nanos(delta_ns);
+                                // 区间有效性三查。hw 时戳取自采样时钟,正常情况下
+                                // `delta == 上一帧样本数 / 真实率` 精确成立,所以本区间
+                                // 的隐含速率就是真实速率——它落到合理性夹板之外,只能是
+                                // 这段里丢了样本(洞)或吐了突发缓冲,不是"时钟慢"。
+                                // 只查 `delta < fill_after` 远远不够:一个 20ms 的洞摊进
+                                // 200ms 窗口就是 -10%,越过容差却仍在夹板内,照样会被
+                                // 错判成慢钟改写采样率(Codex review P1)。
+                                let implied = if delta_ns > 0 {
+                                    clock_hw_pending as f64 * 1e9 / delta_ns as f64
+                                } else {
+                                    0.0
+                                };
+                                let declared = frame.sample_rate as f64;
+                                let usable = ns > prev
+                                    && delta < policy.fill_after
+                                    && implied >= declared * RATE_SANITY.0
+                                    && implied <= declared * RATE_SANITY.1;
+                                if usable {
+                                    clock_span += delta;
+                                    clock_samples += clock_hw_pending;
+                                } else {
+                                    clock_span = Duration::ZERO;
+                                    clock_samples = 0;
+                                    health.hw_gaps.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            clock_hw_prev = Some(ns);
+                            clock_hw_pending = per_channel as u64;
+                        }
+                        None => {
+                            if clock_hw_mode {
+                                clock_span = Duration::ZERO;
+                                clock_samples = 0;
+                                clock_hw_mode = false;
+                            }
+                            clock_hw_prev = None;
+                            clock_hw_pending = 0;
+                            if !first && gap < policy.fill_after {
+                                clock_span += gap;
+                                clock_samples += per_channel as u64;
+                            } else {
+                                clock_span = Duration::ZERO;
+                                clock_samples = 0;
+                            }
+                        }
                     }
                     // 两级判定:快窗只抓粗偏差(伤害最大、5 秒就能认定),满窗抓细偏差。
                     // 快窗未超粗容差时**不清零**,让统计继续攒到满窗再用更稳的估计判一次。
@@ -632,8 +717,19 @@ fn run_frame_tap_with_drift(
                 }
                 health.frames.fetch_add(1, Ordering::Relaxed);
                 health.samples.fetch_add(frame.samples.len() as u64, Ordering::Relaxed);
+                // 背压计量:收帧后的残余队列深度 + 本次转发被下游顶住的时长。
+                let depth = from_capture.len() as u32;
+                if depth > 0 {
+                    health.cap_queue_hw.fetch_max(depth, Ordering::Relaxed);
+                }
+                let send_t = Instant::now();
                 if to_worker.send(frame).is_err() {
                     return; // 会话拆除,下游已关
+                }
+                let waited = send_t.elapsed().as_millis() as u64;
+                if waited > 0 {
+                    health.send_wait_ms.fetch_add(waited, Ordering::Relaxed);
+                    health.send_wait_max_ms.fetch_max(waited, Ordering::Relaxed);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -789,6 +885,275 @@ mod tests {
             return false;
         }
         true
+    }
+
+    /// 带硬件时间戳直发一批帧(hw 时基推进 step_ns/帧,样本 n/帧),返回转发结果与健康。
+    /// 不 sleep:hw 测率路径不依赖到达节奏,这正是它存在的意义。
+    fn run_hw_feed(
+        policy: TapPolicy,
+        declared: u32,
+        n_per_frame: usize,
+        step_ns: u64,
+        frames_n: usize,
+        jump_at: Option<(usize, u64)>,
+        arrival_sleep: Option<Duration>,
+    ) -> (Vec<AudioFrame>, Arc<SourceHealth>) {
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        let mut ns: u64 = 1_000;
+        for i in 0..frames_n {
+            if let Some((at, jump)) = jump_at {
+                if i == at {
+                    ns += jump;
+                }
+            }
+            if let Some(d) = arrival_sleep {
+                std::thread::sleep(d);
+            }
+            ctx.send(AudioFrame {
+                samples: vec![0.2; n_per_frame],
+                sample_rate: declared,
+                channels: 1,
+                host_time_ns: Some(ns),
+            })
+            .unwrap();
+            ns += step_ns;
+        }
+        drop(ctx);
+        t.join().unwrap();
+        (wrx.try_iter().collect(), health)
+    }
+
+    /// 2026-08-14 变速失真事故的根修:旧实现用 tap 线程的到达间隔测率,消费端一卡
+    /// (排队/调度/下游阻塞)就测出假低率并改写采样率,把整场音频变速 1.14×。
+    /// 帧带硬件时间戳时必须按捕获时钟测率——到达节奏在这里被刻意打乱(全部瞬时
+    /// 灌入,到达速率无穷大;或由调度随机拖慢),但 hw 时基显示真率==声明率,
+    /// 绝不允许改写。
+    #[test]
+    fn hw_timestamps_immune_to_delivery_jitter() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        // 480 样本/帧 @ 每帧 hw 推进 10ms = 真率恰为 48k;但到达节奏被拖慢到每帧
+        // ~11.5ms(等效到达率 ~42k,恰在 RATE_SANITY 夹板内)——正是 2026-08-14 事故
+        // 形态:旧的到达间隔测率会在此把 48k 改写成 ~42k 并整场变速。
+        let (got, health) = run_hw_feed(
+            policy,
+            DECLARED,
+            480,
+            10_000_000,
+            60,
+            None,
+            Some(Duration::from_micros(11_500)),
+        );
+        assert!(got.len() >= 60, "全部转发: {}", got.len());
+        assert!(
+            got.iter().all(|f| f.sample_rate == DECLARED),
+            "hw 真率==声明率,任何帧都不得改写"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0, "不得记 rate_fix");
+        assert_eq!(health.hw_gaps.load(Ordering::Relaxed), 0, "hw 时基连续,不得记跳变");
+    }
+
+    /// 真谎报在 hw 时基下照样抓:hw 跨度 T 内只出 2/3·48k·T 个样本(声明 48k、
+    /// 真率 32k),评估窗满后必须改写。确定性版的
+    /// `corrects_source_that_lies_about_its_sample_rate`(无 sleep,不受机器负载影响)。
+    #[test]
+    fn hw_timestamps_still_correct_genuine_rate_lie() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        // 每帧 hw 推进 10ms 却只有 320 样本 → 真率 32k。40 帧 = 400ms hw 跨度。
+        let (got, health) = run_hw_feed(policy, DECLARED, 320, 10_000_000, 40, None, None);
+        assert_eq!(got[0].sample_rate, DECLARED, "评估窗满之前不得改写");
+        let last = got.last().unwrap().sample_rate as f64;
+        assert!(
+            (last - 32_000.0).abs() / 32_000.0 < 0.01,
+            "末帧应为实测率 ~32k,得到 {last}"
+        );
+        assert!(health.rate_fixes.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// hw 时基跳变(≥fill_after,设备断流后缓冲回吐/换设备)要把测率统计清零,
+    /// 跳变前后各自不足评估窗时不得拼起来判定。
+    #[test]
+    fn hw_timestamp_jump_resets_rate_stats() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        // 两段各 15 帧(150ms hw 跨度,不足 200ms 评估窗),中间 hw 跳 1s;
+        // 样本数按 32k 谎报——若统计未被跳变清零,拼起来就会满窗并错误改写。
+        let (got, health) =
+            run_hw_feed(policy, DECLARED, 320, 10_000_000, 30, Some((15, 1_000_000_000)), None);
+        assert!(
+            got.iter().all(|f| f.sample_rate == DECLARED),
+            "两段各自不足评估窗,不得改写"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            health.hw_gaps.load(Ordering::Relaxed),
+            1,
+            "hw 时基跳变计 1 次——它是「采集侧真有洞」的直接计数,与消费端慢无关"
+        );
+    }
+
+    /// 按脚本喂帧:每项 (样本数, 可选 hw 时戳, 发送前等待)。用于精确构造
+    /// 「时基切换」「hw 区间含洞」这类只靠 run_hw_feed 表达不出来的形态。
+    fn run_scripted(
+        policy: TapPolicy,
+        declared: u32,
+        script: &[(usize, Option<u64>, Duration)],
+    ) -> (Vec<AudioFrame>, Arc<SourceHealth>) {
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        for (n, hw, wait) in script {
+            if !wait.is_zero() {
+                std::thread::sleep(*wait);
+            }
+            ctx.send(AudioFrame {
+                samples: vec![0.2; *n],
+                sample_rate: declared,
+                channels: 1,
+                host_time_ns: *hw,
+            })
+            .unwrap();
+        }
+        drop(ctx);
+        t.join().unwrap();
+        (wrx.try_iter().collect(), health)
+    }
+
+    /// Codex review P1:hw 时戳偶发缺失(cpal duration_since 返回 None、SCK CMTime
+    /// 无效、VPIO HostTime 标志位未置)时,若把到达间隔累加进同一个 clock_span,
+    /// 两种时基就被混在一起,足以把观测率推过阈值、重新触发本次修复要根除的错误改率。
+    /// 时基切换必须重开统计窗。
+    #[test]
+    fn timebase_switch_resets_rate_stats_instead_of_mixing() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            fill_after: Duration::from_millis(500),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        let mut script: Vec<(usize, Option<u64>, Duration)> = Vec::new();
+        // hw 段:15 帧 × 10ms = 140ms 真实跨度(不足 200ms 评估窗,自身不判定)
+        let mut ns = 1_000u64;
+        for _ in 0..15 {
+            script.push((480, Some(ns), Duration::ZERO));
+            ns += 10_000_000;
+        }
+        // 无时戳段:5 帧,到达间隔 20ms(共 100ms)。两段若被拼接 = 240ms > 评估窗,
+        // 混合口径算出 ~40kHz → 误判改率;正确行为是切换时重开窗,谁都判不了。
+        for _ in 0..5 {
+            script.push((480, None, Duration::from_millis(20)));
+        }
+        let (got, health) = run_scripted(policy, DECLARED, &script);
+        assert!(
+            got.iter().all(|f| f.sample_rate == DECLARED),
+            "时基切换不得拼接成一次判定"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Codex review P1:`delta < fill_after` 证明不了采集连续。设备掉了 200ms
+    /// 却只交付一帧样本时,该区间的瞬时速率荒谬(样本数配不上时间跨度),
+    /// 累加进窗口就会压低观测率、触发错误改率——正是本次事故的形态。
+    /// 含洞区间必须整段作废并计一次 hw_gaps。
+    #[test]
+    fn hw_interval_with_capture_hole_is_rejected_not_averaged() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            fill_after: Duration::from_millis(500),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        let mut script: Vec<(usize, Option<u64>, Duration)> = Vec::new();
+        let mut ns = 1_000u64;
+        for i in 0..40 {
+            script.push((480, Some(ns), Duration::ZERO));
+            // 第 5 帧后多跳 20ms:洞不大不小,恰恰最危险——摊进 200ms 窗口是 -10%,
+            // 越过容差却仍落在 RATE_SANITY 夹板内,旧实现会照此改写采样率。
+            // 但该区间本身隐含速率仅 16kHz(480 样本 / 30ms),配不上时间跨度。
+            ns += if i == 5 { 30_000_000 } else { 10_000_000 };
+        }
+        let (got, health) = run_scripted(policy, DECLARED, &script);
+        assert!(
+            got.iter().all(|f| f.sample_rate == DECLARED),
+            "含洞区间不得被平均进测率,更不得据此改写采样率"
+        );
+        assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
+        assert_eq!(health.hw_gaps.load(Ordering::Relaxed), 1, "洞要记一次 hw_gaps");
+    }
+
+    /// 下游背压计量:worker 通道被塞住时,tap 要记录 send 阻塞时长与采集队列高水位。
+    /// 这两个数把「worker 慢于实时」从推测变成每场可回看的证据(2026-08-14 事故里
+    /// 只能靠对账风暴倒推,缺这层仪表)。
+    #[test]
+    fn tap_records_downstream_backpressure_metrics() {
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::bounded::<AudioFrame>(1);
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let policy = fast_policy();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+        });
+        // 一次性灌 6 帧:tap 转发第 1 帧后,后续 send 因 bounded(1) 满而阻塞,
+        // 其间未被取走的帧堆在采集队列里 → 高水位可测。
+        for _ in 0..6 {
+            ctx.send(frame(160)).unwrap();
+        }
+        // 慢速排空:每 25ms 取一帧,制造可观测的阻塞时长(4 次 × ~25ms)。
+        let mut got = 0;
+        while got < 6 {
+            std::thread::sleep(Duration::from_millis(25));
+            if wrx.recv_timeout(Duration::from_secs(2)).is_ok() {
+                got += 1;
+            } else {
+                break;
+            }
+        }
+        drop(ctx);
+        // 排干剩余(补零帧可能仍在路上)。
+        while wrx.recv_timeout(Duration::from_millis(50)).is_ok() {}
+        t.join().unwrap();
+
+        assert!(
+            health.send_wait_ms.load(Ordering::Relaxed) >= 30,
+            "send 阻塞累计应可观测: {}ms",
+            health.send_wait_ms.load(Ordering::Relaxed)
+        );
+        assert!(
+            health.send_wait_max_ms.load(Ordering::Relaxed) >= 10,
+            "单次阻塞峰值应可观测: {}ms",
+            health.send_wait_max_ms.load(Ordering::Relaxed)
+        );
+        assert!(
+            health.cap_queue_hw.load(Ordering::Relaxed) >= 2,
+            "采集队列高水位应 ≥2: {}",
+            health.cap_queue_hw.load(Ordering::Relaxed)
+        );
     }
 
     /// 源一直出帧、但每秒样本数与它声明的采样率不符时,tap 必须按实测速率改写下游帧

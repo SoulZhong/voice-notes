@@ -378,6 +378,7 @@ mod tests {
                 crate::store::audio::SyncInfo {
                     wall_ms: 1000, samples: 48_000, track_ms: 1000, drift_ms: 0,
                     silence_ms: 0, gaps: 0, rate_fixes: 0, first_frame_offset_ms: Some(0),
+                    ..Default::default()
                 },
             )
             .unwrap();

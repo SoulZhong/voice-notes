@@ -174,6 +174,58 @@ impl Drop for OfflineEngine {
 /// 键:lang/emotion/event/text/timestamps/durations/tokens/words;此处只取四个。
 /// 解析失败(理论上 C++ std::quoted 不转义控制字符可产非法 JSON)→ 空结果 + stderr,
 /// 走上游 [识别失败] 占位路径,不 panic。
+/// 复读折叠后每个单元保留的份数:2 份既能保住"对对"式的强调语气,又让
+/// 一眼看出这里原本是重复。
+const REPEAT_KEEP: usize = 2;
+/// 判定为复读的最少连续份数。单字单元门槛更高——"哈哈哈哈哈""对对对"是自然汉语。
+/// 取值由真实数据定标(2026-08-14,近期 14 场 5638 段全量回放):8/6 把 16 条解码
+/// 垃圾一条不漏地清掉(它们重复 18-100 遍,离门槛极远),同时把误伤的人类强调
+/// ("对对对对对对""对不起"×4)从 13 条压到 2 条;再放宽到 10/6 无额外收益。
+/// 会议纪要要忠于原话,清理口癖是精修阶段的事,这里只杀解码器垃圾。
+const REPEAT_MIN_SINGLE: usize = 8;
+const REPEAT_MIN_MULTI: usize = 6;
+/// 参与匹配的最长重复单元(字符数)。真实复读单元都很短("然后,""你像这样,"),
+/// 放太长会开始误伤排比句。
+const REPEAT_UNIT_MAX: usize = 8;
+
+/// 折叠自回归解码的复读尾巴。qwen3/fire_red 这类 LLM 式解码器偶发陷入
+/// 重复循环,一路吐同一个单元直到撞上 max_new_tokens 才停(2026-08-14 实测:
+/// 近期 14 场笔记 80 段中招,密度最高 133 字/秒,而人类语速仅 5-6 字/秒)。
+/// 真实内容在开头,尾巴纯属垃圾——放大 max_new_tokens 只会让垃圾更长、解码更慢,
+/// 折叠才是对症。CTC 引擎(SenseVoice/Paraformer)不会复读,且带 token 时间戳,
+/// 调用方据此门控(见 parse_result_json)。
+fn collapse_repeats(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let mut collapsed = false;
+        for unit in 1..=REPEAT_UNIT_MAX.min((chars.len() - i) / 2) {
+            let mut count = 1;
+            while chars[i..i + unit] == chars[i + unit * count..]
+                [..unit.min(chars.len() - (i + unit * count))]
+                && i + unit * (count + 1) <= chars.len()
+            {
+                count += 1;
+            }
+            let min = if unit == 1 { REPEAT_MIN_SINGLE } else { REPEAT_MIN_MULTI };
+            if count >= min {
+                for _ in 0..REPEAT_KEEP {
+                    out.extend(&chars[i..i + unit]);
+                }
+                i += unit * count;
+                collapsed = true;
+                break;
+            }
+        }
+        if !collapsed {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn parse_result_json(json: &str) -> Transcript {
     let parsed: ResultJson = match serde_json::from_str(json) {
         Ok(r) => r,
@@ -182,12 +234,26 @@ pub(crate) fn parse_result_json(json: &str) -> Transcript {
             ResultJson::default()
         }
     };
-    Transcript {
-        text: parsed.text,
-        lang: parsed.lang,
-        tokens: parsed.tokens,
-        timestamps: parsed.timestamps.unwrap_or_default(),
-    }
+    let timestamps = parsed.timestamps.unwrap_or_default();
+    // 复读折叠只对「无 token 时间戳」的自回归引擎生效:CTC 引擎的 text 与
+    // tokens/timestamps 严格等长对应,动一个字就会让段内说话人切分错位,而它们
+    // 本就不会复读。折叠改了文本 → 同批 tokens 随即作废,一并清掉不留错位隐患。
+    let (text, tokens) = if timestamps.is_empty() {
+        let collapsed = collapse_repeats(&parsed.text);
+        if collapsed != parsed.text {
+            eprintln!(
+                "复读折叠: {} 字 → {} 字(解码陷入重复循环,已截取有效前缀)",
+                parsed.text.chars().count(),
+                collapsed.chars().count()
+            );
+            (collapsed, Vec::new())
+        } else {
+            (parsed.text, parsed.tokens)
+        }
+    } else {
+        (parsed.text, parsed.tokens)
+    };
+    Transcript { text, lang: parsed.lang, tokens, timestamps }
 }
 
 #[derive(Deserialize, Default)]
@@ -223,6 +289,50 @@ mod tests {
         assert_eq!(t.text, "hello");
         assert!(t.lang.is_empty());
         assert!(t.timestamps.is_empty(), "缺 timestamps 键 → 空,diarization 走段级降级");
+    }
+
+    /// 自回归解码复读折叠(2026-08-14 实锤:近期 14 场笔记里 80 段是复读,
+    /// 密度 17-133 字/秒——人类语速 5-6 字/秒;真实内容都在开头,尾部是同一
+    /// 单元无限重复,直到撞上 max_new_tokens 才停)。样例取自真实数据。
+    #[test]
+    fn collapse_repeats_cuts_decoder_loops_keeps_natural_emphasis() {
+        // 单字复读(真实样例:"我们要用专业去去去去…去" 40+ 次)
+        assert_eq!(collapse_repeats(&format!("我们要用专业{}", "去".repeat(44))), "我们要用专业去去");
+        // 带标点的词复读(真实样例:"然后,"×21、"这个,"×19)
+        assert_eq!(collapse_repeats(&"然后，".repeat(21)), "然后，然后，");
+        assert_eq!(collapse_repeats(&format!("对，从这个，{}", "这个，".repeat(19))), "对，从这个，这个，");
+        // 多字单元复读(真实样例:"你像这样,"×18)
+        assert_eq!(collapse_repeats(&"你像这样，".repeat(18)), "你像这样，你像这样，");
+        // 带空格的字母复读(真实样例:"现在,D I P T Y Y Y…")
+        assert_eq!(collapse_repeats(&format!("现在，D I P T{}", " Y".repeat(40))), "现在，D I P T Y Y");
+
+        // 自然重复必须原样保留:强调、笑声、短应答、口吃——门槛按真实数据定标,
+        // 下面几条都来自实际笔记(密度 3-6 字/秒,确系人声),折叠它们就是篡改原话。
+        assert_eq!(collapse_repeats("对对对"), "对对对");
+        assert_eq!(collapse_repeats("哈哈哈哈哈"), "哈哈哈哈哈");
+        assert_eq!(collapse_repeats("很好很好"), "很好很好");
+        assert_eq!(collapse_repeats("对对对对对对。"), "对对对对对对。", "六连「对」是强调,不是复读");
+        assert_eq!(collapse_repeats(&"对不起".repeat(4)), "对不起".repeat(4), "连说四遍对不起是人话");
+        assert_eq!(collapse_repeats("这个这个这个这个力"), "这个这个这个这个力", "口吃保留");
+        assert_eq!(collapse_repeats("这是完全正常的一句话，没有任何重复。"), "这是完全正常的一句话，没有任何重复。");
+        assert_eq!(collapse_repeats(""), "");
+    }
+
+    /// 折叠只在「无 token 时间戳」时生效(自回归引擎 qwen3/fire_red 恒空);
+    /// CTC 引擎带时间戳,text 与 tokens/timestamps 必须严格等长对应,一个字都不能动
+    /// ——否则段内说话人切分(group_tokens_by_boundaries)会错位。
+    #[test]
+    fn repeat_collapse_only_without_timestamps_and_drops_stale_tokens() {
+        let looped = "然后，".repeat(21);
+        let t = parse_result_json(&format!(r#"{{"text": "{looped}", "tokens": ["然","后"]}}"#));
+        assert_eq!(t.text, "然后，然后，", "无时间戳:折叠生效");
+        assert!(t.tokens.is_empty(), "文本被改写 → 陈旧 tokens 必须清掉,不留错位隐患");
+
+        let t = parse_result_json(&format!(
+            r#"{{"text": "{looped}", "tokens": ["然","后"], "timestamps": [0.0, 0.1]}}"#
+        ));
+        assert_eq!(t.text, looped, "有时间戳:原样保留,绝不动");
+        assert_eq!(t.tokens.len(), 2);
     }
 
     #[test]

@@ -403,6 +403,7 @@ mod tests {
                 state: "complete".into(),
                 calendar: None,
                 calendar_cleared: false,
+            asr_engine: None,
             },
             segments: vec![
                 crate::store::SegmentRecord {
@@ -462,6 +463,7 @@ mod tests {
                 state: "complete".into(),
                 calendar: None,
                 calendar_cleared: false,
+            asr_engine: None,
             },
             segments: vec![],
             suppressed_segments: vec![],
@@ -485,6 +487,7 @@ mod tests {
                 state: "complete".into(),
                 calendar: None,
                 calendar_cleared: false,
+            asr_engine: None,
             },
             segments: vec![],
             suppressed_segments: vec![],
@@ -508,6 +511,7 @@ mod tests {
                 state: "complete".into(),
                 calendar: None,
                 calendar_cleared: false,
+            asr_engine: None,
             },
             segments: vec![],
             suppressed_segments: vec![],

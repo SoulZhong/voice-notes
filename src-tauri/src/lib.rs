@@ -1582,7 +1582,7 @@ fn spawn_session(
             }
         }
         // New → NoteWriter::create；Resume → NoteWriter::resume（meta 损坏/id 不存在 → Err）。
-        let writer = match notes_dir(&app).and_then(|d| match &target {
+        let mut writer = match notes_dir(&app).and_then(|d| match &target {
             NoteTarget::New => store::writer::NoteWriter::create(&d, chrono::Local::now()),
             NoteTarget::Resume(id) => store::writer::NoteWriter::resume(&d, id),
         }) {
@@ -1602,6 +1602,20 @@ fn spawn_session(
                 return fail(&app, &running, &generation, my_gen, msg);
             }
         };
+        // 引擎身份落盘(显性化):本场实际用于转写的引擎,云端记 "cloud:厂商"。
+        // 2026-08-14 教训:选型与实际生效可能不一致,不落盘事后无从对证。
+        // 身份必须向识别器实例本人要(engine_id),不能回头再读一次设置——本场用的
+        // 可能是开录前预载的常驻实例,用户在预载与开录之间改过选型时,设置里的值
+        // 与真正在跑的实例对不上,恰好毁掉本字段的取证价值(Codex review P2)。
+        // 云端无本机实例,但 cfg 是本次开录的同一份快照,与 make_cloud_asr 同源。
+        // 写失败只打日志——诊断信息,不挡开录。
+        let engine = match recognizer.as_ref() {
+            Some(r) => r.engine_id().to_string(),
+            None => format!("cloud:{}", cfg.cloud_asr_provider),
+        };
+        if let Err(e) = writer.set_asr_engine(&engine) {
+            eprintln!("引擎身份写入失败(不影响录制): {e}");
+        }
         // —— 移交前一次性读完全部元信息(note_id/dir/base_ms/registry 快照):writer
         // 即将整体移交 lifecycle actor(单写者),此后本线程不得再持它的任何引用,
         // 一切写经信箱。——
@@ -2207,6 +2221,10 @@ fn persist_track_sync(
             silence_ms: h.silence_ms,
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,
+            hw_gaps: h.hw_gaps,
+            cap_queue_hw: h.cap_queue_hw,
+            send_wait_ms: h.send_wait_ms,
+            send_wait_max_ms: h.send_wait_max_ms,
             first_frame_offset_ms: Some(health.first_frame_offset_16k() / 16),
         };
         if let Err(e) = store::audio::set_track_sync(note_dir, source.as_str(), info) {
@@ -7620,7 +7638,7 @@ mod tests {
                 silence_ms: 3,
                 gaps: 4,
                 rate_fixes: 5,
-                first_frame_offset_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();

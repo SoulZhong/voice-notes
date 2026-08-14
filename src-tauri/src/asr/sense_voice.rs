@@ -25,6 +25,10 @@ impl SenseVoiceRecognizer {
 }
 
 impl Recognizer for SenseVoiceRecognizer {
+    fn engine_id(&self) -> &'static str {
+        crate::settings::ASR_SENSE_VOICE
+    }
+
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         self.inner.transcribe(16000, samples)
     }

@@ -28,6 +28,10 @@ impl WhisperRecognizer {
 }
 
 impl Recognizer for WhisperRecognizer {
+    fn engine_id(&self) -> &'static str {
+        crate::settings::ASR_WHISPER
+    }
+
     fn recognize(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
         // token 时间戳未启用(enable_token_timestamps=0,迁移前行为):timestamps 恒空,
         // diarization 走段级降级;lang 若模型给出则透传(此前恒空,语言过滤只会更准)。
