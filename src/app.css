@@ -88,7 +88,7 @@
      MiniPlayer.svelte 与 +layout.svelte 里,是因为后者需要给主内容区留出恰好能避开
      浮层的 padding-bottom(安全区),两处数字若各自硬编码,改一处忘另一处就会让浮层
      重新盖住内容。安全区高度按 (--orb-size + --orb-inset * 2) 计算:直径 + 上下各一份留白。 */
-  --orb-size: 56px;
+  --orb-size: 72px;
   --orb-inset: 16px;
 
   /* 深度靠表面阶梯不靠投影;浮层深阴影;shadow-btn 为主按钮药丸专用。
