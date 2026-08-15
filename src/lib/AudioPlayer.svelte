@@ -112,8 +112,14 @@
         lastBackendGen = res.gen;
         // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):会话按新代次恢复,位置与
         // 播放态沿用重装前的现场。装的是别的笔记则不恢复——上面已经作废了。
+        // totalMs 用本次装载返回的 res.total_ms:续录会让笔记变长,沿用重装前的
+        // 旧值会让迷你条的进度环卡在旧总长上(算出来的百分比偏大甚至提前满格)。
         if (prevSession && noteId && prevSession.session.noteId === noteId) {
-          playback.restore({ ...prevSession.session, gen: res.gen }, prevSession.atMs, prevSession.playing);
+          playback.restore(
+            { ...prevSession.session, gen: res.gen, totalMs: res.total_ms },
+            prevSession.atMs,
+            prevSession.playing,
+          );
         }
         onLoaded?.();
         return res.total_ms;
