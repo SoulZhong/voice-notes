@@ -858,6 +858,19 @@ mod mac {
                 shared.sys.len()
             );
         }
+        // 覆盖率也要够(Codex 十七轮 P2):设备在头两次回调后就停摆/消失时,停流照样成功,
+        // 于是一场"370s 的热插拔实验"可能实际只覆盖了几毫秒,却报出"断层 0 次、缺失 0 个"
+        // 这种漂亮结论。要求实际采到的时长不低于请求时长的 90%,否则作废——
+        // 而这条报错本身就是热插拔实验要的观测结果,数字都在错误信息里。
+        let covered = shared.frames as f64 / src_hz;
+        if run < secs * 0.9 || covered < secs * 0.9 {
+            bail!(
+                "采集覆盖不足:请求 {secs:.0}s,实际首→末回调 {run:.1}s、采到 {covered:.1}s 的帧\
+                 (回调 {} 次)。设备中途停摆/消失都会这样——本场不落盘、不出结论,\
+                 但这条信息本身就是热插拔实验的观测数据。",
+                shared.callbacks
+            );
+        }
         let native = args.iter().any(|a| a == "--native");
         let out_hz = if native { src_hz } else { 16_000.0 };
         let mic_path = format!("{out}/mic.wav");

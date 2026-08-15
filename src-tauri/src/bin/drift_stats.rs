@@ -104,11 +104,28 @@ fn passes_since(report_path: &std::path::Path, since: Option<&str>) -> bool {
 /// `--since` 的取值形状:`YYYYMMDD` 或 `YYYYMMDD-HHMMSS`(与笔记 id 同构,可直接比前缀)。
 fn valid_since(v: &str) -> bool {
     let b = v.as_bytes();
-    match b.len() {
+    let shape_ok = match b.len() {
         8 => b.iter().all(|c| c.is_ascii_digit()),
         15 => b[8] == b'-' && b[..8].iter().chain(&b[9..]).all(|c| c.is_ascii_digit()),
         _ => false,
+    };
+    if !shape_ok {
+        return false;
     }
+    // 光看形状不够(Codex 十七轮 P2):`20260814-240000` / `-176000` 全是数字也过形状,
+    // 但字典序过滤会据此静默排掉一批本该计入的场次——与 fail-closed 的初衷相反。
+    let num = |r: std::ops::Range<usize>| v[r].parse::<u32>().unwrap_or(u32::MAX);
+    let (mo, d) = (num(4..6), num(6..8));
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return false;
+    }
+    if b.len() == 15 {
+        let (h, mi, sec) = (num(9..11), num(11..13), num(13..15));
+        if h > 23 || mi > 59 || sec > 59 {
+            return false;
+        }
+    }
+    true
 }
 
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
@@ -205,6 +222,12 @@ mod tests {
         assert!(!valid_since("20260814170000"), "缺分隔符");
         assert!(!valid_since("20260814-17000"), "时分秒位数不对");
         assert!(!valid_since("2026-08-14"), "带横线的日期不是笔记 id 形状");
+        // 形状对但日期/时刻不可能的值也要拒:字典序过滤会据此静默排掉一批本该计入的场次
+        assert!(!valid_since("20260814-240000"), "24 点不存在");
+        assert!(!valid_since("20260814-176000"), "76 分不存在");
+        assert!(!valid_since("20261314"), "13 月不存在");
+        assert!(!valid_since("20260800"), "0 日不存在");
+        assert!(valid_since("20260814-235959"), "边界值要放行");
         assert!(!valid_since("--out"), "把下一个 flag 当成值必须被挡下");
     }
 
