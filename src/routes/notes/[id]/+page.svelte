@@ -51,6 +51,7 @@
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
+  import { playback } from "$lib/playback.svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
@@ -643,6 +644,12 @@
   /** AudioPlayer 每次装载完成回调:有待恢复现场就 seek 回同一时刻(越界即放弃,
       如切到时长更短的轨);进页首次装载 pendingResume 为 null,自然 no-op。 */
   function onPlayerLoaded() {
+    // 从迷你条点标题回到本页:后端新内核从 0/paused 起(player.rs 里 Core 写死
+    // cursor=0),位置不会自动续上,必须显式 seek。复用 pendingResume 通路,
+    // 不新造机制。只在会话确实是本篇笔记时才接管。
+    if (!pendingResume && playback.session?.noteId === note?.meta.id) {
+      pendingResume = { ms: playback.currentMs, playing: playback.playing };
+    }
     const r = pendingResume;
     pendingResume = null;
     if (!r || !player) return;
@@ -1545,7 +1552,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
