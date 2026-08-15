@@ -161,6 +161,9 @@ struct AppState {
     /// 补生成成品轨在跑任务(note_id)。单槽同 retranscribing 的理由:显式修复动作,
     /// 静默排队会被当成卡死。与录制/重转写双向互斥(见 do_regenerate_mixed 守卫链)。
     mixed_regen: Arc<Mutex<Option<String>>>,
+    /// 前端是否有活动播放会话(与迷你浮层同源判定)。只服务托盘菜单的「停止播放」项:
+    /// 会话语义(装载不算播放)在前端,后端只有装载代次,故由前端 set_playback_active 告知。
+    playback_active: Arc<AtomicBool>,
 }
 
 // 手工 Default（而非 derive）：TranscodeQueue::new() 返回 Arc<Self>，且这样每个字段
@@ -184,6 +187,7 @@ impl Default for AppState {
             retranscribing: Arc::new(Mutex::new(None)),
             retranscribe_last: Arc::new(Mutex::new(None)),
             mixed_regen: Arc::new(Mutex::new(None)),
+            playback_active: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -2386,6 +2390,17 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
         });
     } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
+    }
+}
+
+/// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
+/// 为什么由前端说:「有没有在播」的产品语义是会话——进笔记页就自动装载内核,拿后端的
+/// 装载态判会让只看过没播过的笔记也在托盘冒出「停止播放」。
+/// 只在真变化时重建菜单:前端 effect 可能因会话对象换引用(改名/重装)重发同一个值。
+#[tauri::command]
+fn set_playback_active(app: AppHandle, state: State<AppState>, active: bool) {
+    if state.playback_active.swap(active, Ordering::SeqCst) != active {
+        tray::refresh_menu(&app);
     }
 }
 
@@ -7521,7 +7536,8 @@ pub fn run() {
             player::player_pause,
             player::player_seek,
             player::player_set_muted,
-            player::player_stop
+            player::player_stop,
+            set_playback_active
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

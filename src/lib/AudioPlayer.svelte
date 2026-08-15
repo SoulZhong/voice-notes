@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onPlayerPos } from "$lib/events";
+  import { onPlayerPos, onPlayerStopped } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
   import { playback, shouldStopOnCleanup } from "$lib/playback.svelte";
@@ -68,7 +68,16 @@
    * fire-and-forget 的 stop 可能晚于新组件的装载执行,带条件后后端代次已前进就
    * no-op,不作废别人的装载(Codex 十轮 P1)。 */
   let lastBackendGen: number | null = null;
+  /** 重装触发器:托盘停播后自增一次,让下面的装载 effect 再跑一轮(见 onPlayerStopped)。 */
+  let reloadKey = $state(0);
+  /** 每轨静音(源名 → 静音):Rust 混音时跳过该轨,双轨同步与时钟零影响。
+   * 用途:双轨串音的笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音。
+   * 声明提前到装载 effect 之上:每次装载成功要按它补发一遍(见下方)。 */
+  let muted = $state<Record<string, boolean>>({});
   $effect(() => {
+    // 托盘停播后的重装入口:核被后端拆了,本 effect 必须再跑一轮才有得播(见下方
+    // onPlayerStopped)。读一下即建立依赖,值本身无意义。
+    void reloadKey;
     trackErrors = [];
     if (tracks.length === 0) {
       loadPromise = null;
@@ -110,6 +119,12 @@
           throw SUPERSEDED;
         }
         lastBackendGen = res.gen;
+        // 静音是**内核态**,新核每轨一律 muted=false;不补发的话开关显示"已静音"而声音
+        // 照出,再点一次还只是发 false(看着像开关坏了)。凡装载成功即按本地表补一遍——
+        // 不止托盘停播这条新路径,转码完成重拉/续录/A-B 切换一直都缺这一步(Codex P2)。
+        for (const [source, m] of Object.entries(muted)) {
+          if (m) void invoke("player_set_muted", { source, muted: true }).catch(() => {});
+        }
         // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):会话按新代次恢复,位置与
         // 播放态沿用重装前的现场。装的是别的笔记则不恢复——上面已经作废了。
         // totalMs 用本次装载返回的 res.total_ms:续录会让笔记变长,沿用重装前的
@@ -174,9 +189,34 @@
     };
   });
 
-  // 每轨静音(源名 → 静音):Rust 混音时跳过该轨,双轨同步与时钟零影响。
-  // 用途:双轨串音的笔记(外放+蓝牙延迟致 AEC 失效)静掉一轨即无回音。
-  let muted = $state<Record<string, boolean>>({});
+  /** 托盘「停止播放」拆掉了本组件在用的核:不复位的话按钮停在「播放中」、进度僵住,
+      再点播放会打到空内核报「尚未装载音轨」。复位后自增 reloadKey 重装一次,回到
+      "进页面刚装好、停在 0"的状态,随时可以再播。
+
+      两种"在用"都要认(Codex P2):
+      ① 代次相同 = 停的正是本实例已装好的核;
+      ② **本实例正在装**(loading):托盘停播是无条件的,后端进门就推进代次,在途装载
+         必在发布段被判过期——而它的代次前端此刻还拿不到(cleanup 已把 lastBackendGen
+         清成 null),只能按"正在装"认领。此时还要同步推进本地 loadGen,让那次在途装载
+         按既有的「已取代」语义静默失败:否则它会以装载错误弹在页面上,而播放器一直
+         停在未装载,得等切轨或重挂载才恢复。
+      两条都不沾则事不关己(停的是别的实例装的核),什么都不做。 */
+  $effect(() => {
+    const un = onPlayerStopped((e) => {
+      const mine = lastBackendGen !== null && e.gen === lastBackendGen;
+      if (!mine && !loading) return;
+      playing = false;
+      currentMs = 0;
+      // 先清代次再重装:装载 effect 的 cleanup 会拿它发条件停止,核都没了不必再停一次。
+      lastBackendGen = null;
+      if (loading) loadGen++;
+      reloadKey++;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   function toggleMute(source: string) {
     muted = { ...muted, [source]: !muted[source] };
     void invoke("player_set_muted", { source, muted: !!muted[source] }).catch(() => {});

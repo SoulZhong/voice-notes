@@ -119,6 +119,13 @@ export function onPlayerPos(cb: (e: PlayerPosEvent) => void) {
   return listen<PlayerPosEvent>("player_pos", (ev) => cb(ev.payload));
 }
 
+/** 后端主动停掉了播放(目前唯一发源地:托盘「停止播放」)。前端发起的 player_stop 不发
+ * 这条——它自己知道。gen = 被停掉的那次装载代次,收方据此只清自己名下的会话/播放器。 */
+export type PlayerStoppedEvent = { gen: number };
+export function onPlayerStopped(cb: (e: PlayerStoppedEvent) => void) {
+  return listen<PlayerStoppedEvent>("player_stopped", (ev) => cb(ev.payload));
+}
+
 /** 云端识别连接状态(仅云端模式录制时产生),事件名 "cloud-asr-status"。录制页据此显示
  * 「重连中/补识中/补识失败」的细提示条,未接监听不影响录制。 */
 export type CloudAsrStatusEvent = {

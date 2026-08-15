@@ -51,39 +51,60 @@ fn tray_enabled(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
-/// 按录制态构建三项菜单：toggle 文案随 recording 切「停止录制」/「开始录制」，
-/// show / quit 恒定。id 稳定（toggle/show/quit），on_menu_event 据此分发。
+/// 按录制态构建菜单：toggle 文案随 recording 切「停止录制」/「开始录制」，
+/// show / quit 恒定。id 稳定（toggle/stop_playback/show/quit），on_menu_event 据此分发。
 ///
 /// toggle 项按录制就绪判定禁用（spec：模型缺失时禁用开始录制）：录制中恒可停
 /// （enabled = recording || ready）；未录且当前选型模型不完整则灰掉，避免点了必然失败。
-/// 已知取舍:刷新时机只有 setup / set_recording(即 start/stop 前后),模型下载完成本身不触发
-/// 菜单重建——故"模型刚下完到下一次 start/stop 之间"这段,菜单项仍是灰的(点不亮的窗口),
-/// 要到下一次录制状态变化才刷新可用。可接受:下载完成是低频一次性事件。
-/// 三个菜单项的标签(toggle / show / quit),按当前界面语言取。抽成纯函数是为了可测:
-/// build_menu 要 AppHandle,单测里造不出来,而"语言切了托盘却还是旧文案"正是这里会漏的。
-fn menu_labels(recording: bool) -> [String; 3] {
-    [
+/// 已知取舍:刷新时机只有 setup / set_recording(即 start/stop 前后)/播放会话变化,
+/// 模型下载完成本身不触发菜单重建——故"模型刚下完到下一次刷新之间"这段,菜单项仍是灰的
+/// (点不亮的窗口),要到下一次状态变化才刷新可用。可接受:下载完成是低频一次性事件。
+///
+/// 菜单项 =(稳定 id, 标签),按当前界面语言取。抽成纯函数是为了可测:build_menu 要
+/// AppHandle,单测里造不出来,而"语言切了托盘却还是旧文案"正是这里会漏的。
+///
+/// 「停止播放」只在**有播放会话**时插入(id: stop_playback):托盘常驻下关掉主窗口后
+/// 音频继续播(与音乐 App 一致),托盘就是唯一能停它的地方;没在播时插一个点了什么也
+/// 不发生的死项,比不插更糟。会话语义(装载不算播放,见 playback.svelte.ts)在前端,
+/// 故这个开关由前端经 set_playback_active 告知,后端不猜。
+fn menu_items(recording: bool, playback_active: bool) -> Vec<(&'static str, String)> {
+    let mut items = vec![(
+        "toggle",
         if recording {
             crate::tr!("停止录制", "Stop recording")
         } else {
             crate::tr!("开始录制", "Start recording")
         },
-        crate::tr!("打开主窗口", "Open main window"),
-        crate::tr!("退出", "Quit"),
-    ]
+    )];
+    if playback_active {
+        items.push(("stop_playback", crate::tr!("停止播放", "Stop playback")));
+    }
+    items.push(("show", crate::tr!("打开主窗口", "Open main window")));
+    items.push(("quit", crate::tr!("退出", "Quit")));
+    items
+}
+
+/// 当前是否有播放会话。try_state:托盘可能在 manage 之前建起来(setup 顺序变动时),
+/// 取不到就当没在播——菜单少一项远好过 panic 掉整个托盘。
+fn playback_active(app: &AppHandle) -> bool {
+    app.try_state::<crate::AppState>()
+        .map(|s| s.playback_active.load(Ordering::SeqCst))
+        .unwrap_or(false)
 }
 
 fn build_menu(app: &AppHandle, recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
-    let [toggle_label, show_label, quit_label] = menu_labels(recording);
     // 模式感知就绪判定,与设置页(models_status)/开录守卫同一份:云端模式下本机大模型
     // 不必需,只要 vad 在 + 凭证齐就该点得亮——否则云端用户面对一个永远灰着的菜单项。
     let ready = crate::current_models_status(app).recording_ready;
-    let toggle = MenuItemBuilder::with_id("toggle", toggle_label)
-        .enabled(recording || ready)
-        .build(app)?;
-    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
-    Menu::with_items(app, &[&toggle, &show, &quit])
+    let mut built: Vec<MenuItem<tauri::Wry>> = Vec::new();
+    for (id, label) in menu_items(recording, playback_active(app)) {
+        // toggle 之外的项恒可点:show/quit 无前置条件,stop_playback 只在有会话时才存在。
+        let enabled = id != "toggle" || recording || ready;
+        built.push(MenuItemBuilder::with_id(id, label).enabled(enabled).build(app)?);
+    }
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        built.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>).collect();
+    Menu::with_items(app, &refs)
 }
 
 /// 菜单事件分发。toggle → 切换录制；show → 显示并聚焦主窗；quit → 录制中先收尾再退。
@@ -96,6 +117,9 @@ fn on_menu_event(app: &AppHandle, id: &str) {
                 let _ = w.set_focus();
             }
         }
+        // 停播放不碰窗口:用户从托盘停,本意就是不想让窗口跳出来。前端(哪怕窗口是隐藏的,
+        // webview 仍在跑)收 player_stopped 后自行清会话/复位播放器。
+        "stop_playback" => crate::player::stop_from_tray(app),
         "quit" => {
             // 录制中先收尾再退：经 actor 发 Cmd::Stop(P1 改道,委托 do_stop_recording,
             // 阻塞至 flush 尾段 + finalize 落盘完成),秒级延迟是 spec 已知取舍——绝不能
@@ -169,6 +193,14 @@ pub fn set_recording(app: &AppHandle, recording: bool) {
     if let Err(e) = app.run_on_main_thread(move || set_menu_on_main(&app2, recording)) {
         eprintln!("托盘菜单派发失败（不影响录制）: {e}");
     }
+}
+
+/// 播放会话开关变化时重建菜单(「停止播放」项的出现/消失)。录制文案不是本次的
+/// 变化点,但菜单是整份重建的,故现读一次 running 保持它正确——读完即放,
+/// 与 set_recording 同一把 statement-scoped 锁,不与其它锁嵌套。
+pub fn refresh_menu(app: &AppHandle) {
+    let recording = *app.state::<crate::AppState>().running.lock().unwrap();
+    set_recording(app, recording);
 }
 
 fn set_menu_on_main(app: &AppHandle, recording: bool) {
@@ -288,25 +320,45 @@ mod tests {
         assert!(!is_active(&s), "暂停即静止");
     }
 
+    fn labels(recording: bool, playing: bool) -> Vec<String> {
+        menu_items(recording, playing).into_iter().map(|(_, l)| l).collect()
+    }
+    fn ids(recording: bool, playing: bool) -> Vec<&'static str> {
+        menu_items(recording, playing).into_iter().map(|(id, _)| id).collect()
+    }
+
     /// 托盘菜单标签随界面语言切换。语言是进程级全局,故先拿 test_lang_guard 与其它
     /// 改语言的用例互斥,末尾复位中文。
     #[test]
     fn menu_labels_follow_ui_language() {
         let _guard = crate::i18n::test_lang_guard();
         crate::i18n::set_lang("zh");
-        assert_eq!(menu_labels(false)[0], "开始录制");
-        assert_eq!(menu_labels(true)[0], "停止录制");
-        assert_eq!(menu_labels(false)[1..], ["打开主窗口".to_string(), "退出".to_string()]);
+        assert_eq!(labels(false, false)[0], "开始录制");
+        assert_eq!(labels(true, false)[0], "停止录制");
+        assert_eq!(labels(false, false)[1..], ["打开主窗口".to_string(), "退出".to_string()]);
+        assert_eq!(labels(false, true)[1], "停止播放");
 
         crate::i18n::set_lang("en");
-        assert_eq!(menu_labels(false)[0], "Start recording");
-        assert_eq!(menu_labels(true)[0], "Stop recording");
+        assert_eq!(labels(false, false)[0], "Start recording");
+        assert_eq!(labels(true, false)[0], "Stop recording");
         assert_eq!(
-            menu_labels(false)[1..],
+            labels(false, false)[1..],
             ["Open main window".to_string(), "Quit".to_string()]
         );
+        assert_eq!(labels(false, true)[1], "Stop playback");
 
         crate::i18n::set_lang("zh");
+    }
+
+    /// 「停止播放」只在有播放会话时出现,且不挤掉任何既有项——它是插入,不是替换。
+    /// 死项(没在播还挂着一个点了什么都不发生的「停止播放」)是这条用例要挡的回退。
+    #[test]
+    fn stop_playback_item_only_while_a_session_exists() {
+        assert_eq!(ids(false, false), ["toggle", "show", "quit"]);
+        assert_eq!(ids(true, false), ["toggle", "show", "quit"]);
+        assert_eq!(ids(false, true), ["toggle", "stop_playback", "show", "quit"]);
+        // 录制与播放互不排斥:边录边听旧笔记时两项都在。
+        assert_eq!(ids(true, true), ["toggle", "stop_playback", "show", "quit"]);
     }
 
     /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。

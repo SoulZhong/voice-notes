@@ -1,4 +1,4 @@
-import { onNoteRenamed, onPlayerPos } from "$lib/events";
+import { onNoteRenamed, onPlayerPos, onPlayerStopped } from "$lib/events";
 
 /** 活动播放会话。由用户**真正开始播放**建立,不是装载建立——播放器进笔记页就会
     自动装载,若用装载判定,只看过没播过的笔记离页后也会冒出迷你条。 */
@@ -55,6 +55,13 @@ class Playback {
     this.playing = e.playing;
   }
 
+  /** 后端主动停止(托盘「停止播放」):内核已经拆了,会话必须跟着散,否则浮层挂着
+      一篇点不动的笔记。只清**自己这一代**:代次不符说明这条事件属于旧内核,而当前
+      会话是它之后新起的,清了就误杀正在播的那篇。 */
+  stopped(gen: number) {
+    if (this.session?.gen === gen) this.clear();
+  }
+
   /** 后台播放期间笔记被改名 → 迷你条标题跟着更新,否则会一直显示旧名。 */
   rename(noteId: string, title: string) {
     if (this.session?.noteId === noteId) this.session = { ...this.session, title };
@@ -78,8 +85,10 @@ export const playback = new Playback();
 export function startPlaybackSubscriptions(): () => void {
   const unPos = onPlayerPos((e) => playback.applyPos(e));
   const unRename = onNoteRenamed((e) => playback.rename(e.note_id, e.title));
+  const unStopped = onPlayerStopped((e) => playback.stopped(e.gen));
   return () => {
     void Promise.resolve(unPos).then((f) => f());
     void Promise.resolve(unRename).then((f) => f());
+    void Promise.resolve(unStopped).then((f) => f());
   };
 }
