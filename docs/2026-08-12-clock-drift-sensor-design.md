@@ -114,6 +114,14 @@ Adriaensen 二阶 DLL(LAC 2005/2012),纯函数、无 I/O、无系统调用,可�
 >
 > **实现期修订(Codex review 终审发现,AEC 消掉标定刺激)**:默认 capture_path=aec 下,软件 AEC(WebRTC AEC3)在 mic.wav 落盘之前就以 system 路为参考消回声,而 E1 播放的 click 恰恰是"系统回放 → mic 收到的房间回声"这个信号本身——被定向消除后 xcorr 的 0.5 相关阈值会拒掉所有窗,标定测不出任何东西;capture_path=vpio 档同理(Apple AEC 在采集端就把回声压掉)。裁定的修法是环境变量旁路 `VOICE_NOTES_CALIBRATION=1`(`lib.rs` 会话装配处):置位时①强制普通 cpal 麦克风(不进 VPIO)②跳过软件 AEC 角色构建(`aec_roles` 留空),仅对本场生效,不进设置系统/UI——AEC 本身是 PR#86 定死不可配的,标定是唯一例外。该场录音因此会有回声(mic 能听见系统外放)属预期。详见 `scripts/drift-calibration.md` 的启动命令。
 
+> **二期进展(2026-08-15)**:E3 探针已落地并跑出第一批数字,见
+> `docs/2026-08-15-catap-e3-spike.md`(工具 `src-tauri/examples/catap_spike.rs`)。
+> 结论摘要:路线 A 在 macOS 26.5.2 上跑得通,单 IOProc 双轨样本数逐帧相等、370s×2 场
+> 零时间戳断层、CPU 0.05% 单核、跨时钟域补偿残余 ≲1ppm;判据 3(热插拔)与判据 4 的
+> 签名 app 口径仍未测,判据 1 的**声学**口径未做,故**尚未裁决**。
+> E2 侧:`bin/drift_stats` 加了 `--since`,把 PR#103 之前的污染场次挡在基线外;
+> 当前干净样本只有 2 场(内置麦 -3.10ppm、蓝牙 HFP 0.0006ppm),远不够裁决。
+
 **裁决标准(现在预注册,防事后拍脑袋)**——A 达标 = 同时满足:
 
 1. 残余轨间漂移中位 < 20ppm 且错位有界不累积(1 小时 < 10ms);
