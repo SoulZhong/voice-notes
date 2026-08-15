@@ -77,7 +77,7 @@ export const zh = {
 
   // ── 首页空态 ──
   "shell.home.empty": "还没有会议笔记。",
-  "shell.home.emptyHint": "点击左上角「● 开始录制」来第一场。",
+  "shell.home.emptyHint": "点击左上角「开始录制」来第一场。",
 
   // ── 欢迎引导层 ──
   "shell.welcome.tagline": "会议实时转写与说话人分离，数据流向由你选择",
@@ -256,7 +256,7 @@ export const en = {
   "shell.update.dismiss": "Got it",
 
   "shell.home.empty": "No meeting notes yet.",
-  "shell.home.emptyHint": "Click “● Start recording” in the top left to capture your first one.",
+  "shell.home.emptyHint": "Click “Start recording” in the top left to capture your first one.",
 
   "shell.welcome.tagline": "Real-time meeting transcription and speaker diarization — you choose where your data goes",
   "shell.welcome.stepsAria": "Onboarding progress",
