@@ -3,6 +3,7 @@
   import { onPlayerPos } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
+  import { playback, shouldStopOnCleanup } from "$lib/playback.svelte";
 
   /* 多轨播放器(原生引擎):音频在 Rust 里单条 cpal 输出流按 offset 混音——WebView
      只画 UI。此前 <audio> 方案在打包版(tauri:// 文档源)被 WKWebView 按自动播放策略
@@ -15,6 +16,8 @@
     waveform = [],
     currentMs = $bindable(0),
     playing = $bindable(false),
+    noteId,
+    title,
     onLoaded,
   }: {
     tracks: TrackInfo[];
@@ -22,6 +25,10 @@
     waveform?: number[];
     currentMs?: number;
     playing?: boolean;
+    /** 本播放器所属笔记的身份:建立播放会话用(迷你条要显示标题、点标题要能跳回)。
+        不传则不建立会话——本组件也被别处复用时保持现状行为。 */
+    noteId?: string;
+    title?: string;
     /** 装载成功回调(可选):tracks 变化触发的每次 player_load resolve 后调用。
         宿主用它在重装后恢复播放位置(A/B 切换保位置,codex P2)——原生核心
         每次装载都从 0/paused 起,不回调宿主无从得知何时可以 seek。 */
@@ -81,6 +88,13 @@
         // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
         // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
         if (gen !== loadGen) throw SUPERSEDED;
+        // 后端 player_load 进门就 stop_stream 杀旧核,会话必须在**发起装载之前**
+        // 同步作废——放在成功之后同步的话,装载失败/被取代/在途离页三条路径都会
+        // 漏掉,留下一个指着已死内核的会话:迷你条挂着旧笔记、进度僵住、按钮点不动。
+        const prevSession = playback.session
+          ? { session: playback.session, atMs: playback.currentMs, playing: playback.playing }
+          : null;
+        playback.clear();
         const res = await invoke<{ total_ms: number; gen: number }>("player_load", { tracks: payload }).catch((e) => {
           // 后端代次门的拒绝统一折算成取消哨兵(Codex P2):凡 invoke 失败且本地已
           // 换代,必是切换导致的取代而非故障——不按本地化文案匹配,按换代事实判定;
@@ -96,6 +110,17 @@
           throw SUPERSEDED;
         }
         lastBackendGen = res.gen;
+        // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):会话按新代次恢复,位置与
+        // 播放态沿用重装前的现场。装的是别的笔记则不恢复——上面已经作废了。
+        // totalMs 用本次装载返回的 res.total_ms:续录会让笔记变长,沿用重装前的
+        // 旧值会让迷你条的进度环卡在旧总长上(算出来的百分比偏大甚至提前满格)。
+        if (prevSession && noteId && prevSession.session.noteId === noteId) {
+          playback.restore(
+            { ...prevSession.session, gen: res.gen, totalMs: res.total_ms },
+            prevSession.atMs,
+            prevSession.playing,
+          );
+        }
         onLoaded?.();
         return res.total_ms;
       })();
@@ -125,9 +150,16 @@
       // 条件停止(Codex 十轮 P1):只回收**自己**最后一次成功装载的核——迟到的
       // 本 stop 若发现后端代次已前进(新组件已在装载),no-op 不拆别人;从未成功
       // 装载过则无核可收,不发。在途装载的回收由上方 invoke 后的换代分支自理。
+      //
+      // 所有权:内核归**会话**所有,不再归组件所有。本组件装的核若正是活动会话,
+      // 卸载不停它——那正是"切页继续播放"。其余情形语义同现状。
+      // 注意 cleanup 不等于组件卸载:本 effect 依赖 tracks,转码完成重拉、续录、
+      // A/B 切换都会重跑它,所以这里绝不能做"登记会话"之类的副作用。
       const g = lastBackendGen;
       lastBackendGen = null;
-      if (g !== null) void invoke("player_stop", { ifGen: g }).catch(() => {});
+      if (shouldStopOnCleanup(g, playback.session?.gen ?? null)) {
+        void invoke("player_stop", { ifGen: g }).catch(() => {});
+      }
     };
   });
 
@@ -176,6 +208,12 @@
     playing = true; // 乐观置位:事件到达前按钮即时反馈;失败在 catch 复位
     loadPromise
       .then(() => invoke("player_play"))
+      .then(() => {
+        // 会话由**真正开始播放**建立(spec:装载不算)。缺身份则不建会话。
+        if (noteId && lastBackendGen !== null) {
+          playback.begin({ gen: lastBackendGen, noteId, title: title ?? "", totalMs });
+        }
+      })
       .catch((e) => {
         playing = false;
         if (e !== SUPERSEDED) reportError(t("notes.player.errPlay"), `${e}`);

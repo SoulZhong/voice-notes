@@ -111,6 +111,10 @@ export const zh = {
   "notes.player.errLoad": "音轨装载",
   "notes.player.errPlay": "播放",
 
+  // 全局迷你播放浮层(MiniPlayer)右键菜单
+  "notes.player.backToNote": "回到笔记",
+  "notes.player.stopPlayback": "关闭播放",
+
   // 回放方案 A/B 切换(二期)
   "notes.mix.dual": "双轨",
   "notes.mix.mixed": "成品轨",
@@ -221,6 +225,10 @@ export const en = {
   "notes.player.loading": "Loading audio (first load of a long recording may take a while to align)…",
   "notes.player.errLoad": "Track loading",
   "notes.player.errPlay": "Playback",
+
+  // Global mini-player overlay (MiniPlayer) context menu
+  "notes.player.backToNote": "Back to note",
+  "notes.player.stopPlayback": "Stop playback",
 
   // Playback scheme A/B toggle (phase 2)
   "notes.mix.dual": "Dual tracks",

@@ -22,8 +22,15 @@
   } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
+  import MiniPlayer from "$lib/MiniPlayer.svelte";
+  import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
 
   let { children } = $props();
+
+  // 迷你播放浮层的显示判定复用同一个纯函数(与 MiniPlayer.svelte 内部判定同源),
+  // 避免这里再造一份、和浮层实际是否渲染不同步——那样安全区可能在浮层没显示时白留一块空白,
+  // 或者浮层显示了但没留出安全区。
+  const showMiniPlayer = $derived(shouldShowMiniPlayer(playback.session?.noteId ?? null, $page.url.pathname));
 
   // 升级提示放全局布局:app 启动落地页可能是笔记详情/录制/空态任一(见根路由重定向),
   // 布局却必挂载且跨路由常驻——查一次、有新版且未忽略就在内容区顶部出可关闭横幅。
@@ -62,6 +69,7 @@
 
   // 基础初始化由 onboarded 记账；每个新功能由 completed_guides 中的独立 ID 记账。
   // 因此旧用户可以看到新功能引导，同时不会重复经历模型下载。
+
   let welcomeStatus = $state<ModelsStatus | null>(null);
   async function checkOnboarding() {
     try {
@@ -95,6 +103,10 @@
     void tidy.refresh();
   });
 
+  // 位置事件的全局订阅:放这里而不是 AudioPlayer 里——组件一卸载订阅就没了,
+  // 迷你条的进度会僵住。
+  $effect(() => startPlaybackSubscriptions());
+
   onMount(() => {
     recording.init();
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
@@ -119,7 +131,7 @@
 
 <div class="shell">
   <Sidebar />
-  <main class="main">
+  <main class="main" class:with-orb-safearea={showMiniPlayer}>
     {#if update}
       <div class="update-banner">
         <span class="upd-dot"></span>{t("shell.update.found", { latest: update.latest, current: update.current })}
@@ -162,6 +174,7 @@
   <WelcomeOverlay status={welcomeStatus} onDone={onWelcomeDone} />
 {/if}
 <ContextGuide />
+<MiniPlayer />
 
 <style>
   :global(body) {
@@ -178,6 +191,15 @@
     flex: 1;
     overflow-y: auto;
     min-width: 0;
+  }
+  /* 迷你播放浮层显示时才留底部安全区,不显示时不留——否则会凭空多出一块空白。
+     高度 = 浮层直径 + 上下各一份留白,让可滚动页面的最后一行能完全滚到浮层上方
+     而不是被压在下面。--orb-size/--orb-inset 与 MiniPlayer.svelte 的 .orb 共用同一份
+     token(定义在 app.css),避免尺寸各自硬编码后互相漂移。
+     注:不用 bind:clientHeight 量浮层实高再回填——浮层是固定常量尺寸的圆,量了也白量,
+     还会在挂载瞬间有一帧安全区缺失/多余的闪烁。 */
+  .main.with-orb-safearea {
+    padding-bottom: calc(var(--orb-size) + var(--orb-inset) * 2);
   }
   /* 全局升级横幅:内容区顶部,与页面内边距对齐(各页 container 多为 1.5rem 内边距) */
   .update-banner {

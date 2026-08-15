@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { goto } from "$app/navigation";
+import { playback } from "$lib/playback.svelte";
 import {
   onPartial,
   onStatus,
@@ -128,6 +129,15 @@ export const recording = {
     });
     onStatus((e) => {
       if (e.state === "recording") {
+        // 开录即停回放兜底:托盘/全局快捷键(toggle_recording)与 MCP(start_recording)
+        // 直接调后端命令,不经过本文件的 start()/resume()——那两处的前置停止全部
+        // 绕不开这里。"recording" 状态是所有开录路径(手动/续录/托盘/快捷键/MCP)
+        // 唯一的汇合点,兜底放这里才不漏。只在有会话时才发命令,重复进入(暂停恢复/
+        // 对账重发)不会反复调用——幂等、不误伤。
+        if (playback.session) {
+          void invoke("player_stop", {}).catch(() => {});
+          playback.clear();
+        }
         // 同一笔记且此前已是 live（暂停恢复/重复对账）：只更新计时与暂停位，不清屏。
         const isUnpause = e.note_id === noteId && (status === "recording" || status === "paused");
         status = e.state;
@@ -223,6 +233,12 @@ export const recording = {
     if (pending || this.isLive) return false;
     pending = true;
     try {
+      // 开录即停回放:两条 cpal 链路技术上独立,但正在播放的旧笔记会被 system 轨
+      // 录进去,还可能经扬声器串进 mic——是内容污染,不是"互不干扰"。
+      if (playback.session) {
+        await invoke("player_stop", {}).catch(() => {});
+        playback.clear();
+      }
       await invoke("start_recording");
       return true;
     } catch (err) {
@@ -262,6 +278,12 @@ export const recording = {
       speakers = { ...note.speakers };
       noteId = noteId_;
       resuming = true;
+      // 开录即停回放:续录是四条开录路径之一(另三条见 start()/onStatus 汇合点注释),
+      // 同样会把正在播放的旧笔记 system 轨录进新会议——污染内容,必须同样前置停止。
+      if (playback.session) {
+        await invoke("player_stop", {}).catch(() => {});
+        playback.clear();
+      }
       try {
         await resumeRecording(noteId_);
         return true;

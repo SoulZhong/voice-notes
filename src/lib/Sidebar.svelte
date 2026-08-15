@@ -1,9 +1,11 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
+  import { invoke } from "@tauri-apps/api/core";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { onNoteRenamed } from "$lib/events";
   import { recording } from "$lib/recording.svelte";
+  import { playback } from "$lib/playback.svelte";
   import { noteBadgeKind, type NoteBadgeKind } from "$lib/noteBadge";
   import {
     listNotes,
@@ -264,6 +266,13 @@
       cancelLabel: t("shell.deleteConfirm.cancel"),
     });
     if (!yes) return;
+    // 删除前必须先停:音轨是 mmap,Unix 上已删文件会继续播,Windows 上活动映射
+    // 还可能让删除本身失败。用 noteId 比对而非当前路由——可能正在设置页听着 A,
+    // 同时从侧栏删掉 A,这条路径必须覆盖。
+    if (playback.session?.noteId === id) {
+      await invoke("player_stop", {}).catch(() => {});
+      playback.clear();
+    }
     try {
       await deleteNote(id);
       recording.bumpNotes();

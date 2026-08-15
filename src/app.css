@@ -84,6 +84,13 @@
   --radius-xl: 10px;
   --radius-full: 9999px;
 
+  /* 迷你播放浮层(MiniPlayer 的 .orb)尺寸与离边距——定成全局 token 而不是分别写在
+     MiniPlayer.svelte 与 +layout.svelte 里,是因为后者需要给主内容区留出恰好能避开
+     浮层的 padding-bottom(安全区),两处数字若各自硬编码,改一处忘另一处就会让浮层
+     重新盖住内容。安全区高度按 (--orb-size + --orb-inset * 2) 计算:直径 + 上下各一份留白。 */
+  --orb-size: 56px;
+  --orb-inset: 16px;
+
   /* 深度靠表面阶梯不靠投影;浮层深阴影;shadow-btn 为主按钮药丸专用。
      light-dark() 只接受 <color>,box-shadow 的 offset/blur 不能整体塞进去,
      所以只把每层阴影里的颜色部分换成 light-dark(),结构(含分层用的逗号)保持不动 */
