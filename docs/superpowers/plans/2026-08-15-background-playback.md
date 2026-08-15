@@ -247,10 +247,13 @@ class Playback {
     if (this.session?.noteId === noteId) this.session = { ...this.session, title };
   }
 
-  /** 同一篇笔记被重新装载(转码完成重拉/续录/A-B 切换)→ 会话改指新内核。
-      不这么做的话,新核代次一变,位置事件就全被 applyPos 过滤掉,迷你条进度僵住。 */
-  rebind(gen: number) {
-    if (this.session) this.session = { ...this.session, gen };
+  /** 同篇重装后恢复会话:代次换新,位置与播放态沿用重装前的现场。
+      不能用 begin ——它把 currentMs 归零、playing 置真,那是「新开一段播放」的语义,
+      重装场景下会把迷你条进度打回 0。 */
+  restore(s: PlaybackSession, atMs: number, playing: boolean) {
+    this.session = s;
+    this.currentMs = atMs;
+    this.playing = playing;
   }
 }
 
@@ -322,10 +325,13 @@ describe("会话状态机", () => {
     playback.clear();
   });
 
-  it("同篇重装 → rebind 改指新核,位置事件继续被接受", () => {
+  it("同篇重装 → restore 换新代次且不归零现场,新代次事件被接受", () => {
     playback.begin(s);
-    playback.rebind(8);
+    playback.applyPos({ pos_ms: 5000, playing: true, gen: 3 });
+    playback.restore({ ...s, gen: 8 }, 5000, true);
     expect(playback.session?.gen).toBe(8);
+    expect(playback.currentMs).toBe(5000);
+    expect(playback.playing).toBe(true);
     playback.applyPos({ pos_ms: 2000, playing: true, gen: 8 });
     expect(playback.currentMs).toBe(2000);
     // 旧代次事件仍要丢弃
@@ -402,21 +408,37 @@ git commit -m "feat(playback): 播放会话 store
       }
 ```
 
-- [ ] **Step 3: 装载成功后同步会话归属(这是竞态的另一半)**
+- [ ] **Step 3: 会话跟着内核走(发起前作废,成功后恢复)**
 
-装载成功后后端内核已被取代。若不同步,会出现"迷你条显示笔记 A,而 ⏸ 按钮控制的是
-刚装好的 B"——spec 第二版 P1 明确要求定义这条原子更新规则。
+后端 `player_load` 在**函数入口**就 `begin_load()+stop_stream()` 杀掉旧核。所以会话必须
+在**发起装载之前**同步作废——放在成功之后同步的话,装载失败 / 被 SUPERSEDED / 在途
+离页三条路径都会漏掉,留下一个指着已死内核的会话:迷你条挂着旧笔记、进度僵住、
+按钮点不动。
 
-在 `lastBackendGen = res.gen;` 这一行**之后**插入:
+先在 `const res = await invoke<...>("player_load", ...)` 这一句**之前**插入(变量名必须叫
+`prevSession`,不能叫 `prev`——外层 `loadChain` 已有一个 `prev`,重名会触发 TDZ 错误
+而且被 `try { await prev } catch {}` 静默吞掉,变成并发装载时的串行链失效):
 
 ```ts
-        // 后端装载成功即取代了上一个内核,活动会话必须跟着走:
-        // - 同一篇笔记重装(转码完成重拉/续录/A-B 切换)→ 会话改指新核,不丢会话;
-        // - 装的是别的笔记 → 会话持有的核已被取代,作废。
-        // 不做这步的话,迷你条会显示旧笔记,而按钮控制的是新内核。
-        if (playback.session) {
-          if (noteId && playback.session.noteId === noteId) playback.rebind(res.gen);
-          else playback.clear();
+        const prevSession = playback.session
+          ? { session: playback.session, atMs: playback.currentMs, playing: playback.playing }
+          : null;
+        playback.clear();
+```
+
+再在 `lastBackendGen = res.gen;` 这一行**之后**插入:
+
+```ts
+        // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):按新代次恢复会话,位置与
+        // 播放态沿用重装前的现场;装的是别的笔记则不恢复——发起装载前已作废。
+        // totalMs 用本次装载返回的 res.total_ms:续录后笔记变长,沿用旧值会让
+        // 迷你条进度卡在旧总长。
+        if (prevSession && noteId && prevSession.session.noteId === noteId) {
+          playback.restore(
+            { ...prevSession.session, gen: res.gen, totalMs: res.total_ms },
+            prevSession.atMs,
+            prevSession.playing,
+          );
         }
 ```
 
@@ -794,6 +816,7 @@ Run: `npm run tauri dev`,逐条走 spec 的冒烟清单:
 - [ ] **只进笔记页不点播放,离开后不出现迷你条**
 - [ ] 播放中打开另一篇笔记 → 旧的停止,迷你条消失,新笔记未播放
 - [ ] 播放中**快速连点两篇笔记** → 不出现"迷你条显示 A 但按钮控制 B"
+- [ ] **后台播放时切换 A/B 音轨方案** → 播放不中断、迷你条进度不僵住(Task 3 实现者提出:装载 effect 的 cleanup 在切轨时也会跑,该路径只做过静态推演,未真机验证)
 - [ ] 迷你条 ✕ → 停止且消失
 - [ ] 播到结尾 → 迷你条仍在且可重播
 - [ ] 播放中开始录制 → 播放停止、迷你条消失
