@@ -37,24 +37,39 @@ def read(path):
 # 每个窗的"错位"都等于同一个边界值——拟合出来是一条完美的 0.00ppm 直线、残差 0.000ms,
 # 看着比真数据还漂亮(Codex 五轮 P2,拿一条 rms=0 的实测轨复现过)。
 CORR_FLOOR = 0.02
+# 窗内**去均值后**的 RMS 门槛(满量程归一后的幅度)。约 -80dBFS:低于它就当这段没内容,
+# 免得拿一段恒定直流或极低电平的噪声去拟合。
+RMS_FLOOR = 1e-4
 
 
 def norm_xcorr_at(a, b, t0, win, lo, hi):
-    """在 b 的 [t0+lo, t0+hi] 里找与 a[t0:t0+win] 最像的偏移。返回 (offset, corr, at_edge)。"""
-    seg = a[t0 : t0 + win]
-    ea = float(np.dot(seg, seg))
-    if ea < 1e-6:
-        return None  # 参考侧这一段是静音,没什么可对的
+    """在 b 的 [t0+lo, t0+hi] 里找与 a[t0:t0+win] 最像的偏移。返回 (offset, corr, at_edge)。
+
+    相关**去均值**(Pearson 口径),两侧都要过方差门槛。不去均值的话,一段恒定直流
+    (比如 1 LSB 的"数字静音")在每个滞后上的相关都是 1.0,照样能拟合出完美直线
+    (Codex 六轮 P2)。
+    """
+    seg = a[t0 : t0 + win].astype(np.float64)
+    seg = seg - seg.mean()
+    varx = float(np.dot(seg, seg))
+    if varx / win < RMS_FLOOR**2:
+        return None  # 参考侧这一段是静音或纯直流,没什么可对的
     start, end = t0 + lo, t0 + hi + win
     if start < 0 or end > len(b):
         return None
-    window = b[start:end]
-    if float(np.dot(window, window)) < 1e-6:
-        return None  # 采集侧整段静音
-    corr = np.correlate(window, seg, mode="valid")
-    cs = np.concatenate(([0.0], np.cumsum(window.astype(np.float64) ** 2)))
-    energies = cs[win:] - cs[: len(cs) - win]
-    ncorr = corr / np.sqrt(ea * np.maximum(energies, 1e-12))
+    window = b[start:end].astype(np.float64)
+    # 逐滞后的局部均值/方差(cumsum 前缀和),再算 Pearson 相关。
+    cs1 = np.concatenate(([0.0], np.cumsum(window)))
+    cs2 = np.concatenate(([0.0], np.cumsum(window**2)))
+    sum_y = cs1[win:] - cs1[: len(cs1) - win]
+    sumsq_y = cs2[win:] - cs2[: len(cs2) - win]
+    vary = sumsq_y - sum_y**2 / win
+    # seg 已去均值,故 dot(seg, y) 天然等于去均值后的协方差分子。
+    cov = np.correlate(window, seg, mode="valid")
+    valid = vary / win >= RMS_FLOOR**2
+    if not valid.any():
+        return None  # 采集侧整段静音/纯直流
+    ncorr = np.where(valid, cov / np.sqrt(varx * np.maximum(vary, 1e-12)), -1.0)
     k = int(np.argmax(ncorr))
     best = float(ncorr[k])
     if best < CORR_FLOOR:
