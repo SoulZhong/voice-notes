@@ -538,6 +538,9 @@ mod mac {
         /// 断层明细 (发生在第几秒, 跳了多少帧):区分"启动瞬态"与"跑起来之后真的丢帧"。
         /// 只留前 20 条,回调里不做无界增长。
         gap_log: Vec<(f64, f64)>,
+        /// 带/不带有效 mSampleTime 的回调数:分清"0 次断层"与"根本没得查"。
+        ts_valid: u64,
+        ts_missing: u64,
         /// 第一次/最后一次回调的墙钟时刻。实测采样率必须**取这两点之间**:从
         /// AudioDeviceStart 起算会把设备启动延迟(实测 ~0.2s)当成"慢了 14000ppm";
         /// 算到停止时刻则会把主循环 200ms 的轮询粒度算进去(370s 上就是 -540ppm 的假象)。
@@ -576,27 +579,6 @@ mod mac {
         let n = list.mNumberBuffers as usize;
         let bufs = std::slice::from_raw_parts(list.mBuffers.as_ptr(), n);
 
-        // 时间戳连续性:期望本次的 mSampleTime = 上次 + 上次帧数。
-        if !input_time.is_null() {
-            let ts = &*input_time;
-            if ts.mFlags & kAudioTimeStampSampleTimeValid != 0 {
-                if s.last_sample_time > 0.0 {
-                    let expect = s.last_sample_time;
-                    let d = (ts.mSampleTime - expect).abs();
-                    if d > 1.0 {
-                        s.gaps += 1;
-                        if d > s.max_gap {
-                            s.max_gap = d;
-                        }
-                        if s.gap_log.len() < 20 {
-                            let at = s.first_cb.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-                            s.gap_log.push((at, d));
-                        }
-                    }
-                }
-                s.last_sample_time = ts.mSampleTime;
-            }
-        }
 
         // buffer 顺序按聚合设备描述里的 subdevices→taps。边界按**累计声道数**判,不是按
         // buffer 序号(Codex P2):多流输入设备(某些 USB 声卡)的 mic 会占好几个 buffer,
@@ -686,6 +668,30 @@ mod mac {
         if frames_this == 0 {
             return 0;
         }
+        // 时间戳连续性(期望本次 mSampleTime = 上次 + 上次帧数)必须放在"确认有帧"之后
+        // (Codex 十一轮 P2):空回调也更新 last_sample_time 的话,启动/热插拔期间几次
+        // 空回调就能凭空造出断层计数,与"只认有数据的回调"这条账对不上。
+        // 另外要分清"0 次断层"与"根本没时间戳可查":后者不能算判据 2 通过。
+        if input_time.is_null() || (*input_time).mFlags & kAudioTimeStampSampleTimeValid == 0 {
+            s.ts_missing += 1;
+        } else {
+            let ts = &*input_time;
+            s.ts_valid += 1;
+            if s.last_sample_time > 0.0 {
+                let d = (ts.mSampleTime - s.last_sample_time).abs();
+                if d > 1.0 {
+                    s.gaps += 1;
+                    if d > s.max_gap {
+                        s.max_gap = d;
+                    }
+                    if s.gap_log.len() < 20 {
+                        let at = s.first_cb.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                        s.gap_log.push((at, d));
+                    }
+                }
+            }
+            s.last_sample_time = ts.mSampleTime;
+        }
         s.frames += frames_this as u64;
         if s.callbacks == 0 {
             s.first_cb = Some(t0);
@@ -763,6 +769,8 @@ mod mac {
             max_gap: 0.0,
             last_sample_time: 0.0,
             gap_log: Vec::new(),
+            ts_valid: 0,
+            ts_missing: 0,
             first_cb: None,
             last_cb: None,
             first_frames: 0,
@@ -895,7 +903,18 @@ mod mac {
              \x20            其中轨内 buffer 参差 {} 次(>0 则合并归一的分母不可信,轨内容存疑)",
             shared.frame_mismatch, shared.max_frame_mismatch, shared.ragged_buffers
         );
-        println!("时间戳断层: {} 次,最大 {:.0} 帧(判据 2:应为 0)", shared.gaps, shared.max_gap);
+        if shared.ts_valid < 2 {
+            println!(
+                "时间戳断层: **未测**(带有效 mSampleTime 的回调只有 {} 个,缺失 {} 个)——\n\
+                 \x20            判据 2 这一场不成立,不能当通过",
+                shared.ts_valid, shared.ts_missing
+            );
+        } else {
+            println!(
+                "时间戳断层: {} 次,最大 {:.0} 帧(判据 2:应为 0;有效时间戳 {} 个,缺失 {} 个)",
+                shared.gaps, shared.max_gap, shared.ts_valid, shared.ts_missing
+            );
+        }
         for (at, d) in &shared.gap_log {
             println!("  断层 @{at:.1}s 跳 {d:.0} 帧 ≈ {:.0}ms", d * 1000.0 / src_hz);
         }

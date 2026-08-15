@@ -109,9 +109,22 @@ def main():
         print(__doc__)
         sys.exit(2)
     ref_path, cap_path = sys.argv[1], sys.argv[2]
-    min_corr = 0.0
-    if "--min-corr" in sys.argv:
-        min_corr = float(sys.argv[sys.argv.index("--min-corr") + 1])
+    # 参数严格校验:拼错的 `--min-cor 0.5` 被静默忽略,操作者以为收紧了阈值、实际没有,
+    # 报出来的 ppm 也就不是他要的那个(Codex 十一轮 P2)。
+    min_corr, rest = 0.0, sys.argv[3:]
+    while rest:
+        if rest[0] == "--min-corr":
+            if len(rest) < 2:
+                sys.exit("--min-corr 后面缺值")
+            try:
+                min_corr = float(rest[1])
+            except ValueError:
+                sys.exit(f"--min-corr 要一个数,收到: {rest[1]}")
+            rest = rest[2:]
+            if "--min-corr" in rest:
+                sys.exit("--min-corr 只能给一次")
+        else:
+            sys.exit(f"未知参数: {rest[0]}(可用: --min-corr)")
     ref, r1 = read(ref_path)
     cap, r2 = read(cap_path)
     assert r1 == r2, f"两个文件采样率不同: {r1} vs {r2}"
