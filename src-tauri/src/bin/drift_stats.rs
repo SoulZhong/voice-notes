@@ -255,14 +255,24 @@ fn main() {
     // 未知参数一律拒绝(Codex 九轮 P2):`--sine` 这种手滑会让上面的查找返回 None、
     // 悄悄退回"全都算",污染门形同虚设——防污染的开关必须 fail-closed 到底。
     let mut i = 1;
+    let mut since_seen = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--since" => i += 2,
+            "--since" => {
+                since_seen += 1;
+                i += 2;
+            }
             other => {
                 eprintln!("未知参数: {other}(用法: drift_stats <data_root> [--since YYYYMMDD[-HHMMSS]])");
                 std::process::exit(2);
             }
         }
+    }
+    // 重复给也要拒(Codex 十轮 P2):上面的查找只认第一个,写两次的人多半以为后一个生效,
+    // 结果按更宽松的那个跑,污染门又白设了。
+    if since_seen > 1 {
+        eprintln!("--since 给了 {since_seen} 次,只能给一次");
+        std::process::exit(2);
     }
     if let Some(s) = &since {
         println!("(只统计 {s} 及之后建档的笔记——E2 基线不得混入 PR#103 之前的污染数据)");

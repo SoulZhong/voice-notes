@@ -566,9 +566,9 @@ mod mac {
     ) -> OSStatus {
         let t0 = Instant::now();
         let s = &mut *(user as *mut Shared);
-        if s.first_cb.is_none() {
-            s.first_cb = Some(t0);
-        }
+        // 计时与计数都只认**真的送来了帧**的回调(Codex 十轮 P2):启动/热插拔期间
+        // CoreAudio 可能先来几次 input 为空的回调,把它们算进首回调时刻,会让速率的分母
+        // 白白多出一截没数据的时间,读出偏低的采样率。
         if input.is_null() {
             return 0;
         }
@@ -681,8 +681,14 @@ mod mac {
                 s.max_frame_mismatch = d;
             }
         }
+        // 一帧都没送来的回调(input 非空但 buffer 全空)同样不计:它既不该占"两次回调"
+        // 的有效性门槛,也不该拉长速率的分母。
+        if frames_this == 0 {
+            return 0;
+        }
         s.frames += frames_this as u64;
         if s.callbacks == 0 {
+            s.first_cb = Some(t0);
             s.first_frames = frames_this as u64;
         }
         s.last_cb = Some(Instant::now());
@@ -697,7 +703,16 @@ mod mac {
     }
 
     pub fn capture(args: &[String]) -> Result<()> {
-        let secs: f64 = flag(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(120.0);
+        // 参数一律严格校验(Codex 十轮 P2):`--secs nope` 悄悄按 120s 跑、`--natve` 拼错被
+        // 忽略而落成 16k 轨——都会给出"看着正常但配置不是你要的"的结果,而外部参考对照
+        // 恰恰要求 --native。宁可报错。
+        check_args(args, &["--secs", "--out", "--input-uid"], &["--native"])?;
+        let secs: f64 = match flag(args, "--secs") {
+            None => 120.0,
+            Some(v) => v.parse().ok().filter(|x: &f64| *x > 0.0 && x.is_finite()).ok_or_else(|| {
+                anyhow!("--secs 要一个正数秒数,收到: {v}")
+            })?,
+        };
         let out = flag(args, "--out").unwrap_or_else(|| "/tmp/catap".into());
         std::fs::create_dir_all(&out)?;
 
@@ -936,6 +951,33 @@ mod mac {
     }
     fn peak(v: &[f32]) -> f64 {
         v.iter().fold(0.0f64, |m, x| m.max(x.abs() as f64))
+    }
+
+    /// 严格参数检查:args[0] 是子命令,其后只允许 `valued` 里的"带值开关"与 `bare` 里的
+    /// 无值开关;带值开关必须真的跟着一个值,且不许重复。
+    fn check_args(args: &[String], valued: &[&str], bare: &[&str]) -> Result<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut i = 1;
+        while i < args.len() {
+            let a = args[i].as_str();
+            let known = valued.contains(&a) || bare.contains(&a);
+            if !known {
+                bail!("未知参数: {a}(可用: {} {})", valued.join(" "), bare.join(" "));
+            }
+            if seen.contains(&valued.iter().chain(bare).find(|k| **k == a).copied().unwrap()) {
+                bail!("参数重复: {a}");
+            }
+            seen.push(valued.iter().chain(bare).find(|k| **k == a).copied().unwrap());
+            if valued.contains(&a) {
+                if args.get(i + 1).map_or(true, |v| v.starts_with("--")) {
+                    bail!("{a} 后面缺值");
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
     }
 
     fn flag(args: &[String], name: &str) -> Option<String> {
