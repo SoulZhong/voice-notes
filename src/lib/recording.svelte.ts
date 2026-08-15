@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { goto } from "$app/navigation";
+import { playback } from "$lib/playback.svelte";
 import {
   onPartial,
   onStatus,
@@ -223,6 +224,12 @@ export const recording = {
     if (pending || this.isLive) return false;
     pending = true;
     try {
+      // 开录即停回放:两条 cpal 链路技术上独立,但正在播放的旧笔记会被 system 轨
+      // 录进去,还可能经扬声器串进 mic——是内容污染,不是"互不干扰"。
+      if (playback.session) {
+        await invoke("player_stop", {}).catch(() => {});
+        playback.clear();
+      }
       await invoke("start_recording");
       return true;
     } catch (err) {
