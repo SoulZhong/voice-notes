@@ -88,6 +88,13 @@
         // 必须 reject 而非 resolve(Codex P1):成功 resolve 会让排在本 promise 上的
         // play()/seek() 继续 invoke,打到新装载的**另一篇笔记**内核上。
         if (gen !== loadGen) throw SUPERSEDED;
+        // 后端 player_load 进门就 stop_stream 杀旧核,会话必须在**发起装载之前**
+        // 同步作废——放在成功之后同步的话,装载失败/被取代/在途离页三条路径都会
+        // 漏掉,留下一个指着已死内核的会话:迷你条挂着旧笔记、进度僵住、按钮点不动。
+        const prevSession = playback.session
+          ? { session: playback.session, atMs: playback.currentMs, playing: playback.playing }
+          : null;
+        playback.clear();
         const res = await invoke<{ total_ms: number; gen: number }>("player_load", { tracks: payload }).catch((e) => {
           // 后端代次门的拒绝统一折算成取消哨兵(Codex P2):凡 invoke 失败且本地已
           // 换代,必是切换导致的取代而非故障——不按本地化文案匹配,按换代事实判定;
@@ -103,13 +110,10 @@
           throw SUPERSEDED;
         }
         lastBackendGen = res.gen;
-        // 后端装载成功即取代了上一个内核,活动会话必须跟着走:
-        // - 同一篇笔记重装(转码完成重拉/续录/A-B 切换)→ 会话改指新核,不丢会话;
-        // - 装的是别的笔记 → 会话持有的核已被取代,作废。
-        // 不做这步的话,迷你条会显示旧笔记,而按钮控制的是新内核。
-        if (playback.session) {
-          if (noteId && playback.session.noteId === noteId) playback.rebind(res.gen);
-          else playback.clear();
+        // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):会话按新代次恢复,位置与
+        // 播放态沿用重装前的现场。装的是别的笔记则不恢复——上面已经作废了。
+        if (prevSession && noteId && prevSession.session.noteId === noteId) {
+          playback.restore({ ...prevSession.session, gen: res.gen }, prevSession.atMs, prevSession.playing);
         }
         onLoaded?.();
         return res.total_ms;

@@ -60,10 +60,13 @@ class Playback {
     if (this.session?.noteId === noteId) this.session = { ...this.session, title };
   }
 
-  /** 同一篇笔记被重新装载(转码完成重拉/续录/A-B 切换)→ 会话改指新内核。
-      不这么做的话,新核代次一变,位置事件就全被 applyPos 过滤掉,迷你条进度僵住。 */
-  rebind(gen: number) {
-    if (this.session) this.session = { ...this.session, gen };
+  /** 同篇重装后恢复会话:代次换新,位置与播放态沿用重装前的现场。
+      不能用 begin ——它把 currentMs 归零、playing 置真,那是「新开一段播放」的语义,
+      重装场景下会把迷你条进度打回 0。 */
+  restore(s: PlaybackSession, atMs: number, playing: boolean) {
+    this.session = s;
+    this.currentMs = atMs;
+    this.playing = playing;
   }
 }
 

@@ -89,13 +89,16 @@ describe("会话状态机", () => {
     playback.clear();
   });
 
-  it("同篇重装 → rebind 改指新核,位置事件继续被接受", () => {
-    playback.begin(s);
-    playback.rebind(8);
+  it("同篇重装 → restore 恢复到新代次,沿用重装前的位置与播放态", () => {
+    playback.restore({ ...s, gen: 8 }, 12345, false);
     expect(playback.session?.gen).toBe(8);
+    // 位置/播放态沿用传入值,不被 begin 那样归零/置真
+    expect(playback.currentMs).toBe(12345);
+    expect(playback.playing).toBe(false);
+    // 新代次的位置事件能被接受
     playback.applyPos({ pos_ms: 2000, playing: true, gen: 8 });
     expect(playback.currentMs).toBe(2000);
-    // 旧代次事件仍要丢弃
+    // 旧代次事件被丢弃
     playback.applyPos({ pos_ms: 9000, playing: true, gen: 3 });
     expect(playback.currentMs).toBe(2000);
     playback.clear();
