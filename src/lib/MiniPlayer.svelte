@@ -7,9 +7,11 @@
 
   /* 全局迷你播放浮层:切到非笔记页后仍能看到并控制正在播放的笔记。
      形态选择:曾经是底部通栏(position:fixed + left/right:0),真机实测仍会遮住
-     页面底部内容——罪魁是 padding-bottom 避让对内部自带 height:100%/overflow:hidden
-     的页面（如设置页）无效,那类容器按 .main 的内容盒算高,父级加 padding 不会让
-     它们跟着缩短。角落圆形浮层不占布局流、不需要任何避让,从根上绕开这个问题。
+     页面底部内容;角落圆形浮层把遮挡面积从整条通栏收窄到一个 56px 的圆,但圆本身
+     仍会压住右下角内容(如设置页最后一行的「检查更新」按钮)——浮层不占布局流,
+     不会自动帮可滚动内容让位。真正的避让由 +layout.svelte 负责:浮层显示时给
+     .main 加一段底部安全区,量与本文件 .orb 的尺寸/离边距共用同一份 --orb-size/
+     --orb-inset token(定义在 app.css),不用测量元素高度回填。
      进度只读——要精确跳转就右键「回到笔记」,那里有波形和逐句时间戳。 */
   const show = $derived(shouldShowMiniPlayer(playback.session?.noteId ?? null, $page.url.pathname));
   const pct = $derived(
@@ -130,10 +132,12 @@
     --orb-sheen: light-dark(rgba(255, 255, 255, 0.65), rgba(255, 255, 255, 0.08));
     --orb-shade: light-dark(rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.35));
     position: fixed;
-    right: 16px;
-    bottom: 16px;
-    width: 56px;
-    height: 56px;
+    /* 尺寸/离边距取全局 token(见 app.css),不在这里写死——+layout.svelte 的主内容区
+       底部安全区要按同一份数字算(浮层直径 + 上下留白),两处各写一份数字会互相漂移。 */
+    right: var(--orb-inset);
+    bottom: var(--orb-inset);
+    width: var(--orb-size);
+    height: var(--orb-size);
     border-radius: var(--radius-full);
     background: radial-gradient(circle at 32% 26%, var(--orb-sheen), transparent 60%), var(--surface);
     border: 1px solid var(--hairline-strong);
