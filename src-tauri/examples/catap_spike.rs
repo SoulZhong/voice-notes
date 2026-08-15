@@ -724,6 +724,17 @@ mod mac {
         };
         let out = flag(args, "--out").unwrap_or_else(|| "/tmp/catap".into());
         std::fs::create_dir_all(&out)?;
+        // 先清掉上一场留下的产物(Codex 二十轮 P2):输出目录通常被反复复用,而本命令
+        // 有多条"作废不落盘"的出口(覆盖不足、IOProc 停不下来)。旧的 mic.wav/system.wav
+        // 若留在原地,操作者下一步的 xcorr 分析的就是**上一场**的数据,而命令明明说了
+        // 这次没出数据。开跑前删干净,失败就是真的什么都没有。
+        for f in ["mic.wav", "system.wav"] {
+            let p = std::path::Path::new(&out).join(f);
+            if p.exists() {
+                std::fs::remove_file(&p).with_context(|| format!("清理旧产物失败: {}", p.display()))?;
+                println!("已删除上一场的 {f}");
+            }
+        }
 
         let mic = match flag(args, "--input-uid") {
             Some(uid) => all_devices()?
@@ -876,10 +887,15 @@ mod mac {
         }
         let native = args.iter().any(|a| a == "--native");
         let out_hz = if native { src_hz } else { 16_000.0 };
+        // 两条轨要**成对**出现:先写临时名、都写成功再一起改名。否则第二条写失败时会留下
+        // 「这一场的 mic + 上一场的 system」这种最难发现的错配(Codex 二十轮 P2)。
         let mic_path = format!("{out}/mic.wav");
         let sys_path = format!("{out}/system.wav");
-        write_wav(&mic_path, &shared.mic, src_hz, out_hz)?;
-        write_wav(&sys_path, &shared.sys, src_hz, out_hz)?;
+        let (mic_tmp, sys_tmp) = (format!("{mic_path}.part"), format!("{sys_path}.part"));
+        write_wav(&mic_tmp, &shared.mic, src_hz, out_hz)?;
+        write_wav(&sys_tmp, &shared.sys, src_hz, out_hz)?;
+        std::fs::rename(&mic_tmp, &mic_path)?;
+        std::fs::rename(&sys_tmp, &sys_path)?;
 
         let mut us = shared.cb_us.clone();
         us.sort_unstable();
