@@ -1,5 +1,13 @@
 //! 漂移报告全库汇总:真实分布的出口(设计文档第四节)。
-//! 用法: drift_stats <data_root>   递归扫描 drift_report.json
+//! 用法: drift_stats <data_root> [--since YYYYMMDD]   递归扫描 drift_report.json
+//!
+//! `--since` 是给 issue #99 的 E2 用的:**PR #103 之前的报告不能进基线**。那批数据里的
+//! 重锚与 rate_ppm 全是测量 bug 的产物——采样率对账当时用 tap 线程到达间隔算,消费端一被
+//! 抢占就报出假低率,触发 rate_fix 改写采样率并清相位。拿它算 P50/P95 会得到完全错误的
+//! 分布(实测:故障期三场贡献了全库 2327 次重锚里的 2325 次)。
+//! 判据按**笔记目录名的日期前缀**(YYYYMMDD-HHMMSS)过滤,粗但够用:笔记 id 就是建档时刻。
+//! 边界说明:续录场次(history)跟着所属笔记一起算,极端情况下一篇 #103 之前建的笔记在
+//! 之后续录,会被这条过滤一并挡掉——宁可少算,不可混入污染数据。
 
 #[derive(Default)]
 struct Agg {
@@ -72,6 +80,71 @@ fn ingest_one(agg: &mut Agg, v: &serde_json::Value, origin: &str) {
     }
 }
 
+/// 报告路径是否通过 `--since` 门槛。笔记 id 是 `YYYYMMDD-HHMMSS`,字典序即时间序,
+/// 故按 `since` 的长度截取同长前缀直接比:给 `20260814` 是按天,给 `20260814-170000`
+/// 精确到秒。**必须支持到秒**——修复合并那天当天既有污染场次也有干净场次(本机实测:
+/// 8/14 18:07 那场起才干净),只按天分不开。
+/// 目录名不像笔记 id(无 8 位数字日期前缀)时**放行**:宁可多算一场,也不静默丢掉
+/// 不认识的目录布局(测试夹具、导出目录)。
+fn passes_since(report_path: &std::path::Path, since: Option<&str>) -> bool {
+    let Some(since) = since else { return true };
+    let Some(name) = report_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
+        return true;
+    };
+    // 按**字节**切:目录名可能含非 ASCII(中文笔记夹、导出目录),按 char 边界之外切
+    // &str 会 panic(Codex P2)。笔记 id 全是 ASCII,字节序比较与字符串序等价。
+    let (nb, sb) = (name.as_bytes(), since.as_bytes());
+    if nb.len() < 8 || !nb[..8].iter().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let n = sb.len().min(nb.len());
+    nb[..n] >= sb[..n]
+}
+
+/// `--since` 的取值形状:`YYYYMMDD` 或 `YYYYMMDD-HHMMSS`(与笔记 id 同构,可直接比前缀)。
+fn valid_since(v: &str) -> bool {
+    let b = v.as_bytes();
+    let shape_ok = match b.len() {
+        8 => b.iter().all(|c| c.is_ascii_digit()),
+        15 => b[8] == b'-' && b[..8].iter().chain(&b[9..]).all(|c| c.is_ascii_digit()),
+        _ => false,
+    };
+    if !shape_ok {
+        return false;
+    }
+    // 光看形状不够(Codex 十七轮 P2):`20260814-240000` / `-176000` 全是数字也过形状,
+    // 但字典序过滤会据此静默排掉一批本该计入的场次——与 fail-closed 的初衷相反。
+    let num = |r: std::ops::Range<usize>| v[r].parse::<u32>().unwrap_or(u32::MAX);
+    let (y, mo, d) = (num(0..4), num(4..6), num(6..8));
+    if !(1..=12).contains(&mo) {
+        return false;
+    }
+    // 逐月天数(含闰年):2 月 31 日这类"月日各自合法、组合不存在"的值同样会被字典序
+    // 当成"该月末之后"的截止点,静默排掉本该计入的场次(Codex 十八轮 P2)。
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if !(1..=dim).contains(&d) {
+        return false;
+    }
+    if b.len() == 15 {
+        let (h, mi, sec) = (num(9..11), num(11..13), num(13..15));
+        if h > 23 || mi > 59 || sec > 59 {
+            return false;
+        }
+    }
+    true
+}
+
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() { return None; }
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -130,6 +203,55 @@ mod tests {
         assert_eq!((bt.sessions, bt.reanchors, bt.degraded), (1, 7, 1));
     }
 
+    /// E2 基线的污染门:PR#103 之前建档的笔记必须能被一条命令挡在统计之外
+    /// (那批报告的重锚/rate_ppm 是测量 bug 的产物,见文件头)。
+    #[test]
+    fn since_filter_keeps_only_notes_dated_on_or_after() {
+        use std::path::Path;
+        let p = |s: &str| Path::new(s).to_path_buf();
+        let since = Some("20260814");
+        assert!(passes_since(&p("/d/notes/20260814-180747/drift_report.json"), since), "当天建档要留下");
+        assert!(passes_since(&p("/d/notes/20260815-074838/drift_report.json"), since), "之后建档要留下");
+        assert!(!passes_since(&p("/d/notes/20260813-235959/drift_report.json"), since), "之前建档要挡掉");
+        // 精确到秒:修复落地那天当天要能切开(本机实测 8/14 18:07 那场起才干净)
+        let sec = Some("20260814-170000");
+        assert!(passes_since(&p("/d/notes/20260814-180747/drift_report.json"), sec), "当天晚于阈值的留下");
+        assert!(!passes_since(&p("/d/notes/20260814-161211/drift_report.json"), sec), "当天早于阈值的挡掉");
+        assert!(!passes_since(&p("/d/notes/20260814-100830/drift_report.json"), sec));
+        assert!(passes_since(&p("/d/notes/20260815-074838/drift_report.json"), sec), "次日一律留下");
+        // 不给 --since 就全收(与加过滤前的行为一致)
+        assert!(passes_since(&p("/d/notes/20260101-000000/drift_report.json"), None));
+        // 目录名不是笔记 id(测试夹具、导出目录等):放行,不静默丢
+        assert!(passes_since(&p("/d/fixtures/case-a/drift_report.json"), since));
+        // 非 ASCII 目录名:按字节切不能 panic(中文名 8 字节处正好在字符中间)
+        assert!(passes_since(&p("/d/中文目录名字/drift_report.json"), since));
+        assert!(passes_since(&p("/d/中文目录名字/drift_report.json"), Some("20260814-170000")));
+    }
+
+    /// 这道门失效时必须是 fail-closed:`--since` 值写错就退出,绝不悄悄退回"全都算"——
+    /// 那样拿到的是一份看着正常、实则混了污染场次的基线。
+    #[test]
+    fn since_value_shape_is_validated() {
+        assert!(valid_since("20260814"));
+        assert!(valid_since("20260814-170000"));
+        assert!(!valid_since(""));
+        assert!(!valid_since("2026081"), "位数不足");
+        assert!(!valid_since("20260814170000"), "缺分隔符");
+        assert!(!valid_since("20260814-17000"), "时分秒位数不对");
+        assert!(!valid_since("2026-08-14"), "带横线的日期不是笔记 id 形状");
+        // 形状对但日期/时刻不可能的值也要拒:字典序过滤会据此静默排掉一批本该计入的场次
+        assert!(!valid_since("20260814-240000"), "24 点不存在");
+        assert!(!valid_since("20260814-176000"), "76 分不存在");
+        assert!(!valid_since("20261314"), "13 月不存在");
+        assert!(!valid_since("20260800"), "0 日不存在");
+        assert!(!valid_since("20260231"), "2 月 31 日不存在");
+        assert!(!valid_since("20260431"), "4 月 31 日不存在");
+        assert!(!valid_since("20260229"), "2026 不是闰年,2 月 29 日不存在");
+        assert!(valid_since("20240229"), "2024 是闰年,2 月 29 日存在");
+        assert!(valid_since("20260814-235959"), "边界值要放行");
+        assert!(!valid_since("--out"), "把下一个 flag 当成值必须被挡下");
+    }
+
     /// Codex review Fix 3(P2)配套:inter_track 为 null 的场次(单源,或双源未同时
     /// 收敛)不得计入 rel_ppm 分布,但 with_inter_track/sessions 之比要能看出它被过滤了。
     #[test]
@@ -156,7 +278,50 @@ mod tests {
 }
 
 fn main() {
-    let root = std::env::args().nth(1).expect("用法: drift_stats <data_root>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let root = args.first().cloned().expect("用法: drift_stats <data_root> [--since YYYYMMDD]");
+    // --since 写错了必须**当场报错**,不能静默退回"全都算"(Codex P2):这道门就是防污染的,
+    // 失效方式一旦是 fail-open,拿到的就是一份看着正常、实则混了污染数据的基线。
+    let since = match args.iter().position(|a| a == "--since") {
+        None => None,
+        Some(i) => {
+            let v = args.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--since 后面缺日期(要 YYYYMMDD 或 YYYYMMDD-HHMMSS)");
+                std::process::exit(2);
+            });
+            if !valid_since(&v) {
+                eprintln!("--since 值不合法: {v}(要 YYYYMMDD 或 YYYYMMDD-HHMMSS)");
+                std::process::exit(2);
+            }
+            Some(v)
+        }
+    };
+    // 未知参数一律拒绝(Codex 九轮 P2):`--sine` 这种手滑会让上面的查找返回 None、
+    // 悄悄退回"全都算",污染门形同虚设——防污染的开关必须 fail-closed 到底。
+    let mut i = 1;
+    let mut since_seen = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--since" => {
+                since_seen += 1;
+                i += 2;
+            }
+            other => {
+                eprintln!("未知参数: {other}(用法: drift_stats <data_root> [--since YYYYMMDD[-HHMMSS]])");
+                std::process::exit(2);
+            }
+        }
+    }
+    // 重复给也要拒(Codex 十轮 P2):上面的查找只认第一个,写两次的人多半以为后一个生效,
+    // 结果按更宽松的那个跑,污染门又白设了。
+    if since_seen > 1 {
+        eprintln!("--since 给了 {since_seen} 次,只能给一次");
+        std::process::exit(2);
+    }
+    if let Some(s) = &since {
+        println!("(只统计 {s} 及之后建档的笔记——E2 基线不得混入 PR#103 之前的污染数据)");
+    }
+    let mut skipped = 0usize;
     let mut agg = Agg::default();
     let mut stack = vec![std::path::PathBuf::from(&root)];
     while let Some(dir) = stack.pop() {
@@ -165,6 +330,10 @@ fn main() {
             let p = e.path();
             if p.is_dir() { stack.push(p); continue; }
             if p.file_name().map_or(false, |n| n == "drift_report.json") {
+                if !passes_since(&p, since.as_deref()) {
+                    skipped += 1;
+                    continue;
+                }
                 if let Ok(v) = std::fs::read_to_string(&p)
                     .map_err(anyhow::Error::from)
                     .and_then(|s| Ok(serde_json::from_str::<serde_json::Value>(&s)?)) {
@@ -174,6 +343,9 @@ fn main() {
         }
     }
     agg.rel_ppm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if skipped > 0 {
+        println!("按 --since 挡掉的报告: {skipped} 份");
+    }
     println!("场次: {}  含降级源: {}", agg.sessions, agg.degraded);
     println!("含 inter_track 的场次: {}/{}", agg.with_inter_track, agg.sessions);
     println!("|轨间漂移| ppm  P50={:?} P95={:?} max={:?}",

@@ -19,5 +19,5 @@ vite.config.ts.timestamp-*
 .superpowers/
 .playwright-mcp/
 .worktrees/
-tools/__pycache__/
+__pycache__/
 .gstack/
