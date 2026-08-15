@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onPlayerPos } from "$lib/events";
+  import { onPlayerPos, onPlayerStopped } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
   import { playback, shouldStopOnCleanup } from "$lib/playback.svelte";
@@ -68,7 +68,12 @@
    * fire-and-forget 的 stop 可能晚于新组件的装载执行,带条件后后端代次已前进就
    * no-op,不作废别人的装载(Codex 十轮 P1)。 */
   let lastBackendGen: number | null = null;
+  /** 重装触发器:托盘停播后自增一次,让下面的装载 effect 再跑一轮(见 onPlayerStopped)。 */
+  let reloadKey = $state(0);
   $effect(() => {
+    // 托盘停播后的重装入口:核被后端拆了,本 effect 必须再跑一轮才有得播(见下方
+    // onPlayerStopped)。读一下即建立依赖,值本身无意义。
+    void reloadKey;
     trackErrors = [];
     if (tracks.length === 0) {
       loadPromise = null;
@@ -168,6 +173,24 @@
     const un = onPlayerPos((e) => {
       currentMs = Math.min(e.pos_ms, totalMs);
       playing = e.playing;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  /** 托盘「停止播放」拆掉的正是本组件装的那个核(代次相同):不复位的话按钮停在
+      「播放中」、进度僵住,再点播放会打到空内核报「尚未装载音轨」。复位后自增
+      reloadKey 重装一次,回到"进页面刚装好、停在 0"的状态,随时可以再播。
+      代次不符则事不关己(停的是别的实例装的核),什么都不做。 */
+  $effect(() => {
+    const un = onPlayerStopped((e) => {
+      if (lastBackendGen === null || e.gen !== lastBackendGen) return;
+      playing = false;
+      currentMs = 0;
+      // 先清代次再重装:装载 effect 的 cleanup 会拿它发条件停止,核都没了不必再停一次。
+      lastBackendGen = null;
+      reloadKey++;
     });
     return () => {
       un.then((f) => f());

@@ -11,6 +11,7 @@
   import { applyTheme } from "$lib/theme";
   import { i18n, t } from "$lib/i18n/index.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import {
     checkUpdate,
@@ -31,6 +32,17 @@
   // 避免这里再造一份、和浮层实际是否渲染不同步——那样安全区可能在浮层没显示时白留一块空白,
   // 或者浮层显示了但没留出安全区。
   const showMiniPlayer = $derived(shouldShowMiniPlayer(playback.session?.noteId ?? null, $page.url.pathname));
+
+  // 托盘「停止播放」项的出现条件:有播放会话就有得停。托盘常驻下关掉主窗口后音频
+  // 继续播(与音乐 App 一致),那一刻托盘是唯一能停它的地方。判定与浮层同源——都看
+  // 会话,不看内核是否装载(进笔记页就自动装载,拿装载判会让只看过没播过的笔记也
+  // 冒出「停止播放」)。注意条件比浮层少一条 pathname:在笔记本页上浮层要让位给完整
+  // 播放器,托盘却仍该能停(窗口都关了,谈不上"页面里有播放器")。
+  // 派在 layout 而非浮层组件:浮层在自己笔记页上不渲染,挂在它身上会漏掉那一整段。
+  const playbackActive = $derived(playback.session !== null);
+  $effect(() => {
+    void invoke("set_playback_active", { active: playbackActive }).catch(() => {});
+  });
 
   // 升级提示放全局布局:app 启动落地页可能是笔记详情/录制/空态任一(见根路由重定向),
   // 布局却必挂载且跨路由常驻——查一次、有新版且未忽略就在内容区顶部出可关闭横幅。
@@ -197,7 +209,13 @@
      而不是被压在下面。--orb-size/--orb-inset 与 MiniPlayer.svelte 的 .orb 共用同一份
      token(定义在 app.css),避免尺寸各自硬编码后互相漂移。
      注:不用 bind:clientHeight 量浮层实高再回填——浮层是固定常量尺寸的圆,量了也白量,
-     还会在挂载瞬间有一帧安全区缺失/多余的闪烁。 */
+     还会在挂载瞬间有一帧安全区缺失/多余的闪烁。
+     这段留白对 graph 页那种「height:100% + 自己 overflow」的内部滚动页**同样有效**:
+     百分比高度按 .main 的内容盒解析,padding 一加,整棵子树跟着抬到浮层上方。
+     2026-08-15 无头 Chromium 复刻真实类链量过:视口 800 高时页面内容底边 696px、
+     浮层顶边 712px,不相交(#108/#109 记的"内部自管理滚动页面帮不上忙"是误判)。
+     真正吃不到这段留白的只有 position:fixed / 按 100vh 定高的底部元素,全库目前没有。
+     契约护栏见 src/lib/orbSafeArea.test.ts。 */
   .main.with-orb-safearea {
     padding-bottom: calc(var(--orb-size) + var(--orb-inset) * 2);
   }

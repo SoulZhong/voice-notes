@@ -214,6 +214,14 @@ struct PosEvent {
     gen: u64,
 }
 
+/// 后端主动停止播放的广播(目前唯一发源地:托盘「停止播放」)。
+#[derive(Debug, Clone, Serialize)]
+struct StoppedEvent {
+    /// 被停掉的那一代装载:前端只清自己名下的会话/播放器,不误伤这条事件
+    /// 在途期间新起的装载。
+    gen: u64,
+}
+
 fn emit_pos(app: &AppHandle, core: &Core) {
     let _ = app.emit(
         "player_pos",
@@ -934,6 +942,27 @@ pub fn player_stop(state: State<'_, PlayerHandle>, if_gen: Option<u64>) -> Resul
     state.begin_load();
     stop_stream(&state);
     Ok(())
+}
+
+/// 托盘「停止播放」:托盘常驻时关掉主窗口音频仍在响(与音乐 App 一致),
+/// 那一刻托盘是唯一能停它的地方。
+///
+/// 拆除动作与 `player_stop(None)` 完全同一套(推进代次让在途装载过期 + 拆流),
+/// 只多一条广播:命令式停止是前端自己发起的,它知道自己停了;这一路是**后端发起**的,
+/// 不广播的话前端会留下一个指着已死内核的会话——浮层挂着旧笔记、进度僵住、按钮点不动
+/// (正是 player_stop 注释里那条悬空会话失败模式)。
+pub fn stop_from_tray(app: &AppHandle) {
+    let gen = {
+        let state = app.state::<PlayerHandle>();
+        let _publish = state.publish.lock().unwrap();
+        // 先记下被停掉的代次再取号:begin_load 之后读到的是新号,发出去前端一个也对不上。
+        let stopped = state.load_gen.load(Ordering::SeqCst);
+        state.begin_load();
+        stop_stream(&state);
+        stopped
+    };
+    // 广播在锁外:emit 会走到主线程事件循环,持锁广播等于把播放锁暴露给 UI 线程时序。
+    let _ = app.emit("player_stopped", StoppedEvent { gen });
 }
 
 #[cfg(test)]

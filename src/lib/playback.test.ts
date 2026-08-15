@@ -80,6 +80,20 @@ describe("会话状态机", () => {
     playback.clear();
   });
 
+  it("托盘停播:只清自己那一代的会话", () => {
+    playback.begin(s);
+    // 旧内核的停止广播(比如上一篇的迟到事件):当前会话是它之后新起的,清了就误杀
+    playback.stopped(2);
+    expect(playback.session).not.toBe(null);
+    playback.stopped(3);
+    expect(playback.session).toBe(null);
+    expect(playback.playing).toBe(false);
+    expect(playback.currentMs).toBe(0);
+    // 无会话时再来一条也不炸
+    playback.stopped(3);
+    expect(playback.session).toBe(null);
+  });
+
   it("改名只影响同一篇笔记", () => {
     playback.begin(s);
     playback.rename("other", "别的");
