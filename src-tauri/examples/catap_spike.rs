@@ -599,8 +599,13 @@ mod mac {
         // buffer 顺序按聚合设备描述里的 subdevices→taps。边界按**累计声道数**判,不是按
         // buffer 序号(Codex P2):多流输入设备(某些 USB 声卡)的 mic 会占好几个 buffer,
         // 按序号判会把第二个 mic buffer 错当成 tap。s.mic_ch = mic 设备的输入声道总数。
-        let mut mic_frames = 0usize;
-        let mut tap_frames = 0usize;
+        // 同一轨可能横跨**多个 buffer**(多流输入设备):必须按帧合并,不能顺序追加——
+        // 追加会让两个 F 帧的 mic buffer 变成 2F 个样本,而 tap 只有 F,轨长直接翻倍
+        // (Codex 二轮 P2)。做法:先累加各声道的和(同一帧号累到同一个位置),
+        // 循环末尾再按该轨这一回合的总声道数取平均。
+        let (mic_base, sys_base) = (s.mic.len(), s.sys.len());
+        let (mut mic_frames, mut tap_frames) = (0usize, 0usize);
+        let (mut mic_chs, mut tap_chs) = (0usize, 0usize);
         let mut seen_ch = 0usize;
         for b in bufs {
             let ch = b.mNumberChannels as usize;
@@ -612,27 +617,52 @@ mod mac {
             let frames = total / ch;
             let data = std::slice::from_raw_parts(b.mData as *const f32, total);
             let is_mic = seen_ch < s.mic_ch;
-            let dst = if is_mic { &mut s.mic } else { &mut s.sys };
+            let (base, dst) = if is_mic { (mic_base, &mut s.mic) } else { (sys_base, &mut s.sys) };
             for f in 0..frames {
                 let mut acc = 0.0f32;
                 for c in 0..ch {
                     acc += data[f * ch + c];
                 }
-                dst.push(acc / ch as f32);
+                let idx = base + f;
+                if idx < dst.len() {
+                    dst[idx] += acc; // 本轨的另一个 buffer 已经写过这一帧,累加
+                } else {
+                    dst.push(acc);
+                }
             }
             if is_mic {
                 mic_frames = mic_frames.max(frames);
+                mic_chs += ch;
             } else {
                 tap_frames = tap_frames.max(frames);
+                tap_chs += ch;
             }
             seen_ch += ch;
+        }
+        // 归一:各自除以本轨这一回合参与的总声道数(单 buffer 时等价于原来的 acc/ch)。
+        if mic_chs > 1 {
+            for v in &mut s.mic[mic_base..] {
+                *v /= mic_chs as f32;
+            }
+        } else if mic_chs == 1 {
+            // 单声道无需归一
+        }
+        if tap_chs > 1 {
+            for v in &mut s.sys[sys_base..] {
+                *v /= tap_chs as f32;
+            }
         }
         // 逐回调对账(Codex P2):"两轨样本数相等"这条结论必须每次回调都成立才算数。
         // 只在最后比累计长度是不够的——某一次少给、下一次补回来,累计仍然相等。
         let frames_this = mic_frames.max(tap_frames);
-        if mic_frames != tap_frames {
+        // 逐回调对账要看**合并后**的两轨长度增量,不只是各自 buffer 的帧数——多流合并
+        // 万一写歪(某个 buffer 帧数不齐),差值会在这里露出来。
+        let (mic_added, sys_added) = (s.mic.len() - mic_base, s.sys.len() - sys_base);
+        if mic_added != sys_added || mic_frames != tap_frames {
             s.frame_mismatch += 1;
-            let d = (mic_frames as i64 - tap_frames as i64).unsigned_abs();
+            let d = (mic_added as i64 - sys_added as i64)
+                .unsigned_abs()
+                .max((mic_frames as i64 - tap_frames as i64).unsigned_abs());
             if d > s.max_frame_mismatch {
                 s.max_frame_mismatch = d;
             }
@@ -741,11 +771,15 @@ mod mac {
         // 泄漏几 MB 无所谓,回调打到已释放内存则是随机崩溃/脏数据。
         let st_stop = unsafe { AudioDeviceStop(agg.id, proc_id) };
         let st_destroy = unsafe { AudioDeviceDestroyIOProcID(agg.id, proc_id) };
-        let quiesced = st_stop == 0 && st_destroy == 0;
-        if !quiesced {
-            eprintln!(
-                "⚠ IOProc 未能确认停止(stop={st_stop} {} / destroy={st_destroy} {}):\
-                 回调可能仍在跑,故意泄漏其状态以免 use-after-free",
+        if st_stop != 0 || st_destroy != 0 {
+            // 停不下来就**当场放弃这一场**:回调可能还在往 shared 里 push,此后任何读取
+            // (统计、落盘)都是与之竞争,任何提前 return(? 号)都会把 Box 析构掉重新
+            // 变成 use-after-free。所以立刻 forget 掉状态、直接返回错误,一个字节都不读。
+            // 聚合设备/tap 仍由各自的 Drop 拆除(销毁设备本身会终止 IO)。
+            std::mem::forget(shared);
+            bail!(
+                "IOProc 未能确认停止(stop={st_stop} {} / destroy={st_destroy} {}):\
+                 本场数据作废,状态已泄漏以免 use-after-free",
                 os_status_hint(st_stop),
                 os_status_hint(st_destroy)
             );
@@ -821,9 +855,6 @@ mod mac {
             rms(&shared.mic), peak(&shared.mic), rms(&shared.sys), peak(&shared.sys));
         println!("\n落盘: {mic_path}\n      {sys_path}");
         println!("残余漂移(E1 口径,system 在前):\n  cargo run --bin xcorr_align -- {sys_path} {mic_path}");
-        if !quiesced {
-            std::mem::forget(shared); // 见上:回调可能还活着,不许析构
-        }
         Ok(())
     }
 

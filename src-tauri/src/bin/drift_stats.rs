@@ -91,11 +91,14 @@ fn passes_since(report_path: &std::path::Path, since: Option<&str>) -> bool {
     let Some(name) = report_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
         return true;
     };
-    if name.len() < 8 || !name[..8].chars().all(|c| c.is_ascii_digit()) {
+    // 按**字节**切:目录名可能含非 ASCII(中文笔记夹、导出目录),按 char 边界之外切
+    // &str 会 panic(Codex P2)。笔记 id 全是 ASCII,字节序比较与字符串序等价。
+    let (nb, sb) = (name.as_bytes(), since.as_bytes());
+    if nb.len() < 8 || !nb[..8].iter().all(|c| c.is_ascii_digit()) {
         return true;
     }
-    let n = since.len().min(name.len());
-    &name[..n] >= &since[..n]
+    let n = sb.len().min(nb.len());
+    nb[..n] >= sb[..n]
 }
 
 /// `--since` 的取值形状:`YYYYMMDD` 或 `YYYYMMDD-HHMMSS`(与笔记 id 同构,可直接比前缀)。
@@ -186,6 +189,9 @@ mod tests {
         assert!(passes_since(&p("/d/notes/20260101-000000/drift_report.json"), None));
         // 目录名不是笔记 id(测试夹具、导出目录等):放行,不静默丢
         assert!(passes_since(&p("/d/fixtures/case-a/drift_report.json"), since));
+        // 非 ASCII 目录名:按字节切不能 panic(中文名 8 字节处正好在字符中间)
+        assert!(passes_since(&p("/d/中文目录名字/drift_report.json"), since));
+        assert!(passes_since(&p("/d/中文目录名字/drift_report.json"), Some("20260814-170000")));
     }
 
     /// 这道门失效时必须是 fail-closed:`--since` 值写错就退出,绝不悄悄退回"全都算"——
