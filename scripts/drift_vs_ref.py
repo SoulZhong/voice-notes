@@ -40,6 +40,8 @@ CORR_FLOOR = 0.02
 # 窗内**去均值后**的 RMS 门槛(满量程归一后的幅度)。约 -80dBFS:低于它就当这段没内容,
 # 免得拿一段恒定直流或极低电平的噪声去拟合。
 RMS_FLOOR = 1e-4
+# 峰显著性门槛(稳健 z 分数)。无关内容搜几千个滞后的最大值大约在 3~4.5σ,真峰远在此之上。
+PEAK_Z = 6.0
 
 
 def norm_xcorr_at(a, b, t0, win, lo, hi):
@@ -75,6 +77,18 @@ def norm_xcorr_at(a, b, t0, win, lo, hi):
     k = int(np.argmax(ncorr))
     best = float(ncorr[k])
     if best < CORR_FLOOR:
+        return None
+    # 峰**显著性**检查:只看绝对相关值不够。搜几千个滞后,无关内容里最大的那个也能到
+    # 0.02~0.03,足以骗过地板并拟合出一条像模像样的斜线(Codex 八轮实测两条独立噪声轨
+    # 得出 +2052ppm)。真峰是一根尖刺,应远高于其余滞后的涨落:用中位数 + MAD 估背景,
+    # 要求峰高出背景 PEAK_Z 个稳健标准差。本机真数据的窗即使 corr 只有 0.1,z 也在 10 以上。
+    others = ncorr[valid]
+    if others.size < 8:
+        return None
+    med = float(np.median(others))
+    mad = float(np.median(np.abs(others - med))) * 1.4826
+    z = (best - med) / mad if mad > 1e-12 else float("inf")
+    if z < PEAK_Z:
         return None
     # 峰落在搜索边界上 = 真峰多半在窗外,读数不可信,交给调用方决定要不要用。
     at_edge = k == 0 or k == len(ncorr) - 1

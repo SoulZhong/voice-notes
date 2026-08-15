@@ -547,6 +547,8 @@ mod mac {
         /// 只比最终累计长度撑不住(某次少给、下次补回来,累计照样相等)。
         frame_mismatch: u64,
         max_frame_mismatch: u64,
+        /// 同一轨内各 buffer 帧数参差的回合数(见回调里的 ragged 判定)。
+        ragged_buffers: u64,
         /// 首回调那一次的帧数不计入速率分母(它对应的是启动前就已入队的那一块)。
         first_frames: u64,
     }
@@ -605,6 +607,10 @@ mod mac {
         // 循环末尾再按该轨这一回合的总声道数取平均。
         let (mic_base, sys_base) = (s.mic.len(), s.sys.len());
         let (mut mic_frames, mut tap_frames) = (0usize, 0usize);
+        // 同一轨内各 buffer 的最短帧数:与最长不等 = buffer 长度参差,这时按"总声道数"
+        // 归一是错的(尾部若干帧只有部分 buffer 供了数据),必须报出来而不是被 max 抹平
+        // (Codex 八轮 P2)。usize::MAX 作哨兵表示"本轨这回合没有 buffer"。
+        let (mut mic_min, mut tap_min) = (usize::MAX, usize::MAX);
         let (mut mic_chs, mut tap_chs) = (0usize, 0usize);
         let mut seen_ch = 0usize;
         for b in bufs {
@@ -632,9 +638,11 @@ mod mac {
             }
             if is_mic {
                 mic_frames = mic_frames.max(frames);
+                mic_min = mic_min.min(frames);
                 mic_chs += ch;
             } else {
                 tap_frames = tap_frames.max(frames);
+                tap_min = tap_min.min(frames);
                 tap_chs += ch;
             }
             seen_ch += ch;
@@ -658,7 +666,13 @@ mod mac {
         // 逐回调对账要看**合并后**的两轨长度增量,不只是各自 buffer 的帧数——多流合并
         // 万一写歪(某个 buffer 帧数不齐),差值会在这里露出来。
         let (mic_added, sys_added) = (s.mic.len() - mic_base, s.sys.len() - sys_base);
-        if mic_added != sys_added || mic_frames != tap_frames {
+        // 轨内 buffer 参差(min != max)也算不齐:那种情况下尾部帧的归一分母是错的。
+        let ragged = (mic_min != usize::MAX && mic_min != mic_frames)
+            || (tap_min != usize::MAX && tap_min != tap_frames);
+        if ragged {
+            s.ragged_buffers += 1;
+        }
+        if mic_added != sys_added || mic_frames != tap_frames || ragged {
             s.frame_mismatch += 1;
             let d = (mic_added as i64 - sys_added as i64)
                 .unsigned_abs()
@@ -739,6 +753,7 @@ mod mac {
             first_frames: 0,
             frame_mismatch: 0,
             max_frame_mismatch: 0,
+            ragged_buffers: 0,
         });
 
         let mut proc_id: AudioDeviceIOProcID = None;
@@ -796,6 +811,17 @@ mod mac {
         // --native:按设备原始率落盘,绕开下面那个无抗混叠的线性抽取。宽带内容
         // (如白噪参考)被 48k→16k 粗抽取一混叠,波形相关性会被毁掉——实测参考对照的
         // corr 只剩 0.1。轨间对比不受影响(两轨走同一条抽取),但与外部参考比就得用 --native。
+        // 一帧都没收到就别装作跑成功了(Codex 八轮 P2):--secs 0、设备当场丢失、IOProc
+        // 从未被调用,都会走到这里。此时落盘只会得到两个空 WAV,而"断层 0 次、帧数不等
+        // 0 次"这类结论看着还挺漂亮——正是最坏的一种假通过。
+        if shared.callbacks == 0 || shared.mic.is_empty() || shared.sys.is_empty() {
+            bail!(
+                "没有采到有效数据(回调 {} 次,mic {} 样本,system {} 样本):不落盘、不出结论",
+                shared.callbacks,
+                shared.mic.len(),
+                shared.sys.len()
+            );
+        }
         let native = args.iter().any(|a| a == "--native");
         let out_hz = if native { src_hz } else { 16_000.0 };
         let mic_path = format!("{out}/mic.wav");
@@ -846,8 +872,9 @@ mod mac {
             (cpu_user + cpu_sys) / run.max(1e-9) * 100.0
         );
         println!(
-            "逐回调两轨帧数不等: {} 次,最大差 {} 帧(结构性保证成立则应为 0)",
-            shared.frame_mismatch, shared.max_frame_mismatch
+            "逐回调两轨帧数不等: {} 次,最大差 {} 帧(结构性保证成立则应为 0);\n\
+             \x20            其中轨内 buffer 参差 {} 次(>0 则合并归一的分母不可信,轨内容存疑)",
+            shared.frame_mismatch, shared.max_frame_mismatch, shared.ragged_buffers
         );
         println!("时间戳断层: {} 次,最大 {:.0} 帧(判据 2:应为 0)", shared.gaps, shared.max_gap);
         for (at, d) in &shared.gap_log {
