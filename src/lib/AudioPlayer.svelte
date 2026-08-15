@@ -3,6 +3,7 @@
   import { onPlayerPos } from "$lib/events";
   import { formatTs, type TrackInfo } from "$lib/notes";
   import { t } from "$lib/i18n/index.svelte";
+  import { playback, shouldStopOnCleanup } from "$lib/playback.svelte";
 
   /* 多轨播放器(原生引擎):音频在 Rust 里单条 cpal 输出流按 offset 混音——WebView
      只画 UI。此前 <audio> 方案在打包版(tauri:// 文档源)被 WKWebView 按自动播放策略
@@ -15,6 +16,8 @@
     waveform = [],
     currentMs = $bindable(0),
     playing = $bindable(false),
+    noteId,
+    title,
     onLoaded,
   }: {
     tracks: TrackInfo[];
@@ -22,6 +25,10 @@
     waveform?: number[];
     currentMs?: number;
     playing?: boolean;
+    /** 本播放器所属笔记的身份:建立播放会话用(迷你条要显示标题、点标题要能跳回)。
+        不传则不建立会话——本组件也被别处复用时保持现状行为。 */
+    noteId?: string;
+    title?: string;
     /** 装载成功回调(可选):tracks 变化触发的每次 player_load resolve 后调用。
         宿主用它在重装后恢复播放位置(A/B 切换保位置,codex P2)——原生核心
         每次装载都从 0/paused 起,不回调宿主无从得知何时可以 seek。 */
@@ -96,6 +103,14 @@
           throw SUPERSEDED;
         }
         lastBackendGen = res.gen;
+        // 后端装载成功即取代了上一个内核,活动会话必须跟着走:
+        // - 同一篇笔记重装(转码完成重拉/续录/A-B 切换)→ 会话改指新核,不丢会话;
+        // - 装的是别的笔记 → 会话持有的核已被取代,作废。
+        // 不做这步的话,迷你条会显示旧笔记,而按钮控制的是新内核。
+        if (playback.session) {
+          if (noteId && playback.session.noteId === noteId) playback.rebind(res.gen);
+          else playback.clear();
+        }
         onLoaded?.();
         return res.total_ms;
       })();
@@ -125,9 +140,16 @@
       // 条件停止(Codex 十轮 P1):只回收**自己**最后一次成功装载的核——迟到的
       // 本 stop 若发现后端代次已前进(新组件已在装载),no-op 不拆别人;从未成功
       // 装载过则无核可收,不发。在途装载的回收由上方 invoke 后的换代分支自理。
+      //
+      // 所有权:内核归**会话**所有,不再归组件所有。本组件装的核若正是活动会话,
+      // 卸载不停它——那正是"切页继续播放"。其余情形语义同现状。
+      // 注意 cleanup 不等于组件卸载:本 effect 依赖 tracks,转码完成重拉、续录、
+      // A/B 切换都会重跑它,所以这里绝不能做"登记会话"之类的副作用。
       const g = lastBackendGen;
       lastBackendGen = null;
-      if (g !== null) void invoke("player_stop", { ifGen: g }).catch(() => {});
+      if (shouldStopOnCleanup(g, playback.session?.gen ?? null)) {
+        void invoke("player_stop", { ifGen: g }).catch(() => {});
+      }
     };
   });
 
@@ -176,6 +198,12 @@
     playing = true; // 乐观置位:事件到达前按钮即时反馈;失败在 catch 复位
     loadPromise
       .then(() => invoke("player_play"))
+      .then(() => {
+        // 会话由**真正开始播放**建立(spec:装载不算)。缺身份则不建会话。
+        if (noteId && lastBackendGen !== null) {
+          playback.begin({ gen: lastBackendGen, noteId, title: title ?? "", totalMs });
+        }
+      })
       .catch((e) => {
         playing = false;
         if (e !== SUPERSEDED) reportError(t("notes.player.errPlay"), `${e}`);
