@@ -543,6 +543,10 @@ mod mac {
         /// 算到停止时刻则会把主循环 200ms 的轮询粒度算进去(370s 上就是 -540ppm 的假象)。
         first_cb: Option<Instant>,
         last_cb: Option<Instant>,
+        /// 逐回调两轨帧数不等的次数与最大差值。"单 IOProc 双轨天然等长"这条结论靠它撑,
+        /// 只比最终累计长度撑不住(某次少给、下次补回来,累计照样相等)。
+        frame_mismatch: u64,
+        max_frame_mismatch: u64,
         /// 首回调那一次的帧数不计入速率分母(它对应的是启动前就已入队的那一块)。
         first_frames: u64,
     }
@@ -592,8 +596,11 @@ mod mac {
             }
         }
 
-        // buffer 顺序按聚合设备描述里的 subdevices→taps:前面的属 mic,后面的属 tap。
-        let mut frames_this = 0usize;
+        // buffer 顺序按聚合设备描述里的 subdevices→taps。边界按**累计声道数**判,不是按
+        // buffer 序号(Codex P2):多流输入设备(某些 USB 声卡)的 mic 会占好几个 buffer,
+        // 按序号判会把第二个 mic buffer 错当成 tap。s.mic_ch = mic 设备的输入声道总数。
+        let mut mic_frames = 0usize;
+        let mut tap_frames = 0usize;
         let mut seen_ch = 0usize;
         for b in bufs {
             let ch = b.mNumberChannels as usize;
@@ -603,7 +610,6 @@ mod mac {
             }
             let total = (b.mDataByteSize as usize) / std::mem::size_of::<f32>();
             let frames = total / ch;
-            frames_this = frames_this.max(frames);
             let data = std::slice::from_raw_parts(b.mData as *const f32, total);
             let is_mic = seen_ch < s.mic_ch;
             let dst = if is_mic { &mut s.mic } else { &mut s.sys };
@@ -614,11 +620,22 @@ mod mac {
                 }
                 dst.push(acc / ch as f32);
             }
+            if is_mic {
+                mic_frames = mic_frames.max(frames);
+            } else {
+                tap_frames = tap_frames.max(frames);
+            }
             seen_ch += ch;
         }
-        // 两轨长度对齐兜底:同一个 IOProc 出来的帧数本该一致,不一致要看得见。
-        if s.mic.len() != s.sys.len() && s.callbacks % 200 == 0 {
-            eprintln!("警告: 两轨样本数不等 mic={} sys={}", s.mic.len(), s.sys.len());
+        // 逐回调对账(Codex P2):"两轨样本数相等"这条结论必须每次回调都成立才算数。
+        // 只在最后比累计长度是不够的——某一次少给、下一次补回来,累计仍然相等。
+        let frames_this = mic_frames.max(tap_frames);
+        if mic_frames != tap_frames {
+            s.frame_mismatch += 1;
+            let d = (mic_frames as i64 - tap_frames as i64).unsigned_abs();
+            if d > s.max_frame_mismatch {
+                s.max_frame_mismatch = d;
+            }
         }
         s.frames += frames_this as u64;
         if s.callbacks == 0 {
@@ -663,8 +680,15 @@ mod mac {
         if chans.len() < 2 {
             bail!("聚合设备只报出 {} 个输入 buffer,拿不到两轨——先跑 probe 看布局", chans.len());
         }
-        let mic_ch = chans[0] as usize;
-        let tap_ch: usize = chans[1..].iter().map(|c| *c as usize).sum();
+        // 切轨边界取 **mic 设备自己的输入声道总数**,不是第一个 buffer 的声道数:
+        // 多流输入设备(部分 USB 声卡)的 mic 会跨多个 buffer(Codex P2)。
+        let mic_ch = mic.in_channels as usize;
+        let total_ch: usize = chans.iter().map(|c| *c as usize).sum();
+        let tap_ch = total_ch.saturating_sub(mic_ch);
+        if mic_ch == 0 || tap_ch == 0 {
+            bail!("通道账对不上: 聚合设备共 {total_ch}ch,mic 设备声称 {mic_ch}ch → tap 只剩 {tap_ch}ch");
+        }
+        println!("切轨: 前 {mic_ch}ch 归 mic,其余 {tap_ch}ch 归 tap(聚合共 {total_ch}ch)");
 
         let cap = (secs * src_hz) as usize + src_hz as usize;
         let mut shared = Box::new(Shared {
@@ -683,6 +707,8 @@ mod mac {
             first_cb: None,
             last_cb: None,
             first_frames: 0,
+            frame_mismatch: 0,
+            max_frame_mismatch: 0,
         });
 
         let mut proc_id: AudioDeviceIOProcID = None;
@@ -697,6 +723,9 @@ mod mac {
         if st != 0 {
             bail!("创建 IOProc 失败: {st} ({})", os_status_hint(st));
         }
+        // CPU 要报**采集期增量**:进程启动、缓冲预分配、设备建立那几百毫秒 user 时间
+        // 与"每秒采集要花多少 CPU"无关,算进去在短跑里会把数字抬高好几倍。
+        let cpu_before = process_cpu();
         let started = Instant::now();
         let st = unsafe { AudioDeviceStart(agg.id, proc_id) };
         if st != 0 {
@@ -706,11 +735,26 @@ mod mac {
         while started.elapsed().as_secs_f64() < secs && !STOP.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        unsafe {
-            AudioDeviceStop(agg.id, proc_id);
-            AudioDeviceDestroyIOProcID(agg.id, proc_id);
+        // 停 IOProc 必须确认成功才敢释放回调用的状态(Codex P1):`shared` 是这个函数栈上的
+        // Box,函数一返回就析构;若 Stop/Destroy 失败(热插拔测试里完全可能),CoreAudio 仍会
+        // 按那个裸指针回调,就是 use-after-free。失败就**故意泄漏**这块状态——探针马上要退出,
+        // 泄漏几 MB 无所谓,回调打到已释放内存则是随机崩溃/脏数据。
+        let st_stop = unsafe { AudioDeviceStop(agg.id, proc_id) };
+        let st_destroy = unsafe { AudioDeviceDestroyIOProcID(agg.id, proc_id) };
+        let quiesced = st_stop == 0 && st_destroy == 0;
+        if !quiesced {
+            eprintln!(
+                "⚠ IOProc 未能确认停止(stop={st_stop} {} / destroy={st_destroy} {}):\
+                 回调可能仍在跑,故意泄漏其状态以免 use-after-free",
+                os_status_hint(st_stop),
+                os_status_hint(st_destroy)
+            );
         }
         let wall = started.elapsed().as_secs_f64();
+        // CPU 快照要在**落盘之前**取:写两条几分钟长的 WAV 本身就吃掉可观的 user 时间,
+        // 混进去报出来的就不是"采集期的 CPU"了(第一版实测把 0.06% 报成了 0.67%)。
+        let cpu_after = process_cpu();
+        let (cpu_user, cpu_sys) = (cpu_after.0 - cpu_before.0, cpu_after.1 - cpu_before.1);
 
         // ── 落盘:两轨都降到 16k mono s16(与 app 的规范轨一致,xcorr_align 直接可读) ──
         // --native:按设备原始率落盘,绕开下面那个无抗混叠的线性抽取。宽带内容
@@ -752,7 +796,23 @@ mod mac {
             (framed / run / src_hz - 1.0) * 1e6
         );
         println!("回调耗时 p50={}µs p95={}µs max={}µs", pick(0.5), pick(0.95), pick(1.0));
-        println!("回调占用总计 {:.2}s ≈ 单核 {:.2}%", cpu.as_secs_f64(), cpu.as_secs_f64() / run.max(1e-9) * 100.0);
+        // 这是**回调占用**(墙钟),不是 CPU 成本:既不含 coreaudiod 里 tap/聚合设备/drift
+        // 重采样的开销,又混进了回调被抢占的时间(Codex P2)。进程自身 CPU 另用 getrusage 报,
+        // 系统侧开销要看 coreaudiod,本探针测不到。
+        println!(
+            "回调占用(墙钟)总计 {:.2}s ≈ 单核 {:.2}%——不等于 CPU 成本,见下",
+            cpu.as_secs_f64(),
+            cpu.as_secs_f64() / run.max(1e-9) * 100.0
+        );
+        println!(
+            "本进程 CPU(采集期,落盘前快照): user {cpu_user:.2}s + sys {cpu_sys:.2}s = 单核 {:.2}%\
+             (不含 coreaudiod 侧的 tap/聚合设备/drift 重采样开销——那要另测)",
+            (cpu_user + cpu_sys) / run.max(1e-9) * 100.0
+        );
+        println!(
+            "逐回调两轨帧数不等: {} 次,最大差 {} 帧(结构性保证成立则应为 0)",
+            shared.frame_mismatch, shared.max_frame_mismatch
+        );
         println!("时间戳断层: {} 次,最大 {:.0} 帧(判据 2:应为 0)", shared.gaps, shared.max_gap);
         for (at, d) in &shared.gap_log {
             println!("  断层 @{at:.1}s 跳 {d:.0} 帧 ≈ {:.0}ms", d * 1000.0 / src_hz);
@@ -761,6 +821,9 @@ mod mac {
             rms(&shared.mic), peak(&shared.mic), rms(&shared.sys), peak(&shared.sys));
         println!("\n落盘: {mic_path}\n      {sys_path}");
         println!("残余漂移(E1 口径,system 在前):\n  cargo run --bin xcorr_align -- {sys_path} {mic_path}");
+        if !quiesced {
+            std::mem::forget(shared); // 见上:回调可能还活着,不许析构
+        }
         Ok(())
     }
 
@@ -788,6 +851,17 @@ mod mac {
         }
         w.finalize()?;
         Ok(())
+    }
+
+    /// 本进程累计 CPU(user, sys),秒。只算自己这个进程——CoreAudio 的活儿在 coreaudiod 里,
+    /// 这里看不见,报数时必须说清楚。
+    fn process_cpu() -> (f64, f64) {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return (0.0, 0.0);
+        }
+        let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        (s(ru.ru_utime), s(ru.ru_stime))
     }
 
     fn rms(v: &[f32]) -> f64 {

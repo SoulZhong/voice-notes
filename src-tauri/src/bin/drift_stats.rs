@@ -98,6 +98,16 @@ fn passes_since(report_path: &std::path::Path, since: Option<&str>) -> bool {
     &name[..n] >= &since[..n]
 }
 
+/// `--since` 的取值形状:`YYYYMMDD` 或 `YYYYMMDD-HHMMSS`(与笔记 id 同构,可直接比前缀)。
+fn valid_since(v: &str) -> bool {
+    let b = v.as_bytes();
+    match b.len() {
+        8 => b.iter().all(|c| c.is_ascii_digit()),
+        15 => b[8] == b'-' && b[..8].iter().chain(&b[9..]).all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() { return None; }
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -178,6 +188,20 @@ mod tests {
         assert!(passes_since(&p("/d/fixtures/case-a/drift_report.json"), since));
     }
 
+    /// 这道门失效时必须是 fail-closed:`--since` 值写错就退出,绝不悄悄退回"全都算"——
+    /// 那样拿到的是一份看着正常、实则混了污染场次的基线。
+    #[test]
+    fn since_value_shape_is_validated() {
+        assert!(valid_since("20260814"));
+        assert!(valid_since("20260814-170000"));
+        assert!(!valid_since(""));
+        assert!(!valid_since("2026081"), "位数不足");
+        assert!(!valid_since("20260814170000"), "缺分隔符");
+        assert!(!valid_since("20260814-17000"), "时分秒位数不对");
+        assert!(!valid_since("2026-08-14"), "带横线的日期不是笔记 id 形状");
+        assert!(!valid_since("--out"), "把下一个 flag 当成值必须被挡下");
+    }
+
     /// Codex review Fix 3(P2)配套:inter_track 为 null 的场次(单源,或双源未同时
     /// 收敛)不得计入 rel_ppm 分布,但 with_inter_track/sessions 之比要能看出它被过滤了。
     #[test]
@@ -206,7 +230,22 @@ mod tests {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = args.first().cloned().expect("用法: drift_stats <data_root> [--since YYYYMMDD]");
-    let since = args.iter().position(|a| a == "--since").and_then(|i| args.get(i + 1)).cloned();
+    // --since 写错了必须**当场报错**,不能静默退回"全都算"(Codex P2):这道门就是防污染的,
+    // 失效方式一旦是 fail-open,拿到的就是一份看着正常、实则混了污染数据的基线。
+    let since = match args.iter().position(|a| a == "--since") {
+        None => None,
+        Some(i) => {
+            let v = args.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--since 后面缺日期(要 YYYYMMDD 或 YYYYMMDD-HHMMSS)");
+                std::process::exit(2);
+            });
+            if !valid_since(&v) {
+                eprintln!("--since 值不合法: {v}(要 YYYYMMDD 或 YYYYMMDD-HHMMSS)");
+                std::process::exit(2);
+            }
+            Some(v)
+        }
+    };
     if let Some(s) = &since {
         println!("(只统计 {s} 及之后建档的笔记——E2 基线不得混入 PR#103 之前的污染数据)");
     }
