@@ -679,7 +679,10 @@ mod mac {
             s.ts_valid += 1;
             if s.last_sample_time > 0.0 {
                 let d = (ts.mSampleTime - s.last_sample_time).abs();
-                if d > 1.0 {
+                // 容差取半帧而不是一帧(Codex 十二轮 P2):系统只补/丢**一帧**时 d 恰为 1.0,
+                // 用 `> 1.0` 会把这种最典型的硬校正漏掉——而它正是判据 2 要抓的东西。
+                // 0.5 既能抓住整一帧的跳变,又容得下 mSampleTime 的浮点噪声。
+                if d > 0.5 {
                     s.gaps += 1;
                     if d > s.max_gap {
                         s.max_gap = d;
@@ -903,7 +906,15 @@ mod mac {
              \x20            其中轨内 buffer 参差 {} 次(>0 则合并归一的分母不可信,轨内容存疑)",
             shared.frame_mismatch, shared.max_frame_mismatch, shared.ragged_buffers
         );
-        if shared.ts_valid < 2 {
+        // 覆盖率也算数据(Codex 十二轮 P2):中途丢失时间戳(热插拔场景常见)时,
+        // 未被检查的那段不能算"没有断层"。
+        if shared.ts_valid >= 2 && shared.ts_missing > 0 {
+            println!(
+                "时间戳断层: {} 次,最大 {:.0} 帧 —— **只覆盖了部分回调**(有效 {} / 缺失 {}),\n\
+                 \x20            未覆盖的那段无从判断,判据 2 这一场只能算部分成立",
+                shared.gaps, shared.max_gap, shared.ts_valid, shared.ts_missing
+            );
+        } else if shared.ts_valid < 2 {
             println!(
                 "时间戳断层: **未测**(带有效 mSampleTime 的回调只有 {} 个,缺失 {} 个)——\n\
                  \x20            判据 2 这一场不成立,不能当通过",
