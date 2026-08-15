@@ -346,6 +346,21 @@
   }
 </script>
 
+{#snippet auditionIcon(active: boolean)}
+  <!-- 试听按钮的播放/停止图形。DESIGN.md 第 7 条禁用 Unicode 符号字符(此前是 ▶/◼,
+       各平台字形与基线不一,和相邻文字对不齐),统一走 16 单位坐标系的 SVG,与
+       AudioPlayer.svelte 的播放键同源;停止态用圆角方块,和录制中的方块语义一致。 -->
+  {#if active}
+    <svg class="audition-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="3.2" y="3.2" width="9.6" height="9.6" rx="1.6" fill="currentColor" />
+    </svg>
+  {:else}
+    <svg class="audition-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M4.5 2.8v10.4c0 .8.9 1.3 1.6.9l8-5.2c.6-.4.6-1.4 0-1.8l-8-5.2c-.7-.4-1.6.1-1.6.9z" fill="currentColor" />
+    </svg>
+  {/if}
+{/snippet}
+
 {#snippet cardError(key: string)}
   {#if actionError?.key === key}
     <p class="card-error">{actionError.msg}</p>
@@ -368,16 +383,23 @@
       </div>
       <div class="samples">
         {#each p.sample_paths as path, i (path)}
+          {@const sampleLabel = p.sample_dates[i]
+            ? formatDate(p.sample_dates[i]).slice(5, 10)
+            : t("speakers.sampleN", { n: i + 1 })}
+          <!-- aria-label 必须显式给:图标已是 aria-hidden 的 SVG(此前是 ▶/◼ 文本字符,
+               读屏能念),按钮又自带可见文字,title 在这种情况下不是可靠的可及名字,
+               不给就只剩一个日期、听不出这是播放还是停止。label 里包含可见文字本身,
+               满足 WCAG 2.5.3(label in name)。aria-pressed 暴露"正在播"这个开关态。 -->
           <button
             class="chip"
             class:playing={playingKey === path}
             title={playingKey === path ? t("speakers.stop") : t("speakers.auditionSample")}
+            aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionSample")} ${sampleLabel}`}
+            aria-pressed={playingKey === path}
             onclick={() => audition.toggle(path, path)}
           >
-            {playingKey === path ? "◼" : "▶"}
-            {p.sample_dates[i]
-              ? formatDate(p.sample_dates[i]).slice(5, 10)
-              : t("speakers.sampleN", { n: i + 1 })}
+            {@render auditionIcon(playingKey === path)}
+            {sampleLabel}
           </button>
         {:else}
           <span class="hint">{t("speakers.noSamples")}</span>
@@ -426,9 +448,11 @@
               class="chip"
               class:playing={playingKey === path}
               title={playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")}
+              aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionPreMerge")} ${t("speakers.snapshotN", { n: i + 1 })}`}
+              aria-pressed={playingKey === path}
               onclick={() => audition.toggle(path, path)}
             >
-              {playingKey === path ? "◼" : "▶"}
+              {@render auditionIcon(playingKey === path)}
               {t("speakers.snapshotN", { n: i + 1 })}
             </button>
           {:else}
@@ -449,9 +473,11 @@
                 class="chip"
                 class:playing={playingKey === path}
                 title={playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")}
+                aria-label={`${playingKey === path ? t("speakers.stop") : t("speakers.auditionMergeSample")} ${t("speakers.snapshotN", { n: i + 1 })}`}
+                aria-pressed={playingKey === path}
                 onclick={() => audition.toggle(path, path)}
               >
-                {playingKey === path ? "◼" : "▶"}
+                {@render auditionIcon(playingKey === path)}
                 {t("speakers.snapshotN", { n: i + 1 })}
               </button>
             {/each}
@@ -1044,6 +1070,14 @@
   .chip:hover {
     background: var(--surface);
     color: var(--ink);
+  }
+  /* 试听图标:尺寸用 em 跟随 chip 字号,vertical-align 显式压到与相邻日期文字
+     对齐——此前的 ▶/◼ 字符靠各平台自己的字形基线对齐,高低不一正是要修的问题。 */
+  .audition-icon {
+    width: 0.85em;
+    height: 0.85em;
+    vertical-align: -0.09em;
+    margin-right: 0.15em;
   }
   .chip.playing {
     border-color: var(--accent);
