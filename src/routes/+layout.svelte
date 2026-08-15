@@ -64,11 +64,6 @@
 
   // 基础初始化由 onboarded 记账；每个新功能由 completed_guides 中的独立 ID 记账。
   // 因此旧用户可以看到新功能引导，同时不会重复经历模型下载。
-  // 迷你条实际高度(px):由 MiniPlayer.svelte 内部 bind:clientHeight 实测回填,
-  // 不在这里另猜一个像素数——同一个数既是迷你条自己的渲染高度,也是它会遮住的
-  // 高度,两者天然相等,以后迷你条改 padding/字号也不用两头维护。条不显示时
-  // MiniPlayer 会把它归零,下面的 padding-bottom 随之撤掉,不会凭空多出空白。
-  let miniPlayerHeight = $state(0);
 
   let welcomeStatus = $state<ModelsStatus | null>(null);
   async function checkOnboarding() {
@@ -131,7 +126,7 @@
 
 <div class="shell">
   <Sidebar />
-  <main class="main" style:padding-bottom={miniPlayerHeight > 0 ? `${miniPlayerHeight}px` : undefined}>
+  <main class="main">
     {#if update}
       <div class="update-banner">
         <span class="upd-dot"></span>{t("shell.update.found", { latest: update.latest, current: update.current })}
@@ -174,7 +169,7 @@
   <WelcomeOverlay status={welcomeStatus} onDone={onWelcomeDone} />
 {/if}
 <ContextGuide />
-<MiniPlayer bind:height={miniPlayerHeight} />
+<MiniPlayer />
 
 <style>
   :global(body) {
