@@ -252,6 +252,18 @@ fn main() {
             Some(v)
         }
     };
+    // 未知参数一律拒绝(Codex 九轮 P2):`--sine` 这种手滑会让上面的查找返回 None、
+    // 悄悄退回"全都算",污染门形同虚设——防污染的开关必须 fail-closed 到底。
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--since" => i += 2,
+            other => {
+                eprintln!("未知参数: {other}(用法: drift_stats <data_root> [--since YYYYMMDD[-HHMMSS]])");
+                std::process::exit(2);
+            }
+        }
+    }
     if let Some(s) = &since {
         println!("(只统计 {s} 及之后建档的笔记——E2 基线不得混入 PR#103 之前的污染数据)");
     }

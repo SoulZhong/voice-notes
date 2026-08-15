@@ -806,6 +806,12 @@ mod mac {
         // 混进去报出来的就不是"采集期的 CPU"了(第一版实测把 0.06% 报成了 0.67%)。
         let cpu_after = process_cpu();
         let (cpu_user, cpu_sys) = (cpu_after.0 - cpu_before.0, cpu_after.1 - cpu_before.1);
+        // 速率只能量"首回调 → 末回调"这段:两端各有一截与采样无关的时长(启动延迟、
+        // 主循环 200ms 轮询粒度),算进去就是几百 ppm 的假象。下面的有效性守卫也要用它。
+        let run = match (shared.first_cb, shared.last_cb) {
+            (Some(a), Some(b)) => b.duration_since(a).as_secs_f64(),
+            _ => 0.0,
+        };
 
         // ── 落盘:两轨都降到 16k mono s16(与 app 的规范轨一致,xcorr_align 直接可读) ──
         // --native:按设备原始率落盘,绕开下面那个无抗混叠的线性抽取。宽带内容
@@ -814,9 +820,13 @@ mod mac {
         // 一帧都没收到就别装作跑成功了(Codex 八轮 P2):--secs 0、设备当场丢失、IOProc
         // 从未被调用,都会走到这里。此时落盘只会得到两个空 WAV,而"断层 0 次、帧数不等
         // 0 次"这类结论看着还挺漂亮——正是最坏的一种假通过。
-        if shared.callbacks == 0 || shared.mic.is_empty() || shared.sys.is_empty() {
+        // 至少要两次回调:速率的分母是"首→末回调"的间隔,只有一次回调时该间隔为 0、
+        // 且 frames - first_frames = 0,会算出 0Hz / -1000000ppm 这种废数还报成功
+        // (Codex 九轮 P2)。间隔本身也要为正。
+        if shared.callbacks < 2 || shared.mic.is_empty() || shared.sys.is_empty() || run <= 0.0 {
             bail!(
-                "没有采到有效数据(回调 {} 次,mic {} 样本,system {} 样本):不落盘、不出结论",
+                "没有采到足够数据(回调 {} 次,首→末间隔 {run:.3}s,mic {} 样本,system {} 样本):\
+                 不落盘、不出结论",
                 shared.callbacks,
                 shared.mic.len(),
                 shared.sys.len()
@@ -833,12 +843,6 @@ mod mac {
         us.sort_unstable();
         let pick = |q: f64| us.get(((us.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0);
         let cpu = std::time::Duration::from_micros(us.iter().map(|u| *u as u64).sum());
-        // 速率只能量"首回调 → 末回调"这段:两端各有一截与采样无关的时长(启动延迟、
-        // 主循环 200ms 轮询粒度),算进去就是几百 ppm 的假象。
-        let run = match (shared.first_cb, shared.last_cb) {
-            (Some(a), Some(b)) => b.duration_since(a).as_secs_f64(),
-            _ => wall,
-        };
         let framed = shared.frames.saturating_sub(shared.first_frames) as f64;
         println!("\n== 采集结果 ==");
         println!(

@@ -87,8 +87,19 @@ def norm_xcorr_at(a, b, t0, win, lo, hi):
         return None
     med = float(np.median(others))
     mad = float(np.median(np.abs(others - med))) * 1.4826
-    z = (best - med) / mad if mad > 1e-12 else float("inf")
-    if z < PEAK_Z:
+    if mad < 1e-9:
+        # 背景涨落为 0 = 大量滞后并列(周期性内容如等间隔 click 串,或常数序列)。
+        # 这时"显著性"无从谈起,原先按 inf 放行会让并列峰(常常就落在搜索边界)
+        # 拟合出完美 0ppm(Codex 九轮 P2)。宁可丢掉这个窗。
+        return None
+    if (best - med) / mad < PEAK_Z:
+        return None
+    # 峰唯一性:主峰邻域之外若还有一个几乎一样高的峰,说明内容周期性/自相似,
+    # 这个滞后读数没有意义(选中哪个纯看噪声)。邻域取 ±win/8。
+    guard = max(1, win // 8)
+    lo_i, hi_i = max(0, k - guard), min(len(ncorr), k + guard + 1)
+    rest = np.concatenate([ncorr[:lo_i], ncorr[hi_i:]])
+    if rest.size and float(rest.max()) > 0.9 * best:
         return None
     # 峰落在搜索边界上 = 真峰多半在窗外,读数不可信,交给调用方决定要不要用。
     at_edge = k == 0 or k == len(ncorr) - 1
