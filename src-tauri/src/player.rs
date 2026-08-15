@@ -79,6 +79,8 @@ struct Core {
     /// 播放游标(f64 bits,16k 源域采样),回调推进、seek 改写。
     cursor_bits: AtomicU64,
     playing: AtomicBool,
+    /// 装载本核时的代次,随位置事件发给前端做归属判定。
+    gen: u64,
 }
 
 impl Core {
@@ -208,12 +210,18 @@ pub struct LoadTrack {
 struct PosEvent {
     pos_ms: u64,
     playing: bool,
+    /// 装载代次:前端会话据此辨认事件归属,丢弃属于旧内核的排队事件。
+    gen: u64,
 }
 
 fn emit_pos(app: &AppHandle, core: &Core) {
     let _ = app.emit(
         "player_pos",
-        PosEvent { pos_ms: core.pos_ms(), playing: core.playing.load(Ordering::Relaxed) },
+        PosEvent {
+            pos_ms: core.pos_ms(),
+            playing: core.playing.load(Ordering::Relaxed),
+            gen: core.gen,
+        },
     );
 }
 
@@ -769,6 +777,7 @@ pub async fn player_load(
         total_samples,
         cursor_bits: AtomicU64::new(0f64.to_bits()),
         playing: AtomicBool::new(false),
+        gen,
     });
     // 发布段(持 publish 互斥,Codex P1):查代次→装内核→起流→复查整段串行。
     // 过期装载在首查即弃(未触碰任何共享态);持锁期间发布后才发现过期(新装载
@@ -1142,6 +1151,7 @@ mod tests {
             total_samples: total,
             cursor_bits: AtomicU64::new(0f64.to_bits()),
             playing: AtomicBool::new(true),
+            gen: 0,
         }
     }
 
@@ -1384,5 +1394,16 @@ mod tests {
         for (o, e) in out.iter().zip(expect) {
             assert!((o - e).abs() < 1e-6, "空表必须逐采样等于现状");
         }
+    }
+
+    /// 位置事件必须带装载代次:store 靠它把"停 A 装 B"窗口里 A 的排队事件丢掉,
+    /// 否则 A 的位置会写进 B 的界面(spec 第二版 P1)。
+    #[test]
+    fn pos_event_carries_load_generation() {
+        let ev = PosEvent { pos_ms: 1234, playing: true, gen: 7 };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["pos_ms"], 1234);
+        assert_eq!(v["playing"], true);
+        assert_eq!(v["gen"], 7, "缺 gen 前端就无法辨认事件归属");
     }
 }
