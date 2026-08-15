@@ -115,8 +115,25 @@ fn valid_since(v: &str) -> bool {
     // 光看形状不够(Codex 十七轮 P2):`20260814-240000` / `-176000` 全是数字也过形状,
     // 但字典序过滤会据此静默排掉一批本该计入的场次——与 fail-closed 的初衷相反。
     let num = |r: std::ops::Range<usize>| v[r].parse::<u32>().unwrap_or(u32::MAX);
-    let (mo, d) = (num(4..6), num(6..8));
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    let (y, mo, d) = (num(0..4), num(4..6), num(6..8));
+    if !(1..=12).contains(&mo) {
+        return false;
+    }
+    // 逐月天数(含闰年):2 月 31 日这类"月日各自合法、组合不存在"的值同样会被字典序
+    // 当成"该月末之后"的截止点,静默排掉本该计入的场次(Codex 十八轮 P2)。
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if !(1..=dim).contains(&d) {
         return false;
     }
     if b.len() == 15 {
@@ -227,6 +244,10 @@ mod tests {
         assert!(!valid_since("20260814-176000"), "76 分不存在");
         assert!(!valid_since("20261314"), "13 月不存在");
         assert!(!valid_since("20260800"), "0 日不存在");
+        assert!(!valid_since("20260231"), "2 月 31 日不存在");
+        assert!(!valid_since("20260431"), "4 月 31 日不存在");
+        assert!(!valid_since("20260229"), "2026 不是闰年,2 月 29 日不存在");
+        assert!(valid_since("20240229"), "2024 是闰年,2 月 29 日存在");
         assert!(valid_since("20260814-235959"), "边界值要放行");
         assert!(!valid_since("--out"), "把下一个 flag 当成值必须被挡下");
     }
