@@ -16,7 +16,6 @@ b=采集轨,正值 = 采集轨里的内容比参考跑得快。
     python3 scripts/drift_vs_ref.py <参考.wav> <采集.wav> [--min-corr 0.0]
 两个文件都要 16-bit mono 且采样率相同。
 """
-import struct
 import sys
 import wave
 
@@ -27,7 +26,9 @@ def read(path):
     w = wave.open(path)
     assert w.getnchannels() == 1 and w.getsampwidth() == 2, f"{path} 需要 16-bit mono"
     n = w.getnframes()
-    s = np.array(struct.unpack("<%dh" % n, w.readframes(n)), dtype=np.float32) / 32768.0
+    # 直接按小端 i16 视图解,不走 struct.unpack:--native 的 6 分钟 48k 轨有 1800 万样本,
+    # unpack 会先造出等量的 Python int 对象,峰值内存能奔着 GB 去(Codex 三轮 P2)。
+    s = np.frombuffer(w.readframes(n), dtype="<i2").astype(np.float32) / 32768.0
     return s, w.getframerate()
 
 

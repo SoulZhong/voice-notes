@@ -761,7 +761,9 @@ mod mac {
         if st != 0 {
             bail!("启动聚合设备失败: {st} ({})", os_status_hint(st));
         }
-        println!("采集中 {secs:.0}s…(此刻请按 scripts/catap-spike.md 的步骤放标定序列)");
+        println!(
+            "采集中 {secs:.0}s…(此刻请放标定序列/参考音频,步骤见 docs/2026-08-15-catap-e3-spike.md)"
+        );
         while started.elapsed().as_secs_f64() < secs && !STOP.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
