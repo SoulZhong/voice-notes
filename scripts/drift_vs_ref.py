@@ -32,22 +32,36 @@ def read(path):
     return s, w.getframerate()
 
 
+# 相关系数的数值地板。低于它就当"根本没找到峰",直接丢掉这个窗。
+# 为什么必须有:静音轨在每个滞后上的相关都是 0,argmax 会稳定地选中搜索边界,于是
+# 每个窗的"错位"都等于同一个边界值——拟合出来是一条完美的 0.00ppm 直线、残差 0.000ms,
+# 看着比真数据还漂亮(Codex 五轮 P2,拿一条 rms=0 的实测轨复现过)。
+CORR_FLOOR = 0.02
+
+
 def norm_xcorr_at(a, b, t0, win, lo, hi):
-    """在 b 的 [t0+lo, t0+hi] 里找与 a[t0:t0+win] 最像的偏移。返回 (offset, corr)。"""
+    """在 b 的 [t0+lo, t0+hi] 里找与 a[t0:t0+win] 最像的偏移。返回 (offset, corr, at_edge)。"""
     seg = a[t0 : t0 + win]
     ea = float(np.dot(seg, seg))
     if ea < 1e-6:
-        return None
+        return None  # 参考侧这一段是静音,没什么可对的
     start, end = t0 + lo, t0 + hi + win
     if start < 0 or end > len(b):
         return None
     window = b[start:end]
+    if float(np.dot(window, window)) < 1e-6:
+        return None  # 采集侧整段静音
     corr = np.correlate(window, seg, mode="valid")
     cs = np.concatenate(([0.0], np.cumsum(window.astype(np.float64) ** 2)))
     energies = cs[win:] - cs[: len(cs) - win]
     ncorr = corr / np.sqrt(ea * np.maximum(energies, 1e-12))
     k = int(np.argmax(ncorr))
-    return (lo + k, float(ncorr[k]))
+    best = float(ncorr[k])
+    if best < CORR_FLOOR:
+        return None
+    # 峰落在搜索边界上 = 真峰多半在窗外,读数不可信,交给调用方决定要不要用。
+    at_edge = k == 0 or k == len(ncorr) - 1
+    return (lo + k, best, at_edge)
 
 
 def main():
@@ -67,21 +81,27 @@ def main():
     # 粗对齐:头部一个长窗在 ±10s 里找起始偏移(t0 必须 ≥ 搜索半径,否则起点为负)。
     coarse = norm_xcorr_at(ref, cap, rate * 15, win * 2, -10 * rate, 10 * rate)
     if coarse is None:
-        print("粗对齐失败:文件太短或全静音")
+        print("粗对齐失败:文件太短、全静音,或两者内容根本对不上(相关低于地板)")
         sys.exit(1)
-    lag0, c0 = coarse
+    lag0, c0, c_edge = coarse
     print(f"粗对齐: 采集轨比参考晚 {lag0/rate:+.3f}s (corr {c0:.3f})")
+    if c_edge:
+        print("警告: 粗对齐的峰落在 ±10s 搜索边界上,起始差可能超出搜索范围,结果不可信")
 
     # 精测:搜索半径 ±0.2s 足够覆盖 500ppm×几百秒的漂移。
-    pts, t, step = [], rate * 2, rate * 10
+    pts, edge_hits, t, step = [], 0, rate * 2, rate * 10
     print("t_s\toffset_ms\tcorr")
     while t + win < len(ref) and t + lag0 + win + rate // 5 < len(cap):
         r = norm_xcorr_at(ref, cap, t, win, lag0 - rate // 5, lag0 + rate // 5)
         if r and r[1] >= min_corr:
             off_ms = (r[0] - lag0) * 1000.0 / rate
-            print(f"{t/rate:.0f}\t{off_ms:+.3f}\t{r[1]:.2f}")
+            edge = "  ←边界" if r[2] else ""
+            print(f"{t/rate:.0f}\t{off_ms:+.3f}\t{r[1]:.2f}{edge}")
+            edge_hits += 1 if r[2] else 0
             pts.append((t / rate, off_ms))
         t += step
+    if edge_hits:
+        print(f"警告: {edge_hits} 个窗的峰落在 ±0.2s 搜索边界上,漂移可能超出搜索范围")
     if len(pts) < 2:
         print("有效窗不足,无法拟合")
         sys.exit(1)
