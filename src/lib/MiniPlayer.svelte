@@ -151,8 +151,12 @@
     --orb-shade: light-dark(rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.35));
     /* 圆心按钮另立一套:上面两个是给 surface 灰底调的,按钮底色是 accent 实底,明暗
        两主题的 accent luminance 相反(亮色 #0f7fd1 深蓝 / 暗色 #57c1ff 浅蓝),沿用
-       surface 那套会让暗色下 0.08 的高光在浅蓝上几乎看不见。故按 accent 单独取值。 */
-    --orb-toggle-sheen: light-dark(rgba(255, 255, 255, 0.4), rgba(255, 255, 255, 0.22));
+       surface 那套会让暗色下 0.08 的高光在浅蓝上几乎看不见。故按 accent 单独取值。
+       亮色这一档卡在图标对比度上,不能凭手感调:白字形(--on-accent)压在高光最亮处,
+       高光越强底色越白、字越糊。实算 0.4 白叠 #0f7fd1 得 rgb(111,178,227),对白字
+       仅 2.30:1,低于 3:1;取 0.16 得 3.31:1,留出余量。暗色是近黑字形叠浅蓝,
+       高光反而把对比拉到 ~11.6:1,故两档不对称是刻意的,别"顺手统一"。 */
+    --orb-toggle-sheen: light-dark(rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.22));
     --orb-toggle-shade: light-dark(rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.12));
     position: fixed;
     /* 尺寸/离边距取全局 token(见 app.css),不在这里写死——+layout.svelte 的主内容区
