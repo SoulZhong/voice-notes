@@ -50,6 +50,8 @@ def norm_xcorr_at(a, b, t0, win, lo, hi):
     (Codex 六轮 P2)。
     """
     seg = a[t0 : t0 + win].astype(np.float64)
+    if len(seg) < win:
+        return None  # 参考侧不够一个整窗:切片会静默变短,后面 cov/vary 长度对不上直接崩
     seg = seg - seg.mean()
     varx = float(np.dot(seg, seg))
     if varx / win < RMS_FLOOR**2:
