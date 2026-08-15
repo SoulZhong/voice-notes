@@ -15,6 +15,7 @@ export const zh = {
   "common.saveFailed": "保存失败: {e}",
   "common.deleteFailed": "删除失败: {e}",
   "common.none": "—",
+  "common.close": "关闭",
 } as const satisfies Dict;
 
 export const en = {
@@ -30,4 +31,5 @@ export const en = {
   "common.saveFailed": "Failed to save: {e}",
   "common.deleteFailed": "Failed to delete: {e}",
   "common.none": "—",
+  "common.close": "Close",
 } satisfies Record<keyof typeof zh, Msg>;

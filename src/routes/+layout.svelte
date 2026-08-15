@@ -22,6 +22,8 @@
   } from "$lib/update";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
+  import MiniPlayer from "$lib/MiniPlayer.svelte";
+  import { startPlaybackSubscriptions } from "$lib/playback.svelte";
 
   let { children } = $props();
 
@@ -95,6 +97,10 @@
     void tidy.refresh();
   });
 
+  // 位置事件的全局订阅:放这里而不是 AudioPlayer 里——组件一卸载订阅就没了,
+  // 迷你条的进度会僵住。
+  $effect(() => startPlaybackSubscriptions());
+
   onMount(() => {
     recording.init();
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
@@ -162,6 +168,7 @@
   <WelcomeOverlay status={welcomeStatus} onDone={onWelcomeDone} />
 {/if}
 <ContextGuide />
+<MiniPlayer />
 
 <style>
   :global(body) {
