@@ -1,4 +1,4 @@
-import { onPlayerPos } from "$lib/events";
+import { onNoteRenamed, onPlayerPos } from "$lib/events";
 
 /** 活动播放会话。由用户**真正开始播放**建立,不是装载建立——播放器进笔记页就会
     自动装载,若用装载判定,只看过没播过的笔记离页后也会冒出迷你条。 */
@@ -72,11 +72,14 @@ class Playback {
 
 export const playback = new Playback();
 
-/** 全局位置订阅:必须放在 store 而不是 AudioPlayer 组件里——组件一卸载订阅就没了,
-    迷你条的进度会僵住。应用启动时由 +layout.svelte 调一次。 */
+/** 全局订阅:必须放在 store 而不是播放浮层组件里——组件一卸载订阅就没了,
+    位置会僵住、改名也追不上。应用启动时由 +layout.svelte 调一次。
+    listen() 返回 Promise,不能直接当清理函数用,要包一层等它落地再调。 */
 export function startPlaybackSubscriptions(): () => void {
-  const un = onPlayerPos((e) => playback.applyPos(e));
+  const unPos = onPlayerPos((e) => playback.applyPos(e));
+  const unRename = onNoteRenamed((e) => playback.rename(e.note_id, e.title));
   return () => {
-    un.then((f) => f());
+    void Promise.resolve(unPos).then((f) => f());
+    void Promise.resolve(unRename).then((f) => f());
   };
 }
