@@ -13,19 +13,39 @@ use crossbeam_channel::Sender;
 /// 补洞与 drift 记账,宁可少补也不能让回调自己变成卡顿源。
 const DROP_PAD_CAP: usize = 48_000 * 5;
 
-/// 把此前丢掉的样本以静音补在本批数据前面,返回要发送的载荷,并清空待补量。
-/// 纯函数(不碰通道/时钟),便于直接测:补零发生在**丢失位置**,时长与丢失量一致。
-fn pad_dropped(pending: &mut usize, data: &[f32], channels: u16) -> Vec<f32> {
-    if *pending == 0 {
-        return data.to_vec();
+/// 把此前丢掉的样本以静音补在本批数据前面,并把时间戳回拨到**第一个样本**的时刻。
+///
+/// 纯函数,不清 `pending`——清零由调用方在 try_send **成功之后**做:队列持续满时
+/// 每次尝试都会失败,提前清零会让先前累计的丢失被逐次遗忘,最后只补上最后一个
+/// 回调那点(Codex 七轮 P1)。
+///
+/// 时戳必须回拨(Codex 七轮 P1):cpal 给的是 `data` 首样本的捕获时刻,补零之后这
+/// 一帧的首样本比它早了 pad 那么多。不回拨的话,tap 看到的"上一帧到本帧"间隔仍然
+/// 大于本帧携带的样本时长,会把同一段缺口按 HAL 丢失再补一次,轨道反而被拉长。
+fn padded_frame(
+    pending: usize,
+    data: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    ts: Option<u64>,
+) -> (Vec<f32>, Option<u64>) {
+    if pending == 0 {
+        return (data.to_vec(), ts);
     }
     let ch = channels.max(1) as usize;
-    let pad = *pending * ch;
-    *pending = 0;
+    let pad = pending * ch;
     let mut out = Vec::with_capacity(pad + data.len());
     out.resize(pad, 0.0);
     out.extend_from_slice(data);
-    out
+    let ts = ts.map(|t| {
+        let back = if sample_rate > 0 {
+            (pending as u64 * 1_000_000_000) / sample_rate as u64
+        } else {
+            0
+        };
+        t.saturating_sub(back)
+    });
+    (out, ts)
 }
 
 pub struct Microphone {
@@ -119,16 +139,19 @@ impl AudioCapture for Microphone {
                     // 走过的时间重新一致,对账不会被搅乱),也不需要任何跨线程的
                     // 丢失元数据(Codex 六轮:计数器方案在 FIFO 里的位置全错,且生产
                     // 装配隔着 ResilientCapture 根本读不到)。
-                    let payload = pad_dropped(&mut pending_drop, data, channels);
-                    if sink
+                    let (payload, ts) =
+                        padded_frame(pending_drop, data, channels, sample_rate, host_time_ns);
+                    let sent = sink
                         .try_send(AudioFrame {
                             samples: payload,
                             sample_rate,
                             channels,
-                            host_time_ns,
+                            host_time_ns: ts,
                         })
-                        .is_err()
-                    {
+                        .is_ok();
+                    if sent {
+                        pending_drop = 0; // 补出去了才清,失败要留着继续攒
+                    } else {
                         let per_ch = data.len() / channels.max(1) as usize;
                         pending_drop = (pending_drop + per_ch).min(DROP_PAD_CAP);
                         dropped.fetch_add(per_ch as u64, std::sync::atomic::Ordering::Relaxed);
@@ -204,37 +227,55 @@ mod tests {
 
     #[test]
     fn no_pending_drop_passes_data_through() {
-        let mut pending = 0usize;
-        let out = pad_dropped(&mut pending, &[0.1, 0.2], 1);
+        let (out, ts) = padded_frame(0, &[0.1, 0.2], 1, 16_000, Some(5_000));
         assert_eq!(out, vec![0.1, 0.2]);
-        assert_eq!(pending, 0);
+        assert_eq!(ts, Some(5_000), "没补零就不该动时戳");
     }
 
     #[test]
-    fn dropped_span_is_padded_in_front_and_cleared() {
+    fn dropped_span_is_padded_in_front() {
         // 丢了 3 个(每声道)样本,下一批数据前面就该有 3 个静音——补在丢失的位置上,
         // 时长与丢失量一致,下游的时间轴因此不被压缩。
-        let mut pending = 3usize;
-        let out = pad_dropped(&mut pending, &[0.5, 0.6], 1);
+        let (out, _) = padded_frame(3, &[0.5, 0.6], 1, 16_000, None);
         assert_eq!(out, vec![0.0, 0.0, 0.0, 0.5, 0.6]);
-        assert_eq!(pending, 0, "补过就要清零,不能重复补");
+    }
+
+    #[test]
+    fn timestamp_is_rewound_to_the_first_padded_sample() {
+        // 16k 下补 160 个样本 = 10ms;时戳必须回拨 10ms,否则 tap 会把同一段缺口
+        // 当 HAL 丢失再补一次(Codex 七轮 P1)。
+        let (_, ts) = padded_frame(160, &[0.0], 1, 16_000, Some(100_000_000));
+        assert_eq!(ts, Some(90_000_000));
+    }
+
+    #[test]
+    fn missing_timestamp_stays_missing() {
+        let (_, ts) = padded_frame(160, &[0.0], 1, 16_000, None);
+        assert_eq!(ts, None);
     }
 
     #[test]
     fn padding_respects_channel_interleaving() {
         // 双声道:每声道 2 个样本 = 4 个交错样本。
-        let mut pending = 2usize;
-        let out = pad_dropped(&mut pending, &[1.0, -1.0], 2);
+        let (out, _) = padded_frame(2, &[1.0, -1.0], 2, 48_000, None);
         assert_eq!(out.len(), 4 + 2);
         assert!(out[..4].iter().all(|s| *s == 0.0));
         assert_eq!(&out[4..], &[1.0, -1.0]);
     }
 
     #[test]
+    fn pending_is_not_cleared_by_the_helper() {
+        // 纯函数不清零:清零由调用方在发送成功后做。队列持续满时每次都失败,
+        // 提前清零会把先前累计的丢失逐次遗忘。
+        let pending = 5usize;
+        let (a, _) = padded_frame(pending, &[0.0], 1, 16_000, None);
+        let (b, _) = padded_frame(pending, &[0.0], 1, 16_000, None);
+        assert_eq!(a.len(), b.len(), "同一 pending 两次调用结果一致");
+    }
+
+    #[test]
     fn cap_bounds_the_allocation() {
-        // 上限存在的意义:回调里不做无界分配。
-        let mut pending = DROP_PAD_CAP;
-        let out = pad_dropped(&mut pending, &[0.0], 1);
+        let (out, _) = padded_frame(DROP_PAD_CAP, &[0.0], 1, 48_000, None);
         assert_eq!(out.len(), DROP_PAD_CAP + 1);
     }
 }
