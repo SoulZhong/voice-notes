@@ -811,7 +811,15 @@
               if (disposed || forId !== id || sawTerminal) return;
               try {
                 if (!(await noteRefining(forId))) {
-                  if (!disposed && forId === id) refining = false;
+                  if (!disposed && forId === id) {
+                    refining = false;
+                    // 走到这条路径说明终态事件被错过了,refined 还是跑之前那份
+                    // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
+                    // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
+                    void getRefined(forId).then((r) => {
+                      if (!disposed && forId === id) refined = r;
+                    });
+                  }
                   return;
                 }
               } catch {

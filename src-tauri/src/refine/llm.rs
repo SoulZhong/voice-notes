@@ -26,7 +26,9 @@ const RETRY_DELAY_S: u64 = 0;
 pub(crate) fn worth_retry(status: Option<u16>) -> bool {
     match status {
         None => true,
-        Some(429) => true,
+        // 408 是"服务端认定请求超时",与传输层超时同一类瞬时故障——有些
+        // OpenAI 兼容网关就用它报超时,不收进来等于漏掉本次改动最想救的那类。
+        Some(408 | 429) => true,
         Some(c) => (500..600).contains(&c),
     }
 }
@@ -944,6 +946,7 @@ mod tests {
     fn worth_retry_only_for_transient_failures() {
         assert!(worth_retry(None), "传输层错误(超时/DNS/连接断)必重试");
         assert!(worth_retry(Some(429)), "限流是瞬时的");
+        assert!(worth_retry(Some(408)), "网关把超时报成 408 也是瞬时的");
         for c in [500, 502, 503, 504] {
             assert!(worth_retry(Some(c)), "{c} 是服务端瞬时状态");
         }
