@@ -336,18 +336,6 @@
           : "",
   );
 
-  const statusLabel = $derived(
-    isError(recording.status)
-      ? t("record.status.error")
-      : recording.status === "recording"
-        ? t("record.status.recording")
-        : recording.status === "paused"
-          ? t("record.status.paused")
-          : recording.status === "stopped"
-            ? t("record.status.stopped")
-            : t("record.status.ready"),
-  );
-
   // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
   // system_denied=屏幕录制权限缺失(可操作:引导去系统设置);system_unavailable=
   // 设备/组件问题或 Windows(该平台无此权限模型,恒 unavailable,见 lib.rs
@@ -685,7 +673,9 @@
           {/if}
         </div>
 
-        {#if recording.isLive}
+        <!-- 停止中也要出这一簇(Codex P2):stop() 一发 isLive 就转 false,若只认 isLive,
+             「停止中…」这句会连同整簇消失,几秒的收尾期只剩一个禁用图标,用户不知道在等什么。 -->
+        {#if recording.isLive || recording.stopping}
           <span class="sep"></span>
           <!-- 计时英雄位:一场录音里最该一眼看到的就是"已经录了多久"。此前是 1rem 的
                ink-secondary 小字挤在最右缘,与状态标签抢注意力;现在等宽大字 + 呼吸红点,
@@ -695,8 +685,10 @@
             <span class="t" class:warn={recording.paused}>{formatTs(recording.elapsedMs)}</span>
             {#if clockNote}<span class="lbl" class:danger={isError(recording.status)}>{clockNote}</span>{/if}
           </span>
-          <span class="sep"></span>
+        {/if}
 
+        {#if recording.isLive}
+          <span class="sep"></span>
           <!-- 波形:只画 mic 一条(冒烟反馈:双轨两行太吵),取值与整形见 lib/liveWave.ts -->
           <div
             class="wave-live"
@@ -1033,6 +1025,13 @@
   .controls.live {
     background: var(--surface);
     border-color: var(--hairline);
+  }
+  /* 暂停底色必须压过上面的 live 底(Codex P2):暂停时两个类同时在身上,而 .controls.paused
+     写在前面、特异性又相同,后写的 live 会把 warning 底整块吃掉——暂停这个最该显眼的状态
+     反而变得和录制中一模一样。这里用 .live.paused 提高特异性显式盖回。 */
+  .controls.live.paused {
+    background: var(--warning-tint);
+    border-color: transparent;
   }
   /* 簇间发丝线分隔:控制钮 | 计时 | 波形。比纯间距更能说明"这是三组不同的东西"。 */
   .sep {
