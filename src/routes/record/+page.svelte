@@ -590,6 +590,21 @@
     <path d="M10.4 10.4 13.5 13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
   </svg>
 {/snippet}
+{#snippet icoUp()}
+  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+    <path d="M4.5 10 8 6.2 11.5 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{/snippet}
+{#snippet icoDown()}
+  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+    <path d="M4.5 6.2 8 10 11.5 6.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{/snippet}
+{#snippet icoClose()}
+  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+    <path d="M4.6 4.6 11.4 11.4M11.4 4.6 4.6 11.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+  </svg>
+{/snippet}
 {#snippet icoStop()}
   <!-- 实心圆角方块而非描边:描边方块读起来像"录制"按钮,实心才是停止 -->
   <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
@@ -601,7 +616,9 @@
   <!-- 头部整体吸顶(标题/下载卡/控制条/状态行/说话人条):录制中转写自动滚到最新,
        操作与说话人对照都不能跟着滚出视口 -->
   <div class="topbar">
-    <h1>{t("record.title")}</h1>
+    <!-- 标题按用户要求不再占视觉位置(侧栏已经交代了在哪一页,面板本身也自解释),
+         但保留一个仅读屏可见的 h1:页面不该没有标题层级。 -->
+    <h1 class="sr-only">{t("record.title")}</h1>
 
     <!-- 单实例:compact 由 recording_ready 驱动。若拆成两个 if 分支,识别模型下完
          切小提示条时组件会销毁重建,进行中的下载进度/订阅状态全部清零。 -->
@@ -709,13 +726,14 @@
       <!-- 回看工具条:页内搜索(高亮+跳转) + 说话人过滤 chips。只在有转写内容可回看时
            出现(录制中或已有定稿行)，空转写页不占位。 -->
       {#if recording.isLive || recording.finals.length > 0}
+        <!-- 搜索独占一行、与整块面板等宽(用户要求:右侧不该空那么大);命中计数与
+             上下跳转/清除收进药丸右端,像浏览器的查找栏。外层用 div 不用 label——
+             药丸里有按钮,按钮嵌在 label 里点了会连带激活输入框。 -->
         <div class="review-bar">
-          <!-- 搜索改药丸 + 放大镜:此前是 hairline-strong 描边的方框输入,比同屏卡片的边还重,
-               孤零零一个显得突兀。药丸与图标钮/胶囊同一套圆角语言,聚焦时才亮 accent 边。 -->
-          <label class="search">
+          <div class="search">
             <span class="ico">{@render icoSearch()}</span>
-            <!-- aria-label 必须显式给(Codex P2):外层 label 里只有 aria-hidden 的放大镜,
-                 空的关联 label 会盖过 placeholder 的兜底命名,读屏读到的是一个无名输入框。 -->
+            <!-- aria-label 必须显式给:放大镜是 aria-hidden 的,只靠 placeholder
+                 命名不可靠(读屏实现不一)。 -->
             <input
               aria-label={t("record.search.placeholder")}
               placeholder={t("record.search.placeholder")}
@@ -725,17 +743,30 @@
                 if (e.key === "Escape") clearReview();
               }}
             />
-          </label>
-          {#if searchQuery.trim()}
-            <span class="hit-count">
-              {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
-            </span>
-            <button class="ghosty" onclick={() => gotoHit(-1)} title={t("record.search.prev")}>↑</button>
-            <button class="ghosty" onclick={() => gotoHit(1)} title={t("record.search.next")}>↓</button>
-          {/if}
-          <!-- 过滤 chips 只在 ≥2 个说话人时出现:单说话人过滤无意义,还与下方
-               SpeakerChips 管理条视觉重复(冒烟反馈)。 -->
-          {#if speakerIds.length >= 2}
+            {#if searchQuery.trim()}
+              <span class="tools">
+                <span class="hit">
+                  {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
+                </span>
+                <button class="ib" onclick={() => gotoHit(-1)} aria-label={t("record.search.prev")} title={t("record.search.prev")}>
+                  {@render icoUp()}
+                </button>
+                <button class="ib" onclick={() => gotoHit(1)} aria-label={t("record.search.next")} title={t("record.search.next")}>
+                  {@render icoDown()}
+                </button>
+                <button class="ib" onclick={clearReview} aria-label={t("record.search.clear")} title={t("record.search.clear")}>
+                  {@render icoClose()}
+                </button>
+              </span>
+            {/if}
+          </div>
+        </div>
+
+        <!-- 说话人过滤单独一行:搜索要与面板等宽,chips 就不能再挤在同一行。
+             只在 ≥2 个说话人时出现(单说话人过滤无意义,还与下方 SpeakerChips 管理条重复)。 -->
+        {#if speakerIds.length >= 2}
+          <div class="filter-bar">
+            <span class="lbl">{t("record.filter.only")}</span>
             {#each speakerIds as sid (sid)}
               <button
                 class="chip"
@@ -743,11 +774,11 @@
                 onclick={() => toggleSpeaker(sid)}
               >{speakerLabel(sid, "mic", recording.speakers)}</button>
             {/each}
-          {/if}
-          {#if reviewActive}
-            <button class="ghosty" onclick={clearReview}>{t("record.search.clear")}</button>
-          {/if}
-        </div>
+            {#if selectedSpeakers.size > 0}
+              <button class="ghosty" onclick={() => (selectedSpeakers = new Set())}>{t("record.search.clear")}</button>
+            {/if}
+          </div>
+        {/if}
       {/if}
       </div>
 
@@ -1280,12 +1311,15 @@
   }
   /* 搜索药丸:与图标钮同一套圆角语言。此前是 hairline-strong 描边的方框,比同屏卡片的
      边还重,孤零零一个尤其突兀;现在默认无边、只靠 surface-soft 的底立形状,聚焦才亮 accent。 */
+  /* 搜索与整块面板等宽(用户要求):此前收窄到 16rem,右侧空一大片。
+     工具(命中计数/上下跳转/清除)收进药丸右端,不再占行内其它位置。 */
   .review-bar .search {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 0.4rem;
-    min-width: 12rem;
-    max-width: 16rem; /* 冒烟反馈:全宽搜索框喧宾夺主,收窄成工具位 */
+    flex: 1 1 auto;
+    min-width: 0;
+    box-sizing: border-box;
     background: var(--surface-soft);
     border: 1px solid transparent;
     border-radius: var(--radius-full);
@@ -1298,7 +1332,7 @@
   }
   .review-bar .search input {
     all: unset;
-    flex: 1;
+    flex: 1 1 auto;
     min-width: 0;
     font: inherit;
     font-size: 0.86rem;
@@ -1311,13 +1345,68 @@
     border-color: var(--accent);
     color: var(--ink-secondary);
   }
-  .review-bar .hit-count {
-    font-size: 0.82rem;
-    color: var(--ink-faint);
+  /* 药丸内嵌工具:命中计数 + 上一个/下一个/清除。圆形小按钮,悬停才上底,
+     不与药丸本身抢视觉。 */
+  .review-bar .tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    flex: none;
+  }
+  .review-bar .tools .hit {
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    padding: 0 0.2rem;
     white-space: nowrap;
+    color: var(--ink-faint);
+  }
+  .review-bar .tools .ib {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 0;
+    background: none;
+    color: var(--ink-secondary);
+    border-radius: var(--radius-full);
+    cursor: pointer;
+  }
+  .review-bar .tools .ib:hover {
+    background: var(--surface-press);
+    color: var(--ink);
+  }
+  .review-bar .tools .ib:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  /* 说话人过滤行:搜索占满整行后,chips 单独一行。 */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    padding: 0 0.75rem 0.5rem;
+  }
+  .filter-bar .lbl {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    margin-right: 0.1rem;
+  }
+  /* 仅读屏可见:页面标题不占视觉位置,但结构上仍需要一个 h1。 */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
   /* 幽灵按钮:无边透明底，弱化成次级操作(上一个/下一个/清除)，不与说话人 chip 抢视觉。 */
-  .review-bar .ghosty {
+  .filter-bar .ghosty {
     border: none;
     background: none;
     color: var(--ink-secondary);
@@ -1326,11 +1415,11 @@
     font-size: 0.85rem;
     cursor: pointer;
   }
-  .review-bar .ghosty:hover {
+  .filter-bar .ghosty:hover {
     background: var(--surface-soft);
     color: var(--ink);
   }
-  .review-bar .chip {
+  .filter-bar .chip {
     border-radius: var(--radius-full);
     padding: 0.1em 0.6em;
     border: 1px solid var(--hairline);
@@ -1339,7 +1428,7 @@
     font-size: 0.85rem;
     cursor: pointer;
   }
-  .review-bar .chip.on {
+  .filter-bar .chip.on {
     background: var(--accent-tint);
     border-color: var(--accent);
     color: var(--ink);
