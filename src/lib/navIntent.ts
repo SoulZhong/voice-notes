@@ -1,30 +1,37 @@
-/** 显式导航意图标记:一旦发生过"用户/托盘明确要求去某页",所有**自动**重定向都让路。
+/** 显式导航的版本计数:让"等异步结果再跳"的自动重定向能判断——我在等的这段时间里,
+ * 有没有人明确要求去别处?有就放弃本次跳转。
  *
- * 为什么需要它,而不是各处去比 `window.location.pathname`:
- * `goto()` 是异步的——调用之后到浏览器 history 真正更新之间有一个窗口,这段时间里
- * pathname 仍是旧值。冷启动那几百毫秒里同时有三个东西想导航:
- *   ① 托盘「打开设置」(显式,应当赢)
- *   ② 根路由的落地重定向(listNotes 回来后跳 /record 或最近笔记)
- *   ③ onboarding 的功能引导(settings/models IPC 回来后跳 /ai?guide=...)
- * ②③ 都是"等一个异步结果再跳",谁后回来谁覆盖前面的人。只比 pathname 挡不住
- * 「①已 goto 但还没落地」这一拍(Codex 审查连开三轮指出的正是这一族竞态)。
+ * 为什么不是一个布尔标记:布尔一旦置上就永久生效(第一版就是这么写的),用过一次托盘
+ * 「打开设置」之后,再点侧栏回根路由,落地重定向会被永久压住,根页面从此空白
+ * (Codex 四轮指出)。计数是**每个调用方各自比对**的:只关心"我 await 期间有没有变",
+ * 不留任何长期状态。
  *
- * 语义刻意做成**单向、进程内一次性**:置了就不再复位——自动重定向本来就只服务
- * "刚启动、用户还没表达意图"这一小段时间,之后由用户自己掌舵。
+ * 为什么不能只比 `window.location.pathname`:`goto()` 是异步的,调用之后到 history
+ * 更新之间有一拍,pathname 仍是旧值。冷启动那几百毫秒里同时有三个东西想导航——
+ * 托盘「打开设置」(显式)、根路由落地重定向、onboarding 功能引导,后两者都是"等 IPC
+ * 回来再跳",谁后回来谁覆盖。计数守卫挡的就是这一拍。
+ *
+ * 用法:
+ * ```ts
+ * const v = navVersion();
+ * const data = await somethingAsync();
+ * if (navVersion() !== v) return; // 期间已有显式导航,让路
+ * goto(...);
+ * ```
  */
-let navigated = false;
+let version = 0;
 
-/** 标记"已经发生显式导航"。必须在调用 goto **之前**同步调用。 */
+/** 标记一次显式导航。必须在调用 goto **之前**同步调用。 */
 export function markNavigated(): void {
-  navigated = true;
+  version += 1;
 }
 
-/** 自动重定向的守卫:返回 true 说明已有显式导航,应当放弃本次自动跳转。 */
-export function hasNavigated(): boolean {
-  return navigated;
+/** 当前版本号。异步流程在 await 前后各取一次比对。 */
+export function navVersion(): number {
+  return version;
 }
 
-/** 仅测试用:重置标记(生产路径不复位,见文件头)。 */
+/** 仅测试用:复位计数。 */
 export function resetNavIntentForTest(): void {
-  navigated = false;
+  version = 0;
 }

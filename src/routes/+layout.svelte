@@ -22,7 +22,7 @@
     type UpdateProgress,
   } from "$lib/update";
   import { onTrayNavigate } from "$lib/events";
-import { hasNavigated, markNavigated } from "$lib/navIntent";
+import { markNavigated, navVersion } from "$lib/navIntent";
 import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
@@ -86,6 +86,8 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
 
   let welcomeStatus = $state<ModelsStatus | null>(null);
   async function checkOnboarding() {
+    // 进入 await 前记下版本,回来时比对(Codex P2/P4)。
+    const v = navVersion();
     try {
       let s = await getSettings();
       const m = await modelsStatus();
@@ -101,7 +103,7 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
         // 功能教学必须发生在真实操作页；只把用户导航到对应功能并启动上下文引导。
         // 但显式导航优先(Codex P2):这段跑在两个 IPC 之后,冷启动时可能晚于托盘
         // 「打开设置」落地,不让路就会把人从设置页拽到 /ai。引导下次启动还会再来。
-        if (hasNavigated()) return;
+        if (navVersion() !== v) return;
         goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`);
       }
     } catch {
