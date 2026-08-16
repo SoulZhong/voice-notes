@@ -782,11 +782,17 @@
       }
       if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
         sawTerminal = true;
-        refining = false;
         refineRunFailed = e.state === "failed";
-        getRefined(forId).then((r) => {
-          if (forId === id) refined = r;
-        });
+        // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
+        // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
+        // 还能被点到重跑(Codex P2 七轮)。finally 兜底:取失败也必须解除忙态。
+        getRefined(forId)
+          .then((r) => {
+            if (forId === id) refined = r;
+          })
+          .finally(() => {
+            if (forId === id) refining = false;
+          });
       }
     })
       .then((u) => {
@@ -812,13 +818,17 @@
               try {
                 if (!(await noteRefining(forId))) {
                   if (!disposed && forId === id) {
-                    refining = false;
                     // 走到这条路径说明终态事件被错过了,refined 还是跑之前那份
                     // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
                     // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
-                    void getRefined(forId).then((r) => {
-                      if (!disposed && forId === id) refined = r;
-                    });
+                    // 同上:refining 等新稿到手再落,免得中间闪一下(七轮)。
+                    void getRefined(forId)
+                      .then((r) => {
+                        if (!disposed && forId === id) refined = r;
+                      })
+                      .finally(() => {
+                        if (!disposed && forId === id) refining = false;
+                      });
                   }
                   return;
                 }
