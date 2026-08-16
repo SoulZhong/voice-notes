@@ -489,6 +489,13 @@
   // 悄悄替换用户的过滤对象反而更意外)。
   $effect(() => {
     const ids = new Set(speakerIds);
+    // 说话人少于 2 人时筛选行整行不渲染(单人过滤无意义),此时残留的选中集会变成一个
+    // **看不见也清不掉**的过滤器——合并后幸存 id 恰是被选中那个就会这样(Codex P2)。
+    // 行没了就把选择一并清掉,不留隐形状态。
+    if (ids.size < 2) {
+      if (selectedSpeakers.size > 0) selectedSpeakers = new Set();
+      return;
+    }
     if ([...selectedSpeakers].some((sid) => !ids.has(sid))) {
       selectedSpeakers = new Set([...selectedSpeakers].filter((sid) => ids.has(sid)));
     }
