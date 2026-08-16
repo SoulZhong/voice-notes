@@ -396,9 +396,13 @@
       return;
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
+    // 包络的运行值随本轮采样重新起算(Codex P2):它不能跨暂停沿用。暂停前最后一帧若很响,
+    // 恢复后会凭空续出半秒多的红色衰减条——而那段时间根本没有声音进来。
+    // 注意与 liveBarsMic 的区别:已画出的历史要保留(冻结显示),重置的只是这个运行值。
+    let envPrev = 0;
     const t = setInterval(() => {
-      const prev = liveBarsMic.length > 0 ? liveBarsMic[liveBarsMic.length - 1] : 0;
-      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), envelopeStep(prev, micPct)];
+      envPrev = envelopeStep(envPrev, micPct);
+      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), envPrev];
       sysHold = sysPct > 0 ? 8 : Math.max(0, sysHold - 1);
     }, 120);
     return () => clearInterval(t);
@@ -1093,6 +1097,10 @@
     position: relative;
     display: flex;
     align-items: center;
+    /* 右对齐:最新一根永远贴住右缘(Codex P2)。条是定宽的,容器算出来的根数与实际
+       可用宽度总有几像素出入——左对齐时这点出入会落在右边,把最新样本裁掉或推离活动端;
+       右对齐则让出入落在左边,正好被下面的淡出蒙版吃掉。 */
+    justify-content: flex-end;
     gap: 2px;
     overflow: hidden;
     /* 左缘淡出:滚动历史"淡入过去",顺带消掉 overflow 的硬切边 */

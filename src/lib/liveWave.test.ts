@@ -47,14 +47,29 @@ describe("包络(快起慢落)", () => {
 
   it("下降沿按释放系数衰减,而不是立刻归零", () => {
     // 音节间的低谷若直接归零,120ms 采样下画出来是断续栅栏。
-    const after = envelopeStep(60, 0, 0.85);
-    expect(after).toBeCloseTo(51, 6);
+    const after = envelopeStep(60, 0);
+    expect(after).toBeCloseTo(42, 6);
     expect(after).toBeGreaterThan(0);
+  });
+
+  it("拖尾长度必须与注释一致:静音后不该继续红上一秒多", () => {
+    // Codex 审查:0.85 时满量程要 13 帧(1.57s)才落到门限下,视觉上等于"还在收音"。
+    const frames = (from: number) => {
+      let v = from;
+      let n = 0;
+      while (shapeLevel(v) > 0 && n < 100) {
+        v = envelopeStep(v, 0);
+        n++;
+      }
+      return n;
+    };
+    expect(frames(100) * 0.12).toBeLessThan(0.8); // 满量程 → 门限 <0.8s
+    expect(frames(50) * 0.12).toBeLessThan(0.65); // 常见说话档 → 门限 <0.65s
   });
 
   it("持续静音最终落到接近零(不会永远挂着一根高条)", () => {
     let v = 80;
-    for (let i = 0; i < 40; i++) v = envelopeStep(v, 0, 0.85);
+    for (let i = 0; i < 40; i++) v = envelopeStep(v, 0);
     expect(v).toBeLessThan(0.5);
   });
 });
