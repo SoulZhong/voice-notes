@@ -366,8 +366,11 @@ impl AudioCapture for TappedCapture {
         let notify = self.notify.take().unwrap_or_else(TapNotify::none);
         let timeline_origin = self.timeline_origin.clone();
         let drift = self.drift.clone();
+        // 采集回调自报的丢样计数(仅普通麦克风有):有它就不必靠硬件时戳猜缺口,
+        // 可变帧长下时戳法会漏掉比上一帧更短的丢弃(Codex 五轮 P2)。
+        let dropped = self.inner.dropped_samples();
         self.tap = Some(std::thread::spawn(move || {
-            run_frame_tap_with_drift(
+            run_frame_tap_inner(
                 source,
                 cap_rx,
                 sink,
@@ -376,6 +379,7 @@ impl AudioCapture for TappedCapture {
                 notify,
                 timeline_origin,
                 drift,
+                dropped,
             )
         }));
         self.inner.start(cap_tx)
@@ -422,6 +426,34 @@ fn run_frame_tap_with_drift(
     timeline_origin: Arc<OnceLock<Instant>>,
     drift: Option<Arc<DriftMonitor>>,
 ) {
+    run_frame_tap_inner(
+        _source,
+        from_capture,
+        to_worker,
+        health,
+        policy,
+        notify,
+        timeline_origin,
+        drift,
+        None,
+    )
+}
+
+/// 全参版本。`dropped`:采集回调自报的累计丢样数(每声道),Some 时按它精确补洞。
+#[allow(clippy::too_many_arguments)]
+fn run_frame_tap_inner(
+    _source: Source,
+    from_capture: Receiver<AudioFrame>,
+    to_worker: Sender<AudioFrame>,
+    health: Arc<SourceHealth>,
+    policy: TapPolicy,
+    notify: TapNotify,
+    timeline_origin: Arc<OnceLock<Instant>>,
+    drift: Option<Arc<DriftMonitor>>,
+    dropped: Option<Arc<std::sync::atomic::AtomicU64>>,
+) {
+    // 回调丢样的读数基线:每帧读一次增量,差值就是本帧之前被丢掉的样本数。
+    let mut dropped_seen: u64 = 0;
     // 最近一次真实帧的格式:没收到过帧就不填充(源可能根本没起来,
     // 填零会凭空造出一条空白轨)。
     let mut last_format: Option<(u32, u16)> = None;
@@ -505,8 +537,25 @@ fn run_frame_tap_with_drift(
     loop {
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
-                // 本帧之前检测到的采集洞(按硬件时戳算),转发真实帧之前先补齐它。
+                // 本帧之前检测到的采集洞,转发真实帧之前先补齐它。两个来源:
+                // ①回调自报的丢样(精确,下面立即结算);②硬件时戳看出的缺口
+                // (兜住 HAL 侧的丢失,判据保守——见下方 holey)。
                 let mut pending_hole = Duration::ZERO;
+                if let Some(d) = &dropped {
+                    let now = d.load(Ordering::Relaxed);
+                    let delta = now.saturating_sub(dropped_seen);
+                    dropped_seen = now;
+                    if delta > 0 && frame.sample_rate > 0 {
+                        // 精确缺口:回调丢了多少样本就是缺了多少时长,不必猜。
+                        pending_hole += Duration::from_secs_f64(
+                            delta as f64 / frame.sample_rate as f64,
+                        );
+                        health.hw_gaps.fetch_add(1, Ordering::Relaxed);
+                        // 这段区间里样本不连续,不能用来测率。
+                        clock_span = Duration::ZERO;
+                        clock_samples = 0;
+                    }
+                }
                 // Task 5:真实帧原始声明率下喂 DriftMonitor(必须在下方时钟核对
                 // 改写 sample_rate 之前——DLL 要的是设备原始声明率口径的样本计数
                 // 与真实时间戳)。
@@ -2068,6 +2117,43 @@ mod tests {
             if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
         }
         assert_eq!(zeros, 0, "正常停录不该补静音,补了 {zeros} 样本");
+    }
+
+    /// Codex 五轮 P2:可变帧长下,时戳法漏掉"比上一帧更短的丢弃"(20ms 帧之后丢掉
+    /// 一个 10ms 回调,缺口 10ms < 上一帧 20ms,判据不成立)。回调自报丢样数之后
+    /// 这类缺口必须被精确补回,不再依赖猜。
+    #[test]
+    fn callback_reported_drops_are_filled_exactly() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (h2, d2) = (health.clone(), dropped.clone());
+        let t = std::thread::spawn(move || {
+            run_frame_tap_inner(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none(),
+                std::sync::Arc::new(OnceLock::new()), None, Some(d2))
+        });
+        // 一个 20ms 帧 → 回调丢掉 10ms(160 样本 @16k)→ 又一个 20ms 帧。
+        // 墙钟与时戳都按真实节奏走,时戳缺口 10ms 小于上一帧 20ms,时戳法认不出来。
+        cap_tx.send(AudioFrame { samples: vec![0.5; 320], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(0) }).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        dropped.fetch_add(160, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(10));
+        cap_tx.send(AudioFrame { samples: vec![0.5; 320], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(30_000_000) }).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        let mut real = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); } else { real += f.samples.len(); }
+        }
+        assert_eq!(real, 640, "两个真实帧原样转发");
+        assert!(zeros >= 120, "丢掉的 160 样本要补回来(允许欠账夹取),实测 {zeros}");
+        assert!(health.snapshot(Source::Mic).hw_gap_ms >= 5);
     }
 
     /// 反向锁:突发缓冲回吐(样本一次到得比时间多)不是洞,绝不能补零——

@@ -13,16 +13,19 @@ pub struct Microphone {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
     /// 运行期流错误上报口(断连自愈消费);未接线时仅落日志,行为同引入前。
     events: Option<Sender<CaptureEvent>>,
+    /// 回调因下游积压丢弃的样本数(每声道,累计)。回调里只做一次原子加;
+    /// tap 每帧读它的增量,把缺口精确补回时间轴(见 AudioCapture::dropped_samples)。
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Microphone {
     pub fn new() -> Self {
-        Self { stop_tx: None, events: None }
+        Self { stop_tx: None, events: None, dropped: Default::default() }
     }
 
     /// 带流错误上报的构造:err_fn 触发时把错误升格为 CaptureEvent(仍保留日志)。
     pub fn with_events(events: Sender<CaptureEvent>) -> Self {
-        Self { stop_tx: None, events: Some(events) }
+        Self { stop_tx: None, events: Some(events), dropped: Default::default() }
     }
 }
 
@@ -56,6 +59,7 @@ impl AudioCapture for Microphone {
 
         // --- background thread owns the !Send stream ---
         let events = self.events.clone();
+        let dropped = self.dropped.clone();
         std::thread::spawn(move || {
             let err_fn = move |e: cpal::StreamError| {
                 eprintln!("麦克风流错误: {e}");
@@ -68,9 +72,6 @@ impl AudioCapture for Microphone {
             // 只能做差，不能直接取绝对值。anchor_ns 是回调进入时刻，与硬件时刻
             // 差一个缓冲时长量级的常量偏移，不影响斜率(ppm)；绝对偏移由 E1 互相关标定。
             let mut anchor: Option<(cpal::StreamInstant, u64)> = None;
-            // 回调丢帧计量(每声道样本数)。回调里只做一次原子加,停流时汇总打印——
-            // 这条日志是"下游顶住了采集"的直接证据,与 tap 侧 send_wait/hw_gap_ms 对读。
-            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let dropped_cb = dropped.clone();
             let stream = match device.build_input_stream(
                 &stream_config,
@@ -166,5 +167,9 @@ impl AudioCapture for Microphone {
     fn stop(&mut self) {
         // Dropping the sender closes the channel, unblocking the background thread.
         self.stop_tx = None;
+    }
+
+    fn dropped_samples(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        Some(self.dropped.clone())
     }
 }
