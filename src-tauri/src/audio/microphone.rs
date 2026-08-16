@@ -19,14 +19,16 @@ const DROP_PAD_CAP: usize = 48_000 * 5;
 /// 每次尝试都会失败,提前清零会让先前累计的丢失被逐次遗忘,最后只补上最后一个
 /// 回调那点(Codex 七轮 P1)。
 ///
-/// 时戳必须回拨(Codex 七轮 P1):cpal 给的是 `data` 首样本的捕获时刻,补零之后这
-/// 一帧的首样本比它早了 pad 那么多。不回拨的话,tap 看到的"上一帧到本帧"间隔仍然
-/// 大于本帧携带的样本时长,会把同一段缺口按 HAL 丢失再补一次,轨道反而被拉长。
+/// 补过零的帧**不带时戳**(Codex 七轮 P1 提出问题、十一轮 P1 定案):cpal 给的是
+/// `data` 首样本的捕获时刻,补零后这一帧的首样本比它早了 pad 那么多,原样带着会让
+/// tap 把同一段缺口按 HAL 丢失再补一次。而"按 pad 时长回拨"也不成立——回拨只能用
+/// 声明率算,下游若已按实测率改写(48k 声明 / 44k 实跑正是本仓库的老故障),残差
+/// 攒够 100ms 量级又会触发一次重复补。首样本时刻本来就无法用下游的率可靠表达,
+/// 那就不表达:置 None,tap 据此退出硬件时基口径、重开统计窗,不会凭空造洞。
 fn padded_frame(
     pending: usize,
     data: &[f32],
     channels: u16,
-    sample_rate: u32,
     ts: Option<u64>,
 ) -> (Vec<f32>, Option<u64>) {
     if pending == 0 {
@@ -37,15 +39,7 @@ fn padded_frame(
     let mut out = Vec::with_capacity(pad + data.len());
     out.resize(pad, 0.0);
     out.extend_from_slice(data);
-    let ts = ts.map(|t| {
-        let back = if sample_rate > 0 {
-            (pending as u64 * 1_000_000_000) / sample_rate as u64
-        } else {
-            0
-        };
-        t.saturating_sub(back)
-    });
-    (out, ts)
+    (out, None)
 }
 
 pub struct Microphone {
@@ -153,7 +147,7 @@ impl AudioCapture for Microphone {
                         false
                     } else {
                         let (payload, ts) =
-                            padded_frame(pending_drop, data, channels, sample_rate, host_time_ns);
+                            padded_frame(pending_drop, data, channels, host_time_ns);
                         match sink.try_send(AudioFrame {
                             samples: payload,
                             sample_rate,
@@ -245,7 +239,7 @@ mod tests {
 
     #[test]
     fn no_pending_drop_passes_data_through() {
-        let (out, ts) = padded_frame(0, &[0.1, 0.2], 1, 16_000, Some(5_000));
+        let (out, ts) = padded_frame(0, &[0.1, 0.2], 1, Some(5_000));
         assert_eq!(out, vec![0.1, 0.2]);
         assert_eq!(ts, Some(5_000), "没补零就不该动时戳");
     }
@@ -254,28 +248,23 @@ mod tests {
     fn dropped_span_is_padded_in_front() {
         // 丢了 3 个(每声道)样本,下一批数据前面就该有 3 个静音——补在丢失的位置上,
         // 时长与丢失量一致,下游的时间轴因此不被压缩。
-        let (out, _) = padded_frame(3, &[0.5, 0.6], 1, 16_000, None);
+        let (out, _) = padded_frame(3, &[0.5, 0.6], 1, None);
         assert_eq!(out, vec![0.0, 0.0, 0.0, 0.5, 0.6]);
     }
 
     #[test]
-    fn timestamp_is_rewound_to_the_first_padded_sample() {
-        // 16k 下补 160 个样本 = 10ms;时戳必须回拨 10ms,否则 tap 会把同一段缺口
-        // 当 HAL 丢失再补一次(Codex 七轮 P1)。
-        let (_, ts) = padded_frame(160, &[0.0], 1, 16_000, Some(100_000_000));
-        assert_eq!(ts, Some(90_000_000));
-    }
-
-    #[test]
-    fn missing_timestamp_stays_missing() {
-        let (_, ts) = padded_frame(160, &[0.0], 1, 16_000, None);
+    fn padded_frame_carries_no_timestamp() {
+        // 补过零的帧首样本时刻无法用下游的率可靠表达(下游可能已按实测率改写),
+        // 带着旧时戳或按声明率回拨都会让 tap 把同一段缺口再补一次。置 None,
+        // tap 据此退出硬件时基口径、重开统计窗。
+        let (_, ts) = padded_frame(160, &[0.0], 1, Some(100_000_000));
         assert_eq!(ts, None);
     }
 
     #[test]
     fn padding_respects_channel_interleaving() {
         // 双声道:每声道 2 个样本 = 4 个交错样本。
-        let (out, _) = padded_frame(2, &[1.0, -1.0], 2, 48_000, None);
+        let (out, _) = padded_frame(2, &[1.0, -1.0], 2, None);
         assert_eq!(out.len(), 4 + 2);
         assert!(out[..4].iter().all(|s| *s == 0.0));
         assert_eq!(&out[4..], &[1.0, -1.0]);
@@ -286,14 +275,14 @@ mod tests {
         // 纯函数不清零:清零由调用方在发送成功后做。队列持续满时每次都失败,
         // 提前清零会把先前累计的丢失逐次遗忘。
         let pending = 5usize;
-        let (a, _) = padded_frame(pending, &[0.0], 1, 16_000, None);
-        let (b, _) = padded_frame(pending, &[0.0], 1, 16_000, None);
+        let (a, _) = padded_frame(pending, &[0.0], 1, None);
+        let (b, _) = padded_frame(pending, &[0.0], 1, None);
         assert_eq!(a.len(), b.len(), "同一 pending 两次调用结果一致");
     }
 
     #[test]
     fn cap_bounds_the_allocation() {
-        let (out, _) = padded_frame(DROP_PAD_CAP, &[0.0], 1, 48_000, None);
+        let (out, _) = padded_frame(DROP_PAD_CAP, &[0.0], 1, None);
         assert_eq!(out.len(), DROP_PAD_CAP + 1);
     }
 }
