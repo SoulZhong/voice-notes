@@ -63,6 +63,7 @@ export const zh = {
   "record.search.prev": "上一个",
   "record.search.next": "下一个",
   "record.search.clear": "清除",
+  "record.filter.only": "只看",
 
   // 当场纠正(行内编辑文本 / 改派说话人 / 命名改名):后端为唯一真值源,前端不做
   // 乐观更新,失败原样展示、不自动重试。
@@ -136,6 +137,7 @@ export const en = {
   "record.search.prev": "Previous",
   "record.search.next": "Next",
   "record.search.clear": "Clear",
+  "record.filter.only": "Only",
 
   "record.edit.text": "Edit this line",
   "record.edit.speaker": "Change speaker",
