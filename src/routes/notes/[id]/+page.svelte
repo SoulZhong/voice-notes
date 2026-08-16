@@ -97,18 +97,27 @@
       ① 取稿一律走 loadRefined,末次请求赢(seq 比对),旧响应作废;
       ② 取稿在途(refinedLoading > 0)期间不出「这场没做 AI 整理」——眼前这份稿子
          随时可能被换掉,凭它下结论必然出错;
-      ③ 编辑器回读那几处自己取稿,发起时就用 reserveRefinedSeq() 占号、回来用
-         commitRefined(seq, doc) 落地——占号必须在 await **之前**,否则一份早就
-         发出、慢慢才回来的旧回读会拿到更大的号,把新稿盖掉;
+      ③ 编辑器回读那几处自己取稿,同样走 beginRefinedLoad()(占号 + 计入在途)/
+         commitRefined(seq, doc)/endRefinedLoad(seq, ok) 三件套——占号必须在 await
+         **之前**,否则一份早发出、慢回来的旧回读会拿到更大的号把新稿盖掉;计入在途
+         则是为了让提示在任何一路取稿在途时都闭嘴,不只在 loadRefined 那一路;
       ④ 重取失败时不放行提示:那份留在手里的旧稿(stages.llm 仍是 "off")正是
          误报的来源,宁可不提示。 */
   let refinedSeq = 0;
   let refinedLoading = $state(0);
   /** 重取失败,手里这份可能是过期稿:提示一律不出,直到某次重取成功。 */
   let refinedStale = $state(false);
-  function reserveRefinedSeq(): number {
+  /** 发起一次取稿:占号 + 计入在途。每个 begin 必须配一个 endRefinedLoad(放 finally)。 */
+  function beginRefinedLoad(): number {
+    refinedLoading += 1;
     refinedSeq += 1;
     return refinedSeq;
+  }
+  /** 结束一次取稿。committed=false 且自己仍是最新请求时,说明手里这份可能过期
+      (取失败/取回来是 null/守卫没过),提示一律不出——被更新的请求顶掉则不算。 */
+  function endRefinedLoad(seq: number, committed: boolean) {
+    refinedLoading -= 1;
+    if (!committed && seq === refinedSeq) refinedStale = true;
   }
   /** 只有仍是最新一次请求、且没切走笔记时才落地;返回是否真的落了。
       调用方要据此决定跟着落不落编辑器同步——被判过期的那份稿子绝不能推给编辑器,
@@ -120,17 +129,14 @@
     return true;
   }
   async function loadRefined(forId: string): Promise<void> {
-    const seq = reserveRefinedSeq();
-    refinedLoading += 1;
+    const seq = beginRefinedLoad();
+    let ok = false;
     try {
-      commitRefined(seq, await getRefined(forId), forId);
+      ok = commitRefined(seq, await getRefined(forId), forId);
     } catch {
-      // 增值层:取不到就维持现状,但要记下"手里这份可能过期",别拿它下结论。
-      // 只有仍是最新一次请求才置位:被更新的请求顶掉之后再失败,那份失败已无意义,
-      // 置位反而会把提示永久压住。
-      if (forId === id && seq === refinedSeq) refinedStale = true;
+      /* 增值层:取不到就维持现状,过期与否交给 endRefinedLoad 判 */
     } finally {
-      refinedLoading -= 1;
+      endRefinedLoad(seq, ok);
     }
   }
   let refining = $state(false);
@@ -344,13 +350,21 @@
       }
       // 仍停留在本篇且没有继续输入时,把 detached 保存的最终盘上状态同步回来。
       if (targetId === id && !refinedEditor?.hasFocus()) {
-        const seq = reserveRefinedSeq(); // 占号必须在 await 之前(见闸门注释 ③)
-        const latest = await getRefined(targetId);
-        // 被更新的取稿顶掉时不推给编辑器(见 commitRefined 注释)。
-        if (latest && targetId === id && !refinedEditor?.hasFocus() && commitRefined(seq, latest, targetId)) {
-          syncedRefined = latest;
-          syncedEditor = refinedEditor;
-          refinedEditor?.setRefined(latest);
+        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+        let ok = false;
+        try {
+          const latest = await getRefined(targetId);
+          // 被更新的取稿顶掉时不推给编辑器(见 commitRefined 注释)。
+          if (latest && targetId === id && !refinedEditor?.hasFocus()) {
+            ok = commitRefined(seq, latest, targetId);
+            if (ok) {
+              syncedRefined = latest;
+              syncedEditor = refinedEditor;
+              refinedEditor?.setRefined(latest);
+            }
+          }
+        } finally {
+          endRefinedLoad(seq, ok);
         }
       }
     } catch (err) {
@@ -395,20 +409,26 @@
       // 盘上最新精修稿,让 refined 说真话;这份内容和编辑器一致,配合下面 syncedRefined/
       // syncedEditor 闸门,视图来回切换重建新编辑器实例时会用这份正确内容渲染,
       // 而不是被闸门跳过导致空白。
+      const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+      let ok = false;
       try {
-        const seq = reserveRefinedSeq(); // 占号必须在 await 之前(见闸门注释 ③)
         const latest = await getRefined(targetId);
         // await 后重验守卫:回读期间用户可能已经切走了笔记。
         if (targetId === id && loadedRefinedId === targetId) {
-          if (latest && commitRefined(seq, latest, targetId)) {
-            syncedRefined = latest;
-            syncedEditor = refinedEditor;
+          if (latest) {
+            ok = commitRefined(seq, latest, targetId);
+            if (ok) {
+              syncedRefined = latest;
+              syncedEditor = refinedEditor;
+            }
           }
           // latest 为 null(极端情况,如笔记目录被清):保持 refined 原样不动,不因
           // 一次回读失败就把已展示的内容整篇清空。
         }
       } catch {
         /* 回读失败:refined 保持原状;本次保存本身已经成功(markSaved 已确认落定) */
+      } finally {
+        endRefinedLoad(seq, ok);
       }
       if (refinedSaveErr) refinedSaveErr = "";
     } catch (err) {
@@ -425,22 +445,26 @@
       // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
       // (markSaveFailed 已排好下一次)。
       if (String(err).includes("已在别处更新")) { // i18n-exempt: 与后端错误原文判等
+        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+        let ok = false;
         try {
-          const seq = reserveRefinedSeq(); // 占号必须在 await 之前(见闸门注释 ③)
           const latest = await getRefined(targetId);
-          if (targetId === id && loadedRefinedId === targetId && commitRefined(seq, latest, targetId)) {
-            if (latest) {
-              // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
-              // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
-              // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
-              // 属于重复重建。
-              refinedEditor?.setRefined(latest);
-              syncedRefined = latest;
-              syncedEditor = refinedEditor;
-            }
+          if (targetId === id && loadedRefinedId === targetId) {
+            ok = commitRefined(seq, latest, targetId);
+          }
+          // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
+          // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
+          // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
+          // 属于重复重建。
+          if (ok && latest) {
+            refinedEditor?.setRefined(latest);
+            syncedRefined = latest;
+            syncedEditor = refinedEditor;
           }
         } catch {
           /* 重载失败保持错误横幅 */
+        } finally {
+          endRefinedLoad(seq, ok);
         }
       }
     } finally {
@@ -779,6 +803,8 @@
     segMenuPop = null;
     segDeletePop = null;
     refined = null;
+    // 换了笔记,上一篇的"手里这份可能过期"作废;新一篇由自己的取稿重新判定。
+    refinedStale = false;
     syncedRefined = null;
     syncedEditor = null;
     refining = false;
