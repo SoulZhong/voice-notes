@@ -115,6 +115,12 @@ const HW_HOLE_MIN: Duration = Duration::from_millis(3);
 /// 一把 Vec 分配下去就是上百 MB(Codex P1);按这个粒度切块发,峰值内存可控。
 const FILL_CHUNK: Duration = Duration::from_millis(200);
 
+/// 收尾补齐的下限:正常停录时"队列排空→通道关闭"之间总有几十毫秒余量,
+/// 低于此不补,免得每场录音尾巴上都挂一小段静音。
+const TAIL_FILL_MIN: Duration = Duration::from_millis(200);
+/// 收尾补齐的上限:兜住时钟异常/长时间挂起导致的荒谬欠账,不无限补。
+const TAIL_FILL_MAX: Duration = Duration::from_secs(120);
+
 /// 每源健康计数(原子字段,tap 线程写、查询命令读,无锁)。
 #[derive(Default)]
 pub struct SourceHealth {
@@ -479,8 +485,10 @@ fn run_frame_tap_with_drift(
     // 误差不再累积。
     let mut anchor: Option<Instant> = None;
     let mut forwarded = Duration::ZERO;
-    /// 采集时钟原点:首个带硬件时戳的帧。补洞的上限按它算(见补洞处注释)。
-    let mut hw_origin_ns: Option<u64> = None;
+    /// 采集时钟原点:首个带硬件时戳的帧,连同**那一刻已转发的时长**一起记。
+    /// 只记时戳不记基线的话,原点之前那些无时戳帧的时长白白算进 forwarded,
+    /// 欠账被永久低估、后面的洞就补不满(Codex P2)。
+    let mut hw_origin: Option<(u64, Duration)> = None;
     // 本次断流是否已计 gap / 已报 stall(去抖:恢复前不重复)。
     let mut gap_counted = false;
     let mut stalled = false;
@@ -646,7 +654,7 @@ fn run_frame_tap_with_drift(
                                     health.hw_gaps.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            hw_origin_ns.get_or_insert(ns);
+                            hw_origin.get_or_insert((ns, forwarded));
                             clock_hw_prev = Some(ns);
                             clock_hw_pending = per_channel as u64;
                         }
@@ -734,27 +742,6 @@ fn run_frame_tap_with_drift(
                         }
                     }
                 }
-                // 还款:把采样率往债务的反方向拧一点点,下游据此多算/少算一点时长,
-                // forwarded 就平滑地追上墙钟。债清了立刻停手,恢复实测速率。
-                if frame.sample_rate > 0 && phase_debt.abs() > PHASE_TRIM_EPS {
-                    let base = frame.sample_rate;
-                    let held = *phase_rate.get_or_insert_with(|| {
-                        phase_trim_rate(
-                            phase_debt,
-                            policy.phase_trim_window.as_secs_f64(),
-                            base,
-                            policy.phase_trim_max,
-                        )
-                    });
-                    let (rate, repaid) = phase_trim_step(phase_debt, held, base, per_channel);
-                    phase_debt -= repaid;
-                    frame.sample_rate = rate;
-                    if phase_debt.abs() <= PHASE_TRIM_EPS {
-                        phase_rate = None; // 还清,下一帧恢复实测率
-                    }
-                } else {
-                    phase_rate = None;
-                }
                 // 补洞必须发生在**给本帧记账之前**(Codex P1):零帧排在真实帧前面,
                 // 若先把本帧的时长记进 forwarded,欠账就少算一帧,每次修补都短一截、
                 // 真实帧也被放早了。
@@ -763,8 +750,8 @@ fn run_frame_tap_with_drift(
                 // 排的时间,背压越重越虚高,会把 Timeout 分支已经补过的那段再补一遍。
                 // 采集时钟(首帧时戳到本帧时戳)减去已转发时长,才正好是"还缺多少音频"。
                 if pending_hole > Duration::ZERO && frame.sample_rate > 0 {
-                    let captured = match (hw_origin_ns, frame.host_time_ns) {
-                        (Some(o), Some(ns)) if ns > o => Duration::from_nanos(ns - o),
+                    let captured = match (hw_origin, frame.host_time_ns) {
+                        (Some((o, base)), Some(ns)) if ns > o => base + Duration::from_nanos(ns - o),
                         // 没有时戳原点就退回墙钟(与断流补零同口径,只会更保守)。
                         _ => anchor.map(|a| a.elapsed()).unwrap_or(Duration::ZERO),
                     };
@@ -792,13 +779,33 @@ fn run_frame_tap_with_drift(
                         }
                         left = left.saturating_sub(step);
                     }
-                    // 补零改了 forwarded,相位债务要按当前真实残差重算,否则后续帧会
-                    // 继续按旧债拧速率,补出来的这段又被慢慢抹掉(Codex P2,与断流
-                    // 补零分支同款处理)。
-                    if let Some(a) = anchor {
-                        phase_debt = forwarded.as_secs_f64() - a.elapsed().as_secs_f64();
-                        phase_rate = None;
+                    // 补零改了 forwarded,相位债务要按当前真实残差重算,否则后续帧继续
+                    // 按旧债拧速率,把刚补的这段又慢慢抹掉。基准必须仍是**采集时钟**
+                    // (Codex P1):这帧可能在队列里排过很久,拿墙钟算会凭空造出一笔等大
+                    // 的负债,后续帧被拖慢,时间轴又被拉长一次。
+                    phase_debt = forwarded.as_secs_f64() - captured.as_secs_f64();
+                    phase_rate = None;
+                }
+                // 还款:把采样率往债务的反方向拧一点点,下游据此多算/少算一点时长,
+                // forwarded 就平滑地追上墙钟。债清了立刻停手,恢复实测速率。
+                if frame.sample_rate > 0 && phase_debt.abs() > PHASE_TRIM_EPS {
+                    let base = frame.sample_rate;
+                    let held = *phase_rate.get_or_insert_with(|| {
+                        phase_trim_rate(
+                            phase_debt,
+                            policy.phase_trim_window.as_secs_f64(),
+                            base,
+                            policy.phase_trim_max,
+                        )
+                    });
+                    let (rate, repaid) = phase_trim_step(phase_debt, held, base, per_channel);
+                    phase_debt -= repaid;
+                    frame.sample_rate = rate;
+                    if phase_debt.abs() <= PHASE_TRIM_EPS {
+                        phase_rate = None; // 还清,下一帧恢复实测率
                     }
+                } else {
+                    phase_rate = None;
                 }
                 if frame.sample_rate > 0 {
                     forwarded += Duration::from_secs_f64(
@@ -874,7 +881,47 @@ fn run_frame_tap_with_drift(
                 }
                 filled_gap = true;
             }
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                // 收尾补齐(Codex P1):若采集队列一直满到停录,最后那段被回调丢掉的
+                // 音频没有"下一帧"来暴露它——时戳补洞永远等不到那一帧,轨道就这么短
+                // 一截收场。这里按墙钟欠账补最后一次:采集已经结束,`forwarded` 与
+                // `anchor.elapsed()` 的差就是缺的那段。
+                let (Some((declared, channels)), Some(anchor)) = (last_format, anchor) else {
+                    return;
+                };
+                let rate = applied_rate.unwrap_or(declared);
+                if rate == 0 {
+                    return;
+                }
+                let deficit = anchor.elapsed().saturating_sub(forwarded);
+                // 门槛:正常停录时队列排空到通道关闭之间必然有几十毫秒的余量,
+                // 补它只会给每场录音尾巴上加一小段静音。只补真正成规模的缺口。
+                if deficit < TAIL_FILL_MIN {
+                    return;
+                }
+                let mut left = deficit.min(TAIL_FILL_MAX);
+                while left > Duration::ZERO {
+                    let step = left.min(FILL_CHUNK);
+                    let n = (step.as_secs_f64() * rate as f64) as usize;
+                    if n == 0 {
+                        break;
+                    }
+                    let ms = (n as u64 * 1000) / rate as u64;
+                    health.silence_ms.fetch_add(ms, Ordering::Relaxed);
+                    health.hw_gap_ms.fetch_add(ms, Ordering::Relaxed);
+                    let silence = AudioFrame {
+                        samples: vec![0.0; n * channels.max(1) as usize],
+                        sample_rate: rate,
+                        channels,
+                        host_time_ns: None,
+                    };
+                    if to_worker.send(silence).is_err() {
+                        return;
+                    }
+                    left = left.saturating_sub(step);
+                }
+                return;
+            }
         }
     }
 }
@@ -2029,6 +2076,60 @@ mod tests {
         assert!(zeros >= 16_000, "3 秒的洞至少补回 1 秒,实测 {zeros} 样本");
         let cap = (FILL_CHUNK.as_secs_f64() * 16_000.0) as usize;
         assert!(max_frame <= cap, "单个补零帧 {max_frame} 样本超过上限 {cap}");
+    }
+
+    /// Codex P1 回归:采集队列一直满到停录时,最后那段被回调丢掉的音频没有
+    /// "下一帧"来暴露——时戳补洞等不到那一帧,轨道就短一截收场。收尾要按欠账补齐。
+    #[test]
+    fn tail_dropped_span_is_filled_on_disconnect() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(512);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        // fill_after 大于静默时长:排除 Timeout 分支,补零只可能来自收尾补齐。
+        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(0) }).unwrap();
+        // 之后"什么都没发出来"(等价于回调全被丢),1 秒后直接停录。
+        std::thread::sleep(Duration::from_millis(1000));
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
+        }
+        assert!(zeros >= 8_000, "收尾欠账要补回(约 1s@16k),实测 {zeros} 样本");
+        assert!(health.snapshot(Source::Mic).hw_gap_ms >= 500);
+    }
+
+    /// 反向锁:正常停录(队列即时排空)不得在尾巴上挂静音。
+    #[test]
+    fn clean_stop_adds_no_tail_silence() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        let mut ns = 0u64;
+        for _ in 0..5 {
+            cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+                host_time_ns: Some(ns) }).unwrap();
+            ns += 10_000_000;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
+        }
+        assert_eq!(zeros, 0, "正常停录不该补静音,补了 {zeros} 样本");
     }
 
     /// 反向锁:突发缓冲回吐(样本一次到得比时间多)不是洞,绝不能补零——
