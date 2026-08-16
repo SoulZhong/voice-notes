@@ -56,8 +56,9 @@
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
-  import { getSettings } from "$lib/models";
+  import { getSettings, modelsStatus } from "$lib/models";
   import { refineReady } from "$lib/refineReady";
+  import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -154,6 +155,10 @@
   let refineStatusKnown = $state(false);
   /** 快照说"在跑"之后的复核间隔。只在这条自愈路径上用,正常靠事件驱动。 */
   const REFINE_RECHECK_MS = 3000;
+  /** 当前识别引擎与「更强引擎是否已下载」:决定要不要提示"这场疑似识别失败,换引擎重转写"
+      (判据与由来见 $lib/lowDensity)。挂载取一次;换引擎会重转写,届时整页重来。 */
+  let repairReady = $state(false);
+  let repairing = $state(false);
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -1106,6 +1111,59 @@
       refineConfigured = refineReady(s);
     })
     .catch(() => {});
+  // 重转写要的不止 FireRed:双轨重转写还要用 Silero 切段,少一个都跑不起来
+  // (设置页允许单独删任一件,Codex P2)。
+  void modelsStatus()
+    .then((m) => {
+      const have = (id: string) => m.artifacts.some((a) => a.id === id && a.present);
+      repairReady = have("firered") && have("vad");
+    })
+    .catch(() => {});
+
+  /** 这场里"说了好几秒却几乎没转出字"的段。它们的音频是好的(实测同段换引擎能解出
+      连贯中文),所以这不是噪声而是内容丢失——看得见才修得了。 */
+  // 必须连**被抑制的段**一起数(Codex P2):那个 14.6 秒只出一个句号的段,正是被
+  // 「无内容过滤」挪进 suppressed_segments 的——只扫 segments 会一个都数不到,
+  // 恰好把最典型的事故形态漏掉。判据本身(≥3s 且有效字符 ≤2)会把外语过滤、回声
+  // 撤回这类"有内容只是被规则拿掉"的段自然排除在外。
+  const lowDensity = $derived(
+    lowDensityStat([...(note?.segments ?? []), ...(note?.suppressed_segments ?? [])]),
+  );
+  const offerBetterEngine = $derived(
+    shouldOfferBetterEngine(lowDensity, {
+      noteEngine: note?.meta.asr_engine ?? undefined,
+      ready: repairReady,
+      // 门禁与页面上那个重转写按钮完全一致:录制中/精修中/本篇已有重转写在跑/本篇
+      // 未完成时后端都会拒,提供一个必被拒的按钮只是骗点击(Codex P2)。
+      //
+      // 已知局限(与既有重转写按钮同款,刻意不在此扩大改动面):页面只看得到本篇的
+      // 状态,别的笔记正在重转写、本篇转码未完、成品轨在重生成、模型下载/迁移在跑
+      // 这些全局态它不知道,按钮仍会亮。真点了后端会拒,错误经 retransErr 原样显示
+      // (说明是哪一种占用)。要根治得让后端出一个"现在能不能开重转写"的查询,
+      // 那是这两个入口共同的事,该单独做。
+      actionable:
+        !retranscribing &&
+        !refining &&
+        !recording.isLive &&
+        note?.meta.state === "complete" &&
+        // 音频被留存策略清掉的老笔记只剩文字:重转写没有源可读,点了必然失败
+        // (Codex P2)。tracks 为空即"盘上没音频"。
+        tracks.length > 0,
+    }),
+  );
+
+  /** 用 FireRed 重转写本篇。**只作用于这一次**,不动全局设置(Codex P1):改设置既
+      不保证这次生效(云端模式下重转写会走云端批式),又会清缓存并异步预载,与紧接着
+      启动的重转写各建一份 1.2G 模型。想让以后录制也用它,去设置里改。 */
+  async function repairWithFirered() {
+    if (repairing) return;
+    repairing = true;
+    try {
+      await startRetranscribe("dual", "firered");
+    } finally {
+      repairing = false;
+    }
+  }
 
   /** 「这场没做 AI 整理」:后端未配全时是完全静默降级的,不提示就等于没发生
       (2026-08-13 起连断四天六场没被发现)。判定见 $lib/aiSkipHint。 */
@@ -1527,12 +1585,12 @@
       一次)。复用既有的 retransEventSeen 旗:invoke 前先清旗,invoke 成功后只有
       "还没见过任何事件"才自己置 running 态——running 事件与终态事件都已到过,
       说明事件通道已经接管了 retranscribing 的真相,以事件状态为准。 */
-  async function startRetranscribe(input: "dual" | "mixed") {
+  async function startRetranscribe(input: "dual" | "mixed", engine?: string) {
     retransConfirm = false;
     retransErr = "";
     retransEventSeen = false;
     try {
-      await retranscribeNote(id, input);
+      await retranscribeNote(id, input, engine);
       if (!retransEventSeen) {
         retranscribing = true;
         retransStage = "decode";
@@ -1878,6 +1936,16 @@
     {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
     <!-- 放在视图分支之外:切到原始稿也照样看得见——"这场 AI 没跑"是笔记级事实,
          不是精修视图的局部状态。 -->
+    {#if offerBetterEngine}
+      <div class="banner">
+        {t("notes.banner.lowDensity", { n: lowDensity.count, s: lowDensity.seconds })}
+        <button class="link" disabled={repairing} onclick={repairWithFirered}>
+          {repairing ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix")}
+        </button>
+        <span class="hint">{t("notes.banner.lowDensityHint")}</span>
+      </div>
+    {/if}
+
     {#if aiSkipped}
       <div class="banner">
         {aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun")}

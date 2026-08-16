@@ -36,6 +36,9 @@ export type NoteMeta = {
   state: string;
   calendar?: CalendarSnapshot | null;
   calendar_cleared?: boolean;
+  /** 本场转写实际用的识别引擎("firered"/"sense_voice"/…,云端记 "cloud:厂商")。
+      后端 2026-08-14 起每场落盘;更早的笔记没有这个字段。 */
+  asr_engine?: string | null;
 };
 
 export type SegmentRecord = {
@@ -314,8 +317,8 @@ export const refineNote = (id: string) => invoke<void>("refine_note", { id });
 /** 这篇的 Aing 是否正在跑。进页时补问一次:running 事件易失,进页晚了收不到。 */
 export const noteRefining = (id: string) => invoke<boolean>("note_refining", { id });
 /** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */
-export const retranscribeNote = (id: string, input: "dual" | "mixed") =>
-  invoke<void>("retranscribe_note", { id, input });
+export const retranscribeNote = (id: string, input: "dual" | "mixed", engine?: string) =>
+  invoke<void>("retranscribe_note", { id, input, engine: engine ?? null });
 /** 当前重转写任务;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
 export const retranscribeStatus = () =>
   invoke<{ note_id: string; stage: string } | null>("retranscribe_status");

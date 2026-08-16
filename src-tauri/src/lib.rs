@@ -458,7 +458,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             let mut outcome = Err(String::new());
                             for attempt in 0..10 {
                                 // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
-                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, &mut |_| {});
+                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {});
                                 match &outcome {
                                     Err(e) if e.contains("正被占用") || e.contains("busy") => {
                                         if attempt < 9 {
@@ -2579,8 +2579,29 @@ fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, 
 /// 可不可信",槽占用判是因为它改变了共享状态(占槽)——只有前面全过才允许触碰它。
 /// 最后一步(占槽后复拒)是 Fix 1A 补的 Dekker 写后读权威判定:开头那次"录制中拒"只是
 /// 快速失败的 UX,真正堵死与 spawn_session 竞态的是这一步。
-pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<(), String> {
+/// `engine`:本次重转写强制使用的本地识别引擎(如 "firered"),None = 按设置决策。
+/// 为什么要覆盖而不是让调用方改设置(Codex P1):①云端模式下重转写会走云端批式,
+/// 改 asr_model 根本不生效;②改设置会清识别器缓存并异步预载,与紧接着启动的重转写
+/// 各建一份 1.2G 模型,峰值内存翻倍。覆盖只作用于这一次任务,不动用户的默认选择。
+pub(crate) fn do_retranscribe(
+    app: &AppHandle,
+    id: &str,
+    input: &str,
+    engine: Option<String>,
+) -> Result<(), String> {
     store::validate_note_id(id).map_err(|e| e.to_string())?;
+    if let Some(e) = engine.as_deref() {
+        let known = [
+            settings::ASR_SENSE_VOICE,
+            settings::ASR_WHISPER,
+            settings::ASR_PARAFORMER,
+            settings::ASR_QWEN3,
+            settings::ASR_FIRERED,
+        ];
+        if !known.contains(&e) {
+            return Err(tr!("未知识别引擎: {e}", "Unknown ASR engine: {e}", e = e));
+        }
+    }
     if input != "dual" && input != "mixed" {
         return Err(tr!("未知重转写来源: {input}", "Unknown retranscribe input: {input}", input = input));
     }
@@ -2696,7 +2717,7 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
         *state.retranscribing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
     }
-    spawn_retranscribe(app.clone(), id.to_string(), input == "mixed");
+    spawn_retranscribe(app.clone(), id.to_string(), input == "mixed", engine);
     Ok(())
 }
 
@@ -2709,12 +2730,14 @@ pub(crate) fn do_retranscribe(app: &AppHandle, id: &str, input: &str) -> Result<
 /// 不各配一份漂移。识别器按设置决策:local_cloud 且凭证齐 → 云端批式(手动重转写
 /// 与自动二遍同引擎,结果口径一致);否则本地引擎(不碰常驻 recognizer_cache 槽——
 /// 那是录制会话的常驻资源,离线任务混用会互相饿死对方)。
+#[allow(clippy::too_many_arguments)]
 fn run_retranscribe_once(
     app: &tauri::AppHandle,
     note_id: &str,
     mixed: bool,
     language_filter: bool,
     strict: bool,
+    engine: Option<String>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<retranscribe::Summary, String> {
     let dir = notes_dir(app).map_err(|e| e.to_string())?.join(note_id);
@@ -2728,8 +2751,18 @@ fn run_retranscribe_once(
             "The note is busy (recording or being edited); try again later"
         ))?;
     let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
-    let mut recognizer: Box<dyn asr::Recognizer> = if settings::cloud_second_pass_wanted(&s) {
+    // 显式指定引擎时一律走本地那一支:调用方要的就是"用这个引擎再解一遍",
+    // 云端二遍会把这个意图吃掉(Codex P1)。
+    // 云端识别器没有 engine_id(trait 默认值是 "unknown"),身份得从建它时用的那份
+    // 设置快照里取,写成与实时链路同款的 "cloud:厂商"(Codex P2)。写错了这篇就不再
+    // 被认成"云端转的",反而会被建议换 FireRed。
+    let mut cloud_id: Option<String> = None;
+    let mut recognizer: Box<dyn asr::Recognizer> = if let Some(e) = engine.as_deref() {
+        new_recognizer(e, current_asr_provider(app), qwen3_hotwords(app))
+            .map_err(|err| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = err))?
+    } else if settings::cloud_second_pass_wanted(&s) {
         let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        cloud_id = Some(format!("cloud:{}", s.cloud_asr_provider));
         Box::new(asr::cloud::BatchRecognizer::new(cloud))
     } else {
         new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
@@ -2751,13 +2784,22 @@ fn run_retranscribe_once(
     } else {
         Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
     };
-    retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
+    // 身份向识别器实例本人要(与实时链路同款,见 spawn_refine 处注释):这一遍到底
+    // 是谁转的,决定了「疑似识别失败,换引擎重转写」还要不要再提示这篇。
+    let engine_id = cloud_id.unwrap_or_else(|| recognizer.engine_id().to_string());
+    let out = retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
         &mut embedder, seeds, mixed, language_filter, strict, progress,
         &current_speaker_match(app))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 成功提交之后再改 meta:失败时不能留下"已经是 FireRed 转的"这种假账
+    // (Codex P2)。落盘失败只记日志——正文已经换过了,不该因为一行元数据回滚。
+    if let Err(e) = store::set_note_asr_engine(&dir, &engine_id) {
+        eprintln!("重转写:asr_engine 落盘失败(不影响正文): {e}");
+    }
+    Ok(out)
 }
 
-fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
+fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool, engine: Option<String>) {
     let slot = app.state::<AppState>().retranscribing.clone();
     let last = app.state::<AppState>().retranscribe_last.clone();
     // language_filter:与实时链路(0) 一次性读设置同款途径同源同快照——不读到并发写入的
@@ -2794,7 +2836,7 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
                 });
             };
             // 手动路径宽容(strict=false):失败段落占位,用户看 summary 自行决定。
-            run_retranscribe_once(&app, &note_id, mixed, language_filter, false, &mut progress)
+            run_retranscribe_once(&app, &note_id, mixed, language_filter, false, engine.clone(), &mut progress)
         }));
         match body {
             Ok(Ok(summary)) => {
@@ -2821,8 +2863,13 @@ fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool) {
 }
 
 #[tauri::command]
-fn retranscribe_note(app: AppHandle, id: String, input: String) -> Result<(), String> {
-    do_retranscribe(&app, &id, &input)
+fn retranscribe_note(
+    app: AppHandle,
+    id: String,
+    input: String,
+    engine: Option<String>,
+) -> Result<(), String> {
+    do_retranscribe(&app, &id, &input, engine)
 }
 
 #[derive(serde::Serialize)]
