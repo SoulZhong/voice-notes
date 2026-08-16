@@ -56,8 +56,9 @@
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
-  import { getSettings } from "$lib/models";
+  import { getSettings, setSettings, modelsStatus } from "$lib/models";
   import { refineReady } from "$lib/refineReady";
+  import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -154,6 +155,11 @@
   let refineStatusKnown = $state(false);
   /** 快照说"在跑"之后的复核间隔。只在这条自愈路径上用,正常靠事件驱动。 */
   const REFINE_RECHECK_MS = 3000;
+  /** 当前识别引擎与「更强引擎是否已下载」:决定要不要提示"这场疑似识别失败,换引擎重转写"
+      (判据与由来见 $lib/lowDensity)。挂载取一次;换引擎会重转写,届时整页重来。 */
+  let asrEngine = $state("");
+  let fireredReady = $state(false);
+  let switchingEngine = $state(false);
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -1104,8 +1110,43 @@
       playbackScheme = defaultPlayback;
       refineOn = s.refine_enabled;
       refineConfigured = refineReady(s);
+      asrEngine = s.asr_model;
     })
     .catch(() => {});
+  void modelsStatus()
+    .then((m) => {
+      fireredReady = m.artifacts.some((a) => a.id === "firered" && a.present);
+    })
+    .catch(() => {});
+
+  /** 这场里"说了好几秒却几乎没转出字"的段。它们的音频是好的(实测同段换引擎能解出
+      连贯中文),所以这不是噪声而是内容丢失——看得见才修得了。 */
+  const lowDensity = $derived(lowDensityStat(note?.segments ?? []));
+  const offerBetterEngine = $derived(
+    note?.meta.state === "complete" &&
+      !retranscribing &&
+      shouldOfferBetterEngine(lowDensity, {
+        currentEngine: asrEngine,
+        betterEngineReady: fireredReady,
+      }),
+  );
+
+  /** 换用 FireRed 并立刻重转写本篇。引擎设置是全局的——这一点必须在按钮文案里说清楚,
+      不能偷偷改:用户接受的是"以后也用它",而不只是这一次。 */
+  async function switchToFireredAndRetranscribe() {
+    if (switchingEngine) return;
+    switchingEngine = true;
+    try {
+      const fresh = await getSettings();
+      await setSettings({ ...fresh, asr_model: "firered" });
+      asrEngine = "firered";
+      await startRetranscribe("dual");
+    } catch (e) {
+      retransErr = t("notes.retrans.failed", { e });
+    } finally {
+      switchingEngine = false;
+    }
+  }
 
   /** 「这场没做 AI 整理」:后端未配全时是完全静默降级的,不提示就等于没发生
       (2026-08-13 起连断四天六场没被发现)。判定见 $lib/aiSkipHint。 */
@@ -1878,6 +1919,16 @@
     {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
     <!-- 放在视图分支之外:切到原始稿也照样看得见——"这场 AI 没跑"是笔记级事实,
          不是精修视图的局部状态。 -->
+    {#if offerBetterEngine}
+      <div class="banner">
+        {t("notes.banner.lowDensity", { n: lowDensity.count, s: lowDensity.seconds })}
+        <button class="link" disabled={switchingEngine} onclick={switchToFireredAndRetranscribe}>
+          {switchingEngine ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix")}
+        </button>
+        <span class="hint">{t("notes.banner.lowDensityHint")}</span>
+      </div>
+    {/if}
+
     {#if aiSkipped}
       <div class="banner">
         {aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun")}
