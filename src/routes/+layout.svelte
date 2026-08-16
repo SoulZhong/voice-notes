@@ -22,6 +22,7 @@
     type UpdateProgress,
   } from "$lib/update";
   import { onTrayNavigate } from "$lib/events";
+import { hasNavigated, markNavigated } from "$lib/navIntent";
 import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
@@ -98,6 +99,9 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
         welcomeStatus = m;
       } else if (needsAiGuide && $page.url.searchParams.get("guide") !== AI_TOOLS_GUIDE_ID) {
         // 功能教学必须发生在真实操作页；只把用户导航到对应功能并启动上下文引导。
+        // 但显式导航优先(Codex P2):这段跑在两个 IPC 之后,冷启动时可能晚于托盘
+        // 「打开设置」落地,不让路就会把人从设置页拽到 /ai。引导下次启动还会再来。
+        if (hasNavigated()) return;
         goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`);
       }
     } catch {
@@ -127,16 +131,23 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
     const unIdentify = listen("identify_done", () => void tidy.refresh());
     // 托盘「打开设置」:后端只负责亮出窗口,路由在前端。挂在 layout(常驻)而不是设置页,
     // 否则只有已经在设置页时才生效。
+    const trayNavTo = (path: string) => {
+      if (!path.startsWith("/")) return;
+      markNavigated(); // 必须在 goto 之前:自动重定向据此让路(见 navIntent.ts)
+      goto(path);
+    };
     const unTrayNav = onTrayNavigate((e) => {
-      if (!e.path.startsWith("/")) return;
-      goto(e.path);
+      trayNavTo(e.path);
       // 顺手清掉后端那份待办:事件已经送到,不清的话下次重挂载会再跳一次。
       void invoke("take_pending_nav").catch(() => {});
     });
     // 冷启动补领:托盘在 webview 就绪之前就存在,那一刻点「打开设置」发的事件没人接。
-    void invoke<string | null>("take_pending_nav")
+    // **必须等监听注册完再领**(Codex P2):listen() 是异步的,若先领到 null、随后用户
+    // 在注册落地前点了托盘,那次点击既没人接、也不会再被领走,窗口亮了却不跳页。
+    void Promise.resolve(unTrayNav)
+      .then(() => invoke<string | null>("take_pending_nav"))
       .then((path) => {
-        if (path && path.startsWith("/")) goto(path);
+        if (path) trayNavTo(path);
       })
       .catch(() => {});
     // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——
