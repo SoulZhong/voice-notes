@@ -37,6 +37,20 @@ describe("疑似识别失败段", () => {
     expect(lowDensityStat([seg(0, 3_000, "对吧啊")]).count).toBe(0);
   });
 
+  it("被抑制的段一起数:最典型的事故形态就在里面", () => {
+    // 真实数据:14.6 秒只出一个 "." 的段被「无内容过滤」挪进了 suppressed_segments,
+    // 调用方要把两份合起来传进来(见笔记页 lowDensity 派生处注释)。
+    const visible = [seg(0, 12_000, "这段是好的内容确实转出来了")];
+    const suppressed = [seg(20_000, 34_600, "."), seg(40_000, 46_400, "。")];
+    expect(lowDensityStat([...visible, ...suppressed]).count).toBe(2);
+  });
+
+  it("外语过滤掉的长段有内容,不算识别失败", () => {
+    // 「こましま。」是 6 个有效字符,不满足 ≤2——判据天然把这类排除,
+    // 所以合并传入不会把外语过滤/回声撤回误算成失败。
+    expect(lowDensityStat([seg(0, 6_400, "こましま。")]).count).toBe(0);
+  });
+
   it("时长累计按秒向下取整", () => {
     const st = lowDensityStat([seg(0, 3_500, "."), seg(0, 4_400, "，")]);
     expect(st.count).toBe(2);

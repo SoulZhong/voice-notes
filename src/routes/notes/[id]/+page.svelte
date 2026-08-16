@@ -1122,7 +1122,13 @@
 
   /** 这场里"说了好几秒却几乎没转出字"的段。它们的音频是好的(实测同段换引擎能解出
       连贯中文),所以这不是噪声而是内容丢失——看得见才修得了。 */
-  const lowDensity = $derived(lowDensityStat(note?.segments ?? []));
+  // 必须连**被抑制的段**一起数(Codex P2):那个 14.6 秒只出一个句号的段,正是被
+  // 「无内容过滤」挪进 suppressed_segments 的——只扫 segments 会一个都数不到,
+  // 恰好把最典型的事故形态漏掉。判据本身(≥3s 且有效字符 ≤2)会把外语过滤、回声
+  // 撤回这类"有内容只是被规则拿掉"的段自然排除在外。
+  const lowDensity = $derived(
+    lowDensityStat([...(note?.segments ?? []), ...(note?.suppressed_segments ?? [])]),
+  );
   const offerBetterEngine = $derived(
     shouldOfferBetterEngine(lowDensity, {
       noteEngine: note?.meta.asr_engine ?? undefined,

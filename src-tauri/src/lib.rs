@@ -2779,10 +2779,19 @@ fn run_retranscribe_once(
     } else {
         Box::new(retranscribe::input::DualTrackInput::new(dir.clone(), factory))
     };
-    retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
+    // 身份向识别器实例本人要(与实时链路同款,见 spawn_refine 处注释):这一遍到底
+    // 是谁转的,决定了「疑似识别失败,换引擎重转写」还要不要再提示这篇。
+    let engine_id = recognizer.engine_id().to_string();
+    let out = retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
         &mut embedder, seeds, mixed, language_filter, strict, progress,
         &current_speaker_match(app))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 成功提交之后再改 meta:失败时不能留下"已经是 FireRed 转的"这种假账
+    // (Codex P2)。落盘失败只记日志——正文已经换过了,不该因为一行元数据回滚。
+    if let Err(e) = store::set_note_asr_engine(&dir, &engine_id) {
+        eprintln!("重转写:asr_engine 落盘失败(不影响正文): {e}");
+    }
+    Ok(out)
 }
 
 fn spawn_retranscribe(app: tauri::AppHandle, note_id: String, mixed: bool, engine: Option<String>) {
