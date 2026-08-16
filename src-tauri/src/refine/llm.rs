@@ -39,6 +39,27 @@ fn err_status(e: &ureq::Error) -> Option<u16> {
     }
 }
 
+/// 发一个长请求(CHUNK_TIMEOUT_S 档),瞬时失败重试一次,返回响应正文。
+/// 分块精修自己有一套(要按块记 AI 日志),这里服务没有分块的长请求——目前是
+/// 独立关系抽取。
+fn post_long_with_retry(cfg: &LlmConfig, url: &str, body: &str) -> anyhow::Result<String> {
+    let send = || {
+        ureq::post(url)
+            .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
+            .set("authorization", &format!("Bearer {}", cfg.api_key))
+            .set("content-type", "application/json")
+            .send_string(body)
+    };
+    let resp = match send() {
+        Err(e) if worth_retry(err_status(&e)) => {
+            std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_S));
+            send()?
+        }
+        other => other?,
+    };
+    Ok(resp.into_string()?)
+}
+
 /// 这块该不该重试。只有网络类失败才有重试的意义,且要排掉 4xx;内容类(响应能
 /// 收到但内容不合约)重试等于原样再错一次。
 fn retryable(e: &ChunkErr) -> bool {
@@ -210,13 +231,9 @@ pub fn extract_relations(
         ],
     });
     apply_thinking_off(&cfg.base_url, &mut body);
-    // 关系抽取与分块精修同属长请求(要读完整篇段落再吐结构化关系),用同一档超时。
-    let response = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
-        .set("authorization", &format!("Bearer {}", cfg.api_key))
-        .set("content-type", "application/json")
-        .send_string(&body.to_string())?
-        .into_string()?;
+    // 关系抽取与分块精修同属长请求(要读完整篇段落再吐结构化关系),用同一档超时,
+    // 瞬时失败也同样重试一次(Codex P2:漏了这条路径,一次抖动就白丢整篇关系)。
+    let response = post_long_with_retry(cfg, &url, &body.to_string())?;
     let envelope: Value = serde_json::from_str(&response)?;
     let content = envelope["choices"][0]["message"]["content"]
         .as_str()

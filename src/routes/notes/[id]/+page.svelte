@@ -16,6 +16,7 @@
     exportFileName,
     getRefined,
     refineNote,
+    noteRefining,
     retranscribeNote,
     retranscribeStatus,
     mixedInputStatus,
@@ -773,10 +774,20 @@
           if (forId === id) refined = r;
         });
       }
-    }).then((u) => {
-      if (disposed) u();
-      else unlisten = u;
-    });
+    })
+      .then((u) => {
+        if (disposed) u();
+        else unlisten = u;
+        // 补问在途状态:running 事件是易失的,进页晚了就再也收不到,只看事件会把
+        // "正在整理"误判成"没在整理"——而整理途中 stages.llm 本就是 "off",误判会让
+        // 「这场没做 AI 整理」的横幅在整理途中冒出来(Codex P2)。
+        // 必须等监听挂到位之后再问,否则查询与订阅两头并发,状态可能在缝隙里漏掉。
+        return noteRefining(forId);
+      })
+      .then((r) => {
+        if (r && !disposed && forId === id) refining = true;
+      })
+      .catch(() => {});
     return () => {
       disposed = true;
       unlisten?.();
@@ -972,6 +983,7 @@
     aiSkipHint({
       llmStage: refined?.stages.llm,
       noteComplete: note?.meta.state === "complete",
+      running: refining,
       refineEnabled: refineOn,
       ready: refineConfigured,
     }),

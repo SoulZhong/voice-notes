@@ -15,17 +15,25 @@ export function aiSkipHint(opts: {
   llmStage: string | undefined;
   /** 笔记已完成(录制中/收尾中还没到该跑 AI 的时候)。 */
   noteComplete: boolean;
+  /** 这篇的 Aing 正在跑。 */
+  running: boolean;
   /** 会后 AI 功能开关。 */
   refineEnabled: boolean;
   /** 执行体配置是否齐备(口径见 refineReady)。 */
   ready: boolean;
 }): AiSkipHint {
-  const { llmStage, noteComplete, refineEnabled, ready } = opts;
+  const { llmStage, noteComplete, running, refineEnabled, ready } = opts;
   // 跑过就有各自的提示(partial/failed 已有 banner),不归这里管。
   if (llmStage !== "off") return null;
   if (!noteComplete) return null;
+  // 正在跑的时候 stages.llm 本来就是 "off":run_local 一开始就落这个值,LLM 阶段
+  // 结束才改写。不挡住的话,整理途中(可能长达几分钟)会冒出"这场没做 AI 整理",
+  // 还给一个后端必然拒绝的重跑按钮(Codex P2)。
+  if (running) return null;
   // 用户主动关掉了会后 AI:这是明确选择,每篇笔记都唠叨一句是噪音。
   if (!refineEnabled) return null;
   // 开关开着却没跑成:要么现在仍没配全(去配置),要么已经配好了(可以补跑)。
+  // 注意两条文案都只描述**现在**的状态,不解释这场当初为什么没跑——aing.json 只存
+  // "off",不存跳过原因,当初可能只是用户把会后 AI 关着(Codex P2)。
   return ready ? "rerunnable" : "unconfigured";
 }

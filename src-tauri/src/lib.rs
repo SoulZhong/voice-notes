@@ -2547,6 +2547,16 @@ fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
         .request(lifecycle::machine::Msg::RefineRequest { note_id: id })
 }
 
+/// 这篇笔记的 Aing 是否正在跑。前端进页时补问一次:running 事件是易失的,进页晚了
+/// 就再也收不到,只看事件会把"正在跑"误判成"没在跑"——而 run_local 一开始就把
+/// stages.llm 落成 "off",误判会让「这场没做 AI 整理」的提示在整理途中冒出来
+/// (Codex P2)。async:is_refining 要等 actor 回执,不能占着主线程等。
+#[tauri::command]
+async fn note_refining(app: AppHandle, id: String) -> Result<bool, String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    Ok(app.state::<lifecycle::LifecycleHandle>().is_refining(&id))
+}
+
 /// 读取已落盘的 Aing 结果（refined.json）；从未 Aing 过 / Aing 在前置阶段就失败到没能落盘
 /// 时返回 None，前端据此回落展示原始 segments。
 /// 关联了库人物的段落做只读 join：展示名跟随声纹库现名（会议搭子里改名 → 历史修订稿
@@ -7445,6 +7455,7 @@ pub fn run() {
             acknowledge_identify,
             undo_identify_apply,
             get_refined,
+            note_refining,
             retranscribe_note,
             regenerate_mixed,
             mixed_regen_status,
