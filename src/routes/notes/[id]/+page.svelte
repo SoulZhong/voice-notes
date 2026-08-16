@@ -110,11 +110,14 @@
     refinedSeq += 1;
     return refinedSeq;
   }
-  /** 只有仍是最新一次请求、且没切走笔记时才落地。 */
-  function commitRefined(seq: number, doc: RefinedDoc | null, forId: string) {
-    if (seq !== refinedSeq || forId !== id) return;
+  /** 只有仍是最新一次请求、且没切走笔记时才落地;返回是否真的落了。
+      调用方要据此决定跟着落不落编辑器同步——被判过期的那份稿子绝不能推给编辑器,
+      否则 refined 是新的、编辑器却被回滚成旧的。 */
+  function commitRefined(seq: number, doc: RefinedDoc | null, forId: string): boolean {
+    if (seq !== refinedSeq || forId !== id) return false;
     refined = doc;
     refinedStale = false;
+    return true;
   }
   async function loadRefined(forId: string): Promise<void> {
     const seq = reserveRefinedSeq();
@@ -123,7 +126,9 @@
       commitRefined(seq, await getRefined(forId), forId);
     } catch {
       // 增值层:取不到就维持现状,但要记下"手里这份可能过期",别拿它下结论。
-      if (forId === id) refinedStale = true;
+      // 只有仍是最新一次请求才置位:被更新的请求顶掉之后再失败,那份失败已无意义,
+      // 置位反而会把提示永久压住。
+      if (forId === id && seq === refinedSeq) refinedStale = true;
     } finally {
       refinedLoading -= 1;
     }
@@ -341,8 +346,8 @@
       if (targetId === id && !refinedEditor?.hasFocus()) {
         const seq = reserveRefinedSeq(); // 占号必须在 await 之前(见闸门注释 ③)
         const latest = await getRefined(targetId);
-        if (latest && targetId === id && !refinedEditor?.hasFocus()) {
-          commitRefined(seq, latest, targetId);
+        // 被更新的取稿顶掉时不推给编辑器(见 commitRefined 注释)。
+        if (latest && targetId === id && !refinedEditor?.hasFocus() && commitRefined(seq, latest, targetId)) {
           syncedRefined = latest;
           syncedEditor = refinedEditor;
           refinedEditor?.setRefined(latest);
@@ -395,8 +400,7 @@
         const latest = await getRefined(targetId);
         // await 后重验守卫:回读期间用户可能已经切走了笔记。
         if (targetId === id && loadedRefinedId === targetId) {
-          if (latest) {
-            commitRefined(seq, latest, targetId);
+          if (latest && commitRefined(seq, latest, targetId)) {
             syncedRefined = latest;
             syncedEditor = refinedEditor;
           }
@@ -424,8 +428,7 @@
         try {
           const seq = reserveRefinedSeq(); // 占号必须在 await 之前(见闸门注释 ③)
           const latest = await getRefined(targetId);
-          if (targetId === id && loadedRefinedId === targetId) {
-            commitRefined(seq, latest, targetId);
+          if (targetId === id && loadedRefinedId === targetId && commitRefined(seq, latest, targetId)) {
             if (latest) {
               // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
               // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
