@@ -43,21 +43,30 @@ fn err_status(e: &ureq::Error) -> Option<u16> {
 /// 分块精修自己有一套(要按块记 AI 日志),这里服务没有分块的长请求——目前是
 /// 独立关系抽取。
 fn post_long_with_retry(cfg: &LlmConfig, url: &str, body: &str) -> anyhow::Result<String> {
-    let send = || {
-        ureq::post(url)
+    // 一次完整尝试 = 发请求 **加上读完响应体**。ureq 的 body 是惰性读的,长响应
+    // 读到一半超时/断开时 send_string 早已 Ok,把读正文留在重试之外等于漏掉这类
+    // 失败(Codex P2)。错误带一个"值不值得重试"的旗子回来。
+    let attempt = || -> Result<String, (anyhow::Error, bool)> {
+        let resp = ureq::post(url)
             .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
             .set("authorization", &format!("Bearer {}", cfg.api_key))
             .set("content-type", "application/json")
             .send_string(body)
+            .map_err(|e| {
+                let retry = worth_retry(err_status(&e));
+                (anyhow::Error::new(e), retry)
+            })?;
+        // 读正文失败一律算传输层:能走到这儿说明状态码是好的。
+        resp.into_string().map_err(|e| (anyhow::Error::new(e), true))
     };
-    let resp = match send() {
-        Err(e) if worth_retry(err_status(&e)) => {
+    match attempt() {
+        Ok(s) => Ok(s),
+        Err((e, false)) => Err(e),
+        Err((_, true)) => {
             std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_S));
-            send()?
+            attempt().map_err(|(e, _)| e)
         }
-        other => other?,
-    };
-    Ok(resp.into_string()?)
+    }
 }
 
 /// 这块该不该重试。只有网络类失败才有重试的意义,且要排掉 4xx;内容类(响应能

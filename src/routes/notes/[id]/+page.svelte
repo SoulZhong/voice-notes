@@ -761,8 +761,13 @@
     const forId = id;
     let unlisten: (() => void) | null = null;
     let disposed = false;
+    // 事件一到就以事件为准:补问的快照可能比终态事件还晚落地(后端先发 all/done、
+    // 再把 id 从在跑集合里摘掉),晚到的 true 会把页面永久钉在"整理中",此后
+    // 再没有事件来解除(Codex P2)。
+    let sawRefineEvent = false;
     onRefine((e) => {
       if (e.note_id !== forId) return;
+      sawRefineEvent = true;
       if (e.state === "running") {
         refining = true;
         refineRunFailed = false;
@@ -785,7 +790,7 @@
         return noteRefining(forId);
       })
       .then((r) => {
-        if (r && !disposed && forId === id) refining = true;
+        if (r && !disposed && !sawRefineEvent && forId === id) refining = true;
       })
       .catch(() => {});
     return () => {
