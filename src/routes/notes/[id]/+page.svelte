@@ -804,40 +804,49 @@
         // 必须等监听挂到位之后再问,否则查询与订阅两头并发,状态可能在缝隙里漏掉。
         return noteRefining(forId);
       })
-      .then((r) => {
-        if (r && !disposed && !sawTerminal && forId === id) {
-          refining = true;
-          // 从快照取到的"在跑"必须能自愈:终态事件可能早于后端把 id 从在跑集合
-          // 里摘掉而发出,恰好在那一瞬订阅的话,快照拿到 true 却再也等不到事件
-          // (摘除本身不发前端事件),页面会永久卡在"整理中"(Codex P2 五轮)。
-          // 因此隔几秒复核一次,直到后端说不在跑或终态事件到达。
-          void (async () => {
-            while (!disposed && forId === id && !sawTerminal) {
-              await new Promise((done) => setTimeout(done, REFINE_RECHECK_MS));
-              if (disposed || forId !== id || sawTerminal) return;
-              try {
-                if (!(await noteRefining(forId))) {
-                  if (!disposed && forId === id) {
-                    // 走到这条路径说明终态事件被错过了,refined 还是跑之前那份
-                    // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
-                    // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
-                    // 同上:refining 等新稿到手再落,免得中间闪一下(七轮)。
-                    void getRefined(forId)
-                      .then((r) => {
-                        if (!disposed && forId === id) refined = r;
-                      })
-                      .finally(() => {
-                        if (!disposed && forId === id) refining = false;
-                      });
-                  }
-                  return;
-                }
-              } catch {
-                return; // 查不动就不再复核:事件通道仍在,不至于全无出路
-              }
-            }
-          })();
+      .then(async (r) => {
+        if (disposed || forId !== id || sawTerminal) return;
+        if (!r) {
+          // 快照说"没在跑":这一场可能恰好在初次 getRefined 之后、监听装好之前
+          // 跑完,那条终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——
+          // 直接放行会让整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。
+          // 重取一次再放行(refineStatusKnown 在下面的 finally 里置,会等这一步)。
+          try {
+            const doc = await getRefined(forId);
+            if (!disposed && forId === id) refined = doc;
+          } catch {
+            /* 取不到就按现有稿显示,不卡住提示 */
+          }
+          return;
         }
+        refining = true;
+        // 从快照取到的"在跑"必须能自愈:终态事件可能早于后端把 id 从在跑集合
+        // 里摘掉而发出,恰好在那一瞬订阅的话,快照拿到 true 却再也等不到事件
+        // (摘除本身不发前端事件),页面会永久卡在"整理中"(Codex P2 五轮)。
+        // 因此隔几秒复核一次,直到后端说不在跑或终态事件到达。
+        void (async () => {
+          while (!disposed && forId === id && !sawTerminal) {
+            await new Promise((done) => setTimeout(done, REFINE_RECHECK_MS));
+            if (disposed || forId !== id || sawTerminal) return;
+            try {
+              if (await noteRefining(forId)) continue;
+              // 走到这里说明终态事件被错过了,refined 还是跑之前那份
+              // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
+              // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
+              // refining 等新稿到手再落,免得中间闪一下(七轮);await 在 try 内,
+              // 失败由下面的 catch 收掉,不留未处理的 rejection(八轮)。
+              try {
+                const doc = await getRefined(forId);
+                if (!disposed && forId === id) refined = doc;
+              } finally {
+                if (!disposed && forId === id) refining = false;
+              }
+              return;
+            } catch {
+              return; // 查不动就不再复核:事件通道仍在,不至于全无出路
+            }
+          }
+        })();
       })
       .catch(() => {})
       // 无论成败都算"已确定":查询失败时按事件为准,总不能永远不提示。
