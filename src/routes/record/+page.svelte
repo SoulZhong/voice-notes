@@ -324,6 +324,18 @@
   }
   /** 状态机原值(idle/recording/paused/stopped/error:…)映射成右侧簇里的友好短标签;
       错误详情(可能很长)不塞这里,另在下方红色行完整展开。 */
+  /** 计时后缀:只在"非正常录制中"时出条,正常录制由呼吸红点交代,不再挂一个常驻标签。
+      出错也走这里(此前收在右侧状态标签里,重排后那个位置没了,不能把错误一起弄丢)。 */
+  const clockNote = $derived(
+    isError(recording.status)
+      ? t("record.status.error")
+      : recording.stopping
+        ? t("record.btn.stopping")
+        : recording.paused
+          ? t("record.status.paused")
+          : "",
+  );
+
   const statusLabel = $derived(
     isError(recording.status)
       ? t("record.status.error")
@@ -388,11 +400,13 @@
   const WAVE_PEAK_PX = 24; // 峰值条高;容器 34px,留头免得顶到边
   let liveBarsMic = $state<number[]>([]);
   let sysHold = $state(0);
+  let micHold = $state(0);
   let waveW = $state(0);
   $effect(() => {
     if (!recording.isLive) {
       liveBarsMic = [];
       sysHold = 0;
+      micHold = 0;
       return;
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
@@ -403,7 +417,10 @@
     const t = setInterval(() => {
       envPrev = envelopeStep(envPrev, micPct);
       liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), envPrev];
+      // 两路指示灯用同款"带保持"的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),
+      // 灯不跟着每帧电平闪烁。mic 侧的门限与波形同一条(shapeLevel 的噪声门)。
       sysHold = sysPct > 0 ? 8 : Math.max(0, sysHold - 1);
+      micHold = shapeLevel(micPct) > 0 ? 8 : Math.max(0, micHold - 1);
     }, 120);
     return () => clearInterval(t);
   });
@@ -570,6 +587,28 @@
   }
 </script>
 
+<!-- 录制 transport 的三枚图标。DESIGN.md 第 7 条允许"16px 线性 SVG(stroke currentColor)":
+     比 CSS 图形更可控(圆角端点、光学重心),也不受各平台字形影响。抽成片段三处共用。 -->
+{#snippet icoPause()}
+  <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+    <path d="M6 3.5v9M10 3.5v9" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+  </svg>
+{/snippet}
+{#snippet icoPlay()}
+  <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+    <path
+      d="M5.5 3.6v8.8a.6.6 0 0 0 .92.5l7-4.4a.6.6 0 0 0 0-1l-7-4.4a.6.6 0 0 0-.92.5z"
+      fill="currentColor"
+    />
+  </svg>
+{/snippet}
+{#snippet icoStop()}
+  <!-- 实心圆角方块而非描边:描边方块读起来像"录制"按钮,实心才是停止 -->
+  <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+    <rect x="4.25" y="4.25" width="7.5" height="7.5" rx="2" fill="currentColor" />
+  </svg>
+{/snippet}
+
 <div class="container">
   <!-- 头部整体吸顶(标题/下载卡/控制条/状态行/说话人条):录制中转写自动滚到最新,
        操作与说话人对照都不能跟着滚出视口 -->
@@ -585,12 +624,16 @@
     {#if !models || models.recording_ready}
       <!-- 两端对齐:控制钮组贴左、计时+状态贴右、实时波形限宽居中(space-between 把
            富余横向空间分到两侧间隙,波形不再 flex:1 拉满整屏成一根横贯全宽的细带)。 -->
-      <div class="controls" class:paused={recording.paused}>
-        <!-- 左:控制钮组 -->
+      <!-- 录制 transport 条:左图标钮组 / 计时英雄位 / 全宽波形 / 右源指示灯。
+           上 surface 底 + 发丝线读成一块整体(此前裸浮在画布上,几个元素各自为政);
+           发丝线分隔把三簇分开,靠间距对齐而非边框盒。 -->
+      <div class="controls" class:paused={recording.paused} class:live={recording.isLive}>
+        <!-- 左:控制钮。空闲态是主 CTA 药丸(DESIGN.md 第 3 条),录制中转成圆形图标钮
+             ——录制中的两个动作高频且语义强(暂停/停止),图标比文字按钮更省横向、更耐看。 -->
         <div class="ctl-group">
           {#if recording.stopping}
-            <button class="ctl danger" disabled>
-              <span class="sym square"></span>{t("record.btn.stopping")}
+            <button class="iconbtn rec" disabled aria-label={t("record.btn.stopping")} title={t("record.btn.stopping")}>
+              {@render icoStop()}
             </button>
           {:else if !recording.isLive}
             <button class="ctl primary" disabled={recording.pending} onclick={startRecording}>
@@ -598,18 +641,26 @@
             </button>
           {:else}
             {#if recording.paused}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.unpause()}>
-                <span class="sym play"></span>{t("record.btn.resume")}
-              </button>
+              <button
+                class="iconbtn"
+                disabled={recording.pending}
+                onclick={() => recording.unpause()}
+                aria-label={t("record.btn.resume")}
+                title={t("record.btn.resume")}
+              >{@render icoPlay()}</button>
             {:else}
-              <button class="ctl" disabled={recording.pending} onclick={() => recording.pause()}>
-                <span class="sym pause"></span>{t("record.btn.pause")}
-              </button>
+              <button
+                class="iconbtn"
+                disabled={recording.pending}
+                onclick={() => recording.pause()}
+                aria-label={t("record.btn.pause")}
+                title={t("record.btn.pause")}
+              >{@render icoPause()}</button>
             {/if}
             {#if confirmStop}
-              <!-- 紧凑确认胶囊(冒烟反馈:问句+两个全尺寸按钮太拥挤):胶囊底色即警示
-                   语义,只留两个 link 型小按钮,与相邻 .ctl 同高不跳版。 -->
+              <!-- 确认胶囊就地替换停止钮(不额外插一行):胶囊底色即警示语义,两个 link 型小按钮。 -->
               <span class="stop-confirm">
+                <span class="q">{t("record.btn.stopConfirmQ")}</span>
                 <!-- pending(暂停/恢复在途)时禁用(Codex P2):此时 stop() 的幂等守卫会
                      静默返回,若仍关胶囊,用户会误以为已停止。禁用到 pending 落定再点。 -->
                 <button
@@ -623,17 +674,30 @@
                 <button class="link" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
               </span>
             {:else}
-              <button class="ctl danger" disabled={recording.pending} onclick={() => (confirmStop = true)}>
-                <span class="sym square"></span>{t("record.btn.stop")}
-              </button>
+              <button
+                class="iconbtn rec"
+                disabled={recording.pending}
+                onclick={() => (confirmStop = true)}
+                aria-label={t("record.btn.stop")}
+                title={t("record.btn.stop")}
+              >{@render icoStop()}</button>
             {/if}
           {/if}
         </div>
 
-        <!-- 中:实时音轨(录制中才有),限宽居中,滚动电平波形,新声从右缘进入。
-             只画 mic 一条(冒烟反馈:双行太吵);系统声是否在收音由右侧「对方」
-             指示灯回答——有电平点亮 mint 色,静默退灰。 -->
         {#if recording.isLive}
+          <span class="sep"></span>
+          <!-- 计时英雄位:一场录音里最该一眼看到的就是"已经录了多久"。此前是 1rem 的
+               ink-secondary 小字挤在最右缘,与状态标签抢注意力;现在等宽大字 + 呼吸红点,
+               状态字(已暂停/停止中/出错)作为后缀跟在同一簇里,不再单开一个标签。 -->
+          <span class="clock">
+            <span class="recdot" class:breathe={!recording.paused && !recording.stopping}></span>
+            <span class="t" class:warn={recording.paused}>{formatTs(recording.elapsedMs)}</span>
+            {#if clockNote}<span class="lbl" class:danger={isError(recording.status)}>{clockNote}</span>{/if}
+          </span>
+          <span class="sep"></span>
+
+          <!-- 波形:只画 mic 一条(冒烟反馈:双轨两行太吵),取值与整形见 lib/liveWave.ts -->
           <div
             class="wave-live"
             class:frozen={recording.paused}
@@ -647,23 +711,17 @@
                 style="height: {b.height}px; opacity: {b.opacity}"
               ></span>{/each}
           </div>
-          <!-- 「对方」指示灯改「点 + 字」,与右侧「录制中」状态点同一套语汇;
-               此前是描边小方盒,0.68rem 字挤在 1px 边框里,近看糙、远看认不出。 -->
-          <span class="sys-ind" class:on={sysHold > 0} title={t("record.systemLevel")}>
-            <span class="sys-dot"></span>{t("record.badge.them")}
-          </span>
-        {/if}
 
-        <!-- 右:计时 + 状态,同一簇(不再单挂一行);状态点是唯一动态信号。
-             仅录制中出现——空闲态只需左侧「开始录制」CTA,不让一个「就绪」标签
-             孤浮右缘重演失衡;空闲若开录失败,错误仍由下方红色详情行兜底。 -->
-        {#if recording.isLive}
-          <div class="live-meta">
-            <span class="timer" class:pausedTimer={recording.paused}>{formatTs(recording.elapsedMs)}</span>
-            <span class="status-inline" class:pausedTag={recording.paused}>
-              <span class="status-dot" class:live={!recording.paused}></span>{statusLabel}
+          <!-- 两个源指示灯成对出现:成对才自解释("这是两路收音"),单挂一个「对方」
+               谁也说不清指什么。有电平点亮(我=录制红 / 对方=mint),静默退灰。 -->
+          <span class="srcs">
+            <span class="s mic" class:on={micHold > 0} title={t("record.micLevel")}>
+              <span class="d"></span>{t("record.badge.me")}
             </span>
-          </div>
+            <span class="s" class:on={sysHold > 0} title={t("record.systemLevel")}>
+              <span class="d"></span>{t("record.badge.them")}
+            </span>
+          </span>
         {/if}
       </div>
 
@@ -969,36 +1027,156 @@
   .controls.paused {
     background: var(--warning-tint);
   }
+
+  /* 录制中把控制条读成一块 transport 卡:surface 底 + 发丝线(DESIGN.md 第 2/5 条,
+     层级靠表面阶梯与发丝线而非投影)。空闲态不上底——那时条里只有一个 CTA,加底反而像个空盒。 */
+  .controls.live {
+    background: var(--surface);
+    border-color: var(--hairline);
+  }
+  /* 簇间发丝线分隔:控制钮 | 计时 | 波形。比纯间距更能说明"这是三组不同的东西"。 */
+  .sep {
+    width: 1px;
+    height: 22px;
+    background: var(--hairline);
+    flex: none;
+  }
+  /* 圆形图标钮:34px 命中区(≥Apple HIG 的紧凑下限),1px 描边立形状,悬停上一级表面。
+     停止钮走 record 红描边+红图标:它是破坏性动作,但仍属"录制语义"而非 danger 确认。 */
+  .iconbtn {
+    width: 34px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--hairline-strong);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  }
+  .iconbtn:hover:not(:disabled) {
+    background: var(--surface-soft);
+  }
+  .iconbtn:active:not(:disabled) {
+    background: var(--surface-press);
+  }
+  .iconbtn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .iconbtn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .iconbtn.rec {
+    color: var(--record);
+    border-color: color-mix(in srgb, var(--record) 40%, transparent);
+  }
+  .iconbtn.rec:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--record) 12%, transparent);
+  }
+  /* 计时英雄位:一场录音最该一眼看到的是"录了多久"。等宽数字 + 紧字距,
+     红点呼吸(录制中)/静止(暂停·停止中)。后缀只在非正常态出现。 */
+  .clock {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex: none;
+  }
+  .clock .t {
+    font-variant-numeric: tabular-nums;
+    font-size: 1.35rem;
+    font-weight: 500;
+    letter-spacing: -0.4px;
+    line-height: 1;
+    color: var(--ink);
+  }
+  .clock .t.warn {
+    color: var(--warning-ink);
+  }
+  .clock .lbl {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--warning-ink);
+  }
+  .clock .lbl.danger {
+    color: var(--danger);
+  }
+  .recdot {
+    width: 8px;
+    height: 8px;
+    flex: none;
+    border-radius: var(--radius-full);
+    background: var(--record);
+  }
+  .controls.paused .recdot {
+    background: var(--warning-ink);
+  }
+  .recdot.breathe {
+    animation: recbreathe 2.4s ease-in-out infinite;
+  }
+  @keyframes recbreathe {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .recdot.breathe {
+      animation: none;
+    }
+  }
+  /* 两个源指示灯成对出现才自解释("这是两路收音");单挂一个「对方」谁也说不清指什么。
+     有电平点亮(我=录制红 / 对方=mint),静默退灰。 */
+  .srcs {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.7rem;
+    flex: none;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .srcs .s {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    transition: color 200ms;
+  }
+  .srcs .d {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--hairline-strong);
+    transition: background 200ms;
+  }
+  .srcs .s.on {
+    color: var(--tint-mint-ink);
+  }
+  .srcs .s.on .d {
+    background: var(--tint-mint-ink);
+  }
+  .srcs .s.mic.on {
+    color: var(--record);
+  }
+  .srcs .s.mic.on .d {
+    background: var(--record);
+  }
   .ctl-group {
     display: flex;
     align-items: center;
     gap: 0.75rem;
     flex: none;
   }
-  /* 右簇:计时 + 状态标签同一组 */
-  .live-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex: none;
-  }
-  /* 状态短标签(并进右簇):caption 级次要信息,状态点是唯一动态信号;出错转 danger */
-  .status-inline {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4em;
-    color: var(--ink-faint);
-    font-size: 0.85rem;
-    white-space: nowrap;
-  }
-  /* 暂停时状态标签升格：不再是小灰字，warning 墨色 + 加粗，与整条变调呼应 */
-  .status-inline.pausedTag {
-    color: var(--warning-ink);
-    font-weight: 600;
-  }
-  /* 录制控制条：裸 .ctl 是 button-secondary（暂停/恢复）；.primary 是开始录制的
-     唯一主动作；.danger（停止）形态同 secondary，只是字色换 record，呼应
-     “录制红点是唯一常驻彩色信号”。 */
+  /* 空闲态只剩一个主动作「开始录制」,走 primary 药丸(DESIGN.md 第 3 条 Raycast 签名);
+     录制中的暂停/停止改成圆形图标钮(见 .iconbtn),不再用文字按钮占横向。 */
   /* button-secondary 形态：暗色第一公民下 canvas 底=页面底(#07080a 同色)，
      无边+shadow-btn 会让按钮完全隐形；shadow-btn 是主按钮药丸专用高光，这里
      改用 transparent + hairline-strong 描边，靠轮廓立住形状 */
@@ -1020,7 +1198,6 @@
   /* 主停止按钮走 primary 药丸，不需要 secondary 的 hairline 描边 */
   .ctl.primary { background: var(--primary); color: var(--on-primary); border-radius: var(--radius-full); border-color: transparent; }
   .ctl.primary:hover { background: var(--primary-pressed); }
-  .ctl.danger { color: var(--record); font-weight: 500; }
   /* 录制符号用 CSS 图形而非 Unicode 字符(●■▶ 各平台字形/基线不一,显糙) */
   .sym {
     width: 9px;
@@ -1030,21 +1207,7 @@
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
   .sym.dot.on-blue { background: var(--on-primary); }
   /* 方块 8px:9px 的实心方块在 0.9rem 文字旁偏重,压过并排的文字 */
-  .sym.square { width: 8px; height: 8px; border-radius: 2px; background: var(--record); }
   /* 竖条收到 2px:3px 在这个字号旁显糙(视觉上像两根短粗棍而不是暂停符) */
-  .sym.pause {
-    width: 7px;
-    height: 10px;
-    border-left: 2px solid currentColor;
-    border-right: 2px solid currentColor;
-  }
-  .sym.play {
-    width: 0;
-    height: 0;
-    border-left: 9px solid currentColor;
-    border-top: 5px solid transparent;
-    border-bottom: 5px solid transparent;
-  }
   /* 停止二段确认胶囊：#84 同款 warning-tint 行内胶囊，120ms 淡入，不引起行高跳动
      （padding/字号/行高与常态 .ctl-group 一致，只是行内多出一段文案+两枚按钮）。 */
   .stop-confirm {
@@ -1060,6 +1223,9 @@
   }
   /* 胶囊内 link 型小按钮(照笔记页 confirm-capsule 惯例):无底无框,danger 承载
      破坏性着色——胶囊自身即警示语境,不再堆叠全尺寸按钮。 */
+  .stop-confirm .q {
+    font-weight: 500;
+  }
   .stop-confirm .link {
     background: none;
     border: none;
@@ -1079,14 +1245,6 @@
   @media (prefers-reduced-motion: reduce) {
     .stop-confirm { animation: none; }
   }
-  /* 计时用等宽数字：秒数跳动时数字宽度不抖动，视觉更稳定 */
-  .timer {
-    font-variant-numeric: tabular-nums;
-    font-weight: 500;
-    font-size: 1rem;
-    color: var(--ink-secondary);
-  }
-  .timer.pausedTimer { color: var(--ink-faint); }
   /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
      record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
      只画 mic 一条(冒烟反馈:双行太吵),flex:1 吃满控制条与右侧计时之间的整行。 */
@@ -1122,33 +1280,6 @@
   }
   /* 「对方」指示灯:系统声在收音时点亮(mint,同 .badge.system 配色令牌),静默退灰。
      常驻占位不闪现,回答"对方声音有没有在录"而不额外占一行波形。 */
-  /* 点 + 字,与右侧「录制中」同语汇;不再是描边小方盒(0.68rem 字挤在 1px 边框里显糙)。
-     收音时点亮 mint,静默退灰——回答"对方声音有没有在录",不额外占一行波形。 */
-  .sys-ind {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35em;
-    font-size: 0.8rem;
-    font-weight: 500;
-    line-height: 1;
-    white-space: nowrap;
-    color: var(--ink-faint);
-    transition: color 200ms;
-  }
-  .sys-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: var(--radius-full);
-    background: var(--hairline-strong);
-    transition: background 200ms;
-  }
-  .sys-ind.on {
-    color: var(--tint-mint-ink);
-  }
-  .sys-ind.on .sys-dot {
-    background: var(--tint-mint-ink);
-  }
   /* 条:定宽 2px、节距 4px(gap 2px),根数由容器宽度定(见 barCountFor)——
      此前是 flex:1 把 240 根拉满任意宽度,在宽屏上被抻成一排 4~5px 的破折号。 */
   .wave-live .bar {
@@ -1252,17 +1383,6 @@
     height: 7px;
     border-radius: var(--radius-full);
     background: var(--ink-faint);
-  }
-  .status-dot.live {
-    background: var(--record);
-    animation: breathe 1.6s ease-in-out infinite;
-  }
-  @keyframes breathe {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.35; }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .status-dot.live { animation: none; }
   }
 
   .status.error {
