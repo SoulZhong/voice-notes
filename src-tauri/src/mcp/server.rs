@@ -283,6 +283,10 @@ struct RetranscribeParams {
     note_id: String,
     /// 音频来源:"dual"(双轨,默认)| "mixed"(成品轨)
     input: Option<String>,
+    /// 强制这一次使用的本地识别引擎:"firered" | "sense_voice" | "paraformer" |
+    /// "whisper" | "qwen3"。缺省按应用设置决策。用途:某些段被默认引擎解成一两个字
+    /// (实测 14.6 秒只出一个句号)时换更强的引擎救回来,而不改用户的默认选择。
+    engine: Option<String>,
 }
 
 /// UDS 桥的阻塞 IO 包一层 spawn_blocking,避免占用 tokio 工作线程。
@@ -464,13 +468,17 @@ impl VnMcp {
     }
 
     #[tool(
-        description = "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份 segments.orig.jsonl,说话人尽量保留)。异步启动即返回,用 retranscribe_status 轮询进度;同一时刻全局只跑一个任务。需要应用运行 + 用户开启「允许 AI 控制录制」。"
+        description = "对一篇已完成的笔记发起文件重转写:离线重读盘上音轨重新跑 ASR,覆盖原始逐字稿(自动备份 segments.orig.jsonl,说话人尽量保留)。可用 engine 指定这一次的识别引擎(不改应用默认)。异步启动即返回,用 retranscribe_status 轮询进度;同一时刻全局只跑一个任务。需要应用运行 + 用户开启「允许 AI 控制录制」。"
     )]
     async fn retranscribe_note(
         &self,
         Parameters(p): Parameters<RetranscribeParams>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(bridge_call("retranscribe", serde_json::json!({ "note_id": p.note_id, "input": p.input })).await)
+        Ok(bridge_call(
+            "retranscribe",
+            serde_json::json!({ "note_id": p.note_id, "input": p.input, "engine": p.engine }),
+        )
+        .await)
     }
 
     #[tool(description = "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。需要应用运行。")]
