@@ -52,10 +52,21 @@ export const LOW_DENSITY_HINT_MIN_COUNT = 3;
 
 export function shouldOfferBetterEngine(
   stat: LowDensityStat,
-  opts: { currentEngine: string; betterEngineReady: boolean },
+  opts: {
+    /** **这篇**当初实际用的引擎(note.meta.asr_engine);老笔记没记就传 undefined。 */
+    noteEngine: string | undefined;
+    /** FireRed 与重转写所需的其它模型(VAD)都在本地。 */
+    ready: boolean;
+    /** 现在能不能开始一次重转写(没在录制/精修/已有重转写在跑,且本篇已完成)。 */
+    actionable: boolean;
+  },
 ): boolean {
   if (stat.count < LOW_DENSITY_HINT_MIN_COUNT) return false;
-  // 已经在用更强的引擎了就没得换,提了也只是添堵。
-  if (opts.currentEngine === "firered") return false;
-  return opts.betterEngineReady;
+  // 判据必须看**这篇当初用的**引擎,不是当前全局设置(Codex P2):设置改过之后,
+  // sense_voice 转出来的老笔记会莫名其妙不再提示,而 FireRed 转的笔记反被建议
+  // "换 FireRed"。老笔记没记引擎(字段是后加的)时按"值得一试"处理。
+  if (opts.noteEngine === "firered") return false;
+  // 云端转的场次不在此列:那是另一套质量问题,换本地引擎不构成"更强"。
+  if (opts.noteEngine?.startsWith("cloud:")) return false;
+  return opts.ready && opts.actionable;
 }

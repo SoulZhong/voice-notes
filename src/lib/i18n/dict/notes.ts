@@ -47,9 +47,9 @@ export const zh = {
   "notes.banner.llmPartial": "部分段落 AI 处理失败，已保留原文，可重新执行。",
   "notes.banner.llmFailed": "在线 AI 处理失败，当前展示本地处理结果。",
   "notes.banner.lowDensity": "这场有 {n} 段说了好几秒却几乎没转出字(共 {s} 秒)——音频是好的,是识别没跟上。",
-  "notes.banner.lowDensityFix": "换用 FireRed 引擎重转写",
-  "notes.banner.lowDensitySwitching": "正在切换…",
-  "notes.banner.lowDensityHint": "FireRed 更准但更慢(实测同段能解出连贯内容);切换后新录制也会用它,可在设置里改回。",
+  "notes.banner.lowDensityFix": "用 FireRed 重转写本篇",
+  "notes.banner.lowDensitySwitching": "正在发起…",
+  "notes.banner.lowDensityHint": "FireRed 更准但更慢(实测同段能解出连贯内容)。只重转写本篇,不改默认引擎;想让以后录制也用它,去设置里改。",
   "notes.banner.aiUnconfigured": "这场没有做 AI 整理（没有主题标题与精修稿）。会后 AI 的执行体目前还没配置完成。",
   "notes.banner.aiConfigure": "去配置",
   "notes.banner.aiNotRun": "这场没有做 AI 整理（没有主题标题与精修稿）。",
@@ -178,10 +178,10 @@ export const en = {
   "notes.banner.llmFailed": "Online AI processing failed; showing local results.",
   "notes.banner.lowDensity":
     "{n} segments here ran for seconds but produced almost no text ({s}s total) — the audio is fine; recognition failed.",
-  "notes.banner.lowDensityFix": "Re-transcribe with FireRed",
-  "notes.banner.lowDensitySwitching": "Switching\u2026",
+  "notes.banner.lowDensityFix": "Re-transcribe this note with FireRed",
+  "notes.banner.lowDensitySwitching": "Starting\u2026",
   "notes.banner.lowDensityHint":
-    "FireRed is more accurate but slower (measured: it decodes these same spans into coherent text). New recordings will use it too; you can switch back in Settings.",
+    "FireRed is more accurate but slower (measured: it decodes these same spans into coherent text). This re-transcribes only this note and does not change your default engine \u2014 change that in Settings if you want it for new recordings.",
   "notes.banner.aiUnconfigured":
     "No AI processing for this meeting (no topic title, no refined draft). The post-meeting AI executor is not fully configured yet.",
   "notes.banner.aiConfigure": "Configure",

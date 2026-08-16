@@ -56,7 +56,7 @@
   import { t } from "$lib/i18n/index.svelte";
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
-  import { getSettings, setSettings, modelsStatus } from "$lib/models";
+  import { getSettings, modelsStatus } from "$lib/models";
   import { refineReady } from "$lib/refineReady";
   import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
@@ -157,9 +157,8 @@
   const REFINE_RECHECK_MS = 3000;
   /** 当前识别引擎与「更强引擎是否已下载」:决定要不要提示"这场疑似识别失败,换引擎重转写"
       (判据与由来见 $lib/lowDensity)。挂载取一次;换引擎会重转写,届时整页重来。 */
-  let asrEngine = $state("");
-  let fireredReady = $state(false);
-  let switchingEngine = $state(false);
+  let repairReady = $state(false);
+  let repairing = $state(false);
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -1110,12 +1109,14 @@
       playbackScheme = defaultPlayback;
       refineOn = s.refine_enabled;
       refineConfigured = refineReady(s);
-      asrEngine = s.asr_model;
     })
     .catch(() => {});
+  // 重转写要的不止 FireRed:双轨重转写还要用 Silero 切段,少一个都跑不起来
+  // (设置页允许单独删任一件,Codex P2)。
   void modelsStatus()
     .then((m) => {
-      fireredReady = m.artifacts.some((a) => a.id === "firered" && a.present);
+      const have = (id: string) => m.artifacts.some((a) => a.id === id && a.present);
+      repairReady = have("firered") && have("vad");
     })
     .catch(() => {});
 
@@ -1123,28 +1124,26 @@
       连贯中文),所以这不是噪声而是内容丢失——看得见才修得了。 */
   const lowDensity = $derived(lowDensityStat(note?.segments ?? []));
   const offerBetterEngine = $derived(
-    note?.meta.state === "complete" &&
-      !retranscribing &&
-      shouldOfferBetterEngine(lowDensity, {
-        currentEngine: asrEngine,
-        betterEngineReady: fireredReady,
-      }),
+    shouldOfferBetterEngine(lowDensity, {
+      noteEngine: note?.meta.asr_engine ?? undefined,
+      ready: repairReady,
+      // 门禁与页面上那个重转写按钮完全一致:录制中/精修中/已有重转写在跑/本篇未完成
+      // 时后端都会拒,提供一个必被拒的按钮只是骗点击(Codex P2)。
+      actionable:
+        !retranscribing && !refining && !recording.isLive && note?.meta.state === "complete",
+    }),
   );
 
-  /** 换用 FireRed 并立刻重转写本篇。引擎设置是全局的——这一点必须在按钮文案里说清楚,
-      不能偷偷改:用户接受的是"以后也用它",而不只是这一次。 */
-  async function switchToFireredAndRetranscribe() {
-    if (switchingEngine) return;
-    switchingEngine = true;
+  /** 用 FireRed 重转写本篇。**只作用于这一次**,不动全局设置(Codex P1):改设置既
+      不保证这次生效(云端模式下重转写会走云端批式),又会清缓存并异步预载,与紧接着
+      启动的重转写各建一份 1.2G 模型。想让以后录制也用它,去设置里改。 */
+  async function repairWithFirered() {
+    if (repairing) return;
+    repairing = true;
     try {
-      const fresh = await getSettings();
-      await setSettings({ ...fresh, asr_model: "firered" });
-      asrEngine = "firered";
-      await startRetranscribe("dual");
-    } catch (e) {
-      retransErr = t("notes.retrans.failed", { e });
+      await startRetranscribe("dual", "firered");
     } finally {
-      switchingEngine = false;
+      repairing = false;
     }
   }
 
@@ -1568,12 +1567,12 @@
       一次)。复用既有的 retransEventSeen 旗:invoke 前先清旗,invoke 成功后只有
       "还没见过任何事件"才自己置 running 态——running 事件与终态事件都已到过,
       说明事件通道已经接管了 retranscribing 的真相,以事件状态为准。 */
-  async function startRetranscribe(input: "dual" | "mixed") {
+  async function startRetranscribe(input: "dual" | "mixed", engine?: string) {
     retransConfirm = false;
     retransErr = "";
     retransEventSeen = false;
     try {
-      await retranscribeNote(id, input);
+      await retranscribeNote(id, input, engine);
       if (!retransEventSeen) {
         retranscribing = true;
         retransStage = "decode";
@@ -1922,8 +1921,8 @@
     {#if offerBetterEngine}
       <div class="banner">
         {t("notes.banner.lowDensity", { n: lowDensity.count, s: lowDensity.seconds })}
-        <button class="link" disabled={switchingEngine} onclick={switchToFireredAndRetranscribe}>
-          {switchingEngine ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix")}
+        <button class="link" disabled={repairing} onclick={repairWithFirered}>
+          {repairing ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix")}
         </button>
         <span class="hint">{t("notes.banner.lowDensityHint")}</span>
       </div>

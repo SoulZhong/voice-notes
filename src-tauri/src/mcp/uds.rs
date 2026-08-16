@@ -310,7 +310,7 @@ impl UdsBackend for AppBackend<'_> {
     }
 
     fn retranscribe(&self, note_id: &str, input: &str) -> Result<serde_json::Value, String> {
-        crate::do_retranscribe(self.0, note_id, input)?;
+        crate::do_retranscribe(self.0, note_id, input, None)?;
         Ok(serde_json::json!({ "started": true, "note_id": note_id, "input": input }))
     }
 

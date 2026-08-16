@@ -45,25 +45,34 @@ describe("疑似识别失败段", () => {
 });
 
 describe("要不要建议换引擎", () => {
-  const ready = { currentEngine: "sense_voice", betterEngineReady: true };
+  const base = { noteEngine: "sense_voice", ready: true, actionable: true };
+  const many = { count: 9, seconds: 90 };
 
-  it("过线且模型在本地:建议", () => {
-    expect(shouldOfferBetterEngine({ count: LOW_DENSITY_HINT_MIN_COUNT, seconds: 20 }, ready)).toBe(true);
+  it("过线、模型在本地、此刻能跑:建议", () => {
+    expect(shouldOfferBetterEngine({ count: LOW_DENSITY_HINT_MIN_COUNT, seconds: 20 }, base)).toBe(true);
   });
 
   it("零星一两段不打扰", () => {
-    expect(shouldOfferBetterEngine({ count: 2, seconds: 8 }, ready)).toBe(false);
+    expect(shouldOfferBetterEngine({ count: 2, seconds: 8 }, base)).toBe(false);
   });
 
-  it("已经在用 FireRed 就没得换", () => {
-    expect(
-      shouldOfferBetterEngine({ count: 9, seconds: 90 }, { ...ready, currentEngine: "firered" }),
-    ).toBe(false);
+  it("这篇本来就是 FireRed 转的就没得换", () => {
+    expect(shouldOfferBetterEngine(many, { ...base, noteEngine: "firered" })).toBe(false);
+  });
+
+  it("云端转的场次不在此列", () => {
+    expect(shouldOfferBetterEngine(many, { ...base, noteEngine: "cloud:volcano" })).toBe(false);
+  });
+
+  it("老笔记没记引擎:按值得一试处理", () => {
+    expect(shouldOfferBetterEngine(many, { ...base, noteEngine: undefined })).toBe(true);
   });
 
   it("模型没下载就不建议(点了也跑不起来)", () => {
-    expect(
-      shouldOfferBetterEngine({ count: 9, seconds: 90 }, { ...ready, betterEngineReady: false }),
-    ).toBe(false);
+    expect(shouldOfferBetterEngine(many, { ...base, ready: false })).toBe(false);
+  });
+
+  it("此刻不能跑(录制中/精修中/已有重转写)就不给可点的按钮", () => {
+    expect(shouldOfferBetterEngine(many, { ...base, actionable: false })).toBe(false);
   });
 });
