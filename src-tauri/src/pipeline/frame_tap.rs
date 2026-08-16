@@ -508,9 +508,9 @@ fn run_frame_tap_with_drift(
     loop {
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
-                // 本帧之前按硬件时戳判定的采集洞(HAL 侧丢失),转发真实帧前先补齐。
-                // 我们自己回调里丢掉的那部分不走这里——它在源头就被补零补进了下一帧
-                // (见 microphone.rs),位置与时长天然正确。
+                // 本帧之前按硬件时戳判定的采集洞,转发真实帧前先补齐。两类丢失都走这里:
+                // HAL 侧丢的,和我们自己回调 try_send 丢的——后者同样会在下一帧的时戳上
+                // 如实体现(采集回调不自己补零,理由见 microphone.rs 那段注释)。
                 let mut pending_hole = Duration::ZERO;
                 // Task 5:真实帧原始声明率下喂 DriftMonitor(必须在下方时钟核对
                 // 改写 sample_rate 之前——DLL 要的是设备原始声明率口径的样本计数

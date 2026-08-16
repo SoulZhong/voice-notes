@@ -13,8 +13,8 @@ pub struct Microphone {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
     /// 运行期流错误上报口(断连自愈消费);未接线时仅落日志,行为同引入前。
     events: Option<Sender<CaptureEvent>>,
-    /// 回调因下游积压丢弃的样本数(每声道,累计)。仅供停流时汇总日志——
-    /// 时间轴由回调自己补零保住(见 start 里的 pad_dropped)。
+    /// 回调因下游积压丢弃的样本数(每声道,累计)。仅供停流时汇总日志;
+    /// 时间轴的修补由 tap 按硬件时戳负责(见 frame_tap 的 holey 判定)。
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -88,15 +88,6 @@ impl AudioCapture for Microphone {
                             cap.duration_since(&a_inst).map(|d| a_ns + d.as_nanos() as u64)
                         }
                     };
-                    // 绝不阻塞:这是 CoreAudio 的实时回调线程,它一旦被下游背压顶住,
-                    // HAL 侧就开始整块丢音(2026-08-16 实测:一场 98 分钟录音丢了
-                    // 13.5 分钟,tap 被顶最长 1.198 秒)。宁可这一帧不要,也要立刻返回。
-                    //
-                    // 丢掉的那段在**这里**补零补进下一帧,而不是留给 tap 事后猜:
-                    // 位置天然正确(就在下一批数据之前),时长天然对齐(样本数与时戳
-                    // 走过的时间重新一致,对账不会被搅乱),也不需要任何跨线程的
-                    // 丢失元数据(Codex 六轮:计数器方案在 FIFO 里的位置全错,且生产
-                    // 装配隔着 ResilientCapture 根本读不到)。
                     let per_ch = data.len() / channels.max(1) as usize;
                     // 绝不阻塞:这是 CoreAudio 的实时回调线程,被下游背压顶住就等于让
                     // HAL 整块丢音(2026-08-16 实测:98 分钟录音丢了 13.5 分钟,tap 被顶
