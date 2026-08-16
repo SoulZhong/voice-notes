@@ -5,9 +5,8 @@ import type { Dict, Msg } from "../types";
 export const zh = {
   "record.title": "实时转写",
 
-  // 计时后缀:只在非正常态出条(正常录制由呼吸红点交代)。recording/stopped/ready 三条随
-  // 旧的右上状态标签一起删除——重排后没有常驻状态标签了,留着会让人以为还有地方在用。
-  "record.status.error": "出错",
+  // 计时后缀:只在非正常态出条(正常录制由呼吸红点交代)。error/recording/stopped/ready 随
+  // 旧的右上状态标签一起删除——出错有下方专门的红色详情行,不再走这里。
   "record.status.paused": "已暂停",
 
   // 控制钮
@@ -87,7 +86,6 @@ export const zh = {
 export const en = {
   "record.title": "Live Transcription",
 
-  "record.status.error": "Error",
   "record.status.paused": "Paused",
 
   "record.btn.stopping": "Stopping…",

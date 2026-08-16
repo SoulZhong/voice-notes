@@ -324,16 +324,11 @@
   }
   /** 状态机原值(idle/recording/paused/stopped/error:…)映射成右侧簇里的友好短标签;
       错误详情(可能很长)不塞这里,另在下方红色行完整展开。 */
-  /** 计时后缀:只在"非正常录制中"时出条,正常录制由呼吸红点交代,不再挂一个常驻标签。
-      出错也走这里(此前收在右侧状态标签里,重排后那个位置没了,不能把错误一起弄丢)。 */
+  /** 计时后缀:只在"非正常录制中"时出条,正常录制由呼吸红点交代,不再挂常驻标签。
+      不含出错:出错时 isLive/stopping 都是 false,整簇根本不挂载,错误由下方专门的
+      红色详情行(.status.error)承担——在这里写一条出错分支是永远走不到的死代码(Codex P2)。 */
   const clockNote = $derived(
-    isError(recording.status)
-      ? t("record.status.error")
-      : recording.stopping
-        ? t("record.btn.stopping")
-        : recording.paused
-          ? t("record.status.paused")
-          : "",
+    recording.stopping ? t("record.btn.stopping") : recording.paused ? t("record.status.paused") : "",
   );
 
   // 硬承诺双轨(拒录引导卡):Fix A 拆除路径把分类 token 塞进开录失败的错误串——
@@ -397,7 +392,14 @@
       micHold = 0;
       return;
     }
-    if (recording.paused) return; // 冻结:不采样,已有波形保留
+    if (recording.paused) {
+      // 冻结:不采样,已有波形保留(那是历史,该留着)。但两个活跃指示灯必须灭——
+      // 它们表达的是"此刻正在收音",暂停前最后一格保持会让「我」在整个暂停期间红着,
+      // 谎报仍在收音(Codex P2)。
+      micHold = 0;
+      sysHold = 0;
+      return;
+    }
     // 包络的运行值随本轮采样重新起算(Codex P2):它不能跨暂停沿用。暂停前最后一帧若很响,
     // 恢复后会凭空续出半秒多的红色衰减条——而那段时间根本没有声音进来。
     // 注意与 liveBarsMic 的区别:已画出的历史要保留(冻结显示),重置的只是这个运行值。
@@ -683,7 +685,7 @@
           <span class="clock">
             <span class="recdot" class:breathe={!recording.paused && !recording.stopping}></span>
             <span class="t" class:warn={recording.paused}>{formatTs(recording.elapsedMs)}</span>
-            {#if clockNote}<span class="lbl" class:danger={isError(recording.status)}>{clockNote}</span>{/if}
+            {#if clockNote}<span class="lbl">{clockNote}</span>{/if}
           </span>
         {/if}
 
@@ -1005,6 +1007,11 @@
   .controls {
     display: flex;
     align-items: center;
+    /* 允许折行(Codex P2):默认 800px 窗口减去侧栏只剩 ~450px,展开停止确认胶囊后
+       (英文文案更长)固定簇的总宽会超出,内容直接溢出视口。波形是 flex:1/min-width:0,
+       换行计算时按 0 参与,所以常态下永远是一行;只有真放不下时才折第二行。 */
+    flex-wrap: wrap;
+    row-gap: 0.4rem;
     gap: 0.75rem;
     margin: 0 0 1rem;
     padding: 0.5rem 0.75rem;
@@ -1100,9 +1107,6 @@
     font-size: 0.8rem;
     font-weight: 500;
     color: var(--warning-ink);
-  }
-  .clock .lbl.danger {
-    color: var(--danger);
   }
   .recdot {
     width: 8px;
