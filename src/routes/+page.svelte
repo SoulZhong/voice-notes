@@ -2,22 +2,16 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { listNotes } from "$lib/notes";
-  import { navVersion } from "$lib/navIntent";
   import { t } from "$lib/i18n/index.svelte";
 
   let empty = $state(false);
 
   onMount(async () => {
-    // 进入 await 前记下版本,回来时比对(Codex P2/P4)。
-    const v = navVersion();
     try {
       const notes = await listNotes();
-      // 落地重定向只在"我等 listNotes 这段时间里没人明确要去别处"时才做:这个 promise
-      // 在组件销毁后仍会跑完,不设防就会把人从设置页又踢回 /record(冷启动点托盘
-      // 「打开设置」正是如此)。
-      // 两道都要:版本比对挡住"已 goto 但 history 还没更新"的那一拍(goto 是异步的),
-      // pathname 挡住不经 navIntent 的其它导航(比如用户自己点侧栏)。
-      if (navVersion() !== v || window.location.pathname !== "/") return;
+      // 落地重定向只在"还停在根路由"时才做:listNotes 是异步的,这个 promise 在组件
+      // 销毁后仍会跑完,不设防就会把已经翻到别处的用户又踢回 /record。
+      if (window.location.pathname !== "/") return;
       if (notes.length > 0) {
         if (notes[0].state === "active") {
           goto("/record", { replaceState: true });
