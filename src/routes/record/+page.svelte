@@ -1172,11 +1172,16 @@
   .srcs .s.mic.on .d {
     background: var(--record);
   }
+  /* 钮组本身也要能折能缩(Codex P2):窗口可以被拖到比默认 800px 更窄,展开停止确认后
+     「胶囊 + 暂停钮」的固定宽会超过内容区,而 flex: none 的组既不换行也不收缩,
+     整组直接溢出视口。 */
   .ctl-group {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    flex: none;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    flex: 0 1 auto;
+    min-width: 0;
   }
   /* 空闲态只剩一个主动作「开始录制」,走 primary 药丸(DESIGN.md 第 3 条 Raycast 签名);
      录制中的暂停/停止改成圆形图标钮(见 .iconbtn),不再用文字按钮占横向。 */
@@ -1216,6 +1221,8 @@
   .stop-confirm {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 0.25rem;
     background: var(--warning-tint);
     border: 1px solid var(--warning-line);
