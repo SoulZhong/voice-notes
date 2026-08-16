@@ -761,18 +761,20 @@
     const forId = id;
     let unlisten: (() => void) | null = null;
     let disposed = false;
-    // 事件一到就以事件为准:补问的快照可能比终态事件还晚落地(后端先发 all/done、
-    // 再把 id 从在跑集合里摘掉),晚到的 true 会把页面永久钉在"整理中",此后
-    // 再没有事件来解除(Codex P2)。
-    let sawRefineEvent = false;
+    // 只有**终态**事件能作废补问的快照:补问可能比终态事件还晚落地(后端先发
+    // all/done、再把 id 从在跑集合里摘掉),晚到的 true 会把页面永久钉在"整理中"。
+    // 反过来,filter/recluster/llm 这些中间事件不能作废快照——它们都不置
+    // refining=true,执行体没配全时后面也不会再有 running 事件,作废了横幅就会在
+    // 整理还没结束时冒出来(Codex P2 两轮)。
+    let sawTerminal = false;
     onRefine((e) => {
       if (e.note_id !== forId) return;
-      sawRefineEvent = true;
       if (e.state === "running") {
         refining = true;
         refineRunFailed = false;
       }
       if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
+        sawTerminal = true;
         refining = false;
         refineRunFailed = e.state === "failed";
         getRefined(forId).then((r) => {
@@ -790,7 +792,7 @@
         return noteRefining(forId);
       })
       .then((r) => {
-        if (r && !disposed && !sawRefineEvent && forId === id) refining = true;
+        if (r && !disposed && !sawTerminal && forId === id) refining = true;
       })
       .catch(() => {});
     return () => {
