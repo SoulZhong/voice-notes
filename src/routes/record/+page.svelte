@@ -192,14 +192,6 @@
     wasLive = live;
   });
 
-  // 停止二段确认:悬停态胶囊仅在"这一场"有效——录制结束(isLive 翻 false，无论是
-  // 经这次确认停止、还是场次因错误/别处自行终止)都必须复位，否则下一场开录后
-  // 控制条会带着上一场遗留的确认胶囊出现。
-  let confirmStop = $state(false);
-  $effect(() => {
-    if (!recording.isLive) confirmStop = false;
-  });
-
   // ── 当场纠正:行内编辑文本 / 点行首徽章改派说话人 / 命名改名 ──────────────────
   // segment_edited 是唯一真值源(见 recording.svelte.ts 订阅),这里不做乐观更新——
   // 提交后只清本地的"正在编辑"标记,展示的文字/说话人等事件把 finals 改回来。
@@ -592,6 +584,12 @@
     />
   </svg>
 {/snippet}
+{#snippet icoSearch()}
+  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+    <circle cx="7.2" cy="7.2" r="4.3" fill="none" stroke="currentColor" stroke-width="1.6" />
+    <path d="M10.4 10.4 13.5 13.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+  </svg>
+{/snippet}
 {#snippet icoStop()}
   <!-- 实心圆角方块而非描边:描边方块读起来像"录制"按钮,实心才是停止 -->
   <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
@@ -614,10 +612,15 @@
     {#if !models || models.recording_ready}
       <!-- 两端对齐:控制钮组贴左、计时+状态贴右、实时波形限宽居中(space-between 把
            富余横向空间分到两侧间隙,波形不再 flex:1 拉满整屏成一根横贯全宽的细带)。 -->
+      <!-- 录制面板:transport 行 + 回看行同属一块(发丝线分隔)。此前搜索框是块孤零零浮在
+           画布上的描边输入框,与上面的卡片各说各话——并进同一块面板后,页面上就只剩
+           「标题 / 面板 / 转写」三段,不再有游离元素。
+           空转写页(未录且无定稿)不上底:那时面板里只有一个开始录制的 CTA,加底像个空盒。 -->
+      <div class="panel" class:card={recording.isLive || recording.finals.length > 0} class:paused={recording.paused}>
       <!-- 录制 transport 条:左图标钮组 / 计时英雄位 / 全宽波形 / 右源指示灯。
            上 surface 底 + 发丝线读成一块整体(此前裸浮在画布上,几个元素各自为政);
            发丝线分隔把三簇分开,靠间距对齐而非边框盒。 -->
-      <div class="controls" class:paused={recording.paused} class:live={recording.isLive}>
+      <div class="controls">
         <!-- 左:控制钮。空闲态是主 CTA 药丸(DESIGN.md 第 3 条),录制中转成圆形图标钮
              ——录制中的两个动作高频且语义强(暂停/停止),图标比文字按钮更省横向、更耐看。 -->
         <div class="ctl-group">
@@ -647,31 +650,15 @@
                 title={t("record.btn.pause")}
               >{@render icoPause()}</button>
             {/if}
-            {#if confirmStop}
-              <!-- 确认胶囊就地替换停止钮(不额外插一行):胶囊底色即警示语义,两个 link 型小按钮。 -->
-              <span class="stop-confirm">
-                <span class="q">{t("record.btn.stopConfirmQ")}</span>
-                <!-- pending(暂停/恢复在途)时禁用(Codex P2):此时 stop() 的幂等守卫会
-                     静默返回,若仍关胶囊,用户会误以为已停止。禁用到 pending 落定再点。 -->
-                <button
-                  class="link danger"
-                  disabled={recording.pending}
-                  onclick={() => {
-                    confirmStop = false;
-                    recording.stop().catch((err) => console.error("停止录制失败", err));
-                  }}
-                >{t("record.btn.stopConfirmYes")}</button>
-                <button class="link" onclick={() => (confirmStop = false)}>{t("record.btn.stopConfirmNo")}</button>
-              </span>
-            {:else}
-              <button
-                class="iconbtn rec"
-                disabled={recording.pending}
-                onclick={() => (confirmStop = true)}
-                aria-label={t("record.btn.stop")}
-                title={t("record.btn.stop")}
-              >{@render icoStop()}</button>
-            {/if}
+            <!-- 停止即停,不再二段确认(用户裁定):误点的代价有限——本场已转写的内容照常
+                 落盘成笔记,想接着录可以对同一篇「续录」;而每次停止都要点两下的摩擦是常态成本。 -->
+            <button
+              class="iconbtn rec"
+              disabled={recording.pending}
+              onclick={() => recording.stop().catch((err) => console.error("停止录制失败", err))}
+              aria-label={t("record.btn.stop")}
+              title={t("record.btn.stop")}
+            >{@render icoStop()}</button>
           {/if}
         </div>
 
@@ -723,15 +710,19 @@
            出现(录制中或已有定稿行)，空转写页不占位。 -->
       {#if recording.isLive || recording.finals.length > 0}
         <div class="review-bar">
-          <input
-            class="search"
-            placeholder={t("record.search.placeholder")}
-            bind:value={searchQuery}
-            onkeydown={(e) => {
-              if (e.key === "Enter") gotoHit(e.shiftKey ? -1 : 1);
-              if (e.key === "Escape") clearReview();
-            }}
-          />
+          <!-- 搜索改药丸 + 放大镜:此前是 hairline-strong 描边的方框输入,比同屏卡片的边还重,
+               孤零零一个显得突兀。药丸与图标钮/胶囊同一套圆角语言,聚焦时才亮 accent 边。 -->
+          <label class="search">
+            <span class="ico">{@render icoSearch()}</span>
+            <input
+              placeholder={t("record.search.placeholder")}
+              bind:value={searchQuery}
+              onkeydown={(e) => {
+                if (e.key === "Enter") gotoHit(e.shiftKey ? -1 : 1);
+                if (e.key === "Escape") clearReview();
+              }}
+            />
+          </label>
           {#if searchQuery.trim()}
             <span class="hit-count">
               {hits.length ? `${activeHitClamped + 1}/${hits.length}` : t("record.search.none")}
@@ -755,6 +746,7 @@
           {/if}
         </div>
       {/if}
+      </div>
 
       <!-- 出错时才展开完整错误文案(可能较长);正常态收进右侧「录制中/就绪」标签,不占行。
            System 分类错误(isSystemDenied/isSystemUnavailable)不重复展示这行原始
@@ -1013,33 +1005,27 @@
     flex-wrap: wrap;
     row-gap: 0.4rem;
     gap: 0.75rem;
-    margin: 0 0 1rem;
     padding: 0.5rem 0.75rem;
-    border: 1px solid transparent;
-    border-radius: var(--radius-lg);
     /* 几何量常驻，暂停只切颜色——零跳动（照 #84 胶囊纪律） */
   }
-  /* 暂停:整条控制条升格为 warning 基调，呼应"没在录"这一异常态——不再只靠
-     右侧小灰点交代，误以为还在录、白等一场的事故率最高的一刻。 */
-  /* 暂停:只上淡底不描边(冒烟反馈:边框盒+内部胶囊双重嵌套太重),醒目信号由
-     加重的「已暂停」状态字 + 计时变灰 + 波形冻结共同承担。 */
-  .controls.paused {
-    background: var(--warning-tint);
+  /* 面板:transport 行 + 回看行同属一块。底与描边挂在面板上(不再挂 .controls),
+     这样两行共享同一个圆角与边界,读成一个整体而不是"卡片 + 一个孤立输入框"。 */
+  .panel {
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    margin: 0 0 1rem;
   }
-
-  /* 录制中把控制条读成一块 transport 卡:surface 底 + 发丝线(DESIGN.md 第 2/5 条,
-     层级靠表面阶梯与发丝线而非投影)。空闲态不上底——那时条里只有一个 CTA,加底反而像个空盒。 */
-  .controls.live {
+  .panel.card {
     background: var(--surface);
     border-color: var(--hairline);
   }
-  /* 暂停底色必须压过上面的 live 底(Codex P2):暂停时两个类同时在身上,而 .controls.paused
-     写在前面、特异性又相同,后写的 live 会把 warning 底整块吃掉——暂停这个最该显眼的状态
-     反而变得和录制中一模一样。这里用 .live.paused 提高特异性显式盖回。 */
-  .controls.live.paused {
+  /* 暂停:整块面板升格为 warning 基调,呼应"没在录"这一异常态——误以为还在录、
+     白等一场是事故率最高的一刻。必须写在 .card 之后压过它的 surface 底。 */
+  .panel.card.paused {
     background: var(--warning-tint);
     border-color: transparent;
   }
+
   /* 簇间发丝线分隔:控制钮 | 计时 | 波形。比纯间距更能说明"这是三组不同的东西"。 */
   .sep {
     width: 1px;
@@ -1115,7 +1101,7 @@
     border-radius: var(--radius-full);
     background: var(--record);
   }
-  .controls.paused .recdot {
+  .panel.paused .recdot {
     background: var(--warning-ink);
   }
   .recdot.breathe {
@@ -1216,45 +1202,6 @@
   .sym.dot.on-blue { background: var(--on-primary); }
   /* 方块 8px:9px 的实心方块在 0.9rem 文字旁偏重,压过并排的文字 */
   /* 竖条收到 2px:3px 在这个字号旁显糙(视觉上像两根短粗棍而不是暂停符) */
-  /* 停止二段确认胶囊：#84 同款 warning-tint 行内胶囊，120ms 淡入，不引起行高跳动
-     （padding/字号/行高与常态 .ctl-group 一致，只是行内多出一段文案+两枚按钮）。 */
-  .stop-confirm {
-    display: inline-flex;
-    align-items: center;
-    flex-wrap: wrap;
-    min-width: 0;
-    gap: 0.25rem;
-    background: var(--warning-tint);
-    border: 1px solid var(--warning-line);
-    color: var(--warning-ink);
-    border-radius: var(--radius-full);
-    padding: 0.15rem 0.5rem;
-    animation: fadein 120ms ease-out;
-  }
-  /* 胶囊内 link 型小按钮(照笔记页 confirm-capsule 惯例):无底无框,danger 承载
-     破坏性着色——胶囊自身即警示语境,不再堆叠全尺寸按钮。 */
-  .stop-confirm .q {
-    font-weight: 500;
-  }
-  .stop-confirm .link {
-    background: none;
-    border: none;
-    cursor: pointer;
-    font: inherit;
-    font-weight: 500;
-    color: var(--ink-secondary);
-    padding: 0.15em 0.4em;
-    border-radius: var(--radius-md);
-  }
-  .stop-confirm .link:hover { background: var(--surface-press); }
-  .stop-confirm .link.danger { color: var(--danger); }
-  @keyframes fadein {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .stop-confirm { animation: none; }
-  }
   /* 实时音轨:滚动电平条,新条从右缘进入(justify-content:flex-end + overflow 裁左侧)。
      record 红呼应"录制中"是唯一常驻彩色信号;暂停冻结退 ink-faint。
      只画 mic 一条(冒烟反馈:双行太吵),flex:1 吃满控制条与右侧计时之间的整行。 */
@@ -1316,22 +1263,50 @@
   }
 
   /* 回看工具条:页内搜索 + 说话人过滤 chips，紧贴 controls 下方。 */
+  /* 回看行:面板的第二行,用发丝线与 transport 行分隔(第 5 条:发丝线代替阴影)。
+     面板没上底时(空转写页)这条线也不出——那时它根本不渲染。 */
   .review-bar {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
-    margin-top: 0.4rem;
+    padding: 0.45rem 0.75rem;
   }
+  .panel.card .review-bar {
+    border-top: 1px solid var(--hairline);
+  }
+  /* 搜索药丸:与图标钮同一套圆角语言。此前是 hairline-strong 描边的方框,比同屏卡片的
+     边还重,孤零零一个尤其突兀;现在默认无边、只靠 surface-soft 的底立形状,聚焦才亮 accent。 */
   .review-bar .search {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     min-width: 12rem;
     max-width: 16rem; /* 冒烟反馈:全宽搜索框喧宾夺主,收窄成工具位 */
+    background: var(--surface-soft);
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    padding: 0.3rem 0.7rem;
+    color: var(--ink-faint);
+  }
+  .review-bar .search .ico {
+    display: inline-flex;
+    flex: none;
+  }
+  .review-bar .search input {
+    all: unset;
+    flex: 1;
+    min-width: 0;
     font: inherit;
+    font-size: 0.86rem;
     color: var(--ink);
-    background: var(--surface);
-    border: 1px solid var(--hairline-strong);
-    border-radius: var(--radius-md);
-    padding: 0.35em 0.6em;
+  }
+  .review-bar .search input::placeholder {
+    color: var(--ink-faint);
+  }
+  .review-bar .search:focus-within {
+    border-color: var(--accent);
+    color: var(--ink-secondary);
   }
   .review-bar .hit-count {
     font-size: 0.82rem;
