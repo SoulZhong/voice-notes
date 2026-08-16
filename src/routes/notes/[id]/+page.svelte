@@ -1136,7 +1136,13 @@
       // 门禁与页面上那个重转写按钮完全一致:录制中/精修中/已有重转写在跑/本篇未完成
       // 时后端都会拒,提供一个必被拒的按钮只是骗点击(Codex P2)。
       actionable:
-        !retranscribing && !refining && !recording.isLive && note?.meta.state === "complete",
+        !retranscribing &&
+        !refining &&
+        !recording.isLive &&
+        note?.meta.state === "complete" &&
+        // 音频被留存策略清掉的老笔记只剩文字:重转写没有源可读,点了必然失败
+        // (Codex P2)。tracks 为空即"盘上没音频"。
+        tracks.length > 0,
     }),
   );
 

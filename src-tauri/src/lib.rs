@@ -2753,11 +2753,16 @@ fn run_retranscribe_once(
     let s = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
     // 显式指定引擎时一律走本地那一支:调用方要的就是"用这个引擎再解一遍",
     // 云端二遍会把这个意图吃掉(Codex P1)。
+    // 云端识别器没有 engine_id(trait 默认值是 "unknown"),身份得从建它时用的那份
+    // 设置快照里取,写成与实时链路同款的 "cloud:厂商"(Codex P2)。写错了这篇就不再
+    // 被认成"云端转的",反而会被建议换 FireRed。
+    let mut cloud_id: Option<String> = None;
     let mut recognizer: Box<dyn asr::Recognizer> = if let Some(e) = engine.as_deref() {
         new_recognizer(e, current_asr_provider(app), qwen3_hotwords(app))
             .map_err(|err| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = err))?
     } else if settings::cloud_second_pass_wanted(&s) {
         let cloud = make_cloud_asr(&s).map_err(|e| e.to_string())?;
+        cloud_id = Some(format!("cloud:{}", s.cloud_asr_provider));
         Box::new(asr::cloud::BatchRecognizer::new(cloud))
     } else {
         new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
@@ -2781,7 +2786,7 @@ fn run_retranscribe_once(
     };
     // 身份向识别器实例本人要(与实时链路同款,见 spawn_refine 处注释):这一遍到底
     // 是谁转的,决定了「疑似识别失败,换引擎重转写」还要不要再提示这篇。
-    let engine_id = recognizer.engine_id().to_string();
+    let engine_id = cloud_id.unwrap_or_else(|| recognizer.engine_id().to_string());
     let out = retranscribe::run(&dir, &lock, input.as_mut(), recognizer.as_mut(),
         &mut embedder, seeds, mixed, language_filter, strict, progress,
         &current_speaker_match(app))
