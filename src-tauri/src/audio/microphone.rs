@@ -139,20 +139,27 @@ impl AudioCapture for Microphone {
                     // 走过的时间重新一致,对账不会被搅乱),也不需要任何跨线程的
                     // 丢失元数据(Codex 六轮:计数器方案在 FIFO 里的位置全错,且生产
                     // 装配隔着 ResilientCapture 根本读不到)。
-                    let (payload, ts) =
-                        padded_frame(pending_drop, data, channels, sample_rate, host_time_ns);
-                    let sent = sink
-                        .try_send(AudioFrame {
+                    let per_ch = data.len() / channels.max(1) as usize;
+                    // 队列已满就别白造载荷(Codex 八轮 P1):积压期间 pending_drop 可能
+                    // 已攒到数秒,每个回调都零填一遍再被 try_send 立刻丢弃,就是在实时
+                    // 线程上反复做兆级分配——那本身就会错过 CoreAudio 的截止时间,
+                    // 正是本次改动要消除的丢音成因。满则只记账。
+                    let sent = if sink.is_full() {
+                        false
+                    } else {
+                        let (payload, ts) =
+                            padded_frame(pending_drop, data, channels, sample_rate, host_time_ns);
+                        sink.try_send(AudioFrame {
                             samples: payload,
                             sample_rate,
                             channels,
                             host_time_ns: ts,
                         })
-                        .is_ok();
+                        .is_ok()
+                    };
                     if sent {
                         pending_drop = 0; // 补出去了才清,失败要留着继续攒
                     } else {
-                        let per_ch = data.len() / channels.max(1) as usize;
                         pending_drop = (pending_drop + per_ch).min(DROP_PAD_CAP);
                         dropped.fetch_add(per_ch as u64, std::sync::atomic::Ordering::Relaxed);
                     }

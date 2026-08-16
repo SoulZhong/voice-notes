@@ -645,6 +645,14 @@ fn run_frame_tap_with_drift(
                                     // (Codex P0)。突发缓冲回吐(样本比时间多)不是洞,不补。
                                     if holey {
                                         pending_hole = hole;
+                                        // 洞有多长在**检测时**就记账,不等补了多少才记
+                                        // (Codex 八轮 P2):断流补零可能已经填过其中一段,
+                                        // 按残余量记会把 1 秒的洞记成 500ms,这个字段就
+                                        // 失去了"到底丢了多久"的意义。
+                                        health.hw_gap_ms.fetch_add(
+                                            hole.as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
                                     }
                                     clock_span = Duration::ZERO;
                                     clock_samples = 0;
@@ -764,7 +772,6 @@ fn run_frame_tap_with_drift(
                         forwarded += Duration::from_secs_f64(n as f64 / frame.sample_rate as f64);
                         let ms = (n as u64 * 1000) / frame.sample_rate as u64;
                         health.silence_ms.fetch_add(ms, Ordering::Relaxed);
-                        health.hw_gap_ms.fetch_add(ms, Ordering::Relaxed);
                         let silence = AudioFrame {
                             samples: vec![0.0; n * ch],
                             sample_rate: frame.sample_rate,
