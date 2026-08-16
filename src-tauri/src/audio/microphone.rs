@@ -8,13 +8,33 @@ use crossbeam_channel::Sender;
 /// `cpal::Stream` is `!Send`, so we cannot store it directly in `Microphone`
 /// when `AudioCapture: Send` is required. Instead we own the stream on a
 /// dedicated background thread and communicate via a stop-channel.
+/// 回调侧丢样补零的上限(每声道样本数,约 5 秒 @48k)。丢得比这还多说明下游已经
+/// 长时间不动了,再补下去只是在实时回调里做大块分配;超出的部分交给 tap 的时戳
+/// 补洞与 drift 记账,宁可少补也不能让回调自己变成卡顿源。
+const DROP_PAD_CAP: usize = 48_000 * 5;
+
+/// 把此前丢掉的样本以静音补在本批数据前面,返回要发送的载荷,并清空待补量。
+/// 纯函数(不碰通道/时钟),便于直接测:补零发生在**丢失位置**,时长与丢失量一致。
+fn pad_dropped(pending: &mut usize, data: &[f32], channels: u16) -> Vec<f32> {
+    if *pending == 0 {
+        return data.to_vec();
+    }
+    let ch = channels.max(1) as usize;
+    let pad = *pending * ch;
+    *pending = 0;
+    let mut out = Vec::with_capacity(pad + data.len());
+    out.resize(pad, 0.0);
+    out.extend_from_slice(data);
+    out
+}
+
 pub struct Microphone {
     /// Dropping this sender signals the background thread to stop the stream.
     stop_tx: Option<crossbeam_channel::Sender<()>>,
     /// 运行期流错误上报口(断连自愈消费);未接线时仅落日志,行为同引入前。
     events: Option<Sender<CaptureEvent>>,
-    /// 回调因下游积压丢弃的样本数(每声道,累计)。回调里只做一次原子加;
-    /// tap 每帧读它的增量,把缺口精确补回时间轴(见 AudioCapture::dropped_samples)。
+    /// 回调因下游积压丢弃的样本数(每声道,累计)。仅供停流时汇总日志——
+    /// 时间轴由回调自己补零保住(见 start 里的 pad_dropped)。
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -73,6 +93,8 @@ impl AudioCapture for Microphone {
             // 差一个缓冲时长量级的常量偏移，不影响斜率(ppm)；绝对偏移由 E1 互相关标定。
             let mut anchor: Option<(cpal::StreamInstant, u64)> = None;
             let dropped_cb = dropped.clone();
+            // 待补的丢样(每声道样本数):下一次成功发送时补在数据前面。
+            let mut pending_drop: usize = 0;
             let stream = match device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
@@ -90,21 +112,26 @@ impl AudioCapture for Microphone {
                     };
                     // 绝不阻塞:这是 CoreAudio 的实时回调线程,它一旦被下游背压顶住,
                     // HAL 侧就开始整块丢音(2026-08-16 实测:一场 98 分钟录音丢了
-                    // 13.5 分钟,tap 被顶最长 1.198 秒)。宁可这一帧不要,也要立刻返回
-                    // ——丢掉的时长由 tap 按硬件时戳补零补回时间轴,不会压缩时间。
+                    // 13.5 分钟,tap 被顶最长 1.198 秒)。宁可这一帧不要,也要立刻返回。
+                    //
+                    // 丢掉的那段在**这里**补零补进下一帧,而不是留给 tap 事后猜:
+                    // 位置天然正确(就在下一批数据之前),时长天然对齐(样本数与时戳
+                    // 走过的时间重新一致,对账不会被搅乱),也不需要任何跨线程的
+                    // 丢失元数据(Codex 六轮:计数器方案在 FIFO 里的位置全错,且生产
+                    // 装配隔着 ResilientCapture 根本读不到)。
+                    let payload = pad_dropped(&mut pending_drop, data, channels);
                     if sink
                         .try_send(AudioFrame {
-                            samples: data.to_vec(),
+                            samples: payload,
                             sample_rate,
                             channels,
                             host_time_ns,
                         })
                         .is_err()
                     {
-                        dropped.fetch_add(
-                            (data.len() / channels.max(1) as usize) as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        let per_ch = data.len() / channels.max(1) as usize;
+                        pending_drop = (pending_drop + per_ch).min(DROP_PAD_CAP);
+                        dropped.fetch_add(per_ch as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 },
                 err_fn,
@@ -169,7 +196,45 @@ impl AudioCapture for Microphone {
         self.stop_tx = None;
     }
 
-    fn dropped_samples(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        Some(self.dropped.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_pending_drop_passes_data_through() {
+        let mut pending = 0usize;
+        let out = pad_dropped(&mut pending, &[0.1, 0.2], 1);
+        assert_eq!(out, vec![0.1, 0.2]);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn dropped_span_is_padded_in_front_and_cleared() {
+        // 丢了 3 个(每声道)样本,下一批数据前面就该有 3 个静音——补在丢失的位置上,
+        // 时长与丢失量一致,下游的时间轴因此不被压缩。
+        let mut pending = 3usize;
+        let out = pad_dropped(&mut pending, &[0.5, 0.6], 1);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.5, 0.6]);
+        assert_eq!(pending, 0, "补过就要清零,不能重复补");
+    }
+
+    #[test]
+    fn padding_respects_channel_interleaving() {
+        // 双声道:每声道 2 个样本 = 4 个交错样本。
+        let mut pending = 2usize;
+        let out = pad_dropped(&mut pending, &[1.0, -1.0], 2);
+        assert_eq!(out.len(), 4 + 2);
+        assert!(out[..4].iter().all(|s| *s == 0.0));
+        assert_eq!(&out[4..], &[1.0, -1.0]);
+    }
+
+    #[test]
+    fn cap_bounds_the_allocation() {
+        // 上限存在的意义:回调里不做无界分配。
+        let mut pending = DROP_PAD_CAP;
+        let out = pad_dropped(&mut pending, &[0.0], 1);
+        assert_eq!(out.len(), DROP_PAD_CAP + 1);
     }
 }

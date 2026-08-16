@@ -62,13 +62,7 @@ pub trait AudioCapture: Send {
     fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()>;
     /// 停止采集并释放设备。
     fn stop(&mut self);
-    /// 采集回调因下游积压而丢弃的样本数(每声道,累计)。返回 Some 即表示该后端
-    /// **会**丢帧并如实计数——tap 据此精确补回时间轴,不必再靠硬件时戳猜缺口
-    /// (时戳只能猜出"至少缺一整帧"的洞,可变帧长下会漏掉更小的丢弃)。
-    /// 默认 None:不丢帧或未计量的后端(SCK/VPIO/mock)保持原语义。
-    fn dropped_samples(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        None
-    }
+
 }
 
 /// 采集流运行期事件(启动期错误走 start 的 Err,不在此列)。
