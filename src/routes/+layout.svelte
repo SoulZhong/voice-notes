@@ -21,9 +21,9 @@
     type UpdateInfo,
     type UpdateProgress,
   } from "$lib/update";
-  import { onTrayNavigate } from "$lib/events";
-import { markNavigated, navVersion } from "$lib/navIntent";
-import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
+  import { onTrayNavigate, type TrayNavigateEvent } from "$lib/events";
+  import { markNavigated, navVersion } from "$lib/navIntent";
+  import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
   import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
@@ -133,13 +133,18 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
     const unIdentify = listen("identify_done", () => void tidy.refresh());
     // 托盘「打开设置」:后端只负责亮出窗口,路由在前端。挂在 layout(常驻)而不是设置页,
     // 否则只有已经在设置页时才生效。
-    const trayNavTo = (path: string) => {
-      if (!path.startsWith("/")) return;
+    // 按请求号去重(Codex 五轮):点击落在监听注册之后、补领到达 Rust 之前时,同一次点击
+    // 会从事件与补领两条通道各来一次;晚到的那份若也导航,就会在用户离开设置页之后把人
+    // 又拽回去。后端发号,前端只认比处理过的更大的号。
+    let lastTrayNav = 0;
+    const trayNavTo = (e: TrayNavigateEvent) => {
+      if (!e.path.startsWith("/") || e.id <= lastTrayNav) return;
+      lastTrayNav = e.id;
       markNavigated(); // 必须在 goto 之前:自动重定向据此让路(见 navIntent.ts)
-      goto(path);
+      goto(e.path);
     };
     const unTrayNav = onTrayNavigate((e) => {
-      trayNavTo(e.path);
+      trayNavTo(e);
       // 顺手清掉后端那份待办:事件已经送到,不清的话下次重挂载会再跳一次。
       void invoke("take_pending_nav").catch(() => {});
     });
@@ -147,9 +152,9 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
     // **必须等监听注册完再领**(Codex P2):listen() 是异步的,若先领到 null、随后用户
     // 在注册落地前点了托盘,那次点击既没人接、也不会再被领走,窗口亮了却不跳页。
     void Promise.resolve(unTrayNav)
-      .then(() => invoke<string | null>("take_pending_nav"))
-      .then((path) => {
-        if (path) trayNavTo(path);
+      .then(() => invoke<TrayNavigateEvent | null>("take_pending_nav"))
+      .then((pending) => {
+        if (pending) trayNavTo(pending);
       })
       .catch(() => {});
     // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——

@@ -94,8 +94,13 @@ pub struct NoteRealignedEvent {
 
 /// 托盘菜单请求前端导航,事件名 "tray_navigate"。托盘在 Rust 侧,路由在前端,
 /// 只能发事件让前端自己 goto——先 show 窗口再发,否则导航了也看不见。
+///
+/// `id` 是单调递增的请求号:同一次点击可能既走事件、又被前端启动时的 `take_pending_nav`
+/// 领到(点击落在监听注册之后、领取到达 Rust 之前),两条通道都会送达。前端按 id 去重,
+/// 否则慢的那份会在用户离开设置页之后把人再拽回来(Codex 五轮)。
 #[derive(Debug, Clone, Serialize)]
 pub struct TrayNavigateEvent {
+    pub id: u64,
     pub path: String,
 }
 

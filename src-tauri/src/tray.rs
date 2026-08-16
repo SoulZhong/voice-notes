@@ -165,12 +165,15 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             }
             // 事件不是粘性的:冷启动时托盘先于 webview 就绪,这一刻点了就丢(Codex P2)。
             // 所以另存一份待办,前端挂载时主动领取;领到即清,事件先到也会顺手清掉。
-            if let Some(st) = app.try_state::<crate::AppState>() {
-                if let Ok(mut slot) = st.pending_nav.lock() {
-                    *slot = Some("/settings".to_string());
-                }
+            // 两条通道可能把同一次点击都送到(点击落在监听注册之后、领取到达 Rust 之前),
+            // 因此带上单调请求号,由前端去重(Codex 五轮)。
+            let Some(st) = app.try_state::<crate::AppState>() else { return };
+            let id = st.nav_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let ev = crate::ipc::TrayNavigateEvent { id, path: "/settings".into() };
+            if let Ok(mut slot) = st.pending_nav.lock() {
+                *slot = Some(ev.clone());
             }
-            let _ = app.emit("tray_navigate", crate::ipc::TrayNavigateEvent { path: "/settings".into() });
+            let _ = app.emit("tray_navigate", ev);
         }
         "quit" => {
             // 录制中先收尾再退：经 actor 发 Cmd::Stop(P1 改道,委托 do_stop_recording,

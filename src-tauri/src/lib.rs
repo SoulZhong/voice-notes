@@ -31,7 +31,7 @@ mod lifecycle;
 mod hooks_external;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -163,7 +163,10 @@ struct AppState {
     mixed_regen: Arc<Mutex<Option<String>>>,
     /// 托盘发起、尚未被前端消费的导航请求(目前只有「打开设置」)。事件不是粘性的,
     /// 冷启动时托盘先于 webview 就绪,这一刻的点击只能靠这份待办兜住。
-    pending_nav: Arc<Mutex<Option<String>>>,
+    /// 带请求号:同一次点击可能既走事件、又被这份待办领到,前端按号去重(见 TrayNavigateEvent)。
+    pending_nav: Arc<Mutex<Option<ipc::TrayNavigateEvent>>>,
+    /// 导航请求号发号器,单调递增,0 不使用(前端以 0 为"尚未处理过任何请求")。
+    nav_seq: Arc<AtomicU64>,
     /// 前端是否有活动播放会话(与迷你浮层同源判定)。只服务托盘菜单的「停止播放」项:
     /// 会话语义(装载不算播放)在前端,后端只有装载代次,故由前端 set_playback_active 告知。
     playback_active: Arc<AtomicBool>,
@@ -191,6 +194,7 @@ impl Default for AppState {
             retranscribe_last: Arc::new(Mutex::new(None)),
             mixed_regen: Arc::new(Mutex::new(None)),
             pending_nav: Arc::new(Mutex::new(None)),
+            nav_seq: Arc::new(AtomicU64::new(0)),
             playback_active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2400,7 +2404,7 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
 /// 领取并清空托盘留下的导航待办。前端挂载时调一次;事件正常送达时也会调,顺手清掉,
 /// 免得下次重挂载(HMR/重开窗口)又跳一次设置页。
 #[tauri::command]
-fn take_pending_nav(state: State<AppState>) -> Option<String> {
+fn take_pending_nav(state: State<AppState>) -> Option<ipc::TrayNavigateEvent> {
     state.pending_nav.lock().ok().and_then(|mut s| s.take())
 }
 
