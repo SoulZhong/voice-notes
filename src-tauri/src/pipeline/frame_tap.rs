@@ -115,11 +115,6 @@ const HW_HOLE_MIN: Duration = Duration::from_millis(3);
 /// 一把 Vec 分配下去就是上百 MB(Codex P1);按这个粒度切块发,峰值内存可控。
 const FILL_CHUNK: Duration = Duration::from_millis(200);
 
-/// 收尾补齐的下限:正常停录时"队列排空→通道关闭"之间总有几十毫秒余量,
-/// 低于此不补,免得每场录音尾巴上都挂一小段静音。
-const TAIL_FILL_MIN: Duration = Duration::from_millis(200);
-/// 收尾补齐的上限:兜住时钟异常/长时间挂起导致的荒谬欠账,不无限补。
-const TAIL_FILL_MAX: Duration = Duration::from_secs(120);
 
 /// 每源健康计数(原子字段,tap 线程写、查询命令读,无锁)。
 #[derive(Default)]
@@ -881,47 +876,17 @@ fn run_frame_tap_with_drift(
                 }
                 filled_gap = true;
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                // 收尾补齐(Codex P1):若采集队列一直满到停录,最后那段被回调丢掉的
-                // 音频没有"下一帧"来暴露它——时戳补洞永远等不到那一帧,轨道就这么短
-                // 一截收场。这里按墙钟欠账补最后一次:采集已经结束,`forwarded` 与
-                // `anchor.elapsed()` 的差就是缺的那段。
-                let (Some((declared, channels)), Some(anchor)) = (last_format, anchor) else {
-                    return;
-                };
-                let rate = applied_rate.unwrap_or(declared);
-                if rate == 0 {
-                    return;
-                }
-                let deficit = anchor.elapsed().saturating_sub(forwarded);
-                // 门槛:正常停录时队列排空到通道关闭之间必然有几十毫秒的余量,
-                // 补它只会给每场录音尾巴上加一小段静音。只补真正成规模的缺口。
-                if deficit < TAIL_FILL_MIN {
-                    return;
-                }
-                let mut left = deficit.min(TAIL_FILL_MAX);
-                while left > Duration::ZERO {
-                    let step = left.min(FILL_CHUNK);
-                    let n = (step.as_secs_f64() * rate as f64) as usize;
-                    if n == 0 {
-                        break;
-                    }
-                    let ms = (n as u64 * 1000) / rate as u64;
-                    health.silence_ms.fetch_add(ms, Ordering::Relaxed);
-                    health.hw_gap_ms.fetch_add(ms, Ordering::Relaxed);
-                    let silence = AudioFrame {
-                        samples: vec![0.0; n * channels.max(1) as usize],
-                        sample_rate: rate,
-                        channels,
-                        host_time_ns: None,
-                    };
-                    if to_worker.send(silence).is_err() {
-                        return;
-                    }
-                    left = left.saturating_sub(step);
-                }
-                return;
-            }
+            // 采集已断开:直接退出。
+            //
+            // 这里刻意**不**做"按欠账补最后一段":队列一直满到停录时,最后那截被回调
+            // 丢掉的音频确实没有下一帧来暴露,时戳补洞覆盖不到它。但补它需要一个可信的
+            // 终点——Disconnected 是在队列排空、所有阻塞 send 都完成之后才观察到的,
+            // 拿那一刻的墙钟算欠账会把拆除耗时算成缺口,凭空补出静音;而且同步补零会
+            // 拖住 TappedCapture::stop(),另一路采集在此期间还在录,两轨又错开
+            // (Codex 四轮两条 P1)。要做对得先把采集停止改成两阶段(先给所有源发停,
+            // 再各自收尾),那是独立改动。眼下这段残缺是**可见**的:回调丢样有日志、
+            // hw_gaps 有计数、drift_ms 记着残差。
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -2076,33 +2041,6 @@ mod tests {
         assert!(zeros >= 16_000, "3 秒的洞至少补回 1 秒,实测 {zeros} 样本");
         let cap = (FILL_CHUNK.as_secs_f64() * 16_000.0) as usize;
         assert!(max_frame <= cap, "单个补零帧 {max_frame} 样本超过上限 {cap}");
-    }
-
-    /// Codex P1 回归:采集队列一直满到停录时,最后那段被回调丢掉的音频没有
-    /// "下一帧"来暴露——时戳补洞等不到那一帧,轨道就短一截收场。收尾要按欠账补齐。
-    #[test]
-    fn tail_dropped_span_is_filled_on_disconnect() {
-        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
-        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(512);
-        let health = std::sync::Arc::new(SourceHealth::default());
-        // fill_after 大于静默时长:排除 Timeout 分支,补零只可能来自收尾补齐。
-        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
-        let h2 = health.clone();
-        let t = std::thread::spawn(move || {
-            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
-        });
-        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(0) }).unwrap();
-        // 之后"什么都没发出来"(等价于回调全被丢),1 秒后直接停录。
-        std::thread::sleep(Duration::from_millis(1000));
-        drop(cap_tx);
-        t.join().unwrap();
-        let mut zeros = 0usize;
-        while let Ok(f) = out_rx.try_recv() {
-            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
-        }
-        assert!(zeros >= 8_000, "收尾欠账要补回(约 1s@16k),实测 {zeros} 样本");
-        assert!(health.snapshot(Source::Mic).hw_gap_ms >= 500);
     }
 
     /// 反向锁:正常停录(队列即时排空)不得在尾巴上挂静音。
