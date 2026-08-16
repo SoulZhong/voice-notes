@@ -2141,6 +2141,15 @@ fn do_start_recording(app: &AppHandle) -> Result<(), String> {
         NoteTarget::New,
     );
     if result.is_ok() {
+        // 麦克风模式留痕(2026-08-16):系统层「语音突显」会把非人声削成绝对零、判错时
+        // 连人声一起削,实测能吃掉近两成语音,而这一切发生在音频进入本进程之前——
+        // 事后排查只能靠这行日志分辨"录音本身就被系统削过"还是我们自己的链路丢了样。
+        let mm = crate::audio::mic_mode::active();
+        if mm.damages_audio() {
+            eprintln!("[采集] 麦克风模式=语音突显:系统会把非人声削成绝对零,建议在控制中心改回「标准」");
+        } else {
+            eprintln!("[采集] 麦克风模式={}", mm.as_str());
+        }
         // record_system_only 已随三删一藏移除,不再有"仅系统声"录制形态可推断源类别；
         // Task 3(硬承诺双轨)落地后 Mic+System 是必备源集合,能走到这里(result.is_ok())
         // 就意味着两源皆已启动——固定按 Both 上报不再是近似,而是准确值。
@@ -2391,6 +2400,14 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
     } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
     }
+}
+
+/// 当前系统麦克风模式("standard" / "wide_spectrum" / "voice_isolation" / "unknown")。
+/// 录制页据此告警:语音突显会把非人声削成绝对零(见 audio::mic_mode 文档)。
+/// 只报状态不拦录制——它是提示,不是门禁;读不到一律 "unknown",UI 不提示。
+#[tauri::command]
+fn mic_mode() -> &'static str {
+    crate::audio::mic_mode::active().as_str()
 }
 
 /// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
@@ -7554,7 +7571,8 @@ pub fn run() {
             player::player_seek,
             player::player_set_muted,
             player::player_stop,
-            set_playback_active
+            set_playback_active,
+            mic_mode
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -93,6 +93,20 @@
     }
   }
 
+  // 麦克风模式预警(2026-08-16 实测事故):macOS「语音突显」是系统层人声分离,把它判定为
+  // 非人声的部分**削成绝对零**,判错时连人声一起削。同机同麦对照——开着它录的两场,
+  // ≥100ms 数字纯静音占 18.6%/20.6%、45 段直接切在人声上;关掉后立刻 0 段。削发生在音频
+  // 进本进程之前,我们救不回来,所以只能明说。录制中也轮询(用户可能中途在控制中心切),
+  // 读不到("unknown")不提示。
+  let micModeBad = $state(false);
+  async function refreshMicMode() {
+    try {
+      micModeBad = (await invoke<string>("mic_mode")) === "voice_isolation";
+    } catch {
+      micModeBad = false;
+    }
+  }
+
   // 输入音量过低预警:系统输入音量被会议软件拉低会录得很轻,与采集路径设置无关,
   // 纯按当前电平判定。开录前 + 录制中都检测,一键调回可用电平。
   const LOW_INPUT_THRESHOLD = 50;
@@ -290,6 +304,7 @@
     refreshScreenPerm();
     refreshBtRisk();
     refreshInputVol();
+    refreshMicMode();
     getSettings().then((s) => {
       showMcpHint = s.onboarded && !s.mcp_onboarded;
     }).catch(() => {});
@@ -298,14 +313,18 @@
       refreshScreenPerm();
       refreshBtRisk();
       refreshInputVol();
+      refreshMicMode();
     };
     window.addEventListener("focus", onFocus);
     // 录制中也检测(会议软件中途拉低输入音量):轮询与录制状态无关,一直跑。
     const volTimer = setInterval(refreshInputVol, POLL_MS);
+    // 与输入音量同频轮询:模式可以在录制中途被切换,那之后的音频就开始被削。
+    const micModeTimer = setInterval(refreshMicMode, POLL_MS);
     const unCloud = onCloudAsrStatus(handleCloudAsrStatus);
     return () => {
       window.removeEventListener("focus", onFocus);
       clearInterval(volTimer);
+      clearInterval(micModeTimer);
       if (cloudStatusClearTimer) clearTimeout(cloudStatusClearTimer);
       unCloud.then((f) => f());
     };
@@ -855,6 +874,15 @@
 
     <!-- 常态检测(设备现实驱动,与 isSystemDenied/isSystemUnavailable 引导卡互斥):
          那两张卡是"根本录不了"的唯一信息面,同屏再叠加音质类提示只会分散注意力。 -->
+    <!-- 麦克风模式:唯一一条录制中也要显示的音质告警——它正在实时吃掉语音,
+         而且用户随时可以在控制中心改回来,改完轮询会自动撤掉横幅。 -->
+    {#if micModeBad && !isSystemDenied && !isSystemUnavailable}
+      <div class="banner">
+        {t("record.banner.micIsolation")}
+        <span class="hint">{t("record.banner.micIsolationHow")}</span>
+      </div>
+    {/if}
+
     {#if btEchoRisk && !recording.isLive && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.btEcho")}
