@@ -111,6 +111,9 @@ const RATE_SANITY: (f64, f64) = (0.5, 2.0);
 /// (实测同帧内 <100µs),也避免超短帧场景下把噪声当洞。
 const HW_HOLE_MIN: Duration = Duration::from_millis(3);
 
+/// 判洞比较的舍入容差:见 holey 处注释。
+const HW_ROUND_TOL: Duration = Duration::from_millis(1);
+
 /// 单个补零帧的上限时长。一次长断流(睡眠/长时间无回调)的洞可能是分钟级,
 /// 一把 Vec 分配下去就是上百 MB(Codex P1);按这个粒度切块发,峰值内存可控。
 const FILL_CHUNK: Duration = Duration::from_millis(200);
@@ -629,7 +632,14 @@ fn run_frame_tap_with_drift(
                                 // (声明 48k 实跑 32k:每帧都缺半帧),那归对账改率处理,
                                 // 误判成洞会每帧清统计,改率永远收敛不了(实测打红两条老
                                 // 用例);而丢掉一个等长回调恰好缺满一帧,正好被认出来。
-                                let holey = ns > prev && hole >= carried.max(HW_HOLE_MIN);
+                                // 容差(Codex 十轮 P1):设备周期不是整纳秒时,丢一个回调
+                                // 算出来的 hole 可能比 carried 差个位数纳秒(512 帧 @48k:
+                                // carried 10_666_667ns,两周期时戳差 21_333_333ns),严格
+                                // 比较会漏掉这类最常见的单缓冲丢失。1ms 远小于慢时钟场景
+                                // 的判别间距(48k 声明/44.1k 实跑每帧才差 0.88ms),不会
+                                // 把慢时钟误判成洞。
+                                let holey =
+                                    ns > prev && hole + HW_ROUND_TOL >= carried.max(HW_HOLE_MIN);
                                 let usable = ns > prev
                                     && !holey
                                     && delta < policy.fill_after
