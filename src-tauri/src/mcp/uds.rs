@@ -20,6 +20,9 @@ struct Req {
     note_id: Option<String>,
     #[serde(default)]
     input: Option<String>,
+    /// 强制本次重转写使用的本地识别引擎(如 "firered");缺省按设置决策。
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -120,7 +123,15 @@ trait UdsBackend {
     /// 触发「重新 Aing」:Some(id)=单篇;None=全部未 Aing(entities 空)的 complete 笔记。
     fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String>;
     /// 发起文件重转写(异步启动即返回;input 缺省 dual)。
-    fn retranscribe(&self, note_id: &str, input: &str) -> Result<serde_json::Value, String>;
+    /// `engine`:强制用某个本地识别引擎跑这一次(如 "firered"),None = 按设置决策。
+    /// 存在的理由与笔记页那个「用 FireRed 重转写本篇」同一个:换引擎救回识别失败的段,
+    /// 但不动用户的默认选择(见 do_retranscribe 的注释)。
+    fn retranscribe(
+        &self,
+        note_id: &str,
+        input: &str,
+        engine: Option<&str>,
+    ) -> Result<serde_json::Value, String>;
     /// 当前重转写任务;空闲返回 null。
     fn retranscribe_status(&self) -> serde_json::Value;
 }
@@ -141,7 +152,11 @@ fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
         "resume" => b.resume(),
         "reaing" => b.reaing(req.note_id.as_deref().map(str::trim).filter(|s| !s.is_empty())),
         "retranscribe" => match req.note_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(id) => b.retranscribe(id, req.input.as_deref().unwrap_or("dual")),
+            Some(id) => b.retranscribe(
+                id,
+                req.input.as_deref().unwrap_or("dual"),
+                req.engine.as_deref().map(str::trim).filter(|e| !e.is_empty()),
+            ),
             None => Err("retranscribe 需要 note_id".into()),
         },
         "retranscribe_status" => Ok(b.retranscribe_status()),
@@ -309,9 +324,16 @@ impl UdsBackend for AppBackend<'_> {
         }
     }
 
-    fn retranscribe(&self, note_id: &str, input: &str) -> Result<serde_json::Value, String> {
-        crate::do_retranscribe(self.0, note_id, input, None)?;
-        Ok(serde_json::json!({ "started": true, "note_id": note_id, "input": input }))
+    fn retranscribe(
+        &self,
+        note_id: &str,
+        input: &str,
+        engine: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        crate::do_retranscribe(self.0, note_id, input, engine.map(str::to_string))?;
+        Ok(serde_json::json!({
+            "started": true, "note_id": note_id, "input": input, "engine": engine,
+        }))
     }
 
     fn retranscribe_status(&self) -> serde_json::Value {
@@ -386,8 +408,16 @@ mod tests {
             self.log(format!("reaing:{note_id:?}"));
             Ok(serde_json::json!({ "queued": note_id.map(|_| 1).unwrap_or(0) }))
         }
-        fn retranscribe(&self, note_id: &str, input: &str) -> Result<serde_json::Value, String> {
-            self.log(format!("retranscribe:{note_id}:{input}"));
+        fn retranscribe(
+            &self,
+            note_id: &str,
+            input: &str,
+            engine: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            match engine {
+                Some(e) => self.log(format!("retranscribe:{note_id}:{input}:{e}")),
+                None => self.log(format!("retranscribe:{note_id}:{input}")),
+            }
             Ok(serde_json::json!({ "started": true, "note_id": note_id, "input": input }))
         }
         fn retranscribe_status(&self) -> serde_json::Value {
@@ -397,7 +427,7 @@ mod tests {
     }
 
     fn req(op: &str) -> Req {
-        Req { op: op.into(), title: None, tail: None, note_id: None, input: None }
+        Req { op: op.into(), title: None, tail: None, note_id: None, input: None, engine: None }
     }
 
     #[test]
@@ -416,7 +446,7 @@ mod tests {
     fn query_ops_not_gated() {
         let b = MockBackend::new(false); // 即便控制关
         assert!(dispatch_with(&b, &req("status")).ok, "status 不受门控");
-        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None }).ok, "live 不受门控");
+        assert!(dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None }).ok, "live 不受门控");
         assert!(b.called("status") && b.called("live:50"));
     }
 
@@ -430,7 +460,7 @@ mod tests {
         assert!(
             dispatch_with(&b, &Req {
                 op: "retranscribe".into(), title: None, tail: None,
-                note_id: Some("n1".into()), input: Some("dual".into()),
+                note_id: Some("n1".into()), input: Some("dual".into()), engine: None,
             }).ok,
             "retranscribe 门控开时应放行"
         );
@@ -442,9 +472,9 @@ mod tests {
     #[test]
     fn live_tail_clamped_and_defaulted() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000), note_id: None, input: None });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0), note_id: None, input: None });
-        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(1000), note_id: None, input: None, engine: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: Some(0), note_id: None, input: None, engine: None });
+        dispatch_with(&b, &Req { op: "live".into(), title: None, tail: None, note_id: None, input: None, engine: None });
         assert!(b.called("live:500"), "上限 500");
         assert!(b.called("live:1"), "下限 1");
         assert!(b.called("live:50"), "缺省 50");
@@ -453,23 +483,46 @@ mod tests {
     #[test]
     fn start_title_trimmed() {
         let b = MockBackend::new(true);
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None, note_id: None, input: None });
-        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None, note_id: None, input: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("  评审会  ".into()), tail: None, note_id: None, input: None, engine: None });
+        dispatch_with(&b, &Req { op: "start".into(), title: Some("   ".into()), tail: None, note_id: None, input: None, engine: None });
         assert!(b.called("start:Some(\"评审会\")"), "两端空白应 trim: {:?}", b.calls.borrow());
         assert!(b.called("start:None"), "纯空白 title → None");
     }
 
     /// retranscribe 过 control 门;retranscribe_status 是只读查询,不过 control 门。
+    /// engine 覆盖要如实传到 backend(空串按"未指定"处理,免得 `--engine ""` 被
+    /// 当成引擎名传下去撞校验)。
+    #[test]
+    fn retranscribe_engine_override_is_passed_through() {
+        let b = MockBackend::new(true);
+        let r = dispatch_with(&b, &Req {
+            op: "retranscribe".into(), title: None, tail: None,
+            note_id: Some("n1".into()), input: Some("dual".into()),
+            engine: Some("  firered  ".into()),
+        });
+        assert!(r.ok);
+        assert!(b.called("retranscribe:n1:dual:firered"), "engine 应 trim 后传下去");
+
+        let b2 = MockBackend::new(true);
+        let r2 = dispatch_with(&b2, &Req {
+            op: "retranscribe".into(), title: None, tail: None,
+            note_id: Some("n1".into()), input: Some("dual".into()), engine: Some("   ".into()),
+        });
+        assert!(r2.ok);
+        assert!(b2.called("retranscribe:n1:dual"), "空串等于未指定");
+    }
+
     #[test]
     fn retranscribe_gated_but_status_is_not() {
         let denied = MockBackend::new(false);
         let r = dispatch_with(&denied, &Req {
             op: "retranscribe".into(), title: None, tail: None,
-            note_id: Some("n1".into()), input: Some("dual".into()),
+            note_id: Some("n1".into()), input: Some("dual".into()), engine: None,
         });
         assert!(!r.ok, "control 关闭时 retranscribe 必须被拒");
         let r = dispatch_with(&denied, &Req {
-            op: "retranscribe_status".into(), title: None, tail: None, note_id: None, input: None,
+            op: "retranscribe_status".into(), title: None, tail: None, note_id: None,
+            input: None, engine: None,
         });
         assert!(r.ok, "status 查询不受 control 门控");
         assert!(denied.called("retranscribe_status"));
@@ -477,7 +530,7 @@ mod tests {
         let allowed = MockBackend::new(true);
         let r = dispatch_with(&allowed, &Req {
             op: "retranscribe".into(), title: None, tail: None,
-            note_id: Some("n1".into()), input: None,
+            note_id: Some("n1".into()), input: None, engine: None,
         });
         assert!(r.ok);
         assert!(allowed.called("retranscribe:n1:dual"), "input 缺省应补 dual");
