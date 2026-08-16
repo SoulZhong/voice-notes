@@ -16,6 +16,7 @@
     exportFileName,
     getRefined,
     refineNote,
+    noteRefining,
     retranscribeNote,
     retranscribeStatus,
     mixedInputStatus,
@@ -56,6 +57,8 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
   import { getSettings } from "$lib/models";
+  import { refineReady } from "$lib/refineReady";
+  import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
@@ -87,7 +90,62 @@
 
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
+  /** 修订稿的载入闸门。写 refined 的有四路:refresh()、Aing 终态事件、在跑复核、
+      编辑器保存后的回读。它们各自 await,谁先发起不代表谁先落地——Codex 连着几轮
+      抓到的一串竞态(旧稿盖新稿、忙态解除得比新稿早、提示在重取途中闪一下)本质
+      是同一件事:多个写者无序。这里一次收口:
+      ① 取稿一律走 loadRefined,末次请求赢(seq 比对),旧响应作废;
+      ② 取稿在途(refinedLoading > 0)期间不出「这场没做 AI 整理」——眼前这份稿子
+         随时可能被换掉,凭它下结论必然出错;
+      ③ 编辑器回读那几处自己取稿,同样走 beginRefinedLoad()(占号 + 计入在途)/
+         commitRefined(seq, doc)/endRefinedLoad(seq, ok) 三件套——占号必须在 await
+         **之前**,否则一份早发出、慢回来的旧回读会拿到更大的号把新稿盖掉;计入在途
+         则是为了让提示在任何一路取稿在途时都闭嘴,不只在 loadRefined 那一路;
+      ④ 重取失败时不放行提示:那份留在手里的旧稿(stages.llm 仍是 "off")正是
+         误报的来源,宁可不提示。 */
+  let refinedSeq = 0;
+  let refinedLoading = $state(0);
+  /** 重取失败,手里这份可能是过期稿:提示一律不出,直到某次重取成功。 */
+  let refinedStale = $state(false);
+  /** 发起一次取稿:占号 + 计入在途。每个 begin 必须配一个 endRefinedLoad(放 finally)。 */
+  function beginRefinedLoad(): number {
+    refinedLoading += 1;
+    refinedSeq += 1;
+    return refinedSeq;
+  }
+  /** 结束一次取稿。committed=false 且自己仍是最新请求时,说明手里这份可能过期
+      (取失败/取回来是 null/守卫没过),提示一律不出——被更新的请求顶掉则不算。 */
+  function endRefinedLoad(seq: number, committed: boolean) {
+    refinedLoading -= 1;
+    if (!committed && seq === refinedSeq) refinedStale = true;
+  }
+  /** 只有仍是最新一次请求、且没切走笔记时才落地;返回是否真的落了。
+      调用方要据此决定跟着落不落编辑器同步——被判过期的那份稿子绝不能推给编辑器,
+      否则 refined 是新的、编辑器却被回滚成旧的。 */
+  function commitRefined(seq: number, doc: RefinedDoc | null, forId: string): boolean {
+    if (seq !== refinedSeq || forId !== id) return false;
+    refined = doc;
+    refinedStale = false;
+    return true;
+  }
+  async function loadRefined(forId: string): Promise<void> {
+    const seq = beginRefinedLoad();
+    let ok = false;
+    try {
+      ok = commitRefined(seq, await getRefined(forId), forId);
+    } catch {
+      /* 增值层:取不到就维持现状,过期与否交给 endRefinedLoad 判 */
+    } finally {
+      endRefinedLoad(seq, ok);
+    }
+  }
   let refining = $state(false);
+  /** 在跑状态是否已确定:进页那一刻 refining 还是默认 false,而 run_local 一开始就把
+      stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
+      还给出一个后端必然拒绝的重跑按钮(Codex P2 四轮)。未确定期间一律不提示。 */
+  let refineStatusKnown = $state(false);
+  /** 快照说"在跑"之后的复核间隔。只在这条自愈路径上用,正常靠事件驱动。 */
+  const REFINE_RECHECK_MS = 3000;
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -126,6 +184,11 @@
   /** 设置页三档决定的默认回放(spec 2026-08-10)。增值层:取失败按 a(双轨)不打扰。
       挂载取一次即定,id 切换复位用它;会话内手动切换语义不变。 */
   let defaultPlayback = $state<"dual" | "mixed">("dual");
+  /** 会后 AI 开关与执行体就绪:决定「这场没做 AI 整理」提示的口径(见 $lib/aiSkipHint)。
+      与 defaultPlayback 同一次 getSettings 取,挂载取一次即定——去配置要离开本页,
+      回来时组件重挂载,自然拿到新值。 */
+  let refineOn = $state(false);
+  let refineConfigured = $state(false);
   let mixedInfo = $state<MixedPlaybackInfo | null>(null);
   /** 成品轨读数进行中:true 期间回落判定不抢跑——mixedInfo=null 是"未知"不是"确无"。 */
   let mixedPending = $state(true);
@@ -287,12 +350,21 @@
       }
       // 仍停留在本篇且没有继续输入时,把 detached 保存的最终盘上状态同步回来。
       if (targetId === id && !refinedEditor?.hasFocus()) {
-        const latest = await getRefined(targetId);
-        if (latest && targetId === id && !refinedEditor?.hasFocus()) {
-          refined = latest;
-          syncedRefined = latest;
-          syncedEditor = refinedEditor;
-          refinedEditor?.setRefined(latest);
+        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+        let ok = false;
+        try {
+          const latest = await getRefined(targetId);
+          // 被更新的取稿顶掉时不推给编辑器(见 commitRefined 注释)。
+          if (latest && targetId === id && !refinedEditor?.hasFocus()) {
+            ok = commitRefined(seq, latest, targetId);
+            if (ok) {
+              syncedRefined = latest;
+              syncedEditor = refinedEditor;
+              refinedEditor?.setRefined(latest);
+            }
+          }
+        } finally {
+          endRefinedLoad(seq, ok);
         }
       }
     } catch (err) {
@@ -337,20 +409,26 @@
       // 盘上最新精修稿,让 refined 说真话;这份内容和编辑器一致,配合下面 syncedRefined/
       // syncedEditor 闸门,视图来回切换重建新编辑器实例时会用这份正确内容渲染,
       // 而不是被闸门跳过导致空白。
+      const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+      let ok = false;
       try {
         const latest = await getRefined(targetId);
         // await 后重验守卫:回读期间用户可能已经切走了笔记。
         if (targetId === id && loadedRefinedId === targetId) {
           if (latest) {
-            refined = latest;
-            syncedRefined = latest;
-            syncedEditor = refinedEditor;
+            ok = commitRefined(seq, latest, targetId);
+            if (ok) {
+              syncedRefined = latest;
+              syncedEditor = refinedEditor;
+            }
           }
           // latest 为 null(极端情况,如笔记目录被清):保持 refined 原样不动,不因
           // 一次回读失败就把已展示的内容整篇清空。
         }
       } catch {
         /* 回读失败:refined 保持原状;本次保存本身已经成功(markSaved 已确认落定) */
+      } finally {
+        endRefinedLoad(seq, ok);
       }
       if (refinedSaveErr) refinedSaveErr = "";
     } catch (err) {
@@ -367,22 +445,26 @@
       // 非冲突失败(Aing 中/录制中被拒):只保留错误提示,让编辑按 idle 定时器重试
       // (markSaveFailed 已排好下一次)。
       if (String(err).includes("已在别处更新")) { // i18n-exempt: 与后端错误原文判等
+        const seq = beginRefinedLoad(); // 占号+计入在途必须在 await 之前(见闸门注释 ③)
+        let ok = false;
         try {
           const latest = await getRefined(targetId);
           if (targetId === id && loadedRefinedId === targetId) {
-            refined = latest;
-            if (latest) {
-              // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
-              // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
-              // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
-              // 属于重复重建。
-              refinedEditor?.setRefined(latest);
-              syncedRefined = latest;
-              syncedEditor = refinedEditor;
-            }
+            ok = commitRefined(seq, latest, targetId);
+          }
+          // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
+          // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
+          // 同步过"直接跳过——否则 effect 会因 refined 换了身份再 setRefined 一次,
+          // 属于重复重建。
+          if (ok && latest) {
+            refinedEditor?.setRefined(latest);
+            syncedRefined = latest;
+            syncedEditor = refinedEditor;
           }
         } catch {
           /* 重载失败保持错误横幅 */
+        } finally {
+          endRefinedLoad(seq, ok);
         }
       }
     } finally {
@@ -556,7 +638,7 @@
   async function refresh() {
     // 并行发起，note 失败才是真正的加载失败；refined/people 是增值层，取不到静默降级。
     const notePromise = getNote(id);
-    const refinedPromise = getRefined(id).catch(() => null);
+    const refinedLoad = loadRefined(id);
     const peoplePromise = listPeople().catch(() => []);
     try {
       note = await notePromise;
@@ -564,7 +646,7 @@
     } catch (e) {
       error = t("common.loadFailed", { e });
     }
-    refined = await refinedPromise;
+    await refinedLoad;
     people = await peoplePromise;
   }
 
@@ -721,6 +803,8 @@
     segMenuPop = null;
     segDeletePop = null;
     refined = null;
+    // 换了笔记,上一篇的"手里这份可能过期"作废;新一篇由自己的取稿重新判定。
+    refinedStale = false;
     syncedRefined = null;
     syncedEditor = null;
     refining = false;
@@ -753,6 +837,13 @@
     const forId = id;
     let unlisten: (() => void) | null = null;
     let disposed = false;
+    // 只有**终态**事件能作废补问的快照:补问可能比终态事件还晚落地(后端先发
+    // all/done、再把 id 从在跑集合里摘掉),晚到的 true 会把页面永久钉在"整理中"。
+    // 反过来,filter/recluster/llm 这些中间事件不能作废快照——它们都不置
+    // refining=true,执行体没配全时后面也不会再有 running 事件,作废了横幅就会在
+    // 整理还没结束时冒出来(Codex P2 两轮)。
+    let sawTerminal = false;
+    refineStatusKnown = false;
     onRefine((e) => {
       if (e.note_id !== forId) return;
       if (e.state === "running") {
@@ -760,16 +851,65 @@
         refineRunFailed = false;
       }
       if (e.stage === "all" && (e.state === "done" || e.state === "failed")) {
-        refining = false;
+        sawTerminal = true;
         refineRunFailed = e.state === "failed";
-        getRefined(forId).then((r) => {
-          if (forId === id) refined = r;
+        // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
+        // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
+        // 还能被点到重跑。loadRefined 自己吞异常,不会留下未处理的 rejection。
+        void loadRefined(forId).finally(() => {
+          if (forId === id) refining = false;
         });
       }
-    }).then((u) => {
-      if (disposed) u();
-      else unlisten = u;
-    });
+    })
+      .then((u) => {
+        if (disposed) u();
+        else unlisten = u;
+        // 补问在途状态:running 事件是易失的,进页晚了就再也收不到,只看事件会把
+        // "正在整理"误判成"没在整理"——而整理途中 stages.llm 本就是 "off",误判会让
+        // 「这场没做 AI 整理」的横幅在整理途中冒出来(Codex P2)。
+        // 必须等监听挂到位之后再问,否则查询与订阅两头并发,状态可能在缝隙里漏掉。
+        return noteRefining(forId);
+      })
+      .then(async (r) => {
+        if (disposed || forId !== id || sawTerminal) return;
+        if (!r) {
+          // 快照说"没在跑":这一场可能恰好在初次 getRefined 之后、监听装好之前
+          // 跑完,那条终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——
+          // 直接放行会让整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。
+          // 重取一次再放行(refineStatusKnown 在下面的 finally 里置,会等这一步)。
+          await loadRefined(forId);
+          return;
+        }
+        refining = true;
+        // 从快照取到的"在跑"必须能自愈:终态事件可能早于后端把 id 从在跑集合
+        // 里摘掉而发出,恰好在那一瞬订阅的话,快照拿到 true 却再也等不到事件
+        // (摘除本身不发前端事件),页面会永久卡在"整理中"(Codex P2 五轮)。
+        // 因此隔几秒复核一次,直到后端说不在跑或终态事件到达。
+        void (async () => {
+          while (!disposed && forId === id && !sawTerminal) {
+            await new Promise((done) => setTimeout(done, REFINE_RECHECK_MS));
+            if (disposed || forId !== id || sawTerminal) return;
+            try {
+              if (await noteRefining(forId)) continue;
+              // 走到这里说明终态事件被错过了,refined 还是跑之前那份
+              // (stages.llm 仍是 "off")。不重取的话,整理明明成功了,页面
+              // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
+              // refining 等新稿到手再落,免得中间闪一下(七轮);await 在 try 内,
+              // 失败由下面的 catch 收掉,不留未处理的 rejection(八轮)。
+              await loadRefined(forId);
+              if (!disposed && forId === id) refining = false;
+              return;
+            } catch {
+              return; // 查不动就不再复核:事件通道仍在,不至于全无出路
+            }
+          }
+        })();
+      })
+      .catch(() => {})
+      // 无论成败都算"已确定":查询失败时按事件为准,总不能永远不提示。
+      .finally(() => {
+        if (!disposed && forId === id) refineStatusKnown = true;
+      });
     return () => {
       disposed = true;
       unlisten?.();
@@ -948,13 +1088,30 @@
     refresh();
   });
 
-  // 挂载取一次设置：确定默认回放方案。增值层,取失败按 a(双轨)不打扰。
+  // 挂载取一次设置：确定默认回放方案 + 会后 AI 就绪口径。增值层,取失败按 a(双轨)
+  // 不打扰;AI 两项取失败按"开关关着"处理,即不提示——宁可不提示,不可误报。
   void getSettings()
     .then((s) => {
       defaultPlayback = schemeToDefaultPlayback(s.audio_scheme);
       playbackScheme = defaultPlayback;
+      refineOn = s.refine_enabled;
+      refineConfigured = refineReady(s);
     })
     .catch(() => {});
+
+  /** 「这场没做 AI 整理」:后端未配全时是完全静默降级的,不提示就等于没发生
+      (2026-08-13 起连断四天六场没被发现)。判定见 $lib/aiSkipHint。 */
+  const aiSkipped = $derived(
+    aiSkipHint({
+      llmStage: refined?.stages.llm,
+      noteComplete: note?.meta.state === "complete",
+      // 未确定、或修订稿正在重取期间,一律按"可能在跑"处理:宁可晚一拍提示,
+      // 不可拿一份随时会被换掉的旧稿下结论。
+      running: refining || !refineStatusKnown || refinedLoading > 0 || refinedStale,
+      refineEnabled: refineOn,
+      ready: refineConfigured,
+    }),
+  );
 
   // ── 波形音轨:按音频总长等分 260 桶,取桶内段落 rms 峰值。观感三件套(首版全高
   //    平顶像方块阵,冒烟反馈"不像声音波形"):①按本条录音的 rms 峰值归一(AGC 后
@@ -1711,6 +1868,20 @@
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
     {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
+    <!-- 放在视图分支之外:切到原始稿也照样看得见——"这场 AI 没跑"是笔记级事实,
+         不是精修视图的局部状态。 -->
+    {#if aiSkipped}
+      <div class="banner">
+        {aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun")}
+        {#if aiSkipped === "unconfigured"}
+          <button class="link" onclick={() => goto("/ai")}>{t("notes.banner.aiConfigure")}</button>
+        {:else}
+          <button class="link" onclick={rerunRefine} disabled={refining}>
+            {refining ? t("notes.banner.aiRunning") : t("notes.banner.aiRun")}
+          </button>
+        {/if}
+      </div>
+    {/if}
     {#if effectiveView === "refined" && refined}
       <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->

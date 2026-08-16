@@ -311,6 +311,8 @@ export function exportFileName(title: string, startedAt: string, ext = "md"): st
 }
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
+/** 这篇的 Aing 是否正在跑。进页时补问一次:running 事件易失,进页晚了收不到。 */
+export const noteRefining = (id: string) => invoke<boolean>("note_refining", { id });
 /** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */
 export const retranscribeNote = (id: string, input: "dual" | "mixed") =>
   invoke<void>("retranscribe_note", { id, input });
