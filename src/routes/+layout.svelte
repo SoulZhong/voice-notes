@@ -95,15 +95,16 @@
         s = { ...s, onboarded: true };
         await setSettings(s);
       }
+      // 显式导航优先(Codex P2/P6):这段跑在两个 IPC 之后,冷启动时可能晚于托盘
+      // 「打开设置」落地。两个分支都要让路——功能引导会把人从设置页拽到 /ai,
+      // 欢迎浮层是全屏覆盖,盖上去等于「点了没反应」。两者下次启动都还会再来。
+      if (navVersion() !== v) return;
       const needsBaseSetup = !s.onboarded;
       const needsAiGuide = !s.completed_guides.includes(AI_TOOLS_GUIDE_ID);
       if (needsBaseSetup) {
         welcomeStatus = m;
       } else if (needsAiGuide && $page.url.searchParams.get("guide") !== AI_TOOLS_GUIDE_ID) {
         // 功能教学必须发生在真实操作页；只把用户导航到对应功能并启动上下文引导。
-        // 但显式导航优先(Codex P2):这段跑在两个 IPC 之后,冷启动时可能晚于托盘
-        // 「打开设置」落地,不让路就会把人从设置页拽到 /ai。引导下次启动还会再来。
-        if (navVersion() !== v) return;
         goto(`/ai?guide=${AI_TOOLS_GUIDE_ID}`);
       }
     } catch {
@@ -141,6 +142,9 @@
       if (!e.path.startsWith("/") || e.id <= lastTrayNav) return;
       lastTrayNav = e.id;
       markNavigated(); // 必须在 goto 之前:自动重定向据此让路(见 navIntent.ts)
+      // 已经支起来的欢迎浮层要撤掉:它是全屏覆盖,不撤的话跳到设置页也只看得见浮层,
+      // 首启动用户会以为托盘「打开设置」坏了(Codex P6)。浮层下次启动照常再来。
+      welcomeStatus = null;
       goto(e.path);
     };
     const unTrayNav = onTrayNavigate((e) => {
