@@ -5,7 +5,52 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const CHUNK_CHARS: usize = 3000;
+/// 小请求(标题/身份推断)的超时:输出只有几十 token,实测 1.6~2.3s 回来,久等无意义。
 pub const REQ_TIMEOUT_S: u64 = 60;
+/// 长请求(分块精修/关系抽取)的超时。这类请求要把整块正文重写一遍,输出量与输入
+/// 同量级(3000 字块 ≈ 2~3k token),耗时天然是标题的几十倍:本机 ai_logs 527 次
+/// refine_chunk 实测中位 40s、p95 58s、最大 59.8s——老的 60s 上限正压在分布尾巴上,
+/// 159 次(30%)死在墙上,而失败块是**静默保原文**的,用户只看到"部分段落未精修"。
+pub const CHUNK_TIMEOUT_S: u64 = 180;
+/// 瞬时失败重试前的等待。DNS/连接类抖动几秒就恢复,不必退避太久
+/// (超时那种本身已经等了 CHUNK_TIMEOUT_S,再退避更没必要)。测试里置 0,
+/// 否则每个重试用例都要白等 3 秒。
+#[cfg(not(test))]
+const RETRY_DELAY_S: u64 = 3;
+#[cfg(test)]
+const RETRY_DELAY_S: u64 = 0;
+
+/// 这次失败值不值得重试。`None` = 传输层错误(超时/DNS/连接中断),必重试;
+/// 429/5xx 是服务端瞬时状态;其余 4xx(密钥错、模型名错、请求体不合法)重试
+/// 只是原样再错一次,还白烧一次配额。
+pub(crate) fn worth_retry(status: Option<u16>) -> bool {
+    match status {
+        None => true,
+        Some(429) => true,
+        Some(c) => (500..600).contains(&c),
+    }
+}
+
+/// 从 ureq 错误里取 HTTP 状态码;传输层错误没有状态码,返回 None。
+fn err_status(e: &ureq::Error) -> Option<u16> {
+    match e {
+        ureq::Error::Status(code, _) => Some(*code),
+        ureq::Error::Transport(_) => None,
+    }
+}
+
+/// 这块该不该重试。只有网络类失败才有重试的意义,且要排掉 4xx;内容类(响应能
+/// 收到但内容不合约)重试等于原样再错一次。
+fn retryable(e: &ChunkErr) -> bool {
+    match e {
+        // downcast 拿回 ureq 错误看状态码;拿不回来的(如 into_string 的 IO 错误)
+        // 同属传输层,按可重试处理。
+        ChunkErr::Network(err) => err
+            .downcast_ref::<ureq::Error>()
+            .map_or(true, |u| worth_retry(err_status(u))),
+        ChunkErr::Content(_) => false,
+    }
+}
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
@@ -165,8 +210,9 @@ pub fn extract_relations(
         ],
     });
     apply_thinking_off(&cfg.base_url, &mut body);
+    // 关系抽取与分块精修同属长请求(要读完整篇段落再吐结构化关系),用同一档超时。
     let response = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+        .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
         .set("content-type", "application/json")
         .send_string(&body.to_string())?
@@ -389,29 +435,42 @@ fn call_chunk(
         ],
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
-    let started = std::time::Instant::now();
-    let result = do_call_chunk(cfg, &url, &body_json.to_string(), paragraphs.len());
-    // AI 日志:请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
-    if let Some(ctx) = log {
-        let (response, status, error) = match &result {
-            Ok((raw, _, _, _, _, _)) => (Value::String(raw.clone()), "ok", None),
-            Err(e) => (Value::Null, "error", Some(e.to_string())),
-        };
-        crate::ailog::record(
-            ctx,
-            crate::ailog::Draft {
-                kind: "refine_chunk",
-                provider: "openai".into(),
-                model: Some(cfg.model.clone()),
-                endpoint: Some(url.clone()),
-                request: body_json,
-                response,
-                status,
-                error,
-                duration_ms: started.elapsed().as_millis() as u64,
-            },
-        );
-    }
+    let payload = body_json.to_string();
+    // 瞬时失败重试一次:本机 ai_logs 实测 527 次调用里 159 次超时 + 106 次 DNS 抖动,
+    // 都是重试就可能过的,而失败块只会静默保原文。内容类错误(JSON 坏、texts 长度
+    // 不符)与 4xx 不重试——原样再来一次只是再错一次。
+    let mut attempt = 0usize;
+    let result = loop {
+        let started = std::time::Instant::now();
+        let r = do_call_chunk(cfg, &url, &payload, paragraphs.len());
+        // 每次尝试各记一条 AI 日志:重试有没有发生、各花了多久,事后要能从日志直接看出来。
+        // 请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
+        if let Some(ctx) = log {
+            let (response, status, error) = match &r {
+                Ok((raw, _, _, _, _, _)) => (Value::String(raw.clone()), "ok", None),
+                Err(e) => (Value::Null, "error", Some(e.to_string())),
+            };
+            crate::ailog::record(
+                ctx,
+                crate::ailog::Draft {
+                    kind: "refine_chunk",
+                    provider: "openai".into(),
+                    model: Some(cfg.model.clone()),
+                    endpoint: Some(url.clone()),
+                    request: body_json.clone(),
+                    response,
+                    status,
+                    error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        }
+        if attempt >= 1 || !r.as_ref().err().is_some_and(retryable) {
+            break r;
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_S));
+    };
     result.map(|(_, glossary, texts, ents, relations, relations_valid)| {
         (glossary, texts, ents, relations, relations_valid)
     })
@@ -468,11 +527,14 @@ fn do_call_chunk(
     ChunkErr,
 > {
     let resp_text = ureq::post(url)
-        .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
+        .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
         .set("content-type", "application/json")
         .send_string(body)
-        .map_err(|e| ChunkErr::Network(e.into()))?
+        // 保持 Network 分类不变(密钥错等 4xx 也是 Network):outcome 靠"全部块都是
+        // 网络失败"判定 Failed,把 4xx 挪进 Content 会让密钥配错显示成"部分段落失败"。
+        // 该不该重试是另一回事,见 call_chunk 里的 retryable()。
+        .map_err(|e| ChunkErr::Network(anyhow::Error::new(e)))?
         .into_string()
         .map_err(|e| ChunkErr::Network(e.into()))?;
     let resp: Value = serde_json::from_str(&resp_text).map_err(|e| ChunkErr::Content(e.into()))?;
@@ -708,6 +770,31 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
+    /// 可指定状态码的 mock:按顺序对每个连接回一条 (status, body),并数清收到几次请求。
+    /// 重试用例靠这个计数断言"到底重没重试",而不是只看最终结果。
+    fn mock_server_with_status(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for (code, body) in responses {
+                let (mut s, _) = listener.accept().unwrap();
+                read_request(&mut s);
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
     /// 读到请求头结束(\r\n\r\n)且(若有 Content-Length)body 也读完为止;返回 body 文本。
     fn read_request(s: &mut std::net::TcpStream) -> String {
         let mut buf = Vec::new();
@@ -828,6 +915,81 @@ mod tests {
     }
 
     #[test]
+    fn worth_retry_only_for_transient_failures() {
+        assert!(worth_retry(None), "传输层错误(超时/DNS/连接断)必重试");
+        assert!(worth_retry(Some(429)), "限流是瞬时的");
+        for c in [500, 502, 503, 504] {
+            assert!(worth_retry(Some(c)), "{c} 是服务端瞬时状态");
+        }
+        for c in [400, 401, 403, 404, 422] {
+            assert!(!worth_retry(Some(c)), "{c} 重试只是原样再错一次,还白烧配额");
+        }
+    }
+
+    #[test]
+    fn transient_failure_retries_once_and_succeeds() {
+        // 实测里 30% 的块死在超时上、还有一批 DNS 抖动,都是重试就能过的;
+        // 而失败块是静默保原文的,用户只看到"部分段落未精修"。
+        let good = chat_body(&["我们肯定要做。"], "{}");
+        let (base, hits) = mock_server_with_status(vec![(503, "{}".into()), (200, good)]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![para("我们肯计要做。")];
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Done), "重试成功后应是完整成功");
+        assert_eq!(ps[0].text, "我们肯定要做。");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "应当重试了一次");
+    }
+
+    #[test]
+    fn client_error_is_not_retried() {
+        // 401/400 这类是配置错,重试一次只是再错一次,还多烧一次配额。
+        let good = chat_body(&["不该被用到"], "{}");
+        let (base, hits) = mock_server_with_status(vec![(401, "{}".into()), (200, good)]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![para("原文")];
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Failed), "全块网络失败即整体失败");
+        assert_eq!(ps[0].text, "原文");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "4xx 不得重试");
+    }
+
+    #[test]
+    fn content_error_is_not_retried() {
+        // 内容不合约(texts 长度不符)重试也是同一份坏响应,只会更慢。
+        let bad = chat_body(&["多了一段", "又多一段"], "{}");
+        let good = chat_body(&["不该被用到"], "{}");
+        let (base, hits) = mock_server_with_status(vec![(200, bad), (200, good)]);
+        let cfg = LlmConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let mut ps = vec![para("原文")];
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, None);
+        assert!(matches!(outcome, LlmOutcome::Partial(1)));
+        assert_eq!(ps[0].text, "原文");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "内容类错误不得重试");
+    }
+
+    #[test]
+    fn long_requests_get_a_much_larger_timeout_than_small_ones() {
+        // 分块精修要整块重写,实测中位 40s、p95 58s;标题只有几十 token,1.6s 就回来。
+        // 两者共用 60s 是这次故障的根:30% 的块正好死在墙上。
+        assert!(
+            CHUNK_TIMEOUT_S >= 3 * REQ_TIMEOUT_S,
+            "长请求超时至少要给到小请求的三倍"
+        );
+    }
+
+    #[test]
     fn length_mismatch_keeps_originals_as_partial() {
         let base = mock_server(vec![chat_body(
             &["只有一段", "但输入两段之外多了一段"],
@@ -911,7 +1073,14 @@ mod tests {
         let (outcome2, _ents2, _relations2) = polish(&cfg_bad, &mut ps2, Some(&ctx));
         assert!(matches!(outcome2, LlmOutcome::Failed));
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
-        assert_eq!(v["total"], 2);
+        // 3 而不是 2:连不上属于传输层瞬时失败,会重试一次,而**每次尝试各留一条日志**
+        // ——重试有没有发生、各花了多久,事后要能从 ai_logs 直接看出来。
+        assert_eq!(v["total"], 3);
+        assert_eq!(
+            v["entries"].as_array().unwrap().iter().filter(|e| e["status"] == "error").count(),
+            2,
+            "两次尝试都失败,两条错误日志"
+        );
         let all = serde_json::to_string(&v);
         assert!(!all.unwrap().contains("SECRET-KEY"), "api key 绝不落日志");
         let entries = v["entries"].as_array().unwrap();

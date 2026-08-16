@@ -56,6 +56,8 @@
   import { listPeople, type PersonSummary } from "$lib/people";
   import { schemeToDefaultPlayback, shouldFallbackToDual } from "$lib/audioScheme";
   import { getSettings } from "$lib/models";
+  import { refineReady } from "$lib/refineReady";
+  import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
@@ -126,6 +128,11 @@
   /** 设置页三档决定的默认回放(spec 2026-08-10)。增值层:取失败按 a(双轨)不打扰。
       挂载取一次即定,id 切换复位用它;会话内手动切换语义不变。 */
   let defaultPlayback = $state<"dual" | "mixed">("dual");
+  /** 会后 AI 开关与执行体就绪:决定「这场没做 AI 整理」提示的口径(见 $lib/aiSkipHint)。
+      与 defaultPlayback 同一次 getSettings 取,挂载取一次即定——去配置要离开本页,
+      回来时组件重挂载,自然拿到新值。 */
+  let refineOn = $state(false);
+  let refineConfigured = $state(false);
   let mixedInfo = $state<MixedPlaybackInfo | null>(null);
   /** 成品轨读数进行中:true 期间回落判定不抢跑——mixedInfo=null 是"未知"不是"确无"。 */
   let mixedPending = $state(true);
@@ -948,13 +955,27 @@
     refresh();
   });
 
-  // 挂载取一次设置：确定默认回放方案。增值层,取失败按 a(双轨)不打扰。
+  // 挂载取一次设置：确定默认回放方案 + 会后 AI 就绪口径。增值层,取失败按 a(双轨)
+  // 不打扰;AI 两项取失败按"开关关着"处理,即不提示——宁可不提示,不可误报。
   void getSettings()
     .then((s) => {
       defaultPlayback = schemeToDefaultPlayback(s.audio_scheme);
       playbackScheme = defaultPlayback;
+      refineOn = s.refine_enabled;
+      refineConfigured = refineReady(s);
     })
     .catch(() => {});
+
+  /** 「这场没做 AI 整理」:后端未配全时是完全静默降级的,不提示就等于没发生
+      (2026-08-13 起连断四天六场没被发现)。判定见 $lib/aiSkipHint。 */
+  const aiSkipped = $derived(
+    aiSkipHint({
+      llmStage: refined?.stages.llm,
+      noteComplete: note?.meta.state === "complete",
+      refineEnabled: refineOn,
+      ready: refineConfigured,
+    }),
+  );
 
   // ── 波形音轨:按音频总长等分 260 桶,取桶内段落 rms 峰值。观感三件套(首版全高
   //    平顶像方块阵,冒烟反馈"不像声音波形"):①按本条录音的 rms 峰值归一(AGC 后
@@ -1711,6 +1732,20 @@
 
     {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
     {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
+    <!-- 放在视图分支之外:切到原始稿也照样看得见——"这场 AI 没跑"是笔记级事实,
+         不是精修视图的局部状态。 -->
+    {#if aiSkipped}
+      <div class="banner">
+        {aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun")}
+        {#if aiSkipped === "unconfigured"}
+          <button class="link" onclick={() => goto("/ai")}>{t("notes.banner.aiConfigure")}</button>
+        {:else}
+          <button class="link" onclick={rerunRefine} disabled={refining}>
+            {refining ? t("notes.banner.aiRunning") : t("notes.banner.aiRun")}
+          </button>
+        {/if}
+      </div>
+    {/if}
     {#if effectiveView === "refined" && refined}
       <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
