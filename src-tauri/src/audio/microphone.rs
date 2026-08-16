@@ -115,6 +115,11 @@ impl AudioCapture for Microphone {
             let dropped_cb = dropped.clone();
             // 待补的丢样(每声道样本数):下一次成功发送时补在数据前面。
             let mut pending_drop: usize = 0;
+            // 通道已断(tap 提前退出,而 cpal 流要到 stop() 才停):此后一律不再构造
+            // 载荷。空的已断通道在 crossbeam 眼里"不满",不单独记一笔的话每个回调都会
+            // 零填一大段再吃一个 Disconnected,又变成实时线程上的兆级分配
+            // (Codex 九轮 P2)。
+            let mut sink_gone = false;
             let stream = match device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
@@ -144,18 +149,24 @@ impl AudioCapture for Microphone {
                     // 已攒到数秒,每个回调都零填一遍再被 try_send 立刻丢弃,就是在实时
                     // 线程上反复做兆级分配——那本身就会错过 CoreAudio 的截止时间,
                     // 正是本次改动要消除的丢音成因。满则只记账。
-                    let sent = if sink.is_full() {
+                    let sent = if sink_gone || sink.is_full() {
                         false
                     } else {
                         let (payload, ts) =
                             padded_frame(pending_drop, data, channels, sample_rate, host_time_ns);
-                        sink.try_send(AudioFrame {
+                        match sink.try_send(AudioFrame {
                             samples: payload,
                             sample_rate,
                             channels,
                             host_time_ns: ts,
-                        })
-                        .is_ok()
+                        }) {
+                            Ok(()) => true,
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                sink_gone = true;
+                                false
+                            }
+                            Err(_) => false,
+                        }
                     };
                     if sent {
                         pending_drop = 0; // 补出去了才清,失败要留着继续攒
