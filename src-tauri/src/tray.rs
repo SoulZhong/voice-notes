@@ -67,7 +67,9 @@ fn tray_enabled(app: &AppHandle) -> bool {
 /// 音频继续播(与音乐 App 一致),托盘就是唯一能停它的地方;没在播时插一个点了什么也
 /// 不发生的死项,比不插更糟。会话语义(装载不算播放,见 playback.svelte.ts)在前端,
 /// 故这个开关由前端经 set_playback_active 告知,后端不猜。
-fn menu_items(recording: bool, paused: bool, playback_active: bool) -> Vec<(&'static str, String)> {
+/// `session` 为 None 表示"还没有会话槽"(开录途中 running 已置真、会话尚未入槽的窗口),
+/// 此时不出暂停项——点了只会得到「没有正在进行的录制」(Codex P2)。
+fn menu_items(recording: bool, session: Option<bool>, playback_active: bool) -> Vec<(&'static str, String)> {
     let mut items = vec![(
         "toggle",
         if recording {
@@ -78,7 +80,7 @@ fn menu_items(recording: bool, paused: bool, playback_active: bool) -> Vec<(&'st
     )];
     // 暂停/恢复只在录制中出现:托盘存在的意义就是不开窗口也能控制,而此前只能开始/停止,
     // 唯独缺了最常用的暂停——接个电话就得把窗口翻出来。
-    if recording {
+    if let Some(paused) = session.filter(|_| recording) {
         items.push((
             "pause_toggle",
             if paused {
@@ -97,12 +99,13 @@ fn menu_items(recording: bool, paused: bool, playback_active: bool) -> Vec<(&'st
     items
 }
 
-/// 当前会话是否处于暂停。与「有没有在录」分开读:菜单文案要区分暂停/恢复。
+/// 会话槽快照:None = 没有会话(含"开录已置 running、会话还没入槽"的窗口),
+/// Some(paused) = 有会话且是否暂停。菜单据此决定要不要出暂停项、文案取哪个。
 /// 锁 statement-scoped,读完即放,不与其它锁嵌套(同本文件其它取值)。
-fn recording_paused(app: &AppHandle) -> bool {
+fn session_paused(app: &AppHandle) -> Option<bool> {
     app.try_state::<crate::AppState>()
-        .and_then(|s| s.session.lock().ok().map(|slot| slot.as_ref().is_some_and(|x| x.paused_at.is_some())))
-        .unwrap_or(false)
+        .and_then(|s| s.session.lock().ok().map(|slot| slot.as_ref().map(|x| x.paused_at.is_some())))
+        .flatten()
 }
 
 /// 当前是否有播放会话。try_state:托盘可能在 manage 之前建起来(setup 顺序变动时),
@@ -118,7 +121,7 @@ fn build_menu(app: &AppHandle, recording: bool) -> tauri::Result<Menu<tauri::Wry
     // 不必需,只要 vad 在 + 凭证齐就该点得亮——否则云端用户面对一个永远灰着的菜单项。
     let ready = crate::current_models_status(app).recording_ready;
     let mut built: Vec<MenuItem<tauri::Wry>> = Vec::new();
-    for (id, label) in menu_items(recording, recording_paused(app), playback_active(app)) {
+    for (id, label) in menu_items(recording, session_paused(app), playback_active(app)) {
         // toggle 之外的项恒可点:show/quit 无前置条件,stop_playback 只在有会话时才存在。
         let enabled = id != "toggle" || recording || ready;
         built.push(MenuItemBuilder::with_id(id, label).enabled(enabled).build(app)?);
@@ -145,7 +148,7 @@ fn on_menu_event(app: &AppHandle, id: &str) {
         // 丢阻塞线程池执行(同 toggle_recording 的理由):菜单回调跑在事件循环线程,
         // command() 会等 actor 回复,actor 正忙于停录收尾时同步等待会冻住整个 UI。
         "pause_toggle" => {
-            let paused = recording_paused(app);
+            let paused = session_paused(app).unwrap_or(false);
             let lc = app.state::<crate::lifecycle::LifecycleHandle>().inner().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let cmd = if paused { crate::lifecycle::Cmd::Unpause } else { crate::lifecycle::Cmd::Pause };
@@ -159,6 +162,13 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
+            }
+            // 事件不是粘性的:冷启动时托盘先于 webview 就绪,这一刻点了就丢(Codex P2)。
+            // 所以另存一份待办,前端挂载时主动领取;领到即清,事件先到也会顺手清掉。
+            if let Some(st) = app.try_state::<crate::AppState>() {
+                if let Ok(mut slot) = st.pending_nav.lock() {
+                    *slot = Some("/settings".to_string());
+                }
             }
             let _ = app.emit("tray_navigate", crate::ipc::TrayNavigateEvent { path: "/settings".into() });
         }
@@ -363,10 +373,10 @@ mod tests {
     }
 
     fn labels(recording: bool, playing: bool) -> Vec<String> {
-        menu_items(recording, false, playing).into_iter().map(|(_, l)| l).collect()
+        menu_items(recording, Some(false), playing).into_iter().map(|(_, l)| l).collect()
     }
     fn ids(recording: bool, playing: bool) -> Vec<&'static str> {
-        menu_items(recording, false, playing).into_iter().map(|(id, _)| id).collect()
+        menu_items(recording, Some(false), playing).into_iter().map(|(id, _)| id).collect()
     }
 
     /// 托盘菜单标签随界面语言切换。语言是进程级全局,故先拿 test_lang_guard 与其它
@@ -383,7 +393,7 @@ mod tests {
         );
         assert_eq!(labels(false, true)[1], "停止播放");
         assert_eq!(labels(true, false)[1], "暂停录制");
-        assert_eq!(menu_items(true, true, false)[1].1, "恢复录制");
+        assert_eq!(menu_items(true, Some(true), false)[1].1, "恢复录制");
 
         crate::i18n::set_lang("en");
         assert_eq!(labels(false, false)[0], "Start recording");
@@ -394,7 +404,7 @@ mod tests {
         );
         assert_eq!(labels(false, true)[1], "Stop playback");
         assert_eq!(labels(true, false)[1], "Pause recording");
-        assert_eq!(menu_items(true, true, false)[1].1, "Resume recording");
+        assert_eq!(menu_items(true, Some(true), false)[1].1, "Resume recording");
 
         crate::i18n::set_lang("zh");
     }
@@ -415,14 +425,17 @@ mod tests {
     /// 暂停/恢复只在录制中出现:空闲态给一个点了什么都不发生的「暂停录制」是死项。
     #[test]
     fn pause_item_only_while_recording() {
-        let ids_of = |rec, paused| {
-            menu_items(rec, paused, false).into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        let ids_of = |rec, paused: bool| {
+            menu_items(rec, Some(paused), false).into_iter().map(|(id, _)| id).collect::<Vec<_>>()
         };
         assert_eq!(ids_of(false, false), ["toggle", "show", "settings", "quit"]);
         assert_eq!(ids_of(true, false), ["toggle", "pause_toggle", "show", "settings", "quit"]);
         assert_eq!(ids_of(true, true), ["toggle", "pause_toggle", "show", "settings", "quit"]);
         // 空闲态即便 paused 位为真(不该发生)也不出这一项
         assert_eq!(ids_of(false, true), ["toggle", "show", "settings", "quit"]);
+        // 开录途中:running 已置真但会话还没入槽 → 不出暂停项(点了只会报"没有正在进行的录制")
+        let no_session = menu_items(true, None, false).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(no_session, ["toggle", "show", "settings", "quit"]);
     }
 
     /// 录制动画的可见性契约:6 帧必须两两不同,且都不等于静止帧。

@@ -124,12 +124,21 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
     recording.init();
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
     // 不等下一次 peopleVersion 变化。layout 常驻,不必解绑。
-    void listen("identify_done", () => void tidy.refresh());
+    const unIdentify = listen("identify_done", () => void tidy.refresh());
     // 托盘「打开设置」:后端只负责亮出窗口,路由在前端。挂在 layout(常驻)而不是设置页,
     // 否则只有已经在设置页时才生效。
-    void onTrayNavigate((e) => {
-      if (e.path.startsWith("/")) goto(e.path);
+    const unTrayNav = onTrayNavigate((e) => {
+      if (!e.path.startsWith("/")) return;
+      goto(e.path);
+      // 顺手清掉后端那份待办:事件已经送到,不清的话下次重挂载会再跳一次。
+      void invoke("take_pending_nav").catch(() => {});
     });
+    // 冷启动补领:托盘在 webview 就绪之前就存在,那一刻点「打开设置」发的事件没人接。
+    void invoke<string | null>("take_pending_nav")
+      .then((path) => {
+        if (path && path.startsWith("/")) goto(path);
+      })
+      .catch(() => {});
     // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——
     // 主题保持默认(等价跟随系统),语言保持 i18n 默认(zh,与历史行为一致)
     getSettings()
@@ -144,6 +153,12 @@ import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
         if (u.has_update && !updateDismissed(u.latest)) update = u;
       })
       .catch(() => {}); // 断网/限流:静默不打扰
+    // 退订两条原生监听(Codex P2):listen() 返回的是 Promise<UnlistenFn>,丢掉它的话
+    // layout 每次重挂载(HMR/重开窗口)都会再叠一层,一次托盘点击会触发多个陈旧回调。
+    return () => {
+      void Promise.resolve(unIdentify).then((f) => f());
+      void Promise.resolve(unTrayNav).then((f) => f());
+    };
   });
 </script>
 
