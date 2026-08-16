@@ -21,8 +21,6 @@
     type UpdateInfo,
     type UpdateProgress,
   } from "$lib/update";
-  import { onTrayNavigate, type TrayNavigateEvent } from "$lib/events";
-  import { markNavigated, navVersion } from "$lib/navIntent";
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
@@ -86,8 +84,6 @@
 
   let welcomeStatus = $state<ModelsStatus | null>(null);
   async function checkOnboarding() {
-    // 进入 await 前记下版本,回来时比对(Codex P2/P4)。
-    const v = navVersion();
     try {
       let s = await getSettings();
       const m = await modelsStatus();
@@ -95,10 +91,6 @@
         s = { ...s, onboarded: true };
         await setSettings(s);
       }
-      // 显式导航优先(Codex P2/P6):这段跑在两个 IPC 之后,冷启动时可能晚于托盘
-      // 「打开设置」落地。两个分支都要让路——功能引导会把人从设置页拽到 /ai,
-      // 欢迎浮层是全屏覆盖,盖上去等于「点了没反应」。两者下次启动都还会再来。
-      if (navVersion() !== v) return;
       const needsBaseSetup = !s.onboarded;
       const needsAiGuide = !s.completed_guides.includes(AI_TOOLS_GUIDE_ID);
       if (needsBaseSetup) {
@@ -132,35 +124,6 @@
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
     // 不等下一次 peopleVersion 变化。layout 常驻,不必解绑。
     const unIdentify = listen("identify_done", () => void tidy.refresh());
-    // 托盘「打开设置」:后端只负责亮出窗口,路由在前端。挂在 layout(常驻)而不是设置页,
-    // 否则只有已经在设置页时才生效。
-    // 按请求号去重(Codex 五轮):点击落在监听注册之后、补领到达 Rust 之前时,同一次点击
-    // 会从事件与补领两条通道各来一次;晚到的那份若也导航,就会在用户离开设置页之后把人
-    // 又拽回去。后端发号,前端只认比处理过的更大的号。
-    let lastTrayNav = 0;
-    const trayNavTo = (e: TrayNavigateEvent) => {
-      if (!e.path.startsWith("/") || e.id <= lastTrayNav) return;
-      lastTrayNav = e.id;
-      markNavigated(); // 必须在 goto 之前:自动重定向据此让路(见 navIntent.ts)
-      // 已经支起来的欢迎浮层要撤掉:它是全屏覆盖,不撤的话跳到设置页也只看得见浮层,
-      // 首启动用户会以为托盘「打开设置」坏了(Codex P6)。浮层下次启动照常再来。
-      welcomeStatus = null;
-      goto(e.path);
-    };
-    const unTrayNav = onTrayNavigate((e) => {
-      trayNavTo(e);
-      // 顺手清掉后端那份待办:事件已经送到,不清的话下次重挂载会再跳一次。
-      void invoke("take_pending_nav").catch(() => {});
-    });
-    // 冷启动补领:托盘在 webview 就绪之前就存在,那一刻点「打开设置」发的事件没人接。
-    // **必须等监听注册完再领**(Codex P2):listen() 是异步的,若先领到 null、随后用户
-    // 在注册落地前点了托盘,那次点击既没人接、也不会再被领走,窗口亮了却不跳页。
-    void Promise.resolve(unTrayNav)
-      .then(() => invoke<TrayNavigateEvent | null>("take_pending_nav"))
-      .then((pending) => {
-        if (pending) trayNavTo(pending);
-      })
-      .catch(() => {});
     // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——
     // 主题保持默认(等价跟随系统),语言保持 i18n 默认(zh,与历史行为一致)
     getSettings()
@@ -175,11 +138,10 @@
         if (u.has_update && !updateDismissed(u.latest)) update = u;
       })
       .catch(() => {}); // 断网/限流:静默不打扰
-    // 退订两条原生监听(Codex P2):listen() 返回的是 Promise<UnlistenFn>,丢掉它的话
-    // layout 每次重挂载(HMR/重开窗口)都会再叠一层,一次托盘点击会触发多个陈旧回调。
+    // 退订原生监听(Codex P2):listen() 返回的是 Promise<UnlistenFn>,丢掉它的话
+    // layout 每次重挂载(HMR/重开窗口)都会再叠一层,一次事件会触发多个陈旧回调。
     return () => {
       void Promise.resolve(unIdentify).then((f) => f());
-      void Promise.resolve(unTrayNav).then((f) => f());
     };
   });
 </script>
