@@ -209,6 +209,11 @@ pub struct SyncInfo {
     /// 新增字段走 serde default:老记录按 0 读入,不破坏反序列化。
     #[serde(default)]
     pub hw_gaps: u32,
+    /// 按硬件时戳判定并**已补回时间轴**的洞总时长(ms)。hw_gaps 只说发生过几次,
+    /// 这个说丢了多久、补了多久——没有它,1694 次断裂对应多少秒无从对账
+    /// (2026-08-16 事故:438 秒被直接压掉,当时只能靠 drift_ms 反推)。
+    #[serde(default)]
+    pub hw_gap_ms: u64,
     /// 采集→tap 队列深度高水位。持续走高 = tap 或其下游追不上采集节奏。
     #[serde(default)]
     pub cap_queue_hw: u32,

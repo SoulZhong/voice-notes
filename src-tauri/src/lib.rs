@@ -2264,6 +2264,7 @@ fn persist_track_sync(
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,
             hw_gaps: h.hw_gaps,
+            hw_gap_ms: h.hw_gap_ms,
             cap_queue_hw: h.cap_queue_hw,
             send_wait_ms: h.send_wait_ms,
             send_wait_max_ms: h.send_wait_max_ms,
