@@ -107,16 +107,24 @@
   let refinedLoading = $state(0);
   /** 重取失败,手里这份可能是过期稿:提示一律不出,直到某次重取成功。 */
   let refinedStale = $state(false);
-  /** 发起一次取稿:占号 + 计入在途。每个 begin 必须配一个 endRefinedLoad(放 finally)。 */
+  /** 发起一次取稿:占号 + 计入在途。每个 begin 必须配一个 endRefinedLoad(放 finally)。
+      untrack 不可省:`refinedLoading += 1` 是"读 + 写",而 refresh() 是在 $effect 里
+      **同步**调到这里的——不 untrack 的话那个 effect 会把 refinedLoading 记成依赖、
+      又亲手改它,自我失效成死循环,Svelte 抛 effect_update_depth_exceeded 中止整页
+      渲染,笔记页永远停在"加载中"(2026-08-16 真机撞到)。 */
   function beginRefinedLoad(): number {
-    refinedLoading += 1;
+    untrack(() => {
+      refinedLoading += 1;
+    });
     refinedSeq += 1;
     return refinedSeq;
   }
   /** 结束一次取稿。committed=false 且自己仍是最新请求时,说明手里这份可能过期
       (取失败/取回来是 null/守卫没过),提示一律不出——被更新的请求顶掉则不算。 */
   function endRefinedLoad(seq: number, committed: boolean) {
-    refinedLoading -= 1;
+    untrack(() => {
+      refinedLoading -= 1;
+    });
     if (!committed && seq === refinedSeq) refinedStale = true;
   }
   /** 只有仍是最新一次请求、且没切走笔记时才落地;返回是否真的落了。
