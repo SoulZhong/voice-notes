@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { envelopeStep, shapeLevel, normalizeBars, barStyle, barCountFor } from "$lib/liveWave";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
@@ -376,14 +377,18 @@
   const micPct = $derived.by(() => pctOf(recording.levels.mic));
   const sysPct = $derived.by(() => pctOf(recording.levels.system));
 
-  // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移,
-  //    滚动保留最近 240 条(约 29s);暂停冻结不清空,停止清空。interval 回调里读
-  //    micPct/sysPct 是瞬时值,不进 effect 依赖。
+  // ── 实时音轨(录音机式):录制中每 120ms 采样一次电平,新条从右缘进入、旧条左移;
+  //    暂停冻结不清空,停止清空。interval 回调里读 micPct/sysPct 是瞬时值,不进 effect 依赖。
   //    波形只画 mic(冒烟反馈:双轨两行太吵);系统声降级为「对方」指示灯——
-  //    sysHold 是带保持的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),灯不闪烁。 ──
-  const LIVE_BARS = 240;
+  //    sysHold 是带保持的活跃计数(检出电平充 8 格≈1s,无声逐格衰减),灯不闪烁。
+  //
+  //    存的是**包络**不是瞬时值(见 liveWave.ts):快起慢落填平音节间低谷,否则 120ms
+  //    采样撞上 ~4Hz 音节调制,画出来是断续栅栏。整形(噪声门/gamma/峰值归一)在渲染侧做。 ──
+  const LIVE_BARS = 420; // 上限约 50s 历史;实际画多少根按容器宽度定(节距 4px)
+  const WAVE_PEAK_PX = 24; // 峰值条高;容器 34px,留头免得顶到边
   let liveBarsMic = $state<number[]>([]);
   let sysHold = $state(0);
+  let waveW = $state(0);
   $effect(() => {
     if (!recording.isLive) {
       liveBarsMic = [];
@@ -392,18 +397,22 @@
     }
     if (recording.paused) return; // 冻结:不采样,已有波形保留
     const t = setInterval(() => {
-      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), micPct];
+      const prev = liveBarsMic.length > 0 ? liveBarsMic[liveBarsMic.length - 1] : 0;
+      liveBarsMic = [...liveBarsMic.slice(-(LIVE_BARS - 1)), envelopeStep(prev, micPct)];
       sysHold = sysPct > 0 ? 8 : Math.max(0, sysHold - 1);
     }, 120);
     return () => clearInterval(t);
   });
-  /** 渲染用:前导补零到 LIVE_BARS,让波形从开录起就铺满整行(与详情页全宽波形一致),
-      而非少量样本挤在右缘、左侧留大片空——补的零段是低平基线,新声仍从右侧进入。 */
-  const liveBarsMicView = $derived(
-    liveBarsMic.length >= LIVE_BARS
-      ? liveBarsMic
-      : [...new Array(LIVE_BARS - liveBarsMic.length).fill(0), ...liveBarsMic],
-  );
+  /** 渲染用:按容器宽度决定根数(节距 4px),取最近这么多帧;不足则前导补零——
+      让波形从开录起就铺满整行(补的零段是安静基线),新声仍从右侧进入。 */
+  const liveBars = $derived.by(() => {
+    const n = barCountFor(waveW, LIVE_BARS);
+    const tail = liveBarsMic.slice(-n);
+    const pad = n - tail.length;
+    const pcts = pad > 0 ? [...new Array(pad).fill(0), ...tail] : tail;
+    // 峰值归一在**可见窗口内**做:最响的一根顶到满格,整段都轻时不放大底噪(有下限)。
+    return normalizeBars(pcts.map((p) => shapeLevel(p))).map((v) => barStyle(v, WAVE_PEAK_PX));
+  });
 
   // ── 歌词式跟随：新内容到达自动滚到最新；用户上滑即暂停跟随，滚回底部自动恢复 ──
   // 录制中转写容器带 50vh 底部留白(见 .transcript.live)，「滚到底」因此恰好把
@@ -621,10 +630,24 @@
              只画 mic 一条(冒烟反馈:双行太吵);系统声是否在收音由右侧「对方」
              指示灯回答——有电平点亮 mint 色,静默退灰。 -->
         {#if recording.isLive}
-          <div class="wave-live" class:frozen={recording.paused} title={t("record.micLevel")} aria-hidden="true">
-            {#each liveBarsMicView as h, i (i)}<span class="bar" style="height: {Math.max(6, h)}%"></span>{/each}
+          <div
+            class="wave-live"
+            class:frozen={recording.paused}
+            title={t("record.micLevel")}
+            aria-hidden="true"
+            bind:clientWidth={waveW}
+          >
+            {#each liveBars as b, i (i)}<span
+                class="bar"
+                class:silent={b.silent}
+                style="height: {b.height}px; opacity: {b.opacity}"
+              ></span>{/each}
           </div>
-          <span class="sys-ind" class:on={sysHold > 0} title={t("record.systemLevel")}>{t("record.badge.them")}</span>
+          <!-- 「对方」指示灯改「点 + 字」,与右侧「录制中」状态点同一套语汇;
+               此前是描边小方盒,0.68rem 字挤在 1px 边框里,近看糙、远看认不出。 -->
+          <span class="sys-ind" class:on={sysHold > 0} title={t("record.systemLevel")}>
+            <span class="sys-dot"></span>{t("record.badge.them")}
+          </span>
         {/if}
 
         <!-- 右:计时 + 状态,同一簇(不再单挂一行);状态点是唯一动态信号。
@@ -1002,12 +1025,14 @@
   }
   .sym.dot { border-radius: var(--radius-full); background: var(--record); }
   .sym.dot.on-blue { background: var(--on-primary); }
-  .sym.square { border-radius: 2px; background: var(--record); }
+  /* 方块 8px:9px 的实心方块在 0.9rem 文字旁偏重,压过并排的文字 */
+  .sym.square { width: 8px; height: 8px; border-radius: 2px; background: var(--record); }
+  /* 竖条收到 2px:3px 在这个字号旁显糙(视觉上像两根短粗棍而不是暂停符) */
   .sym.pause {
-    width: 8px;
+    width: 7px;
     height: 10px;
-    border-left: 3px solid currentColor;
-    border-right: 3px solid currentColor;
+    border-left: 2px solid currentColor;
+    border-right: 2px solid currentColor;
   }
   .sym.play {
     width: 0;
@@ -1064,43 +1089,81 @@
   .wave-live {
     flex: 1;
     min-width: 0;
-    height: 32px;
+    height: 34px;
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 1px;
+    gap: 2px;
     overflow: hidden;
+    /* 左缘淡出:滚动历史"淡入过去",顺带消掉 overflow 的硬切边 */
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 56px, #000 100%);
+    mask-image: linear-gradient(90deg, transparent 0, #000 56px, #000 100%);
+  }
+  /* 贯穿基线:静音时看到的就是这条线,把条串成一根轴而不是一排浮空的破折号。
+     画在条的下面(z-index),静音条 1px 叠上去只是让"采过样"的区段略实一点。 */
+  .wave-live::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 1px;
+    transform: translateY(-0.5px);
+    background: var(--hairline);
+    pointer-events: none;
   }
   /* 「对方」指示灯:系统声在收音时点亮(mint,同 .badge.system 配色令牌),静默退灰。
      常驻占位不闪现,回答"对方声音有没有在录"而不额外占一行波形。 */
+  /* 点 + 字,与右侧「录制中」同语汇;不再是描边小方盒(0.68rem 字挤在 1px 边框里显糙)。
+     收音时点亮 mint,静默退灰——回答"对方声音有没有在录",不额外占一行波形。 */
   .sys-ind {
     flex: none;
-    font-size: 0.68rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    font-size: 0.8rem;
     font-weight: 500;
     line-height: 1;
-    padding: 0.15em 0.4em;
-    border-radius: var(--radius-sm);
+    white-space: nowrap;
     color: var(--ink-faint);
-    border: 1px solid var(--hairline);
-    transition: background 200ms, color 200ms;
+    transition: color 200ms;
+  }
+  .sys-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--hairline-strong);
+    transition: background 200ms;
   }
   .sys-ind.on {
-    background: var(--tint-mint);
     color: var(--tint-mint-ink);
-    border-color: transparent;
   }
+  .sys-ind.on .sys-dot {
+    background: var(--tint-mint-ink);
+  }
+  /* 条:定宽 2px、节距 4px(gap 2px),根数由容器宽度定(见 barCountFor)——
+     此前是 flex:1 把 240 根拉满任意宽度,在宽屏上被抻成一排 4~5px 的破折号。 */
   .wave-live .bar {
-    flex: 1;
-    min-width: 1px;
-    min-height: 2px;
-    border-radius: var(--radius-full);
+    position: relative;
+    z-index: 1;
+    width: 2px;
+    flex: none;
+    border-radius: 1px;
     background: var(--record);
+  }
+  /* 静音段不上红:只留 1px 的安静基线色。红是"录制中"的信号色,不该被静音铺满整行。 */
+  .wave-live .bar.silent {
+    background: var(--hairline-strong);
   }
   .wave-live.frozen .bar {
     background: var(--ink-faint);
   }
-  /* 冻结波形整体退后:低电平段在暂停态下呈虚线感,降透明度免得像一条破折号横贯全行 */
+  .wave-live.frozen .bar.silent {
+    background: var(--hairline);
+  }
+  /* 冻结波形整体退后(暂停态由整条 warning 底 + 状态字承担醒目度,波形只作背景交代) */
   .wave-live.frozen {
-    opacity: 0.35;
+    opacity: 0.45;
   }
 
   /* 回看工具条:页内搜索 + 说话人过滤 chips，紧贴 controls 下方。 */
