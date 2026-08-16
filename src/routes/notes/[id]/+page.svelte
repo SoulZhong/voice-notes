@@ -91,6 +91,10 @@
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
   let refining = $state(false);
+  /** 在跑状态是否已确定:进页那一刻 refining 还是默认 false,而 run_local 一开始就把
+      stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
+      还给出一个后端必然拒绝的重跑按钮(Codex P2 四轮)。未确定期间一律不提示。 */
+  let refineStatusKnown = $state(false);
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -767,6 +771,7 @@
     // refining=true,执行体没配全时后面也不会再有 running 事件,作废了横幅就会在
     // 整理还没结束时冒出来(Codex P2 两轮)。
     let sawTerminal = false;
+    refineStatusKnown = false;
     onRefine((e) => {
       if (e.note_id !== forId) return;
       if (e.state === "running") {
@@ -794,7 +799,11 @@
       .then((r) => {
         if (r && !disposed && !sawTerminal && forId === id) refining = true;
       })
-      .catch(() => {});
+      .catch(() => {})
+      // 无论成败都算"已确定":查询失败时按事件为准,总不能永远不提示。
+      .finally(() => {
+        if (!disposed && forId === id) refineStatusKnown = true;
+      });
     return () => {
       disposed = true;
       unlisten?.();
@@ -990,7 +999,8 @@
     aiSkipHint({
       llmStage: refined?.stages.llm,
       noteComplete: note?.meta.state === "complete",
-      running: refining,
+      // 未确定期间按"可能在跑"处理:宁可晚一拍提示,不可在整理途中误报。
+      running: refining || !refineStatusKnown,
       refineEnabled: refineOn,
       ready: refineConfigured,
     }),
