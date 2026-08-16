@@ -17,6 +17,8 @@ pub mod neural_aec;
 pub mod host_time;
 pub mod drift_dll;
 pub mod actual_rate;
+// 麦克风模式(系统层「语音突显」检测):双平台同形,非 macOS 恒 Unknown。
+pub mod mic_mode;
 #[cfg(target_os = "macos")]
 pub mod system;
 #[cfg(target_os = "macos")]
@@ -60,6 +62,7 @@ pub trait AudioCapture: Send {
     fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()>;
     /// 停止采集并释放设备。
     fn stop(&mut self);
+
 }
 
 /// 采集流运行期事件(启动期错误走 start 的 Err,不在此列)。

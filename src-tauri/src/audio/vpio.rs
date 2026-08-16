@@ -394,6 +394,15 @@ unsafe fn build_vpio_unit(sink: Sender<AudioFrame>) -> Result<VpioHandle, String
     }
 
     eprintln!("VPIO(AEC)麦克风已启动: {sample_rate} Hz, f32 mono");
+    // 与 microphone.rs 同一条诊断:系统层「语音突显」会把非人声削成绝对零,
+    // 这条路径也要留痕,否则 capture_path=vpio 的场次事后分不清是系统削的还是
+    // 我们链路丢的(Codex 十轮 P2)。
+    let mm = crate::audio::mic_mode::active();
+    if mm.damages_audio() {
+        eprintln!("[采集] 麦克风模式=语音突显:系统会把非人声削成绝对零,建议在控制中心改回「标准」");
+    } else {
+        eprintln!("[采集] 麦克风模式={}", mm.as_str());
+    }
     Ok(VpioHandle { unit, ctx })
 }
 

@@ -29,6 +29,9 @@ export const zh = {
   "record.banner.mcpHint": "新功能：把会议笔记接入 Claude / Cursor 等 AI 助手（MCP）。",
   "record.banner.mcpGo": "去 AI 页",
   "record.banner.mcpDismiss": "知道了",
+  "record.banner.micIsolation":
+    "系统「语音突显」已开启：它会把它认为不是人声的部分削成绝对静音，实测会连人声一起削掉(有场录音因此丢了近两成语音)。",
+  "record.banner.micIsolationHow": "改法：录制时点菜单栏控制中心 → 麦克风模式 → 标准。",
   "record.banner.btEcho": "蓝牙耳机延迟可能影响回声消除效果，建议改用有线耳机或内置扬声器。",
   "record.banner.lowInput": "麦克风输入音量偏低（{vol}%），可能录得很轻。",
   "record.banner.setVolume": "调到 {target}%",
@@ -102,6 +105,9 @@ export const en = {
   "record.banner.mcpHint": "New: connect your meeting notes to AI assistants like Claude / Cursor (MCP).",
   "record.banner.mcpGo": "Open AI page",
   "record.banner.mcpDismiss": "Got it",
+  "record.banner.micIsolation":
+    "macOS Voice Isolation is on: it mutes whatever it decides is not speech to digital silence, and it cuts real speech too (one recording here lost nearly 20% of its speech that way).",
+  "record.banner.micIsolationHow": "Fix: while recording, open Control Center in the menu bar \u2192 Mic Mode \u2192 Standard.",
   "record.banner.btEcho":
     "Bluetooth headset latency may affect echo cancellation; consider using wired headphones or the built-in speaker instead.",
   "record.banner.lowInput": "Microphone input volume is low ({vol}%); the recording may be very quiet.",

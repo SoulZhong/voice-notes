@@ -2264,6 +2264,7 @@ fn persist_track_sync(
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,
             hw_gaps: h.hw_gaps,
+            hw_gap_ms: h.hw_gap_ms,
             cap_queue_hw: h.cap_queue_hw,
             send_wait_ms: h.send_wait_ms,
             send_wait_max_ms: h.send_wait_max_ms,
@@ -2391,6 +2392,14 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
     } else if let Err(e) = lc.command(lifecycle::Cmd::Start { resume_id: None }) {
         eprintln!("快捷键触发开录失败(静默进日志): {e}");
     }
+}
+
+/// 当前系统麦克风模式("standard" / "wide_spectrum" / "voice_isolation" / "unknown")。
+/// 录制页据此告警:语音突显会把非人声削成绝对零(见 audio::mic_mode 文档)。
+/// 只报状态不拦录制——它是提示,不是门禁;读不到一律 "unknown",UI 不提示。
+#[tauri::command]
+fn mic_mode() -> &'static str {
+    crate::audio::mic_mode::active().as_str()
 }
 
 /// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
@@ -7554,7 +7563,8 @@ pub fn run() {
             player::player_seek,
             player::player_set_muted,
             player::player_stop,
-            set_playback_active
+            set_playback_active,
+            mic_mode
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

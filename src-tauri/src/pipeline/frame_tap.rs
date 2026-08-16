@@ -107,6 +107,18 @@ const RATE_TOLERANCE: f64 = 0.01;
 /// 推得更歪——这时保留声明值并留日志。
 const RATE_SANITY: (f64, f64) = (0.5, 2.0);
 
+/// 判洞的绝对下限(与"至少缺一整帧"取大者):挡住时戳量化与设备时钟抖动
+/// (实测同帧内 <100µs),也避免超短帧场景下把噪声当洞。
+const HW_HOLE_MIN: Duration = Duration::from_millis(3);
+
+/// 判洞比较的舍入容差:见 holey 处注释。
+const HW_ROUND_TOL: Duration = Duration::from_millis(1);
+
+/// 单个补零帧的上限时长。一次长断流(睡眠/长时间无回调)的洞可能是分钟级,
+/// 一把 Vec 分配下去就是上百 MB(Codex P1);按这个粒度切块发,峰值内存可控。
+const FILL_CHUNK: Duration = Duration::from_millis(200);
+
+
 /// 每源健康计数(原子字段,tap 线程写、查询命令读,无锁)。
 #[derive(Default)]
 pub struct SourceHealth {
@@ -124,6 +136,10 @@ pub struct SourceHealth {
     /// 的直接计数:消费端再慢,只要采集连续,hw 时基就连续,此值不动——与
     /// send_wait/cap_queue_hw 合起来能把「worker 慢」和「设备/HAL 丢帧」分开。
     pub hw_gaps: AtomicU32,
+    /// 按硬件时戳判定并**已补回时间轴**的洞总时长(ms)。hw_gaps 只说"发生过",
+    /// 这个说"丢了多久、补了多久"——1694 次断裂对应多少秒,此前无从对账
+    /// (2026-08-16:一场 98 分钟录音 438 秒被直接压掉,就是因为只计数不补)。
+    pub hw_gap_ms: AtomicU64,
     /// 采集→tap 队列深度高水位(tap 每收一帧采样一次残余深度)。持续走高 =
     /// tap 或其下游追不上采集节奏。
     pub cap_queue_hw: AtomicU32,
@@ -147,6 +163,8 @@ pub struct HealthSnapshot {
     pub restarts: u32,
     pub rate_fixes: u32,
     pub hw_gaps: u32,
+    #[serde(default)]
+    pub hw_gap_ms: u64,
     pub cap_queue_hw: u32,
     pub send_wait_ms: u64,
     pub send_wait_max_ms: u64,
@@ -163,6 +181,7 @@ impl SourceHealth {
             restarts: self.restarts.load(Ordering::Relaxed),
             rate_fixes: self.rate_fixes.load(Ordering::Relaxed),
             hw_gaps: self.hw_gaps.load(Ordering::Relaxed),
+            hw_gap_ms: self.hw_gap_ms.load(Ordering::Relaxed),
             cap_queue_hw: self.cap_queue_hw.load(Ordering::Relaxed),
             send_wait_ms: self.send_wait_ms.load(Ordering::Relaxed),
             send_wait_max_ms: self.send_wait_max_ms.load(Ordering::Relaxed),
@@ -464,6 +483,10 @@ fn run_frame_tap_with_drift(
     // 误差不再累积。
     let mut anchor: Option<Instant> = None;
     let mut forwarded = Duration::ZERO;
+    // 采集时钟原点:首个带硬件时戳的帧,连同**那一刻已转发的时长**一起记。
+    // 只记时戳不记基线的话,原点之前那些无时戳帧的时长白白算进 forwarded,
+    // 欠账被永久低估、后面的洞就补不满(Codex P2)。
+    let mut hw_origin: Option<(u64, Duration)> = None;
     // 本次断流是否已计 gap / 已报 stall(去抖:恢复前不重复)。
     let mut gap_counted = false;
     let mut stalled = false;
@@ -485,6 +508,10 @@ fn run_frame_tap_with_drift(
     loop {
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
+                // 本帧之前按硬件时戳判定的采集洞,转发真实帧前先补齐。两类丢失都走这里:
+                // HAL 侧丢的,和我们自己回调 try_send 丢的——后者同样会在下一帧的时戳上
+                // 如实体现(采集回调不自己补零,理由见 microphone.rs 那段注释)。
+                let mut pending_hole = Duration::ZERO;
                 // Task 5:真实帧原始声明率下喂 DriftMonitor(必须在下方时钟核对
                 // 改写 sample_rate 之前——DLL 要的是设备原始声明率口径的样本计数
                 // 与真实时间戳)。
@@ -589,7 +616,32 @@ fn run_frame_tap_with_drift(
                                     0.0
                                 };
                                 let declared = frame.sample_rate as f64;
+                                // 洞的判据不能挂在 RATE_SANITY 上(Codex P1):丢掉**一个**
+                                // 等长回调时 delta 恰好翻倍、implied 正好等于 declared*0.5,
+                                // 卡在夹板下沿之内——最常见的单帧丢失既不会被认成洞,还会
+                                // 把"一半速率"喂进对账窗口。改为直接看时戳差与所携样本时长
+                                // 的缺口:超过 HW_HOLE_MIN 就是洞。
+                                // 期望时长按**当前生效**的率算(已改写过就用改写值):
+                                // 时戳量的是真实时间,只有拿真实率折样本数才对得上。
+                                let effective =
+                                    applied_rate.unwrap_or(frame.sample_rate).max(1) as f64;
+                                let carried =
+                                    Duration::from_secs_f64(clock_hw_pending as f64 / effective);
+                                let hole = delta.saturating_sub(carried);
+                                // 判洞门槛是"至少缺一整帧"。低于此的持续小缺口是**慢时钟**
+                                // (声明 48k 实跑 32k:每帧都缺半帧),那归对账改率处理,
+                                // 误判成洞会每帧清统计,改率永远收敛不了(实测打红两条老
+                                // 用例);而丢掉一个等长回调恰好缺满一帧,正好被认出来。
+                                // 容差(Codex 十轮 P1):设备周期不是整纳秒时,丢一个回调
+                                // 算出来的 hole 可能比 carried 差个位数纳秒(512 帧 @48k:
+                                // carried 10_666_667ns,两周期时戳差 21_333_333ns),严格
+                                // 比较会漏掉这类最常见的单缓冲丢失。1ms 远小于慢时钟场景
+                                // 的判别间距(48k 声明/44.1k 实跑每帧才差 0.88ms),不会
+                                // 把慢时钟误判成洞。
+                                let holey =
+                                    ns > prev && hole + HW_ROUND_TOL >= carried.max(HW_HOLE_MIN);
                                 let usable = ns > prev
+                                    && !holey
                                     && delta < policy.fill_after
                                     && implied >= declared * RATE_SANITY.0
                                     && implied <= declared * RATE_SANITY.1;
@@ -597,11 +649,27 @@ fn run_frame_tap_with_drift(
                                     clock_span += delta;
                                     clock_samples += clock_hw_pending;
                                 } else {
+                                    // 时间过去了、样本没来 = 采集侧真有洞(HAL 丢,或我们的
+                                    // 回调 try_send 丢)。只计数不补的话时间轴被直接压缩,
+                                    // 转写时间戳与音频越走越偏,内容也悄无声息地少了
+                                    // (Codex P0)。突发缓冲回吐(样本比时间多)不是洞,不补。
+                                    if holey {
+                                        pending_hole = hole;
+                                        // 洞有多长在**检测时**就记账,不等补了多少才记
+                                        // (Codex 八轮 P2):断流补零可能已经填过其中一段,
+                                        // 按残余量记会把 1 秒的洞记成 500ms,这个字段就
+                                        // 失去了"到底丢了多久"的意义。
+                                        health.hw_gap_ms.fetch_add(
+                                            hole.as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
                                     clock_span = Duration::ZERO;
                                     clock_samples = 0;
                                     health.hw_gaps.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            hw_origin.get_or_insert((ns, forwarded));
                             clock_hw_prev = Some(ns);
                             clock_hw_pending = per_channel as u64;
                         }
@@ -688,6 +756,49 @@ fn run_frame_tap_with_drift(
                             );
                         }
                     }
+                }
+                // 补洞必须发生在**给本帧记账之前**(Codex P1):零帧排在真实帧前面,
+                // 若先把本帧的时长记进 forwarded,欠账就少算一帧,每次修补都短一截、
+                // 真实帧也被放早了。
+                //
+                // 上限用**采集时钟**的欠账而不是墙钟(Codex P1):墙钟包含这一帧在队列里
+                // 排的时间,背压越重越虚高,会把 Timeout 分支已经补过的那段再补一遍。
+                // 采集时钟(首帧时戳到本帧时戳)减去已转发时长,才正好是"还缺多少音频"。
+                if pending_hole > Duration::ZERO && frame.sample_rate > 0 {
+                    let captured = match (hw_origin, frame.host_time_ns) {
+                        (Some((o, base)), Some(ns)) if ns > o => base + Duration::from_nanos(ns - o),
+                        // 没有时戳原点就退回墙钟(与断流补零同口径,只会更保守)。
+                        _ => anchor.map(|a| a.elapsed()).unwrap_or(Duration::ZERO),
+                    };
+                    let fill = pending_hole.min(captured.saturating_sub(forwarded));
+                    let mut left = fill;
+                    let ch = frame.channels.max(1) as usize;
+                    while left > Duration::ZERO {
+                        let step = left.min(FILL_CHUNK);
+                        let n = (step.as_secs_f64() * frame.sample_rate as f64) as usize;
+                        if n == 0 {
+                            break;
+                        }
+                        forwarded += Duration::from_secs_f64(n as f64 / frame.sample_rate as f64);
+                        let ms = (n as u64 * 1000) / frame.sample_rate as u64;
+                        health.silence_ms.fetch_add(ms, Ordering::Relaxed);
+                        let silence = AudioFrame {
+                            samples: vec![0.0; n * ch],
+                            sample_rate: frame.sample_rate,
+                            channels: frame.channels,
+                            host_time_ns: None, // 合成帧,不参与时钟核对
+                        };
+                        if to_worker.send(silence).is_err() {
+                            return;
+                        }
+                        left = left.saturating_sub(step);
+                    }
+                    // 补零改了 forwarded,相位债务要按当前真实残差重算,否则后续帧继续
+                    // 按旧债拧速率,把刚补的这段又慢慢抹掉。基准必须仍是**采集时钟**
+                    // (Codex P1):这帧可能在队列里排过很久,拿墙钟算会凭空造出一笔等大
+                    // 的负债,后续帧被拖慢,时间轴又被拉长一次。
+                    phase_debt = forwarded.as_secs_f64() - captured.as_secs_f64();
+                    phase_rate = None;
                 }
                 // 还款:把采样率往债务的反方向拧一点点,下游据此多算/少算一点时长,
                 // forwarded 就平滑地追上墙钟。债清了立刻停手,恢复实测速率。
@@ -784,6 +895,16 @@ fn run_frame_tap_with_drift(
                 }
                 filled_gap = true;
             }
+            // 采集已断开:直接退出。
+            //
+            // 这里刻意**不**做"按欠账补最后一段":队列一直满到停录时,最后那截被回调
+            // 丢掉的音频确实没有下一帧来暴露,时戳补洞覆盖不到它。但补它需要一个可信的
+            // 终点——Disconnected 是在队列排空、所有阻塞 send 都完成之后才观察到的,
+            // 拿那一刻的墙钟算欠账会把拆除耗时算成缺口,凭空补出静音;而且同步补零会
+            // 拖住 TappedCapture::stop(),另一路采集在此期间还在录,两轨又错开
+            // (Codex 四轮两条 P1)。要做对得先把采集停止改成两阶段(先给所有源发停,
+            // 再各自收尾),那是独立改动。眼下这段残缺是**可见**的:回调丢样有日志、
+            // hw_gaps 有计数、drift_ms 记着残差。
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
@@ -1824,6 +1945,179 @@ mod tests {
     /// `full` 参数区分写 "reanchor_full"/"reanchor_soft" 两种 kind——gap_end 传
     /// full=false(保频率,只清相位),故落地为 "reanchor_soft"。这是 Task 4 已落地
     /// 的既定契约,本任务(仅接线 frame_tap)不改 drift_monitor.rs。
+    /// P0 回归(2026-08-16 事故):硬件时戳看出"时间过去了、样本没来"的洞时,
+    /// 必须按时戳把这段时间补回时间轴,而不是只 hw_gaps+1 让轨道整体缩短。
+    /// 事故形态:一场 98 分钟录音,墙钟 5904s、落盘 5466s,438s 被直接压掉。
+    #[test]
+    fn hardware_gap_is_filled_back_into_the_timeline() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        // fill_after 放大到 5s:确保补出来的零**不是** Timeout 分支干的,
+        // 只可能来自本次要验的时戳补洞。
+        let policy = TapPolicy { fill_after: Duration::from_secs(5), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        // 三帧 10ms 正常,然后时戳直接跳 300ms(中间的样本被 HAL/回调丢了),
+        // 再来一帧。墙钟这边也真的等 300ms,否则"欠账"为 0、按设计不补。
+        let mut ns = 0u64;
+        for _ in 0..3 {
+            cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
+                channels: 1, host_time_ns: Some(ns) }).unwrap();
+            ns += 10_000_000;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        ns += 300_000_000;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
+            channels: 1, host_time_ns: Some(ns) }).unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+
+        let mut zeros = 0usize;
+        let mut real = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); } else { real += f.samples.len(); }
+        }
+        assert_eq!(real, 4 * 160, "四个真实帧必须原样转发");
+        // 300ms @16k ≈ 4800 样本;允许墙钟欠账带来的下浮,但不能一个都不补。
+        assert!(zeros >= 3_000, "洞必须补回时间轴,实测只补了 {zeros} 样本");
+        let s = health.snapshot(Source::Mic);
+        assert!(s.hw_gaps >= 1, "洞要计数");
+        assert!(s.hw_gap_ms >= 180, "补了多久要能对账,实测 {}ms", s.hw_gap_ms);
+    }
+
+    /// Codex P1 回归:丢掉**一个**等长回调时,时戳差恰好翻倍、隐含率正好落在
+    /// RATE_SANITY 下沿之内——旧判据(挂夹板)既不认它是洞,还把"一半速率"喂进
+    /// 对账窗口。现在判据是"至少缺一整帧",单帧丢失必须被认出来并补回时间轴。
+    #[test]
+    fn a_single_dropped_callback_is_detected_and_repaired() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_secs(5), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        // 10ms 一帧,第 4 帧的时戳跳了 20ms(中间那一帧被回调 try_send 丢了)。
+        let mut ns = 0u64;
+        for i in 0..6 {
+            cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
+                channels: 1, host_time_ns: Some(ns) }).unwrap();
+            ns += if i == 2 { 20_000_000 } else { 10_000_000 };
+            std::thread::sleep(Duration::from_millis(if i == 2 { 20 } else { 10 }));
+        }
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
+        }
+        let s = health.snapshot(Source::Mic);
+        assert_eq!(s.hw_gaps, 1, "单帧丢失要认成一次洞");
+        assert!(zeros >= 80, "丢掉的那 10ms 要补回来,实测 {zeros} 样本");
+        assert!(s.hw_gap_ms >= 5, "补了多久要记账,实测 {}ms", s.hw_gap_ms);
+    }
+
+    /// 补零分块上限:一次长洞不得整块分配(13 分钟 @48k 单声道 ≈ 150MB)。
+    /// 用一个 3 秒的洞验证输出被切成多帧、且每帧都不超过 FILL_CHUNK。
+    #[test]
+    fn long_hole_is_filled_in_bounded_chunks() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(512);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        // fill_after 大于洞长:排除 Timeout 分支参与,补零只可能来自时戳补洞。
+        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        let mut ns = 0u64;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(ns) }).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        ns += 10_000_000;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(ns) }).unwrap();
+        // 墙钟也真的过 3 秒,否则采集时钟欠账被墙钟口径的回退夹住。
+        std::thread::sleep(Duration::from_millis(3000));
+        ns += 3_000_000_000;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(ns) }).unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        let mut max_frame = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) {
+                zeros += f.samples.len();
+                max_frame = max_frame.max(f.samples.len());
+            }
+        }
+        assert!(zeros >= 16_000, "3 秒的洞至少补回 1 秒,实测 {zeros} 样本");
+        let cap = (FILL_CHUNK.as_secs_f64() * 16_000.0) as usize;
+        assert!(max_frame <= cap, "单个补零帧 {max_frame} 样本超过上限 {cap}");
+    }
+
+    /// 反向锁:正常停录(队列即时排空)不得在尾巴上挂静音。
+    #[test]
+    fn clean_stop_adds_no_tail_silence() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_secs(30), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        let mut ns = 0u64;
+        for _ in 0..5 {
+            cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+                host_time_ns: Some(ns) }).unwrap();
+            ns += 10_000_000;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
+        }
+        assert_eq!(zeros, 0, "正常停录不该补静音,补了 {zeros} 样本");
+    }
+
+    /// 反向锁:突发缓冲回吐(样本一次到得比时间多)不是洞,绝不能补零——
+    /// 补了就是凭空拉长时间轴。
+    #[test]
+    fn burst_delivery_is_not_mistaken_for_a_gap() {
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let (out_tx, out_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
+        let health = std::sync::Arc::new(SourceHealth::default());
+        let policy = TapPolicy { fill_after: Duration::from_secs(5), ..wallclock_policy() };
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::Mic, cap_rx, out_tx, h2, policy, TapNotify::none())
+        });
+        // 时戳只走 1ms,却一次交付 100ms 的样本(隐含率 100 倍,夹板外)。
+        let mut ns = 0u64;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(ns) }).unwrap();
+        ns += 1_000_000;
+        cap_tx.send(AudioFrame { samples: vec![0.5; 1600], sample_rate: 16_000, channels: 1,
+            host_time_ns: Some(ns) }).unwrap();
+        drop(cap_tx);
+        t.join().unwrap();
+        let mut zeros = 0usize;
+        while let Ok(f) = out_rx.try_recv() {
+            if f.samples.iter().all(|s| *s == 0.0) { zeros += f.samples.len(); }
+        }
+        assert_eq!(zeros, 0, "回吐不是洞,不得补零");
+        assert_eq!(health.snapshot(Source::Mic).hw_gap_ms, 0);
+    }
+
     #[test]
     fn drift_monitor_fed_with_real_frames_only() {
         use crate::pipeline::drift_monitor::DriftMonitor;
