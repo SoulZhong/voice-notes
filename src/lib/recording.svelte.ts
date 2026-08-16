@@ -329,6 +329,12 @@ export const recording = {
     // 后端仍会安全排空识别/音频管线并完成落盘；先给出即时反馈，避免数秒收尾看似没点中。
     status = "stopping";
     paused = false;
+    // 清锚点前先把已走的这一段折进基数(Codex P2):elapsedMs = base + (now - anchor),
+    // 只清锚点不折基数,收尾这几秒里读到的就是上一次快照——对一场从头录到尾的会议
+    // 就是 00:00:00。以前控制条在 stopping 时整簇不渲染,这个坑一直没露头;现在
+    // 「停止中…」要带着时长一起显示,必须先把数字修对。
+    // 下面的失败回滚会重新取锚点,基数已折过,不会重复计。
+    elapsedBaseMs += tickAnchor !== null ? Date.now() - tickAnchor : 0;
     tickAnchor = null;
     levels = { mic: 0, system: 0 };
     try {

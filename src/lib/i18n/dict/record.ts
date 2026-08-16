@@ -5,12 +5,9 @@ import type { Dict, Msg } from "../types";
 export const zh = {
   "record.title": "实时转写",
 
-  // 右上状态短标签(状态机原值→友好文案)
-  "record.status.error": "出错",
-  "record.status.recording": "录制中",
+  // 计时后缀:只在非正常态出条(正常录制由呼吸红点交代)。error/recording/stopped/ready 随
+  // 旧的右上状态标签一起删除——出错有下方专门的红色详情行,不再走这里。
   "record.status.paused": "已暂停",
-  "record.status.stopped": "已停止",
-  "record.status.ready": "就绪",
 
   // 控制钮
   "record.btn.stopping": "正在停止…",
@@ -18,6 +15,8 @@ export const zh = {
   "record.btn.resume": "恢复",
   "record.btn.pause": "暂停",
   "record.btn.stop": "停止",
+  // 停止钮现在是图标(无文字),确认胶囊里补一句问句,否则胶囊里只剩两个动词、看不出在问什么
+  "record.btn.stopConfirmQ": "结束本场?",
   "record.btn.stopConfirmYes": "停止",
   "record.btn.stopConfirmNo": "继续录",
 
@@ -87,17 +86,14 @@ export const zh = {
 export const en = {
   "record.title": "Live Transcription",
 
-  "record.status.error": "Error",
-  "record.status.recording": "Recording",
   "record.status.paused": "Paused",
-  "record.status.stopped": "Stopped",
-  "record.status.ready": "Ready",
 
   "record.btn.stopping": "Stopping…",
   "record.btn.start": "Start Recording",
   "record.btn.resume": "Resume",
   "record.btn.pause": "Pause",
   "record.btn.stop": "Stop",
+  "record.btn.stopConfirmQ": "End this session?",
   "record.btn.stopConfirmYes": "Stop",
   "record.btn.stopConfirmNo": "Keep going",
 
