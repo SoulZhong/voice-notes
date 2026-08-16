@@ -714,7 +714,10 @@
                孤零零一个显得突兀。药丸与图标钮/胶囊同一套圆角语言,聚焦时才亮 accent 边。 -->
           <label class="search">
             <span class="ico">{@render icoSearch()}</span>
+            <!-- aria-label 必须显式给(Codex P2):外层 label 里只有 aria-hidden 的放大镜,
+                 空的关联 label 会盖过 placeholder 的兜底命名,读屏读到的是一个无名输入框。 -->
             <input
+              aria-label={t("record.search.placeholder")}
               placeholder={t("record.search.placeholder")}
               bind:value={searchQuery}
               onkeydown={(e) => {
