@@ -68,9 +68,14 @@ impl AudioCapture for Microphone {
             // 只能做差，不能直接取绝对值。anchor_ns 是回调进入时刻，与硬件时刻
             // 差一个缓冲时长量级的常量偏移，不影响斜率(ppm)；绝对偏移由 E1 互相关标定。
             let mut anchor: Option<(cpal::StreamInstant, u64)> = None;
+            // 回调丢帧计量(每声道样本数)。回调里只做一次原子加,停流时汇总打印——
+            // 这条日志是"下游顶住了采集"的直接证据,与 tap 侧 send_wait/hw_gap_ms 对读。
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let dropped_cb = dropped.clone();
             let stream = match device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    let dropped = &dropped_cb;
                     let cap = info.timestamp().capture;
                     let host_time_ns = match anchor {
                         None => {
@@ -82,12 +87,24 @@ impl AudioCapture for Microphone {
                             cap.duration_since(&a_inst).map(|d| a_ns + d.as_nanos() as u64)
                         }
                     };
-                    let _ = sink.send(AudioFrame {
-                        samples: data.to_vec(),
-                        sample_rate,
-                        channels,
-                        host_time_ns,
-                    });
+                    // 绝不阻塞:这是 CoreAudio 的实时回调线程,它一旦被下游背压顶住,
+                    // HAL 侧就开始整块丢音(2026-08-16 实测:一场 98 分钟录音丢了
+                    // 13.5 分钟,tap 被顶最长 1.198 秒)。宁可这一帧不要,也要立刻返回
+                    // ——丢掉的时长由 tap 按硬件时戳补零补回时间轴,不会压缩时间。
+                    if sink
+                        .try_send(AudioFrame {
+                            samples: data.to_vec(),
+                            sample_rate,
+                            channels,
+                            host_time_ns,
+                        })
+                        .is_err()
+                    {
+                        dropped.fetch_add(
+                            (data.len() / channels.max(1) as usize) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 },
                 err_fn,
                 None, // no timeout
@@ -106,6 +123,15 @@ impl AudioCapture for Microphone {
             let _ = ready_tx.send(Ok(()));
             // Block until stop_tx is dropped (stop() called).
             stop_rx.recv().ok();
+            // 停流汇总:回调丢过帧就说清楚丢了多少——它意味着下游(tap→worker)
+            // 没跟上采集,时间轴虽由 tap 补零保住,内容是真的少了那么多。
+            let lost = dropped.load(std::sync::atomic::Ordering::Relaxed);
+            if lost > 0 {
+                eprintln!(
+                    "麦克风回调丢样: {lost} 样本(约 {:.1}s @{sample_rate}Hz)——下游积压顶到了采集回调",
+                    lost as f64 / sample_rate.max(1) as f64
+                );
+            }
             // `stream` drops here, stopping capture.
         });
 
@@ -115,6 +141,19 @@ impl AudioCapture for Microphone {
                 // 与 vpio.rs 的启动日志对仗:capture_path=aec 排障时靠这行确认
                 // 本场走的是普通输入(无 ducking)而非 VPIO。
                 eprintln!("普通麦克风已启动(无 AEC/ducking): {sample_rate} Hz, f32 x{channels}");
+                // 麦克风模式留痕:必须等流真的跑起来再读——activeMicrophoneMode 描述的是
+                // **当前生效**的输入路由,开录请求刚被受理时读到的可能还是上一场的值
+                // (Codex P2)。系统层「语音突显」会把非人声削成绝对零、判错时连人声一起
+                // 削(2026-08-16 实测吃掉近两成语音),而这发生在音频进入本进程之前;
+                // 事后排查靠这行分辨"系统削的"还是"我们链路丢的"。
+                let mm = crate::audio::mic_mode::active();
+                if mm.damages_audio() {
+                    eprintln!(
+                        "[采集] 麦克风模式=语音突显:系统会把非人声削成绝对零,建议在控制中心改回「标准」"
+                    );
+                } else {
+                    eprintln!("[采集] 麦克风模式={}", mm.as_str());
+                }
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!(e)),
             Err(_) => return Err(anyhow::anyhow!("麦克风线程意外退出，未能开启音频流")),
