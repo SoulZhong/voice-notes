@@ -95,6 +95,8 @@
       stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
       还给出一个后端必然拒绝的重跑按钮(Codex P2 四轮)。未确定期间一律不提示。 */
   let refineStatusKnown = $state(false);
+  /** 快照说"在跑"之后的复核间隔。只在这条自愈路径上用,正常靠事件驱动。 */
+  const REFINE_RECHECK_MS = 3000;
   let refineRunFailed = $state(false);
   let refineErr = $state("");
   let viewMode = $state<"refined" | "raw">("refined");
@@ -797,7 +799,27 @@
         return noteRefining(forId);
       })
       .then((r) => {
-        if (r && !disposed && !sawTerminal && forId === id) refining = true;
+        if (r && !disposed && !sawTerminal && forId === id) {
+          refining = true;
+          // 从快照取到的"在跑"必须能自愈:终态事件可能早于后端把 id 从在跑集合
+          // 里摘掉而发出,恰好在那一瞬订阅的话,快照拿到 true 却再也等不到事件
+          // (摘除本身不发前端事件),页面会永久卡在"整理中"(Codex P2 五轮)。
+          // 因此隔几秒复核一次,直到后端说不在跑或终态事件到达。
+          void (async () => {
+            while (!disposed && forId === id && !sawTerminal) {
+              await new Promise((done) => setTimeout(done, REFINE_RECHECK_MS));
+              if (disposed || forId !== id || sawTerminal) return;
+              try {
+                if (!(await noteRefining(forId))) {
+                  if (!disposed && forId === id) refining = false;
+                  return;
+                }
+              } catch {
+                return; // 查不动就不再复核:事件通道仍在,不至于全无出路
+              }
+            }
+          })();
+        }
       })
       .catch(() => {})
       // 无论成败都算"已确定":查询失败时按事件为准,总不能永远不提示。
