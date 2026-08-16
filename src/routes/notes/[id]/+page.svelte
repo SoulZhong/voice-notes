@@ -90,6 +90,33 @@
 
   // 修订稿视图:refined 与 note 一样按 id 拉取、id 切换即复位(见下方 id-effect)。
   let refined = $state<RefinedDoc | null>(null);
+  /** 修订稿的载入闸门。写 refined 的有四路:refresh()、Aing 终态事件、在跑复核、
+      编辑器保存后的回读。它们各自 await,谁先发起不代表谁先落地——Codex 连着几轮
+      抓到的一串竞态(旧稿盖新稿、忙态解除得比新稿早、提示在重取途中闪一下)本质
+      是同一件事:多个写者无序。这里一次收口:
+      ① 取稿一律走 loadRefined,末次请求赢(seq 比对),旧响应作废;
+      ② 取稿在途(refinedLoading > 0)期间不出「这场没做 AI 整理」——眼前这份稿子
+         随时可能被换掉,凭它下结论必然出错;
+      ③ 编辑器回读那几处直接写 refined 时用 claimRefined 认领一个更新的 seq,
+         免得在途的 loadRefined 回来把用户刚保存的内容盖掉。 */
+  let refinedSeq = 0;
+  let refinedLoading = $state(0);
+  function claimRefined(doc: RefinedDoc | null) {
+    refinedSeq += 1;
+    refined = doc;
+  }
+  async function loadRefined(forId: string): Promise<void> {
+    const seq = ++refinedSeq;
+    refinedLoading += 1;
+    try {
+      const doc = await getRefined(forId);
+      if (seq === refinedSeq && forId === id) refined = doc;
+    } catch {
+      /* 增值层:取不到就维持现状 */
+    } finally {
+      refinedLoading -= 1;
+    }
+  }
   let refining = $state(false);
   /** 在跑状态是否已确定:进页那一刻 refining 还是默认 false,而 run_local 一开始就把
       stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
@@ -303,7 +330,7 @@
       if (targetId === id && !refinedEditor?.hasFocus()) {
         const latest = await getRefined(targetId);
         if (latest && targetId === id && !refinedEditor?.hasFocus()) {
-          refined = latest;
+          claimRefined(latest);
           syncedRefined = latest;
           syncedEditor = refinedEditor;
           refinedEditor?.setRefined(latest);
@@ -356,7 +383,7 @@
         // await 后重验守卫:回读期间用户可能已经切走了笔记。
         if (targetId === id && loadedRefinedId === targetId) {
           if (latest) {
-            refined = latest;
+            claimRefined(latest);
             syncedRefined = latest;
             syncedEditor = refinedEditor;
           }
@@ -384,7 +411,7 @@
         try {
           const latest = await getRefined(targetId);
           if (targetId === id && loadedRefinedId === targetId) {
-            refined = latest;
+            claimRefined(latest);
             if (latest) {
               // 这里显式 setRefined 已经把编辑器文档重建到位;同时把 latest/当前编辑器
               // 实例记进 syncedRefined/syncedEditor,让下面的同步 effect 认出"已经
@@ -570,7 +597,7 @@
   async function refresh() {
     // 并行发起，note 失败才是真正的加载失败；refined/people 是增值层，取不到静默降级。
     const notePromise = getNote(id);
-    const refinedPromise = getRefined(id).catch(() => null);
+    const refinedLoad = loadRefined(id);
     const peoplePromise = listPeople().catch(() => []);
     try {
       note = await notePromise;
@@ -578,7 +605,7 @@
     } catch (e) {
       error = t("common.loadFailed", { e });
     }
-    refined = await refinedPromise;
+    await refinedLoad;
     people = await peoplePromise;
   }
 
@@ -785,14 +812,10 @@
         refineRunFailed = e.state === "failed";
         // refining 要等新稿到手再落:进页时缓存的那份 refined 还是跑之前的
         // (stages.llm = "off"),先落 refining 会让「这场没做 AI 整理」闪一下、
-        // 还能被点到重跑(Codex P2 七轮)。finally 兜底:取失败也必须解除忙态。
-        getRefined(forId)
-          .then((r) => {
-            if (forId === id) refined = r;
-          })
-          .finally(() => {
-            if (forId === id) refining = false;
-          });
+        // 还能被点到重跑。loadRefined 自己吞异常,不会留下未处理的 rejection。
+        void loadRefined(forId).finally(() => {
+          if (forId === id) refining = false;
+        });
       }
     })
       .then((u) => {
@@ -811,12 +834,7 @@
           // 跑完,那条终态事件谁也没接到,缓存里还是 stages.llm="off" 的旧稿——
           // 直接放行会让整理成功的笔记显示「这场没做 AI 整理」(Codex P2 八轮)。
           // 重取一次再放行(refineStatusKnown 在下面的 finally 里置,会等这一步)。
-          try {
-            const doc = await getRefined(forId);
-            if (!disposed && forId === id) refined = doc;
-          } catch {
-            /* 取不到就按现有稿显示,不卡住提示 */
-          }
+          await loadRefined(forId);
           return;
         }
         refining = true;
@@ -835,12 +853,8 @@
               // 却继续显示「这场没做 AI 整理」并邀请再跑一次(Codex P2 六轮)。
               // refining 等新稿到手再落,免得中间闪一下(七轮);await 在 try 内,
               // 失败由下面的 catch 收掉,不留未处理的 rejection(八轮)。
-              try {
-                const doc = await getRefined(forId);
-                if (!disposed && forId === id) refined = doc;
-              } finally {
-                if (!disposed && forId === id) refining = false;
-              }
+              await loadRefined(forId);
+              if (!disposed && forId === id) refining = false;
               return;
             } catch {
               return; // 查不动就不再复核:事件通道仍在,不至于全无出路
@@ -1048,8 +1062,9 @@
     aiSkipHint({
       llmStage: refined?.stages.llm,
       noteComplete: note?.meta.state === "complete",
-      // 未确定期间按"可能在跑"处理:宁可晚一拍提示,不可在整理途中误报。
-      running: refining || !refineStatusKnown,
+      // 未确定、或修订稿正在重取期间,一律按"可能在跑"处理:宁可晚一拍提示,
+      // 不可拿一份随时会被换掉的旧稿下结论。
+      running: refining || !refineStatusKnown || refinedLoading > 0,
       refineEnabled: refineOn,
       ready: refineConfigured,
     }),
