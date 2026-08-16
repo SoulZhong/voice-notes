@@ -483,9 +483,9 @@ fn run_frame_tap_with_drift(
     // 误差不再累积。
     let mut anchor: Option<Instant> = None;
     let mut forwarded = Duration::ZERO;
-    /// 采集时钟原点:首个带硬件时戳的帧,连同**那一刻已转发的时长**一起记。
-    /// 只记时戳不记基线的话,原点之前那些无时戳帧的时长白白算进 forwarded,
-    /// 欠账被永久低估、后面的洞就补不满(Codex P2)。
+    // 采集时钟原点:首个带硬件时戳的帧,连同**那一刻已转发的时长**一起记。
+    // 只记时戳不记基线的话,原点之前那些无时戳帧的时长白白算进 forwarded,
+    // 欠账被永久低估、后面的洞就补不满(Codex P2)。
     let mut hw_origin: Option<(u64, Duration)> = None;
     // 本次断流是否已计 gap / 已报 stall(去抖:恢复前不重复)。
     let mut gap_counted = false;

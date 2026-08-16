@@ -8,40 +8,6 @@ use crossbeam_channel::Sender;
 /// `cpal::Stream` is `!Send`, so we cannot store it directly in `Microphone`
 /// when `AudioCapture: Send` is required. Instead we own the stream on a
 /// dedicated background thread and communicate via a stop-channel.
-/// 回调侧丢样补零的上限(每声道样本数,约 5 秒 @48k)。丢得比这还多说明下游已经
-/// 长时间不动了,再补下去只是在实时回调里做大块分配;超出的部分交给 tap 的时戳
-/// 补洞与 drift 记账,宁可少补也不能让回调自己变成卡顿源。
-const DROP_PAD_CAP: usize = 48_000 * 5;
-
-/// 把此前丢掉的样本以静音补在本批数据前面,并把时间戳回拨到**第一个样本**的时刻。
-///
-/// 纯函数,不清 `pending`——清零由调用方在 try_send **成功之后**做:队列持续满时
-/// 每次尝试都会失败,提前清零会让先前累计的丢失被逐次遗忘,最后只补上最后一个
-/// 回调那点(Codex 七轮 P1)。
-///
-/// 补过零的帧**不带时戳**(Codex 七轮 P1 提出问题、十一轮 P1 定案):cpal 给的是
-/// `data` 首样本的捕获时刻,补零后这一帧的首样本比它早了 pad 那么多,原样带着会让
-/// tap 把同一段缺口按 HAL 丢失再补一次。而"按 pad 时长回拨"也不成立——回拨只能用
-/// 声明率算,下游若已按实测率改写(48k 声明 / 44k 实跑正是本仓库的老故障),残差
-/// 攒够 100ms 量级又会触发一次重复补。首样本时刻本来就无法用下游的率可靠表达,
-/// 那就不表达:置 None,tap 据此退出硬件时基口径、重开统计窗,不会凭空造洞。
-fn padded_frame(
-    pending: usize,
-    data: &[f32],
-    channels: u16,
-    ts: Option<u64>,
-) -> (Vec<f32>, Option<u64>) {
-    if pending == 0 {
-        return (data.to_vec(), ts);
-    }
-    let ch = channels.max(1) as usize;
-    let pad = pending * ch;
-    let mut out = Vec::with_capacity(pad + data.len());
-    out.resize(pad, 0.0);
-    out.extend_from_slice(data);
-    (out, None)
-}
-
 pub struct Microphone {
     /// Dropping this sender signals the background thread to stop the stream.
     stop_tx: Option<crossbeam_channel::Sender<()>>,
@@ -107,13 +73,6 @@ impl AudioCapture for Microphone {
             // 差一个缓冲时长量级的常量偏移，不影响斜率(ppm)；绝对偏移由 E1 互相关标定。
             let mut anchor: Option<(cpal::StreamInstant, u64)> = None;
             let dropped_cb = dropped.clone();
-            // 待补的丢样(每声道样本数):下一次成功发送时补在数据前面。
-            let mut pending_drop: usize = 0;
-            // 通道已断(tap 提前退出,而 cpal 流要到 stop() 才停):此后一律不再构造
-            // 载荷。空的已断通道在 crossbeam 眼里"不满",不单独记一笔的话每个回调都会
-            // 零填一大段再吃一个 Disconnected,又变成实时线程上的兆级分配
-            // (Codex 九轮 P2)。
-            let mut sink_gone = false;
             let stream = match device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
@@ -139,33 +98,29 @@ impl AudioCapture for Microphone {
                     // 丢失元数据(Codex 六轮:计数器方案在 FIFO 里的位置全错,且生产
                     // 装配隔着 ResilientCapture 根本读不到)。
                     let per_ch = data.len() / channels.max(1) as usize;
-                    // 队列已满就别白造载荷(Codex 八轮 P1):积压期间 pending_drop 可能
-                    // 已攒到数秒,每个回调都零填一遍再被 try_send 立刻丢弃,就是在实时
-                    // 线程上反复做兆级分配——那本身就会错过 CoreAudio 的截止时间,
-                    // 正是本次改动要消除的丢音成因。满则只记账。
-                    let sent = if sink_gone || sink.is_full() {
-                        false
-                    } else {
-                        let (payload, ts) =
-                            padded_frame(pending_drop, data, channels, host_time_ns);
-                        match sink.try_send(AudioFrame {
-                            samples: payload,
+                    // 绝不阻塞:这是 CoreAudio 的实时回调线程,被下游背压顶住就等于让
+                    // HAL 整块丢音(2026-08-16 实测:98 分钟录音丢了 13.5 分钟,tap 被顶
+                    // 最长 1.198 秒)。宁可这一帧不要,也要立刻返回。
+                    //
+                    // 丢掉的时长由 tap 按硬件时戳补零补回时间轴(见 frame_tap 的 holey
+                    // 判定):下一帧的时戳会把这段缺口如实暴露出来。这里刻意**不**在回调
+                    // 里自己补零——试过三版(跨线程计数器 / 补进下一帧 / 回拨时戳),每版
+                    // 都引出新问题:计数在 FIFO 里的位置错、混合帧的时戳无法用下游的率
+                    // 表达、合成前缀污染漂移诊断、超过上限的丢失无处安放。要做对得给
+                    // AudioFrame 加"合成样本"标记让 tap 与 drift 区别对待,那是独立改动。
+                    //
+                    // 已知残余:可变帧长下,若丢掉的那个回调比前一个短,时戳缺口不足
+                    // "一整帧",tap 的保守判据认不出来,该段仍会被压掉(每次 < 一个回调
+                    // 周期)。等价的老行为是**整段阻塞**,两害相权取其轻。
+                    if sink
+                        .try_send(AudioFrame {
+                            samples: data.to_vec(),
                             sample_rate,
                             channels,
-                            host_time_ns: ts,
-                        }) {
-                            Ok(()) => true,
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                sink_gone = true;
-                                false
-                            }
-                            Err(_) => false,
-                        }
-                    };
-                    if sent {
-                        pending_drop = 0; // 补出去了才清,失败要留着继续攒
-                    } else {
-                        pending_drop = (pending_drop + per_ch).min(DROP_PAD_CAP);
+                            host_time_ns,
+                        })
+                        .is_err()
+                    {
                         dropped.fetch_add(per_ch as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 },
@@ -231,58 +186,4 @@ impl AudioCapture for Microphone {
         self.stop_tx = None;
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_pending_drop_passes_data_through() {
-        let (out, ts) = padded_frame(0, &[0.1, 0.2], 1, Some(5_000));
-        assert_eq!(out, vec![0.1, 0.2]);
-        assert_eq!(ts, Some(5_000), "没补零就不该动时戳");
-    }
-
-    #[test]
-    fn dropped_span_is_padded_in_front() {
-        // 丢了 3 个(每声道)样本,下一批数据前面就该有 3 个静音——补在丢失的位置上,
-        // 时长与丢失量一致,下游的时间轴因此不被压缩。
-        let (out, _) = padded_frame(3, &[0.5, 0.6], 1, None);
-        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.5, 0.6]);
-    }
-
-    #[test]
-    fn padded_frame_carries_no_timestamp() {
-        // 补过零的帧首样本时刻无法用下游的率可靠表达(下游可能已按实测率改写),
-        // 带着旧时戳或按声明率回拨都会让 tap 把同一段缺口再补一次。置 None,
-        // tap 据此退出硬件时基口径、重开统计窗。
-        let (_, ts) = padded_frame(160, &[0.0], 1, Some(100_000_000));
-        assert_eq!(ts, None);
-    }
-
-    #[test]
-    fn padding_respects_channel_interleaving() {
-        // 双声道:每声道 2 个样本 = 4 个交错样本。
-        let (out, _) = padded_frame(2, &[1.0, -1.0], 2, None);
-        assert_eq!(out.len(), 4 + 2);
-        assert!(out[..4].iter().all(|s| *s == 0.0));
-        assert_eq!(&out[4..], &[1.0, -1.0]);
-    }
-
-    #[test]
-    fn pending_is_not_cleared_by_the_helper() {
-        // 纯函数不清零:清零由调用方在发送成功后做。队列持续满时每次都失败,
-        // 提前清零会把先前累计的丢失逐次遗忘。
-        let pending = 5usize;
-        let (a, _) = padded_frame(pending, &[0.0], 1, None);
-        let (b, _) = padded_frame(pending, &[0.0], 1, None);
-        assert_eq!(a.len(), b.len(), "同一 pending 两次调用结果一致");
-    }
-
-    #[test]
-    fn cap_bounds_the_allocation() {
-        let (out, _) = padded_frame(DROP_PAD_CAP, &[0.0], 1, None);
-        assert_eq!(out.len(), DROP_PAD_CAP + 1);
-    }
 }
