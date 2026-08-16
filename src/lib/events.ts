@@ -138,6 +138,14 @@ export function onCloudAsrStatus(cb: (e: CloudAsrStatusEvent) => void) {
   return listen<CloudAsrStatusEvent>("cloud-asr-status", (ev) => cb(ev.payload));
 }
 
+/** 托盘菜单请求导航(目前只有「打开设置」)。托盘在 Rust 侧、路由在前端,
+ * 只能由后端发事件、前端自己 goto。
+ * `id` 单调递增:同一次点击可能既走事件、又被启动补领拿到,前端按 id 去重。 */
+export type TrayNavigateEvent = { id: number; path: string };
+export function onTrayNavigate(cb: (e: TrayNavigateEvent) => void) {
+  return listen<TrayNavigateEvent>("tray_navigate", (ev) => cb(ev.payload));
+}
+
 /** 后端自动改名(LLM 主题标题)。侧栏与详情页据此刷新标题。 */
 export type NoteRenamedEvent = { note_id: string; title: string };
 
