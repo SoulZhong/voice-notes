@@ -67,6 +67,14 @@ describe("包络(快起慢落)", () => {
     expect(frames(50) * 0.12).toBeLessThan(0.65); // 常见说话档 → 门限 <0.65s
   });
 
+  it("一次 NaN 不得毒化整场:非有限值当 0 处理", () => {
+    // Math.max(NaN, x) 恒为 NaN,而运行值会被下一帧继续引用——不消毒的话,后端漏出
+    // 一次 NaN 电平,此后整场波形永久静音。
+    expect(envelopeStep(Number.NaN, 60)).toBe(60);
+    expect(envelopeStep(60, Number.NaN)).toBeCloseTo(42, 6);
+    expect(Number.isFinite(envelopeStep(Number.NaN, Number.NaN))).toBe(true);
+  });
+
   it("持续静音最终落到接近零(不会永远挂着一根高条)", () => {
     let v = 80;
     for (let i = 0; i < 40; i++) v = envelopeStep(v, 0);

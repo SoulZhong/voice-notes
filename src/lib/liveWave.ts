@@ -24,9 +24,13 @@ export const WAVE_RELEASE = 0.7;
  *  取 ≈ -35dBFS 作下限,意思是"比这还轻的整段,就该显得轻"。 */
 export const WAVE_MIN_PEAK_PCT = 30;
 
-/** 包络推进一帧:快起(直接取采样)慢落(按 release 衰减)。 */
+/** 包络推进一帧:快起(直接取采样)慢落(按 release 衰减)。
+ *  非有限值一律当 0:`Math.max(NaN, x)` 恒为 NaN,而这个运行值会被下一帧继续引用——
+ *  只要后端漏出一次 NaN 电平,整场波形就永久静音了(Codex 二轮 P2)。 */
 export function envelopeStep(prev: number, sample: number, release = WAVE_RELEASE): number {
-  return Math.max(sample, prev * release);
+  const p = Number.isFinite(prev) ? prev : 0;
+  const s = Number.isFinite(sample) ? sample : 0;
+  return Math.max(s, p * release);
 }
 
 /** 门限 + gamma:pct(0..100) → 0..1 的整形值,0 表示"静音,只画基线"。 */
