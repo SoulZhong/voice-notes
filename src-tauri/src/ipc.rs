@@ -92,6 +92,13 @@ pub struct NoteRealignedEvent {
     pub drift_ms: u64,
 }
 
+/// 托盘菜单请求前端导航,事件名 "tray_navigate"。托盘在 Rust 侧,路由在前端,
+/// 只能发事件让前端自己 goto——先 show 窗口再发,否则导航了也看不见。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrayNavigateEvent {
+    pub path: String,
+}
+
 /// 落盘健康度，事件名 "storage"。"degraded" = 追加写失败（段暂存内存）；"ok" = 已恢复。
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {

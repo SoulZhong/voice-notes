@@ -21,7 +21,8 @@
     type UpdateInfo,
     type UpdateProgress,
   } from "$lib/update";
-  import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
+  import { onTrayNavigate } from "$lib/events";
+import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
   import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
@@ -124,6 +125,11 @@
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
     // 不等下一次 peopleVersion 变化。layout 常驻,不必解绑。
     void listen("identify_done", () => void tidy.refresh());
+    // 托盘「打开设置」:后端只负责亮出窗口,路由在前端。挂在 layout(常驻)而不是设置页,
+    // 否则只有已经在设置页时才生效。
+    void onTrayNavigate((e) => {
+      if (e.path.startsWith("/")) goto(e.path);
+    });
     // 启动即按已保存设置切主题与 UI 语言;取不到设置(如首启动/IPC 失败)时静默放弃——
     // 主题保持默认(等价跟随系统),语言保持 i18n 默认(zh,与历史行为一致)
     getSettings()

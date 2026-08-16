@@ -2448,6 +2448,11 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
         }
     };
     let _ = app.emit("status", ev);
+    // 托盘菜单要把「暂停录制」换成「恢复录制」。lifecycle 的托盘钩子对
+    // (Recording, Recording) 这类转移一律返回 None(不为暂停翻转重建菜单),
+    // 所以这里显式刷一次。会话锁已在上面的块结束时释放,与 refresh_menu 读的
+    // running 锁不嵌套。
+    tray::refresh_menu(app);
     Ok(())
 }
 
@@ -2478,6 +2483,7 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
         }
     };
     let _ = app.emit("status", ev);
+    tray::refresh_menu(app); // 同 do_pause_recording:把「恢复录制」换回「暂停录制」
     Ok(())
 }
 
