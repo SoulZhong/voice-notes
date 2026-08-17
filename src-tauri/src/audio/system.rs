@@ -201,6 +201,7 @@ impl AudioCapture for SystemAudioCapture {
                             sample_rate,
                             channels: 1,
                             host_time_ns,
+                            synthetic: false,
                         });
                     }
                 }

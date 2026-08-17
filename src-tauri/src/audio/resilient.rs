@@ -17,6 +17,8 @@
 
 use super::{AudioCapture, AudioFrame, CaptureEvent};
 use crossbeam_channel::{Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 工厂:每次(重)建一个采集实例 + 其事件接收端(无事件后端给个空通道即可)。
@@ -49,6 +51,10 @@ pub struct ResilientCapture {
     /// drop = 通知监控线程停止(本仓 stop-channel 惯用法)。
     ctrl_tx: Option<Sender<()>>,
     monitor: Option<std::thread::JoinHandle<()>>,
+    /// 已退役实例的回调丢样累计。自愈会把内层整个换掉,不在退役时把它的计数
+    /// 收走,一场里断连几次就只剩最后一个实例的数——而这个数正是用来把
+    /// 「我们自己丢的」和「设备没供帧」分开的依据,低报等于把归因指错方向。
+    dropped: Arc<AtomicU64>,
 }
 
 impl ResilientCapture {
@@ -75,6 +81,7 @@ impl ResilientCapture {
             kick_rx: Some(kick_rx),
             ctrl_tx: None,
             monitor: None,
+            dropped: Default::default(),
         }
     }
 
@@ -102,12 +109,15 @@ impl AudioCapture for ResilientCapture {
 
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<()>(0);
         let backoff = self.backoff.clone();
+        let dropped = self.dropped.clone();
         let monitor = std::thread::spawn(move || {
             loop {
                 crossbeam_channel::select! {
                     recv(ctrl_rx) -> _ => {
                         // stop() drop 发送端(或显式发)→ 停内层退出。
                         inner.stop();
+                        // 这个实例从未被退役过,停流后计数才是终值,收走它。
+                        dropped.fetch_add(inner.dropped_samples(), Ordering::Relaxed);
                         return;
                     }
                     recv(events_rx) -> ev => {
@@ -124,9 +134,11 @@ impl AudioCapture for ResilientCapture {
                         }
                         if !attempt_restart(
                             &mut factory, &mut inner, &mut events_rx,
-                            &sink, &backoff, &ctrl_rx, &notify,
+                            &sink, &backoff, &ctrl_rx, &notify, &dropped,
                         ) {
                             // 放弃或停录:若是放弃,守在 ctrl 上等会话拆除。
+                            // 这个实例的丢样已在 attempt_restart 退役时收过,
+                            // 这里只停不收,否则翻倍。
                             ctrl_rx.recv().ok();
                             inner.stop();
                             return;
@@ -140,8 +152,9 @@ impl AudioCapture for ResilientCapture {
                         eprintln!("采集帧荒失联,进入自愈重试(FrameTap 触发)");
                         if !attempt_restart(
                             &mut factory, &mut inner, &mut events_rx,
-                            &sink, &backoff, &ctrl_rx, &notify,
+                            &sink, &backoff, &ctrl_rx, &notify, &dropped,
                         ) {
+                            // 同上:已收过账,只停不收。
                             ctrl_rx.recv().ok();
                             inner.stop();
                             return;
@@ -164,6 +177,12 @@ impl AudioCapture for ResilientCapture {
             let _ = m.join();
         }
     }
+
+    /// 全场累计(含被自愈换下的每一个实例)。停录后调用才是终值——监控线程
+    /// 在退出前把最后一个活着的实例也收进来了。
+    fn dropped_samples(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 /// 一轮有界退避重试。返回 true = 恢复成功(inner/events_rx 已替换);
@@ -176,8 +195,12 @@ fn attempt_restart(
     backoff: &[Duration],
     ctrl_rx: &Receiver<()>,
     notify: &ResilientNotify,
+    retired: &Arc<AtomicU64>,
 ) -> bool {
     inner.stop();
+    // 这一刻起该实例已退役(下面要么被替换,要么就此作废),停流后计数是终值,
+    // 立刻收账。收在这里而不是替换点:重试失败时它同样已经退役了。
+    retired.fetch_add(inner.dropped_samples(), Ordering::Relaxed);
     for delay in backoff {
         // 退避等待兼听停录:停录信号(发或断开)到达就立刻放弃,不拖停止流程。
         match ctrl_rx.recv_timeout(*delay) {
@@ -231,6 +254,7 @@ mod tests {
                     sample_rate: 16000,
                     channels: 1,
                     host_time_ns: None,
+                    synthetic: false,
                 });
             }
             if self.error_after_start {
@@ -243,6 +267,61 @@ mod tests {
 
     fn fast_backoff() -> Vec<Duration> {
         vec![Duration::from_millis(10), Duration::from_millis(20)]
+    }
+
+    /// 丢样计数不能被自愈重建吞掉:被换下来的实例丢了多少,必须累加进总数。
+    /// 否则一场里断连几次,audio.json 只剩最后一个实例的丢样,把「我们丢的」
+    /// 显著低报——而它正是用来和「设备没供帧」区分归因的那个数。
+    #[test]
+    fn dropped_samples_accumulate_across_self_healing_rebuilds() {
+        struct Dropper {
+            dropped: u64,
+            error_after_start: bool,
+            events_tx: Sender<CaptureEvent>,
+        }
+        impl AudioCapture for Dropper {
+            fn start(&mut self, _sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                if self.error_after_start {
+                    let _ = self.events_tx.send(CaptureEvent::Error("device gone".into()));
+                }
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn dropped_samples(&self) -> u64 {
+                self.dropped
+            }
+        }
+
+        let built = Arc::new(AtomicU32::new(0));
+        let b2 = built.clone();
+        let factory: CaptureFactory = Box::new(move || {
+            let n = b2.fetch_add(1, Ordering::SeqCst);
+            let (etx, erx) = crossbeam_channel::unbounded();
+            // 第一个实例丢 100,出错后被换掉;第二个丢 25,活到停录。
+            let cap = Dropper {
+                dropped: if n == 0 { 100 } else { 25 },
+                error_after_start: n == 0,
+                events_tx: etx,
+            };
+            (Box::new(cap) as Box<dyn AudioCapture>, erx)
+        });
+        let mut r = ResilientCapture::with_backoff(
+            factory,
+            ResilientNotify::none(),
+            fast_backoff(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        r.start(tx).unwrap();
+        // 等自愈完成(退避 10ms + 重建)。
+        std::thread::sleep(Duration::from_millis(200));
+        r.stop();
+
+        assert_eq!(built.load(Ordering::SeqCst), 2, "应当重建过一次");
+        assert_eq!(
+            r.dropped_samples(),
+            125,
+            "被换下的实例丢的 100 不得丢账,总数应为 100+25"
+        );
     }
 
     /// 第一实例出错 → 自动重建第二实例,帧续到同一 sink;恢复回调恰一次。

@@ -13,8 +13,10 @@ pub struct Microphone {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
     /// 运行期流错误上报口(断连自愈消费);未接线时仅落日志,行为同引入前。
     events: Option<Sender<CaptureEvent>>,
-    /// 回调因下游积压丢弃的样本数(每声道,累计)。仅供停流时汇总日志;
-    /// 时间轴的修补由 tap 按硬件时戳负责(见 frame_tap 的 holey 判定)。
+    /// 回调因下游积压丢弃的样本数(每声道,累计)。停流时汇总进日志,并由
+    /// `dropped_samples()` 交给 tap 记进 audio.json——它和「设备没供帧」在 hw
+    /// 时戳上同形异因,不入账就分不开。时间轴的修补仍由 tap 按硬件时戳负责
+    /// (见 frame_tap 的 holey 判定)。
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -97,8 +99,10 @@ impl AudioCapture for Microphone {
                     // 判定):下一帧的时戳会把这段缺口如实暴露出来。这里刻意**不**在回调
                     // 里自己补零——试过三版(跨线程计数器 / 补进下一帧 / 回拨时戳),每版
                     // 都引出新问题:计数在 FIFO 里的位置错、混合帧的时戳无法用下游的率
-                    // 表达、合成前缀污染漂移诊断、超过上限的丢失无处安放。要做对得给
-                    // AudioFrame 加"合成样本"标记让 tap 与 drift 区别对待,那是独立改动。
+                    // 表达、合成前缀污染漂移诊断、超过上限的丢失无处安放。
+                    // (AudioFrame.synthetic 标记已于 2026-08-17 落地,补零帧现在自报
+                    // 来源;但补零仍由 tap 统一做,回调里照旧不补——上面那四个问题
+                    // 是"在回调里补"本身带来的,和有没有标记无关。)
                     //
                     // 已知残余:可变帧长下,若丢掉的那个回调比前一个短,时戳缺口不足
                     // "一整帧",tap 的保守判据认不出来,该段仍会被压掉(每次 < 一个回调
@@ -109,6 +113,7 @@ impl AudioCapture for Microphone {
                             sample_rate,
                             channels,
                             host_time_ns,
+                            synthetic: false,
                         })
                         .is_err()
                     {
@@ -177,4 +182,7 @@ impl AudioCapture for Microphone {
         self.stop_tx = None;
     }
 
+    fn dropped_samples(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }

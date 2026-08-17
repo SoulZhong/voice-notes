@@ -79,6 +79,7 @@ impl AudioCapture for LoopbackCapture {
                             channels,
                             // Windows 环回：无硬件时间戳来源，漂移传感器按到达墙钟降级。
                             host_time_ns: None,
+                            synthetic: false,
                         });
                     },
                     err_fn,
@@ -94,6 +95,7 @@ impl AudioCapture for LoopbackCapture {
                             sample_rate,
                             channels,
                             host_time_ns: None,
+                            synthetic: false,
                         });
                     },
                     err_fn,

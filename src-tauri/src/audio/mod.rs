@@ -37,6 +37,16 @@ pub struct AudioFrame {
     /// 帧首样本的 host 时刻(ns,mach 时基;见 audio/host_time.rs)。
     /// None = 采集后端拿不到硬件时间戳,漂移传感器按"到达墙钟"降级(行为等同引入前)。
     pub host_time_ns: Option<u64>,
+    /// 这一帧是不是我们**自己造的**(FrameTap 按墙钟补的零),而非设备送来的。
+    ///
+    /// 为什么单列一个标记而不看 `host_time_ns.is_none()`:后者只说明"这帧没有
+    /// 硬件时戳",VPIO/SCK 在某些路径下也会给不出时戳,两者不是一回事。没有这个
+    /// 标记,补零帧到了下游就和"设备真的送来一段数字静音"完全无法区分——2026-08-17
+    /// 排障里最终 m4a 的绝对零段究竟是补零还是系统削的,只能靠比例反推(Codex 复核 P1)。
+    ///
+    /// 消费方按需使用,默认行为不变:补零帧仍照常参与重采样/AEC/落盘,时间轴语义
+    /// 不受影响。它先解决"看得见",怎么区别对待是后续独立改动。
+    pub synthetic: bool,
 }
 
 /// 音频来源标记：接线时确定，随 Job/事件流转。
@@ -63,6 +73,15 @@ pub trait AudioCapture: Send {
     /// 停止采集并释放设备。
     fn stop(&mut self);
 
+    /// 采集回调因下游队列满而丢弃的样本数(每通道,累计)。
+    ///
+    /// 为什么要暴露:回调丢样和设备/HAL 没供帧在 hw 时戳上长得一模一样——都是
+    /// 一个缺口——但归因相反(前者修下游背压,后者换设备/连接方式)。不把它记进
+    /// audio.json,事后就只能靠猜。默认 0:后端不丢样(VPIO/SCK 阻塞语义不同)
+    /// 或不统计时,不该被记上莫须有的丢样。
+    fn dropped_samples(&self) -> u64 {
+        0
+    }
 }
 
 /// 采集流运行期事件(启动期错误走 start 的 Err,不在此列)。
@@ -74,20 +93,17 @@ pub enum CaptureEvent {
     Error(String),
 }
 
-/// 当前默认输出设备是否蓝牙(macOS)。用途:capture_path=aec(软件回声消除)路径下,
-/// 蓝牙播放延迟(300~600ms+)远超 WebRTC AEC3 的延迟估计范围(约 250ms),
-/// 软件回声消除完全失效,mic 轨会混入近乎全量的对方声音(2026-07-08 蓝牙
-/// 实录实锤:两轨互相关包络峰 lag≈600ms、mic 残余电平与 system 同量级)——
-/// 录制页据此在开录前给出预警(与 capture_path 设置无关,不按设置项门控)。
-/// 查询失败一律按"非蓝牙"处理,不挡任何流程。
+/// 某个默认设备(输入或输出)是否走蓝牙。`selector` 取
+/// `kAudioHardwarePropertyDefaultInputDevice` / `...DefaultOutputDevice`。
+/// 查询失败一律按"非蓝牙"处理,不挡任何流程——这是提示类判定,宁可漏报不可误挡。
 #[cfg(target_os = "macos")]
-pub fn default_output_is_bluetooth() -> bool {
+fn default_device_is_bluetooth(selector: u32) -> bool {
     use coreaudio::sys::*;
     unsafe {
         let mut dev: AudioDeviceID = 0;
         let mut size = std::mem::size_of::<AudioDeviceID>() as u32;
         let addr = AudioObjectPropertyAddress {
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMaster,
         };
@@ -126,8 +142,32 @@ pub fn default_output_is_bluetooth() -> bool {
     }
 }
 
+/// 当前默认输出设备是否蓝牙(macOS)。用途:capture_path=aec(软件回声消除)路径下,
+/// 蓝牙播放延迟(300~600ms+)远超 WebRTC AEC3 的延迟估计范围(约 250ms),
+/// 软件回声消除完全失效,mic 轨会混入近乎全量的对方声音(2026-07-08 蓝牙
+/// 实录实锤:两轨互相关包络峰 lag≈600ms、mic 残余电平与 system 同量级)——
+/// 录制页据此在开录前给出预警(与 capture_path 设置无关,不按设置项门控)。
+#[cfg(target_os = "macos")]
+pub fn default_output_is_bluetooth() -> bool {
+    default_device_is_bluetooth(coreaudio::sys::kAudioHardwarePropertyDefaultOutputDevice)
+}
+
+/// 当前默认**输入**设备是否蓝牙(macOS)。与输出侧是两件事:输出侧管的是回声消除
+/// 失效(听感),输入侧管的是**内容丢失**——蓝牙麦克风走 HFP/SCO,上行带宽要和
+/// 会议软件争,实测一场 22 分钟会议因此丢了 14.2% 的时长(笔记 20260817-112430,
+/// hw_gap_ms=194614),而同场 48kHz 的系统声音轨零断流。开录前据此劝退。
+#[cfg(target_os = "macos")]
+pub fn default_input_is_bluetooth() -> bool {
+    default_device_is_bluetooth(coreaudio::sys::kAudioHardwarePropertyDefaultInputDevice)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn default_output_is_bluetooth() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn default_input_is_bluetooth() -> bool {
     false
 }
 

@@ -398,6 +398,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         return;
     }
     std::thread::spawn(move || {
+        // Aing 集条目的移除交给 RAII(见 RefineDoneOnDrop):线程无论怎么结束都必然移除,
+        // 不再依赖"执行流一定走到末尾那一行"。最先声明 ⇒ 最后 drop,时机不变。
+        let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone() };
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
         // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
@@ -769,9 +772,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
             }
         }
-        // 原 refining.remove 的时机(收尾事件与兜底转码之后):把该 id 移出内核
-        // Aing 集。按 id 移除,并发 Aing 的其它笔记不受波及(与旧 set.remove 一致)。
-        lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
+        // 移出内核 Aing 集的动作由 _refine_done 的 Drop 完成(线程体结束时,即此处之后)。
+        // 刻意不在这里再发一次:重复的 RefineFinished 会撞上 machine 的
+        // "不在集合中"分支,平白产出 ShadowMismatch 对账噪音。
     });
 }
 
@@ -781,6 +784,25 @@ struct ResetOnDrop(Arc<AtomicBool>);
 impl Drop for ResetOnDrop {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// RAII:Aing 集条目必然移除。与上面 ResetOnDrop 同一教训的第二例——
+/// RefineFinished 原先只手动写在 worker 线程体末尾,任何**提前退出**路径都会让
+/// note_id 永久留在内核 Aing 集里,而 `is_refining` 是 delete_note_speaker 等命令的
+/// 第一道守卫,后果是该笔记的删除说话人**永久失败,只能重启应用**
+/// (2026-08-17 真实发生:用户点删除毫无反应,重启后同一操作立即成功)。
+///
+/// 守卫在线程体最先声明 ⇒ 最后 drop,时机与原先"收尾事件与兜底转码之后"一致。
+/// 只覆盖**线程结束**(正常/panic/提前 return);线程若永久阻塞则 Drop 不会执行,
+/// 那条路径由 actor 的滞留超时自愈兜底(见 lifecycle::actor 的 REFINE_STALE)。
+struct RefineDoneOnDrop {
+    lc: lifecycle::LifecycleHandle,
+    note_id: String,
+}
+impl Drop for RefineDoneOnDrop {
+    fn drop(&mut self) {
+        self.lc.report(lifecycle::machine::Msg::RefineFinished { note_id: self.note_id.clone() });
     }
 }
 
@@ -1334,24 +1356,42 @@ fn spawn_session(
                         ipc::SourceHealthEvent {
                             source: "mic".into(),
                             state: "recovered".into(),
+                            gap_pct: None,
                         },
                     );
                 })),
                 on_lost: Some(Box::new(move || {
                     let _ = app2.emit(
                         "source_health",
-                        ipc::SourceHealthEvent { source: "mic".into(), state: "lost".into() },
+                        ipc::SourceHealthEvent {
+                            source: "mic".into(),
+                            state: "lost".into(),
+                            gap_pct: None,
+                        },
                     );
                 })),
             }
         });
         let mic_kicker = mic_resilient.kicker();
+        let storm_app = app.clone();
         let mic_notify = TapNotify {
             on_stall: Some(Box::new(move || {
                 eprintln!("麦克风采集失联(>3s 无帧):静音填充维持时间轴,触发自愈重启");
                 let _ = mic_kicker.try_send(());
             })),
             on_recover: Some(Box::new(|| eprintln!("麦克风采集恢复,静音填充结束"))),
+            // 高频短断流:设备还活着(不触发 on_stall),但内容在持续丢。
+            // 录制中就告诉用户,别等会后才靠耳朵发现掉字。
+            on_gap_storm: Some(Box::new(move |ratio| {
+                let _ = storm_app.emit(
+                    "source_health",
+                    ipc::SourceHealthEvent {
+                        source: "mic".into(),
+                        state: if ratio.is_some() { "gap_storm" } else { "gap_storm_over" }.into(),
+                        gap_pct: ratio.map(|r| (r * 100.0).round() as u32),
+                    },
+                );
+            })),
         };
         let mic: Box<dyn AudioCapture> = Box::new(
             TappedCapture::new_with_timeline_origin(
@@ -1454,6 +1494,7 @@ fn spawn_session(
                                         ipc::SourceHealthEvent {
                                             source: "system".into(),
                                             state: "recovered".into(),
+                                            gap_pct: None,
                                         },
                                     );
                                 })),
@@ -1463,18 +1504,32 @@ fn spawn_session(
                                         ipc::SourceHealthEvent {
                                             source: "system".into(),
                                             state: "lost".into(),
+                                            gap_pct: None,
                                         },
                                     );
                                 })),
                             }
                         });
                     let sys_kicker = sys_resilient.kicker();
+                    let sys_storm_app = app.clone();
                     let sys_notify = TapNotify {
                         on_stall: Some(Box::new(move || {
                             eprintln!("系统声音采集失联(>5s 无帧):静音填充维持时间轴,触发自愈重启");
                             let _ = sys_kicker.try_send(());
                         })),
                         on_recover: Some(Box::new(|| eprintln!("系统声音采集恢复"))),
+                        // system 轨同样接:实测健康场次它恒为 0 断流,真叫起来
+                        // 说明是系统采集侧出了事,同样该在录制中看见。
+                        on_gap_storm: Some(Box::new(move |ratio| {
+                            let _ = sys_storm_app.emit(
+                                "source_health",
+                                ipc::SourceHealthEvent {
+                                    source: "system".into(),
+                                    state: if ratio.is_some() { "gap_storm" } else { "gap_storm_over" }.into(),
+                                    gap_pct: ratio.map(|r| (r * 100.0).round() as u32),
+                                },
+                            );
+                        })),
                     };
                     let sys: Box<dyn AudioCapture> = Box::new(
                         TappedCapture::new_with_timeline_origin(
@@ -1534,6 +1589,7 @@ fn spawn_session(
                                         ipc::SourceHealthEvent {
                                             source: "system".into(),
                                             state: "recovered".into(),
+                                            gap_pct: None,
                                         },
                                     );
                                 })),
@@ -1543,6 +1599,7 @@ fn spawn_session(
                                         ipc::SourceHealthEvent {
                                             source: "system".into(),
                                             state: "lost".into(),
+                                            gap_pct: None,
                                         },
                                     );
                                 })),
@@ -2264,7 +2321,9 @@ fn persist_track_sync(
             gaps: h.gaps,
             rate_fixes: h.rate_fixes,
             hw_gaps: h.hw_gaps,
+            hw_holes: h.hw_holes,
             hw_gap_ms: h.hw_gap_ms,
+            cap_dropped_samples: h.cap_dropped_samples,
             cap_queue_hw: h.cap_queue_hw,
             send_wait_ms: h.send_wait_ms,
             send_wait_max_ms: h.send_wait_max_ms,
@@ -2401,6 +2460,7 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
 fn mic_mode() -> &'static str {
     crate::audio::mic_mode::active().as_str()
 }
+
 
 /// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
 /// 为什么由前端说:「有没有在播」的产品语义是会话——进笔记页就自动装载内核,拿后端的
