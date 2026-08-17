@@ -1,5 +1,7 @@
 //! A2 LLM Aing:OpenAI 兼容 chat completions,分块+术语表前传,失败块保原文。
+//! 提示词一律取自 [`super::prompts`],本文件只组装请求与解析回包。
 
+use super::prompts;
 use crate::store::{RefinedParagraph, RelationPredicate};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -86,10 +88,6 @@ fn retryable(e: &ChunkErr) -> bool {
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
 pub const PROBE_TIMEOUT_S: u64 = 15;
 
-const SYSTEM_PROMPT: &str = "你是会议逐字稿精修助手。对输入的每个段落做四件事,除此之外禁止任何改动:\n1. 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文,禁止改写句式或语义;\n2. 实体归一:同一人名/产品名/术语全文统一为最常见或术语表给定的写法;\n3. 轻度清理口头语:删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留语气词「吧」「啊」等;\n4. 英文与数字排版:英文词组与中文之间加空格,产品名保持原大小写。\n此外,抽取本批出现的关键实体(不改动正文),用修订后的规范名,并抽取有原文证据的语义关系。关系 predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at,或 custom;custom 必须提供非空 label。每条关系给出 0 到 1 的 confidence。valid_from/valid_to 可为 null；非 null 时必须是带时区的 RFC3339 时间戳，且两者同时存在时 valid_from 必须严格早于 valid_to（不允许零长度区间）。evidence.paragraph_index 必须使用输入中标注的全文绝对段落下标,绝不能改成块内下标;start/end 是该修订后段落的 Unicode scalar(char)半开区间,不是 UTF-8 字节偏移;quote 必须逐字符精确等于该区间。\n每段前的 speaker= 标注是该段说话人(人名或簇号),仅供理解上下文:用于人名/称呼错字判断与实体归一(如称呼「小王」后由 speaker=王某 的段应答,可确认「王」字写法)。禁止据此改写句式、把代词替换成人名、或把 speaker 标注/说话人名写进 texts;texts 只输出修订后的正文。\n输出 JSON:{\"glossary\":{\"错误写法\":\"统一写法\"},\"texts\":[\"段落1修订文\",\"段落2修订文\"],\"entities\":[{\"name\":\"规范名\",\"kind\":\"person|org|project|term|decision|task|place|date\",\"aliases\":[\"别名\"]}],\"relations\":[{\"subject\":\"张三\",\"predicate\":{\"type\":\"responsible_for\",\"label\":null},\"object\":\"灯塔计划\",\"confidence\":0.92,\"valid_from\":null,\"valid_to\":null,\"evidence\":[{\"paragraph_index\":0,\"start\":0,\"end\":8,\"quote\":\"张三负责灯塔计划\"}]}]}。\ntexts 数组长度必须与输入段落数一致,顺序一致。glossary 只收实体类归一项。entities 没有可给空数组,aliases 可省略。relations 必须存在,没有关系时给显式空数组。";
-
-const RELATION_ONLY_SYSTEM_PROMPT: &str = "你是会议语义关系抽取器。正文和实体已经定稿，禁止改写、补写或删除任何段落与实体。只根据给定 paragraphs 和 entities 抽取有逐字证据的 relations。subject/object 必须使用 entities 中的规范 name 或 alias；predicate.type 只能是 participates_in、responsible_for、belongs_to、uses、depends_on、produces、assigned_to、occurs_at 或 custom，custom 必须带非空 label；confidence 必须在 0 到 1；valid_from/valid_to 为 null 或带时区 RFC3339，且 from 严格早于 to。evidence.paragraph_index 是全文绝对下标；start/end 是 Unicode scalar 半开区间；quote 必须逐字符等于该区间。只输出 JSON 对象 {\"relations\":[...]}；没有可靠关系时输出 {\"relations\":[]}。";
-
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
@@ -168,7 +166,7 @@ impl super::identify::IdentifyExecutor for HttpIdentifyExecutor {
             "temperature": 0.1,
             "response_format": { "type": "json_object" },
             "messages": [
-                { "role": "system", "content": super::identify::IDENTIFY_SYSTEM_PROMPT },
+                { "role": "system", "content": prompts::IDENTIFY_SYSTEM },
                 { "role": "user", "content": serde_json::to_string(ctx)? },
             ],
         });
@@ -234,7 +232,7 @@ pub fn extract_relations(
         "model": cfg.model,
         "temperature": 0.1,
         "messages": [
-            {"role": "system", "content": RELATION_ONLY_SYSTEM_PROMPT},
+            {"role": "system", "content": prompts::RELATION_ONLY_SYSTEM},
             {"role": "user", "content": serde_json::to_string(&json!({
                 "entities": doc.entities,
                 "paragraphs": paragraphs,
@@ -355,7 +353,7 @@ pub fn probe(cfg: &LlmConfig) -> Result<String, String> {
     let mut body_json = json!({
         "model": cfg.model,
         "max_tokens": 1,
-        "messages": [{ "role": "user", "content": "回复 OK" }],
+        "messages": [{ "role": "user", "content": prompts::LLM_PROBE_USER }],
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
     let body = body_json.to_string();
@@ -427,12 +425,7 @@ pub(crate) fn speaker_label(p: &RefinedParagraph) -> String {
 fn format_chunk_paragraphs(paragraphs: &[ChunkPara]) -> String {
     paragraphs
         .iter()
-        .map(|p| {
-            format!(
-                "paragraph_index={} speaker={}: {}\n",
-                p.index, p.label, p.text
-            )
-        })
+        .map(|p| prompts::refine_paragraph_line(p.index, &p.label, &p.text))
         .collect()
 }
 
@@ -451,14 +444,14 @@ fn call_chunk(
     log: Option<&crate::ailog::Ctx>,
 ) -> Result<(Value, Vec<String>, Vec<RawEntity>, Vec<RawRelation>, bool), ChunkErr> {
     let numbered = format_chunk_paragraphs(paragraphs);
-    let user = format!("术语表(沿用并可扩充):{glossary}\n段落:\n{numbered}");
+    let user = prompts::refine_user(glossary, &numbered);
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut body_json = json!({
         "model": cfg.model,
         "temperature": 0.1,
         "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "system", "content": prompts::REFINE_SYSTEM },
             { "role": "user", "content": user },
         ],
     });
@@ -629,7 +622,7 @@ pub fn gen_title(
         "model": cfg.model,
         "temperature": 0.3,
         "messages": [
-            { "role": "system", "content": "你为会议转写起标题。只输出一个不超过 12 个字的中文标题,概括这场对话的核心主题;不要引号、标点或任何解释。" },
+            { "role": "system", "content": prompts::TITLE_SYSTEM },
             { "role": "user", "content": text },
         ],
     });
