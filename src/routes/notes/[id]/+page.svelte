@@ -5,6 +5,7 @@
   import { goto } from "$app/navigation";
   import { save } from "@tauri-apps/plugin-dialog";
   import { recording } from "$lib/recording.svelte";
+  import { recordRiskGate } from "$lib/recordRisk.svelte";
   import AiStateLabel from "$lib/AiStateLabel.svelte";
   import { onRefine, onRetranscribe, onMixedRegen, onNoteRenamed, onNoteRealigned } from "$lib/events";
   import {
@@ -1601,6 +1602,10 @@
   }
 
   async function doResume() {
+    // 续录会重新打开同一套麦克风与系统采集链,风险与新建录制完全一样,
+    // 必须走同一道门(Codex review P1:这里原先绕过了,而它有完整 UI 上下文,
+    // 不属于快捷键/托盘那种刻意的无 UI 例外)。
+    if (!(await recordRiskGate.guard())) return;
     const ok = await recording.resume(id);
     if (ok) goto("/record");
     else

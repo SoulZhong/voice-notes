@@ -23,6 +23,8 @@
     type ModelsStatus,
   } from "$lib/models";
   import { onCloudAsrStatus, type CloudAsrStatusEvent } from "$lib/events";
+  import { gapStorm } from "$lib/gapStorm.svelte";
+  import { recordRiskGate } from "$lib/recordRisk.svelte";
   import ModelDownloadCard from "$lib/ModelDownloadCard.svelte";
   import { formatTs } from "$lib/notes";
   import { matchesSpeakerFilter, nearestIndexByMs, searchHits } from "$lib/liveView";
@@ -98,12 +100,28 @@
   // ≥100ms 数字纯静音占 18.6%/20.6%、45 段直接切在人声上;关掉后立刻 0 段。削发生在音频
   // 进本进程之前,我们救不回来,所以只能明说。录制中也轮询(用户可能中途在控制中心切),
   // 读不到("unknown")不提示。
-  let micModeBad = $state(false);
+  // 断流风暴预警(2026-08-17 蓝牙实录):麦克风每次断几百毫秒、每分钟二十来次,
+  // 设备始终"活着"所以失联判定不触发,但那场 14.2% 的时长根本没有音频帧,补零补进去
+  // 34% 落在人声中间——用户全程无提示,会后才靠耳朵发现掉字。后端按滚动一分钟窗
+  // 的洞时长比例在上升沿报一次,这里显示到风暴平息;停录即清。
+  // 断流风暴状态读自模块级 store,本页不自己存(Codex 二轮 P2):录制中离开本页
+  // 再回来,页面局部状态会归零,而后端此时不会重发上升沿,横幅就在风暴仍在继续
+  // 时永久消失。订阅与状态都活在 layout 层,见 gapStorm.svelte.ts。
+
+  // 音质风险横幅改由 precheck_recording 单一真值驱动(原先只查 mic_mode)。
+  // 为什么并过来:开录前确认与录制中横幅说的是同两件事,各查各的迟早对不上;
+  // 而且蓝牙麦克风这条必须在录制页可见——快捷键/托盘开录不经过确认对话框
+  // (纯后端路径,没有 UI 上下文),横幅是那条路径唯一的提示面。
+  //
+  // 与确认对话框的"本次会话已放行"互不影响:放行只关掉弹窗,风险仍在,横幅照挂。
+  let riskKinds = $state<string[]>([]);
+  const micModeBad = $derived(riskKinds.includes("voice_isolation"));
+  const btMicRisk = $derived(riskKinds.includes("bluetooth_mic"));
   async function refreshMicMode() {
     try {
-      micModeBad = (await invoke<string>("mic_mode")) === "voice_isolation";
+      riskKinds = (await invoke<{ kind: string }[]>("precheck_recording")).map((r) => r.kind);
     } catch {
-      micModeBad = false;
+      riskKinds = [];
     }
   }
 
@@ -372,6 +390,9 @@
   }
 
   async function startRecording() {
+    // 开录前风险确认(语音突显/蓝牙麦克风):用户选「去改设置」就不开录。
+    // 探测失败一律放行,见 recordRisk.svelte.ts。
+    if (!(await recordRiskGate.guard())) return;
     await recording.start(); // 已在录制页，无需跳转
   }
   /** rms → 0..100% 显示映射,mic/system 两路共用(数值映射与原单通道版本一致)。 */
@@ -876,10 +897,33 @@
          那两张卡是"根本录不了"的唯一信息面,同屏再叠加音质类提示只会分散注意力。 -->
     <!-- 麦克风模式:唯一一条录制中也要显示的音质告警——它正在实时吃掉语音,
          而且用户随时可以在控制中心改回来,改完轮询会自动撤掉横幅。 -->
+    <!-- 断流风暴:与麦克风模式同级——都是"正在实时吃掉语音"且用户当场能改。
+         排在它前面:内容整段没有,比被削更严重。 -->
+    {#if gapStorm.mic !== null && !isSystemDenied && !isSystemUnavailable}
+      <div class="banner">
+        {t("record.banner.gapStorm", { pct: gapStorm.mic })}
+        <span class="hint">{t("record.banner.gapStormHow")}</span>
+      </div>
+    {/if}
+
+    {#if gapStorm.system !== null && !isSystemDenied && !isSystemUnavailable}
+      <div class="banner">
+        {t("record.banner.gapStormSystem", { pct: gapStorm.system })}
+      </div>
+    {/if}
+
     {#if micModeBad && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.micIsolation")}
         <span class="hint">{t("record.banner.micIsolationHow")}</span>
+      </div>
+    {/if}
+
+    <!-- 蓝牙麦克风:与语音突显同级,都是"正在实时吃掉内容"且用户当场能改。 -->
+    {#if btMicRisk && !isSystemDenied && !isSystemUnavailable}
+      <div class="banner">
+        {t("record.risk.bluetooth_mic.impact")}
+        <span class="hint">{t("record.risk.bluetooth_mic.how")}</span>
       </div>
     {/if}
 

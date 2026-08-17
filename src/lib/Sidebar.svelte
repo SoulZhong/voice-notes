@@ -5,6 +5,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import { onNoteRenamed } from "$lib/events";
   import { recording } from "$lib/recording.svelte";
+  import { recordRiskGate } from "$lib/recordRisk.svelte";
   import { playback } from "$lib/playback.svelte";
   import { noteBadgeKind, type NoteBadgeKind } from "$lib/noteBadge";
   import {
@@ -232,6 +233,8 @@
         console.error("停止录制失败", err); // stop() 失败已回滚状态,这里只记日志防未处理拒绝
       }
     } else {
+      // 与录制页同一个门:确认不通过就不开录,也不跳页。
+      if (!(await recordRiskGate.guard())) return;
       await recording.start();
       // 无论成败都进录制页:失败时错误状态与模型下载卡只在录制页渲染,
       // 留在原地会表现为"点了没反应"(模型缺失场景实测踩坑)。

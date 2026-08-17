@@ -18,6 +18,7 @@ mod i18n;
 mod player;
 mod player_align;
 mod player_gate;
+pub mod precheck;
 mod tray;
 mod update;
 pub mod diar;
@@ -2461,6 +2462,22 @@ fn mic_mode() -> &'static str {
     crate::audio::mic_mode::active().as_str()
 }
 
+/// 开录前风险清单(空 = 可以直接开录)。前端两个开录按钮据此弹一次确认。
+///
+/// 为什么由后端组合而不是前端调两次:拦截点要的是"有没有风险"这**一个**判断,
+/// 把组合放这里,将来别的入口读同一份真值,不各自拼一遍。判定本身是纯函数
+/// (`precheck::record_risks`),这里只负责把两个系统查询读出来喂给它。
+///
+/// 注意它与 `mic_mode` 的分工:那个只报状态供横幅用,这个是开录路径上的门。
+/// 「提示不是门禁」的旧约定被推翻了一半——现在拦一次,但用户始终能选择继续
+/// (依据见 docs/superpowers/specs/2026-08-17-precord-risk-gate-design.md)。
+#[tauri::command]
+fn precheck_recording() -> Vec<precheck::RecordRisk> {
+    precheck::record_risks(
+        crate::audio::mic_mode::active(),
+        crate::audio::default_input_is_bluetooth(),
+    )
+}
 
 /// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
 /// 为什么由前端说:「有没有在播」的产品语义是会话——进笔记页就自动装载内核,拿后端的
@@ -7671,7 +7688,8 @@ pub fn run() {
             player::player_set_muted,
             player::player_stop,
             set_playback_active,
-            mic_mode
+            mic_mode,
+            precheck_recording
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
