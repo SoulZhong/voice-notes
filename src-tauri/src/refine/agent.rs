@@ -14,6 +14,7 @@
 //! - 注入:Gemini 的 `.gemini/settings.json` 写进一次性工作区；Claude 用内联
 //!   --mcp-config + --strict-mcp-config，Codex 用 -c 覆盖，均不碰用户全局配置。
 
+use super::prompts;
 use crate::store::{load_refined, RefinedDoc, RefinedParagraph};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -149,7 +150,7 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
         )
     })?;
     let scratch = make_scratch("probe").map_err(|e| format!("建工作区失败: {e}"))?;
-    let prompt = "只回复两个字:正常。不要任何解释。";
+    let prompt = prompts::AGENT_PROBE;
     let run = (|| -> anyhow::Result<(bool, String, String)> {
         let cmd = title_command(kind, &bin, model, prompt, &scratch);
         run_with_timeout(cmd, &scratch, PROBE_TIMEOUT_S)
@@ -182,39 +183,6 @@ pub fn probe_run(provider: &str, bin_override: &str, model: &str) -> Result<Stri
             }
         }
     }
-}
-
-/// Aing 指令。与 llm.rs SYSTEM_PROMPT 同一套四类修订规则,但流程改为「读稿→修订→
-/// 工具写回」;各家 CLI 对 MCP 工具的暴露名前缀不同(claude 是 mcp__server__tool,
-/// gemini 是裸名),提示词里只用裸名,由各家自行映射。
-fn refine_prompt(note_id: &str) -> String {
-    format!(
-        "你是会议逐字稿精修与语义图谱助手。任务:完成 voice-notes 笔记 {note_id} 的文本与图谱 Aing。\n\
-         步骤:\n\
-         1. 调用 MCP 工具 get_note,参数 {{\"note_id\":\"{note_id}\",\"format\":\"segments\"}},\
-         取返回的 paragraphs 数组(段落下标从 0 计;若返回 refined=false 说明还没有精修稿,直接结束并说明)。\
-         每个段落带 speaker/name 字段(该段说话人的簇号与人名);精修正文时利用它做人名/称呼错字判断与称呼一致性\
-         (如称呼「小王」后由王某的段应答,可确认「王」字写法)。禁止修改说话人归属,禁止据此改写句式或把代词替换成人名,\
-         禁止把说话人名当前缀写进正文。\n\
-         2. 逐段检查,只做四类修订,除此之外禁止任何改动(不改句式和语义,不合并/拆分段落):\n\
-         a) 纠正同音/近音错字(如「肯计→肯定」),不确定时保留原文;\
-         b) 实体归一:同一人名/产品名/术语全文统一为最常见写法;\
-         c) 删除无意义的「嗯」「呃」及紧邻重复(「我们我们→我们」),保留「吧」「啊」等语气词;\
-         d) 英文与中文之间加空格,产品名保持原大小写。\n\
-         3. 调用 MCP 工具 apply_refined_texts 一次性写回,参数 \
-         {{\"note_id\":\"{note_id}\",\"updates\":[{{\"index\":段落下标,\"text\":\"该段修订后的完整文本\"}},...],\
-         \"model\":\"你的模型名\"}};只提交有改动的段落;若全文确无需要修订,updates 传空数组 []。\n\
-         4. 文本写回成功后才调用 get_aing_context({{\"note_id\":\"{note_id}\"}}重新读取最终 paragraphs、\
-         source_seqs、实体/mention、core_predicates、contract_version 与当前 source_hash。不得使用步骤 1 的旧文本做证据。\n\
-         5. 基于该 context 抽取实体和有原文证据的关系。predicate 只用 core_predicates 或带非空 label 的 custom;\
-         evidence 的 paragraph_index 与 Unicode scalar start/end 必须指向最终段落,quote 必须逐字符精确匹配,\
-         source_seqs/source_hash 必须照 context 当前值提交。\n\
-         6. 只调用一次 apply_aing_graph,提交 note_id、entities、relations、contract_version、model。\
-         每个 entity 给一个本次载荷内唯一的临时 id,关系 subject/object 引用这些临时 id;服务端会重算全部持久 ID 与 mentions。\
-         没有可靠关系时 relations 传空数组 []，仍须提交实体和图谱完成态。\n\
-         只允许使用 get_note、apply_refined_texts、get_aing_context、apply_aing_graph 四个 MCP 工具;\
-         不要读写任何文件,不要执行任何命令。完成后回复一行「完成」即可。"
-    )
 }
 
 /// voice-notes 自身二进制路径(Agent spawn `<exe> mcp serve` 用)。
@@ -340,17 +308,6 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph",
         }
     }
     Ok(cmd)
-}
-
-fn relation_prompt(note_id: &str, model: &str) -> String {
-    format!(
-        "你是会议语义关系补建助手。只处理 voice-notes 笔记 {note_id} 的关系，禁止修改正文或使用任何文件/shell 工具。\n\
-         1. 只调用一次 get_aing_context({{\"note_id\":\"{note_id}\"}})，读取最终 paragraphs、source_seqs、entities、core_predicates、contract_version 与 source_hash。\n\
-         2. entities 必须逐项、原顺序、原 name/kind/aliases 完整照抄 context，不得新增、删除、重排或归一。\n\
-         3. 仅抽取有逐字证据的 relations；subject/object 引用上述 entities 的临时 id；predicate 只用 core_predicates 或带非空 label 的 custom；evidence 的 paragraph_index 与 Unicode scalar start/end 必须精确指向最终段落，quote 必须逐字符匹配，source_seqs/source_hash 必须照 context 当前值提交。\n\
-         4. 只调用一次 apply_aing_graph，提交 note_id、原样 entities、relations、context 的 contract_version，以及 model=\"{model}\"。没有可靠关系时 relations 传 []。\n\
-         全程只允许调用 get_aing_context 与 apply_aing_graph 两个 MCP 工具。完成后回复一行「完成」。"
-    )
 }
 
 fn relation_command(
@@ -632,7 +589,7 @@ impl super::backfill::RelationExecutor for AgentRelationExecutor {
         let scratch = RelationScratch::create(&format!("relation-{note_id}"))?;
         let isolated = prepare_isolated_relation_note(&scratch, note_id, doc)?;
         (|| -> anyhow::Result<crate::store::aing_graph::ValidatedGraph> {
-            let prompt = relation_prompt(note_id, &self.model);
+            let prompt = prompts::agent_relation(note_id, &self.model);
             let exe = self_exe()?;
             let cmd = relation_command(
                 self.kind,
@@ -733,18 +690,6 @@ fn identify_markers() -> (String, String) {
     (format!("<VN_IDENTIFY_{nonce}>"), format!("</VN_IDENTIFY_{nonce}>"))
 }
 
-/// identify 的 Agent prompt:输入全内嵌(Agent 不读库不读盘),输出用哨兵标记
-/// 包住(允许多行 JSON——serde 不在乎换行,强求单行只会降服从率)。
-pub(crate) fn identify_agent_prompt(ctx_json: &str, start_tag: &str, end_tag: &str) -> String {
-    format!(
-        "{sys}\n\n输入 JSON 如下:\n{ctx}\n\n输出约定:完成推断后,把结果 JSON 输出一次,并用 {start} 与 {end} 这一对标记包住(标记各占一行,JSON 可以多行);除这一处外不要在任何位置输出这两个标记;不要调用任何工具,不要读写任何文件,不要执行任何命令。",
-        sys = super::identify::IDENTIFY_SYSTEM_PROMPT,
-        ctx = ctx_json,
-        start = start_tag,
-        end = end_tag,
-    )
-}
-
 /// identify 的命令构造:零 MCP + 结构性关死内置工具;prompt 走 stdin(不进 argv)。
 /// Cursor 在 new() 已被拒绝(print 模式带全部 write/shell 工具且无法关闭)。
 fn identify_command(kind: AgentKind, bin: &Path, model: &str, scratch: &Path) -> anyhow::Result<Command> {
@@ -819,7 +764,7 @@ impl AgentIdentifyExecutor {
     ) -> anyhow::Result<(Vec<super::identify::RawAssignment>, usize)> {
         let scratch = RelationScratch::create("identify")?;
         let ctx_json = serde_json::to_string(ctx)?;
-        let prompt = identify_agent_prompt(&ctx_json, start_tag, end_tag);
+        let prompt = prompts::agent_identify(&ctx_json, start_tag, end_tag);
         let started = std::time::Instant::now();
         let result = (|| -> anyhow::Result<(String, Vec<super::identify::RawAssignment>, usize)> {
             let cmd = identify_command(self.kind, &self.bin, &self.model, scratch.path())?;
@@ -1035,7 +980,7 @@ pub fn run_refine(
         "aing.json 的 llm 阶段已是 done,无法用盘上终态判定本轮成败"
     );
     let scratch = make_scratch(note_id)?;
-    let prompt = refine_prompt(note_id);
+    let prompt = prompts::agent_refine(note_id);
     let started = std::time::Instant::now();
     let result: RefineProcessResult = (|| {
         let exe = self_exe()?;
@@ -1181,9 +1126,7 @@ pub fn gen_title(
     if text.trim().is_empty() {
         anyhow::bail!("修订稿无内容,不生成标题");
     }
-    let prompt = format!(
-        "只输出一个不超过 12 个字的中文标题,概括下面这场对话的核心主题;不要引号、标点或任何解释。\n\n{text}"
-    );
+    let prompt = prompts::agent_title(&text);
     let scratch = make_scratch("title")?;
     let started = std::time::Instant::now();
     let run = (|| -> anyhow::Result<(bool, String, String)> {
@@ -1608,7 +1551,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
 
     #[test]
     fn refine_prompt_instructs_speaker_usage() {
-        let p = refine_prompt("note-1");
+        let p = prompts::agent_refine("note-1");
         assert!(
             p.contains("speaker/name 字段"),
             "必须告知 Agent 段落带说话人字段"
@@ -1621,7 +1564,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
 
     #[test]
     fn refine_prompt_requires_text_commit_before_one_graph_commit() {
-        let prompt = refine_prompt("note-1");
+        let prompt = prompts::agent_refine("note-1");
         let get_note = prompt.find("get_note").unwrap();
         let apply_text = prompt.find("apply_refined_texts").unwrap();
         let get_context = prompt.find("get_aing_context").unwrap();
@@ -2048,7 +1991,7 @@ mcp__voice-notes__get_aing_context,mcp__voice-notes__apply_aing_graph"
     #[test]
     fn identify_prompt_embeds_ctx_and_marker_contract() {
         let ctx_json = serde_json::to_string(&empty_identify_ctx()).unwrap();
-        let p = identify_agent_prompt(&ctx_json, "<VN_IDENTIFY_x>", "</VN_IDENTIFY_x>");
+        let p = prompts::agent_identify(&ctx_json, "<VN_IDENTIFY_x>", "</VN_IDENTIFY_x>");
         assert!(p.contains("\"note_id\":\"n1\""), "ctx JSON 内嵌");
         assert!(p.contains("<VN_IDENTIFY_x>") && p.contains("</VN_IDENTIFY_x>"));
         assert!(p.contains("不要调用任何工具"));

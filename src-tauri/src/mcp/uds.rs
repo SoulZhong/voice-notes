@@ -212,6 +212,20 @@ impl UdsBackend for AppBackend<'_> {
 
     fn start(&self, title: Option<&str>) -> Result<serde_json::Value, String> {
         let app = self.0;
+        // 开录前风险随返回值带出(Codex review P2):MCP 是无 UI 上下文的第三条开录
+        // 入口,既走不了确认对话框,也享受不到录制页横幅兜底——它不会把用户导航到
+        // 那一页。所以这里不拦(程序化调用拦不了),但必须把风险如实交给调用方,
+        // 让 AI 助手能转达给人,而不是静默录一场残缺的会。
+        let risks = crate::precheck::record_risks(
+            crate::audio::mic_mode::active(),
+            crate::audio::default_input_is_bluetooth(),
+        );
+        if !risks.is_empty() {
+            eprintln!(
+                "mcp start: 开录前检测到风险 {:?},已随返回值带出(MCP 路径不拦)",
+                risks.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+            );
+        }
         // P1 改道:经 lifecycle actor 信箱串行执行,执行体仍是 do_start_recording。
         app.state::<crate::lifecycle::LifecycleHandle>()
             .command(crate::lifecycle::Cmd::Start { resume_id: None })?;
@@ -237,7 +251,7 @@ impl UdsBackend for AppBackend<'_> {
                         eprintln!("mcp start: 设标题失败(录制已开始,不回滚): {e}");
                     }
                 }
-                return Ok(serde_json::json!({ "note_id": note_id }));
+                return Ok(serde_json::json!({ "note_id": note_id, "risks": risks }));
             }
             // 会话未入槽且 running 已被清(启动失败路径)→ 提前报错
             if !*state.running.lock().unwrap() {

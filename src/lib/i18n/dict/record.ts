@@ -33,6 +33,20 @@ export const zh = {
     "系统「语音突显」已开启：它会把它认为不是人声的部分削成绝对静音，实测会连人声一起削掉(有场录音因此丢了近两成语音)。",
   "record.banner.micIsolationHow": "改法：录制时点菜单栏控制中心 → 麦克风模式 → 标准。",
   "record.banner.btEcho": "蓝牙耳机延迟可能影响回声消除效果，建议改用有线耳机或内置扬声器。",
+  "record.banner.gapStorm":
+    "麦克风正在频繁断流：近一分钟有 {pct}% 的时长没有收到音频，这段内容是真的丢了(时间轴已按静音补齐)。",
+  "record.banner.gapStormHow": "多见于蓝牙耳机麦克风与会议软件抢带宽。改法：麦克风换成内置麦或有线设备，蓝牙耳机只用来听。",
+  "record.banner.gapStormSystem": "系统声音采集正在频繁断流：近一分钟有 {pct}% 的时长没有收到音频。对方说的话可能有缺失。",
+  "record.risk.title": "这样录会丢内容",
+  "record.risk.body": "检测到下面的问题。现在改还来得及；已经开会了也可以先录，损失如实记在笔记的对账里。",
+  "record.risk.voice_isolation.title": "系统「语音突显」开着",
+  "record.risk.voice_isolation.impact": "它会把它认为不是人声的部分削成绝对静音，判错时连人声一起削。实测有场录音因此丢了近两成语音。",
+  "record.risk.voice_isolation.how": "改法：菜单栏控制中心 → 麦克风模式 → 标准。",
+  "record.risk.bluetooth_mic.title": "正在用蓝牙耳机的麦克风",
+  "record.risk.bluetooth_mic.impact": "蓝牙麦克风走通话模式，上行要和会议软件抢带宽，会频繁断流。实测一场 23 分钟的会议因此丢了 14% 的时长，且多数断在话说到一半时。",
+  "record.risk.bluetooth_mic.how": "改法：把输入设备换成内置麦克风或有线设备，蓝牙耳机只用来听。",
+  "record.risk.proceed": "仍然录制",
+  "record.risk.cancel": "去改设置",
   "record.banner.lowInput": "麦克风输入音量偏低（{vol}%），可能录得很轻。",
   "record.banner.setVolume": "调到 {target}%",
   "record.banner.screenPerm": "无该权限无法开始录制（会议笔记需同时录制系统声音），请授权后重试。",
@@ -110,6 +124,22 @@ export const en = {
   "record.banner.micIsolationHow": "Fix: while recording, open Control Center in the menu bar \u2192 Mic Mode \u2192 Standard.",
   "record.banner.btEcho":
     "Bluetooth headset latency may affect echo cancellation; consider using wired headphones or the built-in speaker instead.",
+  "record.banner.gapStorm":
+    "The microphone keeps dropping out: {pct}% of the last minute arrived with no audio at all. That content is genuinely lost (the timeline was padded with silence).",
+  "record.banner.gapStormHow":
+    "Usually a Bluetooth headset mic competing with the meeting app for bandwidth. Fix: switch the microphone to the built-in or a wired one, and use the headset for playback only.",
+  "record.banner.gapStormSystem":
+    "System audio capture keeps dropping out: {pct}% of the last minute arrived with no audio. Parts of what the other side said may be missing.",
+  "record.risk.title": "This recording will lose content",
+  "record.risk.body": "We found the problems below. There is still time to fix them; if your meeting has already started you can record anyway, and the loss will be recorded in the note's audio reconciliation.",
+  "record.risk.voice_isolation.title": "macOS Voice Isolation is on",
+  "record.risk.voice_isolation.impact": "It mutes whatever it decides is not speech to digital silence, and it cuts real speech too. One recording here lost nearly 20% of its speech that way.",
+  "record.risk.voice_isolation.how": "Fix: Control Center in the menu bar \u2192 Mic Mode \u2192 Standard.",
+  "record.risk.bluetooth_mic.title": "Recording through a Bluetooth headset mic",
+  "record.risk.bluetooth_mic.impact": "A Bluetooth mic runs in call mode and competes with the meeting app for uplink bandwidth, so it drops out repeatedly. One 23-minute meeting here lost 14% of its duration this way, mostly cutting mid-sentence.",
+  "record.risk.bluetooth_mic.how": "Fix: switch the input device to the built-in or a wired mic, and use the headset for playback only.",
+  "record.risk.proceed": "Record anyway",
+  "record.risk.cancel": "Change settings",
   "record.banner.lowInput": "Microphone input volume is low ({vol}%); the recording may be very quiet.",
   "record.banner.setVolume": "Set to {target}%",
   "record.banner.screenPerm":

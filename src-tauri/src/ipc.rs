@@ -105,7 +105,11 @@ pub struct StorageEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceHealthEvent {
     pub source: String, // "mic" | "system"
-    pub state: String,  // "recovered" | "lost"
+    pub state: String,  // "recovered" | "lost" | "gap_storm"
+    /// state=="gap_storm" 时:滚动窗内没有音频帧的时长占比(整数百分比)。
+    /// 其余状态为 None——前端据此决定横幅措辞,不必解析 state 字符串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_pct: Option<u32>,
 }
 
 /// 云端识别的连接状态,事件名 "cloud-asr-status"。仅云端模式录制时产生,供前端状态条

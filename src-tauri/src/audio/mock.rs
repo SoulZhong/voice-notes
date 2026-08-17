@@ -25,6 +25,7 @@ impl MockCapture {
                 sample_rate: spec.sample_rate,
                 channels: spec.channels,
                 host_time_ns: None,
+                synthetic: false,
             })
             .collect();
         Ok(Self { frames })

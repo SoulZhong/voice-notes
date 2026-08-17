@@ -24,7 +24,9 @@
   import { AI_TOOLS_GUIDE_ID } from "$lib/onboarding";
   import ContextGuide from "$lib/ContextGuide.svelte";
   import MiniPlayer from "$lib/MiniPlayer.svelte";
+  import RecordRiskDialog from "$lib/RecordRiskDialog.svelte";
   import { playback, shouldShowMiniPlayer, startPlaybackSubscriptions } from "$lib/playback.svelte";
+  import { gapStorm, startGapStormSubscription } from "$lib/gapStorm.svelte";
 
   let { children } = $props();
 
@@ -118,6 +120,14 @@
   // 位置事件的全局订阅:放这里而不是 AudioPlayer 里——组件一卸载订阅就没了,
   // 迷你条的进度会僵住。
   $effect(() => startPlaybackSubscriptions());
+  // 断流风暴同理:订阅与状态都必须活得比录制页长,否则录制中切走再回来,
+  // 持续中的风暴横幅会永久消失(后端只在沿上报,不会为新挂载的页面重发)。
+  $effect(() => startGapStormSubscription());
+  // 停录清空:风暴是录制期的事,停了就不该继续挂着。放这里而不是页面里,
+  // 理由同上——页面可能根本没挂载。
+  $effect(() => {
+    if (!recording.isLive) gapStorm.clear();
+  });
 
   onMount(() => {
     recording.init();
@@ -148,6 +158,8 @@
 
 <div class="shell">
   <Sidebar />
+  <!-- 开录前风险确认:两个开录入口共用,挂一处。 -->
+  <RecordRiskDialog />
   <main class="main" class:with-orb-safearea={showMiniPlayer}>
     {#if update}
       <div class="update-banner">

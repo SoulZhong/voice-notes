@@ -132,10 +132,28 @@ pub struct SourceHealth {
     pub restarts: AtomicU32,
     /// 时钟核对改写采样率的次数(>0 说明该源声明的采样率与实测不符)。
     pub rate_fixes: AtomicU32,
-    /// 硬件时基不连续次数(时戳回退,或跳变 ≥ fill_after)。它是「采集侧真有洞」
-    /// 的直接计数:消费端再慢,只要采集连续,hw 时基就连续,此值不动——与
-    /// send_wait/cap_queue_hw 合起来能把「worker 慢」和「设备/HAL 丢帧」分开。
+    /// 硬件时基**区间作废**次数:这一段不能拿去测采样率。触发条件是所有
+    /// `usable == false` 的情形——时戳回退、跳变 ≥ fill_after、突发缓冲回吐
+    /// (样本比时间多)、隐含速率越出 RATE_SANITY 夹板,**以及**真丢样的洞。
+    ///
+    /// 注意它不是「丢了多少次样本」:洞只是它的子集。2026-08-17 排障把本字段
+    /// 当洞计数读,得出「514 次硬件断流」的错误结论(Codex 复核 P1)——真丢样
+    /// 看 `hw_holes` 与 `hw_gap_ms`。消费端再慢,只要采集连续此值不动,与
+    /// send_wait/cap_queue_hw 合起来仍能把「worker 慢」和「设备/HAL 丢帧」分开。
     pub hw_gaps: AtomicU32,
+    /// 判定为**真丢了样本**的洞次数(hw_gaps 的子集,与 hw_gap_ms 同源同判据)。
+    /// 「发生过几次断流」只能看它。
+    ///
+    /// 但它**不区分是谁丢的**(Codex review P2):判洞看的是"时间过去了、样本没来",
+    /// HAL/设备丢的和我们自己回调 try_send 丢的在硬件时戳上完全同形,都会记在这里。
+    /// 想分清归因必须结合 cap_dropped_samples,不能单看它就断言"该换设备"。
+    pub hw_holes: AtomicU32,
+    /// 采集回调因下游队列满而 try_send 丢弃的样本数(每通道)。停流时从采集
+    /// 后端取回。它计的是缺口里**可归因到我们自己**的那部分(下游背压顶到了采集
+    /// 回调)。注意量纲:这里是样本数,hw_holes 是次数,两者不可直接比较——联判要
+    /// 先按原生采样率把样本换成毫秒再与 hw_gap_ms 比。详见 store::audio::SyncInfo
+    /// 上的说明(含两个已知偏差与 0 的二义)。
+    pub cap_dropped_samples: AtomicU64,
     /// 按硬件时戳判定并**已补回时间轴**的洞总时长(ms)。hw_gaps 只说"发生过",
     /// 这个说"丢了多久、补了多久"——1694 次断裂对应多少秒,此前无从对账
     /// (2026-08-16:一场 98 分钟录音 438 秒被直接压掉,就是因为只计数不补)。
@@ -164,7 +182,11 @@ pub struct HealthSnapshot {
     pub rate_fixes: u32,
     pub hw_gaps: u32,
     #[serde(default)]
+    pub hw_holes: u32,
+    #[serde(default)]
     pub hw_gap_ms: u64,
+    #[serde(default)]
+    pub cap_dropped_samples: u64,
     pub cap_queue_hw: u32,
     pub send_wait_ms: u64,
     pub send_wait_max_ms: u64,
@@ -181,7 +203,9 @@ impl SourceHealth {
             restarts: self.restarts.load(Ordering::Relaxed),
             rate_fixes: self.rate_fixes.load(Ordering::Relaxed),
             hw_gaps: self.hw_gaps.load(Ordering::Relaxed),
+            hw_holes: self.hw_holes.load(Ordering::Relaxed),
             hw_gap_ms: self.hw_gap_ms.load(Ordering::Relaxed),
+            cap_dropped_samples: self.cap_dropped_samples.load(Ordering::Relaxed),
             cap_queue_hw: self.cap_queue_hw.load(Ordering::Relaxed),
             send_wait_ms: self.send_wait_ms.load(Ordering::Relaxed),
             send_wait_max_ms: self.send_wait_max_ms.load(Ordering::Relaxed),
@@ -239,7 +263,19 @@ pub struct TapPolicy {
     /// 生产取 60s/2%(听不出);测试可缩短以在秒级内跑完同一段收敛逻辑。
     pub phase_trim_window: Duration,
     pub phase_trim_max: f64,
+    /// 断流风暴告警的滚动窗与阈值(洞时长/墙钟)。窗越长越稳、越迟钝;
+    /// 阈值 0.05 = 窗内 5% 的时长是补零就叫。见 GapStormDetector。
+    pub gap_storm_window: Duration,
+    pub gap_storm_threshold: f64,
 }
+
+/// 断流风暴默认判据:一分钟窗、5%。
+/// 窗取 60s:短于此,一次一秒级断流就能把比例顶过阈值(蓝牙偶发一次是常态);
+/// 长于此,报警来得太迟,会已经开完了。
+/// 阈值取 5%:2026-08-17 那场是 14.2%,而健康场次实测在 0.1% 以下,
+/// 5% 落在两者中间足够宽的空档里,不靠调参也不会误报。
+const GAP_STORM_WINDOW: Duration = Duration::from_secs(60);
+const GAP_STORM_THRESHOLD: f64 = 0.05;
 
 impl TapPolicy {
     pub fn mic() -> Self {
@@ -251,6 +287,8 @@ impl TapPolicy {
             rate_fast_window: RATE_FAST_WINDOW,
             phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
             phase_trim_max: PHASE_TRIM_MAX,
+            gap_storm_window: GAP_STORM_WINDOW,
+            gap_storm_threshold: GAP_STORM_THRESHOLD,
         }
     }
     #[cfg(target_os = "macos")]
@@ -265,6 +303,8 @@ impl TapPolicy {
             rate_fast_window: RATE_FAST_WINDOW,
             phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
             phase_trim_max: PHASE_TRIM_MAX,
+            gap_storm_window: GAP_STORM_WINDOW,
+            gap_storm_threshold: GAP_STORM_THRESHOLD,
         }
     }
     #[cfg(windows)]
@@ -277,7 +317,92 @@ impl TapPolicy {
             rate_fast_window: RATE_FAST_WINDOW,
             phase_trim_window: Duration::from_secs_f64(PHASE_TRIM_SECS),
             phase_trim_max: PHASE_TRIM_MAX,
+            gap_storm_window: GAP_STORM_WINDOW,
+            gap_storm_threshold: GAP_STORM_THRESHOLD,
         }
+    }
+}
+
+/// 断流风暴判定:滚动窗口内「洞时长 / 墙钟时长」越过阈值就报一次。
+///
+/// 为什么需要它:`stall_after`(连续 3 秒无帧)只抓得住设备死亡,抓不住
+/// 「每次几百毫秒、每分钟二十来次」的高频短断流。2026-08-17 那场蓝牙会议
+/// 14.2% 的时长是补零,用户全程零提示,只能会后靠耳朵发现掉字。
+///
+/// 判据刻意用 `hw_gap_ms`(真丢样时长)除以墙钟,不用 `hw_gaps` 次数——后者
+/// 把突发回吐、时戳回退一并计入,语义已被证伪(见 SourceHealth::hw_gaps)。
+///
+/// 只在**沿**上报:起风暴报一次 Storm,平息报一次 Recovered,中间一律安静。
+/// 风暴往往持续整场,每个 tick 都报等于让用户学会忽略它。
+///
+/// 必须有 Recovered 这一条(Codex review P2):只发上升沿的话,消费端就只能拿定时器
+/// 让提示自行过期——而风暴若持续整场,detector 一直不重新武装、不再发事件,提示会
+/// 在断流仍在继续时悄悄消失。有了恢复沿,「显示到风暴平息」才真的成立。
+///
+/// **覆盖范围限制**:判据是 `hw_gap_ms`,它只在**硬件时戳**判洞分支增长。拿不到
+/// 时戳的采集后端(Windows loopback 恒 `host_time_ns: None`)因此永远报不出风暴。
+///
+/// 这是刻意保留的(Codex 二轮 P2 建议改用补零增量,不采纳):Windows loopback 是
+/// 「无播放即无回调」,补零本就是常态(见 TapPolicy::system_loopback 的说明),
+/// 拿补零量当判据会在那个平台上把静音全报成风暴——把一个漏报换成满屏误报。
+/// macOS 两轨与 Windows 的 mic 轨(cpal 有时戳)都不受此限,覆盖到了实际出事的场景。
+/// 要覆盖 Windows system 轨,得先有办法把「该响却没响」和「本来就没声音」分开,
+/// 那是独立课题。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GapStormEvent {
+    /// 起风暴。参数 = 窗内洞时长占比。
+    Storm(f64),
+    /// 已平息(只有真起过风暴才会发)。
+    Recovered,
+}
+
+pub struct GapStormDetector {
+    window: Duration,
+    threshold: f64,
+    /// 窗内采样点 (时刻, 累计洞时长 ms);超出窗长的从头部丢弃。
+    samples: std::collections::VecDeque<(Instant, u64)>,
+    /// false = 正处在已报告的风暴中(等平息);true = 平静,可报下一次风暴。
+    armed: bool,
+}
+
+impl GapStormDetector {
+    pub fn new(window: Duration, threshold: f64) -> Self {
+        Self {
+            window,
+            threshold,
+            samples: std::collections::VecDeque::new(),
+            armed: true,
+        }
+    }
+
+    /// 喂入当前时刻与**累计**洞时长。只在沿上返回事件,平时返回 None。
+    pub fn observe(&mut self, now: Instant, cumulative_gap_ms: u64) -> Option<GapStormEvent> {
+        self.samples.push_back((now, cumulative_gap_ms));
+        // 留一个刚好越过窗左沿的点做基准,窗才是满的;否则开录头一分钟
+        // 分母偏小,一个洞就能把比例顶过阈值(早期误报)。
+        while self.samples.len() > 2
+            && now.duration_since(self.samples[1].0) >= self.window
+        {
+            self.samples.pop_front();
+        }
+        let (t0, g0) = *self.samples.front()?;
+        let span = now.duration_since(t0);
+        if span < self.window {
+            return None; // 窗未满,不判——样本不足的比例没有意义
+        }
+        let ratio = cumulative_gap_ms.saturating_sub(g0) as f64 / span.as_millis().max(1) as f64;
+        if ratio > self.threshold {
+            if self.armed {
+                self.armed = false;
+                return Some(GapStormEvent::Storm(ratio));
+            }
+        } else if !self.armed {
+            // 只有真起过风暴(armed 被拉低过)才发恢复沿——否则安静的一场会在
+            // 首次满窗时凭空发一条"已恢复"。
+            self.armed = true;
+            return Some(GapStormEvent::Recovered);
+        }
+        None
     }
 }
 
@@ -285,11 +410,17 @@ impl TapPolicy {
 pub struct TapNotify {
     pub on_stall: Option<Box<dyn Fn() + Send>>,
     pub on_recover: Option<Box<dyn Fn() + Send>>,
+    /// 断流风暴沿:`Some(比例)` = 起风暴,`None` = 已平息。与 on_stall 互补:
+    /// on_stall 抓的是「连续几秒一帧没有」的设备死亡,这个抓的是
+    /// 「每次几百毫秒、密集反复」的高频短断流——后者不触发前者,
+    /// 却能吃掉一场会 14% 的内容(2026-08-17 蓝牙实录)。
+    /// 两条沿都要报,消费端才能一直显示到平息,而不是靠定时器让提示自行过期。
+    pub on_gap_storm: Option<Box<dyn Fn(Option<f64>) + Send>>,
 }
 
 impl TapNotify {
     pub fn none() -> Self {
-        Self { on_stall: None, on_recover: None }
+        Self { on_stall: None, on_recover: None, on_gap_storm: None }
     }
 }
 
@@ -386,9 +517,19 @@ impl AudioCapture for TappedCapture {
 
     fn stop(&mut self) {
         self.inner.stop();
+        // 回调丢样在停流后才是终值(采集线程此时已收尾),取回来入账,
+        // 它才进得了 audio.json 的对账块。
+        self.health
+            .cap_dropped_samples
+            .store(self.inner.dropped_samples(), Ordering::Relaxed);
         if let Some(t) = self.tap.take() {
             let _ = t.join();
         }
+    }
+
+    /// 透传内层的丢样计数:tap 自己不丢样,套几层包装都该看到同一个数。
+    fn dropped_samples(&self) -> u64 {
+        self.inner.dropped_samples()
     }
 }
 
@@ -504,8 +645,40 @@ fn run_frame_tap_with_drift(
     // device_switch/gap_end。初值取进入循环时的 restarts 值(此前的重启与本次 tap
     // 生命周期无关,不该在第一帧就误判)。
     let mut drift_last_restarts: u32 = health.restarts.load(Ordering::Relaxed);
+    // 断流风暴:每个 tick 采一次「累计洞时长 vs 墙钟」,越过阈值在录制中就叫。
+    let mut gap_storm =
+        GapStormDetector::new(policy.gap_storm_window, policy.gap_storm_threshold);
 
     loop {
+        // 每轮循环(收到帧或 tick 超时)都采一个点:分母是墙钟,采样密度只影响
+        // 判定的时间分辨率,不影响比例本身。
+        match gap_storm.observe(Instant::now(), health.hw_gap_ms.load(Ordering::Relaxed)) {
+            Some(GapStormEvent::Storm(ratio)) => {
+                eprintln!(
+                    "[采集] {} 断流风暴:近 {}s 内有 {:.1}% 的时长没有音频帧,已按墙钟补零,\
+                     内容是真的少了那么多。{}",
+                    _source.as_str(),
+                    policy.gap_storm_window.as_secs(),
+                    ratio * 100.0,
+                    // 建议按源给(Codex 二轮 P2):system 轨的风暴是系统采集出事,
+                    // 让人去换麦克风是把排障引向错误方向。
+                    match _source {
+                        Source::Mic => "建议改用内置麦克风或有线连接",
+                        Source::System => "系统声音采集侧异常,与麦克风无关",
+                    }
+                );
+                if let Some(cb) = &notify.on_gap_storm {
+                    cb(Some(ratio));
+                }
+            }
+            Some(GapStormEvent::Recovered) => {
+                eprintln!("[采集] 断流风暴已平息");
+                if let Some(cb) = &notify.on_gap_storm {
+                    cb(None);
+                }
+            }
+            None => {}
+        }
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
                 // 本帧之前按硬件时戳判定的采集洞,转发真实帧前先补齐。两类丢失都走这里:
@@ -655,6 +828,10 @@ fn run_frame_tap_with_drift(
                                     // (Codex P0)。突发缓冲回吐(样本比时间多)不是洞,不补。
                                     if holey {
                                         pending_hole = hole;
+                                        // 只有这一支是「真丢了样本」。下面那个
+                                        // hw_gaps 覆盖所有「区间不可用」,两者
+                                        // 语义不同,排障必须分开看(Codex 复核 P1)。
+                                        health.hw_holes.fetch_add(1, Ordering::Relaxed);
                                         // 洞有多长在**检测时**就记账,不等补了多少才记
                                         // (Codex 八轮 P2):断流补零可能已经填过其中一段,
                                         // 按残余量记会把 1 秒的洞记成 500ms,这个字段就
@@ -787,6 +964,9 @@ fn run_frame_tap_with_drift(
                             sample_rate: frame.sample_rate,
                             channels: frame.channels,
                             host_time_ns: None, // 合成帧,不参与时钟核对
+                            // 这就是那个「我们自己造的零」——下游据此能把它
+                            // 和设备送来的数字静音分开。
+                            synthetic: true,
                         };
                         if to_worker.send(silence).is_err() {
                             return;
@@ -889,6 +1069,9 @@ fn run_frame_tap_with_drift(
                     channels,
                     // 合成补零帧，无真实硬件时间戳。
                     host_time_ns: None,
+                    // 帧荒期补的零(另一处在 pending_hole 补洞分支):同样是我们
+                    // 自己造的,下游要能认出来。
+                    synthetic: true,
                 };
                 if to_worker.send(silence).is_err() {
                     return;
@@ -930,7 +1113,7 @@ mod tests {
     }
 
     fn frame(n: usize) -> AudioFrame {
-        AudioFrame { samples: vec![0.5; n], sample_rate: 16000, channels: 1, host_time_ns: None }
+        AudioFrame { samples: vec![0.5; n], sample_rate: 16000, channels: 1, host_time_ns: None, synthetic: false }
     }
 
     fn fast_policy() -> TapPolicy {
@@ -944,6 +1127,9 @@ mod tests {
             // 还款窗按比例缩短:秒级用例里跑完与生产同一段收敛逻辑。
             phase_trim_window: Duration::from_millis(200),
             phase_trim_max: 0.5,
+            // 默认给足够大的窗:除风暴用例本身外,其它用例不该被它波及。
+            gap_storm_window: Duration::from_secs(3600),
+            gap_storm_threshold: 1.0,
         }
     }
 
@@ -984,6 +1170,7 @@ mod tests {
                     sample_rate: declared,
                     channels: 1,
                     host_time_ns: None,
+                    synthetic: false,
                 })
                 .is_err()
             {
@@ -1041,6 +1228,7 @@ mod tests {
                 sample_rate: declared,
                 channels: 1,
                 host_time_ns: Some(ns),
+                synthetic: false,
             })
             .unwrap();
             ns += step_ns;
@@ -1139,12 +1327,22 @@ mod tests {
         declared: u32,
         script: &[(usize, Option<u64>, Duration)],
     ) -> (Vec<AudioFrame>, Arc<SourceHealth>) {
+        run_scripted_with_notify(policy, declared, script, TapNotify::none())
+    }
+
+    /// 同 run_scripted,但可注入通知回调(断流风暴一类的接线回归用)。
+    fn run_scripted_with_notify(
+        policy: TapPolicy,
+        declared: u32,
+        script: &[(usize, Option<u64>, Duration)],
+        notify: TapNotify,
+    ) -> (Vec<AudioFrame>, Arc<SourceHealth>) {
         let (ctx, crx) = crossbeam_channel::unbounded();
         let (wtx, wrx) = crossbeam_channel::unbounded();
         let health = Arc::new(SourceHealth::default());
         let h2 = health.clone();
         let t = std::thread::spawn(move || {
-            run_frame_tap(Source::Mic, crx, wtx, h2, policy, TapNotify::none())
+            run_frame_tap(Source::Mic, crx, wtx, h2, policy, notify)
         });
         for (n, hw, wait) in script {
             if !wait.is_zero() {
@@ -1155,6 +1353,7 @@ mod tests {
                 sample_rate: declared,
                 channels: 1,
                 host_time_ns: *hw,
+                synthetic: false,
             })
             .unwrap();
         }
@@ -1225,6 +1424,306 @@ mod tests {
         );
         assert_eq!(health.rate_fixes.load(Ordering::Relaxed), 0);
         assert_eq!(health.hw_gaps.load(Ordering::Relaxed), 1, "洞要记一次 hw_gaps");
+        assert_eq!(health.hw_holes.load(Ordering::Relaxed), 1, "真丢样要记一次 hw_holes");
+    }
+
+    /// Codex 复核 P1(2026-08-17):`hw_gaps` 在**所有**「区间不可用」分支都 +1——
+    /// 时戳回退、突发缓冲回吐、隐含速率越界都算,只有 `holey` 才累加 hw_gap_ms。
+    /// 那次排障据此把 514 读成「514 次硬件断流」,而真正可信的量只有 hw_gap_ms。
+    /// 拆出 hw_holes:只在判洞时 +1,让「丢了样本」与「这段不能拿来测率」分家。
+    ///
+    /// 本例造突发回吐:时戳只前进 4ms,却仍携带上一帧 10ms 的样本(样本比时间多)。
+    /// 区间必须作废(隐含速率 120kHz,拿去测率会毁掉判定),但一个样本都没丢。
+    #[test]
+    fn burst_flush_invalidates_interval_without_counting_a_hole() {
+        const DECLARED: u32 = 48_000;
+        let policy = TapPolicy {
+            rate_eval_window: Duration::from_millis(200),
+            fill_after: Duration::from_millis(500),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        let mut script: Vec<(usize, Option<u64>, Duration)> = Vec::new();
+        let mut ns = 1_000u64;
+        for i in 0..40 {
+            script.push((480, Some(ns), Duration::ZERO));
+            ns += if i == 5 { 4_000_000 } else { 10_000_000 };
+        }
+        let (_got, health) = run_scripted(policy, DECLARED, &script);
+        assert_eq!(
+            health.hw_gaps.load(Ordering::Relaxed),
+            1,
+            "样本比时间多的区间不能拿来测率,要计一次 hw_gaps"
+        );
+        assert_eq!(
+            health.hw_holes.load(Ordering::Relaxed),
+            0,
+            "突发回吐一个样本都没丢,不得计成洞"
+        );
+        assert_eq!(
+            health.hw_gap_ms.load(Ordering::Relaxed),
+            0,
+            "没丢样就没有洞时长"
+        );
+    }
+
+    /// Codex 复核 P1(2026-08-17):采集回调因下游队列满而 try_send 丢掉的样本,
+    /// 此前只在停流时 eprintln,进不了 audio.json。缺了它,排障没法把
+    /// 「设备/HAL 没供帧」和「我们自己的回调丢帧」分开——两者都表现为 hw 时戳
+    /// 出现缺口,归因却完全相反(前者换设备,后者修下游)。
+    #[test]
+    fn capture_callback_drops_are_recorded_into_health() {
+        struct DroppingCapture(u64);
+        impl crate::audio::AudioCapture for DroppingCapture {
+            fn start(&mut self, _sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn dropped_samples(&self) -> u64 {
+                self.0
+            }
+        }
+
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(DroppingCapture(1234)),
+            Source::Mic,
+            fast_policy(),
+            health.clone(),
+            TapNotify::none(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        cap.stop();
+
+        assert_eq!(
+            health.cap_dropped_samples.load(Ordering::Relaxed),
+            1234,
+            "回调丢样必须入账,否则 audio.json 里看不见"
+        );
+        assert_eq!(
+            health.snapshot(Source::Mic).cap_dropped_samples,
+            1234,
+            "快照要带上它,audio.json 才写得出去"
+        );
+    }
+
+    /// 默认实现返回 0:不丢样(或不统计)的后端不该被记上莫须有的丢样。
+    #[test]
+    fn backends_without_drop_accounting_report_zero() {
+        struct QuietCapture;
+        impl crate::audio::AudioCapture for QuietCapture {
+            fn start(&mut self, _sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(QuietCapture),
+            Source::System,
+            fast_policy(),
+            health.clone(),
+            TapNotify::none(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        cap.stop();
+        assert_eq!(health.cap_dropped_samples.load(Ordering::Relaxed), 0);
+    }
+
+    /// 断流风暴要在**录制中**就说出来。2026-08-17 那场蓝牙会议丢了 14.2% 的
+    /// 时长,用户全程无提示,只能会后靠耳朵发现掉字;而 stall_after(3s 无帧)
+    /// 抓不住这种「每次几百毫秒、每分钟二十来次」的高频短断流。
+    /// 判据用 hw_gap_ms/墙钟 的滚动比例,不用语义已被证伪的 hw_gaps 计数。
+    #[test]
+    fn gap_storm_fires_once_on_rising_edge_and_rearms_after_recovery() {
+        let t0 = Instant::now();
+        let mut d = GapStormDetector::new(Duration::from_secs(60), 0.05);
+
+        // 干净的一分钟:一个洞都没有,不许报。
+        for s in 0..=60 {
+            assert_eq!(d.observe(t0 + Duration::from_secs(s), 0), None, "无洞不得告警");
+        }
+
+        // 接下来一分钟丢 9 秒(15%),跨过 5% 阈值 → 上升沿报一次。
+        let mut fired = Vec::new();
+        for s in 61..=120 {
+            let gap_ms = (s - 60) * 150; // 每秒累计 150ms 洞 = 15%
+            if let Some(e) = d.observe(t0 + Duration::from_secs(s), gap_ms) {
+                fired.push((s, e));
+            }
+        }
+        assert_eq!(fired.len(), 1, "同一场风暴只报一次,实测 {fired:?}");
+        assert!(
+            matches!(fired[0].1, GapStormEvent::Storm(r) if r >= 0.05),
+            "报出来的比例要是真比例,实测 {:?}",
+            fired[0].1
+        );
+
+        // 风暴持续:仍然不重复报。
+        let mut gap = 120u64 * 150;
+        for s in 121..=180 {
+            gap += 150;
+            assert_eq!(
+                d.observe(t0 + Duration::from_secs(s), gap),
+                None,
+                "持续风暴不得反复打扰"
+            );
+        }
+
+        // 恢复:洞不再增长,滚动窗口内比例回落到阈值下。
+        for s in 181..=300 {
+            let _ = d.observe(t0 + Duration::from_secs(s), gap);
+        }
+        // 再来一场风暴 → 重新武装,应再报一次。
+        let mut refired = 0;
+        for s in 301..=360 {
+            gap += 150;
+            if matches!(d.observe(t0 + Duration::from_secs(s), gap), Some(GapStormEvent::Storm(_))) {
+                refired += 1;
+            }
+        }
+        assert_eq!(refired, 1, "回落后再起风暴要能再报");
+    }
+
+    /// Codex 复核 P1(2026-08-17):补零帧到了下游就再也认不出来了——它和设备
+    /// 真的送来一段数字静音长得一模一样(host_time_ns=None 只是"没时戳",
+    /// 不等于"我们造的")。于是最终 m4a 里的绝对零段既可能是补零、也可能是
+    /// 设备/系统削的,归因只能靠猜;想做「AGC2 关/开 A/B」更是无从下手。
+    /// 给帧打上来源标记,让下游能区别对待。
+    #[test]
+    fn zero_fill_frames_are_marked_synthetic_and_real_frames_are_not() {
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        let (wtx, wrx) = crossbeam_channel::unbounded();
+        let health = Arc::new(SourceHealth::default());
+        let h2 = health.clone();
+        let t = std::thread::spawn(move || {
+            run_frame_tap(Source::System, crx, wtx, h2, fast_policy(), TapNotify::none())
+        });
+        ctx.send(frame(160)).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        ctx.send(frame(160)).unwrap();
+        drop(ctx);
+        t.join().unwrap();
+        let got: Vec<AudioFrame> = wrx.try_iter().collect();
+        assert!(got.len() > 2, "断流期应有补零帧: {}", got.len());
+        assert!(!got[0].synthetic, "首帧是真帧,不得标成合成");
+        assert!(!got[got.len() - 1].synthetic, "尾帧是真帧,不得标成合成");
+        assert!(
+            got[1..got.len() - 1].iter().all(|f| f.synthetic),
+            "断流期补的每一帧都必须自报是合成的"
+        );
+    }
+
+    /// 接线回归:tap 真的会在断流风暴时叫出来,而不是只把数字埋进 audio.json。
+    /// 会后才看得见的指标救不了正在开的这场会。
+    #[test]
+    fn tap_reports_gap_storm_while_recording() {
+        const DECLARED: u32 = 16_000;
+        let fired = Arc::new(AtomicU32::new(0));
+        let f2 = fired.clone();
+        let notify = TapNotify {
+            on_stall: None,
+            on_recover: None,
+            on_gap_storm: Some(Box::new(move |ratio| {
+                // 只数起风暴那一沿,平息沿不计。
+                if ratio.is_some() {
+                    f2.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+        };
+        let policy = TapPolicy {
+            gap_storm_window: Duration::from_millis(120),
+            gap_storm_threshold: 0.05,
+            fill_after: Duration::from_millis(500),
+            phase_trim_max: 0.0,
+            ..fast_policy()
+        };
+        // 每帧 160 样本(10ms @16k),但硬件时戳每次前进 20ms:每帧都缺一整帧
+        // = 持续断流。墙钟侧每帧 sleep 5ms,窗内比例远超 5%。
+        let mut script: Vec<(usize, Option<u64>, Duration)> = Vec::new();
+        let mut ns = 1_000u64;
+        for _ in 0..60 {
+            script.push((160, Some(ns), Duration::from_millis(5)));
+            ns += 20_000_000;
+        }
+        let (_got, health) = run_scripted_with_notify(policy, DECLARED, &script, notify);
+        assert!(
+            health.hw_gap_ms.load(Ordering::Relaxed) > 0,
+            "前提:这段脚本必须真的判出洞"
+        );
+        assert_eq!(fired.load(Ordering::Relaxed), 1, "断流风暴要在录制中报一次");
+    }
+
+    /// Codex review P2:后端只发上升沿,前端就只能拿定时器让横幅自行过期——
+    /// 风暴若持续整场,detector 一直不重新武装、不再发事件,横幅 90 秒后永久消失,
+    /// 而那时断流还在继续。必须补一条**恢复沿**,让"显示到风暴平息"真的成立。
+    #[test]
+    fn gap_storm_reports_recovery_edge_so_the_banner_can_stay_until_it_is_over() {
+        let t0 = Instant::now();
+        let mut d = GapStormDetector::new(Duration::from_secs(60), 0.05);
+        for s in 0..=60 {
+            assert_eq!(d.observe(t0 + Duration::from_secs(s), 0), None);
+        }
+        // 起风暴:上升沿报一次 Storm。
+        let mut fired = Vec::new();
+        for s in 61..=130 {
+            let gap = (s - 60) * 150;
+            if let Some(e) = d.observe(t0 + Duration::from_secs(s), gap) {
+                fired.push((s, e));
+            }
+        }
+        assert_eq!(fired.len(), 1, "起风暴只报一次,实测 {fired:?}");
+        assert!(
+            matches!(fired[0].1, GapStormEvent::Storm(r) if r >= 0.05),
+            "第一条必须是 Storm 且带真实比例"
+        );
+
+        // 风暴停了(洞不再增长):窗内比例滑落到阈值下时要报一次 Recovered,
+        // 且只报一次——否则整场剩余时间每个 tick 都在发"已恢复"。
+        let gap = 130u64 * 150;
+        let mut recovered = Vec::new();
+        for s in 131..=400 {
+            if let Some(e) = d.observe(t0 + Duration::from_secs(s), gap) {
+                recovered.push((s, e));
+            }
+        }
+        assert_eq!(recovered.len(), 1, "恢复也只报一次,实测 {recovered:?}");
+        assert!(
+            matches!(recovered[0].1, GapStormEvent::Recovered),
+            "第二条必须是 Recovered"
+        );
+    }
+
+    /// 从没起过风暴就不该报"已恢复":那会让前端凭空收到一条恢复事件。
+    #[test]
+    fn quiet_session_never_reports_recovery() {
+        let t0 = Instant::now();
+        let mut d = GapStormDetector::new(Duration::from_secs(60), 0.05);
+        for s in 0..=300 {
+            assert_eq!(d.observe(t0 + Duration::from_secs(s), 0), None, "第 {s} 秒");
+        }
+    }
+
+    /// 阈值以下的零星断流不报警:正常设备偶发一两次几十毫秒的洞是常态,
+    /// 报了就成了狼来了,用户会连真的风暴一起忽略。
+    #[test]
+    fn occasional_small_gaps_stay_below_the_alarm() {
+        let t0 = Instant::now();
+        let mut d = GapStormDetector::new(Duration::from_secs(60), 0.05);
+        let mut gap = 0u64;
+        for s in 0..=600 {
+            // 每 30 秒来一个 200ms 的洞 ≈ 0.67%,远低于 5%。
+            if s % 30 == 0 {
+                gap += 200;
+            }
+            assert_eq!(
+                d.observe(t0 + Duration::from_secs(s), gap),
+                None,
+                "第 {s} 秒:零星小洞不该告警"
+            );
+        }
     }
 
     /// 下游背压计量:worker 通道被塞住时,tap 要记录 send 阻塞时长与采集队列高水位。
@@ -1484,6 +1983,7 @@ mod tests {
                     sample_rate: DECLARED,
                     channels: 1,
                     host_time_ns: None,
+                    synthetic: false,
                 })
                 .unwrap();
                 first_sent.get_or_insert(now);
@@ -1609,6 +2109,7 @@ mod tests {
                 sample_rate: RATE,
                 channels: 1,
                 host_time_ns: None,
+                synthetic: false,
             })
             .unwrap();
         }
@@ -1779,6 +2280,7 @@ mod tests {
             on_recover: Some(Box::new(|| {
                 RECOVERS.fetch_add(1, Ordering::SeqCst);
             })),
+            on_gap_storm: None,
         };
         let health = Arc::new(SourceHealth::default());
         let t = std::thread::spawn(move || {
@@ -1848,6 +2350,7 @@ mod tests {
                         sample_rate: 16000,
                         channels: 1,
                         host_time_ns: None,
+                        synthetic: false,
                     });
                 }
                 if self.error_after_start {
@@ -1965,14 +2468,14 @@ mod tests {
         let mut ns = 0u64;
         for _ in 0..3 {
             cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
-                channels: 1, host_time_ns: Some(ns) }).unwrap();
+                channels: 1, host_time_ns: Some(ns), synthetic: false }).unwrap();
             ns += 10_000_000;
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(300));
         ns += 300_000_000;
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
-            channels: 1, host_time_ns: Some(ns) }).unwrap();
+            channels: 1, host_time_ns: Some(ns), synthetic: false }).unwrap();
         drop(cap_tx);
         t.join().unwrap();
 
@@ -2006,7 +2509,7 @@ mod tests {
         let mut ns = 0u64;
         for i in 0..6 {
             cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000,
-                channels: 1, host_time_ns: Some(ns) }).unwrap();
+                channels: 1, host_time_ns: Some(ns), synthetic: false }).unwrap();
             ns += if i == 2 { 20_000_000 } else { 10_000_000 };
             std::thread::sleep(Duration::from_millis(if i == 2 { 20 } else { 10 }));
         }
@@ -2037,16 +2540,16 @@ mod tests {
         });
         let mut ns = 0u64;
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(ns) }).unwrap();
+            host_time_ns: Some(ns), synthetic: false }).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         ns += 10_000_000;
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(ns) }).unwrap();
+            host_time_ns: Some(ns), synthetic: false }).unwrap();
         // 墙钟也真的过 3 秒,否则采集时钟欠账被墙钟口径的回退夹住。
         std::thread::sleep(Duration::from_millis(3000));
         ns += 3_000_000_000;
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(ns) }).unwrap();
+            host_time_ns: Some(ns), synthetic: false }).unwrap();
         drop(cap_tx);
         t.join().unwrap();
         let mut zeros = 0usize;
@@ -2076,7 +2579,7 @@ mod tests {
         let mut ns = 0u64;
         for _ in 0..5 {
             cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-                host_time_ns: Some(ns) }).unwrap();
+                host_time_ns: Some(ns), synthetic: false }).unwrap();
             ns += 10_000_000;
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2104,10 +2607,10 @@ mod tests {
         // 时戳只走 1ms,却一次交付 100ms 的样本(隐含率 100 倍,夹板外)。
         let mut ns = 0u64;
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(ns) }).unwrap();
+            host_time_ns: Some(ns), synthetic: false }).unwrap();
         ns += 1_000_000;
         cap_tx.send(AudioFrame { samples: vec![0.5; 1600], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(ns) }).unwrap();
+            host_time_ns: Some(ns), synthetic: false }).unwrap();
         drop(cap_tx);
         t.join().unwrap();
         let mut zeros = 0usize;
@@ -2136,11 +2639,11 @@ mod tests {
         // 两个真实帧 → 帧荒 200ms(触发补零) → 再一个真实帧
         for k in 0..2u64 {
             cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-                host_time_ns: Some(k * 10_000_000) }).unwrap();
+                host_time_ns: Some(k * 10_000_000), synthetic: false }).unwrap();
         }
         std::thread::sleep(Duration::from_millis(200));
         cap_tx.send(AudioFrame { samples: vec![0.5; 160], sample_rate: 16_000, channels: 1,
-            host_time_ns: Some(300_000_000) }).unwrap();
+            host_time_ns: Some(300_000_000), synthetic: false }).unwrap();
         drop(cap_tx);
         t.join().unwrap();
         while out_rx.try_recv().is_ok() {}
@@ -2192,6 +2695,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 host_time_ns: Some(0),
+                synthetic: false,
             })
             .unwrap();
         // 断流远超 fill_after(50ms),确保至少发出一次补零帧(filled_gap=true)。
@@ -2203,6 +2707,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
                 host_time_ns: Some(300_000_000),
+                synthetic: false,
             })
             .unwrap();
         drop(cap_tx);
@@ -2259,6 +2764,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 host_time_ns: Some(0),
+                synthetic: false,
             })
             .unwrap();
         // 断流超过 fill_after(50ms),tap 会补零(filled_gap=true)——不加这一步就测不出
@@ -2276,6 +2782,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 host_time_ns: Some(300_000_000),
+                synthetic: false,
             })
             .unwrap();
         drop(cap_tx);

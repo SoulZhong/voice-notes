@@ -176,6 +176,7 @@ export const zh = {
   "speakers.chipMe": "这是我",
   "speakers.chipDelete": "删除这个说话人",
   "speakers.chipDeleteConfirm": "确认删除(其段落变为未标注)",
+  "speakers.actionFailed": "操作失败(无错误信息)",
   "speakers.fragmentsN": "+{n} 位偶现说话人",
 } as const satisfies Dict;
 
@@ -365,5 +366,6 @@ export const en = {
   "speakers.chipMe": "This is me",
   "speakers.chipDelete": "Delete this speaker",
   "speakers.chipDeleteConfirm": "Confirm delete (its segments become unlabeled)",
+  "speakers.actionFailed": "Action failed (no error details)",
   "speakers.fragmentsN": "+{n} occasional speakers",
 } satisfies Record<keyof typeof zh, Msg>;

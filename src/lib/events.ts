@@ -159,3 +159,21 @@ export type NoteRealignedEvent = { note_id: string; drift_ms: number };
 export function onNoteRealigned(cb: (e: NoteRealignedEvent) => void) {
   return listen<NoteRealignedEvent>("note_realigned", (ev) => cb(ev.payload));
 }
+
+/** 采集源健康。state:
+ *  - "recovered"/"lost":断连自愈的结局(设备真的死过);
+ *  - "gap_storm":设备还活着,但在高频短断流——滚动一分钟窗内 gap_pct% 的时长
+ *    根本没有音频帧。它不触发失联判定(每次只有几百毫秒),却能吃掉一场会
+ *    两位数百分比的内容,所以必须在录制中就说出来;
+ *  - "gap_storm_over":风暴平息(gap_pct 缺省)。有这条沿,提示才能一直挂到真的
+ *    结束,而不是靠定时器自行过期——风暴常常持续整场,过期就等于骗人。
+ * `source` 必须看:system 轨也会报风暴,那是系统采集出事,排障动作与麦克风完全不同。 */
+export type SourceHealthEvent = {
+  source: "mic" | "system";
+  state: "recovered" | "lost" | "gap_storm" | "gap_storm_over";
+  gap_pct?: number;
+};
+
+export function onSourceHealth(cb: (e: SourceHealthEvent) => void) {
+  return listen<SourceHealthEvent>("source_health", (ev) => cb(ev.payload));
+}

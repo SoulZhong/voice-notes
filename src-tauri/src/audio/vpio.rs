@@ -149,6 +149,7 @@ unsafe extern "C" fn input_cb(
         sample_rate: ctx.sample_rate,
         channels: 1,
         host_time_ns,
+        synthetic: false,
     });
     0
 }

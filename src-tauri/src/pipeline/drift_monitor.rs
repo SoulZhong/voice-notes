@@ -343,6 +343,7 @@ pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Valu
             anomalies.push(serde_json::json!({
                 "source": key,
                 "kind": "reanchors_high",
+                "metric": "reanchors_total",
                 "value": report.reanchors,
             }));
         }
@@ -358,6 +359,9 @@ pub fn build_report(sources: &[(Source, DriftSourceReport)]) -> serde_json::Valu
             anomalies.push(serde_json::json!({
                 "source": key,
                 "kind": "declared_rate_untrusted",
+                // kind 是结论,value 是证据,两者单位不同——写明量纲,
+                // 免得读者按 kind 的字面意思去理解这个数(2026-08-17 实际踩过)。
+                "metric": "reanchor_burst_per_min",
                 "value": report.reanchor_burst_per_min,
             }));
         }
@@ -446,6 +450,7 @@ mod tests {
             sample_rate: rate,
             channels: 1,
             host_time_ns: ns,
+            synthetic: false,
         }
     }
 
@@ -669,6 +674,19 @@ mod tests {
             .map(|a| a["kind"].as_str().unwrap())
             .collect();
         assert!(kinds.contains(&"declared_rate_untrusted"), "应升格为显式诊断: {kinds:?}");
+        // 每条异常都要自报 value 量的是什么。2026-08-17 排障把这条的 value(16)
+        // 读成了「16kHz 可疑」,实际它是每分钟重锚峰值——kind 说的是结论,
+        // value 是证据,两者单位不同,不写清楚就会被读反(Codex 复核 P1)。
+        let storm = v["anomalies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["kind"] == "declared_rate_untrusted")
+            .unwrap();
+        assert_eq!(
+            storm["metric"], "reanchor_burst_per_min",
+            "value 必须自报量纲,否则读者会按 kind 的字面意思理解它"
+        );
     }
 
     /// 零星重锚(正常会话:补零段结束、暂停恢复)不得被误报成风暴。
