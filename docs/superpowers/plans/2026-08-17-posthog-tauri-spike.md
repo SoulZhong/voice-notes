@@ -42,7 +42,17 @@
 
 用户在 https://posthog.com 注册免费档 → 新建 project → 在 Project Settings 复制 **Project API Key**（形如 `phc_xxxxxxxx`）。注册时会选区域（US 或 EU），对应 host 分别是 `https://us.i.posthog.com` 与 `https://eu.i.posthog.com`——**必须与注册区域一致，选错会连不上**。
 
-此步只能由用户完成。
+此步只能由用户完成。（2026-08-17 记录：用户已建好项目，后台停在 "Waiting for events"。）
+
+**关于官方向导 `npx -y @posthog/wizard@latest`：**
+
+PostHog 的 onboarding 会推荐这个向导，它支持 SvelteKit，能自动装 SDK、配环境变量、接好事件捕获。可以用，但必须知道三件事：
+
+1. **它按 Web SvelteKit 接线，而本项目是 Tauri + SPA**（`adapter-static`，`src/routes/+layout.ts` 里 `export const ssr = false`）。向导可能生成 `hooks.server.ts`、`+layout.server.ts`、反向代理配置——这些在本项目里要么无效，要么破坏静态构建。**生成后必须逐文件审，SSR 相关一律删掉。**
+2. **它配出来的回放遮蔽是错的**。PostHog 默认只遮输入框、不遮普通文本，向导按通用 Web 应用配的就是这个默认值。本项目满屏都是会议内容，必须覆盖成全文本遮蔽（见 Task 5）。**向导的遮蔽配置不可直接采信。**
+3. **它会把仓库代码送到 PostHog 侧做模型推理**（"LLM inference is on us"）。这是一次对外的数据流动，需用户知情同意后再跑。
+
+用法：在**干净的 spike 分支**上跑（这样 `git diff` 能看清它改了什么），跑完**先不提交**，人工审过再决定留哪些。向导不降低本 spike 的任何风险——它只替你省十几行接线，五条判据一条都不能省。
 
 - [ ] **Step 2: 确认 .env.local 不会入库**
 
@@ -91,8 +101,31 @@ git checkout -b spike/posthog-tauri
 
 - [ ] **Step 1: 装依赖**
 
+两条路径，任选其一。
+
+**路径 A · 手工（默认）**
+
 Run: `npm i posthog-js`
 Expected: 安装成功，`package.json` 出现 `posthog-js`。
+
+**路径 B · 官方向导**（见 Task 1 Step 1 的三条注意事项）
+
+由用户执行 `npx -y @posthog/wizard@latest`，跑完**不要提交**，先审：
+
+Run: `git status --short && git diff`
+
+逐项判定：
+
+| 向导产物 | 处理 |
+|---|---|
+| `package.json` 加 `posthog-js` | 保留 |
+| `.env` / `.env.local` 里的 key 与 host | 保留，但确认已被 gitignore |
+| `+layout.svelte` / 客户端 init | 保留，作为本任务 Step 3/4 的替代 |
+| `hooks.server.ts`、`+layout.server.ts`、任何 `PUBLIC_` 之外的服务端接线 | **删除**——本项目 `ssr = false`，无服务端 |
+| 反向代理 / rewrite 配置 | **删除**——Tauri 里没有 Node 服务器 |
+| 回放遮蔽相关配置 | **不采信**，一律以 Task 5 的全遮蔽为准 |
+
+删完后 `npm run check` 必须仍是 0 error。若向导的产物与下面 Step 3/4 的代码重复，以向导版本为准，但**必须补上 Step 3 代码里那两条注释说明的意图**（为什么集中在单文件、为什么先关回放）。
 
 - [ ] **Step 2: 核对配置字段名**
 
