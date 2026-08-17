@@ -800,4 +800,50 @@ mod stale_tests {
         let stale = sync_and_take_stale(&mut c, &["a".into(), "b".into()], 10_000, 10_000);
         assert_eq!(stale, vec!["a".to_string()], "只有 a 到期;b 起算晚,不受牵连");
     }
+
+    /// 计时语义(上面四条)与 RefineFinished 的移除语义(machine.rs)各自都有测试,
+    /// 但「卡死的条目经自愈后守卫真的放行」这条串起来的结论此前没人守——而 2026-08-17
+    /// 出事的恰恰是它:worker 永久阻塞 ⇒ 永不发 RefineFinished ⇒ is_running 恒真 ⇒
+    /// 以它为第一道守卫的命令永久失败。任何一侧单独正确都不足以保证这条成立
+    /// (例如日后有人改 RefineFinished 的移除条件,两边的单测仍会全绿)。
+    ///
+    /// 真端到端(actor 主循环)要构造 AppHandle,仓库未接 tauri::test harness;这里
+    /// 退一层,把主循环里那段自愈逻辑对着**真内核**跑一遍,覆盖到守卫这一步为止。
+    /// 主循环自身的接线(每收一封先体检)不在覆盖内,见 #127 的真机项。
+    #[test]
+    fn 卡死条目经自愈后守卫放行且不波及并发笔记() {
+        let ttl = 10_000;
+        let mut clock = BTreeMap::new();
+
+        // A 手动入集(其 worker 随后永久阻塞,永不回报收尾),B 稍后并发 Aing。
+        let (st, _) = machine::handle(&LifecycleState::init(), &Msg::RefineRequest { note_id: "A".into() });
+        let (st, _) = machine::handle(&st, &Msg::RefineRequest { note_id: "B".into() });
+        let running = |s: &LifecycleState| s.refine.running_ids().map(str::to_string).collect::<Vec<_>>();
+        sync_and_take_stale(&mut clock, &running(&st), 0, ttl);
+
+        // 自愈前:A 的守卫生效,这正是用户看到的「点了没反应」。
+        let (_, fx) = machine::handle(&st, &Msg::RefineRequest { note_id: "A".into() });
+        assert_eq!(fx, vec![Effect::ReplyErr("该笔记正在 Aing 中".into())], "自愈前应照拒");
+
+        // B 正常收尾(worker 活着),A 到期判滞留。
+        let (st, _) = machine::handle(&st, &Msg::RefineFinished { note_id: "B".into() });
+        let stale = sync_and_take_stale(&mut clock, &running(&st), ttl, ttl);
+        assert_eq!(stale, vec!["A".to_string()], "只有卡死的 A 判滞留");
+
+        // 自愈:主循环对每个滞留 id 发 RefineFinished。
+        let (healed, fx) = machine::handle(&st, &Msg::RefineFinished { note_id: "A".into() });
+        assert!(fx.is_empty(), "自愈命中集合内的 id,应零效果而非 ShadowMismatch 噪音:{fx:?}");
+
+        // 守卫放行——本测试的落点:能重新发起 Aing,而不是只观察到集合变空。
+        let (_, fx) = machine::handle(&healed, &Msg::RefineRequest { note_id: "A".into() });
+        assert!(
+            matches!(fx.as_slice(), [Effect::DoSpawnRefine { .. }]),
+            "自愈后守卫必须放行,否则等于没修:{fx:?}"
+        );
+
+        // 自愈后表随内核收缩,不会每轮重复自愈同一个 id。
+        clock.remove("A");
+        assert!(sync_and_take_stale(&mut clock, &running(&healed), ttl * 9, ttl).is_empty());
+        assert!(clock.is_empty(), "A 已移除、B 已收尾,表应为空");
+    }
 }
