@@ -352,7 +352,29 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // P3 首批消费者:托盘图标由迁移驱动(取代 lib.rs 里 tray::set_recording
             // 的散点直调)。启动前注册完再进循环,符合 HookBus「注册序执行」契约。
             bus.register(Box::new(super::consumers::TrayHook));
+            // Aing 集各条目的起始时刻(相对 actor 启动的毫秒)。用于滞留自愈,
+            // 见 REFINE_STALE_MS。单线程持有,无锁。
+            let boot = std::time::Instant::now();
+            let mut refine_clock: std::collections::BTreeMap<String, u64> = Default::default();
             for env in rx {
+                // 每收一封先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
+                // (线程没结束),该 id 会永久占着 Aing 集把守卫钉死——这里兜住那条路径。
+                {
+                    let now_ms = boot.elapsed().as_millis() as u64;
+                    let running: Vec<String> =
+                        state.refine.running_ids().map(str::to_string).collect();
+                    for id in sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS) {
+                        eprintln!(
+                            "lifecycle: Aing 集条目 {id} 滞留超 {}s,判定 worker 未收尾,自愈移除\
+                             (该 id 的 is_refining 守卫此前会一直拒绝编辑类命令)",
+                            REFINE_STALE_MS / 1000
+                        );
+                        // RefineFinished 命中时只移除、零效果(见 machine.rs),可直接应用。
+                        let (next, _fx) = machine::handle(&state, &Msg::RefineFinished { note_id: id.clone() });
+                        state = next;
+                        refine_clock.remove(&id);
+                    }
+                }
                 let (msg, reply) = match env {
                     // 停录特化(P2):teardown 同步执行(handle.stop 排干期间,管线
                     // 消息全部入队),随后把 stop 的 reply 转移进自投的 Finalize——
@@ -697,4 +719,85 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
         })
         .expect("lifecycle actor 线程创建失败");
     handle
+}
+
+/// Aing 集条目的滞留自愈:内核 Aing 集是「worker 还在跑」的**推断**,而推断的唯一
+/// 撤销点原先是 worker 线程末尾那一条 RefineFinished。worker 一旦永久阻塞(卡在
+/// AING_GATE 或某个 IO 上,线程不结束 ⇒ RAII 的 Drop 也不会执行),该 id 就永远留在
+/// 集合里,`is_refining` 恒 true,delete_note_speaker 这类以它为第一道守卫的命令
+/// **永久失败,只能重启应用**——2026-08-17 真实发生过一次。
+///
+/// 这里给每个在跑条目记一个起始时刻,超过 TTL 即判定 worker 未收尾并移除。
+/// 时刻用「相对 actor 启动的毫秒数」而非 Instant:Instant 无法在测试里构造任意时刻。
+///
+/// 取 1 小时的理由:单场 Aing 的真实上界远低于此(HTTP 分块 CHUNK_TIMEOUT_S=180s
+/// 且失败只重试一次,Agent 路径 REFINE_TIMEOUT_S=900s),并发多篇时 AING_GATE 排队
+/// 也有界。宁可自愈得晚,也不能误杀正在跑的 Aing——误杀会让用户能再发起一次,
+/// 两遍 Aing 互相覆盖 aing.json。
+pub(crate) const REFINE_STALE_MS: u64 = 60 * 60 * 1000;
+
+/// 同步「起始时刻」表并挑出滞留条目(纯函数,便于单测)。
+/// - `running` 中的新 id 记为 `now_ms` 起算;
+/// - 已不在 `running` 的条目清出表(worker 正常收尾);
+/// - 返回已达 `ttl_ms` 的 id(调用方据此发 RefineFinished 自愈)。
+pub(crate) fn sync_and_take_stale(
+    clock: &mut std::collections::BTreeMap<String, u64>,
+    running: &[String],
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Vec<String> {
+    for id in running {
+        clock.entry(id.clone()).or_insert(now_ms);
+    }
+    clock.retain(|id, _| running.iter().any(|r| r == id));
+    clock
+        .iter()
+        .filter(|(_, &t0)| now_ms.saturating_sub(t0) >= ttl_ms)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn 新条目记起始时刻且未到期不判滞留() {
+        let mut c = BTreeMap::new();
+        let stale = sync_and_take_stale(&mut c, &["n1".into()], 1_000, 10_000);
+        assert!(stale.is_empty());
+        assert_eq!(c.get("n1"), Some(&1_000), "起始时刻按首次观察到的那一刻记");
+        // 再同步不刷新起点,否则永远到不了期
+        let stale = sync_and_take_stale(&mut c, &["n1".into()], 5_000, 10_000);
+        assert!(stale.is_empty());
+        assert_eq!(c.get("n1"), Some(&1_000), "起点不得被后续同步刷新");
+    }
+
+    #[test]
+    fn 到期即判滞留() {
+        let mut c = BTreeMap::new();
+        sync_and_take_stale(&mut c, &["n1".into()], 0, 10_000);
+        assert_eq!(sync_and_take_stale(&mut c, &["n1".into()], 9_999, 10_000), Vec::<String>::new());
+        assert_eq!(sync_and_take_stale(&mut c, &["n1".into()], 10_000, 10_000), vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn 正常收尾的条目清出表不再判滞留() {
+        let mut c = BTreeMap::new();
+        sync_and_take_stale(&mut c, &["n1".into()], 0, 10_000);
+        // worker 收尾 → 内核集合已无 n1
+        let stale = sync_and_take_stale(&mut c, &[], 999_999, 10_000);
+        assert!(stale.is_empty(), "已收尾的不该再被判滞留");
+        assert!(c.is_empty(), "表要跟着内核集合收缩,否则无界增长");
+    }
+
+    #[test]
+    fn 并发多篇各自计时互不波及() {
+        let mut c = BTreeMap::new();
+        sync_and_take_stale(&mut c, &["a".into()], 0, 10_000);
+        sync_and_take_stale(&mut c, &["a".into(), "b".into()], 8_000, 10_000);
+        let stale = sync_and_take_stale(&mut c, &["a".into(), "b".into()], 10_000, 10_000);
+        assert_eq!(stale, vec!["a".to_string()], "只有 a 到期;b 起算晚,不受牵连");
+    }
 }

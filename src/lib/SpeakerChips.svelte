@@ -4,6 +4,7 @@
   import { recentLabel } from "$lib/personPick";
   import PersonPickList from "$lib/PersonPickList.svelte";
   import { localeVariants, t } from "$lib/i18n/index.svelte";
+  import { describeActionError } from "$lib/speakerAction";
 
   let {
     speakers,
@@ -51,6 +52,8 @@
   /** 改名撞库中现有人名时的待确认态:面板转为确认条,防悄悄造出重名。
       linkedOther=该说话人已关联别人 → 撞名大概率是库里有重复条目,给详情页合并入口。 */
   let dupPending = $state<{ id: string; name: string; person: PersonSummary; linkedOther: boolean } | null>(null);
+  /** 上一次操作的失败文案(后端已本地化)。任何一次新操作先清空。 */
+  let actionErr = $state<string | null>(null);
 
   const ids = $derived.by(() => {
     const all = Object.keys(speakers).sort(speakerIdCompare);
@@ -70,6 +73,7 @@
     void noteId;
     showFragments = false;
     editingId = null;
+    actionErr = null;
   });
   /** 少于 3 个碎片不值得折叠:展开钮本身比一两枚 chip 更占地。 */
   const collapsible = $derived(fragmentIds.length >= 3);
@@ -106,11 +110,27 @@
     deletePending = false;
   }
 
+  /** 所有落到后端的说话人操作都经这里:失败必须看得见。
+   *
+   *  2026-08-17 事故:删除说话人被后端守卫拒绝(「该笔记正在 Aing 中」),而调用处
+   *  裸 await 无 catch,错误被吞——用户看到的是「面板关了、什么都没发生」,且错误
+   *  只走 IPC 回执不进日志,排查时毫无线索。成功才通知外部刷新(与原行为一致:
+   *  原先失败会抛出,onRenamed 同样不执行)。 */
+  async function run(fn: () => Promise<void>) {
+    actionErr = null;
+    try {
+      await fn();
+    } catch (e) {
+      actionErr = describeActionError(e, t("speakers.actionFailed"));
+      return;
+    }
+    onRenamed?.();
+  }
+
   async function commitDelete(id: string) {
     if (!onDelete) return;
     cancelEdit();
-    await onDelete(id);
-    onRenamed?.();
+    await run(() => onDelete(id));
   }
 
   /** 实际改名落点:外部没接管(onRename)就走笔记内 renameSpeaker。 */
@@ -135,8 +155,7 @@
       }
     }
     editingId = null;
-    await doRename(id, name);
-    onRenamed?.();
+    await run(() => doRename(id, name));
   }
 
   /** 重名确认:就是库里那位 → 关联(等价于选人)。 */
@@ -144,8 +163,9 @@
     const d = dupPending;
     if (!d) return;
     cancelEdit();
-    await onPick?.(d.id, d.person.id);
-    onRenamed?.();
+    await run(async () => {
+      await onPick?.(d.id, d.person.id);
+    });
   }
 
   /** 重名确认:确实是另一个人 → 照常改名,允许重名(列表以「最近 MM-DD」区分)。 */
@@ -153,14 +173,14 @@
     const d = dupPending;
     if (!d) return;
     cancelEdit();
-    await doRename(d.id, d.name);
-    onRenamed?.();
+    await run(() => doRename(d.id, d.name));
   }
 
   async function commitPick(id: string, personId: string) {
     cancelEdit();
-    await onPick?.(id, personId);
-    onRenamed?.();
+    await run(async () => {
+      await onPick?.(id, personId);
+    });
   }
 
   async function markAsMe(id: string) {
@@ -175,8 +195,7 @@
       return;
     }
     cancelEdit();
-    await doRename(id, me);
-    onRenamed?.();
+    await run(() => doRename(id, me));
   }
 </script>
 
@@ -321,7 +340,19 @@
   </div>
 {/if}
 
+<!-- 操作失败提示。刻意放在 chips 的 {#if} 之外:删掉最后一个说话人失败时 ids 可能
+     已空,提示不能跟着一起消失。role=alert 让读屏当场播报——这条信息此前完全不存在
+     (错误被吞),用户与排查者都看不到后端给的原因。 -->
+{#if actionErr}
+  <div class="action-err" role="alert">{actionErr}</div>
+{/if}
+
 <style>
+  .action-err {
+    color: var(--danger);
+    font-size: 0.9rem;
+    margin: -0.25rem 0 0.75rem;
+  }
   .chips {
     display: flex;
     flex-wrap: wrap;

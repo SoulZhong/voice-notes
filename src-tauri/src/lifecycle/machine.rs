@@ -39,6 +39,12 @@ impl RefineState {
         self.running.contains(note_id)
     }
 
+    /// 在跑的笔记 id(只读迭代)。供 actor 维护「各条目起始时刻」表以做滞留自愈——
+    /// 集合本身仍只由迁移表增删,这里不开写口。
+    pub fn running_ids(&self) -> impl Iterator<Item = &str> {
+        self.running.iter().map(String::as_str)
+    }
+
     /// 纯函数式插入(handle 不改入参,返回新集合;重复插入幂等,同旧 set.insert)。
     fn with_inserted(&self, note_id: &str) -> Self {
         let mut next = self.clone();
