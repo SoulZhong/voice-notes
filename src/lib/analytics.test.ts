@@ -14,8 +14,10 @@ describe("analyticsConfig(危险默认值必须被显式覆盖)", () => {
     expect(cfg.mask_all_text).toBe(true);
   });
 
-  it("会话回放默认不上线——遮蔽硬门(判据 4)未通过验证前不得开启", () => {
-    expect(cfg.disable_session_recording).toBe(true);
+  it("回放已上线,但四道遮蔽必须同时就位——遮蔽是回放唯一的防线", () => {
+    // 产品决策 2026-08-18 开启回放。判据 4(遮蔽实测)仍未通过,
+    // 因此这条测试的重点从"不许开"转为"开了就必须带齐遮蔽"。
+    expect(cfg.disable_session_recording).toBe(false);
     // 遮蔽配置须已就位,开启只需翻上面那一个开关
     expect(cfg.session_recording.maskAllInputs).toBe(true);
     expect(cfg.session_recording.maskTextSelector).toBe("*");

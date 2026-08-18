@@ -37,10 +37,16 @@ export function analyticsConfig() {
     //    点这些元素时会随 $elements 一起送出去(codex review 发现)。
     mask_all_element_attributes: true,
 
-    // ② 会话回放:**默认不上线**。spike 的判据 4(遮蔽实测硬门)未通过验证,
-    //    设计文档写死「遮蔽未经实测通过,回放不得上线」。遮蔽配置已备好,
-    //    验证通过后把这一行改 false 即可,不必再动其它配置。
-    disable_session_recording: true,
+    // ② 会话回放:**已上线**(产品决策 2026-08-18)。
+    //
+    //    风险明示:spike 的判据 4(遮蔽实测硬门)从未通过验证——没有人实测过
+    //    maskTextSelector:"*" 在 WKWebView/WebView2 里是否真的把文本遮住。本应用
+    //    满屏都是会议内容,遮蔽若失效,上传的就是真实逐字稿。四道遮蔽都已配齐并被
+    //    analytics.test.ts 锁死,但配置正确 ≠ 运行时生效,这两件事只能靠实测分开。
+    //
+    //    上线后第一件该做的事:打开第一条回放,确认笔记标题、说话人名、正文
+    //    全部呈现为遮蔽块。看得到任何一个字就立刻关掉这一行并删除录制。
+    disable_session_recording: false,
     session_recording: {
       maskAllInputs: true,
       maskTextSelector: "*",
