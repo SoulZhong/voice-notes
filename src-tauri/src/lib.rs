@@ -594,6 +594,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         &cfg,
                         model,
                         log_ctx.as_ref(),
+                        // 逐块心跳:重发 llm/running。滞留自愈据此判断 worker 还活着
+                        // (见 lifecycle/actor.rs 的 REFINE_STALE_MS)。事件本身幂等——
+                        // 内核只在 stage=="all"&&state=="running" 时动集合,这里不动状态,
+                        // 只把「还在跑」这件事透出来。
+                        &|| report("llm", "running"),
                     );
                     if let Err(error) = handoff_http_refine_write(write_result, || {
                         let root = data_root(&app)?;
