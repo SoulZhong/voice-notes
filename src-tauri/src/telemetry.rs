@@ -319,7 +319,9 @@ fn redact_event(mut ev: posthog_rs::Event) -> Option<posthog_rs::Event> {
         let cleaned = redact_exception_list(list);
         let _ = ev.insert_prop("$exception_list", cleaned);
     }
-    for key in ["$exception_message", "$exception_type", "$exception_source"] {
+    // panic 事件还带 $exception_panic_file 这类独立的路径属性,
+    // 以及栈帧里的 filename——只脱 type/value 会把它们漏出去(codex review 第二轮)。
+    for key in ["$exception_panic_file", "$exception_message", "$exception_type", "$exception_source"] {
         let Some(v) = ev.properties().get(key).cloned() else { continue };
         if let Some(text) = v.as_str() {
             let _ = ev.insert_prop(key, crate::redact::redact(text));
@@ -341,6 +343,20 @@ fn redact_exception_list(list: Value) -> Value {
                         if let Some(Value::String(text)) = map.get(key) {
                             let safe = crate::redact::redact(text);
                             map.insert(key.to_string(), Value::String(safe));
+                        }
+                    }
+                    // 栈帧的 filename 是文件系统路径,同样在禁止上传之列。
+                    if let Some(Value::Object(st)) = map.get_mut("stacktrace") {
+                        if let Some(Value::Array(frames)) = st.get_mut("frames") {
+                            for f in frames.iter_mut() {
+                                let Value::Object(fm) = f else { continue };
+                                for key in ["filename", "abs_path", "module"] {
+                                    if let Some(Value::String(text)) = fm.get(key) {
+                                        let safe = crate::redact::redact(text);
+                                        fm.insert(key.to_string(), Value::String(safe));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -469,6 +485,27 @@ mod tests {
         let dumped = serde_json::to_string(out.properties()).unwrap();
         assert!(!dumped.contains("张伟"), "姓名必须脱掉: {dumped}");
         assert!(!dumped.contains("季度复盘会"), "会议标题必须脱掉: {dumped}");
+    }
+
+    /// panic 事件的路径不只在 value 里:栈帧的 filename 与 $exception_panic_file
+    /// 都是独立的路径属性(codex review 第二轮发现)。
+    #[test]
+    fn before_send连栈帧路径一起脱掉() {
+        let mut ev = posthog_rs::Event::new_anon("$exception");
+        ev.insert_prop(
+            "$exception_list",
+            json!([{
+                "type": "panic",
+                "value": "boom",
+                "stacktrace": { "frames": [{ "filename": "/Users/张伟/voice-notes/src/x.rs" }] }
+            }]),
+        )
+        .unwrap();
+        ev.insert_prop("$exception_panic_file", "/Users/张伟/voice-notes/src/y.rs").unwrap();
+
+        let out = redact_event(ev).expect("不得丢事件");
+        let dumped = serde_json::to_string(out.properties()).unwrap();
+        assert!(!dumped.contains("张伟"), "栈帧与 panic_file 里的路径都必须脱掉: {dumped}");
     }
 
     #[test]

@@ -78,10 +78,19 @@ fn path_end(tail: &str) -> usize {
             break;
         }
         if c == ' ' {
-            // 空格后若不再是路径样的一段(不含 / 且不以大写字母开头),就收尾
+            // 空格后这个词还属于路径吗?会议标题里常有空格(如 "Q3 roadmap.json"),
+            // 只看"是否大写开头"会在 `Q3 roadmap.json` 处停下、把 roadmap.json 漏出去
+            // (codex review 第二轮发现)。判据改为:含 / 、含扩展名点、或大写开头
+            // ——三者任一都说明还在路径里面。
             let next: String = bytes[i + 1..].iter().map(|(_, c)| *c).collect();
             let word = next.split_whitespace().next().unwrap_or("");
-            let looks_path = word.contains('/') || word.chars().next().is_some_and(|c| c.is_uppercase());
+            let looks_path = word.contains('/')
+                || word.contains('\\')
+                || word.rsplit('.').next().is_some_and(|ext| {
+                    !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                        && word.contains('.')
+                })
+                || word.chars().next().is_some_and(|c| c.is_uppercase());
             if !looks_path {
                 end = idx;
                 break;
@@ -158,6 +167,16 @@ mod tests {
         assert!(!out.contains("季度复盘会"), "会议标题必须脱掉: {out}");
         assert!(out.contains("note-140751"), "note-id 不是内容,应保留以便定位: {out}");
         assert!(out.contains("refine"), "模块名应保留: {out}");
+    }
+
+    /// 会议标题里常有空格。codex review 第二轮发现:原判据会在 "Q3 roadmap.json"
+    /// 的空格处停下,把 roadmap.json 漏出去。
+    #[test]
+    fn 含空格的笔记文件名整条脱掉() {
+        let out = redact("write /Users/Alice/Library/voice-notes/notes/Q3 roadmap.json failed");
+        assert!(!out.contains("roadmap"), "带空格的会议标题必须整条脱掉: {out}");
+        assert!(!out.contains("Alice"), "用户名必须脱掉: {out}");
+        assert!(out.contains("failed"), "尾部英文措辞应保留: {out}");
     }
 
     #[test]
