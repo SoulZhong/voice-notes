@@ -172,7 +172,13 @@ fn dispatch(app: &tauri::AppHandle, req: &Req) -> Resp {
     if let Some(op) = crate::telemetry::McpOp::parse(&req.op) {
         crate::telemetry::track(app, crate::telemetry::Event::McpToolUsed { op });
     }
-    dispatch_with(&AppBackend(app), req)
+    let resp = dispatch_with(&AppBackend(app), req);
+    // 分发失败也上报:MCP 是控制面,它出错时用户往往只看到「AI 助手说做不了」,
+    // 本机日志之外没有任何痕迹。错误文案过脱敏(可能带路径/笔记标题)。
+    if let Some(err) = resp.error.as_deref() {
+        crate::telemetry::report_error(crate::telemetry::ErrorKind::McpDispatch, err);
+    }
+    resp
 }
 
 /// 生产实现:各能力逐块搬自原 dispatch 分支(仅错误从 `return err(..)` 改 `Err(..)`,

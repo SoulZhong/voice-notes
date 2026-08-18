@@ -93,6 +93,7 @@ export const zh = {
   "shell.welcome.changeLater": "以后可随时在设置中更改。",
   "shell.welcome.startUsing": "开 始 使 用",
   "shell.welcome.permissionsHint": "首次录制时，系统会请求麦克风权限；录制系统声音需在系统设置中允许录屏。",
+  "shell.welcome.telemetryHint": "会收集匿名使用统计与错误报告(功能使用次数、版本、出错位置),不含会议内容。",
   "shell.welcome.cloudSetupTitle": "配置云端识别",
   "shell.welcome.cloudSetupHint": "录音音频将实时上传至所选厂商；凭证只保存在本机。",
   "shell.welcome.providerVolcano": "火山引擎",
@@ -272,6 +273,8 @@ export const en = {
   "shell.welcome.startUsing": "Get Started",
   "shell.welcome.permissionsHint":
     "Your first recording will ask for microphone access; capturing system audio requires screen-recording permission in System Settings.",
+  "shell.welcome.telemetryHint":
+    "Anonymous usage stats and error reports are collected (feature counts, version, failure locations). Never meeting content.",
   "shell.welcome.cloudSetupTitle": "Set up cloud transcription",
   "shell.welcome.cloudSetupHint": "Audio streams to the chosen vendor in real time; credentials stay on this device.",
   "shell.welcome.providerVolcano": "Volcano Engine",

@@ -23,7 +23,8 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "d3-force": "^3.0.0",
-    "pinyin-pro": "^3.28.2"
+    "pinyin-pro": "^3.28.2",
+    "posthog-js": "^1.418.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

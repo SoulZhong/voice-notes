@@ -1,15 +1,28 @@
-//! 匿名使用统计(遥测)薄封装——全应用唯一上报入口。
+//! 产品分析(后端侧)——Rust 这半的唯一上报入口。
 //!
-//! 隐私红线:事件属性只允许固定枚举与数值桶。禁止上报会议内容、笔记标题、
-//! 说话人名、文件路径、API key、模型接入点 ID、任何自由文本。事件与属性
-//! 用枚举建模,从类型上杜绝自由字符串进属性;新增事件必须扩 Event 枚举。
-//! 上报失败静默(插件内部批量缓冲+重试),绝不影响主流程。
-//! 设计:docs/superpowers/specs/2026-07-12-voice-notes-telemetry-design.md
+//! 分工:后端埋「事情真的发生了」(开录成功、转写完成、AI 整理完成),经 MCP/UDS
+//! 触发的同样计入;前端埋「用户看到了、点了什么」,见 src/lib/analytics.ts。
+//!
+//! 隐私红线:后端事件属性只允许固定枚举与数值桶。禁止上报会议内容、笔记标题、
+//! 说话人名、文件路径、API key、模型接入点 ID、任何自由文本。事件与属性用枚举
+//! 建模,从类型上杜绝自由字符串进属性;新增事件必须扩 Event 枚举,
+//! payload_shape_locked 会逼改测试、强制走一次红线审视。
+//! 上报失败静默(SDK 内部批量+重试),绝不影响主流程。
+//!
+//! 设计:docs/superpowers/specs/2026-08-17-posthog-analytics-and-error-tracking-design.md
+//! 可行性实测:docs/superpowers/research/2026-08-17-posthog-tauri-spike.md
 
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-/// 供应商已下线(2026-08-18)。事件与属性建模、隐私红线、防回归测试全部保留——
+/// PostHog Project API Key。写进客户端的公开写入端点,不是机密(与前端同一个值,
+/// 见 src/lib/analytics.ts)。空串 = 整体停用,便于本地开发与测试。
+pub const PROJECT_KEY: &str = "phc_qgqdrtaowrPfMPzmD9b7e9JSUPRc3RY3oGAeeKtAAV7E";
+
+/// 区域 host。必须与项目注册区域一致,选错连不上。
+pub const HOST: &str = "https://us.i.posthog.com";
+
+/// 旧供应商已下线(2026-08-18)。事件与属性建模、隐私红线、防回归测试全部保留——
 /// 它们与具体供应商无关,是下一个上报后端接入时直接复用的资产。
 /// 录制源类别。由设置推断而非实际启动结果:遥测只要低基数类别,不追精确。
 ///
@@ -195,13 +208,132 @@ impl Event {
     }
 }
 
-/// 唯一上报入口。**当前无上报后端**:供应商已下线,新后端未接入,故为空实现。
+/// 唯一上报入口。失败静默——上报绝不影响主流程。
 ///
-/// 刻意保留函数与全部调用点(6 处:启动/开录/停录/精修/导出/MCP),而不是把调用点
-/// 一并删掉——删了之后接新后端还得原样找回这 6 个位置,而"该在哪里埋点"正是当初
-/// 花心思定的东西。参数 `_event` 已构造但不消费,构造过程本身仍受类型约束保护,
-/// 属性红线的防回归测试因此继续有效。
-pub fn track(_app: &AppHandle, _event: Event) {}
+/// distinct_id 由前端生成并持久化,经 set_distinct_id 传入(见该函数说明)。
+/// 拿到之前发生的事件(如启动早期)以 personless 形态上报,**绝不在此自造 id**:
+/// 两边各生成一个会把同一个人算成两个人,漏斗与留存全部失真。
+pub fn track(_app: &AppHandle, event: Event) {
+    if PROJECT_KEY.is_empty() {
+        return;
+    }
+    let (name, props) = event.payload();
+    let mut ev = posthog_rs::Event::new(name, &distinct_id());
+    if let Some(Value::Object(map)) = props {
+        for (k, v) in map {
+            // 属性值只可能来自各枚举 as_str 与 duration_bucket(见 payload),
+            // 这里不做二次校验,由 payload_shape_locked 在编译期之外守住形状。
+            let _ = ev.insert_prop(k, v);
+        }
+    }
+    posthog_rs::capture(ev);
+}
+
+/// 前端持久化的匿名 id。未设时用 personless 占位——见 track 的说明。
+static DISTINCT_ID: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
+
+fn slot() -> &'static std::sync::RwLock<String> {
+    DISTINCT_ID.get_or_init(|| std::sync::RwLock::new(String::new()))
+}
+
+fn distinct_id() -> String {
+    let v = slot().read().map(|g| g.clone()).unwrap_or_default();
+    if v.is_empty() {
+        // personless:PostHog 允许无人格事件,漏斗算不到但计数仍在,
+        // 好过自造一个与前端对不上的 id。
+        "anonymous".to_string()
+    } else {
+        v
+    }
+}
+
+/// 由前端在初始化后调用一次(命令壳 set_analytics_id)。幂等,后到的覆盖先到的。
+pub fn set_distinct_id(id: &str) {
+    if let Ok(mut g) = slot().write() {
+        *g = id.to_string();
+    }
+}
+
+/// 进程启动时初始化 SDK 并装 panic hook。失败只记日志,绝不影响启动。
+pub fn init() {
+    if PROJECT_KEY.is_empty() {
+        return;
+    }
+    // capture_panics 默认 false(crate 源码 error_tracking.rs 的 Default impl),
+    // is_server 默认 true——桌面客户端两个都必须显式设。spike 记录的第五个
+    // 「默认值倒在不上报那一侧」的例子。
+    let et = match posthog_rs::ErrorTrackingOptionsBuilder::default()
+        .capture_panics(true)
+        .capture_stacktrace(true)
+        .build()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("telemetry: 错误追踪选项构建失败(已跳过): {e}");
+            return;
+        }
+    };
+    let opts = match posthog_rs::ClientOptionsBuilder::default()
+        .api_key(PROJECT_KEY.to_string())
+        .host(HOST.to_string())
+        .is_server(false)
+        .error_tracking(et)
+        .build()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("telemetry: 客户端选项构建失败(已跳过): {e}");
+            return;
+        }
+    };
+    if let Err(e) = posthog_rs::init_global(opts) {
+        eprintln!("telemetry: 初始化失败(已跳过,不影响主流程): {e}");
+    }
+}
+
+/// 显式上报一次失败(崩溃由 panic hook 全覆盖,这里管「出错了但没崩」的关键链路)。
+///
+/// 消息一律过 [`crate::redact`]:spike 实测异常载荷会原样带出家目录里的姓名与
+/// notes 路径里的会议标题。kind 是固定枚举,便于在 PostHog 侧按链路分组。
+pub fn report_error(kind: ErrorKind, detail: &str) {
+    if PROJECT_KEY.is_empty() {
+        return;
+    }
+    let safe = crate::redact::redact(detail);
+    let mut ev = posthog_rs::Event::new("$exception", &distinct_id());
+    let _ = ev.insert_prop("$exception_type", kind.as_str());
+    let _ = ev.insert_prop("$exception_message", safe);
+    // fingerprint 按 kind 分组:spike 发现 PostHog 会把语义无关的裸 Error 并进
+    // 同一个 issue,不给 fingerprint 就无法按链路看、也无法按 fingerprint 限流。
+    let _ = ev.insert_prop("$exception_fingerprint", kind.as_str());
+    posthog_rs::capture(ev);
+}
+
+/// 关键失败链路。只列「出了错但应用还活着」的那些——崩溃走 panic hook。
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ErrorKind {
+    RecordingStart,
+    RecordingStop,
+    AsrEngine,
+    AiPipeline,
+    NoteWrite,
+    McpDispatch,
+    RefineStaleHeal,
+}
+
+impl ErrorKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ErrorKind::RecordingStart => "recording_start",
+            ErrorKind::RecordingStop => "recording_stop",
+            ErrorKind::AsrEngine => "asr_engine",
+            ErrorKind::AiPipeline => "ai_pipeline",
+            ErrorKind::NoteWrite => "note_write",
+            ErrorKind::McpDispatch => "mcp_dispatch",
+            ErrorKind::RefineStaleHeal => "refine_stale_heal",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

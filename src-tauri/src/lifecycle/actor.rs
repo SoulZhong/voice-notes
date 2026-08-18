@@ -376,6 +376,13 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                              (该 id 的 is_refining 守卫此前会一直拒绝编辑类命令)",
                             REFINE_STALE_MS / 1000
                         );
+                        // 自愈触发本身就是异常信号:兜住了不等于没发生。
+                        // 它一响就说明有个 worker 卡死了,而这正是在别人机器上
+                        // 永远看不到的那类事。
+                        crate::telemetry::report_error(
+                            crate::telemetry::ErrorKind::RefineStaleHeal,
+                            "Aing 条目无进度超时,已自愈移除",
+                        );
                         // RefineFinished 命中时只移除、零效果(见 machine.rs),可直接应用。
                         let (next, _fx) = machine::handle(&state, &Msg::RefineFinished { note_id: id.clone() });
                         state = next;
