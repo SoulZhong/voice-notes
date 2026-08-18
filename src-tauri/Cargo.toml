@@ -29,6 +29,9 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
+# 产品分析与异常上报。默认特性含 async-client(需 tokio runtime),
+# 桌面端在 run() 里同步初始化,故只取 error-tracking。
+posthog-rs = { version = "0.19", default-features = false, features = ["error-tracking"] }
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }

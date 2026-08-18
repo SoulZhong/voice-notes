@@ -27,6 +27,7 @@ mod refine;
 pub mod retranscribe;
 mod graph;
 pub mod mcp;
+mod redact;
 mod telemetry;
 mod lifecycle;
 mod hooks_external;
@@ -557,6 +558,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 log_ctx.as_ref(),
                             ) {
                                 eprintln!("refine: agent Aing 失败: {e}");
+                                telemetry::report_error(
+                                    telemetry::ErrorKind::AiPipeline,
+                                    &format!("agent Aing 失败: {e}"),
+                                );
                             }
                             // Agent 经 MCP 写的是盘上文件:重载同步内存 doc(成功时
                             // llm=done + 修订文本;失败时盘上仍是 off,下面统一降级)。
@@ -759,6 +764,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             }
             Err(_) => {
                 eprintln!("refine({note_id}): 管线 panic");
+                // panic 已被 catch_unwind 吞掉,进程级 hook 仍会捕获它;
+                // 这里补一条带链路 kind 的显式上报,便于按 fingerprint 分组与限流。
+                telemetry::report_error(telemetry::ErrorKind::AiPipeline, "Aing 管线 panic");
                 report("all", "failed");
             }
         }
@@ -7347,7 +7355,20 @@ extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
+/// 前端把它持久化的匿名 id 交给后端,使两端事件归到同一个人。
+///
+/// 方向是单向的:**只由前端生成,后端一律接收、绝不自造**。两边各生成一个会把
+/// 同一个人算成两个人,漏斗与留存全部失真。
+#[tauri::command]
+fn set_analytics_id(id: String) {
+    telemetry::set_distinct_id(&id);
+}
+
 pub fn run() {
+    // 尽早初始化:panic hook 越早装覆盖面越大(它由 posthog-rs 的 capture_panics
+    // 安装,能捕获被 catch_unwind 吞掉的 panic——那些「出事了但应用硬撑着不崩」
+    // 的场景恰恰最该被看见)。失败只记日志,绝不影响启动。
+    telemetry::init();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -7676,7 +7697,8 @@ pub fn run() {
             player::player_stop,
             set_playback_active,
             mic_mode,
-            precheck_recording
+            precheck_recording,
+            set_analytics_id
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -7685,6 +7707,12 @@ pub fn run() {
         // 程序卡死)。召回语义与托盘 show 菜单项一致:show + set_focus。
         // Reopen 是 macOS 独有变体(其余平台该枚举没有此成员,匹配都编不过),整块 cfg。
         .run(|app, event| {
+            // 退出前排空上报队列。SDK 起的是带缓冲的后台 worker,全局单例的析构
+            // 在进程退出时不会执行,不主动 flush 的话临退出那几秒的事件(停录、
+            // 导出、刚发生的错误)会静默丢失(codex review 发现)。
+            if let tauri::RunEvent::Exit = event {
+                telemetry::flush_on_exit();
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 if let Some(w) = app.get_webview_window("main") {

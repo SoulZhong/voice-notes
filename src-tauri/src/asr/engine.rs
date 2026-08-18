@@ -231,6 +231,10 @@ pub(crate) fn parse_result_json(json: &str) -> Transcript {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ASR 结果 JSON 解析失败({e}),按空结果处理");
+            crate::telemetry::report_error(
+                crate::telemetry::ErrorKind::AsrEngine,
+                &format!("ASR 结果 JSON 解析失败: {e}"),
+            );
             ResultJson::default()
         }
     };

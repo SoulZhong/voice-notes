@@ -172,7 +172,29 @@ fn dispatch(app: &tauri::AppHandle, req: &Req) -> Resp {
     if let Some(op) = crate::telemetry::McpOp::parse(&req.op) {
         crate::telemetry::track(app, crate::telemetry::Event::McpToolUsed { op });
     }
-    dispatch_with(&AppBackend(app), req)
+    let resp = dispatch_with(&AppBackend(app), req);
+    // 只上报**意外**的分发失败。控制面被禁(默认态)、空闲时调 stop、不支持的 op
+    // 这些都是正常客户端行为,把它们记成异常会凭空造出 issue、把失败率看板搅浑
+    // (codex review 第二轮发现)。校验/授权/状态类拒绝保持普通回执即可。
+    if let Some(err) = resp.error.as_deref() {
+        if is_unexpected_failure(err) {
+            crate::telemetry::report_error(crate::telemetry::ErrorKind::McpDispatch, err);
+        }
+    }
+    resp
+}
+
+/// 区分「意外失败」与「正常拒绝」。正常拒绝是协议的一部分,不是错误。
+fn is_unexpected_failure(err: &str) -> bool {
+    const EXPECTED: [&str; 6] = [
+        "控制面未启用",
+        "未在录制",
+        "正在录制",
+        "不支持的操作",
+        "参数",
+        "未找到",
+    ];
+    !EXPECTED.iter().any(|k| err.contains(k))
 }
 
 /// 生产实现:各能力逐块搬自原 dispatch 分支(仅错误从 `return err(..)` 改 `Err(..)`,
