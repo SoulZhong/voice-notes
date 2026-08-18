@@ -13,7 +13,7 @@
 //!   能力/授权探针:   cargo run --example catap_spike -- probe
 //!   双轨采集:        cargo run --example catap_spike -- capture --secs 120 --out /tmp/catap
 //!   残余漂移(E1 口径,注意 system 在前):
-//!                    cargo run --bin xcorr_align -- /tmp/catap/system.wav /tmp/catap/mic.wav
+//!                    cargo run --features devtools --bin xcorr_align -- /tmp/catap/system.wav /tmp/catap/mic.wav
 //!
 //! probe 只建/拆设备不落音频,是最便宜的一步:CATap 走 TCC「音频录制」授权,
 //! 从终端跑时继承的是终端的授权身份,失败码本身就是判据 4(授权面)的数据。
@@ -964,7 +964,7 @@ mod mac {
         println!("轨道电平: mic rms={:.5} peak={:.3} / system rms={:.5} peak={:.3}",
             rms(&shared.mic), peak(&shared.mic), rms(&shared.sys), peak(&shared.sys));
         println!("\n落盘: {mic_path}\n      {sys_path}");
-        println!("残余漂移(E1 口径,system 在前):\n  cargo run --bin xcorr_align -- {sys_path} {mic_path}");
+        println!("残余漂移(E1 口径,system 在前):\n  cargo run --features devtools --bin xcorr_align -- {sys_path} {mic_path}");
         Ok(())
     }
 

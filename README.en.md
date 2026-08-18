@@ -286,7 +286,7 @@ Built with [Tauri 2](https://tauri.app) (Rust backend + system integration), [Sv
 
 ```bash
 npm run check                 # frontend type checking
-cd src-tauri && cargo test    # backend tests
+cd src-tauri && cargo test --features devtools   # backend tests (devtools covers 14 cases in src/bin)
 ```
 
 ## License

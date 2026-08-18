@@ -283,7 +283,7 @@ macOS 采集系统声音（别的 App 放出来的声音）只能走 ScreenCaptu
 
 ```bash
 npm run check                 # 前端类型检查
-cd src-tauri && cargo test    # 后端测试
+cd src-tauri && cargo test --features devtools   # 后端测试(devtools 覆盖 src/bin 里的 14 个用例)
 ```
 
 ## License

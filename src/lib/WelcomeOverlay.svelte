@@ -239,7 +239,6 @@
     {:else if phase === "download"}
       <ModelDownloadCard status={current} onComplete={refresh} primaryLabel={t("shell.welcome.startUsing")} />
       <p class="hints">{t("shell.welcome.permissionsHint")}</p>
-      <p class="hints">{t("shell.welcome.telemetryHint")}</p>
     {:else if phase === "cloud-setup"}
       <div class="cloud-setup">
         <h2>{t("shell.welcome.cloudSetupTitle")}</h2>
