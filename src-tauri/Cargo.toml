@@ -117,5 +117,49 @@ objc2-event-kit = { version = "0.3", features = [
 
 # dev 构建给本 crate 开基础优化:声纹全库比对(O(n²) 余弦)未优化时百人级库要数秒,
 # 走查/dev 体验失真;opt-level 1 约 10 倍提速,增量编译代价可接受。release 不受影响。
+
+# 开发/评测用二进制:一律挂 devtools 特性,默认(含 release 打包)不构建。
+# 起因:release 构建会产出它们,而 Tauri 打包把 asr_chunk_probe(25MB)也捡进了
+# .app——产品包里带着一个运行时根本不用的探针。与其猜 bundler 捡哪个,不如让
+# 它们在 release 里根本不存在。本机跑:cargo run --features devtools --bin xxx
+[features]
+# 开发/评测二进制的开关,产品构建绝不启用。
+devtools = []
+
+[[bin]]
+name = "asr_bench"
+path = "src/bin/asr_bench.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "asr_chunk_probe"
+path = "src/bin/asr_chunk_probe.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "drift_stats"
+path = "src/bin/drift_stats.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "speaker_ab_eval"
+path = "src/bin/speaker_ab_eval.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "speaker_eval"
+path = "src/bin/speaker_eval.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "xcorr_align"
+path = "src/bin/xcorr_align.rs"
+required-features = ["devtools"]
+
 [profile.dev]
 opt-level = 1
+
+[profile.release]
+# 实测 strip -x 可去掉 14.6MB 本地符号表(68.3 → 53.7MB);二进制里没有 DWARF
+# 调试信息(strip -S 无变化),所以这一步不损失可调试性。
+strip = "symbols"
