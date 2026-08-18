@@ -478,6 +478,8 @@ pub fn run_llm(
     cfg: &llm::LlmConfig,
     llm_model: &str,
     log: Option<&crate::ailog::Ctx>,
+    // 逐块心跳,透传给 llm::polish,见那里的说明。
+    heartbeat: &dyn Fn(),
 ) -> anyhow::Result<()> {
     let fail_in_memory = |doc: &mut RefinedDoc| {
         doc.stages.llm = "failed".into();
@@ -523,7 +525,7 @@ pub fn run_llm(
     *doc = latest;
     let fallback_graph = GraphFallbackSnapshot::capture(doc);
 
-    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log);
+    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log, heartbeat);
     let relations_complete = text_outcome.relations_complete();
     let state = match &text_outcome {
         llm::LlmOutcome::Done | llm::LlmOutcome::DoneWithRelationErrors => "done",
@@ -1576,7 +1578,7 @@ mod tests {
             api_key: "k".into(),
         };
         store::write_refined_atomic(dir.path(), &doc).unwrap();
-        run_llm(dir.path(), &mut doc, &cfg, "m", None).expect("空段落路径不应触网,写盘应成功");
+        run_llm(dir.path(), &mut doc, &cfg, "m", None, &|| {}).expect("空段落路径不应触网,写盘应成功");
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(doc.llm_model.as_deref(), Some("m"));
         assert!(crate::store::load_refined(dir.path()).is_some(), "已落盘");
@@ -1615,7 +1617,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
         };
-        let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None);
+        let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None, &|| {});
         assert!(err.is_err(), "目录不存在,写盘必须失败");
         assert_eq!(
             doc.stages.llm, "failed",
@@ -1675,7 +1677,7 @@ mod tests {
             api_key: "k".into(),
         };
         store::write_refined_atomic(dir.path(), &doc).unwrap();
-        run_llm(dir.path(), &mut doc, &cfg, "m", None).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "m", None, &|| {}).unwrap();
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(
             doc.stages.entities, "done",
@@ -1698,7 +1700,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-v1", None).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-v1", None, &|| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "🙂张三负责灯塔计划");
         assert_eq!(doc.stages.llm, "done");
@@ -1763,7 +1765,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut stale_caller, &cfg, "model-latest", None).unwrap();
+        run_llm(dir.path(), &mut stale_caller, &cfg, "model-latest", None, &|| {}).unwrap();
 
         assert_eq!(stale_caller.paragraphs[0].text, "盘上润色稿");
         assert_eq!(stale_caller.paragraphs[0].speaker, "disk-speaker");
@@ -1789,7 +1791,7 @@ mod tests {
         let note_dir = dir.path().to_path_buf();
         let mut caller = doc_with(&["调用方旧稿"]);
         let worker = std::thread::spawn(move || {
-            let result = run_llm(&note_dir, &mut caller, &cfg, "model-cas", None);
+            let result = run_llm(&note_dir, &mut caller, &cfg, "model-cas", None, &|| {});
             (result, caller)
         });
 
@@ -1848,7 +1850,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|| {}).unwrap();
 
             assert_eq!(doc.paragraphs[0].text, "张三负责火星计划");
             assert_eq!(doc.stages.llm, "done");
@@ -1889,7 +1891,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|| {}).unwrap();
 
             assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
             assert_eq!(doc.stages.llm, "done");
@@ -1936,7 +1938,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|| {}).unwrap();
 
         assert_fallback_dependencies(&doc);
         assert!(doc.graph_support_mentions.is_empty());
@@ -1993,7 +1995,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(&dir, &mut doc, &cfg, "model-changed", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-changed", None, &|| {}).unwrap();
         assert_eq!(
             doc.graph_support_mentions
                 .iter()
@@ -2003,7 +2005,7 @@ mod tests {
             "正文不再包含旧 occurrences 时，关系端点必须降级为 support"
         );
 
-        run_llm(&dir, &mut doc, &cfg, "model-restored", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-restored", None, &|| {}).unwrap();
 
         assert_fallback_dependencies(&doc);
         assert!(
@@ -2084,12 +2086,12 @@ mod tests {
             model: "model-v2".into(),
             api_key: "k".into(),
         };
-        run_llm(&dir, &mut doc, &cfg, "model-v2", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|| {}).unwrap();
         assert_fallback_dependencies(&doc);
         let support_once = doc.graph_support_mentions.clone();
         assert!(!support_once.is_empty());
 
-        run_llm(&dir, &mut doc, &cfg, "model-v2-retry", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2-retry", None, &|| {}).unwrap();
         assert_fallback_dependencies(&doc);
         assert_eq!(doc.graph_support_mentions, support_once);
         assert!(doc
@@ -2097,7 +2099,7 @@ mod tests {
             .windows(2)
             .all(|ids| ids[0] < ids[1]));
 
-        run_llm(&dir, &mut doc, &cfg, "model-v3", None).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v3", None, &|| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "王五启动金星计划");
         assert_eq!(doc.stages.relations, "done");
@@ -2142,7 +2144,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-strict", None).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-strict", None, &|| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "张三负责灯塔计划");
         assert_eq!(doc.stages.llm, "partial");
@@ -2195,7 +2197,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-multi", None).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-multi", None, &|| {}).unwrap();
 
         assert_eq!(doc.stages.relations, "done");
         assert_eq!(doc.relations.len(), 1);
@@ -2264,7 +2266,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-multi-failure", None).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-multi-failure", None, &|| {}).unwrap();
 
             assert_eq!(doc.stages.relations, "failed", "failure={failure}");
             assert_eq!(doc.paragraphs[0].text, first_revised, "failure={failure}");
@@ -2385,7 +2387,7 @@ mod tests {
             model: "model-v3".into(),
             api_key: "k".into(),
         };
-        let result = run_llm(dir.path(), &mut doc, &cfg, "model-v3", None);
+        let result = run_llm(dir.path(), &mut doc, &cfg, "model-v3", None, &|| {});
         assert!(result.is_err(), "拿不到 note lock 必须显式报告未提交");
         assert_eq!(
             std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),

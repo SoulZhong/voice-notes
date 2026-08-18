@@ -352,20 +352,27 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // P3 首批消费者:托盘图标由迁移驱动(取代 lib.rs 里 tray::set_recording
             // 的散点直调)。启动前注册完再进循环,符合 HookBus「注册序执行」契约。
             bus.register(Box::new(super::consumers::TrayHook));
-            // Aing 集各条目的起始时刻(相对 actor 启动的毫秒)。用于滞留自愈,
-            // 见 REFINE_STALE_MS。单线程持有,无锁。
+            // Aing 集各条目「最后一次有进度」的时刻(相对 actor 启动的毫秒)。
+            // 用于滞留自愈,见 REFINE_STALE_MS。单线程持有,无锁。
             let boot = std::time::Instant::now();
             let mut refine_clock: std::collections::BTreeMap<String, u64> = Default::default();
             for env in rx {
                 // 每收一封先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
                 // (线程没结束),该 id 会永久占着 Aing 集把守卫钉死——这里兜住那条路径。
+                //
+                // 判据是「多久没有进度」而非「启动至今多久」。改口径的原因(codex review
+                // 发现,2026-08-18):按启动计时会误杀正常的长会议 Aing——HTTP 精修按
+                // CHUNK_CHARS=3000 分块串行跑,块数随会议长度无界增长,每块最坏
+                // CHUNK_TIMEOUT_S×2=360s,十块就到一小时,而并发任务还要在 AING_GATE
+                // 前排队。误杀的后果比不自愈更糟:移除标记并不会取消 worker,守卫就此
+                // 放行,随后的编辑与仍在跑的 worker 抢写 aing.json。
                 {
                     let now_ms = boot.elapsed().as_millis() as u64;
                     let running: Vec<String> =
                         state.refine.running_ids().map(str::to_string).collect();
                     for id in sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS) {
                         eprintln!(
-                            "lifecycle: Aing 集条目 {id} 滞留超 {}s,判定 worker 未收尾,自愈移除\
+                            "lifecycle: Aing 集条目 {id} 已 {}s 无进度,判定 worker 未收尾,自愈移除\
                              (该 id 的 is_refining 守卫此前会一直拒绝编辑类命令)",
                             REFINE_STALE_MS / 1000
                         );
@@ -419,6 +426,13 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         continue;
                     }
                 };
+                // 进度即心跳:worker 每报一次进度就把该条目的计时清零。没有这一步,
+                // 判据退化回「启动至今」,长会议的正常 Aing 会被误杀(见上方说明)。
+                // 放在 handle 之前:RefineProgress 的 all/running 分支会把 id 插进集合,
+                // 先刷新则首次插入那一刻也有了准确起点。
+                if let Msg::RefineProgress { note_id, .. } = &msg {
+                    refine_clock.insert(note_id.clone(), boot.elapsed().as_millis() as u64);
+                }
                 let (next, effects) = machine::handle(&state, &msg);
                 let is_cmd = matches!(msg, Msg::Cmd(_));
                 // 效果不带 writer/管线载荷(见 machine.rs Effect 注释),载荷从本轮
@@ -768,10 +782,40 @@ mod stale_tests {
         let stale = sync_and_take_stale(&mut c, &["n1".into()], 1_000, 10_000);
         assert!(stale.is_empty());
         assert_eq!(c.get("n1"), Some(&1_000), "起始时刻按首次观察到的那一刻记");
-        // 再同步不刷新起点,否则永远到不了期
+        // 纯体检(无进度)不刷新计时,否则永远到不了期。刷新只由进度消息触发,
+        // 那条路径在 actor 主循环里(见下面的「进度刷新计时」用例)。
         let stale = sync_and_take_stale(&mut c, &["n1".into()], 5_000, 10_000);
         assert!(stale.is_empty());
-        assert_eq!(c.get("n1"), Some(&1_000), "起点不得被后续同步刷新");
+        assert_eq!(c.get("n1"), Some(&1_000), "体检本身不得刷新计时");
+    }
+
+    /// codex review(2026-08-18)发现的 P1 回归:判据必须是「多久没有进度」,
+    /// 不能是「启动至今多久」。HTTP 精修按 3000 字分块串行跑,块数随会议长度无界,
+    /// 每块最坏 360s,十块即到一小时——按启动计时会把正常的长会议 Aing 误判成卡死,
+    /// 而移除标记并不取消 worker,守卫就此放行,随后的编辑与仍在跑的 worker 抢写。
+    ///
+    /// 这里模拟主循环的行为:每收到一次进度就 insert 当前时刻(即心跳),
+    /// 验证只要还有进度,再久也不判滞留。
+    #[test]
+    fn 进度刷新计时使长任务不被误判() {
+        let mut c = BTreeMap::new();
+        let ttl = 10_000;
+        sync_and_take_stale(&mut c, &["n1".into()], 0, ttl);
+        // 每 9 秒一次心跳,连续 10 轮(累计 90 秒,远超 TTL),期间一次都不该被判滞留
+        for round in 1..=10u64 {
+            let now = round * 9_000;
+            c.insert("n1".to_string(), now); // 主循环收到 RefineProgress 时做的事
+            let stale = sync_and_take_stale(&mut c, &["n1".into()], now, ttl);
+            assert!(stale.is_empty(), "第 {round} 轮:有心跳就不该判滞留");
+        }
+        // 心跳一停,超过 TTL 才判滞留
+        let last = 90_000;
+        assert!(sync_and_take_stale(&mut c, &["n1".into()], last + ttl - 1, ttl).is_empty());
+        assert_eq!(
+            sync_and_take_stale(&mut c, &["n1".into()], last + ttl, ttl),
+            vec!["n1".to_string()],
+            "心跳停止满 TTL 后才自愈"
+        );
     }
 
     #[test]
