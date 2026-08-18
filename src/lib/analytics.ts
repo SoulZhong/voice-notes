@@ -9,6 +9,7 @@
  */
 import posthog from "posthog-js";
 import { invoke } from "@tauri-apps/api/core";
+import { redactEvent } from "$lib/redact";
 
 /** 与后端同一个值。公开写入端点,不是机密。 */
 export const PROJECT_KEY = "phc_qgqdrtaowrPfMPzmD9b7e9JSUPRc3RY3oGAeeKtAAV7E";
@@ -31,6 +32,10 @@ export function analyticsConfig() {
     //    spike 实测捕获到 `clicked link with text "近期工作安排通报"` 这类事件,
     //    与会话回放无关,光开 autocapture 就会泄漏。
     mask_all_text: true,
+    //    mask_all_text 只遮元素**文本**,不遮**属性**。本应用把会议内容放进了属性:
+    //    MiniPlayer 用笔记标题做 title、ForceGraph 把实体名放进 aria-label,
+    //    点这些元素时会随 $elements 一起送出去(codex review 发现)。
+    mask_all_element_attributes: true,
 
     // ② 会话回放:**默认不上线**。spike 的判据 4(遮蔽实测硬门)未通过验证,
     //    设计文档写死「遮蔽未经实测通过,回放不得上线」。遮蔽配置已备好,
@@ -47,6 +52,9 @@ export function analyticsConfig() {
 
     // ④ 异常自动捕获:不显式设置时默认值同样由远端配置决定
     //    (posthog-js 源码 `wr(t) ? this.sl : t`)。console 错误刻意不捕获,同 ③。
+    // 自动捕获的异常默认原样上传消息文本,而它常含 IPC 错误文案、路径、
+    // 笔记标题、逐字稿片段。统一在此脱敏,不丢事件——丢了就看不见异常。
+    before_send: redactEvent,
     capture_exceptions: {
       capture_unhandled_errors: true,
       capture_unhandled_rejections: true,
@@ -57,11 +65,17 @@ export function analyticsConfig() {
     //    /^(localhost|127\.0\.0\.1)$/,而 Tauri 生产在 macOS 上的来源正是
     //    tauri://localhost —— hostname 恰为 localhost。不覆盖的话,打包后**全部
     //    真实用户事件都会被标成内部测试流量**,看板默认过滤,症状是「接完之后
-    //    看板一直是空的」且极难归因。置 undefined 关掉该判定。
-    internal_or_test_user_hostname: undefined,
+    //    看板一直是空的」且极难归因。
+    //
+    //    **必须用 null,不能用 undefined**:posthog-js 的配置合并是
+    //    `for (s in n) void 0 !== n[s] && (t[s] = n[s])`,undefined 会被整个跳过,
+    //    日期默认值的正则原样生效——写 undefined 等于什么都没做(codex review 发现)。
+    internal_or_test_user_hostname: null,
 
     autocapture: true,
-    capture_pageview: true,
+    // SPA:layout 常驻,goto 不触发整页加载。true 只捕获首次加载,
+    // 之后的页面访问全丢,页面漏斗算不出来。
+    capture_pageview: "history_change" as const,
   };
 }
 

@@ -218,7 +218,13 @@ pub fn track(_app: &AppHandle, event: Event) {
         return;
     }
     let (name, props) = event.payload();
-    let mut ev = posthog_rs::Event::new(name, &distinct_id());
+    // id 未到位时必须用 new_anon(真正的 personless),不能用字面量 id:
+    // AppStarted 发生在 webview 调 set_analytics_id 之前,若都记成同一个字面量,
+    // 每台机器的启动会被算成同一个人,独立用户数与激活漏斗全废(codex review 发现)。
+    let mut ev = match current_id() {
+        Some(id) => posthog_rs::Event::new(name, &id),
+        None => posthog_rs::Event::new_anon(name),
+    };
     if let Some(Value::Object(map)) = props {
         for (k, v) in map {
             // 属性值只可能来自各枚举 as_str 与 duration_bucket(见 payload),
@@ -236,14 +242,12 @@ fn slot() -> &'static std::sync::RwLock<String> {
     DISTINCT_ID.get_or_init(|| std::sync::RwLock::new(String::new()))
 }
 
-fn distinct_id() -> String {
+fn current_id() -> Option<String> {
     let v = slot().read().map(|g| g.clone()).unwrap_or_default();
     if v.is_empty() {
-        // personless:PostHog 允许无人格事件,漏斗算不到但计数仍在,
-        // 好过自造一个与前端对不上的 id。
-        "anonymous".to_string()
+        None
     } else {
-        v
+        Some(v)
     }
 }
 
@@ -278,6 +282,11 @@ pub fn init() {
         .host(HOST.to_string())
         .is_server(false)
         .error_tracking(et)
+        // 出口统一脱敏。**panic hook 由 SDK 安装,它直接序列化 panic 载荷,
+        // 不经 report_error、也就不经 redact**——panic 消息里常有 home 路径、
+        // 文件名、上游错误文本(codex review 发现)。放在这里是唯一能覆盖所有
+        // 发送路径的位置:手工上报、自动 panic、将来新增的任何 capture 都过它。
+        .before_send(redact_event)
         .build()
     {
         Ok(v) => v,
@@ -291,6 +300,56 @@ pub fn init() {
     }
 }
 
+/// 退出前排空上报队列。同步版 flush(关掉了 async-client 特性),不阻塞太久:
+/// 失败也无所谓——上报绝不能拖住退出。
+pub fn flush_on_exit() {
+    if PROJECT_KEY.is_empty() {
+        return;
+    }
+    posthog_rs::flush();
+}
+
+/// before_send 钩子:对异常类事件的文本字段做脱敏。
+///
+/// 只改属性值,**绝不丢事件**——丢了就看不见异常,与上报的目的相悖。
+/// 钩子内不得 panic(SDK 会捕获并丢弃该事件),故全程用安全取值。
+fn redact_event(mut ev: posthog_rs::Event) -> Option<posthog_rs::Event> {
+    // 现代错误追踪用 $exception_list;标量字段兼容旧看板,两种都覆盖。
+    if let Some(list) = ev.properties().get("$exception_list").cloned() {
+        let cleaned = redact_exception_list(list);
+        let _ = ev.insert_prop("$exception_list", cleaned);
+    }
+    for key in ["$exception_message", "$exception_type", "$exception_source"] {
+        let Some(v) = ev.properties().get(key).cloned() else { continue };
+        if let Some(text) = v.as_str() {
+            let _ = ev.insert_prop(key, crate::redact::redact(text));
+        }
+    }
+    Some(ev)
+}
+
+/// 逐条脱 $exception_list 里的 type/value。结构不认识就原样返回——
+/// 宁可放过结构变化,也不能因为解析失败把事件丢掉。
+fn redact_exception_list(list: Value) -> Value {
+    let Value::Array(items) = list else { return list };
+    Value::Array(
+        items
+            .into_iter()
+            .map(|mut item| {
+                if let Value::Object(map) = &mut item {
+                    for key in ["value", "type"] {
+                        if let Some(Value::String(text)) = map.get(key) {
+                            let safe = crate::redact::redact(text);
+                            map.insert(key.to_string(), Value::String(safe));
+                        }
+                    }
+                }
+                item
+            })
+            .collect(),
+    )
+}
+
 /// 显式上报一次失败(崩溃由 panic hook 全覆盖,这里管「出错了但没崩」的关键链路)。
 ///
 /// 消息一律过 [`crate::redact`]:spike 实测异常载荷会原样带出家目录里的姓名与
@@ -300,7 +359,17 @@ pub fn report_error(kind: ErrorKind, detail: &str) {
         return;
     }
     let safe = crate::redact::redact(detail);
-    let mut ev = posthog_rs::Event::new("$exception", &distinct_id());
+    let mut ev = match current_id() {
+        Some(id) => posthog_rs::Event::new("$exception", &id),
+        None => posthog_rs::Event::new_anon("$exception"),
+    };
+    // 现代 PostHog 错误追踪按 $exception_list 建 issue 与定位;只发标量字段的话
+    // 事件可能只显示成一条普通事件,拿不到承诺的"出错位置"(codex review 发现)。
+    // 标量字段一并保留,兼容旧看板。
+    let _ = ev.insert_prop(
+        "$exception_list",
+        serde_json::json!([{ "type": kind.as_str(), "value": safe, "mechanism": { "handled": true } }]),
+    );
     let _ = ev.insert_prop("$exception_type", kind.as_str());
     let _ = ev.insert_prop("$exception_message", safe);
     // fingerprint 按 kind 分组:spike 发现 PostHog 会把语义无关的裸 Error 并进
@@ -384,6 +453,32 @@ mod tests {
 
     /// 锁全部事件的序列化形状:事件名、属性键、属性值均为受控枚举输出。
     /// 若有人往属性里塞新字段/自由文本,此测试必须跟着改——强制走一次红线审视。
+    /// before_send 是 panic 载荷的唯一防线:SDK 装的 panic hook 直接序列化载荷,
+    /// 不经 report_error 也就不经 redact。这条钉死它确实在出口生效。
+    #[test]
+    fn before_send脱掉异常载荷里的内容() {
+        let mut ev = posthog_rs::Event::new_anon("$exception");
+        ev.insert_prop(
+            "$exception_list",
+            json!([{ "type": "Error", "value": "写入 /Users/张伟/notes/季度复盘会.json 失败" }]),
+        )
+        .unwrap();
+        ev.insert_prop("$exception_message", "panic at /Users/张伟/x.rs").unwrap();
+
+        let out = redact_event(ev).expect("绝不能丢事件——丢了就看不见异常");
+        let dumped = serde_json::to_string(out.properties()).unwrap();
+        assert!(!dumped.contains("张伟"), "姓名必须脱掉: {dumped}");
+        assert!(!dumped.contains("季度复盘会"), "会议标题必须脱掉: {dumped}");
+    }
+
+    #[test]
+    fn before_send不认识的结构原样放行而非丢弃() {
+        let mut ev = posthog_rs::Event::new_anon("vn_page_view");
+        ev.insert_prop("path", "/notes").unwrap();
+        let out = redact_event(ev).expect("普通事件不得被丢弃");
+        assert_eq!(out.properties().get("path").unwrap(), "/notes");
+    }
+
     #[test]
     fn payload_shape_locked() {
         let cases: Vec<(Event, &str, Option<Value>)> = vec![

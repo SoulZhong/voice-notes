@@ -34,11 +34,27 @@ describe("analyticsConfig(危险默认值必须被显式覆盖)", () => {
     expect(cfg.capture_exceptions.capture_console_errors).toBe(false);
   });
 
+  it("mask_all_element_attributes 必须为 true——标题藏在 title/aria-label 属性里", () => {
+    // mask_all_text 只遮文本不遮属性:MiniPlayer 用笔记标题做 title,
+    // ForceGraph 把实体名放进 aria-label,点击时随 $elements 送出。
+    expect(cfg.mask_all_element_attributes).toBe(true);
+  });
+
+  it("before_send 必须挂上脱敏——自动捕获的异常默认原样上传", () => {
+    expect(typeof cfg.before_send).toBe("function");
+  });
+
+  it("capture_pageview 必须是 history_change——SPA 里 true 只捕获首次加载", () => {
+    expect(cfg.capture_pageview).toBe("history_change");
+  });
+
   it("必须关掉 internal_or_test_user_hostname——否则 macOS 全量真实流量被判成内部测试", () => {
     // defaults:"2026-05-30" 会把它设成 /^(localhost|127\.0\.0\.1)$/,
     // 而 Tauri 生产在 macOS 的来源是 tauri://localhost,hostname 正是 localhost。
     // 不覆盖的症状:看板一直是空的,且极难归因。
-    expect(cfg.internal_or_test_user_hostname).toBeUndefined();
+    // **必须是 null,不能是 undefined**:posthog-js 的配置合并
+    // `void 0 !== n[s] && (t[s] = n[s])` 会跳过 undefined,写 undefined 等于没写。
+    expect(cfg.internal_or_test_user_hostname).toBeNull();
   });
 
   it("host 与项目区域一致", () => {

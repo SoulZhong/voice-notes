@@ -23,8 +23,9 @@ pub fn redact(input: &str) -> String {
 /// 家目录路径收敛为 `<HOME>/…`:`/Users/张伟/x` 与 `/home/zhangwei/x` 都会带出用户名,
 /// 而用户名常常就是真实姓名。同时把 notes 目录下的文件名收敛掉——那是会议标题。
 fn redact_home_paths(s: &str) -> String {
+    let s = redact_windows_home(s);
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
+    let mut rest = s.as_str();
     while let Some(pos) = rest.find("/Users/").or_else(|| rest.find("/home/")) {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos..];
@@ -32,6 +33,31 @@ fn redact_home_paths(s: &str) -> String {
         // 以空白为终点会把后半截漏在外面(实测就漏出了会议标题)。改为:遇到引号、
         // 逗号、分号、换行,或"空格后紧跟非路径样的词"才收尾。
         let end = path_end(tail);
+        out.push_str("<HOME_PATH>");
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Windows 家目录:`C:\Users\Alice\...\notes\周会.json`。Windows 是受支持平台,
+/// 这类路径同样会带出用户名(常是真实姓名)与 notes 下的会议标题(codex review 发现)。
+fn redact_windows_home(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        // 找 "<盘符>:\Users\"
+        let Some(u) = rest.find(":\\Users\\") else { break };
+        // 盘符是它前面那一个字符
+        let start = rest[..u].char_indices().next_back().map(|(i, _)| i).unwrap_or(u);
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| matches!(c, '"' | '\'' | ',' | ';' | '\n' | '\r' | ')' | ']') || *c == ' ')
+            .map(|(i, _)| i)
+            .unwrap_or(tail.len());
         out.push_str("<HOME_PATH>");
         rest = &tail[end..];
     }
@@ -132,6 +158,14 @@ mod tests {
         assert!(!out.contains("季度复盘会"), "会议标题必须脱掉: {out}");
         assert!(out.contains("note-140751"), "note-id 不是内容,应保留以便定位: {out}");
         assert!(out.contains("refine"), "模块名应保留: {out}");
+    }
+
+    #[test]
+    fn windows家目录路径同样收敛() {
+        let out = redact("write C:\\Users\\Alice\\AppData\\voice-notes\\notes\\周会.json failed");
+        assert!(!out.contains("Alice"), "Windows 用户名必须脱掉: {out}");
+        assert!(!out.contains("周会"), "Windows 路径里的会议标题必须脱掉: {out}");
+        assert!(out.contains("failed"), "英文措辞应保留: {out}");
     }
 
     #[test]

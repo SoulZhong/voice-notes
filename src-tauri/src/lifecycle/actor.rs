@@ -181,6 +181,11 @@ fn abort_owned(mut o: Owned) {
     if o.writer.has_content() {
         if let Err(e) = o.writer.finalize(chrono::Local::now()) {
             eprintln!("abort_or_finalize: finalize 失败: {e}");
+            // 落盘失败 = 用户的录音可能没保住,这是最该看见的一类失败。
+            crate::telemetry::report_error(
+                crate::telemetry::ErrorKind::NoteWrite,
+                &format!("abort_or_finalize: finalize 失败: {e}"),
+            );
         }
     } else if o.writer.created_this_session() {
         let dir = o.writer.dir().to_path_buf();
@@ -516,6 +521,12 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             }
                         }
                         Effect::DoAbort { note_id } => {
+                            // 会话被放弃 = 这次录制没能正常开起来/存下来。
+                            // 用户视角就是「点了开录但没录成」,是最该远端可见的一类。
+                            crate::telemetry::report_error(
+                                crate::telemetry::ErrorKind::RecordingStart,
+                                "会话被放弃(DoAbort)",
+                            );
                             // 原 lib.rs abort_or_finalize 语义作用于槽内 writer + 清槽,
                             // 但先对账:note_id 与槽内 owned.note_id 不一致(同样是双
                             // 加载线程重叠窗口下 S1 迟到的 AbortSession)绝不能动槽——
@@ -562,6 +573,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                         }
                                         Err(e) => {
                                             eprintln!("stop_recording: finalize 失败: {e}");
+                                            crate::telemetry::report_error(
+                                                crate::telemetry::ErrorKind::RecordingStop,
+                                                &format!("stop_recording: finalize 失败: {e}"),
+                                            );
                                             let _ = app.emit("storage", crate::ipc::StorageEvent { state: "degraded".into() });
                                         }
                                     }

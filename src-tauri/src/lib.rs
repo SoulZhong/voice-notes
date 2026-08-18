@@ -7707,6 +7707,12 @@ pub fn run() {
         // 程序卡死)。召回语义与托盘 show 菜单项一致:show + set_focus。
         // Reopen 是 macOS 独有变体(其余平台该枚举没有此成员,匹配都编不过),整块 cfg。
         .run(|app, event| {
+            // 退出前排空上报队列。SDK 起的是带缓冲的后台 worker,全局单例的析构
+            // 在进程退出时不会执行,不主动 flush 的话临退出那几秒的事件(停录、
+            // 导出、刚发生的错误)会静默丢失(codex review 发现)。
+            if let tauri::RunEvent::Exit = event {
+                telemetry::flush_on_exit();
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 if let Some(w) = app.get_webview_window("main") {
