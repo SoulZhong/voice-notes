@@ -7359,27 +7359,9 @@ pub fn run() {
                 .with_handler(shortcuts::on_shortcut)
                 .build(),
         );
-    // 遥测插件:未配 App-Key 时不注册,track 亦会短路,双保险。
-    // host 恒传:自托管 key(A-SH-)必需;托管云 key(A-EU-/A-US-)由插件忽略。
-    // 插件内部用裸 tokio::spawn 起批量发送循环、reqwest 发请求、退出时 block_on 冲队列,
-    // 都要求线程环境里有 Tokio reactor;GUI 主线程本身不在 runtime 里(真机启动即 panic:
-    // "there is no reactor running"),这里 enter Tauri 自带 runtime 的 handle 兜底——
-    // guard 与 handle 须存活到 builder.run()(插件 setup/退出 flush 都在其中执行),
-    // 故绑定在 run() 作用域而非 if 内。EnterGuard 只设线程本地标记,不影响主线程其余逻辑。
-    let telemetry_rt = tauri::async_runtime::handle();
-    let _telemetry_reactor_guard = telemetry_rt.inner().enter();
-    let builder = if telemetry::APP_KEY.is_empty() {
-        builder
-    } else {
-        builder.plugin(
-            tauri_plugin_aptabase::Builder::new(telemetry::APP_KEY)
-                .with_options(tauri_plugin_aptabase::InitOptions {
-                    host: Some(telemetry::APTABASE_HOST.into()),
-                    flush_interval: None,
-                })
-                .build(),
-        )
-    };
+    // 遥测供应商(Aptabase)已下线:插件注册、以及为它兜底 Tokio reactor 的
+    // EnterGuard 一并移除(那段兜底是插件内部裸 tokio::spawn 的需要,供应商没了
+    // 就没有存在理由)。telemetry 模块与 6 个埋点调用点保留,见 telemetry.rs。
     builder
         .manage(AppState::default())
         .manage(player::PlayerHandle::default())
