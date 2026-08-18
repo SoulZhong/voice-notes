@@ -278,7 +278,7 @@ tap 与聚合设备都建成了、也真的拿到了系统音频内容。这不�
 本机当前:
 
 ```
-$ cargo run --bin drift_stats -- <data_root> --since 20260814-170000
+$ cargo run --features devtools --bin drift_stats -- <data_root> --since 20260814-170000
 按 --since 挡掉的报告: 3 份
 场次: 2  含降级源: 0
 含 inter_track 的场次: 2/2

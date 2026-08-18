@@ -9,15 +9,8 @@
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-/// Aptabase App-Key。空串 = 遥测整体停用(插件不注册、track 短路)。
-/// A-SH- 前缀 = 自托管实例,必须同时配置 APTABASE_HOST,否则插件静默停用。
-/// App-Key 是写进客户端的公开标识(等同前端可见的写入端点),不是机密,可入库。
-pub const APP_KEY: &str = "A-SH-4723952967";
-
-/// 自托管 Aptabase 实例地址(不带尾斜杠:插件按 "{host}/api/v0/events" 拼接)。
-/// 仅 A-SH- key 时被插件读取;托管云 key(A-EU-/A-US-)会忽略此值。
-pub const APTABASE_HOST: &str = "https://aptabase.tutorkin.com";
-
+/// 供应商已下线(2026-08-18)。事件与属性建模、隐私红线、防回归测试全部保留——
+/// 它们与具体供应商无关,是下一个上报后端接入时直接复用的资产。
 /// 录制源类别。由设置推断而非实际启动结果:遥测只要低基数类别,不追精确。
 ///
 /// `Mic`/`System` 两档目前无构造点(`RecordSource::from_settings` 随 record_system_only
@@ -202,22 +195,13 @@ impl Event {
     }
 }
 
-/// 上报门:key 未配置(本地开发构建)→ 不发。用户开关已移除(2026-07-29 产品
-/// 决策:匿名统计常开,不再提供 opt-out;上报内容不变——仅功能计数与版本,
-/// 绝不含会议内容)。
-fn gate(app_key: &str) -> bool {
-    !app_key.is_empty()
-}
-
-/// 唯一上报入口。
-pub fn track(app: &AppHandle, event: Event) {
-    if !gate(APP_KEY) {
-        return;
-    }
-    use tauri_plugin_aptabase::EventTracker;
-    let (name, props) = event.payload();
-    let _ = app.track_event(name, props); // 上报失败静默(设计约束)
-}
+/// 唯一上报入口。**当前无上报后端**:供应商已下线,新后端未接入,故为空实现。
+///
+/// 刻意保留函数与全部调用点(6 处:启动/开录/停录/精修/导出/MCP),而不是把调用点
+/// 一并删掉——删了之后接新后端还得原样找回这 6 个位置,而"该在哪里埋点"正是当初
+/// 花心思定的东西。参数 `_event` 已构造但不消费,构造过程本身仍受类型约束保护,
+/// 属性红线的防回归测试因此继续有效。
+pub fn track(_app: &AppHandle, _event: Event) {}
 
 #[cfg(test)]
 mod tests {
@@ -305,9 +289,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gate_blocks_without_key() {
-        assert!(!gate("")); // 未配 key(本地开发构建):整体停用
-        assert!(gate("A-EU-123"));
-    }
+    // 原 gate_blocks_without_key 已随供应商删除:它测的是「没配 App-Key 就不上报」,
+    // 而 App-Key 是 Aptabase 的概念。上报门这一层要等新后端接入时按其形态重建。
 }
