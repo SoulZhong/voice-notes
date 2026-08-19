@@ -6347,15 +6347,17 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
             return Err(tr!("录制中不能撤销合并", "Cannot undo a merge while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        let needs_rebuild = store::VoiceprintStore::new(root.clone())
-            .undo_merge(&journal_id)
-            .map_err(|e| e.to_string())?;
+        let mut needs_rebuild = false;
+        let r = store::VoiceprintStore::new(root.clone()).undo_merge(&journal_id, &mut needs_rebuild);
         // 质心因跨空间被置空 → 排一次重建。这里已在 vp_guard 之外(store 方法已返回)。
+        // **先无条件处理,再判 r**:清空已经落盘,撤销后半程(样本、删条目)失败也不能
+        // 让它跟着 Err 一起丢(codex review 实现轮三 P1)。
         if needs_rebuild {
             let st = app.state::<AppState>();
             *st.embedder_cache.lock().unwrap() = None;
             spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "撤销合并后质心置空");
         }
+        r.map_err(|e| e.to_string())?;
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
@@ -6381,18 +6383,21 @@ async fn restore_merged_person(
             return Err(tr!("录制中不能拆回说话人", "Cannot split a speaker back out while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        let (pid, needs_rebuild) = store::VoiceprintStore::new(root.clone())
-            .restore_merged_person(&journal_id)
-            .map_err(|e| e.to_string())?;
+        let mut needs_rebuild = false;
+        let r = store::VoiceprintStore::new(root.clone())
+            .restore_merged_person(&journal_id, &mut needs_rebuild);
         // 质心被清空了(快照来自另一个模型空间)→ 现在必须排一次重建,把这个人从
         // 样本重新长出来。**放在这里而不是 store 里**:store 那边还持着 vp_guard,
         // 重建自己也要取它。走 spawn_voiceprint_rebuild(空闲即启动、忙则排队),
         // 不能直接置 REBUILD_PENDING——那不是队列,空闲时置位不会启动任何东西。
+        // **先无条件处理,再判 r**:同 undo_merge——清空已经落盘,后半程失败也不能
+        // 让重建需求跟着 Err 丢掉(codex review 实现轮三 P1)。
         if needs_rebuild {
             let st = app.state::<AppState>();
             *st.embedder_cache.lock().unwrap() = None;
             spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "拆回后质心置空");
         }
+        let pid = r.map_err(|e| e.to_string())?;
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)

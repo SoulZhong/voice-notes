@@ -502,7 +502,19 @@ pub fn reinforce_person(
         // 快照回填失败:立即回滚质心,把窗口闭合成"什么都没发生"。
         eprintln!("feedback: 账本回填失败,回滚本次回灌: {e}");
         // 回滚刚写进去的那一份:它就是当前空间写的,标签同 expected_model。
-        let _ = vp.restore_feedback(person_id, &applied.person_before, &applied.person_after, expected_model);
+        // 三种结局都要如实处理,不能一律 `let _ =` 当成"已回滚"(codex review 实现轮三 P2):
+        // 回滚期间库可能刚被换空间重建过,那样质心会被清空 → 同样欠一次重建。
+        match vp.restore_feedback(person_id, &applied.person_before, &applied.person_after, expected_model) {
+            Ok(crate::store::RestoreOutcome::Restored) => {}
+            Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => {
+                eprintln!("feedback: 回滚时发现库已换空间,{person_id} 质心已置空,需重建");
+                *needs_rebuild = true;
+            }
+            Ok(crate::store::RestoreOutcome::Skipped) => {
+                eprintln!("feedback: {person_id} 已被其它写动过,本次回灌**未**回滚,库里留有增量")
+            }
+            Err(e2) => eprintln!("feedback: 回滚失败,库里留有本次增量: {e2}"),
+        }
         let mut cleanup = load_ledger(note_dir);
         cleanup.entries.remove(&key);
         let _ = save_ledger(note_dir, &cleanup);

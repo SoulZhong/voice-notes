@@ -426,8 +426,12 @@ impl VoiceprintStore {
     /// 合并所失效的旧条目复活(LIFO 链式撤销)。条目已失效 → Err 带原因。
     /// 库记录与**样本文件**都是硬要求:上面刚把双方现存样本全清了,样本恢复再失败
     /// 就无从复原(样本恢复只补缺失、不覆盖既有,失败保留 journal 供重试)。
-    /// 返回是否需要一次重建(质心因跨空间被置空)。调用方须**在释放锁之后**发起。
-    pub fn undo_merge(&self, journal_id: &str) -> anyhow::Result<bool> {
+    /// `needs_rebuild` 是**出参**(同 feedback::reinforce_person):质心一旦因跨空间被
+    /// 置空就已经落盘,与后面样本恢复、删 journal 成不成功无关。做成返回值的话,
+    /// 任何后续错误都会把它连同 `Err` 一起丢掉,那两个人从此永远没有声纹——库标签
+    /// 没变,启动自愈也不会触发(codex review 实现轮三 P1)。调用方须先无条件处理它,
+    /// 且**在释放锁之后**才发起重建。
+    pub fn undo_merge(&self, journal_id: &str, needs_rebuild: &mut bool) -> anyhow::Result<()> {
         let _guard = vp_guard();
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         let entry = journal.entry(journal_id)?;
@@ -435,39 +439,56 @@ impl VoiceprintStore {
             anyhow::bail!("不能撤销:{reason}");
         }
         let mut vp = self.load();
+        // 合并会把 loser 从 people 移走、换成一条 redirect,所以撤销之前他一定不在
+        // people 里。他在 = 上一次撤销已经把库还原了、卡在后面某步(样本或删条目),
+        // 这次是重试。重试**绝不能**再走一遍"清空双方现存样本":两次尝试之间用户
+        // 可能又录了新样本,清掉它再拿旧快照占位,新录音就没了
+        // (codex review 实现轮三 P1)。
+        let is_retry = vp.people.contains_key(&entry.loser);
         // 快照里的质心可能来自另一个模型空间(换模型重建之后撤销一次旧合并)。
         let mut loser_person = entry.loser_person.clone();
         let mut winner_person = entry.winner_person.clone();
-        let mut needs_rebuild = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);
-        needs_rebuild |= sanitize_replayed(&mut winner_person, &entry.embedding_model, &vp.embedding_model);
-        if needs_rebuild {
+        let mut cleared = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);
+        cleared |= sanitize_replayed(&mut winner_person, &entry.embedding_model, &vp.embedding_model);
+        if cleared {
             eprintln!(
                 "撤销合并:快照来自 {} 空间(库现在是 {}),只还身份、质心置空,待重建",
                 if entry.embedding_model.is_empty() { "未知" } else { &entry.embedding_model },
                 vp.embedding_model
             );
         }
-        vp.people.insert(entry.loser.clone(), loser_person);
-        vp.people.insert(entry.winner.clone(), winner_person);
-        vp.redirects.remove(&entry.loser);
-        for k in &entry.redirects_to_loser {
-            // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
-            // 会让 resolve 把他解析走,笔记归属与新样本落盘全部错人。
-            if vp.people.contains_key(k) { continue; }
-            vp.redirects.insert(k.clone(), entry.loser.clone());
-        }
-        self.save(&vp)?;
-        // 样本还原:双方现存文件清掉(含合并时迁移/兜底截取的),快照副本拷回。
-        // **清理失败也是硬条件**:恢复用的 copy_no_overwrite 遇到已存在的目标会原子
-        // 跳过(那是给"只补缺失"的拆回重试用的语义),所以这里没清干净的话,留在库里的
-        // 就是合并**后**的那份样本,而快照那份被静默丢弃——撤销等于没撤干净。宁可
-        // 整体失败、保留 journal 让用户重试(codex review 实现轮二 P1 的连带面)。
-        for id in [entry.loser.as_str(), entry.winner.as_str()] {
-            for p in self.sample_paths_existing(id) {
-                if let Err(e) = std::fs::remove_file(&p) {
-                    return Err(anyhow::anyhow!(
-                        "清理现存样本失败({id}),已保留可重试的日志条目: {e}"
-                    ));
+        if is_retry {
+            eprintln!("撤销合并:{} 已在库中,视为上次撤销的重试(只补样本、不再清库)", entry.loser);
+            // 上次撤销时若因跨空间清空过质心,库里现在就是空的;这次仍要报"需重建"。
+            *needs_rebuild |= vp
+                .people
+                .get(&entry.loser)
+                .is_some_and(|p| p.centroids.is_empty() && p.session_centroids.is_empty());
+        } else {
+            vp.people.insert(entry.loser.clone(), loser_person);
+            vp.people.insert(entry.winner.clone(), winner_person);
+            vp.redirects.remove(&entry.loser);
+            for k in &entry.redirects_to_loser {
+                // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
+                // 会让 resolve 把他解析走,笔记归属与新样本落盘全部错人。
+                if vp.people.contains_key(k) { continue; }
+                vp.redirects.insert(k.clone(), entry.loser.clone());
+            }
+            self.save(&vp)?;
+            // 置位放在 save **之后**:save 失败则质心还没被清空,不必重建。
+            *needs_rebuild |= cleared;
+            // 样本还原:双方现存文件清掉(含合并时迁移/兜底截取的),快照副本拷回。
+            // **清理失败也是硬条件**:恢复用的 copy_no_overwrite 遇到已存在的目标会原子
+            // 跳过(那是给"只补缺失"的重试语义),所以这里没清干净的话,留在库里的就是
+            // 合并**后**的那份样本,而快照那份被静默丢弃——撤销等于没撤干净。宁可整体
+            // 失败、保留 journal 让用户重试(codex review 实现轮二 P1 的连带面)。
+            for id in [entry.loser.as_str(), entry.winner.as_str()] {
+                for p in self.sample_paths_existing(id) {
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        return Err(anyhow::anyhow!(
+                            "清理现存样本失败({id}),已保留可重试的日志条目: {e}"
+                        ));
+                    }
                 }
             }
         }
@@ -482,7 +503,7 @@ impl VoiceprintStore {
         // remove 失败则 revive 不执行:重试撤销幂等,链上条目只是暂失撤销入口。
         journal.remove(journal_id)?;
         journal.revive_invalidated_by(journal_id);
-        Ok(needs_rebuild)
+        Ok(())
     }
 
     /// 从失效日志条目拆回被并入方:按快照把 loser 重建为原编号独立说话人,还原
@@ -490,13 +511,17 @@ impl VoiceprintStore {
     /// 删除。与 undo_merge 的区别:不动 winner(那次合并未被撤销,质心里已混入的
     /// 贡献不抽回,后续录制自然纠正),也不 revive 链上条目(它们的前置状态未还原,
     /// 复活会造成"可撤销"假象)。仅失效条目可拆;有效条目走 undo_merge。
-    /// 返回 `(拆回的人物 id, 是否需要一次重建)`。needs_rebuild=true 表示质心被清空了
-    /// (快照来自另一个模型空间),调用方**在释放锁之后**要发起一次重建,否则这个人
-    /// 永远没有声纹——库标签已是当前模型,启动自愈不会再动它,而 append_sample
-    /// 只写 WAV 不产生质心。
-    pub fn restore_merged_person(&self, journal_id: &str) -> anyhow::Result<(String, bool)> {
+    /// 返回拆回的人物 id。`needs_rebuild` 是**出参**(同 undo_merge):置位表示质心被
+    /// 清空了(快照来自另一个模型空间),调用方**在释放锁之后**要发起一次重建,否则这
+    /// 个人永远没有声纹——库标签已是当前模型,启动自愈不会再动它,而 append_sample
+    /// 只写 WAV 不产生质心。做成出参是因为清空已经落盘,后面样本恢复或删条目再失败
+    /// 也不能把它跟着 `Err` 丢掉(codex review 实现轮三 P1)。
+    pub fn restore_merged_person(
+        &self,
+        journal_id: &str,
+        needs_rebuild: &mut bool,
+    ) -> anyhow::Result<String> {
         let _guard = vp_guard();
-        let needs_rebuild;
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         let entry = journal.entry(journal_id)?;
         if entry.invalid_reason.is_none() {
@@ -522,7 +547,7 @@ impl VoiceprintStore {
             }
             // 库里那位可能是上次拆回时按旧空间快照写回去的:质心若为空,说明当时被
             // 净化过(或本就无质心),这次仍要报"需要重建",否则他永远长不回来。
-            needs_rebuild = vp
+            *needs_rebuild |= vp
                 .people
                 .get(&entry.loser)
                 .is_some_and(|p| p.centroids.is_empty() && p.session_centroids.is_empty());
@@ -536,7 +561,6 @@ impl VoiceprintStore {
                     vp.embedding_model
                 );
             }
-            needs_rebuild = cleared;
             vp.people.insert(entry.loser.clone(), loser_person);
             vp.redirects.remove(&entry.loser);
             for k in &entry.redirects_to_loser {
@@ -546,6 +570,8 @@ impl VoiceprintStore {
                 vp.redirects.insert(k.clone(), entry.loser.clone());
             }
             self.save(&vp)?;
+            // 置位放在 save **之后**:save 失败则质心还没被清空,不必重建。
+            *needs_rebuild |= cleared;
             // **样本恢复是硬条件,不是 best-effort**:质心已经被清空(或本来就要靠样本
             // 重建),样本是此后唯一能把这个人的声纹长回来的依据。失败就**保留 journal**
             // ——留着条目,用户可以重试拆回;删了就永久失去恢复依据
@@ -564,7 +590,7 @@ impl VoiceprintStore {
             }
         }
         journal.remove(journal_id)?;
-        Ok((entry.loser.clone(), needs_rebuild))
+        Ok(entry.loser.clone())
     }
 
     /// 确认合并回执(删条目及样本副本)。异步化后命令不再天然串行,journal 目录
@@ -1414,7 +1440,8 @@ mod tests {
         let _ = store.rebuild_for_model(OTHER_MODEL, &mut emb);
         assert_eq!(store.load().embedding_model, OTHER_MODEL);
 
-        let (restored_id, needs_rebuild) = store.restore_merged_person(&jid).unwrap();
+        let mut needs_rebuild = false;
+        let restored_id = store.restore_merged_person(&jid, &mut needs_rebuild).unwrap();
         assert_eq!(restored_id, loser);
         assert!(needs_rebuild, "跨空间回放必须报「需要重建」");
 
@@ -1451,7 +1478,8 @@ mod tests {
         let j = super::super::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         j.invalidate(&[&loser], "测试置失效", None);
 
-        let (_id, needs_rebuild) = store.restore_merged_person(&jid).unwrap();
+        let mut needs_rebuild = false;
+        let _id = store.restore_merged_person(&jid, &mut needs_rebuild).unwrap();
         assert!(!needs_rebuild, "同空间不该报需要重建");
         let vp = store.load();
         assert!(!vp.people[&loser].centroids.is_empty(), "同空间的质心必须原样还回来");
@@ -2668,7 +2696,7 @@ mod tests {
         let before = store.load();
         let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1", MODEL).unwrap();
 
-        store.undo_merge(&jid).unwrap();
+        store.undo_merge(&jid, &mut false).unwrap();
 
         let vp = store.load();
         assert_eq!(vp.people["P1"], before.people["P1"], "loser 完整还原");
@@ -2697,7 +2725,7 @@ mod tests {
         let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         assert_eq!(store.load().redirects.get("P3").map(String::as_str), Some("P2"), "压扁改指 P2");
 
-        store.undo_merge(&jid).unwrap();
+        store.undo_merge(&jid, &mut false).unwrap();
         let vp = store.load();
         assert_eq!(vp.redirects.get("P3").map(String::as_str), Some("P1"), "压扁还原回 P1");
         assert!(!vp.redirects.contains_key("P1"));
@@ -2711,7 +2739,7 @@ mod tests {
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         j.invalidate(&["P2"], "此人随后被改名", None);
 
-        let err = store.undo_merge(&jid).unwrap_err().to_string();
+        let err = store.undo_merge(&jid, &mut false).unwrap_err().to_string();
         assert!(err.contains("不能撤销"), "拒绝并带原因: {err}");
         assert!(err.contains("此人随后被改名"));
     }
@@ -2745,11 +2773,11 @@ mod tests {
         let j1 = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         let j2 = store.merge_journaled("P3", "P2", None, "auto", None, "t2", MODEL).unwrap();
 
-        store.undo_merge(&j1).unwrap_err(); // j1 已被 j2 失效
-        store.undo_merge(&j2).unwrap(); // 后进先出:先撤 j2
+        store.undo_merge(&j1, &mut false).unwrap_err(); // j1 已被 j2 失效
+        store.undo_merge(&j2, &mut false).unwrap(); // 后进先出:先撤 j2
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         assert!(j.entry(&j1).unwrap().invalid_reason.is_none(), "j2 撤销后 j1 复活");
-        store.undo_merge(&j1).unwrap(); // 再撤 j1,库回到最初
+        store.undo_merge(&j1, &mut false).unwrap(); // 再撤 j1,库回到最初
         assert_eq!(store.load().people, before.people);
     }
 
@@ -2798,10 +2826,11 @@ mod tests {
         let (store, journal_id, tmp) = setup_invalidated_merge();
         let winner_before = store.load().people.get("P2").cloned();
 
-        let pid = store.restore_merged_person(&journal_id).unwrap();
+        let mut nr = false;
+        let pid = store.restore_merged_person(&journal_id, &mut nr).unwrap();
 
-        assert_eq!(pid.0, "P1");
-        assert!(!pid.1, "同空间快照不需要重建");
+        assert_eq!(pid, "P1");
+        assert!(!nr, "同空间快照不需要重建");
         let vp = store.load();
         assert!(vp.people.contains_key("P1"), "loser 按快照重建");
         assert_eq!(vp.people.get("P2").cloned(), winner_before, "winner 不动");
@@ -2814,7 +2843,7 @@ mod tests {
     #[test]
     fn restore_merged_person_rejects_valid_entry() {
         let (store, journal_id, _tmp) = setup_valid_merge();
-        let err = store.restore_merged_person(&journal_id).unwrap_err().to_string();
+        let err = store.restore_merged_person(&journal_id, &mut false).unwrap_err().to_string();
         assert!(err.contains("撤销"), "有效条目应引导走撤销而非拆回: {err}");
     }
 
@@ -2822,11 +2851,71 @@ mod tests {
     fn restore_merged_person_does_not_revive_chain() {
         let (store, entry_a_id, entry_b_id, tmp) = setup_chained_merges();
 
-        store.restore_merged_person(&entry_b_id).unwrap();
+        store.restore_merged_person(&entry_b_id, &mut false).unwrap();
 
         let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         let a = journal.entry(&entry_a_id).unwrap();
         assert!(a.invalid_reason.is_some(), "链上条目不复活——B 那次合并并未被撤销");
+    }
+
+    #[test]
+    fn undo_merge_retry_keeps_samples_recorded_between_attempts() {
+        // 上一次撤销已把库还原、但卡在后半程(样本或删条目),条目还留着。重试**不能**
+        // 再走一遍"清空双方现存样本":两次尝试之间用户又录了新样本,清掉它再拿旧快照
+        // 占位,新录音就永久没了(codex review 实现轮三 P1)。
+        let (store, jid, tmp) = setup_valid_merge();
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let entry = journal.entry(&jid).unwrap();
+        // 手动把库还原成"上次撤销已完成前半程"的样子。
+        let mut vp = store.load();
+        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+        vp.people.insert(entry.winner.clone(), entry.winner_person.clone());
+        vp.redirects.remove(&entry.loser);
+        store.save(&vp).unwrap();
+        // 两次尝试之间新录了一段。
+        let vpdir = tmp.path().join("voiceprints");
+        std::fs::create_dir_all(&vpdir).unwrap();
+        let fresh = vpdir.join(format!("{}.wav", entry.loser));
+        std::fs::write(&fresh, b"RIFFrecorded-between-attempts").unwrap();
+
+        store.undo_merge(&jid, &mut false).unwrap();
+
+        assert_eq!(
+            std::fs::read(&fresh).unwrap(),
+            b"RIFFrecorded-between-attempts",
+            "重试不得删掉两次尝试之间新录的样本"
+        );
+        assert!(journal.entry(&jid).is_err(), "重试应收尾成功、清掉条目");
+    }
+
+    #[test]
+    fn undo_merge_reports_rebuild_even_when_a_later_step_fails() {
+        // 跨空间快照 → 质心被清空并落盘。之后样本恢复失败返回 Err 时,重建需求必须
+        // 已经通过出参传出去了,否则这两个人永远没有声纹:库标签没变,启动自愈不触发
+        // (codex review 实现轮三 P1)。
+        let (store, jid, tmp) = setup_valid_merge();
+        // 把库换到另一个空间,条目标签仍是 MODEL → sanitize_replayed 会清空质心。
+        let mut vp = store.load();
+        vp.embedding_model = "eres2netv2".into();
+        store.save(&vp).unwrap();
+        // 让样本恢复必然失败:把 loser 侧样本副本目录换成一个普通文件。
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let side = tmp.path().join("merge_journal").join(&jid).join("samples").join("loser");
+        let _ = std::fs::remove_dir_all(&side);
+        std::fs::create_dir_all(side.parent().unwrap()).unwrap();
+        std::fs::write(&side, b"not a directory").unwrap();
+
+        let mut needs_rebuild = false;
+        let r = store.undo_merge(&jid, &mut needs_rebuild);
+
+        assert!(r.is_err(), "样本恢复失败应整体失败");
+        assert!(needs_rebuild, "质心已被清空并落盘,重建需求不得随 Err 丢失");
+        assert!(journal.entry(&jid).is_ok(), "失败时条目必须保留供重试");
+        let vp = store.load();
+        for id in ["P1", "P2"] {
+            let p = &vp.people[id];
+            assert!(p.centroids.is_empty() && p.session_centroids.is_empty(), "{id} 两张质心表都该空");
+        }
     }
 
     #[test]
@@ -2840,9 +2929,10 @@ mod tests {
         vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
         store.save(&vp).unwrap();
 
-        let pid = store.restore_merged_person(&journal_id).unwrap();
+        let mut nr = false;
+        let pid = store.restore_merged_person(&journal_id, &mut nr).unwrap();
 
-        assert_eq!(pid.0, "P1", "重试仍应返回 loser 编号");
+        assert_eq!(pid, "P1", "重试仍应返回 loser 编号");
         let vp = store.load();
         assert_eq!(
             vp.people.get("P1"),
@@ -2871,10 +2961,10 @@ mod tests {
         let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2", MODEL).unwrap();
         // entry_a 已被 entry_b 的创建连带失效(触及 P2);entry_b 本身仍有效。
 
-        store.restore_merged_person(&entry_a).unwrap();
+        store.restore_merged_person(&entry_a, &mut false).unwrap();
         assert!(store.load().people.contains_key("P1"), "拆回后 P1 重建为独立说话人");
 
-        store.undo_merge(&entry_b).unwrap();
+        store.undo_merge(&entry_b, &mut false).unwrap();
 
         let vp = store.load();
         assert!(!vp.redirects.contains_key("P1"), "拆回的人不能被快照回放重新遮蔽");
@@ -2898,7 +2988,7 @@ mod tests {
         let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         let _entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2", MODEL).unwrap();
 
-        store.restore_merged_person(&entry_a).unwrap();
+        store.restore_merged_person(&entry_a, &mut false).unwrap();
 
         let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         let deny = journal.auto_denylist();

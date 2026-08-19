@@ -26,19 +26,72 @@ static RESTORE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// 而用户可能在重试前又录了新样本。`fs::copy` 会拿旧快照把这份新录音盖掉
 /// (codex review 实现轮二 P1)。
 fn copy_no_overwrite(src: &Path, dst: &Path) -> anyhow::Result<bool> {
-    let seq = RESTORE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dst.with_extension(format!("restore-{}-{seq}.tmp", std::process::id()));
-    if let Err(e) = std::fs::copy(src, &tmp) {
+    // 临时名必须用 create_new 抢,不能 fs::copy 直接写:进程崩溃或 remove_file 失败会
+    // 留下临时文件,而 hard_link 成功后留下的那一个**与正式样本同 inode**;下次 PID
+    // 被复用、计数器又从 0 起时,fs::copy 会把它截断,连正式样本一起写坏
+    // (codex review 实现轮三 P2)。抢不到就换下一个序号。
+    let mut tmp = PathBuf::new();
+    let mut tmp_file = None;
+    for _ in 0..64 {
+        let seq = RESTORE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cand = dst.with_extension(format!("restore-{}-{seq}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(f) => {
+                tmp = cand;
+                tmp_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::anyhow!("建临时文件失败({}): {e}", cand.display())),
+        }
+    }
+    let Some(mut out) = tmp_file else {
+        return Err(anyhow::anyhow!("建临时文件失败(64 次都撞名): {}", dst.display()));
+    };
+    let write = (|| -> std::io::Result<()> {
+        let mut inp = std::fs::File::open(src)?;
+        std::io::copy(&mut inp, &mut out)?;
+        std::io::Write::flush(&mut out)?;
+        out.sync_all()
+    })();
+    drop(out);
+    if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::anyhow!("拷贝样本副本失败({} → 临时文件): {e}", src.display()));
     }
     let linked = match std::fs::hard_link(&tmp, dst) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+        // link(2) 不是哪儿都支持:用户的笔记根目录可能落在 iCloud Drive 或网络卷上。
+        // 那里退回 O_EXCL 建文件再写——同样原子、同样不覆盖,代价是崩在写一半时会
+        // 在目标位置留下半个文件(hard_link 路线只会留下临时文件)。所以它只是兜底。
+        Err(_) => copy_exclusive(src, dst),
     };
     let _ = std::fs::remove_file(&tmp);
     linked
+}
+
+/// `copy_no_overwrite` 在不支持硬链接的卷上的兜底:`create_new` 即 `O_CREAT|O_EXCL`,
+/// 目标已存在时原子失败。写到一半出错就把半成品删掉,不留给下次当"已存在"。
+fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    use std::io::Write;
+    let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(dst) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+    };
+    let res = (|| -> std::io::Result<()> {
+        let mut inp = std::fs::File::open(src)?;
+        std::io::copy(&mut inp, &mut out)?;
+        out.flush()?;
+        out.sync_all()
+    })();
+    if let Err(e) = res {
+        drop(out);
+        let _ = std::fs::remove_file(dst);
+        return Err(anyhow::anyhow!("写入样本失败({}): {e}", dst.display()));
+    }
+    Ok(true)
 }
 
 /// `copy_no_overwrite` 的按目录版:目标名沿用源文件名。
