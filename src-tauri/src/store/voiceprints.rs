@@ -520,6 +520,28 @@ impl VoiceprintStore {
     /// 删除。与 undo_merge 的区别:不动 winner(那次合并未被撤销,质心里已混入的
     /// 贡献不抽回,后续录制自然纠正),也不 revive 链上条目(它们的前置状态未还原,
     /// 复活会造成"可撤销"假象)。仅失效条目可拆;有效条目走 undo_merge。
+    /// 拆回时该补哪一侧的样本副本。
+    ///
+    /// 平常只补 loser:那次合并没被撤销,winner 的样本一直好好的。**但如果这条目上有
+    /// 一次没做完的撤销**(undo_phase 到了 samples_cleared),winner 的现存样本已经被那次
+    /// 撤销删光了,只是还没拷回来。此时若仍只补 loser,随后条目被删,winner 的样本就永久
+    /// 没了——而"进行中的撤销又被普通人物变更失效"恰恰会把用户逼上拆回这条路
+    /// (codex review 实现轮六 P1)。两个恢复函数都只补缺失、不覆盖既有,多补一侧是安全的。
+    fn restore_samples_for_phase(
+        &self,
+        journal: &super::merge_journal::MergeJournal,
+        journal_id: &str,
+        entry: &super::merge_journal::MergeJournalEntry,
+    ) -> anyhow::Result<usize> {
+        let dir = self.root.join("voiceprints");
+        if entry.undo_phase == super::merge_journal::undo_phase::SAMPLES_CLEARED {
+            eprintln!("拆回说话人:该条目上有一次没做完的撤销,winner 的样本也要补回来");
+            journal.restore_samples(journal_id, &dir)
+        } else {
+            journal.restore_loser_samples(journal_id, &dir)
+        }
+    }
+
     /// 返回拆回的人物 id。`needs_rebuild` 是**出参**(同 undo_merge):置位表示质心被
     /// 清空了(快照来自另一个模型空间),调用方**在释放锁之后**要发起一次重建,否则这
     /// 个人永远没有声纹——库标签已是当前模型,启动自愈不会再动它,而 append_sample
@@ -551,7 +573,7 @@ impl VoiceprintStore {
             // 上一次正是卡在那里,跳过它、直接删条目 = 永久销毁恢复依据。
             // restore_loser_samples 只补缺失、不覆盖既有,重试幂等。
             eprintln!("拆回说话人:{} 已还原过,视为上次拆回的重试(只补样本)", entry.loser);
-            match journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+            match self.restore_samples_for_phase(&journal, journal_id, &entry) {
                 Err(e) => {
                     eprintln!("拆回说话人(重试):样本还原仍失败,继续保留日志条目: {e}");
                     return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
@@ -591,7 +613,7 @@ impl VoiceprintStore {
             // 重建),样本是此后唯一能把这个人的声纹长回来的依据。失败就**保留 journal**
             // ——留着条目,用户可以重试拆回;删了就永久失去恢复依据
             // (codex review 设计轮二 P1)。
-            if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+            if let Err(e) = self.restore_samples_for_phase(&journal, journal_id, &entry) {
                 eprintln!("拆回说话人:样本还原失败,保留日志条目以便重试: {e}");
                 return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
             }
@@ -2935,6 +2957,40 @@ mod tests {
             "清理阶段没记上就必须重做,合并后的残留不能占住槽位"
         );
         assert!(journal.entry(&jid).is_err());
+    }
+
+    #[test]
+    fn split_back_after_a_half_done_undo_also_restores_the_winner_samples() {
+        // 死角:撤销做到 samples_cleared(双方现存样本都删了)之后失败,紧接着那两个人
+        // 又被合并 → 条目被普通变更失效 → undo_merge 被 invalid_reason 拒、acknowledge
+        // 被 undo_phase 拒,用户唯一能走的只剩"拆回"。而拆回平常只补 loser,收完尾就删
+        // 条目——winner 那些已经被删掉的样本就永久没了(codex review 实现轮六 P1)。
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        // 撤销做到"样本已清空"就停了。
+        let vpdir = tmp.path().join("voiceprints");
+        for f in ["P1.wav", "P2.wav"] {
+            let _ = std::fs::remove_file(vpdir.join(f));
+        }
+        let mut vp = store.load();
+        vp.people.insert("P1".into(), journal.entry(&jid).unwrap().loser_person);
+        vp.people.insert("P2".into(), journal.entry(&jid).unwrap().winner_person);
+        vp.redirects.remove("P1");
+        store.save(&vp).unwrap();
+        journal
+            .set_undo_phase(&jid, crate::store::merge_journal::undo_phase::SAMPLES_CLEARED, false)
+            .unwrap();
+        // 然后普通人物变更把它失效了(第五轮明确要求普通变更照常失效)。
+        journal.invalidate(&["P2"], "P2 随后又被合并", None);
+        assert!(journal.entry(&jid).unwrap().invalid_reason.is_some());
+        // 库里 P1 已经在了,走的是"已还原过"那条分支——它也必须补 winner。
+        let mut nr = false;
+        store.restore_merged_person(&jid, &mut nr).unwrap();
+
+        assert!(vpdir.join("P1.wav").exists(), "loser 样本要回来");
+        assert!(vpdir.join("P2.wav").exists(), "winner 被那次半截撤销删掉的样本也必须回来");
     }
 
     #[test]

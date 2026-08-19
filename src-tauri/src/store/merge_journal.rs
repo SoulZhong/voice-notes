@@ -115,6 +115,14 @@ fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
         std::fs::remove_file(&mark)
             .map_err(|e| anyhow::anyhow!("清理半成品标记失败({}): {e}", mark.display()))?;
     }
+    // 目标已经在了就直接走人,**别去碰旁标**:先写旁标再发现"已存在"的话,一份完整
+    // 的样本就被打上了"未写完"的标记;进程恰好死在两步之间、或旁标删不掉,下次恢复
+    // 就会把这份完整样本删掉、用旧快照顶替(codex review 实现轮六 P2)。
+    // 这里的 exists 检查有理论上的时间窗,但样本写入在进程内由 VP_LOCK 串行,
+    // 跨进程写样本本就不在本版承诺范围内(见设计文档推迟项)。
+    if dst.exists() {
+        return Ok(false);
+    }
     // **旁标必须先于目标落地**。反过来的话,建完 dst、还没写旁标就崩,会留下一个
     // 没有任何标记的空文件;下次恢复看它存在就返回"已存在"跳过,journal 随后被删,
     // 而这个空文件会被 sample_paths_existing 当成正经样本进 list_people 和重建
@@ -125,7 +133,10 @@ fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     let mut out = match opened {
         Ok(f) => f,
         Err(e) => {
-            let _ = std::fs::remove_file(&mark);
+            // 旁标删不掉就上抛:留着它会让下次恢复把这份(别人刚写好的)完整样本当
+            // 半成品清掉重写。
+            std::fs::remove_file(&mark)
+                .map_err(|e2| anyhow::anyhow!("清除半成品标记失败({}): {e2}", mark.display()))?;
             return match e.kind() {
                 std::io::ErrorKind::AlreadyExists => Ok(false),
                 _ => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),

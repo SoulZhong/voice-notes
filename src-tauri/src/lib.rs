@@ -1846,7 +1846,11 @@ fn spawn_session(
         lc.report(lifecycle::machine::Msg::AdoptWriter { writer: Box::new(writer) });
         // 说话人编号/质心延续 + 库种子注入：快照（续录）优先，库中同 person 不重复注入。
         // 库加载失败降级为无种子，绝不挡录制。
-        let seeds = load_voiceprint_seeds(&app);
+        //
+        // 种子门禁比对的是**本场开录时那份 speaker_model 快照**,与校验嵌入器用的是同一个。
+        // 这里若重读当前设置,开录期间切模型就会拿 A 的嵌入器去比 B 库的种子,而门禁看新
+        // 设置已经放行(codex review 实现轮六 P1)。
+        let seeds = load_voiceprint_seeds_for(&app, &speaker_model);
         let mut registry =
             crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
         // 说话人识别方法(设置项):与本场其余配置同一快照,场中改设置不影响进行中会话。
