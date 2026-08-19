@@ -74,6 +74,7 @@ export type Settings = {
   shortcut: string;
   // 系统托盘图标开关
   tray_enabled: boolean;
+  telemetry_enabled: boolean;
   // ASR Aing 开关
   refine_enabled: boolean;
   /** 资源层:在线模型档案(2026-08-11 执行体分层),可被多个 AI 功能引用。 */

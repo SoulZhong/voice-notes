@@ -53,6 +53,9 @@ ureq = "2"
 sha2 = "0.10"
 # UI 语言"跟随系统"的系统 locale 解析(零依赖小 crate,见 src/i18n.rs)。
 sys-locale = "0.3"
+# 系统名与真实系统版本(posthog-rs 已把它带进依赖树,直接用不增加体积)。
+# 为什么不靠 posthog-rs 自己注入 $os:见 telemetry.rs env_props 的说明。
+os_info = "3"
 base64 = "0.22"
 hex = "0.4"
 bzip2 = "0.5"

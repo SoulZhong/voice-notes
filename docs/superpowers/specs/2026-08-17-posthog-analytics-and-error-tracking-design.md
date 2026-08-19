@@ -197,3 +197,75 @@ refine(note-140751): 写入 /Users/张伟/Library/.../notes/季度复盘会.json
 - [会话回放隐私控制](https://posthog.com/docs/session-replay/privacy)
 - [Rust SDK](https://posthog.com/docs/libraries/rust) 与 [Rust 符号上传](https://posthog.com/docs/error-tracking/upload-source-maps/rust)
 - [异常捕获](https://posthog.com/docs/error-tracking/capture)
+
+## 2026-08-19 补齐:落地缺口一次收口
+
+接入后系统排查了一轮「承诺过但没落地 / 换供应商时丢掉 / 默认值倒在错误一侧 / 两端各写一套」四类缺口,统一修完。
+
+**换供应商时丢掉的**(Aptabase 插件自动带、PostHog 不会自动有):
+
+| 字段 | 处置 |
+|---|---|
+| `appVersion` | 补。两端在各自 before_send 注入 `$app_version`——**注入点必须是 before_send**,各调用点覆盖不到 SDK 自装 panic hook 发的事件,而"哪个版本开始崩"正是崩溃最该回答的问题 |
+| `osName` / `osVersion` | 补真值。posthog-js 从 UA 正则解析,而 WKWebView 的 UA 冻结在 `Mac OS X 10_15_7`、WebView2 冻结在 `Windows NT 10.0`(Win11 同样报 10.0)——看板上全部 mac 用户都会显示 10.15.7,而本应用的采集行为恰按 macOS 大版本分叉。改由后端 `os_info` 出唯一真值,前端经 `app_env` 取同一份盖掉 UA 那份 |
+| `locale` | 补(`sys_locale`,收敛成 BCP-47 形态) |
+| `isDebug` | 补。此前开发机流量与真实用户流量混在同一池且事后分不开——`internal_or_test_user_hostname` 因 Tauri 的 `tauri://localhost` 必须置 null,内外分流只剩这一条路 |
+| `engineName` / `sdkVersion` | 不补。posthog-js 的 `$browser`/`$lib` 已等价覆盖 |
+
+**承诺过但没落地的**:
+
+- **异常限流**。「限流与额度」写明按 fingerprint 每会话限流,此前只有一句注释。两端同值实现:同 fingerprint 5 条 + 全会话 50 条双闸。单条链路刷不满、多种错各刷几条合力打满,是 2026-08-13 断流风暴的真实形态,故两道都要。
+- **12 处标记点**。原只落 8 处,补齐采集链自愈重建、模型加载失败、AI 写回失败、迁移失败四类,并新增更新失败(前端经 `report_frontend_error` 白名单回后端上报——异常事件的形状只保留 Rust 一份实现)。
+- **三条漏斗的关键节点**。补 `permission_checked`(漏斗 1 的授权)、`transcript_ready`(漏斗 1 的首次拿到转写,带 local/cloud 与是否空转写)、`ai_configured`(漏斗 3 的配置成功,只在跨越那一次上报)。
+
+**默认值/框架行为倒在错误一侧的**:
+
+- **`app_started` 永远是 personless**。它在 `setup()` 里发,早于 webview 调 `set_analytics_id`;`Event::new_anon` 每次生成随机 distinct_id 并关掉 person profile,于是每次启动都是一个全新的匿名人——留存、DAU、漏斗 1 的第一步全部算不出来。改为**压队等 id**(上限 64 条,退出时仍等不到才以 personless 发出),仍不自造 id。
+- **硬崩溃完全不可见**。panic hook 只覆盖 Rust panic;whisper C++ 层的 SIGSEGV/SIGABRT、CoreAudio 崩溃、OOM 被杀、强退都不走它,且队列里没 flush 的事件一并消失——最严重的一类故障恰恰是唯一上报不到的。改为落"运行中"标记、下次启动回头看,补 `app_unclean_exit`;同一份标记顺带识别版本变化,补 `app_updated`。
+
+**两端各写一套导致的漂移**:
+
+- `redactEvent` 的栈帧 `filename`/`abs_path`/`module` 与 `$exception_panic_file` 在第二轮 codex review 时只修了 Rust 侧,TS 侧没跟上。
+- 路径终点判据两端根本不是同一套:Rust 逐字符判断"空格后是否还像路径",TS 用 `[^\n"',;)\]]*` 一路吃到行尾。两侧号称共用同一组测试向量,但暴露这处差异的那条向量恰好只在 Rust 侧有。已把 TS 改成同算法,并把缺的向量补进两侧。
+
+**隐私开关**。设计文档原把"设置页并无此项"当作既有缺陷、靠改文案解决;本次直接把开关补回来(`settings.telemetry_enabled`,默认开)。关掉后两端都不再发出任何事件——**包括 SDK 自装 panic hook 的**,拦在 before_send 里,那是唯一覆盖得到它的位置;前端则连 `posthog.init` 都不执行,而不是 init 之后再 opt-out(后者仍会加载录制器、仍受远端配置摆布)。欢迎页文案同步写回"可在设置中关闭"。
+
+**未做**:符号上传(`posthog-cli` + CI secret)。release 构建的 panic 堆栈仍是不可读的地址,「错误现场足以直接定位问题」这条目标只兑现了一半。需要新的 CI secret,单独一件事做。
+
+### codex review 后的三处口径变更
+
+- **总开关默认关**。`init()` 在 `run()` 开头装 panic hook,而设置要到 `setup()` 才读得到——默认开的话,中间那几毫秒里的 panic 会绕过一个明确关掉了上报的用户。默认关的代价是打开上报的用户丢掉这个窗口内的 panic;两边都会错的时候,错在不发的一侧。
+- **脱敏从"家目录路径"扩到"任何绝对路径"**。数据目录与模型目录可被用户指到任何地方(`/Volumes/客户名/…`、外置盘、网络盘),迁移失败与模型加载失败的消息里带的正是那些路径,而它们既不在家目录下、中文串又常短于整段丢弃的阈值,原方案会原样放行。家目录仍收成 `<HOME_PATH>`,其余收成 `<PATH>`;URL 显式排除(路由动态段一律是 id,且是定位前端异常现场的依据)。Windows 分支改为与 unix 分支共用同一套终点判据——此前它是"任何空格即终点",含空格的目录名会漏后半截。
+- **身份与压队同一把锁**。分成两把时,`track` 读到"无 id"之后、入队之前,另一线程可能刚好设上 id 并排空当时还空的队列,这条事件会一直滞留到退出。
+
+**已知未修**:`telemetry_session.json` 只有一份,多开时第二个实例会把仍在运行的第一个实例记成 unclean。close 侧已用 pid 守住(别人的标记不清),open 侧的误报需要跨平台进程存活探测。macOS 由 LaunchServices 天然单实例;Windows 多开会多出一条 `app_unclean_exit`,是看板噪音而非用户可见问题。
+
+### codex review 二轮:脱敏面再扩
+
+第一轮把"家目录路径"扩成"任何绝对路径"之后,二轮又指出三类仍然直接漏网的形态,都已补上:
+
+- `file:///Users/Alice/notes/周会.json`——通用扫描要求 `/` 前面不是 `:` 或 `/`(否则 `tauri://localhost/…` 会被吃掉),而 `file://` 三个斜杠连排,三个候选起点全被那条规则挡掉。单独一条规则处理,只认 `file:`;http(s) 是接口地址不是本机路径,留着有用。
+- UNC `\\server\share\客户\周会.json`——网络盘正是自定义数据目录最典型的落点之一。
+- `/Volumes/客户/季度 复盘`——目录名里的空格。原判据("空格后那个词像不像路径")对两个字的中文一律判否,而两个字远短于整段丢弃阈值。新增一条:**还没走到带扩展名的文件名就仍算在目录段里**,空格照吃;走到了(`…/x.json 写入失败`)就在空格处收尾,把措辞留给排查用。
+
+另外两处口径:`normalize_locale` 从"过滤非法字符"改成"整体形态校验"——洗一洗就放行等于给低基数维度留了自由文本口子(`ALICE_PRIVATE` 会被洗成 `ALICE-PRIVATE` 出站);前端 `telemetry_enabled` 的 IPC 失败兜底从 `true` 改成 `false`,前端 `beforeSend` 只看本地 `optedOut`、不经过 Rust 那道默认关的总闸,兜底成开等于一次瞬时 IPC 失败就能让关掉遥测的用户照样出站。
+
+### codex review 三轮:边界与额度
+
+- **冒号边界**。为躲开 `tauri://localhost/…` 而排除"`/` 前面是冒号",连带放过了 `C:/Users/Alice/…`(正斜杠写法的盘符路径)与 `copy:/Volumes/客户/…` 这类"标签:路径"。改为只把 `://` 当 scheme。
+- **目录段空格规则封顶**。不封顶的话 `copy /Volumes/客户/季度 复盘 failed because disk full` 会被整条吞成 `copy <PATH>`——路径是脱干净了,可排查线索一起没了。上限 1 个空格,够覆盖"两词目录名";三词以上的目录名中间那些词含 `/`,由原判据接住,不占额度。
+- **两处两端不等价**:TS 的 `split(/\s/)` 在连续空格处得到空串,会比 Rust 的 `split_whitespace` 提前收尾、漏出文件名;TS 的 `file://` 用小写串索引切原串,而 `toLowerCase` 可能扩展字符(`İ → i̇`)导致偏移。两处都已改成与 Rust 同语义,并各补一条向量。
+- **异常额度改为一小时滚动窗口**。原实现是进程级计数、从不重置,而本应用常驻托盘一开好几天——攒满 50 条之后剩下的整个生命周期都发不出任何异常,等于攒够一次就永久失明。设计文档写的是"每会话",滚动窗口是它可实现的近似:最坏单机 50 条/小时,量级仍远低于免费档 10 万/月。
+
+### codex review 四轮:前瞻判据取代纯额度
+
+三轮为防"整段消息被吞"给目录段空格规则封了 1 个额度,结果四词以上的文件名(`weekly product roadmap review.json`)会从第二个空格处漏出后半截——修一个引入另一个。改成两层:
+
+1. **有硬证据就无条件继续**:硬终点之前若还有含分隔符或带扩展名的词,说明这是个多词文件名,整段都还在路径里,不扣额度。
+2. **没证据才用额度**:仍在目录段(当前段没有扩展名)时让一个空格,覆盖"两词目录名";用完即收尾。
+
+这样 `…/weekly product roadmap review.json failed` 整条脱掉且保留 `failed`,`…/季度 复盘 failed because disk full` 只脱掉目录名、保留整句措辞。
+
+另外三处:Rust 的 UNC 检测只看第一对反斜杠,Debug/JSON 形态的 `\\\\server\\share\\…` 会当场判否并放弃搜索(TS 的正则会继续往后走,两端因此不等价),改为 `match_indices` 继续找;关掉遥测后再打开,必须显式 `startSessionRecording()`——`stopSessionRecording` 会把配置里的 `disable_session_recording` 永久置 true,只 `opt_in_capturing` 的话回放要重启应用才回来。
+
+**已知残留**:关掉遥测的那一刻,几秒前在还开着时捕获、仍排在 posthog-js 发送队列里的事件可能照样送达——SDK 没有公开的清队列接口。新捕获的一律被 `beforeSend` 拦下(它先于入队执行),所以残留有界,只涉及关掉之前已经采集到的数据。对用户的口径是"关掉后不再采集"。

@@ -184,6 +184,10 @@ export const zh = {
   "settings.section.advanced": "高级",
   "settings.section.advancedDesc": "低频/进阶选项:乱码过滤、自动认出说话人",
 
+  // —— 隐私 ——
+  "settings.privacy.label": "匿名使用统计与错误报告",
+  "settings.privacy.desc": "帮助定位崩溃与卡顿。只发功能使用次数、版本、系统与出错位置,不含会议内容",
+
   // —— 关于 / 更新 ——
   "settings.section.about": "关于",
   "settings.about.version": "当前版本 v{v}",
@@ -375,6 +379,9 @@ export const en = {
 
   "settings.section.advanced": "Advanced",
   "settings.section.advancedDesc": "Low-frequency/advanced options: garbled text filter, auto-identify speakers",
+
+  "settings.privacy.label": "Anonymous usage stats and error reports",
+  "settings.privacy.desc": "Helps track down crashes and hangs. Sends feature usage counts, version, OS, and where errors happen — never meeting content",
 
   "settings.section.about": "About",
   "settings.about.version": "Current version v{v}",

@@ -202,6 +202,10 @@ pub struct Settings {
     pub shortcut: String,
     /// 系统托盘图标开关,消费任务:托盘;默认开启。
     pub tray_enabled: bool,
+    /// 匿名使用统计与错误上报开关;默认开启。关掉之后两端都不再发出任何事件——
+    /// 包括 SDK 自装的 panic hook(拦在 telemetry::before_send 里,那是唯一覆盖得到
+    /// 它的位置)。欢迎页文案承诺了这个开关的存在,别把它删掉又不改文案。
+    pub telemetry_enabled: bool,
     /// 会后 LLM Aing 总开关(A2)。默认关,配好执行体后由用户打开。
     pub refine_enabled: bool,
     /// 资源层:在线模型档案(2026-08-11 执行体分层设计)。可被多个 AI 功能引用,
@@ -300,6 +304,8 @@ struct SettingsRepr {
     shortcut: String,
     #[serde(default = "default_true")]
     tray_enabled: bool,
+    #[serde(default = "default_true")]
+    telemetry_enabled: bool,
     #[serde(default)]
     refine_enabled: bool,
     // —— 新键(2026-08-11 执行体分层) ——
@@ -413,6 +419,7 @@ impl From<SettingsRepr> for Settings {
             shortcut_enabled: r.shortcut_enabled,
             shortcut: r.shortcut,
             tray_enabled: r.tray_enabled,
+            telemetry_enabled: r.telemetry_enabled,
             refine_enabled: r.refine_enabled,
             llm_profiles,
             agent_profiles,
@@ -564,6 +571,7 @@ impl Default for Settings {
             shortcut_enabled: false,
             shortcut: default_shortcut(),
             tray_enabled: true,
+            telemetry_enabled: true,
             refine_enabled: false,
             llm_profiles: Vec::new(),
             agent_profiles: Vec::new(),

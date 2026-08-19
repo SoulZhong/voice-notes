@@ -38,6 +38,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { checkUpdate, applyUpdate, type UpdateInfo } from "$lib/update";
   import Segmented from "$lib/Segmented.svelte";
+  import { applyTelemetrySetting, reportError } from "$lib/analytics";
   import type { SegmentedItem } from "$lib/segmented";
 
   let settings = $state<Settings | null>(null);
@@ -105,6 +106,10 @@
     } catch (e) {
       updateError = t("settings.update.oneClickFailed", { e });
       updateFallback = true;
+      // 更新装不上是本机日志之外无人知晓、又直接卡住所有后续修复的那类故障:
+      // 用户停在旧版本上,之后修的每个 bug 都到不了他手里。
+      // detail 是上报载荷、不是界面文案,固定英文:看板上不该按 UI 语言劈成两种写法。
+      reportError("update_failed", `one-click update failed: ${e}`);
     } finally {
       updating = false;
     }
@@ -163,6 +168,9 @@
   /** 系统区:全局快捷键开关 / 菜单栏常驻 / 开机自启(自启为系统真值,非 settings)。 */
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
+  let telemetryEnabled = $state(true);
+  /** 保存中禁用开关:快速连点会让先到的请求把后到的意图覆盖掉。 */
+  let telemetrySaving = $state(false);
   let autostartEnabled = $state(false);
   /** 快捷键录入框聚焦态:聚焦时清空显示并提示「按下组合键…」。 */
   let capturingShortcut = $state(false);
@@ -304,6 +312,7 @@
     identifyAuto = s.identify_auto_apply;
     shortcutEnabled = s.shortcut_enabled;
     trayEnabled = s.tray_enabled;
+    telemetryEnabled = s.telemetry_enabled;
     asrMode = s.asr_mode === "cloud" || s.asr_mode === "local_cloud" ? s.asr_mode : "local";
     cloudProvider = s.cloud_asr_provider === "aliyun" ? "aliyun" : "volcano";
     volcAppKey = s.volc_app_key;
@@ -814,6 +823,40 @@
           bind:checked={trayEnabled}
           disabled={!settings}
           onchange={() => saveSetting((s) => (s.tray_enabled = trayEnabled))}
+        />
+      </label>
+      <!-- 隐私:欢迎页文案承诺了这个开关的存在(shell.welcome.telemetryHint),
+           删它就得同步改文案——上一版正是因为开关被移除而留下了一句假承诺。 -->
+      <label class="row">
+        <div class="row-info">
+          <span class="row-label">{t("settings.privacy.label")}</span>
+          <span class="row-desc">{t("settings.privacy.desc")}</span>
+        </div>
+        <input
+          type="checkbox"
+          class="ctl switch"
+          bind:checked={telemetryEnabled}
+          disabled={!settings || telemetrySaving}
+          onchange={async () => {
+            // desired 当场定格,后面一律用它:saveSetting 内部会 syncLocalFromSettings,
+            // 把 telemetryEnabled 改回磁盘真值,再读共享变量就读到了别人的值
+            // (codex review 二轮 P1#2)。同时保存期间禁用控件,不给快速连点留窗口。
+            const desired = telemetryEnabled;
+            telemetrySaving = true;
+            try {
+              // 两个方向刻意不对称,都倒向"不发"那一侧:
+              // 关掉 → 先当场停再落盘。落盘失败也已经停了,回放尤其不能等下次启动。
+              // 打开 → 先落盘再起。抢跑的话 start() 去问后端总开关读到的还是旧值
+              //        (false),刚打开的开关当场被关回去。
+              if (!desired) applyTelemetrySetting(false);
+              await saveSetting((s) => (s.telemetry_enabled = desired));
+              // 落盘失败时 saveSetting 已把 telemetryEnabled 同步回磁盘真值,
+              // 按真值决定起不起,别按用户那次没存住的意图。
+              applyTelemetrySetting(telemetryEnabled);
+            } finally {
+              telemetrySaving = false;
+            }
+          }}
         />
       </label>
     </div>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyticsConfig, ensureDistinctId } from "./analytics";
+import { analyticsConfig, beforeSend, ensureDistinctId, stampEnv } from "./analytics";
 
 /** 配置形状锁定。规格对齐后端的 payload_shape_locked:改动必须先改测试,
  *  强制走一次隐私红线审视。
@@ -84,5 +84,80 @@ describe("ensureDistinctId(匿名 id 只生成一次)", () => {
     const s = memStore();
     s.setItem("vn_analytics_id", "existing-id");
     expect(ensureDistinctId(s)).toBe("existing-id");
+  });
+});
+
+describe("stampEnv(环境属性:两端同一份值)", () => {
+  const env = {
+    app_version: "0.12.0",
+    os: "macOS",
+    os_version: "15.6.1",
+    arch: "aarch64",
+    locale: "zh-CN",
+    is_debug: false,
+  };
+
+  it("盖掉 posthog-js 那份被 UA 冻结的系统版本", () => {
+    // WKWebView 的 UA 自 macOS 11 起冻结在 Mac OS X 10_15_7,posthog-js 就是从
+    // 这条 UA 正则解析出 $os_version 的 —— 不盖掉,看板上所有 mac 用户都是 10.15.7,
+    // 而本应用的采集行为恰恰按 macOS 大版本分叉。
+    const props: Record<string, unknown> = { $os: "Mac OS X", $os_version: "10.15.7" };
+    stampEnv(props, env);
+    expect(props.$os_version).toBe("15.6.1");
+    expect(props.$os).toBe("macOS");
+  });
+
+  it("补上 posthog-js 压根不知道的应用版本与架构", () => {
+    const props: Record<string, unknown> = {};
+    stampEnv(props, env);
+    expect(props.$app_version).toBe("0.12.0");
+    expect(props.app_arch).toBe("aarch64");
+    expect(props.app_locale).toBe("zh-CN");
+    expect(props.app_is_debug).toBe(false);
+  });
+
+  it("环境还没取到时原样放过,绝不写 undefined 进属性", () => {
+    const props: Record<string, unknown> = { $os_version: "10.15.7" };
+    stampEnv(props, null);
+    expect(props.$app_version).toBeUndefined();
+    expect(props.$os_version).toBe("10.15.7");
+  });
+});
+
+describe("beforeSend(出站唯一关卡)", () => {
+  function exception(fingerprint: string, value = "boom") {
+    return {
+      event: "$exception",
+      properties: {
+        $exception_fingerprint: fingerprint,
+        $exception_list: [{ type: "Error", value }],
+      },
+    };
+  }
+
+  it("同 fingerprint 超过上限即丢弃——断流风暴一场会议就能打满月额度", () => {
+    // 设计文档「限流与额度」要求的,此前两端都只有注释没有实现。
+    for (let i = 0; i < 5; i++) {
+      expect(beforeSend(exception("gap_storm"))).not.toBeNull();
+    }
+    expect(beforeSend(exception("gap_storm"))).toBeNull();
+    // 别的 fingerprint 不受连累
+    expect(beforeSend(exception("other_kind"))).not.toBeNull();
+  });
+
+  it("普通事件绝不丢,且顺带脱敏", () => {
+    const out = beforeSend({
+      event: "$pageview",
+      properties: { $current_url: "tauri://localhost/notes/note-1", msg: "写入 /Users/张伟/x.json 失败" },
+    });
+    expect(out).not.toBeNull();
+    expect(out?.properties.$current_url).toBe("tauri://localhost/notes/note-1");
+  });
+
+  it("异常事件的内容照样脱敏,而不是因为限流放过", () => {
+    const out = beforeSend(exception("redact_probe", "写入 /Users/张伟/notes/季度复盘会.json 失败"));
+    const v = (out?.properties.$exception_list as Array<{ value: string }>)[0].value;
+    expect(v).not.toContain("张伟");
+    expect(v).not.toContain("季度复盘会");
   });
 });

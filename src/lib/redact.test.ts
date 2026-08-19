@@ -19,6 +19,20 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(out).not.toContain("周会");
   });
 
+  it("含空格的笔记文件名整条脱掉,尾部措辞保留", () => {
+    // 这条向量此前只在 Rust 侧有。两边行为其实不同:TS 那条正则会一路吃到行尾,
+    // 把 "failed" 也吞掉——号称共用的一组向量,漏掉的恰恰是能暴露漂移的那条。
+    const out = redact("write /Users/Alice/Library/voice-notes/notes/Q3 roadmap.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("Alice");
+    expect(out).toContain("failed");
+  });
+
+  it("家目录路径两种形态都收敛", () => {
+    expect(redact("open /Users/zhangwei/notes/x.json failed")).not.toContain("zhangwei");
+    expect(redact("open /home/lisi/notes/y.json failed")).not.toContain("lisi");
+  });
+
   it("长中文串整段丢弃而非截断", () => {
     const out = redact("parse failed: 这段话是会议逐字稿的一部分不应该被上报出去");
     expect(out).not.toContain("会议逐字稿");
@@ -32,6 +46,90 @@ describe("redact(与 Rust 侧同规则)", () => {
 
   it("密钥形态被抹掉(含带前缀的形态)", () => {
     expect(redact("key=sk-abcdefghijklmnop failed")).not.toContain("sk-abcdefghijklmnop");
+  });
+
+  it("家目录之外的绝对路径同样收敛", () => {
+    // 数据目录可被指到任何地方,这类路径里的中文串常短于整段丢弃阈值。
+    const out = redact("迁移失败: 复制 /Volumes/客户名/季度复盘/note.json 失败");
+    expect(out).not.toContain("客户名");
+    expect(out).not.toContain("季度复盘");
+    expect(out).toContain("<PATH>");
+  });
+
+  it("Windows 非家目录的绝对路径同样收敛", () => {
+    const out = redact("migrate failed: D:\\客户\\周会.json unreachable");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
+  it("Windows 含空格的路径不漏后半截", () => {
+    const out = redact("write C:\\Users\\Alice\\Meeting Notes\\Q3 roadmap.json failed");
+    expect(out).not.toContain("Meeting");
+    expect(out).not.toContain("roadmap");
+    expect(out).toContain("failed");
+  });
+
+  it("file 协议路径同样收敛", () => {
+    const out = redact("load failed: file:///Users/Alice/notes/周会.json");
+    expect(out).not.toContain("Alice");
+    expect(out).not.toContain("周会");
+  });
+
+  it("UNC 网络路径同样收敛", () => {
+    const out = redact("migrate failed: \\\\server\\share\\客户\\周会.json");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
+  it("无扩展名目录里的空格不截断路径", () => {
+    const out = redact("copy /Volumes/客户/季度 复盘 failed");
+    expect(out).not.toContain("复盘");
+  });
+
+  it("文件名之后的措辞保留", () => {
+    const out = redact("write /Users/Alice/notes/x.json 写入失败");
+    expect(out).toContain("写入失败");
+    expect(out).not.toContain("Alice");
+  });
+
+  it("冒号后的路径不被当成 URL 放过", () => {
+    const out = redact("copy C:/Users/Alice/notes/周会.json failed");
+    expect(out).not.toContain("Alice");
+    expect(out).not.toContain("周会");
+    expect(redact("copy:/Volumes/客户/季度复盘/x.json")).not.toContain("客户");
+  });
+
+  it("目录段空格规则不吞掉整段消息", () => {
+    const out = redact("copy /Volumes/客户/季度 复盘 failed because disk full");
+    expect(out).not.toContain("复盘");
+    expect(out).toContain("failed");
+    expect(out).toContain("disk full");
+  });
+
+  it("连续空格处与 Rust 同判据", () => {
+    // split(/\s/) 在连续空格处得到空串,会让 TS 提前收尾、漏出文件名
+    const out = redact("write /Users/Alice/notes/Q3.v1  roadmap.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("Alice");
+  });
+
+  it("多词文件名整条脱掉", () => {
+    const out = redact("write /Users/Alice/notes/weekly product roadmap review.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("review");
+    expect(out).not.toContain("Alice");
+    expect(out).toContain("failed");
+  });
+
+  it("转义形态的 UNC 同样收敛", () => {
+    const out = redact("migrate failed: \\\\\\\\server\\\\share\\\\客户\\\\周会.json");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
+  it("URL 不被当成路径误伤", () => {
+    const clean = "load failed at tauri://localhost/notes/note-140751";
+    expect(redact(clean)).toBe(clean);
   });
 
   it("无敏感内容时原样通过", () => {
@@ -63,6 +161,32 @@ describe("redactEvent(before_send 钩子)", () => {
     const ev = { event: "$exception", properties: { $exception_message: "boom" } };
     expect(redactEvent(ev)).not.toBeNull();
     expect(redactEvent(null)).toBeNull();
+  });
+
+  it("栈帧里的路径一起脱掉——Rust 侧修过,TS 侧此前没跟上", () => {
+    const ev = {
+      event: "$exception",
+      properties: {
+        $exception_list: [
+          {
+            type: "Error",
+            value: "boom",
+            stacktrace: { frames: [{ filename: "/Users/张伟/voice-notes/src/x.ts" }] },
+          },
+        ],
+        $exception_panic_file: "/Users/张伟/voice-notes/src/y.rs",
+      },
+    };
+    const dumped = JSON.stringify(redactEvent(ev).properties);
+    expect(dumped).not.toContain("张伟");
+  });
+
+  it("认不出的 stacktrace 结构原样放过而不是丢事件", () => {
+    const ev = {
+      event: "$exception",
+      properties: { $exception_list: [{ type: "Error", value: "boom", stacktrace: "字符串形态" }] },
+    };
+    expect(redactEvent(ev)).not.toBeNull();
   });
 
   it("非异常事件原样通过", () => {
