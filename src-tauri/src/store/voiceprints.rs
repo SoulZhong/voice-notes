@@ -425,7 +425,8 @@ impl VoiceprintStore {
     /// 进自动合并拒绝名单(同样的自动判断不犯第二次,重启也不犯)、由本次被撤销
     /// 合并所失效的旧条目复活(LIFO 链式撤销)。条目已失效 → Err 带原因。
     /// 库记录恢复为硬要求;样本文件 best-effort(与 merge 同哲学:库结构一致性优先)。
-    pub fn undo_merge(&self, journal_id: &str) -> anyhow::Result<()> {
+    /// 返回是否需要一次重建(质心因跨空间被置空)。调用方须**在释放锁之后**发起。
+    pub fn undo_merge(&self, journal_id: &str) -> anyhow::Result<bool> {
         let _guard = vp_guard();
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         let entry = journal.entry(journal_id)?;
@@ -463,14 +464,18 @@ impl VoiceprintStore {
                 }
             }
         }
+        // **样本恢复是硬条件**(与 restore_merged_person 同):上面刚把双方现存样本
+        // 全清了,而质心可能因跨空间被置空——此刻样本是唯一的恢复依据。失败就保留
+        // journal 不删,留着让用户重试;删了就永久销毁依据(codex review 实现轮 P1)。
         if let Err(e) = journal.restore_samples(journal_id, &self.root.join("voiceprints")) {
-            eprintln!("撤销合并:样本副本还原失败(不影响库): {e}");
+            eprintln!("撤销合并:样本还原失败,保留日志条目以便重试: {e}");
+            return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
         // remove 失败则 revive 不执行:重试撤销幂等,链上条目只是暂失撤销入口。
         journal.remove(journal_id)?;
         journal.revive_invalidated_by(journal_id);
-        Ok(())
+        Ok(needs_rebuild)
     }
 
     /// 从失效日志条目拆回被并入方:按快照把 loser 重建为原编号独立说话人,还原
@@ -500,7 +505,20 @@ impl VoiceprintStore {
             // 覆盖掉重建后可能已发生的新变化)。所以这一分支只补做收尾
             // (deny_auto + remove),不碰 vp / 样本——与 undo_merge 「remove
             // 失败则重试幂等」的承诺保持一致。
-            eprintln!("拆回说话人:{} 已在库中,视为上次拆回的重试(仅补做收尾)", entry.loser);
+            eprintln!("拆回说话人:{} 已在库中,视为上次拆回的重试", entry.loser);
+            // **重试必须继续补样本**:上一次正是卡在样本这一步才留下条目。跳过它、
+            // 直接删条目 = 永久销毁恢复依据,而质心可能已被置空(codex review 实现轮 P1)。
+            // restore_loser_samples 只补缺失、不覆盖既有,重试幂等。
+            if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+                eprintln!("拆回说话人(重试):样本还原仍失败,继续保留日志条目: {e}");
+                return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
+            }
+            // 库里那位可能是上次拆回时按旧空间快照写回去的:质心若为空,说明当时被
+            // 净化过(或本就无质心),这次仍要报"需要重建",否则他永远长不回来。
+            needs_rebuild = vp
+                .people
+                .get(&entry.loser)
+                .is_some_and(|p| p.centroids.is_empty() && p.session_centroids.is_empty());
         } else {
             let mut loser_person = entry.loser_person.clone();
             let cleared = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);

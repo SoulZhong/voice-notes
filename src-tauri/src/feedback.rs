@@ -129,6 +129,24 @@ pub enum SegFilter {
     Seqs(BTreeSet<u64>),
 }
 
+/// 回灌的结局 + 是否需要一次重建。
+///
+/// needs_rebuild 来自**纠错还原**:上一次灌错了人、这次还原它时发现那份快照来自
+/// 另一个模型空间,于是质心被置空——那个人从此没有声纹,必须靠一次重建从样本长回来。
+/// 早先这里只打日志,理由写的是"下次启动自愈会兜住",但那是错的:还原不改库标签,
+/// 自愈的判据永远不成立(codex review 实现轮 P1)。
+#[derive(Debug, PartialEq)]
+pub struct ReinforceOutcome {
+    pub result: ReinforceResult,
+    pub needs_rebuild: bool,
+}
+
+impl ReinforceOutcome {
+    fn of(result: ReinforceResult) -> Self {
+        Self { result, needs_rebuild: false }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ReinforceResult {
     /// source -> 实际嵌入段数。
@@ -175,7 +193,7 @@ fn undo_entry(
     let mut ledger = load_ledger(note_dir);
     // 不限作用域找:op_id 自己就是身份,找到之后还要比对它,不存在跨作用域错撤的风险;
     // 而调用方并不知道当初是用哪种过滤器记的账(实测既有 Speakers 也有 Seqs)。
-    let Some(key) = find_entry_key_any_scope(&ledger, seqs) else {
+    let Some(key) = find_entry_key_any_scope(&ledger, seqs, op_id) else {
         return Ok(UndoOutcome::NoEntry);
     };
     let Some(entry) = ledger.entries.get(&key) else {
@@ -310,13 +328,28 @@ fn find_entry_key(ledger: &FeedbackLedger, scope: &str, seqs: &BTreeSet<u64>) ->
 /// 不限作用域地按段集合找条目。**只给按 op_id 撤销的路径用**:op_id 本身就是强身份,
 /// 找到之后还要比对它,不存在跨作用域错撤的风险;而那条路径的调用方并不知道当初
 /// 是用哪种过滤器记的账(实测既有 Speakers 也有 Seqs)。
-fn find_entry_key_any_scope(ledger: &FeedbackLedger, seqs: &BTreeSet<u64>) -> Option<String> {
+fn find_entry_key_any_scope(
+    ledger: &FeedbackLedger,
+    seqs: &BTreeSet<u64>,
+    op_id: &str,
+) -> Option<String> {
     let fp = seq_fingerprint(seqs);
-    if ledger.entries.contains_key(&fp) {
-        return Some(fp); // 旧账(裸指纹键)
-    }
     let suffix = format!("|{fp}");
-    ledger.entries.keys().find(|k| k.ends_with(&suffix)).cloned()
+    let matches_fp = |k: &String| *k == fp || k.ends_with(&suffix);
+    // **必须按 op_id 挑,不能只取第一个同指纹的**:同一批 seq 可能同时存在多个作用域
+    // 的条目(原始稿说话人与修订稿重聚类标签),先撞上别人那条就会误报 superseded,
+    // 而正确的那条还好端端在账本里(codex review 实现轮 P1)。
+    if let Some(k) = ledger
+        .entries
+        .iter()
+        .find(|(k, e)| matches_fp(k) && e.op_id.as_deref() == Some(op_id))
+        .map(|(k, _)| k.clone())
+    {
+        return Some(k);
+    }
+    // 没有 op_id 对得上的:退回"任意同指纹",让下面的 op_id 比对如实报 superseded
+    // (而不是报 NoEntry——账是有的,只是不是这次 op 写的)。
+    ledger.entries.keys().find(|k| matches_fp(k)).cloned()
 }
 
 pub(crate) fn seq_fingerprint(seqs: &BTreeSet<u64>) -> String {
@@ -356,10 +389,10 @@ pub fn reinforce_person(
     embedder: &mut dyn SpeakerEmbedder,
     now: &str,
     op_id: Option<&str>,
-) -> anyhow::Result<ReinforceResult> {
+) -> anyhow::Result<ReinforceOutcome> {
     // 门禁:与种子注入同一严格语义(lib.rs 模型门禁)。
     if library_model != expected_model {
-        return Ok(ReinforceResult::SkippedModelMismatch);
+        return Ok(ReinforceOutcome::of(ReinforceResult::SkippedModelMismatch));
     }
     let wanted: Vec<&SegmentRecord> = segs
         .iter()
@@ -369,17 +402,20 @@ pub fn reinforce_person(
         })
         .collect();
     if wanted.is_empty() {
-        return Ok(ReinforceResult::SkippedNoSegments);
+        return Ok(ReinforceOutcome::of(ReinforceResult::SkippedNoSegments));
     }
     {
         // 悬空人物在解码/嵌入之前就短路:嵌入白做还会污染账本。
         let lib = vp.load();
         if crate::store::VoiceprintStore::resolve(&lib, person_id).is_none() {
-            return Ok(ReinforceResult::SkippedUnknownPerson);
+            return Ok(ReinforceOutcome::of(ReinforceResult::SkippedUnknownPerson));
         }
     }
 
     let seq_set: BTreeSet<u64> = wanted.iter().map(|s| s.seq).collect();
+    // 纠错还原若把旧人物的质心清空了(快照来自另一空间),调用方必须排一次重建
+    // ——还原不改库标签,启动自愈的判据永远不成立,不排就永远长不回来。
+    let mut correction_needs_rebuild = false;
     let scope_tag = filter.scope_tag();
     let key = ledger_key(&scope_tag, &seq_set);
     let mut ledger = load_ledger(note_dir);
@@ -387,17 +423,20 @@ pub fn reinforce_person(
     let probe = find_entry_key(&ledger, &scope_tag, &seq_set).unwrap_or_else(|| key.clone());
     if let Some(prev) = ledger.entries.get(&probe) {
         if prev.person_id == person_id {
-            return Ok(ReinforceResult::SkippedAlreadyDone);
+            return Ok(ReinforceOutcome::of(ReinforceResult::SkippedAlreadyDone));
         }
         // 纠错:上一次灌错了人。未被动过就还原;动过则宁留污染不覆盖新信息。
         match vp.restore_feedback(&prev.person_id, &prev.before, &prev.after, &prev.embedding_model) {
             Ok(crate::store::RestoreOutcome::Restored) => {
                 eprintln!("feedback: 已还原 {} 的上次回灌(纠错)", prev.person_id)
             }
-            Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => eprintln!(
-                "feedback: 已还原 {} 的上次回灌,但快照来自另一空间,质心已置空待重建",
-                prev.person_id
-            ),
+            Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => {
+                eprintln!(
+                    "feedback: 已还原 {} 的上次回灌,但快照来自另一空间,质心已置空,需重建",
+                    prev.person_id
+                );
+                correction_needs_rebuild = true;
+            }
             Ok(crate::store::RestoreOutcome::Skipped) => {
                 eprintln!("feedback: {} 已被其它写动过,跳过还原", prev.person_id)
             }
@@ -425,7 +464,7 @@ pub fn reinforce_person(
 
     let stats = build_source_stats(&wanted, &pcm_by_source, embedder);
     if stats.is_empty() {
-        return Ok(ReinforceResult::SkippedNoSegments);
+        return Ok(ReinforceOutcome::of(ReinforceResult::SkippedNoSegments));
     }
     let tuples: Vec<(String, Vec<f32>, u64, u64)> = stats
         .iter()
@@ -454,8 +493,12 @@ pub fn reinforce_person(
         // "已经回灌过",此后永不重试(codex review 二轮 P2)。
         let mut cleanup = load_ledger(note_dir);
         cleanup.entries.remove(&key);
-        let _ = save_ledger(note_dir, &cleanup);
-        return Ok(ReinforceResult::SkippedModelMismatch);
+        // 清理失败必须上抛:留着 complete=false 的占位条目,下次同人物回灌会在检查
+        // complete 之前就返回 SkippedAlreadyDone,这个 scope 从此永久封死
+        // (codex review 实现轮 P2)。报成正常的 mismatch skip 等于把它藏起来。
+        save_ledger(note_dir, &cleanup)
+            .map_err(|e| anyhow::anyhow!("空间不符且占位账清理失败(该 scope 会被永久封死): {e}"))?;
+        return Ok(ReinforceOutcome::of(ReinforceResult::SkippedModelMismatch));
     };
     if let Some(entry) = ledger.entries.get_mut(&key) {
         entry.before = applied.person_before.clone();
@@ -475,15 +518,46 @@ pub fn reinforce_person(
         let _ = save_ledger(note_dir, &cleanup);
         anyhow::bail!("账本回填失败,已回滚: {e}");
     }
-    Ok(ReinforceResult::Applied {
+    Ok(ReinforceOutcome { result: ReinforceResult::Applied {
         per_source: stats.iter().map(|(s, st)| (s.clone(), st.count)).collect(),
-    })
+    }, needs_rebuild: correction_needs_rebuild })
 }
 
 #[cfg(test)]
 mod tests {
     /// 测试库的默认模型标签。向量空间门禁按它比对,测试里恒相符。
     const MODEL: &str = "campplus";
+
+    /// 同一批 seq 可能同时存在多个作用域的条目(原始稿说话人 / 修订稿重聚类标签)。
+    /// 按 op_id 撤销时若只取"第一个同指纹键",会先撞上别人那条并误报 superseded,
+    /// 而正确的那条还好端端在账本里(codex review 实现轮 P1)。
+    #[test]
+    fn 撤销按op_id挑条目而不是撞上第一个同指纹的() {
+        let note = tempfile::tempdir().unwrap();
+        write_wav(&note.path().join("mic.wav"), 4000);
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
+        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
+        let model = store.load().embedding_model.clone();
+
+        // 先写一条别的作用域、别的 op 的账(同一批 seq)
+        let other = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let mut e1 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &other, &pid, &store, &model, &model, &mut e1, "t1", Some("iop-other"))
+            .unwrap();
+        // 再写我们要撤的那条
+        let mine = SegFilter::Seqs(seqs.clone());
+        let mut e2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
+        reinforce_person(note.path(), &segs, &mine, &pid, &store, &model, &model, &mut e2, "t2", Some("iop-mine"))
+            .unwrap();
+
+        // 必须撤到 iop-mine 那条,而不是被 iop-other 挡住报 superseded
+        assert_eq!(
+            undo_reinforce_op(note.path(), &seqs, &pid, "iop-mine", &store).unwrap(),
+            UndoOutcome::Restored
+        );
+    }
 
     use super::*;
     use crate::diar::MockEmbedder;
@@ -638,12 +712,12 @@ mod tests {
 
         let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
         let r1 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None).unwrap();
-        assert!(matches!(r1, ReinforceResult::Applied { .. }), "{r1:?}");
+        assert!(matches!(r1.result, ReinforceResult::Applied { .. }), "{r1:?}");
         let total_after_first = store.load().people[&pid].total_ms;
 
         let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
         let r2 = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb2, "t2", None).unwrap();
-        assert_eq!(r2, ReinforceResult::SkippedAlreadyDone, "同段集合同人重复指认不得重复加权");
+        assert_eq!(r2.result, ReinforceResult::SkippedAlreadyDone, "同段集合同人重复指认不得重复加权");
         assert_eq!(store.load().people[&pid].total_ms, total_after_first);
     }
 
@@ -684,7 +758,7 @@ mod tests {
         // 纠错:同段集合改指 B → A 的上次回灌应被还原(未被动过),B 获得回灌。
         let mut emb2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
         let r = reinforce_person(note.path(), &segs, &filter, &pid_b, &store, &model, &model, &mut emb2, "t2", None).unwrap();
-        assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
+        assert!(matches!(r.result, ReinforceResult::Applied { .. }), "{r:?}");
         assert_eq!(store.load().people[&pid_a].total_ms, 12_000, "A 的回灌应还原");
         assert!(store.load().people[&pid_b].total_ms > 12_000, "B 获得回灌");
     }
@@ -700,12 +774,12 @@ mod tests {
         // 门禁:严格相等,库侧默认模型 vs 期望 "eres2netv2" → 跳过。
         let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, "campplus", "eres2netv2", &mut emb, "t", None)
             .unwrap();
-        assert_eq!(r, ReinforceResult::SkippedModelMismatch);
+        assert_eq!(r.result, ReinforceResult::SkippedModelMismatch);
         // 悬空人物:在解码/嵌入之前就短路。
         write_wav(&note.path().join("mic.wav"), 2000);
         let model = store.load().embedding_model.clone();
         let r2 = reinforce_person(note.path(), &segs, &filter, "P999", &store, &model, &model, &mut emb, "t", None).unwrap();
-        assert_eq!(r2, ReinforceResult::SkippedUnknownPerson);
+        assert_eq!(r2.result, ReinforceResult::SkippedUnknownPerson);
     }
     #[test]
     fn plan_action_dispatches_by_prior_state() {

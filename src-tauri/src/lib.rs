@@ -83,6 +83,12 @@ struct ActiveSession {
     system_audio: String,
     /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
     diarization: String,
+    /// **本场开录时那一份设置快照里的声纹模型**。归还嵌入器时用它重贴标签。
+    ///
+    /// 为什么不能在归还时现读设置:`running` 早在 `handle.stop()` 之前就被置回 false,
+    /// 停录排干期间允许 `set_settings` 切模型——现读就会把 A 建的实例标成 B,下一场
+    /// 核对通过、用 A 算出整场向量却以 B 写库(codex review 实现轮 P1)。
+    speaker_model: String,
     /// 计时：会话入槽时刻、续录基线、暂停起点（Some=暂停中）、已累计暂停时长。
     started: std::time::Instant,
     base_ms: u64,
@@ -2216,6 +2222,7 @@ fn spawn_session(
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
+                    speaker_model: speaker_model.clone(),
                     started: std::time::Instant::now(),
                     base_ms,
                     paused_at: None,
@@ -2465,9 +2472,12 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
         s.paused_at.map(|p| p.elapsed()),
         0,
     );
+    // 标签取自**本场开录时**那一份快照,不是现读设置:running 早在 stop() 之前就置回
+    // false,排干期间允许切模型,现读会把 A 建的实例标成 B(codex review 实现轮 P1)。
+    let session_model = s.speaker_model.clone();
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
-    stash_model(&state.embedder_cache, retag(&current_speaker_model(app), embedder));
+    stash_model(&state.embedder_cache, retag(&session_model, embedder));
     // 本场录制中发生过声纹改名:归还件的 Qwen3 热词已过期,丢弃,停录收尾的
     // preload 会按新名单重建(见 refresh_qwen_hotwords_cache 的脏标记分支)。
     if state.hotwords_dirty.swap(false, Ordering::Relaxed) {
@@ -3885,7 +3895,10 @@ fn spawn_feedback(
                         .map(|d| settings::load(&d).speaker_model)
                         .unwrap_or_default();
                     let library_model = vp.load().embedding_model.clone();
-                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app))?;
+                    // **标签与权重必须来自同一份快照**:用 speaker_model_path(&app) 会
+                    // 再读一次设置,切换发生在两次读取之间时,就会用 B 的权重算、以 A 的
+                    // 标签写库,而库若仍是 A,门禁会错误放行(codex review 实现轮 P1)。
+                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
                     let r = feedback::reinforce_person(
                         &note_dir,
                         &segs,
@@ -4963,7 +4976,9 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
             .map(|d| settings::load(&d).speaker_model)
             .unwrap_or_default();
         let library_model = vp.embedding_model.clone();
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+        // 标签与权重同源(同 spawn_feedback 那处):不能再读一次设置,否则可能用 B 的
+        // 权重算、以 A 的标签写库(codex review 实现轮 P1)。
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
             Ok(mut embedder) => {
                 match feedback::reinforce_person(
                     &dir,
@@ -4977,8 +4992,16 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
                     &now,
                     Some(&op_id),
                 ) {
-                    Ok(feedback::ReinforceResult::Applied { .. }) => None,
-                    Ok(other) => Some(format!("{other:?}")),
+                    Ok(o) if matches!(o.result, feedback::ReinforceResult::Applied { .. }) => {
+                        // 纠错还原把旧人物质心清空了 → 排一次重建(此处已出 vp_guard)。
+                        if o.needs_rebuild {
+                            let st = app.state::<AppState>();
+                            *st.embedder_cache.lock().unwrap() = None;
+                            spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
+                        }
+                        None
+                    }
+                    Ok(other) => Some(format!("{:?}", other.result)),
                     Err(e) => Some(format!("回灌失败: {e}")),
                 }
             }
@@ -5040,11 +5063,19 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
                                 &vp_store,
                             ) {
                                 Ok(feedback::UndoOutcome::Restored) => {}
-                                // 快照来自另一个模型空间:质心已置空,记一笔待重建。
-                                // 恢复路径不在这里发起重建(它跑在 identify 恢复里,
-                                // 不该顺手起后台重活);下次启动的自愈会按标签比对兜住。
+                                // 快照来自另一个模型空间:质心已置空,必须**当场**排重建。
+                                // 早先这里只记日志,理由写的是"下次启动自愈会兜住"——
+                                // 那是错的:restore_feedback 不改库标签,标签恒相等,
+                                // 自愈的判据永远不成立(codex review 实现轮 P1)。
                                 Ok(feedback::UndoOutcome::RestoredNeedsRebuild) => {
-                                    eprintln!("identify 恢复:回灌快照来自另一空间,质心已置空待重建");
+                                    eprintln!("identify 恢复:回灌快照来自另一空间,质心已置空,排重建");
+                                    let st = app.state::<AppState>();
+                                    *st.embedder_cache.lock().unwrap() = None;
+                                    spawn_voiceprint_rebuild(
+                                        app,
+                                        st.embedder_cache.clone(),
+                                        "identify 恢复后质心置空",
+                                    );
                                 }
                                 Ok(feedback::UndoOutcome::NoEntry) => {
                                     op.non_revertible
@@ -6301,9 +6332,15 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
             return Err(tr!("录制中不能撤销合并", "Cannot undo a merge while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        store::VoiceprintStore::new(root.clone())
+        let needs_rebuild = store::VoiceprintStore::new(root.clone())
             .undo_merge(&journal_id)
             .map_err(|e| e.to_string())?;
+        // 质心因跨空间被置空 → 排一次重建。这里已在 vp_guard 之外(store 方法已返回)。
+        if needs_rebuild {
+            let st = app.state::<AppState>();
+            *st.embedder_cache.lock().unwrap() = None;
+            spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "撤销合并后质心置空");
+        }
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
