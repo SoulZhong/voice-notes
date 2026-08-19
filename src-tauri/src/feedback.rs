@@ -157,69 +157,29 @@ pub fn undo_reinforce_op(
     op_id: &str,
     vp: &crate::store::VoiceprintStore,
 ) -> anyhow::Result<UndoOutcome> {
-    undo_entry(note_dir, seqs, expect_person, Some(op_id), None, vp)
+    undo_entry(note_dir, seqs, expect_person, op_id, vp)
 }
 
-/// 撤销一次**手动指认**带来的回灌(取消关联时连带)。
-///
-/// 与 [`undo_reinforce_op`] 的唯一区别是不校验 op_id:手动「选人」路径
-/// (`assign_note_speaker_person` → `spawn_feedback`)记账时 op_id 恒为 `None`,
-/// 拿 op_id 去匹配必然落到 `superseded`——于是"取消关联"永远撤不掉它自己刚灌进去的
-/// 那一份。反过来,带 op_id 的条目属于 identify 流水线,它有自己的 ops 账本与撤销路径,
-/// 这里**拒绝**去动它,免得两本账对不上。
-pub fn undo_reinforce_manual(
-    note_dir: &Path,
-    seqs: &BTreeSet<u64>,
-    expect_person: &str,
-    scope: &str,
-    vp: &crate::store::VoiceprintStore,
-) -> anyhow::Result<UndoOutcome> {
-    undo_entry(note_dir, seqs, expect_person, None, Some(scope), vp)
-}
-
-/// 两条撤销路径的共同体。`op_id`:`Some` = 必须是同一 op 写的;`None` = 只认手动条目。
+/// 撤销的共同体。目前只有按 op_id 一条路径(手动撤销已随「取消关联不做连带撤销」删除)。
 fn undo_entry(
     note_dir: &Path,
     seqs: &BTreeSet<u64>,
     expect_person: &str,
-    op_id: Option<&str>,
-    scope: Option<&str>,
+    op_id: &str,
     vp: &crate::store::VoiceprintStore,
 ) -> anyhow::Result<UndoOutcome> {
     let mut ledger = load_ledger(note_dir);
-    // 按 op_id 撤销:不限作用域找(op_id 自己就是身份,见 find_entry_key_any_scope)。
-    // 手工撤销:**只认精确的作用域键**,不回落到裸指纹键——旧账没有作用域,回落等于
-    // 允许任意作用域去撤它,正是这次要堵的那个洞。旧账因此撤不掉,但那些是本功能
-    // 出现之前写下的,当时也没有"取消关联"可用,不构成回归。
-    let Some(key) = (match scope {
-        Some(sc) => {
-            let scoped = ledger_key(sc, seqs);
-            ledger.entries.contains_key(&scoped).then_some(scoped)
-        }
-        None => find_entry_key_any_scope(&ledger, seqs),
-    }) else {
+    // 不限作用域找:op_id 自己就是身份,找到之后还要比对它,不存在跨作用域错撤的风险;
+    // 而调用方并不知道当初是用哪种过滤器记的账(实测既有 Speakers 也有 Seqs)。
+    let Some(key) = find_entry_key_any_scope(&ledger, seqs) else {
         return Ok(UndoOutcome::NoEntry);
     };
     let Some(entry) = ledger.entries.get(&key) else {
         return Ok(UndoOutcome::NoEntry);
     };
-    match op_id {
-        // 后续人工回灌会覆盖同 scope 条目,凭 scope 撤销会错撤人工作业。
-        Some(want) if entry.op_id.as_deref() != Some(want) => {
-            return Ok(UndoOutcome::NotRevertible("superseded"));
-        }
-        // 归 identify 流水线管的条目不在这里撤,见 undo_reinforce_manual 的说明。
-        None if entry.op_id.is_some() => {
-            return Ok(UndoOutcome::NotRevertible("owned-by-op"));
-        }
-        _ => {}
-    }
-    // 作用域必须对得上:原始稿说话人与修订稿重聚类标签可能覆盖同一批 seq,
-    // 撤错了会把对方仍在使用的回灌还原掉。旧账本没有这一栏(None),放行。
-    if let (Some(want), Some(have)) = (scope, entry.scope.as_deref()) {
-        if want != have {
-            return Ok(UndoOutcome::NotRevertible("scope-mismatch"));
-        }
+    // 后续人工回灌会覆盖同 scope 条目,凭 scope 撤销会错撤人工作业。
+    if entry.op_id.as_deref() != Some(op_id) {
+        return Ok(UndoOutcome::NotRevertible("superseded"));
     }
     if !entry.complete {
         // 占位账:库可能改了但快照丢失(崩溃窗口)——如实报不可还原,不猜。
@@ -310,10 +270,6 @@ struct LedgerEntry {
     /// 不能只凭 scope 判断"这是我那次写的"。人工路径为 None(serde 兼容 P1 数据)。
     #[serde(default)]
     op_id: Option<String>,
-    /// 写这条账的作用域(见 SegFilter::scope_tag)。旧账本无此键 → None,
-    /// 手工撤销遇到 None 一律放行(向后兼容:那时还没有修订稿共用同一指纹的问题)。
-    #[serde(default)]
-    scope: Option<String>,
 }
 
 /// 段集合指纹:sha256(升序 seq 的 LE 字节) 前 8 字节 hex。P1 回灌账本与
@@ -467,7 +423,6 @@ pub fn reinforce_person(
             after: String::new(),
             complete: false,
             op_id: op_id.map(str::to_string),
-            scope: Some(scope_tag.clone()),
         },
     );
     save_ledger(note_dir, &ledger)?;
@@ -759,123 +714,6 @@ mod tests {
             undo_reinforce_op(note.path(), &seqs, &pid, "iop-9", &store).unwrap(),
             UndoOutcome::NoEntry,
             "重复撤销无账"
-        );
-    }
-
-    /// 手动指认(op_id=None)带来的回灌,必须能被"取消关联"撤掉。
-    /// 这条是 2026-08-19 加"取消关联"时发现的缺口:原来只有按 op_id 撤销的入口,
-    /// 而手动路径记账时 op_id 恒为 None,拿 op_id 去匹配必然落到 superseded
-    /// ——于是取消关联永远撤不掉它自己刚灌进去的那一份。
-    #[test]
-    fn undo_reinforce_manual_reverts_manual_assign() {
-        let note = tempfile::tempdir().unwrap();
-        write_wav(&note.path().join("mic.wav"), 4000);
-        let vp_root = tempfile::tempdir().unwrap();
-        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
-        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
-        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        let model = store.load().embedding_model.clone();
-        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
-        let before = store.load().people[&pid].total_ms;
-
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        // op_id=None:这正是 assign_note_speaker_person → spawn_feedback 的记账方式
-        reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None)
-            .unwrap();
-        assert!(store.load().people[&pid].total_ms > before, "先确认确实灌进去了");
-
-        assert_eq!(
-            undo_reinforce_manual(note.path(), &seqs, &pid, &filter.scope_tag(), &store).unwrap(),
-            UndoOutcome::Restored
-        );
-        assert_eq!(store.load().people[&pid].total_ms, before, "撤销后回到原样");
-    }
-
-    /// 原始稿说话人与修订稿重聚类标签可能覆盖同一批 seq,账本却只按 seq 指纹索引。
-    /// 撤销必须认作用域,否则会把对方仍在使用的那一份还原掉(codex review 二轮 P1#2)。
-    #[test]
-    fn undo_reinforce_manual_refuses_other_scope() {
-        let note = tempfile::tempdir().unwrap();
-        write_wav(&note.path().join("mic.wav"), 4000);
-        let vp_root = tempfile::tempdir().unwrap();
-        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
-        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
-        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
-        let model = store.load().embedding_model.clone();
-        // 修订稿路径写的账(Seqs 作用域,同一批 seq)
-        let refined = SegFilter::Seqs(seqs.clone());
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &refined, &pid, &store, &model, &model, &mut emb, "t1", None)
-            .unwrap();
-        // 原始稿的"取消关联"来撤:作用域对不上,必须拒绝
-        let raw = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        assert_eq!(
-            undo_reinforce_manual(note.path(), &seqs, &pid, &raw.scope_tag(), &store).unwrap(),
-            // 作用域进了账本键之后,别人的账在这个作用域下根本不存在——
-            // 比"找到了但拒绝"更干净,结果同样是不会误撤。
-            UndoOutcome::NoEntry
-        );
-    }
-
-    /// 作用域进了账本键之后,同一批 seq 的两个作用域各占一槽、互不覆盖。
-    /// 这是"条目字段"与"账本键"的区别:前者只能在撤销时拒绝,后者从根上不冲突。
-    #[test]
-    fn 两个作用域同批seq各记各的账() {
-        let note = tempfile::tempdir().unwrap();
-        write_wav(&note.path().join("mic.wav"), 4000);
-        let vp_root = tempfile::tempdir().unwrap();
-        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
-        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
-        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
-        let model = store.load().embedding_model.clone();
-        let raw = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        let refined = SegFilter::Seqs(seqs.clone());
-        let before_all = store.load().people[&pid].total_ms;
-
-        let mut e1 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &raw, &pid, &store, &model, &model, &mut e1, "t1", None).unwrap();
-        let after_raw = store.load().people[&pid].total_ms;
-        // 同一批 seq、同一人物,但作用域不同:不该被幂等吞掉,应各记各的
-        let mut e2 = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &refined, &pid, &store, &model, &model, &mut e2, "t2", None)
-            .unwrap();
-
-        // 两份账各自独立存在:按后进先出撤,两次都成功。
-        // (顺序不能反——还原凭据比对的是"库当前状态等于我写完时的状态",
-        //  先撤先写的那份会让后写的那份对不上,如实报 touched-since。)
-        assert_eq!(
-            undo_reinforce_manual(note.path(), &seqs, &pid, &refined.scope_tag(), &store).unwrap(),
-            UndoOutcome::Restored,
-            "修订稿那份(后写)先撤"
-        );
-        assert_eq!(
-            undo_reinforce_manual(note.path(), &seqs, &pid, &raw.scope_tag(), &store).unwrap(),
-            UndoOutcome::Restored,
-            "原始稿那份仍在,可独立撤销"
-        );
-        assert_eq!(store.load().people[&pid].total_ms, before_all, "两份都撤完回到原样");
-        let _ = after_raw;
-    }
-
-    /// identify 流水线写的条目(带 op_id)有自己的 ops 账本与撤销路径,
-    /// 取消关联不许去动它——两本账各撤各的,混着来必然对不上。
-    #[test]
-    fn undo_reinforce_manual_refuses_op_owned_entries() {
-        let note = tempfile::tempdir().unwrap();
-        write_wav(&note.path().join("mic.wav"), 4000);
-        let vp_root = tempfile::tempdir().unwrap();
-        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
-        let segs = vec![seg(0, "mic", 0, 2000), seg(1, "mic", 2000, 4000)];
-        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
-        let model = store.load().embedding_model.clone();
-        let seqs: BTreeSet<u64> = [0u64, 1].into_iter().collect();
-
-        let mut emb = MockEmbedder::new(vec![Ok(unit(1)), Ok(unit(1))]);
-        reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", Some("iop-1"))
-            .unwrap();
-        assert_eq!(
-            undo_reinforce_manual(note.path(), &seqs, &pid, &filter.scope_tag(), &store).unwrap(),
-            UndoOutcome::NotRevertible("owned-by-op")
         );
     }
 

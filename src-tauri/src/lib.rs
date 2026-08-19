@@ -3641,52 +3641,14 @@ fn clear_note_speaker_person(
             speaker_id: speaker_id.clone(),
         },
     })?;
-    if let Some(person) = linked {
-        // 作用域必须与当初关联时写账用的那一份一致(原始稿走 Speakers 过滤器),
-        // 否则会撤到修订稿那一份上去。
-        let scope = feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_id.clone()]))
-            .scope_tag();
-        spawn_undo_feedback(&app, note_id, seqs, person, scope, speaker_id);
-    }
+    // **不连带撤销这次关联带来的声纹回灌**(2026-08-19 范围决定)。
+    // 撤销要求"撤销任务"与"回灌任务"两个后台任务正确排序,而它们只隔着一把不保证
+    // 顺序的门——三轮 codex review 里最难缠的几条 P1(反向执行竞态、MergePrior 漏
+    // 复核、账本误撤)根源全在这里。砍掉撤销任务,这些问题不是被堵住,是不存在。
+    // 代价:库里那个人多留一段本不该有的样本。见
+    // docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md
+    let _ = (linked, seqs);
     Ok(())
-}
-
-/// 取消关联后的回灌撤销:后台 best-effort,任何失败只留日志——关联已经解除了,
-/// 撤不撤得掉库里那份增量不该影响这个结果(与 spawn_feedback 同一哲学)。
-fn spawn_undo_feedback(
-    app: &AppHandle,
-    note_id: String,
-    seqs: std::collections::BTreeSet<u64>,
-    person: String,
-    scope: String,
-    speaker_id: String,
-) {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let run = || -> anyhow::Result<()> {
-            let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
-            let note_dir = notes_dir(&app)?.join(&note_id);
-            let _gate = FEEDBACK_GATE.lock().unwrap();
-            // 对称的复核:用户取消后又关联回同一个人物时,这次撤销就不该再执行——
-            // 否则会把新那次关联刚写下(或因幂等跳过而复用)的账撤掉,结果是笔记关联着
-            // 人物、库里却没有对应增量(codex review 二轮 P2)。
-            let relinked = notes_dir(&app)
-                .ok()
-                .and_then(|d| store::NoteStore::new(d).load(&note_id).ok())
-                .and_then(|n| n.speakers.get(&speaker_id).and_then(|m| m.person_id.clone()))
-                .is_some_and(|pid| pid == person);
-            if relinked {
-                eprintln!("feedback: note={note_id} {speaker_id} 已重新关联 {person},取消撤销");
-                return Ok(());
-            }
-            let r = feedback::undo_reinforce_manual(&note_dir, &seqs, &person, &scope, &vp)?;
-            eprintln!("feedback: 取消关联 note={note_id} person={person} undo={r:?}");
-            Ok(())
-        };
-        if let Err(e) = run() {
-            eprintln!("feedback: 取消关联的回灌撤销失败(不影响已解除的关联): {e:#}");
-        }
-    });
 }
 
 /// 按当前选型重建声纹库:拿每个人存下的录音样本用新模型重新算质心,并把库标签
