@@ -140,6 +140,11 @@ pub struct SpeakerMeta {
     /// speakers.json(无该键)可解析,且未关联时序列化省去该键。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_id: Option<String>,
+    /// 「多人混杂」标记:这个簇里不止一个人在说话,归给谁都是错的。事后打标
+    /// (录音时无从知道,重聚类才暴露)。置位后重转写/再入库不入库、不写样本,
+    /// UI 提供拆分入口。见 docs/superpowers/specs/2026-08-20-mixed-speaker-split-design.md。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_speaker: bool,
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。

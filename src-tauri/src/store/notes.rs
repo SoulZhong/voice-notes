@@ -262,6 +262,7 @@ impl NoteStore {
                 centroid: None,
                 count: 0,
                 person_id: None,
+                multi_speaker: false,
             })
             .name = name.to_string();
         write_speakers_atomic(&dir, &speakers)
@@ -380,6 +381,7 @@ impl NoteStore {
                     centroid: None,
                     count: 0,
                     person_id: None,
+                multi_speaker: false,
                 },
             );
             write_speakers_atomic(&dir, &speakers)?;

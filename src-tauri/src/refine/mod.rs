@@ -1432,7 +1432,7 @@ mod tests {
                 sources: vec!["mic".into()],
                 centroid: None,
                 count: 1,
-                person_id: Some("P2".into()),
+                person_id: Some("P2".into()), multi_speaker: false,
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];

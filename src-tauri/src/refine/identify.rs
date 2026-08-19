@@ -109,6 +109,7 @@ fn calendar_candidates(cal: &crate::store::CalendarSnapshot, vp: &Voiceprints) -
         }
         for (pid, person) in &vp.people {
             if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !person.voiceprint_quarantined
                 && !person.name.trim().is_empty()
                 && person.emails.iter().any(|e| e == &att.email)
                 && seen.insert(pid.clone())
@@ -125,6 +126,7 @@ fn calendar_candidates(cal: &crate::store::CalendarSnapshot, vp: &Voiceprints) -
         }
         for (pid, person) in &vp.people {
             if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !person.voiceprint_quarantined
                 && person.name == name
                 && seen.insert(pid.clone())
             {
@@ -162,7 +164,10 @@ fn recall_candidates(
         for stat in stats {
             let mut sims: Vec<(f32, &str, &str)> = Vec::new();
             for (pid, person) in &vp.people {
-                if VoiceprintStore::resolve(vp, pid) != Some(pid.as_str()) || person.name.trim().is_empty() {
+                if VoiceprintStore::resolve(vp, pid) != Some(pid.as_str())
+                    || person.voiceprint_quarantined
+                    || person.name.trim().is_empty()
+                {
                     continue;
                 }
                 let best = stat
@@ -186,7 +191,9 @@ fn recall_candidates(
         .people
         .iter()
         .filter(|(pid, p)| {
-            VoiceprintStore::resolve(vp, pid) == Some(pid.as_str()) && !p.name.trim().is_empty()
+            VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !p.voiceprint_quarantined
+                && !p.name.trim().is_empty()
         })
         .collect();
     recent.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
@@ -195,8 +202,13 @@ fn recall_candidates(
     }
 
     // ③ 已采纳的种子命中人(adopted):当场证据,最强先验。
+    // 隔离人物再滤一道:新聚类产不出隔离种子(seed_clusters 已过滤),这里兜的是
+    // 打标**之前**算好的旧 ClusterStat 被复用的路径。
     for stat in stats {
         if let Some((pid, name, _, true)) = &stat.seed {
+            if vp.people.get(pid).is_some_and(|p| p.voiceprint_quarantined) {
+                continue;
+            }
             push(pid, name, &mut picked, &mut seen);
         }
     }
@@ -1067,7 +1079,7 @@ mod tests {
             session_centroids: BTreeMap::new(),
             total_ms: 10_000,
             last_seen: last_seen.into(),
-            emails: Vec::new(),
+            emails: Vec::new(), voiceprint_quarantined: false,
         }
     }
 
@@ -1131,6 +1143,22 @@ mod tests {
         let got2 = recall_candidates(&stats, &vp, false, 1, 1, 10);
         assert_eq!(got2.len(), 1);
         assert_eq!(got2[0].person_id, "P2");
+    }
+
+    #[test]
+    fn recall_excludes_quarantined_person_on_every_path() {
+        // P1 既是声学最近又是 last_seen 最近——隔离后两条路都不得召回他。
+        let mut p1 = person("阿隔", "mic", vec![1.0, 0.0, 0.0, 0.0], "2026-08-19");
+        p1.voiceprint_quarantined = true;
+        let vp = vp_with(vec![
+            ("P1", p1),
+            ("P2", person("阿备", "mic", vec![0.9, 0.1, 0.0, 0.0], "2026-01-01")),
+        ]);
+        let stats = vec![stat("R1", "mic", vec![1.0, 0.0, 0.0, 0.0], 60_000)];
+        let got = recall_candidates(&stats, &vp, true, 2, 2, 10);
+        let ids: Vec<&str> = got.iter().map(|c| c.person_id.as_str()).collect();
+        assert!(!ids.contains(&"P1"), "隔离人物不得被任何一路召回: {ids:?}");
+        assert!(ids.contains(&"P2"));
     }
 
     #[test]
