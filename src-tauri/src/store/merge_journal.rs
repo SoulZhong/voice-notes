@@ -104,21 +104,34 @@ fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     use std::io::Write;
     let mark = PathBuf::from(format!("{}{INCOMPLETE_SUFFIX}", dst.display()));
     if mark.exists() {
-        // 上次崩在写一半:目标不可信,连同旁标一起清掉重写。
+        // 上次崩在写一半:目标不可信,连同旁标一起清掉重写。清不掉就整体失败——
+        // 继续下去会把那个半成品当完整样本(codex review 实现轮五 P1)。
         eprintln!("样本恢复:发现上次未写完的 {},清掉重来", dst.display());
-        let _ = std::fs::remove_file(dst);
-        let _ = std::fs::remove_file(&mark);
+        if let Err(e) = std::fs::remove_file(dst) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::anyhow!("清理未写完的样本失败({}): {e}", dst.display()));
+            }
+        }
+        std::fs::remove_file(&mark)
+            .map_err(|e| anyhow::anyhow!("清理半成品标记失败({}): {e}", mark.display()))?;
     }
-    let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(dst) {
+    // **旁标必须先于目标落地**。反过来的话,建完 dst、还没写旁标就崩,会留下一个
+    // 没有任何标记的空文件;下次恢复看它存在就返回"已存在"跳过,journal 随后被删,
+    // 而这个空文件会被 sample_paths_existing 当成正经样本进 list_people 和重建
+    // (codex review 实现轮五 P1)。
+    std::fs::write(&mark, b"")
+        .map_err(|e| anyhow::anyhow!("写半成品标记失败({}): {e}", mark.display()))?;
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(dst);
+    let mut out = match opened {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(e) => return Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+        Err(e) => {
+            let _ = std::fs::remove_file(&mark);
+            return match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Ok(false),
+                _ => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+            };
+        }
     };
-    if let Err(e) = std::fs::write(&mark, b"") {
-        drop(out);
-        let _ = std::fs::remove_file(dst);
-        return Err(anyhow::anyhow!("写半成品标记失败({}): {e}", mark.display()));
-    }
     let res = (|| -> std::io::Result<()> {
         let mut inp = std::fs::File::open(src)?;
         std::io::copy(&mut inp, &mut out)?;
@@ -386,12 +399,19 @@ impl MergeJournal {
     /// 整条日志:宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物
     /// 数据。
     pub fn invalidate(&self, touched: &[&str], reason: &str, by: Option<&str>) {
+        self.invalidate_inner(touched, reason, by, false)
+    }
+
+    /// `exempt_in_progress`:是否放过进行中的撤销条目。**只有换模型重建能豁免**——
+    /// 普通的人物变更(又被合并、被删、又录到)必须照常失效它:那种情况下快照指向的
+    /// 人已经不是原来那个了,重试会把旧样本写到一个已经消失的 id 底下还报成功
+    /// (codex review 实现轮五 P1)。
+    fn invalidate_inner(&self, touched: &[&str], reason: &str, by: Option<&str>, exempt_in_progress: bool) {
         for mut e in self.entries() {
             if e.invalid_reason.is_some() {
                 continue;
             }
-            // 进行中的撤销不被任何来源失效(理由同 invalidate_all)。
-            if !e.undo_phase.is_empty() {
+            if exempt_in_progress && !e.undo_phase.is_empty() {
                 continue;
             }
             if !touched.contains(&e.loser.as_str()) && !touched.contains(&e.winner.as_str()) {
@@ -429,7 +449,7 @@ impl MergeJournal {
             .flat_map(|e| [e.loser.clone(), e.winner.clone()])
             .collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        self.invalidate(&refs, reason, None);
+        self.invalidate_inner(&refs, reason, None, true);
     }
 
     /// 由 by_id 那次合并所失效的条目复活(撤销 by_id = 它施加的失效不再成立)。
@@ -447,7 +467,14 @@ impl MergeJournal {
     }
 
     /// 确认(回执卡「好」)= 删除条目(连同样本副本)。
+    ///
+    /// **进行中的撤销拒绝确认**:那条目里的样本快照是恢复唯一的依据,库已经按快照
+    /// 还原了一半,确认掉就永久回不去(codex review 实现轮五 P1)。
     pub fn acknowledge(&self, id: &str) -> anyhow::Result<()> {
+        let e = self.entry(id)?;
+        if !e.undo_phase.is_empty() {
+            anyhow::bail!("这条撤销还没做完(卡在{}),先重试撤销再确认", e.undo_phase);
+        }
         self.remove(id)
     }
 
@@ -458,10 +485,16 @@ impl MergeJournal {
         Ok(())
     }
 
-    /// 超上限淘汰最旧(entries 已按 time 降序)。
+    /// 超上限淘汰最旧(entries 已按 time 降序)。**进行中的撤销不淘汰**(理由同
+    /// acknowledge):宁可短暂超出上限,也不能把恢复依据当垃圾扔掉。上限只是防无界
+    /// 膨胀,而进行中的条目数天然受限于用户手动重试的次数。
     fn prune(&self) {
         let entries = self.entries();
         for e in entries.iter().skip(JOURNAL_CAP) {
+            if !e.undo_phase.is_empty() {
+                eprintln!("合并日志淘汰:{} 有未做完的撤销,保留", e.id);
+                continue;
+            }
             if let Some(d) = self.entry_dir(&e.id) {
                 let _ = std::fs::remove_dir_all(&d);
             }
@@ -1084,5 +1117,43 @@ mod tests {
         assert!(j.restore_loser_samples("m-P1", &out).is_err());
         // 宽松版仍然容错(它服务于 UI 列表)。
         assert!(j.sample_copies("m-P1", "loser").is_empty());
+    }
+
+    #[test]
+    fn in_progress_entry_is_exempt_only_from_rebuild_invalidation() {
+        // 换模型重建要放过进行中的撤销(否则那次撤销永远做不完);但普通的人物变更
+        // 必须照常失效它——那种情况下快照指向的人已经不是原来那个了,重试会把旧样本
+        // 写到一个已经消失的 id 底下还报成功(codex review 实现轮五 P1)。
+        let (_dir, j) = test_journal();
+        j.append(&entry("m-A", "t1", "P1", "P2"), &[], &[]).unwrap();
+        j.append(&entry("m-B", "t2", "P3", "P4"), &[], &[]).unwrap();
+        j.set_undo_phase("m-A", undo_phase::SAMPLES_CLEARED, false).unwrap();
+        j.set_undo_phase("m-B", undo_phase::SAMPLES_CLEARED, false).unwrap();
+
+        j.invalidate_all("声纹库已按新模型重建");
+        assert!(j.entry("m-A").unwrap().invalid_reason.is_none(), "重建不得失效进行中的撤销");
+
+        j.invalidate(&["P1"], "P1 又被合并了", None);
+        assert!(
+            j.entry("m-A").unwrap().invalid_reason.is_some(),
+            "人物变更必须照常失效,哪怕撤销正进行中"
+        );
+        assert!(j.entry("m-B").unwrap().invalid_reason.is_none(), "没被触及的条目不受影响");
+    }
+
+    #[test]
+    fn in_progress_entry_cannot_be_acknowledged_away() {
+        // 条目里的样本快照是恢复唯一的依据,而库已按快照还原了一半。用户点「好」
+        // 就把它删掉的话永久回不去(codex review 实现轮五 P1)。
+        let (_dir, j) = test_journal();
+        j.append(&entry("m-A", "t1", "P1", "P2"), &[], &[]).unwrap();
+        j.set_undo_phase("m-A", undo_phase::LIBRARY_RESTORED, false).unwrap();
+
+        assert!(j.acknowledge("m-A").is_err(), "进行中的撤销不得被确认掉");
+        assert!(j.entry("m-A").is_ok(), "条目必须还在");
+
+        // 做完了(阶段清空)就能正常确认。
+        j.set_undo_phase("m-A", "", false).unwrap();
+        assert!(j.acknowledge("m-A").is_ok());
     }
 }

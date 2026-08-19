@@ -254,6 +254,15 @@ fn should_enqueue_transcode(note_dir: &std::path::Path) -> bool {
 /// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
 /// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
 fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
+    load_voiceprint_seeds_for(app, &current_speaker_model(app))
+}
+
+/// 同上,但门禁比对的是**调用方指定的**模型标签。
+///
+/// 凡是"先建嵌入器、再取种子"的路径都必须用这个:两处各读一次设置的话,用户在中间
+/// 切了模型就会拿 B 算出来的向量去比 A 空间的种子质心——门禁看的是新设置,已经放行了
+/// (codex review 实现轮五 P1)。标签应取自建那个嵌入器时用的同一份快照。
+fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::registry::SeedCluster> {
     let Ok(root) = data_root(app) else {
         eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
         return Vec::new();
@@ -262,11 +271,6 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
     // 嵌入模型标签与当前选型不一致(切换后台重建尚未完成的窗口)时不注入种子:
     // 不同模型的向量空间不可混比,错认比不认糟。此门禁足以杜绝一切跨空间比较——
     // 种子被跳过后,本场新簇只在新空间内互比;既有人物无种子即不会被命中回写。
-    let cur = app
-        .path()
-        .app_data_dir()
-        .map(|d| settings::load(&d).speaker_model)
-        .unwrap_or_default();
     if vp.embedding_model != cur {
         eprintln!("声纹库模型标签({})与当前选型({cur})不一致,本场跳过种子注入(重建完成后恢复)", vp.embedding_model);
         return Vec::new();
@@ -505,14 +509,16 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
-                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
+                // 标签、权重、种子门禁三者必须出自同一次设置读取(codex review 实现轮五 P1)。
+                let speaker_tag = current_speaker_model(&app);
+                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
                     Ok(e) => Some(e),
                     Err(e) => {
                         eprintln!("refine: 声纹模型不可用，跳过重聚类: {e}");
                         None
                     }
                 };
-                let seeds = load_voiceprint_seeds(&app);
+                let seeds = load_voiceprint_seeds_for(&app, &speaker_tag);
                 let (mut doc, cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
@@ -2948,15 +2954,17 @@ fn run_retranscribe_once(
         new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
             .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?
     };
+    // 标签、权重、种子门禁同源(codex review 实现轮五 P1)。
+    let speaker_tag = current_speaker_model(app);
     let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
             Ok(e) => Some(Box::new(e)),
             Err(e) => {
                 eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
                 None
             }
         };
-    let seeds = load_voiceprint_seeds(app);
+    let seeds = load_voiceprint_seeds_for(app, &speaker_tag);
     let vad_path = models::root().join("silero_vad.onnx");
     let factory: retranscribe::input::SegmenterFactory = Box::new(move || new_silero(&vad_path));
     let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
@@ -4818,7 +4826,9 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                         Err(e) => eprintln!("identify({id}): 音轨 {source} 解码失败,该轨无声学: {e}"),
                     }
                 }
-                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app2))?;
+                // 权重取自决定 acoustic_enabled 的那份设置快照(s),不重读:重读的话
+                // 中途切模型会拿 B 的向量去比快照里 A 的质心(codex review 实现轮五 P1)。
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&s.speaker_model))?;
                 for (speaker, seqs) in &members {
                     let segs: Vec<&store::SegmentRecord> =
                         note.segments.iter().filter(|sg| seqs.contains(&sg.seq)).collect();
@@ -6117,10 +6127,13 @@ fn do_merge_person(
     }
     let now = chrono::Local::now().to_rfc3339();
     // 先取标签再借出嵌入器(借用检查:后者是可变借用)。
+    // 有嵌入器 → 标签取自它(要写新质心,必须同源)。没有嵌入器 → 这次不算任何向量,
+    // merge_journaled 的契约要求传**库当前标签**;传设置标签的话,换模型重建还没跑完
+    // 的窗口里,一次不超样本上限的普通合并会被门禁误拒(codex review 实现轮五 P2)。
     let model_tag = emb
         .as_ref()
         .map(|e| e.model().to_string())
-        .unwrap_or_else(|| current_speaker_model(app));
+        .unwrap_or_else(|| store.load().embedding_model.clone());
     let journal_id = store
         .merge_journaled(
             loser,

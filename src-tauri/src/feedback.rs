@@ -537,7 +537,12 @@ pub fn reinforce_person(
         if rolled_back {
             let mut cleanup = load_ledger(note_dir);
             cleanup.entries.remove(&key);
-            let _ = save_ledger(note_dir, &cleanup);
+            // 清理失败必须说出来:留着 complete=false 的占位条目,下次同人物回灌会在
+            // 检查 complete 之前就返回 SkippedAlreadyDone——库明明已经回滚干净了,
+            // 这个 scope 却被永久封死(codex review 实现轮五 P2)。
+            if let Err(e2) = save_ledger(note_dir, &cleanup) {
+                anyhow::bail!("账本回填失败(已回滚),但占位账清理也失败,该 scope 会被永久封死: {e};{e2}");
+            }
             anyhow::bail!("账本回填失败,已回滚: {e}");
         }
         anyhow::bail!("账本回填失败**且未能回滚**,库中留有本次增量(该 scope 已被占位账挡住,不会重复回灌): {e}");
