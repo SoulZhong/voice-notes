@@ -426,7 +426,16 @@ pub fn reinforce_person(
         },
     );
     save_ledger(note_dir, &ledger)?;
-    let applied = vp.reinforce_feedback(person_id, &tuples, now)?;
+    // 空间门禁在写入这一侧再判一次:上面那道门禁是**开工前**判的,而解码 + 逐段嵌入
+    // 本身就要几十秒到几分钟,期间足够用户切一次模型。返回 None = 库已经不是这个空间。
+    let Some(applied) = vp.reinforce_feedback(person_id, &tuples, now, expected_model)? else {
+        // **必须清掉刚写下的占位账**:它 complete=false,留着会让这个 scope 被永久判成
+        // "已经回灌过",此后永不重试(codex review 二轮 P2)。
+        let mut cleanup = load_ledger(note_dir);
+        cleanup.entries.remove(&key);
+        let _ = save_ledger(note_dir, &cleanup);
+        return Ok(ReinforceResult::SkippedModelMismatch);
+    };
     if let Some(entry) = ledger.entries.get_mut(&key) {
         entry.before = applied.person_before.clone();
         entry.after = applied.person_after.clone();
@@ -448,6 +457,9 @@ pub fn reinforce_person(
 
 #[cfg(test)]
 mod tests {
+    /// 测试库的默认模型标签。向量空间门禁按它比对,测试里恒相符。
+    const MODEL: &str = "campplus";
+
     use super::*;
     use crate::diar::MockEmbedder;
 
@@ -583,7 +595,7 @@ mod tests {
                     total_ms: 12_000,
                 }],
                 "t0",
-            )
+             MODEL,)
             .unwrap();
         let pid = links.get(&key).unwrap().clone();
         (store, pid)
@@ -630,7 +642,7 @@ mod tests {
                         total_ms: 12_000,
                     }],
                     "t0",
-                )
+                 MODEL,)
                 .unwrap();
             (store_b, links.get("seed-b").unwrap().clone())
         };

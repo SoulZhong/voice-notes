@@ -109,6 +109,19 @@ impl Default for Voiceprints {
 /// 没必要互相阻塞。毒化忽略(into_inner):每次落盘各自原子,持锁线程 panic 不留半写状态。
 static VP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 向量空间门禁:这组向量是用哪个模型算的?与库当前 `embedding_model` 不符一律丢弃。
+///
+/// **为什么必须在写入这一侧判,而不是靠调用方自觉**:2026-08-19 定位到的一类问题是
+/// "更早启动、用旧模型算完的写入,在切模型重建成功之后才落盘"——库标签是新的、内容
+/// 是混的,而启动自愈只比标签不比内容,永远发现不了。调用方在算之前判过一次不算数,
+/// 因为算的过程(解码 + 逐段嵌入)本身就要几十秒到几分钟,期间足够切一次模型。
+///
+/// 判据放在取锁之后、动数据之前:此刻读到的 `embedding_model` 就是本次写入将要落进
+/// 的那一份,中间不会再变。
+fn space_ok(vp: &Voiceprints, model: &str) -> bool {
+    vp.embedding_model == model
+}
+
 fn vp_guard() -> std::sync::MutexGuard<'static, ()> {
     VP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -187,7 +200,10 @@ impl VoiceprintStore {
     /// 把 loser 合并进 winner(无嵌入器变体:样本超额时退回"winner 全留、loser 按序
     /// 补空槽"的旧行为)。命令层能拿到声纹模型时请走 merge_with_embedder。
     pub fn merge(&self, loser: &str, winner: &str) -> anyhow::Result<()> {
-        self.merge_with_embedder(loser, winner, None)
+        // 不带嵌入器 = 只并库里已有的质心,两边本来就在同一空间;传库当前标签,
+        // 门禁对这条路径恒成立(留着是为了让所有入口走同一道判据,不开后门)。
+        let model = self.load().embedding_model.clone();
+        self.merge_with_embedder(loser, winner, None, &model)
     }
 
     /// 把 loser 合并进 winner(拿锁 + 委托 merge_locked)。
@@ -196,8 +212,13 @@ impl VoiceprintStore {
         loser: &str,
         winner: &str,
         embedder: Option<&mut dyn crate::diar::SpeakerEmbedder>,
+        model: &str,
     ) -> anyhow::Result<()> {
         let _guard = vp_guard();
+        // 合并会把 loser 的质心并进 winner:两边必须同空间,否则并出来的是噪音。
+        if !space_ok(&self.load(), model) {
+            anyhow::bail!("声纹空间不符,拒绝合并(向量是 {model} 算的)");
+        }
         self.merge_locked(loser, winner, embedder)
     }
 
@@ -332,9 +353,15 @@ impl VoiceprintStore {
         origin: &str,
         similarity: Option<f32>,
         now: &str,
+        model: &str,
     ) -> anyhow::Result<String> {
         let _guard = vp_guard();
         let vp = self.load();
+        // 与 merge_with_embedder 同一道判据。不带嵌入器时并的是库里已有的质心、
+        // 本来就同空间,调用方传库当前标签即可;带嵌入器时这道判据才真正起作用。
+        if !space_ok(&vp, model) {
+            anyhow::bail!("声纹空间不符,拒绝合并(向量是 {model} 算的)");
+        }
         let loser_person =
             vp.people.get(loser).ok_or_else(|| anyhow::anyhow!("未知人物: {loser}"))?.clone();
         let winner_person =
@@ -678,9 +705,17 @@ impl VoiceprintStore {
         &self,
         snaps: &[ClusterSnapshot],
         now: &str,
+        model: &str,
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let _guard = vp_guard();
         let mut vp = self.load();
+        if !space_ok(&vp, model) {
+            eprintln!(
+                "声纹入库丢弃:本场向量是 {model} 算的,库现在是 {};空间不可比,不写",
+                vp.embedding_model
+            );
+            return Ok(BTreeMap::new());
+        }
         let mut new_links = BTreeMap::new();
         let mut touched: Vec<String> = Vec::new();
         for snap in snaps {
@@ -742,9 +777,17 @@ impl VoiceprintStore {
         person_id: &str,
         stats: &[(String, Vec<f32>, u64, u64)], // (source, centroid, count, total_ms)
         now: &str,
-    ) -> anyhow::Result<FeedbackApplied> {
+        model: &str,
+    ) -> anyhow::Result<Option<FeedbackApplied>> {
         let _guard = vp_guard();
         let mut vp = self.load();
+        if !space_ok(&vp, model) {
+            eprintln!(
+                "回灌丢弃:这组向量是 {model} 算的,库现在是 {};空间不可比,不写",
+                vp.embedding_model
+            );
+            return Ok(None);
+        }
         let Some(resolved) = Self::resolve(&vp, person_id).map(str::to_string) else {
             anyhow::bail!("未知人物: {person_id}");
         };
@@ -766,7 +809,7 @@ impl VoiceprintStore {
         let person_after = serde_json::to_string(person)?;
         self.save(&vp)?;
         self.journal_invalidate(&[resolved.as_str()], "此人有纠错回灌");
-        Ok(FeedbackApplied { person_before, person_after })
+        Ok(Some(FeedbackApplied { person_before, person_after }))
     }
 
     /// 建空人物(P2a 新面孔确认用):VP_LOCK 内分配 P<next_person>;空名报错;
@@ -1242,6 +1285,93 @@ fn normalize(v: &[f32]) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    /// 测试库的默认模型标签(Voiceprints::default 的 embedding_model)。
+    /// 向量空间门禁按它比对,测试里恒相符。
+    const MODEL: &str = "campplus";
+    /// 另一个模型空间的标签。门禁用例专用。
+    const OTHER_MODEL: &str = "eres2netv2";
+
+    /// 2026-08-19:切模型重建成功之后,一个更早启动、用旧模型算完的写入落盘,
+    /// 库标签是新的、内容是混的,而启动自愈只比标签不比内容,永远发现不了。
+    /// 门禁就是为这条路存在的——它必须挡在**写入这一侧**,不能靠调用方自觉。
+    #[test]
+    fn 旧模型空间的向量写不进新库() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        // 先用当前空间入一个人,拿到 pid
+        let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
+        let links = store
+            .upsert_from_session(&snaps, "2026-08-19T00:00:00+08:00", MODEL)
+            .unwrap();
+        let pid = links.get("S1").unwrap().clone();
+        let before = store.load();
+
+        // 换个空间来写:三条向量写入路径都必须原地不动
+        let other = vec![snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
+        let links2 = store
+            .upsert_from_session(&other, "2026-08-19T00:01:00+08:00", OTHER_MODEL)
+            .unwrap();
+        assert!(links2.is_empty(), "异空间入库必须什么都不返回");
+
+        let applied = store
+            .reinforce_feedback(
+                &pid,
+                &[("mic".into(), vec![0.0, 1.0], 2, 4_000)],
+                "2026-08-19T00:02:00+08:00",
+                OTHER_MODEL,
+            )
+            .unwrap();
+        assert!(applied.is_none(), "异空间回灌必须丢弃");
+
+        let after = store.load();
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&after).unwrap(),
+            "异空间写入之后库必须一字未动"
+        );
+    }
+
+    /// 合并会把 loser 的质心并进 winner,两边必须同空间;异空间应当**报错**而不是
+    /// 静默丢弃——合并是用户主动动作,失败要让他知道(与回灌的降级语义刻意不同)。
+    #[test]
+    fn 异空间的合并被拒绝() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store
+            .upsert_from_session(&snaps, "2026-08-19T00:00:00+08:00", MODEL)
+            .unwrap();
+        let a = links.get("S1").unwrap().clone();
+        let b = links.get("S2").unwrap().clone();
+        assert!(store.merge_with_embedder(&a, &b, None, OTHER_MODEL).is_err());
+        assert!(store
+            .merge_journaled(&a, &b, None, "test", None, "2026-08-19T00:03:00+08:00", OTHER_MODEL)
+            .is_err());
+        // 同空间照常放行
+        assert!(store.merge_with_embedder(&a, &b, None, MODEL).is_ok());
+    }
+
+    /// 原始录音与模型无关,而且正是重建赖以重算质心的素材——按旧标签拒绝它
+    /// 只会丢掉有价值的原声。它**不该**受门禁。
+    #[test]
+    fn 原始录音样本不受空间门禁() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
+        let pid = store
+            .upsert_from_session(&snaps, "2026-08-19T00:00:00+08:00", MODEL)
+            .unwrap()
+            .get("S1")
+            .unwrap()
+            .clone();
+        // append_sample 没有 model 参数,签名本身就是"不受门禁"的证据
+        assert!(store.append_sample(&pid, &[0.1f32; 16_000]).unwrap());
+        assert!(!store.sample_paths_existing(&pid).is_empty(), "样本必须真写进去了");
+    }
+
     use super::*;
 
     fn snap(id: &str, centroid: Vec<f32>, count: u64, sources: &[&str], person: Option<&str>, total_ms: u64) -> ClusterSnapshot {
@@ -1273,7 +1403,7 @@ mod tests {
 
         // 用 upsert 造一个人,再改名验证往返
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "2026-07-05T10:00:00+08:00").unwrap();
+        let links = store.upsert_from_session(&snaps, "2026-07-05T10:00:00+08:00", MODEL).unwrap();
         let pid = links.get("S1").unwrap().clone();
         store.rename(&pid, "张三").unwrap();
 
@@ -1300,20 +1430,20 @@ mod tests {
 
         // 第一次写入:文件尚不存在,没有"已有内容"可备份,不应产生 .bak。
         let snaps1 = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        store.upsert_from_session(&snaps1, "t1").unwrap();
+        store.upsert_from_session(&snaps1, "t1", MODEL).unwrap();
         assert!(!bak_path.exists(), "首次创建不产生 .bak(没有旧内容可备份)");
         let content_after_first = std::fs::read_to_string(tmp.path().join("voiceprints.json")).unwrap();
 
         // 第二次写入:文件已存在,覆盖前应先备份"覆盖前"的内容。
         let snaps2 = vec![snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        store.upsert_from_session(&snaps2, "t2").unwrap();
+        store.upsert_from_session(&snaps2, "t2", MODEL).unwrap();
         assert!(bak_path.exists());
         let bak_first = std::fs::read_to_string(&bak_path).unwrap();
         assert_eq!(bak_first, content_after_first, ".bak 保存的是覆盖前的内容");
 
         // 第三次写入:.bak 已存在,不应再被滚动覆盖(保留最早一次的备份起点)。
         let snaps3 = vec![snap("S3", vec![1.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        store.upsert_from_session(&snaps3, "t3").unwrap();
+        store.upsert_from_session(&snaps3, "t3", MODEL).unwrap();
         let bak_after = std::fs::read_to_string(&bak_path).unwrap();
         assert_eq!(bak_first, bak_after, ".bak 只在首次覆盖前写一次,不随后续写入滚动");
     }
@@ -1351,7 +1481,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let pid = links["S1"].clone();
         store.rename(&pid, "李四").unwrap();
         assert_eq!(store.load().people[&pid].name, "李四");
@@ -1366,7 +1496,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 10, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 10, &["system"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let winner = links["S1"].clone();
         let loser = links["S2"].clone();
 
@@ -1389,7 +1519,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 10, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 10, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let winner = links["S1"].clone();
         let loser = links["S2"].clone();
         store.merge(&loser, &winner).unwrap();
@@ -1409,7 +1539,7 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![1.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (p1, p2, p3) = (links["S1"].clone(), links["S2"].clone(), links["S3"].clone());
         store.rename(&p2, "王五").unwrap(); // p1 无名,p2 有名
 
@@ -1430,7 +1560,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let p1 = links["S1"].clone();
         assert!(store.merge(&p1, &p1).is_err());
         assert!(store.merge(&p1, "P999").is_err());
@@ -1445,7 +1575,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
         store.merge(&p2, &p1).unwrap(); // 制造指向 p1 的 redirect
 
@@ -1462,12 +1592,12 @@ mod tests {
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         // 先建一个已知 person(种子来源:上一场的 upsert)
         let seed = vec![snap("S1", vec![1.0, 0.0], 10, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&seed, "t1").unwrap();
+        let links = store.upsert_from_session(&seed, "t1", MODEL).unwrap();
         let pid = links["S1"].clone();
 
         // 第二场:该簇已带 person=Some(续录/种子命中),回写加权质心 + 累加 total_ms
         let second = vec![snap("S9", vec![0.0, 1.0], 10, &["mic"], Some(&pid), 3000)];
-        let links2 = store.upsert_from_session(&second, "t2").unwrap();
+        let links2 = store.upsert_from_session(&second, "t2", MODEL).unwrap();
         assert!(links2.is_empty(), "已关联 person 的簇不产生新建映射");
 
         let vp = store.load();
@@ -1484,7 +1614,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         assert_eq!(links.len(), 1);
         let pid = &links["S1"];
         let vp = store.load();
@@ -1503,7 +1633,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS - 1)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         assert!(links.is_empty());
         assert!(store.load().people.is_empty());
     }
@@ -1513,7 +1643,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let snaps = vec![snap("S1", vec![], 0, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         assert!(links.is_empty(), "空质心不入库,即使 total_ms 够格");
         assert!(store.load().people.is_empty());
     }
@@ -1524,7 +1654,7 @@ mod tests {
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         // person 指向一个从未存在过的 id:resolve 应返回 None,upsert 应跳过而非报错/新建
         let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], Some("P999"), AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         assert!(links.is_empty());
         assert!(store.load().people.is_empty());
     }
@@ -1537,7 +1667,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
 
         // 逐份追加:第 1 份走历史布局 <id>.wav,第 2 份 <id>-2.wav。
@@ -1718,17 +1848,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t0", MODEL)
             .unwrap();
         let pid = links["S1"].clone();
         assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "入库场即第一份变体");
 
         // 净增量 <10s 的场不记变体;≥10s 的记,环形上限 5(挤最旧)。
-        store.upsert_from_session(&[snap("Sx", vec![0.9, 0.1], 2, &["mic"], Some(&pid), 5_000)], "t-short").unwrap();
+        store.upsert_from_session(&[snap("Sx", vec![0.9, 0.1], 2, &["mic"], Some(&pid), 5_000)], "t-short", MODEL).unwrap();
         assert_eq!(store.load().people[&pid].session_centroids["mic"].len(), 1, "短场不记");
         for i in 0..6 {
             store
-                .upsert_from_session(&[snap("Sx", vec![1.0, i as f32 * 0.1], 3, &["mic"], Some(&pid), 12_000)], &format!("t{}", i + 1))
+                .upsert_from_session(&[snap("Sx", vec![1.0, i as f32 * 0.1], 3, &["mic"], Some(&pid), 12_000)], &format!("t{}", i + 1), MODEL)
                 .unwrap();
         }
         let list = &store.load().people[&pid].session_centroids["mic"];
@@ -1748,6 +1878,7 @@ mod tests {
                     snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
                 ],
                 "t1",
+            MODEL,
             )
             .unwrap();
         let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
@@ -1849,6 +1980,7 @@ mod tests {
                     snap("S2", vec![0.0, 1.0], 5, &["system"], None, AUTO_ENROLL_MS),
                 ],
                 "t1",
+            MODEL,
             )
             .unwrap();
         let (pa, pb) = (links["S1"].clone(), links["S2"].clone());
@@ -1886,6 +2018,7 @@ mod tests {
                     snap("S3", vec![1.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
                 ],
                 "t1",
+            MODEL,
             )
             .unwrap();
         let (pa, pb, pc) = (links["S1"].clone(), links["S2"].clone(), links["S3"].clone());
@@ -1912,7 +2045,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1")
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1", MODEL)
             .unwrap();
         let p1 = links["S1"].clone();
         for _ in 0..3 {
@@ -1948,7 +2081,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1")
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t1", MODEL)
             .unwrap();
         let p1 = links["S1"].clone();
         for _ in 0..MAX_SAMPLES {
@@ -1966,7 +2099,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (p1, p2) = (links["S1"].clone(), links["S2"].clone());
         // loser 3 份、winner 上限-1 份:无嵌入器(旧行为)= winner 全留,loser 按序补
         // 1 个空槽,余下 2 份删除。样本 <1s,即使有嵌入器也嵌不出(排最后补位同序)。
@@ -1999,7 +2132,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        let links = store.upsert_from_session(&snaps, "t1").unwrap();
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
         let (loser, winner) = (links["S1"].clone(), links["S2"].clone());
         // winner 满员 10 份、全是同一声线(恒定直流);loser 1 份独特声线(交替方波)。
         // 旧行为会因 winner 满员直接丢掉 loser 的独特样本;多样性挑选必须留下它。
@@ -2011,7 +2144,7 @@ mod tests {
 
         let mut e = FlipEmbedder;
         store
-            .merge_with_embedder(&loser, &winner, Some(&mut e as &mut dyn crate::diar::SpeakerEmbedder))
+            .merge_with_embedder(&loser, &winner, Some(&mut e as &mut dyn crate::diar::SpeakerEmbedder), MODEL)
             .unwrap();
 
         let kept = store.sample_paths_existing(&winner);
@@ -2068,7 +2201,7 @@ mod tests {
         r.set_enroller(
             AUTO_ENROLL_MS,
             Box::new(move |snap| {
-                store_cb.upsert_from_session(std::slice::from_ref(snap), "t-live").ok()
+                store_cb.upsert_from_session(std::slice::from_ref(snap), "t-live", MODEL).ok()
                     .and_then(|links| links.get(&snap.id).cloned())
             }),
         );
@@ -2096,7 +2229,7 @@ mod tests {
         assert_eq!(snaps[0].person.as_deref(), Some(pid.as_str()));
         assert_eq!(snaps[0].count, 2, "停止快照只报入库后的净增量");
         assert_eq!(snaps[0].total_ms, 4000);
-        store.upsert_from_session(&snaps, "t-stop").unwrap();
+        store.upsert_from_session(&snaps, "t-stop", MODEL).unwrap();
         let vp = store.load();
         assert_eq!(vp.people[&pid].centroids["mic"].count, n_segs as u64 + 2, "入库段+2 线性增长,不双计");
         assert_eq!(vp.people[&pid].total_ms, AUTO_ENROLL_MS + 4000);
@@ -2116,7 +2249,7 @@ mod tests {
 
         // 库里先有一个人,mic 质心 count=40(模拟此前多场累积的样本数)。
         let seed_snap = vec![snap("S0", vec![1.0, 0.0, 0.0], 40, &["mic"], None, AUTO_ENROLL_MS)];
-        let links = store.upsert_from_session(&seed_snap, "t0").unwrap();
+        let links = store.upsert_from_session(&seed_snap, "t0", MODEL).unwrap();
         let pid = links["S0"].clone();
         assert_eq!(store.load().people[&pid].centroids["mic"].count, 40);
 
@@ -2132,7 +2265,7 @@ mod tests {
         assert_eq!(session_snaps[0].person.as_deref(), Some(pid.as_str()));
 
         // upsert 回库:应是 40+2=42,不该翻倍成 40+42=82。
-        store.upsert_from_session(&session_snaps, "t1").unwrap();
+        store.upsert_from_session(&session_snaps, "t1", MODEL).unwrap();
         let vp = store.load();
         assert_eq!(
             vp.people[&pid].centroids["mic"].count, 42,
@@ -2153,7 +2286,7 @@ mod tests {
             snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "2026-07-31T10:00:00+08:00").unwrap();
+        store.upsert_from_session(&snaps, "2026-07-31T10:00:00+08:00", MODEL).unwrap();
         store.rename("P2", "张三").unwrap();
         write_fake_sample(tmp.path(), "P1.wav");
         write_fake_sample(tmp.path(), "P2.wav");
@@ -2162,7 +2295,7 @@ mod tests {
 
     /// 造好合并日志条目后执行某操作,断言条目失效与否。
     fn journaled_entry(store: &VoiceprintStore, tmp: &tempfile::TempDir) -> String {
-        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         assert!(j.entry(&jid).unwrap().invalid_reason.is_none());
         jid
@@ -2201,7 +2334,7 @@ mod tests {
         let jid = journaled_entry(&store, &tmp);
         // P2(经 redirect 解析)又录了一场
         let snaps = vec![snap("S9", vec![0.0, 1.0], 3, &["mic"], Some("P2"), 20_000)];
-        store.upsert_from_session(&snaps, "t2").unwrap();
+        store.upsert_from_session(&snaps, "t2", MODEL).unwrap();
         assert_invalidated(&tmp, &jid, "新会议");
     }
 
@@ -2235,7 +2368,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
         let jid = store
-            .merge_journaled("P1", "P2", None, "auto", Some(0.9), "2026-07-31T11:00:00+08:00")
+            .merge_journaled("P1", "P2", None, "auto", Some(0.9), "2026-07-31T11:00:00+08:00", MODEL)
             .unwrap();
         assert_eq!(jid, "m-P1");
 
@@ -2258,7 +2391,7 @@ mod tests {
     fn merge_journaled_manual_is_preacknowledged() {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
-        let jid = store.merge_journaled("P1", "P2", None, "manual", None, "t").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "manual", None, "t", MODEL).unwrap();
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         assert!(j.entry(&jid).unwrap().acknowledged, "manual 不进回执队列,撤销走页内撤销条");
     }
@@ -2272,9 +2405,9 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3,均未命名
-        let j1 = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
-        let j2 = store.merge_journaled("P3", "P2", None, "auto", None, "t2").unwrap();
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap(); // P1 P2 P3,均未命名
+        let j1 = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let j2 = store.merge_journaled("P3", "P2", None, "auto", None, "t2", MODEL).unwrap();
 
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         let e1 = j.entry(&j1).unwrap();
@@ -2367,7 +2500,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
         let before = store.load();
-        let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1", MODEL).unwrap();
 
         store.undo_merge(&jid).unwrap();
 
@@ -2393,9 +2526,9 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap(); // P1 P2 P3
         store.merge("P3", "P1").unwrap(); // P3 -> P1(历史合并,无日志)
-        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         assert_eq!(store.load().redirects.get("P3").map(String::as_str), Some("P2"), "压扁改指 P2");
 
         store.undo_merge(&jid).unwrap();
@@ -2408,7 +2541,7 @@ mod tests {
     fn undo_merge_rejects_invalidated_entry_with_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
-        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         j.invalidate(&["P2"], "此人随后被改名", None);
 
@@ -2423,7 +2556,7 @@ mod tests {
     fn acknowledge_merge_removes_entry_same_as_direct_journal_acknowledge() {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
-        let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", Some(0.9), "t1", MODEL).unwrap();
 
         store.acknowledge_merge(&jid).unwrap();
 
@@ -2441,10 +2574,10 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap();
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap();
         let before = store.load();
-        let j1 = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
-        let j2 = store.merge_journaled("P3", "P2", None, "auto", None, "t2").unwrap();
+        let j1 = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let j2 = store.merge_journaled("P3", "P2", None, "auto", None, "t2", MODEL).unwrap();
 
         store.undo_merge(&j1).unwrap_err(); // j1 已被 j2 失效
         store.undo_merge(&j2).unwrap(); // 后进先出:先撤 j2
@@ -2461,7 +2594,7 @@ mod tests {
     fn setup_invalidated_merge() -> (VoiceprintStore, String, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
-        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         j.invalidate(&["P2"], "相关人物随后又被合并", None);
         (store, jid, tmp)
@@ -2471,7 +2604,7 @@ mod tests {
     fn setup_valid_merge() -> (VoiceprintStore, String, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = two_people_store(&tmp);
-        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
+        let jid = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
         (store, jid, tmp)
     }
 
@@ -2486,9 +2619,9 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
-        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
-        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2", MODEL).unwrap();
         let j = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         j.invalidate(&["P3"], "相关人物随后又发生变化", None);
         (store, entry_a, entry_b, tmp)
@@ -2566,9 +2699,9 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
-        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
-        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2", MODEL).unwrap();
         // entry_a 已被 entry_b 的创建连带失效(触及 P2);entry_b 本身仍有效。
 
         store.restore_merged_person(&entry_a).unwrap();
@@ -2594,9 +2727,9 @@ mod tests {
             snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
             snap("S3", vec![0.7, 0.7], 5, &["mic"], None, AUTO_ENROLL_MS),
         ];
-        store.upsert_from_session(&snaps, "t0").unwrap(); // P1 P2 P3
-        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1").unwrap();
-        let _entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2").unwrap();
+        store.upsert_from_session(&snaps, "t0", MODEL).unwrap(); // P1 P2 P3
+        let entry_a = store.merge_journaled("P1", "P2", None, "auto", None, "t1", MODEL).unwrap();
+        let _entry_b = store.merge_journaled("P2", "P3", None, "auto", None, "t2", MODEL).unwrap();
 
         store.restore_merged_person(&entry_a).unwrap();
 
@@ -2610,7 +2743,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0", MODEL)
             .unwrap();
         let pid = links.get("S1").unwrap().clone();
 
@@ -2619,8 +2752,10 @@ mod tests {
                 &pid,
                 &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)],
                 "2026-08-08T01:00:00+08:00",
+            MODEL,
             )
-            .unwrap();
+            .unwrap()
+            .expect("同模型,门禁应放行");
         let vp = store.load();
         let p = vp.people.get(&pid).unwrap();
         assert_eq!(p.total_ms, AUTO_ENROLL_MS + 4_000);
@@ -2633,7 +2768,7 @@ mod tests {
     fn reinforce_feedback_rejects_unknown_person() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
-        let err = store.reinforce_feedback("P999", &[("mic".into(), vec![1.0], 1, 2_000)], "t");
+        let err = store.reinforce_feedback("P999", &[("mic".into(), vec![1.0], 1, 2_000)], "t", MODEL);
         assert!(err.is_err(), "悬空人物必须显式报错,不得静默成功");
     }
 
@@ -2642,12 +2777,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = VoiceprintStore::new(tmp.path().to_path_buf());
         let links = store
-            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0")
+            .upsert_from_session(&[snap("S1", vec![1.0, 0.0, 0.0, 0.0], 4, &["mic"], None, AUTO_ENROLL_MS)], "t0", MODEL)
             .unwrap();
         let pid = links.get("S1").unwrap().clone();
         let applied = store
-            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t1")
-            .unwrap();
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t1", MODEL)
+            .unwrap().expect("同模型,门禁应放行");
 
         // 场景一:未被动过 → 还原成功,total_ms 回到初值。
         assert!(store.restore_feedback(&pid, &applied.person_before, &applied.person_after).unwrap());
@@ -2655,10 +2790,10 @@ mod tests {
 
         // 场景二:重放回灌后又被别的写动过 → 拒绝还原。
         let applied2 = store
-            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t2")
-            .unwrap();
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 1.0, 0.0, 0.0], 2, 4_000)], "t2", MODEL)
+            .unwrap().expect("同模型,门禁应放行");
         store
-            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 0.0, 1.0, 0.0], 1, 2_000)], "t3")
+            .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 0.0, 1.0, 0.0], 1, 2_000)], "t3", MODEL)
             .unwrap();
         assert!(!store.restore_feedback(&pid, &applied2.person_before, &applied2.person_after).unwrap());
     }
@@ -2674,7 +2809,7 @@ mod tests {
         assert!(store.load().people.get(&id2).is_none());
         // 有质心的不删。
         store
-            .reinforce_feedback(&id1, &[("mic".into(), vec![1.0, 0.0], 1, 2_000)], "t2")
+            .reinforce_feedback(&id1, &[("mic".into(), vec![1.0, 0.0], 1, 2_000)], "t2", MODEL)
             .unwrap();
         assert!(!store.delete_person_if_empty(&id1).unwrap());
         assert!(store.load().people.contains_key(&id1));
@@ -2692,7 +2827,7 @@ mod tests {
         // 有邮箱的空质心档案不可被补偿删除。
         assert!(!store.delete_person_if_empty(&a).unwrap());
         // 合并并集:b 并入 a 后邮箱不丢。
-        store.merge_journaled(&b, &a, None, "manual", None, "t2").unwrap();
+        store.merge_journaled(&b, &a, None, "manual", None, "t2", MODEL).unwrap();
         let emails = &store.load().people[&a].emails;
         assert!(emails.contains(&"zw@x.com".to_string()) && emails.contains(&"boss@x.com".to_string()));
     }

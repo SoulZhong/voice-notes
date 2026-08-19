@@ -1252,6 +1252,10 @@ fn spawn_session(
         // 混音成品轨=是、识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型
         // 之前：识别方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+        // 本场声纹的模型标签。**必须取自 cfg 这一份快照**,与下面取嵌入器同源——
+        // 中途再读一次设置就可能与实际用来算向量的那个模型分家,于是"声明的空间"和
+        // "真实的空间"不符,而库那边只认声明(见 voiceprints::space_ok)。
+        let speaker_model = cfg.speaker_model.clone();
         let (language_filter, use_aec_capture, mix_track) = (
             cfg.language_filter,
             cfg.capture_path == settings::CapturePath::Aec,
@@ -1829,12 +1833,15 @@ fn spawn_session(
         if let Ok(root) = data_root(&app) {
             let vp_store_e = store::VoiceprintStore::new(root);
             let live_enrolled_e = live_enrolled.clone();
+            let enroll_model = speaker_model.clone();
             registry.set_enroller(
                 store::AUTO_ENROLL_MS,
                 Box::new(move |snap| {
-                    match vp_store_e
-                        .upsert_from_session(std::slice::from_ref(snap), &chrono::Local::now().to_rfc3339())
-                    {
+                    match vp_store_e.upsert_from_session(
+                        std::slice::from_ref(snap),
+                        &chrono::Local::now().to_rfc3339(),
+                        &enroll_model,
+                    ) {
                         Ok(links) => {
                             let pid = links.get(&snap.id).cloned();
                             if let Some(pid) = &pid {
@@ -1865,6 +1872,8 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
+        // 停录快照入库用的模型标签,与实时入库同一份快照(见上方 speaker_model)。
+        let snapshot_model = speaker_model.clone();
         let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
             Ok(root) => Some(store::VoiceprintStore::new(root)),
             Err(e) => {
@@ -2035,7 +2044,11 @@ fn spawn_session(
                         // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
                         // person_id 随 finalize 落盘。
                         if let Some(store) = &vp_store_d {
-                            match store.upsert_from_session(&snaps, &chrono::Local::now().to_rfc3339()) {
+                            match store.upsert_from_session(
+                                &snaps,
+                                &chrono::Local::now().to_rfc3339(),
+                                &snapshot_model,
+                            ) {
                                 Ok(enrolled) => {
                                     // 原 set_speaker_person(cluster, person) 循环改为把新关联
                                     // 注进 snaps[].person 随消息走:runner 的 store_centroids
@@ -3837,7 +3850,10 @@ fn spawn_feedback(
             match action {
                 feedback::FeedbackAction::Noop => Ok(()),
                 feedback::FeedbackAction::MergePrior { prior } => {
-                    let receipt = vp.merge_journaled(&prior, &target, None, "feedback-assign", None, &now)?;
+                    // 不带嵌入器:并的是库里已有的质心,本来就同空间,传库当前标签。
+                    let lib_model = vp.load().embedding_model.clone();
+                    let receipt =
+                        vp.merge_journaled(&prior, &target, None, "feedback-assign", None, &now, &lib_model)?;
                     eprintln!("feedback: 无名先前人物 {prior} 已并入 {target}(回执 {receipt})");
                     Ok(())
                 }
@@ -6023,6 +6039,8 @@ fn do_merge_person(
             origin,
             similarity,
             &now,
+            // emb 是按当前选型现场建的,标签取自同一次判定,不另读一次设置。
+            &current_speaker_model(app),
         )
         .map_err(|e| e.to_string())?;
     if !loser_had_samples {
