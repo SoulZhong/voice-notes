@@ -1,7 +1,7 @@
 # 声纹库写入收口 设计
 
 日期：2026-08-19
-状态：待实施（Codex review 三轮共 13×P1 + 7×P2 已并入，见文末「修订记录」）
+状态：待实施（Codex review 四轮共 17×P1 + 9×P2 已并入，见文末「修订记录」）
 起因：2026-08-19「取消关联」功能三轮 codex review，每轮都在新位置发现同类问题
 
 ## 背景
@@ -105,9 +105,42 @@ IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock(该笔记) → VP_LOCK → 声�
 5. 复核通过才写 ledger 与声纹库
 6. 逆序释放
 
-**关联写入者一律不动。** 原始稿 assign/clear、修订稿 assign、Aing 提交重建含 `person_id` 的修订稿、重转写替换 `speakers.json`、活动 writer 的 `set_speaker_person`——它们**本来就持 `NoteLock`**，于是与上面的复核段天然互斥，无须逐个改造、也不会再漏掉谁。
+**大部分关联写入者不动。** Aing 提交、重转写提交、活动 writer 的 `set_speaker_person`——它们**本来就持 `NoteLock`**，与上面的复核段天然互斥，无须改造、也不会再漏掉谁。
+
+**但 assign / clear / 修订稿 assign 三处必须改**：后台任务需要知道"改之前关联的是谁"（`prior`）才能决定走 `MergePrior` 还是 `Reinforce`，而那个值在写入完成之后就**没了**——锁内重读只能读到新值。所以这三处要在**自己的 `NoteLock` 内**产出一份 transition receipt 并经 actor 回执带出来：
+
+```
+{ before_person: Option<String>, after_person: Option<String>, scope 指纹 }
+```
+
+它们仍然不碰 `FEEDBACK_GATE`。后台任务不再"锁内重读 prior"，而是：**prior 取自 receipt；锁内复核的是"当前关联是否仍等于 receipt.after_person"**。
 
 这一条同时解决跨进程问题：`NoteLock` 是文件锁，另一个实例改不进来。
+
+**门外准备的数据必须与锁内真值绑定。** `NoteLock` 只保证"复核之后不再被插入"，不保证门外那段计算所依据的版本还是当前版本——重转写会在任务计算期间整体替换 segments 与 speakers，即便最终仍关联同一个人，簇成员、source、起止时间都可能变了。因此准备阶段要产出 `PreparedFeedback`，至少绑定：
+
+- 原始稿：speaker + 排序后的 `(seq, source, start_ms, end_ms)` 指纹
+- 修订稿：revision + speaker + source_seqs 指纹
+- 音频轨道元数据签名
+
+锁内比对，不一致则丢弃或重新排队——**绝不拿旧段算出的嵌入去写当前 scope**。
+
+**`NoteLock` 的获取必须是非阻塞 + 退避，不能持 gate 干等。** 已核实：`NoteLock::acquire()` 只尝试约 100ms 就返回 `None`，且**同进程不可重入**；而长期持锁者包括录制 writer（整场）、普通转码（转码 + 删 WAV 全程）、重转写（解码 + 识别 + 提交全程，分钟级）、mixed regen（全程）。协议：
+
+1. 取 `FEEDBACK_GATE`
+2. **非阻塞**试取该笔记 `NoteLock`
+3. 失败 → **连 gate 一起释放**，退避后重新准备（含重新算指纹）再来；不得持 gate 等待
+4. 成功 → 复核 → 写库 → 逆序释放
+
+只调一次 `acquire()` 就放弃会静默丢掉回灌；持着全局 gate 循环等，则一篇正在录制的笔记会把所有笔记的回灌全堵死。两者都不可接受。
+
+**identify 的两条路径要改成"已持锁"变体。** `auto_apply_one` 与自动撤销当前是「`IDENTIFY_ACT_GATE` → 自己取 `NoteLock` 的 assign → 释放 → `FEEDBACK_GATE`」。`NoteLock` 不可重入，新顺序下不能在外层锁住之后再调这些公共 writer。需新增"调用方已持 `NoteLock`"的 refined assign/unassign 变体，改为：
+
+```
+IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock → locked refined edit → VP_LOCK
+```
+
+`recover_identify_ops`（崩溃恢复）当前持 ACT 之后直接动反馈账与声纹库，既不取 `FEEDBACK_GATE` 也不取 `NoteLock`——**必须一并纳入协议**，否则崩溃恢复仍能与人工回灌并发。
 
 **actor 与命令都不碰 `FEEDBACK_GATE`。** 早先的方案是让 lifecycle actor 等门，那会阻塞整个录制控制面（actor 是单线程串行信箱，开录/停录/实时段落写入全从它过）；改为命令线程持门也只是把等待挪到用户点击上。用 `NoteLock` 之后两者都不需要。
 
@@ -119,7 +152,10 @@ IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock(该笔记) → VP_LOCK → 声�
 
 拆成：**门外**解码 + 嵌入 → **锁内**复核 + 账本 + 库提交。identify 与普通回灌都要拆，不是只拆 identify。
 
-**解码移出门会暴露一处临时文件竞态**：`track_pcm` 对同一笔记/信道固定用 `.<source>.refine.wav.tmp` 且开头先删它，并发解码会互删。改为唯一临时名（或按笔记/信道加独立解码锁），不能继续依赖 `FEEDBACK_GATE` 来串行。
+**解码移出门会暴露两处竞态**：
+
+1. `track_pcm` 对同一笔记/信道固定用 `.<source>.refine.wav.tmp` 且开头先删它，并发解码会互删 → 改唯一临时名
+2. 唯一临时名只解决"解码者之间"。转码持 `NoteLock` 会 rename M4A、删除 WAV，而门外解码不持锁，仍可能在 `exists` 与 `read` 之间踩空 → 准备阶段**短持 `NoteLock` 取一次稳定的音频快照**（取完即放，重活在锁外做）
 
 ### 四、模型标签与声纹计算器绑死
 
@@ -132,6 +168,8 @@ IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock(该笔记) → VP_LOCK → 声�
 `VP_LOCK` 是模块静态 `Mutex`，只在进程内有效。抄 `store::notelock` 的模式加一把跨进程文件锁。
 
 **覆盖范围是所有现有 `VP_LOCK` 写入口**，包括改名、邮箱、删除、样本与 journal——**不能只覆盖向量写入**。理由：声纹库的每次变更都是整份 `load → save`，改名同样是完整的读-改-写，用旧快照 save 一次就能把刚完成的模型重建整体盖回去。「非向量不收口」只表示它们不做模型标签校验，不表示不取文件锁。
+
+**必须按"逻辑事务"划边界，而不是机械包住每个现有 `vp_guard()`。** 反例：`append_sample()` 的 `VP_LOCK` 在 inner 返回时就释放了，**之后**才写 journal 失效——只在原 guard 外面套一层文件锁的话，"样本写"与"journal 失效"之间仍能被另一进程插入。定义统一的 `voiceprint_write_guard = VP_LOCK + 文件锁`，由公共 mutator 持有到 **voiceprints + 样本 + journal 三者的整个逻辑事务结束**。
 
 **当前实际暴露面**：已核实 MCP 子进程只 `load()` 声纹库、不写（`mcp/tools.rs:551/565`），眼下能撞上的只有"开两个 GUI 实例"，macOS 由 LaunchServices 天然拦着。**是真漏洞但眼下打不到**——仍要修，因为不变量一的承诺是"永远写不进"。
 
@@ -156,6 +194,12 @@ IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock(该笔记) → VP_LOCK → 声�
 - **样本恢复是硬条件**：`restore_merged_person` 与 `undo_merge` 各一条——样本复制失败时 journal 必须保留；重试路径补齐样本后才收尾且不覆盖新变化
 - **清空后有触发点**：异模型回放返回 `needs_rebuild=true`；调用方在释放锁后发起重建
 - **复核在锁内**：关联在复核之后、写库之前被改，写入必须被拒（以可注入的时序钩子构造）
+- **receipt 提供 prior**：assign/clear 返回的 receipt 里 `before_person` 必须是写入前的真值（写入后已不可恢复）
+- **准备版本绑定**：门外准备完成后段落被重转写替换，锁内比对必须判不一致并丢弃
+- **`NoteLock` 拿不到时不丢任务**：长期持锁者在场时，回灌应退避重排而非静默消失；且不得持 `FEEDBACK_GATE` 等待
+- **identify 的 locked 变体**：外层已持 `NoteLock` 时调用不得再次取锁（不可重入会死锁）
+- **`recover_identify_ops` 走同一协议**
+- **声纹写事务完整**：样本写与 journal 失效之间不得被另一进程插入
 - **`MergePrior` 同样受复核保护**
 - **修订稿路径同样受保护**：修订稿改派后旧任务不得写入旧人物
 - **`TaggedEmbedder`**：标签≠当前选型的实例不得被取用
@@ -183,3 +227,12 @@ IDENTIFY_ACT_GATE → FEEDBACK_GATE → NoteLock(该笔记) → VP_LOCK → 声�
 - 普通回灌的解码/嵌入同样在门内 → 所有 Reinforce 路径都要拆，不只 identify
 - 解码移出门后 `track_pcm` 的固定临时名会互删 → 唯一临时名或独立解码锁
 - `MergePrior` 无 `TaggedEmbedder`，journal 标签应取自被快照库的 `embedding_model`；mismatch 时必须清理 `complete=false` 占位账
+
+**Codex 设计轮四**（4×P1 + 2×P2）：
+
+- 「关联写入者一律不动」**撤回**：`prior` 在写入完成后不可恢复，后台任务锁内只能读到新值 → assign/clear/修订稿 assign 必须在自己的 `NoteLock` 内产出 transition receipt 并经 actor 回执带出
+- 门外算的嵌入未与锁内真值绑定（重转写会整体替换 segments/speakers）→ 新增 `PreparedFeedback` 版本指纹，锁内比对不一致即丢弃或重排
+- `NoteLock::acquire()` 只试约 100ms、同进程不可重入，而录制/转码/重转写/mixed regen 都是长期持锁者 → 明确"非阻塞试锁、失败连 gate 一起释放、退避重排"的协议
+- identify 的 `auto_apply_one` 与自动撤销会自取 `NoteLock`，新顺序下不可重入 → 新增 locked 变体；`recover_identify_ops` 也必须纳入协议
+- 唯一临时名只解决解码者互删，与转码 rename/删 WAV 的竞争仍在 → 准备阶段短持 `NoteLock` 取稳定音频快照
+- 文件锁要按逻辑事务划边界（`append_sample` 的样本写与 journal 失效当前分处两段临界区）
