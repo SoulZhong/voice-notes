@@ -835,11 +835,15 @@
           class="ctl switch"
           bind:checked={telemetryEnabled}
           disabled={!settings}
-          onchange={() => {
-            // 前端实例当场生效:关掉要立刻停,不能等下次启动(回放尤其如此)。
-            // 后端总开关由 set_settings 同步。
-            applyTelemetrySetting(telemetryEnabled);
-            void saveSetting((s) => (s.telemetry_enabled = telemetryEnabled));
+          onchange={async () => {
+            // 两个方向刻意不对称,都倒向"不发"那一侧(codex review P1#2):
+            // 关掉 → 先当场停再落盘。落盘失败也已经停了,回放尤其不能等下次启动。
+            // 打开 → 先落盘再起。抢跑的话,start() 会去问后端总开关、读到的还是
+            //        旧值(false),刚打开的开关当场被关回去;落盘若失败,
+            //        saveSetting 会把本地值同步回磁盘真值,这里再按真值决定起不起。
+            if (!telemetryEnabled) applyTelemetrySetting(false);
+            await saveSetting((s) => (s.telemetry_enabled = telemetryEnabled));
+            if (telemetryEnabled) applyTelemetrySetting(true);
           }}
         />
       </label>

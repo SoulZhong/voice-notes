@@ -15,50 +15,93 @@ const CJK_RUN_DROP: usize = 12;
 
 /// 脱敏一段可能进入上报载荷的文本。
 pub fn redact(input: &str) -> String {
-    let s = redact_home_paths(input);
+    let s = redact_windows_paths(input);
+    let s = redact_unix_paths(&s);
     let s = redact_api_keys(&s);
     drop_long_cjk_runs(&s)
 }
 
-/// 家目录路径收敛为 `<HOME>/…`:`/Users/张伟/x` 与 `/home/zhangwei/x` 都会带出用户名,
-/// 而用户名常常就是真实姓名。同时把 notes 目录下的文件名收敛掉——那是会议标题。
-fn redact_home_paths(s: &str) -> String {
-    let s = redact_windows_home(s);
+/// 绝对路径收敛。家目录一档(`<HOME_PATH>`)、其余一档(`<PATH>`)。
+///
+/// **为什么家目录之外的也要收**:数据目录与模型目录都可以被用户指到任何地方——
+/// `/Volumes/客户名/季度复盘/`、网络盘、外置盘。迁移失败与模型加载失败的错误消息里
+/// 带的正是那些路径,而它们既不在家目录下、中文串又常常短于整段丢弃的阈值,
+/// 于是会原样出站(codex review P1#3)。
+fn redact_unix_paths(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s.as_str();
-    while let Some(pos) = rest.find("/Users/").or_else(|| rest.find("/home/")) {
+    let mut rest = s;
+    while let Some(pos) = find_path_start(rest) {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos..];
         // 吃到路径结束。注意 macOS 有 "Application Support" 这种含空格的路径段,
         // 以空白为终点会把后半截漏在外面(实测就漏出了会议标题)。改为:遇到引号、
         // 逗号、分号、换行,或"空格后紧跟非路径样的词"才收尾。
         let end = path_end(tail);
-        out.push_str("<HOME_PATH>");
+        let seg = &tail[..end];
+        out.push_str(if seg.starts_with("/Users/") || seg.starts_with("/home/") {
+            "<HOME_PATH>"
+        } else {
+            "<PATH>"
+        });
         rest = &tail[end..];
     }
     out.push_str(rest);
     out
 }
 
-/// Windows 家目录:`C:\Users\Alice\...\notes\周会.json`。Windows 是受支持平台,
-/// 这类路径同样会带出用户名(常是真实姓名)与 notes 下的会议标题(codex review 发现)。
-fn redact_windows_home(s: &str) -> String {
+/// 路径起点:一个 `/`,前面是行首或分隔符,且这条路径至少两段。
+///
+/// **前一个字符不能是 `:` 或 `/`**——否则 `tauri://localhost/notes/note-1` 这类
+/// URL 会被整条吃掉。URL 里没有用户内容(路由动态段一律是 id,见设计文档),
+/// 却是定位前端异常现场的依据,不该误伤。同理要求至少两段:`a/b` 这种相对写法
+/// 与孤零零一个 `/` 都不是路径。
+fn find_path_start(s: &str) -> Option<usize> {
+    for (i, c) in s.char_indices() {
+        if c != '/' {
+            continue;
+        }
+        if i > 0 {
+            let prev = s[..i].chars().next_back()?;
+            if !matches!(prev, ' ' | '\t' | '"' | '\'' | '(' | '[' | ',' | ';' | '=' | '\n' | '\r') {
+                continue;
+            }
+        }
+        let end = path_end(&s[i..]);
+        if s[i..i + end].matches('/').count() >= 2 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Windows 绝对路径:`C:\Users\Alice\...\notes\周会.json`,以及自定义目录可能落在的
+/// `D:\客户\...`。Windows 是受支持平台,这类路径同样会带出用户名(常是真实姓名)与
+/// notes 下的会议标题(codex review 发现)。
+///
+/// 终点判据与 unix 分支**共用 `path_end`**。此前这里是另一套(任何空格即终点),
+/// 于是 `C:\Users\Alice\Meeting Notes\Q3 roadmap.json` 会在第一个空格处停下,
+/// 把后半截连同会议标题漏在外面(codex review P1#4)。
+fn redact_windows_paths(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     loop {
-        // 找 "<盘符>:\Users\"
-        let Some(u) = rest.find(":\\Users\\") else { break };
-        // 盘符是它前面那一个字符
-        let start = rest[..u].char_indices().next_back().map(|(i, _)| i).unwrap_or(u);
+        // 找 "<盘符>:\":盘符是 `:` 前面那一个 ASCII 字母。
+        let Some(start) = rest.char_indices().find_map(|(i, c)| {
+            if !c.is_ascii_alphabetic() {
+                return None;
+            }
+            rest[i + c.len_utf8()..].starts_with(":\\").then_some(i)
+        }) else {
+            break;
+        };
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let end = tail
-            .char_indices()
-            .skip(1)
-            .find(|(_, c)| matches!(c, '"' | '\'' | ',' | ';' | '\n' | '\r' | ')' | ']') || *c == ' ')
-            .map(|(i, _)| i)
-            .unwrap_or(tail.len());
-        out.push_str("<HOME_PATH>");
+        let end = path_end(tail);
+        let seg = &tail[..end];
+        // `C:\Users\` 才算家目录,`D:\客户\` 只是普通绝对路径——两档都不出站,
+        // 但占位符分开,看板上能区分"用户名泄漏面"与"自定义目录面"。
+        let is_home = seg.len() > 2 && seg[2..].to_ascii_lowercase().starts_with("\\users\\");
+        out.push_str(if is_home { "<HOME_PATH>" } else { "<PATH>" });
         rest = &tail[end..];
     }
     out.push_str(rest);
@@ -213,6 +256,39 @@ mod tests {
     fn 密钥形态被抹掉() {
         assert!(!redact("key=sk-abcdefghijklmnop failed").contains("sk-abcdefghijklmnop"));
         assert!(!redact("phc_qgqdrtaowrPfMPzmD9b7e9JSUPRc3RY3oGAeeKtAAV7E leaked").contains("phc_qgq"));
+    }
+
+    /// 数据目录/模型目录可被指到任何地方。这类路径既不在家目录下,里面的中文串
+    /// 又常常短于"整段丢弃"的阈值——不收就原样出站(codex review P1#3)。
+    #[test]
+    fn 家目录之外的绝对路径同样收敛() {
+        let out = redact("迁移失败: 复制 /Volumes/客户名/季度复盘/note.json 失败");
+        assert!(!out.contains("客户名"), "外置盘上的目录名必须脱掉: {out}");
+        assert!(!out.contains("季度复盘"), "路径里的会议名必须脱掉: {out}");
+        assert!(out.contains("<PATH>"), "应留占位便于识别: {out}");
+    }
+
+    #[test]
+    fn windows非家目录的绝对路径同样收敛() {
+        let out = redact("migrate failed: D:\\客户\\周会.json unreachable");
+        assert!(!out.contains("客户"), "盘符路径里的目录名必须脱掉: {out}");
+        assert!(!out.contains("周会"), "盘符路径里的会议名必须脱掉: {out}");
+    }
+
+    /// Windows 分支此前是另一套终点判据(任何空格即终点),含空格的路径会漏后半截。
+    #[test]
+    fn windows含空格的路径不漏后半截() {
+        let out = redact("write C:\\Users\\Alice\\Meeting Notes\\Q3 roadmap.json failed");
+        assert!(!out.contains("Meeting"), "含空格的目录名必须整条脱掉: {out}");
+        assert!(!out.contains("roadmap"), "会议标题必须整条脱掉: {out}");
+        assert!(out.contains("failed"), "尾部英文措辞应保留: {out}");
+    }
+
+    /// URL 不是路径:里面没有用户内容(路由动态段一律是 id),却是定位现场的依据。
+    #[test]
+    fn url不被当成路径误伤() {
+        let clean = "load failed at tauri://localhost/notes/note-140751";
+        assert_eq!(redact(clean), clean);
     }
 
     #[test]

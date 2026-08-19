@@ -45,20 +45,59 @@ function pathEnd(tail: string): number {
   return tail.length;
 }
 
-/** 家目录路径(含 Windows)收敛。用户名常常就是真实姓名,notes 下的文件名就是会议标题。 */
-function redactHomePaths(input: string): string {
+/** 路径起点:一个 `/`,前面是行首或分隔符,且这条路径至少两段。
+ *
+ *  **前一个字符不能是 `:` 或 `/`**——否则 `tauri://localhost/notes/note-1` 这类 URL
+ *  会被整条吃掉。URL 里没有用户内容(路由动态段一律是 id),却是定位前端异常现场的
+ *  依据,不该误伤。与 Rust 侧 `find_path_start` 同判据。 */
+const PATH_BOUNDARY = new Set([" ", "\t", '"', "'", "(", "[", ",", ";", "=", "\n", "\r"]);
+
+function findPathStart(s: string): number {
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "/") continue;
+    if (i > 0 && !PATH_BOUNDARY.has(s[i - 1])) continue;
+    const end = pathEnd(s.slice(i));
+    const seg = s.slice(i, i + end);
+    if ((seg.match(/\//g) ?? []).length >= 2) return i;
+  }
+  return -1;
+}
+
+/** unix 绝对路径收敛。家目录一档 `<HOME_PATH>`、其余一档 `<PATH>`。
+ *
+ *  家目录之外的也要收:数据目录与模型目录可被用户指到任何地方(`/Volumes/客户名/…`、
+ *  网络盘),那些路径既不在家目录下、中文串又常短于整段丢弃的阈值,不收就原样出站。 */
+function redactUnixPaths(input: string): string {
   let out = "";
   let rest = input;
   for (;;) {
-    const starts = ["/Users/", "/home/"].map((k) => rest.indexOf(k)).filter((i) => i >= 0);
-    // Windows:C:\Users\Alice\... 盘符是 ":\Users\" 前面那一个字符。
-    const win = rest.search(/[A-Za-z]:\\Users\\/);
-    if (win >= 0) starts.push(win);
-    if (starts.length === 0) break;
-    const pos = Math.min(...starts);
-    out += rest.slice(0, pos) + "<HOME_PATH>";
+    const pos = findPathStart(rest);
+    if (pos < 0) break;
     const tail = rest.slice(pos);
-    rest = tail.slice(pathEnd(tail));
+    const end = pathEnd(tail);
+    const seg = tail.slice(0, end);
+    out += rest.slice(0, pos);
+    out += seg.startsWith("/Users/") || seg.startsWith("/home/") ? "<HOME_PATH>" : "<PATH>";
+    rest = tail.slice(end);
+  }
+  return out + rest;
+}
+
+/** Windows 绝对路径:`C:\Users\Alice\…` 与自定义目录可能落在的 `D:\客户\…`。
+ *  终点判据与 unix 分支共用 pathEnd,与 Rust 侧 redact_windows_paths 同判据。 */
+function redactWindowsPaths(input: string): string {
+  let out = "";
+  let rest = input;
+  for (;;) {
+    const m = /[A-Za-z]:\\/.exec(rest);
+    if (!m) break;
+    const pos = m.index;
+    const tail = rest.slice(pos);
+    const end = pathEnd(tail);
+    const seg = tail.slice(0, end);
+    out += rest.slice(0, pos);
+    out += seg.slice(2).toLowerCase().startsWith("\\users\\") ? "<HOME_PATH>" : "<PATH>";
+    rest = tail.slice(end);
   }
   return out + rest;
 }
@@ -100,7 +139,7 @@ function dropLongCjkRuns(s: string): string {
 }
 
 export function redact(input: string): string {
-  return dropLongCjkRuns(redactKeys(redactHomePaths(input)));
+  return dropLongCjkRuns(redactKeys(redactUnixPaths(redactWindowsPaths(input))));
 }
 
 /** posthog-js 的 before_send:对异常事件的消息字段做脱敏。

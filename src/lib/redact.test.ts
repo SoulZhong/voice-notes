@@ -48,6 +48,32 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(redact("key=sk-abcdefghijklmnop failed")).not.toContain("sk-abcdefghijklmnop");
   });
 
+  it("家目录之外的绝对路径同样收敛", () => {
+    // 数据目录可被指到任何地方,这类路径里的中文串常短于整段丢弃阈值。
+    const out = redact("迁移失败: 复制 /Volumes/客户名/季度复盘/note.json 失败");
+    expect(out).not.toContain("客户名");
+    expect(out).not.toContain("季度复盘");
+    expect(out).toContain("<PATH>");
+  });
+
+  it("Windows 非家目录的绝对路径同样收敛", () => {
+    const out = redact("migrate failed: D:\\客户\\周会.json unreachable");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
+  it("Windows 含空格的路径不漏后半截", () => {
+    const out = redact("write C:\\Users\\Alice\\Meeting Notes\\Q3 roadmap.json failed");
+    expect(out).not.toContain("Meeting");
+    expect(out).not.toContain("roadmap");
+    expect(out).toContain("failed");
+  });
+
+  it("URL 不被当成路径误伤", () => {
+    const clean = "load failed at tauri://localhost/notes/note-140751";
+    expect(redact(clean)).toBe(clean);
+  });
+
   it("无敏感内容时原样通过", () => {
     const clean = "asr engine returned empty result (code 3)";
     expect(redact(clean)).toBe(clean);

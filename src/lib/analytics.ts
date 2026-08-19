@@ -199,6 +199,9 @@ async function start(): Promise<void> {
   if (started) return;
   // 环境快照拿不到(IPC 不可用)也照常起:上报少几个维度,好过整块不工作。
   env = await invoke<AppEnv>("app_env").catch(() => null);
+  // await 之后必须重查:这一跳期间用户完全可能又把开关关掉,不查就照样 init
+  // 并开始录制(codex review P1#2)。
+  if (optedOut || started) return;
   started = true;
   posthog.init(PROJECT_KEY, analyticsConfig());
   const id = ensureDistinctId(localStorage);

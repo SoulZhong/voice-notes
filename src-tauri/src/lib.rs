@@ -7556,6 +7556,11 @@ pub fn run() {
             };
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
+            // 会话标记要尽早落:它到 setup 末尾才写的话,插件构建、日志、模型、后台
+            // 服务这一大段启动期里发生的 SIGSEGV/OOM 会留着上次的干净标记,下次启动
+            // 什么也报不出来——而启动期崩溃恰恰是最难在别人机器上复现的一类
+            // (codex review P2#7)。事件仍在本闭包末尾发,那时 track 才有意义。
+            let boot = app_data.as_ref().map(|d| telemetry::open_session(d));
             // 上报总开关:settings 一读到就同步。放这么早是因为 telemetry::init() 在
             // run() 开头就装好了 panic hook——从这一刻起到这里之间发生的 panic 仍会上报
             // (那个窗口只有几毫秒,且此时连设置都还没读到,没有更早的判据可用)。
@@ -7677,10 +7682,10 @@ pub fn run() {
                     }
                 });
             }
-            // 上次运行的痕迹:硬崩溃(SIGSEGV/OOM/强退,panic hook 覆盖不到)与升级首启。
-            // 必须在 AppStarted 之前发——它们描述的是上一次运行,时间上排在本次启动之前。
-            if let Some(dir) = &app_data {
-                let boot = telemetry::open_session(dir);
+            // 上次运行的痕迹(标记已在本闭包开头读走并重落,见那里的说明):硬崩溃
+            //(SIGSEGV/OOM/强退,panic hook 覆盖不到)与升级首启。必须在 AppStarted
+            // 之前发——它们描述的是上一次运行,时间上排在本次启动之前。
+            if let Some(boot) = &boot {
                 if boot.unclean_exit {
                     telemetry::track(
                         &handle,

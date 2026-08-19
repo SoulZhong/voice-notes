@@ -414,8 +414,18 @@ pub fn track(_app: &AppHandle, event: Event) {
         return;
     }
     let (name, props) = event.payload();
-    match current_id() {
-        Some(id) => emit(name, Some(&id), props),
+    // 判定"有没有 id"与"入队"必须在同一把锁下完成:分成两步的话,读到"无 id"之后、
+    // 入队之前,另一线程可能刚好把 id 设上并排空了当时还空的队列——这条事件就会一直
+    // 滞留到退出,最后以 personless 发出(codex review P2#5)。
+    let mut guard = match outbox().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    match guard.id.clone() {
+        Some(id) => {
+            drop(guard); // 绝不持锁调 SDK
+            emit(name, Some(&id), props);
+        }
         // id 还没到:压队,等 set_distinct_id 补发。
         //
         // 为什么不像以前那样直接 personless 发出去:app_started 固定发生在 setup()
@@ -423,7 +433,13 @@ pub fn track(_app: &AppHandle, event: Event) {
         // distinct_id 并关掉 person profile——于是**每一次启动都是一个全新的匿名人**,
         // 留存、DAU、以及设计文档漏斗 1 的第一步"首启"全部无从算起。压队是唯一
         // 既不自造 id、又能让启动事件落到正确身份上的办法。
-        None => push_pending(name, props),
+        None => {
+            // **有界**:上限之后直接丢弃而不是无限攒——前端若始终起不来(webview 崩了、
+            // 白屏),这个队列永远等不到补发,不能让它跟着进程一起长。
+            if guard.pending.len() < PENDING_CAP {
+                guard.pending.push((name, props));
+            }
+        }
     }
 }
 
@@ -446,69 +462,68 @@ fn emit(name: &'static str, id: Option<&str>, props: Option<Value>) {
     posthog_rs::capture(ev);
 }
 
-/// 前端持久化的匿名 id。未设时事件压 [`PENDING`] 队列——见 track 的说明。
-static DISTINCT_ID: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
+/// 身份与压队同一把锁。**不拆成两把**——理由见 track 里的注释。
+const PENDING_CAP: usize = 64;
 
-fn slot() -> &'static std::sync::RwLock<String> {
-    DISTINCT_ID.get_or_init(|| std::sync::RwLock::new(String::new()))
+#[derive(Default)]
+struct Outbox {
+    /// 前端持久化的匿名 id。None = 还没到,事件压 pending。
+    id: Option<String>,
+    pending: Vec<(&'static str, Option<Value>)>,
+}
+
+static OUTBOX: std::sync::OnceLock<std::sync::Mutex<Outbox>> = std::sync::OnceLock::new();
+
+fn outbox() -> &'static std::sync::Mutex<Outbox> {
+    OUTBOX.get_or_init(|| std::sync::Mutex::new(Outbox::default()))
 }
 
 fn current_id() -> Option<String> {
-    let v = slot().read().map(|g| g.clone()).unwrap_or_default();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// id 到位前压着的事件。**有界**:上限之后直接丢弃而不是无限攒——前端若始终起不来
-/// (webview 崩了、白屏),这个队列就永远等不到补发,不能让它跟着进程一起长。
-const PENDING_CAP: usize = 64;
-type PendingQueue = std::sync::Mutex<Vec<(&'static str, Option<Value>)>>;
-static PENDING: std::sync::OnceLock<PendingQueue> = std::sync::OnceLock::new();
-
-fn pending() -> &'static PendingQueue {
-    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-fn push_pending(name: &'static str, props: Option<Value>) {
-    if let Ok(mut q) = pending().lock() {
-        if q.len() < PENDING_CAP {
-            q.push((name, props));
-        }
-    }
+    outbox().lock().ok().and_then(|o| o.id.clone())
 }
 
 /// 排空压着的事件。`id` 为 None 表示等不到了(进程要退出),此时以 personless 发出
-/// ——身份不全好过整条没有。
+/// ——身份不全好过整条没有。取出与发送分开,绝不持锁调 SDK。
 fn drain_pending(id: Option<&str>) {
-    let Ok(mut q) = pending().lock() else { return };
-    let items = std::mem::take(&mut *q);
-    drop(q);
+    let items = match outbox().lock() {
+        Ok(mut o) => std::mem::take(&mut o.pending),
+        Err(_) => return,
+    };
     for (name, props) in items {
         emit(name, id, props);
     }
 }
 
 /// 由前端在初始化后调用一次(命令壳 set_analytics_id)。幂等,后到的覆盖先到的。
-/// 设完立刻补发压队的早期事件。
+/// 设完立刻补发压队的早期事件——设 id 与取队列在同一把锁下,不留漏排窗口。
 pub fn set_distinct_id(id: &str) {
     if id.is_empty() {
         return;
     }
-    if let Ok(mut g) = slot().write() {
-        *g = id.to_string();
+    let items = match outbox().lock() {
+        Ok(mut o) => {
+            o.id = Some(id.to_string());
+            std::mem::take(&mut o.pending)
+        }
+        Err(_) => return,
+    };
+    for (name, props) in items {
+        emit(name, Some(id), props);
     }
-    drain_pending(Some(id));
 }
 
 // ---------------------------------------------------------------------------
 // 上报总开关
 // ---------------------------------------------------------------------------
 
-/// 用户可关。默认开(与既有行为一致),由设置在启动与每次保存时同步。
-static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 用户可关。**默认关**,由设置在启动读到 `telemetry_enabled` 后打开。
+///
+/// 为什么默认关而不是默认开:`init()` 在 `run()` 开头就装好了 panic hook,而设置要到
+/// `setup()` 里才读得到(app_data_dir 得等 AppHandle)。默认开的话,这中间几毫秒里发生
+/// 的 panic 会照发不误——对一个明确关掉了上报的用户,那就是直接违背承诺。代价是
+/// 打开上报的用户会丢掉这个窗口内的 panic;两边都错的时候,选择错在不发的一侧
+/// (codex review P1#1)。
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 上报是否放行。key 为空(本地开发/测试)也算关。
 fn enabled() -> bool {
@@ -526,8 +541,8 @@ pub fn is_enabled() -> bool {
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
     if !on {
-        if let Ok(mut q) = pending().lock() {
-            q.clear();
+        if let Ok(mut o) = outbox().lock() {
+            o.pending.clear();
         }
     }
 }
@@ -833,6 +848,11 @@ const SESSION_FILE: &str = "telemetry_session.json";
 struct SessionMark {
     running: bool,
     version: String,
+    /// 落这个标记的进程。**只有 pid 对得上才允许清掉**——本仓库没有单实例守卫,
+    /// 第二个实例正常退出时若把标记清掉,第一个实例随后真崩了就再也报不出来
+    /// (codex review P2#6)。
+    #[serde(default)]
+    pid: u32,
 }
 
 /// 启动时调用一次:读走上次的痕迹,并落下本次的"运行中"标记。
@@ -856,12 +876,31 @@ pub fn open_session(app_data: &Path) -> BootState {
 
 /// 正常退出路径调用。**必须与 flush_on_exit 同一处**:漏在别的分支上,
 /// 那条分支的每次退出都会被下次启动误报成崩溃。
+///
+/// 只在标记确实是自己落的时候才清:多开时第二个实例正常退出,不该把第一个实例
+/// 那份"运行中"抹掉(codex review P2#6)。反向的误报(B 启动时把仍在跑的 A 记成崩溃)
+/// 无法只靠一个文件判掉,需要跨平台的进程存活探测——已知未修,记在这里:
+/// macOS 由 LaunchServices 天然单实例,Windows 多开会多出一条 app_unclean_exit,
+/// 是看板噪音而非用户可见问题。
 pub fn close_session(app_data: &Path) {
-    write_mark(&app_data.join(SESSION_FILE), false);
+    let path = app_data.join(SESSION_FILE);
+    let owner = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<SessionMark>(&t).ok())
+        .map(|m| m.pid);
+    // 标记不存在/读不出来时照常清:那是首次运行或文件坏了,不清反而会误报。
+    if matches!(owner, Some(pid) if pid != std::process::id()) {
+        return;
+    }
+    write_mark(&path, false);
 }
 
 fn write_mark(path: &Path, running: bool) {
-    let mark = SessionMark { running, version: env!("CARGO_PKG_VERSION").to_string() };
+    let mark = SessionMark {
+        running,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -969,6 +1008,7 @@ mod tests {
     #[test]
     fn before_send不认识的结构原样放行而非丢弃() {
         let _g = gate();
+        set_enabled(true);
         let mut ev = posthog_rs::Event::new_anon("vn_page_view");
         ev.insert_prop("path", "/notes").unwrap();
         let out = before_send(ev).expect("普通事件不得被丢弃");
@@ -980,6 +1020,7 @@ mod tests {
     #[test]
     fn before_send给普通事件盖上环境属性() {
         let _g = gate();
+        set_enabled(true);
         let out = before_send(posthog_rs::Event::new_anon("app_started")).expect("不得丢弃");
         let p = out.properties();
         assert_eq!(p.get("$app_version").unwrap(), env!("CARGO_PKG_VERSION"));
@@ -994,6 +1035,7 @@ mod tests {
     #[test]
     fn before_send给panic事件也盖上版本() {
         let _g = gate();
+        set_enabled(true);
         let mut ev = posthog_rs::Event::new_anon("$exception");
         ev.insert_prop("$exception_fingerprint", "panic_env_probe").unwrap();
         let out = before_send(ev).expect("首条不得被限流");
@@ -1101,6 +1143,20 @@ mod tests {
     }
 
     /// 坏文件/无文件都不能挡住启动——这是观测设施,不是主流程。
+    /// 多开时第二个实例正常退出,不该把第一个实例那份"运行中"抹掉。
+    #[test]
+    fn 别的进程落的运行中标记不会被清掉() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(SESSION_FILE);
+        std::fs::write(
+            &path,
+            format!(r#"{{"running":true,"version":"0.12.0","pid":{}}}"#, std::process::id() + 1),
+        )
+        .unwrap();
+        close_session(tmp.path());
+        assert!(open_session(tmp.path()).unclean_exit, "别人的运行中标记必须留着");
+    }
+
     #[test]
     fn 会话标记坏掉时静默当作没有痕迹() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1113,10 +1169,46 @@ mod tests {
     #[test]
     fn 关掉遥测会清空压队() {
         let _g = gate();
-        push_pending("app_started", None);
+        set_enabled(true);
+        outbox().lock().unwrap().pending.push(("app_started", None));
         set_enabled(false);
-        assert!(pending().lock().unwrap().is_empty(), "关掉后压队必须清空");
+        assert!(outbox().lock().unwrap().pending.is_empty(), "关掉后压队必须清空");
         set_enabled(true); // 复原,别影响同进程里别的用例
+    }
+
+    /// 总开关默认关:panic hook 在 run() 开头就装好,而设置要到 setup() 才读得到。
+    /// 默认开的话,那几毫秒里的 panic 会绕过一个明确关掉了上报的用户的意愿
+    /// (codex review P1#1)。
+    #[test]
+    fn 总开关默认关且拦得住panic事件() {
+        let _g = gate();
+        set_enabled(false);
+        let mut ev = posthog_rs::Event::new_anon("$exception");
+        ev.insert_prop("$exception_fingerprint", "gate_probe").unwrap();
+        assert!(before_send(ev).is_none(), "关掉后连 panic 事件也必须拦下");
+        assert!(before_send(posthog_rs::Event::new_anon("app_started")).is_none());
+        set_enabled(true);
+    }
+
+    /// 身份与压队同一把锁:设 id 与取队列必须原子,否则读到"无 id"之后入队的事件
+    /// 会漏排(codex review P2#5)。
+    #[test]
+    fn 设id会把压队一并取走() {
+        let _g = gate();
+        set_enabled(true);
+        {
+            let mut o = outbox().lock().unwrap();
+            o.id = None;
+            o.pending.clear();
+            o.pending.push(("app_started", None));
+        }
+        set_distinct_id("test-id-drain");
+        let o = outbox().lock().unwrap();
+        assert!(o.pending.is_empty(), "设 id 必须把压队一并取走");
+        assert_eq!(o.id.as_deref(), Some("test-id-drain"));
+        drop(o);
+        // 复原:别把这个 id 留给同进程里别的用例
+        outbox().lock().unwrap().id = None;
     }
 
     #[test]
