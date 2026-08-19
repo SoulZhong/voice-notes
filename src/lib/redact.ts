@@ -26,7 +26,9 @@ function looksPath(word: string): boolean {
     const ext = word.split(".").pop() ?? "";
     if (ext.length > 0 && ext.length <= 5 && /^[0-9a-zA-Z]+$/.test(ext)) return true;
   }
-  const first = word[0];
+  // 取**码点**而不是 word[0]:后者是 UTF-16 code unit,非 BMP 的大写字符会被拆成
+  // 代理对,判定与 Rust 侧的 char 不一致(codex review 二轮 P1#3)。
+  const first = [...word][0] ?? "";
   return first !== first.toLowerCase() && first === first.toUpperCase();
 }
 
@@ -39,7 +41,12 @@ function pathEnd(tail: string): number {
     if (PATH_STOP.has(c)) return i;
     if (c === " ") {
       const word = tail.slice(i + 1).split(/\s/)[0] ?? "";
-      if (!looksPath(word)) return i;
+      // 还没走到带扩展名的文件名 ⇒ 仍在目录段里,空格大概率是目录名的一部分。
+      // `/Volumes/客户/季度 复盘` 的"复盘"既不大写开头也无扩展名,只靠 looksPath
+      // 会留在外面,而两个字的中文远短于整段丢弃阈值。与 Rust 侧同判据。
+      const lastSeg = tail.slice(0, i).split(/[/\\]/).pop() ?? "";
+      const inDirSegment = !lastSeg.includes(".");
+      if (!looksPath(word) && !inDirSegment) return i;
     }
   }
   return tail.length;
@@ -83,21 +90,40 @@ function redactUnixPaths(input: string): string {
   return out + rest;
 }
 
-/** Windows 绝对路径:`C:\Users\Alice\…` 与自定义目录可能落在的 `D:\客户\…`。
+/** Windows 绝对路径:盘符 `C:\Users\Alice\…`、自定义目录 `D:\客户\…`,
+ *  以及 UNC `\\server\share\…`——网络盘正是自定义数据目录最典型的落点之一。
  *  终点判据与 unix 分支共用 pathEnd,与 Rust 侧 redact_windows_paths 同判据。 */
 function redactWindowsPaths(input: string): string {
   let out = "";
   let rest = input;
   for (;;) {
-    const m = /[A-Za-z]:\\/.exec(rest);
+    const m = /[A-Za-z]:\\|\\\\[^\\]/.exec(rest);
     if (!m) break;
     const pos = m.index;
     const tail = rest.slice(pos);
     const end = pathEnd(tail);
     const seg = tail.slice(0, end);
     out += rest.slice(0, pos);
-    out += seg.slice(2).toLowerCase().startsWith("\\users\\") ? "<HOME_PATH>" : "<PATH>";
+    // UNC 不算家目录(`\\server\share\…` 的第 3 段是共享名,不是用户名)。
+    const isHome = !seg.startsWith("\\\\") && seg.slice(2).toLowerCase().startsWith("\\users\\");
+    out += isHome ? "<HOME_PATH>" : "<PATH>";
     rest = tail.slice(end);
+  }
+  return out + rest;
+}
+
+/** `file:///Users/Alice/notes/周会.json`。**必须单独一条**:通用扫描要求 `/` 前面不是
+ *  `:` 或 `/`,而 file:// 三个斜杠连排,三个候选起点全被挡掉,整条原样放行。
+ *  只认 `file:` —— http(s) 是接口地址而不是本机路径,留着有用。 */
+function redactFileUrls(input: string): string {
+  let out = "";
+  let rest = input;
+  for (;;) {
+    const pos = rest.toLowerCase().indexOf("file://");
+    if (pos < 0) break;
+    const tail = rest.slice(pos);
+    out += rest.slice(0, pos) + "<PATH>";
+    rest = tail.slice(pathEnd(tail));
   }
   return out + rest;
 }
@@ -139,7 +165,7 @@ function dropLongCjkRuns(s: string): string {
 }
 
 export function redact(input: string): string {
-  return dropLongCjkRuns(redactKeys(redactUnixPaths(redactWindowsPaths(input))));
+  return dropLongCjkRuns(redactKeys(redactUnixPaths(redactWindowsPaths(redactFileUrls(input)))));
 }
 
 /** posthog-js 的 before_send:对异常事件的消息字段做脱敏。

@@ -15,10 +15,29 @@ const CJK_RUN_DROP: usize = 12;
 
 /// 脱敏一段可能进入上报载荷的文本。
 pub fn redact(input: &str) -> String {
-    let s = redact_windows_paths(input);
+    let s = redact_file_urls(input);
+    let s = redact_windows_paths(&s);
     let s = redact_unix_paths(&s);
     let s = redact_api_keys(&s);
     drop_long_cjk_runs(&s)
+}
+
+/// `file:///Users/Alice/notes/周会.json`。**必须单独一条**:通用扫描要求 `/` 前面不是
+/// `:` 或 `/`(否则 `tauri://localhost/…` 会被吃掉),而 `file://` 恰好三个斜杠连排,
+/// 三个候选起点全被那条规则挡掉,整条路径原样放行(codex review 二轮 P1#3)。
+/// 只认 `file:` —— http(s) 是接口地址而不是本机路径,留着有用。
+fn redact_file_urls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.to_ascii_lowercase().find("file://") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let end = path_end(tail);
+        out.push_str("<PATH>");
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 绝对路径收敛。家目录一档(`<HOME_PATH>`)、其余一档(`<PATH>`)。
@@ -85,13 +104,18 @@ fn redact_windows_paths(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     loop {
-        // 找 "<盘符>:\":盘符是 `:` 前面那一个 ASCII 字母。
-        let Some(start) = rest.char_indices().find_map(|(i, c)| {
+        // 盘符路径 "<盘符>:\"(盘符是 `:` 前面那一个 ASCII 字母),或 UNC "\\server\share\"
+        // ——网络盘正是"自定义数据目录能落在哪儿"里最典型的一种(codex review 二轮 P1#3)。
+        let drive = rest.char_indices().find_map(|(i, c)| {
             if !c.is_ascii_alphabetic() {
                 return None;
             }
             rest[i + c.len_utf8()..].starts_with(":\\").then_some(i)
-        }) else {
+        });
+        let unc = rest
+            .find("\\\\")
+            .filter(|i| rest[i + 2..].starts_with(|c: char| c != '\\'));
+        let Some(start) = [drive, unc].into_iter().flatten().min() else {
             break;
         };
         out.push_str(&rest[..start]);
@@ -100,7 +124,10 @@ fn redact_windows_paths(s: &str) -> String {
         let seg = &tail[..end];
         // `C:\Users\` 才算家目录,`D:\客户\` 只是普通绝对路径——两档都不出站,
         // 但占位符分开,看板上能区分"用户名泄漏面"与"自定义目录面"。
-        let is_home = seg.len() > 2 && seg[2..].to_ascii_lowercase().starts_with("\\users\\");
+        // UNC 不算家目录(`\\server\share\…` 的第 3 段是共享名,不是用户名)。
+        let is_home = !seg.starts_with("\\\\")
+            && seg.len() > 2
+            && seg[2..].to_ascii_lowercase().starts_with("\\users\\");
         out.push_str(if is_home { "<HOME_PATH>" } else { "<PATH>" });
         rest = &tail[end..];
     }
@@ -127,6 +154,15 @@ fn path_end(tail: &str) -> usize {
             // ——三者任一都说明还在路径里面。
             let next: String = bytes[i + 1..].iter().map(|(_, c)| *c).collect();
             let word = next.split_whitespace().next().unwrap_or("");
+            // 还没走到带扩展名的文件名 ⇒ 仍在目录段里,空格大概率是目录名的一部分。
+            // `/Volumes/客户/季度 复盘` 里的"复盘"既不大写开头也无扩展名,只靠下面三条
+            // 判据会留在外面,而两个字的中文串远短于整段丢弃阈值,会原样出站
+            // (codex review 二轮 P1#3)。反过来 `…/y.json 写入失败` 已经有扩展名,
+            // 就在空格处收尾,把措辞留给排查用。
+            let in_dir_segment = !tail[..idx]
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|seg| seg.contains('.'));
             let looks_path = word.contains('/')
                 || word.contains('\\')
                 || word.rsplit('.').next().is_some_and(|ext| {
@@ -134,7 +170,7 @@ fn path_end(tail: &str) -> usize {
                         && word.contains('.')
                 })
                 || word.chars().next().is_some_and(|c| c.is_uppercase());
-            if !looks_path {
+            if !looks_path && !in_dir_segment {
                 end = idx;
                 break;
             }
@@ -285,6 +321,37 @@ mod tests {
     }
 
     /// URL 不是路径:里面没有用户内容(路由动态段一律是 id),却是定位现场的依据。
+    /// file:// 的三个斜杠连排,把通用扫描的三个候选起点全挡掉了。
+    #[test]
+    fn file协议路径同样收敛() {
+        let out = redact("load failed: file:///Users/Alice/notes/周会.json");
+        assert!(!out.contains("Alice"), "file:// 里的用户名必须脱掉: {out}");
+        assert!(!out.contains("周会"), "file:// 里的会议标题必须脱掉: {out}");
+    }
+
+    /// 网络盘正是"自定义数据目录能落在哪儿"里最典型的一种。
+    #[test]
+    fn unc网络路径同样收敛() {
+        let out = redact("migrate failed: \\\\server\\share\\客户\\周会.json");
+        assert!(!out.contains("客户"), "UNC 里的目录名必须脱掉: {out}");
+        assert!(!out.contains("周会"), "UNC 里的会议名必须脱掉: {out}");
+    }
+
+    /// 目录段里的空格:两个字的中文远短于整段丢弃阈值,只靠 CJK 规则接不住。
+    #[test]
+    fn 无扩展名目录里的空格不截断路径() {
+        let out = redact("copy /Volumes/客户/季度 复盘 failed");
+        assert!(!out.contains("复盘"), "目录名后半截必须一起脱掉: {out}");
+    }
+
+    /// 反过来:已经走到带扩展名的文件名,就该在空格处收尾,把措辞留给排查。
+    #[test]
+    fn 文件名之后的措辞保留() {
+        let out = redact("write /Users/Alice/notes/x.json 写入失败");
+        assert!(out.contains("写入失败"), "扩展名之后的措辞应保留: {out}");
+        assert!(!out.contains("Alice"), "{out}");
+    }
+
     #[test]
     fn url不被当成路径误伤() {
         let clean = "load failed at tauri://localhost/notes/note-140751";

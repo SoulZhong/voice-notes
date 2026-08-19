@@ -69,6 +69,29 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(out).toContain("failed");
   });
 
+  it("file 协议路径同样收敛", () => {
+    const out = redact("load failed: file:///Users/Alice/notes/周会.json");
+    expect(out).not.toContain("Alice");
+    expect(out).not.toContain("周会");
+  });
+
+  it("UNC 网络路径同样收敛", () => {
+    const out = redact("migrate failed: \\\\server\\share\\客户\\周会.json");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
+  it("无扩展名目录里的空格不截断路径", () => {
+    const out = redact("copy /Volumes/客户/季度 复盘 failed");
+    expect(out).not.toContain("复盘");
+  });
+
+  it("文件名之后的措辞保留", () => {
+    const out = redact("write /Users/Alice/notes/x.json 写入失败");
+    expect(out).toContain("写入失败");
+    expect(out).not.toContain("Alice");
+  });
+
   it("URL 不被当成路径误伤", () => {
     const clean = "load failed at tauri://localhost/notes/note-140751";
     expect(redact(clean)).toBe(clean);

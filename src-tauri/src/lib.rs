@@ -7536,6 +7536,12 @@ pub fn run() {
             if let Some(dir) = &app_data {
                 logging::redirect_stdio_to_file(dir);
             }
+            // 会话标记紧跟着 app_data 落,越早越好:它但凡晚一步,settings 探测/自愈、
+            // 插件构建、模型与后台服务这些启动期步骤里的 SIGSEGV/OOM 就会留着上次的
+            // 干净标记,下次启动什么也报不出来——而启动期崩溃恰恰是最难在别人机器上
+            // 复现的一类(codex review P2#7、二轮 P2)。事件仍在本闭包末尾发,
+            // 那时 track 才有意义。
+            let boot = app_data.as_ref().map(|d| telemetry::open_session(d));
             // 镜像前缀已随三删一藏改为编译期常量(settings::MIRROR_PREFIX),不再有
             // mirror_prefix 字段可迁移——一次性 migrate_mirror_prefix 启动调用随之删除。
             //
@@ -7556,11 +7562,6 @@ pub fn run() {
             };
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
-            // 会话标记要尽早落:它到 setup 末尾才写的话,插件构建、日志、模型、后台
-            // 服务这一大段启动期里发生的 SIGSEGV/OOM 会留着上次的干净标记,下次启动
-            // 什么也报不出来——而启动期崩溃恰恰是最难在别人机器上复现的一类
-            // (codex review P2#7)。事件仍在本闭包末尾发,那时 track 才有意义。
-            let boot = app_data.as_ref().map(|d| telemetry::open_session(d));
             // 上报总开关:settings 一读到就同步。放这么早是因为 telemetry::init() 在
             // run() 开头就装好了 panic hook——从这一刻起到这里之间发生的 panic 仍会上报
             // (那个窗口只有几毫秒,且此时连设置都还没读到,没有更早的判据可用)。

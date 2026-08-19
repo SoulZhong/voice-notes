@@ -169,6 +169,8 @@
   let shortcutEnabled = $state(false);
   let trayEnabled = $state(false);
   let telemetryEnabled = $state(true);
+  /** 保存中禁用开关:快速连点会让先到的请求把后到的意图覆盖掉。 */
+  let telemetrySaving = $state(false);
   let autostartEnabled = $state(false);
   /** 快捷键录入框聚焦态:聚焦时清空显示并提示「按下组合键…」。 */
   let capturingShortcut = $state(false);
@@ -834,16 +836,26 @@
           type="checkbox"
           class="ctl switch"
           bind:checked={telemetryEnabled}
-          disabled={!settings}
+          disabled={!settings || telemetrySaving}
           onchange={async () => {
-            // 两个方向刻意不对称,都倒向"不发"那一侧(codex review P1#2):
-            // 关掉 → 先当场停再落盘。落盘失败也已经停了,回放尤其不能等下次启动。
-            // 打开 → 先落盘再起。抢跑的话,start() 会去问后端总开关、读到的还是
-            //        旧值(false),刚打开的开关当场被关回去;落盘若失败,
-            //        saveSetting 会把本地值同步回磁盘真值,这里再按真值决定起不起。
-            if (!telemetryEnabled) applyTelemetrySetting(false);
-            await saveSetting((s) => (s.telemetry_enabled = telemetryEnabled));
-            if (telemetryEnabled) applyTelemetrySetting(true);
+            // desired 当场定格,后面一律用它:saveSetting 内部会 syncLocalFromSettings,
+            // 把 telemetryEnabled 改回磁盘真值,再读共享变量就读到了别人的值
+            // (codex review 二轮 P1#2)。同时保存期间禁用控件,不给快速连点留窗口。
+            const desired = telemetryEnabled;
+            telemetrySaving = true;
+            try {
+              // 两个方向刻意不对称,都倒向"不发"那一侧:
+              // 关掉 → 先当场停再落盘。落盘失败也已经停了,回放尤其不能等下次启动。
+              // 打开 → 先落盘再起。抢跑的话 start() 去问后端总开关读到的还是旧值
+              //        (false),刚打开的开关当场被关回去。
+              if (!desired) applyTelemetrySetting(false);
+              await saveSetting((s) => (s.telemetry_enabled = desired));
+              // 落盘失败时 saveSetting 已把 telemetryEnabled 同步回磁盘真值,
+              // 按真值决定起不起,别按用户那次没存住的意图。
+              applyTelemetrySetting(telemetryEnabled);
+            } finally {
+              telemetrySaving = false;
+            }
           }}
         />
       </label>

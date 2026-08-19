@@ -182,7 +182,10 @@ let optedOut = false;
 export async function initAnalytics(): Promise<void> {
   if (started || !PROJECT_KEY) return;
   try {
-    const enabled = await invoke<boolean>("telemetry_enabled").catch(() => true);
+    // **失败兜底成关**:前端 beforeSend 只看本地 optedOut,不经过 Rust 那道默认关的
+    // 总闸。兜底成开的话,一次瞬时 IPC 失败就能让明确关掉遥测的用户照样出站
+    // (codex review 二轮 P1#1)。代价是开着上报的用户偶发丢一整场,方向正确。
+    const enabled = await invoke<boolean>("telemetry_enabled").catch(() => false);
     optedOut = !enabled;
     if (optedOut) return;
     await start();

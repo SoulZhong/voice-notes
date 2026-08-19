@@ -81,6 +81,9 @@ impl EnvSnapshot {
 
 /// 系统名收敛成固定几档。**不直接用 os_info 的 Display**:它给的是 "Mac OS",
 /// 而 posthog-js 给的是 "Mac OS X" —— 两端不统一,同一台机器在看板上会劈成两行。
+///
+/// 只列 macOS/Windows/Linux 是刻意的:本应用只发这两个平台,Ubuntu/Debian 这些
+/// `os_info::Type` 落进 `other` 是开发机,不需要在看板上占一档(codex review 二轮 P2)。
 fn canonical_os(t: os_info::Type) -> String {
     match t {
         os_info::Type::Macos => "macOS",
@@ -106,19 +109,32 @@ fn normalize_os_version(raw: &str) -> String {
     }
 }
 
-/// 语言标签只留 BCP-47 允许的字符并截断。系统 locale 理论上可被用户改成任意串,
-/// 属性维度不接受自由文本。
+/// 语言标签必须**整体符合 BCP-47 形态**,否则一律 unknown。
+///
+/// 此前是"过滤掉非法字符"——那是清洗不是校验:`ALICE_PRIVATE` 会被洗成
+/// `ALICE-PRIVATE` 照样出站,等于给一个低基数维度留了自由文本口子
+/// (codex review 二轮 P2)。系统 locale 虽然来自选择器,但可被 `defaults write`
+/// 改成任意串,属性维度不接受这种输入。
 fn normalize_locale(raw: Option<&str>) -> String {
-    let Some(raw) = raw else { return "unknown".to_string() };
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(16)
-        .collect();
-    if cleaned.is_empty() {
-        "unknown".to_string()
+    const UNKNOWN: &str = "unknown";
+    let Some(raw) = raw else { return UNKNOWN.to_string() };
+    let tag = raw.replace('_', "-");
+    if tag.len() > 20 {
+        return UNKNOWN.to_string();
+    }
+    let mut parts = tag.split('-');
+    // 主语言子标签:2-3 个字母(zh / en / yue)。
+    let ok_primary = parts
+        .next()
+        .is_some_and(|p| (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic()));
+    // 其余子标签:2-8 位字母数字(Hans / CN / 419 / valencia)。
+    let ok_rest = parts.all(|p| {
+        (2..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
+    });
+    if ok_primary && ok_rest {
+        tag
     } else {
-        cleaned.replace('_', "-")
+        UNKNOWN.to_string()
     }
 }
 
@@ -684,7 +700,15 @@ fn redact_event(mut ev: posthog_rs::Event) -> posthog_rs::Event {
     }
     // panic 事件还带 $exception_panic_file 这类独立的路径属性,
     // 以及栈帧里的 filename——只脱 type/value 会把它们漏出去(codex review 第二轮)。
-    for key in ["$exception_panic_file", "$exception_message", "$exception_type", "$exception_source"] {
+    // $exception_stack_trace_raw 是 TS 侧已覆盖、Rust 侧漏掉的那一个——同一个清单
+    // 在两端各写一份,漂移就是这么发生的(codex review 二轮 P1#4)。
+    for key in [
+        "$exception_panic_file",
+        "$exception_message",
+        "$exception_type",
+        "$exception_source",
+        "$exception_stack_trace_raw",
+    ] {
         let Some(v) = ev.properties().get(key).cloned() else { continue };
         if let Some(text) = v.as_str() {
             let _ = ev.insert_prop(key, crate::redact::redact(text));
@@ -1096,8 +1120,12 @@ mod tests {
         assert_eq!(normalize_os_version("22.04 (Jammy Jellyfish)"), "22.04");
         assert_eq!(normalize_locale(Some("zh_CN")), "zh-CN");
         assert_eq!(normalize_locale(Some("en-US")), "en-US");
+        assert_eq!(normalize_locale(Some("zh-Hans-CN")), "zh-Hans-CN");
         assert_eq!(normalize_locale(None), "unknown");
         assert_eq!(normalize_locale(Some("!!!")), "unknown");
+        // 校验而非清洗:洗一洗就放行等于给低基数维度留了自由文本口子
+        assert_eq!(normalize_locale(Some("ALICE_PRIVATE")), "unknown");
+        assert_eq!(normalize_locale(Some("a")), "unknown");
     }
 
     /// 系统名两端必须给同一个串,否则同一台机器在看板上劈成两行。
