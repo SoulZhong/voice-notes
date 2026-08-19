@@ -645,19 +645,54 @@ fn before_send(mut ev: posthog_rs::Event) -> Option<posthog_rs::Event> {
 const EXCEPTION_CAP_PER_KIND: u32 = 5;
 const EXCEPTION_CAP_TOTAL: u32 = 50;
 
-static EXCEPTION_COUNTS: std::sync::OnceLock<
-    std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
-> = std::sync::OnceLock::new();
+/// 额度的滚动窗口。**不能只按进程算**:本应用常驻托盘、一开好几天,进程级计数攒满
+/// 50 条之后剩下的整个生命周期都发不出任何异常,等于攒够一次就永久失明
+/// (codex review 三轮 P2)。设计文档写的是"每会话",一小时的滚动窗口是它可实现的
+/// 近似:最坏情形单机 50 条/小时,量级仍远低于免费档 10 万/月。
+const EXCEPTION_WINDOW_SECS: u64 = 3600;
+
+struct ExceptionBudget {
+    per_kind: std::collections::HashMap<String, u32>,
+    total: u32,
+    window_start: std::time::Instant,
+}
+
+static EXCEPTION_COUNTS: std::sync::OnceLock<std::sync::Mutex<ExceptionBudget>> =
+    std::sync::OnceLock::new();
 
 /// 这条异常还能不能发。key 取 fingerprint(report_error 一律带),缺了退回 type,
 /// 再缺就归到一个兜底桶——**绝不因为取不到 key 就放行**,那等于没有限流。
 fn exception_allowed(ev: &posthog_rs::Event) -> bool {
     let key = exception_key(ev);
-    let cell = EXCEPTION_COUNTS
-        .get_or_init(|| std::sync::Mutex::new((std::collections::HashMap::new(), 0)));
+    let cell = EXCEPTION_COUNTS.get_or_init(|| {
+        std::sync::Mutex::new(ExceptionBudget {
+            per_kind: std::collections::HashMap::new(),
+            total: 0,
+            window_start: std::time::Instant::now(),
+        })
+    });
     let Ok(mut g) = cell.lock() else { return true };
-    let (per_kind, total) = &mut *g;
+    let elapsed = g.window_start.elapsed().as_secs();
+    let ExceptionBudget { per_kind, total, window_start } = &mut *g;
+    if roll_window(per_kind, total, elapsed) {
+        *window_start = std::time::Instant::now();
+    }
     allow_once(&key, per_kind, total)
+}
+
+/// 窗口到点就清零,返回是否真的清了(调用方据此重置窗口起点)。
+/// 抽成纯函数是为了能测——`Instant` 在测试里造不出"一小时前"。
+fn roll_window(
+    per_kind: &mut std::collections::HashMap<String, u32>,
+    total: &mut u32,
+    elapsed_secs: u64,
+) -> bool {
+    if elapsed_secs < EXCEPTION_WINDOW_SECS {
+        return false;
+    }
+    per_kind.clear();
+    *total = 0;
+    true
 }
 
 /// 限流分桶键。fingerprint 优先(report_error 一律带),缺了退回 type
@@ -1080,6 +1115,20 @@ mod tests {
     }
 
     /// 单条链路刷不满,很多种错各刷几条却能合力打满——2026-08-13 断流风暴就是这形态。
+    /// 常驻托盘一开好几天:进程级计数攒满就永久失明,窗口到点必须清零。
+    #[test]
+    fn 异常额度按窗口滚动而不是攒一辈子() {
+        let mut per = std::collections::HashMap::new();
+        let mut total = 0;
+        for _ in 0..EXCEPTION_CAP_PER_KIND {
+            allow_once("asr_engine", &mut per, &mut total);
+        }
+        assert!(!allow_once("asr_engine", &mut per, &mut total), "窗口内超额必须丢");
+        assert!(!roll_window(&mut per, &mut total, EXCEPTION_WINDOW_SECS - 1), "没到点不清");
+        assert!(roll_window(&mut per, &mut total, EXCEPTION_WINDOW_SECS), "到点必须清");
+        assert!(allow_once("asr_engine", &mut per, &mut total), "新窗口重新放行");
+    }
+
     #[test]
     fn 异常还有一道全局总闸() {
         let mut per = std::collections::HashMap::new();

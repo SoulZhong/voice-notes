@@ -92,6 +92,27 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(out).not.toContain("Alice");
   });
 
+  it("冒号后的路径不被当成 URL 放过", () => {
+    const out = redact("copy C:/Users/Alice/notes/周会.json failed");
+    expect(out).not.toContain("Alice");
+    expect(out).not.toContain("周会");
+    expect(redact("copy:/Volumes/客户/季度复盘/x.json")).not.toContain("客户");
+  });
+
+  it("目录段空格规则不吞掉整段消息", () => {
+    const out = redact("copy /Volumes/客户/季度 复盘 failed because disk full");
+    expect(out).not.toContain("复盘");
+    expect(out).toContain("failed");
+    expect(out).toContain("disk full");
+  });
+
+  it("连续空格处与 Rust 同判据", () => {
+    // split(/\s/) 在连续空格处得到空串,会让 TS 提前收尾、漏出文件名
+    const out = redact("write /Users/Alice/notes/Q3.v1  roadmap.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("Alice");
+  });
+
   it("URL 不被当成路径误伤", () => {
     const clean = "load failed at tauri://localhost/notes/note-140751";
     expect(redact(clean)).toBe(clean);

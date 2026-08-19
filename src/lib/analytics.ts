@@ -104,8 +104,12 @@ export function analyticsConfig() {
  *  异常按 fingerprint 限流,否则断流风暴那类高频错误一场会议就能打满月额度。 */
 const EXCEPTION_CAP_PER_KIND = 5;
 const EXCEPTION_CAP_TOTAL = 50;
+/** 额度的滚动窗口(毫秒)。**不能只按进程算**:本应用常驻托盘、一开好几天,
+ *  进程级计数攒满就永久失明。与 Rust 侧 EXCEPTION_WINDOW_SECS 同值。 */
+const EXCEPTION_WINDOW_MS = 3600_000;
 const exceptionCounts = new Map<string, number>();
 let exceptionTotal = 0;
+let exceptionWindowStart = Date.now();
 
 /** 这条异常还能不能发。取不到 key 也要落进一个桶——**绝不因为取不到就放行**。 */
 function exceptionAllowed(props: Record<string, unknown>): boolean {
@@ -118,6 +122,14 @@ function exceptionAllowed(props: Record<string, unknown>): boolean {
     (typeof first?.type === "string" && first.type) ||
     (typeof props.$exception_type === "string" && props.$exception_type) ||
     "unknown";
+  const now = Date.now();
+  // 窗口到点清零。Date.now() 会被系统时间回拨影响,回拨即当作到点——
+  // 提前清一次窗口远好过永久卡死。
+  if (now - exceptionWindowStart >= EXCEPTION_WINDOW_MS || now < exceptionWindowStart) {
+    exceptionCounts.clear();
+    exceptionTotal = 0;
+    exceptionWindowStart = now;
+  }
   if (exceptionTotal >= EXCEPTION_CAP_TOTAL) return false;
   const n = exceptionCounts.get(key) ?? 0;
   if (n >= EXCEPTION_CAP_PER_KIND) return false;

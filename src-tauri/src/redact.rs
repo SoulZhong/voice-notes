@@ -80,8 +80,16 @@ fn find_path_start(s: &str) -> Option<usize> {
             continue;
         }
         if i > 0 {
-            let prev = s[..i].chars().next_back()?;
-            if !matches!(prev, ' ' | '\t' | '"' | '\'' | '(' | '[' | ',' | ';' | '=' | '\n' | '\r') {
+            let Some(prev) = s[..i].chars().next_back() else { continue };
+            // 冒号后面**只有 `://` 才是 scheme**。一律排除冒号的话,`C:/Users/Alice/…`
+            // (正斜杠写法的盘符路径)与 `copy:/Volumes/客户/…` 这类"标签:路径"会整条
+            // 漏网,而里面的短用户名与目录名都够不到整段丢弃的阈值(codex review 三轮)。
+            let scheme_sep = prev == ':' && s[i..].starts_with("//");
+            let boundary = matches!(
+                prev,
+                ' ' | '\t' | '"' | '\'' | '(' | '[' | ',' | ';' | '=' | '\n' | '\r'
+            ) || (prev == ':' && !scheme_sep);
+            if !boundary {
                 continue;
             }
         }
@@ -141,6 +149,12 @@ fn path_end(tail: &str) -> usize {
     let bytes: Vec<(usize, char)> = tail.char_indices().collect();
     let mut i = 1;
     let mut end = tail.len();
+    // "还在目录段里"这条规则能吃几个空格。**必须有上限**:不封顶的话,
+    // `copy /Volumes/客户/季度 复盘 failed because disk full` 会被整条吞成
+    // `copy <PATH>`——路径确实脱干净了,可排查线索也一起没了(codex review 三轮 P2)。
+    // 1 个足够覆盖"两词目录名";三词以上的目录名,中间那些词含 `/`,由 looks_path
+    // 接住,不占这个额度。
+    let mut dir_space_budget = 1u8;
     while i < bytes.len() {
         let (idx, c) = bytes[i];
         if matches!(c, '"' | '\'' | ',' | ';' | '\n' | '\r' | ')' | ']') {
@@ -170,9 +184,13 @@ fn path_end(tail: &str) -> usize {
                         && word.contains('.')
                 })
                 || word.chars().next().is_some_and(|c| c.is_uppercase());
-            if !looks_path && !in_dir_segment {
-                end = idx;
-                break;
+            if !looks_path {
+                if in_dir_segment && dir_space_budget > 0 {
+                    dir_space_budget -= 1;
+                } else {
+                    end = idx;
+                    break;
+                }
             }
         }
         i += 1;
@@ -349,6 +367,34 @@ mod tests {
     fn 文件名之后的措辞保留() {
         let out = redact("write /Users/Alice/notes/x.json 写入失败");
         assert!(out.contains("写入失败"), "扩展名之后的措辞应保留: {out}");
+        assert!(!out.contains("Alice"), "{out}");
+    }
+
+    /// 冒号后只有 `://` 才是 scheme。一律排除冒号会把这两类整条放过。
+    #[test]
+    fn 冒号后的路径不被当成url放过() {
+        let out = redact("copy C:/Users/Alice/notes/周会.json failed");
+        assert!(!out.contains("Alice"), "正斜杠盘符路径必须脱掉: {out}");
+        assert!(!out.contains("周会"), "{out}");
+        let out2 = redact("copy:/Volumes/客户/季度复盘/x.json");
+        assert!(!out2.contains("客户"), "标签:路径 必须脱掉: {out2}");
+    }
+
+    /// 目录段规则必须封顶,否则路径脱干净了、排查线索也一起没了。
+    #[test]
+    fn 目录段空格规则不吞掉整段消息() {
+        let out = redact("copy /Volumes/客户/季度 复盘 failed because disk full");
+        assert!(!out.contains("复盘"), "目录名必须脱掉: {out}");
+        assert!(out.contains("failed"), "错误措辞必须留下: {out}");
+        assert!(out.contains("disk full"), "{out}");
+    }
+
+    /// 连续空格:Rust 的 split_whitespace 跳过全部空白,TS 的 split(/\s/) 会拿到空串。
+    /// 这条向量两端都跑,钉住那处不等价。
+    #[test]
+    fn 连续空格处不提前收尾() {
+        let out = redact("write /Users/Alice/notes/Q3.v1  roadmap.json failed");
+        assert!(!out.contains("roadmap"), "连续空格后的文件名必须脱掉: {out}");
         assert!(!out.contains("Alice"), "{out}");
     }
 

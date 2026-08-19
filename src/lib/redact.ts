@@ -36,17 +36,27 @@ function looksPath(word: string): boolean {
  *  `[^\n"',;)\]]*` 会一路吃到行尾,把后面的英文措辞一起吞掉,而 Rust 用的是逐字符
  *  判据。两侧号称共用同一组测试向量,可规则本身早就漂了——漂移正是这组向量要防的事。 */
 function pathEnd(tail: string): number {
+  // "还在目录段里"这条规则能吃几个空格。**必须有上限**:不封顶的话
+  // `copy /Volumes/客户/季度 复盘 failed because disk full` 会被整条吞成
+  // `copy <PATH>`——路径脱干净了,排查线索也一起没了。与 Rust 侧同值。
+  let dirSpaceBudget = 1;
   for (let i = 1; i < tail.length; i++) {
     const c = tail[i];
     if (PATH_STOP.has(c)) return i;
     if (c === " ") {
-      const word = tail.slice(i + 1).split(/\s/)[0] ?? "";
+      // **先 trimStart**:Rust 的 split_whitespace 会跳过全部前导空白,而
+      // split(/\s/) 在连续空格处直接得到空串,于是 TS 在第一个空格就收尾、
+      // 把后面的文件名漏出去(codex review 三轮 P1)。
+      const word = tail.slice(i + 1).trimStart().split(/\s/)[0] ?? "";
       // 还没走到带扩展名的文件名 ⇒ 仍在目录段里,空格大概率是目录名的一部分。
       // `/Volumes/客户/季度 复盘` 的"复盘"既不大写开头也无扩展名,只靠 looksPath
       // 会留在外面,而两个字的中文远短于整段丢弃阈值。与 Rust 侧同判据。
       const lastSeg = tail.slice(0, i).split(/[/\\]/).pop() ?? "";
       const inDirSegment = !lastSeg.includes(".");
-      if (!looksPath(word) && !inDirSegment) return i;
+      if (!looksPath(word)) {
+        if (inDirSegment && dirSpaceBudget > 0) dirSpaceBudget -= 1;
+        else return i;
+      }
     }
   }
   return tail.length;
@@ -62,7 +72,13 @@ const PATH_BOUNDARY = new Set([" ", "\t", '"', "'", "(", "[", ",", ";", "=", "\n
 function findPathStart(s: string): number {
   for (let i = 0; i < s.length; i++) {
     if (s[i] !== "/") continue;
-    if (i > 0 && !PATH_BOUNDARY.has(s[i - 1])) continue;
+    if (i > 0) {
+      const prev = s[i - 1];
+      // 冒号后面**只有 `://` 才是 scheme**。一律排除冒号会把 `C:/Users/Alice/…`
+      // 与 `copy:/Volumes/客户/…` 整条放过。与 Rust 侧同判据。
+      const schemeSep = prev === ":" && s.slice(i, i + 2) === "//";
+      if (!PATH_BOUNDARY.has(prev) && !(prev === ":" && !schemeSep)) continue;
+    }
     const end = pathEnd(s.slice(i));
     const seg = s.slice(i, i + end);
     if ((seg.match(/\//g) ?? []).length >= 2) return i;
@@ -119,7 +135,10 @@ function redactFileUrls(input: string): string {
   let out = "";
   let rest = input;
   for (;;) {
-    const pos = rest.toLowerCase().indexOf("file://");
+    // 用大小写不敏感正则在**原串**上取索引:toLowerCase 会扩展某些字符
+    // (İ → i̇),拿小写串的索引去切原串会偏移甚至切碎路径(codex review 三轮 P2)。
+    const m = /file:\/\//i.exec(rest);
+    const pos = m ? m.index : -1;
     if (pos < 0) break;
     const tail = rest.slice(pos);
     out += rest.slice(0, pos) + "<PATH>";
