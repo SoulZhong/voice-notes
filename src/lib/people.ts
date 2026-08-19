@@ -21,6 +21,15 @@ export const listPeople = () => invoke<PersonSummary[]>("list_people");
     被清空(新模型向量空间不可比),重建完成前无法自动认出(名字/历史笔记不受
     影响)。只读,录制中也可调用。 */
 export const countPeopleWithoutSamples = () => invoke<number>("count_people_without_samples");
+/** 声纹库**实际**所处的模型空间("campplus"/"eres2netv2")。设置页那个分段控件显示的是
+    设置值,重建失败时两者会长期不一致——界面显示新模型、库里还是旧的,声纹识别全程
+    停用而用户看不出来。要如实告诉用户"库现在是什么",只能问这个。 */
+export const voiceprintLibraryModel = () => invoke<string>("voiceprint_library_model");
+
+/** 手动发起一次声纹库重建(启动自愈已会自动做,这里是失败后立刻重试的入口)。
+    录制中后端拒绝。 */
+export const rebuildVoiceprintLibrary = () => invoke<void>("rebuild_voiceprint_library");
+
 /** 该人出现过的会议(扫笔记 person_id 引用,经合并重定向归一),按开始时间倒序。 */
 export const personNotes = (personId: string) =>
   invoke<NoteSummary[]>("person_notes", { personId });

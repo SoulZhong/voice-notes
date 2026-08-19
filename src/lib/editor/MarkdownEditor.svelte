@@ -466,12 +466,21 @@
     const schema = ctx.get(schemaCtx);
     focusedSeqNo = null;
     segBase = new Map();
-    const nodes = segments.map((s) =>
-      schema.nodes.transcript_segment.createChecked(
-        { seq: s.seq, source: s.source, speaker: s.speaker, startMs: s.start_ms },
+    const nodes = segments.map((s) => {
+      const attrs = { seq: s.seq, source: s.source, speaker: s.speaker, startMs: s.start_ms };
+      // badgeKey 必须在这里算进 attrs:显示名来自外部 speakers 映射,不算进去的话
+      // 「S4 关联到刘光浚」这种变化在 PM 眼里节点毫无变化(attrs/内容全同 → node.eq),
+      // 它会复用旧 NodeView,徽章永远停在旧名字上(见 segmentSchema 的 badgeKey 说明)。
+      // **label 之外还要带上配色**:颜色按 person_id(P 号)取,而 label 按名字取。
+      // 本地名恰好与新关联人物同名时 label 不变、颜色却从 S 号切成 P 号——只放 label
+      // 的话节点仍 eq,徽章不会更新,段落与顶部胶囊的颜色就此长期对不上
+      // (codex review 二轮 P2)。
+      const b = speakerBadge(attrs as BadgeAttrs);
+      return schema.nodes.transcript_segment.createChecked(
+        { ...attrs, badgeKey: `${b.label}\u0000${b.bg}\u0000${b.ink}` },
         parseInline(ctx, s.text),
-      ),
-    );
+      );
+    });
     const docNode = schema.topNodeType.createChecked(
       null,
       nodes.length ? nodes : [schema.nodes.paragraph.createAndFill()!],

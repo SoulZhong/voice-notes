@@ -13,6 +13,163 @@ use super::voiceprints::Person;
 /// 上限只是防无界膨胀。
 pub const JOURNAL_CAP: usize = 50;
 
+/// 恢复用的临时文件计数器,保证同一目标的临时名不互撞。
+static RESTORE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把 `src` 拷到 `dst`,**目标已存在就跳过、绝不覆盖**。返回 true=本次拷了。
+///
+/// 做法:先写唯一临时文件,再 `hard_link` 到目标。`hard_link` 在目标已存在时原子
+/// 失败,所以不存在"先 exists 再 copy"的时间窗。失败路径一律清掉临时文件,目标位置
+/// 不会留下半个文件。
+///
+/// 为什么不能直接 `fs::copy`:拆回/撤销在样本恢复失败后会保留 journal 让用户重试,
+/// 而用户可能在重试前又录了新样本。`fs::copy` 会拿旧快照把这份新录音盖掉
+/// (codex review 实现轮二 P1)。
+fn copy_no_overwrite(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    // 临时名必须用 create_new 抢,不能 fs::copy 直接写:进程崩溃或 remove_file 失败会
+    // 留下临时文件,而 hard_link 成功后留下的那一个**与正式样本同 inode**;下次 PID
+    // 被复用、计数器又从 0 起时,fs::copy 会把它截断,连正式样本一起写坏
+    // (codex review 实现轮三 P2)。抢不到就换下一个序号。
+    let mut tmp = PathBuf::new();
+    let mut tmp_file = None;
+    for _ in 0..64 {
+        let seq = RESTORE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cand = dst.with_extension(format!("restore-{}-{seq}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(f) => {
+                tmp = cand;
+                tmp_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::anyhow!("建临时文件失败({}): {e}", cand.display())),
+        }
+    }
+    let Some(mut out) = tmp_file else {
+        return Err(anyhow::anyhow!("建临时文件失败(64 次都撞名): {}", dst.display()));
+    };
+    let write = (|| -> std::io::Result<()> {
+        let mut inp = std::fs::File::open(src)?;
+        std::io::copy(&mut inp, &mut out)?;
+        std::io::Write::flush(&mut out)?;
+        out.sync_all()
+    })();
+    drop(out);
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!("拷贝样本副本失败({} → 临时文件): {e}", src.display()));
+    }
+    let linked = match std::fs::hard_link(&tmp, dst) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // link(2) 不是哪儿都支持:用户的笔记根目录可能落在 iCloud Drive、exFAT 或某些
+        // SMB/NFS 挂载上。**只有"这个卷不支持硬链接"才退回**——ENOENT/EROFS/ENOSPC/
+        // EIO 这类是真故障,吞掉它去做第二次无意义的写入只会掩盖根因
+        // (codex review 实现轮四 P2)。
+        Err(e) if link_unsupported(&e) => copy_exclusive(src, dst),
+        Err(e) => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    linked
+}
+
+/// 这个错误是不是"该卷不支持硬链接"?是才走兜底,其余原样上抛。
+fn link_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    // EXDEV(跨设备)、EOPNOTSUPP/ENOTSUP、ENOSYS、EMLINK、EPERM。EPERM 也算:部分文件
+    // 系统用它表示"这里不给建链接";真的权限问题在兜底里会以同样的错误再现,不会被藏。
+    const EXDEV: i32 = 18;
+    const EPERM: i32 = 1;
+    const EMLINK: i32 = 31;
+    #[cfg(target_os = "macos")]
+    const NOTSUP: [i32; 2] = [45 /* ENOTSUP */, 102 /* EOPNOTSUPP */];
+    #[cfg(not(target_os = "macos"))]
+    const NOTSUP: [i32; 2] = [95 /* EOPNOTSUPP/ENOTSUP */, 38 /* ENOSYS */];
+    matches!(e.raw_os_error(), Some(c) if c == EXDEV || c == EPERM || c == EMLINK || NOTSUP.contains(&c))
+}
+
+/// 恢复途中留下的半文件标记后缀。见 `copy_exclusive`。
+const INCOMPLETE_SUFFIX: &str = ".incomplete";
+
+/// `copy_no_overwrite` 在不支持硬链接的卷上的兜底:`create_new` 即 `O_CREAT|O_EXCL`,
+/// 目标已存在时原子失败。
+///
+/// 这条路线没有"写临时文件再原子落位"的余地(不能 rename,rename 会覆盖),所以进程
+/// 崩在写一半时目标位置就留着半个文件。下一次恢复看到目标存在会当成"已完整"跳过,
+/// 然后删掉 journal——损坏的文件永久占位(codex review 实现轮四 P1)。因此写之前先
+/// 落一个同名 `.incomplete` 旁标,写完 sync 后才删;开头看见旁标就把这对文件清掉重来。
+fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    use std::io::Write;
+    let mark = PathBuf::from(format!("{}{INCOMPLETE_SUFFIX}", dst.display()));
+    if mark.exists() {
+        // 上次崩在写一半:目标不可信,连同旁标一起清掉重写。清不掉就整体失败——
+        // 继续下去会把那个半成品当完整样本(codex review 实现轮五 P1)。
+        eprintln!("样本恢复:发现上次未写完的 {},清掉重来", dst.display());
+        if let Err(e) = std::fs::remove_file(dst) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::anyhow!("清理未写完的样本失败({}): {e}", dst.display()));
+            }
+        }
+        std::fs::remove_file(&mark)
+            .map_err(|e| anyhow::anyhow!("清理半成品标记失败({}): {e}", mark.display()))?;
+    }
+    // 目标已经在了就直接走人,**别去碰旁标**:先写旁标再发现"已存在"的话,一份完整
+    // 的样本就被打上了"未写完"的标记;进程恰好死在两步之间、或旁标删不掉,下次恢复
+    // 就会把这份完整样本删掉、用旧快照顶替(codex review 实现轮六 P2)。
+    // 这里的 exists 检查有理论上的时间窗,但样本写入在进程内由 VP_LOCK 串行,
+    // 跨进程写样本本就不在本版承诺范围内(见设计文档推迟项)。
+    if dst.exists() {
+        return Ok(false);
+    }
+    // **旁标必须先于目标落地**。反过来的话,建完 dst、还没写旁标就崩,会留下一个
+    // 没有任何标记的空文件;下次恢复看它存在就返回"已存在"跳过,journal 随后被删,
+    // 而这个空文件会被 sample_paths_existing 当成正经样本进 list_people 和重建
+    // (codex review 实现轮五 P1)。
+    std::fs::write(&mark, b"")
+        .map_err(|e| anyhow::anyhow!("写半成品标记失败({}): {e}", mark.display()))?;
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(dst);
+    let mut out = match opened {
+        Ok(f) => f,
+        Err(e) => {
+            // 旁标删不掉就上抛:留着它会让下次恢复把这份(别人刚写好的)完整样本当
+            // 半成品清掉重写。
+            std::fs::remove_file(&mark)
+                .map_err(|e2| anyhow::anyhow!("清除半成品标记失败({}): {e2}", mark.display()))?;
+            return match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Ok(false),
+                _ => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+            };
+        }
+    };
+    let res = (|| -> std::io::Result<()> {
+        let mut inp = std::fs::File::open(src)?;
+        std::io::copy(&mut inp, &mut out)?;
+        out.flush()?;
+        out.sync_all()
+    })();
+    drop(out);
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(dst);
+        let _ = std::fs::remove_file(&mark);
+        return Err(anyhow::anyhow!("写入样本失败({}): {e}", dst.display()));
+    }
+    // 旁标删不掉就整体失败:留着它下次会把这份**完整**的样本当半成品清掉重写,
+    // 那是浪费但不丢数据;而谎称成功再让上层删 journal 才是真丢数据。
+    std::fs::remove_file(&mark)
+        .map_err(|e| anyhow::anyhow!("清除半成品标记失败({}): {e}", mark.display()))?;
+    Ok(true)
+}
+
+/// `copy_no_overwrite` 的按目录版:目标名沿用源文件名。
+fn restore_one_sample(src: &Path, vp_samples_dir: &Path) -> anyhow::Result<bool> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("样本副本路径无文件名: {}", src.display()))?;
+    copy_no_overwrite(src, &vp_samples_dir.join(name))
+}
+
 /// 人工处置键名单上限:超出按追加序淘汰最旧。500 远超一轮整理量,只为防无界
 /// 膨胀——丢了顶多让用户重启后再处置一次。
 pub const DISMISSED_CAP: usize = 500;
@@ -49,6 +206,42 @@ pub struct MergeJournalEntry {
     /// 时本条复活——链式撤销 LIFO 可行的关键。
     #[serde(default)]
     pub invalidated_by: Option<String>,
+    /// 快照里那两份 `Person` 的质心属于哪个模型空间(落盘时库的 `embedding_model`)。
+    ///
+    /// **没有它,快照回放就是一个绕过所有门禁的后门**:换模型重建之后,
+    /// `rebuild_for_model` 会把全部条目标记失效,而「拆回人物」**恰恰只接受失效条目**
+    /// ——于是任何一条老日志都能把旧空间的质心原样插回新库,库标签还是新的
+    /// (2026-08-19 codex review 设计轮 P1)。
+    ///
+    /// 旧条目没有这一栏(空串)= 来源不明,回放时按"只还身份、质心置空"处理。
+    #[serde(default)]
+    pub embedding_model: String,
+    /// 撤销/拆回做到哪一步了。**这是一次跨三种资源的操作**——库 JSON、样本文件、
+    /// 日志条目本身——中间任何一步失败都留下一个从外部无法判别的中间态。
+    ///
+    /// 早先靠"loser 是不是已经在 people 里"来猜是不是重试。那个判据只能证明**库**
+    /// 已经还原,证明不了**样本清理**做到哪:第一次撤销删了一半样本就失败的话,重试
+    /// 会跳过全部清理,剩下的合并后样本把对应槽位占住,快照那份被 copy_no_overwrite
+    /// 静默跳过,然后条目被删——撤销结果永久混着合并后的样本
+    /// (codex review 实现轮四 P1)。所以阶段必须落盘,不能推断。
+    ///
+    /// 取值见 `UndoPhase`。空串=还没开始。
+    #[serde(default)]
+    pub undo_phase: String,
+    /// 撤销/拆回时质心因跨模型空间被清空过。**必须持久化**:清空已经落盘,而后半程
+    /// (样本、删条目)可能失败并留下条目等重试;重试时若只看"质心现在空不空",上一次
+    /// 失败后调用方发起的那次重建可能已经从**部分**样本长出了非空质心,于是补齐样本
+    /// 之后不再重建,质心就永久只覆盖样本的一个子集(codex review 实现轮四 P2)。
+    #[serde(default)]
+    pub undo_cleared_centroids: bool,
+}
+
+/// `MergeJournalEntry::undo_phase` 的取值。顺序即推进顺序。
+pub mod undo_phase {
+    /// 库已按快照还原(people/redirects 已落盘)。
+    pub const LIBRARY_RESTORED: &str = "library_restored";
+    /// 双方现存样本已全部清掉,只等把快照副本拷回来。
+    pub const SAMPLES_CLEARED: &str = "samples_cleared";
 }
 
 /// root 为 app_data_dir(与 VoiceprintStore 同根),日志落 root/merge_journal/。
@@ -90,6 +283,16 @@ impl MergeJournal {
 
     fn samples_dir(&self, id: &str, side: &str) -> Option<PathBuf> {
         self.entry_dir(id).map(|d| d.join("samples").join(side))
+    }
+
+    /// 推进撤销阶段并落盘。**必须在该阶段真正做完之后调用**——它记录的是"已完成",
+    /// 不是"打算做"。写失败就上抛:阶段没落盘的话下次重试会重做这一段,而重做样本
+    /// 清理就会删掉两次尝试之间用户新录的东西。
+    pub fn set_undo_phase(&self, id: &str, phase: &str, cleared_centroids: bool) -> anyhow::Result<()> {
+        let mut e = self.entry(id)?;
+        e.undo_phase = phase.to_string();
+        e.undo_cleared_centroids |= cleared_centroids;
+        self.save_entry(&e)
     }
 
     pub fn entry(&self, id: &str) -> anyhow::Result<MergeJournalEntry> {
@@ -207,8 +410,19 @@ impl MergeJournal {
     /// 整条日志:宁可少一个可撤销项,也不能让过期快照继续可撤销并覆盖后续人物
     /// 数据。
     pub fn invalidate(&self, touched: &[&str], reason: &str, by: Option<&str>) {
+        self.invalidate_inner(touched, reason, by, false)
+    }
+
+    /// `exempt_in_progress`:是否放过进行中的撤销条目。**只有换模型重建能豁免**——
+    /// 普通的人物变更(又被合并、被删、又录到)必须照常失效它:那种情况下快照指向的
+    /// 人已经不是原来那个了,重试会把旧样本写到一个已经消失的 id 底下还报成功
+    /// (codex review 实现轮五 P1)。
+    fn invalidate_inner(&self, touched: &[&str], reason: &str, by: Option<&str>, exempt_in_progress: bool) {
         for mut e in self.entries() {
             if e.invalid_reason.is_some() {
+                continue;
+            }
+            if exempt_in_progress && !e.undo_phase.is_empty() {
                 continue;
             }
             if !touched.contains(&e.loser.as_str()) && !touched.contains(&e.winner.as_str()) {
@@ -236,14 +450,17 @@ impl MergeJournal {
     /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本保留(同
     /// invalidate 文档)。
     pub fn invalidate_all(&self, reason: &str) {
+        // 进行中的撤销必须留着能撤完。跨空间撤销失败后调用方会立刻排一次重建,而重建
+        // 结尾就调本函数;失效之后 undo_merge 会被 invalid_reason 挡住,改走"拆回"又
+        // 只还 loser——那次本该双边还原的撤销永远做不完(codex review 实现轮四 P1)。
         let ids: Vec<String> = self
             .entries()
             .iter()
-            .filter(|e| e.invalid_reason.is_none())
+            .filter(|e| e.invalid_reason.is_none() && e.undo_phase.is_empty())
             .flat_map(|e| [e.loser.clone(), e.winner.clone()])
             .collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        self.invalidate(&refs, reason, None);
+        self.invalidate_inner(&refs, reason, None, true);
     }
 
     /// 由 by_id 那次合并所失效的条目复活(撤销 by_id = 它施加的失效不再成立)。
@@ -261,7 +478,14 @@ impl MergeJournal {
     }
 
     /// 确认(回执卡「好」)= 删除条目(连同样本副本)。
+    ///
+    /// **进行中的撤销拒绝确认**:那条目里的样本快照是恢复唯一的依据,库已经按快照
+    /// 还原了一半,确认掉就永久回不去(codex review 实现轮五 P1)。
     pub fn acknowledge(&self, id: &str) -> anyhow::Result<()> {
+        let e = self.entry(id)?;
+        if !e.undo_phase.is_empty() {
+            anyhow::bail!("这条撤销还没做完(卡在{}),先重试撤销再确认", e.undo_phase);
+        }
         self.remove(id)
     }
 
@@ -272,10 +496,16 @@ impl MergeJournal {
         Ok(())
     }
 
-    /// 超上限淘汰最旧(entries 已按 time 降序)。
+    /// 超上限淘汰最旧(entries 已按 time 降序)。**进行中的撤销不淘汰**(理由同
+    /// acknowledge):宁可短暂超出上限,也不能把恢复依据当垃圾扔掉。上限只是防无界
+    /// 膨胀,而进行中的条目数天然受限于用户手动重试的次数。
     fn prune(&self) {
         let entries = self.entries();
         for e in entries.iter().skip(JOURNAL_CAP) {
+            if !e.undo_phase.is_empty() {
+                eprintln!("合并日志淘汰:{} 有未做完的撤销,保留", e.id);
+                continue;
+            }
             if let Some(d) = self.entry_dir(&e.id) {
                 let _ = std::fs::remove_dir_all(&d);
             }
@@ -286,9 +516,29 @@ impl MergeJournal {
     /// 无样本 → 空(回执卡隐藏该试听行)。失效条目(无论 by=Some/None)的副本
     /// 保留,直至条目被确认/撤销/淘汰随目录一并清理。
     pub fn sample_copies(&self, id: &str, side: &str) -> Vec<PathBuf> {
-        let Some(dir) = self.samples_dir(id, side) else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
-        let mut out: Vec<PathBuf> = rd.flatten().map(|f| f.path()).collect();
+        // 面向 UI 的宽松版:读不出来就当没有。恢复路径**不得**用它,见
+        // sample_copies_strict(codex review 实现轮二 P1)。
+        self.sample_copies_strict(id, side).unwrap_or_default()
+    }
+
+    /// 同 `sample_copies`,但**严格传播 I/O 错误**:目录不存在=该侧本就无样本(Ok 空),
+    /// 其余读取失败(权限、损坏、单个目录项出错)一律上抛。恢复路径必须用这个——
+    /// 宽松版把读失败当"无样本",上层会得到 `Ok(0)` 并删掉 journal,唯一的样本副本
+    /// 就永久没了(codex review 实现轮二 P1)。
+    fn sample_copies_strict(&self, id: &str, side: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let dir = self
+            .samples_dir(id, side)
+            .ok_or_else(|| anyhow::anyhow!("非法日志 id: {id}"))?;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(anyhow::anyhow!("读取样本副本目录失败({}): {e}", dir.display())),
+        };
+        let mut out: Vec<PathBuf> = Vec::new();
+        for f in rd {
+            let f = f.map_err(|e| anyhow::anyhow!("读取样本副本目录项失败({}): {e}", dir.display()))?;
+            out.push(f.path());
+        }
         // 槽位序而非字典序:<id>.wav=槽1,<id>-N.wav=槽N。字典序会把 '-' 排在 '.'
         // 前,槽1(最老)反而落到最后,前端"最后一份=最新"的取法就拿错。兜底截声
         // 文件 "<loser>-cut.wav" 的后缀非数字,排在所有数字槽之后(u32::MAX - 1,
@@ -300,7 +550,7 @@ impl MergeJournal {
             }
         };
         out.sort_by_key(slot);
-        out
+        Ok(out)
     }
 
     /// 被并入方(loser)合并前的样本快照副本路径,按槽位序。薄委托,保留旧名不破
@@ -339,16 +589,16 @@ impl MergeJournal {
         }
     }
 
-    /// 把条目的样本副本拷回声纹样本目录(撤销用),返回还原文件数。
+    /// 把条目的样本副本拷回声纹样本目录(撤销用),返回**本次实际拷回**的文件数
+    /// (目标已存在的跳过、不计数)。任何读写失败都上抛——调用方据此保留 journal。
     pub fn restore_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
         let mut n = 0usize;
         for side in ["loser", "winner"] {
-            let Some(dir) = self.samples_dir(id, side) else { continue };
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue }; // 该侧无样本,正常
-            for f in rd.flatten() {
-                std::fs::copy(f.path(), vp_samples_dir.join(f.file_name()))?;
-                n += 1;
+            for p in self.sample_copies_strict(id, side)? {
+                if restore_one_sample(&p, vp_samples_dir)? {
+                    n += 1;
+                }
             }
         }
         Ok(n)
@@ -359,21 +609,27 @@ impl MergeJournal {
     /// sample_slot_path 不识别 -cut 后缀,原名拷回等于拆回的人"无样本"。
     pub fn restore_loser_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
-        let copies = self.sample_copies(id, "loser");
+        let copies = self.sample_copies_strict(id, "loser")?;
         let is_cut = |p: &PathBuf| {
             p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-cut"))
         };
+        let regular: Vec<&PathBuf> = copies.iter().filter(|p| !is_cut(p)).collect();
         let mut n = 0usize;
-        for p in copies.iter().filter(|p| !is_cut(p)) {
-            std::fs::copy(p, vp_samples_dir.join(p.file_name().unwrap()))?;
-            n += 1;
+        for p in &regular {
+            if restore_one_sample(p, vp_samples_dir)? {
+                n += 1;
+            }
         }
-        if n == 0 {
+        // 兜底截声只在**根本没有常规槽位**时才用。判据是 regular 为空,不是 n==0——
+        // 重试时常规槽位可能已全部就位(拷回数 0),那不该再塞一份 -cut
+        // (codex review 实现轮二 P1)。
+        if regular.is_empty() {
             if let Some(cut) = copies.iter().find(|p| is_cut(p)) {
                 let stem = cut.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
                 let loser = stem.trim_end_matches("-cut");
-                std::fs::copy(cut, vp_samples_dir.join(format!("{loser}.wav")))?;
-                n = 1;
+                if copy_no_overwrite(cut, &vp_samples_dir.join(format!("{loser}.wav")))? {
+                    n = 1;
+                }
             }
         }
         Ok(n)
@@ -473,6 +729,9 @@ mod tests {
             acknowledged: false,
             invalid_reason: None,
             invalidated_by: None,
+            embedding_model: "campplus".into(),
+            undo_phase: String::new(),
+            undo_cleared_centroids: false,
         }
     }
 
@@ -798,5 +1057,114 @@ mod tests {
         assert_eq!(n, 1, "常规槽位存在时只拷常规槽");
         assert!(out.join("P1.wav").exists());
         assert!(!out.join("P1-cut.wav").exists(), "截声不该被拷回");
+    }
+
+    #[test]
+    fn restore_samples_never_overwrites_an_existing_sample() {
+        // 拆回/撤销在样本恢复失败后保留 journal 让用户重试,而用户可能在重试前又录了
+        // 新样本。恢复必须只补缺失:旧快照绝不能盖掉那份新录音
+        // (codex review 实现轮二 P1)。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "winner", "P2.wav");
+        let out = dir.path().join("vp");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("P1.wav"), b"RIFFbrand-new-recording").unwrap();
+
+        let n = j.restore_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1, "只该补缺失的 P2,P1 已存在应跳过且不计数");
+        assert_eq!(
+            std::fs::read(out.join("P1.wav")).unwrap(),
+            b"RIFFbrand-new-recording",
+            "既有样本必须原样保留"
+        );
+        assert!(out.join("P2.wav").exists());
+        // 不留临时文件。
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .filter(|f| f.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件必须清干净: {leftovers:?}");
+    }
+
+    #[test]
+    fn restore_loser_samples_is_idempotent_and_keeps_new_recording() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        let out = dir.path().join("vp");
+        assert_eq!(j.restore_loser_samples("m-P1", &out).unwrap(), 1);
+        std::fs::write(out.join("P1.wav"), b"RIFFbrand-new-recording").unwrap();
+        // 重试:常规槽位已就位 → 拷 0 份,且**不得**退回去塞兜底截声。
+        assert_eq!(j.restore_loser_samples("m-P1", &out).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("P1.wav")).unwrap(), b"RIFFbrand-new-recording");
+    }
+
+    #[test]
+    fn restore_loser_samples_still_falls_back_to_cut_on_retry_with_no_regular_slot() {
+        // 兜底截声的判据是"根本没有常规槽位",不是"这次拷了 0 份"——否则重试时
+        // 常规槽已就位(拷 0 份)会被误判成需要兜底。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P2", "loser", "P2-cut.wav");
+        let out = dir.path().join("vp");
+        assert_eq!(j.restore_loser_samples("m-P2", &out).unwrap(), 1);
+        assert!(out.join("P2.wav").exists());
+        // 再来一次:目标已在,跳过,不重复也不报错。
+        assert_eq!(j.restore_loser_samples("m-P2", &out).unwrap(), 0);
+    }
+
+    #[test]
+    fn restore_samples_propagates_read_errors_instead_of_reporting_zero() {
+        // 面向 UI 的 sample_copies 读不出来就当没有;恢复路径不能这样——上层会拿到
+        // Ok(0) 就删掉 journal,唯一的样本副本永久丢失(codex review 实现轮二 P1)。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        // 把 loser 侧目录换成一个普通文件:read_dir 报 NotADirectory,不是 NotFound。
+        let side = j.samples_dir("m-P1", "loser").unwrap();
+        std::fs::remove_dir_all(&side).unwrap();
+        std::fs::write(&side, b"not a directory").unwrap();
+        let out = dir.path().join("vp");
+        assert!(j.restore_samples("m-P1", &out).is_err(), "读取失败必须上抛,不能报 Ok(0)");
+        assert!(j.restore_loser_samples("m-P1", &out).is_err());
+        // 宽松版仍然容错(它服务于 UI 列表)。
+        assert!(j.sample_copies("m-P1", "loser").is_empty());
+    }
+
+    #[test]
+    fn in_progress_entry_is_exempt_only_from_rebuild_invalidation() {
+        // 换模型重建要放过进行中的撤销(否则那次撤销永远做不完);但普通的人物变更
+        // 必须照常失效它——那种情况下快照指向的人已经不是原来那个了,重试会把旧样本
+        // 写到一个已经消失的 id 底下还报成功(codex review 实现轮五 P1)。
+        let (_dir, j) = test_journal();
+        j.append(&entry("m-A", "t1", "P1", "P2"), &[], &[]).unwrap();
+        j.append(&entry("m-B", "t2", "P3", "P4"), &[], &[]).unwrap();
+        j.set_undo_phase("m-A", undo_phase::SAMPLES_CLEARED, false).unwrap();
+        j.set_undo_phase("m-B", undo_phase::SAMPLES_CLEARED, false).unwrap();
+
+        j.invalidate_all("声纹库已按新模型重建");
+        assert!(j.entry("m-A").unwrap().invalid_reason.is_none(), "重建不得失效进行中的撤销");
+
+        j.invalidate(&["P1"], "P1 又被合并了", None);
+        assert!(
+            j.entry("m-A").unwrap().invalid_reason.is_some(),
+            "人物变更必须照常失效,哪怕撤销正进行中"
+        );
+        assert!(j.entry("m-B").unwrap().invalid_reason.is_none(), "没被触及的条目不受影响");
+    }
+
+    #[test]
+    fn in_progress_entry_cannot_be_acknowledged_away() {
+        // 条目里的样本快照是恢复唯一的依据,而库已按快照还原了一半。用户点「好」
+        // 就把它删掉的话永久回不去(codex review 实现轮五 P1)。
+        let (_dir, j) = test_journal();
+        j.append(&entry("m-A", "t1", "P1", "P2"), &[], &[]).unwrap();
+        j.set_undo_phase("m-A", undo_phase::LIBRARY_RESTORED, false).unwrap();
+
+        assert!(j.acknowledge("m-A").is_err(), "进行中的撤销不得被确认掉");
+        assert!(j.entry("m-A").is_ok(), "条目必须还在");
+
+        // 做完了(阶段清空)就能正常确认。
+        j.set_undo_phase("m-A", "", false).unwrap();
+        assert!(j.acknowledge("m-A").is_ok());
     }
 }

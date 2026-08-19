@@ -134,6 +134,7 @@ pub enum EditOp {
     RenameSpeaker { id: String, speaker_id: String, name: String },
     DeleteSpeaker { id: String, speaker_id: String },
     AssignPerson { id: String, speaker_id: String, person_id: String },
+    ClearPerson { id: String, speaker_id: String },
     EditText { id: String, seq: u64, expected_text: String, new_text: String },
     DeleteSegment { id: String, seq: u64, expected_text: String },
     SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },

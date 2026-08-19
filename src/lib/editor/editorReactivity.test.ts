@@ -7,13 +7,14 @@ import { describe, expect, it } from "vitest";
 //
 // 所以 PM 回调只允许读普通(非响应式)镜像变量,由 $effect 负责把 props 同步进镜像。
 // 这条约束靠读源码守住:组件运行时行为没法在 node 环境的单测里跑起来。
-const source = import.meta.glob(["./MarkdownEditor.svelte", "../../routes/notes/[id]/+page.svelte"], {
+const source = import.meta.glob(["./MarkdownEditor.svelte", "../../routes/notes/[id]/+page.svelte", "./segmentSchema.ts"], {
   eager: true,
   query: "?raw",
   import: "default",
 }) as Record<string, string>;
 
 const editor = source["./MarkdownEditor.svelte"];
+const segSchema = source["./segmentSchema.ts"];
 const detail = source["../../routes/notes/[id]/+page.svelte"];
 
 describe("编辑器与 Svelte 响应式的边界", () => {
@@ -72,5 +73,50 @@ describe("编辑器与 Svelte 响应式的边界", () => {
     const handler = detail.slice(detail.indexOf("const onSegRendered"));
     expect(handler).toMatch(/untrack\(\(\) => \(segRenderTick \+= 1\)\)/);
     expect(handler.slice(0, handler.indexOf("};"))).not.toMatch(/^\s*segRenderTick\+\+/m);
+  });
+});
+
+// 2026-08-19 线上 bug:同一段在逐字稿里显示「新说话人 4」,而顶部说话人胶囊与改派菜单
+// 同时显示「刘光浚」——同一份 note.speakers 在同一次渲染里给出两个显示名。
+//
+// 根因不在 speakerLabel,而在两套生命周期:胶囊/菜单是 Svelte 响应式,数据一变就重算;
+// 段落徽章是 ProseMirror NodeView 里的命令式 DOM,只在构造时算一次。而"显示名"来自
+// 外部 speakers 映射、不在节点 attrs 里,所以 S4 关联到人物前后,节点在 PM 眼里完全
+// 没变(type/attrs/内容全同 → node.eq),它会直接复用旧 NodeView:**即便整份
+// replaceWith 重建文档也不会刷新**(这一点尤其反直觉,别再把它归因到 hasFocus 守卫)。
+describe("段落徽章必须跟着说话人信息变化刷新", () => {
+  it("显示名进 attrs——不进去 PM 就看不见变化", () => {
+    expect(segSchema).toBeTruthy();
+    expect(segSchema).toMatch(/badgeKey:\s*\{\s*default:/);
+  });
+
+  it("setSegments 必须把显示名算进 attrs,而不是只传 speaker id", () => {
+    // 只写 {seq, source, speaker, startMs} 的话,attrs 恒定,update() 永不触发。
+    expect(editor).toMatch(/badgeKey:\s*`\$\{b\.label\}/);
+    // 颜色也得进去:label 相同而配色不同的情形(本地名与新关联人物同名)否则漏更新
+    expect(editor).toMatch(/\$\{b\.bg\}/);
+    expect(editor).toMatch(/\$\{b\.ink\}/);
+  });
+
+  it("NodeView 必须实现 update(),否则只能整只重建——而 PM 连重建都不会做", () => {
+    expect(segSchema).toMatch(/update:\s*\(next: PMNode\)\s*=>/);
+    // update 里必须真的重算徽章,不能只换引用
+    expect(segSchema).toMatch(/badge\.textContent\s*=\s*b\.label/);
+  });
+
+  it("update 后事件回调读新节点,不读构造时那个快照", () => {
+    // 否则改派菜单会带着旧的 seq/speaker 开出来。
+    expect(segSchema).toMatch(/let\s+cur\s*=\s*node/);
+    expect(segSchema).toMatch(/cur\.attrs\.seq/);
+    expect(segSchema).not.toMatch(/onBadgeClick\(\s*\n?\s*node\.attrs\.seq/);
+  });
+
+  it("badgeKey 不得进 docSkeleton——否则改个名字会被段结构锁当成骨架破坏而整条拒绝", () => {
+    const skeleton = segSchema.slice(
+      segSchema.indexOf("export function docSkeleton"),
+      segSchema.indexOf("export const segmentLockPlugin"),
+    );
+    expect(skeleton).toBeTruthy();
+    expect(skeleton).not.toContain("badgeKey");
   });
 });

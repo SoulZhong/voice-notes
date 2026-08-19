@@ -351,6 +351,12 @@ export const assignRefinedPerson = (noteId: string, speakerId: string, personId:
 export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, personId: string) =>
   invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId });
 
+/** 解除说话人与声纹库人物的关联:清 person_id,显示回落到「新说话人 N」。
+    连带撤销这次关联带来的声纹回灌(后台 best-effort,见后端注释里那条
+    「MergePrior 不可撤销」的例外)。表项与段落归属都不动——与删除说话人不是一回事。 */
+export const clearNoteSpeakerPerson = (noteId: string, speakerId: string) =>
+  invoke<void>("clear_note_speaker_person", { noteId, speakerId });
+
 /** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
     Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */
 export type SpeakerMetaLite = { name?: string; person_id?: string | null };

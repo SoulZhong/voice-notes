@@ -83,6 +83,12 @@ struct ActiveSession {
     system_audio: String,
     /// 说话人区分可用性："on"（声纹模型就绪）| "unavailable"（缺失，降级），供重挂载重建。
     diarization: String,
+    /// **本场开录时那一份设置快照里的声纹模型**。归还嵌入器时用它重贴标签。
+    ///
+    /// 为什么不能在归还时现读设置:`running` 早在 `handle.stop()` 之前就被置回 false,
+    /// 停录排干期间允许 `set_settings` 切模型——现读就会把 A 建的实例标成 B,下一场
+    /// 核对通过、用 A 算出整场向量却以 B 写库(codex review 实现轮 P1)。
+    speaker_model: String,
     /// 计时：会话入槽时刻、续录基线、暂停起点（Some=暂停中）、已累计暂停时长。
     started: std::time::Instant,
     base_ms: u64,
@@ -132,7 +138,7 @@ struct AppState {
     /// 预载线程持锁加载，使开录 take() 自然阻塞至就绪且永不双重加载。
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     /// 录制中发生过声纹人名变更(Qwen3 热词已过期):停录归还识别器时消费,
     /// 丢弃归还件交预载重建。录制外的变更直接清槽,不经此标记
     /// (见 refresh_qwen_hotwords_cache)。
@@ -248,6 +254,15 @@ fn should_enqueue_transcode(note_dir: &std::path::Path) -> bool {
 /// 库路径不可用/加载损坏 → 一律降级为空种子（load 本身已对损坏文件降级，这里只再兜
 /// app_data_dir 解析失败一层）：声纹库是增值功能，绝不能因为它挡住录制。
 fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedCluster> {
+    load_voiceprint_seeds_for(app, &current_speaker_model(app))
+}
+
+/// 同上,但门禁比对的是**调用方指定的**模型标签。
+///
+/// 凡是"先建嵌入器、再取种子"的路径都必须用这个:两处各读一次设置的话,用户在中间
+/// 切了模型就会拿 B 算出来的向量去比 A 空间的种子质心——门禁看的是新设置,已经放行了
+/// (codex review 实现轮五 P1)。标签应取自建那个嵌入器时用的同一份快照。
+fn load_voiceprint_seeds_for(app: &AppHandle, cur: &str) -> Vec<crate::diar::registry::SeedCluster> {
     let Ok(root) = data_root(app) else {
         eprintln!("声纹库路径不可用，本场开录跳过种子注入（不影响录制）");
         return Vec::new();
@@ -256,11 +271,6 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
     // 嵌入模型标签与当前选型不一致(切换后台重建尚未完成的窗口)时不注入种子:
     // 不同模型的向量空间不可混比,错认比不认糟。此门禁足以杜绝一切跨空间比较——
     // 种子被跳过后,本场新簇只在新空间内互比;既有人物无种子即不会被命中回写。
-    let cur = app
-        .path()
-        .app_data_dir()
-        .map(|d| settings::load(&d).speaker_model)
-        .unwrap_or_default();
     if vp.embedding_model != cur {
         eprintln!("声纹库模型标签({})与当前选型({cur})不一致,本场跳过种子注入(重建完成后恢复)", vp.embedding_model);
         return Vec::new();
@@ -273,6 +283,12 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
 // 逐语句等价):失败路径改发 Msg::AbortSession,由 runner 对槽内 writer 执行。
 
 /// 归还识别器/嵌入器进常驻槽（None = 没取到、asr 线程 panic 等，不回收）。
+/// 会话归还嵌入器时重新贴标签。标签取自**开录时那一份设置快照**——正是用来挑选
+/// 权重、也用来声明写库空间的那一份,三者同源。
+fn retag(model: &str, e: Option<Box<dyn diar::SpeakerEmbedder>>) -> Option<Box<diar::TaggedEmbedder>> {
+    e.map(|inner| Box::new(diar::TaggedEmbedder::new(model, inner)))
+}
+
 /// recognizer_cache 与 embedder_cache 策略完全一致，故共用一个泛型实现。
 fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>) {
     if let Some(m) = m {
@@ -493,14 +509,16 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
-                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
+                // 标签、权重、种子门禁三者必须出自同一次设置读取(codex review 实现轮五 P1)。
+                let speaker_tag = current_speaker_model(&app);
+                let mut embedder = match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
                     Ok(e) => Some(e),
                     Err(e) => {
                         eprintln!("refine: 声纹模型不可用，跳过重聚类: {e}");
                         None
                     }
                 };
-                let seeds = load_voiceprint_seeds(&app);
+                let seeds = load_voiceprint_seeds_for(&app, &speaker_tag);
                 let (mut doc, cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
@@ -1007,7 +1025,15 @@ fn speaker_model_path(app: &AppHandle) -> PathBuf {
         .app_data_dir()
         .map(|d| settings::load(&d).speaker_model)
         .unwrap_or_default();
-    models::root().join(models::speaker_model_file(&model))
+    speaker_model_path_for(&model)
+}
+
+/// 按**给定**模型名取权重路径。重建路径必须用它而不是 speaker_model_path:
+/// 后者自己再读一次设置,于是"库标签写成 A"与"实际用哪个权重嵌入"来自两次独立读取,
+/// 中间用户切一次模型就能让二者分叉——最终把 B 空间的向量写进标着 A 的库
+/// (codex review 二轮 P1#1)。
+fn speaker_model_path_for(model: &str) -> PathBuf {
+    models::root().join(models::speaker_model_file(model))
 }
 
 fn new_silero(vad_path: &std::path::Path) -> anyhow::Result<Box<dyn Segmenter>> {
@@ -1151,7 +1177,7 @@ fn spawn_session(
     generation: Arc<Mutex<u64>>,
     session_slot: Arc<Mutex<Option<ActiveSession>>>,
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     transcode: Arc<store::transcode::TranscodeQueue>,
     retranscribing: Arc<Mutex<Option<(String, String)>>>,
     mixed_regen: Arc<Mutex<Option<String>>>,
@@ -1244,6 +1270,10 @@ fn spawn_session(
         // 混音成品轨=是、识别方式=本地），绝不因读设置失败改变现状行为。位置提到取模型
         // 之前：识别方式决定要不要取常驻识别器。language_filter 在下方 start_session 处消费。
         let cfg = app.path().app_data_dir().map(|d| settings::load(&d)).unwrap_or_default();
+        // 本场声纹的模型标签。**必须取自 cfg 这一份快照**,与下面取嵌入器同源——
+        // 中途再读一次设置就可能与实际用来算向量的那个模型分家,于是"声明的空间"和
+        // "真实的空间"不符,而库那边只认声明(见 voiceprints::space_ok)。
+        let speaker_model = cfg.speaker_model.clone();
         let (language_filter, use_aec_capture, mix_track) = (
             cfg.language_filter,
             cfg.capture_path == settings::CapturePath::Aec,
@@ -1281,7 +1311,20 @@ fn spawn_session(
         // 时不现场加载——预载失败即降级为无声纹（说话人区分不可用），而不是在
         // 开录路径上额外背一次模型加载的延迟/失败风险。云端模式同样取用/返还:
         // 声纹是本机能力,与识别在哪跑无关。
-        let embedder = embedder_cache.lock().unwrap().take();
+        // **取用即核对**:槽里那位可能是上一个选型建的(重建线程 stash 与设置变更
+        // 清缓存之间存在窗口)。不符就丢弃——宁可本场没有说话人区分,也不能用错空间
+        // 的嵌入器算出一整场向量,再以当前标签写进库。
+        let embedder = embedder_cache.lock().unwrap().take().and_then(|te| {
+            if te.model() == speaker_model {
+                Some(te.into_inner())
+            } else {
+                eprintln!(
+                    "常驻声纹嵌入器是 {} 建的,本场选型是 {speaker_model},丢弃不用",
+                    te.model()
+                );
+                None
+            }
+        });
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
@@ -1317,7 +1360,7 @@ fn spawn_session(
             Ok(s) => s,
             Err(e) => {
                 stash_model(&recognizer_cache, recognizer);
-                stash_model(&embedder_cache, embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, embedder));
                 return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
             }
         };
@@ -1742,7 +1785,7 @@ fn spawn_session(
             Ok(w) => w,
             Err(e) => {
                 stash_model(&recognizer_cache, recognizer);
-                stash_model(&embedder_cache, embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, embedder));
                 let msg = match &target {
                     NoteTarget::New => {
                         format!("error: {}", tr!("创建笔记失败: {e}", "Failed to create note: {e}"))
@@ -1803,7 +1846,11 @@ fn spawn_session(
         lc.report(lifecycle::machine::Msg::AdoptWriter { writer: Box::new(writer) });
         // 说话人编号/质心延续 + 库种子注入：快照（续录）优先，库中同 person 不重复注入。
         // 库加载失败降级为无种子，绝不挡录制。
-        let seeds = load_voiceprint_seeds(&app);
+        //
+        // 种子门禁比对的是**本场开录时那份 speaker_model 快照**,与校验嵌入器用的是同一个。
+        // 这里若重读当前设置,开录期间切模型就会拿 A 的嵌入器去比 B 库的种子,而门禁看新
+        // 设置已经放行(codex review 实现轮六 P1)。
+        let seeds = load_voiceprint_seeds_for(&app, &speaker_model);
         let mut registry =
             crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
         // 说话人识别方法(设置项):与本场其余配置同一快照,场中改设置不影响进行中会话。
@@ -1821,12 +1868,15 @@ fn spawn_session(
         if let Ok(root) = data_root(&app) {
             let vp_store_e = store::VoiceprintStore::new(root);
             let live_enrolled_e = live_enrolled.clone();
+            let enroll_model = speaker_model.clone();
             registry.set_enroller(
                 store::AUTO_ENROLL_MS,
                 Box::new(move |snap| {
-                    match vp_store_e
-                        .upsert_from_session(std::slice::from_ref(snap), &chrono::Local::now().to_rfc3339())
-                    {
+                    match vp_store_e.upsert_from_session(
+                        std::slice::from_ref(snap),
+                        &chrono::Local::now().to_rfc3339(),
+                        &enroll_model,
+                    ) {
                         Ok(links) => {
                             let pid = links.get(&snap.id).cloned();
                             if let Some(pid) = &pid {
@@ -1857,6 +1907,8 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
+        // 停录快照入库用的模型标签,与实时入库同一份快照(见上方 speaker_model)。
+        let snapshot_model = speaker_model.clone();
         let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
             Ok(root) => Some(store::VoiceprintStore::new(root)),
             Err(e) => {
@@ -2027,7 +2079,11 @@ fn spawn_session(
                         // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
                         // person_id 随 finalize 落盘。
                         if let Some(store) = &vp_store_d {
-                            match store.upsert_from_session(&snaps, &chrono::Local::now().to_rfc3339()) {
+                            match store.upsert_from_session(
+                                &snaps,
+                                &chrono::Local::now().to_rfc3339(),
+                                &snapshot_model,
+                            ) {
                                 Ok(enrolled) => {
                                     // 原 set_speaker_person(cluster, person) 循环改为把新关联
                                     // 注进 snaps[].person 随消息走:runner 的 store_centroids
@@ -2109,7 +2165,7 @@ fn spawn_session(
                         .collect();
                     let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
-                    stash_model(&embedder_cache, e);
+                    stash_model(&embedder_cache, retag(&speaker_model, e));
                     // 镜像正常停止路径(do_stop_teardown 里 `for j in s.audio_joins`
                     // 那段):分段 worker 已随 handle.stop() join → audio sink 已 drop →
                     // 写盘线程排干无界队列后自退,这里 join 等它们真正退出,确保文件
@@ -2150,7 +2206,7 @@ fn spawn_session(
                     drop(running_guard);
                     let (r, e) = start.handle.stop();
                     stash_model(&recognizer_cache, r);
-                    stash_model(&embedder_cache, e);
+                    stash_model(&embedder_cache, retag(&speaker_model, e));
                     // 镜像上方 Fix A 拆除路径与正常停止路径(do_stop_teardown 里
                     // `for j in s.audio_joins` 那段)的 join:分段 worker 已随
                     // handle.stop() join → audio sink 已 drop → 写盘线程排干无界队列后
@@ -2176,6 +2232,7 @@ fn spawn_session(
                     note_id: note_id.clone(),
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
+                    speaker_model: speaker_model.clone(),
                     started: std::time::Instant::now(),
                     base_ms,
                     paused_at: None,
@@ -2203,7 +2260,7 @@ fn spawn_session(
             }
             Err(se) => {
                 stash_model(&recognizer_cache, se.recognizer);
-                stash_model(&embedder_cache, se.embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, se.embedder));
                 // 会话未能启动:经信箱 abort(此路径无 worker,不存在在途管线消息)。
                 // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
                 lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
@@ -2425,9 +2482,12 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
         s.paused_at.map(|p| p.elapsed()),
         0,
     );
+    // 标签取自**本场开录时**那一份快照,不是现读设置:running 早在 stop() 之前就置回
+    // false,排干期间允许切模型,现读会把 A 建的实例标成 B(codex review 实现轮 P1)。
+    let session_model = s.speaker_model.clone();
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
-    stash_model(&state.embedder_cache, embedder);
+    stash_model(&state.embedder_cache, retag(&session_model, embedder));
     // 本场录制中发生过声纹改名:归还件的 Qwen3 热词已过期,丢弃,停录收尾的
     // preload 会按新名单重建(见 refresh_qwen_hotwords_cache 的脏标记分支)。
     if state.hotwords_dirty.swap(false, Ordering::Relaxed) {
@@ -2898,15 +2958,17 @@ fn run_retranscribe_once(
         new_recognizer(&current_asr(app), current_asr_provider(app), qwen3_hotwords(app))
             .map_err(|e| tr!("识别器加载失败(本地模型未下载?): {e}", "Failed to load recognizer: {e}", e = e))?
     };
+    // 标签、权重、种子门禁同源(codex review 实现轮五 P1)。
+    let speaker_tag = current_speaker_model(app);
     let mut embedder: Option<Box<dyn diar::SpeakerEmbedder>> =
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&speaker_tag)) {
             Ok(e) => Some(Box::new(e)),
             Err(e) => {
                 eprintln!("重转写:声纹模型不可用,归属降级为纯继承: {e}");
                 None
             }
         };
-    let seeds = load_voiceprint_seeds(app);
+    let seeds = load_voiceprint_seeds_for(app, &speaker_tag);
     let vad_path = models::root().join("silero_vad.onnx");
     let factory: retranscribe::input::SegmenterFactory = Box::new(move || new_silero(&vad_path));
     let mut input: Box<dyn retranscribe::input::TranscribeInput> = if mixed {
@@ -3591,11 +3653,195 @@ fn assign_note_speaker_person(
         &app,
         note_for_feedback,
         note.segments,
-        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_for_feedback])),
+        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_for_feedback.clone()])),
         prior,
         resolved,
+        Some(speaker_for_feedback),
     );
     Ok(())
+}
+
+/// 解除说话人与声纹库人物的关联,并**连带撤销**这次关联带来的声纹回灌。
+///
+/// 清掉 person_id 之后 name 必然还是空串(关联时就把本地名清了),显示回落到
+/// 「新说话人 N」。表项与段落归属一概不动——与"删除说话人"不是一回事。
+///
+/// **已知不可撤销的一种**:若当初的指认走的是 `FeedbackAction::MergePrior`
+/// (先前关联的是无名自动人物 → 整个人物被并进目标),那次合并是库级 journaled 操作,
+/// 有自己的撤销入口(收件箱回执),不在这里连带回滚——回灌账本里根本没有它的条目,
+/// 撤销会如实报 NoEntry 并落日志。硬要在这里 un-merge 会把两本账搅乱。
+#[tauri::command]
+fn clear_note_speaker_person(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    speaker_id: String,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    // 撤销回灌要的两样东西必须在清空之前取:清完就查不到当初关联的是谁了。
+    // person_id 取的是 load 后(经 redirects 归一)的值,与账本的比较口径一致。
+    let linked = note.speakers.get(&speaker_id).and_then(|m| m.person_id.clone());
+    let seqs: std::collections::BTreeSet<u64> = note
+        .segments
+        .iter()
+        .filter(|s| s.speaker.as_deref() == Some(speaker_id.as_str()))
+        .map(|s| s.seq)
+        .collect();
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::ClearPerson {
+            id: note_id.clone(),
+            speaker_id: speaker_id.clone(),
+        },
+    })?;
+    // **不连带撤销这次关联带来的声纹回灌**(2026-08-19 范围决定)。
+    // 撤销要求"撤销任务"与"回灌任务"两个后台任务正确排序,而它们只隔着一把不保证
+    // 顺序的门——三轮 codex review 里最难缠的几条 P1(反向执行竞态、MergePrior 漏
+    // 复核、账本误撤)根源全在这里。砍掉撤销任务,这些问题不是被堵住,是不存在。
+    // 代价:库里那个人多留一段本不该有的样本。见
+    // docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md
+    let _ = (linked, seqs);
+    Ok(())
+}
+
+/// 按当前选型重建声纹库:拿每个人存下的录音样本用新模型重新算质心,并把库标签
+/// 改写成新选型。**这是模型切换之后声纹识别能恢复的唯一途径**。
+///
+/// 成功即写标签(`rebuild_for_model` 末尾无条件写),所以"库标签是否等于当前选型"
+/// 就是"重建有没有成功过"的判据——也正是 heal_voiceprint_model_mismatch 的依据。
+/// 同一时刻只允许一个重建在跑。**必须有**:启动自愈、设置切换、手动重建三个入口
+/// 都能触发,并发跑两个的话,两条线程各拿各的模型嵌同一批样本、各自写库与写标签,
+/// 最后谁后写谁赢——库标签与向量空间可能来自不同的两次运行(codex review 二轮 P1#1)。
+static REBUILD_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 重建期间又来了新请求。**不能直接丢**:丢掉的往往正是最新那次切换,结果库停在
+/// 旧空间、门禁继续关着,而用户以为自己已经切过去了(codex review 二轮 P1#1)。
+/// 记一笔,当前这轮跑完再跑一轮(新一轮自己重新读设置,自然收敛到最新选型)。
+static REBUILD_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 当前选型快照。重建全程只读这一份,不再各处重读设置。
+fn current_speaker_model(app: &AppHandle) -> String {
+    app.path()
+        .app_data_dir()
+        .map(|d| settings::load(&d).speaker_model)
+        .unwrap_or_default()
+}
+
+fn spawn_voiceprint_rebuild(
+    app: &AppHandle,
+    cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
+    reason: &'static str,
+) {
+    use std::sync::atomic::Ordering;
+    if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+        REBUILD_PENDING.store(true, Ordering::SeqCst);
+        eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
+        return;
+    }
+    let app2 = app.clone();
+    let cache2 = cache.clone();
+    std::thread::spawn(move || {
+        // RAII 复位:中途 return 或 panic 都不能把单飞标志永久卡住,否则此后
+        // 任何入口都再也发不起重建——那正是本次要修的"永久降级"的另一种形态。
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        {
+            let _reset = Reset;
+            rebuild_once(&app2, cache, reason);
+        }
+        // 收尾:**只因"期间来过新请求"重跑**,不看库标签是否仍不一致。
+        // 曾经也检查过标签(想顺手兜住"跑完发现又被切了"),但那会在永久失败时变成
+        // 无界循环:模型文件缺失/保存失败 → 标签永远对不上 → 每轮结束立刻再起一轮,
+        // 无退避、无上限,日志与遥测一起刷屏(codex review 三轮 P1#1)。
+        // 真正的切换必然经过 set_settings,那条路会把 PENDING 置上,不会漏。
+        // 剩下的"卡住"情形由下次启动的自愈兜——一次启动最多跑一轮,天然有界。
+        if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+            spawn_voiceprint_rebuild(&app2, cache2, "有排队请求,重跑");
+        }
+    });
+}
+
+/// 跑一轮重建。抽出来是为了让上面那层能在它结束之后、单飞标志复位之后决定要不要重跑。
+fn rebuild_once(
+    app2: &AppHandle,
+    cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
+    reason: &'static str,
+) {
+    {
+        // 一次快照定死"标签"与"权重路径",两者必须同源。
+        let tag = current_speaker_model(app2);
+        if tag.is_empty() {
+            return;
+        }
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+            Ok(mut e) => {
+                // 加载模型可能耗时;这中间用户完全可能又切了一次。此时这份嵌入器
+                // 已经不是当前选型,写库与入常驻槽都会把错的东西留下来。
+                if current_speaker_model(&app2) != tag {
+                    eprintln!("声纹库重建({reason})中途选型已变,放弃本次结果");
+                    return;
+                }
+                match data_root(&app2).map(store::VoiceprintStore::new) {
+                    Ok(vps) => match vps.rebuild_for_model(&tag, &mut e) {
+                        Ok(n) => eprintln!("声纹库已按 {tag} 重建({reason};{n} 人有样本可建)"),
+                        Err(err) => eprintln!("声纹库重建失败(种子注入将持续跳过): {err}"),
+                    },
+                    Err(err) => eprintln!("声纹库路径不可用,未重建: {err}"),
+                }
+                // 嵌入很慢(实测约半分钟),再核一次才敢占常驻槽:塞错模型的嵌入器
+                // 进去,下一场录制整场用错空间嵌入。
+                if current_speaker_model(&app2) == tag {
+                    // 标签就是这次重建用的 tag,与权重路径同源(见 rebuild_once 开头)。
+                    stash_model(&cache, Some(Box::new(diar::TaggedEmbedder::new(&tag, Box::new(e)))));
+                }
+            }
+            Err(err) => {
+                eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
+                telemetry::report_error(
+                    telemetry::ErrorKind::ModelLoad,
+                    // 断句是有讲究的:脱敏规则会整段丢弃连续 12 个以上中日韩字符,
+                    // "换模型后声纹模型加载失败" 正好 12 个,连写就会被脱成 <TEXT>。
+                    &format!("{reason}后,声纹模型加载失败,库未重建: {err}"),
+                );
+            }
+        }
+    }
+}
+
+/// 启动自愈:库标签与当前选型不一致就主动重建一次。
+///
+/// **为什么必须有这一步**:重建原先只挂在「设置里改动模型的那一瞬间」起的一次性
+/// 线程上。那次没跑成(应用当场被关、线程死了、或者用户直接改了 settings.json),
+/// 就再也没有第二次机会——门禁从此永久关闭:开录不注入种子、指认不回灌、
+/// identify 的声学证据全程为假,而每次启动只是如实记一行「重建完成后恢复」然后
+/// 什么也不做。实测一台机器这样连续降级了 149 次启动、一个多月(2026-08-19 定位)。
+///
+/// 录制中跳过:重建要现场加载嵌入器逐条嵌入样本,和录制抢 ORT 线程与 CPU;
+/// 这是自愈不是急救,等下次启动无妨。
+fn heal_voiceprint_model_mismatch(app: &AppHandle, state: &AppState) {
+    let Ok(root) = data_root(app) else { return };
+    let want = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d).speaker_model)
+        .unwrap_or_default();
+    if want.is_empty() {
+        return;
+    }
+    let have = store::VoiceprintStore::new(root).load().embedding_model.clone();
+    if have == want {
+        return;
+    }
+    if state.session.lock().map(|s| s.is_some()).unwrap_or(true) {
+        eprintln!("声纹库标签({have})与当前选型({want})不一致,录制中暂不重建,下次启动再试");
+        return;
+    }
+    eprintln!("声纹库标签({have})与当前选型({want})不一致,启动自愈:开始重建");
+    spawn_voiceprint_rebuild(app, state.embedder_cache.clone(), "启动自愈");
 }
 
 /// 回灌互斥门:同一时刻最多一个回灌任务在嵌入。不借用 AppState.embedder_cache
@@ -3614,24 +3860,50 @@ fn spawn_feedback(
     filter: feedback::SegFilter,
     prior: Option<(String, String)>,
     target: String,
+    // 提交前复核用的原始稿说话人 id(修订稿路径传 None)。
+    // **必须在真正写库之前再查一次**:关联与取消关联各起一个后台任务,
+    // FEEDBACK_GATE 只保证互斥、不保证顺序——撤销先跑就会拿到 NoEntry,
+    // 随后这个回灌照样落库,人物明明已经解除关联,增量却留在库里
+    // (codex review 二轮 P1#3)。
+    verify_speaker: Option<String>,
 ) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let run = || -> anyhow::Result<()> {
+        // 声明在 run 之外:纠错还原一旦清空了旧人物的质心,这件事就已经落盘了,
+        // 之后 run 无论返回 Ok 还是 Err 都必须补一次重建,否则那个人永远没有声纹
+        // (codex review 实现轮二 P1)。
+        let mut needs_rebuild = false;
+        let run = |needs_rebuild: &mut bool| -> anyhow::Result<()> {
             let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
             let now = chrono::Local::now().to_rfc3339();
             let action =
                 feedback::plan_action(prior.as_ref().map(|(i, n)| (i.as_str(), n.as_str())), &target);
+            // 门要先拿,复核要在门内做:门只保证互斥、不保证顺序,不在门内复核等于没核。
+            // **复核覆盖所有分支**——MergePrior 会把一整个人物并进目标,是比回灌更重的
+            // 库级写入,且明确不由取消关联撤销(codex review 二轮 P1#2)。
+            let _gate = FEEDBACK_GATE.lock().unwrap();
+            if let Some(sid) = &verify_speaker {
+                let still_linked = notes_dir(&app)
+                    .ok()
+                    .and_then(|d| store::NoteStore::new(d).load(&note_id).ok())
+                    .and_then(|n| n.speakers.get(sid).and_then(|m| m.person_id.clone()))
+                    .is_some_and(|pid| pid == target);
+                if !still_linked {
+                    eprintln!("feedback: note={note_id} {sid} 已不再关联 {target},跳过本次回灌/合并");
+                    return Ok(());
+                }
+            }
             match action {
                 feedback::FeedbackAction::Noop => Ok(()),
                 feedback::FeedbackAction::MergePrior { prior } => {
-                    let _gate = FEEDBACK_GATE.lock().unwrap();
-                    let receipt = vp.merge_journaled(&prior, &target, None, "feedback-assign", None, &now)?;
+                    // 不带嵌入器:并的是库里已有的质心,本来就同空间,传库当前标签。
+                    let lib_model = vp.load().embedding_model.clone();
+                    let receipt =
+                        vp.merge_journaled(&prior, &target, None, "feedback-assign", None, &now, &lib_model)?;
                     eprintln!("feedback: 无名先前人物 {prior} 已并入 {target}(回执 {receipt})");
                     Ok(())
                 }
                 feedback::FeedbackAction::Reinforce => {
-                    let _gate = FEEDBACK_GATE.lock().unwrap();
                     let note_dir = notes_dir(&app)?.join(&note_id);
                     let expected = app
                         .path()
@@ -3639,7 +3911,10 @@ fn spawn_feedback(
                         .map(|d| settings::load(&d).speaker_model)
                         .unwrap_or_default();
                     let library_model = vp.load().embedding_model.clone();
-                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app))?;
+                    // **标签与权重必须来自同一份快照**:用 speaker_model_path(&app) 会
+                    // 再读一次设置,切换发生在两次读取之间时,就会用 B 的权重算、以 A 的
+                    // 标签写库,而库若仍是 A,门禁会错误放行(codex review 实现轮 P1)。
+                    let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
                     let r = feedback::reinforce_person(
                         &note_dir,
                         &segs,
@@ -3651,13 +3926,21 @@ fn spawn_feedback(
                         &mut embedder,
                         &now,
                         None,
+                        needs_rebuild,
                     )?;
                     eprintln!("feedback: note={note_id} target={target} result={r:?}");
                     Ok(())
                 }
             }
         };
-        if let Err(e) = run() {
+        let outcome = run(&mut needs_rebuild);
+        // 先无条件处理重建,再看回灌结果——顺序不能反,run 出错时也要重建。
+        if needs_rebuild {
+            eprintln!("feedback: 纠错还原清空了旧人物质心,排一次重建 note={note_id}");
+            let state = app.state::<AppState>();
+            spawn_voiceprint_rebuild(&app, state.embedder_cache.clone(), "纠错还原清空质心");
+        }
+        if let Err(e) = outcome {
             eprintln!("feedback: 回灌失败(不影响指认) note={note_id}: {e}");
         }
     });
@@ -4248,6 +4531,8 @@ fn do_assign_refined_person(
                     feedback::SegFilter::Seqs(seqs),
                     prior,
                     resolved,
+                    // 修订稿没有"取消关联"入口,不存在反向竞态,无需复核。
+                    None,
                 ),
                 Err(e) => eprintln!("feedback: 读取笔记段失败,跳过回灌: {e}"),
             }
@@ -4545,7 +4830,9 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                         Err(e) => eprintln!("identify({id}): 音轨 {source} 解码失败,该轨无声学: {e}"),
                     }
                 }
-                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path(&app2))?;
+                // 权重取自决定 acoustic_enabled 的那份设置快照(s),不重读:重读的话
+                // 中途切模型会拿 B 的向量去比快照里 A 的质心(codex review 实现轮五 P1)。
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&s.speaker_model))?;
                 for (speaker, seqs) in &members {
                     let segs: Vec<&store::SegmentRecord> =
                         note.segments.iter().filter(|sg| seqs.contains(&sg.seq)).collect();
@@ -4715,9 +5002,12 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
             .map(|d| settings::load(&d).speaker_model)
             .unwrap_or_default();
         let library_model = vp.embedding_model.clone();
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
+        // 标签与权重同源(同 spawn_feedback 那处):不能再读一次设置,否则可能用 B 的
+        // 权重算、以 A 的标签写库(codex review 实现轮 P1)。
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
             Ok(mut embedder) => {
-                match feedback::reinforce_person(
+                let mut needs_rebuild = false;
+                let r = feedback::reinforce_person(
                     &dir,
                     &note.segments,
                     &feedback::SegFilter::Seqs(seqs.clone()),
@@ -4728,7 +5018,17 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
                     &mut embedder,
                     &now,
                     Some(&op_id),
-                ) {
+                    &mut needs_rebuild,
+                );
+                // 先无条件处理重建,再判回灌结果:纠错还原一旦清空了旧人物的质心就已经
+                // 落盘,回灌本身跳过或出错都不改变"必须重建"这件事
+                // (codex review 实现轮二 P1)。此处已出 vp_guard。
+                if needs_rebuild {
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
+                }
+                match r {
                     Ok(feedback::ReinforceResult::Applied { .. }) => None,
                     Ok(other) => Some(format!("{other:?}")),
                     Err(e) => Some(format!("回灌失败: {e}")),
@@ -4792,6 +5092,20 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
                                 &vp_store,
                             ) {
                                 Ok(feedback::UndoOutcome::Restored) => {}
+                                // 快照来自另一个模型空间:质心已置空,必须**当场**排重建。
+                                // 早先这里只记日志,理由写的是"下次启动自愈会兜住"——
+                                // 那是错的:restore_feedback 不改库标签,标签恒相等,
+                                // 自愈的判据永远不成立(codex review 实现轮 P1)。
+                                Ok(feedback::UndoOutcome::RestoredNeedsRebuild) => {
+                                    eprintln!("identify 恢复:回灌快照来自另一空间,质心已置空,排重建");
+                                    let st = app.state::<AppState>();
+                                    *st.embedder_cache.lock().unwrap() = None;
+                                    spawn_voiceprint_rebuild(
+                                        app,
+                                        st.embedder_cache.clone(),
+                                        "identify 恢复后质心置空",
+                                    );
+                                }
                                 Ok(feedback::UndoOutcome::NoEntry) => {
                                     op.non_revertible
                                         .get_or_insert("ledger-lost(账本缺失,污染未回滚)".into());
@@ -5111,6 +5425,14 @@ async fn undo_identify_apply(
             let _fb = FEEDBACK_GATE.lock().unwrap();
             match feedback::undo_reinforce_op(&dir, &seqs, &target, &op_id, &vp_store) {
                 Ok(feedback::UndoOutcome::Restored) => true,
+                Ok(feedback::UndoOutcome::RestoredNeedsRebuild) => {
+                    // 撤销成功,但质心因跨空间被置空 → 排一次重建把这个人从样本长回来。
+                    // 放在门内是安全的:spawn_voiceprint_rebuild 只是起线程,不取 vp_guard。
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "撤销回灌后质心置空");
+                    true
+                }
                 Ok(feedback::UndoOutcome::NoEntry) if !reinforced => true, // 未曾回灌=无污染
                 Ok(feedback::UndoOutcome::NoEntry) => {
                     // op 声称回灌过而账本无条:账丢了,污染无法回滚,如实报。
@@ -5637,6 +5959,31 @@ fn count_people_without_samples(app: AppHandle) -> Result<usize, String> {
     Ok(open_voiceprint_store(&app)?.count_people_without_samples())
 }
 
+/// 声纹库**实际**所处的模型空间。设置页那个分段控件显示的是**设置值**,而重建失败时
+/// 两者会长期不一致——界面显示 ERes2NetV2、库里其实还是 CAM++,声纹识别全程停用而
+/// 用户一无所知(2026-08-19 定位到一台机器这样过了一个多月)。有了这个查询,
+/// 设置页才能如实说出"库现在是什么"。
+#[tauri::command]
+fn voiceprint_library_model(app: AppHandle) -> Result<String, String> {
+    Ok(open_voiceprint_store(&app)?.load().embedding_model.clone())
+}
+
+/// 手动发起一次声纹库重建。启动自愈已经会自动做这件事,这个入口是给
+/// "自愈失败了想立刻重试"与"想知道现在到底在不在重建"的场景兜底。
+/// 录制中拒绝:重建要现场加载嵌入器逐条嵌入样本,和录制抢 ORT 线程与 CPU。
+#[tauri::command]
+fn rebuild_voiceprint_library(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if state.session.lock().map(|s| s.is_some()).unwrap_or(true) {
+        return Err(tr!(
+            "录制中不能重建声纹库,请先停止录制",
+            "Cannot rebuild the voiceprint library while recording"
+        ));
+    }
+    *state.embedder_cache.lock().unwrap() = None;
+    spawn_voiceprint_rebuild(&app, state.embedder_cache.clone(), "手动重建");
+    Ok(())
+}
+
 /// 整理·再辨认：未命名人物与库中其他人比对声纹质心，可归属者给出合并建议。
 /// 纯推荐不落任何修改——确认合并由前端走既有 merge_person（含录制中拒绝等守卫）。
 #[tauri::command]
@@ -5757,7 +6104,10 @@ fn do_merge_person(
     winner: &str,
     origin: &str,
     similarity: Option<f32>,
-    emb: &mut Option<diar::SherpaEmbedder>,
+    // **带标签的实例**:合并要写质心,标签必须与算这些质心的那份权重同源。此前是
+    // 加载时读一次设置、几秒后落库时再读一次当空间标签,期间切完模型的话,旧嵌入器
+    // 算出的向量会顶着新标签通过门禁,并据此永久删掉超额样本(codex review 实现轮四 P2)。
+    emb: &mut Option<diar::TaggedEmbedder>,
 ) -> Result<String, String> {
     let root = data_root(app).map_err(|e| e.to_string())?;
     let store = store::VoiceprintStore::new(root.clone());
@@ -5766,8 +6116,10 @@ fn do_merge_person(
         + store.sample_paths_existing(winner).len()
         > store::MAX_SAMPLES;
     if overflow && emb.is_none() {
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
-            Ok(e) => *emb = Some(e),
+        // 标签与权重出自同一次设置读取,之后一路带着走。
+        let tag = current_speaker_model(app);
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+            Ok(e) => *emb = Some(diar::TaggedEmbedder::new(tag, Box::new(e))),
             // 加载失败不缓存"已尝试":同批后续超限条目会重试加载——模型损坏是罕见态,重试成本可接受,不为它引入毒化标记。
             Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
         }
@@ -5778,6 +6130,14 @@ fn do_merge_person(
         return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
     let now = chrono::Local::now().to_rfc3339();
+    // 先取标签再借出嵌入器(借用检查:后者是可变借用)。
+    // 有嵌入器 → 标签取自它(要写新质心,必须同源)。没有嵌入器 → 这次不算任何向量,
+    // merge_journaled 的契约要求传**库当前标签**;传设置标签的话,换模型重建还没跑完
+    // 的窗口里,一次不超样本上限的普通合并会被门禁误拒(codex review 实现轮五 P2)。
+    let model_tag = emb
+        .as_ref()
+        .map(|e| e.model().to_string())
+        .unwrap_or_else(|| store.load().embedding_model.clone());
     let journal_id = store
         .merge_journaled(
             loser,
@@ -5786,6 +6146,9 @@ fn do_merge_person(
             origin,
             similarity,
             &now,
+            // 标签取自嵌入器自身。没有嵌入器时不写质心,标签取当前选型即可
+            // (merge_journaled 内部仍会与库比对)。
+            &model_tag,
         )
         .map_err(|e| e.to_string())?;
     if !loser_had_samples {
@@ -6012,9 +6375,17 @@ async fn undo_merge(app: AppHandle, state: State<'_, AppState>, journal_id: Stri
             return Err(tr!("录制中不能撤销合并", "Cannot undo a merge while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        store::VoiceprintStore::new(root.clone())
-            .undo_merge(&journal_id)
-            .map_err(|e| e.to_string())?;
+        let mut needs_rebuild = false;
+        let r = store::VoiceprintStore::new(root.clone()).undo_merge(&journal_id, &mut needs_rebuild);
+        // 质心因跨空间被置空 → 排一次重建。这里已在 vp_guard 之外(store 方法已返回)。
+        // **先无条件处理,再判 r**:清空已经落盘,撤销后半程(样本、删条目)失败也不能
+        // 让它跟着 Err 一起丢(codex review 实现轮三 P1)。
+        if needs_rebuild {
+            let st = app.state::<AppState>();
+            *st.embedder_cache.lock().unwrap() = None;
+            spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "撤销合并后质心置空");
+        }
+        r.map_err(|e| e.to_string())?;
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("撤销合并", "Merge undo"))
     })
@@ -6040,9 +6411,21 @@ async fn restore_merged_person(
             return Err(tr!("录制中不能拆回说话人", "Cannot split a speaker back out while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        let pid = store::VoiceprintStore::new(root.clone())
-            .restore_merged_person(&journal_id)
-            .map_err(|e| e.to_string())?;
+        let mut needs_rebuild = false;
+        let r = store::VoiceprintStore::new(root.clone())
+            .restore_merged_person(&journal_id, &mut needs_rebuild);
+        // 质心被清空了(快照来自另一个模型空间)→ 现在必须排一次重建,把这个人从
+        // 样本重新长出来。**放在这里而不是 store 里**:store 那边还持着 vp_guard,
+        // 重建自己也要取它。走 spawn_voiceprint_rebuild(空闲即启动、忙则排队),
+        // 不能直接置 REBUILD_PENDING——那不是队列,空闲时置位不会启动任何东西。
+        // **先无条件处理,再判 r**:同 undo_merge——清空已经落盘,后半程失败也不能
+        // 让重建需求跟着 Err 丢掉(codex review 实现轮三 P1)。
+        if needs_rebuild {
+            let st = app.state::<AppState>();
+            *st.embedder_cache.lock().unwrap() = None;
+            spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "拆回后质心置空");
+        }
+        let pid = r.map_err(|e| e.to_string())?;
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)
@@ -6259,7 +6642,7 @@ fn preload_models(
     app: AppHandle,
     session: Arc<Mutex<Option<ActiveSession>>>,
     cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
 ) {
     std::thread::spawn(move || {
         // 会话活跃则整体跳过：开录已 take() 空槽，此刻加载纯属双载（瞬时 2x 内存），
@@ -6296,8 +6679,12 @@ fn preload_models(
         }
         let mut eslot = embedder_cache.lock().unwrap();
         if eslot.is_none() {
-            match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
-                Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+            // 标签与权重路径必须出自**同一次**设置读取。分两次读的话,用户在两次之间
+            // 切了模型就会造出"A 权重、B 标签"的实例;它被 B 会话取走后,写侧门禁看
+            // 标签放行,A 空间的向量就进了 B 库(codex review 实现轮二 P1)。
+            let tag = current_speaker_model(&app);
+            match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+                Ok(e) => *eslot = Some(Box::new(diar::TaggedEmbedder::new(tag, Box::new(e)))),
                 Err(e) => {
                     eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}");
                     telemetry::report_error(
@@ -6718,6 +7105,7 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     let new_ui_lang = new_settings.ui_lang.clone();
     // 上报总开关(new_settings 即将 move,先取值)。
     let telemetry_on = new_settings.telemetry_enabled;
+    let new_speaker_model = new_settings.speaker_model.clone();
     // AI 从"未配置"变成"已配置"——设计文档漏斗 3 的关键一步,它预期流失率最高,
     // 是本期最想验证的假设。只在跨越那一次上报,之后每次保存设置都不再重复计数。
     let ai_newly_configured = active_refine_executor(&old)
@@ -6751,37 +7139,19 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     // app 已 clone 给 preload,此处直接用 &app。
     if speaker_changed {
         *state.embedder_cache.lock().unwrap() = None; // 旧模型常驻嵌入器作废
-        let app2 = app.clone();
-        let cache = state.embedder_cache.clone();
-        std::thread::spawn(move || {
-            let tag = app2
-                .path()
-                .app_data_dir()
-                .map(|d| settings::load(&d).speaker_model)
-                .unwrap_or_default();
-            match diar::SherpaEmbedder::new(&speaker_model_path(&app2)) {
-                Ok(mut e) => {
-                    match data_root(&app2).map(store::VoiceprintStore::new) {
-                        Ok(vps) => match vps.rebuild_for_model(&tag, &mut e) {
-                            Ok(n) => eprintln!("声纹库已按 {tag} 重建({n} 人有样本可建)"),
-                            Err(err) => eprintln!("声纹库重建失败(种子注入将持续跳过): {err}"),
-                        },
-                        Err(err) => eprintln!("声纹库路径不可用,未重建: {err}"),
-                    }
-                    // 新模型嵌入器顺手入常驻槽,下一场开录直接可用。
-                    stash_model(&cache, Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>));
-                }
-                Err(err) => {
-                    eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
-                    telemetry::report_error(
-                        telemetry::ErrorKind::ModelLoad,
-                        // 断句是有讲究的:脱敏规则会整段丢弃连续 12 个以上中日韩字符,
-                        // "换模型后声纹模型加载失败" 正好 12 个,连写就会被脱成 <TEXT>。
-                        &format!("换模型后,声纹模型加载失败,库未重建: {err}"),
-                    );
-                }
-            }
-        });
+        // 切回库本来所在的空间**不需要重建**:库里的向量就是这个模型算的,标签也已经
+        // 对上,重建纯属白跑半分钟,期间还把常驻槽空着(用户紧接着开会就整场没有说话人
+        // 区分)。设置页那句「切回 X 无需重建」正是这么承诺的,后端必须真的这么做
+        // (codex review 二轮 P2)。
+        let lib_model = data_root(&app)
+            .map(|r| store::VoiceprintStore::new(r).load().embedding_model.clone())
+            .unwrap_or_default();
+        if lib_model == new_speaker_model {
+            eprintln!("声纹库已在 {new_speaker_model} 空间,切回无需重建");
+            preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
+        } else {
+            spawn_voiceprint_rebuild(&app, state.embedder_cache.clone(), "换模型");
+        }
     }
     if tray_changed {
         tray::apply_enabled(&app);
@@ -7706,6 +8076,9 @@ pub fn run() {
                     );
                 }
             }
+            // 声纹库标签与当前选型不一致时主动重建一次。放在启动末尾:它要起线程加载
+            // 嵌入器,不该和前面那些"必须先就位"的初始化抢时间。
+            heal_voiceprint_model_mismatch(&handle, &st);
             telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })
@@ -7746,6 +8119,7 @@ pub fn run() {
             rename_refined_speaker,
             assign_refined_person,
             assign_note_speaker_person,
+            clear_note_speaker_person,
             person_notes,
             note_related,
             graph_entities,
@@ -7811,6 +8185,8 @@ pub fn run() {
             purge_audio,
             list_people,
             count_people_without_samples,
+            voiceprint_library_model,
+            rebuild_voiceprint_library,
             rename_person,
             merge_person,
             delete_person,

@@ -288,6 +288,27 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// 解除说话人与声纹库人物的关联:只清 person_id,表项与段落归属一概不动。
+    ///
+    /// 清完 person_id 之后 name 必然还是空串(assign_speaker_person 关联时就把本地名
+    /// 清了),于是显示回落到「新说话人 N」——这正是"取消关联"该有的样子。
+    /// **不复用 delete_speaker**:那个会连表项一起删、把名下段落全退回未标注,
+    /// 而用户要的只是断开与库人物的绑定,段落该归谁还归谁。
+    pub fn clear_speaker_person(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        if meta.person_id.is_none() {
+            return Ok(()); // 本就没关联,幂等返回
+        }
+        meta.person_id = None;
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 改段落文本。空文本拒绝（如需去段请用 delete_segment）。
     pub fn edit_segment_text(
         &self,
@@ -932,6 +953,43 @@ mod tests {
         assert_eq!(n.segments[2].speaker, None);
         assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人段落不动");
         assert!(store.delete_speaker(&id, "S99").is_err(), "未知说话人拒绝");
+    }
+
+    /// 取消关联:只断开与库人物的绑定,表项与段落归属都留着。
+    /// 与 delete_speaker 的分工是这条用例的重点——用户要的是"别再认成他",
+    /// 不是"把这个说话人连同他说过的话一起抹掉"。
+    #[test]
+    fn clear_speaker_person_only_unlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(
+            tmp.path(),
+            &[("甲", Some("S1")), ("乙", Some("S3"))],
+            &["S1", "S3"],
+        );
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.assign_speaker_person(&id, "S1", "P7").unwrap();
+        assert_eq!(
+            store.load(&id).unwrap().speakers["S1"].person_id.as_deref(),
+            Some("P7")
+        );
+
+        store.clear_speaker_person(&id, "S1").unwrap();
+        let n = store.load(&id).unwrap();
+        assert!(n.speakers.contains_key("S1"), "表项必须留着(不是删除说话人)");
+        assert_eq!(n.speakers["S1"].person_id, None, "关联必须断开");
+        assert_eq!(n.speakers["S1"].name, "", "本地名仍为空 → 显示回落到「新说话人 N」");
+        assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "段落归属一律不动");
+        assert_eq!(n.segments[1].speaker.as_deref(), Some("S3"), "他人不受影响");
+    }
+
+    #[test]
+    fn clear_speaker_person_is_idempotent_and_rejects_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("甲", Some("S1"))], &["S1"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        // 本就没关联:幂等成功,不报错(用户连点两次不该看见错误)
+        assert!(store.clear_speaker_person(&id, "S1").is_ok());
+        assert!(store.clear_speaker_person(&id, "S99").is_err(), "未知说话人拒绝");
     }
 
     #[test]

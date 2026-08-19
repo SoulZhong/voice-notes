@@ -18,6 +18,7 @@
     onPreview,
     previewingId,
     onDelete,
+    onUnlink,
   }: {
     speakers: Record<string, { name: string; sources: string[]; person_id?: string | null }>;
     noteId: string;
@@ -42,6 +43,9 @@
     /** 删除(可选,仅原始逐字稿视图传入)。表项移除,名下段落回到未标注;
         只动本笔记,不碰人物库。面板内二段确认。 */
     onDelete?: (id: string) => Promise<void>;
+    /** 取消关联(可选)。只断开与库人物的绑定,表项与段落归属都留着,
+        显示回落到「新说话人 N」。仅在该说话人确实关联了人物时才显示这一行。 */
+    onUnlink?: (id: string) => Promise<void>;
   } = $props();
 
   let editingId = $state<string | null>(null);
@@ -125,6 +129,13 @@
       return;
     }
     onRenamed?.();
+  }
+
+  /** 取消关联:与选人走同一条 run() 通道,失败必须看得见(那条 2026-08-17 事故的教训)。 */
+  async function commitUnlink(id: string) {
+    if (!onUnlink) return;
+    cancelEdit();
+    await run(() => onUnlink(id));
   }
 
   async function commitDelete(id: string) {
@@ -298,6 +309,14 @@
                   </svg>
                   {t("speakers.chipMe")}
                 </button>
+                {#if onUnlink && speakers[id]?.person_id}
+                  <button class="row" onclick={() => commitUnlink(id)}>
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                      <path d="M6.5 9.5 4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l1.7-1.7M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-1.7 1.7M6 10l4-4" />
+                    </svg>
+                    {t("speakers.chipUnlink")}
+                  </button>
+                {/if}
                 {#if onDelete}
                   {#if deletePending}
                     <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>

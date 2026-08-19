@@ -31,7 +31,7 @@
     type ModelDownloadEvent,
     type MigrateEvent,
   } from "$lib/models";
-  import { countPeopleWithoutSamples } from "$lib/people";
+  import { countPeopleWithoutSamples, rebuildVoiceprintLibrary, voiceprintLibraryModel } from "$lib/people";
   import { refineReady } from "$lib/refineReady";
   import EditableField from "$lib/EditableField.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
@@ -391,6 +391,7 @@
     calendarPermission().then((p) => (calPerm = p)).catch(() => {});
     refreshStatus();
     refreshDiskUsage();
+    void refreshLibModel();
     getVersion().then((v) => (appVersion = v)).catch(() => {});
     // 开机自启读系统真值(与 settings 无关);失败静默,保持未勾选。
     isEnabled()
@@ -402,6 +403,7 @@
     return () => {
       unD.then((f) => f());
       unM.then((f) => f());
+      stopRebuildPoll(); // 组件销毁后别再打 IPC
     };
   });
 
@@ -613,11 +615,57 @@
   // 换模型后质心被清空、重建前认不出,得让用户知情再动手。
   let pendingSpeakerModel = $state<string | null>(null);
   let speakerNoSampleCount = $state(0);
+  /** 声纹库**实际**所处的模型空间。分段控件显示的是设置值,重建失败时两者会长期
+      不一致——界面显示新模型、库里还是旧的,声纹识别全程停用而用户看不出来。 */
+  let libModel = $state("");
+  let rebuilding = $state(false);
+  let rebuildNote = $state("");
+  const modelLabel = (m: string) => (m === "eres2netv2" ? "ERes2NetV2" : m === "campplus" ? "CAM++" : m);
+  /** 库与选型不一致 = 声纹识别当前是停用的。libModel 空 = 还没查到,不做判断。 */
+  const speakerModelMismatch = $derived(
+    !!libModel && !!settings?.speaker_model && libModel !== settings.speaker_model,
+  );
+  async function refreshLibModel() {
+    libModel = await voiceprintLibraryModel().catch(() => "");
+  }
+  /** 重建轮询句柄:离开页面要停,否则组件销毁后还在打 IPC。 */
+  let rebuildPoll: ReturnType<typeof setInterval> | null = null;
+  function stopRebuildPoll() {
+    if (rebuildPoll) clearInterval(rebuildPoll);
+    rebuildPoll = null;
+  }
+  async function doRebuildVoiceprints() {
+    rebuilding = true;
+    rebuildNote = "";
+    error = "";
+    try {
+      await rebuildVoiceprintLibrary();
+      rebuildNote = t("settings.speaker.rebuildStarted");
+      // 后端只负责起线程,IPC 立刻就返回。不轮询的话,重建成功之后这页仍然
+      // 一直显示「不一致 / 识别停用」,还允许你反复点重建(codex review 三轮 P2)。
+      // 轮询到标签对上为止,最多约 2 分钟(实测重建约半分钟)。
+      stopRebuildPoll();
+      let left = 40;
+      rebuildPoll = setInterval(async () => {
+        await refreshLibModel();
+        if (!speakerModelMismatch || --left <= 0) {
+          stopRebuildPoll();
+          rebuilding = false;
+          if (!speakerModelMismatch) rebuildNote = "";
+        }
+      }, 3000);
+      return;
+    } catch (e) {
+      error = `${e}`;
+    }
+    rebuilding = false;
+  }
   function revertSpeakerChoice() {
     speakerChoice = settings?.speaker_model === "eres2netv2" ? "eres2netv2" : "campplus";
   }
   async function changeSpeakerModel(model: string) {
     if (settings?.speaker_model === model) return;
+    rebuildNote = "";
     error = "";
     try {
       speakerNoSampleCount = await countPeopleWithoutSamples();
@@ -637,6 +685,9 @@
       await setSettings(fresh);
       settings = fresh;
       speakerChoice = model;
+      // 切换会起后台重建,库标签要过一会儿才变;先刷一次让"库当前"如实反映此刻
+      // (仍是旧值),重建完成后用户再次进设置页会看到新值。
+      void refreshLibModel();
     } catch (e) {
       error = `${e}`;
       revertSpeakerChoice();
@@ -1167,6 +1218,11 @@
               ? t("settings.speaker.eres2Desc")
               : t("settings.speaker.campplusDesc")}
           </span>
+          <!-- 分段控件显示的是设置值;库到底在哪个空间必须单独说,否则不一致时
+               界面等于在撒谎(2026-08-19:一台机器这样过了一个多月都没人看出来)。 -->
+          {#if libModel}
+            <span class="row-desc">{t("settings.speaker.libModel", { m: modelLabel(libModel) })}</span>
+          {/if}
         </div>
         <Segmented
           items={speakerModelItems}
@@ -1177,10 +1233,34 @@
           }}
         />
       </div>
+      {#if speakerModelMismatch && !pendingSpeakerModel}
+        <!-- 库与选型不一致 = 声纹识别正停着。启动自愈会自动重建,这里给一个立刻重试的
+             入口,并且把"现在是坏的"这件事明说出来。 -->
+        <div class="purge-bar">
+          <span class="confirm-text">
+            {t("settings.speaker.libMismatch", {
+              have: modelLabel(libModel),
+              want: modelLabel(settings?.speaker_model ?? ""),
+            })}
+          </span>
+          <div class="purge-actions">
+            <button class="link" onclick={doRebuildVoiceprints} disabled={rebuilding || recording.isLive}>
+              {t("settings.speaker.rebuildNow")}
+            </button>
+          </div>
+        </div>
+      {/if}
+      {#if rebuildNote}
+        <div class="row-desc">{rebuildNote}</div>
+      {/if}
       {#if pendingSpeakerModel}
         <div class="purge-bar">
           <span class="confirm-text">
-            {t("settings.speaker.confirmText", { n: speakerNoSampleCount })}
+            <!-- 切回库本来所在的空间不需要重建,别拿"要重算声纹"吓人——两个方向
+                 用同一句话正是原来那条提示读不出信息的原因。 -->
+            {pendingSpeakerModel === libModel
+              ? t("settings.speaker.confirmBack", { m: modelLabel(libModel) })
+              : t("settings.speaker.confirmText", { n: speakerNoSampleCount })}
           </span>
           <div class="purge-actions">
             <button class="link danger" onclick={confirmSpeakerModelChange}>{t("settings.speaker.confirmSwitch")}</button>

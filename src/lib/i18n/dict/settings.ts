@@ -141,6 +141,11 @@ export const zh = {
       ? `切换后将用录音样本为每人重算声纹;库内 ${p.n} 人无样本,重建前无法自动认出(名字与历史笔记不受影响)。`
       : "切换后将用录音样本为每人重算声纹。",
   "settings.speaker.confirmSwitch": "确认切换",
+  "settings.speaker.libModel": "声纹库当前:{m}",
+  "settings.speaker.libMismatch": "声纹库还停在 {have},与所选 {want} 不一致——两种模型的声纹不可互比,因此声纹识别当前处于停用状态,直到重建完成。",
+  "settings.speaker.rebuildNow": "立即重建",
+  "settings.speaker.rebuildStarted": "已开始重建,约半分钟;完成后声纹识别自动恢复。",
+  "settings.speaker.confirmBack": "切回 {m} 无需重建:库本来就在这个空间,确认后声纹识别立即恢复。",
 
   // —— 会后 AI ——
   "settings.refine.label": "会后 AI",
@@ -341,6 +346,11 @@ export const en = {
       ? `Switching recalculates every person's voiceprint from recording samples; ${p.n} people in the library have no samples and cannot be auto-recognized until rebuilt (names and past notes are unaffected).`
       : "Switching recalculates every person's voiceprint from recording samples.",
   "settings.speaker.confirmSwitch": "Confirm switch",
+  "settings.speaker.libModel": "Library is on: {m}",
+  "settings.speaker.libMismatch": "The library is still on {have}, which does not match the selected {want}. Voiceprints from the two models are not comparable, so speaker recognition is currently disabled until a rebuild finishes.",
+  "settings.speaker.rebuildNow": "Rebuild now",
+  "settings.speaker.rebuildStarted": "Rebuild started (about half a minute). Speaker recognition resumes automatically when it finishes.",
+  "settings.speaker.confirmBack": "Switching back to {m} needs no rebuild: the library is already in that space, and recognition resumes as soon as you confirm.",
 
   "settings.refine.label": "Post-meeting AI",
   "settings.refine.desc":
