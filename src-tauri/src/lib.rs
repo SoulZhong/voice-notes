@@ -132,7 +132,7 @@ struct AppState {
     /// 预载线程持锁加载，使开录 take() 自然阻塞至就绪且永不双重加载。
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
     /// 常驻声纹嵌入器,策略与 recognizer_cache 完全一致(叶子锁、预载持锁)。
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     /// 录制中发生过声纹人名变更(Qwen3 热词已过期):停录归还识别器时消费,
     /// 丢弃归还件交预载重建。录制外的变更直接清槽,不经此标记
     /// (见 refresh_qwen_hotwords_cache)。
@@ -273,6 +273,12 @@ fn load_voiceprint_seeds(app: &AppHandle) -> Vec<crate::diar::registry::SeedClus
 // 逐语句等价):失败路径改发 Msg::AbortSession,由 runner 对槽内 writer 执行。
 
 /// 归还识别器/嵌入器进常驻槽（None = 没取到、asr 线程 panic 等，不回收）。
+/// 会话归还嵌入器时重新贴标签。标签取自**开录时那一份设置快照**——正是用来挑选
+/// 权重、也用来声明写库空间的那一份,三者同源。
+fn retag(model: &str, e: Option<Box<dyn diar::SpeakerEmbedder>>) -> Option<Box<diar::TaggedEmbedder>> {
+    e.map(|inner| Box::new(diar::TaggedEmbedder::new(model, inner)))
+}
+
 /// recognizer_cache 与 embedder_cache 策略完全一致，故共用一个泛型实现。
 fn stash_model<T: ?Sized>(cache: &Arc<Mutex<Option<Box<T>>>>, m: Option<Box<T>>) {
     if let Some(m) = m {
@@ -1159,7 +1165,7 @@ fn spawn_session(
     generation: Arc<Mutex<u64>>,
     session_slot: Arc<Mutex<Option<ActiveSession>>>,
     recognizer_cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     transcode: Arc<store::transcode::TranscodeQueue>,
     retranscribing: Arc<Mutex<Option<(String, String)>>>,
     mixed_regen: Arc<Mutex<Option<String>>>,
@@ -1293,7 +1299,20 @@ fn spawn_session(
         // 时不现场加载——预载失败即降级为无声纹（说话人区分不可用），而不是在
         // 开录路径上额外背一次模型加载的延迟/失败风险。云端模式同样取用/返还:
         // 声纹是本机能力,与识别在哪跑无关。
-        let embedder = embedder_cache.lock().unwrap().take();
+        // **取用即核对**:槽里那位可能是上一个选型建的(重建线程 stash 与设置变更
+        // 清缓存之间存在窗口)。不符就丢弃——宁可本场没有说话人区分,也不能用错空间
+        // 的嵌入器算出一整场向量,再以当前标签写进库。
+        let embedder = embedder_cache.lock().unwrap().take().and_then(|te| {
+            if te.model() == speaker_model {
+                Some(te.into_inner())
+            } else {
+                eprintln!(
+                    "常驻声纹嵌入器是 {} 建的,本场选型是 {speaker_model},丢弃不用",
+                    te.model()
+                );
+                None
+            }
+        });
         // 声纹模型是否就绪 → 决定前端是否显示「说话人区分不可用」降级横幅。
         let diarization = if embedder.is_some() { "on" } else { "unavailable" }.to_string();
 
@@ -1329,7 +1348,7 @@ fn spawn_session(
             Ok(s) => s,
             Err(e) => {
                 stash_model(&recognizer_cache, recognizer);
-                stash_model(&embedder_cache, embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, embedder));
                 return fail(&app, &running, &generation, my_gen, format!("error: {e}"));
             }
         };
@@ -1754,7 +1773,7 @@ fn spawn_session(
             Ok(w) => w,
             Err(e) => {
                 stash_model(&recognizer_cache, recognizer);
-                stash_model(&embedder_cache, embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, embedder));
                 let msg = match &target {
                     NoteTarget::New => {
                         format!("error: {}", tr!("创建笔记失败: {e}", "Failed to create note: {e}"))
@@ -2130,7 +2149,7 @@ fn spawn_session(
                         .collect();
                     let (r, e) = start.handle.stop(); // 先排干可能已产生的其它源 finals
                     stash_model(&recognizer_cache, r);
-                    stash_model(&embedder_cache, e);
+                    stash_model(&embedder_cache, retag(&speaker_model, e));
                     // 镜像正常停止路径(do_stop_teardown 里 `for j in s.audio_joins`
                     // 那段):分段 worker 已随 handle.stop() join → audio sink 已 drop →
                     // 写盘线程排干无界队列后自退,这里 join 等它们真正退出,确保文件
@@ -2171,7 +2190,7 @@ fn spawn_session(
                     drop(running_guard);
                     let (r, e) = start.handle.stop();
                     stash_model(&recognizer_cache, r);
-                    stash_model(&embedder_cache, e);
+                    stash_model(&embedder_cache, retag(&speaker_model, e));
                     // 镜像上方 Fix A 拆除路径与正常停止路径(do_stop_teardown 里
                     // `for j in s.audio_joins` 那段)的 join:分段 worker 已随
                     // handle.stop() join → audio sink 已 drop → 写盘线程排干无界队列后
@@ -2224,7 +2243,7 @@ fn spawn_session(
             }
             Err(se) => {
                 stash_model(&recognizer_cache, se.recognizer);
-                stash_model(&embedder_cache, se.embedder);
+                stash_model(&embedder_cache, retag(&speaker_model, se.embedder));
                 // 会话未能启动:经信箱 abort(此路径无 worker,不存在在途管线消息)。
                 // note_id 携带本会话身份(P2 对账加固):actor 侧核对与槽内是否一致。
                 lc.report(lifecycle::machine::Msg::AbortSession { note_id: note_id.clone() });
@@ -2448,7 +2467,7 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
     );
     let (returned, embedder) = s.handle.stop(); // 排干 finals：所有 append 消息在此全部入队
     stash_model(&state.recognizer_cache, returned);
-    stash_model(&state.embedder_cache, embedder);
+    stash_model(&state.embedder_cache, retag(&current_speaker_model(app), embedder));
     // 本场录制中发生过声纹改名:归还件的 Qwen3 热词已过期,丢弃,停录收尾的
     // preload 会按新名单重建(见 refresh_qwen_hotwords_cache 的脏标记分支)。
     if state.hotwords_dirty.swap(false, Ordering::Relaxed) {
@@ -3688,7 +3707,7 @@ fn current_speaker_model(app: &AppHandle) -> String {
 
 fn spawn_voiceprint_rebuild(
     app: &AppHandle,
-    cache: std::sync::Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
 ) {
     use std::sync::atomic::Ordering;
@@ -3727,7 +3746,7 @@ fn spawn_voiceprint_rebuild(
 /// 跑一轮重建。抽出来是为了让上面那层能在它结束之后、单飞标志复位之后决定要不要重跑。
 fn rebuild_once(
     app2: &AppHandle,
-    cache: std::sync::Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
 ) {
     {
@@ -3754,7 +3773,8 @@ fn rebuild_once(
                 // 嵌入很慢(实测约半分钟),再核一次才敢占常驻槽:塞错模型的嵌入器
                 // 进去,下一场录制整场用错空间嵌入。
                 if current_speaker_model(&app2) == tag {
-                    stash_model(&cache, Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>));
+                    // 标签就是这次重建用的 tag,与权重路径同源(见 rebuild_once 开头)。
+                    stash_model(&cache, Some(Box::new(diar::TaggedEmbedder::new(&tag, Box::new(e)))));
                 }
             }
             Err(err) => {
@@ -6537,7 +6557,7 @@ fn preload_models(
     app: AppHandle,
     session: Arc<Mutex<Option<ActiveSession>>>,
     cache: Arc<Mutex<Option<Box<dyn asr::Recognizer>>>>,
-    embedder_cache: Arc<Mutex<Option<Box<dyn diar::SpeakerEmbedder>>>>,
+    embedder_cache: Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
 ) {
     std::thread::spawn(move || {
         // 会话活跃则整体跳过：开录已 take() 空槽，此刻加载纯属双载（瞬时 2x 内存），
@@ -6575,7 +6595,14 @@ fn preload_models(
         let mut eslot = embedder_cache.lock().unwrap();
         if eslot.is_none() {
             match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
-                Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
+                // 预载出来的实例同样要贴标签:它建自 speaker_model_path(app),
+                // 标签取自同一次设置读取。
+                Ok(e) => {
+                    *eslot = Some(Box::new(diar::TaggedEmbedder::new(
+                        current_speaker_model(&app),
+                        Box::new(e),
+                    )))
+                }
                 Err(e) => {
                     eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}");
                     telemetry::report_error(
