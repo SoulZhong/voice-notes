@@ -3857,7 +3857,11 @@ fn spawn_feedback(
 ) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let run = || -> anyhow::Result<()> {
+        // 声明在 run 之外:纠错还原一旦清空了旧人物的质心,这件事就已经落盘了,
+        // 之后 run 无论返回 Ok 还是 Err 都必须补一次重建,否则那个人永远没有声纹
+        // (codex review 实现轮二 P1)。
+        let mut needs_rebuild = false;
+        let run = |needs_rebuild: &mut bool| -> anyhow::Result<()> {
             let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
             let now = chrono::Local::now().to_rfc3339();
             let action =
@@ -3910,13 +3914,21 @@ fn spawn_feedback(
                         &mut embedder,
                         &now,
                         None,
+                        needs_rebuild,
                     )?;
                     eprintln!("feedback: note={note_id} target={target} result={r:?}");
                     Ok(())
                 }
             }
         };
-        if let Err(e) = run() {
+        let outcome = run(&mut needs_rebuild);
+        // 先无条件处理重建,再看回灌结果——顺序不能反,run 出错时也要重建。
+        if needs_rebuild {
+            eprintln!("feedback: 纠错还原清空了旧人物质心,排一次重建 note={note_id}");
+            let state = app.state::<AppState>();
+            spawn_voiceprint_rebuild(&app, state.embedder_cache.clone(), "纠错还原清空质心");
+        }
+        if let Err(e) = outcome {
             eprintln!("feedback: 回灌失败(不影响指认) note={note_id}: {e}");
         }
     });
@@ -4980,7 +4992,8 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
         // 权重算、以 A 的标签写库(codex review 实现轮 P1)。
         match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
             Ok(mut embedder) => {
-                match feedback::reinforce_person(
+                let mut needs_rebuild = false;
+                let r = feedback::reinforce_person(
                     &dir,
                     &note.segments,
                     &feedback::SegFilter::Seqs(seqs.clone()),
@@ -4991,17 +5004,19 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
                     &mut embedder,
                     &now,
                     Some(&op_id),
-                ) {
-                    Ok(o) if matches!(o.result, feedback::ReinforceResult::Applied { .. }) => {
-                        // 纠错还原把旧人物质心清空了 → 排一次重建(此处已出 vp_guard)。
-                        if o.needs_rebuild {
-                            let st = app.state::<AppState>();
-                            *st.embedder_cache.lock().unwrap() = None;
-                            spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
-                        }
-                        None
-                    }
-                    Ok(other) => Some(format!("{:?}", other.result)),
+                    &mut needs_rebuild,
+                );
+                // 先无条件处理重建,再判回灌结果:纠错还原一旦清空了旧人物的质心就已经
+                // 落盘,回灌本身跳过或出错都不改变"必须重建"这件事
+                // (codex review 实现轮二 P1)。此处已出 vp_guard。
+                if needs_rebuild {
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
+                }
+                match r {
+                    Ok(feedback::ReinforceResult::Applied { .. }) => None,
+                    Ok(other) => Some(format!("{other:?}")),
                     Err(e) => Some(format!("回灌失败: {e}")),
                 }
             }
@@ -6631,15 +6646,12 @@ fn preload_models(
         }
         let mut eslot = embedder_cache.lock().unwrap();
         if eslot.is_none() {
-            match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
-                // 预载出来的实例同样要贴标签:它建自 speaker_model_path(app),
-                // 标签取自同一次设置读取。
-                Ok(e) => {
-                    *eslot = Some(Box::new(diar::TaggedEmbedder::new(
-                        current_speaker_model(&app),
-                        Box::new(e),
-                    )))
-                }
+            // 标签与权重路径必须出自**同一次**设置读取。分两次读的话,用户在两次之间
+            // 切了模型就会造出"A 权重、B 标签"的实例;它被 B 会话取走后,写侧门禁看
+            // 标签放行,A 空间的向量就进了 B 库(codex review 实现轮二 P1)。
+            let tag = current_speaker_model(&app);
+            match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+                Ok(e) => *eslot = Some(Box::new(diar::TaggedEmbedder::new(tag, Box::new(e)))),
                 Err(e) => {
                     eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}");
                     telemetry::report_error(

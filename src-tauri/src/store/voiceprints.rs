@@ -424,7 +424,8 @@ impl VoiceprintStore {
     /// 按日志条目撤销一次合并:恢复双方记录与 redirects、还原样本副本、pair 落盘
     /// 进自动合并拒绝名单(同样的自动判断不犯第二次,重启也不犯)、由本次被撤销
     /// 合并所失效的旧条目复活(LIFO 链式撤销)。条目已失效 → Err 带原因。
-    /// 库记录恢复为硬要求;样本文件 best-effort(与 merge 同哲学:库结构一致性优先)。
+    /// 库记录与**样本文件**都是硬要求:上面刚把双方现存样本全清了,样本恢复再失败
+    /// 就无从复原(样本恢复只补缺失、不覆盖既有,失败保留 journal 供重试)。
     /// 返回是否需要一次重建(质心因跨空间被置空)。调用方须**在释放锁之后**发起。
     pub fn undo_merge(&self, journal_id: &str) -> anyhow::Result<bool> {
         let _guard = vp_guard();
@@ -489,7 +490,7 @@ impl VoiceprintStore {
     /// 只写 WAV 不产生质心。
     pub fn restore_merged_person(&self, journal_id: &str) -> anyhow::Result<(String, bool)> {
         let _guard = vp_guard();
-        let mut needs_rebuild = false;
+        let needs_rebuild;
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         let entry = journal.entry(journal_id)?;
         if entry.invalid_reason.is_none() {

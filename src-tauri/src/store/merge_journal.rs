@@ -13,6 +13,42 @@ use super::voiceprints::Person;
 /// 上限只是防无界膨胀。
 pub const JOURNAL_CAP: usize = 50;
 
+/// 恢复用的临时文件计数器,保证同一目标的临时名不互撞。
+static RESTORE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把 `src` 拷到 `dst`,**目标已存在就跳过、绝不覆盖**。返回 true=本次拷了。
+///
+/// 做法:先写唯一临时文件,再 `hard_link` 到目标。`hard_link` 在目标已存在时原子
+/// 失败,所以不存在"先 exists 再 copy"的时间窗。失败路径一律清掉临时文件,目标位置
+/// 不会留下半个文件。
+///
+/// 为什么不能直接 `fs::copy`:拆回/撤销在样本恢复失败后会保留 journal 让用户重试,
+/// 而用户可能在重试前又录了新样本。`fs::copy` 会拿旧快照把这份新录音盖掉
+/// (codex review 实现轮二 P1)。
+fn copy_no_overwrite(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    let seq = RESTORE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dst.with_extension(format!("restore-{}-{seq}.tmp", std::process::id()));
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!("拷贝样本副本失败({} → 临时文件): {e}", src.display()));
+    }
+    let linked = match std::fs::hard_link(&tmp, dst) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    linked
+}
+
+/// `copy_no_overwrite` 的按目录版:目标名沿用源文件名。
+fn restore_one_sample(src: &Path, vp_samples_dir: &Path) -> anyhow::Result<bool> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("样本副本路径无文件名: {}", src.display()))?;
+    copy_no_overwrite(src, &vp_samples_dir.join(name))
+}
+
 /// 人工处置键名单上限:超出按追加序淘汰最旧。500 远超一轮整理量,只为防无界
 /// 膨胀——丢了顶多让用户重启后再处置一次。
 pub const DISMISSED_CAP: usize = 500;
@@ -296,9 +332,29 @@ impl MergeJournal {
     /// 无样本 → 空(回执卡隐藏该试听行)。失效条目(无论 by=Some/None)的副本
     /// 保留,直至条目被确认/撤销/淘汰随目录一并清理。
     pub fn sample_copies(&self, id: &str, side: &str) -> Vec<PathBuf> {
-        let Some(dir) = self.samples_dir(id, side) else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
-        let mut out: Vec<PathBuf> = rd.flatten().map(|f| f.path()).collect();
+        // 面向 UI 的宽松版:读不出来就当没有。恢复路径**不得**用它,见
+        // sample_copies_strict(codex review 实现轮二 P1)。
+        self.sample_copies_strict(id, side).unwrap_or_default()
+    }
+
+    /// 同 `sample_copies`,但**严格传播 I/O 错误**:目录不存在=该侧本就无样本(Ok 空),
+    /// 其余读取失败(权限、损坏、单个目录项出错)一律上抛。恢复路径必须用这个——
+    /// 宽松版把读失败当"无样本",上层会得到 `Ok(0)` 并删掉 journal,唯一的样本副本
+    /// 就永久没了(codex review 实现轮二 P1)。
+    fn sample_copies_strict(&self, id: &str, side: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let dir = self
+            .samples_dir(id, side)
+            .ok_or_else(|| anyhow::anyhow!("非法日志 id: {id}"))?;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(anyhow::anyhow!("读取样本副本目录失败({}): {e}", dir.display())),
+        };
+        let mut out: Vec<PathBuf> = Vec::new();
+        for f in rd {
+            let f = f.map_err(|e| anyhow::anyhow!("读取样本副本目录项失败({}): {e}", dir.display()))?;
+            out.push(f.path());
+        }
         // 槽位序而非字典序:<id>.wav=槽1,<id>-N.wav=槽N。字典序会把 '-' 排在 '.'
         // 前,槽1(最老)反而落到最后,前端"最后一份=最新"的取法就拿错。兜底截声
         // 文件 "<loser>-cut.wav" 的后缀非数字,排在所有数字槽之后(u32::MAX - 1,
@@ -310,7 +366,7 @@ impl MergeJournal {
             }
         };
         out.sort_by_key(slot);
-        out
+        Ok(out)
     }
 
     /// 被并入方(loser)合并前的样本快照副本路径,按槽位序。薄委托,保留旧名不破
@@ -349,16 +405,16 @@ impl MergeJournal {
         }
     }
 
-    /// 把条目的样本副本拷回声纹样本目录(撤销用),返回还原文件数。
+    /// 把条目的样本副本拷回声纹样本目录(撤销用),返回**本次实际拷回**的文件数
+    /// (目标已存在的跳过、不计数)。任何读写失败都上抛——调用方据此保留 journal。
     pub fn restore_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
         let mut n = 0usize;
         for side in ["loser", "winner"] {
-            let Some(dir) = self.samples_dir(id, side) else { continue };
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue }; // 该侧无样本,正常
-            for f in rd.flatten() {
-                std::fs::copy(f.path(), vp_samples_dir.join(f.file_name()))?;
-                n += 1;
+            for p in self.sample_copies_strict(id, side)? {
+                if restore_one_sample(&p, vp_samples_dir)? {
+                    n += 1;
+                }
             }
         }
         Ok(n)
@@ -369,21 +425,27 @@ impl MergeJournal {
     /// sample_slot_path 不识别 -cut 后缀,原名拷回等于拆回的人"无样本"。
     pub fn restore_loser_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
-        let copies = self.sample_copies(id, "loser");
+        let copies = self.sample_copies_strict(id, "loser")?;
         let is_cut = |p: &PathBuf| {
             p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-cut"))
         };
+        let regular: Vec<&PathBuf> = copies.iter().filter(|p| !is_cut(p)).collect();
         let mut n = 0usize;
-        for p in copies.iter().filter(|p| !is_cut(p)) {
-            std::fs::copy(p, vp_samples_dir.join(p.file_name().unwrap()))?;
-            n += 1;
+        for p in &regular {
+            if restore_one_sample(p, vp_samples_dir)? {
+                n += 1;
+            }
         }
-        if n == 0 {
+        // 兜底截声只在**根本没有常规槽位**时才用。判据是 regular 为空,不是 n==0——
+        // 重试时常规槽位可能已全部就位(拷回数 0),那不该再塞一份 -cut
+        // (codex review 实现轮二 P1)。
+        if regular.is_empty() {
             if let Some(cut) = copies.iter().find(|p| is_cut(p)) {
                 let stem = cut.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
                 let loser = stem.trim_end_matches("-cut");
-                std::fs::copy(cut, vp_samples_dir.join(format!("{loser}.wav")))?;
-                n = 1;
+                if copy_no_overwrite(cut, &vp_samples_dir.join(format!("{loser}.wav")))? {
+                    n = 1;
+                }
             }
         }
         Ok(n)
@@ -809,5 +871,76 @@ mod tests {
         assert_eq!(n, 1, "常规槽位存在时只拷常规槽");
         assert!(out.join("P1.wav").exists());
         assert!(!out.join("P1-cut.wav").exists(), "截声不该被拷回");
+    }
+
+    #[test]
+    fn restore_samples_never_overwrites_an_existing_sample() {
+        // 拆回/撤销在样本恢复失败后保留 journal 让用户重试,而用户可能在重试前又录了
+        // 新样本。恢复必须只补缺失:旧快照绝不能盖掉那份新录音
+        // (codex review 实现轮二 P1)。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "winner", "P2.wav");
+        let out = dir.path().join("vp");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("P1.wav"), b"RIFFbrand-new-recording").unwrap();
+
+        let n = j.restore_samples("m-P1", &out).unwrap();
+        assert_eq!(n, 1, "只该补缺失的 P2,P1 已存在应跳过且不计数");
+        assert_eq!(
+            std::fs::read(out.join("P1.wav")).unwrap(),
+            b"RIFFbrand-new-recording",
+            "既有样本必须原样保留"
+        );
+        assert!(out.join("P2.wav").exists());
+        // 不留临时文件。
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .filter(|f| f.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件必须清干净: {leftovers:?}");
+    }
+
+    #[test]
+    fn restore_loser_samples_is_idempotent_and_keeps_new_recording() {
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        let out = dir.path().join("vp");
+        assert_eq!(j.restore_loser_samples("m-P1", &out).unwrap(), 1);
+        std::fs::write(out.join("P1.wav"), b"RIFFbrand-new-recording").unwrap();
+        // 重试:常规槽位已就位 → 拷 0 份,且**不得**退回去塞兜底截声。
+        assert_eq!(j.restore_loser_samples("m-P1", &out).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("P1.wav")).unwrap(), b"RIFFbrand-new-recording");
+    }
+
+    #[test]
+    fn restore_loser_samples_still_falls_back_to_cut_on_retry_with_no_regular_slot() {
+        // 兜底截声的判据是"根本没有常规槽位",不是"这次拷了 0 份"——否则重试时
+        // 常规槽已就位(拷 0 份)会被误判成需要兜底。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P2", "loser", "P2-cut.wav");
+        let out = dir.path().join("vp");
+        assert_eq!(j.restore_loser_samples("m-P2", &out).unwrap(), 1);
+        assert!(out.join("P2.wav").exists());
+        // 再来一次:目标已在,跳过,不重复也不报错。
+        assert_eq!(j.restore_loser_samples("m-P2", &out).unwrap(), 0);
+    }
+
+    #[test]
+    fn restore_samples_propagates_read_errors_instead_of_reporting_zero() {
+        // 面向 UI 的 sample_copies 读不出来就当没有;恢复路径不能这样——上层会拿到
+        // Ok(0) 就删掉 journal,唯一的样本副本永久丢失(codex review 实现轮二 P1)。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        // 把 loser 侧目录换成一个普通文件:read_dir 报 NotADirectory,不是 NotFound。
+        let side = j.samples_dir("m-P1", "loser").unwrap();
+        std::fs::remove_dir_all(&side).unwrap();
+        std::fs::write(&side, b"not a directory").unwrap();
+        let out = dir.path().join("vp");
+        assert!(j.restore_samples("m-P1", &out).is_err(), "读取失败必须上抛,不能报 Ok(0)");
+        assert!(j.restore_loser_samples("m-P1", &out).is_err());
+        // 宽松版仍然容错(它服务于 UI 列表)。
+        assert!(j.sample_copies("m-P1", "loser").is_empty());
     }
 }
