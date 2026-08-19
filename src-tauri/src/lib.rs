@@ -5020,6 +5020,12 @@ fn recover_identify_ops(app: &AppHandle, note_id: &str) {
                                 &vp_store,
                             ) {
                                 Ok(feedback::UndoOutcome::Restored) => {}
+                                // 快照来自另一个模型空间:质心已置空,记一笔待重建。
+                                // 恢复路径不在这里发起重建(它跑在 identify 恢复里,
+                                // 不该顺手起后台重活);下次启动的自愈会按标签比对兜住。
+                                Ok(feedback::UndoOutcome::RestoredNeedsRebuild) => {
+                                    eprintln!("identify 恢复:回灌快照来自另一空间,质心已置空待重建");
+                                }
                                 Ok(feedback::UndoOutcome::NoEntry) => {
                                     op.non_revertible
                                         .get_or_insert("ledger-lost(账本缺失,污染未回滚)".into());
@@ -5339,6 +5345,14 @@ async fn undo_identify_apply(
             let _fb = FEEDBACK_GATE.lock().unwrap();
             match feedback::undo_reinforce_op(&dir, &seqs, &target, &op_id, &vp_store) {
                 Ok(feedback::UndoOutcome::Restored) => true,
+                Ok(feedback::UndoOutcome::RestoredNeedsRebuild) => {
+                    // 撤销成功,但质心因跨空间被置空 → 排一次重建把这个人从样本长回来。
+                    // 放在门内是安全的:spawn_voiceprint_rebuild 只是起线程,不取 vp_guard。
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "撤销回灌后质心置空");
+                    true
+                }
                 Ok(feedback::UndoOutcome::NoEntry) if !reinforced => true, // 未曾回灌=无污染
                 Ok(feedback::UndoOutcome::NoEntry) => {
                     // op 声称回灌过而账本无条:账丢了,污染无法回滚,如实报。
@@ -6295,9 +6309,18 @@ async fn restore_merged_person(
             return Err(tr!("录制中不能拆回说话人", "Cannot split a speaker back out while recording"));
         }
         let root = data_root(&app).map_err(|e| e.to_string())?;
-        let pid = store::VoiceprintStore::new(root.clone())
+        let (pid, needs_rebuild) = store::VoiceprintStore::new(root.clone())
             .restore_merged_person(&journal_id)
             .map_err(|e| e.to_string())?;
+        // 质心被清空了(快照来自另一个模型空间)→ 现在必须排一次重建,把这个人从
+        // 样本重新长出来。**放在这里而不是 store 里**:store 那边还持着 vp_guard,
+        // 重建自己也要取它。走 spawn_voiceprint_rebuild(空闲即启动、忙则排队),
+        // 不能直接置 REBUILD_PENDING——那不是队列,空闲时置位不会启动任何东西。
+        if needs_rebuild {
+            let st = app.state::<AppState>();
+            *st.embedder_cache.lock().unwrap() = None;
+            spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "拆回后质心置空");
+        }
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆回说话人", "Speaker split-back"))?;
         Ok(pid)

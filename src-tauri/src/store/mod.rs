@@ -26,6 +26,7 @@ pub use refined::{save_refined_paragraphs, ParagraphPayload}; // 笔记页 WYSIW
 pub use refined::{
     load_refined, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
 };
+pub use voiceprints::RestoreOutcome; // 快照回放结局(feedback 消费,含"质心已置空待重建")。
 pub use voiceprints::confident_picks; // 自动归并筛选(apply_confident_merges 命令消费)。
 pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
 pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。

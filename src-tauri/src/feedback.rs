@@ -143,6 +143,9 @@ pub enum ReinforceResult {
 #[derive(Debug, PartialEq)]
 pub enum UndoOutcome {
     Restored,
+    /// 还原了,但快照来自另一个模型空间 → 质心已置空,**调用方须发起一次重建**,
+    /// 否则这个人永远没有声纹(库标签已是当前模型,启动自愈不会再动它)。
+    RestoredNeedsRebuild,
     NotRevertible(&'static str),
     NoEntry,
 }
@@ -168,6 +171,7 @@ fn undo_entry(
     op_id: &str,
     vp: &crate::store::VoiceprintStore,
 ) -> anyhow::Result<UndoOutcome> {
+    let mut needs_rebuild = false;
     let mut ledger = load_ledger(note_dir);
     // 不限作用域找:op_id 自己就是身份,找到之后还要比对它,不存在跨作用域错撤的风险;
     // 而调用方并不知道当初是用哪种过滤器记的账(实测既有 Speakers 也有 Seqs)。
@@ -191,15 +195,18 @@ fn undo_entry(
     if entry_person.is_none() || entry_person != expect {
         return Ok(UndoOutcome::NotRevertible("person-mismatch"));
     }
-    let restored = vp.restore_feedback(&entry.person_id, &entry.before, &entry.after)?;
-    if !restored {
-        return Ok(UndoOutcome::NotRevertible("touched-since"));
+    match vp.restore_feedback(&entry.person_id, &entry.before, &entry.after, &entry.embedding_model)? {
+        crate::store::RestoreOutcome::Skipped => {
+            return Ok(UndoOutcome::NotRevertible("touched-since"));
+        }
+        crate::store::RestoreOutcome::RestoredNeedsRebuild => needs_rebuild = true,
+        crate::store::RestoreOutcome::Restored => {}
     }
     ledger.entries.remove(&key);
     if let Err(e) = save_ledger(note_dir, &ledger) {
         eprintln!("feedback: 撤销后账本清理失败(无害): {e}");
     }
-    Ok(UndoOutcome::Restored)
+    Ok(if needs_rebuild { UndoOutcome::RestoredNeedsRebuild } else { UndoOutcome::Restored })
 }
 
 /// 指认后的回灌分派决策(纯函数,可单测;IPC 挂钩壳只做 IO)。
@@ -270,6 +277,10 @@ struct LedgerEntry {
     /// 不能只凭 scope 判断"这是我那次写的"。人工路径为 None(serde 兼容 P1 数据)。
     #[serde(default)]
     op_id: Option<String>,
+    /// `before`/`after` 这两份快照里的质心属于哪个模型空间(提交成功那一刻库的标签)。
+    /// 旧条目没有这一栏(空串)= 来源不明,回放时按"只还身份、质心置空"处理。
+    #[serde(default)]
+    embedding_model: String,
 }
 
 /// 段集合指纹:sha256(升序 seq 的 LE 字节) 前 8 字节 hex。P1 回灌账本与
@@ -379,9 +390,17 @@ pub fn reinforce_person(
             return Ok(ReinforceResult::SkippedAlreadyDone);
         }
         // 纠错:上一次灌错了人。未被动过就还原;动过则宁留污染不覆盖新信息。
-        match vp.restore_feedback(&prev.person_id, &prev.before, &prev.after) {
-            Ok(true) => eprintln!("feedback: 已还原 {} 的上次回灌(纠错)", prev.person_id),
-            Ok(false) => eprintln!("feedback: {} 已被其它写动过,跳过还原", prev.person_id),
+        match vp.restore_feedback(&prev.person_id, &prev.before, &prev.after, &prev.embedding_model) {
+            Ok(crate::store::RestoreOutcome::Restored) => {
+                eprintln!("feedback: 已还原 {} 的上次回灌(纠错)", prev.person_id)
+            }
+            Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => eprintln!(
+                "feedback: 已还原 {} 的上次回灌,但快照来自另一空间,质心已置空待重建",
+                prev.person_id
+            ),
+            Ok(crate::store::RestoreOutcome::Skipped) => {
+                eprintln!("feedback: {} 已被其它写动过,跳过还原", prev.person_id)
+            }
             Err(e) => eprintln!("feedback: 还原失败(忽略): {e}"),
         }
         // **删掉刚才真正命中的那个键**,不是新算的 key。命中的可能是旧的裸指纹键
@@ -423,6 +442,8 @@ pub fn reinforce_person(
             after: String::new(),
             complete: false,
             op_id: op_id.map(str::to_string),
+            // 先按占位写空;下面提交成功之后回填成"真正落进去的那个空间"。
+            embedding_model: String::new(),
         },
     );
     save_ledger(note_dir, &ledger)?;
@@ -440,11 +461,15 @@ pub fn reinforce_person(
         entry.before = applied.person_before.clone();
         entry.after = applied.person_after.clone();
         entry.complete = true;
+        // 标签取自**通过门禁并成功提交**的那次写入(expected_model 就是刚才比对通过
+        // 的那个),不是开工前读到的值。
+        entry.embedding_model = expected_model.to_string();
     }
     if let Err(e) = save_ledger(note_dir, &ledger) {
         // 快照回填失败:立即回滚质心,把窗口闭合成"什么都没发生"。
         eprintln!("feedback: 账本回填失败,回滚本次回灌: {e}");
-        let _ = vp.restore_feedback(person_id, &applied.person_before, &applied.person_after);
+        // 回滚刚写进去的那一份:它就是当前空间写的,标签同 expected_model。
+        let _ = vp.restore_feedback(person_id, &applied.person_before, &applied.person_after, expected_model);
         let mut cleanup = load_ledger(note_dir);
         cleanup.entries.remove(&key);
         let _ = save_ledger(note_dir, &cleanup);

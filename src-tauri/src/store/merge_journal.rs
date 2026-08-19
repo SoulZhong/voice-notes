@@ -49,6 +49,16 @@ pub struct MergeJournalEntry {
     /// 时本条复活——链式撤销 LIFO 可行的关键。
     #[serde(default)]
     pub invalidated_by: Option<String>,
+    /// 快照里那两份 `Person` 的质心属于哪个模型空间(落盘时库的 `embedding_model`)。
+    ///
+    /// **没有它,快照回放就是一个绕过所有门禁的后门**:换模型重建之后,
+    /// `rebuild_for_model` 会把全部条目标记失效,而「拆回人物」**恰恰只接受失效条目**
+    /// ——于是任何一条老日志都能把旧空间的质心原样插回新库,库标签还是新的
+    /// (2026-08-19 codex review 设计轮 P1)。
+    ///
+    /// 旧条目没有这一栏(空串)= 来源不明,回放时按"只还身份、质心置空"处理。
+    #[serde(default)]
+    pub embedding_model: String,
 }
 
 /// root 为 app_data_dir(与 VoiceprintStore 同根),日志落 root/merge_journal/。
@@ -473,6 +483,7 @@ mod tests {
             acknowledged: false,
             invalid_reason: None,
             invalidated_by: None,
+            embedding_model: "campplus".into(),
         }
     }
 

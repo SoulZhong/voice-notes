@@ -109,6 +109,24 @@ impl Default for Voiceprints {
 /// 没必要互相阻塞。毒化忽略(into_inner):每次落盘各自原子,持锁线程 panic 不留半写状态。
 static VP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 快照回放的净化:快照里的质心属于 `snapshot_model` 空间,库现在是 `lib_model`。
+/// 不符(或快照来源不明,即空串)就**只还身份、把两张质心表都清空**,返回 true 表示
+/// "这个人现在没有声纹了,需要一次重建把他从样本重新长出来"。
+///
+/// **两张表都要清**:种子注入与自动归并同时消费 `centroids` 与 `session_centroids`,
+/// 只清主质心仍会把旧空间的会话质心注入新模型。
+///
+/// 选"清空"而不是"拒绝回放":人被拆回来了、名字在、样本文件也还原了,只是暂时没有
+/// 声纹——下次重建就从样本重新长出来。拒绝回放会让用户彻底拿不回这个人。
+fn sanitize_replayed(person: &mut Person, snapshot_model: &str, lib_model: &str) -> bool {
+    if !snapshot_model.is_empty() && snapshot_model == lib_model {
+        return false;
+    }
+    person.centroids.clear();
+    person.session_centroids.clear();
+    true
+}
+
 /// 向量空间门禁:这组向量是用哪个模型算的?与库当前 `embedding_model` 不符一律丢弃。
 ///
 /// **为什么必须在写入这一侧判,而不是靠调用方自觉**:2026-08-19 定位到的一类问题是
@@ -384,6 +402,9 @@ impl VoiceprintStore {
             acknowledged: origin == "manual",
             invalid_reason: None,
             invalidated_by: None,
+            // 取自**落盘这一刻库的标签**,而不是调用方传进来的 model:快照记录的是
+            // "被存下来的这两份质心属于哪个空间",那就是库当时的空间。
+            embedding_model: vp.embedding_model.clone(),
         };
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         journal.append(&entry, &self.sample_paths_existing(loser), &self.sample_paths_existing(winner))?;
@@ -412,8 +433,20 @@ impl VoiceprintStore {
             anyhow::bail!("不能撤销:{reason}");
         }
         let mut vp = self.load();
-        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
-        vp.people.insert(entry.winner.clone(), entry.winner_person.clone());
+        // 快照里的质心可能来自另一个模型空间(换模型重建之后撤销一次旧合并)。
+        let mut loser_person = entry.loser_person.clone();
+        let mut winner_person = entry.winner_person.clone();
+        let mut needs_rebuild = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);
+        needs_rebuild |= sanitize_replayed(&mut winner_person, &entry.embedding_model, &vp.embedding_model);
+        if needs_rebuild {
+            eprintln!(
+                "撤销合并:快照来自 {} 空间(库现在是 {}),只还身份、质心置空,待重建",
+                if entry.embedding_model.is_empty() { "未知" } else { &entry.embedding_model },
+                vp.embedding_model
+            );
+        }
+        vp.people.insert(entry.loser.clone(), loser_person);
+        vp.people.insert(entry.winner.clone(), winner_person);
         vp.redirects.remove(&entry.loser);
         for k in &entry.redirects_to_loser {
             // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
@@ -445,8 +478,13 @@ impl VoiceprintStore {
     /// 删除。与 undo_merge 的区别:不动 winner(那次合并未被撤销,质心里已混入的
     /// 贡献不抽回,后续录制自然纠正),也不 revive 链上条目(它们的前置状态未还原,
     /// 复活会造成"可撤销"假象)。仅失效条目可拆;有效条目走 undo_merge。
-    pub fn restore_merged_person(&self, journal_id: &str) -> anyhow::Result<String> {
+    /// 返回 `(拆回的人物 id, 是否需要一次重建)`。needs_rebuild=true 表示质心被清空了
+    /// (快照来自另一个模型空间),调用方**在释放锁之后**要发起一次重建,否则这个人
+    /// 永远没有声纹——库标签已是当前模型,启动自愈不会再动它,而 append_sample
+    /// 只写 WAV 不产生质心。
+    pub fn restore_merged_person(&self, journal_id: &str) -> anyhow::Result<(String, bool)> {
         let _guard = vp_guard();
+        let mut needs_rebuild = false;
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         let entry = journal.entry(journal_id)?;
         if entry.invalid_reason.is_none() {
@@ -464,7 +502,17 @@ impl VoiceprintStore {
             // 失败则重试幂等」的承诺保持一致。
             eprintln!("拆回说话人:{} 已在库中,视为上次拆回的重试(仅补做收尾)", entry.loser);
         } else {
-            vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+            let mut loser_person = entry.loser_person.clone();
+            let cleared = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);
+            if cleared {
+                eprintln!(
+                    "拆回说话人:快照来自 {} 空间(库现在是 {}),只还身份、质心置空,待重建",
+                    if entry.embedding_model.is_empty() { "未知" } else { &entry.embedding_model },
+                    vp.embedding_model
+                );
+            }
+            needs_rebuild = cleared;
+            vp.people.insert(entry.loser.clone(), loser_person);
             vp.redirects.remove(&entry.loser);
             for k in &entry.redirects_to_loser {
                 // 快照回放不得遮蔽现存 person:k 若已重建为独立说话人(拆回),redirect 插回
@@ -473,8 +521,13 @@ impl VoiceprintStore {
                 vp.redirects.insert(k.clone(), entry.loser.clone());
             }
             self.save(&vp)?;
+            // **样本恢复是硬条件,不是 best-effort**:质心已经被清空(或本来就要靠样本
+            // 重建),样本是此后唯一能把这个人的声纹长回来的依据。失败就**保留 journal**
+            // ——留着条目,用户可以重试拆回;删了就永久失去恢复依据
+            // (codex review 设计轮二 P1)。
             if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
-                eprintln!("拆回说话人:样本副本还原失败(不影响库): {e}");
+                eprintln!("拆回说话人:样本还原失败,保留日志条目以便重试: {e}");
+                return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
             }
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
@@ -486,7 +539,7 @@ impl VoiceprintStore {
             }
         }
         journal.remove(journal_id)?;
-        Ok(entry.loser.clone())
+        Ok((entry.loser.clone(), needs_rebuild))
     }
 
     /// 确认合并回执(删条目及样本副本)。异步化后命令不再天然串行,journal 目录
@@ -887,21 +940,40 @@ impl VoiceprintStore {
         person_id: &str,
         before: &str,
         expected_after: &str,
-    ) -> anyhow::Result<bool> {
+        snapshot_model: &str,
+    ) -> anyhow::Result<RestoreOutcome> {
         let _guard = vp_guard();
         let mut vp = self.load();
+        let lib_model = vp.embedding_model.clone();
         let Some(resolved) = Self::resolve(&vp, person_id).map(str::to_string) else {
-            return Ok(false); // 人都没了,无从还原也无需还原
+            return Ok(RestoreOutcome::Skipped); // 人都没了,无从还原也无需还原
         };
         let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
+        // **顺序是硬性的:先 CAS,再按空间决定还原什么。**
+        // 倒过来做(先看空间、不符就直接改)会绕过 CAS,把后来发生的改名、邮箱等
+        // 修改一起覆盖掉(codex review 设计轮二 P2)。
         if serde_json::to_string(person)? != expected_after {
-            return Ok(false);
+            return Ok(RestoreOutcome::Skipped);
         }
-        *person = serde_json::from_str(before)?;
+        let mut restored: Person = serde_json::from_str(before)?;
+        let cleared = sanitize_replayed(&mut restored, snapshot_model, &lib_model);
+        *person = restored;
         self.save(&vp)?;
         self.journal_invalidate(&[resolved.as_str()], "纠错回灌已撤销");
-        Ok(true)
+        Ok(if cleared { RestoreOutcome::RestoredNeedsRebuild } else { RestoreOutcome::Restored })
     }
+}
+
+/// 回放一份历史快照的结局。
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RestoreOutcome {
+    /// 还原成功,快照与库同空间,质心照原样还回去了。
+    Restored,
+    /// 还原成功,但快照来自另一个模型空间 → 质心已置空,**调用方须在释放锁之后
+    /// 发起一次重建**,否则这个人永远没有声纹。
+    RestoredNeedsRebuild,
+    /// 没还原:人已不在库里,或 CAS 不符(库被后续写动过)。
+    Skipped,
 }
 
 /// reinforce_feedback 的前后快照:磁盘壳把它写进笔记级账本,纠错时
@@ -1290,6 +1362,75 @@ mod tests {
     const MODEL: &str = "campplus";
     /// 另一个模型空间的标签。门禁用例专用。
     const OTHER_MODEL: &str = "eres2netv2";
+
+    /// 2026-08-19 设计轮 P1:换模型重建会把**全部**合并日志标记失效,而「拆回人物」
+    /// **恰恰只接受失效条目**——于是重建之后任何一条老日志都能把旧空间的质心原样
+    /// 插回新库,库标签还是新的。这条用例钉住:身份回来、声纹不回来。
+    #[test]
+    fn 跨空间拆回只还身份不还声纹() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store
+            .upsert_from_session(&snaps, "2026-08-19T00:00:00+08:00", MODEL)
+            .unwrap();
+        let loser = links.get("S1").unwrap().clone();
+        let winner = links.get("S2").unwrap().clone();
+        store.rename(&loser, "张三").unwrap();
+        let jid = store
+            .merge_journaled(&loser, &winner, None, "manual", None, "2026-08-19T00:01:00+08:00", MODEL)
+            .unwrap();
+
+        // 换模型重建:库标签变成另一个空间,并把全部日志标记失效
+        let mut emb = FlipEmbedder;
+        let _ = store.rebuild_for_model(OTHER_MODEL, &mut emb);
+        assert_eq!(store.load().embedding_model, OTHER_MODEL);
+
+        let (restored_id, needs_rebuild) = store.restore_merged_person(&jid).unwrap();
+        assert_eq!(restored_id, loser);
+        assert!(needs_rebuild, "跨空间回放必须报「需要重建」");
+
+        let vp = store.load();
+        let p = vp.people.get(&loser).expect("身份必须回来");
+        assert_eq!(p.name, "张三", "名字属于身份,必须还原");
+        assert!(p.centroids.is_empty(), "旧空间的主质心必须清空");
+        assert!(p.session_centroids.is_empty(), "会话质心同样要清——种子注入也消费它");
+        assert!(
+            seed_clusters(&vp).iter().all(|c| c.person != loser),
+            "质心清空之后不得再为此人产出种子"
+        );
+    }
+
+    /// 同空间回放照常整份还原,不能被上一条误伤。
+    #[test]
+    fn 同空间拆回照常还原声纹() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![
+            snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+            snap("S2", vec![0.0, 1.0], 5, &["mic"], None, AUTO_ENROLL_MS),
+        ];
+        let links = store
+            .upsert_from_session(&snaps, "2026-08-19T00:00:00+08:00", MODEL)
+            .unwrap();
+        let loser = links.get("S1").unwrap().clone();
+        let winner = links.get("S2").unwrap().clone();
+        let jid = store
+            .merge_journaled(&loser, &winner, None, "manual", None, "2026-08-19T00:01:00+08:00", MODEL)
+            .unwrap();
+        // 不重建,直接让条目失效(模拟"又被并了一次")
+        store.merge_journaled(&winner, &winner, None, "manual", None, "t", MODEL).ok();
+        let j = super::super::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        j.invalidate(&[&loser], "测试置失效", None);
+
+        let (_id, needs_rebuild) = store.restore_merged_person(&jid).unwrap();
+        assert!(!needs_rebuild, "同空间不该报需要重建");
+        let vp = store.load();
+        assert!(!vp.people[&loser].centroids.is_empty(), "同空间的质心必须原样还回来");
+    }
 
     /// 2026-08-19:切模型重建成功之后,一个更早启动、用旧模型算完的写入落盘,
     /// 库标签是新的、内容是混的,而启动自愈只比标签不比内容,永远发现不了。
@@ -2634,7 +2775,8 @@ mod tests {
 
         let pid = store.restore_merged_person(&journal_id).unwrap();
 
-        assert_eq!(pid, "P1");
+        assert_eq!(pid.0, "P1");
+        assert!(!pid.1, "同空间快照不需要重建");
         let vp = store.load();
         assert!(vp.people.contains_key("P1"), "loser 按快照重建");
         assert_eq!(vp.people.get("P2").cloned(), winner_before, "winner 不动");
@@ -2675,7 +2817,7 @@ mod tests {
 
         let pid = store.restore_merged_person(&journal_id).unwrap();
 
-        assert_eq!(pid, "P1", "重试仍应返回 loser 编号");
+        assert_eq!(pid.0, "P1", "重试仍应返回 loser 编号");
         let vp = store.load();
         assert_eq!(
             vp.people.get("P1"),
@@ -2785,7 +2927,12 @@ mod tests {
             .unwrap().expect("同模型,门禁应放行");
 
         // 场景一:未被动过 → 还原成功,total_ms 回到初值。
-        assert!(store.restore_feedback(&pid, &applied.person_before, &applied.person_after).unwrap());
+        assert_eq!(
+            store
+                .restore_feedback(&pid, &applied.person_before, &applied.person_after, MODEL)
+                .unwrap(),
+            RestoreOutcome::Restored
+        );
         assert_eq!(store.load().people.get(&pid).unwrap().total_ms, AUTO_ENROLL_MS);
 
         // 场景二:重放回灌后又被别的写动过 → 拒绝还原。
@@ -2795,7 +2942,12 @@ mod tests {
         store
             .reinforce_feedback(&pid, &[("mic".into(), vec![0.0, 0.0, 1.0, 0.0], 1, 2_000)], "t3", MODEL)
             .unwrap();
-        assert!(!store.restore_feedback(&pid, &applied2.person_before, &applied2.person_after).unwrap());
+        assert_eq!(
+            store
+                .restore_feedback(&pid, &applied2.person_before, &applied2.person_after, MODEL)
+                .unwrap(),
+            RestoreOutcome::Skipped
+        );
     }
     #[test]
     fn create_person_and_delete_if_empty() {
