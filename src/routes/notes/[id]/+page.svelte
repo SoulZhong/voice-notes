@@ -35,6 +35,7 @@
     editSegment,
     deleteSegment,
     setSegmentSpeaker,
+    clearNoteSpeakerPerson,
     noteAudioInfo,
     renameRefinedSpeaker,
     assignRefinedPerson,
@@ -245,6 +246,11 @@
   /** 本笔记正在录制（含暂停）时禁用一切编辑入口（后端另有 guard 兜底）。 */
   const canEdit = $derived(!(recording.isLive && recording.noteId === id));
   const speakerIds = $derived(note ? Object.keys(note.speakers).sort(speakerIdCompare) : []);
+  /** 改派菜单打开的那一段当前是谁。按 seq 回查 note.segments(权威值),
+      不信浮层里带的快照——同 segBadge 的道理。 */
+  const segMenuSpeaker = $derived(
+    segMenuPop ? (note?.segments.find((s) => s.seq === segMenuPop!.seq)?.speaker ?? null) : null,
+  );
 
   /** 修订稿是否可展示：无 Aing 结果、或笔记尚未 complete（例如中断续录中）一律强制原始稿。 */
   const refinedAvailable = $derived(!!refined && note?.meta.state === "complete");
@@ -1846,6 +1852,7 @@
           people={canEdit ? people : undefined}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
+          onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -2042,8 +2049,17 @@
         style="position: fixed; left: {segMenuPop.rect.left}px; top: {segMenuPop.rect.bottom + 4}px;"
       >
         {#each speakerIds as sid (sid)}
-          <button class="menu-item" onclick={() => doSetSpeaker(segMenuPop!.seq, sid)}>
+          <!-- 当前说话人标出来并禁点:点"已经是这一位"什么都不会发生,而没有任何提示的
+               无反馈正是 2026-08-19 那条「换说话人无效」的一半——用户以为功能坏了,
+               实际上是他点了个空操作。 -->
+          <button
+            class="menu-item"
+            class:current={sid === segMenuSpeaker}
+            disabled={sid === segMenuSpeaker}
+            onclick={() => doSetSpeaker(segMenuPop!.seq, sid)}
+          >
             {speakerLabel(sid, "mic", note.speakers)}
+            {#if sid === segMenuSpeaker}<span class="menu-note">{t("notes.menu.current")}</span>{/if}
           </button>
         {/each}
         <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>{t("notes.menu.newSpeaker")}</button>
@@ -2770,6 +2786,16 @@
   /* 破坏性菜单项(段删除确认)与 .link.danger 同一色钩:红字提示不可撤销。 */
   .menu-item.danger {
     color: var(--danger);
+  }
+  /* 当前说话人:退成次要色 + 不可点(它是状态展示,不是可选动作),光标不给手型。 */
+  .menu-item.current {
+    color: var(--ink-secondary);
+    cursor: default;
+  }
+  .menu-note {
+    color: var(--ink-faint);
+    font-size: 0.9em;
+    margin-left: 0.25em;
   }
   /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
      （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。

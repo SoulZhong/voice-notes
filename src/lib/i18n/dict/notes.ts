@@ -93,6 +93,7 @@ export const zh = {
 
   // 详情页:浮层菜单/相关笔记
   "notes.menu.newSpeaker": "＋ 新说话人",
+  "notes.menu.current": "(当前)",
   "notes.menu.confirmDelete": "确认删除",
   "notes.cancel": "取消",
   "notes.close": "关闭",
@@ -222,6 +223,7 @@ export const en = {
   "notes.detail.drainFailed": "Failed to flush refined edits before leaving: {e}",
 
   "notes.menu.newSpeaker": "+ New speaker",
+  "notes.menu.current": "(current)",
   "notes.menu.confirmDelete": "Confirm delete",
   "notes.cancel": "Cancel",
   "notes.close": "Close",
