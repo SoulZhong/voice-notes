@@ -405,6 +405,8 @@ impl VoiceprintStore {
             // 取自**落盘这一刻库的标签**,而不是调用方传进来的 model:快照记录的是
             // "被存下来的这两份质心属于哪个空间",那就是库当时的空间。
             embedding_model: vp.embedding_model.clone(),
+            undo_phase: String::new(),
+            undo_cleared_centroids: false,
         };
         let journal = super::merge_journal::MergeJournal::new(self.root.clone());
         journal.append(&entry, &self.sample_paths_existing(loser), &self.sample_paths_existing(winner))?;
@@ -439,32 +441,28 @@ impl VoiceprintStore {
             anyhow::bail!("不能撤销:{reason}");
         }
         let mut vp = self.load();
-        // 合并会把 loser 从 people 移走、换成一条 redirect,所以撤销之前他一定不在
-        // people 里。他在 = 上一次撤销已经把库还原了、卡在后面某步(样本或删条目),
-        // 这次是重试。重试**绝不能**再走一遍"清空双方现存样本":两次尝试之间用户
-        // 可能又录了新样本,清掉它再拿旧快照占位,新录音就没了
-        // (codex review 实现轮三 P1)。
-        let is_retry = vp.people.contains_key(&entry.loser);
+        use super::merge_journal::undo_phase;
+        // 上次撤销做到哪一步了,**读盘上的记录,不靠推断**。"loser 在不在 people 里"
+        // 只能证明库已还原,证明不了样本清理做到哪:删了一半就失败的话,跳过清理会让
+        // 剩下的合并后样本占住槽位,快照那份被 copy_no_overwrite 静默跳过
+        // (codex review 实现轮四 P1)。
+        let phase = entry.undo_phase.as_str();
+        // 上一次若已因跨空间清空过质心,这次仍欠一次重建——哪怕中途的重建已经从
+        // 部分样本长出了非空质心(codex review 实现轮四 P2)。
+        *needs_rebuild |= entry.undo_cleared_centroids;
         // 快照里的质心可能来自另一个模型空间(换模型重建之后撤销一次旧合并)。
         let mut loser_person = entry.loser_person.clone();
         let mut winner_person = entry.winner_person.clone();
         let mut cleared = sanitize_replayed(&mut loser_person, &entry.embedding_model, &vp.embedding_model);
         cleared |= sanitize_replayed(&mut winner_person, &entry.embedding_model, &vp.embedding_model);
-        if cleared {
-            eprintln!(
-                "撤销合并:快照来自 {} 空间(库现在是 {}),只还身份、质心置空,待重建",
-                if entry.embedding_model.is_empty() { "未知" } else { &entry.embedding_model },
-                vp.embedding_model
-            );
-        }
-        if is_retry {
-            eprintln!("撤销合并:{} 已在库中,视为上次撤销的重试(只补样本、不再清库)", entry.loser);
-            // 上次撤销时若因跨空间清空过质心,库里现在就是空的;这次仍要报"需重建"。
-            *needs_rebuild |= vp
-                .people
-                .get(&entry.loser)
-                .is_some_and(|p| p.centroids.is_empty() && p.session_centroids.is_empty());
-        } else {
+        if phase.is_empty() {
+            if cleared {
+                eprintln!(
+                    "撤销合并:快照来自 {} 空间(库现在是 {}),只还身份、质心置空,待重建",
+                    if entry.embedding_model.is_empty() { "未知" } else { &entry.embedding_model },
+                    vp.embedding_model
+                );
+            }
             vp.people.insert(entry.loser.clone(), loser_person);
             vp.people.insert(entry.winner.clone(), winner_person);
             vp.redirects.remove(&entry.loser);
@@ -477,6 +475,9 @@ impl VoiceprintStore {
             self.save(&vp)?;
             // 置位放在 save **之后**:save 失败则质心还没被清空,不必重建。
             *needs_rebuild |= cleared;
+            journal.set_undo_phase(journal_id, undo_phase::LIBRARY_RESTORED, cleared)?;
+        }
+        if phase != undo_phase::SAMPLES_CLEARED {
             // 样本还原:双方现存文件清掉(含合并时迁移/兜底截取的),快照副本拷回。
             // **清理失败也是硬条件**:恢复用的 copy_no_overwrite 遇到已存在的目标会原子
             // 跳过(那是给"只补缺失"的重试语义),所以这里没清干净的话,留在库里的就是
@@ -491,13 +492,21 @@ impl VoiceprintStore {
                     }
                 }
             }
+            // 清理确实做完了才记这一步。没记上就重做——重做会删掉两次尝试之间用户
+            // 新录的东西,但那好过留一个"清了一半"的中间态永远判不出来。
+            journal.set_undo_phase(journal_id, undo_phase::SAMPLES_CLEARED, cleared)?;
         }
         // **样本恢复是硬条件**(与 restore_merged_person 同):上面刚把双方现存样本
         // 全清了,而质心可能因跨空间被置空——此刻样本是唯一的恢复依据。失败就保留
         // journal 不删,留着让用户重试;删了就永久销毁依据(codex review 实现轮 P1)。
-        if let Err(e) = journal.restore_samples(journal_id, &self.root.join("voiceprints")) {
-            eprintln!("撤销合并:样本还原失败,保留日志条目以便重试: {e}");
-            return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
+        match journal.restore_samples(journal_id, &self.root.join("voiceprints")) {
+            // 这次补进去了新样本 → 之前那次重建(如果跑过)没看见它们,再排一次。
+            Ok(n) if n > 0 && entry.undo_cleared_centroids => *needs_rebuild = true,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("撤销合并:样本还原失败,保留日志条目以便重试: {e}");
+                return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
+            }
         }
         journal.deny_auto(&format!("{}>{}", entry.loser, entry.winner));
         // remove 失败则 revive 不执行:重试撤销幂等,链上条目只是暂失撤销入口。
@@ -528,25 +537,30 @@ impl VoiceprintStore {
             anyhow::bail!("该条仍可直接撤销,不需要拆回");
         }
         let mut vp = self.load();
-        if vp.people.contains_key(&entry.loser) {
-            // id 单调分配、不复用,现实中不会真撞库——走到这里只有一种解释:
-            // 上一次拆回已经把 loser 写回库(含 redirect/样本回填),但在
-            // journal.remove 前被打断(I/O 偶发失败),条目还留着导致这是次
-            // 重试。此时若仍 bail("已存在"),拆回就永久卡死、无法重试;
-            // 而重建/redirect/样本回填都已经做过,不能再做一遍(会用快照
-            // 覆盖掉重建后可能已发生的新变化)。所以这一分支只补做收尾
-            // (deny_auto + remove),不碰 vp / 样本——与 undo_merge 「remove
-            // 失败则重试幂等」的承诺保持一致。
-            eprintln!("拆回说话人:{} 已在库中,视为上次拆回的重试", entry.loser);
-            // **重试必须继续补样本**:上一次正是卡在样本这一步才留下条目。跳过它、
-            // 直接删条目 = 永久销毁恢复依据,而质心可能已被置空(codex review 实现轮 P1)。
+        use super::merge_journal::undo_phase;
+        // 阶段读盘,不靠"loser 在不在 people 里"推断(同 undo_merge,实现轮四 P1)。
+        // 拆回不清样本,所以只有"库已还原"一个阶段。
+        // 上一次若已因跨空间清空过质心,这次仍欠一次重建——即使中途的重建已经从**部分**
+        // 样本长出了非空质心,补齐样本之后还得再算一次(codex review 实现轮四 P2)。
+        *needs_rebuild |= entry.undo_cleared_centroids;
+        let restored_already =
+            entry.undo_phase == undo_phase::LIBRARY_RESTORED || vp.people.contains_key(&entry.loser);
+        if restored_already {
+            // 上一次拆回已经把 loser 写回库(含 redirect),但在收尾前被打断,条目还留着。
+            // 库不能再写一遍(会用快照覆盖掉此后可能发生的新变化),但**样本必须继续补**:
+            // 上一次正是卡在那里,跳过它、直接删条目 = 永久销毁恢复依据。
             // restore_loser_samples 只补缺失、不覆盖既有,重试幂等。
-            if let Err(e) = journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
-                eprintln!("拆回说话人(重试):样本还原仍失败,继续保留日志条目: {e}");
-                return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
+            eprintln!("拆回说话人:{} 已还原过,视为上次拆回的重试(只补样本)", entry.loser);
+            match journal.restore_loser_samples(journal_id, &self.root.join("voiceprints")) {
+                Err(e) => {
+                    eprintln!("拆回说话人(重试):样本还原仍失败,继续保留日志条目: {e}");
+                    return Err(anyhow::anyhow!("样本还原失败,已保留可重试的日志条目: {e}"));
+                }
+                // 这次补进去了新样本 → 之前那次重建(如果跑过)没看见它们,再排一次。
+                Ok(n) if n > 0 => *needs_rebuild = true,
+                Ok(_) => {}
             }
-            // 库里那位可能是上次拆回时按旧空间快照写回去的:质心若为空,说明当时被
-            // 净化过(或本就无质心),这次仍要报"需要重建",否则他永远长不回来。
+            // 兜底:库里那位质心为空(上次被净化过或本就无质心)同样欠一次重建。
             *needs_rebuild |= vp
                 .people
                 .get(&entry.loser)
@@ -572,6 +586,7 @@ impl VoiceprintStore {
             self.save(&vp)?;
             // 置位放在 save **之后**:save 失败则质心还没被清空,不必重建。
             *needs_rebuild |= cleared;
+            journal.set_undo_phase(journal_id, undo_phase::LIBRARY_RESTORED, cleared)?;
             // **样本恢复是硬条件,不是 best-effort**:质心已经被清空(或本来就要靠样本
             // 重建),样本是此后唯一能把这个人的声纹长回来的依据。失败就**保留 journal**
             // ——留着条目,用户可以重试拆回;删了就永久失去恢复依据
@@ -2860,18 +2875,21 @@ mod tests {
 
     #[test]
     fn undo_merge_retry_keeps_samples_recorded_between_attempts() {
-        // 上一次撤销已把库还原、但卡在后半程(样本或删条目),条目还留着。重试**不能**
-        // 再走一遍"清空双方现存样本":两次尝试之间用户又录了新样本,清掉它再拿旧快照
-        // 占位,新录音就永久没了(codex review 实现轮三 P1)。
+        // 上一次撤销已把库还原、样本也清完了(阶段落盘 samples_cleared),但卡在拷回或
+        // 删条目。重试**不能**再清一遍:两次尝试之间用户又录了新样本,清掉它再拿旧快照
+        // 占位,新录音就永久没了(codex review 实现轮三 P1 / 实现轮四 P1)。
         let (store, jid, tmp) = setup_valid_merge();
         let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
         let entry = journal.entry(&jid).unwrap();
-        // 手动把库还原成"上次撤销已完成前半程"的样子。
+        // 手动把库还原成"上次撤销已完成前半程"的样子,并把阶段记到盘上。
         let mut vp = store.load();
         vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
         vp.people.insert(entry.winner.clone(), entry.winner_person.clone());
         vp.redirects.remove(&entry.loser);
         store.save(&vp).unwrap();
+        journal
+            .set_undo_phase(&jid, crate::store::merge_journal::undo_phase::SAMPLES_CLEARED, false)
+            .unwrap();
         // 两次尝试之间新录了一段。
         let vpdir = tmp.path().join("voiceprints");
         std::fs::create_dir_all(&vpdir).unwrap();
@@ -2886,6 +2904,59 @@ mod tests {
             "重试不得删掉两次尝试之间新录的样本"
         );
         assert!(journal.entry(&jid).is_err(), "重试应收尾成功、清掉条目");
+    }
+
+    #[test]
+    fn undo_merge_redoes_sample_cleanup_when_that_phase_never_completed() {
+        // 反面:上次只做到"库已还原"就失败了,样本清理**没**记上。这时必须重做清理——
+        // 留一个"清了一半"的中间态才是真正判不出来的那种坏。代价是这个窗口里新录的
+        // 东西会被删掉,这是刻意取舍:撤销的正确性优先。
+        let (store, jid, tmp) = setup_valid_merge();
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        let entry = journal.entry(&jid).unwrap();
+        let mut vp = store.load();
+        vp.people.insert(entry.loser.clone(), entry.loser_person.clone());
+        vp.people.insert(entry.winner.clone(), entry.winner_person.clone());
+        vp.redirects.remove(&entry.loser);
+        store.save(&vp).unwrap();
+        journal
+            .set_undo_phase(&jid, crate::store::merge_journal::undo_phase::LIBRARY_RESTORED, false)
+            .unwrap();
+        let vpdir = tmp.path().join("voiceprints");
+        std::fs::create_dir_all(&vpdir).unwrap();
+        let stale = vpdir.join(format!("{}.wav", entry.loser));
+        std::fs::write(&stale, b"RIFFpost-merge-leftover").unwrap();
+
+        store.undo_merge(&jid, &mut false).unwrap();
+
+        assert_ne!(
+            std::fs::read(&stale).unwrap_or_default(),
+            b"RIFFpost-merge-leftover",
+            "清理阶段没记上就必须重做,合并后的残留不能占住槽位"
+        );
+        assert!(journal.entry(&jid).is_err());
+    }
+
+    #[test]
+    fn in_progress_undo_survives_a_library_rebuild_invalidation() {
+        // 跨空间撤销失败后调用方会立刻排一次重建,而重建结尾 invalidate_all 会把所有条目
+        // 标失效——被失效的话重试就被 invalid_reason 挡死,那次本该双边还原的撤销永远
+        // 做不完(codex review 实现轮四 P1)。进行中的撤销必须豁免。
+        let (store, jid, tmp) = setup_valid_merge();
+        let journal = crate::store::merge_journal::MergeJournal::new(tmp.path().to_path_buf());
+        journal
+            .set_undo_phase(&jid, crate::store::merge_journal::undo_phase::LIBRARY_RESTORED, true)
+            .unwrap();
+
+        journal.invalidate_all("声纹库已按新模型重建");
+
+        let e = journal.entry(&jid).unwrap();
+        assert!(e.invalid_reason.is_none(), "进行中的撤销不得被重建失效");
+        assert!(e.undo_cleared_centroids, "跨空间清空过质心的事实要落盘");
+        // 而且重试确实还能走 undo_merge(不被 invalid_reason 挡)。
+        let mut nr = false;
+        store.undo_merge(&jid, &mut nr).unwrap();
+        assert!(nr, "落盘的 undo_cleared_centroids 应让重试仍报需要重建");
     }
 
     #[test]

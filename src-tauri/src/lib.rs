@@ -6090,7 +6090,10 @@ fn do_merge_person(
     winner: &str,
     origin: &str,
     similarity: Option<f32>,
-    emb: &mut Option<diar::SherpaEmbedder>,
+    // **带标签的实例**:合并要写质心,标签必须与算这些质心的那份权重同源。此前是
+    // 加载时读一次设置、几秒后落库时再读一次当空间标签,期间切完模型的话,旧嵌入器
+    // 算出的向量会顶着新标签通过门禁,并据此永久删掉超额样本(codex review 实现轮四 P2)。
+    emb: &mut Option<diar::TaggedEmbedder>,
 ) -> Result<String, String> {
     let root = data_root(app).map_err(|e| e.to_string())?;
     let store = store::VoiceprintStore::new(root.clone());
@@ -6099,8 +6102,10 @@ fn do_merge_person(
         + store.sample_paths_existing(winner).len()
         > store::MAX_SAMPLES;
     if overflow && emb.is_none() {
-        match diar::SherpaEmbedder::new(&speaker_model_path(app)) {
-            Ok(e) => *emb = Some(e),
+        // 标签与权重出自同一次设置读取,之后一路带着走。
+        let tag = current_speaker_model(app);
+        match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
+            Ok(e) => *emb = Some(diar::TaggedEmbedder::new(tag, Box::new(e))),
             // 加载失败不缓存"已尝试":同批后续超限条目会重试加载——模型损坏是罕见态,重试成本可接受,不为它引入毒化标记。
             Err(e) => eprintln!("合并样本挑选:声纹模型不可用,退回按序保留: {e}"),
         }
@@ -6111,6 +6116,11 @@ fn do_merge_person(
         return Err(tr!("录制中不能合并说话人", "Cannot merge speakers while recording"));
     }
     let now = chrono::Local::now().to_rfc3339();
+    // 先取标签再借出嵌入器(借用检查:后者是可变借用)。
+    let model_tag = emb
+        .as_ref()
+        .map(|e| e.model().to_string())
+        .unwrap_or_else(|| current_speaker_model(app));
     let journal_id = store
         .merge_journaled(
             loser,
@@ -6119,8 +6129,9 @@ fn do_merge_person(
             origin,
             similarity,
             &now,
-            // emb 是按当前选型现场建的,标签取自同一次判定,不另读一次设置。
-            &current_speaker_model(app),
+            // 标签取自嵌入器自身。没有嵌入器时不写质心,标签取当前选型即可
+            // (merge_journaled 内部仍会与库比对)。
+            &model_tag,
         )
         .map_err(|e| e.to_string())?;
     if !loser_had_samples {

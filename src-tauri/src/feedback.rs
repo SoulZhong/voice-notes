@@ -438,6 +438,12 @@ pub fn reinforce_person(
         // superseded——关联解除了,增量却留在库里(codex review 三轮 P1#4)。
         ledger.entries.remove(&probe);
         ledger.entries.remove(&key);
+        // **立刻落盘**:旧人物的增量已经撤掉了,但账本删除到这里还只在内存里。后面任何
+        // 一条短路返回(没有有效段、期间切了模型)都会带着这份未落盘的删除直接返回,磁盘
+        // 仍然声称旧人物回灌过——之后再改回旧人物就会命中 SkippedAlreadyDone,而它的
+        // 增量其实早被撤了(codex review 实现轮四 P2)。
+        save_ledger(note_dir, &ledger)
+            .map_err(|e| anyhow::anyhow!("纠错已还原旧人物,但账本删除未能落盘: {e}"))?;
     }
 
     let meta = crate::store::audio::load_audio_meta(note_dir);
@@ -502,23 +508,39 @@ pub fn reinforce_person(
         // 快照回填失败:立即回滚质心,把窗口闭合成"什么都没发生"。
         eprintln!("feedback: 账本回填失败,回滚本次回灌: {e}");
         // 回滚刚写进去的那一份:它就是当前空间写的,标签同 expected_model。
-        // 三种结局都要如实处理,不能一律 `let _ =` 当成"已回滚"(codex review 实现轮三 P2):
-        // 回滚期间库可能刚被换空间重建过,那样质心会被清空 → 同样欠一次重建。
-        match vp.restore_feedback(person_id, &applied.person_before, &applied.person_after, expected_model) {
-            Ok(crate::store::RestoreOutcome::Restored) => {}
+        // 三种结局都要如实处理,不能一律 `let _ =` 当成"已回滚"(codex review 实现轮三 P2)。
+        let rolled_back = match vp.restore_feedback(
+            person_id,
+            &applied.person_before,
+            &applied.person_after,
+            expected_model,
+        ) {
+            Ok(crate::store::RestoreOutcome::Restored) => true,
             Ok(crate::store::RestoreOutcome::RestoredNeedsRebuild) => {
+                // 回滚期间库刚被换空间重建过,质心已被清空 → 同样欠一次重建。
                 eprintln!("feedback: 回滚时发现库已换空间,{person_id} 质心已置空,需重建");
                 *needs_rebuild = true;
+                true
             }
             Ok(crate::store::RestoreOutcome::Skipped) => {
-                eprintln!("feedback: {person_id} 已被其它写动过,本次回灌**未**回滚,库里留有增量")
+                eprintln!("feedback: {person_id} 已被其它写动过,本次回灌**未**回滚,库里留有增量");
+                false
             }
-            Err(e2) => eprintln!("feedback: 回滚失败,库里留有本次增量: {e2}"),
+            Err(e2) => {
+                eprintln!("feedback: 回滚失败,库里留有本次增量: {e2}");
+                false
+            }
+        };
+        // **只有真回滚了才清占位账**。没回滚的话增量还在库里:清掉占位等于允许下次
+        // 重试再灌一遍同一段(重复加权),而第一次那份已经没有恢复凭据了。留着占位反倒
+        // 是对的——它把这个 scope 挡住,不会重复计数(codex review 实现轮四 P2)。
+        if rolled_back {
+            let mut cleanup = load_ledger(note_dir);
+            cleanup.entries.remove(&key);
+            let _ = save_ledger(note_dir, &cleanup);
+            anyhow::bail!("账本回填失败,已回滚: {e}");
         }
-        let mut cleanup = load_ledger(note_dir);
-        cleanup.entries.remove(&key);
-        let _ = save_ledger(note_dir, &cleanup);
-        anyhow::bail!("账本回填失败,已回滚: {e}");
+        anyhow::bail!("账本回填失败**且未能回滚**,库中留有本次增量(该 scope 已被占位账挡住,不会重复回灌): {e}");
     }
     Ok(ReinforceResult::Applied {
         per_source: stats.iter().map(|(s, st)| (s.clone(), st.count)).collect(),

@@ -62,35 +62,79 @@ fn copy_no_overwrite(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     let linked = match std::fs::hard_link(&tmp, dst) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        // link(2) 不是哪儿都支持:用户的笔记根目录可能落在 iCloud Drive 或网络卷上。
-        // 那里退回 O_EXCL 建文件再写——同样原子、同样不覆盖,代价是崩在写一半时会
-        // 在目标位置留下半个文件(hard_link 路线只会留下临时文件)。所以它只是兜底。
-        Err(_) => copy_exclusive(src, dst),
+        // link(2) 不是哪儿都支持:用户的笔记根目录可能落在 iCloud Drive、exFAT 或某些
+        // SMB/NFS 挂载上。**只有"这个卷不支持硬链接"才退回**——ENOENT/EROFS/ENOSPC/
+        // EIO 这类是真故障,吞掉它去做第二次无意义的写入只会掩盖根因
+        // (codex review 实现轮四 P2)。
+        Err(e) if link_unsupported(&e) => copy_exclusive(src, dst),
+        Err(e) => Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
     };
     let _ = std::fs::remove_file(&tmp);
     linked
 }
 
+/// 这个错误是不是"该卷不支持硬链接"?是才走兜底,其余原样上抛。
+fn link_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    // EXDEV(跨设备)、EOPNOTSUPP/ENOTSUP、ENOSYS、EMLINK、EPERM。EPERM 也算:部分文件
+    // 系统用它表示"这里不给建链接";真的权限问题在兜底里会以同样的错误再现,不会被藏。
+    const EXDEV: i32 = 18;
+    const EPERM: i32 = 1;
+    const EMLINK: i32 = 31;
+    #[cfg(target_os = "macos")]
+    const NOTSUP: [i32; 2] = [45 /* ENOTSUP */, 102 /* EOPNOTSUPP */];
+    #[cfg(not(target_os = "macos"))]
+    const NOTSUP: [i32; 2] = [95 /* EOPNOTSUPP/ENOTSUP */, 38 /* ENOSYS */];
+    matches!(e.raw_os_error(), Some(c) if c == EXDEV || c == EPERM || c == EMLINK || NOTSUP.contains(&c))
+}
+
+/// 恢复途中留下的半文件标记后缀。见 `copy_exclusive`。
+const INCOMPLETE_SUFFIX: &str = ".incomplete";
+
 /// `copy_no_overwrite` 在不支持硬链接的卷上的兜底:`create_new` 即 `O_CREAT|O_EXCL`,
-/// 目标已存在时原子失败。写到一半出错就把半成品删掉,不留给下次当"已存在"。
+/// 目标已存在时原子失败。
+///
+/// 这条路线没有"写临时文件再原子落位"的余地(不能 rename,rename 会覆盖),所以进程
+/// 崩在写一半时目标位置就留着半个文件。下一次恢复看到目标存在会当成"已完整"跳过,
+/// 然后删掉 journal——损坏的文件永久占位(codex review 实现轮四 P1)。因此写之前先
+/// 落一个同名 `.incomplete` 旁标,写完 sync 后才删;开头看见旁标就把这对文件清掉重来。
 fn copy_exclusive(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     use std::io::Write;
+    let mark = PathBuf::from(format!("{}{INCOMPLETE_SUFFIX}", dst.display()));
+    if mark.exists() {
+        // 上次崩在写一半:目标不可信,连同旁标一起清掉重写。
+        eprintln!("样本恢复:发现上次未写完的 {},清掉重来", dst.display());
+        let _ = std::fs::remove_file(dst);
+        let _ = std::fs::remove_file(&mark);
+    }
     let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(dst) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(anyhow::anyhow!("落位样本失败({}): {e}", dst.display())),
     };
+    if let Err(e) = std::fs::write(&mark, b"") {
+        drop(out);
+        let _ = std::fs::remove_file(dst);
+        return Err(anyhow::anyhow!("写半成品标记失败({}): {e}", mark.display()));
+    }
     let res = (|| -> std::io::Result<()> {
         let mut inp = std::fs::File::open(src)?;
         std::io::copy(&mut inp, &mut out)?;
         out.flush()?;
         out.sync_all()
     })();
+    drop(out);
     if let Err(e) = res {
-        drop(out);
         let _ = std::fs::remove_file(dst);
+        let _ = std::fs::remove_file(&mark);
         return Err(anyhow::anyhow!("写入样本失败({}): {e}", dst.display()));
     }
+    // 旁标删不掉就整体失败:留着它下次会把这份**完整**的样本当半成品清掉重写,
+    // 那是浪费但不丢数据;而谎称成功再让上层删 journal 才是真丢数据。
+    std::fs::remove_file(&mark)
+        .map_err(|e| anyhow::anyhow!("清除半成品标记失败({}): {e}", mark.display()))?;
     Ok(true)
 }
 
@@ -148,6 +192,32 @@ pub struct MergeJournalEntry {
     /// 旧条目没有这一栏(空串)= 来源不明,回放时按"只还身份、质心置空"处理。
     #[serde(default)]
     pub embedding_model: String,
+    /// 撤销/拆回做到哪一步了。**这是一次跨三种资源的操作**——库 JSON、样本文件、
+    /// 日志条目本身——中间任何一步失败都留下一个从外部无法判别的中间态。
+    ///
+    /// 早先靠"loser 是不是已经在 people 里"来猜是不是重试。那个判据只能证明**库**
+    /// 已经还原,证明不了**样本清理**做到哪:第一次撤销删了一半样本就失败的话,重试
+    /// 会跳过全部清理,剩下的合并后样本把对应槽位占住,快照那份被 copy_no_overwrite
+    /// 静默跳过,然后条目被删——撤销结果永久混着合并后的样本
+    /// (codex review 实现轮四 P1)。所以阶段必须落盘,不能推断。
+    ///
+    /// 取值见 `UndoPhase`。空串=还没开始。
+    #[serde(default)]
+    pub undo_phase: String,
+    /// 撤销/拆回时质心因跨模型空间被清空过。**必须持久化**:清空已经落盘,而后半程
+    /// (样本、删条目)可能失败并留下条目等重试;重试时若只看"质心现在空不空",上一次
+    /// 失败后调用方发起的那次重建可能已经从**部分**样本长出了非空质心,于是补齐样本
+    /// 之后不再重建,质心就永久只覆盖样本的一个子集(codex review 实现轮四 P2)。
+    #[serde(default)]
+    pub undo_cleared_centroids: bool,
+}
+
+/// `MergeJournalEntry::undo_phase` 的取值。顺序即推进顺序。
+pub mod undo_phase {
+    /// 库已按快照还原(people/redirects 已落盘)。
+    pub const LIBRARY_RESTORED: &str = "library_restored";
+    /// 双方现存样本已全部清掉,只等把快照副本拷回来。
+    pub const SAMPLES_CLEARED: &str = "samples_cleared";
 }
 
 /// root 为 app_data_dir(与 VoiceprintStore 同根),日志落 root/merge_journal/。
@@ -189,6 +259,16 @@ impl MergeJournal {
 
     fn samples_dir(&self, id: &str, side: &str) -> Option<PathBuf> {
         self.entry_dir(id).map(|d| d.join("samples").join(side))
+    }
+
+    /// 推进撤销阶段并落盘。**必须在该阶段真正做完之后调用**——它记录的是"已完成",
+    /// 不是"打算做"。写失败就上抛:阶段没落盘的话下次重试会重做这一段,而重做样本
+    /// 清理就会删掉两次尝试之间用户新录的东西。
+    pub fn set_undo_phase(&self, id: &str, phase: &str, cleared_centroids: bool) -> anyhow::Result<()> {
+        let mut e = self.entry(id)?;
+        e.undo_phase = phase.to_string();
+        e.undo_cleared_centroids |= cleared_centroids;
+        self.save_entry(&e)
     }
 
     pub fn entry(&self, id: &str) -> anyhow::Result<MergeJournalEntry> {
@@ -310,6 +390,10 @@ impl MergeJournal {
             if e.invalid_reason.is_some() {
                 continue;
             }
+            // 进行中的撤销不被任何来源失效(理由同 invalidate_all)。
+            if !e.undo_phase.is_empty() {
+                continue;
+            }
             if !touched.contains(&e.loser.as_str()) && !touched.contains(&e.winner.as_str()) {
                 continue;
             }
@@ -335,10 +419,13 @@ impl MergeJournal {
     /// 全部有效条目失效(声纹库整体重建等场景)。永久失效,样本副本保留(同
     /// invalidate 文档)。
     pub fn invalidate_all(&self, reason: &str) {
+        // 进行中的撤销必须留着能撤完。跨空间撤销失败后调用方会立刻排一次重建,而重建
+        // 结尾就调本函数;失效之后 undo_merge 会被 invalid_reason 挡住,改走"拆回"又
+        // 只还 loser——那次本该双边还原的撤销永远做不完(codex review 实现轮四 P1)。
         let ids: Vec<String> = self
             .entries()
             .iter()
-            .filter(|e| e.invalid_reason.is_none())
+            .filter(|e| e.invalid_reason.is_none() && e.undo_phase.is_empty())
             .flat_map(|e| [e.loser.clone(), e.winner.clone()])
             .collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
@@ -599,6 +686,8 @@ mod tests {
             invalid_reason: None,
             invalidated_by: None,
             embedding_model: "campplus".into(),
+            undo_phase: String::new(),
+            undo_cleared_centroids: false,
         }
     }
 
