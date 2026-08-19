@@ -458,10 +458,16 @@ impl VoiceprintStore {
         }
         self.save(&vp)?;
         // 样本还原:双方现存文件清掉(含合并时迁移/兜底截取的),快照副本拷回。
+        // **清理失败也是硬条件**:恢复用的 copy_no_overwrite 遇到已存在的目标会原子
+        // 跳过(那是给"只补缺失"的拆回重试用的语义),所以这里没清干净的话,留在库里的
+        // 就是合并**后**的那份样本,而快照那份被静默丢弃——撤销等于没撤干净。宁可
+        // 整体失败、保留 journal 让用户重试(codex review 实现轮二 P1 的连带面)。
         for id in [entry.loser.as_str(), entry.winner.as_str()] {
             for p in self.sample_paths_existing(id) {
                 if let Err(e) = std::fs::remove_file(&p) {
-                    eprintln!("撤销合并:清理现存样本失败({id},不影响库): {e}");
+                    return Err(anyhow::anyhow!(
+                        "清理现存样本失败({id}),已保留可重试的日志条目: {e}"
+                    ));
                 }
             }
         }
