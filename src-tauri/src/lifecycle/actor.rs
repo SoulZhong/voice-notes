@@ -25,7 +25,7 @@
 //!   spawn 后台线程不等待——不新增环。
 
 use crossbeam_channel::{unbounded, Sender};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::hooks::{HookBus, TransitionCtx};
 use super::machine::{
@@ -554,9 +554,27 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             o.note_id
                                         );
                                     }
+                                    // 漏斗 1 的"首次拿到转写"。必须在 finalize 之前取:
+                                    // 之后 writer 要被搬空,拿不到了。
+                                    let had_content = o.writer.has_content();
                                     let finalized = o.writer.finalize(chrono::Local::now());
                                     match finalized {
                                         Ok(()) => {
+                                            // 一场录制到底有没有产出转写。空转写是这条链路最常见的
+                                            // 失败形态(权限拿到了、录也录了,就是一个字都没出来),
+                                            // 而它不报错、不崩溃,在别人机器上完全不可见。
+                                            let asr_mode = app
+                                                .path()
+                                                .app_data_dir()
+                                                .map(|d| crate::settings::load(&d).asr_mode)
+                                                .unwrap_or_default();
+                                            crate::telemetry::track(
+                                                &app,
+                                                crate::telemetry::Event::TranscriptReady {
+                                                    engine: crate::telemetry::AsrEngine::classify(&asr_mode),
+                                                    empty: !had_content,
+                                                },
+                                            );
                                             // 仅 finalize 成功（state=complete、meta 落盘）才发起 Aing。
                                             // 转码移交时机与失败兜底见 spawn_refine 文档注释。
                                             // 自动 Aing 是保障类直调,不经 RefineRequest 守卫(与旧

@@ -19,6 +19,20 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(out).not.toContain("周会");
   });
 
+  it("含空格的笔记文件名整条脱掉,尾部措辞保留", () => {
+    // 这条向量此前只在 Rust 侧有。两边行为其实不同:TS 那条正则会一路吃到行尾,
+    // 把 "failed" 也吞掉——号称共用的一组向量,漏掉的恰恰是能暴露漂移的那条。
+    const out = redact("write /Users/Alice/Library/voice-notes/notes/Q3 roadmap.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("Alice");
+    expect(out).toContain("failed");
+  });
+
+  it("家目录路径两种形态都收敛", () => {
+    expect(redact("open /Users/zhangwei/notes/x.json failed")).not.toContain("zhangwei");
+    expect(redact("open /home/lisi/notes/y.json failed")).not.toContain("lisi");
+  });
+
   it("长中文串整段丢弃而非截断", () => {
     const out = redact("parse failed: 这段话是会议逐字稿的一部分不应该被上报出去");
     expect(out).not.toContain("会议逐字稿");
@@ -63,6 +77,32 @@ describe("redactEvent(before_send 钩子)", () => {
     const ev = { event: "$exception", properties: { $exception_message: "boom" } };
     expect(redactEvent(ev)).not.toBeNull();
     expect(redactEvent(null)).toBeNull();
+  });
+
+  it("栈帧里的路径一起脱掉——Rust 侧修过,TS 侧此前没跟上", () => {
+    const ev = {
+      event: "$exception",
+      properties: {
+        $exception_list: [
+          {
+            type: "Error",
+            value: "boom",
+            stacktrace: { frames: [{ filename: "/Users/张伟/voice-notes/src/x.ts" }] },
+          },
+        ],
+        $exception_panic_file: "/Users/张伟/voice-notes/src/y.rs",
+      },
+    };
+    const dumped = JSON.stringify(redactEvent(ev).properties);
+    expect(dumped).not.toContain("张伟");
+  });
+
+  it("认不出的 stacktrace 结构原样放过而不是丢事件", () => {
+    const ev = {
+      event: "$exception",
+      properties: { $exception_list: [{ type: "Error", value: "boom", stacktrace: "字符串形态" }] },
+    };
+    expect(redactEvent(ev)).not.toBeNull();
   });
 
   it("非异常事件原样通过", () => {

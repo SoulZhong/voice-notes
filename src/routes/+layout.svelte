@@ -133,7 +133,7 @@
   onMount(() => {
     // 分析初始化放最前:页面浏览与异常捕获越早装上覆盖面越大。
     // 内部做了 try/catch,失败不影响后续任何初始化。
-    initAnalytics();
+    void initAnalytics();
     recording.init();
     // identify(P2a)完成即刷新收件箱:身份建议卡在 Aing 结束后自动出现,
     // 不等下一次 peopleVersion 变化。layout 常驻,不必解绑。

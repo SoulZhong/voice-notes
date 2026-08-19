@@ -197,3 +197,37 @@ refine(note-140751): 写入 /Users/张伟/Library/.../notes/季度复盘会.json
 - [会话回放隐私控制](https://posthog.com/docs/session-replay/privacy)
 - [Rust SDK](https://posthog.com/docs/libraries/rust) 与 [Rust 符号上传](https://posthog.com/docs/error-tracking/upload-source-maps/rust)
 - [异常捕获](https://posthog.com/docs/error-tracking/capture)
+
+## 2026-08-19 补齐:落地缺口一次收口
+
+接入后系统排查了一轮「承诺过但没落地 / 换供应商时丢掉 / 默认值倒在错误一侧 / 两端各写一套」四类缺口,统一修完。
+
+**换供应商时丢掉的**(Aptabase 插件自动带、PostHog 不会自动有):
+
+| 字段 | 处置 |
+|---|---|
+| `appVersion` | 补。两端在各自 before_send 注入 `$app_version`——**注入点必须是 before_send**,各调用点覆盖不到 SDK 自装 panic hook 发的事件,而"哪个版本开始崩"正是崩溃最该回答的问题 |
+| `osName` / `osVersion` | 补真值。posthog-js 从 UA 正则解析,而 WKWebView 的 UA 冻结在 `Mac OS X 10_15_7`、WebView2 冻结在 `Windows NT 10.0`(Win11 同样报 10.0)——看板上全部 mac 用户都会显示 10.15.7,而本应用的采集行为恰按 macOS 大版本分叉。改由后端 `os_info` 出唯一真值,前端经 `app_env` 取同一份盖掉 UA 那份 |
+| `locale` | 补(`sys_locale`,收敛成 BCP-47 形态) |
+| `isDebug` | 补。此前开发机流量与真实用户流量混在同一池且事后分不开——`internal_or_test_user_hostname` 因 Tauri 的 `tauri://localhost` 必须置 null,内外分流只剩这一条路 |
+| `engineName` / `sdkVersion` | 不补。posthog-js 的 `$browser`/`$lib` 已等价覆盖 |
+
+**承诺过但没落地的**:
+
+- **异常限流**。「限流与额度」写明按 fingerprint 每会话限流,此前只有一句注释。两端同值实现:同 fingerprint 5 条 + 全会话 50 条双闸。单条链路刷不满、多种错各刷几条合力打满,是 2026-08-13 断流风暴的真实形态,故两道都要。
+- **12 处标记点**。原只落 8 处,补齐采集链自愈重建、模型加载失败、AI 写回失败、迁移失败四类,并新增更新失败(前端经 `report_frontend_error` 白名单回后端上报——异常事件的形状只保留 Rust 一份实现)。
+- **三条漏斗的关键节点**。补 `permission_checked`(漏斗 1 的授权)、`transcript_ready`(漏斗 1 的首次拿到转写,带 local/cloud 与是否空转写)、`ai_configured`(漏斗 3 的配置成功,只在跨越那一次上报)。
+
+**默认值/框架行为倒在错误一侧的**:
+
+- **`app_started` 永远是 personless**。它在 `setup()` 里发,早于 webview 调 `set_analytics_id`;`Event::new_anon` 每次生成随机 distinct_id 并关掉 person profile,于是每次启动都是一个全新的匿名人——留存、DAU、漏斗 1 的第一步全部算不出来。改为**压队等 id**(上限 64 条,退出时仍等不到才以 personless 发出),仍不自造 id。
+- **硬崩溃完全不可见**。panic hook 只覆盖 Rust panic;whisper C++ 层的 SIGSEGV/SIGABRT、CoreAudio 崩溃、OOM 被杀、强退都不走它,且队列里没 flush 的事件一并消失——最严重的一类故障恰恰是唯一上报不到的。改为落"运行中"标记、下次启动回头看,补 `app_unclean_exit`;同一份标记顺带识别版本变化,补 `app_updated`。
+
+**两端各写一套导致的漂移**:
+
+- `redactEvent` 的栈帧 `filename`/`abs_path`/`module` 与 `$exception_panic_file` 在第二轮 codex review 时只修了 Rust 侧,TS 侧没跟上。
+- 路径终点判据两端根本不是同一套:Rust 逐字符判断"空格后是否还像路径",TS 用 `[^\n"',;)\]]*` 一路吃到行尾。两侧号称共用同一组测试向量,但暴露这处差异的那条向量恰好只在 Rust 侧有。已把 TS 改成同算法,并把缺的向量补进两侧。
+
+**隐私开关**。设计文档原把"设置页并无此项"当作既有缺陷、靠改文案解决;本次直接把开关补回来(`settings.telemetry_enabled`,默认开)。关掉后两端都不再发出任何事件——**包括 SDK 自装 panic hook 的**,拦在 before_send 里,那是唯一覆盖得到它的位置;前端则连 `posthog.init` 都不执行,而不是 init 之后再 opt-out(后者仍会加载录制器、仍受远端配置摆布)。欢迎页文案同步写回"可在设置中关闭"。
+
+**未做**:符号上传(`posthog-cli` + CI secret)。release 构建的 panic 堆栈仍是不可读的地址,「错误现场足以直接定位问题」这条目标只兑现了一半。需要新的 CI secret,单独一件事做。

@@ -579,6 +579,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         doc.stages.llm = "failed".into();
                         if let Err(e) = store::write_refined_atomic(&dir, &doc) {
                             eprintln!("refine: agent 失败态落盘失败: {e}");
+                            // 算出来了但没存住,和根本没算出来是两回事——后者已有
+                            // AiPipeline,前者此前完全不可见。
+                            telemetry::report_error(
+                                telemetry::ErrorKind::AiApplyWrite,
+                                &format!("agent 失败态落盘失败: {e}"),
+                            );
                         }
                     }
                 } else if let Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) = &refine_exec {
@@ -615,6 +621,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             .map(|_| ())
                     }) {
                         eprintln!("refine: HTTP Aing 提交/索引交接: {error:#}");
+                        telemetry::report_error(
+                            telemetry::ErrorKind::AiApplyWrite,
+                            &format!("HTTP Aing 提交/索引交接失败: {error:#}"),
+                        );
                     }
                 }
                 report("llm", &doc.stages.llm);
@@ -1365,6 +1375,11 @@ fn spawn_session(
             audio::resilient::ResilientNotify {
                 on_recovered: Some(Box::new(move || {
                     health.restarts.fetch_add(1, Ordering::Relaxed);
+                    // 兜住不等于没发生:重建成功一次,就说明这台机器上的采集链断过一次。
+                    telemetry::report_error(
+                        telemetry::ErrorKind::CaptureRebuild,
+                        "mic 采集断连后重建成功",
+                    );
                     let _ = app.emit(
                         "source_health",
                         ipc::SourceHealthEvent {
@@ -1375,6 +1390,11 @@ fn spawn_session(
                     );
                 })),
                 on_lost: Some(Box::new(move || {
+                    // 重试耗尽 = 这一路音源本场彻底没了,是最该被看见的采集故障。
+                    telemetry::report_error(
+                        telemetry::ErrorKind::CaptureRebuild,
+                        "mic 采集断连重试耗尽,本场放弃该源",
+                    );
                     let _ = app2.emit(
                         "source_health",
                         ipc::SourceHealthEvent {
@@ -1503,6 +1523,11 @@ fn spawn_session(
                             audio::resilient::ResilientNotify {
                                 on_recovered: Some(Box::new(move || {
                                     health.restarts.fetch_add(1, Ordering::Relaxed);
+                                    // 兜住不等于没发生:重建成功一次,就说明这台机器上的采集链断过一次。
+                                    telemetry::report_error(
+                                        telemetry::ErrorKind::CaptureRebuild,
+                                        "system 采集断连后重建成功",
+                                    );
                                     let _ = app.emit(
                                         "source_health",
                                         ipc::SourceHealthEvent {
@@ -1513,6 +1538,11 @@ fn spawn_session(
                                     );
                                 })),
                                 on_lost: Some(Box::new(move || {
+                                    // 重试耗尽 = 这一路音源本场彻底没了,是最该被看见的采集故障。
+                                    telemetry::report_error(
+                                        telemetry::ErrorKind::CaptureRebuild,
+                                        "system 采集断连重试耗尽,本场放弃该源",
+                                    );
                                     let _ = app2.emit(
                                         "source_health",
                                         ipc::SourceHealthEvent {
@@ -1598,6 +1628,11 @@ fn spawn_session(
                             audio::resilient::ResilientNotify {
                                 on_recovered: Some(Box::new(move || {
                                     health.restarts.fetch_add(1, Ordering::Relaxed);
+                                    // 兜住不等于没发生:重建成功一次,就说明这台机器上的采集链断过一次。
+                                    telemetry::report_error(
+                                        telemetry::ErrorKind::CaptureRebuild,
+                                        "system 采集断连后重建成功",
+                                    );
                                     let _ = app.emit(
                                         "source_health",
                                         ipc::SourceHealthEvent {
@@ -1608,6 +1643,11 @@ fn spawn_session(
                                     );
                                 })),
                                 on_lost: Some(Box::new(move || {
+                                    // 重试耗尽 = 这一路音源本场彻底没了,是最该被看见的采集故障。
+                                    telemetry::report_error(
+                                        telemetry::ErrorKind::CaptureRebuild,
+                                        "system 采集断连重试耗尽,本场放弃该源",
+                                    );
                                     let _ = app2.emit(
                                         "source_health",
                                         ipc::SourceHealthEvent {
@@ -6243,14 +6283,28 @@ fn preload_models(
         if slot.is_none() && !cloud_mode {
             match new_recognizer(&asr_model, current_asr_provider(&app), qwen3_hotwords(&app)) {
                 Ok(r) => *slot = Some(r),
-                Err(e) => eprintln!("识别器预载失败（将在开录时现场加载）: {e}"),
+                Err(e) => {
+                    eprintln!("识别器预载失败（将在开录时现场加载）: {e}");
+                    // 与 AsrEngine 分开:加载失败是装机期问题(模型没下全/文件损坏),
+                    // 引擎异常是运行期问题,合成一档会把两类故障混进同一个 issue。
+                    telemetry::report_error(
+                        telemetry::ErrorKind::ModelLoad,
+                        &format!("识别器预载失败: {e}"),
+                    );
+                }
             }
         }
         let mut eslot = embedder_cache.lock().unwrap();
         if eslot.is_none() {
             match diar::SherpaEmbedder::new(&speaker_model_path(&app)) {
                 Ok(e) => *eslot = Some(Box::new(e) as Box<dyn diar::SpeakerEmbedder>),
-                Err(e) => eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}"),
+                Err(e) => {
+                    eprintln!("声纹模型预载失败（说话人区分将不可用）: {e}");
+                    telemetry::report_error(
+                        telemetry::ErrorKind::ModelLoad,
+                        &format!("声纹模型预载失败: {e}"),
+                    );
+                }
             }
         }
         drop(eslot);
@@ -6662,6 +6716,15 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
     // UI 语言变更:落盘后切全局语言并重建托盘菜单文案(new_settings 即将 move 进闭包,先取值)。
     let lang_changed = old.ui_lang != new_settings.ui_lang;
     let new_ui_lang = new_settings.ui_lang.clone();
+    // 上报总开关(new_settings 即将 move,先取值)。
+    let telemetry_on = new_settings.telemetry_enabled;
+    // AI 从"未配置"变成"已配置"——设计文档漏斗 3 的关键一步,它预期流失率最高,
+    // 是本期最想验证的假设。只在跨越那一次上报,之后每次保存设置都不再重复计数。
+    let ai_newly_configured = active_refine_executor(&old)
+        .is_none()
+        .then(|| active_refine_executor(&new_settings))
+        .flatten()
+        .map(|e| telemetry_provider(&e));
     // 锁内读-改-写(update):整体取前端新值,但 data_dir/models_dir 一律保留磁盘最新值
     //(迁移专管这两指针)——防止本次写把并发迁移刚提交的目录指针覆盖回旧值,随后迁移
     // 删旧 → 笔记"凭空消失"。这正是 update 的 WRITE_LOCK 要串行掉的 load-modify-save 竞态。
@@ -6710,12 +6773,24 @@ fn set_settings(app: AppHandle, state: State<AppState>, new_settings: settings::
                 }
                 Err(err) => {
                     eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
+                    telemetry::report_error(
+                        telemetry::ErrorKind::ModelLoad,
+                        // 断句是有讲究的:脱敏规则会整段丢弃连续 12 个以上中日韩字符,
+                        // "换模型后声纹模型加载失败" 正好 12 个,连写就会被脱成 <TEXT>。
+                        &format!("换模型后,声纹模型加载失败,库未重建: {err}"),
+                    );
                 }
             }
         });
     }
     if tray_changed {
         tray::apply_enabled(&app);
+    }
+    // 总开关放在落盘之后:先保证用户的选择已经存住,再让它生效。关掉的那一刻
+    // set_enabled 会连压队一起清空(见 telemetry::set_enabled)。
+    telemetry::set_enabled(telemetry_on);
+    if let Some(provider) = ai_newly_configured {
+        telemetry::track(&app, telemetry::Event::AiConfigured { provider });
     }
     if lang_changed {
         i18n::set_lang(&new_ui_lang);
@@ -6872,6 +6947,9 @@ fn migrate_data_dir(app: AppHandle, state: State<AppState>, new_dir: String) -> 
         let _unpause = UnpauseOnDrop(transcode.clone());
         let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "copying".into(), message: String::new() });
         let emit_err = |app: &AppHandle, msg: String| {
+            // 用户点了迁移却没迁成:本机日志之外无人知晓,而这是最容易让人以为
+            // "笔记丢了"的一类故障。
+            telemetry::report_error(telemetry::ErrorKind::Migration, &msg);
             let _ = app.emit("migrate", ipc::MigrateEvent { kind: "data".into(), phase: "error".into(), message: msg });
         };
         let entries: &[&str] = &["notes", "voiceprints.json", "voiceprints"];
@@ -7106,11 +7184,21 @@ fn screen_capture_permission() -> bool {
 /// 触发系统授权弹窗并把本应用登记进「屏幕录制」列表。macOS 对每个 App 一生只弹
 /// 一次,之后调用只返回当前状态——前端拿到 false 时应引导去系统设置手动开。
 #[tauri::command]
-fn request_screen_capture_permission() -> bool {
+fn request_screen_capture_permission(app: AppHandle) -> bool {
+    // 漏斗 1 的"授权"这一步。埋在"申请"而不是"预检"上:预检每次进录制页都会跑,
+    // 计进去等于把一个用户算许多次;申请是用户主动做的一次动作,恰好是流失点本身。
     #[cfg(target_os = "macos")]
-    return unsafe { CGRequestScreenCaptureAccess() };
+    let granted = unsafe { CGRequestScreenCaptureAccess() };
     #[cfg(not(target_os = "macos"))]
-    true
+    let granted = true;
+    telemetry::track(
+        &app,
+        telemetry::Event::PermissionChecked {
+            kind: telemetry::PermissionKind::Screen,
+            granted,
+        },
+    );
+    granted
 }
 
 /// 依次执行全部捕获权限清理；任一项失败时仍继续，最终统一报告结果。
@@ -7364,6 +7452,35 @@ fn set_analytics_id(id: String) {
     telemetry::set_distinct_id(&id);
 }
 
+/// 环境快照给前端。**两端必须用同一份值**:posthog-js 的 `$os_version` 从 UA 正则
+/// 解析,而 WKWebView 的 UA 冻结在 `Mac OS X 10_15_7`、WebView2 冻结在
+/// `Windows NT 10.0`(Win11 也报 10.0)——不盖掉的话同一台机器在看板上会劈成两个
+/// 系统版本,而本应用的采集行为恰恰按 macOS 大版本分叉(ScreenCaptureKit/CATap/授权)。
+#[tauri::command]
+fn app_env() -> telemetry::EnvSnapshot {
+    telemetry::EnvSnapshot::current()
+}
+
+/// 上报总开关的当前值。前端 init 前问一次:关掉时 posthog-js 根本不 init,
+/// 而不是 init 之后再 opt-out——后者仍会加载录制器、仍受远端配置摆布。
+#[tauri::command]
+fn telemetry_enabled() -> bool {
+    telemetry::is_enabled()
+}
+
+/// 前端上报一次失败。**kind 走白名单枚举**,认不出就整条丢弃——否则自由文本从这个
+/// 口子绕过了后端的全部隐私红线。detail 与后端同一条脱敏路径(report_error 内部)。
+///
+/// 存在的理由:一键更新走的是 tauri-plugin-updater 的 JS API,失败只发生在前端;
+/// 而"更新装不上"正是那种本机日志之外无人知晓、又直接卡住所有后续修复的故障。
+#[tauri::command]
+fn report_frontend_error(kind: String, detail: String) {
+    let Some(kind) = telemetry::ErrorKind::parse(&kind) else {
+        return;
+    };
+    telemetry::report_error(kind, &detail);
+}
+
 pub fn run() {
     // 尽早初始化:panic hook 越早装覆盖面越大(它由 posthog-rs 的 capture_panics
     // 安装,能捕获被 catch_unwind 吞掉的 panic——那些「出事了但应用硬撑着不崩」
@@ -7439,6 +7556,10 @@ pub fn run() {
             };
             // UI 语言:必须先于托盘构建等任何用户可见文案产生处(tr! 读此全局)。
             i18n::set_lang(&s.ui_lang);
+            // 上报总开关:settings 一读到就同步。放这么早是因为 telemetry::init() 在
+            // run() 开头就装好了 panic hook——从这一刻起到这里之间发生的 panic 仍会上报
+            // (那个窗口只有几毫秒,且此时连设置都还没读到,没有更早的判据可用)。
+            telemetry::set_enabled(s.telemetry_enabled);
             // 模型目录覆盖:settings.models_dir 注入(None 也调,清除历史覆盖,幂等)。
             // 必须先于 models::root() 的任何使用。
             models::set_models_override(s.models_dir.clone().map(PathBuf::from));
@@ -7555,6 +7676,29 @@ pub fn run() {
                         Err(e) => eprintln!("音频保留期清理失败(不影响使用): {e}"),
                     }
                 });
+            }
+            // 上次运行的痕迹:硬崩溃(SIGSEGV/OOM/强退,panic hook 覆盖不到)与升级首启。
+            // 必须在 AppStarted 之前发——它们描述的是上一次运行,时间上排在本次启动之前。
+            if let Some(dir) = &app_data {
+                let boot = telemetry::open_session(dir);
+                if boot.unclean_exit {
+                    telemetry::track(
+                        &handle,
+                        telemetry::Event::AppUncleanExit {
+                            version: telemetry::SafeVersion::parse(
+                                boot.last_version.as_deref().unwrap_or(""),
+                            ),
+                        },
+                    );
+                }
+                if let Some(from) = &boot.updated_from {
+                    telemetry::track(
+                        &handle,
+                        telemetry::Event::AppUpdated {
+                            from_version: telemetry::SafeVersion::parse(from),
+                        },
+                    );
+                }
             }
             telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
@@ -7698,7 +7842,10 @@ pub fn run() {
             set_playback_active,
             mic_mode,
             precheck_recording,
-            set_analytics_id
+            set_analytics_id,
+            app_env,
+            telemetry_enabled,
+            report_frontend_error
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -7711,6 +7858,11 @@ pub fn run() {
             // 在进程退出时不会执行,不主动 flush 的话临退出那几秒的事件(停录、
             // 导出、刚发生的错误)会静默丢失(codex review 发现)。
             if let tauri::RunEvent::Exit = event {
+                // 干净退出记号必须与 flush 同一处:漏在别的退出分支上,那条分支的每次
+                // 退出都会被下次启动误报成崩溃(见 telemetry::close_session)。
+                if let Ok(dir) = app.path().app_data_dir() {
+                    telemetry::close_session(&dir);
+                }
                 telemetry::flush_on_exit();
             }
             #[cfg(target_os = "macos")]
