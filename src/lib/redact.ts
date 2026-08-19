@@ -54,12 +54,33 @@ function pathEnd(tail: string): number {
       const lastSeg = tail.slice(0, i).split(/[/\\]/).pop() ?? "";
       const inDirSegment = !lastSeg.includes(".");
       if (!looksPath(word)) {
-        if (inDirSegment && dirSpaceBudget > 0) dirSpaceBudget -= 1;
-        else return i;
+        // 再往前看一眼:硬终点之前还有像路径的词吗?有就说明这是个多词文件名
+        // (`weekly product roadmap review.json`),整段都还在路径里。只看下一个词的
+        // 话,四词以上的标题会从第二个空格处漏出后半截。与 Rust 侧同判据。
+        if (hasPathAhead(tail.slice(i + 1))) {
+          // 走这条不扣额度:多词文件名有明确证据,不是靠猜。
+        } else if (inDirSegment && dirSpaceBudget > 0) {
+          dirSpaceBudget -= 1;
+        } else {
+          return i;
+        }
       }
     }
   }
   return tail.length;
+}
+
+/** 硬终点之前还有像路径的词吗?**只认硬证据**(含分隔符、或带扩展名),不认
+ *  "大写开头"——那条判据对一个词够用,放到整段前瞻上太松,会把整句英文措辞吞掉。
+ *  与 Rust 侧 has_path_ahead 同判据。 */
+function hasPathAhead(rest: string): boolean {
+  const head = rest.split(/["',;\n\r)\]]/)[0] ?? "";
+  return head.split(/\s+/).some((w) => {
+    if (w.includes("/") || w.includes("\\")) return true;
+    if (!w.includes(".")) return false;
+    const ext = w.split(".").pop() ?? "";
+    return ext.length > 0 && ext.length <= 5 && /^[0-9a-zA-Z]+$/.test(ext);
+  });
 }
 
 /** 路径起点:一个 `/`,前面是行首或分隔符,且这条路径至少两段。

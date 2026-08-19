@@ -113,6 +113,20 @@ describe("redact(与 Rust 侧同规则)", () => {
     expect(out).not.toContain("Alice");
   });
 
+  it("多词文件名整条脱掉", () => {
+    const out = redact("write /Users/Alice/notes/weekly product roadmap review.json failed");
+    expect(out).not.toContain("roadmap");
+    expect(out).not.toContain("review");
+    expect(out).not.toContain("Alice");
+    expect(out).toContain("failed");
+  });
+
+  it("转义形态的 UNC 同样收敛", () => {
+    const out = redact("migrate failed: \\\\\\\\server\\\\share\\\\客户\\\\周会.json");
+    expect(out).not.toContain("客户");
+    expect(out).not.toContain("周会");
+  });
+
   it("URL 不被当成路径误伤", () => {
     const clean = "load failed at tauri://localhost/notes/note-140751";
     expect(redact(clean)).toBe(clean);

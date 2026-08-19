@@ -120,9 +120,13 @@ fn redact_windows_paths(s: &str) -> String {
             }
             rest[i + c.len_utf8()..].starts_with(":\\").then_some(i)
         });
+        // **要接着往后找**,不能只看第一对:Debug/JSON 形态的 `\\\\server\\share\\…`
+        // 第一对后面仍是反斜杠,`find().filter()` 会当场判否并放弃搜索,整条路径原样
+        // 留下——而 TS 侧的正则会继续往后走,两端还因此不等价(codex review 四轮 P1)。
         let unc = rest
-            .find("\\\\")
-            .filter(|i| rest[i + 2..].starts_with(|c: char| c != '\\'));
+            .match_indices("\\\\")
+            .map(|(i, _)| i)
+            .find(|i| rest[i + 2..].starts_with(|c: char| c != '\\'));
         let Some(start) = [drive, unc].into_iter().flatten().min() else {
             break;
         };
@@ -185,7 +189,16 @@ fn path_end(tail: &str) -> usize {
                 })
                 || word.chars().next().is_some_and(|c| c.is_uppercase());
             if !looks_path {
-                if in_dir_segment && dir_space_budget > 0 {
+                // 再往前看一眼:硬终点之前还有像路径的词吗?有就说明这是个多词文件名
+                // (`weekly product roadmap review.json`),整段都还在路径里。
+                // 只看下一个词的话,四词以上的标题会从第二个空格处漏出后半截
+                // ——那正是"额度封顶 1 个"引入的回归(codex review 四轮 P1)。
+                if has_path_ahead(&next) {
+                    // 走这条不扣额度:多词文件名有明确证据,不是靠猜。
+                } else if in_dir_segment && dir_space_budget > 0 {
+                    // 没有证据、又还在目录段里:让一个空格,覆盖"两词目录名"。
+                    // 额度用完就收尾,否则 `…/季度 复盘 failed because disk full`
+                    // 会被整条吞掉,排查线索一起没了。
                     dir_space_budget -= 1;
                 } else {
                     end = idx;
@@ -196,6 +209,26 @@ fn path_end(tail: &str) -> usize {
         i += 1;
     }
     end
+}
+
+/// 硬终点之前还有像路径的词吗?**只认硬证据**(含分隔符、或带扩展名),不认
+/// "大写开头"——那条判据对一个词够用,放到整段前瞻上太松,会把整句英文措辞吞掉。
+/// 前瞻到硬终点为止:逗号/引号/换行之后已经是另一件事了。
+fn has_path_ahead(rest: &str) -> bool {
+    let head: &str = rest
+        .split(|c| matches!(c, '"' | '\'' | ',' | ';' | '\n' | '\r' | ')' | ']'))
+        .next()
+        .unwrap_or("");
+    head.split_whitespace().any(|w| {
+        w.contains('/')
+            || w.contains('\\')
+            || (w.contains('.')
+                && w.rsplit('.').next().is_some_and(|ext| {
+                    !ext.is_empty()
+                        && ext.len() <= 5
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                }))
+    })
 }
 
 /// 形如 sk-/phc_/A-SH- 开头的长串,以及任何 32 位以上的十六进制串。
@@ -396,6 +429,24 @@ mod tests {
         let out = redact("write /Users/Alice/notes/Q3.v1  roadmap.json failed");
         assert!(!out.contains("roadmap"), "连续空格后的文件名必须脱掉: {out}");
         assert!(!out.contains("Alice"), "{out}");
+    }
+
+    /// 多词文件名:只看下一个词的话,四词以上的标题会从第二个空格处漏出后半截。
+    #[test]
+    fn 多词文件名整条脱掉() {
+        let out = redact("write /Users/Alice/notes/weekly product roadmap review.json failed");
+        assert!(!out.contains("roadmap"), "多词标题必须整条脱掉: {out}");
+        assert!(!out.contains("review"), "{out}");
+        assert!(!out.contains("Alice"), "{out}");
+        assert!(out.contains("failed"), "文件名之后的措辞仍应保留: {out}");
+    }
+
+    /// Debug/JSON 形态的 UNC:第一对反斜杠后面仍是反斜杠,不能就此放弃搜索。
+    #[test]
+    fn 转义形态的unc同样收敛() {
+        let out = redact(r"migrate failed: \\server\share\客户\周会.json");
+        assert!(!out.contains("客户"), "转义 UNC 里的目录名必须脱掉: {out}");
+        assert!(!out.contains("周会"), "{out}");
     }
 
     #[test]

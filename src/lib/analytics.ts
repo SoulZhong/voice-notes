@@ -235,10 +235,21 @@ export function applyTelemetrySetting(on: boolean): void {
         posthog.stopSessionRecording();
         posthog.opt_out_capturing();
       }
+      // 已知残留:关掉的那一刻,几秒前**在还开着时**捕获、仍排在 SDK 发送队列里的
+      // 事件可能照样送达——posthog-js 没有公开的清队列接口,opt_out 只挡新的。
+      // 新捕获的一律被 beforeSend 拦下(它先于入队执行),所以残留有界:
+      // 只有关掉之前那一小段已经采集到的数据。承诺的口径是"关掉后不再采集"。
       return;
     }
-    if (started) posthog.opt_in_capturing();
-    else void start().catch(() => {});
+    if (started) {
+      posthog.opt_in_capturing();
+      // **必须显式重开回放**:stopSessionRecording 会把配置里的
+      // disable_session_recording 永久置为 true,只 opt_in 的话普通事件回来了、
+      // 回放要重启应用才回来(codex review 四轮 P2)。
+      posthog.startSessionRecording();
+    } else {
+      void start().catch(() => {});
+    }
   } catch {
     // 静默:开关本身绝不能因为上报库出错而失灵
   }
