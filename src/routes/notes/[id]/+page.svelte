@@ -63,6 +63,8 @@
   import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
+  import { listSplitOps, type SplitOp } from "$lib/multiSpeaker";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -548,6 +550,42 @@
   //    循环);单段最多听 15s,段尾自动停;用户手动暂停/拖走即退出试听态。 ──
   const PREVIEW_MAX_MS = 15_000;
   let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+
+  // ── 多人混杂处置(设计:2026-08-20-mixed-speaker-split-design.md) ──
+  let multiPanel = $state<{ candidates: string[]; existingOp: SplitOp | null } | null>(null);
+  /** 本篇未完成的打标操作(启动/刷新时拉取,恢复入口)。 */
+  let openMultiOps = $state<SplitOp[]>([]);
+  async function refreshMultiOps() {
+    openMultiOps = await listSplitOps(id).catch(() => []);
+  }
+  $effect(() => {
+    void id;
+    void refreshMultiOps();
+  });
+  /** 原始稿入口:直接以该 S 为唯一候选。 */
+  function openMultiForRaw(sid: string) {
+    multiPanel = { candidates: [sid], existingOp: null };
+  }
+  /** 修订稿入口:R 没有存储位,映射出其 source_seqs 涉及的原始 S 让用户勾选。 */
+  function openMultiForRefined(rid: string) {
+    const seqs = new Set(
+      (refined?.paragraphs ?? []).filter((p) => p.speaker === rid).flatMap((p) => p.source_seqs),
+    );
+    const sids = [
+      ...new Set(
+        displaySegments
+          .filter((s) => seqs.has(s.seq))
+          .map((s) => s.speaker)
+          .filter((x): x is string => !!x),
+      ),
+    ];
+    if (sids.length > 0) multiPanel = { candidates: sids, existingOp: null };
+  }
+  function onMultiChanged() {
+    refresh();
+    recording.bumpNotes();
+    void refreshMultiOps();
+  }
 
   function previewSpeaker(sid: string) {
     const source: { speaker?: string | null; start_ms: number; end_ms: number }[] =
@@ -1834,6 +1872,7 @@
           {people}
           onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
           onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
+          onMarkMulti={canEdit ? openMultiForRefined : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1853,6 +1892,7 @@
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
+          onMarkMulti={canEdit ? openMultiForRaw : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1860,6 +1900,18 @@
             recording.bumpNotes();
           }}
         />
+      {/if}
+
+      {#if openMultiOps.length > 0 && !multiPanel}
+        <div class="banner">
+          {t("speakers.multi.resume")}
+          <button
+            class="link"
+            onclick={() => (multiPanel = { candidates: openMultiOps[0].speaker_ids, existingOp: openMultiOps[0] })}
+          >
+            {t("speakers.multi.resumeOpen")}
+          </button>
+        </div>
       {/if}
 
       <div class="view-switch">
@@ -2065,6 +2117,16 @@
         <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>{t("notes.menu.newSpeaker")}</button>
         <button class="menu-item" onclick={() => (segMenuPop = null)}>{t("notes.cancel")}</button>
       </div>
+    {/if}
+    {#if multiPanel && note}
+      <MultiSpeakerPanel
+        noteId={id}
+        speakers={note.speakers}
+        candidateSpeakers={multiPanel.candidates}
+        existingOp={multiPanel.existingOp}
+        onClose={() => (multiPanel = null)}
+        onChanged={onMultiChanged}
+      />
     {/if}
     {#if segDeletePop}
       <div

@@ -3734,8 +3734,10 @@ struct MultiImpactPerson {
 
 #[derive(serde::Serialize)]
 struct MultiImpactSample {
-    /// 相对声纹根的路径(voiceprints/P15-2.wav)。
+    /// 相对声纹根的路径(voiceprints/P15-2.wav),删除 API 用它。
     path: String,
+    /// 绝对路径:前端 convertFileSrc 试听用。
+    audition_path: String,
     /// 有溯源且来自本篇被标簇 → 可自动删;false = 「来源未知」,只能试听勾删。
     from_marked_cluster: bool,
 }
@@ -3876,7 +3878,11 @@ fn multi_impact(app: AppHandle, op_id: String) -> Result<MultiImpactReport, Stri
                         && r.note_id == op.note_id
                         && op.speaker_ids.iter().any(|s| s == &r.cluster_id)
                 });
-                MultiImpactSample { path: rel, from_marked_cluster: from_marked }
+                MultiImpactSample {
+                    path: rel,
+                    audition_path: abs.to_string_lossy().into_owned(),
+                    from_marked_cluster: from_marked,
+                }
             })
             .collect();
         persons.push(MultiImpactPerson {
