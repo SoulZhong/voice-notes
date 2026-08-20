@@ -623,11 +623,23 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         &cfg,
                         model,
                         log_ctx.as_ref(),
-                        // 逐块心跳:重发 llm/running。滞留自愈据此判断 worker 还活着
-                        // (见 lifecycle/actor.rs 的 REFINE_STALE_MS)。事件本身幂等——
-                        // 内核只在 stage=="all"&&state=="running" 时动集合,这里不动状态,
-                        // 只把「还在跑」这件事透出来。
-                        &|| report("llm", "running"),
+                        // 逐块进度:①重发 llm/running(滞留自愈据此判断 worker 活着,
+                        // 见 lifecycle/actor.rs 的 REFINE_STALE_MS;事件幂等,内核只在
+                        // stage=="all"&&state=="running" 时动集合) ②emit aing_progress
+                        // 给界面画「精修中 done/total · 约剩 X 分」。
+                        &|done, total, avg_ms| {
+                            report("llm", "running");
+                            let _ = app.emit(
+                                "aing_progress",
+                                AingProgress {
+                                    note_id: note_id.clone(),
+                                    stage: "llm".into(),
+                                    done: done as u32,
+                                    total: total as u32,
+                                    avg_chunk_ms: avg_ms,
+                                },
+                            );
+                        },
                     );
                     if let Err(error) = handoff_http_refine_write(write_result, || {
                         let root = data_root(&app)?;
@@ -2718,6 +2730,151 @@ fn get_note(app: AppHandle, id: String) -> Result<store::Note, String> {
 /// （Msg::RefineRequest 裁决，文案逐字不变）；通过则内核置 Running 并以 DoSpawnRefine
 /// 调回 spawn_refine——手动重跑时 m4a 早已在盘上（首次 Aing 已经移交过转码），故
 /// enqueue_transcode 恒 false，不再重复入队。
+/// Aing 逐块进度事件(界面画「精修中 3/8 · 约剩 4 分」)。avg_chunk_ms 后端算,
+/// 前端只乘剩余块数;total=0 表示不可分块的阶段。best-effort,发失败不影响流水线。
+#[derive(Clone, serde::Serialize)]
+struct AingProgress {
+    note_id: String,
+    stage: String, // "llm" | "llm_retry"
+    done: u32,
+    total: u32,
+    avg_chunk_ms: u64,
+}
+
+/// 只重试 Aing 失败的段落(不重发已成功的块,token 不重花;2026-08-20 设计)。
+/// 与整篇 Aing 同一套 lifecycle 契约:RefineProgress(all,running) 注册(编辑被拒、
+/// 前端 aiState=running)→ 逐块心跳 → all/done|failed → RefineFinished。
+/// 仅 HTTP 执行体(Agent 不分块,没有失败列表);只补文本润色,不补实体/关系(设计取舍)。
+#[tauri::command]
+async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
+    store::validate_note_id(&id).map_err(|e| e.to_string())?;
+    if let Some((rid, _)) = app.state::<AppState>().retranscribing.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if rid == id {
+            return Err(tr!("该笔记正在重转写中", "This note is being re-transcribed"));
+        }
+    }
+    let lc = app.state::<lifecycle::LifecycleHandle>().inner().clone();
+    if lc.is_refining(&id) {
+        return Err(tr!("该笔记正在 Aing 中", "This note is being refined"));
+    }
+    let s = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d))
+        .map_err(|e| e.to_string())?;
+    let Some(settings::ResolvedExecutor::Http { base_url, model, api_key }) = active_refine_executor(&s) else {
+        return Err(tr!(
+            "当前执行体不支持部分重试(仅 HTTP)",
+            "Partial retry needs the HTTP executor"
+        ));
+    };
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    // 失败列表先验(不注册就能拒绝的错误尽早拒):空/缺失 = 旧产物或无失败。
+    {
+        let doc = store::load_refined(&dir)
+            .ok_or_else(|| tr!("该笔记尚无修订稿", "This note has no refined doc yet"))?;
+        if doc.llm_failed_paragraphs.is_empty() {
+            return Err(tr!("没有待重试的失败段落", "No failed paragraphs to retry"));
+        }
+    }
+    let note_id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = |stage: &str, state: &str| {
+            lc.report(lifecycle::machine::Msg::RefineProgress {
+                note_id: note_id.clone(),
+                stage: stage.into(),
+                state: state.into(),
+            });
+        };
+        report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
+        let run = || -> anyhow::Result<()> {
+            let doc = store::load_refined(&dir)
+                .ok_or_else(|| anyhow::anyhow!("修订稿加载失败"))?;
+            // 越界防御性剔除(理论上只有整写后才会,而整写清列表)。
+            let mut failed: Vec<usize> = doc
+                .llm_failed_paragraphs
+                .iter()
+                .copied()
+                .filter(|&i| i < doc.paragraphs.len())
+                .collect();
+            failed.sort_unstable();
+            failed.dedup();
+            anyhow::ensure!(!failed.is_empty(), "没有待重试的失败段落");
+            let old_texts: Vec<String> =
+                failed.iter().map(|&i| doc.paragraphs[i].text.clone()).collect();
+            let mut subset: Vec<store::RefinedParagraph> =
+                failed.iter().map(|&i| doc.paragraphs[i].clone()).collect();
+            let cfg = refine::llm::LlmConfig {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                api_key: api_key.clone(),
+            };
+            let log_ctx = data_root(&app)
+                .ok()
+                .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+            let (outcome, _ents, _rels) = refine::llm::polish(
+                &cfg,
+                &mut subset,
+                log_ctx.as_ref(),
+                // 取舍(设计明说):补跑块以空术语表起步;实体/关系不补。
+                &|done, total, avg_ms| {
+                    report("llm", "running");
+                    let _ = app.emit(
+                        "aing_progress",
+                        AingProgress {
+                            note_id: note_id.clone(),
+                            stage: "llm_retry".into(),
+                            done: done as u32,
+                            total: total as u32,
+                            avg_chunk_ms: avg_ms,
+                        },
+                    );
+                },
+            );
+            // 子集内仍失败的位置 → 原下标。
+            let still_failed_pos: std::collections::BTreeSet<usize> = match outcome {
+                refine::llm::LlmOutcome::Partial(v) => v.into_iter().collect(),
+                refine::llm::LlmOutcome::Failed => (0..subset.len()).collect(),
+                _ => Default::default(),
+            };
+            store::update_refined_for_retry(&dir, |doc| {
+                let mut remaining: Vec<usize> = Vec::new();
+                for (pos, &idx) in failed.iter().enumerate() {
+                    if still_failed_pos.contains(&pos) {
+                        remaining.push(idx);
+                        continue;
+                    }
+                    match doc.paragraphs.get_mut(idx) {
+                        // 逐段 CAS:注册前的在途保存可能已改过文本——改过就尊重用户,
+                        // 该段按仍失败保留(不覆盖、不谎称已修)。
+                        Some(p) if p.text == old_texts[pos] => p.text = subset[pos].text.clone(),
+                        Some(_) => {
+                            eprintln!("部分重试({note_id}):段 {idx} 文本已被编辑,跳过写回");
+                            remaining.push(idx);
+                        }
+                        None => eprintln!("部分重试({note_id}):段 {idx} 已不存在,移出列表"),
+                    }
+                }
+                remaining.sort_unstable();
+                remaining.dedup();
+                doc.stages.llm = if remaining.is_empty() { "done".into() } else { "partial".into() };
+                doc.llm_failed_paragraphs = remaining;
+                Ok(())
+            })?;
+            Ok(())
+        };
+        match run() {
+            Ok(()) => report("all", "done"),
+            Err(e) => {
+                eprintln!("部分重试失败({note_id}): {e}");
+                report("all", "failed");
+            }
+        }
+        lc.report(lifecycle::machine::Msg::RefineFinished { note_id: note_id.clone() });
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn refine_note(app: AppHandle, id: String) -> Result<(), String> {
     // 重转写中该笔记拒绝 Aing:重转写持 NoteLock,refine 的 run_local 提交时也会
@@ -8092,6 +8249,7 @@ pub fn run() {
             list_notes,
             get_note,
             refine_note,
+            retry_failed_refine,
             identify_note,
             calendar_permission,
             request_calendar_permission,

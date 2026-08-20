@@ -21,6 +21,7 @@ pub use notes::NoteStore;
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::load_refined_for_display; // 纯展示面(笔记页/导出)专用:额外套跨轨时基投影,绝不可用于任何会写回的路径。
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
+pub use refined::update_refined_for_retry;
 pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker, unassign_refined_person_if}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
 pub use refined::{save_refined_paragraphs, ParagraphPayload}; // 笔记页 WYSIWYG 整篇保存(lib.rs 命令层消费)。
 pub use refined::{

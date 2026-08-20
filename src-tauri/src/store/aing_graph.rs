@@ -691,6 +691,7 @@ mod tests {
 
     fn validator_doc() -> RefinedDoc {
         RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: 2,
             generated_at: "2026-07-21T00:00:00Z".into(),
             llm_model: None,

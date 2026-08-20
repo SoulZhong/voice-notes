@@ -1033,6 +1033,7 @@ mod tests {
 
     fn doc_with(paragraphs: Vec<RefinedParagraph>) -> RefinedDoc {
         RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,

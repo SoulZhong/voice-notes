@@ -251,6 +251,7 @@ mod tests {
         // 用生产写入口造一份合法 aing.json(revision=3)
         let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
         let mut doc = crate::store::refined::RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(), llm_model: None,
             stages: crate::store::refined::RefineStages {
