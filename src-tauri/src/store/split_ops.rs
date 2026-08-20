@@ -1,0 +1,107 @@
+//! 打标/拆分操作的阶段机(落盘)。
+//!
+//! 打标横跨四种资源(speakers.json、声纹库、样本文件、段落归属),中间任何一步崩溃
+//! 都留下从外部判不出来的中间态——阶段必须落盘,不能靠盘面推断(教训见
+//! merge_journal 的 undo_phase;设计:2026-08-20-mixed-speaker-split-design.md)。
+//!
+//! quarantine_only:  plan → marked → samples_handled → residual_decided → released → done
+//! (split_commit 的扩展阶段在 D 期加入。)
+//!
+//! `plan` 先于一切副作用落盘;`marked` 停留是合法驻留态(打标即止血,清理与解除
+//! 由用户在 UI 里推进,不自动续跑)。并发:读写都要求已持 vp_guard(op 文件与声纹库
+//! 同根、同锁——阶段推进总是伴随库变更,分锁必竞态)。
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub mod phase {
+    pub const PLAN: &str = "plan";
+    pub const MARKED: &str = "marked";
+    pub const SAMPLES_HANDLED: &str = "samples_handled";
+    pub const RESIDUAL_DECIDED: &str = "residual_decided";
+    pub const RELEASED: &str = "released";
+    pub const DONE: &str = "done";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitOp {
+    pub op_id: String,
+    /// "quarantine_only"(D 期加 "split_commit")。
+    pub mode: String,
+    pub note_id: String,
+    /// 被打标的原始稿说话人(S 编号)。标记以 S 为单位:修订稿的 R 是重聚类产物,
+    /// 没有可挂标记的存储位;UI 从 R 映射回其 source_seqs 涉及的 S 让用户勾选。
+    pub speaker_ids: Vec<String>,
+    /// 受影响的库人物(resolve 后):speakers.json 的关联 + 质心贡献 receipt 的归属。
+    pub affected_persons: Vec<String>,
+    pub phase: String,
+    #[serde(default)]
+    pub residual_choice: Option<String>, // accept | baseline
+    /// 用户确认已看到「历史样本无法归因到本篇」的信息缺口(诚实呈现的落盘证据)。
+    #[serde(default)]
+    pub samples_confirm_seen: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn ops_dir(root: &Path) -> PathBuf {
+    root.join("split_ops")
+}
+
+fn op_path(root: &Path, op_id: &str) -> Option<PathBuf> {
+    // op_id 由我们生成(so-<pid>-<n>),仍校验字符集防路径逃逸。
+    if op_id.is_empty() || !op_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(ops_dir(root).join(format!("{op_id}.json")))
+}
+
+/// 原子写。调用方须已持 vp_guard。
+pub fn save(root: &Path, op: &SplitOp) -> anyhow::Result<()> {
+    let path = op_path(root, &op.op_id).ok_or_else(|| anyhow::anyhow!("非法 op id: {}", op.op_id))?;
+    std::fs::create_dir_all(path.parent().expect("恒有父目录"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(op)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn load(root: &Path, op_id: &str) -> anyhow::Result<SplitOp> {
+    let path = op_path(root, op_id).ok_or_else(|| anyhow::anyhow!("非法 op id: {op_id}"))?;
+    let s = std::fs::read_to_string(&path).map_err(|_| anyhow::anyhow!("打标操作不存在: {op_id}"))?;
+    Ok(serde_json::from_str(&s)?)
+}
+
+/// 某笔记的全部未完成操作(phase != done),UI 恢复入口用。损坏条目跳过。
+pub fn open_ops_for_note(root: &Path, note_id: &str) -> Vec<SplitOp> {
+    let Ok(rd) = std::fs::read_dir(ops_dir(root)) else { return Vec::new() };
+    let mut out: Vec<SplitOp> = rd
+        .flatten()
+        .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+        .filter_map(|s| serde_json::from_str::<SplitOp>(&s).ok())
+        .filter(|o| o.note_id == note_id && o.phase != phase::DONE)
+        .collect();
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out
+}
+
+/// 带锁推进(命令层便捷入口)。
+pub fn advance_guarded(
+    store: &super::VoiceprintStore,
+    root: &Path,
+    op_id: &str,
+    to: &str,
+    now: &str,
+) -> anyhow::Result<SplitOp> {
+    store.with_guard(|| advance(root, op_id, to, now))
+}
+
+/// 推进阶段并落盘。**该阶段真正做完之后才调**(先做后记:没记上就重做,重做幂等;
+/// 反过来"先记后做"崩在中间会跳过没做完的步骤,留下判不出来的中间态)。
+pub fn advance(root: &Path, op_id: &str, to: &str, now: &str) -> anyhow::Result<SplitOp> {
+    let mut op = load(root, op_id)?;
+    op.phase = to.to_string();
+    op.updated_at = now.to_string();
+    save(root, &op)?;
+    Ok(op)
+}

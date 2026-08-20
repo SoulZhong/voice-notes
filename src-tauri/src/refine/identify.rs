@@ -734,6 +734,47 @@ pub struct IdentifyAssignment {
     pub decided_at: Option<String>,
 }
 
+/// 打标(多人混杂)时作废相关建议:被标簇的段落所在的簇、或指向受影响人物的
+/// 未决建议全部记入 rejected 表(跨代不复活)。不失效的话,打标**前**生成的旧建议
+/// 在打标**后**仍可被应用,把混杂段重新灌回库(设计消费面,codex 设计轮一 P1⑥)。
+/// `members`:当前修订稿的 R → 成员 seq 集(调用方从 RefinedDoc 算;无修订稿传空,
+/// 此时只按人物匹配)。返回作废条数。
+pub fn invalidate_for_marking(
+    note_dir: &Path,
+    affected_persons: &std::collections::BTreeSet<String>,
+    marked_seqs: &std::collections::BTreeSet<u64>,
+    members: &BTreeMap<String, std::collections::BTreeSet<u64>>,
+    now: &str,
+) -> usize {
+    let Some(mut doc) = load_identify(note_dir) else { return 0 };
+    let hits: Vec<String> = doc
+        .assignments
+        .iter()
+        .filter(|a| a.status == "suggested" || a.status == "auto_applied")
+        .filter(|a| {
+            let person_hit =
+                a.person_id.as_deref().is_some_and(|p| affected_persons.contains(p));
+            let seq_hit = members
+                .get(&a.cluster)
+                .is_some_and(|m| m.intersection(marked_seqs).next().is_some());
+            person_hit || seq_hit
+        })
+        .map(|a| a.fingerprint.clone())
+        .collect();
+    for fp in &hits {
+        if let Err(e) = mark_rejected(&mut doc, fp, now) {
+            eprintln!("identify 建议作废失败({fp},继续其余): {e}");
+        }
+    }
+    if !hits.is_empty() {
+        if let Err(e) = save_identify(note_dir, &doc) {
+            eprintln!("identify 建议作废落盘失败(旧建议可能残留): {e}");
+            return 0;
+        }
+    }
+    hits.len()
+}
+
 pub fn rejected_key(fingerprint: &str, target_key: &str) -> String {
     format!("{fingerprint}|{target_key}")
 }

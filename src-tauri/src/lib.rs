@@ -3714,6 +3714,289 @@ fn clear_note_speaker_person(
     Ok(())
 }
 
+// ── 多人混杂:打标(quarantine_only)四命令。设计:2026-08-20-mixed-speaker-split-design.md ──
+
+#[derive(serde::Serialize)]
+struct MultiImpactPerson {
+    person_id: String,
+    name: String,
+    /// 该簇对此人的 count 贡献(质心贡献 receipt 汇总)。**估算**,不是账目。
+    cluster_count_est: u64,
+    /// 此人主质心的累计 count(各信道求和),做占比分母。
+    person_count_total: u64,
+    /// 是否存在与该场入库同刻的会话质心。措辞只能是"该场存在",不能说"来自被标簇"
+    /// (同场干净簇也可能写入,系统分不出来)。
+    has_session_centroid: bool,
+    total_ms: u64,
+    last_seen: String,
+    samples: Vec<MultiImpactSample>,
+}
+
+#[derive(serde::Serialize)]
+struct MultiImpactSample {
+    /// 相对声纹根的路径(voiceprints/P15-2.wav)。
+    path: String,
+    /// 有溯源且来自本篇被标簇 → 可自动删;false = 「来源未知」,只能试听勾删。
+    from_marked_cluster: bool,
+}
+
+#[derive(serde::Serialize)]
+struct MultiImpactReport {
+    op_id: String,
+    phase: String,
+    persons: Vec<MultiImpactPerson>,
+}
+
+/// 打「多人混杂」标。speaker_ids 是原始稿 S 编号(修订稿 R 没有存储位,UI 先映射)。
+/// 顺序:plan 落盘 → 库侧隔离 → 笔记侧标记(actor/NoteLock)→ 作废旧 identify 建议
+/// → marked。先库后笔记:反了的话两写之间崩溃,笔记显示"已标记"而库人物还在当种子。
+#[tauri::command]
+fn mark_speaker_multi(
+    app: AppHandle,
+    note_id: String,
+    speaker_ids: Vec<String>,
+) -> Result<String, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    if speaker_ids.is_empty() {
+        return Err(tr!("没有选择说话人", "No speaker selected"));
+    }
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(nroot.clone()).load(&note_id).map_err(|e| e.to_string())?;
+    for sid in &speaker_ids {
+        if !note.speakers.contains_key(sid) {
+            return Err(tr!("笔记中没有该说话人: {sid}", "No such speaker in this note: {sid}", sid = sid));
+        }
+    }
+    let vp_store = store::VoiceprintStore::new(root.clone());
+    let vp = vp_store.load();
+    // 受影响人物 = 关联 + 质心贡献 receipt 的归属,都经当前 redirects 归一。
+    let mut affected: std::collections::BTreeSet<String> = Default::default();
+    for sid in &speaker_ids {
+        if let Some(pid) = note.speakers.get(sid).and_then(|m| m.person_id.as_deref()) {
+            if let Some(r) = store::VoiceprintStore::resolve(&vp, pid) {
+                affected.insert(r.to_string());
+            }
+        }
+    }
+    for r in store::sample_trace::read_centroid_receipts(&root) {
+        if r.note_id == note_id && speaker_ids.iter().any(|s| s == &r.cluster_id) {
+            if let Some(p) = store::VoiceprintStore::resolve(&vp, &r.resolved_person) {
+                affected.insert(p.to_string());
+            }
+        }
+    }
+    let now = chrono::Local::now().to_rfc3339();
+    static SPLIT_OP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let op = store::split_ops::SplitOp {
+        op_id: format!(
+            "so-{}-{}",
+            std::process::id(),
+            SPLIT_OP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        mode: "quarantine_only".into(),
+        note_id: note_id.clone(),
+        speaker_ids: speaker_ids.clone(),
+        affected_persons: affected.iter().cloned().collect(),
+        phase: store::split_ops::phase::PLAN.into(),
+        residual_choice: None,
+        samples_confirm_seen: false,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    // plan 先于一切副作用落盘。
+    vp_store.with_guard(|| store::split_ops::save(&root, &op)).map_err(|e| e.to_string())?;
+    // ① 库侧隔离。
+    vp_store.quarantine_persons(&op.affected_persons, true).map_err(|e| e.to_string())?;
+    // ② 笔记侧标记(actor 持 NoteLock 串行落盘;附带清 person_id)。
+    let lc = app.state::<lifecycle::LifecycleHandle>();
+    for sid in &speaker_ids {
+        lc.request(lifecycle::machine::Msg::EditNote {
+            op: lifecycle::machine::EditOp::SetMultiSpeaker {
+                id: note_id.clone(),
+                speaker_id: sid.clone(),
+            },
+        })?;
+    }
+    // ③ 作废旧 identify 建议(被标段所在簇 + 指向受影响人物的)。
+    let marked_seqs: std::collections::BTreeSet<u64> = note
+        .segments
+        .iter()
+        .filter(|s| s.speaker.as_deref().is_some_and(|sp| speaker_ids.iter().any(|x| x == sp)))
+        .map(|s| s.seq)
+        .collect();
+    let dir = nroot.join(&note_id);
+    let members = store::load_refined(&dir)
+        .map(|doc| refine::identify::cluster_members_from_doc(&doc))
+        .unwrap_or_default();
+    let n = refine::identify::invalidate_for_marking(&dir, &affected, &marked_seqs, &members, &now);
+    if n > 0 {
+        eprintln!("打标({note_id}):作废 {n} 条 identify 旧建议");
+    }
+    store::split_ops::advance_guarded(&vp_store, &root, &op.op_id, store::split_ops::phase::MARKED, &now)
+        .map_err(|e| e.to_string())?;
+    Ok(op.op_id)
+}
+
+/// 打标影响面(供确认面板):每个受影响人物的 count 占比估算、会话质心存在性、
+/// 元数据残留、样本清单(标注哪些可归因)。纯读。
+#[tauri::command]
+fn multi_impact(app: AppHandle, op_id: String) -> Result<MultiImpactReport, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    let vp = store::VoiceprintStore::new(root.clone()).load();
+    let receipts = store::sample_trace::read_centroid_receipts(&root);
+    let trace = store::sample_trace::load(&root);
+    let mut persons = Vec::new();
+    for pid in &op.affected_persons {
+        let Some(p) = vp.people.get(pid) else { continue };
+        let mine: Vec<_> = receipts
+            .iter()
+            .filter(|r| {
+                r.note_id == op.note_id
+                    && op.speaker_ids.iter().any(|s| s == &r.cluster_id)
+                    && store::VoiceprintStore::resolve(&vp, &r.resolved_person).is_some_and(|x| x == pid.as_str())
+            })
+            .collect();
+        let cluster_count_est: u64 = mine.iter().map(|r| r.count).sum();
+        let ats: std::collections::BTreeSet<&str> = mine.iter().map(|r| r.at.as_str()).collect();
+        let has_session_centroid = p
+            .session_centroids
+            .values()
+            .flatten()
+            .any(|c| ats.contains(c.seen.as_str()));
+        let store_h = store::VoiceprintStore::new(root.clone());
+        let samples = store_h
+            .sample_paths_existing(pid)
+            .iter()
+            .map(|abs| {
+                let rel = abs.strip_prefix(&root).unwrap_or(abs).to_string_lossy().into_owned();
+                let from_marked = trace.receipts.iter().any(|r| {
+                    r.path == rel
+                        && r.note_id == op.note_id
+                        && op.speaker_ids.iter().any(|s| s == &r.cluster_id)
+                });
+                MultiImpactSample { path: rel, from_marked_cluster: from_marked }
+            })
+            .collect();
+        persons.push(MultiImpactPerson {
+            person_id: pid.clone(),
+            name: p.name.clone(),
+            cluster_count_est,
+            person_count_total: p.centroids.values().map(|c| c.count).sum(),
+            has_session_centroid,
+            total_ms: p.total_ms,
+            last_seen: p.last_seen.clone(),
+            samples,
+        });
+    }
+    Ok(MultiImpactReport { op_id: op.op_id, phase: op.phase, persons })
+}
+
+/// 样本处置:自动删可归因的(receipt 校验 path+hash),用户勾选的额外删除逐份
+/// hash 封禁后删。confirm_seen 落盘为"用户已确认看到信息缺口"。
+#[tauri::command]
+fn confirm_multi_samples(
+    app: AppHandle,
+    op_id: String,
+    extra_delete: Vec<String>,
+    confirm_seen: bool,
+) -> Result<u32, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if op.phase != store::split_ops::phase::MARKED
+        && op.phase != store::split_ops::phase::SAMPLES_HANDLED
+    {
+        return Err(tr!("当前阶段不能处置样本: {p}", "Cannot handle samples in phase {p}", p = &op.phase));
+    }
+    let vp_store = store::VoiceprintStore::new(root.clone());
+    let deleted = vp_store
+        .purge_marked_samples(&op, &extra_delete)
+        .map_err(|e| e.to_string())?;
+    let now = chrono::Local::now().to_rfc3339();
+    vp_store
+        .with_guard(|| {
+            let mut o = store::split_ops::load(&root, &op_id)?;
+            o.phase = store::split_ops::phase::SAMPLES_HANDLED.into();
+            o.samples_confirm_seen = confirm_seen;
+            o.updated_at = now.clone();
+            store::split_ops::save(&root, &o)
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(deleted)
+}
+
+/// 残留二选一并收尾:accept = 质心不动;baseline = 逐人重算(退回样本基线)。
+/// 两者都以解除隔离(released)+ done 结束。
+#[tauri::command]
+async fn resolve_multi_residual(
+    app: AppHandle,
+    op_id: String,
+    choice: String,
+) -> Result<(), String> {
+    if choice != "accept" && choice != "baseline" {
+        return Err(tr!("未知选项: {choice}", "Unknown choice: {choice}", choice = &choice));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        if op.phase != store::split_ops::phase::SAMPLES_HANDLED
+            && op.phase != store::split_ops::phase::RESIDUAL_DECIDED
+        {
+            return Err(tr!("先完成样本处置(当前阶段: {p})", "Handle samples first (phase: {p})", p = &op.phase));
+        }
+        let vp_store = store::VoiceprintStore::new(root.clone());
+        let now = chrono::Local::now().to_rfc3339();
+        if choice == "baseline" && op.phase != store::split_ops::phase::RESIDUAL_DECIDED {
+            // 与全库重建共用单飞门:重算与全库 rebuild 交错会互相覆盖。
+            use std::sync::atomic::Ordering;
+            if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+                return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+            }
+            let r = (|| -> Result<(), String> {
+                let tag = current_speaker_model(&app);
+                let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+                    .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+                for pid in &op.affected_persons {
+                    vp_store
+                        .rebuild_person_from_samples(pid, &mut e, &tag)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })();
+            REBUILD_RUNNING.store(false, Ordering::SeqCst);
+            r?;
+        }
+        vp_store
+            .with_guard(|| {
+                let mut o = store::split_ops::load(&root, &op_id)?;
+                o.residual_choice = Some(choice.clone());
+                o.phase = store::split_ops::phase::RESIDUAL_DECIDED.into();
+                o.updated_at = now.clone();
+                store::split_ops::save(&root, &o)
+            })
+            .map_err(|e| e.to_string())?;
+        // 解除隔离 → released → done。
+        vp_store.quarantine_persons(&op.affected_persons, false).map_err(|e| e.to_string())?;
+        store::split_ops::advance_guarded(&vp_store, &root, &op_id, store::split_ops::phase::RELEASED, &now)
+            .map_err(|e| e.to_string())?;
+        store::split_ops::advance_guarded(&vp_store, &root, &op_id, store::split_ops::phase::DONE, &now)
+            .map_err(|e| e.to_string())?;
+        refresh_qwen_hotwords_cache(&app);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 某笔记的未完成打标操作(UI 恢复入口)。纯读。
+#[tauri::command]
+fn list_split_ops(app: AppHandle, note_id: String) -> Result<Vec<store::split_ops::SplitOp>, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(store::split_ops::open_ops_for_note(&root, &note_id))
+}
+
 /// 按当前选型重建声纹库:拿每个人存下的录音样本用新模型重新算质心,并把库标签
 /// 改写成新选型。**这是模型切换之后声纹识别能恢复的唯一途径**。
 ///
@@ -8211,6 +8494,11 @@ pub fn run() {
             delete_person_sample,
             suggest_person_merges,
             apply_confident_merges,
+            mark_speaker_multi,
+            multi_impact,
+            confirm_multi_samples,
+            resolve_multi_residual,
+            list_split_ops,
             undo_merge,
             restore_merged_person,
             acknowledge_merge,

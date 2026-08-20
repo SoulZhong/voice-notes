@@ -227,6 +227,13 @@ pub fn append_centroid_receipts(root: &Path, rows: &[CentroidReceipt]) {
     }
 }
 
+/// 全量读质心贡献 receipt(诊断/打标影响面用)。损坏行跳过。
+pub fn read_centroid_receipts(root: &Path) -> Vec<CentroidReceipt> {
+    std::fs::read_to_string(root.join("centroid_receipts.jsonl"))
+        .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default()
+}
+
 pub fn vec_hash(v: &[f32]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

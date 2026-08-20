@@ -138,6 +138,8 @@ pub enum EditOp {
     EditText { id: String, seq: u64, expected_text: String, new_text: String },
     DeleteSegment { id: String, seq: u64, expected_text: String },
     SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },
+    /// 打「多人混杂」标(附带清 person_id)。库侧隔离由命令层先行,见 mark_speaker_multi。
+    SetMultiSpeaker { id: String, speaker_id: String },
 }
 
 /// Msg 不再 derive Clone/PartialEq/Debug:`AdoptWriter` 携带 `Box<NoteWriter>`,

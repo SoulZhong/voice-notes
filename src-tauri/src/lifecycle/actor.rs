@@ -164,6 +164,9 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
         EditOp::ClearPerson { id, speaker_id } => {
             store.clear_speaker_person(&id, &speaker_id).map_err(|e| e.to_string())
         }
+        EditOp::SetMultiSpeaker { id, speaker_id } => {
+            store.set_multi_speaker(&id, &speaker_id).map_err(|e| e.to_string())
+        }
         EditOp::EditText { id, seq, expected_text, new_text } => store
             .edit_segment_text(&id, seq, &expected_text, &new_text)
             .map_err(|e| e.to_string()),

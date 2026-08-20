@@ -310,6 +310,24 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// 打「多人混杂」标(打标流程的笔记侧半步)。置位同时清掉 person_id:一个混杂簇
+    /// 挂着单人关联本身就是错的,留着会继续把段落显示成那个人。幂等。
+    pub fn set_multi_speaker(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        if meta.multi_speaker && meta.person_id.is_none() {
+            return Ok(());
+        }
+        meta.multi_speaker = true;
+        meta.person_id = None;
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 改段落文本。空文本拒绝（如需去段请用 delete_segment）。
     pub fn edit_segment_text(
         &self,
