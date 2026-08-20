@@ -4946,18 +4946,23 @@ fn spawn_voiceprint_rebuild(
     let app2 = app.clone();
     let cache2 = cache.clone();
     std::thread::spawn(move || {
-        // RAII 复位:中途 return 或 panic 都不能把单飞标志永久卡住,否则此后
-        // 任何入口都再也发不起重建——那正是本次要修的"永久降级"的另一种形态。
-        struct Reset;
+        // RAII 复位**只兜 panic**(armed 模式):正常路径的 RUNNING 交接必须在
+        // REBUILD_CTL 内完成。此前 drop 无条件在锁外清 RUNNING,新请求可在
+        // "drop 清完 → 本线程进锁"之间成为新 runner,本线程随后在锁内再清一次,
+        // 把新 runner 的单飞标志掀了——重建并发跑、新标记被误删(codex 轮八/九 P1)。
+        struct Reset {
+            armed: bool,
+        }
         impl Drop for Reset {
             fn drop(&mut self) {
-                REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                if self.armed {
+                    let _ctl = REBUILD_CTL.lock().unwrap_or_else(|e| e.into_inner());
+                    REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
-        let ok = {
-            let _reset = Reset;
-            rebuild_once(&app2, cache, reason)
-        };
+        let mut reset = Reset { armed: true };
+        let ok = rebuild_once(&app2, cache, reason);
         // 收尾:**只因"期间来过新请求"重跑**,不看库标签是否仍不一致。
         // 曾经也检查过标签(想顺手兜住"跑完发现又被切了"),但那会在永久失败时变成
         // 无界循环:模型文件缺失/保存失败 → 标签永远对不上 → 每轮结束立刻再起一轮,
@@ -4969,6 +4974,7 @@ fn spawn_voiceprint_rebuild(
         // (spawn_voiceprint_rebuild 自己要取 CTL,不可重入)。
         let respawn = {
             let _ctl = REBUILD_CTL.lock().unwrap();
+            reset.armed = false; // 正常路径:交接在此完成,panic 兜底解除武装
             REBUILD_RUNNING.store(false, Ordering::SeqCst);
             if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
                 true
