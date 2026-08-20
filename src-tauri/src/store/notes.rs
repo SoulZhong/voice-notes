@@ -476,8 +476,15 @@ impl NoteStore {
         let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
         let mut speakers = read_speakers(&dir);
         for (_, _, new_sp) in moves {
-            if !speakers.contains_key(new_sp) {
-                anyhow::bail!("目标说话人不存在: {new_sp}(拆分不现场分配编号)");
+            match speakers.get(new_sp) {
+                None => anyhow::bail!("目标说话人不存在: {new_sp}(拆分不现场分配编号)"),
+                Some(m) => {
+                    // 别的 op 的预留号不许写:两个拆分共用同一私有号会互相覆盖关联
+                    // (codex 实现轮二 P1⑥)。
+                    if let Some(owner) = m.reserved_by.as_deref() {
+                        anyhow::ensure!(owner == op_id, "目标 {new_sp} 是另一次拆分的预留号");
+                    }
+                }
             }
         }
         // 全量 CAS 先行,一段不符全量拒绝。**cur==new 视为已完成**(幂等):上次改派

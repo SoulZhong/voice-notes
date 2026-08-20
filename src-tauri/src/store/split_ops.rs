@@ -84,6 +84,27 @@ fn op_path(root: &Path, op_id: &str) -> Option<PathBuf> {
     Some(ops_dir(root).join(format!("{op_id}.json")))
 }
 
+/// 新建(防覆盖):op 文件已存在即失败——op_id 含时间戳+pid+计数,理论不撞,
+/// 这里是最后一道闸(codex 实现轮二 P1⑦)。调用方须已持 vp_guard。
+pub fn create(root: &Path, op: &SplitOp) -> anyhow::Result<()> {
+    let path = op_path(root, &op.op_id).ok_or_else(|| anyhow::anyhow!("非法 op id: {}", op.op_id))?;
+    anyhow::ensure!(!path.exists(), "op id 撞了: {}", op.op_id);
+    save(root, op)
+}
+
+/// 该 op 当前是否仍「持有」其人物的隔离(解除判定用)。正在收尾/取消中的不算持有——
+/// 否则两个重叠 op 各自看到对方未关单,互相跳过解除,全部完成后人物永久隔离
+/// (codex 实现轮二 P1③)。
+pub fn holds_quarantine(op: &SplitOp) -> bool {
+    !matches!(
+        op.phase.as_str(),
+        p if p == phase::DONE
+            || p == phase::CANCELLED
+            || p == phase::RELEASED
+            || p == phase::CANCEL_REQUESTED
+    )
+}
+
 /// 原子写。调用方须已持 vp_guard。
 pub fn save(root: &Path, op: &SplitOp) -> anyhow::Result<()> {
     let path = op_path(root, &op.op_id).ok_or_else(|| anyhow::anyhow!("非法 op id: {}", op.op_id))?;
