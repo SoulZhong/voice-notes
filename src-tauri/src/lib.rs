@@ -4905,18 +4905,27 @@ fn clear_rebuild_marker(app: &AppHandle) {
     }
 }
 
+/// 重建调度的控制互斥:RUNNING/PENDING 的交接与落盘标记的写/清必须在同一把锁下。
+/// 没有它,旧 runner 在"清 RUNNING → 查 PENDING → 清标记"的窗口里,会把**新请求
+/// 刚写下的标记**当成自己的诉求删掉——进程随后退出,轮六要修的丢失原样回来
+/// (codex 混杂实现轮七 P1)。锁内只做标志与文件操作,微秒级,不持锁做重活。
+static REBUILD_CTL: Mutex<()> = Mutex::new(());
+
 fn spawn_voiceprint_rebuild(
     app: &AppHandle,
     cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
 ) {
     use std::sync::atomic::Ordering;
-    // 先落盘再排队/起线程:反过来的话"内存标志置了、标记没写、进程退出"仍然丢请求。
-    set_rebuild_marker(app, reason);
-    if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
-        REBUILD_PENDING.store(true, Ordering::SeqCst);
-        eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
-        return;
+    {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        // 先落盘再排队/起线程:反过来的话"内存标志置了、标记没写、进程退出"仍丢请求。
+        set_rebuild_marker(app, reason);
+        if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+            REBUILD_PENDING.store(true, Ordering::SeqCst);
+            eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
+            return;
+        }
     }
     let app2 = app.clone();
     let cache2 = cache.clone();
@@ -4939,11 +4948,24 @@ fn spawn_voiceprint_rebuild(
         // 无退避、无上限,日志与遥测一起刷屏(codex review 三轮 P1#1)。
         // 真正的切换必然经过 set_settings,那条路会把 PENDING 置上,不会漏。
         // 剩下的"卡住"情形由下次启动的自愈兜——一次启动最多跑一轮,天然有界。
-        if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+        //
+        // 决策在 CTL 内做(标志交接与清标记原子),重跑动作在 CTL 外发
+        // (spawn_voiceprint_rebuild 自己要取 CTL,不可重入)。
+        let respawn = {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            REBUILD_RUNNING.store(false, Ordering::SeqCst);
+            if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+                true
+            } else {
+                if ok {
+                    // 成功且无排队:诉求已兑现,清落盘标记。失败留标记,下次启动补跑。
+                    clear_rebuild_marker(&app2);
+                }
+                false
+            }
+        };
+        if respawn {
             spawn_voiceprint_rebuild(&app2, cache2, "有排队请求,重跑");
-        } else if ok {
-            // 成功且无排队:诉求已兑现,清落盘标记。失败留标记,下次启动补跑。
-            clear_rebuild_marker(&app2);
         }
     });
 }
@@ -5016,26 +5038,27 @@ fn rebuild_once(
 ///
 /// 录制中跳过:重建要现场加载嵌入器逐条嵌入样本,和录制抢 ORT 线程与 CPU;
 /// 这是自愈不是急救,等下次启动无妨。
-fn heal_voiceprint_model_mismatch(app: &AppHandle, state: &AppState) {
-    let Ok(root) = data_root(app) else { return };
+fn heal_voiceprint_model_mismatch(app: &AppHandle, state: &AppState) -> bool {
+    let Ok(root) = data_root(app) else { return false };
     let want = app
         .path()
         .app_data_dir()
         .map(|d| settings::load(&d).speaker_model)
         .unwrap_or_default();
     if want.is_empty() {
-        return;
+        return false;
     }
     let have = store::VoiceprintStore::new(root).load().embedding_model.clone();
     if have == want {
-        return;
+        return false;
     }
     if state.session.lock().map(|s| s.is_some()).unwrap_or(true) {
         eprintln!("声纹库标签({have})与当前选型({want})不一致,录制中暂不重建,下次启动再试");
-        return;
+        return false;
     }
     eprintln!("声纹库标签({have})与当前选型({want})不一致,启动自愈:开始重建");
     spawn_voiceprint_rebuild(app, state.embedder_cache.clone(), "启动自愈");
+    true
 }
 
 /// 回灌互斥门:同一时刻最多一个回灌任务在嵌入。不借用 AppState.embedder_cache
@@ -9283,10 +9306,14 @@ pub fn run() {
             }
             // 声纹库标签与当前选型不一致时主动重建一次。放在启动末尾:它要起线程加载
             // 嵌入器,不该和前面那些"必须先就位"的初始化抢时间。
-            heal_voiceprint_model_mismatch(&handle, &st);
+            // 标记快照必须在自愈**之前**取:自愈自己会写标记,后取快照必然看见它,
+            // 一次启动就固定跑两轮整库嵌入(codex 混杂实现轮七 P2)。
+            let stale_marker = rebuild_marker_path(&handle).is_some_and(|p| p.exists());
+            let healed = heal_voiceprint_model_mismatch(&handle, &st);
             // 上次退出前有没跑完的重建诉求(落盘标记还在)→ 补跑。质心清空型重建不改
-            // 库标签,上面的标签自愈兜不住它(codex 混杂实现轮六 P1)。
-            if rebuild_marker_path(&handle).is_some_and(|p| p.exists()) {
+            // 库标签,标签自愈兜不住它(codex 混杂实现轮六 P1)。自愈已发起时不必再发:
+            // 一轮全库重建覆盖同样的诉求。
+            if stale_marker && !healed {
                 eprintln!("发现未完成的重建诉求(上次退出前没跑完),补跑");
                 spawn_voiceprint_rebuild(&handle, st.embedder_cache.clone(), "启动补跑上次未完成的重建");
             }
