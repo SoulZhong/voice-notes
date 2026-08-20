@@ -1,7 +1,7 @@
 # Aing 运行可观测与失败块部分重跑 设计
 
 日期：2026-08-20
-状态：待实施
+状态：待实施(Codex 额度耗尽至 2026-09-19,经用户批准本轮跳过 Codex 评审;自查记录见「自查」节)
 分支：`aing-progress-partial-retry`（基于 master，独立于 PR #136）
 
 ## 要解决的问题
@@ -38,8 +38,12 @@
 - `polish()` 返回值扩展:携带失败块的段落下标集合(现 `Partial(usize)` 的计数语义
   由 `len()` 派生,不破坏既有匹配处)
 - 落盘时机 = 现有 `stages.llm` 写盘那一次,**不加新写点**;`Done` 时写空数组
-- 下标锚定:与 `apply_refined_texts` 同一约束模型——段落下标在"约束式写入"(只改文本、
-  结构不动)下稳定;任何整写(重新 Aing、重转写)都会重算或清空该列表
+- 下标锚定(**自查修正**,原稿假设有误):WYSIWYG 整篇保存(`save_refined_paragraphs`)
+  是可以**增删段落**的(orig_index/index_map 重排),"约束式写入下下标恒稳"不成立。
+  闭合方式:该保存闭包里 old→new 的 `index_map` 现成——**在同一次写盘里把
+  `llm_failed_paragraphs` 一并重映射**(被删的段移出列表)。其余触点核实过不改段数
+  (`apply_refined_texts` 只改文本、`sync_refined_after_split` 只改归属);整写
+  (重新 Aing/重转写)重算或清空列表。retry 侧仍保留越界防御性剔除
 
 ### ② 部分重跑
 
@@ -93,12 +97,23 @@
 - 无新增锁;写回走既有 NoteLock/约束式写入
 - 事件新增一个,无 IPC 破坏
 
+## 自查(替代本轮 Codex 设计审,2026-08-21)
+
+- a. 下标稳定性:**发现原稿假设错误**(WYSIWYG 可增删段)→ 已改为 save 内 index_map
+  同步重映射(见上)
+- b. 并发与守卫:retry 走与 refine_note 完全相同的 lifecycle 消息骨架
+  (RefineRequest 拒重入 / RefineProgress 心跳 / RefineFinished 收尾),无新锁
+- c. polish 返回值:`Partial(usize)` 改 `Partial(Vec<usize>)`(len 即旧计数),
+  调用点一处 + 测试三处,无外部消费者
+- d. 事件:照搬 relation_backfill_progress 的 struct+emit+listen 模式(含终态清理)
+
 ## 测试
 
 - polish 返回失败下标:多块混合成败 → 下标集合正确;全成 → 空
 - 部分重跑:只有失败块的段落文本变化,成功块一字不动;全清后 stages.llm=done;
   再跑一次报"没有失败段落"
 - 越界下标被防御性剔除
+- WYSIWYG 保存增/删/重排段后,失败列表随 index_map 正确重映射(删的段消失,余下指向原段)
 - 约束保持:部分重跑不改段数/说话人/时间戳(apply 同款断言)
 - 进度事件序:llm 阶段 done 单调递增至 total;avg 只在 done≥1 时非零
 - 前端:done<2 不显示 ETA(组件测试);切笔记清进度
