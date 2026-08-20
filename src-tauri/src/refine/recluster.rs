@@ -111,6 +111,92 @@ fn merge_centroid(a: &Cl, b: &Cl) -> Vec<f32> {
     normalize(&mixed).unwrap_or_else(|| a.centroid.clone())
 }
 
+/// 拆分建议的一个组:成员段(下标指向 inputs)+ 最像的库种子(去处建议)。
+pub struct SplitGroup {
+    pub member_idx: Vec<usize>,
+    pub total_ms: u64,
+    /// (person_id, name, cosine):建议去处,仅供 UI 展示,不自动应用。
+    pub suggested: Option<(String, String, f32)>,
+}
+
+/// 拆分建议:AHC 分组 + 无法判定桶。
+pub struct SplitSuggestion {
+    pub groups: Vec<SplitGroup>,
+    /// 无嵌入的段下标(过短/嵌入失败/轨道缺失):不猜,单独一桶交给人。
+    pub undetermined_idx: Vec<usize>,
+}
+
+/// 混杂簇的**拆分专用**聚类(设计:2026-08-20-mixed-speaker-split-design.md 承诺三)。
+/// 与常规 recluster 的三点差别,都是刻意的:
+/// - **不做碎片吞并**(MIN_CLUSTER_MS 不生效):混杂簇里的短发言者正是要分出来的人,
+///   常规路径会把 <8s 的簇无条件并进最近大簇,功能等于没有(codex 设计轮一 P1⑦)
+/// - 无嵌入的段**不按相邻传播**:这簇的段本来就不连续,"相邻"没有意义;统一进
+///   无法判定桶(不只 <1.5s 的,嵌入失败/轨道缺失都算,codex 设计轮三 P2②)
+/// - 种子只用来给每组标"最像谁"(建议去处),不改变分组本身
+/// 组按时长降序;singleton 折叠等展示策略在 UI 层。
+pub fn recluster_split(
+    inputs: &[SegInput],
+    embs: &[Option<Vec<f32>>],
+    seeds: &[SeedCluster],
+) -> SplitSuggestion {
+    assert_eq!(inputs.len(), embs.len());
+    let mut cls: Vec<Cl> = Vec::new();
+    let mut undetermined_idx: Vec<usize> = Vec::new();
+    for (i, e) in embs.iter().enumerate() {
+        match e.as_ref().and_then(|v| normalize(v)) {
+            Some(u) => cls.push(Cl {
+                centroid: u,
+                members: vec![i],
+                total_ms: inputs[i].end_ms.saturating_sub(inputs[i].start_ms),
+            }),
+            None => undetermined_idx.push(i),
+        }
+    }
+    // AHC(与常规同一内核同一阈值),但到此为止——没有碎片吞并、没有传播。
+    loop {
+        let mut best: Option<(usize, usize, f32)> = None;
+        for i in 0..cls.len() {
+            for j in (i + 1)..cls.len() {
+                let sim = dot(&cls[i].centroid, &cls[j].centroid);
+                if best.map_or(true, |(_, _, s)| sim > s) {
+                    best = Some((i, j, sim));
+                }
+            }
+        }
+        match best {
+            Some((i, j, sim)) if sim >= AHC_THRESHOLD => {
+                debug_assert!(i < j);
+                let b = cls.swap_remove(j);
+                let a = &mut cls[i];
+                a.centroid = merge_centroid(a, &b);
+                a.members.extend(b.members);
+                a.total_ms += b.total_ms;
+            }
+            _ => break,
+        }
+    }
+    cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
+    let groups = cls
+        .into_iter()
+        .map(|c| {
+            // 最像的种子:同一 person 多种子取 max(与 seed_clusters 的多种子语义一致)。
+            let mut best: Option<(String, String, f32)> = None;
+            for sd in seeds {
+                if let Some(u) = normalize(&sd.centroid) {
+                    let sim = dot(&c.centroid, &u);
+                    if best.as_ref().map_or(true, |(_, _, s)| sim > *s) {
+                        best = Some((sd.person.clone(), sd.name.clone(), sim));
+                    }
+                }
+            }
+            let mut member_idx = c.members;
+            member_idx.sort_unstable();
+            SplitGroup { member_idx, total_ms: c.total_ms, suggested: best }
+        })
+        .collect();
+    SplitSuggestion { groups, undetermined_idx }
+}
+
 pub fn recluster(
     inputs: &[SegInput],
     embs: &[Option<Vec<f32>>],
@@ -445,5 +531,60 @@ mod tests {
         let (pid, _, sim, adopted) = stats[0].seed.clone().unwrap();
         assert_eq!(pid, "P9");
         assert!(sim < SEED_ASSIGN_THRESHOLD && !adopted);
+    }
+
+    // ── 拆分专用聚类(recluster_split) ──
+
+    #[test]
+    fn split_keeps_short_speaker_as_own_group() {
+        // 常规 recluster 会把 <8s 的簇吞进最近大簇;拆分模式必须保住短发言者。
+        let inputs = vec![seg(0, 0, 5000), seg(1, 5000, 10_000), seg(2, 10_000, 13_000)];
+        let embs = vec![v([1.0, 0.0, 0.0], 0.01), v([1.0, 0.0, 0.0], -0.01), v([0.0, 1.0, 0.0], 0.0)];
+        let sug = recluster_split(&inputs, &embs, &[]);
+        assert_eq!(sug.groups.len(), 2, "3 秒短发言者必须独立成组");
+        assert!(sug.groups.iter().any(|g| g.member_idx == vec![2]));
+        assert!(sug.undetermined_idx.is_empty());
+    }
+
+    #[test]
+    fn split_puts_unembedded_into_undetermined_bucket() {
+        // 无嵌入(过短/失败/轨道缺失)不按相邻传播——这簇的段本来就不连续,"相邻"无意义。
+        let inputs = vec![seg(0, 0, 5000), seg(1, 5000, 6000), seg(2, 6000, 11_000)];
+        let embs = vec![v([1.0, 0.0, 0.0], 0.0), None, v([1.0, 0.0, 0.0], 0.01)];
+        let sug = recluster_split(&inputs, &embs, &[]);
+        assert_eq!(sug.undetermined_idx, vec![1]);
+        assert_eq!(sug.groups.len(), 1);
+        assert_eq!(sug.groups[0].member_idx, vec![0, 2]);
+    }
+
+    #[test]
+    fn split_survives_many_dissimilar_noise_segments() {
+        // 几十个互不相似的 2-4s 噪声段:各自成 singleton,不允许被硬上限强并,
+        // 也不允许崩(折叠是 UI 层的事)。构造两两正交夹角的稀疏向量。
+        let n = 40usize;
+        let mut inputs = Vec::new();
+        let mut embs: Vec<Option<Vec<f32>>> = Vec::new();
+        for i in 0..n {
+            inputs.push(seg(i as u64, (i as u64) * 3000, (i as u64) * 3000 + 2500));
+            let mut e = vec![0.0f32; n];
+            e[i] = 1.0;
+            embs.push(Some(e));
+        }
+        let sug = recluster_split(&inputs, &embs, &[]);
+        assert_eq!(sug.groups.len(), n, "互不相似 → 各自成组,不强并");
+    }
+
+    #[test]
+    fn split_suggests_nearest_seed_per_group() {
+        let inputs = vec![seg(0, 0, 9000)];
+        let embs = vec![v([1.0, 0.0, 0.0], 0.0)];
+        let seeds = vec![
+            SeedCluster { person: "P7".into(), name: "甲".into(), centroid: vec![0.99, 0.05, 0.0], count: 5, source: "mic".into() },
+            SeedCluster { person: "P8".into(), name: "乙".into(), centroid: vec![0.0, 1.0, 0.0], count: 5, source: "mic".into() },
+        ];
+        let sug = recluster_split(&inputs, &embs, &seeds);
+        let (pid, name, sim) = sug.groups[0].suggested.clone().expect("应有建议");
+        assert_eq!((pid.as_str(), name.as_str()), ("P7", "甲"));
+        assert!(sim > 0.9);
     }
 }

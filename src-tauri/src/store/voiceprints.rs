@@ -1271,9 +1271,32 @@ impl VoiceprintStore {
     pub fn reinforce_feedback(
         &self,
         person_id: &str,
+        stats: &[(String, Vec<f32>, u64, u64)],
+        now: &str,
+        model: &str,
+    ) -> anyhow::Result<Option<FeedbackApplied>> {
+        self.reinforce_feedback_inner(person_id, stats, now, model, false)
+    }
+
+    /// 拆分收尾的受权版:允许写入仍处隔离的目标(A 类人物被某组认领,回灌成功后才
+    /// 解除隔离——先解除再回灌的话,回灌失败会暴露空质心)。只有 commit_split 走这里。
+    pub fn reinforce_feedback_authorized(
+        &self,
+        person_id: &str,
+        stats: &[(String, Vec<f32>, u64, u64)],
+        now: &str,
+        model: &str,
+    ) -> anyhow::Result<Option<FeedbackApplied>> {
+        self.reinforce_feedback_inner(person_id, stats, now, model, true)
+    }
+
+    fn reinforce_feedback_inner(
+        &self,
+        person_id: &str,
         stats: &[(String, Vec<f32>, u64, u64)], // (source, centroid, count, total_ms)
         now: &str,
         model: &str,
+        authorized_quarantined: bool,
     ) -> anyhow::Result<Option<FeedbackApplied>> {
         let _guard = vp_guard();
         let mut vp = self.load();
@@ -1288,7 +1311,7 @@ impl VoiceprintStore {
             anyhow::bail!("未知人物: {person_id}");
         };
         let person = vp.people.get_mut(&resolved).expect("resolve 已校验存在");
-        if person.voiceprint_quarantined {
+        if person.voiceprint_quarantined && !authorized_quarantined {
             // 与空间不符同一处置:返回 None,调用方会清掉占位账(不能 bail——bail 会
             // 跳过清理,complete=false 的占位条目把这个 scope 永久封死)。
             eprintln!("回灌丢弃:{resolved} 正被隔离(多人混杂待处置),不接收贡献");
@@ -3990,6 +4013,7 @@ mod tests {
             phase: crate::store::split_ops::phase::MARKED.into(),
             residual_choice: None,
             samples_confirm_seen: false,
+        plan_groups: Vec::new(),
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -4020,6 +4044,7 @@ mod tests {
             phase: crate::store::split_ops::phase::PLAN.into(),
             residual_choice: None,
             samples_confirm_seen: false,
+        plan_groups: Vec::new(),
             created_at: "t0".into(),
             updated_at: "t0".into(),
         };

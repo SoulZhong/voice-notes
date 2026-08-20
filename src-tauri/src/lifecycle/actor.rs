@@ -167,6 +167,16 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
         EditOp::SetMultiSpeaker { id, speaker_id } => {
             store.set_multi_speaker(&id, &speaker_id).map_err(|e| e.to_string())
         }
+        EditOp::ReserveSpeakers { id, speaker_ids, op_id } => {
+            store.reserve_speakers(&id, &speaker_ids, &op_id).map_err(|e| e.to_string())
+        }
+        EditOp::ReleaseReservedSpeakers { id, op_id } => store
+            .release_reserved_speakers(&id, &op_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        EditOp::SplitReassign { id, moves } => {
+            store.batch_set_segment_speaker(&id, &moves).map_err(|e| e.to_string())
+        }
         EditOp::EditText { id, seq, expected_text, new_text } => store
             .edit_segment_text(&id, seq, &expected_text, &new_text)
             .map_err(|e| e.to_string()),

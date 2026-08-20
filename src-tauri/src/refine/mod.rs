@@ -361,7 +361,7 @@ fn slice_range(
 /// 按 source 分组、每次只惰性加载一轨全场 PCM,算完该轨全部段的嵌入即整轨 drop
 /// (F3 修复:避免双轨全场 f32 同时常驻内存——3h 双轨会议可达 ~1.4GB+)。
 /// 结果按 kept 的原始下标回填,输出顺序/长度与 kept 保持一一对应,行为不变。
-fn embed_all(
+pub(crate) fn embed_all(
     note_dir: &Path,
     kept: &[&SegmentRecord],
     embedder: &mut dyn SpeakerEmbedder,
@@ -1432,7 +1432,7 @@ mod tests {
                 sources: vec!["mic".into()],
                 centroid: None,
                 count: 1,
-                person_id: Some("P2".into()), multi_speaker: false,
+                person_id: Some("P2".into()), multi_speaker: false, reserved_by: None,
             },
         );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];

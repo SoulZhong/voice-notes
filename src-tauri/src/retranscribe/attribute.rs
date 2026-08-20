@@ -181,7 +181,7 @@ pub fn finalize_speakers(
             // 旧表的「多人混杂」标记无法可靠映射到新簇 → 不继承,需要用户复核。
             // 安全网不靠它:库人物的隔离(voiceprint_quarantined)在 store 写方法
             // 内部把关,重转写后的任何入库/回灌照样进不去。
-            multi_speaker: false,
+            multi_speaker: false, reserved_by: None,
         });
     }
     // 继承 id 的重编号起点从同一个计数器(`next`)继续,不重新从 base 起跳——保证
@@ -296,7 +296,7 @@ mod tests {
     fn named_meta(name: &str, person: Option<&str>) -> SpeakerMeta {
         SpeakerMeta {
             name: name.into(), sources: vec!["mic".into()], centroid: Some(vec![1.0]),
-            count: 5, person_id: person.map(String::from), multi_speaker: false,
+            count: 5, person_id: person.map(String::from), multi_speaker: false, reserved_by: None,
         }
     }
 

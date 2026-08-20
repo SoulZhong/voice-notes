@@ -19,8 +19,33 @@ pub mod phase {
     pub const MARKED: &str = "marked";
     pub const SAMPLES_HANDLED: &str = "samples_handled";
     pub const RESIDUAL_DECIDED: &str = "residual_decided";
+    // ── split_commit 扩展(D 期):residual_decided 之后 ──
+    pub const RESERVED: &str = "reserved";
+    pub const SEGMENTS_REASSIGNED: &str = "segments_reassigned";
+    pub const REENROLLED: &str = "reenrolled";
+    pub const CANCEL_REQUESTED: &str = "cancel_requested";
+    pub const CANCELLED: &str = "cancelled";
     pub const RELEASED: &str = "released";
     pub const DONE: &str = "done";
+}
+
+/// 拆分计划里的一个组(commit 前由 UI 定稿,落盘后不可变)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitPlanGroup {
+    /// 组内段 seq(升序)。
+    pub seqs: Vec<u64>,
+    /// 每个 seq 在计划定稿时的原 speaker:批量改派逐段 CAS 用——对不上就是第三态
+    /// (用户或其他 writer 动过),停止提交保持隔离(codex 设计轮三 P1④)。
+    pub expected_speakers: Vec<String>,
+    /// existing_speaker | person | new_speaker | keep
+    pub dest_kind: String,
+    /// existing_speaker → S id;person → P id;new_speaker 不用。
+    #[serde(default)]
+    pub dest_id: Option<String>,
+    /// 段落实际改派到的 S id:existing_speaker=dest_id;person=既有关联 S 或预留新 S;
+    /// new_speaker=预留新 S;keep=None(不动)。
+    #[serde(default)]
+    pub dest_speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +65,9 @@ pub struct SplitOp {
     /// 用户确认已看到「历史样本无法归因到本篇」的信息缺口(诚实呈现的落盘证据)。
     #[serde(default)]
     pub samples_confirm_seen: bool,
+    /// 拆分计划(split_commit 模式;commit 前落盘,之后不可变)。
+    #[serde(default)]
+    pub plan_groups: Vec<SplitPlanGroup>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -79,7 +107,7 @@ pub fn open_ops_for_note(root: &Path, note_id: &str) -> Vec<SplitOp> {
         .flatten()
         .filter_map(|f| std::fs::read_to_string(f.path()).ok())
         .filter_map(|s| serde_json::from_str::<SplitOp>(&s).ok())
-        .filter(|o| o.note_id == note_id && o.phase != phase::DONE)
+        .filter(|o| o.note_id == note_id && o.phase != phase::DONE && o.phase != phase::CANCELLED)
         .collect();
     out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     out

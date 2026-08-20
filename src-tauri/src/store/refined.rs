@@ -872,6 +872,52 @@ pub fn unassign_refined_person_if(
     })
 }
 
+/// 拆分后的修订稿同步(一期边界,codex 设计轮三 P1⑤):
+/// - 某段落的**全部**非空 source_seqs 都被改派到同一目标 → 原位只改
+///   speaker/person/name,段界与文本一字不动
+/// - 同一段落的源段被拆到多个目标 → 整份标 stale(横幅提示重新 Aing),不拆文本
+///   (source_seqs 没有字符级映射,拆文本只能复制全文/瞎猜/丢字)
+/// moved: seq → 新 speaker id;person_name: 新 speaker → (person_id, name)(仅 person 去向)。
+/// 返回是否被标了 stale。
+pub fn sync_refined_after_split(
+    note_dir: &Path,
+    moved: &std::collections::BTreeMap<u64, String>,
+    person_name: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
+) -> anyhow::Result<bool> {
+    let mut went_stale = false;
+    update_refined(note_dir, |doc| {
+        let mut stale = false;
+        for p in doc.paragraphs.iter_mut() {
+            let touched: Vec<&u64> =
+                p.source_seqs.iter().filter(|q| moved.contains_key(q)).collect();
+            if touched.is_empty() {
+                continue;
+            }
+            let dests: std::collections::BTreeSet<&String> =
+                touched.iter().map(|q| &moved[q]).collect();
+            if touched.len() == p.source_seqs.len() && dests.len() == 1 {
+                let dest = (*dests.iter().next().expect("len==1")).clone();
+                if let Some((pid, name)) = person_name.get(&dest) {
+                    p.person_id = pid.clone();
+                    p.name = name.clone();
+                } else {
+                    p.person_id = None;
+                    p.name = None;
+                }
+                p.speaker = dest;
+            } else {
+                stale = true; // 跨组/部分改派:不可映射,整份作废重新 Aing
+            }
+        }
+        if stale {
+            doc.stale = true;
+        }
+        went_stale = stale;
+        Ok(())
+    })?;
+    Ok(went_stale)
+}
+
 /// Agent Aing 写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
 /// 约束式写入——只能改文本,说话人/时间戳/段落数一概不可动,这是把「外部 Agent 可写」
 /// 的面收到最小的关键:哪怕 Agent 行为失常,最坏也只是文本变差,结构不会被破坏。
@@ -1859,4 +1905,68 @@ mod tests {
         assert!(p.person_id.is_none() && p.name.is_none());
     }
 
+
+    // ── 拆分后的修订稿同步(Phase D) ──
+
+    fn split_fixture(dir: &std::path::Path) {
+        let doc = RefinedDoc {
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "2026-08-20T00:00:00+08:00".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 3,
+            stale: false,
+            paragraphs: vec![
+                RefinedParagraph {
+                    speaker: "R5".into(), name: None, person_id: None,
+                    start_ms: 0, end_ms: 1000, text: "整段同去向".into(), source_seqs: vec![1, 2],
+                    mentions: vec![],
+                },
+                RefinedParagraph {
+                    speaker: "R5".into(), name: None, person_id: None,
+                    start_ms: 1000, end_ms: 2000, text: "跨组段落".into(), source_seqs: vec![3, 4],
+                    mentions: vec![],
+                },
+            ],
+        };
+        write_refined_atomic(dir, &doc).unwrap();
+    }
+
+    #[test]
+    fn split_sync_updates_whole_paragraph_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        split_fixture(dir.path());
+        let moved: std::collections::BTreeMap<u64, String> =
+            [(1u64, "S9".to_string()), (2u64, "S9".to_string())].into();
+        let pn: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+            [("S9".to_string(), (Some("P7".to_string()), Some("甲".to_string())))].into();
+        let stale = sync_refined_after_split(dir.path(), &moved, &pn).unwrap();
+        assert!(!stale);
+        let doc = load_refined(dir.path()).unwrap();
+        assert_eq!(doc.paragraphs[0].speaker, "S9");
+        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P7"));
+        assert_eq!(doc.paragraphs[0].name.as_deref(), Some("甲"));
+        assert_eq!(doc.paragraphs[0].text, "整段同去向", "文本一字不动");
+        assert_eq!(doc.paragraphs[1].speaker, "R5", "未触及的段落不动");
+        assert!(!doc.stale);
+    }
+
+    #[test]
+    fn split_sync_marks_stale_when_paragraph_crosses_groups() {
+        // source_seqs 没有字符级映射:段落被拆到多组时不拆文本,整份标 stale。
+        let dir = tempfile::tempdir().unwrap();
+        split_fixture(dir.path());
+        let moved: std::collections::BTreeMap<u64, String> =
+            [(3u64, "S9".to_string()), (4u64, "S10".to_string())].into();
+        let stale = sync_refined_after_split(dir.path(), &moved, &Default::default()).unwrap();
+        assert!(stale);
+        let doc = load_refined(dir.path()).unwrap();
+        assert!(doc.stale, "跨组 → 整份标 stale 等重新 Aing");
+        assert_eq!(doc.paragraphs[1].speaker, "R5", "不尝试拆文本/改归属");
+    }
 }
