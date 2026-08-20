@@ -1869,13 +1869,15 @@ fn spawn_session(
             let vp_store_e = store::VoiceprintStore::new(root);
             let live_enrolled_e = live_enrolled.clone();
             let enroll_model = speaker_model.clone();
+            let enroll_note = note_id.clone();
             registry.set_enroller(
                 store::AUTO_ENROLL_MS,
                 Box::new(move |snap| {
-                    match vp_store_e.upsert_from_session(
+                    match vp_store_e.upsert_from_session_traced(
                         std::slice::from_ref(snap),
                         &chrono::Local::now().to_rfc3339(),
                         &enroll_model,
+                        &enroll_note,
                     ) {
                         Ok(links) => {
                             let pid = links.get(&snap.id).cloned();
@@ -2079,10 +2081,11 @@ fn spawn_session(
                         // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
                         // person_id 随 finalize 落盘。
                         if let Some(store) = &vp_store_d {
-                            match store.upsert_from_session(
+                            match store.upsert_from_session_traced(
                                 &snaps,
                                 &chrono::Local::now().to_rfc3339(),
                                 &snapshot_model,
+                                &note_id_d,
                             ) {
                                 Ok(enrolled) => {
                                     // 原 set_speaker_person(cluster, person) 循环改为把新关联
@@ -2114,10 +2117,16 @@ fn spawn_session(
                                         };
                                         let newly_enrolled =
                                             newly.contains(&pid) || enrolled.contains_key(&snap.id);
-                                        if !newly_enrolled && !store.sample_paths_existing(&pid).is_empty() {
-                                            continue; // 识别出的老熟人且已有样本:不再累积
-                                        }
-                                        if let Err(e) = store.append_sample(&pid, sample) {
+                                        // 收口版:resolve/隔离/老熟人检查、WAL 溯源、写文件同一临界区。
+                                        // 旧代码在这里用未 resolve 的 pid 查"有没有样本",笔记持
+                                        // loser id 时会误判无样本、把样本重复写到 winner(设计轮二 P1②)。
+                                        if let Err(e) = store.append_session_sample(
+                                            &pid,
+                                            sample,
+                                            &note_id_d,
+                                            &snap.id,
+                                            newly_enrolled,
+                                        ) {
                                             eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
                                         }
                                     }
@@ -8074,6 +8083,15 @@ pub fn run() {
                             from_version: telemetry::SafeVersion::parse(from),
                         },
                     );
+                }
+            }
+            // 样本溯源 WAL 恢复:上次进程死在"intent 已落、complete 未落"之间的话,
+            // 这里把在途写入按三分支收尾(转正/丢弃/记冲突)。纯文件操作,先于重建。
+            if let Ok(root) = data_root(&handle) {
+                let (done, dropped, conflicted) =
+                    store::VoiceprintStore::new(root).recover_sample_trace();
+                if done + dropped + conflicted > 0 {
+                    eprintln!("样本溯源恢复:转正 {done} 丢弃 {dropped} 冲突 {conflicted}");
                 }
             }
             // 声纹库标签与当前选型不一致时主动重建一次。放在启动末尾:它要起线程加载

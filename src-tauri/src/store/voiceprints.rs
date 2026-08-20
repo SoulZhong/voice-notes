@@ -147,6 +147,28 @@ fn space_ok(vp: &Voiceprints, model: &str) -> bool {
     vp.embedding_model == model
 }
 
+/// 样本 receipt 序号(与恢复用临时名同思路:pid+计数器保证进程内唯一)。
+static SAMPLE_RECEIPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把 f32 采样编码成 16k s16 单声道 WAV 字节(与 append_sample_inner 同规格)。
+fn encode_sample_wav(samples: &[f32]) -> anyhow::Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: crate::store::audio::AUDIO_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cur = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = hound::WavWriter::new(&mut cur, spec)?;
+        for s in samples {
+            w.write_sample(crate::store::audio::f32_to_s16(*s))?;
+        }
+        w.finalize()?;
+    }
+    Ok(cur.into_inner())
+}
+
 fn vp_guard() -> std::sync::MutexGuard<'static, ()> {
     VP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -337,6 +359,8 @@ impl VoiceprintStore {
                 if !keep.contains(&i) {
                     if let Err(e) = std::fs::remove_file(p) {
                         eprintln!("声纹样本淘汰失败({winner},不影响库): {e}");
+                    } else {
+                        super::sample_trace::on_sample_deleted(&self.root, p);
                     }
                 }
             }
@@ -350,18 +374,23 @@ impl VoiceprintStore {
                 if !keep_loser.contains(lp) {
                     if let Err(e) = std::fs::remove_file(lp) {
                         eprintln!("声纹样本淘汰失败({loser},不影响库): {e}");
+                    } else {
+                        super::sample_trace::on_sample_deleted(&self.root, lp);
                     }
                 }
             }
         }
         // 迁移保留的 loser 样本进 winner 空槽(容量经上面淘汰后必然足够)。
         for lp in keep_loser {
-            let res = match self.next_free_sample_slot(winner) {
-                Some(wp) => std::fs::rename(&lp, &wp),
-                None => std::fs::remove_file(&lp),
-            };
-            if let Err(e) = res {
-                eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}");
+            match self.next_free_sample_slot(winner) {
+                Some(wp) => match std::fs::rename(&lp, &wp) {
+                    Ok(()) => super::sample_trace::on_sample_moved(&self.root, &lp, &wp, winner),
+                    Err(e) => eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}"),
+                },
+                None => match std::fs::remove_file(&lp) {
+                    Ok(()) => super::sample_trace::on_sample_deleted(&self.root, &lp),
+                    Err(e) => eprintln!("声纹样本迁移失败({loser}->{winner},不影响库): {e}"),
+                },
             }
         }
         Ok(())
@@ -731,6 +760,72 @@ impl VoiceprintStore {
     ///
     /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,否则「停止入库写样本」
     /// 与管理页并发合并/删除会写出无主孤儿样本或把错人的音频挂到 winner 上。
+    /// 启动时的样本溯源 WAL 恢复(自持 vp_guard)。见 sample_trace::recover。
+    pub fn recover_sample_trace(&self) -> (usize, usize, usize) {
+        let _guard = vp_guard();
+        super::sample_trace::recover(&self.root)
+    }
+
+    /// 停录写样本的收口版:resolve、隔离/老熟人检查、WAL、写文件、溯源转正
+    /// **全在同一次 vp_guard 临界区**。修两处既有缺陷(codex 设计轮二 P1②):
+    /// ①旧代码存在性检查用未 resolve 的 pid(笔记持 loser id 时误判"无样本",
+    ///   把样本重复写到已有样本的 winner);②检查与写入分离,期间删除/合并可改状态。
+    /// `newly_enrolled`=本场新入库(实时或停录兜底):新人物必写;老熟人已有样本不写
+    /// (识别成功说明既有声纹已覆盖),一份都没有时兜底补第一份。
+    pub fn append_session_sample(
+        &self,
+        id: &str,
+        samples: &[f32],
+        note_id: &str,
+        cluster_id: &str,
+        newly_enrolled: bool,
+    ) -> anyhow::Result<bool> {
+        let _guard = vp_guard();
+        let vp = self.load();
+        let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
+            return Ok(false);
+        };
+        if vp.people.get(&resolved).is_some_and(|p| p.voiceprint_quarantined) {
+            eprintln!("声纹样本跳过:{resolved} 正被隔离(多人混杂待处置)");
+            return Ok(false);
+        }
+        if samples.is_empty() {
+            return Ok(false);
+        }
+        if !newly_enrolled && !self.sample_paths_existing(&resolved).is_empty() {
+            return Ok(false); // 识别出的老熟人且已有样本:不再累积
+        }
+        let Some(path) = self.next_free_sample_slot(&resolved) else {
+            return Ok(false); // 满员
+        };
+        std::fs::create_dir_all(path.parent().expect("sample_path 恒有父目录"))?;
+        // 先在内存编码出最终字节:hash 必须与落盘文件逐字节一致,删除校验才有意义。
+        let bytes = encode_sample_wav(samples)?;
+        let receipt = super::sample_trace::SampleReceipt {
+            receipt_id: format!("sr-{}-{}", std::process::id(), SAMPLE_RECEIPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            note_id: note_id.to_string(),
+            cluster_id: cluster_id.to_string(),
+            person_id: resolved.clone(),
+            path: path.strip_prefix(&self.root).unwrap_or(&path).to_string_lossy().into_owned(),
+            content_hash: {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&bytes))
+            },
+            at: chrono::Local::now().to_rfc3339(),
+        };
+        // WAL 顺序是硬性的:intent → 文件 → complete。文件先落、intent 没写成时崩溃,
+        // 会留下一份永远无法归因的样本(那是本模块要消灭的洞)。
+        super::sample_trace::wal_intent(&self.root, &receipt)?;
+        let tmp = path.with_extension("wav.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        if let Ok(dir) = std::fs::File::open(path.parent().expect("恒有父目录")) {
+            let _ = dir.sync_all(); // rename 的持久性靠父目录 fsync(断电级)
+        }
+        super::sample_trace::wal_complete(&self.root, receipt)?;
+        Ok(true)
+    }
+
     fn append_sample_inner(&self, id: &str, samples: &[f32]) -> anyhow::Result<Option<String>> {
         let _guard = vp_guard();
         let vp = self.load();
@@ -891,6 +986,29 @@ impl VoiceprintStore {
         now: &str,
         model: &str,
     ) -> anyhow::Result<BTreeMap<String, String>> {
+        self.upsert_from_session_inner(snaps, now, model, None)
+    }
+
+    /// 同上,带笔记身份:每笔提交追加一条质心贡献 receipt(辅助诊断证据,只记不用)。
+    /// 生产两处入库(实时 enroller、停录 Snapshot)都走这个;不带 note 的旧签名留给
+    /// 测试与无笔记上下文的调用。
+    pub fn upsert_from_session_traced(
+        &self,
+        snaps: &[ClusterSnapshot],
+        now: &str,
+        model: &str,
+        note_id: &str,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        self.upsert_from_session_inner(snaps, now, model, Some(note_id))
+    }
+
+    fn upsert_from_session_inner(
+        &self,
+        snaps: &[ClusterSnapshot],
+        now: &str,
+        model: &str,
+        note_id: Option<&str>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
         let _guard = vp_guard();
         let mut vp = self.load();
         if !space_ok(&vp, model) {
@@ -902,6 +1020,22 @@ impl VoiceprintStore {
         }
         let mut new_links = BTreeMap::new();
         let mut touched: Vec<String> = Vec::new();
+        let mut receipts: Vec<super::sample_trace::CentroidReceipt> = Vec::new();
+        let mut push_receipt = |cluster: &str, person: &str, source: &str, count: u64, total_ms: u64, created: bool, vec: &[f32]| {
+            if let Some(nid) = note_id {
+                receipts.push(super::sample_trace::CentroidReceipt {
+                    note_id: nid.to_string(),
+                    cluster_id: cluster.to_string(),
+                    resolved_person: person.to_string(),
+                    source: source.to_string(),
+                    count,
+                    total_ms,
+                    created_person: created,
+                    vec_hash: super::sample_trace::vec_hash(vec),
+                    at: now.to_string(),
+                });
+            }
+        };
         for snap in snaps {
             // sources 恒空 ⇔ 未命中的库种子簇,勿回写勿入库(终审 triage①):assign 命中
             // 必 sources.insert,空集是种子铺底后本场从未被认领的信号,不是"真实说话人"。
@@ -927,6 +1061,7 @@ impl VoiceprintStore {
                 person.total_ms += snap.total_ms;
                 person.last_seen = now.to_string();
                 push_session_centroid(person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
+                push_receipt(&snap.id, &resolved, &source, snap.count.max(1), snap.total_ms, false, &snap.centroid);
                 touched.push(resolved.clone());
             } else if snap.total_ms >= AUTO_ENROLL_MS && !snap.centroid.is_empty() {
                 let id = format!("P{}", vp.next_person);
@@ -947,10 +1082,12 @@ impl VoiceprintStore {
                 };
                 push_session_centroid(&mut person, &source, &snap.centroid, snap.count.max(1), snap.total_ms, now);
                 vp.people.insert(id.clone(), person);
+                push_receipt(&snap.id, &id, &source, snap.count.max(1), snap.total_ms, true, &snap.centroid);
                 new_links.insert(snap.id.clone(), id);
             }
         }
         self.save(&vp)?;
+        super::sample_trace::append_centroid_receipts(&self.root, &receipts);
         if !touched.is_empty() {
             let refs: Vec<&str> = touched.iter().map(String::as_str).collect();
             self.journal_invalidate(&refs, "此人随后又录了新会议");
@@ -3496,5 +3633,128 @@ mod tests {
         let set = banned_sample_hashes(tmp.path());
         assert_eq!(set.len(), 2);
         assert!(set.contains("abc") && set.contains("def"));
+    }
+
+    // ── 样本溯源(Phase B) ──
+
+    fn square_wave() -> Vec<f32> {
+        (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect()
+    }
+
+    #[test]
+    fn traced_sample_write_lands_receipt_with_matching_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        std::fs::remove_file(tmp.path().join("voiceprints/P1.wav")).unwrap();
+        assert!(store
+            .append_session_sample("P1", &square_wave(), "note-1", "S7", true)
+            .unwrap());
+        let t = crate::store::sample_trace::load(tmp.path());
+        assert_eq!(t.receipts.len(), 1);
+        let r = &t.receipts[0];
+        assert_eq!((r.note_id.as_str(), r.cluster_id.as_str(), r.person_id.as_str()), ("note-1", "S7", "P1"));
+        let disk = sample_content_hash(&tmp.path().join(&r.path)).unwrap();
+        assert_eq!(disk, r.content_hash, "receipt hash 必须与落盘字节一致");
+        assert!(!tmp.path().join("sample_trace.wal.jsonl").exists(), "完成后 WAL 应清空");
+    }
+
+    #[test]
+    fn traced_write_resolves_before_existence_check() {
+        // 既有 bug 回归:笔记还持着 loser id 时,旧代码用未 resolve 的 id 查"有没有样本",
+        // 误判无样本 → 把样本重复写到已有样本的 winner。收口版先 resolve 再查。
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        store.merge_journaled("P1", "P2", None, "manual", None, "t1", MODEL).unwrap();
+        // 合并后 P1 → P2(redirect),P2 已有样本(合并迁移过来的)。
+        assert!(!store.sample_paths_existing("P2").is_empty(), "前置:winner 有样本");
+        let wrote = store
+            .append_session_sample("P1", &square_wave(), "note-1", "S7", false)
+            .unwrap();
+        assert!(!wrote, "老熟人(经 resolve)已有样本,不得重复写");
+    }
+
+    #[test]
+    fn wal_recovery_three_branches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("voiceprints")).unwrap();
+        let mk = |id: &str, path: &str, hash: &str| crate::store::sample_trace::SampleReceipt {
+            receipt_id: id.into(),
+            note_id: "n".into(),
+            cluster_id: "S1".into(),
+            person_id: "P1".into(),
+            path: path.into(),
+            content_hash: hash.into(),
+            at: "t".into(),
+        };
+        // ① 文件在且 hash 符 → 转正
+        std::fs::write(root.join("voiceprints/ok.wav"), b"GOOD").unwrap();
+        let h_ok = sample_content_hash(&root.join("voiceprints/ok.wav")).unwrap();
+        crate::store::sample_trace::wal_intent(root, &mk("r-ok", "voiceprints/ok.wav", &h_ok)).unwrap();
+        // ② 文件不在 → 丢弃
+        crate::store::sample_trace::wal_intent(root, &mk("r-miss", "voiceprints/miss.wav", "x")).unwrap();
+        // ③ 文件在但 hash 不符 → conflict
+        std::fs::write(root.join("voiceprints/bad.wav"), b"TAMPERED").unwrap();
+        crate::store::sample_trace::wal_intent(root, &mk("r-bad", "voiceprints/bad.wav", "expected-other")).unwrap();
+
+        let (done, dropped, conflicted) = crate::store::sample_trace::recover(root);
+        assert_eq!((done, dropped, conflicted), (1, 1, 1));
+        let t = crate::store::sample_trace::load(root);
+        assert_eq!(t.receipts.len(), 1);
+        assert_eq!(t.receipts[0].receipt_id, "r-ok");
+        assert_eq!(t.conflicts.len(), 1);
+        assert_eq!(t.conflicts[0].receipt_id, "r-bad");
+        assert!(root.join("voiceprints/bad.wav").exists(), "冲突文件不认领也不删除");
+        assert!(!root.join("sample_trace.wal.jsonl").exists());
+        // 幂等:再跑一遍无事发生
+        assert_eq!(crate::store::sample_trace::recover(root), (0, 0, 0));
+    }
+
+    #[test]
+    fn merge_migrates_receipts_with_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        // 换成有溯源的真样本(P1 一份),P2 的假样本删掉腾槽位。
+        std::fs::remove_file(tmp.path().join("voiceprints/P1.wav")).unwrap();
+        std::fs::remove_file(tmp.path().join("voiceprints/P2.wav")).unwrap();
+        store.append_session_sample("P1", &square_wave(), "note-1", "S7", true).unwrap();
+
+        store.merge_journaled("P1", "P2", None, "manual", None, "t1", MODEL).unwrap();
+
+        let t = crate::store::sample_trace::load(tmp.path());
+        assert_eq!(t.receipts.len(), 1);
+        let r = &t.receipts[0];
+        assert_eq!(r.person_id, "P2", "迁移后归属改为 winner");
+        assert!(r.path.contains("P2"), "路径随 rename 更新: {}", r.path);
+        assert_eq!(sample_content_hash(&tmp.path().join(&r.path)).unwrap(), r.content_hash);
+    }
+
+    #[test]
+    fn centroid_receipts_record_both_enroll_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        // A 类:新建
+        let links = store
+            .upsert_from_session_traced(
+                &[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)],
+                "t1", MODEL, "note-9",
+            )
+            .unwrap();
+        let pid = links["S1"].clone();
+        // B 类:并入
+        store
+            .upsert_from_session_traced(
+                &[snap("S1", vec![1.0, 0.0], 3, &["mic"], Some(&pid), 6_000)],
+                "t2", MODEL, "note-9",
+            )
+            .unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("centroid_receipts.jsonl")).unwrap();
+        let rows: Vec<crate::store::sample_trace::CentroidReceipt> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].created_person && rows[0].resolved_person == pid);
+        assert!(!rows[1].created_person);
+        assert_eq!(rows[1].note_id, "note-9");
+        assert!(!rows[0].vec_hash.is_empty());
     }
 }
