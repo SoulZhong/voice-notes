@@ -4883,12 +4883,36 @@ fn current_speaker_model(app: &AppHandle) -> String {
         .unwrap_or_default()
 }
 
+/// 重建请求的落盘标记:REBUILD_PENDING/发起中的重建都只在内存,进程在重建线程
+/// 完成前退出即丢——而"质心清空型"重建(纠错还原/拆回/退回基线)不改库标签,
+/// 启动自愈永远兜不住,那些人就永久空质心(codex 混杂实现轮六 P1)。
+/// 语义:有未完成的重建诉求 → 标记在;一轮重建成功跑完 → 清掉。启动时见标记补跑。
+fn rebuild_marker_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    data_root(app).ok().map(|r| r.join("rebuild_pending.flag"))
+}
+
+fn set_rebuild_marker(app: &AppHandle, reason: &str) {
+    if let Some(p) = rebuild_marker_path(app) {
+        if let Err(e) = std::fs::write(&p, reason) {
+            eprintln!("重建标记写入失败(进程退出前完不成的重建将无人补跑): {e}");
+        }
+    }
+}
+
+fn clear_rebuild_marker(app: &AppHandle) {
+    if let Some(p) = rebuild_marker_path(app) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 fn spawn_voiceprint_rebuild(
     app: &AppHandle,
     cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
 ) {
     use std::sync::atomic::Ordering;
+    // 先落盘再排队/起线程:反过来的话"内存标志置了、标记没写、进程退出"仍然丢请求。
+    set_rebuild_marker(app, reason);
     if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
         REBUILD_PENDING.store(true, Ordering::SeqCst);
         eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
@@ -4905,10 +4929,10 @@ fn spawn_voiceprint_rebuild(
                 REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        {
+        let ok = {
             let _reset = Reset;
-            rebuild_once(&app2, cache, reason);
-        }
+            rebuild_once(&app2, cache, reason)
+        };
         // 收尾:**只因"期间来过新请求"重跑**,不看库标签是否仍不一致。
         // 曾经也检查过标签(想顺手兜住"跑完发现又被切了"),但那会在永久失败时变成
         // 无界循环:模型文件缺失/保存失败 → 标签永远对不上 → 每轮结束立刻再起一轮,
@@ -4917,21 +4941,24 @@ fn spawn_voiceprint_rebuild(
         // 剩下的"卡住"情形由下次启动的自愈兜——一次启动最多跑一轮,天然有界。
         if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
             spawn_voiceprint_rebuild(&app2, cache2, "有排队请求,重跑");
+        } else if ok {
+            // 成功且无排队:诉求已兑现,清落盘标记。失败留标记,下次启动补跑。
+            clear_rebuild_marker(&app2);
         }
     });
 }
 
-/// 跑一轮重建。抽出来是为了让上面那层能在它结束之后、单飞标志复位之后决定要不要重跑。
+/// 跑一轮重建。返回是否成功(落盘标记只在成功后清,失败留给下次启动补跑)。
 fn rebuild_once(
     app2: &AppHandle,
     cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
-) {
+) -> bool {
     {
         // 一次快照定死"标签"与"权重路径",两者必须同源。
         let tag = current_speaker_model(app2);
         if tag.is_empty() {
-            return;
+            return false;
         }
         match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
             Ok(mut e) => {
@@ -4939,21 +4966,31 @@ fn rebuild_once(
                 // 已经不是当前选型,写库与入常驻槽都会把错的东西留下来。
                 if current_speaker_model(&app2) != tag {
                     eprintln!("声纹库重建({reason})中途选型已变,放弃本次结果");
-                    return;
+                    return false;
                 }
-                match data_root(&app2).map(store::VoiceprintStore::new) {
+                let ok = match data_root(&app2).map(store::VoiceprintStore::new) {
                     Ok(vps) => match vps.rebuild_for_model(&tag, &mut e) {
-                        Ok(n) => eprintln!("声纹库已按 {tag} 重建({reason};{n} 人有样本可建)"),
-                        Err(err) => eprintln!("声纹库重建失败(种子注入将持续跳过): {err}"),
+                        Ok(n) => {
+                            eprintln!("声纹库已按 {tag} 重建({reason};{n} 人有样本可建)");
+                            true
+                        }
+                        Err(err) => {
+                            eprintln!("声纹库重建失败(种子注入将持续跳过): {err}");
+                            false
+                        }
                     },
-                    Err(err) => eprintln!("声纹库路径不可用,未重建: {err}"),
-                }
+                    Err(err) => {
+                        eprintln!("声纹库路径不可用,未重建: {err}");
+                        false
+                    }
+                };
                 // 嵌入很慢(实测约半分钟),再核一次才敢占常驻槽:塞错模型的嵌入器
                 // 进去,下一场录制整场用错空间嵌入。
                 if current_speaker_model(&app2) == tag {
                     // 标签就是这次重建用的 tag,与权重路径同源(见 rebuild_once 开头)。
                     stash_model(&cache, Some(Box::new(diar::TaggedEmbedder::new(&tag, Box::new(e)))));
                 }
+                return ok;
             }
             Err(err) => {
                 eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
@@ -4966,6 +5003,7 @@ fn rebuild_once(
             }
         }
     }
+    false
 }
 
 /// 启动自愈:库标签与当前选型不一致就主动重建一次。
@@ -9246,6 +9284,12 @@ pub fn run() {
             // 声纹库标签与当前选型不一致时主动重建一次。放在启动末尾:它要起线程加载
             // 嵌入器,不该和前面那些"必须先就位"的初始化抢时间。
             heal_voiceprint_model_mismatch(&handle, &st);
+            // 上次退出前有没跑完的重建诉求(落盘标记还在)→ 补跑。质心清空型重建不改
+            // 库标签,上面的标签自愈兜不住它(codex 混杂实现轮六 P1)。
+            if rebuild_marker_path(&handle).is_some_and(|p| p.exists()) {
+                eprintln!("发现未完成的重建诉求(上次退出前没跑完),补跑");
+                spawn_voiceprint_rebuild(&handle, st.embedder_cache.clone(), "启动补跑上次未完成的重建");
+            }
             telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })
