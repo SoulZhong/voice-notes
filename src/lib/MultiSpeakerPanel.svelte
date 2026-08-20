@@ -31,6 +31,7 @@
     segments = [],
     people = [],
     onAuditionSeg,
+    onBeforeCommit,
     onClose,
     onChanged,
   }: {
@@ -47,6 +48,9 @@
     people?: { id: string; name: string }[];
     /** 试听某段(页面用主播放器实现:独奏所在轨 + seek + 段尾停)。 */
     onAuditionSeg?: (seq: number) => void;
+    /** 提交拆分前排空编辑器未保存修改(后端会推进 refined revision,不排空会把
+        正在编辑的文字冲掉——codex 实现轮一 P1⑫)。 */
+    onBeforeCommit?: () => void | Promise<void>;
     onClose: () => void;
     /** 任何落盘变化后回调(页面刷新笔记/人物)。 */
     onChanged: () => void;
@@ -69,11 +73,14 @@
   const step = $derived.by(() => {
     if (done) return "done";
     if (!op) return "pick";
+    if (op.phase === "plan") return "pick"; // 上次打标卡在半程:重试(后端复用同一 op)
     if (op.phase === "marked") return "samples";
     if (op.phase === "samples_handled") return "residual";
     if (op.phase === "residual_decided")
       return op.mode === "split_commit" ? "split" : "residual";
     if (["reserved", "segments_reassigned", "reenrolled"].includes(op.phase)) return "split_resume";
+    if (op.phase === "cancel_requested") return "cancelling";
+    if (op.phase === "released") return "finishing";
     return "samples";
   });
 
@@ -204,6 +211,7 @@
     busy = true;
     error = "";
     try {
+      await onBeforeCommit?.();
       const groups: SplitGroupIn[] = resume
         ? []
         : groupKeys.map((key) => ({
@@ -418,6 +426,21 @@
           <button class="primary" disabled={busy} onclick={() => doCommitSplit(false)}>{t("speakers.split.commit")}</button>
         </div>
       {/if}
+    {:else if step === "cancelling"}
+      <div class="note">{t("speakers.split.cancel")}</div>
+      <div class="actions">
+        <button class="primary" disabled={busy} onclick={doCancelSplit}>{t("speakers.split.cancel")}</button>
+      </div>
+    {:else if step === "finishing"}
+      <div class="actions">
+        <button
+          class="primary"
+          disabled={busy}
+          onclick={() => doResidual((op?.residual_choice as "accept" | "baseline") ?? "accept")}
+        >
+          {t("speakers.ok")}
+        </button>
+      </div>
     {:else if step === "split_resume"}
       <div class="note">{t("speakers.multi.resume")}</div>
       <div class="actions">

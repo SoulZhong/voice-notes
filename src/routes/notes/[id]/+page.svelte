@@ -2139,6 +2139,7 @@
         segments={note.segments}
         people={people.map((p) => ({ id: p.id, name: p.name }))}
         onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}
+        onBeforeCommit={() => refinedEditor?.flushRefined(true)}
         onClose={() => (multiPanel = null)}
         onChanged={onMultiChanged}
       />

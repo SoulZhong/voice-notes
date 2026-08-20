@@ -65,8 +65,16 @@ pub fn load(root: &Path) -> SampleTrace {
 pub fn save(root: &Path, t: &SampleTrace) -> anyhow::Result<()> {
     let path = trace_path(root);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(t)?)?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(serde_json::to_string_pretty(t)?.as_bytes())?;
+        f.sync_all()?; // 断电级:rename 前内容必须先落稳(codex 实现轮一 P2)
+    }
     std::fs::rename(&tmp, &path)?;
+    if let Ok(d) = std::fs::File::open(root) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -105,7 +113,18 @@ fn remove_wal_line(root: &Path, receipt_id: &str) -> anyhow::Result<()> {
     if kept.is_empty() {
         let _ = std::fs::remove_file(&p);
     } else {
-        std::fs::write(&p, kept.join("\n") + "\n")?;
+        // 原地重写会在崩溃时殃及其他在途行:走 tmp+rename+fsync(codex 实现轮一 P2)。
+        let tmp = p.with_extension("jsonl.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all((kept.join("\n") + "\n").as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &p)?;
+        if let Ok(d) = std::fs::File::open(root) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }

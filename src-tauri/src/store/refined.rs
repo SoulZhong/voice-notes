@@ -872,6 +872,15 @@ pub fn unassign_refined_person_if(
     })
 }
 
+/// 把修订稿整份标 stale(拆分同步失败的硬兜底:原始段已改派,修订稿再不标脏,
+/// 用户在默认视图看到的就是旧归属还以为拆完了)。
+pub fn mark_refined_stale(note_dir: &Path) -> anyhow::Result<()> {
+    update_refined(note_dir, |doc| {
+        doc.stale = true;
+        Ok(())
+    })
+}
+
 /// 拆分后的修订稿同步(一期边界,codex 设计轮三 P1⑤):
 /// - 某段落的**全部**非空 source_seqs 都被改派到同一目标 → 原位只改
 ///   speaker/person/name,段界与文本一字不动

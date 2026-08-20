@@ -118,16 +118,33 @@ pub fn advance_guarded(
     store: &super::VoiceprintStore,
     root: &Path,
     op_id: &str,
+    from: &[&str],
     to: &str,
     now: &str,
 ) -> anyhow::Result<SplitOp> {
-    store.with_guard(|| advance(root, op_id, to, now))
+    store.with_guard(|| advance(root, op_id, from, to, now))
 }
 
-/// 推进阶段并落盘。**该阶段真正做完之后才调**(先做后记:没记上就重做,重做幂等;
-/// 反过来"先记后做"崩在中间会跳过没做完的步骤,留下判不出来的中间态)。
-pub fn advance(root: &Path, op_id: &str, to: &str, now: &str) -> anyhow::Result<SplitOp> {
+/// 全库范围的未完成操作(跨笔记;解除隔离时排除其它 op 仍持有的人物用)。
+pub fn open_ops_all(root: &Path) -> Vec<SplitOp> {
+    let Ok(rd) = std::fs::read_dir(ops_dir(root)) else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+        .filter_map(|s| serde_json::from_str::<SplitOp>(&s).ok())
+        .filter(|o| o.phase != phase::DONE && o.phase != phase::CANCELLED)
+        .collect()
+}
+
+/// 推进阶段并落盘,**带 expected-phase CAS**:当前阶段不在 from 集合内即拒绝——
+/// 没有它,并发的 commit/cancel/confirm 可以互相回退或覆盖(codex 实现轮一 P1③)。
+/// 该阶段真正做完之后才调(先做后记:没记上就重做,重做幂等)。
+pub fn advance(root: &Path, op_id: &str, from: &[&str], to: &str, now: &str) -> anyhow::Result<SplitOp> {
     let mut op = load(root, op_id)?;
+    anyhow::ensure!(
+        from.contains(&op.phase.as_str()),
+        "阶段不符:当前 {},不能推进到 {to}",
+        op.phase
+    );
     op.phase = to.to_string();
     op.updated_at = now.to_string();
     save(root, &op)?;

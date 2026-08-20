@@ -745,8 +745,8 @@ pub fn invalidate_for_marking(
     marked_seqs: &std::collections::BTreeSet<u64>,
     members: &BTreeMap<String, std::collections::BTreeSet<u64>>,
     now: &str,
-) -> usize {
-    let Some(mut doc) = load_identify(note_dir) else { return 0 };
+) -> anyhow::Result<usize> {
+    let Some(mut doc) = load_identify(note_dir) else { return Ok(0) };
     let hits: Vec<String> = doc
         .assignments
         .iter()
@@ -767,12 +767,11 @@ pub fn invalidate_for_marking(
         }
     }
     if !hits.is_empty() {
-        if let Err(e) = save_identify(note_dir, &doc) {
-            eprintln!("identify 建议作废落盘失败(旧建议可能残留): {e}");
-            return 0;
-        }
+        // 落盘失败必须上抛:静默的话打标照样推进,而旧建议还能把混杂段灌回库
+        // (codex 实现轮一 P1⑬)。
+        save_identify(note_dir, &doc)?;
     }
-    hits.len()
+    Ok(hits.len())
 }
 
 pub fn rejected_key(fingerprint: &str, target_key: &str) -> String {

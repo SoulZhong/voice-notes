@@ -505,11 +505,15 @@ impl VoiceprintStore {
                     vp.embedding_model
                 );
             }
-            // 回放不得洗掉隔离:当前库里该人物若被隔离(多人混杂待处置),快照是打标前
-            // 存的——原样还原等于把标记冲掉、把可能已混杂的质心插回来。保留标记并清表,
-            // 身份(名字/邮箱)照快照还。
-            for (id, p) in [(&entry.loser, &mut loser_person), (&entry.winner, &mut winner_person)] {
-                if vp.people.get(id.as_str()).is_some_and(|cur| cur.voiceprint_quarantined) {
+            // 回放不得洗掉隔离,且要**连坐**:合并后打的标只落在合并体上,拆开时污染
+            // 可能在任何一方的快照里——loser 当前不在库(被并走了),只查"精确同名的
+            // 现存者"会把可能已污染的 loser 快照还原成未隔离人物、重新当种子
+            // (codex 实现轮一 P1⑦)。任一方现存者被隔离 → 双方还原体都隔离+清表。
+            let tainted = [entry.loser.as_str(), entry.winner.as_str()]
+                .iter()
+                .any(|id| vp.people.get(*id).is_some_and(|cur| cur.voiceprint_quarantined));
+            if tainted {
+                for p in [&mut loser_person, &mut winner_person] {
                     p.voiceprint_quarantined = true;
                     p.centroids.clear();
                     p.session_centroids.clear();
@@ -641,9 +645,16 @@ impl VoiceprintStore {
                 .is_some_and(|p| p.centroids.is_empty() && p.session_centroids.is_empty());
         } else {
             let mut loser_person = entry.loser_person.clone();
-            // 回放不得洗掉隔离(同 undo_merge):此处 loser 通常不在库(被并走了),
-            // 若在且被隔离,保留标记并清表。
-            if vp.people.get(&entry.loser).is_some_and(|cur| cur.voiceprint_quarantined) {
+            // 回放不得洗掉隔离,且要连坐(同 undo_merge,codex 实现轮一 P1⑦):
+            // loser 通常不在库,污染标记落在它并入的 winner(或其化身)上——查 winner
+            // 现存者的隔离态,命中则拆回体也隔离+清表。
+            let winner_now = Self::resolve(&vp, &entry.winner).map(str::to_string);
+            let tainted = vp.people.get(&entry.loser).is_some_and(|c| c.voiceprint_quarantined)
+                || winner_now
+                    .as_deref()
+                    .and_then(|w| vp.people.get(w))
+                    .is_some_and(|c| c.voiceprint_quarantined);
+            if tainted {
                 loser_person.voiceprint_quarantined = true;
                 loser_person.centroids.clear();
                 loser_person.session_centroids.clear();
@@ -760,6 +771,13 @@ impl VoiceprintStore {
     ///
     /// 持 vp_guard:与 merge/delete 的样本文件迁移串行化,否则「停止入库写样本」
     /// 与管理页并发合并/删除会写出无主孤儿样本或把错人的音频挂到 winner 上。
+    /// **已持 vp_guard** 时的库落盘(with_guard 闭包内专用;normal 路径走各写方法)。
+    /// std::sync::Mutex 不可重入,闭包里再调会自取锁的方法必死锁——这是那次
+    /// 写入收口设计里踩过的同一个坑,故单独开这个裸入口。
+    pub fn save_for_split(&self, vp: &Voiceprints) -> anyhow::Result<()> {
+        self.save(vp)
+    }
+
     /// 在 vp_guard 内执行一段闭包(打标流程的 op 文件与库同锁,避免调用方自己摸锁)。
     pub fn with_guard<T>(&self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         let _guard = vp_guard();
@@ -798,28 +816,23 @@ impl VoiceprintStore {
     ) -> anyhow::Result<u32> {
         let _guard = vp_guard();
         let trace = super::sample_trace::load(&self.root);
-        let mut deleted = 0u32;
-        let mut to_ban: Vec<String> = Vec::new();
-        // ① 可归因的自动删。
+        // 先把全部候选的 hash 收齐并**封禁落盘,然后才动文件**:反过来的话,删了一半
+        // 崩掉,已删的样本 hash 没进名单,合并日志的副本能把它复活,而原文件已不在、
+        // 重试也无从补封禁(codex 实现轮一 P1⑧)。多封无害:封禁只拦"恢复",不动在库文件。
+        let mut auto_del: Vec<(std::path::PathBuf, String)> = Vec::new();
         for r in &trace.receipts {
             if r.note_id != op.note_id || !op.speaker_ids.iter().any(|s| s == &r.cluster_id) {
                 continue;
             }
             let abs = self.root.join(&r.path);
             match sample_content_hash(&abs) {
-                Some(h) if h == r.content_hash => {
-                    to_ban.push(h);
-                    std::fs::remove_file(&abs)
-                        .map_err(|e| anyhow::anyhow!("删除样本失败({}): {e}", r.path))?;
-                    super::sample_trace::on_sample_deleted(&self.root, &abs);
-                    deleted += 1;
-                }
+                Some(h) if h == r.content_hash => auto_del.push((abs, h)),
                 Some(_) => eprintln!("打标样本跳过:{} 内容与 receipt 不符,留人工", r.path),
                 None => eprintln!("打标样本跳过:{} 已不存在", r.path),
             }
         }
-        // ② 用户勾选的(无溯源,人工判断)。路径必须落在样本目录内。
         let samples_dir = self.root.join("voiceprints");
+        let mut extra_del: Vec<(std::path::PathBuf, String)> = Vec::new();
         for rel in extra_delete_rel {
             let abs = self.root.join(rel);
             let canon_ok = abs
@@ -834,14 +847,19 @@ impl VoiceprintStore {
                 eprintln!("打标样本跳过:{rel} 读不出内容");
                 continue;
             };
-            to_ban.push(h);
-            std::fs::remove_file(&abs).map_err(|e| anyhow::anyhow!("删除样本失败({rel}): {e}"))?;
-            super::sample_trace::on_sample_deleted(&self.root, &abs);
-            deleted += 1;
+            extra_del.push((abs, h));
         }
-        if !to_ban.is_empty() {
-            // 封禁失败要上抛:名单没写成的话,合并日志里的副本还能把刚删的复活。
-            ban_sample_hashes(&self.root, &to_ban)?;
+        let hashes: Vec<String> =
+            auto_del.iter().chain(extra_del.iter()).map(|(_, h)| h.clone()).collect();
+        if !hashes.is_empty() {
+            ban_sample_hashes(&self.root, &hashes)?;
+        }
+        let mut deleted = 0u32;
+        for (abs, _) in auto_del.iter().chain(extra_del.iter()) {
+            std::fs::remove_file(abs)
+                .map_err(|e| anyhow::anyhow!("删除样本失败({}): {e}", abs.display()))?;
+            super::sample_trace::on_sample_deleted(&self.root, abs);
+            deleted += 1;
         }
         Ok(deleted)
     }
@@ -1137,6 +1155,9 @@ impl VoiceprintStore {
             anyhow::bail!("不是该人物的样本文件");
         }
         std::fs::remove_file(path)?;
+        // 槽位以后会被新样本复用:旧 receipt 不清的话,影响面会把新文件错标成
+        // "来自本篇"(codex 实现轮一 P2)。
+        super::sample_trace::on_sample_deleted(&self.root, path);
         self.journal_invalidate(&[&resolved], "此人样本随后有变动");
         Ok(())
     }
@@ -3781,7 +3802,11 @@ mod tests {
         assert!(p2.voiceprint_quarantined, "回放不得洗掉隔离标记");
         assert!(p2.centroids.is_empty() && p2.session_centroids.is_empty(), "隔离人物不恢复质心表");
         assert_eq!(p2.name, "张三", "身份(名字)照快照还");
-        assert!(!vp.people["P1"].voiceprint_quarantined, "loser 原不在库,不受连坐");
+        // 连坐(codex 实现轮一 P1⑦):合并后打的标只落在合并体上,污染可能在任一方的
+        // 快照里——loser 还原体同样隔离+清表,否则它带着可能已污染的质心重新当种子。
+        let p1 = &vp.people["P1"];
+        assert!(p1.voiceprint_quarantined, "loser 还原体连坐隔离");
+        assert!(p1.centroids.is_empty() && p1.session_centroids.is_empty());
     }
 
     #[test]
@@ -4050,6 +4075,11 @@ mod tests {
         };
         crate::store::split_ops::save(root, &op).unwrap();
         assert_eq!(crate::store::split_ops::open_ops_for_note(root, "n1").len(), 1);
+        // 乱序推进被 CAS 拒绝(codex 实现轮一 P1③)。
+        assert!(crate::store::split_ops::advance(
+            root, "so-t-2", &[crate::store::split_ops::phase::RESERVED], crate::store::split_ops::phase::DONE, "t1"
+        ).is_err());
+        let mut cur = crate::store::split_ops::phase::PLAN.to_string();
         for ph in [
             crate::store::split_ops::phase::MARKED,
             crate::store::split_ops::phase::SAMPLES_HANDLED,
@@ -4057,7 +4087,8 @@ mod tests {
             crate::store::split_ops::phase::RELEASED,
             crate::store::split_ops::phase::DONE,
         ] {
-            crate::store::split_ops::advance(root, "so-t-2", ph, "t1").unwrap();
+            crate::store::split_ops::advance(root, "so-t-2", &[cur.as_str()], ph, "t1").unwrap();
+            cur = ph.to_string();
         }
         assert!(crate::store::split_ops::open_ops_for_note(root, "n1").is_empty(), "done 不再列出");
         assert!(crate::store::split_ops::load(root, "../evil").is_err(), "路径逃逸被拒");

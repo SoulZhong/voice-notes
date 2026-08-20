@@ -177,11 +177,11 @@ pub fn finalize_speakers(
             centroid: snap.map(|s| s.centroid.clone()),
             count: snap.map(|s| s.count).unwrap_or(0),
             person_id: info.and_then(|i| i.person.clone()),
-            // 重转写整表重建,簇的构成已变(混杂簇可能恰好被更好的聚类拆开了),
-            // 旧表的「多人混杂」标记无法可靠映射到新簇 → 不继承,需要用户复核。
-            // 安全网不靠它:库人物的隔离(voiceprint_quarantined)在 store 写方法
-            // 内部把关,重转写后的任何入库/回灌照样进不去。
-            multi_speaker: false, reserved_by: None,
+            // 「多人混杂」标记从旧表按继承 id 带过来:重转写的继承路径保 id 稳定,
+            // 标记跟着走才能兑现"这簇以后不入库不写样本"(codex 实现轮一 P1①)。
+            // 重聚类真把混杂簇拆开时,拆出的新簇不带标——那正是期望的结果。
+            multi_speaker: old_speakers.get(*old_id).is_some_and(|m| m.multi_speaker),
+            reserved_by: None,
         });
     }
     // 继承 id 的重编号起点从同一个计数器(`next`)继续,不重新从 base 起跳——保证
