@@ -4023,14 +4023,17 @@ fn confirm_multi_samples(
     confirm_seen: bool,
 ) -> Result<u32, String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
+    // **锁后重读**:锁前的快照可能停在"还没选残留"的旧状态——residual 若在本请求
+    // 等锁期间落了意图并跑完 baseline,拿旧快照过冻结检查再删样本,删完才在阶段
+    // CAS 上失败,但删除已无法撤销(codex 实现轮四 P1①)。
     let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
     if op.phase != store::split_ops::phase::MARKED
         && op.phase != store::split_ops::phase::SAMPLES_HANDLED
     {
         return Err(tr!("当前阶段不能处置样本: {p}", "Cannot handle samples in phase {p}", p = &op.phase));
     }
-    let op_lock = split_op_lock(&op_id);
-    let _op_guard = op_lock.lock().unwrap();
     // 意图落盘后样本集合冻结:residual 选择(尤其 baseline)以当时的样本为输入,
     // 再 purge 会让重算的幂等性失效(codex 实现轮三 P2)。
     if op.residual_choice.is_some() {
@@ -4128,7 +4131,13 @@ async fn resolve_multi_residual(
                 }
                 store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::SAMPLES_HANDLED], ph::RESIDUAL_DECIDED, &now)
                     .map_err(|e| e.to_string())?;
-                if then_split {
+                // **以落盘的 mode 为准,不信本次请求参数**:首次 then_split=true 已把
+                // mode=split_commit 落盘,推进前崩掉、恢复请求传 false 的话,按参数走
+                // 会直接解除关单,静默丢掉已持久化的拆分意图(codex 实现轮四 P1②)。
+                let go_split = store::split_ops::load(&root, &op_id)
+                    .map(|o| o.mode == "split_commit")
+                    .unwrap_or(then_split);
+                if go_split {
                     // pending 重建**不在这里**消化:人物还隔离着,全库重建会把刚算的
                     // 基线按"隔离只清空"冲掉(codex 实现轮三 P1②)。commit/cancel
                     // 完成解除后消化。
@@ -4146,21 +4155,13 @@ async fn resolve_multi_residual(
                     ));
                 }
                 if op.mode == "split_commit" {
+                    // 落盘意图优先于请求参数(轮四 P1②)。
                     return Err(tr!("拆分模式由拆分流程收尾", "Split mode finishes via the split flow"));
                 }
             }
             p if p == ph::RELEASED => {
-                // 重入:解除可能没写成(先解除后推进的顺序下不会,但保持幂等兜底),
-                // 重跑一遍再补 done。
-                vp_store
-                    .with_guard(|| {
-                        let o = store::split_ops::load(&root, &op_id)?;
-                        release_for_op_locked(&vp_store, &root, &o)
-                    })
-                    .map_err(|e| e.to_string())?;
-                store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::RELEASED], ph::DONE, &now)
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
+                // 重入:公共收尾(重跑解除+done+pending+缓存+图谱,轮四 P1③)。
+                return complete_released(&app, &vp_store, &root, &op_id, &now);
             }
             p => {
                 return Err(tr!("先完成样本处置(当前阶段: {p})", "Handle samples first (phase: {p})", p = p));
@@ -4168,13 +4169,7 @@ async fn resolve_multi_residual(
         }
         finish_and_release(&vp_store, &root, &op_id, &[ph::RESIDUAL_DECIDED], ph::RELEASED, &now)
             .map_err(|e| e.to_string())?;
-        store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::RELEASED], ph::DONE, &now)
-            .map_err(|e| e.to_string())?;
-        // baseline 期间排队的全库重建放到**解除之后**再消化:提早跑的话它对仍隔离的
-        // 人物只清空,会把刚算好的基线冲掉,且与解除竞争锁结果不定(codex 实现轮二 P1⑤)。
-        consume_pending_rebuild(&app);
-        refresh_qwen_hotwords_cache(&app);
-        Ok(())
+        complete_released(&app, &vp_store, &root, &op_id, &now)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4206,6 +4201,39 @@ fn run_baseline_reset(
     // 清空。调用方在解除隔离之后调 consume_pending_rebuild(codex 实现轮二 P1⑤);
     // 出错路径也由调用方兜(pending 不能没人管)。
     r
+}
+
+/// released 阶段的**公共收尾**(commit/residual 两侧共用,幂等):重跑解除(兜底)→
+/// 补 done → 消化 pending 重建 → 刷缓存 →(拆分模式)排图谱重建。没有它,DONE 推进
+/// 失败后的重入会各走各的半截路径,漏掉 pending/缓存/图谱(codex 实现轮四 P1③)。
+fn complete_released(
+    app: &AppHandle,
+    vp_store: &store::VoiceprintStore,
+    root: &std::path::Path,
+    op_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    vp_store
+        .with_guard(|| {
+            let o = store::split_ops::load(root, op_id)?;
+            release_for_op_locked(vp_store, root, &o)
+        })
+        .map_err(|e| e.to_string())?;
+    let op = store::split_ops::advance_guarded(
+        vp_store,
+        root,
+        op_id,
+        &[store::split_ops::phase::RELEASED],
+        store::split_ops::phase::DONE,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
+    consume_pending_rebuild(app);
+    refresh_qwen_hotwords_cache(app);
+    if op.mode == "split_commit" {
+        queue_person_graph_rebuild(app, root.to_path_buf(), &tr!("拆分说话人", "Speaker split"))?;
+    }
+    Ok(())
 }
 
 /// 消化 REBUILD_PENDING(若有)。与 spawn_voiceprint_rebuild 的排队协议配套:
@@ -4753,20 +4781,13 @@ async fn commit_split(
                 &now,
             )
             .map_err(|e| e.to_string())?;
-            store::split_ops::advance_guarded(
-                &vp_store,
-                &root,
-                &op_id,
-                &[store::split_ops::phase::RELEASED],
-                store::split_ops::phase::DONE,
-                &now,
-            )
-            .map_err(|e| e.to_string())?;
+            op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
         }
-        // 解除已完成:此刻才能安全消化 baseline 期间排队的全库重建(轮三 P1②)。
-        consume_pending_rebuild(&app);
-        refresh_qwen_hotwords_cache(&app);
-        queue_person_graph_rebuild(&app, root, &tr!("拆分说话人", "Speaker split"))?;
+        // released 的公共收尾(轮四 P1③):REENROLLED 刚推进来的、以及上次 DONE 没写成
+        // 的重入,都从这里走同一条幂等路径(done+pending+缓存+图谱)。
+        if op.phase == store::split_ops::phase::RELEASED {
+            complete_released(&app, &vp_store, &root, &op_id, &now)?;
+        }
         Ok(if enroll_notes.is_empty() { String::new() } else { enroll_notes.join("; ") })
     })
     .await
