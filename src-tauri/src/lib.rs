@@ -4029,6 +4029,16 @@ fn confirm_multi_samples(
     {
         return Err(tr!("当前阶段不能处置样本: {p}", "Cannot handle samples in phase {p}", p = &op.phase));
     }
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
+    // 意图落盘后样本集合冻结:residual 选择(尤其 baseline)以当时的样本为输入,
+    // 再 purge 会让重算的幂等性失效(codex 实现轮三 P2)。
+    if op.residual_choice.is_some() {
+        return Err(tr!(
+            "残留处置已开始,样本集合已冻结",
+            "Residual handling has started; the sample set is frozen"
+        ));
+    }
     // 阶段落盘必须证明用户看到过信息缺口:不带确认不推进,重入也不许把已确认改回
     // 未确认(codex 实现轮一 P2)。
     if !confirm_seen {
@@ -4076,37 +4086,39 @@ async fn resolve_multi_residual(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let root = data_root(&app).map_err(|e| e.to_string())?;
+        let op_lock = split_op_lock(&op_id);
+        let _op_guard = op_lock.lock().unwrap();
         let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
         let vp_store = store::VoiceprintStore::new(root.clone());
         let now = chrono::Local::now().to_rfc3339();
         use store::split_ops::phase as ph;
         match op.phase.as_str() {
             p if p == ph::SAMPLES_HANDLED => {
-                // 意图先落盘,副作用后执行,阶段最后推进(codex 实现轮二 P1④):
-                // baseline 是破坏性的——反过来"先重算后记选择",崩在中间时 UI 还允许
-                // 改选 accept,而人物数据已经被清洗过了。重入时锁定为已落盘的选择。
-                if let Some(stored) = &op.residual_choice {
-                    if stored != &choice {
-                        return Err(tr!(
-                            "已选择过「{stored}」,恢复中不能改选",
-                            "Already chose \"{stored}\"; cannot change during recovery",
-                            stored = stored
-                        ));
-                    }
-                } else {
-                    vp_store
-                        .with_guard(|| {
-                            let mut o = store::split_ops::load(&root, &op_id)?;
-                            anyhow::ensure!(o.phase == ph::SAMPLES_HANDLED, "阶段已变: {}", o.phase);
-                            o.residual_choice = Some(choice.clone());
-                            if then_split {
-                                o.mode = "split_commit".into();
+                // 意图先落盘,副作用后执行,阶段最后推进(codex 实现轮二 P1④)。
+                // 意图 CAS 收进 guard 内(锁内重读):两个并发请求各自拿着"还没选"的
+                // 旧快照时,后进 guard 的那个必须看见先者写的 choice 并被拒
+                // (codex 实现轮三 P1④;op 锁已串行化,这是纵深防御)。
+                vp_store
+                    .with_guard(|| {
+                        let mut o = store::split_ops::load(&root, &op_id)?;
+                        anyhow::ensure!(o.phase == ph::SAMPLES_HANDLED, "阶段已变: {}", o.phase);
+                        match &o.residual_choice {
+                            Some(stored) if stored != &choice => {
+                                anyhow::bail!("已选择过「{stored}」,恢复中不能改选")
                             }
-                            o.updated_at = now.clone();
-                            store::split_ops::save(&root, &o)
-                        })
-                        .map_err(|e| e.to_string())?;
-                }
+                            Some(_) => {} // 同值重入:不重写
+                            None => {
+                                o.residual_choice = Some(choice.clone());
+                                if then_split {
+                                    o.mode = "split_commit".into();
+                                }
+                                o.updated_at = now.clone();
+                                store::split_ops::save(&root, &o)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
                 if choice == "baseline" {
                     // 幂等:rebuild_person_from_samples 重跑得到同一结果。
                     if let Err(e) = run_baseline_reset(&app, &vp_store, &op) {
@@ -4117,8 +4129,10 @@ async fn resolve_multi_residual(
                 store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::SAMPLES_HANDLED], ph::RESIDUAL_DECIDED, &now)
                     .map_err(|e| e.to_string())?;
                 if then_split {
-                    consume_pending_rebuild(&app);
-                    return Ok(()); // 拆分接手收尾(隔离由 commit/cancel 解除)
+                    // pending 重建**不在这里**消化:人物还隔离着,全库重建会把刚算的
+                    // 基线按"隔离只清空"冲掉(codex 实现轮三 P1②)。commit/cancel
+                    // 完成解除后消化。
+                    return Ok(());
                 }
             }
             p if p == ph::RESIDUAL_DECIDED => {
@@ -4136,7 +4150,14 @@ async fn resolve_multi_residual(
                 }
             }
             p if p == ph::RELEASED => {
-                // 只剩 done 没写成:补上。
+                // 重入:解除可能没写成(先解除后推进的顺序下不会,但保持幂等兜底),
+                // 重跑一遍再补 done。
+                vp_store
+                    .with_guard(|| {
+                        let o = store::split_ops::load(&root, &op_id)?;
+                        release_for_op_locked(&vp_store, &root, &o)
+                    })
+                    .map_err(|e| e.to_string())?;
                 store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::RELEASED], ph::DONE, &now)
                     .map_err(|e| e.to_string())?;
                 return Ok(());
@@ -4211,32 +4232,67 @@ fn finish_and_release(
     now: &str,
 ) -> anyhow::Result<()> {
     vp_store.with_guard(|| {
-        // 先推进自身阶段(落盘),再算持有者:此刻 self 已是非持有态。
-        let op = store::split_ops::advance(root, op_id, from, to, now)?;
-        let held: std::collections::BTreeSet<String> = store::split_ops::open_ops_all(root)
-            .into_iter()
-            .filter(|o| o.op_id != op_id && store::split_ops::holds_quarantine(o))
-            .flat_map(|o| o.affected_persons)
-            .collect();
-        let mut vp = vp_store.load();
-        let mut changed = false;
-        for pid in &op.affected_persons {
-            if held.contains(pid) {
-                eprintln!("解除隔离跳过:{pid} 仍被其它未完成处置持有");
-                continue;
-            }
-            if let Some(p) = vp.people.get_mut(pid) {
-                if p.voiceprint_quarantined {
-                    p.voiceprint_quarantined = false;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            vp_store.save_for_split(&vp)?;
-        }
+        // **先解除、后推进**(同一 guard):顺序反过来的话,"阶段已 released、解除没写成"
+        // 的崩溃窗会让独占人物永久隔离——released 重入只补 done,cancelled 连恢复列表
+        // 都不进(codex 实现轮三 P1①)。现在崩在中间 → 阶段未变 → 重入重跑解除(幂等)。
+        // 持有者判定读的是**别的 op** 的盘面阶段,与自身阶段无关,所以先后互换不
+        // 影响轮二 P1③ 的原子性结论:后关单者仍然会看到先关单者已是非持有态。
+        let op = store::split_ops::load(root, op_id)?;
+        anyhow::ensure!(
+            from.contains(&op.phase.as_str()),
+            "阶段不符:当前 {},不能收尾到 {to}",
+            op.phase
+        );
+        release_for_op_locked(vp_store, root, &op)?;
+        store::split_ops::advance(root, op_id, from, to, now)?;
         Ok(())
     })
+}
+
+/// 解除本 op 人物的隔离(排除其它持有者)。**调用方须已持 vp_guard**。幂等。
+fn release_for_op_locked(
+    vp_store: &store::VoiceprintStore,
+    root: &std::path::Path,
+    op: &store::split_ops::SplitOp,
+) -> anyhow::Result<()> {
+    let held: std::collections::BTreeSet<String> = store::split_ops::open_ops_all(root)
+        .into_iter()
+        .filter(|o| o.op_id != op.op_id && store::split_ops::holds_quarantine(o))
+        .flat_map(|o| o.affected_persons)
+        .collect();
+    let mut vp = vp_store.load();
+    let mut changed = false;
+    for pid in &op.affected_persons {
+        if held.contains(pid) {
+            eprintln!("解除隔离跳过:{pid} 仍被其它未完成处置持有");
+            continue;
+        }
+        if let Some(p) = vp.people.get_mut(pid) {
+            if p.voiceprint_quarantined {
+                p.voiceprint_quarantined = false;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        vp_store.save_for_split(&vp)?;
+    }
+    Ok(())
+}
+
+/// 进程内按 op 串行化(commit/cancel/confirm/residual 四命令共用):同一 op 的两个
+/// 命令并发交错会产生"读旧阶段 → 各做各的副作用"的竞态(codex 实现轮三 P1⑤)。
+/// 客户端单进程,进程内互斥即可;跨进程不在本设计承诺内(见设计文档推迟项)。
+fn split_op_lock(op_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    LOCKS
+        .lock()
+        .unwrap()
+        .entry(op_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
 }
 
 #[derive(serde::Serialize)]
@@ -4325,6 +4381,10 @@ async fn commit_split(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = data_root(&app).map_err(|e| e.to_string())?;
+        // 同一 op 的 commit/cancel/confirm/residual 进程内串行:并发交错 = 各拿旧阶段
+        // 做各的副作用(codex 实现轮三 P1⑤)。
+        let op_lock = split_op_lock(&op_id);
+        let _op_guard = op_lock.lock().unwrap();
         let vp_store = store::VoiceprintStore::new(root.clone());
         let mut op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
         if op.mode != "split_commit" {
@@ -4515,8 +4575,30 @@ async fn commit_split(
             .map_err(|e| e.to_string())?;
         }
 
-        // ── 阶段 2:批量改派 + 修订稿同步(reserved → segments_reassigned) ──
+        // ── 阶段 2:条件关联 → 批量改派 → 修订稿同步(reserved → segments_reassigned)。
+        //    关联放**最前**:它带 CAS,用户改过关联时在任何段被动过之前干净停下
+        //    (codex 实现轮三 P1③——冲突不是跳过继续,是停止计划);重入幂等(已是目标
+        //    人物直接放行)。 ──
         if op.phase == store::split_ops::phase::RESERVED {
+            {
+                let vp = vp_store.load();
+                for g in &op.plan_groups {
+                    if g.dest_kind == "person" {
+                        let (Some(pid), Some(sid)) = (g.dest_id.as_deref(), g.dest_speaker.as_deref()) else {
+                            continue;
+                        };
+                        if let Some(resolved) = store::VoiceprintStore::resolve(&vp, pid) {
+                            lc.request(lifecycle::machine::Msg::EditNote {
+                                op: lifecycle::machine::EditOp::AssignPersonIf {
+                                    id: op.note_id.clone(),
+                                    speaker_id: sid.to_string(),
+                                    person_id: resolved.to_string(),
+                                },
+                            })?;
+                        }
+                    }
+                }
+            }
             let moves: Vec<(u64, String, String)> = op
                 .plan_groups
                 .iter()
@@ -4539,34 +4621,8 @@ async fn commit_split(
                     },
                 })?;
             }
-            // person 组落关联(预留的新 S 此前无 person_id)。**条件化**:目标 S 的
-            // 关联在计划定稿后被用户改成了别人 → 尊重用户,跳过并如实记(无条件
-            // AssignPerson 会覆盖用户修改——codex 实现轮二 P2⑩)。
-            let vp = vp_store.load();
-            let note_link = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
-            for g in &op.plan_groups {
-                if g.dest_kind == "person" {
-                    let (Some(pid), Some(sid)) = (g.dest_id.as_deref(), g.dest_speaker.as_deref()) else { continue };
-                    if let Some(resolved) = store::VoiceprintStore::resolve(&vp, pid) {
-                        let cur = note_link.speakers.get(sid).and_then(|m| m.person_id.as_deref());
-                        if cur.is_some_and(|c| c != resolved) {
-                            eprintln!(
-                                "拆分({op_id}):{sid} 的关联已被改为 {},尊重用户不覆盖",
-                                cur.unwrap_or("<无>")
-                            );
-                            continue;
-                        }
-                        lc.request(lifecycle::machine::Msg::EditNote {
-                            op: lifecycle::machine::EditOp::AssignPerson {
-                                id: op.note_id.clone(),
-                                speaker_id: sid.to_string(),
-                                person_id: resolved.to_string(),
-                            },
-                        })?;
-                    }
-                }
-            }
             // 修订稿同步:全组同去向原位改;跨组标 stale(一期边界)。
+            let vp = vp_store.load();
             let moved: std::collections::BTreeMap<u64, String> = op
                 .plan_groups
                 .iter()
@@ -4707,6 +4763,8 @@ async fn commit_split(
             )
             .map_err(|e| e.to_string())?;
         }
+        // 解除已完成:此刻才能安全消化 baseline 期间排队的全库重建(轮三 P1②)。
+        consume_pending_rebuild(&app);
         refresh_qwen_hotwords_cache(&app);
         queue_person_graph_rebuild(&app, root, &tr!("拆分说话人", "Speaker split"))?;
         Ok(if enroll_notes.is_empty() { String::new() } else { enroll_notes.join("; ") })
@@ -4721,6 +4779,8 @@ async fn commit_split(
 #[tauri::command]
 fn cancel_split(app: AppHandle, op_id: String) -> Result<(), String> {
     let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
     let vp_store = store::VoiceprintStore::new(root.clone());
     let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
     let now = chrono::Local::now().to_rfc3339();
@@ -4766,6 +4826,7 @@ fn cancel_split(app: AppHandle, op_id: String) -> Result<(), String> {
         &now,
     )
     .map_err(|e| e.to_string())?;
+    consume_pending_rebuild(&app);
     Ok(())
 }
 

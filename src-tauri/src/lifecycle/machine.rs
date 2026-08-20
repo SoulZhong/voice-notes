@@ -144,6 +144,8 @@ pub enum EditOp {
     ReserveSpeakers { id: String, speaker_ids: Vec<String>, op_id: String },
     /// 取消拆分的占号清理:只删仍为空且无引用的本 op 预留项。
     ReleaseReservedSpeakers { id: String, op_id: String },
+    /// 条件关联(拆分收尾):当前关联非空且非目标人物即拒,锁内 CAS。
+    AssignPersonIf { id: String, speaker_id: String, person_id: String },
     /// 拆分批量改派:逐段 CAS 原 speaker,一段不符整体拒绝(已到新值=已完成,幂等)。
     SplitReassign { id: String, moves: Vec<(u64, String, String)>, op_id: String },
 }

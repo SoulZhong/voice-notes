@@ -310,6 +310,34 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// 条件关联(拆分收尾用):目标说话人当前关联必须为空或已是该人物,否则 Err。
+    /// "读关联→actor 写"分两步的话,中间的用户编辑会被无条件覆盖
+    /// (codex 实现轮三 P1③)——CAS 收进同一把笔记锁内。幂等。
+    pub fn assign_speaker_person_if(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        person_id: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        match meta.person_id.as_deref() {
+            Some(cur) if cur == person_id => return Ok(()), // 已是,幂等
+            Some(cur) => anyhow::bail!(
+                "说话人 {speaker_id} 的关联已被改为 {cur},拆分计划停止(尊重用户修改)"
+            ),
+            None => {}
+        }
+        meta.person_id = Some(person_id.to_string());
+        meta.reserved_by = None; // 关联即启用,清占号所有权
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 打「多人混杂」标(打标流程的笔记侧半步)。置位同时清掉 person_id:一个混杂簇
     /// 挂着单人关联本身就是错的,留着会继续把段落显示成那个人。幂等。
     pub fn set_multi_speaker(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
