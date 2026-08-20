@@ -140,14 +140,18 @@
     busy = false;
   }
 
-  let thenSplit = $state(false);
+  // 恢复入口:拆分意图已落盘(mode=split_commit)时锁定为拆分路径,不看本地默认值
+  // (codex 实现轮五 P2)。
+  // svelte-ignore state_referenced_locally -- 面板一次性挂载,existingOp 只做初值
+  let thenSplit = $state(existingOp?.mode === "split_commit");
   async function doResidual(choice: "accept" | "baseline") {
     if (!op || busy) return;
     busy = true;
     error = "";
     try {
-      await resolveMultiResidual(op.op_id, choice, thenSplit);
-      if (thenSplit) {
+      const split = thenSplit || op.mode === "split_commit";
+      await resolveMultiResidual(op.op_id, choice, split);
+      if (split) {
         op = { ...op, phase: "residual_decided", mode: "split_commit" };
         void loadSplitSuggestion();
       } else {

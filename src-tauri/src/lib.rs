@@ -4129,15 +4129,14 @@ async fn resolve_multi_residual(
                         return Err(e);
                     }
                 }
-                store::split_ops::advance_guarded(&vp_store, &root, &op_id, &[ph::SAMPLES_HANDLED], ph::RESIDUAL_DECIDED, &now)
-                    .map_err(|e| e.to_string())?;
-                // **以落盘的 mode 为准,不信本次请求参数**:首次 then_split=true 已把
-                // mode=split_commit 落盘,推进前崩掉、恢复请求传 false 的话,按参数走
-                // 会直接解除关单,静默丢掉已持久化的拆分意图(codex 实现轮四 P1②)。
-                let go_split = store::split_ops::load(&root, &op_id)
-                    .map(|o| o.mode == "split_commit")
-                    .unwrap_or(then_split);
-                if go_split {
+                // **以落盘的 mode 为准,不信本次请求参数**(codex 实现轮四 P1②):
+                // advance 的返回值就是刚落盘的 op,不再单独 load——单独 load 的瞬时
+                // 失败若回退到请求参数,旧问题原样回来(轮五 P1②)。
+                let advanced = store::split_ops::advance_guarded(
+                    &vp_store, &root, &op_id, &[ph::SAMPLES_HANDLED], ph::RESIDUAL_DECIDED, &now,
+                )
+                .map_err(|e| e.to_string())?;
+                if advanced.mode == "split_commit" {
                     // pending 重建**不在这里**消化:人物还隔离着,全库重建会把刚算的
                     // 基线按"隔离只清空"冲掉(codex 实现轮三 P1②)。commit/cancel
                     // 完成解除后消化。
@@ -4219,7 +4218,15 @@ fn complete_released(
             release_for_op_locked(vp_store, root, &o)
         })
         .map_err(|e| e.to_string())?;
-    let op = store::split_ops::advance_guarded(
+    // DONE **最后**落:它一落操作就从恢复列表消失,之前任何一步(图谱排队可失败)
+    // 没做完都补不回来(codex 实现轮五 P1①)。前面各步全部幂等,重试安全。
+    let op = store::split_ops::load(root, op_id).map_err(|e| e.to_string())?;
+    consume_pending_rebuild(app);
+    refresh_qwen_hotwords_cache(app);
+    if op.mode == "split_commit" {
+        queue_person_graph_rebuild(app, root.to_path_buf(), &tr!("拆分说话人", "Speaker split"))?;
+    }
+    store::split_ops::advance_guarded(
         vp_store,
         root,
         op_id,
@@ -4228,11 +4235,6 @@ fn complete_released(
         now,
     )
     .map_err(|e| e.to_string())?;
-    consume_pending_rebuild(app);
-    refresh_qwen_hotwords_cache(app);
-    if op.mode == "split_commit" {
-        queue_person_graph_rebuild(app, root.to_path_buf(), &tr!("拆分说话人", "Speaker split"))?;
-    }
     Ok(())
 }
 
