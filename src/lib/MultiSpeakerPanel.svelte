@@ -28,6 +28,8 @@
     speakers,
     candidateSpeakers,
     existingOp = null,
+    sourceLabel,
+    candidateCounts = {},
     segments = [],
     people = [],
     onAuditionSeg,
@@ -42,6 +44,10 @@
     candidateSpeakers: string[];
     /** 恢复入口:已存在的未完成 op。 */
     existingOp?: SplitOp | null;
+    /** 修订稿入口:被点的那个修订稿说话人的显示名(解释 R↔S 映射用)。 */
+    sourceLabel?: string;
+    /** 每个候选原始说话人在被点说话人名下占的段数。 */
+    candidateCounts?: Record<string, number>;
     /** 原始段(拆分表格用:文本片段/时长/试听定位)。 */
     segments?: { seq: number; text: string; start_ms: number; end_ms: number }[];
     /** 会议搭子(拆分去向「库人物」下拉)。 */
@@ -274,11 +280,18 @@
     {#if error}<div class="banner">{error}</div>{/if}
 
     {#if step === "pick"}
-      <p class="note">{t("speakers.multi.mapNotice")}</p>
+      {#if sourceLabel}
+        <p class="note">{t("speakers.multi.mapExplain", { label: sourceLabel })}</p>
+      {:else}
+        <p class="note">{t("speakers.multi.mapNotice")}</p>
+      {/if}
       {#each candidateSpeakers as sid (sid)}
         <label class="row-check">
           <input type="checkbox" bind:checked={checked[sid]} />
           {speakerLabel(sid, "mic", speakers)}
+          {#if candidateCounts[sid]}
+            <span class="note" style="margin: 0">{t("speakers.multi.mapSegs", { n: candidateCounts[sid] })}</span>
+          {/if}
         </label>
       {/each}
       <div class="actions">
