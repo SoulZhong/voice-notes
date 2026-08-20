@@ -581,6 +581,18 @@
     ];
     if (sids.length > 0) multiPanel = { candidates: sids, existingOp: null };
   }
+  /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
+  function auditionSegment(seq: number) {
+    const seg = note?.segments.find((s) => s.seq === seq);
+    if (!seg || !player) return;
+    const segSource = segSourceAt(seg.start_ms);
+    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource) };
+    // 注:多轨混音下另一条轨的同时段声音会一起响。轨道独奏(soloTrack)在
+    // fix-audition-and-refined-unlink 分支上,两支都合入 master 后在这里接上。
+    player.seek(seekFix(seg.start_ms, segSource));
+    player.play();
+  }
+
   function onMultiChanged() {
     refresh();
     recording.bumpNotes();
@@ -2124,6 +2136,9 @@
         speakers={note.speakers}
         candidateSpeakers={multiPanel.candidates}
         existingOp={multiPanel.existingOp}
+        segments={note.segments}
+        people={people.map((p) => ({ id: p.id, name: p.name }))}
+        onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}
         onClose={() => (multiPanel = null)}
         onChanged={onMultiChanged}
       />

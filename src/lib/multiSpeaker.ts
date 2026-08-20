@@ -48,8 +48,33 @@ export const multiImpact = (opId: string) => invoke<MultiImpactReport>("multi_im
 export const confirmMultiSamples = (opId: string, extraDelete: string[], confirmSeen: boolean) =>
   invoke<number>("confirm_multi_samples", { opId, extraDelete, confirmSeen });
 
-/** 残留二选一并收尾:accept=质心不动;baseline=逐人重算(退回样本基线)。 */
-export const resolveMultiResidual = (opId: string, choice: "accept" | "baseline") =>
-  invoke<void>("resolve_multi_residual", { opId, choice });
+/** 残留二选一:accept=质心不动;baseline=逐人重算(退回样本基线)。
+    thenSplit=true 时进入拆分模式(隔离暂不解除,由 commitSplit/cancelSplit 收尾)。 */
+export const resolveMultiResidual = (opId: string, choice: "accept" | "baseline", thenSplit = false) =>
+  invoke<void>("resolve_multi_residual", { opId, choice, thenSplit });
+
+export type SplitSuggestGroup = {
+  seqs: number[];
+  total_ms: number;
+  suggested: [string, string, number] | null; // (person_id, name, cosine)
+};
+export type SplitSuggestOut = { groups: SplitSuggestGroup[]; undetermined: number[] };
+
+export type SplitGroupIn = {
+  seqs: number[];
+  dest_kind: "existing_speaker" | "person" | "new_speaker" | "keep";
+  dest_id: string | null;
+};
+
+/** 建议分组(拆分专用聚类,纯本地纯读)。重活在后端 spawn_blocking。 */
+export const suggestSplitGroups = (opId: string) =>
+  invoke<SplitSuggestOut>("suggest_split_groups", { opId });
+
+/** 提交拆分(按阶段续跑;返回回灌的如实结果摘要,空串=全部成功)。 */
+export const commitSplit = (opId: string, groups: SplitGroupIn[]) =>
+  invoke<string>("commit_split", { opId, groups });
+
+/** 取消拆分(段落改派前可取消;隔离照常解除)。 */
+export const cancelSplit = (opId: string) => invoke<void>("cancel_split", { opId });
 
 export const listSplitOps = (noteId: string) => invoke<SplitOp[]>("list_split_ops", { noteId });
