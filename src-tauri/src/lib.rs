@@ -4183,8 +4183,12 @@ fn run_baseline_reset(
     op: &store::split_ops::SplitOp,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
-    if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+    {
+        // 起止交接都进 REBUILD_CTL(轮八 P1:锁外摸这些原子量就有交接窗)。
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+            return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+        }
     }
     let r = (|| -> Result<(), String> {
         let tag = current_speaker_model(app);
@@ -4195,10 +4199,14 @@ fn run_baseline_reset(
         }
         Ok(())
     })();
-    REBUILD_RUNNING.store(false, Ordering::SeqCst);
+    {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        REBUILD_RUNNING.store(false, Ordering::SeqCst);
+    }
     // 注意:排队的全库重建**不在这里**消化——人物还隔离着,全库重建会把刚算的基线
     // 清空。调用方在解除隔离之后调 consume_pending_rebuild(codex 实现轮二 P1⑤);
-    // 出错路径也由调用方兜(pending 不能没人管)。
+    // 出错路径也由调用方兜(pending 不能没人管)。PENDING/标记留在原位,进程中途
+    // 退出也有启动补跑兜住(标记是排队那次 spawn 在 CTL 内写的)。
     r
 }
 
@@ -4242,7 +4250,15 @@ fn complete_released(
 /// pending 在 RUNNING 期间被置位,清 RUNNING 的一方负责消化。
 fn consume_pending_rebuild(app: &AppHandle) {
     use std::sync::atomic::Ordering;
-    if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+    // swap 进 CTL(轮八 P1);spawn 在锁外(它自己要取 CTL,不可重入)。
+    // "swap 完、spawn 前"崩掉不会丢诉求:排队那次 spawn 已在 CTL 内写了落盘标记,
+    // 此刻没有 runner 会清它(清标记只发生在 runner 收尾且 PENDING=false&&成功),
+    // 下次启动按标记补跑。
+    let go = {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        REBUILD_PENDING.swap(false, Ordering::SeqCst)
+    };
+    if go {
         let st = app.state::<AppState>();
         spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "基线重算期间排队的重建");
     }
