@@ -23,7 +23,13 @@
   }: {
     speakers: Record<
       string,
-      { name: string; sources: string[]; person_id?: string | null; multi_speaker?: boolean }
+      {
+        name: string;
+        sources: string[];
+        person_id?: string | null;
+        multi_speaker?: boolean;
+        hint_person?: string | null;
+      }
     >;
     noteId: string;
     editable: boolean;
@@ -54,6 +60,13 @@
         已标记的说话人不再显示此入口(chip 上会带「多人」徽标)。 */
     onMarkMulti?: (id: string) => void;
   } = $props();
+
+  /** 声纹建议徽标(一键拆分产物):hint_person 在搭子列表里解析得到名字才显示。 */
+  const hintName = (id: string): string | null => {
+    const pid = speakers[id]?.hint_person;
+    if (!pid) return null;
+    return people?.find((p) => p.id === pid)?.name || null;
+  };
 
   let editingId = $state<string | null>(null);
   let editingName = $state("");
@@ -230,6 +243,9 @@
       >
         {#if speakers[id]?.multi_speaker}
           <span class="multi-tag">{t("speakers.chipMultiTag")}</span>
+        {/if}
+        {#if !speakers[id]?.person_id && hintName(id)}
+          <span class="multi-tag">{t("speakers.chipHint", { name: hintName(id)! })}</span>
         {/if}
         {#if editable}
           <button

@@ -262,9 +262,13 @@ impl NoteStore {
                 centroid: None,
                 count: 0,
                 person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
             })
             .name = name.to_string();
+        // 用户亲自命名 = 已有判断,声纹建议退场。
+        if let Some(m) = speakers.get_mut(speaker_id) {
+            m.hint_person = None;
+        }
         write_speakers_atomic(&dir, &speakers)
     }
 
@@ -286,6 +290,7 @@ impl NoteStore {
             .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
         meta.person_id = Some(person_id.to_string());
         meta.name = String::new();
+        meta.hint_person = None; // 人工结论取代声纹建议
         write_speakers_atomic(&dir, &speakers)
     }
 
@@ -307,6 +312,53 @@ impl NoteStore {
             return Ok(()); // 本就没关联,幂等返回
         }
         meta.person_id = None;
+        write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 一键拆分的恢复原状(不拆/撤销共用):多人标记复位,人物关联按打标前快照
+    /// 恢复(仅当现值为空——用户此后自己关联过就不覆盖)。仅本篇表项,不触库。
+    pub fn restore_after_unsplit(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        prior_person: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let Some(meta) = speakers.get_mut(speaker_id) else {
+            anyhow::bail!("笔记中没有该说话人: {speaker_id}");
+        };
+        meta.multi_speaker = false;
+        if meta.person_id.is_none() {
+            if let Some(p) = prior_person {
+                meta.person_id = Some(p.to_string());
+            }
+        }
+        write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 一键拆分收尾:给新说话人写声纹建议(hint_person)。split_born 已在预留项
+    /// 创建时置位(reserve_speakers)。建议仅展示,关联/改名即清
+    /// (2026-08-22-one-click-split-design.md)。
+    pub fn set_speaker_hints(
+        &self,
+        id: &str,
+        hints: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if hints.is_empty() {
+            return Ok(());
+        }
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        for (sid, pid) in hints {
+            if let Some(m) = speakers.get_mut(sid) {
+                m.hint_person = Some(pid.clone());
+            }
+        }
         write_speakers_atomic(&dir, &speakers)
     }
 
@@ -466,6 +518,8 @@ impl NoteStore {
                     person_id: None,
                     multi_speaker: false,
                     reserved_by: Some(op_id.to_string()),
+                    split_born: true,
+                    hint_person: None,
                 },
             );
         }
@@ -623,7 +677,7 @@ impl NoteStore {
                     centroid: None,
                     count: 0,
                     person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
                 },
             );
             write_speakers_atomic(&dir, &speakers)?;
@@ -1612,6 +1666,47 @@ mod tests {
         assert!(n.speakers.contains_key(&ids[0]), "被引用的保留");
         assert!(!n.speakers.contains_key(&ids[1]), "仍为空的删掉");
         assert!(n.speakers[&ids[0]].reserved_by.is_none(), "启用即清所有权标记");
+    }
+
+    /// 一键拆分配套(2026-08-22):恢复原状 + 建议徽标生命周期。
+    #[test]
+    fn restore_after_unsplit_and_hint_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("a", Some("S1"))], &["S1", "S2"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        // 打标形态:multi 置位、关联被清。
+        store.set_multi_speaker(&id, "S1").unwrap();
+        // 恢复:multi 复位,prior 关联回填。
+        store.restore_after_unsplit(&id, "S1", Some("P7")).unwrap();
+        let n = store.load(&id).unwrap();
+        let m = &n.speakers["S1"];
+        assert!(!m.multi_speaker);
+        assert_eq!(m.person_id.as_deref(), Some("P7"));
+        // 用户已自己关联过 → 不覆盖。
+        store.assign_speaker_person(&id, "S1", "P9").unwrap();
+        store.restore_after_unsplit(&id, "S1", Some("P7")).unwrap();
+        assert_eq!(store.load(&id).unwrap().speakers["S1"].person_id.as_deref(), Some("P9"));
+
+        // hint:写入 → 改名清除;写入 → 关联清除。
+        store.set_speaker_hints(&id, &[("S2".into(), "P3".into())]).unwrap();
+        assert_eq!(store.load(&id).unwrap().speakers["S2"].hint_person.as_deref(), Some("P3"));
+        store.rename_speaker(&id, "S2", "张三").unwrap();
+        assert!(store.load(&id).unwrap().speakers["S2"].hint_person.is_none(), "改名清 hint");
+        store.set_speaker_hints(&id, &[("S2".into(), "P3".into())]).unwrap();
+        store.assign_speaker_person(&id, "S2", "P4").unwrap();
+        let m2 = store.load(&id).unwrap().speakers["S2"].clone();
+        assert!(m2.hint_person.is_none(), "关联清 hint");
+    }
+
+    /// 拆分预留项自带 split_born:关联时批量回灌永久关闭的依据。
+    #[test]
+    fn reserved_speakers_are_split_born() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("a", Some("S1"))], &["S1"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        store.reserve_speakers(&id, &["S9".to_string()], "so-t").unwrap();
+        let n = store.load(&id).unwrap();
+        assert!(n.speakers["S9"].split_born, "预留新号必须带 split_born");
     }
 
     #[test]

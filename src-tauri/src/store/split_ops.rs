@@ -68,6 +68,14 @@ pub struct SplitOp {
     /// 拆分计划(split_commit 模式;commit 前落盘,之后不可变)。
     #[serde(default)]
     pub plan_groups: Vec<SplitPlanGroup>,
+    /// 打标时各被标说话人的人物关联快照(sid → resolve 后 person id)。一键撤销
+    /// (undo_auto_split)恢复本篇表项用;仅笔记级,不触库
+    /// (2026-08-22-one-click-split-design.md)。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub prior_links: std::collections::BTreeMap<String, String>,
+    /// 一键撤销时间戳(undo_auto_split 幂等闸;None=未撤销)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undone_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

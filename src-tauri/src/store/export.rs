@@ -397,7 +397,7 @@ mod tests {
                 sources: vec![],
                 centroid: None,
                 count: 0,
-                person_id: None, multi_speaker: false, reserved_by: None,
+                person_id: None, multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
             },
         );
         let note = crate::store::Note {

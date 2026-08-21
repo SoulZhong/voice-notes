@@ -63,7 +63,7 @@
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
-  import { listSplitOps, type SplitOp } from "$lib/multiSpeaker";
+  import { autoSplitSpeaker, undoAutoSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -616,10 +616,51 @@
     void id;
     void refreshMultiOps();
   });
-  /** 打标入口(两个视图共用:一波说话人后修订稿胸牌就是 S 本尊,无需映射)。 */
+  /** 打标入口(两个视图共用:一波说话人后修订稿胸牌就是 S 本尊,无需映射)。
+      仅存留给历史中断 op 的恢复面板;默认路径已换一键拆分(2026-08-22 设计)。 */
   function openMultiForRaw(sid: string) {
     multiPanel = { candidates: [sid], existingOp: null };
   }
+
+  // ── 一键拆分(2026-08-22-one-click-split-design.md):点击即后台全默认执行 ──
+  let autoSplitRunning = $state(false);
+  let autoToast = $state<
+    | { kind: "split"; out: AutoSplitOut; undone: boolean }
+    | { kind: "nochange" }
+    | { kind: "error"; msg: string }
+    | { kind: "undone" }
+    | null
+  >(null);
+  async function runAutoSplit(sid: string) {
+    if (autoSplitRunning) return;
+    autoSplitRunning = true;
+    autoToast = null;
+    try {
+      const out = await autoSplitSpeaker(id, sid);
+      autoToast = out.split ? { kind: "split", out, undone: false } : { kind: "nochange" };
+    } catch (e) {
+      autoToast = { kind: "error", msg: `${e}` };
+    } finally {
+      autoSplitRunning = false;
+      refresh();
+      recording.bumpNotes();
+      void refreshMultiOps();
+    }
+  }
+  async function undoSplitToast() {
+    if (autoToast?.kind !== "split" || autoToast.undone) return;
+    try {
+      await undoAutoSplit(autoToast.out.op_id);
+      autoToast = { kind: "undone" };
+    } catch (e) {
+      autoToast = { kind: "error", msg: `${e}` };
+    }
+    refresh();
+    recording.bumpNotes();
+  }
+
+  /** 各说话人最近试听过的段 seq(「确认才入库」:关联时把这一段作为确认样本)。 */
+  let lastAuditioned = $state<Record<string, number>>({});
   /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
   function auditionSegment(seq: number) {
     const seg = note?.segments.find((s) => s.seq === seq);
@@ -665,6 +706,7 @@
     // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
+    lastAuditioned[sid] = seg.seq;
     preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
     armPreviewWatchdog(Math.min(seg.end_ms - seg.start_ms, PREVIEW_MAX_MS));
     // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
@@ -1944,8 +1986,8 @@
           editable={!refining}
           counts={segCounts}
           {people}
-          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
-          onMarkMulti={canEdit ? openMultiForRaw : undefined}
+          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
+          onMarkMulti={canEdit ? runAutoSplit : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
@@ -1963,10 +2005,10 @@
           editable={true}
           counts={segCounts}
           people={canEdit ? people : undefined}
-          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
           onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
-          onMarkMulti={canEdit ? openMultiForRaw : undefined}
+          onMarkMulti={canEdit ? runAutoSplit : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1976,7 +2018,25 @@
         />
       {/if}
 
-      {#if openMultiOps.length > 0 && !multiPanel}
+      {#if autoSplitRunning}
+        <div class="banner">{t("speakers.autosplit.progress")}</div>
+      {:else if autoToast}
+        <div class="banner">
+          {#if autoToast.kind === "split"}
+            {t("speakers.autosplit.done", { n: autoToast.out.groups.length })}
+            {#if autoToast.out.kept > 0}{t("speakers.autosplit.kept", { n: autoToast.out.kept })}{/if}
+            <button class="link" onclick={undoSplitToast}>{t("speakers.autosplit.undo")}</button>
+          {:else if autoToast.kind === "nochange"}
+            {t("speakers.autosplit.nochange")}
+          {:else if autoToast.kind === "undone"}
+            {t("speakers.autosplit.undone")}
+          {:else}
+            {t("speakers.autosplit.failed", { e: autoToast.msg })}
+          {/if}
+          <button class="link" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</button>
+        </div>
+      {/if}
+      {#if openMultiOps.length > 0 && !multiPanel && openMultiOps.some((o) => o.phase !== "done")}
         <div class="banner">
           {t("speakers.multi.resume")}
           <button

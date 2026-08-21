@@ -3776,9 +3776,10 @@ fn assign_note_speaker_person(
     note_id: String,
     speaker_id: String,
     person_id: String,
+    audited_seq: Option<u64>,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    do_assign_note_speaker_person(&app, &note_id, &speaker_id, &person_id)
+    do_assign_note_speaker_person_with(&app, &note_id, &speaker_id, &person_id, audited_seq)
 }
 
 /// 关联的可复用本体:命令壳与 identify 建议确认(apply_identify_suggestion)共用。
@@ -3789,6 +3790,20 @@ fn do_assign_note_speaker_person(
     note_id: &str,
     speaker_id: &str,
     person_id: &str,
+) -> Result<(), String> {
+    do_assign_note_speaker_person_with(app, note_id, speaker_id, person_id, None)
+}
+
+/// 「确认才入库」版本(2026-08-22-one-click-split-design.md):拆分产物说话人
+/// (split_born)关联时**不做整组批量回灌**——混杂簇是批量喂库的污染源;库写入
+/// 只走 audited_seq(用户刚试听过的那一段):存为人物样本 + 单段回灌质心。
+/// 没试听就关联 → 本篇生效,库零写入。普通说话人行为不变(整组 spawn_feedback)。
+fn do_assign_note_speaker_person_with(
+    app: &AppHandle,
+    note_id: &str,
+    speaker_id: &str,
+    person_id: &str,
+    audited_seq: Option<u64>,
 ) -> Result<(), String> {
     let vp = open_voiceprint_store(app)?.load();
     let Some(resolved) = store::VoiceprintStore::resolve(&vp, person_id).map(str::to_string) else {
@@ -3808,6 +3823,7 @@ fn do_assign_note_speaker_person(
         .and_then(|m| m.person_id.as_deref())
         .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
         .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
+    let split_born = note.speakers.get(speaker_id).is_some_and(|m| m.split_born);
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::AssignPerson {
             id: note_id.to_string(),
@@ -3815,16 +3831,90 @@ fn do_assign_note_speaker_person(
             person_id: resolved.clone(),
         },
     })?;
-    spawn_feedback(
-        app,
-        note_id.to_string(),
-        note.segments,
-        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_id.to_string()])),
-        prior,
-        resolved,
-        Some(speaker_id.to_string()),
-    );
+    if split_born {
+        // 确认才入库:只有用户刚试听过的那段(audited_seq 且确属该说话人)进库。
+        let audited = audited_seq.and_then(|q| {
+            note.segments.iter().find(|s| s.seq == q && s.speaker.as_deref() == Some(speaker_id)).cloned()
+        });
+        if let Some(seg) = audited {
+            spawn_confirmed_sample(app, note_id.to_string(), speaker_id.to_string(), resolved, note.segments, seg);
+        }
+    } else {
+        spawn_feedback(
+            app,
+            note_id.to_string(),
+            note.segments,
+            feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_id.to_string()])),
+            prior,
+            resolved,
+            Some(speaker_id.to_string()),
+        );
+    }
     Ok(())
+}
+
+/// 用户确认样本的后台落库:切出音频存样本(append_confirmed_sample,免老熟人策略)
+/// + 该段单独回灌质心(reinforce_person,走普通门禁与账本)。失败只记日志——本篇
+/// 关联已生效,库写入是增强不是前提。
+fn spawn_confirmed_sample(
+    app: &AppHandle,
+    note_id: String,
+    speaker_id: String,
+    person_id: String,
+    segments: Vec<store::SegmentRecord>,
+    seg: store::SegmentRecord,
+) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let run = || -> anyhow::Result<()> {
+            let root = data_root(&app).map_err(anyhow::Error::msg)?;
+            let nroot = notes_dir(&app).map_err(anyhow::Error::msg)?;
+            let dir = nroot.join(&note_id);
+            let vp_store = store::VoiceprintStore::new(root);
+            let _fb = FEEDBACK_GATE.lock().unwrap();
+            // 切音频:与 feedback 同一口径(track_pcm + offset_ms,16k f32)。
+            let meta = store::audio::load_audio_meta(&dir);
+            let pcm = store::transcode::track_pcm(&dir, &seg.source)?;
+            let offset = meta.tracks.get(&seg.source).map(|t| t.offset_ms).unwrap_or(0);
+            let start = (seg.start_ms.saturating_sub(offset) as usize).saturating_mul(16);
+            let end = ((seg.end_ms.saturating_sub(offset) as usize).saturating_mul(16)).min(pcm.len());
+            anyhow::ensure!(start < end, "试听段落在音轨覆盖范围之外");
+            let wrote = vp_store.append_confirmed_sample(&person_id, &pcm[start..end], &note_id, &speaker_id)?;
+            if !wrote {
+                eprintln!("确认样本未写入(隔离/满员/空音频): {person_id}");
+            }
+            // 单段回灌质心(模型门禁/账本/黑名单照过)。
+            let expected = current_speaker_model(&app);
+            let library_model = vp_store.load().embedding_model.clone();
+            let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
+            let mut needs_rebuild = false;
+            let now = chrono::Local::now().to_rfc3339();
+            let r = feedback::reinforce_person(
+                &dir,
+                &segments,
+                &feedback::SegFilter::Seqs(std::collections::BTreeSet::from([seg.seq])),
+                &person_id,
+                &vp_store,
+                &library_model,
+                &expected,
+                &mut embedder,
+                &now,
+                None,
+                &mut needs_rebuild,
+                false,
+            )?;
+            if needs_rebuild {
+                let st = app.state::<AppState>();
+                *st.embedder_cache.lock().unwrap() = None;
+                spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "确认样本回灌纠错后质心置空");
+            }
+            eprintln!("确认样本入库: {person_id} seg#{} → {r:?}", seg.seq);
+            Ok(())
+        };
+        if let Err(e) = run() {
+            eprintln!("确认样本入库失败(本篇关联不受影响): {e}");
+        }
+    });
 }
 
 /// 解除说话人与声纹库人物的关联,并**连带撤销**这次关联带来的声纹回灌。
@@ -4018,6 +4108,18 @@ fn mark_speaker_multi(
                     o
                 }
                 None => {
+                    // 撤销要恢复的人物关联快照:SetMultiSpeaker 马上会清掉 person_id,
+                    // 此刻不记就没了(undo_auto_split 只动本篇表项,不触库)。
+                    let mut prior_links: std::collections::BTreeMap<String, String> =
+                        Default::default();
+                    for sid in &speaker_ids {
+                        if let Some(pid) = note.speakers.get(sid).and_then(|m| m.person_id.as_deref())
+                        {
+                            if let Some(r) = store::VoiceprintStore::resolve(&vp, pid) {
+                                prior_links.insert(sid.clone(), r.to_string());
+                            }
+                        }
+                    }
                     let o = store::split_ops::SplitOp {
                         op_id: candidate_op_id.clone(),
                         mode: "quarantine_only".into(),
@@ -4028,6 +4130,8 @@ fn mark_speaker_multi(
                         residual_choice: None,
                         samples_confirm_seen: false,
                         plan_groups: Vec::new(),
+                        prior_links,
+                        undone_at: None,
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     };
@@ -4975,6 +5079,201 @@ fn cancel_split(app: AppHandle, op_id: String) -> Result<(), String> {
 }
 
 /// 某笔记的未完成打标操作(UI 恢复入口)。纯读。
+#[derive(serde::Serialize, Clone)]
+struct AutoSplitHint {
+    person_id: String,
+    name: String,
+    sim: f32,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct AutoSplitGroupOut {
+    speaker_id: String,
+    count: u32,
+    dur_ms: u64,
+    hint: Option<AutoSplitHint>,
+}
+
+#[derive(serde::Serialize)]
+struct AutoSplitOut {
+    op_id: String,
+    /// false = 声纹听下来就是一个人(或全部判不准),没拆,一切已恢复原状。
+    split: bool,
+    groups: Vec<AutoSplitGroupOut>,
+    /// 判不准、留在原说话人的段数。
+    kept: u32,
+}
+
+/// 一键拆分(2026-08-22-one-click-split-design.md):普通用户入口——「这不是一个人?」。
+/// 后台串既有阶段机,全部取默认:mark(隔离) → 样本自动清理(只删可归因到本篇被标簇
+/// 的) → 残留「接受」 → 声纹分组 → 每组落新说话人,判不准的保持不动。只有一组时
+/// 不硬拆:取消并恢复原状,如实报告。全程库零写入(去向全是新说话人,无回灌);
+/// 入库只发生在用户此后亲自试听+认人时(见 assign_note_speaker_person 的 audited_seq)。
+#[tauri::command]
+async fn auto_split_speaker(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    note_id: String,
+    speaker_id: String,
+) -> Result<AutoSplitOut, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    reject_if_active(&state, &note_id)?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
+    }
+    // ① 打标(隔离/作废建议/清关联,记录 prior_links 快照)。
+    let op_id = mark_speaker_multi(app.clone(), note_id.clone(), vec![speaker_id.clone()])?;
+    // ② 样本自动清理:零勾选=只删「可归因到本篇被标簇」的样本(receipt 证据),
+    //    来源未知的一律保留——比旧流程让用户凭试听勾删更保守。
+    confirm_multi_samples(app.clone(), op_id.clone(), Vec::new(), true)?;
+    // ③ 残留默认「接受」:零损失、立即可用,小偏差随后续录音按加权稀释。
+    resolve_multi_residual(app.clone(), op_id.clone(), "accept".into(), true).await?;
+    // ④ 声纹分组。
+    let sug = suggest_split_groups(app.clone(), op_id.clone()).await?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+    let nstore = store::NoteStore::new(nroot);
+    // ⑤ 只有一组(或全是判不准):不硬拆。取消(解除隔离)并恢复本篇原状。
+    if sug.groups.len() <= 1 {
+        cancel_split(app.clone(), op_id.clone())?;
+        let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        nstore
+            .restore_after_unsplit(&note_id, &speaker_id, op.prior_links.get(&speaker_id).map(String::as_str))
+            .map_err(|e| e.to_string())?;
+        return Ok(AutoSplitOut { op_id, split: false, groups: Vec::new(), kept: 0 });
+    }
+    // ⑥ 提交:每组新说话人,判不准保持不动。
+    let mut groups_in: Vec<SplitGroupIn> = sug
+        .groups
+        .iter()
+        .map(|g| SplitGroupIn { seqs: g.seqs.clone(), dest_kind: "new_speaker".into(), dest_id: None })
+        .collect();
+    if !sug.undetermined.is_empty() {
+        groups_in.push(SplitGroupIn {
+            seqs: sug.undetermined.clone(),
+            dest_kind: "keep".into(),
+            dest_id: None,
+        });
+    }
+    let enroll_notes = commit_split(app.clone(), op_id.clone(), groups_in).await?;
+    if !enroll_notes.is_empty() {
+        eprintln!("auto_split({op_id}): {enroll_notes}");
+    }
+    // ⑦ 读回新号,写声纹建议徽标(仅展示;split_born 已随预留项创建置位)。
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    let vp = store::VoiceprintStore::new(root.clone()).load();
+    let mut hints: Vec<(String, String)> = Vec::new();
+    let mut out_groups: Vec<AutoSplitGroupOut> = Vec::new();
+    // plan_groups 与提交的 groups 同序(commit 按提交顺序落计划);逐一配对建议。
+    for (i, pg) in op.plan_groups.iter().enumerate() {
+        if pg.dest_kind != "new_speaker" {
+            continue;
+        }
+        let Some(sid) = pg.dest_speaker.clone() else { continue };
+        let hint = sug.groups.get(i).and_then(|g| g.suggested.as_ref()).map(|(pid, name, sim)| {
+            let resolved = store::VoiceprintStore::resolve(&vp, pid).unwrap_or(pid).to_string();
+            AutoSplitHint { person_id: resolved, name: name.clone(), sim: *sim }
+        });
+        if let Some(h) = &hint {
+            hints.push((sid.clone(), h.person_id.clone()));
+        }
+        out_groups.push(AutoSplitGroupOut {
+            speaker_id: sid,
+            count: pg.seqs.len() as u32,
+            dur_ms: sug.groups.get(i).map(|g| g.total_ms).unwrap_or(0),
+            hint,
+        });
+    }
+    nstore.set_speaker_hints(&note_id, &hints).map_err(|e| e.to_string())?;
+    Ok(AutoSplitOut {
+        op_id,
+        split: true,
+        groups: out_groups,
+        kept: sug.undetermined.len() as u32,
+    })
+}
+
+/// 一键拆分的撤销(纯笔记级——自动流对声纹库零写入,可安全逆转;唯一不还原的是
+/// 已删的「可归因本篇」样本,它们本就是被污染的):段落原路搬回 → 空的新说话人
+/// 删除 → 多人标记复位 → 原人物关联恢复 → 修订稿反向同步。段落被后续编辑动过
+/// 则拒绝(CAS 兜底)。幂等:已撤销过的 op 直接拒。
+#[tauri::command]
+fn undo_auto_split(app: AppHandle, state: State<AppState>, op_id: String) -> Result<(), String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if op.phase != store::split_ops::phase::DONE {
+        return Err(tr!("该拆分未完成,不能撤销: {p}", "Split not finished; cannot undo: {p}", p = &op.phase));
+    }
+    if op.undone_at.is_some() {
+        return Err(tr!("该拆分已撤销过", "This split was already undone"));
+    }
+    reject_if_active(&state, &op.note_id)?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&op.note_id) {
+        return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
+    }
+    let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+    let nstore = store::NoteStore::new(nroot.clone());
+    let dir = nroot.join(&op.note_id);
+    // 反向搬运表:seq 现在必须仍在拆分去向上(CAS),搬回计划定稿时的原说话人。
+    let mut back_moves: Vec<(u64, String, String)> = Vec::new();
+    let mut created_sids: std::collections::BTreeSet<String> = Default::default();
+    for pg in &op.plan_groups {
+        let Some(dest) = &pg.dest_speaker else { continue };
+        if pg.dest_kind == "new_speaker" {
+            created_sids.insert(dest.clone());
+        }
+        for (q, orig) in pg.seqs.iter().zip(&pg.expected_speakers) {
+            back_moves.push((*q, dest.clone(), orig.clone()));
+        }
+    }
+    if !back_moves.is_empty() {
+        nstore
+            .batch_set_segment_speaker(&op.note_id, &back_moves, &op.op_id)
+            .map_err(|e| {
+                tr!(
+                    "段落已被后续编辑改动,无法撤销: {e}",
+                    "Segments were edited after the split; cannot undo: {e}",
+                    e = e
+                )
+            })?;
+    }
+    // 空的新说话人删除(段已搬回,必空;删除失败不阻塞其余恢复,如实记 stderr)。
+    for sid in &created_sids {
+        if let Err(e) = nstore.delete_speaker(&op.note_id, sid) {
+            eprintln!("undo_auto_split({op_id}): 删除新说话人 {sid} 失败(忽略): {e}");
+        }
+    }
+    // 多人标记复位 + 原关联恢复(仅本篇表项,不触库)。
+    for sid in &op.speaker_ids {
+        nstore
+            .restore_after_unsplit(&op.note_id, sid, op.prior_links.get(sid).map(String::as_str))
+            .map_err(|e| e.to_string())?;
+    }
+    // 修订稿反向同步:整段同去向原位改回;跨组标 stale(与正向同一口径)。
+    let moved_back: std::collections::BTreeMap<u64, String> =
+        back_moves.iter().map(|(q, _, back)| (*q, back.clone())).collect();
+    if !moved_back.is_empty() && store::aing_exists(&dir) {
+        if let Err(e) = store::sync_refined_after_split(&dir, &moved_back) {
+            if let Err(e2) = store::mark_refined_stale(&dir) {
+                return Err(tr!(
+                    "撤销已生效,但修订稿同步失败且无法标记过期: {e} / {e2}",
+                    "Undo applied, but refined sync failed and stale-marking failed: {e} / {e2}",
+                    e = e,
+                    e2 = e2
+                ));
+            }
+        }
+    }
+    // 落撤销标记(幂等闸)。
+    let mut op2 = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    op2.undone_at = Some(chrono::Local::now().to_rfc3339());
+    op2.updated_at = op2.undone_at.clone().unwrap();
+    store::split_ops::save(&root, &op2).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn list_split_ops(app: AppHandle, note_id: String) -> Result<Vec<store::split_ops::SplitOp>, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -9518,6 +9817,8 @@ pub fn run() {
             suggest_split_groups,
             commit_split,
             cancel_split,
+            auto_split_speaker,
+            undo_auto_split,
             confirm_multi_samples,
             resolve_multi_residual,
             list_split_ops,

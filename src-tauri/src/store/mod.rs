@@ -152,6 +152,15 @@ pub struct SpeakerMeta {
     /// 取消拆分时仅当表项仍为空且无段引用才连同删除;启用(改派)时清掉此标记。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_by: Option<String>,
+    /// 拆分产物:该说话人由混杂簇拆分创建。关联人物时**永久**关闭整组批量回灌
+    /// (混杂簇是批量喂库的污染源),库写入只走「用户确认过的那一段」
+    /// (2026-08-22-one-click-split-design.md「确认才入库」)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split_born: bool,
+    /// 声纹建议(仅展示,不冒充结论):拆分时种子近邻命中的人物 id。胸牌显示
+    /// 「像是 {name}?」;关联/改名即清除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_person: Option<String>,
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。

@@ -182,6 +182,8 @@ pub fn finalize_speakers(
             // 重聚类真把混杂簇拆开时,拆出的新簇不带标——那正是期望的结果。
             multi_speaker: old_speakers.get(*old_id).is_some_and(|m| m.multi_speaker),
             reserved_by: None,
+            split_born: old_speakers.get(*old_id).is_some_and(|m| m.split_born),
+            hint_person: old_speakers.get(*old_id).and_then(|m| m.hint_person.clone()),
         });
     }
     // 继承 id 的重编号起点从同一个计数器(`next`)继续,不重新从 base 起跳——保证
@@ -296,7 +298,7 @@ mod tests {
     fn named_meta(name: &str, person: Option<&str>) -> SpeakerMeta {
         SpeakerMeta {
             name: name.into(), sources: vec!["mic".into()], centroid: Some(vec![1.0]),
-            count: 5, person_id: person.map(String::from), multi_speaker: false, reserved_by: None,
+            count: 5, person_id: person.map(String::from), multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
         }
     }
 
