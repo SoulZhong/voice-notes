@@ -298,10 +298,10 @@
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** 修订稿视图的说话人条数据:一波说话人(2026-08-21 设计)——就是原始稿说话人
-      表本身(段落 speaker 已由后端 join 映射到 S id),两个视图的胸牌完全一致:
-      同成员、同名、同色、同编号、同「多人」徽标,配合同一份 segCounts 还同序、
-      同碎片折叠。旧文档映射不回 S 的遗留段落说话人补进表(仅显示兜底)。 */
+  /** 修订稿段落标签/配色的解析表:原始稿说话人表 + 旧文档映射不回 S 的遗留
+      段落 id(仅供段落文字显示兜底)。胸牌组件不吃这张表——它直接吃
+      note.speakers,与原始稿视图同一个对象,列表不可能有差异(2026-08-21
+      用户实测:遗留 R 分组会让两视图胸牌对不上)。 */
   const refinedSpeakers = $derived.by(() => {
     const m: Record<
       string,
@@ -1907,7 +1907,7 @@
           <div class="banner">{t("notes.retrans.staleBanner")}</div>
         {/if}
         <SpeakerChips
-          speakers={refinedSpeakers}
+          speakers={note.speakers}
           noteId={id}
           editable={!refining}
           counts={segCounts}
