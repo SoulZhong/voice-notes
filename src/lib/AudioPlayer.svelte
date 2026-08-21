@@ -19,6 +19,7 @@
     noteId,
     title,
     onLoaded,
+    onUserPause,
   }: {
     tracks: TrackInfo[];
     /** 音轨波形(0..1 归一条高,按时间等分;由页面从段落 rms 聚合)。空数组退化为平轨。 */
@@ -33,6 +34,10 @@
         宿主用它在重装后恢复播放位置(A/B 切换保位置,codex P2)——原生核心
         每次装载都从 0/paused 起,不回调宿主无从得知何时可以 seek。 */
     onLoaded?: () => void;
+    /** 用户亲手点了暂停键(可选)。宿主的「试听」要区分「用户主动停」和心跳事件里
+        seek/play 间隙采到的 playing=false——从 playing 翻转推断必有竞态
+        (2026-08-21 用户实测:整篇一直放),只有这里是确定的用户意图。 */
+    onUserPause?: () => void;
   } = $props();
 
   const totalMs = $derived(tracks.reduce((m, t) => Math.max(m, t.offset_ms + t.duration_ms), 0));
@@ -305,8 +310,10 @@
   }
 
   function toggle() {
-    if (playing) pause();
-    else play();
+    if (playing) {
+      pause();
+      onUserPause?.();
+    } else play();
   }
 
   const pct = $derived(totalMs > 0 ? (Math.min(currentMs, totalMs) / totalMs) * 100 : 0);
