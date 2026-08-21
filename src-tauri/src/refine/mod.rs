@@ -366,6 +366,17 @@ pub(crate) fn embed_all(
     kept: &[&SegmentRecord],
     embedder: &mut dyn SpeakerEmbedder,
 ) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
+    embed_all_with_progress(note_dir, kept, embedder, &|_, _| {})
+}
+
+/// 带进度回调的逐段嵌入:(done, total)。大簇(实测 724 段/80 分钟)要算数分钟,
+/// 没有进度的等待与卡死不可区分(2026-08-22 用户实测「提示一直没消失」)。
+pub(crate) fn embed_all_with_progress(
+    note_dir: &Path,
+    kept: &[&SegmentRecord],
+    embedder: &mut dyn SpeakerEmbedder,
+    progress: &dyn Fn(usize, usize),
+) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
     let audio_meta = crate::store::audio::load_audio_meta(note_dir);
     let mut out: Vec<Option<Vec<f32>>> = vec![None; kept.len()];
 
@@ -374,12 +385,15 @@ pub(crate) fn embed_all(
         by_source.entry(s.source.as_str()).or_default().push(i);
     }
 
+    let mut done = 0usize;
     for (source, idxs) in by_source {
         // 该轨全是短段(< MIN_EMBED_MS)时无需读它的 PCM,省一次磁盘 I/O。
         if !idxs.iter().any(|&i| {
             let s = kept[i];
             s.end_ms.saturating_sub(s.start_ms) >= recluster::MIN_EMBED_MS
         }) {
+            done += idxs.len();
+            progress(done, kept.len());
             continue;
         }
         let offset_ms = audio_meta
@@ -390,6 +404,8 @@ pub(crate) fn embed_all(
         let pcm = crate::store::transcode::track_pcm(note_dir, source)?;
         for &i in &idxs {
             let s = kept[i];
+            done += 1;
+            progress(done, kept.len());
             let dur = s.end_ms.saturating_sub(s.start_ms);
             if dur < recluster::MIN_EMBED_MS {
                 continue;

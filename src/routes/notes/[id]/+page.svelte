@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { onTranscodeDone , onAingProgress } from "$lib/events";
+  import { onTranscodeDone , onAingProgress, onAutoSplitProgress } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { save } from "@tauri-apps/plugin-dialog";
@@ -624,6 +624,18 @@
 
   // ── 一键拆分(2026-08-22-one-click-split-design.md):点击即后台全默认执行 ──
   let autoSplitRunning = $state(false);
+  /** 逐段嵌入进度(done/total);null=尚无事件(装载/解码阶段)。 */
+  let autoSplitProg = $state<{ done: number; total: number } | null>(null);
+  $effect(() => {
+    const forId = id;
+    const un = onAutoSplitProgress((e) => {
+      if (e.note_id !== forId) return;
+      autoSplitProg = { done: e.done, total: e.total };
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
   let autoToast = $state<
     | { kind: "split"; out: AutoSplitOut; undone: boolean }
     | { kind: "nochange" }
@@ -634,6 +646,7 @@
   async function runAutoSplit(sid: string) {
     if (autoSplitRunning) return;
     autoSplitRunning = true;
+    autoSplitProg = null;
     autoToast = null;
     try {
       const out = await autoSplitSpeaker(id, sid);
@@ -2019,7 +2032,10 @@
       {/if}
 
       {#if autoSplitRunning}
-        <div class="banner">{t("speakers.autosplit.progress")}</div>
+        <div class="banner">
+          {t("speakers.autosplit.progress")}
+          {#if autoSplitProg}{t("speakers.autosplit.progressN", { done: autoSplitProg.done, total: autoSplitProg.total })}{/if}
+        </div>
       {:else if autoToast}
         <div class="banner">
           {#if autoToast.kind === "split"}
