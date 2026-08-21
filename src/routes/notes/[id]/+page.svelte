@@ -590,9 +590,11 @@
     previewTimer = setTimeout(() => {
       previewTimer = null;
       if (preview) {
+        // 走到这里=响应式边界失灵(真凶已定案一例:effect 依赖追踪误杀,见下方
+        // untrack 注释);留痕以便再犯时定位。
         console.warn("[preview] watchdog fired; reactive end-boundary did not stop playback");
         player?.pause();
-        endPreview();
+        endPreview("watchdog");
       }
     }, durMs + 1200);
   }
@@ -673,7 +675,7 @@
   }
 
   /** 退出试听态:清状态并解除独奏(三条退出路径共用,漏一条就会把轨一直压着)。 */
-  function endPreview() {
+  function endPreview(_reason = "unknown") {
     if (previewTimer) {
       clearTimeout(previewTimer);
       previewTimer = null;
@@ -685,13 +687,21 @@
   // 段尾自动停:只在试听态生效,停完清态(不影响用户随后正常播放)。
   $effect(() => {
     if (preview && playerPlaying && playerMs >= preview.endMs) {
-      player?.pause();
-      endPreview();
+      untrack(() => {
+        player?.pause();
+        endPreview("boundary");
+      });
     }
   });
+  // untrack 是本效应的命门(2026-08-22 定案的「试听不停」真凶):endPreview →
+  // player.soloTrack(null) 会读播放器的 soloSource 等 $state,不隔离的话这些读取
+  // 被追踪成本效应的依赖——试听一开始 soloTrack(源) 改了 soloSource,本效应立即
+  // 误触发,把试听态+看门狗一并清掉(且不暂停),停止边界连根消失,整篇一直放。
+  // 三轮边界修复(armed/onUserPause/墙钟看门狗)全被它一招团灭,埋点日志实锤:
+  // preview 建立 1ms 后 endPreview reason=note-change。
   $effect(() => {
     void id;
-    endPreview();
+    untrack(() => endPreview("note-change"));
   });
 
   /** 原始稿各说话人的段数：说话人条按此排序，并折叠只出现 1 段的碎片。 */
@@ -1887,7 +1897,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={endPreview} noteId={note?.meta.id} title={note?.meta.title} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->

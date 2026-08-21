@@ -237,6 +237,9 @@
       在说话会一起响,听感就是「试听的样本不是同一个人」(2026-08-20 实测:一篇真实
       笔记里 4~5/5 的试听片段都存在跨轨重叠)。 */
   export function soloTrack(source: string | null) {
+    // 成品单轨(mixed)等装载:请求独奏的源不在轨道列表时降级为不独奏——否则唯一的
+    // 轨道被整条静音,试听全程无声(2026-08-22 用户实测)。单轨本就无跨轨串音可隔。
+    if (source && !tracks.some((t) => t.source === source)) source = null;
     if (soloSource === source) return;
     soloSource = source;
     for (const tr of tracks) pushMute(tr.source);
