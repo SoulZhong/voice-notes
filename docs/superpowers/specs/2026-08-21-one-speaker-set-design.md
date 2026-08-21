@@ -48,7 +48,11 @@ rename_refined_speaker 全部删除;拆分面板的 sourceLabel/candidateCounts 
 
 - 簇来源 `cluster_members_from_doc` 不变——文档换 S 键后自动按 S 分簇。
 - 自动应用:改用 notes.rs 既有的 `assign_speaker_person_if`(期望"当前未关联"
-  才写,与"自动应用前置=簇原本无关联"的既有语义严丝合缝)。
+  才写,与"自动应用前置=簇原本无关联"的既有语义严丝合缝)。**不复用
+  assign_note_speaker_person 命令**——命令自带 spawn_feedback,自动路径有自己的
+  同步回灌,复用会双重回灌(自查发现)。
+- 建议确认(手动)则复用命令本体(EditOp::AssignPerson + spawn_feedback),
+  与用户在胸牌上手选人走同一条路。
 - 撤销:新增 `clear_speaker_person_if(speaker, expect_person)`——speakers.json 每
   说话人单值 person_id,CAS 天然不会再有"段落间不一致"这一类误拦。
 - 建议确认(apply_identify_suggestion)同样走 S 域。回灌/撤销回灌账本逻辑不动
@@ -71,7 +75,13 @@ person/name 改写删除(字段已不承载语义,统一清 None)。
 **多数源段落 speaker** 映射到 S;操作作用于映射后的 S。重新 Aing 后自然写成新格式。
 空 source_seqs 的用户插入块无说话人(现状不变)。
 
-### 8. 不动的部分
+### 8. 后端出口跟着查表(自查发现)
+
+凡读段落 `name`/`person_id` 的出口改为按 note.speakers 解析:markdown 导出
+(export.rs 的 R 前缀特判一并删除)、MCP get_note 修订稿载荷。图谱(aing_graph)
+若引用段落身份,同口径处理。
+
+### 9. 不动的部分
 
 LLM 润色/部分重试/WYSIWYG 保存/实体图谱只关心文本与下标,全部不动。
 声纹回灌"不连带撤销"的 2026-08-19 范围决定不动。
