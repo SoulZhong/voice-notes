@@ -1881,13 +1881,24 @@ fn spawn_session(
             let vp_store_e = store::VoiceprintStore::new(root);
             let live_enrolled_e = live_enrolled.clone();
             let enroll_model = speaker_model.clone();
+            let enroll_note = note_id.clone();
+            let enroll_nstore = store::NoteStore::new(match notes_dir(&app) {
+                Ok(d) => d,
+                Err(_) => std::path::PathBuf::new(),
+            });
             registry.set_enroller(
                 store::AUTO_ENROLL_MS,
                 Box::new(move |snap| {
-                    match vp_store_e.upsert_from_session(
+                    // 续录场景:该簇已被标多人混杂 → 不入库(标是上一场停录后打的)。
+                    if enroll_nstore.multi_speaker_ids(&enroll_note).contains(&snap.id) {
+                        eprintln!("实时入库跳过:{} 已标多人混杂", snap.id);
+                        return None;
+                    }
+                    match vp_store_e.upsert_from_session_traced(
                         std::slice::from_ref(snap),
                         &chrono::Local::now().to_rfc3339(),
                         &enroll_model,
+                        &enroll_note,
                     ) {
                         Ok(links) => {
                             let pid = links.get(&snap.id).cloned();
@@ -1921,6 +1932,10 @@ fn spawn_session(
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
         // 停录快照入库用的模型标签,与实时入库同一份快照(见上方 speaker_model)。
         let snapshot_model = speaker_model.clone();
+        let nstore_d = store::NoteStore::new(match notes_dir(&app) {
+            Ok(d) => d,
+            Err(_) => std::path::PathBuf::new(),
+        });
         let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
             Ok(root) => Some(store::VoiceprintStore::new(root)),
             Err(e) => {
@@ -2091,10 +2106,23 @@ fn spawn_session(
                         // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
                         // person_id 随 finalize 落盘。
                         if let Some(store) = &vp_store_d {
-                            match store.upsert_from_session(
+                            // 「多人混杂」簇不入库不写样本(打标是事后行为,续录/重转写
+                            // 后同一 S 再攒出快照时这里兜住——codex 实现轮一 P1①)。
+                            let multi = nstore_d.multi_speaker_ids(&note_id_d);
+                            if !multi.is_empty() {
+                                snaps.retain(|sn| {
+                                    let keep = !multi.contains(&sn.id);
+                                    if !keep {
+                                        eprintln!("声纹入库跳过:{} 已标多人混杂", sn.id);
+                                    }
+                                    keep
+                                });
+                            }
+                            match store.upsert_from_session_traced(
                                 &snaps,
                                 &chrono::Local::now().to_rfc3339(),
                                 &snapshot_model,
+                                &note_id_d,
                             ) {
                                 Ok(enrolled) => {
                                     // 原 set_speaker_person(cluster, person) 循环改为把新关联
@@ -2126,10 +2154,16 @@ fn spawn_session(
                                         };
                                         let newly_enrolled =
                                             newly.contains(&pid) || enrolled.contains_key(&snap.id);
-                                        if !newly_enrolled && !store.sample_paths_existing(&pid).is_empty() {
-                                            continue; // 识别出的老熟人且已有样本:不再累积
-                                        }
-                                        if let Err(e) = store.append_sample(&pid, sample) {
+                                        // 收口版:resolve/隔离/老熟人检查、WAL 溯源、写文件同一临界区。
+                                        // 旧代码在这里用未 resolve 的 pid 查"有没有样本",笔记持
+                                        // loser id 时会误判无样本、把样本重复写到 winner(设计轮二 P1②)。
+                                        if let Err(e) = store.append_session_sample(
+                                            &pid,
+                                            sample,
+                                            &note_id_d,
+                                            &snap.id,
+                                            newly_enrolled,
+                                        ) {
                                             eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
                                         }
                                     }
@@ -3862,6 +3896,1144 @@ fn clear_note_speaker_person(
     Ok(())
 }
 
+// ── 多人混杂:打标(quarantine_only)四命令。设计:2026-08-20-mixed-speaker-split-design.md ──
+
+#[derive(serde::Serialize)]
+struct MultiImpactPerson {
+    person_id: String,
+    name: String,
+    /// 该簇对此人的 count 贡献(质心贡献 receipt 汇总)。**估算**,不是账目。
+    cluster_count_est: u64,
+    /// 此人主质心的累计 count(各信道求和),做占比分母。
+    person_count_total: u64,
+    /// 是否存在与该场入库同刻的会话质心。措辞只能是"该场存在",不能说"来自被标簇"
+    /// (同场干净簇也可能写入,系统分不出来)。
+    has_session_centroid: bool,
+    total_ms: u64,
+    last_seen: String,
+    samples: Vec<MultiImpactSample>,
+}
+
+#[derive(serde::Serialize)]
+struct MultiImpactSample {
+    /// 相对声纹根的路径(voiceprints/P15-2.wav),删除 API 用它。
+    path: String,
+    /// 绝对路径:前端 convertFileSrc 试听用。
+    audition_path: String,
+    /// 有溯源且来自本篇被标簇 → 可自动删;false = 「来源未知」,只能试听勾删。
+    from_marked_cluster: bool,
+}
+
+#[derive(serde::Serialize)]
+struct MultiImpactReport {
+    op_id: String,
+    phase: String,
+    persons: Vec<MultiImpactPerson>,
+}
+
+/// 打「多人混杂」标。speaker_ids 是原始稿 S 编号(修订稿 R 没有存储位,UI 先映射)。
+/// 顺序:plan+隔离(同一 vp_guard,原子)→ 作废旧 identify 建议(IDENTIFY_ACT_GATE 内,
+/// 失败即失败,不静默)→ 笔记侧标记(actor/NoteLock)→ marked。
+/// 幂等恢复:同笔记同说话人集合已有 plan 阶段的 op → 复用续跑,不再新建
+/// (codex 实现轮一 P1④⑤⑬)。
+#[tauri::command]
+fn mark_speaker_multi(
+    app: AppHandle,
+    note_id: String,
+    speaker_ids: Vec<String>,
+) -> Result<String, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    if speaker_ids.is_empty() {
+        return Err(tr!("没有选择说话人", "No speaker selected"));
+    }
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(nroot.clone()).load(&note_id).map_err(|e| e.to_string())?;
+    for sid in &speaker_ids {
+        if !note.speakers.contains_key(sid) {
+            return Err(tr!("笔记中没有该说话人: {sid}", "No such speaker in this note: {sid}", sid = sid));
+        }
+    }
+    let vp_store = store::VoiceprintStore::new(root.clone());
+    let now = chrono::Local::now().to_rfc3339();
+    let marked_seqs: std::collections::BTreeSet<u64> = note
+        .segments
+        .iter()
+        .filter(|s| s.speaker.as_deref().is_some_and(|sp| speaker_ids.iter().any(|x| x == sp)))
+        .map(|s| s.seq)
+        .collect();
+    let dir = nroot.join(&note_id);
+    // **先持 IDENTIFY_ACT_GATE,罩住计划+隔离+作废全程**:auto_apply 持同一把门做
+    // 关联+回灌,不前置的话它可以插在"计划算完(目标还是 suggested,没进 affected)"
+    // 与"作废落盘"之间完成回灌——混杂段进了一个没被隔离的人(codex 实现轮二 P1②)。
+    // 锁序恒 IDENTIFY_ACT_GATE → vp_guard/actor,与 auto_apply_one 同向。
+    let _act_gate = IDENTIFY_ACT_GATE.lock().unwrap();
+    let members = store::load_refined(&dir)
+        .map(|doc| refine::identify::cluster_members_from_doc(&doc))
+        .unwrap_or_default();
+    // ── plan + 受影响人物 + 隔离:同一 vp_guard 内原子完成(解析与置位之间不许插入
+    //    合并;plan 先于隔离落盘)。复用既有 plan 阶段的 op(上次卡在后半程)。 ──
+    static SPLIT_OP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 时间戳进 id:PID 会复用、计数器重启归零,只有 pid+计数在重启后能撞上旧 op 并
+    // 覆盖它(codex 实现轮二 P1⑦);create() 的存在性检查是最后一道闸。
+    let candidate_op_id = format!(
+        "so-{}-{}-{}",
+        chrono::Local::now().format("%Y%m%d%H%M%S%3f"),
+        std::process::id(),
+        SPLIT_OP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let op_id = vp_store
+        .with_guard(|| {
+            let mut sorted_ids = speaker_ids.clone();
+            sorted_ids.sort();
+            // 复用:同笔记同说话人集合、卡在 plan 的 op。
+            let existing = store::split_ops::open_ops_for_note(&root, &note_id)
+                .into_iter()
+                .find(|o| {
+                    let mut a = o.speaker_ids.clone();
+                    a.sort();
+                    o.phase == store::split_ops::phase::PLAN && a == sorted_ids
+                });
+            let vp = vp_store.load();
+            let mut affected: std::collections::BTreeSet<String> = Default::default();
+            for sid in &speaker_ids {
+                if let Some(pid) = note.speakers.get(sid).and_then(|m| m.person_id.as_deref()) {
+                    if let Some(r) = store::VoiceprintStore::resolve(&vp, pid) {
+                        affected.insert(r.to_string());
+                    }
+                }
+            }
+            for r in store::sample_trace::read_centroid_receipts(&root) {
+                if r.note_id == note_id && speaker_ids.iter().any(|s| s == &r.cluster_id) {
+                    if let Some(p) = store::VoiceprintStore::resolve(&vp, &r.resolved_person) {
+                        affected.insert(p.to_string());
+                    }
+                }
+            }
+            // identify 自动应用过、且簇成员与被标段重叠的人物:混杂段已被回灌进去,
+            // 一并隔离(codex 实现轮一 P1⑬)。
+            if let Some(idoc) = refine::identify::load_identify(&dir) {
+                for a in &idoc.assignments {
+                    if a.status != "auto_applied" && a.status != "applied" {
+                        continue;
+                    }
+                    let overlap = members
+                        .get(&a.cluster)
+                        .is_some_and(|m| m.intersection(&marked_seqs).next().is_some());
+                    if overlap {
+                        if let Some(pid) = a.person_id.as_deref() {
+                            if let Some(r) = store::VoiceprintStore::resolve(&vp, pid) {
+                                affected.insert(r.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            let op = match existing {
+                Some(mut o) => {
+                    // 并集,不覆盖:上次已执行的 SetMultiSpeaker 清掉了 person_id,
+                    // 这次重算会看不到那些人——缩小集合等于把已隔离的人永久遗弃
+                    // (codex 实现轮二 P1①)。
+                    for p in &o.affected_persons {
+                        affected.insert(p.clone());
+                    }
+                    o.affected_persons = affected.iter().cloned().collect();
+                    o.updated_at = now.clone();
+                    store::split_ops::save(&root, &o)?;
+                    o
+                }
+                None => {
+                    let o = store::split_ops::SplitOp {
+                        op_id: candidate_op_id.clone(),
+                        mode: "quarantine_only".into(),
+                        note_id: note_id.clone(),
+                        speaker_ids: speaker_ids.clone(),
+                        affected_persons: affected.iter().cloned().collect(),
+                        phase: store::split_ops::phase::PLAN.into(),
+                        residual_choice: None,
+                        samples_confirm_seen: false,
+                        plan_groups: Vec::new(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+                    store::split_ops::create(&root, &o)?;
+                    o
+                }
+            };
+            // 隔离置位与解析同锁:中间不可能插入合并让 id 失效。
+            let mut vp = vp_store.load();
+            let mut changed = false;
+            for pid in &op.affected_persons {
+                if let Some(p) = vp.people.get_mut(pid) {
+                    if !p.voiceprint_quarantined {
+                        p.voiceprint_quarantined = true;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                vp_store.save_for_split(&vp)?;
+            }
+            Ok(op.op_id)
+        })
+        .map_err(|e| e.to_string())?;
+    // ── 作废旧 identify 建议:在 IDENTIFY_ACT_GATE 内,失败就失败(op 停在 plan,
+    //    可重试)——静默吞掉的话旧建议还能把混杂段灌回库(codex 实现轮一 P1⑬)。 ──
+    {
+        refine::identify::invalidate_for_marking(&dir, &{
+            store::split_ops::load(&root, &op_id)
+                .map_err(|e| e.to_string())?
+                .affected_persons
+                .into_iter()
+                .collect()
+        }, &marked_seqs, &members, &now)
+        .map_err(|e| e.to_string())?;
+    }
+    // ── 笔记侧标记(actor 持 NoteLock 串行落盘;附带清 person_id)。幂等。 ──
+    let lc = app.state::<lifecycle::LifecycleHandle>();
+    for sid in &speaker_ids {
+        lc.request(lifecycle::machine::Msg::EditNote {
+            op: lifecycle::machine::EditOp::SetMultiSpeaker {
+                id: note_id.clone(),
+                speaker_id: sid.clone(),
+            },
+        })?;
+    }
+    store::split_ops::advance_guarded(
+        &vp_store,
+        &root,
+        &op_id,
+        &[store::split_ops::phase::PLAN],
+        store::split_ops::phase::MARKED,
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(op_id)
+}
+
+/// 打标影响面(供确认面板):每个受影响人物的 count 占比估算、会话质心存在性、
+/// 元数据残留、样本清单(标注哪些可归因)。纯读。
+#[tauri::command]
+fn multi_impact(app: AppHandle, op_id: String) -> Result<MultiImpactReport, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    let vp = store::VoiceprintStore::new(root.clone()).load();
+    let receipts = store::sample_trace::read_centroid_receipts(&root);
+    let trace = store::sample_trace::load(&root);
+    let mut persons = Vec::new();
+    for pid in &op.affected_persons {
+        let Some(p) = vp.people.get(pid) else { continue };
+        let mine: Vec<_> = receipts
+            .iter()
+            .filter(|r| {
+                r.note_id == op.note_id
+                    && op.speaker_ids.iter().any(|s| s == &r.cluster_id)
+                    && store::VoiceprintStore::resolve(&vp, &r.resolved_person).is_some_and(|x| x == pid.as_str())
+            })
+            .collect();
+        let cluster_count_est: u64 = mine.iter().map(|r| r.count).sum();
+        let ats: std::collections::BTreeSet<&str> = mine.iter().map(|r| r.at.as_str()).collect();
+        let has_session_centroid = p
+            .session_centroids
+            .values()
+            .flatten()
+            .any(|c| ats.contains(c.seen.as_str()));
+        let store_h = store::VoiceprintStore::new(root.clone());
+        let samples = store_h
+            .sample_paths_existing(pid)
+            .iter()
+            .map(|abs| {
+                let rel = abs.strip_prefix(&root).unwrap_or(abs).to_string_lossy().into_owned();
+                let from_marked = trace.receipts.iter().any(|r| {
+                    r.path == rel
+                        && r.note_id == op.note_id
+                        && op.speaker_ids.iter().any(|s| s == &r.cluster_id)
+                });
+                MultiImpactSample {
+                    path: rel,
+                    audition_path: abs.to_string_lossy().into_owned(),
+                    from_marked_cluster: from_marked,
+                }
+            })
+            .collect();
+        persons.push(MultiImpactPerson {
+            person_id: pid.clone(),
+            name: p.name.clone(),
+            cluster_count_est,
+            person_count_total: p.centroids.values().map(|c| c.count).sum(),
+            has_session_centroid,
+            total_ms: p.total_ms,
+            last_seen: p.last_seen.clone(),
+            samples,
+        });
+    }
+    Ok(MultiImpactReport { op_id: op.op_id, phase: op.phase, persons })
+}
+
+/// 样本处置:自动删可归因的(receipt 校验 path+hash),用户勾选的额外删除逐份
+/// hash 封禁后删。confirm_seen 落盘为"用户已确认看到信息缺口"。
+#[tauri::command]
+fn confirm_multi_samples(
+    app: AppHandle,
+    op_id: String,
+    extra_delete: Vec<String>,
+    confirm_seen: bool,
+) -> Result<u32, String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
+    // **锁后重读**:锁前的快照可能停在"还没选残留"的旧状态——residual 若在本请求
+    // 等锁期间落了意图并跑完 baseline,拿旧快照过冻结检查再删样本,删完才在阶段
+    // CAS 上失败,但删除已无法撤销(codex 实现轮四 P1①)。
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if op.phase != store::split_ops::phase::MARKED
+        && op.phase != store::split_ops::phase::SAMPLES_HANDLED
+    {
+        return Err(tr!("当前阶段不能处置样本: {p}", "Cannot handle samples in phase {p}", p = &op.phase));
+    }
+    // 意图落盘后样本集合冻结:residual 选择(尤其 baseline)以当时的样本为输入,
+    // 再 purge 会让重算的幂等性失效(codex 实现轮三 P2)。
+    if op.residual_choice.is_some() {
+        return Err(tr!(
+            "残留处置已开始,样本集合已冻结",
+            "Residual handling has started; the sample set is frozen"
+        ));
+    }
+    // 阶段落盘必须证明用户看到过信息缺口:不带确认不推进,重入也不许把已确认改回
+    // 未确认(codex 实现轮一 P2)。
+    if !confirm_seen {
+        return Err(tr!(
+            "请先确认已了解样本无法归因的说明",
+            "Please confirm you understand the attribution gap first"
+        ));
+    }
+    let vp_store = store::VoiceprintStore::new(root.clone());
+    let deleted = vp_store
+        .purge_marked_samples(&op, &extra_delete)
+        .map_err(|e| e.to_string())?;
+    let now = chrono::Local::now().to_rfc3339();
+    vp_store
+        .with_guard(|| {
+            let mut o = store::split_ops::load(&root, &op_id)?;
+            anyhow::ensure!(
+                o.phase == store::split_ops::phase::MARKED
+                    || o.phase == store::split_ops::phase::SAMPLES_HANDLED,
+                "阶段已变: {}",
+                o.phase
+            );
+            o.phase = store::split_ops::phase::SAMPLES_HANDLED.into();
+            o.samples_confirm_seen = true;
+            o.updated_at = now.clone();
+            store::split_ops::save(&root, &o)
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(deleted)
+}
+
+/// 残留二选一并收尾:accept = 质心不动;baseline = 逐人重算(退回样本基线)。
+/// 恢复语义(codex 实现轮一 P1⑩):residual_decided 阶段重入必须与已落盘的选择一致
+/// (副作用在选择落盘**之前**执行,所以落盘值=已执行值);released 阶段重入只补 done。
+/// 解除隔离排除其它未完成 op 仍持有的人物(P1⑤)。
+#[tauri::command]
+async fn resolve_multi_residual(
+    app: AppHandle,
+    op_id: String,
+    choice: String,
+    then_split: bool,
+) -> Result<(), String> {
+    if choice != "accept" && choice != "baseline" {
+        return Err(tr!("未知选项: {choice}", "Unknown choice: {choice}", choice = &choice));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let op_lock = split_op_lock(&op_id);
+        let _op_guard = op_lock.lock().unwrap();
+        let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        let vp_store = store::VoiceprintStore::new(root.clone());
+        let now = chrono::Local::now().to_rfc3339();
+        use store::split_ops::phase as ph;
+        match op.phase.as_str() {
+            p if p == ph::SAMPLES_HANDLED => {
+                // 意图先落盘,副作用后执行,阶段最后推进(codex 实现轮二 P1④)。
+                // 意图 CAS 收进 guard 内(锁内重读):两个并发请求各自拿着"还没选"的
+                // 旧快照时,后进 guard 的那个必须看见先者写的 choice 并被拒
+                // (codex 实现轮三 P1④;op 锁已串行化,这是纵深防御)。
+                vp_store
+                    .with_guard(|| {
+                        let mut o = store::split_ops::load(&root, &op_id)?;
+                        anyhow::ensure!(o.phase == ph::SAMPLES_HANDLED, "阶段已变: {}", o.phase);
+                        match &o.residual_choice {
+                            Some(stored) if stored != &choice => {
+                                anyhow::bail!("已选择过「{stored}」,恢复中不能改选")
+                            }
+                            Some(_) => {} // 同值重入:不重写
+                            None => {
+                                o.residual_choice = Some(choice.clone());
+                                if then_split {
+                                    o.mode = "split_commit".into();
+                                }
+                                o.updated_at = now.clone();
+                                store::split_ops::save(&root, &o)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                if choice == "baseline" {
+                    // 幂等:rebuild_person_from_samples 重跑得到同一结果。
+                    if let Err(e) = run_baseline_reset(&app, &vp_store, &op) {
+                        consume_pending_rebuild(&app); // pending 不能没人管
+                        return Err(e);
+                    }
+                }
+                // **以落盘的 mode 为准,不信本次请求参数**(codex 实现轮四 P1②):
+                // advance 的返回值就是刚落盘的 op,不再单独 load——单独 load 的瞬时
+                // 失败若回退到请求参数,旧问题原样回来(轮五 P1②)。
+                let advanced = store::split_ops::advance_guarded(
+                    &vp_store, &root, &op_id, &[ph::SAMPLES_HANDLED], ph::RESIDUAL_DECIDED, &now,
+                )
+                .map_err(|e| e.to_string())?;
+                if advanced.mode == "split_commit" {
+                    // pending 重建**不在这里**消化:人物还隔离着,全库重建会把刚算的
+                    // 基线按"隔离只清空"冲掉(codex 实现轮三 P1②)。commit/cancel
+                    // 完成解除后消化。
+                    return Ok(());
+                }
+            }
+            p if p == ph::RESIDUAL_DECIDED => {
+                // 重入:选择已落盘已执行,只允许同值收尾;拆分模式不从这里收尾。
+                let stored = op.residual_choice.clone().unwrap_or_default();
+                if stored != choice {
+                    return Err(tr!(
+                        "已选择过「{stored}」,恢复中不能改选",
+                        "Already chose \"{stored}\"; cannot change during recovery",
+                        stored = &stored
+                    ));
+                }
+                if op.mode == "split_commit" {
+                    // 落盘意图优先于请求参数(轮四 P1②)。
+                    return Err(tr!("拆分模式由拆分流程收尾", "Split mode finishes via the split flow"));
+                }
+            }
+            p if p == ph::RELEASED => {
+                // 重入:公共收尾(重跑解除+done+pending+缓存+图谱,轮四 P1③)。
+                return complete_released(&app, &vp_store, &root, &op_id, &now);
+            }
+            p => {
+                return Err(tr!("先完成样本处置(当前阶段: {p})", "Handle samples first (phase: {p})", p = p));
+            }
+        }
+        finish_and_release(&vp_store, &root, &op_id, &[ph::RESIDUAL_DECIDED], ph::RELEASED, &now)
+            .map_err(|e| e.to_string())?;
+        complete_released(&app, &vp_store, &root, &op_id, &now)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// baseline 重算的执行体:与全库重建共用 REBUILD_RUNNING 单飞;结束后消化
+/// REBUILD_PENDING(期间若有人切模型,请求被记为 pending,没人消化的话库会长期
+/// 停在旧空间——codex 实现轮一 P1⑨)。
+fn run_baseline_reset(
+    app: &AppHandle,
+    vp_store: &store::VoiceprintStore,
+    op: &store::split_ops::SplitOp,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    {
+        // 起止交接都进 REBUILD_CTL(轮八 P1:锁外摸这些原子量就有交接窗)。
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+            return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+        }
+    }
+    let r = (|| -> Result<(), String> {
+        let tag = current_speaker_model(app);
+        let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+            .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+        for pid in &op.affected_persons {
+            vp_store.rebuild_person_from_samples(pid, &mut e, &tag).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        REBUILD_RUNNING.store(false, Ordering::SeqCst);
+    }
+    // 注意:排队的全库重建**不在这里**消化——人物还隔离着,全库重建会把刚算的基线
+    // 清空。调用方在解除隔离之后调 consume_pending_rebuild(codex 实现轮二 P1⑤);
+    // 出错路径也由调用方兜(pending 不能没人管)。PENDING/标记留在原位,进程中途
+    // 退出也有启动补跑兜住(标记是排队那次 spawn 在 CTL 内写的)。
+    r
+}
+
+/// released 阶段的**公共收尾**(commit/residual 两侧共用,幂等):重跑解除(兜底)→
+/// 补 done → 消化 pending 重建 → 刷缓存 →(拆分模式)排图谱重建。没有它,DONE 推进
+/// 失败后的重入会各走各的半截路径,漏掉 pending/缓存/图谱(codex 实现轮四 P1③)。
+fn complete_released(
+    app: &AppHandle,
+    vp_store: &store::VoiceprintStore,
+    root: &std::path::Path,
+    op_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    vp_store
+        .with_guard(|| {
+            let o = store::split_ops::load(root, op_id)?;
+            release_for_op_locked(vp_store, root, &o)
+        })
+        .map_err(|e| e.to_string())?;
+    // DONE **最后**落:它一落操作就从恢复列表消失,之前任何一步(图谱排队可失败)
+    // 没做完都补不回来(codex 实现轮五 P1①)。前面各步全部幂等,重试安全。
+    let op = store::split_ops::load(root, op_id).map_err(|e| e.to_string())?;
+    consume_pending_rebuild(app);
+    refresh_qwen_hotwords_cache(app);
+    if op.mode == "split_commit" {
+        queue_person_graph_rebuild(app, root.to_path_buf(), &tr!("拆分说话人", "Speaker split"))?;
+    }
+    store::split_ops::advance_guarded(
+        vp_store,
+        root,
+        op_id,
+        &[store::split_ops::phase::RELEASED],
+        store::split_ops::phase::DONE,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 消化 REBUILD_PENDING(若有)。与 spawn_voiceprint_rebuild 的排队协议配套:
+/// pending 在 RUNNING 期间被置位,清 RUNNING 的一方负责消化。
+fn consume_pending_rebuild(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    // swap 进 CTL(轮八 P1);spawn 在锁外(它自己要取 CTL,不可重入)。
+    // "swap 完、spawn 前"崩掉不会丢诉求:排队那次 spawn 已在 CTL 内写了落盘标记,
+    // 此刻没有 runner 会清它(清标记只发生在 runner 收尾且 PENDING=false&&成功),
+    // 下次启动按标记补跑。
+    let go = {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        REBUILD_PENDING.swap(false, Ordering::SeqCst)
+    };
+    if go {
+        let st = app.state::<AppState>();
+        spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "基线重算期间排队的重建");
+    }
+}
+
+/// **同一 vp_guard 内**把本 op 推进到"不再持有"的阶段并解除隔离。两件事必须原子:
+/// 分开做的话,重叠的两个 op 各自在解除时看到对方"未关单"而跳过共享人物,随后又
+/// 各自关单——全部完成、人物却永久隔离(codex 实现轮二 P1③)。原子化后,后关单的
+/// 那个 op 一定能看到先关单者已处于非持有阶段,补上解除。
+/// `from`/`to`:本 op 的阶段推进(to 必须是非持有阶段:released / cancelled)。
+fn finish_and_release(
+    vp_store: &store::VoiceprintStore,
+    root: &std::path::Path,
+    op_id: &str,
+    from: &[&str],
+    to: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    vp_store.with_guard(|| {
+        // **先解除、后推进**(同一 guard):顺序反过来的话,"阶段已 released、解除没写成"
+        // 的崩溃窗会让独占人物永久隔离——released 重入只补 done,cancelled 连恢复列表
+        // 都不进(codex 实现轮三 P1①)。现在崩在中间 → 阶段未变 → 重入重跑解除(幂等)。
+        // 持有者判定读的是**别的 op** 的盘面阶段,与自身阶段无关,所以先后互换不
+        // 影响轮二 P1③ 的原子性结论:后关单者仍然会看到先关单者已是非持有态。
+        let op = store::split_ops::load(root, op_id)?;
+        anyhow::ensure!(
+            from.contains(&op.phase.as_str()),
+            "阶段不符:当前 {},不能收尾到 {to}",
+            op.phase
+        );
+        release_for_op_locked(vp_store, root, &op)?;
+        store::split_ops::advance(root, op_id, from, to, now)?;
+        Ok(())
+    })
+}
+
+/// 解除本 op 人物的隔离(排除其它持有者)。**调用方须已持 vp_guard**。幂等。
+fn release_for_op_locked(
+    vp_store: &store::VoiceprintStore,
+    root: &std::path::Path,
+    op: &store::split_ops::SplitOp,
+) -> anyhow::Result<()> {
+    let held: std::collections::BTreeSet<String> = store::split_ops::open_ops_all(root)
+        .into_iter()
+        .filter(|o| o.op_id != op.op_id && store::split_ops::holds_quarantine(o))
+        .flat_map(|o| o.affected_persons)
+        .collect();
+    let mut vp = vp_store.load();
+    let mut changed = false;
+    for pid in &op.affected_persons {
+        if held.contains(pid) {
+            eprintln!("解除隔离跳过:{pid} 仍被其它未完成处置持有");
+            continue;
+        }
+        if let Some(p) = vp.people.get_mut(pid) {
+            if p.voiceprint_quarantined {
+                p.voiceprint_quarantined = false;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        vp_store.save_for_split(&vp)?;
+    }
+    Ok(())
+}
+
+/// 进程内按 op 串行化(commit/cancel/confirm/residual 四命令共用):同一 op 的两个
+/// 命令并发交错会产生"读旧阶段 → 各做各的副作用"的竞态(codex 实现轮三 P1⑤)。
+/// 客户端单进程,进程内互斥即可;跨进程不在本设计承诺内(见设计文档推迟项)。
+fn split_op_lock(op_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    LOCKS
+        .lock()
+        .unwrap()
+        .entry(op_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+#[derive(serde::Serialize)]
+struct SplitSuggestGroup {
+    seqs: Vec<u64>,
+    total_ms: u64,
+    suggested: Option<(String, String, f32)>, // (person_id, name, cosine)
+}
+
+#[derive(serde::Serialize)]
+struct SplitSuggestOut {
+    groups: Vec<SplitSuggestGroup>,
+    /// 无法判定的段(过短/嵌入失败/轨道缺失):不猜,单独一桶交给人。
+    undetermined: Vec<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct SplitGroupIn {
+    seqs: Vec<u64>,
+    dest_kind: String, // existing_speaker | person | new_speaker | keep
+    dest_id: Option<String>,
+}
+
+/// 建议分组:对被标簇的段落单独跑一次拆分专用聚类(关碎片吞并;无嵌入进无法判定桶;
+/// 种子给去处建议)。纯本地纯读,不写任何东西。重活(解码+逐段嵌入)在 spawn_blocking,
+/// FEEDBACK_GATE 约束 ORT 并发(与回灌同一门)。
+#[tauri::command]
+async fn suggest_split_groups(app: AppHandle, op_id: String) -> Result<SplitSuggestOut, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+        let dir = nroot.join(&op.note_id);
+        let note = store::NoteStore::new(nroot).load(&op.note_id).map_err(|e| e.to_string())?;
+        let segs: Vec<&store::SegmentRecord> = note
+            .segments
+            .iter()
+            .filter(|s| s.speaker.as_deref().is_some_and(|sp| op.speaker_ids.iter().any(|x| x == sp)))
+            .collect();
+        if segs.is_empty() {
+            return Err(tr!("被标说话人名下没有段落", "The marked speakers have no segments"));
+        }
+        let _fb = FEEDBACK_GATE.lock().unwrap();
+        // 标签、权重、种子同源(同一次设置读取)。
+        let tag = current_speaker_model(&app);
+        let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+            .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+        let embs = refine::embed_all(&dir, &segs, &mut embedder).map_err(|e| e.to_string())?;
+        let inputs: Vec<refine::recluster::SegInput> = segs
+            .iter()
+            .map(|s| refine::recluster::SegInput {
+                seq: s.seq,
+                start_ms: s.start_ms,
+                end_ms: s.end_ms,
+                source: s.source.clone(),
+                old_speaker: s.speaker.clone(),
+            })
+            .collect();
+        let seeds = load_voiceprint_seeds_for(&app, &tag);
+        let sug = refine::recluster::recluster_split(&inputs, &embs, &seeds);
+        Ok(SplitSuggestOut {
+            groups: sug
+                .groups
+                .into_iter()
+                .map(|g| SplitSuggestGroup {
+                    seqs: g.member_idx.iter().map(|&i| inputs[i].seq).collect(),
+                    total_ms: g.total_ms,
+                    suggested: g.suggested,
+                })
+                .collect(),
+            undetermined: sug.undetermined_idx.iter().map(|&i| inputs[i].seq).collect(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 提交拆分:计划定稿 → 占号(reserved)→ 批量改派+修订稿同步(segments_reassigned)
+/// → 受权回灌(reenrolled)→ 解除隔离(released→done)。按 op.phase 从任意中断点续跑;
+/// 全部改派走显式 ID,重试不产生新编号。返回摘要(含回灌的如实结果)。
+#[tauri::command]
+async fn commit_split(
+    app: AppHandle,
+    op_id: String,
+    groups: Vec<SplitGroupIn>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        // 同一 op 的 commit/cancel/confirm/residual 进程内串行:并发交错 = 各拿旧阶段
+        // 做各的副作用(codex 实现轮三 P1⑤)。
+        let op_lock = split_op_lock(&op_id);
+        let _op_guard = op_lock.lock().unwrap();
+        let vp_store = store::VoiceprintStore::new(root.clone());
+        let mut op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        if op.mode != "split_commit" {
+            return Err(tr!("该操作不在拆分模式", "This operation is not in split mode"));
+        }
+        let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
+        let nstore = store::NoteStore::new(nroot.clone());
+        let dir = nroot.join(&op.note_id);
+        let now = chrono::Local::now().to_rfc3339();
+        let lc = app.state::<lifecycle::LifecycleHandle>();
+
+        // ── 阶段 1:计划定稿 + 占号(residual_decided → reserved) ──
+        if op.phase == store::split_ops::phase::RESIDUAL_DECIDED {
+            if groups.is_empty() {
+                return Err(tr!("没有分组", "No groups"));
+            }
+            // 孤儿清理**先于**选号与建表读取:上次占号成功、阶段没落盘时,残留的预留
+            // 项会把 max(S) 抬高,每次重试都换更大的号;放在 to_reserve 判空之后则
+            // "重试计划不需要新号"时孤儿永远清不掉(codex 实现轮二 P2⑧)。
+            lc.request(lifecycle::machine::Msg::EditNote {
+                op: lifecycle::machine::EditOp::ReleaseReservedSpeakers {
+                    id: op.note_id.clone(),
+                    op_id: op.op_id.clone(),
+                },
+            })?;
+            let note = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
+            let vp = vp_store.load();
+            let by_seq: std::collections::BTreeMap<u64, &store::SegmentRecord> =
+                note.segments.iter().map(|s| (s.seq, s)).collect();
+            // seq 不重不漏地属于被标说话人。
+            let mut seen_seqs: std::collections::BTreeSet<u64> = Default::default();
+            for g in &groups {
+                for q in &g.seqs {
+                    let seg = by_seq
+                        .get(q)
+                        .ok_or_else(|| tr!("段不存在: {q}", "No such segment: {q}", q = q))?;
+                    let sp = seg.speaker.as_deref().unwrap_or("");
+                    if !op.speaker_ids.iter().any(|x| x == sp) {
+                        return Err(tr!("段 {q} 不属于被标说话人", "Segment {q} is not under a marked speaker", q = q));
+                    }
+                    if !seen_seqs.insert(*q) {
+                        return Err(tr!("段 {q} 出现在多个组", "Segment {q} appears in multiple groups", q = q));
+                    }
+                }
+            }
+            // 不漏:分组必须覆盖被标说话人名下的**全部**段(UI 的"无法判定"桶以
+            // dest=keep 送来,等式才成立)。漏段静默留在混杂簇里,op 却能关单
+            // (codex 实现轮二 P2⑨)。
+            let all_marked: std::collections::BTreeSet<u64> = note
+                .segments
+                .iter()
+                .filter(|sg| {
+                    sg.speaker.as_deref().is_some_and(|sp| op.speaker_ids.iter().any(|x| x == sp))
+                })
+                .map(|sg| sg.seq)
+                .collect();
+            if seen_seqs != all_marked {
+                let missing = all_marked.difference(&seen_seqs).count();
+                return Err(tr!(
+                    "分组漏了 {missing} 段(被标说话人的段必须全部指定去处,拿不准选「保持不动」)",
+                    "{missing} segments missing from groups (every marked segment needs a destination; pick keep-as-is when unsure)",
+                    missing = missing
+                ));
+            }
+            // 目标解析 + 预留数量。
+            let mut need_reserve = 0usize;
+            for g in &groups {
+                match g.dest_kind.as_str() {
+                    "existing_speaker" => {
+                        let sid = g.dest_id.as_deref().unwrap_or("");
+                        match note.speakers.get(sid) {
+                            None => {
+                                return Err(tr!("目标说话人不存在: {sid}", "No such speaker: {sid}", sid = sid))
+                            }
+                            Some(m) => {
+                                // 别的 op 的预留号不许当去向(codex 实现轮二 P1⑥)。
+                                if m.reserved_by.as_deref().is_some_and(|o| o != op.op_id) {
+                                    return Err(tr!(
+                                        "说话人 {sid} 是另一次拆分的预留号",
+                                        "Speaker {sid} is reserved by another split",
+                                        sid = sid
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    "person" => {
+                        let pid = g.dest_id.as_deref().unwrap_or("");
+                        let resolved = store::VoiceprintStore::resolve(&vp, pid)
+                            .ok_or_else(|| tr!("声纹库中没有该人物: {pid}", "No such person: {pid}", pid = pid))?;
+                        // 隔离中的人物只允许「本 op 的 A 类认领」:别的 op 正处置中的
+                        // 人物不许当去向——那会绕过它的门禁写入(codex 实现轮一 P1⑥)。
+                        let q = vp.people.get(resolved).is_some_and(|p| p.voiceprint_quarantined);
+                        if q && !op.affected_persons.iter().any(|a| a == resolved) {
+                            return Err(tr!(
+                                "人物 {pid} 正被隔离处置,不能作为去向",
+                                "Person {pid} is quarantined by another cleanup and cannot be a destination",
+                                pid = pid
+                            ));
+                        }
+                        // 已有关联 S 则复用,否则要一个新号。
+                        let linked = note
+                            .speakers
+                            .iter()
+                            .any(|(_, m)| m.person_id.as_deref() == Some(resolved));
+                        if !linked {
+                            need_reserve += 1;
+                        }
+                    }
+                    "new_speaker" => need_reserve += 1,
+                    "keep" => {}
+                    other => return Err(tr!("未知去处: {other}", "Unknown destination: {other}", other = other)),
+                }
+            }
+            let mut fresh = nstore
+                .peek_next_speaker_ids(&op.note_id, need_reserve)
+                .map_err(|e| e.to_string())?
+                .into_iter();
+            let mut plan: Vec<store::split_ops::SplitPlanGroup> = Vec::new();
+            let mut to_reserve: Vec<String> = Vec::new();
+            for g in &groups {
+                let dest_speaker = match g.dest_kind.as_str() {
+                    "existing_speaker" => g.dest_id.clone(),
+                    "person" => {
+                        let resolved = store::VoiceprintStore::resolve(&vp, g.dest_id.as_deref().unwrap())
+                            .expect("上面已校验")
+                            .to_string();
+                        match note
+                            .speakers
+                            .iter()
+                            .find(|(_, m)| m.person_id.as_deref() == Some(resolved.as_str()))
+                        {
+                            Some((sid, _)) => Some(sid.clone()),
+                            None => {
+                                let sid = fresh.next().expect("need_reserve 已计数");
+                                to_reserve.push(sid.clone());
+                                Some(sid)
+                            }
+                        }
+                    }
+                    "new_speaker" => {
+                        let sid = fresh.next().expect("need_reserve 已计数");
+                        to_reserve.push(sid.clone());
+                        Some(sid)
+                    }
+                    _ => None, // keep
+                };
+                let mut seqs = g.seqs.clone();
+                seqs.sort_unstable();
+                let expected: Vec<String> = seqs
+                    .iter()
+                    .map(|q| by_seq[q].speaker.clone().unwrap_or_default())
+                    .collect();
+                plan.push(store::split_ops::SplitPlanGroup {
+                    seqs,
+                    expected_speakers: expected,
+                    dest_kind: g.dest_kind.clone(),
+                    dest_id: g.dest_id.clone(),
+                    dest_speaker,
+                });
+            }
+            // 计划先落盘,再占号(占号后崩溃:reserved_by 所有权 + 计划都在,可恢复可取消)。
+            vp_store
+                .with_guard(|| {
+                    let mut o = store::split_ops::load(&root, &op_id)?;
+                    o.plan_groups = plan.clone();
+                    o.updated_at = now.clone();
+                    store::split_ops::save(&root, &o)
+                })
+                .map_err(|e| e.to_string())?;
+            if !to_reserve.is_empty() {
+                lc.request(lifecycle::machine::Msg::EditNote {
+                    op: lifecycle::machine::EditOp::ReserveSpeakers {
+                        id: op.note_id.clone(),
+                        speaker_ids: to_reserve,
+                        op_id: op.op_id.clone(),
+                    },
+                })?;
+            }
+            op = store::split_ops::advance_guarded(
+                &vp_store,
+                &root,
+                &op_id,
+                &[store::split_ops::phase::RESIDUAL_DECIDED],
+                store::split_ops::phase::RESERVED,
+                &now,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        // ── 阶段 2:条件关联 → 批量改派 → 修订稿同步(reserved → segments_reassigned)。
+        //    关联放**最前**:它带 CAS,用户改过关联时在任何段被动过之前干净停下
+        //    (codex 实现轮三 P1③——冲突不是跳过继续,是停止计划);重入幂等(已是目标
+        //    人物直接放行)。 ──
+        if op.phase == store::split_ops::phase::RESERVED {
+            {
+                let vp = vp_store.load();
+                for g in &op.plan_groups {
+                    if g.dest_kind == "person" {
+                        let (Some(pid), Some(sid)) = (g.dest_id.as_deref(), g.dest_speaker.as_deref()) else {
+                            continue;
+                        };
+                        if let Some(resolved) = store::VoiceprintStore::resolve(&vp, pid) {
+                            lc.request(lifecycle::machine::Msg::EditNote {
+                                op: lifecycle::machine::EditOp::AssignPersonIf {
+                                    id: op.note_id.clone(),
+                                    speaker_id: sid.to_string(),
+                                    person_id: resolved.to_string(),
+                                },
+                            })?;
+                        }
+                    }
+                }
+            }
+            let moves: Vec<(u64, String, String)> = op
+                .plan_groups
+                .iter()
+                .filter_map(|g| g.dest_speaker.as_ref().map(|d| (g, d)))
+                .flat_map(|(g, d)| {
+                    g.seqs
+                        .iter()
+                        .zip(&g.expected_speakers)
+                        .filter(|(_, exp)| exp.as_str() != d.as_str())
+                        .map(|(q, exp)| (*q, exp.clone(), d.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            if !moves.is_empty() {
+                lc.request(lifecycle::machine::Msg::EditNote {
+                    op: lifecycle::machine::EditOp::SplitReassign {
+                        id: op.note_id.clone(),
+                        moves: moves.clone(),
+                        op_id: op.op_id.clone(),
+                    },
+                })?;
+            }
+            // 修订稿同步:全组同去向原位改;跨组标 stale(一期边界)。
+            let vp = vp_store.load();
+            let moved: std::collections::BTreeMap<u64, String> = op
+                .plan_groups
+                .iter()
+                .filter_map(|g| g.dest_speaker.as_ref().map(|d| (g, d)))
+                .flat_map(|(g, d)| g.seqs.iter().map(|q| (*q, d.clone())).collect::<Vec<_>>())
+                .collect();
+            let mut person_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+                Default::default();
+            let note_now = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
+            for g in &op.plan_groups {
+                if let Some(sid) = &g.dest_speaker {
+                    let entry = if g.dest_kind == "person" {
+                        let pid = g.dest_id.clone();
+                        let name = pid
+                            .as_deref()
+                            .and_then(|p| store::VoiceprintStore::resolve(&vp, p))
+                            .and_then(|r| vp.people.get(r))
+                            .map(|p| p.name.clone());
+                        (pid, name)
+                    } else {
+                        // 归入本篇已有说话人:他若已关联库人物,修订稿要保留这份身份,
+                        // 不能写 (None,None) 把关联冲掉(codex 实现轮一 P2)。
+                        let meta = note_now.speakers.get(sid);
+                        let pid = meta.and_then(|m| m.person_id.clone());
+                        let name = pid
+                            .as_deref()
+                            .and_then(|p| store::VoiceprintStore::resolve(&vp, p))
+                            .and_then(|r| vp.people.get(r))
+                            .map(|p| p.name.clone());
+                        (pid, name)
+                    };
+                    person_name.insert(sid.clone(), entry);
+                }
+            }
+            if !moved.is_empty() && store::aing_exists(&dir) {
+                match store::sync_refined_after_split(&dir, &moved, &person_name) {
+                    Ok(true) => eprintln!("拆分({op_id}):修订稿存在跨组段落,已标 stale 待重新 Aing"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        // 原始段已改派而修订稿没跟上:不标脏的话默认视图显示旧归属,
+                        // 用户以为拆完了。降级标 stale;连 stale 都标不上就整体失败
+                        // (重试安全:改派 CAS 认已完成态)——codex 实现轮一 P1⑪。
+                        eprintln!("拆分({op_id}):修订稿同步失败,降级标 stale: {e}");
+                        store::mark_refined_stale(&dir).map_err(|e2| {
+                            format!("修订稿同步失败且标 stale 也失败,先重试: {e};{e2}")
+                        })?;
+                    }
+                }
+            }
+            op = store::split_ops::advance_guarded(
+                &vp_store,
+                &root,
+                &op_id,
+                &[store::split_ops::phase::RESERVED],
+                store::split_ops::phase::SEGMENTS_REASSIGNED,
+                &now,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        // ── 阶段 3:受权回灌(segments_reassigned → reenrolled)。可选增强:失败如实
+        //    报告,不回滚拆分、不挡收尾(设计:回灌只有方向性,不宣称修复)。 ──
+        let mut enroll_notes: Vec<String> = Vec::new();
+        if op.phase == store::split_ops::phase::SEGMENTS_REASSIGNED {
+            let person_groups: Vec<_> =
+                op.plan_groups.iter().filter(|g| g.dest_kind == "person").collect();
+            if !person_groups.is_empty() {
+                let _fb = FEEDBACK_GATE.lock().unwrap();
+                let expected = current_speaker_model(&app);
+                let library_model = vp_store.load().embedding_model.clone();
+                match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
+                    Ok(mut embedder) => {
+                        let note = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
+                        for g in person_groups {
+                            let Some(pid) = g.dest_id.as_deref() else { continue };
+                            let seqs: std::collections::BTreeSet<u64> = g.seqs.iter().copied().collect();
+                            let mut needs_rebuild = false;
+                            let r = feedback::reinforce_person(
+                                &dir,
+                                &note.segments,
+                                &feedback::SegFilter::Seqs(seqs),
+                                pid,
+                                &vp_store,
+                                &library_model,
+                                &expected,
+                                &mut embedder,
+                                &now,
+                                Some(&op.op_id),
+                                &mut needs_rebuild,
+                                // 只对本 op 认领的隔离人物放行;其它目标走普通门禁
+                                // (codex 实现轮一 P1⑥:布尔旁路必须限定在 op 范围内)。
+                                op.affected_persons.iter().any(|a| Some(a.as_str()) == g.dest_id.as_deref()),
+                            );
+                            if needs_rebuild {
+                                let st = app.state::<AppState>();
+                                *st.embedder_cache.lock().unwrap() = None;
+                                spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "拆分回灌纠错后质心置空");
+                            }
+                            match r {
+                                Ok(feedback::ReinforceResult::Applied { .. }) => {}
+                                Ok(other) => enroll_notes.push(format!("{pid}: {other:?}")),
+                                Err(e) => enroll_notes.push(format!("{pid}: {e}")),
+                            }
+                        }
+                    }
+                    Err(e) => enroll_notes.push(format!("嵌入器不可用,回灌全部跳过: {e}")),
+                }
+            }
+            op = store::split_ops::advance_guarded(
+                &vp_store,
+                &root,
+                &op_id,
+                &[store::split_ops::phase::SEGMENTS_REASSIGNED],
+                store::split_ops::phase::REENROLLED,
+                &now,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        // ── 阶段 4:解除隔离并收尾(推进+解除同一 guard,排除其它持有者) ──
+        if op.phase == store::split_ops::phase::REENROLLED {
+            finish_and_release(
+                &vp_store,
+                &root,
+                &op_id,
+                &[store::split_ops::phase::REENROLLED],
+                store::split_ops::phase::RELEASED,
+                &now,
+            )
+            .map_err(|e| e.to_string())?;
+            op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        }
+        // released 的公共收尾(轮四 P1③):REENROLLED 刚推进来的、以及上次 DONE 没写成
+        // 的重入,都从这里走同一条幂等路径(done+pending+缓存+图谱)。
+        if op.phase == store::split_ops::phase::RELEASED {
+            complete_released(&app, &vp_store, &root, &op_id, &now)?;
+        }
+        Ok(if enroll_notes.is_empty() { String::new() } else { enroll_notes.join("; ") })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 取消拆分(持久化路径,不是一句 CAS):residual_decided/reserved 可取消——落取消意图
+/// → 清理本 op 的空预留项 → 解除隔离 → cancelled。segments_reassigned 之后只能前滚
+/// (段落已改派,取消没有还原语义)。
+#[tauri::command]
+fn cancel_split(app: AppHandle, op_id: String) -> Result<(), String> {
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let op_lock = split_op_lock(&op_id);
+    let _op_guard = op_lock.lock().unwrap();
+    let vp_store = store::VoiceprintStore::new(root.clone());
+    let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    let now = chrono::Local::now().to_rfc3339();
+    match op.phase.as_str() {
+        p if p == store::split_ops::phase::RESIDUAL_DECIDED
+            || p == store::split_ops::phase::RESERVED
+            || p == store::split_ops::phase::CANCEL_REQUESTED => {}
+        p if p == store::split_ops::phase::SEGMENTS_REASSIGNED
+            || p == store::split_ops::phase::REENROLLED =>
+        {
+            return Err(tr!("段落已改派,只能继续完成拆分", "Segments already reassigned; finish the split instead"));
+        }
+        p => return Err(tr!("当前阶段不能取消: {p}", "Cannot cancel in phase {p}", p = p)),
+    }
+    store::split_ops::advance_guarded(
+        &vp_store,
+        &root,
+        &op_id,
+        &[
+            store::split_ops::phase::RESIDUAL_DECIDED,
+            store::split_ops::phase::RESERVED,
+            store::split_ops::phase::CANCEL_REQUESTED,
+        ],
+        store::split_ops::phase::CANCEL_REQUESTED,
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
+    let lc = app.state::<lifecycle::LifecycleHandle>();
+    lc.request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::ReleaseReservedSpeakers {
+            id: op.note_id.clone(),
+            op_id: op.op_id.clone(),
+        },
+    })?;
+    // 取消拆分 ≠ 取消打标:隔离义务已在样本/残留阶段兑现,这里照常解除。
+    // 推进 cancelled 与解除同一 guard(codex 实现轮二 P1③)。
+    finish_and_release(
+        &vp_store,
+        &root,
+        &op_id,
+        &[store::split_ops::phase::CANCEL_REQUESTED],
+        store::split_ops::phase::CANCELLED,
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
+    consume_pending_rebuild(&app);
+    Ok(())
+}
+
+/// 某笔记的未完成打标操作(UI 恢复入口)。纯读。
+#[tauri::command]
+fn list_split_ops(app: AppHandle, note_id: String) -> Result<Vec<store::split_ops::SplitOp>, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(store::split_ops::open_ops_for_note(&root, &note_id))
+}
+
 /// 按当前选型重建声纹库:拿每个人存下的录音样本用新模型重新算质心,并把库标签
 /// 改写成新选型。**这是模型切换之后声纹识别能恢复的唯一途径**。
 ///
@@ -3884,55 +5056,110 @@ fn current_speaker_model(app: &AppHandle) -> String {
         .unwrap_or_default()
 }
 
+/// 重建请求的落盘标记:REBUILD_PENDING/发起中的重建都只在内存,进程在重建线程
+/// 完成前退出即丢——而"质心清空型"重建(纠错还原/拆回/退回基线)不改库标签,
+/// 启动自愈永远兜不住,那些人就永久空质心(codex 混杂实现轮六 P1)。
+/// 语义:有未完成的重建诉求 → 标记在;一轮重建成功跑完 → 清掉。启动时见标记补跑。
+fn rebuild_marker_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    data_root(app).ok().map(|r| r.join("rebuild_pending.flag"))
+}
+
+fn set_rebuild_marker(app: &AppHandle, reason: &str) {
+    if let Some(p) = rebuild_marker_path(app) {
+        if let Err(e) = std::fs::write(&p, reason) {
+            eprintln!("重建标记写入失败(进程退出前完不成的重建将无人补跑): {e}");
+        }
+    }
+}
+
+fn clear_rebuild_marker(app: &AppHandle) {
+    if let Some(p) = rebuild_marker_path(app) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 重建调度的控制互斥:RUNNING/PENDING 的交接与落盘标记的写/清必须在同一把锁下。
+/// 没有它,旧 runner 在"清 RUNNING → 查 PENDING → 清标记"的窗口里,会把**新请求
+/// 刚写下的标记**当成自己的诉求删掉——进程随后退出,轮六要修的丢失原样回来
+/// (codex 混杂实现轮七 P1)。锁内只做标志与文件操作,微秒级,不持锁做重活。
+static REBUILD_CTL: Mutex<()> = Mutex::new(());
+
 fn spawn_voiceprint_rebuild(
     app: &AppHandle,
     cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
 ) {
     use std::sync::atomic::Ordering;
-    if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
-        REBUILD_PENDING.store(true, Ordering::SeqCst);
-        eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
-        return;
+    {
+        let _ctl = REBUILD_CTL.lock().unwrap();
+        // 先落盘再排队/起线程:反过来的话"内存标志置了、标记没写、进程退出"仍丢请求。
+        set_rebuild_marker(app, reason);
+        if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+            REBUILD_PENDING.store(true, Ordering::SeqCst);
+            eprintln!("声纹库重建已在进行中,本次({reason})排队等当前这轮跑完");
+            return;
+        }
     }
     let app2 = app.clone();
     let cache2 = cache.clone();
     std::thread::spawn(move || {
-        // RAII 复位:中途 return 或 panic 都不能把单飞标志永久卡住,否则此后
-        // 任何入口都再也发不起重建——那正是本次要修的"永久降级"的另一种形态。
-        struct Reset;
+        // RAII 复位**只兜 panic**(armed 模式):正常路径的 RUNNING 交接必须在
+        // REBUILD_CTL 内完成。此前 drop 无条件在锁外清 RUNNING,新请求可在
+        // "drop 清完 → 本线程进锁"之间成为新 runner,本线程随后在锁内再清一次,
+        // 把新 runner 的单飞标志掀了——重建并发跑、新标记被误删(codex 轮八/九 P1)。
+        struct Reset {
+            armed: bool,
+        }
         impl Drop for Reset {
             fn drop(&mut self) {
-                REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                if self.armed {
+                    let _ctl = REBUILD_CTL.lock().unwrap_or_else(|e| e.into_inner());
+                    REBUILD_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
-        {
-            let _reset = Reset;
-            rebuild_once(&app2, cache, reason);
-        }
+        let mut reset = Reset { armed: true };
+        let ok = rebuild_once(&app2, cache, reason);
         // 收尾:**只因"期间来过新请求"重跑**,不看库标签是否仍不一致。
         // 曾经也检查过标签(想顺手兜住"跑完发现又被切了"),但那会在永久失败时变成
         // 无界循环:模型文件缺失/保存失败 → 标签永远对不上 → 每轮结束立刻再起一轮,
         // 无退避、无上限,日志与遥测一起刷屏(codex review 三轮 P1#1)。
         // 真正的切换必然经过 set_settings,那条路会把 PENDING 置上,不会漏。
         // 剩下的"卡住"情形由下次启动的自愈兜——一次启动最多跑一轮,天然有界。
-        if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+        //
+        // 决策在 CTL 内做(标志交接与清标记原子),重跑动作在 CTL 外发
+        // (spawn_voiceprint_rebuild 自己要取 CTL,不可重入)。
+        let respawn = {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            reset.armed = false; // 正常路径:交接在此完成,panic 兜底解除武装
+            REBUILD_RUNNING.store(false, Ordering::SeqCst);
+            if REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+                true
+            } else {
+                if ok {
+                    // 成功且无排队:诉求已兑现,清落盘标记。失败留标记,下次启动补跑。
+                    clear_rebuild_marker(&app2);
+                }
+                false
+            }
+        };
+        if respawn {
             spawn_voiceprint_rebuild(&app2, cache2, "有排队请求,重跑");
         }
     });
 }
 
-/// 跑一轮重建。抽出来是为了让上面那层能在它结束之后、单飞标志复位之后决定要不要重跑。
+/// 跑一轮重建。返回是否成功(落盘标记只在成功后清,失败留给下次启动补跑)。
 fn rebuild_once(
     app2: &AppHandle,
     cache: std::sync::Arc<Mutex<Option<Box<diar::TaggedEmbedder>>>>,
     reason: &'static str,
-) {
+) -> bool {
     {
         // 一次快照定死"标签"与"权重路径",两者必须同源。
         let tag = current_speaker_model(app2);
         if tag.is_empty() {
-            return;
+            return false;
         }
         match diar::SherpaEmbedder::new(&speaker_model_path_for(&tag)) {
             Ok(mut e) => {
@@ -3940,21 +5167,31 @@ fn rebuild_once(
                 // 已经不是当前选型,写库与入常驻槽都会把错的东西留下来。
                 if current_speaker_model(&app2) != tag {
                     eprintln!("声纹库重建({reason})中途选型已变,放弃本次结果");
-                    return;
+                    return false;
                 }
-                match data_root(&app2).map(store::VoiceprintStore::new) {
+                let ok = match data_root(&app2).map(store::VoiceprintStore::new) {
                     Ok(vps) => match vps.rebuild_for_model(&tag, &mut e) {
-                        Ok(n) => eprintln!("声纹库已按 {tag} 重建({reason};{n} 人有样本可建)"),
-                        Err(err) => eprintln!("声纹库重建失败(种子注入将持续跳过): {err}"),
+                        Ok(n) => {
+                            eprintln!("声纹库已按 {tag} 重建({reason};{n} 人有样本可建)");
+                            true
+                        }
+                        Err(err) => {
+                            eprintln!("声纹库重建失败(种子注入将持续跳过): {err}");
+                            false
+                        }
                     },
-                    Err(err) => eprintln!("声纹库路径不可用,未重建: {err}"),
-                }
+                    Err(err) => {
+                        eprintln!("声纹库路径不可用,未重建: {err}");
+                        false
+                    }
+                };
                 // 嵌入很慢(实测约半分钟),再核一次才敢占常驻槽:塞错模型的嵌入器
                 // 进去,下一场录制整场用错空间嵌入。
                 if current_speaker_model(&app2) == tag {
                     // 标签就是这次重建用的 tag,与权重路径同源(见 rebuild_once 开头)。
                     stash_model(&cache, Some(Box::new(diar::TaggedEmbedder::new(&tag, Box::new(e)))));
                 }
+                return ok;
             }
             Err(err) => {
                 eprintln!("声纹模型加载失败(模型未下载?),库未重建、录制不自动认人: {err}");
@@ -3967,6 +5204,7 @@ fn rebuild_once(
             }
         }
     }
+    false
 }
 
 /// 启动自愈:库标签与当前选型不一致就主动重建一次。
@@ -3979,26 +5217,27 @@ fn rebuild_once(
 ///
 /// 录制中跳过:重建要现场加载嵌入器逐条嵌入样本,和录制抢 ORT 线程与 CPU;
 /// 这是自愈不是急救,等下次启动无妨。
-fn heal_voiceprint_model_mismatch(app: &AppHandle, state: &AppState) {
-    let Ok(root) = data_root(app) else { return };
+fn heal_voiceprint_model_mismatch(app: &AppHandle, state: &AppState) -> bool {
+    let Ok(root) = data_root(app) else { return false };
     let want = app
         .path()
         .app_data_dir()
         .map(|d| settings::load(&d).speaker_model)
         .unwrap_or_default();
     if want.is_empty() {
-        return;
+        return false;
     }
     let have = store::VoiceprintStore::new(root).load().embedding_model.clone();
     if have == want {
-        return;
+        return false;
     }
     if state.session.lock().map(|s| s.is_some()).unwrap_or(true) {
         eprintln!("声纹库标签({have})与当前选型({want})不一致,录制中暂不重建,下次启动再试");
-        return;
+        return false;
     }
     eprintln!("声纹库标签({have})与当前选型({want})不一致,启动自愈:开始重建");
     spawn_voiceprint_rebuild(app, state.embedder_cache.clone(), "启动自愈");
+    true
 }
 
 /// 回灌互斥门:同一时刻最多一个回灌任务在嵌入。不借用 AppState.embedder_cache
@@ -4084,6 +5323,7 @@ fn spawn_feedback(
                         &now,
                         None,
                         needs_rebuild,
+                        false,
                     )?;
                     eprintln!("feedback: note={note_id} target={target} result={r:?}");
                     Ok(())
@@ -5176,6 +6416,7 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
                     &now,
                     Some(&op_id),
                     &mut needs_rebuild,
+                    false,
                 );
                 // 先无条件处理重建,再判回灌结果:纠错还原一旦清空了旧人物的质心就已经
                 // 落盘,回灌本身跳过或出错都不改变"必须重建"这件事
@@ -8233,9 +9474,28 @@ pub fn run() {
                     );
                 }
             }
+            // 样本溯源 WAL 恢复:上次进程死在"intent 已落、complete 未落"之间的话,
+            // 这里把在途写入按三分支收尾(转正/丢弃/记冲突)。纯文件操作,先于重建。
+            if let Ok(root) = data_root(&handle) {
+                let (done, dropped, conflicted) =
+                    store::VoiceprintStore::new(root).recover_sample_trace();
+                if done + dropped + conflicted > 0 {
+                    eprintln!("样本溯源恢复:转正 {done} 丢弃 {dropped} 冲突 {conflicted}");
+                }
+            }
             // 声纹库标签与当前选型不一致时主动重建一次。放在启动末尾:它要起线程加载
             // 嵌入器,不该和前面那些"必须先就位"的初始化抢时间。
-            heal_voiceprint_model_mismatch(&handle, &st);
+            // 标记快照必须在自愈**之前**取:自愈自己会写标记,后取快照必然看见它,
+            // 一次启动就固定跑两轮整库嵌入(codex 混杂实现轮七 P2)。
+            let stale_marker = rebuild_marker_path(&handle).is_some_and(|p| p.exists());
+            let healed = heal_voiceprint_model_mismatch(&handle, &st);
+            // 上次退出前有没跑完的重建诉求(落盘标记还在)→ 补跑。质心清空型重建不改
+            // 库标签,标签自愈兜不住它(codex 混杂实现轮六 P1)。自愈已发起时不必再发:
+            // 一轮全库重建覆盖同样的诉求。
+            if stale_marker && !healed {
+                eprintln!("发现未完成的重建诉求(上次退出前没跑完),补跑");
+                spawn_voiceprint_rebuild(&handle, st.embedder_cache.clone(), "启动补跑上次未完成的重建");
+            }
             telemetry::track(&handle, telemetry::Event::AppStarted);
             Ok(())
         })
@@ -8351,6 +9611,14 @@ pub fn run() {
             delete_person_sample,
             suggest_person_merges,
             apply_confident_merges,
+            mark_speaker_multi,
+            multi_impact,
+            suggest_split_groups,
+            commit_split,
+            cancel_split,
+            confirm_multi_samples,
+            resolve_multi_residual,
+            list_split_ops,
             undo_merge,
             restore_merged_person,
             acknowledge_merge,

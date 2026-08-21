@@ -593,9 +593,13 @@ impl MergeJournal {
     /// (目标已存在的跳过、不计数)。任何读写失败都上抛——调用方据此保留 journal。
     pub fn restore_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
+        let banned = super::voiceprints::banned_sample_hashes(&self.root);
         let mut n = 0usize;
         for side in ["loser", "winner"] {
             for p in self.sample_copies_strict(id, side)? {
+                if self.sample_banned(&p, &banned) {
+                    continue;
+                }
                 if restore_one_sample(&p, vp_samples_dir)? {
                     n += 1;
                 }
@@ -604,12 +608,38 @@ impl MergeJournal {
         Ok(n)
     }
 
+    /// 该样本副本是否已被封禁(内容 hash 命中名单)。读不出 hash 按**封禁**处理:
+    /// 恢复是把文件放回正式库,拿不准宁可不放(名单本身缺失时是空集,不受此影响)。
+    fn sample_banned(&self, p: &Path, banned: &std::collections::BTreeSet<String>) -> bool {
+        if banned.is_empty() {
+            return false;
+        }
+        match super::voiceprints::sample_content_hash(p) {
+            Some(h) => {
+                let hit = banned.contains(&h);
+                if hit {
+                    eprintln!("样本恢复跳过:{} 命中封禁名单(混杂样本不复活)", p.display());
+                }
+                hit
+            }
+            None => {
+                eprintln!("样本恢复跳过:{} 读不出内容,按封禁处理", p.display());
+                true
+            }
+        }
+    }
+
     /// 只把 loser 侧快照副本拷回声纹样本目录(拆回用;undo 用 restore_samples 双侧)。
     /// 无常规槽位而有 `<loser>-cut.wav` 兜底截声时,改名拷成 `<loser>.wav`(槽 1)——
     /// sample_slot_path 不识别 -cut 后缀,原名拷回等于拆回的人"无样本"。
     pub fn restore_loser_samples(&self, id: &str, vp_samples_dir: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(vp_samples_dir)?;
-        let copies = self.sample_copies_strict(id, "loser")?;
+        let banned = super::voiceprints::banned_sample_hashes(&self.root);
+        let copies: Vec<PathBuf> = self
+            .sample_copies_strict(id, "loser")?
+            .into_iter()
+            .filter(|p| !self.sample_banned(p, &banned))
+            .collect();
         let is_cut = |p: &PathBuf| {
             p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-cut"))
         };
@@ -1166,5 +1196,26 @@ mod tests {
         // 做完了(阶段清空)就能正常确认。
         j.set_undo_phase("m-A", "", false).unwrap();
         assert!(j.acknowledge("m-A").is_ok());
+    }
+
+    #[test]
+    fn banned_hash_blocks_sample_restore_in_both_paths() {
+        // 打标删掉的混杂样本,其内容 hash 进封禁名单;journal 里的副本同 hash,
+        // 恢复(undo 双侧 / 拆回 loser 侧)都不得把它拷回正式库。
+        let (dir, j) = test_journal();
+        put_side_file(&j, "m-P1", "loser", "P1.wav");
+        put_side_file(&j, "m-P1", "winner", "P2.wav");
+        let h = crate::store::voiceprints::sample_content_hash(
+            &j.samples_dir("m-P1", "loser").unwrap().join("P1.wav"),
+        )
+        .unwrap();
+        crate::store::voiceprints::ban_sample_hashes(dir.path(), &[h]).unwrap();
+        let out = dir.path().join("vp");
+
+        // put_side_file 写的两份内容相同 → 同 hash → 双双被封。
+        assert_eq!(j.restore_samples("m-P1", &out).unwrap(), 0, "同 hash 的副本全部不落地");
+        assert!(!out.join("P1.wav").exists() && !out.join("P2.wav").exists());
+        assert_eq!(j.restore_loser_samples("m-P1", &out).unwrap(), 0);
+        assert!(!out.join("P1.wav").exists());
     }
 }

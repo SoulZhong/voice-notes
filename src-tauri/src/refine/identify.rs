@@ -109,6 +109,7 @@ fn calendar_candidates(cal: &crate::store::CalendarSnapshot, vp: &Voiceprints) -
         }
         for (pid, person) in &vp.people {
             if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !person.voiceprint_quarantined
                 && !person.name.trim().is_empty()
                 && person.emails.iter().any(|e| e == &att.email)
                 && seen.insert(pid.clone())
@@ -125,6 +126,7 @@ fn calendar_candidates(cal: &crate::store::CalendarSnapshot, vp: &Voiceprints) -
         }
         for (pid, person) in &vp.people {
             if VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !person.voiceprint_quarantined
                 && person.name == name
                 && seen.insert(pid.clone())
             {
@@ -162,7 +164,10 @@ fn recall_candidates(
         for stat in stats {
             let mut sims: Vec<(f32, &str, &str)> = Vec::new();
             for (pid, person) in &vp.people {
-                if VoiceprintStore::resolve(vp, pid) != Some(pid.as_str()) || person.name.trim().is_empty() {
+                if VoiceprintStore::resolve(vp, pid) != Some(pid.as_str())
+                    || person.voiceprint_quarantined
+                    || person.name.trim().is_empty()
+                {
                     continue;
                 }
                 let best = stat
@@ -186,7 +191,9 @@ fn recall_candidates(
         .people
         .iter()
         .filter(|(pid, p)| {
-            VoiceprintStore::resolve(vp, pid) == Some(pid.as_str()) && !p.name.trim().is_empty()
+            VoiceprintStore::resolve(vp, pid) == Some(pid.as_str())
+                && !p.voiceprint_quarantined
+                && !p.name.trim().is_empty()
         })
         .collect();
     recent.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
@@ -195,8 +202,13 @@ fn recall_candidates(
     }
 
     // ③ 已采纳的种子命中人(adopted):当场证据,最强先验。
+    // 隔离人物再滤一道:新聚类产不出隔离种子(seed_clusters 已过滤),这里兜的是
+    // 打标**之前**算好的旧 ClusterStat 被复用的路径。
     for stat in stats {
         if let Some((pid, name, _, true)) = &stat.seed {
+            if vp.people.get(pid).is_some_and(|p| p.voiceprint_quarantined) {
+                continue;
+            }
             push(pid, name, &mut picked, &mut seen);
         }
     }
@@ -722,6 +734,46 @@ pub struct IdentifyAssignment {
     pub decided_at: Option<String>,
 }
 
+/// 打标(多人混杂)时作废相关建议:被标簇的段落所在的簇、或指向受影响人物的
+/// 未决建议全部记入 rejected 表(跨代不复活)。不失效的话,打标**前**生成的旧建议
+/// 在打标**后**仍可被应用,把混杂段重新灌回库(设计消费面,codex 设计轮一 P1⑥)。
+/// `members`:当前修订稿的 R → 成员 seq 集(调用方从 RefinedDoc 算;无修订稿传空,
+/// 此时只按人物匹配)。返回作废条数。
+pub fn invalidate_for_marking(
+    note_dir: &Path,
+    affected_persons: &std::collections::BTreeSet<String>,
+    marked_seqs: &std::collections::BTreeSet<u64>,
+    members: &BTreeMap<String, std::collections::BTreeSet<u64>>,
+    now: &str,
+) -> anyhow::Result<usize> {
+    let Some(mut doc) = load_identify(note_dir) else { return Ok(0) };
+    let hits: Vec<String> = doc
+        .assignments
+        .iter()
+        .filter(|a| a.status == "suggested" || a.status == "auto_applied")
+        .filter(|a| {
+            let person_hit =
+                a.person_id.as_deref().is_some_and(|p| affected_persons.contains(p));
+            let seq_hit = members
+                .get(&a.cluster)
+                .is_some_and(|m| m.intersection(marked_seqs).next().is_some());
+            person_hit || seq_hit
+        })
+        .map(|a| a.fingerprint.clone())
+        .collect();
+    for fp in &hits {
+        if let Err(e) = mark_rejected(&mut doc, fp, now) {
+            eprintln!("identify 建议作废失败({fp},继续其余): {e}");
+        }
+    }
+    if !hits.is_empty() {
+        // 落盘失败必须上抛:静默的话打标照样推进,而旧建议还能把混杂段灌回库
+        // (codex 实现轮一 P1⑬)。
+        save_identify(note_dir, &doc)?;
+    }
+    Ok(hits.len())
+}
+
 pub fn rejected_key(fingerprint: &str, target_key: &str) -> String {
     format!("{fingerprint}|{target_key}")
 }
@@ -1068,7 +1120,7 @@ mod tests {
             session_centroids: BTreeMap::new(),
             total_ms: 10_000,
             last_seen: last_seen.into(),
-            emails: Vec::new(),
+            emails: Vec::new(), voiceprint_quarantined: false,
         }
     }
 
@@ -1132,6 +1184,22 @@ mod tests {
         let got2 = recall_candidates(&stats, &vp, false, 1, 1, 10);
         assert_eq!(got2.len(), 1);
         assert_eq!(got2[0].person_id, "P2");
+    }
+
+    #[test]
+    fn recall_excludes_quarantined_person_on_every_path() {
+        // P1 既是声学最近又是 last_seen 最近——隔离后两条路都不得召回他。
+        let mut p1 = person("阿隔", "mic", vec![1.0, 0.0, 0.0, 0.0], "2026-08-19");
+        p1.voiceprint_quarantined = true;
+        let vp = vp_with(vec![
+            ("P1", p1),
+            ("P2", person("阿备", "mic", vec![0.9, 0.1, 0.0, 0.0], "2026-01-01")),
+        ]);
+        let stats = vec![stat("R1", "mic", vec![1.0, 0.0, 0.0, 0.0], 60_000)];
+        let got = recall_candidates(&stats, &vp, true, 2, 2, 10);
+        let ids: Vec<&str> = got.iter().map(|c| c.person_id.as_str()).collect();
+        assert!(!ids.contains(&"P1"), "隔离人物不得被任何一路召回: {ids:?}");
+        assert!(ids.contains(&"P2"));
     }
 
     #[test]
