@@ -164,6 +164,10 @@ required-features = ["devtools"]
 
 [profile.dev]
 opt-level = 1
+# 增量编译在「优化 dev profile」下会产坏 rlib(同一档案混两代 codegen 对象),链接报
+# symbol not found,清 deps/incremental/fingerprint 重编还会再坏——2026-08-20/21 两次
+# 实锤,指纹是「cargo test 全绿但 bin 链不动」。关掉后全量链接实测仅 ~30s,代价可忽略。
+incremental = false
 
 [profile.release]
 # 实测 strip -x 可去掉 14.6MB 本地符号表(68.3 → 53.7MB);二进制里没有 DWARF
