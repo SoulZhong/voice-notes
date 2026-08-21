@@ -1192,6 +1192,7 @@ mod tests {
 
     fn doc(llm: &str, texts: &[&str]) -> RefinedDoc {
         RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { onTranscodeDone } from "$lib/events";
+  import { onTranscodeDone , onAingProgress } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { save } from "@tauri-apps/plugin-dialog";
@@ -17,6 +17,7 @@
     exportFileName,
     getRefined,
     refineNote,
+    retryFailedRefine,
     noteRefining,
     retranscribeNote,
     retranscribeStatus,
@@ -153,6 +154,28 @@
     }
   }
   let refining = $state(false);
+  /** Aing 逐块进度(行内「精修中 3/8 · 约剩 4 分」)。null=无进度可画。 */
+  let aingProg = $state<{ stage: string; done: number; total: number; avgMs: number } | null>(null);
+  $effect(() => {
+    const forId = id;
+    aingProg = null; // 换笔记清残留
+    const un = onAingProgress((e) => {
+      if (e.note_id !== forId) return;
+      aingProg = { stage: e.stage, done: e.done, total: e.total, avgMs: e.avg_chunk_ms };
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+  $effect(() => {
+    // 终态清行内进度:refining 结束(done/failed)后残留的 3/8 会误导。
+    if (!refining) aingProg = null;
+  });
+  const aingEtaMin = $derived(
+    aingProg && aingProg.done >= 2 && aingProg.avgMs > 0
+      ? Math.max(1, Math.ceil(((aingProg.total - aingProg.done) * aingProg.avgMs) / 60000))
+      : null, // 前两块没完成不显示时间:没数据不瞎估
+  );
   /** 在跑状态是否已确定:进页那一刻 refining 还是默认 false,而 run_local 一开始就把
       stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
       还给出一个后端必然拒绝的重跑按钮(Codex P2 四轮)。未确定期间一律不提示。 */
@@ -1958,6 +1981,15 @@
             <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
           </div>
         {:else}
+          {#if refining && aingProg}
+            <span class="aing-inline">
+              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+                done: aingProg.done,
+                total: aingProg.total,
+              })}
+              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+            </span>
+          {/if}
           <button
             class="reaing"
             class:casting={refining}
@@ -2060,7 +2092,24 @@
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
       {#if refinedSaveErr}<div class="banner banner-danger">{refinedSaveErr}</div>{/if}
       {#if refined.stages.llm === "partial"}
-        <div class="banner">{t("notes.banner.llmPartial")}</div>
+        <div class="banner">
+          {t("notes.banner.llmPartial")}
+          {#if (refined.llm_failed_paragraphs?.length ?? 0) > 0 && !refining}
+            <button
+              class="link"
+              onclick={async () => {
+                try {
+                  await retryFailedRefine(id);
+                  refining = true; // 事件随后接管;先置上避免按钮双击
+                } catch (e) {
+                  error = `${e}`;
+                }
+              }}
+            >
+              {t("notes.banner.retryFailedSegs", { n: refined.llm_failed_paragraphs?.length ?? 0 })}
+            </button>
+          {/if}
+        </div>
       {:else if refined.stages.llm === "failed"}
         <div class="banner banner-danger">{t("notes.banner.llmFailed")}</div>
       {/if}
@@ -2242,6 +2291,13 @@
 </main>
 
 <style>
+  .aing-inline {
+    font-size: 12.5px;
+    opacity: 0.8;
+    margin-right: 8px;
+    white-space: nowrap;
+  }
+
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;

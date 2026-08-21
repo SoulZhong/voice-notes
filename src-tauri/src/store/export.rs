@@ -341,6 +341,7 @@ mod tests {
             }
         };
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "t".into(),
             llm_model: None,

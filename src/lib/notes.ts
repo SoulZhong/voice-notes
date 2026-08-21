@@ -168,6 +168,8 @@ export interface RefinedDoc {
   generated_at: string;
   llm_model?: string;
   stages: RefineStages;
+  /** LLM 精修失败块覆盖的段落下标(部分重跑的输入;旧产物无此键)。 */
+  llm_failed_paragraphs?: number[];
   discarded_seqs: number[];
   paragraphs: RefinedParagraph[];
   entities?: Entity[];
@@ -316,6 +318,9 @@ export function exportFileName(title: string, startedAt: string, ext = "md"): st
 }
 export const getRefined = (id: string) => invoke<RefinedDoc | null>("get_refined", { id });
 export const refineNote = (id: string) => invoke<void>("refine_note", { id });
+
+/** 只重试 Aing 失败的段落(已成功的块不重发,token 不重花)。仅 HTTP 执行体。 */
+export const retryFailedRefine = (id: string) => invoke<void>("retry_failed_refine", { id });
 /** 这篇的 Aing 是否正在跑。进页时补问一次:running 事件易失,进页晚了收不到。 */
 export const noteRefining = (id: string) => invoke<boolean>("note_refining", { id });
 /** 发起文件重转写(破坏性:覆盖原始逐字稿,后端自动备份)。input: "dual" | "mixed"。 */

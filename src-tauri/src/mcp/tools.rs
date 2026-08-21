@@ -629,6 +629,7 @@ mod tests {
 
     fn graph_doc(text: &str) -> store::RefinedDoc {
         store::RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T09:00:00+08:00".into(),
             llm_model: Some("text-model".into()),
@@ -733,6 +734,7 @@ mod tests {
         store::write_refined_atomic(
             &tmp.path().join("notes/20260301-100000"),
             &store::RefinedDoc {
+                llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "2026-03-01T11:00:00+08:00".into(),
                 llm_model: None,
@@ -831,6 +833,7 @@ mod tests {
         store::write_refined_atomic(
             &dir,
             &store::RefinedDoc {
+                llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "2026-01-01T11:00:00+08:00".into(),
                 llm_model: None,
@@ -940,6 +943,7 @@ mod tests {
         store::write_refined_atomic(
             &dir,
             &store::RefinedDoc {
+                llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "t".into(),
                 llm_model: None,

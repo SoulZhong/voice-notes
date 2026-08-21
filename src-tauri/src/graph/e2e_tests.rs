@@ -27,6 +27,7 @@ fn predicate() -> RelationPredicate {
 fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
     let text = "Alice uses Beacon";
     let mut doc = RefinedDoc {
+        llm_failed_paragraphs: Vec::new(),
         schema_version: store::refined::REFINED_SCHEMA_VERSION,
         generated_at: "2026-07-21T12:00:00+08:00".into(),
         llm_model: Some("fixture-model".into()),
