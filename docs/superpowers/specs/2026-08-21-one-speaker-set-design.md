@@ -98,3 +98,17 @@ LLM 润色/部分重试/WYSIWYG 保存/实体图谱只关心文本与下标,全�
   (被人工改过则拒绝且状态回退)
 - 旧 R 文档:显示映射到多数 S;操作作用于映射后的 S(前端测试)
 - sync_refined_after_split:整段改派原位改 speaker、跨组标 stale(既有测试改口径)
+
+## 实现期修订(自查/实现中发现,已落地)
+
+1. **LLM 提示词标签**:段落不携带身份后,润色提示词的说话人标签改由调用方现查
+   speakers.json 提供(`run_llm`/`polish` 新增 labels 参数;部分重试同口径)。
+2. **显示 join 统一入口**:`join_note_identities` 落在 store 层,get_refined /
+   export_note / hooks 钩子载荷 / MCP get_note / MCP get_aing_context 五个出口
+   全部走它——含旧 R 键文档按 source_seqs 多数票映射回 S(display 副本连
+   speaker 一并改写,前端零映射代码);无源段可映射的遗留段保留快照字段但仍
+   归一 redirects、跟库中现名(原 join_library_names 语义,该函数已删)。
+3. **重新 Aing 的"改名会丢失"二段确认删除**:名字住在 speakers.json,重 Aing
+   只重建文本,确认与 loseNames 文案一并移除。
+4. **cluster_members_from_doc 排除空 speaker**:无说话人源段/用户手插块不是簇。
+5. **auto_apply_targets 增加 !multi_speaker 前置**(S 表上有此标记,顺手收紧)。

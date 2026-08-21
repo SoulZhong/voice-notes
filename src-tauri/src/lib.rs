@@ -522,7 +522,6 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 let (mut doc, cluster_stats) = refine::run_local(
                     &dir,
                     &note.segments,
-                    &note.speakers,
                     embedder.as_mut().map(|e| e as &mut dyn diar::SpeakerEmbedder),
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
@@ -617,11 +616,19 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         model: model.clone(),
                         api_key: api_key.clone(),
                     };
+                    let prompt_labels = {
+                        let vp_now = store::VoiceprintStore::new(
+                            data_root(&app).map_err(anyhow::Error::msg)?,
+                        )
+                        .load();
+                        speaker_prompt_labels(&note.speakers, &vp_now)
+                    };
                     let write_result = refine::run_llm(
                         &dir,
                         &mut doc,
                         &cfg,
                         model,
+                        &prompt_labels,
                         log_ctx.as_ref(),
                         // 逐块进度:①重发 llm/running(滞留自愈据此判断 worker 活着,
                         // 见 lifecycle/actor.rs 的 REFINE_STALE_MS;事件幂等,内核只在
@@ -690,6 +697,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 &dir,
                                 &note_id,
                                 &doc,
+                                &note.speakers,
                                 &cluster_stats,
                                 &vp,
                                 acoustic_enabled,
@@ -706,7 +714,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                         if s.identify_auto_apply {
                             let fps: Vec<String> = store::load_refined(&dir)
                                 .map(|d| {
-                                    refine::identify::auto_apply_targets(&idoc, &d)
+                                    refine::identify::auto_apply_targets(&idoc, &d, &note.speakers)
                                         .iter()
                                         .map(|a| a.fingerprint.clone())
                                         .collect()
@@ -2846,9 +2854,17 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             let log_ctx = data_root(&app)
                 .ok()
                 .map(|root| ailog::Ctx { data_root: root, note_id: note_id.clone() });
+            let prompt_labels = {
+                let note = store::NoteStore::new(notes_dir(&app).map_err(anyhow::Error::msg)?)
+                    .load(&note_id)?;
+                let vp_now =
+                    store::VoiceprintStore::new(data_root(&app).map_err(anyhow::Error::msg)?).load();
+                speaker_prompt_labels(&note.speakers, &vp_now)
+            };
             let (outcome, _ents, _rels) = refine::llm::polish(
                 &cfg,
                 &mut subset,
+                &prompt_labels,
                 log_ctx.as_ref(),
                 // 取舍(设计明说):补跑块以空术语表起步;实体/关系不补。
                 &|done, total, avg_ms| {
@@ -2939,13 +2955,13 @@ async fn note_refining(app: AppHandle, id: String) -> Result<bool, String> {
 #[tauri::command]
 fn get_refined(app: AppHandle, id: String) -> Result<Option<store::RefinedDoc>, String> {
     store::validate_note_id(&id).map_err(|e| e.to_string())?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&id);
+    let root = notes_dir(&app).map_err(|e| e.to_string())?;
+    let dir = root.join(&id);
     Ok(store::load_refined_for_display(&dir).map(|mut doc| {
-        if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
-            if let Ok(root) = data_root(&app) {
-                let vp = store::VoiceprintStore::new(root).load();
-                store::join_library_names(&mut doc, &vp);
-            }
+        // 一波说话人 join:身份现查 note.speakers(旧 R 键文档按源段多数票映射回 S)。
+        if let (Ok(note), Ok(droot)) = (store::NoteStore::new(root.clone()).load(&id), data_root(&app)) {
+            let vp = store::VoiceprintStore::new(droot).load();
+            store::join_note_identities(&mut doc, &note.speakers, &note.segments, &vp);
         }
         doc
     }))
@@ -3750,58 +3766,6 @@ fn retry_relation_backfill_index(
     })
 }
 
-/// 修订稿说话人改名，并同步声纹库（会议搭子）：该说话人已关联库人物时，库中人名一并
-/// 更新——所有历史与未来会议随之显示新名；未关联的只改本篇修订稿。Aing 中拒绝（管线
-/// 随后整写 refined.json 会吞掉本次编辑），录制中拒绝（speakers.json 由 writer 独占）。
-#[tauri::command]
-fn rename_refined_speaker(
-    app: AppHandle,
-    state: State<AppState>,
-    note_id: String,
-    speaker_id: String,
-    name: String,
-) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(tr!("名字不能为空", "Name cannot be empty"));
-    }
-    // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!(
-            "该笔记正在 Aing 中，稍后再改",
-            "This note is being refined by AI; try again later"
-        ));
-    }
-    reject_if_active(&state, &note_id)?;
-    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    let root = notes_dir(&app).map_err(|e| e.to_string())?;
-    let person_id = store::rename_refined_speaker(&root.join(&note_id), &speaker_id, name)
-        .map_err(|e| e.to_string())?;
-    // 降级修订稿沿用 S* 标签(重聚类 skipped/failed):speakers.json 同名条目一并改,
-    // 原始逐字稿视图不与修订稿打架。R* 标签不存在于 speakers.json,不碰。
-    if speaker_id.starts_with('S') {
-        if let Err(e) = store::NoteStore::new(root).rename_speaker(&note_id, &speaker_id, name) {
-            eprintln!("修订稿改名已生效,但同步 speakers.json 失败({speaker_id}): {e}");
-        }
-    }
-    // 同步会议搭子:人已被删除/合并成悬空引用时静默跳过——本地改名已生效,不回滚。
-    if let Some(pid) = person_id {
-        let graph_root = data_root(&app).map_err(|e| e.to_string())?;
-        let vp_store = store::VoiceprintStore::new(graph_root.clone());
-        let vp = vp_store.load();
-        if let Some(resolved) = store::VoiceprintStore::resolve(&vp, &pid).map(str::to_string) {
-            match vp_store.rename(&resolved, name) {
-                Ok(()) => {
-                    refresh_qwen_hotwords_cache(&app);
-                    queue_person_graph_rebuild(&app, graph_root, &tr!("人物改名", "Person rename"))?
-                }
-                Err(e) => eprintln!("修订稿改名已生效,但同步声纹库失败({pid}): {e}"),
-            }
-        }
-    }
-    Ok(())
-}
-
 /// 原始稿说话人关联声纹库人物（会议搭子选人）：speakers.json 写 person_id 并清空
 /// 本地改名，展示走既有只读 join 显示库中现名。录制中拒绝（speakers.json 由 writer
 /// 独占）；person_id 经 resolve 归一，悬空报错。
@@ -3814,40 +3778,51 @@ fn assign_note_speaker_person(
     person_id: String,
 ) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    let vp = open_voiceprint_store(&app)?.load();
-    let Some(resolved) = store::VoiceprintStore::resolve(&vp, &person_id).map(str::to_string) else {
+    do_assign_note_speaker_person(&app, &note_id, &speaker_id, &person_id)
+}
+
+/// 关联的可复用本体:命令壳与 identify 建议确认(apply_identify_suggestion)共用。
+/// 调用方自备录制中守卫(reject_if_active);EditNote 经 lifecycle actor 串行,
+/// spawn_feedback 承担纠错回灌。一波说话人设计(2026-08-21)后这是唯一的关联写入口。
+fn do_assign_note_speaker_person(
+    app: &AppHandle,
+    note_id: &str,
+    speaker_id: &str,
+    person_id: &str,
+) -> Result<(), String> {
+    let vp = open_voiceprint_store(app)?.load();
+    let Some(resolved) = store::VoiceprintStore::resolve(&vp, person_id).map(str::to_string) else {
         return Err(tr!(
             "声纹库中没有该人物: {person_id}",
-            "No such person in the voiceprint library: {person_id}"
+            "No such person in the voiceprint library: {person_id}",
+            person_id = person_id
         ));
     };
     // 纠错回灌(spec P1-2)的输入必须在写入前同步取好:指认时刻的段快照与
     // 先前关联,后台任务不再回读笔记,避免基于"稍后状态"的混合版本回灌。
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(dir).load(note_id).map_err(|e| e.to_string())?;
     let prior = note
         .speakers
-        .get(&speaker_id)
+        .get(speaker_id)
         .and_then(|m| m.person_id.as_deref())
         .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
         .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
-    let note_for_feedback = note_id.clone();
-    let speaker_for_feedback = speaker_id.clone();
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::AssignPerson {
-            id: note_id,
-            speaker_id,
+            id: note_id.to_string(),
+            speaker_id: speaker_id.to_string(),
             person_id: resolved.clone(),
         },
     })?;
     spawn_feedback(
-        &app,
-        note_for_feedback,
+        app,
+        note_id.to_string(),
         note.segments,
-        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_for_feedback.clone()])),
+        feedback::SegFilter::Speakers(std::collections::BTreeSet::from([speaker_id.to_string()])),
         prior,
         resolved,
-        Some(speaker_for_feedback),
+        Some(speaker_id.to_string()),
     );
     Ok(())
 }
@@ -4825,43 +4800,16 @@ async fn commit_split(
                 })?;
             }
             // 修订稿同步:全组同去向原位改;跨组标 stale(一期边界)。
-            let vp = vp_store.load();
+            // 一波说话人(2026-08-21):段落只改归属,身份显示现查 note.speakers,
+            // 原 person_name 快照(codex 实现轮一 P2 的保身份逻辑)随之整体删除。
             let moved: std::collections::BTreeMap<u64, String> = op
                 .plan_groups
                 .iter()
                 .filter_map(|g| g.dest_speaker.as_ref().map(|d| (g, d)))
                 .flat_map(|(g, d)| g.seqs.iter().map(|q| (*q, d.clone())).collect::<Vec<_>>())
                 .collect();
-            let mut person_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
-                Default::default();
-            let note_now = nstore.load(&op.note_id).map_err(|e| e.to_string())?;
-            for g in &op.plan_groups {
-                if let Some(sid) = &g.dest_speaker {
-                    let entry = if g.dest_kind == "person" {
-                        let pid = g.dest_id.clone();
-                        let name = pid
-                            .as_deref()
-                            .and_then(|p| store::VoiceprintStore::resolve(&vp, p))
-                            .and_then(|r| vp.people.get(r))
-                            .map(|p| p.name.clone());
-                        (pid, name)
-                    } else {
-                        // 归入本篇已有说话人:他若已关联库人物,修订稿要保留这份身份,
-                        // 不能写 (None,None) 把关联冲掉(codex 实现轮一 P2)。
-                        let meta = note_now.speakers.get(sid);
-                        let pid = meta.and_then(|m| m.person_id.clone());
-                        let name = pid
-                            .as_deref()
-                            .and_then(|p| store::VoiceprintStore::resolve(&vp, p))
-                            .and_then(|r| vp.people.get(r))
-                            .map(|p| p.name.clone());
-                        (pid, name)
-                    };
-                    person_name.insert(sid.clone(), entry);
-                }
-            }
             if !moved.is_empty() && store::aing_exists(&dir) {
-                match store::sync_refined_after_split(&dir, &moved, &person_name) {
+                match store::sync_refined_after_split(&dir, &moved) {
                     Ok(true) => eprintln!("拆分({op_id}):修订稿存在跨组段落,已标 stale 待重新 Aing"),
                     Ok(false) => {}
                     Err(e) => {
@@ -5864,116 +5812,6 @@ fn rename_entity(app: AppHandle, id: String, new_name: String) -> Result<ipc::Re
     result
 }
 
-/// 把修订稿说话人关联到声纹库人物（会议搭子选人）：段落写入 person_id 并采用库中
-/// 现名。此后对该说话人的改名会同步进库；库里改名也会经 get_refined join 反映回来。
-#[tauri::command]
-fn assign_refined_person(
-    app: AppHandle,
-    note_id: String,
-    speaker_id: String,
-    person_id: String,
-) -> Result<(), String> {
-    do_assign_refined_person(&app, &note_id, &speaker_id, &person_id)
-}
-
-/// 取消修订稿说话人与库人物的关联(原始稿的对应命令是 clear_note_speaker_person)。
-/// 只断开绑定:段落归属、文本、时间戳都不动,显示回落到「说话人 R<n>」。
-///
-/// 走 CAS(unassign_refined_person_if 比对当前 person_id):用户看到的是谁就只解开谁。
-/// 面板开着的时候 identify 自动应用可能已经把关联改成了别人,不比对就会误解别人的绑定。
-///
-/// **不连带撤销这次关联带来的声纹回灌**,与原始稿同一决定(见
-/// docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md「配套」一节)。
-#[tauri::command]
-fn clear_refined_speaker_person(
-    app: AppHandle,
-    note_id: String,
-    speaker_id: String,
-) -> Result<(), String> {
-    // Aing 中拒绝:整写 refined.json 会和本次修改互相冲掉(同 do_assign_refined_person)。
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!(
-            "该笔记正在 Aing 中，稍后再改",
-            "This note is being refined by AI; try again later"
-        ));
-    }
-    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
-    let doc = store::load_refined(&dir)
-        .ok_or_else(|| tr!("该笔记尚无修订稿", "This note has no refined doc yet"))?;
-    let Some(current) = doc
-        .paragraphs
-        .iter()
-        .find(|p| p.speaker == speaker_id)
-        .and_then(|p| p.person_id.clone())
-    else {
-        return Ok(()); // 本来就没关联,幂等
-    };
-    store::unassign_refined_person_if(&dir, &speaker_id, &current).map_err(|e| e.to_string())
-}
-
-/// 修订稿说话人关联的可复用本体:assign_refined_person 命令与 identify 建议确认
-/// (apply_identify_suggestion)共用。自带 Aing 中拒绝守卫;内部 store 写入自取
-/// NoteLock,调用方不得持任何笔记锁(嵌套会死锁)。
-fn do_assign_refined_person(
-    app: &AppHandle,
-    note_id: &str,
-    speaker_id: &str,
-    person_id: &str,
-) -> Result<(), String> {
-    // Aing 中拒绝:改读 lifecycle 内核 Aing 态(原 AppState.refining 集合已删)。
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(note_id) {
-        return Err(tr!(
-            "该笔记正在 Aing 中，稍后再改",
-            "This note is being refined by AI; try again later"
-        ));
-    }
-    store::validate_note_id(note_id).map_err(|e| e.to_string())?;
-    let vp = open_voiceprint_store(app)?.load();
-    let Some(resolved) = store::VoiceprintStore::resolve(&vp, person_id).map(str::to_string) else {
-        return Err(tr!(
-            "声纹库中没有该人物: {person_id}",
-            "No such person in the voiceprint library: {person_id}",
-            person_id = person_id
-        ));
-    };
-    let name = vp.people.get(&resolved).map(|p| p.name.clone()).unwrap_or_default();
-    let root = notes_dir(app).map_err(|e| e.to_string())?;
-    let dir = root.join(note_id);
-    // 纠错回灌输入(prior 与 R 段落 seq 集合)必须在写入前读取:写入后
-    // person_id 已变,读不到"先前关联"了。
-    let feedback_input = store::load_refined(&dir).map(|doc| {
-        let paras: Vec<_> = doc.paragraphs.iter().filter(|p| p.speaker == speaker_id).collect();
-        let seqs: std::collections::BTreeSet<u64> =
-            paras.iter().flat_map(|p| p.source_seqs.iter().copied()).collect();
-        let prior = paras
-            .iter()
-            .find_map(|p| p.person_id.as_deref())
-            .and_then(|pid| store::VoiceprintStore::resolve(&vp, pid))
-            .map(|rid| (rid.to_string(), vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default()));
-        (seqs, prior)
-    });
-    store::assign_refined_person(&dir, speaker_id, &resolved, &name).map_err(|e| e.to_string())?;
-    if let Some((seqs, prior)) = feedback_input {
-        if !seqs.is_empty() {
-            match store::NoteStore::new(root).load(note_id) {
-                Ok(note) => spawn_feedback(
-                    app,
-                    note_id.to_string(),
-                    note.segments,
-                    feedback::SegFilter::Seqs(seqs),
-                    prior,
-                    resolved,
-                    // 修订稿没有"取消关联"入口,不存在反向竞态,无需复核。
-                    None,
-                ),
-                Err(e) => eprintln!("feedback: 读取笔记段失败,跳过回灌: {e}"),
-            }
-        }
-    }
-    Ok(())
-}
-
 /// P3 自动日历匹配(停止后/backfill 共用):开关开、已授权、无快照且未被清除
 /// 才写。持锁复查——查询期间用户手动改选/清除则放弃。返回是否写入。
 fn match_and_store_calendar(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
@@ -6302,6 +6140,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
                     &dir,
                     &id,
                     &doc,
+                    &note.speakers,
                     &stats,
                     &vp,
                     acoustic_enabled,
@@ -6316,7 +6155,7 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
             if s.identify_auto_apply {
                 let fps: Vec<String> = store::load_refined(&dir)
                     .map(|d| {
-                        refine::identify::auto_apply_targets(&idoc, &d)
+                        refine::identify::auto_apply_targets(&idoc, &d, &note.speakers)
                             .iter()
                             .map(|a| a.fingerprint.clone())
                             .collect()
@@ -6341,6 +6180,29 @@ async fn identify_note(app: AppHandle, state: State<'_, AppState>, id: String) -
 /// 读改写,UI 双击/并发确认全收敛于此(list 只读不受影响)。
 static IDENTIFY_ACT_GATE: Mutex<()> = Mutex::new(());
 
+/// 一波说话人:LLM 提示词的说话人标签(id → 显示名)。段落不携带身份,标签由
+/// 调用方现查 speakers.json(关联者跟库中现名,否则本地名;无名不进表,由
+/// llm::speaker_label 退回裸 id)。
+fn speaker_prompt_labels(
+    speakers: &std::collections::BTreeMap<String, store::SpeakerMeta>,
+    vp: &store::Voiceprints,
+) -> std::collections::BTreeMap<String, String> {
+    speakers
+        .iter()
+        .filter_map(|(sid, m)| {
+            let name = m
+                .person_id
+                .as_deref()
+                .and_then(|pid| store::VoiceprintStore::resolve(vp, pid))
+                .and_then(|rid| vp.people.get(rid))
+                .map(|p| p.name.clone())
+                .filter(|n| !n.is_empty())
+                .or_else(|| Some(m.name.clone()).filter(|n| !n.is_empty()))?;
+            Some((sid.clone(), name))
+        })
+        .collect()
+}
+
 /// P2b 操作 id:进程号 + 计数 + 时间戳,不求密码学强度,只求全局不重。
 fn identify_op_id() -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6364,8 +6226,10 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
     let mut idoc = refine::identify::load_identify(&dir)
         .ok_or_else(|| anyhow::anyhow!("identify.json 缺失"))?;
     let doc = store::load_refined(&dir).ok_or_else(|| anyhow::anyhow!("精修稿缺失"))?;
-    // 资格在锁内复核(auto_apply_targets 含"簇当前无关联无手填名"的全部前置)。
-    let eligible = refine::identify::auto_apply_targets(&idoc, &doc)
+    // 资格在锁内复核(auto_apply_targets 含"说话人当前无关联无手填名"的全部前置;
+    // 一波说话人后前置查 speakers.json,须在锁内取新鲜表)。
+    let fresh = store::NoteStore::new(root.clone()).load(note_id)?;
+    let eligible = refine::identify::auto_apply_targets(&idoc, &doc, &fresh.speakers)
         .iter()
         .any(|a| a.fingerprint == fingerprint);
     anyhow::ensure!(eligible, "条目已不满足自动应用前置");
@@ -6421,8 +6285,9 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
         let _ = refine::identify::save_ops(dir, &ops);
     };
 
-    // ② 关联(store 层自取 NoteLock;绕命令壳的 is_refining 守卫)。
-    store::assign_refined_person(&dir, &speaker, &resolved, &name)?;
+    // ② 关联:一波说话人——写 speakers.json,CAS「当前未关联才写」(store 层自取
+    // NoteLock;与资格复核间若被用户抢先关联,这里原子拒绝)。
+    store::NoteStore::new(root.clone()).assign_speaker_person_if(note_id, &speaker, &resolved)?;
     set_stage(&dir, &op_id, "assigned", None);
 
     // ③ 同步回灌(自动路径绝不异步——否则撤销后后台污染)。
@@ -6843,7 +6708,9 @@ async fn undo_identify_apply(
                 "Speaker clusters changed; cannot auto-undo (reassign manually)"
             ));
         };
-        if let Err(e) = store::unassign_refined_person_if(&dir, &speaker, &target) {
+        if let Err(e) =
+            store::NoteStore::new(root.clone()).clear_speaker_person_if(&note_id, &speaker, &target)
+        {
             ops.ops[idx].undo_stage = None;
             let _ = refine::identify::save_ops(&dir, &ops);
             return Err(e.to_string());
@@ -6946,7 +6813,10 @@ async fn apply_identify_suggestion(
             (None, Some(nn)) => (vp_store.create_person(nn, &now).map_err(|e| e.to_string())?, true),
             _ => return Err(tr!("建议数据异常", "Corrupt suggestion")),
         };
-        if let Err(e) = do_assign_refined_person(&app2, &note_id, &speaker, &target) {
+        // 录制中拒绝(speakers.json 由 writer 独占;与手动关联命令同守卫)。
+        if let Err(e) = reject_if_active(&app2.state::<AppState>(), &note_id)
+            .and_then(|_| do_assign_note_speaker_person(&app2, &note_id, &speaker, &target))
+        {
             if created {
                 let _ = vp_store.delete_person_if_empty(&target);
             }
@@ -7284,11 +7154,9 @@ fn export_note(app: AppHandle, id: String, format: String, prefer_refined: bool,
     let dir = notes_dir(&app).map_err(|e| e.to_string())?;
     let refined = if prefer_refined {
         store::load_refined_for_display(&dir.join(&id)).map(|mut doc| {
-            if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
-                if let Ok(root) = data_root(&app) {
-                    let vp = store::VoiceprintStore::new(root).load();
-                    store::join_library_names(&mut doc, &vp);
-                }
+            if let (Ok(note), Ok(root)) = (store::NoteStore::new(dir.clone()).load(&id), data_root(&app)) {
+                let vp = store::VoiceprintStore::new(root).load();
+                store::join_note_identities(&mut doc, &note.speakers, &note.segments, &vp);
             }
             doc
         })
@@ -9570,8 +9438,6 @@ pub fn run() {
             start_relation_backfill,
             cancel_relation_backfill,
             retry_relation_backfill_index,
-            rename_refined_speaker,
-            assign_refined_person,
             assign_note_speaker_person,
             clear_note_speaker_person,
             person_notes,
@@ -9677,7 +9543,6 @@ pub fn run() {
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
-            clear_refined_speaker_person,
             player::player_load,
             player::player_play,
             player::player_pause,

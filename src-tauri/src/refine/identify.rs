@@ -77,11 +77,15 @@ pub fn cluster_fingerprint(seqs: &BTreeSet<u64>) -> String {
     crate::feedback::seq_fingerprint(seqs)
 }
 
-/// 从最终稿重建每个 R 簇的成员 seq 集(source_seqs 并集)。指纹一律以此为准:
-/// recluster 的 core_seqs 不含无嵌入传播段,与最终稿不一致,不能当身份指纹。
+/// 从最终稿重建每个簇(一波说话人后=每个 S 说话人)的成员 seq 集(source_seqs
+/// 并集)。指纹一律以此为准:stats 的 core_seqs 不含无嵌入段,与最终稿不一致,
+/// 不能当身份指纹。空 speaker(无说话人源段/用户手插块)不是簇,不入表。
 pub fn cluster_members_from_doc(doc: &RefinedDoc) -> BTreeMap<String, BTreeSet<u64>> {
     let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     for p in &doc.paragraphs {
+        if p.speaker.is_empty() {
+            continue;
+        }
         out.entry(p.speaker.clone())
             .or_default()
             .extend(p.source_seqs.iter().copied());
@@ -293,6 +297,7 @@ fn sample_paragraphs(
 pub fn build_context(
     note_id: &str,
     doc: &RefinedDoc,
+    speakers: &BTreeMap<String, crate::store::SpeakerMeta>,
     stats: &[ClusterStat],
     vp: &Voiceprints,
     acoustic_enabled: bool,
@@ -315,14 +320,14 @@ pub fn build_context(
     }
     candidates.truncate(MAX_CANDIDATES);
 
-    // 段落既有关联(种子命中会写进 paragraphs 的 person_id/name)。
+    // 既有关联:一波说话人后段落不携带身份,一律查 speakers.json(经 redirects
+    // 归一,名字取库中现名)。
     let mut linked_by_speaker: BTreeMap<&str, (String, String)> = BTreeMap::new();
-    for p in &doc.paragraphs {
-        if let Some(pid) = &p.person_id {
-            linked_by_speaker
-                .entry(p.speaker.as_str())
-                .or_insert_with(|| (pid.clone(), p.name.clone().unwrap_or_default()));
-        }
+    for (sid, meta) in speakers {
+        let Some(pid) = meta.person_id.as_deref() else { continue };
+        let rid = crate::store::VoiceprintStore::resolve(vp, pid).unwrap_or(pid);
+        let name = vp.people.get(rid).map(|p| p.name.clone()).unwrap_or_default();
+        linked_by_speaker.insert(sid.as_str(), (rid.to_string(), name));
     }
 
     let clusters = members
@@ -801,6 +806,7 @@ pub fn run_identify(
     note_dir: &Path,
     note_id: &str,
     doc: &RefinedDoc,
+    speakers: &BTreeMap<String, crate::store::SpeakerMeta>,
     stats: &[ClusterStat],
     vp: &Voiceprints,
     acoustic_enabled: bool,
@@ -810,7 +816,7 @@ pub fn run_identify(
     now: &str,
 ) -> anyhow::Result<IdentifyDoc> {
     let members = cluster_members_from_doc(doc);
-    let ctx = build_context(note_id, doc, stats, vp, acoustic_enabled, calendar);
+    let ctx = build_context(note_id, doc, speakers, stats, vp, acoustic_enabled, calendar);
     let (raws, parse_skipped) = executor.infer(&ctx, log)?;
     if parse_skipped > 0 {
         eprintln!("identify({note_id}): {parse_skipped} 条输出条目类型非法,已跳过");
@@ -1014,6 +1020,7 @@ pub fn save_ops(note_dir: &Path, ops: &IdentifyOps) -> anyhow::Result<()> {
 pub fn auto_apply_targets<'a>(
     idoc: &'a IdentifyDoc,
     doc: &RefinedDoc,
+    speakers: &BTreeMap<String, crate::store::SpeakerMeta>,
 ) -> Vec<&'a IdentifyAssignment> {
     let members = cluster_members_from_doc(doc);
     let fp_to_speaker: BTreeMap<String, String> = members
@@ -1029,9 +1036,10 @@ pub fn auto_apply_targets<'a>(
                 && a.acoustic.is_some()
                 && a.acoustic_z.map_or(true, |z| z >= crate::diar::registry::SEED_ASSIGN_Z)
                 && fp_to_speaker.get(&a.fingerprint).is_some_and(|sp| {
-                    doc.paragraphs.iter().filter(|p| &p.speaker == sp).all(|p| {
-                        p.person_id.is_none()
-                            && p.name.as_deref().map_or(true, |n| n.trim().is_empty())
+                    // 一波说话人:关联/手填名都在 speakers.json——该说话人当前
+                    // 无关联、无手填名、未标多人才允许自动写。
+                    speakers.get(sp).map_or(false, |m| {
+                        m.person_id.is_none() && m.name.trim().is_empty() && !m.multi_speaker
                     })
                 })
         })
@@ -1226,16 +1234,26 @@ mod tests {
 
     #[test]
     fn build_context_marks_mixed_and_linked() {
-        let mut p0 = para("R1", &[0], "开场");
-        p0.person_id = Some("P7".into());
-        p0.name = Some("老熟人".into());
-        let doc = doc_with(vec![p0, para("R2", &[1], "另一位")]);
+        let doc = doc_with(vec![para("R1", &[0], "开场"), para("R2", &[1], "另一位")]);
+        let mut speakers: BTreeMap<String, crate::store::SpeakerMeta> = BTreeMap::new();
+        speakers.insert(
+            "R1".into(),
+            crate::store::SpeakerMeta {
+                name: String::new(),
+                sources: vec!["mic".into()],
+                centroid: None,
+                count: 1,
+                person_id: Some("P7".into()),
+                multi_speaker: false,
+                reserved_by: None,
+            },
+        );
         // R1 混合簇:mic 6s + system 4s(次信道 40% > 20%)。
         let mut s1 = stat("R1", "mic", vec![1.0, 0.0], 6_000);
         s1.source_ms.insert("system".into(), 4_000);
         s1.total_ms = 10_000;
         let stats = vec![s1, stat("R2", "system", vec![0.0, 1.0], 8_000)];
-        let ctx = build_context("n1", &doc, &stats, &Voiceprints::default(), true, None);
+        let ctx = build_context("n1", &doc, &speakers, &stats, &Voiceprints::default(), true, None);
         let r1 = ctx.clusters.iter().find(|c| c.speaker == "R1").unwrap();
         assert!(r1.mixed);
         assert!(r1.is_mic);
@@ -1392,7 +1410,7 @@ mod tests {
 
         // 第一轮:R1 建议张伟(P1)。
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d1 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t1").unwrap();
+        let d1 = run_identify(dir.path(), "n1", &doc, &BTreeMap::new(), &stats, &vp, true, None, &exec, None, "t1").unwrap();
         assert_eq!(d1.assignments.len(), 1);
         assert_eq!(d1.assignments[0].status, "suggested");
         assert_eq!(d1.assignments[0].tier, Tier::High);
@@ -1403,11 +1421,11 @@ mod tests {
         d1_rejected.rejected.insert(rejected_key(&fp_r1, "P1"), "t1x".into());
         d1_rejected.assignments.clear();
         save_identify(dir.path(), &d1_rejected).unwrap();
-        let d2 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t2").unwrap();
+        let d2 = run_identify(dir.path(), "n1", &doc, &BTreeMap::new(), &stats, &vp, true, None, &exec, None, "t2").unwrap();
         assert!(d2.assignments.is_empty(), "拒过的同目标建议不再生成");
         assert!(d2.rejected.contains_key(&rejected_key(&fp_r1, "P1")), "拒绝表跨代继承");
         let exec_new = MockExec(vec![raw("R1", None, Some("张老板"), vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d3 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec_new, None, "t3").unwrap();
+        let d3 = run_identify(dir.path(), "n1", &doc, &BTreeMap::new(), &stats, &vp, true, None, &exec_new, None, "t3").unwrap();
         // 「我是张伟」不含「张老板」→ self_intro 降级 → Low → 不落建议;
         // 换个含名证据检查放行路径:
         assert!(d3.assignments.is_empty());
@@ -1427,7 +1445,7 @@ mod tests {
         };
         d4.rejected.clear();
         save_identify(dir.path(), &d4).unwrap();
-        let d5 = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t5").unwrap();
+        let d5 = run_identify(dir.path(), "n1", &doc, &BTreeMap::new(), &stats, &vp, true, None, &exec, None, "t5").unwrap();
         assert_eq!(d5.assignments.len(), 1, "applied 保留且不重复建议");
         assert_eq!(d5.assignments[0].status, "applied");
     }
@@ -1435,14 +1453,23 @@ mod tests {
     #[test]
     fn run_identify_skips_suggestion_equal_to_existing_link() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut doc, _, stats, vp) = adjudicate_fixture();
-        // R1 已关联 P1:同目标建议是废话,不生成。
-        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == "R1") {
-            p.person_id = Some("P1".into());
-            p.name = Some("张伟".into());
-        }
+        let (doc, _, stats, vp) = adjudicate_fixture();
+        // R1 已关联 P1(一波说话人:关联在 speakers.json):同目标建议是废话,不生成。
+        let mut speakers: BTreeMap<String, crate::store::SpeakerMeta> = BTreeMap::new();
+        speakers.insert(
+            "R1".into(),
+            crate::store::SpeakerMeta {
+                name: String::new(),
+                sources: vec!["mic".into()],
+                centroid: None,
+                count: 1,
+                person_id: Some("P1".into()),
+                multi_speaker: false,
+                reserved_by: None,
+            },
+        );
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
-        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t").unwrap();
+        let d = run_identify(dir.path(), "n1", &doc, &speakers, &stats, &vp, true, None, &exec, None, "t").unwrap();
         assert!(d.assignments.is_empty());
     }
     #[test]
@@ -1493,7 +1520,7 @@ mod tests {
         assert!(got.iter().any(|c| c.person_id == "P1"), "名字精确命中入选");
         // build_context:calendar 进 ctx,参会人 cap+is_me 标注+截断占位。
         let doc = doc_with(vec![para("R1", &[0], "开场")]);
-        let ctx = build_context("n1", &doc, &[], &vp, false, Some(&cal));
+        let ctx = build_context("n1", &doc, &BTreeMap::new(), &[], &vp, false, Some(&cal));
         assert_eq!(ctx.candidates[0].person_id, "P2", "日历候选排最前");
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(json.contains("calendar"), "calendar 序列化进 prompt 主体");
@@ -1566,12 +1593,25 @@ mod tests {
         assert!(d2.rejected.contains_key(&rejected_key("fp", "P1")));
     }
 
+    fn smeta(name: &str, person: Option<&str>, multi: bool) -> crate::store::SpeakerMeta {
+        crate::store::SpeakerMeta {
+            name: name.into(),
+            sources: vec!["mic".into()],
+            centroid: None,
+            count: 1,
+            person_id: person.map(str::to_string),
+            multi_speaker: multi,
+            reserved_by: None,
+        }
+    }
+
     #[test]
     fn auto_apply_targets_gate_all_preconditions() {
-        // 稿:R1(无关联)与 R2(有手填名)。
-        let mut p2 = para("R2", &[5], "b");
-        p2.name = Some("手填".into());
-        let doc = doc_with(vec![para("R1", &[0, 1], "a"), p2]);
+        // 一波说话人:前置查 speakers.json——R1 干净,R2 有手填名。
+        let doc = doc_with(vec![para("R1", &[0, 1], "a"), para("R2", &[5], "b")]);
+        let mut speakers: BTreeMap<String, crate::store::SpeakerMeta> = BTreeMap::new();
+        speakers.insert("R1".into(), smeta("", None, false));
+        speakers.insert("R2".into(), smeta("手填", None, false));
         let members = cluster_members_from_doc(&doc);
         let fp1 = cluster_fingerprint(&members["R1"]);
         let fp2 = cluster_fingerprint(&members["R2"]);
@@ -1580,19 +1620,19 @@ mod tests {
             ass(&fp2, Tier::High, Some("P1"), "suggested", true, None),      // 簇有手填名 → 拒
             ass("fp-x", Tier::High, Some("P1"), "suggested", true, None),    // 指纹失配 → 拒
         ]);
-        let got: Vec<&str> = auto_apply_targets(&d, &doc).iter().map(|a| a.fingerprint.as_str()).collect();
+        let got: Vec<&str> = auto_apply_targets(&d, &doc, &speakers).iter().map(|a| a.fingerprint.as_str()).collect();
         assert_eq!(got, vec![fp1.as_str()]);
         // z 可算但不达标 → 拒;new_name → 拒;Medium → 拒;无声学确认 → 拒。
         let d2 = idoc_with(vec![
             ass(&fp1, Tier::High, Some("P1"), "suggested", true, Some(2.0)),
         ]);
-        assert!(auto_apply_targets(&d2, &doc).is_empty(), "z<3 拒");
+        assert!(auto_apply_targets(&d2, &doc, &speakers).is_empty(), "z<3 拒");
         let d3 = idoc_with(vec![ass(&fp1, Tier::High, None, "suggested", true, None)]);
-        assert!(auto_apply_targets(&d3, &doc).is_empty(), "new_name 永不自动建档");
+        assert!(auto_apply_targets(&d3, &doc, &speakers).is_empty(), "new_name 永不自动建档");
         let d4 = idoc_with(vec![ass(&fp1, Tier::Medium, Some("P1"), "suggested", true, None)]);
-        assert!(auto_apply_targets(&d4, &doc).is_empty(), "Medium 拒");
+        assert!(auto_apply_targets(&d4, &doc, &speakers).is_empty(), "Medium 拒");
         let d5 = idoc_with(vec![ass(&fp1, Tier::High, Some("P1"), "suggested", false, None)]);
-        assert!(auto_apply_targets(&d5, &doc).is_empty(), "无声学确认拒");
+        assert!(auto_apply_targets(&d5, &doc, &speakers).is_empty(), "无声学确认拒");
     }
 
     #[test]
@@ -1604,7 +1644,7 @@ mod tests {
         seeded.source_hash = crate::store::source_hash(&doc.paragraphs);
         save_identify(dir.path(), &seeded).unwrap();
         let exec = MockExec(vec![]);
-        let d = run_identify(dir.path(), "n1", &doc, &stats, &vp, true, None, &exec, None, "t").unwrap();
+        let d = run_identify(dir.path(), "n1", &doc, &BTreeMap::new(), &stats, &vp, true, None, &exec, None, "t").unwrap();
         assert_eq!(d.assignments.len(), 1, "auto_applied 回执跨代保留");
         assert_eq!(d.assignments[0].status, "auto_applied");
     }

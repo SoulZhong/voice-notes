@@ -14,7 +14,6 @@ use crate::diar::registry::SeedCluster;
 use crate::diar::SpeakerEmbedder;
 use crate::store::{
     Entity, GraphExtraction, Mention, RefineStages, RefinedDoc, RefinedParagraph, SegmentRecord,
-    SpeakerMeta,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -250,7 +249,6 @@ fn merge_entity_aliases(existing: &mut Entity, current: &Entity) {
 pub fn run_local(
     note_dir: &Path,
     segs: &[SegmentRecord],
-    speakers: &BTreeMap<String, SpeakerMeta>,
     embedder: Option<&mut dyn SpeakerEmbedder>,
     seeds: &[SeedCluster],
     generated_at: &str,
@@ -275,22 +273,23 @@ pub fn run_local(
 
     // cluster_stats 是 identify(P2a)的声学输入,随 doc 一并返回;
     // 降级/无嵌入路径没有簇统计,identify 拿到空表自然只走文本档。
-    let (assign, cluster_stats, recluster_state) = match embedder {
+    // 一波说话人(2026-08-21-one-speaker-set-design.md):段落分组直接沿用原始稿
+    // 说话人,不再重分组;嵌入只为 identify 供声学统计(按 S 说话人聚合)。
+    let (cluster_stats, recluster_state) = match embedder {
         Some(e) => match embed_all(note_dir, &kept, e) {
             Ok(embs) => {
                 let matcher = crate::diar::registry::matcher_from_key(speaker_match);
-                let (assign, stats) = recluster::recluster(&inputs, &embs, seeds, matcher.as_ref());
-                (assign, stats, "done")
+                (recluster::stats_by_speaker(&inputs, &embs, seeds, matcher.as_ref()), "done")
             }
             Err(err) => {
-                eprintln!("refine: 嵌入失败,重聚类降级: {err}");
-                (fallback_assign(&inputs), vec![], "failed")
+                eprintln!("refine: 嵌入失败,簇统计降级: {err}");
+                (vec![], "failed")
             }
         },
-        None => (fallback_assign(&inputs), vec![], "skipped"),
+        None => (vec![], "skipped"),
     };
 
-    let paragraphs = build_paragraphs(segs, &discarded, &assign, speakers);
+    let paragraphs = build_paragraphs(segs, &discarded);
     let mut doc = RefinedDoc {
         llm_failed_paragraphs: Vec::new(),
         schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
@@ -405,47 +404,19 @@ pub(crate) fn embed_all(
     Ok(out)
 }
 
-fn fallback_assign(inputs: &[recluster::SegInput]) -> Vec<recluster::Assignment> {
-    inputs
-        .iter()
-        .map(|i| recluster::Assignment {
-            seq: i.seq,
-            speaker: i.old_speaker.clone().unwrap_or_else(|| "R1".into()),
-            name: None,
-            person: None,
-        })
-        .collect()
-}
-
-pub(crate) fn build_paragraphs(
-    segs: &[SegmentRecord],
-    discarded: &[u64],
-    assign: &[recluster::Assignment],
-    speakers: &BTreeMap<String, SpeakerMeta>,
-) -> Vec<RefinedParagraph> {
-    let by_seq: BTreeMap<u64, &recluster::Assignment> = assign.iter().map(|a| (a.seq, a)).collect();
+/// 修订稿段落:按原始稿说话人(S 域)分组,连续同 speaker 段合并(上限 MAX_PARA_MS)。
+/// 一波说话人设计(2026-08-21):段落不携带身份(name/person_id 恒 None,字段仅为
+/// 旧文档反序列化兼容保留),显示端一律现查 note.speakers。无 speaker 段归入 ""
+/// (与用户手插块同显示口径:无说话人前缀)。
+pub(crate) fn build_paragraphs(segs: &[SegmentRecord], discarded: &[u64]) -> Vec<RefinedParagraph> {
     let mut out: Vec<RefinedParagraph> = Vec::new();
     for s in segs {
         if discarded.contains(&s.seq) {
             continue;
         }
-        let Some(a) = by_seq.get(&s.seq) else {
-            continue;
-        };
-        let old_meta = s.speaker.as_ref().and_then(|old| speakers.get(old));
-        let name = a.name.clone().or_else(|| {
-            old_meta
-                .filter(|m| !m.name.is_empty())
-                .map(|m| m.name.clone())
-        });
-        // 人物关联:重聚类种子命中优先;降级路径(沿用旧 S 标签)继承该说话人在
-        // speakers.json 里已有的关联——与 name 同一套兜底逻辑。
-        let person_id = a
-            .person
-            .clone()
-            .or_else(|| old_meta.and_then(|m| m.person_id.clone()));
+        let sp = s.speaker.clone().unwrap_or_default();
         let merge = out.last().map_or(false, |p: &RefinedParagraph| {
-            p.speaker == a.speaker && s.end_ms.saturating_sub(p.start_ms) <= MAX_PARA_MS
+            p.speaker == sp && s.end_ms.saturating_sub(p.start_ms) <= MAX_PARA_MS
         });
         if merge {
             let p = out.last_mut().unwrap();
@@ -454,9 +425,9 @@ pub(crate) fn build_paragraphs(
             p.source_seqs.push(s.seq);
         } else {
             out.push(RefinedParagraph {
-                speaker: a.speaker.clone(),
-                name,
-                person_id,
+                speaker: sp,
+                name: None,
+                person_id: None,
                 start_ms: s.start_ms,
                 end_ms: s.end_ms,
                 text: s.text.clone(),
@@ -478,6 +449,8 @@ pub fn run_llm(
     doc: &mut RefinedDoc,
     cfg: &llm::LlmConfig,
     llm_model: &str,
+    // 说话人 id → 显示名(提示词标签用,见 llm::polish)。
+    labels: &std::collections::BTreeMap<String, String>,
     log: Option<&crate::ailog::Ctx>,
     // 逐块进度 (done,total,avg_ms),透传给 llm::polish,见那里的说明。
     progress: &dyn Fn(usize, usize, u64),
@@ -526,7 +499,7 @@ pub fn run_llm(
     *doc = latest;
     let fallback_graph = GraphFallbackSnapshot::capture(doc);
 
-    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, log, progress);
+    let (text_outcome, raw_entities, raw_relations) = llm::polish(cfg, &mut doc.paragraphs, labels, log, progress);
     let relations_complete = text_outcome.relations_complete();
     let state = match &text_outcome {
         llm::LlmOutcome::Done | llm::LlmOutcome::DoneWithRelationErrors => "done",
@@ -1392,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn run_local_filters_reclusters_and_builds_paragraphs() {
+    fn run_local_filters_and_builds_paragraphs_by_note_speaker() {
         let dir = tempfile::tempdir().unwrap();
         write_wav(dir.path(), "mic.wav", 30);
         let segs = vec![
@@ -1410,7 +1383,6 @@ mod tests {
         let (doc, _) = run_local(
             dir.path(),
             &segs,
-            &BTreeMap::new(),
             Some(&mut e),
             &[],
             "2026-07-06T15:00:00+08:00",
@@ -1421,9 +1393,12 @@ mod tests {
         assert_eq!(doc.stages.filter, "done");
         assert_eq!(doc.stages.recluster, "done");
         assert_eq!(doc.stages.llm, "off");
-        assert_eq!(doc.paragraphs.len(), 2, "seq0+seq2 并段,seq3 独立");
-        assert_eq!(doc.paragraphs[0].source_seqs, vec![0, 2]);
-        assert_ne!(doc.paragraphs[0].speaker, doc.paragraphs[1].speaker);
+        // 一波说话人:段落沿用原始稿 S 标签,不再按嵌入重分组(S1/S2 即便同声也不并)。
+        assert_eq!(doc.paragraphs.len(), 3, "S1/S2/S3 各自成段");
+        let sps: Vec<&str> = doc.paragraphs.iter().map(|p| p.speaker.as_str()).collect();
+        assert_eq!(sps, vec!["S1", "S2", "S3"]);
+        assert!(doc.paragraphs.iter().all(|p| p.name.is_none() && p.person_id.is_none()),
+            "段落不携带身份,显示端现查 note.speakers");
         assert!(
             crate::store::load_refined(dir.path()).is_some(),
             "run_local 已落盘"
@@ -1431,32 +1406,15 @@ mod tests {
     }
 
     #[test]
-    fn run_local_without_embedder_skips_recluster_keeps_old_labels() {
+    fn run_local_without_embedder_keeps_note_labels_and_no_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let mut speakers = BTreeMap::new();
-        speakers.insert(
-            "S1".into(),
-            SpeakerMeta {
-                name: "老板".into(),
-                sources: vec!["mic".into()],
-                centroid: None,
-                count: 1,
-                person_id: Some("P2".into()), multi_speaker: false, reserved_by: None,
-            },
-        );
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
-        let (doc, _) = run_local(dir.path(), &segs, &speakers, None, &[], "t", "nearest").unwrap();
+        let (doc, _) = run_local(dir.path(), &segs, None, &[], "t", "nearest").unwrap();
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
-        assert_eq!(
-            doc.paragraphs[0].name.as_deref(),
-            Some("老板"),
-            "旧标签沿用用户改名"
-        );
-        assert_eq!(
-            doc.paragraphs[0].person_id.as_deref(),
-            Some("P2"),
-            "降级路径继承既有人物关联"
+        assert!(
+            doc.paragraphs[0].name.is_none() && doc.paragraphs[0].person_id.is_none(),
+            "段落不携带身份(一波说话人),显示端现查 note.speakers"
         );
     }
 
@@ -1465,15 +1423,7 @@ mod tests {
         let segs: Vec<SegmentRecord> = (0..5)
             .map(|i| seg(i, "mic", "内容。", i * 20_000, (i + 1) * 20_000, "S1"))
             .collect();
-        let assign: Vec<_> = (0..5)
-            .map(|i| recluster::Assignment {
-                seq: i,
-                speaker: "R1".into(),
-                name: None,
-                person: None,
-            })
-            .collect();
-        let ps = build_paragraphs(&segs, &[], &assign, &BTreeMap::new());
+        let ps = build_paragraphs(&segs, &[]);
         assert!(ps.len() >= 2, "100s 同人内容必须按 MAX_PARA_MS 切段");
         assert!(ps
             .iter()
@@ -1588,7 +1538,7 @@ mod tests {
             api_key: "k".into(),
         };
         store::write_refined_atomic(dir.path(), &doc).unwrap();
-        run_llm(dir.path(), &mut doc, &cfg, "m", None, &|_, _, _| {}).expect("空段落路径不应触网,写盘应成功");
+        run_llm(dir.path(), &mut doc, &cfg, "m", &Default::default(), None, &|_, _, _| {}).expect("空段落路径不应触网,写盘应成功");
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(doc.llm_model.as_deref(), Some("m"));
         assert!(crate::store::load_refined(dir.path()).is_some(), "已落盘");
@@ -1628,7 +1578,7 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
         };
-        let err = run_llm(&missing_dir, &mut doc, &cfg, "m", None, &|_, _, _| {});
+        let err = run_llm(&missing_dir, &mut doc, &cfg, "m", &Default::default(), None, &|_, _, _| {});
         assert!(err.is_err(), "目录不存在,写盘必须失败");
         assert_eq!(
             doc.stages.llm, "failed",
@@ -1688,7 +1638,7 @@ mod tests {
             api_key: "k".into(),
         };
         store::write_refined_atomic(dir.path(), &doc).unwrap();
-        run_llm(dir.path(), &mut doc, &cfg, "m", None, &|_, _, _| {}).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "m", &Default::default(), None, &|_, _, _| {}).unwrap();
         assert_eq!(doc.stages.llm, "done");
         assert_eq!(
             doc.stages.entities, "done",
@@ -1711,7 +1661,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-v1", None, &|_, _, _| {}).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-v1", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "🙂张三负责灯塔计划");
         assert_eq!(doc.stages.llm, "done");
@@ -1776,7 +1726,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut stale_caller, &cfg, "model-latest", None, &|_, _, _| {}).unwrap();
+        run_llm(dir.path(), &mut stale_caller, &cfg, "model-latest", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_eq!(stale_caller.paragraphs[0].text, "盘上润色稿");
         assert_eq!(stale_caller.paragraphs[0].speaker, "disk-speaker");
@@ -1802,7 +1752,7 @@ mod tests {
         let note_dir = dir.path().to_path_buf();
         let mut caller = doc_with(&["调用方旧稿"]);
         let worker = std::thread::spawn(move || {
-            let result = run_llm(&note_dir, &mut caller, &cfg, "model-cas", None, &|_, _, _| {});
+            let result = run_llm(&note_dir, &mut caller, &cfg, "model-cas", &Default::default(), None, &|_, _, _| {});
             (result, caller)
         });
 
@@ -1861,7 +1811,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|_, _, _| {}).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-v2", &Default::default(), None, &|_, _, _| {}).unwrap();
 
             assert_eq!(doc.paragraphs[0].text, "张三负责火星计划");
             assert_eq!(doc.stages.llm, "done");
@@ -1902,7 +1852,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|_, _, _| {}).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-v2", &Default::default(), None, &|_, _, _| {}).unwrap();
 
             assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
             assert_eq!(doc.stages.llm, "done");
@@ -1949,7 +1899,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_fallback_dependencies(&doc);
         assert!(doc.graph_support_mentions.is_empty());
@@ -2006,7 +1956,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(&dir, &mut doc, &cfg, "model-changed", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-changed", &Default::default(), None, &|_, _, _| {}).unwrap();
         assert_eq!(
             doc.graph_support_mentions
                 .iter()
@@ -2016,7 +1966,7 @@ mod tests {
             "正文不再包含旧 occurrences 时，关系端点必须降级为 support"
         );
 
-        run_llm(&dir, &mut doc, &cfg, "model-restored", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-restored", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_fallback_dependencies(&doc);
         assert!(
@@ -2097,12 +2047,12 @@ mod tests {
             model: "model-v2".into(),
             api_key: "k".into(),
         };
-        run_llm(&dir, &mut doc, &cfg, "model-v2", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2", &Default::default(), None, &|_, _, _| {}).unwrap();
         assert_fallback_dependencies(&doc);
         let support_once = doc.graph_support_mentions.clone();
         assert!(!support_once.is_empty());
 
-        run_llm(&dir, &mut doc, &cfg, "model-v2-retry", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v2-retry", &Default::default(), None, &|_, _, _| {}).unwrap();
         assert_fallback_dependencies(&doc);
         assert_eq!(doc.graph_support_mentions, support_once);
         assert!(doc
@@ -2110,7 +2060,7 @@ mod tests {
             .windows(2)
             .all(|ids| ids[0] < ids[1]));
 
-        run_llm(&dir, &mut doc, &cfg, "model-v3", None, &|_, _, _| {}).unwrap();
+        run_llm(&dir, &mut doc, &cfg, "model-v3", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "王五启动金星计划");
         assert_eq!(doc.stages.relations, "done");
@@ -2155,7 +2105,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-strict", None, &|_, _, _| {}).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-strict", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "张三负责灯塔计划");
         assert_eq!(doc.stages.llm, "partial");
@@ -2208,7 +2158,7 @@ mod tests {
             api_key: "k".into(),
         };
 
-        run_llm(dir.path(), &mut doc, &cfg, "model-multi", None, &|_, _, _| {}).unwrap();
+        run_llm(dir.path(), &mut doc, &cfg, "model-multi", &Default::default(), None, &|_, _, _| {}).unwrap();
 
         assert_eq!(doc.stages.relations, "done");
         assert_eq!(doc.relations.len(), 1);
@@ -2277,7 +2227,7 @@ mod tests {
                 api_key: "k".into(),
             };
 
-            run_llm(&dir, &mut doc, &cfg, "model-multi-failure", None, &|_, _, _| {}).unwrap();
+            run_llm(&dir, &mut doc, &cfg, "model-multi-failure", &Default::default(), None, &|_, _, _| {}).unwrap();
 
             assert_eq!(doc.stages.relations, "failed", "failure={failure}");
             assert_eq!(doc.paragraphs[0].text, first_revised, "failure={failure}");
@@ -2301,7 +2251,7 @@ mod tests {
         let baseline_graph = graph_bytes(&baseline);
         let segments = vec![seg(7, "mic", "李四负责火星计划", 0, 4000, "S1")];
 
-        let (doc, _) = run_local(&dir, &segments, &BTreeMap::new(), None, &[], "new-time", "nearest").unwrap();
+        let (doc, _) = run_local(&dir, &segments, None, &[], "new-time", "nearest").unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
         assert_eq!(graph_bytes(&doc), baseline_graph);
@@ -2373,7 +2323,6 @@ mod tests {
         let local_result = run_local(
             dir.path(),
             &segments,
-            &BTreeMap::new(),
             None,
             &[],
             "new-time",
@@ -2398,7 +2347,7 @@ mod tests {
             model: "model-v3".into(),
             api_key: "k".into(),
         };
-        let result = run_llm(dir.path(), &mut doc, &cfg, "model-v3", None, &|_, _, _| {});
+        let result = run_llm(dir.path(), &mut doc, &cfg, "model-v3", &Default::default(), None, &|_, _, _| {});
         assert!(result.is_err(), "拿不到 note lock 必须显式报告未提交");
         assert_eq!(
             std::fs::read(dir.path().join(store::AING_DOC_FILE)).unwrap(),
@@ -2460,7 +2409,6 @@ mod tests {
         let (doc, _) = run_local(
             &dst,
             &note.segments,
-            &note.speakers,
             Some(&mut embedder as &mut dyn crate::diar::SpeakerEmbedder),
             &[],
             "golden",

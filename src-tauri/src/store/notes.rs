@@ -329,12 +329,37 @@ impl NoteStore {
         match meta.person_id.as_deref() {
             Some(cur) if cur == person_id => return Ok(()), // 已是,幂等
             Some(cur) => anyhow::bail!(
-                "说话人 {speaker_id} 的关联已被改为 {cur},拆分计划停止(尊重用户修改)"
+                "说话人 {speaker_id} 已关联 {cur},不覆盖(尊重已有关联)"
             ),
             None => {}
         }
         meta.person_id = Some(person_id.to_string());
         meta.reserved_by = None; // 关联即启用,清占号所有权
+        write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// CAS 解除关联:仅当该说话人当前关联仍是 expect_person 才清空(identify 自动
+    /// 应用的撤销用;已被用户改成别人则拒绝,绝不覆盖最新人工结果)。speakers.json
+    /// 每说话人单值 person_id,这里的 CAS 不存在"段落间不一致"误拦(设计:
+    /// 2026-08-21-one-speaker-set-design.md §4)。
+    pub fn clear_speaker_person_if(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        expect_person: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        anyhow::ensure!(
+            meta.person_id.as_deref() == Some(expect_person),
+            "当前关联已被修改,拒绝撤销覆盖"
+        );
+        meta.person_id = None;
         write_speakers_atomic(&dir, &speakers)
     }
 

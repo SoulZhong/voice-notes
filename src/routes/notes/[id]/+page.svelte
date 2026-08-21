@@ -37,10 +37,7 @@
     deleteSegment,
     setSegmentSpeaker,
     clearNoteSpeakerPerson,
-    clearRefinedSpeakerPerson,
     noteAudioInfo,
-    renameRefinedSpeaker,
-    assignRefinedPerson,
     assignNoteSpeakerPerson,
     type Note,
     type TrackInfo,
@@ -301,13 +298,22 @@
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** 修订稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
-      徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。
-      person_id 一并带上:关联库人物的说话人跨笔记同色、无名时按全局编号兜底。 */
+  /** 修订稿视图的说话人条数据:一波说话人(2026-08-21 设计)——段落 speaker 就是
+      原始稿 S id(后端 join 已把旧 R 键文档按源段多数票映射回 S),身份一律取
+      note.speakers 表项(与原始稿同名、同色、同全局编号、同「多人」徽标)。
+      表里查不到的遗留段落(无源段可映射)退回段落自带快照字段。 */
   const refinedSpeakers = $derived.by(() => {
-    const m: Record<string, { name: string; sources: string[]; person_id?: string | null }> = {};
+    const m: Record<
+      string,
+      { name: string; sources: string[]; person_id?: string | null; multi_speaker?: boolean }
+    > = {};
     for (const p of refined?.paragraphs ?? []) {
-      if (!m[p.speaker]) m[p.speaker] = { name: p.name ?? "", sources: ["mic"], person_id: p.person_id ?? null };
+      if (!p.speaker || m[p.speaker]) continue;
+      m[p.speaker] = note?.speakers[p.speaker] ?? {
+        name: p.name ?? "",
+        sources: ["mic"],
+        person_id: p.person_id ?? null,
+      };
     }
     return m;
   });
@@ -586,10 +592,6 @@
   let multiPanel = $state<{
     candidates: string[];
     existingOp: SplitOp | null;
-    /** 修订稿入口:被点的那个 R 的显示名(面板解释 R↔S 映射用)。 */
-    sourceLabel?: string;
-    /** 每个候选 S 在该 R 里占的段数。 */
-    candidateCounts?: Record<string, number>;
   } | null>(null);
   /** 本篇未完成的打标操作(启动/刷新时拉取,恢复入口)。 */
   let openMultiOps = $state<SplitOp[]>([]);
@@ -600,29 +602,9 @@
     void id;
     void refreshMultiOps();
   });
-  /** 原始稿入口:直接以该 S 为唯一候选。 */
+  /** 打标入口(两个视图共用:一波说话人后修订稿胸牌就是 S 本尊,无需映射)。 */
   function openMultiForRaw(sid: string) {
     multiPanel = { candidates: [sid], existingOp: null };
-  }
-  /** 修订稿入口:R 没有存储位,映射出其 source_seqs 涉及的原始 S 让用户勾选。
-      带上映射上下文(点的是谁、每个 S 多少段):用户点「说话人 5」看到「新说话人 2」
-      而没有任何解释,只会以为界面错乱(2026-08-20 用户实测反馈)。 */
-  function openMultiForRefined(rid: string) {
-    const seqs = new Set(
-      (refined?.paragraphs ?? []).filter((p) => p.speaker === rid).flatMap((p) => p.source_seqs),
-    );
-    const counts = new Map<string, number>();
-    for (const s of displaySegments) {
-      if (s.speaker && seqs.has(s.seq)) counts.set(s.speaker, (counts.get(s.speaker) ?? 0) + 1);
-    }
-    const sids = [...counts.keys()];
-    if (sids.length > 0)
-      multiPanel = {
-        candidates: sids,
-        existingOp: null,
-        sourceLabel: speakerLabel(rid, "mic", refinedSpeakers),
-        candidateCounts: Object.fromEntries(counts),
-      };
   }
   /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
   function auditionSegment(seq: number) {
@@ -938,7 +920,6 @@
     refining = false;
     refineRunFailed = false;
     refineErr = "";
-    confirmRefine = false;
     retranscribing = false;
     retransStage = "";
     retransConfirm = false;
@@ -1667,18 +1648,9 @@
     }
   }
 
-  /** 重新 Aing 会整写 refined.json:未关联搭子的说话人改名会被冲掉,这种情况下二段确认。 */
-  const refineWouldLoseNames = $derived(
-    !!refined?.paragraphs.some((p) => p.name && !p.person_id),
-  );
-  let confirmRefine = $state(false);
-
+  // 一波说话人(2026-08-21):说话人名字/关联都住在 speakers.json,重新 Aing 只重建
+  // 段落文本,不再有"改名被冲掉"的问题——原二段确认(refineWouldLoseNames)删除。
   async function rerunRefine() {
-    if (refineWouldLoseNames && !confirmRefine) {
-      confirmRefine = true;
-      return;
-    }
-    confirmRefine = false;
     refineErr = "";
     refineRunFailed = false;
     refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次 Aing
@@ -1940,10 +1912,9 @@
           noteId={id}
           editable={!refining}
           {people}
-          onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
-          onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
-          onMarkMulti={canEdit ? openMultiForRefined : undefined}
-          onUnlink={(sid) => clearRefinedSpeakerPerson(id, sid)}
+          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onMarkMulti={canEdit ? openMultiForRaw : undefined}
+          onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1988,24 +1959,15 @@
       <div class="view-switch">
         <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
         <span class="spacer"></span>
-        {#if confirmRefine}
-          <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
-          <div class="confirm-capsule">
-            <span class="refine-warn">{t("notes.refine.loseNames")}</span>
-            <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
-            <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
-          </div>
-        {:else}
-          {#if refining && aingProg}
-            <span class="aing-inline">
-              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
-                done: aingProg.done,
-                total: aingProg.total,
-              })}
-              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
-            </span>
-          {/if}
-          <button
+        {#if refining && aingProg}
+          <span class="aing-inline">
+            {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+              done: aingProg.done,
+              total: aingProg.total,
+            })}
+            {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+          </span>
+            <button
             class="reaing"
             class:casting={refining}
             disabled={refining || note.meta.state !== "complete"}
@@ -2040,7 +2002,7 @@
         {/if}
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
-             自动备份为 segments.orig.jsonl),二段确认同款 confirmRefine 样板。
+             自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
         {#if retransConfirm}
@@ -2221,8 +2183,6 @@
         speakers={note.speakers}
         candidateSpeakers={multiPanel.candidates}
         existingOp={multiPanel.existingOp}
-        sourceLabel={multiPanel.sourceLabel}
-        candidateCounts={multiPanel.candidateCounts}
         segments={note.segments}
         people={people.map((p) => ({ id: p.id, name: p.name }))}
         onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}
