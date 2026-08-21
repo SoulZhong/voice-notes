@@ -298,22 +298,18 @@
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** 修订稿视图的说话人条数据:一波说话人(2026-08-21 设计)——段落 speaker 就是
-      原始稿 S id(后端 join 已把旧 R 键文档按源段多数票映射回 S),身份一律取
-      note.speakers 表项(与原始稿同名、同色、同全局编号、同「多人」徽标)。
-      表里查不到的遗留段落(无源段可映射)退回段落自带快照字段。 */
+  /** 修订稿视图的说话人条数据:一波说话人(2026-08-21 设计)——就是原始稿说话人
+      表本身(段落 speaker 已由后端 join 映射到 S id),两个视图的胸牌完全一致:
+      同成员、同名、同色、同编号、同「多人」徽标,配合同一份 segCounts 还同序、
+      同碎片折叠。旧文档映射不回 S 的遗留段落说话人补进表(仅显示兜底)。 */
   const refinedSpeakers = $derived.by(() => {
     const m: Record<
       string,
       { name: string; sources: string[]; person_id?: string | null; multi_speaker?: boolean }
-    > = {};
+    > = { ...(note?.speakers ?? {}) };
     for (const p of refined?.paragraphs ?? []) {
       if (!p.speaker || m[p.speaker]) continue;
-      m[p.speaker] = note?.speakers[p.speaker] ?? {
-        name: p.name ?? "",
-        sources: ["mic"],
-        person_id: p.person_id ?? null,
-      };
+      m[p.speaker] = { name: p.name ?? "", sources: ["mic"], person_id: p.person_id ?? null };
     }
     return m;
   });
@@ -630,14 +626,17 @@
     // 2026-08-20 在一篇真实笔记上实测:472 个段落里 466 个(99%)的时间范围内夹着
     // 其他说话人的段,最长的一个横跨 58.6 秒而自己只占 8 段。用户的观感就是
     // 「试听的这些样本不是同一个人」。源段(中位 4.5s)才是真实的单人音频区间。
+    // 一波说话人:两个视图的 sid 都是原始稿说话人,直接取其原始段;修订稿旧文档
+    // 映射不回 S 的遗留 id 才退回「段落 source_seqs 还原」。
+    const direct = displaySegments.filter((s) => s.speaker === sid);
     const segs = (
-      effectiveView === "refined"
-        ? (refined?.paragraphs ?? [])
+      direct.length > 0
+        ? direct
+        : (refined?.paragraphs ?? [])
             .filter((p) => p.speaker === sid)
             .flatMap((p) => p.source_seqs)
             .map((seq) => segBySeq.get(seq))
             .filter((s) => s !== undefined)
-        : displaySegments.filter((s) => s.speaker === sid)
     )
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
       .slice(0, 5);
@@ -1911,6 +1910,7 @@
           speakers={refinedSpeakers}
           noteId={id}
           editable={!refining}
+          counts={segCounts}
           {people}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onMarkMulti={canEdit ? openMultiForRaw : undefined}
