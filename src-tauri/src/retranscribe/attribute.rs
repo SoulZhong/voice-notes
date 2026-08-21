@@ -177,6 +177,11 @@ pub fn finalize_speakers(
             centroid: snap.map(|s| s.centroid.clone()),
             count: snap.map(|s| s.count).unwrap_or(0),
             person_id: info.and_then(|i| i.person.clone()),
+            // 「多人混杂」标记从旧表按继承 id 带过来:重转写的继承路径保 id 稳定,
+            // 标记跟着走才能兑现"这簇以后不入库不写样本"(codex 实现轮一 P1①)。
+            // 重聚类真把混杂簇拆开时,拆出的新簇不带标——那正是期望的结果。
+            multi_speaker: old_speakers.get(*old_id).is_some_and(|m| m.multi_speaker),
+            reserved_by: None,
         });
     }
     // 继承 id 的重编号起点从同一个计数器(`next`)继续,不重新从 base 起跳——保证
@@ -291,7 +296,7 @@ mod tests {
     fn named_meta(name: &str, person: Option<&str>) -> SpeakerMeta {
         SpeakerMeta {
             name: name.into(), sources: vec!["mic".into()], centroid: Some(vec![1.0]),
-            count: 5, person_id: person.map(String::from),
+            count: 5, person_id: person.map(String::from), multi_speaker: false, reserved_by: None,
         }
     }
 

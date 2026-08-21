@@ -68,6 +68,8 @@ export type Note = {
       centroid?: number[];
       count?: number;
       person_id?: string;
+      /** 多人混杂标记:该簇不止一人在说话,已隔离,不入库不写样本。 */
+      multi_speaker?: boolean;
     }
   >;
 };

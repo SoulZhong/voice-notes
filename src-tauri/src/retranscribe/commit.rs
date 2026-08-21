@@ -156,7 +156,7 @@ mod tests {
         let dir = setup();
         let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
         let speakers = BTreeMap::from([("S1".to_string(), SpeakerMeta {
-            name: "张三".into(), sources: vec!["mic".into()], centroid: None, count: 0, person_id: None,
+            name: "张三".into(), sources: vec!["mic".into()], centroid: None, count: 0, person_id: None, multi_speaker: false, reserved_by: None,
         })]);
         commit(dir.path(), &lock, &[seg(1, "新文本")], &speakers).unwrap();
         let backup = std::fs::read_to_string(dir.path().join(SEGMENTS_BACKUP_FILE)).unwrap();
@@ -182,7 +182,7 @@ mod tests {
         let lock = NoteLock::acquire(dir.path()).unwrap().unwrap();
         let old_s1 = SpeakerMeta {
             name: "张三".into(), sources: vec!["mic".into()], centroid: Some(vec![0.5]),
-            count: 7, person_id: Some("P1".into()),
+            count: 7, person_id: Some("P1".into()), multi_speaker: false, reserved_by: None,
         };
         let old_table = BTreeMap::from([("S1".to_string(), old_s1.clone())]);
         crate::store::write_speakers_atomic(dir.path(), &old_table).unwrap();
@@ -194,7 +194,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("segments.jsonl")).unwrap();
 
         let new_s2 = SpeakerMeta {
-            name: "李四".into(), sources: vec!["mic".into()], centroid: None, count: 3, person_id: None,
+            name: "李四".into(), sources: vec!["mic".into()], centroid: None, count: 3, person_id: None, multi_speaker: false, reserved_by: None,
         };
         let new_table = BTreeMap::from([("S2".to_string(), new_s2.clone())]);
         let result = commit(dir.path(), &lock, &[seg(1, "新文本")], &new_table);
@@ -292,7 +292,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("speakers.json.tmp")).unwrap();
 
         let speakers = BTreeMap::from([("S1".to_string(), SpeakerMeta {
-            name: "李四".into(), sources: vec!["mic".into()], centroid: None, count: 0, person_id: None,
+            name: "李四".into(), sources: vec!["mic".into()], centroid: None, count: 0, person_id: None, multi_speaker: false, reserved_by: None,
         })]);
         let result = commit(dir.path(), &lock, &[seg(1, "新文本")], &speakers);
         assert!(result.is_err(), "speakers 预写失败必须整体 Err");

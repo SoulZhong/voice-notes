@@ -63,6 +63,8 @@
   import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
+  import { listSplitOps, type SplitOp } from "$lib/multiSpeaker";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -547,7 +549,71 @@
   //    播该说话人时长最长的一段(代表性最好),重复点击按时长降序换下一段(取前 5,
   //    循环);单段最多听 15s,段尾自动停;用户手动暂停/拖走即退出试听态。 ──
   const PREVIEW_MAX_MS = 15_000;
-  let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+  /** armed:本次试听已观察到 playing=true。没有它有个竞态:seek 的位置事件(playing
+      还是 false、playerMs 已跳到段起点)先于 play 的 playing=true 到达,下面"手动暂停
+      即退出"的效应把 preview 当场清掉——段尾停止边界消失,整篇笔记一直放
+      (2026-08-20 用户实测复现)。 */
+  let preview = $state<{ sid: string; idx: number; endMs: number; armed: boolean } | null>(null);
+
+  // ── 多人混杂处置(设计:2026-08-20-mixed-speaker-split-design.md) ──
+  let multiPanel = $state<{
+    candidates: string[];
+    existingOp: SplitOp | null;
+    /** 修订稿入口:被点的那个 R 的显示名(面板解释 R↔S 映射用)。 */
+    sourceLabel?: string;
+    /** 每个候选 S 在该 R 里占的段数。 */
+    candidateCounts?: Record<string, number>;
+  } | null>(null);
+  /** 本篇未完成的打标操作(启动/刷新时拉取,恢复入口)。 */
+  let openMultiOps = $state<SplitOp[]>([]);
+  async function refreshMultiOps() {
+    openMultiOps = await listSplitOps(id).catch(() => []);
+  }
+  $effect(() => {
+    void id;
+    void refreshMultiOps();
+  });
+  /** 原始稿入口:直接以该 S 为唯一候选。 */
+  function openMultiForRaw(sid: string) {
+    multiPanel = { candidates: [sid], existingOp: null };
+  }
+  /** 修订稿入口:R 没有存储位,映射出其 source_seqs 涉及的原始 S 让用户勾选。
+      带上映射上下文(点的是谁、每个 S 多少段):用户点「说话人 5」看到「新说话人 2」
+      而没有任何解释,只会以为界面错乱(2026-08-20 用户实测反馈)。 */
+  function openMultiForRefined(rid: string) {
+    const seqs = new Set(
+      (refined?.paragraphs ?? []).filter((p) => p.speaker === rid).flatMap((p) => p.source_seqs),
+    );
+    const counts = new Map<string, number>();
+    for (const s of displaySegments) {
+      if (s.speaker && seqs.has(s.seq)) counts.set(s.speaker, (counts.get(s.speaker) ?? 0) + 1);
+    }
+    const sids = [...counts.keys()];
+    if (sids.length > 0)
+      multiPanel = {
+        candidates: sids,
+        existingOp: null,
+        sourceLabel: speakerLabel(rid, "mic", refinedSpeakers),
+        candidateCounts: Object.fromEntries(counts),
+      };
+  }
+  /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
+  function auditionSegment(seq: number) {
+    const seg = note?.segments.find((s) => s.seq === seq);
+    if (!seg || !player) return;
+    const segSource = segSourceAt(seg.start_ms);
+    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource), armed: false };
+    // 注:多轨混音下另一条轨的同时段声音会一起响。轨道独奏(soloTrack)在
+    // fix-audition-and-refined-unlink 分支上,两支都合入 master 后在这里接上。
+    player.seek(seekFix(seg.start_ms, segSource));
+    player.play();
+  }
+
+  function onMultiChanged() {
+    refresh();
+    recording.bumpNotes();
+    void refreshMultiOps();
+  }
 
   function previewSpeaker(sid: string) {
     const source: { speaker?: string | null; start_ms: number; end_ms: number }[] =
@@ -562,7 +628,7 @@
     // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
-    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource), armed: false };
     player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
@@ -574,9 +640,14 @@
       preview = null;
     }
   });
-  // 用户手动暂停(未到段尾)即视为退出试听;换笔记同样清态。
+  // 武装:真正播起来之后,"暂停"才有"用户手动暂停"的含义。
   $effect(() => {
-    if (preview && !playerPlaying && playerMs < preview.endMs - 200) preview = null;
+    if (preview && !preview.armed && playerPlaying) preview = { ...preview, armed: true };
+  });
+  // 用户手动暂停(未到段尾)即视为退出试听;换笔记同样清态。
+  // 只在 armed 后生效:seek 事件先于 play 事件到达时 playing 短暂为 false,不是暂停。
+  $effect(() => {
+    if (preview?.armed && !playerPlaying && playerMs < preview.endMs - 200) preview = null;
   });
   $effect(() => {
     void id;
@@ -1834,6 +1905,7 @@
           {people}
           onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
           onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
+          onMarkMulti={canEdit ? openMultiForRefined : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1853,6 +1925,7 @@
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
+          onMarkMulti={canEdit ? openMultiForRaw : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1860,6 +1933,18 @@
             recording.bumpNotes();
           }}
         />
+      {/if}
+
+      {#if openMultiOps.length > 0 && !multiPanel}
+        <div class="banner">
+          {t("speakers.multi.resume")}
+          <button
+            class="link"
+            onclick={() => (multiPanel = { candidates: openMultiOps[0].speaker_ids, existingOp: openMultiOps[0] })}
+          >
+            {t("speakers.multi.resumeOpen")}
+          </button>
+        </div>
       {/if}
 
       <div class="view-switch">
@@ -2065,6 +2150,22 @@
         <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>{t("notes.menu.newSpeaker")}</button>
         <button class="menu-item" onclick={() => (segMenuPop = null)}>{t("notes.cancel")}</button>
       </div>
+    {/if}
+    {#if multiPanel && note}
+      <MultiSpeakerPanel
+        noteId={id}
+        speakers={note.speakers}
+        candidateSpeakers={multiPanel.candidates}
+        existingOp={multiPanel.existingOp}
+        sourceLabel={multiPanel.sourceLabel}
+        candidateCounts={multiPanel.candidateCounts}
+        segments={note.segments}
+        people={people.map((p) => ({ id: p.id, name: p.name }))}
+        onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}
+        onBeforeCommit={() => refinedEditor?.flushRefined(true)}
+        onClose={() => (multiPanel = null)}
+        onChanged={onMultiChanged}
+      />
     {/if}
     {#if segDeletePop}
       <div

@@ -138,6 +138,16 @@ pub enum EditOp {
     EditText { id: String, seq: u64, expected_text: String, new_text: String },
     DeleteSegment { id: String, seq: u64, expected_text: String },
     SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },
+    /// 打「多人混杂」标(附带清 person_id)。库侧隔离由命令层先行,见 mark_speaker_multi。
+    SetMultiSpeaker { id: String, speaker_id: String },
+    /// 拆分占号:创建空表项(带 op 所有权)。撞号整体失败。
+    ReserveSpeakers { id: String, speaker_ids: Vec<String>, op_id: String },
+    /// 取消拆分的占号清理:只删仍为空且无引用的本 op 预留项。
+    ReleaseReservedSpeakers { id: String, op_id: String },
+    /// 条件关联(拆分收尾):当前关联非空且非目标人物即拒,锁内 CAS。
+    AssignPersonIf { id: String, speaker_id: String, person_id: String },
+    /// 拆分批量改派:逐段 CAS 原 speaker,一段不符整体拒绝(已到新值=已完成,幂等)。
+    SplitReassign { id: String, moves: Vec<(u64, String, String)>, op_id: String },
 }
 
 /// Msg 不再 derive Clone/PartialEq/Debug:`AdoptWriter` 携带 `Box<NoteWriter>`,
