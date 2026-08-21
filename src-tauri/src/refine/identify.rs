@@ -1246,6 +1246,8 @@ mod tests {
                 person_id: Some("P7".into()),
                 multi_speaker: false,
                 reserved_by: None,
+                split_born: false,
+                hint_person: None,
             },
         );
         // R1 混合簇:mic 6s + system 4s(次信道 40% > 20%)。
@@ -1466,6 +1468,8 @@ mod tests {
                 person_id: Some("P1".into()),
                 multi_speaker: false,
                 reserved_by: None,
+                split_born: false,
+                hint_person: None,
             },
         );
         let exec = MockExec(vec![raw("R1", Some("P1"), None, vec![ev(0, 0, 4, "我是张伟", "self_intro")])]);
@@ -1602,6 +1606,8 @@ mod tests {
             person_id: person.map(str::to_string),
             multi_speaker: multi,
             reserved_by: None,
+            split_born: false,
+            hint_person: None,
         }
     }
 

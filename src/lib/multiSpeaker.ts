@@ -15,6 +15,22 @@ export type SplitOp = {
   updated_at: string;
 };
 
+export type AutoSplitHint = { person_id: string; name: string; sim: number };
+export type AutoSplitGroup = { speaker_id: string; count: number; dur_ms: number; hint: AutoSplitHint | null };
+export type AutoSplitOut = {
+  op_id: string;
+  /** false = 声纹听下来就是一个人,没拆,一切已恢复原状。 */
+  split: boolean;
+  groups: AutoSplitGroup[];
+  kept: number;
+};
+
+/** 一键拆分(2026-08-22 设计):后台全默认执行,只有一组时不硬拆。 */
+export const autoSplitSpeaker = (noteId: string, speakerId: string) =>
+  invoke<AutoSplitOut>("auto_split_speaker", { noteId, speakerId });
+/** 一键拆分撤销:段落原路搬回(纯笔记级;段落被后续编辑动过会拒绝)。 */
+export const undoAutoSplit = (opId: string) => invoke<void>("undo_auto_split", { opId });
+
 export type MultiImpactSample = {
   path: string;
   audition_path: string;

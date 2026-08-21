@@ -277,7 +277,7 @@ impl NoteWriter {
                 centroid: None,
                 count: 0,
                 person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
             })
             .name = name.to_string();
     }
@@ -295,7 +295,7 @@ impl NoteWriter {
                 centroid: None,
                 count: 0,
                 person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
             })
             .person_id = Some(person.to_string());
     }
@@ -404,7 +404,7 @@ impl NoteWriter {
                             centroid: Some(s.centroid.clone()),
                             count: s.count,
                             person_id: s.person.clone(),
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
                         },
                     );
                 }
@@ -450,7 +450,7 @@ impl NoteWriter {
                     centroid: None,
                     count: 0,
                     person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
                 }
             });
             for s in sources {
@@ -510,7 +510,7 @@ impl NoteWriter {
                         centroid: None,
                         count: 0,
                         person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
                     });
             if winner_entry.name.is_empty() && !loser_meta.name.is_empty() {
                 winner_entry.name = loser_meta.name;
@@ -643,7 +643,7 @@ impl NoteWriter {
                                         centroid: None,
                                         count: 0,
                                         person_id: None,
-                multi_speaker: false, reserved_by: None,
+                multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
                                     },
                                 );
                             }

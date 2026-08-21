@@ -884,6 +884,31 @@ impl VoiceprintStore {
         cluster_id: &str,
         newly_enrolled: bool,
     ) -> anyhow::Result<bool> {
+        self.append_sample_traced(id, samples, note_id, cluster_id, newly_enrolled, false)
+    }
+
+    /// 用户确认样本(2026-08-22-one-click-split-design.md「确认才入库」):用户试听
+    /// 并指认过的那一段**永远可以入库**——免「老熟人不再累积」策略;隔离/满员
+    /// 门禁照过,WAL/回执与停录样本同一套。
+    pub fn append_confirmed_sample(
+        &self,
+        id: &str,
+        samples: &[f32],
+        note_id: &str,
+        cluster_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.append_sample_traced(id, samples, note_id, cluster_id, false, true)
+    }
+
+    fn append_sample_traced(
+        &self,
+        id: &str,
+        samples: &[f32],
+        note_id: &str,
+        cluster_id: &str,
+        newly_enrolled: bool,
+        user_confirmed: bool,
+    ) -> anyhow::Result<bool> {
         let _guard = vp_guard();
         let vp = self.load();
         let Some(resolved) = Self::resolve(&vp, id).map(str::to_string) else {
@@ -896,8 +921,8 @@ impl VoiceprintStore {
         if samples.is_empty() {
             return Ok(false);
         }
-        if !newly_enrolled && !self.sample_paths_existing(&resolved).is_empty() {
-            return Ok(false); // 识别出的老熟人且已有样本:不再累积
+        if !newly_enrolled && !user_confirmed && !self.sample_paths_existing(&resolved).is_empty() {
+            return Ok(false); // 识别出的老熟人且已有样本:不再累积(用户确认样本除外)
         }
         let Some(path) = self.next_free_sample_slot(&resolved) else {
             return Ok(false); // 满员
@@ -2369,6 +2394,30 @@ mod tests {
         // 删除连带删全部样本。
         store.delete(&p2).unwrap();
         assert!(store.sample_paths_existing(&p2).is_empty(), "删除人物连带删全部样本");
+    }
+
+    /// 确认才入库(2026-08-22 一键拆分):用户确认样本免「老熟人不再累积」策略;
+    /// 隔离门禁照过。
+    #[test]
+    fn append_confirmed_sample_bypasses_old_timer_but_not_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let snaps = vec![snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)];
+        let links = store.upsert_from_session(&snaps, "t1", MODEL).unwrap();
+        let p1 = links["S1"].clone();
+        assert!(store.append_sample(&p1, &[0.5; 160]).unwrap());
+        // 老熟人已有样本:session 路径拒,confirmed 路径收。
+        assert!(!store.append_session_sample(&p1, &[0.6; 160], "n1", "S9", false).unwrap());
+        assert!(store.append_confirmed_sample(&p1, &[0.6; 160], "n1", "S9").unwrap());
+        assert_eq!(store.sample_paths_existing(&p1).len(), 2);
+        // 隔离中:confirmed 同样拒。
+        {
+            let mut vp = store.load();
+            vp.people.get_mut(&p1).unwrap().voiceprint_quarantined = true;
+            store.save_for_split(&vp).unwrap();
+        }
+        assert!(!store.append_confirmed_sample(&p1, &[0.7; 160], "n1", "S9").unwrap());
+        assert_eq!(store.sample_paths_existing(&p1).len(), 2);
     }
 
     /// suggest_merges 用的库构造:直接拼 Voiceprints(不经 upsert,好精确控制质心)。
@@ -4039,6 +4088,8 @@ mod tests {
             residual_choice: None,
             samples_confirm_seen: false,
         plan_groups: Vec::new(),
+            prior_links: Default::default(),
+            undone_at: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -4070,6 +4121,8 @@ mod tests {
             residual_choice: None,
             samples_confirm_seen: false,
         plan_groups: Vec::new(),
+            prior_links: Default::default(),
+            undone_at: None,
             created_at: "t0".into(),
             updated_at: "t0".into(),
         };

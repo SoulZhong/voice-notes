@@ -350,8 +350,13 @@ export const regenerateMixed = (id: string) => invoke<void>("regenerate_mixed", 
 export const mixedRegenStatus = () => invoke<string | null>("mixed_regen_status");
 /** 说话人关联声纹库人物:speakers.json 写 person_id 并清本地名(join 显库名)。
     一波说话人(2026-08-21 设计):修订稿视图同用此命令,修订稿专用关联命令已删。 */
-export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, personId: string) =>
-  invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId });
+export const assignNoteSpeakerPerson = (
+  noteId: string,
+  speakerId: string,
+  personId: string,
+  /** 用户刚试听过的段 seq(「确认才入库」):拆分产物说话人只把这一段存进声纹库。 */
+  auditedSeq?: number,
+) => invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId, auditedSeq: auditedSeq ?? null });
 
 /** 解除原始稿说话人与声纹库人物的关联:清 person_id,显示回落到「新说话人 N」。
     表项与段落归属都不动——与删除说话人不是一回事。

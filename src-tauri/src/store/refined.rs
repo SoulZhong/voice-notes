@@ -1572,6 +1572,8 @@ mod tests {
             person_id: person.map(str::to_string),
             multi_speaker: false,
             reserved_by: None,
+            split_born: false,
+            hint_person: None,
         };
         speakers.insert("S1".into(), meta("", Some("P2"))); // 关联(经 redirect)
         speakers.insert("S2".into(), meta("现场名", None)); // 只有本地名
