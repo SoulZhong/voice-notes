@@ -280,18 +280,11 @@
     {#if error}<div class="banner">{error}</div>{/if}
 
     {#if step === "pick"}
-      {#if sourceLabel}
-        <p class="note">{t("speakers.multi.mapExplain", { label: sourceLabel })}</p>
-      {:else}
-        <p class="note">{t("speakers.multi.mapNotice")}</p>
-      {/if}
+      <p class="note">{t("speakers.multi.mapNotice")}</p>
       {#each candidateSpeakers as sid (sid)}
         <label class="row-check">
           <input type="checkbox" bind:checked={checked[sid]} />
           {speakerLabel(sid, "mic", speakers)}
-          {#if candidateCounts[sid]}
-            <span class="note" style="margin: 0">{t("speakers.multi.mapSegs", { n: candidateCounts[sid] })}</span>
-          {/if}
         </label>
       {/each}
       <div class="actions">

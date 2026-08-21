@@ -320,11 +320,9 @@ fn note_content_from_dirs(
     // 纯读出口(钩子载荷):render_refined 会带 [时间戳],与 App 用同一条时基。
     let text = match crate::store::load_refined_for_display(&notes_dir.join(note_id)) {
         Some(mut doc) => {
-            if doc.paragraphs.iter().any(|p| p.person_id.is_some()) {
-                if let Some(root) = data_root {
-                    let vp = crate::store::VoiceprintStore::new(root.to_path_buf()).load();
-                    crate::store::join_library_names(&mut doc, &vp);
-                }
+            if let Some(root) = data_root {
+                let vp = crate::store::VoiceprintStore::new(root.to_path_buf()).load();
+                crate::store::join_note_identities(&mut doc, &note.speakers, &note.segments, &vp);
             }
             crate::store::render_refined(&note.meta.title, &doc, true)
         }

@@ -348,13 +348,8 @@ export const mixedPlaybackInfo = (id: string) =>
 export const regenerateMixed = (id: string) => invoke<void>("regenerate_mixed", { id });
 /** 正在补生成的 note_id;空闲 null。挂载时回填(事件只覆盖在页期间)。 */
 export const mixedRegenStatus = () => invoke<string | null>("mixed_regen_status");
-/** 修订稿说话人改名;该说话人已关联库人物时,声纹库(会议搭子)现名一并同步。 */
-export const renameRefinedSpeaker = (noteId: string, speakerId: string, name: string) =>
-  invoke<void>("rename_refined_speaker", { noteId, speakerId, name });
-/** 把修订稿说话人关联到声纹库人物(会议搭子选人),采用库中现名。 */
-export const assignRefinedPerson = (noteId: string, speakerId: string, personId: string) =>
-  invoke<void>("assign_refined_person", { noteId, speakerId, personId });
-/** 原始稿说话人关联声纹库人物:speakers.json 写 person_id 并清本地名(join 显库名)。 */
+/** 说话人关联声纹库人物:speakers.json 写 person_id 并清本地名(join 显库名)。
+    一波说话人(2026-08-21 设计):修订稿视图同用此命令,修订稿专用关联命令已删。 */
 export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, personId: string) =>
   invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId });
 
@@ -366,10 +361,6 @@ export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, perso
 export const clearNoteSpeakerPerson = (noteId: string, speakerId: string) =>
   invoke<void>("clear_note_speaker_person", { noteId, speakerId });
 
-/** 同上,修订稿(全文)视图版:清该说话人所有段落的 person_id/name,回落到「说话人 R<n>」。
-    后端走 CAS——面板开着时 identify 自动应用可能已改成别人,只解开用户看到的那个。 */
-export const clearRefinedSpeakerPerson = (noteId: string, speakerId: string) =>
-  invoke<void>("clear_refined_speaker_person", { noteId, speakerId });
 
 /** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
     Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */

@@ -237,6 +237,9 @@
       在说话会一起响,听感就是「试听的样本不是同一个人」(2026-08-20 实测:一篇真实
       笔记里 4~5/5 的试听片段都存在跨轨重叠)。 */
   export function soloTrack(source: string | null) {
+    // 成品单轨(mixed)等装载:请求独奏的源不在轨道列表时降级为不独奏——否则唯一的
+    // 轨道被整条静音,试听全程无声(2026-08-22 用户实测)。单轨本就无跨轨串音可隔。
+    if (source && !tracks.some((t) => t.source === source)) source = null;
     if (soloSource === source) return;
     soloSource = source;
     for (const tr of tracks) pushMute(tr.source);
@@ -294,7 +297,9 @@
 
   export function pause() {
     playing = false;
-    void invoke("player_pause").catch(() => {});
+    // 失败不能再静默吞:player_pause 若被拒,Rust 继续放而 UI 已翻停,下一拍
+    // player_pos 事件又把 playing 拽回 true——正是「试听不停」一类悬案的候选真凶。
+    void invoke("player_pause").catch((e) => console.warn("player_pause failed:", e));
   }
 
   export function seek(ms: number) {

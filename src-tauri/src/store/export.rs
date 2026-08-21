@@ -145,9 +145,15 @@ pub fn render_refined(title: &str, doc: &RefinedDoc, md: bool) -> String {
                     .as_ref()
                     .map(|pid| format!("说话人 {}", pid.trim_start_matches('P')))
             })
-            .unwrap_or_else(|| match p.speaker.strip_prefix('R') {
-                Some(n) if n.chars().all(|c| c.is_ascii_digit()) => format!("说话人 {n}"),
-                _ => p.speaker.clone(),
+            .unwrap_or_else(|| {
+                // 一波说话人后段落是 S 键(与 label() 的段口径一致);旧文档残留 R 键
+                // 同样按「说话人 N」兜底。
+                let n = p.speaker.trim_start_matches(['R', 'S']);
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    format!("说话人 {n}")
+                } else {
+                    p.speaker.clone()
+                }
             });
         let ts = format_ts(p.start_ms);
         if md {

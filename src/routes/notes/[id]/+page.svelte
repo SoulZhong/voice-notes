@@ -37,10 +37,7 @@
     deleteSegment,
     setSegmentSpeaker,
     clearNoteSpeakerPerson,
-    clearRefinedSpeakerPerson,
     noteAudioInfo,
-    renameRefinedSpeaker,
-    assignRefinedPerson,
     assignNoteSpeakerPerson,
     type Note,
     type TrackInfo,
@@ -301,13 +298,18 @@
   /** 原始稿中被 Aing 过滤掉的段（灰显用）。 */
   const discardedSeqs = $derived(new Set(refined?.discarded_seqs ?? []));
 
-  /** 修订稿视图的说话人条数据：从重聚类终稿段落聚合（R* 命名空间，与下方段落
-      徽章一致）。在线聚类的 S* 表在此视图不展示——两套命名空间并排必然对不上。
-      person_id 一并带上:关联库人物的说话人跨笔记同色、无名时按全局编号兜底。 */
+  /** 修订稿段落标签/配色的解析表:原始稿说话人表 + 旧文档映射不回 S 的遗留
+      段落 id(仅供段落文字显示兜底)。胸牌组件不吃这张表——它直接吃
+      note.speakers,与原始稿视图同一个对象,列表不可能有差异(2026-08-21
+      用户实测:遗留 R 分组会让两视图胸牌对不上)。 */
   const refinedSpeakers = $derived.by(() => {
-    const m: Record<string, { name: string; sources: string[]; person_id?: string | null }> = {};
+    const m: Record<
+      string,
+      { name: string; sources: string[]; person_id?: string | null; multi_speaker?: boolean }
+    > = { ...(note?.speakers ?? {}) };
     for (const p of refined?.paragraphs ?? []) {
-      if (!m[p.speaker]) m[p.speaker] = { name: p.name ?? "", sources: ["mic"], person_id: p.person_id ?? null };
+      if (!p.speaker || m[p.speaker]) continue;
+      m[p.speaker] = { name: p.name ?? "", sources: ["mic"], person_id: p.person_id ?? null };
     }
     return m;
   });
@@ -578,6 +580,24 @@
       seek 生效、play 未生效的间隙采到 playing=false,armed 拦不住——preview 被清,
       段尾边界消失,整篇一直放(2026-08-20/21 用户两次实测)。 */
   let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+  /** 试听强制停表:按样本时长走墙钟,到点仍在试听态就硬停。响应式段尾边界已三轮
+      "修好又复发"(2026-08-20 两次、08-21 一次用户实测),失效环节始终未坐实
+      (事件链/边界比较/暂停失败均有嫌疑);墙钟不依赖位置事件与响应式依赖追踪,
+      是无条件兜底。正常情况下边界效应先到,这里只负责最后一道。 */
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  function armPreviewWatchdog(durMs: number) {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      if (preview) {
+        // 走到这里=响应式边界失灵(真凶已定案一例:effect 依赖追踪误杀,见下方
+        // untrack 注释);留痕以便再犯时定位。
+        console.warn("[preview] watchdog fired; reactive end-boundary did not stop playback");
+        player?.pause();
+        endPreview("watchdog");
+      }
+    }, durMs + 1200);
+  }
 
   /** seq -> 原始段。修订稿试听要靠它把段落还原成真实音频区间。 */
   const segBySeq = $derived(new Map(displaySegments.map((s) => [s.seq, s])));
@@ -586,10 +606,6 @@
   let multiPanel = $state<{
     candidates: string[];
     existingOp: SplitOp | null;
-    /** 修订稿入口:被点的那个 R 的显示名(面板解释 R↔S 映射用)。 */
-    sourceLabel?: string;
-    /** 每个候选 S 在该 R 里占的段数。 */
-    candidateCounts?: Record<string, number>;
   } | null>(null);
   /** 本篇未完成的打标操作(启动/刷新时拉取,恢复入口)。 */
   let openMultiOps = $state<SplitOp[]>([]);
@@ -600,29 +616,9 @@
     void id;
     void refreshMultiOps();
   });
-  /** 原始稿入口:直接以该 S 为唯一候选。 */
+  /** 打标入口(两个视图共用:一波说话人后修订稿胸牌就是 S 本尊,无需映射)。 */
   function openMultiForRaw(sid: string) {
     multiPanel = { candidates: [sid], existingOp: null };
-  }
-  /** 修订稿入口:R 没有存储位,映射出其 source_seqs 涉及的原始 S 让用户勾选。
-      带上映射上下文(点的是谁、每个 S 多少段):用户点「说话人 5」看到「新说话人 2」
-      而没有任何解释,只会以为界面错乱(2026-08-20 用户实测反馈)。 */
-  function openMultiForRefined(rid: string) {
-    const seqs = new Set(
-      (refined?.paragraphs ?? []).filter((p) => p.speaker === rid).flatMap((p) => p.source_seqs),
-    );
-    const counts = new Map<string, number>();
-    for (const s of displaySegments) {
-      if (s.speaker && seqs.has(s.seq)) counts.set(s.speaker, (counts.get(s.speaker) ?? 0) + 1);
-    }
-    const sids = [...counts.keys()];
-    if (sids.length > 0)
-      multiPanel = {
-        candidates: sids,
-        existingOp: null,
-        sourceLabel: speakerLabel(rid, "mic", refinedSpeakers),
-        candidateCounts: Object.fromEntries(counts),
-      };
   }
   /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
   function auditionSegment(seq: number) {
@@ -630,6 +626,7 @@
     if (!seg || !player) return;
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource) };
+    armPreviewWatchdog(seg.end_ms - seg.start_ms);
     // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
     player.soloTrack(seg.source ?? null);
     player.seek(seekFix(seg.start_ms, segSource));
@@ -648,14 +645,17 @@
     // 2026-08-20 在一篇真实笔记上实测:472 个段落里 466 个(99%)的时间范围内夹着
     // 其他说话人的段,最长的一个横跨 58.6 秒而自己只占 8 段。用户的观感就是
     // 「试听的这些样本不是同一个人」。源段(中位 4.5s)才是真实的单人音频区间。
+    // 一波说话人:两个视图的 sid 都是原始稿说话人,直接取其原始段;修订稿旧文档
+    // 映射不回 S 的遗留 id 才退回「段落 source_seqs 还原」。
+    const direct = displaySegments.filter((s) => s.speaker === sid);
     const segs = (
-      effectiveView === "refined"
-        ? (refined?.paragraphs ?? [])
+      direct.length > 0
+        ? direct
+        : (refined?.paragraphs ?? [])
             .filter((p) => p.speaker === sid)
             .flatMap((p) => p.source_seqs)
             .map((seq) => segBySeq.get(seq))
             .filter((s) => s !== undefined)
-        : displaySegments.filter((s) => s.speaker === sid)
     )
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
       .slice(0, 5);
@@ -666,6 +666,7 @@
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    armPreviewWatchdog(Math.min(seg.end_ms - seg.start_ms, PREVIEW_MAX_MS));
     // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
     // (system)说的话会跟着一起响,听起来就是「试听的样本不是同一个人」。
     player.soloTrack(seg.source ?? null);
@@ -674,7 +675,11 @@
   }
 
   /** 退出试听态:清状态并解除独奏(三条退出路径共用,漏一条就会把轨一直压着)。 */
-  function endPreview() {
+  function endPreview(_reason = "unknown") {
+    if (previewTimer) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
     preview = null;
     player?.soloTrack(null);
   }
@@ -682,13 +687,21 @@
   // 段尾自动停:只在试听态生效,停完清态(不影响用户随后正常播放)。
   $effect(() => {
     if (preview && playerPlaying && playerMs >= preview.endMs) {
-      player?.pause();
-      endPreview();
+      untrack(() => {
+        player?.pause();
+        endPreview("boundary");
+      });
     }
   });
+  // untrack 是本效应的命门(2026-08-22 定案的「试听不停」真凶):endPreview →
+  // player.soloTrack(null) 会读播放器的 soloSource 等 $state,不隔离的话这些读取
+  // 被追踪成本效应的依赖——试听一开始 soloTrack(源) 改了 soloSource,本效应立即
+  // 误触发,把试听态+看门狗一并清掉(且不暂停),停止边界连根消失,整篇一直放。
+  // 三轮边界修复(armed/onUserPause/墙钟看门狗)全被它一招团灭,埋点日志实锤:
+  // preview 建立 1ms 后 endPreview reason=note-change。
   $effect(() => {
     void id;
-    endPreview();
+    untrack(() => endPreview("note-change"));
   });
 
   /** 原始稿各说话人的段数：说话人条按此排序，并折叠只出现 1 段的碎片。 */
@@ -938,7 +951,6 @@
     refining = false;
     refineRunFailed = false;
     refineErr = "";
-    confirmRefine = false;
     retranscribing = false;
     retransStage = "";
     retransConfirm = false;
@@ -1667,18 +1679,9 @@
     }
   }
 
-  /** 重新 Aing 会整写 refined.json:未关联搭子的说话人改名会被冲掉,这种情况下二段确认。 */
-  const refineWouldLoseNames = $derived(
-    !!refined?.paragraphs.some((p) => p.name && !p.person_id),
-  );
-  let confirmRefine = $state(false);
-
+  // 一波说话人(2026-08-21):说话人名字/关联都住在 speakers.json,重新 Aing 只重建
+  // 段落文本,不再有"改名被冲掉"的问题——原二段确认(refineWouldLoseNames)删除。
   async function rerunRefine() {
-    if (refineWouldLoseNames && !confirmRefine) {
-      confirmRefine = true;
-      return;
-    }
-    confirmRefine = false;
     refineErr = "";
     refineRunFailed = false;
     refining = true; // 乐观置位:避免事件到达前的空隙内重复点击触发二次 Aing
@@ -1894,7 +1897,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={endPreview} noteId={note?.meta.id} title={note?.meta.title} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={() => endPreview("user-pause")} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
@@ -1936,14 +1939,14 @@
           <div class="banner">{t("notes.retrans.staleBanner")}</div>
         {/if}
         <SpeakerChips
-          speakers={refinedSpeakers}
+          speakers={note.speakers}
           noteId={id}
           editable={!refining}
+          counts={segCounts}
           {people}
-          onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
-          onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
-          onMarkMulti={canEdit ? openMultiForRefined : undefined}
-          onUnlink={(sid) => clearRefinedSpeakerPerson(id, sid)}
+          onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
+          onMarkMulti={canEdit ? openMultiForRaw : undefined}
+          onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1988,24 +1991,15 @@
       <div class="view-switch">
         <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
         <span class="spacer"></span>
-        {#if confirmRefine}
-          <!-- 二段确认(仅当存在未关联搭子的手工改名):整写 refined.json 会冲掉它们 -->
-          <div class="confirm-capsule">
-            <span class="refine-warn">{t("notes.refine.loseNames")}</span>
-            <button class="link danger" onclick={rerunRefine}>{t("notes.refine.confirm")}</button>
-            <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
-          </div>
-        {:else}
-          {#if refining && aingProg}
-            <span class="aing-inline">
-              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
-                done: aingProg.done,
-                total: aingProg.total,
-              })}
-              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
-            </span>
-          {/if}
-          <button
+        {#if refining && aingProg}
+          <span class="aing-inline">
+            {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+              done: aingProg.done,
+              total: aingProg.total,
+            })}
+            {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+          </span>
+            <button
             class="reaing"
             class:casting={refining}
             disabled={refining || note.meta.state !== "complete"}
@@ -2040,7 +2034,7 @@
         {/if}
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
-             自动备份为 segments.orig.jsonl),二段确认同款 confirmRefine 样板。
+             自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。
              来源二选一:双轨(mic+system 分轨)/成品轨(单混音轨,mixedInputStatus
              判定可用性并置灰+tooltip 给原因)。 -->
         {#if retransConfirm}
@@ -2221,8 +2215,6 @@
         speakers={note.speakers}
         candidateSpeakers={multiPanel.candidates}
         existingOp={multiPanel.existingOp}
-        sourceLabel={multiPanel.sourceLabel}
-        candidateCounts={multiPanel.candidateCounts}
         segments={note.segments}
         people={people.map((p) => ({ id: p.id, name: p.name }))}
         onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}

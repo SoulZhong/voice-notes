@@ -122,7 +122,12 @@ pub fn get_note(
     let refined = if prefer_refined {
         // 纯读出口:渲染出去的 markdown 带 [时间戳],必须与 App 同一条时基
         // (段那边 NoteStore::load 已投影,这里不投影会在同一份输出里混两套时基)。
-        store::load_refined_for_display(&notes_dir(roots).join(id))
+        store::load_refined_for_display(&notes_dir(roots).join(id)).map(|mut doc| {
+            // 一波说话人 join:身份现查 note.speakers(与 get_refined 同口径)。
+            let vp = crate::store::VoiceprintStore::new(roots.data_root.clone()).load();
+            crate::store::join_note_identities(&mut doc, &note.speakers, &note.segments, &vp);
+            doc
+        })
     } else {
         None
     };
@@ -268,12 +273,16 @@ fn get_aing_context_with_hook(
     note_id: &str,
     mut hook: impl FnMut(GraphIoStage),
 ) -> anyhow::Result<serde_json::Value> {
-    NoteStore::new(notes_dir(roots)).load(note_id)?;
+    let note = NoteStore::new(notes_dir(roots)).load(note_id)?;
     let anchored = store::refined::AnchoredRefinedDir::open(&notes_dir(roots), note_id)?;
     hook(GraphIoStage::AfterAnchor);
-    let doc = anchored
+    let mut doc = anchored
         .load_current()?
         .ok_or_else(|| anyhow::anyhow!("aing.json 不存在"))?;
+    // 一波说话人 join:段落不携带身份,Agent 上下文的 name/person_id 现查
+    // note.speakers(与 get_refined 同口径)。纯读,不写回 aing.json。
+    let vp = crate::store::VoiceprintStore::new(roots.data_root.clone()).load();
+    crate::store::join_note_identities(&mut doc, &note.speakers, &note.segments, &vp);
     let support: HashSet<&str> = doc
         .graph_support_mentions
         .iter()

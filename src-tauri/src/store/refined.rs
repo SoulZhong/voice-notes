@@ -817,74 +817,6 @@ fn update_refined(
 }
 
 /// 修订稿说话人改名:该 speaker 的全部段落 name 置为新名。
-/// 返回该说话人已关联的 person_id(若有),供调用方把改名同步进声纹库。
-pub fn rename_refined_speaker(
-    note_dir: &Path,
-    speaker_id: &str,
-    name: &str,
-) -> anyhow::Result<Option<String>> {
-    let mut person_id = None;
-    update_refined(note_dir, |doc| {
-        let mut hit = false;
-        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == speaker_id) {
-            hit = true;
-            p.name = Some(name.to_string());
-            if person_id.is_none() {
-                person_id = p.person_id.clone();
-            }
-        }
-        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
-        Ok(())
-    })?;
-    Ok(person_id)
-}
-
-/// 把修订稿说话人关联到声纹库人物:该 speaker 的全部段落写入 person_id,
-/// name 采用库中现名(空名传 None,展示端按「说话人 N」兜底)。
-pub fn assign_refined_person(
-    note_dir: &Path,
-    speaker_id: &str,
-    person_id: &str,
-    person_name: &str,
-) -> anyhow::Result<()> {
-    update_refined(note_dir, |doc| {
-        let mut hit = false;
-        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == speaker_id) {
-            hit = true;
-            p.person_id = Some(person_id.to_string());
-            p.name = if person_name.is_empty() { None } else { Some(person_name.to_string()) };
-        }
-        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
-        Ok(())
-    })
-}
-
-/// 撤销自动身份关联(P2b):CAS——仅当该 speaker 的现有关联仍等于 expect_person
-/// 才清空 person_id/name;已被用户改成别人则拒绝(绝不覆盖最新人工结果)。
-/// 自动应用前置已验证簇原本无关联、无手填名,清空即恢复原状。
-pub fn unassign_refined_person_if(
-    note_dir: &Path,
-    speaker_id: &str,
-    expect_person: &str,
-) -> anyhow::Result<()> {
-    update_refined(note_dir, |doc| {
-        let mut hit = false;
-        for p in doc.paragraphs.iter().filter(|p| p.speaker == speaker_id) {
-            hit = true;
-            anyhow::ensure!(
-                p.person_id.as_deref() == Some(expect_person),
-                "当前关联已被修改,拒绝撤销覆盖"
-            );
-        }
-        anyhow::ensure!(hit, "修订稿中没有该说话人: {speaker_id}");
-        for p in doc.paragraphs.iter_mut().filter(|p| p.speaker == speaker_id) {
-            p.person_id = None;
-            p.name = None;
-        }
-        Ok(())
-    })
-}
-
 /// 把修订稿整份标 stale(拆分同步失败的硬兜底:原始段已改派,修订稿再不标脏,
 /// 用户在默认视图看到的就是旧归属还以为拆完了)。
 pub fn mark_refined_stale(note_dir: &Path) -> anyhow::Result<()> {
@@ -904,7 +836,6 @@ pub fn mark_refined_stale(note_dir: &Path) -> anyhow::Result<()> {
 pub fn sync_refined_after_split(
     note_dir: &Path,
     moved: &std::collections::BTreeMap<u64, String>,
-    person_name: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
 ) -> anyhow::Result<bool> {
     let mut went_stale = false;
     update_refined(note_dir, |doc| {
@@ -919,13 +850,10 @@ pub fn sync_refined_after_split(
                 touched.iter().map(|q| &moved[q]).collect();
             if touched.len() == p.source_seqs.len() && dests.len() == 1 {
                 let dest = (*dests.iter().next().expect("len==1")).clone();
-                if let Some((pid, name)) = person_name.get(&dest) {
-                    p.person_id = pid.clone();
-                    p.name = name.clone();
-                } else {
-                    p.person_id = None;
-                    p.name = None;
-                }
+                // 一波说话人(2026-08-21):段落不携带身份,只改归属;显示端现查
+                // note.speakers,人物随 speakers.json 自然更新。
+                p.person_id = None;
+                p.name = None;
                 p.speaker = dest;
             } else {
                 stale = true; // 跨组/部分改派:不可映射,整份作废重新 Aing
@@ -1098,18 +1026,66 @@ pub fn save_refined_paragraphs(
 /// 只读 join:关联了库人物的段落,展示名跟随库中现名(会议搭子改名 → 历史修订稿
 /// 跟着变),person_id 经 redirects 归一到 winner。只改返回值,不落盘——与
 /// notes.rs join_person_names 同一哲学。库中无名/人已删除时保留段落原 name。
-pub fn join_library_names(doc: &mut RefinedDoc, vp: &super::voiceprints::Voiceprints) {
+/// 一波说话人显示 join(2026-08-21-one-speaker-set-design.md §2/§7):
+/// 段落身份一律现查 note.speakers——person 经 redirects 归一、名字跟库中现名,
+/// speakers.json 本地名兜底;旧版 R 键文档按 source_seqs 的多数源段落说话人映射回
+/// S(display 副本连 speaker 一并改写,前端胸牌/操作全走 S 域)。只影响返回值,
+/// 不落盘。查不到映射的段落(用户手插块/空 source_seqs 的遗留段)保留原样。
+pub fn join_note_identities(
+    doc: &mut RefinedDoc,
+    speakers: &std::collections::BTreeMap<String, super::SpeakerMeta>,
+    segments: &[super::SegmentRecord],
+    vp: &super::voiceprints::Voiceprints,
+) {
+    let seg_speaker: std::collections::BTreeMap<u64, &str> = segments
+        .iter()
+        .filter_map(|s| s.speaker.as_deref().map(|sp| (s.seq, sp)))
+        .collect();
     for p in doc.paragraphs.iter_mut() {
-        let Some(pid) = &p.person_id else { continue };
-        let Some(resolved) = super::VoiceprintStore::resolve(vp, pid).map(str::to_string) else {
-            continue;
-        };
-        if let Some(person) = vp.people.get(&resolved) {
-            if !person.name.is_empty() {
-                p.name = Some(person.name.clone());
+        if !speakers.contains_key(&p.speaker) {
+            // 旧 R 键(或已被删的 S):多数票映射。平票取 BTreeMap 序首者,稳定可复现。
+            let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+            for q in &p.source_seqs {
+                if let Some(sp) = seg_speaker.get(q) {
+                    *counts.entry(sp).or_default() += 1;
+                }
+            }
+            let Some(best) = counts.iter().max_by_key(|(_, n)| **n).map(|(sp, _)| sp.to_string())
+            else {
+                // 无源段可映射:保留遗留身份字段,但仍归一 redirects、跟库中现名
+                // (旧 join_library_names 语义),不至于显示已合并人物的旧名。
+                if let Some(rid) =
+                    p.person_id.as_deref().and_then(|pid| super::VoiceprintStore::resolve(vp, pid))
+                {
+                    if let Some(person) = vp.people.get(rid) {
+                        if !person.name.is_empty() {
+                            p.name = Some(person.name.clone());
+                        }
+                    }
+                    p.person_id = Some(rid.to_string());
+                }
+                continue;
+            };
+            p.speaker = best;
+        }
+        let Some(meta) = speakers.get(&p.speaker) else { continue };
+        match meta.person_id.as_deref().and_then(|pid| super::VoiceprintStore::resolve(vp, pid)) {
+            Some(rid) => {
+                let lib_name = vp.people.get(rid).map(|per| per.name.clone()).unwrap_or_default();
+                p.person_id = Some(rid.to_string());
+                p.name = if !lib_name.is_empty() {
+                    Some(lib_name)
+                } else if !meta.name.is_empty() {
+                    Some(meta.name.clone())
+                } else {
+                    None
+                };
+            }
+            None => {
+                p.person_id = None;
+                p.name = if meta.name.is_empty() { None } else { Some(meta.name.clone()) };
             }
         }
-        p.person_id = Some(resolved);
     }
 }
 
@@ -1526,14 +1502,6 @@ mod tests {
             apply_refined_texts(dir.path(), &[(0, "局部替换。".into())], "m").is_err(),
             "公共 read-modify-write 必须服从同一把 NoteLock"
         );
-        assert!(
-            rename_refined_speaker(dir.path(), "R1", "新名字").is_err(),
-            "改名 writer 必须服从同一把 NoteLock"
-        );
-        assert!(
-            assign_refined_person(dir.path(), "R1", "P1", "人物").is_err(),
-            "人物关联 writer 必须服从同一把 NoteLock"
-        );
         assert_eq!(
             std::fs::read(dir.path().join(AING_DOC_FILE)).unwrap(),
             original,
@@ -1546,50 +1514,6 @@ mod tests {
             load_refined(dir.path()).unwrap().paragraphs[0].text,
             "整份替换。"
         );
-    }
-
-    #[test]
-    fn rename_updates_all_paragraphs_of_speaker_and_returns_linked_person() {
-        let dir = tempfile::tempdir().unwrap();
-        write_doc(
-            dir.path(),
-            vec![para("R1", None, Some("P3"), 0), para("R2", Some("李四"), None, 1000), para("R1", None, Some("P3"), 2000)],
-        );
-        let pid = rename_refined_speaker(dir.path(), "R1", "张三").unwrap();
-        assert_eq!(pid.as_deref(), Some("P3"), "返回关联人物供调用方同步声纹库");
-        let doc = load_refined(dir.path()).unwrap();
-        assert_eq!(doc.paragraphs[0].name.as_deref(), Some("张三"));
-        assert_eq!(doc.paragraphs[2].name.as_deref(), Some("张三"));
-        assert_eq!(doc.paragraphs[1].name.as_deref(), Some("李四"), "别的说话人不受影响");
-    }
-
-    #[test]
-    fn rename_unknown_speaker_errors_and_leaves_file_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        write_doc(dir.path(), vec![para("R1", None, None, 0)]);
-        assert!(rename_refined_speaker(dir.path(), "R9", "张三").is_err());
-        let doc = load_refined(dir.path()).unwrap();
-        assert!(doc.paragraphs[0].name.is_none(), "未命中不落盘任何修改");
-        // 无修订稿时同样报错,不凭空造文件。
-        let empty = tempfile::tempdir().unwrap();
-        assert!(rename_refined_speaker(empty.path(), "R1", "张三").is_err());
-    }
-
-    #[test]
-    fn assign_person_links_and_adopts_library_name() {
-        let dir = tempfile::tempdir().unwrap();
-        write_doc(dir.path(), vec![para("R1", Some("旧名"), None, 0), para("R1", None, None, 1000)]);
-        assign_refined_person(dir.path(), "R1", "P7", "王五").unwrap();
-        let doc = load_refined(dir.path()).unwrap();
-        for p in &doc.paragraphs {
-            assert_eq!(p.person_id.as_deref(), Some("P7"));
-            assert_eq!(p.name.as_deref(), Some("王五"));
-        }
-        // 关联未命名人物:name 清为 None,展示端按「说话人 N」兜底。
-        assign_refined_person(dir.path(), "R1", "P8", "").unwrap();
-        let doc = load_refined(dir.path()).unwrap();
-        assert!(doc.paragraphs[0].name.is_none());
-        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P8"));
     }
 
     #[test]
@@ -1633,11 +1557,29 @@ mod tests {
     }
 
     #[test]
-    fn join_library_names_follows_current_names_and_redirects() {
+    fn join_note_identities_resolves_s_and_maps_legacy_r() {
         use crate::store::voiceprints::{Person, Voiceprints};
         let mut vp = Voiceprints::default();
         vp.people.insert("P1".into(), Person { name: "张三".into(), ..Default::default() });
         vp.redirects.insert("P2".into(), "P1".into());
+        let mut speakers: std::collections::BTreeMap<String, crate::store::SpeakerMeta> =
+            Default::default();
+        let meta = |name: &str, person: Option<&str>| crate::store::SpeakerMeta {
+            name: name.into(),
+            sources: vec!["mic".into()],
+            centroid: None,
+            count: 1,
+            person_id: person.map(str::to_string),
+            multi_speaker: false,
+            reserved_by: None,
+        };
+        speakers.insert("S1".into(), meta("", Some("P2"))); // 关联(经 redirect)
+        speakers.insert("S2".into(), meta("现场名", None)); // 只有本地名
+        let segments = vec![
+            crate::store::SegmentRecord { seq: 0, source: "mic".into(), text: "a".into(), start_ms: 0, end_ms: 1000, speaker: Some("S1".into()), rms: None },
+            crate::store::SegmentRecord { seq: 1, source: "mic".into(), text: "b".into(), start_ms: 1000, end_ms: 2000, speaker: Some("S2".into()), rms: None },
+            crate::store::SegmentRecord { seq: 2, source: "mic".into(), text: "c".into(), start_ms: 2000, end_ms: 3000, speaker: Some("S2".into()), rms: None },
+        ];
         let mut doc = RefinedDoc {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
@@ -1652,16 +1594,23 @@ mod tests {
             revision: 0,
             stale: false,
             paragraphs: vec![
-                para("R1", Some("旧快照名"), Some("P2"), 0), // 已被合并的引用:归一到 P1 且跟随现名
-                para("R2", Some("现场名"), None, 1000),      // 未关联:原样保留
-                para("R3", Some("留名"), Some("P9"), 2000),  // 悬空引用:容忍,保留原 name
+                // 新格式:S 键,身份现查表(经 redirect 归一、名字跟库)。
+                { let mut p = para("S1", None, None, 0); p.source_seqs = vec![0]; p },
+                // 旧 R 键:source_seqs 多数票映射到 S2,采用其本地名。
+                { let mut p = para("R7", Some("旧名"), None, 1000); p.source_seqs = vec![1, 2]; p },
+                // 无源段的遗留段:保留字段,但 person 归一 redirects + 跟库名。
+                { let mut p = para("R8", Some("旧快照名"), Some("P2"), 3000); p.source_seqs = vec![]; p },
             ],
         };
-        join_library_names(&mut doc, &vp);
+        join_note_identities(&mut doc, &speakers, &segments, &vp);
         assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P1"));
         assert_eq!(doc.paragraphs[0].name.as_deref(), Some("张三"));
+        assert_eq!(doc.paragraphs[1].speaker, "S2", "旧 R 键按源段多数票映射回 S");
+        assert!(doc.paragraphs[1].person_id.is_none());
         assert_eq!(doc.paragraphs[1].name.as_deref(), Some("现场名"));
-        assert_eq!(doc.paragraphs[2].name.as_deref(), Some("留名"));
+        assert_eq!(doc.paragraphs[2].speaker, "R8", "无源段:不硬造映射");
+        assert_eq!(doc.paragraphs[2].person_id.as_deref(), Some("P1"), "遗留引用仍归一 redirects");
+        assert_eq!(doc.paragraphs[2].name.as_deref(), Some("张三"));
     }
 
     fn editable_doc() -> RefinedDoc {
@@ -1901,51 +1850,6 @@ mod tests {
 
         assert_eq!(load_refined(&note).unwrap().revision, on_disk_revision);
     }
-    #[test]
-    fn unassign_refined_person_if_is_cas() {
-        let dir = tempfile::tempdir().unwrap();
-        let doc = RefinedDoc {
-            llm_failed_paragraphs: Vec::new(),
-            schema_version: REFINED_SCHEMA_VERSION,
-            generated_at: "t".into(),
-            llm_model: None,
-            stages: RefineStages {
-                filter: "done".into(),
-                recluster: "done".into(),
-                llm: "off".into(),
-                entities: "off".into(),
-                relations: "off".into(),
-            },
-            discarded_seqs: vec![],
-            entities: vec![],
-            graph_extraction: None,
-            relations: vec![],
-            graph_support_mentions: vec![],
-            revision: 0,
-            stale: false,
-            paragraphs: vec![RefinedParagraph {
-                speaker: "R1".into(),
-                name: None,
-                person_id: None,
-                start_ms: 0,
-                end_ms: 1000,
-                text: "你好".into(),
-                source_seqs: vec![0],
-                mentions: vec![],
-            }],
-        };
-        write_refined_atomic(dir.path(), &doc).unwrap();
-        assign_refined_person(dir.path(), "R1", "P1", "张伟").unwrap();
-        // 期望不符(已被"改成"别人)→ 拒绝。
-        assert!(unassign_refined_person_if(dir.path(), "R1", "P9").is_err());
-        // 期望相符 → 清空。
-        unassign_refined_person_if(dir.path(), "R1", "P1").unwrap();
-        let after = load_refined(dir.path()).unwrap();
-        let p = after.paragraphs.iter().find(|p| p.speaker == "R1").unwrap();
-        assert!(p.person_id.is_none() && p.name.is_none());
-    }
-
-
     // ── 失败段下标的重映射与序列化(部分重跑,2026-08-21) ──
 
     #[test]
@@ -2047,14 +1951,12 @@ mod tests {
         split_fixture(dir.path());
         let moved: std::collections::BTreeMap<u64, String> =
             [(1u64, "S9".to_string()), (2u64, "S9".to_string())].into();
-        let pn: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
-            [("S9".to_string(), (Some("P7".to_string()), Some("甲".to_string())))].into();
-        let stale = sync_refined_after_split(dir.path(), &moved, &pn).unwrap();
+        let stale = sync_refined_after_split(dir.path(), &moved).unwrap();
         assert!(!stale);
         let doc = load_refined(dir.path()).unwrap();
         assert_eq!(doc.paragraphs[0].speaker, "S9");
-        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P7"));
-        assert_eq!(doc.paragraphs[0].name.as_deref(), Some("甲"));
+        // 一波说话人:段落不携带身份,归属改写后 person/name 恒空,显示端现查表。
+        assert!(doc.paragraphs[0].person_id.is_none() && doc.paragraphs[0].name.is_none());
         assert_eq!(doc.paragraphs[0].text, "整段同去向", "文本一字不动");
         assert_eq!(doc.paragraphs[1].speaker, "R5", "未触及的段落不动");
         assert!(!doc.stale);
@@ -2067,7 +1969,7 @@ mod tests {
         split_fixture(dir.path());
         let moved: std::collections::BTreeMap<u64, String> =
             [(3u64, "S9".to_string()), (4u64, "S10".to_string())].into();
-        let stale = sync_refined_after_split(dir.path(), &moved, &Default::default()).unwrap();
+        let stale = sync_refined_after_split(dir.path(), &moved).unwrap();
         assert!(stale);
         let doc = load_refined(dir.path()).unwrap();
         assert!(doc.stale, "跨组 → 整份标 stale 等重新 Aing");
