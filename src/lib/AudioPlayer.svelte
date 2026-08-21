@@ -122,8 +122,9 @@
         // 静音是**内核态**,新核每轨一律 muted=false;不补发的话开关显示"已静音"而声音
         // 照出,再点一次还只是发 false(看着像开关坏了)。凡装载成功即按本地表补一遍——
         // 不止托盘停播这条新路径,转码完成重拉/续录/A-B 切换一直都缺这一步(Codex P2)。
-        for (const [source, m] of Object.entries(muted)) {
-          if (m) void invoke("player_set_muted", { source, muted: true }).catch(() => {});
+        // 独奏态同样是内核态,重装后一并补发(否则试听中途换轨会漏掉压制)。
+        for (const tr of tracks) {
+          if (effMuted(tr.source)) void invoke("player_set_muted", { source: tr.source, muted: true }).catch(() => {});
         }
         // 同一篇笔记重装(转码完成重拉/续录/A-B 切换):会话按新代次恢复,位置与
         // 播放态沿用重装前的现场。装的是别的笔记则不恢复——上面已经作废了。
@@ -217,9 +218,35 @@
     };
   });
 
+  /** 试听独奏中的音轨(null=没在独奏)。与 muted 分开存:muted 是用户的意图,
+      独奏只是试听期间的临时压制,结束要原样还原,不能把用户的开关改掉。 */
+  let soloSource = $state<string | null>(null);
+  /** 送给内核的最终静音态:独奏期间只认独奏,否则认用户开关。 */
+  const effMuted = (source: string) => (soloSource ? source !== soloSource : !!muted[source]);
+  function pushMute(source: string) {
+    void invoke("player_set_muted", { source, muted: effMuted(source) }).catch(() => {});
+  }
+
+  /** 试听独奏:只放 source 这一条轨(传 null 取消)。
+      播放器是多轨混音的——试听某人一段 mic 音频时,同一时刻 system 轨里远端的人
+      在说话会一起响,听感就是「试听的样本不是同一个人」(2026-08-20 实测:一篇真实
+      笔记里 4~5/5 的试听片段都存在跨轨重叠)。 */
+  export function soloTrack(source: string | null) {
+    if (soloSource === source) return;
+    soloSource = source;
+    for (const tr of tracks) pushMute(tr.source);
+  }
+
   function toggleMute(source: string) {
+    // 用户手动动开关 = 显式意图,优先于试听独奏:先解除独奏再按新意图下发。
+    if (soloSource) {
+      soloSource = null;
+      muted = { ...muted, [source]: !muted[source] };
+      for (const tr of tracks) pushMute(tr.source);
+      return;
+    }
     muted = { ...muted, [source]: !muted[source] };
-    void invoke("player_set_muted", { source, muted: !!muted[source] }).catch(() => {});
+    pushMute(source);
   }
 
   // ── 音轨菜单(收纳每轨静音开关):双轨会议才有,主控制行只留一个「音轨」按钮 ──

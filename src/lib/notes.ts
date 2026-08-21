@@ -358,11 +358,18 @@ export const assignRefinedPerson = (noteId: string, speakerId: string, personId:
 export const assignNoteSpeakerPerson = (noteId: string, speakerId: string, personId: string) =>
   invoke<void>("assign_note_speaker_person", { noteId, speakerId, personId });
 
-/** 解除说话人与声纹库人物的关联:清 person_id,显示回落到「新说话人 N」。
-    连带撤销这次关联带来的声纹回灌(后台 best-effort,见后端注释里那条
-    「MergePrior 不可撤销」的例外)。表项与段落归属都不动——与删除说话人不是一回事。 */
+/** 解除原始稿说话人与声纹库人物的关联:清 person_id,显示回落到「新说话人 N」。
+    表项与段落归属都不动——与删除说话人不是一回事。
+
+    **不连带撤销这次关联带来的声纹回灌**:库里那个人会多留一段本不该有的样本。
+    见 docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md「配套」一节。 */
 export const clearNoteSpeakerPerson = (noteId: string, speakerId: string) =>
   invoke<void>("clear_note_speaker_person", { noteId, speakerId });
+
+/** 同上,修订稿(全文)视图版:清该说话人所有段落的 person_id/name,回落到「说话人 R<n>」。
+    后端走 CAS——面板开着时 identify 自动应用可能已改成别人,只解开用户看到的那个。 */
+export const clearRefinedSpeakerPerson = (noteId: string, speakerId: string) =>
+  invoke<void>("clear_refined_speaker_person", { noteId, speakerId });
 
 /** speakerLabel/speakerColor 共用的说话人元数据形状(录制态 SpeakerMap 与
     Note.speakers 都满足)。person_id 是全局声纹库人物 id(P<n>)。 */

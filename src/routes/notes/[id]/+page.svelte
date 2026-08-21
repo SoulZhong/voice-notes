@@ -37,6 +37,7 @@
     deleteSegment,
     setSegmentSpeaker,
     clearNoteSpeakerPerson,
+    clearRefinedSpeakerPerson,
     noteAudioInfo,
     renameRefinedSpeaker,
     assignRefinedPerson,
@@ -578,6 +579,9 @@
       (2026-08-20 用户实测复现)。 */
   let preview = $state<{ sid: string; idx: number; endMs: number; armed: boolean } | null>(null);
 
+  /** seq -> 原始段。修订稿试听要靠它把段落还原成真实音频区间。 */
+  const segBySeq = $derived(new Map(displaySegments.map((s) => [s.seq, s])));
+
   // ── 多人混杂处置(设计:2026-08-20-mixed-speaker-split-design.md) ──
   let multiPanel = $state<{
     candidates: string[];
@@ -626,8 +630,8 @@
     if (!seg || !player) return;
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource), armed: false };
-    // 注:多轨混音下另一条轨的同时段声音会一起响。轨道独奏(soloTrack)在
-    // fix-audition-and-refined-unlink 分支上,两支都合入 master 后在这里接上。
+    // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
+    player.soloTrack(seg.source ?? null);
     player.seek(seekFix(seg.start_ms, segSource));
     player.play();
   }
@@ -639,10 +643,20 @@
   }
 
   function previewSpeaker(sid: string) {
-    const source: { speaker?: string | null; start_ms: number; end_ms: number }[] =
-      effectiveView === "refined" ? (refined?.paragraphs ?? []) : displaySegments;
-    const segs = source
-      .filter((p) => p.speaker === sid)
+    // **修订稿一律回落到源段**。修订稿的段落是「不连续源段的合并」,却只记一个
+    // start_ms~end_ms 的大范围;照那个范围连续播,中间别人说的话会原样放出来。
+    // 2026-08-20 在一篇真实笔记上实测:472 个段落里 466 个(99%)的时间范围内夹着
+    // 其他说话人的段,最长的一个横跨 58.6 秒而自己只占 8 段。用户的观感就是
+    // 「试听的这些样本不是同一个人」。源段(中位 4.5s)才是真实的单人音频区间。
+    const segs = (
+      effectiveView === "refined"
+        ? (refined?.paragraphs ?? [])
+            .filter((p) => p.speaker === sid)
+            .flatMap((p) => p.source_seqs)
+            .map((seq) => segBySeq.get(seq))
+            .filter((s) => s !== undefined)
+        : displaySegments.filter((s) => s.speaker === sid)
+    )
       .sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))
       .slice(0, 5);
     if (segs.length === 0 || !player) return;
@@ -652,15 +666,24 @@
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource), armed: false };
+    // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
+    // (system)说的话会跟着一起响,听起来就是「试听的样本不是同一个人」。
+    player.soloTrack(seg.source ?? null);
     player.seek(seekFix(seg.start_ms, segSource));
     player.play();
+  }
+
+  /** 退出试听态:清状态并解除独奏(三条退出路径共用,漏一条就会把轨一直压着)。 */
+  function endPreview() {
+    preview = null;
+    player?.soloTrack(null);
   }
 
   // 段尾自动停:只在试听态生效,停完清态(不影响用户随后正常播放)。
   $effect(() => {
     if (preview && playerPlaying && playerMs >= preview.endMs) {
       player?.pause();
-      preview = null;
+      endPreview();
     }
   });
   // 武装:真正播起来之后,"暂停"才有"用户手动暂停"的含义。
@@ -670,11 +693,11 @@
   // 用户手动暂停(未到段尾)即视为退出试听;换笔记同样清态。
   // 只在 armed 后生效:seek 事件先于 play 事件到达时 playing 短暂为 false,不是暂停。
   $effect(() => {
-    if (preview?.armed && !playerPlaying && playerMs < preview.endMs - 200) preview = null;
+    if (preview?.armed && !playerPlaying && playerMs < preview.endMs - 200) endPreview();
   });
   $effect(() => {
     void id;
-    preview = null;
+    endPreview();
   });
 
   /** 原始稿各说话人的段数：说话人条按此排序，并折叠只出现 1 段的碎片。 */
@@ -1929,6 +1952,7 @@
           onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
           onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
           onMarkMulti={canEdit ? openMultiForRefined : undefined}
+          onUnlink={(sid) => clearRefinedSpeakerPerson(id, sid)}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {

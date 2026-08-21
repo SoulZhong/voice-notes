@@ -5876,6 +5876,42 @@ fn assign_refined_person(
     do_assign_refined_person(&app, &note_id, &speaker_id, &person_id)
 }
 
+/// 取消修订稿说话人与库人物的关联(原始稿的对应命令是 clear_note_speaker_person)。
+/// 只断开绑定:段落归属、文本、时间戳都不动,显示回落到「说话人 R<n>」。
+///
+/// 走 CAS(unassign_refined_person_if 比对当前 person_id):用户看到的是谁就只解开谁。
+/// 面板开着的时候 identify 自动应用可能已经把关联改成了别人,不比对就会误解别人的绑定。
+///
+/// **不连带撤销这次关联带来的声纹回灌**,与原始稿同一决定(见
+/// docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md「配套」一节)。
+#[tauri::command]
+fn clear_refined_speaker_person(
+    app: AppHandle,
+    note_id: String,
+    speaker_id: String,
+) -> Result<(), String> {
+    // Aing 中拒绝:整写 refined.json 会和本次修改互相冲掉(同 do_assign_refined_person)。
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err(tr!(
+            "该笔记正在 Aing 中，稍后再改",
+            "This note is being refined by AI; try again later"
+        ));
+    }
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+    let doc = store::load_refined(&dir)
+        .ok_or_else(|| tr!("该笔记尚无修订稿", "This note has no refined doc yet"))?;
+    let Some(current) = doc
+        .paragraphs
+        .iter()
+        .find(|p| p.speaker == speaker_id)
+        .and_then(|p| p.person_id.clone())
+    else {
+        return Ok(()); // 本来就没关联,幂等
+    };
+    store::unassign_refined_person_if(&dir, &speaker_id, &current).map_err(|e| e.to_string())
+}
+
 /// 修订稿说话人关联的可复用本体:assign_refined_person 命令与 identify 建议确认
 /// (apply_identify_suggestion)共用。自带 Aing 中拒绝守卫;内部 store 写入自取
 /// NoteLock,调用方不得持任何笔记锁(嵌套会死锁)。
@@ -9641,6 +9677,7 @@ pub fn run() {
             mcp_skill_read,
             mcp_skill_save,
             update::check_update,
+            clear_refined_speaker_person,
             player::player_load,
             player::player_play,
             player::player_pause,
