@@ -573,11 +573,11 @@
   //    播该说话人时长最长的一段(代表性最好),重复点击按时长降序换下一段(取前 5,
   //    循环);单段最多听 15s,段尾自动停;用户手动暂停/拖走即退出试听态。 ──
   const PREVIEW_MAX_MS = 15_000;
-  /** armed:本次试听已观察到 playing=true。没有它有个竞态:seek 的位置事件(playing
-      还是 false、playerMs 已跳到段起点)先于 play 的 playing=true 到达,下面"手动暂停
-      即退出"的效应把 preview 当场清掉——段尾停止边界消失,整篇笔记一直放
-      (2026-08-20 用户实测复现)。 */
-  let preview = $state<{ sid: string; idx: number; endMs: number; armed: boolean } | null>(null);
+  /** 退出试听只认两个确定信号:播到段尾(下方效应)与用户亲手点暂停(onUserPause)。
+      从 playing 翻转**推断**"用户暂停"两次修两次漏:play() 是乐观置位,Rust 心跳在
+      seek 生效、play 未生效的间隙采到 playing=false,armed 拦不住——preview 被清,
+      段尾边界消失,整篇一直放(2026-08-20/21 用户两次实测)。 */
+  let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
 
   /** seq -> 原始段。修订稿试听要靠它把段落还原成真实音频区间。 */
   const segBySeq = $derived(new Map(displaySegments.map((s) => [s.seq, s])));
@@ -629,7 +629,7 @@
     const seg = note?.segments.find((s) => s.seq === seq);
     if (!seg || !player) return;
     const segSource = segSourceAt(seg.start_ms);
-    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource), armed: false };
+    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource) };
     // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
     player.soloTrack(seg.source ?? null);
     player.seek(seekFix(seg.start_ms, segSource));
@@ -665,7 +665,7 @@
     // endMs 与 seek 同一套修正(codex P2):停止条件比较的是修正后的 playerMs,
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
-    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource), armed: false };
+    preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
     // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
     // (system)说的话会跟着一起响,听起来就是「试听的样本不是同一个人」。
     player.soloTrack(seg.source ?? null);
@@ -685,15 +685,6 @@
       player?.pause();
       endPreview();
     }
-  });
-  // 武装:真正播起来之后,"暂停"才有"用户手动暂停"的含义。
-  $effect(() => {
-    if (preview && !preview.armed && playerPlaying) preview = { ...preview, armed: true };
-  });
-  // 用户手动暂停(未到段尾)即视为退出试听;换笔记同样清态。
-  // 只在 armed 后生效:seek 事件先于 play 事件到达时 playing 短暂为 false,不是暂停。
-  $effect(() => {
-    if (preview?.armed && !playerPlaying && playerMs < preview.endMs - 200) endPreview();
   });
   $effect(() => {
     void id;
@@ -1903,7 +1894,7 @@
       <div class="transport">
         {#if canEdit && tracks.length > 0}
           <div class="player-slot">
-            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} noteId={note?.meta.id} title={note?.meta.title} />
+            <AudioPlayer bind:this={player} tracks={playerTracks} {waveform} bind:currentMs={playerMs} bind:playing={playerPlaying} onLoaded={onPlayerLoaded} onUserPause={endPreview} noteId={note?.meta.id} title={note?.meta.title} />
           </div>
           <!-- 回放方案 A/B(二期):可选项由该笔记实际产物决定——无成品轨给「生成」
                动作段;有但不可信(mixed_untrusted)置灰并 tooltip 给原因。 -->
