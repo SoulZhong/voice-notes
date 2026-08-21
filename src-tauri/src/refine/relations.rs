@@ -256,6 +256,7 @@ mod tests {
 
     fn doc(text: &str, entities: Vec<Entity>, mentions: Vec<Mention>) -> RefinedDoc {
         RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T09:00:00+08:00".into(),
             llm_model: Some("model-v1".into()),

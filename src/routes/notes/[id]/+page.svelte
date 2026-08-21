@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { onTranscodeDone } from "$lib/events";
+  import { onTranscodeDone , onAingProgress } from "$lib/events";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { save } from "@tauri-apps/plugin-dialog";
@@ -17,6 +17,7 @@
     exportFileName,
     getRefined,
     refineNote,
+    retryFailedRefine,
     noteRefining,
     retranscribeNote,
     retranscribeStatus,
@@ -64,6 +65,8 @@
   import { lowDensityStat, shouldOfferBetterEngine } from "$lib/lowDensity";
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
+  import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
+  import { listSplitOps, type SplitOp } from "$lib/multiSpeaker";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -152,6 +155,28 @@
     }
   }
   let refining = $state(false);
+  /** Aing 逐块进度(行内「精修中 3/8 · 约剩 4 分」)。null=无进度可画。 */
+  let aingProg = $state<{ stage: string; done: number; total: number; avgMs: number } | null>(null);
+  $effect(() => {
+    const forId = id;
+    aingProg = null; // 换笔记清残留
+    const un = onAingProgress((e) => {
+      if (e.note_id !== forId) return;
+      aingProg = { stage: e.stage, done: e.done, total: e.total, avgMs: e.avg_chunk_ms };
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+  $effect(() => {
+    // 终态清行内进度:refining 结束(done/failed)后残留的 3/8 会误导。
+    if (!refining) aingProg = null;
+  });
+  const aingEtaMin = $derived(
+    aingProg && aingProg.done >= 2 && aingProg.avgMs > 0
+      ? Math.max(1, Math.ceil(((aingProg.total - aingProg.done) * aingProg.avgMs) / 60000))
+      : null, // 前两块没完成不显示时间:没数据不瞎估
+  );
   /** 在跑状态是否已确定:进页那一刻 refining 还是默认 false,而 run_local 一开始就把
       stages.llm 落成 "off"——若在补问 note_refining 落地之前就渲染,横幅会闪一下,
       还给出一个后端必然拒绝的重跑按钮(Codex P2 四轮)。未确定期间一律不提示。 */
@@ -556,6 +581,66 @@
 
   /** seq -> 原始段。修订稿试听要靠它把段落还原成真实音频区间。 */
   const segBySeq = $derived(new Map(displaySegments.map((s) => [s.seq, s])));
+
+  // ── 多人混杂处置(设计:2026-08-20-mixed-speaker-split-design.md) ──
+  let multiPanel = $state<{
+    candidates: string[];
+    existingOp: SplitOp | null;
+    /** 修订稿入口:被点的那个 R 的显示名(面板解释 R↔S 映射用)。 */
+    sourceLabel?: string;
+    /** 每个候选 S 在该 R 里占的段数。 */
+    candidateCounts?: Record<string, number>;
+  } | null>(null);
+  /** 本篇未完成的打标操作(启动/刷新时拉取,恢复入口)。 */
+  let openMultiOps = $state<SplitOp[]>([]);
+  async function refreshMultiOps() {
+    openMultiOps = await listSplitOps(id).catch(() => []);
+  }
+  $effect(() => {
+    void id;
+    void refreshMultiOps();
+  });
+  /** 原始稿入口:直接以该 S 为唯一候选。 */
+  function openMultiForRaw(sid: string) {
+    multiPanel = { candidates: [sid], existingOp: null };
+  }
+  /** 修订稿入口:R 没有存储位,映射出其 source_seqs 涉及的原始 S 让用户勾选。
+      带上映射上下文(点的是谁、每个 S 多少段):用户点「说话人 5」看到「新说话人 2」
+      而没有任何解释,只会以为界面错乱(2026-08-20 用户实测反馈)。 */
+  function openMultiForRefined(rid: string) {
+    const seqs = new Set(
+      (refined?.paragraphs ?? []).filter((p) => p.speaker === rid).flatMap((p) => p.source_seqs),
+    );
+    const counts = new Map<string, number>();
+    for (const s of displaySegments) {
+      if (s.speaker && seqs.has(s.seq)) counts.set(s.speaker, (counts.get(s.speaker) ?? 0) + 1);
+    }
+    const sids = [...counts.keys()];
+    if (sids.length > 0)
+      multiPanel = {
+        candidates: sids,
+        existingOp: null,
+        sourceLabel: speakerLabel(rid, "mic", refinedSpeakers),
+        candidateCounts: Object.fromEntries(counts),
+      };
+  }
+  /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
+  function auditionSegment(seq: number) {
+    const seg = note?.segments.find((s) => s.seq === seq);
+    if (!seg || !player) return;
+    const segSource = segSourceAt(seg.start_ms);
+    preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource), armed: false };
+    // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
+    player.soloTrack(seg.source ?? null);
+    player.seek(seekFix(seg.start_ms, segSource));
+    player.play();
+  }
+
+  function onMultiChanged() {
+    refresh();
+    recording.bumpNotes();
+    void refreshMultiOps();
+  }
 
   function previewSpeaker(sid: string) {
     // **修订稿一律回落到源段**。修订稿的段落是「不连续源段的合并」,却只记一个
@@ -1866,6 +1951,7 @@
           {people}
           onRename={(sid, name) => renameRefinedSpeaker(id, sid, name)}
           onPick={(sid, personId) => assignRefinedPerson(id, sid, personId)}
+          onMarkMulti={canEdit ? openMultiForRefined : undefined}
           onUnlink={(sid) => clearRefinedSpeakerPerson(id, sid)}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
@@ -1886,6 +1972,7 @@
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId) : undefined}
           onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
+          onMarkMulti={canEdit ? openMultiForRaw : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
           onRenamed={() => {
@@ -1893,6 +1980,18 @@
             recording.bumpNotes();
           }}
         />
+      {/if}
+
+      {#if openMultiOps.length > 0 && !multiPanel}
+        <div class="banner">
+          {t("speakers.multi.resume")}
+          <button
+            class="link"
+            onclick={() => (multiPanel = { candidates: openMultiOps[0].speaker_ids, existingOp: openMultiOps[0] })}
+          >
+            {t("speakers.multi.resumeOpen")}
+          </button>
+        </div>
       {/if}
 
       <div class="view-switch">
@@ -1906,6 +2005,15 @@
             <button class="link" onclick={() => (confirmRefine = false)}>{t("notes.cancel")}</button>
           </div>
         {:else}
+          {#if refining && aingProg}
+            <span class="aing-inline">
+              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+                done: aingProg.done,
+                total: aingProg.total,
+              })}
+              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+            </span>
+          {/if}
           <button
             class="reaing"
             class:casting={refining}
@@ -2008,7 +2116,24 @@
            成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
       {#if refinedSaveErr}<div class="banner banner-danger">{refinedSaveErr}</div>{/if}
       {#if refined.stages.llm === "partial"}
-        <div class="banner">{t("notes.banner.llmPartial")}</div>
+        <div class="banner">
+          {t("notes.banner.llmPartial")}
+          {#if (refined.llm_failed_paragraphs?.length ?? 0) > 0 && !refining}
+            <button
+              class="link"
+              onclick={async () => {
+                try {
+                  await retryFailedRefine(id);
+                  refining = true; // 事件随后接管;先置上避免按钮双击
+                } catch (e) {
+                  error = `${e}`;
+                }
+              }}
+            >
+              {t("notes.banner.retryFailedSegs", { n: refined.llm_failed_paragraphs?.length ?? 0 })}
+            </button>
+          {/if}
+        </div>
       {:else if refined.stages.llm === "failed"}
         <div class="banner banner-danger">{t("notes.banner.llmFailed")}</div>
       {/if}
@@ -2099,6 +2224,22 @@
         <button class="menu-item" onclick={() => (segMenuPop = null)}>{t("notes.cancel")}</button>
       </div>
     {/if}
+    {#if multiPanel && note}
+      <MultiSpeakerPanel
+        noteId={id}
+        speakers={note.speakers}
+        candidateSpeakers={multiPanel.candidates}
+        existingOp={multiPanel.existingOp}
+        sourceLabel={multiPanel.sourceLabel}
+        candidateCounts={multiPanel.candidateCounts}
+        segments={note.segments}
+        people={people.map((p) => ({ id: p.id, name: p.name }))}
+        onAuditionSeg={tracks.length > 0 ? auditionSegment : undefined}
+        onBeforeCommit={() => refinedEditor?.flushRefined(true)}
+        onClose={() => (multiPanel = null)}
+        onChanged={onMultiChanged}
+      />
+    {/if}
     {#if segDeletePop}
       <div
         class="badge-menu floating"
@@ -2174,6 +2315,13 @@
 </main>
 
 <style>
+  .aing-inline {
+    font-size: 12.5px;
+    opacity: 0.8;
+    margin-right: 8px;
+    white-space: nowrap;
+  }
+
   .container {
     padding: 1.5rem;
     font-family: -apple-system, system-ui, sans-serif;

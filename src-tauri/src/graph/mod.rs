@@ -603,6 +603,7 @@ mod tests {
     }
     fn doc_with(entities: Vec<Entity>, paras: Vec<RefinedParagraph>) -> RefinedDoc {
         RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: 1, generated_at: "t".into(), llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![], entities, graph_extraction: None, relations: vec![], graph_support_mentions: vec![], revision: 0, stale: false, paragraphs: paras,

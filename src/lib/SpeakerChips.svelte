@@ -19,8 +19,12 @@
     previewingId,
     onDelete,
     onUnlink,
+    onMarkMulti,
   }: {
-    speakers: Record<string, { name: string; sources: string[]; person_id?: string | null }>;
+    speakers: Record<
+      string,
+      { name: string; sources: string[]; person_id?: string | null; multi_speaker?: boolean }
+    >;
     noteId: string;
     editable: boolean;
     /** 各说话人的段数(可选)。传入则按段数降序排,并折叠只出现 1 段的碎片说话人;
@@ -46,6 +50,9 @@
     /** 取消关联(可选)。只断开与库人物的绑定,表项与段落归属都留着,
         显示回落到「新说话人 N」。仅在该说话人确实关联了人物时才显示这一行。 */
     onUnlink?: (id: string) => Promise<void>;
+    /** 标记为多人混杂(可选)。回调只负责打开处置面板;真正的打标由面板内确认后执行。
+        已标记的说话人不再显示此入口(chip 上会带「多人」徽标)。 */
+    onMarkMulti?: (id: string) => void;
   } = $props();
 
   let editingId = $state<string | null>(null);
@@ -221,6 +228,9 @@
         class:open={editingId === id}
         style="background: {speakerColor(id, 'mic', speakers)}; color: {speakerInk(id, 'mic', speakers)}"
       >
+        {#if speakers[id]?.multi_speaker}
+          <span class="multi-tag">{t("speakers.chipMultiTag")}</span>
+        {/if}
         {#if editable}
           <button
             class="name"
@@ -317,6 +327,15 @@
                     {t("speakers.chipUnlink")}
                   </button>
                 {/if}
+                {#if onMarkMulti && !speakers[id]?.multi_speaker}
+                  <button class="row" onclick={() => { cancelEdit(); onMarkMulti(id); }}>
+                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="5.5" cy="5.5" r="2.6" /><circle cx="10.5" cy="5.5" r="2.6" />
+                      <path d="M2.2 13.4c.6-2.1 1.9-3.2 3.3-3.2m5 0c1.4 0 2.7 1.1 3.3 3.2" />
+                    </svg>
+                    {t("speakers.chipMarkMulti")}
+                  </button>
+                {/if}
                 {#if onDelete}
                   {#if deletePending}
                     <button class="row strong" onclick={() => commitDelete(id)}>{t("speakers.chipDeleteConfirm")}</button>
@@ -367,6 +386,15 @@
 {/if}
 
 <style>
+  .multi-tag {
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 6px;
+    border: 1px solid currentColor;
+    opacity: 0.75;
+    margin-right: 4px;
+  }
+
   .action-err {
     color: var(--danger);
     font-size: 0.9rem;

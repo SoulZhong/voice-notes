@@ -4,6 +4,8 @@ pub mod audio;
 pub mod disk;
 mod export;
 pub mod merge_journal;
+pub mod sample_trace;
+pub mod split_ops;
 pub mod migrate;
 pub mod mix_regen;
 pub mod notelock;
@@ -21,7 +23,8 @@ pub use notes::NoteStore;
 pub use refined::apply_refined_texts; // Agent Aing 写回(mcp::tools 消费)。
 pub use refined::load_refined_for_display; // 纯展示面(笔记页/导出)专用:额外套跨轨时基投影,绝不可用于任何会写回的路径。
 pub use refined::{aing_exists, AING_DOC_FILE, LEGACY_REFINED_FILE}; // 迁移感知的存在性判断 + 落盘/旧文件名(mcp::tools、refine::agent 消费)。
-pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker, unassign_refined_person_if}; // 修订稿说话人编辑三件套(lib.rs 命令层消费)。
+pub use refined::update_refined_for_retry; // 部分重试写回(lib.rs 消费)。
+pub use refined::{assign_refined_person, join_library_names, rename_refined_speaker, mark_refined_stale, sync_refined_after_split, unassign_refined_person_if}; // 修订稿说话人编辑(lib.rs 命令层消费)。
 pub use refined::{save_refined_paragraphs, ParagraphPayload}; // 笔记页 WYSIWYG 整篇保存(lib.rs 命令层消费)。
 pub use refined::{
     load_refined, write_refined_atomic, Entity, Mention, RefineStages, RefinedDoc, RefinedParagraph,
@@ -140,6 +143,15 @@ pub struct SpeakerMeta {
     /// speakers.json(无该键)可解析,且未关联时序列化省去该键。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_id: Option<String>,
+    /// 「多人混杂」标记:这个簇里不止一个人在说话,归给谁都是错的。事后打标
+    /// (录音时无从知道,重聚类才暴露)。置位后重转写/再入库不入库、不写样本,
+    /// UI 提供拆分入口。见 docs/superpowers/specs/2026-08-20-mixed-speaker-split-design.md。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_speaker: bool,
+    /// 拆分占号:该表项由某次拆分操作预留(值=split op id),尚未被批量改派启用。
+    /// 取消拆分时仅当表项仍为空且无段引用才连同删除;启用(改派)时清掉此标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_by: Option<String>,
 }
 
 /// 一场会议的完整内容（详情页 / 导出用）。

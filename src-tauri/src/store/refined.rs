@@ -101,6 +101,11 @@ pub struct RefinedDoc {
     /// writer 的收敛点)。历史文档缺省 0。
     #[serde(default)]
     pub revision: u64,
+    /// LLM 精修失败块覆盖的段落下标(升序去重)。「只重试失败段落」的输入;整写
+    /// (重新 Aing)重算,WYSIWYG 保存随 index_map 重映射(增删段时下标会漂——
+    /// 2026-08-21 自查发现原设计假设有误)。旧文件无此键 = 无部分重跑入口。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_failed_paragraphs: Vec<usize>,
     /// 段落已被重转写整体替换:本稿引用的 source_seqs/文本基于旧段,内容过期。
     /// UI 据此提示「重新 Aing」;下一次 run_local 整写新稿时自然回 false。
     #[serde(default)]
@@ -785,6 +790,14 @@ static REFINED_EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 锁内 read-modify-write 骨架:加载 → 就地修改 → 原子落盘。缺失/损坏 → Err
 /// (编辑必须以「盘上有可编辑的修订稿」为前提,不能凭空造一份)。
+/// 部分重试的写回入口:泛化 update(NoteLock + revision 递增)对 lib.rs 收窄暴露。
+pub fn update_refined_for_retry(
+    note_dir: &Path,
+    f: impl FnOnce(&mut RefinedDoc) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    update_refined(note_dir, f)
+}
+
 fn update_refined(
     note_dir: &Path,
     f: impl FnOnce(&mut RefinedDoc) -> anyhow::Result<()>,
@@ -870,6 +883,61 @@ pub fn unassign_refined_person_if(
         }
         Ok(())
     })
+}
+
+/// 把修订稿整份标 stale(拆分同步失败的硬兜底:原始段已改派,修订稿再不标脏,
+/// 用户在默认视图看到的就是旧归属还以为拆完了)。
+pub fn mark_refined_stale(note_dir: &Path) -> anyhow::Result<()> {
+    update_refined(note_dir, |doc| {
+        doc.stale = true;
+        Ok(())
+    })
+}
+
+/// 拆分后的修订稿同步(一期边界,codex 设计轮三 P1⑤):
+/// - 某段落的**全部**非空 source_seqs 都被改派到同一目标 → 原位只改
+///   speaker/person/name,段界与文本一字不动
+/// - 同一段落的源段被拆到多个目标 → 整份标 stale(横幅提示重新 Aing),不拆文本
+///   (source_seqs 没有字符级映射,拆文本只能复制全文/瞎猜/丢字)
+/// moved: seq → 新 speaker id;person_name: 新 speaker → (person_id, name)(仅 person 去向)。
+/// 返回是否被标了 stale。
+pub fn sync_refined_after_split(
+    note_dir: &Path,
+    moved: &std::collections::BTreeMap<u64, String>,
+    person_name: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
+) -> anyhow::Result<bool> {
+    let mut went_stale = false;
+    update_refined(note_dir, |doc| {
+        let mut stale = false;
+        for p in doc.paragraphs.iter_mut() {
+            let touched: Vec<&u64> =
+                p.source_seqs.iter().filter(|q| moved.contains_key(q)).collect();
+            if touched.is_empty() {
+                continue;
+            }
+            let dests: std::collections::BTreeSet<&String> =
+                touched.iter().map(|q| &moved[q]).collect();
+            if touched.len() == p.source_seqs.len() && dests.len() == 1 {
+                let dest = (*dests.iter().next().expect("len==1")).clone();
+                if let Some((pid, name)) = person_name.get(&dest) {
+                    p.person_id = pid.clone();
+                    p.name = name.clone();
+                } else {
+                    p.person_id = None;
+                    p.name = None;
+                }
+                p.speaker = dest;
+            } else {
+                stale = true; // 跨组/部分改派:不可映射,整份作废重新 Aing
+            }
+        }
+        if stale {
+            doc.stale = true;
+        }
+        went_stale = stale;
+        Ok(())
+    })?;
+    Ok(went_stale)
 }
 
 /// Agent Aing 写回:按段落下标批量替换 text,并把 stages.llm 置 "done"、记录 llm_model。
@@ -972,6 +1040,18 @@ pub fn save_refined_paragraphs(
                 }),
             }
         }
+        // 失败段下标随本次增删/重排一并重映射:不映射的话,部分重跑会把润色写到错的段
+        // (被删的段直接移出列表)。与段落数组同一次写盘,原子。
+        doc.llm_failed_paragraphs = {
+            let mut v: Vec<usize> = doc
+                .llm_failed_paragraphs
+                .iter()
+                .filter_map(|&i| index_map.get(i).copied().flatten().map(|(new_i, _)| new_i))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         doc.paragraphs = new_paras;
 
         // 脏段 mention 降级为 support-only
@@ -1042,6 +1122,7 @@ mod tests {
     fn v2_writes_synthesize_stable_mention_ids_without_a_repair_read() {
         let dir = tempfile::tempdir().unwrap();
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T00:00:00+08:00".into(),
             llm_model: None,
@@ -1117,6 +1198,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_refined(dir.path()).is_none(), "缺失返回 None");
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
             llm_model: Some("deepseek-chat".into()),
@@ -1193,6 +1275,7 @@ mod tests {
     fn aing_fields_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-16T10:00:00+08:00".into(),
             llm_model: None,
@@ -1407,6 +1490,7 @@ mod tests {
 
     fn write_doc(dir: &Path, paragraphs: Vec<RefinedParagraph>) {
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
@@ -1555,6 +1639,7 @@ mod tests {
         vp.people.insert("P1".into(), Person { name: "张三".into(), ..Default::default() });
         vp.redirects.insert("P2".into(), "P1".into());
         let mut doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
@@ -1820,6 +1905,7 @@ mod tests {
     fn unassign_refined_person_if_is_cas() {
         let dir = tempfile::tempdir().unwrap();
         let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
             llm_model: None,
@@ -1859,4 +1945,132 @@ mod tests {
         assert!(p.person_id.is_none() && p.name.is_none());
     }
 
+
+    // ── 失败段下标的重映射与序列化(部分重跑,2026-08-21) ──
+
+    #[test]
+    fn wysiwyg_save_remaps_failed_paragraph_indices() {
+        // 失败列表 [0,2];保存删掉段 0、保留段 1/2 → 列表应重映射为 [1](原段 2 的新位置)。
+        // 不映射的话部分重跑会把润色写错段(设计自查修正项)。
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = RefinedDoc {
+            llm_failed_paragraphs: vec![0, 2],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "partial".into(), entities: "off".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 5,
+            stale: false,
+            paragraphs: (0..3)
+                .map(|i| RefinedParagraph {
+                    speaker: "R1".into(), name: None, person_id: None,
+                    start_ms: i * 1000, end_ms: i * 1000 + 900,
+                    text: format!("段{i}"), source_seqs: vec![i], mentions: vec![],
+                })
+                .collect(),
+        };
+        write_refined_atomic(dir.path(), &doc).unwrap();
+        doc = load_refined(dir.path()).unwrap(); // 取落盘 revision 基线
+        let payload = vec![
+            ParagraphPayload { orig_index: Some(1), text: "段1".into(), dirty: false },
+            ParagraphPayload { orig_index: Some(2), text: "段2".into(), dirty: false },
+        ];
+        save_refined_paragraphs(dir.path(), doc.revision, &payload).unwrap();
+        let saved = load_refined(dir.path()).unwrap();
+        assert_eq!(saved.llm_failed_paragraphs, vec![1], "原段2 → 新下标1;被删的段0移出");
+    }
+
+    #[test]
+    fn empty_failed_list_is_not_serialized() {
+        // 空列表不落键:旧文件形状不变,与一切按字节/JSON 比对的既有快照兼容。
+        let doc = RefinedDoc {
+            llm_failed_paragraphs: vec![],
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "t".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 0,
+            stale: false,
+            paragraphs: vec![],
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("llm_failed_paragraphs"), "{json}");
+        let back: RefinedDoc = serde_json::from_str(&json).unwrap();
+        assert!(back.llm_failed_paragraphs.is_empty());
+    }
+
+    // ── 拆分后的修订稿同步(混杂说话人 Phase D) ──
+
+    fn split_fixture(dir: &std::path::Path) {
+        let doc = RefinedDoc {
+            llm_failed_paragraphs: Vec::new(),
+            schema_version: REFINED_SCHEMA_VERSION,
+            generated_at: "2026-08-20T00:00:00+08:00".into(),
+            llm_model: None,
+            stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
+            discarded_seqs: vec![],
+            entities: vec![],
+            graph_extraction: None,
+            relations: vec![],
+            graph_support_mentions: vec![],
+            revision: 3,
+            stale: false,
+            paragraphs: vec![
+                RefinedParagraph {
+                    speaker: "R5".into(), name: None, person_id: None,
+                    start_ms: 0, end_ms: 1000, text: "整段同去向".into(), source_seqs: vec![1, 2],
+                    mentions: vec![],
+                },
+                RefinedParagraph {
+                    speaker: "R5".into(), name: None, person_id: None,
+                    start_ms: 1000, end_ms: 2000, text: "跨组段落".into(), source_seqs: vec![3, 4],
+                    mentions: vec![],
+                },
+            ],
+        };
+        write_refined_atomic(dir, &doc).unwrap();
+    }
+
+    #[test]
+    fn split_sync_updates_whole_paragraph_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        split_fixture(dir.path());
+        let moved: std::collections::BTreeMap<u64, String> =
+            [(1u64, "S9".to_string()), (2u64, "S9".to_string())].into();
+        let pn: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+            [("S9".to_string(), (Some("P7".to_string()), Some("甲".to_string())))].into();
+        let stale = sync_refined_after_split(dir.path(), &moved, &pn).unwrap();
+        assert!(!stale);
+        let doc = load_refined(dir.path()).unwrap();
+        assert_eq!(doc.paragraphs[0].speaker, "S9");
+        assert_eq!(doc.paragraphs[0].person_id.as_deref(), Some("P7"));
+        assert_eq!(doc.paragraphs[0].name.as_deref(), Some("甲"));
+        assert_eq!(doc.paragraphs[0].text, "整段同去向", "文本一字不动");
+        assert_eq!(doc.paragraphs[1].speaker, "R5", "未触及的段落不动");
+        assert!(!doc.stale);
+    }
+
+    #[test]
+    fn split_sync_marks_stale_when_paragraph_crosses_groups() {
+        // source_seqs 没有字符级映射:段落被拆到多组时不拆文本,整份标 stale。
+        let dir = tempfile::tempdir().unwrap();
+        split_fixture(dir.path());
+        let moved: std::collections::BTreeMap<u64, String> =
+            [(3u64, "S9".to_string()), (4u64, "S10".to_string())].into();
+        let stale = sync_refined_after_split(dir.path(), &moved, &Default::default()).unwrap();
+        assert!(stale);
+        let doc = load_refined(dir.path()).unwrap();
+        assert!(doc.stale, "跨组 → 整份标 stale 等重新 Aing");
+        assert_eq!(doc.paragraphs[1].speaker, "R5", "不尝试拆文本/改归属");
+    }
 }

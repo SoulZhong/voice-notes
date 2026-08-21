@@ -262,6 +262,7 @@ impl NoteStore {
                 centroid: None,
                 count: 0,
                 person_id: None,
+                multi_speaker: false, reserved_by: None,
             })
             .name = name.to_string();
         write_speakers_atomic(&dir, &speakers)
@@ -309,6 +310,52 @@ impl NoteStore {
         write_speakers_atomic(&dir, &speakers)
     }
 
+    /// 条件关联(拆分收尾用):目标说话人当前关联必须为空或已是该人物,否则 Err。
+    /// "读关联→actor 写"分两步的话,中间的用户编辑会被无条件覆盖
+    /// (codex 实现轮三 P1③)——CAS 收进同一把笔记锁内。幂等。
+    pub fn assign_speaker_person_if(
+        &self,
+        id: &str,
+        speaker_id: &str,
+        person_id: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        match meta.person_id.as_deref() {
+            Some(cur) if cur == person_id => return Ok(()), // 已是,幂等
+            Some(cur) => anyhow::bail!(
+                "说话人 {speaker_id} 的关联已被改为 {cur},拆分计划停止(尊重用户修改)"
+            ),
+            None => {}
+        }
+        meta.person_id = Some(person_id.to_string());
+        meta.reserved_by = None; // 关联即启用,清占号所有权
+        write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 打「多人混杂」标(打标流程的笔记侧半步)。置位同时清掉 person_id:一个混杂簇
+    /// 挂着单人关联本身就是错的,留着会继续把段落显示成那个人。幂等。
+    pub fn set_multi_speaker(&self, id: &str, speaker_id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        let meta = speakers
+            .get_mut(speaker_id)
+            .ok_or_else(|| anyhow::anyhow!("笔记中没有该说话人: {speaker_id}"))?;
+        if meta.multi_speaker && meta.person_id.is_none() {
+            return Ok(());
+        }
+        meta.multi_speaker = true;
+        meta.person_id = None;
+        write_speakers_atomic(&dir, &speakers)
+    }
+
     /// 改段落文本。空文本拒绝（如需去段请用 delete_segment）。
     pub fn edit_segment_text(
         &self,
@@ -343,6 +390,177 @@ impl NoteStore {
     /// 改段落说话人归属。speaker_id="new" → 分配 S<max+1>（max 跨 speakers.json 键与
     /// 段内既有 speaker id，防与孤儿 id 撞号）先入表再改段（中间崩溃只留无害孤儿）。
     /// 只改 segment.speaker 字段，不回灌声纹质心（离线编辑不影响聚类）。
+    /// 该笔记里被标「多人混杂」的说话人集合(只读 speakers.json,入库/写样本前过滤用)。
+    pub fn multi_speaker_ids(&self, id: &str) -> std::collections::BTreeSet<String> {
+        let Ok(dir) = self.note_dir(id) else { return Default::default() };
+        read_speakers(&dir)
+            .into_iter()
+            .filter(|(_, m)| m.multi_speaker)
+            .map(|(sid, _)| sid)
+            .collect()
+    }
+
+    /// 预看接下来 n 个空闲 S 编号(占号计划用;只读,竞态由 reserve 的撞号 CAS 兜住)。
+    pub fn peek_next_speaker_ids(&self, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
+        let dir = self.note_dir(id)?;
+        let lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        let speakers = read_speakers(&dir);
+        let num = |s: &str| s.strip_prefix('S').and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+        let max_known = speakers
+            .keys()
+            .map(|k| num(k))
+            .chain(lines.iter().filter_map(|l| match l {
+                JsonlLine::Seg(r) => r.speaker.as_deref().map(num),
+                _ => None,
+            }))
+            .max()
+            .unwrap_or(0);
+        Ok((1..=n as u64).map(|i| format!("S{}", max_known + i)).collect())
+    }
+
+    /// 拆分占号:一次性创建若干**空的**说话人表项,带 reserved_by=op 所有权。
+    /// 任一 id 已存在即整体失败(撞号:说明计划外有并发编辑,调用方重建计划)。
+    pub fn reserve_speakers(&self, id: &str, speaker_ids: &[String], op_id: &str) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut speakers = read_speakers(&dir);
+        for sid in speaker_ids {
+            if speakers.contains_key(sid) {
+                anyhow::bail!("占号撞了({sid} 已存在),拆分计划需要重建");
+            }
+        }
+        for sid in speaker_ids {
+            speakers.insert(
+                sid.clone(),
+                SpeakerMeta {
+                    name: String::new(),
+                    sources: Vec::new(),
+                    centroid: None,
+                    count: 0,
+                    person_id: None,
+                    multi_speaker: false,
+                    reserved_by: Some(op_id.to_string()),
+                },
+            );
+        }
+        write_speakers_atomic(&dir, &speakers)
+    }
+
+    /// 取消拆分时清理占号:只删「reserved_by==op 且仍为空(无段引用、未命名、未关联)」
+    /// 的表项。被引用/被动过的保留(那已经不是空号了)。返回删除数。
+    pub fn release_reserved_speakers(&self, id: &str, op_id: &str) -> anyhow::Result<usize> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        let mut referenced: std::collections::BTreeSet<String> = lines
+            .iter()
+            .filter_map(|l| match l {
+                JsonlLine::Seg(r) => r.speaker.clone(),
+                _ => None,
+            })
+            .collect();
+        // 修订稿的段落也可能引用预留号(拆分同步之后):一并算引用,否则清理会把
+        // 修订稿还指着的号删掉(codex 实现轮一 P2)。
+        if let Some(doc) = super::refined::load_refined(&dir) {
+            for pgh in &doc.paragraphs {
+                referenced.insert(pgh.speaker.clone());
+            }
+        }
+        let mut speakers = read_speakers(&dir);
+        let victims: Vec<String> = speakers
+            .iter()
+            .filter(|(sid, m)| {
+                m.reserved_by.as_deref() == Some(op_id)
+                    && m.name.is_empty()
+                    && m.person_id.is_none()
+                    && !referenced.contains(*sid)
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in &victims {
+            speakers.remove(sid);
+        }
+        if !victims.is_empty() {
+            write_speakers_atomic(&dir, &speakers)?;
+        }
+        Ok(victims.len())
+    }
+
+    /// 拆分的批量改派:一次锁内改完全部段,**逐段 CAS 原 speaker**。任何一段对不上
+    /// (第三态:计划落盘后用户/其他 writer 动过)→ 整体失败不落盘,调用方停止提交、
+    /// 保持隔离、作废计划(codex 设计轮三 P1④)。目标 id 必须已存在(预留或既有),
+    /// 不走 "new" 的现场分配(重试会撞出新编号,不幂等)。改派同时清目标的占号标记。
+    pub fn batch_set_segment_speaker(
+        &self,
+        id: &str,
+        moves: &[(u64, String, String)], // (seq, expected_speaker, new_speaker)
+        op_id: &str,
+    ) -> anyhow::Result<()> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        let mut speakers = read_speakers(&dir);
+        for (_, _, new_sp) in moves {
+            match speakers.get(new_sp) {
+                None => anyhow::bail!("目标说话人不存在: {new_sp}(拆分不现场分配编号)"),
+                Some(m) => {
+                    // 别的 op 的预留号不许写:两个拆分共用同一私有号会互相覆盖关联
+                    // (codex 实现轮二 P1⑥)。
+                    if let Some(owner) = m.reserved_by.as_deref() {
+                        anyhow::ensure!(owner == op_id, "目标 {new_sp} 是另一次拆分的预留号");
+                    }
+                }
+            }
+        }
+        // 全量 CAS 先行,一段不符全量拒绝。**cur==new 视为已完成**(幂等):上次改派
+        // 落盘后、阶段推进前崩溃,重试的 expected 还是旧值,不认已完成态会永久卡死
+        // (codex 实现轮一 P1②)。
+        for (seq, expected, new_sp) in moves {
+            let cur = lines
+                .iter()
+                .find_map(|l| match l {
+                    JsonlLine::Seg(r) if r.seq == *seq => Some(r.speaker.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("段不存在: seq={seq}"))?;
+            let cur_s = cur.as_deref();
+            if cur_s != Some(expected.as_str()) && cur_s != Some(new_sp.as_str()) {
+                anyhow::bail!(
+                    "段 {seq} 的说话人已变({}≠{expected}),拆分计划已过期",
+                    cur_s.unwrap_or("<无>")
+                );
+            }
+        }
+        for (seq, _, new_sp) in moves {
+            for l in lines.iter_mut() {
+                if let JsonlLine::Seg(r) = l {
+                    if r.seq == *seq {
+                        r.speaker = Some(new_sp.clone());
+                    }
+                }
+            }
+        }
+        let mut touched = false;
+        for (_, _, new_sp) in moves {
+            if let Some(m) = speakers.get_mut(new_sp) {
+                // 只清**本 op**的占号:清别人的等于窃取另一次拆分的预留
+                // (codex 实现轮一 P2)。
+                if m.reserved_by.as_deref() == Some(op_id) {
+                    m.reserved_by = None;
+                    touched = true;
+                }
+            }
+        }
+        write_jsonl_atomic(&dir, &lines)?;
+        if touched {
+            write_speakers_atomic(&dir, &speakers)?;
+        }
+        Ok(())
+    }
+
     pub fn set_segment_speaker(
         &self,
         id: &str,
@@ -380,6 +598,7 @@ impl NoteStore {
                     centroid: None,
                     count: 0,
                     person_id: None,
+                multi_speaker: false, reserved_by: None,
                 },
             );
             write_speakers_atomic(&dir, &speakers)?;
@@ -1345,4 +1564,56 @@ mod tests {
         assert!(!dir.join("meta.json.tmp").exists(), "无 tmp 残留");
     }
 
+
+    // ── 拆分:占号 / 批量改派(Phase D) ──
+
+    #[test]
+    fn reserve_and_release_reserved_speakers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("a", Some("S1"))], &["S1"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let ids = store.peek_next_speaker_ids(&id, 2).unwrap();
+        store.reserve_speakers(&id, &ids, "so-x").unwrap();
+        let n = store.load(&id).unwrap();
+        assert!(ids.iter().all(|s| n.speakers[s].reserved_by.as_deref() == Some("so-x")));
+        // 撞号整体失败
+        assert!(store.reserve_speakers(&id, &ids[..1].to_vec(), "so-y").is_err());
+        // 其中一个被启用(改派),清理只删仍为空的另一个
+        store
+            .batch_set_segment_speaker(&id, &[(0, "S1".into(), ids[0].clone())], "so-x")
+            .unwrap();
+        assert_eq!(store.release_reserved_speakers(&id, "so-x").unwrap(), 1);
+        let n = store.load(&id).unwrap();
+        assert!(n.speakers.contains_key(&ids[0]), "被引用的保留");
+        assert!(!n.speakers.contains_key(&ids[1]), "仍为空的删掉");
+        assert!(n.speakers[&ids[0]].reserved_by.is_none(), "启用即清所有权标记");
+    }
+
+    #[test]
+    fn batch_reassign_is_all_or_nothing_cas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("a", Some("S1")), ("b", Some("S1"))], &["S1", "S2"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        // 第二条的 expected 故意写错:整体失败,第一条也不许落。
+        let err = store
+            .batch_set_segment_speaker(
+                &id,
+                &[(0, "S1".into(), "S2".into()), (1, "S9".into(), "S2".into())],
+                "so-x",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("已变"), "{err}");
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.segments[0].speaker.as_deref(), Some("S1"), "CAS 失败不得落任何一段");
+        // 目标不存在:拒绝(拆分不现场分配编号)
+        assert!(store
+            .batch_set_segment_speaker(&id, &[(0, "S1".into(), "S99".into())], "so-x")
+            .is_err());
+        // 正常批量
+        store
+            .batch_set_segment_speaker(&id, &[(0, "S1".into(), "S2".into()), (1, "S1".into(), "S2".into())], "so-x")
+            .unwrap();
+        let n = store.load(&id).unwrap();
+        assert!(n.segments.iter().all(|s| s.speaker.as_deref() == Some("S2")));
+    }
 }
