@@ -580,6 +580,22 @@
       seek 生效、play 未生效的间隙采到 playing=false,armed 拦不住——preview 被清,
       段尾边界消失,整篇一直放(2026-08-20/21 用户两次实测)。 */
   let preview = $state<{ sid: string; idx: number; endMs: number } | null>(null);
+  /** 试听强制停表:按样本时长走墙钟,到点仍在试听态就硬停。响应式段尾边界已三轮
+      "修好又复发"(2026-08-20 两次、08-21 一次用户实测),失效环节始终未坐实
+      (事件链/边界比较/暂停失败均有嫌疑);墙钟不依赖位置事件与响应式依赖追踪,
+      是无条件兜底。正常情况下边界效应先到,这里只负责最后一道。 */
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  function armPreviewWatchdog(durMs: number) {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      if (preview) {
+        console.warn("[preview] watchdog fired; reactive end-boundary did not stop playback");
+        player?.pause();
+        endPreview();
+      }
+    }, durMs + 1200);
+  }
 
   /** seq -> 原始段。修订稿试听要靠它把段落还原成真实音频区间。 */
   const segBySeq = $derived(new Map(displaySegments.map((s) => [s.seq, s])));
@@ -608,6 +624,7 @@
     if (!seg || !player) return;
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid: "__split", idx: 0, endMs: seekFix(seg.end_ms, segSource) };
+    armPreviewWatchdog(seg.end_ms - seg.start_ms);
     // 独奏该段所在轨:多轨混音下另一条轨的同时段声音会一起响(fix 分支合入后接上)。
     player.soloTrack(seg.source ?? null);
     player.seek(seekFix(seg.start_ms, segSource));
@@ -647,6 +664,7 @@
     // 边界不修正会让试听提前一个首帧偏移量截停。
     const segSource = segSourceAt(seg.start_ms);
     preview = { sid, idx, endMs: seekFix(Math.min(seg.end_ms, seg.start_ms + PREVIEW_MAX_MS), segSource) };
+    armPreviewWatchdog(Math.min(seg.end_ms - seg.start_ms, PREVIEW_MAX_MS));
     // 只放这一段所在的那条轨。播放器是多轨混音的:不压另一条轨的话,同一时刻远端
     // (system)说的话会跟着一起响,听起来就是「试听的样本不是同一个人」。
     player.soloTrack(seg.source ?? null);
@@ -656,6 +674,10 @@
 
   /** 退出试听态:清状态并解除独奏(三条退出路径共用,漏一条就会把轨一直压着)。 */
   function endPreview() {
+    if (previewTimer) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
     preview = null;
     player?.soloTrack(null);
   }

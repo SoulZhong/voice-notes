@@ -294,7 +294,9 @@
 
   export function pause() {
     playing = false;
-    void invoke("player_pause").catch(() => {});
+    // 失败不能再静默吞:player_pause 若被拒,Rust 继续放而 UI 已翻停,下一拍
+    // player_pos 事件又把 playing 拽回 true——正是「试听不停」一类悬案的候选真凶。
+    void invoke("player_pause").catch((e) => console.warn("player_pause failed:", e));
   }
 
   export function seek(ms: number) {
