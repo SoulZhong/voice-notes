@@ -59,6 +59,11 @@
       "minimumSystemVersion": "13.0",
       "signingIdentity": "Developer ID Application: weijian zhong (892P9TWV6L)",
       "entitlements": "./Entitlements.plist"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/installer-hooks.nsh"
+      }
     }
   }
 }
