@@ -196,6 +196,9 @@ pub struct Settings {
     pub ui_lang: String,
     /// 语言过滤开关,消费任务:转写语言过滤;默认开启。
     pub language_filter: bool,
+    /// 录前设备检查自动择优(2026-08-22 设计):默认输入是蓝牙通话麦时,本场采集
+    /// 自动改用内置/有线设备(不改系统设置)。默认开;关掉则回到弹窗提醒。
+    pub auto_input_pick: bool,
     /// 全局快捷键开关,消费任务:快捷键;默认关闭(避免未经用户同意即占用系统快捷键)。
     pub shortcut_enabled: bool,
     /// 全局快捷键组合,消费任务:快捷键。
@@ -298,6 +301,8 @@ struct SettingsRepr {
     ui_lang: String,
     #[serde(default = "default_true")]
     language_filter: bool,
+    #[serde(default = "default_true")]
+    auto_input_pick: bool,
     #[serde(default)]
     shortcut_enabled: bool,
     #[serde(default = "default_shortcut")]
@@ -416,6 +421,7 @@ impl From<SettingsRepr> for Settings {
             theme: r.theme,
             ui_lang: r.ui_lang,
             language_filter: r.language_filter,
+            auto_input_pick: r.auto_input_pick,
             shortcut_enabled: r.shortcut_enabled,
             shortcut: r.shortcut,
             tray_enabled: r.tray_enabled,
@@ -568,6 +574,7 @@ impl Default for Settings {
             theme: default_theme(),
             ui_lang: default_ui_lang(),
             language_filter: true,
+            auto_input_pick: true,
             shortcut_enabled: false,
             shortcut: default_shortcut(),
             tray_enabled: true,
@@ -878,11 +885,12 @@ mod tests {
         assert_eq!(s.theme, "system");
         assert_eq!(s.ui_lang, "system", "老配置缺 ui_lang 应回落跟随系统");
         assert!(s.language_filter);
+        assert!(s.auto_input_pick, "老配置缺键应默认开自动择优");
         assert!(!s.shortcut_enabled);
         assert_eq!(s.shortcut, "Alt+CmdOrCtrl+R");
         assert!(s.tray_enabled);
         let s = Settings { theme: "dark".into(), ui_lang: "en".into(),
-            language_filter: false, shortcut_enabled: true,
+            language_filter: false, shortcut_enabled: true, auto_input_pick: false,
             shortcut: "Alt+CmdOrCtrl+K".into(), tray_enabled: false, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());
@@ -890,6 +898,7 @@ mod tests {
         assert_eq!(got.ui_lang, "en");
         assert!(!got.language_filter);
         assert!(got.shortcut_enabled && !got.tray_enabled);
+        assert!(!got.auto_input_pick, "显式关掉的自动择优要能存取");
         assert_eq!(got.shortcut, "Alt+CmdOrCtrl+K");
     }
 

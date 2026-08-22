@@ -18,16 +18,24 @@ pub struct Microphone {
     /// 时戳上同形异因,不入账就分不开。时间轴的修补仍由 tap 按硬件时戳负责
     /// (见 frame_tap 的 holey 判定)。
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 指定输入设备名(录前设备检查自动择优):None=系统默认。按名字在 cpal 输入
+    /// 设备里匹配;找不到(设备拔了)回落默认并留日志,绝不因此录不了。
+    device_name: Option<String>,
 }
 
 impl Microphone {
     pub fn new() -> Self {
-        Self { stop_tx: None, events: None, dropped: Default::default() }
+        Self { stop_tx: None, events: None, dropped: Default::default(), device_name: None }
     }
 
     /// 带流错误上报的构造:err_fn 触发时把错误升格为 CaptureEvent(仍保留日志)。
     pub fn with_events(events: Sender<CaptureEvent>) -> Self {
-        Self { stop_tx: None, events: Some(events), dropped: Default::default() }
+        Self { stop_tx: None, events: Some(events), dropped: Default::default(), device_name: None }
+    }
+
+    /// 带指定输入设备的构造(录前设备检查自动择优,2026-08-22 设计)。
+    pub fn with_events_and_device(events: Sender<CaptureEvent>, device_name: Option<String>) -> Self {
+        Self { stop_tx: None, events: Some(events), dropped: Default::default(), device_name }
     }
 }
 
@@ -35,9 +43,28 @@ impl AudioCapture for Microphone {
     fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
         // --- device & config (validated synchronously before we spawn) ---
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("找不到默认麦克风"))?;
+        let device = match &self.device_name {
+            Some(want) => {
+                let found = host
+                    .input_devices()
+                    .ok()
+                    .and_then(|mut it| it.find(|d| d.name().map(|n| &n == want).unwrap_or(false)));
+                match found {
+                    Some(d) => {
+                        eprintln!("麦克风采集绑定指定设备: {want}");
+                        d
+                    }
+                    None => {
+                        eprintln!("指定输入设备「{want}」不在(已拔?),回落系统默认");
+                        host.default_input_device()
+                            .ok_or_else(|| anyhow::anyhow!("找不到默认麦克风"))?
+                    }
+                }
+            }
+            None => host
+                .default_input_device()
+                .ok_or_else(|| anyhow::anyhow!("找不到默认麦克风"))?,
+        };
         let supported = device.default_input_config()?;
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels();

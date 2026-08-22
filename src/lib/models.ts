@@ -65,6 +65,8 @@ export type Settings = {
   capture_path: "aec" | "vpio";
   // 转写语言过滤开关
   language_filter: boolean;
+  /** 录前设备检查自动择优:蓝牙通话麦自动换内置/有线(仅本应用采集)。默认开。 */
+  auto_input_pick: boolean;
   /** 录音音频保留期:"forever"(默认,不清理)/ "90d" / "30d"。到期后台自动清理音频轨
    * (笔记文字与说话人不受影响,同手动「清理…」的语义)。 */
   audio_retention: "forever" | "90d" | "30d";

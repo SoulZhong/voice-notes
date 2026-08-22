@@ -161,6 +161,107 @@ pub fn default_input_is_bluetooth() -> bool {
     default_device_is_bluetooth(coreaudio::sys::kAudioHardwarePropertyDefaultInputDevice)
 }
 
+/// 择优挑一个**非蓝牙**输入设备(录前设备检查自动择优,2026-08-22 设计):
+/// 内置麦克风(BuiltIn)优先,其次任意非蓝牙输入;返回设备名(cpal 按名字匹配)。
+/// 查询失败/无候选返回 None——与蓝牙判定同一原则:提示类逻辑宁可放弃不可误挡。
+#[cfg(target_os = "macos")]
+pub fn pick_non_bluetooth_input() -> Option<String> {
+    use coreaudio::sys::*;
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        let mut size: u32 = 0;
+        if AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, std::ptr::null(), &mut size) != 0 {
+            return None;
+        }
+        let n = size as usize / std::mem::size_of::<AudioDeviceID>();
+        let mut ids = vec![0 as AudioDeviceID; n];
+        if AudioObjectGetPropertyData(
+            kAudioObjectSystemObject, &addr, 0, std::ptr::null(), &mut size,
+            ids.as_mut_ptr() as *mut _,
+        ) != 0 {
+            return None;
+        }
+        let prop_u32 = |dev: AudioDeviceID, sel: u32, scope: u32| -> Option<u32> {
+            let a = AudioObjectPropertyAddress { mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMaster };
+            let mut v: u32 = 0;
+            let mut sz = std::mem::size_of::<u32>() as u32;
+            (AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut sz, &mut v as *mut _ as *mut _) == 0).then_some(v)
+        };
+        let input_channels = |dev: AudioDeviceID| -> u32 {
+            let a = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyStreamConfiguration,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+            let mut sz: u32 = 0;
+            if AudioObjectGetPropertyDataSize(dev, &a, 0, std::ptr::null(), &mut sz) != 0 || sz == 0 {
+                return 0;
+            }
+            let mut buf = vec![0u8; sz as usize];
+            if AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut sz, buf.as_mut_ptr() as *mut _) != 0 {
+                return 0;
+            }
+            let abl = &*(buf.as_ptr() as *const AudioBufferList);
+            std::slice::from_raw_parts(abl.mBuffers.as_ptr(), abl.mNumberBuffers as usize)
+                .iter()
+                .map(|b| b.mNumberChannels)
+                .sum()
+        };
+        let dev_name = |dev: AudioDeviceID| -> Option<String> {
+            let a = AudioObjectPropertyAddress {
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+            let mut cf: CFStringRef = std::ptr::null();
+            let mut sz = std::mem::size_of::<CFStringRef>() as u32;
+            if AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut sz, &mut cf as *mut _ as *mut _) != 0
+                || cf.is_null()
+            {
+                return None;
+            }
+            let mut buf = [0i8; 256];
+            let ok = CFStringGetCString(cf, buf.as_mut_ptr(), buf.len() as CFIndex, kCFStringEncodingUTF8) != 0;
+            CFRelease(cf as *const _);
+            ok.then(|| std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+        };
+        let mut best: Option<(u32, String)> = None; // (rank: 0=内置 1=其它, name)
+        for dev in ids {
+            if input_channels(dev) == 0 {
+                continue;
+            }
+            let Some(t) = prop_u32(dev, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal) else { continue };
+            if t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE {
+                continue;
+            }
+            // 聚合/虚拟设备不作候选:名义上有输入,实际路由不明,自动换上去反而坑人。
+            if t == kAudioDeviceTransportTypeAggregate || t == kAudioDeviceTransportTypeVirtual {
+                continue;
+            }
+            let Some(name) = dev_name(dev) else { continue };
+            let rank = if t == kAudioDeviceTransportTypeBuiltIn { 0 } else { 1 };
+            if best.as_ref().map_or(true, |(r, _)| rank < *r) {
+                let done = rank == 0;
+                best = Some((rank, name));
+                if done {
+                    break;
+                }
+            }
+        }
+        best.map(|(_, n)| n)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pick_non_bluetooth_input() -> Option<String> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn default_output_is_bluetooth() -> bool {
     false

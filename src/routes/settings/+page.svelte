@@ -157,6 +157,7 @@
   let langChoice = $state("system");
   /** 设置开关的本地镜像(为什么用本地 state 见上方注释)。 */
   let langFilter = $state(false);
+  let autoInputPick = $state(true);
   let audioScheme = $state<"a" | "ab" | "b">("a");
   let audioRetention = $state<"forever" | "90d" | "30d">("forever");
   let calendarMatch = $state(true);
@@ -305,6 +306,7 @@
     themeChoice = s.theme;
     langChoice = s.ui_lang;
     langFilter = s.language_filter;
+    autoInputPick = s.auto_input_pick;
     audioScheme = s.audio_scheme;
     audioRetention = s.audio_retention;
     calendarMatch = s.calendar_match_enabled;
@@ -1467,6 +1469,19 @@
               bind:checked={langFilter}
               disabled={!settings}
               onchange={() => saveSetting((s) => (s.language_filter = langFilter))}
+            />
+          </label>
+          <label class="row">
+            <div class="row-info">
+              <span class="row-label">{t("settings.record.autoInput.label")}</span>
+              <span class="row-desc">{t("settings.record.autoInput.desc")}</span>
+            </div>
+            <input
+              type="checkbox"
+              class="ctl switch"
+              bind:checked={autoInputPick}
+              disabled={!settings}
+              onchange={() => saveSetting((s) => (s.auto_input_pick = autoInputPick))}
             />
           </label>
           <label class="row">
