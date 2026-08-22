@@ -2052,12 +2052,18 @@
           <button class="link" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</button>
         </div>
       {/if}
-      {#if openMultiOps.length > 0 && !multiPanel && openMultiOps.some((o) => o.phase !== "done")}
+      {#if openMultiOps.length > 0 && !multiPanel && !autoSplitRunning && openMultiOps.some((o) => o.phase !== "done")}
         <div class="banner">
           {t("speakers.multi.resume")}
           <button
             class="link"
-            onclick={() => (multiPanel = { candidates: openMultiOps[0].speaker_ids, existingOp: openMultiOps[0] })}
+            onclick={() => {
+              const op = openMultiOps[0];
+              // 单说话人 op 走一键续跑(带进度,人话);多说话人是旧面板时代的遗留,
+              // 只有它才回到面板。
+              if (op.speaker_ids.length === 1) runAutoSplit(op.speaker_ids[0]);
+              else multiPanel = { candidates: op.speaker_ids, existingOp: op };
+            }}
           >
             {t("speakers.multi.resumeOpen")}
           </button>
