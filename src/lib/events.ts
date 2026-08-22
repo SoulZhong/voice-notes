@@ -121,6 +121,12 @@ export type AingProgressEvent = {
   total: number;
   avg_chunk_ms: number;
 };
+/** 一键拆分的逐段嵌入进度(auto_split_progress):区分「在算」与「卡死」。 */
+export type AutoSplitProgressEvent = { note_id: string; done: number; total: number };
+export function onAutoSplitProgress(cb: (e: AutoSplitProgressEvent) => void) {
+  return listen<AutoSplitProgressEvent>("auto_split_progress", (ev) => cb(ev.payload));
+}
+
 export function onAingProgress(cb: (e: AingProgressEvent) => void) {
   return listen<AingProgressEvent>("aing_progress", (ev) => cb(ev.payload));
 }

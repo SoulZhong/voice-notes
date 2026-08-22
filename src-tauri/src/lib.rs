@@ -4622,7 +4622,21 @@ async fn suggest_split_groups(app: AppHandle, op_id: String) -> Result<SplitSugg
         let tag = current_speaker_model(&app);
         let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
             .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
-        let embs = refine::embed_all(&dir, &segs, &mut embedder).map_err(|e| e.to_string())?;
+        // 进度事件:大簇逐段嵌入要数分钟,前端横幅靠它区分「在算」与「卡死」。
+        // 每 10 段发一次 + 首尾各一次,避免事件风暴。
+        let note_id_ev = op.note_id.clone();
+        let app_ev = app.clone();
+        let total_hint = segs.len();
+        let embs = refine::embed_all_with_progress(&dir, &segs, &mut embedder, &|done, total| {
+            if done == 1 || done == total || done % 10 == 0 {
+                let _ = app_ev.emit(
+                    "auto_split_progress",
+                    serde_json::json!({ "note_id": note_id_ev, "done": done, "total": total }),
+                );
+            }
+        })
+        .map_err(|e| e.to_string())?;
+        let _ = total_hint;
         let inputs: Vec<refine::recluster::SegInput> = segs
             .iter()
             .map(|s| refine::recluster::SegInput {
@@ -5121,18 +5135,64 @@ async fn auto_split_speaker(
     if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
         return Err(tr!("该笔记正在 Aing 中,稍后再试", "This note is being refined; try again later"));
     }
-    // ① 打标(隔离/作废建议/清关联,记录 prior_links 快照)。
-    let op_id = mark_speaker_multi(app.clone(), note_id.clone(), vec![speaker_id.clone()])?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    // 断点续跑:同一说话人已有未完成 op(嵌入中途被重启杀掉是常态,实测一天两单)
+    // 就接着跑,绝不另起炉灶——重复 mark 会叠出第二个 op,隔离悬置、账目成灾。
+    use store::split_ops::phase as ph;
+    let existing = store::split_ops::open_ops_for_note(&root, &note_id)
+        .into_iter()
+        .find(|o| o.speaker_ids == vec![speaker_id.clone()] && o.undone_at.is_none());
+    // ① 打标(隔离/作废建议/清关联,记录 prior_links 快照)。PLAN 态的 op 由 mark
+    //    自身复用推进。
+    let op_id = match &existing {
+        Some(o) if o.phase != ph::PLAN => o.op_id.clone(),
+        _ => mark_speaker_multi(app.clone(), note_id.clone(), vec![speaker_id.clone()])?,
+    };
     // ② 样本自动清理:零勾选=只删「可归因到本篇被标簇」的样本(receipt 证据),
     //    来源未知的一律保留——比旧流程让用户凭试听勾删更保守。
-    confirm_multi_samples(app.clone(), op_id.clone(), Vec::new(), true)?;
+    let cur = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if cur.phase == ph::MARKED {
+        confirm_multi_samples(app.clone(), op_id.clone(), Vec::new(), true)?;
+    }
     // ③ 残留默认「接受」:零损失、立即可用,小偏差随后续录音按加权稀释。
-    resolve_multi_residual(app.clone(), op_id.clone(), "accept".into(), true).await?;
-    // ④ 声纹分组。
-    let sug = suggest_split_groups(app.clone(), op_id.clone()).await?;
-    let root = data_root(&app).map_err(|e| e.to_string())?;
+    let cur = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if cur.phase == ph::SAMPLES_HANDLED {
+        resolve_multi_residual(app.clone(), op_id.clone(), "accept".into(), true).await?;
+    }
     let nroot = notes_dir(&app).map_err(|e| e.to_string())?;
     let nstore = store::NoteStore::new(nroot);
+    // 已过计划期(占号/改派/回灌/释放中断):不重新分组,直接把既有计划跑到头。
+    let cur = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+    if matches!(cur.phase.as_str(), p if p == ph::RESERVED || p == ph::SEGMENTS_REASSIGNED || p == ph::REENROLLED || p == ph::RELEASED)
+    {
+        let enroll_notes = commit_split(app.clone(), op_id.clone(), Vec::new()).await?;
+        if !enroll_notes.is_empty() {
+            eprintln!("auto_split({op_id}): {enroll_notes}");
+        }
+        let op = store::split_ops::load(&root, &op_id).map_err(|e| e.to_string())?;
+        let out_groups: Vec<AutoSplitGroupOut> = op
+            .plan_groups
+            .iter()
+            .filter(|pg| pg.dest_kind == "new_speaker")
+            .filter_map(|pg| {
+                pg.dest_speaker.clone().map(|sid| AutoSplitGroupOut {
+                    speaker_id: sid,
+                    count: pg.seqs.len() as u32,
+                    dur_ms: 0,
+                    hint: None,
+                })
+            })
+            .collect();
+        let kept = op
+            .plan_groups
+            .iter()
+            .filter(|pg| pg.dest_kind == "keep")
+            .map(|pg| pg.seqs.len() as u32)
+            .sum();
+        return Ok(AutoSplitOut { op_id, split: true, groups: out_groups, kept });
+    }
+    // ④ 声纹分组。
+    let sug = suggest_split_groups(app.clone(), op_id.clone()).await?;
     // ⑤ 只有一组(或全是判不准):不硬拆。取消(解除隔离)并恢复本篇原状。
     if sug.groups.len() <= 1 {
         cancel_split(app.clone(), op_id.clone())?;
