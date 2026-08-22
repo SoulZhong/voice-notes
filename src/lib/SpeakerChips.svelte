@@ -310,13 +310,25 @@
             {:else}
               {#if !editingDirty}
                 {#if onPreview}
-                  <button class="row" onclick={() => onPreview(id)}>
-                    <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M5 3.5v9l7.5-4.5z" />
-                    </svg>
-                    {t("speakers.chipPreview")}
-                    {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
-                  </button>
+                  {#if counts && !counts[id]}
+                    <!-- 名下已无段落(如拆分后清空的原始说话人):试听无物可放,静默
+                         没反应会被当成坏了(2026-08-22 用户实测)——置灰并说明白。 -->
+                    <div class="row row-off">
+                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M5 3.5v9l7.5-4.5z" />
+                      </svg>
+                      {t("speakers.chipPreview")}
+                      <span class="row-sub">{t("speakers.chipPreviewEmpty")}</span>
+                    </div>
+                  {:else}
+                    <button class="row" onclick={() => onPreview(id)}>
+                      <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M5 3.5v9l7.5-4.5z" />
+                      </svg>
+                      {t("speakers.chipPreview")}
+                      {#if previewingId === id}<span class="row-sub">{t("speakers.chipPreviewPlaying")}</span>{/if}
+                    </button>
+                  {/if}
                 {/if}
                 <button class="row" onclick={() => markAsMe(id)}>
                   <svg class="row-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
@@ -562,5 +574,12 @@
     color: var(--ink-faint);
     font-size: 0.72rem;
     flex: none;
+  }
+  .row-off {
+    opacity: 0.45;
+    cursor: default;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 </style>
