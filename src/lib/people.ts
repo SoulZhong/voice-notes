@@ -39,6 +39,10 @@ export const mergePerson = (loser: string, winner: string) =>
   invoke<string>("merge_person", { loser, winner });
 export const deletePerson = (id: string) => invoke<void>("delete_person", { id });
 /** 删除一份录音样本(试听纠错;样本不参与识别)。path 须取自该人的 sample_paths。 */
+/** 按样本重建声纹(2026-08-23 污染修复):删掉坏样本后从剩余样本重算质心,
+    历史回灌污染整体清除。 */
+export const rebuildPersonVoiceprint = (id: string) =>
+  invoke<void>("rebuild_person_voiceprint", { id });
 export const deletePersonSample = (id: string, path: string) =>
   invoke<void>("delete_person_sample", { id, path });
 
