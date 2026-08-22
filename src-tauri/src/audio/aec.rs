@@ -17,6 +17,22 @@
 use std::sync::Arc;
 use webrtc_audio_processing::{config, Config, Processor};
 
+/// 最新 AEC3 erle(毫 dB;i32::MIN=尚无读数)。场景传感器跨线程读取。
+static LATEST_ERLE_MILLI_DB: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+fn publish_erle(erle: Option<f64>) {
+    let v = erle
+        .filter(|x| x.is_finite())
+        .map(|x| (x * 1000.0) as i32)
+        .unwrap_or(i32::MIN);
+    LATEST_ERLE_MILLI_DB.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn latest_erle_db() -> Option<f32> {
+    let v = LATEST_ERLE_MILLI_DB.load(std::sync::atomic::Ordering::Relaxed);
+    (v != i32::MIN).then(|| v as f32 / 1000.0)
+}
+
+
 /// 10ms @ 16kHz。Processor::new(16000) 的帧长与之一致(num_samples_per_frame)。
 const FRAME: usize = 160;
 
@@ -218,6 +234,9 @@ impl AecCapture {
                         "AEC3 stats: delay {:?}ms erl {:?} erle {:?} (预对齐扣压不计入)",
                         s.delay_ms, s.echo_return_loss, s.echo_return_loss_enhancement
                     );
+                    // 场景传感器共享(2026-08-23 一期):最新 erle 以毫 dB 原子量导出,
+                    // session 侧判「外放(收敛)vs 同源双路(收不敛)」用。
+                    publish_erle(s.echo_return_loss_enhancement);
                 }
             }
         }
@@ -449,6 +468,7 @@ mod tests {
     #[test]
     fn aligned_pair_cancels_600ms_echo_after_adjustment() {
         use crate::audio::delay_estimate::tests::block_modulated_noise;
+
         let (mut r, mut c, align) = new_aligned_pair(16_000, 0).unwrap();
         let mut seed = 77u64;
         let far = block_modulated_noise(16_000 * 45, &mut seed); // 45s

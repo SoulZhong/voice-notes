@@ -363,6 +363,10 @@ export const assignNoteSpeakerPerson = (
 
     **不连带撤销这次关联带来的声纹回灌**:库里那个人会多留一段本不该有的样本。
     见 docs/superpowers/specs/2026-08-19-voiceprint-model-space-design.md「配套」一节。 */
+/** 场景判定结果(scene.json;无判定返回 null)。 */
+export type SceneDoc = { schema_version: number; windows: { start_ms: number; end_ms: number; scene: string }[]; final_scene: string };
+export const getScene = (noteId: string) => invoke<SceneDoc | null>("get_scene", { noteId });
+
 export const clearNoteSpeakerPerson = (noteId: string, speakerId: string) =>
   invoke<void>("clear_note_speaker_person", { noteId, speakerId });
 

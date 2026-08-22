@@ -318,6 +318,19 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                     },
                 );
             }
+            crate::session::DiarEvent::SceneHint { scene } => {
+                // 场景判定稳定切换(2026-08-23 一期):录制页非阻断提示,不动行为。
+                let _ = app.emit(
+                    "scene_hint",
+                    serde_json::json!({ "note_id": owned.writer.note_id(), "scene": scene }),
+                );
+            }
+            crate::session::DiarEvent::SceneReport(doc) => {
+                // 整场场景时间线落盘(scene.json 为独立新文件,仅本线程写,无写者竞争)。
+                if let Err(e) = crate::scene::save(owned.writer.dir(), &doc) {
+                    eprintln!("scene.json 写入失败(忽略,纯观测数据): {e}");
+                }
+            }
             crate::session::DiarEvent::EchoRetract { start_ms, end_ms, text } => {
                 // 已放行的 mic 回声段被 system 定稿追认:磁盘删行 + 通知前端撤回显示。
                 // 时间戳已在回调侧加续录偏移(与 on_final 同口径),此处不再加。落盘

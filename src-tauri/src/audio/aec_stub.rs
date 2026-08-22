@@ -58,3 +58,8 @@ impl AecCapture {
         Vec::new()
     }
 }
+
+/// 同形 API(见 aec.rs):Windows 无 AEC,恒无读数。
+pub fn latest_erle_db() -> Option<f32> {
+    None
+}
