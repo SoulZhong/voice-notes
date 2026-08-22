@@ -11,6 +11,7 @@ export type SplitOp = {
   phase: string; // plan|marked|samples_handled|residual_decided|released|done
   residual_choice?: string | null;
   samples_confirm_seen: boolean;
+  undone_at?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -30,6 +31,9 @@ export const autoSplitSpeaker = (noteId: string, speakerId: string) =>
   invoke<AutoSplitOut>("auto_split_speaker", { noteId, speakerId });
 /** 一键拆分撤销:段落原路搬回(纯笔记级;段落被后续编辑动过会拒绝)。 */
 export const undoAutoSplit = (opId: string) => invoke<void>("undo_auto_split", { opId });
+/** 最近一次可撤销的拆分(结果横幅关掉后的撤销入口)。 */
+export const latestUndoableSplit = (noteId: string) =>
+  invoke<SplitOp | null>("latest_undoable_split", { noteId });
 
 export type MultiImpactSample = {
   path: string;

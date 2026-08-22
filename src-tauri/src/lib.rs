@@ -5335,6 +5335,17 @@ fn undo_auto_split(app: AppHandle, state: State<AppState>, op_id: String) -> Res
     Ok(())
 }
 
+/// 最近一次可撤销的拆分(结果横幅关掉后的撤销入口)。纯读。
+#[tauri::command]
+fn latest_undoable_split(
+    app: AppHandle,
+    note_id: String,
+) -> Result<Option<store::split_ops::SplitOp>, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let root = data_root(&app).map_err(|e| e.to_string())?;
+    Ok(store::split_ops::latest_undoable_for_note(&root, &note_id))
+}
+
 #[tauri::command]
 fn list_split_ops(app: AppHandle, note_id: String) -> Result<Vec<store::split_ops::SplitOp>, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -9880,6 +9891,7 @@ pub fn run() {
             cancel_split,
             auto_split_speaker,
             undo_auto_split,
+            latest_undoable_split,
             confirm_multi_samples,
             resolve_multi_residual,
             list_split_ops,

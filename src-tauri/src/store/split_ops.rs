@@ -142,6 +142,22 @@ pub fn open_ops_for_note(root: &Path, note_id: &str) -> Vec<SplitOp> {
     out
 }
 
+/// 最近一次已完成且未撤销的拆分(撤销入口用):结果横幅被关掉后,撤销必须仍有
+/// 处可寻(2026-08-22 一键拆分)。
+pub fn latest_undoable_for_note(root: &Path, note_id: &str) -> Option<SplitOp> {
+    let rd = std::fs::read_dir(ops_dir(root)).ok()?;
+    rd.flatten()
+        .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+        .filter_map(|s| serde_json::from_str::<SplitOp>(&s).ok())
+        .filter(|o| {
+            o.note_id == note_id
+                && o.phase == phase::DONE
+                && o.undone_at.is_none()
+                && o.mode == "split_commit"
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
 /// 带锁推进(命令层便捷入口)。
 pub fn advance_guarded(
     store: &super::VoiceprintStore,

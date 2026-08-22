@@ -63,7 +63,7 @@
   import { aiSkipHint } from "$lib/aiSkipHint";
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
-  import { autoSplitSpeaker, undoAutoSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
+  import { autoSplitSpeaker, undoAutoSplit, latestUndoableSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -658,6 +658,7 @@
       refresh();
       recording.bumpNotes();
       void refreshMultiOps();
+      void refreshUndoable();
     }
   }
   async function undoSplitToast() {
@@ -674,6 +675,32 @@
 
   /** 各说话人最近试听过的段 seq(「确认才入库」:关联时把这一段作为确认样本)。 */
   let lastAuditioned = $state<Record<string, number>>({});
+
+  /** 最近一次可撤销拆分(24h 内;结果横幅关掉后撤销仍有处可寻)。本页会话内可忽略。 */
+  let undoableSplit = $state<SplitOp | null>(null);
+  let undoableDismissed = $state(false);
+  $effect(() => {
+    void id;
+    undoableDismissed = false;
+    void refreshUndoable();
+  });
+  async function refreshUndoable() {
+    const op = await latestUndoableSplit(id).catch(() => null);
+    undoableSplit =
+      op && Date.now() - new Date(op.created_at).getTime() < 24 * 3600_000 ? op : null;
+  }
+  async function undoLatestSplit() {
+    if (!undoableSplit) return;
+    try {
+      await undoAutoSplit(undoableSplit.op_id);
+      autoToast = { kind: "undone" };
+      undoableSplit = null;
+    } catch (e) {
+      autoToast = { kind: "error", msg: `${e}` };
+    }
+    refresh();
+    recording.bumpNotes();
+  }
   /** 拆分面板的段试听:独奏该段所在轨、seek、播到段尾自动停(复用 preview 机制)。 */
   function auditionSegment(seq: number) {
     const seg = note?.segments.find((s) => s.seq === seq);
@@ -2050,6 +2077,13 @@
             {t("speakers.autosplit.failed", { e: autoToast.msg })}
           {/if}
           <button class="link" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</button>
+        </div>
+      {/if}
+      {#if !autoSplitRunning && !autoToast && undoableSplit && !undoableDismissed}
+        <div class="banner">
+          {t("speakers.autosplit.undoableNotice")}
+          <button class="link" onclick={undoLatestSplit}>{t("speakers.autosplit.undo")}</button>
+          <button class="link" onclick={() => (undoableDismissed = true)}>{t("speakers.autosplit.dismiss")}</button>
         </div>
       {/if}
       {#if openMultiOps.length > 0 && !multiPanel && !autoSplitRunning && openMultiOps.some((o) => o.phase !== "done")}
