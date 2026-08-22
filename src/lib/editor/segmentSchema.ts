@@ -73,7 +73,7 @@ export type SegmentViewCallbacks = {
   speakerBadge: (attrs: Record<string, unknown>) => { label: string; bg: string; ink: string };
   formatTs: (ms: number) => string;
   canEdit: () => boolean;
-  onBadgeClick: (seq: number, speaker: string | null, source: Source, rect: DOMRect) => void;
+  onBadgeClick: (seq: number, speaker: string | null, source: Source, rect: DOMRect, shiftKey: boolean) => void;
   onPlayFrom: (startMs: number) => void;
   onDeleteClick: (seq: number, rect: DOMRect) => void;
 };
@@ -106,6 +106,7 @@ export function makeSegmentView(cb: SegmentViewCallbacks) {
           cur.attrs.speaker as string | null,
           cur.attrs.source as Source,
           badge.getBoundingClientRect(),
+          e.shiftKey,
         );
     };
     const ts = document.createElement("button");

@@ -36,6 +36,7 @@
     editSegment,
     deleteSegment,
     setSegmentSpeaker,
+    setSegmentsSpeaker,
     clearNoteSpeakerPerson,
     noteAudioInfo,
     assignNoteSpeakerPerson,
@@ -65,6 +66,8 @@
   import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
   import { autoSplitSpeaker, undoAutoSplit, latestUndoableSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
   import NoticeStrip from "$lib/NoticeStrip.svelte";
+  import SegSpeakerPop from "$lib/SegSpeakerPop.svelte";
+  import { contiguousRun, seqRange } from "$lib/segPick";
   import type { Notice } from "$lib/notices";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
@@ -1712,6 +1715,73 @@
     }
   }
 
+  /** 批量改派(甲作用范围/乙勾选共用):moves 逐段带 expected_text CAS。 */
+  async function doSetSpeakerBatch(seqs: number[], speakerId: string) {
+    segMenuPop = null;
+    if (!canEdit || seqs.length === 0) return;
+    const bySeq = new Map((note?.segments ?? []).map((s) => [s.seq, s]));
+    const moves: [number, string][] = [];
+    for (const q of seqs) {
+      const seg = bySeq.get(q);
+      if (seg) moves.push([q, seg.text]);
+    }
+    try {
+      if (moves.length === 1) {
+        await setSegmentSpeaker(id, moves[0][0], moves[0][1], speakerId);
+      } else {
+        await setSegmentsSpeaker(id, moves, speakerId);
+      }
+      await refresh();
+      syncSegments(true);
+    } catch (e) {
+      error = t("notes.detail.setSpeakerFailed", { e });
+      await refresh();
+      syncSegments(true);
+    }
+  }
+
+  // ── 乙:勾选多段模式(2026-08-22 批量改说话人) ──
+  let selMode = $state(false);
+  let selected = $state<number[]>([]);
+  let lastSel: number | null = null;
+  let selPick = $state<DOMRect | null>(null);
+  function exitSelMode() {
+    selMode = false;
+    selected = [];
+    lastSel = null;
+    selPick = null;
+  }
+  function toggleSel(seq: number, shiftKey: boolean) {
+    if (shiftKey && lastSel !== null) {
+      const range = seqRange(displaySegments, lastSel, seq);
+      selected = [...new Set([...selected, ...range])];
+    } else if (selected.includes(seq)) {
+      selected = selected.filter((q) => q !== seq);
+    } else {
+      selected = [...selected, seq];
+    }
+    lastSel = seq;
+  }
+  // 勾选视觉:直接给编辑器 DOM 的 .md-seg 上/撤 sel-on 类(编辑器重建后由
+  // displaySegments 依赖触发重涂;v1 取巧但零编辑器改造)。
+  $effect(() => {
+    void displaySegments;
+    const on = new Set(selMode ? selected : []);
+    const host = transcriptEl;
+    if (!host) return;
+    requestAnimationFrame(() => {
+      for (const el of host.querySelectorAll<HTMLElement>(".md-seg")) {
+        el.classList.toggle("sel-on", on.has(Number(el.dataset.seq)));
+      }
+    });
+  });
+  async function applySelPick(sid: string) {
+    const seqs = [...selected];
+    selPick = null;
+    await doSetSpeakerBatch(seqs, sid);
+    exitSelMode();
+  }
+
   /** note.segments → 编辑器文档重建。默认受 hasFocus() 守卫(常驻编辑态不打断
       正在输入)。force=true:调用方是用户刚下的离散命令(删段/改说话人/Esc 放弃/
       冲突回滚)——WKWebView(macOS 实际运行时)下点悬浮菜单按钮不转移焦点,
@@ -2292,8 +2362,12 @@
             editable={canEdit && displaySegments.length > 0}
             speakerBadge={segBadge}
             onEditSegment={doEditSegment}
-            onBadgeClick={(attrs, rect) => {
+            onBadgeClick={(attrs, rect, shiftKey) => {
               if (!canEdit) return;
+              if (selMode) {
+                toggleSel(attrs.seq!, shiftKey ?? false);
+                return;
+              }
               // WKWebView 焦点语义保险:点悬浮菜单按钮不像 Chromium 那样把焦点从编辑
               // 宿主夺走,focusout 不触发,段内未提交的文字进不了 commitSegment,随后
               // 命令路径的 syncSegments(true) 整份重建会把它静默吹掉。这里显式 blur
@@ -2318,29 +2392,65 @@
     </div>
 
     {#if segMenuPop && note}
-      <!-- 原始稿说话人浮层:锚定被点击徽章的屏幕矩形,与 entity-pop/refinedBadgePop
-           同一套 position:fixed 套路;菜单项复用旧版 badge-menu 的按钮结构与样式。 -->
-      <div
-        class="badge-menu floating"
-        style="position: fixed; left: {segMenuPop.rect.left}px; top: {segMenuPop.rect.bottom + 4}px;"
-      >
-        {#each speakerIds as sid (sid)}
-          <!-- 当前说话人标出来并禁点:点"已经是这一位"什么都不会发生,而没有任何提示的
-               无反馈正是 2026-08-19 那条「换说话人无效」的一半——用户以为功能坏了,
-               实际上是他点了个空操作。 -->
-          <button
-            class="menu-item"
-            class:current={sid === segMenuSpeaker}
-            disabled={sid === segMenuSpeaker}
-            onclick={() => doSetSpeaker(segMenuPop!.seq, sid)}
-          >
-            {speakerLabel(sid, "mic", note.speakers)}
-            {#if sid === segMenuSpeaker}<span class="menu-note">{t("notes.menu.current")}</span>{/if}
-          </button>
-        {/each}
-        <button class="menu-item new" onclick={() => doSetSpeaker(segMenuPop!.seq, "new")}>{t("notes.menu.newSpeaker")}</button>
-        <button class="menu-item" onclick={() => (segMenuPop = null)}>{t("notes.cancel")}</button>
+      <!-- 段落说话人选择弹窗(2026-08-22 批量化):与胸牌菜单同一套视觉;
+           甲=作用范围单选(仅这段/连续同说话人/该说话人全部),乙=「勾选多段…」入口。 -->
+      {@const runN = contiguousRun(displaySegments, segMenuPop.seq).length}
+      {@const allN = segMenuSpeaker ? displaySegments.filter((sg) => sg.speaker === segMenuSpeaker).length : 1}
+      <SegSpeakerPop
+        speakers={note.speakers}
+        currentSid={segMenuSpeaker}
+        counts={segCounts}
+        rect={segMenuPop.rect}
+        scopes={[
+          { key: "one", label: t("notes.segpick.scopeOne"), n: 1 },
+          { key: "run", label: t("notes.segpick.scopeRun", { n: runN }), n: runN },
+          { key: "all", label: t("notes.segpick.scopeAll", { n: allN }), n: allN },
+        ]}
+        showMultiEntry={true}
+        onEnterMulti={() => {
+          const seq = segMenuPop!.seq;
+          segMenuPop = null;
+          selMode = true;
+          selected = [seq];
+          lastSel = seq;
+        }}
+        onPick={(sid, scope) => {
+          const seq = segMenuPop!.seq;
+          const seqs =
+            scope === "run"
+              ? contiguousRun(displaySegments, seq)
+              : scope === "all" && segMenuSpeaker
+                ? displaySegments.filter((sg) => sg.speaker === segMenuSpeaker).map((sg) => sg.seq)
+                : [seq];
+          void doSetSpeakerBatch(seqs, sid);
+        }}
+        onClose={() => (segMenuPop = null)}
+      />
+    {/if}
+    {#if selMode}
+      <div class="sel-bar">
+        <span>{t("notes.segpick.selectedN", { n: selected.length })}</span>
+        <button
+          class="link"
+          disabled={selected.length === 0}
+          onclick={(e) => (selPick = (e.currentTarget as HTMLElement).getBoundingClientRect())}
+        >
+          {t("notes.segpick.changeTo")}
+        </button>
+        <button class="link" disabled={selected.length === 0} onclick={() => (selected = [])}>{t("notes.segpick.clearSel")}</button>
+        <button class="link" onclick={exitSelMode}>{t("notes.segpick.exitSel")}</button>
       </div>
+    {/if}
+    {#if selPick && note}
+      <SegSpeakerPop
+        speakers={note.speakers}
+        currentSid={null}
+        counts={segCounts}
+        rect={selPick}
+        scopes={null}
+        onPick={(sid) => void applySelPick(sid)}
+        onClose={() => (selPick = null)}
+      />
     {/if}
     {#if multiPanel && note}
       <MultiSpeakerPanel
@@ -3077,22 +3187,9 @@
     font-size: 0.8em;
     padding: 0.15em 0.4em;
   }
-  .menu-item.new {
-    font-weight: 500;
-  }
   /* 破坏性菜单项(段删除确认)与 .link.danger 同一色钩:红字提示不可撤销。 */
   .menu-item.danger {
     color: var(--danger);
-  }
-  /* 当前说话人:退成次要色 + 不可点(它是状态展示,不是可选动作),光标不给手型。 */
-  .menu-item.current {
-    color: var(--ink-secondary);
-    cursor: default;
-  }
-  .menu-note {
-    color: var(--ink-faint);
-    font-size: 0.9em;
-    margin-left: 0.25em;
   }
   /* speaker-badge：soft 底 + 内联配对文字色、rounded-sm、micro 字级
      （底色与文字色均由内联 style 按说话人取，此处不设默认 color——设了也恒被覆盖）。
@@ -3257,5 +3354,27 @@
   .cal-item .cal-time {
     opacity: 0.6;
     white-space: nowrap;
+  }
+  /* 勾选多段(乙):选中段高亮 + 底部浮条 */
+  :global(.md-seg.sel-on) {
+    outline: 2px solid rgba(90, 160, 255, 0.65);
+    outline-offset: 1px;
+    border-radius: 6px;
+  }
+  .sel-bar {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 18px;
+    z-index: 55;
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    background: var(--pop-bg, #1c1e22);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 13px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
   }
 </style>

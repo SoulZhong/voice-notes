@@ -138,6 +138,8 @@ pub enum EditOp {
     EditText { id: String, seq: u64, expected_text: String, new_text: String },
     DeleteSegment { id: String, seq: u64, expected_text: String },
     SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },
+    /// 批量改派(2026-08-22):同目标一次改一批;"new" 整批共享一个新号。
+    SetSegmentsSpeaker { id: String, moves: Vec<(u64, String)>, speaker_id: String },
     /// 打「多人混杂」标(附带清 person_id)。库侧隔离由命令层先行,见 mark_speaker_multi。
     SetMultiSpeaker { id: String, speaker_id: String },
     /// 拆分占号:创建空表项(带 op 所有权)。撞号整体失败。

@@ -7496,6 +7496,35 @@ fn delete_segment(
     })
 }
 
+/// 批量改派段落说话人(2026-08-22):同目标一次一批,逐段 expected_text CAS,任一
+/// 失配整体失败零写入;"new" 整批共享一个新号。录制中一律拒(批量场景本就来自
+/// 事后修正;live 路径的单段语义不外推)。
+#[tauri::command]
+fn set_segments_speaker(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    moves: Vec<(u64, String)>,
+    speaker_id: String,
+) -> Result<String, String> {
+    reject_if_active(&state, &note_id)?;
+    let first = moves.first().map(|(q, _)| *q);
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::SetSegmentsSpeaker {
+            id: note_id.clone(),
+            moves,
+            speaker_id,
+        },
+    })?;
+    // 与单段版同款:actor 回执收窄为 ()、终值(尤其 "new" 分配的号)靠重查取回。
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let note = store::NoteStore::new(dir).load(&note_id).map_err(|e| e.to_string())?;
+    first
+        .and_then(|q| note.segments.iter().find(|s| s.seq == q))
+        .and_then(|s| s.speaker.clone())
+        .ok_or_else(|| tr!("改派已生效但重查失败", "Applied, but re-query failed"))
+}
+
 #[tauri::command]
 fn set_segment_speaker(
     app: AppHandle,
@@ -9884,6 +9913,7 @@ pub fn run() {
             edit_segment,
             delete_segment,
             set_segment_speaker,
+            set_segments_speaker,
             pipeline_health,
             screen_capture_permission,
             request_screen_capture_permission,

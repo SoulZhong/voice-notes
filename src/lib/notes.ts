@@ -476,6 +476,10 @@ export const deleteSegment = (noteId: string, seq: number, expectedText: string)
 /** 返回实际生效的 speaker id（speakerId="new" 时为后端分配的新 id） */
 export const setSegmentSpeaker = (noteId: string, seq: number, expectedText: string, speakerId: string) =>
   invoke<string>("set_segment_speaker", { noteId, seq, expectedText, speakerId });
+/** 批量改派段落说话人(2026-08-22):同目标一批;"new" 整批共享一个新号;
+    逐段 expected_text CAS,任一失配整体失败零写入。返回终值说话人 id。 */
+export const setSegmentsSpeaker = (noteId: string, moves: [number, string][], speakerId: string) =>
+  invoke<string>("set_segments_speaker", { noteId, moves, speakerId });
 
 /** 说话人 id 排序：S2 < S10（数值序）；非 S<n> 形态沉底按字典序。 */
 export function speakerIdCompare(a: string, b: string): number {
