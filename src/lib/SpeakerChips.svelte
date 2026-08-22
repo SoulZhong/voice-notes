@@ -61,13 +61,6 @@
     onMarkMulti?: (id: string) => void;
   } = $props();
 
-  /** 声纹建议徽标(一键拆分产物):hint_person 在搭子列表里解析得到名字才显示。 */
-  const hintName = (id: string): string | null => {
-    const pid = speakers[id]?.hint_person;
-    if (!pid) return null;
-    return people?.find((p) => p.id === pid)?.name || null;
-  };
-
   let editingId = $state<string | null>(null);
   let editingName = $state("");
   /** 用户是否已敲过字:预填的现名不参与人物过滤(否则一打开列表就只剩自己)。 */
@@ -244,9 +237,6 @@
         {#if speakers[id]?.multi_speaker}
           <span class="multi-tag">{t("speakers.chipMultiTag")}</span>
         {/if}
-        {#if !speakers[id]?.person_id && hintName(id)}
-          <span class="multi-tag">{t("speakers.chipHint", { name: hintName(id)! })}</span>
-        {/if}
         {#if editable}
           <button
             class="name"
@@ -373,6 +363,7 @@
                   query={editingDirty ? editingName : ""}
                   onpick={(p) => commitPick(id, p.id)}
                   selectedId={speakers[id]?.person_id ?? null}
+                  hintId={speakers[id]?.hint_person ?? null}
                   emptyText={people.length === 0
                     ? t("speakers.noPeopleYet")
                     : t("speakers.noMatch")}

@@ -13,6 +13,7 @@
     onpick,
     emptyText = t("speakers.noMatch"),
     selectedId = null,
+    hintId = null,
   }: {
     people: PersonSummary[];
     /** 检索词(空串=全量);宿主决定何时把这个传成非空(改名输入/纯检索输入)。 */
@@ -24,9 +25,18 @@
     emptyText?: string;
     /** 当前已关联/已选中的人物 id(可选):命中行末尾加勾选标记。 */
     selectedId?: string | null;
+    /** 声纹建议的人物 id(可选):置顶并加「可能是」标。一键拆分产物的提示改放这里
+        ——选人时才需要建议,胸牌徽标已撤(2026-08-22 用户反馈)。 */
+    hintId?: string | null;
   } = $props();
 
-  const candidates = $derived(filterPeople(people.filter((p) => !excludeIds.includes(p.id)), query));
+  const candidates = $derived.by(() => {
+    const base = filterPeople(people.filter((p) => !excludeIds.includes(p.id)), query);
+    if (!hintId) return base;
+    const i = base.findIndex((p) => p.id === hintId);
+    if (i <= 0) return base;
+    return [base[i], ...base.slice(0, i), ...base.slice(i + 1)];
+  });
   const dups = $derived(dupNameSet(people));
 </script>
 
@@ -37,6 +47,7 @@
         <!-- 色点用 ink 变体:soft 底(15% alpha)做 9px 点几乎不可见 -->
         <span class="dot" style="background: {speakerInk(p.id, 'mic')}"></span>
         <span class="row-label">{personLabel(p)}</span>
+        {#if hintId === p.id}<span class="hint-tag">{t("speakers.menuHint")}</span>{/if}
         {#if !p.name || dups.has(p.name)}
           <!-- 未命名/重名条目:补最近出现日期,两行不至于一模一样 -->
           <span class="row-sub">{recentLabel(p)}</span>
@@ -103,5 +114,13 @@
   .empty {
     padding: 0.38rem 0.55rem 0.45rem;
     color: var(--ink-faint);
+  }
+  .hint-tag {
+    font-size: 11px;
+    opacity: 0.75;
+    border: 1px solid currentColor;
+    border-radius: 8px;
+    padding: 0 6px;
+    margin-left: 6px;
   }
 </style>
