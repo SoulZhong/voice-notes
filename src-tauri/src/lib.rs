@@ -89,6 +89,9 @@ struct ActiveSession {
     /// 停录排干期间允许 `set_settings` 切模型——现读就会把 A 建的实例标成 B,下一场
     /// 核对通过、用 A 算出整场向量却以 B 写库(codex review 实现轮 P1)。
     speaker_model: String,
+    /// 本场自动改用的输入设备名(录前设备检查自动择优):默认输入是蓝牙通话麦时,
+    /// 本场 cpal 采集换成的内置/有线设备。空串=没换。重挂载重建横幅用。
+    input_override: String,
     /// 计时：会话入槽时刻、续录基线、暂停起点（Some=暂停中）、已累计暂停时长。
     started: std::time::Instant,
     base_ms: u64,
@@ -1278,7 +1281,7 @@ fn spawn_session(
             // 加载失败且确属当前代:running 已复位，托盘同步回 idle（过期线程在上面已提前
             // return，走不到这里，不会误把托盘打回 idle）。托盘不存在则内部静默跳过。
             tray::set_recording(app, false);
-            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0 });
+            let _ = app.emit("status", ipc::StatusEvent { state: msg, system_audio: String::new(), note_id: String::new(), diarization: String::new(), elapsed_ms: 0, input_override: String::new() });
             // P1 影子回报:仅当前代的启动失败走到这里(过期线程已提前 return),
             // 通知 actor 内核回到 Idle。后台线程投递,不等待(见 actor.rs 死锁注记②)。
             app.state::<lifecycle::LifecycleHandle>().report(lifecycle::machine::Msg::SessionFailed);
@@ -1398,16 +1401,39 @@ fn spawn_session(
         //    错误回调的后端,与 cpal 的 CaptureEvent 快路径互补。
         // 标定模式(calibration)下即便 vpio 档也不许走 VPIO——同一 Codex review Fix 4
         // 理由:Apple AEC 会把标定刺激的房间回声消掉,校准是唯一例外,不进设置系统。
+        // 录前设备检查自动择优(2026-08-22 设计):跟随系统默认的输入是蓝牙通话麦
+        // 且存在内置/有线替代 → 本场 cpal 采集直接绑定替代设备(不改系统设置,
+        // 不影响会议软件)。设置开关 auto_input_pick 可关;VPIO 逃生舱路径不覆盖
+        // (它由 Apple 通话链路自行管理设备)。
+        #[cfg(target_os = "macos")]
+        let input_override: Option<String> = if cfg.auto_input_pick
+            && (use_aec_capture || calibration)
+            && audio::default_input_is_bluetooth()
+        {
+            let picked = audio::pick_non_bluetooth_input();
+            if let Some(name) = &picked {
+                eprintln!("录前择优:默认输入是蓝牙通话麦,本场改用「{name}」采集");
+            }
+            picked
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let input_override_for_session = input_override.clone().unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let input_override_for_session = String::new();
         #[cfg(target_os = "macos")]
         let mic_factory: audio::resilient::CaptureFactory = if use_aec_capture || calibration {
             if calibration && !use_aec_capture {
                 eprintln!("[标定模式] AEC 已停用(本场)");
             }
-            Box::new(|| {
+            Box::new(move || {
                 let (etx, erx) = crossbeam_channel::unbounded();
                 (
-                    Box::new(audio::microphone::Microphone::with_events(etx))
-                        as Box<dyn AudioCapture>,
+                    Box::new(audio::microphone::Microphone::with_events_and_device(
+                        etx,
+                        input_override.clone(),
+                    )) as Box<dyn AudioCapture>,
                     erx,
                 )
             })
@@ -2288,6 +2314,7 @@ fn spawn_session(
                     system_audio: system_audio.clone(),
                     diarization: diarization.clone(),
                     speaker_model: speaker_model.clone(),
+                    input_override: input_override_for_session.clone(),
                     started: std::time::Instant::now(),
                     base_ms,
                     paused_at: None,
@@ -2302,7 +2329,7 @@ fn spawn_session(
                 drop(running_guard);
                 let _ = app.emit(
                     "status",
-                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms },
+                    ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms, input_override: input_override_for_session.clone() },
                 );
                 // P1 影子回报:会话已真实入槽并广播 recording,通知 actor 内核演进。
                 // 本回报来自后台加载线程,只投递不等待(见 actor.rs 死锁注记②)。
@@ -2581,7 +2608,7 @@ pub(crate) fn do_stop_tail(app: &AppHandle, note_id: String) {
     let state = app.state::<AppState>();
     let _ = app.emit(
         "status",
-        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0 },
+        ipc::StatusEvent { state: "stopped".into(), system_audio: String::new(), note_id, diarization: String::new(), elapsed_ms: 0, input_override: String::new() },
     );
     // 停录补预载：录制中下载完成的模型（预载被活跃跳过）此刻补进空槽；幂等，槽有货即跳。
     preload_models(app.clone(), state.session.clone(), state.recognizer_cache.clone(), state.embedder_cache.clone());
@@ -2640,11 +2667,17 @@ fn mic_mode() -> &'static str {
 /// 「提示不是门禁」的旧约定被推翻了一半——现在拦一次,但用户始终能选择继续
 /// (依据见 docs/superpowers/specs/2026-08-17-precord-risk-gate-design.md)。
 #[tauri::command]
-fn precheck_recording() -> Vec<precheck::RecordRisk> {
-    precheck::record_risks(
-        crate::audio::mic_mode::active(),
-        crate::audio::default_input_is_bluetooth(),
-    )
+fn precheck_recording(app: AppHandle) -> Vec<precheck::RecordRisk> {
+    let bt = crate::audio::default_input_is_bluetooth();
+    // 自动择优接管时蓝牙不再弹窗(开录时会真的换设备并出横幅);关了开关或没有
+    // 替代设备,风险如实照弹。
+    let auto = app
+        .path()
+        .app_data_dir()
+        .map(|d| settings::load(&d).auto_input_pick)
+        .unwrap_or(true);
+    let bt_effective = bt && !(auto && crate::audio::pick_non_bluetooth_input().is_some());
+    precheck::record_risks(crate::audio::mic_mode::active(), bt_effective)
 }
 
 /// 前端播放会话开/关的告知(与迷你浮层同源判定):托盘据此增删「停止播放」项。
@@ -2668,6 +2701,7 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
             note_id: s.note_id.clone(),
             diarization: s.diarization.clone(),
             elapsed_ms: s.elapsed_ms(),
+            input_override: s.input_override.clone(),
         },
         None => ipc::StatusEvent {
             state: "idle".into(),
@@ -2675,6 +2709,7 @@ fn recording_status(state: State<AppState>) -> ipc::StatusEvent {
             note_id: String::new(),
             diarization: String::new(),
             elapsed_ms: 0,
+            input_override: String::new(),
         },
     }
 }
@@ -2699,6 +2734,7 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
             note_id: s.note_id.clone(),
             diarization: s.diarization.clone(),
             elapsed_ms: s.elapsed_ms(),
+            input_override: s.input_override.clone(),
         }
     };
     let _ = app.emit("status", ev);
@@ -2734,6 +2770,7 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
             note_id: s.note_id.clone(),
             diarization: s.diarization.clone(),
             elapsed_ms: s.elapsed_ms(),
+            input_override: s.input_override.clone(),
         }
     };
     let _ = app.emit("status", ev);

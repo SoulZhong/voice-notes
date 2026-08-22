@@ -61,6 +61,8 @@ export const zh = {
   "settings.section.record": "录制",
   "settings.record.langFilter.label": "乱码过滤",
   "settings.record.langFilter.desc": "丢弃静音、噪声被误识别出的文字。多语种会议误伤时可关闭",
+  "settings.record.autoInput.label": "自动避开蓝牙麦克风",
+  "settings.record.autoInput.desc": "开录时若系统输入是蓝牙耳机麦(通话模式易断流),本场自动改用内置/有线麦克风录音,耳机继续用来听。只影响本应用,不改系统设置。",
   "settings.identifyAuto.label": "自动认出说话人",
   "settings.identifyAuto.desc": "high 档身份推断自动关联并回灌声纹(回执可撤销)。开启前请先用 speaker_eval 标注评测:high 档 ≥50 样本且误认 ≤1% 再开",
   "settings.calendar.label": "日历匹配",
@@ -270,6 +272,8 @@ export const en = {
   "settings.record.langFilter.label": "Garbled text filter",
   "settings.record.langFilter.desc":
     "Drops text falsely transcribed from silence or noise. Turn off if multilingual meetings are affected",
+  "settings.record.autoInput.label": "Avoid Bluetooth mic automatically",
+  "settings.record.autoInput.desc": "If the system input is a Bluetooth headset mic (call mode, prone to dropouts), each recording automatically uses the built-in/wired mic instead; the headset keeps playing audio. Only affects this app.",
   "settings.identifyAuto.label": "Auto-identify speakers",
   "settings.identifyAuto.desc": "Auto-link high-confidence identity inferences and reinforce voiceprints (undoable receipts). Before enabling, evaluate with speaker_eval: \u226550 high-tier samples with \u22641% misidentification",
   "settings.calendar.label": "Calendar matching",

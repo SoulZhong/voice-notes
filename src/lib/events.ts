@@ -19,6 +19,8 @@ export type StatusEvent = {
   note_id: string;
   diarization: Diarization;
   elapsed_ms: number;
+  /** 本场自动改用的输入设备名(录前设备检查自动择优);无则缺省/空。 */
+  input_override?: string;
 };
 export type StorageEvent = { state: "ok" | "degraded" };
 /** 追溯回声撤回:已上屏的 mic 段被 system 定稿追认为回声,应从 finals 移除匹配行。 */

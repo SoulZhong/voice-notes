@@ -28,6 +28,7 @@ export type SpeakerMap = Record<
 
 let status = $state("idle");
 let systemAudio = $state<SystemAudio>("");
+let inputOverride = $state("");
 let diarization = $state<Diarization>("");
 let noteId = $state("");
 let finals = $state<Line[]>([]);
@@ -60,6 +61,7 @@ let resuming = false;
 export const recording = {
   get status() { return status; },
   get systemAudio() { return systemAudio; },
+  get inputOverride() { return inputOverride; },
   get diarization() { return diarization; },
   get noteId() { return noteId; },
   get finals() { return finals; },
@@ -142,6 +144,7 @@ export const recording = {
         const isUnpause = e.note_id === noteId && (status === "recording" || status === "paused");
         status = e.state;
         systemAudio = e.system_audio;
+        inputOverride = e.input_override ?? "";
         diarization = e.diarization;
         paused = false;
         elapsedBaseMs = e.elapsed_ms;
@@ -172,6 +175,7 @@ export const recording = {
       } else if (e.state === "stopped" || e.state.startsWith("error:")) {
         status = e.state;
         systemAudio = e.system_audio;
+        inputOverride = "";
         diarization = e.diarization;
         resuming = false;
         paused = false;
@@ -216,6 +220,7 @@ export const recording = {
     if (s.state === "recording" || s.state === "paused") {
       status = s.state;
       systemAudio = s.system_audio;
+      inputOverride = s.input_override ?? "";
       diarization = s.diarization;
       noteId = s.note_id;
       paused = s.state === "paused";
@@ -248,6 +253,7 @@ export const recording = {
         if (s.state === "recording" || s.state === "paused") {
           status = s.state;
           systemAudio = s.system_audio;
+          inputOverride = s.input_override ?? "";
           diarization = s.diarization;
           noteId = s.note_id;
           paused = s.state === "paused";

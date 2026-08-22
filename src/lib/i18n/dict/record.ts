@@ -38,6 +38,7 @@ export const zh = {
   "record.banner.gapStormHow": "多见于蓝牙耳机麦克风与会议软件抢带宽。改法：麦克风换成内置麦或有线设备，蓝牙耳机只用来听。",
   "record.banner.gapStormSystem": "系统声音采集正在频繁断流：近一分钟有 {pct}% 的时长没有收到音频。对方说的话可能有缺失。",
   "record.risk.title": "这样录会丢内容",
+  "record.inputAutoPicked": "蓝牙耳机的麦克风容易断流,本场已自动改用「{device}」录音;耳机继续用来听。想关掉自动切换,去设置。",
   "record.risk.body": "检测到下面的问题。现在改还来得及；已经开会了也可以先录，损失如实记在笔记的对账里。",
   "record.risk.voice_isolation.title": "系统「语音突显」开着",
   "record.risk.voice_isolation.impact": "它会把它认为不是人声的部分削成绝对静音，判错时连人声一起削。实测有场录音因此丢了近两成语音。",
@@ -131,6 +132,7 @@ export const en = {
   "record.banner.gapStormSystem":
     "System audio capture keeps dropping out: {pct}% of the last minute arrived with no audio. Parts of what the other side said may be missing.",
   "record.risk.title": "This recording will lose content",
+  "record.inputAutoPicked": "Bluetooth headset mics drop audio; this session automatically records with \u201c{device}\u201d instead. Your headset still plays audio. Disable auto-switch in Settings.",
   "record.risk.body": "We found the problems below. There is still time to fix them; if your meeting has already started you can record anyway, and the loss will be recorded in the note's audio reconciliation.",
   "record.risk.voice_isolation.title": "macOS Voice Isolation is on",
   "record.risk.voice_isolation.impact": "It mutes whatever it decides is not speech to digital silence, and it cuts real speech too. One recording here lost nearly 20% of its speech that way.",

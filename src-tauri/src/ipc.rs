@@ -20,6 +20,10 @@ pub struct StatusEvent {
     /// 活跃录制毫秒数（不含暂停期；续录含历史 base_ms）。仅 recording/paused 状态
     /// 有意义，其余为 0。
     pub elapsed_ms: u64,
+    /// 本场自动改用的输入设备名(录前设备检查自动择优,2026-08-22 设计):默认输入是
+    /// 蓝牙通话麦时本场采集换成的内置/有线设备。空串=没换。录制页横幅据此显示。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_override: String,
 }
 
 /// 采集电平（闸前 RMS，0..1 量级），事件名 "level"，每源约 10Hz。

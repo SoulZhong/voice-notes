@@ -843,6 +843,13 @@
            横幅(修复入口原本唯一挂载点)根本不亮,而采集失败按分类会落进这两张卡——
            不在这里给入口,本 PR 要修的场景就永远触达不了 tccutil 双清。unavailable
            卡的 Windows 场景没有 TCC,按平台隐藏修复行。 -->
+      {#if recording.inputOverride}
+        <!-- 录前设备检查自动择优(2026-08-22 设计):蓝牙通话麦被自动换成了更稳的
+             设备,一句话告知即可,不阻断;想关自动换去设置。 -->
+        <div class="banner">
+          {t("record.inputAutoPicked", { device: recording.inputOverride })}
+        </div>
+      {/if}
       {#if isSystemDenied}
         <div class="banner">
           <strong>{t("record.systemDenied.title")}</strong>
