@@ -64,6 +64,8 @@
   import SpeakerChips from "$lib/SpeakerChips.svelte";
   import MultiSpeakerPanel from "$lib/MultiSpeakerPanel.svelte";
   import { autoSplitSpeaker, undoAutoSplit, latestUndoableSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
+  import NoticeStrip from "$lib/NoticeStrip.svelte";
+  import type { Notice } from "$lib/notices";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
   import { rebaseQueuedRefinedSave } from "$lib/editor/editorDoc";
@@ -678,10 +680,8 @@
 
   /** 最近一次可撤销拆分(24h 内;结果横幅关掉后撤销仍有处可寻)。本页会话内可忽略。 */
   let undoableSplit = $state<SplitOp | null>(null);
-  let undoableDismissed = $state(false);
   $effect(() => {
     void id;
-    undoableDismissed = false;
     void refreshUndoable();
   });
   async function refreshUndoable() {
@@ -689,6 +689,114 @@
     undoableSplit =
       op && Date.now() - new Date(op.created_at).getTime() < 24 * 3600_000 ? op : null;
   }
+  async function retryPartial() {
+    try {
+      await retryFailedRefine(id);
+      refining = true; // 事件随后接管;先置上避免按钮双击
+    } catch (e) {
+      error = `${e}`;
+    }
+  }
+  function resumeOp(op: SplitOp) {
+    // 单说话人 op 走一键续跑(带进度,人话);多说话人是旧面板时代的遗留,只有它回面板。
+    if (op.speaker_ids.length === 1) runAutoSplit(op.speaker_ids[0]);
+    else multiPanel = { candidates: op.speaker_ids, existingOp: op };
+  }
+
+  /** 提示系统(2026-08-22 方案甲):本页全部常驻提示统一进一条通知条。
+      数组序即优先级:错误(组件内单列) > 数据一致性 > 可重试 > 恢复中断 >
+      质量建议 > 可撤销 > 背景信息。 */
+  const pageNotices = $derived.by((): Notice[] => {
+    const out: Notice[] = [];
+    if (regenErr) out.push({ key: "regenErr", level: "error", text: regenErr });
+    if (refineErr) out.push({ key: "refineErr", level: "error", text: refineErr });
+    if (retransErr) out.push({ key: "retransErr", level: "error", text: retransErr });
+    if (effectiveView === "refined" && refined && refinedSaveErr)
+      out.push({ key: "refinedSaveErr", level: "error", text: refinedSaveErr });
+    if (effectiveView === "refined" && refined?.stages.llm === "failed")
+      out.push({ key: "llmFailed", level: "error", text: t("notes.banner.llmFailed") });
+    if (effectiveView === "refined" && refined?.stale)
+      out.push({
+        key: "stale",
+        level: "action",
+        text: t("notes.retrans.staleBanner"),
+        epoch: refined.generated_at,
+        actions: [{
+          label: refining ? t("notes.banner.aiRunning") : t("notes.banner.aiRun"),
+          run: rerunRefine,
+          disabled: refining || note?.meta.state !== "complete",
+        }],
+      });
+    if (effectiveView === "refined" && refined?.stages.llm === "partial") {
+      const nFailed = refined.llm_failed_paragraphs?.length ?? 0;
+      out.push({
+        key: "llmPartial",
+        level: "action",
+        text: t("notes.banner.llmPartial"),
+        epoch: `${refined.generated_at}:${nFailed}`,
+        actions:
+          nFailed > 0 && !refining
+            ? [{ label: t("notes.banner.retryFailedSegs", { n: nFailed }), run: retryPartial }]
+            : [],
+      });
+    }
+    const openOp = openMultiOps.find((o) => o.phase !== "done");
+    if (openOp && !multiPanel && !autoSplitRunning)
+      out.push({
+        key: "resume",
+        level: "action",
+        text: t("speakers.multi.resume"),
+        dismissible: false,
+        actions: [{ label: t("speakers.multi.resumeOpen"), run: () => resumeOp(openOp) }],
+      });
+    if (offerBetterEngine)
+      out.push({
+        key: "lowDensity",
+        level: "suggest",
+        text: t("notes.banner.lowDensity", { n: lowDensity.count, s: lowDensity.seconds }),
+        detail: t("notes.banner.lowDensityHint"),
+        actions: [{
+          label: repairing ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix"),
+          run: repairWithFirered,
+          disabled: repairing,
+        }],
+      });
+    if (undoableSplit && !autoSplitRunning && !autoToast)
+      out.push({
+        key: "undoable",
+        level: "suggest",
+        text: t("speakers.autosplit.undoableNotice"),
+        epoch: undoableSplit.op_id,
+        actions: [{ label: t("speakers.autosplit.undo"), run: undoLatestSplit }],
+      });
+    if (aiSkipped)
+      out.push({
+        key: "aiSkipped",
+        level: "info",
+        text: aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun"),
+        actions:
+          aiSkipped === "unconfigured"
+            ? [{ label: t("notes.banner.aiConfigure"), run: () => goto("/ai") }]
+            : [{
+                label: refining ? t("notes.banner.aiRunning") : t("notes.banner.aiRun"),
+                run: rerunRefine,
+                disabled: refining,
+              }],
+      });
+    if (note?.meta.state === "recording")
+      out.push({ key: "interrupted", level: "info", text: t("notes.banner.interrupted") });
+    if ((note?.skipped_lines ?? 0) > 0)
+      out.push({
+        key: "skipped",
+        level: "info",
+        text: t("notes.banner.skipped", { n: note?.skipped_lines ?? 0 }),
+        epoch: String(note?.skipped_lines ?? 0),
+      });
+    if (playbackScheme === "mixed" && mixedInfo?.ab_caveat)
+      out.push({ key: "abCaveat", level: "info", text: t("notes.mix.abCaveat") });
+    return out;
+  });
+
   async function undoLatestSplit() {
     if (!undoableSplit) return;
     try {
@@ -1966,12 +2074,9 @@
         </div>
       </div>
 
-      {#if note.meta.state === "recording"}
-        <div class="banner">{t("notes.banner.interrupted")}</div>
-      {/if}
-      {#if note.skipped_lines > 0}
-        <div class="banner">{t("notes.banner.skipped", { n: note.skipped_lines })}</div>
-      {/if}
+      <!-- 提示系统(2026-08-22 方案甲):本页常驻提示统一收敛到这一条通知条,
+           一次只打扰一条,其余进抽屉;「知道了」按笔记记住。 -->
+      <NoticeStrip notices={pageNotices} storageKey={"vn-notices:" + id} />
       {#if exportMsg}<p class="hint export-msg">{exportMsg}</p>{/if}
 
       <!-- 控制行(录音机式,整合一行):播放/暂停 + 波形音轨,行尾圆形红点录音键。
@@ -2003,23 +2108,11 @@
           <span class="rec-dot"></span>
         </button>
       </div>
-      {#if playbackScheme === "mixed" && mixedInfo?.ab_caveat}
-        <!-- A/B 口径护栏(spec §对照条件):mic 轨经过离线回声清洗而 mixed 拿不到
-             这道处理,A 侧多一级抑制——此场次听感差异不能归因于录制期混音本身。 -->
-        <p class="hint">{t("notes.mix.abCaveat")}</p>
-      {/if}
-      {#if regenErr}
-        <div class="banner">{regenErr}</div>
-      {/if}
 
       {#if effectiveView === "refined"}
         <!-- 修订稿视图:只展示重聚类终稿的说话人,不摊开在线 S* 临时簇。
              可直接改名/从会议搭子选人:改名同步声纹库,选人采用库中现名。
              Aing 中禁编辑(管线随后整写 refined.json,后端同款 guard 兜底)。 -->
-        {#if refined?.stale}
-          <!-- 文件重转写(三期)已跑过但本修订稿还是旧文本(段落已变):提示重新执行 AI -->
-          <div class="banner">{t("notes.retrans.staleBanner")}</div>
-        {/if}
         <SpeakerChips
           speakers={note.speakers}
           noteId={id}
@@ -2078,30 +2171,6 @@
             {t("speakers.autosplit.failed", { e: autoToast.msg })}
           {/if}
           <button class="link" onclick={() => (autoToast = null)}>{t("speakers.autosplit.dismiss")}</button>
-        </div>
-      {/if}
-      {#if !autoSplitRunning && !autoToast && undoableSplit && !undoableDismissed}
-        <div class="banner">
-          {t("speakers.autosplit.undoableNotice")}
-          <button class="link" onclick={undoLatestSplit}>{t("speakers.autosplit.undo")}</button>
-          <button class="link" onclick={() => (undoableDismissed = true)}>{t("speakers.autosplit.dismiss")}</button>
-        </div>
-      {/if}
-      {#if openMultiOps.length > 0 && !multiPanel && !autoSplitRunning && openMultiOps.some((o) => o.phase !== "done")}
-        <div class="banner">
-          {t("speakers.multi.resume")}
-          <button
-            class="link"
-            onclick={() => {
-              const op = openMultiOps[0];
-              // 单说话人 op 走一键续跑(带进度,人话);多说话人是旧面板时代的遗留,
-              // 只有它才回到面板。
-              if (op.speaker_ids.length === 1) runAutoSplit(op.speaker_ids[0]);
-              else multiPanel = { candidates: op.speaker_ids, existingOp: op };
-            }}
-          >
-            {t("speakers.multi.resumeOpen")}
-          </button>
         </div>
       {/if}
 
@@ -2187,59 +2256,6 @@
       </div>
     </div>
 
-    {#if refineErr}<div class="banner banner-danger">{refineErr}</div>{/if}
-    {#if retransErr}<div class="banner banner-danger">{retransErr}</div>{/if}
-    <!-- 放在视图分支之外:切到原始稿也照样看得见——"这场 AI 没跑"是笔记级事实,
-         不是精修视图的局部状态。 -->
-    {#if offerBetterEngine}
-      <div class="banner">
-        {t("notes.banner.lowDensity", { n: lowDensity.count, s: lowDensity.seconds })}
-        <button class="link" disabled={repairing} onclick={repairWithFirered}>
-          {repairing ? t("notes.banner.lowDensitySwitching") : t("notes.banner.lowDensityFix")}
-        </button>
-        <span class="hint">{t("notes.banner.lowDensityHint")}</span>
-      </div>
-    {/if}
-
-    {#if aiSkipped}
-      <div class="banner">
-        {aiSkipped === "unconfigured" ? t("notes.banner.aiUnconfigured") : t("notes.banner.aiNotRun")}
-        {#if aiSkipped === "unconfigured"}
-          <button class="link" onclick={() => goto("/ai")}>{t("notes.banner.aiConfigure")}</button>
-        {:else}
-          <button class="link" onclick={rerunRefine} disabled={refining}>
-            {refining ? t("notes.banner.aiRunning") : t("notes.banner.aiRun")}
-          </button>
-        {/if}
-      </div>
-    {/if}
-    {#if effectiveView === "refined" && refined}
-      <!-- 精修稿保存错误:独立粘性 banner,不复用共享 error——那个会被 refresh()
-           成功悄悄清掉,持续性拒绝(Aing 中反复被拒)会因此再无提示。 -->
-      {#if refinedSaveErr}<div class="banner banner-danger">{refinedSaveErr}</div>{/if}
-      {#if refined.stages.llm === "partial"}
-        <div class="banner">
-          {t("notes.banner.llmPartial")}
-          {#if (refined.llm_failed_paragraphs?.length ?? 0) > 0 && !refining}
-            <button
-              class="link"
-              onclick={async () => {
-                try {
-                  await retryFailedRefine(id);
-                  refining = true; // 事件随后接管;先置上避免按钮双击
-                } catch (e) {
-                  error = `${e}`;
-                }
-              }}
-            >
-              {t("notes.banner.retryFailedSegs", { n: refined.llm_failed_paragraphs?.length ?? 0 })}
-            </button>
-          {/if}
-        </div>
-      {:else if refined.stages.llm === "failed"}
-        <div class="banner banner-danger">{t("notes.banner.llmFailed")}</div>
-      {/if}
-    {/if}
 
     <div class="transcript" class:live={playerPlaying} bind:this={transcriptEl}>
       {#if effectiveView === "refined" && refined}
