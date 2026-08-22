@@ -260,6 +260,50 @@ fn is_aec_residue(sub_start: u64, sub_end: u64, rms: f32, recent_system: &VecDeq
         .any(|r| is_residue_pair(rms, sub_start, sub_end, r.start_ms, r.end_ms))
 }
 
+// 残渣幻觉词抑制(2026-08-23 用户实测):对方说中文时,mic 路的 AEC 残渣被 ASR
+// 幻觉成孤立英文语气短词(Yeah./The./So.)。此类段 rms 可到 0.07,远超
+// RESIDUE_RMS_MAX——实测 28 段可疑短词里仅 10 段低于 mic 中位一半,能量判据
+// 失效;改用文本+语境三条件合围(实测 24/28 命中重叠条件):
+// ①归一化后恰为词表词 ②与某 system 段重叠 ≥ RESIDUE_OVERLAP_MIN 且该 system
+// 文本以汉字为主 ③段长 ≤ FILLER_MAX_MS。
+// 词表刻意窄且全英文:真人中文插话("对""嗯")不在表内;英文会议里对方文本非
+// 汉字为主,②不成立,真实的 "yes" 回应不受影响。③兜「长段只转出一个词」的
+// 转写失败——那是内容丢失,按 is_no_content_final 注释的既有准则不得抑制。
+const RESIDUE_FILLER_WORDS: &[&str] = &[
+    "yeah", "yes", "oh", "the", "so", "this", "i", "a", "and", "but", "ok", "okay", "uh", "um",
+    "hmm", "mhm", "thankyou", "right",
+];
+/// 残渣幻觉词抑制的段长上界。实测幻觉段 0.9~1.8s,真人短句也可能落此区间但
+/// 会被词表(仅孤立英文语气词)排除。
+const FILLER_MAX_MS: u64 = 2_500;
+
+fn is_cjk_dominant(text: &str) -> bool {
+    let (mut letters, mut cjk) = (0u32, 0u32);
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            letters += 1;
+            if (0x4E00..=0x9FFF).contains(&(c as u32)) {
+                cjk += 1;
+            }
+        }
+    }
+    letters > 0 && cjk * 2 >= letters
+}
+
+fn is_filler_hallucination(
+    norm_mic: &str,
+    sub_start: u64,
+    sub_end: u64,
+    recent_system: &VecDeque<RecentSystem>,
+) -> bool {
+    sub_end.saturating_sub(sub_start) <= FILLER_MAX_MS
+        && RESIDUE_FILLER_WORDS.contains(&norm_mic)
+        && recent_system.iter().any(|r| {
+            overlap_fraction(sub_start, sub_end, r.start_ms, r.end_ms) >= RESIDUE_OVERLAP_MIN
+                && is_cjk_dominant(&r.text)
+        })
+}
+
 /// 完整处理链：embed → assign → take_merges/SpeakersChanged → on_final。
 /// 即时路径（system 段、无匹配的 mic 段）与 release 路径（hold 到期/排干的 mic 段）共用，
 /// 保证「被丢弃段零副作用、被处理段处理逻辑同源」。
@@ -769,6 +813,20 @@ where
                 dropped_mic.push((p.text.clone(), p.start_ms, p.end_ms, p.rms, "aec_residue"));
                 return false;
             }
+            if p.end_ms.saturating_sub(p.start_ms) <= FILLER_MAX_MS
+                && RESIDUE_FILLER_WORDS.contains(&p.norm.as_str())
+                && overlap_fraction(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
+                    >= RESIDUE_OVERLAP_MIN
+                && is_cjk_dominant(&sub.text)
+            {
+                eprintln!(
+                    "残渣幻觉词抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                    p.rms,
+                    text_prefix20(&p.text)
+                );
+                dropped_mic.push((p.text.clone(), p.start_ms, p.end_ms, p.rms, "residue_filler"));
+                return false;
+            }
             let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
                 && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
             if echoed {
@@ -888,6 +946,28 @@ where
                 &mut self.on_final,
                 &mut self.on_diar,
             );
+        } else if is_filler_hallucination(
+            &normalize_text(&sub.text),
+            sub.start_ms,
+            sub.end_ms,
+            &self.recent_system,
+        ) {
+            // 残渣幻觉词抑制:见 RESIDUE_FILLER_WORDS 注释。与残渣抑制同待遇,
+            // reason 单列供对账区分。
+            eprintln!(
+                "残渣幻觉词抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
+                seg_rms,
+                text_prefix20(&sub.text)
+            );
+            (self.on_partial)(Source::Mic, String::new());
+            (self.on_diar)(DiarEvent::SuppressedFinal {
+                source: Source::Mic,
+                text: sub.text,
+                start_ms: sub.start_ms,
+                end_ms: sub.end_ms,
+                rms: Some(seg_rms),
+                reason: "residue_filler".into(),
+            });
         } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &self.recent_system) {
             // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
             // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
@@ -3975,6 +4055,34 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filler_hallucination_needs_all_three_conditions() {
+        let mut rs: VecDeque<RecentSystem> = VecDeque::new();
+        rs.push_back(RecentSystem {
+            text: "实验限好我放完了应该没问题".into(),
+            norm: normalize_text("实验限好我放完了应该没问题"),
+            start_ms: 1000,
+            end_ms: 9000,
+        });
+        // 三条件齐:命中
+        assert!(is_filler_hallucination(&normalize_text("Yeah."), 2000, 3000, &rs));
+        // 词不在表内(真人中文插话):放行
+        assert!(!is_filler_hallucination(&normalize_text("对。"), 2000, 3000, &rs));
+        // 不重叠(对方没在说话):放行
+        assert!(!is_filler_hallucination(&normalize_text("Yeah."), 20_000, 21_000, &rs));
+        // 段太长(可能是转写失败掩盖内容,按既有准则不抑制):放行
+        assert!(!is_filler_hallucination(&normalize_text("Yeah."), 2000, 8000, &rs));
+        // 对方说英文(真实英文会议的 yes 回应):放行
+        let mut en: VecDeque<RecentSystem> = VecDeque::new();
+        en.push_back(RecentSystem {
+            text: "Could you confirm the deployment plan".into(),
+            norm: normalize_text("Could you confirm the deployment plan"),
+            start_ms: 1000,
+            end_ms: 9000,
+        });
+        assert!(!is_filler_hallucination(&normalize_text("Yes."), 2000, 3000, &en));
+    }
+
 
     #[test]
     fn foreign_final_detection() {
