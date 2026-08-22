@@ -71,7 +71,7 @@
         排到该请求之后。普通 idle 保存仍走 onSaveRefined。 */
     onDrainRefined?: (payload: { revision: number; paragraphs: ParagraphPayload[] }) => void;
     onEditSegment?: (seq: number, expectedText: string, newText: string) => void;
-    onBadgeClick?: (attrs: BadgeAttrs, rect: DOMRect) => void;
+    onBadgeClick?: (attrs: BadgeAttrs, rect: DOMRect, shiftKey?: boolean) => void;
     onPlayFrom?: (startMs: number) => void;
     // 实体跳转不在这里出口:组件只在实体高亮上派发 entityhover/entityleave,跳转由
     // 页面浮层的按钮发起(见 +page.svelte 的 entityPop)。
@@ -606,8 +606,8 @@
               // speaker/source 是点击当下的渲染快照,宿主应按 seq 回查
               // note.segments 拿权威 speaker/source/startMs,不要直接拿这里
               // 透传的值当权威数据用。
-              onBadgeClick: (seq, speaker, source, rect) =>
-                onBadgeClick?.({ seq, speaker, source, name: null, personId: null, startMs: 0 }, rect),
+              onBadgeClick: (seq, speaker, source, rect, shiftKey) =>
+                onBadgeClick?.({ seq, speaker, source, name: null, personId: null, startMs: 0 }, rect, shiftKey),
               onPlayFrom: (ms) => onPlayFrom?.(ms),
               onDeleteClick: (seq, rect) => onDeleteClick?.(seq, rect),
             }),

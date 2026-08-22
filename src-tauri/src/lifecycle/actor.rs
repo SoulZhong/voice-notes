@@ -190,6 +190,10 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
             .set_segment_speaker(&id, seq, &expected_text, &speaker_id)
             .map(|_| ())
             .map_err(|e| e.to_string()),
+        EditOp::SetSegmentsSpeaker { id, moves, speaker_id } => store
+            .set_segments_speaker(&id, &moves, &speaker_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
     }
 }
 

@@ -693,6 +693,63 @@ impl NoteStore {
         Ok(target)
     }
 
+    /// 批量改派段落说话人(2026-08-22 批量修改说话人):同一目标、一次锁内全改。
+    /// 语义与 set_segment_speaker 完全一致:逐段 (seq, expected_text) CAS,任一段
+    /// 对不上整体失败零写入;speaker_id="new" 只分配**一个**新号给整批。
+    pub fn set_segments_speaker(
+        &self,
+        id: &str,
+        moves: &[(u64, String)],
+        speaker_id: &str,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(!moves.is_empty(), "没有选中任何段落");
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        // 全量 CAS 预检:先证明每段都还是用户看到的样子,再动第一笔。
+        for (seq, expected) in moves {
+            find_seg(&mut lines, *seq, expected)?;
+        }
+        let mut speakers = read_speakers(&dir);
+        let target = if speaker_id == "new" {
+            let num = |s: &str| s.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            let max_known = speakers
+                .keys()
+                .map(|k| num(k))
+                .chain(lines.iter().filter_map(|l| match l {
+                    JsonlLine::Seg(r) => r.speaker.as_deref().map(num),
+                    _ => None,
+                }))
+                .max()
+                .unwrap_or(0);
+            let new_id = format!("S{}", max_known + 1);
+            speakers.insert(
+                new_id.clone(),
+                SpeakerMeta {
+                    name: String::new(),
+                    sources: Vec::new(),
+                    centroid: None,
+                    count: 0,
+                    person_id: None,
+                    multi_speaker: false, reserved_by: None, split_born: false, hint_person: None,
+                },
+            );
+            write_speakers_atomic(&dir, &speakers)?;
+            new_id
+        } else {
+            if !speakers.contains_key(speaker_id) {
+                anyhow::bail!("未知说话人: {speaker_id}");
+            }
+            speaker_id.to_string()
+        };
+        for (seq, expected) in moves {
+            find_seg(&mut lines, *seq, expected)?.speaker = Some(target.clone());
+        }
+        write_jsonl_atomic(&dir, &lines)?;
+        Ok(target)
+    }
+
     /// 删除说话人:speakers.json 去条目,名下段落全部回到未标注(speaker=None)。
     /// 只动本笔记——person_id 只是指向人物库的引用,库(会议搭子/声纹)不受影响。
     /// 顺序刻意「先改段、再删表」:两写之间崩溃最坏留一个无段落引用的孤儿表项,
@@ -1707,6 +1764,27 @@ mod tests {
         store.reserve_speakers(&id, &["S9".to_string()], "so-t").unwrap();
         let n = store.load(&id).unwrap();
         assert!(n.speakers["S9"].split_born, "预留新号必须带 split_born");
+    }
+
+    /// 批量改派(UI 版,2026-08-22):全量 CAS 预检、"new" 整批一个号。
+    #[test]
+    fn set_segments_speaker_batches_with_single_new_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = make_spk_note(tmp.path(), &[("a", Some("S1")), ("b", Some("S1")), ("c", Some("S2"))], &["S1", "S2"]);
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let got = store
+            .set_segments_speaker(&id, &[(0, "a".into()), (1, "b".into())], "new")
+            .unwrap();
+        let n = store.load(&id).unwrap();
+        assert_eq!(n.segments[0].speaker.as_deref(), Some(got.as_str()));
+        assert_eq!(n.segments[1].speaker.as_deref(), Some(got.as_str()), "整批共享一个新号");
+        assert_eq!(n.segments[2].speaker.as_deref(), Some("S2"), "未选段不动");
+        // CAS 失配整体失败零写入
+        let err = store
+            .set_segments_speaker(&id, &[(2, "c".into()), (0, "错文".into())], "S2")
+            .unwrap_err();
+        assert!(err.to_string().contains("已变") || err.to_string().contains("没有"), "{err}");
+        assert_eq!(store.load(&id).unwrap().segments[2].speaker.as_deref(), Some("S2"));
     }
 
     #[test]
