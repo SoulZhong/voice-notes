@@ -167,20 +167,47 @@ pub fn recluster_split(
             _ => break,
         }
     }
-    cls.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
-    let groups = cls
-        .into_iter()
-        .map(|c| {
-            // 最像的种子:同一 person 多种子取 max(与 seed_clusters 的多种子语义一致)。
-            let mut best: Option<(String, String, f32)> = None;
-            for sd in seeds {
-                if let Some(u) = normalize(&sd.centroid) {
-                    let sim = dot(&c.centroid, &u);
-                    if best.as_ref().map_or(true, |(_, _, s)| sim > *s) {
-                        best = Some((sd.person.clone(), sd.name.clone(), sim));
-                    }
+    // 同名强建议合组(2026-08-22 用户拍板「甲」):多个组的最近种子指向同一人且都
+    // 过 SEED_ASSIGN_THRESHOLD,拆开自相矛盾(724 段大簇实测碎成 15 组、5 组同标
+    // 「像是徐万振?」)。声纹既然笃定是同一人,就并成一组;低于阈值的仅是参考,
+    // 不并(种子只是建议,不越权)。
+    let seed_of = |c: &Cl| -> Option<(String, String, f32)> {
+        // 最像的种子:同一 person 多种子取 max(与 seed_clusters 的多种子语义一致)。
+        let mut best: Option<(String, String, f32)> = None;
+        for sd in seeds {
+            if let Some(u) = normalize(&sd.centroid) {
+                let sim = dot(&c.centroid, &u);
+                if best.as_ref().map_or(true, |(_, _, s)| sim > *s) {
+                    best = Some((sd.person.clone(), sd.name.clone(), sim));
                 }
             }
+        }
+        best
+    };
+    let mut by_person: BTreeMap<String, usize> = BTreeMap::new();
+    let mut merged: Vec<Cl> = Vec::new();
+    for c in cls {
+        match seed_of(&c).filter(|(_, _, sim)| *sim >= SEED_ASSIGN_THRESHOLD) {
+            Some((pid, _, _)) => match by_person.get(&pid) {
+                Some(&k) => {
+                    let t = &mut merged[k];
+                    t.centroid = merge_centroid(t, &c);
+                    t.members.extend(c.members);
+                    t.total_ms += c.total_ms;
+                }
+                None => {
+                    by_person.insert(pid, merged.len());
+                    merged.push(c);
+                }
+            },
+            None => merged.push(c),
+        }
+    }
+    merged.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
+    let groups = merged
+        .into_iter()
+        .map(|c| {
+            let best = seed_of(&c);
             let mut member_idx = c.members;
             member_idx.sort_unstable();
             SplitGroup { member_idx, total_ms: c.total_ms, suggested: best }
@@ -394,6 +421,29 @@ mod tests {
         }
         let sug = recluster_split(&inputs, &embs, &[]);
         assert_eq!(sug.groups.len(), n, "互不相似 → 各自成组,不强并");
+    }
+
+    /// 甲(2026-08-22):同名强建议合组——两组都笃定是同一人就并;低于阈值仅参考不并。
+    #[test]
+    fn split_merges_groups_sharing_confident_seed_but_not_weak_ones() {
+        let sc = |p: &str, c: Vec<f32>| crate::diar::registry::SeedCluster {
+            person: p.into(), name: p.into(), centroid: c, count: 5, source: "mic".into(),
+        };
+        // 两个互不相似(dot=0 < AHC 阈值)的方向,但都与种子 PX 高相似(0.8+)。
+        let a = [1.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0];
+        let seed_mid = vec![0.7071, 0.7071, 0.0]; // 与 a、b 余弦均 ~0.707 ≥ 0.68
+        let inputs = vec![seg(0, 0, 10_000), seg(1, 10_000, 20_000)];
+        let embs = vec![v(a, 0.0), v(b, 0.0)];
+        let sug = recluster_split(&inputs, &embs, &[sc("PX", seed_mid.clone())]);
+        assert_eq!(sug.groups.len(), 1, "同名强建议必须并组");
+        assert_eq!(sug.groups[0].member_idx, vec![0, 1]);
+        assert_eq!(sug.groups[0].suggested.as_ref().unwrap().0, "PX");
+
+        // 低于阈值的同名建议:仅参考,不并。
+        let weak = vec![0.35, 0.35, 0.87]; // 与 a、b 余弦 ~0.35 < 0.68
+        let sug = recluster_split(&inputs, &embs, &[sc("PY", weak)]);
+        assert_eq!(sug.groups.len(), 2, "弱建议不得并组");
     }
 
     #[test]
