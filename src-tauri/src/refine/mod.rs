@@ -253,6 +253,8 @@ pub fn run_local(
     seeds: &[SeedCluster],
     generated_at: &str,
     speaker_match: &str,
+    // 声纹模型标识:段落声纹缓存的失效键(2026-08-22-embedding-cache-design.md)。
+    embed_model_tag: &str,
 ) -> anyhow::Result<(RefinedDoc, Vec<recluster::ClusterStat>)> {
     let discarded = filter::discarded_seqs(segs);
     let kept: Vec<&SegmentRecord> = segs
@@ -276,7 +278,7 @@ pub fn run_local(
     // 一波说话人(2026-08-21-one-speaker-set-design.md):段落分组直接沿用原始稿
     // 说话人,不再重分组;嵌入只为 identify 供声学统计(按 S 说话人聚合)。
     let (cluster_stats, recluster_state) = match embedder {
-        Some(e) => match embed_all(note_dir, &kept, e) {
+        Some(e) => match embed_all(note_dir, &kept, e, embed_model_tag) {
             Ok(embs) => {
                 let matcher = crate::diar::registry::matcher_from_key(speaker_match);
                 (recluster::stats_by_speaker(&inputs, &embs, seeds, matcher.as_ref()), "done")
@@ -365,34 +367,66 @@ pub(crate) fn embed_all(
     note_dir: &Path,
     kept: &[&SegmentRecord],
     embedder: &mut dyn SpeakerEmbedder,
+    model_tag: &str,
 ) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
-    embed_all_with_progress(note_dir, kept, embedder, &|_, _| {})
+    embed_all_with_progress(note_dir, kept, embedder, model_tag, &|_, _| {})
 }
 
 /// 带进度回调的逐段嵌入:(done, total)。大簇(实测 724 段/80 分钟)要算数分钟,
 /// 没有进度的等待与卡死不可区分(2026-08-22 用户实测「提示一直没消失」)。
+///
+/// 写通缓存(2026-08-22-embedding-cache-design.md):先查 notes/<id>/embeddings.json,
+/// 命中((seq,start,end,source) 全等且 model 一致)直接用;只算缺的;算完把
+/// **当前段集合**的向量原子写回(条目自动修剪,消失的 seq 不留)。缓存可丢,
+/// 读损坏 = 当无缓存。第一次付全款,此后拆分/重 Aing 秒出。
 pub(crate) fn embed_all_with_progress(
     note_dir: &Path,
     kept: &[&SegmentRecord],
     embedder: &mut dyn SpeakerEmbedder,
+    model_tag: &str,
     progress: &dyn Fn(usize, usize),
 ) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
     let audio_meta = crate::store::audio::load_audio_meta(note_dir);
     let mut out: Vec<Option<Vec<f32>>> = vec![None; kept.len()];
+
+    let cached: BTreeMap<(u64, u64, u64, &str), &crate::store::embed_cache::EmbedCacheEntry>;
+    let cache_doc = crate::store::embed_cache::load(note_dir).filter(|c| c.model == model_tag);
+    cached = cache_doc
+        .as_ref()
+        .map(|c| {
+            c.entries
+                .iter()
+                .map(|e| ((e.seq, e.start_ms, e.end_ms, e.source.as_str()), e))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut by_source: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, s) in kept.iter().enumerate() {
         by_source.entry(s.source.as_str()).or_default().push(i);
     }
 
+    let mut computed_any = false;
     let mut done = 0usize;
     for (source, idxs) in by_source {
-        // 该轨全是短段(< MIN_EMBED_MS)时无需读它的 PCM,省一次磁盘 I/O。
-        if !idxs.iter().any(|&i| {
+        // 缓存命中先落座(不读 PCM 不进嵌入器)。
+        let mut misses: Vec<usize> = Vec::new();
+        for &i in &idxs {
+            let s = kept[i];
+            if let Some(e) = cached.get(&(s.seq, s.start_ms, s.end_ms, s.source.as_str())) {
+                out[i] = Some(e.vec.clone());
+                done += 1;
+                progress(done, kept.len());
+            } else {
+                misses.push(i);
+            }
+        }
+        // 该轨缺的全是短段(< MIN_EMBED_MS)时无需读它的 PCM,省一次磁盘 I/O。
+        if !misses.iter().any(|&i| {
             let s = kept[i];
             s.end_ms.saturating_sub(s.start_ms) >= recluster::MIN_EMBED_MS
         }) {
-            done += idxs.len();
+            done += misses.len();
             progress(done, kept.len());
             continue;
         }
@@ -402,7 +436,7 @@ pub(crate) fn embed_all_with_progress(
             .map(|t| t.offset_ms)
             .unwrap_or(0);
         let pcm = crate::store::transcode::track_pcm(note_dir, source)?;
-        for &i in &idxs {
+        for &i in &misses {
             let s = kept[i];
             done += 1;
             progress(done, kept.len());
@@ -412,10 +446,33 @@ pub(crate) fn embed_all_with_progress(
             }
             if let Some((a, b)) = slice_range(s.start_ms, s.end_ms, offset_ms, pcm.len()) {
                 out[i] = embedder.embed(&pcm[a..b]).ok();
+                if out[i].is_some() {
+                    computed_any = true;
+                }
             }
         }
         // `pcm` 在此 for 迭代结束时被 drop:下一轮换轨才会再分配一份全场 PCM,
         // 任意时刻至多一轨全场 PCM 常驻内存。
+    }
+
+    // 写回:有新算才写(纯命中不动盘);条目=当前 kept 里所有有向量的段(自动修剪)。
+    if computed_any {
+        let entries: Vec<crate::store::embed_cache::EmbedCacheEntry> = kept
+            .iter()
+            .zip(&out)
+            .filter_map(|(s, v)| {
+                v.as_ref().map(|vec| crate::store::embed_cache::EmbedCacheEntry {
+                    seq: s.seq,
+                    start_ms: s.start_ms,
+                    end_ms: s.end_ms,
+                    source: s.source.clone(),
+                    vec: vec.clone(),
+                })
+            })
+            .collect();
+        if let Err(e) = crate::store::embed_cache::save(note_dir, model_tag, entries) {
+            eprintln!("embed 缓存写回失败(不影响本次结果): {e}");
+        }
     }
     Ok(out)
 }
@@ -1403,6 +1460,7 @@ mod tests {
             &[],
             "2026-07-06T15:00:00+08:00",
             "nearest",
+            "test-model",
         )
         .unwrap();
         assert_eq!(doc.discarded_seqs, vec![1]);
@@ -1425,7 +1483,7 @@ mod tests {
     fn run_local_without_embedder_keeps_note_labels_and_no_identity() {
         let dir = tempfile::tempdir().unwrap();
         let segs = vec![seg(0, "mic", "就这样定了。", 0, 4000, "S1")];
-        let (doc, _) = run_local(dir.path(), &segs, None, &[], "t", "nearest").unwrap();
+        let (doc, _) = run_local(dir.path(), &segs, None, &[], "t", "nearest", "test-model").unwrap();
         assert_eq!(doc.stages.recluster, "skipped");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert!(
@@ -1510,7 +1568,7 @@ mod tests {
             }
         }
         let mut e = CaptureEmbedder(Vec::new());
-        let out = embed_all(dir.path(), &kept, &mut e).unwrap();
+        let out = embed_all(dir.path(), &kept, &mut e, "test-model").unwrap();
         assert!(
             out[0].is_some(),
             "offset 换算后应落在轨道有效范围内,必须产出嵌入"
@@ -1520,6 +1578,60 @@ mod tests {
             5000.0 / 32768.0,
             "切片起点须是文件内 1000ms 处的 marker 采样,而非误用时间轴 61_000ms 直接当文件内 ms"
         );
+    }
+
+    /// 段落声纹缓存(2026-08-22 设计):命中跳过嵌入器;段边界变更单段失效;
+    /// 模型不符整份失效;写回修剪消失的 seq;损坏文件容忍。
+    #[test]
+    fn embed_all_cache_hit_invalidate_prune_and_corrupt_tolerance() {
+        struct CountEmbedder(usize);
+        impl crate::diar::SpeakerEmbedder for CountEmbedder {
+            fn embed(&mut self, _s: &[f32]) -> anyhow::Result<Vec<f32>> {
+                self.0 += 1;
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "mic.wav", 30);
+        let s0 = seg(0, "mic", "一。", 0, 5000, "S1");
+        let s1 = seg(1, "mic", "二。", 5000, 10_000, "S1");
+
+        // 首轮:全算,缓存落盘。
+        let mut e = CountEmbedder(0);
+        let out = embed_all(dir.path(), &[&s0, &s1], &mut e, "m1").unwrap();
+        assert!(out[0].is_some() && out[1].is_some());
+        assert_eq!(e.0, 2);
+        assert!(dir.path().join(crate::store::embed_cache::EMBED_CACHE_FILE).exists());
+
+        // 二轮:全命中,嵌入器一次不进。
+        let mut e = CountEmbedder(0);
+        let out = embed_all(dir.path(), &[&s0, &s1], &mut e, "m1").unwrap();
+        assert!(out[0].is_some() && out[1].is_some());
+        assert_eq!(e.0, 0, "全命中不得进嵌入器");
+
+        // 段边界变更:仅该段失效重算。
+        let s1b = seg(1, "mic", "二。", 5000, 9000, "S1");
+        let mut e = CountEmbedder(0);
+        embed_all(dir.path(), &[&s0, &s1b], &mut e, "m1").unwrap();
+        assert_eq!(e.0, 1, "只有边界变过的段重算");
+
+        // 模型不符:整份失效。
+        let mut e = CountEmbedder(0);
+        embed_all(dir.path(), &[&s0, &s1b], &mut e, "m2").unwrap();
+        assert_eq!(e.0, 2, "换模型必须全量重算");
+
+        // 写回修剪:只送 s0,消失的 seq1 不得留在缓存里。
+        let mut e = CountEmbedder(0);
+        embed_all(dir.path(), &[&s0], &mut e, "m1").unwrap();
+        let c = crate::store::embed_cache::load(dir.path()).unwrap();
+        assert!(c.entries.iter().all(|en| en.seq == 0), "修剪失败: {:?}", c.entries.len());
+
+        // 损坏文件:当无缓存,重算不崩。
+        std::fs::write(dir.path().join(crate::store::embed_cache::EMBED_CACHE_FILE), b"{broken").unwrap();
+        let mut e = CountEmbedder(0);
+        let out = embed_all(dir.path(), &[&s0], &mut e, "m1").unwrap();
+        assert!(out[0].is_some());
+        assert_eq!(e.0, 1);
     }
 
     #[test]
@@ -2267,7 +2379,7 @@ mod tests {
         let baseline_graph = graph_bytes(&baseline);
         let segments = vec![seg(7, "mic", "李四负责火星计划", 0, 4000, "S1")];
 
-        let (doc, _) = run_local(&dir, &segments, None, &[], "new-time", "nearest").unwrap();
+        let (doc, _) = run_local(&dir, &segments, None, &[], "new-time", "nearest", "test-model").unwrap();
 
         assert_eq!(doc.paragraphs[0].text, "李四负责火星计划");
         assert_eq!(graph_bytes(&doc), baseline_graph);
@@ -2343,6 +2455,7 @@ mod tests {
             &[],
             "new-time",
             "nearest",
+            "test-model",
         );
         assert!(
             local_result.is_err(),
@@ -2429,6 +2542,7 @@ mod tests {
             &[],
             "golden",
             "nearest",
+            "test-model",
         )
         .unwrap();
 

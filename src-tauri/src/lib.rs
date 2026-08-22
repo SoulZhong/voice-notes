@@ -526,6 +526,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     &seeds,
                     &chrono::Local::now().to_rfc3339(),
                     &current_speaker_match(&app),
+                    &speaker_tag,
                 )?;
                 report("filter", &doc.stages.filter);
                 report("recluster", &doc.stages.recluster);
@@ -4627,7 +4628,7 @@ async fn suggest_split_groups(app: AppHandle, op_id: String) -> Result<SplitSugg
         let note_id_ev = op.note_id.clone();
         let app_ev = app.clone();
         let total_hint = segs.len();
-        let embs = refine::embed_all_with_progress(&dir, &segs, &mut embedder, &|done, total| {
+        let embs = refine::embed_all_with_progress(&dir, &segs, &mut embedder, &tag, &|done, total| {
             if done == 1 || done == total || done % 10 == 0 {
                 let _ = app_ev.emit(
                     "auto_split_progress",
