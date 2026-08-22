@@ -2028,6 +2028,7 @@
           {people}
           onPick={canEdit ? (sid, personId) => assignNoteSpeakerPerson(id, sid, personId, lastAuditioned[sid]) : undefined}
           onMarkMulti={canEdit ? runAutoSplit : undefined}
+          onDelete={canEdit ? (sid) => deleteNoteSpeaker(id, sid) : undefined}
           onUnlink={canEdit ? (sid) => clearNoteSpeakerPerson(id, sid) : undefined}
           onPreview={canEdit && tracks.length > 0 ? previewSpeaker : undefined}
           previewingId={preview?.sid ?? null}
