@@ -7943,6 +7943,51 @@ async fn merge_person(
 }
 
 /// 录制中拒绝：理由同 merge_person。
+/// 按样本重建人物声纹(2026-08-23 污染修复):删掉坏样本后一键从剩余样本重算
+/// 质心,历史回灌污染整体清除(样本即真相)。复用拆分 baseline 的同一 store 例程;
+/// REBUILD_RUNNING 互斥全库重建;隔离中的人物拒绝(拆分流程自会处理)。
+#[tauri::command]
+async fn rebuild_person_voiceprint(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let root = data_root(&app).map_err(|e| e.to_string())?;
+        let vp_store = store::VoiceprintStore::new(root);
+        let vp = vp_store.load();
+        let Some(resolved) = store::VoiceprintStore::resolve(&vp, &id).map(str::to_string) else {
+            return Err(tr!("声纹库中没有该人物: {id}", "No such person: {id}", id = id));
+        };
+        if vp.people.get(&resolved).is_some_and(|p| p.voiceprint_quarantined) {
+            return Err(tr!(
+                "该人物正被拆分流程隔离,请先完成或撤销拆分",
+                "Person is quarantined by a split; finish or undo it first"
+            ));
+        }
+        {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            if REBUILD_RUNNING.swap(true, Ordering::SeqCst) {
+                return Err(tr!("声纹库重建进行中,稍后再试", "A library rebuild is running; try again later"));
+            }
+        }
+        let r = (|| -> Result<(), String> {
+            let tag = current_speaker_model(&app);
+            let mut e = diar::SherpaEmbedder::new(&speaker_model_path_for(&tag))
+                .map_err(|e| tr!("声纹模型不可用: {e}", "Speaker model unavailable: {e}", e = e))?;
+            vp_store.rebuild_person_from_samples(&resolved, &mut e, &tag).map_err(|e| e.to_string())
+        })();
+        {
+            let _ctl = REBUILD_CTL.lock().unwrap();
+            REBUILD_RUNNING.store(false, Ordering::SeqCst);
+        }
+        // 嵌入器缓存作废:质心已换血,种子须按新库重取。
+        if r.is_ok() {
+            let st = app.state::<AppState>();
+            *st.embedder_cache.lock().unwrap() = None;
+        }
+        r
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn delete_person(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
     if state.session.lock().unwrap().is_some() {
@@ -9948,6 +9993,7 @@ pub fn run() {
             rename_person,
             merge_person,
             delete_person,
+            rebuild_person_voiceprint,
             delete_person_sample,
             suggest_person_merges,
             apply_confident_merges,

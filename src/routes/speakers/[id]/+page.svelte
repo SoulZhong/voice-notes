@@ -10,6 +10,7 @@
     undoMerge,
     deletePerson,
     deletePersonSample,
+    rebuildPersonVoiceprint,
     type PersonSummary,
     type PersonMergeSuggestion,
   } from "$lib/people";
@@ -181,6 +182,25 @@
 
   /** 样本删除的行内二段确认:记下标(与 sample_paths 对齐)。 */
   let confirmSampleIdx = $state<number | null>(null);
+
+  // 按样本重建(2026-08-23 污染修复):删完坏样本一键重算,rebuilding 防双击。
+  let rebuilding = $state(false);
+  let rebuildMsg = $state("");
+  async function doRebuildFromSamples() {
+    const p = person;
+    if (!p || rebuilding) return;
+    rebuilding = true;
+    rebuildMsg = "";
+    try {
+      await rebuildPersonVoiceprint(p.id);
+      rebuildMsg = t("speakers.rebuildDone");
+      await refresh();
+    } catch (e) {
+      rebuildMsg = t("speakers.rebuildFailed", { e });
+    } finally {
+      rebuilding = false;
+    }
+  }
 
   async function doDeleteSample(i: number) {
     const p = person;
@@ -570,7 +590,17 @@
 
     <!-- 试听:确认"这个声纹是谁"的主要手段,给成块的卡而非藏在角标里 -->
     <section class="card">
-      <div class="card-title">{t("speakers.audition")}</div>
+      <div class="card-title">
+        {t("speakers.audition")}
+        {#if person.sample_paths.length > 0}
+          <!-- 污染修复出口:逐份试听、删掉不是本人的,然后按剩余样本整体重算声纹
+               (样本即真相;历史回灌污染随重算清除)。 -->
+          <button class="mini" disabled={rebuilding || recording.isLive} onclick={doRebuildFromSamples}>
+            {rebuilding ? t("speakers.rebuilding") : t("speakers.rebuildFromSamples")}
+          </button>
+        {/if}
+        {#if rebuildMsg}<span class="hint">{rebuildMsg}</span>{/if}
+      </div>
       {#if person.sample_paths.length > 0}
         <div class="listen-row">
           {#each person.sample_paths as sp, i (sp)}
