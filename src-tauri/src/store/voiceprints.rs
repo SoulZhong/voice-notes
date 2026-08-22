@@ -18,6 +18,10 @@ const SCHEMA_VERSION: u32 = 1;
 /// 够料自动识别/入库的门槛(累计发声毫秒)。累计 10s 即建立身份，
 /// 让短发言者也能在本场会议内及时获得稳定人物编号。
 pub const AUTO_ENROLL_MS: u64 = 10_000;
+/// 样本片段时长下限(2026-08-22 用户定):不足 10s 不作为声纹样本。
+/// 与 AUTO_ENROLL_MS(建档需累计 ≥10s)同值不同义:那个管"这个人够不够格建档",
+/// 这个管"这段音频够不够格当样本"。
+pub const MIN_SAMPLE_MS: u64 = 10_000;
 
 /// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
 /// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
@@ -919,6 +923,17 @@ impl VoiceprintStore {
             return Ok(false);
         }
         if samples.is_empty() {
+            return Ok(false);
+        }
+        // 样本时长下限(2026-08-22 用户定):不足 10s 的片段不入样本库——太短的样本
+        // 试听无法辨认、重建声纹也不稳。只挡新写入,存量短样本不动(可手动删)。
+        // 质心回灌不受此限(reinforce 有自己的 MIN_SEG_MS 口径)。
+        if samples.len() < MIN_SAMPLE_MS as usize * 16 {
+            eprintln!(
+                "声纹样本跳过:片段 {:.1}s 不足 {}s 下限({resolved})",
+                samples.len() as f32 / 16000.0,
+                MIN_SAMPLE_MS / 1000
+            );
             return Ok(false);
         }
         if !newly_enrolled && !user_confirmed && !self.sample_paths_existing(&resolved).is_empty() {
@@ -2407,8 +2422,10 @@ mod tests {
         let p1 = links["S1"].clone();
         assert!(store.append_sample(&p1, &[0.5; 160]).unwrap());
         // 老熟人已有样本:session 路径拒,confirmed 路径收。
-        assert!(!store.append_session_sample(&p1, &[0.6; 160], "n1", "S9", false).unwrap());
-        assert!(store.append_confirmed_sample(&p1, &[0.6; 160], "n1", "S9").unwrap());
+        assert!(!store.append_session_sample(&p1, &[0.6; 160_000], "n1", "S9", false).unwrap());
+        // 时长下限(2026-08-22 用户定):不足 10s 连确认样本也不收。
+        assert!(!store.append_confirmed_sample(&p1, &[0.6; 159_000], "n1", "S9").unwrap());
+        assert!(store.append_confirmed_sample(&p1, &[0.6; 160_000], "n1", "S9").unwrap());
         assert_eq!(store.sample_paths_existing(&p1).len(), 2);
         // 隔离中:confirmed 同样拒。
         {
@@ -2416,7 +2433,7 @@ mod tests {
             vp.people.get_mut(&p1).unwrap().voiceprint_quarantined = true;
             store.save_for_split(&vp).unwrap();
         }
-        assert!(!store.append_confirmed_sample(&p1, &[0.7; 160], "n1", "S9").unwrap());
+        assert!(!store.append_confirmed_sample(&p1, &[0.7; 160_000], "n1", "S9").unwrap());
         assert_eq!(store.sample_paths_existing(&p1).len(), 2);
     }
 
@@ -3902,7 +3919,8 @@ mod tests {
     // ── 样本溯源(Phase B) ──
 
     fn square_wave() -> Vec<f32> {
-        (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect()
+        // ≥ MIN_SAMPLE_MS(10s):样本时长下限生效后短波形进不了库。
+        (0..160_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect()
     }
 
     #[test]
