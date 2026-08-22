@@ -43,6 +43,9 @@ export const zh = {
 
   // 详情页:横幅与提示
   "notes.banner.interrupted": "这场录音曾意外中断，中断前的内容已保存。点击下方播放器右侧的红色录音键可接着录。",
+  "notes.notice.more": "还有 {n} 条",
+  "notes.notice.collapse": "收起",
+  "notes.notice.gotIt": "知道了",
   "notes.banner.skipped": "有 {n} 行记录损坏被跳过。",
   "notes.banner.llmPartial": "部分段落 AI 处理失败，已保留原文，可重新执行。",
   "notes.banner.retryFailedSegs": "只重试失败段落({n} 段)",
@@ -176,6 +179,9 @@ export const en = {
 
   "notes.banner.interrupted":
     "This recording was interrupted unexpectedly; everything before the interruption is saved. Click the red record button to the right of the player below to continue.",
+  "notes.notice.more": "{n} more",
+  "notes.notice.collapse": "Collapse",
+  "notes.notice.gotIt": "Got it",
   "notes.banner.skipped": (p) => `${p.n} corrupted line${p.n === 1 ? "" : "s"} skipped.`,
   "notes.banner.llmPartial": "AI failed on some paragraphs; their original text is kept. You can run it again.",
   "notes.banner.retryFailedSegs": "Retry failed paragraphs only ({n})",
