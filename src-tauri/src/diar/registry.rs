@@ -290,6 +290,27 @@ impl Cluster {
 /// (None = 库不可用/入库失败,该簇留待下条 final 重试)。
 pub type EnrollFn = Box<dyn FnMut(&ClusterSnapshot) -> Option<String> + Send>;
 
+/// 匹配决策日志条目(2026-08-23 数据积累,issue #163):只记两类有信息量的时刻——
+/// 新簇诞生(为什么没人认领:附当时种子人物 top3 裸分)与种子簇首次被真实段命中
+/// (谁赢、赢了多少)。量级与簇数同阶,停录随 DiarEvent::MatchLog 导出。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MatchTrace {
+    /// "new_cluster" | "seed_adopt"
+    pub event: String,
+    pub cluster: String,
+    pub source: String,
+    /// 段身份("mic:12345",assign 无时间轴,借 seg_key 定位;无则空)。
+    pub seg_key: String,
+    /// seed_adopt:命中的人物与分数。
+    pub person: Option<String>,
+    pub sim: Option<f32>,
+    /// 决策当时的种子人物 top3(person, 裸分)。
+    pub top: Vec<(String, f32)>,
+}
+
+/// 匹配日志容量上限:防极端碎片化场刷爆内存。
+const MATCH_TRACE_CAP: usize = 500;
+
 pub struct SpeakerRegistry {
     clusters: Vec<Cluster>,
     next_id: u32,
@@ -304,6 +325,8 @@ pub struct SpeakerRegistry {
     seed_z_disabled: bool,
     /// 种子匹配策略(settings.speaker_match):默认单最近邻,set_matcher 切换。
     matcher: Box<dyn SeedMatcher>,
+    /// 匹配决策日志(见 MatchTrace)。
+    match_trace: Vec<MatchTrace>,
 }
 
 fn normalize(v: &[f32]) -> Option<Vec<f32>> {
@@ -366,7 +389,13 @@ impl SpeakerRegistry {
             contributions: VecDeque::new(),
             seed_z_disabled: false,
             matcher: Box::new(NearestMatcher),
+            match_trace: Vec::new(),
         }
+    }
+
+    /// 取走匹配决策日志(停录导出;取一次即清)。
+    pub fn take_match_trace(&mut self) -> Vec<MatchTrace> {
+        std::mem::take(&mut self.match_trace)
     }
 
     /// 装配会话中实时入库回调(lib.rs 在 with_seeds 之后调用)。
@@ -436,6 +465,14 @@ impl SpeakerRegistry {
                 }
             }
         }
+        // 匹配日志用的 owned top3(person_max 借着 clusters,后面的可变借用前先物化)。
+        let trace_top3: Vec<(String, f32)> = {
+            let mut v: Vec<(String, f32)> =
+                person_max.iter().map(|(p, s)| (p.to_string(), *s)).collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            v.truncate(3);
+            v
+        };
 
         // 种子命中三闸(闭包供 k-NN 票决后的资格审查调用,判定逻辑与旧单最近邻
         // 逐位一致):①段长 ≥ SEED_MIN_SAMPLES 才有资格拍板;②同信道走裸分快路
@@ -517,7 +554,20 @@ impl SpeakerRegistry {
         let best_idx = pick(best_regular, best_seed);
         let best = best_idx.map(|(sim, idx)| (sim, &mut self.clusters[idx]));
 
-        if let Some((_sim, cluster)) = best {
+        if let Some((sim, cluster)) = best {
+            // 匹配日志:种子簇首次被真实段命中 = 本场认领了这个库人物。
+            if cluster.is_seed() && cluster.sources.is_empty() && self.match_trace.len() < MATCH_TRACE_CAP
+            {
+                self.match_trace.push(MatchTrace {
+                    event: "seed_adopt".into(),
+                    cluster: cluster.id.clone(),
+                    source: source.to_string(),
+                    seg_key: seg_key.unwrap_or("").to_string(),
+                    person: cluster.person.clone(),
+                    sim: Some(sim),
+                    top: trace_top3.clone(),
+                });
+            }
             cluster.sources.insert(source.to_string());
             // 短段不更新质心、不增count(短段声纹噪声大,防拖歪质心)
             let mut contribution: Option<(String, u64)> = None;
@@ -567,6 +617,19 @@ impl SpeakerRegistry {
         }
         let id = format!("S{}", self.next_id);
         self.next_id += 1;
+        // 匹配日志:新簇诞生 = 没有任何人认领这段声音;top3 记下"差多远",
+        // 灰区近失(如 0.6x)正是阈值校准与分身死循环诊断的关键证据。
+        if self.match_trace.len() < MATCH_TRACE_CAP {
+            self.match_trace.push(MatchTrace {
+                event: "new_cluster".into(),
+                cluster: id.clone(),
+                source: source.to_string(),
+                seg_key: seg_key.unwrap_or("").to_string(),
+                person: None,
+                sim: None,
+                top: trace_top3,
+            });
+        }
         let ms = (num_samples / 16) as u64;
         let ring_embedding = seg_key.map(|_| unit.clone());
         self.clusters.push(Cluster {
@@ -884,6 +947,7 @@ impl SpeakerRegistry {
             contributions: VecDeque::new(),
             seed_z_disabled: false,
             matcher: Box::new(NearestMatcher),
+            match_trace: Vec::new(),
         }
     }
 
@@ -969,6 +1033,36 @@ impl SpeakerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 匹配决策日志(issue #163):新簇诞生与种子首次认领各记一条(带 top 候选),
+    /// 取走即清。
+    #[test]
+    fn match_trace_records_new_cluster_and_seed_adopt() {
+        let mut r = SpeakerRegistry::with_seeds(&[], &[SeedCluster {
+            person: "P1".into(),
+            name: "甲".into(),
+            centroid: vec![1.0, 0.0, 0.0],
+            count: 5,
+            source: "mic".into(),
+        }]);
+        // 与种子高相似 + 段长过闸 → seed_adopt
+        let hit = r.assign(&[1.0, 0.01, 0.0], "mic", 16_000 * 5);
+        assert!(hit.is_some());
+        // 与谁都不像 → new_cluster(top 里躺着 P1 的低分作近失证据)
+        let miss = r.assign(&[0.0, 1.0, 0.0], "mic", 16_000 * 5);
+        assert!(miss.is_some());
+        let trace = r.take_match_trace();
+        let events: Vec<&str> = trace.iter().map(|t| t.event.as_str()).collect();
+        assert!(events.contains(&"seed_adopt"), "{events:?}");
+        assert!(events.contains(&"new_cluster"), "{events:?}");
+        let adopt = trace.iter().find(|t| t.event == "seed_adopt").unwrap();
+        assert_eq!(adopt.person.as_deref(), Some("P1"));
+        assert!(adopt.sim.unwrap() > 0.9);
+        let nc = trace.iter().find(|t| t.event == "new_cluster").unwrap();
+        assert_eq!(nc.top.first().map(|(p, _)| p.as_str()), Some("P1"), "近失证据在 top 里");
+        assert!(r.take_match_trace().is_empty(), "取走即清");
+    }
+
 
     /// 三维正交基方便构造:e1/e2 相似度 0,混合向量可控。
     fn v(x: f32, y: f32, z: f32) -> Vec<f32> {
