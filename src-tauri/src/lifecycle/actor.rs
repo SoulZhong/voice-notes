@@ -328,6 +328,18 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                     serde_json::json!({ "note_id": owned.writer.note_id(), "scene": scene }),
                 );
             }
+            crate::session::DiarEvent::MatchLog(trace) => {
+                // 匹配决策日志落盘(纯观测,同 scene.json 纪律)。
+                let path = owned.writer.dir().join("match_log.json");
+                match serde_json::to_vec_pretty(&trace) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&path, bytes) {
+                            eprintln!("match_log.json 写入失败(忽略): {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("match_log 序列化失败(忽略): {e}"),
+                }
+            }
             crate::session::DiarEvent::SceneReport(doc) => {
                 // 整场场景时间线落盘(scene.json 为独立新文件,仅本线程写,无写者竞争)。
                 if let Err(e) = crate::scene::save(owned.writer.dir(), &doc) {

@@ -46,6 +46,9 @@ pub struct DiagnosticsDoc {
     /// 场景判定(scene.json;无则空串)。
     pub scene_final: String,
     pub scene_windows: u64,
+    /// 匹配决策(match_log.json):本场新簇数与种子认领数。
+    pub match_new_clusters: u64,
+    pub match_seed_adopts: u64,
 }
 
 pub fn load(note_dir: &Path) -> Option<DiagnosticsDoc> {
@@ -120,6 +123,17 @@ pub fn compute_and_save(
     if let Some(sc) = crate::scene::load(note_dir) {
         doc.scene_final = sc.final_scene;
         doc.scene_windows = sc.windows.len() as u64;
+    }
+    if let Ok(raw) = std::fs::read(note_dir.join("match_log.json")) {
+        if let Ok(v) = serde_json::from_slice::<Vec<serde_json::Value>>(&raw) {
+            for e in v {
+                match e["event"].as_str() {
+                    Some("new_cluster") => doc.match_new_clusters += 1,
+                    Some("seed_adopt") => doc.match_seed_adopts += 1,
+                    _ => {}
+                }
+            }
+        }
     }
     let path = note_dir.join(DIAGNOSTICS_FILE);
     let tmp = path.with_extension("json.tmp");

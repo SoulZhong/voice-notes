@@ -570,6 +570,8 @@ pub enum DiarEvent {
     SceneHint { scene: String },
     /// 停录时的整场场景时间线(scene.json 内容):消费方写入笔记目录。
     SceneReport(crate::scene::SceneDoc),
+    /// 停录时的匹配决策日志(match_log.json 内容,issue #163):消费方写入笔记目录。
+    MatchLog(Vec<crate::diar::registry::MatchTrace>),
     /// 自动规则判为不可见的识别结果。消费方必须先写原始段，再以 reason 写入抑制
     /// sidecar；不得直接丢弃，以便离线评测、误杀诊断和恢复。
     SuppressedFinal {
@@ -1146,6 +1148,10 @@ where
             .unwrap_or(0);
         let scene = std::mem::replace(&mut self.scene, crate::scene::SceneSensor::new());
         (self.on_diar)(DiarEvent::SceneReport(scene.finish(now_ms)));
+        let trace = self.registry.take_match_trace();
+        if !trace.is_empty() {
+            (self.on_diar)(DiarEvent::MatchLog(trace));
+        }
         (self.on_diar)(DiarEvent::Snapshot { snaps, samples });
     }
 }
