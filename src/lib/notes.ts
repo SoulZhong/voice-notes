@@ -484,6 +484,9 @@ export const setSegmentSpeaker = (noteId: string, seq: number, expectedText: str
     逐段 expected_text CAS,任一失配整体失败零写入。返回终值说话人 id。 */
 export const setSegmentsSpeaker = (noteId: string, moves: [number, string][], speakerId: string) =>
   invoke<string>("set_segments_speaker", { noteId, moves, speakerId });
+/** 批量删段(同源双路清洗):逐段 expected_text CAS,任一失配整体失败零写入。 */
+export const deleteSegments = (noteId: string, moves: [number, string][]) =>
+  invoke<void>("delete_segments", { noteId, moves });
 
 /** 说话人 id 排序：S2 < S10（数值序）；非 S<n> 形态沉底按字典序。 */
 export function speakerIdCompare(a: string, b: string): number {

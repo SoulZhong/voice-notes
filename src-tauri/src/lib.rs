@@ -7508,6 +7508,20 @@ fn delete_segment(
 /// 批量改派段落说话人(2026-08-22):同目标一次一批,逐段 expected_text CAS,任一
 /// 失配整体失败零写入;"new" 整批共享一个新号。录制中一律拒(批量场景本就来自
 /// 事后修正;live 路径的单段语义不外推)。
+/// 批量删段(2026-08-23 同源双路清洗):录制中拒;逐段 CAS 任一失配整体失败。
+#[tauri::command]
+fn delete_segments(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    moves: Vec<(u64, String)>,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::DeleteSegments { id: note_id, moves },
+    })
+}
+
 #[tauri::command]
 fn set_segments_speaker(
     app: AppHandle,
@@ -9968,6 +9982,7 @@ pub fn run() {
             delete_segment,
             set_segment_speaker,
             set_segments_speaker,
+            delete_segments,
             pipeline_health,
             screen_capture_permission,
             request_screen_capture_permission,
