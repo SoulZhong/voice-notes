@@ -4,6 +4,19 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { recording, type Line } from "$lib/recording.svelte";
+  import { onSceneHint } from "$lib/events";
+
+  /** 场景提示(2026-08-23 一期):只提示不动行为;只报值得说的场景(2/3)。 */
+  let sceneHint = $state("");
+  $effect(() => {
+    const un = onSceneHint((e) => {
+      if (e.note_id !== recording.noteId) return;
+      sceneHint = e.scene === "speaker_echo" || e.scene === "dual_path" ? e.scene : "";
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
   import { t } from "$lib/i18n/index.svelte";
   import {
     speakerLabel,
@@ -843,6 +856,11 @@
            横幅(修复入口原本唯一挂载点)根本不亮,而采集失败按分类会落进这两张卡——
            不在这里给入口,本 PR 要修的场景就永远触达不了 tccutil 双清。unavailable
            卡的 Windows 场景没有 TCC,按平台隐藏修复行。 -->
+      {#if sceneHint}
+        <div class="banner">
+          {t(sceneHint === "dual_path" ? "record.scene.dualPath" : "record.scene.speakerEcho")}
+        </div>
+      {/if}
       {#if recording.inputOverride}
         <!-- 录前设备检查自动择优(2026-08-22 设计):蓝牙通话麦被自动换成了更稳的
              设备,一句话告知即可,不阻断;想关自动换去设置。 -->

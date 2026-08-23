@@ -390,13 +390,46 @@ pub fn reinforce_person(
     if library_model != expected_model {
         return Ok(ReinforceResult::SkippedModelMismatch);
     }
+    // 声纹断喂(2026-08-23 场景识别一期 A):与 system 活动重叠 ≥80% 的 mic 段是
+    // 外放/同源双路场景里「对方的声音」高危段(两场实测 71%/86% 的 mic 段如此,
+    // 文本比对只拦得住零头)——文本与说话人归属不动,但**绝不喂声纹**。这是
+    // 五实名档案两两余弦 0.53~0.89 互染的最大污染管道(用户手动关联触发的批量
+    // 回灌把整组高危段灌进了库)。system 段不受此过滤(它本来就是对方)。
+    let sys_windows: Vec<(u64, u64)> = segs
+        .iter()
+        .filter(|s| s.source == "system")
+        .map(|s| (s.start_ms, s.end_ms))
+        .collect();
+    let overlapped = |s: &SegmentRecord| -> bool {
+        if s.source != "mic" || sys_windows.is_empty() {
+            return false;
+        }
+        let dur = s.end_ms.saturating_sub(s.start_ms).max(1);
+        let ov: u64 = sys_windows
+            .iter()
+            .map(|(a, b)| s.end_ms.min(*b).saturating_sub(s.start_ms.max(*a)))
+            .sum();
+        ov as f32 / dur as f32 >= crate::session::RESIDUE_OVERLAP_MIN
+    };
+    let mut echo_risk_dropped = 0usize;
     let wanted: Vec<&SegmentRecord> = segs
         .iter()
         .filter(|s| match filter {
             SegFilter::Speakers(ids) => s.speaker.as_ref().is_some_and(|sp| ids.contains(sp)),
             SegFilter::Seqs(seqs) => seqs.contains(&s.seq),
         })
+        .filter(|s| {
+            if overlapped(s) {
+                echo_risk_dropped += 1;
+                false
+            } else {
+                true
+            }
+        })
         .collect();
+    if echo_risk_dropped > 0 {
+        eprintln!("feedback: 断喂 {echo_risk_dropped} 段(与对方发言重叠 ≥80%,回声高危不入库)");
+    }
     if wanted.is_empty() {
         return Ok(ReinforceResult::SkippedNoSegments);
     }
@@ -735,6 +768,30 @@ mod tests {
             .unwrap();
         let pid = links.get(&key).unwrap().clone();
         (store, pid)
+    }
+
+    /// 声纹断喂(2026-08-23 场景识别一期 A):与 system 活动重叠 ≥80% 的 mic 段
+    /// 不参与回灌;独立段照常;system 窗口本身不受过滤。
+    #[test]
+    fn reinforce_drops_mic_segments_overlapped_by_system() {
+        let note = tempfile::tempdir().unwrap();
+        write_wav(&note.path().join("mic.wav"), 10_000);
+        let vp_root = tempfile::tempdir().unwrap();
+        let (store, pid) = seeded_store(vp_root.path(), vec![1.0, 0.0, 0.0, 0.0]);
+        // seq0:被 system(0..5000) 全覆盖 → 断喂;seq1:独立(6000..8000) → 保留。
+        let mut s_sys = seg(9, "system", 0, 5000);
+        s_sys.speaker = Some("S9".into());
+        let mut s0 = seg(0, "mic", 500, 3000);
+        s0.speaker = Some("S1".into());
+        let mut s1 = seg(1, "mic", 6000, 8000);
+        s1.speaker = Some("S1".into());
+        let segs = vec![s_sys, s0, s1];
+        let filter = SegFilter::Speakers(BTreeSet::from(["S1".to_string()]));
+        let model = store.load().embedding_model.clone();
+        // 只应嵌入 1 段(独立那段):Mock 只备一份向量,多取会 panic/Err。
+        let mut emb = MockEmbedder::new(vec![Ok(unit(1))]);
+        let r = reinforce_person(note.path(), &segs, &filter, &pid, &store, &model, &model, &mut emb, "t1", None, &mut false, false).unwrap();
+        assert!(matches!(r, ReinforceResult::Applied { .. }), "{r:?}");
     }
 
     #[test]

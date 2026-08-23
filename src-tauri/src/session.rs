@@ -539,6 +539,11 @@ pub enum DiarEvent {
     /// 时间戳为会话相对值,消费方自行加续录 base_ms)。挂在 DiarEvent 总线上是复用
     /// 既有事件通道(避免为单一事件再扩 run_asr_worker 签名),并非声纹语义。
     EchoRetract { start_ms: u64, end_ms: u64, text: String },
+    /// 场景判定稳定切换(2026-08-23 一期):录制页据此显示非阻断提示。scene 为
+    /// scene.rs 的稳定机读码。一期只提示不动行为。
+    SceneHint { scene: String },
+    /// 停录时的整场场景时间线(scene.json 内容):消费方写入笔记目录。
+    SceneReport(crate::scene::SceneDoc),
     /// 自动规则判为不可见的识别结果。消费方必须先写原始段，再以 reason 写入抑制
     /// sidecar；不得直接丢弃，以便离线评测、误杀诊断和恢复。
     SuppressedFinal {
@@ -594,6 +599,8 @@ where
     /// 各簇代表性样本(声纹库试听),随 process_final 更新、Snapshot 导出。
     /// 同时保留来源段 key,追溯回声撤回时若它正是代表样本也一并移除。
     sample_store: std::collections::HashMap<String, (String, Vec<f32>)>,
+    /// 场景传感器(2026-08-23 一期):只观测不干预,停录随 SceneReport 导出。
+    scene: crate::scene::SceneSensor,
 }
 
 impl<'a, F, P, D> FinalSink<'a, F, P, D>
@@ -626,6 +633,14 @@ where
             recent_mic: VecDeque::new(),
             last_system_partial: String::new(),
             sample_store: std::collections::HashMap::new(),
+            scene: crate::scene::SceneSensor::new(),
+        }
+    }
+
+    /// 场景喂食后的统一收尾:发生稳定切换即发 SceneHint。
+    fn scene_poll(&mut self) {
+        if let Some(sc) = self.scene.poll_change() {
+            (self.on_diar)(DiarEvent::SceneHint { scene: sc.to_string() });
         }
     }
 
@@ -811,6 +826,7 @@ where
                     text_prefix20(&p.text)
                 );
                 dropped_mic.push((p.text.clone(), p.start_ms, p.end_ms, p.rms, "aec_residue"));
+                // 场景观测:追溯残渣同为回声证据(借 sys 到达路径,无 &mut self——由调用方补计)。
                 return false;
             }
             if p.end_ms.saturating_sub(p.start_ms) <= FILLER_MAX_MS
@@ -841,6 +857,9 @@ where
         });
         if !dropped_mic.is_empty() {
             (self.on_partial)(Source::Mic, String::new());
+        }
+        for _ in 0..dropped_mic.len() {
+            self.scene.feed_echo_hit();
         }
         for (text, start_ms, end_ms, rms, reason) in dropped_mic {
             (self.on_diar)(DiarEvent::SuppressedFinal {
@@ -913,6 +932,8 @@ where
         // 该句已定稿:预览级抑制改由 recent_system(带 10s 窗)接力,
         // 清掉在途预览文本,防其无限期滞留误杀后续 mic 预览。
         self.last_system_partial.clear();
+        self.scene.feed_system(sub.start_ms, sub.end_ms, crate::audio::aec::latest_erle_db());
+        self.scene_poll();
         self.recent_system.push_back(RecentSystem {
             text: sub.text,
             norm: sys_norm,
@@ -926,6 +947,9 @@ where
 
     /// mic 侧子段：占位段直通、残渣/回声命中即丢，其余进 hold 等 system 侧比对。
     fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32) {
+        // 场景观测:发声口径,与随后是否被抑制无关(抑制另计 echo_hits)。
+        self.scene.feed_mic(sub.start_ms, sub.end_ms, crate::audio::aec::latest_erle_db());
+        self.scene_poll();
         // 占位文本("[识别失败]"，未归一比较)是"确有发声但识别失败"的痕迹，
         // 不参与回声去重：双路同时识别失败时文本雷同（都是占位串）又时间
         // 邻近，会被误判为回声互相丢弃，静默吞掉一段真实发声。跳过匹配与
@@ -960,6 +984,7 @@ where
                 text_prefix20(&sub.text)
             );
             (self.on_partial)(Source::Mic, String::new());
+            self.scene.feed_echo_hit();
             (self.on_diar)(DiarEvent::SuppressedFinal {
                 source: Source::Mic,
                 text: sub.text,
@@ -978,6 +1003,7 @@ where
                 text_prefix20(&sub.text)
             );
             (self.on_partial)(Source::Mic, String::new());
+            self.scene.feed_echo_hit();
             (self.on_diar)(DiarEvent::SuppressedFinal {
                 source: Source::Mic,
                 text: sub.text,
@@ -1002,6 +1028,7 @@ where
                     // 命中：不 embed/不 assign/不 emit/不落盘，直接丢弃。
                     // 同语言过滤路径：无 final 接替，主动清空该源 partial 残影。
                     (self.on_partial)(Source::Mic, String::new());
+                    self.scene.feed_echo_hit();
                     (self.on_diar)(DiarEvent::SuppressedFinal {
                         source: Source::Mic,
                         text: sub.text,
@@ -1070,6 +1097,17 @@ where
         }
         let snaps = self.registry.snapshot();
         let samples = self.sample_store.drain().map(|(id, (_, samples))| (id, samples)).collect();
+        // 场景时间线先于 Snapshot 导出:消费方写 scene.json(一期只落盘不动行为)。
+        let now_ms = self
+            .recent_system
+            .back()
+            .map(|r| r.end_ms)
+            .into_iter()
+            .chain(self.recent_mic.back().map(|m| m.end_ms))
+            .max()
+            .unwrap_or(0);
+        let scene = std::mem::replace(&mut self.scene, crate::scene::SceneSensor::new());
+        (self.on_diar)(DiarEvent::SceneReport(scene.finish(now_ms)));
         (self.on_diar)(DiarEvent::Snapshot { snaps, samples });
     }
 }

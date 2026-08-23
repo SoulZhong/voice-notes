@@ -123,6 +123,12 @@ export type AingProgressEvent = {
   total: number;
   avg_chunk_ms: number;
 };
+/** 场景判定稳定切换(2026-08-23 一期):录制页非阻断提示。 */
+export type SceneHintEvent = { note_id: string; scene: string };
+export function onSceneHint(cb: (e: SceneHintEvent) => void) {
+  return listen<SceneHintEvent>("scene_hint", (ev) => cb(ev.payload));
+}
+
 /** 一键拆分的逐段嵌入进度(auto_split_progress):区分「在算」与「卡死」。 */
 export type AutoSplitProgressEvent = { note_id: string; done: number; total: number };
 export function onAutoSplitProgress(cb: (e: AutoSplitProgressEvent) => void) {

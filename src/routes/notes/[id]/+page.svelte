@@ -46,6 +46,8 @@
     noteRelated,
     type RelatedNote,
     saveRefined,
+    getScene,
+    type SceneDoc,
     type ParagraphPayload,
     listCalendarCandidates,
     setNoteCalendarEvent,
@@ -678,6 +680,14 @@
     recording.bumpNotes();
   }
 
+  /** 场景判定(scene.json,一期只提示):final_scene 为 2/3/4 时给 info 通知。 */
+  let sceneDoc = $state<SceneDoc | null>(null);
+  $effect(() => {
+    void id;
+    sceneDoc = null;
+    getScene(id).then((d) => (sceneDoc = d)).catch(() => {});
+  });
+
   /** 各说话人最近试听过的段 seq(「确认才入库」:关联时把这一段作为确认样本)。 */
   let lastAuditioned = $state<Record<string, number>>({});
 
@@ -794,6 +804,20 @@
         level: "info",
         text: t("notes.banner.skipped", { n: note?.skipped_lines ?? 0 }),
         epoch: String(note?.skipped_lines ?? 0),
+      });
+    const sc = sceneDoc?.final_scene;
+    if (sc === "dual_path" || sc === "speaker_echo" || sc === "onsite")
+      out.push({
+        key: "scene",
+        level: "info",
+        text: t(
+          sc === "dual_path"
+            ? "notes.scene.dualPath"
+            : sc === "speaker_echo"
+              ? "notes.scene.speakerEcho"
+              : "notes.scene.onsite",
+        ),
+        epoch: sc,
       });
     if (playbackScheme === "mixed" && mixedInfo?.ab_caveat)
       out.push({ key: "abCaveat", level: "info", text: t("notes.mix.abCaveat") });

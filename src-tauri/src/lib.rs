@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod asr;
 mod ipc;
 pub mod models;
+mod scene;
 mod session;
 pub mod settings;
 mod shortcuts;
@@ -5383,6 +5384,14 @@ fn latest_undoable_split(
     Ok(store::split_ops::latest_undoable_for_note(&root, &note_id))
 }
 
+/// 场景判定结果(2026-08-23 一期):笔记页信息级提示用。纯读。
+#[tauri::command]
+fn get_scene(app: AppHandle, note_id: String) -> Result<Option<scene::SceneDoc>, String> {
+    store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?.join(&note_id);
+    Ok(scene::load(&dir))
+}
+
 #[tauri::command]
 fn list_split_ops(app: AppHandle, note_id: String) -> Result<Vec<store::split_ops::SplitOp>, String> {
     store::validate_note_id(&note_id).map_err(|e| e.to_string())?;
@@ -10005,6 +10014,7 @@ pub fn run() {
             auto_split_speaker,
             undo_auto_split,
             latest_undoable_split,
+            get_scene,
             confirm_multi_samples,
             resolve_multi_residual,
             list_split_ops,
