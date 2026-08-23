@@ -808,7 +808,8 @@
       });
     const sc = sceneDoc?.final_scene;
     if (sc === "dual_path" || sc === "speaker_echo" || sc === "onsite") {
-      const suspects = sc !== "onsite" && effectiveView === "raw" ? overlappedMicSeqs(displaySegments) : [];
+      // 修订稿视图也给按钮:点击先切原始逐字稿再选中(勾选模式只存在于原始稿)。
+      const suspects = sc !== "onsite" ? overlappedMicSeqs(displaySegments) : [];
       out.push({
         key: "scene",
         level: "info",
@@ -825,6 +826,7 @@
             ? [{
                 label: t("notes.scene.selectSuspects", { n: suspects.length }),
                 run: () => {
+                  viewMode = "raw";
                   selMode = true;
                   selected = suspects;
                   lastSel = suspects[suspects.length - 1] ?? null;
