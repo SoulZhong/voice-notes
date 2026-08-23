@@ -143,6 +143,11 @@ path = "src/bin/asr_chunk_probe.rs"
 required-features = ["devtools"]
 
 [[bin]]
+name = "diag_stats"
+path = "src/bin/diag_stats.rs"
+required-features = ["devtools"]
+
+[[bin]]
 name = "drift_stats"
 path = "src/bin/drift_stats.rs"
 required-features = ["devtools"]

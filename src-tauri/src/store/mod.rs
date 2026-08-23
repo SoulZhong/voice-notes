@@ -3,6 +3,7 @@ pub mod align;
 pub mod audio;
 pub mod disk;
 mod export;
+pub mod diagnostics;
 pub mod embed_cache;
 pub mod merge_journal;
 pub mod sample_trace;

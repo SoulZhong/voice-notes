@@ -2594,6 +2594,32 @@ pub(crate) fn do_stop_teardown(app: &AppHandle) -> Option<String> {
         }
         Err(e) => eprintln!("[drift] 报告写入失败: {e}"),
     }
+    // 诊断档案(2026-08-23 数据积累):从盘上产物汇总 diagnostics.json,后续开发
+    // 先分析再设计。延时 3s:scene.json 经 actor 信箱异步落盘,给它让路;纯观测,
+    // 失败只打日志(旁路纪律同 drift)。
+    {
+        let dir = s.note_dir.clone();
+        let cap = store::diagnostics::CaptureMeta {
+            capture_path: {
+                let p = app
+                    .path()
+                    .app_data_dir()
+                    .map(|d| settings::load(&d).capture_path)
+                    .unwrap_or_default();
+                format!("{p:?}").to_lowercase()
+            },
+            input_override: s.input_override.clone(),
+            speaker_model: session_model.clone(),
+            erle_last_db: audio::aec::latest_erle_db(),
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let now = chrono::Local::now().to_rfc3339();
+            if let Err(e) = store::diagnostics::compute_and_save(&dir, cap, &now) {
+                eprintln!("[diag] 诊断档案写入失败(忽略): {e}");
+            }
+        });
+    }
     Some(s.note_id)
 }
 
