@@ -21,3 +21,20 @@ export function seqRange(segs: SegLite[], a: number, b: number): number[] {
   const [lo, hi] = ia <= ib ? [ia, ib] : [ib, ia];
   return segs.slice(lo, hi + 1).map((s) => s.seq);
 }
+
+/** 同源双路清洗(2026-08-23):与 system 活动重叠 ≥80% 的 mic 段 seq(高危回声段,
+    与后端断喂同一判据)。 */
+export function overlappedMicSeqs(
+  segs: { seq: number; source: string; start_ms: number; end_ms: number }[],
+): number[] {
+  const sys = segs.filter((s) => s.source === "system").map((s) => [s.start_ms, s.end_ms] as const);
+  const out: number[] = [];
+  for (const s of segs) {
+    if (s.source !== "mic") continue;
+    const dur = Math.max(s.end_ms - s.start_ms, 1);
+    let ov = 0;
+    for (const [a, b] of sys) ov += Math.max(0, Math.min(s.end_ms, b) - Math.max(s.start_ms, a));
+    if (ov / dur >= 0.8) out.push(s.seq);
+  }
+  return out;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { contiguousRun, seqRange } from "./segPick";
+import { contiguousRun, overlappedMicSeqs, seqRange } from "./segPick";
 
 const segs = [
   { seq: 10, speaker: "S1" },
@@ -26,5 +26,17 @@ describe("seqRange", () => {
   it("端点顺序无关,含两端", () => {
     expect(seqRange(segs, 13, 11)).toEqual([11, 12, 13]);
     expect(seqRange(segs, 10, 10)).toEqual([10]);
+  });
+});
+
+describe("overlappedMicSeqs", () => {
+  it("mic 段被 system 覆盖 ≥80% 才入选;system 段与独立 mic 段不选", () => {
+    const segs = [
+      { seq: 1, source: "system", start_ms: 0, end_ms: 10_000 },
+      { seq: 2, source: "mic", start_ms: 1000, end_ms: 3000 }, // 全覆盖 → 选
+      { seq: 3, source: "mic", start_ms: 9000, end_ms: 15_000 }, // 覆盖 1/6 → 不选
+      { seq: 4, source: "mic", start_ms: 20_000, end_ms: 22_000 }, // 独立 → 不选
+    ];
+    expect(overlappedMicSeqs(segs)).toEqual([2]);
   });
 });

@@ -290,6 +290,32 @@ fn is_cjk_dominant(text: &str) -> bool {
     letters > 0 && cjk * 2 >= letters
 }
 
+/// C 层增强(2026-08-23):mic 回声段常是 system 长句的**碎片**,整段对整段的编辑
+/// 距离比不出来(两场实测漏掉数百段,相似度判据只拦 35 段)。补「包含匹配」:
+/// mic 归一文本(≥6 字,短语气词交给残渣门,避免误杀"对对对"这类真插话)作为
+/// 子串出现在时间邻近的 system 归一文本(或其拼接,兜段界切开的碎片)里 → 回声。
+const ECHO_CONTAIN_MIN_CHARS: usize = 6;
+
+fn echo_by_containment(
+    mic_norm: &str,
+    start: u64,
+    end: u64,
+    recent_system: &VecDeque<RecentSystem>,
+) -> bool {
+    if mic_norm.chars().count() < ECHO_CONTAIN_MIN_CHARS {
+        return false;
+    }
+    let near: Vec<&RecentSystem> = recent_system
+        .iter()
+        .filter(|r| time_near(start, end, r.start_ms, r.end_ms))
+        .collect();
+    if near.iter().any(|r| r.norm.contains(mic_norm)) {
+        return true;
+    }
+    let concat: String = near.iter().map(|r| r.norm.as_str()).collect();
+    concat.len() > mic_norm.len() && concat.contains(mic_norm)
+}
+
 fn is_filler_hallucination(
     norm_mic: &str,
     sub_start: u64,
@@ -844,7 +870,9 @@ where
                 return false;
             }
             let echoed = time_near(p.start_ms, p.end_ms, sub.start_ms, sub.end_ms)
-                && text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+                && (text_similarity(&p.norm, &sys_norm) >= ECHO_SIM_THRESHOLD
+                    || sys_norm.contains(p.norm.as_str())
+                        && p.norm.chars().count() >= ECHO_CONTAIN_MIN_CHARS);
             if echoed {
                 eprintln!(
                     "回声去重: 丢弃 mic 段(与 system 段匹配) mic=\"{}\" system=\"{}\"",
@@ -899,7 +927,9 @@ where
                     self.recent_mic[i].end_ms,
                     sub.start_ms,
                     sub.end_ms,
-                ) && text_similarity(&self.recent_mic[i].norm, &sys_norm) >= ECHO_SIM_THRESHOLD;
+                ) && (text_similarity(&self.recent_mic[i].norm, &sys_norm) >= ECHO_SIM_THRESHOLD
+                    || sys_norm.contains(self.recent_mic[i].norm.as_str())
+                        && self.recent_mic[i].norm.chars().count() >= ECHO_CONTAIN_MIN_CHARS);
                 if hit {
                     let m = self.recent_mic.remove(i).unwrap();
                     // 该 mic 段的嵌入早已进过 registry 的簇质心/count/total_ms(process_final
@@ -1016,7 +1046,15 @@ where
             let mic_norm = normalize_text(&sub.text);
             let echo = self.recent_system.iter().find(|r| {
                 time_near(sub.start_ms, sub.end_ms, r.start_ms, r.end_ms)
-                    && text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                    && (text_similarity(&mic_norm, &r.norm) >= ECHO_SIM_THRESHOLD
+                        || r.norm.contains(mic_norm.as_str())
+                            && mic_norm.chars().count() >= ECHO_CONTAIN_MIN_CHARS)
+            });
+            // 碎片跨段界:单段没兜住时对拼接窗口再查一次包含。
+            let echo = echo.or_else(|| {
+                echo_by_containment(&mic_norm, sub.start_ms, sub.end_ms, &self.recent_system)
+                    .then(|| self.recent_system.back())
+                    .flatten()
             });
             match echo {
                 Some(r) => {
@@ -4093,6 +4131,30 @@ mod session_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// C 层包含匹配:mic 碎片是 system 长句子串即回声;短文本/不邻近/拼接兜底各验。
+    #[test]
+    fn echo_containment_matches_fragments_but_spares_short_and_far() {
+        let mk = |t: &str, a: u64, b: u64| RecentSystem {
+            text: t.into(),
+            norm: normalize_text(t),
+            start_ms: a,
+            end_ms: b,
+        };
+        let mut rs: VecDeque<RecentSystem> = VecDeque::new();
+        rs.push_back(mk("实验限好我放完了应该构件都过然后第二个是", 1000, 9000));
+        // 碎片包含 → 命中
+        assert!(echo_by_containment(&normalize_text("构件都过。然后第二个是"), 2000, 4000, &rs));
+        // 不足 6 字(真插话空间)→ 放行
+        assert!(!echo_by_containment(&normalize_text("都过。"), 2000, 4000, &rs));
+        // 时间不邻近 → 放行
+        assert!(!echo_by_containment(&normalize_text("构件都过。然后第二个是"), 60_000, 62_000, &rs));
+        // 跨段界:两段拼接后才包含
+        let mut rs2: VecDeque<RecentSystem> = VecDeque::new();
+        rs2.push_back(mk("我们一线的同事的经验确实", 1000, 4000));
+        rs2.push_back(mk("不是那么厚就一定是给我们的", 4000, 8000));
+        assert!(echo_by_containment(&normalize_text("经验确实不是那么厚"), 2000, 6000, &rs2));
+    }
+
     #[test]
     fn filler_hallucination_needs_all_three_conditions() {
         let mut rs: VecDeque<RecentSystem> = VecDeque::new();

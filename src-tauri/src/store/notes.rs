@@ -464,6 +464,22 @@ impl NoteStore {
         write_jsonl_atomic(&dir, &lines)
     }
 
+    /// 批量删段(2026-08-23 同源双路清洗):逐段 (seq, expected_text) CAS 预检全过
+    /// 才动第一笔,任一失配整体失败零写入——与 set_segments_speaker 同一准则。
+    pub fn delete_segments(&self, id: &str, moves: &[(u64, String)]) -> anyhow::Result<()> {
+        anyhow::ensure!(!moves.is_empty(), "没有选中任何段落");
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let mut lines = read_jsonl_lines(&dir.join("segments.jsonl"));
+        for (seq, expected) in moves {
+            find_seg(&mut lines, *seq, expected)?;
+        }
+        let gone: std::collections::BTreeSet<u64> = moves.iter().map(|(q, _)| *q).collect();
+        lines.retain(|l| !matches!(l, JsonlLine::Seg(r) if gone.contains(&r.seq)));
+        write_jsonl_atomic(&dir, &lines)
+    }
+
     /// 改段落说话人归属。speaker_id="new" → 分配 S<max+1>（max 跨 speakers.json 键与
     /// 段内既有 speaker id，防与孤儿 id 撞号）先入表再改段（中间崩溃只留无害孤儿）。
     /// 只改 segment.speaker 字段，不回灌声纹质心（离线编辑不影响聚类）。

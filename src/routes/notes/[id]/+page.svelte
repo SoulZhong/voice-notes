@@ -37,6 +37,7 @@
     deleteSegment,
     setSegmentSpeaker,
     setSegmentsSpeaker,
+    deleteSegments,
     clearNoteSpeakerPerson,
     noteAudioInfo,
     assignNoteSpeakerPerson,
@@ -69,7 +70,7 @@
   import { autoSplitSpeaker, undoAutoSplit, latestUndoableSplit, listSplitOps, type AutoSplitOut, type SplitOp } from "$lib/multiSpeaker";
   import NoticeStrip from "$lib/NoticeStrip.svelte";
   import SegSpeakerPop from "$lib/SegSpeakerPop.svelte";
-  import { contiguousRun, seqRange } from "$lib/segPick";
+  import { contiguousRun, overlappedMicSeqs, seqRange } from "$lib/segPick";
   import type { Notice } from "$lib/notices";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import MarkdownEditor, { type BadgeAttrs } from "$lib/editor/MarkdownEditor.svelte";
@@ -806,7 +807,8 @@
         epoch: String(note?.skipped_lines ?? 0),
       });
     const sc = sceneDoc?.final_scene;
-    if (sc === "dual_path" || sc === "speaker_echo" || sc === "onsite")
+    if (sc === "dual_path" || sc === "speaker_echo" || sc === "onsite") {
+      const suspects = sc !== "onsite" && effectiveView === "raw" ? overlappedMicSeqs(displaySegments) : [];
       out.push({
         key: "scene",
         level: "info",
@@ -818,7 +820,19 @@
               : "notes.scene.onsite",
         ),
         epoch: sc,
+        actions:
+          suspects.length > 0 && canEdit
+            ? [{
+                label: t("notes.scene.selectSuspects", { n: suspects.length }),
+                run: () => {
+                  selMode = true;
+                  selected = suspects;
+                  lastSel = suspects[suspects.length - 1] ?? null;
+                },
+              }]
+            : [],
       });
+    }
     if (playbackScheme === "mixed" && mixedInfo?.ab_caveat)
       out.push({ key: "abCaveat", level: "info", text: t("notes.mix.abCaveat") });
     return out;
@@ -1770,6 +1784,7 @@
   let lastSel: number | null = null;
   let selPick = $state<DOMRect | null>(null);
   function exitSelMode() {
+    selDeleteConfirm = false;
     selMode = false;
     selected = [];
     lastSel = null;
@@ -1799,6 +1814,28 @@
       }
     });
   });
+  let selDeleteConfirm = $state(false);
+  async function applySelDelete() {
+    const bySeq = new Map((note?.segments ?? []).map((s) => [s.seq, s]));
+    const moves: [number, string][] = [];
+    for (const q of selected) {
+      const seg = bySeq.get(q);
+      if (seg) moves.push([q, seg.text]);
+    }
+    selDeleteConfirm = false;
+    if (moves.length === 0) return;
+    try {
+      await deleteSegments(id, moves);
+      await refresh();
+      syncSegments(true);
+    } catch (e) {
+      error = `${e}`;
+      await refresh();
+      syncSegments(true);
+    }
+    exitSelMode();
+  }
+
   async function applySelPick(sid: string) {
     const seqs = [...selected];
     selPick = null;
@@ -2461,6 +2498,12 @@
         >
           {t("notes.segpick.changeTo")}
         </button>
+        {#if selDeleteConfirm}
+          <button class="link danger" onclick={applySelDelete}>{t("notes.segpick.deleteConfirm", { n: selected.length })}</button>
+          <button class="link" onclick={() => (selDeleteConfirm = false)}>{t("notes.cancel")}</button>
+        {:else}
+          <button class="link danger" disabled={selected.length === 0} onclick={() => (selDeleteConfirm = true)}>{t("notes.segpick.deleteSel")}</button>
+        {/if}
         <button class="link" disabled={selected.length === 0} onclick={() => (selected = [])}>{t("notes.segpick.clearSel")}</button>
         <button class="link" onclick={exitSelMode}>{t("notes.segpick.exitSel")}</button>
       </div>
