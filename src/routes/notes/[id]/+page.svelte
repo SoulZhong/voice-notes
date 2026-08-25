@@ -54,6 +54,7 @@
     setNoteCalendarEvent,
     noteCalendarPermission,
     identifyNote,
+    finalizeInterruptedNote,
     type CalendarCandidate,
   } from "$lib/notes";
   import { noteEntityLinks, type EntityLink } from "$lib/graph";
@@ -798,7 +799,20 @@
               }],
       });
     if (note?.meta.state === "recording")
-      out.push({ key: "interrupted", level: "info", text: t("notes.banner.interrupted") });
+      out.push({
+        key: "interrupted",
+        level: "info",
+        text: finalizeErr
+          ? t("notes.banner.finalizeFailed", { e: finalizeErr })
+          : t("notes.banner.interrupted"),
+        epoch: finalizeErr || undefined,
+        actions: [{
+          label: finalizing ? t("notes.banner.finalizing") : t("notes.banner.finalizeNow"),
+          run: finalizeNow,
+          // 本篇正被续录时不给收尾(后端也会拒);别的笔记在录不挡。
+          disabled: finalizing || (recording.isLive && recording.noteId === id),
+        }],
+      });
     if ((note?.skipped_lines ?? 0) > 0)
       out.push({
         key: "skipped",
@@ -1515,6 +1529,27 @@
   /** 用 FireRed 重转写本篇。**只作用于这一次**,不动全局设置(Codex P1):改设置既
       不保证这次生效(云端模式下重转写会走云端批式),又会清缓存并异步预载,与紧接着
       启动的重转写各建一份 1.2G 模型。想让以后录制也用它,去设置里改。 */
+  /** 「就此结束」:中断笔记免续录收尾。成功后 refresh 拉新 meta(complete),横幅
+      随 state 消失;Aing/转码在后端继续,进度走既有 refine 事件。失败进横幅重试。 */
+  let finalizing = $state(false);
+  let finalizeErr = $state("");
+  async function finalizeNow() {
+    if (finalizing) return;
+    finalizing = true;
+    finalizeErr = "";
+    try {
+      await finalizeInterruptedNote(id);
+      await refresh();
+      // 侧栏列表不订阅本页状态:bump notesVersion 让它的 $effect 重拉,
+      // 「已中断」徽章才会跟着 meta 变化消失(与编辑页保存后同一套路)。
+      recording.bumpNotes();
+    } catch (e) {
+      finalizeErr = String(e);
+    } finally {
+      finalizing = false;
+    }
+  }
+
   async function repairWithFirered() {
     if (repairing) return;
     repairing = true;
