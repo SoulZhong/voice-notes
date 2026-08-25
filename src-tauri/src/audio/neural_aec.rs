@@ -399,8 +399,27 @@ impl DtlnAec {
 /// (45 分钟音频约 34 万块,plan/模型只建一次)。输出长度恒等于 `mic.len()`;
 /// `reference` 短则零垫齐、长则截断到 `mic.len()`。
 pub fn suppress_residual(mic: &[f32], reference: &[f32], models_dir: &Path) -> Result<Vec<f32>> {
-    let aec = load(models_dir)?;
-    aec.process(mic, reference)
+    // catch_unwind 兜底:调用方(echo_clean)的契约是「失败保留 AEC3 输出,永不
+    // panic、不阻塞转码」,用 match Err 接——但 tract 家族有用 panic 报错的前科
+    // (Cargo.toml 路线注释里就记着 tract-tflite 负轴 ReduceMean panic)。panic 从
+    // 这里穿出去,轻则毒化上游锁,重则 unwind 途中再遇 Drop panic 直接 abort 整个
+    // 应用。AssertUnwindSafe 成立:aec/入参都在本次调用内构造与消费,panic 后一律
+    // 丢弃,无跨调用状态可被半写。
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let aec = load(models_dir)?;
+        aec.process(mic, reference)
+    }));
+    match r {
+        Ok(inner) => inner,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(无文本 payload)".into());
+            Err(anyhow::anyhow!("神经残余级内部 panic(已拦截,降级 AEC3): {msg}"))
+        }
+    }
 }
 
 #[cfg(test)]

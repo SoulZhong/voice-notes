@@ -158,8 +158,23 @@ path = "src/bin/speaker_ab_eval.rs"
 required-features = ["devtools"]
 
 [[bin]]
+name = "echo_clean_repro"
+path = "src/bin/echo_clean_repro.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "speaker_loso_eval"
+path = "src/bin/speaker_loso_eval.rs"
+required-features = ["devtools"]
+
+[[bin]]
 name = "speaker_eval"
 path = "src/bin/speaker_eval.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "vp_probe"
+path = "src/bin/vp_probe.rs"
 required-features = ["devtools"]
 
 [[bin]]

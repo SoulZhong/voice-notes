@@ -1,4 +1,4 @@
-mod audio;
+pub mod audio; // devtools bin echo_clean_repro 复现停录清洗崩溃需要直呼 clean_wav
 #[cfg(target_os = "macos")]
 mod calendar;
 #[cfg(not(target_os = "macos"))]
@@ -2770,6 +2770,8 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
     // 所以这里显式刷一次。会话锁已在上面的块结束时释放,与 refresh_menu 读的
     // running 锁不嵌套。
     tray::refresh_menu(app);
+    // 图标动画同理:边沿在暂停路上不存在,必须在这里显式停(set_anim_paused 注释)。
+    tray::set_anim_paused(app, true);
     Ok(())
 }
 
@@ -2777,6 +2779,42 @@ fn do_pause_recording(app: &AppHandle) -> Result<(), String> {
 fn pause_recording(app: AppHandle) -> Result<(), String> {
     // 薄壳(P1 改道):经 lifecycle actor 信箱串行执行,执行体仍是 do_pause_recording。
     app.state::<lifecycle::LifecycleHandle>().command(lifecycle::Cmd::Pause)
+}
+
+/// 「就此结束」:把已中断笔记免续录收尾(2026-08-26 用户实报:为收尾假录一两秒不合理)。
+///
+/// 守卫最小集,与停止尾巴同权:
+/// - 该笔记正被活动会话占用(续录已重开)→ 拒绝;**别的笔记在录不挡**——Aing/转码
+///   本就允许与新录制并行,重叠由 AING_GATE(Aing 全局串行)与 spawn_refine 内的
+///   F1 守卫(入队前复查活跃会话)兜底。
+/// - 幂等由 store 层保证:非 recording 态返回 false,这里就不再补跑尾巴。
+/// - 与续录的竞争:两入口都不经内核仲裁,窗口极窄且两个结局都自洽——续录先到则
+///   本命令的会话守卫拒绝;本命令先写 complete 而用户随后续录,writer 的
+///   open_resume 会把 state 改回 recording,F1 守卫让转码不碰追加中的 WAV。
+///
+/// 声纹**不补**(见 NoteStore::finalize_interrupted 注释):实时入库在录制期间已
+/// 发生,停止时的加权回写消费内存会话态,随崩溃丢失——不从快照伪造。
+#[tauri::command]
+fn finalize_interrupted_note(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
+    let occupied = state
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.note_id == note_id)
+        .unwrap_or(false);
+    if occupied {
+        return Err(tr!("该笔记正在录制中,请先停止", "This note is currently recording; stop it first"));
+    }
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    let changed = store::NoteStore::new(dir)
+        .finalize_interrupted(&note_id)
+        .map_err(|e| e.to_string())?;
+    if changed {
+        // 与首次停录同一条尾巴:云端二遍(若配)→ 会后 Aing → 转码入队。
+        spawn_refine(app, note_id, true);
+    }
+    Ok(())
 }
 
 /// 续录共用实现(命令壳、UDS 桥共用)。逐语句搬自原 unpause_recording 命令体,唯一改动是
@@ -2802,6 +2840,7 @@ fn do_resume_recording(app: &AppHandle) -> Result<(), String> {
     };
     let _ = app.emit("status", ev);
     tray::refresh_menu(app); // 同 do_pause_recording:把「恢复录制」换回「暂停录制」
+    tray::set_anim_paused(app, false); // 恢复抖动:边沿在暂停路上不存在,显式起
     Ok(())
 }
 
@@ -9941,6 +9980,7 @@ pub fn run() {
             recording_status,
             pause_recording,
             unpause_recording,
+            finalize_interrupted_note,
             list_notes,
             get_note,
             refine_note,

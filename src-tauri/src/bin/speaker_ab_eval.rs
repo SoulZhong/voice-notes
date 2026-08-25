@@ -364,7 +364,7 @@ fn main() {
     if total == 0 {
         // 空库/坏数据根目录会被 VoiceprintStore::load 降级成空库,零探针的"成功"
         // 输出全是 NaN,只会误导——显式报错退出(codex P2)。
-        eprintln!("没有任何会话变体探针:data_root 是否指错?(voiceprints.json 缺失/损坏也会降级为空库)");
+        eprintln!("没有会话变体探针。2026-08-23 校准后重建只写主质心,库里本就不再有变体——\n本工具已失去探针来源,改用 speaker_loso_eval(留一样本法,不依赖库的内部表示)。\n(若你确信库里该有变体:data_root 指错或 voiceprints.json 损坏也会降级为空库)");
         std::process::exit(2);
     }
     println!("探针(库会话变体留一): {total} 条,人物 {} 个", vp.people.len());

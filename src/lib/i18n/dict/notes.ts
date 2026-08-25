@@ -42,7 +42,10 @@ export const zh = {
   "notes.resume.blocked": "无法继续录制:请确认没有正在进行的录制",
 
   // 详情页:横幅与提示
-  "notes.banner.interrupted": "这场录音曾意外中断，中断前的内容已保存。点击下方播放器右侧的红色录音键可接着录。",
+  "notes.banner.interrupted": "这场录音曾意外中断，中断前的内容已保存。可以点击下方播放器右侧的红色录音键接着录，或就此结束整理成稿。",
+  "notes.banner.finalizeNow": "就此结束",
+  "notes.banner.finalizing": "正在收尾…",
+  "notes.banner.finalizeFailed": "收尾失败：{e}",
   "notes.notice.more": "还有 {n} 条",
   "notes.notice.collapse": "收起",
   "notes.notice.gotIt": "知道了",
@@ -193,7 +196,10 @@ export const en = {
   "notes.resume.blocked": "Cannot resume recording: make sure no other recording is in progress",
 
   "notes.banner.interrupted":
-    "This recording was interrupted unexpectedly; everything before the interruption is saved. Click the red record button to the right of the player below to continue.",
+    "This recording was interrupted unexpectedly; everything before the interruption is saved. Click the red record button to the right of the player to continue, or finish it now.",
+  "notes.banner.finalizeNow": "Finish now",
+  "notes.banner.finalizing": "Finishing…",
+  "notes.banner.finalizeFailed": "Failed to finish: {e}",
   "notes.notice.more": "{n} more",
   "notes.notice.collapse": "Collapse",
   "notes.notice.gotIt": "Got it",

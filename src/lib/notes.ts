@@ -259,6 +259,9 @@ export const setNoteCalendarEvent = (id: string, eventId: string | null) =>
 export const noteCalendarPermission = () => invoke<string>("calendar_permission");
 /** 手动触发/重试说话人身份推断(P2a):完成后 identify_done 事件驱动收件箱刷新。 */
 export const identifyNote = (id: string) => invoke<void>("identify_note", { id });
+/** 「就此结束」:把已中断笔记免续录收尾(state→complete + 会后 Aing/转码尾巴)。 */
+export const finalizeInterruptedNote = (id: string) =>
+  invoke<void>("finalize_interrupted_note", { noteId: id });
 
 export const listNotes = () => invoke<NoteSummary[]>("list_notes");
 /** 笔记音频轨道;无音频(旧笔记/写失败)返回空数组。 */

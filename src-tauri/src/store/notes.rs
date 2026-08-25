@@ -248,6 +248,39 @@ impl NoteStore {
         Ok(())
     }
 
+    /// 「就此结束」:把一篇**已中断**(state=recording 且无活动会话)的笔记直接收尾,
+    /// 不要求先续录。此前中断态的唯一出口是「续录一两秒再停止」——借道重建会话好让
+    /// 正常停止跑收尾,代价是往结束了的会议里追加一段垃圾音频(2026-08-26 用户实报
+    /// 不合理)。本方法只做磁盘可完成的部分:
+    /// - `ended_at` = started_at + 段落时间轴最大 end_ms(与列表页时长口径一致;
+    ///   无段落/起点损坏回退当前时刻),state 置 complete;
+    /// - 声纹**不补**:录制期间的实时入库已发生,停止时那份加权回写/补样本消费的是
+    ///   内存会话态,随崩溃丢失——不从快照伪造(调用方注释同此)。
+    /// 转码/会后 Aing 由调用方走 spawn_refine 尾巴(state=complete 后转码门自然放行)。
+    ///
+    /// 幂等:非 recording 态返回 Ok(false) 不动盘。锁纪律与 rename/delete 相同
+    /// (EDIT_LOCK + 笔记 flock);「无活动会话」由命令壳把关——store 层看不见会话。
+    pub fn finalize_interrupted(&self, id: &str) -> anyhow::Result<bool> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let Some(mut meta) = read_meta(&dir) else {
+            anyhow::bail!("meta.json 缺失或损坏,无法收尾");
+        };
+        if meta.state != "recording" {
+            return Ok(false); // 已完成/其它态:幂等,不动
+        }
+        let ended = chrono::DateTime::parse_from_rfc3339(&meta.started_at)
+            .ok()
+            .zip(max_end_ms(&dir.join("segments.jsonl")))
+            .map(|(start, ms)| (start + chrono::Duration::milliseconds(ms as i64)).to_rfc3339())
+            .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
+        meta.ended_at = Some(ended);
+        meta.state = "complete".into();
+        write_meta_atomic(&dir, &meta)?;
+        Ok(true)
+    }
+
     /// 改说话人显示名：读表（缺失则视为空表新建）→ 设 name → 原子写 speakers.json。
     pub fn rename_speaker(&self, id: &str, speaker_id: &str, name: &str) -> anyhow::Result<()> {
         let _guard = edit_guard();
@@ -1634,6 +1667,52 @@ mod tests {
         assert_eq!(store.title("n1").as_deref(), Some("周会"));
         assert_eq!(store.title("nope"), None, "不存在的笔记 → None");
     }
+    /// 「就此结束」:中断笔记免续录收尾。ended_at = started_at + 段落最大 end_ms
+    /// (与列表页时长口径一致);非 recording 态幂等不动;无段落回退当前时刻。
+    #[test]
+    fn finalize_interrupted_completes_with_segment_end_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("n1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"schema_version":1,"id":"n1","title":"t","started_at":"2026-08-24T15:26:17+08:00","ended_at":null,"state":"recording"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            concat!(
+                r#"{"seq":0,"source":"mic","text":"a","start_ms":0,"end_ms":1000,"speaker":"S1","rms":0.1}"#, "\n",
+                r#"{"seq":1,"source":"mic","text":"b","start_ms":50000,"end_ms":533000,"speaker":"S1","rms":0.1}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        assert!(store.finalize_interrupted("n1").unwrap(), "首次收尾应落盘");
+        let m = read_meta(&dir).unwrap();
+        assert_eq!(m.state, "complete");
+        assert_eq!(
+            m.ended_at.as_deref(),
+            Some("2026-08-24T15:35:10+08:00"),
+            "ended = started + 533s(段落最大 end_ms)"
+        );
+        assert!(!store.finalize_interrupted("n1").unwrap(), "已完成:幂等,不再动");
+        assert_eq!(read_meta(&dir).unwrap(), m, "第二次调用逐位不变");
+
+        // 无段落:回退当前时刻(只验存在性与态,不钉墙钟)。
+        let d2 = tmp.path().join("n2");
+        std::fs::create_dir_all(&d2).unwrap();
+        std::fs::write(
+            d2.join("meta.json"),
+            r#"{"schema_version":1,"id":"n2","title":"t","started_at":"2026-08-24T15:26:17+08:00","ended_at":null,"state":"recording"}"#,
+        )
+        .unwrap();
+        assert!(store.finalize_interrupted("n2").unwrap());
+        let m2 = read_meta(&d2).unwrap();
+        assert_eq!(m2.state, "complete");
+        assert!(m2.ended_at.is_some(), "无段落也要有 ended_at(回退 now)");
+    }
+
     #[test]
     fn calendar_snapshot_roundtrip_and_legacy_compat() {
         // 旧 meta(无 calendar 键)→ None/false;带快照往返保真。

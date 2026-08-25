@@ -1070,16 +1070,23 @@ impl VoiceprintStore {
                 person.centroids.keys().cloned().collect()
             };
             person.centroids.clear();
-            let variants: Vec<PersonCentroid> = embs
-                .iter()
-                .take(SESSION_CENTROIDS_MAX)
-                .map(|v| PersonCentroid { vec: v.clone(), count: 1, seen: String::new() })
-                .collect();
+            // 只写主质心。曾经这里把每份样本再写成一份 count=1 的会话质心,但
+            // **一份样本 ≠ 一场出场**:会话质心的语义是"同一个人的一种状态"(戴耳机
+            // /外放/不同增益时代),由 upsert_from_session 在真实出场且净增量够
+            // SESSION_CENTROID_MIN_MS 时记录。把样本冒充成变体有两个代价——匹配取
+            // max,一段装错人的样本就成了这个人身上一根永久的认领触角(2026-08-23
+            // 实测:311 个会话质心里 87% 是这样来的 count=1 单样本);而且样本平均
+            // 本就是更稳的锚,变体只会往里掺噪声。
+            // 真库落地实测(130 人 / 240 段样本):代表向量 479 → 167;人工否决过的
+            // 人物对里仍会被判成同一人的比例 32.8% → 19.0%;≥0.68 的危险人物对
+            // 38 → 22;卷入"互认团"的语料占比 58% → 30%;最大互认团 13 人 → 9 人。
+            // 逐位相同的重复向量(cos=1.000)一并消失。
+            // 注:端到端识别准确率没有可测的变化(见 SEED_ASSIGN_RAW_FLOOR 处的 2×2),
+            // 本改动的收益是"库里能互相认错的人变少了",不是"认得更准了"。
             for src in &sources {
                 person
                     .centroids
                     .insert(src.clone(), PersonCentroid { vec: mean.clone(), count, seen: String::new() });
-                person.session_centroids.insert(src.clone(), variants.clone());
             }
             rebuilt += 1;
         }
@@ -1154,17 +1161,14 @@ impl VoiceprintStore {
             }
             let mean = normalize(&mean).unwrap_or(mean);
             let count = embs.len() as u64;
-            let variants: Vec<PersonCentroid> = embs
-                .iter()
-                .take(SESSION_CENTROIDS_MAX)
-                .map(|v| PersonCentroid { vec: v.clone(), count: 1, seen: String::new() })
-                .collect();
+            // 只写主质心,**不把每份样本再写成一份会话质心**——见 rebuild_for_model
+            // 同处注释:一份样本 ≠ 一场出场,而单样本变体在 max 匹配下会让一段脏音频
+            // 永久毒化整个档案。样本基线就是"所有样本的平均",没有状态变体。
             // 信道无从考据(样本文件不带信道):与全库重建同一取舍,写 mic 一档。
             person.centroids.insert(
                 "mic".into(),
                 PersonCentroid { vec: mean, count, seen: String::new() },
             );
-            person.session_centroids.insert("mic".into(), variants);
         }
         self.save(&vp)?;
         journal.invalidate(&[id], "已退回样本基线重算", None);
@@ -2741,7 +2745,7 @@ mod tests {
         let a = &vp.people[&pa];
         // 方波经 FlipEmbedder → [0,1];主质心与变体都应是新空间向量。
         assert!((normalize(&a.centroids["mic"].vec).unwrap()[1] - 1.0).abs() < 1e-4);
-        assert_eq!(a.session_centroids["mic"].len(), 1, "变体=各样本嵌入");
+        assert!(a.session_centroids.is_empty(), "样本基线只写主质心,不把样本冒充成状态变体");
         let b = &vp.people[&pb];
         assert!(b.centroids.is_empty(), "无样本者清空质心(身份保留,等重新积累)");
         assert!(b.session_centroids.is_empty());
@@ -4071,6 +4075,42 @@ mod tests {
         assert_eq!(p.total_ms, 2_000, "total_ms 重置为现存样本时长");
         assert!(p.last_seen.is_empty(), "last_seen 置空,不得用 mtime 推断");
         assert!(p.voiceprint_quarantined, "重算不动隔离标记(解除另有入口)");
+    }
+
+    /// 样本基线 = 所有样本的平均,**没有状态变体**。
+    ///
+    /// 这条钉的是 2026-08-23 那次校准的核心语义:一份样本 ≠ 一场出场。曾经重建会把
+    /// 每份样本再写成一份 count=1 的会话质心,而种子匹配对同人多向量取 max——于是
+    /// 一段装错人的样本就成了这个人身上一根永久的认领触角,主质心里的污染反而被
+    /// 平均稀释得看不出来。真实库里 311 个会话质心有 87% 是这么来的。
+    #[test]
+    fn 样本基线只写主质心且等于样本均值() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = two_people_store(&tmp);
+        // fixture 已给 P1 塞了一份占位样本,换成两份可嵌入的真 wav:嵌入分别是
+        // [1,0] 与 [0,1],均值方向应是 [√½,√½]。
+        std::fs::remove_file(tmp.path().join("voiceprints/P1.wav")).unwrap();
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        store.append_sample("P1", &square).unwrap();
+        store.append_sample("P1", &square).unwrap();
+        assert_eq!(store.sample_paths_existing("P1").len(), 2, "前置:两份样本都在");
+
+        let mut e = crate::diar::MockEmbedder::new(vec![Ok(vec![1.0, 0.0]), Ok(vec![0.0, 1.0])]);
+        store.rebuild_person_from_samples("P1", &mut e, MODEL).unwrap();
+
+        let p = &store.load().people["P1"];
+        assert!(
+            p.session_centroids.is_empty(),
+            "样本不得冒充状态变体——否则一段脏样本在 max 匹配下永久毒化档案"
+        );
+        let main = &p.centroids["mic"];
+        assert_eq!(main.count, 2, "count = 参与平均的样本份数");
+        let unit = normalize(&main.vec).unwrap();
+        assert!(
+            (unit[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4
+                && (unit[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4,
+            "主质心 = 样本嵌入的归一化平均,实得 {unit:?}"
+        );
     }
 
     #[test]

@@ -306,6 +306,21 @@ fn stop_anim(app: &AppHandle) {
     dispatch_icon(app, IDLE_ICON);
 }
 
+/// 暂停/恢复的动画驱动。内核不追踪 paused 翻转(见 consumers::tray_flag:
+/// (Recording, Recording) 转移一律 None),所以 `update` 的状态边沿在暂停路上
+/// **不存在**——菜单文案早为此在 do_pause/do_resume 里显式刷过一次,图标动画
+/// 当时漏了同样的补偿,暂停后图标继续抖,读起来像"没暂停成"(2026-08-24 真机
+/// 实报)。与菜单同一choke point:仅 do_pause_recording / do_resume_recording
+/// 在**实际发生翻转后**调用(幂等早退分支不会走到),恢复时会话必然存在且录制中,
+/// 直接 start 是安全的。等价性测试见 is_active——那是判定,这里是被漏掉的接线。
+pub fn set_anim_paused(app: &AppHandle, paused: bool) {
+    if paused {
+        stop_anim(app);
+    } else {
+        start_anim(app);
+    }
+}
+
 /// 把某帧图标 fire-and-forget 派发到主线程设置（彩色 Logo，非模板）。
 fn dispatch_icon(app: &AppHandle, bytes: &'static [u8]) {
     let app2 = app.clone();
