@@ -350,6 +350,123 @@ mod tests {
         assert!(prod < 1.0, "生产配置在这段真语音上不得触顶,实测 {prod:.3}");
     }
 
+    /// #126 收口:守住削波**本身**,不只峰值余量。上面的 headroom 用例守两条腿,
+    /// 但它的 fixture 只有 4.1s,复现不出稀疏削波——若将来别的改动(换 WebRTC
+    /// 版本、动 max_gain、上游增益)让削波重新出现而 headroom 数值没动,它抓不到。
+    ///
+    /// fixture `tts_zh_16k_40s.wav` 为**合成语音**(macOS `say -v Tingting`,
+    /// 会议体中文文本,无版权/隐私负担;40s ≈ 1.25MB)。合成语音能驱动 AGC2 的
+    /// 语音置信度门控已实测验证(agc_experiments::tts_fixture_viability 判据一:
+    /// max_gain 60 vs 20 的尾段增益 948x vs 100x,自适应确在工作——不是当年
+    /// 噪声实验"只读 initial_gain"的坑)。
+    ///
+    /// 信号形态复刻实录故障:「长时间低电平 → 突然响段」。前 30s 压到 1/8 喂
+    /// 自适应增益爬满,后 10s 全电平——增益还没退下来,响峰顶到 limiter。
+    /// 同实验判据二:此形态下 headroom=3 在 0.05~0.4 全部输入电平削 1~3 处、
+    /// headroom=6 恒 0;平稳形态高电平不具区分度(输入本身顶满,两边都削)。
+    ///
+    /// 双腿断言:
+    /// ① 金丝雀:3dB 余量必须削出来(>0)——否则是 fixture/链路失去了复现力,
+    ///    测试自身失效要大声喊,不许静默通过;
+    /// ② 正主:生产配置必须零削波——让削波回来的任何改动都在此被抓,
+    ///    不只 headroom 数值回调(那是上面用例的活)。
+    #[test]
+    fn production_agc2_no_clipping_on_dynamic_speech() {
+        let mut rd = hound::WavReader::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tts_zh_16k_40s.wav"
+        ))
+        .expect("TTS 语音 fixture");
+        // fixture 格式契约全量断言(codex P2):FRAME=160 的时间语义依赖 16k 单声道
+        // s16;双声道会让 30s 切点实际落在 15s,长度漂移会让"后 10s"失真但可能照过。
+        let spec = rd.spec();
+        assert_eq!(spec.sample_rate, 16_000, "fixture 需 16k");
+        assert_eq!(spec.channels, 1, "fixture 需单声道,否则帧时间语义整体错位");
+        assert_eq!(spec.bits_per_sample, 16, "fixture 需 s16");
+        let raw: Vec<f32> =
+            rd.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();
+        assert_eq!(raw.len(), 16_000 * 40, "fixture 需恰 40.000s,时长漂移会让区间断言失真");
+        let src_peak = raw.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-9);
+
+        const WARM_SAMPLES: usize = 16_000 * 30;
+        // 分区间计削波(codex P2):金丝雀只认**响段**的削波——铺垫段若因别的原因触顶,
+        // 整段计数会让金丝雀失去针对性还照样通过。返回(铺垫段削波, 响段削波)。
+        let clips_by_region = |out: &[f32]| -> (usize, usize) {
+            let warm = out[..WARM_SAMPLES.min(out.len())].iter().filter(|x| x.abs() >= 1.0).count();
+            let loud = out[WARM_SAMPLES.min(out.len())..].iter().filter(|x| x.abs() >= 1.0).count();
+            (warm, loud)
+        };
+        // 金丝雀腿:隔离 AGC2(headroom=3)。它的职责只有一个——证明本 fixture 在本
+        // 形态下**能**把 3dB 余量打出削波;隔离配置比全链更"纯",不受 AEC3 演化影响。
+        let clips_isolated = |ad: config::AdaptiveDigital, sig: &[f32]| -> (usize, usize) {
+            let ap = Processor::new(16_000).unwrap();
+            ap.set_config(Config {
+                gain_controller: Some(config::GainController::GainController2(
+                    config::GainController2 {
+                        input_volume_controller_enabled: false,
+                        adaptive_digital: Some(ad),
+                        fixed_digital: config::FixedDigital::default(),
+                    },
+                )),
+                ..Default::default()
+            });
+            let mut buf = sig.to_vec();
+            let mut out = Vec::with_capacity(sig.len());
+            for chunk in buf.chunks_mut(FRAME) {
+                if chunk.len() < FRAME {
+                    break;
+                }
+                let _ = ap.process_capture_frame([&mut chunk[..]]);
+                out.extend_from_slice(chunk);
+            }
+            clips_by_region(&out)
+        };
+        // 正主腿:走 new_pair 生产工厂(AEC3 + AGC2 生产参数,零远端参考——AEC3 无可
+        // 消之声但滤波器在环内)。codex P2 指出手抄配置会漏掉生产接线的演化;此处直接
+        // 消费生产构造器,上游改增益/换 WebRTC 版本都在环内。NS 只在 new_aligned_pair
+        // (实时对)里,本测试契约不含它。
+        let clips_production = |sig: &[f32]| -> (usize, usize) {
+            let (mut render, mut capture) = new_pair(16_000).unwrap();
+            let zeros = vec![0.0f32; FRAME];
+            let mut out = Vec::with_capacity(sig.len());
+            for chunk in sig.chunks(FRAME) {
+                if chunk.len() < FRAME {
+                    break;
+                }
+                render.push(&zeros);
+                out.extend_from_slice(&capture.process(chunk));
+            }
+            clips_by_region(&out)
+        };
+        let tight = config::AdaptiveDigital { headroom_db: 3.0, ..production_adaptive_digital() };
+        // 两档输入峰都要守:0.05(轻声设备)与 0.1(实录出爆音的量级)。
+        for target_peak in [0.05f32, 0.1] {
+            let k = target_peak / src_peak;
+            let dynamic: Vec<f32> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, x)| if i < WARM_SAMPLES { x * k / 8.0 } else { x * k })
+                .collect();
+            let (canary_warm, canary_loud) = clips_isolated(tight.clone(), &dynamic);
+            assert_eq!(
+                canary_warm, 0,
+                "金丝雀失去针对性(输入峰 {target_peak}):铺垫段不该削波却削了 {canary_warm} 处\
+                 ——削波不再由「低电平铺垫→响段」机制驱动,本测试的复现力依据失效"
+            );
+            assert!(
+                canary_loud > 0,
+                "金丝雀失效(输入峰 {target_peak}):3dB 余量必须在响段削出来,现在 0 处\
+                 ——fixture 或链路失去了复现力,本测试守不住削波了"
+            );
+            let (prod_warm, prod_loud) = clips_production(&dynamic);
+            assert_eq!(
+                (prod_warm, prod_loud), (0, 0),
+                "生产链路在「低电平铺垫→响段」形态(输入峰 {target_peak})下削波\
+                 铺垫{prod_warm}/响段{prod_loud} 处(同信号隔离 3dB 余量响段削 {canary_loud} 处)\
+                 ——爆音回来了"
+            );
+        }
+    }
     #[test]
     fn framing_conserves_samples_in_10ms_multiples() {
         let (_r, mut c) = new_pair(16_000).unwrap();
@@ -894,6 +1011,112 @@ mod agc_experiments {
                 "{name} | 峰{:.3} 削{:>5}    | {:>10.1}x   | {:>10.1}x",
                 loud.0, loud.1, w1, w2
             );
+        }
+    }
+
+    /// TTS fixture 可行性(issue #126 方向 2):合成语音能不能驱动 AGC2 的自适应档。
+    /// 判据一(issue 原文):同一段信号在 `max_gain_db` 60 与 20 下输出 RMS 必须
+    /// 显著不同——若相同,说明自适应没启动、量到的只是 initial_gain 直读,方案作废
+    /// (与下面 real_speech 注释记录的噪声之坑同因)。
+    /// 判据二(fixture 要守的目标本身):headroom 3 与 6 在多档输入电平 × 有无
+    /// 「静音→响峰」动态包络下的削波数——3dB 复现不出削波,fixture 就守不住削波。
+    #[test]
+    #[ignore] // 实验用:cargo test agc_experiments::tts_fixture_viability -- --ignored --nocapture(VN_AGC_WAV 可换语料,缺省用仓库 fixture)
+    fn tts_fixture_viability() {
+        // codex P2:实验原版只打印不断言,判据翻车也静默成功,无法当可重复验证依据。
+        // 现改为缺省吃仓库 fixture + 两判据都硬断言——它既是当年的可行性档案,也是
+        // 随时可重跑的复核工具。
+        let path = std::env::var("VN_AGC_WAV").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tts_zh_16k_40s.wav").into()
+        });
+        let mut rd = hound::WavReader::open(&path).expect("打不开 WAV");
+        assert_eq!(rd.spec().sample_rate, 16_000, "需 16k");
+        assert_eq!(rd.spec().channels, 1, "需单声道,双声道会让帧时间语义错位");
+        let raw: Vec<f32> = rd
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .take(16_000 * 360)
+            .collect();
+        let src_peak = raw.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-9);
+        let mk = |headroom: f32, max_gain: f32| Config {
+            gain_controller: Some(config::GainController::GainController2(config::GainController2 {
+                input_volume_controller_enabled: false,
+                adaptive_digital: Some(config::AdaptiveDigital {
+                    headroom_db: headroom,
+                    max_gain_db: max_gain,
+                    ..super::production_adaptive_digital()
+                }),
+                fixed_digital: config::FixedDigital::default(),
+            })),
+            ..Default::default()
+        };
+        // 通用跑批:整段过 AGC,返回(尾段功率增益, 峰值, 削波数)。尾段 = 最后 1/3,
+        // 自适应爬升期(前段)不计,量的是稳态。
+        let run = |cfg: Config, sig: &[f32]| -> (f32, f32, usize) {
+            let ap = Processor::new(16_000).unwrap();
+            ap.set_config(cfg);
+            let mut buf = sig.to_vec();
+            // tail 上对齐到 FRAME(codex P2):输出从下一个完整帧才开始收,分母若从
+            // 未对齐的样本数起算,分子分母比较的就不是同一批样本。
+            let tail = (sig.len() / 3 * 2).div_ceil(FRAME) * FRAME;
+            let (mut out_tail, mut peak, mut clips) = (Vec::new(), 0.0f32, 0usize);
+            for (i, chunk) in buf.chunks_mut(FRAME).enumerate() {
+                if chunk.len() < FRAME {
+                    break;
+                }
+                let _ = ap.process_capture_frame([&mut chunk[..]]);
+                for v in chunk.iter() {
+                    peak = peak.max(v.abs());
+                    if v.abs() >= 1.0 {
+                        clips += 1;
+                    }
+                }
+                if i * FRAME >= tail {
+                    out_tail.extend_from_slice(chunk);
+                }
+            }
+            (power(&out_tail) / power(&sig[tail..sig.len() / FRAME * FRAME]), peak, clips)
+            // ↑ 分子 out_tail 与分母切片同起点 tail、同终点(整帧截断),口径一致。
+        };
+
+        // 判据一:低电平(峰 0.02)下 max_gain 60 vs 20,尾段功率增益要显著分开。
+        let quiet: Vec<f32> = raw.iter().map(|x| x * 0.02 / src_peak).collect();
+        let g60 = run(mk(6.0, 60.0), &quiet);
+        let g20 = run(mk(6.0, 20.0), &quiet);
+        eprintln!("判据一(自适应启动): max_gain 60 → 尾段增益 {:.1}x | max_gain 20 → {:.1}x", g60.0, g20.0);
+        eprintln!("  (相同 ≈ 只在读 initial_gain,自适应未启动,TTS 方案作废)");
+        assert!(
+            g60.0 > g20.0 * 2.0,
+            "判据一失败:max_gain 60/20 的尾段增益 {:.1}x vs {:.1}x 未显著分开——\
+             自适应档没在这段语料上启动(2026-08-26 基线 948x vs 100x)",
+            g60.0, g20.0
+        );
+
+        // 判据二:headroom 3 vs 6 的削波复现。两种形态:
+        //  平稳 = 整段等比缩放;动态 = 前 30s 压到 1/8(安静铺垫喂增益) + 之后原样响。
+        eprintln!("判据二(削波复现):  形态 | 输入峰 | headroom 3 峰/削 | headroom 6 峰/削");
+        for target in [0.05f32, 0.1, 0.2, 0.4] {
+            let k = target / src_peak;
+            let flat: Vec<f32> = raw.iter().map(|x| x * k).collect();
+            let dynamic: Vec<f32> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, x)| if i < 16_000 * 30 { x * k / 8.0 } else { x * k })
+                .collect();
+            for (name, sig) in [("平稳", &flat), ("动态", &dynamic)] {
+                let h3 = run(mk(3.0, 60.0), sig);
+                let h6 = run(mk(6.0, 60.0), sig);
+                eprintln!(
+                    "  {name} | {target:>4.2} | 峰{:.3} 削{:>5} | 峰{:.3} 削{:>5}",
+                    h3.1, h3.2, h6.1, h6.2
+                );
+                // 只有动态形态是判据:平稳形态高电平下输入本身顶满,两边都削,不具区分度
+                // (2026-08-26 基线:动态下 h3 全电平削 1~3 处,h6 恒 0)。
+                if name == "动态" {
+                    assert!(h3.2 > 0, "判据二失败(峰 {target}):动态形态下 3dB 余量削不出来,fixture 无复现力");
+                    assert_eq!(h6.2, 0, "判据二失败(峰 {target}):动态形态下 6dB 余量竟削 {} 处", h6.2);
+                }
+            }
         }
     }
 
