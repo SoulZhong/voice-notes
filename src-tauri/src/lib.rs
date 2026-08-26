@@ -2997,6 +2997,10 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     let note_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+        // 收尾(清心跳+RefineFinished)交 RAII(codex 八轮):polish/回调 panic 展开时
+        // 手动清理会被跳过,心跳条目从此常驻,refine_status 永远报一个不存在的 worker。
+        let _refine_done =
+            RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
         let report = |stage: &str, state: &str| {
             refine_beat_touch(&note_id, beat_gen, stage, state); // 心跳表(#173):部分重试同样可探
             lc.report(lifecycle::machine::Msg::RefineProgress {
@@ -3097,8 +3101,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                 report("all", "failed");
             }
         }
-        refine_beat_clear(&note_id, beat_gen); // 部分重试无 RAII 哨兵,收尾手动清心跳
-        lc.report(lifecycle::machine::Msg::RefineFinished { note_id: note_id.clone() });
+        // 清心跳与 RefineFinished 由函数头部的 RefineDoneOnDrop 在退出时统一处理
     });
     Ok(())
 }

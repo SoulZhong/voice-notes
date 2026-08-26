@@ -448,8 +448,6 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         {
                             let app2 = app.clone();
                             let id2 = id.clone();
-                            // 停摆判定时刻先于线程起跑固定下来:自愈只处置比这更旧的盘上稿
-                            let stalled_at = chrono::Local::now().to_rfc3339();
                             std::thread::spawn(move || {
                                 #[cfg(target_os = "macos")]
                                 {
@@ -488,11 +486,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             .map(|lc| lc.is_refining(&id2))
                                             .unwrap_or(false)
                                     };
-                                    match crate::store::heal_stale_refined(
-                                        &dir,
-                                        &stalled_at,
-                                        still_stale,
-                                    ) {
+                                    match crate::store::heal_stale_refined(&dir, still_stale) {
                                         Ok(act) => {
                                             eprintln!("lifecycle: 停摆自愈({id2}):{act}");
                                             if act.contains("failed") {
