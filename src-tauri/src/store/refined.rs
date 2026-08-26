@@ -917,14 +917,30 @@ pub fn heal_stale_refined(note_dir: &Path, stalled_at: &str) -> anyhow::Result<&
                 (note_dir.parent(), note_dir.file_name().and_then(|n| n.to_str()))
             {
                 if let Ok(note) = crate::store::NoteStore::new(parent.to_path_buf()).load(id) {
+                    // aing.json 只能存未投影时基(codex 六轮):展示端
+                    // load_refined_for_display 会再按 align.json 投影一次,直接存
+                    // 规范加载器给的已投影值等于二次投影。段序/抑制/空段语义照用
+                    // 规范视图,时间戳按 seq 回查磁盘原始行。
+                    let mut raw_ms = std::collections::HashMap::new();
+                    if let Ok(raw) = std::fs::read_to_string(note_dir.join("segments.jsonl")) {
+                        for line in raw.lines() {
+                            if let Ok(r) =
+                                serde_json::from_str::<crate::store::SegmentRecord>(line)
+                            {
+                                raw_ms.insert(r.seq, (r.start_ms, r.end_ms));
+                            }
+                        }
+                    }
                     for seg in note.segments {
+                        let (start_ms, end_ms) =
+                            raw_ms.get(&seg.seq).copied().unwrap_or((seg.start_ms, seg.end_ms));
                         doc.paragraphs.push(RefinedParagraph {
                             speaker: seg.speaker.unwrap_or_default(),
                             name: None,
                             person_id: None,
                             text: seg.text,
-                            start_ms: seg.start_ms,
-                            end_ms: seg.end_ms,
+                            start_ms,
+                            end_ms,
                             source_seqs: vec![seg.seq],
                             mentions: Vec::new(),
                         });
