@@ -694,6 +694,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: 2,
             generated_at: "2026-07-21T00:00:00Z".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),

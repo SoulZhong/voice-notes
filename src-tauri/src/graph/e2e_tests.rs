@@ -30,6 +30,8 @@ fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
         llm_failed_paragraphs: Vec::new(),
         schema_version: store::refined::REFINED_SCHEMA_VERSION,
         generated_at: "2026-07-21T12:00:00+08:00".into(),
+        written_at: String::new(),
+        writer_pid: 0,
         llm_model: Some("fixture-model".into()),
         stages: RefineStages {
             filter: "done".into(),

@@ -433,6 +433,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
         // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
         let report = |stage: &str, st: &str| {
+            refine_beat_touch(&note_id, stage, st); // 心跳表(#173):对外可探的最近进度
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
                 stage: stage.into(),
@@ -883,8 +884,37 @@ struct RefineDoneOnDrop {
 }
 impl Drop for RefineDoneOnDrop {
     fn drop(&mut self) {
+        // 心跳条目随 worker 生命周期清理:线程无论怎么结束都必然移除(与 RefineFinished
+        // 同一 RAII 教训)。
+        refine_beat_clear(&self.note_id);
         self.lc.report(lifecycle::machine::Msg::RefineFinished { note_id: self.note_id.clone() });
     }
+}
+
+/// Aing 心跳表(issue #173):note_id → (最近一次 stage/state, 时刻)。由 spawn_refine
+/// 的 report 咽喉更新、RefineDoneOnDrop 清理;refine_status(UDS/MCP)对外暴露——
+/// 外部工具从此能区分「在跑(心跳新鲜)/收工(无条目)/真停摆(心跳陈旧)」,不再靠
+/// 猜文件名与取样验尸(2026-08-26 事故:一次误诊链耗掉两小时)。
+static REFINE_BEAT: Mutex<Option<std::collections::HashMap<String, (String, std::time::Instant)>>> =
+    Mutex::new(None);
+
+fn refine_beat_touch(note_id: &str, stage: &str, state_s: &str) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.get_or_insert_with(Default::default)
+        .insert(note_id.to_string(), (format!("{stage}/{state_s}"), std::time::Instant::now()));
+}
+
+fn refine_beat_clear(note_id: &str) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(m) = g.as_mut() {
+        m.remove(note_id);
+    }
+}
+
+/// 查一篇的心跳:Some((stage/state, 距今 ms))。None = 无 worker 在跑。
+pub(crate) fn refine_beat_of(note_id: &str) -> Option<(String, u64)> {
+    let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()?.get(note_id).map(|(s, t)| (s.clone(), t.elapsed().as_millis() as u64))
 }
 
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session

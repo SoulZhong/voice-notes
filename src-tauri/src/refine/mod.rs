@@ -296,6 +296,8 @@ pub fn run_local(
         llm_failed_paragraphs: Vec::new(),
         schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
         generated_at: generated_at.to_string(),
+        written_at: String::new(),   // 落盘时自动盖戳(write_refined_atomic_locked)
+        writer_pid: 0,
         llm_model: None,
         stages: RefineStages {
             filter: "done".into(),
@@ -802,6 +804,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
 
+    /// 落盘咽喉会盖 written_at/writer_pid(issue #173),比对"内存稿==盘上稿"时剥掉。
+    fn sans_write_stamp(mut v: serde_json::Value) -> serde_json::Value {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("written_at");
+            o.remove("writer_pid");
+        }
+        v
+    }
+
     fn para(text: &str) -> crate::store::RefinedParagraph {
         crate::store::RefinedParagraph {
             speaker: "R1".into(),
@@ -820,6 +831,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -983,8 +996,8 @@ mod tests {
         }
         let persisted = store::load_refined(&root.join("notes").join(note_id)).unwrap();
         assert_eq!(
-            serde_json::to_value(doc).unwrap(),
-            serde_json::to_value(&persisted).unwrap(),
+            sans_write_stamp(serde_json::to_value(doc).unwrap()),
+            sans_write_stamp(serde_json::to_value(&persisted).unwrap()),
             "HTTP 返回内存态必须与落盘完全一致"
         );
         assert_task4_stale_not_invalid(root, note_id, doc);
@@ -1643,6 +1656,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1684,6 +1699,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1827,8 +1844,8 @@ mod tests {
         assert_eq!(graph_bytes(&persisted), graph_bytes(&doc));
         assert_eq!(persisted.stages.relations, "done");
         assert_eq!(
-            serde_json::to_value(&persisted).unwrap(),
-            serde_json::to_value(&doc).unwrap(),
+            sans_write_stamp(serde_json::to_value(&persisted).unwrap()),
+            sans_write_stamp(serde_json::to_value(&doc).unwrap()),
             "成功返回的内存 doc 必须与 reload 后逐字段一致"
         );
     }
@@ -2210,8 +2227,8 @@ mod tests {
                 .iter()
                 .any(|entity| entity.id == mention.entity)));
         assert_eq!(
-            serde_json::to_value(&doc).unwrap(),
-            serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap()
+            sans_write_stamp(serde_json::to_value(&doc).unwrap()),
+            sans_write_stamp(serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap())
         );
     }
 
@@ -2241,8 +2258,8 @@ mod tests {
         assert_eq!(graph_bytes(&doc), baseline_graph);
         assert_fallback_dependencies(&doc);
         assert_eq!(
-            serde_json::to_value(&doc).unwrap(),
-            serde_json::to_value(store::load_refined(dir.path()).unwrap()).unwrap()
+            sans_write_stamp(serde_json::to_value(&doc).unwrap()),
+            sans_write_stamp(serde_json::to_value(store::load_refined(dir.path()).unwrap()).unwrap())
         );
     }
 
@@ -2385,8 +2402,8 @@ mod tests {
         assert_eq!(graph_bytes(&doc), baseline_graph);
         assert_fallback_dependencies(&doc);
         assert_eq!(
-            serde_json::to_value(&doc).unwrap(),
-            serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap()
+            sans_write_stamp(serde_json::to_value(&doc).unwrap()),
+            sans_write_stamp(serde_json::to_value(store::load_refined(&dir).unwrap()).unwrap())
         );
         assert_eq!(
             graph_bytes(&store::load_refined(&dir).unwrap()),

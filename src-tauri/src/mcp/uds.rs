@@ -120,6 +120,11 @@ trait UdsBackend {
     fn stop(&self) -> Result<serde_json::Value, String>;
     fn pause(&self) -> Result<serde_json::Value, String>;
     fn resume(&self) -> Result<serde_json::Value, String>;
+    /// Aing 可观测(issue #173,只读不受控):在跑/心跳/盘上稿三视角合一。
+    /// 默认实现报未支持,生产 AppBackend 覆写——mock 后端们不关心此 op。
+    fn refine_status(&self, _note_id: &str) -> Result<serde_json::Value, String> {
+        Err("refine_status 未实现".into())
+    }
     /// 触发「重新 Aing」:Some(id)=单篇;None=全部未 Aing(entities 空)的 complete 笔记。
     fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String>;
     /// 发起文件重转写(异步启动即返回;input 缺省 dual)。
@@ -160,6 +165,10 @@ fn dispatch_with<B: UdsBackend>(b: &B, req: &Req) -> Resp {
             None => Err("retranscribe 需要 note_id".into()),
         },
         "retranscribe_status" => Ok(b.retranscribe_status()),
+        "refine_status" => match req.note_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => b.refine_status(id),
+            None => Err("refine_status 需要 note_id".into()),
+        },
         other => return err(format!("未知 op: {other}")),
     };
     match result {
@@ -309,6 +318,38 @@ impl UdsBackend for AppBackend<'_> {
             .state::<crate::lifecycle::LifecycleHandle>()
             .command(crate::lifecycle::Cmd::Unpause)?;
         Ok(status_json(self.0))
+    }
+
+    fn refine_status(&self, note_id: &str) -> Result<serde_json::Value, String> {
+        crate::store::validate_note_id(note_id).map_err(|e| e.to_string())?;
+        let app = self.0;
+        // 三视角(#173):内核在跑集合 / worker 心跳 / 盘上稿摘要。合起来能区分
+        // 「在跑(refining=true 且心跳新鲜)/收工(有稿且 written_at 新)/真停摆
+        // (refining=true 但心跳陈旧)」——2026-08-26 那晚要有这个,两小时误诊不会发生。
+        let refining = app.state::<crate::lifecycle::LifecycleHandle>().is_refining(note_id);
+        let beat = crate::refine_beat_of(note_id);
+        let doc = crate::notes_dir(app)
+            .ok()
+            .map(|root| root.join(note_id))
+            .and_then(|dir| crate::store::load_refined(&dir))
+            .map(|d| {
+                serde_json::json!({
+                    "stages": {
+                        "filter": d.stages.filter, "recluster": d.stages.recluster,
+                        "llm": d.stages.llm, "entities": d.stages.entities,
+                        "relations": d.stages.relations,
+                    },
+                    "written_at": d.written_at, "writer_pid": d.writer_pid,
+                    "generated_at": d.generated_at,
+                    "llm_failed_paragraphs": d.llm_failed_paragraphs.len(),
+                })
+            });
+        Ok(serde_json::json!({
+            "note_id": note_id,
+            "refining": refining,
+            "beat": beat.map(|(stage, age_ms)| serde_json::json!({ "stage": stage, "age_ms": age_ms })),
+            "doc": doc,
+        }))
     }
 
     fn reaing(&self, note_id: Option<&str>) -> Result<serde_json::Value, String> {

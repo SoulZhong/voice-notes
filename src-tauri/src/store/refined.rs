@@ -80,6 +80,15 @@ pub struct RefineStages {
 pub struct RefinedDoc {
     pub schema_version: u32,
     pub generated_at: String,
+    /// 本份文档**落盘时刻**(每次整写在 write_refined_atomic_locked 内自动盖戳)。
+    /// generated_at 是"开跑时刻",事后无法回答"这稿是几点写出的/哪一轮写的"——
+    /// 2026-08-26 排障为此误判过一整晚(issue #173)。旧文件缺字段 serde default 兼容。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub written_at: String,
+    /// 写出本份文档的进程 pid(运行代次标识):重跑覆盖旧稿时,新旧稿归属哪一轮
+    /// 从此可查。0 不落盘。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub writer_pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
     pub stages: RefineStages,
@@ -649,12 +658,50 @@ fn symlink_metadata_optional(path: &Path) -> std::io::Result<Option<std::fs::Met
 /// 若 aing.json 存在但已损坏(`load_aing_file` 返回 `None`),此处不进位——损坏时
 /// 旧值本就不可读，无法判断该不该让步，保持当前 doc 的 revision 原样落盘是有意
 /// 取舍。
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+impl RefinedDoc {
+    /// 停摆自愈用的最小失败稿(issue #173):worker 无声消失且盘上无稿时落一份
+    /// llm=failed,让 UI 显示「失败可重跑」而不是「这场没做 AI 整理」的幻觉。
+    /// 段落为空——展示端 load 缺段回落原始 segments,不影响正文。
+    pub fn minimal_failed() -> Self {
+        Self {
+            schema_version: 1,
+            generated_at: String::new(), // 调用方盖当前时刻
+            written_at: String::new(),   // 落盘咽喉自动盖
+            writer_pid: 0,
+            llm_model: None,
+            stages: RefineStages {
+                filter: "off".into(),
+                recluster: "off".into(),
+                llm: "failed".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
+            discarded_seqs: Vec::new(),
+            entities: Vec::new(),
+            graph_extraction: None,
+            relations: Vec::new(),
+            graph_support_mentions: Vec::new(),
+            revision: 0,
+            paragraphs: Vec::new(),
+            llm_failed_paragraphs: Vec::new(),
+            stale: false,
+        }
+    }
+}
+
 pub(crate) fn write_refined_atomic_locked(
     note_dir: &Path,
     doc: &RefinedDoc,
     _lock: &NoteLock,
 ) -> anyhow::Result<()> {
     let mut doc = doc.clone();
+    // 落盘戳单一咽喉:所有整写路径(llm 成功/失败态/agent/滞留自愈)都从这里过。
+    doc.written_at = chrono::Local::now().to_rfc3339();
+    doc.writer_pid = std::process::id();
     if let Some(Some(existing)) = load_aing_file(note_dir) {
         if existing.revision > doc.revision {
             doc.revision = existing.revision.saturating_add(1);
@@ -1101,6 +1148,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T00:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1177,6 +1226,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: Some("deepseek-chat".into()),
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![1, 2],
@@ -1254,6 +1305,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-16T10:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1469,6 +1522,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1586,6 +1641,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1863,6 +1920,8 @@ mod tests {
             llm_failed_paragraphs: vec![0, 2],
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "partial".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1898,6 +1957,8 @@ mod tests {
             llm_failed_paragraphs: vec![],
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1922,6 +1983,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-08-20T00:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],

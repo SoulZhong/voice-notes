@@ -439,6 +439,49 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             crate::telemetry::ErrorKind::RefineStaleHeal,
                             "Aing 条目无进度超时,已自愈移除",
                         );
+                        // 停摆监工升级(issue #173):自愈不只摘标记——
+                        // ① 自采线程栈落 stderr:2026-08-26 的两小时误诊全因停摆现场
+                        //   无尸检材料;下次直接带报告(macOS sample 自身 pid,best-effort)。
+                        // ② 盘上补失败态:aing.json 缺失时写 llm=failed 的最小稿,UI 从
+                        //   「这场没做 AI 整理」的幻觉变成「失败可重跑」;worker 若诈尸
+                        //   跑完会整写覆盖,不冲突。均在独立线程做,不阻塞 actor 信箱。
+                        {
+                            let app2 = app.clone();
+                            let id2 = id.clone();
+                            std::thread::spawn(move || {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let pid = std::process::id().to_string();
+                                    match std::process::Command::new("sample")
+                                        .args([pid.as_str(), "2"])
+                                        .output()
+                                    {
+                                        Ok(o) => eprintln!(
+                                            "lifecycle: 停摆尸检({id2})线程栈采样 {} 字节:
+{}",
+                                            o.stdout.len(),
+                                            String::from_utf8_lossy(&o.stdout)
+                                        ),
+                                        Err(e) => eprintln!("lifecycle: 停摆尸检采样失败({id2}): {e}"),
+                                    }
+                                }
+                                if let Ok(root) = crate::notes_dir(&app2) {
+                                    let dir = root.join(&id2);
+                                    if !crate::store::aing_exists(&dir) {
+                                        let mut doc = crate::store::RefinedDoc::minimal_failed();
+                                        doc.generated_at = chrono::Local::now().to_rfc3339();
+                                        match crate::store::write_refined_atomic(&dir, &doc) {
+                                            Ok(()) => eprintln!(
+                                                "lifecycle: 停摆自愈({id2})已落 llm=failed 最小稿,UI 可重跑"
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "lifecycle: 停摆自愈({id2})失败态落盘失败(仅日志): {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         // RefineFinished 命中时只移除、零效果(见 machine.rs),可直接应用。
                         let (next, _fx) = machine::handle(&state, &Msg::RefineFinished { note_id: id.clone() });
                         state = next;

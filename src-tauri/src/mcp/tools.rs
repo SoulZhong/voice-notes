@@ -641,6 +641,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T09:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: Some("text-model".into()),
             stages: store::RefineStages {
                 filter: "done".into(),
@@ -746,6 +748,8 @@ mod tests {
                 llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "2026-03-01T11:00:00+08:00".into(),
+                written_at: String::new(),
+                writer_pid: 0,
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),
@@ -845,6 +849,8 @@ mod tests {
                 llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "2026-01-01T11:00:00+08:00".into(),
+                written_at: String::new(),
+                writer_pid: 0,
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),
@@ -955,6 +961,8 @@ mod tests {
                 llm_failed_paragraphs: Vec::new(),
                 schema_version: 1,
                 generated_at: "t".into(),
+                written_at: String::new(),
+                writer_pid: 0,
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),

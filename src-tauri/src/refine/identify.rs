@@ -1096,6 +1096,8 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: crate::store::refined::REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
