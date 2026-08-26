@@ -51,6 +51,11 @@ pub struct SceneDoc {
     pub windows: Vec<SceneWindow>,
     /// 占时最长的场景(unknown 不参与;全 unknown 则为 unknown)。
     pub final_scene: String,
+    /// 事后回填标记(scene_backfill 工具,issue #169):区别于录制期活体判定——
+    /// 回填缺 erle、被抑制段无时间戳,口径有已知偏差(见该 bin 模块注释)。
+    /// false 不落盘,旧文件缺字段 serde default 兼容。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
 }
 
 pub struct SceneSensor {
@@ -158,7 +163,8 @@ impl SceneSensor {
         self.roll(end_ms, erle_db);
     }
 
-    /// mic 段(无论随后被抑制与否都喂:活跃度按"发声"口径)。
+    /// mic 段(无论随后被抑制与否都喂:活跃度按"发声"口径)。重叠按「已喂入的
+    /// system 窗口」因果计算——实时流没有未来知识,只能这么算。
     pub fn feed_mic(&mut self, start_ms: u64, end_ms: u64, erle_db: Option<f32>) {
         let dur = end_ms.saturating_sub(start_ms);
         let ov: u64 = self
@@ -167,8 +173,17 @@ impl SceneSensor {
             .map(|(a, b)| end_ms.min(*b).saturating_sub(start_ms.max(*a)))
             .sum::<u64>()
             .min(dur);
+        self.feed_mic_precomputed(start_ms, end_ms, ov, erle_db);
+    }
+
+    /// mic 段,重叠量由调用方给定(scene_backfill 离线回放用,issue #169):离线有
+    /// 全局视野,重叠按完整 system 时间线算,不受喂入顺序/段粒度影响——重转写过的
+    /// 场次段结构与活体子段毫无对应,因果式 sys_windows 在那里会系统性漏算。
+    /// feed_mic 委托到此,判定/防抖/入桶单一实现。
+    pub fn feed_mic_precomputed(&mut self, start_ms: u64, end_ms: u64, ov_ms: u64, erle_db: Option<f32>) {
+        let dur = end_ms.saturating_sub(start_ms);
         self.cur.mic_ms += dur;
-        self.cur.mic_ov_ms += ov;
+        self.cur.mic_ov_ms += ov_ms.min(dur);
         self.roll(end_ms, erle_db);
     }
 
@@ -201,7 +216,7 @@ impl SceneSensor {
             .max_by_key(|(_, ms)| *ms)
             .map(|(s, _)| s.to_string())
             .unwrap_or_else(|| SC_UNKNOWN.to_string());
-        SceneDoc { schema_version: 1, windows: self.timeline, final_scene }
+        SceneDoc { schema_version: 1, windows: self.timeline, final_scene, backfilled: false }
     }
 }
 

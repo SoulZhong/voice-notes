@@ -10,7 +10,7 @@ pub mod pipeline;
 pub mod asr;
 mod ipc;
 pub mod models;
-mod scene;
+pub mod scene; // devtools bin scene_backfill(#169)重放 SceneSensor 需要
 mod session;
 pub mod settings;
 mod shortcuts;

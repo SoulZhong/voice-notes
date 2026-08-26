@@ -2345,15 +2345,27 @@
       <div class="view-switch">
         <Segmented items={viewItems} value={effectiveView} onSelect={(id) => (viewMode = id as "refined" | "raw")} />
         <span class="spacer"></span>
-        {#if refining && aingProg}
+        <!-- 行内进度只需 refining:aingProg 来自分块事件,页面重载后要等下一个分块
+             才有——这期间(以及长块/重试中)也必须有可见指示,否则整理中的页面只剩
+             一排灰按钮,读起来像"Aing 丢了"(2026-08-26 用户实报,3h 会议整理 70 分钟
+             无任何指示)。无分块数据时显示通用"整理中",有再升级为 n/m + ETA。 -->
+        {#if refining}
           <span class="aing-inline">
-            {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
-              done: aingProg.done,
-              total: aingProg.total,
-            })}
-            {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+            {#if aingProg}
+              {t(aingProg.stage === "llm_retry" ? "notes.progress.llmRetry" : "notes.progress.llm", {
+                done: aingProg.done,
+                total: aingProg.total,
+              })}
+              {#if aingEtaMin !== null}· {t("notes.progress.eta", { m: aingEtaMin })}{/if}
+            {:else}
+              {t("notes.progress.llmWarmup")}
+            {/if}
           </span>
-            <button
+        {/if}
+        <!-- 魔杖(重新 Aing)恒渲染:PR#141 重构误把上面的 {/if} 挪到按钮之后,魔杖被
+             吞进 refining && aingProg——普通完成笔记从此没有这个按钮,整理中还会
+             整个消失。按钮自身的 disabled/casting 已按 refining 处理,无需条件包裹。 -->
+        <button
             class="reaing"
             class:casting={refining}
             disabled={refining || note.meta.state !== "complete"}
@@ -2385,7 +2397,6 @@
             </svg>
             <AiStateLabel state={aiState} />
           </button>
-        {/if}
 
         <!-- 文件重转写(三期):离线用盘上音频重新转写全文,破坏性(覆盖原始逐字稿,
              自动备份为 segments.orig.jsonl),二段确认走 retransConfirm 胶囊。

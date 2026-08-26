@@ -172,6 +172,7 @@ mod tests {
                     scene: "dual_path".into(),
                 }],
                 final_scene: "dual_path".into(),
+                backfilled: false,
             },
         )
         .unwrap();
