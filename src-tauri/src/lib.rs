@@ -530,6 +530,13 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
+                // 新一轮起跑先撕掉旧收工戳(codex 十一轮):重跑一场已收工的笔记时,
+                // 若本轮中途停摆,自愈不能被上一轮留下的 finished_at 骗成「已收工」。
+                // 无旧稿(首跑)时 update 失败,静默即可。
+                let _ = store::update_refined_for_retry(&dir, |d| {
+                    d.finished_at = String::new();
+                    Ok(())
+                });
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
@@ -3026,6 +3033,13 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             });
         };
         report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
+        // 起跑撕旧收工戳,理由同 spawn_refine(codex 十一轮);重试必有旧稿,失败仅日志
+        if let Err(e) = store::update_refined_for_retry(&dir, |d| {
+            d.finished_at = String::new();
+            Ok(())
+        }) {
+            eprintln!("部分重试({note_id}):清收工戳失败(仅日志): {e}");
+        }
         let run = || -> anyhow::Result<()> {
             let doc = store::load_refined(&dir)
                 .ok_or_else(|| anyhow::anyhow!("修订稿加载失败"))?;
