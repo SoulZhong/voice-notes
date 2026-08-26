@@ -80,6 +80,24 @@ pub struct RefineStages {
 pub struct RefinedDoc {
     pub schema_version: u32,
     pub generated_at: String,
+    /// 本份文档**落盘时刻**(每次整写在 write_refined_atomic_locked 内自动盖戳)。
+    /// generated_at 是"开跑时刻",事后无法回答"这稿是几点写出的/哪一轮写的"——
+    /// 2026-08-26 排障为此误判过一整晚(issue #173)。旧文件缺字段 serde default 兼容。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub written_at: String,
+    /// 写出本份文档的进程 pid(运行代次标识):重跑覆盖旧稿时,新旧稿归属哪一轮
+    /// 从此可查。0 不落盘。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub writer_pid: u32,
+    /// 整轮 worker 有序收工时刻(issue #173 十轮):llm 终态只说明 llm 阶段写过盘,
+    /// identify/标题等尾段可能还在跑;此戳由 worker 终态上报前落盘。空 = 未收工。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finished_at: String,
+    /// 本次写盘所属的运行标识 "pid-代次"(codex 三十轮):writer_pid 在同进程多轮
+    /// 重跑间不变,无法把稿与 aing_runs.jsonl 里的某一轮对上;此值从心跳表取在跑
+    /// worker 的代次,空 = 非 worker 写(编辑器保存/维护工具)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub writer_run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
     pub stages: RefineStages,
@@ -116,6 +134,13 @@ pub struct RefinedDoc {
 fn prepared_doc_bytes(note_id: &str, doc: &RefinedDoc) -> anyhow::Result<Vec<u8>> {
     let mut doc = doc.clone();
     crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+    // 落盘戳单一咽喉(issue #173):write_refined_atomic_locked 与锚定 writer
+    // (Agent 图谱写回/关系回填)全都在此序列化,谁写盘谁盖戳,不会漏路径。
+    doc.written_at = chrono::Local::now().to_rfc3339();
+    doc.writer_pid = std::process::id();
+    doc.writer_run = crate::current_refine_run()
+        .or_else(|| crate::refine_beat_run_of(note_id))
+        .unwrap_or_default();
     Ok(serde_json::to_vec_pretty(&doc)?)
 }
 
@@ -649,12 +674,50 @@ fn symlink_metadata_optional(path: &Path) -> std::io::Result<Option<std::fs::Met
 /// 若 aing.json 存在但已损坏(`load_aing_file` 返回 `None`),此处不进位——损坏时
 /// 旧值本就不可读，无法判断该不该让步，保持当前 doc 的 revision 原样落盘是有意
 /// 取舍。
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+impl RefinedDoc {
+    /// 停摆自愈用的最小失败稿(issue #173):worker 无声消失且盘上无稿时落一份
+    /// llm=failed,让 UI 显示「失败可重跑」而不是「这场没做 AI 整理」的幻觉。
+    /// 段落为空——展示端 load 缺段回落原始 segments,不影响正文。
+    pub fn minimal_failed() -> Self {
+        Self {
+            schema_version: 1,
+            generated_at: String::new(), // 调用方盖当前时刻
+            written_at: String::new(),   // 落盘咽喉自动盖
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
+            llm_model: None,
+            stages: RefineStages {
+                filter: "off".into(),
+                recluster: "off".into(),
+                llm: "failed".into(),
+                entities: "off".into(),
+                relations: "off".into(),
+            },
+            discarded_seqs: Vec::new(),
+            entities: Vec::new(),
+            graph_extraction: None,
+            relations: Vec::new(),
+            graph_support_mentions: Vec::new(),
+            revision: 0,
+            paragraphs: Vec::new(),
+            llm_failed_paragraphs: Vec::new(),
+            stale: false,
+        }
+    }
+}
+
 pub(crate) fn write_refined_atomic_locked(
     note_dir: &Path,
     doc: &RefinedDoc,
     _lock: &NoteLock,
 ) -> anyhow::Result<()> {
     let mut doc = doc.clone();
+    // 落盘戳已下沉到 prepared_doc_bytes(锚定 writer 同样经过那里),此处只管 revision。
     if let Some(Some(existing)) = load_aing_file(note_dir) {
         if existing.revision > doc.revision {
             doc.revision = existing.revision.saturating_add(1);
@@ -814,6 +877,122 @@ fn update_refined(
     // 失效,防止笔记页保存悄悄盖掉改名/Agent 修订等其他 writer 的成果。
     doc.revision = doc.revision.saturating_add(1);
     write_refined_atomic_locked(note_dir, &doc, &note_lock)
+}
+
+/// 停摆自愈(issue #173,codex P1a/P1b):一把 NoteLock 内完成「查-判-写」,
+/// 消灭"检查后 worker 诈尸写完稿、自愈再拿空失败稿盖掉"的窗口。
+/// 返回动作描述供日志;拿不到锁(别的进程正在写=有人活着)让路即成功。
+pub fn heal_stale_refined(
+    note_dir: &Path,
+    still_stale: impl Fn() -> bool,
+) -> anyhow::Result<String> {
+    let Some(lock) = NoteLock::acquire(note_dir)? else {
+        return Ok("另一进程持锁,让路".to_string());
+    };
+    match load_aing_file(note_dir) {
+        // 文件在但读不出:是证据,不能拿失败稿盖掉
+        None => Ok("盘上稿损坏,保留原样".to_string()),
+        Some(Some(mut doc)) => {
+            // 进门先复验接管(codex 十二轮):替补在首查之后才占槽时,盘上可能还是
+            // 上一轮的终态稿——此时定性/广播都属于替补的剧本,这里不能抢戏。
+            if !still_stale() {
+                return Ok("新一轮已接手(占槽),让路".to_string());
+            }
+            if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
+                // llm 已终态 ≠ 整个 worker 收工(codex 九/十轮):看收工戳定性。
+                if !doc.finished_at.is_empty() {
+                    return Ok("盘上稿已收工(收工戳在),不动".to_string());
+                }
+                // identify/标题尾段吊死:worker 没有序退场过。失败必须落稿面
+                // (codex 三十一轮)——终态事件是一次性的,重启后页面只认 stages,
+                // 不标的话这场停摆会永远显示成「已完成」。正文原样保留,llm 改标
+                // failed 换来「失败可重跑」入口。
+                if doc.stages.llm != "failed" {
+                    let prev = doc.stages.llm.clone();
+                    doc.stages.llm = "failed".into();
+                    doc.revision = doc.revision.saturating_add(1);
+                    write_refined_atomic_locked(note_dir, &doc, &lock)?;
+                    // 原值随动作字串进 runs 日志(codex 三十五轮):worker 诈尸跑完
+                    // 收工 done 时,靠它把稿面从 failed 调解回原终态。
+                    return Ok(format!(
+                        "盘上稿 llm 已终态但收工戳缺失(尾段停摆),已改标 llm=failed(原 {prev})"
+                    ));
+                }
+                return Ok("盘上稿 llm 已终态但收工戳缺失(尾段停摆),已是 failed".to_string());
+            }
+            // 接管识别只看生死簿不看写盘戳(codex 八轮定稿):真替补从起跑到收工
+            // 全程占着 lifecycle 槽,still_stale 必能探到;替补已收工则稿子是终态,
+            // 上面的检查已放行。写盘戳比对反而会被普通编辑(WYSIWYG/改名,停摆
+            // 标记一摘编辑立即放行)误触发,把该标失败的中间稿漏掉。
+            // 提交时复验(codex 七轮):替补 worker 可能在前面查完之后才占上
+            // lifecycle 槽、且还没写出自己的 aing.json——写盘戳守卫探不到它,
+            // 落笔前再问一次生死簿。
+            if !still_stale() {
+                return Ok("新一轮已接手(占槽未写盘),让路".to_string());
+            }
+            // run_local 之后 llm 阶段停摆:中间稿改标 failed,UI 出「失败可重跑」
+            doc.stages.llm = "failed".into();
+            doc.revision = doc.revision.saturating_add(1);
+            write_refined_atomic_locked(note_dir, &doc, &lock)?;
+            Ok("中间稿已改标 llm=failed".to_string())
+        }
+        Some(None) => {
+            // 盘上无 aing.json(run_local 前就停摆)。两个坑(codex 二轮):
+            // ① 旧世界只有 refined.json 的笔记,写空稿会把旧稿整个挡在读取
+            //   优先级后面——先认旧稿,改标 failed 迁移过来,正文原样保留;
+            // ② 全新笔记落空段稿会让「修订视图/get_note(prefer_refined)」变
+            //   白板——从 segments.jsonl 物化原始段当正文,失败横幅照出。
+            if !still_stale() {
+                return Ok("新一轮已接手(占槽未写盘),让路".to_string());
+            }
+            if let Some(mut doc) = load_legacy_file(note_dir) {
+                doc.stages.llm = "failed".into();
+                doc.revision = doc.revision.saturating_add(1);
+                write_refined_atomic_locked(note_dir, &doc, &lock)?;
+                return Ok("旧稿已迁移并改标 llm=failed".to_string());
+            }
+            let mut doc = RefinedDoc::minimal_failed();
+            doc.generated_at = chrono::Local::now().to_rfc3339();
+            // 正文取自规范加载器(codex 五轮):抑制侧车/空段剔除/稳定排序/align
+            // 时基修正全套语义与原始稿视图一致,失败稿不另造一套口径。
+            if let (Some(parent), Some(id)) =
+                (note_dir.parent(), note_dir.file_name().and_then(|n| n.to_str()))
+            {
+                if let Ok(note) = crate::store::NoteStore::new(parent.to_path_buf()).load(id) {
+                    // aing.json 只能存未投影时基(codex 六轮):展示端
+                    // load_refined_for_display 会再按 align.json 投影一次,直接存
+                    // 规范加载器给的已投影值等于二次投影。段序/抑制/空段语义照用
+                    // 规范视图,时间戳按 seq 回查磁盘原始行。
+                    let mut raw_ms = std::collections::HashMap::new();
+                    if let Ok(raw) = std::fs::read_to_string(note_dir.join("segments.jsonl")) {
+                        for line in raw.lines() {
+                            if let Ok(r) =
+                                serde_json::from_str::<crate::store::SegmentRecord>(line)
+                            {
+                                raw_ms.insert(r.seq, (r.start_ms, r.end_ms));
+                            }
+                        }
+                    }
+                    for seg in note.segments {
+                        let (start_ms, end_ms) =
+                            raw_ms.get(&seg.seq).copied().unwrap_or((seg.start_ms, seg.end_ms));
+                        doc.paragraphs.push(RefinedParagraph {
+                            speaker: seg.speaker.unwrap_or_default(),
+                            name: None,
+                            person_id: None,
+                            text: seg.text,
+                            start_ms,
+                            end_ms,
+                            source_seqs: vec![seg.seq],
+                            mentions: Vec::new(),
+                        });
+                    }
+                }
+            }
+            write_refined_atomic_locked(note_dir, &doc, &lock)?;
+            Ok("已落 llm=failed 失败稿(正文取原始段)".to_string())
+        }
+    }
 }
 
 /// 修订稿说话人改名:该 speaker 的全部段落 name 置为新名。
@@ -1095,12 +1274,102 @@ mod tests {
     use crate::store::{ensure_graph_ids, evidence_id};
 
     #[test]
+    fn heal_stale_covers_missing_intermediate_and_finished_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().join("20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        // ① 盘上无稿:落失败稿,正文从 segments.jsonl 物化(不落白板稿)
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            concat!(
+                r#"{"seq":0,"source":"mic","text":"原文甲","start_ms":0,"end_ms":1000,"speaker":"S1"}"#,
+                "
+",
+                r#"{"seq":1,"source":"mic","text":"回声段","start_ms":1000,"end_ms":2000,"speaker":"S1"}"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("segment-suppressions.jsonl"), r#"{"seq":1,"reason":"echo_match"}"#)
+            .unwrap();
+        let act = heal_stale_refined(&dir, || true).unwrap();
+        assert!(act.contains("原始段"), "{act}");
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.paragraphs[0].text, "原文甲", "修订视图不是白板");
+        assert_eq!(doc.paragraphs[0].speaker, "S1");
+        assert_eq!(doc.paragraphs.len(), 1, "被抑制的回声段不得借失败稿还魂");
+        assert!(!doc.written_at.is_empty(), "咽喉盖了写盘戳");
+        // ② 中间稿(run_local 后 llm=off):改标 failed,revision 进位,正文保留
+        let mut mid = RefinedDoc::minimal_failed();
+        mid.stages.llm = "off".into();
+        mid.paragraphs.push(RefinedParagraph {
+            speaker: "S1".into(),
+            name: None,
+            person_id: None,
+            text: "正文在".into(),
+            start_ms: 0,
+            end_ms: 1,
+            source_seqs: vec![0],
+            mentions: Vec::new(),
+        });
+        write_refined_atomic(&dir, &mid).unwrap();
+        let rev0 = load_refined(&dir).unwrap().revision;
+        // ②a 接管守卫:生死簿上有人(still_stale=false) ⇒ 替补在跑,让路
+        let act = heal_stale_refined(&dir, || false).unwrap();
+        assert!(act.contains("让路"), "{act}");
+        assert_eq!(load_refined(&dir).unwrap().stages.llm, "off", "替补的稿不被扣帽");
+        let act = heal_stale_refined(&dir, || true).unwrap();
+        assert!(act.contains("改标"), "{act}");
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.paragraphs[0].text, "正文在", "正文不丢");
+        assert!(doc.revision > rev0, "进位挡住过期编辑器");
+        // ③ 已收工的稿(llm=done):原样不动
+        let mut done = load_refined(&dir).unwrap();
+        done.stages.llm = "done".into();
+        write_refined_atomic(&dir, &done).unwrap();
+        let before = std::fs::read(dir.join(AING_DOC_FILE)).unwrap();
+        let act = heal_stale_refined(&dir, || true).unwrap();
+        assert!(act.contains("尾段停摆"), "llm 终态但无收工戳 ⇒ 尾段停摆: {act}");
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed", "尾段停摆失败要落稿面,重启不失忆");
+        assert_eq!(doc.paragraphs[0].text, "正文在", "正文原样保留");
+        let _ = before; // 稿面已按停摆语义改写,字节级不动的断言随之退役
+        // ③b 收工戳在:定性为已收工(调用方广播 done)
+        let mut done2 = load_refined(&dir).unwrap();
+        done2.finished_at = "2026-01-01T00:00:00+08:00".into();
+        write_refined_atomic(&dir, &done2).unwrap();
+        let act = heal_stale_refined(&dir, || true).unwrap();
+        assert!(act.contains("已收工"), "{act}");
+        // ④ 只有旧世界 refined.json 的笔记:迁移旧稿改标 failed,正文保留
+        let legacy_dir = dir.parent().unwrap().join("20260101-000001");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let mut legacy = load_refined(&dir).unwrap();
+        legacy.stages.llm = "done".into();
+        legacy.paragraphs[0].text = "旧稿正文".into();
+        std::fs::write(
+            legacy_dir.join(LEGACY_REFINED_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let act = heal_stale_refined(&legacy_dir, || true).unwrap();
+        assert!(act.contains("迁移"), "{act}");
+        let doc = load_refined(&legacy_dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.paragraphs[0].text, "旧稿正文", "旧稿正文不被空稿挡住");
+    }
+
+    #[test]
     fn v2_writes_synthesize_stable_mention_ids_without_a_repair_read() {
         let dir = tempfile::tempdir().unwrap();
         let doc = RefinedDoc {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-21T00:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1177,6 +1446,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "2026-07-06T15:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: Some("deepseek-chat".into()),
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![1, 2],
@@ -1254,6 +1527,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-07-16T10:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1469,6 +1746,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1586,6 +1867,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1863,6 +2148,10 @@ mod tests {
             llm_failed_paragraphs: vec![0, 2],
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "partial".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1898,6 +2187,10 @@ mod tests {
             llm_failed_paragraphs: vec![],
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1922,6 +2215,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: REFINED_SCHEMA_VERSION,
             generated_at: "2026-08-20T00:00:00+08:00".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],

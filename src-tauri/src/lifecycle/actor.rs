@@ -412,8 +412,17 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // 用于滞留自愈,见 REFINE_STALE_MS。单线程持有,无锁。
             let boot = std::time::Instant::now();
             let mut refine_clock: std::collections::BTreeMap<String, u64> = Default::default();
-            for env in rx {
-                // 每收一封先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
+            loop {
+                // 定时唤醒(codex 十三轮 P1):信箱空闲时也要做滞留体检——worker 吊死
+                // 且此后再无 lifecycle 流量(无人开笔记页轮询/无头 MCP 场景)时,原
+                // for-recv 会永远阻塞,一小时阈值形同虚设。60s 一跳:超时也走一遍
+                // 体检再回来等信;通道关闭即退出(与 for-recv 的结束语义一致)。
+                let env = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                    Ok(env) => Some(env),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                // 每收一封(或每次定时醒来)先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
                 // (线程没结束),该 id 会永久占着 Aing 集把守卫钉死——这里兜住那条路径。
                 //
                 // 判据是「多久没有进度」而非「启动至今多久」。改口径的原因(codex review
@@ -426,7 +435,32 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     let now_ms = boot.elapsed().as_millis() as u64;
                     let running: Vec<String> =
                         state.refine.running_ids().map(str::to_string).collect();
-                    for id in sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS) {
+                    // 心跳表并入停摆判据(codex 十五轮):有些阶段只碰 beat 不发
+                    // RefineProgress(identify/标题/云端二遍),refine_clock 看不见它们
+                    // 的活动。判死前问一嘴心跳,新鲜就当有进度回填时钟,免得定时
+                    // 体检把还在干活的 worker 误杀(移除标记不等于取消线程,守卫一
+                    // 放行编辑就会与它抢写 aing.json)。
+                    let stale_ids: Vec<String> =
+                        sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS)
+                            .into_iter()
+                            .filter(|id| {
+                                if let Some((stage, age_ms)) = crate::refine_beat_of(id) {
+                                    if (age_ms as u128) < REFINE_STALE_MS as u128 {
+                                        eprintln!(
+                                            "lifecycle: {id} 事件流静默但心跳新鲜({stage}, {age_ms}ms 前),不判停摆"
+                                        );
+                                        // 按心跳真实年龄回填(codex 十七轮):填 now_ms 会把
+                                        // 一个已经 59 分钟没跳的心跳当刚跳过,下次能判死
+                                        // 要再等整整一个 TTL,自愈延迟翻倍。
+                                        refine_clock
+                                            .insert(id.clone(), now_ms.saturating_sub(age_ms));
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .collect();
+                    for id in stale_ids {
                         eprintln!(
                             "lifecycle: Aing 集条目 {id} 已 {}s 无进度,判定 worker 未收尾,自愈移除\
                              (该 id 的 is_refining 守卫此前会一直拒绝编辑类命令)",
@@ -439,12 +473,220 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                             crate::telemetry::ErrorKind::RefineStaleHeal,
                             "Aing 条目无进度超时,已自愈移除",
                         );
+                        // 停摆监工升级(issue #173):自愈不只摘标记——
+                        // ① 自采线程栈落 stderr:2026-08-26 的两小时误诊全因停摆现场
+                        //   无尸检材料;下次直接带报告(macOS sample 自身 pid,best-effort)。
+                        // ② 盘上补失败态:aing.json 缺失时写 llm=failed 的最小稿,UI 从
+                        //   「这场没做 AI 整理」的幻觉变成「失败可重跑」;worker 若诈尸
+                        //   跑完会整写覆盖,不冲突。均在独立线程做,不阻塞 actor 信箱。
+                        {
+                            let app2 = app.clone();
+                            let id2 = id.clone();
+                            std::thread::spawn(move || {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let pid = std::process::id().to_string();
+                                    match std::process::Command::new("sample")
+                                        .args([pid.as_str(), "2"])
+                                        .output()
+                                    {
+                                        Ok(o) => eprintln!(
+                                            "lifecycle: 停摆尸检({id2})线程栈采样 {} 字节:
+{}",
+                                            o.stdout.len(),
+                                            String::from_utf8_lossy(&o.stdout)
+                                        ),
+                                        Err(e) => eprintln!("lifecycle: 停摆尸检采样失败({id2}): {e}"),
+                                    }
+                                }
+                                // 代次快查(codex 三轮 P1):sample 拖的两秒里新一轮可能
+                                // 已接手(本信箱后续消息重新插回 Aing 集),先问一句再动手;
+                                // 查后写前的窗口由 heal 内部的写盘戳比对兜底。
+                                if app2
+                                    .try_state::<crate::lifecycle::LifecycleHandle>()
+                                    .map(|lc| lc.is_refining(&id2))
+                                    .unwrap_or(false)
+                                {
+                                    eprintln!("lifecycle: 停摆自愈({id2})发现新一轮已接手,让路");
+                                    return;
+                                }
+                                if let Ok(root) = crate::notes_dir(&app2) {
+                                    let dir = root.join(&id2);
+                                    // 查-判-写整体在一把 NoteLock 内(codex P1a/P1b):
+                                    // 已有中间稿改标 failed;诈尸写完的稿原样保留。
+                                    let still_stale = || {
+                                        let lc_active = app2
+                                            .try_state::<crate::lifecycle::LifecycleHandle>()
+                                            .map(|lc| lc.is_refining(&id2))
+                                            .unwrap_or(false);
+                                        if lc_active {
+                                            return false;
+                                        }
+                                        // 心跳新鲜同样算活(codex 三十轮):被摘的前任在
+                                        // sample/锁重试窗口里诈尸继续跑时,只有心跳在动
+                                        // (阶段级 report 不会把它重新插回 lifecycle 集),
+                                        // 不能对着活人的中间稿写失败态。
+                                        if let Some((_, age_ms)) = crate::refine_beat_of(&id2) {
+                                            if age_ms < 10 * 60 * 1000 {
+                                                return false;
+                                            }
+                                        }
+                                        true
+                                    };
+                                    // 锁忙重试(codex 二十轮):吊死的 worker 可能正抱着
+                                    // NoteLock,或普通编辑瞬时占锁。只试一次就放弃的话,
+                                    // 停摆标记已摘、时钟已清,再没有下一次体检会回来补
+                                    // 写失败态,盘上状态与 UI 就此永久失和。
+                                    let mut healed =
+                                        crate::store::heal_stale_refined(&dir, still_stale);
+                                    for _ in 0..20 {
+                                        match &healed {
+                                            Ok(act) if act.contains("持锁") => {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_secs(15),
+                                                );
+                                                healed = crate::store::heal_stale_refined(
+                                                    &dir,
+                                                    still_stale,
+                                                );
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    if let Ok(act) = &healed {
+                                        if act.contains("持锁") {
+                                            eprintln!(
+                                                "lifecycle: 停摆自愈({id2})五分钟内锁一直被占,放弃(盘上状态可能未收口)"
+                                            );
+                                        }
+                                    }
+                                    match healed {
+                                        Ok(act) => {
+                                            eprintln!("lifecycle: 停摆自愈({id2}):{act}");
+                                            // 终态广播(codex P2b/九轮):笔记页在
+                                            // note_refining 回 false 后已停轮询,凡是
+                                            // 停摆标记被摘且盘上有稿的情形都补一发,
+                                            // 页面按稿子实际状态收口。写了失败态报
+                                            // failed;稿子本就终态(llm 收过尾、worker
+                                            // 死在 identify/标题)报 done——稿子可用,
+                                            // 但把心跳留证打进日志,不静默当成功。
+                                            let state_s = if act.contains("failed")
+                                                || act.contains("尾段停摆")
+                                            {
+                                                // 写了失败态,或 worker 从未有序退场
+                                                // (收工戳缺失):都算停摆失败,附心跳留证
+                                                if let Some((stage, age_ms)) =
+                                                    crate::refine_beat_of(&id2)
+                                                {
+                                                    eprintln!(
+                                                        "lifecycle: 停摆自愈({id2})心跳停在 {stage} 已 {age_ms}ms"
+                                                    );
+                                                }
+                                                // 停摆定性落盘(codex 二十六轮):事件是
+                                                // 一次性的,页面/应用重启后只剩盘上稿
+                                                // (可能是 llm=done 的旧稿)——runs 日志
+                                                // 补一条 stale 终局,refine_status 的
+                                                // last_run 才不会指回更早的一轮。
+                                                let _ = crate::append_refine_run_log(
+                                                    &dir,
+                                                    &id2,
+                                                    &serde_json::json!({
+                                                        "event": "finished",
+                                                        "outcome": "stale_heal_failed",
+                                                        "detail": act,
+                                                        "at": chrono::Local::now().to_rfc3339(),
+                                                    }),
+                                                );
+                                                Some("failed")
+                                            } else if act.contains("已收工") {
+                                                // 收工戳在 ≠ 成功(codex 三十六轮):诈尸
+                                                // worker 可能以 failed/panic 收的工。事件
+                                                // 状态按 runs 日志末条真实 outcome 选。
+                                                // 事件要与盘上稿对上号(codex 三十七轮):
+                                                // 末条可能是老 worker 迟到的 superseded
+                                                // 退场记录,拿它给替补的成功稿定 failed
+                                                // 就冤了。跳过 superseded;稿面有
+                                                // writer_run 时优先找 run 匹配的记录。
+                                                let doc_run = crate::store::load_refined(&dir)
+                                                    .map(|d| d.writer_run)
+                                                    .unwrap_or_default();
+                                                let ok = std::fs::read_to_string(
+                                                    dir.join("aing_runs.jsonl"),
+                                                )
+                                                .ok()
+                                                .and_then(|raw| {
+                                                    let evs: Vec<serde_json::Value> = raw
+                                                        .lines()
+                                                        .filter_map(|l| {
+                                                            serde_json::from_str(l).ok()
+                                                        })
+                                                        .filter(|v: &serde_json::Value| {
+                                                            v.get("event").is_some()
+                                                                && v["superseded"]
+                                                                    != serde_json::json!(true)
+                                                        })
+                                                        .collect();
+                                                    evs.iter()
+                                                        .rev()
+                                                        .find(|v| {
+                                                            !doc_run.is_empty()
+                                                                && v["run"].as_str()
+                                                                    == Some(doc_run.as_str())
+                                                        })
+                                                        .or_else(|| evs.last())
+                                                        .cloned()
+                                                })
+                                                .map(|v| {
+                                                    matches!(
+                                                        v["outcome"].as_str(),
+                                                        Some("done") | Some("retry_done")
+                                                    )
+                                                })
+                                                // 无日志(旧世界收工稿):按成功处理
+                                                .unwrap_or(true);
+                                                Some(if ok { "done" } else { "failed" })
+                                            } else {
+                                                None // 让路/坏稿:没动盘,也不该发终态
+                                            };
+                                            if let Some(state_s) = state_s {
+                                                // 发布前最后一验(codex 十七轮):替补可能在
+                                                // heal 的 still_stale 之后、这一发之前入场,
+                                                // 此时终态事件会把活跑的替补在页面上盖章
+                                                // 收场。已有人在跑就撤销广播。
+                                                let taken_over = app2
+                                                    .try_state::<crate::lifecycle::LifecycleHandle>()
+                                                    .map(|lc| lc.is_refining(&id2))
+                                                    .unwrap_or(false);
+                                                if taken_over {
+                                                    eprintln!(
+                                                        "lifecycle: 停摆自愈({id2})替补已接手,终态广播撤销"
+                                                    );
+                                                } else {
+                                                    let _ = app2.emit(
+                                                        "refine",
+                                                        crate::ipc::RefineEvent {
+                                                            note_id: id2.clone(),
+                                                            stage: "all".into(),
+                                                            state: state_s.into(),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => eprintln!(
+                                            "lifecycle: 停摆自愈({id2})落盘失败(仅日志): {e}"
+                                        ),
+                                    }
+                                }
+                            });
+                        }
                         // RefineFinished 命中时只移除、零效果(见 machine.rs),可直接应用。
                         let (next, _fx) = machine::handle(&state, &Msg::RefineFinished { note_id: id.clone() });
                         state = next;
                         refine_clock.remove(&id);
                     }
                 }
+                let Some(env) = env else { continue }; // 定时醒来无信:体检完回去等
                 let (msg, reply) = match env {
                     // 停录特化(P2):teardown 同步执行(handle.stop 排干期间,管线
                     // 消息全部入队),随后把 stop 的 reply 转移进自投的 Finalize——

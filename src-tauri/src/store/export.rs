@@ -350,6 +350,10 @@ mod tests {
             llm_failed_paragraphs: Vec::new(),
             schema_version: 1,
             generated_at: "t".into(),
+            written_at: String::new(),
+            writer_pid: 0,
+            finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),

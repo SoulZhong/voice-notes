@@ -367,6 +367,233 @@ fn handoff_http_refine_write(
 /// 需放宽到 N 并行,把此 Mutex 换成计数信号量即可。
 static AING_GATE: Mutex<()> = Mutex::new(());
 
+/// 重跑起跑仪式(codex 十二轮):上一轮的运行元数据(收工/写盘戳)先归档进
+/// aing_runs.jsonl 再撕掉 finished_at——停摆取证靠的就是这些,不能裸清。
+/// 归档发生在 update 闭包内,天然处于 NoteLock 保护下。无旧稿时 update 失败即无事。
+fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut last_err = None;
+    // archived_at 在重试圈外定死(codex 十八轮):归档成功而后续整写失败时,下一轮
+    // 重试生成的行与已写入的字节相同,末行比对即可去重,一次运行不会记成好几次。
+    let archived_at = chrono::Local::now().to_rfc3339();
+    for _ in 0..5 {
+        match store::update_refined_for_retry(dir, |d| {
+        if !d.finished_at.is_empty() || !d.written_at.is_empty() {
+            let rec = serde_json::json!({
+                "finished_at": d.finished_at,
+                "written_at": d.written_at,
+                "writer_pid": d.writer_pid,
+                // 上一轮的运行标识随档保留(codex 三十二轮):新一轮整写会把稿面
+                // writer_run 顶掉,归档不带它,稿与终态日志就再对不上号了。
+                "writer_run": d.writer_run,
+                "generated_at": d.generated_at,
+                "archived_at": archived_at,
+            });
+            // 归档失败必须中止(codex 十四轮):闭包报错则 update 不落盘,收工戳
+            // 原样保留——绝不能戳清了、档没归,把要保全的证据反手清掉。
+            // 幂等去重按上一轮的四个稳定字段(codex 十八/十九轮),不含 archived_at:
+            // 进程在「归档已写、撕戳未落」之间死掉,下次启动 archived_at 必然不同,
+            // 按整行比对会把同一次运行再归一遍;按源字段比对跨重启也认得。
+            let path = dir.join("aing_runs.jsonl");
+            let rec_line = rec.to_string();
+            // 扫全文件而非只看末行(codex 二十二轮):归档后整写失败会再插一条
+            // failed_before_start,末行比对就认不出已归档过的同一轮了。文件小,全扫无妨。
+            let dup = std::fs::read_to_string(&path)
+                .ok()
+                .map(|raw| {
+                    raw.lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .any(|v| {
+                            v["finished_at"] == rec["finished_at"]
+                                && v["written_at"] == rec["written_at"]
+                                && v["writer_pid"] == rec["writer_pid"]
+                                && v["writer_run"] == rec["writer_run"]
+                                && v["generated_at"] == rec["generated_at"]
+                        })
+                })
+                .unwrap_or(false);
+            if !dup {
+                // 与 append_refine_run_log 同款互斥+整行单写(codex 二十三轮)
+                let _g = REFINE_RUN_LOG_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                use std::io::Write as _;
+                f.write_all(format!("{rec_line}\n").as_bytes())?;
+            }
+        }
+            d.finished_at = String::new();
+            Ok(())
+        }) {
+            Ok(()) => return Ok(()),
+            // 「不存在或已损坏」要分家(codex 十五轮):盘上确实没有稿(首跑)才等价
+            // 成功;文件在但解析不了是坏稿,必须拦住重跑,别把取证材料整写覆盖掉。
+            Err(e) if e.to_string().contains("不存在") => {
+                if store::aing_exists(dir) {
+                    return Err(anyhow::anyhow!("盘上稿存在但已损坏,拒绝开跑以保全证据: {e}"));
+                }
+                return Ok(());
+            }
+            // 锁被短暂占用等瞬态:重试几轮再定失败(codex 十三轮 P2:失败必须拦住
+            // 重跑,否则旧 finished_at 仍在,本轮停摆会被自愈误判为已收工)
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
+}
+
+/// runs 日志写入互斥(codex 二十三轮):writeln! 对 Value 是多次小写,并发 writer
+/// (前任收工 vs 部分重试收工)可能把两行绞在一起毁掉 JSONL。进程内上锁 + 整行
+/// 一次 write_all(O_APPEND 单次写原子);跨进程仍靠单次写兜底。
+static REFINE_RUN_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+/// aing_runs.jsonl 追加一条运行事件。失败出声并返回 Err,成败由调用方决定要不要
+/// 因此放弃后续动作(收工戳与成败日志的先后契约见 stamp_refine_finished)。
+pub(crate) fn append_refine_run_log(
+    dir: &std::path::Path,
+    note_id: &str,
+    rec: &serde_json::Value,
+) -> std::io::Result<()> {
+    let _g = REFINE_RUN_LOG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let line = format!("{rec}\n");
+    let r = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("aing_runs.jsonl"))
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(line.as_bytes())
+        });
+    if let Err(e) = &r {
+        eprintln!("refine({note_id}): 运行日志写入失败: {e}");
+    }
+    r
+}
+
+/// 收工戳落盘(codex 十六轮):worker 有序退场时调用。
+/// - outcome 一并记进 aing_runs.jsonl:重跑失败在 run_local 写盘之前时,盘上还是
+///   上一轮的 llm=done 旧稿,光有 finished_at 会被读成「新近成功收工」——成败要
+///   有单独的落盘证据。
+/// - 落戳带重试且失败出声:静默丢戳会让自愈把下一次停摆误判成「尾段停摆」。
+fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my_gen: u64) {
+    let at = chrono::Local::now().to_rfc3339();
+    // 代次守卫(codex 二十一轮):被判停摆的前任若在替补起跑后才苏醒走到这里,
+    // 盘上已是替补的中间稿——前任来盖 finished_at 会让替补此后的停摆被误判为
+    // 已收工。心跳表在座代次比我新即让位:成败照记日志(标 superseded),稿不动。
+    // (跨进程的双实例场景此守卫不覆盖,写盘仍由 NoteLock 串行,属已知边界。)
+    if refine_beat_owner(note_id).is_some_and(|g| g > my_gen) {
+        let rec = serde_json::json!({
+            "event": "finished", "outcome": outcome, "at": at, "superseded": true,
+        });
+        let _ = append_refine_run_log(dir, note_id, &rec);
+        eprintln!("refine({note_id}): 替补已在跑,前任收工戳弃盖(成败已记日志)");
+        return;
+    }
+    // 先落成败日志,后盖收工戳(codex 二十轮):反过来的话,盖完戳、日志没写成
+    // (或进程恰好死在中间),旧 llm=done 稿+新戳会被读成「新近成功收工」——这
+    // 正是日志要消灭的歧义。日志写不进就不盖戳,保持「无戳=没收工」的保守可读。
+    // 落日志前先查一次替补(codex 三十七轮):否则先记普通 finished、锁内才发现
+    // 被替,又补一条 superseded——同一 worker 两条终态,中间崩掉还会让废稿看着
+    // 像正主。此查后锁内仍有兜底复验。
+    let superseded_now = refine_beat_owner(note_id).is_some_and(|g| g > my_gen);
+    let rec = serde_json::json!({
+        "event": "finished", "outcome": outcome, "at": at,
+        "run": format!("{}-{my_gen}", std::process::id()),
+        "superseded": if superseded_now { Some(true) } else { None::<bool> },
+    });
+    if append_refine_run_log(dir, note_id, &rec).is_err() {
+        eprintln!("refine({note_id}): 成败日志未落,收工戳弃盖(保守:无戳读作未收工)");
+        return;
+    }
+    if superseded_now {
+        eprintln!("refine({note_id}): 替补已在跑,前任成败已记日志(superseded),不盖稿");
+        return;
+    }
+    // 尾段停摆调解(codex 三十五轮):自愈曾把 llm 从终态改标 failed,而 identify/
+    // 标题尾段不再写盘——worker 诈尸跑完以 done 收工时,稿面还挂着 failed,与
+    // 事件/last_run 永久矛盾。从 runs 日志找出自愈记录里的原值,收工时调解回去。
+    let heal_prev: Option<String> = if matches!(outcome, "done" | "retry_done") {
+        std::fs::read_to_string(dir.join("aing_runs.jsonl"))
+            .ok()
+            .and_then(|raw| {
+                // rec 刚追加,倒数第二条起往回找最近的 event 记录
+                let last = raw
+                    .lines()
+                    .rev()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter(|v| v.get("event").is_some())
+                    .nth(1)?;
+                if last["outcome"] != "stale_heal_failed" {
+                    return None;
+                }
+                let detail = last["detail"].as_str()?;
+                if !detail.contains("尾段停摆") {
+                    return None;
+                }
+                let prev = detail.split("(原 ").nth(1)?.trim_end_matches(')');
+                Some(prev.to_string())
+            })
+    } else {
+        None
+    };
+    let mut stamped = false;
+    let mut last_err = None;
+    for _ in 0..5 {
+        match store::update_refined_for_retry(dir, |d| {
+            // 锁内复验(codex 二十二轮):每轮起跑仪式都会清空 finished_at,此刻
+            // 稿上已有戳 = 我离场后另一轮已完整收工(替补收工连心跳都清了,光看
+            // 心跳表查不出)。前任不得覆盖,弃盖中止本次 update。
+            if !d.finished_at.is_empty() {
+                anyhow::bail!("稿上已有更新的收工戳,弃盖");
+            }
+            // 提交时再验代次(codex 二十八轮):替补在外层检查之后才起跑(部分重试
+            // 不过 AING_GATE)时,它的仪式已清过戳,上一条查不出;但它起跑前必先
+            // 同步注册更高代次心跳,此处能看见。
+            if refine_beat_owner(note_id).is_some_and(|g| g > my_gen) {
+                anyhow::bail!("替补已接手,弃盖");
+            }
+            if let Some(prev) = &heal_prev {
+                if d.stages.llm == "failed" {
+                    d.stages.llm = prev.clone(); // 调解:自愈的 failed 让位于真收工
+                }
+            }
+            d.finished_at = at.clone();
+            Ok(())
+        }) {
+            Ok(()) => {
+                stamped = true;
+                break;
+            }
+            Err(e) if e.to_string().contains("弃盖") => {
+                let rec = serde_json::json!({
+                    "event": "finished", "outcome": outcome, "at": at, "superseded": true,
+                });
+                let _ = append_refine_run_log(dir, note_id, &rec);
+                eprintln!("refine({note_id}): 稿上已有更新收工戳,前任弃盖(成败已记日志)");
+                return;
+            }
+            // 盘上无稿(run_local 前就失败):没有可盖戳的稿,run 日志照记
+            Err(e) if e.to_string().contains("不存在") && !store::aing_exists(dir) => break,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    if !stamped {
+        if let Some(e) = last_err {
+            eprintln!(
+                "refine({note_id}): 收工戳落盘失败(自愈可能把下次停摆误判为尾段停摆): {e}"
+            );
+        }
+    }
+}
+
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
     let transcode = state.transcode.clone();
@@ -378,11 +605,13 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     // 排在停录 reply 之前入队,停录返回后到达的续录命令必然在它后面,内核守卫才
     // 不会因 worker 线程起步慢而漏挡(与旧世界入口同步 insert 的窗口对齐)。
     // 它同时就是旧 worker 的第一条 emit("all","running"),事件序列起点不变。
-    lc.report(lifecycle::machine::Msg::RefineProgress {
-        note_id: note_id.clone(),
-        stage: "all".into(),
-        state: "running".into(),
-    });
+    // 心跳注册必须先于 all/running 入队(codex 三十三轮):前任退场围栏持心跳锁
+    // 做「查代次+发 RefineFinished」,只有保证「注册在前、入队在后」,围栏读不到
+    // 新代次才能推出替补的 running 还没入队,FIFO 上前任的 Finished 必然排在它
+    // 前面,不会反过来把刚起跑的替补摘掉。
+    // (也兼收 codex P2a:run_local 阶段 refine_status 即有 beat 可探。)
+    let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+    refine_report_fenced(&lc, &note_id, beat_gen, "all", "running");
     // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
     // 里 `is_refining(id)` 占槽后复查处的同款注释)。
     //
@@ -416,13 +645,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             stage: "all".into(),
             state: "failed".into(),
         });
+        refine_beat_clear(&note_id, beat_gen); // 上面刚起的心跳同步清掉,不留无主条目
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
         return;
     }
     std::thread::spawn(move || {
         // Aing 集条目的移除交给 RAII(见 RefineDoneOnDrop):线程无论怎么结束都必然移除,
         // 不再依赖"执行流一定走到末尾那一行"。最先声明 ⇒ 最后 drop,时机不变。
-        let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone() };
+        let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
+        set_current_refine_run(beat_gen); // 本线程写盘一律以本代次署名(codex 三十三轮)
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
         // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
@@ -433,11 +664,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
         // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
         let report = |stage: &str, st: &str| {
-            lc.report(lifecycle::machine::Msg::RefineProgress {
-                note_id: note_id.clone(),
-                stage: stage.into(),
-                state: st.into(),
-            });
+            // 代次围栏+心跳+入队三合一持锁(codex 二十五/三十四轮)
+            refine_report_fenced(&lc, &note_id, beat_gen, stage, st);
         };
         let enqueued = std::cell::Cell::new(false);
         // 全局串行闸:在起 ORT 线程池的重活之前排队,同一时刻只放一篇过。守卫在 catch_unwind
@@ -448,13 +676,21 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 运行集——之后真开工时集合不再插入,编辑守卫/重复 Aing 全部失效。改
         // try_lock 轮询,每分钟补一条 all/running 心跳。代价是失去 Mutex 的排队
         // 公平性(多篇并发排队时唤醒顺序随机),Aing 并发本就罕见,可接受。
-        let _aing_gate = loop {
-            match AING_GATE.try_lock() {
-                Ok(g) => break g,
-                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                    report("all", "running");
+        let _aing_gate = {
+            // 2s 一试拿门,60s 一报心跳(codex 二十四轮):照旧一分钟一试的话,
+            // 前一篇一放门,排队的这篇还要干等最多一分钟才接上。
+            let mut ticks: u32 = 0;
+            loop {
+                match AING_GATE.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        ticks += 1;
+                        if ticks % 30 == 0 {
+                            report("all", "running");
+                        }
+                    }
                 }
             }
         };
@@ -495,9 +731,55 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             // 覆盖调度抖动(codex P2)——这里再包一层有界重试(~3s),
                             // 「笔记正被占用」以外的错误立刻放弃不重试。
                             let mut outcome = Err(String::new());
+                            // 伴生刷跳线程(codex 二十七轮):进度回调只在 decode/
+                            // transcribe/attribute/commit 四个阶段边界响,云端转写
+                            // 单阶段就能超一小时——不持续打点会被定时体检误杀
+                            // (写失败态+放行编辑,而 worker 还在跑)。每分钟代跳
+                            // 一次,二遍结束落旗自停。
+                            let sp_alive =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                            // 落旗交 RAII(codex 二十八轮):二遍代码 panic 展开时手动
+                            // store 走不到,刷跳线程会拿着这篇的心跳永远跳下去。
+                            struct SpFlagDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                            impl Drop for SpFlagDrop {
+                                fn drop(&mut self) {
+                                    self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            let _sp_guard = SpFlagDrop(sp_alive.clone());
+                            let _sp_refresher = {
+                                let alive = sp_alive.clone();
+                                let nid = note_id.clone();
+                                std::thread::spawn(move || {
+                                    // 保活设硬上限(codex 二十九轮):无进度信号的盲打点
+                                    // 若无限续命,二遍真吊死时体检永远看不见。4 小时
+                                    // 远超实测最长二遍(3.5h 会议约 70min),超限停跳,
+                                    // 停摆监工随后接管。
+                                    for i in 0.. {
+                                        if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_secs(60));
+                                        if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        if i >= 240 {
+                                            eprintln!(
+                                                "refine({nid}): 二遍保活达 4h 上限,停止代跳(若真吊死,停摆监工将接管)"
+                                            );
+                                            break;
+                                        }
+                                        refine_beat_touch(&nid, beat_gen, "second_pass", "running");
+                                    }
+                                })
+                            };
                             for attempt in 0..10 {
                                 // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
-                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {});
+                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {
+                                    // 二遍的解码/转写/归属进度喂进心跳表(codex 十五轮):
+                                    // 长会议二遍可超一小时,不打点会被定时体检误杀
+                                    refine_beat_touch(&note_id, beat_gen, "second_pass", "running");
+                                });
                                 match &outcome {
                                     Err(e) if e.contains("正被占用") || e.contains("busy") => {
                                         if attempt < 9 {
@@ -509,6 +791,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 }
                                 break;
                             }
+                            // 二遍收尾落旗,刷跳线程最多再睡一觉便自停
+                            sp_alive.store(false, std::sync::atomic::Ordering::Relaxed);
                             match outcome {
                                 Ok(sum) => {
                                     eprintln!("云端二遍完成({note_id}): {sum:?}");
@@ -524,6 +808,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
+                // 新一轮起跑:归档上一轮证据并撕收工戳(codex 十一/十二轮)——
+                // 停摆时自愈不能被旧 finished_at 骗成「已收工」,而旧戳本身是取证
+                // 材料,清之前先落 aing_runs.jsonl。
+                archive_and_clear_finish_stamp(&dir)
+                    .map_err(|e| anyhow::anyhow!("重跑起跑仪式失败(旧收工戳未清,拒绝开跑): {e}"))?;
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
@@ -696,6 +985,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 };
                 if let Some(identify_exec) = identify_exec {
+                    // 心跳表专用(codex 七轮):identify/title 在末次 report("llm",..)
+                    // 之后运行,不打点的话 refine_status 只见 llm/done 越来越陈旧,
+                    // 健康长跑与真停摆无从区分。只碰 beat,不进 lifecycle 事件流。
+                    refine_beat_touch(&note_id, beat_gen, "identify", "running");
                     let identify_result = (|| -> anyhow::Result<()> {
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
@@ -777,6 +1070,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
                 if refine_exec.is_some() && store::writer::is_default_title(&note.meta.title) {
+                    refine_beat_touch(&note_id, beat_gen, "title", "running"); // 心跳表打点,同 identify
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
                     let title = match refine_exec.as_ref().unwrap() {
@@ -823,10 +1117,38 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 anyhow::Ok(())
             }));
+        // 收工戳(issue #173 十/十六轮):llm 终态只证明 llm 阶段写过盘,identify/
+        // 标题尾段吊死时稿面与真收工无从区分。有序走到终态上报(done/failed/panic
+        // 被 catch 三臂都算"worker 有序退场")才盖戳,成败记进 runs 日志。
+        let stamp_finished = |outcome: &str| {
+            if let Ok(root) = notes_dir(&app) {
+                stamp_refine_finished(&root.join(&note_id), &note_id, outcome, beat_gen);
+            }
+        };
         match &result {
-            Ok(Ok(())) => report("all", "done"),
+            Ok(Ok(())) => {
+                stamp_finished("done");
+                report("all", "done");
+            }
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
+                if e.to_string().contains("起跑仪式失败") {
+                    // 证据保全优先(codex 十九轮):归档没写成,盘上旧收工戳必须原样
+                    // 保留——盖戳会把「上一轮何时收工」的唯一记录冲掉。只记日志。
+                    if let Ok(root) = notes_dir(&app) {
+                        let _ = append_refine_run_log(
+                            &root.join(&note_id),
+                            &note_id,
+                            &serde_json::json!({
+                                "event": "finished",
+                                "outcome": "failed_before_start",
+                                "at": chrono::Local::now().to_rfc3339(),
+                            }),
+                        );
+                    }
+                } else {
+                    stamp_finished("failed");
+                }
                 report("all", "failed");
             }
             Err(_) => {
@@ -834,6 +1156,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // panic 已被 catch_unwind 吞掉,进程级 hook 仍会捕获它;
                 // 这里补一条带链路 kind 的显式上报,便于按 fingerprint 分组与限流。
                 telemetry::report_error(telemetry::ErrorKind::AiPipeline, "Aing 管线 panic");
+                stamp_finished("panic");
                 report("all", "failed");
             }
         }
@@ -880,11 +1203,138 @@ impl Drop for ResetOnDrop {
 struct RefineDoneOnDrop {
     lc: lifecycle::LifecycleHandle,
     note_id: String,
+    beat_gen: u64,
 }
 impl Drop for RefineDoneOnDrop {
     fn drop(&mut self) {
+        // 代次围栏(codex 二十五/三十三轮):整个「查代次+清心跳+发 RefineFinished」
+        // 持心跳锁执行,与替补的注册(touch,同一把锁)互斥——查不到新代次即可断定
+        // 替补的 all/running 尚未入队(注册先于入队,见 spawn_refine),本条 Finished
+        // 在 FIFO 上必排它前面,不可能把刚起跑的替补移出 Aing 集。
+        let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = g.get_or_insert_with(Default::default);
+        if m.get(&self.note_id).is_some_and(|(g0, _, _)| *g0 > self.beat_gen) {
+            eprintln!(
+                "refine({}): 前任 worker 退场,替补在跑,不发 RefineFinished",
+                self.note_id
+            );
+            return;
+        }
+        if m.get(&self.note_id).is_some_and(|(g0, _, _)| *g0 == self.beat_gen) {
+            m.remove(&self.note_id);
+        }
+        // 持锁发送:unbounded channel 不阻塞,actor 侧不回取本锁,无死锁环。
         self.lc.report(lifecycle::machine::Msg::RefineFinished { note_id: self.note_id.clone() });
     }
+}
+
+/// Aing 心跳表(issue #173):note_id → (最近一次 stage/state, 时刻)。由 spawn_refine
+/// 的 report 咽喉更新、RefineDoneOnDrop 清理;refine_status(UDS/MCP)对外暴露——
+/// 外部工具从此能区分「在跑(心跳新鲜)/收工(无条目)/真停摆(心跳陈旧)」,不再靠
+/// 猜文件名与取样验尸(2026-08-26 事故:一次误诊链耗掉两小时)。
+static REFINE_BEAT: Mutex<
+    Option<std::collections::HashMap<String, (u64, String, std::time::Instant)>>,
+> = Mutex::new(None);
+/// worker 代次发号器:替补 worker 的心跳不被前任的 RAII 清理误伤(codex 四轮)。
+static REFINE_BEAT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn refine_beat_gen_next() -> u64 {
+    REFINE_BEAT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// 持心跳锁的「查代次+记心跳+入队上报」三合一(codex 三十四轮):与替补的注册
+/// 互斥,诈尸前任的终态事件不可能在替补 all/running 之后入队(FIFO 论证同
+/// RefineDoneOnDrop)。lifecycle 事件一律走这里;纯打点(identify/标题/二遍)仍用
+/// refine_beat_touch。
+fn refine_report_fenced(
+    lc: &lifecycle::LifecycleHandle,
+    note_id: &str,
+    my_gen: u64,
+    stage: &str,
+    state_s: &str,
+) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let m = g.get_or_insert_with(Default::default);
+    if m.get(note_id).is_some_and(|(g0, _, _)| *g0 > my_gen) {
+        return; // 替补已注册:前任连进度都不该再报
+    }
+    m.insert(
+        note_id.to_string(),
+        (my_gen, format!("{stage}/{state_s}"), std::time::Instant::now()),
+    );
+    // 持锁入队:unbounded 不阻塞,actor 不回取本锁,无死锁环。
+    lc.report(lifecycle::machine::Msg::RefineProgress {
+        note_id: note_id.to_string(),
+        stage: stage.into(),
+        state: state_s.into(),
+    });
+}
+
+/// 运行署名 RAII(codex 三十四轮):spawn_blocking 线程会被复用,退役时不清署名,
+/// 后续无关写盘会被记到已收工的那轮头上。
+struct RunTagGuard;
+impl Drop for RunTagGuard {
+    fn drop(&mut self) {
+        CURRENT_REFINE_RUN.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+fn refine_beat_touch(note_id: &str, gen: u64, stage: &str, state_s: &str) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let m = g.get_or_insert_with(Default::default);
+    // 旧代次不许抢座(codex 五轮):停摆被摘的前任若诈尸继续 report,任其覆盖
+    // 替补的条目,前任 Drop 时会把座位整个清掉,替补重活阶段就误报 beat=null。
+    if m.get(note_id).is_some_and(|(g0, _, _)| *g0 > gen) {
+        return;
+    }
+    m.insert(note_id.to_string(), (gen, format!("{stage}/{state_s}"), std::time::Instant::now()));
+}
+
+/// 只清本代 worker 的条目:停摆被摘的前任退场时,若心跳已被替补接管(代次不同),
+/// 原样留下——否则 refine_status 会在替补重活阶段误报 beat=null。
+fn refine_beat_clear(note_id: &str, gen: u64) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(m) = g.as_mut() {
+        if m.get(note_id).is_some_and(|(g0, _, _)| *g0 == gen) {
+            m.remove(note_id);
+        }
+    }
+}
+
+thread_local! {
+    /// 本线程所属 Aing 运行的标识 "pid-代次"(codex 三十/三十三轮):worker 线程
+    /// 起跑时设置,写盘咽喉读它落 writer_run。查心跳表在座者会把诈尸前任的写
+    /// 错记到替补头上;线程局部才是"谁写的"的真值。非 worker 线程为 None。
+    static CURRENT_REFINE_RUN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_current_refine_run(gen: u64) {
+    CURRENT_REFINE_RUN
+        .with(|c| *c.borrow_mut() = Some(format!("{}-{gen}", std::process::id())));
+}
+
+pub(crate) fn current_refine_run() -> Option<String> {
+    CURRENT_REFINE_RUN.with(|c| c.borrow().clone())
+}
+
+/// 写盘署名的回退源(codex 三十六轮):Agent 执行体经 UDS 桥写回时,执行线程是
+/// UDS 服务线程,线程局部未设——此时写盘是替当前在跑 worker 干活,取心跳在座
+/// 者代次署名是准确的。诈尸前任线程有自己的线程局部,不会落到这个回退。
+pub(crate) fn refine_beat_run_of(note_id: &str) -> Option<String> {
+    refine_beat_owner(note_id).map(|g| format!("{}-{g}", std::process::id()))
+}
+
+/// 查一篇心跳条目当前属于哪一代 worker(收工戳代次守卫用,codex 二十一轮)。
+fn refine_beat_owner(note_id: &str) -> Option<u64> {
+    let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()?.get(note_id).map(|(gen, _, _)| *gen)
+}
+
+/// 查一篇的心跳:Some((stage/state, 距今 ms))。None = 无 worker 在跑。
+pub(crate) fn refine_beat_of(note_id: &str) -> Option<(String, u64)> {
+    let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()?.get(note_id).map(|(_, s, t)| (s.clone(), t.elapsed().as_millis() as u64))
 }
 
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
@@ -2939,14 +3389,36 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     }
     let note_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+        set_current_refine_run(beat_gen); // 本线程写盘一律以本代次署名(codex 三十三轮)
+        let _run_tag = RunTagGuard; // spawn_blocking 线程复用,退出必清署名(codex 三十四轮)
+        // 收尾(清心跳+RefineFinished)交 RAII(codex 八轮):polish/回调 panic 展开时
+        // 手动清理会被跳过,心跳条目从此常驻,refine_status 永远报一个不存在的 worker。
+        let _refine_done =
+            RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
         let report = |stage: &str, state: &str| {
-            lc.report(lifecycle::machine::Msg::RefineProgress {
-                note_id: note_id.clone(),
-                stage: stage.into(),
-                state: state.into(),
-            });
+            // 代次围栏+心跳+入队三合一持锁,同 spawn_refine(codex 三十四轮)
+            refine_report_fenced(&lc, &note_id, beat_gen, stage, state);
         };
         report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
+        // 起跑归档上一轮证据并撕收工戳,理由同 spawn_refine(codex 十一/十二轮);
+        // 失败必须拦住重跑(codex 十三轮 P2),报终态走人,RAII 哨兵收尾
+        if let Err(e) = archive_and_clear_finish_stamp(&dir) {
+            eprintln!("部分重试({note_id}):旧收工戳未清,拒绝开跑: {e}");
+            // 与整篇路径同款(codex 二十一轮):这次未遂的重试也要进 runs 日志,
+            // 否则重启后 status 只剩上一轮的旧记录,这次失败像没发生过。
+            let _ = append_refine_run_log(
+                &dir,
+                &note_id,
+                &serde_json::json!({
+                    "event": "finished",
+                    "outcome": "failed_before_start",
+                    "at": chrono::Local::now().to_rfc3339(),
+                }),
+            );
+            report("all", "failed");
+            return;
+        }
         let run = || -> anyhow::Result<()> {
             let doc = store::load_refined(&dir)
                 .ok_or_else(|| anyhow::anyhow!("修订稿加载失败"))?;
@@ -3032,13 +3504,17 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             Ok(())
         };
         match run() {
-            Ok(()) => report("all", "done"),
+            Ok(()) => {
+                stamp_refine_finished(&dir, &note_id, "retry_done", beat_gen);
+                report("all", "done");
+            }
             Err(e) => {
                 eprintln!("部分重试失败({note_id}): {e}");
+                stamp_refine_finished(&dir, &note_id, "retry_failed", beat_gen);
                 report("all", "failed");
             }
         }
-        lc.report(lifecycle::machine::Msg::RefineFinished { note_id: note_id.clone() });
+        // 清心跳与 RefineFinished 由函数头部的 RefineDoneOnDrop 在退出时统一处理
     });
     Ok(())
 }

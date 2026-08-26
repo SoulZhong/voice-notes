@@ -277,6 +277,12 @@ pub struct StartParams {
     pub title: Option<String>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct NoteIdArg {
+    /// 笔记 id(如 20260826-140144)
+    note_id: String,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RetranscribeParams {
     /// 目标笔记 id
@@ -485,6 +491,16 @@ impl VnMcp {
     async fn retranscribe_status(&self) -> Result<CallToolResult, McpError> {
         Ok(bridge_call("retranscribe_status", serde_json::json!({})).await)
     }
+
+    #[tool(
+        description = "查询一篇笔记的 Aing(AI 整理)状态:refining(内核在跑集合)、beat(worker 最近心跳 stage 与距今毫秒)、doc(盘上 aing.json 摘要:各 stage/失败段数/written_at/writer_pid)。用于区分「在跑/已收工/真停摆」——beat 陈旧而 refining=true 即停摆。只读,需要应用正在运行。"
+    )]
+    async fn refine_status(
+        &self,
+        Parameters(NoteIdArg { note_id }): Parameters<NoteIdArg>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(bridge_call("refine_status", serde_json::json!({ "note_id": note_id })).await)
+    }
 }
 
 #[tool_handler(router = self.active_tool_router())]
@@ -537,6 +553,7 @@ pub fn catalog() -> serde_json::Value {
             "control",
         ),
         ("retranscribe_status", "查询当前重转写任务(running/note_id/阶段);空闲返回 running=false。含最近一次任务的终态(last)。", "app"),
+        ("refine_status", "查询一篇笔记的 Aing 状态(在跑/心跳/盘上稿三视角),区分在跑/收工/停摆。", "app"),
         (
             "identify_speakers",
             "读取笔记最近一次说话人身份推断结果(簇→人物建议、置信档、证据与处置状态;stale 标志提示稿已变化)。只读。",
@@ -594,8 +611,8 @@ mod catalog_tests {
         );
         assert_eq!(
             cat_names.len(),
-            16,
-            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status + identify_speakers"
+            17,
+            "11 个既有工具 + get_aing_context/apply_aing_graph + retranscribe_note/retranscribe_status + identify_speakers + refine_status"
         );
         assert!(cat_names.contains("get_aing_context"));
         assert!(cat_names.contains("apply_aing_graph"));
