@@ -497,12 +497,21 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
     // 先落成败日志,后盖收工戳(codex 二十轮):反过来的话,盖完戳、日志没写成
     // (或进程恰好死在中间),旧 llm=done 稿+新戳会被读成「新近成功收工」——这
     // 正是日志要消灭的歧义。日志写不进就不盖戳,保持「无戳=没收工」的保守可读。
+    // 落日志前先查一次替补(codex 三十七轮):否则先记普通 finished、锁内才发现
+    // 被替,又补一条 superseded——同一 worker 两条终态,中间崩掉还会让废稿看着
+    // 像正主。此查后锁内仍有兜底复验。
+    let superseded_now = refine_beat_owner(note_id).is_some_and(|g| g > my_gen);
     let rec = serde_json::json!({
         "event": "finished", "outcome": outcome, "at": at,
         "run": format!("{}-{my_gen}", std::process::id()),
+        "superseded": if superseded_now { Some(true) } else { None::<bool> },
     });
     if append_refine_run_log(dir, note_id, &rec).is_err() {
         eprintln!("refine({note_id}): 成败日志未落,收工戳弃盖(保守:无戳读作未收工)");
+        return;
+    }
+    if superseded_now {
+        eprintln!("refine({note_id}): 替补已在跑,前任成败已记日志(superseded),不盖稿");
         return;
     }
     // 尾段停摆调解(codex 三十五轮):自愈曾把 llm 从终态改标 failed,而 identify/

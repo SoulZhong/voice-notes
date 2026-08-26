@@ -602,20 +602,39 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                                 // 收工戳在 ≠ 成功(codex 三十六轮):诈尸
                                                 // worker 可能以 failed/panic 收的工。事件
                                                 // 状态按 runs 日志末条真实 outcome 选。
+                                                // 事件要与盘上稿对上号(codex 三十七轮):
+                                                // 末条可能是老 worker 迟到的 superseded
+                                                // 退场记录,拿它给替补的成功稿定 failed
+                                                // 就冤了。跳过 superseded;稿面有
+                                                // writer_run 时优先找 run 匹配的记录。
+                                                let doc_run = crate::store::load_refined(&dir)
+                                                    .map(|d| d.writer_run)
+                                                    .unwrap_or_default();
                                                 let ok = std::fs::read_to_string(
                                                     dir.join("aing_runs.jsonl"),
                                                 )
                                                 .ok()
                                                 .and_then(|raw| {
-                                                    raw.lines()
-                                                        .rev()
+                                                    let evs: Vec<serde_json::Value> = raw
+                                                        .lines()
                                                         .filter_map(|l| {
-                                                            serde_json::from_str::<
-                                                                serde_json::Value,
-                                                            >(l)
-                                                            .ok()
+                                                            serde_json::from_str(l).ok()
                                                         })
-                                                        .find(|v| v.get("event").is_some())
+                                                        .filter(|v: &serde_json::Value| {
+                                                            v.get("event").is_some()
+                                                                && v["superseded"]
+                                                                    != serde_json::json!(true)
+                                                        })
+                                                        .collect();
+                                                    evs.iter()
+                                                        .rev()
+                                                        .find(|v| {
+                                                            !doc_run.is_empty()
+                                                                && v["run"].as_str()
+                                                                    == Some(doc_run.as_str())
+                                                        })
+                                                        .or_else(|| evs.last())
+                                                        .cloned()
                                                 })
                                                 .map(|v| {
                                                     matches!(
