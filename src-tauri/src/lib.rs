@@ -462,8 +462,20 @@ fn append_refine_run_log(
 ///   上一轮的 llm=done 旧稿,光有 finished_at 会被读成「新近成功收工」——成败要
 ///   有单独的落盘证据。
 /// - 落戳带重试且失败出声:静默丢戳会让自愈把下一次停摆误判成「尾段停摆」。
-fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str) {
+fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my_gen: u64) {
     let at = chrono::Local::now().to_rfc3339();
+    // 代次守卫(codex 二十一轮):被判停摆的前任若在替补起跑后才苏醒走到这里,
+    // 盘上已是替补的中间稿——前任来盖 finished_at 会让替补此后的停摆被误判为
+    // 已收工。心跳表在座代次比我新即让位:成败照记日志(标 superseded),稿不动。
+    // (跨进程的双实例场景此守卫不覆盖,写盘仍由 NoteLock 串行,属已知边界。)
+    if refine_beat_owner(note_id).is_some_and(|g| g > my_gen) {
+        let rec = serde_json::json!({
+            "event": "finished", "outcome": outcome, "at": at, "superseded": true,
+        });
+        let _ = append_refine_run_log(dir, note_id, &rec);
+        eprintln!("refine({note_id}): 替补已在跑,前任收工戳弃盖(成败已记日志)");
+        return;
+    }
     // 先落成败日志,后盖收工戳(codex 二十轮):反过来的话,盖完戳、日志没写成
     // (或进程恰好死在中间),旧 llm=done 稿+新戳会被读成「新近成功收工」——这
     // 正是日志要消灭的歧义。日志写不进就不盖戳,保持「无戳=没收工」的保守可读。
@@ -981,7 +993,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 被 catch 三臂都算"worker 有序退场")才盖戳,成败记进 runs 日志。
         let stamp_finished = |outcome: &str| {
             if let Ok(root) = notes_dir(&app) {
-                stamp_refine_finished(&root.join(&note_id), &note_id, outcome);
+                stamp_refine_finished(&root.join(&note_id), &note_id, outcome, beat_gen);
             }
         };
         match &result {
@@ -1107,6 +1119,12 @@ fn refine_beat_clear(note_id: &str, gen: u64) {
             m.remove(note_id);
         }
     }
+}
+
+/// 查一篇心跳条目当前属于哪一代 worker(收工戳代次守卫用,codex 二十一轮)。
+fn refine_beat_owner(note_id: &str) -> Option<u64> {
+    let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()?.get(note_id).map(|(gen, _, _)| *gen)
 }
 
 /// 查一篇的心跳:Some((stage/state, 距今 ms))。None = 无 worker 在跑。
@@ -3185,6 +3203,17 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
         // 失败必须拦住重跑(codex 十三轮 P2),报终态走人,RAII 哨兵收尾
         if let Err(e) = archive_and_clear_finish_stamp(&dir) {
             eprintln!("部分重试({note_id}):旧收工戳未清,拒绝开跑: {e}");
+            // 与整篇路径同款(codex 二十一轮):这次未遂的重试也要进 runs 日志,
+            // 否则重启后 status 只剩上一轮的旧记录,这次失败像没发生过。
+            let _ = append_refine_run_log(
+                &dir,
+                &note_id,
+                &serde_json::json!({
+                    "event": "finished",
+                    "outcome": "failed_before_start",
+                    "at": chrono::Local::now().to_rfc3339(),
+                }),
+            );
             report("all", "failed");
             return;
         }
@@ -3274,12 +3303,12 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
         };
         match run() {
             Ok(()) => {
-                stamp_refine_finished(&dir, &note_id, "retry_done");
+                stamp_refine_finished(&dir, &note_id, "retry_done", beat_gen);
                 report("all", "done");
             }
             Err(e) => {
                 eprintln!("部分重试失败({note_id}): {e}");
-                stamp_refine_finished(&dir, &note_id, "retry_failed");
+                stamp_refine_finished(&dir, &note_id, "retry_failed", beat_gen);
                 report("all", "failed");
             }
         }
