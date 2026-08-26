@@ -508,6 +508,12 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
             if !d.finished_at.is_empty() {
                 anyhow::bail!("稿上已有更新的收工戳,弃盖");
             }
+            // 提交时再验代次(codex 二十八轮):替补在外层检查之后才起跑(部分重试
+            // 不过 AING_GATE)时,它的仪式已清过戳,上一条查不出;但它起跑前必先
+            // 同步注册更高代次心跳,此处能看见。
+            if refine_beat_owner(note_id).is_some_and(|g| g > my_gen) {
+                anyhow::bail!("替补已接手,弃盖");
+            }
             d.finished_at = at.clone();
             Ok(())
         }) {
@@ -695,6 +701,15 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             // 一次,二遍结束落旗自停。
                             let sp_alive =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                            // 落旗交 RAII(codex 二十八轮):二遍代码 panic 展开时手动
+                            // store 走不到,刷跳线程会拿着这篇的心跳永远跳下去。
+                            struct SpFlagDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                            impl Drop for SpFlagDrop {
+                                fn drop(&mut self) {
+                                    self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            let _sp_guard = SpFlagDrop(sp_alive.clone());
                             let _sp_refresher = {
                                 let alive = sp_alive.clone();
                                 let nid = note_id.clone();
