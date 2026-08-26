@@ -382,14 +382,14 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
                 "generated_at": d.generated_at,
                 "archived_at": chrono::Local::now().to_rfc3339(),
             });
-            if let Ok(mut f) = std::fs::OpenOptions::new()
+            // 归档失败必须中止(codex 十四轮):闭包报错则 update 不落盘,收工戳
+            // 原样保留——绝不能戳清了、档没归,把要保全的证据反手清掉。
+            let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join("aing_runs.jsonl"))
-            {
-                use std::io::Write as _;
-                let _ = writeln!(f, "{rec}");
-            }
+                .open(dir.join("aing_runs.jsonl"))?;
+            use std::io::Write as _;
+            writeln!(f, "{rec}")?;
         }
             d.finished_at = String::new();
             Ok(())
