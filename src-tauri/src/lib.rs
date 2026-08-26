@@ -392,16 +392,19 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
             // 按整行比对会把同一次运行再归一遍;按源字段比对跨重启也认得。
             let path = dir.join("aing_runs.jsonl");
             let rec_line = rec.to_string();
+            // 扫全文件而非只看末行(codex 二十二轮):归档后整写失败会再插一条
+            // failed_before_start,末行比对就认不出已归档过的同一轮了。文件小,全扫无妨。
             let dup = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|raw| {
-                    let v: serde_json::Value = serde_json::from_str(raw.lines().last()?).ok()?;
-                    Some(
-                        v["finished_at"] == rec["finished_at"]
-                            && v["written_at"] == rec["written_at"]
-                            && v["writer_pid"] == rec["writer_pid"]
-                            && v["generated_at"] == rec["generated_at"],
-                    )
+                .map(|raw| {
+                    raw.lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .any(|v| {
+                            v["finished_at"] == rec["finished_at"]
+                                && v["written_at"] == rec["written_at"]
+                                && v["writer_pid"] == rec["writer_pid"]
+                                && v["generated_at"] == rec["generated_at"]
+                        })
                 })
                 .unwrap_or(false);
             if !dup {
@@ -488,12 +491,26 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
     let mut last_err = None;
     for _ in 0..5 {
         match store::update_refined_for_retry(dir, |d| {
+            // 锁内复验(codex 二十二轮):每轮起跑仪式都会清空 finished_at,此刻
+            // 稿上已有戳 = 我离场后另一轮已完整收工(替补收工连心跳都清了,光看
+            // 心跳表查不出)。前任不得覆盖,弃盖中止本次 update。
+            if !d.finished_at.is_empty() {
+                anyhow::bail!("稿上已有更新的收工戳,弃盖");
+            }
             d.finished_at = at.clone();
             Ok(())
         }) {
             Ok(()) => {
                 stamped = true;
                 break;
+            }
+            Err(e) if e.to_string().contains("弃盖") => {
+                let rec = serde_json::json!({
+                    "event": "finished", "outcome": outcome, "at": at, "superseded": true,
+                });
+                let _ = append_refine_run_log(dir, note_id, &rec);
+                eprintln!("refine({note_id}): 稿上已有更新收工戳,前任弃盖(成败已记日志)");
+                return;
             }
             // 盘上无稿(run_local 前就失败):没有可盖戳的稿,run 日志照记
             Err(e) if e.to_string().contains("不存在") && !store::aing_exists(dir) => break,
