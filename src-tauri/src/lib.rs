@@ -383,6 +383,9 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         stage: "all".into(),
         state: "running".into(),
     });
+    // 心跳与首条 all/running 同步起表(codex P2a):否则 run_local(嵌入/本地重聚)
+    // 整个阶段 refine_status 都是 refining=true 而 beat=null,早期停摆恰好探不到。
+    refine_beat_touch(&note_id, "all", "running");
     // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
     // 里 `is_refining(id)` 占槽后复查处的同款注释)。
     //

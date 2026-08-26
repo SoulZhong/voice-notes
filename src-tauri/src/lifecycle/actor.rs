@@ -467,17 +467,28 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                 }
                                 if let Ok(root) = crate::notes_dir(&app2) {
                                     let dir = root.join(&id2);
-                                    if !crate::store::aing_exists(&dir) {
-                                        let mut doc = crate::store::RefinedDoc::minimal_failed();
-                                        doc.generated_at = chrono::Local::now().to_rfc3339();
-                                        match crate::store::write_refined_atomic(&dir, &doc) {
-                                            Ok(()) => eprintln!(
-                                                "lifecycle: 停摆自愈({id2})已落 llm=failed 最小稿,UI 可重跑"
-                                            ),
-                                            Err(e) => eprintln!(
-                                                "lifecycle: 停摆自愈({id2})失败态落盘失败(仅日志): {e}"
-                                            ),
+                                    // 查-判-写整体在一把 NoteLock 内(codex P1a/P1b):
+                                    // 已有中间稿改标 failed;诈尸写完的稿原样保留。
+                                    match crate::store::heal_stale_refined(&dir) {
+                                        Ok(act) => {
+                                            eprintln!("lifecycle: 停摆自愈({id2}):{act}");
+                                            if act.contains("failed") {
+                                                // 真写了失败态才广播(codex P2b):笔记页
+                                                // 在 note_refining 回 false 后已停轮询,
+                                                // 补一发终态事件让打开着的页面刷新。
+                                                let _ = app2.emit(
+                                                    "refine",
+                                                    crate::ipc::RefineEvent {
+                                                        note_id: id2.clone(),
+                                                        stage: "all".into(),
+                                                        state: "failed".into(),
+                                                    },
+                                                );
+                                            }
                                         }
+                                        Err(e) => eprintln!(
+                                            "lifecycle: 停摆自愈({id2})落盘失败(仅日志): {e}"
+                                        ),
                                     }
                                 }
                             });

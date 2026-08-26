@@ -863,6 +863,37 @@ fn update_refined(
     write_refined_atomic_locked(note_dir, &doc, &note_lock)
 }
 
+/// 停摆自愈(issue #173,codex P1a/P1b):一把 NoteLock 内完成「查-判-写」,
+/// 消灭"检查后 worker 诈尸写完稿、自愈再拿空失败稿盖掉"的窗口。
+/// 返回动作描述供日志;拿不到锁(别的进程正在写=有人活着)让路即成功。
+pub fn heal_stale_refined(note_dir: &Path) -> anyhow::Result<&'static str> {
+    let Some(lock) = NoteLock::acquire(note_dir)? else {
+        return Ok("另一进程持锁,让路");
+    };
+    match load_aing_file(note_dir) {
+        // 文件在但读不出:是证据,不能拿失败稿盖掉
+        None => Ok("盘上稿损坏,保留原样"),
+        Some(Some(mut doc)) => {
+            if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
+                // worker 其实收工了(或早已标败):稿子可用/可重跑,不动
+                return Ok("盘上稿已收尾,不动");
+            }
+            // run_local 之后 llm 阶段停摆:中间稿改标 failed,UI 出「失败可重跑」
+            doc.stages.llm = "failed".into();
+            doc.revision = doc.revision.saturating_add(1);
+            write_refined_atomic_locked(note_dir, &doc, &lock)?;
+            Ok("中间稿已改标 llm=failed")
+        }
+        Some(None) => {
+            // 盘上无稿(run_local 前就停摆):落最小失败稿替掉「没做 AI 整理」幻觉
+            let mut doc = RefinedDoc::minimal_failed();
+            doc.generated_at = chrono::Local::now().to_rfc3339();
+            write_refined_atomic_locked(note_dir, &doc, &lock)?;
+            Ok("已落 llm=failed 最小稿")
+        }
+    }
+}
+
 /// 修订稿说话人改名:该 speaker 的全部段落 name 置为新名。
 /// 把修订稿整份标 stale(拆分同步失败的硬兜底:原始段已改派,修订稿再不标脏,
 /// 用户在默认视图看到的就是旧归属还以为拆完了)。
@@ -1140,6 +1171,49 @@ pub fn join_note_identities(
 mod tests {
     use super::*;
     use crate::store::{ensure_graph_ids, evidence_id};
+
+    #[test]
+    fn heal_stale_covers_missing_intermediate_and_finished_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().join("20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        // ① 盘上无稿:落最小失败稿
+        let act = heal_stale_refined(&dir).unwrap();
+        assert!(act.contains("最小稿"), "{act}");
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert!(doc.paragraphs.is_empty());
+        assert!(!doc.written_at.is_empty(), "咽喉盖了写盘戳");
+        // ② 中间稿(run_local 后 llm=off):改标 failed,revision 进位,正文保留
+        let mut mid = RefinedDoc::minimal_failed();
+        mid.stages.llm = "off".into();
+        mid.paragraphs.push(RefinedParagraph {
+            speaker: "S1".into(),
+            name: None,
+            person_id: None,
+            text: "正文在".into(),
+            start_ms: 0,
+            end_ms: 1,
+            source_seqs: vec![0],
+            mentions: Vec::new(),
+        });
+        write_refined_atomic(&dir, &mid).unwrap();
+        let rev0 = load_refined(&dir).unwrap().revision;
+        let act = heal_stale_refined(&dir).unwrap();
+        assert!(act.contains("改标"), "{act}");
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.paragraphs[0].text, "正文在", "正文不丢");
+        assert!(doc.revision > rev0, "进位挡住过期编辑器");
+        // ③ 已收工的稿(llm=done):原样不动
+        let mut done = load_refined(&dir).unwrap();
+        done.stages.llm = "done".into();
+        write_refined_atomic(&dir, &done).unwrap();
+        let before = std::fs::read(dir.join(AING_DOC_FILE)).unwrap();
+        let act = heal_stale_refined(&dir).unwrap();
+        assert!(act.contains("不动"), "{act}");
+        assert_eq!(std::fs::read(dir.join(AING_DOC_FILE)).unwrap(), before);
+    }
 
     #[test]
     fn v2_writes_synthesize_stable_mention_ids_without_a_repair_read() {
