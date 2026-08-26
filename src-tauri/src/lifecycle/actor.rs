@@ -599,7 +599,33 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                                 );
                                                 Some("failed")
                                             } else if act.contains("已收工") {
-                                                Some("done") // 稿好戳在:纯粹补广播
+                                                // 收工戳在 ≠ 成功(codex 三十六轮):诈尸
+                                                // worker 可能以 failed/panic 收的工。事件
+                                                // 状态按 runs 日志末条真实 outcome 选。
+                                                let ok = std::fs::read_to_string(
+                                                    dir.join("aing_runs.jsonl"),
+                                                )
+                                                .ok()
+                                                .and_then(|raw| {
+                                                    raw.lines()
+                                                        .rev()
+                                                        .filter_map(|l| {
+                                                            serde_json::from_str::<
+                                                                serde_json::Value,
+                                                            >(l)
+                                                            .ok()
+                                                        })
+                                                        .find(|v| v.get("event").is_some())
+                                                })
+                                                .map(|v| {
+                                                    matches!(
+                                                        v["outcome"].as_str(),
+                                                        Some("done") | Some("retry_done")
+                                                    )
+                                                })
+                                                // 无日志(旧世界收工稿):按成功处理
+                                                .unwrap_or(true);
+                                                Some(if ok { "done" } else { "failed" })
                                             } else {
                                                 None // 让路/坏稿:没动盘,也不该发终态
                                             };

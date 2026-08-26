@@ -1309,6 +1309,13 @@ pub(crate) fn current_refine_run() -> Option<String> {
     CURRENT_REFINE_RUN.with(|c| c.borrow().clone())
 }
 
+/// 写盘署名的回退源(codex 三十六轮):Agent 执行体经 UDS 桥写回时,执行线程是
+/// UDS 服务线程,线程局部未设——此时写盘是替当前在跑 worker 干活,取心跳在座
+/// 者代次署名是准确的。诈尸前任线程有自己的线程局部,不会落到这个回退。
+pub(crate) fn refine_beat_run_of(note_id: &str) -> Option<String> {
+    refine_beat_owner(note_id).map(|g| format!("{}-{g}", std::process::id()))
+}
+
 /// 查一篇心跳条目当前属于哪一代 worker(收工戳代次守卫用,codex 二十一轮)。
 fn refine_beat_owner(note_id: &str) -> Option<u64> {
     let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
