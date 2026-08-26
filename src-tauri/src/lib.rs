@@ -564,15 +564,18 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     // 排在停录 reply 之前入队,停录返回后到达的续录命令必然在它后面,内核守卫才
     // 不会因 worker 线程起步慢而漏挡(与旧世界入口同步 insert 的窗口对齐)。
     // 它同时就是旧 worker 的第一条 emit("all","running"),事件序列起点不变。
+    // 心跳注册必须先于 all/running 入队(codex 三十三轮):前任退场围栏持心跳锁
+    // 做「查代次+发 RefineFinished」,只有保证「注册在前、入队在后」,围栏读不到
+    // 新代次才能推出替补的 running 还没入队,FIFO 上前任的 Finished 必然排在它
+    // 前面,不会反过来把刚起跑的替补摘掉。
+    // (也兼收 codex P2a:run_local 阶段 refine_status 即有 beat 可探。)
+    let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+    refine_beat_touch(&note_id, beat_gen, "all", "running");
     lc.report(lifecycle::machine::Msg::RefineProgress {
         note_id: note_id.clone(),
         stage: "all".into(),
         state: "running".into(),
     });
-    // 心跳与首条 all/running 同步起表(codex P2a):否则 run_local(嵌入/本地重聚)
-    // 整个阶段 refine_status 都是 refining=true 而 beat=null,早期停摆恰好探不到。
-    let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
-    refine_beat_touch(&note_id, beat_gen, "all", "running");
     // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
     // 里 `is_refining(id)` 占槽后复查处的同款注释)。
     //
@@ -614,6 +617,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // Aing 集条目的移除交给 RAII(见 RefineDoneOnDrop):线程无论怎么结束都必然移除,
         // 不再依赖"执行流一定走到末尾那一行"。最先声明 ⇒ 最后 drop,时机不变。
         let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
+        set_current_refine_run(beat_gen); // 本线程写盘一律以本代次署名(codex 三十三轮)
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
         // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
@@ -1177,19 +1181,23 @@ struct RefineDoneOnDrop {
 }
 impl Drop for RefineDoneOnDrop {
     fn drop(&mut self) {
-        // 代次围栏(codex 二十五轮):替补(更高代次)在跑时,前任退场只能悄悄走——
-        // RefineFinished 只带 note_id,发出去会把替补移出 Aing 集,编辑守卫随之
-        // 放行,与还在写盘的替补对撞。心跳条目属于替补,同样不动。
-        if refine_beat_owner(&self.note_id).is_some_and(|g| g > self.beat_gen) {
+        // 代次围栏(codex 二十五/三十三轮):整个「查代次+清心跳+发 RefineFinished」
+        // 持心跳锁执行,与替补的注册(touch,同一把锁)互斥——查不到新代次即可断定
+        // 替补的 all/running 尚未入队(注册先于入队,见 spawn_refine),本条 Finished
+        // 在 FIFO 上必排它前面,不可能把刚起跑的替补移出 Aing 集。
+        let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = g.get_or_insert_with(Default::default);
+        if m.get(&self.note_id).is_some_and(|(g0, _, _)| *g0 > self.beat_gen) {
             eprintln!(
                 "refine({}): 前任 worker 退场,替补在跑,不发 RefineFinished",
                 self.note_id
             );
             return;
         }
-        // 心跳条目随 worker 生命周期清理:线程无论怎么结束都必然移除(与 RefineFinished
-        // 同一 RAII 教训)。只清本代,不误伤替补 worker 的条目。
-        refine_beat_clear(&self.note_id, self.beat_gen);
+        if m.get(&self.note_id).is_some_and(|(g0, _, _)| *g0 == self.beat_gen) {
+            m.remove(&self.note_id);
+        }
+        // 持锁发送:unbounded channel 不阻塞,actor 侧不回取本锁,无死锁环。
         self.lc.report(lifecycle::machine::Msg::RefineFinished { note_id: self.note_id.clone() });
     }
 }
@@ -1230,9 +1238,21 @@ fn refine_beat_clear(note_id: &str, gen: u64) {
     }
 }
 
-/// 查一篇在跑 worker 的运行标识 "pid-代次"(稿面 writer_run 用,codex 三十轮)。
-pub(crate) fn refine_beat_run_of(note_id: &str) -> Option<String> {
-    refine_beat_owner(note_id).map(|g| format!("{}-{g}", std::process::id()))
+thread_local! {
+    /// 本线程所属 Aing 运行的标识 "pid-代次"(codex 三十/三十三轮):worker 线程
+    /// 起跑时设置,写盘咽喉读它落 writer_run。查心跳表在座者会把诈尸前任的写
+    /// 错记到替补头上;线程局部才是"谁写的"的真值。非 worker 线程为 None。
+    static CURRENT_REFINE_RUN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_current_refine_run(gen: u64) {
+    CURRENT_REFINE_RUN
+        .with(|c| *c.borrow_mut() = Some(format!("{}-{gen}", std::process::id())));
+}
+
+pub(crate) fn current_refine_run() -> Option<String> {
+    CURRENT_REFINE_RUN.with(|c| c.borrow().clone())
 }
 
 /// 查一篇心跳条目当前属于哪一代 worker(收工戳代次守卫用,codex 二十一轮)。
@@ -3300,6 +3320,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     let note_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+        set_current_refine_run(beat_gen); // 本线程写盘一律以本代次署名(codex 三十三轮)
         // 收尾(清心跳+RefineFinished)交 RAII(codex 八轮):polish/回调 panic 展开时
         // 手动清理会被跳过,心跳条目从此常驻,refine_status 永远报一个不存在的 worker。
         let _refine_done =

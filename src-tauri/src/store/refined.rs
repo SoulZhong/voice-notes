@@ -138,7 +138,7 @@ fn prepared_doc_bytes(note_id: &str, doc: &RefinedDoc) -> anyhow::Result<Vec<u8>
     // (Agent 图谱写回/关系回填)全都在此序列化,谁写盘谁盖戳,不会漏路径。
     doc.written_at = chrono::Local::now().to_rfc3339();
     doc.writer_pid = std::process::id();
-    doc.writer_run = crate::refine_beat_run_of(note_id).unwrap_or_default();
+    doc.writer_run = crate::current_refine_run().unwrap_or_default();
     Ok(serde_json::to_vec_pretty(&doc)?)
 }
 
