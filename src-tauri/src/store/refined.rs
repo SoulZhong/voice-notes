@@ -911,35 +911,24 @@ pub fn heal_stale_refined(note_dir: &Path, stalled_at: &str) -> anyhow::Result<&
             }
             let mut doc = RefinedDoc::minimal_failed();
             doc.generated_at = chrono::Local::now().to_rfc3339();
-            // 被抑制段(回声/撤回)不得借失败稿还魂:套用与 NoteStore::load 同款侧车
-            let suppressed: std::collections::HashSet<u64> =
-                std::fs::read_to_string(note_dir.join("segment-suppressions.jsonl"))
-                    .map(|raw| {
-                        raw.lines()
-                            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                            .filter_map(|v| v["seq"].as_u64())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            if let Ok(raw) = std::fs::read_to_string(note_dir.join("segments.jsonl")) {
-                for line in raw.lines() {
-                    let Ok(seg) = serde_json::from_str::<crate::store::SegmentRecord>(line)
-                    else {
-                        continue;
-                    };
-                    if suppressed.contains(&seg.seq) {
-                        continue;
+            // 正文取自规范加载器(codex 五轮):抑制侧车/空段剔除/稳定排序/align
+            // 时基修正全套语义与原始稿视图一致,失败稿不另造一套口径。
+            if let (Some(parent), Some(id)) =
+                (note_dir.parent(), note_dir.file_name().and_then(|n| n.to_str()))
+            {
+                if let Ok(note) = crate::store::NoteStore::new(parent.to_path_buf()).load(id) {
+                    for seg in note.segments {
+                        doc.paragraphs.push(RefinedParagraph {
+                            speaker: seg.speaker.unwrap_or_default(),
+                            name: None,
+                            person_id: None,
+                            text: seg.text,
+                            start_ms: seg.start_ms,
+                            end_ms: seg.end_ms,
+                            source_seqs: vec![seg.seq],
+                            mentions: Vec::new(),
+                        });
                     }
-                    doc.paragraphs.push(RefinedParagraph {
-                        speaker: seg.speaker.unwrap_or_default(),
-                        name: None,
-                        person_id: None,
-                        text: seg.text,
-                        start_ms: seg.start_ms,
-                        end_ms: seg.end_ms,
-                        source_seqs: vec![seg.seq],
-                        mentions: Vec::new(),
-                    });
                 }
             }
             write_refined_atomic_locked(note_dir, &doc, &lock)?;

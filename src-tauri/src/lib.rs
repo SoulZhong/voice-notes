@@ -913,10 +913,13 @@ fn refine_beat_gen_next() -> u64 {
 
 fn refine_beat_touch(note_id: &str, gen: u64, stage: &str, state_s: &str) {
     let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.get_or_insert_with(Default::default).insert(
-        note_id.to_string(),
-        (gen, format!("{stage}/{state_s}"), std::time::Instant::now()),
-    );
+    let m = g.get_or_insert_with(Default::default);
+    // 旧代次不许抢座(codex 五轮):停摆被摘的前任若诈尸继续 report,任其覆盖
+    // 替补的条目,前任 Drop 时会把座位整个清掉,替补重活阶段就误报 beat=null。
+    if m.get(note_id).is_some_and(|(g0, _, _)| *g0 > gen) {
+        return;
+    }
+    m.insert(note_id.to_string(), (gen, format!("{stage}/{state_s}"), std::time::Instant::now()));
 }
 
 /// 只清本代 worker 的条目:停摆被摘的前任退场时,若心跳已被替补接管(代次不同),
