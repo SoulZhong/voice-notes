@@ -382,6 +382,9 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
                 "finished_at": d.finished_at,
                 "written_at": d.written_at,
                 "writer_pid": d.writer_pid,
+                // 上一轮的运行标识随档保留(codex 三十二轮):新一轮整写会把稿面
+                // writer_run 顶掉,归档不带它,稿与终态日志就再对不上号了。
+                "writer_run": d.writer_run,
                 "generated_at": d.generated_at,
                 "archived_at": archived_at,
             });
@@ -403,6 +406,7 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
                             v["finished_at"] == rec["finished_at"]
                                 && v["written_at"] == rec["written_at"]
                                 && v["writer_pid"] == rec["writer_pid"]
+                                && v["writer_run"] == rec["writer_run"]
                                 && v["generated_at"] == rec["generated_at"]
                         })
                 })
