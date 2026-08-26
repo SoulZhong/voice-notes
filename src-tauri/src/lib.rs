@@ -611,6 +611,12 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
         // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
         let report = |stage: &str, st: &str| {
+            // 代次围栏(codex 二十五轮):被判停摆的前任苏醒后不得再向 lifecycle
+            // 发任何事件——它的终态会让 UI 把还在跑的替补当收场,RefineFinished
+            // 会把替补移出 Aing 集重新放行编辑。
+            if refine_beat_owner(&note_id).is_some_and(|g| g > beat_gen) {
+                return;
+            }
             refine_beat_touch(&note_id, beat_gen, stage, st); // 心跳表(#173):对外可探的最近进度
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
@@ -1114,6 +1120,16 @@ struct RefineDoneOnDrop {
 }
 impl Drop for RefineDoneOnDrop {
     fn drop(&mut self) {
+        // 代次围栏(codex 二十五轮):替补(更高代次)在跑时,前任退场只能悄悄走——
+        // RefineFinished 只带 note_id,发出去会把替补移出 Aing 集,编辑守卫随之
+        // 放行,与还在写盘的替补对撞。心跳条目属于替补,同样不动。
+        if refine_beat_owner(&self.note_id).is_some_and(|g| g > self.beat_gen) {
+            eprintln!(
+                "refine({}): 前任 worker 退场,替补在跑,不发 RefineFinished",
+                self.note_id
+            );
+            return;
+        }
         // 心跳条目随 worker 生命周期清理:线程无论怎么结束都必然移除(与 RefineFinished
         // 同一 RAII 教训)。只清本代,不误伤替补 worker 的条目。
         refine_beat_clear(&self.note_id, self.beat_gen);
@@ -3227,6 +3243,9 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
         let _refine_done =
             RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
         let report = |stage: &str, state: &str| {
+            if refine_beat_owner(&note_id).is_some_and(|g| g > beat_gen) {
+                return; // 代次围栏,同 spawn_refine(codex 二十五轮)
+            }
             refine_beat_touch(&note_id, beat_gen, stage, state); // 心跳表(#173):部分重试同样可探
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
