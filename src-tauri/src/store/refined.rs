@@ -125,6 +125,10 @@ pub struct RefinedDoc {
 fn prepared_doc_bytes(note_id: &str, doc: &RefinedDoc) -> anyhow::Result<Vec<u8>> {
     let mut doc = doc.clone();
     crate::store::aing_graph::ensure_graph_ids(note_id, &mut doc);
+    // 落盘戳单一咽喉(issue #173):write_refined_atomic_locked 与锚定 writer
+    // (Agent 图谱写回/关系回填)全都在此序列化,谁写盘谁盖戳,不会漏路径。
+    doc.written_at = chrono::Local::now().to_rfc3339();
+    doc.writer_pid = std::process::id();
     Ok(serde_json::to_vec_pretty(&doc)?)
 }
 
@@ -699,9 +703,7 @@ pub(crate) fn write_refined_atomic_locked(
     _lock: &NoteLock,
 ) -> anyhow::Result<()> {
     let mut doc = doc.clone();
-    // 落盘戳单一咽喉:所有整写路径(llm 成功/失败态/agent/滞留自愈)都从这里过。
-    doc.written_at = chrono::Local::now().to_rfc3339();
-    doc.writer_pid = std::process::id();
+    // 落盘戳已下沉到 prepared_doc_bytes(锚定 writer 同样经过那里),此处只管 revision。
     if let Some(Some(existing)) = load_aing_file(note_dir) {
         if existing.revision > doc.revision {
             doc.revision = existing.revision.saturating_add(1);
@@ -909,12 +911,25 @@ pub fn heal_stale_refined(note_dir: &Path, stalled_at: &str) -> anyhow::Result<&
             }
             let mut doc = RefinedDoc::minimal_failed();
             doc.generated_at = chrono::Local::now().to_rfc3339();
+            // 被抑制段(回声/撤回)不得借失败稿还魂:套用与 NoteStore::load 同款侧车
+            let suppressed: std::collections::HashSet<u64> =
+                std::fs::read_to_string(note_dir.join("segment-suppressions.jsonl"))
+                    .map(|raw| {
+                        raw.lines()
+                            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                            .filter_map(|v| v["seq"].as_u64())
+                            .collect()
+                    })
+                    .unwrap_or_default();
             if let Ok(raw) = std::fs::read_to_string(note_dir.join("segments.jsonl")) {
                 for line in raw.lines() {
                     let Ok(seg) = serde_json::from_str::<crate::store::SegmentRecord>(line)
                     else {
                         continue;
                     };
+                    if suppressed.contains(&seg.seq) {
+                        continue;
+                    }
                     doc.paragraphs.push(RefinedParagraph {
                         speaker: seg.speaker.unwrap_or_default(),
                         name: None,
@@ -1219,15 +1234,23 @@ mod tests {
         // ① 盘上无稿:落失败稿,正文从 segments.jsonl 物化(不落白板稿)
         std::fs::write(
             dir.join("segments.jsonl"),
-            r#"{"seq":0,"source":"mic","text":"原文甲","start_ms":0,"end_ms":1000,"speaker":"S1"}"#,
+            concat!(
+                r#"{"seq":0,"source":"mic","text":"原文甲","start_ms":0,"end_ms":1000,"speaker":"S1"}"#,
+                "
+",
+                r#"{"seq":1,"source":"mic","text":"回声段","start_ms":1000,"end_ms":2000,"speaker":"S1"}"#,
+            ),
         )
         .unwrap();
+        std::fs::write(dir.join("segment-suppressions.jsonl"), r#"{"seq":1,"reason":"echo_match"}"#)
+            .unwrap();
         let act = heal_stale_refined(&dir, &chrono::Local::now().to_rfc3339()).unwrap();
         assert!(act.contains("原始段"), "{act}");
         let doc = load_refined(&dir).unwrap();
         assert_eq!(doc.stages.llm, "failed");
         assert_eq!(doc.paragraphs[0].text, "原文甲", "修订视图不是白板");
         assert_eq!(doc.paragraphs[0].speaker, "S1");
+        assert_eq!(doc.paragraphs.len(), 1, "被抑制的回声段不得借失败稿还魂");
         assert!(!doc.written_at.is_empty(), "咽喉盖了写盘戳");
         // ② 中间稿(run_local 后 llm=off):改标 failed,revision 进位,正文保留
         let mut mid = RefinedDoc::minimal_failed();

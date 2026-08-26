@@ -385,7 +385,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     });
     // 心跳与首条 all/running 同步起表(codex P2a):否则 run_local(嵌入/本地重聚)
     // 整个阶段 refine_status 都是 refining=true 而 beat=null,早期停摆恰好探不到。
-    refine_beat_touch(&note_id, "all", "running");
+    let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
+    refine_beat_touch(&note_id, beat_gen, "all", "running");
     // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
     // 里 `is_refining(id)` 占槽后复查处的同款注释)。
     //
@@ -419,14 +420,14 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             stage: "all".into(),
             state: "failed".into(),
         });
-        refine_beat_clear(&note_id); // 上面刚起的心跳同步清掉,不留无主条目
+        refine_beat_clear(&note_id, beat_gen); // 上面刚起的心跳同步清掉,不留无主条目
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
         return;
     }
     std::thread::spawn(move || {
         // Aing 集条目的移除交给 RAII(见 RefineDoneOnDrop):线程无论怎么结束都必然移除,
         // 不再依赖"执行流一定走到末尾那一行"。最先声明 ⇒ 最后 drop,时机不变。
-        let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone() };
+        let _refine_done = RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
         // F1 修复(b):若此刻活跃会话正是本 note_id,说明 resume 已经抢在 Aing 完成前重开
         // 录制、正在向 mic.wav 追加写——此刻 enqueue 会让转码 worker 编码+删除一份正在
         // 被写入的 WAV,续录段音频永久丢失。锁只取 note_id 立即释放,不跨 enqueue 调用
@@ -437,7 +438,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
         // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
         let report = |stage: &str, st: &str| {
-            refine_beat_touch(&note_id, stage, st); // 心跳表(#173):对外可探的最近进度
+            refine_beat_touch(&note_id, beat_gen, stage, st); // 心跳表(#173):对外可探的最近进度
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
                 stage: stage.into(),
@@ -885,12 +886,13 @@ impl Drop for ResetOnDrop {
 struct RefineDoneOnDrop {
     lc: lifecycle::LifecycleHandle,
     note_id: String,
+    beat_gen: u64,
 }
 impl Drop for RefineDoneOnDrop {
     fn drop(&mut self) {
         // 心跳条目随 worker 生命周期清理:线程无论怎么结束都必然移除(与 RefineFinished
-        // 同一 RAII 教训)。
-        refine_beat_clear(&self.note_id);
+        // 同一 RAII 教训)。只清本代,不误伤替补 worker 的条目。
+        refine_beat_clear(&self.note_id, self.beat_gen);
         self.lc.report(lifecycle::machine::Msg::RefineFinished { note_id: self.note_id.clone() });
     }
 }
@@ -899,26 +901,39 @@ impl Drop for RefineDoneOnDrop {
 /// 的 report 咽喉更新、RefineDoneOnDrop 清理;refine_status(UDS/MCP)对外暴露——
 /// 外部工具从此能区分「在跑(心跳新鲜)/收工(无条目)/真停摆(心跳陈旧)」,不再靠
 /// 猜文件名与取样验尸(2026-08-26 事故:一次误诊链耗掉两小时)。
-static REFINE_BEAT: Mutex<Option<std::collections::HashMap<String, (String, std::time::Instant)>>> =
-    Mutex::new(None);
+static REFINE_BEAT: Mutex<
+    Option<std::collections::HashMap<String, (u64, String, std::time::Instant)>>,
+> = Mutex::new(None);
+/// worker 代次发号器:替补 worker 的心跳不被前任的 RAII 清理误伤(codex 四轮)。
+static REFINE_BEAT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn refine_beat_touch(note_id: &str, stage: &str, state_s: &str) {
-    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.get_or_insert_with(Default::default)
-        .insert(note_id.to_string(), (format!("{stage}/{state_s}"), std::time::Instant::now()));
+fn refine_beat_gen_next() -> u64 {
+    REFINE_BEAT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-fn refine_beat_clear(note_id: &str) {
+fn refine_beat_touch(note_id: &str, gen: u64, stage: &str, state_s: &str) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.get_or_insert_with(Default::default).insert(
+        note_id.to_string(),
+        (gen, format!("{stage}/{state_s}"), std::time::Instant::now()),
+    );
+}
+
+/// 只清本代 worker 的条目:停摆被摘的前任退场时,若心跳已被替补接管(代次不同),
+/// 原样留下——否则 refine_status 会在替补重活阶段误报 beat=null。
+fn refine_beat_clear(note_id: &str, gen: u64) {
     let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(m) = g.as_mut() {
-        m.remove(note_id);
+        if m.get(note_id).is_some_and(|(g0, _, _)| *g0 == gen) {
+            m.remove(note_id);
+        }
     }
 }
 
 /// 查一篇的心跳:Some((stage/state, 距今 ms))。None = 无 worker 在跑。
 pub(crate) fn refine_beat_of(note_id: &str) -> Option<(String, u64)> {
     let g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.as_ref()?.get(note_id).map(|(s, t)| (s.clone(), t.elapsed().as_millis() as u64))
+    g.as_ref()?.get(note_id).map(|(_, s, t)| (s.clone(), t.elapsed().as_millis() as u64))
 }
 
 /// 识别器唯一实例化点：按选型造对应识别器，装进 trait 对象。preload 与 spawn_session
@@ -2973,8 +2988,9 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     }
     let note_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
         let report = |stage: &str, state: &str| {
-            refine_beat_touch(&note_id, stage, state); // 心跳表(#173):部分重试同样可探
+            refine_beat_touch(&note_id, beat_gen, stage, state); // 心跳表(#173):部分重试同样可探
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
                 stage: stage.into(),
@@ -3073,7 +3089,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                 report("all", "failed");
             }
         }
-        refine_beat_clear(&note_id); // 部分重试无 RAII 哨兵,收尾手动清心跳
+        refine_beat_clear(&note_id, beat_gen); // 部分重试无 RAII 哨兵,收尾手动清心跳
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id: note_id.clone() });
     });
     Ok(())
