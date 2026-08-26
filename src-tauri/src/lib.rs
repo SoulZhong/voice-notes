@@ -414,6 +414,51 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
 }
 
+/// 收工戳落盘(codex 十六轮):worker 有序退场时调用。
+/// - outcome 一并记进 aing_runs.jsonl:重跑失败在 run_local 写盘之前时,盘上还是
+///   上一轮的 llm=done 旧稿,光有 finished_at 会被读成「新近成功收工」——成败要
+///   有单独的落盘证据。
+/// - 落戳带重试且失败出声:静默丢戳会让自愈把下一次停摆误判成「尾段停摆」。
+fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str) {
+    let at = chrono::Local::now().to_rfc3339();
+    let mut stamped = false;
+    let mut last_err = None;
+    for _ in 0..5 {
+        match store::update_refined_for_retry(dir, |d| {
+            d.finished_at = at.clone();
+            Ok(())
+        }) {
+            Ok(()) => {
+                stamped = true;
+                break;
+            }
+            // 盘上无稿(run_local 前就失败):没有可盖戳的稿,run 日志照记
+            Err(e) if e.to_string().contains("不存在") && !store::aing_exists(dir) => break,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    if !stamped {
+        if let Some(e) = last_err {
+            eprintln!(
+                "refine({note_id}): 收工戳落盘失败(自愈可能把下次停摆误判为尾段停摆): {e}"
+            );
+        }
+    }
+    let rec = serde_json::json!({ "event": "finished", "outcome": outcome, "at": at });
+    match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aing_runs.jsonl")) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            if let Err(e) = writeln!(f, "{rec}") {
+                eprintln!("refine({note_id}): 运行日志追加失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("refine({note_id}): 运行日志打开失败: {e}"),
+    }
+}
+
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
     let transcode = state.transcode.clone();
@@ -890,25 +935,22 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 anyhow::Ok(())
             }));
-        // 收工戳(issue #173 十轮):llm 终态只证明 llm 阶段写过盘,identify/标题
-        // 尾段吊死时稿面与真收工无从区分。有序走到终态上报(done/failed/panic 被
-        // catch 三臂都算"worker 有序退场")才盖此戳;写失败不拦终态上报。
-        let stamp_finished = || {
+        // 收工戳(issue #173 十/十六轮):llm 终态只证明 llm 阶段写过盘,identify/
+        // 标题尾段吊死时稿面与真收工无从区分。有序走到终态上报(done/failed/panic
+        // 被 catch 三臂都算"worker 有序退场")才盖戳,成败记进 runs 日志。
+        let stamp_finished = |outcome: &str| {
             if let Ok(root) = notes_dir(&app) {
-                let _ = store::update_refined_for_retry(&root.join(&note_id), |d| {
-                    d.finished_at = chrono::Local::now().to_rfc3339();
-                    Ok(())
-                });
+                stamp_refine_finished(&root.join(&note_id), &note_id, outcome);
             }
         };
         match &result {
             Ok(Ok(())) => {
-                stamp_finished();
+                stamp_finished("done");
                 report("all", "done");
             }
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
-                stamp_finished();
+                stamp_finished("failed");
                 report("all", "failed");
             }
             Err(_) => {
@@ -916,7 +958,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // panic 已被 catch_unwind 吞掉,进程级 hook 仍会捕获它;
                 // 这里补一条带链路 kind 的显式上报,便于按 fingerprint 分组与限流。
                 telemetry::report_error(telemetry::ErrorKind::AiPipeline, "Aing 管线 panic");
-                stamp_finished();
+                stamp_finished("panic");
                 report("all", "failed");
             }
         }
@@ -3173,20 +3215,14 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             })?;
             Ok(())
         };
-        let stamp_finished = || {
-            let _ = store::update_refined_for_retry(&dir, |d| {
-                d.finished_at = chrono::Local::now().to_rfc3339();
-                Ok(())
-            });
-        };
         match run() {
             Ok(()) => {
-                stamp_finished();
+                stamp_refine_finished(&dir, &note_id, "retry_done");
                 report("all", "done");
             }
             Err(e) => {
                 eprintln!("部分重试失败({note_id}): {e}");
-                stamp_finished();
+                stamp_refine_finished(&dir, &note_id, "retry_failed");
                 report("all", "failed");
             }
         }
