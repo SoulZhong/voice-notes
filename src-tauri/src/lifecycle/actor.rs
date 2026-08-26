@@ -569,6 +569,21 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                                         "lifecycle: 停摆自愈({id2})心跳停在 {stage} 已 {age_ms}ms"
                                                     );
                                                 }
+                                                // 停摆定性落盘(codex 二十六轮):事件是
+                                                // 一次性的,页面/应用重启后只剩盘上稿
+                                                // (可能是 llm=done 的旧稿)——runs 日志
+                                                // 补一条 stale 终局,refine_status 的
+                                                // last_run 才不会指回更早的一轮。
+                                                let _ = crate::append_refine_run_log(
+                                                    &dir,
+                                                    &id2,
+                                                    &serde_json::json!({
+                                                        "event": "finished",
+                                                        "outcome": "stale_heal_failed",
+                                                        "detail": act,
+                                                        "at": chrono::Local::now().to_rfc3339(),
+                                                    }),
+                                                );
                                                 Some("failed")
                                             } else if act.contains("已收工") {
                                                 Some("done") // 稿好戳在:纯粹补广播

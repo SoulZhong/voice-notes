@@ -450,7 +450,7 @@ static REFINE_RUN_LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// aing_runs.jsonl 追加一条运行事件。失败出声并返回 Err,成败由调用方决定要不要
 /// 因此放弃后续动作(收工戳与成败日志的先后契约见 stamp_refine_finished)。
-fn append_refine_run_log(
+pub(crate) fn append_refine_run_log(
     dir: &std::path::Path,
     note_id: &str,
     rec: &serde_json::Value,
