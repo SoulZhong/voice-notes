@@ -702,6 +702,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     }
                 };
                 if let Some(identify_exec) = identify_exec {
+                    // 心跳表专用(codex 七轮):identify/title 在末次 report("llm",..)
+                    // 之后运行,不打点的话 refine_status 只见 llm/done 越来越陈旧,
+                    // 健康长跑与真停摆无从区分。只碰 beat,不进 lifecycle 事件流。
+                    refine_beat_touch(&note_id, beat_gen, "identify", "running");
                     let identify_result = (|| -> anyhow::Result<()> {
                         let vp = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?.load();
                         let acoustic_enabled = vp.embedding_model == s.speaker_model;
@@ -783,6 +787,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 失败;llm 失败时段落是原文,起标题足够)。手动命名永远最高优先级,
                 // 失败静默保默认名。
                 if refine_exec.is_some() && store::writer::is_default_title(&note.meta.title) {
+                    refine_beat_touch(&note_id, beat_gen, "title", "running"); // 心跳表打点,同 identify
                     // 标题跟随 Aing 执行体:Agent 模式一发一收(无 MCP、无工具),
                     // HTTP 模式走原 chat completions。两边同一长度守卫、同样失败即放弃。
                     let title = match refine_exec.as_ref().unwrap() {

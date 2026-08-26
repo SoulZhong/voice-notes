@@ -482,7 +482,17 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     let dir = root.join(&id2);
                                     // 查-判-写整体在一把 NoteLock 内(codex P1a/P1b):
                                     // 已有中间稿改标 failed;诈尸写完的稿原样保留。
-                                    match crate::store::heal_stale_refined(&dir, &stalled_at) {
+                                    let still_stale = || {
+                                        !app2
+                                            .try_state::<crate::lifecycle::LifecycleHandle>()
+                                            .map(|lc| lc.is_refining(&id2))
+                                            .unwrap_or(false)
+                                    };
+                                    match crate::store::heal_stale_refined(
+                                        &dir,
+                                        &stalled_at,
+                                        still_stale,
+                                    ) {
                                         Ok(act) => {
                                             eprintln!("lifecycle: 停摆自愈({id2}):{act}");
                                             if act.contains("failed") {
