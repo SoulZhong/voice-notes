@@ -688,6 +688,26 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             // 覆盖调度抖动(codex P2)——这里再包一层有界重试(~3s),
                             // 「笔记正被占用」以外的错误立刻放弃不重试。
                             let mut outcome = Err(String::new());
+                            // 伴生刷跳线程(codex 二十七轮):进度回调只在 decode/
+                            // transcribe/attribute/commit 四个阶段边界响,云端转写
+                            // 单阶段就能超一小时——不持续打点会被定时体检误杀
+                            // (写失败态+放行编辑,而 worker 还在跑)。每分钟代跳
+                            // 一次,二遍结束落旗自停。
+                            let sp_alive =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                            let _sp_refresher = {
+                                let alive = sp_alive.clone();
+                                let nid = note_id.clone();
+                                std::thread::spawn(move || {
+                                    while alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                        std::thread::sleep(std::time::Duration::from_secs(60));
+                                        if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        refine_beat_touch(&nid, beat_gen, "second_pass", "running");
+                                    }
+                                })
+                            };
                             for attempt in 0..10 {
                                 // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
                                 outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {
@@ -706,6 +726,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 }
                                 break;
                             }
+                            // 二遍收尾落旗,刷跳线程最多再睡一觉便自停
+                            sp_alive.store(false, std::sync::atomic::Ordering::Relaxed);
                             match outcome {
                                 Ok(sum) => {
                                     eprintln!("云端二遍完成({note_id}): {sum:?}");
