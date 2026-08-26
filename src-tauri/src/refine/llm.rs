@@ -14,13 +14,18 @@ pub const REQ_TIMEOUT_S: u64 = 60;
 /// refine_chunk 实测中位 40s、p95 58s、最大 59.8s——老的 60s 上限正压在分布尾巴上,
 /// 159 次(30%)死在墙上,而失败块是**静默保原文**的,用户只看到"部分段落未精修"。
 pub const CHUNK_TIMEOUT_S: u64 = 180;
-/// 瞬时失败重试前的等待。DNS/连接类抖动几秒就恢复,不必退避太久
-/// (超时那种本身已经等了 CHUNK_TIMEOUT_S,再退避更没必要)。测试里置 0,
-/// 否则每个重试用例都要白等 3 秒。
+/// 瞬时失败重试前的等待(post_long_with_retry 的单次重试用)。测试里置 0。
 #[cfg(not(test))]
 const RETRY_DELAY_S: u64 = 3;
 #[cfg(test)]
 const RETRY_DELAY_S: u64 = 0;
+/// 分块请求的退避表:第 n 次重试前睡 RETRY_BACKOFF_S[n](共 len 次重试,3 次尝试)。
+/// 3s 等瞬时抖动,30s 等 DNS 爆发窗过去(ai_logs 实测爆发簇持续数分钟,30s 是
+/// "值得等"与"别把整场 Aing 拖死"的折中)。测试置 0 免白等。
+#[cfg(not(test))]
+const RETRY_BACKOFF_S: [u64; 2] = [3, 30];
+#[cfg(test)]
+const RETRY_BACKOFF_S: [u64; 2] = [0, 0];
 
 /// 这次失败值不值得重试。`None` = 传输层错误(超时/DNS/连接中断),必重试;
 /// 429/5xx 是服务端瞬时状态;其余 4xx(密钥错、模型名错、请求体不合法)重试
@@ -83,6 +88,8 @@ fn retryable(e: &ChunkErr) -> bool {
             .downcast_ref::<ureq::Error>()
             .map_or(true, |u| worth_retry(err_status(u))),
         ChunkErr::Content(_) => false,
+        // 截断重试同一块必然原地再断,由 run_llm 拆块处理,不走重试。
+        ChunkErr::Truncated(_) => false,
     }
 }
 /// 「测试连接」探测的超时:比生产 REQ_TIMEOUT_S 短,测试不该久等。
@@ -398,6 +405,11 @@ pub fn probe(cfg: &LlmConfig) -> Result<String, String> {
 enum ChunkErr {
     Network(anyhow::Error),
     Content(anyhow::Error),
+    /// 模型输出撞 token 上限被掐(外层 finish_reason=="length"):内层 JSON 必然
+    /// 断尾,重试同一块只会在同一处再断——正确动作是**对半拆块**(run_llm 队列重排)。
+    /// 2026-08-27 审计:36 次"响应截断"误标为传输问题,成功响应 completion_tokens
+    /// 顶到 4085≈4096,EOF 失败偏向大块——此类占当前失败的大头(issue #175)。
+    Truncated(anyhow::Error),
 }
 
 /// 一段进块的最小信息:绝对下标 + 已 sanitize 的说话人标签 + 正文引用。
@@ -436,6 +448,7 @@ impl std::fmt::Display for ChunkErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChunkErr::Network(e) | ChunkErr::Content(e) => write!(f, "{e}"),
+            ChunkErr::Truncated(e) => write!(f, "输出被截断(finish_reason=length): {e}"),
         }
     }
 }
@@ -460,19 +473,27 @@ fn call_chunk(
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
     let payload = body_json.to_string();
-    // 瞬时失败重试一次:本机 ai_logs 实测 527 次调用里 159 次超时 + 106 次 DNS 抖动,
-    // 都是重试就可能过的,而失败块只会静默保原文。内容类错误(JSON 坏、texts 长度
-    // 不符)与 4xx 不重试——原样再来一次只是再错一次。
+    // 传输类失败指数退避重试(issue #175):DNS 爆发窗/节点拥塞下"3 秒后立即再试"
+    // 大概率撞同一堵墙——ai_logs 实测 DNS 失败成爆发簇(数分钟窗口内全灭)。退避
+    // 表两级(短等抖动、长等窗口过去);内容类/4xx 不重试(原样再来只是再错一次),
+    // 截断类由 run_llm 拆块。总最坏 CHUNK_TIMEOUT_S×3+33s≈9.5min/块,仍远低于
+    // REFINE_STALE_MS(1h,且逐块 progress 会重置滞留时钟)。
     let mut attempt = 0usize;
     let result = loop {
         let started = std::time::Instant::now();
-        let r = do_call_chunk(cfg, &url, &payload, paragraphs.len());
+        let mut raw: Option<String> = None;
+        let r = do_call_chunk(cfg, &url, &payload, paragraphs.len(), &mut raw);
         // 每次尝试各记一条 AI 日志:重试有没有发生、各花了多久,事后要能从日志直接看出来。
-        // 请求体全量(key 在请求头,天然不落);响应记服务端原文或错误。
+        // 请求体全量(key 在请求头,天然不落);响应记**原始正文**——解析失败也要留,
+        // 否则 finish_reason 证据随 null 一起蒸发(2026-08-27 审计教训)。
         if let Some(ctx) = log {
             let (response, status, error) = match &r {
-                Ok((raw, _, _, _, _, _)) => (Value::String(raw.clone()), "ok", None),
-                Err(e) => (Value::Null, "error", Some(e.to_string())),
+                Ok((raw_ok, _, _, _, _, _)) => (Value::String(raw_ok.clone()), "ok", None),
+                Err(e) => (
+                    raw.take().map(Value::String).unwrap_or(Value::Null),
+                    "error",
+                    Some(e.to_string()),
+                ),
             };
             crate::ailog::record(
                 ctx,
@@ -489,11 +510,11 @@ fn call_chunk(
                 },
             );
         }
-        if attempt >= 1 || !r.as_ref().err().is_some_and(retryable) {
+        if attempt >= RETRY_BACKOFF_S.len() || !r.as_ref().err().is_some_and(retryable) {
             break r;
         }
+        std::thread::sleep(std::time::Duration::from_secs(RETRY_BACKOFF_S[attempt]));
         attempt += 1;
-        std::thread::sleep(std::time::Duration::from_secs(RETRY_DELAY_S));
     };
     result.map(|(_, glossary, texts, ents, relations, relations_valid)| {
         (glossary, texts, ents, relations, relations_valid)
@@ -539,6 +560,10 @@ fn do_call_chunk(
     url: &str,
     body: &str,
     expect_len: usize,
+    // 一读到响应体就填入:解析失败时调用方仍能把**原始响应**落 AI 日志——
+    // 此前错误路径记 null,把 finish_reason 证据全销毁了,"传输截断"与"token
+    // 截断"从日志上无法区分(2026-08-27 审计,issue #175)。
+    raw_out: &mut Option<String>,
 ) -> Result<
     (
         String,
@@ -561,18 +586,29 @@ fn do_call_chunk(
         .map_err(|e| ChunkErr::Network(anyhow::Error::new(e)))?
         .into_string()
         .map_err(|e| ChunkErr::Network(e.into()))?;
+    *raw_out = Some(resp_text.clone());
     let resp: Value = serde_json::from_str(&resp_text).map_err(|e| ChunkErr::Content(e.into()))?;
+    // finish_reason=="length" ⇒ 输出在 token 上限处被掐,内层 content 必是断尾 JSON。
+    // 后续任何内容类失败都归 Truncated,交 run_llm 拆块,而不是当"坏 JSON"保原文。
+    let truncated = resp["choices"][0]["finish_reason"].as_str() == Some("length");
+    let content_err = |e: anyhow::Error| -> ChunkErr {
+        if truncated {
+            ChunkErr::Truncated(e)
+        } else {
+            ChunkErr::Content(e)
+        }
+    };
     let content = resp["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or_else(|| ChunkErr::Content(anyhow::anyhow!("响应缺 choices[0].message.content")))?;
-    let parsed: Value = serde_json::from_str(content).map_err(|e| ChunkErr::Content(e.into()))?;
+        .ok_or_else(|| content_err(anyhow::anyhow!("响应缺 choices[0].message.content")))?;
+    let parsed: Value = serde_json::from_str(content).map_err(|e| content_err(e.into()))?;
     let texts_value = parsed
         .get("texts")
-        .ok_or_else(|| ChunkErr::Content(anyhow::anyhow!("响应缺 texts 数组")))?;
+        .ok_or_else(|| content_err(anyhow::anyhow!("响应缺 texts 数组")))?;
     let texts_out: Vec<String> = serde_json::from_value(texts_value.clone())
-        .map_err(|error| ChunkErr::Content(anyhow::anyhow!("texts 必须是纯字符串数组: {error}")))?;
+        .map_err(|error| content_err(anyhow::anyhow!("texts 必须是纯字符串数组: {error}")))?;
     if texts_out.len() != expect_len {
-        return Err(ChunkErr::Content(anyhow::anyhow!(
+        return Err(content_err(anyhow::anyhow!(
             "texts 长度不符: 期望 {} 实得 {}",
             expect_len,
             texts_out.len()
@@ -697,7 +733,13 @@ pub fn polish(
     if chunks.is_empty() {
         return (LlmOutcome::Done, Vec::new(), Vec::new());
     }
-    let total = chunks.len();
+    // 队列而非定长循环:输出截断(Truncated)的块**对半拆开压回队首**,各半独立成败。
+    // 拆块是截断的唯一正解——重试同一块只会在同一 token 上限处再断;len==1 拆无可拆,
+    // 走普通失败保原文。total 随拆分增长,进度/ETA 自然跟上。
+    let mut queue: std::collections::VecDeque<Vec<usize>> = chunks.into_iter().collect();
+    // 进度按**段**计,不按块(codex P2):拆块会增块数,按块计会让"3/8"倒退成"3/9",
+    // 用户看到进度回吐、ETA 突涨。段总数在拆块下恒定,比例单调。
+    let total = queue.iter().map(|c| c.len()).sum::<usize>();
     let mut done = 0usize;
     let mut spent_ms = 0u64;
     let mut glossary = json!({});
@@ -706,7 +748,7 @@ pub fn polish(
     let mut all_entities: Vec<RawEntity> = Vec::new();
     let mut all_relations: Vec<RawRelation> = Vec::new();
     let mut relation_failed = false;
-    for chunk in &chunks {
+    while let Some(chunk) = queue.pop_front() {
         progress(done, total, if done > 0 { spent_ms / done as u64 } else { 0 });
         let t0 = std::time::Instant::now();
         let inputs: Vec<ChunkPara> = chunk
@@ -739,6 +781,21 @@ pub fn polish(
                     relation_failed = true;
                 }
             }
+            Err(ChunkErr::Truncated(e)) if chunk.len() > 1 => {
+                // 拆块不计 done(这块还没完),两半各成一块;耗时照记(真实花了)。
+                let mid = chunk.len() / 2;
+                let (a, b) = (chunk[..mid].to_vec(), chunk[mid..].to_vec());
+                eprintln!(
+                    "refine llm: 输出撞 token 上限,{} 段拆为 {}+{} 重试: {e}",
+                    chunk.len(),
+                    a.len(),
+                    b.len()
+                );
+                queue.push_front(b);
+                queue.push_front(a);
+                spent_ms += t0.elapsed().as_millis() as u64;
+                continue; // 段一个没完成:done 不动,total 不变,进度稳在原地
+            }
             Err(e) => {
                 if matches!(e, ChunkErr::Network(_)) {
                     network_failed += 1;
@@ -749,7 +806,7 @@ pub fn polish(
             }
         }
         spent_ms += t0.elapsed().as_millis() as u64;
-        done += 1;
+        done += chunk.len();
     }
     progress(done, total, if done > 0 { spent_ms / done as u64 } else { 0 });
     let failed = {
@@ -895,6 +952,107 @@ mod tests {
         })
         .to_string();
         serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
+    }
+
+    /// 截断→拆块(issue #175):finish_reason=="length" 的块对半拆开重试,两半各自
+    /// 成功后全部段落都拿到修订;拆无可拆(单段)才保原文。mock 序列:首块(2 段)回
+    /// 截断响应,随后两个单段请求各回成功。
+    #[test]
+    fn truncated_chunk_splits_in_half_and_converges() {
+        // 断尾 content + finish_reason=length:外层 JSON 完好,内层被掐。
+        let truncated = serde_json::json!({
+            "choices": [{ "finish_reason": "length",
+                          "message": { "content": "{\"glossary\":{},\"texts\":[\"只写了一半" } }]
+        })
+        .to_string();
+        let base = mock_server(vec![
+            truncated,
+            chat_body(&["修一。"], "{}"),
+            chat_body(&["修二。"], "{}"),
+        ]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("原一。"), para("原二。")];
+        // 强制两段同块:正文远短于 CHUNK_CHARS,chunk_indices 天然会并成一块。
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert!(matches!(outcome, LlmOutcome::Done), "拆块后两半都成功,整体应 Done: {outcome:?}");
+        assert_eq!(ps[0].text, "修一。");
+        assert_eq!(ps[1].text, "修二。");
+    }
+
+    /// 有成功块之后再发生拆块:对外进度按**段**计,total 恒定、比例不回退
+    /// (codex P2:按块计会让 3/8 倒退成 3/9,ETA 突涨)。
+    #[test]
+    fn split_after_success_keeps_total_constant_and_progress_monotonic() {
+        // 3 段拆两块(靠正文撑过 CHUNK_CHARS):块1(2段)成功,块2... 反过来更简单:
+        // 用短文本让 3 段并成一块不行——直接构造:块序列 = [成功(1段), 截断(2段)→拆两半各成功]。
+        // chunk_indices 按字数分块,用长文本强拆:段1 长文本自成一块,段2/3 合一块。
+        let long = "长".repeat(CHUNK_CHARS + 10);
+        let truncated = serde_json::json!({
+            "choices": [{ "finish_reason": "length",
+                          "message": { "content": "{\"texts\":[\"半" } }]
+        })
+        .to_string();
+        let base = mock_server(vec![
+            chat_body(&["修长。"], "{}"),
+            truncated,
+            chat_body(&["修二。"], "{}"),
+            chat_body(&["修三。"], "{}"),
+        ]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para(&long), para("原二。"), para("原三。")];
+        let calls = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
+        let (outcome, _e, _r) =
+            polish(&cfg, &mut ps, &Default::default(), None, &|d, t, _| {
+                calls.lock().unwrap().push((d, t));
+            });
+        assert!(matches!(outcome, LlmOutcome::Done), "{outcome:?}");
+        let calls = calls.into_inner().unwrap();
+        assert!(calls.iter().all(|&(_, t)| t == 3), "total 恒为段数 3,拆块不得改变: {calls:?}");
+        assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0), "done 单调: {calls:?}");
+        assert_eq!(calls.last().unwrap().0, 3, "终态 done==total");
+        assert_eq!(ps[1].text, "修二。");
+        assert_eq!(ps[2].text, "修三。");
+    }
+
+    /// 单段块截断:拆无可拆,保原文走 Partial——不许无限拆、不许把截断误报成网络失败。
+    #[test]
+    fn truncated_single_paragraph_keeps_original_as_partial() {
+        let truncated = serde_json::json!({
+            "choices": [{ "finish_reason": "length",
+                          "message": { "content": "{\"texts\":[\"半" } }]
+        })
+        .to_string();
+        let base = mock_server(vec![truncated]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("原文。")];
+        let (outcome, _e, _r) = polish(&cfg, &mut ps, &Default::default(), None, &|_, _, _| {});
+        assert!(
+            matches!(outcome, LlmOutcome::Partial(_)),
+            "单段截断=内容失败保原文,非网络失败: {outcome:?}"
+        );
+        assert_eq!(ps[0].text, "原文。", "原文必须原样保留");
+    }
+
+    /// 证据保全(issue #175):内层 JSON 解析失败时,AI 日志的 response 必须是**原始
+    /// 响应体**而非 null——finish_reason 是区分"传输截断/token 截断"的唯一证据。
+    #[test]
+    fn parse_failure_logs_raw_response_not_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ailog::Ctx { data_root: tmp.path().to_path_buf(), note_id: "n1".into() };
+        let bad = serde_json::json!({
+            "choices": [{ "finish_reason": "stop", "message": { "content": "这不是JSON" } }]
+        })
+        .to_string();
+        let base = mock_server(vec![bad]);
+        let cfg = LlmConfig { base_url: base, model: "m".into(), api_key: "k".into() };
+        let mut ps = vec![para("原文。")];
+        let _ = polish(&cfg, &mut ps, &Default::default(), Some(&ctx), &|_, _, _| {});
+        let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
+        let entries = v["entries"].as_array().unwrap();
+        let err = entries.iter().find(|e| e["status"] == "error").expect("应有错误日志");
+        let resp = err["response"].as_str().expect("解析失败也要留原始响应,不许 null");
+        assert!(resp.contains("这不是JSON"), "原始响应体要完整在日志里: {resp}");
+        assert!(resp.contains("finish_reason"), "finish_reason 证据要在");
     }
 
     #[test]
@@ -1149,13 +1307,14 @@ mod tests {
         let (outcome2, _ents2, _relations2) = polish(&cfg_bad, &mut ps2, &Default::default(), Some(&ctx), &|_, _, _| {});
         assert!(matches!(outcome2, LlmOutcome::Failed));
         let v = crate::ailog::query(tmp.path(), &crate::ailog::Filter::default());
-        // 3 而不是 2:连不上属于传输层瞬时失败,会重试一次,而**每次尝试各留一条日志**
-        // ——重试有没有发生、各花了多久,事后要能从 ai_logs 直接看出来。
-        assert_eq!(v["total"], 3);
+        // 4 = 成功块 1 条 + 失败块 3 条:传输层失败按退避表重试(RETRY_BACKOFF_S 两级,
+        // 共 3 次尝试),**每次尝试各留一条日志**——重试有没有发生、各花了多久,
+        // 事后要能从 ai_logs 直接看出来。
+        assert_eq!(v["total"], 4);
         assert_eq!(
             v["entries"].as_array().unwrap().iter().filter(|e| e["status"] == "error").count(),
-            2,
-            "两次尝试都失败,两条错误日志"
+            3,
+            "三次尝试都失败,三条错误日志"
         );
         let all = serde_json::to_string(&v);
         assert!(!all.unwrap().contains("SECRET-KEY"), "api key 绝不落日志");

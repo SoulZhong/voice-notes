@@ -443,7 +443,21 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 全局串行闸:在起 ORT 线程池的重活之前排队,同一时刻只放一篇过。守卫在 catch_unwind
         // 之前取、随线程体自然释放——被捕获的 panic 不经此守卫展开,不会毒化(仍加 poison 兜底)。
         // 多篇同时点会各自先发一条 "all/running"(显示「Aing 中…」),但实际串行等锁逐篇跑。
-        let _aing_gate = AING_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 排队要发心跳(codex P1,预存缺陷被 #175 退避拓宽后收口):滞留自愈按
+        // RefineProgress 刷时钟,而排队者在 lock() 里睡死、一小时无声就被误杀出
+        // 运行集——之后真开工时集合不再插入,编辑守卫/重复 Aing 全部失效。改
+        // try_lock 轮询,每分钟补一条 all/running 心跳。代价是失去 Mutex 的排队
+        // 公平性(多篇并发排队时唤醒顺序随机),Aing 并发本就罕见,可接受。
+        let _aing_gate = loop {
+            match AING_GATE.try_lock() {
+                Ok(g) => break g,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    report("all", "running");
+                }
+            }
+        };
         let result: std::thread::Result<anyhow::Result<()>> =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // (第一条 "all/running" 已在 spawn 前由入口同步发出,见上)
