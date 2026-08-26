@@ -261,6 +261,7 @@ mod tests {
             generated_at: "2026-07-21T09:00:00+08:00".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: Some("model-v1".into()),
             stages: RefineStages {
                 filter: "done".into(),

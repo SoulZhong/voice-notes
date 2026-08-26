@@ -1909,6 +1909,7 @@ mod tests {
             generated_at: "2026-07-21T00:00:00Z".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),

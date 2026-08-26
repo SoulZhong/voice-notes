@@ -348,6 +348,7 @@ impl UdsBackend for AppBackend<'_> {
                         "llm": d.stages.llm, "entities": d.stages.entities,
                         "relations": d.stages.relations,
                     },
+                    "finished_at": d.finished_at,
                     "written_at": d.written_at, "writer_pid": d.writer_pid,
                     "generated_at": d.generated_at,
                     "llm_failed_paragraphs": d.llm_failed_paragraphs.len(),

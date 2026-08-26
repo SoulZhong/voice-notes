@@ -834,10 +834,25 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 anyhow::Ok(())
             }));
+        // 收工戳(issue #173 十轮):llm 终态只证明 llm 阶段写过盘,identify/标题
+        // 尾段吊死时稿面与真收工无从区分。有序走到终态上报(done/failed/panic 被
+        // catch 三臂都算"worker 有序退场")才盖此戳;写失败不拦终态上报。
+        let stamp_finished = || {
+            if let Ok(root) = notes_dir(&app) {
+                let _ = store::update_refined_for_retry(&root.join(&note_id), |d| {
+                    d.finished_at = chrono::Local::now().to_rfc3339();
+                    Ok(())
+                });
+            }
+        };
         match &result {
-            Ok(Ok(())) => report("all", "done"),
+            Ok(Ok(())) => {
+                stamp_finished();
+                report("all", "done");
+            }
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
+                stamp_finished();
                 report("all", "failed");
             }
             Err(_) => {
@@ -845,6 +860,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // panic 已被 catch_unwind 吞掉,进程级 hook 仍会捕获它;
                 // 这里补一条带链路 kind 的显式上报,便于按 fingerprint 分组与限流。
                 telemetry::report_error(telemetry::ErrorKind::AiPipeline, "Aing 管线 panic");
+                stamp_finished();
                 report("all", "failed");
             }
         }
@@ -3094,10 +3110,20 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             })?;
             Ok(())
         };
+        let stamp_finished = || {
+            let _ = store::update_refined_for_retry(&dir, |d| {
+                d.finished_at = chrono::Local::now().to_rfc3339();
+                Ok(())
+            });
+        };
         match run() {
-            Ok(()) => report("all", "done"),
+            Ok(()) => {
+                stamp_finished();
+                report("all", "done");
+            }
             Err(e) => {
                 eprintln!("部分重试失败({note_id}): {e}");
+                stamp_finished();
                 report("all", "failed");
             }
         }

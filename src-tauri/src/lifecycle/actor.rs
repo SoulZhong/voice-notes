@@ -496,17 +496,21 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             // failed;稿子本就终态(llm 收过尾、worker
                                             // 死在 identify/标题)报 done——稿子可用,
                                             // 但把心跳留证打进日志,不静默当成功。
-                                            let state_s = if act.contains("failed") {
-                                                Some("failed")
-                                            } else if act.contains("收尾") {
+                                            let state_s = if act.contains("failed")
+                                                || act.contains("尾段停摆")
+                                            {
+                                                // 写了失败态,或 worker 从未有序退场
+                                                // (收工戳缺失):都算停摆失败,附心跳留证
                                                 if let Some((stage, age_ms)) =
                                                     crate::refine_beat_of(&id2)
                                                 {
                                                     eprintln!(
-                                                        "lifecycle: 停摆自愈({id2})后 LLM 阶段疑似吊死:心跳停在 {stage} 已 {age_ms}ms"
+                                                        "lifecycle: 停摆自愈({id2})心跳停在 {stage} 已 {age_ms}ms"
                                                     );
                                                 }
-                                                Some("done")
+                                                Some("failed")
+                                            } else if act.contains("已收工") {
+                                                Some("done") // 稿好戳在:纯粹补广播
                                             } else {
                                                 None // 让路/坏稿:没动盘,也不该发终态
                                             };

@@ -298,6 +298,7 @@ pub fn run_local(
         generated_at: generated_at.to_string(),
         written_at: String::new(),   // 落盘时自动盖戳(write_refined_atomic_locked)
         writer_pid: 0,
+        finished_at: String::new(),
         llm_model: None,
         stages: RefineStages {
             filter: "done".into(),
@@ -833,6 +834,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1658,6 +1660,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1701,6 +1704,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),

@@ -89,6 +89,10 @@ pub struct RefinedDoc {
     /// 从此可查。0 不落盘。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub writer_pid: u32,
+    /// 整轮 worker 有序收工时刻(issue #173 十轮):llm 终态只说明 llm 阶段写过盘,
+    /// identify/标题等尾段可能还在跑;此戳由 worker 终态上报前落盘。空 = 未收工。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finished_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
     pub stages: RefineStages,
@@ -676,6 +680,7 @@ impl RefinedDoc {
             generated_at: String::new(), // 调用方盖当前时刻
             written_at: String::new(),   // 落盘咽喉自动盖
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "off".into(),
@@ -880,10 +885,14 @@ pub fn heal_stale_refined(
         None => Ok("盘上稿损坏,保留原样"),
         Some(Some(mut doc)) => {
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
-                // llm 已终态 ≠ 整个 worker 收工(codex 九轮):identify/标题阶段吊死
-                // 时稿子长这样。稿子本身可用,不动;但调用方必须补广播终态,并拿
-                // 心跳表(停在 identify/title 即后 LLM 停摆)留证——不能静默当成功。
-                return Ok("盘上稿已收尾,不动(后 LLM 阶段是否停摆看心跳)");
+                // llm 已终态 ≠ 整个 worker 收工(codex 九/十轮):看收工戳定性。
+                // 稿子本身可用,两种情形都不动稿;定性字串供调用方选终态事件。
+                return Ok(if doc.finished_at.is_empty() {
+                    // identify/标题尾段吊死:worker 没有序退场过
+                    "盘上稿 llm 已终态但收工戳缺失(尾段停摆),不动"
+                } else {
+                    "盘上稿已收工(收工戳在),不动"
+                });
             }
             // 接管识别只看生死簿不看写盘戳(codex 八轮定稿):真替补从起跑到收工
             // 全程占着 lifecycle 槽,still_stale 必能探到;替补已收工则稿子是终态,
@@ -1295,8 +1304,14 @@ mod tests {
         write_refined_atomic(&dir, &done).unwrap();
         let before = std::fs::read(dir.join(AING_DOC_FILE)).unwrap();
         let act = heal_stale_refined(&dir, || true).unwrap();
-        assert!(act.contains("不动"), "{act}");
+        assert!(act.contains("尾段停摆"), "llm 终态但无收工戳 ⇒ 尾段停摆: {act}");
         assert_eq!(std::fs::read(dir.join(AING_DOC_FILE)).unwrap(), before);
+        // ③b 收工戳在:定性为已收工(调用方广播 done)
+        let mut done2 = load_refined(&dir).unwrap();
+        done2.finished_at = "2026-01-01T00:00:00+08:00".into();
+        write_refined_atomic(&dir, &done2).unwrap();
+        let act = heal_stale_refined(&dir, || true).unwrap();
+        assert!(act.contains("已收工"), "{act}");
         // ④ 只有旧世界 refined.json 的笔记:迁移旧稿改标 failed,正文保留
         let legacy_dir = dir.parent().unwrap().join("20260101-000001");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -1324,6 +1339,7 @@ mod tests {
             generated_at: "2026-07-21T00:00:00+08:00".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1402,6 +1418,7 @@ mod tests {
             generated_at: "2026-07-06T15:00:00+08:00".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: Some("deepseek-chat".into()),
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![1, 2],
@@ -1481,6 +1498,7 @@ mod tests {
             generated_at: "2026-07-16T10:00:00+08:00".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1698,6 +1716,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1817,6 +1836,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2096,6 +2116,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "partial".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2133,6 +2154,7 @@ mod tests {
             generated_at: "t".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2159,6 +2181,7 @@ mod tests {
             generated_at: "2026-08-20T00:00:00+08:00".into(),
             written_at: String::new(),
             writer_pid: 0,
+            finished_at: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
