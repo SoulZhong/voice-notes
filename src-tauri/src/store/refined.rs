@@ -866,7 +866,7 @@ fn update_refined(
 /// 停摆自愈(issue #173,codex P1a/P1b):一把 NoteLock 内完成「查-判-写」,
 /// 消灭"检查后 worker 诈尸写完稿、自愈再拿空失败稿盖掉"的窗口。
 /// 返回动作描述供日志;拿不到锁(别的进程正在写=有人活着)让路即成功。
-pub fn heal_stale_refined(note_dir: &Path) -> anyhow::Result<&'static str> {
+pub fn heal_stale_refined(note_dir: &Path, stalled_at: &str) -> anyhow::Result<&'static str> {
     let Some(lock) = NoteLock::acquire(note_dir)? else {
         return Ok("另一进程持锁,让路");
     };
@@ -877,6 +877,17 @@ pub fn heal_stale_refined(note_dir: &Path) -> anyhow::Result<&'static str> {
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
                 // worker 其实收工了(或早已标败):稿子可用/可重跑,不动
                 return Ok("盘上稿已收尾,不动");
+            }
+            // 代次校验(codex 三轮 P1):自愈线程被 sample 拖了两秒,期间新一轮
+            // Aing 可能已接手并写了自己的 llm=off 中间稿——写盘戳比停摆判定
+            // 时刻新,说明稿主是活人不是死者,不能给新一轮扣失败帽。
+            if let (Ok(w), Ok(s)) = (
+                chrono::DateTime::parse_from_rfc3339(&doc.written_at),
+                chrono::DateTime::parse_from_rfc3339(stalled_at),
+            ) {
+                if w > s {
+                    return Ok("盘上稿比停摆判定新(新一轮已接手),让路");
+                }
             }
             // run_local 之后 llm 阶段停摆:中间稿改标 failed,UI 出「失败可重跑」
             doc.stages.llm = "failed".into();
@@ -1211,7 +1222,7 @@ mod tests {
             r#"{"seq":0,"source":"mic","text":"原文甲","start_ms":0,"end_ms":1000,"speaker":"S1"}"#,
         )
         .unwrap();
-        let act = heal_stale_refined(&dir).unwrap();
+        let act = heal_stale_refined(&dir, &chrono::Local::now().to_rfc3339()).unwrap();
         assert!(act.contains("原始段"), "{act}");
         let doc = load_refined(&dir).unwrap();
         assert_eq!(doc.stages.llm, "failed");
@@ -1233,7 +1244,11 @@ mod tests {
         });
         write_refined_atomic(&dir, &mid).unwrap();
         let rev0 = load_refined(&dir).unwrap().revision;
-        let act = heal_stale_refined(&dir).unwrap();
+        // ②a 代次守卫:盘上稿写于"停摆判定时刻"之后 ⇒ 是新一轮的稿,让路
+        let act = heal_stale_refined(&dir, "2000-01-01T00:00:00+08:00").unwrap();
+        assert!(act.contains("让路"), "{act}");
+        assert_eq!(load_refined(&dir).unwrap().stages.llm, "off", "新一轮的稿不被扣帽");
+        let act = heal_stale_refined(&dir, &chrono::Local::now().to_rfc3339()).unwrap();
         assert!(act.contains("改标"), "{act}");
         let doc = load_refined(&dir).unwrap();
         assert_eq!(doc.stages.llm, "failed");
@@ -1244,7 +1259,7 @@ mod tests {
         done.stages.llm = "done".into();
         write_refined_atomic(&dir, &done).unwrap();
         let before = std::fs::read(dir.join(AING_DOC_FILE)).unwrap();
-        let act = heal_stale_refined(&dir).unwrap();
+        let act = heal_stale_refined(&dir, &chrono::Local::now().to_rfc3339()).unwrap();
         assert!(act.contains("不动"), "{act}");
         assert_eq!(std::fs::read(dir.join(AING_DOC_FILE)).unwrap(), before);
         // ④ 只有旧世界 refined.json 的笔记:迁移旧稿改标 failed,正文保留
@@ -1258,7 +1273,7 @@ mod tests {
             serde_json::to_vec(&legacy).unwrap(),
         )
         .unwrap();
-        let act = heal_stale_refined(&legacy_dir).unwrap();
+        let act = heal_stale_refined(&legacy_dir, &chrono::Local::now().to_rfc3339()).unwrap();
         assert!(act.contains("迁移"), "{act}");
         let doc = load_refined(&legacy_dir).unwrap();
         assert_eq!(doc.stages.llm, "failed");

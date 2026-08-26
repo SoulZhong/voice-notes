@@ -331,7 +331,16 @@ impl UdsBackend for AppBackend<'_> {
         let doc = crate::notes_dir(app)
             .ok()
             .map(|root| root.join(note_id))
-            .and_then(|dir| crate::store::load_refined(&dir))
+            .and_then(|dir| {
+                let d = crate::store::load_refined(&dir)?;
+                if d.written_at.is_empty() {
+                    // 旧稿刚被 load_refined 迁移成 aing.json 时,返回的还是未盖戳
+                    // 的内存对象(戳只落在盘上)——重读一次拿真值(codex 三轮 P2)。
+                    crate::store::load_refined(&dir).or(Some(d))
+                } else {
+                    Some(d)
+                }
+            })
             .map(|d| {
                 serde_json::json!({
                     "stages": {

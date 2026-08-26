@@ -448,6 +448,8 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         {
                             let app2 = app.clone();
                             let id2 = id.clone();
+                            // 停摆判定时刻先于线程起跑固定下来:自愈只处置比这更旧的盘上稿
+                            let stalled_at = chrono::Local::now().to_rfc3339();
                             std::thread::spawn(move || {
                                 #[cfg(target_os = "macos")]
                                 {
@@ -465,11 +467,22 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                         Err(e) => eprintln!("lifecycle: 停摆尸检采样失败({id2}): {e}"),
                                     }
                                 }
+                                // 代次快查(codex 三轮 P1):sample 拖的两秒里新一轮可能
+                                // 已接手(本信箱后续消息重新插回 Aing 集),先问一句再动手;
+                                // 查后写前的窗口由 heal 内部的写盘戳比对兜底。
+                                if app2
+                                    .try_state::<crate::lifecycle::LifecycleHandle>()
+                                    .map(|lc| lc.is_refining(&id2))
+                                    .unwrap_or(false)
+                                {
+                                    eprintln!("lifecycle: 停摆自愈({id2})发现新一轮已接手,让路");
+                                    return;
+                                }
                                 if let Ok(root) = crate::notes_dir(&app2) {
                                     let dir = root.join(&id2);
                                     // 查-判-写整体在一把 NoteLock 内(codex P1a/P1b):
                                     // 已有中间稿改标 failed;诈尸写完的稿原样保留。
-                                    match crate::store::heal_stale_refined(&dir) {
+                                    match crate::store::heal_stale_refined(&dir, &stalled_at) {
                                         Ok(act) => {
                                             eprintln!("lifecycle: 停摆自愈({id2}):{act}");
                                             if act.contains("failed") {

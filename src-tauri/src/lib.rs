@@ -2974,6 +2974,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     let note_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let report = |stage: &str, state: &str| {
+            refine_beat_touch(&note_id, stage, state); // 心跳表(#173):部分重试同样可探
             lc.report(lifecycle::machine::Msg::RefineProgress {
                 note_id: note_id.clone(),
                 stage: stage.into(),
@@ -3072,6 +3073,7 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
                 report("all", "failed");
             }
         }
+        refine_beat_clear(&note_id); // 部分重试无 RAII 哨兵,收尾手动清心跳
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id: note_id.clone() });
     });
     Ok(())
