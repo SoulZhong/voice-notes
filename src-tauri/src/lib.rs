@@ -367,6 +367,33 @@ fn handoff_http_refine_write(
 /// 需放宽到 N 并行,把此 Mutex 换成计数信号量即可。
 static AING_GATE: Mutex<()> = Mutex::new(());
 
+/// 重跑起跑仪式(codex 十二轮):上一轮的运行元数据(收工/写盘戳)先归档进
+/// aing_runs.jsonl 再撕掉 finished_at——停摆取证靠的就是这些,不能裸清。
+/// 归档发生在 update 闭包内,天然处于 NoteLock 保护下。无旧稿时 update 失败即无事。
+fn archive_and_clear_finish_stamp(dir: &std::path::Path) {
+    let _ = store::update_refined_for_retry(dir, |d| {
+        if !d.finished_at.is_empty() || !d.written_at.is_empty() {
+            let rec = serde_json::json!({
+                "finished_at": d.finished_at,
+                "written_at": d.written_at,
+                "writer_pid": d.writer_pid,
+                "generated_at": d.generated_at,
+                "archived_at": chrono::Local::now().to_rfc3339(),
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("aing_runs.jsonl"))
+            {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{rec}");
+            }
+        }
+        d.finished_at = String::new();
+        Ok(())
+    });
+}
+
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
     let state: tauri::State<AppState> = app.state();
     let transcode = state.transcode.clone();
@@ -530,13 +557,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 }
                 let root = notes_dir(&app)?;
                 let dir = root.join(&note_id);
-                // 新一轮起跑先撕掉旧收工戳(codex 十一轮):重跑一场已收工的笔记时,
-                // 若本轮中途停摆,自愈不能被上一轮留下的 finished_at 骗成「已收工」。
-                // 无旧稿(首跑)时 update 失败,静默即可。
-                let _ = store::update_refined_for_retry(&dir, |d| {
-                    d.finished_at = String::new();
-                    Ok(())
-                });
+                // 新一轮起跑:归档上一轮证据并撕收工戳(codex 十一/十二轮)——
+                // 停摆时自愈不能被旧 finished_at 骗成「已收工」,而旧戳本身是取证
+                // 材料,清之前先落 aing_runs.jsonl。
+                archive_and_clear_finish_stamp(&dir);
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
@@ -3033,13 +3057,8 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             });
         };
         report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
-        // 起跑撕旧收工戳,理由同 spawn_refine(codex 十一轮);重试必有旧稿,失败仅日志
-        if let Err(e) = store::update_refined_for_retry(&dir, |d| {
-            d.finished_at = String::new();
-            Ok(())
-        }) {
-            eprintln!("部分重试({note_id}):清收工戳失败(仅日志): {e}");
-        }
+        // 起跑归档上一轮证据并撕收工戳,理由同 spawn_refine(codex 十一/十二轮)
+        archive_and_clear_finish_stamp(&dir);
         let run = || -> anyhow::Result<()> {
             let doc = store::load_refined(&dir)
                 .ok_or_else(|| anyhow::anyhow!("修订稿加载失败"))?;

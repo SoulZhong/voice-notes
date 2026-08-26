@@ -884,6 +884,11 @@ pub fn heal_stale_refined(
         // 文件在但读不出:是证据,不能拿失败稿盖掉
         None => Ok("盘上稿损坏,保留原样"),
         Some(Some(mut doc)) => {
+            // 进门先复验接管(codex 十二轮):替补在首查之后才占槽时,盘上可能还是
+            // 上一轮的终态稿——此时定性/广播都属于替补的剧本,这里不能抢戏。
+            if !still_stale() {
+                return Ok("新一轮已接手(占槽),让路");
+            }
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
                 // llm 已终态 ≠ 整个 worker 收工(codex 九/十轮):看收工戳定性。
                 // 稿子本身可用,两种情形都不动稿;定性字串供调用方选终态事件。
