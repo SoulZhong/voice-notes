@@ -714,9 +714,22 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                                 let alive = sp_alive.clone();
                                 let nid = note_id.clone();
                                 std::thread::spawn(move || {
-                                    while alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // 保活设硬上限(codex 二十九轮):无进度信号的盲打点
+                                    // 若无限续命,二遍真吊死时体检永远看不见。4 小时
+                                    // 远超实测最长二遍(3.5h 会议约 70min),超限停跳,
+                                    // 停摆监工随后接管。
+                                    for i in 0.. {
+                                        if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
                                         std::thread::sleep(std::time::Duration::from_secs(60));
                                         if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        if i >= 240 {
+                                            eprintln!(
+                                                "refine({nid}): 二遍保活达 4h 上限,停止代跳(若真吊死,停摆监工将接管)"
+                                            );
                                             break;
                                         }
                                         refine_beat_touch(&nid, beat_gen, "second_pass", "running");
