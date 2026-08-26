@@ -880,8 +880,10 @@ pub fn heal_stale_refined(
         None => Ok("盘上稿损坏,保留原样"),
         Some(Some(mut doc)) => {
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
-                // worker 其实收工了(或早已标败):稿子可用/可重跑,不动
-                return Ok("盘上稿已收尾,不动");
+                // llm 已终态 ≠ 整个 worker 收工(codex 九轮):identify/标题阶段吊死
+                // 时稿子长这样。稿子本身可用,不动;但调用方必须补广播终态,并拿
+                // 心跳表(停在 identify/title 即后 LLM 停摆)留证——不能静默当成功。
+                return Ok("盘上稿已收尾,不动(后 LLM 阶段是否停摆看心跳)");
             }
             // 接管识别只看生死簿不看写盘戳(codex 八轮定稿):真替补从起跑到收工
             // 全程占着 lifecycle 槽,still_stale 必能探到;替补已收工则稿子是终态,

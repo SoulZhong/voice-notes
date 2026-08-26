@@ -489,16 +489,34 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     match crate::store::heal_stale_refined(&dir, still_stale) {
                                         Ok(act) => {
                                             eprintln!("lifecycle: 停摆自愈({id2}):{act}");
-                                            if act.contains("failed") {
-                                                // 真写了失败态才广播(codex P2b):笔记页
-                                                // 在 note_refining 回 false 后已停轮询,
-                                                // 补一发终态事件让打开着的页面刷新。
+                                            // 终态广播(codex P2b/九轮):笔记页在
+                                            // note_refining 回 false 后已停轮询,凡是
+                                            // 停摆标记被摘且盘上有稿的情形都补一发,
+                                            // 页面按稿子实际状态收口。写了失败态报
+                                            // failed;稿子本就终态(llm 收过尾、worker
+                                            // 死在 identify/标题)报 done——稿子可用,
+                                            // 但把心跳留证打进日志,不静默当成功。
+                                            let state_s = if act.contains("failed") {
+                                                Some("failed")
+                                            } else if act.contains("收尾") {
+                                                if let Some((stage, age_ms)) =
+                                                    crate::refine_beat_of(&id2)
+                                                {
+                                                    eprintln!(
+                                                        "lifecycle: 停摆自愈({id2})后 LLM 阶段疑似吊死:心跳停在 {stage} 已 {age_ms}ms"
+                                                    );
+                                                }
+                                                Some("done")
+                                            } else {
+                                                None // 让路/坏稿:没动盘,也不该发终态
+                                            };
+                                            if let Some(state_s) = state_s {
                                                 let _ = app2.emit(
                                                     "refine",
                                                     crate::ipc::RefineEvent {
                                                         note_id: id2.clone(),
                                                         stage: "all".into(),
-                                                        state: "failed".into(),
+                                                        state: state_s.into(),
                                                     },
                                                 );
                                             }
