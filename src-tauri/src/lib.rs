@@ -387,13 +387,22 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
             });
             // 归档失败必须中止(codex 十四轮):闭包报错则 update 不落盘,收工戳
             // 原样保留——绝不能戳清了、档没归,把要保全的证据反手清掉。
-            // 末行相同则跳过追加(幂等,archived_at 圈外定死):上一轮归档成功但
-            // 整写失败的重试,不会把同一次运行写成好几行。
+            // 幂等去重按上一轮的四个稳定字段(codex 十八/十九轮),不含 archived_at:
+            // 进程在「归档已写、撕戳未落」之间死掉,下次启动 archived_at 必然不同,
+            // 按整行比对会把同一次运行再归一遍;按源字段比对跨重启也认得。
             let path = dir.join("aing_runs.jsonl");
             let rec_line = rec.to_string();
             let dup = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|raw| raw.lines().last().map(|l| l == rec_line))
+                .and_then(|raw| {
+                    let v: serde_json::Value = serde_json::from_str(raw.lines().last()?).ok()?;
+                    Some(
+                        v["finished_at"] == rec["finished_at"]
+                            && v["written_at"] == rec["written_at"]
+                            && v["writer_pid"] == rec["writer_pid"]
+                            && v["generated_at"] == rec["generated_at"],
+                    )
+                })
                 .unwrap_or(false);
             if !dup {
                 let mut f = std::fs::OpenOptions::new()
@@ -425,6 +434,19 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
+}
+
+/// aing_runs.jsonl 追加一条运行事件(best-effort,失败仅出声)。
+fn append_refine_run_log(dir: &std::path::Path, note_id: &str, rec: &serde_json::Value) {
+    match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aing_runs.jsonl")) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            if let Err(e) = writeln!(f, "{rec}") {
+                eprintln!("refine({note_id}): 运行日志追加失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("refine({note_id}): 运行日志打开失败: {e}"),
+    }
 }
 
 /// 收工戳落盘(codex 十六轮):worker 有序退场时调用。
@@ -461,15 +483,7 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str) {
         }
     }
     let rec = serde_json::json!({ "event": "finished", "outcome": outcome, "at": at });
-    match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aing_runs.jsonl")) {
-        Ok(mut f) => {
-            use std::io::Write as _;
-            if let Err(e) = writeln!(f, "{rec}") {
-                eprintln!("refine({note_id}): 运行日志追加失败: {e}");
-            }
-        }
-        Err(e) => eprintln!("refine({note_id}): 运行日志打开失败: {e}"),
-    }
+    append_refine_run_log(dir, note_id, &rec);
 }
 
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
@@ -963,7 +977,23 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             }
             Ok(Err(e)) => {
                 eprintln!("refine({note_id}): 管线失败: {e}");
-                stamp_finished("failed");
+                if e.to_string().contains("起跑仪式失败") {
+                    // 证据保全优先(codex 十九轮):归档没写成,盘上旧收工戳必须原样
+                    // 保留——盖戳会把「上一轮何时收工」的唯一记录冲掉。只记日志。
+                    if let Ok(root) = notes_dir(&app) {
+                        append_refine_run_log(
+                            &root.join(&note_id),
+                            &note_id,
+                            &serde_json::json!({
+                                "event": "finished",
+                                "outcome": "failed_before_start",
+                                "at": chrono::Local::now().to_rfc3339(),
+                            }),
+                        );
+                    }
+                } else {
+                    stamp_finished("failed");
+                }
                 report("all", "failed");
             }
             Err(_) => {
