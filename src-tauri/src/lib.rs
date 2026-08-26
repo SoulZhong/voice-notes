@@ -372,6 +372,9 @@ static AING_GATE: Mutex<()> = Mutex::new(());
 /// 归档发生在 update 闭包内,天然处于 NoteLock 保护下。无旧稿时 update 失败即无事。
 fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
     let mut last_err = None;
+    // archived_at 在重试圈外定死(codex 十八轮):归档成功而后续整写失败时,下一轮
+    // 重试生成的行与已写入的字节相同,末行比对即可去重,一次运行不会记成好几次。
+    let archived_at = chrono::Local::now().to_rfc3339();
     for _ in 0..5 {
         match store::update_refined_for_retry(dir, |d| {
         if !d.finished_at.is_empty() || !d.written_at.is_empty() {
@@ -380,16 +383,26 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
                 "written_at": d.written_at,
                 "writer_pid": d.writer_pid,
                 "generated_at": d.generated_at,
-                "archived_at": chrono::Local::now().to_rfc3339(),
+                "archived_at": archived_at,
             });
             // 归档失败必须中止(codex 十四轮):闭包报错则 update 不落盘,收工戳
             // 原样保留——绝不能戳清了、档没归,把要保全的证据反手清掉。
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("aing_runs.jsonl"))?;
-            use std::io::Write as _;
-            writeln!(f, "{rec}")?;
+            // 末行相同则跳过追加(幂等,archived_at 圈外定死):上一轮归档成功但
+            // 整写失败的重试,不会把同一次运行写成好几行。
+            let path = dir.join("aing_runs.jsonl");
+            let rec_line = rec.to_string();
+            let dup = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| raw.lines().last().map(|l| l == rec_line))
+                .unwrap_or(false);
+            if !dup {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                use std::io::Write as _;
+                writeln!(f, "{rec_line}")?;
+            }
         }
             d.finished_at = String::new();
             Ok(())

@@ -328,15 +328,15 @@ impl UdsBackend for AppBackend<'_> {
         // (refining=true 但心跳陈旧)」——2026-08-26 那晚要有这个,两小时误诊不会发生。
         let refining = app.state::<crate::lifecycle::LifecycleHandle>().is_refining(note_id);
         let beat = crate::refine_beat_of(note_id);
-        let doc = crate::notes_dir(app)
-            .ok()
-            .map(|root| root.join(note_id))
+        let note_dir = crate::notes_dir(app).ok().map(|root| root.join(note_id));
+        let doc = note_dir
+            .as_ref()
             .and_then(|dir| {
-                let d = crate::store::load_refined(&dir)?;
+                let d = crate::store::load_refined(dir)?;
                 if d.written_at.is_empty() {
                     // 旧稿刚被 load_refined 迁移成 aing.json 时,返回的还是未盖戳
                     // 的内存对象(戳只落在盘上)——重读一次拿真值(codex 三轮 P2)。
-                    crate::store::load_refined(&dir).or(Some(d))
+                    crate::store::load_refined(dir).or(Some(d))
                 } else {
                     Some(d)
                 }
@@ -349,6 +349,17 @@ impl UdsBackend for AppBackend<'_> {
                         "relations": d.stages.relations,
                     },
                     "finished_at": d.finished_at,
+                    // 最近一次 worker 退场记录(codex 十八轮):重跑在写盘前失败时,
+                    // 盘上还是旧 llm=done 稿+新戳,光看稿会误读成重跑成功;成败
+                    // 真值在 runs 日志末行。
+                    "last_run": note_dir
+                        .as_ref()
+                        .and_then(|dir| std::fs::read_to_string(dir.join("aing_runs.jsonl")).ok())
+                        .and_then(|raw| {
+                            raw.lines().rev().find_map(|l| {
+                                serde_json::from_str::<serde_json::Value>(l).ok()
+                            })
+                        }),
                     "written_at": d.written_at, "writer_pid": d.writer_pid,
                     "generated_at": d.generated_at,
                     "llm_failed_paragraphs": d.llm_failed_paragraphs.len(),
