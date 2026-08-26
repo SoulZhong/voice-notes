@@ -408,12 +408,16 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
                 })
                 .unwrap_or(false);
             if !dup {
+                // 与 append_refine_run_log 同款互斥+整行单写(codex 二十三轮)
+                let _g = REFINE_RUN_LOG_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)?;
                 use std::io::Write as _;
-                writeln!(f, "{rec_line}")?;
+                f.write_all(format!("{rec_line}\n").as_bytes())?;
             }
         }
             d.finished_at = String::new();
@@ -439,6 +443,11 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
 }
 
+/// runs 日志写入互斥(codex 二十三轮):writeln! 对 Value 是多次小写,并发 writer
+/// (前任收工 vs 部分重试收工)可能把两行绞在一起毁掉 JSONL。进程内上锁 + 整行
+/// 一次 write_all(O_APPEND 单次写原子);跨进程仍靠单次写兜底。
+static REFINE_RUN_LOG_LOCK: Mutex<()> = Mutex::new(());
+
 /// aing_runs.jsonl 追加一条运行事件。失败出声并返回 Err,成败由调用方决定要不要
 /// 因此放弃后续动作(收工戳与成败日志的先后契约见 stamp_refine_finished)。
 fn append_refine_run_log(
@@ -446,13 +455,15 @@ fn append_refine_run_log(
     note_id: &str,
     rec: &serde_json::Value,
 ) -> std::io::Result<()> {
+    let _g = REFINE_RUN_LOG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let line = format!("{rec}\n");
     let r = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("aing_runs.jsonl"))
         .and_then(|mut f| {
             use std::io::Write as _;
-            writeln!(f, "{rec}")
+            f.write_all(line.as_bytes())
         });
     if let Err(e) = &r {
         eprintln!("refine({note_id}): 运行日志写入失败: {e}");

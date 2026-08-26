@@ -349,27 +349,27 @@ impl UdsBackend for AppBackend<'_> {
                         "relations": d.stages.relations,
                     },
                     "finished_at": d.finished_at,
-                    // 最近一次 worker 退场记录(codex 十八轮):重跑在写盘前失败时,
-                    // 盘上还是旧 llm=done 稿+新戳,光看稿会误读成重跑成功;成败
-                    // 真值在 runs 日志末行。
-                    "last_run": note_dir
-                        .as_ref()
-                        .and_then(|dir| std::fs::read_to_string(dir.join("aing_runs.jsonl")).ok())
-                        .and_then(|raw| {
-                            raw.lines().rev().find_map(|l| {
-                                serde_json::from_str::<serde_json::Value>(l).ok()
-                            })
-                        }),
                     "written_at": d.written_at, "writer_pid": d.writer_pid,
                     "generated_at": d.generated_at,
                     "llm_failed_paragraphs": d.llm_failed_paragraphs.len(),
                 })
+            });
+        // 最近一次 worker 退场记录(codex 十八/二十三轮):独立于盘上稿——首跑在
+        // run_local 写盘前就失败时 doc 为 null,但 runs 日志有记录,否则「跑失败过」
+        // 与「从没跑过」无从区分;重跑在写盘前失败时盘上还是旧 done 稿,成败真值
+        // 也在这里。
+        let last_run = note_dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join("aing_runs.jsonl")).ok())
+            .and_then(|raw| {
+                raw.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             });
         Ok(serde_json::json!({
             "note_id": note_id,
             "refining": refining,
             "beat": beat.map(|(stage, age_ms)| serde_json::json!({ "stage": stage, "age_ms": age_ms })),
             "doc": doc,
+            "last_run": last_run,
         }))
     }
 
