@@ -370,8 +370,10 @@ static AING_GATE: Mutex<()> = Mutex::new(());
 /// 重跑起跑仪式(codex 十二轮):上一轮的运行元数据(收工/写盘戳)先归档进
 /// aing_runs.jsonl 再撕掉 finished_at——停摆取证靠的就是这些,不能裸清。
 /// 归档发生在 update 闭包内,天然处于 NoteLock 保护下。无旧稿时 update 失败即无事。
-fn archive_and_clear_finish_stamp(dir: &std::path::Path) {
-    let _ = store::update_refined_for_retry(dir, |d| {
+fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match store::update_refined_for_retry(dir, |d| {
         if !d.finished_at.is_empty() || !d.written_at.is_empty() {
             let rec = serde_json::json!({
                 "finished_at": d.finished_at,
@@ -389,9 +391,21 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) {
                 let _ = writeln!(f, "{rec}");
             }
         }
-        d.finished_at = String::new();
-        Ok(())
-    });
+            d.finished_at = String::new();
+            Ok(())
+        }) {
+            Ok(()) => return Ok(()),
+            // 无旧稿(首跑)没有可归档/可撕的戳,等价成功
+            Err(e) if e.to_string().contains("不存在") => return Ok(()),
+            // 锁被短暂占用等瞬态:重试几轮再定失败(codex 十三轮 P2:失败必须拦住
+            // 重跑,否则旧 finished_at 仍在,本轮停摆会被自愈误判为已收工)
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
 }
 
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
@@ -560,7 +574,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 新一轮起跑:归档上一轮证据并撕收工戳(codex 十一/十二轮)——
                 // 停摆时自愈不能被旧 finished_at 骗成「已收工」,而旧戳本身是取证
                 // 材料,清之前先落 aing_runs.jsonl。
-                archive_and_clear_finish_stamp(&dir);
+                archive_and_clear_finish_stamp(&dir)
+                    .map_err(|e| anyhow::anyhow!("重跑起跑仪式失败(旧收工戳未清,拒绝开跑): {e}"))?;
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;
@@ -3057,8 +3072,13 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
             });
         };
         report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
-        // 起跑归档上一轮证据并撕收工戳,理由同 spawn_refine(codex 十一/十二轮)
-        archive_and_clear_finish_stamp(&dir);
+        // 起跑归档上一轮证据并撕收工戳,理由同 spawn_refine(codex 十一/十二轮);
+        // 失败必须拦住重跑(codex 十三轮 P2),报终态走人,RAII 哨兵收尾
+        if let Err(e) = archive_and_clear_finish_stamp(&dir) {
+            eprintln!("部分重试({note_id}):旧收工戳未清,拒绝开跑: {e}");
+            report("all", "failed");
+            return;
+        }
         let run = || -> anyhow::Result<()> {
             let doc = store::load_refined(&dir)
                 .ok_or_else(|| anyhow::anyhow!("修订稿加载失败"))?;

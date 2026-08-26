@@ -412,8 +412,17 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
             // 用于滞留自愈,见 REFINE_STALE_MS。单线程持有,无锁。
             let boot = std::time::Instant::now();
             let mut refine_clock: std::collections::BTreeMap<String, u64> = Default::default();
-            for env in rx {
-                // 每收一封先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
+            loop {
+                // 定时唤醒(codex 十三轮 P1):信箱空闲时也要做滞留体检——worker 吊死
+                // 且此后再无 lifecycle 流量(无人开笔记页轮询/无头 MCP 场景)时,原
+                // for-recv 会永远阻塞,一小时阈值形同虚设。60s 一跳:超时也走一遍
+                // 体检再回来等信;通道关闭即退出(与 for-recv 的结束语义一致)。
+                let env = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                    Ok(env) => Some(env),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                // 每收一封(或每次定时醒来)先做一次滞留体检:worker 若永久阻塞,RAII 的 Drop 不会执行
                 // (线程没结束),该 id 会永久占着 Aing 集把守卫钉死——这里兜住那条路径。
                 //
                 // 判据是「多久没有进度」而非「启动至今多久」。改口径的原因(codex review
@@ -538,6 +547,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         refine_clock.remove(&id);
                     }
                 }
+                let Some(env) = env else { continue }; // 定时醒来无信:体检完回去等
                 let (msg, reply) = match env {
                     // 停录特化(P2):teardown 同步执行(handle.stop 排干期间,管线
                     // 消息全部入队),随后把 stop 的 reply 转移进自投的 Finalize——
