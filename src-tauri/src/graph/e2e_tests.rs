@@ -33,6 +33,7 @@ fn relation_doc(note_id: &str, relations_state: &str) -> RefinedDoc {
         written_at: String::new(),
         writer_pid: 0,
         finished_at: String::new(),
+        writer_run: String::new(),
         llm_model: Some("fixture-model".into()),
         stages: RefineStages {
             filter: "done".into(),

@@ -608,6 +608,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![], entities, graph_extraction: None, relations: vec![], graph_support_mentions: vec![], revision: 0, stale: false, paragraphs: paras,
         }

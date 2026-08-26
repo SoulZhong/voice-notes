@@ -644,6 +644,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: Some("text-model".into()),
             stages: store::RefineStages {
                 filter: "done".into(),
@@ -752,6 +753,7 @@ mod tests {
                 written_at: String::new(),
                 writer_pid: 0,
                 finished_at: String::new(),
+                writer_run: String::new(),
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),
@@ -854,6 +856,7 @@ mod tests {
                 written_at: String::new(),
                 writer_pid: 0,
                 finished_at: String::new(),
+                writer_run: String::new(),
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),
@@ -967,6 +970,7 @@ mod tests {
                 written_at: String::new(),
                 writer_pid: 0,
                 finished_at: String::new(),
+                writer_run: String::new(),
                 llm_model: None,
                 stages: store::RefineStages {
                     filter: "done".into(),

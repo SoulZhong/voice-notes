@@ -257,6 +257,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             stages: crate::store::refined::RefineStages {
                 filter: "done".into(), recluster: "done".into(), llm: "off".into(),
                 entities: "off".into(), relations: "off".into(),

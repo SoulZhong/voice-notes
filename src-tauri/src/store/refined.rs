@@ -93,6 +93,11 @@ pub struct RefinedDoc {
     /// identify/标题等尾段可能还在跑;此戳由 worker 终态上报前落盘。空 = 未收工。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finished_at: String,
+    /// 本次写盘所属的运行标识 "pid-代次"(codex 三十轮):writer_pid 在同进程多轮
+    /// 重跑间不变,无法把稿与 aing_runs.jsonl 里的某一轮对上;此值从心跳表取在跑
+    /// worker 的代次,空 = 非 worker 写(编辑器保存/维护工具)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub writer_run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
     pub stages: RefineStages,
@@ -133,6 +138,7 @@ fn prepared_doc_bytes(note_id: &str, doc: &RefinedDoc) -> anyhow::Result<Vec<u8>
     // (Agent 图谱写回/关系回填)全都在此序列化,谁写盘谁盖戳,不会漏路径。
     doc.written_at = chrono::Local::now().to_rfc3339();
     doc.writer_pid = std::process::id();
+    doc.writer_run = crate::refine_beat_run_of(note_id).unwrap_or_default();
     Ok(serde_json::to_vec_pretty(&doc)?)
 }
 
@@ -681,6 +687,7 @@ impl RefinedDoc {
             written_at: String::new(),   // 落盘咽喉自动盖
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "off".into(),
@@ -1345,6 +1352,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "done".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1424,6 +1432,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: Some("deepseek-chat".into()),
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![1, 2],
@@ -1504,6 +1513,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages {
                 filter: "done".into(),
@@ -1722,6 +1732,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -1842,6 +1853,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "off".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2122,6 +2134,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "partial".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2160,6 +2173,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],
@@ -2187,6 +2201,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: None,
             stages: RefineStages { filter: "done".into(), recluster: "done".into(), llm: "done".into(), entities: "off".into(), relations: "off".into() },
             discarded_seqs: vec![],

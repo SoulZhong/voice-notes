@@ -515,10 +515,23 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     // 查-判-写整体在一把 NoteLock 内(codex P1a/P1b):
                                     // 已有中间稿改标 failed;诈尸写完的稿原样保留。
                                     let still_stale = || {
-                                        !app2
+                                        let lc_active = app2
                                             .try_state::<crate::lifecycle::LifecycleHandle>()
                                             .map(|lc| lc.is_refining(&id2))
-                                            .unwrap_or(false)
+                                            .unwrap_or(false);
+                                        if lc_active {
+                                            return false;
+                                        }
+                                        // 心跳新鲜同样算活(codex 三十轮):被摘的前任在
+                                        // sample/锁重试窗口里诈尸继续跑时,只有心跳在动
+                                        // (阶段级 report 不会把它重新插回 lifecycle 集),
+                                        // 不能对着活人的中间稿写失败态。
+                                        if let Some((_, age_ms)) = crate::refine_beat_of(&id2) {
+                                            if age_ms < 10 * 60 * 1000 {
+                                                return false;
+                                            }
+                                        }
+                                        true
                                     };
                                     // 锁忙重试(codex 二十轮):吊死的 worker 可能正抱着
                                     // NoteLock,或普通编辑瞬时占锁。只试一次就放弃的话,

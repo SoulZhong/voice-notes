@@ -262,6 +262,7 @@ mod tests {
             written_at: String::new(),
             writer_pid: 0,
             finished_at: String::new(),
+            writer_run: String::new(),
             llm_model: Some("model-v1".into()),
             stages: RefineStages {
                 filter: "done".into(),

@@ -493,7 +493,10 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
     // 先落成败日志,后盖收工戳(codex 二十轮):反过来的话,盖完戳、日志没写成
     // (或进程恰好死在中间),旧 llm=done 稿+新戳会被读成「新近成功收工」——这
     // 正是日志要消灭的歧义。日志写不进就不盖戳,保持「无戳=没收工」的保守可读。
-    let rec = serde_json::json!({ "event": "finished", "outcome": outcome, "at": at });
+    let rec = serde_json::json!({
+        "event": "finished", "outcome": outcome, "at": at,
+        "run": format!("{}-{my_gen}", std::process::id()),
+    });
     if append_refine_run_log(dir, note_id, &rec).is_err() {
         eprintln!("refine({note_id}): 成败日志未落,收工戳弃盖(保守:无戳读作未收工)");
         return;
@@ -1221,6 +1224,11 @@ fn refine_beat_clear(note_id: &str, gen: u64) {
             m.remove(note_id);
         }
     }
+}
+
+/// 查一篇在跑 worker 的运行标识 "pid-代次"(稿面 writer_run 用,codex 三十轮)。
+pub(crate) fn refine_beat_run_of(note_id: &str) -> Option<String> {
+    refine_beat_owner(note_id).map(|g| format!("{}-{g}", std::process::id()))
 }
 
 /// 查一篇心跳条目当前属于哪一代 worker(收工戳代次守卫用,codex 二十一轮)。
