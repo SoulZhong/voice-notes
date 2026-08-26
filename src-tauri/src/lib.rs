@@ -395,8 +395,14 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
             Ok(())
         }) {
             Ok(()) => return Ok(()),
-            // 无旧稿(首跑)没有可归档/可撕的戳,等价成功
-            Err(e) if e.to_string().contains("不存在") => return Ok(()),
+            // 「不存在或已损坏」要分家(codex 十五轮):盘上确实没有稿(首跑)才等价
+            // 成功;文件在但解析不了是坏稿,必须拦住重跑,别把取证材料整写覆盖掉。
+            Err(e) if e.to_string().contains("不存在") => {
+                if store::aing_exists(dir) {
+                    return Err(anyhow::anyhow!("盘上稿存在但已损坏,拒绝开跑以保全证据: {e}"));
+                }
+                return Ok(());
+            }
             // 锁被短暂占用等瞬态:重试几轮再定失败(codex 十三轮 P2:失败必须拦住
             // 重跑,否则旧 finished_at 仍在,本轮停摆会被自愈误判为已收工)
             Err(e) => {
@@ -544,7 +550,11 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                             let mut outcome = Err(String::new());
                             for attempt in 0..10 {
                                 // strict=true:任一段失败整体放弃(见 retranscribe::run 注释)。
-                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {});
+                                outcome = run_retranscribe_once(&app, &note_id, false, s2.language_filter, true, None, &mut |_| {
+                                    // 二遍的解码/转写/归属进度喂进心跳表(codex 十五轮):
+                                    // 长会议二遍可超一小时,不打点会被定时体检误杀
+                                    refine_beat_touch(&note_id, beat_gen, "second_pass", "running");
+                                });
                                 match &outcome {
                                     Err(e) if e.contains("正被占用") || e.contains("busy") => {
                                         if attempt < 9 {

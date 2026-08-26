@@ -435,7 +435,28 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                     let now_ms = boot.elapsed().as_millis() as u64;
                     let running: Vec<String> =
                         state.refine.running_ids().map(str::to_string).collect();
-                    for id in sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS) {
+                    // 心跳表并入停摆判据(codex 十五轮):有些阶段只碰 beat 不发
+                    // RefineProgress(identify/标题/云端二遍),refine_clock 看不见它们
+                    // 的活动。判死前问一嘴心跳,新鲜就当有进度回填时钟,免得定时
+                    // 体检把还在干活的 worker 误杀(移除标记不等于取消线程,守卫一
+                    // 放行编辑就会与它抢写 aing.json)。
+                    let stale_ids: Vec<String> =
+                        sync_and_take_stale(&mut refine_clock, &running, now_ms, REFINE_STALE_MS)
+                            .into_iter()
+                            .filter(|id| {
+                                if let Some((stage, age_ms)) = crate::refine_beat_of(id) {
+                                    if (age_ms as u128) < REFINE_STALE_MS as u128 {
+                                        eprintln!(
+                                            "lifecycle: {id} 事件流静默但心跳新鲜({stage}, {age_ms}ms 前),不判停摆"
+                                        );
+                                        refine_clock.insert(id.clone(), now_ms);
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .collect();
+                    for id in stale_ids {
                         eprintln!(
                             "lifecycle: Aing 集条目 {id} 已 {}s 无进度,判定 worker 未收尾,自愈移除\
                              (该 id 的 is_refining 守卫此前会一直拒绝编辑类命令)",
