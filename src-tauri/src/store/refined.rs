@@ -883,34 +883,40 @@ fn update_refined(
 pub fn heal_stale_refined(
     note_dir: &Path,
     still_stale: impl Fn() -> bool,
-) -> anyhow::Result<&'static str> {
+) -> anyhow::Result<String> {
     let Some(lock) = NoteLock::acquire(note_dir)? else {
-        return Ok("另一进程持锁,让路");
+        return Ok("另一进程持锁,让路".to_string());
     };
     match load_aing_file(note_dir) {
         // 文件在但读不出:是证据,不能拿失败稿盖掉
-        None => Ok("盘上稿损坏,保留原样"),
+        None => Ok("盘上稿损坏,保留原样".to_string()),
         Some(Some(mut doc)) => {
             // 进门先复验接管(codex 十二轮):替补在首查之后才占槽时,盘上可能还是
             // 上一轮的终态稿——此时定性/广播都属于替补的剧本,这里不能抢戏。
             if !still_stale() {
-                return Ok("新一轮已接手(占槽),让路");
+                return Ok("新一轮已接手(占槽),让路".to_string());
             }
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
                 // llm 已终态 ≠ 整个 worker 收工(codex 九/十轮):看收工戳定性。
                 if !doc.finished_at.is_empty() {
-                    return Ok("盘上稿已收工(收工戳在),不动");
+                    return Ok("盘上稿已收工(收工戳在),不动".to_string());
                 }
                 // identify/标题尾段吊死:worker 没有序退场过。失败必须落稿面
                 // (codex 三十一轮)——终态事件是一次性的,重启后页面只认 stages,
                 // 不标的话这场停摆会永远显示成「已完成」。正文原样保留,llm 改标
                 // failed 换来「失败可重跑」入口。
                 if doc.stages.llm != "failed" {
+                    let prev = doc.stages.llm.clone();
                     doc.stages.llm = "failed".into();
                     doc.revision = doc.revision.saturating_add(1);
                     write_refined_atomic_locked(note_dir, &doc, &lock)?;
+                    // 原值随动作字串进 runs 日志(codex 三十五轮):worker 诈尸跑完
+                    // 收工 done 时,靠它把稿面从 failed 调解回原终态。
+                    return Ok(format!(
+                        "盘上稿 llm 已终态但收工戳缺失(尾段停摆),已改标 llm=failed(原 {prev})"
+                    ));
                 }
-                return Ok("盘上稿 llm 已终态但收工戳缺失(尾段停摆),已改标 llm=failed");
+                return Ok("盘上稿 llm 已终态但收工戳缺失(尾段停摆),已是 failed".to_string());
             }
             // 接管识别只看生死簿不看写盘戳(codex 八轮定稿):真替补从起跑到收工
             // 全程占着 lifecycle 槽,still_stale 必能探到;替补已收工则稿子是终态,
@@ -920,13 +926,13 @@ pub fn heal_stale_refined(
             // lifecycle 槽、且还没写出自己的 aing.json——写盘戳守卫探不到它,
             // 落笔前再问一次生死簿。
             if !still_stale() {
-                return Ok("新一轮已接手(占槽未写盘),让路");
+                return Ok("新一轮已接手(占槽未写盘),让路".to_string());
             }
             // run_local 之后 llm 阶段停摆:中间稿改标 failed,UI 出「失败可重跑」
             doc.stages.llm = "failed".into();
             doc.revision = doc.revision.saturating_add(1);
             write_refined_atomic_locked(note_dir, &doc, &lock)?;
-            Ok("中间稿已改标 llm=failed")
+            Ok("中间稿已改标 llm=failed".to_string())
         }
         Some(None) => {
             // 盘上无 aing.json(run_local 前就停摆)。两个坑(codex 二轮):
@@ -935,13 +941,13 @@ pub fn heal_stale_refined(
             // ② 全新笔记落空段稿会让「修订视图/get_note(prefer_refined)」变
             //   白板——从 segments.jsonl 物化原始段当正文,失败横幅照出。
             if !still_stale() {
-                return Ok("新一轮已接手(占槽未写盘),让路");
+                return Ok("新一轮已接手(占槽未写盘),让路".to_string());
             }
             if let Some(mut doc) = load_legacy_file(note_dir) {
                 doc.stages.llm = "failed".into();
                 doc.revision = doc.revision.saturating_add(1);
                 write_refined_atomic_locked(note_dir, &doc, &lock)?;
-                return Ok("旧稿已迁移并改标 llm=failed");
+                return Ok("旧稿已迁移并改标 llm=failed".to_string());
             }
             let mut doc = RefinedDoc::minimal_failed();
             doc.generated_at = chrono::Local::now().to_rfc3339();
@@ -982,7 +988,7 @@ pub fn heal_stale_refined(
                 }
             }
             write_refined_atomic_locked(note_dir, &doc, &lock)?;
-            Ok("已落 llm=failed 失败稿(正文取原始段)")
+            Ok("已落 llm=failed 失败稿(正文取原始段)".to_string())
         }
     }
 }

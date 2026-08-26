@@ -505,6 +505,33 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
         eprintln!("refine({note_id}): 成败日志未落,收工戳弃盖(保守:无戳读作未收工)");
         return;
     }
+    // 尾段停摆调解(codex 三十五轮):自愈曾把 llm 从终态改标 failed,而 identify/
+    // 标题尾段不再写盘——worker 诈尸跑完以 done 收工时,稿面还挂着 failed,与
+    // 事件/last_run 永久矛盾。从 runs 日志找出自愈记录里的原值,收工时调解回去。
+    let heal_prev: Option<String> = if matches!(outcome, "done" | "retry_done") {
+        std::fs::read_to_string(dir.join("aing_runs.jsonl"))
+            .ok()
+            .and_then(|raw| {
+                // rec 刚追加,倒数第二条起往回找最近的 event 记录
+                let last = raw
+                    .lines()
+                    .rev()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter(|v| v.get("event").is_some())
+                    .nth(1)?;
+                if last["outcome"] != "stale_heal_failed" {
+                    return None;
+                }
+                let detail = last["detail"].as_str()?;
+                if !detail.contains("尾段停摆") {
+                    return None;
+                }
+                let prev = detail.split("(原 ").nth(1)?.trim_end_matches(')');
+                Some(prev.to_string())
+            })
+    } else {
+        None
+    };
     let mut stamped = false;
     let mut last_err = None;
     for _ in 0..5 {
@@ -520,6 +547,11 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str, my
             // 同步注册更高代次心跳,此处能看见。
             if refine_beat_owner(note_id).is_some_and(|g| g > my_gen) {
                 anyhow::bail!("替补已接手,弃盖");
+            }
+            if let Some(prev) = &heal_prev {
+                if d.stages.llm == "failed" {
+                    d.stages.llm = prev.clone(); // 调解:自愈的 failed 让位于真收工
+                }
             }
             d.finished_at = at.clone();
             Ok(())
