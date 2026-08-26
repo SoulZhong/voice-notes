@@ -362,7 +362,12 @@ impl UdsBackend for AppBackend<'_> {
             .as_ref()
             .and_then(|dir| std::fs::read_to_string(dir.join("aing_runs.jsonl")).ok())
             .and_then(|raw| {
-                raw.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                raw.lines().rev().find_map(|l| {
+                    let v = serde_json::from_str::<serde_json::Value>(l).ok()?;
+                    // 只认终态事件行(codex 二十四轮):起跑仪式的归档行没有 event
+                    // 字段,拿它当 last_run 会把「上一轮的真实成败」挡在后面。
+                    v.get("event").is_some().then_some(v)
+                })
             });
         Ok(serde_json::json!({
             "note_id": note_id,

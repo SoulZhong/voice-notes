@@ -627,13 +627,21 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 运行集——之后真开工时集合不再插入,编辑守卫/重复 Aing 全部失效。改
         // try_lock 轮询,每分钟补一条 all/running 心跳。代价是失去 Mutex 的排队
         // 公平性(多篇并发排队时唤醒顺序随机),Aing 并发本就罕见,可接受。
-        let _aing_gate = loop {
-            match AING_GATE.try_lock() {
-                Ok(g) => break g,
-                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                    report("all", "running");
+        let _aing_gate = {
+            // 2s 一试拿门,60s 一报心跳(codex 二十四轮):照旧一分钟一试的话,
+            // 前一篇一放门,排队的这篇还要干等最多一分钟才接上。
+            let mut ticks: u32 = 0;
+            loop {
+                match AING_GATE.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        ticks += 1;
+                        if ticks % 30 == 0 {
+                            report("all", "running");
+                        }
+                    }
                 }
             }
         };
