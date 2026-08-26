@@ -898,13 +898,19 @@ pub fn heal_stale_refined(
             }
             if matches!(doc.stages.llm.as_str(), "done" | "failed" | "partial") {
                 // llm 已终态 ≠ 整个 worker 收工(codex 九/十轮):看收工戳定性。
-                // 稿子本身可用,两种情形都不动稿;定性字串供调用方选终态事件。
-                return Ok(if doc.finished_at.is_empty() {
-                    // identify/标题尾段吊死:worker 没有序退场过
-                    "盘上稿 llm 已终态但收工戳缺失(尾段停摆),不动"
-                } else {
-                    "盘上稿已收工(收工戳在),不动"
-                });
+                if !doc.finished_at.is_empty() {
+                    return Ok("盘上稿已收工(收工戳在),不动");
+                }
+                // identify/标题尾段吊死:worker 没有序退场过。失败必须落稿面
+                // (codex 三十一轮)——终态事件是一次性的,重启后页面只认 stages,
+                // 不标的话这场停摆会永远显示成「已完成」。正文原样保留,llm 改标
+                // failed 换来「失败可重跑」入口。
+                if doc.stages.llm != "failed" {
+                    doc.stages.llm = "failed".into();
+                    doc.revision = doc.revision.saturating_add(1);
+                    write_refined_atomic_locked(note_dir, &doc, &lock)?;
+                }
+                return Ok("盘上稿 llm 已终态但收工戳缺失(尾段停摆),已改标 llm=failed");
             }
             // 接管识别只看生死簿不看写盘戳(codex 八轮定稿):真替补从起跑到收工
             // 全程占着 lifecycle 槽,still_stale 必能探到;替补已收工则稿子是终态,
@@ -1317,7 +1323,10 @@ mod tests {
         let before = std::fs::read(dir.join(AING_DOC_FILE)).unwrap();
         let act = heal_stale_refined(&dir, || true).unwrap();
         assert!(act.contains("尾段停摆"), "llm 终态但无收工戳 ⇒ 尾段停摆: {act}");
-        assert_eq!(std::fs::read(dir.join(AING_DOC_FILE)).unwrap(), before);
+        let doc = load_refined(&dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed", "尾段停摆失败要落稿面,重启不失忆");
+        assert_eq!(doc.paragraphs[0].text, "正文在", "正文原样保留");
+        let _ = before; // 稿面已按停摆语义改写,字节级不动的断言随之退役
         // ③b 收工戳在:定性为已收工(调用方广播 done)
         let mut done2 = load_refined(&dir).unwrap();
         done2.finished_at = "2026-01-01T00:00:00+08:00".into();

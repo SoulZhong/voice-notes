@@ -350,6 +350,7 @@ impl UdsBackend for AppBackend<'_> {
                     },
                     "finished_at": d.finished_at,
                     "written_at": d.written_at, "writer_pid": d.writer_pid,
+                    "writer_run": d.writer_run,
                     "generated_at": d.generated_at,
                     "llm_failed_paragraphs": d.llm_failed_paragraphs.len(),
                 })
