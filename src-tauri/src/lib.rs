@@ -419,6 +419,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
             stage: "all".into(),
             state: "failed".into(),
         });
+        refine_beat_clear(&note_id); // 上面刚起的心跳同步清掉,不留无主条目
         lc.report(lifecycle::machine::Msg::RefineFinished { note_id });
         return;
     }

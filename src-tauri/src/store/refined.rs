@@ -885,11 +885,39 @@ pub fn heal_stale_refined(note_dir: &Path) -> anyhow::Result<&'static str> {
             Ok("中间稿已改标 llm=failed")
         }
         Some(None) => {
-            // 盘上无稿(run_local 前就停摆):落最小失败稿替掉「没做 AI 整理」幻觉
+            // 盘上无 aing.json(run_local 前就停摆)。两个坑(codex 二轮):
+            // ① 旧世界只有 refined.json 的笔记,写空稿会把旧稿整个挡在读取
+            //   优先级后面——先认旧稿,改标 failed 迁移过来,正文原样保留;
+            // ② 全新笔记落空段稿会让「修订视图/get_note(prefer_refined)」变
+            //   白板——从 segments.jsonl 物化原始段当正文,失败横幅照出。
+            if let Some(mut doc) = load_legacy_file(note_dir) {
+                doc.stages.llm = "failed".into();
+                doc.revision = doc.revision.saturating_add(1);
+                write_refined_atomic_locked(note_dir, &doc, &lock)?;
+                return Ok("旧稿已迁移并改标 llm=failed");
+            }
             let mut doc = RefinedDoc::minimal_failed();
             doc.generated_at = chrono::Local::now().to_rfc3339();
+            if let Ok(raw) = std::fs::read_to_string(note_dir.join("segments.jsonl")) {
+                for line in raw.lines() {
+                    let Ok(seg) = serde_json::from_str::<crate::store::SegmentRecord>(line)
+                    else {
+                        continue;
+                    };
+                    doc.paragraphs.push(RefinedParagraph {
+                        speaker: seg.speaker.unwrap_or_default(),
+                        name: None,
+                        person_id: None,
+                        text: seg.text,
+                        start_ms: seg.start_ms,
+                        end_ms: seg.end_ms,
+                        source_seqs: vec![seg.seq],
+                        mentions: Vec::new(),
+                    });
+                }
+            }
             write_refined_atomic_locked(note_dir, &doc, &lock)?;
-            Ok("已落 llm=failed 最小稿")
+            Ok("已落 llm=failed 失败稿(正文取原始段)")
         }
     }
 }
@@ -1177,12 +1205,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().join("20260101-000000");
         std::fs::create_dir_all(&dir).unwrap();
-        // ① 盘上无稿:落最小失败稿
+        // ① 盘上无稿:落失败稿,正文从 segments.jsonl 物化(不落白板稿)
+        std::fs::write(
+            dir.join("segments.jsonl"),
+            r#"{"seq":0,"source":"mic","text":"原文甲","start_ms":0,"end_ms":1000,"speaker":"S1"}"#,
+        )
+        .unwrap();
         let act = heal_stale_refined(&dir).unwrap();
-        assert!(act.contains("最小稿"), "{act}");
+        assert!(act.contains("原始段"), "{act}");
         let doc = load_refined(&dir).unwrap();
         assert_eq!(doc.stages.llm, "failed");
-        assert!(doc.paragraphs.is_empty());
+        assert_eq!(doc.paragraphs[0].text, "原文甲", "修订视图不是白板");
+        assert_eq!(doc.paragraphs[0].speaker, "S1");
         assert!(!doc.written_at.is_empty(), "咽喉盖了写盘戳");
         // ② 中间稿(run_local 后 llm=off):改标 failed,revision 进位,正文保留
         let mut mid = RefinedDoc::minimal_failed();
@@ -1213,6 +1247,22 @@ mod tests {
         let act = heal_stale_refined(&dir).unwrap();
         assert!(act.contains("不动"), "{act}");
         assert_eq!(std::fs::read(dir.join(AING_DOC_FILE)).unwrap(), before);
+        // ④ 只有旧世界 refined.json 的笔记:迁移旧稿改标 failed,正文保留
+        let legacy_dir = dir.parent().unwrap().join("20260101-000001");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let mut legacy = load_refined(&dir).unwrap();
+        legacy.stages.llm = "done".into();
+        legacy.paragraphs[0].text = "旧稿正文".into();
+        std::fs::write(
+            legacy_dir.join(LEGACY_REFINED_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let act = heal_stale_refined(&legacy_dir).unwrap();
+        assert!(act.contains("迁移"), "{act}");
+        let doc = load_refined(&legacy_dir).unwrap();
+        assert_eq!(doc.stages.llm, "failed");
+        assert_eq!(doc.paragraphs[0].text, "旧稿正文", "旧稿正文不被空稿挡住");
     }
 
     #[test]
