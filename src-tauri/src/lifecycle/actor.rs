@@ -449,7 +449,11 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                         eprintln!(
                                             "lifecycle: {id} 事件流静默但心跳新鲜({stage}, {age_ms}ms 前),不判停摆"
                                         );
-                                        refine_clock.insert(id.clone(), now_ms);
+                                        // 按心跳真实年龄回填(codex 十七轮):填 now_ms 会把
+                                        // 一个已经 59 分钟没跳的心跳当刚跳过,下次能判死
+                                        // 要再等整整一个 TTL,自愈延迟翻倍。
+                                        refine_clock
+                                            .insert(id.clone(), now_ms.saturating_sub(age_ms));
                                         return false;
                                     }
                                 }
@@ -545,14 +549,28 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                                 None // 让路/坏稿:没动盘,也不该发终态
                                             };
                                             if let Some(state_s) = state_s {
-                                                let _ = app2.emit(
-                                                    "refine",
-                                                    crate::ipc::RefineEvent {
-                                                        note_id: id2.clone(),
-                                                        stage: "all".into(),
-                                                        state: state_s.into(),
-                                                    },
-                                                );
+                                                // 发布前最后一验(codex 十七轮):替补可能在
+                                                // heal 的 still_stale 之后、这一发之前入场,
+                                                // 此时终态事件会把活跑的替补在页面上盖章
+                                                // 收场。已有人在跑就撤销广播。
+                                                let taken_over = app2
+                                                    .try_state::<crate::lifecycle::LifecycleHandle>()
+                                                    .map(|lc| lc.is_refining(&id2))
+                                                    .unwrap_or(false);
+                                                if taken_over {
+                                                    eprintln!(
+                                                        "lifecycle: 停摆自愈({id2})替补已接手,终态广播撤销"
+                                                    );
+                                                } else {
+                                                    let _ = app2.emit(
+                                                        "refine",
+                                                        crate::ipc::RefineEvent {
+                                                            note_id: id2.clone(),
+                                                            stage: "all".into(),
+                                                            state: state_s.into(),
+                                                        },
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(e) => eprintln!(
