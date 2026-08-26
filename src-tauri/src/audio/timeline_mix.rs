@@ -34,6 +34,20 @@ const NSRC: usize = 2;
 /// 覆盖实测 165~245ms 声学回路延迟与设备抖动。待实测校准的初值,不是定论。
 pub const DEFAULT_MARGIN_SAMPLES: u64 = 6400;
 
+/// 软限幅拐点(线性区上界,≈ −1 dBFS)。低于它逐样本原样通过——正常单人说话
+/// (远离满量程)听感零变化;高于它平滑压向 1.0 渐近线,取代原先「越界值交给
+/// 存储层硬钳制」的最粗暴削法(issue #124:双讲响峰重合时成品轨会硬削波)。
+pub const LIMIT_KNEE: f32 = 0.891;
+
+/// 定稿样本的限幅统计(issue #124 观测前提):没有它,削波量只能事后解码 m4a 反推。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LimitStats {
+    /// 混音和 |x| > 1.0 的样本数:限幅器接手前注定被硬削的量,即旧行为的削波计数。
+    pub clipped_samples: u64,
+    /// 混音和 |x| > 拐点、限幅器实际压过的样本数(含上一类)。
+    pub limited_samples: u64,
+}
+
 pub struct TimelineMixer {
     /// 每源已接受样本数 = 该源在时间轴上的当前写入位置。
     pos: [u64; NSRC],
@@ -41,11 +55,18 @@ pub struct TimelineMixer {
     win_start: u64,
     win: Vec<f32>,
     margin: u64,
+    stats: LimitStats,
 }
 
 impl TimelineMixer {
     pub fn new(margin_samples: u64) -> Self {
-        Self { pos: [0; NSRC], win_start: 0, win: Vec::new(), margin: margin_samples }
+        Self {
+            pos: [0; NSRC],
+            win_start: 0,
+            win: Vec::new(),
+            margin: margin_samples,
+            stats: LimitStats::default(),
+        }
     }
 
     /// 接受某源一块样本,返回本次新定稿的连续样本(从旧 win_start 起)。
@@ -98,7 +119,8 @@ impl TimelineMixer {
     /// 这一 `accept` 依赖的不变式——否则落后源下次 accept 时 `pos[src] - win_start`
     /// 直接下溢(release 下 `need` 回绕成 ~2^64,`Vec::resize` capacity overflow)。
     pub fn finish(&mut self) -> Vec<f32> {
-        let out: Vec<f32> = self.win.drain(..).collect();
+        let mut out: Vec<f32> = self.win.drain(..).collect();
+        self.limit(&mut out);
         self.win_start += out.len() as u64;
         // 恢复不变式:把落后源的位置拉平到 max(pos),而不是让它继续 < win_start。
         let max_pos = self.pos.iter().copied().max().expect("pos 长度固定为 NSRC,max 不可能为 None");
@@ -126,9 +148,35 @@ impl TimelineMixer {
         // (窗口右端恒等于目前见过的最大位置)。之前的 `.min(win.len())` 是不可达的
         // 死防御,换成断言把它从"掩盖"变成"锁定"。
         debug_assert!(n <= self.win.len(), "watermark 越过窗口右端,不变式被打破: n={n} win.len()={}", self.win.len());
-        let out: Vec<f32> = self.win.drain(..n).collect();
+        let mut out: Vec<f32> = self.win.drain(..n).collect();
+        self.limit(&mut out);
         self.win_start += out.len() as u64;
         out
+    }
+
+    /// 累计限幅统计(供定稿方写进 audio.json 的 MixInfo)。
+    pub fn limit_stats(&self) -> LimitStats {
+        self.stats
+    }
+
+    /// 无记忆软限幅:|x| ≤ 拐点原样;超出部分经 tanh 压向 1.0 渐近线(C¹ 连续,
+    /// 无前瞻无延迟,与逐块流式结构不冲突——issue #124 路线 2 里最便宜的形态)。
+    /// 相比旧行为(超界样本交给 f32_to_s16 硬钳),失真只发生在本来就要被硬削的
+    /// 邻域,且更缓和;正常响度样本逐位不变,不动整体听感。
+    /// 只在定稿出口做,窗内累加值保持纯和——分层语义(混音=加法,界=出口)不变。
+    fn limit(&mut self, out: &mut [f32]) {
+        for s in out.iter_mut() {
+            let a = s.abs();
+            if a <= LIMIT_KNEE {
+                continue;
+            }
+            self.stats.limited_samples += 1;
+            if a > 1.0 {
+                self.stats.clipped_samples += 1;
+            }
+            let span = 1.0 - LIMIT_KNEE;
+            *s = s.signum() * (LIMIT_KNEE + span * ((a - LIMIT_KNEE) / span).tanh());
+        }
     }
 }
 
@@ -136,7 +184,7 @@ impl TimelineMixer {
 mod tests {
     use super::*;
 
-    /// f32 逐元素容差比较。不用 assert_eq! 精确比:和式(如 1.0+0.1)是否恰好等于
+    /// f32 逐元素容差比较。不用 assert_eq! 精确比:和式(如 0.1+0.1)是否恰好等于
     /// 字面量 1.1f32 取决于舍入,断言不该赌这个。
     fn assert_close(got: &[f32], want: &[f32]) {
         assert_eq!(got.len(), want.len(), "长度不符: got {got:?} want {want:?}");
@@ -149,8 +197,8 @@ mod tests {
     #[test]
     fn equal_rate_sources_sum_pointwise() {
         let mut m = TimelineMixer::new(0); // margin=0 便于逐样本断言
-        assert!(m.accept(MIC, &[1.0, 1.0, 1.0]).is_empty(), "只有一源时水位线为 0,不该定稿");
-        assert_close(&m.accept(SYSTEM, &[0.5, 0.5, 0.5]), &[1.5, 1.5, 1.5]);
+        assert!(m.accept(MIC, &[0.1, 0.1, 0.1]).is_empty(), "只有一源时水位线为 0,不该定稿");
+        assert_close(&m.accept(SYSTEM, &[0.05, 0.05, 0.05]), &[0.15, 0.15, 0.15]);
     }
 
     /// 一源滞后:滞后期间不定稿;补上后按位置对齐,不与更晚的对面窗错配。
@@ -158,11 +206,11 @@ mod tests {
     fn lagging_source_aligns_by_position_not_arrival() {
         let mut m = TimelineMixer::new(0);
         // mic 先跑 4 个样本,system 一个都没来
-        assert!(m.accept(MIC, &[1.0, 2.0, 3.0, 4.0]).is_empty());
+        assert!(m.accept(MIC, &[0.1, 0.2, 0.3, 0.4]).is_empty());
         // system 追上前 2 个 → 只定稿前 2 个位置
-        assert_close(&m.accept(SYSTEM, &[0.1, 0.2]), &[1.1, 2.2]);
+        assert_close(&m.accept(SYSTEM, &[0.01, 0.02]), &[0.11, 0.22]);
         // system 再追 2 个 → 定稿第 3、4 个位置(而非和 mic 后来的样本错配)
-        assert_close(&m.accept(SYSTEM, &[0.3, 0.4]), &[3.3, 4.4]);
+        assert_close(&m.accept(SYSTEM, &[0.03, 0.04]), &[0.33, 0.44]);
     }
 
     /// 两源首帧并非同时出现时,调用方给出的共同时间轴起点必须保留下来。system
@@ -170,10 +218,10 @@ mod tests {
     #[test]
     fn explicit_first_frame_offset_preserves_leading_silence() {
         let mut m = TimelineMixer::new(0);
-        assert!(m.accept_at(MIC, 0, &[1.0, 1.0, 1.0, 1.0]).is_empty());
+        assert!(m.accept_at(MIC, 0, &[0.1, 0.1, 0.1, 0.1]).is_empty());
         assert_close(
-            &m.accept_at(SYSTEM, 2, &[0.5, 0.5]),
-            &[1.0, 1.0, 1.5, 1.5],
+            &m.accept_at(SYSTEM, 2, &[0.05, 0.05]),
+            &[0.1, 0.1, 0.15, 0.15],
         );
     }
 
@@ -182,8 +230,8 @@ mod tests {
     #[test]
     fn silent_fill_does_not_shift_positions() {
         let mut m = TimelineMixer::new(0);
-        assert!(m.accept(MIC, &[0.0, 0.0, 9.0]).is_empty(), "只有一源时水位线为 0,不该定稿");
-        assert_close(&m.accept(SYSTEM, &[1.0, 1.0, 1.0]), &[1.0, 1.0, 10.0]);
+        assert!(m.accept(MIC, &[0.0, 0.0, 0.5]).is_empty(), "只有一源时水位线为 0,不该定稿");
+        assert_close(&m.accept(SYSTEM, &[0.1, 0.1, 0.1]), &[0.1, 0.1, 0.6]);
     }
 
     /// 不等长块 + 交替到达:定稿序列与位置严格对应。
@@ -206,24 +254,45 @@ mod tests {
     #[test]
     fn margin_holds_back_recent_positions() {
         let mut m = TimelineMixer::new(2);
-        m.accept(MIC, &[1.0, 1.0, 1.0, 1.0]);
+        m.accept(MIC, &[0.1, 0.1, 0.1, 0.1]);
         // 两源 min 位置 = 4,减 margin 2 → 只定稿位置 0、1
-        assert_close(&m.accept(SYSTEM, &[1.0, 1.0, 1.0, 1.0]), &[2.0, 2.0]);
+        assert_close(&m.accept(SYSTEM, &[0.1, 0.1, 0.1, 0.1]), &[0.2, 0.2]);
         // finish 把剩下的全部吐出
-        assert_close(&m.finish(), &[2.0, 2.0]);
+        assert_close(&m.finish(), &[0.2, 0.2]);
     }
 
-    /// 核心**不**钳制:溢出交给落盘侧的 f32_to_s16(既有,已 clamp)。
-    /// 混音器是纯加法,钳制是存储层关注点;两处都钳会让核心的单测无法用直观数值断言,
-    /// 也掩盖"两路相加真的触顶了"这一诊断信号。
+    /// 定稿出口过软限幅(issue #124,取代旧的 sum_is_not_clamped_here):
+    /// 拐点以下逐位纯和;超界样本压进 (拐点, 0.1),不再把 >0.1 交给存储层硬削;
+    /// "两路相加真的触顶了"这一诊断信号改由 limit_stats 计数承载。
     #[test]
-    fn sum_is_not_clamped_here() {
+    fn finalized_output_is_soft_limited_with_stats() {
         let mut m = TimelineMixer::new(0);
-        m.accept(MIC, &[0.9, -0.9]);
-        let out = m.accept(SYSTEM, &[0.9, -0.9]);
-        assert_eq!(out.len(), 2);
-        assert!((out[0] - 1.8).abs() < 1e-6, "got {out:?}");
-        assert!((out[1] + 1.8).abs() < 1e-6, "got {out:?}");
+        m.accept(MIC, &[0.4, 0.9, -0.9]);
+        let out = m.accept(SYSTEM, &[0.4, 0.9, -0.9]);
+        assert_eq!(out.len(), 3);
+        // 拐点以下:纯和逐位不变
+        assert!((out[0] - 0.8).abs() < 1e-6, "got {out:?}");
+        // 超界:被压进 (拐点, 1.0),符号保留
+        assert!(out[1] > LIMIT_KNEE && out[1] <= 1.0, "got {out:?}");
+        assert!(out[2] < -LIMIT_KNEE && out[2] >= -1.0, "got {out:?}");
+        let st = m.limit_stats();
+        assert_eq!(st.clipped_samples, 2, "1.8 与 -1.8 都是旧行为下的硬削样本");
+        assert_eq!(st.limited_samples, 2);
+    }
+
+    /// 拐点边缘的单调与连续:略低于拐点原样,略高于拐点被压但仍高于拐点(不回跳)。
+    #[test]
+    fn limiter_is_monotonic_and_continuous_at_knee() {
+        let mut m = TimelineMixer::new(0);
+        let just_below = LIMIT_KNEE - 0.01;
+        let just_above = LIMIT_KNEE + 0.01;
+        m.accept(MIC, &[just_below, just_above]);
+        let out = m.accept(SYSTEM, &[0.0, 0.0]);
+        assert!((out[0] - just_below).abs() < 1e-6, "拐点下不动: {out:?}");
+        assert!(out[1] > LIMIT_KNEE && out[1] < just_above, "拐点上压而不回跳: {out:?}");
+        let st = m.limit_stats();
+        assert_eq!(st.limited_samples, 1);
+        assert_eq!(st.clipped_samples, 0, "未超 1.0 不算旧削波");
     }
 
     /// Critical 回归:`finish()` 之后落后源再 accept 不能 panic。修复前,若某源在
@@ -234,12 +303,12 @@ mod tests {
     #[test]
     fn accept_after_finish_appends_at_tail_without_panicking() {
         let mut m = TimelineMixer::new(0);
-        assert!(m.accept(MIC, &[1.0, 2.0, 3.0]).is_empty(), "system 未喂过,水位线为 0");
-        assert_close(&m.finish(), &[1.0, 2.0, 3.0]);
+        assert!(m.accept(MIC, &[0.1, 0.2, 0.3]).is_empty(), "system 未喂过,水位线为 0");
+        assert_close(&m.finish(), &[0.1, 0.2, 0.3]);
 
         // system 落后 3 个位置迟到:修复前这里必 panic。
-        assert!(m.accept(SYSTEM, &[9.0]).is_empty(), "margin=0 且 mic 未再推进,不会立即定稿");
-        assert_close(&m.finish(), &[9.0]);
+        assert!(m.accept(SYSTEM, &[0.5]).is_empty(), "margin=0 且 mic 未再推进,不会立即定稿");
+        assert_close(&m.finish(), &[0.5]);
     }
 
     /// 空切片不是特殊情况,不该 panic、也不该产生任何定稿输出。

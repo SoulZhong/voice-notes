@@ -125,6 +125,17 @@ pub struct MixInfo {
     /// ——消费端 mixed_untrusted 拿它与源轨全长终点比对,codex P1 修正)。
     /// 未转码时 mixed_untrusted 的时长读数来源。
     pub track_ms: u64,
+    /// 混音和 |x|>1.0 的样本数(issue #124 观测):软限幅接手前注定被硬削的量,
+    /// 即旧行为的削波计数。老记录缺键读 0。
+    #[serde(default, skip_serializing_if = "audio_stat_is_zero")]
+    pub clipped_samples: u64,
+    /// 混音和超过软限幅拐点、被压过的样本数(含上一类)。
+    #[serde(default, skip_serializing_if = "audio_stat_is_zero")]
+    pub limited_samples: u64,
+}
+
+fn audio_stat_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// 墙钟-轨时间轴对账:该轨在本场录制里实际落盘的时长 vs 同一场的墙钟时长。
@@ -1449,6 +1460,8 @@ mod tests {
             origin: "live".into(),
             seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
             track_ms: 5000,
+            clipped_samples: 0,
+            limited_samples: 0,
         };
         set_track_mix(dir.path(), "mixed", mix.clone()).unwrap();
         let meta = load_audio_meta(dir.path());

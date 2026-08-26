@@ -17,6 +17,8 @@ use crate::store::audio::{bytes_to_ms, f32_to_s16, wav_header, HEADER_LEN};
 
 /// 补生成产物的落盘口径:写进 audio.json 的 offset 与 MixInfo.track_ms。
 pub struct RegenOutcome {
+    /// 混音级限幅统计(issue #124),随 MixInfo 落 audio.json。
+    pub limit: crate::audio::timeline_mix::LimitStats,
     pub offset_ms: u64,
     pub track_ms: u64,
 }
@@ -101,7 +103,11 @@ pub fn regen_mixed_to<W: Write + Seek>(
     sink.write_all(&wav_header(u32::try_from(data_len).unwrap_or(u32::MAX)))?;
     sink.seek(SeekFrom::End(0))?;
 
-    Ok(RegenOutcome { offset_ms: origin_ms, track_ms: bytes_to_ms(data_len) })
+    Ok(RegenOutcome {
+        limit: mixer.limit_stats(),
+        offset_ms: origin_ms,
+        track_ms: bytes_to_ms(data_len),
+    })
 }
 
 /// 对一个笔记目录做完整补生成:mmap 两条源轨(wav 优先,仅 m4a 则临时解码)→
@@ -241,6 +247,8 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
             // regen 按 offset_ms 定位,段落 seek 无需修正 ⇒ 空表(见模块头注)
             seek_offset_ms: Default::default(),
             track_ms: outcome.track_ms,
+            clipped_samples: outcome.limit.clipped_samples,
+            limited_samples: outcome.limit.limited_samples,
         },
     )?;
     match crate::store::audio::waveform_from_wav(&dir.join(format!("{MIXED_TRACK}.wav"))) {
@@ -474,6 +482,8 @@ mod tests {
                 origin: "live".into(),
                 seek_offset_ms: Default::default(),
                 track_ms: 999,
+                clipped_samples: 0,
+                limited_samples: 0,
             },
         )
         .unwrap();

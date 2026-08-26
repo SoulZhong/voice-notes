@@ -366,6 +366,10 @@ impl RecordingSink for MixedSink {
                                 origin: "live".into(),
                                 seek_offset_ms,
                                 track_ms,
+                                // 削波观测(issue #124):没有它,削波量只能事后解码
+                                // m4a 反推;先有数据,响度取舍才有依据。
+                                clipped_samples: mixer.limit_stats().clipped_samples,
+                                limited_samples: mixer.limit_stats().limited_samples,
                             },
                         ) {
                             eprintln!("[mix] 完整性标记写入失败(轨内容不受影响): {e}");

@@ -299,6 +299,8 @@ mod tests {
                 origin: origin.into(),
                 seek_offset_ms: Default::default(),
                 track_ms: 61_000, // 偏差 800ms:超 500 严格档,在 2000 放宽档内
+                clipped_samples: 0,
+                limited_samples: 0,
             });
             m
         };
@@ -317,6 +319,8 @@ mod tests {
             origin: "live".into(),
             seek_offset_ms: Default::default(),
             track_ms: 60_400, // 对账值 max(60000, 1200+59000)=60200,差 200ms ≤ 容限
+            clipped_samples: 0,
+            limited_samples: 0,
         });
         assert_eq!(mixed_untrusted(&m), None, "有 MixInfo.track_ms 即可校验通过");
     }
