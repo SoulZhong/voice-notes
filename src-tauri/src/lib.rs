@@ -436,17 +436,25 @@ fn archive_and_clear_finish_stamp(dir: &std::path::Path) -> anyhow::Result<()> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("清收工戳未知失败")))
 }
 
-/// aing_runs.jsonl 追加一条运行事件(best-effort,失败仅出声)。
-fn append_refine_run_log(dir: &std::path::Path, note_id: &str, rec: &serde_json::Value) {
-    match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("aing_runs.jsonl")) {
-        Ok(mut f) => {
+/// aing_runs.jsonl 追加一条运行事件。失败出声并返回 Err,成败由调用方决定要不要
+/// 因此放弃后续动作(收工戳与成败日志的先后契约见 stamp_refine_finished)。
+fn append_refine_run_log(
+    dir: &std::path::Path,
+    note_id: &str,
+    rec: &serde_json::Value,
+) -> std::io::Result<()> {
+    let r = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("aing_runs.jsonl"))
+        .and_then(|mut f| {
             use std::io::Write as _;
-            if let Err(e) = writeln!(f, "{rec}") {
-                eprintln!("refine({note_id}): 运行日志追加失败: {e}");
-            }
-        }
-        Err(e) => eprintln!("refine({note_id}): 运行日志打开失败: {e}"),
+            writeln!(f, "{rec}")
+        });
+    if let Err(e) = &r {
+        eprintln!("refine({note_id}): 运行日志写入失败: {e}");
     }
+    r
 }
 
 /// 收工戳落盘(codex 十六轮):worker 有序退场时调用。
@@ -456,6 +464,14 @@ fn append_refine_run_log(dir: &std::path::Path, note_id: &str, rec: &serde_json:
 /// - 落戳带重试且失败出声:静默丢戳会让自愈把下一次停摆误判成「尾段停摆」。
 fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str) {
     let at = chrono::Local::now().to_rfc3339();
+    // 先落成败日志,后盖收工戳(codex 二十轮):反过来的话,盖完戳、日志没写成
+    // (或进程恰好死在中间),旧 llm=done 稿+新戳会被读成「新近成功收工」——这
+    // 正是日志要消灭的歧义。日志写不进就不盖戳,保持「无戳=没收工」的保守可读。
+    let rec = serde_json::json!({ "event": "finished", "outcome": outcome, "at": at });
+    if append_refine_run_log(dir, note_id, &rec).is_err() {
+        eprintln!("refine({note_id}): 成败日志未落,收工戳弃盖(保守:无戳读作未收工)");
+        return;
+    }
     let mut stamped = false;
     let mut last_err = None;
     for _ in 0..5 {
@@ -482,8 +498,6 @@ fn stamp_refine_finished(dir: &std::path::Path, note_id: &str, outcome: &str) {
             );
         }
     }
-    let rec = serde_json::json!({ "event": "finished", "outcome": outcome, "at": at });
-    append_refine_run_log(dir, note_id, &rec);
 }
 
 fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_local: bool) {
@@ -981,7 +995,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                     // 证据保全优先(codex 十九轮):归档没写成,盘上旧收工戳必须原样
                     // 保留——盖戳会把「上一轮何时收工」的唯一记录冲掉。只记日志。
                     if let Ok(root) = notes_dir(&app) {
-                        append_refine_run_log(
+                        let _ = append_refine_run_log(
                             &root.join(&note_id),
                             &note_id,
                             &serde_json::json!({

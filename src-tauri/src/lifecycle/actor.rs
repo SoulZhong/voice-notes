@@ -520,7 +520,34 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             .map(|lc| lc.is_refining(&id2))
                                             .unwrap_or(false)
                                     };
-                                    match crate::store::heal_stale_refined(&dir, still_stale) {
+                                    // 锁忙重试(codex 二十轮):吊死的 worker 可能正抱着
+                                    // NoteLock,或普通编辑瞬时占锁。只试一次就放弃的话,
+                                    // 停摆标记已摘、时钟已清,再没有下一次体检会回来补
+                                    // 写失败态,盘上状态与 UI 就此永久失和。
+                                    let mut healed =
+                                        crate::store::heal_stale_refined(&dir, still_stale);
+                                    for _ in 0..20 {
+                                        match &healed {
+                                            Ok(act) if act.contains("持锁") => {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_secs(15),
+                                                );
+                                                healed = crate::store::heal_stale_refined(
+                                                    &dir,
+                                                    still_stale,
+                                                );
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    if let Ok(act) = &healed {
+                                        if act.contains("持锁") {
+                                            eprintln!(
+                                                "lifecycle: 停摆自愈({id2})五分钟内锁一直被占,放弃(盘上状态可能未收口)"
+                                            );
+                                        }
+                                    }
+                                    match healed {
                                         Ok(act) => {
                                             eprintln!("lifecycle: 停摆自愈({id2}):{act}");
                                             // 终态广播(codex P2b/九轮):笔记页在
