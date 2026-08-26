@@ -570,12 +570,7 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
     // 前面,不会反过来把刚起跑的替补摘掉。
     // (也兼收 codex P2a:run_local 阶段 refine_status 即有 beat 可探。)
     let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
-    refine_beat_touch(&note_id, beat_gen, "all", "running");
-    lc.report(lifecycle::machine::Msg::RefineProgress {
-        note_id: note_id.clone(),
-        stage: "all".into(),
-        state: "running".into(),
-    });
+    refine_report_fenced(&lc, &note_id, beat_gen, "all", "running");
     // Fix 2(codex 第三轮,A 侧互查闭环——两处必须同步改,另一侧见 do_retranscribe
     // 里 `is_refining(id)` 占槽后复查处的同款注释)。
     //
@@ -628,18 +623,8 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
         // 原 emit("refine",..) 改 report 进 lifecycle 信箱:同一 worker 串行 report +
         // 信箱 FIFO,actor 的 DoEmitRefine 以同种类/载荷/顺序对外发事件,逐位不变。
         let report = |stage: &str, st: &str| {
-            // 代次围栏(codex 二十五轮):被判停摆的前任苏醒后不得再向 lifecycle
-            // 发任何事件——它的终态会让 UI 把还在跑的替补当收场,RefineFinished
-            // 会把替补移出 Aing 集重新放行编辑。
-            if refine_beat_owner(&note_id).is_some_and(|g| g > beat_gen) {
-                return;
-            }
-            refine_beat_touch(&note_id, beat_gen, stage, st); // 心跳表(#173):对外可探的最近进度
-            lc.report(lifecycle::machine::Msg::RefineProgress {
-                note_id: note_id.clone(),
-                stage: stage.into(),
-                state: st.into(),
-            });
+            // 代次围栏+心跳+入队三合一持锁(codex 二十五/三十四轮)
+            refine_report_fenced(&lc, &note_id, beat_gen, stage, st);
         };
         let enqueued = std::cell::Cell::new(false);
         // 全局串行闸:在起 ORT 线程池的重活之前排队,同一时刻只放一篇过。守卫在 catch_unwind
@@ -1214,6 +1199,43 @@ static REFINE_BEAT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 fn refine_beat_gen_next() -> u64 {
     REFINE_BEAT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// 持心跳锁的「查代次+记心跳+入队上报」三合一(codex 三十四轮):与替补的注册
+/// 互斥,诈尸前任的终态事件不可能在替补 all/running 之后入队(FIFO 论证同
+/// RefineDoneOnDrop)。lifecycle 事件一律走这里;纯打点(identify/标题/二遍)仍用
+/// refine_beat_touch。
+fn refine_report_fenced(
+    lc: &lifecycle::LifecycleHandle,
+    note_id: &str,
+    my_gen: u64,
+    stage: &str,
+    state_s: &str,
+) {
+    let mut g = REFINE_BEAT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let m = g.get_or_insert_with(Default::default);
+    if m.get(note_id).is_some_and(|(g0, _, _)| *g0 > my_gen) {
+        return; // 替补已注册:前任连进度都不该再报
+    }
+    m.insert(
+        note_id.to_string(),
+        (my_gen, format!("{stage}/{state_s}"), std::time::Instant::now()),
+    );
+    // 持锁入队:unbounded 不阻塞,actor 不回取本锁,无死锁环。
+    lc.report(lifecycle::machine::Msg::RefineProgress {
+        note_id: note_id.to_string(),
+        stage: stage.into(),
+        state: state_s.into(),
+    });
+}
+
+/// 运行署名 RAII(codex 三十四轮):spawn_blocking 线程会被复用,退役时不清署名,
+/// 后续无关写盘会被记到已收工的那轮头上。
+struct RunTagGuard;
+impl Drop for RunTagGuard {
+    fn drop(&mut self) {
+        CURRENT_REFINE_RUN.with(|c| *c.borrow_mut() = None);
+    }
 }
 
 fn refine_beat_touch(note_id: &str, gen: u64, stage: &str, state_s: &str) {
@@ -3321,20 +3343,14 @@ async fn retry_failed_refine(app: AppHandle, id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let beat_gen = refine_beat_gen_next(); // 本 worker 的心跳代次(codex 四轮)
         set_current_refine_run(beat_gen); // 本线程写盘一律以本代次署名(codex 三十三轮)
+        let _run_tag = RunTagGuard; // spawn_blocking 线程复用,退出必清署名(codex 三十四轮)
         // 收尾(清心跳+RefineFinished)交 RAII(codex 八轮):polish/回调 panic 展开时
         // 手动清理会被跳过,心跳条目从此常驻,refine_status 永远报一个不存在的 worker。
         let _refine_done =
             RefineDoneOnDrop { lc: lc.clone(), note_id: note_id.clone(), beat_gen };
         let report = |stage: &str, state: &str| {
-            if refine_beat_owner(&note_id).is_some_and(|g| g > beat_gen) {
-                return; // 代次围栏,同 spawn_refine(codex 二十五轮)
-            }
-            refine_beat_touch(&note_id, beat_gen, stage, state); // 心跳表(#173):部分重试同样可探
-            lc.report(lifecycle::machine::Msg::RefineProgress {
-                note_id: note_id.clone(),
-                stage: stage.into(),
-                state: state.into(),
-            });
+            // 代次围栏+心跳+入队三合一持锁,同 spawn_refine(codex 三十四轮)
+            refine_report_fenced(&lc, &note_id, beat_gen, stage, state);
         };
         report("all", "running"); // 注册:编辑从此被拒,与整篇 Aing 同一守卫
         // 起跑归档上一轮证据并撕收工戳,理由同 spawn_refine(codex 十一/十二轮);
