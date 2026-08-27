@@ -813,6 +813,10 @@ fn spawn_refine(app: tauri::AppHandle, note_id: String, enqueue_transcode_after_
                 // 材料,清之前先落 aing_runs.jsonl。
                 archive_and_clear_finish_stamp(&dir)
                     .map_err(|e| anyhow::anyhow!("重跑起跑仪式失败(旧收工戳未清,拒绝开跑): {e}"))?;
+                // 预热排干屏障(issue #164):停录即起的自动 Aing 若不等预热 worker,
+                // 短会议(< 攒批阈值)整批还躺在内存里,首次 Aing 拿不到任何缓存。
+                // 有上限等待,超时放弃,绝不让 Aing 卡死在旁路上。
+                pipeline::embed_prewarm::drain(&dir, std::time::Duration::from_secs(30));
                 // 与 get_note 同款只读加载：全部 segments（已按 get_note 语义过滤空白 +
                 // 排序）+ speakers 表。
                 let note = store::NoteStore::new(root).load(&note_id)?;

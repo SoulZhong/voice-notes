@@ -36,22 +36,49 @@ const MAX_DEFERS: u8 = 10;
 /// 停录即起的自动 Aing 会带着这些未缓存段付全款。
 const DEFER_RETRY: Duration = Duration::from_secs(3);
 
-static TX: Mutex<Option<crossbeam_channel::Sender<Job>>> = Mutex::new(None);
+enum Msg {
+    Seg(Job),
+    /// 排干屏障(codex:自动 Aing 不等 worker 就会重算未落盘的批):FIFO 保证
+    /// 在它之前入队的段全部处理完;回执前把该笔记攒着的批与到期推迟项清算落盘。
+    Drain(PathBuf, crossbeam_channel::Sender<()>),
+}
+
+static TX: Mutex<Option<crossbeam_channel::Sender<Msg>>> = Mutex::new(None);
 
 /// 入队一段(actor 管线 Final 落盘成功后调用)。首次调用惰性起 worker 线程。
 /// 队列满即丢:纯缓存,丢了 Aing 时再算,绝不反压录制路径。
 pub fn enqueue(app: &tauri::AppHandle, job: Job) {
     let mut g = TX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tx = g.get_or_insert_with(|| {
-        let (tx, rx) = crossbeam_channel::bounded::<Job>(1024);
+        let (tx, rx) = crossbeam_channel::bounded::<Msg>(1024);
         let app = app.clone();
         std::thread::spawn(move || worker(app, rx));
         tx
     });
-    let _ = tx.try_send(job);
+    let _ = tx.try_send(Msg::Seg(job));
 }
 
-fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Job>) {
+/// 排干一篇笔记的预热在途量(Aing worker 起跑前调用):等 worker 把队列里先于
+/// 屏障的段全部算完、该笔记的攒批落盘。有上限等待,超时即放弃——预热是纯增值,
+/// 绝不让 Aing 卡在它身上;从未起过 worker 直接返回。
+pub fn drain(note_dir: &std::path::Path, timeout: Duration) {
+    let tx = {
+        let g = TX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match g.as_ref() {
+            Some(tx) => tx.clone(),
+            None => return,
+        }
+    };
+    let (rtx, rrx) = crossbeam_channel::bounded(1);
+    if tx.send_timeout(Msg::Drain(note_dir.to_path_buf(), rtx), timeout).is_err() {
+        return; // 队列满到塞不进屏障:放弃排干,Aing 照常现算
+    }
+    if rrx.recv_timeout(timeout).is_err() {
+        eprintln!("预热排干超时(不阻塞 Aing,缺的段现算)");
+    }
+}
+
+fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Msg>) {
     // (模型标签, 嵌入器):标签变了重建。模型加载贵,worker 生命周期内复用。
     let mut embedder: Option<(String, crate::diar::SherpaEmbedder)> = None;
     // 待写批:按 (note_dir, model) 攒;正常一场只有一个键。
@@ -59,19 +86,46 @@ fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Job>) {
     // 音频未落齐推迟重试的段:(job, 已试次数, 到期时刻)。
     let mut deferred: Vec<(Job, u8, std::time::Instant)> = Vec::new();
     loop {
-        let job = match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(j) => Some(j),
+        let msg = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(m) => Some(m),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 flush_all(&mut pending);
                 return;
             }
         };
-        if let Some(job) = job {
-            handle(&app, job, 0, &mut embedder, &mut pending, &mut deferred);
-        } else {
-            // 空闲拍:攒着的批落盘(重试不等这一拍,见下)。
-            flush_all(&mut pending);
+        match msg {
+            Some(Msg::Seg(job)) => {
+                handle(&app, job, 0, &mut embedder, &mut pending, &mut deferred);
+            }
+            Some(Msg::Drain(dir, reply)) => {
+                // 停录后音频已全部落盘:该笔记的推迟项不再等到期,立即清算。
+                let (mine, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut deferred)
+                    .into_iter()
+                    .partition(|(j, _, _)| j.note_dir == dir);
+                deferred = keep;
+                for (job, tries, _) in mine {
+                    handle(&app, job, tries, &mut embedder, &mut pending, &mut deferred);
+                }
+                // 该笔记二次推迟的(音频真缺)不再等:排干语义是"能算的都算完"。
+                deferred.retain(|(j, _, _)| j.note_dir != dir);
+                let keys: Vec<(PathBuf, String)> =
+                    pending.keys().filter(|(d, _)| *d == dir).cloned().collect();
+                for k in keys {
+                    if let Some(entries) = pending.remove(&k) {
+                        if let Err(e) =
+                            crate::store::embed_cache::merge_save(&k.0, &k.1, entries)
+                        {
+                            eprintln!("预热排干落盘失败(缺的段 Aing 现算): {e}");
+                        }
+                    }
+                }
+                let _ = reply.send(());
+            }
+            None => {
+                // 空闲拍:攒着的批落盘(重试不等这一拍,见下)。
+                flush_all(&mut pending);
+            }
         }
         // 每圈处理到期的推迟项(不管这圈是来活还是超时)。
         let now = std::time::Instant::now();
