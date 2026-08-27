@@ -166,6 +166,13 @@ pub fn default_input_is_bluetooth() -> bool {
 /// 查询失败/无候选返回 None——与蓝牙判定同一原则:提示类逻辑宁可放弃不可误挡。
 #[cfg(target_os = "macos")]
 pub fn pick_non_bluetooth_input() -> Option<String> {
+    pick_non_bluetooth_input_device().map(|(_, n)| n)
+}
+
+/// 同上,但连 AudioDeviceID 一起返回:VPIO 路径注入设备属性要的是 ID 不是名字
+/// (issue #165;cpal 路径按名字绑定,两个调用方各取所需)。
+#[cfg(target_os = "macos")]
+pub fn pick_non_bluetooth_input_device() -> Option<(u32, String)> {
     use coreaudio::sys::*;
     unsafe {
         let addr = AudioObjectPropertyAddress {
@@ -230,7 +237,7 @@ pub fn pick_non_bluetooth_input() -> Option<String> {
             ok.then(|| std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
                 .filter(|s| !s.is_empty())
         };
-        let mut best: Option<(u32, String)> = None; // (rank: 0=内置 1=其它, name)
+        let mut best: Option<(u32, AudioDeviceID, String)> = None; // (rank: 0=内置 1=其它, id, name)
         for dev in ids {
             if input_channels(dev) == 0 {
                 continue;
@@ -245,15 +252,15 @@ pub fn pick_non_bluetooth_input() -> Option<String> {
             }
             let Some(name) = dev_name(dev) else { continue };
             let rank = if t == kAudioDeviceTransportTypeBuiltIn { 0 } else { 1 };
-            if best.as_ref().map_or(true, |(r, _)| rank < *r) {
+            if best.as_ref().map_or(true, |(r, _, _)| rank < *r) {
                 let done = rank == 0;
-                best = Some((rank, name));
+                best = Some((rank, dev, name));
                 if done {
                     break;
                 }
             }
         }
-        best.map(|(_, n)| n)
+        best.map(|(_, id, n)| (id, n))
     }
 }
 

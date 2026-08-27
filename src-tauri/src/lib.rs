@@ -1875,18 +1875,18 @@ fn spawn_session(
         // 不影响会议软件)。设置开关 auto_input_pick 可关;VPIO 逃生舱路径不覆盖
         // (它由 Apple 通话链路自行管理设备)。
         #[cfg(target_os = "macos")]
-        let input_override: Option<String> = if cfg.auto_input_pick
-            && (use_aec_capture || calibration)
-            && audio::default_input_is_bluetooth()
-        {
-            let picked = audio::pick_non_bluetooth_input();
-            if let Some(name) = &picked {
-                eprintln!("录前择优:默认输入是蓝牙通话麦,本场改用「{name}」采集");
-            }
-            picked
-        } else {
-            None
-        };
+        let picked_input: Option<(u32, String)> =
+            if cfg.auto_input_pick && audio::default_input_is_bluetooth() {
+                let picked = audio::pick_non_bluetooth_input_device();
+                if let Some((_, name)) = &picked {
+                    eprintln!("录前择优:默认输入是蓝牙通话麦,本场改用「{name}」采集");
+                }
+                picked
+            } else {
+                None
+            };
+        #[cfg(target_os = "macos")]
+        let input_override: Option<String> = picked_input.as_ref().map(|(_, n)| n.clone());
         #[cfg(target_os = "macos")]
         let input_override_for_session = input_override.clone().unwrap_or_default();
         #[cfg(not(target_os = "macos"))]
@@ -1907,11 +1907,18 @@ fn spawn_session(
                 )
             })
         } else {
-            Box::new(|| {
+            let picked_for_vpio = picked_input.clone();
+            Box::new(move || {
                 // VPIO 无运行期错误回调:事件通道空置(发送端即弃),
                 // 死亡由 Tap 帧荒检测兜底。
                 let (_etx, erx) = crossbeam_channel::unbounded::<audio::CaptureEvent>();
-                (Box::new(audio::vpio::VpioMicrophone::new()) as Box<dyn AudioCapture>, erx)
+                // 录前择优对 VPIO 同样生效(issue #165):经 CurrentDevice 属性注入,
+                // 注入失败 vpio.rs 内降级默认设备,再失败整体回退 cpal,不挡录制。
+                (
+                    Box::new(audio::vpio::VpioMicrophone::with_device(picked_for_vpio.clone()))
+                        as Box<dyn AudioCapture>,
+                    erx,
+                )
             })
         };
         #[cfg(not(target_os = "macos"))]
