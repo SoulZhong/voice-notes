@@ -937,6 +937,14 @@
       </div>
     {/if}
 
+    <!-- Windows loopback 盲区声明(issue #125):放在风暴横幅同一位置——用户会在
+         这里期待 system 告警,必须在同处说明本轨给不出告警。info 级不打扰。 -->
+    {#if gapStorm.systemUnmonitored && !isSystemDenied && !isSystemUnavailable}
+      <div class="banner info">
+        {t("record.banner.systemUnmonitored")}
+      </div>
+    {/if}
+
     {#if micModeBad && !isSystemDenied && !isSystemUnavailable}
       <div class="banner">
         {t("record.banner.micIsolation")}

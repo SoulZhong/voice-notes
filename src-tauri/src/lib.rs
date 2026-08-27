@@ -2176,10 +2176,20 @@ fn spawn_session(
             // 已知盲区显式化(issue #125,方案 3):loopback 无硬件时戳
             // (host_time_ns=None),断流风暴检测的判据(hw_gap_ms)在本轨永远
             // 不增长——system 轨「该响没响」类丢失不会有风暴横幅。真修需要
-            // IAudioClock/会话活跃探测,须真机验证;在有 Windows 实测样本之前,
-            // 以此日志声明边界,排障时先看到它再看别的。
+            // IAudioClock/会话活跃探测,须真机验证。在此之前把边界说给用户看
+            // (codex 复审:光 stderr 不算 UI):走风暴同一条 source_health 通道
+            // 发 unmonitored 态,录制页在用户本会依赖风暴横幅的位置渲染一行
+            // info 提示——「没有 system 告警」不再被误读为「system 轨健康」。
             eprintln!(
                 "[采集] Windows system 轨(loopback)无硬件时戳,断流风暴检测不覆盖本轨(issue #125)"
+            );
+            let _ = app.emit(
+                "source_health",
+                ipc::SourceHealthEvent {
+                    source: "system".into(),
+                    state: "unmonitored".into(),
+                    gap_pct: None,
+                },
             );
             match new_silero(&vad_path) {
                 Ok(sys_seg) => {

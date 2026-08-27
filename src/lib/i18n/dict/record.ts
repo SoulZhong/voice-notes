@@ -37,6 +37,8 @@ export const zh = {
     "麦克风正在频繁断流：近一分钟有 {pct}% 的时长没有收到音频，这段内容是真的丢了(时间轴已按静音补齐)。",
   "record.banner.gapStormHow": "多见于蓝牙耳机麦克风与会议软件抢带宽。改法：麦克风换成内置麦或有线设备，蓝牙耳机只用来听。",
   "record.banner.gapStormSystem": "系统声音采集正在频繁断流：近一分钟有 {pct}% 的时长没有收到音频。对方说的话可能有缺失。",
+  "record.banner.systemUnmonitored":
+    "本平台无法自动检测系统声音断流：若对方声音有缺失，本页不会出现告警。",
   "record.risk.title": "这样录会丢内容",
   "record.inputAutoPicked": "蓝牙耳机的麦克风容易断流,本场已自动改用「{device}」录音;耳机继续用来听。想关掉自动切换,去设置。",
   "record.scene.speakerEcho": "像是外放开会:对方的声音会从扬声器进到麦克风,已在消回声;戴耳机效果最好。",
@@ -133,6 +135,8 @@ export const en = {
     "Usually a Bluetooth headset mic competing with the meeting app for bandwidth. Fix: switch the microphone to the built-in or a wired one, and use the headset for playback only.",
   "record.banner.gapStormSystem":
     "System audio capture keeps dropping out: {pct}% of the last minute arrived with no audio. Parts of what the other side said may be missing.",
+  "record.banner.systemUnmonitored":
+    "System-audio dropouts cannot be detected on this platform: if the other side's audio goes missing, no warning will appear here.",
   "record.risk.title": "This recording will lose content",
   "record.inputAutoPicked": "Bluetooth headset mics drop audio; this session automatically records with \u201c{device}\u201d instead. Your headset still plays audio. Disable auto-switch in Settings.",
   "record.scene.speakerEcho": "Sounds like speaker playback: the other side leaks into your mic. Echo cancellation is on; headphones work best.",
