@@ -839,7 +839,13 @@ impl NoteStore {
         let _guard = edit_guard();
         let dir = self.note_dir(id)?;
         let _flock = write_lock(&dir)?;
-        let existing = read_suppressions(&dir);
+        Self::suppress_segments_locked(&dir, seqs, reason)
+    }
+
+    /// 已持 edit_guard+write_lock 的内核(fold 全程持锁复用;guard 不可重入,
+    /// 公开入口与 fold 各拿一次,绝不嵌套)。
+    fn suppress_segments_locked(dir: &Path, seqs: &[u64], reason: &str) -> anyhow::Result<usize> {
+        let existing = read_suppressions(dir);
         let fresh: Vec<u64> = seqs.iter().copied().filter(|q| !existing.contains(q)).collect();
         if fresh.is_empty() {
             return Ok(0);
@@ -896,6 +902,14 @@ impl NoteStore {
         }
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &path)?;
+        drop(_flock);
+        // 展开改变可见原始集合(codex 四轮,与折叠对称):已有修订稿的场不标 stale,
+        // 默认视图仍缺刚恢复的段、横幅又没了,动作看着无效。
+        if crate::store::aing_exists(&dir) {
+            if let Err(e) = crate::store::mark_refined_stale(&dir) {
+                eprintln!("展开:修订稿标 stale 失败(视图可能暂缺恢复段): {e}");
+            }
+        }
         Ok(removed)
     }
 
@@ -909,12 +923,26 @@ impl NoteStore {
         if sc.final_scene != crate::scene::SC_DUAL_PATH {
             return Ok(0);
         }
-        let note = self.load(id)?; // 已应用既有抑制:与前端可见集合一致
-        let picks = crate::scene::overlapped_mic_seqs(&note.segments);
-        if picks.is_empty() {
-            return Ok(0);
-        }
-        let n = self.suppress_segments(id, &picks, "scene_dual_path")?;
+        // 选段与写入同一把锁(codex 四轮):另一实例/重转写在 load 与写入之间整表
+        // 换 seq 时,旧号写进新表会把无关段藏掉。锁下现读现算,load 缓存不参与。
+        let n = {
+            let _guard = edit_guard();
+            let _flock = write_lock(&dir)?;
+            let suppressed = read_suppressions(&dir);
+            let segs: Vec<SegmentRecord> = read_jsonl_lines(&dir.join("segments.jsonl"))
+                .into_iter()
+                .filter_map(|l| match l {
+                    JsonlLine::Seg(r) if !suppressed.contains(&r.seq) => Some(r),
+                    _ => None,
+                })
+                .filter(|r| !r.text.trim().is_empty())
+                .collect();
+            let picks = crate::scene::overlapped_mic_seqs(&segs);
+            if picks.is_empty() {
+                return Ok(0);
+            }
+            Self::suppress_segments_locked(&dir, &picks, "scene_dual_path")?
+        };
         // 历史/回填场折叠(codex):盘上已有修订稿时,精修段落仍引用刚被折叠的
         // 段——默认视图会继续放回声,横幅却说折叠了。整份标 stale,UI 走既有的
         // 「修订稿已过期,重新 Aing」提示。停录自动折叠路径此时还没有 aing.json,
