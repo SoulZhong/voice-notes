@@ -16,7 +16,16 @@ fn main() -> anyhow::Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dry-run" => dry = true,
-            "--since" => since = args.next().unwrap_or_default().replace('-', ""),
+            "--since" => {
+                // 必须带合法 YYYY-MM-DD(codex P1):缺值时空串会静默关掉过滤,
+                // 非 dry-run 下等于全量折叠。
+                let v = args.next().ok_or_else(|| anyhow::anyhow!("--since 需要 YYYY-MM-DD"))?;
+                anyhow::ensure!(
+                    v.len() == 10 && v.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() }),
+                    "--since 格式须为 YYYY-MM-DD,得到「{v}」"
+                );
+                since = v.replace('-', "");
+            }
             other => anyhow::bail!("未知参数: {other}"),
         }
     }
@@ -27,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     ids.sort();
-    let (mut scanned, mut folded_notes, mut folded_segs, mut busy) = (0, 0, 0usize, 0);
+    let (mut scanned, mut folded_notes, mut folded_segs, mut busy, mut failed) = (0, 0, 0usize, 0, 0);
     for id in ids {
         if !since.is_empty() && id.as_str() < since.as_str() {
             continue;
@@ -60,9 +69,16 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{id}: 笔记被占用,跳过");
                 busy += 1;
             }
-            Err(e) => eprintln!("{id}: 失败 {e}"),
+            Err(e) => {
+                eprintln!("{id}: 失败 {e}");
+                failed += 1;
+            }
         }
     }
-    println!("dual_path 场次 {scanned};折叠 {folded_notes} 场共 {folded_segs} 段;忙跳过 {busy}");
+    println!(
+        "dual_path 场次 {scanned};折叠 {folded_notes} 场共 {folded_segs} 段;忙跳过 {busy};失败 {failed}"
+    );
+    // 非锁忙的失败要以非零退出码上报(codex P2):脚本化跑批不能把部分完成当成功。
+    anyhow::ensure!(failed == 0, "{failed} 篇折叠失败,见上方日志");
     Ok(())
 }
