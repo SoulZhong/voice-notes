@@ -432,6 +432,13 @@ impl TapNotify {
 ///
 /// 为什么包装而不是改 start_session:平台策略(fill_after 阈值)与健康暴露属于
 /// 装配层关心的事,session 层保持平台无关;且既有 Mock 流测试不被填充语义波及。
+/// 收尾 join 采集/tap 线程的等待上限(issue #182)。测试档缩短:回归测试要验证
+/// 「卡死线程不拖死 stop」,不该真等 5 秒。
+#[cfg(not(test))]
+const TAP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const TAP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct TappedCapture {
     inner: Box<dyn AudioCapture>,
     source: Source,
@@ -523,7 +530,28 @@ impl AudioCapture for TappedCapture {
             .cap_dropped_samples
             .store(self.inner.dropped_samples(), Ordering::Relaxed);
         if let Some(t) = self.tap.take() {
-            let _ = t.join();
+            // 有界 join(issue #182,2026-08-27 实测事故):采集线程被设备卡死
+            // (蓝牙麦断流风暴)时不会丢它的发送端,tap 的 recv 永不返回,这里
+            // 无界 join 会把 lifecycle actor 连同整个应用一起冻死——用户当时
+            // 正点「确认删除 322 段」,只能强杀进程。超时即放弃:泄漏一条
+            // 阻塞线程(连同下面的陪跑 join 线程),换收尾继续走、应用可用;
+            // 音频/转写本就已增量落盘,不因放弃 join 少一个字节。
+            let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+            let source = self.source;
+            std::thread::spawn(move || {
+                let _ = t.join();
+                let _ = done_tx.send(());
+            });
+            if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
+                eprintln!(
+                    "[采集] {} tap 线程 5s 未退出(采集线程疑似卡死在设备调用),放弃等待继续收尾;                     线程泄漏,建议尽快重启应用并改用内置麦克风",
+                    source.as_str()
+                );
+                crate::telemetry::report_error(
+                    crate::telemetry::ErrorKind::CaptureTeardown,
+                    &format!("{} 采集/tap 线程收尾 join 超时,已放弃(线程泄漏)", source.as_str()),
+                );
+            }
         }
     }
 
@@ -1505,6 +1533,45 @@ mod tests {
             health.snapshot(Source::Mic).cap_dropped_samples,
             1234,
             "快照要带上它,audio.json 才写得出去"
+        );
+    }
+
+    /// 卡死采集线程不拖死 stop(issue #182 回归):后端把 sink 发送端泄漏给一条
+    /// 永不退出的线程(模拟设备卡死的采集回调持有者),tap 的 recv 永不返回——
+    /// stop() 必须在有界超时后放弃 join 返回,而不是把调用方(lifecycle actor,
+    /// 事故当天连带整个应用)冻死。
+    #[test]
+    fn stop_returns_despite_wedged_capture_thread() {
+        struct WedgedCapture;
+        impl crate::audio::AudioCapture for WedgedCapture {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                // 模拟卡死:发送端交给一条永远睡着的线程,通道永不关闭。
+                std::thread::spawn(move || {
+                    let _keep = sink;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                });
+                Ok(())
+            }
+            fn stop(&mut self) {} // 停不动:真设备卡死时 stop 信号也救不了回调线程
+        }
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(WedgedCapture),
+            Source::Mic,
+            fast_policy(),
+            health,
+            TapNotify::none(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        let begin = std::time::Instant::now();
+        cap.stop();
+        let took = begin.elapsed();
+        assert!(
+            took < TAP_JOIN_TIMEOUT * 5,
+            "stop 应在超时档附近返回,实际等了 {took:?}"
         );
     }
 
