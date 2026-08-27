@@ -202,6 +202,14 @@ fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), 
             if refining_ids.iter().any(|r| r == &id) {
                 return Err("该笔记正在 Aing,请稍后再试".to_string());
             }
+            // 重转写同样拒(codex 三轮):提交会整表换 seq 并删抑制表——先折叠
+            // 后被整替,成功回执成了谎话;worker 已持锁时这里也只会忙碌失败。
+            {
+                let st = app.state::<crate::AppState>();
+                if crate::retranscribing_blocks_refine(&st.retranscribing, &id) {
+                    return Err("该笔记正在重转写,请稍后再试".to_string());
+                }
+            }
             store.fold_dual_path_echo(&id).map(|_| ()).map_err(|e| e.to_string())
         }
         EditOp::SetSegmentsSpeaker { id, moves, speaker_id } => store

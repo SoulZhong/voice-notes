@@ -914,7 +914,17 @@ impl NoteStore {
         if picks.is_empty() {
             return Ok(0);
         }
-        self.suppress_segments(id, &picks, "scene_dual_path")
+        let n = self.suppress_segments(id, &picks, "scene_dual_path")?;
+        // 历史/回填场折叠(codex):盘上已有修订稿时,精修段落仍引用刚被折叠的
+        // 段——默认视图会继续放回声,横幅却说折叠了。整份标 stale,UI 走既有的
+        // 「修订稿已过期,重新 Aing」提示。停录自动折叠路径此时还没有 aing.json,
+        // 天然不进这支。(suppress 的 flock 已释放,mark 内部自取 NoteLock 不撞。)
+        if n > 0 && crate::store::aing_exists(&dir) {
+            if let Err(e) = crate::store::mark_refined_stale(&dir) {
+                eprintln!("scene 折叠:修订稿标 stale 失败(视图可能暂含回声段): {e}");
+            }
+        }
+        Ok(n)
     }
 }
 
