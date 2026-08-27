@@ -432,6 +432,13 @@ impl TapNotify {
 ///
 /// 为什么包装而不是改 start_session:平台策略(fill_after 阈值)与健康暴露属于
 /// 装配层关心的事,session 层保持平台无关;且既有 Mock 流测试不被填充语义波及。
+/// 收尾 join 采集/tap 线程的等待上限(issue #182)。测试档缩短:回归测试要验证
+/// 「卡死线程不拖死 stop」,不该真等 5 秒。
+#[cfg(not(test))]
+const TAP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const TAP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct TappedCapture {
     inner: Box<dyn AudioCapture>,
     source: Source,
@@ -440,6 +447,9 @@ pub struct TappedCapture {
     /// start 时取走(TapNotify 非 Clone);重复 start 本仓不存在,取空则退化为无通知。
     notify: Option<TapNotify>,
     tap: Option<std::thread::JoinHandle<()>>,
+    /// 收尾取消旗(issue #182):采集线程卡死不丢发送端时,tap 靠它自行退出并
+    /// 放掉下游发送端,segment worker 才解得开。
+    tap_cancel: Arc<std::sync::atomic::AtomicBool>,
     timeline_origin: Arc<OnceLock<Instant>>,
     /// 时钟漂移监视器(Task 5 接线);None = 不采样(未启用/未装配)。
     drift: Option<Arc<DriftMonitor>>,
@@ -479,6 +489,7 @@ impl TappedCapture {
             health,
             notify: Some(notify),
             tap: None,
+            tap_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             timeline_origin,
             drift: None,
         }
@@ -500,8 +511,9 @@ impl AudioCapture for TappedCapture {
         let notify = self.notify.take().unwrap_or_else(TapNotify::none);
         let timeline_origin = self.timeline_origin.clone();
         let drift = self.drift.clone();
+        let cancel = self.tap_cancel.clone();
         self.tap = Some(std::thread::spawn(move || {
-            run_frame_tap_with_drift(
+            run_frame_tap_cancellable(
                 source,
                 cap_rx,
                 sink,
@@ -510,6 +522,7 @@ impl AudioCapture for TappedCapture {
                 notify,
                 timeline_origin,
                 drift,
+                cancel,
             )
         }));
         self.inner.start(cap_tx)
@@ -523,7 +536,57 @@ impl AudioCapture for TappedCapture {
             .cap_dropped_samples
             .store(self.inner.dropped_samples(), Ordering::Relaxed);
         if let Some(t) = self.tap.take() {
-            let _ = t.join();
+            // 有界收尾(issue #182,2026-08-27 实测事故 + codex P1 收口):采集线程
+            // 被设备卡死(蓝牙麦断流风暴)时不会丢它的发送端,tap 的 recv 永不因
+            // 通道关闭返回——旧的无界 join 把 lifecycle actor 连同整个应用冻死
+            // (用户正点「确认删除 322 段」,只能强杀)。
+            // 光放弃 join 还不够(codex):tap 手里攥着下游发送端,segment worker
+            // 的 frame_rx.iter() 照样收不了尾,冻结只是挪后一站。所以先升取消旗
+            // ——tap 的 recv_timeout 每个 tick 都会醒,见旗即退,**自然 drop 下游
+            // 发送端**,worker 随之解锁;然后再有界等它退场。超时(旗都救不了,
+            // 说明 tap 卡在 send 上等一个满且无人消费的通道,理论罕见)才放弃,
+            // 泄漏换可用;音频/转写本就增量落盘,不因放弃少一个字节。
+            // 两阶段(codex 二轮 P1):取消旗只留给卡死路径。健康收尾靠上游断开
+            // ——tap 会先排干队列里最多 256 帧再退,立即升旗会把这些帧无声扔掉。
+            // 阶段一:无旗有界等(健康路径在此返回,语义与旧无界 join 完全一致);
+            // 阶段二:超时说明采集线程攥着发送端没死透,升旗让 tap 弃排干自退
+            // (此时上游本就不再产真实帧,弃掉的至多是设备卡死前的残留);
+            // 仍超时(tap 卡在满通道 send 等罕见形态)才放弃泄漏。
+            let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+            let source = self.source;
+            std::thread::spawn(move || {
+                let _ = t.join();
+                let _ = done_tx.send(());
+            });
+            if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
+                // 第一超时就是事故本体(codex 三轮):采集后端攥着发送端没退,
+                // 它那条线程已经泄漏——取消旗随后多半能让 tap 体面退场,但
+                // 遥测/告警必须记在这里,否则最典型的卡死(本 issue 的蓝牙麦
+                // 现场)反而无声无息。
+                let hint = match source {
+                    crate::audio::Source::Mic => "建议尽快重启应用并改用内置麦克风",
+                    _ => "建议尽快重启应用",
+                };
+                eprintln!(
+                    "[采集] {} 采集线程收尾超时(疑似卡死在设备调用,线程泄漏),已升取消旗让 tap 退场;{hint}",
+                    source.as_str()
+                );
+                crate::telemetry::report_error(
+                    crate::telemetry::ErrorKind::CaptureTeardown,
+                    &format!("{} 采集线程收尾超时(后端线程泄漏),升旗自愈", source.as_str()),
+                );
+                self.tap_cancel.store(true, std::sync::atomic::Ordering::Release);
+                if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
+                    eprintln!(
+                        "[采集] {} tap 线程也未退出(取消旗未生效,罕见:疑似卡在满通道 send),放弃等待继续收尾",
+                        source.as_str()
+                    );
+                    crate::telemetry::report_error(
+                        crate::telemetry::ErrorKind::CaptureTeardown,
+                        &format!("{} tap 线程取消旗后仍未退出,已放弃(双线程泄漏)", source.as_str()),
+                    );
+                }
+            }
         }
     }
 
@@ -556,6 +619,33 @@ pub fn run_frame_tap(
     )
 }
 
+/// 可取消版本(issue #182):cancel 升起后在下一个 tick 退出,自然 drop to_worker,
+/// 下游 segment worker 才收得了尾。除取消检查外与 run_frame_tap_with_drift 同义。
+#[allow(clippy::too_many_arguments)]
+fn run_frame_tap_cancellable(
+    source: Source,
+    from_capture: Receiver<AudioFrame>,
+    to_worker: Sender<AudioFrame>,
+    health: Arc<SourceHealth>,
+    policy: TapPolicy,
+    notify: TapNotify,
+    timeline_origin: Arc<OnceLock<Instant>>,
+    drift: Option<Arc<DriftMonitor>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    run_frame_tap_inner(
+        source,
+        from_capture,
+        to_worker,
+        health,
+        policy,
+        notify,
+        timeline_origin,
+        drift,
+        Some(cancel),
+    )
+}
+
 fn run_frame_tap_with_drift(
     _source: Source,
     from_capture: Receiver<AudioFrame>,
@@ -565,6 +655,31 @@ fn run_frame_tap_with_drift(
     notify: TapNotify,
     timeline_origin: Arc<OnceLock<Instant>>,
     drift: Option<Arc<DriftMonitor>>,
+) {
+    run_frame_tap_inner(
+        _source,
+        from_capture,
+        to_worker,
+        health,
+        policy,
+        notify,
+        timeline_origin,
+        drift,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_frame_tap_inner(
+    _source: Source,
+    from_capture: Receiver<AudioFrame>,
+    to_worker: Sender<AudioFrame>,
+    health: Arc<SourceHealth>,
+    policy: TapPolicy,
+    notify: TapNotify,
+    timeline_origin: Arc<OnceLock<Instant>>,
+    drift: Option<Arc<DriftMonitor>>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     // 最近一次真实帧的格式:没收到过帧就不填充(源可能根本没起来,
     // 填零会凭空造出一条空白轨)。
@@ -678,6 +793,11 @@ fn run_frame_tap_with_drift(
                 }
             }
             None => {}
+        }
+        // 取消旗(issue #182):正常收尾靠上游关通道;采集线程卡死不放发送端时,
+        // 这面旗是唯一退出通路——退出即 drop to_worker,下游 worker 解锁。
+        if cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            return;
         }
         match from_capture.recv_timeout(policy.tick) {
             Ok(mut frame) => {
@@ -1506,6 +1626,100 @@ mod tests {
             1234,
             "快照要带上它,audio.json 才写得出去"
         );
+    }
+
+    /// 健康收尾不丢队列帧(codex 二轮 P1 回归):stop 时上游正常断开,tap 必须
+    /// 先排干在途帧再退——取消旗若抢在排干前生效,最多 256 帧会无声消失。
+    #[test]
+    fn healthy_stop_drains_queued_frames() {
+        struct BurstCapture;
+        impl crate::audio::AudioCapture for BurstCapture {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                for i in 0..40 {
+                    let _ = sink.send(AudioFrame {
+                        samples: vec![i as f32; 160],
+                        sample_rate: 16000,
+                        channels: 1,
+                        host_time_ns: None,
+                        synthetic: false,
+                    });
+                }
+                Ok(()) // start 返回即全部帧已在途;sink 随 self 一起活到 stop
+            }
+            fn stop(&mut self) {}
+        }
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(BurstCapture),
+            Source::Mic,
+            fast_policy(),
+            health,
+            TapNotify::none(),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        cap.stop(); // BurstCapture 无后台线程,start 后发送端仅存于…无处:已 drop → 上游断开
+        let mut got = 0;
+        while let Ok(f) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            if f.samples.first().copied().unwrap_or(-1.0) >= 0.0 {
+                got += 1;
+            }
+        }
+        assert_eq!(got, 40, "stop 前已在途的帧一帧不许丢");
+    }
+
+    /// 卡死采集线程不拖死 stop(issue #182 回归):后端把 sink 发送端泄漏给一条
+    /// 永不退出的线程(模拟设备卡死的采集回调持有者),tap 的 recv 永不返回——
+    /// stop() 必须在有界超时后放弃 join 返回,而不是把调用方(lifecycle actor,
+    /// 事故当天连带整个应用)冻死。
+    #[test]
+    fn stop_returns_despite_wedged_capture_thread() {
+        struct WedgedCapture;
+        impl crate::audio::AudioCapture for WedgedCapture {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                // 模拟卡死:发送端交给一条永远睡着的线程,通道永不关闭。
+                std::thread::spawn(move || {
+                    let _keep = sink;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                });
+                Ok(())
+            }
+            fn stop(&mut self) {} // 停不动:真设备卡死时 stop 信号也救不了回调线程
+        }
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(WedgedCapture),
+            Source::Mic,
+            fast_policy(),
+            health,
+            TapNotify::none(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        let begin = std::time::Instant::now();
+        cap.stop();
+        let took = begin.elapsed();
+        assert!(
+            took < TAP_JOIN_TIMEOUT * 5,
+            "stop 应在超时档附近返回,实际等了 {took:?}"
+        );
+        // codex P1 的核心:stop 返回还不够,tap 必须已放掉下游发送端——
+        // segment worker 的 frame_rx.iter() 靠通道关闭收尾,发送端不放它就冻着。
+        let deadline = std::time::Instant::now() + TAP_JOIN_TIMEOUT * 5;
+        loop {
+            match _rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Ok(_) => {} // 排掉退场前可能填充的静音帧
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "下游通道迟迟不关闭:tap 没放发送端,worker 仍会冻死"
+                    );
+                }
+            }
+        }
     }
 
     /// 默认实现返回 0:不丢样(或不统计)的后端不该被记上莫须有的丢样。

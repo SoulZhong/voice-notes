@@ -830,6 +830,9 @@ pub enum ErrorKind {
     /// 采集断连自愈:重建成功(recovered)与放弃(lost)都算。同 RefineStaleHeal 的道理
     /// ——兜住不等于没发生,它触发一次就说明这台机器上的采集链断过。
     CaptureRebuild,
+    /// 停录收尾时采集线程 join 超时被放弃(issue #182):线程泄漏换全应用不冻结。
+    /// 一响就说明这台机器的采集线程曾卡死在设备调用里(实测:蓝牙麦断流风暴)。
+    CaptureTeardown,
     /// 模型加载失败(ASR/声纹)。与 AsrEngine 分开:加载失败是装机期问题,
     /// 引擎异常是运行期问题,合成一档会把两类完全不同的故障混进同一个 issue。
     ModelLoad,
@@ -853,6 +856,7 @@ impl ErrorKind {
             ErrorKind::McpDispatch => "mcp_dispatch",
             ErrorKind::RefineStaleHeal => "refine_stale_heal",
             ErrorKind::CaptureRebuild => "capture_rebuild",
+            ErrorKind::CaptureTeardown => "capture_teardown",
             ErrorKind::ModelLoad => "model_load",
             ErrorKind::AiApplyWrite => "ai_apply_write",
             ErrorKind::Migration => "migration",
