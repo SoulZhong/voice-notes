@@ -8307,13 +8307,13 @@ fn delete_segments(
 /// 与停录自动折叠同一实现(scene 终判 dual_path 才动作,幂等);Aing 中拒绝
 /// (折叠改变可见集合,管线整写会拿到折叠前后不一致的输入)。
 #[tauri::command]
-fn fold_scene_echo(app: AppHandle, state: State<AppState>, note_id: String) -> Result<usize, String> {
+fn fold_scene_echo(app: AppHandle, state: State<AppState>, note_id: String) -> Result<(), String> {
     reject_if_active(&state, &note_id)?;
-    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
-        return Err(tr!("该笔记正在 Aing,请稍后再试", "This note is being refined by AI; try again later"));
-    }
-    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
-    store::NoteStore::new(dir).fold_dual_path_echo(&note_id).map_err(|e| e.to_string())
+    // Aing 判定在 actor 串行流里做(EditOp::FoldSceneEcho,codex:命令线程
+    // check-then-act 与 refine 准入有竞态窗口;同信箱 FIFO 才是真值)。
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::FoldSceneEcho { id: note_id },
+    })
 }
 
 /// 恢复被折叠的段(场景二期,issue #162):自动折叠的回声段/任何被抑制段回到

@@ -867,7 +867,13 @@ impl NoteStore {
         let dir = self.note_dir(id)?;
         let _flock = write_lock(&dir)?;
         let path = dir.join(SEGMENT_SUPPRESSIONS_FILE);
-        let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(0) };
+        // 只有「文件不存在」算空表;读失败(权限/IO/非 UTF-8)必须报错——静默
+        // Ok(0) 会让「展开全部」显示成功而段永远藏着(codex)。
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(anyhow::anyhow!("抑制表读取失败: {e}")),
+        };
         let gone: std::collections::BTreeSet<u64> = seqs.iter().copied().collect();
         let mut removed = 0usize;
         let kept: Vec<&str> = raw

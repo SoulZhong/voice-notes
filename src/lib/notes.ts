@@ -494,7 +494,7 @@ export const deleteSegments = (noteId: string, moves: [number, string][]) =>
 export const restoreSuppressedSegments = (noteId: string, seqs: number[]) =>
   invoke<void>("restore_suppressed_segments", { noteId, seqs });
 /** 手动触发同源双路折叠(与停录自动折叠同实现,幂等);返回折叠段数。 */
-export const foldSceneEcho = (noteId: string) => invoke<number>("fold_scene_echo", { noteId });
+export const foldSceneEcho = (noteId: string) => invoke<void>("fold_scene_echo", { noteId });
 
 /** 说话人 id 排序：S2 < S10（数值序）；非 S<n> 形态沉底按字典序。 */
 export function speakerIdCompare(a: string, b: string): number {
