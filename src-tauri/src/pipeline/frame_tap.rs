@@ -546,7 +546,12 @@ impl AudioCapture for TappedCapture {
             // 发送端**,worker 随之解锁;然后再有界等它退场。超时(旗都救不了,
             // 说明 tap 卡在 send 上等一个满且无人消费的通道,理论罕见)才放弃,
             // 泄漏换可用;音频/转写本就增量落盘,不因放弃少一个字节。
-            self.tap_cancel.store(true, std::sync::atomic::Ordering::Release);
+            // 两阶段(codex 二轮 P1):取消旗只留给卡死路径。健康收尾靠上游断开
+            // ——tap 会先排干队列里最多 256 帧再退,立即升旗会把这些帧无声扔掉。
+            // 阶段一:无旗有界等(健康路径在此返回,语义与旧无界 join 完全一致);
+            // 阶段二:超时说明采集线程攥着发送端没死透,升旗让 tap 弃排干自退
+            // (此时上游本就不再产真实帧,弃掉的至多是设备卡死前的残留);
+            // 仍超时(tap 卡在满通道 send 等罕见形态)才放弃泄漏。
             let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
             let source = self.source;
             std::thread::spawn(move || {
@@ -554,14 +559,23 @@ impl AudioCapture for TappedCapture {
                 let _ = done_tx.send(());
             });
             if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
-                eprintln!(
-                    "[采集] {} tap 线程超时未退出(取消旗也未生效),放弃等待继续收尾;                     线程泄漏,建议尽快重启应用并改用内置麦克风",
-                    source.as_str()
-                );
-                crate::telemetry::report_error(
-                    crate::telemetry::ErrorKind::CaptureTeardown,
-                    &format!("{} 采集/tap 线程收尾超时,已放弃(线程泄漏)", source.as_str()),
-                );
+                self.tap_cancel.store(true, std::sync::atomic::Ordering::Release);
+                if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
+                    // 文案按源定制(codex 二轮 P2):system 轨与麦克风无关,
+                    // 指错子系统会把用户支去错误的排障方向。
+                    let hint = match source {
+                        crate::audio::Source::Mic => "建议尽快重启应用并改用内置麦克风",
+                        _ => "建议尽快重启应用",
+                    };
+                    eprintln!(
+                        "[采集] {} tap 线程超时未退出(取消旗也未生效),放弃等待继续收尾;线程泄漏,{hint}",
+                        source.as_str()
+                    );
+                    crate::telemetry::report_error(
+                        crate::telemetry::ErrorKind::CaptureTeardown,
+                        &format!("{} 采集/tap 线程收尾超时,已放弃(线程泄漏)", source.as_str()),
+                    );
+                }
             }
         }
     }
@@ -1602,6 +1616,46 @@ mod tests {
             1234,
             "快照要带上它,audio.json 才写得出去"
         );
+    }
+
+    /// 健康收尾不丢队列帧(codex 二轮 P1 回归):stop 时上游正常断开,tap 必须
+    /// 先排干在途帧再退——取消旗若抢在排干前生效,最多 256 帧会无声消失。
+    #[test]
+    fn healthy_stop_drains_queued_frames() {
+        struct BurstCapture;
+        impl crate::audio::AudioCapture for BurstCapture {
+            fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
+                for i in 0..40 {
+                    let _ = sink.send(AudioFrame {
+                        samples: vec![i as f32; 160],
+                        sample_rate: 16000,
+                        channels: 1,
+                        host_time_ns: None,
+                        synthetic: false,
+                    });
+                }
+                Ok(()) // start 返回即全部帧已在途;sink 随 self 一起活到 stop
+            }
+            fn stop(&mut self) {}
+        }
+        let health = Arc::new(SourceHealth::default());
+        let mut cap = TappedCapture::new(
+            Box::new(BurstCapture),
+            Source::Mic,
+            fast_policy(),
+            health,
+            TapNotify::none(),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        cap.stop(); // BurstCapture 无后台线程,start 后发送端仅存于…无处:已 drop → 上游断开
+        let mut got = 0;
+        while let Ok(f) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            if f.samples.first().copied().unwrap_or(-1.0) >= 0.0 {
+                got += 1;
+            }
+        }
+        assert_eq!(got, 40, "stop 前已在途的帧一帧不许丢");
     }
 
     /// 卡死采集线程不拖死 stop(issue #182 回归):后端把 sink 发送端泄漏给一条
