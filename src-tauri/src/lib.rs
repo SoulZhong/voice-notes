@@ -2378,54 +2378,10 @@ fn spawn_session(
             crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
         // 说话人识别方法(设置项):与本场其余配置同一快照,场中改设置不影响进行中会话。
         registry.set_matcher(crate::diar::registry::matcher_from_key(&cfg.speaker_match));
-        // 本场实时入库产生的 person id 集合:enroller(ASR worker 线程)写入,停止时的
-        // Snapshot 分支读取,用于区分「本场新入库的陌生声音」与「种子命中的老熟人」——
-        // 样本只为前者写(见 Snapshot 分支注释)。
-        let live_enrolled: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
-        // 实时全局入库：新识别出的声纹一旦够料(≥AUTO_ENROLL_MS)当场入库领全局
-        // person id(P<n>)，说话人从此刻起就有全局唯一身份，不必等停止。回调在
-        // ASR worker 线程同步执行,一个新说话人只发生一次,库写失败降级为 None
-        // (下条 final 自动重试),绝不影响转写主流程。库路径不可用则不装配——
-        // 停止时的 Snapshot upsert 仍是兜底入库路径,行为同旧版。
-        if let Ok(root) = data_root(&app) {
-            let vp_store_e = store::VoiceprintStore::new(root);
-            let live_enrolled_e = live_enrolled.clone();
-            let enroll_model = speaker_model.clone();
-            let enroll_note = note_id.clone();
-            let enroll_nstore = store::NoteStore::new(match notes_dir(&app) {
-                Ok(d) => d,
-                Err(_) => std::path::PathBuf::new(),
-            });
-            registry.set_enroller(
-                store::AUTO_ENROLL_MS,
-                Box::new(move |snap| {
-                    // 续录场景:该簇已被标多人混杂 → 不入库(标是上一场停录后打的)。
-                    if enroll_nstore.multi_speaker_ids(&enroll_note).contains(&snap.id) {
-                        eprintln!("实时入库跳过:{} 已标多人混杂", snap.id);
-                        return None;
-                    }
-                    match vp_store_e.upsert_from_session_traced(
-                        std::slice::from_ref(snap),
-                        &chrono::Local::now().to_rfc3339(),
-                        &enroll_model,
-                        &enroll_note,
-                    ) {
-                        Ok(links) => {
-                            let pid = links.get(&snap.id).cloned();
-                            if let Some(pid) = &pid {
-                                live_enrolled_e.lock().unwrap().insert(pid.clone());
-                            }
-                            pid
-                        }
-                        Err(e) => {
-                            eprintln!("声纹实时入库失败(不影响录制,稍后自动重试): {e}");
-                            None
-                        }
-                    }
-                }),
-            );
-        }
+        // 实时自动建档已摘除(2026-08-27 用户拍板「确认才入库」全面推广,issue #166):
+        // 不再装配 enroller——陌生声音保持本场 S 簇身份,不自动领 P 编号建档。
+        // 种子匹配(认老熟人)不受影响;新人入库唯一路径 = 用户命名/关联确认。
+        // 数据依据见停录 Snapshot 分支注释。
 
         // 3) 起会话。管线回调只发消息(writer 归 actor):on_final/on_diar 的 writer
         // 触发块已逐字搬进 actor 的 run_pipeline,回调侧仅保留不触 writer 的声纹库
@@ -2441,19 +2397,7 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
-        // 停录快照入库用的模型标签,与实时入库同一份快照(见上方 speaker_model)。
-        let snapshot_model = speaker_model.clone();
-        let nstore_d = store::NoteStore::new(match notes_dir(&app) {
-            Ok(d) => d,
-            Err(_) => std::path::PathBuf::new(),
-        });
-        let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
-            Ok(root) => Some(store::VoiceprintStore::new(root)),
-            Err(e) => {
-                eprintln!("声纹库路径不可用，本场停止时的库回写将被跳过（不影响笔记落盘）: {e}");
-                None
-            }
-        };
+        // 停录 Snapshot 分支已不再写库(确认才入库推广),相关句柄一并摘除。
         // 音频保留:每个配置的源一个惰性轨道写入器(首帧才建档;失败只降级,不影响转写)。
         // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
         // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
@@ -2611,78 +2555,22 @@ fn spawn_session(
                         rms,
                         reason,
                     },
-                    session::DiarEvent::Snapshot { mut snaps, samples } => {
-                        // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
-                        // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
-                        // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
-                        // person_id 随 finalize 落盘。
-                        if let Some(store) = &vp_store_d {
-                            // 「多人混杂」簇不入库不写样本(打标是事后行为,续录/重转写
-                            // 后同一 S 再攒出快照时这里兜住——codex 实现轮一 P1①)。
-                            let multi = nstore_d.multi_speaker_ids(&note_id_d);
-                            if !multi.is_empty() {
-                                snaps.retain(|sn| {
-                                    let keep = !multi.contains(&sn.id);
-                                    if !keep {
-                                        eprintln!("声纹入库跳过:{} 已标多人混杂", sn.id);
-                                    }
-                                    keep
-                                });
-                            }
-                            match store.upsert_from_session_traced(
-                                &snaps,
-                                &chrono::Local::now().to_rfc3339(),
-                                &snapshot_model,
-                                &note_id_d,
-                            ) {
-                                Ok(enrolled) => {
-                                    // 原 set_speaker_person(cluster, person) 循环改为把新关联
-                                    // 注进 snaps[].person 随消息走:runner 的 store_centroids
-                                    // 落表时一并写 person_id,终态逐位等价(enrolled 只含
-                                    // person 原为 None 的新入库簇)。
-                                    for snap in &mut snaps {
-                                        if let Some(pid) = enrolled.get(&snap.id) {
-                                            snap.person = Some(pid.clone());
-                                        }
-                                    }
-                                    // 声纹样本落盘:只为「本场新入库的陌生声音」写(实时入库或停止
-                                    // 兜底入库)。种子命中的老熟人不再追加——识别成功说明既有声纹
-                                    // 已覆盖这条声音,再存一份没有新信息;识别精度的提升靠质心加权
-                                    // 回写 + 用户把认错拆重的条目合并进来(样本/质心随合并归一)。
-                                    // 兜底:老人物一份样本都没有(样本功能上线前的数据/历史写失败)
-                                    // 时补第一份,兑现管理页"下次录到会自动补上"的承诺。
-                                    let sample_of = |cluster: &str| {
-                                        samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
-                                    };
-                                    let newly = live_enrolled.lock().unwrap();
-                                    for snap in &snaps {
-                                        let pid = snap
-                                            .person
-                                            .clone()
-                                            .or_else(|| enrolled.get(&snap.id).cloned());
-                                        let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
-                                            continue;
-                                        };
-                                        let newly_enrolled =
-                                            newly.contains(&pid) || enrolled.contains_key(&snap.id);
-                                        // 收口版:resolve/隔离/老熟人检查、WAL 溯源、写文件同一临界区。
-                                        // 旧代码在这里用未 resolve 的 pid 查"有没有样本",笔记持
-                                        // loser id 时会误判无样本、把样本重复写到 winner(设计轮二 P1②)。
-                                        if let Err(e) = store.append_session_sample(
-                                            &pid,
-                                            sample,
-                                            &note_id_d,
-                                            &snap.id,
-                                            newly_enrolled,
-                                        ) {
-                                            eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
-                            }
-                        }
-                        // samples 已在上方消费完,不随消息复运(嵌入样本可达 MB 级)。
+                    session::DiarEvent::Snapshot { snaps, samples } => {
+                        // samples(每簇最长段音频)原是自动样本写入的原料,现原地丢弃;
+                        // 采集端仍随会话攒着(有界,SPEAKER_SAMPLE_CAP),协议形状不动,
+                        // 将来命名确认动线若要"停录即可试听"可直接复用。
+                        drop(samples);
+                        // 「确认才入库」全面推广(2026-08-27 用户拍板,issue #166):
+                        // 停录不再做任何自动库写入——不建档、不加权回写质心、不写样本。
+                        // 数据依据:25 个自动档只有 1 个后来获得命名,9 个要人工合并
+                        // 收拾;56 次自动回灌 66% 进了从未确认的 P 编号档,正是五实名
+                        // 互染的生成机制。库写入唯一入口 = 用户命名/关联/拆分确认
+                        // (do_assign_note_speaker_person_with / spawn_confirmed_sample /
+                        // 拆分受权回灌),陌生声音以本场 S 簇留在笔记里当候选,命名即
+                        // 转正(apply_identify_suggestion 可 create_person)。
+                        // 种子命中的关联(snap.person 来自 registry)照常随 runner 的
+                        // store_centroids 落进 speakers.json——识别不受影响,只停写库。
+                        // samples 不再消费,也不随消息复运(嵌入样本可达 MB 级)。
                         session::DiarEvent::Snapshot { snaps, samples: Vec::new() }
                     }
                     other => other,
