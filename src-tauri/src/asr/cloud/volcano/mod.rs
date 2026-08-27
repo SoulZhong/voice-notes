@@ -215,7 +215,7 @@ impl CloudAsr for VolcanoAsr {
             },
         });
 
-        let resp = match ureq::post(FLASH_URL)
+        let resp = match crate::netproxy::agent().post(FLASH_URL)
             .timeout(Duration::from_secs(FLASH_TIMEOUT_S))
             .set("X-Api-App-Key", &self.app_key)
             .set("X-Api-Access-Key", &self.access_key)
