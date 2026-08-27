@@ -66,7 +66,14 @@ impl AudioCapture for VpioMicrophone {
             }
             Err(e) => {
                 eprintln!("VPIO(AEC)初始化失败，回退 cpal 麦克风(无回声消除): {e:#}");
-                let mut mic = Microphone::new();
+                // 回退也要沿用录前择优(codex):否则 VPIO 一失败就悄悄回到蓝牙
+                // 系统默认,状态/诊断里的「已换设备」成了谎话。事件通道空置,
+                // 与 VPIO 分支同款(死亡由 Tap 帧荒检测兜底)。
+                let (etx, _erx) = crossbeam_channel::unbounded();
+                let mut mic = Microphone::with_events_and_device(
+                    etx,
+                    self.device.as_ref().map(|(_, n)| n.clone()),
+                );
                 // cpal 也起不来 → 麦克风彻底不可用，向上返回 Err。
                 mic.start(sink)?;
                 self.backend = Some(Backend::Cpal(mic));
@@ -288,7 +295,15 @@ unsafe fn build_vpio_unit(
         if st == 0 {
             eprintln!("VPIO 录前择优:本场输入改用「{name}」(id={id})");
         } else {
-            eprintln!("VPIO 设备注入失败(OSStatus={st}),录前择优「{name}」未生效,沿用系统默认输入");
+            // 注入失败不许静默沿用系统默认(codex:状态事件/诊断已宣称换了设备,
+            // 实际却在录蓝牙麦是说谎)。整体判 VPIO 失败,走 cpal 回退——回退路径
+            // 会按名字绑定同一台择优设备,宣称与事实重新对齐(代价是丢 Apple AEC,
+            // 但择优的初衷就是蓝牙通话麦劣化比无 AEC 更伤)。
+            return Err(fail(
+                unit,
+                None,
+                format!("择优设备「{name}」注入失败(OSStatus={st}),交给 cpal 回退绑定"),
+            ));
         }
     }
 
