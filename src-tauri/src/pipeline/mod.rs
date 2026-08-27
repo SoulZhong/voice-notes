@@ -1,4 +1,5 @@
 pub mod cloud_forward;
+pub mod embed_prewarm;
 pub mod drift_monitor;
 pub mod frame_tap;
 pub mod recording_sink;

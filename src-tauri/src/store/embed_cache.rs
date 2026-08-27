@@ -8,6 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// 进程内写序列化(codex:预热 worker 与 embed_all 可并发写同一份缓存):
+/// load-modify-save 全程持锁,写者互不覆盖对方刚落的快照。
+/// 跨进程(离线评测 bin)由唯一 tmp 名 + rename 原子性兜底,最坏丢一次合并。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub const EMBED_CACHE_FILE: &str = "embeddings.json";
 const SCHEMA_VERSION: u32 = 1;
@@ -36,12 +43,52 @@ pub fn load(note_dir: &Path) -> Option<EmbedCache> {
     (c.schema_version == SCHEMA_VERSION).then_some(c)
 }
 
+/// 增量合并写入(录音期预热用,issue #164):按 (seq,start,end,source) 键 upsert,
+/// 不修剪既有条目(全量修剪仍归 embed_all 的整写)。盘上 model 与本批不符时整份
+/// 弃旧起新——缓存文件只有一个 model 位,混模型无意义。
+pub fn merge_save(
+    note_dir: &Path,
+    model: &str,
+    new_entries: Vec<EmbedCacheEntry>,
+) -> anyhow::Result<()> {
+    let _g = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut entries = load(note_dir)
+        .filter(|c| c.model == model)
+        .map(|c| c.entries)
+        .unwrap_or_default();
+    for ne in new_entries {
+        match entries.iter_mut().find(|e| {
+            e.seq == ne.seq
+                && e.start_ms == ne.start_ms
+                && e.end_ms == ne.end_ms
+                && e.source == ne.source
+        }) {
+            Some(slot) => *slot = ne,
+            None => entries.push(ne),
+        }
+    }
+    save_locked(note_dir, model, entries)
+}
+
 /// 原子写回。缓存可丢,不做父目录 fsync(与真值文件的持久性等级刻意区分)。
 pub fn save(note_dir: &Path, model: &str, entries: Vec<EmbedCacheEntry>) -> anyhow::Result<()> {
+    let _g = WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    save_locked(note_dir, model, entries)
+}
+
+fn save_locked(note_dir: &Path, model: &str, entries: Vec<EmbedCacheEntry>) -> anyhow::Result<()> {
     let c = EmbedCache { schema_version: SCHEMA_VERSION, model: model.to_string(), entries };
     let path = note_dir.join(EMBED_CACHE_FILE);
-    let tmp = path.with_extension("json.tmp");
+    // tmp 名带 pid+序号:跨进程(离线评测 bin)同时写也不会共享半成品文件。
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, serde_json::to_vec(&c)?)?;
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp); // rename 失败别留孤儿 tmp
+        return Err(e.into());
+    }
     Ok(())
 }

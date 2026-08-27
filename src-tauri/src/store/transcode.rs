@@ -360,6 +360,53 @@ fn extract_wav_data(path: &Path) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("WAV 无 data 块: {}", path.display())
 }
 
+/// 读 WAV 的一个样本子区间(16k 单声道 s16 口径,即本应用全部轨文件),解码与
+/// `read_wav_f32` 逐位一致(i16/32768)。录音期预热按段切片用:整读 80 分钟轨是
+/// 数百 MB,子区间只有几十 KB。返回样本数可能少于请求(区间越过文件尾)。
+pub fn read_wav_f32_slice(
+    wav: &Path,
+    from_sample: u64,
+    n_samples: usize,
+) -> anyhow::Result<Vec<f32>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(wav)?;
+    let mut head = [0u8; 12];
+    f.read_exact(&mut head)?;
+    if &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        anyhow::bail!("非 WAV 数据: {}", wav.display());
+    }
+    let file_len = f.metadata()?.len();
+    let mut pos = 12u64;
+    loop {
+        if pos + 8 > file_len {
+            anyhow::bail!("WAV 无 data 块: {}", wav.display());
+        }
+        f.seek(SeekFrom::Start(pos))?;
+        let mut ch = [0u8; 8];
+        f.read_exact(&mut ch)?;
+        let size = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]) as u64;
+        let start = pos + 8;
+        if &ch[0..4] == b"data" {
+            // data 块实际字节数以文件长度为上限(录音中的文件头 size 可能滞后于尾部
+            // 追加,按 extract_wav_data 同款 min 口径截)。
+            let data_len = size.min(file_len.saturating_sub(start));
+            let a = (from_sample * 2).min(data_len);
+            let b = (from_sample * 2 + n_samples as u64 * 2).min(data_len);
+            if b <= a {
+                return Ok(Vec::new());
+            }
+            f.seek(SeekFrom::Start(start + a))?;
+            let mut buf = vec![0u8; (b - a) as usize];
+            f.read_exact(&mut buf)?;
+            return Ok(buf
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect());
+        }
+        pos = start.saturating_add(size).saturating_add(size & 1);
+    }
+}
+
 /// 旧笔记波形懒回填:波形预计算上线前转码的 m4a 没有 waveform——解码到临时 WAV、
 /// 取纯 PCM 桶化、写回 audio.json。秒级阻塞,调用方放后台线程;失败只降级
 /// (播放器继续用段落包络),临时文件成败都清。

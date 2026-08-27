@@ -241,6 +241,21 @@ fn run_pipeline(app: &AppHandle, owned: &mut Owned, op: PipelineOp) {
                         owned.degraded = false;
                         let _ = app.emit("storage", crate::ipc::StorageEvent { state: "ok".into() });
                     }
+                    // 声纹缓存预热(issue #164):段落定稿即入队后台嵌入,与离线
+                    // embed_all 同口径写 embeddings.json。纯旁路:队列满即丢,
+                    // 失败只日志,绝不反压 actor/录制路径。
+                    if let Ok(root) = crate::notes_dir(app) {
+                        crate::pipeline::embed_prewarm::enqueue(
+                            app,
+                            crate::pipeline::embed_prewarm::Job {
+                                note_dir: root.join(owned.writer.note_id()),
+                                seq,
+                                source: source.clone(),
+                                start_ms,
+                                end_ms,
+                            },
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("append_final 失败（段暂存内存待重试）: {e}");
