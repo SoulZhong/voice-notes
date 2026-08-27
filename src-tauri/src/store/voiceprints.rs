@@ -939,12 +939,27 @@ impl VoiceprintStore {
         if !newly_enrolled && !user_confirmed && !self.sample_paths_existing(&resolved).is_empty() {
             return Ok(false); // 识别出的老熟人且已有样本:不再累积(用户确认样本除外)
         }
+        // 先在内存编码出最终字节:hash 必须与落盘文件逐字节一致,删除校验才有意义。
+        let bytes = encode_sample_wav(samples)?;
+        // 内容去重(codex:同一次关联被重复提交/回执被确认两次时,同一段音频会
+        // 填满十个槽位并在 rebuild 里超权重):与该人既有样本逐字节哈希比对,
+        // 命中即幂等成功语义地拒写。≤10 个文件、每个几百 KB,读得起。
+        {
+            use sha2::{Digest, Sha256};
+            let new_hash = Sha256::digest(&bytes);
+            for existing in self.sample_paths_existing(&resolved) {
+                if let Ok(old) = std::fs::read(&existing) {
+                    if Sha256::digest(&old) == new_hash {
+                        eprintln!("声纹样本跳过:内容与既有样本相同({resolved})");
+                        return Ok(false);
+                    }
+                }
+            }
+        }
         let Some(path) = self.next_free_sample_slot(&resolved) else {
             return Ok(false); // 满员
         };
         std::fs::create_dir_all(path.parent().expect("sample_path 恒有父目录"))?;
-        // 先在内存编码出最终字节:hash 必须与落盘文件逐字节一致,删除校验才有意义。
-        let bytes = encode_sample_wav(samples)?;
         let receipt = super::sample_trace::SampleReceipt {
             receipt_id: format!("sr-{}-{}", std::process::id(), SAMPLE_RECEIPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             note_id: note_id.to_string(),

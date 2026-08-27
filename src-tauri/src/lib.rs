@@ -2378,54 +2378,10 @@ fn spawn_session(
             crate::diar::registry::SpeakerRegistry::with_seeds(&registry_snap, &seeds);
         // 说话人识别方法(设置项):与本场其余配置同一快照,场中改设置不影响进行中会话。
         registry.set_matcher(crate::diar::registry::matcher_from_key(&cfg.speaker_match));
-        // 本场实时入库产生的 person id 集合:enroller(ASR worker 线程)写入,停止时的
-        // Snapshot 分支读取,用于区分「本场新入库的陌生声音」与「种子命中的老熟人」——
-        // 样本只为前者写(见 Snapshot 分支注释)。
-        let live_enrolled: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
-        // 实时全局入库：新识别出的声纹一旦够料(≥AUTO_ENROLL_MS)当场入库领全局
-        // person id(P<n>)，说话人从此刻起就有全局唯一身份，不必等停止。回调在
-        // ASR worker 线程同步执行,一个新说话人只发生一次,库写失败降级为 None
-        // (下条 final 自动重试),绝不影响转写主流程。库路径不可用则不装配——
-        // 停止时的 Snapshot upsert 仍是兜底入库路径,行为同旧版。
-        if let Ok(root) = data_root(&app) {
-            let vp_store_e = store::VoiceprintStore::new(root);
-            let live_enrolled_e = live_enrolled.clone();
-            let enroll_model = speaker_model.clone();
-            let enroll_note = note_id.clone();
-            let enroll_nstore = store::NoteStore::new(match notes_dir(&app) {
-                Ok(d) => d,
-                Err(_) => std::path::PathBuf::new(),
-            });
-            registry.set_enroller(
-                store::AUTO_ENROLL_MS,
-                Box::new(move |snap| {
-                    // 续录场景:该簇已被标多人混杂 → 不入库(标是上一场停录后打的)。
-                    if enroll_nstore.multi_speaker_ids(&enroll_note).contains(&snap.id) {
-                        eprintln!("实时入库跳过:{} 已标多人混杂", snap.id);
-                        return None;
-                    }
-                    match vp_store_e.upsert_from_session_traced(
-                        std::slice::from_ref(snap),
-                        &chrono::Local::now().to_rfc3339(),
-                        &enroll_model,
-                        &enroll_note,
-                    ) {
-                        Ok(links) => {
-                            let pid = links.get(&snap.id).cloned();
-                            if let Some(pid) = &pid {
-                                live_enrolled_e.lock().unwrap().insert(pid.clone());
-                            }
-                            pid
-                        }
-                        Err(e) => {
-                            eprintln!("声纹实时入库失败(不影响录制,稍后自动重试): {e}");
-                            None
-                        }
-                    }
-                }),
-            );
-        }
+        // 实时自动建档已摘除(2026-08-27 用户拍板「确认才入库」全面推广,issue #166):
+        // 不再装配 enroller——陌生声音保持本场 S 簇身份,不自动领 P 编号建档。
+        // 种子匹配(认老熟人)不受影响;新人入库唯一路径 = 用户命名/关联确认。
+        // 数据依据见停录 Snapshot 分支注释。
 
         // 3) 起会话。管线回调只发消息(writer 归 actor):on_final/on_diar 的 writer
         // 触发块已逐字搬进 actor 的 run_pipeline,回调侧仅保留不触 writer 的声纹库
@@ -2441,19 +2397,7 @@ fn spawn_session(
         // 声纹库句柄：闭包前构造一次，供 Snapshot 分支停止时的入库回写。用 Option
         // 包裹而非兜底占位路径——app_data_dir 解析失败时彻底跳过库回写（None），
         // 而不是拿一个空/相对路径去读写，那样反而可能在意外位置产生副作用文件。
-        // 停录快照入库用的模型标签,与实时入库同一份快照(见上方 speaker_model)。
-        let snapshot_model = speaker_model.clone();
-        let nstore_d = store::NoteStore::new(match notes_dir(&app) {
-            Ok(d) => d,
-            Err(_) => std::path::PathBuf::new(),
-        });
-        let vp_store_d: Option<store::VoiceprintStore> = match data_root(&app) {
-            Ok(root) => Some(store::VoiceprintStore::new(root)),
-            Err(e) => {
-                eprintln!("声纹库路径不可用，本场停止时的库回写将被跳过（不影响笔记落盘）: {e}");
-                None
-            }
-        };
+        // 停录 Snapshot 分支已不再写库(确认才入库推广),相关句柄一并摘除。
         // 音频保留:每个配置的源一个惰性轨道写入器(首帧才建档;失败只降级,不影响转写)。
         // 写盘走独立线程 + 无界通道:磁盘卡顿(Spotlight/Time Machine/外置盘)绝不
         // 反压分段 worker 与采集实时线程——增值层不许伤转写热路径。无界与 NoteWriter
@@ -2611,78 +2555,22 @@ fn spawn_session(
                         rms,
                         reason,
                     },
-                    session::DiarEvent::Snapshot { mut snaps, samples } => {
-                        // 库回写/够料入库（spec:person 簇加权回写；无主簇 ≥10s 入库为未命名人）。
-                        // 失败只降级打日志:库是增值层,绝不影响笔记落盘。Snapshot 在 worker
-                        // join 前送达(入队),故恒先于停录自投的 Finalize 被 actor 处理,
-                        // person_id 随 finalize 落盘。
-                        if let Some(store) = &vp_store_d {
-                            // 「多人混杂」簇不入库不写样本(打标是事后行为,续录/重转写
-                            // 后同一 S 再攒出快照时这里兜住——codex 实现轮一 P1①)。
-                            let multi = nstore_d.multi_speaker_ids(&note_id_d);
-                            if !multi.is_empty() {
-                                snaps.retain(|sn| {
-                                    let keep = !multi.contains(&sn.id);
-                                    if !keep {
-                                        eprintln!("声纹入库跳过:{} 已标多人混杂", sn.id);
-                                    }
-                                    keep
-                                });
-                            }
-                            match store.upsert_from_session_traced(
-                                &snaps,
-                                &chrono::Local::now().to_rfc3339(),
-                                &snapshot_model,
-                                &note_id_d,
-                            ) {
-                                Ok(enrolled) => {
-                                    // 原 set_speaker_person(cluster, person) 循环改为把新关联
-                                    // 注进 snaps[].person 随消息走:runner 的 store_centroids
-                                    // 落表时一并写 person_id,终态逐位等价(enrolled 只含
-                                    // person 原为 None 的新入库簇)。
-                                    for snap in &mut snaps {
-                                        if let Some(pid) = enrolled.get(&snap.id) {
-                                            snap.person = Some(pid.clone());
-                                        }
-                                    }
-                                    // 声纹样本落盘:只为「本场新入库的陌生声音」写(实时入库或停止
-                                    // 兜底入库)。种子命中的老熟人不再追加——识别成功说明既有声纹
-                                    // 已覆盖这条声音,再存一份没有新信息;识别精度的提升靠质心加权
-                                    // 回写 + 用户把认错拆重的条目合并进来(样本/质心随合并归一)。
-                                    // 兜底:老人物一份样本都没有(样本功能上线前的数据/历史写失败)
-                                    // 时补第一份,兑现管理页"下次录到会自动补上"的承诺。
-                                    let sample_of = |cluster: &str| {
-                                        samples.iter().find(|(id, _)| id == cluster).map(|(_, s)| s)
-                                    };
-                                    let newly = live_enrolled.lock().unwrap();
-                                    for snap in &snaps {
-                                        let pid = snap
-                                            .person
-                                            .clone()
-                                            .or_else(|| enrolled.get(&snap.id).cloned());
-                                        let (Some(pid), Some(sample)) = (pid, sample_of(&snap.id)) else {
-                                            continue;
-                                        };
-                                        let newly_enrolled =
-                                            newly.contains(&pid) || enrolled.contains_key(&snap.id);
-                                        // 收口版:resolve/隔离/老熟人检查、WAL 溯源、写文件同一临界区。
-                                        // 旧代码在这里用未 resolve 的 pid 查"有没有样本",笔记持
-                                        // loser id 时会误判无样本、把样本重复写到 winner(设计轮二 P1②)。
-                                        if let Err(e) = store.append_session_sample(
-                                            &pid,
-                                            sample,
-                                            &note_id_d,
-                                            &snap.id,
-                                            newly_enrolled,
-                                        ) {
-                                            eprintln!("声纹样本写入失败({pid},不影响笔记): {e}");
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("声纹库回写失败(不影响笔记): {e}"),
-                            }
-                        }
-                        // samples 已在上方消费完,不随消息复运(嵌入样本可达 MB 级)。
+                    session::DiarEvent::Snapshot { snaps, samples } => {
+                        // samples(每簇最长段音频)原是自动样本写入的原料,现原地丢弃;
+                        // 采集端仍随会话攒着(有界,SPEAKER_SAMPLE_CAP),协议形状不动,
+                        // 将来命名确认动线若要"停录即可试听"可直接复用。
+                        drop(samples);
+                        // 「确认才入库」全面推广(2026-08-27 用户拍板,issue #166):
+                        // 停录不再做任何自动库写入——不建档、不加权回写质心、不写样本。
+                        // 数据依据:25 个自动档只有 1 个后来获得命名,9 个要人工合并
+                        // 收拾;56 次自动回灌 66% 进了从未确认的 P 编号档,正是五实名
+                        // 互染的生成机制。库写入唯一入口 = 用户命名/关联/拆分确认
+                        // (do_assign_note_speaker_person_with / spawn_confirmed_sample /
+                        // 拆分受权回灌),陌生声音以本场 S 簇留在笔记里当候选,命名即
+                        // 转正(apply_identify_suggestion 可 create_person)。
+                        // 种子命中的关联(snap.person 来自 registry)照常随 runner 的
+                        // store_centroids 落进 speakers.json——识别不受影响,只停写库。
+                        // samples 不再消费,也不随消息复运(嵌入样本可达 MB 级)。
                         session::DiarEvent::Snapshot { snaps, samples: Vec::new() }
                     }
                     other => other,
@@ -4442,9 +4330,39 @@ fn do_assign_note_speaker_person_with(
             note.segments.iter().find(|s| s.seq == q && s.speaker.as_deref() == Some(speaker_id)).cloned()
         });
         if let Some(seg) = audited {
-            spawn_confirmed_sample(app, note_id.to_string(), speaker_id.to_string(), resolved, note.segments, seg);
+            // audited 单段是唯一被试听确认的料:不拼其它段(拆分簇未确认段有混杂
+            // 风险),不足 10s 会被时长门拒——如实跳过,总好过拿未确认段凑数。
+            spawn_confirmed_sample(
+                app,
+                note_id.to_string(),
+                speaker_id.to_string(),
+                resolved,
+                note.segments.clone(),
+                vec![seg],
+                true,
+            );
         }
     } else {
+        // 确认才入库时代的样本闭环(codex:停录不再自动写样本后,经确认的人物若
+        // 一份样本都没有,换声纹模型 rebuild 时质心被清空、无从重算,人就没了)。
+        // 关联即确认:切该说话人本篇最长段存为样本;append_confirmed_sample 内部
+        // 自带隔离/满员/去重门,不会因反复关联而灌爆。
+        let pool: Vec<store::SegmentRecord> = note
+            .segments
+            .iter()
+            .filter(|s| s.speaker.as_deref() == Some(speaker_id))
+            .cloned()
+            .collect();
+        let picks = pick_confirmed_sample_segs(&pool);
+        spawn_confirmed_sample(
+            app,
+            note_id.to_string(),
+            speaker_id.to_string(),
+            resolved.clone(),
+            note.segments.clone(),
+            picks,
+            false,
+        );
         spawn_feedback(
             app,
             note_id.to_string(),
@@ -4461,14 +4379,44 @@ fn do_assign_note_speaker_person_with(
 /// 用户确认样本的后台落库:切出音频存样本(append_confirmed_sample,免老熟人策略)
 /// + 该段单独回灌质心(reinforce_person,走普通门禁与账本)。失败只记日志——本篇
 /// 关联已生效,库写入是增强不是前提。
+/// 从确认段池挑样本料:按时长降序累计到 ≥AUTO_ENROLL_MS(10s)即止。
+/// 总量不足返回空(调用方跳过)。只拼**用户确认动作覆盖的段**——与 #167 备忘
+/// 「只拼用户确认过的段」一致;未确认段永不入选。
+fn pick_confirmed_sample_segs(pool: &[store::SegmentRecord]) -> Vec<store::SegmentRecord> {
+    let mut segs: Vec<store::SegmentRecord> = pool.to_vec();
+    segs.sort_by_key(|s| std::cmp::Reverse(s.end_ms.saturating_sub(s.start_ms)));
+    let mut acc = 0u64;
+    let mut picks = Vec::new();
+    for s in segs {
+        if acc >= store::AUTO_ENROLL_MS {
+            break;
+        }
+        acc += s.end_ms.saturating_sub(s.start_ms);
+        picks.push(s);
+    }
+    if acc < store::AUTO_ENROLL_MS {
+        return Vec::new();
+    }
+    picks
+}
+
+/// 确认样本落库:把 picks(多段拼接,凑够 10s 门槛——codex:单挑最长段会被
+/// append_confirmed_sample 的时长门拒掉,确认过的人物零样本,换模型 rebuild
+/// 直接把人清没)切音频写为人物样本;reinforce=true 时另做这些段的质心回灌
+/// (拆分确认路径用;普通关联的回灌由 spawn_feedback 整组承担,不在此重复)。
 fn spawn_confirmed_sample(
     app: &AppHandle,
     note_id: String,
     speaker_id: String,
     person_id: String,
     segments: Vec<store::SegmentRecord>,
-    seg: store::SegmentRecord,
+    picks: Vec<store::SegmentRecord>,
+    reinforce: bool,
 ) {
+    if picks.is_empty() && !reinforce {
+        eprintln!("确认样本跳过({person_id}):确认段总时长不足 10s");
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         let run = || -> anyhow::Result<()> {
@@ -4477,43 +4425,113 @@ fn spawn_confirmed_sample(
             let dir = nroot.join(&note_id);
             let vp_store = store::VoiceprintStore::new(root);
             let _fb = FEEDBACK_GATE.lock().unwrap();
+            // 门内复核(codex 五轮 P1):命令返回到本任务执行之间,用户可能已解除/
+            // 改走关联,或段落已被改派——拿旧料写样本会把音频永久挂到错人身上。
+            // ① 说话人现关联仍是 person_id;② picks 逐段仍归该说话人(改派段剔除),
+            // 剔完不足 10s 门槛即放弃。
+            let fresh = store::NoteStore::new(nroot.clone()).load(&note_id)?;
+            let vp_now = vp_store.load();
+            // person_id 也过 redirects 归一(codex 末轮 P2):任务等待期间目标被合并
+            // 时,现关联解析到 winner 而入参还是 loser,直接比会冤枉合法关联。
+            let person_id = store::VoiceprintStore::resolve(&vp_now, &person_id)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("目标人物已不在库,样本放弃"))?;
+            let cur = fresh
+                .speakers
+                .get(&speaker_id)
+                .and_then(|m| m.person_id.as_deref())
+                .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid))
+                .map(str::to_string);
+            anyhow::ensure!(
+                cur.as_deref() == Some(person_id.as_str()),
+                "说话人现关联({cur:?})已不是 {person_id},样本放弃"
+            );
+            let picks: Vec<store::SegmentRecord> = picks
+                .into_iter()
+                .filter(|p| {
+                    fresh
+                        .segments
+                        .iter()
+                        .any(|s| s.seq == p.seq && s.speaker.as_deref() == Some(speaker_id.as_str()))
+                })
+                .collect();
+            let picked_ms: u64 = picks.iter().map(|s| s.end_ms.saturating_sub(s.start_ms)).sum();
+            // 时长门只挡「样本落盘」,不挡回灌(codex 末轮 P2):拆分 audited 段在
+            // 1.5s~10s 之间时,样本存不了,但用户确认过的质心回灌照做——这是旧行为,
+            // 不能倒退。
+            let sample_ok = picked_ms >= store::AUTO_ENROLL_MS;
+            anyhow::ensure!(
+                sample_ok || reinforce,
+                "确认段被改派后剩余 {picked_ms}ms 不足门槛,样本放弃"
+            );
             // 切音频:与 feedback 同一口径(track_pcm + offset_ms,16k f32)。
+            // 多段拼接,每源全场 PCM 只读一次。
             let meta = store::audio::load_audio_meta(&dir);
-            let pcm = store::transcode::track_pcm(&dir, &seg.source)?;
-            let offset = meta.tracks.get(&seg.source).map(|t| t.offset_ms).unwrap_or(0);
-            let start = (seg.start_ms.saturating_sub(offset) as usize).saturating_mul(16);
-            let end = ((seg.end_ms.saturating_sub(offset) as usize).saturating_mul(16)).min(pcm.len());
-            anyhow::ensure!(start < end, "试听段落在音轨覆盖范围之外");
-            let wrote = vp_store.append_confirmed_sample(&person_id, &pcm[start..end], &note_id, &speaker_id)?;
-            if !wrote {
-                eprintln!("确认样本未写入(隔离/满员/空音频): {person_id}");
+            let mut pcm_by_src: std::collections::HashMap<String, Vec<f32>> =
+                std::collections::HashMap::new();
+            let mut sample: Vec<f32> = Vec::new();
+            for seg in &picks {
+                if !pcm_by_src.contains_key(&seg.source) {
+                    pcm_by_src
+                        .insert(seg.source.clone(), store::transcode::track_pcm(&dir, &seg.source)?);
+                }
+                let pcm = &pcm_by_src[&seg.source];
+                let offset = meta.tracks.get(&seg.source).map(|t| t.offset_ms).unwrap_or(0);
+                let start = (seg.start_ms.saturating_sub(offset) as usize).saturating_mul(16);
+                let end = ((seg.end_ms.saturating_sub(offset) as usize).saturating_mul(16))
+                    .min(pcm.len());
+                if start < end {
+                    sample.extend_from_slice(&pcm[start..end]);
+                }
             }
-            // 单段回灌质心(模型门禁/账本/黑名单照过)。
-            let expected = current_speaker_model(&app);
-            let library_model = vp_store.load().embedding_model.clone();
-            let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
-            let mut needs_rebuild = false;
-            let now = chrono::Local::now().to_rfc3339();
-            let r = feedback::reinforce_person(
-                &dir,
-                &segments,
-                &feedback::SegFilter::Seqs(std::collections::BTreeSet::from([seg.seq])),
-                &person_id,
-                &vp_store,
-                &library_model,
-                &expected,
-                &mut embedder,
-                &now,
-                None,
-                &mut needs_rebuild,
-                false,
-            )?;
-            if needs_rebuild {
-                let st = app.state::<AppState>();
-                *st.embedder_cache.lock().unwrap() = None;
-                spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "确认样本回灌纠错后质心置空");
+            anyhow::ensure!(
+                !sample.is_empty() || reinforce,
+                "确认段落全部在音轨覆盖范围之外"
+            );
+            if sample_ok && !sample.is_empty() {
+                let wrote =
+                    vp_store.append_confirmed_sample(&person_id, &sample, &note_id, &speaker_id)?;
+                if !wrote {
+                    eprintln!("确认样本未写入(隔离/满员/时长门/空音频): {person_id}");
+                }
+            } else {
+                eprintln!("确认样本不足 10s 门槛({person_id}),只回灌不存样本");
             }
-            eprintln!("确认样本入库: {person_id} seg#{} → {r:?}", seg.seq);
+            if reinforce {
+                // 确认段回灌质心(模型门禁/账本/黑名单照过)。
+                let expected = current_speaker_model(&app);
+                let library_model = vp_store.load().embedding_model.clone();
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
+                let mut needs_rebuild = false;
+                let now = chrono::Local::now().to_rfc3339();
+                let seqs: std::collections::BTreeSet<u64> = picks.iter().map(|s| s.seq).collect();
+                let r = feedback::reinforce_person(
+                    &dir,
+                    &segments,
+                    &feedback::SegFilter::Seqs(seqs),
+                    &person_id,
+                    &vp_store,
+                    &library_model,
+                    &expected,
+                    &mut embedder,
+                    &now,
+                    None,
+                    &mut needs_rebuild,
+                    false,
+                )?;
+                if needs_rebuild {
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(
+                        &app,
+                        st.embedder_cache.clone(),
+                        "确认样本回灌纠错后质心置空",
+                    );
+                }
+                eprintln!("确认样本入库: {person_id} {} 段 → {r:?}", picks.len());
+            } else {
+                eprintln!("确认样本入库: {person_id} {} 段(回灌由关联流程承担)", picks.len());
+            }
             Ok(())
         };
         if let Err(e) = run() {
@@ -7273,52 +7291,11 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
     store::NoteStore::new(root.clone()).assign_speaker_person_if(note_id, &speaker, &resolved)?;
     set_stage(&dir, &op_id, "assigned", None);
 
-    // ③ 同步回灌(自动路径绝不异步——否则撤销后后台污染)。
-    let skipped = {
-        let _fb = FEEDBACK_GATE.lock().unwrap();
-        let note = store::NoteStore::new(root.clone()).load(note_id)?;
-        let expected = app
-            .path()
-            .app_data_dir()
-            .map(|d| settings::load(&d).speaker_model)
-            .unwrap_or_default();
-        let library_model = vp.embedding_model.clone();
-        // 标签与权重同源(同 spawn_feedback 那处):不能再读一次设置,否则可能用 B 的
-        // 权重算、以 A 的标签写库(codex review 实现轮 P1)。
-        match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
-            Ok(mut embedder) => {
-                let mut needs_rebuild = false;
-                let r = feedback::reinforce_person(
-                    &dir,
-                    &note.segments,
-                    &feedback::SegFilter::Seqs(seqs.clone()),
-                    &resolved,
-                    &vp_store,
-                    &library_model,
-                    &expected,
-                    &mut embedder,
-                    &now,
-                    Some(&op_id),
-                    &mut needs_rebuild,
-                    false,
-                );
-                // 先无条件处理重建,再判回灌结果:纠错还原一旦清空了旧人物的质心就已经
-                // 落盘,回灌本身跳过或出错都不改变"必须重建"这件事
-                // (codex review 实现轮二 P1)。此处已出 vp_guard。
-                if needs_rebuild {
-                    let st = app.state::<AppState>();
-                    *st.embedder_cache.lock().unwrap() = None;
-                    spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
-                }
-                match r {
-                    Ok(feedback::ReinforceResult::Applied { .. }) => None,
-                    Ok(other) => Some(format!("{other:?}")),
-                    Err(e) => Some(format!("回灌失败: {e}")),
-                }
-            }
-            Err(e) => Some(format!("嵌入器不可用: {e}")),
-        }
-    };
+    // ③ 回灌已摘(2026-08-27「确认才入库」全面推广,issue #166):自动应用是
+    // LLM 推断的身份,没有用户确认动作——它可以替用户做**笔记内**关联(可撤销、
+    // 建议卡上有痕),但不配写库。原同步 reinforce_person 调用整块移除;库写入
+    // 只在用户亲手关联/确认时发生。stage 记 skipped 供审计与撤销语义对齐。
+    let skipped: Option<String> = Some("确认才入库:自动应用不写库".to_string());
     set_stage(&dir, &op_id, "reinforced", skipped);
 
     // ④ 状态落盘 + done。
@@ -7625,6 +7602,8 @@ fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Resul
         .ok_or_else(|| tr!("回执不存在或已处理", "Receipt missing or already handled"))?;
     op.acknowledged = true;
     let fp = op.fingerprint.clone();
+    let ack_seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
+    let ack_target = op.target_person.clone();
     refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
     if let Some(mut idoc) = refine::identify::load_identify(&dir) {
         let now = chrono::Local::now().to_rfc3339();
@@ -7632,7 +7611,155 @@ fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Resul
             let _ = refine::identify::save_identify(&dir, &idoc);
         }
     }
+    // 「Good」就是用户确认(codex,确认才入库的写入边界):此刻补做自动应用时刻意
+    // 跳过的回灌——与手动关联的库待遇对齐。后台执行,门内复核撤销态。
+    spawn_ack_reinforce(&app, note_id, op_id, ack_seqs, ack_target);
     Ok(())
+}
+
+/// 回执确认后的回灌:锁序 IDENTIFY_ACT_GATE → FEEDBACK_GATE(与 auto_apply_one
+/// 一致);门内复核 op 仍是「已确认且未撤销」——确认与本任务之间用户可能已点撤销,
+/// 撤销后再回灌就是把解除掉的关联偷偷写回库(codex review 二轮 P1#3 同款教训)。
+fn spawn_ack_reinforce(
+    app: &AppHandle,
+    note_id: String,
+    op_id: String,
+    seqs: std::collections::BTreeSet<u64>,
+    target: String,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let run = || -> anyhow::Result<()> {
+            let root = notes_dir(&app)?;
+            let dir = root.join(&note_id);
+            let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+            let ops = refine::identify::load_ops(&dir);
+            let Some(op) =
+                ops.ops.iter().find(|o| o.op_id == op_id && o.acknowledged && o.undo_stage.is_none())
+            else {
+                return Ok(()); // 已撤销/状态变了:不写库
+            };
+            anyhow::ensure!(op.target_person == target, "op 目标已变,放弃回灌");
+            let op_cluster = op.cluster.clone();
+            let vp_store = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
+            let now = chrono::Local::now().to_rfc3339();
+            let skipped = {
+                let _fb = FEEDBACK_GATE.lock().unwrap();
+                let note = store::NoteStore::new(root.clone()).load(&note_id)?;
+                // 门内复核关联现状(codex P1):确认与本任务之间用户可能已把该说话人
+                // 手动改给别人——op 记录还在,但笔记里的关联已不是 target,此刻回灌
+                // 会跟更新的手动 feedback 抢写,把错人留在库里。现关联≠target 即放弃。
+                let vp_now = vp_store.load();
+                // target 先过 redirects 归一(codex 六轮):自动应用到用户点 Good 之间
+                // 目标人物可能已被合并,笔记侧关联解析到的是 winner,拿 loser 比对会
+                // 白白放弃用户的确认。
+                let Some(target) =
+                    store::VoiceprintStore::resolve(&vp_now, &target).map(str::to_string)
+                else {
+                    eprintln!("回执确认回灌放弃:目标人物已不在库");
+                    return Ok(());
+                };
+                // seqs 归属复核(codex 五/六轮):重聚类会换簇号,op.cluster 可能已
+                // 过期——现簇从 seqs 反推(撤销路径同款思路):全部段必须存在且归
+                // 同一个说话人,否则组已散,放弃不拿混料喂库。
+                let owners: std::collections::BTreeSet<&str> = seqs
+                    .iter()
+                    .filter_map(|q| {
+                        note.segments.iter().find(|s| s.seq == *q).and_then(|s| s.speaker.as_deref())
+                    })
+                    .collect();
+                let all_present = seqs
+                    .iter()
+                    .all(|q| note.segments.iter().any(|s| s.seq == *q && s.speaker.is_some()));
+                let Some(cur_cluster) = (if all_present && owners.len() == 1 {
+                    owners.iter().next().map(|s| s.to_string())
+                } else {
+                    None
+                }) else {
+                    eprintln!("回执确认回灌放弃:op 覆盖的段已散/被改派");
+                    return Ok(());
+                };
+                let _ = &op_cluster; // 旧簇号仅供日志,判定一律以 seqs 反推为准
+                // 现关联复核(codex 五轮 P1):确认与本任务之间用户可能已把该说话人
+                // 改给别人;现关联(归一后)≠target 即放弃,不与更新的 feedback 抢写。
+                let cur = note
+                    .speakers
+                    .get(&cur_cluster)
+                    .and_then(|m| m.person_id.as_deref())
+                    .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid));
+                if cur != Some(target.as_str()) {
+                    eprintln!("回执确认回灌放弃:说话人现关联({cur:?})已不是 {target}");
+                    return Ok(());
+                }
+                let expected = current_speaker_model(&app);
+                let library_model = vp_store.load().embedding_model.clone();
+                match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
+                    Ok(mut embedder) => {
+                        let mut needs_rebuild = false;
+                        let r = feedback::reinforce_person(
+                            &dir,
+                            &note.segments,
+                            &feedback::SegFilter::Seqs(seqs.clone()),
+                            &target,
+                            &vp_store,
+                            &library_model,
+                            &expected,
+                            &mut embedder,
+                            &now,
+                            Some(&op_id),
+                            &mut needs_rebuild,
+                            false,
+                        );
+                        if needs_rebuild {
+                            let st = app.state::<AppState>();
+                            *st.embedder_cache.lock().unwrap() = None;
+                            spawn_voiceprint_rebuild(
+                                &app,
+                                st.embedder_cache.clone(),
+                                "回执确认回灌触发质心置空",
+                            );
+                        }
+                        let sk = match r {
+                            Ok(feedback::ReinforceResult::Applied { .. }) => None,
+                            Ok(other) => Some(format!("{other:?}")),
+                            Err(e) => Some(format!("回灌失败: {e}")),
+                        };
+                        (sk, target, cur_cluster)
+                    }
+                    Err(e) => (Some(format!("声纹模型不可用: {e}")), target, cur_cluster),
+                }
+            };
+            let (skipped, target, cur_cluster) = skipped;
+            let mut ops = refine::identify::load_ops(&dir);
+            if let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) {
+                op.reinforce_skipped = skipped.or(Some("回执确认后已回灌".to_string()));
+            }
+            let _ = refine::identify::save_ops(&dir, &ops);
+            // 确认样本(codex 三轮):被确认目标若零样本,换模型 rebuild 会把人清没。
+            // 料 = 本 op 覆盖的段(用户「Good」确认的正是这组识别),凑长同一口径。
+            // 簇号/目标一律用门内复核出的现值(codex 六轮:旧簇号/被合并的旧 id
+            // 会让复核白白失败,吞掉用户的确认)。
+            {
+                let note = store::NoteStore::new(root.clone()).load(&note_id)?;
+                let pool: Vec<store::SegmentRecord> =
+                    note.segments.iter().filter(|s| seqs.contains(&s.seq)).cloned().collect();
+                let picks = pick_confirmed_sample_segs(&pool);
+                spawn_confirmed_sample(
+                    &app,
+                    note_id.clone(),
+                    cur_cluster,
+                    target,
+                    note.segments,
+                    picks,
+                    false,
+                );
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            eprintln!("回执确认回灌失败(关联不受影响): {e}");
+        }
+    });
 }
 
 /// P2b 回执「撤销」:CAS 解除关联 + 按 op 对账还原质心 + 拒绝键。返回质心是否
@@ -7963,6 +8090,64 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
 /// 活动会话经 lifecycle 信箱走 writer 单写者路径(P2:writer 归 actor)——改内存表、
 /// persist_speakers 原子落盘、广播都在 actor 线程串行执行,与管线事件同线程,天然
 /// 杜绝互相覆盖窗口(不再经 NoteStore 直写);非活动笔记才走 NoteStore 直写磁盘。
+/// 命名即入库(2026-08-27「确认才入库」的转正通路,codex 末轮 P1):自动建档摘除
+/// 后,用户给陌生说话人打名字是唯一的身份确认动作,必须通向库——否则那个人
+/// 永远是笔记局部身份,以后录到也认不出。
+/// 规则:库里恰有一个同名人 → 关联它;没有 → 建人再关联;重名多于一个 → 跳过
+/// 并日志(自动挑人必错,让用户走关联动线亲自选)。非活动会话时调用。
+fn enroll_named_speaker(app: &AppHandle, note_id: &str, speaker_id: &str, name: &str) {
+    let run = || -> anyhow::Result<()> {
+        let root = notes_dir(app)?;
+        let note = store::NoteStore::new(root).load(note_id)?;
+        let Some(m) = note.speakers.get(speaker_id) else { return Ok(()) };
+        if m.person_id.is_some() {
+            return Ok(()); // 已有关联:改名不换人
+        }
+        let vp_store = open_voiceprint_store(app).map_err(anyhow::Error::msg)?;
+        let vp = vp_store.load();
+        let same: Vec<&String> =
+            vp.people.iter().filter(|(_, p)| p.name == name).map(|(id, _)| id).collect();
+        let (target, created) = match same.len() {
+            0 => (vp_store.create_person(name, &chrono::Local::now().to_rfc3339())?, true),
+            1 => (same[0].clone(), false),
+            n => {
+                eprintln!("命名入库跳过({name}):库中有 {n} 个同名人,请手动关联挑选");
+                return Ok(());
+            }
+        };
+        if let Err(e) = do_assign_note_speaker_person(app, note_id, speaker_id, &target) {
+            if created {
+                // 与 apply_identify_suggestion 同款收尾:刚建的空人别留孤儿
+                let _ = vp_store.delete_person_if_empty(&target);
+            }
+            return Err(anyhow::Error::msg(e));
+        }
+        eprintln!("命名入库:{note_id}/{speaker_id} 「{name}」 → {target}");
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("命名入库失败(笔记内命名不受影响): {e}");
+    }
+}
+
+/// 停录后补做录制中命名的入库(录制中不能动库,只记名字;此处兑现)。
+/// 扫本篇「有名无主」说话人逐个走 enroll_named_speaker,幂等。
+pub(crate) fn spawn_enroll_named_speakers(app: &AppHandle, note_id: String) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = match notes_dir(&app) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let Ok(note) = store::NoteStore::new(root).load(&note_id) else { return };
+        for (sid, m) in &note.speakers {
+            if !m.name.trim().is_empty() && m.person_id.is_none() && !m.split_born {
+                enroll_named_speaker(&app, &note_id, sid, m.name.trim());
+            }
+        }
+    });
+}
+
 #[tauri::command]
 fn rename_speaker(
     app: AppHandle,
@@ -7994,11 +8179,15 @@ fn rename_speaker(
     // 非活动笔记：经 actor 串行执行(取代 NoteStore 直写)。
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::RenameSpeaker {
-            id: note_id,
-            speaker_id,
+            id: note_id.clone(),
+            speaker_id: speaker_id.clone(),
             name: name.to_string(),
         },
-    })
+    })?;
+    // 命名即确认(codex 末轮 P1):无主说话人得名 → 转正入库(建人/唯一同名关联,
+    // 带样本与回灌);已有关联者只改显示名,不动库。
+    enroll_named_speaker(&app, &note_id, &speaker_id, name);
+    Ok(())
 }
 
 /// 删除笔记内说话人(原始逐字稿 chips):表项移除,名下段落回到未标注。
