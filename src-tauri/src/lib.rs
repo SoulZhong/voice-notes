@@ -4330,29 +4330,39 @@ fn do_assign_note_speaker_person_with(
             note.segments.iter().find(|s| s.seq == q && s.speaker.as_deref() == Some(speaker_id)).cloned()
         });
         if let Some(seg) = audited {
-            spawn_confirmed_sample(app, note_id.to_string(), speaker_id.to_string(), resolved, note.segments, seg);
+            // audited 单段是唯一被试听确认的料:不拼其它段(拆分簇未确认段有混杂
+            // 风险),不足 10s 会被时长门拒——如实跳过,总好过拿未确认段凑数。
+            spawn_confirmed_sample(
+                app,
+                note_id.to_string(),
+                speaker_id.to_string(),
+                resolved,
+                note.segments.clone(),
+                vec![seg],
+                true,
+            );
         }
     } else {
         // 确认才入库时代的样本闭环(codex:停录不再自动写样本后,经确认的人物若
         // 一份样本都没有,换声纹模型 rebuild 时质心被清空、无从重算,人就没了)。
         // 关联即确认:切该说话人本篇最长段存为样本;append_confirmed_sample 内部
         // 自带隔离/满员/去重门,不会因反复关联而灌爆。
-        let longest = note
+        let pool: Vec<store::SegmentRecord> = note
             .segments
             .iter()
             .filter(|s| s.speaker.as_deref() == Some(speaker_id))
-            .max_by_key(|s| s.end_ms.saturating_sub(s.start_ms))
-            .cloned();
-        if let Some(seg) = longest {
-            spawn_confirmed_sample(
-                app,
-                note_id.to_string(),
-                speaker_id.to_string(),
-                resolved.clone(),
-                note.segments.clone(),
-                seg,
-            );
-        }
+            .cloned()
+            .collect();
+        let picks = pick_confirmed_sample_segs(&pool);
+        spawn_confirmed_sample(
+            app,
+            note_id.to_string(),
+            speaker_id.to_string(),
+            resolved.clone(),
+            note.segments.clone(),
+            picks,
+            false,
+        );
         spawn_feedback(
             app,
             note_id.to_string(),
@@ -4369,14 +4379,44 @@ fn do_assign_note_speaker_person_with(
 /// 用户确认样本的后台落库:切出音频存样本(append_confirmed_sample,免老熟人策略)
 /// + 该段单独回灌质心(reinforce_person,走普通门禁与账本)。失败只记日志——本篇
 /// 关联已生效,库写入是增强不是前提。
+/// 从确认段池挑样本料:按时长降序累计到 ≥AUTO_ENROLL_MS(10s)即止。
+/// 总量不足返回空(调用方跳过)。只拼**用户确认动作覆盖的段**——与 #167 备忘
+/// 「只拼用户确认过的段」一致;未确认段永不入选。
+fn pick_confirmed_sample_segs(pool: &[store::SegmentRecord]) -> Vec<store::SegmentRecord> {
+    let mut segs: Vec<store::SegmentRecord> = pool.to_vec();
+    segs.sort_by_key(|s| std::cmp::Reverse(s.end_ms.saturating_sub(s.start_ms)));
+    let mut acc = 0u64;
+    let mut picks = Vec::new();
+    for s in segs {
+        if acc >= store::AUTO_ENROLL_MS {
+            break;
+        }
+        acc += s.end_ms.saturating_sub(s.start_ms);
+        picks.push(s);
+    }
+    if acc < store::AUTO_ENROLL_MS {
+        return Vec::new();
+    }
+    picks
+}
+
+/// 确认样本落库:把 picks(多段拼接,凑够 10s 门槛——codex:单挑最长段会被
+/// append_confirmed_sample 的时长门拒掉,确认过的人物零样本,换模型 rebuild
+/// 直接把人清没)切音频写为人物样本;reinforce=true 时另做这些段的质心回灌
+/// (拆分确认路径用;普通关联的回灌由 spawn_feedback 整组承担,不在此重复)。
 fn spawn_confirmed_sample(
     app: &AppHandle,
     note_id: String,
     speaker_id: String,
     person_id: String,
     segments: Vec<store::SegmentRecord>,
-    seg: store::SegmentRecord,
+    picks: Vec<store::SegmentRecord>,
+    reinforce: bool,
 ) {
+    if picks.is_empty() {
+        eprintln!("确认样本跳过({person_id}):确认段总时长不足 10s");
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         let run = || -> anyhow::Result<()> {
@@ -4386,42 +4426,66 @@ fn spawn_confirmed_sample(
             let vp_store = store::VoiceprintStore::new(root);
             let _fb = FEEDBACK_GATE.lock().unwrap();
             // 切音频:与 feedback 同一口径(track_pcm + offset_ms,16k f32)。
+            // 多段拼接,每源全场 PCM 只读一次。
             let meta = store::audio::load_audio_meta(&dir);
-            let pcm = store::transcode::track_pcm(&dir, &seg.source)?;
-            let offset = meta.tracks.get(&seg.source).map(|t| t.offset_ms).unwrap_or(0);
-            let start = (seg.start_ms.saturating_sub(offset) as usize).saturating_mul(16);
-            let end = ((seg.end_ms.saturating_sub(offset) as usize).saturating_mul(16)).min(pcm.len());
-            anyhow::ensure!(start < end, "试听段落在音轨覆盖范围之外");
-            let wrote = vp_store.append_confirmed_sample(&person_id, &pcm[start..end], &note_id, &speaker_id)?;
+            let mut pcm_by_src: std::collections::HashMap<String, Vec<f32>> =
+                std::collections::HashMap::new();
+            let mut sample: Vec<f32> = Vec::new();
+            for seg in &picks {
+                if !pcm_by_src.contains_key(&seg.source) {
+                    pcm_by_src
+                        .insert(seg.source.clone(), store::transcode::track_pcm(&dir, &seg.source)?);
+                }
+                let pcm = &pcm_by_src[&seg.source];
+                let offset = meta.tracks.get(&seg.source).map(|t| t.offset_ms).unwrap_or(0);
+                let start = (seg.start_ms.saturating_sub(offset) as usize).saturating_mul(16);
+                let end = ((seg.end_ms.saturating_sub(offset) as usize).saturating_mul(16))
+                    .min(pcm.len());
+                if start < end {
+                    sample.extend_from_slice(&pcm[start..end]);
+                }
+            }
+            anyhow::ensure!(!sample.is_empty(), "确认段落全部在音轨覆盖范围之外");
+            let wrote =
+                vp_store.append_confirmed_sample(&person_id, &sample, &note_id, &speaker_id)?;
             if !wrote {
-                eprintln!("确认样本未写入(隔离/满员/空音频): {person_id}");
+                eprintln!("确认样本未写入(隔离/满员/时长门/空音频): {person_id}");
             }
-            // 单段回灌质心(模型门禁/账本/黑名单照过)。
-            let expected = current_speaker_model(&app);
-            let library_model = vp_store.load().embedding_model.clone();
-            let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
-            let mut needs_rebuild = false;
-            let now = chrono::Local::now().to_rfc3339();
-            let r = feedback::reinforce_person(
-                &dir,
-                &segments,
-                &feedback::SegFilter::Seqs(std::collections::BTreeSet::from([seg.seq])),
-                &person_id,
-                &vp_store,
-                &library_model,
-                &expected,
-                &mut embedder,
-                &now,
-                None,
-                &mut needs_rebuild,
-                false,
-            )?;
-            if needs_rebuild {
-                let st = app.state::<AppState>();
-                *st.embedder_cache.lock().unwrap() = None;
-                spawn_voiceprint_rebuild(&app, st.embedder_cache.clone(), "确认样本回灌纠错后质心置空");
+            if reinforce {
+                // 确认段回灌质心(模型门禁/账本/黑名单照过)。
+                let expected = current_speaker_model(&app);
+                let library_model = vp_store.load().embedding_model.clone();
+                let mut embedder = diar::SherpaEmbedder::new(&speaker_model_path_for(&expected))?;
+                let mut needs_rebuild = false;
+                let now = chrono::Local::now().to_rfc3339();
+                let seqs: std::collections::BTreeSet<u64> = picks.iter().map(|s| s.seq).collect();
+                let r = feedback::reinforce_person(
+                    &dir,
+                    &segments,
+                    &feedback::SegFilter::Seqs(seqs),
+                    &person_id,
+                    &vp_store,
+                    &library_model,
+                    &expected,
+                    &mut embedder,
+                    &now,
+                    None,
+                    &mut needs_rebuild,
+                    false,
+                )?;
+                if needs_rebuild {
+                    let st = app.state::<AppState>();
+                    *st.embedder_cache.lock().unwrap() = None;
+                    spawn_voiceprint_rebuild(
+                        &app,
+                        st.embedder_cache.clone(),
+                        "确认样本回灌纠错后质心置空",
+                    );
+                }
+                eprintln!("确认样本入库: {person_id} {} 段 → {r:?}", picks.len());
+            } else {
+                eprintln!("确认样本入库: {person_id} {} 段(回灌由关联流程承担)", picks.len());
             }
-            eprintln!("确认样本入库: {person_id} seg#{} → {r:?}", seg.seq);
             Ok(())
         };
         if let Err(e) = run() {
@@ -7573,10 +7637,28 @@ fn spawn_ack_reinforce(
                 }
             };
             let mut ops = refine::identify::load_ops(&dir);
+            let cluster = ops.ops.iter().find(|o| o.op_id == op_id).map(|o| o.cluster.clone());
             if let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) {
                 op.reinforce_skipped = skipped.or(Some("回执确认后已回灌".to_string()));
             }
             let _ = refine::identify::save_ops(&dir, &ops);
+            // 确认样本(codex 三轮):被确认目标若零样本,换模型 rebuild 会把人清没。
+            // 料 = 本 op 覆盖的段(用户「Good」确认的正是这组识别),凑长同一口径。
+            if let Some(cluster) = cluster {
+                let note = store::NoteStore::new(root.clone()).load(&note_id)?;
+                let pool: Vec<store::SegmentRecord> =
+                    note.segments.iter().filter(|s| seqs.contains(&s.seq)).cloned().collect();
+                let picks = pick_confirmed_sample_segs(&pool);
+                spawn_confirmed_sample(
+                    &app,
+                    note_id.clone(),
+                    cluster,
+                    target.clone(),
+                    note.segments,
+                    picks,
+                    false,
+                );
+            }
             Ok(())
         };
         if let Err(e) = run() {
