@@ -193,6 +193,9 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
         EditOp::DeleteSegments { id, moves } => {
             store.delete_segments(&id, &moves).map_err(|e| e.to_string())
         }
+        EditOp::RestoreSuppressed { id, seqs } => {
+            store.restore_suppressed(&id, &seqs).map(|_| ()).map_err(|e| e.to_string())
+        }
         EditOp::SetSegmentsSpeaker { id, moves, speaker_id } => store
             .set_segments_speaker(&id, &moves, &speaker_id)
             .map(|_| ())
@@ -903,6 +906,28 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             // 可能不同——finalize 的 IO 只作用于槽内 writer,Aing 必须
                                             // 跟随真正落盘的那条笔记,否则会给一条根本没被收尾的笔记
                                             // 触发 Aing(内容还在 owned 槽或已被后续会话占用)。
+                                            // 场景二期·同源双路自动折叠(issue #162):必须在
+                                            // spawn_refine 之前**同步**做——Aing 经 NoteStore 读段,
+                                            // 折叠先落,精修稿天然不含回声段。文件级操作毫秒量级,
+                                            // 不足以拖累收尾;失败只日志(折叠是增值,不挡 Aing)。
+                                            let fold_on = app
+                                                .path()
+                                                .app_data_dir()
+                                                .map(|d| crate::settings::load(&d).scene_auto_fold)
+                                                .unwrap_or(true);
+                                            if fold_on {
+                                                match crate::notes_dir(&app)
+                                                    .map(crate::store::NoteStore::new)
+                                                    .and_then(|st| st.fold_dual_path_echo(&o.note_id))
+                                                {
+                                                    Ok(0) => {}
+                                                    Ok(n) => eprintln!(
+                                                        "scene: 同源双路自动折叠 {n} 段回声({}),笔记页可展开恢复",
+                                                        o.note_id
+                                                    ),
+                                                    Err(e) => eprintln!("scene: 自动折叠失败(跳过): {e}"),
+                                                }
+                                            }
                                             crate::spawn_refine(app.clone(), o.note_id.clone(), true);
                                         }
                                         Err(e) => {

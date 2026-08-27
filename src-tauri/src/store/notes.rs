@@ -827,6 +827,91 @@ impl NoteStore {
     }
 }
 
+impl NoteStore {
+    /// 可逆折叠:把 seqs 追加进 segment-suppressions.jsonl(已抑制的跳过,幂等)。
+    /// 返回实际新增条数。场景二期自动折叠与将来其它折叠共用此原语。
+    pub fn suppress_segments(
+        &self,
+        id: &str,
+        seqs: &[u64],
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let existing = read_suppressions(&dir);
+        let fresh: Vec<u64> = seqs.iter().copied().filter(|q| !existing.contains(q)).collect();
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(SEGMENT_SUPPRESSIONS_FILE))?;
+        use std::io::Write as _;
+        for q in &fresh {
+            let line = serde_json::to_string(&SegmentSuppression {
+                seq: *q,
+                reason: reason.to_string(),
+            })?;
+            writeln!(f, "{line}")?;
+        }
+        Ok(fresh.len())
+    }
+
+    /// 恢复被折叠的段:整表重写去掉给定 seqs 的抑制行(损坏行原样保留)。
+    /// 返回移除条数。
+    pub fn restore_suppressed(&self, id: &str, seqs: &[u64]) -> anyhow::Result<usize> {
+        anyhow::ensure!(!seqs.is_empty(), "没有选中任何段落");
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let path = dir.join(SEGMENT_SUPPRESSIONS_FILE);
+        let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(0) };
+        let gone: std::collections::BTreeSet<u64> = seqs.iter().copied().collect();
+        let mut removed = 0usize;
+        let kept: Vec<&str> = raw
+            .lines()
+            .filter(|l| match serde_json::from_str::<SegmentSuppression>(l) {
+                Ok(r) if gone.contains(&r.seq) => {
+                    removed += 1;
+                    false
+                }
+                _ => !l.trim().is_empty(),
+            })
+            .collect();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let tmp = dir.join(".suppressions.tmp");
+        let mut body = kept.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(removed)
+    }
+
+    /// 场景二期·同源双路自动折叠(issue #162):scene.json 终判为 dual_path 时,
+    /// 把可见段里被 system 覆盖 ≥80% 的 mic 段(UI「选中可疑段」同口径)折叠为
+    /// 回声。可逆(reason=scene_dual_path,恢复走 restore_suppressed);幂等。
+    /// 返回本次折叠段数;非 dual_path 场 0。
+    pub fn fold_dual_path_echo(&self, id: &str) -> anyhow::Result<usize> {
+        let dir = self.note_dir(id)?;
+        let Some(sc) = crate::scene::load(&dir) else { return Ok(0) };
+        if sc.final_scene != crate::scene::SC_DUAL_PATH {
+            return Ok(0);
+        }
+        let note = self.load(id)?; // 已应用既有抑制:与前端可见集合一致
+        let picks = crate::scene::overlapped_mic_seqs(&note.segments);
+        if picks.is_empty() {
+            return Ok(0);
+        }
+        self.suppress_segments(id, &picks, "scene_dual_path")
+    }
+}
+
 fn read_suppressions(dir: &Path) -> std::collections::BTreeSet<u64> {
     let Ok(file) = fs::File::open(dir.join(SEGMENT_SUPPRESSIONS_FILE)) else {
         return std::collections::BTreeSet::new();
@@ -1030,6 +1115,58 @@ fn scan_max_end_ms(jsonl: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 场景二期折叠原语(issue #162):追加幂等/恢复往返/dual_path 场端到端/非双路零动作。
+    #[test]
+    fn suppress_restore_and_dual_path_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&NoteMeta {
+                schema_version: SCHEMA_VERSION,
+                id: "20260101-000000".into(),
+                title: "t".into(),
+                started_at: "t".into(),
+                ended_at: Some("t".into()),
+                state: "complete".into(),
+                calendar: None,
+                calendar_cleared: false,
+                asr_engine: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let segs = [
+            r#"{"seq":0,"source":"system","text":"甲","start_ms":0,"end_ms":10000}"#,
+            r#"{"seq":1,"source":"mic","text":"乙","start_ms":1000,"end_ms":3000}"#,
+            r#"{"seq":2,"source":"mic","text":"丙","start_ms":20000,"end_ms":22000}"#,
+        ];
+        std::fs::write(dir.join("segments.jsonl"), segs.join("\n")).unwrap();
+        // 非 dual_path(无 scene.json):零动作
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 0);
+        crate::scene::save(&dir, &crate::scene::SceneDoc {
+            schema_version: 1,
+            windows: vec![],
+            final_scene: crate::scene::SC_DUAL_PATH.into(),
+            backfilled: false,
+        }).unwrap();
+        // dual_path:seq1(全覆盖)折叠,seq2(不重叠)保留
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 1);
+        let note = store.load("20260101-000000").unwrap();
+        assert_eq!(note.segments.iter().map(|s| s.seq).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(note.suppressed_segments.len(), 1);
+        // 幂等:再折叠零新增
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 0);
+        // 恢复往返
+        assert_eq!(store.restore_suppressed("20260101-000000", &[1]).unwrap(), 1);
+        let note = store.load("20260101-000000").unwrap();
+        assert_eq!(note.segments.len(), 3, "恢复后回到可见集合");
+        // 再恢复:无事发生
+        assert_eq!(store.restore_suppressed("20260101-000000", &[1]).unwrap(), 0);
+    }
     use super::*;
     use crate::store::writer::NoteWriter;
 

@@ -8303,6 +8303,35 @@ fn delete_segments(
     })
 }
 
+/// 手动触发同源双路折叠(场景二期,issue #162):展开查看后想再收起时用。
+/// 与停录自动折叠同一实现(scene 终判 dual_path 才动作,幂等);Aing 中拒绝
+/// (折叠改变可见集合,管线整写会拿到折叠前后不一致的输入)。
+#[tauri::command]
+fn fold_scene_echo(app: AppHandle, state: State<AppState>, note_id: String) -> Result<usize, String> {
+    reject_if_active(&state, &note_id)?;
+    if app.state::<lifecycle::LifecycleHandle>().is_refining(&note_id) {
+        return Err(tr!("该笔记正在 Aing,请稍后再试", "This note is being refined by AI; try again later"));
+    }
+    let dir = notes_dir(&app).map_err(|e| e.to_string())?;
+    store::NoteStore::new(dir).fold_dual_path_echo(&note_id).map_err(|e| e.to_string())
+}
+
+/// 恢复被折叠的段(场景二期,issue #162):自动折叠的回声段/任何被抑制段回到
+/// 可见集合。录制中拒绝(与段落编辑同模式);Aing 中不拦——恢复只增不删,
+/// 管线整写读到的是恢复后的更全集合,无覆盖冲突。
+#[tauri::command]
+fn restore_suppressed_segments(
+    app: AppHandle,
+    state: State<AppState>,
+    note_id: String,
+    seqs: Vec<u64>,
+) -> Result<(), String> {
+    reject_if_active(&state, &note_id)?;
+    app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
+        op: lifecycle::machine::EditOp::RestoreSuppressed { id: note_id, seqs },
+    })
+}
+
 #[tauri::command]
 fn set_segments_speaker(
     app: AppHandle,
@@ -10765,6 +10794,8 @@ pub fn run() {
             set_segment_speaker,
             set_segments_speaker,
             delete_segments,
+            restore_suppressed_segments,
+            fold_scene_echo,
             pipeline_health,
             screen_capture_permission,
             request_screen_capture_permission,

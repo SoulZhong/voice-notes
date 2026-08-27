@@ -199,6 +199,9 @@ pub struct Settings {
     /// 录前设备检查自动择优(2026-08-22 设计):默认输入是蓝牙通话麦时,本场采集
     /// 自动改用内置/有线设备(不改系统设置)。默认开;关掉则回到弹窗提醒。
     pub auto_input_pick: bool,
+    /// 场景二期(issue #162):停录后同源双路场自动把回声段折叠(可逆,笔记页可
+    /// 展开恢复)。默认开;判定准确率经真会与人工试听验证(2026-08-27)。
+    pub scene_auto_fold: bool,
     /// 全局快捷键开关,消费任务:快捷键;默认关闭(避免未经用户同意即占用系统快捷键)。
     pub shortcut_enabled: bool,
     /// 全局快捷键组合,消费任务:快捷键。
@@ -303,6 +306,8 @@ struct SettingsRepr {
     language_filter: bool,
     #[serde(default = "default_true")]
     auto_input_pick: bool,
+    #[serde(default = "default_true")]
+    scene_auto_fold: bool,
     #[serde(default)]
     shortcut_enabled: bool,
     #[serde(default = "default_shortcut")]
@@ -422,6 +427,7 @@ impl From<SettingsRepr> for Settings {
             ui_lang: r.ui_lang,
             language_filter: r.language_filter,
             auto_input_pick: r.auto_input_pick,
+            scene_auto_fold: r.scene_auto_fold,
             shortcut_enabled: r.shortcut_enabled,
             shortcut: r.shortcut,
             tray_enabled: r.tray_enabled,
@@ -575,6 +581,7 @@ impl Default for Settings {
             ui_lang: default_ui_lang(),
             language_filter: true,
             auto_input_pick: true,
+            scene_auto_fold: true,
             shortcut_enabled: false,
             shortcut: default_shortcut(),
             tray_enabled: true,
@@ -891,6 +898,7 @@ mod tests {
         assert!(s.tray_enabled);
         let s = Settings { theme: "dark".into(), ui_lang: "en".into(),
             language_filter: false, shortcut_enabled: true, auto_input_pick: false,
+            scene_auto_fold: false,
             shortcut: "Alt+CmdOrCtrl+K".into(), tray_enabled: false, ..Default::default() };
         save(tmp.path(), &s).unwrap();
         let got = load(tmp.path());

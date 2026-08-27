@@ -37,7 +37,7 @@
     deleteSegment,
     setSegmentSpeaker,
     setSegmentsSpeaker,
-    deleteSegments,
+    deleteSegments, restoreSuppressedSegments, foldSceneEcho,
     clearNoteSpeakerPerson,
     noteAudioInfo,
     assignNoteSpeakerPerson,
@@ -849,6 +849,45 @@
             : [],
       });
     }
+    // 场景二期折叠横幅(issue #162):有被折叠段即显示——展开全部找回;
+    // dual_path 场展开后还能一键重新折叠(与停录自动折叠同实现)。
+    const foldedN = note?.suppressed_segments?.length ?? 0;
+    if (foldedN > 0 && canEdit)
+      out.push({
+        key: "folded",
+        level: "info",
+        text: t("notes.scene.folded", { n: foldedN }),
+        epoch: String(foldedN),
+        actions: [{
+          label: t("notes.scene.unfoldAll"),
+          run: async () => {
+            try {
+              await restoreSuppressedSegments(id, (note?.suppressed_segments ?? []).map((s) => s.seq));
+              await refresh();
+            } catch (e) {
+              error = t("common.loadFailed", { e });
+            }
+          },
+        }],
+      });
+    else if (foldedN === 0 && sc === "dual_path" && canEdit && overlappedMicSeqs(displaySegments).length > 0)
+      out.push({
+        key: "refold",
+        level: "info",
+        text: t("notes.scene.refoldHint", { n: overlappedMicSeqs(displaySegments).length }),
+        epoch: "refold",
+        actions: [{
+          label: t("notes.scene.refold"),
+          run: async () => {
+            try {
+              await foldSceneEcho(id);
+              await refresh();
+            } catch (e) {
+              error = t("common.loadFailed", { e });
+            }
+          },
+        }],
+      });
     if (playbackScheme === "mixed" && mixedInfo?.ab_caveat)
       out.push({ key: "abCaveat", level: "info", text: t("notes.mix.abCaveat") });
     return out;
