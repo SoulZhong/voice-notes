@@ -36,6 +36,32 @@ pub fn load(note_dir: &Path) -> Option<EmbedCache> {
     (c.schema_version == SCHEMA_VERSION).then_some(c)
 }
 
+/// 增量合并写入(录音期预热用,issue #164):按 (seq,start,end,source) 键 upsert,
+/// 不修剪既有条目(全量修剪仍归 embed_all 的整写)。盘上 model 与本批不符时整份
+/// 弃旧起新——缓存文件只有一个 model 位,混模型无意义。
+pub fn merge_save(
+    note_dir: &Path,
+    model: &str,
+    new_entries: Vec<EmbedCacheEntry>,
+) -> anyhow::Result<()> {
+    let mut entries = load(note_dir)
+        .filter(|c| c.model == model)
+        .map(|c| c.entries)
+        .unwrap_or_default();
+    for ne in new_entries {
+        match entries.iter_mut().find(|e| {
+            e.seq == ne.seq
+                && e.start_ms == ne.start_ms
+                && e.end_ms == ne.end_ms
+                && e.source == ne.source
+        }) {
+            Some(slot) => *slot = ne,
+            None => entries.push(ne),
+        }
+    }
+    save(note_dir, model, entries)
+}
+
 /// 原子写回。缓存可丢,不做父目录 fsync(与真值文件的持久性等级刻意区分)。
 pub fn save(note_dir: &Path, model: &str, entries: Vec<EmbedCacheEntry>) -> anyhow::Result<()> {
     let c = EmbedCache { schema_version: SCHEMA_VERSION, model: model.to_string(), entries };
