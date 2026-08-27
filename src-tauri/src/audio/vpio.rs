@@ -32,11 +32,20 @@ enum Backend {
 /// 带 Apple AEC 的麦克风采集，实现 `AudioCapture`。
 pub struct VpioMicrophone {
     backend: Option<Backend>,
+    /// 录前择优选中的输入设备 (AudioDeviceID, 名字):Some 时在 initialize 前注入
+    /// kAudioOutputUnitProperty_CurrentDevice(issue #165)。None = 跟随系统默认。
+    device: Option<(u32, String)>,
 }
 
 impl VpioMicrophone {
     pub fn new() -> Self {
-        Self { backend: None }
+        Self { backend: None, device: None }
+    }
+
+    /// 绑定录前择优结果。VPIO 由 Apple 通话链路自管设备,唯一改道入口就是这条
+    /// 属性注入;注入失败降级为默认设备(打日志),绝不挡录制。
+    pub fn with_device(device: Option<(u32, String)>) -> Self {
+        Self { backend: None, device }
     }
 }
 
@@ -49,7 +58,7 @@ impl Default for VpioMicrophone {
 impl AudioCapture for VpioMicrophone {
     fn start(&mut self, sink: Sender<AudioFrame>) -> anyhow::Result<()> {
         // 先试 VPIO；sink 用 clone 传入，失败时原 sink 仍可交给 cpal 回退。
-        match start_vpio(sink.clone()) {
+        match start_vpio(sink.clone(), self.device.clone()) {
             Ok(stop_tx) => {
                 self.backend = Some(Backend::Vpio(stop_tx));
                 // 原 sink 在此作用域结束时丢弃，不残留多余 Sender。
@@ -156,7 +165,10 @@ unsafe extern "C" fn input_cb(
 
 /// 在后台线程创建/配置/启动 VPIO，附 ready 握手：`start()` 阻塞至设备确认打开，
 /// 失败返回 Err（语义与 `microphone.rs` 完全一致）。成功返回 stop 发送端。
-fn start_vpio(sink: Sender<AudioFrame>) -> anyhow::Result<Sender<()>> {
+fn start_vpio(
+    sink: Sender<AudioFrame>,
+    device: Option<(u32, String)>,
+) -> anyhow::Result<Sender<()>> {
     // stop 通道：只用作信号，drop 发送端 = 断开 = 通知后台线程停止。
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(0);
     // ready 通道：后台线程回报设备是否真正打开。
@@ -164,7 +176,7 @@ fn start_vpio(sink: Sender<AudioFrame>) -> anyhow::Result<Sender<()>> {
 
     std::thread::spawn(move || {
         // 裸指针句柄全程只在本线程内出现，不跨线程，故无需 Send。
-        let handle = match unsafe { build_vpio_unit(sink) } {
+        let handle = match unsafe { build_vpio_unit(sink, device) } {
             Ok(h) => h,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -204,7 +216,10 @@ struct AuVoiceIoOtherAudioDuckingConfiguration {
 ///
 /// # Safety
 /// 直调 CoreAudio C API，操作裸 `AudioUnit` 句柄。仅在 `start_vpio` 的后台线程内调用。
-unsafe fn build_vpio_unit(sink: Sender<AudioFrame>) -> Result<VpioHandle, String> {
+unsafe fn build_vpio_unit(
+    sink: Sender<AudioFrame>,
+    device: Option<(u32, String)>,
+) -> Result<VpioHandle, String> {
     // 1) 定位并实例化 VoiceProcessingIO 组件。
     let desc = AudioComponentDescription {
         componentType: kAudioUnitType_Output,
@@ -255,6 +270,26 @@ unsafe fn build_vpio_unit(sink: Sender<AudioFrame>) -> Result<VpioHandle, String
     );
     if st != 0 {
         return Err(fail(unit, None, format!("关闭输出 IO 失败: OSStatus={st}")));
+    }
+
+    // 2.5) 录前择优设备注入(issue #165):必须在读原生格式/Initialize 之前——
+    //     换了设备,下面读到的才是新设备的原生率。注入失败只降级为系统默认
+    //     (Apple 链路自管),打日志不中止:择优是增值,不是门禁。
+    if let Some((dev_id, name)) = &device {
+        let id: u32 = *dev_id;
+        let st = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &id as *const _ as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if st == 0 {
+            eprintln!("VPIO 录前择优:本场输入改用「{name}」(id={id})");
+        } else {
+            eprintln!("VPIO 设备注入失败(OSStatus={st}),录前择优「{name}」未生效,沿用系统默认输入");
+        }
     }
 
     // 3) 客户端格式：读设备原生采样率，再设 f32 mono 非交错。请求 16k 会在 initialize 报
