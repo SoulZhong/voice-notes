@@ -277,21 +277,24 @@ impl RecordingSink for MixedSink {
         // ③ 有标记前缀:继承其计数与 metered;但若本场 base_ms 早于既有轨长,
         //   open() 会截短前缀——被丢弃的尾巴里的削波仍算在旧计数里,无从拆分,
         //   整体降标未测(计数只是粗值)。
-        let prior_file_ms = std::fs::metadata(&mixed_path)
+        let prior_data_bytes = std::fs::metadata(&mixed_path)
             .ok()
-            .map(|m| crate::store::audio::bytes_to_ms(
-                m.len().saturating_sub(crate::store::audio::HEADER_LEN),
-            ));
-        // 截短判定与 writer 的 open() 同口径(codex 四轮):对齐目标是
-        // base_ms − 该轨 offset_ms,不是 base_ms——mixed 轨中途出现
-        // (offset>0)时按 base_ms 比会漏报截短,旧尾巴计数错标已测。
+            .map(|m| m.len().saturating_sub(crate::store::audio::HEADER_LEN));
+        // 截短判定与 writer 的 open() 逐字节同口径(codex 四/五轮):对齐目标是
+        // ms_to_bytes(base_ms − 该轨 offset_ms)。两点教训:mixed 轨中途出现
+        // (offset>0)时按 base_ms 比会漏报;先换算成 ms 再比会把 <1ms 的截短
+        // 地板掉——计数要分辨个位数样本,比较就得在字节口径做。
         let mixed_offset_ms = crate::store::audio::track_offset_ms(&note_dir, MIXED_TRACK);
-        let will_truncate =
-            prior_file_ms.is_some_and(|ms| ms > base_ms.saturating_sub(mixed_offset_ms));
-        let (prior_clipped, prior_limited, prior_metered) = match (&prior_mix, prior_file_ms) {
-            (Some(m), _) => {
+        let target_bytes =
+            crate::store::audio::ms_to_bytes(base_ms.saturating_sub(mixed_offset_ms));
+        let will_truncate = prior_data_bytes.is_some_and(|b| b > target_bytes);
+        let (prior_clipped, prior_limited, prior_metered) = match (&prior_mix, prior_data_bytes) {
+            (Some(m), Some(_)) => {
                 (m.clipped_samples, m.limited_samples, m.limit_metered && !will_truncate)
             }
+            // 有标记无文件(如 m4a 解码失败被移成 .bad):旧计数描述的内容已不在,
+            // writer 将新建空轨——按全新轨起步,不继承亡灵计数(codex 五轮)。
+            (Some(_), None) => (0, 0, true),
             (None, Some(_)) => (0, 0, false), // 旧世界前缀:削波量未知
             (None, None) => (0, 0, true),     // 全新轨
         };

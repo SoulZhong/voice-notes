@@ -37,7 +37,7 @@ fn meta_guard() -> std::sync::MutexGuard<'static, ()> {
     META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn ms_to_bytes(ms: u64) -> u64 {
+pub fn ms_to_bytes(ms: u64) -> u64 {
     // 损坏的 segments.jsonl 可能带出天文数字 end_ms → base_ms:饱和乘法防回绕,
     // 上限交由调用方(open 对照 MAX_DATA_BYTES 拒绝),不在这里 panic。
     ms.saturating_mul(AUDIO_SAMPLE_RATE as u64) / 1000 * BYTES_PER_SAMPLE
