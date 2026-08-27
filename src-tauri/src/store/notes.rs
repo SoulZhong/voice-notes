@@ -929,7 +929,7 @@ impl NoteStore {
             let _guard = edit_guard();
             let _flock = write_lock(&dir)?;
             let suppressed = read_suppressions(&dir);
-            let segs: Vec<SegmentRecord> = read_jsonl_lines(&dir.join("segments.jsonl"))
+            let mut segs: Vec<SegmentRecord> = read_jsonl_lines(&dir.join("segments.jsonl"))
                 .into_iter()
                 .filter_map(|l| match l {
                     JsonlLine::Seg(r) if !suppressed.contains(&r.seq) => Some(r),
@@ -937,6 +937,16 @@ impl NoteStore {
                 })
                 .filter(|r| !r.text.trim().is_empty())
                 .collect();
+            // 时基投影与 load/前端同口径(codex 五轮):有 align.json 的场,mic 段
+            // 必须先映射到 system 时基再算重叠,否则挑出的集合与横幅宣称的不同。
+            if let Some(map) = crate::store::align::read(&dir) {
+                for s in segs.iter_mut() {
+                    if s.source == "mic" {
+                        s.start_ms = crate::player_align::map_ms(&map, s.start_ms);
+                        s.end_ms = crate::player_align::map_ms(&map, s.end_ms);
+                    }
+                }
+            }
             let picks = crate::scene::overlapped_mic_seqs(&segs);
             if picks.is_empty() {
                 return Ok(0);

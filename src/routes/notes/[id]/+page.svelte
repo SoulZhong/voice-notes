@@ -852,7 +852,7 @@
     // 场景二期折叠横幅(issue #162):有被折叠段即显示——展开全部找回;
     // dual_path 场展开后还能一键重新折叠(与停录自动折叠同实现)。
     const foldedN = note?.suppressed_segments?.length ?? 0;
-    if (foldedN > 0 && canEdit)
+    if (foldedN > 0 && canEdit && !refining)
       out.push({
         key: "folded",
         level: "info",

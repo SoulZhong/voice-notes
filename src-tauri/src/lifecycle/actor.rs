@@ -194,6 +194,18 @@ fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), 
             store.delete_segments(&id, &moves).map_err(|e| e.to_string())
         }
         EditOp::RestoreSuppressed { id, seqs } => {
+            // 与折叠同级拒绝(codex 五轮 P1):Aing worker 可能已装载折叠后的段集,
+            // 恢复标的 stale 会被它稍后整写的 stale=false 覆盖——恢复段无声消失
+            // 且无重跑提示。重转写同理(提交整表换 seq+删抑制表)。
+            if refining_ids.iter().any(|r| r == &id) {
+                return Err("该笔记正在 Aing,请稍后再试".to_string());
+            }
+            {
+                let st = app.state::<crate::AppState>();
+                if crate::retranscribing_blocks_refine(&st.retranscribing, &id) {
+                    return Err("该笔记正在重转写,请稍后再试".to_string());
+                }
+            }
             store.restore_suppressed(&id, &seqs).map(|_| ()).map_err(|e| e.to_string())
         }
         EditOp::FoldSceneEcho { id } => {
