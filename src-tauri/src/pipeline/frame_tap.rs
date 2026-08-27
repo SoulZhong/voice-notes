@@ -559,21 +559,31 @@ impl AudioCapture for TappedCapture {
                 let _ = done_tx.send(());
             });
             if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
+                // 第一超时就是事故本体(codex 三轮):采集后端攥着发送端没退,
+                // 它那条线程已经泄漏——取消旗随后多半能让 tap 体面退场,但
+                // 遥测/告警必须记在这里,否则最典型的卡死(本 issue 的蓝牙麦
+                // 现场)反而无声无息。
+                let hint = match source {
+                    crate::audio::Source::Mic => "建议尽快重启应用并改用内置麦克风",
+                    _ => "建议尽快重启应用",
+                };
+                eprintln!(
+                    "[采集] {} 采集线程收尾超时(疑似卡死在设备调用,线程泄漏),已升取消旗让 tap 退场;{hint}",
+                    source.as_str()
+                );
+                crate::telemetry::report_error(
+                    crate::telemetry::ErrorKind::CaptureTeardown,
+                    &format!("{} 采集线程收尾超时(后端线程泄漏),升旗自愈", source.as_str()),
+                );
                 self.tap_cancel.store(true, std::sync::atomic::Ordering::Release);
                 if done_rx.recv_timeout(TAP_JOIN_TIMEOUT).is_err() {
-                    // 文案按源定制(codex 二轮 P2):system 轨与麦克风无关,
-                    // 指错子系统会把用户支去错误的排障方向。
-                    let hint = match source {
-                        crate::audio::Source::Mic => "建议尽快重启应用并改用内置麦克风",
-                        _ => "建议尽快重启应用",
-                    };
                     eprintln!(
-                        "[采集] {} tap 线程超时未退出(取消旗也未生效),放弃等待继续收尾;线程泄漏,{hint}",
+                        "[采集] {} tap 线程也未退出(取消旗未生效,罕见:疑似卡在满通道 send),放弃等待继续收尾",
                         source.as_str()
                     );
                     crate::telemetry::report_error(
                         crate::telemetry::ErrorKind::CaptureTeardown,
-                        &format!("{} 采集/tap 线程收尾超时,已放弃(线程泄漏)", source.as_str()),
+                        &format!("{} tap 线程取消旗后仍未退出,已放弃(双线程泄漏)", source.as_str()),
                     );
                 }
             }
