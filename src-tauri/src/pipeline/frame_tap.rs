@@ -395,6 +395,11 @@ impl GapStormDetector {
             return None; // 窗未满,不判——样本不足的比例没有意义
         }
         let ratio = cumulative_gap_ms.saturating_sub(g0) as f64 / span.as_millis().max(1) as f64;
+        // 钳制到 1.0(2026-08-27 实测:采集线程卡死恢复后,整段停摆期攒的补零一次性
+        // 计入累计值,60s 窗读出「5300%」——数值真实反映了欠账,但作为「窗内占比」
+        // 展示就是胡话,also 见 issue #123 的口径清单)。>100% 与 =100% 的处置一样:
+        // 这一窗全是洞。
+        let ratio = ratio.min(1.0);
         if ratio > self.threshold {
             if self.armed {
                 self.armed = false;
@@ -1670,6 +1675,23 @@ mod tests {
             }
         }
         assert_eq!(got, 40, "stop 前已在途的帧一帧不许丢");
+    }
+
+    /// 比例钳制(issue #123 口径):采集线程卡死恢复后,停摆期攒的补零一次性入账,
+    /// 原始比例可冲到 53(=5300%)——展示为「窗内占比」必须钳回 100%。
+    #[test]
+    fn storm_ratio_is_clamped_to_100_percent() {
+        let mut d = GapStormDetector::new(std::time::Duration::from_secs(60), 0.05);
+        let t0 = Instant::now();
+        assert!(d.observe(t0, 0).is_none());
+        // 61s 后一次性入账 53 分钟欠账
+        let t1 = t0 + std::time::Duration::from_secs(61);
+        match d.observe(t1, 53 * 60 * 1000) {
+            Some(GapStormEvent::Storm(r)) => {
+                assert!(r <= 1.0, "窗内占比不得超过 100%,得 {r}");
+            }
+            other => panic!("应起风暴,得 {other:?}"),
+        }
     }
 
     /// 卡死采集线程不拖死 stop(issue #182 回归):后端把 sink 发送端泄漏给一条
