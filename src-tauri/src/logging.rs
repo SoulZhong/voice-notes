@@ -39,7 +39,11 @@ fn redirect_stdio_to_file_windows(app_data: &Path) {
     let path = logs.join("stderr.log");
     if let Ok(md) = std::fs::metadata(&path) {
         if md.len() > ROTATE_BYTES {
-            let _ = std::fs::rename(&path, logs.join("stderr.old.log"));
+            // Windows 的 rename 不覆盖既有目标(unix 会):先删旧代,否则第二次轮转
+            // 起永远失败,stderr.log 无界增长(codex)。
+            let old = logs.join("stderr.old.log");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&path, &old);
         }
     }
     let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {

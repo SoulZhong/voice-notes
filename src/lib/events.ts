@@ -197,7 +197,7 @@ export function onNoteRealigned(cb: (e: NoteRealignedEvent) => void) {
  * `source` 必须看:system 轨也会报风暴,那是系统采集出事,排障动作与麦克风完全不同。 */
 export type SourceHealthEvent = {
   source: "mic" | "system";
-  state: "recovered" | "lost" | "gap_storm" | "gap_storm_over";
+  state: "recovered" | "lost" | "gap_storm" | "gap_storm_over" | "unmonitored";
   gap_pct?: number;
 };
 
