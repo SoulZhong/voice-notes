@@ -284,11 +284,14 @@ unsafe fn build_vpio_unit(
     //     (Apple 链路自管),打日志不中止:择优是增值,不是门禁。
     if let Some((dev_id, name)) = &device {
         let id: u32 = *dev_id;
+        // element 1 = 输入侧(codex P1):VPIO 分管输入/输出两台设备,element 0 是
+        // 输出设备——绑错侧要么拒收纯输入设备白白回退 cpal,要么"成功"了实际
+        // 还在录蓝牙默认麦。WebRTC ADM 同款用法:输入设备一律挂 element 1。
         let st = AudioUnitSetProperty(
             unit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
-            0,
+            1,
             &id as *const _ as *const c_void,
             std::mem::size_of::<u32>() as u32,
         );
