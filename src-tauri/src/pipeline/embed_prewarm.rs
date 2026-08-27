@@ -29,8 +29,12 @@ pub struct Job {
 
 /// 攒批阈值:每满 8 条合并写一次 embeddings.json,避免逐段整写 O(n²) 磁盘量。
 const FLUSH_EVERY: usize = 8;
-/// 音频未落齐的段最多重试次数(每轮间隔 = 队列空闲超时 10s)。
+/// 音频未落齐的段最多重试次数。
 const MAX_DEFERS: u8 = 10;
+/// 推迟重试间隔:每条推迟项挂到期时刻,**每圈**都处理到期项——连续 final 抵达
+/// (间隔 < 队列超时)时 recv 永远 Ok,只靠超时拍重试会被饿死(codex P1),
+/// 停录即起的自动 Aing 会带着这些未缓存段付全款。
+const DEFER_RETRY: Duration = Duration::from_secs(3);
 
 static TX: Mutex<Option<crossbeam_channel::Sender<Job>>> = Mutex::new(None);
 
@@ -52,8 +56,8 @@ fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Job>) {
     let mut embedder: Option<(String, crate::diar::SherpaEmbedder)> = None;
     // 待写批:按 (note_dir, model) 攒;正常一场只有一个键。
     let mut pending: HashMap<(PathBuf, String), Vec<EmbedCacheEntry>> = HashMap::new();
-    // 音频未落齐推迟重试的段。
-    let mut deferred: Vec<(Job, u8)> = Vec::new();
+    // 音频未落齐推迟重试的段:(job, 已试次数, 到期时刻)。
+    let mut deferred: Vec<(Job, u8, std::time::Instant)> = Vec::new();
     loop {
         let job = match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(j) => Some(j),
@@ -66,11 +70,16 @@ fn worker(app: tauri::AppHandle, rx: crossbeam_channel::Receiver<Job>) {
         if let Some(job) = job {
             handle(&app, job, 0, &mut embedder, &mut pending, &mut deferred);
         } else {
-            // 空闲拍:先把推迟的段再试一轮,再把攒着的批落盘。
-            for (job, tries) in std::mem::take(&mut deferred) {
-                handle(&app, job, tries, &mut embedder, &mut pending, &mut deferred);
-            }
+            // 空闲拍:攒着的批落盘(重试不等这一拍,见下)。
             flush_all(&mut pending);
+        }
+        // 每圈处理到期的推迟项(不管这圈是来活还是超时)。
+        let now = std::time::Instant::now();
+        let (due, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut deferred).into_iter().partition(|(_, _, at)| *at <= now);
+        deferred = keep;
+        for (job, tries, _) in due {
+            handle(&app, job, tries, &mut embedder, &mut pending, &mut deferred);
         }
         // 攒批落盘(逐键判阈值)。
         let full: Vec<(PathBuf, String)> = pending
@@ -105,7 +114,7 @@ fn handle(
     tries: u8,
     embedder: &mut Option<(String, crate::diar::SherpaEmbedder)>,
     pending: &mut HashMap<(PathBuf, String), Vec<EmbedCacheEntry>>,
-    deferred: &mut Vec<(Job, u8)>,
+    deferred: &mut Vec<(Job, u8, std::time::Instant)>,
 ) {
     let dur = job.end_ms.saturating_sub(job.start_ms);
     if dur < crate::refine::recluster::MIN_EMBED_MS {
@@ -139,7 +148,7 @@ fn handle(
         Ok(None) => {
             // 音频尚未落齐:推迟重试。半截音频算出的向量与离线不一致,宁缺毋滥。
             if tries < MAX_DEFERS {
-                deferred.push((job, tries + 1));
+                deferred.push((job, tries + 1, std::time::Instant::now() + DEFER_RETRY));
             }
         }
         Err(e) => eprintln!("预热嵌入失败(本段放弃,Aing 时再算): {e}"),
