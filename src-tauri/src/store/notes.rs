@@ -903,12 +903,13 @@ impl NoteStore {
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &path)?;
         drop(_flock);
-        // 展开改变可见原始集合(codex 四轮,与折叠对称):已有修订稿的场不标 stale,
-        // 默认视图仍缺刚恢复的段、横幅又没了,动作看着无效。
+        // 展开改变可见原始集合(codex 四轮,与折叠对称):已有修订稿的场必须标
+        // stale。标记失败如实报错(codex 六轮):恢复已生效但精修视图会静默缺段,
+        // 吞错等于对用户撒谎——报错里说清已恢复、建议重新 Aing。
         if crate::store::aing_exists(&dir) {
-            if let Err(e) = crate::store::mark_refined_stale(&dir) {
-                eprintln!("展开:修订稿标 stale 失败(视图可能暂缺恢复段): {e}");
-            }
+            crate::store::mark_refined_stale(&dir).map_err(|e| {
+                anyhow::anyhow!("段已恢复,但修订稿过期标记失败(建议手动重新 Aing): {e}")
+            })?;
         }
         Ok(removed)
     }
@@ -958,9 +959,9 @@ impl NoteStore {
         // 「修订稿已过期,重新 Aing」提示。停录自动折叠路径此时还没有 aing.json,
         // 天然不进这支。(suppress 的 flock 已释放,mark 内部自取 NoteLock 不撞。)
         if n > 0 && crate::store::aing_exists(&dir) {
-            if let Err(e) = crate::store::mark_refined_stale(&dir) {
-                eprintln!("scene 折叠:修订稿标 stale 失败(视图可能暂含回声段): {e}");
-            }
+            crate::store::mark_refined_stale(&dir).map_err(|e| {
+                anyhow::anyhow!("已折叠 {n} 段,但修订稿过期标记失败(建议手动重新 Aing): {e}")
+            })?;
         }
         Ok(n)
     }

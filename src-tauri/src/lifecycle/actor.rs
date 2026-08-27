@@ -216,6 +216,10 @@ fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), 
             }
             // 重转写同样拒(codex 三轮):提交会整表换 seq 并删抑制表——先折叠
             // 后被整替,成功回执成了谎话;worker 已持锁时这里也只会忙碌失败。
+            // 已知窄竞态(codex 六轮,记录不设防):重转写在本判定之后、折叠写入
+            // 前后才占槽时,其提交仍会整表重建并清抑制——这与「任何编辑赶在重转写
+            // 提交前」同一语义(提交本就以新表为准),亚秒窗口且都是用户自己的
+            // 动作,不为它建编辑代次系统。
             {
                 let st = app.state::<crate::AppState>();
                 if crate::retranscribing_blocks_refine(&st.retranscribing, &id) {
