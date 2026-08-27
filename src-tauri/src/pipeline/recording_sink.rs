@@ -256,6 +256,10 @@ impl RecordingSink for MixedSink {
         // 文件,旧标记(描述装配前内容)一旦残留,本场异常中断后 mixed_untrusted 会
         // 拿旧读数为已被改动的文件背书。清不掉就整体退回方案 A:混音是纯增值旁路,
         // 宁可这场没有成品轨,不可留下"标记与内容脱钩"的可能。
+        // 续录场次不清零观测(codex):mixed.wav 前缀是上一场的内容,其削波计数
+        // 也是整文件读数的一部分。清标记前留存,定稿时与本场计数相加。
+        // 前缀计数仅在旧标记 limit_metered 时可信;混入未测前缀时整体也只能算未测。
+        let prior_mix = crate::store::audio::track_mix(&note_dir, MIXED_TRACK);
         if let Err(e) = crate::store::audio::clear_track_mix(&note_dir, MIXED_TRACK) {
             eprintln!("续录装配清旧 mixed 完整性标记失败,本场退回双轨方案: {e}");
             return w;
@@ -267,6 +271,33 @@ impl RecordingSink for MixedSink {
         // 定稿时写 MixInfo.seek_offset_ms 用:线程要在两源 sink 全部 drop 之后才收尾,
         // 彼时 first_frame_offset 已是终值(它只在首帧记录一次,之后只读)。
         let finalize_offsets = self.first_offsets.clone();
+        // (prior_clipped, prior_limited, prior_metered)。三种前缀形态(codex 三处收口):
+        // ① 全新轨(盘上无 mixed.wav):已测零起步;
+        // ② 旧世界前缀(有文件无 MixInfo,一期形态):计数未知,整体只能未测;
+        // ③ 有标记前缀:继承其计数与 metered;但若本场 base_ms 早于既有轨长,
+        //   open() 会截短前缀——被丢弃的尾巴里的削波仍算在旧计数里,无从拆分,
+        //   整体降标未测(计数只是粗值)。
+        let prior_data_bytes = std::fs::metadata(&mixed_path)
+            .ok()
+            .map(|m| m.len().saturating_sub(crate::store::audio::HEADER_LEN));
+        // 截短判定与 writer 的 open() 逐字节同口径(codex 四/五轮):对齐目标是
+        // ms_to_bytes(base_ms − 该轨 offset_ms)。两点教训:mixed 轨中途出现
+        // (offset>0)时按 base_ms 比会漏报;先换算成 ms 再比会把 <1ms 的截短
+        // 地板掉——计数要分辨个位数样本,比较就得在字节口径做。
+        let mixed_offset_ms = crate::store::audio::track_offset_ms(&note_dir, MIXED_TRACK);
+        let target_bytes =
+            crate::store::audio::ms_to_bytes(base_ms.saturating_sub(mixed_offset_ms));
+        let will_truncate = prior_data_bytes.is_some_and(|b| b > target_bytes);
+        let (prior_clipped, prior_limited, prior_metered) = match (&prior_mix, prior_data_bytes) {
+            (Some(m), Some(_)) => {
+                (m.clipped_samples, m.limited_samples, m.limit_metered && !will_truncate)
+            }
+            // 有标记无文件(如 m4a 解码失败被移成 .bad):旧计数描述的内容已不在,
+            // writer 将新建空轨——按全新轨起步,不继承亡灵计数(codex 五轮)。
+            (Some(_), None) => (0, 0, true),
+            (None, Some(_)) => (0, 0, false), // 旧世界前缀:削波量未知
+            (None, None) => (0, 0, true),     // 全新轨
+        };
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
             // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
@@ -366,6 +397,15 @@ impl RecordingSink for MixedSink {
                                 origin: "live".into(),
                                 seek_offset_ms,
                                 track_ms,
+                                // 削波观测(issue #124):没有它,削波量只能事后解码
+                                // m4a 反推。整文件口径 = 上一场留存 + 本场。
+                                clipped_samples: prior_clipped
+                                    + mixer.limit_stats().clipped_samples,
+                                limited_samples: prior_limited
+                                    + mixer.limit_stats().limited_samples,
+                                // 前缀未测(仪表化前录的)则整文件也只能标未测,
+                                // 计数仅为下界
+                                limit_metered: prior_metered,
                             },
                         ) {
                             eprintln!("[mix] 完整性标记写入失败(轨内容不受影响): {e}");

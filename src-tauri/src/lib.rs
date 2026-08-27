@@ -11845,6 +11845,9 @@ mod tests {
                 origin: "live".into(),
                 seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
                 track_ms: 1000,
+                clipped_samples: 0,
+                limited_samples: 0,
+                limit_metered: true,
             }),
             ..Default::default()
         });

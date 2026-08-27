@@ -37,7 +37,7 @@ fn meta_guard() -> std::sync::MutexGuard<'static, ()> {
     META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn ms_to_bytes(ms: u64) -> u64 {
+pub fn ms_to_bytes(ms: u64) -> u64 {
     // 损坏的 segments.jsonl 可能带出天文数字 end_ms → base_ms:饱和乘法防回绕,
     // 上限交由调用方(open 对照 MAX_DATA_BYTES 拒绝),不在这里 panic。
     ms.saturating_mul(AUDIO_SAMPLE_RATE as u64) / 1000 * BYTES_PER_SAMPLE
@@ -125,6 +125,21 @@ pub struct MixInfo {
     /// ——消费端 mixed_untrusted 拿它与源轨全长终点比对,codex P1 修正)。
     /// 未转码时 mixed_untrusted 的时长读数来源。
     pub track_ms: u64,
+    /// 混音和 |x|>1.0 的样本数(issue #124 观测):软限幅接手前注定被硬削的量,
+    /// 即旧行为的削波计数。老记录缺键读 0。
+    #[serde(default, skip_serializing_if = "audio_stat_is_zero")]
+    pub clipped_samples: u64,
+    /// 混音和超过软限幅拐点、被压过的样本数(含上一类)。
+    #[serde(default, skip_serializing_if = "audio_stat_is_zero")]
+    pub limited_samples: u64,
+    /// 计数是否出自限幅观测(codex:未测≠零)。老记录缺键读 false =「仪表化之前
+    /// 的录音,削波量未知」;新写恒 true,此时计数为 0 才真正表示「干净」。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub limit_metered: bool,
+}
+
+fn audio_stat_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// 墙钟-轨时间轴对账:该轨在本场录制里实际落盘的时长 vs 同一场的墙钟时长。
@@ -491,6 +506,19 @@ pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Res
     meta.schema_version = 1;
     meta.tracks.entry(source.to_string()).or_default().mix = Some(mix);
     save_audio_meta(note_dir, &meta)
+}
+
+/// 读某轨 offset_ms(截短判定与 open() 对齐同口径用;缺项按 0,与 open 的
+/// 丢档重建路径殊途同归——那条路径反推出的 offset 也以「文件尾≈base」为不变式)。
+pub fn track_offset_ms(note_dir: &Path, source: &str) -> u64 {
+    let _guard = meta_guard();
+    load_audio_meta(note_dir).tracks.get(source).map(|t| t.offset_ms).unwrap_or(0)
+}
+
+/// 读成品轨完整性标记(续录装配在 clear 前留存上一场计数用;无标记 None)。
+pub fn track_mix(note_dir: &Path, source: &str) -> Option<MixInfo> {
+    let _guard = meta_guard();
+    load_audio_meta(note_dir).tracks.get(source)?.mix.clone()
 }
 
 /// 清成品轨完整性标记。**任何可能改动 mixed 轨字节的操作开始之前必须调用**
@@ -1449,6 +1477,9 @@ mod tests {
             origin: "live".into(),
             seek_offset_ms: [("system".to_string(), 120u64)].into_iter().collect(),
             track_ms: 5000,
+            clipped_samples: 0,
+            limited_samples: 0,
+            limit_metered: true,
         };
         set_track_mix(dir.path(), "mixed", mix.clone()).unwrap();
         let meta = load_audio_meta(dir.path());
