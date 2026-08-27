@@ -827,6 +827,146 @@ impl NoteStore {
     }
 }
 
+impl NoteStore {
+    /// 可逆折叠:把 seqs 追加进 segment-suppressions.jsonl(已抑制的跳过,幂等)。
+    /// 返回实际新增条数。场景二期自动折叠与将来其它折叠共用此原语。
+    pub fn suppress_segments(
+        &self,
+        id: &str,
+        seqs: &[u64],
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        Self::suppress_segments_locked(&dir, seqs, reason)
+    }
+
+    /// 已持 edit_guard+write_lock 的内核(fold 全程持锁复用;guard 不可重入,
+    /// 公开入口与 fold 各拿一次,绝不嵌套)。
+    fn suppress_segments_locked(dir: &Path, seqs: &[u64], reason: &str) -> anyhow::Result<usize> {
+        let existing = read_suppressions(dir);
+        let fresh: Vec<u64> = seqs.iter().copied().filter(|q| !existing.contains(q)).collect();
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(SEGMENT_SUPPRESSIONS_FILE))?;
+        use std::io::Write as _;
+        for q in &fresh {
+            let line = serde_json::to_string(&SegmentSuppression {
+                seq: *q,
+                reason: reason.to_string(),
+            })?;
+            writeln!(f, "{line}")?;
+        }
+        Ok(fresh.len())
+    }
+
+    /// 恢复被折叠的段:整表重写去掉给定 seqs 的抑制行(损坏行原样保留)。
+    /// 返回移除条数。
+    pub fn restore_suppressed(&self, id: &str, seqs: &[u64]) -> anyhow::Result<usize> {
+        anyhow::ensure!(!seqs.is_empty(), "没有选中任何段落");
+        let _guard = edit_guard();
+        let dir = self.note_dir(id)?;
+        let _flock = write_lock(&dir)?;
+        let path = dir.join(SEGMENT_SUPPRESSIONS_FILE);
+        // 只有「文件不存在」算空表;读失败(权限/IO/非 UTF-8)必须报错——静默
+        // Ok(0) 会让「展开全部」显示成功而段永远藏着(codex)。
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(anyhow::anyhow!("抑制表读取失败: {e}")),
+        };
+        let gone: std::collections::BTreeSet<u64> = seqs.iter().copied().collect();
+        let mut removed = 0usize;
+        let kept: Vec<&str> = raw
+            .lines()
+            .filter(|l| match serde_json::from_str::<SegmentSuppression>(l) {
+                Ok(r) if gone.contains(&r.seq) => {
+                    removed += 1;
+                    false
+                }
+                _ => !l.trim().is_empty(),
+            })
+            .collect();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let tmp = dir.join(".suppressions.tmp");
+        let mut body = kept.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
+        drop(_flock);
+        // 展开改变可见原始集合(codex 四轮,与折叠对称):已有修订稿的场必须标
+        // stale。标记失败如实报错(codex 六轮):恢复已生效但精修视图会静默缺段,
+        // 吞错等于对用户撒谎——报错里说清已恢复、建议重新 Aing。
+        if crate::store::aing_exists(&dir) {
+            crate::store::mark_refined_stale(&dir).map_err(|e| {
+                anyhow::anyhow!("段已恢复,但修订稿过期标记失败(建议手动重新 Aing): {e}")
+            })?;
+        }
+        Ok(removed)
+    }
+
+    /// 场景二期·同源双路自动折叠(issue #162):scene.json 终判为 dual_path 时,
+    /// 把可见段里被 system 覆盖 ≥80% 的 mic 段(UI「选中可疑段」同口径)折叠为
+    /// 回声。可逆(reason=scene_dual_path,恢复走 restore_suppressed);幂等。
+    /// 返回本次折叠段数;非 dual_path 场 0。
+    pub fn fold_dual_path_echo(&self, id: &str) -> anyhow::Result<usize> {
+        let dir = self.note_dir(id)?;
+        let Some(sc) = crate::scene::load(&dir) else { return Ok(0) };
+        if sc.final_scene != crate::scene::SC_DUAL_PATH {
+            return Ok(0);
+        }
+        // 选段与写入同一把锁(codex 四轮):另一实例/重转写在 load 与写入之间整表
+        // 换 seq 时,旧号写进新表会把无关段藏掉。锁下现读现算,load 缓存不参与。
+        let n = {
+            let _guard = edit_guard();
+            let _flock = write_lock(&dir)?;
+            let suppressed = read_suppressions(&dir);
+            let mut segs: Vec<SegmentRecord> = read_jsonl_lines(&dir.join("segments.jsonl"))
+                .into_iter()
+                .filter_map(|l| match l {
+                    JsonlLine::Seg(r) if !suppressed.contains(&r.seq) => Some(r),
+                    _ => None,
+                })
+                .filter(|r| !r.text.trim().is_empty())
+                .collect();
+            // 时基投影与 load/前端同口径(codex 五轮):有 align.json 的场,mic 段
+            // 必须先映射到 system 时基再算重叠,否则挑出的集合与横幅宣称的不同。
+            if let Some(map) = crate::store::align::read(&dir) {
+                for s in segs.iter_mut() {
+                    if s.source == "mic" {
+                        s.start_ms = crate::player_align::map_ms(&map, s.start_ms);
+                        s.end_ms = crate::player_align::map_ms(&map, s.end_ms);
+                    }
+                }
+            }
+            let picks = crate::scene::overlapped_mic_seqs(&segs);
+            if picks.is_empty() {
+                return Ok(0);
+            }
+            Self::suppress_segments_locked(&dir, &picks, "scene_dual_path")?
+        };
+        // 历史/回填场折叠(codex):盘上已有修订稿时,精修段落仍引用刚被折叠的
+        // 段——默认视图会继续放回声,横幅却说折叠了。整份标 stale,UI 走既有的
+        // 「修订稿已过期,重新 Aing」提示。停录自动折叠路径此时还没有 aing.json,
+        // 天然不进这支。(suppress 的 flock 已释放,mark 内部自取 NoteLock 不撞。)
+        if n > 0 && crate::store::aing_exists(&dir) {
+            crate::store::mark_refined_stale(&dir).map_err(|e| {
+                anyhow::anyhow!("已折叠 {n} 段,但修订稿过期标记失败(建议手动重新 Aing): {e}")
+            })?;
+        }
+        Ok(n)
+    }
+}
+
 fn read_suppressions(dir: &Path) -> std::collections::BTreeSet<u64> {
     let Ok(file) = fs::File::open(dir.join(SEGMENT_SUPPRESSIONS_FILE)) else {
         return std::collections::BTreeSet::new();
@@ -1030,6 +1170,58 @@ fn scan_max_end_ms(jsonl: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 场景二期折叠原语(issue #162):追加幂等/恢复往返/dual_path 场端到端/非双路零动作。
+    #[test]
+    fn suppress_restore_and_dual_path_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NoteStore::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&NoteMeta {
+                schema_version: SCHEMA_VERSION,
+                id: "20260101-000000".into(),
+                title: "t".into(),
+                started_at: "t".into(),
+                ended_at: Some("t".into()),
+                state: "complete".into(),
+                calendar: None,
+                calendar_cleared: false,
+                asr_engine: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let segs = [
+            r#"{"seq":0,"source":"system","text":"甲","start_ms":0,"end_ms":10000}"#,
+            r#"{"seq":1,"source":"mic","text":"乙","start_ms":1000,"end_ms":3000}"#,
+            r#"{"seq":2,"source":"mic","text":"丙","start_ms":20000,"end_ms":22000}"#,
+        ];
+        std::fs::write(dir.join("segments.jsonl"), segs.join("\n")).unwrap();
+        // 非 dual_path(无 scene.json):零动作
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 0);
+        crate::scene::save(&dir, &crate::scene::SceneDoc {
+            schema_version: 1,
+            windows: vec![],
+            final_scene: crate::scene::SC_DUAL_PATH.into(),
+            backfilled: false,
+        }).unwrap();
+        // dual_path:seq1(全覆盖)折叠,seq2(不重叠)保留
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 1);
+        let note = store.load("20260101-000000").unwrap();
+        assert_eq!(note.segments.iter().map(|s| s.seq).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(note.suppressed_segments.len(), 1);
+        // 幂等:再折叠零新增
+        assert_eq!(store.fold_dual_path_echo("20260101-000000").unwrap(), 0);
+        // 恢复往返
+        assert_eq!(store.restore_suppressed("20260101-000000", &[1]).unwrap(), 1);
+        let note = store.load("20260101-000000").unwrap();
+        assert_eq!(note.segments.len(), 3, "恢复后回到可见集合");
+        // 再恢复:无事发生
+        assert_eq!(store.restore_suppressed("20260101-000000", &[1]).unwrap(), 0);
+    }
     use super::*;
     use crate::store::writer::NoteWriter;
 

@@ -490,6 +490,11 @@ export const setSegmentsSpeaker = (noteId: string, moves: [number, string][], sp
 /** 批量删段(同源双路清洗):逐段 expected_text CAS,任一失配整体失败零写入。 */
 export const deleteSegments = (noteId: string, moves: [number, string][]) =>
   invoke<void>("delete_segments", { noteId, moves });
+/** 恢复被折叠的段(场景二期,issue #162):抑制表移除,段回到可见集合。 */
+export const restoreSuppressedSegments = (noteId: string, seqs: number[]) =>
+  invoke<void>("restore_suppressed_segments", { noteId, seqs });
+/** 手动触发同源双路折叠(与停录自动折叠同实现,幂等);返回折叠段数。 */
+export const foldSceneEcho = (noteId: string) => invoke<void>("fold_scene_echo", { noteId });
 
 /** 说话人 id 排序：S2 < S10（数值序）；非 S<n> 形态沉底按字典序。 */
 export function speakerIdCompare(a: string, b: string): number {

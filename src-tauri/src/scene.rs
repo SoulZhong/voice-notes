@@ -311,3 +311,57 @@ mod tests {
         assert_eq!(doc.final_scene, SC_DUAL_PATH);
     }
 }
+
+/// UI「选中可疑段」同口径(src/lib/segPick.ts 的 overlappedMicSeqs 逐位镜像):
+/// mic 段时长被 system 段覆盖 ≥80% 即命中。输入应为**未被抑制**的段集合
+/// (与前端 displaySegments 一致)。二期自动折叠与手动选中共用一个口径,
+/// 两边判出的集合永远相同。
+pub fn overlapped_mic_seqs(segs: &[crate::store::SegmentRecord]) -> Vec<u64> {
+    let sys: Vec<(u64, u64)> =
+        segs.iter().filter(|s| s.source == "system").map(|s| (s.start_ms, s.end_ms)).collect();
+    let mut out = Vec::new();
+    for s in segs {
+        if s.source != "mic" {
+            continue;
+        }
+        let dur = s.end_ms.saturating_sub(s.start_ms).max(1);
+        let ov: u64 = sys
+            .iter()
+            .map(|(a, b)| s.end_ms.min(*b).saturating_sub(s.start_ms.max(*a)))
+            .sum();
+        if ov as f64 / dur as f64 >= 0.8 {
+            out.push(s.seq);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn seg(seq: u64, source: &str, a: u64, b: u64) -> crate::store::SegmentRecord {
+        crate::store::SegmentRecord {
+            seq,
+            source: source.into(),
+            text: "字".into(),
+            start_ms: a,
+            end_ms: b,
+            speaker: None,
+            rms: None,
+        }
+    }
+
+    /// 与前端 segPick.ts 的表驱动口径一致:全覆盖命中、部分(<80%)不命中、
+    /// system 段自身不入选。
+    #[test]
+    fn overlap_pick_mirrors_frontend_semantics() {
+        let segs = vec![
+            seg(0, "system", 0, 10_000),
+            seg(1, "mic", 1_000, 3_000),  // 100% 覆盖 → 命中
+            seg(2, "mic", 9_000, 12_000), // 1s/3s ≈ 33% → 不命中
+            seg(3, "mic", 8_500, 10_400), // 1.5s/1.9s ≈ 79% → 不命中(边界下)
+        ];
+        assert_eq!(overlapped_mic_seqs(&segs), vec![1]);
+    }
+}

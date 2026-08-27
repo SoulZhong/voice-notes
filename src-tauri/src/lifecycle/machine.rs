@@ -140,6 +140,12 @@ pub enum EditOp {
     SetSegmentSpeaker { id: String, seq: u64, expected_text: String, speaker_id: String },
     /// 批量删段(2026-08-23 同源双路清洗):全量 CAS,任一失配零写入。
     DeleteSegments { id: String, moves: Vec<(u64, String)> },
+    /// 恢复被折叠的段(场景二期,issue #162):从抑制表移除,段回到可见集合。
+    RestoreSuppressed { id: String, seqs: Vec<u64> },
+    /// 手动同源双路折叠(issue #162):经 actor 与 Aing 准入天然串行——
+    /// spawn_refine 的 all/running 自投与本 op 同信箱 FIFO,谁先入队谁先生效,
+    /// 不存在「查完没在 Aing、写抑制时 Aing 已开跑读到旧集合」的窗口。
+    FoldSceneEcho { id: String },
     /// 批量改派(2026-08-22):同目标一次改一批;"new" 整批共享一个新号。
     SetSegmentsSpeaker { id: String, moves: Vec<(u64, String)>, speaker_id: String },
     /// 打「多人混杂」标(附带清 person_id)。库侧隔离由命令层先行,见 mark_speaker_multi。

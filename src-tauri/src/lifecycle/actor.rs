@@ -146,7 +146,7 @@ fn run_delegate(app: &AppHandle, cmd: &Cmd, refine: &RefineState) -> Result<(), 
 /// 丢弃、统一收敛成 Result<(),String>,与其余六个编辑操作同形状——actor 的
 /// 请求面不为它单开回执类型。命令壳在 request 成功后重查 note 拿回该值(actor
 /// 已把写入落盘完成才回执 Ok,重查读到的必是刚写入的最终值,不构成竞态)。
-fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
+fn run_edit(app: &AppHandle, op: EditOp, refining_ids: &[String]) -> Result<(), String> {
     let dir = crate::notes_dir(app).map_err(|e| e.to_string())?;
     let store = crate::store::NoteStore::new(dir);
     match op {
@@ -192,6 +192,41 @@ fn run_edit(app: &AppHandle, op: EditOp) -> Result<(), String> {
             .map_err(|e| e.to_string()),
         EditOp::DeleteSegments { id, moves } => {
             store.delete_segments(&id, &moves).map_err(|e| e.to_string())
+        }
+        EditOp::RestoreSuppressed { id, seqs } => {
+            // 与折叠同级拒绝(codex 五轮 P1):Aing worker 可能已装载折叠后的段集,
+            // 恢复标的 stale 会被它稍后整写的 stale=false 覆盖——恢复段无声消失
+            // 且无重跑提示。重转写同理(提交整表换 seq+删抑制表)。
+            if refining_ids.iter().any(|r| r == &id) {
+                return Err("该笔记正在 Aing,请稍后再试".to_string());
+            }
+            {
+                let st = app.state::<crate::AppState>();
+                if crate::retranscribing_blocks_refine(&st.retranscribing, &id) {
+                    return Err("该笔记正在重转写,请稍后再试".to_string());
+                }
+            }
+            store.restore_suppressed(&id, &seqs).map(|_| ()).map_err(|e| e.to_string())
+        }
+        EditOp::FoldSceneEcho { id } => {
+            // 在 actor 串行流里判 Aing(codex:命令线程 check-then-act 有窗口;
+            // 这里与 RefineProgress 的插入同信箱,判定即真值)。
+            if refining_ids.iter().any(|r| r == &id) {
+                return Err("该笔记正在 Aing,请稍后再试".to_string());
+            }
+            // 重转写同样拒(codex 三轮):提交会整表换 seq 并删抑制表——先折叠
+            // 后被整替,成功回执成了谎话;worker 已持锁时这里也只会忙碌失败。
+            // 已知窄竞态(codex 六轮,记录不设防):重转写在本判定之后、折叠写入
+            // 前后才占槽时,其提交仍会整表重建并清抑制——这与「任何编辑赶在重转写
+            // 提交前」同一语义(提交本就以新表为准),亚秒窗口且都是用户自己的
+            // 动作,不为它建编辑代次系统。
+            {
+                let st = app.state::<crate::AppState>();
+                if crate::retranscribing_blocks_refine(&st.retranscribing, &id) {
+                    return Err("该笔记正在重转写,请稍后再试".to_string());
+                }
+            }
+            store.fold_dual_path_echo(&id).map(|_| ()).map_err(|e| e.to_string())
         }
         EditOp::SetSegmentsSpeaker { id, moves, speaker_id } => store
             .set_segments_speaker(&id, &moves, &speaker_id)
@@ -865,6 +900,7 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     // 漏斗 1 的"首次拿到转写"。必须在 finalize 之前取:
                                     // 之后 writer 要被搬空,拿不到了。
                                     let had_content = o.writer.has_content();
+                                    let mut finalized_ok = false;
                                     let finalized = o.writer.finalize(chrono::Local::now());
                                     match finalized {
                                         Ok(()) => {
@@ -903,7 +939,10 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             // 可能不同——finalize 的 IO 只作用于槽内 writer,Aing 必须
                                             // 跟随真正落盘的那条笔记,否则会给一条根本没被收尾的笔记
                                             // 触发 Aing(内容还在 owned 槽或已被后续会话占用)。
-                                            crate::spawn_refine(app.clone(), o.note_id.clone(), true);
+                                            // Aing/折叠移到 drop(o) 之后(codex P1:writer 仍握
+                                            // .note.lock,folding 在此必被「笔记被占用」拒掉),
+                                            // 这里只立旗。
+                                            finalized_ok = true;
                                         }
                                         Err(e) => {
                                             eprintln!("stop_recording: finalize 失败: {e}");
@@ -914,7 +953,35 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                             let _ = app.emit("storage", crate::ipc::StorageEvent { state: "degraded".into() });
                                         }
                                     }
+                                    let done_id = o.note_id.clone();
                                     drop(o); // writer Drop 释放笔记目录 flock,此后转码/续录可拿锁
+                                    if finalized_ok {
+                                        // 场景二期·同源双路自动折叠(issue #162):锁已释放,
+                                        // 且必须在 spawn_refine 之前同步做——Aing 经 NoteStore
+                                        // 读段,折叠先落,精修稿天然不含回声段。文件操作毫秒级;
+                                        // 失败只日志(折叠是增值,不挡 Aing)。
+                                        let fold_on = app
+                                            .path()
+                                            .app_data_dir()
+                                            .map(|d| crate::settings::load(&d).scene_auto_fold)
+                                            .unwrap_or(true);
+                                        if fold_on {
+                                            match crate::notes_dir(&app)
+                                                .map(crate::store::NoteStore::new)
+                                                .and_then(|st| st.fold_dual_path_echo(&done_id))
+                                            {
+                                                Ok(0) => {}
+                                                Ok(n) => eprintln!(
+                                                    "scene: 同源双路自动折叠 {n} 段回声({done_id}),笔记页可展开恢复"
+                                                ),
+                                                Err(e) => eprintln!("scene: 自动折叠失败(跳过): {e}"),
+                                            }
+                                        }
+                                        // 仅 finalize 成功才发起 Aing(原位置注释的语义不变:
+                                        // 自动 Aing 保障类直调,RefineProgress 同步自投仍排在
+                                        // 停录 reply 之前——do_stop_tail 在本行之后)。
+                                        crate::spawn_refine(app.clone(), done_id.clone(), true);
+                                    }
                                     crate::do_stop_tail(&app, note_id.clone());
                                 }
                                 None => {
@@ -1047,7 +1114,9 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                         }
                         Effect::DoEdit => {
                             if let Some(op) = edit_payload.take() {
-                                let r = run_edit(&app, op);
+                                let refining_ids: Vec<String> =
+                                    state.refine.running_ids().map(str::to_string).collect();
+                                let r = run_edit(&app, op, &refining_ids);
                                 if result.is_ok() { result = r; }
                             } else {
                                 eprintln!("lifecycle: DoEdit 无对应 EditNote 载荷(不应发生)");
