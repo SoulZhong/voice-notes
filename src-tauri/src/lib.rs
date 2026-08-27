@@ -4425,6 +4425,36 @@ fn spawn_confirmed_sample(
             let dir = nroot.join(&note_id);
             let vp_store = store::VoiceprintStore::new(root);
             let _fb = FEEDBACK_GATE.lock().unwrap();
+            // 门内复核(codex 五轮 P1):命令返回到本任务执行之间,用户可能已解除/
+            // 改走关联,或段落已被改派——拿旧料写样本会把音频永久挂到错人身上。
+            // ① 说话人现关联仍是 person_id;② picks 逐段仍归该说话人(改派段剔除),
+            // 剔完不足 10s 门槛即放弃。
+            let fresh = store::NoteStore::new(nroot.clone()).load(&note_id)?;
+            let vp_now = vp_store.load();
+            let cur = fresh
+                .speakers
+                .get(&speaker_id)
+                .and_then(|m| m.person_id.as_deref())
+                .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid))
+                .map(str::to_string);
+            anyhow::ensure!(
+                cur.as_deref() == Some(person_id.as_str()),
+                "说话人现关联({cur:?})已不是 {person_id},样本放弃"
+            );
+            let picks: Vec<store::SegmentRecord> = picks
+                .into_iter()
+                .filter(|p| {
+                    fresh
+                        .segments
+                        .iter()
+                        .any(|s| s.seq == p.seq && s.speaker.as_deref() == Some(speaker_id.as_str()))
+                })
+                .collect();
+            let picked_ms: u64 = picks.iter().map(|s| s.end_ms.saturating_sub(s.start_ms)).sum();
+            anyhow::ensure!(
+                picked_ms >= store::AUTO_ENROLL_MS,
+                "确认段被改派后剩余 {picked_ms}ms 不足门槛,样本放弃"
+            );
             // 切音频:与 feedback 同一口径(track_pcm + offset_ms,16k f32)。
             // 多段拼接,每源全场 PCM 只读一次。
             let meta = store::audio::load_audio_meta(&dir);
@@ -7611,6 +7641,19 @@ fn spawn_ack_reinforce(
                     .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid));
                 if cur != Some(target.as_str()) {
                     eprintln!("回执确认回灌放弃:说话人现关联({cur:?})已不是 {target}");
+                    return Ok(());
+                }
+                // seqs 归属复核(codex 五轮 P1):重转写/重聚类/手动改派后,op 存的
+                // 段号可能已归别的说话人——簇还挂着 target 不代表这组段还是。任一
+                // 段已易主即整体放弃,不拿混料喂库。
+                let strayed = seqs.iter().any(|q| {
+                    note.segments
+                        .iter()
+                        .find(|s| s.seq == *q)
+                        .is_none_or(|s| s.speaker.as_deref() != Some(op_cluster.as_str()))
+                });
+                if strayed {
+                    eprintln!("回执确认回灌放弃:op 覆盖的段已被改派/不存在");
                     return Ok(());
                 }
                 let expected = current_speaker_model(&app);
