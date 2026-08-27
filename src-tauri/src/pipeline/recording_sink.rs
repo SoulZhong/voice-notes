@@ -271,10 +271,24 @@ impl RecordingSink for MixedSink {
         // 定稿时写 MixInfo.seek_offset_ms 用:线程要在两源 sink 全部 drop 之后才收尾,
         // 彼时 first_frame_offset 已是终值(它只在首帧记录一次,之后只读)。
         let finalize_offsets = self.first_offsets.clone();
-        // (prior_clipped, prior_limited, prior_metered):无旧标记 = 全新轨,视为已测零
-        let (prior_clipped, prior_limited, prior_metered) = match &prior_mix {
-            Some(m) => (m.clipped_samples, m.limited_samples, m.limit_metered),
-            None => (0, 0, true),
+        // (prior_clipped, prior_limited, prior_metered)。三种前缀形态(codex 三处收口):
+        // ① 全新轨(盘上无 mixed.wav):已测零起步;
+        // ② 旧世界前缀(有文件无 MixInfo,一期形态):计数未知,整体只能未测;
+        // ③ 有标记前缀:继承其计数与 metered;但若本场 base_ms 早于既有轨长,
+        //   open() 会截短前缀——被丢弃的尾巴里的削波仍算在旧计数里,无从拆分,
+        //   整体降标未测(计数只是粗值)。
+        let prior_file_ms = std::fs::metadata(&mixed_path)
+            .ok()
+            .map(|m| crate::store::audio::bytes_to_ms(
+                m.len().saturating_sub(crate::store::audio::HEADER_LEN),
+            ));
+        let will_truncate = prior_file_ms.is_some_and(|ms| ms > base_ms);
+        let (prior_clipped, prior_limited, prior_metered) = match (&prior_mix, prior_file_ms) {
+            (Some(m), _) => {
+                (m.clipped_samples, m.limited_samples, m.limit_metered && !will_truncate)
+            }
+            (None, Some(_)) => (0, 0, false), // 旧世界前缀:削波量未知
+            (None, None) => (0, 0, true),     // 全新轨
         };
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
