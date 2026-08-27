@@ -868,6 +868,14 @@ pub fn spawn(app: AppHandle) -> LifecycleHandle {
                                     let finalized = o.writer.finalize(chrono::Local::now());
                                     match finalized {
                                         Ok(()) => {
+                                            // 录制中命名的兑现(codex 末轮 P1):live rename 只
+                                            // 记名字不动库(录制中禁库写),停录 finalize 后把
+                                            // 「有名无主」说话人补走命名入库通路。幂等后台任务,
+                                            // 失败只日志。
+                                            crate::spawn_enroll_named_speakers(
+                                                &app,
+                                                note_id.clone(),
+                                            );
                                             // 一场录制到底有没有产出转写。空转写是这条链路最常见的
                                             // 失败形态(权限拿到了、录也录了,就是一个字都没出来),
                                             // 而它不报错、不崩溃,在别人机器上完全不可见。

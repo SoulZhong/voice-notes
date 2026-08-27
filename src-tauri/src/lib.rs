@@ -4413,7 +4413,7 @@ fn spawn_confirmed_sample(
     picks: Vec<store::SegmentRecord>,
     reinforce: bool,
 ) {
-    if picks.is_empty() {
+    if picks.is_empty() && !reinforce {
         eprintln!("确认样本跳过({person_id}):确认段总时长不足 10s");
         return;
     }
@@ -4431,6 +4431,11 @@ fn spawn_confirmed_sample(
             // 剔完不足 10s 门槛即放弃。
             let fresh = store::NoteStore::new(nroot.clone()).load(&note_id)?;
             let vp_now = vp_store.load();
+            // person_id 也过 redirects 归一(codex 末轮 P2):任务等待期间目标被合并
+            // 时,现关联解析到 winner 而入参还是 loser,直接比会冤枉合法关联。
+            let person_id = store::VoiceprintStore::resolve(&vp_now, &person_id)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("目标人物已不在库,样本放弃"))?;
             let cur = fresh
                 .speakers
                 .get(&speaker_id)
@@ -4451,8 +4456,12 @@ fn spawn_confirmed_sample(
                 })
                 .collect();
             let picked_ms: u64 = picks.iter().map(|s| s.end_ms.saturating_sub(s.start_ms)).sum();
+            // 时长门只挡「样本落盘」,不挡回灌(codex 末轮 P2):拆分 audited 段在
+            // 1.5s~10s 之间时,样本存不了,但用户确认过的质心回灌照做——这是旧行为,
+            // 不能倒退。
+            let sample_ok = picked_ms >= store::AUTO_ENROLL_MS;
             anyhow::ensure!(
-                picked_ms >= store::AUTO_ENROLL_MS,
+                sample_ok || reinforce,
                 "确认段被改派后剩余 {picked_ms}ms 不足门槛,样本放弃"
             );
             // 切音频:与 feedback 同一口径(track_pcm + offset_ms,16k f32)。
@@ -4475,11 +4484,18 @@ fn spawn_confirmed_sample(
                     sample.extend_from_slice(&pcm[start..end]);
                 }
             }
-            anyhow::ensure!(!sample.is_empty(), "确认段落全部在音轨覆盖范围之外");
-            let wrote =
-                vp_store.append_confirmed_sample(&person_id, &sample, &note_id, &speaker_id)?;
-            if !wrote {
-                eprintln!("确认样本未写入(隔离/满员/时长门/空音频): {person_id}");
+            anyhow::ensure!(
+                !sample.is_empty() || reinforce,
+                "确认段落全部在音轨覆盖范围之外"
+            );
+            if sample_ok && !sample.is_empty() {
+                let wrote =
+                    vp_store.append_confirmed_sample(&person_id, &sample, &note_id, &speaker_id)?;
+                if !wrote {
+                    eprintln!("确认样本未写入(隔离/满员/时长门/空音频): {person_id}");
+                }
+            } else {
+                eprintln!("确认样本不足 10s 门槛({person_id}),只回灌不存样本");
             }
             if reinforce {
                 // 确认段回灌质心(模型门禁/账本/黑名单照过)。
@@ -8074,6 +8090,64 @@ fn delete_note(app: AppHandle, state: State<AppState>, id: String) -> Result<(),
 /// 活动会话经 lifecycle 信箱走 writer 单写者路径(P2:writer 归 actor)——改内存表、
 /// persist_speakers 原子落盘、广播都在 actor 线程串行执行,与管线事件同线程,天然
 /// 杜绝互相覆盖窗口(不再经 NoteStore 直写);非活动笔记才走 NoteStore 直写磁盘。
+/// 命名即入库(2026-08-27「确认才入库」的转正通路,codex 末轮 P1):自动建档摘除
+/// 后,用户给陌生说话人打名字是唯一的身份确认动作,必须通向库——否则那个人
+/// 永远是笔记局部身份,以后录到也认不出。
+/// 规则:库里恰有一个同名人 → 关联它;没有 → 建人再关联;重名多于一个 → 跳过
+/// 并日志(自动挑人必错,让用户走关联动线亲自选)。非活动会话时调用。
+fn enroll_named_speaker(app: &AppHandle, note_id: &str, speaker_id: &str, name: &str) {
+    let run = || -> anyhow::Result<()> {
+        let root = notes_dir(app)?;
+        let note = store::NoteStore::new(root).load(note_id)?;
+        let Some(m) = note.speakers.get(speaker_id) else { return Ok(()) };
+        if m.person_id.is_some() {
+            return Ok(()); // 已有关联:改名不换人
+        }
+        let vp_store = open_voiceprint_store(app).map_err(anyhow::Error::msg)?;
+        let vp = vp_store.load();
+        let same: Vec<&String> =
+            vp.people.iter().filter(|(_, p)| p.name == name).map(|(id, _)| id).collect();
+        let (target, created) = match same.len() {
+            0 => (vp_store.create_person(name, &chrono::Local::now().to_rfc3339())?, true),
+            1 => (same[0].clone(), false),
+            n => {
+                eprintln!("命名入库跳过({name}):库中有 {n} 个同名人,请手动关联挑选");
+                return Ok(());
+            }
+        };
+        if let Err(e) = do_assign_note_speaker_person(app, note_id, speaker_id, &target) {
+            if created {
+                // 与 apply_identify_suggestion 同款收尾:刚建的空人别留孤儿
+                let _ = vp_store.delete_person_if_empty(&target);
+            }
+            return Err(anyhow::Error::msg(e));
+        }
+        eprintln!("命名入库:{note_id}/{speaker_id} 「{name}」 → {target}");
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("命名入库失败(笔记内命名不受影响): {e}");
+    }
+}
+
+/// 停录后补做录制中命名的入库(录制中不能动库,只记名字;此处兑现)。
+/// 扫本篇「有名无主」说话人逐个走 enroll_named_speaker,幂等。
+pub(crate) fn spawn_enroll_named_speakers(app: &AppHandle, note_id: String) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = match notes_dir(&app) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let Ok(note) = store::NoteStore::new(root).load(&note_id) else { return };
+        for (sid, m) in &note.speakers {
+            if !m.name.trim().is_empty() && m.person_id.is_none() && !m.split_born {
+                enroll_named_speaker(&app, &note_id, sid, m.name.trim());
+            }
+        }
+    });
+}
+
 #[tauri::command]
 fn rename_speaker(
     app: AppHandle,
@@ -8105,11 +8179,15 @@ fn rename_speaker(
     // 非活动笔记：经 actor 串行执行(取代 NoteStore 直写)。
     app.state::<lifecycle::LifecycleHandle>().request(lifecycle::machine::Msg::EditNote {
         op: lifecycle::machine::EditOp::RenameSpeaker {
-            id: note_id,
-            speaker_id,
+            id: note_id.clone(),
+            speaker_id: speaker_id.clone(),
             name: name.to_string(),
         },
-    })
+    })?;
+    // 命名即确认(codex 末轮 P1):无主说话人得名 → 转正入库(建人/唯一同名关联,
+    // 带样本与回灌);已有关联者只改显示名,不动库。
+    enroll_named_speaker(&app, &note_id, &speaker_id, name);
+    Ok(())
 }
 
 /// 删除笔记内说话人(原始逐字稿 chips):表项移除,名下段落回到未标注。
