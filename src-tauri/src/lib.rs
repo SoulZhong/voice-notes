@@ -4333,6 +4333,26 @@ fn do_assign_note_speaker_person_with(
             spawn_confirmed_sample(app, note_id.to_string(), speaker_id.to_string(), resolved, note.segments, seg);
         }
     } else {
+        // 确认才入库时代的样本闭环(codex:停录不再自动写样本后,经确认的人物若
+        // 一份样本都没有,换声纹模型 rebuild 时质心被清空、无从重算,人就没了)。
+        // 关联即确认:切该说话人本篇最长段存为样本;append_confirmed_sample 内部
+        // 自带隔离/满员/去重门,不会因反复关联而灌爆。
+        let longest = note
+            .segments
+            .iter()
+            .filter(|s| s.speaker.as_deref() == Some(speaker_id))
+            .max_by_key(|s| s.end_ms.saturating_sub(s.start_ms))
+            .cloned();
+        if let Some(seg) = longest {
+            spawn_confirmed_sample(
+                app,
+                note_id.to_string(),
+                speaker_id.to_string(),
+                resolved.clone(),
+                note.segments.clone(),
+                seg,
+            );
+        }
         spawn_feedback(
             app,
             note_id.to_string(),
@@ -7472,6 +7492,8 @@ fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Resul
         .ok_or_else(|| tr!("回执不存在或已处理", "Receipt missing or already handled"))?;
     op.acknowledged = true;
     let fp = op.fingerprint.clone();
+    let ack_seqs: std::collections::BTreeSet<u64> = op.seqs.iter().copied().collect();
+    let ack_target = op.target_person.clone();
     refine::identify::save_ops(&dir, &ops).map_err(|e| e.to_string())?;
     if let Some(mut idoc) = refine::identify::load_identify(&dir) {
         let now = chrono::Local::now().to_rfc3339();
@@ -7479,7 +7501,88 @@ fn acknowledge_identify(app: AppHandle, note_id: String, op_id: String) -> Resul
             let _ = refine::identify::save_identify(&dir, &idoc);
         }
     }
+    // 「Good」就是用户确认(codex,确认才入库的写入边界):此刻补做自动应用时刻意
+    // 跳过的回灌——与手动关联的库待遇对齐。后台执行,门内复核撤销态。
+    spawn_ack_reinforce(&app, note_id, op_id, ack_seqs, ack_target);
     Ok(())
+}
+
+/// 回执确认后的回灌:锁序 IDENTIFY_ACT_GATE → FEEDBACK_GATE(与 auto_apply_one
+/// 一致);门内复核 op 仍是「已确认且未撤销」——确认与本任务之间用户可能已点撤销,
+/// 撤销后再回灌就是把解除掉的关联偷偷写回库(codex review 二轮 P1#3 同款教训)。
+fn spawn_ack_reinforce(
+    app: &AppHandle,
+    note_id: String,
+    op_id: String,
+    seqs: std::collections::BTreeSet<u64>,
+    target: String,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let run = || -> anyhow::Result<()> {
+            let root = notes_dir(&app)?;
+            let dir = root.join(&note_id);
+            let _gate = IDENTIFY_ACT_GATE.lock().unwrap();
+            let ops = refine::identify::load_ops(&dir);
+            let Some(op) =
+                ops.ops.iter().find(|o| o.op_id == op_id && o.acknowledged && o.undo_stage.is_none())
+            else {
+                return Ok(()); // 已撤销/状态变了:不写库
+            };
+            anyhow::ensure!(op.target_person == target, "op 目标已变,放弃回灌");
+            let vp_store = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
+            let now = chrono::Local::now().to_rfc3339();
+            let skipped = {
+                let _fb = FEEDBACK_GATE.lock().unwrap();
+                let note = store::NoteStore::new(root.clone()).load(&note_id)?;
+                let expected = current_speaker_model(&app);
+                let library_model = vp_store.load().embedding_model.clone();
+                match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
+                    Ok(mut embedder) => {
+                        let mut needs_rebuild = false;
+                        let r = feedback::reinforce_person(
+                            &dir,
+                            &note.segments,
+                            &feedback::SegFilter::Seqs(seqs.clone()),
+                            &target,
+                            &vp_store,
+                            &library_model,
+                            &expected,
+                            &mut embedder,
+                            &now,
+                            Some(&op_id),
+                            &mut needs_rebuild,
+                            false,
+                        );
+                        if needs_rebuild {
+                            let st = app.state::<AppState>();
+                            *st.embedder_cache.lock().unwrap() = None;
+                            spawn_voiceprint_rebuild(
+                                &app,
+                                st.embedder_cache.clone(),
+                                "回执确认回灌触发质心置空",
+                            );
+                        }
+                        match r {
+                            Ok(feedback::ReinforceResult::Applied { .. }) => None,
+                            Ok(other) => Some(format!("{other:?}")),
+                            Err(e) => Some(format!("回灌失败: {e}")),
+                        }
+                    }
+                    Err(e) => Some(format!("声纹模型不可用: {e}")),
+                }
+            };
+            let mut ops = refine::identify::load_ops(&dir);
+            if let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) {
+                op.reinforce_skipped = skipped.or(Some("回执确认后已回灌".to_string()));
+            }
+            let _ = refine::identify::save_ops(&dir, &ops);
+            Ok(())
+        };
+        if let Err(e) = run() {
+            eprintln!("回执确认回灌失败(关联不受影响): {e}");
+        }
+    });
 }
 
 /// P2b 回执「撤销」:CAS 解除关联 + 按 op 对账还原质心 + 拒绝键。返回质心是否
