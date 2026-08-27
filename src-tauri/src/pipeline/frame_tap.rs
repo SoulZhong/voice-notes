@@ -265,6 +265,10 @@ pub struct TapPolicy {
     pub phase_trim_max: f64,
     /// 断流风暴告警的滚动窗与阈值(洞时长/墙钟)。窗越长越稳、越迟钝;
     /// 阈值 0.05 = 窗内 5% 的时长是补零就叫。见 GapStormDetector。
+    /// 覆盖矩阵(issue #125):判据 hw_gap_ms 只在硬件时戳判洞分支增长——
+    /// macOS mic/system 与 Windows mic 有时戳、能报;**Windows system
+    /// (loopback,host_time_ns=None)是已声明盲区**,不能拿补零量替代判据
+    /// (loopback「无播放即无回调」,补零是常态,换判据=满屏误报)。
     pub gap_storm_window: Duration,
     pub gap_storm_threshold: f64,
 }

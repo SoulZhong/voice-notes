@@ -2173,6 +2173,14 @@ fn spawn_session(
         // 重启重新解析默认输出设备,天然跟随用户换设备。
         #[cfg(windows)]
         {
+            // 已知盲区显式化(issue #125,方案 3):loopback 无硬件时戳
+            // (host_time_ns=None),断流风暴检测的判据(hw_gap_ms)在本轨永远
+            // 不增长——system 轨「该响没响」类丢失不会有风暴横幅。真修需要
+            // IAudioClock/会话活跃探测,须真机验证;在有 Windows 实测样本之前,
+            // 以此日志声明边界,排障时先看到它再看别的。
+            eprintln!(
+                "[采集] Windows system 轨(loopback)无硬件时戳,断流风暴检测不覆盖本轨(issue #125)"
+            );
             match new_silero(&vad_path) {
                 Ok(sys_seg) => {
                     let sys_factory: audio::resilient::CaptureFactory = Box::new(|| {
