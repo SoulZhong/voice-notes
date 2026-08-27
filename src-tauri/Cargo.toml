@@ -133,6 +133,11 @@ objc2-event-kit = { version = "0.3", features = [
 devtools = []
 
 [[bin]]
+name = "vp_prune"
+path = "src/bin/vp_prune.rs"
+required-features = ["devtools"]
+
+[[bin]]
 name = "asr_bench"
 path = "src/bin/asr_bench.rs"
 required-features = ["devtools"]

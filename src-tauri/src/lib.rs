@@ -7161,52 +7161,11 @@ fn auto_apply_one(app: &AppHandle, note_id: &str, fingerprint: &str) -> anyhow::
     store::NoteStore::new(root.clone()).assign_speaker_person_if(note_id, &speaker, &resolved)?;
     set_stage(&dir, &op_id, "assigned", None);
 
-    // ③ 同步回灌(自动路径绝不异步——否则撤销后后台污染)。
-    let skipped = {
-        let _fb = FEEDBACK_GATE.lock().unwrap();
-        let note = store::NoteStore::new(root.clone()).load(note_id)?;
-        let expected = app
-            .path()
-            .app_data_dir()
-            .map(|d| settings::load(&d).speaker_model)
-            .unwrap_or_default();
-        let library_model = vp.embedding_model.clone();
-        // 标签与权重同源(同 spawn_feedback 那处):不能再读一次设置,否则可能用 B 的
-        // 权重算、以 A 的标签写库(codex review 实现轮 P1)。
-        match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
-            Ok(mut embedder) => {
-                let mut needs_rebuild = false;
-                let r = feedback::reinforce_person(
-                    &dir,
-                    &note.segments,
-                    &feedback::SegFilter::Seqs(seqs.clone()),
-                    &resolved,
-                    &vp_store,
-                    &library_model,
-                    &expected,
-                    &mut embedder,
-                    &now,
-                    Some(&op_id),
-                    &mut needs_rebuild,
-                    false,
-                );
-                // 先无条件处理重建,再判回灌结果:纠错还原一旦清空了旧人物的质心就已经
-                // 落盘,回灌本身跳过或出错都不改变"必须重建"这件事
-                // (codex review 实现轮二 P1)。此处已出 vp_guard。
-                if needs_rebuild {
-                    let st = app.state::<AppState>();
-                    *st.embedder_cache.lock().unwrap() = None;
-                    spawn_voiceprint_rebuild(app, st.embedder_cache.clone(), "纠错还原后质心置空");
-                }
-                match r {
-                    Ok(feedback::ReinforceResult::Applied { .. }) => None,
-                    Ok(other) => Some(format!("{other:?}")),
-                    Err(e) => Some(format!("回灌失败: {e}")),
-                }
-            }
-            Err(e) => Some(format!("嵌入器不可用: {e}")),
-        }
-    };
+    // ③ 回灌已摘(2026-08-27「确认才入库」全面推广,issue #166):自动应用是
+    // LLM 推断的身份,没有用户确认动作——它可以替用户做**笔记内**关联(可撤销、
+    // 建议卡上有痕),但不配写库。原同步 reinforce_person 调用整块移除;库写入
+    // 只在用户亲手关联/确认时发生。stage 记 skipped 供审计与撤销语义对齐。
+    let skipped: Option<String> = Some("确认才入库:自动应用不写库".to_string());
     set_stage(&dir, &op_id, "reinforced", skipped);
 
     // ④ 状态落盘 + done。
