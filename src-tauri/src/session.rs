@@ -248,16 +248,24 @@ struct RecentSystem {
 
 /// AEC 残渣判定的原子条件：一对(mic, system)段的 rms + 时间重叠是否命中残渣特征。
 /// 供两个检查点共用（mic 到达时对照 recent_system；system 到达时对照 pending_mic）。
-fn is_residue_pair(rms: f32, a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
-    rms < RESIDUE_RMS_MAX && overlap_fraction(a_start, a_end, b_start, b_end) >= RESIDUE_OVERLAP_MIN
+fn is_residue_pair(rms: f32, rms_cap: f32, a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    rms < rms_cap && overlap_fraction(a_start, a_end, b_start, b_end) >= RESIDUE_OVERLAP_MIN
 }
 
 /// AEC 残渣判定：mic 段 rms 低于上界，且与某个最近处理过的 system 段有足够比例的
 /// 时间重叠——残渣必然与外放(system 路)同时发生，能量却达不到近场真人声门槛。
-fn is_aec_residue(sub_start: u64, sub_end: u64, rms: f32, recent_system: &VecDeque<RecentSystem>) -> bool {
+/// rms_cap 按场景给(场景二期,issue #162):外放场 AEC 必然收敛不足,残渣能量更高,
+/// 上限放宽一倍(scene::residue_rms_cap);其余场维持 RESIDUE_RMS_MAX。
+fn is_aec_residue(
+    sub_start: u64,
+    sub_end: u64,
+    rms: f32,
+    rms_cap: f32,
+    recent_system: &VecDeque<RecentSystem>,
+) -> bool {
     recent_system
         .iter()
-        .any(|r| is_residue_pair(rms, sub_start, sub_end, r.start_ms, r.end_ms))
+        .any(|r| is_residue_pair(rms, rms_cap, sub_start, sub_end, r.start_ms, r.end_ms))
 }
 
 // 残渣幻觉词抑制(2026-08-23 用户实测):对方说中文时,mic 路的 AEC 残渣被 ASR
@@ -629,6 +637,9 @@ where
     sample_store: std::collections::HashMap<String, (String, Vec<f32>)>,
     /// 场景传感器(2026-08-23 一期):只观测不干预,停录随 SceneReport 导出。
     scene: crate::scene::SceneSensor,
+    /// 上一条 mic 母段 (终点, 时长)(旁听门续段判据用):硬切长句的尾块与它
+    /// 首尾相接,且前段本身够长。
+    last_mic_final: Option<(u64, u64)>,
 }
 
 impl<'a, F, P, D> FinalSink<'a, F, P, D>
@@ -662,6 +673,7 @@ where
             last_system_partial: String::new(),
             sample_store: std::collections::HashMap::new(),
             scene: crate::scene::SceneSensor::new(),
+            last_mic_final: None,
         }
     }
 
@@ -797,6 +809,22 @@ where
             )
         };
 
+        // 旁听门按**母段**时长判一次(codex P1:split_final 会把 3s 真发言切成
+        // 1.5s 子段,逐子段判会把长发言整段吞掉;门语义是「短附和」,时长天然属于
+        // 母段)。判定结果带给每个 mic 子段。
+        // 硬切续段豁免(codex 二轮):>15s 长句被 Silero 硬切成多个 FinalJob,尾块 ≤2s
+        // 与上一 mic 终稿首尾相接——那是长发言的尾巴,不是附和。
+        let continuation = source == Source::Mic
+            && crate::scene::is_forced_continuation(self.last_mic_final, start_ms);
+        let parent_backchannel = source == Source::Mic
+            && !continuation
+            && crate::scene::listening_backchannel_gate(
+                self.scene.current_scene(),
+                end_ms.saturating_sub(start_ms),
+            );
+        if source == Source::Mic {
+            self.last_mic_final = Some((end_ms, end_ms.saturating_sub(start_ms)));
+        }
         for sub in subs {
             let seg_rms = rms_of(&sub.samples);
             // 子段要再过一遍无内容过滤:母段整体有内容、切开后某一片只剩标点,是
@@ -822,7 +850,7 @@ where
             }
             match source {
                 Source::System => self.push_system_sub(sub, seg_rms),
-                Source::Mic => self.push_mic_sub(sub, seg_rms),
+                Source::Mic => self.push_mic_sub(sub, seg_rms, parent_backchannel),
             }
         }
     }
@@ -847,7 +875,14 @@ where
             // 段与某 pending mic 段重叠且 mic 段 rms 低,视为残渣,先于文本
             // 相似度判定丢弃(残渣文本本就与 system 段不相似,躲不过下面的
             // echoed 判定,须单独拦)。
-            if is_residue_pair(p.rms, p.start_ms, p.end_ms, sub.start_ms, sub.end_ms) {
+            if is_residue_pair(
+                p.rms,
+                crate::scene::residue_rms_cap(self.scene.current_scene(), RESIDUE_RMS_MAX),
+                p.start_ms,
+                p.end_ms,
+                sub.start_ms,
+                sub.end_ms,
+            ) {
                 eprintln!(
                     "残渣抑制: 丢弃 mic 段 rms={:.4} \"{}\"",
                     p.rms,
@@ -978,7 +1013,7 @@ where
     }
 
     /// mic 侧子段：占位段直通、残渣/回声命中即丢，其余进 hold 等 system 侧比对。
-    fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32) {
+    fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32, parent_backchannel: bool) {
         // 场景观测:发声口径,与随后是否被抑制无关(抑制另计 echo_hits)。
         self.scene.feed_mic(sub.start_ms, sub.end_ms, crate::audio::aec::latest_erle_db());
         self.scene_poll();
@@ -1025,7 +1060,13 @@ where
                 rms: Some(seg_rms),
                 reason: "residue_filler".into(),
             });
-        } else if is_aec_residue(sub.start_ms, sub.end_ms, seg_rms, &self.recent_system) {
+        } else if is_aec_residue(
+            sub.start_ms,
+            sub.end_ms,
+            seg_rms,
+            crate::scene::residue_rms_cap(self.scene.current_scene(), RESIDUE_RMS_MAX),
+            &self.recent_system,
+        ) {
             // AEC 残渣抑制:与文本回声去重镜像的第一个检查点——rms 低且与
             // 某最近 system 段高度重叠,视为外放残渣,不进 hold/不处理,与
             // ECHO 命中同待遇。
@@ -1079,6 +1120,27 @@ where
                     });
                 }
                 None => {
+                    // 旁听场 backchannel 不上屏(场景二期,issue #162):判定在母段
+                    // 时长上做(见 push 循环前注释),此处只消费结果——场景稳定为
+                    // listening 且母段 ≤2s 的短附和进可逆抑制;长发言即使被切成短
+                    // 子段也照常上屏。
+                    if parent_backchannel {
+                        eprintln!(
+                            "旁听场附和不上屏: {}ms \"{}\"",
+                            sub.end_ms.saturating_sub(sub.start_ms),
+                            text_prefix20(&sub.text)
+                        );
+                        (self.on_partial)(Source::Mic, String::new());
+                        (self.on_diar)(DiarEvent::SuppressedFinal {
+                            source: Source::Mic,
+                            text: sub.text,
+                            start_ms: sub.start_ms,
+                            end_ms: sub.end_ms,
+                            rms: Some(seg_rms),
+                            reason: "listening_backchannel".into(),
+                        });
+                        return;
+                    }
                     self.pending_mic.push_back(PendingMic {
                         text: sub.text,
                         norm: mic_norm,

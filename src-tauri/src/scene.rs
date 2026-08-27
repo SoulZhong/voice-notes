@@ -193,6 +193,11 @@ impl SceneSensor {
     }
 
     /// 取走"刚发生的稳定切换"(SceneHint 用;取一次即清)。
+    /// 当前稳定场景(实时行为门用;未稳定前 = unknown)。
+    pub fn current_scene(&self) -> &'static str {
+        self.current
+    }
+
     pub fn poll_change(&mut self) -> Option<&'static str> {
         self.changed.take()
     }
@@ -312,6 +317,51 @@ mod tests {
     }
 }
 
+/// 场景二期·实时行为门(issue #162):纯函数,表驱动可测。
+/// 旁听场的 backchannel(附和短语)不上屏——旁听者偶尔的「嗯/对/好的」在
+/// 转写里只制造噪音;门槛按时长,≤ 该值的 mic 段进抑制而不是正文。
+pub(crate) const LISTENING_BACKCHANNEL_MAX_MS: u64 = 2_000;
+
+/// dur_ms == 0 视为「时长未知」不拦(codex 四轮):云端终稿可能不带可用终点
+/// (Aliyun 刻意 end==start,Volcano 可能 end<start,饱和减后都是 0)——拿 0 当
+/// ≤2s 会把任意长度的真话藏掉。
+pub(crate) fn listening_backchannel_gate(scene: &str, dur_ms: u64) -> bool {
+    scene == SC_LISTENING && dur_ms > 0 && dur_ms <= LISTENING_BACKCHANNEL_MAX_MS
+}
+
+/// 强制切分续段识别(codex 二轮):Silero 把 >15s 长句硬切成多个 FinalJob,尾块可能
+/// ≤2s——它不是独立附和,是长发言的尾巴。判据:本段起点与上一 mic 终稿终点首尾
+/// 相接(硬切产物时间轴连续,容差 ≤ FORCED_CONTINUATION_GAP_MS 吸收取整)。
+pub(crate) const FORCED_CONTINUATION_GAP_MS: u64 = 100;
+/// 硬切只发生在长句之后:前段本身须 ≥ 此长(Silero split_long 阈值 15s 的块,
+/// 任一块都远长于附和)。仅凭首尾相接不够(codex 三轮):暂停冲刷+续录后紧接着
+/// 的新段也会首尾相接,而那可能就是一句附和。
+/// 已知边界(codex 四轮,记录不设防):这是启发式而非显式切分溯源——云端 ASR 的
+/// 厂商长句后 100ms 内紧接的真附和、或长句后暂停续录,会被豁免而**显示**出来。
+/// 失效方向是「多显示一句附和」,不是藏真话;显式溯源要动 FinalJob 协议,等旁听
+/// 场有真机样本再评估是否值得。
+pub(crate) const FORCED_CONTINUATION_PREV_MIN_MS: u64 = 8_000;
+
+/// prev = 上一 mic 母段 (终点, 时长)。
+pub(crate) fn is_forced_continuation(prev: Option<(u64, u64)>, start_ms: u64) -> bool {
+    prev.is_some_and(|(e, dur)| {
+        dur >= FORCED_CONTINUATION_PREV_MIN_MS
+            && start_ms >= e
+            && start_ms - e <= FORCED_CONTINUATION_GAP_MS
+    })
+}
+
+/// 外放场残渣门收紧:AEC 在外放场必然收敛不足,残渣能量比耳机场高——上限
+/// 放宽 1.5×(0.012→0.018)。**必须停在近场真人声地板(实测 ≈0.02)之下**
+/// (codex P1:2× 会把 [0.02,0.024) 的真人插话按残渣藏掉),overlap 判据不动。
+pub(crate) fn residue_rms_cap(scene: &str, base: f32) -> f32 {
+    if scene == SC_SPEAKER_ECHO {
+        base * 1.5
+    } else {
+        base
+    }
+}
+
 /// UI「选中可疑段」同口径(src/lib/segPick.ts 的 overlappedMicSeqs 逐位镜像):
 /// mic 段时长被 system 段覆盖 ≥80% 即命中。输入应为**未被抑制**的段集合
 /// (与前端 displaySegments 一致)。二期自动折叠与手动选中共用一个口径,
@@ -334,6 +384,38 @@ pub fn overlapped_mic_seqs(segs: &[crate::store::SegmentRecord]) -> Vec<u64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod behavior_gate_tests {
+    use super::*;
+
+    /// 旁听门:只在 listening 场、只对短段;外放门:只在 speaker_echo 场放宽一倍。
+    #[test]
+    fn gates_fire_only_in_their_scene() {
+        assert!(listening_backchannel_gate(SC_LISTENING, 1_500));
+        assert!(!listening_backchannel_gate(SC_LISTENING, 2_001), "长段是真发言,不拦");
+        assert!(!listening_backchannel_gate(SC_HEADSET, 500), "非旁听场不拦");
+        assert!(!listening_backchannel_gate(SC_UNKNOWN, 500), "未稳定不拦(保守)");
+        assert!(!listening_backchannel_gate(SC_LISTENING, 0), "时长未知(云端无终点)不拦");
+        assert_eq!(residue_rms_cap(SC_SPEAKER_ECHO, 0.012), 0.018);
+        assert_eq!(residue_rms_cap(SC_HEADSET, 0.012), 0.012);
+        assert_eq!(residue_rms_cap(SC_UNKNOWN, 0.012), 0.012);
+    }
+
+    /// 硬切续段:首尾相接(含 ≤100ms 取整容差)算续段;有空隙/无前段不算。
+    #[test]
+    fn forced_continuation_requires_contiguity_and_long_prev() {
+        assert!(is_forced_continuation(Some((15_000, 15_000)), 15_000));
+        assert!(is_forced_continuation(Some((15_000, 15_000)), 15_080));
+        assert!(!is_forced_continuation(Some((15_000, 15_000)), 15_500), "半秒空隙=独立段");
+        assert!(!is_forced_continuation(Some((15_000, 15_000)), 14_000), "起点早于前段终点不是续段");
+        assert!(
+            !is_forced_continuation(Some((15_000, 1_500)), 15_000),
+            "前段本身是短句(暂停后续录紧接的新段)不算硬切续段"
+        );
+        assert!(!is_forced_continuation(None, 0));
+    }
 }
 
 #[cfg(test)]
