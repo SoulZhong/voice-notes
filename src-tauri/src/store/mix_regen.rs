@@ -249,6 +249,7 @@ pub fn regen_note_dir(dir: &std::path::Path) -> anyhow::Result<RegenOutcome> {
             track_ms: outcome.track_ms,
             clipped_samples: outcome.limit.clipped_samples,
             limited_samples: outcome.limit.limited_samples,
+            limit_metered: true, // regen 整文件重混,计数即全量
         },
     )?;
     match crate::store::audio::waveform_from_wav(&dir.join(format!("{MIXED_TRACK}.wav"))) {
@@ -484,6 +485,7 @@ mod tests {
                 track_ms: 999,
                 clipped_samples: 0,
                 limited_samples: 0,
+                limit_metered: true,
             },
         )
         .unwrap();

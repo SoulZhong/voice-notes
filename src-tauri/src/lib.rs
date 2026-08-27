@@ -11847,6 +11847,7 @@ mod tests {
                 track_ms: 1000,
                 clipped_samples: 0,
                 limited_samples: 0,
+                limit_metered: true,
             }),
             ..Default::default()
         });

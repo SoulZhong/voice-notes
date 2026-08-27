@@ -256,6 +256,10 @@ impl RecordingSink for MixedSink {
         // 文件,旧标记(描述装配前内容)一旦残留,本场异常中断后 mixed_untrusted 会
         // 拿旧读数为已被改动的文件背书。清不掉就整体退回方案 A:混音是纯增值旁路,
         // 宁可这场没有成品轨,不可留下"标记与内容脱钩"的可能。
+        // 续录场次不清零观测(codex):mixed.wav 前缀是上一场的内容,其削波计数
+        // 也是整文件读数的一部分。清标记前留存,定稿时与本场计数相加。
+        // 前缀计数仅在旧标记 limit_metered 时可信;混入未测前缀时整体也只能算未测。
+        let prior_mix = crate::store::audio::track_mix(&note_dir, MIXED_TRACK);
         if let Err(e) = crate::store::audio::clear_track_mix(&note_dir, MIXED_TRACK) {
             eprintln!("续录装配清旧 mixed 完整性标记失败,本场退回双轨方案: {e}");
             return w;
@@ -267,6 +271,11 @@ impl RecordingSink for MixedSink {
         // 定稿时写 MixInfo.seek_offset_ms 用:线程要在两源 sink 全部 drop 之后才收尾,
         // 彼时 first_frame_offset 已是终值(它只在首帧记录一次,之后只读)。
         let finalize_offsets = self.first_offsets.clone();
+        // (prior_clipped, prior_limited, prior_metered):无旧标记 = 全新轨,视为已测零
+        let (prior_clipped, prior_limited, prior_metered) = match &prior_mix {
+            Some(m) => (m.clipped_samples, m.limited_samples, m.limit_metered),
+            None => (0, 0, true),
+        };
         w.joins.push(std::thread::spawn(move || {
             let mut mixer = TimelineMixer::new(DEFAULT_MARGIN_SAMPLES);
             // Option 包住:abandoned 分支需要在删除文件前先把 writer 显式 drop 掉,
@@ -367,9 +376,14 @@ impl RecordingSink for MixedSink {
                                 seek_offset_ms,
                                 track_ms,
                                 // 削波观测(issue #124):没有它,削波量只能事后解码
-                                // m4a 反推;先有数据,响度取舍才有依据。
-                                clipped_samples: mixer.limit_stats().clipped_samples,
-                                limited_samples: mixer.limit_stats().limited_samples,
+                                // m4a 反推。整文件口径 = 上一场留存 + 本场。
+                                clipped_samples: prior_clipped
+                                    + mixer.limit_stats().clipped_samples,
+                                limited_samples: prior_limited
+                                    + mixer.limit_stats().limited_samples,
+                                // 前缀未测(仪表化前录的)则整文件也只能标未测,
+                                // 计数仅为下界
+                                limit_metered: prior_metered,
                             },
                         ) {
                             eprintln!("[mix] 完整性标记写入失败(轨内容不受影响): {e}");
