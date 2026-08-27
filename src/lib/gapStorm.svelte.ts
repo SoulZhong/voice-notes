@@ -7,16 +7,23 @@ export type { GapStormState };
 class GapStorm {
   mic = $state<number | null>(null);
   system = $state<number | null>(null);
+  systemUnmonitored = $state(false);
 
   apply(ev: SourceHealthEvent) {
-    const next = nextGapStorm({ mic: this.mic, system: this.system }, ev, recording.isLive);
+    const next = nextGapStorm(
+      { mic: this.mic, system: this.system, systemUnmonitored: this.systemUnmonitored },
+      ev,
+      recording.isLive,
+    );
     this.mic = next.mic;
     this.system = next.system;
+    this.systemUnmonitored = next.systemUnmonitored;
   }
 
   clear() {
     this.mic = null;
     this.system = null;
+    this.systemUnmonitored = false;
   }
 }
 

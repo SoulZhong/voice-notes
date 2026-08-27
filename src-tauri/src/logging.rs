@@ -11,16 +11,60 @@ use std::path::Path;
 const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn redirect_stdio_to_file(app_data: &Path) {
-    // Windows 首版无 fd 级重定向:dup2/STDERR_FILENO 是 unix 概念,Windows GUI 子系统
-    // 的 stdout/stderr 需 SetStdHandle + CRT fd 双重接管,留作后续(计划文档已记);
-    // dev 构建带控制台,输出仍可见,不至于两眼一抹黑。
-    #[cfg(not(unix))]
-    {
-        let _ = app_data;
-        return;
-    }
     #[cfg(unix)]
     redirect_stdio_to_file_unix(app_data);
+    // Windows(issue #125 复审补齐):windows_subsystem="windows" 下 stderr 句柄
+    // 无效,Rust 侧 eprintln/panic 文本全部丢弃——排障两眼一抹黑,连「盲区声明」
+    // 都无处落。SetStdHandle 接管 std 的 stdout/stderr(std 每次写都 GetStdHandle,
+    // 启动即改全程生效)。已知边界:CRT fd 级输出(ONNX Runtime 的 C 侧打印)仍
+    // 捕不到——那需要 _open_osfhandle+_dup2 双重接管,等有 Windows 真机再验;
+    // Rust 侧诊断与 panic 是大头,先落。
+    #[cfg(windows)]
+    redirect_stdio_to_file_windows(app_data);
+    #[cfg(not(any(unix, windows)))]
+    let _ = app_data;
+}
+
+#[cfg(windows)]
+fn redirect_stdio_to_file_windows(app_data: &Path) {
+    // dev(控制台启动)不重定向,保留实时输出;与 unix 同判据。
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let logs = app_data.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return; // 建目录失败(磁盘满/权限),放弃重定向,绝不挡启动
+    }
+    let path = logs.join("stderr.log");
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > ROTATE_BYTES {
+            // Windows 的 rename 不覆盖既有目标(unix 会):先删旧代,否则第二次轮转
+            // 起永远失败,stderr.log 无界增长(codex)。
+            let old = logs.join("stderr.old.log");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&path, &old);
+        }
+    }
+    let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    use std::os::windows::io::AsRawHandle;
+    let h = f.as_raw_handle();
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h as _);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, h as _);
+    }
+    // 句柄必须活到进程结束:f 关闭后 std 拿到的就是悬空句柄。
+    std::mem::forget(f);
+    eprintln!(
+        "\n===== voice-notes {} 启动 {} =====",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
 }
 
 #[cfg(unix)]
