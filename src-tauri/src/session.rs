@@ -637,6 +637,8 @@ where
     sample_store: std::collections::HashMap<String, (String, Vec<f32>)>,
     /// 场景传感器(2026-08-23 一期):只观测不干预,停录随 SceneReport 导出。
     scene: crate::scene::SceneSensor,
+    /// 上一条 mic 母段终点(旁听门续段判据用):硬切长句的尾块与它首尾相接。
+    last_mic_final_end_ms: Option<u64>,
 }
 
 impl<'a, F, P, D> FinalSink<'a, F, P, D>
@@ -670,6 +672,7 @@ where
             last_system_partial: String::new(),
             sample_store: std::collections::HashMap::new(),
             scene: crate::scene::SceneSensor::new(),
+            last_mic_final_end_ms: None,
         }
     }
 
@@ -808,11 +811,19 @@ where
         // 旁听门按**母段**时长判一次(codex P1:split_final 会把 3s 真发言切成
         // 1.5s 子段,逐子段判会把长发言整段吞掉;门语义是「短附和」,时长天然属于
         // 母段)。判定结果带给每个 mic 子段。
+        // 硬切续段豁免(codex 二轮):>15s 长句被 Silero 硬切成多个 FinalJob,尾块 ≤2s
+        // 与上一 mic 终稿首尾相接——那是长发言的尾巴,不是附和。
+        let continuation = source == Source::Mic
+            && crate::scene::is_forced_continuation(self.last_mic_final_end_ms, start_ms);
         let parent_backchannel = source == Source::Mic
+            && !continuation
             && crate::scene::listening_backchannel_gate(
                 self.scene.current_scene(),
                 end_ms.saturating_sub(start_ms),
             );
+        if source == Source::Mic {
+            self.last_mic_final_end_ms = Some(end_ms);
+        }
         for sub in subs {
             let seg_rms = rms_of(&sub.samples);
             // 子段要再过一遍无内容过滤:母段整体有内容、切开后某一片只剩标点,是
