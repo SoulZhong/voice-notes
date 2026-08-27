@@ -7594,11 +7594,25 @@ fn spawn_ack_reinforce(
                 return Ok(()); // 已撤销/状态变了:不写库
             };
             anyhow::ensure!(op.target_person == target, "op 目标已变,放弃回灌");
+            let op_cluster = op.cluster.clone();
             let vp_store = open_voiceprint_store(&app).map_err(anyhow::Error::msg)?;
             let now = chrono::Local::now().to_rfc3339();
             let skipped = {
                 let _fb = FEEDBACK_GATE.lock().unwrap();
                 let note = store::NoteStore::new(root.clone()).load(&note_id)?;
+                // 门内复核关联现状(codex P1):确认与本任务之间用户可能已把该说话人
+                // 手动改给别人——op 记录还在,但笔记里的关联已不是 target,此刻回灌
+                // 会跟更新的手动 feedback 抢写,把错人留在库里。现关联≠target 即放弃。
+                let vp_now = vp_store.load();
+                let cur = note
+                    .speakers
+                    .get(&op_cluster)
+                    .and_then(|m| m.person_id.as_deref())
+                    .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid));
+                if cur != Some(target.as_str()) {
+                    eprintln!("回执确认回灌放弃:说话人现关联({cur:?})已不是 {target}");
+                    return Ok(());
+                }
                 let expected = current_speaker_model(&app);
                 let library_model = vp_store.load().embedding_model.clone();
                 match diar::SherpaEmbedder::new(&speaker_model_path_for(&expected)) {
