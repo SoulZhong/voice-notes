@@ -2183,14 +2183,7 @@ fn spawn_session(
             eprintln!(
                 "[采集] Windows system 轨(loopback)无硬件时戳,断流风暴检测不覆盖本轨(issue #125)"
             );
-            let _ = app.emit(
-                "source_health",
-                ipc::SourceHealthEvent {
-                    source: "system".into(),
-                    state: "unmonitored".into(),
-                    gap_pct: None,
-                },
-            );
+
             match new_silero(&vad_path) {
                 Ok(sys_seg) => {
                     let sys_factory: audio::resilient::CaptureFactory = Box::new(|| {
@@ -2713,6 +2706,21 @@ fn spawn_session(
                     "status",
                     ipc::StatusEvent { state: "recording".into(), system_audio, note_id: note_id.clone(), diarization, elapsed_ms: base_ms, input_override: input_override_for_session.clone() },
                 );
+                // Windows loopback 盲区声明(issue #125,codex P1 时序):必须发在
+                // status:recording **之后**——前端 nextGapStorm 有 isLive 门,早发
+                // 会被静默丢弃,横幅永远出不来。同一发射方按序送达,前端先置
+                // isLive 再收本条。system 不可用时前端另有引导卡压制,无需在此判。
+                #[cfg(windows)]
+                {
+                    let _ = app.emit(
+                        "source_health",
+                        ipc::SourceHealthEvent {
+                            source: "system".into(),
+                            state: "unmonitored".into(),
+                            gap_pct: None,
+                        },
+                    );
+                }
                 // P1 影子回报:会话已真实入槽并广播 recording,通知 actor 内核演进。
                 // 本回报来自后台加载线程,只投递不等待(见 actor.rs 死锁注记②)。
                 // 托盘红点态(图标+菜单文案「停止录制」)不再在此直调:actor 内核收到
