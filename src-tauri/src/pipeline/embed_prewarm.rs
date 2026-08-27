@@ -70,10 +70,14 @@ pub fn drain(note_dir: &std::path::Path, timeout: Duration) {
         }
     };
     let (rtx, rrx) = crossbeam_channel::bounded(1);
+    // 单一截止时刻(codex 三轮):send 与 recv 分别给整段 timeout 会叠到近两倍,
+    // 统一按 deadline 扣剩余量。
+    let deadline = std::time::Instant::now() + timeout;
     if tx.send_timeout(Msg::Drain(note_dir.to_path_buf(), rtx), timeout).is_err() {
         return; // 队列满到塞不进屏障:放弃排干,Aing 照常现算
     }
-    if rrx.recv_timeout(timeout).is_err() {
+    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+    if rrx.recv_timeout(remain).is_err() {
         eprintln!("预热排干超时(不阻塞 Aing,缺的段现算)");
     }
 }
@@ -189,7 +193,19 @@ fn handle(
             }
         }
     }
-    match compute_one(&job, &mut embedder.as_mut().expect("上面刚置 Some").1) {
+    let computed = compute_one(&job, &mut embedder.as_mut().expect("上面刚置 Some").1);
+    // WAV 尚未被写盘线程建出来(final 先于建档是可能的时序):等同音频未落齐,
+    // 推迟重试而不是当永久失败(codex 三轮)。
+    let computed = match computed {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        other => other,
+    };
+    match computed {
         Ok(Some(vec)) => {
             pending.entry((job.note_dir.clone(), tag)).or_default().push(EmbedCacheEntry {
                 seq: job.seq,
