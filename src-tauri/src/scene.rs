@@ -193,6 +193,11 @@ impl SceneSensor {
     }
 
     /// 取走"刚发生的稳定切换"(SceneHint 用;取一次即清)。
+    /// 当前稳定场景(实时行为门用;未稳定前 = unknown)。
+    pub fn current_scene(&self) -> &'static str {
+        self.current
+    }
+
     pub fn poll_change(&mut self) -> Option<&'static str> {
         self.changed.take()
     }
@@ -312,6 +317,25 @@ mod tests {
     }
 }
 
+/// 场景二期·实时行为门(issue #162):纯函数,表驱动可测。
+/// 旁听场的 backchannel(附和短语)不上屏——旁听者偶尔的「嗯/对/好的」在
+/// 转写里只制造噪音;门槛按时长,≤ 该值的 mic 段进抑制而不是正文。
+pub(crate) const LISTENING_BACKCHANNEL_MAX_MS: u64 = 2_000;
+
+pub(crate) fn listening_backchannel_gate(scene: &str, dur_ms: u64) -> bool {
+    scene == SC_LISTENING && dur_ms <= LISTENING_BACKCHANNEL_MAX_MS
+}
+
+/// 外放场残渣门收紧:AEC 在外放场必然收敛不足,残渣能量比耳机场高——
+/// 能量上限放宽一倍,让更多真残渣进得了残渣门(overlap 判据不动)。
+pub(crate) fn residue_rms_cap(scene: &str, base: f32) -> f32 {
+    if scene == SC_SPEAKER_ECHO {
+        base * 2.0
+    } else {
+        base
+    }
+}
+
 /// UI「选中可疑段」同口径(src/lib/segPick.ts 的 overlappedMicSeqs 逐位镜像):
 /// mic 段时长被 system 段覆盖 ≥80% 即命中。输入应为**未被抑制**的段集合
 /// (与前端 displaySegments 一致)。二期自动折叠与手动选中共用一个口径,
@@ -334,6 +358,23 @@ pub fn overlapped_mic_seqs(segs: &[crate::store::SegmentRecord]) -> Vec<u64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod behavior_gate_tests {
+    use super::*;
+
+    /// 旁听门:只在 listening 场、只对短段;外放门:只在 speaker_echo 场放宽一倍。
+    #[test]
+    fn gates_fire_only_in_their_scene() {
+        assert!(listening_backchannel_gate(SC_LISTENING, 1_500));
+        assert!(!listening_backchannel_gate(SC_LISTENING, 2_001), "长段是真发言,不拦");
+        assert!(!listening_backchannel_gate(SC_HEADSET, 500), "非旁听场不拦");
+        assert!(!listening_backchannel_gate(SC_UNKNOWN, 500), "未稳定不拦(保守)");
+        assert_eq!(residue_rms_cap(SC_SPEAKER_ECHO, 0.012), 0.024);
+        assert_eq!(residue_rms_cap(SC_HEADSET, 0.012), 0.012);
+        assert_eq!(residue_rms_cap(SC_UNKNOWN, 0.012), 0.012);
+    }
 }
 
 #[cfg(test)]
