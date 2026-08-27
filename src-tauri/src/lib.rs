@@ -7634,26 +7634,45 @@ fn spawn_ack_reinforce(
                 // 手动改给别人——op 记录还在,但笔记里的关联已不是 target,此刻回灌
                 // 会跟更新的手动 feedback 抢写,把错人留在库里。现关联≠target 即放弃。
                 let vp_now = vp_store.load();
+                // target 先过 redirects 归一(codex 六轮):自动应用到用户点 Good 之间
+                // 目标人物可能已被合并,笔记侧关联解析到的是 winner,拿 loser 比对会
+                // 白白放弃用户的确认。
+                let Some(target) =
+                    store::VoiceprintStore::resolve(&vp_now, &target).map(str::to_string)
+                else {
+                    eprintln!("回执确认回灌放弃:目标人物已不在库");
+                    return Ok(());
+                };
+                // seqs 归属复核(codex 五/六轮):重聚类会换簇号,op.cluster 可能已
+                // 过期——现簇从 seqs 反推(撤销路径同款思路):全部段必须存在且归
+                // 同一个说话人,否则组已散,放弃不拿混料喂库。
+                let owners: std::collections::BTreeSet<&str> = seqs
+                    .iter()
+                    .filter_map(|q| {
+                        note.segments.iter().find(|s| s.seq == *q).and_then(|s| s.speaker.as_deref())
+                    })
+                    .collect();
+                let all_present = seqs
+                    .iter()
+                    .all(|q| note.segments.iter().any(|s| s.seq == *q && s.speaker.is_some()));
+                let Some(cur_cluster) = (if all_present && owners.len() == 1 {
+                    owners.iter().next().map(|s| s.to_string())
+                } else {
+                    None
+                }) else {
+                    eprintln!("回执确认回灌放弃:op 覆盖的段已散/被改派");
+                    return Ok(());
+                };
+                let _ = &op_cluster; // 旧簇号仅供日志,判定一律以 seqs 反推为准
+                // 现关联复核(codex 五轮 P1):确认与本任务之间用户可能已把该说话人
+                // 改给别人;现关联(归一后)≠target 即放弃,不与更新的 feedback 抢写。
                 let cur = note
                     .speakers
-                    .get(&op_cluster)
+                    .get(&cur_cluster)
                     .and_then(|m| m.person_id.as_deref())
                     .and_then(|pid| store::VoiceprintStore::resolve(&vp_now, pid));
                 if cur != Some(target.as_str()) {
                     eprintln!("回执确认回灌放弃:说话人现关联({cur:?})已不是 {target}");
-                    return Ok(());
-                }
-                // seqs 归属复核(codex 五轮 P1):重转写/重聚类/手动改派后,op 存的
-                // 段号可能已归别的说话人——簇还挂着 target 不代表这组段还是。任一
-                // 段已易主即整体放弃,不拿混料喂库。
-                let strayed = seqs.iter().any(|q| {
-                    note.segments
-                        .iter()
-                        .find(|s| s.seq == *q)
-                        .is_none_or(|s| s.speaker.as_deref() != Some(op_cluster.as_str()))
-                });
-                if strayed {
-                    eprintln!("回执确认回灌放弃:op 覆盖的段已被改派/不存在");
                     return Ok(());
                 }
                 let expected = current_speaker_model(&app);
@@ -7684,24 +7703,27 @@ fn spawn_ack_reinforce(
                                 "回执确认回灌触发质心置空",
                             );
                         }
-                        match r {
+                        let sk = match r {
                             Ok(feedback::ReinforceResult::Applied { .. }) => None,
                             Ok(other) => Some(format!("{other:?}")),
                             Err(e) => Some(format!("回灌失败: {e}")),
-                        }
+                        };
+                        (sk, target, cur_cluster)
                     }
-                    Err(e) => Some(format!("声纹模型不可用: {e}")),
+                    Err(e) => (Some(format!("声纹模型不可用: {e}")), target, cur_cluster),
                 }
             };
+            let (skipped, target, cur_cluster) = skipped;
             let mut ops = refine::identify::load_ops(&dir);
-            let cluster = ops.ops.iter().find(|o| o.op_id == op_id).map(|o| o.cluster.clone());
             if let Some(op) = ops.ops.iter_mut().find(|o| o.op_id == op_id) {
                 op.reinforce_skipped = skipped.or(Some("回执确认后已回灌".to_string()));
             }
             let _ = refine::identify::save_ops(&dir, &ops);
             // 确认样本(codex 三轮):被确认目标若零样本,换模型 rebuild 会把人清没。
             // 料 = 本 op 覆盖的段(用户「Good」确认的正是这组识别),凑长同一口径。
-            if let Some(cluster) = cluster {
+            // 簇号/目标一律用门内复核出的现值(codex 六轮:旧簇号/被合并的旧 id
+            // 会让复核白白失败,吞掉用户的确认)。
+            {
                 let note = store::NoteStore::new(root.clone()).load(&note_id)?;
                 let pool: Vec<store::SegmentRecord> =
                     note.segments.iter().filter(|s| seqs.contains(&s.seq)).cloned().collect();
@@ -7709,8 +7731,8 @@ fn spawn_ack_reinforce(
                 spawn_confirmed_sample(
                     &app,
                     note_id.clone(),
-                    cluster,
-                    target.clone(),
+                    cur_cluster,
+                    target,
                     note.segments,
                     picks,
                     false,
