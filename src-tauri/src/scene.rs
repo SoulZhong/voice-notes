@@ -330,9 +330,18 @@ pub(crate) fn listening_backchannel_gate(scene: &str, dur_ms: u64) -> bool {
 /// ≤2s——它不是独立附和,是长发言的尾巴。判据:本段起点与上一 mic 终稿终点首尾
 /// 相接(硬切产物时间轴连续,容差 ≤ FORCED_CONTINUATION_GAP_MS 吸收取整)。
 pub(crate) const FORCED_CONTINUATION_GAP_MS: u64 = 100;
+/// 硬切只发生在长句之后:前段本身须 ≥ 此长(Silero split_long 阈值 15s 的块,
+/// 任一块都远长于附和)。仅凭首尾相接不够(codex 三轮):暂停冲刷+续录后紧接着
+/// 的新段也会首尾相接,而那可能就是一句附和。
+pub(crate) const FORCED_CONTINUATION_PREV_MIN_MS: u64 = 8_000;
 
-pub(crate) fn is_forced_continuation(prev_mic_end_ms: Option<u64>, start_ms: u64) -> bool {
-    prev_mic_end_ms.is_some_and(|e| start_ms >= e && start_ms - e <= FORCED_CONTINUATION_GAP_MS)
+/// prev = 上一 mic 母段 (终点, 时长)。
+pub(crate) fn is_forced_continuation(prev: Option<(u64, u64)>, start_ms: u64) -> bool {
+    prev.is_some_and(|(e, dur)| {
+        dur >= FORCED_CONTINUATION_PREV_MIN_MS
+            && start_ms >= e
+            && start_ms - e <= FORCED_CONTINUATION_GAP_MS
+    })
 }
 
 /// 外放场残渣门收紧:AEC 在外放场必然收敛不足,残渣能量比耳机场高——上限
@@ -388,11 +397,15 @@ mod behavior_gate_tests {
 
     /// 硬切续段:首尾相接(含 ≤100ms 取整容差)算续段;有空隙/无前段不算。
     #[test]
-    fn forced_continuation_requires_contiguity() {
-        assert!(is_forced_continuation(Some(15_000), 15_000));
-        assert!(is_forced_continuation(Some(15_000), 15_080));
-        assert!(!is_forced_continuation(Some(15_000), 15_500), "半秒空隙=独立段");
-        assert!(!is_forced_continuation(Some(15_000), 14_000), "起点早于前段终点不是续段");
+    fn forced_continuation_requires_contiguity_and_long_prev() {
+        assert!(is_forced_continuation(Some((15_000, 15_000)), 15_000));
+        assert!(is_forced_continuation(Some((15_000, 15_000)), 15_080));
+        assert!(!is_forced_continuation(Some((15_000, 15_000)), 15_500), "半秒空隙=独立段");
+        assert!(!is_forced_continuation(Some((15_000, 15_000)), 14_000), "起点早于前段终点不是续段");
+        assert!(
+            !is_forced_continuation(Some((15_000, 1_500)), 15_000),
+            "前段本身是短句(暂停后续录紧接的新段)不算硬切续段"
+        );
         assert!(!is_forced_continuation(None, 0));
     }
 }
