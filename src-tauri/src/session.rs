@@ -805,6 +805,14 @@ where
             )
         };
 
+        // 旁听门按**母段**时长判一次(codex P1:split_final 会把 3s 真发言切成
+        // 1.5s 子段,逐子段判会把长发言整段吞掉;门语义是「短附和」,时长天然属于
+        // 母段)。判定结果带给每个 mic 子段。
+        let parent_backchannel = source == Source::Mic
+            && crate::scene::listening_backchannel_gate(
+                self.scene.current_scene(),
+                end_ms.saturating_sub(start_ms),
+            );
         for sub in subs {
             let seg_rms = rms_of(&sub.samples);
             // 子段要再过一遍无内容过滤:母段整体有内容、切开后某一片只剩标点,是
@@ -830,7 +838,7 @@ where
             }
             match source {
                 Source::System => self.push_system_sub(sub, seg_rms),
-                Source::Mic => self.push_mic_sub(sub, seg_rms),
+                Source::Mic => self.push_mic_sub(sub, seg_rms, parent_backchannel),
             }
         }
     }
@@ -993,7 +1001,7 @@ where
     }
 
     /// mic 侧子段：占位段直通、残渣/回声命中即丢，其余进 hold 等 system 侧比对。
-    fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32) {
+    fn push_mic_sub(&mut self, sub: SubFinal, seg_rms: f32, parent_backchannel: bool) {
         // 场景观测:发声口径,与随后是否被抑制无关(抑制另计 echo_hits)。
         self.scene.feed_mic(sub.start_ms, sub.end_ms, crate::audio::aec::latest_erle_db());
         self.scene_poll();
@@ -1100,14 +1108,14 @@ where
                     });
                 }
                 None => {
-                    // 旁听场 backchannel 不上屏(场景二期,issue #162):场景稳定为
-                    // listening 时,旁听者偶发的短附和(≤2s)只制造转写噪音——进可逆
-                    // 抑制而非正文。长段是真发言照常上屏;场景未稳定(unknown)不拦。
-                    let dur = sub.end_ms.saturating_sub(sub.start_ms);
-                    if crate::scene::listening_backchannel_gate(self.scene.current_scene(), dur) {
+                    // 旁听场 backchannel 不上屏(场景二期,issue #162):判定在母段
+                    // 时长上做(见 push 循环前注释),此处只消费结果——场景稳定为
+                    // listening 且母段 ≤2s 的短附和进可逆抑制;长发言即使被切成短
+                    // 子段也照常上屏。
+                    if parent_backchannel {
                         eprintln!(
                             "旁听场附和不上屏: {}ms \"{}\"",
-                            dur,
+                            sub.end_ms.saturating_sub(sub.start_ms),
                             text_prefix20(&sub.text)
                         );
                         (self.on_partial)(Source::Mic, String::new());
