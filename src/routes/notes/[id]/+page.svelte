@@ -870,7 +870,7 @@
           },
         }],
       });
-    else if (foldedN === 0 && sc === "dual_path" && canEdit && overlappedMicSeqs(displaySegments).length > 0)
+    else if (foldedN === 0 && sc === "dual_path" && canEdit && !refining && overlappedMicSeqs(displaySegments).length > 0)
       out.push({
         key: "refold",
         level: "info",
