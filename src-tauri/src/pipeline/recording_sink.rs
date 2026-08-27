@@ -282,7 +282,12 @@ impl RecordingSink for MixedSink {
             .map(|m| crate::store::audio::bytes_to_ms(
                 m.len().saturating_sub(crate::store::audio::HEADER_LEN),
             ));
-        let will_truncate = prior_file_ms.is_some_and(|ms| ms > base_ms);
+        // 截短判定与 writer 的 open() 同口径(codex 四轮):对齐目标是
+        // base_ms − 该轨 offset_ms,不是 base_ms——mixed 轨中途出现
+        // (offset>0)时按 base_ms 比会漏报截短,旧尾巴计数错标已测。
+        let mixed_offset_ms = crate::store::audio::track_offset_ms(&note_dir, MIXED_TRACK);
+        let will_truncate =
+            prior_file_ms.is_some_and(|ms| ms > base_ms.saturating_sub(mixed_offset_ms));
         let (prior_clipped, prior_limited, prior_metered) = match (&prior_mix, prior_file_ms) {
             (Some(m), _) => {
                 (m.clipped_samples, m.limited_samples, m.limit_metered && !will_truncate)

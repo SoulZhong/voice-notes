@@ -508,6 +508,13 @@ pub fn set_track_mix(note_dir: &Path, source: &str, mix: MixInfo) -> anyhow::Res
     save_audio_meta(note_dir, &meta)
 }
 
+/// 读某轨 offset_ms(截短判定与 open() 对齐同口径用;缺项按 0,与 open 的
+/// 丢档重建路径殊途同归——那条路径反推出的 offset 也以「文件尾≈base」为不变式)。
+pub fn track_offset_ms(note_dir: &Path, source: &str) -> u64 {
+    let _guard = meta_guard();
+    load_audio_meta(note_dir).tracks.get(source).map(|t| t.offset_ms).unwrap_or(0)
+}
+
 /// 读成品轨完整性标记(续录装配在 clear 前留存上一场计数用;无标记 None)。
 pub fn track_mix(note_dir: &Path, source: &str) -> Option<MixInfo> {
     let _guard = meta_guard();
