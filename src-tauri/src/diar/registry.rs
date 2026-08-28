@@ -42,6 +42,19 @@ pub const SEED_MIN_SAMPLES: usize = 32_000;
 /// AS-Norm 增益通道:对称 z(与整理层 suggest 同式)达标且裸分不低于地板即命中种子。
 /// 3.0 与自动归并 SUGGEST_STRONG_Z 同档。待评测集校准的初值。
 pub const SEED_ASSIGN_Z: f32 = 3.0;
+/// 认领差距门:最佳合格席位与**另一个有名字的人**的最佳合格席位裸分差小于此值
+/// 即弃权(不认领、只记参考近邻,交 identify 裁决层/用户拍板)。
+///
+/// 2026-08-28 事故:「郑超敏」P11 档案自 8/14 一次手动误合并起装的一直是仲维建
+/// (P14)本人的声音,两档质心互似 0.898;两份档案本就是同一个人时最近邻是抛
+/// 硬币,错认的代价(错档案再吸一场样本,越滚越像)远大于不认。
+/// 口径:只看合格席位(不合格席位本就不许认领,也不该反过来否决合格席位,与
+/// nearest_picks_best_eligible_not_nearest_overall 锁定的语义一致);只把有名字
+/// 的人当竞争者(无名空壳见 SeedSeat::named)。
+/// 0.03 由 speaker_loso_eval 校准(155 探针):0.03 与 0.05 拦下的是同一批 5 条,
+/// 其中 3 条第二名是无名档案(收窄后放行)、1 条真人贴脸(王伟 0.709 / 侯令
+/// 0.703,弃权正确)、1 条本就认错(放行后仍错)。
+pub const SEED_CLAIM_MARGIN: f32 = 0.03;
 /// 见 SEED_ASSIGN_Z:z 通道命中仍要求的裸分地板。
 ///
 /// **2026-08-23 试过 0.30,量完回退。** 留档以免有人照着"同人余弦中位只有 0.44"
@@ -144,6 +157,10 @@ pub struct SeedSeat<'a> {
     /// 已过命中三闸。claim 返回的席位必须 eligible(认领=建立库关联,不合格
     /// 不许认);reference 不受此约束。
     pub eligible: bool,
+    /// 席位所属人物有名字。差距门只把**有名字的**第二名当竞争者:无名档案多是
+    /// 待确认/待清理的空壳(2026-08-28 LOSO 实测:差距门拦下的 5 条里 3 条第二名
+    /// 是 0~1 场的无名档案),被它们逼到弃权只损召回不防事故。
+    pub named: bool,
 }
 
 pub trait SeedMatcher: Send {
@@ -159,6 +176,18 @@ pub trait SeedMatcher: Send {
 /// (中位 2~3 席),票决邻域多为不同人各一席,多数票反而压掉正确最近邻。
 pub struct NearestMatcher;
 
+/// 差距门判定(默认最近邻用;票决策略不适用,见其 claim 注释):pick 与**其他有名
+/// 人物**最佳合格席位的裸分差 ≥ SEED_CLAIM_MARGIN 才许认领;没有这样的席位则恒过。
+fn margin_ok(seats: &[SeedSeat<'_>], pick: usize) -> bool {
+    let me = seats[pick].person;
+    let runner = seats
+        .iter()
+        .filter(|s| s.eligible && s.named && s.person != me)
+        .map(|s| s.sim)
+        .fold(f32::MIN, f32::max);
+    runner == f32::MIN || seats[pick].sim - runner >= SEED_CLAIM_MARGIN
+}
+
 impl SeedMatcher for NearestMatcher {
     // 严格大于 + 保先到:与 PR#94 之前的选择循环逐位一致——库里存在完全相同的
     // 质心(同声重复入库)时平手,历史行为取先注入者,max_by 会取后者(实测
@@ -170,7 +199,7 @@ impl SeedMatcher for NearestMatcher {
                 best = Some(i);
             }
         }
-        best
+        best.filter(|&b| margin_ok(seats, b))
     }
     fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
         let mut best: Option<usize> = None;
@@ -245,6 +274,8 @@ impl SeedMatcher for KnnVoteMatcher {
                 best = Some(i);
             }
         }
+        // 不过差距门:票决的语义本就是「多数票压过单个更近席位」,人级差距门与之
+        // 冲突;该策略为实验项,非默认。
         best
     }
     fn reference(&self, seats: &[SeedSeat<'_>]) -> Option<usize> {
@@ -561,7 +592,12 @@ impl SpeakerRegistry {
                 continue;
             }
             seat_cluster.push(idx);
-            seats.push(SeedSeat { person: c.person.as_deref().unwrap(), sim, eligible: seed_hit(c, sim) });
+            seats.push(SeedSeat {
+                person: c.person.as_deref().unwrap(),
+                sim,
+                eligible: seed_hit(c, sim),
+                named: c.person_name.as_deref().is_some_and(|n| !n.is_empty()),
+            });
         }
         let strategy_claim: Option<(f32, usize)> =
             self.matcher.claim(&seats).map(|i| (seats[i].sim, seat_cluster[i]));
@@ -2244,9 +2280,10 @@ mod tests {
 
     #[test]
     fn knn_vote_tie_breaks_by_best_similarity() {
-        // 甲乙各 2 席平票,甲的最高分(0.75)高于乙(0.73)→ 甲胜。
+        // 甲乙各 2 席平票,甲的最高分(0.80)高于乙(0.73)→ 甲胜(差 0.07 过差距门;
+        // 差距内的平票弃权见 knn_vote_abstains_within_margin)。
         let seeds = vec![
-            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.75), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.80), count: 10, source: "mic".into() },
             SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.70), count: 10, source: "mic".into() },
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.73), count: 10, source: "mic".into() },
             SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.72), count: 10, source: "mic".into() },
@@ -2397,4 +2434,63 @@ mod tests {
         let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.person.as_deref(), Some("PA"), "只有最近 5 席有投票权");
     }
+
+    /// 差距门(2026-08-28 P11/P14 同声双档事故):两人合格席位 0.96/0.94 只差
+    /// 0.02 → 弃权不认领,探针新建无主簇;参考近邻仍记录给裁决层。
+    #[test]
+    fn nearest_abstains_when_two_persons_within_margin() {
+        let seeds = vec![
+            SeedCluster { person: "P11".into(), name: "郑".into(), centroid: at_cos(0.96), count: 10, source: "mic".into() },
+            SeedCluster { person: "P14".into(), name: "仲".into(), centroid: at_cos(0.94), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person, None, "两人差距 < SEED_CLAIM_MARGIN 应弃权");
+        let seats = [
+            SeedSeat { person: "P11", sim: 0.96, eligible: true, named: true },
+            SeedSeat { person: "P14", sim: 0.94, eligible: true, named: true },
+        ];
+        assert_eq!(NearestMatcher.reference(&seats), Some(0), "参考近邻不受差距门约束");
+    }
+
+    /// 差距门只在**不同人**之间比:同一人多份变体挤在一起(0.96/0.95)不算含糊。
+    #[test]
+    fn nearest_margin_ignores_same_person_variants() {
+        let seeds = vec![
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.96), count: 10, source: "mic".into() },
+            SeedCluster { person: "PA".into(), name: "甲".into(), centroid: at_cos(0.95), count: 10, source: "mic".into() },
+            SeedCluster { person: "PB".into(), name: "乙".into(), centroid: at_cos(0.80), count: 10, source: "mic".into() },
+        ];
+        let mut r = SpeakerRegistry::with_seeds(&[], &seeds);
+        let id = r.assign(&v(1.0, 0.0, 0.0), "mic", LONG).unwrap();
+        let info = r.speakers().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.person.as_deref(), Some("PA"), "同人变体不触发差距门;与乙差 0.16 照常认领");
+    }
+
+    /// 差距门只把有名字的人当竞争者:无名空壳贴脸(0.716 vs 0.689)不逼弃权。
+    #[test]
+    fn nearest_margin_ignores_unnamed_runner_up() {
+        let seats = [
+            SeedSeat { person: "P8", sim: 0.716, eligible: true, named: true },
+            SeedSeat { person: "P386", sim: 0.689, eligible: true, named: false },
+        ];
+        assert_eq!(NearestMatcher.claim(&seats), Some(0));
+        let seats = [
+            SeedSeat { person: "P8", sim: 0.716, eligible: true, named: true },
+            SeedSeat { person: "P59", sim: 0.703, eligible: true, named: true },
+        ];
+        assert_eq!(NearestMatcher.claim(&seats), None, "有名字的第二名贴脸才弃权");
+    }
+
+    /// 差距门只看合格席位:不合格的更近席位不许认领,也不该反过来否决合格席位。
+    #[test]
+    fn nearest_margin_ignores_ineligible_runner_up() {
+        let seats = [
+            SeedSeat { person: "PA", sim: 0.72, eligible: false, named: true },
+            SeedSeat { person: "PB", sim: 0.70, eligible: true, named: true },
+        ];
+        assert_eq!(NearestMatcher.claim(&seats), Some(1), "不合格席位不参与差距比较");
+    }
+
 }

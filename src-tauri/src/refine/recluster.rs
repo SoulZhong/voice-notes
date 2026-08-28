@@ -72,7 +72,12 @@ fn seed_pick(
         .iter()
         .map(|(i, u)| {
             let sim = dot(centroid, u);
-            SeedSeat { person: seeds[*i].person.as_str(), sim, eligible: sim >= SEED_ASSIGN_THRESHOLD }
+            SeedSeat {
+                person: seeds[*i].person.as_str(),
+                sim,
+                eligible: sim >= SEED_ASSIGN_THRESHOLD,
+                named: !seeds[*i].name.is_empty(),
+            }
         })
         .collect();
     let pick = |k: usize| {
