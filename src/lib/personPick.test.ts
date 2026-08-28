@@ -9,7 +9,7 @@ const person = (id: string, name = "", lastSeen = "2026-07-31T10:00:00+08:00"): 
   last_seen: lastSeen,
   sources: ["mic"],
   sample_paths: [],
-  sample_dates: [],
+  sample_dates: [], sample_notes: [],
 });
 
 describe("personLabel", () => {

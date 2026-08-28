@@ -13,6 +13,7 @@
     rebuildPersonVoiceprint,
     type PersonSummary,
     type PersonMergeSuggestion,
+    movePersonSample,
   } from "$lib/people";
   import { tidy, sugKey, isStrong } from "$lib/tidy.svelte";
   import { describePlayError } from "$lib/tidyAudio";
@@ -178,6 +179,41 @@
     mergeQuery = "";
     confirmDelete = false;
     confirmSampleIdx = null;
+    moveSampleIdx = null;
+    moveTarget = null;
+    moveQuery = "";
+  }
+
+  // ── 样本改归属(2026-08-28 样本管理):听出来是别人的声音 → 归到对的人 ──
+  /** 正在选目标的样本下标;null=未打开。 */
+  let moveSampleIdx = $state<number | null>(null);
+  let moveTarget = $state<string | null>(null);
+  let moveQuery = $state("");
+  let moving = $state(false);
+  /** 样本区一次性反馈(改归属/删除完成)。 */
+  let sampleMsg = $state("");
+  async function doMoveSample() {
+    const p = person;
+    const i = moveSampleIdx;
+    const to = moveTarget;
+    const target = people.find((o) => o.id === to);
+    if (!p || i === null || !to || !target || moving) return;
+    const path = p.sample_paths[i];
+    moving = true;
+    sampleMsg = "";
+    stopSample();
+    try {
+      await movePersonSample(p.id, path, to);
+      closeAllOps();
+      sampleMsg = t("speakers.moveSampleDone", { name: displayName(target) });
+      recording.bumpPeople();
+      await refresh();
+    } catch (e) {
+      error = t("speakers.moveSampleFailed", { e });
+      await refresh();
+    } finally {
+      moving = false;
+    }
   }
 
   /** 样本删除的行内二段确认:记下标(与 sample_paths 对齐)。 */
@@ -208,8 +244,11 @@
     const path = p.sample_paths[i];
     confirmSampleIdx = null;
     stopSample(); // 删除后下标会移位,正在播的一律先停,别让播放态指错样本
+    sampleMsg = "";
     try {
       await deletePersonSample(p.id, path);
+      sampleMsg = t("speakers.sampleDeleted");
+      recording.bumpPeople();
       await refresh();
     } catch (e) {
       error = t("speakers.deleteSampleFailed", { e });
@@ -217,14 +256,18 @@
     }
   }
 
+  /** 合并进行中(后端要落日志、迁样本、按样本重建声纹,数秒):按钮显"合并中…"
+      并禁用,免得看起来像没反应而连点(2026-08-28 用户实报)。 */
+  let merging = $state(false);
   async function doMerge() {
     const winner = pendingMergeWinner;
     const target = people.find((o) => o.id === winner);
-    if (!person || !winner || !target) return;
+    if (!person || !winner || !target || merging) return;
     const loser = person;
-    closeAllOps();
+    merging = true;
     try {
       const jid = await mergePerson(loser.id, winner);
+      closeAllOps();
       tidy.lastManual = { journalId: jid, label: `${displayName(loser)} → ${displayName(target)}` };
       recording.bumpPeople();
       // 本人已并入对方:跳到对方详情,让"这个人现在是谁"立即可见。
@@ -233,6 +276,8 @@
       // 录制中后端拒绝等错误文案原样展示。
       error = `${e}`;
       await refresh(); // 失败也对账
+    } finally {
+      merging = false;
     }
   }
 
@@ -602,54 +647,94 @@
         {#if rebuildMsg}<span class="hint">{rebuildMsg}</span>{/if}
       </div>
       {#if person.sample_paths.length > 0}
-        <div class="listen-row">
+        <!-- 一行一份样本(2026-08-28 样本管理):试听 · 来源会议 · 归到别人 · 删除。
+             来源会议是"这段声音到底是谁"的第二证据:点进笔记看上下文再定。 -->
+        <ul class="sample-list">
           {#each person.sample_paths as sp, i (sp)}
-            {#if confirmSampleIdx === i}
-              <!-- 行内二段确认(页面级破坏性动作既有模式);样本不参与识别,删了不影响认人 -->
-              <span class="confirm-inline">
-                <button class="mini danger" onclick={() => doDeleteSample(i)}>{t("speakers.deleteSample")}</button>
-                <button class="mini" onclick={() => (confirmSampleIdx = null)}>{t("speakers.cancel")}</button>
-              </span>
-            {:else}
-              <span class="sample-wrap">
-                <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
-                  {#if playingIdx === i}
-                    <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
-                    {t("speakers.stop")}
-                  {:else}
-                    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-                      <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
-                    </svg>
-                    {person.sample_paths.length === 1
-                      ? t("speakers.playSample")
-                      : t("speakers.sampleN", { n: i + 1 })}
-                    {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
-                      <!-- 样本录制日期(文件时间):标出"哪场的声音",多样本核对时才分得清 -->
-                      <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
-                    {/if}
-                  {/if}
-                </button>
-                <!-- 悬停显影的删除叉:录坏/混进别人声音的样本可单独删 -->
-                <button
-                  class="sample-x"
-                  title={t("speakers.deleteSample")}
-                  aria-label={t("speakers.deleteSample")}
-                  onclick={() => {
-                    closeAllOps();
-                    confirmSampleIdx = i;
-                  }}
-                >
-                  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-                    <path d="M4 4l8 8M12 4l-8 8" />
+            {@const origin = person.sample_notes[i] ?? null}
+            <li class="sample-row" class:active={moveSampleIdx === i || confirmSampleIdx === i}>
+              <button class="listen" class:playing={playingIdx === i} onclick={() => toggleSample(i)}>
+                {#if playingIdx === i}
+                  <span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>
+                  {t("speakers.stop")}
+                {:else}
+                  <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M5 2.9v10.2c0 .7.8 1.2 1.4.8l7.4-5.1c.6-.4.6-1.2 0-1.6L6.4 2.1c-.6-.4-1.4.1-1.4.8z" fill="currentColor" />
                   </svg>
-                </button>
+                  {t("speakers.sampleN", { n: i + 1 })}
+                {/if}
+              </button>
+              <span class="sample-origin">
+                {#if formatDate(person.sample_dates[i] ?? "") !== "—"}
+                  <span class="listen-date">{formatDate(person.sample_dates[i]).slice(0, 10)}</span>
+                {/if}
+                {#if origin}
+                  <a href="/notes/{origin.note_id}" title={origin.cluster_id ? `${origin.note_id} · ${origin.cluster_id}` : origin.note_id}>
+                    {t("speakers.sampleFrom", { title: origin.title || origin.note_id })}
+                  </a>
+                  {#if origin.inferred}<span class="origin-tag">{t("speakers.sampleFromInferred")}</span>{/if}
+                {:else}
+                  <span class="origin-none">{t("speakers.sampleNoOrigin")}</span>
+                {/if}
               </span>
-            {/if}
+              <span class="sample-ops">
+                {#if confirmSampleIdx === i}
+                  <!-- 行内二段确认;删完后端即按剩余样本重算声纹 -->
+                  <button class="mini danger" onclick={() => doDeleteSample(i)}>{t("speakers.deleteSample")}</button>
+                  <button class="mini" onclick={() => (confirmSampleIdx = null)}>{t("speakers.cancel")}</button>
+                {:else}
+                  <button
+                    class="mini"
+                    disabled={recording.isLive || moving || others.length === 0}
+                    title={recording.isLive ? t("speakers.noMergeWhileRecording") : t("speakers.moveSample")}
+                    onclick={() => {
+                      const opening = moveSampleIdx !== i;
+                      closeAllOps();
+                      if (opening) moveSampleIdx = i;
+                    }}>{t("speakers.moveSample")}</button
+                  >
+                  <button
+                    class="mini quiet"
+                    title={t("speakers.deleteSample")}
+                    onclick={() => {
+                      closeAllOps();
+                      confirmSampleIdx = i;
+                    }}>{t("speakers.deleteSample")}</button
+                  >
+                {/if}
+              </span>
+              {#if moveSampleIdx === i}
+                <!-- 归到别人:与「合并到…」同一套选人菜单;选定后二段确认 -->
+                <div class="merge-anchor sample-move">
+                  <button class="menu-scrim" aria-label={t("speakers.closeMenu")} onclick={closeAllOps}></button>
+                  {#if !moveTarget}
+                    <div class="menu">
+                      <div class="menu-title">{t("speakers.moveSampleTitle", { n: i + 1 })}</div>
+                      <!-- svelte-ignore a11y_autofocus -->
+                      <input class="pick-input" autofocus placeholder={t("speakers.searchPlaceholder")} bind:value={moveQuery} />
+                      <PersonPickList people={others} query={moveQuery} onpick={(p) => (moveTarget = p.id)} />
+                    </div>
+                  {:else}
+                    {@const target = people.find((o) => o.id === moveTarget)}
+                    <div class="menu confirm">
+                      <div class="menu-title">
+                        {t("speakers.moveSampleConfirm", { n: i + 1, name: target ? displayName(target) : "?" })}
+                      </div>
+                      <div class="confirm-row">
+                        <button class="mini accent" disabled={moving} onclick={doMoveSample}>
+                          {moving ? t("speakers.rebuilding") : t("speakers.moveSampleGo")}
+                        </button>
+                        <button class="mini" onclick={closeAllOps}>{t("speakers.cancel")}</button>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </li>
           {/each}
-        </div>
-        <span class="card-hint">
-          {t("speakers.auditionHint")}{#if person.sample_paths.length > 1}{t("speakers.auditionHintMulti")}{/if}
-        </span>
+        </ul>
+        {#if sampleMsg}<span class="hint">{sampleMsg}</span>{/if}
+        <span class="card-hint">{t("speakers.auditionHint")}</span>
       {:else}
         <span class="card-hint">{t("speakers.noSamplesYet")}</span>
       {/if}
@@ -719,7 +804,9 @@
                 <div class="menu-note">{t("speakers.reverseNote")}</div>
               {/if}
               <div class="confirm-row">
-                <button class="mini danger" onclick={doMerge}>{t("speakers.confirmMerge")}</button>
+                <button class="mini danger" disabled={merging} onclick={doMerge}>
+                  {merging ? t("speakers.merging") : t("speakers.confirmMerge")}
+                </button>
                 <button class="mini" onclick={closeAllOps}>{t("speakers.cancel")}</button>
               </div>
             </div>
@@ -822,33 +909,65 @@
     font-size: 0.76rem;
     font-weight: 400;
   }
-  /* 样本删除叉:悬停样本才显影(行级操作隐身惯例),hover 转 danger */
-  .sample-wrap {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-  }
-  .sample-x {
-    visibility: hidden;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.35rem;
-    height: 1.35rem;
+  /* 样本列表:一行一份(试听 · 来源 · 操作);操作按钮悬停/激活才显影 */
+  .sample-list {
+    list-style: none;
+    margin: 0 0 0.4rem;
     padding: 0;
-    border: none;
-    background: none;
-    color: var(--ink-faint);
-    border-radius: var(--radius-full);
-    cursor: pointer;
+    display: flex;
+    flex-direction: column;
   }
-  .sample-wrap:hover .sample-x,
-  .sample-x:focus-visible {
+  .sample-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .sample-row:last-child {
+    border-bottom: none;
+  }
+  .sample-origin {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45em;
+    flex: 1 1 12rem;
+    min-width: 0;
+    font-size: 0.82rem;
+    color: var(--ink-soft);
+  }
+  .sample-origin a {
+    color: var(--ink);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sample-origin a:hover {
+    text-decoration: underline;
+  }
+  .origin-tag,
+  .origin-none {
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+  }
+  .sample-ops {
+    display: inline-flex;
+    gap: 0.35rem;
+    visibility: hidden;
+  }
+  .sample-row:hover .sample-ops,
+  .sample-row.active .sample-ops,
+  .sample-ops:focus-within {
     visibility: visible;
   }
-  .sample-x:hover {
-    color: var(--danger);
-    background: var(--danger-tint);
+  .sample-move {
+    position: absolute;
+    left: 0;
+    top: 100%;
+    z-index: 5;
   }
   /* 列表型卡片(出现过的会议):纵排,标题行与列表上下排布 */
   .card.col {
@@ -1040,13 +1159,6 @@
   .card-hint {
     color: var(--ink-faint);
     font-size: 0.82rem;
-  }
-  /* 多份样本按钮排一行,窄卡自动换行 */
-  .listen-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-bottom: 0.4rem;
   }
   /* 试听按钮:secondary 形态,播放中 accent 文字 + 跳动条 */
   .listen {

@@ -34,7 +34,8 @@ pub use refined::{
 };
 pub use voiceprints::RestoreOutcome; // 快照回放结局(feedback 消费,含"质心已置空待重建")。
 pub use voiceprints::confident_picks; // 自动归并筛选(apply_confident_merges 命令消费)。
-pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(主质心+会话变体,lib.rs 消费)。
+pub use voiceprints::seed_clusters; // 开录/Aing 种子构建(只取主质心,lib.rs 消费)。
+pub use voiceprints::seed_clusters_with_variants; // 旧表示(含会话变体)对照,仅评测 bin 消费。
 pub use voiceprints::SESSION_CENTROIDS_MAX; // 会话变体环形上限(speaker_loso_eval 复刻旧表示时对齐)。
 pub use voiceprints::suggest_merges; // 整理·再辨认(suggest_person_merges 命令消费)。
 pub use voiceprints::MergeSuggestion; // confident_picks 出入参类型(lib.rs 消费)。

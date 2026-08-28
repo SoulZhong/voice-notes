@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use app_lib::diar::{SherpaEmbedder, SpeakerEmbedder};
-use app_lib::store::{seed_clusters, PersonCentroid, VoiceprintStore};
+use app_lib::store::{seed_clusters, seed_clusters_with_variants, PersonCentroid, VoiceprintStore};
 
 /// 探针视作长段:样本本就 ≥10s(MIN_SAMPLE_MS),段长闸恒过。
 const PROBE_SAMPLES: usize = 48_000;
@@ -130,6 +130,9 @@ fn main() {
 
     let mut t = Tally::default();
     let mut wrongs: Vec<String> = Vec::new();
+    let mut abstains: Vec<String> = Vec::new();
+    // 弃权明细默认不打(几十行噪音);校准差距门时置 LOSO_SHOW_ABSTAIN=1 看弃权落在谁头上。
+    let show_abstain = std::env::var_os("LOSO_SHOW_ABSTAIN").is_some();
     let probe_owners: Vec<&String> = embs.keys().filter(|k| embs[*k].len() >= 2).collect();
     let probe_count: usize = probe_owners.iter().map(|k| embs[*k].len()).sum();
 
@@ -181,7 +184,8 @@ fn main() {
                     }
                 }
             }
-            let seeds = seed_clusters(&g);
+            // 旧表示对照要显式取变体席位:生产 seed_clusters 已只取主质心。
+            let seeds = if old_variants { seed_clusters_with_variants(&g) } else { seed_clusters(&g) };
             let mut r = app_lib::diar::registry::SpeakerRegistry::with_seeds(&[], &seeds);
             let got = r.assign(&own[held], "mic", PROBE_SAMPLES).and_then(|cid| {
                 r.speakers().into_iter().find(|s| s.id == cid).and_then(|s| s.person)
@@ -192,6 +196,30 @@ fn main() {
                     label(owner),
                     held + 1,
                     label(got.as_deref().unwrap())
+                ));
+            }
+            if got.is_none() && show_abstain {
+                // 每人取最高分席位,列前两名:看弃权是差距门拦的(两人贴得近)
+                // 还是本就不过阈。
+                let mut per: BTreeMap<&str, f32> = BTreeMap::new();
+                for sd in &seeds {
+                    if let Some(u) = normalize(&sd.centroid) {
+                        let sim: f32 = own[held].iter().zip(&u).map(|(a, b)| a * b).sum();
+                        let e = per.entry(sd.person.as_str()).or_insert(f32::MIN);
+                        if sim > *e {
+                            *e = sim;
+                        }
+                    }
+                }
+                let mut top: Vec<(&str, f32)> = per.into_iter().collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let show: Vec<String> =
+                    top.iter().take(2).map(|(p, s)| format!("{} {:.3}", label(p), s)).collect();
+                abstains.push(format!(
+                    "  {} 的第 {} 份样本 → 弃权  [{}]",
+                    label(owner),
+                    held + 1,
+                    show.join(" / ")
                 ));
             }
             t.add(got.as_deref(), owner);
@@ -215,6 +243,12 @@ fn main() {
         println!("\n认错明细({} 条):", wrongs.len());
         for w in &wrongs {
             println!("{w}");
+        }
+    }
+    if !abstains.is_empty() {
+        println!("\n弃权明细({} 条,LOSO_SHOW_ABSTAIN=1):", abstains.len());
+        for a in &abstains {
+            println!("{a}");
         }
     }
 }

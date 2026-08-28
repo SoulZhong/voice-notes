@@ -9,7 +9,7 @@ const person = (id: string, name = "", samples: string[] = []): PersonSummary =>
   last_seen: "2026-07-31T10:00:00+08:00",
   sources: ["mic"],
   sample_paths: samples,
-  sample_dates: samples.map(() => ""),
+  sample_dates: samples.map(() => ""), sample_notes: [],
 });
 
 const sug = (loser: string, winner: string): PersonMergeSuggestion => ({

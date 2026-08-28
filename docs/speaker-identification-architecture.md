@@ -140,6 +140,7 @@ flowchart LR
 |---|---|---|---|
 | `ASSIGN_THRESHOLD` | 0.62 | 归入普通簇 | registry.rs |
 | `SEED_ASSIGN_THRESHOLD` | 0.68 | 归入种子簇(认老熟人,更严;同信道;跨信道走 z 通道) | registry.rs |
+| `SEED_CLAIM_MARGIN` | 0.03 | 认领差距门(仅默认最近邻):最佳合格席位与另一个**有名字**人物的最佳合格席位差 < 此值即弃权、只记参考近邻(两份档案本是同一人时最近邻等于抛硬币,2026-08-28 P11/P14 事故;LOSO 校准) | registry.rs |
 | `SOFT_ASSIGN_THRESHOLD` | 0.45 | 灰区软归属(不动质心) | registry.rs |
 | `MERGE_THRESHOLD` | 0.74 | 场内簇间自动合并 | registry.rs |
 | `MIN_NEW_CLUSTER_SAMPLES` | 2.5s | 短于此不建新簇 | registry.rs |
@@ -185,3 +186,17 @@ flowchart LR
 | `src/lib/notes.ts` | 名字解析链、调色板 |
 | `src/lib/recording.svelte.ts` | 实时事件消费(SpeakerMap/merged) |
 | `src/routes/speakers/` | 会议搭子:概览/整理/详情 |
+
+## 2026-08-29 单均值宪法(Codex 复审后收口)
+
+P11 事故(一次手动误合并 + 三次自动归并 + 两次自动回灌,把用户本人的声音滚成「郑超敏」整档)之后,把"错误会自我强化"的传播链从代码层切断:
+
+| 路径 | 之前 | 现在 |
+|---|---|---|
+| 入库 / 纠错回灌(`upsert_from_session`、`reinforce_feedback`) | 加权并入主质心 **+ 追加一份会话变体** | 只加权并入主质心 |
+| 合并(`merge_locked`) | loser 主质心降级为 winner 变体、loser 变体全部带过来 | 只加权并入;命令层合并后 **按样本重建 winner**(`rebuild_person_blocking`) |
+| 合并超额淘汰 | farthest-point 留"彼此最不像"的 10 份(偏爱错人/噪声样本) | `select_balanced_recent`:双方按比例、各留最新;淘汰件在合并日志有副本 |
+| 种子注入(`seed_clusters`) | 主质心 + 全部会话变体各一席,取 max | **只取主质心**;`seed_clusters_with_variants` 仅评测对照 |
+| 自动归并(`apply_confident_merges`) | strong 档自动落库 | 永不落库,只出建议(`applied` 恒空) |
+
+结论:一个人的声纹 = 其样本 wav 嵌入的归一化均值,别无其他状态。要改一个人的声纹,改他的样本(删/归到别人/确认新场次),不存在"库里悄悄多了一份质心"的路径。多质心/条件分层等长尾方案,须在清库 + 按时间切分的 enrollment→未来会议评测(含陌生人探针)搭起来之后再议。

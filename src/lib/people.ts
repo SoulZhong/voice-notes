@@ -13,6 +13,16 @@ export type PersonSummary = {
   sample_paths: string[];
   /** 与 sample_paths 一一对应的录制日期(文件 mtime,RFC3339;取不到为空串)。 */
   sample_dates: string[];
+  /** 与 sample_paths 一一对应的来源会议:溯源真值(inferred=false,带 cluster_id)或
+      按文件时间≈会议结束时间推断(inferred=true);推不出为 null。 */
+  sample_notes: (SampleNoteRef | null)[];
+};
+
+export type SampleNoteRef = {
+  note_id: string;
+  title: string;
+  cluster_id: string | null;
+  inferred: boolean;
 };
 
 /** 后端已按 last_seen 降序返回。 */
@@ -43,8 +53,12 @@ export const deletePerson = (id: string) => invoke<void>("delete_person", { id }
     历史回灌污染整体清除。 */
 export const rebuildPersonVoiceprint = (id: string) =>
   invoke<void>("rebuild_person_voiceprint", { id });
+/** 删除后后端即按剩余样本重建该人声纹(2026-08-28 起),不用再手点重建。 */
 export const deletePersonSample = (id: string, path: string) =>
   invoke<void>("delete_person_sample", { id, path });
+/** 样本改归属:这份样本其实是 to 的声音。搬文件后双方都按样本重建;录制中后端拒绝。 */
+export const movePersonSample = (from: string, path: string, to: string) =>
+  invoke<void>("move_person_sample", { from, path, to });
 
 /** 整理·合并建议:把 loser 并入 winner 的推荐。similarity=共有信道质心余弦最大值;
     salience=S-Norm 显著性 z 分数(相对库内分布的鹤立鸡群程度,库太小为 null)。
