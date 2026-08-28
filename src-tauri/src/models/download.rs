@@ -60,7 +60,7 @@ pub fn probe_mirror(prefix: &str) -> Result<String, String> {
         .map(|a| a.url)
         .unwrap_or("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx");
     let url = apply_mirror(origin, true, p);
-    match ureq::get(&url)
+    match crate::netproxy::agent_for(&url).get(&url)
         .timeout(Duration::from_secs(10))
         .set("Range", "bytes=0-0")
         .call()
@@ -297,10 +297,7 @@ pub fn download_artifact(
     //   永不误杀;读间隙的取消检查也因此最迟 30s 内响应。
     // 读超时错误文案含 "timed out",经 retryable_download_error 判定可重试,同 URL
     // Range 续传后再轮换,已下字节不浪费。
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(30))
-        .build();
+    let agent = crate::netproxy::agent_with_timeouts(&url, Duration::from_secs(15), Duration::from_secs(30));
     let req = agent.get(url);
     let req = if offset > 0 { req.set("Range", &format!("bytes={offset}-")) } else { req };
     let resp = match req.call() {

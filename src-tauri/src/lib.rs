@@ -11,6 +11,7 @@ pub mod asr;
 mod ipc;
 pub mod models;
 pub mod scene; // devtools bin scene_backfill(#169)重放 SceneSensor 需要
+mod netproxy; // 出站代理探测(更新器/ureq 共用,v0.13.1 冒烟实录)
 mod session;
 pub mod settings;
 mod shortcuts;
@@ -10795,6 +10796,7 @@ pub fn run() {
             set_segments_speaker,
             delete_segments,
             restore_suppressed_segments,
+            netproxy::system_proxy_url,
             fold_scene_echo,
             pipeline_health,
             screen_capture_permission,

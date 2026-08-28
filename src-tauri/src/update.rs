@@ -30,7 +30,7 @@ pub fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current = app.package_info().version.to_string();
     let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
     // GitHub API 强制要求 User-Agent,缺了直接 403——前端 fetch 设不了此头,故走 Rust。
-    let body = ureq::get(&api)
+    let body = crate::netproxy::agent_for(&api).get(&api)
         .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
         .set("User-Agent", "voice-notes")
         .set("Accept", "application/vnd.github+json")
