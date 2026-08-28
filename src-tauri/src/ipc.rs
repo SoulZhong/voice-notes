@@ -165,7 +165,7 @@ pub struct PersonSummary {
     pub total_ms: u64,
     pub last_seen: String,
     pub sources: Vec<String>,
-    /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES;合并会带入对方的样本)。
+    /// 录音样本绝对路径列表(按会议逐份累积,至多 MAX_SAMPLES=30;合并会带入对方的样本)。
     /// 空 = 库中无样本(旧数据/写失败),前端据此决定是否显示「试听」。
     pub sample_paths: Vec<String>,
     /// 与 sample_paths 一一对应的录制日期(文件 mtime,RFC3339;取不到给空串)。

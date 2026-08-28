@@ -24,10 +24,13 @@ pub const AUTO_ENROLL_MS: u64 = 10_000;
 pub const MIN_SAMPLE_MS: u64 = 10_000;
 
 /// 每人录音样本上限。样本按会议逐份累积(试听区分"哪场的声音"),合并时双方样本
-/// 合池、按声纹多样性保留(见 merge_with_embedder);超出上限的不再写/合并时按
-/// "保留最不相似的组合"丢弃,防止长期使用无界膨胀(每份 ≤15s 16k s16 ≈ 480KB,
-/// 10 份 ≈ 4.8MB/人封顶)。
-pub const MAX_SAMPLES: usize = 10;
+/// 合池、超额按 select_balanced_recent 保留;超出上限的不再写。
+///
+/// 2026-08-29 由 10 提到 30(用户:"10 份丢了太多长尾")。单均值表示下样本越多均值
+/// 越稳,且不同设备/场景的声音都有机会进均值;存储 30 × ≈480KB ≈ 14MB/人封顶,
+/// 不是问题。真正的代价是重建耗时(每份嵌入几百毫秒),由 EmbedCache 按内容哈希
+/// 缓存兜住——审库时删一份只重算 0 份。
+pub const MAX_SAMPLES: usize = 30;
 
 /// resolve 跟随 redirects 链的步数上限。merge 已做链条压扁,正常情况下一跳到底;
 /// 这里是纯防御性上限,防止任何异常写入(例如手工改坏文件成环)导致死循环。
@@ -1023,6 +1026,7 @@ impl VoiceprintStore {
         let mut vp = self.load();
         let ids: Vec<String> = vp.people.keys().cloned().collect();
         let mut rebuilt = 0usize;
+        let mut cache = EmbedCache::load(&self.root, model_tag);
         for id in ids {
             if vp.people.get(&id).is_some_and(|p| p.voiceprint_quarantined) {
                 // 隔离人物不重算,只清空:他的样本可能就是混杂音频,重算等于把污染
@@ -1035,7 +1039,7 @@ impl VoiceprintStore {
             let embs: Vec<Vec<f32>> = self
                 .sample_paths_existing(&id)
                 .iter()
-                .filter_map(|p| embed_wav_sample(p, e))
+                .filter_map(|p| cache.get_or_embed(p, e))
                 .collect();
             let person = vp.people.get_mut(&id).expect("刚枚举的 key");
             person.session_centroids.clear();
@@ -1079,6 +1083,7 @@ impl VoiceprintStore {
             rebuilt += 1;
         }
         vp.embedding_model = model_tag.to_string();
+        cache.save();
         self.save(&vp)?;
         super::merge_journal::MergeJournal::new(self.root.clone())
             .invalidate_all("声纹库已按新模型重建");
@@ -1123,8 +1128,9 @@ impl VoiceprintStore {
         let paths = self.sample_paths_existing(id);
         let mut embs: Vec<Vec<f32>> = Vec::new();
         let mut total_ms = 0u64;
+        let mut cache = EmbedCache::load(&self.root, model);
         for p in &paths {
-            if let Some(v) = embed_wav_sample(p, e) {
+            if let Some(v) = cache.get_or_embed(p, e) {
                 embs.push(v);
             }
             if let Ok(r) = hound::WavReader::open(p) {
@@ -1134,6 +1140,7 @@ impl VoiceprintStore {
                 }
             }
         }
+        cache.save();
         let person = vp.people.get_mut(id).expect("上面已校验存在");
         person.session_centroids.clear();
         person.centroids.clear();
@@ -1686,6 +1693,67 @@ pub(crate) fn normalize_loudness(samples: &mut [f32]) {
     let scale = (EMBED_TARGET_RMS / rms).min(0.99 / peak.max(1e-6));
     for x in samples.iter_mut() {
         *x *= scale;
+    }
+}
+
+/// 样本嵌入缓存:key = 样本文件内容 sha256,value = 归一化嵌入;整文件绑定一个模型
+/// 标签,换模型即整体作废。放 `voiceprints/.embed_cache.json`,纯加速层——缺失/损坏
+/// 等于全部重算,不影响正确性。为什么要它:MAX_SAMPLES 提到 30 后,每删/搬一份
+/// 样本都按样本重建,30 份 × 几百毫秒一次就是十几秒;按内容哈希缓存后只算新样本。
+struct EmbedCache {
+    path: PathBuf,
+    model: String,
+    entries: BTreeMap<String, Vec<f32>>,
+    dirty: bool,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct EmbedCacheFile {
+    model: String,
+    entries: BTreeMap<String, Vec<f32>>,
+}
+
+impl EmbedCache {
+    fn load(root: &std::path::Path, model: &str) -> Self {
+        let path = root.join("voiceprints").join(".embed_cache.json");
+        let file: EmbedCacheFile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let entries = if file.model == model { file.entries } else { BTreeMap::new() };
+        Self { path, model: model.to_string(), entries, dirty: false }
+    }
+
+    /// 命中即返回;未命中则嵌入并记入(嵌入失败不记,下次再试)。
+    fn get_or_embed(&mut self, p: &std::path::Path, e: &mut dyn crate::diar::SpeakerEmbedder) -> Option<Vec<f32>> {
+        let hash = sample_content_hash(p)?;
+        if let Some(v) = self.entries.get(&hash) {
+            return Some(v.clone());
+        }
+        let v = embed_wav_sample(p, e)?;
+        self.entries.insert(hash, v.clone());
+        self.dirty = true;
+        Some(v)
+    }
+
+    /// best-effort 落盘(原子写);失败只打日志——下次重建多算几份而已。
+    fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        let file = EmbedCacheFile { model: self.model.clone(), entries: self.entries.clone() };
+        let tmp = self.path.with_extension("json.tmp");
+        let r = (|| -> anyhow::Result<()> {
+            if let Some(d) = self.path.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::write(&tmp, serde_json::to_string(&file)?)?;
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if let Err(err) = r {
+            eprintln!("样本嵌入缓存落盘失败(不影响库,下次重算): {err}");
+        }
     }
 }
 
@@ -4143,6 +4211,33 @@ mod tests {
         assert!(p.voiceprint_quarantined, "重算不动隔离标记(解除另有入口)");
     }
 
+    /// 嵌入缓存:同内容第二次不再调模型;换模型标签整体作废。
+    #[test]
+    fn embed_cache_hits_by_content_hash_and_resets_on_model_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VoiceprintStore::new(tmp.path().to_path_buf());
+        let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        store.upsert_from_session(&[snap("S1", vec![1.0, 0.0], 5, &["mic"], None, AUTO_ENROLL_MS)], "t", MODEL).unwrap();
+        let pid = store.load().people.keys().next().unwrap().clone();
+        store.append_sample(&pid, &square).unwrap();
+        let path = store.sample_paths_existing(&pid)[0].clone();
+
+        // 第一次:未命中,mock 被调用一次并落盘。
+        let mut e = crate::diar::MockEmbedder::new(vec![Ok(vec![0.0, 1.0])]);
+        let mut c = EmbedCache::load(tmp.path(), MODEL);
+        assert_eq!(c.get_or_embed(&path, &mut e).unwrap(), vec![0.0, 1.0]);
+        c.save();
+        assert!(tmp.path().join("voiceprints/.embed_cache.json").exists());
+        // 第二次:命中,mock 队列已空(再调会 Err),仍返回缓存值。
+        let mut e2 = crate::diar::MockEmbedder::new(vec![]);
+        let mut c2 = EmbedCache::load(tmp.path(), MODEL);
+        assert_eq!(c2.get_or_embed(&path, &mut e2).unwrap(), vec![0.0, 1.0]);
+        // 换模型:作废,需重算。
+        let mut e3 = crate::diar::MockEmbedder::new(vec![Ok(vec![1.0, 0.0])]);
+        let mut c3 = EmbedCache::load(tmp.path(), "other-model");
+        assert_eq!(c3.get_or_embed(&path, &mut e3).unwrap(), vec![1.0, 0.0]);
+    }
+
     /// 样本基线 = 所有样本的平均,**没有状态变体**。
     ///
     /// 这条钉的是 2026-08-23 那次校准的核心语义:一份样本 ≠ 一场出场。曾经重建会把
@@ -4156,9 +4251,11 @@ mod tests {
         // fixture 已给 P1 塞了一份占位样本,换成两份可嵌入的真 wav:嵌入分别是
         // [1,0] 与 [0,1],均值方向应是 [√½,√½]。
         std::fs::remove_file(tmp.path().join("voiceprints/P1.wav")).unwrap();
+        // 两份内容必须不同:嵌入按内容哈希缓存,同内容同嵌入(那才是对的)。
         let square: Vec<f32> = (0..16_000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        let square2: Vec<f32> = (0..16_000).map(|i| if i % 4 < 2 { 0.4 } else { -0.4 }).collect();
         store.append_sample("P1", &square).unwrap();
-        store.append_sample("P1", &square).unwrap();
+        store.append_sample("P1", &square2).unwrap();
         assert_eq!(store.sample_paths_existing("P1").len(), 2, "前置:两份样本都在");
 
         let mut e = crate::diar::MockEmbedder::new(vec![Ok(vec![1.0, 0.0]), Ok(vec![0.0, 1.0])]);
