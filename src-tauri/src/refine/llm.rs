@@ -56,7 +56,7 @@ fn post_long_with_retry(cfg: &LlmConfig, url: &str, body: &str) -> anyhow::Resul
     // 读到一半超时/断开时 send_string 早已 Ok,把读正文留在重试之外等于漏掉这类
     // 失败(Codex P2)。错误带一个"值不值得重试"的旗子回来。
     let attempt = || -> Result<String, (anyhow::Error, bool)> {
-        let resp = crate::netproxy::agent().post(url)
+        let resp = crate::netproxy::agent_for(&url).post(url)
             .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
             .set("authorization", &format!("Bearer {}", cfg.api_key))
             .set("content-type", "application/json")
@@ -180,7 +180,7 @@ impl super::identify::IdentifyExecutor for HttpIdentifyExecutor {
         apply_thinking_off(&self.cfg.base_url, &mut body);
         let started = std::time::Instant::now();
         let result = (|| -> anyhow::Result<(String, Vec<super::identify::RawAssignment>, usize)> {
-            let resp_text = crate::netproxy::agent().post(&url)
+            let resp_text = crate::netproxy::agent_for(&url).post(&url)
                 .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
                 .set("authorization", &format!("Bearer {}", self.cfg.api_key))
                 .set("content-type", "application/json")
@@ -367,7 +367,7 @@ pub fn probe(cfg: &LlmConfig) -> Result<String, String> {
     });
     apply_thinking_off(&cfg.base_url, &mut body_json);
     let body = body_json.to_string();
-    let resp = crate::netproxy::agent().post(&url)
+    let resp = crate::netproxy::agent_for(&url).post(&url)
         .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
         .set("content-type", "application/json")
@@ -575,7 +575,7 @@ fn do_call_chunk(
     ),
     ChunkErr,
 > {
-    let resp_text = crate::netproxy::agent().post(url)
+    let resp_text = crate::netproxy::agent_for(&url).post(url)
         .timeout(std::time::Duration::from_secs(CHUNK_TIMEOUT_S))
         .set("authorization", &format!("Bearer {}", cfg.api_key))
         .set("content-type", "application/json")
@@ -668,7 +668,7 @@ pub fn gen_title(
     apply_thinking_off(&cfg.base_url, &mut body_json);
     let started = std::time::Instant::now();
     let resp_result: anyhow::Result<String> = (|| {
-        Ok(crate::netproxy::agent().post(&url)
+        Ok(crate::netproxy::agent_for(&url).post(&url)
             .timeout(std::time::Duration::from_secs(REQ_TIMEOUT_S))
             .set("authorization", &format!("Bearer {}", cfg.api_key))
             .set("content-type", "application/json")

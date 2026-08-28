@@ -199,7 +199,7 @@ impl CloudAsr for AliyunAsr {
         let wav = wav_bytes(samples)?;
         let body = batch_request_json(&base64_std(&wav));
 
-        let resp = match crate::netproxy::agent().post(BATCH_URL)
+        let resp = match crate::netproxy::agent_for(&BATCH_URL).post(BATCH_URL)
             .timeout(Duration::from_secs(BATCH_TIMEOUT_S))
             // 批式走标准 HTTP Bearer(流式 WS 那边是小写 bearer,两处都按官方样例写)。
             .set("Authorization", &format!("Bearer {}", self.api_key))

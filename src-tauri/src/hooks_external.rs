@@ -686,7 +686,7 @@ pub fn run_webhook(
     payload: &serde_json::Value,
     limit: Duration,
 ) -> Result<u16, String> {
-    match crate::netproxy::agent().post(url)
+    match crate::netproxy::agent_for(&url).post(url)
         .timeout(limit)
         .set("content-type", "application/json")
         .send_string(&payload.to_string())

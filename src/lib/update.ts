@@ -84,7 +84,9 @@ async function doApplyUpdate(onProgress: (p: UpdateProgress) => void): Promise<"
   // 代理探测(v0.13.1 冒烟实录):GUI 进程不继承终端代理变量,更新器直连 github
   // 在 Clash 系统代理模式下时通时不通;后端读环境变量/macOS 系统代理,有则显式传入。
   const { invoke } = await import("@tauri-apps/api/core");
-  const proxy = (await invoke<string | null>("system_proxy_url").catch(() => null)) ?? undefined;
+  const proxy =
+    (await invoke<string | null>("system_proxy_url", { target: "https://github.com/" }).catch(() => null)) ??
+    undefined;
   const update = await check({ timeout: UPDATE_TIMEOUT_MS, proxy });
   if (!update) return "none";
   let downloaded = 0;
